@@ -737,14 +737,18 @@ pub fn require_non_raw_update_message(is_raw: bool) -> Result<(), String> {
 ///
 /// PHP: `ArcanistWorkflow::parseBaseCommitArgument()`
 /// (`src/workflow/ArcanistWorkflow.php:1825-1846`): no argument is a no-op;
-/// more than one argument is a usage error. The selected commit becomes the
-/// symbolic base whose merge-base with the head is diffed.
-///
-/// Divergence: PHP rejects VCSes without commit ranges (`:1830-1834`); this
-/// git-only port always supports them.
-pub fn parse_base_commit_argument(argv: &[String]) -> Result<Option<String>, String> {
+/// a VCS without commit ranges (svn) rejects any argument; more than one
+/// argument is a usage error. The selected commit becomes the symbolic base
+/// whose merge-base with the head is diffed.
+pub fn parse_base_commit_argument(
+    supports_commit_ranges: bool,
+    argv: &[String],
+) -> Result<Option<String>, String> {
     if argv.is_empty() {
         return Ok(None);
+    }
+    if !supports_commit_ranges {
+        return Err("This version control system does not support commit ranges.".to_string());
     }
     if argv.len() > 1 {
         return Err(
@@ -1738,23 +1742,21 @@ pub fn harbormaster_type_from_result(unit_result: i32) -> &'static str {
 /// True when lint must be skipped (reporting `RESULT_SKIP`).
 ///
 /// PHP: `runLint()` (`src/workflow/ArcanistDiffWorkflow.php:1146-1151`):
-/// `--nolint`, a raw diff source, or an explicit `--head` all skip.
-///
-/// Divergence: PHP tests argument truthiness; only `None` heads skip here
-/// (empty heads are unreachable via CLI parsing, which requires a value).
+/// `--nolint`, a raw diff source, or an explicit `--head` all skip. PHP
+/// tests argument truthiness, so an empty `--head=` does not skip.
 #[must_use]
 pub fn should_skip_lint(nolint: bool, is_raw: bool, head: Option<&str>) -> bool {
-    nolint || is_raw || head.is_some()
+    nolint || is_raw || head.is_some_and(|h| !h.is_empty())
 }
 
 /// True when unit tests must be skipped (reporting `RESULT_SKIP`).
 ///
 /// PHP: `runUnit()` (`src/workflow/ArcanistDiffWorkflow.php:1214-1219`):
 /// `--nounit`, a raw diff source, or an explicit `--head` all skip. Same
-/// head-truthiness divergence as [`should_skip_lint`].
+/// head truthiness as [`should_skip_lint`]: an empty `--head=` does not skip.
 #[must_use]
 pub fn should_skip_unit(nounit: bool, is_raw: bool, head: Option<&str>) -> bool {
-    nounit || is_raw || head.is_some()
+    nounit || is_raw || head.is_some_and(|h| !h.is_empty())
 }
 
 /// `diff` flags passed through to the `lint` child workflow, in spec order.

@@ -402,15 +402,22 @@ fn raw_update_message_guard_reports_exact_error() {
 #[test]
 fn base_commit_argument_allows_exactly_one() {
     let none: Vec<String> = vec![];
-    assert_eq!(parse_base_commit_argument(&none).unwrap(), None);
+    assert_eq!(parse_base_commit_argument(true, &none).unwrap(), None);
     assert_eq!(
-        parse_base_commit_argument(&["abc".to_string()]).unwrap(),
+        parse_base_commit_argument(true, &["abc".to_string()]).unwrap(),
         Some("abc".to_string())
     );
     assert_eq!(
-        parse_base_commit_argument(&["a".to_string(), "b".to_string()]).unwrap_err(),
+        parse_base_commit_argument(true, &["a".to_string(), "b".to_string()]).unwrap_err(),
         "Specify exactly one base commit. The end of the commit range is always the working \
          copy state."
+    );
+    // A VCS without commit ranges rejects even one argument, but no
+    // argument stays a no-op.
+    assert_eq!(parse_base_commit_argument(false, &none).unwrap(), None);
+    assert_eq!(
+        parse_base_commit_argument(false, &["abc".to_string()]).unwrap_err(),
+        "This version control system does not support commit ranges."
     );
 }
 
@@ -878,10 +885,12 @@ fn skip_predicates_cover_nolint_nounit_raw_head() {
     assert!(should_skip_lint(false, true, None));
     assert!(should_skip_lint(false, false, Some("abc")));
     assert!(!should_skip_lint(false, false, None));
+    assert!(!should_skip_lint(false, false, Some("")));
     assert!(should_skip_unit(true, false, None));
     assert!(should_skip_unit(false, true, None));
     assert!(should_skip_unit(false, false, Some("abc")));
     assert!(!should_skip_unit(false, false, None));
+    assert!(!should_skip_unit(false, false, Some("")));
 }
 
 #[test]
