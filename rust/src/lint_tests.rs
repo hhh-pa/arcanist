@@ -356,10 +356,42 @@ fn spawn_retries_while_script_is_busy() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// True when exec refuses a write-held script with ETXTBSY (Linux
+/// does; macOS does not enforce it). Probed once per process so the
+/// stuck-script test pins behavior only where the errno exists.
+#[cfg(unix)]
+fn platform_reports_txtbsy() -> bool {
+    static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PROBE.get_or_init(|| probe_txtbsy().unwrap_or(false))
+}
+
+#[cfg(unix)]
+fn probe_txtbsy() -> Option<bool> {
+    let dir = std::env::temp_dir().join(format!("arc-rs-txtbsy-probe-lint-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok()?;
+    let sh = dir.join("probe.sh");
+    std::fs::write(&sh, "#!/bin/sh\nexit 0\n").ok()?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&sh).ok()?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&sh, perms).ok()?;
+    }
+    let _held = std::fs::OpenOptions::new().write(true).open(&sh).ok()?;
+    let failed_busy = std::process::Command::new(&sh)
+        .output()
+        .is_err_and(|error| error.raw_os_error() == Some(26));
+    std::fs::remove_dir_all(&dir).ok();
+    Some(failed_busy)
+}
+
 /// A permanently busy script still fails (after the bound).
 #[cfg(unix)]
 #[test]
 fn spawn_gives_up_on_permanently_busy_script() {
+    if !platform_reports_txtbsy() {
+        return;
+    }
     let dir = std::env::temp_dir().join(format!(
         "arc-rs-lint-stuck-{}-{}",
         std::process::id(),
