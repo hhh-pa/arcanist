@@ -675,3 +675,95 @@ pub fn evaluate_gates(
 #[cfg(test)]
 #[path = "land_checks_tests.rs"]
 mod land_checks_tests;
+
+/// Prompt for the final land confirmation (`ArcanistLandEngine.php:1216`).
+pub const PROMPT_CONFIRM: &str = "arc.land.confirm";
+/// Prompt for landing with implicitly-associated commits
+/// (`ArcanistLandEngine.php:753`).
+pub const PROMPT_IMPLICIT: &str = "arc.land.implicit";
+/// Prompt for creating new branches or bookmarks in the remote
+/// (`ArcanistGitLandEngine.php:1029`,
+/// `ArcanistMercurialLandEngine.php:377`).
+pub const PROMPT_CREATE: &str = "arc.land.create";
+
+/// Description of every `arc land` prompt, verbatim from `newPrompts()`
+/// (`ArcanistLandWorkflow.php:237-289`).
+///
+/// Shown by the `?` prompt help (`ArcanistPrompt.php:191-231`). Returns
+/// `None` for unknown keys.
+#[must_use]
+pub fn prompt_description(key: &str) -> Option<&'static str> {
+    match key {
+        PROMPT_LARGE_WORKING_SET => {
+            Some("Confirms landing more than 50 commit(s) in a single operation.")
+        }
+        PROMPT_CONFIRM => Some("Confirms that the correct changes have been selected to land."),
+        PROMPT_IMPLICIT => Some(
+            "Confirms that local commits which are not associated with a revision have been \
+             associated correctly and should land.",
+        ),
+        PROMPT_UNAUTHORED => Some("Confirms that revisions you did not author should land."),
+        PROMPT_CHANGES_PLANNED => Some("Confirms that revisions with changes planned should land."),
+        PROMPT_PUBLISHED => Some("Confirms that revisions that are already published should land."),
+        PROMPT_NOT_ACCEPTED => Some("Confirms that revisions that are not accepted should land."),
+        PROMPT_OPEN_PARENTS => {
+            Some("Confirms that revisions with open parent revisions should land.")
+        }
+        PROMPT_FAILED_BUILDS => Some("Confirms that revisions with failed builds should land."),
+        PROMPT_ONGOING_BUILDS => Some("Confirms that revisions with ongoing builds should land."),
+        PROMPT_CREATE => {
+            Some("Confirms that new branches or bookmarks should be created in the remote.")
+        }
+        _ => None,
+    }
+}
+
+/// `IMPLICIT COMMITS` gate (`ArcanistLandEngine.php:720-756`).
+///
+/// Fires when `implicit_commits` commits land without an explicit
+/// revision association. The PHP query takes no count; `count` carries
+/// the implicit commit count for list rendering.
+#[must_use]
+pub fn implicit_gate(implicit_commits: usize) -> Option<GateFinding> {
+    if implicit_commits == 0 {
+        return None;
+    }
+    Some(GateFinding {
+        prompt: PROMPT_IMPLICIT,
+        title: "IMPLICIT COMMITS".to_string(),
+        query: "Continue with this mapping between commits and revisions?".to_string(),
+        count: implicit_commits,
+    })
+}
+
+/// `CREATE N BRANCHE(S)` gate, git flavour
+/// (`ArcanistGitLandEngine.php:998-1032`).
+///
+/// The `branche(s)` spelling is verbatim from PHP.
+#[must_use]
+pub fn create_gate_git(new_refs: usize) -> Option<GateFinding> {
+    if new_refs == 0 {
+        return None;
+    }
+    Some(GateFinding {
+        prompt: PROMPT_CREATE,
+        title: format!("CREATE {new_refs} BRANCHE(S)"),
+        query: format!("Create {new_refs} new branche(s) in the remote?"),
+        count: new_refs,
+    })
+}
+
+/// `CREATE N BOOKMARK(S)` gate, Mercurial flavour
+/// (`ArcanistMercurialLandEngine.php:345-380`).
+#[must_use]
+pub fn create_gate_hg(new_refs: usize) -> Option<GateFinding> {
+    if new_refs == 0 {
+        return None;
+    }
+    Some(GateFinding {
+        prompt: PROMPT_CREATE,
+        title: format!("CREATE {new_refs} BOOKMARK(S)"),
+        query: format!("Create {new_refs} new remote bookmark(s)?"),
+        count: new_refs,
+    })
+}

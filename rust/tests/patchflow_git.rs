@@ -5,7 +5,7 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use arc_rs::{conduit, export, patch};
+use arc_rs::{conduit, export, land, patch};
 
 /// Unique scratch dir for one test; removed on drop (best effort).
 struct Fixture {
@@ -133,6 +133,13 @@ fn client_for(base: &str) -> conduit::Client {
     conduit::Client::new(base, "api-test-token").unwrap()
 }
 
+/// Adapt a blocking conduit client to the `patch` call closure.
+fn patch_call(
+    client: &conduit::Client,
+) -> impl Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String> + '_ {
+    |method, params| client.call(method, params).map_err(|e| e.to_string())
+}
+
 const RAW_DIFF: &str = "diff --git a/f.txt b/f.txt\nindex 257cc56..5716ca5 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-a\n+b\n";
 
 #[test]
@@ -164,8 +171,8 @@ fn patch_help_succeeds() {
         export::run_in(fx.path(), &argv(&["--help"])),
         ExitCode::SUCCESS
     );
-    let text = patch::execute(fx.path(), &argv(&["--help"])).unwrap();
-    assert!(text.contains("usage: arc-rs patch"), "{text}");
+    let out = patch::execute(fx.path(), &argv(&["--help"])).unwrap();
+    assert!(out.stdout.contains("usage: arc-rs patch"), "{}", out.stdout);
 }
 
 #[test]
@@ -174,7 +181,7 @@ fn patch_preview_prints_patch_file_without_repo() {
     fx.write("fix.patch", RAW_DIFF);
     let patch_path = fx.dir.join("fix.patch").to_string_lossy().to_string();
     let out = patch::execute(fx.path(), &argv(&["--patch", &patch_path, "--preview"])).unwrap();
-    assert_eq!(out, RAW_DIFF);
+    assert_eq!(out.stdout, RAW_DIFF);
 }
 
 #[test]
@@ -186,7 +193,7 @@ fn patch_preview_reads_stdin_patch() {
         Some("x\n"),
     )
     .unwrap();
-    assert_eq!(out, "x\n");
+    assert_eq!(out.stdout, "x\n");
     let err = patch::execute_with_stdin(fx.path(), &argv(&["--patch", "-", "--preview"]), Some(""))
         .unwrap_err();
     assert!(err.contains("stdin"), "{err}");
@@ -203,8 +210,32 @@ fn patch_applies_patch_file_to_repo() {
     px.write("fix.patch", RAW_DIFF);
     let patch_path = px.dir.join("fix.patch").to_string_lossy().to_string();
 
-    let out = patch::execute(fx.path(), &argv(&["--patch", &patch_path])).unwrap();
-    assert!(out.contains("Applied patch"), "{out}");
+    let out = patch::execute(
+        fx.path(),
+        &argv(&["--patch", &patch_path, "--nocommit", "--nobranch"]),
+    )
+    .unwrap();
+    assert!(out.stderr.contains("APPLIED"), "{}", out.stderr);
+    assert_eq!(
+        std::fs::read_to_string(fx.dir.join("f.txt")).unwrap(),
+        "b\n"
+    );
+    assert_eq!(fx.git(&["branch", "--show-current"]), "main");
+}
+
+#[test]
+fn patch_branches_by_default() {
+    let fx = Fixture::named("branch");
+    fx.init_repo();
+    fx.write("f.txt", "a\n");
+    fx.commit_all("one");
+    let px = Fixture::named("branch-patch");
+    px.write("fix.patch", RAW_DIFF);
+    let patch_path = px.dir.join("fix.patch").to_string_lossy().to_string();
+
+    let out = patch::execute(fx.path(), &argv(&["--patch", &patch_path, "--nocommit"])).unwrap();
+    assert!(out.stderr.contains("APPLIED"), "{}", out.stderr);
+    assert_eq!(fx.git(&["branch", "--show-current"]), "arcpatch");
     assert_eq!(
         std::fs::read_to_string(fx.dir.join("f.txt")).unwrap(),
         "b\n"
@@ -223,11 +254,31 @@ fn patch_refuses_dirty_tree_unless_forced() {
     px.write("fix.patch", RAW_DIFF);
     let patch_path = px.dir.join("fix.patch").to_string_lossy().to_string();
 
-    let err = patch::execute(fx.path(), &argv(&["--patch", &patch_path])).unwrap_err();
-    assert!(err.contains("not clean"), "{err}");
+    let mut io = land::Io::canned(&["n"]);
+    let err = patch::execute_with_io(
+        fx.path(),
+        &argv(&["--patch", &patch_path]),
+        &mut io,
+        &patch::Backends::default(),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("You can not continue with uncommitted changes"),
+        "{err}"
+    );
 
-    let out = patch::execute(fx.path(), &argv(&["--patch", &patch_path, "--force"])).unwrap();
-    assert!(out.contains("Applied patch"), "{out}");
+    let out = patch::execute(
+        fx.path(),
+        &argv(&[
+            "--patch",
+            &patch_path,
+            "--force",
+            "--nocommit",
+            "--nobranch",
+        ]),
+    )
+    .unwrap();
+    assert!(out.stderr.contains("APPLIED"), "{}", out.stderr);
     assert_eq!(
         std::fs::read_to_string(fx.dir.join("f.txt")).unwrap(),
         "b\n"
@@ -244,8 +295,12 @@ fn patch_reports_apply_failure() {
     px.write("fix.patch", RAW_DIFF);
     let patch_path = px.dir.join("fix.patch").to_string_lossy().to_string();
 
-    let err = patch::execute(fx.path(), &argv(&["--patch", &patch_path])).unwrap_err();
-    assert!(err.contains("git apply failed"), "{err}");
+    let err = patch::execute(
+        fx.path(),
+        &argv(&["--patch", &patch_path, "--nocommit", "--nobranch"]),
+    )
+    .unwrap_err();
+    assert_eq!(err, "Unable to apply patch!");
 }
 
 #[test]
@@ -264,9 +319,11 @@ fn patch_fetches_revision_through_querydiffs_then_getrawdiff() {
     let raw = r#"{"result": "diff --git a/x\n", "error_code": null}"#;
     let (base, rx) = serve_seq(vec![query, raw]);
     let client = client_for(&base);
+    let call = patch_call(&client);
 
-    let text = patch::fetch_raw_diff_for_revision(&client, 123).unwrap();
-    assert_eq!(text, "diff --git a/x\n");
+    let bundle = patch::fetch_revision_bundle(&call, 123).unwrap();
+    assert_eq!(bundle.text, "diff --git a/x\n");
+    assert_eq!(bundle.revision_id, Some(123));
 
     let seen = seen_requests(&rx);
     assert_eq!(seen.len(), 2);
@@ -288,18 +345,25 @@ fn patch_fetches_revision_through_querydiffs_then_getrawdiff() {
 #[test]
 fn patch_fetches_single_diff() {
     let raw = r#"{"result": "patch-bytes\n", "error_code": null}"#;
-    let (base, rx) = serve_seq(vec![raw]);
+    let query = r#"{"result": {"9": {"id": 9}}, "error_code": null}"#;
+    let (base, rx) = serve_seq(vec![query, raw]);
     let client = client_for(&base);
+    let call = patch_call(&client);
 
-    let text = patch::fetch_raw_diff_for_diff(&client, "9").unwrap();
-    assert_eq!(text, "patch-bytes\n");
+    let bundle = patch::fetch_diff_bundle(&call, 9).unwrap();
+    assert_eq!(bundle.text, "patch-bytes\n");
 
     let seen = seen_requests(&rx);
-    assert_eq!(seen.len(), 1);
+    assert_eq!(seen.len(), 2);
     assert!(
-        seen[0].0.starts_with("POST /api/differential.getrawdiff "),
+        seen[0].0.starts_with("POST /api/differential.querydiffs "),
         "{}",
         seen[0].0
+    );
+    assert!(
+        seen[1].0.starts_with("POST /api/differential.getrawdiff "),
+        "{}",
+        seen[1].0
     );
 }
 
@@ -307,7 +371,8 @@ fn patch_fetches_single_diff() {
 fn patch_rejects_unknown_revision() {
     let (base, _rx) = serve_seq(vec![r#"{"result": {}, "error_code": null}"#]);
     let client = client_for(&base);
-    let err = patch::fetch_raw_diff_for_revision(&client, 404).unwrap_err();
+    let call = patch_call(&client);
+    let err = patch::fetch_revision_bundle(&call, 404).unwrap_err();
     assert!(
         err.contains("invalid or you don't have permission"),
         "{err}"
