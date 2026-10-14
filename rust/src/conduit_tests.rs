@@ -65,3 +65,9 @@ fn rejects_malformed_response() {
     ));
     assert!(matches!(parse_response("[1]"), Err(Error::Protocol(_))));
 }
+
+#[test]
+fn request_timeout_matches_php_default() {
+    // `ConduitClient::$timeout` is 300 seconds in PHP.
+    assert_eq!(REQUEST_TIMEOUT, std::time::Duration::from_secs(300));
+}
