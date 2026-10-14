@@ -26,7 +26,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # The CI workspace mounts at /work owned by the host user; mark it safe so
 # git works as root inside the container (else "dubious ownership" errors).
-RUN git config --global --add safe.directory /work
+# System level: some tests override HOME, which would hide a global entry.
+RUN git config --system --add safe.directory /work
 
 # Provision every pinned gate tool. Prebuilt downloads that cannot execute
 # on this libc compile here once (see ensure_tool), so runtime provisioning
