@@ -37,3 +37,6 @@
 # Python extension compiled files.
 /support/hg/arc-hg.pyc
 /support/hg/__pycache__/
+
+# Rust port (T1128)
+/rust/target/
