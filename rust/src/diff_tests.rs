@@ -535,6 +535,49 @@ fn g1_full_help_and_wrap() {
 }
 
 #[test]
+fn merge_routes_hg_to_full_flows() {
+    let dir = scratch_dir("route-hg");
+    std::fs::create_dir_all(dir.join(".hg")).unwrap();
+    let err = inspect(&dir, &defaults()).unwrap_err();
+    assert!(
+        !err.contains("not yet ported"),
+        "still baseline-gated: {err}"
+    );
+}
+
+#[test]
+fn merge_routes_svn_to_full_flows() {
+    let dir = scratch_dir("route-svn");
+    std::fs::create_dir_all(dir.join(".svn")).unwrap();
+    let err = inspect(&dir, &defaults()).unwrap_err();
+    assert!(
+        !err.contains("not yet ported"),
+        "still baseline-gated: {err}"
+    );
+}
+
+#[test]
+fn merge_routes_raw_sources_without_working_copy() {
+    let dir = scratch_dir("route-raw");
+    let options = Options {
+        raw_command: Some("echo hello-raw".to_string()),
+        ..defaults()
+    };
+    let out = inspect(&dir, &options).unwrap();
+    assert!(
+        String::from_utf8(out).unwrap().contains("hello-raw"),
+        "raw source did not execute"
+    );
+}
+
+#[test]
+fn merge_help_text_combines_usage_and_full_help() {
+    let text = help_text();
+    assert!(text.starts_with(USAGE), "{text:?}");
+    assert!(text.contains("Supports: git, svn, hg"), "{text:?}");
+}
+
+#[test]
 fn g1_confirm_prompt_helpers() {
     let prompt = format_confirm_prompt("Continue?", true);
     assert!(prompt.starts_with("\n\n    Continue? [y/N]"), "{prompt:?}");

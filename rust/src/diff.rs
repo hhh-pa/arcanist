@@ -1405,6 +1405,14 @@ fn submit_via_client(cwd: &Path, options: &Options, mode: &SubmitMode) -> Result
 /// output is byte-identical to before. With `--create`, `--update`, or
 /// `--only`, the diff is submitted over Conduit instead.
 pub fn inspect(cwd: &Path, options: &Options) -> Result<Vec<u8>, String> {
+    // Full-state routing (merge): raw sources and non-git working copies
+    // take the parallel G1 pipeline; git and vcs-less shells keep the
+    // locked baseline contract below.
+    if diff_local::is_raw_diff_source(options.raw, options.raw_command.as_deref())
+        || matches!(detect_vcs(cwd), Some(vcs) if vcs != Vcs::Git)
+    {
+        return inspect_full(cwd, options);
+    }
     let resolved = prepare(cwd, options)?;
     let options = &resolved;
     if !is_inside_git_repo(cwd) {
@@ -1435,7 +1443,7 @@ pub fn run(argv: &[String]) -> ExitCode {
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", help_text());
             return ExitCode::SUCCESS;
         }
         Err(msg) => {
@@ -1458,6 +1466,12 @@ pub fn run(argv: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Full `--help` text: usage line plus the long help.
+#[must_use]
+pub fn help_text() -> String {
+    format!("{USAGE}\n{FULL_HELP}")
 }
 
 /* -(  Full-State Prompts and Raw Sources (G1)  )--------------------------------- */

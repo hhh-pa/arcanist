@@ -35,7 +35,6 @@ fn usage() -> String {
 #[derive(Debug, PartialEq, Eq)]
 struct CallArgs {
     method: String,
-    params_json: String,
     conduit_uri: Option<String>,
 }
 
@@ -51,31 +50,32 @@ enum Action {
 }
 
 fn parse_call_conduit(rest: &[String]) -> Result<CallArgs, String> {
-    let mut iter = rest.iter();
-    let Some(method) = iter.next() else {
-        return Err("call-conduit requires a method name".to_string());
-    };
-    let mut params_json = "{}".to_string();
+    // PHP (`ArcanistCallConduitWorkflow.php:31-44`): `method` is a wildcard
+    // argument and exactly one name is required; params come from stdin,
+    // never from argv.
+    let mut methods = Vec::new();
     let mut conduit_uri = None;
-    let mut positional = false;
+    let mut positional_only = false;
+    let mut iter = rest.iter();
     while let Some(arg) = iter.next() {
-        if arg == "--conduit-uri" {
+        if !positional_only && arg == "--" {
+            positional_only = true;
+        } else if !positional_only && arg == "--conduit-uri" {
             let Some(uri) = iter.next() else {
                 return Err("--conduit-uri requires a value".to_string());
             };
             conduit_uri = Some(uri.clone());
-        } else if arg.starts_with("--") {
+        } else if !positional_only && arg.starts_with("--") {
             return Err(format!("unknown flag '{arg}'"));
-        } else if positional {
-            return Err("call-conduit takes at most one params-json argument".to_string());
         } else {
-            params_json = arg.clone();
-            positional = true;
+            methods.push(arg.clone());
         }
     }
+    let [method] = methods.as_slice() else {
+        return Err("Provide exactly one Conduit method name to call.".to_string());
+    };
     Ok(CallArgs {
         method: method.clone(),
-        params_json,
         conduit_uri,
     })
 }
@@ -96,11 +96,44 @@ fn classify(argv: &[String]) -> Action {
     }
 }
 
-fn run_call_conduit(args: &CallArgs) -> ExitCode {
-    let params: serde_json::Value = match serde_json::from_str(&args.params_json) {
+/// Read the params JSON blob from stdin (PHP `readStdin` + decode,
+/// `ArcanistCallConduitWorkflow.php:46-52`).
+fn read_params_json<R: std::io::Read>(mut reader: R) -> Result<serde_json::Value, String> {
+    let mut text = String::new();
+    reader
+        .read_to_string(&mut text)
+        .map_err(|e| format!("failed to read stdin: {e}"))?;
+    serde_json::from_str(&text)
+        .map_err(|_| "Provide method parameters on stdin as a JSON blob.".to_string())
+}
+
+/// Render the `{error, errorMessage, response}` envelope (PHP `:67-72`).
+/// Key order matches PHP: `serde_json` maps sort keys the same way.
+fn render_envelope(error: Option<(&str, &str)>, response: serde_json::Value) -> String {
+    let (code, message) = match error {
+        Some((code, info)) => (
+            serde_json::Value::String(code.to_string()),
+            serde_json::Value::String(info.to_string()),
+        ),
+        None => (serde_json::Value::Null, serde_json::Value::Null),
+    };
+    serde_json::to_string_pretty(&serde_json::json!({
+        "error": code,
+        "errorMessage": message,
+        "response": response,
+    }))
+    .unwrap_or_else(|_| "null".to_string())
+}
+
+fn run_call_conduit_with<R: std::io::Read, W: std::io::Write>(
+    args: &CallArgs,
+    stdin: R,
+    stdout: &mut W,
+) -> ExitCode {
+    let params = match read_params_json(stdin) {
         Ok(value) => value,
-        Err(e) => {
-            eprintln!("arc-rs: invalid params JSON: {e}");
+        Err(msg) => {
+            eprintln!("arc-rs: {msg}");
             return ExitCode::FAILURE;
         }
     };
@@ -111,19 +144,30 @@ fn run_call_conduit(args: &CallArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match client.call(&args.method, &params) {
-        Ok(result) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&result).unwrap_or_else(|_| "null".to_string())
-            );
-            ExitCode::SUCCESS
+    // API errors land in the envelope with exit 0, exactly like PHP
+    // (`:57-74`); transport failures stay hard errors.
+    let text = match client.call(&args.method, &params) {
+        Ok(result) => render_envelope(None, result),
+        Err(arc_rs::conduit::Error::Api { code, info }) => {
+            render_envelope(Some((&code, &info)), serde_json::Value::Null)
         }
         Err(e) => {
             eprintln!("arc-rs: {e}");
-            ExitCode::FAILURE
+            return ExitCode::FAILURE;
         }
+    };
+    // No trailing newline: PHP `echo`s the encoded blob as-is (`:67`).
+    if stdout.write_all(text.as_bytes()).is_err() {
+        eprintln!("arc-rs: failed to write output");
+        return ExitCode::FAILURE;
     }
+    ExitCode::SUCCESS
+}
+
+fn run_call_conduit(args: &CallArgs) -> ExitCode {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    run_call_conduit_with(args, stdin.lock(), &mut stdout.lock())
 }
 
 fn main() -> ExitCode {
