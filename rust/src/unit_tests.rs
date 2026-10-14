@@ -461,17 +461,16 @@ fn run_single_rejects_everything_when_unsupported() {
 fn run_single_unrunnable_engines_error_clearly() {
     let ctx = EngineContext::new(&forward_slashes(&std::env::temp_dir()));
     let runner = |_: &[String], _: &str| CapturedOutput::new(0, "", "");
-    // Phutil needs a PHP runtime; xUnit/C# need .NET toolchains plus
-    // `.arcconfig` discovery, so bare temp dirs fail with environment errors.
-    for (engine, needle) in [
-        ("PhutilUnitTestEngine", "cannot execute phutil"),
-        ("phutil", "cannot execute phutil"),
-    ] {
-        let err = run_single_with_runner(engine, &ctx, &runner).unwrap_err();
-        assert!(
-            err.message().contains(needle),
-            "{engine}: {}",
-            err.message()
+    // Phutil without a PHP interpreter fails with the clear php-absent
+    // error (forced absent, so no PATH assumption); xUnit/C# need .NET
+    // toolchains plus `.arcconfig` discovery, so bare temp dirs fail with
+    // environment errors.
+    for engine in ["PhutilUnitTestEngine", "phutil"] {
+        let err = run_single_with_php(engine, &ctx, &runner, &|| None).unwrap_err();
+        assert_eq!(
+            err.message(),
+            &format!("Engine '{engine}' requires PHP on your $PATH (php) to execute phutil tests."),
+            "{engine}"
         );
     }
     for engine in ["XUnitTestEngine", "CSharpToolsTestEngine"] {
@@ -921,12 +920,20 @@ fn git_helpers_list_status_range_and_tracked() {
     run(&["add", "a.txt"]);
     run(&["commit", "-qm", "two"]);
     assert!(uncommitted_paths(&repo).unwrap().is_empty());
-    // Range HEAD~1...HEAD touches a.txt; bogus rev errors.
+    // Range HEAD~1...HEAD touches a.txt; bogus rev errors with the PHP
+    // usage message; the magic empty tree lists every tracked file.
     assert_eq!(
         commit_range_paths(&repo, "HEAD~1").unwrap(),
         vec!["a.txt".to_string()]
     );
-    assert!(commit_range_paths(&repo, "no-such-rev-xyz").is_err());
+    assert_eq!(
+        commit_range_paths(&repo, "no-such-rev-xyz").unwrap_err(),
+        "Unable to find any git commit named 'no-such-rev-xyz' in this repository."
+    );
+    assert_eq!(
+        commit_range_paths(&repo, crate::git::GIT_MAGIC_ROOT_COMMIT).unwrap(),
+        vec!["a.txt".to_string()]
+    );
     assert_eq!(
         working_copy_paths(&repo, Some("HEAD~1")).unwrap(),
         vec!["a.txt".to_string()]
@@ -1060,7 +1067,8 @@ fn json_and_modern_dicts() {
     assert!(json.ends_with('\n'));
     let ugly = render_workflow_output(&[r], &[], "ugly", false, &root);
     assert!(ugly.contains("\"name\":\"t\""), "{ugly}");
-    assert!(ugly.ends_with('\n'));
+    // Like PHP `json_encode`, ugly carries no trailing newline.
+    assert!(!ugly.ends_with('\n'), "{ugly}");
     assert_eq!(render_workflow_output(&[], &[], "none", false, &root), "");
     assert_eq!(render_workflow_output(&[], &[], "bogus", false, &root), "");
     std::fs::remove_dir_all(&root).ok();
@@ -1204,5 +1212,656 @@ fn xunit_and_csharp_runs_cover_stages() {
         "{}",
         err.message()
     );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// --- Gap2: hg/svn selection (U1/U2) ---
+
+#[test]
+fn hg_symbol_escape_quotes_non_symbols() {
+    assert_eq!(hg_symbol_escape("abc123"), "abc123");
+    assert_eq!(hg_symbol_escape("tip"), "tip");
+    assert_eq!(hg_symbol_escape("my-branch"), "'my-branch'");
+    assert_eq!(hg_symbol_escape("a'b\\c"), "'a\\'b\\\\c'");
+    assert_eq!(hg_symbol_escape(""), "''");
+}
+
+#[test]
+fn hg_base_revsets_quote_then_raw() {
+    assert_eq!(
+        hg_base_revsets("tip"),
+        ["ancestor(tip,.)".to_string(), "ancestor(tip,.)".to_string()]
+    );
+    assert_eq!(
+        hg_base_revsets("my-branch"),
+        [
+            "ancestor('my-branch',.)".to_string(),
+            "ancestor(my-branch,.)".to_string()
+        ]
+    );
+}
+
+#[test]
+fn hg_status_paths_omits_untracked() {
+    let stdout = "M mod.py\nA add.py\nR del.py\n! gone.py\n? new.py\nC clean.py\nI ign.py\nA copy.py\n  orig.py\n";
+    assert_eq!(
+        super::hg_status_paths(stdout).unwrap(),
+        args(&[
+            "add.py", "clean.py", "copy.py", "del.py", "gone.py", "ign.py", "mod.py",
+        ])
+    );
+    assert!(super::hg_status_paths("").unwrap().is_empty());
+    assert!(super::hg_status_paths("bogus line").is_err());
+}
+
+#[test]
+fn svn_rev_is_a_usage_error() {
+    let dir = unique_dir("svn-rev");
+    std::fs::create_dir_all(&dir).unwrap();
+    // The guard fires before any binary runs: system backend, no PATH
+    // assumption.
+    let err = svn_working_copy_paths_with(&dir, &crate::svn::SvnCommand::system(), Some("123"))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        "This version control system does not support commit ranges."
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// --- Gap2: cargo extension behavior (U3) ---
+
+#[test]
+fn cargo_argv_appends_paths_as_filters() {
+    assert_eq!(cargo_test_argv(&Options::default()), args(&["test"]));
+    let opts = parse_args(&args(&["--", "--nocapture"])).unwrap();
+    assert_eq!(cargo_test_argv(&opts), args(&["test", "--nocapture"]));
+    let opts = Options {
+        paths: args(&["adds_", "other"]),
+        ..Options::default()
+    };
+    assert_eq!(cargo_test_argv(&opts), args(&["test", "adds_", "other"]));
+    let opts = parse_args(&args(&["flt", "--", "--", "--nocapture"])).unwrap();
+    assert_eq!(
+        cargo_test_argv(&opts),
+        args(&["test", "--", "--nocapture", "flt"])
+    );
+}
+
+#[test]
+fn cargo_coverage_warning_names_the_flag() {
+    assert_eq!(cargo_coverage_warning(&Options::default()), None);
+    let mut opts = Options {
+        no_coverage: true,
+        ..Options::default()
+    };
+    assert_eq!(cargo_coverage_warning(&opts), None);
+    opts.coverage = true;
+    assert_eq!(
+        cargo_coverage_warning(&opts).as_deref(),
+        Some(
+            "arc-rs unit: warning: the cargo engine does not support coverage; ignoring --coverage"
+        )
+    );
+    opts.detailed_coverage = true;
+    assert_eq!(
+        cargo_coverage_warning(&opts).as_deref(),
+        Some(
+            "arc-rs unit: warning: the cargo engine does not support coverage; ignoring --detailed-coverage"
+        )
+    );
+}
+
+// --- Gap2: documented extensions stay (U7/U8) ---
+
+#[test]
+fn unknown_engine_message_lists_every_engine() {
+    let opts = Options {
+        engine: "Nope".to_string(),
+        ..Options::default()
+    };
+    assert_eq!(
+        execute(&opts, Path::new("."), None).unwrap_err(),
+        "unknown engine 'Nope' (available engines: cargo, \
+         ArcanistConfigurationDrivenUnitTestEngine, CSharpToolsTestEngine, NoseTestEngine, \
+         PhpunitTestEngine, PhutilUnitTestEngine, PytestTestEngine, XUnitTestEngine)"
+    );
+    // Cargo stays the default selection (documented extension, not PHP's
+    // ArcanistNoEngineException).
+    let dir = unique_dir("cargo-default");
+    std::fs::create_dir_all(&dir).unwrap();
+    assert_eq!(
+        discover_selection(&Options::default(), &dir).unwrap(),
+        Selection::Cargo
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// --- Gap2: PHP byte-compatible JSON (U9) ---
+
+#[test]
+fn json_text_escapes_slashes_only_when_ugly() {
+    let result = engine_result("a/b", "pass");
+    let ugly = results_to_json_text(std::slice::from_ref(&result), false);
+    assert_eq!(
+        ugly,
+        "[{\"namespace\":null,\"name\":\"a\\/b\",\"link\":null,\"result\":\"pass\",\
+         \"duration\":null,\"extra\":null,\"userData\":null,\"coverage\":null}]"
+    );
+    let pretty = results_to_json_text(std::slice::from_ref(&result), true);
+    assert_eq!(
+        pretty,
+        "{\n  \"0\": {\n    \"namespace\": null,\n    \"name\": \"a/b\",\n    \
+         \"link\": null,\n    \"result\": \"pass\",\n    \"duration\": null,\n    \
+         \"extra\": null,\n    \"userData\": null,\n    \"coverage\": null\n  }\n}\n"
+    );
+}
+
+#[test]
+fn json_text_escapes_controls_and_unicode() {
+    let result = engine_result("q\"\\\n\r\t\u{8}\u{c}\u{1}é😀", "fail");
+    let ugly = results_to_json_text(std::slice::from_ref(&result), false);
+    assert!(
+        ugly.contains("\"name\":\"q\\\"\\\\\\n\\r\\t\\b\\f\\u0001\\u00e9\\ud83d\\ude00\""),
+        "{ugly}"
+    );
+    // Pretty escapes identically apart from slashes.
+    let pretty = results_to_json_text(std::slice::from_ref(&result), true);
+    assert!(
+        pretty.contains("\"name\": \"q\\\"\\\\\\n\\r\\t\\b\\f\\u0001\\u00e9\\ud83d\\ude00\""),
+        "{pretty}"
+    );
+}
+
+#[test]
+fn json_text_renders_nested_maps_and_lists() {
+    use std::collections::HashMap;
+    let mut one = engine_result("one", "pass");
+    one.set_coverage(HashMap::from([(
+        "src/App.cs".to_string(),
+        "CC".to_string(),
+    )]));
+    let two = engine_result("two", "fail");
+    let ugly = results_to_json_text(&[one.clone(), two.clone()], false);
+    assert!(ugly.starts_with("[{"), "{ugly}");
+    assert!(ugly.contains("},{\""), "{ugly}");
+    assert!(ugly.ends_with("}]"), "{ugly}");
+
+    let pretty = results_to_json_text(&[one, two], true);
+    assert_eq!(
+        pretty,
+        "{\n  \"0\": {\n    \"namespace\": null,\n    \"name\": \"one\",\n    \
+         \"link\": null,\n    \"result\": \"pass\",\n    \"duration\": null,\n    \
+         \"extra\": null,\n    \"userData\": null,\n    \"coverage\": {\n      \
+         \"src/App.cs\": \"CC\"\n    }\n  },\n  \"1\": {\n    \
+         \"namespace\": null,\n    \"name\": \"two\",\n    \"link\": null,\n    \
+         \"result\": \"fail\",\n    \"duration\": null,\n    \"extra\": null,\n    \
+         \"userData\": null,\n    \"coverage\": null\n  }\n}\n"
+    );
+}
+
+#[test]
+fn json_text_orders_keys_and_renders_empty_maps() {
+    use std::collections::HashMap;
+    let mut r = engine_result("t", "pass");
+    r.set_duration(2.0);
+    r.set_extra_data(HashMap::new());
+    r.set_coverage(HashMap::from([
+        ("b.php".to_string(), "U".to_string()),
+        ("a.php".to_string(), "C".to_string()),
+    ]));
+    let ugly = results_to_json_text(std::slice::from_ref(&r), false);
+    assert!(ugly.contains("\"duration\":2.0"), "{ugly}");
+    assert!(ugly.contains("\"extra\":[]"), "{ugly}");
+    assert!(
+        ugly.contains("\"coverage\":{\"a.php\":\"C\",\"b.php\":\"U\"}"),
+        "{ugly}"
+    );
+    let mut last = 0;
+    for key in [
+        "namespace",
+        "name",
+        "link",
+        "result",
+        "duration",
+        "extra",
+        "userData",
+        "coverage",
+    ] {
+        let at = ugly.find(&format!("\"{key}\"")).unwrap();
+        assert!(at > last, "{ugly}");
+        last = at;
+    }
+    let mut short = engine_result("t", "pass");
+    short.set_duration(0.125);
+    let ugly = results_to_json_text(std::slice::from_ref(&short), false);
+    assert!(ugly.contains("\"duration\":0.125"), "{ugly}");
+
+    assert_eq!(results_to_json_text(&[], false), "[]");
+    assert_eq!(results_to_json_text(&[], true), "{}\n");
+}
+
+// --- Gap2: cscover flow (U4) plus full Ok-path runs (U10) ---
+
+const ASSEMBLY_XML: &str = "<assembly>\
+    <test name=\"A.T1\" time=\"0.5\" result=\"Pass\"/>\
+    <test name=\"A.T2\" time=\"0.25\" result=\"Fail\"/>\
+    </assembly>";
+
+fn csharp_cover_xml(root_s: &str) -> String {
+    format!(
+        "<coverage>\
+        <instrumented file=\"{root_s}/src/App.cs\" start=\"1\" end=\"4\"/>\
+        <executed file=\"{root_s}/src/App.cs\" start=\"1\" end=\"2\"/>\
+        </coverage>"
+    )
+}
+
+fn fake_xunit_plan(root_s: &str, assembly: &str) -> XunitPlan {
+    XunitPlan {
+        env: crate::unit_xunit::XunitEnvironment {
+            build_engine: "fake-msbuild".to_string(),
+            runtime_engine: String::new(),
+            test_engine: "fake-xunit".to_string(),
+            project_root: root_s.to_string(),
+            discovery_rules: Vec::new(),
+        },
+        projects: vec![crate::unit_xunit::TestProject {
+            project: format!("{root_s}/A.Tests.csproj"),
+            assembly: assembly.to_string(),
+        }],
+        is_windows: false,
+    }
+}
+
+fn staged_leftovers(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn csharp_cover_run_wraps_xunit_and_reads_coverage() {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    let root = unique_dir("csharp-cover");
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("App.Tests.dll"), "dll").unwrap();
+    std::fs::write(bin.join("Dep.dll"), "dll").unwrap();
+    std::fs::write(bin.join("Skip.dll"), "dll").unwrap();
+    std::fs::write(bin.join("readme.txt"), "txt").unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src").join("App.cs"), "one\ntwo\nthree\nfour\n").unwrap();
+    let root_s = forward_slashes(&root);
+    let bindir = format!("{root_s}/bin");
+    let assembly = format!("{bindir}/App.Tests.dll");
+    let plan = fake_xunit_plan(&root_s, &assembly);
+    let cover = super::CsharpCover {
+        cover_engine: "fake-cscover".to_string(),
+        match_regex: None,
+        excluded: Some(HashMap::from([("Skip.dll".to_string(), "1".to_string())])),
+    };
+
+    let cover_xml = csharp_cover_xml(&root_s);
+    let seen = RefCell::new(Vec::new());
+    let runner = |argv: &[String], _cwd: &str| {
+        seen.borrow_mut().push(argv.to_vec());
+        let o = argv.iter().position(|a| a == "-o").unwrap();
+        std::fs::write(&argv[o + 1], &cover_xml).unwrap();
+        let xml = argv
+            .iter()
+            .position(|a| a == "/xml")
+            .map(|i| &argv[i + 1])
+            .unwrap();
+        let w = argv.iter().position(|a| a == "-w").unwrap();
+        std::fs::write(format!("{}/{xml}", argv[w + 1]), ASSEMBLY_XML).unwrap();
+        CapturedOutput::new(0, "", "")
+    };
+    let results = super::run_csharp_test(&plan, Some(&cover), None, &runner).unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].get_name(), "A.T1");
+    assert_eq!(results[0].get_result(), "pass");
+    assert_eq!(results[1].get_result(), "fail");
+    assert_eq!(
+        results[0]
+            .get_coverage()
+            .unwrap()
+            .get("src/App.cs")
+            .unwrap(),
+        "CCUU"
+    );
+
+    // Full cscover argv: cover first (empty runtime omitted), then
+    // -o/-c/-a/-w plus the instrumented assemblies (Skip.dll excluded,
+    // readme.txt not an assembly).
+    let calls = seen.borrow();
+    assert_eq!(calls.len(), 1);
+    let argv = &calls[0];
+    assert_eq!(argv.len(), 13);
+    assert_eq!(argv[0], "fake-cscover");
+    assert_eq!(argv[1], "-o");
+    assert!(
+        argv[2].starts_with(&root_s) && argv[2].ends_with(".xml"),
+        "{}",
+        argv[2]
+    );
+    assert_eq!(argv[3], "-c");
+    assert_eq!(argv[4], "fake-xunit");
+    assert_eq!(argv[5], "-a");
+    assert_eq!(argv[6], assembly);
+    assert_eq!(argv[7], "/xml");
+    assert!(argv[8].ends_with(".results.xml"), "{}", argv[8]);
+    assert_eq!(argv[9], "-w");
+    assert_eq!(argv[10], bindir);
+    assert_eq!(argv[11], format!("{bindir}/App.Tests.dll"));
+    assert_eq!(argv[12], format!("{bindir}/Dep.dll"));
+
+    // Staged reports are removed after parsing.
+    assert!(
+        staged_leftovers(&root)
+            .iter()
+            .all(|n| !n.starts_with(".cscover-"))
+    );
+    assert!(
+        staged_leftovers(&bin)
+            .iter()
+            .all(|n| !n.ends_with(".results.xml"))
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn csharp_plain_fallback_skips_cscover() {
+    let root = unique_dir("csharp-plain");
+    std::fs::create_dir_all(&root).unwrap();
+    let root_s = forward_slashes(&root);
+    let assembly = format!("{root_s}/bin/App.Tests.dll");
+    let plan = fake_xunit_plan(&root_s, &assembly);
+    let runner = |argv: &[String], _cwd: &str| {
+        assert!(!argv.contains(&"-o".to_string()), "{argv:?}");
+        let at = argv.iter().position(|a| a == "/xml").unwrap();
+        std::fs::write(format!("{root_s}/{}", argv[at + 1]), ASSEMBLY_XML).unwrap();
+        CapturedOutput::new(0, "", "")
+    };
+    // Coverage disabled: no cover engine, plain xUnit reports under the
+    // project root, no coverage attached.
+    let results = super::run_csharp_test(&plan, None, Some(false), &runner).unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(results[0].get_coverage().is_none());
+    assert_eq!(staged_leftovers(&root).len(), 0);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn csharp_missing_reports_contribute_nothing() {
+    use std::collections::HashMap;
+
+    let root = unique_dir("csharp-missing");
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("App.Tests.dll"), "dll").unwrap();
+    let root_s = forward_slashes(&root);
+    let assembly = format!("{root_s}/bin/App.Tests.dll");
+    let plan = fake_xunit_plan(&root_s, &assembly);
+    let cover = super::CsharpCover {
+        cover_engine: "fake-cscover".to_string(),
+        match_regex: None,
+        excluded: Some(HashMap::new()),
+    };
+    // The runner writes nothing (Mono segfault tolerance): no results,
+    // and the staged cover file is still removed.
+    let runner = |_: &[String], _: &str| CapturedOutput::new(0, "", "");
+    let results = super::run_csharp_test(&plan, Some(&cover), None, &runner).unwrap();
+    assert!(results.is_empty());
+    assert!(
+        staged_leftovers(&root)
+            .iter()
+            .all(|n| !n.starts_with(".cscover-"))
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn csharp_cover_config_loads_and_errors() {
+    let root = unique_dir("csharp-cfg");
+    std::fs::create_dir_all(root.join("tools")).unwrap();
+    std::fs::write(root.join("tools").join("cscover.exe"), "x").unwrap();
+    let root_s = forward_slashes(&root);
+    let ctx = EngineContext {
+        project_root: root_s.clone(),
+        paths: Vec::new(),
+        enable_coverage: None,
+        run_all_tests: false,
+    };
+    std::fs::write(
+        root.join(".arcconfig"),
+        r#"{"unit.csharp.cscover.binary": "tools/cscover.exe",
+            "unit.csharp.coverage.match": "App",
+            "unit.csharp.coverage.excluded": {"Skip.dll": "1"}}"#,
+    )
+    .unwrap();
+    let cover = super::load_csharp_cover(&ctx).unwrap().unwrap();
+    assert!(
+        cover.cover_engine.ends_with("tools/cscover.exe"),
+        "{}",
+        cover.cover_engine
+    );
+    assert_eq!(cover.match_regex.as_deref(), Some("App"));
+    assert!(cover.excluded.unwrap().contains_key("Skip.dll"));
+
+    let off = EngineContext {
+        enable_coverage: Some(false),
+        ..ctx.clone()
+    };
+    assert!(super::load_csharp_cover(&off).unwrap().is_none());
+
+    std::fs::write(root.join(".arcconfig"), "{}").unwrap();
+    let err = super::load_csharp_cover(&ctx).unwrap_err();
+    assert!(
+        err.message().contains("unit.csharp.coverage.binary"),
+        "{}",
+        err.message()
+    );
+
+    std::fs::write(
+        root.join(".arcconfig"),
+        r#"{"unit.csharp.cscover.binary": "nope.exe"}"#,
+    )
+    .unwrap();
+    let err = super::load_csharp_cover(&ctx).unwrap_err();
+    assert!(
+        err.message().contains("have you built yet"),
+        "{}",
+        err.message()
+    );
+
+    assert!(super::parse_excluded_files(&serde_json::json!(["a"])).is_none());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn xunit_plan_runs_stages_with_fakes() {
+    let root = unique_dir("xunit-plan");
+    std::fs::create_dir_all(&root).unwrap();
+    let root_s = forward_slashes(&root);
+    let assembly = format!("{root_s}/bin/A.Tests.dll");
+    let plan = fake_xunit_plan(&root_s, &assembly);
+    let runner = |argv: &[String], _cwd: &str| {
+        if argv[0] == "fake-xunit" {
+            let at = argv.iter().position(|a| a == "/xml").unwrap();
+            std::fs::write(
+                format!("{root_s}/{}", argv[at + 1]),
+                "<assembly><test name=\"A.T1\" time=\"0.5\" result=\"Pass\"/>\
+                 <test name=\"A.T2\" time=\"0\" result=\"Skip\"/></assembly>",
+            )
+            .unwrap();
+        }
+        CapturedOutput::new(0, "", "")
+    };
+    // No Build dir: empty generate, passing build, two parsed tests.
+    let results = super::run_xunit_plan(&plan, &runner).unwrap();
+    assert_eq!(results.len(), 3);
+    assert_eq!(
+        results[0].get_name(),
+        format!("(build) {root_s}/A.Tests.csproj")
+    );
+    assert_eq!(results[0].get_result(), "pass");
+    assert_eq!(results[1].get_name(), "A.T1");
+    assert_eq!(results[2].get_result(), "skip");
+    assert_eq!(staged_leftovers(&root).len(), 0);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn phutil_run_parses_canned_output_and_cleans_up() {
+    use std::cell::RefCell;
+
+    let root = unique_dir("phutil-run");
+    std::fs::create_dir_all(&root).unwrap();
+    let root_s = forward_slashes(&root);
+    let ctx = EngineContext {
+        project_root: root_s.clone(),
+        paths: vec!["a.php".to_string()],
+        enable_coverage: None,
+        run_all_tests: false,
+    };
+    let seen = RefCell::new(Vec::new());
+    let runner = |argv: &[String], cwd: &str| {
+        seen.borrow_mut().push((argv.to_vec(), cwd.to_string()));
+        assert_eq!(argv[0], "fake-php");
+        assert!(argv[1].ends_with(".php") && Path::new(&argv[1]).exists());
+        let input_text = std::fs::read_to_string(&argv[2]).unwrap();
+        let input: serde_json::Value = serde_json::from_str(&input_text).unwrap();
+        assert_eq!(
+            input["projectRoot"],
+            serde_json::Value::String(root_s.clone())
+        );
+        assert_eq!(input["paths"], serde_json::json!(["a.php"]));
+        assert!(input["enableCoverage"].is_null());
+        std::fs::write(
+            &argv[3],
+            r#"{"results": [{"name": "t", "result": "pass", "duration": 1.5}]}"#,
+        )
+        .unwrap();
+        CapturedOutput::new(0, "", "")
+    };
+    let results = run_single_with_php("phutil", &ctx, &runner, &|| {
+        Some(vec!["fake-php".to_string()])
+    })
+    .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get_result(), "pass");
+    assert_eq!(results[0].get_duration(), Some(1.5));
+    let calls = seen.borrow();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0.len(), 4);
+    assert_eq!(calls[0].1, root_s);
+    assert!(
+        calls[0].0[2].contains(".arc-unit-phutil-input-"),
+        "{:?}",
+        calls[0].0
+    );
+    assert_eq!(staged_leftovers(&root).len(), 0);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn phutil_run_maps_driver_failures() {
+    let root = unique_dir("phutil-fail");
+    std::fs::create_dir_all(&root).unwrap();
+    let root_s = forward_slashes(&root);
+    let ctx = EngineContext {
+        project_root: root_s,
+        paths: Vec::new(),
+        enable_coverage: Some(false),
+        run_all_tests: true,
+    };
+    let php = || Some(vec!["fake-php".to_string()]);
+    macro_rules! run {
+        ($runner:expr) => {
+            run_single_with_php("PhutilUnitTestEngine", &ctx, &$runner, &php).unwrap_err()
+        };
+    }
+    let err = run!(|_: &[String], _: &str| CapturedOutput::new(3, "out", "bad thing"));
+    assert_eq!(err.message(), "phutil driver failed: bad thing");
+    let err = run!(|_: &[String], _: &str| CapturedOutput::new(3, "out only", ""));
+    assert_eq!(err.message(), "phutil driver failed: out only");
+    let err = run!(|_: &[String], _: &str| CapturedOutput::new(3, "", ""));
+    assert_eq!(err.message(), "phutil driver failed with exit code 3");
+    let err = run!(|_: &[String], _: &str| CapturedOutput::new(0, "", ""));
+    assert!(err.message().contains("did not write"), "{}", err.message());
+    let err = run!(|argv: &[String], _: &str| {
+        std::fs::write(&argv[3], r#"{"error": "no init"}"#).unwrap();
+        CapturedOutput::new(0, "", "")
+    });
+    assert!(matches!(err, crate::unit_engine::EngineError::Usage(_)));
+    assert_eq!(err.message(), "no init");
+    let err = run!(|argv: &[String], _: &str| {
+        std::fs::write(&argv[3], r#"{"results": []}"#).unwrap();
+        CapturedOutput::new(0, "", "")
+    });
+    assert!(err.is_no_effect());
+    assert_eq!(staged_leftovers(&root).len(), 0);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn assembly_parent_dir_falls_back_to_root() {
+    assert_eq!(super::assembly_parent_dir("/r/bin/App.dll", "/r"), "/r/bin");
+    assert_eq!(super::assembly_parent_dir("App.dll", "/r"), "/r");
+}
+
+#[test]
+fn default_php_prefix_matches_path_probe() {
+    assert_eq!(
+        super::resolve_php_prefix(),
+        crate::unit_phutil::php_argv_prefix()
+    );
+}
+
+#[test]
+fn single_php_seam_rejects_unknown_engines() {
+    let ctx = EngineContext::new(&forward_slashes(&std::env::temp_dir()));
+    let runner = |_: &[String], _: &str| CapturedOutput::new(0, "", "");
+    let err = run_single_with_php("Bogus", &ctx, &runner, &|| None).unwrap_err();
+    assert!(
+        err.message().contains("unknown engine 'Bogus'"),
+        "{}",
+        err.message()
+    );
+}
+
+#[test]
+fn single_wrapper_matches_php_seam_for_non_phutil() {
+    let root = unique_dir("wrap-parity");
+    std::fs::create_dir_all(root.join("pkg")).unwrap();
+    std::fs::create_dir_all(root.join("tests").join("pkg")).unwrap();
+    std::fs::write(root.join("pkg").join("mod.py"), "x\n").unwrap();
+    std::fs::write(root.join("tests").join("pkg").join("test_mod.py"), "t\n").unwrap();
+    let ctx = EngineContext {
+        project_root: forward_slashes(&root),
+        paths: vec!["pkg/mod.py".to_string()],
+        enable_coverage: Some(false),
+        run_all_tests: false,
+    };
+    let runner = |argv: &[String], _cwd: &str| {
+        let xunit = argv
+            .iter()
+            .find(|a| a.starts_with("--xunit-file="))
+            .unwrap();
+        std::fs::write(xunit.trim_start_matches("--xunit-file="), CANNED_XUNIT).unwrap();
+        CapturedOutput::new(1, "", "")
+    };
+    // The php resolver is unused outside the phutil arm.
+    let plain = run_single_with_runner("NoseTestEngine", &ctx, &runner).unwrap();
+    let seamed = run_single_with_php("NoseTestEngine", &ctx, &runner, &|| None).unwrap();
+    assert_eq!(plain, seamed);
     std::fs::remove_dir_all(&root).ok();
 }

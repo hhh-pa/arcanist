@@ -10,19 +10,36 @@
 //! Divergences from PHP (each cites the PHP line it relaxes):
 //! - Test execution itself is in-process PHP (`newv($test_class)` plus
 //!   `willRunTestCases`/`run`/`didRunTestCases` hooks, lines 45-77) with
-//!   XDebug coverage; no equivalent exists here, so this port selects test
-//!   classes and resolves coverage only. The caller runs tests by other means.
+//!   XDebug coverage. This port shells out to the user's `php` binary
+//!   (like anoid's `python3`) running a staged driver script that mirrors
+//!   selection plus execution; see [`phutil_driver_source`].
 //! - `getAllTests`/`getTestsForPaths` use `PhutilSymbolLoader` (lines 83-87,
-//!   136-142); here the caller supplies symbol names and this port applies
-//!   the same `__tests__` and working-copy filters.
+//!   136-142); the selection helpers below take caller-supplied symbols and
+//!   apply the same `__tests__` and working-copy filters, while the staged
+//!   driver uses the real symbol loader in-process.
 //! - Library roots/names come from caller-supplied callbacks instead of
 //!   `phutil_get_library_root_for_path` / `phutil_get_library_name_for_root`
 //!   (lines 162-168).
+//! - The driver cannot build arc's `WorkingCopy` object out-of-process, so
+//!   per-test links and XDebug coverage maps (which need the project root
+//!   via `getWorkingCopy()`) are unavailable unless the init script loads
+//!   arc's PHP: forced `--coverage` without it is a clear error, and the
+//!   default run proceeds uncovered.
+//!
+//! Out-of-process protocol: the driver reads a JSON input file
+//! ([`PhutilRunInput`]), writes `{"results": [<toDictionary>...]}` or
+//! `{"error": "..."}` to a JSON output file, and exits 0 whenever it wrote
+//! output. The input's `initScript` (`.arcconfig`
+//! [`INIT_SCRIPT_KEY`]) is a PHP file that loads the project's libraries;
+//! without it the driver reports an error instead of running.
 
 extern crate self as arc_rs;
 
-use arc_rs::unit_engine::EngineError;
+use arc_rs::unit_engine::{
+    EngineError, RESULT_BROKEN, RESULT_FAIL, RESULT_PASS, RESULT_SKIP, RESULT_UNSOUND, UnitResult,
+};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// `getEngineConfigurationName` (lines 8-10) returns `'phutil'`.
 pub const ENGINE_CONFIGURATION_NAME: &str = "phutil";
@@ -236,6 +253,337 @@ fn readable_path(path: &str, root: &str) -> String {
 fn is_descendant(path: &str, root: &str) -> bool {
     let base = root.trim_end_matches('/');
     path == base || path.starts_with(&format!("{base}/"))
+}
+
+/// PHP interpreter binary name, resolved on the user's `PATH`.
+pub const PHP_BINARY: &str = "php";
+
+/// `.arcconfig` key for the PHP bootstrap file (project-relative or
+/// absolute) that loads the project's libraries before tests run.
+/// (Rust extension: PHP runs in-process, already bootstrapped.)
+pub const INIT_SCRIPT_KEY: &str = "unit.phutil.init-script";
+
+/// Candidate interpreter names (mirrors anoid: stock installs call it
+/// `php` on every platform; the `.exe` probe handles Windows suffixes).
+fn php_candidates() -> &'static [&'static str] {
+    &[PHP_BINARY]
+}
+
+/// Locate a PHP interpreter on the real `$PATH` (anoid's
+/// `python3_on_path` pattern: `find_on_path` per candidate).
+#[must_use]
+pub fn php_on_path() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    php_candidates()
+        .iter()
+        .find_map(|binary| arc_rs::anoid::find_on_path(&path, binary))
+}
+
+/// Default `php` invocation prefix: the resolved interpreter path, if any.
+#[must_use]
+pub fn php_argv_prefix() -> Option<Vec<String>> {
+    php_on_path().map(|path| vec![path.to_string_lossy().into_owned()])
+}
+
+/// Clear error when no `php` is available (the php-absent path is correct:
+/// phutil tests cannot run without an interpreter).
+#[must_use]
+pub fn missing_php_message(engine: &str) -> String {
+    format!("Engine '{engine}' requires PHP on your $PATH (php) to execute phutil tests.")
+}
+
+/// Input for one phutil driver run, serialized to the staged input file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhutilRunInput {
+    /// Project root (selection scope and relative-path base).
+    pub project_root: String,
+    /// Enumerate every test (`getAllTests`) instead of path-derived ones.
+    pub run_all_tests: bool,
+    /// Workflow-selected paths (empty under `--everything`).
+    pub paths: Vec<String>,
+    /// Coverage flag (`None` is the default, like PHP's `null`).
+    pub enable_coverage: Option<bool>,
+    /// Init script from [INIT_SCRIPT_KEY], if configured.
+    pub init_script: Option<String>,
+}
+
+/// Serialize one driver input to JSON.
+#[must_use]
+pub fn phutil_input_json(input: &PhutilRunInput) -> String {
+    serde_json::json!({
+        "projectRoot": input.project_root,
+        "runAllTests": input.run_all_tests,
+        "paths": input.paths,
+        "enableCoverage": input.enable_coverage,
+        "initScript": input.init_script,
+    })
+    .to_string()
+}
+
+/// Driver argv: `php <driver> <input-json> <output-json>`.
+#[must_use]
+pub fn build_php_argv(
+    php_prefix: &[String],
+    driver: &str,
+    input: &str,
+    output: &str,
+) -> Vec<String> {
+    let mut argv = php_prefix.to_vec();
+    argv.push(driver.to_string());
+    argv.push(input.to_string());
+    argv.push(output.to_string());
+    argv
+}
+
+/// True for the five known result codes (anything else is driver-output
+/// corruption, since the driver only emits `toDictionary` codes).
+#[must_use]
+pub fn is_known_result_code(code: &str) -> bool {
+    matches!(
+        code,
+        RESULT_PASS | RESULT_FAIL | RESULT_SKIP | RESULT_BROKEN | RESULT_UNSOUND
+    )
+}
+
+/// Fetch an optional string field from a driver result object.
+fn result_string_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    value.get(key)?.as_str().map(str::to_string)
+}
+
+/// Fetch an optional string-map field from a driver result object.
+/// Non-string values become empty (only keys matter downstream).
+fn result_map_field(value: &serde_json::Value, key: &str) -> Option<HashMap<String, String>> {
+    let obj = value.get(key)?.as_object()?;
+    Some(
+        obj.iter()
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+            .collect(),
+    )
+}
+
+/// Parse one driver result object (`toDictionary` shape) into a result.
+fn parse_phutil_result(value: &serde_json::Value) -> Result<UnitResult, EngineError> {
+    let name = result_string_field(value, "name").ok_or_else(|| {
+        EngineError::Failed("phutil driver result is missing its 'name'.".to_string())
+    })?;
+    let code = result_string_field(value, "result").ok_or_else(|| {
+        EngineError::Failed("phutil driver result is missing its 'result'.".to_string())
+    })?;
+    if !is_known_result_code(&code) {
+        return Err(EngineError::Failed(format!(
+            "phutil driver reported unknown result code '{code}'."
+        )));
+    }
+    let mut result = UnitResult::new();
+    result.set_name(&name).map_err(EngineError::Failed)?;
+    result.set_result(&code);
+    if let Some(namespace) = result_string_field(value, "namespace") {
+        result.set_namespace(&namespace);
+    }
+    if let Some(link) = result_string_field(value, "link") {
+        result.set_link(&link);
+    }
+    if let Some(duration) = value.get("duration").and_then(|v| v.as_f64()) {
+        result.set_duration(duration);
+    }
+    if let Some(user_data) = result_string_field(value, "userData") {
+        result.set_user_data(&user_data);
+    }
+    if let Some(coverage) = result_map_field(value, "coverage") {
+        result.set_coverage(coverage);
+    }
+    Ok(result)
+}
+
+/// Parse driver output JSON into results: `{"results": [...]}` yields
+/// results (empty yields `No tests to run.`, like an empty class
+/// selection), `{"error": "..."}` yields the driver's usage error.
+pub fn parse_phutil_output(text: &str, output_file: &str) -> Result<Vec<UnitResult>, EngineError> {
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|e| {
+        EngineError::Failed(format!("cannot parse phutil output '{output_file}': {e}"))
+    })?;
+    if let Some(error) = result_string_field(&value, "error") {
+        return Err(EngineError::Usage(error));
+    }
+    let Some(items) = value.get("results").and_then(|v| v.as_array()) else {
+        return Err(EngineError::Failed(format!(
+            "phutil output '{output_file}' has neither 'results' nor 'error'."
+        )));
+    };
+    if items.is_empty() {
+        return Err(EngineError::no_effect());
+    }
+    items.iter().map(parse_phutil_result).collect()
+}
+
+/// The staged driver script: enumerate and run libphutil test cases
+/// out-of-process, reporting JSON. Usage: `php <driver> <input.json>
+/// <output.json>`. Mirrors `PhutilUnitTestEngine::run` (selection lines
+/// 16-25, coverage gate lines 27-43, execution lines 45-77) with
+/// libphutil primitives; the init script must load libphutil first.
+#[must_use]
+pub fn phutil_driver_source() -> &'static str {
+    r#"<?php
+// arc-rs phutil unit driver: enumerate and run libphutil test cases
+// out-of-process, reporting JSON results.
+// Usage: php <driver> <input.json> <output.json>
+// Input keys: projectRoot, runAllTests, paths, enableCoverage
+// (bool|null), initScript (string|null).
+$input_file = $argv[1];
+$output_file = $argv[2];
+$input = json_decode(@file_get_contents($input_file), true);
+if (!is_array($input)) {
+  fwrite(STDERR, "phutil driver: cannot read input '{$input_file}'.\n");
+  exit(1);
+}
+$emit = function ($data) use ($output_file) {
+  file_put_contents($output_file, json_encode($data));
+};
+$root = $input['projectRoot'];
+$init = isset($input['initScript']) ? $input['initScript'] : null;
+if ($init === null || !strlen($init)) {
+  $emit(array(
+    'error' => "Cannot run phutil tests: no init script configured (set ".
+      "'unit.phutil.init-script' in .arcconfig to a PHP file that loads ".
+      "your project's libraries).",
+  ));
+  exit(0);
+}
+if ($init[0] !== '/' && !preg_match('/^[A-Za-z]:[\\\\\\/]/', $init)) {
+  $init = $root.'/'.$init;
+}
+if (!file_exists($init)) {
+  $emit(array('error' => "Phutil init script was not found in {$init}"));
+  exit(0);
+}
+require_once $init;
+$coverage = array_key_exists('enableCoverage', $input)
+  ? $input['enableCoverage']
+  : null;
+if ($coverage !== false) {
+  if (!function_exists('xdebug_start_code_coverage')) {
+    if ($coverage === true) {
+      $emit(array('error' => 'You specified --coverage but XDebug is not '.
+        'available, so coverage can not be enabled for '.
+        'PhutilUnitTestEngine.'));
+      exit(0);
+    }
+  } else if (!class_exists('ArcanistWorkingCopyIdentity')) {
+    // Out-of-process runs cannot build arc's WorkingCopy object, which
+    // coverage maps need for the project root: refuse forced coverage,
+    // and run uncovered by default.
+    if ($coverage === true) {
+      $emit(array('error' => 'Coverage for PhutilUnitTestEngine requires '.
+        'an Arcanist working copy, which is unavailable when arc-rs runs '.
+        'phutil tests out-of-process; run without --coverage.'));
+      exit(0);
+    }
+    $coverage = false;
+  } else {
+    $coverage = true;
+  }
+}
+$classes = array();
+if (!empty($input['runAllTests'])) {
+  $symbols = id(new PhutilSymbolLoader())
+    ->setType('class')
+    ->setAncestorClass('PhutilTestCase')
+    ->setConcreteOnly(true)
+    ->selectSymbolsWithoutLoading();
+  foreach ($symbols as $symbol) {
+    if (!preg_match('@(?:^|/)__tests__/@', $symbol['where'])) {
+      continue;
+    }
+    $lib_root = phutil_get_library_root($symbol['library']);
+    if (!Filesystem::isDescendant($lib_root, $root)) {
+      continue;
+    }
+    $classes[$symbol['name']] = true;
+  }
+} else {
+  $look = array();
+  foreach ($input['paths'] as $path) {
+    $lib_root = phutil_get_library_root_for_path($path);
+    if (!$lib_root) {
+      continue;
+    }
+    $lib_name = phutil_get_library_name_for_root($lib_root);
+    if (!$lib_name) {
+      $emit(array('error' => "Attempting to run unit tests on a library ".
+        "which has not been loaded, at:\n\n    {$lib_root}\n\nMake sure ".
+        "this library is configured to load.\n\n(In rare cases, this may ".
+        "be because you are attempting to run one copy of this software ".
+        "against a different copy of this software. This operation is not ".
+        "supported.)"));
+      exit(0);
+    }
+    $resolved = Filesystem::resolvePath($path, $root);
+    if (!Filesystem::isDescendant($resolved, $lib_root)) {
+      continue;
+    }
+    $lib_path = Filesystem::readablePath($resolved, $lib_root);
+    if (is_file($resolved) &&
+        preg_match('@(?:^|/)__tests__/@', $resolved)) {
+      $look[$lib_name.':'.$lib_path] = array(
+        'library' => $lib_name,
+        'path' => $lib_path,
+      );
+      continue;
+    }
+    foreach (Filesystem::walkToRoot($resolved, $lib_root) as $sub) {
+      if ($sub == $lib_root) {
+        $look[$lib_name.':.'] = array(
+          'library' => $lib_name,
+          'path' => '__tests__/',
+        );
+      } else {
+        $sub_path = Filesystem::readablePath($sub, $lib_root);
+        $look[$lib_name.':'.$sub_path] = array(
+          'library' => $lib_name,
+          'path' => $sub_path.'/__tests__/',
+        );
+      }
+    }
+  }
+  foreach ($look as $info) {
+    $symbols = id(new PhutilSymbolLoader())
+      ->setType('class')
+      ->setLibrary($info['library'])
+      ->setPathPrefix($info['path'])
+      ->setAncestorClass('PhutilTestCase')
+      ->setConcreteOnly(true)
+      ->selectAndLoadSymbols();
+    foreach ($symbols as $symbol) {
+      $classes[$symbol['name']] = true;
+    }
+  }
+}
+$cases = array();
+foreach (array_keys($classes) as $class) {
+  $case = newv($class, array());
+  $case->setEnableCoverage($coverage);
+  if (!empty($input['paths'])) {
+    $case->setPaths($input['paths']);
+  }
+  $cases[] = $case;
+}
+foreach ($cases as $case) {
+  $case->willRunTestCases($cases);
+}
+$results = array();
+foreach ($cases as $case) {
+  $results[] = $case->run();
+}
+$results = array_mergev($results);
+foreach ($cases as $case) {
+  $case->didRunTestCases($cases);
+}
+$dicts = array();
+foreach ($results as $result) {
+  $dicts[] = $result->toDictionary();
+}
+$emit(array('results' => array_values($dicts)));
+"#
 }
 
 #[cfg(test)]

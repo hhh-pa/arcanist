@@ -3,7 +3,11 @@
 use std::path::{Path, PathBuf};
 
 use arc_rs::unit::{self, Options, find_crate_root_from};
-use arc_rs::unit_engine::{CapturedOutput, EngineContext, UnitResult as EngineUnitResult};
+use arc_rs::unit_engine::{self, CapturedOutput, EngineContext, UnitResult as EngineUnitResult};
+
+mod common;
+
+use common::with_owned_home;
 
 /// Copy the `sample` fixture crate to a unique temp dir and return its root.
 /// Each test gets its own copy so parallel runs never share cargo state.
@@ -281,16 +285,21 @@ fn config_phutil_run_errors_clearly_and_badtype_rejected() {
     };
     assert_eq!(engines[0].engine_type, "phutil");
     let runner = |_: &[String], _: &str| CapturedOutput::new(0, "", "");
-    let err = unit::run_config_with_runner(
+    // Forced php-absent (no PATH assumption): the clear php-absent error.
+    let err = unit::run_config_with_php(
         &engines,
         &forward_slashes(&dir),
         &[],
         false,
         Some(false),
         &runner,
+        &|| None,
     )
     .unwrap_err();
-    assert!(err.contains("cannot execute phutil"), "{err}");
+    assert!(
+        err.contains("requires PHP on your $PATH (php) to execute phutil tests"),
+        "{err}"
+    );
 
     std::fs::copy(
         wire_unit_fixture("arcunit_badtype.json"),
@@ -365,4 +374,205 @@ fn render_per_test_lines_through_wired_lib() {
     assert_eq!(unit::format_time(61.0), "1m01s");
     assert!(unit::supports_run_all_tests("NoseTestEngine"));
     assert!(!unit::supports_run_all_tests("PhpunitTestEngine"));
+}
+
+// --- gap2: cargo filters (U3) ------------------------------------------------
+
+#[test]
+fn cargo_honors_paths_as_filters() {
+    let root = fixture_copy("filter-paths");
+    let target = root.join("target");
+    // Positional paths become `cargo test` filters (cargo extension).
+    let opts = unit::parse_args(&args(&["deliberately_fails"])).unwrap();
+    let report = unit::execute(&opts, &root, Some(&target)).unwrap();
+    assert!(!report.success);
+    let opts = unit::parse_args(&args(&["adds_positive_numbers"])).unwrap();
+    let report = unit::execute(&opts, &root, Some(&target)).unwrap();
+    assert!(report.success);
+    assert_eq!((report.passed, report.failed), (1, 0));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// --- gap2: Harbormaster upload over a mock conduit server (U6) ---------------
+
+/// Serve one request with a canned Conduit response; returns the base URI
+/// and the received (request line, body).
+fn serve_once(canned: &'static str) -> (String, std::sync::mpsc::Receiver<(String, String)>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            use std::io::Read;
+            if stream.read(&mut byte).unwrap() == 0 {
+                break;
+            }
+            head.push(byte[0]);
+        }
+        let head_text = String::from_utf8_lossy(&head).into_owned();
+        let len = head_text
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        let mut body = vec![0u8; len];
+        {
+            use std::io::Read;
+            stream.read_exact(&mut body).unwrap();
+        }
+        let request_line = head_text.lines().next().unwrap_or("").to_string();
+        tx.send((request_line, String::from_utf8(body).unwrap()))
+            .unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            canned.len(),
+            canned
+        );
+        use std::io::Write;
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    (base, rx)
+}
+
+/// Write an `.arcrc` for `base` (a `serve_once` URI) under a fresh home
+/// dir, and install the home override. Returns the override guard.
+fn arcrc_for(base: &str, name: &str) -> common::HomeGuard {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "arc-rs-unit-upload-home-{name}-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let uri = base.trim_end_matches('/');
+    let doc = serde_json::json!({
+        "hosts": {
+            format!("{uri}/api/"): {"token": "unit-upload-token"},
+        },
+    });
+    std::fs::write(dir.join(".arcrc"), serde_json::to_string(&doc).unwrap()).unwrap();
+    with_owned_home(dir)
+}
+
+/// Decode one `application/x-www-form-urlencoded` value (`+` and `%XX`).
+fn form_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                out.push(u8::from_str_radix(&value[i + 1..i + 3], 16).unwrap());
+                i += 3;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap()
+}
+
+/// Extract and decode the `params` form field from a conduit request body.
+fn conduit_params(body: &str) -> serde_json::Value {
+    let encoded = body
+        .strip_prefix("params=")
+        .unwrap()
+        .split('&')
+        .next()
+        .unwrap();
+    serde_json::from_str(&form_decode(encoded)).unwrap()
+}
+
+fn upload_result(name: &str, code: &str, user_data: Option<&str>) -> EngineUnitResult {
+    let mut result = EngineUnitResult::new();
+    result.set_name(name).unwrap();
+    result.set_result(code);
+    if let Some(data) = user_data {
+        result.set_user_data(data);
+    }
+    result.set_extra_data(std::collections::HashMap::from([(
+        "suite".to_string(),
+        "main".to_string(),
+    )]));
+    result.set_coverage(std::collections::HashMap::from([(
+        "a.php".to_string(),
+        "C".to_string(),
+    )]));
+    result
+}
+
+#[test]
+fn harbormaster_upload_sends_pass_over_mock_conduit() {
+    let (base, rx) = serve_once(r#"{"error_code": null, "response": "PHID-HMBT-1"}"#);
+    let _home = arcrc_for(&base, "pass");
+    let results = vec![upload_result("t", "pass", Some("all good"))];
+    unit::upload_results(
+        "PHID-HMBT-1",
+        unit_engine::WORKFLOW_RESULT_OKAY,
+        &results,
+        Some(base.as_str()),
+    )
+    .unwrap();
+
+    let (request_line, body) = rx.recv().unwrap();
+    assert!(
+        request_line.starts_with("POST /api/harbormaster.sendmessage HTTP/"),
+        "{request_line}"
+    );
+    let params = conduit_params(&body);
+    assert_eq!(params["buildTargetPHID"], "PHID-HMBT-1");
+    assert_eq!(params["type"], "pass");
+    assert_eq!(params["__conduit__"]["token"], "unit-upload-token");
+    let first = &params["unit"][0];
+    assert_eq!(first["name"], "t");
+    assert_eq!(first["result"], "pass");
+    // Modern dict: non-empty userData becomes details, nulls drop out,
+    // maps pass through.
+    assert_eq!(first["details"], "all good");
+    assert!(first.get("userData").is_none());
+    assert!(first.get("namespace").is_none());
+    assert_eq!(first["extra"]["suite"], "main");
+    assert_eq!(first["coverage"]["a.php"], "C");
+}
+
+#[test]
+fn harbormaster_upload_sends_fail_over_mock_conduit() {
+    let (base, rx) = serve_once(r#"{"error_code": null, "response": "PHID-HMBT-1"}"#);
+    let _home = arcrc_for(&base, "fail");
+    let results = vec![upload_result("t", "fail", None)];
+    unit::upload_results(
+        "PHID-HMBT-1",
+        unit_engine::WORKFLOW_RESULT_FAIL,
+        &results,
+        Some(base.as_str()),
+    )
+    .unwrap();
+
+    let (request_line, body) = rx.recv().unwrap();
+    assert!(
+        request_line.starts_with("POST /api/harbormaster.sendmessage HTTP/"),
+        "{request_line}"
+    );
+    let params = conduit_params(&body);
+    assert_eq!(params["type"], "fail");
+    // Missing userData means no details key at all.
+    assert!(params["unit"][0].get("details").is_none());
 }

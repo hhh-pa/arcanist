@@ -4,9 +4,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use arc_rs::hg::HgCommand;
+use arc_rs::svn::SvnCommand;
 use arc_rs::{
-    unit_config, unit_csharp,
-    unit_engine::{self, CapturedOutput, EngineContext, EngineError, UnitResult},
+    unit, unit_config, unit_csharp,
+    unit_engine::{self, CapturedOutput, CommandRunner, EngineContext, EngineError, UnitResult},
     unit_nose,
     unit_phpunit::{self, PhpunitFs},
     unit_phutil,
@@ -489,4 +491,322 @@ fn shared_result_model_merges_and_reports() {
         unit_engine::WORKFLOW_RESULT_FAIL
     );
     assert_eq!(UnitResult::get_all_result_codes().len(), 5);
+}
+
+// --- gap2: hg/svn selection over fake binaries (U1/U2) -----------------------
+
+#[cfg(windows)]
+const FAKEHG: &str = include_str!("fixtures/vcs/fakehg.bat");
+#[cfg(not(windows))]
+const FAKEHG: &str = include_str!("fixtures/vcs/fakehg.sh");
+
+#[cfg(windows)]
+const FAKESVN: &str = include_str!("fixtures/vcs/fakesvn.bat");
+#[cfg(not(windows))]
+const FAKESVN: &str = include_str!("fixtures/vcs/fakesvn.sh");
+
+#[cfg(windows)]
+const FAKEPHP: &str = include_str!("fixtures/unit/fakephp.bat");
+#[cfg(not(windows))]
+const FAKEPHP: &str = include_str!("fixtures/unit/fakephp.sh");
+
+/// Install a fake script into `dir` (executable on unix) and return its path.
+fn install_fake(dir: &TempDir, name: &str, contents: &str) -> String {
+    let file = format!("{name}.{}", if cfg!(windows) { "bat" } else { "sh" });
+    let path = dir.write(&file, contents);
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path
+}
+
+fn hg_backend(dir: &TempDir) -> HgCommand {
+    let script = install_fake(dir, "fakehg", FAKEHG);
+    #[cfg(windows)]
+    {
+        HgCommand::custom("cmd", &["/C", script.as_str()])
+    }
+    #[cfg(not(windows))]
+    {
+        HgCommand::custom(script.as_str(), &[])
+    }
+}
+
+fn svn_backend(dir: &TempDir) -> SvnCommand {
+    let script = install_fake(dir, "fakesvn", FAKESVN);
+    #[cfg(windows)]
+    {
+        SvnCommand::custom("cmd", &["/C", script.as_str()])
+    }
+    #[cfg(not(windows))]
+    {
+        SvnCommand::custom(script.as_str(), &[])
+    }
+}
+
+#[test]
+fn hg_selection_excludes_untracked_and_resolves_rev() {
+    let dir = TempDir::new("hg-sel");
+    dir.write(".fakehg-status", "M mod.py\nA add.py\n? new.py\n");
+    let hg = hg_backend(&dir);
+    let root = dir.root_string();
+    let root_path = Path::new(&root);
+    assert_eq!(
+        unit::hg_uncommitted_paths_with(root_path, &hg).unwrap(),
+        vec!["add.py".to_string(), "mod.py".to_string()]
+    );
+    // The range resolves the quoted revset first, then diffs base..tip.
+    dir.write(".fakehg-status", "M old.py\n");
+    let paths = unit::hg_commit_range_paths_with(root_path, &hg, "my-branch").unwrap();
+    assert_eq!(paths, vec!["old.py".to_string()]);
+    let log = std::fs::read_to_string(dir.path.join(".fakehg.log")).unwrap();
+    assert!(log.contains("ancestor('my-branch',.)"), "{log}");
+    assert!(
+        log.contains("--rev 0123456789abcdef0123456789abcdef01234567 --rev tip"),
+        "{log}"
+    );
+}
+
+#[test]
+fn hg_invalid_rev_and_failures_surface() {
+    let dir = TempDir::new("hg-err");
+    dir.write(".fakehg-status", "");
+    let hg = hg_backend(&dir);
+    let root = dir.root_string();
+    let root_path = Path::new(&root);
+    let err = unit::hg_commit_range_paths_with(root_path, &hg, "nope-xyz").unwrap_err();
+    assert_eq!(
+        err,
+        "Commit 'nope-xyz' is not a valid Mercurial commit identifier."
+    );
+    dir.write(".fakehg-manifest", "b.py\na.py\n");
+    assert_eq!(
+        unit::hg_all_tracked_files_with(root_path, &hg).unwrap(),
+        vec!["a.py".to_string(), "b.py".to_string()]
+    );
+    dir.write(".fakehg-fail-status", "x");
+    let err = unit::hg_uncommitted_paths_with(root_path, &hg).unwrap_err();
+    assert!(err.contains("hg status failed"), "{err}");
+}
+
+#[test]
+fn svn_selection_excludes_untracked_and_externals() {
+    let dir = TempDir::new("svn-sel");
+    dir.write(
+        ".fakesvn-status",
+        "<status><target path=\".\">\
+         <entry path=\"mod.py\"><wc-status item=\"modified\" props=\"none\"/></entry>\
+         <entry path=\"new.py\"><wc-status item=\"unversioned\" props=\"none\"/></entry>\
+         <entry path=\"ext\"><wc-status item=\"external\" props=\"none\"/></entry>\
+         <entry path=\"ext/e.py\"><wc-status item=\"modified\" props=\"none\"/></entry>\
+         </target></status>",
+    );
+    let svn = svn_backend(&dir);
+    let root = dir.root_string();
+    let root_path = Path::new(&root);
+    assert_eq!(
+        unit::svn_uncommitted_paths_with(root_path, &svn).unwrap(),
+        vec!["mod.py".to_string()]
+    );
+    dir.write(".fakesvn-list", "b.py\na.py\nsub/\n\n");
+    assert_eq!(
+        unit::svn_all_tracked_files_with(root_path, &svn).unwrap(),
+        vec!["a.py".to_string(), "b.py".to_string()]
+    );
+    dir.write(".fakesvn-fail-status", "x");
+    let err = unit::svn_uncommitted_paths_with(root_path, &svn).unwrap_err();
+    assert!(err.contains("svn --xml status failed"), "{err}");
+    dir.write(".fakesvn-fail-list", "x");
+    let err = unit::svn_all_tracked_files_with(root_path, &svn).unwrap_err();
+    assert!(err.contains("svn list failed"), "{err}");
+}
+
+#[test]
+fn select_paths_routes_hg_and_svn() {
+    use arc_rs::unit::Options;
+
+    // hg repo: everything lists the manifest, default unions status,
+    // explicit paths bypass VCS, rev flows through.
+    let dir = TempDir::new("sel-hg");
+    std::fs::create_dir_all(dir.path.join(".hg")).unwrap();
+    dir.write(".fakehg-manifest", "a.py\n");
+    dir.write(".fakehg-status", "M a.py\n? u.py\n");
+    dir.write("a.py", "x\n");
+    let hg = hg_backend(&dir);
+    let svn = svn_backend(&dir);
+    let root = dir.root_string();
+    let root_path = Path::new(&root);
+    let everything = Options {
+        everything: true,
+        ..Options::default()
+    };
+    assert_eq!(
+        unit::select_paths_with(&everything, root_path, root_path, &hg, &svn).unwrap(),
+        vec!["a.py".to_string()]
+    );
+    assert_eq!(
+        unit::select_paths_with(&Options::default(), root_path, root_path, &hg, &svn).unwrap(),
+        vec!["a.py".to_string()]
+    );
+    let explicit = Options {
+        paths: vec!["a.py".to_string()],
+        ..Options::default()
+    };
+    assert_eq!(
+        unit::select_paths_with(&explicit, root_path, root_path, &hg, &svn).unwrap(),
+        vec!["a.py".to_string()]
+    );
+    let rev = Options {
+        rev: Some("my-branch".to_string()),
+        ..Options::default()
+    };
+    assert_eq!(
+        unit::select_paths_with(&rev, root_path, root_path, &hg, &svn).unwrap(),
+        vec!["a.py".to_string()]
+    );
+
+    // svn repo: same, except rev is a usage error.
+    let dir = TempDir::new("sel-svn");
+    std::fs::create_dir_all(dir.path.join(".svn")).unwrap();
+    dir.write(".fakesvn-list", "s.py\n");
+    dir.write(
+        ".fakesvn-status",
+        "<status><target path=\".\">\
+         <entry path=\"s.py\"><wc-status item=\"modified\" props=\"none\"/></entry>\
+         </target></status>",
+    );
+    let hg = hg_backend(&dir);
+    let svn = svn_backend(&dir);
+    let root = dir.root_string();
+    let root_path = Path::new(&root);
+    assert_eq!(
+        unit::select_paths_with(&everything, root_path, root_path, &hg, &svn).unwrap(),
+        vec!["s.py".to_string()]
+    );
+    assert_eq!(
+        unit::select_paths_with(&Options::default(), root_path, root_path, &hg, &svn).unwrap(),
+        vec!["s.py".to_string()]
+    );
+    let err = unit::select_paths_with(&rev, root_path, root_path, &hg, &svn).unwrap_err();
+    assert_eq!(
+        err,
+        "This version control system does not support commit ranges."
+    );
+
+    // No VCS: the empty selection passes through.
+    let dir = TempDir::new("sel-none");
+    let root = dir.root_string();
+    let root_path = Path::new(&root);
+    let hg = hg_backend(&dir);
+    let svn = svn_backend(&dir);
+    assert!(
+        unit::select_paths_with(&everything, root_path, root_path, &hg, &svn)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        unit::select_paths_with(&Options::default(), root_path, root_path, &hg, &svn)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+// --- gap2: phutil fake-php end to end (U5) -----------------------------------
+
+/// Spawn-argv runner for the fake-php tests (the real `php` never runs).
+struct SpawnRunner;
+
+impl CommandRunner for SpawnRunner {
+    fn run(&self, argv: &[String], cwd: &str) -> CapturedOutput {
+        let out = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .current_dir(cwd)
+            .output()
+            .expect("spawn fake php");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        CapturedOutput::new(out.status.code().unwrap_or(-1), &stdout, &stderr)
+    }
+}
+
+fn php_prefix(dir: &TempDir) -> Vec<String> {
+    let script = install_fake(dir, "fakephp", FAKEPHP);
+    #[cfg(windows)]
+    {
+        vec!["cmd".to_string(), "/C".to_string(), script]
+    }
+    #[cfg(not(windows))]
+    {
+        vec![script]
+    }
+}
+
+#[test]
+fn phutil_fake_php_end_to_end() {
+    let dir = TempDir::new("php-e2e");
+    let php = php_prefix(&dir);
+    dir.write(
+        ".fakephp-output",
+        r#"{"results": [{"namespace": "C", "name": "testIt", "result": "pass", "duration": 0.5}]}"#,
+    );
+    let root = dir.root_string();
+    let ctx = EngineContext {
+        project_root: root.clone(),
+        paths: vec!["lib/A.php".to_string()],
+        enable_coverage: Some(false),
+        run_all_tests: false,
+    };
+    let results = unit::run_single_with_php("PhutilUnitTestEngine", &ctx, &SpawnRunner, &|| {
+        Some(php.clone())
+    })
+    .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get_name(), "testIt");
+    assert_eq!(results[0].get_duration(), Some(0.5));
+
+    // Fixture-pinned argv: driver, input, output in order (the fake logs
+    // its own argv, so the interpreter prefix is not in the log).
+    let log = std::fs::read_to_string(dir.path.join(".fakephp.log")).unwrap();
+    let line = log.lines().next().unwrap();
+    let driver_at = line.find(".arc-unit-phutil-driver-").unwrap();
+    let input_at = line.find(".arc-unit-phutil-input-").unwrap();
+    let output_at = line.find(".arc-unit-phutil-output-").unwrap();
+    assert!(driver_at < input_at && input_at < output_at, "{line}");
+    assert!(line[input_at..].contains(".json"), "{line}");
+
+    // The staged input carried the run parameters.
+    let input_text = std::fs::read_to_string(dir.path.join(".fakephp-input-seen")).unwrap();
+    let input: serde_json::Value = serde_json::from_str(&input_text).unwrap();
+    assert_eq!(input["projectRoot"], root);
+    assert_eq!(input["paths"], serde_json::json!(["lib/A.php"]));
+    assert_eq!(input["enableCoverage"], false);
+    assert!(input["initScript"].is_null());
+
+    // Staged files are cleaned; only fake control files remain.
+    let leftovers: Vec<String> = std::fs::read_dir(&dir.path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".arc-unit-phutil-"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+#[test]
+fn phutil_fake_php_failure_surfaces() {
+    let dir = TempDir::new("php-fail");
+    let php = php_prefix(&dir);
+    dir.write(".fakephp-fail", "x");
+    let root = dir.root_string();
+    let ctx = EngineContext {
+        project_root: root,
+        paths: Vec::new(),
+        enable_coverage: None,
+        run_all_tests: true,
+    };
+    let err =
+        unit::run_single_with_php("phutil", &ctx, &SpawnRunner, &|| Some(php.clone())).unwrap_err();
+    assert_eq!(err.message(), "phutil driver failed: fake php exploded");
 }

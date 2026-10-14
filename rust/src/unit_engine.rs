@@ -330,6 +330,10 @@ impl UnitDictionary {
     }
 }
 
+/// Escape one string like PHP `json_encode` with default flags (the
+/// compact `to_json_string` form): `"`/`\`/`/` plus controls (short
+/// forms `\b \f \n \r \t`, other C0 as lowercase `\u00xx`) and non-ASCII
+/// (lowercase `\uXXXX`, surrogate pairs past the BMP).
 fn json_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
     out.push('"');
@@ -337,15 +341,32 @@ fn json_escape(text: &str) -> String {
         match ch {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
+            '/' => out.push_str("\\/"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0C}' => out.push_str("\\f"),
             c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+            c if (c as u32) < 0x80 => out.push(c),
+            c => append_unicode_escape(&mut out, c),
         }
     }
     out.push('"');
     out
+}
+
+/// Append a lowercase `\uXXXX` (or surrogate pair) escape for `ch`.
+fn append_unicode_escape(out: &mut String, ch: char) {
+    let n = ch as u32;
+    if n < 0x1_0000 {
+        out.push_str(&format!("\\u{n:04x}"));
+    } else {
+        let v = n - 0x1_0000;
+        let hi = 0xD800 + (v >> 10);
+        let lo = 0xDC00 + (v & 0x3FF);
+        out.push_str(&format!("\\u{hi:04x}\\u{lo:04x}"));
+    }
 }
 
 fn json_string_or_null(value: Option<&str>) -> String {
@@ -356,6 +377,10 @@ fn json_map_or_null(pairs: Option<&[(String, String)]>) -> String {
     pairs.map_or_else(
         || "null".to_string(),
         |entries| {
+            // PHP encodes an empty array as a list.
+            if entries.is_empty() {
+                return "[]".to_string();
+            }
             let body: Vec<String> = entries
                 .iter()
                 .map(|(k, v)| format!("{}:{}", json_escape(k), json_escape(v)))

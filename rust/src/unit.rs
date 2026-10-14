@@ -22,6 +22,13 @@
 //! (`ArcanistConfigurationDrivenUnitTestEngine.php:176-181`) where only
 //! `phutil` is non-null in-tree, so accepting class names there diverges
 //! from PHP to make every ported engine selectable.
+//!
+//! Out-of-process notes: the `cargo` engine treats positional paths as
+//! `cargo test` filters and warns (instead of failing) on coverage flags
+//! it cannot honor; the `phutil` engine shells out to the user's `php`
+//! running a staged driver (see `unit_phutil`); `json`/`ugly` rendering
+//! matches PHP byte-for-byte including the pretty numeric-key quirk (see
+//! [`results_to_json_text`]).
 
 extern crate self as arc_rs;
 
@@ -29,11 +36,13 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use arc_rs::hg::HgCommand;
+use arc_rs::svn::SvnCommand;
 use arc_rs::unit_config::{self, PlannedEngine};
 use arc_rs::unit_engine::{
     CommandRunner, EngineContext, EngineError, UnitResult as EngineUnitResult,
 };
-use arc_rs::{config, unit_csharp, unit_nose, unit_phpunit, unit_pytest, unit_xunit};
+use arc_rs::{config, unit_csharp, unit_nose, unit_phpunit, unit_phutil, unit_pytest, unit_xunit};
 
 pub const NAME: &str = "unit";
 
@@ -726,13 +735,28 @@ pub fn uncommitted_paths(cwd: &Path) -> Result<Vec<String>, String> {
     Ok(paths)
 }
 
-/// Paths changed in `rev...HEAD` (`getCommitRangeStatus` half of
-/// `getWorkingCopyStatus`, `ArcanistRepositoryAPI.php:253-265`).
+/// Resolve an explicit git base revision to its merge-base hash with `HEAD`
+/// (`ArcanistGitAPI::buildBaseCommit`, explicit branch,
+/// `ArcanistGitAPI.php:208-243`): the empty tree passes through, anything
+/// else resolves via `git merge-base`, and unknown names fail with the PHP
+/// usage message.
+fn git_base_commit(cwd: &Path, rev: &str) -> Result<String, String> {
+    arc_rs::git::base_commit_for_explicit_symbol(cwd, rev, "HEAD")
+}
+
+/// Paths changed between `rev` and `HEAD` (`getCommitRangeStatus` half of
+/// `getWorkingCopyStatus`, `ArcanistRepositoryAPI.php:253-265`): the rev
+/// resolves to its merge-base first (like PHP), then `git diff --name-only`
+/// lists the range. `--name-only` without rename detection reports the same
+/// path set as PHP's `--raw` plus `parseGitRawDiff`.
 pub fn commit_range_paths(cwd: &Path, rev: &str) -> Result<Vec<String>, String> {
-    let spec = format!("{rev}...HEAD");
-    let out = git_output(cwd, &["diff", "--name-only", "-z", &spec])?;
+    let base = git_base_commit(cwd, rev)?;
+    let out = git_output(cwd, &["diff", "--name-only", "-z", &base, "HEAD"])?;
     if !out.status.success() {
-        return Err(format!("invalid base revision '{rev}'"));
+        return Err(format!(
+            "git diff failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
     let mut paths: Vec<String> = out
         .stdout
@@ -779,6 +803,175 @@ pub fn all_tracked_files(cwd: &Path) -> Result<Vec<String>, String> {
     Ok(paths)
 }
 
+/// Escape an hg symbol for revset use (`hgsprintf` `%s`,
+/// `src/xsprintf/hgsprintf.php:26-35`): alphanumeric-only symbols pass
+/// through, anything else is single-quoted with `'` and `\` escaped.
+#[must_use]
+pub fn hg_symbol_escape(symbol: &str) -> String {
+    let plain = !symbol.is_empty() && symbol.bytes().all(|b| b.is_ascii_alphanumeric());
+    if plain {
+        symbol.to_string()
+    } else {
+        format!("'{}'", symbol.replace('\\', "\\\\").replace('\'', "\\'"))
+    }
+}
+
+/// `ancestor(<rev>,.)` revsets for an explicit hg base revision, quoted
+/// first then raw (`ArcanistMercurialAPI::buildBaseCommit`,
+/// `ArcanistMercurialAPI.php:82-98`).
+#[must_use]
+pub fn hg_base_revsets(rev: &str) -> [String; 2] {
+    [
+        format!("ancestor({},.)", hg_symbol_escape(rev)),
+        format!("ancestor({rev},.)"),
+    ]
+}
+
+/// Resolve an explicit hg base revision to a node hash: the quoted revset
+/// first, then the raw revset, else the PHP usage error
+/// (`ArcanistMercurialAPI.php:93-97`).
+fn hg_base_commit_with(dir: &Path, hg: &HgCommand, rev: &str) -> Result<String, String> {
+    for revset in hg_base_revsets(rev) {
+        if let Ok(node) = arc_rs::hg::get_canonical_revision_name_with(dir, hg, &revset) {
+            return Ok(node);
+        }
+    }
+    Err(format!(
+        "Commit '{rev}' is not a valid Mercurial commit identifier."
+    ))
+}
+
+/// Parse `hg status` output into sorted paths, omitting untracked files
+/// (the default `FLAG_UNTRACKED` omit mask,
+/// `ArcanistWorkflow.php:1627-1629`). Clean/ignored entries carry zero
+/// flags and pass through like PHP, but plain `hg status` never emits them.
+fn hg_status_paths(stdout: &str) -> Result<Vec<String>, String> {
+    let status = arc_rs::hg::parse_mercurial_status(stdout)?;
+    Ok(status
+        .iter()
+        .filter(|(_, mask)| *mask & arc_rs::hg::FLAG_UNTRACKED == 0)
+        .map(|(path, _)| path.clone())
+        .collect())
+}
+
+/// Run `hg` with `args` in `dir`, mapping failures to `<command> failed`
+/// errors carrying stderr, like the git helpers above.
+fn hg_output_checked(
+    dir: &Path,
+    hg: &HgCommand,
+    args: &[&str],
+    command: &str,
+) -> Result<String, String> {
+    let out = arc_rs::hg::output_with(dir, hg, args)?;
+    if !out.status.success() {
+        return Err(format!(
+            "{command} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Uncommitted hg paths (`hg status` minus untracked,
+/// `ArcanistMercurialAPI.php:313-329`).
+pub fn hg_uncommitted_paths_with(dir: &Path, hg: &HgCommand) -> Result<Vec<String>, String> {
+    let stdout = hg_output_checked(dir, hg, &["status"], "hg status")?;
+    hg_status_paths(&stdout)
+}
+
+/// hg commit-range paths (`hg status --rev <base> --rev tip`,
+/// `ArcanistMercurialAPI.php:331-344`).
+pub fn hg_commit_range_paths_with(
+    dir: &Path,
+    hg: &HgCommand,
+    rev: &str,
+) -> Result<Vec<String>, String> {
+    let base = hg_base_commit_with(dir, hg, rev)?;
+    let args = ["status", "--rev", base.as_str(), "--rev", "tip"];
+    let stdout = hg_output_checked(dir, hg, &args, "hg status")?;
+    hg_status_paths(&stdout)
+}
+
+/// hg working-copy status: commit-range union uncommitted, untracked
+/// excluded (`ArcanistRepositoryAPI.php:253-265`).
+pub fn hg_working_copy_paths_with(
+    dir: &Path,
+    hg: &HgCommand,
+    rev: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut paths = hg_uncommitted_paths_with(dir, hg)?;
+    if let Some(rev) = rev {
+        paths.append(&mut hg_commit_range_paths_with(dir, hg, rev)?);
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// Every tracked file (`hg manifest`,
+/// `ArcanistMercurialAPI.php:268-272`).
+pub fn hg_all_tracked_files_with(dir: &Path, hg: &HgCommand) -> Result<Vec<String>, String> {
+    let stdout = hg_output_checked(dir, hg, &["manifest"], "hg manifest")?;
+    let mut paths = arc_rs::hg::parse_manifest_lines(&stdout);
+    paths.sort();
+    Ok(paths)
+}
+
+/// Uncommitted svn paths (`svn --xml status` minus externals and untracked,
+/// `ArcanistSubversionAPI.php:53-55,69-149` with the default
+/// `FLAG_UNTRACKED` omit mask).
+pub fn svn_uncommitted_paths_with(dir: &Path, svn: &SvnCommand) -> Result<Vec<String>, String> {
+    let argv = arc_rs::svn::status_argv(&[]);
+    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let out = arc_rs::svn::output_with(dir, svn, &args)?;
+    if !out.status.success() {
+        return Err(format!(
+            "svn --xml status failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let parsed = arc_rs::svn::parse_svn_status_xml(&String::from_utf8_lossy(&out.stdout))?;
+    let visible = arc_rs::svn::filter_externals(&parsed.files, false);
+    Ok(visible
+        .iter()
+        .filter(|(_, mask)| *mask & arc_rs::svn::FLAG_UNTRACKED == 0)
+        .map(|(path, _)| path.clone())
+        .collect())
+}
+
+/// svn working-copy status: uncommitted only, since svn has no commit
+/// ranges (`ArcanistSubversionAPI.php:47-51`). An explicit rev is the PHP
+/// usage error (`ArcanistWorkflow.php:1831-1834`); the `unit` flag check
+/// rejects `--rev` under svn before this runs.
+pub fn svn_working_copy_paths_with(
+    dir: &Path,
+    svn: &SvnCommand,
+    rev: Option<&str>,
+) -> Result<Vec<String>, String> {
+    if rev.is_some() {
+        return Err("This version control system does not support commit ranges.".to_string());
+    }
+    svn_uncommitted_paths_with(dir, svn)
+}
+
+/// Every tracked file (`svn list -R` minus directories,
+/// `ArcanistSubversionAPI.php:525-531,553-559`).
+pub fn svn_all_tracked_files_with(dir: &Path, svn: &SvnCommand) -> Result<Vec<String>, String> {
+    let out = arc_rs::svn::output_with(dir, svn, &["list", "-R"])?;
+    if !out.status.success() {
+        return Err(format!(
+            "svn list failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let mut paths: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(arc_rs::svn::filter_files)
+        .collect();
+    paths.sort();
+    Ok(paths)
+}
+
 /// Validate explicit paths (`selectPathsForWorkflow`,
 /// `ArcanistWorkflow.php:1631-1645`): each must exist, then is relativized
 /// against the project root like `Filesystem::readablePath`.
@@ -812,29 +1005,30 @@ pub fn validate_paths(
     Ok(out)
 }
 
-/// Select workflow paths (`ArcanistUnitWorkflow.php:136-149` plus
-/// `selectPathsForWorkflow`): `--everything` lists every tracked file, else
-/// explicit paths validate, else working-copy status (range plus
-/// uncommitted, untracked excluded). `hg`/`svn` working copies are not yet
-/// ported; without a detectable repo an empty selection passes through and
-/// the engine reports no tests.
-pub fn select_paths(
+/// Select workflow paths with injectable `hg`/`svn` backends
+/// (`ArcanistUnitWorkflow.php:136-149` plus `selectPathsForWorkflow`):
+/// `--everything` lists every tracked file, else explicit paths validate,
+/// else working-copy status (range plus uncommitted, untracked excluded).
+/// Without a detectable repo an empty selection passes through and the
+/// engine reports no tests. `hg`/`svn` run at the project root like PHP
+/// (`execxLocal` uses the project path).
+pub fn select_paths_with(
     opts: &Options,
     cwd: &Path,
     project_root: &Path,
+    hg: &HgCommand,
+    svn: &SvnCommand,
 ) -> Result<Vec<String>, String> {
     check_everything_paths(opts.everything, &opts.paths)?;
     if opts.everything {
         let Some(vcs) = detect_vcs(cwd) else {
             return Ok(Vec::new());
         };
-        if vcs != Vcs::Git {
-            return Err(format!(
-                "{} working copies are not yet ported (see T1128)",
-                vcs.name()
-            ));
-        }
-        return all_tracked_files(cwd);
+        return match vcs {
+            Vcs::Git => all_tracked_files(cwd),
+            Vcs::Hg => hg_all_tracked_files_with(project_root, hg),
+            Vcs::Svn => svn_all_tracked_files_with(project_root, svn),
+        };
     }
     if !opts.paths.is_empty() {
         return validate_paths(&opts.paths, cwd, project_root);
@@ -842,13 +1036,26 @@ pub fn select_paths(
     let Some(vcs) = detect_vcs(cwd) else {
         return Ok(Vec::new());
     };
-    if vcs != Vcs::Git {
-        return Err(format!(
-            "{} working copies are not yet ported (see T1128)",
-            vcs.name()
-        ));
+    match vcs {
+        Vcs::Git => working_copy_paths(cwd, opts.rev.as_deref()),
+        Vcs::Hg => hg_working_copy_paths_with(project_root, hg, opts.rev.as_deref()),
+        Vcs::Svn => svn_working_copy_paths_with(project_root, svn, opts.rev.as_deref()),
     }
-    working_copy_paths(cwd, opts.rev.as_deref())
+}
+
+/// Select workflow paths with the system `hg`/`svn` binaries.
+pub fn select_paths(
+    opts: &Options,
+    cwd: &Path,
+    project_root: &Path,
+) -> Result<Vec<String>, String> {
+    select_paths_with(
+        opts,
+        cwd,
+        project_root,
+        &HgCommand::system(),
+        &SvnCommand::system(),
+    )
 }
 
 /// Walk up from `dir` looking for `Cargo.toml`; returns the directory that
@@ -962,12 +1169,54 @@ pub fn tail(text: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
+/// `cargo test` arguments for an options set (Rust extension; PHP has no
+/// cargo engine): the cargo-test args after the unit `--` separator first,
+/// then the positional unit paths as test-name filters. Filters after a
+/// `--` in the cargo args still filter: the test binary treats its first
+/// positional the same way.
+#[must_use]
+pub fn cargo_test_argv(opts: &Options) -> Vec<String> {
+    let mut argv = vec!["test".to_string()];
+    argv.extend(opts.cargo_args.iter().cloned());
+    argv.extend(opts.paths.iter().cloned());
+    argv
+}
+
+/// Coverage warning for the cargo engine (Rust extension): cargo has no
+/// coverage support, so an explicit `--coverage` (or `--detailed-coverage`,
+/// which implies it) warns on stderr and the run continues without
+/// coverage. `--no-coverage` needs no warning: it is already the effective
+/// behavior.
+#[must_use]
+pub fn cargo_coverage_warning(opts: &Options) -> Option<String> {
+    if opts.detailed_coverage {
+        Some(
+            "arc-rs unit: warning: the cargo engine does not support coverage; \
+             ignoring --detailed-coverage"
+                .to_string(),
+        )
+    } else if opts.coverage {
+        Some(
+            "arc-rs unit: warning: the cargo engine does not support coverage; \
+             ignoring --coverage"
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
 /// Run the configured engine in the crate found by walking up from `cwd`.
 ///
 /// `target_dir` overrides `CARGO_TARGET_DIR` for the child process only;
 /// pass `None` for normal runs (cargo default) and `Some` in tests to keep
 /// build output out of the repo. The child always runs with
 /// `CARGO_NET_OFFLINE=true`.
+///
+/// Cargo-extension behavior: positional paths become `cargo test` filters
+/// (see [`cargo_test_argv`]), `--everything` is the default full-suite run,
+/// `--rev` is ignored, and coverage flags warn (see
+/// [`cargo_coverage_warning`]).
 ///
 /// Per-test parsing is out of scope: `passed`/`failed` are 1/0 or 0/1 based
 /// on the `cargo test` exit status.
@@ -997,8 +1246,7 @@ pub fn execute(
     };
 
     let mut cmd = std::process::Command::new("cargo");
-    cmd.arg("test")
-        .args(&opts.cargo_args)
+    cmd.args(cargo_test_argv(opts))
         .current_dir(&root)
         .env("CARGO_NET_OFFLINE", "true")
         .stdin(std::process::Stdio::null())
@@ -1320,12 +1568,21 @@ fn random_xml_stem() -> String {
         .collect()
 }
 
-/// Run the xUnit engine (`XUnitTestEngine.php:103-113,167-184`) with real
-/// filesystem probes and the injected command runner.
-pub fn run_xunit_with_runner(
-    ctx: &EngineContext,
-    runner: &dyn CommandRunner,
-) -> Result<Vec<EngineUnitResult>, EngineError> {
+/// xUnit environment plus the test projects selected for a run: the
+/// shared half of the xUnit and C# engines (the C# engine inherits the
+/// parent stages and only overrides the test future).
+pub struct XunitPlan {
+    /// Loaded build/runtime/test engines, root, and discovery rules.
+    pub env: unit_xunit::XunitEnvironment,
+    /// Test projects mapped from the run paths.
+    pub projects: Vec<unit_xunit::TestProject>,
+    /// Host platform flag for report paths.
+    pub is_windows: bool,
+}
+
+/// Load the xUnit environment and map the run paths to test projects
+/// (`XUnitTestEngine.php:36-95,103-113`) with real filesystem probes.
+pub fn prepare_xunit_run(ctx: &EngineContext) -> Result<XunitPlan, EngineError> {
     let is_windows = cfg!(windows);
     let arcconfig = read_arcconfig(&ctx.project_root);
     let discovery = arcconfig
@@ -1352,24 +1609,44 @@ pub fn run_xunit_with_runner(
         ctx.paths.clone()
     };
     let projects = unit_xunit::map_paths_to_results(&paths, &env, &|p| Path::new(p).exists());
-    if projects.is_empty() {
-        return Ok(Vec::new());
-    }
-    // Generate (may be empty when no Build/Protobuild), then build, then
-    // test, stopping after the first failing stage
-    // (`runAllTests`, lines 167-184).
-    let mut results = run_xunit_generate(&env, runner)?;
+    Ok(XunitPlan {
+        env,
+        projects,
+        is_windows,
+    })
+}
+
+/// Run generate, build, then test over a plan, stopping after the first
+/// failing stage (`runAllTests`, `XUnitTestEngine.php:167-184`).
+fn run_xunit_plan(
+    plan: &XunitPlan,
+    runner: &dyn CommandRunner,
+) -> Result<Vec<EngineUnitResult>, EngineError> {
+    let mut results = run_xunit_generate(&plan.env, runner)?;
     if unit_xunit::results_contain_failures(&results) {
         return Ok(results);
     }
-    let mut built = run_xunit_build(&env, &projects, runner)?;
+    let mut built = run_xunit_build(&plan.env, &plan.projects, runner)?;
     results.append(&mut built);
     if unit_xunit::results_contain_failures(&results) {
         return Ok(results);
     }
-    let mut tested = run_xunit_test(&env, &projects, runner, is_windows)?;
+    let mut tested = run_xunit_test(&plan.env, &plan.projects, runner, plan.is_windows)?;
     results.append(&mut tested);
     Ok(results)
+}
+
+/// Run the xUnit engine (`XUnitTestEngine.php:103-113,167-184`) with real
+/// filesystem probes and the injected command runner.
+pub fn run_xunit_with_runner(
+    ctx: &EngineContext,
+    runner: &dyn CommandRunner,
+) -> Result<Vec<EngineUnitResult>, EngineError> {
+    let plan = prepare_xunit_run(ctx)?;
+    if plan.projects.is_empty() {
+        return Ok(Vec::new());
+    }
+    run_xunit_plan(&plan, runner)
 }
 
 /// xUnit generate stage (`generateProjects`, lines 215-264).
@@ -1483,46 +1760,275 @@ fn run_xunit_test(
     Ok(merged)
 }
 
-/// C# tools run: xUnit stages plus cscover coverage when enabled
-/// (`CSharpToolsTestEngine.php:22-55,88-143,152-157,216-285`). Without a
-/// cover engine (coverage disabled) this is the plain xUnit path.
-pub fn run_csharp_with_runner(
-    ctx: &EngineContext,
-    runner: &dyn CommandRunner,
-) -> Result<Vec<EngineUnitResult>, EngineError> {
-    // Load the xUnit half first (build/runtime/test engines, discovery).
-    let xunit_results = run_xunit_with_runner(ctx, runner)?;
-    // When coverage is disabled there is no cscover report to attach.
-    if ctx.enable_coverage == Some(false) {
-        return Ok(xunit_results);
-    }
-    // Resolve the cover engine (validates the cscover hint even when the
-    // xUnit run found no projects, mirroring `loadEnvironment` order where
-    // the parent loads before the cover check... except the parent throws
-    // first when discovery is missing, which `run_xunit_with_runner` did).
+/// C# cover configuration: resolved cscover engine plus the
+/// instrumentation filters (`CSharpToolsTestEngine.php:22-55`).
+#[derive(Debug)]
+struct CsharpCover {
+    cover_engine: String,
+    match_regex: Option<String>,
+    excluded: Option<HashMap<String, String>>,
+}
+
+/// Load the C# cover configuration from `.arcconfig`: the cscover hint
+/// plus the match/excluded filters. `None` when coverage is disabled
+/// (then every assembly runs the plain xUnit future).
+fn load_csharp_cover(ctx: &EngineContext) -> Result<Option<CsharpCover>, EngineError> {
     let arcconfig = read_arcconfig(&ctx.project_root);
     let hint = arcconfig
         .as_ref()
         .and_then(|v| v.get(unit_csharp::CSCOVER_BINARY_KEY))
         .and_then(|v| v.as_str());
-    let cover =
+    let cover_engine =
         unit_csharp::load_cover_engine(&ctx.project_root, hint, ctx.enable_coverage, &|p| {
             Path::new(p).exists()
         })?;
-    // Without a cover engine there is nothing further to do (unreachable:
-    // `load_cover_engine` with coverage enabled either resolves or throws).
-    if cover.is_none() {
-        return Ok(xunit_results);
+    let Some(cover_engine) = cover_engine else {
+        return Ok(None);
+    };
+    let match_regex = arcconfig
+        .as_ref()
+        .and_then(|v| v.get(unit_csharp::COVERAGE_MATCH_KEY))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let excluded = arcconfig
+        .as_ref()
+        .and_then(|v| v.get(unit_csharp::COVERAGE_EXCLUDED_KEY))
+        .and_then(parse_excluded_files);
+    Ok(Some(CsharpCover {
+        cover_engine,
+        match_regex,
+        excluded,
+    }))
+}
+
+/// Parse `unit.csharp.coverage.excluded` (a map; PHP checks key existence,
+/// so only keys matter and non-string values become empty).
+fn parse_excluded_files(value: &serde_json::Value) -> Option<HashMap<String, String>> {
+    let obj = value.as_object()?;
+    Some(
+        obj.iter()
+            .map(|(key, value)| (key.clone(), value.as_str().unwrap_or("").to_string()))
+            .collect(),
+    )
+}
+
+/// One planned C# test run: the argv plus the report files it produces
+/// (`buildTestFuture`, `CSharpToolsTestEngine.php:88-143`).
+struct CsharpRun {
+    argv: Vec<String>,
+    xunit_output: String,
+    cover_output: Option<String>,
+}
+
+/// Parent directory of an assembly path (forward slashes), defaulting to
+/// the project root for bare names.
+fn assembly_parent_dir(assembly: &str, project_root: &str) -> String {
+    let parent = Path::new(assembly)
+        .parent()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+    if parent.is_empty() {
+        project_root.to_string()
+    } else {
+        parent
     }
-    // Full cscover instrumentation (per-assembly `-o/-c/-a/-w` runs plus
-    // `readCoverage`) requires a Windows .NET toolchain with built
-    // assemblies; the xUnit results above are the portable half. Report the
-    // gap instead of silently dropping coverage.
-    Err(EngineError::Failed(
-        "Engine 'CSharpToolsTestEngine' coverage requires cscover-instrumented assemblies; \
-         run the xUnit engine without coverage or on a Windows .NET host (see T1128)."
-            .to_string(),
-    ))
+}
+
+/// Bare file names directly under `dir`, sorted for a deterministic
+/// assembly scan.
+fn dir_file_names(dir: &str) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Assemblies in `assembly_dir` selected for instrumentation (`.dll`/`.exe`
+/// passing the excluded/match filters, lines 117-125).
+fn instrumentable_assemblies(
+    assembly_dir: &str,
+    match_regex: &Option<String>,
+    excluded: Option<&HashMap<String, String>>,
+) -> Vec<String> {
+    let files = dir_file_names(assembly_dir);
+    let refs: Vec<&str> = files.iter().map(String::as_str).collect();
+    unit_csharp::collect_assemblies(assembly_dir, &refs, excluded, match_regex.as_deref())
+}
+
+/// Stage an empty cscover output file next to the project root (unique
+/// stem). PHP uses a system `TempFile`; we stage next to the destination.
+fn stage_cover_file(project_root: &str) -> Result<String, EngineError> {
+    let path = format!("{project_root}/.cscover-{}.xml", random_xml_stem());
+    std::fs::write(&path, "")
+        .map_err(|e| EngineError::Failed(format!("cannot stage cover file '{path}': {e}")))?;
+    Ok(path)
+}
+
+/// Remove a stale report file, if any (best-effort).
+fn remove_report_file(path: &str) {
+    std::fs::remove_file(path).ok();
+}
+
+/// Plan one assembly's test run: with coverage and at least one
+/// instrumentable assembly, wrap xUnit in cscover (`-o/-c/-a/-w`);
+/// otherwise run the plain xUnit future (lines 89-91, 126-128).
+fn plan_csharp_assembly(
+    env: &unit_xunit::XunitEnvironment,
+    assembly: &str,
+    cover: Option<&CsharpCover>,
+    enable_coverage: Option<bool>,
+    is_windows: bool,
+) -> Result<CsharpRun, EngineError> {
+    let xml_name = unit_xunit::xml_report_name(&random_xml_stem());
+    let (xunit_cmd, xunit_args) =
+        unit_csharp::xunit_cmd_and_args(&env.runtime_engine, &env.test_engine, assembly, &xml_name);
+    let assembly_dir = assembly_parent_dir(assembly, &env.project_root);
+    let assemblies = match cover {
+        Some(cover) => {
+            instrumentable_assemblies(&assembly_dir, &cover.match_regex, cover.excluded.as_ref())
+        }
+        None => Vec::new(),
+    };
+    if let Some(cover) = cover
+        && unit_csharp::use_cover_engine(enable_coverage, &assemblies)
+    {
+        let cover_output = stage_cover_file(&env.project_root)?;
+        let argv = unit_csharp::build_cscover_argv(
+            &env.runtime_engine,
+            &cover.cover_engine,
+            &cover_output,
+            &xunit_cmd,
+            &xunit_args,
+            &assembly_dir,
+            &assemblies,
+        );
+        // cscover runs xUnit with `-w <assembly_dir>`, so the report lands
+        // next to the assemblies.
+        let xunit_output = format!("{assembly_dir}/{xml_name}");
+        remove_report_file(&xunit_output);
+        return Ok(CsharpRun {
+            argv,
+            xunit_output,
+            cover_output: Some(cover_output),
+        });
+    }
+    let argv =
+        unit_xunit::build_test_argv(&env.runtime_engine, &env.test_engine, assembly, &xml_name);
+    let xunit_output = unit_xunit::xunit_output_path(&env.project_root, &xml_name, is_windows);
+    remove_report_file(&xunit_output);
+    Ok(CsharpRun {
+        argv,
+        xunit_output,
+        cover_output: None,
+    })
+}
+
+/// Read one run's cscover report through the cache (`readCoverage`,
+/// lines 216-285). Line counts come from the real filesystem, matching
+/// PHP `count(file(...))`.
+fn read_run_coverage(
+    cover_output: Option<&str>,
+    project_root: &str,
+    cache: &mut unit_csharp::CoverageCache,
+) -> Result<Option<HashMap<String, String>>, EngineError> {
+    let Some(cover_file) = cover_output else {
+        return Ok(None);
+    };
+    let xml = std::fs::read_to_string(cover_file)
+        .map_err(|e| EngineError::Failed(format!("cannot read '{cover_file}': {e}")))?;
+    cache
+        .read_cached(cover_file, &xml, project_root, &|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .map(|text| text.lines().count())
+        })
+        .map(Some)
+}
+
+/// Execute one planned C# run and parse its results. A missing xUnit
+/// report contributes nothing (Mono segfault tolerance, like the parent
+/// stage); staged files are removed best-effort either way.
+fn execute_csharp_run(
+    run: &CsharpRun,
+    project_root: &str,
+    runner: &dyn CommandRunner,
+    cache: &mut unit_csharp::CoverageCache,
+) -> Result<Vec<EngineUnitResult>, EngineError> {
+    runner.run(&run.argv, project_root);
+    if !Path::new(&run.xunit_output).exists() {
+        if let Some(cover) = run.cover_output.as_deref() {
+            remove_report_file(cover);
+        }
+        return Ok(Vec::new());
+    }
+    let xml = std::fs::read_to_string(&run.xunit_output)
+        .map_err(|e| EngineError::Failed(format!("cannot read '{}': {e}", run.xunit_output)))?;
+    let coverage = read_run_coverage(run.cover_output.as_deref(), project_root, cache)?;
+    let results = unit_csharp::parse_assembly_results(&xml, coverage.as_ref())?;
+    remove_report_file(&run.xunit_output);
+    if let Some(cover) = run.cover_output.as_deref() {
+        remove_report_file(cover);
+    }
+    Ok(results)
+}
+
+/// C# test stage over all projects (`testAssemblies` with the overridden
+/// future, `XUnitTestEngine.php:351-391`).
+fn run_csharp_test(
+    plan: &XunitPlan,
+    cover: Option<&CsharpCover>,
+    enable_coverage: Option<bool>,
+    runner: &dyn CommandRunner,
+) -> Result<Vec<EngineUnitResult>, EngineError> {
+    let mut cache = unit_csharp::CoverageCache::new();
+    let mut merged = Vec::new();
+    for project in &plan.projects {
+        let run = plan_csharp_assembly(
+            &plan.env,
+            &project.assembly,
+            cover,
+            enable_coverage,
+            plan.is_windows,
+        )?;
+        let mut results = execute_csharp_run(&run, &plan.env.project_root, runner, &mut cache)?;
+        merged.append(&mut results);
+    }
+    Ok(merged)
+}
+
+/// C# tools run: shared xUnit stages plus the cscover test future when
+/// coverage applies, else the plain xUnit path
+/// (`CSharpToolsTestEngine.php:22-55,88-143,152-157,216-285`).
+pub fn run_csharp_with_runner(
+    ctx: &EngineContext,
+    runner: &dyn CommandRunner,
+) -> Result<Vec<EngineUnitResult>, EngineError> {
+    let plan = prepare_xunit_run(ctx)?;
+    // The cover engine resolves before any stage runs (like the parent
+    // `loadEnvironment` plus the cover half throwing first), even when no
+    // projects mapped.
+    let cover = load_csharp_cover(ctx)?;
+    if plan.projects.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut results = run_xunit_generate(&plan.env, runner)?;
+    if unit_xunit::results_contain_failures(&results) {
+        return Ok(results);
+    }
+    let mut built = run_xunit_build(&plan.env, &plan.projects, runner)?;
+    results.append(&mut built);
+    if unit_xunit::results_contain_failures(&results) {
+        return Ok(results);
+    }
+    let mut tested = run_csharp_test(&plan, cover.as_ref(), ctx.enable_coverage, runner)?;
+    results.append(&mut tested);
+    Ok(results)
 }
 
 /// Build a phpunit engine from `.arcconfig` (`prepareConfigFile`,
@@ -1564,13 +2070,125 @@ pub fn phpunit_engine_from_config(project_root: &str) -> unit_phpunit::PhpunitEn
     }
 }
 
+/// Staged phutil driver files (all next to the project root, one stem).
+struct PhutilStaging {
+    driver: String,
+    input: String,
+    output: String,
+}
+
+/// Stage the driver script plus its JSON input next to the project root.
+fn stage_phutil_files(project_root: &str, input_json: &str) -> Result<PhutilStaging, EngineError> {
+    let stem = random_xml_stem();
+    let driver = format!("{project_root}/.arc-unit-phutil-driver-{stem}.php");
+    let input = format!("{project_root}/.arc-unit-phutil-input-{stem}.json");
+    let output = format!("{project_root}/.arc-unit-phutil-output-{stem}.json");
+    std::fs::write(&driver, unit_phutil::phutil_driver_source())
+        .map_err(|e| EngineError::Failed(format!("cannot stage phutil driver '{driver}': {e}")))?;
+    std::fs::write(&input, input_json)
+        .map_err(|e| EngineError::Failed(format!("cannot stage phutil input '{input}': {e}")))?;
+    Ok(PhutilStaging {
+        driver,
+        input,
+        output,
+    })
+}
+
+/// Remove staged phutil files (best-effort).
+fn cleanup_phutil_files(staging: &PhutilStaging) {
+    remove_report_file(&staging.driver);
+    remove_report_file(&staging.input);
+    remove_report_file(&staging.output);
+}
+
+/// Failure message for a nonzero driver exit: stderr when present, else
+/// stdout, else the bare exit code.
+fn phutil_failure(outcome: &arc_rs::unit_engine::CapturedOutput) -> EngineError {
+    let stderr = outcome.stderr.trim();
+    if !stderr.is_empty() {
+        return EngineError::Failed(format!("phutil driver failed: {stderr}"));
+    }
+    let stdout = outcome.stdout.trim();
+    if !stdout.is_empty() {
+        return EngineError::Failed(format!("phutil driver failed: {stdout}"));
+    }
+    EngineError::Failed(format!(
+        "phutil driver failed with exit code {}",
+        outcome.exit_code
+    ))
+}
+
+/// Default `php` invocation prefix: the interpreter on the real `PATH`,
+/// if any (anoid's `python3` pattern).
+fn resolve_php_prefix() -> Option<Vec<String>> {
+    unit_phutil::php_argv_prefix()
+}
+
+/// Run the phutil engine out-of-process: stage the driver plus its JSON
+/// input next to the project root, run `php` through `runner`, and parse
+/// the JSON output. `php` resolves the interpreter prefix argv; `None` is
+/// the clear php-absent error.
+pub fn run_phutil_with_runner(
+    ctx: &EngineContext,
+    runner: &dyn CommandRunner,
+    engine: &str,
+    php: &dyn Fn() -> Option<Vec<String>>,
+) -> Result<Vec<EngineUnitResult>, EngineError> {
+    let Some(prefix) = php() else {
+        return Err(EngineError::Usage(unit_phutil::missing_php_message(engine)));
+    };
+    let init_script = read_arcconfig(&ctx.project_root)
+        .as_ref()
+        .and_then(|v| v.get(unit_phutil::INIT_SCRIPT_KEY))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let input = unit_phutil::PhutilRunInput {
+        project_root: ctx.project_root.clone(),
+        run_all_tests: ctx.run_all_tests,
+        paths: ctx.paths.clone(),
+        enable_coverage: ctx.enable_coverage,
+        init_script,
+    };
+    let staging = stage_phutil_files(&ctx.project_root, &unit_phutil::phutil_input_json(&input))?;
+    let argv =
+        unit_phutil::build_php_argv(&prefix, &staging.driver, &staging.input, &staging.output);
+    let outcome = runner.run(&argv, &ctx.project_root);
+    if outcome.exit_code != 0 {
+        cleanup_phutil_files(&staging);
+        return Err(phutil_failure(&outcome));
+    }
+    let text = std::fs::read_to_string(&staging.output).map_err(|e| {
+        EngineError::Failed(format!(
+            "phutil driver did not write '{}': {e}",
+            staging.output
+        ))
+    });
+    cleanup_phutil_files(&staging);
+    unit_phutil::parse_phutil_output(&text?, &staging.output)
+}
+
 /// Run one engine by `.arcunit` type or `--engine` class name.
 ///
 /// Every command goes through `runner` so tests inject canned outputs.
+/// The phutil engine resolves `php` on the real `PATH`; see
+/// [`run_single_with_php`] for the injectable seam.
 pub fn run_single_with_runner(
     engine_type: &str,
     ctx: &EngineContext,
     runner: &dyn CommandRunner,
+) -> Result<Vec<EngineUnitResult>, EngineError> {
+    run_single_with_php(engine_type, ctx, runner, &resolve_php_prefix)
+}
+
+/// Run one engine by `.arcunit` type or `--engine` class name, with an
+/// injectable `php` prefix resolver for the phutil engine.
+///
+/// Every command goes through `runner` so tests inject canned outputs.
+pub fn run_single_with_php(
+    engine_type: &str,
+    ctx: &EngineContext,
+    runner: &dyn CommandRunner,
+    php: &dyn Fn() -> Option<Vec<String>>,
 ) -> Result<Vec<EngineUnitResult>, EngineError> {
     if !CONFIG_AVAILABLE.contains(&engine_type) {
         return Err(EngineError::Usage(format!(
@@ -1607,11 +2225,7 @@ pub fn run_single_with_runner(
             }
             engine.run_with(ctx, runner, &RealPhpunitFs)
         }
-        "PhutilUnitTestEngine" | "phutil" => Err(EngineError::Usage(
-            "Engine 'PhutilUnitTestEngine' executes PHP test cases in-process and requires \
-             a PHP runtime with loaded libraries; arc-rs cannot execute phutil tests."
-                .to_string(),
-        )),
+        "PhutilUnitTestEngine" | "phutil" => run_phutil_with_runner(ctx, runner, engine_type, php),
         "XUnitTestEngine" => run_xunit_with_runner(ctx, runner),
         "CSharpToolsTestEngine" => run_csharp_with_runner(ctx, runner),
         _ => Err(EngineError::Usage(format!(
@@ -1670,7 +2284,8 @@ pub fn run_single_report(
 
 /// Run `.arcunit` engines and merge their results, mirroring
 /// `ArcanistConfigurationDrivenUnitTestEngine::run`
-/// (`ArcanistConfigurationDrivenUnitTestEngine.php:117-170`).
+/// (`ArcanistConfigurationDrivenUnitTestEngine.php:117-170`). The phutil
+/// engine resolves `php` on the real `PATH`; see [`run_config_with_php`].
 pub fn run_config_with_runner(
     planned: &[PlannedEngine],
     project_root: &str,
@@ -1678,6 +2293,28 @@ pub fn run_config_with_runner(
     run_all_tests: bool,
     enable_coverage: Option<bool>,
     runner: &dyn CommandRunner,
+) -> Result<ConfigReport, String> {
+    run_config_with_php(
+        planned,
+        project_root,
+        paths,
+        run_all_tests,
+        enable_coverage,
+        runner,
+        &resolve_php_prefix,
+    )
+}
+
+/// Run `.arcunit` engines with an injectable `php` prefix resolver for
+/// the phutil engine.
+pub fn run_config_with_php(
+    planned: &[PlannedEngine],
+    project_root: &str,
+    paths: &[String],
+    run_all_tests: bool,
+    enable_coverage: Option<bool>,
+    runner: &dyn CommandRunner,
+    php: &dyn Fn() -> Option<Vec<String>>,
 ) -> Result<ConfigReport, String> {
     let child_supports: Vec<bool> = planned
         .iter()
@@ -1700,7 +2337,12 @@ pub fn run_config_with_runner(
     for engine in planned {
         let child =
             unit_config::child_context(&top, engine, supports_run_all_tests(&engine.engine_type));
-        runs.push(run_single_with_runner(&engine.engine_type, &child, runner));
+        runs.push(run_single_with_php(
+            &engine.engine_type,
+            &child,
+            runner,
+            php,
+        ));
     }
     let results = unit_config::merge_engine_runs(runs).map_err(|e| e.message().to_string())?;
     let duration_ms: u64 = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
@@ -1877,6 +2519,270 @@ pub fn render_detailed_coverage_report(data: &str, report: &str) -> String {
     out
 }
 
+/// Escape one string like PHP `json_encode`.
+///
+/// Both unit JSON formats escape `"`, `\`, controls (short forms `\b \f
+/// `\n \r \t`, other C0 as lowercase `\u00xx`) and non-ASCII (lowercase
+/// `\uXXXX`, surrogate pairs past the BMP). Only the ugly format escapes
+/// `/` as `\/`: pretty values use `JSON_UNESCAPED_SLASHES`
+/// (`src/parser/PhutilJSON.php:133-140`). `<`, `>`, `&` stay raw in both
+/// (PHP escapes those only with `JSON_HEX_*`).
+fn php_json_escape_into(out: &mut String, text: &str, escape_slashes: bool) {
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '/' if escape_slashes => out.push_str("\\/"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0C}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c if (c as u32) < 0x80 => out.push(c),
+            c => append_json_unicode_escape(out, c),
+        }
+    }
+}
+
+/// Append a lowercase `\uXXXX` (or surrogate pair) escape for `ch`.
+fn append_json_unicode_escape(out: &mut String, ch: char) {
+    let n = ch as u32;
+    if n < 0x1_0000 {
+        out.push_str(&format!("\\u{n:04x}"));
+    } else {
+        let v = n - 0x1_0000;
+        let hi = 0xD800 + (v >> 10);
+        let lo = 0xDC00 + (v & 0x3FF);
+        out.push_str(&format!("\\u{hi:04x}\\u{lo:04x}"));
+    }
+}
+
+/// Quote one string like PHP `json_encode` renders a scalar.
+fn php_json_string(text: &str, escape_slashes: bool) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    php_json_escape_into(&mut out, text, escape_slashes);
+    out.push('"');
+    out
+}
+
+/// Render a float like `json_encode` (shortest round-trip, `.0` for
+/// integrals); non-finite becomes `null` (durations are always finite).
+fn php_json_number(value: f64) -> String {
+    serde_json::Number::from_f64(value).map_or_else(|| "null".to_string(), |n| n.to_string())
+}
+
+/// Render one `extra`/`coverage` map: `null` when absent, `[]` when empty
+/// (PHP encodes an empty array as a list), else an object. Nested keys are
+/// sorted; PHP keeps insertion order (see the audit note on
+/// [`results_to_json_text`]).
+fn append_json_map(
+    out: &mut String,
+    pairs: Option<&[(String, String)]>,
+    escape_slashes: bool,
+    pretty: bool,
+    depth: usize,
+) {
+    let Some(pairs) = pairs else {
+        out.push_str("null");
+        return;
+    };
+    if pairs.is_empty() {
+        out.push_str("[]");
+        return;
+    }
+    if !pretty {
+        out.push('{');
+        for (i, (key, value)) in pairs.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&php_json_string(key, escape_slashes));
+            out.push(':');
+            out.push_str(&php_json_string(value, escape_slashes));
+        }
+        out.push('}');
+        return;
+    }
+    append_json_map_pretty(out, pairs, depth);
+}
+
+/// Render one non-empty map in `PhutilJSON` pretty form at `depth`.
+fn append_json_map_pretty(out: &mut String, pairs: &[(String, String)], depth: usize) {
+    out.push_str("{\n");
+    for (i, (key, value)) in pairs.iter().enumerate() {
+        if i > 0 {
+            out.push_str(",\n");
+        }
+        append_json_indent(out, depth + 1);
+        out.push_str(&php_json_string(key, false));
+        out.push_str(": ");
+        out.push_str(&php_json_string(value, false));
+    }
+    out.push('\n');
+    append_json_indent(out, depth);
+    out.push('}');
+}
+
+/// Append `depth` levels of two-space `PhutilJSON` indentation.
+fn append_json_indent(out: &mut String, depth: usize) {
+    for _ in 0..depth {
+        out.push_str("  ");
+    }
+}
+
+/// Render one result dict in `toDictionary` key order (compact).
+fn append_result_ugly(out: &mut String, result: &EngineUnitResult) {
+    let dict = result.to_dictionary();
+    out.push_str("{\"namespace\":");
+    append_json_string_or_null(out, dict.namespace.as_deref(), true);
+    out.push_str(",\"name\":");
+    out.push_str(&php_json_string(&dict.name, true));
+    out.push_str(",\"link\":");
+    append_json_string_or_null(out, dict.link.as_deref(), true);
+    out.push_str(",\"result\":");
+    out.push_str(&php_json_string(&dict.result, true));
+    out.push_str(",\"duration\":");
+    append_json_duration(out, dict.duration);
+    out.push_str(",\"extra\":");
+    append_json_map(out, dict.extra.as_deref(), true, false, 0);
+    out.push_str(",\"userData\":");
+    append_json_string_or_null(out, dict.user_data.as_deref(), true);
+    out.push_str(",\"coverage\":");
+    append_json_map(out, dict.coverage.as_deref(), true, false, 0);
+    out.push('}');
+}
+
+/// Render one result dict in `PhutilJSON` pretty form at `depth`.
+fn append_result_pretty(out: &mut String, result: &EngineUnitResult, depth: usize) {
+    let dict = result.to_dictionary();
+    let mut extra = String::new();
+    append_json_map(&mut extra, dict.extra.as_deref(), false, true, depth + 1);
+    let mut coverage = String::new();
+    append_json_map(
+        &mut coverage,
+        dict.coverage.as_deref(),
+        false,
+        true,
+        depth + 1,
+    );
+    let fields = [
+        (
+            "namespace",
+            php_json_string_or_null(dict.namespace.as_deref(), false),
+        ),
+        ("name", php_json_string(&dict.name, false)),
+        ("link", php_json_string_or_null(dict.link.as_deref(), false)),
+        ("result", php_json_string(&dict.result, false)),
+        ("duration", php_json_duration(dict.duration)),
+        ("extra", extra),
+        (
+            "userData",
+            php_json_string_or_null(dict.user_data.as_deref(), false),
+        ),
+        ("coverage", coverage),
+    ];
+    out.push('{');
+    for (i, (key, value)) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('\n');
+        append_json_indent(out, depth + 1);
+        out.push_str(&php_json_string(key, false));
+        out.push_str(": ");
+        out.push_str(value);
+    }
+    out.push('\n');
+    append_json_indent(out, depth);
+    out.push('}');
+}
+
+/// Render an optional string as a JSON string or `null`.
+fn append_json_string_or_null(out: &mut String, value: Option<&str>, escape_slashes: bool) {
+    match value {
+        Some(text) => out.push_str(&php_json_string(text, escape_slashes)),
+        None => out.push_str("null"),
+    }
+}
+
+/// Render an optional string as a JSON string or `null` (owned form).
+fn php_json_string_or_null(value: Option<&str>, escape_slashes: bool) -> String {
+    value.map_or_else(
+        || "null".to_string(),
+        |text| php_json_string(text, escape_slashes),
+    )
+}
+
+/// Render an optional duration as a JSON number or `null`.
+fn append_json_duration(out: &mut String, duration: Option<f64>) {
+    match duration {
+        Some(value) => out.push_str(&php_json_number(value)),
+        None => out.push_str("null"),
+    }
+}
+
+/// Render an optional duration as a JSON number or `null` (owned form).
+fn php_json_duration(duration: Option<f64>) -> String {
+    duration.map_or_else(|| "null".to_string(), php_json_number)
+}
+
+/// Encode results exactly like PHP renders them
+/// (`ArcanistUnitWorkflow.php:258-266`).
+///
+/// Ugly is `json_encode($data)`: a compact array, `/` escaped as `\/`,
+/// no trailing newline. Pretty is `PhutilJSON::encodeFormatted($data)`:
+/// note it formats the result *list* as an object with numeric keys
+/// (`encodeFormatted` always calls `encodeFormattedObject`), slashes
+/// unescaped, one trailing newline; empty results render `{}`.
+///
+/// Audit note (serde vs PHP): serde_json sorts keys (PHP keeps
+/// `toDictionary` insertion order), never escapes `/`, and emits raw
+/// UTF-8 (PHP `\uXXXX`-escapes non-ASCII) and `{}` for empty maps (PHP
+/// emits `[]` for empty arrays), so both formats render here by hand.
+/// Remaining known divergences: nested `extra`/`coverage` key order
+/// (sorted here, first-seen in PHP) and Harbormaster upload encoding
+/// (the shared conduit client serializes with serde).
+#[must_use]
+pub fn results_to_json_text(results: &[EngineUnitResult], pretty: bool) -> String {
+    if pretty {
+        results_to_json_pretty(results)
+    } else {
+        let mut out = String::from("[");
+        for (i, result) in results.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            append_result_ugly(&mut out, result);
+        }
+        out.push(']');
+        out
+    }
+}
+
+/// Pretty results: an object with numeric keys plus one trailing newline.
+fn results_to_json_pretty(results: &[EngineUnitResult]) -> String {
+    if results.is_empty() {
+        return "{}\n".to_string();
+    }
+    let mut out = String::from("{");
+    for (i, result) in results.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('\n');
+        append_json_indent(&mut out, 1);
+        out.push_str(&php_json_string(&i.to_string(), false));
+        out.push_str(": ");
+        append_result_pretty(&mut out, result, 1);
+    }
+    out.push_str("\n}\n");
+    out
+}
+
 /// Encode results as a JSON array of `toDictionary` objects
 /// (`ArcanistUnitWorkflow.php:258`, `ArcanistUnitTestResult.php:164-175`),
 /// in `toDictionary` key order with `null` for missing values.
@@ -1997,8 +2903,9 @@ pub fn upload_results(
 /// Render a full workflow report to stdout text (pure helper for tests).
 ///
 /// `full` echoes per-result lines plus the coverage report when coverage is
-/// present; `json` pretty-prints the `toDictionary` array; `ugly` compacts
-/// it; `none` prints nothing (`ArcanistUnitWorkflow.php:178-273`).
+/// present; `json` pretty-prints the `toDictionary` list (as a
+/// numeric-keyed object, like `PhutilJSON`); `ugly` compacts it to a JSON
+/// array; `none` prints nothing (`ArcanistUnitWorkflow.php:178-273`).
 #[must_use]
 pub fn render_workflow_output(
     results: &[EngineUnitResult],
@@ -2008,18 +2915,8 @@ pub fn render_workflow_output(
     project_root: &Path,
 ) -> String {
     match output_format {
-        "json" => {
-            let mut text = serde_json::to_string_pretty(&results_to_json(results))
-                .unwrap_or_else(|_| "[]".to_string());
-            text.push('\n');
-            text
-        }
-        "ugly" => {
-            let mut text = serde_json::to_string(&results_to_json(results))
-                .unwrap_or_else(|_| "[]".to_string());
-            text.push('\n');
-            text
-        }
+        "json" => results_to_json_text(results, true),
+        "ugly" => results_to_json_text(results, false),
         "none" => String::new(),
         _ => {
             let mut out = String::new();
@@ -2057,6 +2954,9 @@ fn run_cargo_selection(opts: &Options, cwd: &Path) -> ExitCode {
     if let Err(msg) = check_everything_paths(opts.everything, &opts.paths) {
         eprintln!("arc-rs unit: {msg}");
         return ExitCode::FAILURE;
+    }
+    if let Some(warning) = cargo_coverage_warning(opts) {
+        eprintln!("{warning}");
     }
     match execute(opts, cwd, None) {
         Ok(report) => {
