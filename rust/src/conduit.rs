@@ -5,7 +5,8 @@
 
 use std::time::Duration;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+// PHP parity: `ConduitClient::$timeout` defaults to 300 seconds.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
