@@ -67,11 +67,22 @@ pub fn find_on_path(path_env: &std::ffi::OsStr, binary: &str) -> Option<PathBuf>
     None
 }
 
-/// Locate `python3` on the real `$PATH`.
+/// Candidate interpreter names: stock Windows installs call it `python`.
+fn interpreter_candidates() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["python3", "python"]
+    } else {
+        &["python3"]
+    }
+}
+
+/// Locate a Python 3 interpreter on the real `$PATH`.
 #[must_use]
 pub fn python3_on_path() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    find_on_path(&path, "python3")
+    interpreter_candidates()
+        .iter()
+        .find_map(|binary| find_on_path(&path, binary))
 }
 
 /// Locate `support/arcanoid/arcanoid.py` at or above `start`.
@@ -116,7 +127,7 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
     }
     let Some(python) = python3_on_path() else {
         eprintln!(
-            "arc-rs {NAME}: The \"arc-rs anoid\" workflow requires \"python3\" to be available in your $PATH."
+            "arc-rs {NAME}: The \"arc-rs anoid\" workflow requires Python 3 on your $PATH (python3, or python on Windows)."
         );
         return ExitCode::FAILURE;
     };

@@ -128,3 +128,10 @@ fn run_in_fails_without_python_or_script() {
         std::process::ExitCode::SUCCESS
     );
 }
+
+#[test]
+fn interpreter_candidates_cover_platform() {
+    let found = interpreter_candidates();
+    assert!(found.contains(&"python3"));
+    assert_eq!(found.contains(&"python"), cfg!(windows));
+}
