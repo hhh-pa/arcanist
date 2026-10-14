@@ -966,3 +966,38 @@ echo hi
     let err = output_with(&fake.dir, &svn, &[]).unwrap_err();
     assert!(err.contains("failed to run"), "{err}");
 }
+#[test]
+fn normalizes_status_path_separators() {
+    assert_eq!(normalize_status_path("sub\\file.txt"), "sub/file.txt");
+    assert_eq!(normalize_status_path("plain/path.txt"), "plain/path.txt");
+    assert_eq!(normalize_status_path(""), "");
+}
+
+#[test]
+fn apply_externals_flags_only_paths_under_externals() {
+    let mut files = status_of(&[
+        ("lib/a.txt", FLAG_MODIFIED),
+        ("lib/sub/b.txt", FLAG_MODIFIED),
+        ("lib-other/c.txt", FLAG_MODIFIED),
+        ("top.txt", FLAG_MODIFIED),
+    ]);
+    apply_externals(&mut files, &["lib".to_string()]);
+    assert_eq!(files["lib/a.txt"], FLAG_MODIFIED | FLAG_EXTERNALS);
+    assert_eq!(files["lib/sub/b.txt"], FLAG_MODIFIED | FLAG_EXTERNALS);
+    assert_eq!(files["lib-other/c.txt"], FLAG_MODIFIED);
+    assert_eq!(files["top.txt"], FLAG_MODIFIED);
+}
+
+#[test]
+fn paths_with_mask_selects_flagged_paths_in_order() {
+    let files = status_of(&[
+        ("b.txt", FLAG_UNTRACKED),
+        ("a.txt", FLAG_MODIFIED | FLAG_UNTRACKED),
+        ("c.txt", FLAG_MODIFIED),
+    ]);
+    assert_eq!(
+        paths_with_mask(&files, FLAG_UNTRACKED),
+        vec!["a.txt".to_string(), "b.txt".to_string()]
+    );
+    assert!(paths_with_mask(&files, FLAG_CONFLICT).is_empty());
+}

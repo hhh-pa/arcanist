@@ -171,3 +171,36 @@ fn usage_covers_files_and_seed() {
     assert!(text.contains("<file>"));
     assert!(text.contains("--seed"));
 }
+#[test]
+fn weld_line_bytes_fuses_invalid_utf8_bytewise() {
+    let earlier = b"\xff\xfe data\n";
+    let later = b"xy\n";
+    for seed in 0..25 {
+        let mut rng = Rng::new(seed);
+        let out = weld_line_bytes(earlier, later, 0.5, &mut rng);
+        assert!(out.ends_with(b"\n"), "seed={seed} {out:?}");
+        let body = &out[..out.len() - 1];
+        assert_eq!(body.len(), earlier.len() - 1, "seed={seed} {out:?}");
+        for (index, byte) in body.iter().enumerate() {
+            let choices = [earlier[index], *later.get(index).unwrap_or(&b' ')];
+            assert!(choices.contains(byte), "seed={seed} index={index} {out:?}");
+        }
+    }
+}
+
+#[test]
+fn weld_buffers_skips_empty_and_is_deterministic() {
+    let files = vec![b"alpha\n".to_vec(), vec![], b"beta\n".to_vec()];
+    let no_empty = vec![b"alpha\n".to_vec(), b"beta\n".to_vec()];
+    let mut first = Rng::new(11);
+    let mut second = Rng::new(11);
+    assert_eq!(
+        weld_buffers(&files, &mut first),
+        weld_buffers(&no_empty, &mut second)
+    );
+    let mut third = Rng::new(7);
+    assert_eq!(
+        weld_buffers(&[b"a\nb\n".to_vec()], &mut third),
+        b"a\nb\n".to_vec()
+    );
+}

@@ -1197,3 +1197,25 @@ echo hi
     let err = output_with(&fake.dir, &hg, &[]).unwrap_err();
     assert!(err.contains("failed to run"), "{err}");
 }
+#[test]
+fn commit_range_status_parses_like_plain_status() {
+    let sample = "M a.txt\nA b.txt\nR c.txt\n! d.txt\n? e.txt\n";
+    assert_eq!(
+        commit_range_status_from_output(sample).unwrap(),
+        parse_mercurial_status(sample).unwrap()
+    );
+    assert!(commit_range_status_from_output("").unwrap().is_empty());
+}
+
+#[test]
+fn paths_with_mask_selects_flagged_paths_in_order() {
+    let mut status = StatusMap::new();
+    status.insert("b".to_string(), FLAG_UNTRACKED);
+    status.insert("a".to_string(), FLAG_MODIFIED | FLAG_UNTRACKED);
+    status.insert("c".to_string(), FLAG_MODIFIED);
+    assert_eq!(
+        paths_with_mask(&status, FLAG_UNTRACKED),
+        vec!["a".to_string(), "b".to_string()]
+    );
+    assert!(paths_with_mask(&status, FLAG_CONFLICT).is_empty());
+}
