@@ -7,10 +7,10 @@ CLI behavior, ported workflow by workflow with `arc` as the reference.
 
 | Command | State |
 |---|---|
-| `diff` | planned |
-| `land` | planned |
-| `lint` | planned |
-| `unit` | planned |
+| `diff` | basic (local stat+patch/`--json` vs base; no Differential submit) |
+| `land` | basic (squash onto local branch; `--preview`/`--push`; no Differential checks) |
+| `lint` | basic (TextLinter TXT2/TXT4/TXT6; changed-files or PATHS; `--json`) |
+| `unit` | basic (cargo engine only: exit-status pass/fail, `--json`, no per-test parsing) |
 | `call-conduit` | basic (direct HTTP/S, `~/.arcrc` token) |
 
 The Conduit client (mirroring `src/conduit/ConduitClient.php`) is the next

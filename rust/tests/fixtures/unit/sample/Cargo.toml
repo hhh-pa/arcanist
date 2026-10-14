@@ -1,0 +1,7 @@
+[package]
+name = "sample"
+version = "0.1.0"
+edition = "2021"
+
+# Pin as its own workspace so cargo never walks up into the arc-rs tree.
+[workspace]

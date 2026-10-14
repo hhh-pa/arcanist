@@ -1,25 +1,30 @@
 //! `arc-rs` — Rust port of Arcanist.
 //!
-//! Tracks T1128. Only `call-conduit` is implemented so far; other
-//! subcommands are planned behind the same names `arc` uses.
+//! Tracks T1128. `call-conduit`, `diff`, `lint`, `unit`, and `land` are
+//! implemented; remaining subcommands keep the same names `arc` uses.
 
 use std::process::ExitCode;
 
-use arc_rs::{conduit, config};
+use arc_rs::{conduit, config, diff, land, lint, unit};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const PLANNED: &[&str] = &["diff", "land", "lint", "unit"];
+const PLANNED: &[&str] = &[];
 
 fn usage() -> String {
-    let planned = PLANNED
-        .iter()
-        .map(|c| format!("  {c}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "usage: arc-rs [--version] [--help] <command>\n\nimplemented commands:\n  call-conduit <method> [params-json] [--conduit-uri URI]\n\nplanned commands (not yet ported):\n{planned}\n"
-    )
+    let mut text = "usage: arc-rs [--version] [--help] <command>\n\nimplemented commands:\n  call-conduit <method> [params-json] [--conduit-uri URI]\n  diff [--base REV] [--json]\n  land [--onto BRANCH] [--preview] [--push]\n  lint [PATHS...] [--json]\n  unit [-- <cargo-test-args>]\n"
+        .to_string();
+    if !PLANNED.is_empty() {
+        let planned = PLANNED
+            .iter()
+            .map(|c| format!("  {c}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        text.push_str(&format!(
+            "\nplanned commands (not yet ported):\n{planned}\n"
+        ));
+    }
+    text
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -134,6 +139,16 @@ fn run_call_conduit(args: &CallArgs) -> ExitCode {
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(cmd) = argv.first() {
+        let rest = &argv[1..];
+        match cmd.as_str() {
+            "diff" => return diff::run(rest),
+            "land" => return land::run(rest),
+            "lint" => return lint::run(rest),
+            "unit" => return unit::run(rest),
+            _ => {}
+        }
+    }
     match classify(&argv) {
         Action::Help => {
             print!("{}", usage());
