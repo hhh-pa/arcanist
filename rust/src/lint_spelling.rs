@@ -230,6 +230,8 @@ fn spelling_message(
         description: format!(
             "Possible spelling error. You wrote '{word}', but did you mean '{correction}'?"
         ),
+        original: None,
+        replacement: None,
     }
 }
 

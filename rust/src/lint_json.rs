@@ -77,6 +77,8 @@ impl Linter for JsonLinter {
                 severity: arc_rs::lint::SEVERITY_ERROR.to_string(),
                 name: NAME_PARSE_ERROR.to_string(),
                 description: message,
+                original: None,
+                replacement: None,
             }],
         }
     }

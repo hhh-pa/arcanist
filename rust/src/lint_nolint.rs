@@ -42,6 +42,10 @@ impl Linter for NoLintLinter {
         "NOLINT"
     }
 
+    fn priority(&self) -> f64 {
+        0.25
+    }
+
     fn lint_bytes(&self, _path: &str, _data: &[u8]) -> Vec<arc_rs::lint::LintMessage> {
         Vec::new()
     }

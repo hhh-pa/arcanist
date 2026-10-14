@@ -146,6 +146,8 @@ fn parse_offense(path: &str, offense: &serde_json::Value) -> Option<LintMessage>
         severity: severity_for(severity_word).to_string(),
         name: "RuboCop".to_string(),
         description,
+        original: None,
+        replacement: None,
     })
 }
 

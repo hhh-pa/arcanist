@@ -44,18 +44,35 @@ impl Linter for FilenameLinter {
         "NAME"
     }
 
+    // PHP lints binary files, directories, and symlinks with this
+    // linter (`ArcanistFilenameLinter.php:28-54`).
+    fn should_lint_binary_files(&self) -> bool {
+        true
+    }
+
+    fn should_lint_directories(&self) -> bool {
+        true
+    }
+
+    fn should_lint_symbolic_links(&self) -> bool {
+        true
+    }
+
     fn lint_bytes(&self, path: &str, _data: &[u8]) -> Vec<LintMessage> {
         if is_valid_filename(path) {
             return Vec::new();
         }
         vec![LintMessage {
             path: path.to_string(),
-            line: 1,
-            col: 1,
+            // Path-level (`raiseLintAtPath()`): no line or char.
+            line: 0,
+            col: 0,
             code: CODE_BAD_FILENAME.to_string(),
             severity: arc_rs::lint::SEVERITY_ERROR.to_string(),
             name: NAME_BAD_FILENAME.to_string(),
             description: DESC_BAD_FILENAME.to_string(),
+            original: None,
+            replacement: None,
         }]
     }
 }

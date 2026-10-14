@@ -85,7 +85,7 @@ fn failed_parse_yields_one_unable_to_parse_warning() {
         let messages = parse_output("src/a.php", exit_code, "", "boom");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].path, "src/a.php");
-        assert_eq!((messages[0].line, messages[0].col), (1, 1));
+        assert_eq!((messages[0].line, messages[0].col), (0, 0));
         assert_eq!(messages[0].code, "XHP2");
         assert_eq!(messages[0].name, "Unable to Parse");
         assert_eq!(messages[0].severity, "warning");

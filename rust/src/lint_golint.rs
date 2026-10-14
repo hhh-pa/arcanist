@@ -198,6 +198,8 @@ pub fn parse_output(path: &str, exit_code: i32, stdout: &str, _stderr: &str) -> 
             severity: SEVERITY_ADVICE.to_string(),
             name: "GOLINT".to_string(),
             description: ucfirst(message.trim()),
+            original: None,
+            replacement: None,
         });
     }
     out

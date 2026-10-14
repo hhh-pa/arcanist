@@ -119,6 +119,8 @@ pub fn parse_lint_output(path: &str, stderr: &str) -> Vec<LintMessage> {
                 severity: arc_rs::lint::SEVERITY_ERROR.to_string(),
                 name: human.to_string(),
                 description: ucfirst(&description),
+                original: None,
+                replacement: None,
             }),
             None => messages.push(failure_message(
                 path,
@@ -287,6 +289,8 @@ fn failure_message(path: &str, description: &str, line: usize, col: usize) -> Li
         severity: arc_rs::lint::SEVERITY_ERROR.to_string(),
         name: LINTER_NAME.to_string(),
         description: description.to_string(),
+        original: None,
+        replacement: None,
     }
 }
 

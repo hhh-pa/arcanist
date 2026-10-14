@@ -20,6 +20,8 @@ fn canned_parser(
         severity: "error".to_string(),
         name: "External".to_string(),
         description: stdout.to_string(),
+        original: None,
+        replacement: None,
     }])
 }
 

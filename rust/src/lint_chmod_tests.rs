@@ -42,7 +42,7 @@ fn executable_text_needs_a_shebang() {
     assert_eq!(found[0].code, "CHMOD1");
     assert_eq!(found[0].severity, "warning");
     assert_eq!(found[0].name, "Invalid Executable");
-    assert_eq!((found[0].line, found[0].col), (1, 1));
+    assert_eq!((found[0].line, found[0].col), (0, 0));
     assert_eq!(
         found[0].description,
         "Executable files should either be binary or contain a shebang."

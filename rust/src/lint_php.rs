@@ -200,6 +200,8 @@ pub fn parse_output(path: &str, _exit_code: i32, stdout: &str, stderr: &str) -> 
             severity: SEVERITY_ERROR.to_string(),
             name: name.to_string(),
             description: message,
+            original: None,
+            replacement: None,
         }];
     }
     Vec::new()

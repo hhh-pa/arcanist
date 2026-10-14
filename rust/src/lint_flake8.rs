@@ -144,6 +144,8 @@ fn parse_at(path: &str, line: &str, colon: usize) -> Option<LintMessage> {
         severity: severity_for(code).to_string(),
         name: format!("flake8 {code}"),
         description,
+        original: None,
+        replacement: None,
     })
 }
 

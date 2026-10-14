@@ -255,12 +255,15 @@ pub fn check_bytes(path: &str, data: &[u8], is_executable: bool) -> Vec<LintMess
 fn invalid_executable(path: &str, description: &str) -> LintMessage {
     LintMessage {
         path: path.to_string(),
-        line: 1,
-        col: 1,
+        // Path-level (`raiseLintAtPath()`): no line or char.
+        line: 0,
+        col: 0,
         code: CODE_INVALID_EXECUTABLE.to_string(),
         severity: SEVERITY_WARNING.to_string(),
         name: NAME_INVALID_EXECUTABLE.to_string(),
         description: description.to_string(),
+        original: None,
+        replacement: None,
     }
 }
 
@@ -292,6 +295,12 @@ fn is_executable_permissions(_meta: &std::fs::Metadata) -> bool {
 impl Linter for ChmodLinter {
     fn name(&self) -> &'static str {
         "CHMOD"
+    }
+
+    // PHP lints binaries with this linter
+    // (`ArcanistChmodLinter.php:40-42`).
+    fn should_lint_binary_files(&self) -> bool {
+        true
     }
 
     fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {

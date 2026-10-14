@@ -235,6 +235,8 @@ pub fn parse_output(path: &str, exit_code: i32, _stdout: &str, stderr: &str) -> 
                 severity: lint_severity.to_string(),
                 name: id.clone(),
                 description: msg.clone(),
+                original: None,
+                replacement: None,
             });
         }
     }

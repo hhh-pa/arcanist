@@ -267,6 +267,8 @@ fn parse_issue(path: &str, issue: &serde_json::Value) -> Option<LintMessage> {
         severity: cslint_severity(index.get("Severity")).to_string(),
         name: text("Name").to_string(),
         description,
+        original: None,
+        replacement: None,
     })
 }
 

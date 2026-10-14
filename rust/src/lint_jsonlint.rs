@@ -104,6 +104,8 @@ pub fn parse_compact_output(path: &str, stderr: &str) -> Vec<LintMessage> {
                 severity: arc_rs::lint::SEVERITY_ERROR.to_string(),
                 name: LINTER_NAME.to_string(),
                 description,
+                original: None,
+                replacement: None,
             });
         }
     }
@@ -172,6 +174,8 @@ pub fn native_json_check(path: &str, data: &[u8]) -> Vec<LintMessage> {
             severity: arc_rs::lint::SEVERITY_ERROR.to_string(),
             name: NATIVE_NAME.to_string(),
             description: short_message(&error.to_string()),
+            original: None,
+            replacement: None,
         }],
     }
 }
@@ -287,6 +291,8 @@ fn failure_message(path: &str, description: &str) -> LintMessage {
         severity: arc_rs::lint::SEVERITY_ERROR.to_string(),
         name: LINTER_NAME.to_string(),
         description: description.to_string(),
+        original: None,
+        replacement: None,
     }
 }
 
