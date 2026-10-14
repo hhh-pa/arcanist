@@ -32,8 +32,10 @@ RUN mkdir -p /tmp/prov-work \
     && python3 /tmp/gates-lib/rust-quality-gates.py /tmp/prov-work --provision-only \
     && rm -rf /tmp/prov-work /tmp/gates-lib /usr/local/cargo/registry
 
-# Warm the registry cache for the workspace dependencies.
+# Warm the registry cache for the workspace dependencies. Cargo requires at
+# least one target to resolve a manifest, hence the dummy main.
 COPY rust/Cargo.toml rust/Cargo.lock /tmp/fetch/rust/
-RUN cd /tmp/fetch/rust && cargo fetch && rm -rf /tmp/fetch /usr/local/cargo/registry/src
+RUN mkdir -p /tmp/fetch/rust/src && touch /tmp/fetch/rust/src/main.rs \
+    && cd /tmp/fetch/rust && cargo fetch && rm -rf /tmp/fetch /usr/local/cargo/registry/src
 
 WORKDIR /work

@@ -52,18 +52,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      # Public image repo for the cached gate image. Override the namespace
-      # with the DOCKERHUB_NAMESPACE repo variable; pushes need the
-      # DOCKERHUB_USERNAME / DOCKERHUB_TOKEN secrets (a namespace PAT with
-      # read+write). Without the token the image builds local-only and the
-      # gates still run (fork PRs stay green, just slower).
-      GATE_IMAGE: ${{ vars.DOCKERHUB_NAMESPACE || 'm-hu' }}/arcanist-quality-gates
+      # Image repo for the cached gate image (public, so pulls stay
+      # anonymous). Override with the GATE_IMAGE repo variable; pushes need
+      # the DOCKERHUB_USERNAME / DOCKERHUB_TOKEN secrets (a PAT with
+      # read+write on the namespace). Without the token the image builds
+      # local-only and the gates still run (fork PRs stay green, slower).
+      GATE_IMAGE: ${{ vars.GATE_IMAGE || 'hhhpa/arcanist' }}
     steps:
       - uses: actions/checkout@v4
       # Cache key: every input the image depends on. A hit pulls the image
       # and runs the gates in it; a miss rebuilds, pushes, then runs.
       - name: compute image key
-        run: echo "GATE_KEY=${{ hashFiles('rust/Cargo.lock', 'scripts/ci/quality-gates.Dockerfile', 'scripts/ci/lib/*.py') }}" >> "$GITHUB_ENV"
+        run: |
+          key="${{ hashFiles('rust/Cargo.lock', 'scripts/ci/quality-gates.Dockerfile', 'scripts/ci/lib/*.py') }}"
+          echo "GATE_KEY=$key" >> "$GITHUB_ENV"
+          echo "Gate image: $GATE_IMAGE:$key"
       - name: pull gate image
         id: pull
         continue-on-error: true
