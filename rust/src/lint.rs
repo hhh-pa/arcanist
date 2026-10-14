@@ -1,17 +1,30 @@
-//! `lint` workflow: text lint rules (T1128).
+//! `lint` workflow: run ported linters (T1128).
 //!
-//! PHP references: `src/lint/linter/ArcanistTextLinter.php` (rules and
-//! messages), `src/lint/ArcanistLintSeverity.php` (severities), and
-//! `src/workflow/ArcanistLintWorkflow.php` (CLI flags).
+//! PHP references: `src/lint/linter/ArcanistTextLinter.php` (text rules and
+//! messages), `src/lint/ArcanistLintSeverity.php` (severities),
+//! `src/workflow/ArcanistLintWorkflow.php` (CLI flags, including
+//! `--severity`), `src/workflow/ArcanistWorkflow.php` (`newLintEngine()`),
+//! and `src/lint/engine/ArcanistConfigurationDrivenLintEngine.php`
+//! (`.arclint` selection).
 //!
 //! Scope: a small [`Linter`] trait plus an [`Engine`], with [`TextLinter`]
 //! covering trailing whitespace, tab literals, and a missing newline at
 //! end of file. Severities mirror the PHP linter: trailing whitespace is
 //! `autofix`, tab literals and a missing EOF newline are `error`.
 //!
-//! Out of scope (rejected with a not-yet-ported message): other linters
+//! Run wiring: [`discover_arclint`] finds the nearest `.arclint` at or
+//! above the working directory; when one exists the engine runs only the
+//! configured linters ([`Engine::from_config`], exact PHP configuration
+//! names via [`crate::arclint`]). Without a config every ported linter
+//! runs, exactly as before. `--severity` filters messages by minimum
+//! severity, defaulting to `advice` like the PHP workflow.
+//!
+//! Out of scope (rejected with a not-yet-ported message): other engines
 //! (`--engine`), autofix application (`--apply-patches`, `--amend-all`,
 //! `--amend-autofixes`), and linting committed ranges (`--rev`).
+//! Per-linter `.arclint` keys (include/exclude routing, `severity` maps,
+//! per-tool binary paths) parse but are not applied yet: routing and
+//! `severity.rules` need a regex engine the dependency set lacks.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -19,7 +32,15 @@ use std::process::{Command, ExitCode};
 pub const NAME: &str = "lint";
 
 pub const SEVERITY_ERROR: &str = "error";
+pub const SEVERITY_WARNING: &str = "warning";
 pub const SEVERITY_AUTOFIX: &str = "autofix";
+pub const SEVERITY_ADVICE: &str = "advice";
+pub const SEVERITY_DISABLED: &str = "disabled";
+
+/// Default minimum severity, mirroring
+/// `ArcanistLintWorkflow::DEFAULT_SEVERITY`
+/// (`src/workflow/ArcanistLintWorkflow.php:13`).
+pub const DEFAULT_SEVERITY: &str = SEVERITY_ADVICE;
 
 const CODE_TAB: &str = "TXT2";
 const CODE_EOF_NEWLINE: &str = "TXT4";
@@ -34,7 +55,7 @@ const DESC_EOF_NEWLINE: &str = "Files must end in a newline.";
 const DESC_TRAILING: &str = "This line contains trailing whitespace. Consider setting up your editor to automatically remove trailing whitespace.";
 
 fn usage() -> String {
-    "usage: arc-rs lint [PATHS...] [--json]\n\
+    "usage: arc-rs lint [PATHS...] [--json] [--severity LEVEL]\n\
      \n\
      Run text lint rules (trailing whitespace, tab literals, missing EOF\n\
      newline).\n\
@@ -43,19 +64,61 @@ fn usage() -> String {
      tree versus HEAD (staged plus unstaged). Explicit paths must exist;\n\
      directories are walked recursively.\n\
      \n\
+     When an .arclint file exists at or above the working directory, only\n\
+     its configured linters run; otherwise every ported linter runs.\n\
+     \n\
      Output is one line per message as path:line:col: severity: message,\n\
      or a JSON array of message objects with --json. Exits non-zero when\n\
      any error-severity message is found.\n\
      \n\
      Options:\n\
-     \x20 --json        Emit a JSON array of message objects.\n\
-     \x20 -h, --help    Show this help.\n\
+     \x20 --json              Emit a JSON array of message objects.\n\
+     \x20 --severity LEVEL    Only show messages at or above LEVEL: advice,\n\
+     \x20                     autofix, warning, error, disabled. Defaults\n\
+     \x20                     to 'advice'.\n\
+     \x20 -h, --help          Show this help.\n\
      \n\
      Not yet ported (see T1128): other linters (--engine), autofix\n\
      (--apply-patches, --amend-all, --amend-autofixes), linting committed\n\
-     ranges (--rev), and --everything/--lintall/--severity/--output/\n\
-     --outfile/--never-apply-patches.\n"
+     ranges (--rev), and --everything/--lintall/--output/--outfile/\n\
+     --never-apply-patches.\n"
         .to_string()
+}
+
+/// Rank of a severity level, mirroring
+/// `ArcanistLintSeverity::isAtLeastAsSevere()`
+/// (`src/lint/ArcanistLintSeverity.php:34-48`): disabled 10, advice 20,
+/// autofix 25, warning 30, error 40.
+fn severity_rank(severity: &str) -> Option<u32> {
+    match severity {
+        SEVERITY_DISABLED => Some(10),
+        SEVERITY_ADVICE => Some(20),
+        SEVERITY_AUTOFIX => Some(25),
+        SEVERITY_WARNING => Some(30),
+        SEVERITY_ERROR => Some(40),
+        _ => None,
+    }
+}
+
+/// True when a message with `message_severity` passes a `minimum` filter,
+/// mirroring `ArcanistLintSeverity::isAtLeastAsSevere()`: unknown message
+/// severities pass, and an unknown minimum passes everything.
+#[must_use]
+pub fn severity_allows(message_severity: &str, minimum: &str) -> bool {
+    let Some(rank) = severity_rank(message_severity) else {
+        return true;
+    };
+    rank >= severity_rank(minimum).unwrap_or(0)
+}
+
+/// Drop messages below `minimum`, mirroring the engine-side
+/// `isSeverityEnabled()` filter (`src/lint/engine/ArcanistLintEngine.php:272-275`).
+#[must_use]
+pub fn filter_by_severity(messages: Vec<LintMessage>, minimum: &str) -> Vec<LintMessage> {
+    messages
+        .into_iter()
+        .filter(|message| severity_allows(&message.severity, minimum))
+        .collect()
 }
 
 /// A single lint finding, mirroring `ArcanistLintMessage`.
@@ -215,12 +278,42 @@ pub fn all_linters() -> Vec<Box<dyn Linter>> {
     ]
 }
 
+/// Find the nearest `.arclint` file at or above `start`. PHP looks only
+/// at the project root (`ArcanistWorkflow.php:2065` `newLintEngine()` via
+/// `ArcanistWorkingCopyIdentity::getProjectPath()`); the upward walk
+/// generalizes that so nested working directories resolve their project
+/// config. A file `start` resolves from its parent directory.
+#[must_use]
+pub fn discover_arclint(start: &Path) -> Option<PathBuf> {
+    let mut dir = if start.is_file() {
+        start.parent().map(Path::to_path_buf)?
+    } else {
+        start.to_path_buf()
+    };
+    loop {
+        let candidate = dir.join(crate::arclint::CONFIG_FILE_NAME);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
+}
+
 impl Engine {
     #[must_use]
     pub fn new() -> Self {
         Self {
             linters: all_linters(),
         }
+    }
+
+    /// An engine running only the linters `config` selects, matched by
+    /// exact PHP display name against [`all_linters`].
+    #[must_use]
+    pub fn from_config(config: &crate::arclint::ArclintConfig) -> Self {
+        let mut linters = all_linters();
+        crate::arclint::retain_selected(&mut linters, |linter| linter.name(), config);
+        Self { linters }
     }
 
     #[must_use]
@@ -237,8 +330,13 @@ impl Engine {
     #[must_use]
     pub fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {
         // PHP `shouldStopAllLinters`: generated and `@nolint` files skip
-        // every linter.
-        if crate::lint_generated::is_generated(data) || crate::lint_nolint::is_nolint(data) {
+        // every linter, but only when the stopping linter (`GEN`,
+        // `NOLINT`) is part of the engine.
+        let generated = self.linters.iter().any(|linter| linter.name() == "GEN")
+            && crate::lint_generated::is_generated(data);
+        let nolint = self.linters.iter().any(|linter| linter.name() == "NOLINT")
+            && crate::lint_nolint::is_nolint(data);
+        if generated || nolint {
             return Vec::new();
         }
         let mut out = Vec::new();
@@ -333,10 +431,28 @@ fn trailing_in_line(data: &[u8], start: usize, end: usize) -> Option<(usize, usi
     }
 }
 
+/// Resolve the engine for a working directory: the nearest `.arclint`
+/// at or above `dir` selects the linters, or every ported linter runs
+/// when no config is found. Returns the engine plus the config path used,
+/// if any. An unreadable or invalid config is an error, mirroring the PHP
+/// engine which throws (`ArcanistConfigurationDrivenLintEngine.php:9-30`).
+pub fn engine_for_dir(dir: &Path) -> Result<(Engine, Option<PathBuf>), String> {
+    let Some(config_path) = discover_arclint(dir) else {
+        return Ok((Engine::new(), None));
+    };
+    let root = config_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| dir.to_path_buf());
+    let config = crate::arclint::load_arclint(&root)?;
+    Ok((Engine::from_config(&config), Some(config_path)))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct LintArgs {
     paths: Vec<String>,
     json: bool,
+    severity: String,
 }
 
 enum ParseOutcome {
@@ -355,21 +471,33 @@ fn not_yet_ported_reason(flag: &str) -> Option<&'static str> {
         "--rev" => Some("linting committed ranges"),
         "--apply-patches" | "--amend-all" | "--amend-autofixes" => Some("autofix"),
         "--engine" => Some("other linters"),
-        "--everything"
-        | "--lintall"
-        | "--severity"
-        | "--output"
-        | "--outfile"
-        | "--never-apply-patches" => Some("extended lint options"),
+        "--everything" | "--lintall" | "--output" | "--outfile" | "--never-apply-patches" => {
+            Some("extended lint options")
+        }
         _ => None,
+    }
+}
+
+fn check_severity(value: &str) -> Result<(), String> {
+    if crate::arclint::is_valid_severity(value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "unknown severity '{value}' (expected one of: {})",
+            crate::arclint::SEVERITIES.join(", ")
+        ))
     }
 }
 
 fn parse_args(argv: &[String]) -> ParseOutcome {
     let mut paths = Vec::new();
     let mut json = false;
+    let mut severity = DEFAULT_SEVERITY.to_string();
     let mut end_of_flags = false;
-    for arg in argv {
+    let mut index = 0;
+    while index < argv.len() {
+        let arg = &argv[index];
+        index += 1;
         if end_of_flags {
             paths.push(arg.clone());
         } else if arg == "--" {
@@ -380,6 +508,20 @@ fn parse_args(argv: &[String]) -> ParseOutcome {
             return ParseOutcome::Help;
         } else if arg == "-" {
             paths.push(arg.clone());
+        } else if arg == "--severity" {
+            let Some(value) = argv.get(index) else {
+                return ParseOutcome::Error("--severity requires a value".to_string());
+            };
+            index += 1;
+            if let Err(message) = check_severity(value) {
+                return ParseOutcome::Error(message);
+            }
+            severity = value.clone();
+        } else if let Some(value) = arg.strip_prefix("--severity=") {
+            if let Err(message) = check_severity(value) {
+                return ParseOutcome::Error(message);
+            }
+            severity = value.to_string();
         } else if arg.starts_with('-') {
             let name = flag_name(arg);
             if let Some(reason) = not_yet_ported_reason(name) {
@@ -392,7 +534,11 @@ fn parse_args(argv: &[String]) -> ParseOutcome {
             paths.push(arg.clone());
         }
     }
-    ParseOutcome::Args(LintArgs { paths, json })
+    ParseOutcome::Args(LintArgs {
+        paths,
+        json,
+        severity,
+    })
 }
 
 /// Display path for lint output: relative to the working directory when the
@@ -460,9 +606,12 @@ pub fn collect_explicit(paths: &[String]) -> Result<Vec<(PathBuf, String)>, Stri
     Ok(out)
 }
 
-/// Lint explicit paths, returning sorted messages or a combined error.
-pub fn lint_explicit_paths(paths: &[String]) -> Result<Vec<LintMessage>, String> {
-    let engine = Engine::new();
+/// Lint explicit paths with `engine`, returning sorted messages or a
+/// combined error.
+pub fn lint_explicit_paths_with_engine(
+    engine: &Engine,
+    paths: &[String],
+) -> Result<Vec<LintMessage>, String> {
     let files = collect_explicit(paths)?;
     let mut messages = Vec::new();
     let mut errors = Vec::new();
@@ -478,6 +627,12 @@ pub fn lint_explicit_paths(paths: &[String]) -> Result<Vec<LintMessage>, String>
     messages
         .sort_by(|a, b| (&a.path, a.line, a.col, &a.code).cmp(&(&b.path, b.line, b.col, &b.code)));
     Ok(messages)
+}
+
+/// Lint explicit paths with every ported linter, returning sorted
+/// messages or a combined error.
+pub fn lint_explicit_paths(paths: &[String]) -> Result<Vec<LintMessage>, String> {
+    lint_explicit_paths_with_engine(&Engine::new(), paths)
 }
 
 fn run_git(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
@@ -547,9 +702,12 @@ pub fn changed_files_in(dir: &Path) -> Result<Vec<(PathBuf, String)>, String> {
     Ok(out)
 }
 
-/// Lint the working-tree changes under `dir`, skipping deleted files.
-pub fn lint_changed_in(dir: &Path) -> Result<Vec<LintMessage>, String> {
-    let engine = Engine::new();
+/// Lint the working-tree changes under `dir` with `engine`, skipping
+/// deleted files.
+pub fn lint_changed_in_with_engine(
+    engine: &Engine,
+    dir: &Path,
+) -> Result<Vec<LintMessage>, String> {
     let files = changed_files_in(dir)?;
     let mut messages = Vec::new();
     for (disk, display) in &files {
@@ -566,7 +724,27 @@ pub fn lint_changed_in(dir: &Path) -> Result<Vec<LintMessage>, String> {
     Ok(messages)
 }
 
+/// Lint the working-tree changes under `dir` with every ported linter,
+/// skipping deleted files.
+pub fn lint_changed_in(dir: &Path) -> Result<Vec<LintMessage>, String> {
+    lint_changed_in_with_engine(&Engine::new(), dir)
+}
+
 pub fn run(argv: &[String]) -> ExitCode {
+    let cwd = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            eprintln!("arc-rs {NAME}: cannot determine current directory: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    run_in(&cwd, argv)
+}
+
+/// Entry point with an explicit working directory (the discovery root and
+/// default lint target), so tests can run without mutating the process
+/// directory.
+pub fn run_in(cwd: &Path, argv: &[String]) -> ExitCode {
     let args = match parse_args(argv) {
         ParseOutcome::Help => {
             print!("{}", usage());
@@ -583,15 +761,16 @@ pub fn run(argv: &[String]) -> ExitCode {
         ParseOutcome::Args(args) => args,
     };
 
+    let (engine, _config) = match engine_for_dir(cwd) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            eprintln!("arc-rs {NAME}: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let messages = if args.paths.is_empty() {
-        let cwd = match std::env::current_dir() {
-            Ok(dir) => dir,
-            Err(error) => {
-                eprintln!("arc-rs {NAME}: cannot determine current directory: {error}");
-                return ExitCode::FAILURE;
-            }
-        };
-        match lint_changed_in(&cwd) {
+        match lint_changed_in_with_engine(&engine, cwd) {
             Ok(messages) => messages,
             Err(error) => {
                 eprintln!("arc-rs {NAME}: {error}");
@@ -599,7 +778,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             }
         }
     } else {
-        match lint_explicit_paths(&args.paths) {
+        match lint_explicit_paths_with_engine(&engine, &args.paths) {
             Ok(messages) => messages,
             Err(error) => {
                 eprintln!("arc-rs {NAME}: {error}");
@@ -607,6 +786,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             }
         }
     };
+    let messages = filter_by_severity(messages, &args.severity);
 
     if args.json {
         let array: Vec<serde_json::Value> = messages.iter().map(LintMessage::to_json).collect();

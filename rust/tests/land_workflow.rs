@@ -1,9 +1,15 @@
 //! `land` against local git fixtures through the wired library.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use arc_rs::land;
+
+mod common;
+
+use common::with_owned_home;
 
 /// Unique scratch dir for one test; removed on drop (best effort).
 struct Fixture {
@@ -302,6 +308,150 @@ fn land_without_push_leaves_remote_alone() {
 
     assert_eq!(bare.git(&["rev-parse", "refs/heads/master"]), remote_before);
     assert_ne!(repo.git(&["rev-parse", "master"]), remote_before);
+}
+
+/// Canned conduit seam: records calls, replays fixture responses, never
+/// touches the network.
+#[derive(Default)]
+struct Canned {
+    calls: RefCell<Vec<(String, serde_json::Value)>>,
+    responses: HashMap<String, serde_json::Value>,
+}
+
+impl Canned {
+    fn with(mut self, method: &str, response: &str) -> Self {
+        self.responses
+            .insert(method.to_string(), serde_json::from_str(response).unwrap());
+        self
+    }
+
+    fn with_json(mut self, method: &str, response: serde_json::Value) -> Self {
+        self.responses.insert(method.to_string(), response);
+        self
+    }
+
+    fn call(&self, method: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
+        self.calls
+            .borrow_mut()
+            .push((method.to_string(), params.clone()));
+        self.responses
+            .get(method)
+            .cloned()
+            .ok_or_else(|| format!("no canned response for {method}"))
+    }
+
+    fn methods(&self) -> Vec<String> {
+        self.calls.borrow().iter().map(|(m, _)| m.clone()).collect()
+    }
+}
+
+fn wire_fixture(name: &str) -> &'static str {
+    match name {
+        "accepted" => include_str!("fixtures/wire_diff/revisionsearch_accepted.json"),
+        "planned" => include_str!("fixtures/wire_diff/revisionsearch_planned.json"),
+        "empty" => include_str!("fixtures/wire_diff/revisionsearch_empty.json"),
+        "whoami" => include_str!("fixtures/wire_diff/whoami.json"),
+        _ => panic!("unknown wire fixture {name}"),
+    }
+}
+
+fn temp_home(tag: &str) -> common::HomeGuard {
+    let home = std::env::temp_dir().join(format!(
+        "arc-rs-land-home-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    with_owned_home(home)
+}
+
+#[test]
+fn revision_preview_skips_gates_without_conduit() {
+    let repo = Fixture::init_repo("revskip-preview");
+    make_feature(&repo);
+    let _guard = temp_home("preview");
+
+    let out = land::execute(repo.path(), &args(&["--preview", "--revision", "D123"])).unwrap();
+    assert!(out.contains("skipping pre-land checks"), "{out}");
+    assert!(
+        out.contains("Preview: land 'feature' onto 'master'"),
+        "{out}"
+    );
+    assert!(out.contains("add a") && out.contains("add b"), "{out}");
+    // Unchanged: still on the feature branch.
+    assert_eq!(repo.git(&["symbolic-ref", "--short", "HEAD"]), "feature");
+}
+
+#[test]
+fn revision_land_skips_gates_without_conduit() {
+    let repo = Fixture::init_repo("revskip-land");
+    make_feature(&repo);
+    let _guard = temp_home("land");
+
+    let out = land::execute(repo.path(), &args(&["--revision", "123"])).unwrap();
+    assert!(out.contains("skipping pre-land checks"), "{out}");
+    assert!(out.contains("Landed 'feature' onto 'master'"), "{out}");
+    assert_eq!(repo.git(&["symbolic-ref", "--short", "HEAD"]), "master");
+}
+
+#[test]
+fn revision_flag_rejects_bad_values() {
+    let repo = Fixture::init_repo("revbad");
+    make_feature(&repo);
+    let err = land::execute(repo.path(), &args(&["--preview", "--revision", "nope"])).unwrap_err();
+    assert!(err.contains("Parameter to --revision"), "{err}");
+    let err = land::execute(repo.path(), &args(&["--revision"])).unwrap_err();
+    assert!(err.contains("--revision requires"), "{err}");
+}
+
+#[test]
+fn gates_over_seam_report_status() {
+    let canned = Canned::default()
+        .with("differential.revision.search", wire_fixture("accepted"))
+        .with("user.whoami", wire_fixture("whoami"));
+    let call = |method: &str, params: &serde_json::Value| canned.call(method, params);
+    assert!(land::load_gate_findings(&call, 123, 2).unwrap().is_empty());
+    assert_eq!(
+        canned.methods(),
+        vec!["differential.revision.search", "user.whoami"]
+    );
+
+    let planned = Canned::default()
+        .with("differential.revision.search", wire_fixture("planned"))
+        .with("user.whoami", wire_fixture("whoami"));
+    let call = |method: &str, params: &serde_json::Value| planned.call(method, params);
+    let findings = land::load_gate_findings(&call, 123, 2).unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].prompt, "arc.land.changes-planned");
+
+    let stranger = Canned::default()
+        .with("differential.revision.search", wire_fixture("accepted"))
+        .with_json(
+            "user.whoami",
+            serde_json::json!({"userName": "stranger", "phid": "PHID-USER-stranger"}),
+        );
+    let call = |method: &str, params: &serde_json::Value| stranger.call(method, params);
+    let findings = land::load_gate_findings(&call, 123, 2).unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].prompt, "arc.land.unauthored");
+
+    let big = Canned::default()
+        .with("differential.revision.search", wire_fixture("accepted"))
+        .with("user.whoami", wire_fixture("whoami"));
+    let call = |method: &str, params: &serde_json::Value| big.call(method, params);
+    let findings = land::load_gate_findings(&call, 123, 60).unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].prompt, "arc.land.large-working-set");
+
+    let empty = Canned::default().with("differential.revision.search", wire_fixture("empty"));
+    let call = |method: &str, params: &serde_json::Value| empty.call(method, params);
+    let err = land::load_gate_findings(&call, 123, 2).unwrap_err();
+    assert!(
+        err.contains("no differential.revision.search result"),
+        "{err}"
+    );
 }
 
 #[test]

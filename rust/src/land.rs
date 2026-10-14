@@ -5,21 +5,37 @@
 //! strategy: check out the target branch, squash-merge the feature branch,
 //! and commit the result as a single commit naming the branch.
 //!
-//! Out of scope (not yet ported, see T1128): Differential accepted-status
-//! checks, and landing directly onto remote-tracking branches.
+//! Pre-land gates (`land_checks`, from
+//! `src/land/engine/ArcanistLandEngine.php`) run only with `--revision` and
+//! only when revision info is available; otherwise they are skipped with a
+//! note.
+//!
+//! Out of scope (not yet ported, see T1128): automatic revision discovery
+//! from commits, build and parent gates, and landing directly onto
+//! remote-tracking branches.
+
+extern crate self as arc_rs;
 
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
+use arc_rs::{config, diff_submit, land_checks};
+
 pub const NAME: &str = "land";
 
 const DEFAULT_ONTO: &str = "master";
+
+/// `user.whoami` Conduit method; the result's `phid` is the viewer PHID
+/// (`src/workflow/ArcanistWorkflow.php:489-494`).
+pub const METHOD_WHOAMI: &str = "user.whoami";
 
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
     onto: String,
     preview: bool,
     push: bool,
+    revision: Option<String>,
+    conduit_uri: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -39,7 +55,7 @@ pub struct Plan {
 
 fn usage() -> String {
     format!(
-        "usage: arc-rs {NAME} [--onto BRANCH] [--preview] [--push]\n\
+        "usage: arc-rs {NAME} [--onto BRANCH] [--preview] [--push] [--revision REV] [--conduit-uri URI]\n\
          \n\
          Squash-merge the current branch onto BRANCH (default: {DEFAULT_ONTO})\n\
          and commit the result as a single commit naming the branch.\n\
@@ -48,9 +64,15 @@ fn usage() -> String {
          \x20 --onto BRANCH  land onto BRANCH instead of {DEFAULT_ONTO} (must be a local branch)\n\
          \x20 --preview      print the commits that would land; change nothing\n\
          \x20 --push         push the target branch after landing\n\
+         \x20 --revision REV  check pre-land gates for revision REV (D123 or 123)\n\
+         \x20 --conduit-uri URI  Conduit URI for the revision lookup\n\
          \n\
-         Not yet ported (see T1128): Differential accepted-status checks,\n\
-         landing directly onto remote-tracking branches.\n"
+         Pre-land gates (author, status, working-set size) run only with\n\
+         --revision and only when revision info is available; otherwise they\n\
+         are skipped with a note.\n\
+         \n\
+         Not yet ported (see T1128): automatic revision discovery from commits,\n\
+         build and parent gates, landing directly onto remote-tracking branches.\n"
     )
 }
 
@@ -64,6 +86,8 @@ fn parse_args(argv: &[String]) -> Result<Options, String> {
         onto: DEFAULT_ONTO.to_string(),
         preview: false,
         push: false,
+        revision: None,
+        conduit_uri: None,
     };
     let mut iter = argv.iter();
     while let Some(arg) = iter.next() {
@@ -79,6 +103,30 @@ fn parse_args(argv: &[String]) -> Result<Options, String> {
                 return Err("--onto requires a non-empty branch name".to_string());
             }
             opts.onto = value.to_string();
+        } else if arg == "--revision" {
+            match iter.next() {
+                Some(value) if !value.is_empty() && !value.starts_with('-') => {
+                    opts.revision = Some(value.clone());
+                }
+                _ => return Err("--revision requires a non-empty revision".to_string()),
+            }
+        } else if let Some(value) = arg.strip_prefix("--revision=") {
+            if value.is_empty() {
+                return Err("--revision requires a non-empty revision".to_string());
+            }
+            opts.revision = Some(value.to_string());
+        } else if arg == "--conduit-uri" {
+            match iter.next() {
+                Some(value) if !value.is_empty() && !value.starts_with('-') => {
+                    opts.conduit_uri = Some(value.clone());
+                }
+                _ => return Err("--conduit-uri requires a non-empty URI".to_string()),
+            }
+        } else if let Some(value) = arg.strip_prefix("--conduit-uri=") {
+            if value.is_empty() {
+                return Err("--conduit-uri requires a non-empty URI".to_string());
+            }
+            opts.conduit_uri = Some(value.to_string());
         } else if arg == "--preview" {
             opts.preview = true;
         } else if arg == "--push" {
@@ -90,6 +138,26 @@ fn parse_args(argv: &[String]) -> Result<Options, String> {
         }
     }
     Ok(opts)
+}
+
+/// Parse a `--revision` value (`D123` or `123`) into a revision ID.
+///
+/// Mirrors `normalizeRevisionID()`
+/// (`src/workflow/ArcanistWorkflow.php:1519-1521`) for the `revision`
+/// argument (`src/workflow/ArcanistLandWorkflow.php:179-184`).
+pub fn parse_revision_argument(target: &str) -> Result<u64, String> {
+    let digits = target
+        .strip_prefix('D')
+        .or_else(|| target.strip_prefix('d'))
+        .unwrap_or(target)
+        .trim();
+    if !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && let Ok(id) = digits.parse::<u64>()
+    {
+        return Ok(id);
+    }
+    Err("Parameter to --revision must be a Differential Revision number.".to_string())
 }
 
 /// Run `git` in `dir`, returning trimmed stdout or trimmed combined output.
@@ -250,6 +318,139 @@ pub fn build_message(plan: &Plan) -> String {
     message
 }
 
+/// Load revision rows for `revision_id` via `differential.revision.search`.
+///
+/// The modern search shape is parsed by `land_checks::parse_revision`; an
+/// empty `data` list means no revision info is available.
+pub fn fetch_revision_views(
+    call: &diff_submit::ConduitCall<'_>,
+    revision_id: u64,
+) -> Result<Vec<land_checks::RevisionView>, String> {
+    let id = i64::try_from(revision_id)
+        .map_err(|_| format!("Revision ID {revision_id} is out of range."))?;
+    let result = call(
+        diff_submit::METHOD_REVISION_SEARCH,
+        &diff_submit::revision_search_params(&[id]),
+    )?;
+    let rows = result
+        .get("data")
+        .and_then(|data| data.as_array())
+        .ok_or_else(|| "differential.revision.search response has no data list".to_string())?;
+    rows.iter().map(land_checks::parse_revision).collect()
+}
+
+/// Load the viewer PHID via `user.whoami` (`result['phid']`,
+/// `src/workflow/ArcanistWorkflow.php:489-494`).
+pub fn fetch_viewer_phid(call: &diff_submit::ConduitCall<'_>) -> Result<String, String> {
+    let result = call(METHOD_WHOAMI, &serde_json::json!({}))?;
+    result
+        .get("phid")
+        .and_then(|phid| phid.as_str())
+        .filter(|phid| !phid.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "user.whoami response has no phid".to_string())
+}
+
+/// Evaluate the pre-land gates for `revision_id` over `call`.
+///
+/// Fails when revision info is unavailable (the caller skips with a note).
+/// Parent and build gates run empty: joining parents and builds to revisions
+/// needs Conduit data this port does not fetch (see the `land_checks`
+/// divergences).
+pub fn load_gate_findings(
+    call: &diff_submit::ConduitCall<'_>,
+    revision_id: u64,
+    commit_count: usize,
+) -> Result<Vec<land_checks::GateFinding>, String> {
+    let revisions = fetch_revision_views(call, revision_id)?;
+    if revisions.is_empty() {
+        return Err(format!(
+            "revision D{revision_id} has no differential.revision.search result"
+        ));
+    }
+    // Without a viewer identity the author check can not run; viewing as the
+    // landing author reduces it to a no-op for the single-row result.
+    let fallback = revisions[0].author_phid.clone();
+    let viewer = fetch_viewer_phid(call).unwrap_or(fallback);
+    Ok(land_checks::evaluate_gates(
+        &revisions,
+        &viewer,
+        &[],
+        &[],
+        &[],
+        Some(commit_count),
+    ))
+}
+
+/// Note printed when gates are skipped: revision info is unavailable.
+pub fn format_skip_note(reason: &str) -> String {
+    format!("Note: revision info unavailable ({reason}); skipping pre-land checks.\n")
+}
+
+/// One gate finding as an indented line.
+fn format_finding_line(finding: &land_checks::GateFinding) -> String {
+    format!(
+        "  [{}] {}: {}\n",
+        finding.prompt, finding.title, finding.query
+    )
+}
+
+/// Advisory gate report for `--preview`: a pass line or listed findings.
+pub fn format_gate_preview(findings: &[land_checks::GateFinding], revision_id: u64) -> String {
+    if findings.is_empty() {
+        return format!("Pre-land checks passed (--revision D{revision_id}).\n");
+    }
+    let mut out = format!("Pre-land checks (--revision D{revision_id}):\n");
+    for finding in findings {
+        out.push_str(&format_finding_line(finding));
+    }
+    out
+}
+
+/// Blocking gate report for a real land: listed findings abort the land.
+///
+/// Divergence: PHP prompts interactively per finding (`confirmRevisions`,
+/// `src/land/engine/ArcanistLandEngine.php:278-534`, and `confirmBuilds`,
+/// `:536-718`); this non-interactive port aborts instead.
+pub fn format_gate_failure(findings: &[land_checks::GateFinding], revision_id: u64) -> String {
+    let mut out = format!("Pre-land checks failed (--revision D{revision_id}):\n");
+    for finding in findings {
+        out.push_str(&format_finding_line(finding));
+    }
+    out
+}
+
+/// Run the `--revision` gates, returning output text (or a blocking error).
+///
+/// Unavailable revision info (no Conduit, failed lookup, empty result) skips
+/// with a note; findings block a real land but stay advisory under
+/// `--preview`.
+fn revision_gate_text(
+    conduit_uri: Option<&str>,
+    revision_id: u64,
+    commit_count: usize,
+    preview: bool,
+) -> Result<String, String> {
+    let client = match config::client_for(conduit_uri) {
+        Ok(client) => client,
+        Err(reason) => return Ok(format_skip_note(&reason)),
+    };
+    let call = |method: &str, params: &serde_json::Value| {
+        client.call(method, params).map_err(|e| e.to_string())
+    };
+    let findings = match load_gate_findings(&call, revision_id, commit_count) {
+        Ok(findings) => findings,
+        Err(reason) => return Ok(format_skip_note(&reason)),
+    };
+    if preview {
+        Ok(format_gate_preview(&findings, revision_id))
+    } else if findings.is_empty() {
+        Ok(String::new())
+    } else {
+        Err(format_gate_failure(&findings, revision_id))
+    }
+}
+
 fn push_remote(dir: &Path) -> Result<String, String> {
     let remotes = git_output(dir, &["remote"])?;
     let names: Vec<&str> = remotes
@@ -313,14 +514,35 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
     let opts = parse_args(argv).map_err(|message| format!("{message}\n\n{}", usage()))?;
     let land = plan(dir, &opts.onto)?;
     if opts.preview {
-        let mut out = format_preview(&land);
+        let mut out = String::new();
+        if let Some(target) = opts.revision.as_deref() {
+            let revision_id = parse_revision_argument(target)?;
+            out.push_str(&revision_gate_text(
+                opts.conduit_uri.as_deref(),
+                revision_id,
+                land.commits.len(),
+                true,
+            )?);
+        }
+        out.push_str(&format_preview(&land));
         if opts.push {
             out.push_str("--push has no effect with --preview; nothing was pushed.\n");
         }
         return Ok(out);
     }
     ensure_clean(dir)?;
-    land_plan(dir, &land, opts.push)
+    let mut out = String::new();
+    if let Some(target) = opts.revision.as_deref() {
+        let revision_id = parse_revision_argument(target)?;
+        out.push_str(&revision_gate_text(
+            opts.conduit_uri.as_deref(),
+            revision_id,
+            land.commits.len(),
+            false,
+        )?);
+    }
+    out.push_str(&land_plan(dir, &land, opts.push)?);
+    Ok(out)
 }
 
 pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {

@@ -1,0 +1,4 @@
+{"engines": {
+  "py": {"type": "PytestTestEngine"},
+  "php": {"type": "PhpunitTestEngine", "exclude": "vendor/"}
+}}

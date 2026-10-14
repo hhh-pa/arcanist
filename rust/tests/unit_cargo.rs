@@ -1,8 +1,9 @@
-//! Cargo engine behavior through the wired library.
+//! Cargo engine behavior plus W1 selection/config/render through the wired library.
 
 use std::path::{Path, PathBuf};
 
 use arc_rs::unit::{self, Options, find_crate_root_from};
+use arc_rs::unit_engine::{CapturedOutput, EngineContext, UnitResult as EngineUnitResult};
 
 /// Copy the `sample` fixture crate to a unique temp dir and return its root.
 /// Each test gets its own copy so parallel runs never share cargo state.
@@ -119,4 +120,249 @@ fn run_rejects_bad_flags_and_answers_help() {
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(unit::NAME, "unit");
+}
+
+// --- W1 wiring: selection, config, render with canned outputs ---
+
+fn wire_unit_fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("unit")
+        .join("wire_unit")
+        .join(name)
+}
+
+fn temp_project(tag: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "arc-rs-unit-wire-{}-{nanos}-{tag}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn forward_slashes(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+const CANNED_XUNIT: &str = "<testsuite name=\"t\" tests=\"3\">\
+    <testcase classname=\"a\" name=\"ok\" time=\"0.125\"/>\
+    <testcase classname=\"a\" name=\"bad\" time=\"0.5\">\
+    <failure>oops</failure></testcase>\
+    <testcase classname=\"a\" name=\"skipped\" time=\"0.0\">\
+    <skipped>later</skipped></testcase></testsuite>";
+
+#[test]
+fn selection_prefers_explicit_unit_engine_arcunit_cargo() {
+    let dir = temp_project("sel");
+    assert_eq!(
+        unit::discover_selection(&Options::default(), &dir).unwrap(),
+        unit::Selection::Cargo
+    );
+
+    std::fs::copy(wire_unit_fixture("arcunit_nose.json"), dir.join(".arcunit")).unwrap();
+    assert!(matches!(
+        unit::discover_selection(&Options::default(), &dir).unwrap(),
+        unit::Selection::Config { .. }
+    ));
+
+    std::fs::write(
+        dir.join(".arcconfig"),
+        r#"{"unit.engine": "PytestTestEngine"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        unit::discover_selection(&Options::default(), &dir).unwrap(),
+        unit::Selection::Single("PytestTestEngine".to_string())
+    );
+
+    let explicit = unit::parse_args(&args(&["--engine", "NoseTestEngine"])).unwrap();
+    assert_eq!(
+        unit::discover_selection(&explicit, &dir).unwrap(),
+        unit::Selection::Single("NoseTestEngine".to_string())
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn config_nose_runs_with_canned_output() {
+    let dir = temp_project("nose");
+    std::fs::copy(wire_unit_fixture("arcunit_nose.json"), dir.join(".arcunit")).unwrap();
+    std::fs::create_dir_all(dir.join("pkg")).unwrap();
+    std::fs::create_dir_all(dir.join("tests").join("pkg")).unwrap();
+    std::fs::write(dir.join("pkg").join("mod.py"), "x = 1\n").unwrap();
+    std::fs::write(
+        dir.join("tests").join("pkg").join("test_mod.py"),
+        "def test_ok(): pass\n",
+    )
+    .unwrap();
+
+    let selection = unit::discover_selection(&Options::default(), &dir).unwrap();
+    let unit::Selection::Config { engines, root } = selection else {
+        panic!("expected Config selection");
+    };
+    assert_eq!(root, dir);
+    assert_eq!(engines.len(), 1);
+
+    let runner = |argv: &[String], _cwd: &str| {
+        let xunit = argv
+            .iter()
+            .find(|a| a.starts_with("--xunit-file="))
+            .unwrap();
+        std::fs::write(xunit.trim_start_matches("--xunit-file="), CANNED_XUNIT).unwrap();
+        CapturedOutput::new(1, "", "")
+    };
+    let report = unit::run_config_with_runner(
+        &engines,
+        &forward_slashes(&dir),
+        &["pkg/mod.py".to_string()],
+        false,
+        Some(false),
+        &runner,
+    )
+    .unwrap();
+    assert_eq!(report.engine, "ArcanistConfigurationDrivenUnitTestEngine");
+    assert_eq!((report.passed, report.failed), (1, 1));
+    assert!(!report.success);
+    assert_eq!(report.results.len(), 3);
+
+    let rendered: String = report
+        .results
+        .iter()
+        .map(unit::render_unit_result)
+        .collect();
+    assert!(rendered.contains("  PASS 125ms a.ok\n"), "{rendered}");
+    assert!(rendered.contains("  FAIL a.bad\n"), "{rendered}");
+    assert!(rendered.contains("oops\n"), "{rendered}");
+    assert!(rendered.contains("  SKIP a.skipped\n"), "{rendered}");
+
+    let json = report.to_json();
+    assert_eq!(json["engine"], "ArcanistConfigurationDrivenUnitTestEngine");
+    assert_eq!(json["passed"], 1);
+    assert_eq!(json["failed"], 1);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn config_mixed_fixture_selects_two_engines() {
+    let dir = temp_project("mixed");
+    std::fs::copy(
+        wire_unit_fixture("arcunit_mixed.json"),
+        dir.join(".arcunit"),
+    )
+    .unwrap();
+    let selection = unit::discover_selection(&Options::default(), &dir).unwrap();
+    let unit::Selection::Config { engines, .. } = selection else {
+        panic!("expected Config selection");
+    };
+    assert_eq!(engines.len(), 2);
+    assert_eq!(engines[0].engine_type, "PytestTestEngine");
+    assert_eq!(engines[1].engine_type, "PhpunitTestEngine");
+    assert_eq!(engines[1].exclude, vec!["vendor/".to_string()]);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn config_phutil_run_errors_clearly_and_badtype_rejected() {
+    let dir = temp_project("phutil");
+    std::fs::copy(
+        wire_unit_fixture("arcunit_phutil.json"),
+        dir.join(".arcunit"),
+    )
+    .unwrap();
+    let selection = unit::discover_selection(&Options::default(), &dir).unwrap();
+    let unit::Selection::Config { engines, .. } = selection else {
+        panic!("expected Config selection");
+    };
+    assert_eq!(engines[0].engine_type, "phutil");
+    let runner = |_: &[String], _: &str| CapturedOutput::new(0, "", "");
+    let err = unit::run_config_with_runner(
+        &engines,
+        &forward_slashes(&dir),
+        &[],
+        false,
+        Some(false),
+        &runner,
+    )
+    .unwrap_err();
+    assert!(err.contains("cannot execute phutil"), "{err}");
+
+    std::fs::copy(
+        wire_unit_fixture("arcunit_badtype.json"),
+        dir.join(".arcunit"),
+    )
+    .unwrap();
+    let err = unit::discover_selection(&Options::default(), &dir).unwrap_err();
+    assert!(
+        err.contains("specifies invalid type 'BogusEngine'"),
+        "{err}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn everything_rejected_when_no_child_supports_it() {
+    let dir = temp_project("everything");
+    std::fs::write(
+        dir.join(".arcunit"),
+        r#"{"engines": {"p": {"type": "PytestTestEngine"}}}"#,
+    )
+    .unwrap();
+    let selection = unit::discover_selection(&Options::default(), &dir).unwrap();
+    let unit::Selection::Config { engines, .. } = selection else {
+        panic!("expected Config selection");
+    };
+    let runner = |_: &[String], _: &str| CapturedOutput::new(0, "", "");
+    let err = unit::run_config_with_runner(
+        &engines,
+        &forward_slashes(&dir),
+        &[],
+        true,
+        Some(false),
+        &runner,
+    )
+    .unwrap_err();
+    assert!(err.contains("does not support --everything"), "{err}");
+
+    let ctx = EngineContext {
+        project_root: forward_slashes(&dir),
+        paths: Vec::new(),
+        enable_coverage: Some(false),
+        run_all_tests: true,
+    };
+    let err = unit::run_single_with_runner("PytestTestEngine", &ctx, &runner).unwrap_err();
+    assert!(
+        err.message().contains("does not support --everything"),
+        "{}",
+        err.message()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn render_per_test_lines_through_wired_lib() {
+    let mut pass = EngineUnitResult::new();
+    pass.set_name("a.ok").unwrap();
+    pass.set_result("pass");
+    pass.set_duration(2.5);
+    assert_eq!(unit::render_unit_result(&pass), "  PASS  2.5s a.ok\n");
+
+    let mut fail = EngineUnitResult::new();
+    fail.set_namespace("ns");
+    fail.set_name("bad").unwrap();
+    fail.set_result("fail");
+    fail.set_user_data("traceback");
+    assert_eq!(
+        unit::render_unit_result(&fail),
+        "  FAIL ns::bad\ntraceback\n"
+    );
+
+    assert_eq!(unit::format_time(61.0), "1m01s");
+    assert!(unit::supports_run_all_tests("NoseTestEngine"));
+    assert!(!unit::supports_run_all_tests("PhpunitTestEngine"));
 }

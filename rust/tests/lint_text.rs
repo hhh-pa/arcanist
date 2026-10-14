@@ -215,6 +215,116 @@ fn collect_walks_directories() {
     assert_eq!(files.len(), 2);
 }
 
+fn install_arclint(tmp: &TempDir, fixture: &str) {
+    let body = std::fs::read(Path::new("tests/fixtures/lint").join(fixture)).unwrap();
+    std::fs::write(tmp.path().join(".arclint"), body).unwrap();
+}
+
+#[test]
+fn arclint_selection_limits_run() {
+    let tmp = TempDir::new("arclint-select");
+    install_arclint(&tmp, "arclint-text-only.json");
+    let bad_json = tmp.file("bad.json", b"not json\n");
+
+    let (engine, config) = lint::engine_for_dir(tmp.path()).unwrap();
+    assert_eq!(config, Some(tmp.path().join(".arclint")));
+    assert!(
+        lint::lint_explicit_paths_with_engine(&engine, std::slice::from_ref(&bad_json))
+            .unwrap()
+            .is_empty(),
+        "text-only config must not report JSON1"
+    );
+    assert!(
+        lint::lint_explicit_paths(std::slice::from_ref(&bad_json))
+            .unwrap()
+            .iter()
+            .any(|m| m.code == "JSON1"),
+        "unconfigured run still reports JSON1"
+    );
+    assert_eq!(
+        lint::run_in(tmp.path(), &[bad_json]),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
+#[test]
+fn arclint_is_discovered_from_child_directories() {
+    let tmp = TempDir::new("arclint-nested");
+    install_arclint(&tmp, "arclint-text-only.json");
+    let bad_json = tmp.file("sub/bad.json", b"not json\n");
+
+    let child = tmp.path().join("sub");
+    let (_engine, config) = lint::engine_for_dir(&child).unwrap();
+    assert_eq!(config, Some(tmp.path().join(".arclint")));
+    assert_eq!(
+        lint::run_in(&child, &[bad_json]),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
+#[test]
+fn invalid_arclint_fails_run() {
+    for fixture in ["arclint-invalid.json", "arclint-unknown-type.json"] {
+        let tmp = TempDir::new("arclint-bad");
+        install_arclint(&tmp, fixture);
+        let clean = tmp.file("clean.txt", b"ok\n");
+        assert!(lint::engine_for_dir(tmp.path()).is_err(), "for {fixture}");
+        assert_eq!(
+            lint::run_in(tmp.path(), &[clean]),
+            std::process::ExitCode::FAILURE,
+            "for {fixture}"
+        );
+    }
+}
+
+#[test]
+fn severity_flag_filters_messages() {
+    let tmp = TempDir::new("severity");
+    install_arclint(&tmp, "arclint-text-only.json");
+    let ws = tmp.file("ws.txt", b"bad   \n");
+    let tab = tmp.file("tab.txt", b"a\tb\n");
+
+    // Library level: the autofix downgrade is dropped at error minimum.
+    let engine = lint::Engine::new();
+    let found = lint::lint_explicit_paths_with_engine(&engine, std::slice::from_ref(&ws)).unwrap();
+    assert_eq!(found.len(), 1);
+    assert!(lint::filter_by_severity(found, "error").is_empty());
+
+    // CLI level: filtering never fails the run, errors still surface.
+    assert_eq!(
+        lint::run_in(tmp.path(), std::slice::from_ref(&ws)),
+        std::process::ExitCode::SUCCESS
+    );
+    assert_eq!(
+        lint::run_in(
+            tmp.path(),
+            &[ws, "--severity".to_string(), "error".to_string()]
+        ),
+        std::process::ExitCode::SUCCESS
+    );
+    assert_eq!(
+        lint::run_in(tmp.path(), &[tab, "--severity=error".to_string()]),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn severity_flag_rejects_bad_values() {
+    let tmp = TempDir::new("severity-bad");
+    let clean = tmp.file("clean.txt", b"ok\n");
+    assert_eq!(
+        lint::run_in(
+            tmp.path(),
+            &[clean.clone(), "--severity".to_string(), "bogus".to_string()]
+        ),
+        std::process::ExitCode::FAILURE
+    );
+    assert_eq!(
+        lint::run_in(tmp.path(), &[clean, "--severity".to_string()]),
+        std::process::ExitCode::FAILURE
+    );
+}
+
 #[test]
 fn changed_files_cover_staged_and_unstaged_only() {
     let tmp = TempDir::new("git");
