@@ -69,6 +69,11 @@ pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
 }
 
 /// Small splitmix64 generator (std-only; no new dependencies).
+///
+/// PHP welds with `mt_rand`, whose stream no std-only generator reproduces;
+/// exact stream parity is intentionally not pursued — the joint is random
+/// either way. What matters is determinism under `--seed`, which this
+/// provides and the tests pin.
 #[derive(Debug, Clone)]
 pub struct Rng(u64);
 

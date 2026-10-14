@@ -109,3 +109,151 @@ fn usage_covers_options_and_limits() {
     assert!(text.contains("--revision") && text.contains("--show"));
     assert!(text.contains("history.immutable"));
 }
+
+fn revision(id: &str, title: &str) -> close_revision::Revision {
+    close_revision::Revision {
+        id: id.to_string(),
+        title: title.to_string(),
+        status: close_revision::STATUS_ACCEPTED,
+        status_name: "Accepted".to_string(),
+        author_phid: "PHID-USER-1".to_string(),
+        commits: Vec::new(),
+    }
+}
+
+#[test]
+fn parses_ids_from_messages() {
+    assert_eq!(
+        revision_id_in_message("Title\n\nDifferential Revision: D123\n"),
+        Ok(Some(123))
+    );
+    assert_eq!(revision_id_in_message("no trailer here\n"), Ok(None));
+    assert!(revision_id_in_message("T\nDifferential Revision: bogus\n").is_err());
+}
+
+#[test]
+fn rows_of_covers_result_shapes() {
+    let array = serde_json::json!([{"id": 1}, {"id": 2}]);
+    assert_eq!(rows_of(&array).len(), 2);
+    let search = serde_json::json!({"data": [{"id": 3}], "cursor": {}});
+    assert_eq!(rows_of(&search), vec![serde_json::json!({"id": 3})]);
+    let map = serde_json::json!({"b": {"id": 2}, "a": {"id": 1}});
+    assert_eq!(
+        rows_of(&map),
+        vec![serde_json::json!({"id": 1}), serde_json::json!({"id": 2})]
+    );
+    assert!(rows_of(&serde_json::json!(null)).is_empty());
+    assert!(rows_of(&serde_json::json!("x")).is_empty());
+}
+
+#[test]
+fn parses_revisions_skipping_idless_rows() {
+    let rows = vec![
+        serde_json::json!({"id": 7, "title": "Seven"}),
+        serde_json::json!({"title": "no id"}),
+    ];
+    let parsed = parse_revisions(&rows);
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].id, "7");
+    assert_eq!(parsed[0].title, "Seven");
+}
+
+#[test]
+fn renders_ref_view_lines() {
+    assert_eq!(ref_view_line("D123", "Title"), "**  *  ** D123 Title\n");
+    assert_eq!(ref_view_line("@alice", ""), "**  *  ** @alice\n");
+    assert_eq!(
+        ref_view_line("@alice", "(Alice)"),
+        "**  *  ** @alice (Alice)\n"
+    );
+}
+
+#[test]
+fn revision_numeric_id_rejects_garbage() {
+    assert_eq!(revision_numeric_id(&revision("123", "T")), Ok(123));
+    assert!(revision_numeric_id(&revision("abc", "T")).is_err());
+}
+
+#[test]
+fn select_guessed_needs_exactly_one() {
+    let mut io = land::Io::buffered();
+    let err = select_guessed(&mut io, Vec::new()).unwrap_err();
+    assert!(err.contains("no revisions found"), "unexpected: {err}");
+    assert!(err.contains("Use \"--revision <id>\""), "unexpected: {err}");
+
+    let mut io = land::Io::buffered();
+    let err =
+        select_guessed(&mut io, vec![revision("1", "One"), revision("2", "Two")]).unwrap_err();
+    assert_eq!(
+        err,
+        "Use \"--revision <id>\" to specify which revision you want to amend."
+    );
+    assert!(
+        io.out.stdout.contains("MULTIPLE REVISIONS IN WORKING COPY"),
+        "unexpected: {}",
+        io.out.stdout
+    );
+    assert!(
+        io.out.stdout.contains("**  *  ** D1 One\n"),
+        "unexpected: {}",
+        io.out.stdout
+    );
+    assert!(
+        io.out.stdout.contains("**  *  ** D2 Two\n"),
+        "unexpected: {}",
+        io.out.stdout
+    );
+
+    let mut io = land::Io::buffered();
+    let only = select_guessed(&mut io, vec![revision("9", "Nine")]).unwrap();
+    assert_eq!(only.id, "9");
+    assert!(io.out.stdout.is_empty());
+}
+
+#[test]
+fn immutable_config_beats_default() {
+    let empty = get_config::Sources {
+        local: serde_json::Map::new(),
+        project: serde_json::Map::new(),
+        user: serde_json::Map::new(),
+        system: serde_json::Map::new(),
+        default: get_config::default_config(),
+        project_file: None,
+    };
+    assert!(!history_is_immutable_in(&empty, false));
+    assert!(history_is_immutable_in(&empty, true));
+
+    let mut project = serde_json::Map::new();
+    project.insert("history.immutable".to_string(), serde_json::json!(true));
+    let locked = get_config::Sources {
+        local: serde_json::Map::new(),
+        project,
+        user: serde_json::Map::new(),
+        system: serde_json::Map::new(),
+        default: get_config::default_config(),
+        project_file: None,
+    };
+    assert!(history_is_immutable_in(&locked, false));
+
+    let mut project = serde_json::Map::new();
+    project.insert(
+        "history.immutable".to_string(),
+        serde_json::json!("yes, really"),
+    );
+    let fuzzy = get_config::Sources {
+        local: serde_json::Map::new(),
+        project,
+        user: serde_json::Map::new(),
+        system: serde_json::Map::new(),
+        default: get_config::default_config(),
+        project_file: None,
+    };
+    assert!(!history_is_immutable_in(&fuzzy, false));
+}
+
+#[test]
+fn immutable_prompt_keys_match_php() {
+    assert_eq!(PROMPT_UNRELATED, "arc.amend.unrelated");
+    assert_eq!(PROMPT_AUTHOR, "arc.amend.author");
+    assert_eq!(PROMPT_IMMUTABLE, "arc.amend.immutable");
+}

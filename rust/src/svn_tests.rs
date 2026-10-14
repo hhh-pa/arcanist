@@ -1001,3 +1001,102 @@ fn paths_with_mask_selects_flagged_paths_in_order() {
     );
     assert!(paths_with_mask(&files, FLAG_CONFLICT).is_empty());
 }
+
+#[test]
+fn migrates_legacy_scratch_dir() {
+    let base = std::env::temp_dir().join(format!("arc-rs-svn-migrate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let meta = base.join("wc").join(".svn");
+    std::fs::create_dir_all(base.join("old").join(".arc")).unwrap();
+    std::fs::write(base.join("old").join(".arc").join("x"), "data").unwrap();
+    assert!(migrate_scratch_dir(&base.join("old"), &meta));
+    assert_eq!(read_scratch_file(&meta, "x").as_deref(), Some("data"));
+    assert!(!base.join("old").join(".arc").exists());
+
+    // Nothing to migrate: missing old dir, or an existing new dir.
+    assert!(migrate_scratch_dir(&base.join("absent"), &meta));
+    std::fs::create_dir_all(base.join("both").join(".arc")).unwrap();
+    std::fs::write(base.join("both").join(".arc").join("x"), "old").unwrap();
+    assert!(write_scratch_file(&meta, "x", "new"));
+    assert!(migrate_scratch_dir(&base.join("both"), &meta));
+    assert_eq!(read_scratch_file(&meta, "x").as_deref(), Some("new"));
+
+    // A subdirectory aborts the migration without deleting anything.
+    std::fs::create_dir_all(base.join("sub").join(".arc").join("dir")).unwrap();
+    std::fs::write(base.join("sub").join(".arc").join("x"), "data").unwrap();
+    assert!(!migrate_scratch_dir(
+        &base.join("sub"),
+        &base.join("fresh-meta")
+    ));
+    assert!(base.join("sub").join(".arc").join("x").exists());
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn selects_svn_locale() {
+    assert_eq!(select_svn_locale("C\nen_US.UTF-8\nPOSIX\n"), "en_US.UTF-8");
+    assert_eq!(select_svn_locale("C\nPOSIX\n"), "en_US.utf8");
+    assert_eq!(select_svn_locale(""), "en_US.utf8");
+    assert_eq!(select_svn_locale("en_US.UTF-8 \n"), "en_US.utf8");
+}
+
+#[test]
+fn auto_locale_is_a_known_value() {
+    assert!(["en_US.UTF-8", "en_US.utf8"].contains(&svn_lang_env_var()));
+}
+
+#[test]
+fn commit_passes_files_encoding_and_message_file() {
+    let fake = FakeSvn::named("commit");
+    let out = commit_with_locale(&fake.dir, &fake.svn, &["a.txt", "b.txt"], "msg\n", None).unwrap();
+    assert!(out.is_empty());
+    let log = fake.log();
+    assert!(
+        log.contains("commit a.txt b.txt --encoding utf-8 -F"),
+        "{log}"
+    );
+}
+
+#[test]
+fn commit_failure_reports_the_php_sentence() {
+    let fake = FakeSvn::named("commit-fail");
+    fake.write(".fakesvn-fail-commit", b"");
+    let err = commit_with_locale(&fake.dir, &fake.svn, &["a.txt"], "msg\n", None).unwrap_err();
+    assert!(
+        err.contains("Executing 'svn commit' failed!"),
+        "unexpected: {err}"
+    );
+}
+
+#[test]
+fn commit_sets_lang_for_the_child() {
+    let dir = std::env::temp_dir().join(format!("arc-rs-svn-lang-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    #[cfg(windows)]
+    let svn = {
+        let bat = dir.join("langprobe.bat");
+        std::fs::write(&bat, "@echo off\r\necho LANG=%LANG%\r\n").unwrap();
+        SvnCommand::custom("cmd", &["/C", &bat.to_string_lossy()])
+    };
+    #[cfg(not(windows))]
+    let svn = {
+        let sh = dir.join("langprobe.sh");
+        std::fs::write(&sh, "#!/bin/sh\necho \"LANG=$LANG\"\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&sh).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&sh, perms).unwrap();
+        }
+        SvnCommand::custom(&sh.to_string_lossy(), &[])
+    };
+    let out = commit_with_locale(&dir, &svn, &[], "msg\n", Some("en_US.UTF-8")).unwrap();
+    assert!(out.contains("LANG=en_US.UTF-8"), "unexpected: {out}");
+    #[cfg(not(windows))]
+    {
+        let out = commit_with(&dir, &svn, &[], "msg\n").unwrap();
+        assert!(out.contains("LANG=en_US."), "unexpected: {out}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

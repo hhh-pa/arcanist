@@ -124,3 +124,159 @@ fn usage_covers_options_and_limits() {
     assert!(text.contains("--revision") && text.contains("--show"));
     assert!(text.contains("--conduit-uri"));
 }
+
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "arc-rs-commit-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn rejects_git_only_options_under_svn() {
+    let mut options = empty_options();
+    options.messages = vec!["x".to_string()];
+    assert!(reject_git_only_options(&options).is_err());
+    let mut options = empty_options();
+    options.all = true;
+    assert!(reject_git_only_options(&options).is_err());
+    let mut options = empty_options();
+    options.allow_empty = true;
+    assert!(reject_git_only_options(&options).is_err());
+    assert!(reject_git_only_options(&empty_options()).is_ok());
+}
+
+#[test]
+fn parent_dirs_stop_at_top() {
+    assert_eq!(parent_dir("a/b/c.txt"), "a/b");
+    assert_eq!(parent_dir("a/b"), "a");
+    assert_eq!(parent_dir("a"), ".");
+    assert_eq!(parent_dir("."), ".");
+    assert_eq!(parent_dir("a/b/"), "a");
+}
+
+#[test]
+fn expands_commit_dirs() {
+    let commit = expand_commit_dirs(&["a/b/c.txt".to_string(), "top.txt".to_string()]);
+    let sorted: Vec<&str> = commit.iter().map(String::as_str).collect();
+    assert_eq!(sorted, vec!["a", "a/b", "a/b/c.txt", "top.txt"]);
+    assert!(expand_commit_dirs(&[]).is_empty());
+}
+
+#[test]
+fn matches_source_paths() {
+    let dir = scratch("source");
+    let raw = dir.to_string_lossy().into_owned();
+    assert!(root_matches_source(&dir, &raw));
+    assert!(!root_matches_source(&dir, "/elsewhere/entirely"));
+    assert!(!root_matches_source(&dir, ""));
+    let canonical = std::fs::canonicalize(&dir)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let canonical = canonical.strip_prefix(r"\\?\").unwrap_or(&canonical);
+    assert!(root_matches_source(&dir, canonical));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn descendant_checks_need_dirs_on_disk() {
+    let dir = scratch("descendant");
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("sub").join("inner.txt"), "x").unwrap();
+    std::fs::write(dir.join("file.txt"), "x").unwrap();
+    assert!(is_path_descendant(&dir, "sub/inner.txt", "sub"));
+    assert!(!is_path_descendant(&dir, "sub", "sub"));
+    assert!(!is_path_descendant(&dir, "file.txt", "sub"));
+    assert!(!is_path_descendant(&dir, "sub/inner.txt", "file.txt"));
+    assert!(!is_path_descendant(&dir, "sub/missing.txt", "sub"));
+    assert!(!is_path_descendant(&dir, "nope/x.txt", "nope"));
+    assert!(is_path_descendant(&dir, "sub/inner.txt", "."));
+    assert!(!is_path_descendant(&dir, ".", "."));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn partitions_uncommitted_status() {
+    let dir = scratch("partition");
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("sub").join("inner.txt"), "x").unwrap();
+    std::fs::write(dir.join("other.txt"), "x").unwrap();
+    let mut status = svn::StatusMap::new();
+    status.insert("sub/inner.txt".to_string(), svn::FLAG_MODIFIED);
+    status.insert("other.txt".to_string(), svn::FLAG_MODIFIED);
+    status.insert("sub/keep.txt".to_string(), svn::FLAG_MODIFIED);
+
+    // Everything committed: nothing skipped.
+    let mut commit = expand_commit_dirs(&[
+        "sub/inner.txt".to_string(),
+        "other.txt".to_string(),
+        "sub/keep.txt".to_string(),
+    ]);
+    assert!(
+        partition_uncommitted(&dir, &status, &commit)
+            .unwrap()
+            .is_empty()
+    );
+
+    // One path outside the set: skipped, and the set keeps its dirs.
+    commit.remove("other.txt");
+    let skipped = partition_uncommitted(&dir, &status, &commit).unwrap();
+    assert_eq!(skipped, vec!["other.txt".to_string()]);
+    assert!(commit.contains("sub"));
+
+    // A modified path under a committed directory throws.
+    std::fs::write(dir.join("sub").join("keep.txt"), "x").unwrap();
+    commit.remove("sub/keep.txt");
+    let err = partition_uncommitted(&dir, &status, &commit).unwrap_err();
+    assert!(
+        err.contains("NOT included in the commit"),
+        "unexpected: {err}"
+    );
+    assert!(err.contains("'sub/keep.txt'"), "unexpected: {err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn drops_missing_paths_but_keeps_deletions() {
+    let dir = scratch("missing");
+    std::fs::write(dir.join("kept.txt"), "x").unwrap();
+    let mut status = svn::StatusMap::new();
+    status.insert("gone.txt".to_string(), svn::FLAG_DELETED);
+    let mut commit = BTreeSet::from([
+        "kept.txt".to_string(),
+        "gone.txt".to_string(),
+        "vanished.txt".to_string(),
+    ]);
+    let missing = remove_missing_paths(&dir, &status, &mut commit);
+    assert_eq!(missing, vec!["vanished.txt".to_string()]);
+    assert!(commit.contains("kept.txt"));
+    assert!(commit.contains("gone.txt"));
+    assert!(!commit.contains("vanished.txt"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn file_warnings_confirm_or_abort() {
+    let mut io = land::Io::canned(&["y"]);
+    prompt_file_warning(&mut io, "1 path(s):", "Proceed?", &["a.txt".to_string()]).unwrap();
+    assert!(io.out.stdout.contains("    a.txt\n"), "{}", io.out.stdout);
+
+    let mut io = land::Io::canned(&["n"]);
+    let err =
+        prompt_file_warning(&mut io, "1 path(s):", "Proceed?", &["a.txt".to_string()]).unwrap_err();
+    assert_eq!(err, land::ABORT);
+
+    let mut io = land::Io::canned(&["y", "n"]);
+    let err = confirm_all(&mut io, &["One?".to_string(), "Two?".to_string()]).unwrap_err();
+    assert_eq!(err, land::ABORT);
+    let mut io = land::Io::canned(&["y", "y"]);
+    confirm_all(&mut io, &["One?".to_string(), "Two?".to_string()]).unwrap();
+}

@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use arc_rs::{hg, svn};
+use arc_rs::{bookmarks, hg, svn};
 
 const HG_STATUS_SIMPLE: &str = include_str!("fixtures/vcs/hg_status_simple.txt");
 const HG_STATUS_COPIES: &str = include_str!("fixtures/vcs/hg_status_copies.txt");
@@ -121,6 +121,35 @@ impl TempDir {
         #[cfg(not(windows))]
         {
             svn::SvnCommand::custom(&script.to_string_lossy(), &[])
+        }
+    }
+
+    /// Backend running the bookmark/branch listing fake.
+    fn marks_backend(&self) -> hg::HgCommand {
+        #[cfg(windows)]
+        const FAKE: &str = include_str!("fixtures/vcs/fakehg_marks.bat");
+        #[cfg(not(windows))]
+        const FAKE: &str = include_str!("fixtures/vcs/fakehg_marks.sh");
+        #[cfg(windows)]
+        let file_name = "fakehg_marks.bat";
+        #[cfg(not(windows))]
+        let file_name = "fakehg_marks.sh";
+        let script = self.path.join(file_name);
+        std::fs::write(&script, FAKE).unwrap();
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            hg::HgCommand::custom("cmd", &["/C", &script.to_string_lossy()])
+        }
+        #[cfg(not(windows))]
+        {
+            hg::HgCommand::custom(&script.to_string_lossy(), &[])
         }
     }
 
@@ -603,5 +632,54 @@ fn metadata_layouts_differ_per_vcs() {
     assert_eq!(
         svn::find_metadata_path(tmp.path().join("wc").join("sub").as_path()),
         None
+    );
+}
+
+#[test]
+fn hg_bookmarks_runner_lists_canned() {
+    let tmp = TempDir::new("marks-bookmarks");
+    let hg = tmp.marks_backend();
+    tmp.write(
+        ".fakehg-bookmarks",
+        b"* active 12:abc123def456\n  other 3:789abcdef012\n",
+    );
+    let output = hg::get_bookmarks_with(tmp.path(), &hg).unwrap();
+    let marks = bookmarks::parse_bookmarks(&output).unwrap();
+    assert_eq!(marks.len(), 2);
+    assert_eq!(marks[0].name, "active");
+    assert!(marks[0].active);
+    assert_eq!(marks[1].name, "other");
+    assert!(!marks[1].active);
+    assert!(tmp.read_log(".fakehg.log").contains("bookmarks"));
+}
+
+#[test]
+fn hg_branches_runner_lists_canned() {
+    let tmp = TempDir::new("marks-branches");
+    let hg = tmp.marks_backend();
+    tmp.write(
+        ".fakehg-branches",
+        b"default 15101:a21ccf4412d5\nmy feature 14900:deadbeef1234 (inactive)\n",
+    );
+    tmp.write(".fakehg-branch", b"my feature\n");
+    let output = hg::get_branches_with(tmp.path(), &hg).unwrap();
+    let branches = hg::parse_mercurial_branches(&output).unwrap();
+    assert_eq!(branches.len(), 2);
+    assert_eq!(branches["default"].rev, "a21ccf4412d5");
+    assert_eq!(branches["my feature"].rev, "deadbeef1234");
+    assert_eq!(
+        hg::get_branch_name_with(tmp.path(), &hg).unwrap(),
+        "my feature"
+    );
+    assert!(tmp.read_log(".fakehg.log").contains("branches"));
+}
+
+#[test]
+fn hg_marks_current_branch_defaults() {
+    let tmp = TempDir::new("marks-branch-default");
+    let hg = tmp.marks_backend();
+    assert_eq!(
+        hg::get_branch_name_with(tmp.path(), &hg).unwrap(),
+        "default"
     );
 }

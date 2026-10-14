@@ -34,8 +34,10 @@
 //! - File and diff data are `Vec<u8>`, matching PHP byte strings.
 //! - Dates parse to `Option<i64>`; unparseable dates yield `None` where
 //!   PHP `strtotime` yields false.
-//! - Scratch `.arc` migration (`ArcanistRepositoryAPI.php:551-562`) is not
-//!   performed.
+//! - Scratch `.arc` migration (`ArcanistRepositoryAPI.php:551-562`) is
+//!   explicit: [`migrate_scratch_dir`] moves the files on demand instead of
+//!   once per process, and it leaves the old directory alone when it holds
+//!   anything but plain files (PHP would crash mid-migration there).
 //! - Conduit revision lookup (`:643-660`) is excluded; see the crate brief.
 //!
 //! Status maps use `BTreeMap`, so iteration order matches PHP `ksort`
@@ -1743,6 +1745,102 @@ pub fn update_working_copy(dir: &Path) -> Result<(), String> {
     update_working_copy_with(dir, &SvnCommand::system())
 }
 
+/// Pick the `svn commit` `LANG` value from `locale -a` output:
+/// `en_US.UTF-8` when listed, else `en_US.utf8`.
+///
+/// PHP: `ArcanistCommitWorkflow::getSVNLangEnvVar`
+/// (`src/workflow/ArcanistCommitWorkflow.php:297-310`).
+#[must_use]
+pub fn select_svn_locale(locales_output: &str) -> &'static str {
+    if locales_output.lines().any(|line| line == "en_US.UTF-8") {
+        "en_US.UTF-8"
+    } else {
+        "en_US.utf8"
+    }
+}
+
+/// Probe `locale -a` for the `svn commit` `LANG` value, defaulting to
+/// `en_US.utf8` when the probe fails. PHP swallows probe errors the same
+/// way; Windows callers pass no locale at all (PHP skips `LANG` there).
+pub fn svn_lang_env_var() -> &'static str {
+    let output = std::process::Command::new("locale").arg("-a").output();
+    match output {
+        Ok(out) if out.status.success() => select_svn_locale(&String::from_utf8_lossy(&out.stdout)),
+        _ => "en_US.utf8",
+    }
+}
+
+/// Failure message for `svn commit`, starting from the PHP sentence
+/// (`ArcanistCommitWorkflow.php:163`) with the captured output appended:
+/// PHP streams it live, while this port captures it.
+fn commit_failed_message(out: &std::process::Output) -> String {
+    const BASE: &str = "Executing 'svn commit' failed!";
+    let detail = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let detail = detail.trim();
+    if detail.is_empty() {
+        BASE.to_string()
+    } else {
+        format!("{BASE}: {detail}")
+    }
+}
+
+/// Commit `files` with `message`: `svn commit <files> --encoding utf-8
+/// -F <tmp>`, with `LANG` set to `locale` when given.
+///
+/// PHP: the `svn commit` call in `ArcanistCommitWorkflow::run`
+/// (`src/workflow/ArcanistCommitWorkflow.php:148-164`). Returns raw
+/// stdout (the `Sending ... Committed revision N` progress) so callers
+/// can show it, like PHP's passthru.
+pub fn commit_with_locale(
+    dir: &Path,
+    svn: &SvnCommand,
+    files: &[&str],
+    message: &str,
+    locale: Option<&str>,
+) -> Result<String, String> {
+    let tmp = write_temp_file("svncommit", message.as_bytes())?;
+    let tmp_name = tmp.to_string_lossy().into_owned();
+    let mut argv: Vec<&str> = Vec::with_capacity(files.len() + 5);
+    argv.push("commit");
+    argv.extend(files.iter().copied());
+    argv.extend(["--encoding", "utf-8", "-F", tmp_name.as_str()]);
+    let mut cmd = command_for(dir, svn, &argv);
+    if let Some(locale) = locale {
+        cmd.env("LANG", locale);
+    }
+    let out = spawn_output(&mut cmd).map_err(|e| format!("failed to run {}: {e}", svn.program))?;
+    std::fs::remove_file(&tmp).ok();
+    if !out.status.success() {
+        return Err(commit_failed_message(&out));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Commit `files` with `message`, probing `LANG` on non-Windows.
+///
+/// PHP skips `LANG` on Windows (`ArcanistCommitWorkflow.php:155`).
+pub fn commit_with(
+    dir: &Path,
+    svn: &SvnCommand,
+    files: &[&str],
+    message: &str,
+) -> Result<String, String> {
+    #[cfg(windows)]
+    let locale = None;
+    #[cfg(not(windows))]
+    let locale = Some(svn_lang_env_var());
+    commit_with_locale(dir, svn, files, message, locale)
+}
+
+/// Commit `files` with `message` using the system binary.
+pub fn commit(dir: &Path, files: &[&str], message: &str) -> Result<String, String> {
+    commit_with(dir, &SvnCommand::system(), files, message)
+}
+
 /// `getPath` (`ArcanistRepositoryAPI.php:105-113`): the root, or the root
 /// joined with a file whose leading separators are stripped. Both slash
 /// styles strip on every platform, where PHP strips only the platform
@@ -1825,11 +1923,61 @@ pub fn get_display_hash(hash: &str) -> String {
     hash.chars().take(12).collect()
 }
 
-/// `getScratchFilePath` (`ArcanistRepositoryAPI.php:538-565`), without the
-/// one-time `.arc` migration.
+/// `getScratchFilePath` (`ArcanistRepositoryAPI.php:538-565`).
+///
+/// The one-time `.arc` migration there is explicit here: call
+/// [`migrate_scratch_dir`] before the first scratch access.
 #[must_use]
 pub fn scratch_file_path(metadata: &Path, name: &str) -> PathBuf {
     metadata.join("arc").join(name)
+}
+
+/// Top-level file names under `old`, or `None` when the directory cannot
+/// be listed or holds anything but plain files.
+fn migration_file_names(old: &Path) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(old).ok()? {
+        let entry = entry.ok()?;
+        if !entry.file_type().ok()?.is_file() {
+            return None;
+        }
+        names.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    names.sort();
+    Some(names)
+}
+
+/// Move the legacy `<root>/.arc` scratch directory to `<metadata>/arc`.
+///
+/// PHP: the one-time migration inside `getScratchFilePath`
+/// (`ArcanistRepositoryAPI.php:538-565`). When the old directory exists
+/// and the new one does not, every top-level file moves over and the old
+/// directory is removed; otherwise nothing happens. Returns true when the
+/// new location is usable afterwards (migrated, or nothing to migrate).
+///
+/// Divergence: PHP runs this once per process behind a static flag; the
+/// `<new> missing` check makes repeats no-ops anyway, so this runs on
+/// demand. PHP also crashes when the old directory holds a subdirectory;
+/// this leaves the old directory untouched instead, never deleting data
+/// the migration did not move.
+pub fn migrate_scratch_dir(work_root: &Path, metadata: &Path) -> bool {
+    let old = work_root.join(".arc");
+    let new = metadata.join("arc");
+    if !old.is_dir() || new.exists() {
+        return true;
+    }
+    let Some(names) = migration_file_names(&old) else {
+        return false;
+    };
+    if std::fs::create_dir_all(&new).is_err() {
+        return false;
+    }
+    for name in &names {
+        if std::fs::copy(old.join(name), new.join(name)).is_err() {
+            return false;
+        }
+    }
+    std::fs::remove_dir_all(&old).is_ok() && !old.exists()
 }
 
 /// `readScratchFile` (`ArcanistRepositoryAPI.php:436-453`).
