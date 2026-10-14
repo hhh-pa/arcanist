@@ -16,7 +16,7 @@ fn g1_unified_parser_on_real_git_diff() {
     let first = fx.commit_all("one");
     fx.write("f.txt", "a\nB2\nB3\nc\n");
     let text = diff_local::get_full_git_diff(fx.path(), &first, None, 3).unwrap();
-    let changes = diff_local::parse_unified_diff(&text);
+    let changes = diff_local::parse_unified_diff(&text).unwrap();
     assert_eq!(changes.len(), 1);
     let change = &changes[0];
     assert_eq!(change.current_path, "f.txt");
@@ -36,17 +36,20 @@ fn g1_unified_parser_on_real_git_diff() {
 #[test]
 fn g1_unified_parser_vcs_shapes() {
     let hg = "diff -r abc f.txt\n--- f.txt\tdate\n+++ f.txt\tdate\n@@ -1 +1 @@\n-a\n+b\n";
-    let changes = diff_local::parse_unified_diff(hg);
+    let changes = diff_local::parse_unified_diff(hg).unwrap();
     assert_eq!(changes[0].current_path, "f.txt");
     assert_eq!(changes[0].hunks.len(), 1);
 
     let svn =
         "Index: s.txt\n--- s.txt\t(revision 5)\n+++ s.txt\t(working copy)\n@@ -1 +1 @@\n-a\n+b\n";
-    assert_eq!(diff_local::parse_unified_diff(svn)[0].current_path, "s.txt");
+    assert_eq!(
+        diff_local::parse_unified_diff(svn).unwrap()[0].current_path,
+        "s.txt"
+    );
 
     let rename =
         "diff --git a/a b/b\nrename from a\nrename to b\n--- a/a\n+++ b/b\n@@ -1 +1 @@\n x\n";
-    let change = &diff_local::parse_unified_diff(rename)[0];
+    let change = &diff_local::parse_unified_diff(rename).unwrap()[0];
     assert_eq!(change.change_type, diff_local::TYPE_MOVE_HERE);
     assert_eq!(
         (change.old_path.as_str(), change.current_path.as_str()),
@@ -54,13 +57,13 @@ fn g1_unified_parser_vcs_shapes() {
     );
 
     let binary = "diff --git a/i.png b/i.png\nBinary files a/i.png and b/i.png differ\n";
-    let change = &diff_local::parse_unified_diff(binary)[0];
+    let change = &diff_local::parse_unified_diff(binary).unwrap()[0];
     assert_eq!(change.file_type, diff_local::FILE_BINARY);
     assert!(change.hunks.is_empty());
 
     let show =
         "commit abc\n\n    subject\n\ndiff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n";
-    let changes = diff_local::parse_unified_diff(show);
+    let changes = diff_local::parse_unified_diff(show).unwrap();
     assert_eq!(changes.len(), 2);
     assert!(changes[0].is_message());
     assert_eq!(changes[0].commit_hash.as_deref(), Some("abc"));

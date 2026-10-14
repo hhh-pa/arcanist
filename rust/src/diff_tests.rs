@@ -178,6 +178,118 @@ fn g1_browser_helpers() {
 }
 
 #[test]
+fn gap2_open_submit_result_in_browser_matrix() {
+    use std::cell::RefCell;
+    let none = |_: &str| false;
+    // No URI or no --browse: the runner never runs.
+    let calls = RefCell::new(0);
+    let counting = |_: &str, _: &[String]| {
+        *calls.borrow_mut() += 1;
+        Ok(())
+    };
+    open_submit_result_in_browser(None, true, None, &none, &counting).unwrap();
+    open_submit_result_in_browser(Some("http://x/"), false, None, &none, &counting).unwrap();
+    assert_eq!(*calls.borrow(), 0);
+    // --browse with a URI opens through the resolved browser argv.
+    let seen: RefCell<Vec<(String, Vec<String>)>> = RefCell::new(Vec::new());
+    let recording = |uri: &str, browser: &[String]| {
+        seen.borrow_mut().push((uri.to_string(), browser.to_vec()));
+        Ok(())
+    };
+    let configured = ["my-browser".to_string(), "--new".to_string()];
+    open_submit_result_in_browser(
+        Some("http://x/D1"),
+        true,
+        Some(&configured),
+        &none,
+        &recording,
+    )
+    .unwrap();
+    assert_eq!(
+        *seen.borrow(),
+        vec![("http://x/D1".to_string(), configured.to_vec())]
+    );
+    // Runner failures propagate (production maps them to the PHP text).
+    let failing = |_: &str, _: &[String]| Err("boom".to_string());
+    assert_eq!(
+        open_submit_result_in_browser(Some("http://x/"), true, Some(&configured), &none, &failing)
+            .unwrap_err(),
+        "boom"
+    );
+    // Unresolvable browser surfaces the PHP message (off Windows, where
+    // `cmd /c start` always resolves).
+    let ok_run = |_: &str, _: &[String]| Ok(());
+    if cfg!(windows) {
+        open_submit_result_in_browser(Some("http://x/"), true, None, &none, &ok_run).unwrap();
+    } else {
+        assert_eq!(
+            open_submit_result_in_browser(Some("http://x/"), true, None, &none, &ok_run)
+                .unwrap_err(),
+            NO_BROWSER_MESSAGE
+        );
+        let has_xdg = |name: &str| name == "xdg-open";
+        open_submit_result_in_browser(Some("http://x/"), true, None, &has_xdg, &recording).unwrap();
+        assert_eq!(
+            seen.borrow().last().unwrap(),
+            &("http://x/".to_string(), vec!["xdg-open".to_string()])
+        );
+    }
+}
+
+#[test]
+fn gap2_configured_browser_command_shapes() {
+    let dir = scratch_dir("gap2-browser-cfg");
+    std::fs::write(dir.join(".arcconfig"), r#"{"browser": "plain-browser"}"#).unwrap();
+    assert_eq!(
+        configured_browser_command_in(&dir, None),
+        Some(vec!["plain-browser".to_string()])
+    );
+    std::fs::write(dir.join(".arcconfig"), r#"{"browser": ["a", "--b"]}"#).unwrap();
+    assert_eq!(
+        configured_browser_command_in(&dir, None),
+        Some(vec!["a".to_string(), "--b".to_string()])
+    );
+    for body in [
+        r#"{"browser": ""}"#,
+        r#"{"browser": []}"#,
+        r#"{"browser": 42}"#,
+        r#"{}"#,
+    ] {
+        std::fs::write(dir.join(".arcconfig"), body).unwrap();
+        assert_eq!(configured_browser_command_in(&dir, None), None, "{body}");
+    }
+    std::fs::write(dir.join(".arcconfig"), r#"{"browser": ["ok", 7]}"#).unwrap();
+    assert_eq!(
+        configured_browser_command_in(&dir, None),
+        Some(vec!["ok".to_string()])
+    );
+}
+
+#[test]
+fn gap2_binary_exists_in_dirs_probes_files() {
+    let dir = scratch_dir("gap2-bin-probe");
+    let other = scratch_dir("gap2-bin-probe2");
+    std::fs::write(dir.join("tool"), b"#!/bin/sh\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(dir.join("tool")).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(dir.join("tool"), perms).unwrap();
+        std::fs::write(dir.join("plain"), b"x").unwrap();
+        assert!(!binary_exists_in_dirs("plain", std::slice::from_ref(&dir)));
+    }
+    assert!(binary_exists_in_dirs("tool", &[dir.clone(), other.clone()]));
+    assert!(binary_exists_in_dirs("tool", &[other.clone(), dir.clone()]));
+    assert!(!binary_exists_in_dirs(
+        "missing",
+        std::slice::from_ref(&dir)
+    ));
+    assert!(!binary_exists_in_dirs("tool", std::slice::from_ref(&other)));
+    assert!(!binary_exists_in_dirs("tool", &[]));
+}
+
+#[test]
 fn g1_amend_helpers() {
     assert!(amend_worktree_message_git(Path::new("definitely-not-a-repo-g1"), "msg").is_err());
     assert!(!hg_supports_amend(Path::new("definitely-not-a-repo-g1")));
@@ -316,6 +428,48 @@ fn g1_collect_submit_changes_branches() {
         err,
         "No changes found. (Did you specify the wrong commit range?)"
     );
+}
+
+#[test]
+fn gap2_prepare_submit_with_report_stamps_status_words() {
+    let git = git_dir("gap2-lint-status");
+    std::fs::write(git.join("f.txt"), "a\n").unwrap();
+    let add = std::process::Command::new("git")
+        .current_dir(&git)
+        .args(["add", "f.txt"])
+        .status()
+        .unwrap();
+    assert!(add.success());
+    let commit = std::process::Command::new("git")
+        .current_dir(&git)
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "one",
+        ])
+        .status()
+        .unwrap();
+    assert!(commit.success());
+    std::fs::write(git.join("f.txt"), "a\nb\n").unwrap();
+
+    let options = defaults();
+    let report = diff_local::LintUnitReport {
+        lint_result: Some(1),
+        unresolved_lint: Vec::new(),
+        unit_result: Some(0),
+        test_results: Vec::new(),
+    };
+    let input = prepare_submit_with_report(&git, &options, &SubmitMode::Only, &report).unwrap();
+    assert_eq!(input.spec["lintStatus"], serde_json::json!("warn"));
+    assert_eq!(input.spec["unitStatus"], serde_json::json!("okay"));
+    // Legacy entry keeps the empty report (none/none).
+    let input = prepare_submit(&git, &options, &SubmitMode::Only).unwrap();
+    assert_eq!(input.spec["lintStatus"], serde_json::json!("none"));
+    assert_eq!(input.spec["unitStatus"], serde_json::json!("none"));
 }
 
 #[test]
@@ -591,6 +745,13 @@ fn g1_confirm_prompt_helpers() {
     assert_eq!(interpret_confirm_answer("", false), Some(true));
     assert_eq!(interpret_confirm_answer("  \n", true), Some(false));
     assert_eq!(interpret_confirm_answer("bogus", true), None);
+    // PHP `trim()` strips " \t\n\r\0\x0B" only: vertical tab and NUL
+    // trim, but Unicode whitespace (NBSP, EM SPACE) reprompts.
+    assert_eq!(interpret_confirm_answer("\x0BY\x0B", true), Some(true));
+    assert_eq!(interpret_confirm_answer("\0n\0", false), Some(false));
+    assert_eq!(interpret_confirm_answer("\u{a0}y\u{a0}", true), None);
+    assert_eq!(interpret_confirm_answer("\u{2003}n\u{2003}", false), None);
+    assert_eq!(interpret_confirm_answer("\u{a0}", true), None);
 
     let mut out = Vec::new();
     let answer = prompt_confirm_from(
@@ -615,6 +776,9 @@ fn g1_confirm_prompt_helpers() {
 
 #[test]
 fn g1_prompt_confirm_requires_tty() {
+    if !cfg!(unix) {
+        return; // PHP has no TTY gate without posix_isatty (Windows).
+    }
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         return; // Interactive session: the TTY gate cannot fail deterministically.
     }
@@ -622,6 +786,20 @@ fn g1_prompt_confirm_requires_tty() {
         prompt_confirm("Continue?", true).unwrap_err(),
         STDIN_NOT_TTY
     );
+}
+
+#[test]
+fn gap2_tty_gate_matches_php_platform_semantics() {
+    // PHP `phutil_console_require_tty()`: gate exists only where
+    // `posix_isatty` exists; elsewhere prompting reads stdin directly.
+    if cfg!(unix) {
+        assert_eq!(
+            super::tty_gate_blocks(),
+            !std::io::IsTerminal::is_terminal(&std::io::stdin())
+        );
+    } else {
+        assert!(!super::tty_gate_blocks());
+    }
 }
 
 #[test]
@@ -682,6 +860,7 @@ fn g1_hunk_and_change_conversion() {
         change_type: diff_local::TYPE_MOVE_HERE,
         file_type: diff_local::FILE_TEXT,
         hunks: vec![hunk],
+        away_paths: vec!["away.txt".to_string()],
         commit_hash: None,
         message: None,
     };
@@ -690,14 +869,16 @@ fn g1_hunk_and_change_conversion() {
     assert_eq!(submit.current_path, "n.txt");
     assert_eq!(submit.change_type, i64::from(diff_local::TYPE_MOVE_HERE));
     assert_eq!(submit.hunks.len(), 1);
+    assert_eq!(submit.away_paths, vec!["away.txt".to_string()]);
 
     let entry = change_entry_from_parsed(&change);
     assert_eq!(entry.old_path.as_deref(), Some("o.txt"));
+    assert_eq!(entry.away_paths, vec!["away.txt".to_string()]);
     assert_eq!(entry.current.added, 1);
     assert_eq!(entry.current.deleted, 1);
 
     let text = "commit abc\n\n    subject\n\ndiff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-a\n+b\n";
-    let changes = parse_raw_diff_changes(text);
+    let changes = parse_raw_diff_changes(text).unwrap();
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].current_path, "f.txt");
     assert_eq!(changes[0].hunks.len(), 1);
