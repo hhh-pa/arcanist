@@ -157,7 +157,7 @@ impl Linter for ExternalLinter {
         };
         command.args(&self.config.flags);
         command.arg(path);
-        let output = match command.output() {
+        let output = match arc_rs::lint::spawn_with_retry(&mut command) {
             Ok(output) => output,
             Err(_) => return Vec::new(),
         };

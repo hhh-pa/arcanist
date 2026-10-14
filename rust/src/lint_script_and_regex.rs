@@ -299,15 +299,14 @@ pub fn script_command(script: &str, path: &str) -> String {
 pub fn run_script_for_path(script: &str, path: &str) -> Result<String, String> {
     let command = script_command(script, path);
     #[cfg(unix)]
-    let spawned = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&command)
-        .output();
+    let mut spawned_command = std::process::Command::new("sh");
     #[cfg(windows)]
-    let spawned = std::process::Command::new("cmd")
-        .arg("/C")
-        .arg(&command)
-        .output();
+    let mut spawned_command = std::process::Command::new("cmd");
+    #[cfg(unix)]
+    spawned_command.arg("-c").arg(&command);
+    #[cfg(windows)]
+    spawned_command.arg("/C").arg(&command);
+    let spawned = arc_rs::lint::spawn_with_retry(&mut spawned_command);
     let output = spawned.map_err(|error| format!("failed to run script: {error}"))?;
     if !output.status.success() {
         return Err(format!("script exited with status {}", output.status));

@@ -179,12 +179,9 @@ fn staged_name(display_path: &str) -> String {
 }
 
 fn run_tool(program: &Path, prefix: &[String], file: &Path) -> Option<(i32, String, String)> {
-    let output = Command::new(program)
-        .args(prefix)
-        .arg(file)
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
+    let mut command = Command::new(program);
+    command.args(prefix).arg(file).stdin(Stdio::null());
+    let output = arc_rs::lint::spawn_with_retry(&mut command).ok()?;
     let code = output.status.code().unwrap_or(1);
     Some((
         code,

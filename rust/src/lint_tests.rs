@@ -323,3 +323,59 @@ fn engine_for_dir_falls_back_without_config() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// ETXTBSY retry: hold a script open for writing, release it mid-retry,
+/// and the spawn must succeed. Unix-only (Windows has no ETXTBSY).
+#[cfg(unix)]
+#[test]
+fn spawn_retries_while_script_is_busy() {
+    let dir = std::env::temp_dir().join(format!(
+        "arc-rs-lint-busy-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sh = dir.join("busy.sh");
+    std::fs::write(&sh, "#!/bin/sh\necho hi\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&sh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&sh, perms).unwrap();
+    }
+    let held = std::fs::OpenOptions::new().write(true).open(&sh).unwrap();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        drop(held);
+    });
+    let mut command = std::process::Command::new(&sh);
+    let out = spawn_with_retry(&mut command).unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
+    releaser.join().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A permanently busy script still fails (after the bound).
+#[cfg(unix)]
+#[test]
+fn spawn_gives_up_on_permanently_busy_script() {
+    let dir = std::env::temp_dir().join(format!(
+        "arc-rs-lint-stuck-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sh = dir.join("stuck.sh");
+    std::fs::write(&sh, "#!/bin/sh\necho hi\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&sh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&sh, perms).unwrap();
+    }
+    let _held = std::fs::OpenOptions::new().write(true).open(&sh).unwrap();
+    let mut command = std::process::Command::new(&sh);
+    assert!(spawn_with_retry(&mut command).is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -224,16 +224,16 @@ fn run_tool(binary: &Path, args: &[String]) -> Option<ToolOutput> {
         binary.extension().and_then(|ext| ext.to_str()),
         Some(ext) if ext.eq_ignore_ascii_case("bat") || ext.eq_ignore_ascii_case("cmd")
     );
-    let output = if scripted {
-        Command::new("cmd")
-            .arg("/C")
-            .arg(binary)
-            .args(args)
-            .output()
+    let mut command = if scripted {
+        let mut command = Command::new("cmd");
+        command.arg("/C").arg(binary).args(args);
+        command
     } else {
-        Command::new(binary).args(args).output()
+        let mut command = Command::new(binary);
+        command.args(args);
+        command
     };
-    let output = output.ok()?;
+    let output = arc_rs::lint::spawn_with_retry(&mut command).ok()?;
     Some(ToolOutput {
         success: output.status.success(),
         code: output.status.code().unwrap_or(-1),

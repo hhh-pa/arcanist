@@ -88,11 +88,12 @@ pub fn lint_with_binary(path: &str, data: &[u8], binary: Option<&Path>) -> Vec<L
     let Some(scratch) = write_scratch("pylint", ".py", path, data) else {
         return Vec::new();
     };
-    let output = Command::new(tool)
+    let mut command = Command::new(tool);
+    command
         .args(mandatory_flags())
         .arg(&scratch.file)
-        .current_dir(&scratch.cwd)
-        .output();
+        .current_dir(&scratch.cwd);
+    let output = arc_rs::lint::spawn_with_retry(&mut command);
     let mut messages = Vec::new();
     if let Ok(output) = output {
         let code = output.status.code().unwrap_or_default();
