@@ -43,19 +43,33 @@ RUN mkdir -p /tmp/prov-work \
 # survives it; the gates script already honors CARGO_TARGET_DIR, and its
 # llvm-cov seed copies this debug tree so coverage deps stay fresh too.
 # The nightly udeps tree warms with the script's exact command and target
-# dir (pin extracted from the script: no drift); its exit status stays a
-# runtime verdict. Registry sources stay extracted: cargo fingerprints
-# compare mtimes, and re-extraction would stale every prebuilt unit. Cargo
-# requires at least one target to resolve a manifest, hence the dummy main.
+# dir (pin extracted from the script: no drift). The warm stub must COMPILE
+# as a normal bin: an empty main.rs passes `cargo test --no-run` (the test
+# harness supplies main) but fails udeps with E0601, hence `fn main() {}`.
+# A nonzero udeps exit on the stub is EXPECTED (the stub uses no
+# dependencies, so every dep reports unused): only a genuine build failure
+# ("could not compile" in the log, or zero fingerprints) fails the image,
+# otherwise the log stays quiet and the verdict stays a runtime one.
+# Registry sources stay extracted: cargo fingerprints compare mtimes, and
+# re-extraction would stale every prebuilt unit.
 ENV CARGO_TARGET_DIR=/opt/target
 COPY rust/Cargo.toml rust/Cargo.lock /tmp/warm/rust/
 COPY scripts/ci/lib/rust-quality-gates.py /tmp/warm/pins.py
-RUN mkdir -p /tmp/warm/rust/src && touch /tmp/warm/rust/src/main.rs \
+RUN mkdir -p /tmp/warm/rust/src && printf 'fn main() {}\n' > /tmp/warm/rust/src/main.rs \
     && cd /tmp/warm/rust && cargo fetch \
     && cargo test --no-run \
     && NIGHTLY=$(grep -E '^UDEPS_NIGHTLY = ' /tmp/warm/pins.py | cut -d'"' -f2) \
     && [ -n "$NIGHTLY" ] \
-    && { CARGO_TARGET_DIR=/opt/target/nightly cargo +"$NIGHTLY" udeps --all-targets || echo "udeps warm: gate verdict deferred to runtime"; } \
+    && UDEPS_LOG=/tmp/warm/udeps.log \
+    && { NIGHTLY_TARGET="${CARGO_TARGET_DIR}/nightly"; \
+        CARGO_TARGET_DIR="$NIGHTLY_TARGET" cargo +"$NIGHTLY" udeps --all-targets >"$UDEPS_LOG" 2>&1; \
+        STATUS=$?; \
+        if [ $STATUS -ne 0 ] \
+            && { grep -q "could not compile" "$UDEPS_LOG" \
+                || [ -z "$(ls -A "$NIGHTLY_TARGET/debug/.fingerprint" 2>/dev/null)" ]; }; then \
+            echo "udeps warm: nightly build FAILED:"; cat "$UDEPS_LOG"; exit 1; \
+        fi; \
+        echo "udeps warm: nightly tree prebuilt (udeps exit $STATUS; unused-deps verdict deferred to runtime)"; } \
     && rm -rf /tmp/warm
 
 WORKDIR /work
