@@ -104,6 +104,14 @@ jobs:
           fi
       - name: run quality gates
         run: docker run --rm -v "${{ github.workspace }}:/work" -w /work "$GATE_IMAGE:$GATE_KEY" python3 scripts/ci/lib/rust-quality-gates.py rust rust/target/llvm-cov nextest --run-ignored all --no-fail-fast
+      # The container runs as root; hand the report back so later steps can
+      # read it.
+      - name: take ownership of coverage report
+        if: always()
+        run: |
+          if [ -d rust/target/llvm-cov ]; then
+            sudo chown -R "$(id -u):$(id -g)" rust/target/llvm-cov
+          fi
       - name: publish coverage summary
         if: always()
         run: python3 scripts/ci/lib/coverage-summary.py rust/target/llvm-cov/lcov.info >> "$GITHUB_STEP_SUMMARY"
