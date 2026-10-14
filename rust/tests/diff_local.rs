@@ -6,6 +6,161 @@ use std::process::Command;
 
 use arc_rs::diff_local;
 
+/* G1 full-state integration tests: parser on real diffs, VCS helpers. */
+
+#[test]
+fn g1_unified_parser_on_real_git_diff() {
+    let fx = Fixture::named("g1-parse");
+    fx.init_repo();
+    fx.write("f.txt", "a\nb\nc\n");
+    let first = fx.commit_all("one");
+    fx.write("f.txt", "a\nB2\nB3\nc\n");
+    let text = diff_local::get_full_git_diff(fx.path(), &first, None, 3).unwrap();
+    let changes = diff_local::parse_unified_diff(&text);
+    assert_eq!(changes.len(), 1);
+    let change = &changes[0];
+    assert_eq!(change.current_path, "f.txt");
+    assert_eq!(change.change_type, diff_local::TYPE_CHANGE);
+    assert!(!change.is_message());
+    assert_eq!(change.hunks.len(), 1);
+    let hunk = &change.hunks[0];
+    assert_eq!(
+        (hunk.old_start, hunk.old_len, hunk.new_start, hunk.new_len),
+        (1, 3, 1, 4)
+    );
+    assert!(hunk.corpus.contains("+B2\n"), "{}", hunk.corpus);
+    assert_eq!(change.corpus_size(), hunk.corpus.len());
+    assert_eq!(diff_local::without_message_changes(&changes).len(), 1);
+}
+
+#[test]
+fn g1_unified_parser_vcs_shapes() {
+    let hg = "diff -r abc f.txt\n--- f.txt\tdate\n+++ f.txt\tdate\n@@ -1 +1 @@\n-a\n+b\n";
+    let changes = diff_local::parse_unified_diff(hg);
+    assert_eq!(changes[0].current_path, "f.txt");
+    assert_eq!(changes[0].hunks.len(), 1);
+
+    let svn =
+        "Index: s.txt\n--- s.txt\t(revision 5)\n+++ s.txt\t(working copy)\n@@ -1 +1 @@\n-a\n+b\n";
+    assert_eq!(diff_local::parse_unified_diff(svn)[0].current_path, "s.txt");
+
+    let rename =
+        "diff --git a/a b/b\nrename from a\nrename to b\n--- a/a\n+++ b/b\n@@ -1 +1 @@\n x\n";
+    let change = &diff_local::parse_unified_diff(rename)[0];
+    assert_eq!(change.change_type, diff_local::TYPE_MOVE_HERE);
+    assert_eq!(
+        (change.old_path.as_str(), change.current_path.as_str()),
+        ("a", "b")
+    );
+
+    let binary = "diff --git a/i.png b/i.png\nBinary files a/i.png and b/i.png differ\n";
+    let change = &diff_local::parse_unified_diff(binary)[0];
+    assert_eq!(change.file_type, diff_local::FILE_BINARY);
+    assert!(change.hunks.is_empty());
+
+    let show =
+        "commit abc\n\n    subject\n\ndiff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n";
+    let changes = diff_local::parse_unified_diff(show);
+    assert_eq!(changes.len(), 2);
+    assert!(changes[0].is_message());
+    assert_eq!(changes[0].commit_hash.as_deref(), Some("abc"));
+    assert_eq!(diff_local::without_message_changes(&changes).len(), 1);
+}
+
+#[test]
+fn g1_hg_svn_helpers_smoke() {
+    assert_eq!(
+        diff_local::hg_diff_options(3),
+        vec!["--git".to_string(), "-U3".to_string()]
+    );
+    let argv = diff_local::hg_full_diff_argv("abc", 3);
+    assert_eq!(&argv[..5], &["diff", "--git", "-U3", "--rev", "abc"]);
+    let entries = diff_local::parse_hg_status("M f\nA g\n? u\n").unwrap();
+    assert_eq!(
+        entries,
+        vec![
+            ("f".to_string(), diff_local::FLAG_MODIFIED),
+            ("g".to_string(), diff_local::FLAG_ADDED),
+            ("u".to_string(), diff_local::FLAG_UNTRACKED),
+        ]
+    );
+    let log = diff_local::parse_hg_commit_log("n1\x01d1\x02");
+    assert_eq!(log, vec![("n1".to_string(), "d1".to_string())]);
+    assert!(diff_local::hg_supports_amend_from_help("commit --amend"));
+
+    assert_eq!(
+        diff_local::svn_props_mask("modified").unwrap(),
+        diff_local::FLAG_MODIFIED
+    );
+    assert_eq!(
+        diff_local::parse_svn_item_status("added").unwrap(),
+        diff_local::FLAG_ADDED
+    );
+    assert_eq!(
+        diff_local::check_svn_base_consistency(&[("a", 9), ("b", 9)]).unwrap(),
+        9
+    );
+    assert!(diff_local::check_svn_base_consistency(&[("a", 9), ("b", 10)]).is_err());
+    assert_eq!(
+        diff_local::svn_info_argv("/"),
+        vec!["info".to_string(), ".".to_string()]
+    );
+    assert_eq!(
+        diff_local::svn_branch_name("https://s/r/t", "https://s/r"),
+        "/t"
+    );
+
+    let (author, email) = diff_local::parse_hg_author("A U Thor <a@t>");
+    assert_eq!(author.as_deref(), Some("A U Thor"));
+    assert_eq!(email.as_deref(), Some("a@t"));
+    let info = diff_local::parse_svn_info("URL: u\nRevision: 7\n");
+    assert_eq!(info.get("Revision").map(String::as_str), Some("7"));
+}
+
+#[test]
+fn g1_staging_lint_review_texts() {
+    let config = diff_local::StagingConfig::new(true, Some("ssh://x"), true);
+    assert_eq!(
+        diff_local::staging_skip_reason(false, false, Some("P"), Some(&config)),
+        None
+    );
+    assert_eq!(
+        diff_local::staging_skip_reason(true, false, Some("P"), Some(&config)),
+        Some(diff_local::STAGING_USER_SKIP)
+    );
+    assert_eq!(
+        diff_local::staging_skip_body(diff_local::STAGING_DIFF_RAW),
+        "Raw changes can not be pushed to a staging area."
+    );
+    assert_eq!(
+        diff_local::staging_refspecs("b", "h", "phabricator", 7, false),
+        vec![
+            "b:refs/tags/phabricator/base/7".to_string(),
+            "h:refs/tags/phabricator/diff/7".to_string()
+        ]
+    );
+    assert!(diff_local::git_supports_push_no_verify("2.0"));
+
+    assert_eq!(
+        diff_local::lint_result_notice(diff_local::LINT_RESULT_OKAY),
+        Some(("LINT OKAY", "No lint problems."))
+    );
+    assert_eq!(
+        diff_local::unit_result_notice(diff_local::UNIT_RESULT_FAIL),
+        Some(("UNIT ERRORS", "Unit testing raised errors!"))
+    );
+    assert!(diff_local::utf8_warning_body(1).contains("1 file(s)"));
+    assert!(diff_local::gigantic_confirm("f", 1_000_000).contains("Mark this file as 'binary'"));
+    assert!(diff_local::needs_binary_upload(
+        diff_local::FILE_BINARY,
+        false
+    ));
+    assert_eq!(
+        diff_local::included_commits_block(Some("main"), &["c".to_string()])[1],
+        "Included commits in branch main:"
+    );
+}
+
 /// Unique scratch dir for one test; removed on drop (best effort).
 struct Fixture {
     dir: PathBuf,

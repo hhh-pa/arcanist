@@ -2181,6 +2181,1525 @@ pub fn should_amend(
     true
 }
 
+/* -(  Unified Diff Parser (G1 full-state)  )------------------------------------ */
+
+/// One parsed hunk: header offsets plus the verbatim corpus.
+///
+/// PHP: `ArcanistDiffHunk` (`src/parser/diff/ArcanistDiffHunk.php`); the
+/// corpus is the `@@` header line plus every body line through the next
+/// header, exactly as `ArcanistDiffParser` accumulates it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedHunk {
+    /// Old-file start line (`-old_start`).
+    pub old_start: u64,
+    /// Old-file line count (`-old_start,old_len`; bare start means 1).
+    pub old_len: u64,
+    /// New-file start line (`+new_start`).
+    pub new_start: u64,
+    /// New-file line count.
+    pub new_len: u64,
+    /// Verbatim hunk text: header line plus body lines, `\n`-joined with a
+    /// trailing newline when non-empty.
+    pub corpus: String,
+}
+
+/// One parsed file change (or commit message) from unified diff text.
+///
+/// PHP: `ArcanistDiffChange` (`src/parser/diff/ArcanistDiffChange.php`) as
+/// built by `ArcanistDiffParser::parseDiff()`. Only the fields the diff
+/// workflow reads are ported: paths, types, hunks, and (for `TYPE_MESSAGE`
+/// changes from `git show`/`git log`) the commit hash and message body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedChange {
+    /// Old path; equals `current_path` except for renames, copies, and
+    /// adds (empty here; `/dev/null` upstream).
+    pub old_path: String,
+    /// Current path (`getCurrentPath()`).
+    pub current_path: String,
+    /// `TYPE_*` change type.
+    pub change_type: u32,
+    /// `FILE_*` file type.
+    pub file_type: u32,
+    /// Parsed hunks (empty for binary and message changes).
+    pub hunks: Vec<ParsedHunk>,
+    /// Commit hash for `TYPE_MESSAGE` changes, else `None`.
+    pub commit_hash: Option<String>,
+    /// Message body for `TYPE_MESSAGE` changes, else `None`.
+    pub message: Option<String>,
+}
+
+impl ParsedChange {
+    /// True for commit-message pseudo-changes (`TYPE_MESSAGE`), which raw
+    /// diffs drop (`ArcanistDiffWorkflow.php:821-826`).
+    #[must_use]
+    pub fn is_message(&self) -> bool {
+        self.change_type == TYPE_MESSAGE
+    }
+
+    /// Total hunk corpus size in bytes (the gigantic-diff scan input).
+    #[must_use]
+    pub fn corpus_size(&self) -> usize {
+        self.hunks.iter().map(|hunk| hunk.corpus.len()).sum()
+    }
+}
+
+/// Parse unified diff text into per-file changes.
+///
+/// Handles `diff --git` (git), `diff -r` (hg), and `Index:` (svn) headers,
+/// `---`/`+++` paths (with `a/`/`b/` prefixes and `/dev/null` for
+/// add/delete), rename/copy headers, `Binary files ... differ` and
+/// `GIT binary patch` markers, and `commit <hash>` message blocks from
+/// `git show`/`git log`. Unknown text between blocks is skipped, mirroring
+/// the PHP parser's tolerance for extended headers.
+///
+/// Divergence: combined-diff (`@@@`) headers are not parsed; they are
+/// treated as hunk body text.
+#[must_use]
+pub fn parse_unified_diff(text: &str) -> Vec<ParsedChange> {
+    let mut changes: Vec<ParsedChange> = Vec::new();
+    let mut pending_message: Option<(String, Vec<String>)> = None;
+    let lines: Vec<&str> = text.lines().collect();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        if let Some(hash) = line.strip_prefix("commit ") {
+            if let Some((done_hash, body)) = pending_message.take() {
+                changes.push(message_change(&done_hash, &body));
+            }
+            let hash = hash.split_whitespace().next().unwrap_or("").to_string();
+            pending_message = Some((hash, Vec::new()));
+            index += 1;
+            continue;
+        }
+        if is_diff_header(line) {
+            if let Some((done_hash, body)) = pending_message.take()
+                && (!body_is_empty(&body) || changes.is_empty())
+            {
+                changes.push(message_change(&done_hash, &body));
+            }
+            let (change, next) = parse_file_block(&lines, index);
+            changes.push(change);
+            index = next;
+            continue;
+        }
+        if let Some((_, body)) = pending_message.as_mut() {
+            body.push(line.to_string());
+        }
+        index += 1;
+    }
+    if let Some((hash, body)) = pending_message {
+        changes.push(message_change(&hash, &body));
+    }
+    changes
+}
+
+/// Drop `TYPE_MESSAGE` changes from a raw parse (`:821-826`).
+#[must_use]
+pub fn without_message_changes(changes: &[ParsedChange]) -> Vec<ParsedChange> {
+    changes
+        .iter()
+        .filter(|change| !change.is_message())
+        .cloned()
+        .collect()
+}
+
+fn body_is_empty(body: &[String]) -> bool {
+    body.iter().all(|line| line.trim().is_empty())
+}
+
+fn message_change(hash: &str, body: &[String]) -> ParsedChange {
+    ParsedChange {
+        old_path: String::new(),
+        current_path: String::new(),
+        change_type: TYPE_MESSAGE,
+        file_type: FILE_TEXT,
+        hunks: Vec::new(),
+        commit_hash: Some(hash.to_string()),
+        message: Some(body.join("\n")),
+    }
+}
+
+fn is_diff_header(line: &str) -> bool {
+    line.starts_with("diff --git ")
+        || line.starts_with("diff -r ")
+        || line.starts_with("diff -u ")
+        || line.starts_with("Index: ")
+}
+
+/// Parse one `diff`/`Index:` block starting at `lines[start]`.
+fn parse_file_block(lines: &[&str], start: usize) -> (ParsedChange, usize) {
+    let mut old_path = String::new();
+    let mut new_path = String::new();
+    let mut change_type = TYPE_CHANGE;
+    let mut file_type = FILE_TEXT;
+    let mut hunks: Vec<ParsedHunk> = Vec::new();
+    let mut rename_from: Option<String> = None;
+    let mut rename_to: Option<String> = None;
+    let mut is_copy = false;
+    let mut is_rename = false;
+    let mut new_file = false;
+    let mut deleted_file = false;
+    let mut binary = false;
+
+    // Seed paths from the header line when present (`diff --git a/o b/n`,
+    // `diff -r <rev> <file>`, `Index: <file>`).
+    let header = lines[start];
+    if let Some(rest) = header.strip_prefix("diff --git ") {
+        let mut parts = rest.split_whitespace();
+        if let (Some(old), Some(new)) = (parts.next(), parts.next()) {
+            old_path = strip_ab_prefix(old).to_string();
+            new_path = strip_ab_prefix(new).to_string();
+        }
+    } else if let Some(rest) = header.strip_prefix("Index: ") {
+        old_path = rest.trim().to_string();
+        new_path = old_path.clone();
+    } else if (header.starts_with("diff -r ") || header.starts_with("diff -u "))
+        && let Some(last) = header.split_whitespace().last()
+    {
+        old_path = strip_ab_prefix(last).to_string();
+        new_path = old_path.clone();
+    }
+
+    let mut index = start + 1;
+    // Extended headers up to `---`.
+    while index < lines.len() {
+        let line = lines[index];
+        if line.starts_with("--- ")
+            || line.starts_with("Binary files ")
+            || line.starts_with("GIT binary patch")
+            || line.starts_with("@@ ")
+            || is_diff_header(line)
+            || line.starts_with("commit ")
+        {
+            break;
+        }
+        if let Some(path) = line.strip_prefix("rename from ") {
+            rename_from = Some(path.trim().to_string());
+            is_rename = true;
+        } else if let Some(path) = line.strip_prefix("rename to ") {
+            rename_to = Some(path.trim().to_string());
+            is_rename = true;
+        } else if let Some(path) = line.strip_prefix("copy from ") {
+            rename_from = Some(path.trim().to_string());
+            is_copy = true;
+        } else if let Some(path) = line.strip_prefix("copy to ") {
+            rename_to = Some(path.trim().to_string());
+            is_copy = true;
+        } else if line.starts_with("new file mode") {
+            new_file = true;
+        } else if line.starts_with("deleted file mode") {
+            deleted_file = true;
+        }
+        index += 1;
+    }
+
+    // `---` / `+++` path lines.
+    if index < lines.len() && lines[index].starts_with("--- ") {
+        let old = diff_path_value(lines[index]);
+        if old == "/dev/null" {
+            new_file = true;
+        } else if !old.is_empty() {
+            old_path = old;
+        }
+        index += 1;
+    }
+    if index < lines.len() && lines[index].starts_with("+++ ") {
+        let new = diff_path_value(lines[index]);
+        if new == "/dev/null" {
+            deleted_file = true;
+            new_path.clone_from(&old_path);
+        } else if !new.is_empty() {
+            new_path = new;
+        }
+        index += 1;
+    }
+    if new_path.is_empty() {
+        new_path.clone_from(&old_path);
+    }
+    if old_path.is_empty() {
+        old_path.clone_from(&new_path);
+    }
+
+    // Body: binary markers and hunks until the next block.
+    while index < lines.len() {
+        let line = lines[index];
+        if is_diff_header(line) || line.starts_with("commit ") {
+            break;
+        }
+        if line.starts_with("Binary files ") || line.starts_with("GIT binary patch") {
+            binary = true;
+            index += 1;
+            // Skip binary payload lines (`literal ...`, base85, ...).
+            while index < lines.len()
+                && !lines[index].starts_with("@@ ")
+                && !is_diff_header(lines[index])
+                && !lines[index].starts_with("commit ")
+            {
+                index += 1;
+            }
+            continue;
+        }
+        if let Some((old_start, old_len, new_start, new_len)) = parse_hunk_header(line) {
+            let (hunk, next) = collect_hunk(lines, index, old_start, old_len, new_start, new_len);
+            hunks.push(hunk);
+            index = next;
+            continue;
+        }
+        index += 1;
+    }
+
+    if binary {
+        file_type = FILE_BINARY;
+        hunks.clear();
+    }
+    if is_rename {
+        change_type = TYPE_MOVE_HERE;
+        if let (Some(from), Some(to)) = (rename_from, rename_to) {
+            old_path = from;
+            new_path = to;
+        }
+    } else if is_copy {
+        change_type = TYPE_COPY_HERE;
+        if let (Some(from), Some(to)) = (rename_from, rename_to) {
+            old_path = from;
+            new_path = to;
+        }
+    } else if new_file {
+        change_type = TYPE_ADD;
+    } else if deleted_file {
+        change_type = TYPE_DELETE;
+    }
+    if old_path == "/dev/null" {
+        old_path.clear();
+    }
+
+    (
+        ParsedChange {
+            old_path,
+            current_path: new_path,
+            change_type,
+            file_type,
+            hunks,
+            commit_hash: None,
+            message: None,
+        },
+        index,
+    )
+}
+
+fn strip_ab_prefix(path: &str) -> &str {
+    if path.len() > 2 && (path.starts_with("a/") || path.starts_with("b/")) {
+        &path[2..]
+    } else {
+        path
+    }
+}
+
+/// Extract the path from a `---`/`+++` line, dropping hg/svn suffixes.
+///
+/// Handles `a/f`, `b/f`, bare `f`, quoted `"f"`, svn `f (revision N)` /
+/// `f (working copy)` suffixes, and hg tab-separated date suffixes.
+fn diff_path_value(line: &str) -> String {
+    let value = line[4..].trim_end();
+    // Tab separates svn/hg metadata suffixes.
+    let path = value.split('\t').next().unwrap_or("").trim();
+    // Svn appends ` (revision N)` / ` (working copy)` after a space.
+    let path = if path.contains(" (revision ") || path.ends_with(" (working copy)") {
+        path.rsplit_once(" (").map_or(path, |(head, _)| head)
+    } else {
+        path
+    };
+    let path = path.trim();
+    let unquoted = if path.len() >= 2 && path.starts_with('"') && path.ends_with('"') {
+        &path[1..path.len() - 1]
+    } else {
+        path
+    };
+    strip_ab_prefix(unquoted).to_string()
+}
+
+/// Parse an `@@ -a[,b] +c[,d] @@` header into its four offsets.
+fn parse_hunk_header(line: &str) -> Option<(u64, u64, u64, u64)> {
+    let inner = line.strip_prefix("@@ ")?.split_once("@@")?.0;
+    let mut parts = inner.split_whitespace();
+    let old = parts.next()?.strip_prefix('-')?;
+    let new = parts.next()?.strip_prefix('+')?;
+    let (old_start, old_len) = parse_hunk_range(old)?;
+    let (new_start, new_len) = parse_hunk_range(new)?;
+    Some((old_start, old_len, new_start, new_len))
+}
+
+fn parse_hunk_range(text: &str) -> Option<(u64, u64)> {
+    if let Some((start, len)) = text.split_once(',') {
+        Some((start.parse().ok()?, len.parse().ok()?))
+    } else {
+        Some((text.parse().ok()?, 1))
+    }
+}
+
+fn collect_hunk(
+    lines: &[&str],
+    start: usize,
+    old_start: u64,
+    old_len: u64,
+    new_start: u64,
+    new_len: u64,
+) -> (ParsedHunk, usize) {
+    let mut corpus = String::new();
+    corpus.push_str(lines[start]);
+    corpus.push('\n');
+    let mut index = start + 1;
+    while index < lines.len() {
+        let line = lines[index];
+        if line.starts_with("@@ ") || is_diff_header(line) || line.starts_with("commit ") {
+            break;
+        }
+        corpus.push_str(line);
+        corpus.push('\n');
+        index += 1;
+    }
+    (
+        ParsedHunk {
+            old_start,
+            old_len,
+            new_start,
+            new_len,
+            corpus,
+        },
+        index,
+    )
+}
+
+/* -(  Raw Sources, Hg, Svn (G1 full-state)  )----------------------------------- */
+
+/// Notice written to stderr while reading a `--raw` diff from stdin.
+///
+/// PHP: `generateChanges()` (`src/workflow/ArcanistDiffWorkflow.php:808-813`).
+pub const RAW_STDIN_NOTICE: &str = "Reading diff from stdin...\n";
+
+/// Error for an unreachable raw-source branch (`:817`).
+pub const UNKNOWN_RAW_DIFF_SOURCE: &str = "Unknown raw diff source.";
+
+/// Read a `--raw` diff fully from `reader` (stdin in production).
+///
+/// PHP: `file_get_contents('php://stdin')` (`:813`). The caller prints
+/// [`RAW_STDIN_NOTICE`] to stderr first.
+pub fn read_raw_stdin_from<R: std::io::Read>(mut reader: R) -> Result<String, String> {
+    let mut text = String::new();
+    reader
+        .read_to_string(&mut text)
+        .map_err(|e| format!("failed to read diff from stdin: {e}"))?;
+    Ok(text)
+}
+
+/// Run `command` through the platform shell and capture its output.
+///
+/// PHP: `execx('%C', ...)` / `passthru('%C', ...)`.
+///
+/// On Windows the command passes verbatim (`raw_arg`): re-quoting it for
+/// `CreateProcess` would corrupt inner quotes for `cmd`.
+pub fn shell_command_output(command: &str) -> Result<std::process::Output, String> {
+    #[cfg(windows)]
+    {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C"]);
+        <std::process::Command as std::os::windows::process::CommandExt>::raw_arg(
+            &mut cmd, command,
+        );
+        cmd.output()
+            .map_err(|e| format!("failed to run shell command: {e}"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("sh")
+            .args(["-c", command])
+            .output()
+            .map_err(|e| format!("failed to run shell command: {e}"))
+    }
+}
+
+/// Run `command` through the platform shell with stdio inherited.
+///
+/// Same verbatim-argument rule as [`shell_command_output`].
+pub fn shell_command_status(command: &str) -> Result<std::process::ExitStatus, String> {
+    #[cfg(windows)]
+    {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C"]);
+        <std::process::Command as std::os::windows::process::CommandExt>::raw_arg(
+            &mut cmd, command,
+        );
+        cmd.status()
+            .map_err(|e| format!("failed to run shell command: {e}"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("sh")
+            .args(["-c", command])
+            .status()
+            .map_err(|e| format!("failed to run shell command: {e}"))
+    }
+}
+
+/// Run a `--raw-command` string and capture its stdout (`:815`).
+pub fn run_raw_command_text(command: &str) -> Result<String, String> {
+    let output = shell_command_output(command)?;
+    if !output.status.success() {
+        return Err(format!(
+            "raw command failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// `hg diff` option list for `context_lines` lines of context.
+///
+/// PHP: `ArcanistMercurialAPI::getDiffOptions()`
+/// (`src/repository/api/ArcanistMercurialAPI.php:353-359`).
+#[must_use]
+pub fn hg_diff_options(context_lines: u32) -> Vec<String> {
+    vec!["--git".to_string(), format!("-U{context_lines}")]
+}
+
+/// Full `hg diff` argv against `base`.
+///
+/// PHP: `getRawDiffText('')` (`ArcanistMercurialAPI.php:361-384`):
+/// `diff {options} --rev {base} -- ''`.
+#[must_use]
+pub fn hg_full_diff_argv(base: &str, context_lines: u32) -> Vec<String> {
+    let mut argv = vec!["diff".to_string()];
+    argv.extend(hg_diff_options(context_lines));
+    argv.extend(["--rev".to_string(), base.to_string(), "--".to_string()]);
+    argv.push(String::new());
+    argv
+}
+
+/// Generate the full Mercurial diff of `base` against the worktree.
+///
+/// PHP: `getFullMercurialDiff()` (`ArcanistMercurialAPI.php:382-384`).
+/// Like [`get_full_git_diff`], output decodes lossy.
+pub fn get_full_hg_diff(dir: &Path, base: &str, context_lines: u32) -> Result<String, String> {
+    let argv = hg_full_diff_argv(base, context_lines);
+    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let out = arc_rs::hg::output(dir, &refs)?;
+    if !out.status.success() {
+        return Err(format!(
+            "hg diff failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// `hg branch` argv (`ArcanistMercurialAPI.php:70-76`).
+#[must_use]
+pub fn hg_branch_argv() -> Vec<String> {
+    vec!["branch".to_string()]
+}
+
+/// Read the Mercurial branch name (trimmed stdout).
+pub fn get_hg_branch_name(dir: &Path) -> Result<String, String> {
+    let out = arc_rs::hg::stdout_text(dir, &["branch"])?;
+    Ok(out.trim().to_string())
+}
+
+/// `hg status --rev <since>` argv (`ArcanistMercurialAPI.php:275-278`).
+#[must_use]
+pub fn hg_status_argv(since_commit: &str) -> Vec<String> {
+    vec![
+        "status".to_string(),
+        "--rev".to_string(),
+        since_commit.to_string(),
+    ]
+}
+
+/// One `hg status` line: the status code plus path (and copy source).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HgStatusEntry {
+    /// Status code (`A`, `R`, `M`, `C`, `!`, `?`, `I`).
+    pub status: char,
+    /// Repository-relative path.
+    pub path: String,
+    /// Copy/move source from a following `  <path>` line, if any.
+    pub from: Option<String>,
+}
+
+/// Parse `hg status` output into entries with copy sources.
+///
+/// PHP: `ArcanistMercurialParser::parseMercurialStatusDetails()`
+/// (`src/repository/parser/ArcanistMercurialParser.php:24-91`), including
+/// both error strings. Clean (`C`) and ignored (`I`) entries are kept with
+/// a zero mask so callers can filter them like PHP does.
+pub fn parse_hg_status_details(output: &str) -> Result<Vec<(HgStatusEntry, u32)>, String> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut entries: Vec<(HgStatusEntry, u32)> = Vec::new();
+    for line in trimmed.split('\n') {
+        let bytes = line.as_bytes();
+        if bytes.len() < 2 || bytes[1] != b' ' {
+            return Err(format!("Unparsable Mercurial status line '{line}'."));
+        }
+        let code = bytes[0] as char;
+        let path = line[2..].to_string();
+        if code == ' ' {
+            let Some((last, _)) = entries.last_mut() else {
+                return Err(format!("Unexpected copy source in hg status, '{line}'."));
+            };
+            last.from = Some(path);
+            continue;
+        }
+        let flags = match code {
+            'A' => FLAG_ADDED,
+            'R' => FLAG_DELETED,
+            'M' => FLAG_MODIFIED,
+            'C' | 'I' => 0,
+            '!' => FLAG_MISSING,
+            '?' => FLAG_UNTRACKED,
+            _ => return Err(format!("Unknown Mercurial status '{code}'.")),
+        };
+        entries.push((
+            HgStatusEntry {
+                status: code,
+                path,
+                from: None,
+            },
+            flags,
+        ));
+    }
+    Ok(entries)
+}
+
+/// Parse `hg status` output into a path-to-mask map (`:103-106`).
+pub fn parse_hg_status(output: &str) -> Result<Vec<(String, u32)>, String> {
+    Ok(parse_hg_status_details(output)?
+        .into_iter()
+        .map(|(entry, flags)| (entry.path, flags))
+        .collect())
+}
+
+/// `hg log` argv for the commit-message log between `base` and `.`.
+///
+/// PHP: `getCommitMessageLog()` (`ArcanistMercurialAPI.php:532-538`).
+#[must_use]
+pub fn hg_commit_log_argv(base: &str, branch: &str) -> Vec<String> {
+    vec![
+        "log".to_string(),
+        "--template".to_string(),
+        "{node}\u{1}{desc}\u{2}".to_string(),
+        "--rev".to_string(),
+        format!("({base}::. - {base})"),
+        "--branch".to_string(),
+        branch.to_string(),
+        "--".to_string(),
+    ]
+}
+
+/// Parse the `{node}\1{desc}\2` commit-message log into `(node, desc)` pairs
+/// (`ArcanistMercurialAPI.php:542-546`).
+#[must_use]
+pub fn parse_hg_commit_log(output: &str) -> Vec<(String, String)> {
+    output
+        .trim()
+        .split('\u{2}')
+        .filter(|log| !log.is_empty())
+        .filter_map(|log| {
+            let (node, desc) = log.split_once('\u{1}')?;
+            Some((node.to_string(), desc.to_string()))
+        })
+        .collect()
+}
+
+/// True when `hg help commit` output advertises `--amend`.
+///
+/// PHP: `supportsAmend()` (`ArcanistMercurialAPI.php:469-476`).
+#[must_use]
+pub fn hg_supports_amend_from_help(help_text: &str) -> bool {
+    help_text.contains("amend")
+}
+
+/// `hg commit --amend --logfile <file> --` argv for head commits
+/// (`ArcanistMercurialAPI.php:715`).
+#[must_use]
+pub fn hg_amend_argv(logfile: &str) -> Vec<String> {
+    vec![
+        "commit".to_string(),
+        "--amend".to_string(),
+        "--logfile".to_string(),
+        logfile.to_string(),
+        "--".to_string(),
+    ]
+}
+
+/// Working-copy status flag: modified (`ArcanistRepositoryAPI.php:10`).
+pub const FLAG_MODIFIED: u32 = 1;
+/// Working-copy status flag: added (`:11`).
+pub const FLAG_ADDED: u32 = 2;
+/// Working-copy status flag: deleted (`:12`).
+pub const FLAG_DELETED: u32 = 4;
+/// Working-copy status flag: untracked (`:13`).
+pub const FLAG_UNTRACKED: u32 = 8;
+/// Working-copy status flag: conflicted (`:14`).
+pub const FLAG_CONFLICT: u32 = 16;
+/// Working-copy status flag: missing (`:15`).
+pub const FLAG_MISSING: u32 = 32;
+/// Working-copy status flag: unstaged (`:16`).
+pub const FLAG_UNSTAGED: u32 = 64;
+/// Working-copy status flag: uncommitted (`:17`).
+pub const FLAG_UNCOMMITTED: u32 = 128;
+/// Working-copy status flag: inside `svn:externals` (`:21`).
+pub const FLAG_EXTERNALS: u32 = 256;
+/// Working-copy status flag: obstructed (`:25`).
+pub const FLAG_OBSTRUCTED: u32 = 512;
+/// Working-copy status flag: incomplete (`:28`).
+pub const FLAG_INCOMPLETE: u32 = 1024;
+
+/// `svn --xml status` argv, limited to `paths` when non-empty.
+///
+/// PHP: `getSVNStatus()` (`src/repository/api/ArcanistSubversionAPI.php:69-77`).
+#[must_use]
+pub fn svn_status_argv(paths: &[String]) -> Vec<String> {
+    let mut argv = vec!["--xml".to_string(), "status".to_string()];
+    argv.extend(paths.iter().cloned());
+    argv
+}
+
+/// Map an svn `wc-status` `props` value to its flag mask.
+///
+/// PHP: `getSVNStatus()` (`ArcanistSubversionAPI.php:100-111`).
+pub fn svn_props_mask(props: &str) -> Result<u32, String> {
+    match props {
+        "none" | "normal" => Ok(0),
+        "modified" => Ok(FLAG_MODIFIED),
+        _ => Err(format!("Unrecognized property status '{props}'.")),
+    }
+}
+
+/// Map an svn `wc-status` `item` value to its flag mask.
+///
+/// PHP: `parseSVNStatus()` (`ArcanistSubversionAPI.php:151-183`).
+pub fn parse_svn_item_status(item: &str) -> Result<u32, String> {
+    match item {
+        "none" | "normal" => Ok(0),
+        "external" => Ok(FLAG_EXTERNALS),
+        "unversioned" => Ok(FLAG_UNTRACKED),
+        "obstructed" => Ok(FLAG_OBSTRUCTED),
+        "missing" => Ok(FLAG_MISSING),
+        "added" => Ok(FLAG_ADDED),
+        "replaced" | "modified" => Ok(FLAG_MODIFIED),
+        "deleted" => Ok(FLAG_DELETED),
+        "conflicted" => Ok(FLAG_CONFLICT),
+        "incomplete" => Ok(FLAG_INCOMPLETE),
+        _ => Err(format!("Unrecognized item status '{item}'.")),
+    }
+}
+
+/// `svn info` argv for `path` (`buildInfoFuture()`, `:255-279`).
+///
+/// `/` maps to `info .` (the symlink bug workaround, `:256-271`);
+/// other paths gain a trailing `@` so literal `@` parses correctly
+/// (`:273-277`).
+#[must_use]
+pub fn svn_info_argv(path: &str) -> Vec<String> {
+    if path == "/" {
+        vec!["info".to_string(), ".".to_string()]
+    } else {
+        vec!["info".to_string(), format!("{path}@")]
+    }
+}
+
+/// `svn diff` argv for `path` (`buildDiffFuture()`, `:281-314`).
+///
+/// `--depth empty` keeps directory diffs non-recursive. On Windows the plain
+/// diff applies (`:295-302`); elsewhere `binary_safe_diff.sh` is the
+/// `--diff-cmd` with `-U<context>` (`:303-313`).
+#[must_use]
+pub fn svn_diff_argv(path: &str, diff_cmd: Option<&str>, context_lines: u32) -> Vec<String> {
+    let mut argv = vec![
+        "diff".to_string(),
+        "--depth".to_string(),
+        "empty".to_string(),
+    ];
+    if let Some(cmd) = diff_cmd {
+        argv.extend([
+            "--diff-cmd".to_string(),
+            cmd.to_string(),
+            "-x".to_string(),
+            format!("-U{context_lines}"),
+        ]);
+    }
+    argv.push(path.to_string());
+    argv
+}
+
+/// Render one `svn status` base-revision line (`:854`).
+#[must_use]
+pub fn svn_base_rev_line(baserev: i64, path: &str) -> String {
+    format!("    Revision {baserev}, {path}")
+}
+
+/// Require consistent svn base revisions; new files (`<= 0`) are ignored.
+///
+/// PHP: `generateChanges()` (`src/workflow/ArcanistDiffWorkflow.php:840-878`).
+/// Returns the effective base revision (the common value).
+pub fn check_svn_base_consistency(bases: &[(&str, i64)]) -> Result<i64, String> {
+    let live: Vec<(&str, i64)> = bases.iter().copied().filter(|(_, rev)| *rev > 0).collect();
+    if live.is_empty() {
+        return Ok(0);
+    }
+    let rev = live[0].1;
+    if live.iter().all(|(_, other)| *other == rev) {
+        return Ok(rev);
+    }
+    let revlist = live
+        .iter()
+        .map(|(path, baserev)| svn_base_rev_line(*baserev, path))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(format!(
+        "Base revisions of changed paths are mismatched. Update all paths to the same base \
+         revision before creating a diff: \n\n{revlist}"
+    ))
+}
+
+/// Warning printed when `svn:externals` paths carry local modifications.
+///
+/// PHP: `generateAffectedPaths()`
+/// (`src/workflow/ArcanistDiffWorkflow.php:768-779`). The trailing wrapped
+/// path list is appended by the caller.
+#[must_use]
+pub fn svn_externals_warning() -> String {
+    "The working copy includes changes to 'svn:externals' paths. These changes will not be \
+     included in the diff because SVN can not commit 'svn:externals' changes alongside normal \
+     changes.\n\nModified 'svn:externals' files:"
+        .to_string()
+}
+
+/// Confirm prompt after the externals warning (`:780`).
+pub const PROMPT_SVN_EXTERNALS_ANYWAY: &str = "Generate a diff (with just local changes) anyway?";
+
+/// Derive the svn branch name from the working-copy URL and repository root.
+///
+/// PHP: `getBranchName()` (`ArcanistSubversionAPI.php:240-249`).
+#[must_use]
+pub fn svn_branch_name(url: &str, repo_root: &str) -> String {
+    if let Some(rest) = url.strip_prefix(repo_root) {
+        rest.to_string()
+    } else {
+        "svn".to_string()
+    }
+}
+
+/* -(  Change Review Texts (G1 full-state)  )------------------------------------- */
+
+/// Svn-only gigantic-diff error: warn plus the binary-marking hint.
+///
+/// PHP: `generateChanges()` (`src/workflow/ArcanistDiffWorkflow.php:915-922`).
+#[must_use]
+pub fn gigantic_svn_error(path: &str, size_bytes: usize) -> String {
+    format!(
+        "{} If the file is not a text file, mark it as binary with:\n\n  $ svn propset \
+         svn:mime-type application/octet-stream <filename>",
+        gigantic_diff_warning(path, size_bytes)
+    )
+}
+
+/// Confirm question appended to the gigantic-diff warning for git/hg (`:923-925`).
+pub const GIGANTIC_MARK_BINARY_QUESTION: &str = "If the file is not a text file, you can mark it \
+    'binary'. Mark this file as 'binary' and continue?";
+
+/// Full gigantic-diff confirm prompt for git/hg (`:910-925`).
+#[must_use]
+pub fn gigantic_confirm(path: &str, size_bytes: usize) -> String {
+    format!(
+        "{} {GIGANTIC_MARK_BINARY_QUESTION}",
+        gigantic_diff_warning(path, size_bytes)
+    )
+}
+
+/// Header for the non-UTF8 warning block (`:1005-1007`).
+pub const UTF8_HEADER: &str = "Invalid Content Encoding (Non-UTF8)";
+
+/// Body of the non-UTF8 warning block for `count` affected files (`:984-1000`).
+#[must_use]
+pub fn utf8_warning_body(count: usize) -> String {
+    format!(
+        "This diff includes {count} file(s) which are not valid UTF-8 (they contain invalid byte \
+         sequences). You can either stop this workflow and fix these files, or continue. If you \
+         continue, these files will be marked as binary.\n\nYou can learn more about how this \
+         software handles character encodings (and how to configure encoding settings and detect \
+         and correct encoding problems) by reading 'User Guide: UTF-8 and Character Encoding' in \
+         the documentation.\n\n    {count} AFFECTED FILE(S)\n"
+    )
+}
+
+/// Confirm prompt for the non-UTF8 warning (`:1001-1003`).
+#[must_use]
+pub fn utf8_continue_prompt(count: usize) -> String {
+    format!("Do you want to mark these {count} file(s) as binary and continue?")
+}
+
+/// Abort message when the user stops to fix encodings (`:1015`).
+pub const ABORTED_UTF8: &str = "Aborted workflow to fix UTF-8.";
+
+/// Notice when a hunk corpus is converted to UTF-8 (`:964-970`).
+#[must_use]
+pub fn converted_hunk_notice(name: &str, encoding: &str) -> String {
+    format!("Converted a '{name}' hunk from '{encoding}' to UTF-8.\n")
+}
+
+/// Notice when the project encoding lookup fails (`:952-955`).
+#[must_use]
+pub fn encoding_lookup_failed(message: &str) -> String {
+    format!("Lookup of encoding in project failed: {message}")
+}
+
+/// Lint start notice (`src/workflow/ArcanistDiffWorkflow.php:1155`).
+pub const LINTING: &str = "Linting...";
+/// Unit start notice (`:1223`).
+pub const RUNNING_UNIT_TESTS: &str = "Running unit tests...";
+
+/// Banner for a lint result, or `None` when nothing prints.
+///
+/// PHP: `runLint()` (`:1172-1191`). `RESULT_SKIP` and the no-engine
+/// fallthrough print no banner.
+#[must_use]
+pub fn lint_result_notice(result: i32) -> Option<(&'static str, &'static str)> {
+    match result {
+        r if r == LINT_RESULT_OKAY => Some(("LINT OKAY", "No lint problems.")),
+        r if r == LINT_RESULT_WARNINGS => {
+            Some(("LINT MESSAGES", "Lint issued unresolved warnings."))
+        }
+        r if r == LINT_RESULT_ERRORS => Some(("LINT ERRORS", "Lint raised errors!")),
+        _ => None,
+    }
+}
+
+/// Banner for a unit result, or `None` when nothing prints.
+///
+/// PHP: `runUnit()` (`:1233-1262`). `RESULT_SKIP` and the no-engine
+/// fallthrough print no banner.
+#[must_use]
+pub fn unit_result_notice(result: i32) -> Option<(&'static str, &'static str)> {
+    match result {
+        r if r == UNIT_RESULT_OKAY => Some(("UNIT OKAY", "No unit test failures.")),
+        r if r == UNIT_RESULT_UNSOUND => Some((
+            "UNIT UNSOUND",
+            "Unit testing raised errors, but all failing tests are unsound.",
+        )),
+        r if r == UNIT_RESULT_FAIL => Some(("UNIT ERRORS", "Unit testing raised errors!")),
+        _ => None,
+    }
+}
+
+/// Confirm prompt for unsound-only unit failures (`:1241-1244`).
+pub const UNSOUND_PROMPT: &str = "Unit test results included failures, but all failing tests are \
+    known to be unsound. Ignore unsound test failures?";
+
+/// Notice when no lint engine is configured (`:1200-1202`).
+pub const NO_LINT_ENGINE: &str = "No lint engine configured for this project.";
+/// Notice when no unit engine is configured (`:1270-1273`).
+pub const NO_UNIT_ENGINE: &str = "No unit test engine is configured for this project.";
+
+/// `git commit --amend` argv, reusing `HEAD` or writing `message_file`.
+///
+/// PHP: `ArcanistGitAPI::amendCommit()`
+/// (`src/repository/api/ArcanistGitAPI.php:829-838`).
+#[must_use]
+pub fn git_amend_argv(message_file: Option<&str>) -> Vec<String> {
+    let mut argv = vec![
+        "commit".to_string(),
+        "--amend".to_string(),
+        "--allow-empty".to_string(),
+    ];
+    match message_file {
+        None => argv.extend(["-C".to_string(), "HEAD".to_string()]),
+        Some(path) => argv.extend(["-F".to_string(), path.to_string()]),
+    }
+    argv
+}
+
+/* -(  Message, Staging, Upload Texts (G1 full-state)  )-------------------------- */
+
+/// Prompt to reuse a saved `create-message` scratch file (`:1388-1390`).
+pub const PROMPT_USE_SAVED_MESSAGE: &str = "Do you want to use this message?";
+/// Prompt to re-edit a message with parser errors (`:1533-1535`).
+pub const PROMPT_EDIT_MESSAGE_AGAIN: &str = "Do you want to edit the message?";
+/// Interactive-editor task for a new revision (`:1482-1483`).
+pub const TASK_NEW_REVISION: &str = "Provide the details for a new revision, then save and exit.";
+/// Interactive-editor task for update comments (`:1763-1764`).
+pub const TASK_UPDATE_COMMENTS: &str = "Update the revision comments, then save and exit.";
+/// Interactive-editor task for editing revision info (`:675-676`).
+pub const TASK_EDIT_REVISION_INFO: &str = "Update the details for a revision, then save and exit.";
+/// Error when the default create template is saved unedited (`:1489`).
+pub const TEMPLATE_NOT_EDITED: &str = "Template not edited.";
+/// Lead line before commit-message parser errors (`:1525`).
+pub const COMMIT_MESSAGE_HAS_ERRORS: &str = "Commit message has errors:";
+/// First re-edit issue line (`:1526`).
+pub const RESOLVE_THESE_ERRORS: &str = "Resolve these errors:";
+/// Notice after listing parser errors (`:1532`).
+pub const MUST_RESOLVE_ERRORS: &str = "You must resolve these errors to continue.";
+/// Error when parser errors stay unresolved (`:1543-1544`).
+pub const MESSAGE_HAS_UNRESOLVED_ERRORS: &str = "Message has unresolved errors.";
+
+/// Lead line for the saved-message preview (`:1377`).
+pub const MESSAGE_BEGINS: &str = "Message begins:";
+
+/// Truncate a saved-message first line to 64 glyphs.
+///
+/// PHP: `PhutilUTF8StringTruncator::setMaximumGlyphs(64)` (`:1369-1374`).
+/// Glyphs are approximated with `char`s.
+#[must_use]
+pub fn truncate_preview_64(saved: &str) -> String {
+    let first = saved.split('\n').next().unwrap_or("").trim();
+    first.chars().take(64).collect()
+}
+
+/// Notice that a saved revision message exists (`:1382-1386`).
+///
+/// `preview` is the [`truncate_preview_64`] result; an empty preview omits
+/// the `Message begins:` block (`:1376-1380`).
+#[must_use]
+pub fn saved_message_notice(where_path: &str, preview: &str) -> String {
+    let block = if preview.is_empty() {
+        String::new()
+    } else {
+        format!("{MESSAGE_BEGINS}\n\n       {preview}\n\n")
+    };
+    format!(
+        "You have a saved revision message in '{where_path}'.\n{block}You can use this message, or discard it."
+    )
+}
+
+/// `Included commits` block for the create-message editor (`:1428-1448`).
+///
+/// Returns the blank line, the lead line, another blank line, then one
+/// 8-space-indented commit per entry. `branch` is `None` for raw sources.
+#[must_use]
+pub fn included_commits_block(branch: Option<&str>, commits: &[String]) -> Vec<String> {
+    let mut block = vec![String::new()];
+    match branch {
+        Some(name) => block.push(format!("Included commits in branch {name}:")),
+        None => block.push("Included commits:".to_string()),
+    }
+    block.push(String::new());
+    block.extend(commits.iter().map(|commit| format!("        {commit}")));
+    block
+}
+
+/// First create-message editor issue line (`:1452`).
+pub const NEW_DIFFERENTIAL_REVISION: &str = "NEW DIFFERENTIAL REVISION";
+/// Second create-message editor issue line (`:1453`).
+pub const DESCRIBE_NEW_REVISION: &str = "Describe the changes in this new revision.";
+/// Hint that no revision matched the working copy (`:1458-1459`).
+pub const ARC_COULD_NOT_IDENTIFY: &str =
+    "arc could not identify any existing revision in your working copy.";
+/// Hint lead for updating instead (`:1460`).
+pub const IF_INTENDED_UPDATE: &str = "If you intended to update an existing revision, use:";
+/// Hint command for updating instead (`:1462`).
+pub const UPDATE_HINT_CMD: &str = "  $ arc diff --update <revision>";
+
+/// Full create-message editor issue list (`:1450-1466`).
+#[must_use]
+pub fn new_revision_issues(included: &[String], notes: &[String]) -> Vec<String> {
+    let mut issues = vec![
+        NEW_DIFFERENTIAL_REVISION.to_string(),
+        DESCRIBE_NEW_REVISION.to_string(),
+    ];
+    issues.extend(included.iter().cloned());
+    issues.extend([
+        String::new(),
+        ARC_COULD_NOT_IDENTIFY.to_string(),
+        IF_INTENDED_UPDATE.to_string(),
+        String::new(),
+        UPDATE_HINT_CMD.to_string(),
+    ]);
+    if !notes.is_empty() {
+        issues.push(String::new());
+        issues.extend(notes.iter().cloned());
+    }
+    issues
+}
+
+/// Note when a commit message fails partial parsing (`:1881-1883`).
+#[must_use]
+pub fn commit_parse_note(short_hash: &str) -> String {
+    format!("NOTE: commit {short_hash} could not be completely parsed:")
+}
+
+/// Scratch location name when the commit message itself was amended (`:1511`).
+pub const WHERE_COMMIT_MESSAGE: &str = "commit message";
+
+/// Suffix for the unresolved-errors abort (`:1541`).
+#[must_use]
+pub fn copy_saved_to(where_path: &str) -> String {
+    format!("A copy was saved to {where_path}.")
+}
+
+/// Notice that a failed message was still saved (`:1548`).
+#[must_use]
+pub fn message_saved_to(where_path: &str) -> String {
+    format!("(Message saved to {where_path}.)")
+}
+
+/// Staging status: refs were pushed (`:25`).
+pub const STAGING_PUSHED: &str = "pushed";
+/// Staging status: `--skip-staging` was given (`:26`).
+pub const STAGING_USER_SKIP: &str = "user.skip";
+/// Staging status: raw changes can not be pushed (`:27`).
+pub const STAGING_DIFF_RAW: &str = "diff.raw";
+/// Staging status: no repository PHID (`:28`).
+pub const STAGING_REPOSITORY_UNKNOWN: &str = "repository.unknown";
+/// Staging status: server predates staging areas (`:29`).
+pub const STAGING_REPOSITORY_UNAVAILABLE: &str = "repository.unavailable";
+/// Staging status: server disabled staging for the repo (`:30`).
+pub const STAGING_REPOSITORY_UNSUPPORTED: &str = "repository.unsupported";
+/// Staging status: no staging URI configured (`:31`).
+pub const STAGING_REPOSITORY_UNCONFIGURED: &str = "repository.unconfigured";
+/// Staging status: non-git working copy (`:32`).
+pub const STAGING_CLIENT_UNSUPPORTED: &str = "client.unsupported";
+
+/// Header for every staging notice (`:2624-2684`).
+pub const SKIP_STAGING_HEADER: &str = "SKIP STAGING";
+
+/// Body for a staging skip `reason` (`:2622-2674`).
+#[must_use]
+pub fn staging_skip_body(reason: &str) -> &'static str {
+    if reason == STAGING_USER_SKIP {
+        "Flag --skip-staging was specified."
+    } else if reason == STAGING_DIFF_RAW {
+        "Raw changes can not be pushed to a staging area."
+    } else if reason == STAGING_REPOSITORY_UNKNOWN {
+        "Unable to determine repository for this change."
+    } else if reason == STAGING_REPOSITORY_UNAVAILABLE {
+        "The server does not support staging areas."
+    } else if reason == STAGING_REPOSITORY_UNSUPPORTED {
+        "The server does not support staging areas for this repository."
+    } else if reason == STAGING_REPOSITORY_UNCONFIGURED {
+        "No staging area is configured for this repository."
+    } else {
+        "This client version does not support staging this repository."
+    }
+}
+
+/// Staging repository configuration subset read by the push decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagingConfig {
+    /// `supported` flag for this repository.
+    pub repo_supported: bool,
+    /// Staging-area push URI, if configured.
+    pub uri: Option<String>,
+    /// Staging tag prefix (`prefix`, default `phabricator`).
+    pub prefix: String,
+    /// True for git working copies (only those can push).
+    pub is_git: bool,
+}
+
+impl StagingConfig {
+    /// Build a config with the default `phabricator` prefix.
+    #[must_use]
+    pub fn new(repo_supported: bool, uri: Option<&str>, is_git: bool) -> Self {
+        Self {
+            repo_supported,
+            uri: uri.map(str::to_string),
+            prefix: "phabricator".to_string(),
+            is_git,
+        }
+    }
+}
+
+/// Decide whether to skip the staging push, returning the skip reason.
+///
+/// PHP: `pushChangesToStagingArea()` (`:2622-2674`). `None` means push;
+/// `Some(reason)` is one of the `STAGING_*` constants. A `None` config
+/// means the server predates staging areas (`:2644-2650`).
+#[must_use]
+pub fn staging_skip_reason(
+    skip_staging: bool,
+    is_raw: bool,
+    repository_phid: Option<&str>,
+    config: Option<&StagingConfig>,
+) -> Option<&'static str> {
+    if skip_staging {
+        return Some(STAGING_USER_SKIP);
+    }
+    if is_raw {
+        return Some(STAGING_DIFF_RAW);
+    }
+    if repository_phid.is_none() {
+        return Some(STAGING_REPOSITORY_UNKNOWN);
+    }
+    let Some(config) = config else {
+        return Some(STAGING_REPOSITORY_UNAVAILABLE);
+    };
+    if !config.repo_supported {
+        return Some(STAGING_REPOSITORY_UNSUPPORTED);
+    }
+    if config.uri.as_deref().is_none_or(|uri| uri.is_empty()) {
+        return Some(STAGING_REPOSITORY_UNCONFIGURED);
+    }
+    if !config.is_git {
+        return Some(STAGING_CLIENT_UNSUPPORTED);
+    }
+    None
+}
+
+/// Header/body for the staging push start (`:2682-2684`).
+pub const PUSH_STAGING_HEADER: &str = "PUSH STAGING";
+/// Body for the staging push start (`:2684`).
+pub const PUSH_STAGING_BODY: &str = "Pushing changes to staging area...";
+
+/// Build a staging tag ref (`:2679-2680`). `kind` is `base` or `diff`.
+#[must_use]
+pub fn staging_tag(prefix: &str, kind: &str, id: i64) -> String {
+    format!("refs/tags/{prefix}/{kind}/{id}")
+}
+
+/// Refspecs for the staging push: the base ref (unless the magic root
+/// commit) plus the diff ref (`:2708-2729`).
+///
+/// LFS working copies push the base commit to the diff ref here; the real
+/// head follows via [`staging_lfs_refspec`] (`:2722`).
+#[must_use]
+pub fn staging_refspecs(
+    base_commit: &str,
+    head_commit: &str,
+    prefix: &str,
+    id: i64,
+    is_lfs: bool,
+) -> Vec<String> {
+    let mut refspecs = Vec::new();
+    if base_commit != GIT_MAGIC_ROOT_COMMIT {
+        refspecs.push(format!("{base_commit}:{}", staging_tag(prefix, "base", id)));
+    }
+    let diff_commit = if is_lfs { base_commit } else { head_commit };
+    refspecs.push(format!("{diff_commit}:{}", staging_tag(prefix, "diff", id)));
+    refspecs
+}
+
+/// Forced refspec for the LFS follow-up push (`:2749`).
+#[must_use]
+pub fn staging_lfs_refspec(head_commit: &str, prefix: &str, id: i64) -> String {
+    format!("+{head_commit}:{}", staging_tag(prefix, "diff", id))
+}
+
+/// `git push` argv for the staging area (`:2731-2735`).
+#[must_use]
+pub fn staging_push_argv(
+    uri: &str,
+    refspecs: &[String],
+    git_supports_no_verify: bool,
+) -> Vec<String> {
+    let mut argv = vec!["push".to_string()];
+    if git_supports_no_verify {
+        argv.push("--no-verify".to_string());
+    }
+    argv.extend(["--".to_string(), uri.to_string()]);
+    argv.extend(refspecs.iter().cloned());
+    argv
+}
+
+/// True when `git_version` supports `push --no-verify` (`>= 1.8.2`, `:2687`).
+#[must_use]
+pub fn git_supports_push_no_verify(git_version: &str) -> bool {
+    compare_version(git_version, "1.8.2") != std::cmp::Ordering::Less
+}
+
+/// Compare dotted numeric version prefixes (`version_compare()` subset).
+fn compare_version(left: &str, right: &str) -> std::cmp::Ordering {
+    let parse = |text: &str| {
+        text.split('.')
+            .map(|part| {
+                part.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse::<u64>()
+                    .unwrap_or(0)
+            })
+            .collect::<Vec<_>>()
+    };
+    parse(left).cmp(&parse(right))
+}
+
+/// Header for staging failures (`:2738-2740`, `:2756-2758`).
+pub const STAGING_FAILED_HEADER: &str = "STAGING FAILED";
+/// Body for staging push failures (`:2740`).
+pub const STAGING_FAILED_BODY: &str = "Unable to push changes to the staging area.";
+/// Body for LFS staging push failures (`:2758`).
+pub const STAGING_FAILED_LFS_BODY: &str = "Unable to push lfs changes to the staging area.";
+/// Usage error after a staging push failure (`:2742-2745`).
+pub const STAGING_PUSH_FAILED: &str = "Failed to push changes to staging area. Correct the issue, or use --skip-staging to skip \
+     this step.";
+/// Usage error after an LFS staging push failure (`:2760-2763`).
+pub const STAGING_LFS_PUSH_FAILED: &str = "Failed to push lfs changes to staging area. Correct the issue, or use --skip-staging to \
+     skip this step.";
+
+/// Notice after all binary uploads finish (`:2585`).
+pub const UPLOAD_COMPLETE: &str = "Upload complete.";
+
+/// Per-file binary upload notice (`:2582`).
+#[must_use]
+pub fn uploaded_binary_notice(name: &str) -> String {
+    format!("Uploaded binary data for \"{name}\".")
+}
+
+/// Per-file binary upload failure (`:2556-2558`).
+#[must_use]
+pub fn failed_binary_upload(name: &str) -> String {
+    format!("Failed to upload binary \"{name}\".")
+}
+
+/// Confirm prompt after upload failures (`:2563`).
+pub const PROMPT_CONTINUE: &str = "Continue?";
+
+/// Abort message when uploads fail and the user stops (`:2566-2571`).
+pub const ABORTED_UPLOAD_FAILURE: &str =
+    "Aborted due to file upload failure. You can use --skip-binaries to skip binary uploads.";
+
+/// True when a change needs its file data uploaded (`:2479-2486`).
+#[must_use]
+pub fn needs_binary_upload(file_type: u32, skip_binaries: bool) -> bool {
+    file_type == FILE_BINARY && !skip_binaries
+}
+
+/// True when a mime type marks a change as an image (`:2530-2533`).
+#[must_use]
+pub fn is_image_mime_type(mime: &str) -> bool {
+    mime.starts_with("image/")
+}
+
+/// Notice while amending the worktree commit message (`:542`).
+pub const UPDATING_COMMIT_MESSAGE: &str = "Updating commit message...";
+/// Notice when amend is unsupported (`:545-548`).
+pub const AMEND_UNSUPPORTED: &str = "Commit message was not amended. Amending commit message is \
+    only supported in git and hg (version 2.2 or newer)";
+
+/// True when created objects should open in a browser (`:2594-2596`).
+#[must_use]
+pub fn should_open_in_browser(browse: bool) -> bool {
+    browse
+}
+
+/* -(  Hg Local Commits and Svn Info (G1 full-state)  )--------------------------- */
+
+/// Split an hg author string into display name and email.
+///
+/// PHP: `ArcanistMercurialAPI::parseFullAuthor()`
+/// (`src/repository/api/ArcanistMercurialAPI.php:645-656`) plus
+/// `PhutilEmailAddress` (`src/parser/PhutilEmailAddress.php:20-32`): no
+/// `@` keeps the whole string as the name; `Display <addr>` trims quotes
+/// and spaces from the display part; a bare address has no display name.
+#[must_use]
+pub fn parse_hg_author(full_author: &str) -> (Option<String>, Option<String>) {
+    if !full_author.contains('@') {
+        return (Some(full_author.to_string()), None);
+    }
+    let trimmed = full_author.trim();
+    if let Some((display, rest)) = trimmed.rsplit_once('<')
+        && let Some(inner) = rest.strip_suffix('>')
+    {
+        let display = display.trim().trim_matches(['\'', '"', ' ']).to_string();
+        return (Some(display), Some(inner.trim().to_string()));
+    }
+    (None, Some(trimmed.to_string()))
+}
+
+/// `hg log` template for local commit information.
+///
+/// PHP: `getLocalCommitInformation()`
+/// (`ArcanistMercurialAPI.php:193-198`).
+///
+/// Divergence: `{date|hgdate}` replaces `{date|rfc822date}`; both name the
+/// same instant, and `hgdate` parses without a date library.
+pub const HG_LOCAL_COMMIT_TEMPLATE: &str = "{node}\u{1}{rev}\u{1}{author}\u{1}{date|hgdate}\u{1}{branch}\u{1}{tag}\u{1}{parents}\u{1}{desc}\u{2}";
+
+/// `hg log` argv for local commit information between `base` and `.` (`:193-198`).
+#[must_use]
+pub fn hg_local_commit_argv(base: &str, branch: &str) -> Vec<String> {
+    vec![
+        "log".to_string(),
+        "--template".to_string(),
+        HG_LOCAL_COMMIT_TEMPLATE.to_string(),
+        "--rev".to_string(),
+        format!("({base}::. - {base})"),
+        "--branch".to_string(),
+        branch.to_string(),
+        "--".to_string(),
+    ]
+}
+
+/// One hg local commit, verbatim PHP keys via [`to_json`](HgLocalCommit::to_json).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HgLocalCommit {
+    /// Node hash (`commit`; also `rev`, which PHP aliases to the node).
+    pub node: String,
+    /// Local revision number (`local`).
+    pub rev: String,
+    /// Display name (`author`), `None` for bare addresses.
+    pub author: Option<String>,
+    /// Author email (`authorEmail`).
+    pub author_email: Option<String>,
+    /// Author timestamp (`time`, unix).
+    pub time: i64,
+    /// Branch (`branch`).
+    pub branch: String,
+    /// Tag (`tag`).
+    pub tag: String,
+    /// Parent nodes (`parents`); `None` needs an `hg parents` lookup.
+    pub parents: Option<Vec<String>>,
+    /// First message line (`summary`).
+    pub summary: String,
+    /// Full message (`message`).
+    pub message: String,
+}
+
+impl HgLocalCommit {
+    /// Render with the verbatim PHP keys (`:232-244`).
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "author": self.author.clone().map_or(serde_json::Value::Null, serde_json::Value::String),
+            "time": self.time,
+            "branch": self.branch,
+            "tag": self.tag,
+            "commit": self.node,
+            "rev": self.node,
+            "local": self.rev,
+            "parents": self.parents.clone().unwrap_or_default(),
+            "summary": self.summary,
+            "message": self.message,
+            "authorEmail": self.author_email.clone().map_or(serde_json::Value::Null, serde_json::Value::String),
+        })
+    }
+}
+
+/// Parse `hg log` local-commit output, newest-first.
+///
+/// PHP: `getLocalCommitInformation()` (`:199-260`): records split on
+/// `\x02`, fields on `\x01`; empty `{parents}` chains to the previous
+/// (older) node, otherwise the parents need a lookup; the oldest-first
+/// input reverses to newest-first (`:260`).
+///
+/// Divergence: records with fewer than 8 fields are skipped; PHP assigns
+/// nulls with warnings.
+#[must_use]
+pub fn parse_hg_local_commits(output: &str) -> Vec<HgLocalCommit> {
+    let mut commits = Vec::new();
+    let mut last_node: Option<String> = None;
+    for log in output.split('\u{2}').filter(|log| !log.is_empty()) {
+        let parts: Vec<&str> = log.splitn(9, '\u{1}').collect();
+        if parts.len() < 8 {
+            continue;
+        }
+        let (author, author_email) = parse_hg_author(parts[2]);
+        let time = parts[3]
+            .split_whitespace()
+            .next()
+            .and_then(|stamp| stamp.parse::<i64>().ok())
+            .unwrap_or(0);
+        let parents = if parts[6].is_empty() {
+            last_node.clone().map(|node| vec![node])
+        } else {
+            None
+        };
+        let message = parts[7].to_string();
+        commits.push(HgLocalCommit {
+            node: parts[0].to_string(),
+            rev: parts[1].to_string(),
+            author,
+            author_email,
+            time,
+            branch: parts[4].to_string(),
+            tag: parts[5].to_string(),
+            parents,
+            summary: message.lines().next().unwrap_or("").to_string(),
+            message,
+        });
+        last_node = Some(parts[0].to_string());
+    }
+    commits.reverse();
+    commits
+}
+
+/// `hg parents` argv for one node's parent nodes (`:226-230`).
+#[must_use]
+pub fn hg_parents_argv(node: &str) -> Vec<String> {
+    vec![
+        "parents".to_string(),
+        "--template".to_string(),
+        "{node}\n".to_string(),
+        "--rev".to_string(),
+        node.to_string(),
+    ]
+}
+
+/// List hg local commits between `base` and `.`, newest-first.
+///
+/// PHP: `getLocalCommitInformation()` (`:190-266`).
+///
+/// Divergence: parent lookups run sequentially; PHP fans out with a
+/// limit of 4 (`:249-255`).
+pub fn get_hg_local_commits(
+    dir: &Path,
+    base: &str,
+    branch: &str,
+) -> Result<Vec<HgLocalCommit>, String> {
+    let argv = hg_local_commit_argv(base, branch);
+    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let text = arc_rs::hg::stdout_text(dir, &refs)?;
+    let mut commits = parse_hg_local_commits(&text);
+    for commit in &mut commits {
+        if commit.parents.is_none() {
+            let argv = hg_parents_argv(&commit.node);
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let parents = arc_rs::hg::stdout_text(dir, &refs)?;
+            commit.parents = Some(
+                parents
+                    .lines()
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            );
+        }
+    }
+    Ok(commits)
+}
+
+/// Parse `svn info` output into key/value pairs.
+///
+/// PHP: `getSVNInfo()` (`src/repository/api/ArcanistSubversionAPI.php:326-348`)
+/// extracts URL, Revision, and last-changed keys with regexes; every
+/// `Key: value` line is kept here (a superset) and callers read what they
+/// need. CRLF line endings are tolerated (`:340`).
+#[must_use]
+pub fn parse_svn_info(output: &str) -> BTreeMap<String, String> {
+    let mut info = BTreeMap::new();
+    for line in output.lines() {
+        if let Some((key, value)) = line.split_once(": ") {
+            info.insert(key.trim().to_string(), value.trim().to_string());
+        }
+    }
+    info
+}
+
+/// Read and parse `svn info` for `path`.
+///
+/// PHP: `getSVNInfo()` (`:326-337`), including the nonzero-exit error.
+pub fn get_svn_info(dir: &Path, path: &str) -> Result<BTreeMap<String, String>, String> {
+    let argv = svn_info_argv(path);
+    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let out = arc_rs::svn::output(dir, &refs)?;
+    if !out.status.success() {
+        return Err(format!(
+            "Error #{} executing svn info against '{path}'.",
+            out.status.code().unwrap_or(-1)
+        ));
+    }
+    Ok(parse_svn_info(&String::from_utf8_lossy(&out.stdout)))
+}
+
 #[cfg(test)]
 #[path = "diff_local_tests.rs"]
 mod diff_local_tests;

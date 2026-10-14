@@ -975,6 +975,299 @@ pub fn submit_create_revision_via_edit(
     Ok((created, revision_id))
 }
 
+/* -(  Revision Flow Texts (G1 full-state)  )------------------------------------- */
+
+/// Lead line when a diff-only submit succeeds (`:418`).
+pub const CREATED_DIFF_LEAD: &str = "Created a new Differential diff:";
+/// Label for the diff URI (`:419`).
+pub const DIFF_URI_LABEL: &str = "Diff URI:";
+/// Lead line when an update succeeds (`:476`).
+pub const UPDATED_REVISION_LEAD: &str = "Updated an existing Differential revision:";
+/// Lead line when a create succeeds (`:551`).
+pub const CREATED_REVISION_LEAD: &str = "Created a new Differential revision:";
+/// Label for the revision URI (`:557`).
+pub const REVISION_URI_LABEL: &str = "Revision URI:";
+/// Lead line for the change summary (`:565`).
+pub const INCLUDED_CHANGES_LABEL: &str = "Included changes:";
+
+/// Render matching revisions for the several-revisions error.
+///
+/// PHP: `ArcanistWorkflow::renderRevisionList()`
+/// (`src/workflow/ArcanistWorkflow.php:1665-1671`): five spaces, `- D{id}:`,
+/// title, newline.
+#[must_use]
+pub fn render_revision_list(revisions: &[(i64, &str)]) -> String {
+    revisions
+        .iter()
+        .map(|(id, title)| format!("     - D{id}: {title}\n"))
+        .collect()
+}
+
+/// Error when several open revisions match the working copy (`:1321-1328`).
+#[must_use]
+pub fn several_revisions_error(revision_list: &str) -> String {
+    format!(
+        "There are several revisions which match the working copy:\n\n{revision_list}\nUse \
+         '--update' to choose one, or '--create' to create a new revision."
+    )
+}
+
+/// Error when `--update` is not a revision number (`:1342-1346`).
+pub const UPDATE_PARAM_MUST_BE_NUMBER: &str =
+    "Parameter to --update must be a Differential Revision number.";
+
+/// Ownership decision for updating `revision_id`: the confirm prompt when
+/// the viewer is not the author, else `None` (`:2446-2466`).
+#[must_use]
+pub fn check_revision_ownership(
+    author_phid: &str,
+    viewer_phid: &str,
+    revision_id: i64,
+    title: &str,
+) -> Option<String> {
+    if needs_ownership_confirm(author_phid, viewer_phid) {
+        Some(ownership_prompt(revision_id, title))
+    } else {
+        None
+    }
+}
+
+/// Banner header for the already-a-draft warning (`:444`).
+pub const ALREADY_A_DRAFT: &str = "ALREADY A DRAFT";
+
+/// Header when every reviewer is away (`:1680-1682`).
+#[must_use]
+pub fn away_reviewers_all_message(formatted_date: &str) -> String {
+    format!("All reviewers are away until {formatted_date}:")
+}
+
+/// Header when some reviewers are away (`:1684`).
+pub const AWAY_SOME_MESSAGE: &str = "Some reviewers are currently away:";
+
+/// One away-reviewer list item (`:1692-1698`).
+#[must_use]
+pub fn away_reviewer_list_item(name: &str, formatted_date: &str) -> String {
+    format!("{name} (until {formatted_date})")
+}
+
+/// Prompt to continue despite away reviewers (`:1704`).
+pub const CONTINUE_DESPITE_AWAY: &str = "Continue even though reviewers are unavailable?";
+/// Abort message when the user stops over away reviewers (`:1706-1707`).
+pub const SPECIFY_AVAILABLE_REVIEWERS: &str = "Specify available reviewers and retry.";
+
+/// Format a unix timestamp like `date('l, M j Y', $ts)` (`:1682,1696`).
+///
+/// Renders `Thursday, Jan 1 1970` for `0`.
+///
+/// Divergence: PHP uses the server's default timezone; this renders UTC.
+#[must_use]
+pub fn format_phab_date(timestamp: i64) -> String {
+    const WEEKDAYS: [&str; 7] = [
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+    ];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let days = timestamp.div_euclid(86_400);
+    let weekday = WEEKDAYS[days.rem_euclid(7) as usize];
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    if month <= 2 {
+        year += 1;
+    }
+    format!("{weekday}, {} {day} {year}", MONTHS[(month - 1) as usize])
+}
+
+/// Numeric `currentStatusUntil`, defaulting to `0` when absent.
+#[must_use]
+pub fn away_until_timestamp(until: &serde_json::Value) -> i64 {
+    json_i64(until).unwrap_or(0)
+}
+
+/// Earliest `currentStatusUntil` across away reviewers (`:1678`).
+#[must_use]
+pub fn away_earliest_return(aways: &[AwayReviewer]) -> Option<i64> {
+    aways
+        .iter()
+        .map(|away| away_until_timestamp(&away.until))
+        .min()
+}
+
+/// Full away-reviewers notice block, or `None` when nobody is away
+/// (`:1676-1702`).
+///
+/// The header is followed by a blank line, then one 6-space-indented item
+/// per reviewer (`PhutilConsoleList`, `src/console/view/PhutilConsoleList.php:39-61`).
+#[must_use]
+pub fn away_reviewers_block(aways: &[AwayReviewer], total_reviewers: usize) -> Option<String> {
+    if aways.is_empty() {
+        return None;
+    }
+    let header = if aways.len() == total_reviewers {
+        let earliest = away_earliest_return(aways).unwrap_or(0);
+        away_reviewers_all_message(&format_phab_date(earliest))
+    } else {
+        AWAY_SOME_MESSAGE.to_string()
+    };
+    let mut block = format!("{header}\n\n");
+    for away in aways {
+        let item = away_reviewer_list_item(
+            &away.name,
+            &format_phab_date(away_until_timestamp(&away.until)),
+        );
+        block.push_str(&format!("      {item}\n"));
+    }
+    Some(block)
+}
+
+/* -(  Autotargets and Staging Property (G1 full-state)  )---------------------- */
+
+/// `harbormaster.queryautotargets` (`:2782`).
+pub const METHOD_QUERY_AUTOTARGETS: &str = "harbormaster.queryautotargets";
+/// `harbormaster.sendmessage` (`:2818,2836`).
+pub const METHOD_SENDMESSAGE: &str = "harbormaster.sendmessage";
+/// Autotarget key for lint (`:2778`).
+pub const AUTOTARGET_LINT_KEY: &str = "arcanist.lint";
+/// Autotarget key for unit (`:2779`).
+pub const AUTOTARGET_UNIT_KEY: &str = "arcanist.unit";
+
+/// Params for `harbormaster.queryautotargets` (`:2782-2790`).
+#[must_use]
+pub fn query_autotargets_params(diff_phid: &str) -> serde_json::Value {
+    serde_json::json!({
+        "objectPHID": diff_phid,
+        "targetKeys": [AUTOTARGET_LINT_KEY, AUTOTARGET_UNIT_KEY],
+    })
+}
+
+/// Target PHID for `key` from a `queryautotargets` response
+/// (`:2791,2798,2826`).
+#[must_use]
+pub fn autotarget_phid(response: &serde_json::Value, key: &str) -> Option<String> {
+    response
+        .get("targetMap")?
+        .get(key)?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Lint autotarget type: `fail` when any severity is warning/error, else
+/// `pass` (`:2807-2815`).
+#[must_use]
+pub fn lint_autotarget_type(severities: &[&str]) -> &'static str {
+    if severities
+        .iter()
+        .any(|severity| *severity == "warning" || *severity == "error")
+    {
+        "fail"
+    } else {
+        "pass"
+    }
+}
+
+/// Params for a lint `harbormaster.sendmessage` (`:2817-2823`).
+#[must_use]
+pub fn sendmessage_lint_params(
+    target_phid: &str,
+    lint: &[serde_json::Value],
+    autotarget_type: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "buildTargetPHID": target_phid,
+        "lint": lint,
+        "type": autotarget_type,
+    })
+}
+
+/// Params for a unit `harbormaster.sendmessage` (`:2835-2841`).
+#[must_use]
+pub fn sendmessage_unit_params(
+    target_phid: &str,
+    unit: &[serde_json::Value],
+    autotarget_type: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "buildTargetPHID": target_phid,
+        "unit": unit,
+        "type": autotarget_type,
+    })
+}
+
+/// Push lint/unit results to Harbormaster autotargets over the seam.
+///
+/// PHP: `updateAutotargets()` (`:2777-2855`). Lint and unit messages are
+/// caller-normalized (`getModernLintDictionary()` / `getModernUnitDictionary()`
+/// are identity here: this port stores dictionaries already). Returns false
+/// when the query fails or any send fails, like PHP's exception swallowing
+/// (`:2792-2794`, `:2844-2853`).
+///
+/// Divergence: PHP resolves the sends as parallel futures; the seam runs
+/// them in order.
+pub fn update_autotargets(
+    call: &ConduitCall<'_>,
+    diff_phid: &str,
+    lint_messages: &[serde_json::Value],
+    unit_results: &[serde_json::Value],
+    unit_result: i64,
+) -> bool {
+    let response = match call(
+        METHOD_QUERY_AUTOTARGETS,
+        &query_autotargets_params(diff_phid),
+    ) {
+        Ok(response) => response,
+        Err(_) => return false,
+    };
+    let mut sends = Vec::new();
+    if let Some(target) = autotarget_phid(&response, AUTOTARGET_LINT_KEY) {
+        let severities: Vec<&str> = lint_messages
+            .iter()
+            .filter_map(|message| message.get("severity").and_then(|value| value.as_str()))
+            .collect();
+        sends.push(sendmessage_lint_params(
+            &target,
+            lint_messages,
+            lint_autotarget_type(&severities),
+        ));
+    }
+    if let Some(target) = autotarget_phid(&response, AUTOTARGET_UNIT_KEY) {
+        let unit_type = crate::diff_local::harbormaster_type_from_result(
+            i32::try_from(unit_result).unwrap_or(crate::diff_local::UNIT_RESULT_FAIL),
+        );
+        sends.push(sendmessage_unit_params(&target, unit_results, unit_type));
+    }
+    for params in &sends {
+        if call(METHOD_SENDMESSAGE, params).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+/// `arc.staging` diff property payload (`:2598-2620`).
+///
+/// Keys render `status` first like `phutil_json_encode()`; `refs` is the
+/// pushed-ref list (empty on skip).
+#[must_use]
+pub fn staging_property_data(status: &str, refs: &[serde_json::Value]) -> String {
+    let status = serde_json::to_string(status).unwrap_or_else(|_| "\"\"".to_string());
+    let refs = serde_json::to_string(refs).unwrap_or_else(|_| "[]".to_string());
+    format!("{{\"status\":{status},\"refs\":{refs}}}")
+}
+
 #[cfg(test)]
 #[path = "diff_submit_tests.rs"]
 mod diff_submit_tests;

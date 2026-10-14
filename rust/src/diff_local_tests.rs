@@ -1,6 +1,107 @@
 use super::*;
 use std::collections::HashSet;
 
+/* G1 full-state tests: hg local commits and svn info. */
+
+#[test]
+fn g1_hg_author_and_commit_argv() {
+    assert_eq!(
+        parse_hg_author("plain name"),
+        (Some("plain name".to_string()), None)
+    );
+    assert_eq!(
+        parse_hg_author("A U Thor <a@example.test>"),
+        (
+            Some("A U Thor".to_string()),
+            Some("a@example.test".to_string())
+        )
+    );
+    assert_eq!(
+        parse_hg_author("\"Quoted, Name\" <q@example.test>"),
+        (
+            Some("Quoted, Name".to_string()),
+            Some("q@example.test".to_string())
+        )
+    );
+    assert_eq!(
+        parse_hg_author("bare@example.test"),
+        (None, Some("bare@example.test".to_string()))
+    );
+
+    let argv = hg_local_commit_argv("abc", "default");
+    assert_eq!(argv[0], "log");
+    assert_eq!(argv[1], "--template");
+    assert!(argv[2].contains("{node}\u{1}"), "{}", argv[2]);
+    assert_eq!(argv[4], "(abc::. - abc)");
+    assert_eq!(
+        hg_parents_argv("node1"),
+        vec![
+            "parents".to_string(),
+            "--template".to_string(),
+            "{node}\n".to_string(),
+            "--rev".to_string(),
+            "node1".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn g1_parse_hg_local_commits() {
+    let output = "node1\x011\x01A U Thor <a@t>\x01100 0\x01default\x01\x01\x01first desc\x02node2\x012\x01bare@t\x01200 0\x01default\x01\x01\x01second desc\nmore\x02garbage";
+    let commits = parse_hg_local_commits(output);
+    assert_eq!(commits.len(), 2);
+    // Newest-first: node2 (no parents output) chains to node1.
+    assert_eq!(commits[0].node, "node2");
+    assert_eq!(commits[0].rev, "2");
+    assert_eq!(commits[0].author, None);
+    assert_eq!(commits[0].author_email.as_deref(), Some("bare@t"));
+    assert_eq!(commits[0].time, 200);
+    assert_eq!(commits[0].parents, Some(vec!["node1".to_string()]));
+    assert_eq!(commits[0].summary, "second desc");
+    assert_eq!(commits[1].node, "node1");
+    assert_eq!(commits[1].author.as_deref(), Some("A U Thor"));
+    // First record has no older node to chain to: lookup needed.
+    assert_eq!(commits[1].parents, None);
+
+    let json = commits[0].to_json();
+    assert_eq!(json["commit"], serde_json::json!("node2"));
+    assert_eq!(json["rev"], serde_json::json!("node2"));
+    assert_eq!(json["local"], serde_json::json!("2"));
+    assert_eq!(json["parents"], serde_json::json!(["node1"]));
+    assert_eq!(json["author"], serde_json::Value::Null);
+
+    // Non-empty {parents} always needs a lookup.
+    let two_parent = "n1\x011\x01x\x010 0\x01b\x01\x01p1 p2\x01d\x02";
+    assert_eq!(parse_hg_local_commits(two_parent)[0].parents, None);
+    assert!(parse_hg_local_commits("").is_empty());
+    assert!(parse_hg_local_commits("short\x01record\x02").is_empty());
+
+    let bogus = std::path::Path::new("definitely-not-an-hg-repo-g1");
+    assert!(get_hg_local_commits(bogus, "tip", "default").is_err());
+}
+
+#[test]
+fn g1_svn_info_helpers() {
+    let output = "Path: .\nWorking Copy Root Path: /repo\nURL: https://s.example/r/trunk\nRepository Root: https://s.example/r\nRevision: 42\nNode Kind: directory\n";
+    let info = parse_svn_info(output);
+    assert_eq!(
+        info.get("URL").map(String::as_str),
+        Some("https://s.example/r/trunk")
+    );
+    assert_eq!(
+        info.get("Repository Root").map(String::as_str),
+        Some("https://s.example/r")
+    );
+    assert_eq!(info.get("Revision").map(String::as_str), Some("42"));
+    assert!(parse_svn_info("").is_empty());
+    let crlf = parse_svn_info("URL: u\r\nRevision: 7\r\n");
+    assert_eq!(crlf.get("Revision").map(String::as_str), Some("7"));
+
+    let bogus = std::path::Path::new("definitely-not-an-svn-repo-g1");
+    let err = get_svn_info(bogus, "/").unwrap_err();
+    assert!(!err.is_empty(), "{err}");
+}
+
 fn fields(pairs: &[(&str, FieldValue)]) -> CommitFields {
     pairs
         .iter()
@@ -1042,4 +1143,687 @@ fn workflow_predicates_follow_php_branches() {
     assert!(!should_amend(false, false, Some("abc"), false));
     assert!(!should_amend(false, false, None, true));
     assert!(should_amend(false, false, None, false));
+}
+
+#[test]
+fn unified_diff_parses_git_change() {
+    let text = "diff --git a/f.txt b/f.txt\nindex 111..222 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1,3 @@\n a\n+b\n c\n";
+    let changes = parse_unified_diff(text);
+    assert_eq!(changes.len(), 1);
+    let change = &changes[0];
+    assert_eq!(change.old_path, "f.txt");
+    assert_eq!(change.current_path, "f.txt");
+    assert_eq!(change.change_type, TYPE_CHANGE);
+    assert_eq!(change.file_type, FILE_TEXT);
+    assert!(!change.is_message());
+    assert_eq!(change.hunks.len(), 1);
+    let hunk = &change.hunks[0];
+    assert_eq!(
+        (hunk.old_start, hunk.old_len, hunk.new_start, hunk.new_len),
+        (1, 2, 1, 3)
+    );
+    assert!(
+        hunk.corpus.starts_with("@@ -1,2 +1,3 @@\n"),
+        "{}",
+        hunk.corpus
+    );
+    assert!(hunk.corpus.contains("+b\n"), "{}", hunk.corpus);
+    assert_eq!(change.corpus_size(), hunk.corpus.len());
+    assert_eq!(change.commit_hash, None);
+}
+
+#[test]
+fn unified_diff_handles_add_delete_rename_binary() {
+    let add = "diff --git a/new.txt b/new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hi\n";
+    let changes = parse_unified_diff(add);
+    assert_eq!(changes[0].change_type, TYPE_ADD);
+    assert_eq!(changes[0].current_path, "new.txt");
+
+    let delete = "diff --git a/old.txt b/old.txt\ndeleted file mode 100644\n--- a/old.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-bye\n";
+    let changes = parse_unified_diff(delete);
+    assert_eq!(changes[0].change_type, TYPE_DELETE);
+    assert_eq!(changes[0].current_path, "old.txt");
+
+    let rename = "diff --git a/a.txt b/b.txt\nsimilarity index 90%\nrename from a.txt\nrename to b.txt\n--- a/a.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-x\n+y\n";
+    let changes = parse_unified_diff(rename);
+    assert_eq!(changes[0].change_type, TYPE_MOVE_HERE);
+    assert_eq!(changes[0].old_path, "a.txt");
+    assert_eq!(changes[0].current_path, "b.txt");
+
+    let copy = "diff --git a/a.txt b/c.txt\ncopy from a.txt\ncopy to c.txt\n--- a/a.txt\n+++ b/c.txt\n@@ -1 +1 @@\n x\n";
+    let changes = parse_unified_diff(copy);
+    assert_eq!(changes[0].change_type, TYPE_COPY_HERE);
+
+    let binary = "diff --git a/img.png b/img.png\nBinary files a/img.png and b/img.png differ\n";
+    let changes = parse_unified_diff(binary);
+    assert_eq!(changes[0].file_type, FILE_BINARY);
+    assert!(changes[0].hunks.is_empty());
+
+    let git_binary =
+        "diff --git a/bin.dat b/bin.dat\nGIT binary patch\nliteral 3\nabc\n\nliteral 3\ndef\n\n";
+    let changes = parse_unified_diff(git_binary);
+    assert_eq!(changes[0].file_type, FILE_BINARY);
+    assert!(changes[0].hunks.is_empty());
+}
+
+#[test]
+fn unified_diff_handles_hg_and_svn_headers() {
+    let hg = "diff -r abc123 f.txt\n--- f.txt\tThu Jan 01 00:00:00 2026\n+++ f.txt\tThu Jan 01 00:00:00 2026\n@@ -1 +1 @@\n-a\n+b\n";
+    let changes = parse_unified_diff(hg);
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].current_path, "f.txt");
+    assert_eq!(changes[0].hunks.len(), 1);
+
+    let svn =
+        "Index: f.txt\n--- f.txt\t(revision 5)\n+++ f.txt\t(working copy)\n@@ -1 +1 @@\n-a\n+b\n";
+    let changes = parse_unified_diff(svn);
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].current_path, "f.txt");
+    assert_eq!(changes[0].old_path, "f.txt");
+}
+
+#[test]
+fn unified_diff_message_changes_filter() {
+    let text = "commit abc123def\nAuthor: A U Thor\n\n    add feature\n\ndiff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-a\n+b\n";
+    let changes = parse_unified_diff(text);
+    assert_eq!(changes.len(), 2);
+    assert!(changes[0].is_message());
+    assert_eq!(changes[0].commit_hash.as_deref(), Some("abc123def"));
+    assert!(
+        changes[0]
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("add feature")
+    );
+    let files = without_message_changes(&changes);
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].current_path, "f.txt");
+    assert!(without_message_changes(&[]).is_empty());
+    assert!(parse_unified_diff("").is_empty());
+}
+
+struct FailingReader;
+
+impl std::io::Read for FailingReader {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("boom"))
+    }
+}
+
+#[test]
+fn raw_stdin_and_command_helpers() {
+    assert_eq!(RAW_STDIN_NOTICE, "Reading diff from stdin...\n");
+    assert_eq!(UNKNOWN_RAW_DIFF_SOURCE, "Unknown raw diff source.");
+    let text = read_raw_stdin_from(std::io::Cursor::new("diff text")).unwrap();
+    assert_eq!(text, "diff text");
+    let err = read_raw_stdin_from(FailingReader).unwrap_err();
+    assert!(err.contains("failed to read diff from stdin"), "{err}");
+
+    let out = shell_command_output("echo hello").unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("hello"));
+    assert!(out.status.success());
+    assert!(shell_command_status("exit 0").unwrap().success());
+    assert!(!shell_command_status("exit 3").unwrap().success());
+    // Quoted arguments survive the shell round-trip on every platform.
+    let quoted = shell_command_output("echo \"a b\"").unwrap();
+    assert!(String::from_utf8_lossy(&quoted.stdout).contains("a b"));
+
+    let out = run_raw_command_text("echo hello").unwrap();
+    assert!(out.contains("hello"), "{out}");
+    assert!(run_raw_command_text("exit 1").is_err());
+}
+
+#[test]
+fn hg_argv_and_parsers() {
+    assert_eq!(
+        hg_diff_options(7),
+        vec!["--git".to_string(), "-U7".to_string()]
+    );
+    assert_eq!(
+        hg_full_diff_argv("abc", 32767),
+        vec![
+            "diff".to_string(),
+            "--git".to_string(),
+            "-U32767".to_string(),
+            "--rev".to_string(),
+            "abc".to_string(),
+            "--".to_string(),
+            String::new(),
+        ]
+    );
+    assert_eq!(hg_branch_argv(), vec!["branch".to_string()]);
+    assert_eq!(
+        hg_status_argv("abc"),
+        vec!["status".to_string(), "--rev".to_string(), "abc".to_string()]
+    );
+    let log_argv = hg_commit_log_argv("abc", "default");
+    assert_eq!(log_argv[0], "log");
+    assert!(
+        log_argv.contains(&"(abc::. - abc)".to_string()),
+        "{log_argv:?}"
+    );
+    assert_eq!(
+        hg_amend_argv("msg.txt"),
+        vec![
+            "commit".to_string(),
+            "--amend".to_string(),
+            "--logfile".to_string(),
+            "msg.txt".to_string(),
+            "--".to_string(),
+        ]
+    );
+
+    let entries =
+        parse_hg_status_details("M f.txt\nA g.txt\nR h.txt\n? u.txt\n! m.txt\nC c.txt\nI i.txt\n")
+            .unwrap();
+    let masks: Vec<u32> = entries.iter().map(|(_, flags)| *flags).collect();
+    assert_eq!(
+        masks,
+        vec![
+            FLAG_MODIFIED,
+            FLAG_ADDED,
+            FLAG_DELETED,
+            FLAG_UNTRACKED,
+            FLAG_MISSING,
+            0,
+            0,
+        ]
+    );
+    let copied = parse_hg_status_details("A new.txt\n  old.txt\n").unwrap();
+    assert_eq!(copied[0].0.from.as_deref(), Some("old.txt"));
+    assert_eq!(
+        parse_hg_status_details("X").unwrap_err(),
+        "Unparsable Mercurial status line 'X'."
+    );
+    assert_eq!(
+        parse_hg_status_details("Z f.txt").unwrap_err(),
+        "Unknown Mercurial status 'Z'."
+    );
+    // Like PHP, whole-output trim runs first, so a leading copy-source
+    // line loses its spaces and reports as unparsable.
+    assert_eq!(
+        parse_hg_status_details("  orphan.txt").unwrap_err(),
+        "Unparsable Mercurial status line 'orphan.txt'."
+    );
+    assert!(parse_hg_status_details("  \n").unwrap().is_empty());
+
+    let map = parse_hg_status("M f.txt\nA g.txt\n").unwrap();
+    assert_eq!(
+        map,
+        vec![
+            ("f.txt".to_string(), FLAG_MODIFIED),
+            ("g.txt".to_string(), FLAG_ADDED)
+        ]
+    );
+
+    let log = parse_hg_commit_log("node1\x01first desc\x02node2\x01second desc\x02");
+    assert_eq!(
+        log,
+        vec![
+            ("node1".to_string(), "first desc".to_string()),
+            ("node2".to_string(), "second desc".to_string()),
+        ]
+    );
+    assert!(parse_hg_commit_log("").is_empty());
+    assert!(parse_hg_commit_log("garbage-without-separator\x02").is_empty());
+
+    assert!(hg_supports_amend_from_help("commit --amend ..."));
+    assert!(!hg_supports_amend_from_help("commit ..."));
+
+    let bogus = std::path::Path::new("definitely-not-an-hg-repo-g1");
+    assert!(get_full_hg_diff(bogus, "tip", 3).is_err());
+    assert!(get_hg_branch_name(bogus).is_err());
+}
+
+#[test]
+fn svn_helpers() {
+    assert_eq!(
+        svn_status_argv(&[]),
+        vec!["--xml".to_string(), "status".to_string()]
+    );
+    assert_eq!(
+        svn_status_argv(&["a.txt".to_string()]),
+        vec![
+            "--xml".to_string(),
+            "status".to_string(),
+            "a.txt".to_string()
+        ]
+    );
+    assert_eq!(svn_props_mask("none").unwrap(), 0);
+    assert_eq!(svn_props_mask("normal").unwrap(), 0);
+    assert_eq!(svn_props_mask("modified").unwrap(), FLAG_MODIFIED);
+    assert_eq!(
+        svn_props_mask("bogus").unwrap_err(),
+        "Unrecognized property status 'bogus'."
+    );
+
+    for (item, flags) in [
+        ("none", 0),
+        ("normal", 0),
+        ("external", FLAG_EXTERNALS),
+        ("unversioned", FLAG_UNTRACKED),
+        ("obstructed", FLAG_OBSTRUCTED),
+        ("missing", FLAG_MISSING),
+        ("added", FLAG_ADDED),
+        ("replaced", FLAG_MODIFIED),
+        ("modified", FLAG_MODIFIED),
+        ("deleted", FLAG_DELETED),
+        ("conflicted", FLAG_CONFLICT),
+        ("incomplete", FLAG_INCOMPLETE),
+    ] {
+        assert_eq!(parse_svn_item_status(item).unwrap(), flags, "{item}");
+    }
+    assert_eq!(
+        parse_svn_item_status("bogus").unwrap_err(),
+        "Unrecognized item status 'bogus'."
+    );
+
+    assert_eq!(
+        svn_info_argv("/"),
+        vec!["info".to_string(), ".".to_string()]
+    );
+    assert_eq!(
+        svn_info_argv("f.txt"),
+        vec!["info".to_string(), "f.txt@".to_string()]
+    );
+    assert_eq!(
+        svn_diff_argv("f.txt", None, 3),
+        vec![
+            "diff".to_string(),
+            "--depth".to_string(),
+            "empty".to_string(),
+            "f.txt".to_string(),
+        ]
+    );
+    assert_eq!(
+        svn_diff_argv("f.txt", Some("/bin/sh-diff"), 5),
+        vec![
+            "diff".to_string(),
+            "--depth".to_string(),
+            "empty".to_string(),
+            "--diff-cmd".to_string(),
+            "/bin/sh-diff".to_string(),
+            "-x".to_string(),
+            "-U5".to_string(),
+            "f.txt".to_string(),
+        ]
+    );
+
+    assert_eq!(svn_base_rev_line(7, "a/b"), "    Revision 7, a/b");
+    assert_eq!(check_svn_base_consistency(&[]).unwrap(), 0);
+    assert_eq!(check_svn_base_consistency(&[("n", 0)]).unwrap(), 0);
+    assert_eq!(
+        check_svn_base_consistency(&[("a", 9), ("b", 9)]).unwrap(),
+        9
+    );
+    let err = check_svn_base_consistency(&[("a", 9), ("b", 10)]).unwrap_err();
+    assert!(
+        err.contains("Base revisions of changed paths are mismatched."),
+        "{err}"
+    );
+    assert!(err.contains("    Revision 9, a"), "{err}");
+    assert!(err.contains("    Revision 10, b"), "{err}");
+
+    let warning = svn_externals_warning();
+    assert!(
+        warning.contains("These changes will not be included in the diff"),
+        "{warning}"
+    );
+    assert!(
+        warning.ends_with("Modified 'svn:externals' files:"),
+        "{warning}"
+    );
+    assert_eq!(
+        PROMPT_SVN_EXTERNALS_ANYWAY,
+        "Generate a diff (with just local changes) anyway?"
+    );
+
+    assert_eq!(
+        svn_branch_name("https://s.example/r/trunk", "https://s.example/r"),
+        "/trunk"
+    );
+    assert_eq!(
+        svn_branch_name("https://other/x", "https://s.example/r"),
+        "svn"
+    );
+}
+
+#[test]
+fn change_review_texts() {
+    let err = gigantic_svn_error("big.txt", 5_000_000);
+    assert!(
+        err.contains("Diff for 'big.txt' with context is 5000000 bytes in length."),
+        "{err}"
+    );
+    assert!(
+        err.contains("svn propset svn:mime-type application/octet-stream <filename>"),
+        "{err}"
+    );
+
+    let confirm = gigantic_confirm("big.txt", 5_000_000);
+    assert!(
+        confirm.contains("Generally, source changes should not be this large."),
+        "{confirm}"
+    );
+    assert!(
+        confirm.contains("Mark this file as 'binary' and continue?"),
+        "{confirm}"
+    );
+
+    assert_eq!(UTF8_HEADER, "Invalid Content Encoding (Non-UTF8)");
+    let body = utf8_warning_body(2);
+    assert!(
+        body.contains("This diff includes 2 file(s) which are not valid UTF-8"),
+        "{body}"
+    );
+    assert!(
+        body.contains("these files will be marked as binary."),
+        "{body}"
+    );
+    assert!(
+        body.contains("User Guide: UTF-8 and Character Encoding"),
+        "{body}"
+    );
+    assert!(body.contains("    2 AFFECTED FILE(S)\n"), "{body}");
+    assert_eq!(
+        utf8_continue_prompt(3),
+        "Do you want to mark these 3 file(s) as binary and continue?"
+    );
+    assert_eq!(ABORTED_UTF8, "Aborted workflow to fix UTF-8.");
+    assert_eq!(
+        converted_hunk_notice("f.txt", "latin1"),
+        "Converted a 'f.txt' hunk from 'latin1' to UTF-8.\n"
+    );
+    assert_eq!(
+        encoding_lookup_failed("nope"),
+        "Lookup of encoding in project failed: nope"
+    );
+
+    assert_eq!(LINTING, "Linting...");
+    assert_eq!(RUNNING_UNIT_TESTS, "Running unit tests...");
+    assert_eq!(
+        lint_result_notice(LINT_RESULT_OKAY),
+        Some(("LINT OKAY", "No lint problems."))
+    );
+    assert_eq!(
+        lint_result_notice(LINT_RESULT_WARNINGS),
+        Some(("LINT MESSAGES", "Lint issued unresolved warnings."))
+    );
+    assert_eq!(
+        lint_result_notice(LINT_RESULT_ERRORS),
+        Some(("LINT ERRORS", "Lint raised errors!"))
+    );
+    assert_eq!(lint_result_notice(LINT_RESULT_SKIP), None);
+    assert_eq!(lint_result_notice(99), None);
+    assert_eq!(
+        unit_result_notice(UNIT_RESULT_OKAY),
+        Some(("UNIT OKAY", "No unit test failures."))
+    );
+    assert_eq!(
+        unit_result_notice(UNIT_RESULT_UNSOUND),
+        Some((
+            "UNIT UNSOUND",
+            "Unit testing raised errors, but all failing tests are unsound."
+        ))
+    );
+    assert_eq!(
+        unit_result_notice(UNIT_RESULT_FAIL),
+        Some(("UNIT ERRORS", "Unit testing raised errors!"))
+    );
+    assert_eq!(unit_result_notice(UNIT_RESULT_SKIP), None);
+    assert!(UNSOUND_PROMPT.contains("Ignore unsound test failures?"));
+    assert_eq!(
+        NO_LINT_ENGINE,
+        "No lint engine configured for this project."
+    );
+    assert_eq!(
+        NO_UNIT_ENGINE,
+        "No unit test engine is configured for this project."
+    );
+
+    assert_eq!(
+        git_amend_argv(None),
+        vec![
+            "commit".to_string(),
+            "--amend".to_string(),
+            "--allow-empty".to_string(),
+            "-C".to_string(),
+            "HEAD".to_string(),
+        ]
+    );
+    assert_eq!(
+        git_amend_argv(Some("m.txt")),
+        vec![
+            "commit".to_string(),
+            "--amend".to_string(),
+            "--allow-empty".to_string(),
+            "-F".to_string(),
+            "m.txt".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn message_texts() {
+    assert_eq!(PROMPT_USE_SAVED_MESSAGE, "Do you want to use this message?");
+    assert_eq!(
+        PROMPT_EDIT_MESSAGE_AGAIN,
+        "Do you want to edit the message?"
+    );
+    assert_eq!(
+        TASK_NEW_REVISION,
+        "Provide the details for a new revision, then save and exit."
+    );
+    assert_eq!(
+        TASK_UPDATE_COMMENTS,
+        "Update the revision comments, then save and exit."
+    );
+    assert_eq!(
+        TASK_EDIT_REVISION_INFO,
+        "Update the details for a revision, then save and exit."
+    );
+    assert_eq!(TEMPLATE_NOT_EDITED, "Template not edited.");
+    assert_eq!(COMMIT_MESSAGE_HAS_ERRORS, "Commit message has errors:");
+    assert_eq!(RESOLVE_THESE_ERRORS, "Resolve these errors:");
+    assert_eq!(
+        MUST_RESOLVE_ERRORS,
+        "You must resolve these errors to continue."
+    );
+    assert_eq!(
+        MESSAGE_HAS_UNRESOLVED_ERRORS,
+        "Message has unresolved errors."
+    );
+
+    assert_eq!(truncate_preview_64("  Title line\nsecond"), "Title line");
+    assert_eq!(truncate_preview_64(""), "");
+    let long = "x".repeat(100);
+    assert_eq!(truncate_preview_64(&long).len(), 64);
+
+    let notice = saved_message_notice("/tmp/create-message", "Fix pager");
+    assert!(
+        notice.contains("You have a saved revision message in '/tmp/create-message'."),
+        "{notice}"
+    );
+    assert!(
+        notice.contains("Message begins:\n\n       Fix pager\n\n"),
+        "{notice}"
+    );
+    assert!(
+        notice.ends_with("You can use this message, or discard it."),
+        "{notice}"
+    );
+    let bare = saved_message_notice("/tmp/create-message", "");
+    assert!(!bare.contains("Message begins:"), "{bare}");
+
+    let block = included_commits_block(Some("main"), &["abc title".to_string()]);
+    assert_eq!(
+        block,
+        vec![
+            String::new(),
+            "Included commits in branch main:".to_string(),
+            String::new(),
+            "        abc title".to_string(),
+        ]
+    );
+    let raw_block = included_commits_block(None, &[]);
+    assert_eq!(raw_block[1], "Included commits:");
+
+    let issues = new_revision_issues(&["  included".to_string()], &["note".to_string()]);
+    assert_eq!(issues[0], "NEW DIFFERENTIAL REVISION");
+    assert_eq!(issues[1], "Describe the changes in this new revision.");
+    assert!(issues.contains(&"  $ arc diff --update <revision>".to_string()));
+    assert!(issues.contains(&"note".to_string()));
+    let plain = new_revision_issues(&[], &[]);
+    assert!(!plain.iter().any(|line| line == "note"));
+
+    assert_eq!(
+        commit_parse_note("abc123"),
+        "NOTE: commit abc123 could not be completely parsed:"
+    );
+    assert_eq!(WHERE_COMMIT_MESSAGE, "commit message");
+    assert_eq!(copy_saved_to("X"), "A copy was saved to X.");
+    assert_eq!(message_saved_to("X"), "(Message saved to X.)");
+}
+
+#[test]
+fn staging_and_upload_helpers() {
+    assert_eq!(
+        staging_skip_body(STAGING_USER_SKIP),
+        "Flag --skip-staging was specified."
+    );
+    assert_eq!(
+        staging_skip_body(STAGING_DIFF_RAW),
+        "Raw changes can not be pushed to a staging area."
+    );
+    assert_eq!(
+        staging_skip_body(STAGING_REPOSITORY_UNKNOWN),
+        "Unable to determine repository for this change."
+    );
+    assert_eq!(
+        staging_skip_body(STAGING_REPOSITORY_UNAVAILABLE),
+        "The server does not support staging areas."
+    );
+    assert_eq!(
+        staging_skip_body(STAGING_REPOSITORY_UNSUPPORTED),
+        "The server does not support staging areas for this repository."
+    );
+    assert_eq!(
+        staging_skip_body(STAGING_REPOSITORY_UNCONFIGURED),
+        "No staging area is configured for this repository."
+    );
+    assert_eq!(
+        staging_skip_body(STAGING_CLIENT_UNSUPPORTED),
+        "This client version does not support staging this repository."
+    );
+    assert_eq!(SKIP_STAGING_HEADER, "SKIP STAGING");
+
+    let config = StagingConfig::new(true, Some("ssh://x"), true);
+    assert_eq!(config.prefix, "phabricator");
+    assert_eq!(
+        staging_skip_reason(true, false, Some("PHID"), Some(&config)),
+        Some(STAGING_USER_SKIP)
+    );
+    assert_eq!(
+        staging_skip_reason(false, true, Some("PHID"), Some(&config)),
+        Some(STAGING_DIFF_RAW)
+    );
+    assert_eq!(
+        staging_skip_reason(false, false, None, Some(&config)),
+        Some(STAGING_REPOSITORY_UNKNOWN)
+    );
+    assert_eq!(
+        staging_skip_reason(false, false, Some("PHID"), None),
+        Some(STAGING_REPOSITORY_UNAVAILABLE)
+    );
+    let unsupported = StagingConfig::new(false, Some("ssh://x"), true);
+    assert_eq!(
+        staging_skip_reason(false, false, Some("PHID"), Some(&unsupported)),
+        Some(STAGING_REPOSITORY_UNSUPPORTED)
+    );
+    let unconfigured = StagingConfig::new(true, None, true);
+    assert_eq!(
+        staging_skip_reason(false, false, Some("PHID"), Some(&unconfigured)),
+        Some(STAGING_REPOSITORY_UNCONFIGURED)
+    );
+    let non_git = StagingConfig::new(true, Some("ssh://x"), false);
+    assert_eq!(
+        staging_skip_reason(false, false, Some("PHID"), Some(&non_git)),
+        Some(STAGING_CLIENT_UNSUPPORTED)
+    );
+    assert_eq!(
+        staging_skip_reason(false, false, Some("PHID"), Some(&config)),
+        None
+    );
+
+    assert_eq!(PUSH_STAGING_HEADER, "PUSH STAGING");
+    assert_eq!(PUSH_STAGING_BODY, "Pushing changes to staging area...");
+    assert_eq!(
+        staging_tag("phabricator", "base", 7),
+        "refs/tags/phabricator/base/7"
+    );
+    assert_eq!(
+        staging_refspecs("base1", "head1", "phabricator", 7, false),
+        vec![
+            "base1:refs/tags/phabricator/base/7".to_string(),
+            "head1:refs/tags/phabricator/diff/7".to_string(),
+        ]
+    );
+    assert_eq!(
+        staging_refspecs(GIT_MAGIC_ROOT_COMMIT, "head1", "phabricator", 7, false),
+        vec!["head1:refs/tags/phabricator/diff/7".to_string()]
+    );
+    assert_eq!(
+        staging_refspecs("base1", "head1", "phabricator", 7, true),
+        vec![
+            "base1:refs/tags/phabricator/base/7".to_string(),
+            "base1:refs/tags/phabricator/diff/7".to_string(),
+        ]
+    );
+    assert_eq!(
+        staging_lfs_refspec("head1", "phabricator", 7),
+        "+head1:refs/tags/phabricator/diff/7"
+    );
+    assert_eq!(
+        staging_push_argv("ssh://x", &["a:b".to_string()], true),
+        vec![
+            "push".to_string(),
+            "--no-verify".to_string(),
+            "--".to_string(),
+            "ssh://x".to_string(),
+            "a:b".to_string(),
+        ]
+    );
+    assert_eq!(
+        staging_push_argv("ssh://x", &[], false),
+        vec!["push".to_string(), "--".to_string(), "ssh://x".to_string()]
+    );
+    assert!(!git_supports_push_no_verify("1.8.1"));
+    assert!(git_supports_push_no_verify("1.8.2"));
+    assert!(git_supports_push_no_verify("2.40.0"));
+    assert_eq!(STAGING_FAILED_HEADER, "STAGING FAILED");
+    assert!(STAGING_PUSH_FAILED.contains("--skip-staging"));
+    assert!(STAGING_LFS_PUSH_FAILED.contains("lfs changes"));
+
+    assert_eq!(UPLOAD_COMPLETE, "Upload complete.");
+    assert_eq!(
+        uploaded_binary_notice("a.png"),
+        "Uploaded binary data for \"a.png\"."
+    );
+    assert_eq!(
+        failed_binary_upload("a.png"),
+        "Failed to upload binary \"a.png\"."
+    );
+    assert_eq!(PROMPT_CONTINUE, "Continue?");
+    assert!(ABORTED_UPLOAD_FAILURE.contains("--skip-binaries"));
+    assert!(needs_binary_upload(FILE_BINARY, false));
+    assert!(!needs_binary_upload(FILE_BINARY, true));
+    assert!(!needs_binary_upload(FILE_TEXT, false));
+    assert!(is_image_mime_type("image/png"));
+    assert!(!is_image_mime_type("application/octet-stream"));
+
+    assert_eq!(UPDATING_COMMIT_MESSAGE, "Updating commit message...");
+    assert!(AMEND_UNSUPPORTED.contains("only supported in git and hg"));
+    assert!(should_open_in_browser(true));
+    assert!(!should_open_in_browser(false));
 }
