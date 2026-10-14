@@ -1,0 +1,28 @@
+# cargo-deny policy, imported from github-io (T1128). Advisories are covered
+# by cargo-audit instead (same RustSec DB), so there is intentionally no
+# [advisories] section; CI runs `cargo deny check licenses bans sources`.
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+]
+[licenses.private]
+ignore = true
+[bans]
+multiple-versions = "deny"
+# wildcards = allow, mirroring github-io: duplicate versions (the costly
+# half of bans) are still denied above.
+wildcards = "allow"
+skip = []
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

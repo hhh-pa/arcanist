@@ -1,18 +1,22 @@
 //! `arc-rs` — Rust port of Arcanist.
 //!
-//! Tracks T1128. `call-conduit`, `diff`, `lint`, `unit`, and `land` are
-//! implemented; remaining subcommands keep the same names `arc` uses.
+//! Tracks T1128. All arc subcommands are implemented; remaining work is
+//! linters, unit engines, and Differential submission depth.
 
 use std::process::ExitCode;
 
-use arc_rs::{conduit, config, diff, land, lint, unit};
+use arc_rs::{
+    amend, anoid, bookmarks, branches, close_revision, commit, config, cover, diff, download,
+    export, get_config, inspect, install_certificate, land, liberate, lint, linters, list, look,
+    paste, patch, set_config, tasks, todo, unit, upgrade, upload, weld, which, work,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const PLANNED: &[&str] = &[];
 
 fn usage() -> String {
-    let mut text = "usage: arc-rs [--version] [--help] <command>\n\nimplemented commands:\n  call-conduit <method> [params-json] [--conduit-uri URI]\n  diff [--base REV] [--json]\n  land [--onto BRANCH] [--preview] [--push]\n  lint [PATHS...] [--json]\n  unit [-- <cargo-test-args>]\n"
+    let mut text = "usage: arc-rs [--version] [--help] <command>\n\ncommands (see <command> --help):\n  amend\n  anoid\n  bookmarks\n  branches\n  call-conduit\n  close-revision\n  commit\n  cover\n  diff\n  download\n  export\n  get-config\n  inspect\n  install-certificate\n  land\n  liberate\n  lint\n  linters\n  list\n  look\n  paste\n  patch\n  set-config\n  tasks\n  todo\n  unit\n  upgrade\n  upload\n  weld\n  which\n  work\n"
         .to_string();
     if !PLANNED.is_empty() {
         let planned = PLANNED
@@ -99,26 +103,10 @@ fn run_call_conduit(args: &CallArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let uri = args
-        .conduit_uri
-        .clone()
-        .or_else(|| std::env::var("ARC_CONDUIT_URI").ok())
-        .or_else(config::discover_conduit_uri);
-    let Some(uri) = uri else {
-        eprintln!(
-            "arc-rs: no conduit URI: pass --conduit-uri, set ARC_CONDUIT_URI, or run inside a project with .arcconfig"
-        );
-        return ExitCode::FAILURE;
-    };
-    let token = config::arcrc_path().and_then(|path| config::token_for_file(&path, &uri));
-    let Some(token) = token else {
-        eprintln!("arc-rs: no token for {uri} in ~/.arcrc");
-        return ExitCode::FAILURE;
-    };
-    let client = match conduit::Client::new(&uri, &token) {
+    let client = match config::client_for(args.conduit_uri.as_deref()) {
         Ok(client) => client,
-        Err(e) => {
-            eprintln!("arc-rs: {e}");
+        Err(msg) => {
+            eprintln!("arc-rs: {msg}");
             return ExitCode::FAILURE;
         }
     };
@@ -140,13 +128,41 @@ fn run_call_conduit(args: &CallArgs) -> ExitCode {
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if let Some(cmd) = argv.first() {
-        let rest = &argv[1..];
-        match cmd.as_str() {
-            "diff" => return diff::run(rest),
-            "land" => return land::run(rest),
-            "lint" => return lint::run(rest),
-            "unit" => return unit::run(rest),
-            _ => {}
+        type CommandFn = fn(&[String]) -> ExitCode;
+        const COMMANDS: &[(&str, CommandFn)] = &[
+            (amend::NAME, amend::run),
+            (anoid::NAME, anoid::run),
+            (bookmarks::NAME, bookmarks::run),
+            (branches::NAME, branches::run),
+            (close_revision::NAME, close_revision::run),
+            (commit::NAME, commit::run),
+            (cover::NAME, cover::run),
+            (diff::NAME, diff::run),
+            (download::NAME, download::run),
+            (export::NAME, export::run),
+            (get_config::NAME, get_config::run),
+            (inspect::NAME, inspect::run),
+            (install_certificate::NAME, install_certificate::run),
+            (land::NAME, land::run),
+            (liberate::NAME, liberate::run),
+            (lint::NAME, lint::run),
+            (linters::NAME, linters::run),
+            (list::NAME, list::run),
+            (look::NAME, look::run),
+            (paste::NAME, paste::run),
+            (patch::NAME, patch::run),
+            (set_config::NAME, set_config::run),
+            (tasks::NAME, tasks::run),
+            (todo::NAME, todo::run),
+            (unit::NAME, unit::run),
+            (upgrade::NAME, upgrade::run),
+            (upload::NAME, upload::run),
+            (weld::NAME, weld::run),
+            (which::NAME, which::run),
+            (work::NAME, work::run),
+        ];
+        if let Some((_, run)) = COMMANDS.iter().find(|(name, _)| *name == cmd.as_str()) {
+            return run(&argv[1..]);
         }
     }
     match classify(&argv) {
@@ -179,90 +195,5 @@ fn main() -> ExitCode {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn args(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn classifies_help_and_version() {
-        assert_eq!(classify(&args(&["--help"])), Action::Help);
-        assert_eq!(classify(&args(&["-h"])), Action::Help);
-        assert_eq!(classify(&args(&["help"])), Action::Help);
-        assert_eq!(classify(&args(&["--version"])), Action::Version);
-        assert_eq!(classify(&args(&["-V"])), Action::Version);
-    }
-
-    #[test]
-    fn classifies_planned_commands() {
-        for c in PLANNED {
-            assert_eq!(classify(&args(&[*c])), Action::Planned((*c).to_string()));
-        }
-    }
-
-    #[test]
-    fn classifies_call_conduit() {
-        assert_eq!(
-            classify(&args(&["call-conduit", "user.whoami"])),
-            Action::CallConduit(CallArgs {
-                method: "user.whoami".to_string(),
-                params_json: "{}".to_string(),
-                conduit_uri: None,
-            })
-        );
-        assert_eq!(
-            classify(&args(&[
-                "call-conduit",
-                "user.whoami",
-                "{}",
-                "--conduit-uri",
-                "https://orsay.hhh.pa/"
-            ])),
-            Action::CallConduit(CallArgs {
-                method: "user.whoami".to_string(),
-                params_json: "{}".to_string(),
-                conduit_uri: Some("https://orsay.hhh.pa/".to_string()),
-            })
-        );
-    }
-
-    #[test]
-    fn rejects_bad_call_conduit_invocations() {
-        assert!(matches!(
-            classify(&args(&["call-conduit"])),
-            Action::Error(_)
-        ));
-        assert!(matches!(
-            classify(&args(&["call-conduit", "m", "--bogus"])),
-            Action::Error(_)
-        ));
-        assert!(matches!(
-            classify(&args(&["call-conduit", "m", "{}", "--conduit-uri"])),
-            Action::Error(_)
-        ));
-        assert!(matches!(
-            classify(&args(&["call-conduit", "m", "{}", "{}"])),
-            Action::Error(_)
-        ));
-    }
-
-    #[test]
-    fn classifies_missing_and_unknown() {
-        assert_eq!(classify(&args(&[])), Action::Missing);
-        assert_eq!(
-            classify(&args(&["bogus"])),
-            Action::Unknown("bogus".to_string())
-        );
-    }
-
-    #[test]
-    fn usage_lists_all_planned_commands() {
-        let u = usage();
-        for c in PLANNED {
-            assert!(u.contains(c), "usage missing {c}");
-        }
-        assert!(u.contains("call-conduit"));
-    }
-}
+#[path = "main_tests.rs"]
+mod main_tests;

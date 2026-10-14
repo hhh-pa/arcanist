@@ -1,0 +1,360 @@
+//! `arc-rs weld`: robustly fuse two or more files together.
+//!
+//! PHP reference: `src/workflow/ArcanistWeldWorkflow.php`. Each input file
+//! is appended to the joint with a randomly blended overlap of 16-32
+//! lines (halved for short inputs); overlapped line pairs fuse glyph by
+//! glyph, biased from the earlier file toward the later one. The joint is
+//! much stronger than the one created by tools like `cat`.
+
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+pub const NAME: &str = "weld";
+
+fn usage() -> String {
+    format!(
+        "usage: arc-rs {NAME} [options] -- <file> <file> [...]\n\
+         \n\
+         Robustly fuse two or more files together. Files are concatenated\n\
+         with a randomly blended overlap region; empty files are skipped.\n\
+         \n\
+         Options:\n\
+         \x20 --seed N       deterministic output from seed N (arc-rs extension;\n\
+         \x20                PHP welds randomly and has no equivalent)\n\
+         \x20 -h, --help     show this help\n"
+    )
+}
+
+/// Parsed `weld` options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Options {
+    pub files: Vec<String>,
+    pub seed: Option<u64>,
+}
+
+fn parse_seed(text: &str) -> Result<u64, String> {
+    text.parse::<u64>()
+        .map_err(|_| format!("invalid --seed '{text}' (expected an unsigned integer)"))
+}
+
+/// Parse `argv` (excluding the subcommand name).
+///
+/// Returns `Ok(None)` when `--help` was requested.
+pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
+    let mut files = Vec::new();
+    let mut seed = None;
+    let mut end_of_flags = false;
+    let mut iter = argv.iter();
+    while let Some(arg) = iter.next() {
+        if end_of_flags {
+            files.push(arg.clone());
+        } else if arg == "--" {
+            end_of_flags = true;
+        } else if arg == "--seed" {
+            let Some(value) = iter.next() else {
+                return Err("--seed requires a value".to_string());
+            };
+            seed = Some(parse_seed(value)?);
+        } else if let Some(value) = arg.strip_prefix("--seed=") {
+            seed = Some(parse_seed(value)?);
+        } else if arg == "-h" || arg == "--help" {
+            return Ok(None);
+        } else if arg.starts_with('-') {
+            return Err(format!("unknown flag '{arg}'"));
+        } else {
+            files.push(arg.clone());
+        }
+    }
+    Ok(Some(Options { files, seed }))
+}
+
+/// Small splitmix64 generator (std-only; no new dependencies).
+#[derive(Debug, Clone)]
+pub struct Rng(u64);
+
+impl Rng {
+    #[must_use]
+    pub fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    pub fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    pub fn range_inclusive(&mut self, low: u64, high: u64) -> u64 {
+        debug_assert!(low <= high);
+        low + self.next_u64() % (high - low + 1)
+    }
+
+    /// Uniform draw from [0, 1).
+    pub fn unit(&mut self) -> f64 {
+        const SCALE: f64 = (1u64 << 53) as f64;
+        ((self.next_u64() >> 11) as f64) / SCALE
+    }
+}
+
+/// Blend threshold for one glyph position, mirroring the PHP: a space on
+/// the earlier side always loses, a space on the later side always wins,
+/// otherwise the positional bias applies.
+fn threshold(earlier_is_space: bool, later_is_space: bool, bias: f64) -> f64 {
+    let mut value = bias;
+    if earlier_is_space {
+        value = 1.0;
+    }
+    if later_is_space {
+        value = 0.0;
+    }
+    value
+}
+
+/// True when the draw keeps the earlier glyph (PHP: `mt_rand()/max >
+/// threshold`).
+#[must_use]
+pub fn keep_earlier(earlier_is_space: bool, later_is_space: bool, bias: f64, draw: f64) -> bool {
+    draw > threshold(earlier_is_space, later_is_space, bias)
+}
+
+/// Fuse one glyph pair: spaces defer to the other side, otherwise the
+/// draw is compared against the bias.
+#[must_use]
+pub fn pick(earlier: char, later: char, bias: f64, draw: f64) -> char {
+    if keep_earlier(earlier == ' ', later == ' ', bias, draw) {
+        earlier
+    } else {
+        later
+    }
+}
+
+/// Split a line into content and its trailing `[\r\n]+` terminator, if any.
+#[must_use]
+pub fn split_terminator(line: &str) -> (&str, Option<&str>) {
+    let end = line.trim_end_matches(['\r', '\n']).len();
+    if end == line.len() {
+        (line, None)
+    } else {
+        (&line[..end], Some(&line[end..]))
+    }
+}
+
+fn split_terminator_bytes(line: &[u8]) -> (&[u8], Option<&[u8]>) {
+    let mut end = line.len();
+    while end > 0 && (line[end - 1] == b'\r' || line[end - 1] == b'\n') {
+        end -= 1;
+    }
+    if end == line.len() {
+        (line, None)
+    } else {
+        (&line[..end], Some(&line[end..]))
+    }
+}
+
+/// Split text into lines that retain their terminators, mirroring
+/// `phutil_split_lines($data, true)`.
+#[must_use]
+pub fn split_lines_keep(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (index, byte) in text.bytes().enumerate() {
+        if byte == b'\n' {
+            out.push(&text[start..=index]);
+            start = index + 1;
+        }
+    }
+    if start < text.len() {
+        out.push(&text[start..]);
+    }
+    out
+}
+
+/// Byte-level line split keeping terminators.
+#[must_use]
+pub fn split_lines_bytes(data: &[u8]) -> Vec<&[u8]> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (index, byte) in data.iter().enumerate() {
+        if *byte == b'\n' {
+            out.push(&data[start..=index]);
+            start = index + 1;
+        }
+    }
+    if start < data.len() {
+        out.push(&data[start..]);
+    }
+    out
+}
+
+/// Fuse one line pair glyph by glyph. The shorter side is padded with
+/// spaces; the terminator is the later line's when present, else the
+/// earlier line's.
+pub fn weld_lines(earlier: &str, later: &str, bias: f64, rng: &mut Rng) -> String {
+    let (ucontent, unewline) = split_terminator(earlier);
+    let (vcontent, vnewline) = split_terminator(later);
+    let newline = vnewline.or(unewline);
+    let mut us: Vec<char> = ucontent.chars().collect();
+    let mut vs: Vec<char> = vcontent.chars().collect();
+    let len = us.len().max(vs.len());
+    us.resize(len, ' ');
+    vs.resize(len, ' ');
+    let mut out = String::new();
+    for (uc, vc) in us.iter().zip(vs.iter()) {
+        out.push(pick(*uc, *vc, bias, rng.unit()));
+    }
+    if let Some(newline) = newline {
+        out.push_str(newline);
+    }
+    out
+}
+
+/// Fuse one raw line pair. Valid UTF-8 pairs fuse glyph by glyph like
+/// [`weld_lines`]; anything else fuses byte by byte so binary input
+/// round-trips without corruption.
+pub fn weld_line_bytes(earlier: &[u8], later: &[u8], bias: f64, rng: &mut Rng) -> Vec<u8> {
+    if let (Ok(u), Ok(v)) = (std::str::from_utf8(earlier), std::str::from_utf8(later)) {
+        return weld_lines(u, v, bias, rng).into_bytes();
+    }
+    let (ucontent, unewline) = split_terminator_bytes(earlier);
+    let (vcontent, vnewline) = split_terminator_bytes(later);
+    let mut us = ucontent.to_vec();
+    let mut vs = vcontent.to_vec();
+    let len = us.len().max(vs.len());
+    us.resize(len, b' ');
+    vs.resize(len, b' ');
+    let mut out = Vec::with_capacity(len + 2);
+    for (ub, vb) in us.iter().zip(vs.iter()) {
+        let keep = keep_earlier(*ub == b' ', *vb == b' ', bias, rng.unit());
+        out.push(if keep { *ub } else { *vb });
+    }
+    if let Some(newline) = vnewline.or(unewline) {
+        out.extend_from_slice(newline);
+    }
+    out
+}
+
+/// Blend width for one joint: random 16-32 lines, halved for short
+/// inputs, and never wider than either side.
+pub fn overlap_for(buffered: usize, incoming: usize, rng: &mut Rng) -> usize {
+    let mut overlap = rng.range_inclusive(16, 32) as usize;
+    if buffered > 6 {
+        overlap = overlap.min(buffered.div_ceil(2));
+    }
+    if incoming > 6 {
+        overlap = overlap.min(incoming.div_ceil(2));
+    }
+    overlap.min(buffered).min(incoming)
+}
+
+/// Fuse UTF-8 file contents; empty inputs are skipped.
+#[must_use]
+pub fn weld_texts(texts: &[&str], rng: &mut Rng) -> String {
+    let mut buffer: Vec<String> = Vec::new();
+    for text in texts {
+        if text.is_empty() {
+            continue;
+        }
+        let lines = split_lines_keep(text);
+        let overlap = overlap_for(buffer.len(), lines.len(), rng);
+        let start = buffer.len() - overlap;
+        for (index, line) in lines.iter().take(overlap).enumerate() {
+            let bias = (index as f64 + 0.5) / overlap as f64;
+            buffer[start + index] = weld_lines(&buffer[start + index], line, bias, rng);
+        }
+        for line in lines.iter().skip(overlap) {
+            buffer.push((*line).to_string());
+        }
+    }
+    buffer.concat()
+}
+
+/// Fuse raw file contents; empty inputs are skipped.
+#[must_use]
+pub fn weld_buffers(files: &[Vec<u8>], rng: &mut Rng) -> Vec<u8> {
+    let mut buffer: Vec<Vec<u8>> = Vec::new();
+    for data in files {
+        if data.is_empty() {
+            continue;
+        }
+        let lines = split_lines_bytes(data);
+        let overlap = overlap_for(buffer.len(), lines.len(), rng);
+        let start = buffer.len() - overlap;
+        for (index, line) in lines.iter().take(overlap).enumerate() {
+            let bias = (index as f64 + 0.5) / overlap as f64;
+            buffer[start + index] = weld_line_bytes(&buffer[start + index], line, bias, rng);
+        }
+        for line in lines.iter().skip(overlap) {
+            buffer.push((*line).to_vec());
+        }
+    }
+    buffer.concat()
+}
+
+fn seed_from_clock() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    (nanos as u64).wrapping_add((std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
+/// Run the workflow rooted at `dir`, returning stdout bytes or an error message.
+pub fn execute(dir: &Path, argv: &[String]) -> Result<Vec<u8>, String> {
+    let options = match parse_options(argv) {
+        Ok(Some(options)) => options,
+        Ok(None) => return Ok(usage().into_bytes()),
+        Err(message) => return Err(format!("{message}\n\n{}", usage())),
+    };
+    if options.files.len() < 2 {
+        return Err(format!(
+            "Specify two or more files to weld together.\n\n{}",
+            usage()
+        ));
+    }
+    let mut inputs = Vec::with_capacity(options.files.len());
+    for file in &options.files {
+        let path = if Path::new(file).is_absolute() {
+            PathBuf::from(file)
+        } else {
+            dir.join(file)
+        };
+        inputs.push(std::fs::read(&path).map_err(|e| format!("cannot read '{file}': {e}"))?);
+    }
+    let seed = options.seed.unwrap_or_else(seed_from_clock);
+    Ok(weld_buffers(&inputs, &mut Rng::new(seed)))
+}
+
+pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
+    match execute(dir, argv) {
+        Ok(bytes) => {
+            use std::io::Write;
+            if std::io::stdout().write_all(&bytes).is_err() {
+                eprintln!("arc-rs {NAME}: failed to write output");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("arc-rs {NAME}: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Entry point: `argv` excludes the subcommand name.
+pub fn run(argv: &[String]) -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    run_in(&cwd, argv)
+}
+
+#[cfg(test)]
+#[path = "weld_tests.rs"]
+mod weld_tests;

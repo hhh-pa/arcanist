@@ -1,0 +1,5 @@
+# cargo-audit baseline (T1128): pre-existing findings ignored so the gate fails
+# only on NEW advisories. Each entry must name the remediation; drop entries
+# as migrations land.
+[advisories]
+ignore = []
