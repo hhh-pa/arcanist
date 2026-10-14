@@ -1,6 +1,225 @@
 use super::*;
 use serde_json::json;
 
+/* G1 full-state tests: revision flow, away reviewers, autotargets. */
+
+#[test]
+fn g1_revision_flow_texts() {
+    assert_eq!(CREATED_DIFF_LEAD, "Created a new Differential diff:");
+    assert_eq!(DIFF_URI_LABEL, "Diff URI:");
+    assert_eq!(
+        UPDATED_REVISION_LEAD,
+        "Updated an existing Differential revision:"
+    );
+    assert_eq!(
+        CREATED_REVISION_LEAD,
+        "Created a new Differential revision:"
+    );
+    assert_eq!(REVISION_URI_LABEL, "Revision URI:");
+    assert_eq!(INCLUDED_CHANGES_LABEL, "Included changes:");
+
+    let list = render_revision_list(&[(1, "First"), (22, "Second")]);
+    assert_eq!(list, "     - D1: First\n     - D22: Second\n");
+    assert!(render_revision_list(&[]).is_empty());
+
+    let err = several_revisions_error(&list);
+    assert!(
+        err.starts_with(
+            "There are several revisions which match the working copy:\n\n     - D1: First\n"
+        ),
+        "{err}"
+    );
+    assert!(
+        err.ends_with("Use '--update' to choose one, or '--create' to create a new revision."),
+        "{err}"
+    );
+
+    assert_eq!(
+        UPDATE_PARAM_MUST_BE_NUMBER,
+        "Parameter to --update must be a Differential Revision number."
+    );
+    assert_eq!(ALREADY_A_DRAFT, "ALREADY A DRAFT");
+
+    assert!(check_revision_ownership("PHID-A", "PHID-A", 5, "T").is_none());
+    let prompt = check_revision_ownership("PHID-A", "PHID-B", 5, "T").unwrap();
+    assert!(prompt.contains("You don't own revision D5"), "{prompt}");
+    assert!(prompt.ends_with("Update this revision anyway?"), "{prompt}");
+}
+
+#[test]
+fn g1_away_reviewer_helpers() {
+    assert_eq!(
+        away_reviewers_all_message("Thursday, Jan 1 1970"),
+        "All reviewers are away until Thursday, Jan 1 1970:"
+    );
+    assert_eq!(AWAY_SOME_MESSAGE, "Some reviewers are currently away:");
+    assert_eq!(
+        away_reviewer_list_item("alice", "Friday, Jan 2 1970"),
+        "alice (until Friday, Jan 2 1970)"
+    );
+    assert_eq!(
+        CONTINUE_DESPITE_AWAY,
+        "Continue even though reviewers are unavailable?"
+    );
+    assert_eq!(
+        SPECIFY_AVAILABLE_REVIEWERS,
+        "Specify available reviewers and retry."
+    );
+
+    assert_eq!(format_phab_date(0), "Thursday, Jan 1 1970");
+    assert_eq!(format_phab_date(86_400), "Friday, Jan 2 1970");
+    assert_eq!(format_phab_date(-86_400), "Wednesday, Dec 31 1969");
+    assert_eq!(format_phab_date(1_767_225_600), "Thursday, Jan 1 2026");
+    assert_eq!(format_phab_date(1_768_089_600), "Sunday, Jan 11 2026");
+
+    assert_eq!(away_until_timestamp(&json!(123)), 123);
+    assert_eq!(away_until_timestamp(&json!(null)), 0);
+    assert_eq!(away_until_timestamp(&json!("x")), 0);
+
+    let aways = vec![
+        AwayReviewer {
+            name: "a".to_string(),
+            until: json!(200),
+        },
+        AwayReviewer {
+            name: "b".to_string(),
+            until: json!(100),
+        },
+    ];
+    assert_eq!(away_earliest_return(&aways), Some(100));
+    assert_eq!(away_earliest_return(&[]), None);
+
+    assert!(away_reviewers_block(&[], 0).is_none());
+    let all = away_reviewers_block(&aways, 2).unwrap();
+    assert!(
+        all.starts_with("All reviewers are away until Thursday, Jan 1 1970:\n\n"),
+        "{all}"
+    );
+    assert!(
+        all.contains("      a (until Thursday, Jan 1 1970)\n"),
+        "{all}"
+    );
+    let some = away_reviewers_block(&aways[..1], 2).unwrap();
+    assert!(
+        some.starts_with("Some reviewers are currently away:\n\n"),
+        "{some}"
+    );
+}
+
+#[test]
+fn g1_autotarget_helpers() {
+    assert_eq!(METHOD_QUERY_AUTOTARGETS, "harbormaster.queryautotargets");
+    assert_eq!(METHOD_SENDMESSAGE, "harbormaster.sendmessage");
+    assert_eq!(AUTOTARGET_LINT_KEY, "arcanist.lint");
+    assert_eq!(AUTOTARGET_UNIT_KEY, "arcanist.unit");
+
+    let params = query_autotargets_params("PHID-DIFF-1");
+    assert_eq!(params["objectPHID"], json!("PHID-DIFF-1"));
+    assert_eq!(
+        params["targetKeys"],
+        json!(["arcanist.lint", "arcanist.unit"])
+    );
+
+    let response = json!({"targetMap": {"arcanist.lint": "PHID-T-1"}});
+    assert_eq!(
+        autotarget_phid(&response, "arcanist.lint").as_deref(),
+        Some("PHID-T-1")
+    );
+    assert_eq!(autotarget_phid(&response, "arcanist.unit"), None);
+    assert_eq!(autotarget_phid(&json!({}), "arcanist.lint"), None);
+
+    assert_eq!(lint_autotarget_type(&[]), "pass");
+    assert_eq!(lint_autotarget_type(&["advice", "disabled"]), "pass");
+    assert_eq!(lint_autotarget_type(&["warning"]), "fail");
+    assert_eq!(lint_autotarget_type(&["advice", "error"]), "fail");
+
+    let lint_params = sendmessage_lint_params("PHID-T-1", &[json!({"a": 1})], "fail");
+    assert_eq!(lint_params["buildTargetPHID"], json!("PHID-T-1"));
+    assert_eq!(lint_params["lint"], json!([{"a": 1}]));
+    assert_eq!(lint_params["type"], json!("fail"));
+    let unit_params = sendmessage_unit_params("PHID-T-2", &[], "pass");
+    assert_eq!(unit_params["buildTargetPHID"], json!("PHID-T-2"));
+    assert_eq!(unit_params["unit"], json!([]));
+    assert_eq!(unit_params["type"], json!("pass"));
+}
+
+#[test]
+fn g1_update_autotargets_over_seam() {
+    use std::cell::RefCell;
+    let sent = RefCell::new(Vec::new());
+    let call = |method: &str, params: &serde_json::Value| {
+        if method == "harbormaster.queryautotargets" {
+            return Ok(
+                json!({"targetMap": {"arcanist.lint": "PHID-L", "arcanist.unit": "PHID-U"}}),
+            );
+        }
+        assert_eq!(method, "harbormaster.sendmessage");
+        sent.borrow_mut().push(params.clone());
+        Ok(json!(null))
+    };
+    let ok = update_autotargets(
+        &call,
+        "PHID-DIFF-1",
+        &[json!({"severity": "warning"})],
+        &[json!({"name": "t"})],
+        UNIT_RESULT_OKAY,
+    );
+    assert!(ok);
+    let sent = sent.borrow();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0]["buildTargetPHID"], json!("PHID-L"));
+    assert_eq!(sent[0]["type"], json!("fail"));
+    assert_eq!(sent[1]["buildTargetPHID"], json!("PHID-U"));
+    assert_eq!(sent[1]["type"], json!("pass"));
+
+    let failing = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        Err("down".to_string())
+    };
+    assert!(!update_autotargets(
+        &failing,
+        "PHID-D-1",
+        &[],
+        &[],
+        UNIT_RESULT_OKAY
+    ));
+
+    let send_fails = |method: &str, _: &serde_json::Value| {
+        if method == "harbormaster.queryautotargets" {
+            Ok(json!({"targetMap": {"arcanist.lint": "PHID-L"}}))
+        } else {
+            Err("send down".to_string())
+        }
+    };
+    assert!(!update_autotargets(
+        &send_fails,
+        "PHID-D-1",
+        &[],
+        &[],
+        UNIT_RESULT_OKAY
+    ));
+
+    let no_targets = |_: &str, _: &serde_json::Value| Ok(json!({"targetMap": {}}));
+    assert!(update_autotargets(
+        &no_targets,
+        "PHID-D-1",
+        &[],
+        &[],
+        UNIT_RESULT_FAIL
+    ));
+}
+
+#[test]
+fn g1_staging_property_data_orders_keys() {
+    assert_eq!(
+        staging_property_data("pushed", &[json!({"ref": "r"})]),
+        "{\"status\":\"pushed\",\"refs\":[{\"ref\":\"r\"}]}"
+    );
+    assert_eq!(
+        staging_property_data("user.skip", &[]),
+        "{\"status\":\"user.skip\",\"refs\":[]}"
+    );
+}
+
 fn spec_input() -> DiffSpecInput {
     DiffSpecInput {
         source_machine: "devbox".to_string(),

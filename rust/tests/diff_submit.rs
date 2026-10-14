@@ -6,6 +6,139 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use arc_rs::{diff_submit, land_checks};
+
+/* G1 full-state integration tests: revision flow, away reviewers, autotargets. */
+
+#[test]
+fn g1_revision_list_and_several_error() {
+    let list = diff_submit::render_revision_list(&[(1, "First"), (22, "Second")]);
+    assert_eq!(list, "     - D1: First\n     - D22: Second\n");
+    let err = diff_submit::several_revisions_error(&list);
+    assert!(
+        err.starts_with("There are several revisions which match the working copy:"),
+        "{err}"
+    );
+    assert!(
+        err.ends_with("Use '--update' to choose one, or '--create' to create a new revision."),
+        "{err}"
+    );
+    assert_eq!(
+        diff_submit::UPDATE_PARAM_MUST_BE_NUMBER,
+        "Parameter to --update must be a Differential Revision number."
+    );
+    assert!(diff_submit::check_revision_ownership("A", "A", 5, "T").is_none());
+    let prompt = diff_submit::check_revision_ownership("A", "B", 5, "T").unwrap();
+    assert!(prompt.ends_with("Update this revision anyway?"), "{prompt}");
+    assert_eq!(
+        diff_submit::CREATED_DIFF_LEAD,
+        "Created a new Differential diff:"
+    );
+    assert_eq!(diff_submit::INCLUDED_CHANGES_LABEL, "Included changes:");
+}
+
+#[test]
+fn g1_away_reviewers_block_shapes() {
+    use serde_json::json;
+    assert_eq!(diff_submit::format_phab_date(0), "Thursday, Jan 1 1970");
+    let aways = vec![
+        diff_submit::AwayReviewer {
+            name: "a".to_string(),
+            until: json!(100),
+        },
+        diff_submit::AwayReviewer {
+            name: "b".to_string(),
+            until: json!(200),
+        },
+    ];
+    assert!(diff_submit::away_reviewers_block(&[], 0).is_none());
+    let all = diff_submit::away_reviewers_block(&aways, 2).unwrap();
+    assert!(
+        all.starts_with("All reviewers are away until Thursday, Jan 1 1970:\n\n"),
+        "{all}"
+    );
+    assert!(
+        all.contains("      b (until Thursday, Jan 1 1970)\n"),
+        "{all}"
+    );
+    let some = diff_submit::away_reviewers_block(&aways[..1], 3).unwrap();
+    assert!(
+        some.starts_with("Some reviewers are currently away:\n\n"),
+        "{some}"
+    );
+    assert_eq!(
+        diff_submit::CONTINUE_DESPITE_AWAY,
+        "Continue even though reviewers are unavailable?"
+    );
+    assert_eq!(
+        diff_submit::SPECIFY_AVAILABLE_REVIEWERS,
+        "Specify available reviewers and retry."
+    );
+}
+
+#[test]
+fn g1_update_autotargets_over_canned_seam() {
+    use serde_json::json;
+    let canned = Canned::new().with(
+        "harbormaster.queryautotargets",
+        r#"{"targetMap": {"arcanist.lint": "PHID-L", "arcanist.unit": "PHID-U"}}"#,
+    );
+    let call = |method: &str, params: &Value| canned.call(method, params);
+    // `sendmessage` has no canned response: the first send fails.
+    assert!(!diff_submit::update_autotargets(
+        &call,
+        "PHID-D",
+        &[],
+        &[],
+        diff_submit::UNIT_RESULT_OKAY
+    ));
+    assert_eq!(
+        canned.methods(),
+        vec![
+            "harbormaster.queryautotargets".to_string(),
+            "harbormaster.sendmessage".to_string()
+        ]
+    );
+
+    let canned = Canned::new()
+        .with(
+            "harbormaster.queryautotargets",
+            r#"{"targetMap": {"arcanist.lint": "PHID-L", "arcanist.unit": "PHID-U"}}"#,
+        )
+        .with("harbormaster.sendmessage", "null");
+    let call = |method: &str, params: &Value| canned.call(method, params);
+    let ok = diff_submit::update_autotargets(
+        &call,
+        "PHID-D",
+        &[json!({"severity": "error"})],
+        &[json!({"name": "t"})],
+        diff_submit::UNIT_RESULT_FAIL,
+    );
+    assert!(ok);
+    let sends = canned.params_for("harbormaster.sendmessage");
+    assert_eq!(sends.len(), 2);
+    assert_eq!(sends[0]["type"], json!("fail"));
+    assert_eq!(sends[1]["type"], json!("fail"));
+    assert_eq!(sends[0]["buildTargetPHID"], json!("PHID-L"));
+
+    let down = Canned::new().failing("harbormaster.queryautotargets", "down");
+    let call = |method: &str, params: &Value| down.call(method, params);
+    assert!(!diff_submit::update_autotargets(
+        &call,
+        "PHID-D",
+        &[],
+        &[],
+        diff_submit::UNIT_RESULT_OKAY
+    ));
+}
+
+#[test]
+fn g1_staging_property_data_orders_keys() {
+    use serde_json::json;
+    assert_eq!(
+        diff_submit::staging_property_data("pushed", &[json!({"ref": "r"})]),
+        "{\"status\":\"pushed\",\"refs\":[{\"ref\":\"r\"}]}"
+    );
+}
 use serde_json::Value;
 
 /// Canned conduit seam: records every call and replays fixed responses.

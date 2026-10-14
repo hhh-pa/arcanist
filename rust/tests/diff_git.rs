@@ -7,6 +7,152 @@ use std::process::Command;
 
 use arc_rs::diff;
 
+/* G1 full-state integration tests: hunk-carrying submits, full inspection. */
+
+fn g1_repo(name: &str) -> (Fixture, String, String) {
+    let fx = Fixture::named(name);
+    fx.init_repo();
+    fx.write("f.txt", "a\nb\nc\n");
+    let first = fx.commit_all("First");
+    fx.write("f.txt", "a\nB\nc\n");
+    let second = fx.commit_all("Second title");
+    fx.write("f.txt", "a\nB\nC\n");
+    (fx, first, second)
+}
+
+#[test]
+fn g1_full_submit_carries_hunks_over_seam() {
+    let (fx, _first, second) = g1_repo("g1-full-hunks");
+    let opts = options(None, false);
+    let input = diff::prepare_submit_full(fx.path(), &opts, &diff::SubmitMode::Only).unwrap();
+    assert!(
+        input.included_changes.starts_with("Included changes:"),
+        "{}",
+        input.included_changes
+    );
+    assert!(
+        input.included_changes.contains("f.txt"),
+        "{}",
+        input.included_changes
+    );
+
+    let canned = Canned::default().with("differential.creatediff", wire_fixture("creatediff"));
+    let call = |method: &str, params: &serde_json::Value| canned.call(method, params);
+    let report = diff::submit_over(&call, &input).unwrap();
+    assert!(report.contains("Differential diff"), "{report}");
+
+    let sent = canned.params_for("differential.creatediff");
+    assert_eq!(sent.len(), 1);
+    let changes = sent[0]["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0]["currentPath"], serde_json::json!("f.txt"));
+    let hunks = changes[0]["hunks"].as_array().unwrap();
+    assert!(!hunks.is_empty(), "{}", sent[0]);
+    assert!(
+        hunks[0]["corpus"].as_str().unwrap().contains("@@"),
+        "{}",
+        sent[0]
+    );
+    assert_eq!(
+        sent[0]["sourceControlBaseRevision"],
+        serde_json::json!(second)
+    );
+}
+
+#[test]
+fn g1_full_submit_draft_create_fails_legacy() {
+    let (fx, _, _) = g1_repo("g1-full-draft");
+    let mut opts = options(None, false);
+    opts.draft = true;
+    let err = diff::prepare_submit_full(fx.path(), &opts, &diff::SubmitMode::Create).unwrap_err();
+    assert!(err.contains("too old"), "{err}");
+}
+
+#[test]
+fn g1_full_submit_update_requires_message() {
+    let (fx, _, _) = g1_repo("g1-full-updmsg");
+    let err = diff::prepare_submit_full(
+        fx.path(),
+        &options(None, false),
+        &diff::SubmitMode::Update(5),
+    )
+    .unwrap_err();
+    assert!(err.contains("requires --message"), "{err}");
+}
+
+#[test]
+fn g1_full_submit_verbatim_update_sends_fields() {
+    let (fx, first, _) = g1_repo("g1-full-verbatim");
+    let mut opts = options(Some(&first), false);
+    opts.verbatim = true;
+    opts.message = Some("update notes".to_string());
+    let input = diff::prepare_submit_full(fx.path(), &opts, &diff::SubmitMode::Update(5)).unwrap();
+    assert_eq!(input.fields["title"], serde_json::json!("Second title"));
+    assert_eq!(input.message.as_deref(), Some("update notes"));
+    assert!(
+        input.properties.iter().any(|p| p.name == "local:commits"),
+        "{:?}",
+        input.properties.iter().map(|p| &p.name).collect::<Vec<_>>()
+    );
+
+    // Without `--verbatim`, updates carry no local fields.
+    let mut plain = options(Some(&first), false);
+    plain.message = Some("update notes".to_string());
+    let input = diff::prepare_submit_full(fx.path(), &plain, &diff::SubmitMode::Update(5)).unwrap();
+    assert_eq!(input.fields, serde_json::json!({}));
+}
+
+#[test]
+fn g1_full_submit_message_file_wins() {
+    let (fx, _, _) = g1_repo("g1-full-msgfile");
+    fx.write("msg.txt", "Filed title\n\nReviewers: alice\n");
+    let mut opts = options(None, false);
+    opts.message_file = Some(fx.path().join("msg.txt").to_string_lossy().to_string());
+    let input = diff::prepare_submit_full(fx.path(), &opts, &diff::SubmitMode::Create).unwrap();
+    assert_eq!(input.fields["title"], serde_json::json!("Filed title"));
+    assert_eq!(input.fields["reviewerPHIDs"], serde_json::json!(["alice"]));
+}
+
+#[test]
+fn g1_inspect_full_matches_inspect_for_git() {
+    let (fx, first, _) = g1_repo("g1-full-inspect");
+    let opts = options(Some(&first), false);
+    let classic = diff::inspect(fx.path(), &opts).unwrap();
+    let full = diff::inspect_full(fx.path(), &opts).unwrap();
+    assert_eq!(full, classic);
+
+    let json_opts = options(Some(&first), true);
+    let classic: serde_json::Value =
+        serde_json::from_slice(&diff::inspect(fx.path(), &json_opts).unwrap()).unwrap();
+    let full: serde_json::Value =
+        serde_json::from_slice(&diff::inspect_full(fx.path(), &json_opts).unwrap()).unwrap();
+    assert_eq!(full, classic);
+    assert_eq!(full["base"], serde_json::json!(first));
+    assert!(!full["files"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn g1_amend_worktree_message_git_rewrites() {
+    let fx = Fixture::named("g1-amend");
+    fx.init_repo();
+    fx.write("f.txt", "a\n");
+    fx.commit_all("old subject");
+    diff::amend_worktree_message_git(fx.path(), "new subject").unwrap();
+    assert_eq!(fx.git(&["log", "-1", "--format=%s"]), "new subject");
+}
+
+#[test]
+fn g1_full_spec_input_git_shape() {
+    let (fx, _, second) = g1_repo("g1-full-spec");
+    let spec = diff::full_spec_input(fx.path(), Some(diff::VcsKind::Git), &second).unwrap();
+    assert_eq!(spec.source_control_system.as_deref(), Some("git"));
+    assert_eq!(spec.branch.as_deref(), Some("main"));
+    assert_eq!(
+        spec.source_control_base_revision.as_deref(),
+        Some(second.as_str())
+    );
+}
+
 /// Unique scratch dir for one test; removed on drop (best effort).
 struct Fixture {
     dir: PathBuf,
