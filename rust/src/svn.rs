@@ -108,6 +108,37 @@ fn command_for(dir: &Path, svn: &SvnCommand, args: &[&str]) -> std::process::Com
     cmd
 }
 
+/// Spawn `cmd`, retrying briefly on ETXTBSY ("Text file busy"). A
+/// freshly written executable can still be settling when it is spawned
+/// (parallel tests, an editor saving a hook); the error is transient by
+/// nature, so retry bounded, then return the last error unchanged.
+fn spawn_output(cmd: &mut std::process::Command) -> Result<std::process::Output, std::io::Error> {
+    let mut attempt = 0;
+    loop {
+        match cmd.output() {
+            Err(error) if is_text_file_busy(&error) && attempt < 50 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// True for ETXTBSY (errno 26 on Linux and the BSDs, including macOS).
+/// Windows has no such spawn error.
+#[cfg(unix)]
+fn is_text_file_busy(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(26)
+}
+
+/// True for ETXTBSY (errno 26 on Linux and the BSDs, including macOS).
+/// Windows has no such spawn error.
+#[cfg(not(unix))]
+fn is_text_file_busy(_error: &std::io::Error) -> bool {
+    false
+}
+
 /// Run `svn` in `dir`, returning the raw output. Spawn failures become
 /// errors; non-zero exit statuses are left for the caller to interpret.
 /// Mirrors `git::output` (`ArcanistSubversionAPI.php:39-45`).
@@ -116,8 +147,7 @@ pub fn output_with(
     svn: &SvnCommand,
     args: &[&str],
 ) -> Result<std::process::Output, String> {
-    command_for(dir, svn, args)
-        .output()
+    spawn_output(&mut command_for(dir, svn, args))
         .map_err(|e| format!("failed to run {}: {e}", svn.program))
 }
 

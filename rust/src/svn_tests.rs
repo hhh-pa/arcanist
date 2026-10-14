@@ -8,31 +8,82 @@ struct FakeSvn {
 }
 
 impl FakeSvn {
+    /// Backend script shared by every test in the process: written once
+    /// under a lock, then executed read-only with per-test CWDs (canned
+    /// files and logs stay per-test, so isolation is unchanged). Sharing
+    /// removes the per-test write-then-exec window that flakes on Linux
+    /// with ETXTBSY under parallel load (same class as the hg fake).
+    fn shared_script() -> PathBuf {
+        static ONCE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        ONCE.get_or_init(|| {
+            let dir =
+                std::env::temp_dir().join(format!("arc-rs-svn-shared-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            #[cfg(windows)]
+            {
+                const FAKE: &str = include_str!("../tests/fixtures/vcs/fakesvn.bat");
+                let bat = dir.join("fakesvn.bat");
+                std::fs::write(&bat, FAKE).unwrap();
+                bat
+            }
+            #[cfg(not(windows))]
+            {
+                const FAKE: &str = include_str!("../tests/fixtures/vcs/fakesvn.sh");
+                let sh = dir.join("fakesvn.sh");
+                std::fs::write(&sh, FAKE).unwrap();
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perms = std::fs::metadata(&sh).unwrap().permissions();
+                    perms.set_mode(0o755);
+                    std::fs::set_permissions(&sh, perms).unwrap();
+                }
+                sh
+            }
+        })
+        .clone()
+    }
+
+    /// Shared fake unified `diff` (same write-once reasoning).
+    fn shared_diff() -> PathBuf {
+        static ONCE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        ONCE.get_or_init(|| {
+            let dir =
+                std::env::temp_dir().join(format!("arc-rs-svn-shared-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            #[cfg(windows)]
+            {
+                const FAKE: &str = include_str!("../tests/fixtures/vcs/fakediff.bat");
+                let bat = dir.join("fakediff.bat");
+                std::fs::write(&bat, FAKE).unwrap();
+                bat
+            }
+            #[cfg(not(windows))]
+            {
+                const FAKE: &str = include_str!("../tests/fixtures/vcs/fakediff.sh");
+                let sh = dir.join("fakediff.sh");
+                std::fs::write(&sh, FAKE).unwrap();
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perms = std::fs::metadata(&sh).unwrap().permissions();
+                    perms.set_mode(0o755);
+                    std::fs::set_permissions(&sh, perms).unwrap();
+                }
+                sh
+            }
+        })
+        .clone()
+    }
+
     fn named(tag: &str) -> Self {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("arc-rs-svn-{tag}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        let sh = Self::shared_script();
         #[cfg(windows)]
-        let svn = {
-            const FAKE: &str = include_str!("../tests/fixtures/vcs/fakesvn.bat");
-            let bat = dir.join("fakesvn.bat");
-            std::fs::write(&bat, FAKE).unwrap();
-            SvnCommand::custom("cmd", &["/C", &bat.to_string_lossy()])
-        };
+        let svn = SvnCommand::custom("cmd", &["/C", &sh.to_string_lossy()]);
         #[cfg(not(windows))]
-        let svn = {
-            const FAKE: &str = include_str!("../tests/fixtures/vcs/fakesvn.sh");
-            let sh = dir.join("fakesvn.sh");
-            std::fs::write(&sh, FAKE).unwrap();
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = std::fs::metadata(&sh).unwrap().permissions();
-                perms.set_mode(0o755);
-                std::fs::set_permissions(&sh, perms).unwrap();
-            }
-            SvnCommand::custom(&sh.to_string_lossy(), &[])
-        };
+        let svn = SvnCommand::custom(&sh.to_string_lossy(), &[]);
         Self { dir, svn }
     }
 
@@ -48,28 +99,17 @@ impl FakeSvn {
     }
 
     /// Install the fake unified `diff`, returning `(program, prefix)`.
-    fn install_diff(&self) -> (String, Vec<String>) {
+    fn install_diff() -> (String, Vec<String>) {
+        let sh = Self::shared_diff();
         #[cfg(windows)]
         {
-            const FAKE: &str = include_str!("../tests/fixtures/vcs/fakediff.bat");
-            let bat = self.dir.join("fakediff.bat");
-            std::fs::write(&bat, FAKE).unwrap();
             (
                 "cmd".to_string(),
-                vec!["/C".to_string(), bat.to_string_lossy().to_string()],
+                vec!["/C".to_string(), sh.to_string_lossy().to_string()],
             )
         }
         #[cfg(not(windows))]
         {
-            const FAKE: &str = include_str!("../tests/fixtures/vcs/fakediff.sh");
-            let sh = self.dir.join("fakediff.sh");
-            std::fs::write(&sh, FAKE).unwrap();
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = std::fs::metadata(&sh).unwrap().permissions();
-                perms.set_mode(0o755);
-                std::fs::set_permissions(&sh, perms).unwrap();
-            }
             (sh.to_string_lossy().to_string(), Vec::new())
         }
     }
@@ -749,7 +789,7 @@ fn diffs_copied_additions() {
         ".fakediff-canned",
         b"--- a/orig.txt\n+++ b/copied.txt\n@@ -1 +1 @@\n-old\n+new\n",
     );
-    let (program, prefix) = fake.install_diff();
+    let (program, prefix) = FakeSvn::install_diff();
     let prefix_refs: Vec<&str> = prefix.iter().map(String::as_str).collect();
     let config = SvnDiffConfig {
         context: 3,
@@ -783,7 +823,7 @@ fn diffs_copied_additions() {
     same.write(".fakesvn-info", INFO_TEXT.as_bytes());
     same.write(".fakesvn-cat-url", b"same\n");
     same.write(".fakediff-empty", b"");
-    let (program, prefix) = same.install_diff();
+    let (program, prefix) = FakeSvn::install_diff();
     let prefix_refs: Vec<&str> = prefix.iter().map(String::as_str).collect();
     let config = SvnDiffConfig {
         context: 3,
@@ -835,4 +875,62 @@ fn added_without_copy_uses_plain_diff() {
     .unwrap()
     .unwrap();
     assert_eq!(diff, b"canned\n");
+}
+
+/// ETXTBSY retry: hold a script open for writing, release it mid-retry,
+/// and the spawn must succeed. Unix-only (Windows has no ETXTBSY).
+#[cfg(unix)]
+#[test]
+fn output_retries_while_script_is_busy() {
+    let fake = FakeSvn::named("busy");
+    let sh = fake.dir.join("busy.sh");
+    std::fs::write(
+        &sh,
+        "#!/bin/sh
+echo hi
+",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&sh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&sh, perms).unwrap();
+    }
+    let held = std::fs::OpenOptions::new().write(true).open(&sh).unwrap();
+    let svn = SvnCommand::custom(&sh.to_string_lossy(), &[]);
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        drop(held);
+    });
+    let out = output_with(&fake.dir, &svn, &[]).unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
+    releaser.join().unwrap();
+}
+
+/// A permanently busy script still fails (after the bound) with the
+/// original error shape.
+#[cfg(unix)]
+#[test]
+fn output_gives_up_on_permanently_busy_script() {
+    let fake = FakeSvn::named("stuck");
+    let sh = fake.dir.join("stuck.sh");
+    std::fs::write(
+        &sh,
+        "#!/bin/sh
+echo hi
+",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&sh).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&sh, perms).unwrap();
+    }
+    let _held = std::fs::OpenOptions::new().write(true).open(&sh).unwrap();
+    let svn = SvnCommand::custom(&sh.to_string_lossy(), &[]);
+    let err = output_with(&fake.dir, &svn, &[]).unwrap_err();
+    assert!(err.contains("failed to run"), "{err}");
 }
