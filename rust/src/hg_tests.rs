@@ -1219,3 +1219,60 @@ fn paths_with_mask_selects_flagged_paths_in_order() {
     );
     assert!(paths_with_mask(&status, FLAG_CONFLICT).is_empty());
 }
+
+#[test]
+fn finds_hg_root_upward() {
+    let base = std::env::temp_dir().join(format!("arc-rs-hg-root-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let nested = base.join("a").join("b");
+    std::fs::create_dir_all(nested.join(".hg")).unwrap();
+    assert_eq!(find_root(&nested), Some(nested.clone()));
+    assert_eq!(find_root(&base), None);
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn migrates_legacy_scratch_dir() {
+    let base = std::env::temp_dir().join(format!("arc-rs-hg-migrate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let root = base.join("wc");
+    let meta = root.join(".hg");
+    std::fs::create_dir_all(base.join("old").join(".arc")).unwrap();
+    std::fs::write(base.join("old").join(".arc").join("x"), "data").unwrap();
+    std::fs::write(base.join("old").join(".arc").join("y"), "more").unwrap();
+    assert!(migrate_scratch_dir(&base.join("old"), &meta));
+    assert_eq!(read_scratch_file(&meta, "x").as_deref(), Some("data"));
+    assert_eq!(read_scratch_file(&meta, "y").as_deref(), Some("more"));
+    assert!(!base.join("old").join(".arc").exists());
+
+    // Nothing to migrate: missing old dir, or an existing new dir.
+    assert!(migrate_scratch_dir(&base.join("absent"), &meta));
+    std::fs::create_dir_all(base.join("both").join(".arc")).unwrap();
+    std::fs::write(base.join("both").join(".arc").join("x"), "old").unwrap();
+    assert!(write_scratch_file(&meta, "x", "new"));
+    assert!(migrate_scratch_dir(&base.join("both"), &meta));
+    assert_eq!(read_scratch_file(&meta, "x").as_deref(), Some("new"));
+    assert!(base.join("both").join(".arc").join("x").exists());
+
+    // A subdirectory aborts the migration without deleting anything.
+    std::fs::create_dir_all(base.join("sub").join(".arc").join("dir")).unwrap();
+    std::fs::write(base.join("sub").join(".arc").join("x"), "data").unwrap();
+    assert!(!migrate_scratch_dir(
+        &base.join("sub"),
+        &base.join("fresh-meta")
+    ));
+    assert!(base.join("sub").join(".arc").join("x").exists());
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn bookmarks_and_branches_run_through_the_backend() {
+    let fake = FakeHg::named("marks");
+    let out = get_bookmarks_with(&fake.dir, &fake.hg).unwrap();
+    assert!(out.is_empty());
+    let out = get_branches_with(&fake.dir, &fake.hg).unwrap();
+    assert!(out.is_empty());
+    let log = fake.log();
+    assert!(log.contains("bookmarks"), "{log}");
+    assert!(log.contains("branches"), "{log}");
+}

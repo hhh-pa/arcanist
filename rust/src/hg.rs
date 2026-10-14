@@ -31,7 +31,10 @@
 //!   `ArcanistRepositoryAPI.php:642-658`) are excluded; explicit and
 //!   automatic base commits are ported.
 //! - Scratch `.arc` to `.hg/arc` migration
-//!   (`ArcanistRepositoryAPI.php:551-562`) is not performed.
+//!   (`ArcanistRepositoryAPI.php:551-562`) is explicit: [`migrate_scratch_dir`]
+//!   moves the files on demand instead of once per process, and it leaves
+//!   the old directory alone when it holds anything but plain files (PHP
+//!   would crash mid-migration there).
 //! - Conduit, marker/remote/graph queries, land/work engines, commit refs,
 //!   and `getAllLocalChanges` (needs `ArcanistDiffParser`, which has no
 //!   wired equivalent) are excluded; see the crate brief for line refs.
@@ -283,6 +286,15 @@ pub fn get_source_control_system_name() -> &'static str {
 #[must_use]
 pub fn get_metadata_path(root: &Path) -> PathBuf {
     root.join(".hg")
+}
+
+/// Walk up from `dir` looking for a Mercurial working copy root (the
+/// directory holding `.hg`), or `None` outside one.
+#[must_use]
+pub fn find_root(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .find(|dir| dir.join(".hg").exists())
+        .map(Path::to_path_buf)
 }
 
 /// `getSourceControlPath` (`ArcanistMercurialAPI.php:66-68`).
@@ -1272,6 +1284,34 @@ pub fn get_branch_name_with(dir: &Path, hg: &HgCommand) -> Result<String, String
 /// `getBranchName` with the system binary.
 pub fn get_branch_name(dir: &Path) -> Result<String, String> {
     get_branch_name_with(dir, &HgCommand::system())
+}
+
+/// Raw `hg bookmarks` output: one `[*] <name> <rev>:<node>` entry per
+/// line, `*` marking the active bookmark.
+///
+/// Divergence: PHP lists markers through the `arc-hg` extension
+/// (`hg arc-ls-markers`, `ArcanistMercurialRepositoryMarkerQuery.php`),
+/// which arc-rs does not require; plain `hg bookmarks` carries the same
+/// names, heads, and active mark.
+pub fn get_bookmarks_with(dir: &Path, hg: &HgCommand) -> Result<String, String> {
+    stdout_text_with(dir, hg, &["bookmarks"])
+}
+
+/// Raw `hg bookmarks` output with the system binary.
+pub fn get_bookmarks(dir: &Path) -> Result<String, String> {
+    get_bookmarks_with(dir, &HgCommand::system())
+}
+
+/// Raw `hg branches` output, parsed by [`parse_mercurial_branches`].
+///
+/// Divergence: same `arc-hg` simplification as [`get_bookmarks_with`].
+pub fn get_branches_with(dir: &Path, hg: &HgCommand) -> Result<String, String> {
+    stdout_text_with(dir, hg, &["branches"])
+}
+
+/// Raw `hg branches` output with the system binary.
+pub fn get_branches(dir: &Path) -> Result<String, String> {
+    get_branches_with(dir, &HgCommand::system())
 }
 
 /// `getSourceControlBaseRevision` for a resolved base commit
@@ -2395,11 +2435,61 @@ pub fn get_display_hash(hash: &str) -> String {
     hash.chars().take(12).collect()
 }
 
-/// `getScratchFilePath` (`ArcanistRepositoryAPI.php:538-565`), without the
-/// one-time `.arc` migration.
+/// `getScratchFilePath` (`ArcanistRepositoryAPI.php:538-565`).
+///
+/// The one-time `.arc` migration there is explicit here: call
+/// [`migrate_scratch_dir`] before the first scratch access.
 #[must_use]
 pub fn scratch_file_path(metadata: &Path, name: &str) -> PathBuf {
     metadata.join("arc").join(name)
+}
+
+/// Top-level file names under `old`, or `None` when the directory cannot
+/// be listed or holds anything but plain files.
+fn migration_file_names(old: &Path) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(old).ok()? {
+        let entry = entry.ok()?;
+        if !entry.file_type().ok()?.is_file() {
+            return None;
+        }
+        names.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    names.sort();
+    Some(names)
+}
+
+/// Move the legacy `<root>/.arc` scratch directory to `<metadata>/arc`.
+///
+/// PHP: the one-time migration inside `getScratchFilePath`
+/// (`ArcanistRepositoryAPI.php:538-565`). When the old directory exists
+/// and the new one does not, every top-level file moves over and the old
+/// directory is removed; otherwise nothing happens. Returns true when the
+/// new location is usable afterwards (migrated, or nothing to migrate).
+///
+/// Divergence: PHP runs this once per process behind a static flag; the
+/// `<new> missing` check makes repeats no-ops anyway, so this runs on
+/// demand. PHP also crashes when the old directory holds a subdirectory;
+/// this leaves the old directory untouched instead, never deleting data
+/// the migration did not move.
+pub fn migrate_scratch_dir(work_root: &Path, metadata: &Path) -> bool {
+    let old = work_root.join(".arc");
+    let new = metadata.join("arc");
+    if !old.is_dir() || new.exists() {
+        return true;
+    }
+    let Some(names) = migration_file_names(&old) else {
+        return false;
+    };
+    if std::fs::create_dir_all(&new).is_err() {
+        return false;
+    }
+    for name in &names {
+        if std::fs::copy(old.join(name), new.join(name)).is_err() {
+            return false;
+        }
+    }
+    std::fs::remove_dir_all(&old).is_ok() && !old.exists()
 }
 
 /// `readScratchFile` (`ArcanistRepositoryAPI.php:436-453`).

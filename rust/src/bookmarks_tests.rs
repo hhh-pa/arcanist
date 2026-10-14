@@ -18,17 +18,38 @@ fn scratch(name: &str) -> std::path::PathBuf {
     dir
 }
 
+fn options(json: bool, conduit_uri: Option<&str>) -> Options {
+    Options {
+        json,
+        conduit_uri: conduit_uri.map(str::to_string),
+    }
+}
+
 #[test]
 fn parses_defaults() {
-    assert_eq!(parse_options(&args(&[])), Ok(Some(Options { json: false })));
+    assert_eq!(parse_options(&args(&[])), Ok(Some(options(false, None))));
 }
 
 #[test]
 fn parses_json() {
     assert_eq!(
         parse_options(&args(&["--json"])),
-        Ok(Some(Options { json: true }))
+        Ok(Some(options(true, None)))
     );
+}
+
+#[test]
+fn parses_conduit_uri() {
+    assert_eq!(
+        parse_options(&args(&["--conduit-uri", "http://x/"])),
+        Ok(Some(options(false, Some("http://x/"))))
+    );
+    assert_eq!(
+        parse_options(&args(&["--conduit-uri=http://x/"])),
+        Ok(Some(options(false, Some("http://x/"))))
+    );
+    assert!(parse_options(&args(&["--conduit-uri"])).is_err());
+    assert!(parse_options(&args(&["--conduit-uri="])).is_err());
 }
 
 #[test]
@@ -58,12 +79,14 @@ fn parses_bookmark_entries() {
                 active: true,
                 rev: "12".to_string(),
                 node: "abc123def456".to_string(),
+                revisions: Vec::new(),
             },
             Bookmark {
                 name: "other".to_string(),
                 active: false,
                 rev: "3".to_string(),
                 node: "789abc".to_string(),
+                revisions: Vec::new(),
             },
         ]
     );
@@ -100,6 +123,20 @@ fn finds_hg_root_upward() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+fn annotated(name: &str) -> Bookmark {
+    Bookmark {
+        name: name.to_string(),
+        active: false,
+        rev: "12".to_string(),
+        node: "abc123".to_string(),
+        revisions: vec![amend::AnnotatedRevision {
+            monogram: "D123".to_string(),
+            status: "Accepted".to_string(),
+            title: "Title".to_string(),
+        }],
+    }
+}
+
 #[test]
 fn formats_text_with_active_marker() {
     let marks = vec![
@@ -108,17 +145,27 @@ fn formats_text_with_active_marker() {
             active: true,
             rev: "12".to_string(),
             node: "abc123".to_string(),
+            revisions: Vec::new(),
         },
         Bookmark {
             name: "other".to_string(),
             active: false,
             rev: "3".to_string(),
             node: "789abc".to_string(),
+            revisions: Vec::new(),
         },
     ];
     assert_eq!(
         format_text(&marks),
         "* active 12:abc123\n  other 3:789abc\n"
+    );
+}
+
+#[test]
+fn formats_text_with_annotations() {
+    assert_eq!(
+        format_text(&[annotated("mark")]),
+        "  mark 12:abc123 [D123 Accepted]\n"
     );
 }
 
@@ -129,6 +176,7 @@ fn formats_json_objects() {
         active: true,
         rev: "12".to_string(),
         node: "abc123".to_string(),
+        revisions: Vec::new(),
     }];
     assert_eq!(
         format_json(&marks),
@@ -137,6 +185,20 @@ fn formats_json_objects() {
             "active": true,
             "rev": "12",
             "node": "abc123",
+            "revisions": [],
+        }])
+    );
+}
+
+#[test]
+fn formats_json_with_annotations() {
+    let doc = format_json(&[annotated("mark")]);
+    assert_eq!(
+        doc[0]["revisions"],
+        serde_json::json!([{
+            "monogram": "D123",
+            "status": "Accepted",
+            "title": "Title",
         }])
     );
 }

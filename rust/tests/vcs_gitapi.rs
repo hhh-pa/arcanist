@@ -447,3 +447,56 @@ fn repo_kind_probes() {
     assert!(!git::is_perforce_remote(dir, "p4"));
     assert!(!git::is_git_lfs_working_copy(dir));
 }
+
+/// Point `git svn` at a shell function instead of git-svn: aliases win
+/// over external subcommands, so the helpers below run hermetically (no
+/// git-svn/perl needed, and a real git-svn install cannot leak in).
+fn alias_git_svn(dir: &Path, shell: &str) {
+    run_git(dir, &["config", "alias.svn", shell]);
+}
+
+#[test]
+fn git_svn_find_rev_through_alias() {
+    let repo = init_repo("gitsvn");
+    let dir = repo.path();
+    let hash = head(dir);
+    alias_git_svn(dir, &format!("!f() {{ echo {hash}; }}; f"));
+    assert_eq!(git::execute_svn_find_rev(dir, "r42", "Git").unwrap(), hash);
+    assert_eq!(git::hash_from_svn_revision_number(dir, "42").unwrap(), hash);
+
+    alias_git_svn(dir, "!f() { echo 456; }; f");
+    assert_eq!(
+        git::svn_revision_number_from_hash(dir, &hash).unwrap(),
+        "456"
+    );
+    // A partial rebuild prints progress first: the second-to-last line
+    // wins, mirroring `executeSVNFindRev`.
+    alias_git_svn(dir, &format!("!f() {{ echo rebuilding; echo {hash}; }}; f"));
+    assert_eq!(git::execute_svn_find_rev(dir, "r42", "Git").unwrap(), hash);
+}
+
+#[test]
+fn git_svn_find_rev_missing_reports_both_directions() {
+    let repo = init_repo("gitsvn-missing");
+    let dir = repo.path();
+    alias_git_svn(dir, "!f() { exit 1; }; f");
+    assert_eq!(
+        git::execute_svn_find_rev(dir, "r42", "Git").unwrap_err(),
+        "Cannot find the Git equivalent of r42."
+    );
+    assert_eq!(
+        git::hash_from_svn_revision_number(dir, "42").unwrap_err(),
+        "Cannot find the Git equivalent of r42."
+    );
+    let hash = head(dir);
+    assert_eq!(
+        git::svn_revision_number_from_hash(dir, &hash).unwrap_err(),
+        format!("Cannot find the SVN equivalent of {hash}.")
+    );
+    // Empty output is missing too.
+    alias_git_svn(dir, "!f() { :; }; f");
+    assert_eq!(
+        git::execute_svn_find_rev(dir, "r42", "Git").unwrap_err(),
+        "Cannot find the Git equivalent of r42."
+    );
+}
