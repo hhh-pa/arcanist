@@ -51,6 +51,10 @@ jobs:
     name: quality gates
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read # checkout
+      actions: write # coverage artifact + GHA image cache
+      pull-requests: write # sticky coverage comment
     env:
       # Image repo for the cached gate image (public, so pulls stay
       # anonymous). Override with the GATE_IMAGE repo variable; pushes need
@@ -114,7 +118,7 @@ jobs:
           fi
       - name: publish coverage summary
         if: always()
-        run: python3 scripts/ci/lib/coverage-summary.py rust/target/llvm-cov/lcov.info >> "$GITHUB_STEP_SUMMARY"
+        run: python3 scripts/ci/lib/coverage-summary.py --out rust/target/llvm-cov/coverage-comment.md rust/target/llvm-cov/lcov.info >> "$GITHUB_STEP_SUMMARY"
       - name: upload coverage report
         if: always() && hashFiles('rust/target/llvm-cov/lcov.info') != ''
         uses: actions/upload-artifact@v4
@@ -122,6 +126,20 @@ jobs:
           name: coverage-report
           path: rust/target/llvm-cov/
           retention-days: 30
+      - name: coverage PR comment
+        if: always() && github.event_name == 'pull_request' && hashFiles('rust/target/llvm-cov/coverage-comment.md') != ''
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: coverage
+          path: rust/target/llvm-cov/coverage-comment.md
+          skip_unchanged: true
+      - name: upload coverage to codecov
+        if: always() && hashFiles('rust/target/llvm-cov/lcov.info') != ''
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: rust/target/llvm-cov/lcov.info
+          fail_ci_if_error: false
 
   build-release:
     name: release (${{ matrix.os }})
