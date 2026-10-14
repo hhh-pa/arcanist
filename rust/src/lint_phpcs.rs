@@ -286,7 +286,6 @@ fn xml_unescape(text: &str) -> String {
         out.push_str(&rest[..amp]);
         rest = &rest[amp..];
         let Some(semi) = rest.find(';') else {
-            out.push_str(rest);
             break;
         };
         if semi > 12 {

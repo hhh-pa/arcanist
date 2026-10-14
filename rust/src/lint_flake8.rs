@@ -67,25 +67,32 @@ impl Linter for Flake8Linter {
         if !is_supported_path(path) || data.contains(&0) {
             return Vec::new();
         }
-        let Some(tool) = binary_on_path(BINARY) else {
-            // Inactive when the tool is not installed, mirroring PHP.
-            return Vec::new();
-        };
-        let Some(scratch) = write_scratch("flake8", ".py", path, data) else {
-            return Vec::new();
-        };
-        let output = Command::new(&tool)
-            .args(mandatory_flags())
-            .arg(&scratch.file)
-            .current_dir(&scratch.cwd)
-            .output();
-        let mut messages = Vec::new();
-        if let Ok(output) = output {
-            messages = parse_output(path, &String::from_utf8_lossy(&output.stdout));
-        }
-        scratch.cleanup();
-        messages
+        let tool = binary_on_path(BINARY);
+        lint_with_binary(path, data, tool.as_deref())
     }
+}
+
+/// Lint with an explicit tool binary (test seam mirroring bundle E);
+/// `None` means the tool is not installed and reports nothing.
+pub fn lint_with_binary(path: &str, data: &[u8], binary: Option<&Path>) -> Vec<LintMessage> {
+    let Some(tool) = binary else {
+        // Inactive when the tool is not installed, mirroring PHP.
+        return Vec::new();
+    };
+    let Some(scratch) = write_scratch("flake8", ".py", path, data) else {
+        return Vec::new();
+    };
+    let output = Command::new(tool)
+        .args(mandatory_flags())
+        .arg(&scratch.file)
+        .current_dir(&scratch.cwd)
+        .output();
+    let mut messages = Vec::new();
+    if let Ok(output) = output {
+        messages = parse_output(path, &String::from_utf8_lossy(&output.stdout));
+    }
+    scratch.cleanup();
+    messages
 }
 
 /// Parse `flake8` stdout into messages for `path`, mirroring PHP
@@ -178,9 +185,13 @@ fn binary_on_path(name: &str) -> Option<PathBuf> {
         }
         return None;
     }
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
+    std::env::var_os("PATH").and_then(|path| binary_in(&path))
+}
+
+/// Look the tool up in `path_env` (test seam; production passes `$PATH`).
+fn binary_in(path_env: &std::ffi::OsStr) -> Option<PathBuf> {
+    for dir in std::env::split_paths(path_env) {
+        let candidate = dir.join(BINARY);
         if candidate.is_file() {
             return Some(candidate);
         }

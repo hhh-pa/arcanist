@@ -37,6 +37,110 @@ fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(Path::new("tests/fixtures/lintB").join(name)).unwrap()
 }
 
+/// A fake external tool: a script that records its argv, replays canned
+/// stdout/stderr, and exits with a fixed status.
+struct FakeTool {
+    dir: TempDir,
+    script: PathBuf,
+}
+
+impl FakeTool {
+    fn script(&self) -> &Path {
+        &self.script
+    }
+
+    fn args_text(&self) -> String {
+        std::fs::read_to_string(self.dir.path().join("args.txt")).unwrap_or_default()
+    }
+}
+
+fn fake_tool(tag: &str, stdout_text: &str, stderr_text: &str, exit_code: i32) -> FakeTool {
+    let dir = TempDir::new(tag);
+    std::fs::write(dir.path().join("out.txt"), stdout_text).unwrap();
+    std::fs::write(dir.path().join("err.txt"), stderr_text).unwrap();
+    let script = write_fake_script(
+        &dir,
+        !stdout_text.is_empty(),
+        !stderr_text.is_empty(),
+        exit_code,
+    );
+    FakeTool { dir, script }
+}
+
+#[cfg(windows)]
+fn write_fake_script(
+    dir: &TempDir,
+    emit_stdout: bool,
+    emit_stderr: bool,
+    exit_code: i32,
+) -> PathBuf {
+    let path = dir.path().join("tool.bat");
+    let out = dir.path().join("out.txt").display().to_string();
+    let err = dir.path().join("err.txt").display().to_string();
+    let args = dir.path().join("args.txt").display().to_string();
+    let mut body = format!("@echo off\r\necho %* > \"{args}\"\r\n");
+    if emit_stdout {
+        body.push_str(&format!("type \"{out}\"\r\n"));
+    }
+    if emit_stderr {
+        body.push_str(&format!("type \"{err}\" 1>&2\r\n"));
+    }
+    body.push_str(&format!("exit /b {exit_code}\r\n"));
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+#[cfg(not(windows))]
+fn write_fake_script(
+    dir: &TempDir,
+    emit_stdout: bool,
+    emit_stderr: bool,
+    exit_code: i32,
+) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.path().join("tool.sh");
+    let out = dir.path().join("out.txt").display().to_string();
+    let err = dir.path().join("err.txt").display().to_string();
+    let args = dir.path().join("args.txt").display().to_string();
+    let mut body = format!("#!/bin/sh\necho \"$@\" > \"{args}\"\n");
+    if emit_stdout {
+        body.push_str(&format!("cat \"{out}\"\n"));
+    }
+    if emit_stderr {
+        body.push_str(&format!("cat \"{err}\" >&2\n"));
+    }
+    body.push_str(&format!("exit {exit_code}\n"));
+    std::fs::write(&path, &body).unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
+fn echo_parser(
+    path: &str,
+    exit_code: i32,
+    stdout: &str,
+    _stderr: &str,
+) -> Option<Vec<lint::LintMessage>> {
+    Some(vec![lint::LintMessage {
+        path: path.to_string(),
+        line: 1,
+        col: 1,
+        code: format!("ECHO.exit{exit_code}"),
+        severity: "error".to_string(),
+        name: "echo".to_string(),
+        description: stdout.trim().to_string(),
+    }])
+}
+
+fn tool_config(tool: &FakeTool) -> lint_external::ExternalToolConfig {
+    lint_external::ExternalToolConfig {
+        binaries: vec![tool.script().display().to_string()],
+        ..Default::default()
+    }
+}
+
 #[test]
 fn registry_names_match_config_names() {
     assert_eq!(lint_spelling::SpellingLinter::new().name(), "SPELL");
@@ -391,4 +495,96 @@ fn bundle_linters_run_together_in_one_engine() {
             .lint_bytes("clean.txt", b"all good here\n")
             .is_empty()
     );
+}
+
+#[test]
+fn configured_runner_executes_binary_with_flags() {
+    let tool = fake_tool("external-run", "tool says hi\n", "", 0);
+    let mut config = tool_config(&tool);
+    config.flags = vec!["--check".to_string()];
+    let linter = lint_external::ExternalLinter::with_config(config, echo_parser);
+    let messages = linter.lint_bytes("any.txt", b"data\n");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].path, "any.txt");
+    assert_eq!(messages[0].code, "ECHO.exit0");
+    assert_eq!(messages[0].description, "tool says hi");
+    let argv = tool.args_text();
+    assert!(argv.contains("--check"), "{argv}");
+    assert!(argv.contains("any.txt"), "{argv}");
+}
+
+#[test]
+fn version_gate_silences_mismatch_and_runs_match() {
+    let tool = fake_tool("external-ver", "v\n", "", 1);
+    let mut mismatch = tool_config(&tool);
+    mismatch.version_requirement = Some(">= 99.0".to_string());
+    mismatch.known_version = Some("1.0".to_string());
+    let linter = lint_external::ExternalLinter::with_config(mismatch, echo_parser);
+    assert!(linter.lint_bytes("any.txt", b"data\n").is_empty());
+
+    let mut matched = tool_config(&tool);
+    matched.version_requirement = Some(">= 1.0".to_string());
+    matched.known_version = Some("1.0".to_string());
+    let linter = lint_external::ExternalLinter::with_config(matched, echo_parser);
+    let messages = linter.lint_bytes("any.txt", b"data\n");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].description, "v");
+}
+
+#[test]
+fn interpreter_mode_runs_through_interpreter() {
+    let tool = fake_tool("external-interp", "via interp\n", "", 0);
+    let script = tool.script().display().to_string();
+    let config = lint_external::ExternalToolConfig {
+        binaries: vec![script.clone()],
+        interpreters: vec![script],
+        ..Default::default()
+    };
+    let linter = lint_external::ExternalLinter::with_config(config, echo_parser);
+    let messages = linter.lint_bytes("any.txt", b"data\n");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].description, "via interp");
+}
+
+#[test]
+fn missing_candidates_name_script_or_binary() {
+    let missing_interp = lint_external::ExternalToolConfig {
+        binaries: vec!["x".to_string()],
+        interpreters: vec!["arc-rs-missing-interp".to_string()],
+        ..Default::default()
+    };
+    let err = lint_external::check_binary_configuration(&missing_interp).unwrap_err();
+    assert!(err.contains("interpreter"), "{err}");
+
+    let tool = fake_tool("external-resolve", "", "", 0);
+    let missing_script = lint_external::ExternalToolConfig {
+        binaries: vec!["arc-rs-missing-script".to_string()],
+        interpreters: vec![tool.script().display().to_string()],
+        ..Default::default()
+    };
+    let err = lint_external::check_binary_configuration(&missing_script).unwrap_err();
+    assert!(err.contains("script"), "{err}");
+
+    let missing_binary = lint_external::ExternalToolConfig {
+        binaries: vec!["arc-rs-missing-binary".to_string()],
+        ..Default::default()
+    };
+    let err = lint_external::check_binary_configuration(&missing_binary).unwrap_err();
+    assert!(err.contains("binary"), "{err}");
+}
+
+#[test]
+fn binary_exists_edges() {
+    assert!(!lint_external::binary_exists(""));
+    assert!(!lint_external::binary_exists("arc-rs-definitely-missing"));
+    let shell = if cfg!(windows) { "cmd" } else { "sh" };
+    assert!(lint_external::binary_exists(shell));
+}
+
+#[test]
+fn unknown_version_reports_upgrade_hint() {
+    let err =
+        lint_external::check_version_requirement("L", "b", None, ">= 1.0", Some("run update"))
+            .unwrap_err();
+    assert!(err.contains("TO UPGRADE: run update"), "{err}");
 }

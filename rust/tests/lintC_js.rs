@@ -438,3 +438,250 @@ fn unparseable_output_is_a_clear_error() {
         messages[0].description
     );
 }
+
+fn assert_tool_failure(module: &str, code: &str, messages: &[arc_rs::lint::LintMessage]) {
+    assert_eq!(messages.len(), 1, "{module}: expected one failure message");
+    assert_eq!(messages[0].code, code, "{module}: failure code");
+    assert_eq!(messages[0].severity, "error", "{module}: failure severity");
+    assert_eq!(
+        (messages[0].line, messages[0].col),
+        (1, 1),
+        "{module}: failure position"
+    );
+    assert!(
+        messages[0].description.contains("exit 3"),
+        "{module}: {}",
+        messages[0].description
+    );
+}
+
+#[test]
+fn jshint_tool_failure_details() {
+    let boom = fake_tool("fail-jshint", "", "boom", 3);
+    let messages =
+        lint_jshint::JshintLinter::with_binary(boom.script()).lint_bytes("a.js", b"var x = 1;\n");
+    assert_tool_failure("jshint", "JSHint", &messages);
+    assert!(
+        messages[0].description.contains("boom"),
+        "{}",
+        messages[0].description
+    );
+
+    let empty = fake_tool("fail-empty-jshint", "", "", 3);
+    let messages =
+        lint_jshint::JshintLinter::with_binary(empty.script()).lint_bytes("a.js", b"var x = 1;\n");
+    assert_tool_failure("jshint", "JSHint", &messages);
+    assert!(
+        messages[0].description.contains("no output"),
+        "{}",
+        messages[0].description
+    );
+
+    let long = fake_tool("fail-long-jshint", "", &"x".repeat(400), 3);
+    let messages =
+        lint_jshint::JshintLinter::with_binary(long.script()).lint_bytes("a.js", b"var x = 1;\n");
+    assert_tool_failure("jshint", "JSHint", &messages);
+    assert!(
+        messages[0].description.contains("..."),
+        "{}",
+        messages[0].description
+    );
+}
+
+#[test]
+fn jscs_tool_failure_details() {
+    let boom = fake_tool("fail-jscs", "", "boom", 3);
+    let messages =
+        lint_jscs::JscsLinter::with_binary(boom.script()).lint_bytes("a.js", b"var x = 1;\n");
+    assert_tool_failure("jscs", "JSCS", &messages);
+    assert!(
+        messages[0].description.contains("boom"),
+        "{}",
+        messages[0].description
+    );
+
+    let empty = fake_tool("fail-empty-jscs", "", "", 3);
+    let messages =
+        lint_jscs::JscsLinter::with_binary(empty.script()).lint_bytes("a.js", b"var x = 1;\n");
+    assert_tool_failure("jscs", "JSCS", &messages);
+    assert!(
+        messages[0].description.contains("no output"),
+        "{}",
+        messages[0].description
+    );
+
+    let long = fake_tool("fail-long-jscs", "", &"x".repeat(400), 3);
+    let messages =
+        lint_jscs::JscsLinter::with_binary(long.script()).lint_bytes("a.js", b"var x = 1;\n");
+    assert_tool_failure("jscs", "JSCS", &messages);
+    assert!(
+        messages[0].description.contains("..."),
+        "{}",
+        messages[0].description
+    );
+}
+
+#[test]
+fn jsonlint_tool_failure_details() {
+    let boom = fake_tool("fail-jsonlint", "", "boom", 3);
+    let messages = lint_jsonlint::JsonlintLinter::with_binary(boom.script())
+        .lint_bytes("a.json", b"{\"a\": 1}\n");
+    assert_tool_failure("jsonlint", "JSON", &messages);
+    assert!(
+        messages[0].description.contains("boom"),
+        "{}",
+        messages[0].description
+    );
+
+    let empty = fake_tool("fail-empty-jsonlint", "", "", 3);
+    let messages = lint_jsonlint::JsonlintLinter::with_binary(empty.script())
+        .lint_bytes("a.json", b"{\"a\": 1}\n");
+    assert_tool_failure("jsonlint", "JSON", &messages);
+    assert!(
+        messages[0].description.contains("no output"),
+        "{}",
+        messages[0].description
+    );
+
+    let long = fake_tool("fail-long-jsonlint", "", &"x".repeat(400), 3);
+    let messages = lint_jsonlint::JsonlintLinter::with_binary(long.script())
+        .lint_bytes("a.json", b"{\"a\": 1}\n");
+    assert_tool_failure("jsonlint", "JSON", &messages);
+    assert!(
+        messages[0].description.contains("..."),
+        "{}",
+        messages[0].description
+    );
+}
+
+#[test]
+fn csslint_tool_failure_details() {
+    let boom = fake_tool("fail-csslint", "", "boom", 3);
+    let messages = lint_csslint::CsslintLinter::with_binary(boom.script())
+        .lint_bytes("a.css", b"a { color: red; }\n");
+    assert_tool_failure("csslint", "CSSLint", &messages);
+    assert!(
+        messages[0].description.contains("boom"),
+        "{}",
+        messages[0].description
+    );
+
+    let empty = fake_tool("fail-empty-csslint", "", "", 3);
+    let messages = lint_csslint::CsslintLinter::with_binary(empty.script())
+        .lint_bytes("a.css", b"a { color: red; }\n");
+    assert_tool_failure("csslint", "CSSLint", &messages);
+    assert!(
+        messages[0].description.contains("no output"),
+        "{}",
+        messages[0].description
+    );
+
+    let long = fake_tool("fail-long-csslint", "", &"x".repeat(400), 3);
+    let messages = lint_csslint::CsslintLinter::with_binary(long.script())
+        .lint_bytes("a.css", b"a { color: red; }\n");
+    assert_tool_failure("csslint", "CSSLint", &messages);
+    assert!(
+        messages[0].description.contains("..."),
+        "{}",
+        messages[0].description
+    );
+}
+
+#[test]
+fn lessc_tool_failure_details() {
+    let boom = fake_tool("fail-lessc", "", "boom", 3);
+    let messages = lint_lessc::LesscLinter::with_binary(boom.script())
+        .lint_bytes("a.less", b"a { width: 1; }\n");
+    assert_tool_failure("lessc", "LESSC", &messages);
+    assert!(
+        messages[0].description.contains("boom"),
+        "{}",
+        messages[0].description
+    );
+
+    let empty = fake_tool("fail-empty-lessc", "", "", 3);
+    let messages = lint_lessc::LesscLinter::with_binary(empty.script())
+        .lint_bytes("a.less", b"a { width: 1; }\n");
+    assert_tool_failure("lessc", "LESSC", &messages);
+    assert!(
+        messages[0].description.contains("no output"),
+        "{}",
+        messages[0].description
+    );
+
+    let long = fake_tool("fail-long-lessc", "", &"x".repeat(400), 3);
+    let messages = lint_lessc::LesscLinter::with_binary(long.script())
+        .lint_bytes("a.less", b"a { width: 1; }\n");
+    assert_tool_failure("lessc", "LESSC", &messages);
+    assert!(
+        messages[0].description.contains("..."),
+        "{}",
+        messages[0].description
+    );
+}
+
+#[test]
+fn closure_tool_failure_details() {
+    let boom = fake_tool("fail-closure", "", "boom", 3);
+    let messages =
+        lint_closure::ClosureLinter::with_binary(boom.script()).lint_bytes("a.js", b"var x = 1;\n");
+    assert_tool_failure("closure", "GJSLINT", &messages);
+    assert!(
+        messages[0].description.contains("boom"),
+        "{}",
+        messages[0].description
+    );
+
+    let empty = fake_tool("fail-empty-closure", "", "", 3);
+    let messages = lint_closure::ClosureLinter::with_binary(empty.script())
+        .lint_bytes("a.js", b"var x = 1;\n");
+    assert_tool_failure("closure", "GJSLINT", &messages);
+    assert!(
+        messages[0].description.contains("no output"),
+        "{}",
+        messages[0].description
+    );
+
+    let long = fake_tool("fail-long-closure", "", &"x".repeat(400), 3);
+    let messages =
+        lint_closure::ClosureLinter::with_binary(long.script()).lint_bytes("a.js", b"var x = 1;\n");
+    assert_tool_failure("closure", "GJSLINT", &messages);
+    assert!(
+        messages[0].description.contains("..."),
+        "{}",
+        messages[0].description
+    );
+}
+
+#[test]
+fn coffeelint_tool_failure_details() {
+    let boom = fake_tool("fail-coffee", "", "boom", 3);
+    let messages = lint_coffeelint::CoffeelintLinter::with_binary(boom.script())
+        .lint_bytes("a.coffee", b"x = 1\n");
+    assert_tool_failure("coffeelint", "COFFEE", &messages);
+    assert!(
+        messages[0].description.contains("boom"),
+        "{}",
+        messages[0].description
+    );
+
+    let empty = fake_tool("fail-empty-coffee", "", "", 3);
+    let messages = lint_coffeelint::CoffeelintLinter::with_binary(empty.script())
+        .lint_bytes("a.coffee", b"x = 1\n");
+    assert_tool_failure("coffeelint", "COFFEE", &messages);
+    assert!(
+        messages[0].description.contains("no output"),
+        "{}",
+        messages[0].description
+    );
+
+    let long = fake_tool("fail-long-coffee", "", &"x".repeat(400), 3);
+    let messages = lint_coffeelint::CoffeelintLinter::with_binary(long.script())
+        .lint_bytes("a.coffee", b"x = 1\n");
+    assert_tool_failure("coffeelint", "COFFEE", &messages);
+    assert!(
+        messages[0].description.contains("..."),
+        "{}",
+        messages[0].description
+    );
+}

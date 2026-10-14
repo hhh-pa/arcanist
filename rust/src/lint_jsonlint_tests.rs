@@ -58,3 +58,8 @@ fn missing_binary_falls_back_to_native_check() {
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].code, "JSON1");
 }
+
+#[test]
+fn lookup_miss_reports_no_tool() {
+    assert!(find_on_path("arc-rs-definitely-missing-tool").is_none());
+}

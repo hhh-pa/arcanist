@@ -1,10 +1,113 @@
 //! Compiled-language external-tool linters (bundle E, T1128 round 3)
 //! through the wired library.
 
+use std::path::{Path, PathBuf};
+
 use arc_rs::{
     lint::Linter, lint_cppcheck, lint_cpplint, lint_csharp, lint_golint, lint_hlint, lint_php,
     lint_phpcs, lint_puppetlint, lint_xhpast,
 };
+
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path =
+            std::env::temp_dir().join(format!("arc-rs-lintE-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+/// A fake external tool: a script that replays canned stdout/stderr and
+/// exits with a fixed status.
+struct FakeTool {
+    // Held only so the temp dir is removed on drop.
+    #[allow(dead_code)]
+    dir: TempDir,
+    script: PathBuf,
+}
+
+impl FakeTool {
+    fn script(&self) -> &Path {
+        &self.script
+    }
+}
+
+fn fake_tool(tag: &str, stdout_text: &str, stderr_text: &str, exit_code: i32) -> FakeTool {
+    let dir = TempDir::new(tag);
+    std::fs::write(dir.path().join("out.txt"), stdout_text).unwrap();
+    std::fs::write(dir.path().join("err.txt"), stderr_text).unwrap();
+    let script = write_fake_script(
+        &dir,
+        !stdout_text.is_empty(),
+        !stderr_text.is_empty(),
+        exit_code,
+    );
+    FakeTool { dir, script }
+}
+
+#[cfg(windows)]
+fn write_fake_script(
+    dir: &TempDir,
+    emit_stdout: bool,
+    emit_stderr: bool,
+    exit_code: i32,
+) -> PathBuf {
+    let path = dir.path().join("tool.bat");
+    let out = dir.path().join("out.txt").display().to_string();
+    let err = dir.path().join("err.txt").display().to_string();
+    let mut body = String::from("@echo off\r\n");
+    if emit_stdout {
+        body.push_str(&format!("type \"{out}\"\r\n"));
+    }
+    if emit_stderr {
+        body.push_str(&format!("type \"{err}\" 1>&2\r\n"));
+    }
+    body.push_str(&format!("exit /b {exit_code}\r\n"));
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+#[cfg(not(windows))]
+fn write_fake_script(
+    dir: &TempDir,
+    emit_stdout: bool,
+    emit_stderr: bool,
+    exit_code: i32,
+) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.path().join("tool.sh");
+    let out = dir.path().join("out.txt").display().to_string();
+    let err = dir.path().join("err.txt").display().to_string();
+    let mut body = String::from("#!/bin/sh\n");
+    if emit_stdout {
+        body.push_str(&format!("cat \"{out}\"\n"));
+    }
+    if emit_stderr {
+        body.push_str(&format!("cat \"{err}\" >&2\n"));
+    }
+    body.push_str(&format!("exit {exit_code}\n"));
+    std::fs::write(&path, &body).unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    path
+}
 
 fn linters() -> Vec<Box<dyn Linter>> {
     vec![
@@ -227,4 +330,32 @@ fn fixtures_are_skipped_by_foreign_linters() {
             .lint_bytes("sample.go", &go)
             .is_empty()
     );
+}
+
+#[test]
+fn phpcs_tool_run_parses_xml_report() {
+    let report = "<phpcs><file name=\"a.php\">\
+        <error line=\"3\" column=\"7\" source=\"PSR12.Files.FileHeader\">\
+        Missing file doc comment.</error>\
+        </file></phpcs>";
+    let tool = fake_tool("phpcs-run", report, "", 1);
+    let messages = lint_phpcs::lint_with_binary("a.php", b"<?php echo 1;\n", Some(tool.script()));
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].path, "a.php");
+    assert_eq!((messages[0].line, messages[0].col), (3, 7));
+    assert_eq!(messages[0].code, "PHPCS.E.PSR12.Files.FileHeader");
+    assert_eq!(messages[0].severity, "error");
+    assert_eq!(messages[0].name, "PSR12.Files.FileHeader");
+    assert_eq!(messages[0].description, "Missing file doc comment.");
+}
+
+#[test]
+fn phpcs_clean_tool_run_reports_nothing() {
+    let tool = fake_tool("phpcs-clean", "", "", 0);
+    for path in ["a.php", "Makefile", "archive.verylongextension", "odd.b-c"] {
+        assert!(
+            lint_phpcs::lint_with_binary(path, b"<?php echo 1;\n", Some(tool.script())).is_empty(),
+            "{path} must report nothing on a clean run"
+        );
+    }
 }

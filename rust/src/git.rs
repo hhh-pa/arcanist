@@ -2219,10 +2219,12 @@ pub fn all_files(dir: &Path) -> Result<Vec<String>, String> {
 /// [`empty_commit_range_message`]; the no-commits exception is not
 /// raised because the caller passes the range explicitly.
 pub fn local_commit_information(dir: &Path, against: &str) -> Result<Vec<LocalCommit>, String> {
-    let format = log_local_commit_format();
+    // Attached `--format=<value>`: the space form after a revision makes
+    // git's revision parser swallow the value as a bad revision.
+    let format = format!("--format={}", log_local_commit_format());
     let mut args: Vec<&str> = vec!["log"];
     args.extend(against.split_whitespace());
-    args.extend(["--format", format, "--"]);
+    args.extend([format.as_str(), "--"]);
     let out = output(dir, &args)?;
     if !out.status.success() {
         return Err("git log failed".to_string());

@@ -1,11 +1,11 @@
 //! Public-behavior tests for bundle D: the Python/Ruby external-tool
 //! linters (`flake8`, `PYFLAKES`, `PyLint`, `PEP8`, `RuboCop`, `RUBY`).
 //!
-//! Tool execution is never required: parsing is exercised on canned output,
-//! and `lint_bytes` is exercised only on inputs every linter must skip
-//! without a tool (wrong extension, NUL bytes).
+//! Parsing is exercised on canned output, `lint_bytes` on inputs every
+//! linter must skip without a tool (wrong extension, NUL bytes), and the
+//! tool-execution path on hermetic fake binaries (never the real tools).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use arc_rs::{
     lint::{self, Linter},
@@ -175,4 +175,171 @@ fn ruby_fixture_parses() {
     assert!(messages.iter().all(|m| m.name == "Syntax Error"));
     assert!(messages.iter().all(|m| m.severity == "error"));
     assert_eq!((messages[0].line, messages[0].col), (2, 1));
+}
+
+/// Hermetic fake external tool: a script printing canned bytes from a
+/// sibling file (no shell quoting involved). Removed on drop.
+struct FakeTool {
+    dir: PathBuf,
+    tool: PathBuf,
+}
+
+impl FakeTool {
+    /// Fake named `stem` printing `output` (to stderr when asked).
+    fn with_output(tag: &str, stem: &str, output: &str, to_stderr: bool) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("arc-rs-lintD-{tag}-{n}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("out.txt"), output).unwrap();
+        #[cfg(windows)]
+        let tool = {
+            let redirect = if to_stderr { " 1>&2" } else { "" };
+            let bat = dir.join(format!("{stem}.bat"));
+            std::fs::write(
+                &bat,
+                format!("@echo off\ntype \"%~dp0out.txt\"{redirect}\nexit /b 1\n"),
+            )
+            .unwrap();
+            bat
+        };
+        #[cfg(not(windows))]
+        let tool = {
+            let redirect = if to_stderr { " >&2" } else { "" };
+            let sh = dir.join(format!("{stem}.sh"));
+            std::fs::write(
+                &sh,
+                format!("#!/bin/sh\ncat \"$(dirname \"$0\")/out.txt\"{redirect}\nexit 1\n"),
+            )
+            .unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&sh).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&sh, perms).unwrap();
+            }
+            sh
+        };
+        Self { dir, tool }
+    }
+}
+
+impl Drop for FakeTool {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
+#[test]
+fn lint_with_binary_none_or_missing_is_silent() {
+    let missing = std::env::temp_dir().join("arc-rs-lintD-definitely-missing");
+    assert!(lint_flake8::lint_with_binary("a.py", b"x\n", None).is_empty());
+    assert!(lint_pep8::lint_with_binary("a.py", b"x\n", None).is_empty());
+    assert!(lint_pyflakes::lint_with_binary("a.py", b"x\n", None).is_empty());
+    assert!(lint_pylint::lint_with_binary("a.py", b"x\n", None).is_empty());
+    assert!(lint_rubocop::lint_with_binary("a.rb", b"x\n", None).is_empty());
+    assert!(lint_ruby::lint_with_binary("a.rb", b"x\n", None).is_empty());
+    assert!(lint_flake8::lint_with_binary("a.py", b"x\n", Some(&missing)).is_empty());
+    assert!(lint_pep8::lint_with_binary("a.py", b"x\n", Some(&missing)).is_empty());
+    assert!(lint_pyflakes::lint_with_binary("a.py", b"x\n", Some(&missing)).is_empty());
+    assert!(lint_pylint::lint_with_binary("a.py", b"x\n", Some(&missing)).is_empty());
+    assert!(lint_rubocop::lint_with_binary("a.rb", b"x\n", Some(&missing)).is_empty());
+    assert!(lint_ruby::lint_with_binary("a.rb", b"x\n", Some(&missing)).is_empty());
+}
+
+#[test]
+fn flake8_runs_fake_tool_end_to_end() {
+    let fake = FakeTool::with_output(
+        "flake8",
+        "flake8",
+        "target.py:3:1: E302 expected 2 blank lines\n",
+        false,
+    );
+    let messages = lint_flake8::lint_with_binary("src/main.py", b"x = 1\n", Some(&fake.tool));
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].path, "src/main.py");
+    assert_eq!((messages[0].line, messages[0].col), (3, 1));
+    assert_eq!(messages[0].code, "E302");
+    assert_eq!(messages[0].severity, "error");
+}
+
+#[test]
+fn pep8_runs_fake_tool_end_to_end() {
+    let fake = FakeTool::with_output(
+        "pep8",
+        "pep8",
+        "target.py:2:5: E225 missing whitespace\n",
+        false,
+    );
+    let messages = lint_pep8::lint_with_binary("pkg/mod.py", b"x = 1\n", Some(&fake.tool));
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].path, "pkg/mod.py");
+    assert_eq!((messages[0].line, messages[0].col), (2, 5));
+    assert_eq!(messages[0].code, "E225");
+    assert_eq!(messages[0].severity, "error");
+}
+
+#[test]
+fn pyflakes_runs_fake_tool_end_to_end() {
+    let fake = FakeTool::with_output(
+        "pyflakes",
+        "pyflakes",
+        "target.py:1:1 undefined name foo\n",
+        false,
+    );
+    let messages = lint_pyflakes::lint_with_binary("pkg/mod.py", b"x = 1\n", Some(&fake.tool));
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].path, "pkg/mod.py");
+    assert_eq!((messages[0].line, messages[0].col), (1, 1));
+    assert_eq!(messages[0].code, "PYFLAKES");
+    assert_eq!(messages[0].severity, "error");
+}
+
+#[test]
+fn pylint_runs_fake_tool_end_to_end() {
+    let fake = FakeTool::with_output(
+        "pylint",
+        "pylint",
+        "2|4|E0602|undefined-variable|Undefined variable\n",
+        false,
+    );
+    let messages = lint_pylint::lint_with_binary("pkg/mod.py", b"x = 1\n", Some(&fake.tool));
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].path, "pkg/mod.py");
+    assert_eq!((messages[0].line, messages[0].col), (2, 4));
+    assert_eq!(messages[0].code, "E0602");
+    assert_eq!(messages[0].severity, "error");
+}
+
+#[test]
+fn rubocop_runs_fake_tool_end_to_end() {
+    let fake = FakeTool::with_output(
+        "rubocop",
+        "rubocop",
+        r#"{"files":[{"path":"x","offenses":[{"severity":"error","message":"Syntax error.","cop_name":"Lint/Syntax","location":{"line":9,"column":1,"length":1}}]}]}"#,
+        false,
+    );
+    let messages = lint_rubocop::lint_with_binary("lib/app.rb", b"puts 1\n", Some(&fake.tool));
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].path, "lib/app.rb");
+    assert_eq!((messages[0].line, messages[0].col), (9, 1));
+    assert_eq!(messages[0].code, "Lint/Syntax");
+    assert_eq!(messages[0].severity, "error");
+}
+
+#[test]
+fn ruby_runs_fake_tool_end_to_end() {
+    let fake = FakeTool::with_output(
+        "ruby",
+        "ruby",
+        "target.rb:2: syntax error, unexpected end\n",
+        true,
+    );
+    let messages = lint_ruby::lint_with_binary("lib/app.rb", b"puts 1\n", Some(&fake.tool));
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].path, "lib/app.rb");
+    assert_eq!((messages[0].line, messages[0].col), (2, 1));
+    assert_eq!(messages[0].code, "RUBY");
+    assert_eq!(messages[0].severity, "error");
 }

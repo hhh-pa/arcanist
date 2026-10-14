@@ -86,3 +86,53 @@ fn lint_bytes_skips_without_running_tool() {
     assert!(linter.lint_bytes("a.py", b"a\0b\n").is_empty());
     assert!(linter.lint_bytes("Makefile", b"all:\n").is_empty());
 }
+
+#[test]
+fn binary_lookup_reads_only_the_given_path_env() {
+    let dir = std::env::temp_dir().join(format!("arc-rs-flake8-lookup-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    assert!(binary_in(dir.as_os_str()).is_none());
+    let marker = dir.join(BINARY);
+    std::fs::write(&marker, b"x").unwrap();
+    assert_eq!(binary_in(dir.as_os_str()), Some(marker.clone()));
+    // Second-directory hit after an empty first segment.
+    let empty = dir.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let both = std::env::join_paths([&empty, &dir]).unwrap();
+    assert_eq!(binary_in(&both), Some(marker.clone()));
+    // Explicit paths bypass the search.
+    assert!(binary_on_path(dir.join("nope").to_str().unwrap()).is_none());
+    assert!(binary_on_path(marker.to_str().unwrap()).is_some());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+#[cfg(windows)]
+fn binary_lookup_probes_pathext_on_windows() {
+    let dir = std::env::temp_dir().join(format!("arc-rs-flake8-pathext-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exts = std::env::var_os("PATHEXT")
+        .map(|v| v.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".BAT".to_string());
+    let ext = exts
+        .split(';')
+        .map(str::trim)
+        .find(|e| !e.is_empty())
+        .unwrap_or(".BAT");
+    std::fs::write(dir.join(format!("{BINARY}{ext}")), b"x").unwrap();
+    let found = binary_in(dir.as_os_str()).unwrap();
+    assert!(
+        found
+            .to_string_lossy()
+            .to_lowercase()
+            .ends_with(&ext.to_lowercase())
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn skips_lines_with_broken_columns() {
+    assert!(parse_output("a.py", "f.py:3:5 E000 x\n").is_empty());
+    assert!(parse_output("a.py", "f.py:1:1: \n").is_empty());
+    assert!(parse_output("a.py", "\n").is_empty());
+}

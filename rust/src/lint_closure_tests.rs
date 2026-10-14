@@ -40,3 +40,8 @@ fn missing_binary_is_silent() {
     let linter = ClosureLinter::with_binary(&missing);
     assert!(linter.lint_bytes("a.js", b"var x = 1;\n").is_empty());
 }
+
+#[test]
+fn lookup_miss_reports_no_tool() {
+    assert!(find_on_path("arc-rs-definitely-missing-tool").is_none());
+}
