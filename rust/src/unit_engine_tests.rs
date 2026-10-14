@@ -245,3 +245,21 @@ fn temp_file_is_removed_on_drop() {
     };
     assert!(!path.exists());
 }
+
+#[test]
+fn dict_json_escapes_like_php_json_encode() {
+    let mut result = UnitResult::new();
+    result.set_name("a/b\"c\\d\u{8}\u{c}é").unwrap();
+    result.set_result(RESULT_PASS);
+    result.set_user_data("x/y");
+    let json = result.to_dictionary().to_json_string();
+    assert!(
+        json.contains("\"name\":\"a\\/b\\\"c\\\\d\\b\\f\\u00e9\""),
+        "{json}"
+    );
+    assert!(json.contains("\"userData\":\"x\\/y\""), "{json}");
+    // Empty maps encode as lists, like PHP's empty arrays.
+    result.set_extra_data(std::collections::HashMap::new());
+    let json = result.to_dictionary().to_json_string();
+    assert!(json.contains("\"extra\":[]"), "{json}");
+}
