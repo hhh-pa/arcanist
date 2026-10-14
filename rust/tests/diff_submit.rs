@@ -58,29 +58,57 @@ impl Canned {
     }
 }
 
-fn fixture(name: &str) -> &'static str {
+/// Canned Differential write-call responses (`creatediff`, `edit`, ...).
+fn fixture_mutation(name: &str) -> Option<&'static str> {
     match name {
-        "creatediff" => include_str!("fixtures/diffsubmit/creatediff.json"),
-        "updaterevision" => include_str!("fixtures/diffsubmit/updaterevision.json"),
-        "revisionedit" => include_str!("fixtures/diffsubmit/revisionedit.json"),
-        "createrevision" => include_str!("fixtures/diffsubmit/createrevision.json"),
-        "commitmessage" => include_str!("fixtures/diffsubmit/commitmessage.json"),
-        "setdiffproperty" => include_str!("fixtures/diffsubmit/setdiffproperty.json"),
-        "query" => include_str!("fixtures/diffsubmit/query.json"),
-        "userquery" => include_str!("fixtures/diffsubmit/userquery.json"),
-        "revisionsearch" => include_str!("fixtures/diffsubmit/revisionsearch.json"),
-        "diffsearch" => include_str!("fixtures/diffsubmit/diffsearch.json"),
-        "diffsearchempty" => include_str!("fixtures/diffsubmit/diffsearchempty.json"),
-        "querydiffs" => include_str!("fixtures/diffsubmit/querydiffs.json"),
-        "parsecommit" => include_str!("fixtures/diffsubmit/parsecommit.json"),
-        "parsecommitbad" => include_str!("fixtures/diffsubmit/parsecommitbad.json"),
-        "landaccepted" => include_str!("fixtures/diffsubmit/landaccepted.json"),
-        "landplanned" => include_str!("fixtures/diffsubmit/landplanned.json"),
-        "parentopen" => include_str!("fixtures/diffsubmit/parentopen.json"),
-        "parentclosed" => include_str!("fixtures/diffsubmit/parentclosed.json"),
-        "builds" => include_str!("fixtures/diffsubmit/builds.json"),
-        _ => panic!("unknown fixture {name}"),
+        "creatediff" => Some(include_str!("fixtures/diffsubmit/creatediff.json")),
+        "updaterevision" => Some(include_str!("fixtures/diffsubmit/updaterevision.json")),
+        "revisionedit" => Some(include_str!("fixtures/diffsubmit/revisionedit.json")),
+        "createrevision" => Some(include_str!("fixtures/diffsubmit/createrevision.json")),
+        "setdiffproperty" => Some(include_str!("fixtures/diffsubmit/setdiffproperty.json")),
+        _ => None,
     }
+}
+
+/// Canned Differential read-call responses (`query`, `search`, `parse`, ...).
+fn fixture_lookup(name: &str) -> Option<&'static str> {
+    match name {
+        "commitmessage" => Some(include_str!("fixtures/diffsubmit/commitmessage.json")),
+        "query" => Some(include_str!("fixtures/diffsubmit/query.json")),
+        "userquery" => Some(include_str!("fixtures/diffsubmit/userquery.json")),
+        "revisionsearch" => Some(include_str!("fixtures/diffsubmit/revisionsearch.json")),
+        "diffsearch" => Some(include_str!("fixtures/diffsubmit/diffsearch.json")),
+        "diffsearchempty" => Some(include_str!("fixtures/diffsubmit/diffsearchempty.json")),
+        "querydiffs" => Some(include_str!("fixtures/diffsubmit/querydiffs.json")),
+        "parsecommit" => Some(include_str!("fixtures/diffsubmit/parsecommit.json")),
+        "parsecommitbad" => Some(include_str!("fixtures/diffsubmit/parsecommitbad.json")),
+        _ => None,
+    }
+}
+
+/// Canned pre-land gate inputs (revision states, parents, builds).
+fn fixture_gate(name: &str) -> Option<&'static str> {
+    match name {
+        "landaccepted" => Some(include_str!("fixtures/diffsubmit/landaccepted.json")),
+        "landplanned" => Some(include_str!("fixtures/diffsubmit/landplanned.json")),
+        "parentopen" => Some(include_str!("fixtures/diffsubmit/parentopen.json")),
+        "parentclosed" => Some(include_str!("fixtures/diffsubmit/parentclosed.json")),
+        "builds" => Some(include_str!("fixtures/diffsubmit/builds.json")),
+        _ => None,
+    }
+}
+
+fn fixture(name: &str) -> &'static str {
+    if let Some(content) = fixture_mutation(name) {
+        return content;
+    }
+    if let Some(content) = fixture_lookup(name) {
+        return content;
+    }
+    if let Some(content) = fixture_gate(name) {
+        return content;
+    }
+    panic!("unknown fixture {name}")
 }
 
 fn json_fixture(name: &str) -> Value {

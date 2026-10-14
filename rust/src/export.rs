@@ -108,117 +108,214 @@ fn take_value(iter: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<Str
     }
 }
 
-fn parse_args(argv: &[String]) -> ParseOutcome {
-    let mut git = false;
-    let mut unified = false;
-    let mut revision: Option<String> = None;
-    let mut diff: Option<String> = None;
-    let mut positional: Option<String> = None;
-    let mut conduit_uri: Option<String> = None;
-    let mut end_of_flags = false;
+/// One argument's parse step: consumed, or a terminal outcome.
+enum Step {
+    Handled,
+    Done(ParseOutcome),
+}
 
-    let mut iter = argv.iter();
-    while let Some(arg) = iter.next() {
-        if end_of_flags {
-            if positional.is_some() {
-                return ParseOutcome::Error("unexpected extra argument".to_string());
-            }
-            positional = Some(arg.clone());
-        } else if arg == "--" {
-            end_of_flags = true;
-        } else if arg == "--git" {
-            git = true;
-        } else if arg == "--unified" {
-            unified = true;
-        } else if arg == "--revision" {
-            match take_value(&mut iter, "--revision") {
-                Ok(value) => revision = Some(value),
-                Err(outcome) => return outcome,
-            }
-        } else if let Some(value) = arg.strip_prefix("--revision=") {
-            revision = Some(value.to_string());
-        } else if arg == "--diff" {
-            match take_value(&mut iter, "--diff") {
-                Ok(value) => diff = Some(value),
-                Err(outcome) => return outcome,
-            }
-        } else if let Some(value) = arg.strip_prefix("--diff=") {
-            diff = Some(value.to_string());
-        } else if arg == "--conduit-uri" {
-            match take_value(&mut iter, "--conduit-uri") {
-                Ok(value) => conduit_uri = Some(value),
-                Err(outcome) => return outcome,
-            }
-        } else if let Some(value) = arg.strip_prefix("--conduit-uri=") {
-            conduit_uri = Some(value.to_string());
-        } else if arg == "-h" || arg == "--help" {
-            return ParseOutcome::Help;
-        } else if arg == "--arcbundle" || arg.starts_with("--arcbundle=") {
-            return not_yet_ported("--arcbundle");
-        } else if arg == "--encoding" || arg.starts_with("--encoding=") {
-            return not_yet_ported("--encoding");
-        } else if arg.starts_with('-') {
-            return ParseOutcome::Error(format!("unknown flag '{arg}'"));
-        } else {
-            if positional.is_some() {
-                return ParseOutcome::Error("unexpected extra argument".to_string());
-            }
-            positional = Some(arg.clone());
+struct Parser {
+    git: bool,
+    unified: bool,
+    revision: Option<String>,
+    diff: Option<String>,
+    positional: Option<String>,
+    conduit_uri: Option<String>,
+    end_of_flags: bool,
+}
+
+impl Parser {
+    fn new() -> Self {
+        Self {
+            git: false,
+            unified: false,
+            revision: None,
+            diff: None,
+            positional: None,
+            conduit_uri: None,
+            end_of_flags: false,
         }
     }
 
-    let format = match (git, unified) {
-        (true, false) => Format::Git,
-        (false, true) => Format::Unified,
-        (false, false) => {
-            return ParseOutcome::Error(
-                "Specify one of '--git' or '--unified' to choose an export format.".to_string(),
-            );
+    fn flag_revision(
+        &mut self,
+        arg: &str,
+        iter: &mut std::slice::Iter<'_, String>,
+    ) -> Option<Step> {
+        if arg == "--revision" {
+            match take_value(iter, "--revision") {
+                Ok(value) => self.revision = Some(value),
+                Err(outcome) => return Some(Step::Done(outcome)),
+            }
+            return Some(Step::Handled);
         }
-        (true, true) => {
-            return ParseOutcome::Error(
-                "Options '--git' and '--unified' are not compatible. Choose exactly one export format."
-                    .to_string(),
-            );
+        if let Some(value) = arg.strip_prefix("--revision=") {
+            self.revision = Some(value.to_string());
+            return Some(Step::Handled);
         }
-    };
+        None
+    }
 
-    if revision.is_some() && diff.is_some() {
+    fn flag_diff(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Option<Step> {
+        if arg == "--diff" {
+            match take_value(iter, "--diff") {
+                Ok(value) => self.diff = Some(value),
+                Err(outcome) => return Some(Step::Done(outcome)),
+            }
+            return Some(Step::Handled);
+        }
+        if let Some(value) = arg.strip_prefix("--diff=") {
+            self.diff = Some(value.to_string());
+            return Some(Step::Handled);
+        }
+        None
+    }
+
+    fn flag_conduit(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Option<Step> {
+        if arg == "--conduit-uri" {
+            match take_value(iter, "--conduit-uri") {
+                Ok(value) => self.conduit_uri = Some(value),
+                Err(outcome) => return Some(Step::Done(outcome)),
+            }
+            return Some(Step::Handled);
+        }
+        if let Some(value) = arg.strip_prefix("--conduit-uri=") {
+            self.conduit_uri = Some(value.to_string());
+            return Some(Step::Handled);
+        }
+        None
+    }
+
+    fn positional(&mut self, arg: &str) -> Step {
+        if self.positional.is_some() {
+            Step::Done(ParseOutcome::Error("unexpected extra argument".to_string()))
+        } else {
+            self.positional = Some(arg.to_string());
+            Step::Handled
+        }
+    }
+
+    fn tail(&mut self, arg: &str) -> Step {
+        if arg == "--" {
+            self.end_of_flags = true;
+            return Step::Handled;
+        }
+        if arg == "--git" {
+            self.git = true;
+            return Step::Handled;
+        }
+        if arg == "--unified" {
+            self.unified = true;
+            return Step::Handled;
+        }
+        if arg == "-h" || arg == "--help" {
+            return Step::Done(ParseOutcome::Help);
+        }
+        if arg == "--arcbundle" || arg.starts_with("--arcbundle=") {
+            return Step::Done(not_yet_ported("--arcbundle"));
+        }
+        if arg == "--encoding" || arg.starts_with("--encoding=") {
+            return Step::Done(not_yet_ported("--encoding"));
+        }
+        if arg.starts_with('-') {
+            return Step::Done(ParseOutcome::Error(format!("unknown flag '{arg}'")));
+        }
+        self.positional(arg)
+    }
+
+    fn consume(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Step {
+        if self.end_of_flags {
+            return self.positional(arg);
+        }
+        if let Some(step) = self.flag_revision(arg, iter) {
+            return step;
+        }
+        if let Some(step) = self.flag_diff(arg, iter) {
+            return step;
+        }
+        if let Some(step) = self.flag_conduit(arg, iter) {
+            return step;
+        }
+        self.tail(arg)
+    }
+}
+
+fn resolve_format(git: bool, unified: bool) -> Result<Format, ParseOutcome> {
+    match (git, unified) {
+        (true, false) => Ok(Format::Git),
+        (false, true) => Ok(Format::Unified),
+        (false, false) => Err(ParseOutcome::Error(
+            "Specify one of '--git' or '--unified' to choose an export format.".to_string(),
+        )),
+        (true, true) => Err(ParseOutcome::Error(
+            "Options '--git' and '--unified' are not compatible. Choose exactly one export format."
+                .to_string(),
+        )),
+    }
+}
+
+fn resolve_source(
+    revision: Option<String>,
+    diff: Option<String>,
+    positional: Option<String>,
+) -> Result<Source, ParseOutcome> {
+    if let Some(value) = revision {
+        if positional.is_some() {
+            return Err(ParseOutcome::Error(
+                "unexpected argument: --revision takes no base commit".to_string(),
+            ));
+        }
+        return match normalize_revision_id(&value) {
+            Ok(id) => Ok(Source::Revision(id)),
+            Err(message) => Err(ParseOutcome::Error(message)),
+        };
+    }
+    if let Some(value) = diff {
+        if positional.is_some() {
+            return Err(ParseOutcome::Error(
+                "unexpected argument: --diff takes no base commit".to_string(),
+            ));
+        }
+        return match parse_diff_id(&value) {
+            Ok(id) => Ok(Source::Diff(id)),
+            Err(message) => Err(ParseOutcome::Error(message)),
+        };
+    }
+    Ok(Source::Local { base: positional })
+}
+
+fn finish(parser: Parser) -> ParseOutcome {
+    let format = match resolve_format(parser.git, parser.unified) {
+        Ok(format) => format,
+        Err(outcome) => return outcome,
+    };
+    if parser.revision.is_some() && parser.diff.is_some() {
         return ParseOutcome::Error(
             "Options '--revision' and '--diff' are not compatible. Choose exactly one change source."
                 .to_string(),
         );
     }
-
-    let source = if let Some(value) = revision {
-        if positional.is_some() {
-            return ParseOutcome::Error(
-                "unexpected argument: --revision takes no base commit".to_string(),
-            );
-        }
-        match normalize_revision_id(&value) {
-            Ok(id) => Source::Revision(id),
-            Err(message) => return ParseOutcome::Error(message),
-        }
-    } else if let Some(value) = diff {
-        if positional.is_some() {
-            return ParseOutcome::Error(
-                "unexpected argument: --diff takes no base commit".to_string(),
-            );
-        }
-        match parse_diff_id(&value) {
-            Ok(id) => Source::Diff(id),
-            Err(message) => return ParseOutcome::Error(message),
-        }
-    } else {
-        Source::Local { base: positional }
+    let source = match resolve_source(parser.revision, parser.diff, parser.positional) {
+        Ok(source) => source,
+        Err(outcome) => return outcome,
     };
-
     ParseOutcome::Args(Options {
         format,
         source,
-        conduit_uri,
+        conduit_uri: parser.conduit_uri,
     })
+}
+
+fn parse_args(argv: &[String]) -> ParseOutcome {
+    let mut parser = Parser::new();
+    let mut iter = argv.iter();
+    while let Some(arg) = iter.next() {
+        match parser.consume(arg, &mut iter) {
+            Step::Handled => {}
+            Step::Done(outcome) => return outcome,
+        }
+    }
+    finish(parser)
 }
 
 /// First diff ID in a `differential.querydiffs` result (a dict keyed by diff

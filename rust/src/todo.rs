@@ -51,55 +51,143 @@ fn flag_value(
     Ok(value.clone())
 }
 
+/// One argument's parse step: consumed, `--help`, or a fatal error.
+enum Step {
+    Handled,
+    Help,
+    Error(String),
+}
+
+struct Parser {
+    summary: Vec<String>,
+    cc: Vec<String>,
+    projects: Vec<String>,
+    browse: bool,
+    json: bool,
+    conduit_uri: Option<String>,
+    end_of_flags: bool,
+}
+
+impl Parser {
+    fn new() -> Self {
+        Self {
+            summary: Vec::new(),
+            cc: Vec::new(),
+            projects: Vec::new(),
+            browse: false,
+            json: false,
+            conduit_uri: None,
+            end_of_flags: false,
+        }
+    }
+
+    fn cc_error(arg: &str) -> String {
+        if arg == "-C" {
+            "-C requires a value".to_string()
+        } else {
+            "--cc requires a value".to_string()
+        }
+    }
+
+    fn flag_cc(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Option<Step> {
+        if arg == "--cc" || arg == "-C" || arg.starts_with("--cc=") {
+            match flag_value(iter, arg, "--cc") {
+                Ok(value) => self.cc.push(value),
+                Err(_) => return Some(Step::Error(Self::cc_error(arg))),
+            }
+            return Some(Step::Handled);
+        }
+        None
+    }
+
+    fn flag_project(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Option<Step> {
+        if arg == "--project" || arg.starts_with("--project=") {
+            match flag_value(iter, arg, "--project") {
+                Ok(value) => self.projects.push(value),
+                Err(message) => return Some(Step::Error(message)),
+            }
+            return Some(Step::Handled);
+        }
+        None
+    }
+
+    fn flag_conduit(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Option<Step> {
+        if arg == "--conduit-uri" || arg.starts_with("--conduit-uri=") {
+            match flag_value(iter, arg, "--conduit-uri") {
+                Ok(value) => self.conduit_uri = Some(value),
+                Err(message) => return Some(Step::Error(message)),
+            }
+            return Some(Step::Handled);
+        }
+        None
+    }
+
+    fn tail(&mut self, arg: &str) -> Step {
+        if arg == "--" {
+            self.end_of_flags = true;
+            return Step::Handled;
+        }
+        if arg == "--browse" {
+            self.browse = true;
+            return Step::Handled;
+        }
+        if arg == "--json" {
+            self.json = true;
+            return Step::Handled;
+        }
+        if arg == "--help" || arg == "-h" {
+            return Step::Help;
+        }
+        if arg.starts_with('-') {
+            return Step::Error(format!("unknown flag '{arg}'"));
+        }
+        self.summary.push(arg.to_string());
+        Step::Handled
+    }
+
+    fn consume(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Step {
+        if self.end_of_flags {
+            self.summary.push(arg.to_string());
+            return Step::Handled;
+        }
+        if let Some(step) = self.flag_cc(arg, iter) {
+            return step;
+        }
+        if let Some(step) = self.flag_project(arg, iter) {
+            return step;
+        }
+        if let Some(step) = self.flag_conduit(arg, iter) {
+            return step;
+        }
+        self.tail(arg)
+    }
+
+    fn finish(self) -> Options {
+        Options {
+            summary: self.summary,
+            cc: self.cc,
+            projects: self.projects,
+            browse: self.browse,
+            json: self.json,
+            conduit_uri: self.conduit_uri,
+        }
+    }
+}
+
 /// Parse `argv` (excluding the subcommand name).
 ///
 /// Returns `Ok(None)` when `--help` was requested.
 pub fn parse_args(argv: &[String]) -> Result<Option<Options>, String> {
-    let mut summary = Vec::new();
-    let mut cc = Vec::new();
-    let mut projects = Vec::new();
-    let mut browse = false;
-    let mut json = false;
-    let mut conduit_uri = None;
-    let mut end_of_flags = false;
+    let mut parser = Parser::new();
     let mut iter = argv.iter();
     while let Some(arg) = iter.next() {
-        if end_of_flags {
-            summary.push(arg.clone());
-        } else if arg == "--" {
-            end_of_flags = true;
-        } else if arg == "--cc" || arg == "-C" || arg.starts_with("--cc=") {
-            cc.push(flag_value(&mut iter, arg, "--cc").map_err(|_| {
-                if arg == "-C" {
-                    "-C requires a value".to_string()
-                } else {
-                    "--cc requires a value".to_string()
-                }
-            })?);
-        } else if arg == "--project" || arg.starts_with("--project=") {
-            projects.push(flag_value(&mut iter, arg, "--project")?);
-        } else if arg == "--browse" {
-            browse = true;
-        } else if arg == "--json" {
-            json = true;
-        } else if arg == "--conduit-uri" || arg.starts_with("--conduit-uri=") {
-            conduit_uri = Some(flag_value(&mut iter, arg, "--conduit-uri")?);
-        } else if arg == "--help" || arg == "-h" {
-            return Ok(None);
-        } else if arg.starts_with('-') {
-            return Err(format!("unknown flag '{arg}'"));
-        } else {
-            summary.push(arg.clone());
+        match parser.consume(arg, &mut iter) {
+            Step::Handled => {}
+            Step::Help => return Ok(None),
+            Step::Error(message) => return Err(message),
         }
     }
-    Ok(Some(Options {
-        summary,
-        cc,
-        projects,
-        browse,
-        json,
-        conduit_uri,
-    }))
+    Ok(Some(parser.finish()))
 }
 
 /// Authenticated user's PHID via `user.whoami`.

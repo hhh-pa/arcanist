@@ -251,109 +251,211 @@ struct Options {
     force: bool,
 }
 
-fn parse_args(argv: &[String]) -> Result<Option<Options>, String> {
-    let mut uri = None;
-    let mut conduit_uri = None;
-    let mut token = None;
-    let mut force = false;
-    let mut positional = 0;
-    let mut iter = argv.iter().peekable();
-    while let Some(arg) = iter.next() {
-        if arg == "--conduit-uri" {
-            let Some(value) = iter.next() else {
-                return Err("--conduit-uri requires a value".to_string());
-            };
-            conduit_uri = Some(value.clone());
-        } else if arg == "--token" {
-            let Some(value) = iter.next() else {
-                return Err("--token requires a value".to_string());
-            };
-            token = Some(value.clone());
-        } else if arg == "--force" {
-            force = true;
-        } else if arg == "-h" || arg == "--help" {
-            return Ok(None);
-        } else if arg == "--" {
-            for rest in iter.by_ref() {
-                if positional > 0 {
-                    return Err("Specify at most one URI.".to_string());
-                }
-                uri = Some(rest.clone());
-                positional += 1;
-            }
-        } else if arg.starts_with('-') {
-            return Err(format!("unknown flag '{arg}'"));
-        } else {
-            if positional > 0 {
-                return Err("Specify at most one URI.".to_string());
-            }
-            uri = Some(arg.clone());
-            positional += 1;
+type ArgIter<'a> = std::iter::Peekable<std::slice::Iter<'a, String>>;
+
+/// One argument's parse step: consumed, `--help`, or a fatal error.
+enum Step {
+    Handled,
+    Help,
+    Error(String),
+}
+
+struct Parser {
+    uri: Option<String>,
+    conduit_uri: Option<String>,
+    token: Option<String>,
+    force: bool,
+    positional: u32,
+}
+
+impl Parser {
+    fn new() -> Self {
+        Self {
+            uri: None,
+            conduit_uri: None,
+            token: None,
+            force: false,
+            positional: 0,
         }
     }
-    Ok(Some(Options {
-        uri,
-        conduit_uri,
-        token,
-        force,
-    }))
+
+    fn flag_conduit(&mut self, arg: &str, iter: &mut ArgIter<'_>) -> Option<Step> {
+        if arg != "--conduit-uri" {
+            return None;
+        }
+        let Some(value) = iter.next() else {
+            return Some(Step::Error("--conduit-uri requires a value".to_string()));
+        };
+        self.conduit_uri = Some(value.clone());
+        Some(Step::Handled)
+    }
+
+    fn flag_token(&mut self, arg: &str, iter: &mut ArgIter<'_>) -> Option<Step> {
+        if arg != "--token" {
+            return None;
+        }
+        let Some(value) = iter.next() else {
+            return Some(Step::Error("--token requires a value".to_string()));
+        };
+        self.token = Some(value.clone());
+        Some(Step::Handled)
+    }
+
+    fn push_positional(&mut self, arg: &str) -> Step {
+        if self.positional > 0 {
+            Step::Error("Specify at most one URI.".to_string())
+        } else {
+            self.uri = Some(arg.to_string());
+            self.positional += 1;
+            Step::Handled
+        }
+    }
+
+    fn consume_rest(&mut self, iter: &mut ArgIter<'_>) -> Option<String> {
+        for rest in iter.by_ref() {
+            if self.positional > 0 {
+                return Some("Specify at most one URI.".to_string());
+            }
+            self.uri = Some(rest.clone());
+            self.positional += 1;
+        }
+        None
+    }
+
+    fn tail(&mut self, arg: &str, iter: &mut ArgIter<'_>) -> Step {
+        if arg == "--force" {
+            self.force = true;
+            return Step::Handled;
+        }
+        if arg == "-h" || arg == "--help" {
+            return Step::Help;
+        }
+        if arg == "--" {
+            if let Some(message) = self.consume_rest(iter) {
+                return Step::Error(message);
+            }
+            return Step::Handled;
+        }
+        if arg.starts_with('-') {
+            return Step::Error(format!("unknown flag '{arg}'"));
+        }
+        self.push_positional(arg)
+    }
+
+    fn consume(&mut self, arg: &str, iter: &mut ArgIter<'_>) -> Step {
+        if let Some(step) = self.flag_conduit(arg, iter) {
+            return step;
+        }
+        if let Some(step) = self.flag_token(arg, iter) {
+            return step;
+        }
+        self.tail(arg, iter)
+    }
+
+    fn finish(self) -> Options {
+        Options {
+            uri: self.uri,
+            conduit_uri: self.conduit_uri,
+            token: self.token,
+            force: self.force,
+        }
+    }
+}
+
+fn parse_args(argv: &[String]) -> Result<Option<Options>, String> {
+    let mut parser = Parser::new();
+    let mut iter = argv.iter().peekable();
+    while let Some(arg) = iter.next() {
+        match parser.consume(arg, &mut iter) {
+            Step::Handled => {}
+            Step::Help => return Ok(None),
+            Step::Error(message) => return Err(message),
+        }
+    }
+    Ok(Some(parser.finish()))
+}
+
+fn install_options(argv: &[String]) -> Result<Options, ExitCode> {
+    match parse_args(argv) {
+        Ok(Some(options)) => Ok(options),
+        Ok(None) => {
+            print!("{USAGE}");
+            Err(ExitCode::SUCCESS)
+        }
+        Err(message) => {
+            eprintln!("arc-rs {NAME}: {message}\n\n{USAGE}");
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+fn resolve_install_uri(options: &Options, cwd: &Path) -> Result<String, ExitCode> {
+    let env_uri = std::env::var("ARC_CONDUIT_URI").ok();
+    match resolve_uri(
+        options.uri.as_deref(),
+        options.conduit_uri.as_deref(),
+        env_uri.as_deref(),
+        cwd,
+    ) {
+        Ok(uri) => Ok(uri),
+        Err(message) => {
+            eprintln!("arc-rs {NAME}: {message}");
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+fn install_token_value(options: &Options, uri: &str) -> Result<String, ExitCode> {
+    if let Some(token) = &options.token {
+        return Ok(token.clone());
+    }
+    println!("Open this page in your browser and log in if necessary:\n");
+    println!("{}\n", token_login_url(uri));
+    println!("Then paste the API Token on that page below.");
+    print!("Paste API Token from that page: ");
+    use std::io::Write;
+    if std::io::stdout().flush().is_err() {
+        eprintln!("arc-rs {NAME}: failed to write output");
+        return Err(ExitCode::FAILURE);
+    }
+    match prompt_token() {
+        Ok(token) => Ok(token),
+        Err(message) => {
+            eprintln!("arc-rs {NAME}: {message}");
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+fn install_arcrc() -> Result<PathBuf, ExitCode> {
+    match config::arcrc_path() {
+        Some(path) => Ok(path),
+        None => {
+            eprintln!("arc-rs {NAME}: cannot locate ~/.arcrc (HOME/USERPROFILE is not set)");
+            Err(ExitCode::FAILURE)
+        }
+    }
 }
 
 /// Entry point: `argv` excludes the subcommand name.
 pub fn run(argv: &[String]) -> ExitCode {
-    let options = match parse_args(argv) {
-        Ok(Some(options)) => options,
-        Ok(None) => {
-            print!("{USAGE}");
-            return ExitCode::SUCCESS;
-        }
-        Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}\n\n{USAGE}");
-            return ExitCode::FAILURE;
-        }
+    let options = match install_options(argv) {
+        Ok(options) => options,
+        Err(code) => return code,
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let env_uri = std::env::var("ARC_CONDUIT_URI").ok();
-    let uri = match resolve_uri(
-        options.uri.as_deref(),
-        options.conduit_uri.as_deref(),
-        env_uri.as_deref(),
-        &cwd,
-    ) {
+    let uri = match resolve_install_uri(&options, &cwd) {
         Ok(uri) => uri,
-        Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
-    let token = match options.token {
-        Some(token) => token,
-        None => {
-            println!("Open this page in your browser and log in if necessary:\n");
-            println!("{}\n", token_login_url(&uri));
-            println!("Then paste the API Token on that page below.");
-            print!("Paste API Token from that page: ");
-            use std::io::Write;
-            if std::io::stdout().flush().is_err() {
-                eprintln!("arc-rs {NAME}: failed to write output");
-                return ExitCode::FAILURE;
-            }
-            match prompt_token() {
-                Ok(token) => token,
-                Err(message) => {
-                    eprintln!("arc-rs {NAME}: {message}");
-                    return ExitCode::FAILURE;
-                }
-            }
-        }
+    let token = match install_token_value(&options, &uri) {
+        Ok(token) => token,
+        Err(code) => return code,
     };
     println!("Connecting to \"{uri}\"...");
-    let arcrc = match config::arcrc_path() {
-        Some(path) => path,
-        None => {
-            eprintln!("arc-rs {NAME}: cannot locate ~/.arcrc (HOME/USERPROFILE is not set)");
-            return ExitCode::FAILURE;
-        }
+    let arcrc = match install_arcrc() {
+        Ok(path) => path,
+        Err(code) => return code,
     };
     match install(&uri, &token, &arcrc, options.force) {
         Ok(message) => {

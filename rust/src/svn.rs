@@ -395,45 +395,82 @@ fn parse_tag_attrs(tag: &str) -> BTreeMap<String, String> {
         i += 1;
     }
     while i < bytes.len() {
-        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
-            i += 1;
-        }
-        if i >= bytes.len() {
+        let Some(((name, value), next)) = scan_tag_attr(tag, bytes, i) else {
             break;
-        }
-        let start = i;
-        while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        let name = tag[start..i].to_string();
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= bytes.len() || bytes[i] != b'=' || name.is_empty() {
-            break;
-        }
-        i += 1;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-        let quote = bytes[i];
-        if quote != b'"' && quote != b'\'' {
-            break;
-        }
-        i += 1;
-        let value_start = i;
-        while i < bytes.len() && bytes[i] != quote {
-            i += 1;
-        }
-        attrs.insert(name, decode_entities(&tag[value_start..i.min(bytes.len())]));
-        if i < bytes.len() {
-            i += 1;
-        }
+        };
+        attrs.insert(name, value);
+        i = next;
     }
     attrs
+}
+
+/// Scan one attribute at `start`: the `(name, value)` pair plus the resume
+/// offset. Anything malformed halts the whole tag, like the PHP parser.
+fn scan_tag_attr(tag: &str, bytes: &[u8], start: usize) -> Option<((String, String), usize)> {
+    let i = skip_tag_gap(bytes, start);
+    if i >= bytes.len() {
+        return None;
+    }
+    let (name, i) = scan_tag_name(tag, bytes, i);
+    let (value, next) = scan_tag_value(tag, bytes, &name, i)?;
+    Some(((name, value), next))
+}
+
+/// Scan an attribute name plus the whitespace before `=`: the name and the
+/// offset past the gap.
+fn scan_tag_name(tag: &str, bytes: &[u8], start: usize) -> (String, usize) {
+    let mut i = start;
+    while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let name = tag[start..i].to_string();
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    (name, i)
+}
+
+/// Scan the `= "value"` half of the attribute named `name` at `start`.
+fn scan_tag_value(tag: &str, bytes: &[u8], name: &str, start: usize) -> Option<(String, usize)> {
+    let mut i = start;
+    if i >= bytes.len() || bytes[i] != b'=' || name.is_empty() {
+        return None;
+    }
+    i += 1;
+    i = skip_tag_ws(bytes, i);
+    if i >= bytes.len() {
+        return None;
+    }
+    let quote = bytes[i];
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    i += 1;
+    let value_start = i;
+    while i < bytes.len() && bytes[i] != quote {
+        i += 1;
+    }
+    let value = decode_entities(&tag[value_start..i.min(bytes.len())]);
+    if i < bytes.len() {
+        i += 1;
+    }
+    Some((value, i))
+}
+
+/// Skip inter-attribute padding (whitespace and `/`).
+fn skip_tag_gap(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
+        i += 1;
+    }
+    i
+}
+
+/// Skip whitespace between an attribute name, `=`, and its value.
+fn skip_tag_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
 }
 
 fn is_tag_boundary(byte: Option<u8>) -> bool {
@@ -687,6 +724,12 @@ pub fn parse_svn_date(text: &str) -> Option<i64> {
     if parts.next().is_some() {
         return None;
     }
+    let (year, month, day) = parse_iso_date(date)?;
+    Some(days_from_civil(year, month, day) * 86400 + clock - zone)
+}
+
+/// Parse a `YYYY-MM-DD` date with range-checked month and day.
+fn parse_iso_date(date: &str) -> Option<(i64, i64, i64)> {
     let mut fields = date.split('-');
     let year: i64 = fields.next()?.parse().ok()?;
     let month: i64 = fields.next()?.parse().ok()?;
@@ -694,7 +737,7 @@ pub fn parse_svn_date(text: &str) -> Option<i64> {
     if fields.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
-    Some(days_from_civil(year, month, day) * 86400 + clock - zone)
+    Some((year, month, day))
 }
 
 /// Single-token `svn info` keys (`getSVNInfo`,
@@ -866,6 +909,20 @@ fn is_php_numeric(text: &str) -> bool {
     if bytes[0] == b'+' || bytes[0] == b'-' {
         i = 1;
     }
+    let (digits, after) = scan_php_mantissa(bytes, i);
+    if digits == 0 {
+        return false;
+    }
+    match scan_php_exponent(bytes, after) {
+        Some(end) => end == bytes.len(),
+        None => false,
+    }
+}
+
+/// Scan the mantissa (`digits[.digits]`) at `start`: the digit count plus
+/// the offset past it.
+fn scan_php_mantissa(bytes: &[u8], start: usize) -> (usize, usize) {
+    let mut i = start;
     let mut digits = 0;
     while i < bytes.len() && bytes[i].is_ascii_digit() {
         digits += 1;
@@ -878,24 +935,28 @@ fn is_php_numeric(text: &str) -> bool {
             i += 1;
         }
     }
-    if digits == 0 {
-        return false;
+    (digits, i)
+}
+
+/// Scan the optional `e[+-]digits` exponent at `start`: the offset past it,
+/// or `None` for an `e` with no digits.
+fn scan_php_exponent(bytes: &[u8], start: usize) -> Option<usize> {
+    if start >= bytes.len() || (bytes[start] != b'e' && bytes[start] != b'E') {
+        return Some(start);
     }
-    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+    let mut i = start + 1;
+    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
         i += 1;
-        if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
-            i += 1;
-        }
-        let mut exponent = 0;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            exponent += 1;
-            i += 1;
-        }
-        if exponent == 0 {
-            return false;
-        }
     }
-    i == bytes.len()
+    let mut exponent = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        exponent += 1;
+        i += 1;
+    }
+    if exponent == 0 {
+        return None;
+    }
+    Some(i)
 }
 
 /// `getCanonicalRevisionName` (`ArcanistSubversionAPI.php:217-225`):
@@ -1387,43 +1448,11 @@ pub fn get_raw_diff_text_with(
     let Some(flags) = status.get(path).copied() else {
         return Ok(None);
     };
-    if flags & FLAG_ADDED != 0 {
-        let info = get_svn_info_with(dir, svn, path)?;
-        if let Some(source) = info.get("Copied From URL")
-            && !source.is_empty()
-        {
-            let rev = info.get("Copied From Rev").cloned().unwrap_or_default();
-            let root_info = get_svn_info_with(dir, svn, "/")?;
-            let source_control_path = root_info.get("URL").cloned().unwrap_or_default();
-            return build_synthetic_addition_diff_with(
-                dir,
-                svn,
-                path,
-                source,
-                &rev,
-                &source_control_path,
-                config,
-            );
-        }
+    if let Some(diff) = copied_addition_diff(dir, svn, path, flags, config)? {
+        return Ok(diff);
     }
-    if is_binary_filename(path) {
-        if flags & FLAG_DELETED != 0 {
-            return Ok(Some(binary_diff_text(path).into_bytes()));
-        }
-        let mime = get_svn_property_with(dir, svn, path, "svn:mime-type")?;
-        if mime != "application/octet-stream" {
-            let absolute = join_path(dir, Some(path)).to_string_lossy().to_string();
-            stdout_text_with(
-                dir,
-                svn,
-                &[
-                    "propset",
-                    "svn:mime-type",
-                    "application/octet-stream",
-                    &escape_file_name_for_svn(&absolute),
-                ],
-            )?;
-        }
+    if let Some(diff) = binary_filename_diff(dir, svn, path, flags)? {
+        return Ok(Some(diff));
     }
     let argv = diff_argv(path, config.context, config.diff_cmd);
     let out = output_with(dir, svn, &argv_refs(&argv))?;
@@ -1439,6 +1468,71 @@ pub fn get_raw_diff_text_with(
         return Ok(build_synthetic_unchanged_diff(dir, path));
     }
     Ok(Some(out.stdout))
+}
+
+/// Synthetic addition diff for an added path copied from elsewhere;
+/// `None` when the path is not an added copy.
+fn copied_addition_diff(
+    dir: &Path,
+    svn: &SvnCommand,
+    path: &str,
+    flags: u32,
+    config: &SvnDiffConfig,
+) -> Result<Option<Option<Vec<u8>>>, String> {
+    if flags & FLAG_ADDED == 0 {
+        return Ok(None);
+    }
+    let info = get_svn_info_with(dir, svn, path)?;
+    if let Some(source) = info.get("Copied From URL")
+        && !source.is_empty()
+    {
+        let rev = info.get("Copied From Rev").cloned().unwrap_or_default();
+        let root_info = get_svn_info_with(dir, svn, "/")?;
+        let source_control_path = root_info.get("URL").cloned().unwrap_or_default();
+        let diff = build_synthetic_addition_diff_with(
+            dir,
+            svn,
+            path,
+            source,
+            &rev,
+            &source_control_path,
+            config,
+        )?;
+        return Ok(Some(diff));
+    }
+    Ok(None)
+}
+
+/// Binary-filename handling: deleted paths yield the binary body;
+/// otherwise the octet-stream mime type is enforced. `None` means "no
+/// early diff, run `svn diff`".
+fn binary_filename_diff(
+    dir: &Path,
+    svn: &SvnCommand,
+    path: &str,
+    flags: u32,
+) -> Result<Option<Vec<u8>>, String> {
+    if !is_binary_filename(path) {
+        return Ok(None);
+    }
+    if flags & FLAG_DELETED != 0 {
+        return Ok(Some(binary_diff_text(path).into_bytes()));
+    }
+    let mime = get_svn_property_with(dir, svn, path, "svn:mime-type")?;
+    if mime != "application/octet-stream" {
+        let absolute = join_path(dir, Some(path)).to_string_lossy().to_string();
+        stdout_text_with(
+            dir,
+            svn,
+            &[
+                "propset",
+                "svn:mime-type",
+                "application/octet-stream",
+                &escape_file_name_for_svn(&absolute),
+            ],
+        )?;
+    }
+    Ok(None)
 }
 
 /// `getRawDiffText` with the system binary and default config.

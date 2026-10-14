@@ -209,39 +209,64 @@ pub fn discovery_replace(template: &str, captures: &[String]) -> String {
     let chars: Vec<char> = template.chars().collect();
     let mut i = 0;
     while i < chars.len() {
-        if chars[i] == '$' && i + 1 < chars.len() {
-            if chars[i + 1] == '{' {
-                if let Some(end) = chars[i + 2..].iter().position(|c| *c == '}') {
-                    let num: String = chars[i + 2..i + 2 + end].iter().collect();
-                    if let Ok(n) = num.parse::<usize>()
-                        && n >= 1
-                        && n <= captures.len()
-                    {
-                        out.push_str(&captures[n - 1]);
-                        i += 3 + end;
-                        continue;
-                    }
-                }
-            } else if chars[i + 1].is_ascii_digit() {
-                let mut j = i + 1;
-                while j < chars.len() && chars[j].is_ascii_digit() {
-                    j += 1;
-                }
-                let num: String = chars[i + 1..j].iter().collect();
-                if let Ok(n) = num.parse::<usize>()
-                    && n >= 1
-                    && n <= captures.len()
-                {
-                    out.push_str(&captures[n - 1]);
-                    i = j;
-                    continue;
-                }
-            }
+        if let Some((text, next)) = replace_capture(&chars, i, captures) {
+            out.push_str(&text);
+            i = next;
+            continue;
         }
         out.push(chars[i]);
         i += 1;
     }
     out
+}
+
+/// Expand a `$1`/`${1}` reference at `i`: the replacement plus the resume
+/// offset. Anything else (including malformed or out-of-range references,
+/// which `preg_replace` emits literally) is `None`.
+fn replace_capture(chars: &[char], i: usize, captures: &[String]) -> Option<(String, usize)> {
+    if chars[i] != '$' || i + 1 >= chars.len() {
+        return None;
+    }
+    if chars[i + 1] == '{' {
+        return replace_braced_capture(chars, i, captures);
+    }
+    if chars[i + 1].is_ascii_digit() {
+        return replace_plain_capture(chars, i, captures);
+    }
+    None
+}
+
+/// Expand a `${1}` reference at `i` (`chars[i]` is `$`, `chars[i + 1]` is
+/// `{`).
+fn replace_braced_capture(
+    chars: &[char],
+    i: usize,
+    captures: &[String],
+) -> Option<(String, usize)> {
+    let end = chars[i + 2..].iter().position(|c| *c == '}')?;
+    let num: String = chars[i + 2..i + 2 + end].iter().collect();
+    let n = num.parse::<usize>().ok()?;
+    if n >= 1 && n <= captures.len() {
+        Some((captures[n - 1].clone(), i + 3 + end))
+    } else {
+        None
+    }
+}
+
+/// Expand a `$1` reference at `i` (`chars[i]` is `$`, `chars[i + 1]` is a
+/// digit), consuming the longest digit run.
+fn replace_plain_capture(chars: &[char], i: usize, captures: &[String]) -> Option<(String, usize)> {
+    let mut j = i + 1;
+    while j < chars.len() && chars[j].is_ascii_digit() {
+        j += 1;
+    }
+    let num: String = chars[i + 1..j].iter().collect();
+    let n = num.parse::<usize>().ok()?;
+    if n >= 1 && n <= captures.len() {
+        Some((captures[n - 1].clone(), j))
+    } else {
+        None
+    }
 }
 
 /// `mapPathsToResults` (lines 121-159): apply every discovery rule to every

@@ -81,6 +81,102 @@ fn wants_help(argv: &[String]) -> bool {
         .any(|arg| arg == "-h" || arg == "--help" || arg == "help")
 }
 
+/// Read the value of a `--flag VALUE` argument, rejecting a missing, empty,
+/// or flag-like value. `what` names the value in the error.
+fn take_space_value(
+    iter: &mut std::slice::Iter<'_, String>,
+    flag: &str,
+    what: &str,
+) -> Result<String, String> {
+    let Some(value) = iter.next() else {
+        return Err(format!("{flag} requires a non-empty {what}"));
+    };
+    if value.is_empty() || value.starts_with('-') {
+        return Err(format!("{flag} requires a non-empty {what}"));
+    }
+    Ok(value.clone())
+}
+
+/// Read the value of a `--flag=VALUE` argument, rejecting an empty value.
+fn take_equals_value(value: &str, flag: &str, what: &str) -> Result<String, String> {
+    if value.is_empty() {
+        return Err(format!("{flag} requires a non-empty {what}"));
+    }
+    Ok(value.to_string())
+}
+
+/// Apply one `--onto` argument in either `--onto BRANCH` or `--onto=BRANCH`
+/// form. Returns true when `arg` was consumed.
+fn apply_onto_flag(
+    opts: &mut Options,
+    iter: &mut std::slice::Iter<'_, String>,
+    arg: &str,
+) -> Result<bool, String> {
+    if arg == "--onto" {
+        opts.onto = take_space_value(iter, "--onto", "branch name")?;
+        Ok(true)
+    } else if let Some(value) = arg.strip_prefix("--onto=") {
+        opts.onto = take_equals_value(value, "--onto", "branch name")?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Apply one `--revision` argument in either space or `=` form. Returns true
+/// when `arg` was consumed.
+fn apply_revision_flag(
+    opts: &mut Options,
+    iter: &mut std::slice::Iter<'_, String>,
+    arg: &str,
+) -> Result<bool, String> {
+    if arg == "--revision" {
+        opts.revision = Some(take_space_value(iter, "--revision", "revision")?);
+        Ok(true)
+    } else if let Some(value) = arg.strip_prefix("--revision=") {
+        opts.revision = Some(take_equals_value(value, "--revision", "revision")?);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Apply one `--conduit-uri` argument in either space or `=` form. Returns
+/// true when `arg` was consumed.
+fn apply_conduit_flag(
+    opts: &mut Options,
+    iter: &mut std::slice::Iter<'_, String>,
+    arg: &str,
+) -> Result<bool, String> {
+    if arg == "--conduit-uri" {
+        opts.conduit_uri = Some(take_space_value(iter, "--conduit-uri", "URI")?);
+        Ok(true)
+    } else if let Some(value) = arg.strip_prefix("--conduit-uri=") {
+        opts.conduit_uri = Some(take_equals_value(value, "--conduit-uri", "URI")?);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Apply one value-taking `land` flag. Returns true when `arg` was consumed.
+fn apply_value_flag(
+    opts: &mut Options,
+    iter: &mut std::slice::Iter<'_, String>,
+    arg: &str,
+) -> Result<bool, String> {
+    if apply_onto_flag(opts, iter, arg)? {
+        return Ok(true);
+    }
+    if apply_revision_flag(opts, iter, arg)? {
+        return Ok(true);
+    }
+    if apply_conduit_flag(opts, iter, arg)? {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn parse_args(argv: &[String]) -> Result<Options, String> {
     let mut opts = Options {
         onto: DEFAULT_ONTO.to_string(),
@@ -91,42 +187,8 @@ fn parse_args(argv: &[String]) -> Result<Options, String> {
     };
     let mut iter = argv.iter();
     while let Some(arg) = iter.next() {
-        if arg == "--onto" {
-            match iter.next() {
-                Some(value) if !value.is_empty() && !value.starts_with('-') => {
-                    opts.onto = value.clone();
-                }
-                _ => return Err("--onto requires a non-empty branch name".to_string()),
-            }
-        } else if let Some(value) = arg.strip_prefix("--onto=") {
-            if value.is_empty() {
-                return Err("--onto requires a non-empty branch name".to_string());
-            }
-            opts.onto = value.to_string();
-        } else if arg == "--revision" {
-            match iter.next() {
-                Some(value) if !value.is_empty() && !value.starts_with('-') => {
-                    opts.revision = Some(value.clone());
-                }
-                _ => return Err("--revision requires a non-empty revision".to_string()),
-            }
-        } else if let Some(value) = arg.strip_prefix("--revision=") {
-            if value.is_empty() {
-                return Err("--revision requires a non-empty revision".to_string());
-            }
-            opts.revision = Some(value.to_string());
-        } else if arg == "--conduit-uri" {
-            match iter.next() {
-                Some(value) if !value.is_empty() && !value.starts_with('-') => {
-                    opts.conduit_uri = Some(value.clone());
-                }
-                _ => return Err("--conduit-uri requires a non-empty URI".to_string()),
-            }
-        } else if let Some(value) = arg.strip_prefix("--conduit-uri=") {
-            if value.is_empty() {
-                return Err("--conduit-uri requires a non-empty URI".to_string());
-            }
-            opts.conduit_uri = Some(value.to_string());
+        if apply_value_flag(&mut opts, &mut iter, arg)? {
+            // Flag consumed.
         } else if arg == "--preview" {
             opts.preview = true;
         } else if arg == "--push" {

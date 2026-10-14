@@ -1,8 +1,8 @@
 //! `arc-rs` — Rust port of Arcanist.
 //!
-//! Tracks T1128. All arc subcommands are implemented; remaining work is
-//! wiring the ported depth (unit engines, diff submit, land checks,
-//! `.arclint`) into the command run paths.
+//! Tracks T1128. All arc subcommands are implemented and the ported depth
+//! is wired into the run paths; remaining work is the coverage push past
+//! 80% and removing the PHP tree.
 
 use std::process::ExitCode;
 

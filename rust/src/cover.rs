@@ -153,6 +153,53 @@ fn fallback_path(line: &str) -> Option<String> {
     Some(rest[marker + 3..].to_string())
 }
 
+fn apply_plusplus_line(files: &mut [FileChanges], path: &str) {
+    if path == "/dev/null" {
+        return;
+    }
+    let path = path.strip_prefix("b/").unwrap_or(path).to_string();
+    if let Some(file) = files.last_mut() {
+        file.path = path;
+    }
+}
+
+fn apply_minusminus_line(files: &mut [FileChanges], path: &str) {
+    if path == "/dev/null" {
+        return;
+    }
+    let path = path.strip_prefix("a/").unwrap_or(path).to_string();
+    if let Some(file) = files.last_mut()
+        && file.path.is_empty()
+    {
+        file.path = path;
+    }
+}
+
+fn apply_hunk_line(files: &mut [FileChanges], header: &str) {
+    let Some((start, count)) = parse_hunk(header) else {
+        return;
+    };
+    if let Some(file) = files.last_mut() {
+        file.lines.extend(start..start + count);
+    }
+}
+
+fn apply_diff_line(files: &mut Vec<FileChanges>, line: &str) {
+    if line.starts_with("diff --git ") {
+        let path = fallback_path(line).unwrap_or_default();
+        files.push(FileChanges {
+            path,
+            lines: Vec::new(),
+        });
+    } else if let Some(path) = line.strip_prefix("+++ ") {
+        apply_plusplus_line(files, path);
+    } else if let Some(path) = line.strip_prefix("--- ") {
+        apply_minusminus_line(files, path);
+    } else if let Some(header) = line.strip_prefix("@@ ") {
+        apply_hunk_line(files, header);
+    }
+}
+
 /// Parse `git diff --unified=0` output into per-file changed lines. Files
 /// without new-side lines (deletions, binary files, mode changes) are kept
 /// with empty line lists so callers can tell "changed but unattributable"
@@ -160,38 +207,7 @@ fn fallback_path(line: &str) -> Option<String> {
 pub fn parse_diff_unified0(text: &str) -> Vec<FileChanges> {
     let mut files: Vec<FileChanges> = Vec::new();
     for line in text.lines() {
-        if line.starts_with("diff --git ") {
-            let path = fallback_path(line).unwrap_or_default();
-            files.push(FileChanges {
-                path,
-                lines: Vec::new(),
-            });
-        } else if let Some(path) = line.strip_prefix("+++ ") {
-            if path == "/dev/null" {
-                continue;
-            }
-            let path = path.strip_prefix("b/").unwrap_or(path).to_string();
-            if let Some(file) = files.last_mut() {
-                file.path = path;
-            }
-        } else if let Some(path) = line.strip_prefix("--- ") {
-            if path == "/dev/null" {
-                continue;
-            }
-            let path = path.strip_prefix("a/").unwrap_or(path).to_string();
-            if let Some(file) = files.last_mut()
-                && file.path.is_empty()
-            {
-                file.path = path;
-            }
-        } else if let Some(header) = line.strip_prefix("@@ ") {
-            let Some((start, count)) = parse_hunk(header) else {
-                continue;
-            };
-            if let Some(file) = files.last_mut() {
-                file.lines.extend(start..start + count);
-            }
-        }
+        apply_diff_line(&mut files, line);
     }
     files.retain(|file| !file.path.is_empty());
     files
@@ -288,6 +304,103 @@ fn untracked_files(dir: &Path, paths: &[String]) -> Result<Vec<String>, String> 
         .collect())
 }
 
+/// Changed lines grouped by author, then by file.
+type Covers = BTreeMap<String, BTreeMap<String, Vec<u64>>>;
+
+fn resolve_cover_base(dir: &Path, rev: Option<&str>) -> Result<Option<String>, String> {
+    match rev {
+        Some(rev) => match resolve_commit(dir, rev) {
+            Some(sha) => Ok(Some(sha)),
+            None => Err(format!("invalid revision '{rev}'.")),
+        },
+        None => Ok(resolve_commit(dir, "HEAD")),
+    }
+}
+
+fn check_cover_paths(dir: &Path, paths: &[String], base: Option<&str>) -> Result<(), String> {
+    for path in paths {
+        if !path_known(dir, path, base) {
+            return Err(format!("path does not exist: {path}"));
+        }
+    }
+    Ok(())
+}
+
+fn collect_cover_changes(
+    dir: &Path,
+    base: Option<&str>,
+    paths: &[String],
+) -> Result<(Vec<FileChanges>, Vec<String>), String> {
+    let tracked = match base {
+        Some(base) => diff_changes(dir, base, paths)?,
+        None => Vec::new(),
+    };
+    let untracked = untracked_files(dir, paths)?;
+    Ok((tracked, untracked))
+}
+
+fn attribute_lines(authors: &[String], changes: &FileChanges, covers: &mut Covers) {
+    for line in &changes.lines {
+        let index = (*line as usize).saturating_sub(1);
+        let Some(author) = authors.get(index) else {
+            continue;
+        };
+        if author.is_empty() {
+            continue;
+        }
+        covers
+            .entry(author.clone())
+            .or_default()
+            .entry(changes.path.clone())
+            .or_default()
+            .push(*line);
+    }
+}
+
+fn blame_cover_lines(dir: &Path, tracked: &[FileChanges]) -> Result<Covers, String> {
+    let mut covers: Covers = BTreeMap::new();
+    for changes in tracked {
+        if changes.lines.is_empty() {
+            continue;
+        }
+        let authors = blame_file(dir, &changes.path)?;
+        attribute_lines(&authors, changes, &mut covers);
+    }
+    Ok(covers)
+}
+
+fn print_covers(covers: &Covers) {
+    for (author, files) in covers {
+        println!("{author}");
+        for (file, lines) in files {
+            println!(
+                "  {file}: {} line(s) {}",
+                lines.len(),
+                readable_sequence(lines)
+            );
+        }
+    }
+}
+
+fn execute_cover(dir: &Path, options: &Options) -> Result<(), String> {
+    check_working_copy(dir)?;
+    let base = resolve_cover_base(dir, options.rev.as_deref())?;
+    check_cover_paths(dir, &options.paths, base.as_deref())?;
+    let (tracked, untracked) = collect_cover_changes(dir, base.as_deref(), &options.paths)?;
+    if tracked.is_empty() && untracked.is_empty() {
+        println!("You're covered, you didn't change anything.");
+        return Ok(());
+    }
+    let covers = blame_cover_lines(dir, &tracked)?;
+    // Untracked files carry no blame, so their lines stay unattributed.
+    if covers.is_empty() {
+        println!("You're covered, your changes didn't touch anyone else's code.");
+        return Ok(());
+    }
+    print_covers(&covers);
+    Ok(())
+}
+
 /// Cover changed lines in `dir` per `argv`.
 pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
     let options = match parse_args(argv) {
@@ -301,91 +414,13 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
         }
         ParseOutcome::Args(options) => options,
     };
-    if let Err(message) = check_working_copy(dir) {
-        eprintln!("arc-rs {NAME}: {message}");
-        return ExitCode::FAILURE;
-    }
-    let base = match options.rev.as_deref() {
-        Some(rev) => match resolve_commit(dir, rev) {
-            Some(sha) => Some(sha),
-            None => {
-                eprintln!("arc-rs {NAME}: invalid revision '{rev}'.");
-                return ExitCode::FAILURE;
-            }
-        },
-        None => resolve_commit(dir, "HEAD"),
-    };
-    for path in &options.paths {
-        if !path_known(dir, path, base.as_deref()) {
-            eprintln!("arc-rs {NAME}: path does not exist: {path}");
-            return ExitCode::FAILURE;
-        }
-    }
-    let tracked = match base.as_deref() {
-        Some(base) => match diff_changes(dir, base, &options.paths) {
-            Ok(changes) => changes,
-            Err(message) => {
-                eprintln!("arc-rs {NAME}: {message}");
-                return ExitCode::FAILURE;
-            }
-        },
-        None => Vec::new(),
-    };
-    let untracked = match untracked_files(dir, &options.paths) {
-        Ok(files) => files,
+    match execute_cover(dir, &options) {
+        Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("arc-rs {NAME}: {message}");
-            return ExitCode::FAILURE;
-        }
-    };
-    if tracked.is_empty() && untracked.is_empty() {
-        println!("You're covered, you didn't change anything.");
-        return ExitCode::SUCCESS;
-    }
-    let mut covers: BTreeMap<String, BTreeMap<String, Vec<u64>>> = BTreeMap::new();
-    for changes in &tracked {
-        if changes.lines.is_empty() {
-            continue;
-        }
-        let authors = match blame_file(dir, &changes.path) {
-            Ok(authors) => authors,
-            Err(message) => {
-                eprintln!("arc-rs {NAME}: {message}");
-                return ExitCode::FAILURE;
-            }
-        };
-        for line in &changes.lines {
-            let index = (*line as usize).saturating_sub(1);
-            let Some(author) = authors.get(index) else {
-                continue;
-            };
-            if author.is_empty() {
-                continue;
-            }
-            covers
-                .entry(author.clone())
-                .or_default()
-                .entry(changes.path.clone())
-                .or_default()
-                .push(*line);
+            ExitCode::FAILURE
         }
     }
-    // Untracked files carry no blame, so their lines stay unattributed.
-    if covers.is_empty() {
-        println!("You're covered, your changes didn't touch anyone else's code.");
-        return ExitCode::SUCCESS;
-    }
-    for (author, files) in &covers {
-        println!("{author}");
-        for (file, lines) in files {
-            println!(
-                "  {file}: {} line(s) {}",
-                lines.len(),
-                readable_sequence(lines)
-            );
-        }
-    }
-    ExitCode::SUCCESS
 }
 
 /// Entry point: `argv` excludes the subcommand name.

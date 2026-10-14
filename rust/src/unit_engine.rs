@@ -782,44 +782,79 @@ fn parse_attrs(head: &str) -> Vec<(String, String)> {
     let chars: Vec<char> = head.chars().collect();
     let mut i = 0;
     while i < chars.len() {
-        while i < chars.len() && (chars[i].is_whitespace() || chars[i] == '/') {
-            i += 1;
-        }
-        let start = i;
-        while i < chars.len() && !chars[i].is_whitespace() && chars[i] != '=' && chars[i] != '/' {
-            i += 1;
-        }
-        if start == i {
-            if i < chars.len() {
-                i += 1;
-            }
-            continue;
-        }
-        let name: String = chars[start..i].iter().collect();
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
-        }
-        if i < chars.len() && chars[i] == '=' {
-            i += 1;
-            while i < chars.len() && chars[i].is_whitespace() {
-                i += 1;
-            }
-            if i < chars.len() && (chars[i] == '"' || chars[i] == '\'') {
-                let quote = chars[i];
-                i += 1;
-                let value_start = i;
-                while i < chars.len() && chars[i] != quote {
-                    i += 1;
-                }
-                let value: String = chars[value_start..i].iter().collect();
-                if i < chars.len() {
-                    i += 1;
-                }
+        match scan_unit_attr(&chars, i) {
+            UnitAttrScan::Parsed(name, value, next) => {
                 attrs.push((name, unescape_xml(&value)));
+                i = next;
             }
+            UnitAttrScan::Skipped(next) => i = next,
         }
     }
     attrs
+}
+
+/// Outcome of scanning one attribute: parsed or skipped (resume at the
+/// offset). Valueless names are silently dropped, like the PHP parser.
+enum UnitAttrScan {
+    Parsed(String, String, usize),
+    Skipped(usize),
+}
+
+/// Scan one attribute starting at `start` (past leading padding).
+fn scan_unit_attr(chars: &[char], start: usize) -> UnitAttrScan {
+    let mut i = skip_unit_gap(chars, start);
+    let name_start = i;
+    while i < chars.len() && !chars[i].is_whitespace() && chars[i] != '=' && chars[i] != '/' {
+        i += 1;
+    }
+    if name_start == i {
+        if i < chars.len() {
+            i += 1;
+        }
+        return UnitAttrScan::Skipped(i);
+    }
+    let name: String = chars[name_start..i].iter().collect();
+    scan_unit_attr_value(chars, name, i)
+}
+
+/// Scan the `= "value"` half of an attribute whose name ends at `start`.
+fn scan_unit_attr_value(chars: &[char], name: String, start: usize) -> UnitAttrScan {
+    let mut i = skip_unit_ws(chars, start);
+    if i >= chars.len() || chars[i] != '=' {
+        return UnitAttrScan::Skipped(i);
+    }
+    i += 1;
+    i = skip_unit_ws(chars, i);
+    if i >= chars.len() || (chars[i] != '"' && chars[i] != '\'') {
+        return UnitAttrScan::Skipped(i);
+    }
+    let quote = chars[i];
+    i += 1;
+    let value_start = i;
+    while i < chars.len() && chars[i] != quote {
+        i += 1;
+    }
+    let value: String = chars[value_start..i].iter().collect();
+    if i < chars.len() {
+        i += 1;
+    }
+    UnitAttrScan::Parsed(name, value, i)
+}
+
+/// Skip inter-attribute padding (whitespace and `/`).
+fn skip_unit_gap(chars: &[char], mut i: usize) -> usize {
+    while i < chars.len() && (chars[i].is_whitespace() || chars[i] == '/') {
+        i += 1;
+    }
+    i
+}
+
+/// Skip whitespace between an attribute name, `=`, and its value.
+fn skip_unit_ws(chars: &[char], mut i: usize) -> usize {
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    i
 }
 
 /// Parse JUnit/XUnit `<testcase>` results, mirroring
@@ -840,64 +875,65 @@ pub fn parse_xunit_testcases(test_results: &str) -> Result<Vec<UnitResult>, Stri
     }
     let mut results = Vec::new();
     for testcase in find_elements(test_results, "testcase") {
-        let classname = testcase.attr("classname").unwrap_or("");
-        let name = testcase.attr("name").unwrap_or("");
-        let time = testcase.attr("time").unwrap_or("");
-        let mut status = RESULT_PASS;
-        let mut user_data = String::new();
-
-        let skipped = find_elements(&testcase.inner, "skipped");
-        if !skipped.is_empty() {
-            status = RESULT_SKIP;
-            let messages: Vec<String> = skipped
-                .iter()
-                .map(|e| {
-                    text_content(&e.inner)
-                        .trim_matches(|c| c == ' ' || c == '\n')
-                        .to_string()
-                })
-                .collect();
-            user_data.push_str(&messages.join("\n"));
-        }
-
-        let failures = find_elements(&testcase.inner, "failure");
-        if !failures.is_empty() {
-            status = RESULT_FAIL;
-            let messages: Vec<String> = failures
-                .iter()
-                .map(|e| {
-                    text_content(&e.inner)
-                        .trim_matches(|c| c == ' ' || c == '\n')
-                        .to_string()
-                })
-                .collect();
-            user_data.push_str(&messages.join("\n"));
-            user_data.push('\n');
-        }
-
-        let errors = find_elements(&testcase.inner, "error");
-        if !errors.is_empty() {
-            status = RESULT_BROKEN;
-            let messages: Vec<String> = errors
-                .iter()
-                .map(|e| {
-                    text_content(&e.inner)
-                        .trim_matches(|c| c == ' ' || c == '\n')
-                        .to_string()
-                })
-                .collect();
-            user_data.push_str(&messages.join("\n"));
-            user_data.push('\n');
-        }
-
-        let mut result = UnitResult::new();
-        result.set_name(&format!("{classname}.{name}"))?;
-        result.set_result(status);
-        result.set_duration(time.parse::<f64>().unwrap_or(0.0));
-        result.set_user_data(&user_data);
-        results.push(result);
+        results.push(build_xunit_case_result(&testcase)?);
     }
     Ok(results)
+}
+
+/// Build one testcase result: `classname.name`, parsed duration, and the
+/// status/user-data resolved from its `skipped`/`failure`/`error` blocks.
+fn build_xunit_case_result(testcase: &XmlElement) -> Result<UnitResult, String> {
+    let classname = testcase.attr("classname").unwrap_or("");
+    let name = testcase.attr("name").unwrap_or("");
+    let time = testcase.attr("time").unwrap_or("");
+    let (status, user_data) = xunit_case_status(&testcase.inner);
+    let mut result = UnitResult::new();
+    result.set_name(&format!("{classname}.{name}"))?;
+    result.set_result(status);
+    result.set_duration(time.parse::<f64>().unwrap_or(0.0));
+    result.set_user_data(&user_data);
+    Ok(result)
+}
+
+/// Resolve a testcase's status from its outcome blocks: `skipped` maps to
+/// skip, `failure` to fail, `error` to broken; later blocks override earlier
+/// ones, and failure/error bodies gain a trailing newline.
+fn xunit_case_status(inner: &str) -> (&'static str, String) {
+    let mut status = RESULT_PASS;
+    let mut user_data = String::new();
+    if let Some(messages) = xunit_block_text(inner, "skipped") {
+        status = RESULT_SKIP;
+        user_data.push_str(&messages);
+    }
+    if let Some(messages) = xunit_block_text(inner, "failure") {
+        status = RESULT_FAIL;
+        user_data.push_str(&messages);
+        user_data.push('\n');
+    }
+    if let Some(messages) = xunit_block_text(inner, "error") {
+        status = RESULT_BROKEN;
+        user_data.push_str(&messages);
+        user_data.push('\n');
+    }
+    (status, user_data)
+}
+
+/// Joined text of a testcase's outcome blocks, or `None` when the testcase
+/// has no such block.
+fn xunit_block_text(inner: &str, tag: &str) -> Option<String> {
+    let blocks = find_elements(inner, tag);
+    if blocks.is_empty() {
+        return None;
+    }
+    let messages: Vec<String> = blocks
+        .iter()
+        .map(|e| {
+            text_content(&e.inner)
+                .trim_matches(|c| c == ' ' || c == '\n')
+                .to_string()
+        })
+        .collect();
+    Some(messages.join("\n"))
 }
 
 // --- Mini JSON --------------------------------------------------------------
@@ -1096,49 +1132,7 @@ impl JsonParser {
                 }
                 '\\' => {
                     self.pos += 1;
-                    if self.pos >= self.chars.len() {
-                        return Err("unterminated escape in JSON string".to_string());
-                    }
-                    let esc = self.chars[self.pos];
-                    match esc {
-                        '"' | '\\' | '/' => out.push(esc),
-                        'b' => out.push('\u{0008}'),
-                        'f' => out.push('\u{000C}'),
-                        'n' => out.push('\n'),
-                        'r' => out.push('\r'),
-                        't' => out.push('\t'),
-                        'u' => {
-                            self.pos += 1;
-                            let mut code = self.parse_hex4()?;
-                            if (0xD800..0xDC00).contains(&code) {
-                                if self.pos + 1 < self.chars.len()
-                                    && self.chars[self.pos] == '\\'
-                                    && self.chars[self.pos + 1] == 'u'
-                                {
-                                    self.pos += 2;
-                                    let low = self.parse_hex4()?;
-                                    if (0xDC00..0xE000).contains(&low) {
-                                        code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
-                                    } else {
-                                        return Err(
-                                            "invalid low surrogate in JSON string".to_string()
-                                        );
-                                    }
-                                } else {
-                                    return Err(
-                                        "unpaired high surrogate in JSON string".to_string()
-                                    );
-                                }
-                            }
-                            match char::from_u32(code) {
-                                Some(ch) => out.push(ch),
-                                None => return Err("invalid code point in JSON string".to_string()),
-                            }
-                            continue;
-                        }
-                        _ => return Err(format!("invalid escape '\\{esc}' in JSON string")),
-                    }
-                    self.pos += 1;
+                    self.parse_string_escape(&mut out)?;
                 }
                 c if (c as u32) < 0x20 => {
                     return Err("unescaped control character in JSON string".to_string());
@@ -1150,6 +1144,75 @@ impl JsonParser {
             }
         }
         Err("unterminated JSON string".to_string())
+    }
+
+    /// One `\` escape. Precondition: the position is just past the
+    /// backslash; on success it is past the escape.
+    fn parse_string_escape(&mut self, out: &mut String) -> Result<(), String> {
+        if self.pos >= self.chars.len() {
+            return Err("unterminated escape in JSON string".to_string());
+        }
+        let esc = self.chars[self.pos];
+        match esc {
+            '"' | '\\' | '/' => {
+                out.push(esc);
+                self.pos += 1;
+            }
+            'b' => {
+                out.push('\u{0008}');
+                self.pos += 1;
+            }
+            'f' => {
+                out.push('\u{000C}');
+                self.pos += 1;
+            }
+            'n' => {
+                out.push('\n');
+                self.pos += 1;
+            }
+            'r' => {
+                out.push('\r');
+                self.pos += 1;
+            }
+            't' => {
+                out.push('\t');
+                self.pos += 1;
+            }
+            'u' => {
+                let ch = self.parse_unicode_escape()?;
+                out.push(ch);
+            }
+            _ => return Err(format!("invalid escape '\\{esc}' in JSON string")),
+        }
+        Ok(())
+    }
+
+    /// One `\uXXXX` escape with surrogate-pair handling. Precondition: the
+    /// position is at the `u`; on success it is past the escape.
+    fn parse_unicode_escape(&mut self) -> Result<char, String> {
+        self.pos += 1;
+        let mut code = self.parse_hex4()?;
+        if (0xD800..0xDC00).contains(&code) {
+            code = self.parse_low_surrogate(code)?;
+        }
+        char::from_u32(code).ok_or_else(|| "invalid code point in JSON string".to_string())
+    }
+
+    /// The `\uDC00`-`\uDFFF` second half of a surrogate pair, combining it
+    /// with the high surrogate into the astral code point.
+    fn parse_low_surrogate(&mut self, high: u32) -> Result<u32, String> {
+        if self.pos + 1 < self.chars.len()
+            && self.chars[self.pos] == '\\'
+            && self.chars[self.pos + 1] == 'u'
+        {
+            self.pos += 2;
+            let low = self.parse_hex4()?;
+            if (0xDC00..0xE000).contains(&low) {
+                return Ok(0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00));
+            }
+            return Err("invalid low surrogate in JSON string".to_string());
+        }
+        Err("unpaired high surrogate in JSON string".to_string())
     }
 
     fn parse_hex4(&mut self) -> Result<u32, String> {
@@ -1165,31 +1228,43 @@ impl JsonParser {
 
     fn parse_number(&mut self) -> Result<JsonValue, String> {
         let start = self.pos;
+        self.skip_number_sign();
+        self.skip_number_digits();
+        if self.pos < self.chars.len() && self.chars[self.pos] == '.' {
+            self.pos += 1;
+            self.skip_number_digits();
+        }
+        self.skip_number_exponent();
+        let text: String = self.chars[start..self.pos].iter().collect();
+        text.parse::<f64>()
+            .map(JsonValue::Num)
+            .map_err(|_| format!("invalid JSON number '{text}'"))
+    }
+
+    /// The optional leading `-` of a JSON number.
+    fn skip_number_sign(&mut self) {
         if self.pos < self.chars.len() && self.chars[self.pos] == '-' {
             self.pos += 1;
         }
+    }
+
+    /// A run of ASCII digits (possibly empty; validity is settled by the
+    /// final `f64` parse).
+    fn skip_number_digits(&mut self) {
         while self.pos < self.chars.len() && self.chars[self.pos].is_ascii_digit() {
             self.pos += 1;
         }
-        if self.pos < self.chars.len() && self.chars[self.pos] == '.' {
-            self.pos += 1;
-            while self.pos < self.chars.len() && self.chars[self.pos].is_ascii_digit() {
-                self.pos += 1;
-            }
-        }
+    }
+
+    /// The optional `e[+-]digits` exponent of a JSON number.
+    fn skip_number_exponent(&mut self) {
         if self.pos < self.chars.len() && matches!(self.chars[self.pos], 'e' | 'E') {
             self.pos += 1;
             if self.pos < self.chars.len() && matches!(self.chars[self.pos], '+' | '-') {
                 self.pos += 1;
             }
-            while self.pos < self.chars.len() && self.chars[self.pos].is_ascii_digit() {
-                self.pos += 1;
-            }
+            self.skip_number_digits();
         }
-        let text: String = self.chars[start..self.pos].iter().collect();
-        text.parse::<f64>()
-            .map(JsonValue::Num)
-            .map_err(|_| format!("invalid JSON number '{text}'"))
     }
 }
 

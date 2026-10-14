@@ -95,6 +95,143 @@ fn take_equals(value: &str, flag: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
+/// A value-taking `diff` flag (`--base REV`, `--base=REV`, `-m MSG`, ...).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueFlag {
+    Base,
+    Head,
+    Message,
+    MessageFile,
+    Reviewers,
+    Cc,
+    Update,
+    ConduitUri,
+}
+
+/// Canonical `--flag` spelling of a value flag, for error messages.
+fn flag_name(flag: ValueFlag) -> &'static str {
+    match flag {
+        ValueFlag::Base => "--base",
+        ValueFlag::Head => "--head",
+        ValueFlag::Message => "--message",
+        ValueFlag::MessageFile => "--message-file",
+        ValueFlag::Reviewers => "--reviewers",
+        ValueFlag::Cc => "--cc",
+        ValueFlag::Update => "--update",
+        ValueFlag::ConduitUri => "--conduit-uri",
+    }
+}
+
+/// Classify a space-separated value flag (`--base`, `-m`, ...).
+fn classify_space_flag(arg: &str) -> Option<ValueFlag> {
+    if arg == "--base" {
+        Some(ValueFlag::Base)
+    } else if arg == "--head" {
+        Some(ValueFlag::Head)
+    } else if arg == "--message" || arg == "-m" {
+        Some(ValueFlag::Message)
+    } else if arg == "--message-file" || arg == "-F" {
+        Some(ValueFlag::MessageFile)
+    } else if arg == "--reviewers" {
+        Some(ValueFlag::Reviewers)
+    } else if arg == "--cc" {
+        Some(ValueFlag::Cc)
+    } else if arg == "--update" {
+        Some(ValueFlag::Update)
+    } else if arg == "--conduit-uri" {
+        Some(ValueFlag::ConduitUri)
+    } else {
+        None
+    }
+}
+
+/// Classify a `--flag=value` argument, returning the flag and the value.
+fn classify_equals_flag(arg: &str) -> Option<(ValueFlag, &str)> {
+    if let Some(value) = arg.strip_prefix("--base=") {
+        Some((ValueFlag::Base, value))
+    } else if let Some(value) = arg.strip_prefix("--head=") {
+        Some((ValueFlag::Head, value))
+    } else if let Some(value) = arg.strip_prefix("--message=") {
+        Some((ValueFlag::Message, value))
+    } else if let Some(value) = arg.strip_prefix("--message-file=") {
+        Some((ValueFlag::MessageFile, value))
+    } else if let Some(value) = arg.strip_prefix("--reviewers=") {
+        Some((ValueFlag::Reviewers, value))
+    } else if let Some(value) = arg.strip_prefix("--cc=") {
+        Some((ValueFlag::Cc, value))
+    } else if let Some(value) = arg.strip_prefix("--update=") {
+        Some((ValueFlag::Update, value))
+    } else if let Some(value) = arg.strip_prefix("--conduit-uri=") {
+        Some((ValueFlag::ConduitUri, value))
+    } else {
+        None
+    }
+}
+
+/// Store a parsed value-flag value in `options`.
+fn store_value_flag(options: &mut Options, flag: ValueFlag, value: String) {
+    match flag {
+        ValueFlag::Base => options.base = Some(value),
+        ValueFlag::Head => options.head = Some(value),
+        ValueFlag::Message => options.message = Some(value),
+        ValueFlag::MessageFile => options.message_file = Some(value),
+        ValueFlag::Reviewers => options.reviewers = Some(value),
+        ValueFlag::Cc => options.cc = Some(value),
+        ValueFlag::Update => options.update = Some(value),
+        ValueFlag::ConduitUri => options.conduit_uri = Some(value),
+    }
+}
+
+/// Apply a boolean `diff` flag (`--json`, `--create`, `--only`).
+///
+/// Returns true when `arg` was consumed.
+fn apply_simple_flag(options: &mut Options, arg: &str) -> bool {
+    if arg == "--json" {
+        options.json = true;
+    } else if arg == "--create" {
+        options.create = true;
+    } else if arg == "--only" {
+        options.only = true;
+    } else {
+        return false;
+    }
+    true
+}
+
+/// Apply one value-taking `diff` flag in either `--flag VALUE` or
+/// `--flag=VALUE` form.
+///
+/// Returns true when `arg` was consumed.
+fn apply_value_flag(
+    options: &mut Options,
+    iter: &mut std::iter::Peekable<std::slice::Iter<'_, String>>,
+    arg: &str,
+) -> Result<bool, String> {
+    if let Some(flag) = classify_space_flag(arg) {
+        store_value_flag(options, flag, take_value(iter, arg)?);
+        return Ok(true);
+    }
+    if let Some((flag, value)) = classify_equals_flag(arg) {
+        store_value_flag(options, flag, take_equals(value, flag_name(flag))?);
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Apply one `diff` flag (boolean or value-taking).
+///
+/// Returns true when `arg` was consumed.
+fn apply_flag(
+    options: &mut Options,
+    iter: &mut std::iter::Peekable<std::slice::Iter<'_, String>>,
+    arg: &str,
+) -> Result<bool, String> {
+    if apply_simple_flag(options, arg) {
+        return Ok(true);
+    }
+    apply_value_flag(options, iter, arg)
+}
+
 /// Parse `argv` (excluding the subcommand name).
 ///
 /// Returns `Ok(None)` when `--help` was requested.
@@ -121,44 +258,8 @@ pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
             positionals.push(arg.clone());
         } else if arg == "--" {
             end_of_flags = true;
-        } else if arg == "--json" {
-            options.json = true;
-        } else if arg == "--create" {
-            options.create = true;
-        } else if arg == "--only" {
-            options.only = true;
-        } else if arg == "--base" {
-            options.base = Some(take_value(&mut iter, "--base")?);
-        } else if arg == "--head" {
-            options.head = Some(take_value(&mut iter, "--head")?);
-        } else if arg == "--message" || arg == "-m" {
-            options.message = Some(take_value(&mut iter, arg)?);
-        } else if arg == "--message-file" || arg == "-F" {
-            options.message_file = Some(take_value(&mut iter, arg)?);
-        } else if arg == "--reviewers" {
-            options.reviewers = Some(take_value(&mut iter, "--reviewers")?);
-        } else if arg == "--cc" {
-            options.cc = Some(take_value(&mut iter, "--cc")?);
-        } else if arg == "--update" {
-            options.update = Some(take_value(&mut iter, "--update")?);
-        } else if arg == "--conduit-uri" {
-            options.conduit_uri = Some(take_value(&mut iter, "--conduit-uri")?);
-        } else if let Some(value) = arg.strip_prefix("--base=") {
-            options.base = Some(take_equals(value, "--base")?);
-        } else if let Some(value) = arg.strip_prefix("--head=") {
-            options.head = Some(take_equals(value, "--head")?);
-        } else if let Some(value) = arg.strip_prefix("--message=") {
-            options.message = Some(take_equals(value, "--message")?);
-        } else if let Some(value) = arg.strip_prefix("--message-file=") {
-            options.message_file = Some(take_equals(value, "--message-file")?);
-        } else if let Some(value) = arg.strip_prefix("--reviewers=") {
-            options.reviewers = Some(take_equals(value, "--reviewers")?);
-        } else if let Some(value) = arg.strip_prefix("--cc=") {
-            options.cc = Some(take_equals(value, "--cc")?);
-        } else if let Some(value) = arg.strip_prefix("--update=") {
-            options.update = Some(take_equals(value, "--update")?);
-        } else if let Some(value) = arg.strip_prefix("--conduit-uri=") {
-            options.conduit_uri = Some(take_equals(value, "--conduit-uri")?);
+        } else if apply_flag(&mut options, &mut iter, arg)? {
+            // Flag consumed.
         } else if arg == "--help" || arg == "-h" {
             return Ok(None);
         } else if arg.starts_with('-') {

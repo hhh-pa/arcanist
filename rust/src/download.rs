@@ -65,56 +65,116 @@ fn take_value(iter: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<Str
     }
 }
 
-fn parse_args(argv: &[String]) -> ParseOutcome {
-    let mut save_as: Option<String> = None;
-    let mut conduit_uri: Option<String> = None;
-    let mut positionals: Vec<String> = Vec::new();
-    let mut end_of_flags = false;
+/// One argument's parse step: consumed, or a terminal outcome.
+enum Step {
+    Handled,
+    Done(ParseOutcome),
+}
 
-    let mut iter = argv.iter();
-    while let Some(arg) = iter.next() {
-        if end_of_flags {
-            positionals.push(arg.clone());
-        } else if arg == "--" {
-            end_of_flags = true;
-        } else if arg == "--as" {
-            match take_value(&mut iter, "--as") {
-                Ok(value) => save_as = Some(value),
-                Err(outcome) => return outcome,
-            }
-        } else if let Some(value) = arg.strip_prefix("--as=") {
-            save_as = Some(value.to_string());
-        } else if arg == "--conduit-uri" {
-            match take_value(&mut iter, "--conduit-uri") {
-                Ok(value) => conduit_uri = Some(value),
-                Err(outcome) => return outcome,
-            }
-        } else if let Some(value) = arg.strip_prefix("--conduit-uri=") {
-            conduit_uri = Some(value.to_string());
-        } else if arg == "-h" || arg == "--help" {
-            return ParseOutcome::Help;
-        } else if arg.starts_with('-') {
-            return ParseOutcome::Error(format!("unknown flag '{arg}'"));
-        } else {
-            positionals.push(arg.clone());
+struct Parser {
+    save_as: Option<String>,
+    conduit_uri: Option<String>,
+    positionals: Vec<String>,
+    end_of_flags: bool,
+}
+
+impl Parser {
+    fn new() -> Self {
+        Self {
+            save_as: None,
+            conduit_uri: None,
+            positionals: Vec::new(),
+            end_of_flags: false,
         }
     }
 
-    if positionals.is_empty() {
-        return ParseOutcome::Error("Specify a file to download.".to_string());
+    fn flag_save_as(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Option<Step> {
+        if arg == "--as" {
+            match take_value(iter, "--as") {
+                Ok(value) => self.save_as = Some(value),
+                Err(outcome) => return Some(Step::Done(outcome)),
+            }
+            return Some(Step::Handled);
+        }
+        if let Some(value) = arg.strip_prefix("--as=") {
+            self.save_as = Some(value.to_string());
+            return Some(Step::Handled);
+        }
+        None
     }
-    if positionals.len() > 1 {
-        return ParseOutcome::Error("Specify exactly one file to download.".to_string());
+
+    fn flag_conduit(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Option<Step> {
+        if arg == "--conduit-uri" {
+            match take_value(iter, "--conduit-uri") {
+                Ok(value) => self.conduit_uri = Some(value),
+                Err(outcome) => return Some(Step::Done(outcome)),
+            }
+            return Some(Step::Handled);
+        }
+        if let Some(value) = arg.strip_prefix("--conduit-uri=") {
+            self.conduit_uri = Some(value.to_string());
+            return Some(Step::Handled);
+        }
+        None
     }
-    let file_id = match parse_file_symbol(&positionals[0]) {
-        Ok(id) => id,
-        Err(message) => return ParseOutcome::Error(message),
-    };
-    ParseOutcome::Args(Options {
-        file_id,
-        save_as,
-        conduit_uri,
-    })
+
+    fn tail(&mut self, arg: &str) -> Step {
+        if arg == "--" {
+            self.end_of_flags = true;
+            Step::Handled
+        } else if arg == "-h" || arg == "--help" {
+            Step::Done(ParseOutcome::Help)
+        } else if arg.starts_with('-') {
+            Step::Done(ParseOutcome::Error(format!("unknown flag '{arg}'")))
+        } else {
+            self.positionals.push(arg.to_string());
+            Step::Handled
+        }
+    }
+
+    fn consume(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Step {
+        if self.end_of_flags {
+            self.positionals.push(arg.to_string());
+            return Step::Handled;
+        }
+        if let Some(step) = self.flag_save_as(arg, iter) {
+            return step;
+        }
+        if let Some(step) = self.flag_conduit(arg, iter) {
+            return step;
+        }
+        self.tail(arg)
+    }
+
+    fn finish(self) -> ParseOutcome {
+        if self.positionals.is_empty() {
+            return ParseOutcome::Error("Specify a file to download.".to_string());
+        }
+        if self.positionals.len() > 1 {
+            return ParseOutcome::Error("Specify exactly one file to download.".to_string());
+        }
+        let file_id = match parse_file_symbol(&self.positionals[0]) {
+            Ok(id) => id,
+            Err(message) => return ParseOutcome::Error(message),
+        };
+        ParseOutcome::Args(Options {
+            file_id,
+            save_as: self.save_as,
+            conduit_uri: self.conduit_uri,
+        })
+    }
+}
+
+fn parse_args(argv: &[String]) -> ParseOutcome {
+    let mut parser = Parser::new();
+    let mut iter = argv.iter();
+    while let Some(arg) = iter.next() {
+        match parser.consume(arg, &mut iter) {
+            Step::Handled => {}
+            Step::Done(outcome) => return outcome,
+        }
+    }
+    parser.finish()
 }
 
 /// A file resolved over Conduit, mirroring `ArcanistFileRef`.

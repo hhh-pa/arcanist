@@ -158,6 +158,84 @@ fn start_is_branch(dir: &Path, start: &str) -> bool {
     full.starts_with("refs/heads/") || full.starts_with("refs/remotes/")
 }
 
+fn work_outside_repo(dir: &Path) -> ExitCode {
+    if dir.join(".hg").is_dir() {
+        eprintln!("arc-rs {NAME}: Mercurial working copies are not yet ported (see T1128)");
+    } else {
+        eprintln!("arc-rs {NAME}: \"arc-rs work\" must be run in a Git or Mercurial working copy.");
+    }
+    ExitCode::FAILURE
+}
+
+fn checkout_existing(dir: &Path, symbol: &str) -> ExitCode {
+    println!("BRANCH Checking out branch \"{symbol}\".");
+    match git::stdout_text(dir, &["checkout", symbol, "--"]) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("arc-rs {NAME}: git checkout failed: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Reject revision/task monograms, which need Conduit lookups.
+fn reject_monogram(symbol: &str) -> Option<ExitCode> {
+    if looks_like_revision(symbol) {
+        eprintln!(
+            "arc-rs {NAME}: resolving revision \"{symbol}\" via Conduit is not yet ported (see T1128)"
+        );
+        return Some(ExitCode::FAILURE);
+    }
+    if looks_like_task(symbol) {
+        eprintln!(
+            "arc-rs {NAME}: resolving task \"{symbol}\" via Conduit is not yet ported (see T1128)"
+        );
+        return Some(ExitCode::FAILURE);
+    }
+    None
+}
+
+fn resolve_start(dir: &Path, start: Option<String>) -> Result<String, ExitCode> {
+    match start {
+        Some(start) => {
+            if resolve_commit(dir, &start).is_none() {
+                eprintln!("arc-rs {NAME}: Unable to resolve startpoint \"{start}\".");
+                return Err(ExitCode::FAILURE);
+            }
+            Ok(start)
+        }
+        None => match default_start(dir) {
+            Some(start) if resolve_commit(dir, &start).is_some() => Ok(start),
+            Some(start) => {
+                eprintln!("arc-rs {NAME}: Unable to resolve startpoint \"{start}\".");
+                Err(ExitCode::FAILURE)
+            }
+            None => {
+                eprintln!(
+                    "arc-rs {NAME}: Unable to determine a startpoint; pass --start <commit>."
+                );
+                Err(ExitCode::FAILURE)
+            }
+        },
+    }
+}
+
+fn create_branch(dir: &Path, symbol: &str, start: &str) -> ExitCode {
+    println!("NEW BRANCH Creating new branch \"{symbol}\" from \"{start}\".");
+    let mut args: Vec<&str> = vec!["checkout"];
+    if start_is_branch(dir, start) {
+        args.push("--track");
+    }
+    args.extend(["-b", symbol, start, "--"]);
+    match git::stdout_text(dir, &args) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("arc-rs {NAME}: git checkout failed: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// Begin or resume work in `dir` per `argv`.
 pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
     let options = match parse_args(argv) {
@@ -172,73 +250,20 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
         ParseOutcome::Args(options) => options,
     };
     if !git::is_inside_work_tree(dir) {
-        if dir.join(".hg").is_dir() {
-            eprintln!("arc-rs {NAME}: Mercurial working copies are not yet ported (see T1128)");
-        } else {
-            eprintln!(
-                "arc-rs {NAME}: \"arc-rs work\" must be run in a Git or Mercurial working copy."
-            );
-        }
-        return ExitCode::FAILURE;
+        return work_outside_repo(dir);
     }
     let Options { start, symbol } = options;
     if branch_exists(dir, &symbol) {
-        println!("BRANCH Checking out branch \"{symbol}\".");
-        return match git::stdout_text(dir, &["checkout", &symbol, "--"]) {
-            Ok(_) => ExitCode::SUCCESS,
-            Err(message) => {
-                eprintln!("arc-rs {NAME}: git checkout failed: {message}");
-                ExitCode::FAILURE
-            }
-        };
+        return checkout_existing(dir, &symbol);
     }
-    if looks_like_revision(&symbol) {
-        eprintln!(
-            "arc-rs {NAME}: resolving revision \"{symbol}\" via Conduit is not yet ported (see T1128)"
-        );
-        return ExitCode::FAILURE;
+    if let Some(code) = reject_monogram(&symbol) {
+        return code;
     }
-    if looks_like_task(&symbol) {
-        eprintln!(
-            "arc-rs {NAME}: resolving task \"{symbol}\" via Conduit is not yet ported (see T1128)"
-        );
-        return ExitCode::FAILURE;
-    }
-    let start = match start {
-        Some(start) => {
-            if resolve_commit(dir, &start).is_none() {
-                eprintln!("arc-rs {NAME}: Unable to resolve startpoint \"{start}\".");
-                return ExitCode::FAILURE;
-            }
-            start
-        }
-        None => match default_start(dir) {
-            Some(start) if resolve_commit(dir, &start).is_some() => start,
-            Some(start) => {
-                eprintln!("arc-rs {NAME}: Unable to resolve startpoint \"{start}\".");
-                return ExitCode::FAILURE;
-            }
-            None => {
-                eprintln!(
-                    "arc-rs {NAME}: Unable to determine a startpoint; pass --start <commit>."
-                );
-                return ExitCode::FAILURE;
-            }
-        },
+    let start = match resolve_start(dir, start) {
+        Ok(start) => start,
+        Err(code) => return code,
     };
-    println!("NEW BRANCH Creating new branch \"{symbol}\" from \"{start}\".");
-    let mut args: Vec<&str> = vec!["checkout"];
-    if start_is_branch(dir, &start) {
-        args.push("--track");
-    }
-    args.extend(["-b", &symbol, &start, "--"]);
-    match git::stdout_text(dir, &args) {
-        Ok(_) => ExitCode::SUCCESS,
-        Err(message) => {
-            eprintln!("arc-rs {NAME}: git checkout failed: {message}");
-            ExitCode::FAILURE
-        }
-    }
+    create_branch(dir, &symbol, &start)
 }
 
 /// Entry point: `argv` excludes the subcommand name.

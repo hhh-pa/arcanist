@@ -68,6 +68,126 @@ fn take_value(flag: &str, iter: &mut std::slice::Iter<'_, String>) -> Result<Str
     }
 }
 
+/// One argument's parse step: consumed, `--help`, or a fatal error.
+enum Step {
+    Handled,
+    Help,
+    Error(String),
+}
+
+fn flag_message(
+    options: &mut Options,
+    arg: &str,
+    iter: &mut std::slice::Iter<'_, String>,
+) -> Option<Step> {
+    if arg == "-m" || arg == "--message" {
+        match take_value(arg, iter) {
+            Ok(value) => options.messages.push(value),
+            Err(message) => return Some(Step::Error(message)),
+        }
+        return Some(Step::Handled);
+    }
+    if let Some(value) = arg.strip_prefix("--message=") {
+        if value.is_empty() {
+            return Some(Step::Error(
+                "--message requires a non-empty value".to_string(),
+            ));
+        }
+        options.messages.push(value.to_string());
+        return Some(Step::Handled);
+    }
+    None
+}
+
+fn flag_message_short(options: &mut Options, arg: &str) -> Option<Step> {
+    if arg.len() > 2 && arg.starts_with("-m") && !arg.starts_with("--") {
+        options.messages.push(arg[2..].to_string());
+        Some(Step::Handled)
+    } else {
+        None
+    }
+}
+
+fn flag_revision(
+    options: &mut Options,
+    arg: &str,
+    iter: &mut std::slice::Iter<'_, String>,
+) -> Option<Step> {
+    if arg == "--revision" {
+        match take_value(arg, iter) {
+            Ok(value) => options.revision = Some(value),
+            Err(message) => return Some(Step::Error(message)),
+        }
+        return Some(Step::Handled);
+    }
+    if let Some(value) = arg.strip_prefix("--revision=") {
+        if value.is_empty() {
+            return Some(Step::Error(
+                "--revision requires a non-empty value".to_string(),
+            ));
+        }
+        options.revision = Some(value.to_string());
+        return Some(Step::Handled);
+    }
+    None
+}
+
+fn flag_conduit(
+    options: &mut Options,
+    arg: &str,
+    iter: &mut std::slice::Iter<'_, String>,
+) -> Option<Step> {
+    if arg == "--conduit-uri" {
+        match take_value(arg, iter) {
+            Ok(value) => options.conduit_uri = Some(value),
+            Err(message) => return Some(Step::Error(message)),
+        }
+        return Some(Step::Handled);
+    }
+    if let Some(value) = arg.strip_prefix("--conduit-uri=") {
+        if value.is_empty() {
+            return Some(Step::Error(
+                "--conduit-uri requires a non-empty value".to_string(),
+            ));
+        }
+        options.conduit_uri = Some(value.to_string());
+        return Some(Step::Handled);
+    }
+    None
+}
+
+fn flag_tail(arg: &str) -> Step {
+    if arg == "-h" || arg == "--help" {
+        Step::Help
+    } else if arg == "--" {
+        Step::Error("unexpected argument '--': amend takes no paths".to_string())
+    } else if arg.starts_with('-') {
+        Step::Error(format!("unknown flag '{arg}'"))
+    } else {
+        Step::Error(format!("unexpected argument '{arg}': amend takes no paths"))
+    }
+}
+
+fn consume_arg(options: &mut Options, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Step {
+    if arg == "--show" {
+        options.show = true;
+        return Step::Handled;
+    }
+    if let Some(step) = flag_message(options, arg, iter) {
+        return step;
+    }
+    if let Some(step) = flag_message_short(options, arg) {
+        return step;
+    }
+    if let Some(step) = flag_revision(options, arg, iter) {
+        return step;
+    }
+    if let Some(step) = flag_conduit(options, arg, iter) {
+        return step;
+    }
+    flag_tail(arg)
+}
+
 /// Parse `argv` (excluding the subcommand name).
 ///
 /// Returns `Ok(None)` when `--help` was requested.
@@ -75,39 +195,10 @@ pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
     let mut options = Options::empty();
     let mut iter = argv.iter();
     while let Some(arg) = iter.next() {
-        if arg == "--show" {
-            options.show = true;
-        } else if arg == "-m" || arg == "--message" {
-            options.messages.push(take_value(arg, &mut iter)?);
-        } else if let Some(value) = arg.strip_prefix("--message=") {
-            if value.is_empty() {
-                return Err("--message requires a non-empty value".to_string());
-            }
-            options.messages.push(value.to_string());
-        } else if arg.len() > 2 && arg.starts_with("-m") && !arg.starts_with("--") {
-            options.messages.push(arg[2..].to_string());
-        } else if arg == "--revision" {
-            options.revision = Some(take_value(arg, &mut iter)?);
-        } else if let Some(value) = arg.strip_prefix("--revision=") {
-            if value.is_empty() {
-                return Err("--revision requires a non-empty value".to_string());
-            }
-            options.revision = Some(value.to_string());
-        } else if arg == "--conduit-uri" {
-            options.conduit_uri = Some(take_value(arg, &mut iter)?);
-        } else if let Some(value) = arg.strip_prefix("--conduit-uri=") {
-            if value.is_empty() {
-                return Err("--conduit-uri requires a non-empty value".to_string());
-            }
-            options.conduit_uri = Some(value.to_string());
-        } else if arg == "-h" || arg == "--help" {
-            return Ok(None);
-        } else if arg == "--" {
-            return Err("unexpected argument '--': amend takes no paths".to_string());
-        } else if arg.starts_with('-') {
-            return Err(format!("unknown flag '{arg}'"));
-        } else {
-            return Err(format!("unexpected argument '{arg}': amend takes no paths"));
+        match consume_arg(&mut options, arg, &mut iter) {
+            Step::Handled => {}
+            Step::Help => return Ok(None),
+            Step::Error(message) => return Err(message),
         }
     }
     Ok(Some(options))

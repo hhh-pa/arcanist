@@ -112,78 +112,181 @@ fn take_value(iter: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<Str
     }
 }
 
-fn parse_args(argv: &[String]) -> ParseOutcome {
-    let mut revision: Option<String> = None;
-    let mut diff: Option<String> = None;
-    let mut patch: Option<String> = None;
-    let mut name: Option<String> = None;
-    let mut preview = false;
-    let mut force = false;
-    let mut conduit_uri: Option<String> = None;
-    let mut end_of_flags = false;
+/// One argument's parse step: consumed, or a terminal outcome.
+enum Step {
+    Handled,
+    Done(ParseOutcome),
+}
 
-    let mut iter = argv.iter();
-    while let Some(arg) = iter.next() {
-        if end_of_flags {
-            if name.is_some() {
-                return ParseOutcome::Error("Specify at most one revision name.".to_string());
-            }
-            name = Some(arg.clone());
-        } else if arg == "--" {
-            end_of_flags = true;
-        } else if arg == "--revision" {
-            match take_value(&mut iter, "--revision") {
-                Ok(value) => revision = Some(value),
-                Err(outcome) => return outcome,
-            }
-        } else if let Some(value) = arg.strip_prefix("--revision=") {
-            revision = Some(value.to_string());
-        } else if arg == "--diff" {
-            match take_value(&mut iter, "--diff") {
-                Ok(value) => diff = Some(value),
-                Err(outcome) => return outcome,
-            }
-        } else if let Some(value) = arg.strip_prefix("--diff=") {
-            diff = Some(value.to_string());
-        } else if arg == "--patch" {
-            match take_value(&mut iter, "--patch") {
-                Ok(value) => patch = Some(value),
-                Err(outcome) => return outcome,
-            }
-        } else if let Some(value) = arg.strip_prefix("--patch=") {
-            patch = Some(value.to_string());
-        } else if arg == "--conduit-uri" {
-            match take_value(&mut iter, "--conduit-uri") {
-                Ok(value) => conduit_uri = Some(value),
-                Err(outcome) => return outcome,
-            }
-        } else if let Some(value) = arg.strip_prefix("--conduit-uri=") {
-            conduit_uri = Some(value.to_string());
-        } else if arg == "--preview" {
-            preview = true;
-        } else if arg == "--force" {
-            force = true;
-        } else if arg == "--nocommit" || arg == "--nobranch" || arg == "--skip-dependencies" {
-            // No-op: this port never commits, branches, or follows dependencies.
-        } else if arg == "-h" || arg == "--help" {
-            return ParseOutcome::Help;
-        } else if arg == "--arcbundle" || arg.starts_with("--arcbundle=") {
-            return not_yet_ported("--arcbundle");
-        } else if arg == "--encoding" || arg.starts_with("--encoding=") {
-            return not_yet_ported("--encoding");
-        } else if arg == "--update" {
-            return not_yet_ported("--update");
-        } else if arg.starts_with('-') {
-            return ParseOutcome::Error(format!("unknown flag '{arg}'"));
-        } else {
-            // A positional revision name, like `D12345`.
-            if name.is_some() {
-                return ParseOutcome::Error("Specify at most one revision name.".to_string());
-            }
-            name = Some(arg.clone());
+struct Parser {
+    revision: Option<String>,
+    diff: Option<String>,
+    patch: Option<String>,
+    name: Option<String>,
+    preview: bool,
+    force: bool,
+    conduit_uri: Option<String>,
+    end_of_flags: bool,
+}
+
+impl Parser {
+    fn new() -> Self {
+        Self {
+            revision: None,
+            diff: None,
+            patch: None,
+            name: None,
+            preview: false,
+            force: false,
+            conduit_uri: None,
+            end_of_flags: false,
         }
     }
 
+    fn flag_revision(
+        &mut self,
+        arg: &str,
+        iter: &mut std::slice::Iter<'_, String>,
+    ) -> Option<Step> {
+        if arg == "--revision" {
+            match take_value(iter, "--revision") {
+                Ok(value) => self.revision = Some(value),
+                Err(outcome) => return Some(Step::Done(outcome)),
+            }
+            return Some(Step::Handled);
+        }
+        if let Some(value) = arg.strip_prefix("--revision=") {
+            self.revision = Some(value.to_string());
+            return Some(Step::Handled);
+        }
+        None
+    }
+
+    fn flag_diff(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Option<Step> {
+        if arg == "--diff" {
+            match take_value(iter, "--diff") {
+                Ok(value) => self.diff = Some(value),
+                Err(outcome) => return Some(Step::Done(outcome)),
+            }
+            return Some(Step::Handled);
+        }
+        if let Some(value) = arg.strip_prefix("--diff=") {
+            self.diff = Some(value.to_string());
+            return Some(Step::Handled);
+        }
+        None
+    }
+
+    fn flag_patch(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Option<Step> {
+        if arg == "--patch" {
+            match take_value(iter, "--patch") {
+                Ok(value) => self.patch = Some(value),
+                Err(outcome) => return Some(Step::Done(outcome)),
+            }
+            return Some(Step::Handled);
+        }
+        if let Some(value) = arg.strip_prefix("--patch=") {
+            self.patch = Some(value.to_string());
+            return Some(Step::Handled);
+        }
+        None
+    }
+
+    fn flag_conduit(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Option<Step> {
+        if arg == "--conduit-uri" {
+            match take_value(iter, "--conduit-uri") {
+                Ok(value) => self.conduit_uri = Some(value),
+                Err(outcome) => return Some(Step::Done(outcome)),
+            }
+            return Some(Step::Handled);
+        }
+        if let Some(value) = arg.strip_prefix("--conduit-uri=") {
+            self.conduit_uri = Some(value.to_string());
+            return Some(Step::Handled);
+        }
+        None
+    }
+
+    /// A positional revision name, like `D12345`.
+    fn push_name(&mut self, arg: &str) -> Step {
+        if self.name.is_some() {
+            Step::Done(ParseOutcome::Error(
+                "Specify at most one revision name.".to_string(),
+            ))
+        } else {
+            self.name = Some(arg.to_string());
+            Step::Handled
+        }
+    }
+
+    fn tail_simple(&mut self, arg: &str) -> Option<Step> {
+        if arg == "--" {
+            self.end_of_flags = true;
+            return Some(Step::Handled);
+        }
+        if arg == "--preview" {
+            self.preview = true;
+            return Some(Step::Handled);
+        }
+        if arg == "--force" {
+            self.force = true;
+            return Some(Step::Handled);
+        }
+        if arg == "--nocommit" || arg == "--nobranch" || arg == "--skip-dependencies" {
+            // No-op: this port never commits, branches, or follows dependencies.
+            return Some(Step::Handled);
+        }
+        if arg == "-h" || arg == "--help" {
+            return Some(Step::Done(ParseOutcome::Help));
+        }
+        None
+    }
+
+    fn tail_source(&mut self, arg: &str) -> Step {
+        if arg == "--arcbundle" || arg.starts_with("--arcbundle=") {
+            return Step::Done(not_yet_ported("--arcbundle"));
+        }
+        if arg == "--encoding" || arg.starts_with("--encoding=") {
+            return Step::Done(not_yet_ported("--encoding"));
+        }
+        if arg == "--update" {
+            return Step::Done(not_yet_ported("--update"));
+        }
+        if arg.starts_with('-') {
+            return Step::Done(ParseOutcome::Error(format!("unknown flag '{arg}'")));
+        }
+        self.push_name(arg)
+    }
+
+    fn consume(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Step {
+        if self.end_of_flags {
+            return self.push_name(arg);
+        }
+        if let Some(step) = self.flag_revision(arg, iter) {
+            return step;
+        }
+        if let Some(step) = self.flag_diff(arg, iter) {
+            return step;
+        }
+        if let Some(step) = self.flag_patch(arg, iter) {
+            return step;
+        }
+        if let Some(step) = self.flag_conduit(arg, iter) {
+            return step;
+        }
+        if let Some(step) = self.tail_simple(arg) {
+            return step;
+        }
+        self.tail_source(arg)
+    }
+}
+
+fn check_source_count(
+    revision: &Option<String>,
+    diff: &Option<String>,
+    patch: &Option<String>,
+    name: &Option<String>,
+) -> Option<ParseOutcome> {
     let mut sources = 0;
     if revision.is_some() {
         sources += 1;
@@ -198,47 +301,81 @@ fn parse_args(argv: &[String]) -> ParseOutcome {
         sources += 1;
     }
     if sources == 0 {
-        return ParseOutcome::Error(
+        return Some(ParseOutcome::Error(
             "You must specify changes to apply to the working copy with \
              \"D12345\", \"--revision\", \"--diff\", or \"--patch\"."
                 .to_string(),
-        );
+        ));
     }
     if sources > 1 {
-        return ParseOutcome::Error(
+        return Some(ParseOutcome::Error(
             "Options \"D12345\", \"--revision\", \"--diff\" and \"--patch\" are \
              mutually exclusive. Choose exactly one patch source."
                 .to_string(),
-        );
+        ));
     }
+    None
+}
 
-    let source = if let Some(value) = revision {
-        match normalize_revision_id(&value) {
-            Ok(id) => Source::Revision(id),
-            Err(message) => return ParseOutcome::Error(message),
-        }
-    } else if let Some(value) = diff {
-        match parse_diff_id(&value) {
-            Ok(id) => Source::Diff(id),
-            Err(message) => return ParseOutcome::Error(message),
-        }
-    } else if let Some(path) = patch {
-        Source::PatchFile(path)
-    } else if let Some(value) = name {
-        match normalize_revision_id(&value) {
-            Ok(id) => Source::Revision(id),
-            Err(message) => return ParseOutcome::Error(message),
-        }
-    } else {
-        unreachable!("source count checked above");
+fn resolve_revision_source(value: &str) -> Result<Source, ParseOutcome> {
+    match normalize_revision_id(value) {
+        Ok(id) => Ok(Source::Revision(id)),
+        Err(message) => Err(ParseOutcome::Error(message)),
+    }
+}
+
+fn resolve_source(
+    revision: Option<String>,
+    diff: Option<String>,
+    patch: Option<String>,
+    name: Option<String>,
+) -> Result<Source, ParseOutcome> {
+    if let Some(value) = revision {
+        return resolve_revision_source(&value);
+    }
+    if let Some(value) = diff {
+        return match parse_diff_id(&value) {
+            Ok(id) => Ok(Source::Diff(id)),
+            Err(message) => Err(ParseOutcome::Error(message)),
+        };
+    }
+    if let Some(path) = patch {
+        return Ok(Source::PatchFile(path));
+    }
+    if let Some(value) = name {
+        return resolve_revision_source(&value);
+    }
+    unreachable!("source count checked above")
+}
+
+fn finish(parser: Parser) -> ParseOutcome {
+    if let Some(outcome) =
+        check_source_count(&parser.revision, &parser.diff, &parser.patch, &parser.name)
+    {
+        return outcome;
+    }
+    let source = match resolve_source(parser.revision, parser.diff, parser.patch, parser.name) {
+        Ok(source) => source,
+        Err(outcome) => return outcome,
     };
-
     ParseOutcome::Args(Options {
         source,
-        preview,
-        force,
-        conduit_uri,
+        preview: parser.preview,
+        force: parser.force,
+        conduit_uri: parser.conduit_uri,
     })
+}
+
+fn parse_args(argv: &[String]) -> ParseOutcome {
+    let mut parser = Parser::new();
+    let mut iter = argv.iter();
+    while let Some(arg) = iter.next() {
+        match parser.consume(arg, &mut iter) {
+            Step::Handled => {}
+            Step::Done(outcome) => return outcome,
+        }
+    }
+    finish(parser)
 }
 
 /// First diff ID in a `differential.querydiffs` result (a dict keyed by diff

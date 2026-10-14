@@ -360,32 +360,48 @@ pub fn parse_mercurial_status_details(
         let code = bytes[0];
         let path = line[2..].to_string();
         if code == b' ' {
-            match &last_path {
-                None => {
-                    return Err(format!("Unexpected copy source in hg status, '{line}'."));
-                }
-                Some(prev) => {
-                    if let Some(detail) = result.get_mut(prev) {
-                        detail.from = Some(path);
-                    }
-                    continue;
-                }
-            }
+            apply_status_copy_source(&mut result, &last_path, &path, line)?;
+            continue;
         }
-        let flags = match code {
-            b'A' => FLAG_ADDED,
-            b'R' => FLAG_DELETED,
-            b'M' => FLAG_MODIFIED,
-            b'C' => 0,
-            b'!' => FLAG_MISSING,
-            b'?' => FLAG_UNTRACKED,
-            b'I' => 0,
-            _ => return Err(format!("Unknown Mercurial status '{}'.", code as char)),
-        };
+        let flags = status_code_flags(code)?;
         last_path = Some(path.clone());
         result.insert(path, HgStatusDetail { flags, from: None });
     }
     Ok(result)
+}
+
+/// Record a `hg status -C` copy-source continuation line on the previous
+/// entry; a source with no previous entry is an error.
+fn apply_status_copy_source(
+    result: &mut BTreeMap<String, HgStatusDetail>,
+    last_path: &Option<String>,
+    path: &str,
+    line: &str,
+) -> Result<(), String> {
+    match last_path {
+        None => Err(format!("Unexpected copy source in hg status, '{line}'.")),
+        Some(prev) => {
+            if let Some(detail) = result.get_mut(prev) {
+                detail.from = Some(path.to_string());
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Flag mask for one Mercurial status code; clean (`C`) and ignored (`I`)
+/// entries carry zero flags, like PHP.
+fn status_code_flags(code: u8) -> Result<u32, String> {
+    match code {
+        b'A' => Ok(FLAG_ADDED),
+        b'R' => Ok(FLAG_DELETED),
+        b'M' => Ok(FLAG_MODIFIED),
+        b'C' => Ok(0),
+        b'!' => Ok(FLAG_MISSING),
+        b'?' => Ok(FLAG_UNTRACKED),
+        b'I' => Ok(0),
+        _ => Err(format!("Unknown Mercurial status '{}'.", code as char)),
+    }
 }
 
 /// `ArcanistMercurialParser::parseMercurialStatus`
@@ -456,42 +472,53 @@ pub fn parse_mercurial_log(stdout: &str) -> Result<Vec<HgLogEntry>, String> {
     for chunk in trimmed.split("\n\n") {
         let mut entry = HgLogEntry::default();
         for line in chunk.split('\n') {
-            if line.starts_with("comparing with")
-                || line.starts_with("searching for changes")
-                || line.starts_with("remote:")
-            {
+            if is_log_noise_line(line) {
                 continue;
             }
             let (name, value) = match line.split_once(':') {
                 Some((name, value)) => (name, value.trim().to_string()),
                 None => (line, String::new()),
             };
-            match name {
-                "user" => entry.user = Some(value),
-                "date" => {
-                    entry.date_unix = parse_hg_default_date(&value);
-                    entry.date_raw = Some(value);
-                }
-                "summary" => entry.summary = Some(value),
-                "changeset" => {
-                    let (local, rev) = split_changeset(&value);
-                    entry.local = Some(local);
-                    entry.rev = rev;
-                }
-                "parent" => {
-                    let (local, rev) = split_changeset(&value);
-                    entry.parents.push(HgLogParent { local, rev });
-                }
-                "branch" => entry.branch = Some(value),
-                "tag" => entry.tag = Some(value),
-                "bookmark" => entry.bookmark = Some(value),
-                "obsolete" | "instability" => {}
-                _ => return Err(format!("Unknown Mercurial log field '{name}'!")),
-            }
+            apply_log_field(&mut entry, name, value)?;
         }
         result.push(entry);
     }
     Ok(result)
+}
+
+/// Progress chatter `hg log` may interleave with changesets.
+fn is_log_noise_line(line: &str) -> bool {
+    line.starts_with("comparing with")
+        || line.starts_with("searching for changes")
+        || line.starts_with("remote:")
+}
+
+/// Apply one `name: value` log line to the entry; the `evolve` extension's
+/// `obsolete` / `instability` fields are skipped, unknown fields are errors.
+fn apply_log_field(entry: &mut HgLogEntry, name: &str, value: String) -> Result<(), String> {
+    match name {
+        "user" => entry.user = Some(value),
+        "date" => {
+            entry.date_unix = parse_hg_default_date(&value);
+            entry.date_raw = Some(value);
+        }
+        "summary" => entry.summary = Some(value),
+        "changeset" => {
+            let (local, rev) = split_changeset(&value);
+            entry.local = Some(local);
+            entry.rev = rev;
+        }
+        "parent" => {
+            let (local, rev) = split_changeset(&value);
+            entry.parents.push(HgLogParent { local, rev });
+        }
+        "branch" => entry.branch = Some(value),
+        "tag" => entry.tag = Some(value),
+        "bookmark" => entry.bookmark = Some(value),
+        "obsolete" | "instability" => {}
+        _ => return Err(format!("Unknown Mercurial log field '{name}'!")),
+    }
+    Ok(())
 }
 
 /// One branch of `parseMercurialBranches`

@@ -314,34 +314,29 @@ pub fn parse_field_tags(corpus: &str) -> CommitFields {
     if !title.is_empty() {
         fields.insert(FIELD_TITLE.to_string(), FieldValue::Text(title.to_string()));
     }
-    let mut body: Vec<&str> = Vec::new();
+    let (body, tags) = split_field_lines(lines);
+    insert_tag_fields(&mut fields, tags);
+    merge_body_summary(&mut fields, &body);
+    fields
+}
+
+/// Split message lines after the title into body lines and `(key, text)`
+/// tag values; values continue over following non-blank, non-tag lines
+/// until a blank line or the next tag.
+fn split_field_lines<'a>(
+    lines: impl Iterator<Item = &'a str>,
+) -> (Vec<&'a str>, Vec<(String, String)>) {
+    let mut body: Vec<&'a str> = Vec::new();
     let mut tags: Vec<(String, String)> = Vec::new();
     let mut current: Option<(String, Vec<String>)> = None;
-    let flush = |current: &mut Option<(String, Vec<String>)>, tags: &mut Vec<(String, String)>| {
-        if let Some((key, parts)) = current.take() {
-            tags.push((key, parts.join("\n")));
-        }
-    };
     for line in lines {
         if line.trim().is_empty() {
-            flush(&mut current, &mut tags);
+            flush_current_tag(&mut current, &mut tags);
             body.push("");
             continue;
         }
         if let Some((name, value)) = split_tag_line(line) {
-            match tag_field_key(name) {
-                Some(Some(key)) => {
-                    flush(&mut current, &mut tags);
-                    current = Some((key.to_string(), vec![value.to_string()]));
-                }
-                Some(None) => {
-                    flush(&mut current, &mut tags);
-                }
-                None => {
-                    flush(&mut current, &mut tags);
-                    body.push(line);
-                }
-            }
+            step_field_tag_line(name, value, line, &mut current, &mut tags, &mut body);
             continue;
         }
         if let Some((_, parts)) = current.as_mut() {
@@ -350,58 +345,112 @@ pub fn parse_field_tags(corpus: &str) -> CommitFields {
             body.push(line);
         }
     }
-    flush(&mut current, &mut tags);
+    flush_current_tag(&mut current, &mut tags);
+    (body, tags)
+}
 
+/// Join the open tag value (if any) onto the collected tags.
+fn flush_current_tag(
+    current: &mut Option<(String, Vec<String>)>,
+    tags: &mut Vec<(String, String)>,
+) {
+    if let Some((key, parts)) = current.take() {
+        tags.push((key, parts.join("\n")));
+    }
+}
+
+/// Route one `Tag: value` line: known tags open a value, `Differential
+/// Revision` lines are dropped, unknown tags stay verbatim body text.
+fn step_field_tag_line<'a>(
+    name: &str,
+    value: &str,
+    line: &'a str,
+    current: &mut Option<(String, Vec<String>)>,
+    tags: &mut Vec<(String, String)>,
+    body: &mut Vec<&'a str>,
+) {
+    match tag_field_key(name) {
+        Some(Some(key)) => {
+            flush_current_tag(current, tags);
+            *current = Some((key.to_string(), vec![value.to_string()]));
+        }
+        Some(None) => {
+            flush_current_tag(current, tags);
+        }
+        None => {
+            flush_current_tag(current, tags);
+            body.push(line);
+        }
+    }
+}
+
+/// Insert collected tag values: `Reviewers`/`CC`/`Tasks` split on commas
+/// into lists, other tags become text; repeats append, empties drop.
+fn insert_tag_fields(fields: &mut CommitFields, tags: Vec<(String, String)>) {
     for (key, text) in tags {
         if key == FIELD_REVIEWERS || key == FIELD_CCS || key == FIELD_TASKS {
-            let names: Vec<String> = text
-                .split(',')
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(str::to_string)
-                .collect();
-            if names.is_empty() {
-                continue;
-            }
-            match fields.get_mut(&key) {
-                Some(FieldValue::List(existing)) => existing.extend_from_slice(&names),
-                _ => {
-                    fields.insert(key, FieldValue::List(names));
-                }
-            }
+            insert_list_field(fields, &key, &text);
         } else {
-            if text.trim().is_empty() {
-                continue;
-            }
-            match fields.get_mut(&key) {
-                Some(FieldValue::Text(existing)) => {
-                    existing.push_str("\n\n");
-                    existing.push_str(&text);
-                }
-                _ => {
-                    fields.insert(key, FieldValue::Text(text));
-                }
-            }
+            insert_text_field(fields, &key, &text);
         }
     }
+}
 
+/// Append comma-separated names to a list field; empty lists are dropped.
+fn insert_list_field(fields: &mut CommitFields, key: &str, text: &str) {
+    let names: Vec<String> = text
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    match fields.get_mut(key) {
+        Some(FieldValue::List(existing)) => existing.extend_from_slice(&names),
+        _ => {
+            fields.insert(key.to_string(), FieldValue::List(names));
+        }
+    }
+}
+
+/// Append a tag value to a text field; blank values are dropped.
+fn insert_text_field(fields: &mut CommitFields, key: &str, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    match fields.get_mut(key) {
+        Some(FieldValue::Text(existing)) => {
+            existing.push_str("\n\n");
+            existing.push_str(text);
+        }
+        _ => {
+            fields.insert(key.to_string(), FieldValue::Text(text.to_string()));
+        }
+    }
+}
+
+/// Fold body text into `summary`: ahead of an explicit `Summary` tag when
+/// one exists, alone otherwise.
+fn merge_body_summary(fields: &mut CommitFields, body: &[&str]) {
     let body_text = body.join("\n");
     let body_text = body_text.trim();
-    if !body_text.is_empty() {
-        match fields.get(FIELD_SUMMARY) {
-            Some(FieldValue::Text(explicit)) if !explicit.trim().is_empty() => {
-                let combined = format!("{body_text}\n\n{explicit}");
-                fields.insert(FIELD_SUMMARY.to_string(), FieldValue::Text(combined));
-            }
-            _ => {
-                fields.insert(
-                    FIELD_SUMMARY.to_string(),
-                    FieldValue::Text(body_text.to_string()),
-                );
-            }
+    if body_text.is_empty() {
+        return;
+    }
+    match fields.get(FIELD_SUMMARY) {
+        Some(FieldValue::Text(explicit)) if !explicit.trim().is_empty() => {
+            let combined = format!("{body_text}\n\n{explicit}");
+            fields.insert(FIELD_SUMMARY.to_string(), FieldValue::Text(combined));
+        }
+        _ => {
+            fields.insert(
+                FIELD_SUMMARY.to_string(),
+                FieldValue::Text(body_text.to_string()),
+            );
         }
     }
-    fields
 }
 
 /// Placeholder title prepended to the `--reviewers`/`--cc` faux message so
@@ -479,28 +528,10 @@ pub fn included_commit_line(hash: &str, summary: &str) -> String {
 /// skipped here.
 #[must_use]
 pub fn merge_fields_oldest_first(messages: &[CommitFields]) -> CommitFields {
-    use std::collections::btree_map::Entry;
-
     let mut result = CommitFields::new();
     let mut summary_override: Vec<Option<String>> = vec![None; messages.len()];
     for (index, dict) in messages.iter().enumerate() {
-        let Some(FieldValue::Text(title)) = dict.get(FIELD_TITLE) else {
-            continue;
-        };
-        if title.is_empty() || title == PLACEHOLDER_TITLE {
-            continue;
-        }
-        if result.contains_key(FIELD_TITLE) {
-            let base = match dict.get(FIELD_SUMMARY) {
-                Some(FieldValue::Text(summary)) if !summary.is_empty() => {
-                    format!("{title}\n\n{summary}")
-                }
-                _ => title.clone(),
-            };
-            summary_override[index] = Some(base);
-        } else {
-            result.insert(FIELD_TITLE.to_string(), FieldValue::Text(title.clone()));
-        }
+        demote_later_title(&mut result, &mut summary_override, index, dict);
     }
 
     for (index, dict) in messages.iter().enumerate() {
@@ -508,39 +539,80 @@ pub fn merge_fields_oldest_first(messages: &[CommitFields]) -> CommitFields {
         if let Some(summary) = summary_override[index].take() {
             effective.insert(FIELD_SUMMARY.to_string(), FieldValue::Text(summary));
         }
-        for (key, value) in &effective {
-            if key == FIELD_TITLE {
-                continue;
-            }
-            if let FieldValue::Text(text) = value
-                && text.trim().is_empty()
-            {
-                continue;
-            }
-            match result.entry(key.clone()) {
-                Entry::Vacant(slot) => {
-                    slot.insert(value.clone());
-                }
-                Entry::Occupied(mut slot) => match (slot.get_mut(), value) {
-                    (FieldValue::List(existing), FieldValue::List(items)) => {
-                        existing.extend_from_slice(items);
-                    }
-                    (FieldValue::Text(existing), FieldValue::Text(text)) => {
-                        if existing.is_empty() {
-                            *existing = text.clone();
-                        } else {
-                            existing.push_str("\n\n");
-                            existing.push_str(text);
-                        }
-                    }
-                    (slot, newer) => {
-                        *slot = newer.clone();
-                    }
-                },
-            }
-        }
+        merge_message_fields(&mut result, &effective);
     }
     result
+}
+
+/// Title pass of the oldest-first merge: the first real title wins; later
+/// titles demote into their own summary override. Placeholder titles and
+/// missing titles are skipped.
+fn demote_later_title(
+    result: &mut CommitFields,
+    overrides: &mut [Option<String>],
+    index: usize,
+    dict: &CommitFields,
+) {
+    let Some(FieldValue::Text(title)) = dict.get(FIELD_TITLE) else {
+        return;
+    };
+    if title.is_empty() || title == PLACEHOLDER_TITLE {
+        return;
+    }
+    if result.contains_key(FIELD_TITLE) {
+        let base = match dict.get(FIELD_SUMMARY) {
+            Some(FieldValue::Text(summary)) if !summary.is_empty() => {
+                format!("{title}\n\n{summary}")
+            }
+            _ => title.clone(),
+        };
+        overrides[index] = Some(base);
+    } else {
+        result.insert(FIELD_TITLE.to_string(), FieldValue::Text(title.clone()));
+    }
+}
+
+/// Merge one message's non-title fields: lists concatenate, strings join
+/// with a blank line, blanks skip, and a newer mismatched type wins.
+fn merge_message_fields(result: &mut CommitFields, effective: &CommitFields) {
+    use std::collections::btree_map::Entry;
+
+    for (key, value) in effective {
+        if key == FIELD_TITLE {
+            continue;
+        }
+        if let FieldValue::Text(text) = value
+            && text.trim().is_empty()
+        {
+            continue;
+        }
+        match result.entry(key.clone()) {
+            Entry::Vacant(slot) => {
+                slot.insert(value.clone());
+            }
+            Entry::Occupied(mut slot) => merge_occupied_field(slot.get_mut(), value),
+        }
+    }
+}
+
+/// Merge one value into an occupied field entry.
+fn merge_occupied_field(slot: &mut FieldValue, value: &FieldValue) {
+    match (slot, value) {
+        (FieldValue::List(existing), FieldValue::List(items)) => {
+            existing.extend_from_slice(items);
+        }
+        (FieldValue::Text(existing), FieldValue::Text(text)) => {
+            if existing.is_empty() {
+                *existing = text.clone();
+            } else {
+                existing.push_str("\n\n");
+                existing.push_str(text);
+            }
+        }
+        (slot, newer) => {
+            *slot = newer.clone();
+        }
+    }
 }
 
 /// Read a revision message from `--message-file` and parse its local parts.
@@ -1534,44 +1606,16 @@ pub fn collect_change_entries(
         range.push(revision);
     }
     range.push("--");
-    let mut status_args = vec!["diff", "--name-status", "-z", "-M", "-C"];
-    status_args.extend_from_slice(&range);
-    let status_out = git::output(dir, &status_args)?;
-    if !status_out.status.success() {
-        return Err(format!(
-            "git diff failed: {}",
-            String::from_utf8_lossy(&status_out.stderr).trim()
-        ));
-    }
-    let mut numstat_args = vec!["diff", "--numstat", "-z", "-M", "-C"];
-    numstat_args.extend_from_slice(&range);
-    let numstat_out = git::output(dir, &numstat_args)?;
-    if !numstat_out.status.success() {
-        return Err(format!(
-            "git diff failed: {}",
-            String::from_utf8_lossy(&numstat_out.stderr).trim()
-        ));
-    }
-    let counts: BTreeMap<String, (u64, u64)> = diff::parse_numstat_z(&numstat_out.stdout)?
+    let status_raw = git_diff_output(dir, "--name-status", &range)?;
+    let numstat_raw = git_diff_output(dir, "--numstat", &range)?;
+    let counts: BTreeMap<String, (u64, u64)> = diff::parse_numstat_z(&numstat_raw)?
         .into_iter()
         .map(|file| (file.path, (file.added, file.deleted)))
         .collect();
 
     let mut entries = Vec::new();
-    for record in parse_name_status_z(&status_out.stdout)? {
-        let (change_type, old_path) = match record.status {
-            'A' => (TYPE_ADD, None),
-            'M' | 'T' | 'U' => (TYPE_CHANGE, None),
-            'D' => (TYPE_DELETE, None),
-            'R' => (TYPE_MOVE_HERE, record.old_path.clone()),
-            'C' => (TYPE_COPY_HERE, record.old_path.clone()),
-            other => {
-                return Err(format!(
-                    "unsupported change status '{other}' for '{}'",
-                    record.path
-                ));
-            }
-        };
+    for record in parse_name_status_z(&status_raw)? {
+        let (change_type, old_path) = status_change_type(&record)?;
         let (added, deleted) = counts.get(&record.path).copied().unwrap_or((0, 0));
         let file_type = classify_file_type(dir, &record.path, change_type);
         entries.push(ChangeEntry {
@@ -1587,6 +1631,36 @@ pub fn collect_change_entries(
         });
     }
     Ok(entries)
+}
+
+/// Run `git diff <kind> -z -M -C <range>`; failures report trimmed stderr.
+fn git_diff_output(dir: &Path, kind: &str, range: &[&str]) -> Result<Vec<u8>, String> {
+    let mut args = vec!["diff", kind, "-z", "-M", "-C"];
+    args.extend_from_slice(range);
+    let out = git::output(dir, &args)?;
+    if !out.status.success() {
+        return Err(format!(
+            "git diff failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(out.stdout)
+}
+
+/// Map a name-status letter to its `TYPE_*` change type plus the old path
+/// for renames and copies; anything else is an error.
+fn status_change_type(record: &NameStatusEntry) -> Result<(u32, Option<String>), String> {
+    match record.status {
+        'A' => Ok((TYPE_ADD, None)),
+        'M' | 'T' | 'U' => Ok((TYPE_CHANGE, None)),
+        'D' => Ok((TYPE_DELETE, None)),
+        'R' => Ok((TYPE_MOVE_HERE, record.old_path.clone())),
+        'C' => Ok((TYPE_COPY_HERE, record.old_path.clone())),
+        other => Err(format!(
+            "unsupported change status '{other}' for '{}'",
+            record.path
+        )),
+    }
 }
 
 /* -(  Lint and Unit Hooks  )-------------------------------------------------- */

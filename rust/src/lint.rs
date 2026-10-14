@@ -489,6 +489,28 @@ fn check_severity(value: &str) -> Result<(), String> {
     }
 }
 
+/// Read the value of a `--severity VALUE` argument, advancing `index` past
+/// it. Validates the severity like the `--severity=VALUE` form.
+fn take_severity_space(argv: &[String], index: &mut usize) -> Result<String, String> {
+    let Some(value) = argv.get(*index) else {
+        return Err("--severity requires a value".to_string());
+    };
+    *index += 1;
+    check_severity(value)?;
+    Ok(value.clone())
+}
+
+/// Outcome for an unrecognized `-` flag: either not-yet-ported or unknown.
+fn unknown_flag_outcome(arg: &str) -> ParseOutcome {
+    let name = flag_name(arg);
+    if let Some(reason) = not_yet_ported_reason(name) {
+        return ParseOutcome::NotYetPorted(format!(
+            "arc-rs {NAME}: {name} is not yet ported ({reason}; see T1128)"
+        ));
+    }
+    ParseOutcome::Error(format!("unknown flag '{arg}'"))
+}
+
 fn parse_args(argv: &[String]) -> ParseOutcome {
     let mut paths = Vec::new();
     let mut json = false;
@@ -509,27 +531,17 @@ fn parse_args(argv: &[String]) -> ParseOutcome {
         } else if arg == "-" {
             paths.push(arg.clone());
         } else if arg == "--severity" {
-            let Some(value) = argv.get(index) else {
-                return ParseOutcome::Error("--severity requires a value".to_string());
-            };
-            index += 1;
-            if let Err(message) = check_severity(value) {
-                return ParseOutcome::Error(message);
+            match take_severity_space(argv, &mut index) {
+                Ok(value) => severity = value,
+                Err(message) => return ParseOutcome::Error(message),
             }
-            severity = value.clone();
         } else if let Some(value) = arg.strip_prefix("--severity=") {
             if let Err(message) = check_severity(value) {
                 return ParseOutcome::Error(message);
             }
             severity = value.to_string();
         } else if arg.starts_with('-') {
-            let name = flag_name(arg);
-            if let Some(reason) = not_yet_ported_reason(name) {
-                return ParseOutcome::NotYetPorted(format!(
-                    "arc-rs {NAME}: {name} is not yet ported ({reason}; see T1128)"
-                ));
-            }
-            return ParseOutcome::Error(format!("unknown flag '{arg}'"));
+            return unknown_flag_outcome(arg);
         } else {
             paths.push(arg.clone());
         }
@@ -730,6 +742,35 @@ pub fn lint_changed_in(dir: &Path) -> Result<Vec<LintMessage>, String> {
     lint_changed_in_with_engine(&Engine::new(), dir)
 }
 
+/// Collect `run_in` messages: working-tree changes when no paths were given,
+/// else the explicit paths.
+fn collect_run_messages(
+    engine: &Engine,
+    cwd: &Path,
+    paths: &[String],
+) -> Result<Vec<LintMessage>, String> {
+    if paths.is_empty() {
+        lint_changed_in_with_engine(engine, cwd)
+    } else {
+        lint_explicit_paths_with_engine(engine, paths)
+    }
+}
+
+/// Print collected lint messages as JSON or one-per-line text.
+fn emit_messages(messages: &[LintMessage], json: bool) {
+    if json {
+        let array: Vec<serde_json::Value> = messages.iter().map(LintMessage::to_json).collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&array).unwrap_or_else(|_| "[]".to_string())
+        );
+    } else {
+        for message in messages {
+            println!("{}", message.to_line());
+        }
+    }
+}
+
 pub fn run(argv: &[String]) -> ExitCode {
     let cwd = match std::env::current_dir() {
         Ok(dir) => dir,
@@ -769,36 +810,15 @@ pub fn run_in(cwd: &Path, argv: &[String]) -> ExitCode {
         }
     };
 
-    let messages = if args.paths.is_empty() {
-        match lint_changed_in_with_engine(&engine, cwd) {
-            Ok(messages) => messages,
-            Err(error) => {
-                eprintln!("arc-rs {NAME}: {error}");
-                return ExitCode::FAILURE;
-            }
-        }
-    } else {
-        match lint_explicit_paths_with_engine(&engine, &args.paths) {
-            Ok(messages) => messages,
-            Err(error) => {
-                eprintln!("arc-rs {NAME}: {error}");
-                return ExitCode::FAILURE;
-            }
+    let messages = match collect_run_messages(&engine, cwd, &args.paths) {
+        Ok(messages) => messages,
+        Err(error) => {
+            eprintln!("arc-rs {NAME}: {error}");
+            return ExitCode::FAILURE;
         }
     };
     let messages = filter_by_severity(messages, &args.severity);
-
-    if args.json {
-        let array: Vec<serde_json::Value> = messages.iter().map(LintMessage::to_json).collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&array).unwrap_or_else(|_| "[]".to_string())
-        );
-    } else {
-        for message in &messages {
-            println!("{}", message.to_line());
-        }
-    }
+    emit_messages(&messages, args.json);
 
     if messages.iter().any(|m| m.severity == SEVERITY_ERROR) {
         ExitCode::FAILURE

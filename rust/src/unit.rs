@@ -769,6 +769,65 @@ fn run_config_report(report: &ConfigReport, json: bool) -> ExitCode {
     }
 }
 
+/// Run the default `cargo` selection and report its outcome.
+fn run_cargo_selection(opts: &Options, cwd: &Path) -> ExitCode {
+    match execute(opts, cwd, None) {
+        Ok(report) => {
+            if opts.json {
+                println!("{}", report.to_json());
+            } else {
+                println!("{}", report.summary_line());
+                if !report.tail.is_empty() {
+                    println!("{}", report.tail);
+                }
+            }
+            if report.success {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(msg) => {
+            eprintln!("arc-rs unit: {msg}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Run one engine named by `--engine` or `unit.engine`.
+fn run_single_selection(opts: &Options, cwd: &Path, class: &str) -> ExitCode {
+    if !opts.cargo_args.is_empty() {
+        eprintln!("arc-rs unit: cargo test args after '--' require the cargo engine");
+        return ExitCode::FAILURE;
+    }
+    let root = project_root_for_single(cwd);
+    let runner = RealRunner;
+    match run_single_report(class, &root, &[], opts.everything, None, &runner) {
+        Ok(report) => run_config_report(&report, opts.json),
+        Err(msg) => {
+            eprintln!("arc-rs unit: {msg}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Run a configuration-driven (`.arcunit`) selection.
+fn run_config_selection(opts: &Options, engines: &[PlannedEngine], root: &Path) -> ExitCode {
+    if !opts.cargo_args.is_empty() {
+        eprintln!("arc-rs unit: cargo test args after '--' require the cargo engine");
+        return ExitCode::FAILURE;
+    }
+    let root_string = root.to_string_lossy().replace('\\', "/");
+    let runner = RealRunner;
+    match run_config_with_runner(engines, &root_string, &[], opts.everything, None, &runner) {
+        Ok(report) => run_config_report(&report, opts.json),
+        Err(msg) => {
+            eprintln!("arc-rs unit: {msg}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 pub fn run(argv: &[String]) -> ExitCode {
     let opts = match parse_args(argv) {
         Ok(opts) => opts,
@@ -797,64 +856,9 @@ pub fn run(argv: &[String]) -> ExitCode {
         }
     };
     match selection {
-        Selection::Cargo => match execute(&opts, &cwd, None) {
-            Ok(report) => {
-                if opts.json {
-                    println!("{}", report.to_json());
-                } else {
-                    println!("{}", report.summary_line());
-                    if !report.tail.is_empty() {
-                        println!("{}", report.tail);
-                    }
-                }
-                if report.success {
-                    ExitCode::SUCCESS
-                } else {
-                    ExitCode::FAILURE
-                }
-            }
-            Err(msg) => {
-                eprintln!("arc-rs unit: {msg}");
-                ExitCode::FAILURE
-            }
-        },
-        Selection::Single(class) => {
-            if !opts.cargo_args.is_empty() {
-                eprintln!("arc-rs unit: cargo test args after '--' require the cargo engine");
-                return ExitCode::FAILURE;
-            }
-            let root = project_root_for_single(&cwd);
-            let runner = RealRunner;
-            match run_single_report(&class, &root, &[], opts.everything, None, &runner) {
-                Ok(report) => run_config_report(&report, opts.json),
-                Err(msg) => {
-                    eprintln!("arc-rs unit: {msg}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        Selection::Config { engines, root } => {
-            if !opts.cargo_args.is_empty() {
-                eprintln!("arc-rs unit: cargo test args after '--' require the cargo engine");
-                return ExitCode::FAILURE;
-            }
-            let root_string = root.to_string_lossy().replace('\\', "/");
-            let runner = RealRunner;
-            match run_config_with_runner(
-                &engines,
-                &root_string,
-                &[],
-                opts.everything,
-                None,
-                &runner,
-            ) {
-                Ok(report) => run_config_report(&report, opts.json),
-                Err(msg) => {
-                    eprintln!("arc-rs unit: {msg}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
+        Selection::Cargo => run_cargo_selection(&opts, &cwd),
+        Selection::Single(class) => run_single_selection(&opts, &cwd, &class),
+        Selection::Config { engines, root } => run_config_selection(&opts, &engines, &root),
     }
 }
 

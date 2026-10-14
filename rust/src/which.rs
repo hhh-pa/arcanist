@@ -277,10 +277,7 @@ pub fn load_context(
     })
 }
 
-/// Render the human-readable report.
-#[must_use]
-pub fn render(ctx: &Context) -> String {
-    let mut out = String::new();
+fn render_working_copy(ctx: &Context, out: &mut String) {
     out.push_str("WORKING COPY\n");
     out.push_str(&format!("    Directory: {}\n", ctx.dir));
     match (&ctx.vcs_root, ctx.vcs) {
@@ -293,6 +290,9 @@ pub fn render(ctx: &Context) -> String {
         }
         _ => out.push_str("    Project: no .arcconfig found above this directory\n"),
     }
+}
+
+fn render_repository(ctx: &Context, out: &mut String) {
     out.push_str("\nREPOSITORY\n");
     out.push_str(&format!(
         "    Branch: {}\n",
@@ -314,6 +314,9 @@ pub fn render(ctx: &Context) -> String {
         (Some(name), None) => out.push_str(&format!("    Callsign: {name}\n")),
         (None, _) => out.push_str("    Callsign: not configured\n"),
     }
+}
+
+fn render_conduit(ctx: &Context, out: &mut String) {
     out.push_str("\nCONDUIT\n");
     match &ctx.conduit_uri {
         Some(uri) => out.push_str(&format!("    URI: {uri} (from {})\n", ctx.conduit_source)),
@@ -324,6 +327,9 @@ pub fn render(ctx: &Context) -> String {
         Some(false) => out.push_str("    Token: missing (run `arc-rs install-certificate`)\n"),
         None => out.push_str("    Token: unknown (no conduit URI)\n"),
     }
+}
+
+fn render_range(ctx: &Context, out: &mut String) {
     out.push_str("\nCOMMIT RANGE\n");
     match (&ctx.base, &ctx.base_explanation) {
         (Some(base), Some(why)) => {
@@ -341,6 +347,16 @@ pub fn render(ctx: &Context) -> String {
         }
         _ => out.push_str("    (No commit range outside a working copy.)\n"),
     }
+}
+
+/// Render the human-readable report.
+#[must_use]
+pub fn render(ctx: &Context) -> String {
+    let mut out = String::new();
+    render_working_copy(ctx, &mut out);
+    render_repository(ctx, &mut out);
+    render_conduit(ctx, &mut out);
+    render_range(ctx, &mut out);
     out.push_str("\nMATCHING REVISIONS\n");
     out.push_str("    (Not yet ported: Differential revision matching; see T1128.)\n");
     out
@@ -386,61 +402,145 @@ enum Parsed {
     Error(String),
 }
 
-fn parse_args(argv: &[String]) -> Parsed {
-    let mut conduit_uri = None;
-    let mut head = "HEAD".to_string();
-    let mut show_base = false;
-    let mut json = false;
-    let mut commit = None;
-    let mut iter = argv.iter().peekable();
-    while let Some(arg) = iter.next() {
-        if arg == "--conduit-uri" {
-            let Some(value) = iter.next() else {
-                return Parsed::Error("--conduit-uri requires a value".to_string());
-            };
-            conduit_uri = Some(value.clone());
-        } else if arg == "--head" {
-            let Some(value) = iter.next() else {
-                return Parsed::Error("--head requires a value".to_string());
-            };
-            head = value.clone();
-        } else if arg == "--show-base" {
-            show_base = true;
-        } else if arg == "--json" {
-            json = true;
-        } else if arg == "--base" {
-            return Parsed::NotYetPorted(format!(
-                "arc-rs {NAME}: --base is not yet ported (base rules; see T1128)"
-            ));
-        } else if arg == "--any-status" {
-            return Parsed::NotYetPorted(format!(
-                "arc-rs {NAME}: --any-status is not yet ported (Differential revision matching; see T1128)"
-            ));
-        } else if arg == "-h" || arg == "--help" {
-            return Parsed::Help;
-        } else if arg == "--" {
-            for rest in iter.by_ref() {
-                if commit.is_some() {
-                    return Parsed::Error("Specify at most one commit.".to_string());
-                }
-                commit = Some(rest.clone());
-            }
-        } else if arg.starts_with('-') {
-            return Parsed::Error(format!("unknown flag '{arg}'"));
-        } else {
-            if commit.is_some() {
-                return Parsed::Error("Specify at most one commit.".to_string());
-            }
-            commit = Some(arg.clone());
+type ArgIter<'a> = std::iter::Peekable<std::slice::Iter<'a, String>>;
+
+/// One argument's parse step: consumed, or a terminal outcome.
+enum Step {
+    Handled,
+    Done(Parsed),
+}
+
+struct Parser {
+    conduit_uri: Option<String>,
+    head: String,
+    show_base: bool,
+    json: bool,
+    commit: Option<String>,
+}
+
+impl Parser {
+    fn new() -> Self {
+        Self {
+            conduit_uri: None,
+            head: "HEAD".to_string(),
+            show_base: false,
+            json: false,
+            commit: None,
         }
     }
-    Parsed::Options(Options {
-        conduit_uri,
-        head,
-        show_base,
-        json,
-        commit,
-    })
+
+    fn flag_conduit(&mut self, arg: &str, iter: &mut ArgIter<'_>) -> Option<Step> {
+        if arg != "--conduit-uri" {
+            return None;
+        }
+        let Some(value) = iter.next() else {
+            return Some(Step::Done(Parsed::Error(
+                "--conduit-uri requires a value".to_string(),
+            )));
+        };
+        self.conduit_uri = Some(value.clone());
+        Some(Step::Handled)
+    }
+
+    fn flag_head(&mut self, arg: &str, iter: &mut ArgIter<'_>) -> Option<Step> {
+        if arg != "--head" {
+            return None;
+        }
+        let Some(value) = iter.next() else {
+            return Some(Step::Done(Parsed::Error(
+                "--head requires a value".to_string(),
+            )));
+        };
+        self.head = value.clone();
+        Some(Step::Handled)
+    }
+
+    fn push_commit(&mut self, arg: &str) -> Step {
+        if self.commit.is_some() {
+            Step::Done(Parsed::Error("Specify at most one commit.".to_string()))
+        } else {
+            self.commit = Some(arg.to_string());
+            Step::Handled
+        }
+    }
+
+    fn consume_rest(&mut self, iter: &mut ArgIter<'_>) -> Option<Step> {
+        for rest in iter.by_ref() {
+            if self.commit.is_some() {
+                return Some(Step::Done(Parsed::Error(
+                    "Specify at most one commit.".to_string(),
+                )));
+            }
+            self.commit = Some(rest.clone());
+        }
+        None
+    }
+
+    fn tail(&mut self, arg: &str, iter: &mut ArgIter<'_>) -> Step {
+        if arg == "--show-base" {
+            self.show_base = true;
+            return Step::Handled;
+        }
+        if arg == "--json" {
+            self.json = true;
+            return Step::Handled;
+        }
+        if arg == "--base" {
+            return Step::Done(Parsed::NotYetPorted(format!(
+                "arc-rs {NAME}: --base is not yet ported (base rules; see T1128)"
+            )));
+        }
+        if arg == "--any-status" {
+            return Step::Done(Parsed::NotYetPorted(format!(
+                "arc-rs {NAME}: --any-status is not yet ported (Differential revision matching; see T1128)"
+            )));
+        }
+        if arg == "-h" || arg == "--help" {
+            return Step::Done(Parsed::Help);
+        }
+        if arg == "--" {
+            if let Some(step) = self.consume_rest(iter) {
+                return step;
+            }
+            return Step::Handled;
+        }
+        if arg.starts_with('-') {
+            return Step::Done(Parsed::Error(format!("unknown flag '{arg}'")));
+        }
+        self.push_commit(arg)
+    }
+
+    fn consume(&mut self, arg: &str, iter: &mut ArgIter<'_>) -> Step {
+        if let Some(step) = self.flag_conduit(arg, iter) {
+            return step;
+        }
+        if let Some(step) = self.flag_head(arg, iter) {
+            return step;
+        }
+        self.tail(arg, iter)
+    }
+
+    fn finish(self) -> Options {
+        Options {
+            conduit_uri: self.conduit_uri,
+            head: self.head,
+            show_base: self.show_base,
+            json: self.json,
+            commit: self.commit,
+        }
+    }
+}
+
+fn parse_args(argv: &[String]) -> Parsed {
+    let mut parser = Parser::new();
+    let mut iter = argv.iter().peekable();
+    while let Some(arg) = iter.next() {
+        match parser.consume(arg, &mut iter) {
+            Step::Handled => {}
+            Step::Done(parsed) => return parsed,
+        }
+    }
+    Parsed::Options(parser.finish())
 }
 
 /// Entry point: `argv` excludes the subcommand name.

@@ -42,66 +42,133 @@ pub struct Options {
     pub conduit_uri: Option<String>,
 }
 
+/// One argument's parse step: consumed, `--help`, or a fatal error.
+enum Step {
+    Handled,
+    Help,
+    Error(String),
+}
+
+struct Parser {
+    finalize: bool,
+    quiet: bool,
+    json: bool,
+    force: bool,
+    conduit_uri: Option<String>,
+    revision: Option<String>,
+    end_of_flags: bool,
+}
+
+impl Parser {
+    fn new() -> Self {
+        Self {
+            finalize: false,
+            quiet: false,
+            json: false,
+            force: false,
+            conduit_uri: None,
+            revision: None,
+            end_of_flags: false,
+        }
+    }
+
+    fn positional(&mut self, arg: &str) -> Step {
+        if self.revision.is_some() {
+            Step::Error("close-revision requires exactly one revision.".to_string())
+        } else {
+            self.revision = Some(arg.to_string());
+            Step::Handled
+        }
+    }
+
+    fn flag_simple(&mut self, arg: &str) -> Option<Step> {
+        if arg == "--finalize" {
+            self.finalize = true;
+        } else if arg == "--quiet" {
+            self.quiet = true;
+        } else if arg == "--json" {
+            self.json = true;
+        } else if arg == "--force" {
+            self.force = true;
+        } else {
+            return None;
+        }
+        Some(Step::Handled)
+    }
+
+    fn flag_conduit(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Option<Step> {
+        if arg == "--conduit-uri" {
+            let Some(value) = iter.next() else {
+                return Some(Step::Error("--conduit-uri requires a value".to_string()));
+            };
+            self.conduit_uri = Some(value.clone());
+            return Some(Step::Handled);
+        }
+        if let Some(value) = arg.strip_prefix("--conduit-uri=") {
+            if value.is_empty() {
+                return Some(Step::Error("--conduit-uri requires a value".to_string()));
+            }
+            self.conduit_uri = Some(value.to_string());
+            return Some(Step::Handled);
+        }
+        None
+    }
+
+    fn tail(&mut self, arg: &str) -> Step {
+        if arg == "--" {
+            self.end_of_flags = true;
+            Step::Handled
+        } else if arg == "--help" || arg == "-h" {
+            Step::Help
+        } else if arg.starts_with('-') {
+            Step::Error(format!("unknown flag '{arg}'"))
+        } else {
+            self.positional(arg)
+        }
+    }
+
+    fn consume(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Step {
+        if self.end_of_flags {
+            return self.positional(arg);
+        }
+        if let Some(step) = self.flag_simple(arg) {
+            return step;
+        }
+        if let Some(step) = self.flag_conduit(arg, iter) {
+            return step;
+        }
+        self.tail(arg)
+    }
+
+    fn finish(self) -> Result<Option<Options>, String> {
+        let Some(revision) = self.revision else {
+            return Err("close-revision requires a revision number.".to_string());
+        };
+        Ok(Some(Options {
+            revision,
+            finalize: self.finalize,
+            quiet: self.quiet,
+            json: self.json,
+            force: self.force,
+            conduit_uri: self.conduit_uri,
+        }))
+    }
+}
+
 /// Parse `argv` (excluding the subcommand name).
 ///
 /// Returns `Ok(None)` when `--help` was requested.
 pub fn parse_args(argv: &[String]) -> Result<Option<Options>, String> {
-    let mut finalize = false;
-    let mut quiet = false;
-    let mut json = false;
-    let mut force = false;
-    let mut conduit_uri = None;
-    let mut revision: Option<String> = None;
-    let mut end_of_flags = false;
+    let mut parser = Parser::new();
     let mut iter = argv.iter();
     while let Some(arg) = iter.next() {
-        if end_of_flags {
-            if revision.is_some() {
-                return Err("close-revision requires exactly one revision.".to_string());
-            }
-            revision = Some(arg.clone());
-        } else if arg == "--" {
-            end_of_flags = true;
-        } else if arg == "--finalize" {
-            finalize = true;
-        } else if arg == "--quiet" {
-            quiet = true;
-        } else if arg == "--json" {
-            json = true;
-        } else if arg == "--force" {
-            force = true;
-        } else if arg == "--conduit-uri" {
-            let Some(value) = iter.next() else {
-                return Err("--conduit-uri requires a value".to_string());
-            };
-            conduit_uri = Some(value.clone());
-        } else if let Some(value) = arg.strip_prefix("--conduit-uri=") {
-            if value.is_empty() {
-                return Err("--conduit-uri requires a value".to_string());
-            }
-            conduit_uri = Some(value.to_string());
-        } else if arg == "--help" || arg == "-h" {
-            return Ok(None);
-        } else if arg.starts_with('-') {
-            return Err(format!("unknown flag '{arg}'"));
-        } else {
-            if revision.is_some() {
-                return Err("close-revision requires exactly one revision.".to_string());
-            }
-            revision = Some(arg.clone());
+        match parser.consume(arg, &mut iter) {
+            Step::Handled => {}
+            Step::Help => return Ok(None),
+            Step::Error(message) => return Err(message),
         }
     }
-    let Some(revision) = revision else {
-        return Err("close-revision requires a revision number.".to_string());
-    };
-    Ok(Some(Options {
-        revision,
-        finalize,
-        quiet,
-        json,
-        force,
-        conduit_uri,
-    }))
+    parser.finish()
 }
 
 /// Strip a leading `D` (like `ArcanistWorkflow::normalizeRevisionID`) and
@@ -249,6 +316,132 @@ pub fn result_json(
     })
 }
 
+/// Reject a missing revision, or one that is not accepted outside
+/// `--finalize` mode.
+fn check_closable(
+    revision: &Option<Revision>,
+    options: &Options,
+    object_name: &str,
+) -> Result<(), String> {
+    if revision.is_none() && !options.finalize {
+        return Err(format!("Revision {object_name} does not exist."));
+    }
+    if let Some(rev) = revision
+        && !options.finalize
+        && rev.status != STATUS_ACCEPTED
+    {
+        return Err(format!(
+            "Revision {object_name} can not be closed. You can only close revisions which have been 'accepted'."
+        ));
+    }
+    Ok(())
+}
+
+/// Ask `confirm` before closing a revision owned by someone else (skipped
+/// with `--finalize`, which never prompts, or `--force`).
+fn confirm_ownership(
+    client: &conduit::Client,
+    options: &Options,
+    rev: &Revision,
+    object_name: &str,
+    confirm: &dyn Fn(&str) -> bool,
+) -> Result<(), String> {
+    if !options.finalize && rev.author_phid != user_phid(client)? && !options.force {
+        let prompt = format!(
+            "You are not the author of revision \"{object_name}\", are you sure you want to close it?"
+        );
+        if !confirm(&prompt) {
+            return Err("Aborted.".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Output of one close attempt: progress and warning text plus whether the
+/// `differential.close` call ran.
+struct CloseStep {
+    progress: String,
+    warnings: String,
+    closed: bool,
+}
+
+/// Close one revision unless `--finalize` mode leaves it open.
+fn close_if_accepted(
+    client: &conduit::Client,
+    options: &Options,
+    rev: &Revision,
+    id: &str,
+    object_name: &str,
+) -> Result<CloseStep, String> {
+    // See T13458: the server rejects a close transition unless the
+    // revision is accepted, so finalize mode skips the attempt.
+    if options.finalize && rev.status != STATUS_ACCEPTED {
+        return Ok(CloseStep {
+            progress: String::new(),
+            warnings: format!(
+                "OPEN REVISION: Revision \"{object_name}\" is not in state \"Accepted\", so it will be left open.\n"
+            ),
+            closed: false,
+        });
+    }
+    let display = format!("{object_name} {}", rev.title);
+    let mut progress = format!("Closing revision \"{display}\"...\n");
+    client
+        .call(
+            "differential.close",
+            &serde_json::json!({"revisionID": id_param(id)}),
+        )
+        .map_err(|e| e.to_string())?;
+    progress += "Done, closed revision.\n";
+    Ok(CloseStep {
+        progress,
+        warnings: String::new(),
+        closed: true,
+    })
+}
+
+/// The final message: empty with `--quiet`, else the push hint for a
+/// finalized revision or a plain `Done.`.
+fn closing_message(revision: &Option<Revision>, quiet: bool) -> String {
+    if quiet {
+        return String::new();
+    }
+    let finalized = matches!(&revision, Some(rev)
+        if (rev.status == STATUS_ACCEPTED || rev.status == STATUS_CLOSED)
+            && rev.commits.is_empty());
+    if finalized {
+        "You may now push this commit upstream, as appropriate (e.g. with 'git push', or 'git svn dcommit', or by printing and faxing it).\n"
+            .to_string()
+    } else {
+        "Done.\n".to_string()
+    }
+}
+
+fn render_report(
+    options: &Options,
+    object_name: &str,
+    revision: Option<&Revision>,
+    progress: &str,
+    closing: &str,
+    warnings: &str,
+    closed: bool,
+) -> Result<Report, String> {
+    if options.json {
+        let mut doc = serde_json::to_string_pretty(&result_json(object_name, revision, closed))
+            .map_err(|e| format!("failed to encode JSON: {e}"))?;
+        doc.push('\n');
+        Ok(Report {
+            stdout: doc,
+            stderr: format!("{progress}{closing}{warnings}"),
+        })
+    } else {
+        Ok(Report {
+            stdout: format!("{progress}{closing}"),
+            stderr: warnings.to_string(),
+        })
+    }
+}
+
 /// Close `options.revision`, asking `confirm` before closing a revision owned
 /// by someone else (skipped with `--finalize`, which never prompts, or
 /// `--force`).
@@ -260,85 +453,29 @@ pub fn execute(
     let id = normalize_revision_id(&options.revision)?;
     let object_name = format!("D{id}");
     let revision = query_revision(client, &id)?;
-
-    if revision.is_none() && !options.finalize {
-        return Err(format!("Revision {object_name} does not exist."));
-    }
-    if let Some(rev) = &revision
-        && !options.finalize
-        && rev.status != STATUS_ACCEPTED
-    {
-        return Err(format!(
-            "Revision {object_name} can not be closed. You can only close revisions which have been 'accepted'."
-        ));
-    }
+    check_closable(&revision, options, &object_name)?;
 
     let mut progress = String::new();
     let mut warnings = String::new();
     let mut closed = false;
-
     if let Some(rev) = &revision {
-        let display = format!("{object_name} {}", rev.title);
-        if !options.finalize && rev.author_phid != user_phid(client)? && !options.force {
-            let prompt = format!(
-                "You are not the author of revision \"{object_name}\", are you sure you want to close it?"
-            );
-            if !confirm(&prompt) {
-                return Err("Aborted.".to_string());
-            }
-        }
-
-        // See T13458: the server rejects a close transition unless the
-        // revision is accepted, so finalize mode skips the attempt.
-        let mut actually_close = true;
-        if options.finalize && rev.status != STATUS_ACCEPTED {
-            warnings += &format!(
-                "OPEN REVISION: Revision \"{object_name}\" is not in state \"Accepted\", so it will be left open.\n"
-            );
-            actually_close = false;
-        }
-
-        if actually_close {
-            progress += &format!("Closing revision \"{display}\"...\n");
-            client
-                .call(
-                    "differential.close",
-                    &serde_json::json!({"revisionID": id_param(&id)}),
-                )
-                .map_err(|e| e.to_string())?;
-            closed = true;
-            progress += "Done, closed revision.\n";
-        }
+        confirm_ownership(client, options, rev, &object_name, confirm)?;
+        let step = close_if_accepted(client, options, rev, &id, &object_name)?;
+        progress += &step.progress;
+        warnings += &step.warnings;
+        closed = step.closed;
     }
 
-    let is_finalized = matches!(&revision, Some(rev)
-        if (rev.status == STATUS_ACCEPTED || rev.status == STATUS_CLOSED)
-            && rev.commits.is_empty());
-    let mut closing = String::new();
-    if !options.quiet {
-        if is_finalized {
-            closing += "You may now push this commit upstream, as appropriate (e.g. with 'git push', or 'git svn dcommit', or by printing and faxing it).\n";
-        } else {
-            closing += "Done.\n";
-        }
-    }
-
-    if options.json {
-        let mut doc =
-            serde_json::to_string_pretty(&result_json(&object_name, revision.as_ref(), closed))
-                .map_err(|e| format!("failed to encode JSON: {e}"))?;
-        doc.push('\n');
-        warnings = progress + &closing + &warnings;
-        Ok(Report {
-            stdout: doc,
-            stderr: warnings,
-        })
-    } else {
-        Ok(Report {
-            stdout: progress + &closing,
-            stderr: warnings,
-        })
-    }
+    let closing = closing_message(&revision, options.quiet);
+    render_report(
+        options,
+        &object_name,
+        revision.as_ref(),
+        &progress,
+        &closing,
+        &warnings,
+        closed,
+    )
 }
 
 fn confirm_interactive(prompt: &str) -> bool {

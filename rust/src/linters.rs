@@ -41,44 +41,72 @@ pub struct LinterInfo {
     pub description: String,
 }
 
+fn describe_core(name: &str) -> Option<&'static str> {
+    match name {
+        "TXT" => {
+            Some("Trailing whitespace, tab literals, and missing EOF newlines (TXT2/TXT4/TXT6).")
+        }
+        "NAME" => Some("File names must be boring (NAME1)."),
+        "JSON" => Some("JSON syntax errors, native or via jsonlint."),
+        "XML" => Some("XML well-formedness errors."),
+        "MERGECONFLICT" => Some("Unresolved merge-conflict markers."),
+        "GEN" => Some("Generated-file marker (stops all linters)."),
+        "NOLINT" => Some("Nolint marker (stops all linters)."),
+        "CHMOD" => Some("Executable bit and script permissions."),
+        "SPELL" => Some("Common spelling mistakes."),
+        _ => None,
+    }
+}
+
+fn describe_script(name: &str) -> Option<&'static str> {
+    match name {
+        "S&RX" => Some("Custom script-and-regex rules."),
+        "COMPOSER" => Some("Stale composer.lock (COMPOSER1)."),
+        "PHL" => Some("Phutil library symbol map consistency."),
+        "JSHint" => Some("JavaScript errors via jshint."),
+        "JSCS" => Some("JavaScript code style via jscs."),
+        "CSSLint" => Some("CSS errors via csslint."),
+        "LESSC" => Some("LESS compile errors via lessc."),
+        "GJSLINT" => Some("JavaScript style via gjslint."),
+        _ => None,
+    }
+}
+
+fn describe_python_ruby(name: &str) -> Option<&'static str> {
+    match name {
+        "COFFEE" => Some("CoffeeScript errors via coffeelint."),
+        "flake8" => Some("Python errors via flake8."),
+        "PYFLAKES" => Some("Python errors via pyflakes."),
+        "PyLint" => Some("Python errors via pylint."),
+        "PEP8" => Some("Python style via pep8."),
+        "RuboCop" => Some("Ruby style via rubocop."),
+        "RUBY" => Some("Ruby syntax via ruby -c."),
+        "cppcheck" => Some("C/C++ errors via cppcheck."),
+        _ => None,
+    }
+}
+
+fn describe_native(name: &str) -> Option<&'static str> {
+    match name {
+        "C++ Google's Styleguide" => Some("C++ style via cpplint."),
+        "GOLINT" => Some("Go style via golint."),
+        "HLINT" => Some("Haskell suggestions via hlint."),
+        "C#" => Some("C# style via cslint."),
+        "PHPCS" => Some("PHP style via phpcs."),
+        "PHP" => Some("PHP syntax via php -l."),
+        "PUPPETLINT" => Some("Puppet style via puppet-lint."),
+        "XHP" => Some("XHP AST lint (parse wrapper)."),
+        _ => None,
+    }
+}
+
 /// One-line description for a registry linter name.
 fn describe(name: &str) -> &'static str {
-    match name {
-        "TXT" => "Trailing whitespace, tab literals, and missing EOF newlines (TXT2/TXT4/TXT6).",
-        "NAME" => "File names must be boring (NAME1).",
-        "JSON" => "JSON syntax errors, native or via jsonlint.",
-        "XML" => "XML well-formedness errors.",
-        "MERGECONFLICT" => "Unresolved merge-conflict markers.",
-        "GEN" => "Generated-file marker (stops all linters).",
-        "NOLINT" => "Nolint marker (stops all linters).",
-        "CHMOD" => "Executable bit and script permissions.",
-        "SPELL" => "Common spelling mistakes.",
-        "S&RX" => "Custom script-and-regex rules.",
-        "COMPOSER" => "Stale composer.lock (COMPOSER1).",
-        "PHL" => "Phutil library symbol map consistency.",
-        "JSHint" => "JavaScript errors via jshint.",
-        "JSCS" => "JavaScript code style via jscs.",
-        "CSSLint" => "CSS errors via csslint.",
-        "LESSC" => "LESS compile errors via lessc.",
-        "GJSLINT" => "JavaScript style via gjslint.",
-        "COFFEE" => "CoffeeScript errors via coffeelint.",
-        "flake8" => "Python errors via flake8.",
-        "PYFLAKES" => "Python errors via pyflakes.",
-        "PyLint" => "Python errors via pylint.",
-        "PEP8" => "Python style via pep8.",
-        "RuboCop" => "Ruby style via rubocop.",
-        "RUBY" => "Ruby syntax via ruby -c.",
-        "cppcheck" => "C/C++ errors via cppcheck.",
-        "C++ Google's Styleguide" => "C++ style via cpplint.",
-        "GOLINT" => "Go style via golint.",
-        "HLINT" => "Haskell suggestions via hlint.",
-        "C#" => "C# style via cslint.",
-        "PHPCS" => "PHP style via phpcs.",
-        "PHP" => "PHP syntax via php -l.",
-        "PUPPETLINT" => "Puppet style via puppet-lint.",
-        "XHP" => "XHP AST lint (parse wrapper).",
-        _ => "No description available.",
-    }
+    describe_core(name)
+        .or_else(|| describe_script(name))
+        .or_else(|| describe_python_ruby(name))
+        .or_else(|| describe_native(name))
+        .unwrap_or("No description available.")
 }
 
 /// Extra detail shown for `--verbose`, when the linter is known.

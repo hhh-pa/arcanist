@@ -602,6 +602,68 @@ pub struct RawCommit {
     message: Option<String>,
 }
 
+/// Split the next header line (with its newline) off a raw blob.
+fn next_blob_line(rest: &str) -> (&str, &str) {
+    match rest.find('\n') {
+        Some(pos) => (&rest[..pos + 1], &rest[pos + 1..]),
+        None => (rest, ""),
+    }
+}
+
+/// Split a header line into its `label value` halves: the label is a
+/// non-empty word, the value is non-empty.
+fn parse_blob_header<'a>(body: &'a str, blob: &str) -> Result<(&'a str, &'a str), String> {
+    const PATTERN: &str = "(^(\\w+) ([^\\n]+)\\n?\\z)";
+    body.split_once(' ')
+        .filter(|(label, value)| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                && !value.is_empty()
+        })
+        .ok_or_else(|| {
+            format!(
+                "Expected to match pattern \"{PATTERN}\" against line \"{body}\" \
+                 in raw commit blob: {blob}"
+            )
+        })
+}
+
+/// Store one header line: reject duplicate non-`parent` labels and unknown
+/// labels, else record the value.
+fn store_blob_header<'a>(
+    raw: &mut RawCommit,
+    seen: &mut BTreeMap<&'a str, &'a str>,
+    label: &'a str,
+    value: &str,
+    line: &'a str,
+    body: &str,
+    blob: &str,
+) -> Result<(), String> {
+    if seen.contains_key(label) && label != "parent" {
+        let first = seen[label].trim_end_matches('\n');
+        return Err(format!(
+            "Encountered two \"{label}\" lines (\"{first}\", \"{body}\") while \
+             parsing raw commit blob, expected at most one: {blob}"
+        ));
+    }
+    seen.insert(label, line);
+    match label {
+        "tree" => raw.tree_hash = Some(value.to_string()),
+        "parent" => raw.parents.push(value.to_string()),
+        "author" => raw.raw_author = Some(value.to_string()),
+        "committer" => raw.raw_committer = Some(value.to_string()),
+        _ => {
+            return Err(format!(
+                "Unknown attribute label \"{label}\" in line \"{body}\" while \
+                 parsing raw commit blob: {blob}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl RawCommit {
     /// Commit with the empty tree and no other fields.
     ///
@@ -624,16 +686,12 @@ impl RawCommit {
     /// labels and malformed lines are errors. Error texts mirror the PHP
     /// messages (shown lines are trimmed of the newline here).
     pub fn new_from_raw_blob(blob: &str) -> Result<Self, String> {
-        const PATTERN: &str = "(^(\\w+) ([^\\n]+)\\n?\\z)";
         let mut raw = Self::default();
         let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
         let mut rest = blob;
         let mut consumed = 0usize;
         loop {
-            let (line, tail) = match rest.find('\n') {
-                Some(pos) => (&rest[..pos + 1], &rest[pos + 1..]),
-                None => (rest, ""),
-            };
+            let (line, tail) = next_blob_line(rest);
             if line.is_empty() {
                 break;
             }
@@ -643,41 +701,8 @@ impl RawCommit {
                 break;
             }
             let body = line.strip_suffix('\n').unwrap_or(line);
-            let (label, value) = body
-                .split_once(' ')
-                .filter(|(label, value)| {
-                    !label.is_empty()
-                        && label
-                            .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-                        && !value.is_empty()
-                })
-                .ok_or_else(|| {
-                    format!(
-                        "Expected to match pattern \"{PATTERN}\" against line \"{body}\" \
-                         in raw commit blob: {blob}"
-                    )
-                })?;
-            if seen.contains_key(label) && label != "parent" {
-                let first = seen[label].trim_end_matches('\n');
-                return Err(format!(
-                    "Encountered two \"{label}\" lines (\"{first}\", \"{body}\") while \
-                     parsing raw commit blob, expected at most one: {blob}"
-                ));
-            }
-            seen.insert(label, line);
-            match label {
-                "tree" => raw.tree_hash = Some(value.to_string()),
-                "parent" => raw.parents.push(value.to_string()),
-                "author" => raw.raw_author = Some(value.to_string()),
-                "committer" => raw.raw_committer = Some(value.to_string()),
-                _ => {
-                    return Err(format!(
-                        "Unknown attribute label \"{label}\" in line \"{body}\" while \
-                         parsing raw commit blob: {blob}"
-                    ));
-                }
-            }
+            let (label, value) = parse_blob_header(body, blob)?;
+            store_blob_header(&mut raw, &mut seen, label, value, line, body, blob)?;
             if tail.is_empty() && !line.ends_with('\n') {
                 break;
             }
@@ -1181,14 +1206,6 @@ pub fn parse_porcelain_v2_status(stdout: &[u8]) -> BTreeMap<String, u32> {
     let parts: Vec<&[u8]> = stdout.split(|b| *b == 0).collect();
     let mut result: BTreeMap<String, u32> = BTreeMap::new();
     let mut rest = parts.as_slice();
-    let ord_field = |entry: &[u8], count: usize| -> Option<Vec<String>> {
-        let text = String::from_utf8_lossy(entry).into_owned();
-        let fields: Vec<String> = text.splitn(count, ' ').map(str::to_string).collect();
-        if fields.len() != count {
-            return None;
-        }
-        Some(fields)
-    };
     while rest.len() > 1 {
         let entry = rest[0];
         rest = &rest[1..];
@@ -1201,57 +1218,10 @@ pub fn parse_porcelain_v2_status(stdout: &[u8]) -> BTreeMap<String, u32> {
             result.insert(head[1].to_string(), FLAG_UNTRACKED);
             continue;
         }
-        let (fields, path) = match head[0] {
-            "1" => {
-                let Some(fields) = ord_field(entry, 9) else {
-                    continue;
-                };
-                let path = fields[8].clone();
-                (fields, path)
-            }
-            "2" => {
-                let Some(fields) = ord_field(entry, 10) else {
-                    continue;
-                };
-                let path = fields[9].clone();
-                (fields, path)
-            }
-            "u" => {
-                let Some(fields) = ord_field(entry, 11) else {
-                    continue;
-                };
-                let path = fields[10].clone();
-                (fields, path)
-            }
-            _ => continue,
+        let Some((fields, path)) = porcelain_ord_fields(entry, head[0]) else {
+            continue;
         };
-        let xy = fields[1].as_bytes();
-        let index_state = xy.first().copied().unwrap_or(b'.');
-        let working_state = xy.get(1).copied().unwrap_or(b'.');
-        let mut mask = FLAG_UNCOMMITTED;
-        if index_state == b'A' {
-            mask |= FLAG_ADDED;
-        } else if index_state == b'M' {
-            mask |= FLAG_MODIFIED;
-        } else if index_state == b'D' {
-            mask |= FLAG_DELETED;
-        }
-        if working_state != b'.' {
-            mask |= FLAG_UNSTAGED;
-            if index_state == b'.' {
-                if working_state == b'A' {
-                    mask |= FLAG_ADDED;
-                } else if working_state == b'M' {
-                    mask |= FLAG_MODIFIED;
-                } else if working_state == b'D' {
-                    mask |= FLAG_DELETED;
-                }
-            }
-        }
-        let submodule = fields[2].as_bytes();
-        if submodule.get(2) == Some(&b'M') || submodule.get(3) == Some(&b'U') {
-            mask |= FLAG_EXTERNALS;
-        }
+        let mask = porcelain_entry_mask(&fields);
         if head[0] == "2" {
             if rest.is_empty() {
                 continue;
@@ -1269,6 +1239,73 @@ pub fn parse_porcelain_v2_status(stdout: &[u8]) -> BTreeMap<String, u32> {
     result
 }
 
+/// Split one `1`/`2`/`u` porcelain entry into its fields plus the path (the
+/// last field). Unknown ords and truncated field lists are `None`.
+fn porcelain_ord_fields(entry: &[u8], ord: &str) -> Option<(Vec<String>, String)> {
+    match ord {
+        "1" => {
+            let fields = porcelain_fields(entry, 9)?;
+            let path = fields[8].clone();
+            Some((fields, path))
+        }
+        "2" => {
+            let fields = porcelain_fields(entry, 10)?;
+            let path = fields[9].clone();
+            Some((fields, path))
+        }
+        "u" => {
+            let fields = porcelain_fields(entry, 11)?;
+            let path = fields[10].clone();
+            Some((fields, path))
+        }
+        _ => None,
+    }
+}
+
+/// Split an entry into exactly `count` space-separated fields.
+fn porcelain_fields(entry: &[u8], count: usize) -> Option<Vec<String>> {
+    let text = String::from_utf8_lossy(entry).into_owned();
+    let fields: Vec<String> = text.splitn(count, ' ').map(str::to_string).collect();
+    if fields.len() != count {
+        return None;
+    }
+    Some(fields)
+}
+
+/// Flag mask for one `1`/`2`/`u` entry: index and worktree states plus the
+/// submodule externals bit.
+fn porcelain_entry_mask(fields: &[String]) -> u32 {
+    let xy = fields[1].as_bytes();
+    let index_state = xy.first().copied().unwrap_or(b'.');
+    let working_state = xy.get(1).copied().unwrap_or(b'.');
+    let mut mask = FLAG_UNCOMMITTED;
+    mask |= state_change_flag(index_state);
+    if working_state != b'.' {
+        mask |= FLAG_UNSTAGED;
+        if index_state == b'.' {
+            mask |= state_change_flag(working_state);
+        }
+    }
+    let submodule = fields[2].as_bytes();
+    if submodule.get(2) == Some(&b'M') || submodule.get(3) == Some(&b'U') {
+        mask |= FLAG_EXTERNALS;
+    }
+    mask
+}
+
+/// The added/modified/deleted bit for one porcelain XY state letter.
+fn state_change_flag(state: u8) -> u32 {
+    if state == b'A' {
+        FLAG_ADDED
+    } else if state == b'M' {
+        FLAG_MODIFIED
+    } else if state == b'D' {
+        FLAG_DELETED
+    } else {
+        0
+    }
+}
+
 /// Parse `git ls-tree` stdout into path-to-entry rows.
 ///
 /// PHP: `ArcanistGitAPI::parseGitTree`
@@ -1280,41 +1317,52 @@ pub fn parse_git_tree(stdout: &str) -> Result<BTreeMap<String, TreeEntry>, Strin
         return Ok(result);
     }
     for line in trimmed.split('\n') {
-        let valid: Option<(String, TreeEntry)> = (|| {
-            let (meta, name) = line.split_once('\t')?;
-            let mut meta_parts = meta.split(' ');
-            let (mode, kind, hash) = (meta_parts.next()?, meta_parts.next()?, meta_parts.next()?);
-            if meta_parts.next().is_some() {
-                return None;
-            }
-            if mode.len() != 6 || !mode.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-            if kind != "blob" && kind != "tree" && kind != "commit" {
-                return None;
-            }
-            if hash.len() != 40
-                || !hash
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
-            {
-                return None;
-            }
-            Some((
-                name.to_string(),
-                TreeEntry {
-                    mode: mode.to_string(),
-                    r#type: kind.to_string(),
-                    r#ref: hash.to_string(),
-                },
-            ))
-        })();
-        let Some((name, entry)) = valid else {
+        let Some((name, entry)) = parse_git_tree_line(line) else {
             return Err("Failed to parse git ls-tree output!".to_string());
         };
         result.insert(name, entry);
     }
     Ok(result)
+}
+
+/// Parse one `ls-tree` line (`<mode> <type> <hash>\t<name>`); malformed
+/// lines are `None`.
+fn parse_git_tree_line(line: &str) -> Option<(String, TreeEntry)> {
+    let (meta, name) = line.split_once('\t')?;
+    let mut meta_parts = meta.split(' ');
+    let (mode, kind, hash) = (meta_parts.next()?, meta_parts.next()?, meta_parts.next()?);
+    if meta_parts.next().is_some() {
+        return None;
+    }
+    if !is_tree_mode(mode) || !is_tree_kind(kind) || !is_tree_hash(hash) {
+        return None;
+    }
+    Some((
+        name.to_string(),
+        TreeEntry {
+            mode: mode.to_string(),
+            r#type: kind.to_string(),
+            r#ref: hash.to_string(),
+        },
+    ))
+}
+
+/// A 6-digit `ls-tree` mode.
+fn is_tree_mode(mode: &str) -> bool {
+    mode.len() == 6 && mode.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// A `blob`/`tree`/`commit` entry kind.
+fn is_tree_kind(kind: &str) -> bool {
+    kind == "blob" || kind == "tree" || kind == "commit"
+}
+
+/// A 40-char lowercase hex object hash.
+fn is_tree_hash(hash: &str) -> bool {
+    hash.len() == 40
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
 /// `--format` value listing every local branch for [`parse_all_branches`].

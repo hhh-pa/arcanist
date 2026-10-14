@@ -59,7 +59,25 @@ pub fn has_shebang(data: &[u8]) -> bool {
 /// PHP switch are ever returned.
 #[must_use]
 pub fn detect_non_executable_mime(data: &[u8]) -> Option<&'static str> {
-    // Archives.
+    if let Some(mime) = detect_archive_mime(data) {
+        return Some(mime);
+    }
+    if let Some(mime) = detect_audio_mime(data) {
+        return Some(mime);
+    }
+    if is_ftyp(data) {
+        // Decisive like the PHP switch: non-audio `ftyp` brands (mp4 video,
+        // 3gp, ...) accept the file without consulting later categories.
+        return ftyp_audio_or_quicktime(data);
+    }
+    detect_font_mime(data)
+        .or_else(|| detect_image_mime(data))
+        .or_else(|| detect_document_mime(data))
+        .or_else(|| detect_video_mime(data))
+}
+
+/// Archive magic from the PHP mime switch.
+fn detect_archive_mime(data: &[u8]) -> Option<&'static str> {
     if data.starts_with(b"PK\x03\x04")
         || data.starts_with(b"PK\x05\x06")
         || data.starts_with(b"PK\x07\x08")
@@ -78,7 +96,12 @@ pub fn detect_non_executable_mime(data: &[u8]) -> Option<&'static str> {
     if data.len() > 262 && data[257..262] == *b"ustar" {
         return Some("application/x-tar");
     }
-    // Audio.
+    None
+}
+
+/// Audio magic from the PHP mime switch (ISO base-media `ftyp` boxes are
+/// classified separately by [`ftyp_audio_or_quicktime`]).
+fn detect_audio_mime(data: &[u8]) -> Option<&'static str> {
     if data.starts_with(b"MThd") {
         return Some("audio/midi");
     }
@@ -88,10 +111,11 @@ pub fn detect_non_executable_mime(data: &[u8]) -> Option<&'static str> {
     if is_riff(data, b"WAVE") {
         return Some("audio/x-wav");
     }
-    if is_ftyp(data) {
-        return ftyp_audio_or_quicktime(data);
-    }
-    // Fonts.
+    None
+}
+
+/// Font magic from the PHP mime switch.
+fn detect_font_mime(data: &[u8]) -> Option<&'static str> {
     if data.starts_with(b"wOFF") {
         return Some("application/x-woff");
     }
@@ -104,7 +128,11 @@ pub fn detect_non_executable_mime(data: &[u8]) -> Option<&'static str> {
     if is_eot(data) {
         return Some("application/vnd.ms-fontobject");
     }
-    // Images.
+    None
+}
+
+/// Image magic from the PHP mime switch.
+fn detect_image_mime(data: &[u8]) -> Option<&'static str> {
     if data.starts_with(b"FWS") || data.starts_with(b"CWS") || data.starts_with(b"ZWS") {
         return Some("application/x-shockwave-flash");
     }
@@ -126,7 +154,11 @@ pub fn detect_non_executable_mime(data: &[u8]) -> Option<&'static str> {
     if data.starts_with(b"BM") {
         return Some("image/x-ms-bmp");
     }
-    // Documents.
+    None
+}
+
+/// Document magic from the PHP mime switch.
+fn detect_document_mime(data: &[u8]) -> Option<&'static str> {
     if data.starts_with(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1") {
         // OLE container (doc/xls/ppt); msword is the representative type.
         return Some("application/msword");
@@ -140,7 +172,11 @@ pub fn detect_non_executable_mime(data: &[u8]) -> Option<&'static str> {
     if data.starts_with(b"{\\rtf") {
         return Some("application/rtf");
     }
-    // Video.
+    None
+}
+
+/// Video magic from the PHP mime switch.
+fn detect_video_mime(data: &[u8]) -> Option<&'static str> {
     if data.starts_with(b"\x00\x00\x01\xb3") {
         return Some("video/mpeg");
     }

@@ -81,6 +81,21 @@ pub fn parse_engine_specs(
             "Error in parsing '{config_path}' file: expected an 'engines' map."
         )));
     };
+    check_spec_shapes(entries, config_path)?;
+
+    let mut planned = Vec::new();
+    for (name, spec) in entries {
+        planned.push(parse_single_spec(name, spec, available)?);
+    }
+    Ok(planned)
+}
+
+/// Reject non-map engine specs before any per-engine validation, so shape
+/// errors take precedence over type errors regardless of entry order.
+fn check_spec_shapes(
+    entries: &[(String, JsonValue)],
+    config_path: &str,
+) -> Result<(), EngineError> {
     for (name, spec) in entries {
         let Some(spec_obj) = spec.as_obj() else {
             return Err(EngineError::Failed(format!(
@@ -89,68 +104,73 @@ pub fn parse_engine_specs(
         };
         let _ = spec_obj;
     }
+    Ok(())
+}
 
-    let mut planned = Vec::new();
-    for (name, spec) in entries {
-        let spec_obj = spec.as_obj().unwrap_or(&[]);
-        let engine_type = spec_obj
-            .iter()
-            .find(|(k, _)| k == "type")
-            .and_then(|(_, v)| v.as_str());
+/// Validate one engine spec: a known `type` plus optional `include`/
+/// `exclude` rule lists; unknown keys are errors.
+fn parse_single_spec(
+    name: &str,
+    spec: &JsonValue,
+    available: &[&str],
+) -> Result<PlannedEngine, EngineError> {
+    let spec_obj = spec.as_obj().unwrap_or(&[]);
+    let engine_type = spec_obj
+        .iter()
+        .find(|(k, _)| k == "type")
+        .and_then(|(_, v)| v.as_str());
 
-        if let Some(engine_type) = engine_type
-            && !available.contains(&engine_type)
-        {
-            return Err(EngineError::Usage(format!(
-                "Test engine '{name}' specifies invalid type '{engine_type}'. Available test \
-                 engines are: {}.",
-                available.join(", ")
-            )));
-        }
+    if let Some(engine_type) = engine_type
+        && !available.contains(&engine_type)
+    {
+        return Err(EngineError::Usage(format!(
+            "Test engine '{name}' specifies invalid type '{engine_type}'. Available test \
+             engines are: {}.",
+            available.join(", ")
+        )));
+    }
 
-        let Some(engine_type) = engine_type else {
-            return Err(EngineError::Failed(format!(
-                "Error in parsing '.arcunit' file, for test engine '{name}': expected a \
-                 'type' string."
-            )));
-        };
-        let mut include = Vec::new();
-        let mut exclude = Vec::new();
-        for (key, value) in spec_obj {
-            match key.as_str() {
-                "type" => {}
-                "include" => {
-                    include = parse_rule_list(value).ok_or_else(|| {
-                        EngineError::Failed(format!(
-                            "Error in parsing '.arcunit' file, for test engine '{name}': \
-                             'include' must be a regex or a list of regexes."
-                        ))
-                    })?;
-                }
-                "exclude" => {
-                    exclude = parse_rule_list(value).ok_or_else(|| {
-                        EngineError::Failed(format!(
-                            "Error in parsing '.arcunit' file, for test engine '{name}': \
-                             'exclude' must be a regex or a list of regexes."
-                        ))
-                    })?;
-                }
-                _ => {
-                    return Err(EngineError::Failed(format!(
-                        "Error in parsing '.arcunit' file, for test engine '{name}': unknown \
-                         key '{key}'."
-                    )));
-                }
+    let Some(engine_type) = engine_type else {
+        return Err(EngineError::Failed(format!(
+            "Error in parsing '.arcunit' file, for test engine '{name}': expected a \
+             'type' string."
+        )));
+    };
+    let mut include = Vec::new();
+    let mut exclude = Vec::new();
+    for (key, value) in spec_obj {
+        match key.as_str() {
+            "type" => {}
+            "include" => {
+                include = parse_rule_list(value).ok_or_else(|| {
+                    EngineError::Failed(format!(
+                        "Error in parsing '.arcunit' file, for test engine '{name}': \
+                         'include' must be a regex or a list of regexes."
+                    ))
+                })?;
+            }
+            "exclude" => {
+                exclude = parse_rule_list(value).ok_or_else(|| {
+                    EngineError::Failed(format!(
+                        "Error in parsing '.arcunit' file, for test engine '{name}': \
+                         'exclude' must be a regex or a list of regexes."
+                    ))
+                })?;
+            }
+            _ => {
+                return Err(EngineError::Failed(format!(
+                    "Error in parsing '.arcunit' file, for test engine '{name}': unknown \
+                     key '{key}'."
+                )));
             }
         }
-        planned.push(PlannedEngine {
-            name: name.clone(),
-            engine_type: engine_type.to_string(),
-            include,
-            exclude,
-        });
     }
-    Ok(planned)
+    Ok(PlannedEngine {
+        name: name.to_string(),
+        engine_type: engine_type.to_string(),
+        include,
+        exclude,
+    })
 }
 
 /// Read `.arcunit` from the project root and parse it (lines 19-43). A missing
@@ -174,10 +194,18 @@ pub fn load_engine_specs(
 /// (line 195). See the module docs for the Divergence.
 #[must_use]
 pub fn rule_matches(rule: &str, path: &str) -> bool {
-    let mut body = rule;
-    // Strip `preg_match` delimiters with trailing flags, e.g. `@...@i`.
-    // Bracket openers are never treated as delimiters: a rule starting with a
-    // group (e.g. `(.*)Tests/`) is matched as a body instead.
+    let body = strip_rule_delimiters(rule);
+    if body.contains("(.*)") {
+        return match_capture_rule(body, path);
+    }
+    match_literal_rule(body, path)
+}
+
+/// Strip `preg_match` delimiters with trailing flags, e.g. `@...@i`.
+/// Bracket openers are never treated as delimiters: a rule starting with a
+/// group (e.g. `(.*)Tests/`) is matched as a body instead.
+fn strip_rule_delimiters(rule: &str) -> &str {
+    let body = rule;
     if body.len() >= 2 {
         let first = body.chars().next().unwrap_or('\0');
         let is_bracket = matches!(first, '(' | '[' | '{' | '<');
@@ -188,31 +216,38 @@ pub fn rule_matches(rule: &str, path: &str) -> bool {
             && let Some(last) = body.rfind(first)
             && last > 0
         {
-            body = &body[1..last];
+            return &body[1..last];
         }
     }
-    if body.contains("(.*)") {
-        // Ordered literal match around `(.*)` captures.
-        let mut rest = path;
-        for (i, part) in body.split("(.*)").enumerate() {
-            if part.is_empty() {
-                continue;
-            }
-            let part = part.replace("\\/", "/");
-            if i == 0 {
-                if let Some(stripped) = rest.strip_prefix(part.as_str()) {
-                    rest = stripped;
-                } else {
-                    return false;
-                }
-            } else if let Some(at) = rest.find(part.as_str()) {
-                rest = &rest[at + part.len()..];
+    body
+}
+
+/// Ordered literal match around `(.*)` captures: the first part anchors at
+/// the path start, later parts match in order.
+fn match_capture_rule(body: &str, path: &str) -> bool {
+    let mut rest = path;
+    for (i, part) in body.split("(.*)").enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        let part = part.replace("\\/", "/");
+        if i == 0 {
+            if let Some(stripped) = rest.strip_prefix(part.as_str()) {
+                rest = stripped;
             } else {
                 return false;
             }
+        } else if let Some(at) = rest.find(part.as_str()) {
+            rest = &rest[at + part.len()..];
+        } else {
+            return false;
         }
-        return true;
     }
+    true
+}
+
+/// Literal substring match after stripping `^`/`$` anchors.
+fn match_literal_rule(body: &str, path: &str) -> bool {
     let mut literal = body.to_string();
     if literal.starts_with('^') {
         literal.remove(0);

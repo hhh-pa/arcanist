@@ -504,67 +504,96 @@ fn scan_php_declarations(data: &[u8]) -> Vec<PhpDecl> {
     let mut depth: usize = 0;
     while index < len {
         if !in_php {
-            if is_open_tag(data, index) {
-                in_php = true;
-                index += 2;
-                continue;
-            }
-            index += 1;
+            index = step_outside_php(data, index, &mut in_php);
             continue;
         }
-        let byte = data[index];
-        let next = data.get(index + 1).copied().unwrap_or(0);
-        if (byte == b'/' && next == b'/') || byte == b'#' {
-            let (after, closed) = skip_line_rest(data, index);
+        if let Some((after, closed)) = skip_php_trivia(data, index) {
             index = after;
             if closed {
                 in_php = false;
             }
             continue;
         }
-        if byte == b'/' && next == b'*' {
-            index = skip_block_comment(data, index);
-            continue;
-        }
-        if byte == b'\'' || byte == b'"' || byte == b'`' {
-            index = skip_quoted(data, index);
-            continue;
-        }
-        if let Some(after) = skip_heredoc(data, index) {
-            index = after;
-            continue;
-        }
-        if byte == b'?' && next == b'>' {
-            in_php = false;
-            index += 2;
-            continue;
-        }
-        if byte == b'{' {
-            depth += 1;
-            index += 1;
-            continue;
-        }
-        if byte == b'}' {
-            depth = depth.saturating_sub(1);
-            index += 1;
-            continue;
-        }
-        if depth == 0
-            && is_identifier_start(byte)
-            && is_left_boundary(data, index)
-            && let Some((kind, end)) = match_keyword(data, index)
-        {
-            let excluded =
-                kind == DeclKind::ClassOrInterface && is_double_colon_before(data, index);
-            if !excluded && let Some(decl) = parse_declaration(data, index, kind, end) {
-                decls.push(decl);
-            }
-            index = end;
-            continue;
-        }
-        index += 1;
+        index = step_php_code(data, index, &mut depth, &mut decls);
     }
     decls
+}
+
+/// Advance one step outside `<?php` code: honor `<?` open tags, else skip a
+/// byte. `index` is below `data.len()`.
+fn step_outside_php(data: &[u8], index: usize, in_php: &mut bool) -> usize {
+    if is_open_tag(data, index) {
+        *in_php = true;
+        index + 2
+    } else {
+        index + 1
+    }
+}
+
+/// Skip comments, strings, heredocs, and `?>` inside PHP code. Returns the
+/// resume offset and whether PHP mode closed, or `None` for code bytes.
+/// `index` is below `data.len()`.
+fn skip_php_trivia(data: &[u8], index: usize) -> Option<(usize, bool)> {
+    let byte = data[index];
+    let next = data.get(index + 1).copied().unwrap_or(0);
+    if (byte == b'/' && next == b'/') || byte == b'#' {
+        let (after, closed) = skip_line_rest(data, index);
+        return Some((after, closed));
+    }
+    if byte == b'/' && next == b'*' {
+        return Some((skip_block_comment(data, index), false));
+    }
+    if byte == b'\'' || byte == b'"' || byte == b'`' {
+        return Some((skip_quoted(data, index), false));
+    }
+    if let Some(after) = skip_heredoc(data, index) {
+        return Some((after, false));
+    }
+    if byte == b'?' && next == b'>' {
+        return Some((index + 2, true));
+    }
+    None
+}
+
+/// Advance one step over PHP code bytes: track braces, match top-level
+/// declarations, else skip a byte. `index` is below `data.len()`.
+fn step_php_code(data: &[u8], index: usize, depth: &mut usize, decls: &mut Vec<PhpDecl>) -> usize {
+    let byte = data[index];
+    if byte == b'{' {
+        *depth += 1;
+        return index + 1;
+    }
+    if byte == b'}' {
+        *depth = depth.saturating_sub(1);
+        return index + 1;
+    }
+    if *depth == 0
+        && let Some((decl, end)) = match_declaration(data, index)
+    {
+        if let Some(decl) = decl {
+            decls.push(decl);
+        }
+        return end;
+    }
+    index + 1
+}
+
+/// Match a declaration keyword at `index`: the declaration (absent for
+/// anonymous classes, closures, and `::class` fetches) plus the offset just
+/// past the keyword. `index` is below `data.len()`.
+fn match_declaration(data: &[u8], index: usize) -> Option<(Option<PhpDecl>, usize)> {
+    let byte = data[index];
+    if !is_identifier_start(byte) || !is_left_boundary(data, index) {
+        return None;
+    }
+    let (kind, end) = match_keyword(data, index)?;
+    let excluded = kind == DeclKind::ClassOrInterface && is_double_colon_before(data, index);
+    let decl = if excluded {
+        None
+    } else {
+        parse_declaration(data, index, kind, end)
+    };
+    Some((decl, end))
 }
 
 /// `<?` that is not a `<?xml` prolog.
@@ -730,65 +759,111 @@ fn skip_quoted(data: &[u8], index: usize) -> usize {
 
 /// Skip a heredoc/nowdoc starting at `index`, if one starts there.
 fn skip_heredoc(data: &[u8], index: usize) -> Option<usize> {
-    if data.get(index) != Some(&b'<')
-        || data.get(index + 1) != Some(&b'<')
-        || data.get(index + 2) != Some(&b'<')
-    {
+    let (label, body) = parse_heredoc_opener(data, index)?;
+    Some(find_heredoc_end(data, label, body))
+}
+
+/// Parse a heredoc/nowdoc opener at `index`: the label plus the offset of
+/// the first body line. `None` when no opener starts there.
+fn parse_heredoc_opener(data: &[u8], index: usize) -> Option<(&[u8], usize)> {
+    if !is_heredoc_opener(data, index) {
         return None;
     }
-    // `<<<=` and `<<` shifts are not heredocs.
-    if data.get(index + 3) == Some(&b'<') || data.get(index + 3) == Some(&b'=') {
-        return None;
-    }
-    let mut cursor = index + 3;
-    while cursor < data.len() && (data[cursor] == b' ' || data[cursor] == b'\t') {
-        cursor += 1;
-    }
+    let mut cursor = skip_opener_gap(data, index + 3);
     let quote = data.get(cursor).copied().unwrap_or(0);
     let quoted = quote == b'\'' || quote == b'"';
     if quoted {
         cursor += 1;
     }
-    let label_start = cursor;
-    while cursor < data.len() && (data[cursor].is_ascii_alphanumeric() || data[cursor] == b'_') {
-        cursor += 1;
-    }
-    if cursor == label_start || !is_identifier_start(data[label_start]) {
-        return None;
-    }
-    let label = &data[label_start..cursor];
+    let (label, after) = scan_heredoc_label(data, cursor)?;
+    cursor = after;
     if quoted {
         if data.get(cursor) != Some(&quote) {
             return None;
         }
         cursor += 1;
     }
-    // The label must end the opener line (modulo whitespace).
-    while cursor < data.len() && data[cursor] != b'\n' {
-        if data[cursor] != b' ' && data[cursor] != b'\t' && data[cursor] != b'\r' {
+    let body = opener_body_start(data, cursor)?;
+    Some((label, body))
+}
+
+/// True when `<<<` (but not `<<<=` or a `<<` shift) starts at `index`.
+fn is_heredoc_opener(data: &[u8], index: usize) -> bool {
+    if data.get(index) != Some(&b'<')
+        || data.get(index + 1) != Some(&b'<')
+        || data.get(index + 2) != Some(&b'<')
+    {
+        return false;
+    }
+    data.get(index + 3) != Some(&b'<') && data.get(index + 3) != Some(&b'=')
+}
+
+/// Offset of the first body line: the label must end the opener line
+/// (modulo whitespace), else `None`.
+fn opener_body_start(data: &[u8], cursor: usize) -> Option<usize> {
+    let mut end = cursor;
+    while end < data.len() && data[end] != b'\n' {
+        if data[end] != b' ' && data[end] != b'\t' && data[end] != b'\r' {
             return None;
         }
+        end += 1;
+    }
+    if end >= data.len() {
+        Some(end)
+    } else {
+        Some(end + 1)
+    }
+}
+
+/// Skip spaces/tabs between `<<<` and the heredoc label.
+fn skip_opener_gap(data: &[u8], mut cursor: usize) -> usize {
+    while cursor < data.len() && (data[cursor] == b' ' || data[cursor] == b'\t') {
         cursor += 1;
     }
-    if cursor >= data.len() {
-        return Some(cursor);
+    cursor
+}
+
+/// Scan a heredoc label at `cursor`: the label plus the offset past it.
+/// The label must be a valid identifier start.
+fn scan_heredoc_label(data: &[u8], cursor: usize) -> Option<(&[u8], usize)> {
+    let mut end = cursor;
+    while end < data.len() && (data[end].is_ascii_alphanumeric() || data[end] == b'_') {
+        end += 1;
     }
-    cursor += 1;
-    // Consume body lines until the terminator line.
+    if end == cursor || !is_identifier_start(data[cursor]) {
+        return None;
+    }
+    Some((&data[cursor..end], end))
+}
+
+/// Consume heredoc body lines from `body` until the terminator line for
+/// `label`; unterminated bodies run to the end of input.
+fn find_heredoc_end(data: &[u8], label: &[u8], mut cursor: usize) -> usize {
     while cursor < data.len() {
-        let mut probe = cursor;
-        while probe < data.len() && (data[probe] == b' ' || data[probe] == b'\t') {
-            probe += 1;
-        }
-        if data[probe..].starts_with(label) {
-            let next = data.get(probe + label.len()).copied().unwrap_or(b';');
-            if next != b'_' && !next.is_ascii_alphanumeric() {
-                return Some(end_of_line(data, probe));
-            }
+        if let Some(probe) = heredoc_terminator_probe(data, label, cursor) {
+            return end_of_line(data, probe);
         }
         cursor = end_of_line(data, cursor);
     }
-    Some(cursor)
+    cursor
+}
+
+/// Offset of the label when the line at `cursor` terminates the heredoc:
+/// optional indent, the label, then a non-identifier byte.
+fn heredoc_terminator_probe(data: &[u8], label: &[u8], cursor: usize) -> Option<usize> {
+    let mut probe = cursor;
+    while probe < data.len() && (data[probe] == b' ' || data[probe] == b'\t') {
+        probe += 1;
+    }
+    if !data[probe..].starts_with(label) {
+        return None;
+    }
+    let next = data.get(probe + label.len()).copied().unwrap_or(b';');
+    if next != b'_' && !next.is_ascii_alphanumeric() {
+        Some(probe)
+    } else {
+        None
+    }
 }
 
 fn end_of_line(data: &[u8], index: usize) -> usize {

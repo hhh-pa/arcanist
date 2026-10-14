@@ -144,6 +144,44 @@ fn hex_val(byte: u8) -> u32 {
     }
 }
 
+/// The five predefined XML entities.
+fn is_predefined_entity(body: &[u8]) -> bool {
+    body == b"amp" || body == b"lt" || body == b"gt" || body == b"apos" || body == b"quot"
+}
+
+/// Value of a `#...` character reference body: an optional `x` radix marker
+/// plus up to 8 well-formed digits. `None` when malformed.
+fn char_ref_value(digits: &[u8]) -> Option<u32> {
+    let (digits, radix) = match digits.first() {
+        Some(b'x' | b'X') => (&digits[1..], 16),
+        _ => (digits, 10),
+    };
+    if digits.is_empty() || digits.len() > 8 {
+        return None;
+    }
+    let well_formed = if radix == 16 {
+        digits.iter().all(|byte| byte.is_ascii_hexdigit())
+    } else {
+        digits.iter().all(|byte| byte.is_ascii_digit())
+    };
+    if !well_formed {
+        return None;
+    }
+    Some(digits.iter().fold(0u32, |acc, byte| {
+        acc.wrapping_mul(radix).wrapping_add(hex_val(*byte))
+    }))
+}
+
+/// Code points no character reference may denote.
+fn is_forbidden_char_ref(value: u32) -> bool {
+    value == 0
+        || value > 0x10FFFF
+        || (0xD800..0xE000).contains(&value)
+        || value == 0xFFFE
+        || value == 0xFFFF
+        || (value < 0x20 && !matches!(value, 0x09 | 0x0A | 0x0D))
+}
+
 struct Cursor<'a> {
     data: &'a [u8],
     pos: usize,
@@ -345,7 +383,13 @@ impl<'a> Cursor<'a> {
     fn parse_reference(&mut self) -> Result<(), XmlError> {
         // Precondition: the current byte is '&'.
         let (line, col) = self.position();
-        self.bump();
+        let body = self.scan_reference_body(line, col)?;
+        self.check_reference_body(&body, line, col)
+    }
+
+    /// Consume `&...;`, returning the raw body between them.
+    fn scan_reference_body(&mut self, line: usize, col: usize) -> Result<Vec<u8>, XmlError> {
+        self.bump(); // '&'
         let start = self.pos;
         loop {
             match self.peek() {
@@ -357,41 +401,24 @@ impl<'a> Cursor<'a> {
                 _ => return Err(self.error_at(line, col, "invalid entity reference")),
             }
         }
-        let body = &self.data[start..self.pos];
+        let body = self.data[start..self.pos].to_vec();
         self.bump(); // Consume ';'.
-        if body == b"amp" || body == b"lt" || body == b"gt" || body == b"apos" || body == b"quot" {
+        Ok(body)
+    }
+
+    /// Validate a scanned reference body: a predefined entity or a
+    /// well-formed, in-range character reference.
+    fn check_reference_body(&self, body: &[u8], line: usize, col: usize) -> Result<(), XmlError> {
+        if is_predefined_entity(body) {
             return Ok(());
         }
         let Some(digits) = body.strip_prefix(b"#") else {
             return Err(self.error_at(line, col, "unknown entity"));
         };
-        let (digits, radix) = match digits
-            .strip_prefix(b"x")
-            .or_else(|| digits.strip_prefix(b"X"))
-        {
-            Some(hex) => (hex, 16),
-            None => (digits, 10),
-        };
-        let well_formed = !digits.is_empty()
-            && digits.len() <= 8
-            && (if radix == 16 {
-                digits.iter().all(|byte| byte.is_ascii_hexdigit())
-            } else {
-                digits.iter().all(|byte| byte.is_ascii_digit())
-            });
-        if !well_formed {
+        let Some(value) = char_ref_value(digits) else {
             return Err(self.error_at(line, col, "invalid character reference"));
-        }
-        let value = digits.iter().fold(0u32, |acc, byte| {
-            acc.wrapping_mul(radix).wrapping_add(hex_val(*byte))
-        });
-        let forbidden = value == 0
-            || value > 0x10FFFF
-            || (0xD800..0xE000).contains(&value)
-            || value == 0xFFFE
-            || value == 0xFFFF
-            || (value < 0x20 && !matches!(value, 0x09 | 0x0A | 0x0D));
-        if forbidden {
+        };
+        if is_forbidden_char_ref(value) {
             return Err(self.error_at(line, col, "character reference out of range"));
         }
         Ok(())
@@ -471,6 +498,12 @@ impl<'a> Cursor<'a> {
         let (line, col) = self.position();
         self.bump_n(5); // "<?xml"
         self.skip_whitespace();
+        self.parse_xml_decl_version(line, col)?;
+        self.parse_xml_decl_attrs(line, col)
+    }
+
+    /// The mandatory `version="1.0"|"1.1"` opening of an XML declaration.
+    fn parse_xml_decl_version(&mut self, line: usize, col: usize) -> Result<(), XmlError> {
         let version_name = match self.parse_name() {
             Ok(name) => name,
             Err(_) => return Err(self.error_at(line, col, "invalid XML declaration")),
@@ -486,6 +519,11 @@ impl<'a> Cursor<'a> {
         if version != b"1.0" && version != b"1.1" {
             return Err(self.error_at(line, col, "unsupported XML version"));
         }
+        Ok(())
+    }
+
+    /// Optional `encoding`/`standalone` attributes plus the closing `?>`.
+    fn parse_xml_decl_attrs(&mut self, line: usize, col: usize) -> Result<(), XmlError> {
         let mut saw_encoding = false;
         let mut saw_standalone = false;
         loop {
@@ -512,20 +550,42 @@ impl<'a> Cursor<'a> {
             let value = self
                 .parse_quoted_raw()
                 .map_err(|_| self.error_at(line, col, "invalid XML declaration"))?;
-            if attr == b"encoding" {
-                if saw_encoding || saw_standalone || value.is_empty() {
-                    return Err(self.error_at(line, col, "invalid encoding declaration"));
-                }
-                saw_encoding = true;
-            } else if attr == b"standalone" {
-                if saw_standalone || (value != b"yes" && value != b"no") {
-                    return Err(self.error_at(line, col, "invalid standalone declaration"));
-                }
-                saw_standalone = true;
-            } else {
-                return Err(self.error_at(line, col, "unknown XML declaration attribute"));
-            }
+            self.check_xml_decl_attr(
+                &attr,
+                &value,
+                &mut saw_encoding,
+                &mut saw_standalone,
+                line,
+                col,
+            )?;
         }
+    }
+
+    /// Validate one `encoding`/`standalone` declaration attribute in order:
+    /// `encoding` first and non-empty, `standalone` once as `yes`/`no`.
+    fn check_xml_decl_attr(
+        &self,
+        attr: &[u8],
+        value: &[u8],
+        saw_encoding: &mut bool,
+        saw_standalone: &mut bool,
+        line: usize,
+        col: usize,
+    ) -> Result<(), XmlError> {
+        if attr == b"encoding" {
+            if *saw_encoding || *saw_standalone || value.is_empty() {
+                return Err(self.error_at(line, col, "invalid encoding declaration"));
+            }
+            *saw_encoding = true;
+        } else if attr == b"standalone" {
+            if *saw_standalone || (value != b"yes" && value != b"no") {
+                return Err(self.error_at(line, col, "invalid standalone declaration"));
+            }
+            *saw_standalone = true;
+        } else {
+            return Err(self.error_at(line, col, "unknown XML declaration attribute"));
+        }
+        Ok(())
     }
 
     fn parse_doctype(&mut self) -> Result<(), XmlError> {
@@ -622,6 +682,17 @@ impl<'a> Cursor<'a> {
             return Err(self.error_here("element nesting too deep"));
         }
         let (line, col) = self.position();
+        let (name, empty) = self.parse_start_tag(line, col)?;
+        if empty {
+            return Ok(());
+        }
+        stack.push(name);
+        self.parse_element_content(stack, depth)
+    }
+
+    /// The `<name ...>` opener: the element name plus whether it self-closes
+    /// (`/>`). Attribute duplicates are rejected.
+    fn parse_start_tag(&mut self, line: usize, col: usize) -> Result<(Vec<u8>, bool), XmlError> {
         self.bump(); // '<'
         let name = match self.parse_name() {
             Ok(name) => name,
@@ -635,20 +706,28 @@ impl<'a> Cursor<'a> {
                     self.bump();
                     if self.peek() == Some(b'>') {
                         self.bump();
-                        return Ok(());
+                        return Ok((name, true));
                     }
                     return Err(self.error_here("expected '>'"));
                 }
                 Some(b'>') => {
                     self.bump();
-                    break;
+                    return Ok((name, false));
                 }
                 Some(_) if saw_ws => self.parse_attribute(&mut attrs)?,
                 Some(_) => return Err(self.error_here("expected whitespace before attribute")),
                 None => return Err(self.error_at(line, col, "unterminated start tag")),
             }
         }
-        stack.push(name);
+    }
+
+    /// Element content up to the matching end tag: nested markup,
+    /// references, and text.
+    fn parse_element_content(
+        &mut self,
+        stack: &mut Vec<Vec<u8>>,
+        depth: usize,
+    ) -> Result<(), XmlError> {
         loop {
             match self.peek() {
                 None => {
@@ -657,40 +736,8 @@ impl<'a> Cursor<'a> {
                     return Err(self.error_here(format!("unclosed element <{open}>")));
                 }
                 Some(b'<') => {
-                    if self.starts_with(b"<!--") {
-                        self.parse_comment()?;
-                    } else if self.starts_with(b"<![CDATA[") {
-                        self.parse_cdata()?;
-                    } else if self.starts_with(b"<?") {
-                        self.parse_pi()?;
-                    } else if self.starts_with(b"</") {
-                        let (end_line, end_col) = self.position();
-                        self.bump_n(2);
-                        let end = match self.parse_name() {
-                            Ok(name) => name,
-                            Err(_) => {
-                                return Err(self.error_at(end_line, end_col, "invalid end tag"));
-                            }
-                        };
-                        self.skip_whitespace();
-                        if self.peek() != Some(b'>') {
-                            return Err(self.error_here("expected '>'"));
-                        }
-                        self.bump();
-                        let open = stack.pop().unwrap_or_default();
-                        if open != end {
-                            let open = String::from_utf8_lossy(&open);
-                            return Err(self.error_at(
-                                end_line,
-                                end_col,
-                                format!("mismatched end tag: expected </{open}>"),
-                            ));
-                        }
+                    if self.parse_content_markup(stack, depth)? {
                         return Ok(());
-                    } else if self.starts_with(b"<!") {
-                        return Err(self.error_here("markup declaration is not allowed here"));
-                    } else {
-                        self.parse_element(stack, depth + 1)?;
                     }
                 }
                 Some(b'&') => self.parse_reference()?,
@@ -700,6 +747,59 @@ impl<'a> Cursor<'a> {
                 }
             }
         }
+    }
+
+    /// One `<...` construct in content. Returns true when the element's own
+    /// end tag closed it. Precondition: the current byte is `<`.
+    fn parse_content_markup(
+        &mut self,
+        stack: &mut Vec<Vec<u8>>,
+        depth: usize,
+    ) -> Result<bool, XmlError> {
+        if self.starts_with(b"<!--") {
+            self.parse_comment()?;
+            Ok(false)
+        } else if self.starts_with(b"<![CDATA[") {
+            self.parse_cdata()?;
+            Ok(false)
+        } else if self.starts_with(b"<?") {
+            self.parse_pi()?;
+            Ok(false)
+        } else if self.starts_with(b"</") {
+            self.parse_end_tag(stack)?;
+            Ok(true)
+        } else if self.starts_with(b"<!") {
+            Err(self.error_here("markup declaration is not allowed here"))
+        } else {
+            self.parse_element(stack, depth + 1)?;
+            Ok(false)
+        }
+    }
+
+    /// The `</name>` closer: pop the open element and match names.
+    /// Precondition: starts with `</`.
+    fn parse_end_tag(&mut self, stack: &mut Vec<Vec<u8>>) -> Result<(), XmlError> {
+        let (end_line, end_col) = self.position();
+        self.bump_n(2);
+        let end = match self.parse_name() {
+            Ok(name) => name,
+            Err(_) => return Err(self.error_at(end_line, end_col, "invalid end tag")),
+        };
+        self.skip_whitespace();
+        if self.peek() != Some(b'>') {
+            return Err(self.error_here("expected '>'"));
+        }
+        self.bump();
+        let open = stack.pop().unwrap_or_default();
+        if open != end {
+            let open = String::from_utf8_lossy(&open);
+            return Err(self.error_at(
+                end_line,
+                end_col,
+                format!("mismatched end tag: expected </{open}>"),
+            ));
+        }
+        Ok(())
     }
 }
 

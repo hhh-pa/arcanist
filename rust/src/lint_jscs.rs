@@ -168,51 +168,90 @@ fn parse_attrs(tag: &str) -> Vec<(String, String)> {
     let bytes = tag.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-        let start = i;
-        while i < bytes.len() && is_name_byte(bytes[i]) {
-            i += 1;
-        }
-        if start == i {
-            let width = tag[i..].chars().next().map_or(1, |ch| ch.len_utf8());
-            i += width;
-            continue;
-        }
-        let key = &tag[start..i];
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= bytes.len() || bytes[i] != b'=' {
-            continue;
-        }
-        i += 1;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-        let quote = bytes[i];
-        if quote != b'"' && quote != b'\'' {
-            continue;
-        }
-        i += 1;
-        let value_start = i;
-        while i < bytes.len() && bytes[i] != quote {
-            i += 1;
-        }
-        let raw = &tag[value_start..i.min(bytes.len())];
-        attrs.push((key.to_string(), unescape_xml(raw)));
-        if i < bytes.len() {
-            i += 1;
+        match scan_attr(tag, bytes, i) {
+            AttrScan::Parsed(key, value, next) => {
+                attrs.push((key, value));
+                i = next;
+            }
+            AttrScan::Skipped(next) => i = next,
+            AttrScan::Halt => break,
         }
     }
     attrs
+}
+
+/// Outcome of scanning one attribute at an offset: parsed, skipped (resume
+/// at the offset), or halted (a trailing `=` with nothing after it).
+enum AttrScan {
+    Parsed(String, String, usize),
+    Skipped(usize),
+    Halt,
+}
+
+/// Scan one attribute starting at `start` (past leading padding).
+fn scan_attr(tag: &str, bytes: &[u8], start: usize) -> AttrScan {
+    let mut i = skip_attr_gap(bytes, start);
+    if i >= bytes.len() {
+        return AttrScan::Halt;
+    }
+    let name_start = i;
+    while i < bytes.len() && is_name_byte(bytes[i]) {
+        i += 1;
+    }
+    if name_start == i {
+        return AttrScan::Skipped(skip_attr_char(tag, i));
+    }
+    let key = tag[name_start..i].to_string();
+    scan_attr_value(tag, bytes, key, i)
+}
+
+/// Scan the `= "value"` half of an attribute whose name ends at `start`.
+fn scan_attr_value(tag: &str, bytes: &[u8], key: String, start: usize) -> AttrScan {
+    let mut i = skip_attr_ws(bytes, start);
+    if i >= bytes.len() || bytes[i] != b'=' {
+        return AttrScan::Skipped(i);
+    }
+    i += 1;
+    i = skip_attr_ws(bytes, i);
+    if i >= bytes.len() {
+        return AttrScan::Halt;
+    }
+    let quote = bytes[i];
+    if quote != b'"' && quote != b'\'' {
+        return AttrScan::Skipped(i);
+    }
+    i += 1;
+    let value_start = i;
+    while i < bytes.len() && bytes[i] != quote {
+        i += 1;
+    }
+    let raw = &tag[value_start..i.min(bytes.len())];
+    let value = unescape_xml(raw);
+    if i < bytes.len() {
+        i += 1;
+    }
+    AttrScan::Parsed(key, value, i)
+}
+
+/// Skip inter-attribute padding (whitespace and `/`).
+fn skip_attr_gap(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
+        i += 1;
+    }
+    i
+}
+
+/// Skip whitespace between an attribute name, `=`, and its value.
+fn skip_attr_ws(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// Skip one non-name character (a full UTF-8 scalar, never a bare byte).
+fn skip_attr_char(tag: &str, i: usize) -> usize {
+    i + tag[i..].chars().next().map_or(1, |ch| ch.len_utf8())
 }
 
 fn unescape_xml(text: &str) -> String {

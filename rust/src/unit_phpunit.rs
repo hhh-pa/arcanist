@@ -423,61 +423,7 @@ pub fn parse_phpunit_results(
             }
             _ => continue,
         }
-        let mut status = RESULT_PASS;
-        let mut user_data = String::new();
-        match event.get("status").and_then(JsonValue::as_str) {
-            Some("fail") => {
-                status = RESULT_FAIL;
-                user_data.push_str(
-                    event
-                        .get("message")
-                        .and_then(JsonValue::as_str)
-                        .unwrap_or(""),
-                );
-                user_data.push('\n');
-                for trace in event
-                    .get("trace")
-                    .and_then(JsonValue::as_arr)
-                    .unwrap_or(&[])
-                {
-                    let file = trace.get("file").and_then(JsonValue::as_str).unwrap_or("");
-                    let line = trace_number(trace.get("line"));
-                    user_data.push_str(&format!("\n{file}:{line}"));
-                }
-            }
-            Some("error") => {
-                let message = event
-                    .get("message")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or("");
-                if message.contains("Skipped Test") || message.contains("Incomplete Test") {
-                    status = RESULT_SKIP;
-                    user_data.push_str(message);
-                } else {
-                    status = RESULT_BROKEN;
-                    user_data.push_str(message);
-                    for trace in event
-                        .get("trace")
-                        .and_then(JsonValue::as_arr)
-                        .unwrap_or(&[])
-                    {
-                        let file = trace.get("file").and_then(JsonValue::as_str).unwrap_or("");
-                        let line = trace_number(trace.get("line"));
-                        user_data.push_str(&format!("\n{file}:{line}"));
-                    }
-                }
-            }
-            _ => {}
-        }
-        let raw_name = event.get("test").and_then(JsonValue::as_str).unwrap_or("");
-        let name = strip_paren_suffix(raw_name);
-        let mut result = UnitResult::new();
-        result.set_name(&name).map_err(EngineError::Failed)?;
-        result.set_result(status);
-        result.set_duration(event.get("time").and_then(JsonValue::as_num).unwrap_or(0.0));
-        result.set_coverage(coverage.clone());
-        result.set_user_data(&user_data);
-        results.push(result);
+        results.push(build_phpunit_event_result(event, &coverage)?);
         last_test_finished = true;
     }
 
@@ -490,6 +436,77 @@ pub fn parse_phpunit_results(
         results.push(result);
     }
     Ok(results)
+}
+
+/// Build one result from a `test` event: the stripped test name, status
+/// and user data from [`phpunit_event_outcome`], duration, and the shared
+/// clover coverage map.
+fn build_phpunit_event_result(
+    event: &JsonValue,
+    coverage: &HashMap<String, String>,
+) -> Result<UnitResult, EngineError> {
+    let (status, user_data) = phpunit_event_outcome(event);
+    let raw_name = event.get("test").and_then(JsonValue::as_str).unwrap_or("");
+    let name = strip_paren_suffix(raw_name);
+    let mut result = UnitResult::new();
+    result.set_name(&name).map_err(EngineError::Failed)?;
+    result.set_result(status);
+    result.set_duration(event.get("time").and_then(JsonValue::as_num).unwrap_or(0.0));
+    result.set_coverage(coverage.clone());
+    result.set_user_data(&user_data);
+    Ok(result)
+}
+
+/// Resolve a `test` event's status and user data: `fail` gains the message
+/// plus trace, `error` with a skip/incomplete message becomes a skip,
+/// otherwise an `error` is broken with the message plus trace.
+fn phpunit_event_outcome(event: &JsonValue) -> (&'static str, String) {
+    let mut status = RESULT_PASS;
+    let mut user_data = String::new();
+    match event.get("status").and_then(JsonValue::as_str) {
+        Some("fail") => {
+            status = RESULT_FAIL;
+            user_data.push_str(
+                event
+                    .get("message")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or(""),
+            );
+            user_data.push('\n');
+            user_data.push_str(&format_phpunit_trace(event));
+        }
+        Some("error") => {
+            let message = event
+                .get("message")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("");
+            if message.contains("Skipped Test") || message.contains("Incomplete Test") {
+                status = RESULT_SKIP;
+                user_data.push_str(message);
+            } else {
+                status = RESULT_BROKEN;
+                user_data.push_str(message);
+                user_data.push_str(&format_phpunit_trace(event));
+            }
+        }
+        _ => {}
+    }
+    (status, user_data)
+}
+
+/// Format a `test` event's trace frames as `\nfile:line` lines.
+fn format_phpunit_trace(event: &JsonValue) -> String {
+    let mut out = String::new();
+    for trace in event
+        .get("trace")
+        .and_then(JsonValue::as_arr)
+        .unwrap_or(&[])
+    {
+        let file = trace.get("file").and_then(JsonValue::as_str).unwrap_or("");
+        let line = trace_number(trace.get("line"));
+        out.push_str(&format!("\n{file}:{line}"));
+    }
+    out
 }
 
 fn trace_number(value: Option<&JsonValue>) -> String {
@@ -583,40 +600,47 @@ pub fn read_clover_coverage(
         let Some(line_count) = line_count_of(class_path) else {
             continue;
         };
-        let mut coverage = vec![b'N'; line_count];
-        let mut any_covered = false;
-        for line in arc_rs::unit_engine::find_elements(&file.inner, "line") {
-            if line.attr("type") != Some("stmt") {
-                continue;
-            }
-            let count = line
-                .attr("count")
-                .and_then(|c| c.parse::<i64>().ok())
-                .unwrap_or(0);
-            let num = line
-                .attr("num")
-                .and_then(|n| n.parse::<usize>().ok())
-                .unwrap_or(0);
-            if num == 0 || num > line_count {
-                continue;
-            }
-            if count > 0 {
-                coverage[num - 1] = b'C';
-                any_covered = true;
-            } else {
-                coverage[num - 1] = b'U';
-            }
-        }
-        if any_covered {
+        if let Some(marks) = clover_file_marks(&file.inner, line_count) {
             let prefix = format!("{}/", normalize(project_root));
             let relative = normalize(class_path)
                 .strip_prefix(&prefix)
                 .unwrap_or(class_path)
                 .to_string();
-            reports.insert(relative, String::from_utf8_lossy(&coverage).to_string());
+            reports.insert(relative, String::from_utf8_lossy(&marks).to_string());
         }
     }
     reports
+}
+
+/// Per-line coverage marks for one clover `<file>`: the report starts as
+/// all-`N` with covered (`C`) and uncovered (`U`) `stmt` lines overlaid.
+/// `None` when no line is covered (a false positive, dropped like PHP).
+fn clover_file_marks(inner: &str, line_count: usize) -> Option<Vec<u8>> {
+    let mut coverage = vec![b'N'; line_count];
+    let mut any_covered = false;
+    for line in arc_rs::unit_engine::find_elements(inner, "line") {
+        if line.attr("type") != Some("stmt") {
+            continue;
+        }
+        let count = line
+            .attr("count")
+            .and_then(|c| c.parse::<i64>().ok())
+            .unwrap_or(0);
+        let num = line
+            .attr("num")
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or(0);
+        if num == 0 || num > line_count {
+            continue;
+        }
+        if count > 0 {
+            coverage[num - 1] = b'C';
+            any_covered = true;
+        } else {
+            coverage[num - 1] = b'U';
+        }
+    }
+    if any_covered { Some(coverage) } else { None }
 }
 
 fn normalize(path: &str) -> String {

@@ -263,61 +263,81 @@ pub fn parse_revision(value: &serde_json::Value) -> Result<RevisionView, String>
         .and_then(json_i64)
         .ok_or_else(|| "revision entry has no id".to_string())?;
     let monogram = format!("D{id}");
+    let status = value
+        .get("fields")
+        .and_then(|fields| fields.get("status"))
+        .and_then(|status| status.get("value"))
+        .and_then(|v| v.as_str());
+    if let Some(status) = status {
+        Ok(parse_modern_revision(value, id, monogram, status))
+    } else {
+        Ok(parse_legacy_revision(value, id, monogram))
+    }
+}
+
+/// Parse a modern `differential.revision.search` row
+/// (`fields.status.value` / `name` / `closed`, `fields.title`,
+/// `fields.authorPHID`, `fields.diffPHID`, `id`, `phid`).
+fn parse_modern_revision(
+    value: &serde_json::Value,
+    id: i64,
+    monogram: String,
+    status: &str,
+) -> RevisionView {
     let fields = value.get("fields");
     let status_obj = fields.and_then(|fields| fields.get("status"));
-    if let Some(status) = status_obj
-        .and_then(|status| status.get("value"))
+    let status_name = status_obj
+        .and_then(|status| status.get("name"))
         .and_then(|v| v.as_str())
-    {
-        let status_name = status_obj
-            .and_then(|status| status.get("name"))
+        .unwrap_or("");
+    let closed = status_obj
+        .and_then(|status| status.get("closed"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let name = fields
+        .and_then(|fields| fields.get("title"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let author_phid = fields
+        .and_then(|fields| fields.get("authorPHID"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    RevisionView {
+        id,
+        monogram,
+        name: name.to_string(),
+        status: status.to_string(),
+        status_name: status_name.to_string(),
+        closed,
+        author_phid: author_phid.to_string(),
+        phid: get_str(value, "phid").to_string(),
+        diff_phid: fields
+            .and_then(|fields| fields.get("diffPHID"))
             .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let closed = status_obj
-            .and_then(|status| status.get("closed"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let name = fields
-            .and_then(|fields| fields.get("title"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let author_phid = fields
-            .and_then(|fields| fields.get("authorPHID"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        Ok(RevisionView {
-            id,
-            monogram,
-            name: name.to_string(),
-            status: status.to_string(),
-            status_name: status_name.to_string(),
-            closed,
-            author_phid: author_phid.to_string(),
-            phid: get_str(value, "phid").to_string(),
-            diff_phid: fields
-                .and_then(|fields| fields.get("diffPHID"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-        })
-    } else {
-        let status = value
-            .get("status")
-            .and_then(json_i64)
-            .and_then(legacy_status_value)
-            .unwrap_or("");
-        let status_name = get_str(value, "statusName");
-        let closed = matches!(status_name, "Abandoned" | "Closed");
-        Ok(RevisionView {
-            id,
-            monogram,
-            name: get_str(value, "title").to_string(),
-            status: status.to_string(),
-            status_name: status_name.to_string(),
-            closed,
-            author_phid: get_str(value, "authorPHID").to_string(),
-            phid: get_str(value, "phid").to_string(),
-            diff_phid: None,
-        })
+            .map(str::to_string),
+    }
+}
+
+/// Parse a legacy `differential.query` row via the `newFromConduitQuery`
+/// mapping (`ArcanistRevisionRef.php:36-92`).
+fn parse_legacy_revision(value: &serde_json::Value, id: i64, monogram: String) -> RevisionView {
+    let status = value
+        .get("status")
+        .and_then(json_i64)
+        .and_then(legacy_status_value)
+        .unwrap_or("");
+    let status_name = get_str(value, "statusName");
+    let closed = matches!(status_name, "Abandoned" | "Closed");
+    RevisionView {
+        id,
+        monogram,
+        name: get_str(value, "title").to_string(),
+        status: status.to_string(),
+        status_name: status_name.to_string(),
+        closed,
+        author_phid: get_str(value, "authorPHID").to_string(),
+        phid: get_str(value, "phid").to_string(),
+        diff_phid: None,
     }
 }
 

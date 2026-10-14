@@ -69,102 +69,192 @@ fn take_value(iter: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<Str
     }
 }
 
-fn parse_args(argv: &[String]) -> ParseOutcome {
-    let mut title: Option<String> = None;
-    let mut lang: Option<String> = None;
-    let mut input: Option<String> = None;
-    let mut browse = false;
-    let mut symbol: Option<String> = None;
-    let mut conduit_uri: Option<String> = None;
-    let mut end_of_flags = false;
+/// One argument's parse step: consumed, or a terminal outcome.
+enum Step {
+    Handled,
+    Done(ParseOutcome),
+}
 
+struct Parser {
+    title: Option<String>,
+    lang: Option<String>,
+    input: Option<String>,
+    browse: bool,
+    symbol: Option<String>,
+    conduit_uri: Option<String>,
+    end_of_flags: bool,
+}
+
+impl Parser {
+    fn new() -> Self {
+        Self {
+            title: None,
+            lang: None,
+            input: None,
+            browse: false,
+            symbol: None,
+            conduit_uri: None,
+            end_of_flags: false,
+        }
+    }
+
+    fn flag_title(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Option<Step> {
+        if arg == "--title" {
+            match take_value(iter, "--title") {
+                Ok(value) => self.title = Some(value),
+                Err(message) => return Some(Step::Done(ParseOutcome::Error(message))),
+            }
+            return Some(Step::Handled);
+        }
+        if let Some(value) = arg.strip_prefix("--title=") {
+            self.title = Some(value.to_string());
+            return Some(Step::Handled);
+        }
+        None
+    }
+
+    fn flag_lang(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Option<Step> {
+        if arg == "--lang" {
+            match take_value(iter, "--lang") {
+                Ok(value) => self.lang = Some(value),
+                Err(message) => return Some(Step::Done(ParseOutcome::Error(message))),
+            }
+            return Some(Step::Handled);
+        }
+        if let Some(value) = arg.strip_prefix("--lang=") {
+            self.lang = Some(value.to_string());
+            return Some(Step::Handled);
+        }
+        None
+    }
+
+    fn flag_input(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Option<Step> {
+        if arg == "--input" {
+            match take_value(iter, "--input") {
+                Ok(value) => self.input = Some(value),
+                Err(message) => return Some(Step::Done(ParseOutcome::Error(message))),
+            }
+            return Some(Step::Handled);
+        }
+        if let Some(value) = arg.strip_prefix("--input=") {
+            self.input = Some(value.to_string());
+            return Some(Step::Handled);
+        }
+        None
+    }
+
+    fn flag_conduit(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Option<Step> {
+        if arg == "--conduit-uri" {
+            match take_value(iter, "--conduit-uri") {
+                Ok(value) => self.conduit_uri = Some(value),
+                Err(message) => return Some(Step::Done(ParseOutcome::Error(message))),
+            }
+            return Some(Step::Handled);
+        }
+        if let Some(value) = arg.strip_prefix("--conduit-uri=") {
+            self.conduit_uri = Some(value.to_string());
+            return Some(Step::Handled);
+        }
+        None
+    }
+
+    fn symbol(&mut self, arg: &str) -> Step {
+        if self.symbol.is_some() {
+            Step::Done(ParseOutcome::Error(
+                "Specify only one paste to retrieve.".to_string(),
+            ))
+        } else {
+            self.symbol = Some(arg.to_string());
+            Step::Handled
+        }
+    }
+
+    fn tail(&mut self, arg: &str) -> Step {
+        if arg == "--" {
+            self.end_of_flags = true;
+            return Step::Handled;
+        }
+        if arg == "--browse" {
+            self.browse = true;
+            return Step::Handled;
+        }
+        if arg == "-h" || arg == "--help" {
+            return Step::Done(ParseOutcome::Help);
+        }
+        if arg.starts_with('-') {
+            return Step::Done(ParseOutcome::Error(format!("unknown flag '{arg}'")));
+        }
+        self.symbol(arg)
+    }
+
+    fn consume(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Step {
+        if self.end_of_flags {
+            return self.symbol(arg);
+        }
+        if let Some(step) = self.flag_title(arg, iter) {
+            return step;
+        }
+        if let Some(step) = self.flag_lang(arg, iter) {
+            return step;
+        }
+        if let Some(step) = self.flag_input(arg, iter) {
+            return step;
+        }
+        if let Some(step) = self.flag_conduit(arg, iter) {
+            return step;
+        }
+        self.tail(arg)
+    }
+
+    fn finish(self) -> ParseOutcome {
+        if self.symbol.is_some() {
+            if self.lang.is_some() {
+                return ParseOutcome::Error(
+                    "Flag \"--lang\" is not supported when reading pastes.".to_string(),
+                );
+            }
+            if self.title.is_some() {
+                return ParseOutcome::Error(
+                    "Flag \"--title\" is not supported when reading pastes.".to_string(),
+                );
+            }
+            if self.browse {
+                return ParseOutcome::Error(
+                    "Flag \"--browse\" is not supported when reading pastes. Use \"arc browse\" to browse known objects."
+                        .to_string(),
+                );
+            }
+            if self.input.is_some() {
+                return ParseOutcome::Error(
+                    "Flag \"--input\" is not supported when reading pastes.".to_string(),
+                );
+            }
+        } else if self.browse {
+            return ParseOutcome::NotYetPorted(format!(
+                "arc-rs {NAME}: --browse is not yet ported (see T1128)"
+            ));
+        }
+        ParseOutcome::Args(Options {
+            title: self.title,
+            lang: self.lang,
+            input: self.input,
+            browse: self.browse,
+            symbol: self.symbol,
+            conduit_uri: self.conduit_uri,
+        })
+    }
+}
+
+fn parse_args(argv: &[String]) -> ParseOutcome {
+    let mut parser = Parser::new();
     let mut iter = argv.iter();
     while let Some(arg) = iter.next() {
-        if end_of_flags {
-            if symbol.is_some() {
-                return ParseOutcome::Error("Specify only one paste to retrieve.".to_string());
-            }
-            symbol = Some(arg.clone());
-        } else if arg == "--" {
-            end_of_flags = true;
-        } else if arg == "--title" {
-            match take_value(&mut iter, "--title") {
-                Ok(value) => title = Some(value),
-                Err(message) => return ParseOutcome::Error(message),
-            }
-        } else if let Some(value) = arg.strip_prefix("--title=") {
-            title = Some(value.to_string());
-        } else if arg == "--lang" {
-            match take_value(&mut iter, "--lang") {
-                Ok(value) => lang = Some(value),
-                Err(message) => return ParseOutcome::Error(message),
-            }
-        } else if let Some(value) = arg.strip_prefix("--lang=") {
-            lang = Some(value.to_string());
-        } else if arg == "--input" {
-            match take_value(&mut iter, "--input") {
-                Ok(value) => input = Some(value),
-                Err(message) => return ParseOutcome::Error(message),
-            }
-        } else if let Some(value) = arg.strip_prefix("--input=") {
-            input = Some(value.to_string());
-        } else if arg == "--browse" {
-            browse = true;
-        } else if arg == "--conduit-uri" {
-            match take_value(&mut iter, "--conduit-uri") {
-                Ok(value) => conduit_uri = Some(value),
-                Err(message) => return ParseOutcome::Error(message),
-            }
-        } else if let Some(value) = arg.strip_prefix("--conduit-uri=") {
-            conduit_uri = Some(value.to_string());
-        } else if arg == "-h" || arg == "--help" {
-            return ParseOutcome::Help;
-        } else if arg.starts_with('-') {
-            return ParseOutcome::Error(format!("unknown flag '{arg}'"));
-        } else {
-            if symbol.is_some() {
-                return ParseOutcome::Error("Specify only one paste to retrieve.".to_string());
-            }
-            symbol = Some(arg.clone());
+        match parser.consume(arg, &mut iter) {
+            Step::Handled => {}
+            Step::Done(outcome) => return outcome,
         }
     }
-
-    if symbol.is_some() {
-        if lang.is_some() {
-            return ParseOutcome::Error(
-                "Flag \"--lang\" is not supported when reading pastes.".to_string(),
-            );
-        }
-        if title.is_some() {
-            return ParseOutcome::Error(
-                "Flag \"--title\" is not supported when reading pastes.".to_string(),
-            );
-        }
-        if browse {
-            return ParseOutcome::Error(
-                "Flag \"--browse\" is not supported when reading pastes. Use \"arc browse\" to browse known objects."
-                    .to_string(),
-            );
-        }
-        if input.is_some() {
-            return ParseOutcome::Error(
-                "Flag \"--input\" is not supported when reading pastes.".to_string(),
-            );
-        }
-    } else if browse {
-        return ParseOutcome::NotYetPorted(format!(
-            "arc-rs {NAME}: --browse is not yet ported (see T1128)"
-        ));
-    }
-
-    ParseOutcome::Args(Options {
-        title,
-        lang,
-        input,
-        browse,
-        symbol,
-        conduit_uri,
-    })
+    parser.finish()
 }
 
 /// `P123`, `123`, or a paste PHID to search constraints.
@@ -322,14 +412,7 @@ fn fetch_paste_uri(
         .unwrap_or(fallback)
 }
 
-/// Create a paste via `paste.create`, falling back to `paste.edit`.
-pub fn create_paste(
-    client: &crate::conduit::Client,
-    title: &str,
-    lang: Option<&str>,
-    content: &str,
-    conduit_uri: Option<&str>,
-) -> Result<CreatedPaste, String> {
+fn create_params(title: &str, lang: Option<&str>, content: &str) -> serde_json::Value {
     let mut params = serde_json::json!({
         "content": content,
         "title": title,
@@ -337,47 +420,80 @@ pub fn create_paste(
     if let Some(lang) = lang {
         params["language"] = serde_json::json!(lang);
     }
-    if let Ok(result) = client.call("paste.create", &params) {
-        if let Some(id) = created_id_of(&result) {
-            let uri = created_uri_of(&result).map_or_else(
-                || fetch_paste_uri(client, &PasteSymbol::Ids(vec![id]), conduit_uri, id),
-                |uri| absolute_uri(conduit_uri, &uri),
-            );
-            return Ok(CreatedPaste { id, uri });
-        }
-        if let Some(phid) = created_phid_of(&result) {
-            let symbol = PasteSymbol::Phids(vec![phid]);
-            let search = client
-                .call(
-                    "paste.search",
-                    &serde_json::json!({"constraints": search_constraints(&symbol)}),
-                )
-                .map_err(|e| e.to_string())?;
-            let hit = search
-                .get("data")
-                .and_then(|v| v.as_array())
-                .and_then(|items| items.first())
-                .ok_or_else(|| {
-                    "paste.create succeeded but the new paste could not be found".to_string()
-                })?;
-            let id = hit
-                .get("id")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            let uri = hit
-                .get("fields")
-                .and_then(|f| f.get("uri"))
-                .and_then(|v| v.as_str())
-                .map_or_else(|| format!("/P{id}"), str::to_string);
-            return Ok(CreatedPaste {
-                id,
-                uri: absolute_uri(conduit_uri, &uri),
-            });
-        }
-        return Err("paste.create returned an unexpected response".to_string());
-    }
+    params
+}
 
-    // Older or newer servers may only offer `paste.edit` transactions.
+fn json_u64(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn created_from_search_hit(hit: &serde_json::Value, conduit_uri: Option<&str>) -> CreatedPaste {
+    let id = hit
+        .get("id")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let uri = hit
+        .get("fields")
+        .and_then(|f| f.get("uri"))
+        .and_then(|v| v.as_str())
+        .map_or_else(|| format!("/P{id}"), str::to_string);
+    CreatedPaste {
+        id,
+        uri: absolute_uri(conduit_uri, &uri),
+    }
+}
+
+/// Resolve a freshly created paste known only by PHID via `paste.search`.
+fn created_from_phid(
+    client: &crate::conduit::Client,
+    phid: &str,
+    conduit_uri: Option<&str>,
+    verb: &str,
+) -> Result<CreatedPaste, String> {
+    let symbol = PasteSymbol::Phids(vec![phid.to_string()]);
+    let search = client
+        .call(
+            "paste.search",
+            &serde_json::json!({"constraints": search_constraints(&symbol)}),
+        )
+        .map_err(|e| e.to_string())?;
+    let hit = search
+        .get("data")
+        .and_then(|v| v.as_array())
+        .and_then(|items| items.first())
+        .ok_or_else(|| format!("{verb} succeeded but the new paste could not be found"))?;
+    Ok(created_from_search_hit(hit, conduit_uri))
+}
+
+fn created_from_create_result(
+    client: &crate::conduit::Client,
+    result: &serde_json::Value,
+    conduit_uri: Option<&str>,
+) -> Result<CreatedPaste, String> {
+    if let Some(id) = created_id_of(result) {
+        let uri = created_uri_of(result).map_or_else(
+            || fetch_paste_uri(client, &PasteSymbol::Ids(vec![id]), conduit_uri, id),
+            |uri| absolute_uri(conduit_uri, &uri),
+        );
+        return Ok(CreatedPaste { id, uri });
+    }
+    if let Some(phid) = created_phid_of(result) {
+        return created_from_phid(client, &phid, conduit_uri, "paste.create");
+    }
+    Err("paste.create returned an unexpected response".to_string())
+}
+
+fn create_via_edit(
+    client: &crate::conduit::Client,
+    title: &str,
+    lang: Option<&str>,
+    content: &str,
+    conduit_uri: Option<&str>,
+) -> Result<CreatedPaste, String> {
     let mut transactions = vec![serde_json::json!({"type": "title", "value": title})];
     if let Some(lang) = lang {
         transactions.push(serde_json::json!({"type": "language", "value": lang}));
@@ -392,11 +508,7 @@ pub fn create_paste(
     let object = result
         .get("object")
         .ok_or_else(|| "paste.edit returned an unexpected response".to_string())?;
-    let id = object.get("id").and_then(|v| match v {
-        serde_json::Value::Number(n) => n.as_u64(),
-        serde_json::Value::String(s) => s.parse::<u64>().ok(),
-        _ => None,
-    });
+    let id = object.get("id").and_then(json_u64);
     let phid = object
         .get("phid")
         .and_then(|v| v.as_str())
@@ -406,37 +518,25 @@ pub fn create_paste(
             uri: fetch_paste_uri(client, &PasteSymbol::Ids(vec![id]), conduit_uri, id),
             id,
         }),
-        (None, Some(phid)) => {
-            let symbol = PasteSymbol::Phids(vec![phid]);
-            let search = client
-                .call(
-                    "paste.search",
-                    &serde_json::json!({"constraints": search_constraints(&symbol)}),
-                )
-                .map_err(|e| e.to_string())?;
-            let hit = search
-                .get("data")
-                .and_then(|v| v.as_array())
-                .and_then(|items| items.first())
-                .ok_or_else(|| {
-                    "paste.edit succeeded but the new paste could not be found".to_string()
-                })?;
-            let id = hit
-                .get("id")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            let uri = hit
-                .get("fields")
-                .and_then(|f| f.get("uri"))
-                .and_then(|v| v.as_str())
-                .map_or_else(|| format!("/P{id}"), str::to_string);
-            Ok(CreatedPaste {
-                id,
-                uri: absolute_uri(conduit_uri, &uri),
-            })
-        }
+        (None, Some(phid)) => created_from_phid(client, &phid, conduit_uri, "paste.edit"),
         (None, None) => Err("paste.edit returned an unexpected response".to_string()),
     }
+}
+
+/// Create a paste via `paste.create`, falling back to `paste.edit`.
+pub fn create_paste(
+    client: &crate::conduit::Client,
+    title: &str,
+    lang: Option<&str>,
+    content: &str,
+    conduit_uri: Option<&str>,
+) -> Result<CreatedPaste, String> {
+    let params = create_params(title, lang, content);
+    if let Ok(result) = client.call("paste.create", &params) {
+        return created_from_create_result(client, &result, conduit_uri);
+    }
+    // Older or newer servers may only offer `paste.edit` transactions.
+    create_via_edit(client, title, lang, content, conduit_uri)
 }
 
 fn read_stdin_text() -> Result<String, String> {
@@ -446,6 +546,43 @@ fn read_stdin_text() -> Result<String, String> {
         .read_to_string(&mut text)
         .map_err(|e| format!("failed to read stdin: {e}"))?;
     Ok(text)
+}
+
+fn read_paste_output(client: &crate::conduit::Client, symbol: &str) -> Result<String, String> {
+    let content = read_paste(client, symbol)?;
+    if content.ends_with('\n') || content.is_empty() {
+        return Ok(content);
+    }
+    Ok(format!("{content}\n"))
+}
+
+fn create_paste_output(
+    dir: &Path,
+    client: &crate::conduit::Client,
+    opts: &Options,
+    stdin_text: Option<&str>,
+) -> Result<String, String> {
+    let content = match opts.input.as_deref() {
+        None | Some("-") => match stdin_text {
+            Some(text) => text.to_string(),
+            None => read_stdin_text()?,
+        },
+        Some(path) => std::fs::read_to_string(dir.join(path))
+            .map_err(|e| format!("cannot read \"{path}\": {e}"))?,
+    };
+    if content.is_empty() {
+        return Err("no paste content provided (stdin was empty)".to_string());
+    }
+    let title = opts.title.as_deref().unwrap_or(DEFAULT_TITLE);
+    let base = resolve_conduit_uri(opts.conduit_uri.as_deref());
+    let created = create_paste(
+        client,
+        title,
+        opts.lang.as_deref(),
+        &content,
+        base.as_deref(),
+    )?;
+    Ok(format_created(&created))
 }
 
 /// Run the workflow; `stdin_text` overrides stdin when creating from stdin
@@ -464,34 +601,9 @@ pub fn execute_with_stdin(
     let client = crate::config::client_for(opts.conduit_uri.as_deref())?;
 
     if let Some(symbol) = opts.symbol {
-        let content = read_paste(&client, &symbol)?;
-        if content.ends_with('\n') || content.is_empty() {
-            return Ok(content);
-        }
-        return Ok(format!("{content}\n"));
+        return read_paste_output(&client, &symbol);
     }
-
-    let content = match opts.input.as_deref() {
-        None | Some("-") => match stdin_text {
-            Some(text) => text.to_string(),
-            None => read_stdin_text()?,
-        },
-        Some(path) => std::fs::read_to_string(dir.join(path))
-            .map_err(|e| format!("cannot read \"{path}\": {e}"))?,
-    };
-    if content.is_empty() {
-        return Err("no paste content provided (stdin was empty)".to_string());
-    }
-    let title = opts.title.as_deref().unwrap_or(DEFAULT_TITLE);
-    let base = resolve_conduit_uri(opts.conduit_uri.as_deref());
-    let created = create_paste(
-        &client,
-        title,
-        opts.lang.as_deref(),
-        &content,
-        base.as_deref(),
-    )?;
-    Ok(format_created(&created))
+    create_paste_output(dir, &client, &opts, stdin_text)
 }
 
 /// One-line summary of a created paste.

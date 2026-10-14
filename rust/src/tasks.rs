@@ -53,64 +53,175 @@ fn flag_value(
     Ok(value.clone())
 }
 
+/// One argument's parse step: consumed, `--help`, or a fatal error.
+enum Step {
+    Handled,
+    Help,
+    Error(String),
+}
+
+struct Parser {
+    status: Option<String>,
+    owner: Option<String>,
+    order: Option<String>,
+    limit: Option<u32>,
+    unassigned: bool,
+    json: bool,
+    conduit_uri: Option<String>,
+    end_of_flags: bool,
+}
+
+impl Parser {
+    fn new() -> Self {
+        Self {
+            status: None,
+            owner: None,
+            order: None,
+            limit: None,
+            unassigned: false,
+            json: false,
+            conduit_uri: None,
+            end_of_flags: false,
+        }
+    }
+
+    fn flag_status(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Option<Step> {
+        if arg == "--status" || arg.starts_with("--status=") {
+            match flag_value(iter, arg, "--status") {
+                Ok(value) => self.status = Some(value),
+                Err(message) => return Some(Step::Error(message)),
+            }
+            return Some(Step::Handled);
+        }
+        None
+    }
+
+    fn flag_owner(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Option<Step> {
+        if arg == "--owner" || arg.starts_with("--owner=") {
+            match flag_value(iter, arg, "--owner") {
+                Ok(value) => self.owner = Some(value),
+                Err(message) => return Some(Step::Error(message)),
+            }
+            return Some(Step::Handled);
+        }
+        None
+    }
+
+    fn flag_order(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Option<Step> {
+        if arg == "--order" || arg.starts_with("--order=") {
+            match flag_value(iter, arg, "--order") {
+                Ok(value) => self.order = Some(value),
+                Err(message) => return Some(Step::Error(message)),
+            }
+            return Some(Step::Handled);
+        }
+        None
+    }
+
+    fn flag_limit(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Option<Step> {
+        if arg == "--limit" || arg.starts_with("--limit=") {
+            let raw = match flag_value(iter, arg, "--limit") {
+                Ok(raw) => raw,
+                Err(message) => return Some(Step::Error(message)),
+            };
+            match raw.parse::<u32>() {
+                Ok(n) => self.limit = Some(n),
+                Err(_) => {
+                    return Some(Step::Error("--limit requires an integer value".to_string()));
+                }
+            }
+            return Some(Step::Handled);
+        }
+        None
+    }
+
+    fn flag_conduit(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Option<Step> {
+        if arg == "--conduit-uri" || arg.starts_with("--conduit-uri=") {
+            match flag_value(iter, arg, "--conduit-uri") {
+                Ok(value) => self.conduit_uri = Some(value),
+                Err(message) => return Some(Step::Error(message)),
+            }
+            return Some(Step::Handled);
+        }
+        None
+    }
+
+    fn tail(&mut self, arg: &str) -> Step {
+        if arg == "--" {
+            self.end_of_flags = true;
+            return Step::Handled;
+        }
+        if arg == "--unassigned" {
+            self.unassigned = true;
+            return Step::Handled;
+        }
+        if arg == "--json" {
+            self.json = true;
+            return Step::Handled;
+        }
+        if arg == "--help" || arg == "-h" {
+            return Step::Help;
+        }
+        if arg.starts_with('-') {
+            return Step::Error(format!("unknown flag '{arg}'"));
+        }
+        Step::Error(format!("unexpected argument '{arg}'"))
+    }
+
+    fn consume(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Step {
+        if self.end_of_flags {
+            return Step::Error(format!("unexpected argument '{arg}'"));
+        }
+        if let Some(step) = self.flag_status(arg, iter) {
+            return step;
+        }
+        if let Some(step) = self.flag_owner(arg, iter) {
+            return step;
+        }
+        if let Some(step) = self.flag_order(arg, iter) {
+            return step;
+        }
+        if let Some(step) = self.flag_limit(arg, iter) {
+            return step;
+        }
+        if let Some(step) = self.flag_conduit(arg, iter) {
+            return step;
+        }
+        self.tail(arg)
+    }
+
+    fn finish(self) -> Result<Option<Options>, String> {
+        if self.owner.is_some() && self.unassigned {
+            return Err(
+                "--owner and --unassigned conflict (--owner suppresses unassigned)".to_string(),
+            );
+        }
+        Ok(Some(Options {
+            status: self.status,
+            owner: self.owner,
+            order: self.order,
+            limit: self.limit,
+            unassigned: self.unassigned,
+            json: self.json,
+            conduit_uri: self.conduit_uri,
+        }))
+    }
+}
+
 /// Parse `argv` (excluding the subcommand name).
 ///
 /// Returns `Ok(None)` when `--help` was requested.
 pub fn parse_args(argv: &[String]) -> Result<Option<Options>, String> {
-    let mut status = None;
-    let mut owner = None;
-    let mut order = None;
-    let mut limit = None;
-    let mut unassigned = false;
-    let mut json = false;
-    let mut conduit_uri = None;
-    let mut end_of_flags = false;
+    let mut parser = Parser::new();
     let mut iter = argv.iter();
     while let Some(arg) = iter.next() {
-        if end_of_flags {
-            return Err(format!("unexpected argument '{arg}'"));
-        } else if arg == "--" {
-            end_of_flags = true;
-        } else if arg == "--status" || arg.starts_with("--status=") {
-            status = Some(flag_value(&mut iter, arg, "--status")?);
-        } else if arg == "--owner" || arg.starts_with("--owner=") {
-            owner = Some(flag_value(&mut iter, arg, "--owner")?);
-        } else if arg == "--order" || arg.starts_with("--order=") {
-            order = Some(flag_value(&mut iter, arg, "--order")?);
-        } else if arg == "--limit" || arg.starts_with("--limit=") {
-            let raw = flag_value(&mut iter, arg, "--limit")?;
-            match raw.parse::<u32>() {
-                Ok(n) => limit = Some(n),
-                Err(_) => return Err("--limit requires an integer value".to_string()),
-            }
-        } else if arg == "--unassigned" {
-            unassigned = true;
-        } else if arg == "--json" {
-            json = true;
-        } else if arg == "--conduit-uri" || arg.starts_with("--conduit-uri=") {
-            conduit_uri = Some(flag_value(&mut iter, arg, "--conduit-uri")?);
-        } else if arg == "--help" || arg == "-h" {
-            return Ok(None);
-        } else if arg.starts_with('-') {
-            return Err(format!("unknown flag '{arg}'"));
-        } else {
-            return Err(format!("unexpected argument '{arg}'"));
+        match parser.consume(arg, &mut iter) {
+            Step::Handled => {}
+            Step::Help => return Ok(None),
+            Step::Error(message) => return Err(message),
         }
     }
-    if owner.is_some() && unassigned {
-        return Err(
-            "--owner and --unassigned conflict (--owner suppresses unassigned)".to_string(),
-        );
-    }
-    Ok(Some(Options {
-        status,
-        owner,
-        order,
-        limit,
-        unassigned,
-        json,
-        conduit_uri,
-    }))
+    parser.finish()
 }
 
 /// One task row from `maniphest.query`.
