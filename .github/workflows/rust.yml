@@ -104,6 +104,16 @@ jobs:
           fi
       - name: run quality gates
         run: docker run --rm -v "${{ github.workspace }}:/work" -w /work "$GATE_IMAGE:$GATE_KEY" python3 scripts/ci/lib/rust-quality-gates.py rust rust/target/llvm-cov nextest --run-ignored all --no-fail-fast
+      - name: publish coverage summary
+        if: always()
+        run: python3 scripts/ci/lib/coverage-summary.py rust/target/llvm-cov/lcov.info >> "$GITHUB_STEP_SUMMARY"
+      - name: upload coverage report
+        if: always() && hashFiles('rust/target/llvm-cov/lcov.info') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: rust/target/llvm-cov/
+          retention-days: 30
 
   build-release:
     name: release (${{ matrix.os }})
