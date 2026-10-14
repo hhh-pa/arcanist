@@ -634,17 +634,24 @@ fn tar_list(bundle: &str) -> Result<Vec<String>, String> {
 }
 
 /// Extract one `tar` member of `bundle` to bytes (`tar xfO`).
+///
+/// Tries `member` then `./{member}`: GNU tar stores `./`-prefixed names
+/// (from `tar -cf ... .`) and requires an exact match, while bsdtar
+/// matches either spelling.
 fn tar_extract(bundle: &str, member: &str) -> Result<Vec<u8>, String> {
-    let output = std::process::Command::new("tar")
-        .args(["-xOf", bundle, member])
-        .output()
-        .map_err(|e| format!("failed to read arcbundle '{bundle}': {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "failed to read arcbundle '{bundle}': member '{member}' is missing"
-        ));
+    for candidate in [member.to_string(), format!("./{member}")] {
+        let output = std::process::Command::new("tar")
+            .args(["-xOf", bundle])
+            .arg(&candidate)
+            .output()
+            .map_err(|e| format!("failed to read arcbundle '{bundle}': {e}"))?;
+        if output.status.success() {
+            return Ok(output.stdout);
+        }
     }
-    Ok(output.stdout)
+    Err(format!(
+        "failed to read arcbundle '{bundle}': member '{member}' is missing"
+    ))
 }
 
 /// Bundle metadata from `meta.json`
@@ -2920,9 +2927,19 @@ pub fn svn_prop_mapping(prop: &str, value: Option<String>) -> (String, Option<St
 /// Streams `patch` output to stdout (like `passthru`) and returns
 /// whether it applied.
 pub fn run_patch_file(dir: &Path, patch_text: &str) -> Result<(bool, String), String> {
+    run_patch_file_with(dir, patch_text, "patch")
+}
+
+/// [`run_patch_file`] with an explicit `patch` binary (test seam: whether
+/// the system binary exists varies by machine).
+pub fn run_patch_file_with(
+    dir: &Path,
+    patch_text: &str,
+    patch_bin: &str,
+) -> Result<(bool, String), String> {
     let patchfile = TempPatchFile::write(patch_text)?;
     let file = patchfile.path.to_string_lossy().to_string();
-    let output = std::process::Command::new("patch")
+    let output = std::process::Command::new(patch_bin)
         .current_dir(dir)
         .args(["-p0", "-i", &file])
         .output()

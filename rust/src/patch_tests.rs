@@ -2063,7 +2063,7 @@ fn run_touch_and_symlink() {
 #[test]
 fn run_patch_file_fails_without_binary() {
     let dir = temp_dir("no_patch_bin");
-    let error = run_patch_file(&dir, "text\n").unwrap_err();
+    let error = run_patch_file_with(&dir, "text\n", "arc-rs-no-such-patch-binary").unwrap_err();
     assert!(error.starts_with("failed to run patch"), "{error}");
 }
 

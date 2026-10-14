@@ -14,13 +14,6 @@ fn classifies_help_and_version() {
 }
 
 #[test]
-fn classifies_planned_commands() {
-    for c in PLANNED {
-        assert_eq!(classify(&args(&[*c])), Action::Planned((*c).to_string()));
-    }
-}
-
-#[test]
 fn classifies_call_conduit() {
     assert_eq!(
         classify(&args(&["call-conduit", "user.whoami"])),
@@ -136,10 +129,8 @@ fn classifies_missing_and_unknown() {
 }
 
 #[test]
-fn usage_lists_all_planned_commands() {
+fn usage_lists_commands() {
     let u = usage();
-    for c in PLANNED {
-        assert!(u.contains(c), "usage missing {c}");
-    }
     assert!(u.contains("call-conduit"));
+    assert!(u.contains("diff"));
 }

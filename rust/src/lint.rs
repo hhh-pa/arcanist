@@ -2991,9 +2991,14 @@ fn prompt_for_patch(result: &LintResult, patched: &[u8], sink: &mut Sink) {
 
 /// Write `data` to a unique temp file, returning its path.
 fn write_temp_bytes(tag: &str, data: &[u8]) -> Option<PathBuf> {
+    write_temp_bytes_in(&std::env::temp_dir(), tag, data)
+}
+
+/// Write `data` to a unique temp file inside `dir`, returning its path.
+fn write_temp_bytes_in(dir: &Path, tag: &str, data: &[u8]) -> Option<PathBuf> {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let path = std::env::temp_dir().join(format!("{tag}-{}-{n}", std::process::id()));
+    let path = dir.join(format!("{tag}-{}-{n}", std::process::id()));
     std::fs::write(&path, data).ok()?;
     Some(path)
 }
@@ -3244,7 +3249,14 @@ fn run_workflow(cwd: &Path, options: &Options, input: &mut dyn BufRead) -> Resul
 
 /// Write renderer output to `--outfile` via temp file plus rename.
 fn flush_outfile(out_path: &str, buffer: &str) -> Result<(), String> {
-    let temp = write_temp_bytes("arc-rs-lint-out", buffer.as_bytes())
+    // Stage next to the destination (same filesystem): system-temp plus
+    // rename fails with EXDEV when the workspace lives on another mount
+    // (the gates container mounts /work apart from /tmp).
+    let staging: PathBuf = match Path::new(out_path).parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+        _ => std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()),
+    };
+    let temp = write_temp_bytes_in(&staging, "arc-rs-lint-out", buffer.as_bytes())
         .ok_or_else(|| "cannot write output file".to_string())?;
     rename_over(&temp, Path::new(out_path)).map_err(|e| format!("cannot write '{out_path}': {e}"))
 }

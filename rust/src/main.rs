@@ -14,22 +14,9 @@ use arc_rs::{
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const PLANNED: &[&str] = &[];
-
 fn usage() -> String {
-    let mut text = "usage: arc-rs [--version] [--help] <command>\n\ncommands (see <command> --help):\n  amend\n  anoid\n  bookmarks\n  branches\n  call-conduit\n  close-revision\n  commit\n  cover\n  diff\n  download\n  export\n  get-config\n  inspect\n  install-certificate\n  land\n  liberate\n  lint\n  linters\n  list\n  look\n  markers\n  paste\n  patch\n  set-config\n  tasks\n  todo\n  unit\n  upgrade\n  upload\n  weld\n  which\n  work\n"
-        .to_string();
-    if !PLANNED.is_empty() {
-        let planned = PLANNED
-            .iter()
-            .map(|c| format!("  {c}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        text.push_str(&format!(
-            "\nplanned commands (not yet ported):\n{planned}\n"
-        ));
-    }
-    text
+    "usage: arc-rs [--version] [--help] <command>\n\ncommands (see <command> --help):\n  amend\n  anoid\n  bookmarks\n  branches\n  call-conduit\n  close-revision\n  commit\n  cover\n  diff\n  download\n  export\n  get-config\n  inspect\n  install-certificate\n  land\n  liberate\n  lint\n  linters\n  list\n  look\n  markers\n  paste\n  patch\n  set-config\n  tasks\n  todo\n  unit\n  upgrade\n  upload\n  weld\n  which\n  work\n"
+        .to_string()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -43,7 +30,6 @@ enum Action {
     Help,
     Version,
     CallConduit(CallArgs),
-    Planned(String),
     Unknown(String),
     Missing,
     Error(String),
@@ -91,7 +77,6 @@ fn classify(argv: &[String]) -> Action {
             Ok(args) => Action::CallConduit(args),
             Err(msg) => Action::Error(msg),
         },
-        c if PLANNED.contains(&c) => Action::Planned(c.to_string()),
         c => Action::Unknown(c.to_string()),
     }
 }
@@ -221,10 +206,6 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Action::CallConduit(args) => run_call_conduit(&args),
-        Action::Planned(c) => {
-            eprintln!("arc-rs {c}: not yet ported (see T1128)");
-            ExitCode::FAILURE
-        }
         Action::Missing => {
             eprintln!("{}", usage());
             ExitCode::FAILURE
