@@ -118,6 +118,18 @@ fn git_working_copy_reports_no_bookmark_support() {
 }
 
 #[test]
+fn list_under_git_reports_no_bookmark_support() {
+    // Direct `list` coverage on the git path (no `hg` spawned): deterministic
+    // on every platform, with or without Mercurial installed.
+    let repo = Fixture::init_repo("git-list");
+    let err = bookmarks::list(repo.path()).unwrap_err();
+    assert!(
+        err.contains("does not support bookmarks"),
+        "unexpected: {err}"
+    );
+}
+
+#[test]
 fn outside_any_working_copy_fails() {
     let empty = Fixture::named("notrepo");
     assert_eq!(bookmarks::find_hg_root(empty.path()), None);
@@ -133,21 +145,22 @@ fn outside_any_working_copy_fails() {
 }
 
 #[test]
-fn broken_hg_checkout_fails() {
-    // A bare `.hg` directory is detected as Mercurial, but `hg bookmarks`
-    // cannot succeed there (whether `hg` is missing or the checkout is
-    // not a real repository); either way this must fail, never lie.
+fn missing_hg_binary_fails() {
+    // `.hg` detection works everywhere, but whether plain `hg bookmarks`
+    // fails in a bare `.hg` dir depends on the installed Mercurial: some
+    // versions exit 0 with an empty list (which is also what `arc` would
+    // report). The deterministic contract, forced through the binary seam:
+    // when `hg` cannot run, this must fail, never lie.
     let broken = Fixture::named("broken-hg");
     std::fs::create_dir_all(broken.path().join(".hg")).unwrap();
     assert_eq!(
         bookmarks::find_hg_root(broken.path()),
         Some(broken.path().to_path_buf())
     );
-    assert!(bookmarks::execute(broken.path(), &args(&[])).is_err());
-    assert_eq!(
-        bookmarks::run_in(broken.path(), &args(&[])),
-        ExitCode::FAILURE
-    );
+    let err =
+        bookmarks::execute_with_binary(broken.path(), &args(&[]), "arc-rs-definitely-missing-hg")
+            .unwrap_err();
+    assert!(err.contains("failed to run"), "unexpected: {err}");
 }
 
 #[test]

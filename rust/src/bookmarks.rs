@@ -107,6 +107,14 @@ pub fn parse_bookmarks(text: &str) -> Result<Vec<Bookmark>, String> {
 
 /// List bookmarks under `dir`, which must be a Mercurial working copy.
 pub fn list(dir: &Path) -> Result<Vec<Bookmark>, String> {
+    list_with_binary(dir, "hg")
+}
+
+/// List bookmarks under `dir` invoking `hg_binary`.
+///
+/// The binary seam lets tests force the Mercurial-missing path without
+/// depending on what is installed on PATH.
+pub fn list_with_binary(dir: &Path, hg_binary: &str) -> Result<Vec<Bookmark>, String> {
     if find_hg_root(dir).is_none() {
         if git::is_inside_work_tree(dir) {
             return Err(
@@ -119,11 +127,11 @@ pub fn list(dir: &Path) -> Result<Vec<Bookmark>, String> {
                 .to_string(),
         );
     }
-    let output = std::process::Command::new("hg")
+    let output = std::process::Command::new(hg_binary)
         .current_dir(dir)
         .args(["bookmarks"])
         .output()
-        .map_err(|e| format!("bookmarks require Mercurial ('hg' failed to run: {e})"))?;
+        .map_err(|e| format!("bookmarks require Mercurial ('{hg_binary}' failed to run: {e})"))?;
     if !output.status.success() {
         let detail = format!(
             "{}{}",
@@ -177,12 +185,17 @@ pub fn format_json(marks: &[Bookmark]) -> serde_json::Value {
 
 /// Run the workflow rooted at `dir`, returning stdout text or an error message.
 pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
+    execute_with_binary(dir, argv, "hg")
+}
+
+/// Run the workflow rooted at `dir` invoking `hg_binary` (test seam).
+pub fn execute_with_binary(dir: &Path, argv: &[String], hg_binary: &str) -> Result<String, String> {
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => return Ok(usage()),
         Err(message) => return Err(format!("{message}\n\n{}", usage())),
     };
-    let marks = list(dir)?;
+    let marks = list_with_binary(dir, hg_binary)?;
     if options.json {
         let mut text = serde_json::to_string_pretty(&format_json(&marks))
             .map_err(|e| format!("failed to encode JSON: {e}"))?;
