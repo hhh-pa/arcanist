@@ -1,0 +1,6 @@
+{
+  "name": "example/nolock",
+  "require": {
+    "php": ">=8.0"
+  }
+}

@@ -1,0 +1,1 @@
+{"sample.coffee": [{"lineNumber": 2, "name": "no_trailing_semicolons", "message": "Line contains a trailing semicolon", "level": "error", "line": "x = 1;"}, {"lineNumber": 5, "name": "max_line_length", "message": "Line exceeds maximum allowed length", "level": "warn", "line": "y = 2;"}]}

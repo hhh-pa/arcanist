@@ -1,9 +1,8 @@
-#[path = "../src/lint.rs"]
-mod lint;
+//! `arc-rs lint` behavior through the wired library.
 
 use std::path::{Path, PathBuf};
 
-use lint::Linter;
+use arc_rs::lint::{self, Linter};
 
 struct TempDir {
     path: PathBuf,
@@ -13,8 +12,12 @@ impl TempDir {
     fn new(tag: &str) -> Self {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let path =
-            std::env::temp_dir().join(format!("arc-rs-lint-{tag}-{}-{n}", std::process::id()));
+        // Inside the crate dir so display paths stay relative and boring
+        // for the NAME linter on every platform (absolute Windows paths
+        // carry a drive prefix no filename rule accepts).
+        let root = Path::new("target/lint-test-tmp");
+        std::fs::create_dir_all(root).unwrap();
+        let path = root.join(format!("arc-rs-lint-{tag}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&path).unwrap();
         Self { path }
     }
@@ -57,7 +60,7 @@ fn git(dir: &Path, args: &[&str]) {
 #[test]
 fn module_name_is_lint() {
     assert_eq!(lint::NAME, "lint");
-    assert_eq!(lint::TextLinter::new().name(), "text");
+    assert_eq!(lint::TextLinter::new().name(), "TXT");
 }
 
 #[test]

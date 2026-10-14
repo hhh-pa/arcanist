@@ -70,10 +70,10 @@ fn rejects_missing_search_value_and_unknown_flags() {
 }
 
 #[test]
-fn registry_lists_text_linter_with_one_line() {
+fn registry_lists_txt_linter_with_one_line() {
     let all = available_linters();
     assert!(!all.is_empty());
-    let text = all.iter().find(|info| info.name == "text").unwrap();
+    let text = all.iter().find(|info| info.name == "TXT").unwrap();
     assert!(!text.description.is_empty());
     assert!(!text.description.contains('\n'));
     let mut names: Vec<&str> = all.iter().map(|info| info.name.as_str()).collect();

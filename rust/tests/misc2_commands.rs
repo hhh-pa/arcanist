@@ -1,34 +1,9 @@
 //! Public-behavior tests for the misc bundle: `linters`, `anoid`, `work`,
-//! `inspect`, and `cover`.
-//!
-//! Each command module is included directly (sibling `*_tests.rs` unit tests
-//! ride along until the parent wires `lib.rs`).
-
-// Shared-helper shims (see cfgsys tests): `arc_rs::...` paths in the
-// included modules resolve to these in test builds.
-#[allow(dead_code)]
-#[path = "../src/git.rs"]
-mod git;
-#[allow(dead_code)]
-#[path = "../src/lint.rs"]
-mod lint;
-
-#[path = "../src/linters.rs"]
-mod linters;
-
-#[path = "../src/anoid.rs"]
-mod anoid;
-
-#[path = "../src/work.rs"]
-mod work;
-
-#[path = "../src/inspect.rs"]
-mod inspect;
-
-#[path = "../src/cover.rs"]
-mod cover;
+//! `inspect`, and `cover` through the wired library.
 
 use std::path::{Path, PathBuf};
+
+use arc_rs::{anoid, cover, inspect, linters, work};
 
 fn args(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
@@ -148,16 +123,20 @@ fn every_command_rejects_unknown_flags() {
 }
 
 #[test]
-fn linters_lists_the_text_linter() {
+fn linters_lists_the_full_registry() {
     let all = linters::available_linters();
-    assert!(all.iter().any(|info| info.name == "text"));
+    // TXT plus all 33 round-3 linters (JSON is listed twice: the native
+    // linter and the jsonlint wrapper share the PHP name, as in `arc`).
+    assert_eq!(all.len(), 34);
+    assert!(all.iter().any(|info| info.name == "TXT"));
+    assert!(all.iter().all(|info| !info.description.is_empty()));
     assert_eq!(linters::run(&args(&[])), std::process::ExitCode::SUCCESS);
     assert_eq!(
         linters::run(&args(&["--search", "zzz-no-such-linter"])),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(
-        linters::run(&args(&["--verbose", "text"])),
+        linters::run(&args(&["--verbose", "TXT"])),
         std::process::ExitCode::SUCCESS
     );
 }

@@ -23,8 +23,8 @@ CLI behavior, ported workflow by workflow with `arc` as the reference.
 | `install-certificate` | basic (token install; --token/--force; no legacy exchange) |
 | `land` | basic (squash onto local branch; `--preview`/`--push`; no Differential checks) |
 | `liberate` | basic (create/rebuild libphutil libs; needs php) |
-| `lint` | basic (TextLinter TXT2/TXT4/TXT6; changed-files or PATHS; `--json`) |
-| `linters` | basic (registry names + one line; --verbose/--search/exact; no engine config) |
+| `lint` | full registry (34 linters; GEN/NOLINT stop-all; changed-files or PATHS; `--json`) |
+| `linters` | full registry (34 names + one line; --verbose/--search/exact; no engine config) |
 | `list` | basic (open revs, \* = current WC; --json) |
 | `look` | basic (Arcventure clearing/remotes/published; UTC flavor) |
 | `paste` | basic (read/create pastes; --title/--lang/--input) |
@@ -38,6 +38,30 @@ CLI behavior, ported workflow by workflow with `arc` as the reference.
 | `weld` | full (fuse files; +--seed deterministic mode) |
 | `which` | basic (context report; --head/--show-base/--json) |
 | `work` | basic (checkout/create local branch; --start) |
+
+### Linters (all 34 PHP lint names ported)
+
+| Name | Behavior |
+|---|---|
+| `TXT` | native (TXT2/TXT4/TXT6) |
+| `NAME` | native (NAME1 boring file names) |
+| `JSON` (native) | native serde_json parse check |
+| `JSON` (jsonlint) | external jsonlint, falls back to native when uninstalled |
+| `XML` | native well-formedness (no DTD/namespaces) |
+| `MERGECONFLICT` | native conflict-marker scan |
+| `GEN` / `NOLINT` | markers (stop all linters for the file) |
+| `CHMOD` | exec-bit + shebang check |
+| `SPELL` | native dictionary (curated subset default; custom dict supported) |
+| `S&RX` | script-and-regex runner (caller-supplied matcher) |
+| `COMPOSER` | stale composer.lock MD5 check |
+| `PHL` | phutil PHL3 per-file + PHL1/2/4 map helpers |
+| `JSHint` `JSCS` `CSSLint` `LESSC` `GJSLINT` `COFFEE` | external JS/CSS tools (silent if uninstalled; no rc/flags config) |
+| `flake8` `PYFLAKES` `PyLint` `PEP8` `RuboCop` `RUBY` | external Python/Ruby tools (silent if uninstalled) |
+| `cppcheck` `C++ Google's Styleguide` `GOLINT` `HLINT` `C#` `PHPCS` `PHP` `PUPPETLINT` | external compiled-language tools (silent if uninstalled) |
+| `XHP` | parse wrapper only (XHPAST rule tree not ported) |
+
+External linters skip silently when their binary is missing, and none take
+per-linter configuration yet (binary path, flags, standards, rcfiles).
 
 ### Known divergences from PHP `arc`
 

@@ -44,7 +44,39 @@ pub struct LinterInfo {
 /// One-line description for a registry linter name.
 fn describe(name: &str) -> &'static str {
     match name {
-        "text" => "Trailing whitespace, tab literals, and missing EOF newlines (TXT2/TXT4/TXT6).",
+        "TXT" => "Trailing whitespace, tab literals, and missing EOF newlines (TXT2/TXT4/TXT6).",
+        "NAME" => "File names must be boring (NAME1).",
+        "JSON" => "JSON syntax errors, native or via jsonlint.",
+        "XML" => "XML well-formedness errors.",
+        "MERGECONFLICT" => "Unresolved merge-conflict markers.",
+        "GEN" => "Generated-file marker (stops all linters).",
+        "NOLINT" => "Nolint marker (stops all linters).",
+        "CHMOD" => "Executable bit and script permissions.",
+        "SPELL" => "Common spelling mistakes.",
+        "S&RX" => "Custom script-and-regex rules.",
+        "COMPOSER" => "Stale composer.lock (COMPOSER1).",
+        "PHL" => "Phutil library symbol map consistency.",
+        "JSHint" => "JavaScript errors via jshint.",
+        "JSCS" => "JavaScript code style via jscs.",
+        "CSSLint" => "CSS errors via csslint.",
+        "LESSC" => "LESS compile errors via lessc.",
+        "GJSLINT" => "JavaScript style via gjslint.",
+        "COFFEE" => "CoffeeScript errors via coffeelint.",
+        "flake8" => "Python errors via flake8.",
+        "PYFLAKES" => "Python errors via pyflakes.",
+        "PyLint" => "Python errors via pylint.",
+        "PEP8" => "Python style via pep8.",
+        "RuboCop" => "Ruby style via rubocop.",
+        "RUBY" => "Ruby syntax via ruby -c.",
+        "cppcheck" => "C/C++ errors via cppcheck.",
+        "C++ Google's Styleguide" => "C++ style via cpplint.",
+        "GOLINT" => "Go style via golint.",
+        "HLINT" => "Haskell suggestions via hlint.",
+        "C#" => "C# style via cslint.",
+        "PHPCS" => "PHP style via phpcs.",
+        "PHP" => "PHP syntax via php -l.",
+        "PUPPETLINT" => "Puppet style via puppet-lint.",
+        "XHP" => "XHP AST lint (parse wrapper).",
         _ => "No description available.",
     }
 }
@@ -52,7 +84,7 @@ fn describe(name: &str) -> &'static str {
 /// Extra detail shown for `--verbose`, when the linter is known.
 fn details(name: &str) -> Option<&'static str> {
     match name {
-        "text" => Some(
+        "TXT" => Some(
             "Rules: TXT2 Tab Literal (error), TXT4 File Does Not End in Newline (error), \
              TXT6 Trailing Whitespace (autofix).",
         ),

@@ -1,0 +1,6 @@
+{
+  "name": "example/badlock",
+  "require": {
+    "php": ">=8.1"
+  }
+}

@@ -1,0 +1,4 @@
+sample.json: line 1, col 15, Parse error on line 1
+{"a": [1, 2,]}
+--------------^
+Expecting value, got '}'

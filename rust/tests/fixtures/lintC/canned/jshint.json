@@ -1,0 +1,1 @@
+[{"file":"sample.js","line":3,"col":9,"reason":"Missing semicolon.","code":"W032"},{"file":"sample.js","line":7,"col":1,"reason":"Too many errors.","code":"E043"},{"file":"sample.js","line":10,"col":5,"reason":"Expected an assignment or function call and instead saw an expression.","code":"E030"}]

@@ -1,0 +1,6 @@
+{
+  "name": "example/stale",
+  "require": {
+    "php": ">=7.0"
+  }
+}

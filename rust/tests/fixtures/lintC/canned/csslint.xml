@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<lint>
+<file name="sample.css">
+<issue line="1" char="5" severity="error" reason="Expected RBRACE at line 1, col 5." evidence=".a { color: red; "/>
+<issue line="2" char="1" severity="warning" reason="Rule is empty." evidence=""/>
+</file>
+</lint>

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<checkstyle version="1.0">
+<file name="sample.js">
+<error line="2" column="1" severity="error" message="Missing semicolon" source="requireSemicolons"/>
+<error line="4" column="12" severity="warning" message="Line must be at most 120 characters" source="maximumLineLength"/>
+</file>
+</checkstyle>

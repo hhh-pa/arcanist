@@ -114,7 +114,7 @@ impl TextLinter {
 
 impl Linter for TextLinter {
     fn name(&self) -> &'static str {
-        "text"
+        "TXT"
     }
 
     fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {
@@ -173,10 +173,46 @@ pub struct Engine {
     linters: Vec<Box<dyn Linter>>,
 }
 
-/// Every ported linter, in registration order. Extended as linters land.
+/// Every ported linter, in registration order. `lint_external` stays out:
+/// the PHP base class is abstract and defines no linter of its own.
 #[must_use]
 pub fn all_linters() -> Vec<Box<dyn Linter>> {
-    vec![Box::new(TextLinter::new())]
+    vec![
+        Box::new(TextLinter::new()),
+        Box::new(crate::lint_chmod::ChmodLinter::new()),
+        Box::new(crate::lint_closure::ClosureLinter::new()),
+        Box::new(crate::lint_coffeelint::CoffeelintLinter::new()),
+        Box::new(crate::lint_composer::ComposerLinter::new()),
+        Box::new(crate::lint_cppcheck::CppcheckLinter::new()),
+        Box::new(crate::lint_cpplint::CpplintLinter::new()),
+        Box::new(crate::lint_csharp::CsharpLinter::new()),
+        Box::new(crate::lint_csslint::CsslintLinter::new()),
+        Box::new(crate::lint_filename::FilenameLinter::new()),
+        Box::new(crate::lint_flake8::Flake8Linter::new()),
+        Box::new(crate::lint_generated::GeneratedLinter::new()),
+        Box::new(crate::lint_golint::GolintLinter::new()),
+        Box::new(crate::lint_hlint::HlintLinter::new()),
+        Box::new(crate::lint_jscs::JscsLinter::new()),
+        Box::new(crate::lint_jshint::JshintLinter::new()),
+        Box::new(crate::lint_json::JsonLinter::new()),
+        Box::new(crate::lint_jsonlint::JsonlintLinter::new()),
+        Box::new(crate::lint_lessc::LesscLinter::new()),
+        Box::new(crate::lint_merge_conflict::MergeConflictLinter::new()),
+        Box::new(crate::lint_nolint::NoLintLinter::new()),
+        Box::new(crate::lint_pep8::Pep8Linter::new()),
+        Box::new(crate::lint_php::PhpLinter::new()),
+        Box::new(crate::lint_phpcs::PhpcsLinter::new()),
+        Box::new(crate::lint_phutil_library::PhutilLibraryLinter::new()),
+        Box::new(crate::lint_puppetlint::PuppetlintLinter::new()),
+        Box::new(crate::lint_pyflakes::PyFlakesLinter::new()),
+        Box::new(crate::lint_pylint::PyLintLinter::new()),
+        Box::new(crate::lint_rubocop::RuboCopLinter::new()),
+        Box::new(crate::lint_ruby::RubyLinter::new()),
+        Box::new(crate::lint_script_and_regex::ScriptAndRegexLinter::new()),
+        Box::new(crate::lint_spelling::SpellingLinter::new()),
+        Box::new(crate::lint_xhpast::XhpastLinter::new()),
+        Box::new(crate::lint_xml::XmlLinter::new()),
+    ]
 }
 
 impl Engine {
@@ -200,6 +236,11 @@ impl Engine {
 
     #[must_use]
     pub fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {
+        // PHP `shouldStopAllLinters`: generated and `@nolint` files skip
+        // every linter.
+        if crate::lint_generated::is_generated(data) || crate::lint_nolint::is_nolint(data) {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         for linter in &self.linters {
             out.extend(linter.lint_bytes(path, data));
@@ -354,6 +395,21 @@ fn parse_args(argv: &[String]) -> ParseOutcome {
     ParseOutcome::Args(LintArgs { paths, json })
 }
 
+/// Display path for lint output: relative to the working directory when the
+/// file is under it (like the PHP engine's repo-relative paths), otherwise
+/// the path as given.
+fn display_for(disk: &Path) -> String {
+    if disk.is_relative() {
+        return disk.to_string_lossy().to_string();
+    }
+    if let Ok(cwd) = std::env::current_dir()
+        && let Ok(rel) = disk.strip_prefix(&cwd)
+    {
+        return rel.to_string_lossy().to_string();
+    }
+    disk.to_string_lossy().to_string()
+}
+
 fn collect_from_dir(dir: &Path, out: &mut Vec<(PathBuf, String)>) -> Result<(), String> {
     let read =
         std::fs::read_dir(dir).map_err(|e| format!("cannot list '{}': {e}", dir.display()))?;
@@ -376,7 +432,7 @@ fn collect_from_dir(dir: &Path, out: &mut Vec<(PathBuf, String)>) -> Result<(), 
             }
             collect_from_dir(&path, out)?;
         } else {
-            out.push((path.clone(), path.to_string_lossy().to_string()));
+            out.push((path.clone(), display_for(&path)));
         }
     }
     Ok(())
@@ -395,7 +451,8 @@ pub fn collect_explicit(paths: &[String]) -> Result<Vec<(PathBuf, String)>, Stri
         if meta.file_type().is_dir() {
             collect_from_dir(&disk, &mut out)?;
         } else {
-            out.push((disk, path.clone()));
+            let display = display_for(&disk);
+            out.push((disk, display));
         }
     }
     out.sort_by(|a, b| a.1.cmp(&b.1));
