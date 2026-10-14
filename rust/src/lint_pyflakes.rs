@@ -138,6 +138,8 @@ fn parse_at(path: &str, line: &str, colon: usize) -> Option<LintMessage> {
         severity: severity_for(&description).to_string(),
         name: "PYFLAKES".to_string(),
         description,
+        original: None,
+        replacement: None,
     })
 }
 

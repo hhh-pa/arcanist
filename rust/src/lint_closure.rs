@@ -100,6 +100,8 @@ pub fn parse_gjslint_output(path: &str, stdout: &str) -> Vec<LintMessage> {
                 severity: arc_rs::lint::SEVERITY_ERROR.to_string(),
                 name: format!("{LINTER_NAME}{number}"),
                 description,
+                original: None,
+                replacement: None,
             });
         }
     }
@@ -227,6 +229,8 @@ fn failure_message(path: &str, description: &str) -> LintMessage {
         severity: arc_rs::lint::SEVERITY_ERROR.to_string(),
         name: LINTER_NAME.to_string(),
         description: description.to_string(),
+        original: None,
+        replacement: None,
     }
 }
 

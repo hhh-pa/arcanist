@@ -59,14 +59,17 @@ impl Linter for ComposerLinter {
         }
         vec![LintMessage {
             path: path.to_string(),
-            line: 1,
-            col: 1,
+            // Path-level (`raiseLintAtPath()`): no line or char.
+            line: 0,
+            col: 0,
             code: CODE_OUT_OF_DATE.to_string(),
             severity: SEVERITY_ERROR.to_string(),
             name: NAME_OUT_OF_DATE.to_string(),
             description: "The 'composer.lock' file seems to be out-of-date. \
                           You probably need to run `composer update`."
                 .to_string(),
+            original: None,
+            replacement: None,
         }]
     }
 }

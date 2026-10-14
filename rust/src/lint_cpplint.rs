@@ -199,6 +199,8 @@ pub fn parse_output(path: &str, _exit_code: i32, _stdout: &str, stderr: &str) ->
             severity: SEVERITY_WARNING.to_string(),
             name: category,
             description: message,
+            original: None,
+            replacement: None,
         });
     }
     out

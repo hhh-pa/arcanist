@@ -59,6 +59,8 @@ impl Linter for MergeConflictLinter {
                     severity: arc_rs::lint::SEVERITY_ERROR.to_string(),
                     name: NAME_MERGECONFLICT.to_string(),
                     description: DESC_MERGECONFLICT.to_string(),
+                    original: None,
+                    replacement: None,
                 });
             }
         }

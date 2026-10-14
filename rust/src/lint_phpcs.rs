@@ -206,6 +206,8 @@ pub fn parse_output(path: &str, exit_code: i32, stdout: &str, _stderr: &str) -> 
                 severity: severity.to_string(),
                 name: source,
                 description: xml_unescape(&text),
+                original: None,
+                replacement: None,
             });
         }
     }

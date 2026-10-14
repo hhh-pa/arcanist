@@ -112,6 +112,8 @@ impl Linter for XmlLinter {
                 severity: arc_rs::lint::SEVERITY_ERROR.to_string(),
                 name: NAME_XML_ERROR.to_string(),
                 description: error.message,
+                original: None,
+                replacement: None,
             }],
         }
     }

@@ -65,6 +65,10 @@ impl Linter for PhutilLibraryLinter {
         "PHL"
     }
 
+    fn priority(&self) -> f64 {
+        2.0
+    }
+
     fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {
         if !is_php_file(path) || data.contains(&0) {
             return Vec::new();
@@ -218,6 +222,8 @@ impl LibraryFinding {
             severity: SEVERITY_ERROR.to_string(),
             name: self.name.clone(),
             description: self.description.clone(),
+            original: None,
+            replacement: None,
         }
     }
 }
@@ -444,6 +450,8 @@ pub fn check_one_class_per_file(path: &str, data: &[u8]) -> Vec<LintMessage> {
                  ({class_list}) definitions in the same file. A file which declares a class \
                  or an interface MUST declare nothing else."
             ),
+            original: None,
+            replacement: None,
         }];
     }
     if classes.len() > 1 {
@@ -461,6 +469,8 @@ pub fn check_one_class_per_file(path: &str, data: &[u8]) -> Vec<LintMessage> {
                 "File '{path}' declares more than one class or interface ({class_list}). \
                  A file which declares a class or interface MUST declare nothing else."
             ),
+            original: None,
+            replacement: None,
         }];
     }
     Vec::new()

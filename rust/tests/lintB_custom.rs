@@ -131,6 +131,8 @@ fn echo_parser(
         severity: "error".to_string(),
         name: "echo".to_string(),
         description: stdout.trim().to_string(),
+        original: None,
+        replacement: None,
     }])
 }
 
@@ -287,6 +289,8 @@ fn external_parsers_resolve_on_canned_output() {
             severity: "error".to_string(),
             name: "External".to_string(),
             description: stdout.to_string(),
+            original: None,
+            replacement: None,
         }])
     }
     let messages = lint_external::resolve_output(parser, "f.txt", 0, "boom\n", "", true).unwrap();
@@ -462,7 +466,13 @@ fn engine_lint_file_covers_disk_semantics() {
 
     let missing = tmp.path().join("missing.php");
     let missing_display = missing.to_string_lossy().to_string();
-    assert!(engine.lint_file(&missing, &missing_display).is_err());
+    // Deleted files are filtered from every linter: no error.
+    assert!(
+        engine
+            .lint_file(&missing, &missing_display)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -472,11 +482,23 @@ fn lint_cli_plumbing_smoke() {
         lint::run(&["--help".to_string()]),
         std::process::ExitCode::SUCCESS
     );
-    assert!(lint::collect_explicit(&[]).unwrap().is_empty());
-    assert!(lint::lint_explicit_paths(&["lintB-definitely-missing-xyz".to_string()]).is_err());
-    let tmp = TempDir::new("nogit");
-    assert!(lint::changed_files_in(tmp.path()).is_err());
-    assert!(lint::lint_changed_in(tmp.path()).is_err());
+    let tmp = TempDir::new("plumbing");
+    assert!(
+        lint::collect_explicit(&[], tmp.path(), tmp.path())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        lint::lint_explicit_paths(tmp.path(), &["lintB-definitely-missing-xyz".to_string()])
+            .is_err()
+    );
+    // Outside any working copy (the system temp dir is outside the
+    // worktree), selection fails.
+    let outside = std::env::temp_dir().join(format!("lintB-nogit-{}", std::process::id()));
+    std::fs::create_dir_all(&outside).unwrap();
+    assert!(lint::changed_files_in(&outside, None).is_err());
+    assert!(lint::lint_changed_in(&outside, None).is_err());
+    std::fs::remove_dir_all(&outside).ok();
 }
 
 #[test]

@@ -188,6 +188,8 @@ pub fn parse_output_with(
             description: nonempty(&captured.message)
                 .unwrap_or(MESSAGE_DEFAULT)
                 .to_string(),
+            original: None,
+            replacement: None,
         });
     }
     Ok(out)

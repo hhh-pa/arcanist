@@ -58,7 +58,7 @@ fn creative_names_fail_with_path_message() {
         assert_eq!(found[0].code, "NAME1");
         assert_eq!(found[0].severity, "error");
         assert_eq!(found[0].name, "Bad Filename");
-        assert_eq!((found[0].line, found[0].col), (1, 1));
+        assert_eq!((found[0].line, found[0].col), (0, 0));
         assert!(!is_valid_filename(path), "for {path:?}");
     }
 }

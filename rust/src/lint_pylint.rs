@@ -145,6 +145,8 @@ fn parse_line(path: &str, line: &str) -> Option<LintMessage> {
         severity: severity.to_string(),
         name: display_name(symbol),
         description: message.to_string(),
+        original: None,
+        replacement: None,
     })
 }
 

@@ -138,6 +138,8 @@ fn parse_at(path: &str, line: &str, colon: usize) -> Option<LintMessage> {
         severity: SEVERITY_ERROR.to_string(),
         name: "Syntax Error".to_string(),
         description,
+        original: None,
+        replacement: None,
     })
 }
 

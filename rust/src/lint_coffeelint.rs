@@ -135,6 +135,8 @@ pub fn parse_raw_output(path: &str, stdout: &str) -> Result<Vec<LintMessage>, St
             severity: severity.to_string(),
             name: ucwords(&raw_name.replace('_', " ")),
             description: message.to_string(),
+            original: None,
+            replacement: None,
         });
     }
     Ok(messages)
@@ -267,6 +269,8 @@ fn failure_message(path: &str, description: &str) -> LintMessage {
         severity: arc_rs::lint::SEVERITY_ERROR.to_string(),
         name: LINTER_NAME.to_string(),
         description: description.to_string(),
+        original: None,
+        replacement: None,
     }
 }
 

@@ -228,6 +228,8 @@ fn parse_idea(path: &str, idea: &serde_json::Value) -> Option<LintMessage> {
         severity: severity.to_string(),
         name: hint.to_string(),
         description,
+        original: None,
+        replacement: None,
     })
 }
 

@@ -192,14 +192,17 @@ pub fn parse_output(path: &str, exit_code: i32, _stdout: &str, _stderr: &str) ->
     }
     vec![LintMessage {
         path: path.to_string(),
-        line: 1,
-        col: 1,
+        // Path-level (`raiseLintAtPath()`): no line or char.
+        line: 0,
+        col: 0,
         code: "XHP2".to_string(),
         severity: SEVERITY_WARNING.to_string(),
         name: "Unable to Parse".to_string(),
         description: format!(
             "xhpast could not parse this file (exit status {exit_code}). XHPAST rule evaluation is not yet ported."
         ),
+        original: None,
+        replacement: None,
     }]
 }
 

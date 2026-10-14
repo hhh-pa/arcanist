@@ -204,6 +204,8 @@ pub fn parse_output(path: &str, _exit_code: i32, stdout: &str, _stderr: &str) ->
             severity: severity.to_string(),
             name: ucwords(&check),
             description: ucfirst(parts[4].trim()),
+            original: None,
+            replacement: None,
         });
     }
     out

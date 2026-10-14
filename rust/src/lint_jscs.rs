@@ -114,6 +114,8 @@ pub fn parse_checkstyle_output(path: &str, stdout: &str) -> Result<Vec<LintMessa
             severity: severity.to_string(),
             name: LINTER_NAME.to_string(),
             description: attr(&attrs, "message").to_string(),
+            original: None,
+            replacement: None,
         });
     }
     Ok(messages)
@@ -413,6 +415,8 @@ fn failure_message(path: &str, description: &str) -> LintMessage {
         severity: arc_rs::lint::SEVERITY_ERROR.to_string(),
         name: LINTER_NAME.to_string(),
         description: description.to_string(),
+        original: None,
+        replacement: None,
     }
 }
 

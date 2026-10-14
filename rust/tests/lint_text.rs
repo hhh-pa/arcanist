@@ -1,23 +1,27 @@
-//! `arc-rs lint` behavior through the wired library.
+//! Workflow tests for `arc lint`: flags, exit codes, renderers,
+//! changed-line filtering, patching, and amend flows against real git
+//! repositories.
 
+use arc_rs::lint;
+use std::io::{BufReader, Cursor};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use arc_rs::lint::{self, Linter};
+static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct TempDir {
     path: PathBuf,
 }
 
 impl TempDir {
-    fn new(tag: &str) -> Self {
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // Inside the crate dir so display paths stay relative and boring
-        // for the NAME linter on every platform (absolute Windows paths
-        // carry a drive prefix no filename rule accepts).
-        let root = Path::new("target/lint-test-tmp");
-        std::fs::create_dir_all(root).unwrap();
-        let path = root.join(format!("arc-rs-lint-{tag}-{}-{n}", std::process::id()));
+    fn new(name: &str) -> Self {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = Path::new("target").join("lint-text-tmp").join(format!(
+            "{}-{}-{n}",
+            name,
+            std::process::id()
+        ));
         std::fs::create_dir_all(&path).unwrap();
         Self { path }
     }
@@ -26,13 +30,13 @@ impl TempDir {
         &self.path
     }
 
-    fn file(&self, name: &str, contents: &[u8]) -> String {
-        let disk = self.path.join(name);
-        if let Some(parent) = disk.parent() {
+    fn write(&self, name: &str, contents: &str) -> PathBuf {
+        let path = self.path.join(name);
+        if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
-        std::fs::write(&disk, contents).unwrap();
-        disk.to_string_lossy().to_string()
+        std::fs::write(&path, contents).unwrap();
+        path
     }
 }
 
@@ -42,319 +46,558 @@ impl Drop for TempDir {
     }
 }
 
-fn git(dir: &Path, args: &[&str]) {
+fn git(dir: &Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
+        .arg("-c")
+        .arg("core.autocrlf=false")
+        .arg("-c")
+        .arg("core.eol=lf")
+        .arg("-c")
+        .arg("user.email=lint@test")
+        .arg("-c")
+        .arg("user.name=lint")
+        .arg("-c")
+        .arg("init.defaultBranch=main")
         .args(args)
+        .current_dir(dir)
         .output()
-        .unwrap();
+        .expect("git must run");
     assert!(
         output.status.success(),
-        "git {} failed: {}",
-        args.join(" "),
+        "git {args:?} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-#[test]
-fn module_name_is_lint() {
-    assert_eq!(lint::NAME, "lint");
-    assert_eq!(lint::TextLinter::new().name(), "TXT");
-}
-
-#[test]
-fn trailing_whitespace_is_autofix() {
-    let engine = lint::Engine::new();
-    let messages = engine.lint_bytes("f.txt", b"ok\nbad   \n");
-    assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].code, "TXT6");
-    assert_eq!(messages[0].severity, lint::SEVERITY_AUTOFIX);
-    assert_eq!((messages[0].line, messages[0].col), (2, 4));
-}
-
-#[test]
-fn tabs_and_missing_newline_are_errors() {
-    let engine = lint::Engine::new();
-    let messages = engine.lint_bytes("f.txt", b"a\tb\nno-newline");
-    assert!(
-        messages
-            .iter()
-            .any(|m| m.code == "TXT2" && m.severity == "error")
-    );
-    assert!(
-        messages
-            .iter()
-            .any(|m| m.code == "TXT4" && m.severity == "error")
-    );
-}
-
-#[test]
-fn clean_empty_and_binary_files_pass() {
-    let engine = lint::Engine::new();
-    assert!(engine.lint_bytes("f.txt", b"hello\nworld\n").is_empty());
-    assert!(engine.lint_bytes("f.txt", b"").is_empty());
-
-    let tmp = TempDir::new("binary");
-    let path = tmp.file("bin.dat", b"a\0b\n");
-    let found = engine.lint_file(Path::new(&path), &path).unwrap();
-    assert!(found.is_empty());
-}
-
-#[test]
-fn engine_supports_extra_linters() {
-    struct Silent;
-    impl lint::Linter for Silent {
-        fn name(&self) -> &'static str {
-            "silent"
-        }
-        fn lint_bytes(&self, _path: &str, _data: &[u8]) -> Vec<lint::LintMessage> {
-            Vec::new()
-        }
-    }
-    let mut engine = lint::Engine::empty();
-    engine.add_linter(Box::new(Silent));
-    assert!(engine.lint_bytes("f.txt", b"bad   \n").is_empty());
-}
-
-#[test]
-fn fixtures_match_expectations() {
-    let engine = lint::Engine::new();
-    let base = Path::new("tests/fixtures/lint");
-    let clean = std::fs::read(base.join("clean.txt")).unwrap();
-    assert!(engine.lint_bytes("clean.txt", &clean).is_empty());
-
-    let trailing = std::fs::read(base.join("trailing.txt")).unwrap();
-    let found = engine.lint_bytes("trailing.txt", &trailing);
-    assert_eq!(found.len(), 1);
-    assert_eq!(found[0].code, "TXT6");
-
-    let tabs = std::fs::read(base.join("tabs.txt")).unwrap();
-    assert!(
-        engine
-            .lint_bytes("tabs.txt", &tabs)
-            .iter()
-            .any(|m| m.code == "TXT2")
-    );
-
-    let noeol = std::fs::read(base.join("noeol.txt")).unwrap();
-    assert!(
-        engine
-            .lint_bytes("noeol.txt", &noeol)
-            .iter()
-            .any(|m| m.code == "TXT4")
-    );
-}
-
-#[test]
-fn explicit_paths_lint_and_missing_paths_fail() {
-    let tmp = TempDir::new("explicit");
-    let dirty = tmp.file("dirty.txt", b"bad   \n");
-    let messages = lint::lint_explicit_paths(&[dirty]).unwrap();
-    assert_eq!(messages.len(), 1);
-
-    let missing = tmp.path().join("nope.txt").to_string_lossy().to_string();
-    assert!(lint::lint_explicit_paths(&[missing]).is_err());
-
-    let clean = tmp.file("clean.txt", b"ok\n");
-    assert_eq!(
-        lint::run(&[clean, "--json".to_string()]),
-        std::process::ExitCode::SUCCESS
-    );
-}
-
-#[test]
-fn run_rejects_bad_and_unported_flags() {
-    assert_eq!(
-        lint::run(&["--bogus".to_string()]),
-        std::process::ExitCode::FAILURE
-    );
-    for flag in [
-        "--rev",
-        "--apply-patches",
-        "--amend-all",
-        "--engine",
-        "--everything",
-    ] {
-        assert_eq!(
-            lint::run(&[flag.to_string()]),
-            std::process::ExitCode::FAILURE,
-            "for {flag}"
-        );
-    }
-}
-
-#[test]
-fn run_reports_missing_paths_and_help() {
-    assert_eq!(
-        lint::run(&["definitely/missing/file.txt".to_string()]),
-        std::process::ExitCode::FAILURE
-    );
-    assert_eq!(
-        lint::run(&["--help".to_string()]),
-        std::process::ExitCode::SUCCESS
-    );
-}
-
-#[test]
-fn run_exit_reflects_error_severity() {
-    let tmp = TempDir::new("exit");
-    let tabbed = tmp.file("tab.txt", b"a\tb\n");
-    assert_eq!(lint::run(&[tabbed]), std::process::ExitCode::FAILURE);
-    let autofix_only = tmp.file("ws.txt", b"bad   \n");
-    assert_eq!(lint::run(&[autofix_only]), std::process::ExitCode::SUCCESS);
-}
-
-#[test]
-fn collect_walks_directories() {
-    let tmp = TempDir::new("walk");
-    tmp.file("sub/a.txt", b"ok\n");
-    tmp.file("sub/b.txt", b"ok\n");
-    let dir = tmp.path().join("sub").to_string_lossy().to_string();
-    let files = lint::collect_explicit(&[dir]).unwrap();
-    assert_eq!(files.len(), 2);
-}
-
-fn install_arclint(tmp: &TempDir, fixture: &str) {
-    let body = std::fs::read(Path::new("tests/fixtures/lint").join(fixture)).unwrap();
-    std::fs::write(tmp.path().join(".arclint"), body).unwrap();
-}
-
-#[test]
-fn arclint_selection_limits_run() {
-    let tmp = TempDir::new("arclint-select");
-    install_arclint(&tmp, "arclint-text-only.json");
-    let bad_json = tmp.file("bad.json", b"not json\n");
-
-    let (engine, config) = lint::engine_for_dir(tmp.path()).unwrap();
-    assert_eq!(config, Some(tmp.path().join(".arclint")));
-    assert!(
-        lint::lint_explicit_paths_with_engine(&engine, std::slice::from_ref(&bad_json))
-            .unwrap()
-            .is_empty(),
-        "text-only config must not report JSON1"
-    );
-    assert!(
-        lint::lint_explicit_paths(std::slice::from_ref(&bad_json))
-            .unwrap()
-            .iter()
-            .any(|m| m.code == "JSON1"),
-        "unconfigured run still reports JSON1"
-    );
-    assert_eq!(
-        lint::run_in(tmp.path(), &[bad_json]),
-        std::process::ExitCode::SUCCESS
-    );
-}
-
-#[test]
-fn arclint_is_discovered_from_child_directories() {
-    let tmp = TempDir::new("arclint-nested");
-    install_arclint(&tmp, "arclint-text-only.json");
-    let bad_json = tmp.file("sub/bad.json", b"not json\n");
-
-    let child = tmp.path().join("sub");
-    let (_engine, config) = lint::engine_for_dir(&child).unwrap();
-    assert_eq!(config, Some(tmp.path().join(".arclint")));
-    assert_eq!(
-        lint::run_in(&child, &[bad_json]),
-        std::process::ExitCode::SUCCESS
-    );
-}
-
-#[test]
-fn invalid_arclint_fails_run() {
-    for fixture in ["arclint-invalid.json", "arclint-unknown-type.json"] {
-        let tmp = TempDir::new("arclint-bad");
-        install_arclint(&tmp, fixture);
-        let clean = tmp.file("clean.txt", b"ok\n");
-        assert!(lint::engine_for_dir(tmp.path()).is_err(), "for {fixture}");
-        assert_eq!(
-            lint::run_in(tmp.path(), &[clean]),
-            std::process::ExitCode::FAILURE,
-            "for {fixture}"
-        );
-    }
-}
-
-#[test]
-fn severity_flag_filters_messages() {
-    let tmp = TempDir::new("severity");
-    install_arclint(&tmp, "arclint-text-only.json");
-    let ws = tmp.file("ws.txt", b"bad   \n");
-    let tab = tmp.file("tab.txt", b"a\tb\n");
-
-    // Library level: the autofix downgrade is dropped at error minimum.
-    let engine = lint::Engine::new();
-    let found = lint::lint_explicit_paths_with_engine(&engine, std::slice::from_ref(&ws)).unwrap();
-    assert_eq!(found.len(), 1);
-    assert!(lint::filter_by_severity(found, "error").is_empty());
-
-    // CLI level: filtering never fails the run, errors still surface.
-    assert_eq!(
-        lint::run_in(tmp.path(), std::slice::from_ref(&ws)),
-        std::process::ExitCode::SUCCESS
-    );
-    assert_eq!(
-        lint::run_in(
-            tmp.path(),
-            &[ws, "--severity".to_string(), "error".to_string()]
-        ),
-        std::process::ExitCode::SUCCESS
-    );
-    assert_eq!(
-        lint::run_in(tmp.path(), &[tab, "--severity=error".to_string()]),
-        std::process::ExitCode::FAILURE
-    );
-}
-
-#[test]
-fn severity_flag_rejects_bad_values() {
-    let tmp = TempDir::new("severity-bad");
-    let clean = tmp.file("clean.txt", b"ok\n");
-    assert_eq!(
-        lint::run_in(
-            tmp.path(),
-            &[clean.clone(), "--severity".to_string(), "bogus".to_string()]
-        ),
-        std::process::ExitCode::FAILURE
-    );
-    assert_eq!(
-        lint::run_in(tmp.path(), &[clean, "--severity".to_string()]),
-        std::process::ExitCode::FAILURE
-    );
-}
-
-#[test]
-fn changed_files_cover_staged_and_unstaged_only() {
-    let tmp = TempDir::new("git");
+/// A git repo with a text-only `.arclint`.
+fn git_repo(name: &str) -> TempDir {
+    let tmp = TempDir::new(name);
     git(tmp.path(), &["init"]);
+    tmp.write(".arclint", r#"{"linters": {"text": {"type": "text"}}}"#);
+    tmp
+}
+
+fn args(words: &[&str]) -> Vec<String> {
+    words.iter().map(|word| word.to_string()).collect()
+}
+
+fn run_in(dir: &Path, words: &[&str]) -> ExitCode {
+    let argv = args(words);
+    let mut empty = BufReader::new("".as_bytes());
+    lint::run_in_with_input(dir, &argv, &mut empty)
+}
+
+fn run_in_with(dir: &Path, words: &[&str], stdin_text: &str) -> ExitCode {
+    let argv = args(words);
+    let mut input = Cursor::new(stdin_text.as_bytes().to_vec());
+    lint::run_in_with_input(dir, &argv, &mut input)
+}
+
+fn code(value: ExitCode) -> Option<u8> {
+    // `ExitCode` exposes no accessor; probe the values we assert.
+    (0..=3u8).find(|expected| value == ExitCode::from(*expected))
+}
+
+#[test]
+fn lint_help_and_usage_errors() {
+    let tmp = git_repo("help");
+    assert_eq!(run_in(tmp.path(), &["--help"]), ExitCode::SUCCESS);
+    assert_eq!(run_in(tmp.path(), &["--bogus"]), ExitCode::FAILURE);
+    assert_eq!(
+        run_in(tmp.path(), &["--apply-patches", "--never-apply-patches"]),
+        ExitCode::FAILURE
+    );
+    assert_eq!(
+        run_in(tmp.path(), &["--everything", "file.txt"]),
+        ExitCode::FAILURE
+    );
+    assert_eq!(run_in(tmp.path(), &["--rev"]), ExitCode::FAILURE);
+}
+
+#[test]
+fn lint_requires_a_working_copy_and_an_engine() {
+    let outside = std::env::temp_dir().join(format!("lint-text-outside-{}", std::process::id()));
+    std::fs::create_dir_all(&outside).unwrap();
+    assert_eq!(run_in(&outside, &["--output", "none"]), ExitCode::FAILURE);
+    std::fs::remove_dir_all(&outside).ok();
+
+    // A repo without `.arclint` has no engine.
+    let tmp = TempDir::new("noengine");
+    git(tmp.path(), &["init"]);
+    tmp.write("file.txt", "ok\n");
+    assert_eq!(
+        run_in(tmp.path(), &["file.txt", "--output", "none"]),
+        ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn lint_unknown_engine_and_renderer_fail() {
+    let tmp = git_repo("badengine");
+    tmp.write("file.txt", "ok\n");
+    assert_eq!(
+        run_in(tmp.path(), &["file.txt", "--engine", "BogusEngine"]),
+        ExitCode::FAILURE
+    );
+    assert_eq!(
+        run_in(tmp.path(), &["file.txt", "--output", "bogus"]),
+        ExitCode::FAILURE
+    );
+    assert_eq!(
+        run_in(tmp.path(), &["missing.txt", "--output", "none"]),
+        ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn lint_exit_codes_follow_severity() {
+    let tmp = git_repo("codes");
+    tmp.write("error.txt", "ok\nx\ty\n");
+    tmp.write("warn.txt", &format!("{}\n", "x".repeat(81)));
+    tmp.write("clean.txt", "ok\n");
+
+    assert_eq!(
+        code(run_in(tmp.path(), &["error.txt", "--output", "none"])),
+        Some(2)
+    );
+    assert_eq!(
+        code(run_in(tmp.path(), &["warn.txt", "--output", "none"])),
+        Some(1)
+    );
+    assert_eq!(
+        code(run_in(tmp.path(), &["clean.txt", "--output", "none"])),
+        Some(0)
+    );
+    // Autofixes left unapplied do not fail the run.
+    tmp.write("auto.txt", "ok  \n");
+    assert_eq!(
+        code(run_in(
+            tmp.path(),
+            &["auto.txt", "--output", "none", "--never-apply-patches"]
+        )),
+        Some(0)
+    );
+}
+
+#[test]
+fn lint_severity_minimum_filters_and_accepts_anything() {
+    let tmp = git_repo("severity");
+    tmp.write("warn.txt", &format!("{}\n", "x".repeat(81)));
+    assert_eq!(
+        code(run_in(
+            tmp.path(),
+            &["warn.txt", "--output", "none", "--severity", "error"]
+        )),
+        Some(0)
+    );
+    // PHP validates nothing: an unknown minimum shows everything.
+    assert_eq!(
+        code(run_in(
+            tmp.path(),
+            &["warn.txt", "--output", "none", "--severity", "bogus"]
+        )),
+        Some(1)
+    );
+}
+
+#[test]
+fn lint_summary_renderer_writes_exact_bytes() {
+    let tmp = git_repo("summary");
+    tmp.write("tab.txt", "ok\nx\ty\n");
+    let out = tmp.path().join("out.txt");
+    let out_arg = out.to_string_lossy().to_string();
+    assert_eq!(
+        code(run_in(
+            tmp.path(),
+            &["tab.txt", "--output", "summary", "--outfile", &out_arg]
+        )),
+        Some(2)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "tab.txt:2:Error: Tab Literal\n"
+    );
+    // Clean files append the OKAY line through the same sink.
+    tmp.write("clean.txt", "ok\n");
+    assert_eq!(
+        code(run_in(
+            tmp.path(),
+            &["clean.txt", "--output", "summary", "--outfile", &out_arg]
+        )),
+        Some(0)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "   OKAY  No lint messages.\n"
+    );
+}
+
+#[test]
+fn lint_compiler_json_xml_none_renderers() {
+    let tmp = git_repo("renderers");
+    tmp.write("tab.txt", "ok\nx\ty\n");
+    let out = tmp.path().join("out.txt");
+    let out_arg = out.to_string_lossy().to_string();
+
+    assert_eq!(
+        code(run_in(
+            tmp.path(),
+            &["tab.txt", "--output", "compiler", "--outfile", &out_arg]
+        )),
+        Some(2)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "tab.txt:2:Error (TXT2) Configure your editor to use spaces for indentation.\n"
+    );
+
+    assert_eq!(
+        code(run_in(
+            tmp.path(),
+            &["tab.txt", "--output", "json", "--outfile", &out_arg]
+        )),
+        Some(2)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    assert_eq!(parsed["tab.txt"][0]["code"], "TXT2");
+    assert_eq!(parsed["tab.txt"][0]["line"], 2);
+    assert_eq!(parsed["tab.txt"][0]["char"], 2);
+    assert_eq!(parsed["tab.txt"][0]["severity"], "error");
+    assert_eq!(parsed["tab.txt"][0]["context"], "ok\nx\ty\n");
+    assert!(std::fs::read_to_string(&out).unwrap().contains("tab.txt"));
+
+    assert_eq!(
+        code(run_in(
+            tmp.path(),
+            &["tab.txt", "--output", "xml", "--outfile", &out_arg]
+        )),
+        Some(2)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <checkstyle version=\"4.3\">\n\
+         \x20\x20<file name=\"tab.txt\">\n\
+         \x20\x20\x20\x20<error line=\"2\" column=\"2\" severity=\"error\" message=\"Configure your editor to use spaces for indentation.\" source=\"TXT2\"/>\n\
+         \x20\x20</file>\n\
+         </checkstyle>\n"
+    );
+
+    assert_eq!(
+        code(run_in(
+            tmp.path(),
+            &["tab.txt", "--output", "none", "--outfile", &out_arg]
+        )),
+        Some(2)
+    );
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "");
+}
+
+#[test]
+fn lint_console_renderer_writes_exact_bytes() {
+    let tmp = git_repo("console");
+    tmp.write("c.txt", "ok  \n");
+    let out = tmp.path().join("out.txt");
+    let out_arg = out.to_string_lossy().to_string();
+    assert_eq!(
+        code(run_in(
+            tmp.path(),
+            &[
+                "c.txt",
+                "--output",
+                "console",
+                "--outfile",
+                &out_arg,
+                "--never-apply-patches"
+            ]
+        )),
+        Some(0)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        ">>> Lint for c.txt:\n\
+         \n\
+         \n\
+         \x20\x20\x20Auto-Fix  (TXT6) Trailing Whitespace\n\
+         \x20\x20\x20\x20This line contains trailing whitespace. Consider setting up your editor to\n\
+         \x20\x20\x20\x20automatically remove trailing whitespace.\n\
+         \n\
+         \x20\x20\x20\x20>>> -      1 ok  \n\
+         \x20\x20\x20\x20\x20\x20\x20\x20+        ok\n\
+         \x20\x20\x20OKAY  No lint messages.\n"
+    );
+}
+
+#[test]
+fn lint_autofixes_apply_without_prompting() {
+    let tmp = git_repo("autofix");
+    let file = tmp.write("auto.txt", "ok  \n");
+    // Only the console renderer patches; autofixes apply silently.
+    assert_eq!(code(run_in_with(tmp.path(), &["auto.txt"], "")), Some(0));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "ok\n");
+    // No `.linted` temp files are left behind.
+    let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().contains(".linted"))
+        .collect();
+    assert!(leftovers.is_empty());
+}
+
+#[test]
+fn lint_patch_prompts_accept_and_decline() {
+    // TXT4 is patchable but not an autofix: the console renderer asks.
+    let tmp = git_repo("prompt");
+    let file = tmp.write("noeol.txt", "hello\nworld");
+    // `--output none` never patches: the error stays unresolved.
+    assert_eq!(
+        code(run_in_with(
+            tmp.path(),
+            &["noeol.txt", "--output", "none"],
+            "n\n"
+        )),
+        Some(2)
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello\nworld");
+
+    assert_eq!(
+        code(run_in_with(tmp.path(), &["noeol.txt"], "n\n")),
+        Some(2)
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello\nworld");
+
+    assert_eq!(
+        code(run_in_with(tmp.path(), &["noeol.txt"], "y\n")),
+        Some(0)
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello\nworld\n");
+
+    // `--output none` never patches, even with `--apply-patches`,
+    // so the error stays unresolved.
+    tmp.write("noeol2.txt", "hello\nworld");
+    assert_eq!(
+        code(run_in(
+            tmp.path(),
+            &["noeol2.txt", "--apply-patches", "--output", "none"]
+        )),
+        Some(2)
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("noeol2.txt")).unwrap(),
+        "hello\nworld"
+    );
+    assert_eq!(
+        code(run_in(tmp.path(), &["noeol2.txt", "--apply-patches"])),
+        Some(0)
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("noeol2.txt")).unwrap(),
+        "hello\nworld\n"
+    );
+}
+
+#[test]
+fn lint_amend_all_amends_and_decline_aborts() {
+    let tmp = git_repo("amend");
+    // The amend flow shells out to `git commit --amend`, which needs an
+    // identity the `-c` flags on the helper cannot provide.
     git(tmp.path(), &["config", "user.email", "lint@test"]);
     git(tmp.path(), &["config", "user.name", "lint"]);
-    git(tmp.path(), &["config", "commit.gpgsign", "false"]);
-    std::fs::write(tmp.path().join("tracked.txt"), b"ok\n").unwrap();
-    git(tmp.path(), &["add", "tracked.txt"]);
-    git(tmp.path(), &["commit", "-m", "init"]);
+    tmp.write("fix.txt", "ok  \n");
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-m", "base"]);
 
-    assert!(lint::changed_files_in(tmp.path()).unwrap().is_empty());
-
-    // Unstaged modification plus an untracked file: only the tracked change
-    // must be reported.
-    std::fs::write(tmp.path().join("tracked.txt"), b"ok   \n").unwrap();
-    std::fs::write(tmp.path().join("untracked.txt"), b"bad   \n").unwrap();
-    let changed = lint::changed_files_in(tmp.path()).unwrap();
-    assert_eq!(changed.len(), 1);
-    assert_eq!(changed[0].1, "tracked.txt");
-
-    // Staging the new file makes it visible to the diff versus HEAD.
-    git(tmp.path(), &["add", "untracked.txt"]);
-    let changed = lint::changed_files_in(tmp.path()).unwrap();
-    assert_eq!(changed.len(), 2);
-
-    let messages = lint::lint_changed_in(tmp.path()).unwrap();
-    assert!(
-        messages
-            .iter()
-            .any(|m| m.path == "tracked.txt" && m.code == "TXT6")
+    assert_eq!(
+        code(run_in(
+            tmp.path(),
+            &["fix.txt", "--apply-patches", "--amend-all"]
+        )),
+        Some(0)
     );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("fix.txt")).unwrap(),
+        "ok\n"
+    );
+    assert_eq!(git(tmp.path(), &["status", "--porcelain"]).trim(), "");
+    assert_eq!(
+        git(tmp.path(), &["show", "HEAD:fix.txt"]),
+        "ok\n".to_string()
+    );
+
+    // A declined amend keeps the patch in the worktree and fails.
+    tmp.write("fix2.txt", "hello\nworld");
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-m", "second"]);
+    assert_eq!(
+        code(run_in_with(
+            tmp.path(),
+            &["fix2.txt", "--apply-patches", "--amend-autofixes"],
+            "n\n"
+        )),
+        Some(1)
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("fix2.txt")).unwrap(),
+        "hello\nworld\n"
+    );
+    assert_eq!(
+        git(tmp.path(), &["show", "HEAD:fix2.txt"]),
+        "hello\nworld".to_string()
+    );
+}
+
+#[test]
+fn lint_everything_covers_tracked_only() {
+    let tmp = git_repo("everything");
+    tmp.write("tracked.txt", "ok\nx\ty\n");
+    tmp.write("ignored.txt", "ok\n");
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-m", "base"]);
+    // Untracked files are invisible to `--everything`.
+    tmp.write("untracked.txt", "ok\nx\ty\n");
+    assert_eq!(
+        code(run_in(tmp.path(), &["--everything", "--output", "none"])),
+        Some(2)
+    );
+    // ...and to the status selection (which is empty here).
+    assert_eq!(
+        code(run_in_with(
+            tmp.path(),
+            &["--rev", "HEAD", "--output", "none"],
+            ""
+        )),
+        Some(1)
+    );
+}
+
+#[test]
+fn lint_changed_line_filtering_hides_off_line_warnings() {
+    let tmp = git_repo("changedlines");
+    let long = "x".repeat(81);
+    tmp.write("lines.txt", &format!("{long}\n{long}\n"));
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-m", "base"]);
+    // Shorten line 1 (changed); line 2 stays long (unchanged).
+    tmp.write("lines.txt", &format!("short\n{long}\n"));
+
+    // Errors always show; off-line warnings hide.
+    assert_eq!(
+        code(run_in(tmp.path(), &["--rev", "HEAD", "--output", "none"])),
+        Some(0)
+    );
+    assert_eq!(
+        code(run_in(
+            tmp.path(),
+            &["--rev", "HEAD", "--output", "none", "--lintall"]
+        )),
+        Some(1)
+    );
+    // Unknown revisions fail.
+    assert_eq!(
+        code(run_in(
+            tmp.path(),
+            &["--rev", "no-such-rev", "--output", "none"]
+        )),
+        Some(1)
+    );
+}
+
+#[test]
+fn lint_explicit_paths_do_not_recurse() {
+    let tmp = git_repo("dirs");
+    tmp.write("sub/inner.txt", "ok\nx\ty\n");
+    // Directories are not walked, and directory paths only reach
+    // directory-aware linters (the filename linter opts in; the text
+    // linter does not), so explicit directories stay silent here.
+    assert_eq!(
+        code(run_in(tmp.path(), &["sub", "--output", "none"])),
+        Some(0)
+    );
+    std::fs::create_dir_all(tmp.path().join("bad dir")).unwrap();
+    assert_eq!(
+        code(run_in(tmp.path(), &["bad dir", "--output", "none"])),
+        Some(0)
+    );
+    // Binaries skip text rules.
+    std::fs::write(tmp.path().join("bin.dat"), b"has\0nul\t\n").unwrap();
+    assert_eq!(
+        code(run_in(tmp.path(), &["bin.dat", "--output", "none"])),
+        Some(0)
+    );
+}
+
+#[test]
+fn lint_comprehensive_and_single_engines() {
+    let tmp = TempDir::new("engines");
+    git(tmp.path(), &["init"]);
+    tmp.write("a.php", "ok\nx\ty\n");
+
+    // Comprehensive needs no `.arclint`.
+    assert_eq!(
+        code(run_in(
+            tmp.path(),
+            &[
+                "a.php",
+                "--engine",
+                "ArcanistComprehensiveLintEngine",
+                "--output",
+                "none"
+            ]
+        )),
+        Some(2)
+    );
+    // `externals/` is excluded: nothing lintable.
+    tmp.write("externals/a.php", "ok\nx\ty\n");
+    assert_eq!(
+        code(run_in(
+            tmp.path(),
+            &[
+                "externals/a.php",
+                "--engine",
+                "ArcanistComprehensiveLintEngine",
+                "--output",
+                "none"
+            ]
+        )),
+        Some(1)
+    );
+
+    // Single runs one linter class.
+    tmp.write(
+        ".arcconfig",
+        r#"{"lint.engine.single.linter": "ArcanistTextLinter"}"#,
+    );
+    assert_eq!(
+        code(run_in(
+            tmp.path(),
+            &[
+                "a.php",
+                "--engine",
+                "ArcanistSingleLintEngine",
+                "--output",
+                "none"
+            ]
+        )),
+        Some(2)
+    );
+}
+
+#[test]
+fn write_patch_to_disk_roundtrip() {
+    let tmp = git_repo("patchdisk");
+    let file = tmp.write("p.txt", "ok  \n");
+    let engine = lint::Engine::new();
+    let messages = engine.lint_bytes("p.txt", b"ok  \n");
+    assert!(!messages.is_empty());
+    let mut result = lint::LintResult::new("p.txt".to_string(), file.clone(), b"ok  \n".to_vec());
+    for message in messages {
+        result.add_message(message);
+    }
+    assert!(result.is_patchable());
+    assert!(result.is_all_autofix());
+    let applied = lint::write_patch_to_disk(&result).unwrap();
+    assert!(applied.iter().any(|flag| *flag));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "ok\n");
 }
