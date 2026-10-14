@@ -36,10 +36,19 @@ RUN mkdir -p /tmp/prov-work \
     && python3 /tmp/gates-lib/rust-quality-gates.py /tmp/prov-work --provision-only \
     && rm -rf /tmp/prov-work /tmp/gates-lib /usr/local/cargo/registry
 
-# Warm the registry cache for the workspace dependencies. Cargo requires at
-# least one target to resolve a manifest, hence the dummy main.
-COPY rust/Cargo.toml rust/Cargo.lock /tmp/fetch/rust/
-RUN mkdir -p /tmp/fetch/rust/src && touch /tmp/fetch/rust/src/main.rs \
-    && cd /tmp/fetch/rust && cargo fetch && rm -rf /tmp/fetch /usr/local/cargo/registry/src
+# Prebuilt dependency tree ("builder" layer): compiling the workspace's
+# dependencies once here means gate runs rebuild arc-rs itself only.
+# CARGO_TARGET_DIR lives outside the /work mount so the prebuilt tree
+# survives it; the gates script already honors CARGO_TARGET_DIR, and its
+# llvm-cov seed copies this debug tree so coverage deps stay fresh too.
+# Registry sources stay extracted: cargo fingerprints compare mtimes, and
+# re-extraction would stale every prebuilt unit. Cargo requires at least
+# one target to resolve a manifest, hence the dummy main.
+ENV CARGO_TARGET_DIR=/opt/target
+COPY rust/Cargo.toml rust/Cargo.lock /tmp/warm/rust/
+RUN mkdir -p /tmp/warm/rust/src && touch /tmp/warm/rust/src/main.rs \
+    && cd /tmp/warm/rust && cargo fetch \
+    && cargo test --no-run \
+    && rm -rf /tmp/warm
 
 WORKDIR /work
