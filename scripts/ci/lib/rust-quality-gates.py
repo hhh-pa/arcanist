@@ -2,12 +2,16 @@
 """Rust quality gates (T968): audit, deny, udeps, geiger, complexity, coverage.
 
 Usage: rust-quality-gates.py <workspace-dir> <report-dir> <cov-runner> [cov-args...]
+       rust-quality-gates.py <workspace-dir> --provision-only
   workspace-dir: Rust workspace root (Cargo.toml, Cargo.lock, deny.toml,
     .cargo/audit.toml, *-baseline.json)
   report-dir: where coverage reports land (lcov.info + html/)
   cov-runner + cov-args: how llvm-cov runs the suite, e.g.
     nextest --profile ci --run-ignored all
     test --workspace
+  --provision-only: install every pinned tool plus the toolchains they
+    need, then exit without running any gate. Used to bake the CI gate
+    image (scripts/ci/quality-gates.Dockerfile).
   NOTE: for nextest, OMIT the run subcommand. `cargo llvm-cov nextest`
   calls `cargo nextest run` internally, so a literal run would be treated
   as a test-name filter and the coverage run would silently execute only
@@ -56,6 +60,7 @@ LLVM_COV_VERSION = "0.9.1"
 GEIGER_VERSION = "0.13.0"
 UDEPS_VERSION = "0.1.61"
 RCA_VERSION = "0.0.25"
+NEXTEST_VERSION = "0.9.148"
 UDEPS_NIGHTLY = "nightly-2026-10-01"
 
 LIB_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -786,19 +791,30 @@ def coverage_reports(env, workspace, report_dir, cov_runner):
 
 
 def main():
-    if len(sys.argv) < 4 or sys.argv[1] in ("-h", "--help"):
+    if len(sys.argv) < 3 or sys.argv[1] in ("-h", "--help"):
         print(__doc__)
         return 2
     workspace = os.path.abspath(sys.argv[1])
-    report_dir = os.path.abspath(sys.argv[2])
-    cov_runner = sys.argv[3:]
-    if cov_runner[0] == "nextest" and "run" in cov_runner:
-        # `cargo llvm-cov nextest` calls `cargo nextest run` internally; a
-        # literal run becomes a test-name filter and silently guts coverage.
-        raise SystemExit(
-            "refusing nextest cov-runner containing 'run': omit the "
-            "subcommand, llvm-cov inserts it (else it filters tests by name)"
-        )
+    if len(sys.argv) == 3 and sys.argv[2] == "--provision-only":
+        provision_only = True
+        report_dir = None
+        cov_runner = []
+    else:
+        if len(sys.argv) < 4:
+            print(__doc__)
+            return 2
+        provision_only = False
+        report_dir = os.path.abspath(sys.argv[2])
+        cov_runner = sys.argv[3:]
+        if cov_runner[0] == "nextest" and "run" in cov_runner:
+            # `cargo llvm-cov nextest` calls `cargo nextest run`
+            # internally; a literal run becomes a test-name filter and
+            # silently guts coverage.
+            raise SystemExit(
+                "refusing nextest cov-runner containing 'run': omit the "
+                "subcommand, llvm-cov inserts it (else it filters tests "
+                "by name)"
+            )
     arch = machine_arch()
 
     cargo_home = os.environ.get("CARGO_HOME")
@@ -927,6 +943,16 @@ def main():
         None,
         "vendored-openssl",
     )
+    # No prebuilt URL: compiled once (baked into the CI gate image, then
+    # cached in the shared cargo home like every other fallback compile).
+    ensure_tool(
+        env,
+        tools_root,
+        "cargo-nextest",
+        "cargo-nextest",
+        NEXTEST_VERSION,
+        None,
+    )
     run(["rustup", "component", "add", "llvm-tools-preview"], env, workspace)
     run(
         [
@@ -941,6 +967,9 @@ def main():
         env,
         workspace,
     )
+    if provision_only:
+        print("rust quality gates: tools provisioned for %s" % workspace)
+        return 0
 
     # Per-workspace advisory-db, freshly cloned every run: the default
     # ~/.cargo/advisory-db is shared across parallel stages on the node

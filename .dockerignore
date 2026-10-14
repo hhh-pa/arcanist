@@ -1,0 +1,6 @@
+# Build context for scripts/ci/quality-gates.Dockerfile: only manifests and
+# gate scripts are COPYd; keep everything bulky out of the context.
+.git/
+GH_log/
+GH_rca/
+**/target/
