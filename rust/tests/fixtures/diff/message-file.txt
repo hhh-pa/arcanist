@@ -1,0 +1,7 @@
+Fix off-by-one in pager
+
+The last page was skipped when the row count was an exact multiple
+of the page size.
+
+Test Plan: cargo test pager
+Reviewers: dave

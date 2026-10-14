@@ -1,0 +1,5 @@
+URL: https://svn.example.test/repo/trunk
+Repository Root: https://svn.example.test/repo
+Repository UUID: 12345678-1234-1234-1234-1234567890ab
+Revision: 42
+Node Kind: directory

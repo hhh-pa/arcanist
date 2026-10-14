@@ -40,3 +40,4 @@
 
 # Rust port (T1128)
 /rust/target/
+/rust/target-*/

@@ -1,11 +1,9 @@
-#[path = "../src/git.rs"]
-mod git;
-
-#[path = "../src/branches.rs"]
-mod branches;
+//! `branches` behavior through the wired library.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+
+use arc_rs::branches;
 
 /// Unique scratch dir for one test; removed on drop (best effort).
 struct Fixture {

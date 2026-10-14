@@ -1,14 +1,15 @@
 //! `arc-rs` — Rust port of Arcanist.
 //!
 //! Tracks T1128. All arc subcommands are implemented; remaining work is
-//! linters, unit engines, and Differential submission depth.
+//! wiring the ported depth (unit engines, diff submit, land checks,
+//! `.arclint`) into the command run paths.
 
 use std::process::ExitCode;
 
 use arc_rs::{
     amend, anoid, bookmarks, branches, close_revision, commit, config, cover, diff, download,
     export, get_config, inspect, install_certificate, land, liberate, lint, linters, list, look,
-    paste, patch, set_config, tasks, todo, unit, upgrade, upload, weld, which, work,
+    markers, paste, patch, set_config, tasks, todo, unit, upgrade, upload, weld, which, work,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -16,7 +17,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const PLANNED: &[&str] = &[];
 
 fn usage() -> String {
-    let mut text = "usage: arc-rs [--version] [--help] <command>\n\ncommands (see <command> --help):\n  amend\n  anoid\n  bookmarks\n  branches\n  call-conduit\n  close-revision\n  commit\n  cover\n  diff\n  download\n  export\n  get-config\n  inspect\n  install-certificate\n  land\n  liberate\n  lint\n  linters\n  list\n  look\n  paste\n  patch\n  set-config\n  tasks\n  todo\n  unit\n  upgrade\n  upload\n  weld\n  which\n  work\n"
+    let mut text = "usage: arc-rs [--version] [--help] <command>\n\ncommands (see <command> --help):\n  amend\n  anoid\n  bookmarks\n  branches\n  call-conduit\n  close-revision\n  commit\n  cover\n  diff\n  download\n  export\n  get-config\n  inspect\n  install-certificate\n  land\n  liberate\n  lint\n  linters\n  list\n  look\n  markers\n  paste\n  patch\n  set-config\n  tasks\n  todo\n  unit\n  upgrade\n  upload\n  weld\n  which\n  work\n"
         .to_string();
     if !PLANNED.is_empty() {
         let planned = PLANNED
@@ -149,6 +150,7 @@ fn main() -> ExitCode {
             (linters::NAME, linters::run),
             (list::NAME, list::run),
             (look::NAME, look::run),
+            (markers::NAME, markers::run),
             (paste::NAME, paste::run),
             (patch::NAME, patch::run),
             (set_config::NAME, set_config::run),

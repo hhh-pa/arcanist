@@ -1,21 +1,9 @@
-// Shared-helper shims: the module under test addresses the library as
-// `arc_rs::...` (via its crate alias), which resolves to these includes
-// in test builds and to the real library once the module is wired in.
-#[allow(dead_code)]
-#[path = "../src/conduit.rs"]
-mod conduit;
-#[allow(dead_code)]
-#[path = "../src/config.rs"]
-mod config;
-#[allow(dead_code)]
-#[path = "../src/git.rs"]
-mod git;
-
-#[path = "../src/upgrade.rs"]
-mod upgrade;
+//! `upgrade` behavior through the wired library.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+use arc_rs::upgrade;
 
 struct TempDir {
     path: PathBuf,

@@ -15,24 +15,25 @@ CLI behavior, ported workflow by workflow with `arc` as the reference.
 | `close-revision` | basic (close via differential.close; --finalize/--quiet/--json/--force) |
 | `commit` | basic (git commit from -m/--revision; --show; no push/SVN) |
 | `cover` | basic (changed-line blame by author; --rev/paths; git only) |
-| `diff` | basic (local stat+patch/`--json` vs base; no Differential submit) |
+| `diff` | basic (local stat+patch/`--json` vs base; message/range parsing + submit payloads ported, submit not yet wired) |
 | `download` | basic (F123 download; --as/--as -; size-verified) |
 | `export` | basic (--git/--unified local or revision export) |
 | `get-config` | basic (precedence read; --show-source; 15 builtins) |
 | `inspect` | basic (working-copy tree + --explore; no browse) |
 | `install-certificate` | basic (token install; --token/--force; no legacy exchange) |
-| `land` | basic (squash onto local branch; `--preview`/`--push`; no Differential checks) |
+| `land` | basic (squash onto local branch; `--preview`/`--push`; Differential pre-land checks ported, not yet wired) |
 | `liberate` | basic (create/rebuild libphutil libs; needs php) |
-| `lint` | full registry (34 linters; GEN/NOLINT stop-all; changed-files or PATHS; `--json`) |
+| `lint` | full registry (34 linters; GEN/NOLINT stop-all; changed-files or PATHS; `--json`; `.arclint` selection ported, not yet wired) |
 | `linters` | full registry (34 names + one line; --verbose/--search/exact; no engine config) |
 | `list` | basic (open revs, \* = current WC; --json) |
 | `look` | basic (Arcventure clearing/remotes/published; UTC flavor) |
+| `markers` | basic (branch/bookmark grid; --type/--json; no Differential status) |
 | `paste` | basic (read/create pastes; --title/--lang/--input) |
 | `patch` | basic (apply revision/diff/patch; --preview/--force; no arcbundle) |
 | `set-config` | basic (user/--local write; typed coercion; empty deletes) |
 | `tasks` | basic (Maniphest table/--json; --owner/--status/--order/--limit) |
 | `todo` | basic (quick task create; --cc/--project/--json; no --browse) |
-| `unit` | basic (cargo engine only: exit-status pass/fail, `--json`, no per-test parsing) |
+| `unit` | basic (cargo engine live; phpunit/pytest/nose/xunit/phutil/csharp + config-driven engines ported, selection not yet wired) |
 | `upgrade` | report-only (version/status + manual steps; --check/--json) |
 | `upload` | basic (chunked upload + fallback; --temporary/--json) |
 | `weld` | full (fuse files; +--seed deterministic mode) |

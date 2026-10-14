@@ -1,19 +1,11 @@
-#[path = "../src/git.rs"]
-mod git;
-
-#[path = "../src/conduit.rs"]
-mod conduit;
-
-#[path = "../src/config.rs"]
-mod config;
-
-#[path = "../src/amend.rs"]
-mod amend;
+//! `amend` behavior through the wired library.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+
+use arc_rs::amend;
 
 /// Unique scratch dir for one test; removed on drop (best effort).
 struct Fixture {
@@ -130,62 +122,13 @@ fn serve_once(canned: String) -> (String, std::sync::mpsc::Receiver<(String, Str
     (base, rx)
 }
 
-static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+mod common;
 
-/// Point `~/.arcrc` discovery at a fresh temp home dir while the
-/// returned guard (and the process-wide env lock) is held; restores the
-/// previous values and removes the dir on drop.
-struct HomeOverride {
-    home: PathBuf,
-    prev_profile: Option<std::ffi::OsString>,
-    prev_home: Option<std::ffi::OsString>,
-    _guard: std::sync::MutexGuard<'static, ()>,
-}
-
-impl HomeOverride {
-    fn install(home: PathBuf) -> Self {
-        let guard = ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
-        let prev_profile = std::env::var_os("USERPROFILE");
-        let prev_home = std::env::var_os("HOME");
-        // SAFETY: the process-wide lock serializes every env mutation and
-        // read in this test binary, so no other thread can observe a
-        // half-updated environment.
-        unsafe {
-            std::env::set_var("USERPROFILE", &home);
-            std::env::set_var("HOME", &home);
-        }
-        Self {
-            home,
-            prev_profile,
-            prev_home,
-            _guard: guard,
-        }
-    }
-}
-
-impl Drop for HomeOverride {
-    fn drop(&mut self) {
-        // SAFETY: still holding the process-wide env lock.
-        unsafe {
-            match &self.prev_profile {
-                Some(value) => std::env::set_var("USERPROFILE", value),
-                None => std::env::remove_var("USERPROFILE"),
-            }
-            match &self.prev_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-        std::fs::remove_dir_all(&self.home).ok();
-    }
-}
+use common::{HomeGuard, with_owned_home};
 
 /// Write an `.arcrc` for `base` (a `serve_once` URI) under a fresh home
 /// dir, and install the home override. Returns the override guard.
-fn arcrc_for(base: &str, name: &str) -> HomeOverride {
+fn arcrc_for(base: &str, name: &str) -> HomeGuard {
     let dir = std::env::temp_dir().join(format!(
         "arc-rs-vcs1-amend-home-{name}-{}-{}",
         std::process::id(),
@@ -203,7 +146,7 @@ fn arcrc_for(base: &str, name: &str) -> HomeOverride {
         },
     });
     std::fs::write(dir.join(".arcrc"), serde_json::to_string(&doc).unwrap()).unwrap();
-    HomeOverride::install(dir)
+    with_owned_home(dir)
 }
 
 #[test]

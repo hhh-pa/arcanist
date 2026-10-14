@@ -1,9 +1,8 @@
-#[path = "../src/unit.rs"]
-mod unit;
+//! Cargo engine behavior through the wired library.
 
 use std::path::{Path, PathBuf};
 
-use unit::{Options, find_crate_root_from};
+use arc_rs::unit::{self, Options, find_crate_root_from};
 
 /// Copy the `sample` fixture crate to a unique temp dir and return its root.
 /// Each test gets its own copy so parallel runs never share cargo state.

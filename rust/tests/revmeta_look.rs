@@ -1,13 +1,10 @@
-// Integration tests for `arc-rs look`. Git fixtures are local temp repos
-// only. Including the command source also compiles its sibling unit tests.
-
-#[path = "../src/git.rs"]
-mod git;
-#[path = "../src/look.rs"]
-mod look;
+//! Integration tests for `arc-rs look` through the wired library.
+//! Git fixtures are local temp repos only.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+
+use arc_rs::{git, look};
 
 /// 2026-01-01T12:00:00Z (midday UTC).
 const NOON: u64 = 1_767_268_800;

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<status>
+<target path=".">
+<entry path="ext">
+<wc-status props="none" item="external" revision="42">
+</wc-status>
+</entry>
+<entry path="ext/inner.txt">
+<wc-status props="none" item="modified" revision="9">
+</wc-status>
+</entry>
+<entry path="top.txt">
+<wc-status props="none" item="modified" revision="42">
+</wc-status>
+</entry>
+</target>
+</status>

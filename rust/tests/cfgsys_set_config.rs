@@ -1,21 +1,9 @@
-// Shared-helper shims: the module under test addresses the library as
-// `arc_rs::...` (via its crate alias), which resolves to these includes
-// in test builds and to the real library once the module is wired in.
-#[allow(dead_code)]
-#[path = "../src/conduit.rs"]
-mod conduit;
-#[allow(dead_code)]
-#[path = "../src/config.rs"]
-mod config;
-#[allow(dead_code)]
-#[path = "../src/git.rs"]
-mod git;
-
-#[path = "../src/set_config.rs"]
-mod set_config;
+//! `set-config` behavior through the wired library.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+use arc_rs::set_config;
 
 struct TempDir {
     path: PathBuf,
@@ -44,39 +32,9 @@ impl Drop for TempDir {
     }
 }
 
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+mod common;
 
-struct HomeGuard {
-    saved_home: Option<std::ffi::OsString>,
-    saved_profile: Option<std::ffi::OsString>,
-}
-
-fn with_temp_home(dir: &Path) -> HomeGuard {
-    let guard = HomeGuard {
-        saved_home: std::env::var_os("HOME"),
-        saved_profile: std::env::var_os("USERPROFILE"),
-    };
-    unsafe {
-        std::env::set_var("HOME", dir);
-        std::env::set_var("USERPROFILE", dir);
-    }
-    guard
-}
-
-impl Drop for HomeGuard {
-    fn drop(&mut self) {
-        unsafe {
-            match &self.saved_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-            match &self.saved_profile {
-                Some(value) => std::env::set_var("USERPROFILE", value),
-                None => std::env::remove_var("USERPROFILE"),
-            }
-        }
-    }
-}
+use common::with_temp_home;
 
 fn run_git(dir: &Path, args: &[&str]) {
     let output = std::process::Command::new("git")
@@ -111,7 +69,6 @@ fn run_help_and_bad_args() {
 
 #[test]
 fn run_writes_user_config_under_temp_home() {
-    let _lock = ENV_LOCK.lock().unwrap();
     let tmp = TempDir::new("run");
     let _home = with_temp_home(tmp.path());
     assert_eq!(

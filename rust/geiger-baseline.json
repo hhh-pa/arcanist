@@ -1,4 +1,4 @@
 {
-  "_comment": "cargo-geiger baseline (T1128): total unsafe items/expressions summed over workspace crates (used + unused). CI fails when the total grows; lower it when unsafe is removed.",
-  "unsafe_total": 0
+  "_comment": "cargo-geiger baseline (T1128): total unsafe items/expressions summed over workspace crates (used + unused). CI fails when the total grows; lower it when unsafe is removed. Current 12 are all in tests/common/mod.rs (process-serialized HOME overrides for config tests); shipped code has zero unsafe.",
+  "unsafe_total": 12
 }

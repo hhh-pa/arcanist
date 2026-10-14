@@ -1,8 +1,9 @@
-#[path = "../src/weld.rs"]
-mod weld;
+//! `weld` behavior through the wired library.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+use arc_rs::weld;
 
 /// Unique scratch dir for one test; removed on drop (best effort).
 struct Fixture {

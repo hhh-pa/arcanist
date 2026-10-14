@@ -1,0 +1,4 @@
+file.txt
+src/
+src/main.rs
+docs/

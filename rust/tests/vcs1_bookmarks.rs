@@ -1,11 +1,9 @@
-#[path = "../src/git.rs"]
-mod git;
-
-#[path = "../src/bookmarks.rs"]
-mod bookmarks;
+//! `bookmarks` behavior through the wired library.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+
+use arc_rs::bookmarks;
 
 /// Unique scratch dir for one test; removed on drop (best effort).
 struct Fixture {

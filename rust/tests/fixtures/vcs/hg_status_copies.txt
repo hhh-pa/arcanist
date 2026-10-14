@@ -1,0 +1,6 @@
+A copied.txt
+  original.txt
+M renamed.txt
+  oldname.txt
+C clean.txt
+I ignored.txt

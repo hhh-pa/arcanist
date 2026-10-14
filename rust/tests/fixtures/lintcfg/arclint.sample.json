@@ -1,0 +1,20 @@
+{
+  "exclude": "externals/",
+  "linters": {
+    "text": {
+      "type": "text"
+    },
+    "spelling-strict": {
+      "type": "spelling",
+      "severity": {
+        "SPELL1": "error"
+      }
+    },
+    "json-files": {
+      "type": "json",
+      "include": [
+        "(\\.json$)"
+      ]
+    }
+  }
+}

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="nose" tests="4" failures="1" errors="1" skip="1">
+  <testcase classname="pkg.test_mod" name="test_ok" time="0.125"/>
+  <testcase classname="pkg.test_mod" name="test_skipped" time="0.0"><skipped>not today</skipped></testcase>
+  <testcase classname="pkg.test_mod" name="test_broken" time="0.5"><failure>assert 1 == 2</failure></testcase>
+  <testcase classname="pkg.test_mod" name="test_crashed" time="1.0"><error>ImportError: nope</error></testcase>
+</testsuite>

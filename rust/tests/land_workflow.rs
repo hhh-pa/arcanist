@@ -1,8 +1,9 @@
-#[path = "../src/land.rs"]
-mod land;
+//! `land` against local git fixtures through the wired library.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+
+use arc_rs::land;
 
 /// Unique scratch dir for one test; removed on drop (best effort).
 struct Fixture {

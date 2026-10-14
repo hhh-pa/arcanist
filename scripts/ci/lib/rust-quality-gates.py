@@ -63,7 +63,8 @@ LIB_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def machine_arch():
     m = platform.machine()
-    if m == "x86_64":
+    # Arcanist import: Windows reports AMD64 for x86_64.
+    if m in ("x86_64", "AMD64"):
         return "x86_64"
     if m in ("aarch64", "arm64"):
         return "aarch64"

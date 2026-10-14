@@ -1,24 +1,11 @@
-// Shared helpers, included so `crate::` paths in the ported modules resolve
-// both here and once the parent wires them into lib.rs.
-#[path = "../src/conduit.rs"]
-mod conduit;
-#[path = "../src/config.rs"]
-mod config;
-#[path = "../src/download.rs"]
-mod download;
-#[path = "../src/git.rs"]
-mod git;
-#[path = "../src/liberate.rs"]
-mod liberate;
-#[path = "../src/paste.rs"]
-mod paste;
-#[path = "../src/upload.rs"]
-mod upload;
+//! `download`/`liberate`/`paste`/`upload` flows through the wired library.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+use arc_rs::{conduit, download, liberate, paste, upload};
 
 /// Unique scratch dir for one test; removed on drop (best effort).
 struct Fixture {

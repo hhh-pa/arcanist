@@ -1,0 +1,5 @@
+M modified.txt
+A added.txt
+R removed.txt
+! missing.txt
+? untracked.txt

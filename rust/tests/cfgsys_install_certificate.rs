@@ -1,22 +1,10 @@
-// Shared-helper shims: the module under test addresses the library as
-// `arc_rs::...` (via its crate alias), which resolves to these includes
-// in test builds and to the real library once the module is wired in.
-#[allow(dead_code)]
-#[path = "../src/conduit.rs"]
-mod conduit;
-#[allow(dead_code)]
-#[path = "../src/config.rs"]
-mod config;
-#[allow(dead_code)]
-#[path = "../src/git.rs"]
-mod git;
-
-#[path = "../src/install_certificate.rs"]
-mod install_certificate;
+//! `install-certificate` behavior through the wired library.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+use arc_rs::{config, install_certificate};
 
 const CLI_TOKEN: &str = "cli-0123456789abcdef0123456789ab";
 const API_TOKEN: &str = "api-0123456789abcdef0123456789ab";
@@ -48,39 +36,9 @@ impl Drop for TempDir {
     }
 }
 
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+mod common;
 
-struct HomeGuard {
-    saved_home: Option<std::ffi::OsString>,
-    saved_profile: Option<std::ffi::OsString>,
-}
-
-fn with_temp_home(dir: &Path) -> HomeGuard {
-    let guard = HomeGuard {
-        saved_home: std::env::var_os("HOME"),
-        saved_profile: std::env::var_os("USERPROFILE"),
-    };
-    unsafe {
-        std::env::set_var("HOME", dir);
-        std::env::set_var("USERPROFILE", dir);
-    }
-    guard
-}
-
-impl Drop for HomeGuard {
-    fn drop(&mut self) {
-        unsafe {
-            match &self.saved_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-            match &self.saved_profile {
-                Some(value) => std::env::set_var("USERPROFILE", value),
-                None => std::env::remove_var("USERPROFILE"),
-            }
-        }
-    }
-}
+use common::with_temp_home;
 
 /// Serve a script of canned Conduit responses on 127.0.0.1, one per
 /// connection, returning the base URI and the observed request lines.
@@ -162,7 +120,6 @@ fn run_help_and_arg_errors_need_no_network() {
 
 #[test]
 fn bad_token_fails_before_network() {
-    let _lock = ENV_LOCK.lock().unwrap();
     let tmp = TempDir::new("badtoken");
     let _home = with_temp_home(tmp.path());
     // Unroutable URI: success would require network, so FAILURE here
@@ -188,7 +145,6 @@ fn bad_token_fails_before_network() {
 
 #[test]
 fn full_install_pings_verifies_and_writes_arcrc() {
-    let _lock = ENV_LOCK.lock().unwrap();
     let tmp = TempDir::new("install");
     let _home = with_temp_home(tmp.path());
     let (base, rx) = serve_script(vec![
@@ -234,7 +190,6 @@ fn full_install_pings_verifies_and_writes_arcrc() {
 
 #[test]
 fn rejected_token_writes_nothing() {
-    let _lock = ENV_LOCK.lock().unwrap();
     let tmp = TempDir::new("rejected");
     let _home = with_temp_home(tmp.path());
     let (base, rx) = serve_script(vec![
@@ -252,7 +207,6 @@ fn rejected_token_writes_nothing() {
 
 #[test]
 fn dead_server_and_legacy_auth_fail_cleanly() {
-    let _lock = ENV_LOCK.lock().unwrap();
     let tmp = TempDir::new("dead");
     let _home = with_temp_home(tmp.path());
     let (base, rx) = serve_script(vec![

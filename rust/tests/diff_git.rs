@@ -1,8 +1,9 @@
-#[path = "../src/diff.rs"]
-mod diff;
+//! `diff` against local git fixtures through the wired library.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use arc_rs::diff;
 
 /// Unique scratch dir for one test; removed on drop (best effort).
 struct Fixture {

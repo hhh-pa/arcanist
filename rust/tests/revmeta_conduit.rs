@@ -1,25 +1,12 @@
-// Integration tests for the revmeta bundle's conduit commands
-// (close-revision, tasks, todo, list). Conduit is a 127.0.0.1 mock only.
-// Including the command sources here also compiles their sibling unit tests.
-
-#[path = "../src/close_revision.rs"]
-mod close_revision;
-#[path = "../src/conduit.rs"]
-mod conduit;
-#[path = "../src/config.rs"]
-mod config;
-#[path = "../src/git.rs"]
-mod git;
-#[path = "../src/list.rs"]
-mod list;
-#[path = "../src/tasks.rs"]
-mod tasks;
-#[path = "../src/todo.rs"]
-mod todo;
+//! Integration tests for the revmeta bundle's conduit commands
+//! (close-revision, tasks, todo, list) through the wired library.
+//! Conduit is a 127.0.0.1 mock only.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+
+use arc_rs::{close_revision, conduit, config, git, list, tasks, todo};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc;

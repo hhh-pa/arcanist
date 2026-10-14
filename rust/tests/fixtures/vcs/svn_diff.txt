@@ -1,0 +1,7 @@
+Index: modified.txt
+===================================================================
+--- modified.txt	(revision 42)
++++ modified.txt	(working copy)
+@@ -1 +1 @@
+-old
++new

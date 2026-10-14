@@ -43,6 +43,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --locked
 
+  quality-gates:
+    name: quality gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: install nextest
+        run: cargo install cargo-nextest --locked
+      - name: run quality gates
+        run: python3 scripts/ci/lib/rust-quality-gates.py rust rust/target/llvm-cov nextest --run-ignored all --no-fail-fast
+
   build-release:
     name: release (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

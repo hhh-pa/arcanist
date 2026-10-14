@@ -1,0 +1,6 @@
+comparing with https://hg.example.test/repo
+searching for changes
+changeset:   3:cccccccccccccccccccccccccccccccccccccccc
+user:        Test User <t@example.test>
+date:        Thu Oct 14 12:34:56 2026 +0000
+summary:     outgoing work
