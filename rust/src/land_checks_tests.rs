@@ -373,3 +373,61 @@ fn evaluate_gates_runs_in_php_order() {
     let uncounted = evaluate_gates(&clean, "PHID-USER-1", &[], &[], &[], None);
     assert!(uncounted.is_empty());
 }
+
+#[test]
+fn prompt_descriptions_cover_every_land_prompt() {
+    for key in [
+        "arc.land.large-working-set",
+        "arc.land.confirm",
+        "arc.land.implicit",
+        "arc.land.unauthored",
+        "arc.land.changes-planned",
+        "arc.land.published",
+        "arc.land.not-accepted",
+        "arc.land.open-parents",
+        "arc.land.failed-builds",
+        "arc.land.ongoing-builds",
+        "arc.land.create",
+    ] {
+        assert!(
+            prompt_description(key).is_some_and(|text| !text.is_empty()),
+            "missing description for {key}"
+        );
+    }
+    assert_eq!(prompt_description("arc.land.bogus"), None);
+    assert_eq!(
+        prompt_description(PROMPT_CONFIRM),
+        Some("Confirms that the correct changes have been selected to land.")
+    );
+    assert_eq!(
+        prompt_description(PROMPT_LARGE_WORKING_SET),
+        Some("Confirms landing more than 50 commit(s) in a single operation.")
+    );
+}
+
+#[test]
+fn implicit_gate_queries_mapping() {
+    assert!(implicit_gate(0).is_none());
+    let finding = implicit_gate(3).unwrap();
+    assert_eq!(finding.prompt, PROMPT_IMPLICIT);
+    assert_eq!(finding.title, "IMPLICIT COMMITS");
+    assert_eq!(
+        finding.query,
+        "Continue with this mapping between commits and revisions?"
+    );
+    assert_eq!(finding.count, 3);
+}
+
+#[test]
+fn create_gates_use_vcs_wording() {
+    assert!(create_gate_git(0).is_none());
+    assert!(create_gate_hg(0).is_none());
+    let git = create_gate_git(2).unwrap();
+    assert_eq!(git.prompt, PROMPT_CREATE);
+    assert_eq!(git.title, "CREATE 2 BRANCHE(S)");
+    assert_eq!(git.query, "Create 2 new branche(s) in the remote?");
+    let hg = create_gate_hg(1).unwrap();
+    assert_eq!(hg.prompt, PROMPT_CREATE);
+    assert_eq!(hg.title, "CREATE 1 BOOKMARK(S)");
+    assert_eq!(hg.query, "Create 1 new remote bookmark(s)?");
+}
