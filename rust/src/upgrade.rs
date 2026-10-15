@@ -1489,7 +1489,9 @@ fn run_apply_command(cwd: &Path, options: &Options) -> ExitCode {
     }
 }
 
-/// Entry point: `argv` excludes the subcommand name.
+/// Entry point: `argv` excludes the subcommand name. `--apply` is live
+/// (network fetch, then replaces the running executable): keep it out
+/// of integration tests; `upgrade_tests` covers it hermetically.
 pub fn run(argv: &[String]) -> ExitCode {
     let options = match parse_args(argv) {
         Parsed::Help => {
