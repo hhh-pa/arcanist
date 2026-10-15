@@ -713,3 +713,88 @@ fn gap2_saved_template_resume_roundtrip() {
     assert!(text.contains("You have a saved revision message"), "{text}");
     assert!(text.contains(diff_local::PROMPT_USE_SAVED_MESSAGE), "{text}");
 }
+
+/* Gap2 D3: clean working-copy check over seams. */
+
+#[test]
+fn gap2_clean_check_commits_unstaged() {
+    use std::io::Cursor;
+    let added = std::cell::RefCell::new(Vec::<String>::new());
+    let add = |paths: &[String]| -> Result<(), String> {
+        added.borrow_mut().extend(paths.iter().cloned());
+        Ok(())
+    };
+    let committed = std::cell::RefCell::new(Vec::<String>::new());
+    let commit = |message: &str| -> Result<(), String> {
+        committed.borrow_mut().push(message.to_string());
+        Ok(())
+    };
+    let edit = |_: &str| -> Result<String, String> { Ok("Msg\n".to_string()) };
+    let vcs = diff_local::CleanCheckVcs {
+        kind: diff::VcsKind::Git,
+        work_path: "/repo".to_string(),
+        supports_local_commits: true,
+        can_stash: true,
+        autostash: false,
+        require_clean_untracked: true,
+        should_amend: false,
+        head_commit_message: None,
+        add_to_commit: Some(&add),
+        stash_changes: None,
+        do_commit: Some(&commit),
+        amend_commit: None,
+        edit: &edit,
+    };
+    let mut changes = diff_local::WorkingCopyChanges::default();
+    changes.unstaged = vec!["s.txt".to_string()];
+
+    let mut out = Vec::new();
+    let outcome = diff_local::require_clean_working_copy(
+        &mut Cursor::new(b"y\n".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        diff_local::CommitMode::Allow,
+    )
+    .unwrap();
+    assert!(!outcome.stashed);
+    assert_eq!(added.borrow().as_slice(), ["s.txt".to_string()]);
+    assert_eq!(committed.borrow().as_slice(), ["Msg\n".to_string()]);
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains(diff_local::UNCOMMITTED_CHANGES_HERE), "{text}");
+}
+
+#[test]
+fn gap2_clean_check_fatal_conflicts() {
+    use std::io::Cursor;
+    let edit = |_: &str| -> Result<String, String> { Ok(String::new()) };
+    let vcs = diff_local::CleanCheckVcs {
+        kind: diff::VcsKind::Git,
+        work_path: "/repo".to_string(),
+        supports_local_commits: true,
+        can_stash: true,
+        autostash: false,
+        require_clean_untracked: true,
+        should_amend: false,
+        head_commit_message: None,
+        add_to_commit: None,
+        stash_changes: None,
+        do_commit: None,
+        amend_commit: None,
+        edit: &edit,
+    };
+    let mut changes = diff_local::WorkingCopyChanges::default();
+    changes.conflicts = vec!["c.txt".to_string()];
+
+    let mut out = Vec::new();
+    let err = diff_local::require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        diff_local::CommitMode::Allow,
+    )
+    .unwrap_err();
+    assert!(err.contains("Conflicts in working copy:"), "{err}");
+    assert!(err.contains("    c.txt"), "{err}");
+}

@@ -52,6 +52,8 @@ pub const METHOD_QUERY_DIFFS: &str = "differential.querydiffs";
 /// `differential.parsecommitmessage`
 /// (`ArcanistDifferentialCommitMessage.php:53`).
 pub const METHOD_PARSE_COMMIT_MESSAGE: &str = "differential.parsecommitmessage";
+/// `diffusion.querycommits` (`ArcanistWorkflow.php:1313`).
+pub const METHOD_QUERY_COMMITS: &str = "diffusion.querycommits";
 
 /// Diff property holding unresolved lint messages
 /// (`ArcanistDiffWorkflow.php:2300`).
@@ -476,6 +478,13 @@ pub fn differential_query_params(ids: &[i64]) -> serde_json::Value {
 #[must_use]
 pub fn user_query_params(phids: &[&str]) -> serde_json::Value {
     serde_json::json!({"phids": phids})
+}
+
+/// Build the `diffusion.querycommits` params: `names`
+/// (`ArcanistWorkflow.php:1311-1314`).
+#[must_use]
+pub fn diffusion_query_commits_params(names: &[&str]) -> serde_json::Value {
+    serde_json::json!({"names": names})
 }
 
 /// Build the `differential.revision.search` params: `constraints` + `ids`

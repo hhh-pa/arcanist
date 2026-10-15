@@ -5433,6 +5433,690 @@ pub fn resolve_message_source(
     }
 }
 
+/* -(  Clean working-copy check (D3)  )--------------------------------------- */
+
+/// Commit-mode state machine (`COMMIT_DISABLE/ENABLE/ALLOW`,
+/// `src/workflow/ArcanistWorkflow.php`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitMode {
+    /// `--uncommitted`: never offer to commit.
+    Disable,
+    /// `--add-all`: always commit without asking.
+    Enable,
+    /// Neither flag: prompt.
+    Allow,
+}
+
+/// Commit-mode selection (`runDiffSetupBasics()`,
+/// `src/workflow/ArcanistDiffWorkflow.php:608-614`).
+#[must_use]
+pub fn resolve_commit_mode(add_all: bool, uncommitted: bool) -> CommitMode {
+    if add_all {
+        CommitMode::Enable
+    } else if uncommitted {
+        CommitMode::Disable
+    } else {
+        CommitMode::Allow
+    }
+}
+
+/// Working-copy change lists: mask-filtered status
+/// (`getUncommittedStatus()` plus the `get*Changes()` getters,
+/// `src/repository/api/ArcanistRepositoryAPI.php:380-440`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkingCopyChanges {
+    /// `FLAG_INCOMPLETE` paths (svn only).
+    pub incomplete: Vec<String>,
+    /// `FLAG_CONFLICT` paths.
+    pub conflicts: Vec<String>,
+    /// `FLAG_MISSING` paths.
+    pub missing: Vec<String>,
+    /// `FLAG_EXTERNALS` paths.
+    pub externals: Vec<String>,
+    /// `FLAG_UNCOMMITTED` paths.
+    pub uncommitted: Vec<String>,
+    /// `FLAG_UNSTAGED` paths.
+    pub unstaged: Vec<String>,
+    /// `FLAG_UNTRACKED` paths.
+    pub untracked: Vec<String>,
+}
+
+/// Mask-filter one status map into change lists.
+///
+/// PHP `ksort()`s the status first; `BTreeMap` iteration is already
+/// sorted. Masks arrive as
+/// `[incomplete, conflict, missing, externals, uncommitted, unstaged, untracked]`.
+fn changes_from_status(status: &BTreeMap<String, u32>, masks: [u32; 7]) -> WorkingCopyChanges {
+    let mut out = WorkingCopyChanges::default();
+    for (path, mask) in status {
+        if mask & masks[0] != 0 {
+            out.incomplete.push(path.clone());
+        }
+        if mask & masks[1] != 0 {
+            out.conflicts.push(path.clone());
+        }
+        if mask & masks[2] != 0 {
+            out.missing.push(path.clone());
+        }
+        if mask & masks[3] != 0 {
+            out.externals.push(path.clone());
+        }
+        if mask & masks[4] != 0 {
+            out.uncommitted.push(path.clone());
+        }
+        if mask & masks[5] != 0 {
+            out.unstaged.push(path.clone());
+        }
+        if mask & masks[6] != 0 {
+            out.untracked.push(path.clone());
+        }
+    }
+    out
+}
+
+/// Git change lists from `git::uncommitted_status()`.
+#[must_use]
+pub fn git_working_copy_changes(status: &BTreeMap<String, u32>) -> WorkingCopyChanges {
+    changes_from_status(
+        status,
+        [
+            git::FLAG_INCOMPLETE,
+            git::FLAG_CONFLICT,
+            git::FLAG_MISSING,
+            git::FLAG_EXTERNALS,
+            git::FLAG_UNCOMMITTED,
+            git::FLAG_UNSTAGED,
+            git::FLAG_UNTRACKED,
+        ],
+    )
+}
+
+/// Mercurial change lists from `hg::get_uncommitted_status_with()`.
+#[must_use]
+pub fn hg_working_copy_changes(status: &BTreeMap<String, u32>) -> WorkingCopyChanges {
+    changes_from_status(
+        status,
+        [
+            hg::FLAG_INCOMPLETE,
+            hg::FLAG_CONFLICT,
+            hg::FLAG_MISSING,
+            hg::FLAG_EXTERNALS,
+            hg::FLAG_UNCOMMITTED,
+            hg::FLAG_UNSTAGED,
+            hg::FLAG_UNTRACKED,
+        ],
+    )
+}
+
+/// Subversion change lists from `svn::get_svn_status_with()`.
+#[must_use]
+pub fn svn_working_copy_changes(status: &BTreeMap<String, u32>) -> WorkingCopyChanges {
+    changes_from_status(
+        status,
+        [
+            svn::FLAG_INCOMPLETE,
+            svn::FLAG_CONFLICT,
+            svn::FLAG_MISSING,
+            svn::FLAG_EXTERNALS,
+            svn::FLAG_UNCOMMITTED,
+            svn::FLAG_UNSTAGED,
+            svn::FLAG_UNTRACKED,
+        ],
+    )
+}
+
+/// `Working copy:` description line (`:1025-1029`).
+///
+/// PHP wraps the path in `__...__` console markup (underline when
+/// colorized, stripped otherwise); the port never colorizes, so the
+/// plain shape renders.
+#[must_use]
+pub fn working_copy_desc(work_path: &str) -> String {
+    format!("  Working copy: {work_path}\n\n")
+}
+
+/// Incomplete-checkout error (`:1032-1048`).
+///
+/// The stray apostrophe in `proceeding.'` is upstream verbatim.
+#[must_use]
+pub fn incomplete_checkout_error(desc: &str, incomplete: &[String]) -> String {
+    format!(
+        "{}\n\n{}  {}\n    {}\n\n{}",
+        "You have incompletely checked out directories in this working copy. Fix them before \
+         proceeding.'",
+        desc,
+        "Incomplete directories in working copy:",
+        incomplete.join("\n    "),
+        "You can fix these paths by running 'svn update' on them."
+    )
+}
+
+/// Merge-conflict error (`:1050-1062`).
+#[must_use]
+pub fn merge_conflicts_error(desc: &str, conflicts: &[String]) -> String {
+    format!(
+        "{}\n\n{}  {}\n    {}",
+        "You have merge conflicts in this working copy. Resolve merge conflicts before proceeding.",
+        desc,
+        "Conflicts in working copy:",
+        conflicts.join("\n    ")
+    )
+}
+
+/// Missing-files error (`:1064-1078`): note the trailing newline.
+#[must_use]
+pub fn missing_files_error(desc: &str, missing: &[String]) -> String {
+    format!(
+        "{}\n\n{}  {}\n    {}\n",
+        "You have missing files in this working copy. Revert or formally remove them (with `svn \
+         rm`) before proceeding.",
+        desc,
+        "Missing files in working copy:",
+        missing.join("\n    ")
+    )
+}
+
+/// Thousands-grouped count (`PhutilNumber` via `formatNumber()`,
+/// `src/internationalization/PhutilTranslator.php:249-256`).
+#[must_use]
+pub fn format_count(count: usize) -> String {
+    let digits = count.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, byte) in digits.bytes().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(byte as char);
+    }
+    out
+}
+
+/// Dirty-externals notice block (`:1088-1103`): paragraph plus one
+/// 6-space-indented item per path (`PhutilConsoleBlock`/`PhutilConsoleList`).
+#[must_use]
+pub fn dirty_externals_block(externals: &[String]) -> String {
+    let mut out = format!(
+        "{} submodule(s) have uncommitted or untracked changes:\n\n",
+        format_count(externals.len())
+    );
+    for external in externals {
+        out.push_str(&format!("      {external}\n"));
+    }
+    out
+}
+
+/// Prompt to ignore dirty externals (`:1090-1094`, default yes).
+#[must_use]
+pub fn ignore_externals_prompt(count: usize) -> String {
+    format!(
+        "Ignore the changes to these {} submodule(s) and continue?",
+        format_count(count)
+    )
+}
+
+/// Untracked-files lead (`:1123-1126`).
+pub const UNTRACKED_FILES_HERE: &str = "You have untracked files in this working copy.";
+/// Untracked-files list header (`:1149`).
+pub const UNTRACKED_CHANGES_IN: &str = "Untracked changes in working copy:";
+/// Unstaged-files list header (`:1177`).
+pub const UNSTAGED_CHANGES_IN: &str = "Unstaged changes in working copy:";
+/// Uncommitted-files list header (`:1185`).
+pub const UNCOMMITTED_CHANGES_IN: &str = "Uncommitted changes in working copy:";
+/// Uncommitted-changes lead (`:1168-1170`).
+pub const UNCOMMITTED_CHANGES_HERE: &str = "You have uncommitted changes in this working copy.";
+
+/// Ignore hint naming the per-VCS ignore file (`:1129-1143`).
+#[must_use]
+pub fn untracked_hint(kind: diff::VcsKind, count: usize) -> String {
+    let file = match kind {
+        diff::VcsKind::Git => ".git/info/exclude",
+        diff::VcsKind::Svn => "svn:ignore",
+        diff::VcsKind::Hg => ".hgignore",
+    };
+    format!(
+        "(To ignore these {} change(s), add them to \"{file}\".)",
+        format_count(count)
+    )
+}
+
+/// Untracked-files list echo (`:1147-1151`).
+#[must_use]
+pub fn untracked_list_echo(hint: &str, untracked: &[String]) -> String {
+    format!(
+        "  {}\n  {}\n    {}",
+        UNTRACKED_CHANGES_IN,
+        hint,
+        untracked.join("\n    ")
+    )
+}
+
+/// Prompt to ignore untracked files (`:1153-1157`, default no).
+#[must_use]
+pub fn ignore_untracked_prompt(count: usize) -> String {
+    format!(
+        "Ignore these {} untracked file(s) and continue?",
+        format_count(count)
+    )
+}
+
+/// Unstaged list echo: the header carries two leading spaces (`:1175-1180`).
+#[must_use]
+pub fn unstaged_list_echo(unstaged: &[String]) -> String {
+    format!(
+        "  {}\n    {}",
+        UNSTAGED_CHANGES_IN,
+        unstaged.join("\n    ")
+    )
+}
+
+/// Uncommitted list echo: no header indent (`:1183-1188`).
+#[must_use]
+pub fn uncommitted_list_echo(uncommitted: &[String]) -> String {
+    format!(
+        "{}\n    {}",
+        UNCOMMITTED_CHANGES_IN,
+        uncommitted.join("\n    ")
+    )
+}
+
+/// Prompt to amend the current commit (`:1350-1354`, default no).
+#[must_use]
+pub fn amend_changes_prompt(count: usize) -> String {
+    format!(
+        "Do you want to amend these {} change(s) to the current commit?",
+        format_count(count)
+    )
+}
+
+/// Prompt to create a new commit (`:1355-1359`, default no).
+#[must_use]
+pub fn create_commit_prompt(count: usize) -> String {
+    format!(
+        "Do you want to create a new commit with these {} change(s)?",
+        format_count(count)
+    )
+}
+
+/// Refusal to continue with uncommitted changes (`:1209-1213`).
+pub const CANNOT_CONTINUE_UNCOMMITTED: &str =
+    "You can not continue with uncommitted changes. Commit or discard them before proceeding.";
+/// Autostash notice (`:1202-1205`).
+pub const STASHING_UNCOMMITTED: &str =
+    "Stashing uncommitted changes. (You can restore them with `git stash pop`).";
+/// Empty commit-template error (`:1246-1249`).
+pub const MUST_PROVIDE_MESSAGE: &str = "You must provide a commit message.";
+/// Empty commit-message error (`:1255-1258`, dead in PHP: comment removal
+/// always leaves the trailing newline, so the length is never zero).
+pub const MUST_PROVIDE_NONEMPTY_MESSAGE: &str = "You must provide a nonempty commit message.";
+/// Commit-template editor name (`:1236`).
+pub const NAME_COMMIT_MESSAGE: &str = "commit-message";
+/// Commit-template editor task (`:1237-1240`).
+pub const TASK_SUPPLY_COMMIT_MESSAGE: &str =
+    "Supply commit message for uncommitted changes, then save and exit.";
+
+/// Commit-message editor template (`:1224-1233`): sorted unique paths.
+#[must_use]
+pub fn commit_editor_template(paths: &[String]) -> String {
+    let mut sorted: Vec<&str> = paths.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut out = "\n\n# Enter a commit message.\n#\n# Changes:\n#\n".to_string();
+    for path in sorted {
+        out.push_str(&format!("#     {path}\n"));
+    }
+    out
+}
+
+/// Commit-mode prompt decision (`askForAdd()`, `:1330-1344`).
+pub fn ask_for_add<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    mode: CommitMode,
+    should_amend: bool,
+    files: &[String],
+) -> Result<bool, String> {
+    match mode {
+        CommitMode::Disable => Ok(false),
+        CommitMode::Enable => Ok(true),
+        CommitMode::Allow => {
+            let prompt = if should_amend {
+                amend_changes_prompt(files.len())
+            } else {
+                create_commit_prompt(files.len())
+            };
+            Ok(diff::prompt_confirm_from(reader, writer, &prompt, true)?)
+        }
+    }
+}
+
+/// VCS hooks for the clean check.
+pub struct CleanCheckVcs<'a> {
+    /// Working-copy kind (svn zeroes the externals list, `:1083-1086`).
+    pub kind: diff::VcsKind,
+    /// `getPath()` for the `Working copy:` description.
+    pub work_path: String,
+    /// `supportsLocalCommits()`.
+    pub supports_local_commits: bool,
+    /// `canStashChanges()`.
+    pub can_stash: bool,
+    /// `arc.autostash` configuration.
+    pub autostash: bool,
+    /// `shouldRequireCleanUntrackedFiles()` (false under
+    /// `--allow-untracked`).
+    pub require_clean_untracked: bool,
+    /// Precomputed `getShouldAmend()`.
+    pub should_amend: bool,
+    /// Head local-commit message, when amending may apply.
+    pub head_commit_message: Option<String>,
+    /// `addToCommit()`.
+    pub add_to_commit: Option<&'a dyn Fn(&[String]) -> Result<(), String>>,
+    /// `stashChanges()`.
+    pub stash_changes: Option<&'a dyn Fn() -> Result<(), String>>,
+    /// `doCommit()`.
+    pub do_commit: Option<&'a dyn Fn(&str) -> Result<(), String>>,
+    /// `amendCommit()`.
+    pub amend_commit: Option<&'a dyn Fn(&str) -> Result<(), String>>,
+    /// Commit-message editor: template text to edited text.
+    pub edit: &'a dyn Fn(&str) -> Result<String, String>,
+}
+
+/// Clean-check outcome: whether the flow stashed (`$this->stashed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CleanCheckOutcome {
+    /// True after autostashing.
+    pub stashed: bool,
+}
+
+/// Order-preserving difference (`array_diff()`, `:1113-1115`).
+fn without_paths(paths: &[String], remove: &[Vec<String>]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|path| !remove.iter().any(|list| list.contains(path)))
+        .cloned()
+        .collect()
+}
+
+/// Dirty-externals gate (`:1080-1107`).
+fn check_dirty_externals<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    kind: diff::VcsKind,
+    externals: &[String],
+) -> Result<(), String> {
+    let mut externals = externals.to_vec();
+    if kind == diff::VcsKind::Svn {
+        externals.clear();
+    }
+    if externals.is_empty() {
+        return Ok(());
+    }
+    let block = dirty_externals_block(&externals);
+    writer
+        .write_all(block.as_bytes())
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    if !diff::prompt_confirm_from(reader, writer, &ignore_externals_prompt(externals.len()), false)?
+    {
+        return Err(USER_ABORT.to_string());
+    }
+    Ok(())
+}
+
+/// Untracked-files gate (`:1117-1159`).
+fn check_untracked_files<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    vcs: &CleanCheckVcs<'_>,
+    desc: &str,
+    untracked: &[String],
+) -> Result<(), String> {
+    if untracked.is_empty() || !vcs.require_clean_untracked {
+        return Ok(());
+    }
+    let echo = format!("{UNTRACKED_FILES_HERE}\n\n{desc}");
+    writer
+        .write_all(echo.as_bytes())
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    let hint = untracked_hint(vcs.kind, untracked.len());
+    let list = untracked_list_echo(&hint, untracked);
+    writer
+        .write_all(list.as_bytes())
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    if !diff::prompt_confirm_from(
+        reader,
+        writer,
+        &ignore_untracked_prompt(untracked.len()),
+        true,
+    )? {
+        return Err(USER_ABORT.to_string());
+    }
+    Ok(())
+}
+
+/// Uncommitted-changes gate (`:1162-1215`).
+///
+/// Returns whether the flow should commit.
+fn check_uncommitted_changes<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    vcs: &CleanCheckVcs<'_>,
+    desc: &str,
+    unstaged: &[String],
+    uncommitted: &[String],
+    mode: CommitMode,
+) -> Result<bool, String> {
+    if unstaged.is_empty() && uncommitted.is_empty() {
+        return Ok(false);
+    }
+    let echo = format!("{UNCOMMITTED_CHANGES_HERE}\n\n{desc}");
+    writer
+        .write_all(echo.as_bytes())
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    let mut lists = Vec::new();
+    if !unstaged.is_empty() {
+        lists.push(unstaged_list_echo(unstaged));
+    }
+    if !uncommitted.is_empty() {
+        lists.push(uncommitted_list_echo(uncommitted));
+    }
+    writer
+        .write_all(format!("{}\n", lists.join("\n\n")).as_bytes())
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    let mut all = unstaged.to_vec();
+    all.extend(uncommitted.iter().cloned());
+    if ask_for_add(reader, writer, mode, vcs.should_amend, &all)? {
+        if !unstaged.is_empty()
+            && let Some(add) = vcs.add_to_commit
+        {
+            add(unstaged)?;
+        }
+        return Ok(true);
+    }
+    if vcs.autostash && vcs.can_stash
+        && let Some(stash) = vcs.stash_changes
+    {
+        writer
+            .write_all(format!("{STASHING_UNCOMMITTED}\n").as_bytes())
+            .map_err(|error| format!("failed to write prompt: {error}"))?;
+        stash()?;
+        return Ok(false);
+    }
+    if vcs.autostash && vcs.can_stash {
+        return Ok(false);
+    }
+    Err(CANNOT_CONTINUE_UNCOMMITTED.to_string())
+}
+
+/// Commit-or-amend UX (`:1217-1261`).
+fn commit_clean_check_changes(
+    vcs: &CleanCheckVcs<'_>,
+    unstaged: &[String],
+    uncommitted: &[String],
+) -> Result<(), String> {
+    if vcs.should_amend {
+        let Some(head) = vcs.head_commit_message.clone() else {
+            return Err("cannot amend without a local commit".to_string());
+        };
+        if let Some(amend) = vcs.amend_commit {
+            amend(&head)?;
+        }
+        return Ok(());
+    }
+    if !vcs.supports_local_commits {
+        return Ok(());
+    }
+    let mut paths = uncommitted.to_vec();
+    paths.extend(unstaged.iter().cloned());
+    let template = commit_editor_template(&paths);
+    let edited = (vcs.edit)(&template)?;
+    if edited == template {
+        return Err(MUST_PROVIDE_MESSAGE.to_string());
+    }
+    let message = remove_comments(&edited);
+    if message.is_empty() {
+        return Err(MUST_PROVIDE_NONEMPTY_MESSAGE.to_string());
+    }
+    if let Some(commit) = vcs.do_commit {
+        commit(&message)?;
+    }
+    Ok(())
+}
+
+/// Require a clean working copy (`requireCleanWorkingCopy()`,
+/// `src/workflow/ArcanistWorkflow.php:1014-1262`).
+///
+/// Runs the fatal gates (incomplete, conflicts, missing), the
+/// externals/untracked confirms, the commit-or-stash decision, and the
+/// commit/amend UX. VCS state arrives precomputed in `changes`; effects
+/// run through `vcs` hooks.
+pub fn require_clean_working_copy<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    vcs: &CleanCheckVcs<'_>,
+    changes: &WorkingCopyChanges,
+    mode: CommitMode,
+) -> Result<CleanCheckOutcome, String> {
+    let desc = working_copy_desc(&vcs.work_path);
+    if !changes.incomplete.is_empty() {
+        return Err(incomplete_checkout_error(&desc, &changes.incomplete));
+    }
+    if !changes.conflicts.is_empty() {
+        return Err(merge_conflicts_error(&desc, &changes.conflicts));
+    }
+    if !changes.missing.is_empty() {
+        return Err(missing_files_error(&desc, &changes.missing));
+    }
+    check_dirty_externals(reader, writer, vcs.kind, &changes.externals)?;
+    let unstaged = without_paths(&changes.unstaged, &[changes.externals.clone()]);
+    let uncommitted = without_paths(&changes.uncommitted, &[unstaged.clone(), changes.externals.clone()]);
+    check_untracked_files(reader, writer, vcs, &desc, &changes.untracked)?;
+    let should_commit =
+        check_uncommitted_changes(reader, writer, vcs, &desc, &unstaged, &uncommitted, mode)?;
+    // The gate stashes exactly when the lists are non-empty, no commit
+    // was requested, and autostashing applies (`$this->stashed`).
+    let stashed = !should_commit
+        && (!unstaged.is_empty() || !uncommitted.is_empty())
+        && vcs.autostash
+        && vcs.can_stash;
+    if should_commit {
+        commit_clean_check_changes(vcs, &unstaged, &uncommitted)?;
+    }
+    Ok(CleanCheckOutcome { stashed })
+}
+
+/// Project repository reference for the amend check (`id`, `callsign`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmendRepository {
+    /// Diffusion repository id.
+    pub id: i64,
+    /// Repository callsign, when set.
+    pub callsign: Option<String>,
+}
+
+/// Inputs for the amend decision (`calculateShouldAmend()`,
+/// `src/workflow/ArcanistWorkflow.php:1268-1330`).
+pub struct AmendCheck<'a> {
+    /// `history.immutable` configuration.
+    pub history_immutable: bool,
+    /// `supportsAmend()`.
+    pub supports_amend: bool,
+    /// Head local commit, newest first.
+    pub head: Option<LocalCommitInfo>,
+    /// `getAuthor()`.
+    pub api_author: &'a str,
+    /// `--create` was given.
+    pub create: bool,
+    /// Project repository (`loadProjectRepository()`), when known.
+    pub repository: Option<AmendRepository>,
+    /// Open working-copy revisions for the viewer
+    /// (`loadWorkingCopyDifferentialRevisions()`, `status-open`).
+    pub load_open_revisions: &'a dyn Fn() -> Result<Vec<(i64, String)>, String>,
+    /// Conduit caller (`diffusion.querycommits`).
+    pub call: &'a diff_submit::ConduitCall<'a>,
+}
+
+/// PHP truthiness for conduit values: null, false, 0, `""`, and empty
+/// arrays/objects are falsy.
+fn conduit_truthy(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(flag) => *flag,
+        serde_json::Value::Number(number) => {
+            number.as_i64().is_some_and(|n| n != 0)
+                || number.as_f64().is_some_and(|n| n != 0.0)
+        }
+        serde_json::Value::String(text) => !text.is_empty() && text != "0",
+        serde_json::Value::Array(items) => !items.is_empty(),
+        serde_json::Value::Object(map) => !map.is_empty(),
+    }
+}
+
+/// Commit name for the published check (`:1304-1309`): old-style
+/// `r{callsign}{hash}` when a callsign exists, else `R{id}:{hash}`.
+#[must_use]
+pub fn amend_commit_name(repository: &AmendRepository, commit_hash: &str) -> String {
+    match &repository.callsign {
+        Some(callsign) => format!("r{callsign}{commit_hash}"),
+        None => format!("R{}:{commit_hash}", repository.id),
+    }
+}
+
+/// Decide whether uncommitted changes amend the head commit
+/// (`calculateShouldAmend()`, `:1268-1330`).
+pub fn calculate_should_amend(check: &AmendCheck) -> Result<bool, String> {
+    if check.history_immutable || !check.supports_amend {
+        return Ok(false);
+    }
+    let Some(head) = &check.head else {
+        return Ok(false);
+    };
+    let message = CommitMessage::new_from_raw_corpus(&head.message)?;
+    if message.git_svn_base_revision.is_some() {
+        return Ok(false);
+    }
+    if check.api_author != head.author {
+        return Ok(false);
+    }
+    if message.revision_id.is_some() && check.create {
+        return Ok(false);
+    }
+    if let Some(repository) = &check.repository {
+        let name = amend_commit_name(repository, &head.commit);
+        let params = diff_submit::diffusion_query_commits_params(&[name.as_str()]);
+        let result = (check.call)(diff_submit::METHOD_QUERY_COMMITS, &params)?;
+        let known = result
+            .get("identifierMap")
+            .and_then(|map| map.get(name.as_str()))
+            .unwrap_or(&serde_json::Value::Null);
+        if conduit_truthy(known) {
+            return Ok(false);
+        }
+    }
+    if message.revision_id.is_none() {
+        return Ok(true);
+    }
+    Ok(!(check.load_open_revisions)()?.is_empty())
+}
+
 #[cfg(test)]
 #[path = "diff_local_tests.rs"]
 mod diff_local_tests;

@@ -3451,3 +3451,458 @@ fn gap2_resolve_message_source_dispatch() {
         resolve_message_source(false, false, false, Some("D9"), None, false, None).unwrap_err();
     assert_eq!(err, diff_submit::UPDATE_PARAM_MUST_BE_NUMBER);
 }
+
+/* Gap2 D3: clean working-copy check. */
+
+fn gap2_d3_vcs<'a>(edit: &'a dyn Fn(&str) -> Result<String, String>) -> CleanCheckVcs<'a> {
+    CleanCheckVcs {
+        kind: diff::VcsKind::Git,
+        work_path: "/repo".to_string(),
+        supports_local_commits: true,
+        can_stash: true,
+        autostash: false,
+        require_clean_untracked: true,
+        should_amend: false,
+        head_commit_message: None,
+        add_to_commit: None,
+        stash_changes: None,
+        do_commit: None,
+        amend_commit: None,
+        edit,
+    }
+}
+
+#[test]
+fn gap2_resolve_commit_mode_selection() {
+    assert_eq!(resolve_commit_mode(true, false), CommitMode::Enable);
+    assert_eq!(resolve_commit_mode(false, true), CommitMode::Disable);
+    assert_eq!(resolve_commit_mode(false, false), CommitMode::Allow);
+    assert_eq!(resolve_commit_mode(true, true), CommitMode::Enable);
+}
+
+#[test]
+fn gap2_working_copy_changes_from_masks() {
+    use std::collections::BTreeMap;
+    let status: BTreeMap<String, u32> = [
+        ("b.txt".to_string(), git::FLAG_UNCOMMITTED),
+        ("a.txt".to_string(), git::FLAG_UNSTAGED | git::FLAG_UNCOMMITTED),
+        ("u.txt".to_string(), git::FLAG_UNTRACKED),
+        ("c.txt".to_string(), git::FLAG_CONFLICT),
+    ]
+    .into_iter()
+    .collect();
+    let changes = git_working_copy_changes(&status);
+    assert!(changes.incomplete.is_empty() && changes.missing.is_empty());
+    assert_eq!(changes.conflicts, vec!["c.txt".to_string()]);
+    assert_eq!(changes.uncommitted, vec!["a.txt".to_string(), "b.txt".to_string()]);
+    assert_eq!(changes.unstaged, vec!["a.txt".to_string()]);
+    assert_eq!(changes.untracked, vec!["u.txt".to_string()]);
+
+    let svn_status: BTreeMap<String, u32> = [
+        ("i".to_string(), svn::FLAG_INCOMPLETE),
+        ("m".to_string(), svn::FLAG_MISSING),
+    ]
+    .into_iter()
+    .collect();
+    let changes = svn_working_copy_changes(&svn_status);
+    assert_eq!(changes.incomplete, vec!["i".to_string()]);
+    assert_eq!(changes.missing, vec!["m".to_string()]);
+}
+
+#[test]
+fn gap2_clean_check_fatal_gates() {
+    use std::io::Cursor;
+    let edit = |_: &str| -> Result<String, String> { Ok(String::new()) };
+    let vcs = gap2_d3_vcs(&edit);
+    let desc = working_copy_desc("/repo");
+
+    let mut changes = WorkingCopyChanges::default();
+    changes.incomplete = vec!["sub".to_string()];
+    let mut out = Vec::new();
+    let err = require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Allow,
+    )
+    .unwrap_err();
+    assert_eq!(err, incomplete_checkout_error(&desc, &["sub".to_string()]));
+    assert!(err.contains("proceeding.'"), "{err}");
+    assert!(err.contains("  Working copy: /repo\n\n"), "{err}");
+
+    let mut changes = WorkingCopyChanges::default();
+    changes.conflicts = vec!["c.txt".to_string()];
+    let mut out = Vec::new();
+    let err = require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Allow,
+    )
+    .unwrap_err();
+    assert!(err.contains("Conflicts in working copy:"), "{err}");
+
+    let mut changes = WorkingCopyChanges::default();
+    changes.missing = vec!["m.txt".to_string()];
+    let mut out = Vec::new();
+    let err = require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Allow,
+    )
+    .unwrap_err();
+    assert!(err.ends_with("    m.txt\n"), "{err}");
+}
+
+#[test]
+fn gap2_clean_check_externals_gate() {
+    use std::io::Cursor;
+    let edit = |_: &str| -> Result<String, String> { Ok(String::new()) };
+    let vcs = gap2_d3_vcs(&edit);
+    let mut changes = WorkingCopyChanges::default();
+    changes.externals = vec!["ext".to_string()];
+
+    let mut out = Vec::new();
+    let outcome = require_clean_working_copy(
+        &mut Cursor::new(b"y\n".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Allow,
+    )
+    .unwrap();
+    assert!(!outcome.stashed);
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("1 submodule(s) have uncommitted or untracked changes:\n\n      ext\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Ignore the changes to these 1 submodule(s) and continue?"),
+        "{text}"
+    );
+
+    let mut out = Vec::new();
+    let err = require_clean_working_copy(
+        &mut Cursor::new(b"n\n".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Allow,
+    )
+    .unwrap_err();
+    assert_eq!(err, USER_ABORT);
+
+    // Subversion zeroes the externals list: no prompt, no output.
+    let mut svn_vcs = gap2_d3_vcs(&edit);
+    svn_vcs.kind = diff::VcsKind::Svn;
+    let mut out = Vec::new();
+    require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &svn_vcs,
+        &changes,
+        CommitMode::Allow,
+    )
+    .unwrap();
+    assert!(out.is_empty());
+}
+
+#[test]
+fn gap2_clean_check_untracked_gate() {
+    use std::io::Cursor;
+    let edit = |_: &str| -> Result<String, String> { Ok(String::new()) };
+    let vcs = gap2_d3_vcs(&edit);
+    let mut changes = WorkingCopyChanges::default();
+    changes.untracked = vec!["u.txt".to_string()];
+
+    let mut out = Vec::new();
+    require_clean_working_copy(
+        &mut Cursor::new(b"y\n".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Allow,
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains(UNTRACKED_FILES_HERE), "{text}");
+    assert!(text.contains(".git/info/exclude"), "{text}");
+    assert!(text.contains("Ignore these 1 untracked file(s) and continue?"), "{text}");
+
+    assert!(untracked_hint(diff::VcsKind::Svn, 2).contains("svn:ignore"));
+    assert!(untracked_hint(diff::VcsKind::Hg, 2).contains(".hgignore"));
+
+    let mut out = Vec::new();
+    let err = require_clean_working_copy(
+        &mut Cursor::new(b"n\n".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Allow,
+    )
+    .unwrap_err();
+    assert_eq!(err, USER_ABORT);
+
+    // `--allow-untracked` skips the gate silently.
+    let mut lax = gap2_d3_vcs(&edit);
+    lax.require_clean_untracked = false;
+    let mut out = Vec::new();
+    require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &lax,
+        &changes,
+        CommitMode::Allow,
+    )
+    .unwrap();
+    assert!(out.is_empty());
+}
+
+#[test]
+fn gap2_clean_check_commit_decisions() {
+    use std::io::Cursor;
+    let edit = |_: &str| -> Result<String, String> { Ok("Msg\n".to_string()) };
+    let added = std::cell::RefCell::new(Vec::<String>::new());
+    let add = |paths: &[String]| -> Result<(), String> {
+        added.borrow_mut().extend(paths.iter().cloned());
+        Ok(())
+    };
+    let committed = std::cell::RefCell::new(Vec::<String>::new());
+    let commit = |message: &str| -> Result<(), String> {
+        committed.borrow_mut().push(message.to_string());
+        Ok(())
+    };
+    let mut vcs = gap2_d3_vcs(&edit);
+    vcs.add_to_commit = Some(&add);
+    vcs.do_commit = Some(&commit);
+
+    let mut changes = WorkingCopyChanges::default();
+    changes.unstaged = vec!["s.txt".to_string()];
+    changes.uncommitted = vec!["c.txt".to_string()];
+
+    // Prompted commit: staged paths are added, the editor message commits.
+    let mut out = Vec::new();
+    let outcome = require_clean_working_copy(
+        &mut Cursor::new(b"y\n".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Allow,
+    )
+    .unwrap();
+    assert!(!outcome.stashed);
+    assert_eq!(added.borrow().as_slice(), ["s.txt".to_string()]);
+    assert_eq!(committed.borrow().as_slice(), ["Msg\n".to_string()]);
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains(UNCOMMITTED_CHANGES_HERE), "{text}");
+    // The unstaged header is indented, the uncommitted header is not.
+    assert!(text.contains("  Unstaged changes in working copy:\n    s.txt"), "{text}");
+    assert!(text.contains("Uncommitted changes in working copy:\n    c.txt"), "{text}");
+    assert!(
+        text.contains("Do you want to create a new commit with these 2 change(s)?"),
+        "{text}"
+    );
+
+    // `--add-all` skips the prompt (empty input is never read).
+    added.borrow_mut().clear();
+    committed.borrow_mut().clear();
+    let mut out = Vec::new();
+    require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Enable,
+    )
+    .unwrap();
+    assert_eq!(added.borrow().len(), 1);
+    assert_eq!(committed.borrow().len(), 1);
+
+    // `--uncommitted` refuses without autostash.
+    let mut out = Vec::new();
+    let err = require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Disable,
+    )
+    .unwrap_err();
+    assert_eq!(err, CANNOT_CONTINUE_UNCOMMITTED);
+
+    // Autostash stashes instead of failing.
+    let stashed = std::cell::Cell::new(false);
+    let stash = || -> Result<(), String> {
+        stashed.set(true);
+        Ok(())
+    };
+    vcs.autostash = true;
+    vcs.stash_changes = Some(&stash);
+    let mut out = Vec::new();
+    let outcome = require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Disable,
+    )
+    .unwrap();
+    assert!(outcome.stashed);
+    assert!(stashed.get());
+    assert!(String::from_utf8(out).unwrap().contains(STASHING_UNCOMMITTED));
+}
+
+#[test]
+fn gap2_clean_check_commit_ux() {
+    use std::io::Cursor;
+    let edit = |template: &str| -> Result<String, String> {
+        assert!(template.starts_with("\n\n# Enter a commit message.\n#\n# Changes:\n#\n"));
+        assert!(template.contains("#     a.txt\n#     b.txt\n"));
+        Ok("My commit\n".to_string())
+    };
+    let committed = std::cell::RefCell::new(Vec::<String>::new());
+    let commit = |message: &str| -> Result<(), String> {
+        committed.borrow_mut().push(message.to_string());
+        Ok(())
+    };
+    let mut vcs = gap2_d3_vcs(&edit);
+    vcs.do_commit = Some(&commit);
+    let mut changes = WorkingCopyChanges::default();
+    changes.uncommitted = vec!["b.txt".to_string(), "a.txt".to_string()];
+
+    let mut out = Vec::new();
+    require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Enable,
+    )
+    .unwrap();
+    assert_eq!(committed.borrow().as_slice(), ["My commit\n".to_string()]);
+
+    // Unedited templates fail.
+    let passthrough = |template: &str| -> Result<String, String> { Ok(template.to_string()) };
+    let mut vcs = gap2_d3_vcs(&passthrough);
+    vcs.do_commit = Some(&commit);
+    let mut out = Vec::new();
+    let err = require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Enable,
+    )
+    .unwrap_err();
+    assert_eq!(err, MUST_PROVIDE_MESSAGE);
+
+    // Amending passes the head message through.
+    let amended = std::cell::RefCell::new(Vec::<String>::new());
+    let amend = |message: &str| -> Result<(), String> {
+        amended.borrow_mut().push(message.to_string());
+        Ok(())
+    };
+    let mut vcs = gap2_d3_vcs(&edit);
+    vcs.should_amend = true;
+    vcs.head_commit_message = Some("Head msg\n".to_string());
+    vcs.amend_commit = Some(&amend);
+    let mut out = Vec::new();
+    require_clean_working_copy(
+        &mut Cursor::new(b"y\n".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Allow,
+    )
+    .unwrap();
+    assert_eq!(amended.borrow().as_slice(), ["Head msg\n".to_string()]);
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("Do you want to amend these 1 change(s) to the current commit?"),
+        "{text}"
+    );
+}
+
+#[test]
+fn gap2_format_count_grouping() {
+    assert_eq!(format_count(0), "0");
+    assert_eq!(format_count(5), "5");
+    assert_eq!(format_count(999), "999");
+    assert_eq!(format_count(1000), "1,000");
+    assert_eq!(format_count(1_234_567), "1,234,567");
+}
+
+#[test]
+fn gap2_calculate_should_amend_decisions() {
+    let no_revisions = || -> Result<Vec<(i64, String)>, String> { Ok(Vec::new()) };
+    let fail_call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        Err("must not call".to_string())
+    };
+    let head = gap2_d1_local_commit("abc123", "Work", "Work\n");
+    let base = || AmendCheck {
+        history_immutable: false,
+        supports_amend: true,
+        head: Some(head.clone()),
+        api_author: "a",
+        create: false,
+        repository: None,
+        load_open_revisions: &no_revisions,
+        call: &fail_call,
+    };
+
+    // No revision id: amend.
+    assert!(calculate_should_amend(&base()).unwrap());
+    // Immutable history, no amend support, no commits, foreign author.
+    let mut check = base();
+    check.history_immutable = true;
+    assert!(!calculate_should_amend(&check).unwrap());
+    let mut check = base();
+    check.supports_amend = false;
+    assert!(!calculate_should_amend(&check).unwrap());
+    let mut check = base();
+    check.head = None;
+    assert!(!calculate_should_amend(&check).unwrap());
+    let mut check = base();
+    check.api_author = "someone-else";
+    assert!(!calculate_should_amend(&check).unwrap());
+    // git-svn messages never amend.
+    let mut check = base();
+    check.head.as_mut().unwrap().message = "Work\n\ngit-svn-id: https://x/y@9 uuid\n".to_string();
+    assert!(!calculate_should_amend(&check).unwrap());
+    // Revision ids only amend outside `--create` with an open revision.
+    let mut check = base();
+    check.head.as_mut().unwrap().message = "Work\n\nDifferential Revision: D1\n".to_string();
+    check.create = true;
+    assert!(!calculate_should_amend(&check).unwrap());
+    check.create = false;
+    assert!(!calculate_should_amend(&check).unwrap());
+    let open = || -> Result<Vec<(i64, String)>, String> { Ok(vec![(1, "R".to_string())]) };
+    check.load_open_revisions = &open;
+    assert!(calculate_should_amend(&check).unwrap());
+
+    // Published commits never amend.
+    let known = |_: &str, _: &serde_json::Value| {
+        Ok(serde_json::json!({"identifierMap": {"rXabc123": {"id": 1}}}))
+    };
+    let mut check = base();
+    check.repository = Some(AmendRepository { id: 9, callsign: Some("X".to_string()) });
+    check.call = &known;
+    assert!(!calculate_should_amend(&check).unwrap());
+    assert_eq!(
+        amend_commit_name(check.repository.as_ref().unwrap(), "abc123"),
+        "rXabc123"
+    );
+    let unknown = |_: &str, _: &serde_json::Value| Ok(serde_json::json!({"identifierMap": {}}));
+    check.call = &unknown;
+    assert!(calculate_should_amend(&check).unwrap());
+    check.repository = Some(AmendRepository { id: 9, callsign: None });
+    assert_eq!(
+        amend_commit_name(check.repository.as_ref().unwrap(), "abc123"),
+        "R9:abc123"
+    );
+}
