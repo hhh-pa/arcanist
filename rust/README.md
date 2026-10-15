@@ -10,8 +10,8 @@ every gap-closing change updates this table in the same turn. `full*`
 marks commands with a documented edge divergence (listed below); behavior
 is otherwise exact, including error strings and exit codes.
 
-Console colors: plain-text output matches PHP; the ANSI styling pass is
-still in progress, so colored output may differ from `arc` for now.
+Console colors: plain-text output matches PHP, and ANSI styling matches
+PHP `phutil_console_format` bytes on TTYs (plain text off-TTY).
 
 | Command | State |
 |---|---|
@@ -42,7 +42,7 @@ still in progress, so colored output may differ from `arc` for now.
 | `tasks` | full (Maniphest table/`--json`; `--owner`/`--status`/`--order`/`--limit`) |
 | `todo` | full (quick task create; `--browse`; `--cc`/`--project`/`--json`) |
 | `unit` | full (engine selection; `.arcunit`/`unit.engine`; `--engine`/`--everything`; cargo/phpunit/xunit) |
-| `upgrade` | report-only (version/status + manual steps; `--check`/`--json`; no self-update) |
+| `upgrade` | full (version/status report; `--check`/`--json`; `--apply` self-updates with SHA-256 check) |
 | `upload` | full (chunked upload + fallback; `--temporary`/`--json`) |
 | `weld` | full (fuse files; +`--seed` deterministic mode) |
 | `which` | full (context report; `--head`/`--show-base`/`--json`) |
@@ -67,7 +67,7 @@ still in progress, so colored output may differ from `arc` for now.
 | `JSHint` `JSCS` `CSSLint` `LESSC` `GJSLINT` `COFFEE` | external JS/CSS tools (silent if uninstalled; rc/flags config supported) |
 | `flake8` `PYFLAKES` `PyLint` `PEP8` `RuboCop` `RUBY` | external Python/Ruby tools (silent if uninstalled; config supported) |
 | `cppcheck` `C++ Google's Styleguide` `GOLINT` `HLINT` `C#` `PHPCS` `PHP` `PUPPETLINT` | external compiled-language tools (silent if uninstalled; config supported) |
-| `XHP` | external xhpast wrapper only: XHP2 unable-to-parse; rule tree not ported |
+| `XHP` | native subset (66/108 rules; XHP2 unable-to-parse; rest in `blocked_rules()`) |
 
 External linters skip silently when their binary is missing. Per-linter
 configuration (`bin`, `flags`, `version`, `interpreter`, standards,
@@ -75,9 +75,9 @@ rcfiles) is supported.
 
 ### Known divergences from PHP `arc`
 
-- `upgrade` is report-only; it never fetches or replaces the binary.
 - `look` uses the UTC hour for its time-of-day flavor.
-- `XHP` reports parse failures only; the XHPAST rule tree is not ported.
+- `XHP` ports 66/108 XHPAST rules natively; the rest (42 in `blocked_rules()`,
+  incl. XHP134 product-name literals needing the libphutil runtime) are follow-up.
 
 ## Gates
 
