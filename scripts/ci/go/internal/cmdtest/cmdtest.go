@@ -27,15 +27,39 @@ func Build(t *testing.T, dir string) string {
 // Stderr must stay empty: the Python oracles print everything to stdout.
 func Run(t *testing.T, bin, workdir string, args ...string) (string, int) {
 	t.Helper()
+	stdout, stderr, code := RunBothEnv(t, bin, workdir, nil, args...)
+	if stderr != "" {
+		t.Fatalf("%s %v wrote to stderr:\n%s", bin, args, stderr)
+	}
+	return stdout, code
+}
+
+// RunEnv is Run with extra environment entries appended (last wins,
+// so tests can override ambient variables like GITHUB_*).
+func RunEnv(t *testing.T, bin, workdir string, extraEnv []string, args ...string) (string, int) {
+	t.Helper()
+	stdout, stderr, code := RunBothEnv(t, bin, workdir, extraEnv, args...)
+	if stderr != "" {
+		t.Fatalf("%s %v wrote to stderr:\n%s", bin, args, stderr)
+	}
+	return stdout, code
+}
+
+// RunBothEnv executes bin with args in workdir, returning stdout,
+// stderr, and exit code. Used where the oracle itself writes stderr
+// (rust-quality-gates raises SystemExit with a message, which Python
+// prints to stderr).
+func RunBothEnv(t *testing.T, bin, workdir string, extraEnv []string, args ...string) (string, string, int) {
+	t.Helper()
 	cmd := exec.Command(bin, args...)
 	cmd.Dir = workdir
+	if extraEnv != nil {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
-	if stderr.Len() != 0 {
-		t.Fatalf("%s %v wrote to stderr:\n%s", bin, args, stderr.String())
-	}
 	code := 0
 	if err != nil {
 		if exit, ok := err.(*exec.ExitError); ok {
@@ -44,7 +68,7 @@ func Run(t *testing.T, bin, workdir string, args ...string) (string, int) {
 			t.Fatalf("%s %v failed to run: %v", bin, args, err)
 		}
 	}
-	return stdout.String(), code
+	return stdout.String(), stderr.String(), code
 }
 
 // Golden reads a testdata golden file.
