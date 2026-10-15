@@ -87,6 +87,7 @@ pub mod unit_pytest;
 pub mod unit_xunit;
 pub mod upgrade;
 pub mod upload;
+pub mod version;
 pub mod weld;
 pub mod which;
 pub mod work;

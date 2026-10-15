@@ -271,6 +271,7 @@ fn expected_commands() -> Vec<(&'static str, CommandFn)> {
         (unit::NAME, unit::run),
         (upgrade::NAME, upgrade::run),
         (upload::NAME, upload::run),
+        (version::NAME, version::run),
         (weld::NAME, weld::run),
         (which::NAME, which::run),
         (work::NAME, work::run),
@@ -301,4 +302,32 @@ fn all_ported_commands_dispatch_through_main() {
             "command '{name}' did not dispatch through main"
         );
     }
+}
+
+#[test]
+fn help_forwards_to_command_help() {
+    assert_eq!(
+        forward_help(&args(&["help", "diff"])),
+        args(&["diff", "--help"])
+    );
+    assert_eq!(
+        forward_help(&args(&["help", "version"])),
+        args(&["version", "--help"])
+    );
+    assert_eq!(dispatch(&args(&["help", "diff"])), ExitCode::SUCCESS);
+    assert_eq!(dispatch(&args(&["help", "version"])), ExitCode::SUCCESS);
+}
+
+#[test]
+fn help_keeps_bare_list_and_rejects_unknown_names() {
+    assert_eq!(forward_help(&args(&["help"])), args(&["help"]));
+    assert_eq!(forward_help(&args(&["--help"])), args(&["--help"]));
+    assert_eq!(forward_help(&args(&[])), args(&[]));
+    assert_eq!(
+        forward_help(&args(&["help", "diff", "extra"])),
+        args(&["diff", "--help"])
+    );
+    assert_eq!(dispatch(&args(&["help"])), ExitCode::SUCCESS);
+    assert_eq!(dispatch(&args(&["help", "help"])), ExitCode::SUCCESS);
+    assert_eq!(dispatch(&args(&["help", "bogus"])), ExitCode::FAILURE);
 }

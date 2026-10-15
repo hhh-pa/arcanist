@@ -9,8 +9,8 @@ use std::process::ExitCode;
 use arc_rs::{
     alias, amend, anoid, bookmarks, branches, browse, close_revision, commit, config, cover, diff,
     download, export, get_config, inspect, install_certificate, land, liberate, lint, linters,
-    list, look, markers, paste, patch, set_config, tasks, todo, unit, upgrade, upload, weld, which,
-    work,
+    list, look, markers, paste, patch, set_config, tasks, todo, unit, upgrade, upload, version,
+    weld, which, work,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -48,13 +48,14 @@ const COMMANDS: &[(&str, CommandFn)] = &[
     (unit::NAME, unit::run),
     (upgrade::NAME, upgrade::run),
     (upload::NAME, upload::run),
+    (version::NAME, version::run),
     (weld::NAME, weld::run),
     (which::NAME, which::run),
     (work::NAME, work::run),
 ];
 
 fn usage() -> String {
-    "usage: arc-rs [--version] [--help] <command>\n\ncommands (see <command> --help):\n  alias\n  amend\n  anoid\n  bookmarks\n  branches\n  browse\n  call-conduit\n  close-revision\n  commit\n  cover\n  diff\n  download\n  export\n  get-config\n  inspect\n  install-certificate\n  land\n  liberate\n  lint\n  linters\n  list\n  look\n  markers\n  paste\n  patch\n  set-config\n  tasks\n  todo\n  unit\n  upgrade\n  upload\n  weld\n  which\n  work\n"
+    "usage: arc-rs [--version] [--help] <command>\n\ncommands (see <command> --help):\n  alias\n  amend\n  anoid\n  bookmarks\n  branches\n  browse\n  call-conduit\n  close-revision\n  commit\n  cover\n  diff\n  download\n  export\n  get-config\n  inspect\n  install-certificate\n  land\n  liberate\n  lint\n  linters\n  list\n  look\n  markers\n  paste\n  patch\n  set-config\n  tasks\n  todo\n  unit\n  upgrade\n  upload\n  version\n  weld\n  which\n  work\n"
         .to_string()
 }
 
@@ -265,7 +266,22 @@ fn apply_alias_expansion(argv: Vec<String>) -> Result<Vec<String>, ExitCode> {
     }
 }
 
+/// Rewrite `help <cmd>` to `<cmd> --help`, mirroring PHP's help workflow
+/// rendering the named command's help (`ArcanistHelpWorkflow` delegates to
+/// `PhutilHelpArgumentWorkflow`). Bare `help` (and `-h`/`--help`) passes
+/// through to the full command list; words after the command name are
+/// dropped, and an unknown name flows into the unknown-command error below.
+fn forward_help(argv: &[String]) -> Vec<String> {
+    if argv.first().is_some_and(|first| first == "help") && argv.len() > 1 {
+        vec![argv[1].clone(), "--help".to_string()]
+    } else {
+        argv.to_vec()
+    }
+}
+
 fn dispatch(argv: &[String]) -> ExitCode {
+    let forwarded = forward_help(argv);
+    let argv = forwarded.as_slice();
     if let Some(cmd) = argv.first()
         && let Some(run) = find_command(cmd)
     {
