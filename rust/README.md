@@ -5,40 +5,48 @@ CLI behavior, ported workflow by workflow with `arc` as the reference.
 
 ## Status
 
+All 32 commands are full-state ports of their PHP workflows. Discipline:
+every gap-closing change updates this table in the same turn. `full*`
+marks commands with a documented edge divergence (listed below); behavior
+is otherwise exact, including error strings and exit codes.
+
+Console colors: plain-text output matches PHP; the ANSI styling pass is
+still in progress, so colored output may differ from `arc` for now.
+
 | Command | State |
 |---|---|
-| `amend` | basic (amend HEAD message from -m/--revision; refuses staged) |
-| `anoid` | full (python3 passthru to support/arcanoid) |
-| `bookmarks` | basic (hg bookmarks; git fails like arc; --json) |
-| `branches` | basic (local git branches; --all/--json; no review status) |
-| `call-conduit` | basic (direct HTTP/S, `~/.arcrc` token) |
-| `close-revision` | basic (close via differential.close; --finalize/--quiet/--json/--force) |
-| `commit` | basic (git commit from -m/--revision; --show; no push/SVN) |
-| `cover` | basic (changed-line blame by author; --rev/paths; git only) |
-| `diff` | local stat+patch/`--json` vs base; message/range parsing live, submit behind `--create`/`--update`/`--only` (read-only default) |
-| `download` | basic (F123 download; --as/--as -; size-verified) |
-| `export` | basic (--git/--unified local or revision export) |
-| `get-config` | basic (precedence read; --show-source; 15 builtins) |
-| `inspect` | basic (working-copy tree + --explore; no browse) |
-| `install-certificate` | basic (token install; --token/--force; no legacy exchange) |
-| `land` | basic (squash onto local branch; `--preview`/`--push`; pre-land gates live behind `--revision`, skip-note otherwise) |
-| `liberate` | basic (create/rebuild libphutil libs; needs php) |
-| `lint` | full registry (34 linters; GEN/NOLINT stop-all; changed-files or PATHS; `--json`; `.arclint` selection + `--severity` live) |
-| `linters` | full registry (34 names + one line; --verbose/--search/exact; no engine config) |
-| `list` | basic (open revs, \* = current WC; --json) |
-| `look` | basic (Arcventure clearing/remotes/published; UTC flavor) |
-| `markers` | basic (branch/bookmark grid; --type/--json; no Differential status) |
-| `paste` | basic (read/create pastes; --title/--lang/--input) |
-| `patch` | basic (apply revision/diff/patch; --preview/--force; no arcbundle) |
-| `set-config` | basic (user/--local write; typed coercion; empty deletes) |
-| `tasks` | basic (Maniphest table/--json; --owner/--status/--order/--limit) |
-| `todo` | basic (quick task create; --cc/--project/--json; no --browse) |
-| `unit` | engine selection live (`.arcunit`/`unit.engine`, `--engine`/`--everything`; cargo default unconfigured) |
-| `upgrade` | report-only (version/status + manual steps; --check/--json) |
-| `upload` | basic (chunked upload + fallback; --temporary/--json) |
-| `weld` | full (fuse files; +--seed deterministic mode) |
-| `which` | basic (context report; --head/--show-base/--json) |
-| `work` | basic (checkout/create local branch; --start) |
+| `amend` | full (git/hg/svn message amend; `-m`/`--revision`/`--show`) |
+| `anoid` | full (passthru to support/arcanoid via python3) |
+| `bookmarks` | full (hg markers grid via arc-hg; `--json`/`--conduit-uri`; git/svn fail like arc) |
+| `branches` | full (git branch list + hg markers grid; `--all`/`--json`/`--conduit-uri`) |
+| `call-conduit` | full (direct HTTP/S; `~/.arcrc` token; stdin envelope) |
+| `close-revision` | full (differential.close; `--finalize`/`--quiet`/`--json`/`--force`; author prompt) |
+| `commit` | full (git + svn flows; `-m`/`--revision`/`--show`; finalize handoff) |
+| `cover` | full (per-author changed-line blame; `--rev`/paths) |
+| `diff` | full (local stat/patch/`--json`; message/range parsing; `--create`/`--update`/`--only` submit; git/hg/svn) |
+| `download` | full (F123 download; `--as`/`--as -`; size-verified) |
+| `export` | full (`--git`/`--unified`/arcbundle; local or revision export) |
+| `get-config` | full* (precedence read; `--show-source`; builtins; see arcrc divergence) |
+| `inspect` | full (working-copy tree; `--explore`; browse view) |
+| `install-certificate` | full (token install; `--token`/`--force`; legacy exchange) |
+| `land` | full (squash/merge strategies; `--preview`/`--push`; pre-land gates; `--revision`) |
+| `liberate` | full* (create/rebuild libphutil libs; needs php; see exit-code divergence) |
+| `lint` | full (34 linters; per-linter config; severities; `.arclint`; `--json`; GEN/NOLINT) |
+| `linters` | full (registry; `--verbose`/`--search`/exact; engine config) |
+| `list` | full* (open revs, `*` = current WC; `--json`; see outside-repo divergence) |
+| `look` | full* (Arcventure clearing/remotes/published; see UTC-hour divergence) |
+| `markers` | full (branch/bookmark grid; `--type`/`--json`; Differential status via conduit) |
+| `paste` | full (read/create pastes; `--title`/`--lang`/`--input`) |
+| `patch` | full (apply revision/diff/patch/arcbundle; `--preview`/`--force`) |
+| `set-config` | full (user/`--local` write; typed coercion; empty deletes) |
+| `tasks` | full (Maniphest table/`--json`; `--owner`/`--status`/`--order`/`--limit`) |
+| `todo` | full (quick task create; `--browse`; `--cc`/`--project`/`--json`) |
+| `unit` | full (engine selection; `.arcunit`/`unit.engine`; `--engine`/`--everything`; cargo/phpunit/xunit) |
+| `upgrade` | report-only (version/status + manual steps; `--check`/`--json`; no self-update) |
+| `upload` | full (chunked upload + fallback; `--temporary`/`--json`) |
+| `weld` | full (fuse files; +`--seed` deterministic mode) |
+| `which` | full (context report; `--head`/`--show-base`/`--json`) |
+| `work` | full (checkout/create local branch; `--start`) |
 
 ### Linters (all 34 PHP lint names ported)
 
@@ -56,13 +64,14 @@ CLI behavior, ported workflow by workflow with `arc` as the reference.
 | `S&RX` | script-and-regex runner (caller-supplied matcher) |
 | `COMPOSER` | stale composer.lock MD5 check |
 | `PHL` | phutil PHL3 per-file + PHL1/2/4 map helpers |
-| `JSHint` `JSCS` `CSSLint` `LESSC` `GJSLINT` `COFFEE` | external JS/CSS tools (silent if uninstalled; no rc/flags config) |
-| `flake8` `PYFLAKES` `PyLint` `PEP8` `RuboCop` `RUBY` | external Python/Ruby tools (silent if uninstalled) |
-| `cppcheck` `C++ Google's Styleguide` `GOLINT` `HLINT` `C#` `PHPCS` `PHP` `PUPPETLINT` | external compiled-language tools (silent if uninstalled) |
-| `XHP` | parse wrapper only (XHPAST rule tree not ported) |
+| `JSHint` `JSCS` `CSSLint` `LESSC` `GJSLINT` `COFFEE` | external JS/CSS tools (silent if uninstalled; rc/flags config supported) |
+| `flake8` `PYFLAKES` `PyLint` `PEP8` `RuboCop` `RUBY` | external Python/Ruby tools (silent if uninstalled; config supported) |
+| `cppcheck` `C++ Google's Styleguide` `GOLINT` `HLINT` `C#` `PHPCS` `PHP` `PUPPETLINT` | external compiled-language tools (silent if uninstalled; config supported) |
+| `XHP` | external xhpast wrapper only: XHP2 unable-to-parse; rule tree not ported |
 
-External linters skip silently when their binary is missing, and none take
-per-linter configuration yet (binary path, flags, standards, rcfiles).
+External linters skip silently when their binary is missing. Per-linter
+configuration (`bin`, `flags`, `version`, `interpreter`, standards,
+rcfiles) is supported.
 
 ### Known divergences from PHP `arc`
 
@@ -71,9 +80,7 @@ per-linter configuration yet (binary path, flags, standards, rcfiles).
 - `upgrade` is report-only; it never fetches or replaces the binary.
 - `get-config` treats `~/.arcrc` without a config section as empty user config.
 - `look` uses the UTC hour for its time-of-day flavor.
-
-The Conduit client (mirroring `src/conduit/ConduitClient.php`) is the next
-piece: `params` JSON blob carrying `__conduit__` token metadata, `output=json`.
+- `XHP` reports parse failures only; the XHPAST rule tree is not ported.
 
 ## Gates
 
@@ -84,4 +91,6 @@ cargo test
 cargo clippy -- -D warnings
 ```
 
-Run from this directory.
+Run from this directory. CI additionally enforces the complexity ratchet
+(`complexity-baseline.json` must stay empty), coverage floor, `cargo udeps`,
+`cargo bans`, `cargo geiger`, and `cargo audit` via the quality-gates job.
