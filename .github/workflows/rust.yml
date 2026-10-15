@@ -186,14 +186,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: scripts/ci/go/go.mod
-      - run: go test -coverprofile=coverage.out ./...
+      - run: go test ./...
         working-directory: scripts/ci/go
-      - name: upload Go coverage to codecov
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: scripts/ci/go/coverage.out
-          fail_ci_if_error: false
 
   # Every run keeps its release binaries as downloadable Actions artifacts
   # (`arc-<target>.tar.gz` per OS, 14-day retention), so any commit's build

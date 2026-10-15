@@ -4,6 +4,3 @@
 # Rust build trees.
 /rust/target/
 /rust/target-*/
-
-# Go CI-tools coverage profile (uploaded to Codecov, never committed).
-/scripts/ci/go/coverage.out
