@@ -33,8 +33,11 @@
 | `LICENSE` | 2015 | KEEP: Apache 2.0, matches README claim |
 | `NOTICE` | 2014 | KEEP: Phacility attribution, legally required |
 
-Deletion safety: repo tests use `tests/fixtures`, never the
-repo-root configs (verified by grep); CI reads neither file.
+Deletion safety: repo tests use `rust/tests/fixtures` plus
+temp-dir fixtures, never the repo-root configs (verified by grep
+plus a base-vs-head coverage diff, which caught one implicit
+cwd dependence in `misc2_commands.rs`, since fixed); CI reads
+neither file.
 
 ## Acceptance criteria
 
