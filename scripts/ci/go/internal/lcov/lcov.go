@@ -6,9 +6,13 @@ package lcov
 
 import (
 	"math"
+	"os"
+	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // AbsurdCount bounds real execution counts: llvm occasionally emits
@@ -123,8 +127,21 @@ func mergeBRDATaken(slot map[BRKey]string, key BRKey, taken string) {
 	a, aok := parseCount(prev)
 	b, bok := parseCount(taken)
 	if aok && bok {
-		slot[key] = strconv.FormatInt(a+b, 10)
+		slot[key] = strconv.FormatInt(addSat(a, b), 10)
 	}
+}
+
+// addSat adds with int64 saturation. Python ints are unbounded, but
+// merged counts near 2**62 are profiler garbage that ParseRecords
+// clamps; saturation keeps them non-negative instead of wrapping.
+func addSat(a, b int64) int64 {
+	if b > 0 && a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	if b < 0 && a < math.MinInt64-b {
+		return math.MinInt64
+	}
+	return a + b
 }
 
 // ParseRecords parses full LCOV text, mirroring parse_lcov_records:
@@ -276,6 +293,27 @@ func mustCount(raw string) int64 {
 	return count
 }
 
+// SanitizeUTF8 replaces each invalid UTF-8 byte with U+FFFD,
+// mirroring Python errors="replace" on LCOV reads (a literal U+FFFD
+// re-encodes identically).
+func SanitizeUTF8(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for len(s) > 0 {
+		r, w := utf8.DecodeRuneInString(s)
+		if r == utf8.RuneError && w == 1 {
+			b.WriteString("\uFFFD")
+		} else {
+			b.WriteString(s[:w])
+		}
+		s = s[w:]
+	}
+	return b.String()
+}
+
 // SortedSFs returns SFs in byte order.
 func SortedSFs(files map[string]map[string]int64) []string {
 	sfs := make([]string, 0, len(files))
@@ -284,4 +322,262 @@ func SortedSFs(files map[string]map[string]int64) []string {
 	}
 	sort.Strings(sfs)
 	return sfs
+}
+
+// CovExcludedParts mirrors cargo-llvm-cov's report filtering
+// (_COV_EXCLUDED_PARTS): test/bench/example sources, build output,
+// and non-workspace code, matched AFTER normpath so
+// `<crate>/tests/../src/*.rs` (#[path]-included production code)
+// survives while `<crate>/tests/*.rs` does not.
+var CovExcludedParts = []string{
+	"/tests/",
+	"/benches/",
+	"/examples/",
+	"/target/",
+	"/.cargo/",
+	"/rustup/",
+	"/rustc/",
+}
+
+// NormPath mirrors posixpath.normpath. path.Clean differs only on a
+// leading double slash, which POSIX preserves.
+func NormPath(p string) string {
+	if strings.HasPrefix(p, "//") && (len(p) == 2 || p[2] != '/') {
+		return "/" + path.Clean(p)
+	}
+	return path.Clean(p)
+}
+
+func copyRecord(rec Record) Record {
+	out := NewRecord()
+	for k, v := range rec.DA {
+		out.DA[k] = v
+	}
+	for k, v := range rec.BRDA {
+		out.BRDA[k] = v
+	}
+	for k, v := range rec.FNDA {
+		out.FNDA[k] = v
+	}
+	for k := range rec.FN {
+		out.FN[k] = true
+	}
+	return out
+}
+
+// Canonicalize merges raw-export records onto canonical workspace
+// paths, mirroring canonicalize_lcov_records. Lexical normpath
+// collapses `<crate>/tests/../src/*.rs` twins onto the binary's own
+// absolute paths so both copies merge; pure test sources,
+// non-workspace paths, and excluded parts are dropped. Returns
+// records sorted by SF.
+func Canonicalize(records []SFRecord, workspace string) []SFRecord {
+	merged := map[string]*Record{}
+	prefix := workspace + string(os.PathSeparator)
+	for _, sr := range records {
+		p := sr.SF
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(workspace, p)
+		}
+		norm := NormPath(p)
+		if !strings.HasPrefix(norm, prefix) {
+			continue
+		}
+		excluded := false
+		for _, part := range CovExcludedParts {
+			if strings.Contains(norm, part) {
+				excluded = true
+				break
+			}
+		}
+		if excluded {
+			continue
+		}
+		slot := merged[norm]
+		if slot == nil {
+			rec := copyRecord(sr.Rec)
+			merged[norm] = &rec
+			continue
+		}
+		for line, count := range sr.Rec.DA {
+			slot.DA[line] = addSat(slot.DA[line], count)
+		}
+		for key, taken := range sr.Rec.BRDA {
+			mergeBRDATaken(slot.BRDA, key, taken)
+		}
+		for name, count := range sr.Rec.FNDA {
+			slot.FNDA[name] = addSat(slot.FNDA[name], count)
+		}
+		for key := range sr.Rec.FN {
+			slot.FN[key] = true
+		}
+	}
+	sfs := make([]string, 0, len(merged))
+	for sf := range merged {
+		sfs = append(sfs, sf)
+	}
+	sort.Strings(sfs)
+	out := make([]SFRecord, 0, len(sfs))
+	for _, sf := range sfs {
+		out = append(out, SFRecord{SF: sf, Rec: *merged[sf]})
+	}
+	return out
+}
+
+// NormSFs normpaths record SFs without filtering, mirroring the
+// cargo_canon view in upgrade_lcov_with_canonical.
+func NormSFs(records []SFRecord) []SFRecord {
+	out := make([]SFRecord, 0, len(records))
+	for _, sr := range records {
+		out = append(out, SFRecord{SF: NormPath(sr.SF), Rec: sr.Rec})
+	}
+	return out
+}
+
+// intKey parses a numeric sort key, mirroring the int() sort keys in
+// emit_lcov (non-numeric keys, which crash the oracle, sort by raw
+// string instead).
+func intKey(s string) (int64, bool) {
+	return parseCount(s)
+}
+
+func lessNumOrStr(a, b string) bool {
+	ai, aok := intKey(a)
+	bi, bok := intKey(b)
+	if aok && bok && ai != bi {
+		return ai < bi
+	}
+	return a < b
+}
+
+// Emit renders canonical [(sf, record)] back to LCOV with recomputed
+// summaries, mirroring emit_lcov. Empty input yields "".
+func Emit(canonical []SFRecord) string {
+	var out []string
+	for _, sr := range canonical {
+		rec := sr.Rec
+		out = append(out, "SF:"+sr.SF)
+		fns := make([]FNKey, 0, len(rec.FN))
+		for key := range rec.FN {
+			fns = append(fns, key)
+		}
+		sort.Slice(fns, func(i, j int) bool {
+			if fns[i].Name != fns[j].Name {
+				return fns[i].Name < fns[j].Name
+			}
+			return fns[i].Line < fns[j].Line
+		})
+		for _, key := range fns {
+			out = append(out, "FN:"+key.Line+","+key.Name)
+		}
+		fndas := make([]string, 0, len(rec.FNDA))
+		for name := range rec.FNDA {
+			fndas = append(fndas, name)
+		}
+		sort.Strings(fndas)
+		for _, name := range fndas {
+			out = append(out, "FNDA:"+strconv.FormatInt(rec.FNDA[name], 10)+","+name)
+		}
+		if len(rec.FN) > 0 || len(rec.FNDA) > 0 {
+			names := map[string]bool{}
+			for name := range rec.FNDA {
+				names[name] = true
+			}
+			for _, key := range fns {
+				names[key.Name] = true
+			}
+			hit := 0
+			for name := range names {
+				if rec.FNDA[name] > 0 {
+					hit++
+				}
+			}
+			out = append(out, "FNF:"+strconv.Itoa(len(names)))
+			out = append(out, "FNH:"+strconv.Itoa(hit))
+		}
+		brs := make([]BRKey, 0, len(rec.BRDA))
+		for key := range rec.BRDA {
+			brs = append(brs, key)
+		}
+		sort.Slice(brs, func(i, j int) bool {
+			a, b := brs[i], brs[j]
+			if a.Line != b.Line {
+				return lessNumOrStr(a.Line, b.Line)
+			}
+			if a.Block != b.Block {
+				return lessNumOrStr(a.Block, b.Block)
+			}
+			if a.Branch != b.Branch {
+				return lessNumOrStr(a.Branch, b.Branch)
+			}
+			return false
+		})
+		for _, key := range brs {
+			out = append(out, "BRDA:"+key.Line+","+key.Block+","+key.Branch+","+rec.BRDA[key])
+		}
+		if len(rec.BRDA) > 0 {
+			hit := 0
+			for _, taken := range rec.BRDA {
+				if taken != "-" && taken != "0" {
+					hit++
+				}
+			}
+			out = append(out, "BRF:"+strconv.Itoa(len(rec.BRDA)))
+			out = append(out, "BRH:"+strconv.Itoa(hit))
+		}
+		das := make([]string, 0, len(rec.DA))
+		for line := range rec.DA {
+			das = append(das, line)
+		}
+		sort.Slice(das, func(i, j int) bool { return lessNumOrStr(das[i], das[j]) })
+		for _, line := range das {
+			out = append(out, "DA:"+line+","+strconv.FormatInt(rec.DA[line], 10))
+		}
+		hit := 0
+		for _, count := range rec.DA {
+			if count > 0 {
+				hit++
+			}
+		}
+		out = append(out, "LF:"+strconv.Itoa(len(rec.DA)))
+		out = append(out, "LH:"+strconv.Itoa(hit))
+		out = append(out, "end_of_record")
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	return strings.Join(out, "\n") + "\n"
+}
+
+// LineKey is one (file, line) pair in a coverage line set.
+type LineKey struct {
+	SF   string
+	Line string
+}
+
+// LineSets returns the (total, covered) line sets for canonical
+// records, mirroring lcov_line_sets.
+func LineSets(canonical []SFRecord) (total, covered map[LineKey]bool) {
+	total = map[LineKey]bool{}
+	covered = map[LineKey]bool{}
+	for _, sr := range canonical {
+		for line, count := range sr.Rec.DA {
+			key := LineKey{sr.SF, line}
+			total[key] = true
+			if count > 0 {
+				covered[key] = true
+			}
+		}
+	}
+	return total, covered
+}
+
+// IsSubset reports whether every key of sub is in super.
+func IsSubset(sub, super map[LineKey]bool) bool {
+	for key := range sub {
+		if !super[key] {
+			return false
+		}
+	}
+	return true
 }

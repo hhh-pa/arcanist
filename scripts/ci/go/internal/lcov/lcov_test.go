@@ -80,3 +80,79 @@ func TestParseSummariesSkipsOrphanCounts(t *testing.T) {
 		t.Fatalf("got %d %d %v", found, hit, files)
 	}
 }
+
+func TestNormPathMatchesPosix(t *testing.T) {
+	for in, want := range map[string]string{
+		"/a/./b/../c": "/a/c",
+		"//a":         "//a",
+		"//":          "//",
+		"///a":        "/a",
+		"":            ".",
+		"a//b":        "a/b",
+	} {
+		if got := NormPath(in); got != want {
+			t.Fatalf("NormPath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestCanonicalizeMergesTwinsAndFilters(t *testing.T) {
+	text := "SF:/ws/c/app/tests/../src/t.rs\nDA:1,2\nend_of_record\n" +
+		"SF:/ws/c/app/src/t.rs\nDA:1,3\nDA:2,0\nend_of_record\n" +
+		"SF:/ws/c/app/tests/u.rs\nDA:1,9\nend_of_record\n" +
+		"SF:/ws/target/x.rs\nDA:1,9\nend_of_record\n" +
+		"SF:/other/y.rs\nDA:1,9\nend_of_record\n" +
+		"SF:rel/z.rs\nDA:1,4\nend_of_record\n"
+	records, _ := ParseRecords(text)
+	canon := Canonicalize(records, "/ws")
+	if len(canon) != 2 {
+		t.Fatalf("files: %v", canon)
+	}
+	if canon[0].SF != "/ws/c/app/src/t.rs" || canon[1].SF != "/ws/rel/z.rs" {
+		t.Fatalf("sfs: %v", canon)
+	}
+	if canon[0].Rec.DA["1"] != 5 || canon[0].Rec.DA["2"] != 0 {
+		t.Fatalf("merged da: %v", canon[0].Rec.DA)
+	}
+	if canon[1].Rec.DA["1"] != 4 {
+		t.Fatalf("relative da: %v", canon[1].Rec.DA)
+	}
+}
+
+func TestEmitRecomputesSummaries(t *testing.T) {
+	records, _ := ParseRecords(
+		"SF:/ws/a.rs\nFN:10,f\nFN:20,g\nFNDA:2,f\nFNDA:0,g\n" +
+			"BRDA:3,0,0,1\nBRDA:3,0,1,-\nBRDA:10,0,0,0\n" +
+			"DA:1,5\nDA:2,0\nDA:10,1\nLF:99\nLH:99\nend_of_record\n",
+	)
+	got := Emit(Canonicalize(records, "/ws"))
+	want := "SF:/ws/a.rs\n" +
+		"FN:10,f\nFN:20,g\n" +
+		"FNDA:2,f\nFNDA:0,g\n" +
+		"FNF:2\nFNH:1\n" +
+		"BRDA:3,0,0,1\nBRDA:3,0,1,-\nBRDA:10,0,0,0\n" +
+		"BRF:3\nBRH:1\n" +
+		"DA:1,5\nDA:2,0\nDA:10,1\n" +
+		"LF:3\nLH:2\n" +
+		"end_of_record\n"
+	if got != want {
+		t.Fatalf("mismatch:\n got: %q\nwant: %q", got, want)
+	}
+	if Emit(nil) != "" {
+		t.Fatalf("empty emit should be empty")
+	}
+}
+
+func TestLineSetsAndSubset(t *testing.T) {
+	records, _ := ParseRecords(
+		"SF:/ws/a.rs\nDA:1,1\nDA:2,0\nend_of_record\n",
+	)
+	canon := Canonicalize(records, "/ws")
+	total, covered := LineSets(canon)
+	if len(total) != 2 || len(covered) != 1 {
+		t.Fatalf("sets: %v %v", total, covered)
+	}
+	if !IsSubset(covered, total) || IsSubset(total, covered) {
+		t.Fatalf("subset broken: %v %v", total, covered)
+	}
+}

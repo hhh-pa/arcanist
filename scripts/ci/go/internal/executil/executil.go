@@ -43,13 +43,15 @@ func ChildEnv() []string {
 }
 
 // PathOf returns the PATH value carried by env ("" when absent).
+// The last entry wins, matching exec resolution of duplicate keys.
 func PathOf(env []string) string {
+	val := ""
 	for _, kv := range env {
 		if strings.HasPrefix(kv, "PATH=") {
-			return kv[len("PATH="):]
+			val = kv[len("PATH="):]
 		}
 	}
-	return ""
+	return val
 }
 
 // IsExecutable mirrors os.access(path, X_OK): a non-directory with

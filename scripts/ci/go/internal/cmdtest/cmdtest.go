@@ -15,12 +15,18 @@ import (
 func Build(t *testing.T, dir string) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "tool")
-	cmd := exec.Command("go", "build", "-o", bin, ".")
-	cmd.Dir = dir
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("go build %s: %v\n%s", dir, err, out)
-	}
+	BuildTo(t, dir, bin)
 	return bin
+}
+
+// BuildTo compiles the main package in srcdir to dest.
+func BuildTo(t *testing.T, srcdir, dest string) {
+	t.Helper()
+	cmd := exec.Command("go", "build", "-o", dest, ".")
+	cmd.Dir = srcdir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build %s: %v\n%s", srcdir, err, out)
+	}
 }
 
 // Run executes bin with args in workdir, returning stdout and exit code.

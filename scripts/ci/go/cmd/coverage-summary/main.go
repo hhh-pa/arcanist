@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/m-hu/arcanist/scripts/ci/go/internal/lcov"
 )
@@ -161,10 +160,9 @@ func run(argv []string) int {
 			"No `lcov.info` was produced (an earlier gate failed first).\n"
 		comment = strings.Replace(summary, "## Coverage:", "## Coverage report:", 1)
 	} else {
-		// Mirror errors="replace": Go strings may hold invalid UTF-8;
-		// Python would have replaced it. LCOV paths are ASCII or
-		// valid UTF-8 in practice; decode via rune scan to match.
-		found, hit, files := lcov.ParseSummaries(sanitizeUTF8(string(data)))
+		// Mirror errors="replace": Go strings may hold invalid
+		// UTF-8; Python would have replaced it.
+		found, hit, files := lcov.ParseSummaries(lcov.SanitizeUTF8(string(data)))
 		total := 100.0
 		if found != 0 {
 			total = 100.0 * float64(hit) / float64(found)
@@ -189,26 +187,6 @@ func run(argv []string) int {
 		}
 	}
 	return 0
-}
-
-// sanitizeUTF8 replaces each invalid UTF-8 byte with U+FFFD, mirroring
-// Python errors="replace" (a literal U+FFFD re-encodes identically).
-func sanitizeUTF8(s string) string {
-	if utf8.ValidString(s) {
-		return s
-	}
-	var b strings.Builder
-	b.Grow(len(s))
-	for len(s) > 0 {
-		r, w := utf8.DecodeRuneInString(s)
-		if r == utf8.RuneError && w == 1 {
-			b.WriteString("\uFFFD")
-		} else {
-			b.WriteString(s[:w])
-		}
-		s = s[w:]
-	}
-	return b.String()
 }
 
 func main() {
