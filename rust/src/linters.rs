@@ -68,41 +68,69 @@ pub fn available_linters() -> Vec<LinterInfo> {
 /// One-line summary for a display name.
 #[must_use]
 pub fn describe(name: &str) -> &'static str {
+    if let Some(text) = describe_text_linters(name) {
+        return text;
+    }
+    if let Some(text) = describe_script_linters(name) {
+        return text;
+    }
+    if let Some(text) = describe_compiled_linters(name) {
+        return text;
+    }
+    "Lint rule."
+}
+
+/// Summaries for the text, file, and generic linters.
+fn describe_text_linters(name: &str) -> Option<&'static str> {
     match name {
-        "TXT" => "Basic text checks: tabs, trailing whitespace, newlines.",
-        "NAME" => "Requires boring file names.",
-        "JSON" => "Detects syntax errors in JSON files.",
-        "XML" => "Detects malformed XML files.",
-        "MERGECONFLICT" => "Detects unresolved merge-conflict markers.",
-        "GEN" => "Skips generated files.",
-        "NOLINT" => "Lets files opt out of lint.",
-        "CHMOD" => "Flags dubious executable bits.",
-        "SPELL" => "Detects common spelling mistakes.",
-        "S&RX" => "Runs a script and parses output with a regex.",
-        "COMPOSER" => "Flags stale composer.lock files.",
-        "PHL" => "Enforces one class per file in PHP.",
-        "JSHint" => "Checks JavaScript with JSHint.",
-        "JSCS" => "Checks JavaScript code style.",
-        "CSSLint" => "Checks CSS with CSSLint.",
-        "LESSC" => "Checks LESS files with lessc.",
-        "GJSLINT" => "Checks JavaScript with Closure Linter.",
-        "COFFEE" => "Checks CoffeeScript with CoffeeLint.",
-        "flake8" => "Checks Python with flake8.",
-        "PYFLAKES" => "Checks Python with PyFlakes.",
-        "PyLint" => "Checks Python with PyLint.",
-        "PEP8" => "Checks Python style with pep8.",
-        "RuboCop" => "Checks Ruby with RuboCop.",
-        "RUBY" => "Checks Ruby syntax.",
-        "cppcheck" => "Analyzes C/C++ with cppcheck.",
-        "C++ Google's Styleguide" => "Checks C++ style with cpplint.",
-        "GOLINT" => "Checks Go with Golint.",
-        "HLINT" => "Checks Haskell with HLint.",
-        "C#" => "Checks C# with a Mono runner.",
-        "PHPCS" => "Checks PHP with PHP CodeSniffer.",
-        "PHP" => "Checks PHP syntax with php -l.",
-        "PUPPETLINT" => "Checks Puppet with puppet-lint.",
-        "XHP" => "Lints legacy XHP PHP files.",
-        _ => "Lint rule.",
+        "TXT" => Some("Basic text checks: tabs, trailing whitespace, newlines."),
+        "NAME" => Some("Requires boring file names."),
+        "JSON" => Some("Detects syntax errors in JSON files."),
+        "XML" => Some("Detects malformed XML files."),
+        "MERGECONFLICT" => Some("Detects unresolved merge-conflict markers."),
+        "GEN" => Some("Skips generated files."),
+        "NOLINT" => Some("Lets files opt out of lint."),
+        "CHMOD" => Some("Flags dubious executable bits."),
+        "SPELL" => Some("Detects common spelling mistakes."),
+        "S&RX" => Some("Runs a script and parses output with a regex."),
+        "COMPOSER" => Some("Flags stale composer.lock files."),
+        "PHL" => Some("Enforces one class per file in PHP."),
+        _ => None,
+    }
+}
+
+/// Summaries for the web and script-language linters.
+fn describe_script_linters(name: &str) -> Option<&'static str> {
+    match name {
+        "JSHint" => Some("Checks JavaScript with JSHint."),
+        "JSCS" => Some("Checks JavaScript code style."),
+        "CSSLint" => Some("Checks CSS with CSSLint."),
+        "LESSC" => Some("Checks LESS files with lessc."),
+        "GJSLINT" => Some("Checks JavaScript with Closure Linter."),
+        "COFFEE" => Some("Checks CoffeeScript with CoffeeLint."),
+        "flake8" => Some("Checks Python with flake8."),
+        "PYFLAKES" => Some("Checks Python with PyFlakes."),
+        "PyLint" => Some("Checks Python with PyLint."),
+        "PEP8" => Some("Checks Python style with pep8."),
+        "RuboCop" => Some("Checks Ruby with RuboCop."),
+        _ => None,
+    }
+}
+
+/// Summaries for the compiled-language and remaining linters.
+fn describe_compiled_linters(name: &str) -> Option<&'static str> {
+    match name {
+        "RUBY" => Some("Checks Ruby syntax."),
+        "cppcheck" => Some("Analyzes C/C++ with cppcheck."),
+        "C++ Google's Styleguide" => Some("Checks C++ style with cpplint."),
+        "GOLINT" => Some("Checks Go with Golint."),
+        "HLINT" => Some("Checks Haskell with HLint."),
+        "C#" => Some("Checks C# with a Mono runner."),
+        "PHPCS" => Some("Checks PHP with PHP CodeSniffer."),
+        "PHP" => Some("Checks PHP syntax with php -l."),
+        "PUPPETLINT" => Some("Checks Puppet with puppet-lint."),
+        "XHP" => Some("Lints legacy XHP PHP files."),
+        _ => None,
     }
 }
 
@@ -856,115 +884,145 @@ fn at_boundary(rest: &str) -> bool {
 pub fn parse_version(pattern: VersionPattern, stdout: &str, stderr: &str) -> Option<String> {
     match pattern {
         VersionPattern::ExactTriple | VersionPattern::LenientTriple => {
-            let text = stdout.trim();
-            let (version, rest) = take_triple(text)?;
-            if !rest.is_empty() || version.bytes().filter(|b| *b == b'.').count() != 2 {
-                return None;
-            }
-            Some(version)
+            parse_exact_triple_version(stdout)
         }
-        VersionPattern::Cppcheck => {
-            let text = stdout.trim().strip_prefix("Cppcheck ")?;
-            let (version, rest) = take_triple(text)?;
-            if !rest.is_empty() {
-                return None;
-            }
-            Some(version)
-        }
-        VersionPattern::CssV => {
-            let text = stdout.trim().strip_prefix('v')?;
-            let (version, rest) = take_triple(text)?;
-            if !rest.is_empty() || version.bytes().filter(|b| *b == b'.').count() != 2 {
-                return None;
-            }
-            Some(version)
-        }
-        VersionPattern::PrefixMinor => {
-            let text = stdout.trim_start();
-            let (version, rest) = take_triple(text)?;
-            if !at_boundary(rest) {
-                return None;
-            }
-            Some(version)
-        }
-        VersionPattern::Hlint => {
-            let (_, after) = stdout.split_once("HLint v")?;
-            let line = after.split('\n').next().unwrap_or(after);
-            let (version, _) = line.rsplit_once(',')?;
-            let version = version.trim();
-            if version.is_empty() {
-                return None;
-            }
-            Some(version.to_string())
-        }
-        VersionPattern::JshintStderr => {
-            let text = stderr.trim().strip_prefix("jshint v")?;
-            let (version, rest) = take_triple(text)?;
-            if !rest.is_empty() || version.bytes().filter(|b| *b == b'.').count() != 2 {
-                return None;
-            }
-            Some(version)
-        }
-        VersionPattern::PuppetLint => {
-            let text = stdout.trim().strip_prefix("puppet-lint ")?;
-            let (version, rest) = take_triple(text)?;
-            if !rest.is_empty() || version.bytes().filter(|b| *b == b'.').count() != 2 {
-                return None;
-            }
-            Some(version)
-        }
-        VersionPattern::Pyflakes => {
-            let text = stdout.trim();
-            let (version, rest) = take_triple(text)?;
-            if version.bytes().filter(|b| *b == b'.').count() != 2 {
-                return None;
-            }
-            if rest.is_empty() || rest.starts_with(" Python") {
-                Some(version)
-            } else {
-                None
-            }
-        }
-        VersionPattern::Pylint => {
-            let text = stdout.trim_start().strip_prefix("pylint ")?;
-            let (version, rest) = take_triple(text)?;
-            if version.bytes().filter(|b| *b == b'.').count() != 2 {
-                return None;
-            }
-            let _ = rest;
-            Some(version)
-        }
-        VersionPattern::Phpcs => {
-            let text = stdout
-                .trim_start()
-                .strip_prefix("PHP_CodeSniffer version ")?;
-            let (version, rest) = take_triple(text)?;
-            if version.bytes().filter(|b| *b == b'.').count() != 2 || !at_boundary(rest) {
-                return None;
-            }
-            Some(version)
-        }
-        VersionPattern::Ruby => {
-            let mut text = stdout.trim_start().strip_prefix("ruby ")?;
-            let mut version = None;
-            while let Some((triple, rest)) = take_triple(text) {
-                if triple.bytes().filter(|b| *b == b'.').count() != 2 {
-                    break;
-                }
-                version = Some(triple);
-                text = rest;
-            }
-            version
-        }
-        VersionPattern::PhpVersion => {
-            let version = stdout.trim();
-            if version.is_empty() {
-                return None;
-            }
-            Some(version.to_string())
-        }
+        VersionPattern::Cppcheck => parse_cppcheck_version(stdout),
+        VersionPattern::CssV => parse_css_version(stdout),
+        VersionPattern::PrefixMinor => parse_prefix_minor_version(stdout),
+        VersionPattern::Hlint => parse_hlint_version(stdout),
+        VersionPattern::JshintStderr => parse_jshint_version(stderr),
+        VersionPattern::PuppetLint => parse_puppet_lint_version(stdout),
+        VersionPattern::Pyflakes => parse_pyflakes_version(stdout),
+        VersionPattern::Pylint => parse_pylint_version(stdout),
+        VersionPattern::Phpcs => parse_phpcs_version(stdout),
+        VersionPattern::Ruby => parse_ruby_version(stdout),
+        VersionPattern::PhpVersion => parse_php_version(stdout),
         VersionPattern::RunOnly => None,
     }
+}
+
+/// Parse a full `major.minor.patch` triple consuming all of `text`.
+fn take_full_triple(text: &str) -> Option<String> {
+    let (version, rest) = take_triple(text)?;
+    if !rest.is_empty() || version.bytes().filter(|b| *b == b'.').count() != 2 {
+        return None;
+    }
+    Some(version)
+}
+
+/// `^\d+\.\d+\.\d+$` on stdout.
+fn parse_exact_triple_version(stdout: &str) -> Option<String> {
+    take_full_triple(stdout.trim())
+}
+
+/// `^Cppcheck \d+\.\d+(\.\d+)?$` on stdout.
+fn parse_cppcheck_version(stdout: &str) -> Option<String> {
+    let text = stdout.trim().strip_prefix("Cppcheck ")?;
+    let (version, rest) = take_triple(text)?;
+    if !rest.is_empty() {
+        return None;
+    }
+    Some(version)
+}
+
+/// `^v\d+\.\d+\.\d+$` on stdout.
+fn parse_css_version(stdout: &str) -> Option<String> {
+    let text = stdout.trim().strip_prefix('v')?;
+    take_full_triple(text)
+}
+
+/// `^(\d+\.\d+(\.\d+)?)\b` prefix on stdout.
+fn parse_prefix_minor_version(stdout: &str) -> Option<String> {
+    let text = stdout.trim_start();
+    let (version, rest) = take_triple(text)?;
+    if !at_boundary(rest) {
+        return None;
+    }
+    Some(version)
+}
+
+/// `HLint v(.*),` scan on stdout.
+fn parse_hlint_version(stdout: &str) -> Option<String> {
+    let (_, after) = stdout.split_once("HLint v")?;
+    let line = after.split('\n').next().unwrap_or(after);
+    let (version, _) = line.rsplit_once(',')?;
+    let version = version.trim();
+    if version.is_empty() {
+        return None;
+    }
+    Some(version.to_string())
+}
+
+/// `^jshint v\d+\.\d+\.\d+$` on stderr.
+fn parse_jshint_version(stderr: &str) -> Option<String> {
+    let text = stderr.trim().strip_prefix("jshint v")?;
+    take_full_triple(text)
+}
+
+/// `^puppet-lint \d+\.\d+\.\d+$` on stdout.
+fn parse_puppet_lint_version(stdout: &str) -> Option<String> {
+    let text = stdout.trim().strip_prefix("puppet-lint ")?;
+    take_full_triple(text)
+}
+
+/// `^(\d+\.\d+\.\d+)( Python.*)?$` on stdout.
+fn parse_pyflakes_version(stdout: &str) -> Option<String> {
+    let text = stdout.trim();
+    let (version, rest) = take_triple(text)?;
+    if version.bytes().filter(|b| *b == b'.').count() != 2 {
+        return None;
+    }
+    if rest.is_empty() || rest.starts_with(" Python") {
+        Some(version)
+    } else {
+        None
+    }
+}
+
+/// `^pylint \d+\.\d+\.\d+` prefix on stdout.
+fn parse_pylint_version(stdout: &str) -> Option<String> {
+    let text = stdout.trim_start().strip_prefix("pylint ")?;
+    let (version, rest) = take_triple(text)?;
+    if version.bytes().filter(|b| *b == b'.').count() != 2 {
+        return None;
+    }
+    let _ = rest;
+    Some(version)
+}
+
+/// `^PHP_CodeSniffer version \d+\.\d+\.\d+\b` prefix on stdout.
+fn parse_phpcs_version(stdout: &str) -> Option<String> {
+    let text = stdout
+        .trim_start()
+        .strip_prefix("PHP_CodeSniffer version ")?;
+    let (version, rest) = take_triple(text)?;
+    if version.bytes().filter(|b| *b == b'.').count() != 2 || !at_boundary(rest) {
+        return None;
+    }
+    Some(version)
+}
+
+/// `^ruby \d+\.\d+\.\d+` prefix on stdout.
+fn parse_ruby_version(stdout: &str) -> Option<String> {
+    let mut text = stdout.trim_start().strip_prefix("ruby ")?;
+    let mut version = None;
+    while let Some((triple, rest)) = take_triple(text) {
+        if triple.bytes().filter(|b| *b == b'.').count() != 2 {
+            break;
+        }
+        version = Some(triple);
+        text = rest;
+    }
+    version
+}
+
+/// Raw `php --run 'echo phpversion();'` output, trimmed.
+fn parse_php_version(stdout: &str) -> Option<String> {
+    let version = stdout.trim();
+    if version.is_empty() {
+        return None;
+    }
+    Some(version.to_string())
 }
 
 /// A version-probe failure, shown as an exception in verbose mode.
@@ -1156,65 +1214,86 @@ pub fn configured_classes(cwd: &Path) -> Result<Vec<&'static str>, String> {
         Ok(work) => work,
         Err(_) => return Ok(Vec::new()),
     };
+    let Some(class) = configured_engine_class(&work) else {
+        return Ok(Vec::new());
+    };
+    classes_for_engine(&work, &class)
+}
+
+/// Resolve the effective engine class: `.arcconfig` `lint.engine`, else
+/// the configuration-driven engine when `.arclint` exists, else none.
+fn configured_engine_class(work: &arc_rs::lint::WorkCopy) -> Option<String> {
     let class = arc_rs::lint::arcconfig_value(&work.project_root, "lint.engine")
         .ok()
         .flatten()
         .and_then(|value| value.as_str().map(str::to_string))
         .filter(|name| !name.is_empty());
-    let class = match class {
-        Some(class) => class,
-        None => {
-            if work
-                .project_root
-                .join(arc_rs::arclint::CONFIG_FILE_NAME)
-                .is_file()
-            {
-                arc_rs::lint::ENGINE_CONFIGURATION_DRIVEN.to_string()
-            } else {
-                return Ok(Vec::new());
-            }
-        }
-    };
-    match class.as_str() {
-        arc_rs::lint::ENGINE_CONFIGURATION_DRIVEN => {
-            let config = arc_rs::arclint::load_arclint(&work.project_root)?;
-            let mut classes = Vec::new();
-            for spec in &config.linters {
-                if let Some(meta) = LINTERS.iter().find(|meta| meta.display == spec.display)
-                    && !classes.contains(&meta.class)
-                {
-                    classes.push(meta.class);
-                }
-            }
-            Ok(classes)
-        }
+    if class.is_some() {
+        return class;
+    }
+    if work
+        .project_root
+        .join(arc_rs::arclint::CONFIG_FILE_NAME)
+        .is_file()
+    {
+        return Some(arc_rs::lint::ENGINE_CONFIGURATION_DRIVEN.to_string());
+    }
+    None
+}
+
+/// Configured linter classes for an engine class name.
+fn classes_for_engine(
+    work: &arc_rs::lint::WorkCopy,
+    class: &str,
+) -> Result<Vec<&'static str>, String> {
+    match class {
+        arc_rs::lint::ENGINE_CONFIGURATION_DRIVEN => configuration_driven_classes(work),
         arc_rs::lint::ENGINE_COMPREHENSIVE => {
             // With no paths, only the filename linter is built.
             Ok(vec!["ArcanistFilenameLinter"])
         }
-        arc_rs::lint::ENGINE_SINGLE => {
-            const KEY: &str = "lint.engine.single.linter";
-            let name = arc_rs::lint::arcconfig_value(&work.project_root, KEY)
-                .ok()
-                .flatten()
-                .and_then(|value| value.as_str().map(str::to_string))
-                .filter(|name| !name.is_empty());
-            let Some(name) = name else {
-                return Err(format!(
-                    "You must configure '{KEY}' with the name of a linter in order to use {}.",
-                    arc_rs::lint::ENGINE_SINGLE
-                ));
-            };
-            match LINTERS.iter().find(|meta| meta.class == name) {
-                Some(meta) => Ok(vec![meta.class]),
-                None => Err(format!(
-                    "Linter '{name}' configured in '{KEY}' does not exist!"
-                )),
-            }
-        }
+        arc_rs::lint::ENGINE_SINGLE => single_engine_class(work),
         _ => Err(format!(
             "Configured lint engine \"{class}\" is not a subclass of \"{}\", but must be.",
             arc_rs::lint::ENGINE_BASE_CLASS
+        )),
+    }
+}
+
+/// Classes named by `.arclint`, class-grouped in config order.
+fn configuration_driven_classes(
+    work: &arc_rs::lint::WorkCopy,
+) -> Result<Vec<&'static str>, String> {
+    let config = arc_rs::arclint::load_arclint(&work.project_root)?;
+    let mut classes = Vec::new();
+    for spec in &config.linters {
+        if let Some(meta) = LINTERS.iter().find(|meta| meta.display == spec.display)
+            && !classes.contains(&meta.class)
+        {
+            classes.push(meta.class);
+        }
+    }
+    Ok(classes)
+}
+
+/// The single linter class named by `lint.engine.single.linter`.
+fn single_engine_class(work: &arc_rs::lint::WorkCopy) -> Result<Vec<&'static str>, String> {
+    const KEY: &str = "lint.engine.single.linter";
+    let name = arc_rs::lint::arcconfig_value(&work.project_root, KEY)
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .filter(|name| !name.is_empty());
+    let Some(name) = name else {
+        return Err(format!(
+            "You must configure '{KEY}' with the name of a linter in order to use {}.",
+            arc_rs::lint::ENGINE_SINGLE
+        ));
+    };
+    match LINTERS.iter().find(|meta| meta.class == name) {
+        Some(meta) => Ok(vec![meta.class]),
+        None => Err(format!(
+            "Linter '{name}' configured in '{KEY}' does not exist!"
         )),
     }
 }
@@ -1294,78 +1373,114 @@ pub fn sort_entries(entries: Vec<&LinterEntry>) -> Vec<&LinterEntry> {
 pub fn render_entries(entries: &[&LinterEntry], verbose: bool) -> String {
     let mut out = String::new();
     for entry in entries {
-        let meta = entry.meta;
         if verbose {
-            out.push('\n');
-            out.push_str(&format!(
-                " {:<10}  {} ({})\n",
-                entry.status.text(),
-                meta.info_name,
-                meta.class
-            ));
+            render_verbose_entry(entry, &mut out);
         } else {
-            out.push_str(&format!(
-                " {:<10}  {} ({})\n",
-                entry.status.text(),
-                meta.config_name,
-                meta.info_name
-            ));
-            continue;
-        }
-
-        let mut tail = false;
-        if let Some(error) = &entry.error {
-            tail = true;
-            out.push('\n');
-            out.push_str(&format!("    {}\n", error.class));
-            out.push_str(&arc_rs::lint::word_wrap(&error.message, 4));
-            out.push('\n');
-        }
-        if entry.version.is_some() || meta.uri.is_some() {
-            tail = true;
-            out.push('\n');
-            if let Some(version) = &entry.version {
-                out.push_str(&format!("    Version {version}\n"));
-            }
-            if let Some(uri) = meta.uri {
-                out.push_str(&format!("    {uri}\n"));
-            }
-        }
-        if let Some(description) = meta.description {
-            tail = true;
-            out.push('\n');
-            out.push_str(&arc_rs::lint::word_wrap(description, 4));
-            out.push('\n');
-        }
-        let options = meta.options();
-        if !options.is_empty() {
-            tail = true;
-            out.push_str("\n    Configuration Options\n\n");
-            let rendered: Vec<String> = options
-                .iter()
-                .map(|option| {
-                    format!(
-                        "    {} ({})\n{}\n",
-                        option.name,
-                        option.option_type,
-                        arc_rs::lint::word_wrap(&meta.option_help(option), 6)
-                    )
-                })
-                .collect();
-            out.push_str(&rendered.join("\n"));
-        }
-        if meta.class == "ArcanistXHPASTLinter" {
-            out.push_str("\n    Linter Rules\n\n");
-            out.push_str(&xhpast_rules_table());
-        }
-        if tail {
-            out.push('\n');
+            render_brief_entry(entry, &mut out);
         }
     }
     if !verbose {
         out.push_str("(Run `arc linters --verbose` for more details.)\n");
     }
     out
+}
+
+/// One non-verbose entry line.
+fn render_brief_entry(entry: &LinterEntry, out: &mut String) {
+    let meta = entry.meta;
+    out.push_str(&format!(
+        " {:<10}  {} ({})\n",
+        entry.status.text(),
+        meta.config_name,
+        meta.info_name
+    ));
+}
+
+/// One verbose entry: header plus error, version, description, options,
+/// and XHP rules sections.
+fn render_verbose_entry(entry: &LinterEntry, out: &mut String) {
+    let meta = entry.meta;
+    out.push('\n');
+    out.push_str(&format!(
+        " {:<10}  {} ({})\n",
+        entry.status.text(),
+        meta.info_name,
+        meta.class
+    ));
+    let mut tail = false;
+    tail |= render_entry_error(entry, out);
+    tail |= render_entry_version(entry, out);
+    tail |= render_entry_description(entry, out);
+    tail |= render_entry_options(entry, out);
+    if meta.class == "ArcanistXHPASTLinter" {
+        out.push_str("\n    Linter Rules\n\n");
+        out.push_str(&xhpast_rules_table());
+    }
+    if tail {
+        out.push('\n');
+    }
+}
+
+/// A probe failure, shown as an exception. Returns true when written.
+fn render_entry_error(entry: &LinterEntry, out: &mut String) -> bool {
+    let Some(error) = &entry.error else {
+        return false;
+    };
+    out.push('\n');
+    out.push_str(&format!("    {}\n", error.class));
+    out.push_str(&arc_rs::lint::word_wrap(&error.message, 4));
+    out.push('\n');
+    true
+}
+
+/// The version/URI block. Returns true when written.
+fn render_entry_version(entry: &LinterEntry, out: &mut String) -> bool {
+    let meta = entry.meta;
+    if entry.version.is_none() && meta.uri.is_none() {
+        return false;
+    }
+    out.push('\n');
+    if let Some(version) = &entry.version {
+        out.push_str(&format!("    Version {version}\n"));
+    }
+    if let Some(uri) = meta.uri {
+        out.push_str(&format!("    {uri}\n"));
+    }
+    true
+}
+
+/// The description block. Returns true when written.
+fn render_entry_description(entry: &LinterEntry, out: &mut String) -> bool {
+    let Some(description) = entry.meta.description else {
+        return false;
+    };
+    out.push('\n');
+    out.push_str(&arc_rs::lint::word_wrap(description, 4));
+    out.push('\n');
+    true
+}
+
+/// The configuration-options block. Returns true when written.
+fn render_entry_options(entry: &LinterEntry, out: &mut String) -> bool {
+    let meta = entry.meta;
+    let options = meta.options();
+    if options.is_empty() {
+        return false;
+    }
+    out.push_str("\n    Configuration Options\n\n");
+    let rendered: Vec<String> = options
+        .iter()
+        .map(|option| {
+            format!(
+                "    {} ({})\n{}\n",
+                option.name,
+                option.option_type,
+                arc_rs::lint::word_wrap(&meta.option_help(option), 6)
+            )
+        })
+        .collect();
+    out.push_str(&rendered.join("\n"));
+    true
 }
 
 /// The exact-match failure message (`renderLinters()`, `:226-235`).

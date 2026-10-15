@@ -2093,26 +2093,48 @@ impl Engine {
         section.severity.severity_for(lookup, SEVERITY_ERROR) != SEVERITY_DISABLED
     }
 
+    /// Comprehensive allow-list for `path`: `None` when the path is
+    /// excluded (`externals/`), else the permitted display names (or
+    /// `None` when routing is off).
+    fn bytes_allowed(&self, path: &str) -> Option<Option<Vec<&'static str>>> {
+        if !self.comprehensive {
+            return Some(None);
+        }
+        comprehensive_linters_for(path).map(Some)
+    }
+
+    /// True when a section running the linter `name` covers `path`
+    /// under the comprehensive allow-list.
+    fn section_runs_on(&self, name: &str, path: &str, allowed: &Option<Vec<&'static str>>) -> bool {
+        let routed = self
+            .sections
+            .iter()
+            .any(|section| section.linter.name() == name && section.routing.allows(path));
+        routed && allowed.as_ref().is_none_or(|names| names.contains(&name))
+    }
+
+    /// True when generated/`@nolint` markers skip every linter on this
+    /// path (PHP `shouldStopAllLinters`): only when the stopping
+    /// linter (`GEN`, `NOLINT`) runs on this path.
+    fn bytes_globally_skipped(
+        &self,
+        path: &str,
+        data: &[u8],
+        allowed: &Option<Vec<&'static str>>,
+    ) -> bool {
+        let generated =
+            self.section_runs_on("GEN", path, allowed) && crate::lint_generated::is_generated(data);
+        let nolint =
+            self.section_runs_on("NOLINT", path, allowed) && crate::lint_nolint::is_nolint(data);
+        generated || nolint
+    }
+
     #[must_use]
     pub fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {
-        let routed = self.comprehensive.then(|| comprehensive_linters_for(path));
-        if let Some(None) = routed {
+        let Some(allowed) = self.bytes_allowed(path) else {
             return Vec::new();
-        }
-        let allowed = routed.flatten();
-        let runs = |name: &str| {
-            self.sections
-                .iter()
-                .any(|section| section.linter.name() == name && section.routing.allows(path))
-                && allowed.as_ref().is_none_or(|names| names.contains(&name))
         };
-
-        // PHP `shouldStopAllLinters`: generated and `@nolint` files skip
-        // every linter, but only when the stopping linter (`GEN`,
-        // `NOLINT`) runs on this path.
-        let generated = runs("GEN") && crate::lint_generated::is_generated(data);
-        let nolint = runs("NOLINT") && crate::lint_nolint::is_nolint(data);
-        if generated || nolint {
+        if self.bytes_globally_skipped(path, data, &allowed) {
             return Vec::new();
         }
 
@@ -2723,40 +2745,61 @@ pub fn collect_explicit(
 fn status_paths(work: &WorkCopy, base: Option<&str>) -> Result<Vec<String>, String> {
     let mut merged: BTreeMap<String, u32> = BTreeMap::new();
     match work.vcs {
-        Vcs::Git => {
-            let root = &work.vcs_root;
-            if let Some(base) = base {
-                for (path, mask) in git::commit_range_status(root, base)? {
-                    *merged.entry(path).or_default() |= mask;
-                }
-            }
-            for (path, mask) in git::uncommitted_status(root)? {
-                *merged.entry(path).or_default() |= mask;
-            }
-            merged.retain(|_, mask| *mask & git::FLAG_UNTRACKED == 0);
-        }
-        Vcs::Hg => {
-            let root = &work.vcs_root;
-            if let Some(base) = base {
-                for (path, mask) in hg::get_commit_range_status(root, base)? {
-                    *merged.entry(path).or_default() |= mask;
-                }
-            }
-            for (path, mask) in hg::get_uncommitted_status(root)? {
-                *merged.entry(path).or_default() |= mask;
-            }
-            merged.retain(|_, mask| *mask & hg::FLAG_UNTRACKED == 0);
-        }
-        Vcs::Svn => {
-            let status = svn::get_uncommitted_status(&work.vcs_root, &[])?;
-            for (path, mask) in status {
-                if mask & svn::FLAG_UNTRACKED == 0 {
-                    merged.insert(path, mask);
-                }
-            }
-        }
+        Vcs::Git => merge_git_status(&work.vcs_root, base, &mut merged)?,
+        Vcs::Hg => merge_hg_status(&work.vcs_root, base, &mut merged)?,
+        Vcs::Svn => merge_svn_status(&work.vcs_root, &mut merged)?,
     }
     Ok(merged.keys().cloned().collect())
+}
+
+/// Merge the git commit range (when `base` is set) plus uncommitted
+/// status into `merged`, minus untracked paths.
+fn merge_git_status(
+    root: &Path,
+    base: Option<&str>,
+    merged: &mut BTreeMap<String, u32>,
+) -> Result<(), String> {
+    if let Some(base) = base {
+        for (path, mask) in git::commit_range_status(root, base)? {
+            *merged.entry(path).or_default() |= mask;
+        }
+    }
+    for (path, mask) in git::uncommitted_status(root)? {
+        *merged.entry(path).or_default() |= mask;
+    }
+    merged.retain(|_, mask| *mask & git::FLAG_UNTRACKED == 0);
+    Ok(())
+}
+
+/// Merge the Mercurial commit range (when `base` is set) plus
+/// uncommitted status into `merged`, minus untracked paths.
+fn merge_hg_status(
+    root: &Path,
+    base: Option<&str>,
+    merged: &mut BTreeMap<String, u32>,
+) -> Result<(), String> {
+    if let Some(base) = base {
+        for (path, mask) in hg::get_commit_range_status(root, base)? {
+            *merged.entry(path).or_default() |= mask;
+        }
+    }
+    for (path, mask) in hg::get_uncommitted_status(root)? {
+        *merged.entry(path).or_default() |= mask;
+    }
+    merged.retain(|_, mask| *mask & hg::FLAG_UNTRACKED == 0);
+    Ok(())
+}
+
+/// Merge the Subversion worktree status into `merged`, minus untracked
+/// paths.
+fn merge_svn_status(root: &Path, merged: &mut BTreeMap<String, u32>) -> Result<(), String> {
+    let status = svn::get_uncommitted_status(root, &[])?;
+    for (path, mask) in status {
+        if mask & svn::FLAG_UNTRACKED == 0 {
+            merged.insert(path, mask);
+        }
+    }
+    Ok(())
 }
 
 /// All tracked files (`--everything`), mirroring `getAllFiles()`.
@@ -3494,31 +3537,46 @@ pub fn word_wrap(text: &str, indent: usize) -> String {
             out.push('\n');
             continue;
         }
-        let mut line_len = 0;
-        for word in paragraph.split(' ') {
-            if word.is_empty() {
-                continue;
-            }
-            let width = indent + line_len + if line_len > 0 { 1 } else { 0 } + word.len();
-            if line_len > 0 && width > WIDTH {
-                out.push('\n');
-                line_len = 0;
-            }
-            if line_len == 0 {
-                out.push_str(&prefix);
-            } else {
-                out.push(' ');
-            }
-            out.push_str(word);
-            line_len += if line_len > 0 {
-                word.len() + 1
-            } else {
-                word.len()
-            };
-        }
+        wrap_paragraph(paragraph, &prefix, indent, WIDTH, &mut out);
         out.push('\n');
     }
     out
+}
+
+/// Wrap one non-empty paragraph into `out` (without the trailing newline).
+fn wrap_paragraph(paragraph: &str, prefix: &str, indent: usize, width: usize, out: &mut String) {
+    let mut line_len = 0;
+    for word in paragraph.split(' ') {
+        if word.is_empty() {
+            continue;
+        }
+        line_len = wrap_push_word(out, prefix, indent, width, line_len, word);
+    }
+}
+
+/// Append one word at `line_len`, breaking the line past `width`.
+/// Returns the new current-line length.
+fn wrap_push_word(
+    out: &mut String,
+    prefix: &str,
+    indent: usize,
+    width: usize,
+    line_len: usize,
+    word: &str,
+) -> usize {
+    if line_len > 0 && indent + line_len + 1 + word.len() > width {
+        out.push('\n');
+        out.push_str(prefix);
+        out.push_str(word);
+        return word.len();
+    }
+    if line_len == 0 {
+        out.push_str(prefix);
+    } else {
+        out.push(' ');
+    }
+    out.push_str(word);
+    line_len + usize::from(line_len > 0) + word.len()
 }
 
 /// Render one result in console format
@@ -3570,16 +3628,44 @@ fn split_keep_ends(text: &str) -> Vec<String> {
 }
 
 fn render_context(message: &LintMessage, data: &[u8]) -> String {
-    const CONTEXT: usize = 3;
     let data_text = String::from_utf8_lossy(data).into_owned();
     let old_lines: Vec<String> = split_keep_ends(&data_text);
 
     let (line, char, original, replacement) = trimmed_patch(message);
     let old_impact = original.bytes().filter(|b| *b == b'\n').count() + 1;
     let mut start = line;
-    let max_old = old_lines.len();
 
     // PHI1782: messages past the end of the file render a warning.
+    if let Some(invalid) = context_past_end_message(start, old_lines.len(), &original, char) {
+        return invalid;
+    }
+
+    let patchable = message.is_patchable();
+    let mut new_lines: Vec<String> = Vec::new();
+    let (old_impact, new_impact) = if patchable {
+        let patch = ContextPatch {
+            line,
+            char,
+            original: &original,
+            replacement: replacement.as_deref(),
+            old_impact,
+        };
+        context_patch_impacts(&data_text, &old_lines, &mut new_lines, &mut start, &patch)
+    } else {
+        (0, 0)
+    };
+
+    let specs = context_build_specs(&old_lines, &new_lines, start, old_impact, new_impact);
+    context_render_specs(&specs, patchable, original.is_empty(), char)
+}
+
+/// PHI1782 warning when a message sits past the end of the file.
+fn context_past_end_message(
+    start: usize,
+    max_old: usize,
+    original: &str,
+    char: usize,
+) -> Option<String> {
     let invalid = if start > max_old + 1 {
         true
     } else if start > max_old {
@@ -3587,60 +3673,115 @@ fn render_context(message: &LintMessage, data: &[u8]) -> String {
     } else {
         false
     };
-    if invalid {
-        return format!(
-            "{}\n\n",
-            render_line(
-                Some(start),
-                &format!(
-                    "(This message was raised at line {}, but the file only has {} line(s).)",
-                    format_number(start),
-                    format_number(max_old),
-                ),
-                false,
-                None,
-            )
-        );
+    if !invalid {
+        return None;
     }
+    Some(format!(
+        "{}\n\n",
+        render_line(
+            Some(start),
+            &format!(
+                "(This message was raised at line {}, but the file only has {} line(s).)",
+                format_number(start),
+                format_number(max_old),
+            ),
+            false,
+            None,
+        )
+    ))
+}
 
-    let patchable = message.is_patchable();
-    let mut new_lines: Vec<String> = Vec::new();
-    let (old_impact, new_impact) = if patchable {
-        let line_map = offset_map(&data_text);
-        let patch_offset = line_map.get(&line).copied().unwrap_or(0) + char.saturating_sub(1);
-        let replacement_text = replacement.clone().unwrap_or_default();
-        let mut new_data = data_text.as_bytes().to_vec();
-        let end = (patch_offset + original.len()).min(new_data.len());
-        new_data.splice(
-            patch_offset.min(new_data.len())..end,
-            replacement_text.bytes(),
-        );
-        let new_text = String::from_utf8_lossy(&new_data).into_owned();
-        new_lines = split_keep_ends(&new_text);
-        let new_impact = replacement_text.bytes().filter(|b| *b == b'\n').count() + 1;
-        shrink_ranges(&old_lines, &new_lines, &mut start, old_impact, new_impact)
-    } else {
-        (0, 0)
-    };
+/// Trimmed patch inputs for [`context_patch_impacts`].
+struct ContextPatch<'a> {
+    line: usize,
+    char: usize,
+    original: &'a str,
+    replacement: Option<&'a str>,
+    old_impact: usize,
+}
 
-    struct Spec {
-        text: String,
-        number: Option<usize>,
-        diff: Option<char>,
-        chevron: bool,
-    }
-    let mut specs: Vec<Spec> = Vec::new();
+/// Apply a patchable message's patch to `data_text`, fill `new_lines`,
+/// and return the shrunk old/new impacts (adjusting `start`).
+fn context_patch_impacts(
+    data_text: &str,
+    old_lines: &[String],
+    new_lines: &mut Vec<String>,
+    start: &mut usize,
+    patch: &ContextPatch,
+) -> (usize, usize) {
+    let line_map = offset_map(data_text);
+    let patch_offset =
+        line_map.get(&patch.line).copied().unwrap_or(0) + patch.char.saturating_sub(1);
+    let replacement_text = patch.replacement.unwrap_or_default();
+    let mut new_data = data_text.as_bytes().to_vec();
+    let end = (patch_offset + patch.original.len()).min(new_data.len());
+    new_data.splice(
+        patch_offset.min(new_data.len())..end,
+        replacement_text.bytes(),
+    );
+    let new_text = String::from_utf8_lossy(&new_data).into_owned();
+    *new_lines = split_keep_ends(&new_text);
+    let new_impact = replacement_text.bytes().filter(|b| *b == b'\n').count() + 1;
+    shrink_ranges(old_lines, new_lines, start, patch.old_impact, new_impact)
+}
+
+/// One context line to render.
+struct ContextSpec {
+    text: String,
+    number: Option<usize>,
+    diff: Option<char>,
+    chevron: bool,
+}
+
+/// Context lines: head context, the `-`/`+` diff, then foot context.
+fn context_build_specs(
+    old_lines: &[String],
+    new_lines: &[String],
+    start: usize,
+    old_impact: usize,
+    new_impact: usize,
+) -> Vec<ContextSpec> {
+    const CONTEXT: usize = 3;
+    let mut specs: Vec<ContextSpec> = Vec::new();
     let head = start.saturating_sub(CONTEXT).max(1);
     for number in head..start {
-        specs.push(Spec {
+        specs.push(ContextSpec {
             text: old_lines.get(number - 1).cloned().unwrap_or_default(),
             number: Some(number),
             diff: None,
             chevron: false,
         });
     }
+    context_push_diff_specs(
+        &mut specs, old_lines, new_lines, start, old_impact, new_impact,
+    );
+    let cursor = start + old_impact;
+    let foot = old_lines.len().min(cursor + CONTEXT);
+    for number in cursor..=foot {
+        if number == 0 {
+            continue;
+        }
+        specs.push(ContextSpec {
+            text: old_lines.get(number - 1).cloned().unwrap_or_default(),
+            number: Some(number),
+            diff: None,
+            chevron: number == cursor,
+        });
+    }
+    specs
+}
+
+/// The `-` old lines and `+` new lines of a patchable message.
+fn context_push_diff_specs(
+    specs: &mut Vec<ContextSpec>,
+    old_lines: &[String],
+    new_lines: &[String],
+    start: usize,
+    old_impact: usize,
+    new_impact: usize,
+) {
     for number in start..start + old_impact {
-        specs.push(Spec {
+        specs.push(ContextSpec {
             text: old_lines.get(number - 1).cloned().unwrap_or_default(),
             number: Some(number),
             diff: Some('-'),
@@ -3648,49 +3789,49 @@ fn render_context(message: &LintMessage, data: &[u8]) -> String {
         });
     }
     for number in start..start + new_impact {
-        specs.push(Spec {
+        specs.push(ContextSpec {
             text: new_lines.get(number - 1).cloned().unwrap_or_default(),
             number: None,
             diff: Some('+'),
             chevron: number == start,
         });
     }
-    let cursor = start + old_impact;
-    let foot = old_lines.len().min(cursor + CONTEXT);
-    for number in cursor..=foot {
-        if number == 0 {
-            continue;
-        }
-        specs.push(Spec {
-            text: old_lines.get(number - 1).cloned().unwrap_or_default(),
-            number: Some(number),
-            diff: None,
-            chevron: number == cursor,
-        });
-    }
+}
 
+/// Render context specs, marking the first chevron line (plus a caret
+/// for non-patchable messages without original text).
+fn context_render_specs(
+    specs: &[ContextSpec],
+    patchable: bool,
+    original_empty: bool,
+    char: usize,
+) -> String {
     let mut out = String::new();
     let mut seen_chevron = false;
-    for spec in &specs {
-        let chevron = if seen_chevron {
-            false
-        } else {
-            if spec.chevron {
-                seen_chevron = true;
-            }
-            spec.chevron
-        };
+    for spec in specs {
+        let chevron = context_take_chevron(spec.chevron, &mut seen_chevron);
         let mut text = spec.text.clone();
         if !text.ends_with('\n') {
             text.push('\n');
         }
         out.push_str(&render_line(spec.number, &text, chevron, spec.diff));
-        if chevron && !patchable && original.is_empty() {
+        if chevron && !patchable && original_empty {
             out.push_str(&render_caret(char));
             out.push('\n');
         }
     }
     out
+}
+
+/// Take a spec's chevron marker unless one was already shown.
+fn context_take_chevron(chevron: bool, seen_chevron: &mut bool) -> bool {
+    if *seen_chevron {
+        return false;
+    }
+    if chevron {
+        *seen_chevron = true;
+    }
+    chevron
 }
 
 /// Trim a shared prefix/suffix off a patchable message's texts
@@ -4235,42 +4376,93 @@ pub fn run_in_with_input(cwd: &Path, argv: &[String], input: &mut dyn BufRead) -
 fn run_workflow(cwd: &Path, options: &Options, input: &mut dyn BufRead) -> Result<i32, String> {
     let work = discover_working_copy(cwd)?;
     check_supports(options, work.vcs)?;
-
-    if options.everything && !options.paths.is_empty() {
-        return Err("You can not specify paths with --everything. The --everything flag lints every tracked file in the working copy."
-            .to_string());
-    }
-
+    reject_everything_with_paths(options)?;
     let engine = engine_for_workcopy(&work, options.engine.as_deref())?;
     if engine.is_empty() {
         return Err("No linters to run.".to_string());
     }
+    let mut results = workflow_gather(&work, cwd, options, &engine, input)?;
+    workflow_emit(&work, options, input, &mut results)
+}
 
-    // Resolve the commit-range base: explicit `--rev`, else the default
-    // base when linting the whole selection (`parseBaseCommitArgument()`
-    // plus `buildBaseCommit()`; svn has no ranges).
+/// Reject `--everything` combined with explicit paths.
+fn reject_everything_with_paths(options: &Options) -> Result<(), String> {
+    if options.everything && !options.paths.is_empty() {
+        return Err("You can not specify paths with --everything. The --everything flag lints every tracked file in the working copy."
+            .to_string());
+    }
+    Ok(())
+}
+
+/// Lint the selection and group the filtered messages by path.
+fn workflow_gather(
+    work: &WorkCopy,
+    cwd: &Path,
+    options: &Options,
+    engine: &Engine,
+    input: &mut dyn BufRead,
+) -> Result<Vec<LintResult>, String> {
+    let base = workflow_base(work, options, input)?;
+    let selection = workflow_selection(work, cwd, options, base.as_deref(), engine)?;
+    let messages = workflow_lint_selection(engine, work, &selection)?;
+    let minimum = options.severity.as_deref().unwrap_or(DEFAULT_SEVERITY);
+    let mut messages = filter_by_severity(messages, minimum);
+    if !lint_all(options) {
+        messages = workflow_filter_changed(work, base.as_deref(), &selection, messages)?;
+    }
+    Ok(workflow_group_results(work, messages))
+}
+
+/// Resolve the commit-range base: explicit `--rev`, else the default
+/// base when linting the whole selection (`parseBaseCommitArgument()`
+/// plus `buildBaseCommit()`; svn has no ranges).
+fn workflow_base(
+    work: &WorkCopy,
+    options: &Options,
+    input: &mut dyn BufRead,
+) -> Result<Option<String>, String> {
     let needs_base = options.rev.is_some() || (options.paths.is_empty() && !options.everything);
-    let base: Option<String> = if !needs_base || work.vcs == Vcs::Svn {
-        None
-    } else if let Some(rev) = &options.rev {
-        Some(match work.vcs {
-            Vcs::Git => git_base_for_rev(&work, rev)?,
-            Vcs::Hg => hg_base_for(&work, Some(rev))?,
-            Vcs::Svn => unreachable!("svn --rev rejected by check_supports"),
-        })
-    } else {
-        match work.vcs {
-            Vcs::Git => Some(git_default_base(&work, input, &mut |text| {
-                print!("{text}")
-            })?),
-            Vcs::Hg => Some(hg_base_for(&work, None)?),
-            Vcs::Svn => None,
-        }
-    };
+    if !needs_base || work.vcs == Vcs::Svn {
+        return Ok(None);
+    }
+    if let Some(rev) = &options.rev {
+        return workflow_explicit_base(work, rev).map(Some);
+    }
+    workflow_default_base(work, input)
+}
 
-    let lint_all = lint_all(options);
+/// Base for an explicit `--rev` symbol.
+fn workflow_explicit_base(work: &WorkCopy, rev: &str) -> Result<String, String> {
+    match work.vcs {
+        Vcs::Git => git_base_for_rev(work, rev),
+        Vcs::Hg => hg_base_for(work, Some(rev)),
+        Vcs::Svn => unreachable!("svn --rev rejected by check_supports"),
+    }
+}
+
+/// Default base commit (svn has no ranges).
+fn workflow_default_base(
+    work: &WorkCopy,
+    input: &mut dyn BufRead,
+) -> Result<Option<String>, String> {
+    match work.vcs {
+        Vcs::Git => git_default_base(work, input, &mut |text| print!("{text}")).map(Some),
+        Vcs::Hg => hg_base_for(work, None).map(Some),
+        Vcs::Svn => Ok(None),
+    }
+}
+
+/// Resolve lint targets: `--everything`, explicit paths, or worktree
+/// status. Errors when nothing is lintable.
+fn workflow_selection(
+    work: &WorkCopy,
+    cwd: &Path,
+    options: &Options,
+    base: Option<&str>,
+    engine: &Engine,
+) -> Result<Vec<String>, String> {
     let selection: Vec<String> = if options.everything {
-        let mut paths = everything_paths(&work)?;
+        let mut paths = everything_paths(work)?;
         paths.sort();
         paths
     } else if !options.paths.is_empty() {
@@ -4279,7 +4471,7 @@ fn run_workflow(cwd: &Path, options: &Options, input: &mut dyn BufRead) -> Resul
             .map(|(_, display)| display)
             .collect()
     } else {
-        status_paths(&work, base.as_deref())?
+        status_paths(work, base)?
     };
     if selection.is_empty() {
         return Err("No paths are lintable.".to_string());
@@ -4291,32 +4483,49 @@ fn run_workflow(cwd: &Path, options: &Options, input: &mut dyn BufRead) -> Resul
     {
         return Err("No paths are lintable.".to_string());
     }
+    Ok(selection)
+}
 
-    let disk_for = |path: &str| work.vcs_root.join(path);
+/// Lint every selected path, collecting messages.
+fn workflow_lint_selection(
+    engine: &Engine,
+    work: &WorkCopy,
+    selection: &[String],
+) -> Result<Vec<LintMessage>, String> {
     let mut messages = Vec::new();
-    for path in &selection {
-        let disk = disk_for(path);
+    for path in selection {
+        let disk = work.vcs_root.join(path);
         match engine.lint_file(&disk, path) {
             Ok(mut found) => messages.append(&mut found),
             Err(error) => return Err(format!("{path}: {error}")),
         }
     }
+    Ok(messages)
+}
 
-    let minimum = options.severity.as_deref().unwrap_or(DEFAULT_SEVERITY);
-    let mut messages = filter_by_severity(messages, minimum);
-    if !lint_all {
-        let mut changed: HashMap<String, Option<BTreeSet<usize>>> = HashMap::new();
-        for path in &selection {
-            // The base is always resolved when filtering under git/hg;
-            // svn diffs the worktree.
-            let lines = changed_lines_for(&work, base.as_deref().unwrap_or("HEAD"), path)?;
-            changed.insert(path.clone(), lines);
-        }
-        messages = filter_changed_lines(messages, &changed);
+/// Filter messages to changed lines (the base is always resolved when
+/// filtering under git/hg; svn diffs the worktree).
+fn workflow_filter_changed(
+    work: &WorkCopy,
+    base: Option<&str>,
+    selection: &[String],
+    messages: Vec<LintMessage>,
+) -> Result<Vec<LintMessage>, String> {
+    let mut changed: HashMap<String, Option<BTreeSet<usize>>> = HashMap::new();
+    for path in selection {
+        let lines = changed_lines_for(work, base.unwrap_or("HEAD"), path)?;
+        changed.insert(path.clone(), lines);
     }
+    Ok(filter_changed_lines(messages, &changed))
+}
 
-    let mut results = group_results(messages, &disk_for);
+/// Group messages by path, loading file data for context rendering.
+fn workflow_group_results(work: &WorkCopy, messages: Vec<LintMessage>) -> Vec<LintResult> {
+    group_results(messages, &|path: &str| work.vcs_root.join(path))
+}
 
+/// Validate the `--output` renderer key.
+fn workflow_renderer(options: &Options) -> Result<&str, String> {
     let renderer_key = options.output.as_deref().unwrap_or(RENDERER_CONSOLE);
     if !all_renderers().contains(&renderer_key) {
         return Err(format!(
@@ -4325,85 +4534,137 @@ fn run_workflow(cwd: &Path, options: &Options, input: &mut dyn BufRead) -> Resul
             all_renderers().join(", ")
         ));
     }
+    Ok(renderer_key)
+}
 
+/// Render results, apply patches, flush `--outfile`, maybe amend, and
+/// compute the result code.
+fn workflow_emit(
+    work: &WorkCopy,
+    options: &Options,
+    input: &mut dyn BufRead,
+    results: &mut [LintResult],
+) -> Result<i32, String> {
+    let renderer_key = workflow_renderer(options)?;
     let mut sink = if options.outfile.is_some() {
         Sink::Buffer(String::new())
     } else {
         Sink::Stdout
     };
+    let (wrote_to_disk, all_autofix) =
+        workflow_render(results, renderer_key, options, input, &mut sink)?;
+    // `--outfile` lands via temp file plus rename (PHP `TempFile`
+    // plus `Filesystem::rename()`), before the amend prompt.
+    if let Sink::Buffer(buffer) = &sink {
+        flush_outfile(options.outfile.as_deref().unwrap_or_default(), buffer)?;
+    }
+    maybe_amend(work, options, wrote_to_disk, all_autofix, input)?;
+    let code = result_code(results);
+    workflow_render_okay(renderer_key, options.outfile.as_deref(), code)?;
+    Ok(code)
+}
+
+/// Render every result and apply console patches. Returns
+/// `(wrote_to_disk, all_autofix)`.
+fn workflow_render(
+    results: &mut [LintResult],
+    renderer_key: &str,
+    options: &Options,
+    input: &mut dyn BufRead,
+    sink: &mut Sink,
+) -> Result<(bool, bool), String> {
     if renderer_key == RENDERER_XML {
         sink.write(&render_xml_header());
     }
-
     let apply_patches = !options.never_apply_patches;
     let prompt_patches = !options.apply_patches;
     let should_patch = apply_patches && renderer_key == RENDERER_CONSOLE;
-
     let mut wrote_to_disk = false;
     let mut all_autofix = true;
-    for result in &mut results {
+    for result in results.iter_mut() {
         if result.messages.is_empty() {
             continue;
         }
         if !result.is_all_autofix() {
             all_autofix = false;
         }
-        match renderer_key {
-            RENDERER_CONSOLE => sink.write(&render_console_result(result)?),
-            RENDERER_JSON => sink.write(&format!("{}\n", render_json_result(result))),
-            RENDERER_SUMMARY => sink.write(&render_summary_result(result)?),
-            RENDERER_COMPILER => sink.write(&render_compiler_result(result)?),
-            RENDERER_XML => sink.write(&render_xml_result(result)),
-            RENDERER_NONE => {}
-            _ => unreachable!("renderer validated above"),
-        }
-
+        render_workflow_result(result, renderer_key, sink)?;
         if should_patch && result.is_patchable() {
-            let (patched, _) = build_patched_data(&result.data, &result.messages)?;
-            let result_all_autofix = result.is_all_autofix();
-            let mut apply = true;
-            if prompt_patches && !result_all_autofix {
-                prompt_for_patch(result, &patched, &mut sink);
-                apply = confirm(
-                    &format!("Apply this patch to {}?", result.path),
-                    true,
-                    input,
-                );
-            }
-            if apply {
-                let applied = write_patch_to_disk(result)?;
-                for (slot, flag) in result.applied.iter_mut().zip(applied.iter()) {
-                    if *flag {
-                        *slot = true;
-                    }
-                }
-                wrote_to_disk = true;
-            }
+            wrote_to_disk |= apply_result_patch(result, prompt_patches, sink, input)?;
         }
     }
     if renderer_key == RENDERER_XML {
         sink.write(&render_xml_footer());
     }
+    Ok((wrote_to_disk, all_autofix))
+}
 
-    // `--outfile` lands via temp file plus rename (PHP `TempFile`
-    // plus `Filesystem::rename()`), before the amend prompt.
-    if let Sink::Buffer(buffer) = &sink {
-        flush_outfile(options.outfile.as_deref().unwrap_or_default(), buffer)?;
+/// Render one result through the selected renderer.
+fn render_workflow_result(
+    result: &LintResult,
+    renderer_key: &str,
+    sink: &mut Sink,
+) -> Result<(), String> {
+    match renderer_key {
+        RENDERER_CONSOLE => sink.write(&render_console_result(result)?),
+        RENDERER_JSON => sink.write(&format!("{}\n", render_json_result(result))),
+        RENDERER_SUMMARY => sink.write(&render_summary_result(result)?),
+        RENDERER_COMPILER => sink.write(&render_compiler_result(result)?),
+        RENDERER_XML => sink.write(&render_xml_result(result)),
+        RENDERER_NONE => {}
+        _ => unreachable!("renderer validated above"),
     }
+    Ok(())
+}
 
-    maybe_amend(&work, options, wrote_to_disk, all_autofix, input)?;
-
-    let code = result_code(&results);
-    if matches!(renderer_key, RENDERER_CONSOLE | RENDERER_SUMMARY) {
-        let okay = render_result_code_okay(code);
-        if let Some(out_path) = options.outfile.as_deref() {
-            // `renderResultCode()` appends through the same sink.
-            append_outfile(out_path, &okay)?;
-        } else {
-            print!("{okay}");
+/// Apply one result's patch (prompting unless autofix-only or
+/// `--apply-patches`). Returns true when patches reached disk.
+fn apply_result_patch(
+    result: &mut LintResult,
+    prompt_patches: bool,
+    sink: &mut Sink,
+    input: &mut dyn BufRead,
+) -> Result<bool, String> {
+    let (patched, _) = build_patched_data(&result.data, &result.messages)?;
+    let result_all_autofix = result.is_all_autofix();
+    let mut apply = true;
+    if prompt_patches && !result_all_autofix {
+        prompt_for_patch(result, &patched, sink);
+        apply = confirm(
+            &format!("Apply this patch to {}?", result.path),
+            true,
+            input,
+        );
+    }
+    if !apply {
+        return Ok(false);
+    }
+    let applied = write_patch_to_disk(result)?;
+    for (slot, flag) in result.applied.iter_mut().zip(applied.iter()) {
+        if *flag {
+            *slot = true;
         }
     }
-    Ok(code)
+    Ok(true)
+}
+
+/// Render the trailing `OKAY` line for console/summary renderers.
+fn workflow_render_okay(
+    renderer_key: &str,
+    outfile: Option<&str>,
+    code: i32,
+) -> Result<(), String> {
+    if !matches!(renderer_key, RENDERER_CONSOLE | RENDERER_SUMMARY) {
+        return Ok(());
+    }
+    let okay = render_result_code_okay(code);
+    if let Some(out_path) = outfile {
+        // `renderResultCode()` appends through the same sink.
+        append_outfile(out_path, &okay)?;
+    } else {
+        print!("{okay}");
+    }
+    Ok(())
 }
 
 /// Write renderer output to `--outfile` via temp file plus rename.
@@ -4441,13 +4702,7 @@ fn maybe_amend(
     all_autofix: bool,
     input: &mut dyn BufRead,
 ) -> Result<(), String> {
-    let mut should_amend = options.amend_all || options.amend_autofixes;
-    if should_amend {
-        let immutable = config_bool(work, "history.immutable")?
-            .unwrap_or_else(|| work.vcs.is_history_default_immutable());
-        should_amend = work.vcs.supports_amend(&work.vcs_root) && !immutable;
-    }
-    if !wrote_to_disk || !should_amend {
+    if !wrote_to_disk || !amend_enabled(work, options)? {
         return Ok(());
     }
     let automatic = options.amend_all || (options.amend_autofixes && all_autofix);
@@ -4463,24 +4718,40 @@ fn maybe_amend(
                 .to_string(),
         );
     }
-    match work.vcs {
-        Vcs::Git => {
-            let out = git::output(&work.vcs_root, &["add", "-u"])?;
-            if !out.status.success() {
-                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                if stderr.is_empty() {
-                    return Err("git add -u failed".to_string());
-                }
-                return Err(format!("git add -u failed: {stderr}"));
-            }
-            git::amend_commit(&work.vcs_root, None)?;
-        }
-        Vcs::Hg => {
-            hg::amend_commit(&work.vcs_root, None, None)?;
-        }
-        Vcs::Svn => {}
+    amend_head(work)
+}
+
+/// True when the amend flags request an amend the VCS allows: the VCS
+/// must support amend and history must be mutable.
+fn amend_enabled(work: &WorkCopy, options: &Options) -> Result<bool, String> {
+    if !(options.amend_all || options.amend_autofixes) {
+        return Ok(false);
     }
-    Ok(())
+    let immutable = config_bool(work, "history.immutable")?
+        .unwrap_or_else(|| work.vcs.is_history_default_immutable());
+    Ok(work.vcs.supports_amend(&work.vcs_root) && !immutable)
+}
+
+/// Amend HEAD with the applied patches.
+fn amend_head(work: &WorkCopy) -> Result<(), String> {
+    match work.vcs {
+        Vcs::Git => amend_git_head(&work.vcs_root),
+        Vcs::Hg => hg::amend_commit(&work.vcs_root, None, None),
+        Vcs::Svn => Ok(()),
+    }
+}
+
+/// Stage the worktree (`git add -u`) and amend HEAD.
+fn amend_git_head(root: &Path) -> Result<(), String> {
+    let out = git::output(root, &["add", "-u"])?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if stderr.is_empty() {
+            return Err("git add -u failed".to_string());
+        }
+        return Err(format!("git add -u failed: {stderr}"));
+    }
+    git::amend_commit(root, None)
 }
 
 #[cfg(test)]
