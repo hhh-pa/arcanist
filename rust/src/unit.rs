@@ -2529,21 +2529,42 @@ pub fn render_detailed_coverage_report(data: &str, report: &str) -> String {
 /// (PHP escapes those only with `JSON_HEX_*`).
 fn php_json_escape_into(out: &mut String, text: &str, escape_slashes: bool) {
     for ch in text.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '/' if escape_slashes => out.push_str("\\/"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0C}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c if (c as u32) < 0x80 => out.push(c),
-            c => append_json_unicode_escape(out, c),
+        if !escape_short_form(out, ch, escape_slashes) {
+            escape_fallback_char(out, ch);
         }
+    }
+}
+
+/// Push a short escape for `ch`; true when handled.
+fn escape_short_form(out: &mut String, ch: char, escape_slashes: bool) -> bool {
+    match ch {
+        '"' => out.push_str("\\\""),
+        '\\' => out.push_str("\\\\"),
+        '/' => {
+            if escape_slashes {
+                out.push_str("\\/");
+            } else {
+                out.push('/');
+            }
+        }
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        '\t' => out.push_str("\\t"),
+        '\u{08}' => out.push_str("\\b"),
+        '\u{0C}' => out.push_str("\\f"),
+        _ => return false,
+    }
+    true
+}
+
+/// Push a control, ASCII, or unicode escape for a non-short-form char.
+fn escape_fallback_char(out: &mut String, ch: char) {
+    if (ch as u32) < 0x20 {
+        out.push_str(&format!("\\u{:04x}", ch as u32));
+    } else if (ch as u32) < 0x80 {
+        out.push(ch);
+    } else {
+        append_json_unicode_escape(out, ch);
     }
 }
 
@@ -2945,6 +2966,65 @@ pub fn exit_code_for_overall(overall: i32) -> ExitCode {
     ExitCode::from(overall as u8)
 }
 
+fn print_cargo_output(report: &EngineReport, format: &str) {
+    match format {
+        "json" => {
+            let text =
+                serde_json::to_string_pretty(&report.to_json()).unwrap_or_else(empty_json_object);
+            println!("{text}");
+        }
+        "ugly" => {
+            println!("{}", report.to_json());
+        }
+        "none" => {}
+        _ => {
+            println!("{}", report.summary_line());
+            if !report.tail.is_empty() {
+                println!("{}", report.tail);
+            }
+        }
+    }
+}
+
+fn cargo_outcome_code(outcome: Outcome) -> &'static str {
+    match outcome {
+        Outcome::Pass => arc_rs::unit_engine::RESULT_PASS,
+        Outcome::Fail => arc_rs::unit_engine::RESULT_FAIL,
+        Outcome::Skip => arc_rs::unit_engine::RESULT_SKIP,
+        Outcome::Broken => arc_rs::unit_engine::RESULT_BROKEN,
+        Outcome::Unsound => arc_rs::unit_engine::RESULT_UNSOUND,
+    }
+}
+
+fn convert_cargo_result(result: &UnitResult) -> EngineUnitResult {
+    let mut out = EngineUnitResult::new();
+    let _ = out.set_name(&result.name);
+    out.set_result(cargo_outcome_code(result.outcome));
+    out.set_duration(result.duration_secs);
+    out
+}
+
+fn converted_cargo_results(report: &EngineReport) -> Vec<EngineUnitResult> {
+    report.results.iter().map(convert_cargo_result).collect()
+}
+
+fn upload_cargo_target(opts: &Options, report: &EngineReport) -> Result<(), String> {
+    let Some(target) = opts.target.as_deref() else {
+        return Ok(());
+    };
+    let overall = if report.success {
+        arc_rs::unit_engine::WORKFLOW_RESULT_OKAY
+    } else {
+        arc_rs::unit_engine::WORKFLOW_RESULT_FAIL
+    };
+    let converted = converted_cargo_results(report);
+    upload_results(target, overall, &converted, opts.conduit_uri.as_deref())
+}
+
+fn empty_json_object(_: serde_json::Error) -> String {
+    "{}".to_string()
+}
+
 /// Run the default `cargo` selection and report its outcome.
 ///
 /// `full` prints the one-line summary plus the trailing output tail;
@@ -2961,52 +3041,10 @@ fn run_cargo_selection(opts: &Options, cwd: &Path) -> ExitCode {
     match execute(opts, cwd, None) {
         Ok(report) => {
             let format = output_format(opts);
-            match format.as_str() {
-                "json" => {
-                    let text = serde_json::to_string_pretty(&report.to_json())
-                        .unwrap_or_else(|_| "{}".to_string());
-                    println!("{text}");
-                }
-                "ugly" => {
-                    println!("{}", report.to_json());
-                }
-                "none" => {}
-                _ => {
-                    println!("{}", report.summary_line());
-                    if !report.tail.is_empty() {
-                        println!("{}", report.tail);
-                    }
-                }
-            }
-            if let Some(target) = opts.target.as_deref() {
-                let overall = if report.success {
-                    arc_rs::unit_engine::WORKFLOW_RESULT_OKAY
-                } else {
-                    arc_rs::unit_engine::WORKFLOW_RESULT_FAIL
-                };
-                let converted: Vec<EngineUnitResult> = report
-                    .results
-                    .iter()
-                    .map(|r| {
-                        let mut out = EngineUnitResult::new();
-                        let _ = out.set_name(&r.name);
-                        out.set_result(match r.outcome {
-                            Outcome::Pass => arc_rs::unit_engine::RESULT_PASS,
-                            Outcome::Fail => arc_rs::unit_engine::RESULT_FAIL,
-                            Outcome::Skip => arc_rs::unit_engine::RESULT_SKIP,
-                            Outcome::Broken => arc_rs::unit_engine::RESULT_BROKEN,
-                            Outcome::Unsound => arc_rs::unit_engine::RESULT_UNSOUND,
-                        });
-                        out.set_duration(r.duration_secs);
-                        out
-                    })
-                    .collect();
-                if let Err(msg) =
-                    upload_results(target, overall, &converted, opts.conduit_uri.as_deref())
-                {
-                    eprintln!("arc-rs unit: {msg}");
-                    return ExitCode::FAILURE;
-                }
+            print_cargo_output(&report, &format);
+            if let Err(msg) = upload_cargo_target(opts, &report) {
+                eprintln!("arc-rs unit: {msg}");
+                return ExitCode::FAILURE;
             }
             if report.success {
                 ExitCode::SUCCESS
@@ -3110,64 +3148,105 @@ fn finish_php_report(
     exit_code_for_overall(overall)
 }
 
-pub fn run(argv: &[String]) -> ExitCode {
-    let opts = match parse_options(argv) {
-        Ok(Some(opts)) => opts,
+fn parse_unit_options(argv: &[String]) -> Result<Options, ExitCode> {
+    match parse_options(argv) {
+        Ok(Some(opts)) => Ok(opts),
         Ok(None) => {
             print!("{USAGE}");
-            return ExitCode::SUCCESS;
+            Err(ExitCode::SUCCESS)
         }
         Err(msg) => {
             eprintln!("arc-rs unit: {msg}\n\n{USAGE}");
-            return ExitCode::FAILURE;
+            Err(ExitCode::FAILURE)
         }
-    };
-    let cwd = match std::env::current_dir() {
-        Ok(dir) => dir,
+    }
+}
+
+fn unit_working_dir() -> Result<PathBuf, ExitCode> {
+    match std::env::current_dir() {
+        Ok(dir) => Ok(dir),
         Err(e) => {
             eprintln!("arc-rs unit: cannot read current directory: {e}");
-            return ExitCode::FAILURE;
+            Err(ExitCode::FAILURE)
         }
-    };
-    if let Some(vcs) = detect_vcs(&cwd)
+    }
+}
+
+fn check_unit_supports(cwd: &Path, opts: &Options) -> Result<(), ExitCode> {
+    if let Some(vcs) = detect_vcs(cwd)
         && let Err(msg) = check_supports(vcs, &opts.provided)
     {
         eprintln!("arc-rs unit: {msg}");
-        return ExitCode::FAILURE;
+        return Err(ExitCode::FAILURE);
     }
+    Ok(())
+}
+
+fn discover_unit_selection(opts: &Options, cwd: &Path) -> Result<Selection, ExitCode> {
     // Cargo ignores paths/rev (it runs `cargo test` in the crate root), but
     // the `--everything` plus paths check still applies workflow-wide.
-    let selection = match discover_selection(&opts, &cwd) {
-        Ok(selection) => selection,
+    match discover_selection(opts, cwd) {
+        Ok(selection) => Ok(selection),
+        Err(msg) => {
+            eprintln!("arc-rs unit: {msg}");
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+fn run_single_paths(opts: &Options, cwd: &Path, class: &str) -> ExitCode {
+    let root = project_root_path(cwd);
+    let paths = match select_paths(opts, cwd, &root) {
+        Ok(paths) => paths,
         Err(msg) => {
             eprintln!("arc-rs unit: {msg}");
             return ExitCode::FAILURE;
         }
     };
+    run_single_selection(opts, cwd, class, &paths)
+}
+
+fn run_config_paths(
+    opts: &Options,
+    cwd: &Path,
+    engines: &[PlannedEngine],
+    root: &Path,
+) -> ExitCode {
+    let paths = match select_paths(opts, cwd, root) {
+        Ok(paths) => paths,
+        Err(msg) => {
+            eprintln!("arc-rs unit: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    run_config_selection(opts, engines, root, &paths)
+}
+
+fn run_unit_selection(opts: &Options, cwd: &Path, selection: Selection) -> ExitCode {
     match selection {
-        Selection::Cargo => run_cargo_selection(&opts, &cwd),
-        Selection::Single(class) => {
-            let root = project_root_path(&cwd);
-            let paths = match select_paths(&opts, &cwd, &root) {
-                Ok(paths) => paths,
-                Err(msg) => {
-                    eprintln!("arc-rs unit: {msg}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            run_single_selection(&opts, &cwd, &class, &paths)
-        }
-        Selection::Config { engines, root } => {
-            let paths = match select_paths(&opts, &cwd, &root) {
-                Ok(paths) => paths,
-                Err(msg) => {
-                    eprintln!("arc-rs unit: {msg}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            run_config_selection(&opts, &engines, &root, &paths)
-        }
+        Selection::Cargo => run_cargo_selection(opts, cwd),
+        Selection::Single(class) => run_single_paths(opts, cwd, &class),
+        Selection::Config { engines, root } => run_config_paths(opts, cwd, &engines, &root),
     }
+}
+
+pub fn run(argv: &[String]) -> ExitCode {
+    let opts = match parse_unit_options(argv) {
+        Ok(opts) => opts,
+        Err(code) => return code,
+    };
+    let cwd = match unit_working_dir() {
+        Ok(dir) => dir,
+        Err(code) => return code,
+    };
+    if let Err(code) = check_unit_supports(&cwd, &opts) {
+        return code;
+    }
+    let selection = match discover_unit_selection(&opts, &cwd) {
+        Ok(selection) => selection,
+        Err(code) => return code,
+    };
+    run_unit_selection(&opts, &cwd, selection)
 }
 
 #[cfg(test)]

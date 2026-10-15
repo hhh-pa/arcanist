@@ -300,13 +300,82 @@ pub fn created_json(task: &CreatedTask) -> serde_json::Value {
     })
 }
 
+fn conduit_error_text(error: conduit::Error) -> String {
+    error.to_string()
+}
+
+fn missing_task_id() -> String {
+    "conduit maniphest.createtask response has no id".to_string()
+}
+
+fn json_encode_error(error: serde_json::Error) -> String {
+    format!("failed to encode JSON: {error}")
+}
+
+fn is_blank_summary(summary: &str) -> bool {
+    summary
+        .trim_matches([' ', '\t', '\n', '\r', '\0', '\u{b}'])
+        .is_empty()
+}
+
+fn phid_array(phids: Vec<String>) -> serde_json::Value {
+    serde_json::Value::Array(phids.into_iter().map(serde_json::Value::String).collect())
+}
+
+fn task_create_params(
+    client: &conduit::Client,
+    options: &Options,
+    summary: String,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let mut params = serde_json::Map::from_iter([
+        ("title".to_string(), serde_json::Value::String(summary)),
+        (
+            "ownerPHID".to_string(),
+            serde_json::Value::String(user_phid(client)?),
+        ),
+    ]);
+    if !options.cc.is_empty() {
+        let phids = resolve_cc_phids(client, &options.cc)?;
+        params.insert("ccPHIDs".to_string(), phid_array(phids));
+    }
+    if !options.projects.is_empty() {
+        let phids = resolve_project_phids(client, &options.projects)?;
+        params.insert("projectPHIDs".to_string(), phid_array(phids));
+    }
+    Ok(params)
+}
+
+fn finish_created_task(
+    dir: &std::path::Path,
+    task: &CreatedTask,
+    options: &Options,
+) -> Result<String, String> {
+    if options.browse {
+        let configured = crate::browser::configured_browser(dir);
+        crate::browser::open_uris_in_browser(
+            std::slice::from_ref(&task.uri),
+            configured.as_deref(),
+        )?;
+    }
+    if options.json {
+        let mut doc =
+            serde_json::to_string_pretty(&created_json(task)).map_err(json_encode_error)?;
+        doc.push('\n');
+        return Ok(doc);
+    }
+    Ok(render_created(task, terminal::ansi_enabled()))
+}
+
 /// Create the task per `options`, returning the stdout text.
 ///
 /// Like the PHP reference, a blank summary prints a message and creates
 /// nothing. `--browse` opens the new task, resolving the browser command
 /// from the config for the current directory.
 pub fn execute(client: &conduit::Client, options: &Options) -> Result<String, String> {
-    let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let dir = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(_) => std::path::PathBuf::from("."),
+    };
     execute_in(&dir, client, options)
 }
 
@@ -317,54 +386,15 @@ pub fn execute_in(
     options: &Options,
 ) -> Result<String, String> {
     let summary = options.summary.join(" ");
-    if summary
-        .trim_matches([' ', '\t', '\n', '\r', '\0', '\u{b}'])
-        .is_empty()
-    {
+    if is_blank_summary(&summary) {
         return Ok("Please provide a summary.\n".to_string());
     }
-
-    let mut params = serde_json::Map::from_iter([
-        ("title".to_string(), serde_json::Value::String(summary)),
-        (
-            "ownerPHID".to_string(),
-            serde_json::Value::String(user_phid(client)?),
-        ),
-    ]);
-    if !options.cc.is_empty() {
-        let phids = resolve_cc_phids(client, &options.cc)?;
-        params.insert(
-            "ccPHIDs".to_string(),
-            serde_json::Value::Array(phids.into_iter().map(serde_json::Value::String).collect()),
-        );
-    }
-    if !options.projects.is_empty() {
-        let phids = resolve_project_phids(client, &options.projects)?;
-        params.insert(
-            "projectPHIDs".to_string(),
-            serde_json::Value::Array(phids.into_iter().map(serde_json::Value::String).collect()),
-        );
-    }
-
+    let params = task_create_params(client, options, summary)?;
     let result = client
         .call("maniphest.createtask", &serde_json::Value::Object(params))
-        .map_err(|e| e.to_string())?;
-    let task = parse_created(&result)
-        .ok_or_else(|| "conduit maniphest.createtask response has no id".to_string())?;
-    if options.browse {
-        let configured = crate::browser::configured_browser(dir);
-        crate::browser::open_uris_in_browser(
-            std::slice::from_ref(&task.uri),
-            configured.as_deref(),
-        )?;
-    }
-    if options.json {
-        let mut doc = serde_json::to_string_pretty(&created_json(&task))
-            .map_err(|e| format!("failed to encode JSON: {e}"))?;
-        doc.push('\n');
-        return Ok(doc);
-    }
-    Ok(render_created(&task, terminal::ansi_enabled()))
+        .map_err(conduit_error_text)?;
+    let task = parse_created(&result).ok_or_else(missing_task_id)?;
+    finish_created_task(dir, &task, options)
 }
 
 /// Entry point: `argv` excludes the subcommand name.

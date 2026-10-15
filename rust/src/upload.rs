@@ -279,25 +279,36 @@ fn conduit_truthy(value: Option<&serde_json::Value>) -> bool {
     }
 }
 
-fn upload_missing_chunks(
+fn conduit_error_text(error: crate::conduit::Error) -> String {
+    error.to_string()
+}
+
+fn query_file_chunks(
     client: &crate::conduit::Client,
-    data: &[u8],
     file_phid: &str,
     display: &str,
-) -> Result<(), String> {
+) -> Result<Vec<serde_json::Value>, String> {
     let chunks = client
         .call(
             "file.querychunks",
             &serde_json::json!({"filePHID": file_phid}),
         )
-        .map_err(|e| e.to_string())?;
-    let chunks = chunks.as_array().ok_or_else(|| {
-        format!("file.querychunks for \"{display}\" returned an unexpected response")
-    })?;
-    let remaining = chunks
-        .iter()
-        .filter(|chunk| !conduit_truthy(chunk.get("complete")))
-        .count();
+        .map_err(conduit_error_text)?;
+    match chunks {
+        serde_json::Value::Array(chunks) => Ok(chunks),
+        _ => Err(format!(
+            "file.querychunks for \"{display}\" returned an unexpected response"
+        )),
+    }
+}
+
+fn announce_chunk_progress(chunks: &[serde_json::Value]) {
+    let mut remaining = 0;
+    for chunk in chunks {
+        if !conduit_truthy(chunk.get("complete")) {
+            remaining += 1;
+        }
+    }
     // PHP `writeStatus()` goes to stderr.
     if remaining == chunks.len() {
         eprintln!(
@@ -311,38 +322,68 @@ fn upload_missing_chunks(
             crate::download::format_count(chunks.len() as u64)
         );
     }
-    for chunk in chunks {
+}
+
+fn chunk_byte_range(chunk: &serde_json::Value, display: &str) -> Result<(usize, usize), String> {
+    let start = match chunk.get("byteStart").and_then(serde_json::Value::as_u64) {
+        Some(start) => start as usize,
+        None => {
+            return Err(format!(
+                "file.querychunks for \"{display}\" returned a chunk without byteStart"
+            ));
+        }
+    };
+    let end = match chunk.get("byteEnd").and_then(serde_json::Value::as_u64) {
+        Some(end) => end as usize,
+        None => {
+            return Err(format!(
+                "file.querychunks for \"{display}\" returned a chunk without byteEnd"
+            ));
+        }
+    };
+    Ok((start, end))
+}
+
+fn upload_one_chunk(
+    client: &crate::conduit::Client,
+    data: &[u8],
+    file_phid: &str,
+    chunk: &serde_json::Value,
+    display: &str,
+) -> Result<(), String> {
+    let (start, end) = chunk_byte_range(chunk, display)?;
+    if start > end || end > data.len() {
+        return Err(format!(
+            "file.querychunks for \"{display}\" returned an out-of-range chunk ({start}..{end})"
+        ));
+    }
+    match client.call(
+        "file.uploadchunk",
+        &serde_json::json!({
+            "filePHID": file_phid,
+            "byteStart": start,
+            "dataEncoding": "base64",
+            "data": base64_encode(&data[start..end]),
+        }),
+    ) {
+        Ok(_) => Ok(()),
+        Err(error) => Err(format!("Unable to upload file chunks: {error}")),
+    }
+}
+
+fn upload_missing_chunks(
+    client: &crate::conduit::Client,
+    data: &[u8],
+    file_phid: &str,
+    display: &str,
+) -> Result<(), String> {
+    let chunks = query_file_chunks(client, file_phid, display)?;
+    announce_chunk_progress(&chunks);
+    for chunk in &chunks {
         if conduit_truthy(chunk.get("complete")) {
             continue;
         }
-        let start = chunk
-            .get("byteStart")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| {
-                format!("file.querychunks for \"{display}\" returned a chunk without byteStart")
-            })? as usize;
-        let end = chunk
-            .get("byteEnd")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| {
-                format!("file.querychunks for \"{display}\" returned a chunk without byteEnd")
-            })? as usize;
-        if start > end || end > data.len() {
-            return Err(format!(
-                "file.querychunks for \"{display}\" returned an out-of-range chunk ({start}..{end})"
-            ));
-        }
-        client
-            .call(
-                "file.uploadchunk",
-                &serde_json::json!({
-                    "filePHID": file_phid,
-                    "byteStart": start,
-                    "dataEncoding": "base64",
-                    "data": base64_encode(&data[start..end]),
-                }),
-            )
-            .map_err(|e| format!("Unable to upload file chunks: {e}"))?;
+        upload_one_chunk(client, data, file_phid, chunk, display)?;
     }
     Ok(())
 }
@@ -496,6 +537,81 @@ pub fn upload_paths(
     upload_paths_with_browse(client, dir, paths, temporary, json, false, conduit_uri)
 }
 
+fn upload_single_path(
+    client: &crate::conduit::Client,
+    dir: &Path,
+    path: &str,
+    temporary: bool,
+) -> Result<(String, String), String> {
+    let disk = dir.join(path);
+    let data = match std::fs::read(&disk) {
+        Ok(data) => data,
+        Err(error) => return Err(format!("cannot read \"{path}\": {error}")),
+    };
+    let name = match disk.file_name() {
+        Some(name) => name.to_string_lossy().to_string(),
+        None => path.to_string(),
+    };
+    let phid = upload_data(client, &name, &data, temporary)?;
+    Ok((path.to_string(), phid))
+}
+
+fn collect_uploads(
+    client: &crate::conduit::Client,
+    dir: &Path,
+    paths: &[String],
+    temporary: bool,
+) -> Result<Vec<(String, String)>, String> {
+    // PHP uploads every file first, then throws the first file's errors.
+    let mut uploads: Vec<(String, String)> = Vec::with_capacity(paths.len());
+    let mut first_error: Option<String> = None;
+    for path in paths {
+        match upload_single_path(client, dir, path, temporary) {
+            Ok(pair) => uploads.push(pair),
+            Err(message) => {
+                if first_error.is_none() {
+                    first_error = Some(message);
+                }
+            }
+        }
+    }
+    match first_error {
+        Some(message) => Err(message),
+        None => Ok(uploads),
+    }
+}
+
+fn browse_uploaded_refs(dir: &Path, refs: &[UploadedRef]) -> Result<(), String> {
+    let mut uris: Vec<String> = Vec::with_capacity(refs.len());
+    for item in refs {
+        uris.push(item.uri.clone());
+    }
+    let configured = crate::browser::configured_browser(dir);
+    crate::browser::open_uris_in_browser(&uris, configured.as_deref())
+}
+
+fn render_uploaded_refs(refs: &[UploadedRef], json: bool) -> Result<String, String> {
+    if json {
+        let list: Vec<serde_json::Value> = refs.iter().map(UploadedRef::to_json).collect();
+        let mut text = match serde_json::to_string_pretty(&list) {
+            Ok(text) => text,
+            Err(error) => return Err(format!("failed to encode JSON: {error}")),
+        };
+        text.push('\n');
+        return Ok(text);
+    }
+    let mut out = String::new();
+    for item in refs {
+        out.push_str(&format!(
+            "F{id} {name}\n{uri}\n",
+            id = item.id,
+            name = item.name,
+            uri = item.uri
+        ));
+    }
+    Ok(out)
+}
+
 /// Upload `paths`, opening the uploaded files in a browser when `browse`.
 pub fn upload_paths_with_browse(
     client: &crate::conduit::Client,
@@ -506,60 +622,12 @@ pub fn upload_paths_with_browse(
     browse: bool,
     conduit_uri: Option<&str>,
 ) -> Result<String, String> {
-    // PHP uploads every file first, then throws the first file's errors.
-    let mut uploads: Vec<(String, String)> = Vec::with_capacity(paths.len());
-    let mut first_error: Option<String> = None;
-    for path in paths {
-        let disk = dir.join(path);
-        let data = match std::fs::read(&disk) {
-            Ok(data) => data,
-            Err(e) => {
-                if first_error.is_none() {
-                    first_error = Some(format!("cannot read \"{path}\": {e}"));
-                }
-                continue;
-            }
-        };
-        let name = disk
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.clone());
-        match upload_data(client, &name, &data, temporary) {
-            Ok(phid) => uploads.push((path.clone(), phid)),
-            Err(message) => {
-                if first_error.is_none() {
-                    first_error = Some(message);
-                }
-            }
-        }
-    }
-    if let Some(message) = first_error {
-        return Err(message);
-    }
+    let uploads = collect_uploads(client, dir, paths, temporary)?;
     let refs = resolve_refs(client, &uploads, conduit_uri)?;
     if browse {
-        let uris: Vec<String> = refs.iter().map(|r| r.uri.clone()).collect();
-        let configured = crate::browser::configured_browser(dir);
-        crate::browser::open_uris_in_browser(&uris, configured.as_deref())?;
+        browse_uploaded_refs(dir, &refs)?;
     }
-    if json {
-        let list: Vec<serde_json::Value> = refs.iter().map(UploadedRef::to_json).collect();
-        let mut text = serde_json::to_string_pretty(&list)
-            .map_err(|e| format!("failed to encode JSON: {e}"))?;
-        text.push('\n');
-        Ok(text)
-    } else {
-        let mut out = String::new();
-        for r in &refs {
-            out.push_str(&format!(
-                "F{id} {name}\n{uri}\n",
-                id = r.id,
-                name = r.name,
-                uri = r.uri
-            ));
-        }
-        Ok(out)
-    }
+    render_uploaded_refs(&refs, json)
 }
 
 /// Run the workflow rooted at `dir`, returning stdout text or an error message.

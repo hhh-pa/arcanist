@@ -705,6 +705,65 @@ fn fail(message: String) -> ExitCode {
     ExitCode::FAILURE
 }
 
+fn conduit_error_text(error: conduit::Error) -> String {
+    error.to_string()
+}
+
+fn call_or_unavailable(
+    client: Option<&conduit::Client>,
+    method: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    match client {
+        Some(client) => client.call(method, params).map_err(conduit_error_text),
+        None => Err("conduit unavailable".to_string()),
+    }
+}
+
+fn optional_call<'a>(
+    client: &'a Option<conduit::Client>,
+    call: &'a dyn Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>,
+) -> Option<&'a diff_submit::ConduitCall<'a>> {
+    if client.is_some() { Some(call) } else { None }
+}
+
+fn render_remotes_output(remotes: &[RemoteInfo], ansi: bool) -> Result<String, String> {
+    let mut out = String::new();
+    for part in [
+        render_title(ansi),
+        render_paragraph(grove_text(), ansi),
+        render_paragraph(grove_remotes_text(), ansi),
+    ] {
+        out.push_str(&part?);
+    }
+    let width = terminal::terminal_width();
+    for remote in remotes {
+        out.push_str(&render_remote_view(remote, width, ansi));
+    }
+    let blank = render_markup("\n", ansi)?;
+    let tail = render_markup(stream_markup(), ansi)?;
+    out.push_str(&blank);
+    out.push_str(&tail);
+    Ok(out)
+}
+
+fn render_published_output(hashes: &[String], ansi: bool) -> Result<String, String> {
+    let mut out = String::new();
+    for part in [render_title(ansi), render_paragraph(river_text(), ansi)] {
+        out.push_str(&part?);
+    }
+    if hashes.is_empty() {
+        out.push_str(&render_quiet_river(ansi)?);
+        return Ok(out);
+    }
+    out.push_str(&render_paragraph(floating_text(), ansi)?);
+    for hash in hashes {
+        out.push_str(&render_line(hash, ansi)?);
+    }
+    out.push_str(&render_bubbles_tail(ansi)?);
+    Ok(out)
+}
+
 fn run_clearing(ansi: bool) -> ExitCode {
     let now = now_unix();
     let time = hour_text(hour_of(now), lunar_phase(now as i64));
@@ -729,88 +788,37 @@ fn run_clearing(ansi: bool) -> ExitCode {
 fn run_remotes(cwd: &Path, ansi: bool) -> ExitCode {
     let client = look_conduit_client();
     let call = |method: &str, params: &serde_json::Value| {
-        client.as_ref().map_or_else(
-            || Err("conduit unavailable".to_string()),
-            |client| client.call(method, params).map_err(|e| e.to_string()),
-        )
+        call_or_unavailable(client.as_ref(), method, params)
     };
-    let remotes = match look_remotes_data(
-        cwd,
-        client.as_ref().map(|_| &call as &diff_submit::ConduitCall),
-    ) {
+    let remotes = match look_remotes_data(cwd, optional_call(&client, &call)) {
         Ok(remotes) => remotes,
         Err(message) => return fail(message),
     };
-    let mut out = String::new();
-    for part in [
-        render_title(ansi),
-        render_paragraph(grove_text(), ansi),
-        render_paragraph(grove_remotes_text(), ansi),
-    ] {
-        match part {
-            Ok(text) => out.push_str(&text),
-            Err(message) => return fail(message),
+    match render_remotes_output(&remotes, ansi) {
+        Ok(out) => {
+            print!("{out}");
+            ExitCode::SUCCESS
         }
+        Err(message) => fail(message),
     }
-    let width = terminal::terminal_width();
-    for remote in &remotes {
-        out.push_str(&render_remote_view(remote, width, ansi));
-    }
-    match render_markup("\n", ansi)
-        .and_then(|blank| render_markup(stream_markup(), ansi).map(|tail| blank + &tail))
-    {
-        Ok(tail) => out.push_str(&tail),
-        Err(message) => return fail(message),
-    }
-    print!("{out}");
-    ExitCode::SUCCESS
 }
 
 fn run_published(cwd: &Path, ansi: bool) -> ExitCode {
     let client = look_conduit_client();
     let call = |method: &str, params: &serde_json::Value| {
-        client.as_ref().map_or_else(
-            || Err("conduit unavailable".to_string()),
-            |client| client.call(method, params).map_err(|e| e.to_string()),
-        )
+        call_or_unavailable(client.as_ref(), method, params)
     };
-    let hashes = match look_published_data(
-        cwd,
-        client.as_ref().map(|_| &call as &diff_submit::ConduitCall),
-    ) {
+    let hashes = match look_published_data(cwd, optional_call(&client, &call)) {
         Ok(hashes) => hashes,
         Err(message) => return fail(message),
     };
-    let mut out = String::new();
-    for part in [render_title(ansi), render_paragraph(river_text(), ansi)] {
-        match part {
-            Ok(text) => out.push_str(&text),
-            Err(message) => return fail(message),
+    match render_published_output(&hashes, ansi) {
+        Ok(out) => {
+            print!("{out}");
+            ExitCode::SUCCESS
         }
+        Err(message) => fail(message),
     }
-    if hashes.is_empty() {
-        match render_quiet_river(ansi) {
-            Ok(text) => out.push_str(&text),
-            Err(message) => return fail(message),
-        }
-    } else {
-        match render_paragraph(floating_text(), ansi) {
-            Ok(text) => out.push_str(&text),
-            Err(message) => return fail(message),
-        }
-        for hash in &hashes {
-            match render_line(hash, ansi) {
-                Ok(text) => out.push_str(&text),
-                Err(message) => return fail(message),
-            }
-        }
-        match render_bubbles_tail(ansi) {
-            Ok(text) => out.push_str(&text),
-            Err(message) => return fail(message),
-        }
-    }
-    print!("{out}");
-    ExitCode::SUCCESS
 }
 
 fn run_unknown(thing: &[String], ansi: bool) -> ExitCode {
