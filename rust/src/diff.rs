@@ -1411,9 +1411,9 @@ pub struct SubmitReport {
     pub uri: Option<String>,
 }
 
-/// Format one submit report: bold lead plus underlined URI.
+/// Format one submit report: plain lead, bold label, underlined URI.
 ///
-/// PHP renders leads bold and URIs underlined (`**bold**`,
+/// PHP prints the lead plain; the URI line is `"**%s** __%s__"`
 /// `__underline__`); `ansi=false` strips to the plain shape,
 /// byte-identical to the historical `format!` output.
 fn format_submit_report_ansi(
