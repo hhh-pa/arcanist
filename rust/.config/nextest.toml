@@ -1,0 +1,6 @@
+# JUnit report for Codecov Test Analytics. The path is relative to
+# nextest's store dir (target/nextest/<profile>/), NOT the workspace
+# root: this lands at target/nextest/default/junit.xml, which rust.yml
+# uploads via codecov/test-results-action.
+[profile.default.junit]
+path = "junit.xml"
