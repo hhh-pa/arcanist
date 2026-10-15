@@ -1751,3 +1751,94 @@ fn builds_json_document() {
     );
     assert_eq!(summarize(&[]), (0, 0));
 }
+
+#[test]
+fn ansi_console_wrap_delegates_to_terminal() {
+    for (text, indent, prefix) in [
+        ("hi".to_string(), 4, true),
+        ("a\nb".to_string(), 2, false),
+        (String::new(), 0, true),
+        ("word ".repeat(20), 4, true),
+    ] {
+        assert_eq!(
+            console_wrap(&text, indent, prefix),
+            crate::terminal::console_wrap(&text, indent, prefix),
+            "{text:?} {indent} {prefix}"
+        );
+    }
+    let colored = "\x1b[1mhi\x1b[m there";
+    assert_eq!(
+        console_wrap(colored, 0, true),
+        crate::terminal::console_wrap(colored, 0, true)
+    );
+}
+
+#[test]
+fn ansi_working_copy_desc_underlines_path() {
+    assert_eq!(
+        working_copy_desc_ansi("/w", false),
+        "  Working copy: /w\n\n"
+    );
+    assert_eq!(
+        working_copy_desc_ansi("/w", true),
+        "  Working copy: \x1b[4m/w\x1b[m\n\n"
+    );
+    assert_eq!(working_copy_desc("/w"), "  Working copy: /w\n\n");
+}
+
+#[test]
+fn ansi_worktree_blocks_thread_underline() {
+    let paths = vec!["a".to_string()];
+    let plain = clean_worktree_error_ansi(CleanWorktreeIssue::Conflicts, "/w", &paths, false);
+    assert!(plain.contains("  Working copy: /w\n\n"), "{plain:?}");
+    assert!(!plain.contains('\x1b'), "{plain:?}");
+    let colored = clean_worktree_error_ansi(CleanWorktreeIssue::Conflicts, "/w", &paths, true);
+    assert!(
+        colored.contains("  Working copy: \x1b[4m/w\x1b[m\n\n"),
+        "{colored:?}"
+    );
+
+    let plain = untracked_block_ansi("/w", "git", &paths, false);
+    assert!(plain.contains("  Working copy: /w\n\n"), "{plain:?}");
+    assert!(!plain.contains('\x1b'));
+    let colored = untracked_block_ansi("/w", "git", &paths, true);
+    assert!(colored.contains("\x1b[4m/w\x1b[m"), "{colored:?}");
+
+    let plain = uncommitted_block_ansi("/w", &paths, &[], false);
+    assert!(plain.contains("  Working copy: /w\n\n"), "{plain:?}");
+    assert!(!plain.contains('\x1b'));
+    let colored = uncommitted_block_ansi("/w", &paths, &[], true);
+    assert!(colored.contains("\x1b[4m/w\x1b[m"), "{colored:?}");
+}
+
+#[test]
+fn ansi_submit_reports_bold_lead_and_underline_uri() {
+    let call = |method: &str, _params: &serde_json::Value| {
+        if method == diff_submit::METHOD_CREATE_DIFF {
+            Ok(serde_json::json!({"diffid": 1, "uri": "http://x/D1"}))
+        } else if method == diff_submit::METHOD_SET_DIFF_PROPERTY {
+            Ok(serde_json::Value::Null)
+        } else {
+            Err(format!("unexpected {method}"))
+        }
+    };
+    let input = SubmitInput {
+        mode: SubmitMode::Only,
+        message: None,
+        fields: serde_json::Value::Null,
+        spec: serde_json::json!({}),
+        properties: Vec::new(),
+        included_changes: "Included changes:\n".to_string(),
+        json: false,
+    };
+    let plain = submit_over_ansi(&call, &input, false).unwrap();
+    assert_eq!(
+        plain,
+        "Created a new Differential diff:\n        Diff URI: http://x/D1\n\nIncluded changes:\n"
+    );
+    let colored = submit_over_ansi(&call, &input, true).unwrap();
+    assert_eq!(
+        colored,
+        "\x1b[1mCreated a new Differential diff:\x1b[m\n        Diff URI: \x1b[4mhttp://x/D1\x1b[m\n\nIncluded changes:\n"
+    );
+}

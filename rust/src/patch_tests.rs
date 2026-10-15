@@ -2817,3 +2817,120 @@ fn gap2_plan_children_with_uses_fake_hg() {
     let log = std::fs::read_to_string(dir.join(".fakehg.log")).unwrap();
     assert!(log.contains("nope-missing"), "{log}");
 }
+
+#[test]
+fn ansi_status_lines_preserve_stars_and_gain_backgrounds() {
+    assert_eq!(
+        status_line_ansi("green", "OKAY", "Successfully applied patch.", false),
+        "** OKAY ** Successfully applied patch.\n"
+    );
+    assert_eq!(
+        status_line_ansi("green", "OKAY", "Successfully applied patch.", true),
+        "\x1b[42m** OKAY **\x1b[49m Successfully applied patch.\n"
+    );
+    assert_eq!(
+        status_line_ansi(
+            "blue",
+            "INFO",
+            "Base commit is not in local repository; trying to fetch.",
+            false
+        ),
+        "** INFO ** Base commit is not in local repository; trying to fetch.\n"
+    );
+    assert_eq!(
+        status_line_ansi(
+            "blue",
+            "INFO",
+            "Base commit is not in local repository; trying to fetch.",
+            true
+        ),
+        "\x1b[44m** INFO **\x1b[49m Base commit is not in local repository; trying to fetch.\n"
+    );
+    assert_eq!(
+        status_line_ansi("green", "COMMITTED", "Successfully committed patch.", true),
+        "\x1b[42m** COMMITTED **\x1b[49m Successfully committed patch.\n"
+    );
+    assert_eq!(
+        status_line_ansi("green", "APPLIED", "Successfully applied patch.", true),
+        "\x1b[42m** APPLIED **\x1b[49m Successfully applied patch.\n"
+    );
+}
+
+#[test]
+fn ansi_failure_banners_gain_red_backgrounds() {
+    assert_eq!(
+        cherry_pick_failed_banner_ansi(false),
+        "\n** Cherry Pick Failed!**\n"
+    );
+    assert_eq!(
+        cherry_pick_failed_banner_ansi(true),
+        "\n\x1b[41m** Cherry Pick Failed!**\x1b[49m\n"
+    );
+    assert_eq!(patch_failed_banner_ansi(false), "\n** Patch Failed! **\n");
+    assert_eq!(
+        patch_failed_banner_ansi(true),
+        "\n\x1b[41m** Patch Failed! **\x1b[49m\n"
+    );
+}
+
+#[test]
+fn ansi_warning_blocks_gain_yellow_backgrounds() {
+    let plain = hg_case_warning_ansi(false);
+    assert!(
+        plain.starts_with("\n** WARNING ** This patch may have failed"),
+        "{plain:?}"
+    );
+    assert!(!plain.contains('\x1b'), "{plain:?}");
+    let colored = hg_case_warning_ansi(true);
+    assert!(
+        colored.starts_with("\n\x1b[43m** WARNING **\x1b[49m This patch may have failed"),
+        "{colored:?}"
+    );
+    let plain = svn_hunks_warning_ansi(false);
+    assert!(
+        plain.starts_with("\n\n** WARNING ** Some hunks could not be applied"),
+        "{plain:?}"
+    );
+    assert!(!plain.contains('\x1b'), "{plain:?}");
+    let colored = svn_hunks_warning_ansi(true);
+    assert!(
+        colored.starts_with("\n\n\x1b[43m** WARNING **\x1b[49m Some hunks could not be applied"),
+        "{colored:?}"
+    );
+}
+
+#[test]
+fn ansi_apply_svn_okay_uses_green_background() {
+    let dir = temp_dir("svn_ansi_okay");
+    for ansi in [false, true] {
+        let mut io = Io::buffered();
+        let outcome = apply_svn_ansi(
+            &dir,
+            &svn::SvnCommand::system(),
+            &[],
+            &mut io,
+            &mut |_, _| Ok((true, String::new())),
+            &mut |_| Ok(()),
+            &mut |_, _| Ok(()),
+            ansi,
+        )
+        .unwrap();
+        assert_eq!(outcome, SvnOutcome::Applied);
+        if ansi {
+            assert!(
+                io.out.stdout.contains("\x1b[42m** OKAY **\x1b[49m"),
+                "{}",
+                io.out.stdout
+            );
+        } else {
+            assert!(
+                io.out
+                    .stdout
+                    .contains("** OKAY ** Successfully applied patch"),
+                "{}",
+                io.out.stdout
+            );
+            assert!(!io.out.stdout.contains('\x1b'), "{}", io.out.stdout);
+        }
+    }
+}
