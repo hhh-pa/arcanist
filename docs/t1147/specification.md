@@ -30,8 +30,10 @@ from source.
 2. Package step fails closed: `set -euo pipefail`, executable bit
    asserted, `usage:` smoke asserted, `if-no-files-found: error`.
 3. README install docs point at the Releases page.
-4. A `workflow_dispatch` dry run on the branch shows all three build
-   jobs green and publish skipped. No tag is cut by this task.
+4. After merge, a `workflow_dispatch` dry run from the default branch
+   shows all three build jobs green and publish skipped (GitHub only
+   resolves dispatch workflows from the default branch, so no dry run
+   is possible pre-merge). No tag is cut by this task.
 
 ## Technical notes
 

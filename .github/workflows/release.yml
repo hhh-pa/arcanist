@@ -42,7 +42,8 @@ jobs:
           mkdir -p dist
           asset="dist/arc-$target.tar.gz"
           tar -czf "$asset" -C target/release "$(basename "$bin")"
-          echo "asset=$asset target=$target" >> "$GITHUB_OUTPUT"
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+          echo "target=$target" >> "$GITHUB_OUTPUT"
         id: package
       - uses: actions/upload-artifact@v4
         with:
