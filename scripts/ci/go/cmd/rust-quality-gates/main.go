@@ -175,29 +175,12 @@ func cargoInstall(env []string, toolsRoot, crate, version, features string) erro
 	return run(cmd, env, cwd)
 }
 
-// withinDir reports whether cleaned path stays inside dest.
-func withinDir(dest, path string) bool {
-	sep := string(os.PathSeparator)
-	return path == dest || strings.HasPrefix(path, filepath.Clean(dest)+sep)
-}
-
-// safeJoin resolves a tar entry name under dest, rejecting absolute
-// paths and ".." escapes (ZipSlip guard for extractTarGz).
-func safeJoin(dest, name string) (string, error) {
-	if filepath.IsAbs(name) {
-		return "", fmt.Errorf("tarball entry is absolute: %s", name)
-	}
-	target := filepath.Join(dest, name)
-	if !withinDir(dest, target) {
-		return "", fmt.Errorf("tarball entry escapes: %s", name)
-	}
-	return target, nil
-}
-
 // extractTarGz unpacks a tool tarball like tarfile.extractall, with
 // zip-slip protection the oracle predates (real tool tarballs are
-// unaffected).
+// unaffected). Containment checks stay inline at each sink in the
+// canonical prefix form so static analysis can verify them.
 func extractTarGz(archive, dest string) error {
+	dest = filepath.Clean(dest)
 	fh, err := os.Open(archive)
 	if err != nil {
 		return err
@@ -217,9 +200,12 @@ func extractTarGz(archive, dest string) error {
 		if err != nil {
 			return err
 		}
-		target, err := safeJoin(dest, hdr.Name)
-		if err != nil {
-			return err
+		if filepath.IsAbs(hdr.Name) {
+			return fmt.Errorf("tarball entry is absolute: %s", hdr.Name)
+		}
+		target := filepath.Join(dest, hdr.Name)
+		if target != dest && !strings.HasPrefix(target, dest+string(os.PathSeparator)) {
+			return fmt.Errorf("tarball entry escapes: %s", hdr.Name)
 		}
 		switch hdr.Typeflag {
 		case tar.TypeDir:
@@ -244,11 +230,11 @@ func extractTarGz(archive, dest string) error {
 				return closeErr
 			}
 		case tar.TypeSymlink:
-			resolved := hdr.Linkname
-			if !filepath.IsAbs(resolved) {
-				resolved = filepath.Join(filepath.Dir(target), resolved)
+			linkTarget := hdr.Linkname
+			if !filepath.IsAbs(linkTarget) {
+				linkTarget = filepath.Join(filepath.Dir(target), linkTarget)
 			}
-			if !withinDir(dest, resolved) {
+			if !strings.HasPrefix(linkTarget, dest+string(os.PathSeparator)) {
 				return fmt.Errorf("tarball symlink escapes: %s -> %s", hdr.Name, hdr.Linkname)
 			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o777); err != nil {
@@ -259,8 +245,11 @@ func extractTarGz(archive, dest string) error {
 				return err
 			}
 		case tar.TypeLink:
-			src, err := safeJoin(dest, hdr.Linkname)
-			if err != nil {
+			if filepath.IsAbs(hdr.Linkname) {
+				return fmt.Errorf("tarball hardlink escapes: %s -> %s", hdr.Name, hdr.Linkname)
+			}
+			src := filepath.Join(dest, hdr.Linkname)
+			if !strings.HasPrefix(src, dest+string(os.PathSeparator)) {
 				return fmt.Errorf("tarball hardlink escapes: %s -> %s", hdr.Name, hdr.Linkname)
 			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o777); err != nil {

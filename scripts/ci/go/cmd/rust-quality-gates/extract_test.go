@@ -112,17 +112,3 @@ func TestExtractTarGzRejectsEscapes(t *testing.T) {
 		})
 	}
 }
-
-func TestSafeJoin(t *testing.T) {
-	dest := filepath.Join(string(filepath.Separator), "tmp", "d")
-	for _, name := range []string{"a/b", "./a", "a/./b"} {
-		if _, err := safeJoin(dest, name); err != nil {
-			t.Fatalf("%s: %v", name, err)
-		}
-	}
-	for _, name := range []string{"..", "../a", "/abs", "a/../../b"} {
-		if _, err := safeJoin(dest, name); err == nil {
-			t.Fatalf("%s unexpectedly allowed", name)
-		}
-	}
-}
