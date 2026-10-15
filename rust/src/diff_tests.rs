@@ -98,6 +98,34 @@ fn g1_edit_interactively_roundtrip() {
 }
 
 #[test]
+fn gap2_readable_scratch_file_path() {
+    let root = scratch_dir("gap2-readable");
+    let meta = root.join(".git");
+    let expected = Path::new(".git")
+        .join("arc")
+        .join("create-message")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        readable_scratch_file_path(&meta, &root, "create-message"),
+        expected
+    );
+    // Dotted roots resolve lexically on the second attempt.
+    assert_eq!(
+        readable_scratch_file_path(&meta, &root.join("sub").join(".."), "create-message"),
+        expected
+    );
+    // Roots that do not contain the file keep the absolute path.
+    let elsewhere = scratch_dir("gap2-readable-elsewhere");
+    assert_eq!(
+        readable_scratch_file_path(&meta, &elsewhere, "create-message"),
+        scratch_file_path(&meta, "create-message")
+            .to_string_lossy()
+            .into_owned()
+    );
+}
+
+#[test]
 fn g1_scratch_files() {
     let meta = scratch_dir("g1-scratch");
     assert_eq!(

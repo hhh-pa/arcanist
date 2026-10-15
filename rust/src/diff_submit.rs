@@ -421,6 +421,16 @@ pub fn commit_message_update_params(
     })
 }
 
+/// Build the `--update` message `differential.getcommitmessage` params:
+/// `revision_id`, `edit` = `edit` (`ArcanistDiffWorkflow.php:1600-1603`).
+#[must_use]
+pub fn get_commit_message_edit_params(revision_id: i64) -> serde_json::Value {
+    serde_json::json!({
+        "revision_id": revision_id,
+        "edit": "edit",
+    })
+}
+
 /// Build the create-template `differential.getcommitmessage` params:
 /// `revision_id` = null, `edit` = `create`, `fields`
 /// (`ArcanistDiffWorkflow.php:1416-1422`).

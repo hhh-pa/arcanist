@@ -16,20 +16,42 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
-use arc_rs::{diff, git, hg, lint, svn, unit};
+use arc_rs::{diff, diff_submit, git, hg, lint, svn, unit};
 
 /* -(  Commit Messages  )---------------------------------------------------- */
 
-/// A parsed commit message: the local subset of
-/// `ArcanistDifferentialCommitMessage` without the Conduit round-trip.
+/// Failure to pull commit-message data from Conduit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PullDataError {
+    /// Parser errors from `differential.parsecommitmessage`
+    /// (`ArcanistDifferentialCommitMessageParserException`, carrying the
+    /// error list; the exception message is the first error).
+    Parser(Vec<String>),
+    /// Transport or malformed-response failure.
+    Other(String),
+}
+
+impl PullDataError {
+    /// Render for string-error contexts: the first parser error, or the
+    /// transport message.
+    #[must_use]
+    pub fn into_message(self) -> String {
+        match self {
+            PullDataError::Parser(errors) => errors.into_iter().next().unwrap_or_default(),
+            PullDataError::Other(message) => message,
+        }
+    }
+}
+
+/// A parsed commit message: `ArcanistDifferentialCommitMessage` with the
+/// Conduit round-trip.
 ///
 /// PHP: `src/differential/ArcanistDifferentialCommitMessage.php:6-15`
 /// (properties) and `newFromRawCorpus()` at `:17-31`.
 ///
-/// Divergence: `pullDataFromConduit()` (`:48-70`, server call
-/// `differential.parsecommitmessage`) is not ported; field tags are parsed
-/// locally by [`parse_field_tags`], and user/project names are never
-/// resolved to PHIDs.
+/// Divergence: [`parse_field_tags`] stays as the offline field parser
+/// for the merge flows; Conduit-resolved fields (names to PHIDs) only
+/// exist after [`CommitMessage::pull_data_from_conduit`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitMessage {
     /// Verbatim corpus, as passed to `newFromRawCorpus()`.
@@ -42,6 +64,65 @@ pub struct CommitMessage {
     pub git_svn_base_path: Option<String>,
     /// `git-svn-id` UUID, if present.
     pub git_svn_uuid: Option<String>,
+    /// Parsed fields, empty until [`CommitMessage::pull_data_from_conduit`].
+    pub fields: CommitFields,
+    /// Server transactions, when the response carries them.
+    pub xactions: Option<serde_json::Value>,
+}
+
+/// Coerce one conduit field value to a [`FieldValue`]: strings stay text,
+/// arrays become lists (non-string items render as JSON), anything else
+/// renders as JSON text.
+fn conduit_field_value(value: &serde_json::Value) -> FieldValue {
+    match value {
+        serde_json::Value::String(text) => FieldValue::Text(text.clone()),
+        serde_json::Value::Array(items) => FieldValue::List(
+            items
+                .iter()
+                .map(|item| {
+                    item.as_str().map(str::to_string).unwrap_or_else(|| item.to_string())
+                })
+                .collect(),
+        ),
+        other => FieldValue::Text(other.to_string()),
+    }
+}
+
+/// Coerce the `fields` member of a `parsecommitmessage` result.
+///
+/// PHP assigns `$result['fields']` verbatim (possibly null); a missing or
+/// non-object member yields no fields here.
+fn conduit_fields(result: &serde_json::Value) -> CommitFields {
+    result
+        .get("fields")
+        .and_then(serde_json::Value::as_object)
+        .map(|map| {
+            map.iter()
+                .map(|(key, value)| (key.clone(), conduit_field_value(value)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parser errors from a `parsecommitmessage` result: a non-empty `errors`
+/// array, else none. PHP throws on any non-empty `errors`; non-array
+/// members never occur from real servers and are ignored.
+fn conduit_parser_errors(result: &serde_json::Value) -> Option<Vec<String>> {
+    let errors = result.get("errors")?.as_array()?;
+    if errors.is_empty() {
+        return None;
+    }
+    Some(
+        errors
+            .iter()
+            .map(|error| {
+                error
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| error.to_string())
+            })
+            .collect(),
+    )
 }
 
 impl CommitMessage {
@@ -64,7 +145,62 @@ impl CommitMessage {
             git_svn_base_revision,
             git_svn_base_path,
             git_svn_uuid,
+            fields: CommitFields::new(),
+            xactions: None,
         })
+    }
+
+    /// Pull parsed fields and transactions from Conduit.
+    ///
+    /// PHP: `pullDataFromConduit()`
+    /// (`src/differential/ArcanistDifferentialCommitMessage.php:48-70`):
+    /// `differential.parsecommitmessage` with `corpus` and `partial`;
+    /// assigns `fields` plus `transactions` (absent before late October
+    /// 2017), then throws the parser errors when `errors` is non-empty.
+    pub fn pull_data_from_conduit(
+        &mut self,
+        call: &diff_submit::ConduitCall<'_>,
+        partial: bool,
+    ) -> Result<(), PullDataError> {
+        let params = diff_submit::parse_commit_message_params(&self.raw_corpus, partial);
+        let result = call(diff_submit::METHOD_PARSE_COMMIT_MESSAGE, &params)
+            .map_err(PullDataError::Other)?;
+        self.fields = conduit_fields(&result);
+        self.xactions = result.get("transactions").cloned();
+        if let Some(errors) = conduit_parser_errors(&result) {
+            return Err(PullDataError::Parser(errors));
+        }
+        Ok(())
+    }
+
+    /// Read one parsed field (`getFieldValue()`, `:72-77`).
+    #[must_use]
+    pub fn get_field_value(&self, key: &str) -> Option<&FieldValue> {
+        self.fields.get(key)
+    }
+
+    /// Write one parsed field (`setFieldValue()`, `:79-82`).
+    pub fn set_field_value(&mut self, key: &str, value: FieldValue) {
+        self.fields.insert(key.to_string(), value);
+    }
+
+    /// All parsed fields (`getFields()`, `:84-86`).
+    #[must_use]
+    pub fn get_fields(&self) -> &CommitFields {
+        &self.fields
+    }
+
+    /// Server transactions (`getTransactions()`, `:105-107`).
+    #[must_use]
+    pub fn get_transactions(&self) -> Option<&serde_json::Value> {
+        self.xactions.as_ref()
+    }
+
+    /// `D123` for the revision ID, if present (`getRevisionMonogram()`,
+    /// `:40-45`).
+    #[must_use]
+    pub fn get_revision_monogram(&self) -> Option<String> {
+        self.revision_id.map(|id| format!("D{id}"))
     }
 }
 
@@ -621,8 +757,8 @@ fn merge_occupied_field(slot: &mut FieldValue, value: &FieldValue) {
 /// PHP: `getCommitMessageFromFile()`
 /// (`src/workflow/ArcanistDiffWorkflow.php:1561-1571`): `readFile`,
 /// `newFromRawCorpus`, Conduit pull, validate. Only the read and the local
-/// parse are ported; validation needs Conduit (`validateCommitMessage()`,
-/// `:1620-1714`) and belongs to D2.
+/// parse happen here; [`get_commit_message_from_file_with`] adds the
+/// Conduit pull and [`validate_commit_message`].
 pub fn commit_message_from_file(path: &Path) -> Result<CommitMessage, String> {
     let data = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read message file '{}': {e}", path.display()))?;
@@ -4720,6 +4856,581 @@ pub fn get_svn_info_with(
         ));
     }
     Ok(parse_svn_info(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/* -(  Create-message edit loop (D1)  )-------------------------------------- */
+
+/// Scratch file holding the in-progress create message (`:1382`).
+pub const SCRATCH_CREATE_MESSAGE: &str = "create-message";
+
+/// PHP `rtrim()` default charlist (also `trim()` and `ltrim()`).
+const PHP_TRIM_CHARS: [char; 6] = [' ', '\t', '\n', '\r', '\0', '\x0B'];
+
+/// Build the editor template: message, blank line, `#`-comment issues,
+/// trailing blank line (`getCommitMessageFromUser()`, `:1467-1474`).
+#[must_use]
+pub fn build_editor_template(template: &str, issues: &[String]) -> String {
+    let mut out = format!("{}\n\n", template.trim_end_matches(['\r', '\n']));
+    for issue in issues {
+        out.push_str(format!("# {issue}").trim_end_matches(PHP_TRIM_CHARS));
+        out.push('\n');
+    }
+    out.push('\n');
+    out
+}
+
+/// Saved-message resume block (`getCommitMessageFromUser()`, `:1362-1400`).
+///
+/// Skipped for `--verbatim`. A saved `create-message` scratch template
+/// prints the saved notice and confirms reuse (`[Y/n]`); a refusal
+/// deletes the scratch file. Returns the reused template, if any.
+pub fn resolve_saved_template<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    metadata_dir: &Path,
+    work_root: &Path,
+    verbatim: bool,
+) -> Result<Option<String>, String> {
+    if verbatim {
+        return Ok(None);
+    }
+    let Some(saved) = diff::read_scratch_file(metadata_dir, SCRATCH_CREATE_MESSAGE) else {
+        return Ok(None);
+    };
+    if saved.is_empty() {
+        return Ok(None);
+    }
+    let preview = truncate_preview_64(&saved);
+    let where_path =
+        diff::readable_scratch_file_path(metadata_dir, work_root, SCRATCH_CREATE_MESSAGE);
+    let notice = saved_message_notice(&where_path, &preview);
+    writer
+        .write_all(notice.as_bytes())
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    if diff::prompt_confirm_from(reader, writer, PROMPT_USE_SAVED_MESSAGE, false)? {
+        return Ok(Some(saved));
+    }
+    diff::remove_scratch_file(metadata_dir, SCRATCH_CREATE_MESSAGE);
+    Ok(None)
+}
+
+/// Refuse (after confirm) to update someone else's revision (`:2446-2467`).
+pub fn check_revision_ownership<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    revision: &serde_json::Value,
+    user_phid: &str,
+) -> Result<(), String> {
+    let author = revision
+        .get("authorPHID")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !diff_submit::needs_ownership_confirm(author, user_phid) {
+        return Ok(());
+    }
+    let id = revision
+        .get("id")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let title = revision
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let prompt = diff_submit::ownership_prompt(id, title);
+    if !diff::prompt_confirm_from(reader, writer, &prompt, true)? {
+        return Err(diff_submit::OWNERSHIP_ABORT.to_string());
+    }
+    Ok(())
+}
+
+/// `reviewerPHIDs` as a string list, else empty (`getFieldValue()`, `:1634`).
+fn message_reviewer_phids(message: &CommitMessage) -> Vec<&str> {
+    match message.get_field_value("reviewerPHIDs") {
+        Some(FieldValue::List(phids)) => phids.iter().map(String::as_str).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Filter `user.query` rows to the requested reviewers, in reviewer order
+/// (`array_select_keys()`, `:1641`).
+fn select_reviewer_users<'a>(
+    users: &'a serde_json::Value,
+    reviewers: &[&str],
+) -> Vec<&'a serde_json::Value> {
+    let mut out = Vec::new();
+    if let serde_json::Value::Object(map) = users {
+        for phid in reviewers {
+            if let Some(user) = map.get(*phid) {
+                out.push(user);
+            }
+        }
+    }
+    out
+}
+
+/// Away-reviewer block of `validateCommitMessage()` (`:1633-1712`).
+fn validate_reviewer_availability<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    call: &diff_submit::ConduitCall<'_>,
+    reviewers: &[&str],
+    away_offset: i64,
+) -> Result<(), String> {
+    if reviewers.is_empty() {
+        return Ok(());
+    }
+    let params = diff_submit::user_query_params(reviewers);
+    let users = call(diff_submit::METHOD_USER_QUERY, &params)?;
+    let selected: Vec<serde_json::Value> = select_reviewer_users(&users, reviewers)
+        .into_iter()
+        .cloned()
+        .collect();
+    let away = diff_submit::away_reviewers(&serde_json::Value::Array(selected));
+    let Some(block) =
+        diff_submit::away_reviewers_block_with_offset(&away, reviewers.len(), away_offset)
+    else {
+        return Ok(());
+    };
+    writer
+        .write_all(block.as_bytes())
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    if !diff::prompt_confirm_from(reader, writer, diff_submit::CONTINUE_DESPITE_AWAY, true)? {
+        return Err(diff_submit::SPECIFY_AVAILABLE_REVIEWERS.to_string());
+    }
+    Ok(())
+}
+
+/// Validate a message against Conduit (`validateCommitMessage()`, `:1620-1649`).
+///
+/// With a `Differential Revision:` field, `differential.query` must find
+/// the row (else `There is no revision D{id}.`), then the ownership
+/// check runs. `reviewerPHIDs` fields trigger the away-reviewer block.
+pub fn validate_commit_message<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    call: &diff_submit::ConduitCall<'_>,
+    message: &CommitMessage,
+    user_phid: &str,
+    away_offset: i64,
+) -> Result<(), String> {
+    if let Some(id) = message.revision_id {
+        let id_arg = i64::try_from(id).unwrap_or(i64::MAX);
+        let params = diff_submit::differential_query_params(&[id_arg]);
+        let result = call(diff_submit::METHOD_QUERY, &params)?;
+        let row = result.as_array().and_then(|rows| rows.first());
+        match row {
+            Some(row) => check_revision_ownership(reader, writer, row, user_phid)?,
+            None => return Err(diff_submit::missing_revision_message(id_arg)),
+        }
+    }
+    let reviewers = message_reviewer_phids(message);
+    validate_reviewer_availability(reader, writer, call, &reviewers, away_offset)
+}
+
+/// Seams plus context for the create-message edit loop.
+pub struct CreateMessageEditor<'a, R: BufRead, W: Write> {
+    /// Prompt input.
+    pub reader: &'a mut R,
+    /// Echo plus prompt output.
+    pub writer: &'a mut W,
+    /// Conduit caller.
+    pub call: &'a diff_submit::ConduitCall<'a>,
+    /// VCS metadata dir (scratch files).
+    pub metadata_dir: &'a Path,
+    /// Work root (readable scratch paths).
+    pub work_root: &'a Path,
+    /// Interactive editor: template text to edited text.
+    pub edit: &'a dyn Fn(&str) -> Result<String, String>,
+    /// Amend hook when a single worktree commit absorbs the message
+    /// (`shouldAmend()`); `None` saves to scratch instead.
+    pub amend_commit: Option<&'a dyn Fn(&str) -> Result<(), String>>,
+    /// Viewer PHID (ownership checks).
+    pub user_phid: &'a str,
+    /// Server-tz offset seconds (away-reviewer dates).
+    pub away_offset: i64,
+}
+
+/// One parse/validate attempt inside the loop.
+enum AttemptError {
+    /// Conduit parser errors: re-editable.
+    Parser(Vec<String>),
+    /// Anything else: fatal after the saved-copy note.
+    Other(String),
+}
+
+/// Parse, pull, and validate one draft (`:1516-1522`).
+fn attempt_message<R: BufRead, W: Write>(
+    editor: &mut CreateMessageEditor<'_, R, W>,
+    template: &str,
+) -> Result<CommitMessage, AttemptError> {
+    let mut message =
+        CommitMessage::new_from_raw_corpus(template).map_err(AttemptError::Other)?;
+    message
+        .pull_data_from_conduit(editor.call, false)
+        .map_err(|error| match error {
+            PullDataError::Parser(errors) => AttemptError::Parser(errors),
+            PullDataError::Other(text) => AttemptError::Other(text),
+        })?;
+    validate_commit_message(
+        &mut *editor.reader,
+        &mut *editor.writer,
+        editor.call,
+        &message,
+        editor.user_phid,
+        editor.away_offset,
+    )
+    .map_err(AttemptError::Other)?;
+    Ok(message)
+}
+
+/// Unresolved-errors abort (`:1541-1544`): with a saved copy the suffix
+/// names it, else PHP's `" ...errors." . " "` trailing space survives.
+#[must_use]
+pub fn unresolved_errors_error(saved_where: Option<&str>) -> String {
+    match saved_where {
+        Some(where_path) => format!(
+            "{} {}",
+            MESSAGE_HAS_UNRESOLVED_ERRORS,
+            copy_saved_to(where_path)
+        ),
+        None => format!("{MESSAGE_HAS_UNRESOLVED_ERRORS} "),
+    }
+}
+
+/// Echo parser errors and confirm re-editing (`:1524-1540`).
+///
+/// Returns the next-round issues on re-edit, or the abort error on refusal.
+fn confirm_message_reedit<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    errors: &[String],
+    saved_where: Option<&str>,
+) -> Result<Vec<String>, String> {
+    writer
+        .write_all(format!("{COMMIT_MESSAGE_HAS_ERRORS}\n\n").as_bytes())
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    let mut issues = vec![RESOLVE_THESE_ERRORS.to_string()];
+    for error in errors {
+        let line = diff::console_wrap(&format!("- {error}\n"), 6, true);
+        writer
+            .write_all(line.as_bytes())
+            .map_err(|error| format!("failed to write prompt: {error}"))?;
+        issues.push(format!("  - {error}"));
+    }
+    writer
+        .write_all(b"\n")
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    writer
+        .write_all(MUST_RESOLVE_ERRORS.as_bytes())
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    if !diff::prompt_confirm_from(reader, writer, PROMPT_EDIT_MESSAGE_AGAIN, false)? {
+        return Err(unresolved_errors_error(saved_where));
+    }
+    Ok(issues)
+}
+
+/// Amend-or-scratch the draft (`:1502-1514`).
+///
+/// Returns `(wrote, where)`: `where` is `None` only when amending left
+/// the message unchanged.
+fn save_message_draft<R: BufRead, W: Write>(
+    editor: &CreateMessageEditor<'_, R, W>,
+    old_message: &str,
+    template: &str,
+) -> Result<(bool, Option<String>), String> {
+    if let Some(amend) = editor.amend_commit {
+        let wrote =
+            old_message.trim_end_matches(PHP_TRIM_CHARS) != template.trim_end_matches(PHP_TRIM_CHARS);
+        if wrote {
+            amend(template)?;
+            return Ok((true, Some(WHERE_COMMIT_MESSAGE.to_string())));
+        }
+        return Ok((false, None));
+    }
+    let wrote = diff::write_scratch_file(editor.metadata_dir, SCRATCH_CREATE_MESSAGE, template);
+    let where_path = format!(
+        "'{}'",
+        diff::readable_scratch_file_path(editor.metadata_dir, editor.work_root, SCRATCH_CREATE_MESSAGE)
+    );
+    Ok((wrote, Some(where_path)))
+}
+
+/// Echo the saved-copy note for a fatal loop error (`:1546-1550`).
+fn echo_saved_copy_note<W: Write>(
+    writer: &mut W,
+    where_path: &str,
+) -> Result<(), String> {
+    let note = diff::console_wrap(&format!("{}\n", message_saved_to(where_path)), 0, true);
+    writer
+        .write_all(note.as_bytes())
+        .map_err(|error| format!("failed to write prompt: {error}"))
+}
+
+/// Interactively build a create message (`getCommitMessageFromUser()`,
+/// `:1359-1559`).
+///
+/// `template`/`old_message` are the starting and pre-edit templates,
+/// `issues` the first-round `#` comments, `template_is_default` whether
+/// the template came from the server default, and `verbatim` the flag
+/// (skips the editor on the first pass for non-default templates).
+/// Returns the parsed, pulled, validated message.
+pub fn edit_create_message<R: BufRead, W: Write>(
+    editor: &mut CreateMessageEditor<'_, R, W>,
+    template: &str,
+    old_message: &str,
+    template_is_default: bool,
+    verbatim: bool,
+    issues: &[String],
+) -> Result<CommitMessage, String> {
+    let mut template = template.to_string();
+    let mut issues = issues.to_vec();
+    let mut first = true;
+    loop {
+        let edit_text = build_editor_template(&template, &issues);
+        let new_template = if first && verbatim && !template_is_default {
+            template.clone()
+        } else {
+            let edited = (editor.edit)(&edit_text)?;
+            let stripped = remove_comments(&edited);
+            if template_is_default && stripped == template {
+                return Err(TEMPLATE_NOT_EDITED.to_string());
+            }
+            stripped
+        };
+        first = false;
+        template = new_template;
+        let (wrote, where_path) = save_message_draft(editor, old_message, &template)?;
+        match attempt_message(editor, &template) {
+            Ok(message) => return Ok(message),
+            Err(AttemptError::Parser(errors)) => {
+                issues = confirm_message_reedit(
+                    &mut *editor.reader,
+                    &mut *editor.writer,
+                    &errors,
+                    where_path.as_deref(),
+                )?;
+            }
+            Err(AttemptError::Other(error)) => {
+                if wrote {
+                    if let Some(where_path) = where_path {
+                        echo_saved_copy_note(&mut *editor.writer, &where_path)?;
+                    }
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+/// Twelve-char hash prefix (`substr($commit, 0, 12)`, `:1853-1855`).
+fn short_commit_hash(hash: &str) -> String {
+    hash.chars().take(12).collect()
+}
+
+/// One default-field message outcome.
+enum CreateFieldOutcome {
+    /// Pulled fields.
+    Fields(CommitFields),
+    /// Parse-failure note lines.
+    Notes(Vec<String>),
+}
+
+/// Parse one message for default fields (`:1874-1886`).
+///
+/// Usage errors from the corpus parser and transport failures propagate;
+/// conduit parser errors become note lines (verbatim rethrows the first).
+fn parse_create_message_fields(
+    call: &diff_submit::ConduitCall<'_>,
+    hash: &str,
+    message: &str,
+    verbatim: bool,
+) -> Result<CreateFieldOutcome, String> {
+    let mut parsed = CommitMessage::new_from_raw_corpus(message)?;
+    match parsed.pull_data_from_conduit(call, true) {
+        Ok(()) => Ok(CreateFieldOutcome::Fields(parsed.fields)),
+        Err(PullDataError::Parser(errors)) => {
+            if verbatim {
+                return Err(errors.into_iter().next().unwrap_or_default());
+            }
+            let mut notes = vec![commit_parse_note(&short_commit_hash(hash))];
+            notes.extend(errors.iter().map(|error| format!("  - {error}")));
+            Ok(CreateFieldOutcome::Notes(notes))
+        }
+        Err(PullDataError::Other(error)) => Err(error),
+    }
+}
+
+/// Default create fields from local commits (`getDefaultCreateFields()`,
+/// `:1770-1848`).
+///
+/// `local` is newest-first (as returned); `reviewers`/`cc` build the faux
+/// flag message. Returns merged fields, `Included commits` lines
+/// (newest-first, faux first), and parse notes.
+/// `getDependsOnRevisionRef()` always returns null in PHP (`:1993-1996`
+/// TODO), so no dependency line is emitted. The
+/// `TYPE_DIFF_WILLBUILDMESSAGE` event (`:2431-2444`) has no port: there
+/// are no extensions to dispatch to.
+pub fn get_default_create_fields_with(
+    call: &diff_submit::ConduitCall<'_>,
+    local: &[LocalCommitInfo],
+    create: bool,
+    reviewers: Option<&str>,
+    cc: Option<&str>,
+    verbatim: bool,
+) -> Result<(CommitFields, Vec<String>, Vec<String>), String> {
+    let mut messages: Vec<(String, String, String)> = Vec::new();
+    if let Some(faux) = faux_flag_message(reviewers, cc) {
+        messages.push((
+            FLAGS_COMMIT_HASH.to_string(),
+            faux,
+            "Command-Line Flags".to_string(),
+        ));
+    }
+    for info in local {
+        messages.push((info.commit.clone(), info.message.clone(), info.summary.clone()));
+    }
+    let mut included = Vec::new();
+    for (hash, _, summary) in &messages {
+        included.push(included_commit_line(hash, summary));
+    }
+    messages.reverse();
+    let mut dicts = Vec::new();
+    let mut notes = Vec::new();
+    for (hash, message, _) in &messages {
+        match parse_create_message_fields(call, hash, message, verbatim)? {
+            CreateFieldOutcome::Fields(dict) => dicts.push(dict),
+            CreateFieldOutcome::Notes(mut lines) => notes.append(&mut lines),
+        }
+    }
+    let mut fields = merge_fields_oldest_first(&dicts);
+    if create {
+        fields.remove(FIELD_REVISION_ID);
+    }
+    Ok((fields, included, notes))
+}
+
+/// Failure to fetch the `--update` template (`:1606-1610`).
+pub const FAILED_TO_RETRIEVE_TEMPLATE: &str =
+    "Failed to retrieve commit message template from server.";
+
+/// Message from `--message-file` (`getCommitMessageFromFile()`, `:1561-1575`).
+pub fn get_commit_message_from_file_with<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    call: &diff_submit::ConduitCall<'_>,
+    path: &Path,
+    user_phid: &str,
+    away_offset: i64,
+) -> Result<CommitMessage, String> {
+    let mut message = commit_message_from_file(path)?;
+    message
+        .pull_data_from_conduit(call, false)
+        .map_err(PullDataError::into_message)?;
+    validate_commit_message(reader, writer, call, &message, user_phid, away_offset)?;
+    Ok(message)
+}
+
+/// Message from `--update` (`getCommitMessageFromRevision()`, `:1577-1618`).
+///
+/// Returns the message plus whether the revision is a draft. Unlike the
+/// create paths, PHP never validates here (no away-reviewer block).
+pub fn get_commit_message_from_revision_with<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    call: &diff_submit::ConduitCall<'_>,
+    revision_id: &str,
+    user_phid: &str,
+) -> Result<(CommitMessage, bool), String> {
+    let id_arg = i64::try_from(parse_update_revision_id(revision_id)?).unwrap_or(i64::MAX);
+    let params = diff_submit::differential_query_params(&[id_arg]);
+    let result = call(diff_submit::METHOD_QUERY, &params)?;
+    let row = result
+        .as_array()
+        .and_then(|rows| rows.first())
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if row.is_null() {
+        return Err(diff_submit::unknown_revision_message(revision_id));
+    }
+    check_revision_ownership(reader, writer, &row, user_phid)?;
+    let is_draft =
+        row.get("statusName").and_then(serde_json::Value::as_str) == Some("Draft");
+    let params = diff_submit::get_commit_message_edit_params(id_arg);
+    let template = call(diff_submit::METHOD_GET_COMMIT_MESSAGE, &params)?;
+    let Some(corpus) = template.as_str() else {
+        return Err(FAILED_TO_RETRIEVE_TEMPLATE.to_string());
+    };
+    let mut message = CommitMessage::new_from_raw_corpus(corpus)?;
+    message
+        .pull_data_from_conduit(call, false)
+        .map_err(PullDataError::into_message)?;
+    Ok((message, is_draft))
+}
+
+/// Resolved `buildCommitMessage()` source (`:1292-1357`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageSource {
+    /// `--only` or raw: no message.
+    None,
+    /// `--create --message-file`: from file.
+    CreateFromFile(String),
+    /// Create (or `--verbatim`): interactive editor.
+    CreateFromUser,
+    /// `--update`: from revision (numeric id).
+    UpdateFromRevision(u64),
+}
+
+/// Dispatch `buildCommitMessage()` (`:1292-1357`).
+///
+/// `loaded` carries the working-copy revision lookup (id, title) when the
+/// caller ran it; it is required unless `only`, raw, `create`, or
+/// `update` short-circuits. Zero revisions create; one updates; several
+/// fail. The lookup itself (`loadWorkingCopyDifferentialRevisions()`)
+/// is caller-provided: per-VCS discovery plus Conduit.
+pub fn resolve_message_source(
+    only: bool,
+    verbatim: bool,
+    create: bool,
+    update: Option<&str>,
+    message_file: Option<&str>,
+    is_raw: bool,
+    loaded: Option<&[(i64, String)]>,
+) -> Result<MessageSource, String> {
+    if only || is_raw {
+        return Ok(MessageSource::None);
+    }
+    if verbatim {
+        return Ok(MessageSource::CreateFromUser);
+    }
+    if !create && update.is_none() {
+        let revisions = loaded.unwrap_or(&[]);
+        if revisions.is_empty() {
+            return Ok(MessageSource::CreateFromUser);
+        }
+        if revisions.len() > 1 {
+            let list: Vec<(i64, &str)> = revisions
+                .iter()
+                .map(|(id, title)| (*id, title.as_str()))
+                .collect();
+            return Err(diff_submit::several_revisions_error(
+                &diff_submit::render_revision_list(&list),
+            ));
+        }
+        return Ok(MessageSource::UpdateFromRevision(
+            u64::try_from(revisions[0].0).unwrap_or(0),
+        ));
+    }
+    if create {
+        if let Some(file) = message_file {
+            return Ok(MessageSource::CreateFromFile(file.to_string()));
+        }
+        return Ok(MessageSource::CreateFromUser);
+    }
+    match update {
+        Some(id) => Ok(MessageSource::UpdateFromRevision(parse_update_revision_id(id)?)),
+        // Unreachable: `!create && update.is_none()` returned above.
+        None => Ok(MessageSource::CreateFromUser),
+    }
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use arc_rs::diff_local;
+use arc_rs::{diff, diff_local};
 
 /* G1 full-state integration tests: parser on real diffs, VCS helpers. */
 
@@ -623,4 +623,93 @@ fn upstream_branch_feeds_onto_targets() {
 
     let configured = diff_local::diff_onto_targets(None, Some("stable"));
     assert_eq!(configured[0].kind, diff_local::DIFF_ONTO_CONFIG_KEY);
+}
+
+/* Gap2 D1: create-message edit loop over canned conduit. */
+
+#[test]
+fn gap2_create_message_loop_reedits_then_succeeds() {
+    use std::io::Cursor;
+    let fx = Fixture::named("gap2-d1-loop");
+    let meta = fx.path().join(".git");
+    std::fs::create_dir_all(&meta).unwrap();
+
+    let flaky = |method: &str, params: &serde_json::Value| -> Result<serde_json::Value, String> {
+        if method == "differential.parsecommitmessage"
+            && params["corpus"].as_str().unwrap_or("").contains("Bad")
+        {
+            return Ok(serde_json::json!({"fields": {}, "errors": ["Title is required."]}));
+        }
+        match method {
+            "differential.parsecommitmessage" => {
+                Ok(serde_json::json!({"fields": {"title": "Good"}, "errors": []}))
+            }
+            "differential.query" => Ok(serde_json::json!([])),
+            "user.query" => Ok(serde_json::json!({})),
+            other => Err(format!("unexpected conduit call {other}")),
+        }
+    };
+    let calls = std::cell::RefCell::new(0usize);
+    let edit = |_: &str| -> Result<String, String> {
+        *calls.borrow_mut() += 1;
+        if *calls.borrow() == 1 {
+            return Ok("Bad\n".to_string());
+        }
+        Ok("Good title\n".to_string())
+    };
+
+    let mut input = Cursor::new(b"y\n".to_vec());
+    let mut out = Vec::new();
+    let mut editor = diff_local::CreateMessageEditor {
+        reader: &mut input,
+        writer: &mut out,
+        call: &flaky,
+        metadata_dir: &meta,
+        work_root: fx.path(),
+        edit: &edit,
+        amend_commit: None,
+        user_phid: "PHID-USER-me",
+        away_offset: 0,
+    };
+    let message =
+        diff_local::edit_create_message(&mut editor, "Seed\n", "Seed\n", false, false, &[])
+            .unwrap();
+    assert_eq!(*calls.borrow(), 2);
+    assert_eq!(message.raw_corpus, "Good title\n");
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains(diff_local::COMMIT_MESSAGE_HAS_ERRORS), "{text}");
+    assert!(text.contains("Title is required."), "{text}");
+    assert!(text.contains(diff_local::MUST_RESOLVE_ERRORS), "{text}");
+    // The final draft lands in the scratch file.
+    assert_eq!(
+        diff::read_scratch_file(&meta, diff_local::SCRATCH_CREATE_MESSAGE)
+            .as_deref(),
+        Some("Good title\n")
+    );
+}
+
+#[test]
+fn gap2_saved_template_resume_roundtrip() {
+    use std::io::Cursor;
+    let fx = Fixture::named("gap2-d1-resume");
+    let meta = fx.path().join(".git");
+    assert!(diff::write_scratch_file(
+        &meta,
+        diff_local::SCRATCH_CREATE_MESSAGE,
+        "Saved title\n"
+    ));
+
+    let mut out = Vec::new();
+    let reused = diff_local::resolve_saved_template(
+        &mut Cursor::new(b"y\n".to_vec()),
+        &mut out,
+        &meta,
+        fx.path(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(reused.as_deref(), Some("Saved title\n"));
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("You have a saved revision message"), "{text}");
+    assert!(text.contains(diff_local::PROMPT_USE_SAVED_MESSAGE), "{text}");
 }

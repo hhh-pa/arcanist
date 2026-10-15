@@ -2699,3 +2699,755 @@ fn gap2_default_svn_diff_cmd_shape() {
         );
     }
 }
+
+/* Gap2 D10: pullDataFromConduit. */
+
+#[test]
+fn gap2_pull_data_from_conduit_assigns_fields() {
+    let seen = std::cell::RefCell::new((String::new(), serde_json::json!(null)));
+    let call = |method: &str, params: &serde_json::Value| {
+        *seen.borrow_mut() = (method.to_string(), params.clone());
+        Ok(serde_json::json!({
+            "fields": {
+                "title": "Hello",
+                "reviewerPHIDs": ["PHID-USER-1", "PHID-USER-2"],
+                "count": 7,
+            },
+            "transactions": [{"type": "title"}],
+            "errors": [],
+        }))
+    };
+    let mut message = CommitMessage::new_from_raw_corpus("Hello\n").unwrap();
+    assert!(message.get_fields().is_empty());
+    assert_eq!(message.get_transactions(), None);
+    message.pull_data_from_conduit(&call, true).unwrap();
+
+    let (method, params) = seen.borrow().clone();
+    assert_eq!(method, "differential.parsecommitmessage");
+    assert_eq!(params["corpus"], serde_json::json!("Hello\n"));
+    assert_eq!(params["partial"], serde_json::json!(true));
+
+    assert_eq!(
+        message.get_field_value("title"),
+        Some(&FieldValue::Text("Hello".to_string()))
+    );
+    assert_eq!(
+        message.get_field_value("reviewerPHIDs"),
+        Some(&FieldValue::List(vec![
+            "PHID-USER-1".to_string(),
+            "PHID-USER-2".to_string()
+        ]))
+    );
+    assert_eq!(
+        message.get_field_value("count"),
+        Some(&FieldValue::Text("7".to_string()))
+    );
+    assert_eq!(message.get_field_value("missing"), None);
+    assert_eq!(
+        message.get_transactions(),
+        Some(&serde_json::json!([{"type": "title"}]))
+    );
+
+    message.set_field_value("title", FieldValue::Text("Changed".to_string()));
+    assert_eq!(
+        message.get_fields().get("title"),
+        Some(&FieldValue::Text("Changed".to_string()))
+    );
+}
+
+#[test]
+fn gap2_pull_data_parser_errors_carry_list() {
+    let call = |_: &str, _: &serde_json::Value| {
+        Ok(serde_json::json!({
+            "fields": {"title": "Hello"},
+            "errors": ["first problem", "second problem"],
+        }))
+    };
+    let mut message = CommitMessage::new_from_raw_corpus("Hello\n").unwrap();
+    let err = message.pull_data_from_conduit(&call, false).unwrap_err();
+    // Fields assign before the throw, like PHP.
+    assert_eq!(
+        message.get_field_value("title"),
+        Some(&FieldValue::Text("Hello".to_string()))
+    );
+    // Pre-October-2017 responses carry no transactions.
+    assert_eq!(message.get_transactions(), None);
+    assert_eq!(
+        err,
+        PullDataError::Parser(vec![
+            "first problem".to_string(),
+            "second problem".to_string()
+        ])
+    );
+    assert_eq!(err.into_message(), "first problem");
+
+    let transport =
+        |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> { Err("down".into()) };
+    let mut message = CommitMessage::new_from_raw_corpus("Hello\n").unwrap();
+    let err = message.pull_data_from_conduit(&transport, false).unwrap_err();
+    assert_eq!(err, PullDataError::Other("down".to_string()));
+    assert_eq!(err.into_message(), "down");
+}
+
+#[test]
+fn gap2_commit_message_monogram_and_defaults() {
+    let message = CommitMessage::new_from_raw_corpus("Title\n\nDifferential Revision: D123\n").unwrap();
+    assert_eq!(message.revision_id, Some(123));
+    assert_eq!(message.get_revision_monogram(), Some("D123".to_string()));
+    let plain = CommitMessage::new_from_raw_corpus("Title\n").unwrap();
+    assert_eq!(plain.get_revision_monogram(), None);
+}
+
+/* Gap2 D1: create-message edit loop. */
+
+fn gap2_d1_scratch(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("arc-rs-diff-d1-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    dir
+}
+
+fn gap2_d1_ok_call(
+    method: &str,
+    _params: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    match method {
+        "differential.parsecommitmessage" => Ok(serde_json::json!({
+            "fields": {"title": "Hello"},
+            "errors": [],
+        })),
+        "differential.query" => Ok(serde_json::json!([
+            {"id": 7, "title": "Mine", "authorPHID": "PHID-USER-me", "statusName": "Accepted"},
+        ])),
+        "user.query" => Ok(serde_json::json!({})),
+        "differential.getcommitmessage" => Ok(serde_json::json!("Template title\n")),
+        other => Err(format!("unexpected conduit call {other}")),
+    }
+}
+
+#[test]
+fn gap2_build_editor_template_shapes() {
+    assert_eq!(
+        build_editor_template("Title\n", &[]),
+        "Title\n\n\n".to_string()
+    );
+    assert_eq!(
+        build_editor_template("Title\r\n\r\n", &["one".to_string(), "two  ".to_string()]),
+        "Title\n\n# one\n# two\n\n".to_string()
+    );
+    assert_eq!(
+        build_editor_template("", &["".to_string()]),
+        "\n\n#\n\n".to_string()
+    );
+}
+
+#[test]
+fn gap2_resolve_saved_template_flows() {
+    use std::io::Cursor;
+    let root = gap2_d1_scratch("saved");
+    let meta = root.join(".git");
+
+    // No scratch file, or verbatim: nothing to resume.
+    let mut out = Vec::new();
+    assert_eq!(
+        resolve_saved_template(&mut Cursor::new(b"".to_vec()), &mut out, &meta, &root, false)
+            .unwrap(),
+        None
+    );
+    assert!(out.is_empty());
+    diff::write_scratch_file(&meta, SCRATCH_CREATE_MESSAGE, "Saved title\nBody\n");
+    let mut out = Vec::new();
+    assert_eq!(
+        resolve_saved_template(&mut Cursor::new(b"".to_vec()), &mut out, &meta, &root, true)
+            .unwrap(),
+        None
+    );
+    assert!(out.is_empty());
+
+    // Acceptance reuses the template after the exact notice bytes.
+    let mut out = Vec::new();
+    let reused = resolve_saved_template(
+        &mut Cursor::new(b"y\n".to_vec()),
+        &mut out,
+        &meta,
+        &root,
+        false,
+    )
+    .unwrap();
+    assert_eq!(reused, Some("Saved title\nBody\n".to_string()));
+    let readable = diff::readable_scratch_file_path(&meta, &root, SCRATCH_CREATE_MESSAGE);
+    let expected = format!(
+        "{}\n\n{}\n",
+        saved_message_notice(&readable, &truncate_preview_64("Saved title\nBody\n")),
+        diff::format_confirm_prompt(PROMPT_USE_SAVED_MESSAGE, false)
+            .trim_start_matches("\n\n")
+    );
+    assert_eq!(String::from_utf8(out).unwrap(), expected);
+
+    // Refusal deletes the scratch file.
+    let mut out = Vec::new();
+    let reused = resolve_saved_template(
+        &mut Cursor::new(b"n\n".to_vec()),
+        &mut out,
+        &meta,
+        &root,
+        false,
+    )
+    .unwrap();
+    assert_eq!(reused, None);
+    assert!(diff::read_scratch_file(&meta, SCRATCH_CREATE_MESSAGE).is_none());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn gap2_check_revision_ownership_flows() {
+    use std::io::Cursor;
+    let mine = serde_json::json!({"id": 1, "title": "T", "authorPHID": "PHID-USER-me"});
+    let mut out = Vec::new();
+    check_revision_ownership(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &mine,
+        "PHID-USER-me",
+    )
+    .unwrap();
+    assert!(out.is_empty());
+
+    let other = serde_json::json!({"id": 2, "title": "O", "authorPHID": "PHID-USER-you"});
+    let mut out = Vec::new();
+    check_revision_ownership(
+        &mut Cursor::new(b"y\n".to_vec()),
+        &mut out,
+        &other,
+        "PHID-USER-me",
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("You don't own revision D2: \"O\"."), "{text}");
+
+    let mut out = Vec::new();
+    let err = check_revision_ownership(
+        &mut Cursor::new(b"n\n".to_vec()),
+        &mut out,
+        &other,
+        "PHID-USER-me",
+    )
+    .unwrap_err();
+    assert_eq!(err, diff_submit::OWNERSHIP_ABORT);
+}
+
+#[test]
+fn gap2_validate_commit_message_flows() {
+    use std::io::Cursor;
+
+    // No revision, no reviewers: silent success, no conduit calls.
+    let message = CommitMessage::new_from_raw_corpus("Title\n").unwrap();
+    let fail = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        Err("must not call".to_string())
+    };
+    let mut out = Vec::new();
+    validate_commit_message(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &fail,
+        &message,
+        "PHID-USER-me",
+        0,
+    )
+    .unwrap();
+    assert!(out.is_empty());
+
+    // Unknown revision id.
+    let message =
+        CommitMessage::new_from_raw_corpus("Title\n\nDifferential Revision: D9\n").unwrap();
+    let empty = |_: &str, _: &serde_json::Value| Ok(serde_json::json!([]));
+    let mut out = Vec::new();
+    let err = validate_commit_message(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &empty,
+        &message,
+        "PHID-USER-me",
+        0,
+    )
+    .unwrap_err();
+    assert_eq!(err, "There is no revision D9.");
+
+    // Owned revision validates (PHP takes the first row without
+    // comparing ids, so the canned D7 row satisfies the D9 message).
+    let mut out = Vec::new();
+    validate_commit_message(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &gap2_d1_ok_call,
+        &message,
+        "PHID-USER-me",
+        0,
+    )
+    .unwrap();
+    assert!(out.is_empty());
+}
+
+#[test]
+fn gap2_validate_reviewer_availability_flows() {
+    use std::io::Cursor;
+    let mut message = CommitMessage::new_from_raw_corpus("Title\n").unwrap();
+    message.set_field_value(
+        "reviewerPHIDs",
+        FieldValue::List(vec!["PHID-USER-away".to_string()]),
+    );
+    let away_user = |_: &str, _: &serde_json::Value| {
+        Ok(serde_json::json!({
+            "PHID-USER-away": {
+                "phid": "PHID-USER-away",
+                "userName": "away",
+                "realName": "",
+                "isDisabled": false,
+                "isAway": true,
+                "currentStatus": "away",
+                "currentStatusUntil": 1_700_000_000u64,
+            },
+        }))
+    };
+
+    let mut out = Vec::new();
+    validate_commit_message(
+        &mut Cursor::new(b"y\n".to_vec()),
+        &mut out,
+        &away_user,
+        &message,
+        "PHID-USER-me",
+        0,
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("away (until"), "{text}");
+    assert!(text.contains(diff_submit::CONTINUE_DESPITE_AWAY), "{text}");
+
+    let mut out = Vec::new();
+    let err = validate_commit_message(
+        &mut Cursor::new(b"n\n".to_vec()),
+        &mut out,
+        &away_user,
+        &message,
+        "PHID-USER-me",
+        0,
+    )
+    .unwrap_err();
+    assert_eq!(err, diff_submit::SPECIFY_AVAILABLE_REVIEWERS);
+}
+
+#[test]
+fn gap2_unresolved_errors_error_shapes() {
+    assert_eq!(
+        unresolved_errors_error(Some("somewhere")),
+        "Message has unresolved errors. A copy was saved to somewhere."
+    );
+    assert_eq!(unresolved_errors_error(None), "Message has unresolved errors. ");
+}
+
+#[test]
+fn gap2_edit_create_message_first_pass() {
+    use std::io::Cursor;
+    let root = gap2_d1_scratch("loop-first");
+    let meta = root.join(".git");
+    let calls = std::cell::RefCell::new(0usize);
+    let edit = |_: &str| -> Result<String, String> {
+        *calls.borrow_mut() += 1;
+        Ok("Edited\n".to_string())
+    };
+
+    // Verbatim skips the editor on the first pass for non-default templates.
+    let mut input = Cursor::new(b"".to_vec());
+    let mut out = Vec::new();
+    let mut editor = CreateMessageEditor {
+        reader: &mut input,
+        writer: &mut out,
+        call: &gap2_d1_ok_call,
+        metadata_dir: &meta,
+        work_root: &root,
+        edit: &edit,
+        amend_commit: None,
+        user_phid: "PHID-USER-me",
+        away_offset: 0,
+    };
+    let message = edit_create_message(&mut editor, "Raw template\n", "Raw template\n", false, true, &[])
+        .unwrap();
+    assert_eq!(*calls.borrow(), 0);
+    assert_eq!(message.raw_corpus, "Raw template\n");
+    assert_eq!(
+        diff::read_scratch_file(&meta, SCRATCH_CREATE_MESSAGE),
+        Some("Raw template\n".to_string())
+    );
+
+    // Default templates saved unedited fail.
+    let passthrough = |template: &str| -> Result<String, String> { Ok(template.to_string()) };
+    let mut input = Cursor::new(b"".to_vec());
+    let mut out = Vec::new();
+    let mut editor = CreateMessageEditor {
+        reader: &mut input,
+        writer: &mut out,
+        call: &gap2_d1_ok_call,
+        metadata_dir: &meta,
+        work_root: &root,
+        edit: &passthrough,
+        amend_commit: None,
+        user_phid: "PHID-USER-me",
+        away_offset: 0,
+    };
+    let err = edit_create_message(&mut editor, "Title\n", "Title\n", true, false, &[]).unwrap_err();
+    assert_eq!(err, TEMPLATE_NOT_EDITED);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn gap2_edit_create_message_reedits_on_parser_errors() {
+    use std::io::Cursor;
+    let root = gap2_d1_scratch("loop-reedit");
+    let meta = root.join(".git");
+    let flaky = |method: &str, params: &serde_json::Value| -> Result<serde_json::Value, String> {
+        if method == "differential.parsecommitmessage"
+            && params["corpus"].as_str().unwrap_or("").contains("Bad")
+        {
+            return Ok(serde_json::json!({
+                "fields": {},
+                "errors": ["Title is required."],
+            }));
+        }
+        gap2_d1_ok_call(method, params)
+    };
+    let calls = std::cell::RefCell::new(0usize);
+    let edit = |_: &str| -> Result<String, String> {
+        *calls.borrow_mut() += 1;
+        if *calls.borrow() == 1 {
+            return Ok("Bad\n".to_string());
+        }
+        Ok("Good title\n".to_string())
+    };
+
+    let mut input = Cursor::new(b"y\n".to_vec());
+    let mut out = Vec::new();
+    let mut editor = CreateMessageEditor {
+        reader: &mut input,
+        writer: &mut out,
+        call: &flaky,
+        metadata_dir: &meta,
+        work_root: &root,
+        edit: &edit,
+        amend_commit: None,
+        user_phid: "PHID-USER-me",
+        away_offset: 0,
+    };
+    let message =
+        edit_create_message(&mut editor, "Seed\n", "Seed\n", false, false, &[]).unwrap();
+    assert_eq!(*calls.borrow(), 2);
+    assert_eq!(message.raw_corpus, "Good title\n");
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains(COMMIT_MESSAGE_HAS_ERRORS), "{text}");
+    assert!(text.contains("Title is required."), "{text}");
+    assert!(text.contains(MUST_RESOLVE_ERRORS), "{text}");
+    assert!(text.contains(PROMPT_EDIT_MESSAGE_AGAIN), "{text}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn gap2_edit_create_message_aborts_unresolved() {
+    use std::io::Cursor;
+    let root = gap2_d1_scratch("loop-abort");
+    let meta = root.join(".git");
+    let failing = |_: &str, _: &serde_json::Value| {
+        Ok(serde_json::json!({"fields": {}, "errors": ["Nope."]}))
+    };
+    let edit = |_: &str| -> Result<String, String> { Ok("Bad\n".to_string()) };
+
+    let mut input = Cursor::new(b"n\n".to_vec());
+    let mut out = Vec::new();
+    let mut editor = CreateMessageEditor {
+        reader: &mut input,
+        writer: &mut out,
+        call: &failing,
+        metadata_dir: &meta,
+        work_root: &root,
+        edit: &edit,
+        amend_commit: None,
+        user_phid: "PHID-USER-me",
+        away_offset: 0,
+    };
+    let err = edit_create_message(&mut editor, "Seed\n", "Seed\n", false, false, &[]).unwrap_err();
+    let readable = diff::readable_scratch_file_path(&meta, &root, SCRATCH_CREATE_MESSAGE);
+    assert_eq!(
+        err,
+        format!("Message has unresolved errors. A copy was saved to '{readable}'.")
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn gap2_edit_create_message_amends_single_commit() {
+    use std::io::Cursor;
+    let root = gap2_d1_scratch("loop-amend");
+    let meta = root.join(".git");
+    let amended = std::cell::RefCell::new(Vec::<String>::new());
+    let amend = |message: &str| -> Result<(), String> {
+        amended.borrow_mut().push(message.to_string());
+        Ok(())
+    };
+    let edit = |_: &str| -> Result<String, String> { Ok("Amended title\n".to_string()) };
+
+    let mut input = Cursor::new(b"".to_vec());
+    let mut out = Vec::new();
+    let mut editor = CreateMessageEditor {
+        reader: &mut input,
+        writer: &mut out,
+        call: &gap2_d1_ok_call,
+        metadata_dir: &meta,
+        work_root: &root,
+        edit: &edit,
+        amend_commit: Some(&amend),
+        user_phid: "PHID-USER-me",
+        away_offset: 0,
+    };
+    let message =
+        edit_create_message(&mut editor, "Old\n", "Old\n", false, false, &[]).unwrap();
+    assert_eq!(message.raw_corpus, "Amended title\n");
+    assert_eq!(amended.borrow().as_slice(), ["Amended title\n".to_string()]);
+    // Amending never touches the scratch file.
+    assert!(diff::read_scratch_file(&meta, SCRATCH_CREATE_MESSAGE).is_none());
+
+    // An unchanged message skips the amend hook.
+    let edit_same = |_: &str| -> Result<String, String> { Ok("Old\n".to_string()) };
+    let mut input = Cursor::new(b"".to_vec());
+    let mut out = Vec::new();
+    let mut editor = CreateMessageEditor {
+        reader: &mut input,
+        writer: &mut out,
+        call: &gap2_d1_ok_call,
+        metadata_dir: &meta,
+        work_root: &root,
+        edit: &edit_same,
+        amend_commit: Some(&amend),
+        user_phid: "PHID-USER-me",
+        away_offset: 0,
+    };
+    edit_create_message(&mut editor, "Old\n", "Old\n", false, false, &[]).unwrap();
+    assert_eq!(amended.borrow().len(), 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn gap2_d1_local_commit(commit: &str, summary: &str, message: &str) -> LocalCommitInfo {
+    LocalCommitInfo {
+        commit: commit.to_string(),
+        tree: "t".to_string(),
+        parents: Vec::new(),
+        time: "0".to_string(),
+        author: "a".to_string(),
+        summary: summary.to_string(),
+        message: message.to_string(),
+        author_email: "a@x".to_string(),
+    }
+}
+
+#[test]
+fn gap2_get_default_create_fields_merges_oldest_first() {
+    let call = |_: &str, params: &serde_json::Value| -> Result<serde_json::Value, String> {
+        let corpus = params["corpus"].as_str().unwrap_or("");
+        if corpus.contains("Newest") {
+            return Ok(serde_json::json!({
+                "fields": {"title": "Newest title", "summary": "Newest summary"},
+                "errors": [],
+            }));
+        }
+        if corpus.contains("Oldest") {
+            return Ok(serde_json::json!({
+                "fields": {"title": "Oldest title"},
+                "errors": [],
+            }));
+        }
+        Ok(serde_json::json!({"fields": {}, "errors": []}))
+    };
+    let local = vec![
+        gap2_d1_local_commit("newest111111", "Newest", "Newest\n"),
+        gap2_d1_local_commit("oldest222222", "Oldest", "Oldest\n"),
+    ];
+    let (fields, included, notes) =
+        get_default_create_fields_with(&call, &local, true, Some("r1"), Some("c1"), false).unwrap();
+    // Faux flags first, then newest-first commits.
+    assert_eq!(included.len(), 3);
+    assert!(included[0].contains("Command-Line Flags"), "{included:?}");
+    assert_eq!(included[1], "newest111111 Newest");
+    assert_eq!(included[2], "oldest222222 Oldest");
+    assert!(notes.is_empty());
+    // Oldest title wins; the newest title demotes to summary.
+    assert_eq!(
+        fields.get("title"),
+        Some(&FieldValue::Text("Oldest title".to_string()))
+    );
+
+    // Parse failures become notes (verbatim rethrows the first error).
+    let flaky = |_: &str, params: &serde_json::Value| -> Result<serde_json::Value, String> {
+        if params["corpus"].as_str().unwrap_or("").contains("Oldest") {
+            return Ok(serde_json::json!({"fields": {}, "errors": ["Bad tag."]}));
+        }
+        call("differential.parsecommitmessage", params)
+    };
+    let (_, _, notes) =
+        get_default_create_fields_with(&flaky, &local, true, None, None, false).unwrap();
+    assert_eq!(notes.len(), 2);
+    assert!(notes[0].contains("oldest222222"), "{notes:?}");
+    assert_eq!(notes[1], "  - Bad tag.");
+    let err = get_default_create_fields_with(&flaky, &local, true, None, None, true).unwrap_err();
+    assert_eq!(err, "Bad tag.");
+}
+
+#[test]
+fn gap2_get_commit_message_from_file_and_revision() {
+    use std::io::Cursor;
+    let root = gap2_d1_scratch("from-file");
+    let file = root.join("msg.txt");
+    std::fs::write(&file, "File title\n").unwrap();
+
+    let mut out = Vec::new();
+    let message = get_commit_message_from_file_with(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &gap2_d1_ok_call,
+        &file,
+        "PHID-USER-me",
+        0,
+    )
+    .unwrap();
+    assert_eq!(message.raw_corpus, "File title\n");
+    assert_eq!(
+        message.get_field_value("title"),
+        Some(&FieldValue::Text("Hello".to_string()))
+    );
+
+    // Unknown revisions fail before any prompt.
+    let empty = |_: &str, _: &serde_json::Value| Ok(serde_json::json!([]));
+    let mut out = Vec::new();
+    let err = get_commit_message_from_revision_with(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &empty,
+        "42",
+        "PHID-USER-me",
+    )
+    .unwrap_err();
+    assert_eq!(err, "Revision '42' does not exist!");
+
+    // Owned draft revisions return the template plus the draft flag.
+    let draft = |method: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        if method == "differential.query" {
+            return Ok(serde_json::json!([
+                {"id": 7, "title": "Mine", "authorPHID": "PHID-USER-me", "statusName": "Draft"},
+            ]));
+        }
+        gap2_d1_ok_call(method, &serde_json::json!(null))
+    };
+    let mut out = Vec::new();
+    let (message, is_draft) = get_commit_message_from_revision_with(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &draft,
+        "7",
+        "PHID-USER-me",
+    )
+    .unwrap();
+    assert!(is_draft);
+    assert_eq!(message.raw_corpus, "Template title\n");
+
+    // Non-string templates and non-numeric ids fail exactly.
+    let broken = |method: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        if method == "differential.getcommitmessage" {
+            return Ok(serde_json::json!(null));
+        }
+        draft(method, &serde_json::json!(null))
+    };
+    let mut out = Vec::new();
+    let err = get_commit_message_from_revision_with(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &broken,
+        "7",
+        "PHID-USER-me",
+    )
+    .unwrap_err();
+    assert_eq!(err, FAILED_TO_RETRIEVE_TEMPLATE);
+    let mut out = Vec::new();
+    let err = get_commit_message_from_revision_with(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &draft,
+        "D7",
+        "PHID-USER-me",
+    )
+    .unwrap_err();
+    assert_eq!(err, diff_submit::UPDATE_PARAM_MUST_BE_NUMBER);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn gap2_resolve_message_source_dispatch() {
+    assert_eq!(
+        resolve_message_source(true, false, false, None, None, false, None).unwrap(),
+        MessageSource::None
+    );
+    assert_eq!(
+        resolve_message_source(false, false, false, None, None, true, None).unwrap(),
+        MessageSource::None
+    );
+    assert_eq!(
+        resolve_message_source(false, true, false, None, None, false, None).unwrap(),
+        MessageSource::CreateFromUser
+    );
+    assert_eq!(
+        resolve_message_source(false, false, false, None, None, false, Some(&[])).unwrap(),
+        MessageSource::CreateFromUser
+    );
+    assert_eq!(
+        resolve_message_source(
+            false,
+            false,
+            false,
+            None,
+            None,
+            false,
+            Some(&[(7, "Mine".to_string())]),
+        )
+        .unwrap(),
+        MessageSource::UpdateFromRevision(7)
+    );
+    let err = resolve_message_source(
+        false,
+        false,
+        false,
+        None,
+        None,
+        false,
+        Some(&[(7, "A".to_string()), (8, "B".to_string())]),
+    )
+    .unwrap_err();
+    assert!(err.contains("several revisions"), "{err}");
+    assert!(err.contains("D7: A"), "{err}");
+    assert_eq!(
+        resolve_message_source(false, false, true, None, Some("m.txt"), false, None).unwrap(),
+        MessageSource::CreateFromFile("m.txt".to_string())
+    );
+    assert_eq!(
+        resolve_message_source(false, false, true, None, None, false, None).unwrap(),
+        MessageSource::CreateFromUser
+    );
+    assert_eq!(
+        resolve_message_source(false, false, false, Some("9"), None, false, None).unwrap(),
+        MessageSource::UpdateFromRevision(9)
+    );
+    let err =
+        resolve_message_source(false, false, false, Some("D9"), None, false, None).unwrap_err();
+    assert_eq!(err, diff_submit::UPDATE_PARAM_MUST_BE_NUMBER);
+}

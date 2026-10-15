@@ -2736,6 +2736,47 @@ pub fn scratch_file_path(metadata_dir: &Path, name: &str) -> PathBuf {
     metadata_dir.join("arc").join(name)
 }
 
+/// Collapse `.` and `..` segments lexically (the `resolvePath()` subset
+/// `readablePath()` needs for its second attempt).
+fn lexically_normal_root(root: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in root.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Human-readable scratch path: relative to the work root when under it,
+/// else absolute.
+///
+/// PHP: `ArcanistRepositoryAPI::getReadableScratchFilePath()`
+/// (`src/repository/api/ArcanistRepositoryAPI.php:519-529`) via
+/// `Filesystem::readablePath()` (`src/filesystem/Filesystem.php`): strip
+/// a trailing-separator root prefix, trying the root as given and then
+/// resolved.
+#[must_use]
+pub fn readable_scratch_file_path(
+    metadata_dir: &Path,
+    work_root: &Path,
+    name: &str,
+) -> String {
+    let full = scratch_file_path(metadata_dir, name);
+    if let Ok(relative) = full.strip_prefix(work_root) {
+        return relative.to_string_lossy().into_owned();
+    }
+    let normal = lexically_normal_root(work_root);
+    if let Ok(relative) = full.strip_prefix(&normal) {
+        return relative.to_string_lossy().into_owned();
+    }
+    full.to_string_lossy().into_owned()
+}
+
 /// Read a scratch file, `None` on any failure (`:436-453`).
 #[must_use]
 pub fn read_scratch_file(metadata_dir: &Path, name: &str) -> Option<String> {
