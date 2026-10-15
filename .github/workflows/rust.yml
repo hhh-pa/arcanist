@@ -141,11 +141,11 @@ jobs:
           files: rust/target/llvm-cov/lcov.info
           fail_ci_if_error: false
       - name: upload test results to codecov
-        if: ${{ !cancelled() }} && hashFiles('rust/target/llvm-cov/junit.xml') != ''
+        if: ${{ !cancelled() }} && hashFiles('rust/target/nextest/default/junit.xml') != ''
         uses: codecov/test-results-action@v1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: rust/target/llvm-cov/junit.xml
+          files: rust/target/nextest/default/junit.xml
           fail_ci_if_error: false
 
   build-release:
