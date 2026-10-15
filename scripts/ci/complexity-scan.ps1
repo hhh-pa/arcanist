@@ -1,6 +1,6 @@
 # Local mirror of scripts/ci/lib/complexity-check.py for Windows dev machines
 # without Python: reports functions with cyclomatic>15 or cognitive>20.
-# Usage: powershell -ExecutionPolicy Bypass -File scripts/ci/rca-viol.ps1 -Ws <rust-dir>
+# Usage: powershell -ExecutionPolicy Bypass -File scripts/ci/complexity-scan.ps1 -Ws <rust-dir>
 # CI remains authoritative; thresholds must match complexity-check.py.
 param([string]$Ws = '')
 if (-not $Ws) { $Ws = Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) 'rust' }
