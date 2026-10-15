@@ -143,6 +143,42 @@ fn declines_missing_directory() {
 }
 
 #[test]
+fn eof_while_naming_library_cancels() {
+    // A 0-byte `read_line` (EOF) must surface the `cancelled` error, not
+    // map to `Some("")` and re-prompt forever.
+    let mut input = BufReader::new(std::io::Cursor::new(""));
+    let err = ask_library_name(&mut input).expect_err("EOF must cancel, not loop");
+    assert!(err.contains("cancelled"), "{err}");
+
+    // Same after one invalid name: the loop must still terminate.
+    let mut input = BufReader::new(std::io::Cursor::new("Bad Name!\n"));
+    let err = ask_library_name(&mut input).expect_err("EOF must cancel, not loop");
+    assert!(err.contains("cancelled"), "{err}");
+}
+
+#[test]
+fn ancient_and_unknown_versions_are_usage_errors() {
+    // Ancient (v1, including a missing map) and unknown versions abort
+    // with `Err`, which the `run_in` layer maps to exit 1.
+    let dir = scratch("versions");
+    let old = dir.join("oldlib");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join(INIT_FILE), "<?php\n").unwrap();
+    let weird = dir.join("weirdlib");
+    std::fs::create_dir_all(&weird).unwrap();
+    std::fs::write(weird.join(INIT_FILE), "<?php\n").unwrap();
+    std::fs::write(weird.join(MAP_FILE), "@phutil-library-version 7\n").unwrap();
+
+    let mut input = BufReader::new(std::io::Cursor::new(""));
+    let err = execute_with_input(&dir, &argv(&["oldlib"]), &mut input).unwrap_err();
+    assert!(err.contains("no longer supported"), "{err}");
+    let mut input = BufReader::new(std::io::Cursor::new(""));
+    let err = execute_with_input(&dir, &argv(&["weirdlib"]), &mut input).unwrap_err();
+    assert!(err.contains("Unknown library version '7'"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn pluralizes_done_messages() {
     assert_eq!(done_message(1), "Updated library.");
     assert_eq!(done_message(2), "Updated 2 libraries.");
@@ -181,9 +217,19 @@ fn finds_rebuild_script_upwards() {
     std::fs::create_dir_all(&deep).unwrap();
 
     assert_eq!(find_rebuild_script(&deep, &deep), Some(script));
-    let bare = scratch("noscript");
-    assert_eq!(find_rebuild_script(&bare, &bare), None);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn out_of_tree_libraries_resolve_script_via_binary() {
+    // Nothing above a bare temp dir, so the lookup falls through to the
+    // binary-relative search, which finds the shipped script (the test
+    // binary lives under the worktree holding `support/`).
+    let bare = scratch("out-of-tree");
+    assert_eq!(
+        find_rebuild_script(&bare, &bare),
+        Some(repo_root().join("support/lib/rebuild-map.php"))
+    );
     std::fs::remove_dir_all(&bare).ok();
 }
 
@@ -212,6 +258,32 @@ fn rebuild_script_ships_in_tree() {
     assert!(body.contains("buildAndWriteMap"), "unexpected body");
     assert!(root.join("support/init/init-script.php").is_file());
     assert!(root.join("support/lib/extract-symbols.php").is_file());
+    // The restored scripts must be valid PHP. `php` is present in CI but
+    // not on every dev machine: skip the lint when it is absent.
+    let php_present = std::process::Command::new("php")
+        .arg("-v")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if php_present {
+        for name in [
+            "support/lib/rebuild-map.php",
+            "support/lib/extract-symbols.php",
+            "support/init/init-script.php",
+        ] {
+            let target = root.join(name);
+            let output = std::process::Command::new("php")
+                .arg("-l")
+                .arg(&target)
+                .output()
+                .expect("php -l failed to spawn");
+            assert!(
+                output.status.success(),
+                "php -l {} failed: {}",
+                target.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -220,7 +292,7 @@ fn rebuild_script_ships_in_tree() {
                 .unwrap()
                 .permissions()
                 .mode();
-            assert_eq!(mode & 0o111, 0o111, "{name} lost its exec bit");
+            assert_ne!(mode & 0o100, 0, "{name} lost its owner-execute bit");
         }
     }
 }
@@ -238,32 +310,45 @@ fn finds_shipped_rebuild_script_from_tree() {
 }
 
 #[test]
-fn missing_script_stays_per_library_failure() {
-    // No script above a bare temp dir: per-library failure text (exit 0
-    // at the `run_in` layer, as in PHP where a failing passthru still
-    // returns 0 from `runWorkflow`).
-    let dir = scratch("noscript-msg");
-    let message = rebuild_map(&dir, false, None).expect("expected failure text");
+fn rebuild_failure_stays_per_library_failure() {
+    // A failing rebuild (here: an explicit script stub exiting 3, or a
+    // missing `php` binary) yields per-library failure text, with or
+    // without `php` installed; the `run_in` layer still exits 0, as in
+    // PHP where a failing passthru still returns 0 from `runWorkflow`
+    // (`$any_errors` never fails the run).
+    let dir = scratch("rebuild-msg");
+    let stub = dir.join("rebuild-map.php");
+    std::fs::write(&stub, "<?php exit(3);\n").unwrap();
+    let message = rebuild_map(&dir, false, Some(&stub)).expect("expected failure text");
     assert!(message.contains("rebuild-map.php"), "{message}");
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn run_in_exits_zero_on_workflow_errors() {
-    // PHP runWorkflow always returns 0: finding no libraries is
-    // reported but still exits 0.
-    let dir = scratch("exit-zero");
-    assert_eq!(run_in(&dir, &argv(&[])), ExitCode::SUCCESS);
+fn run_in_fails_on_usage_errors() {
+    // Usage-class failures (argument errors, no libraries found,
+    // ancient/unknown versions, declined prompts) exit 1 with a clean
+    // message: PHP throws `ArcanistUsageException`, which escapes the
+    // runtime and fails the CLI. Help still succeeds.
+    let dir = scratch("exit-usage");
+    assert_eq!(run_in(&dir, &argv(&[])), ExitCode::FAILURE);
+    assert_eq!(run_in(&dir, &argv(&["a", "b"])), ExitCode::FAILURE);
+    assert_eq!(run_in(&dir, &argv(&["--bogus"])), ExitCode::FAILURE);
+    assert_eq!(run_in(&dir, &argv(&["--help"])), ExitCode::SUCCESS);
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn run_in_fails_only_on_argument_errors() {
-    // Argument errors come from the toolset runtime outside the
-    // workflow, so they still fail; help still succeeds.
-    let dir = scratch("exit-args");
-    assert_eq!(run_in(&dir, &argv(&["a", "b"])), ExitCode::FAILURE);
-    assert_eq!(run_in(&dir, &argv(&["--bogus"])), ExitCode::FAILURE);
-    assert_eq!(run_in(&dir, &argv(&["--help"])), ExitCode::SUCCESS);
+fn run_in_exits_zero_on_rebuild_failures() {
+    // Per-library rebuild failures (missing script, missing `php`, a
+    // failing rebuild) still exit 0, per PHP's `$any_errors` policy. The
+    // rebuild runs for real here when `php` is present, and fails
+    // cleanly when it is absent; either way the exit code is 0.
+    let dir = scratch("exit-rebuild-ok");
+    let lib = dir.join("v2lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(lib.join(INIT_FILE), "<?php\n").unwrap();
+    std::fs::write(lib.join(MAP_FILE), "@phutil-library-version 2\n").unwrap();
+    assert_eq!(run_in(&dir, &argv(&["v2lib"])), ExitCode::SUCCESS);
     std::fs::remove_dir_all(&dir).ok();
 }

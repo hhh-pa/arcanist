@@ -15,14 +15,21 @@
 //! plural variants (`Updated library.` / `Updated %s libraries.`).
 //!
 //! Like PHP, per-library rebuild failures report `ERROR` lines but still
-//! exit 0; only argument-parsing errors fail (raised by the toolset
-//! runtime outside the workflow, as in PHP). Every workflow failure --
-//! no libraries found, ancient or unknown library versions, declined
-//! prompts -- still exits 0 after reporting the error.
+//! exit 0 (`$any_errors` never fails the run, including a missing script
+//! or a missing `php` binary). Every other workflow failure -- argument
+//! errors, no libraries found, ancient or unknown library versions,
+//! declined prompts, unreadable maps -- exits 1 with a clean message.
+//! (PHP throws `ArcanistUsageException`, which escapes
+//! `ArcanistRuntime::execute` and fails the CLI at 255; the port maps
+//! that class to `ExitCode::FAILURE` instead of replicating a fatal
+//! trace, matching the runtime's caught-usage convention.)
 //!
 //! The rebuild script ships in-tree under `support/` (restored from the
-//! PHP master); it is found by an upward `support/lib/rebuild-map.php`
-//! search instead of PHP's install-relative bundled path.
+//! PHP master). It is found by an upward `support/lib/rebuild-map.php`
+//! search above the library first, then above the running binary: an
+//! installed `arc-rs` (e.g. `<prefix>/bin/arc-rs` with the tree at
+//! `<prefix>/support/...`) resolves just like PHP's install-relative
+//! bundled path, and so do out-of-tree libraries.
 //!
 //! Divergences:
 //! - A declined directory prompt fails with `cancelled: ...` instead of
@@ -217,7 +224,10 @@ fn prompt_line(prompt: &str, input: &mut dyn BufRead) -> Option<String> {
     print!("{prompt}");
     std::io::stdout().flush().ok();
     let mut line = String::new();
-    input.read_line(&mut line).ok()?;
+    let read = input.read_line(&mut line).ok()?;
+    if read == 0 {
+        return None;
+    }
     Some(line.trim().to_string())
 }
 
@@ -310,10 +320,23 @@ pub fn ensure_library(path: &Path, input: &mut dyn BufRead) -> Result<bool, Stri
     Ok(true)
 }
 
-/// Find `support/lib/rebuild-map.php` above `path`, then above `fallback`.
+/// Find `support/lib/rebuild-map.php` above `path`, then above `fallback`,
+/// then above the running binary.
+///
+/// The binary search is the install story: `arc-rs` ships with a `support/`
+/// tree next to its install root (like PHP's install-relative bundled
+/// script), so out-of-tree libraries still resolve the script.
 pub fn find_rebuild_script(path: &Path, fallback: &Path) -> Option<PathBuf> {
     for root in [path, fallback] {
         for ancestor in root.ancestors() {
+            let candidate = ancestor.join("support/lib/rebuild-map.php");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors() {
             let candidate = ancestor.join("support/lib/rebuild-map.php");
             if candidate.is_file() {
                 return Some(candidate);
@@ -335,7 +358,7 @@ pub fn rebuild_map(path: &Path, clean: bool, script: Option<&Path>) -> Option<St
     );
     let Some(script) = script else {
         return Some(format!(
-            "cannot rebuild '{}': support/lib/rebuild-map.php was not found above the library",
+            "cannot rebuild '{}': support/lib/rebuild-map.php was not found above the library or the arc-rs binary",
             path.display()
         ));
     };
@@ -363,7 +386,8 @@ pub fn rebuild_map(path: &Path, clean: bool, script: Option<&Path>) -> Option<St
 /// Returns `Ok(None)` on success and `Ok(Some(message))` when the rebuild
 /// step fails (a per-library failure: reported, but the workflow still
 /// exits 0). Usage errors (ancient or unknown versions, declined
-/// prompts, unreadable maps) return `Err` and abort the workflow.
+/// prompts, unreadable maps) return `Err`, abort the workflow, and exit 1
+/// at the `run_in` layer.
 pub fn liberate_path(
     path: &Path,
     clean: bool,
@@ -473,13 +497,13 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
         }
         Err(message) => {
             eprintln!("arc-rs {NAME}: {message}");
-            // PHP `runWorkflow` always returns 0; only argument errors
-            // (raised by the toolset runtime, outside the workflow) fail.
-            if matches!(parse_args(argv), ParseOutcome::Error(_)) {
-                ExitCode::FAILURE
-            } else {
-                ExitCode::SUCCESS
-            }
+            // Usage-class failures (argument errors, no libraries found,
+            // ancient/unknown versions, declined prompts) throw
+            // `ArcanistUsageException` in PHP, which escapes the runtime
+            // and fails the CLI; the port reports the same clean message
+            // with the caught-usage exit code instead of a fatal trace.
+            // Per-library rebuild failures never reach here (`Ok` above).
+            ExitCode::FAILURE
         }
     }
 }
