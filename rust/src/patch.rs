@@ -2295,9 +2295,20 @@ pub fn svn_tree_status(
     parse_svn_status_xml(&output)
 }
 
-/// `  Working copy: <path>` block (`:1025-1028`, markup stripped).
-fn working_copy_desc(dir: &Path) -> String {
-    format!("  Working copy: {}\n\n", dir.display())
+/// `  Working copy: <path>` block (`:1025-1028`) with an explicit ANSI
+/// setting.
+///
+/// PHP wraps the path in `__...__` (underline on TTYs, stripped
+/// otherwise); `ansi=false` renders byte-identical to the plain shape.
+fn working_copy_desc_ansi(dir: &Path, ansi: bool) -> String {
+    let path = dir.display().to_string();
+    terminal::tsprintf_ansi(
+        "  Working copy: __%R__\n\n",
+        &[terminal::TVal::Text(&path)],
+        ansi,
+    )
+    .map(|t| t.to_string())
+    .unwrap_or_else(|_| format!("  Working copy: {path}\n\n"))
 }
 
 /// Whether `arc.autostash` configuration permits autostashing
@@ -2346,6 +2357,18 @@ pub fn require_clean_tree(
     io: &mut Io,
     force: bool,
 ) -> Result<StashState, String> {
+    require_clean_tree_ansi(dir, vcs, backends, io, force, terminal::ansi_enabled())
+}
+
+/// [`require_clean_tree`] with an explicit ANSI setting.
+pub fn require_clean_tree_ansi(
+    dir: &Path,
+    vcs: Vcs,
+    backends: &Backends,
+    io: &mut Io,
+    force: bool,
+    ansi: bool,
+) -> Result<StashState, String> {
     if force {
         return Ok(StashState::Clean);
     }
@@ -2354,7 +2377,7 @@ pub fn require_clean_tree(
         Vcs::Hg => hg_tree_status(dir, &backends.hg, &["status"])?,
         Vcs::Svn => svn_tree_status(dir, &backends.svn, &["--xml", "status"])?,
     };
-    let desc = working_copy_desc(dir);
+    let desc = working_copy_desc_ansi(dir, ansi);
     fail_on_fatal_tree_state(&status, &desc)?;
     // Subversion externals are handled elsewhere; never prompt (`:1076-1080`).
     if vcs == Vcs::Svn {
@@ -2955,6 +2978,17 @@ pub fn git_submodule_update(dir: &Path, io: &mut Io) -> Result<(), String> {
 /// Failures print the verbatim `\n** Patch Failed! **\n` banner and fail
 /// with `Unable to apply patch!`.
 pub fn git_apply_patch(dir: &Path, bundle: &Bundle, io: &mut Io) -> Result<(), String> {
+    git_apply_patch_ansi(dir, bundle, io, terminal::ansi_enabled())
+}
+
+/// [`git_apply_patch`] with an explicit ANSI setting for the failure
+/// banner.
+pub fn git_apply_patch_ansi(
+    dir: &Path,
+    bundle: &Bundle,
+    io: &mut Io,
+    ansi: bool,
+) -> Result<(), String> {
     let patchfile = TempPatchFile::write(&bundle.text)?;
     let path = patchfile.path.to_string_lossy().to_string();
     let output = git::output(
@@ -2970,10 +3004,8 @@ pub fn git_apply_patch(dir: &Path, bundle: &Bundle, io: &mut Io) -> Result<(), S
         ],
     )?;
     if !output.status.success() {
-        io.push_out(&format!(
-            "{}\n** Patch Failed! **\n",
-            String::from_utf8_lossy(&output.stdout)
-        ));
+        io.push_out(&String::from_utf8_lossy(&output.stdout));
+        io.push_out(&patch_failed_banner_ansi(ansi));
         return Err("Unable to apply patch!".to_string());
     }
     io.push_out(&String::from_utf8_lossy(&output.stdout));
@@ -3018,15 +3050,16 @@ pub fn git_commit_patch(dir: &Path, bundle: &Bundle, message: &str) -> Result<()
 
 /// Format one `** TITLE ** message` status line with a background.
 ///
-/// The stars are literal (part of the substituted value) so `ansi=false`
-/// stays byte-identical to the plain shape while TTYs gain the color.
+/// PHP renders `"<bg:color>** %s **</bg> %s\n"`
+/// (`ArcanistWorkflow.php:1571-1593`, `ArcanistPatchWorkflow.php:436-440,
+/// 677-681, 865-868`): TTYs gain the background plus the bold label
+/// (the `**` markers become codes), while `ansi=false` keeps the
+/// legacy `**`-marked plain bytes.
 fn status_line_ansi(color: &str, title: &str, message: &str, ansi: bool) -> String {
-    let label = format!("** {title} **");
-    terminal::console_format(
-        &format!("<bg:{color}>%s</bg> %s\n"),
-        &[&label, message],
-        ansi,
-    )
+    if !ansi {
+        return format!("** {title} ** {message}\n");
+    }
+    terminal::format_status_message(color, title, message, true)
 }
 
 /// Print a git success line to stderr (`writeOkay()`,
@@ -3035,9 +3068,13 @@ fn git_write_okay_ansi(io: &mut Io, title: &str, message: &str, ansi: bool) {
     io.push_err(&status_line_ansi("green", title, message, ansi));
 }
 
-/// Cherry-pick failure banner (no space before the closers, as in PHP).
+/// Cherry-pick failure banner (`"\n<bg:red>** %s**</bg>\n"`, no space
+/// before the closers, as in PHP `:787-789`).
 fn cherry_pick_failed_banner_ansi(ansi: bool) -> String {
-    terminal::console_format("\n<bg:red>%s</bg>\n", &["** Cherry Pick Failed!**"], ansi)
+    if !ansi {
+        return "\n** Cherry Pick Failed!**\n".to_string();
+    }
+    terminal::console_format("\n<bg:red>** %s**</bg>\n", &["Cherry Pick Failed!"], true)
 }
 
 /// Cherry-pick the temp branch onto the original branch, then delete it
@@ -3153,7 +3190,7 @@ pub fn apply_git_ansi(
     new_branch: Option<&str>,
     ansi: bool,
 ) -> Result<(), String> {
-    git_apply_patch(dir, bundle, io)?;
+    git_apply_patch_ansi(dir, bundle, io, ansi)?;
     git_submodule_update(dir, io)?;
     if should_commit(options) {
         let message = resolve_commit_message(bundle, call)?;
@@ -3255,9 +3292,23 @@ pub fn hg_create_bookmark(
     Ok(name)
 }
 
-/// Patch-failure banner.
+/// Patch-failure banner (`"\n<bg:red>** %s **</bg>\n"`, `:713-715` for
+/// git, `:801-803` for hg).
 fn patch_failed_banner_ansi(ansi: bool) -> String {
-    terminal::console_format("\n<bg:red>%s</bg>\n", &["** Patch Failed! **"], ansi)
+    if !ansi {
+        return "\n** Patch Failed! **\n".to_string();
+    }
+    terminal::console_format("\n<bg:red>** %s **</bg>\n", &["Patch Failed!"], true)
+}
+
+/// Rebase-failure banner (`"\n<bg:red>** %s**</bg>\n"`, no space before
+/// the closers, as in PHP `:854-857`).
+fn rebase_failed_banner_ansi(original_branch: &str, ansi: bool) -> String {
+    if !ansi {
+        return format!("\n** Rebase onto {original_branch} failed!**\n");
+    }
+    let message = format!("Rebase onto {original_branch} failed!");
+    terminal::console_format("\n<bg:red>** %s**</bg>\n", &[&message], true)
 }
 
 /// Case-folding warning (plain shape, verbatim from PHP).
@@ -3267,11 +3318,18 @@ const HG_CASE_WARNING_PLAIN: &str = "\n** WARNING ** This patch may have failed 
      manually.\n";
 
 /// Case-folding warning with an explicit ANSI setting.
+///
+/// PHP renders `"\n<bg:yellow>** %s **</bg> %s\n"` (`:807-815`); the
+/// `**` markers stay in the pattern so TTYs gain the bold label,
+/// while `ansi=false` keeps the legacy `**`-marked plain bytes.
 fn hg_case_warning_ansi(ansi: bool) -> String {
+    if !ansi {
+        return HG_CASE_WARNING_PLAIN.to_string();
+    }
     let rest = HG_CASE_WARNING_PLAIN
         .strip_prefix("\n** WARNING ** ")
         .unwrap_or(HG_CASE_WARNING_PLAIN);
-    terminal::console_format("\n<bg:yellow>%s</bg> %s", &["** WARNING **", rest], ansi)
+    terminal::console_format("\n<bg:yellow>** %s **</bg> %s", &["WARNING", rest], true)
 }
 
 /// Import the bundle with `hg import --no-commit -` (`:794-819`).
@@ -3359,6 +3417,24 @@ pub fn hg_rebase_temp(
     original_branch: &str,
     new_branch: &str,
 ) -> Result<(), String> {
+    hg_rebase_temp_ansi(
+        dir,
+        hg,
+        original_branch,
+        new_branch,
+        terminal::ansi_enabled(),
+    )
+}
+
+/// [`hg_rebase_temp`] with an explicit ANSI setting for the failure
+/// banner (PHP formats the banner into the thrown message, `:854-857`).
+pub fn hg_rebase_temp_ansi(
+    dir: &Path,
+    hg: &hg::HgCommand,
+    original_branch: &str,
+    new_branch: &str,
+    ansi: bool,
+) -> Result<(), String> {
     let original_rev = hg_canonical(dir, hg, original_branch)?;
     let current_parent = hg_canonical(dir, hg, &format!("{new_branch}^"))?;
     let mut failed = false;
@@ -3372,7 +3448,7 @@ pub fn hg_rebase_temp(
     hg::stdout_text_with(dir, hg, &["bookmark", "--delete", new_branch])?;
     if failed {
         let _ = hg::ok_with(dir, hg, &["rebase", "--abort"]);
-        return Err(format!("\n** Rebase onto {original_branch} failed!**\n"));
+        return Err(rebase_failed_banner_ansi(original_branch, ansi));
     }
     Ok(())
 }
@@ -3427,7 +3503,7 @@ pub fn apply_hg_ansi(
             && has_base_local
             && let (Some(original), Some(new)) = (original_branch, new_branch)
         {
-            hg_rebase_temp(dir, hg, original, new)?;
+            hg_rebase_temp_ansi(dir, hg, original, new, ansi)?;
         }
         io.push_err(&status_line_ansi(
             "green",
@@ -3929,11 +4005,18 @@ const SVN_HUNKS_WARNING_PLAIN: &str = "\n\n** WARNING ** Some hunks could not be
      The output above, from 'patch', may be helpful in figuring out what went wrong.\n";
 
 /// Svn hunks-failed warning with an explicit ANSI setting.
+///
+/// PHP renders `"\n\n<bg:yellow>** %s **</bg> %s\n"` (`:683-700`); the
+/// `**` markers stay in the pattern so TTYs gain the bold label,
+/// while `ansi=false` keeps the legacy `**`-marked plain bytes.
 fn svn_hunks_warning_ansi(ansi: bool) -> String {
+    if !ansi {
+        return SVN_HUNKS_WARNING_PLAIN.to_string();
+    }
     let rest = SVN_HUNKS_WARNING_PLAIN
         .strip_prefix("\n\n** WARNING ** ")
         .unwrap_or(SVN_HUNKS_WARNING_PLAIN);
-    terminal::console_format("\n\n<bg:yellow>%s</bg> %s", &["** WARNING **", rest], ansi)
+    terminal::console_format("\n\n<bg:yellow>** %s **</bg> %s", &["WARNING", rest], true)
 }
 
 /// Apply bundle changes under svn (`:476-700`).
@@ -4767,7 +4850,7 @@ fn run_patch_flow(
     if options.update {
         update_working_copy(dir, vcs, backends, io)?;
     }
-    let stash = require_clean_tree(dir, vcs, backends, io, options.force)?;
+    let stash = require_clean_tree_ansi(dir, vcs, backends, io, options.force, ansi)?;
     let outcome = run_patch_flow_inner(dir, options, io, backends, &source, vcs, ansi);
     let pop = unstash_changes(dir, stash);
     match (outcome, pop) {

@@ -3984,17 +3984,17 @@ fn ansi_lint_banners_gain_backgrounds() {
         (
             LINT_RESULT_OKAY,
             "** LINT OKAY ** No lint problems.\n",
-            "\x1b[42m** LINT OKAY **\x1b[49m No lint problems.\n",
+            "\x1b[42m\x1b[1m LINT OKAY \x1b[m\x1b[49m No lint problems.\n",
         ),
         (
             LINT_RESULT_WARNINGS,
             "** LINT MESSAGES ** Lint issued unresolved warnings.\n",
-            "\x1b[43m** LINT MESSAGES **\x1b[49m Lint issued unresolved warnings.\n",
+            "\x1b[43m\x1b[1m LINT MESSAGES \x1b[m\x1b[49m Lint issued unresolved warnings.\n",
         ),
         (
             LINT_RESULT_ERRORS,
             "** LINT ERRORS ** Lint raised errors!\n",
-            "\x1b[41m** LINT ERRORS **\x1b[49m Lint raised errors!\n",
+            "\x1b[41m\x1b[1m LINT ERRORS \x1b[m\x1b[49m Lint raised errors!\n",
         ),
     ] {
         let mut out = Vec::new();
@@ -4032,12 +4032,12 @@ fn ansi_unit_banners_gain_backgrounds() {
         (
             UNIT_RESULT_OKAY,
             "** UNIT OKAY ** No unit test failures.\n",
-            "\x1b[42m** UNIT OKAY **\x1b[49m No unit test failures.\n",
+            "\x1b[42m\x1b[1m UNIT OKAY \x1b[m\x1b[49m No unit test failures.\n",
         ),
         (
             UNIT_RESULT_FAIL,
             "** UNIT ERRORS ** Unit testing raised errors!\n",
-            "\x1b[41m** UNIT ERRORS **\x1b[49m Unit testing raised errors!\n",
+            "\x1b[41m\x1b[1m UNIT ERRORS \x1b[m\x1b[49m Unit testing raised errors!\n",
         ),
     ] {
         let mut input = std::io::BufReader::new(std::io::empty());
@@ -4074,6 +4074,35 @@ fn ansi_unit_banners_gain_backgrounds() {
             out,
             format!("Running unit tests...\n{colored_banner}").into_bytes()
         );
+    }
+    // Unsound prompts (default yes), then prints the yellow banner.
+    use std::io::Cursor;
+    for (ansi, banner) in [
+        (
+            false,
+            "** UNIT UNSOUND ** Unit testing raised errors, but all failing tests are unsound.\n",
+        ),
+        (
+            true,
+            "\x1b[43m\x1b[1m UNIT UNSOUND \x1b[m\x1b[49m Unit testing raised errors, but all failing tests are unsound.\n",
+        ),
+    ] {
+        let mut input = Cursor::new(b"y\n".to_vec());
+        let mut out = Vec::new();
+        run_unit_ansi(
+            &dir,
+            None,
+            &[],
+            false,
+            &run(ChildOutcome::Code(UNIT_RESULT_UNSOUND)),
+            &mut input,
+            &mut out,
+            ansi,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains(banner), "{text:?}");
+        assert_eq!(text.contains('\x1b'), ansi, "{text:?}");
     }
 }
 

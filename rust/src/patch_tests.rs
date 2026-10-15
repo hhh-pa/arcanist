@@ -2819,14 +2819,14 @@ fn gap2_plan_children_with_uses_fake_hg() {
 }
 
 #[test]
-fn ansi_status_lines_preserve_stars_and_gain_backgrounds() {
+fn ansi_status_lines_gain_bold_labels_and_backgrounds() {
     assert_eq!(
         status_line_ansi("green", "OKAY", "Successfully applied patch.", false),
         "** OKAY ** Successfully applied patch.\n"
     );
     assert_eq!(
         status_line_ansi("green", "OKAY", "Successfully applied patch.", true),
-        "\x1b[42m** OKAY **\x1b[49m Successfully applied patch.\n"
+        "\x1b[42m\x1b[1m OKAY \x1b[m\x1b[49m Successfully applied patch.\n"
     );
     assert_eq!(
         status_line_ansi(
@@ -2844,15 +2844,15 @@ fn ansi_status_lines_preserve_stars_and_gain_backgrounds() {
             "Base commit is not in local repository; trying to fetch.",
             true
         ),
-        "\x1b[44m** INFO **\x1b[49m Base commit is not in local repository; trying to fetch.\n"
+        "\x1b[44m\x1b[1m INFO \x1b[m\x1b[49m Base commit is not in local repository; trying to fetch.\n"
     );
     assert_eq!(
         status_line_ansi("green", "COMMITTED", "Successfully committed patch.", true),
-        "\x1b[42m** COMMITTED **\x1b[49m Successfully committed patch.\n"
+        "\x1b[42m\x1b[1m COMMITTED \x1b[m\x1b[49m Successfully committed patch.\n"
     );
     assert_eq!(
         status_line_ansi("green", "APPLIED", "Successfully applied patch.", true),
-        "\x1b[42m** APPLIED **\x1b[49m Successfully applied patch.\n"
+        "\x1b[42m\x1b[1m APPLIED \x1b[m\x1b[49m Successfully applied patch.\n"
     );
 }
 
@@ -2864,12 +2864,20 @@ fn ansi_failure_banners_gain_red_backgrounds() {
     );
     assert_eq!(
         cherry_pick_failed_banner_ansi(true),
-        "\n\x1b[41m** Cherry Pick Failed!**\x1b[49m\n"
+        "\n\x1b[41m\x1b[1m Cherry Pick Failed!\x1b[m\x1b[49m\n"
     );
     assert_eq!(patch_failed_banner_ansi(false), "\n** Patch Failed! **\n");
     assert_eq!(
         patch_failed_banner_ansi(true),
-        "\n\x1b[41m** Patch Failed! **\x1b[49m\n"
+        "\n\x1b[41m\x1b[1m Patch Failed! \x1b[m\x1b[49m\n"
+    );
+    assert_eq!(
+        rebase_failed_banner_ansi("main", false),
+        "\n** Rebase onto main failed!**\n"
+    );
+    assert_eq!(
+        rebase_failed_banner_ansi("main", true),
+        "\n\x1b[41m\x1b[1m Rebase onto main failed!\x1b[m\x1b[49m\n"
     );
 }
 
@@ -2883,7 +2891,7 @@ fn ansi_warning_blocks_gain_yellow_backgrounds() {
     assert!(!plain.contains('\x1b'), "{plain:?}");
     let colored = hg_case_warning_ansi(true);
     assert!(
-        colored.starts_with("\n\x1b[43m** WARNING **\x1b[49m This patch may have failed"),
+        colored.starts_with("\n\x1b[43m\x1b[1m WARNING \x1b[m\x1b[49m This patch may have failed"),
         "{colored:?}"
     );
     let plain = svn_hunks_warning_ansi(false);
@@ -2894,7 +2902,9 @@ fn ansi_warning_blocks_gain_yellow_backgrounds() {
     assert!(!plain.contains('\x1b'), "{plain:?}");
     let colored = svn_hunks_warning_ansi(true);
     assert!(
-        colored.starts_with("\n\n\x1b[43m** WARNING **\x1b[49m Some hunks could not be applied"),
+        colored.starts_with(
+            "\n\n\x1b[43m\x1b[1m WARNING \x1b[m\x1b[49m Some hunks could not be applied"
+        ),
         "{colored:?}"
     );
 }
@@ -2918,7 +2928,9 @@ fn ansi_apply_svn_okay_uses_green_background() {
         assert_eq!(outcome, SvnOutcome::Applied);
         if ansi {
             assert!(
-                io.out.stdout.contains("\x1b[42m** OKAY **\x1b[49m"),
+                io.out
+                    .stdout
+                    .contains("\x1b[42m\x1b[1m OKAY \x1b[m\x1b[49m"),
                 "{}",
                 io.out.stdout
             );
@@ -2927,6 +2939,76 @@ fn ansi_apply_svn_okay_uses_green_background() {
                 io.out
                     .stdout
                     .contains("** OKAY ** Successfully applied patch"),
+                "{}",
+                io.out.stdout
+            );
+            assert!(!io.out.stdout.contains('\x1b'), "{}", io.out.stdout);
+        }
+    }
+}
+
+#[test]
+fn ansi_git_apply_failure_banner_modes() {
+    for ansi in [false, true] {
+        let repo = make_repo(&format!("git_apply_ansi_{ansi}"));
+        let mut io = Io::buffered();
+        let bad = Bundle {
+            text: "not a patch\n".to_string(),
+            ..Bundle::default()
+        };
+        assert_eq!(
+            git_apply_patch_ansi(&repo, &bad, &mut io, ansi).unwrap_err(),
+            "Unable to apply patch!"
+        );
+        if ansi {
+            assert!(
+                io.out
+                    .stdout
+                    .contains("\n\x1b[41m\x1b[1m Patch Failed! \x1b[m\x1b[49m\n"),
+                "{}",
+                io.out.stdout
+            );
+        } else {
+            assert!(
+                io.out.stdout.contains("\n** Patch Failed! **\n"),
+                "{}",
+                io.out.stdout
+            );
+            assert!(!io.out.stdout.contains('\x1b'), "{}", io.out.stdout);
+        }
+    }
+}
+
+#[test]
+fn ansi_clean_tree_desc_underlines_path() {
+    assert_eq!(
+        working_copy_desc_ansi(Path::new("/repo"), false),
+        "  Working copy: /repo\n\n"
+    );
+    assert_eq!(
+        working_copy_desc_ansi(Path::new("/repo"), true),
+        "  Working copy: \x1b[4m/repo\x1b[m\n\n"
+    );
+    for ansi in [false, true] {
+        let repo = make_repo(&format!("clean_ansi_{ansi}"));
+        std::fs::write(repo.join("new.txt"), "new\n").unwrap();
+        let backends = Backends::default();
+        let mut io = Io::canned(&["y"]);
+        require_clean_tree_ansi(&repo, Vcs::Git, &backends, &mut io, false, ansi).unwrap();
+        let path = repo.display().to_string();
+        if ansi {
+            assert!(
+                io.out
+                    .stdout
+                    .contains(&format!("  Working copy: \x1b[4m{path}\x1b[m\n\n")),
+                "{}",
+                io.out.stdout
+            );
+        } else {
+            assert!(
+                io.out
+                    .stdout
+                    .contains(&format!("  Working copy: {path}\n\n")),
                 "{}",
                 io.out.stdout
             );

@@ -2086,21 +2086,21 @@ fn banner_color(title: &str) -> &'static str {
 
 /// Print a lint/unit result banner (`** TITLE ** detail`).
 ///
-/// The `** TITLE **` label renders through `console_format` with a
-/// `<bg:color>` tag so TTYs gain the status background while
-/// `ansi=false` stays byte-identical to the plain shape.
+/// PHP renders `"<bg:color>** %s **</bg> %s\n"` (`:1175-1193`,
+/// `:1236-1262`): TTYs gain the status background plus the bold label
+/// (the `**` markers become codes), while `ansi=false` keeps the
+/// legacy `**`-marked plain bytes.
 fn write_banner_ansi(
     out: &mut dyn Write,
     title: &str,
     detail: &str,
     ansi: bool,
 ) -> Result<(), String> {
-    let label = format!("** {title} **");
-    let line = terminal::console_format(
-        &format!("<bg:{}>%s</bg> %s\n", banner_color(title)),
-        &[&label, detail],
-        ansi,
-    );
+    let line = if ansi {
+        terminal::format_status_message(banner_color(title), title, detail, true)
+    } else {
+        format!("** {title} ** {detail}\n")
+    };
     out.write_all(line.as_bytes())
         .map_err(|e| format!("failed to write output: {e}"))
 }

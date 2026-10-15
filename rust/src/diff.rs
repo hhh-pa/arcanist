@@ -1413,9 +1413,9 @@ pub struct SubmitReport {
 
 /// Format one submit report: plain lead, bold label, underlined URI.
 ///
-/// PHP prints the lead plain; the URI line is `"**%s** __%s__"`
-/// `__underline__`); `ansi=false` strips to the plain shape,
-/// byte-identical to the historical `format!` output.
+/// PHP prints the lead with plain `%s` and the URI line as
+/// `"**%s** __%s__"` (`:414-420`, `:554-558`); `ansi=false` strips to
+/// the plain shape, byte-identical to the historical `format!` output.
 fn format_submit_report_ansi(
     lead: &str,
     label: &str,
@@ -1424,7 +1424,7 @@ fn format_submit_report_ansi(
     ansi: bool,
 ) -> String {
     terminal::tsprintf_ansi(
-        "**%R**\n        %R __%R__\n\n%R",
+        "%R\n        **%R** __%R__\n\n%R",
         &[
             terminal::TVal::Text(lead),
             terminal::TVal::Text(label),

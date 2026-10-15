@@ -1812,7 +1812,7 @@ fn ansi_worktree_blocks_thread_underline() {
 }
 
 #[test]
-fn ansi_submit_reports_bold_lead_and_underline_uri() {
+fn ansi_submit_reports_bold_label_and_underline_uri() {
     let call = |method: &str, _params: &serde_json::Value| {
         if method == diff_submit::METHOD_CREATE_DIFF {
             Ok(serde_json::json!({"diffid": 1, "uri": "http://x/D1"}))
@@ -1839,6 +1839,6 @@ fn ansi_submit_reports_bold_lead_and_underline_uri() {
     let colored = submit_over_ansi(&call, &input, true).unwrap();
     assert_eq!(
         colored,
-        "\x1b[1mCreated a new Differential diff:\x1b[m\n        Diff URI: \x1b[4mhttp://x/D1\x1b[m\n\nIncluded changes:\n"
+        "Created a new Differential diff:\n        \x1b[1mDiff URI:\x1b[m \x1b[4mhttp://x/D1\x1b[m\n\nIncluded changes:\n"
     );
 }
