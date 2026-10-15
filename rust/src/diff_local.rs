@@ -2135,6 +2135,33 @@ pub fn run_lint<W: Write>(
 /// `input` (default yes, like `phutil_console_confirm()`), and declining
 /// aborts with [`USER_ABORT`]. Test-result dictionaries are always
 /// empty (same in-process caveat as [`run_lint`]).
+/// Render a lint/unit output failure.
+fn write_output_error(error: std::io::Error) -> String {
+    format!("failed to write output: {error}")
+}
+
+/// Write one line to lint/unit output, mapping I/O failures.
+fn write_unit_line<W: Write>(out: &mut W, text: &str) -> Result<(), String> {
+    writeln!(out, "{text}").map_err(write_output_error)
+}
+
+/// Report one unit result code: the unsound confirm plus the banner.
+fn handle_unit_code<R: BufRead, W: Write>(
+    input: &mut R,
+    out: &mut W,
+    result: i32,
+) -> Result<Option<i32>, String> {
+    if result == UNIT_RESULT_UNSOUND
+        && !diff::prompt_confirm_from(input, out, UNSOUND_PROMPT, false)?
+    {
+        return Err(USER_ABORT.to_string());
+    }
+    if let Some((title, detail)) = unit_result_notice(result) {
+        write_banner(out, title, detail)?;
+    }
+    Ok(Some(result))
+}
+
 pub fn run_unit<R: BufRead, W: Write>(
     cwd: &Path,
     base: Option<&str>,
@@ -2148,29 +2175,18 @@ pub fn run_unit<R: BufRead, W: Write>(
         return Ok(Some(UNIT_RESULT_SKIP));
     }
     let argv = lint_unit_argv(&passthru_argv("unit", set_flags), base);
-    writeln!(out, "{RUNNING_UNIT_TESTS}").map_err(|e| format!("failed to write output: {e}"))?;
+    write_unit_line(out, RUNNING_UNIT_TESTS)?;
     match run_child(cwd, &argv) {
         ChildOutcome::NoEngine => {
-            writeln!(out, "{NO_UNIT_ENGINE}")
-                .map_err(|e| format!("failed to write output: {e}"))?;
+            write_unit_line(out, NO_UNIT_ENGINE)?;
             Ok(None)
         }
         ChildOutcome::NoEffect(message) => {
-            writeln!(out, "{message}").map_err(|e| format!("failed to write output: {e}"))?;
+            write_unit_line(out, &message)?;
             Ok(None)
         }
         ChildOutcome::Failed(message) => Err(message),
-        ChildOutcome::Code(result) => {
-            if result == UNIT_RESULT_UNSOUND
-                && !diff::prompt_confirm_from(input, out, UNSOUND_PROMPT, false)?
-            {
-                return Err(USER_ABORT.to_string());
-            }
-            if let Some((title, detail)) = unit_result_notice(result) {
-                write_banner(out, title, detail)?;
-            }
-            Ok(Some(result))
-        }
+        ChildOutcome::Code(result) => handle_unit_code(input, out, result),
     }
 }
 
@@ -2804,146 +2820,200 @@ fn is_diff_header(line: &str) -> bool {
         || line.starts_with("Index: ")
 }
 
-/// Parse one `diff`/`Index:` block starting at `lines[start]`.
-///
-/// `raw` parallels `lines` with endings retained, for parse errors.
-fn parse_file_block(
-    lines: &[&str],
-    raw: &[&str],
-    start: usize,
-) -> Result<(ParsedChange, usize), String> {
-    let mut old_path = String::new();
-    let mut new_path = String::new();
-    let mut change_type = TYPE_CHANGE;
-    let mut file_type = FILE_TEXT;
-    let mut hunks: Vec<ParsedHunk> = Vec::new();
-    let mut rename_from: Option<String> = None;
-    let mut rename_to: Option<String> = None;
-    let mut is_copy = false;
-    let mut is_rename = false;
-    let mut new_file = false;
-    let mut deleted_file = false;
-    let mut binary = false;
+/// Mutable header/path state for [`parse_file_block`].
+struct FileBlockState {
+    old_path: String,
+    new_path: String,
+    rename_from: Option<String>,
+    rename_to: Option<String>,
+    is_copy: bool,
+    is_rename: bool,
+    new_file: bool,
+    deleted_file: bool,
+}
 
-    // Seed paths from the header line when present (`diff --git a/o b/n`,
-    // `diff -r <rev> <file>`, `Index: <file>`).
-    let header = lines[start];
+/// Seed `(old, new)` paths from a block header line (`diff --git a/o b/n`,
+/// `diff -r <rev> <file>`, `Index: <file>`).
+fn seed_file_block_paths(header: &str) -> (String, String) {
     if let Some(rest) = header.strip_prefix("diff --git ") {
         let mut parts = rest.split_whitespace();
         if let (Some(old), Some(new)) = (parts.next(), parts.next()) {
-            old_path = strip_ab_prefix(old).to_string();
-            new_path = strip_ab_prefix(new).to_string();
+            return (
+                strip_ab_prefix(old).to_string(),
+                strip_ab_prefix(new).to_string(),
+            );
         }
-    } else if let Some(rest) = header.strip_prefix("Index: ") {
-        old_path = rest.trim().to_string();
-        new_path = old_path.clone();
-    } else if (header.starts_with("diff -r ") || header.starts_with("diff -u "))
+        return (String::new(), String::new());
+    }
+    if let Some(rest) = header.strip_prefix("Index: ") {
+        let path = rest.trim().to_string();
+        return (path.clone(), path);
+    }
+    if (header.starts_with("diff -r ") || header.starts_with("diff -u "))
         && let Some(last) = header.split_whitespace().last()
     {
-        old_path = strip_ab_prefix(last).to_string();
-        new_path = old_path.clone();
+        let path = strip_ab_prefix(last).to_string();
+        return (path.clone(), path);
     }
+    (String::new(), String::new())
+}
 
-    let mut index = start + 1;
-    // Extended headers up to `---`.
+/// True at the end of the extended-header run (`---`, binary markers,
+/// hunks, or the next block).
+fn is_extended_header_end(line: &str) -> bool {
+    line.starts_with("--- ")
+        || line.starts_with("Binary files ")
+        || line.starts_with("GIT binary patch")
+        || is_svn_binary_marker(line)
+        || line.starts_with("@@ ")
+        || is_diff_header(line)
+        || line.starts_with("commit ")
+}
+
+/// Fold one extended-header line into `state` (renames, copies, modes).
+fn apply_extended_header_line(line: &str, state: &mut FileBlockState) {
+    if let Some(path) = line.strip_prefix("rename from ") {
+        state.rename_from = Some(path.trim().to_string());
+        state.is_rename = true;
+    } else if let Some(path) = line.strip_prefix("rename to ") {
+        state.rename_to = Some(path.trim().to_string());
+        state.is_rename = true;
+    } else if let Some(path) = line.strip_prefix("copy from ") {
+        state.rename_from = Some(path.trim().to_string());
+        state.is_copy = true;
+    } else if let Some(path) = line.strip_prefix("copy to ") {
+        state.rename_to = Some(path.trim().to_string());
+        state.is_copy = true;
+    } else if line.starts_with("new file mode") {
+        state.new_file = true;
+    } else if line.starts_with("deleted file mode") {
+        state.deleted_file = true;
+    }
+}
+
+/// Scan extended headers from `index`, returning the first body line.
+fn scan_extended_headers(lines: &[&str], state: &mut FileBlockState, mut index: usize) -> usize {
     while index < lines.len() {
         let line = lines[index];
-        if line.starts_with("--- ")
-            || line.starts_with("Binary files ")
-            || line.starts_with("GIT binary patch")
-            || is_svn_binary_marker(line)
-            || line.starts_with("@@ ")
-            || is_diff_header(line)
-            || line.starts_with("commit ")
-        {
+        if is_extended_header_end(line) {
             break;
         }
-        if let Some(path) = line.strip_prefix("rename from ") {
-            rename_from = Some(path.trim().to_string());
-            is_rename = true;
-        } else if let Some(path) = line.strip_prefix("rename to ") {
-            rename_to = Some(path.trim().to_string());
-            is_rename = true;
-        } else if let Some(path) = line.strip_prefix("copy from ") {
-            rename_from = Some(path.trim().to_string());
-            is_copy = true;
-        } else if let Some(path) = line.strip_prefix("copy to ") {
-            rename_to = Some(path.trim().to_string());
-            is_copy = true;
-        } else if line.starts_with("new file mode") {
-            new_file = true;
-        } else if line.starts_with("deleted file mode") {
-            deleted_file = true;
-        }
+        apply_extended_header_line(line, state);
         index += 1;
     }
+    index
+}
 
-    // `Index:` blocks key on the header path; `---`/`+++` only supply
-    // the old path with `(...)` suffixes stripped (`parseHunkTarget()`,
-    // `src/parser/ArcanistDiffParser.php:840-878`).
-    let index_block = header.starts_with("Index: ");
-    // `---` / `+++` path lines.
-    if index < lines.len() && lines[index].starts_with("--- ") {
-        let old = diff_path_value(lines[index], index_block);
-        if old == "/dev/null" {
-            new_file = true;
-        } else if !old.is_empty() {
-            old_path = old;
-        }
-        index += 1;
+/// Consume the `---` path line at `index`, returning the next index.
+fn consume_minus_path_line(
+    lines: &[&str],
+    index: usize,
+    index_block: bool,
+    state: &mut FileBlockState,
+) -> usize {
+    if index >= lines.len() || !lines[index].starts_with("--- ") {
+        return index;
     }
-    if index < lines.len() && lines[index].starts_with("+++ ") {
-        let new = diff_path_value(lines[index], index_block);
-        if new == "/dev/null" {
-            deleted_file = true;
-            new_path.clone_from(&old_path);
-        } else if !new.is_empty() {
-            new_path = new;
-        }
-        index += 1;
+    let old = diff_path_value(lines[index], index_block);
+    if old == "/dev/null" {
+        state.new_file = true;
+    } else if !old.is_empty() {
+        state.old_path = old;
     }
+    index + 1
+}
+
+/// Consume the `+++` path line at `index`, returning the next index.
+fn consume_plus_path_line(
+    lines: &[&str],
+    index: usize,
+    index_block: bool,
+    state: &mut FileBlockState,
+) -> usize {
+    if index >= lines.len() || !lines[index].starts_with("+++ ") {
+        return index;
+    }
+    let new = diff_path_value(lines[index], index_block);
+    if new == "/dev/null" {
+        state.deleted_file = true;
+        state.new_path.clone_from(&state.old_path);
+    } else if !new.is_empty() {
+        state.new_path = new;
+    }
+    index + 1
+}
+
+/// Key `Index:` paths on the header, defaulting empty sides to each other.
+fn finalize_block_paths(header: &str, index_block: bool, state: &mut FileBlockState) {
     if index_block {
-        new_path = header["Index: ".len()..].trim().to_string();
+        state.new_path = header["Index: ".len()..].trim().to_string();
     }
-    if new_path.is_empty() {
-        new_path.clone_from(&old_path);
+    if state.new_path.is_empty() {
+        state.new_path.clone_from(&state.old_path);
     }
-    if old_path.is_empty() {
-        old_path.clone_from(&new_path);
+    if state.old_path.is_empty() {
+        state.old_path.clone_from(&state.new_path);
     }
+}
 
-    // Body: binary markers and hunks until the next block.
+/// True at the start of the next block (diff header or `commit ` line).
+fn is_block_end_line(line: &str) -> bool {
+    is_diff_header(line) || is_combined_diff_header(line) || line.starts_with("commit ")
+}
+
+/// Skip an svn binary marker plus its `svn:mime-type` line, returning the
+/// next index. The mime line is the next non-empty line (`:739-743`).
+fn skip_svn_binary_block(lines: &[&str], mut index: usize) -> usize {
+    index += 1;
+    while index < lines.len() && lines[index].trim().is_empty() {
+        index += 1;
+    }
+    if index < lines.len() {
+        index += 1;
+    }
+    index
+}
+
+/// True at the end of a git binary payload (hunk or next block).
+fn is_binary_payload_end(line: &str) -> bool {
+    line.starts_with("@@ ")
+        || line.starts_with("@@@")
+        || is_diff_header(line)
+        || is_combined_diff_header(line)
+        || line.starts_with("commit ")
+}
+
+/// Skip `Binary files`/`GIT binary patch` payload lines (`literal ...`,
+/// base85, ...), returning the next index.
+fn skip_git_binary_block(lines: &[&str], mut index: usize) -> usize {
+    index += 1;
+    while index < lines.len() && !is_binary_payload_end(lines[index]) {
+        index += 1;
+    }
+    index
+}
+
+/// Collect body hunks from `index`, returning `(hunks, binary, next)`.
+fn collect_block_body(
+    lines: &[&str],
+    raw: &[&str],
+    mut index: usize,
+) -> Result<(Vec<ParsedHunk>, bool, usize), String> {
+    let mut hunks = Vec::new();
+    let mut binary = false;
     while index < lines.len() {
         let line = lines[index];
-        if is_diff_header(line) || is_combined_diff_header(line) || line.starts_with("commit ") {
+        if is_block_end_line(line) {
             break;
         }
         if is_svn_binary_marker(line) {
-            // `Cannot display: ...` plus its `svn:mime-type` line
-            // (`:739-743`); the mime line is the next non-empty line.
             binary = true;
-            index += 1;
-            while index < lines.len() && lines[index].trim().is_empty() {
-                index += 1;
-            }
-            if index < lines.len() {
-                index += 1;
-            }
+            index = skip_svn_binary_block(lines, index);
             continue;
         }
         if line.starts_with("Binary files ") || line.starts_with("GIT binary patch") {
             binary = true;
-            index += 1;
-            // Skip binary payload lines (`literal ...`, base85, ...).
-            while index < lines.len()
-                && !lines[index].starts_with("@@ ")
-                && !lines[index].starts_with("@@@")
-                && !is_diff_header(lines[index])
-                && !is_combined_diff_header(lines[index])
-                && !lines[index].starts_with("commit ")
-            {
-                index += 1;
-            }
+            index = skip_git_binary_block(lines, index);
             continue;
         }
         if let Some((old_start, old_len, new_start, new_len)) = parse_hunk_header(line) {
@@ -2957,7 +3027,29 @@ fn parse_file_block(
         }
         index += 1;
     }
+    Ok((hunks, binary, index))
+}
 
+/// Resolve change/file types and build the parsed change.
+fn finish_file_block(
+    state: FileBlockState,
+    hunks: Vec<ParsedHunk>,
+    binary: bool,
+    index: usize,
+) -> (ParsedChange, usize) {
+    let FileBlockState {
+        mut old_path,
+        mut new_path,
+        rename_from,
+        rename_to,
+        is_copy,
+        is_rename,
+        new_file,
+        deleted_file,
+    } = state;
+    let mut hunks = hunks;
+    let mut change_type = TYPE_CHANGE;
+    let mut file_type = FILE_TEXT;
     if binary {
         file_type = FILE_BINARY;
         hunks.clear();
@@ -2982,8 +3074,7 @@ fn parse_file_block(
     if old_path == "/dev/null" {
         old_path.clear();
     }
-
-    Ok((
+    (
         ParsedChange {
             old_path,
             current_path: new_path,
@@ -2995,7 +3086,44 @@ fn parse_file_block(
             message: None,
         },
         index,
-    ))
+    )
+}
+
+/// Parse one `diff`/`Index:` block starting at `lines[start]`.
+///
+/// `raw` parallels `lines` with endings retained, for parse errors.
+fn parse_file_block(
+    lines: &[&str],
+    raw: &[&str],
+    start: usize,
+) -> Result<(ParsedChange, usize), String> {
+    let header = lines[start];
+    let (old_path, new_path) = seed_file_block_paths(header);
+    let mut state = FileBlockState {
+        old_path,
+        new_path,
+        rename_from: None,
+        rename_to: None,
+        is_copy: false,
+        is_rename: false,
+        new_file: false,
+        deleted_file: false,
+    };
+    // Extended headers up to `---`.
+    let mut index = scan_extended_headers(lines, &mut state, start + 1);
+
+    // `Index:` blocks key on the header path; `---`/`+++` only supply
+    // the old path with `(...)` suffixes stripped (`parseHunkTarget()`,
+    // `src/parser/ArcanistDiffParser.php:840-878`).
+    let index_block = header.starts_with("Index: ");
+    // `---` / `+++` path lines.
+    index = consume_minus_path_line(lines, index, index_block, &mut state);
+    index = consume_plus_path_line(lines, index, index_block, &mut state);
+    finalize_block_paths(header, index_block, &mut state);
+
+    // Body: binary markers and hunks until the next block.
+    let (hunks, binary, next) = collect_block_body(lines, raw, index)?;
+    Ok(finish_file_block(state, hunks, binary, next))
 }
 
 fn strip_ab_prefix(path: &str) -> &str {
@@ -5181,6 +5309,28 @@ fn echo_saved_copy_note<W: Write>(writer: &mut W, where_path: &str) -> Result<()
 /// the template came from the server default, and `verbatim` the flag
 /// (skips the editor on the first pass for non-default templates).
 /// Returns the parsed, pulled, validated message.
+/// Produce the next create-message draft: the verbatim template on the
+/// first pass, else one editor round-trip with comment stripping.
+fn next_create_template<R: BufRead, W: Write>(
+    editor: &CreateMessageEditor<'_, R, W>,
+    template: &str,
+    issues: &[String],
+    first: bool,
+    verbatim: bool,
+    template_is_default: bool,
+) -> Result<String, String> {
+    if first && verbatim && !template_is_default {
+        return Ok(template.to_string());
+    }
+    let edit_text = build_editor_template(template, issues);
+    let edited = (editor.edit)(&edit_text)?;
+    let stripped = remove_comments(&edited);
+    if template_is_default && stripped == template {
+        return Err(TEMPLATE_NOT_EDITED.to_string());
+    }
+    Ok(stripped)
+}
+
 pub fn edit_create_message<R: BufRead, W: Write>(
     editor: &mut CreateMessageEditor<'_, R, W>,
     template: &str,
@@ -5193,19 +5343,15 @@ pub fn edit_create_message<R: BufRead, W: Write>(
     let mut issues = issues.to_vec();
     let mut first = true;
     loop {
-        let edit_text = build_editor_template(&template, &issues);
-        let new_template = if first && verbatim && !template_is_default {
-            template.clone()
-        } else {
-            let edited = (editor.edit)(&edit_text)?;
-            let stripped = remove_comments(&edited);
-            if template_is_default && stripped == template {
-                return Err(TEMPLATE_NOT_EDITED.to_string());
-            }
-            stripped
-        };
+        template = next_create_template(
+            editor,
+            &template,
+            &issues,
+            first,
+            verbatim,
+            template_is_default,
+        )?;
         first = false;
-        template = new_template;
         let (wrote, where_path) = save_message_draft(editor, old_message, &template)?;
         match attempt_message(editor, &template) {
             Ok(message) => return Ok(message),
@@ -5902,6 +6048,70 @@ fn check_untracked_files<R: BufRead, W: Write>(
     Ok(())
 }
 
+/// Render a clean-check prompt failure.
+fn write_prompt_error(error: std::io::Error) -> String {
+    format!("failed to write prompt: {error}")
+}
+
+/// Write prompt bytes, mapping I/O failures.
+fn write_prompt_bytes<W: Write>(writer: &mut W, bytes: &[u8]) -> Result<(), String> {
+    writer.write_all(bytes).map_err(write_prompt_error)
+}
+
+/// Echo the uncommitted-changes notice plus the staged/unstaged lists.
+fn echo_uncommitted_state<W: Write>(
+    writer: &mut W,
+    desc: &str,
+    unstaged: &[String],
+    uncommitted: &[String],
+) -> Result<(), String> {
+    let echo = format!("{UNCOMMITTED_CHANGES_HERE}\n\n{desc}");
+    write_prompt_bytes(writer, echo.as_bytes())?;
+    let mut lists = Vec::new();
+    if !unstaged.is_empty() {
+        lists.push(unstaged_list_echo(unstaged));
+    }
+    if !uncommitted.is_empty() {
+        lists.push(uncommitted_list_echo(uncommitted));
+    }
+    write_prompt_bytes(writer, format!("{}\n", lists.join("\n\n")).as_bytes())
+}
+
+/// Resolve the commit decision: `Some(true)` commits, `None` falls through.
+fn decide_uncommitted_commit<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    vcs: &CleanCheckVcs<'_>,
+    unstaged: &[String],
+    all: &[String],
+    mode: CommitMode,
+) -> Result<Option<bool>, String> {
+    if !ask_for_add(reader, writer, mode, vcs.should_amend, all)? {
+        return Ok(None);
+    }
+    if !unstaged.is_empty()
+        && let Some(add) = vcs.add_to_commit
+    {
+        add(unstaged)?;
+    }
+    Ok(Some(true))
+}
+
+/// Resolve autostashing: `Some(false)` when it applies, `None` falls through.
+fn decide_uncommitted_stash<W: Write>(
+    writer: &mut W,
+    vcs: &CleanCheckVcs<'_>,
+) -> Result<Option<bool>, String> {
+    if !vcs.autostash || !vcs.can_stash {
+        return Ok(None);
+    }
+    if let Some(stash) = vcs.stash_changes {
+        write_prompt_bytes(writer, format!("{STASHING_UNCOMMITTED}\n").as_bytes())?;
+        stash()?;
+    }
+    Ok(Some(false))
+}
+
 /// Uncommitted-changes gate (`:1162-1215`).
 ///
 /// Returns whether the flow should commit.
@@ -5917,42 +6127,14 @@ fn check_uncommitted_changes<R: BufRead, W: Write>(
     if unstaged.is_empty() && uncommitted.is_empty() {
         return Ok(false);
     }
-    let echo = format!("{UNCOMMITTED_CHANGES_HERE}\n\n{desc}");
-    writer
-        .write_all(echo.as_bytes())
-        .map_err(|error| format!("failed to write prompt: {error}"))?;
-    let mut lists = Vec::new();
-    if !unstaged.is_empty() {
-        lists.push(unstaged_list_echo(unstaged));
-    }
-    if !uncommitted.is_empty() {
-        lists.push(uncommitted_list_echo(uncommitted));
-    }
-    writer
-        .write_all(format!("{}\n", lists.join("\n\n")).as_bytes())
-        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    echo_uncommitted_state(writer, desc, unstaged, uncommitted)?;
     let mut all = unstaged.to_vec();
     all.extend(uncommitted.iter().cloned());
-    if ask_for_add(reader, writer, mode, vcs.should_amend, &all)? {
-        if !unstaged.is_empty()
-            && let Some(add) = vcs.add_to_commit
-        {
-            add(unstaged)?;
-        }
-        return Ok(true);
+    if let Some(commit) = decide_uncommitted_commit(reader, writer, vcs, unstaged, &all, mode)? {
+        return Ok(commit);
     }
-    if vcs.autostash
-        && vcs.can_stash
-        && let Some(stash) = vcs.stash_changes
-    {
-        writer
-            .write_all(format!("{STASHING_UNCOMMITTED}\n").as_bytes())
-            .map_err(|error| format!("failed to write prompt: {error}"))?;
-        stash()?;
-        return Ok(false);
-    }
-    if vcs.autostash && vcs.can_stash {
-        return Ok(false);
+    if let Some(stashed) = decide_uncommitted_stash(writer, vcs)? {
+        return Ok(stashed);
     }
     Err(CANNOT_CONTINUE_UNCOMMITTED.to_string())
 }
