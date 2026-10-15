@@ -130,13 +130,40 @@ fn linters_lists_the_full_registry() {
     assert_eq!(all.len(), 34);
     assert!(all.iter().any(|info| info.name == "TXT"));
     assert!(all.iter().all(|info| !info.description.is_empty()));
-    assert_eq!(linters::run(&args(&[])), std::process::ExitCode::SUCCESS);
+
+    // Hermetic working copy: `run()` would resolve the process cwd (the
+    // package dir under `cargo test`) and read this repo's own `.arclint`,
+    // so drive `run_in` against a temp repo with a fixture config instead.
+    // The `text` spec's `exclude` key and the `xhpast` spec keep the
+    // per-spec exclude parse and the XHPAST version probe covered.
+    let tmp = init_repo("linters-config");
+    commit_file(
+        tmp.path(),
+        ".arclint",
+        r#"{"linters": {"text": {"type": "text", "exclude": "(\\.txt$)"}, "xhpast": {"type": "xhpast", "include": "(\\.php$)"}}}"#,
+    );
+    let configured = linters::configured_classes(tmp.path()).unwrap();
+    assert!(configured.contains(&"ArcanistTextLinter"));
+    assert!(configured.contains(&"ArcanistXHPASTLinter"));
     assert_eq!(
-        linters::run(&args(&["--search", "zzz-no-such-linter"])),
+        linters::run_in(tmp.path(), &args(&[])),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(
-        linters::run(&args(&["--verbose", "TXT"])),
+        linters::run_in(tmp.path(), &args(&["--search", "zzz-no-such-linter"])),
+        std::process::ExitCode::SUCCESS
+    );
+    assert_eq!(
+        linters::run_in(tmp.path(), &args(&["--verbose", "TXT"])),
+        std::process::ExitCode::SUCCESS
+    );
+
+    // A repo without `.arclint` keeps the unconfigured path covered.
+    let bare = init_repo("linters-bare");
+    commit_file(bare.path(), "f.txt", "one");
+    assert!(linters::configured_classes(bare.path()).unwrap().is_empty());
+    assert_eq!(
+        linters::run_in(bare.path(), &args(&[])),
         std::process::ExitCode::SUCCESS
     );
 }
