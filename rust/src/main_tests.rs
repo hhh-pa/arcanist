@@ -134,3 +134,70 @@ fn usage_lists_commands() {
     assert!(u.contains("call-conduit"));
     assert!(u.contains("diff"));
 }
+
+/// Every ported subcommand: the (NAME, run) pairs that must be registered
+/// in COMMANDS, listed in usage, and reachable through `dispatch` (the
+/// same path `main` uses). `call-conduit` is intentionally absent: it
+/// dispatches through `classify`, not the table.
+fn expected_commands() -> Vec<(&'static str, CommandFn)> {
+    vec![
+        (amend::NAME, amend::run),
+        (anoid::NAME, anoid::run),
+        (bookmarks::NAME, bookmarks::run),
+        (branches::NAME, branches::run),
+        (browse::NAME, browse::run),
+        (close_revision::NAME, close_revision::run),
+        (commit::NAME, commit::run),
+        (cover::NAME, cover::run),
+        (diff::NAME, diff::run),
+        (download::NAME, download::run),
+        (export::NAME, export::run),
+        (get_config::NAME, get_config::run),
+        (inspect::NAME, inspect::run),
+        (install_certificate::NAME, install_certificate::run),
+        (land::NAME, land::run),
+        (liberate::NAME, liberate::run),
+        (lint::NAME, lint::run),
+        (linters::NAME, linters::run),
+        (list::NAME, list::run),
+        (look::NAME, look::run),
+        (markers::NAME, markers::run),
+        (paste::NAME, paste::run),
+        (patch::NAME, patch::run),
+        (set_config::NAME, set_config::run),
+        (tasks::NAME, tasks::run),
+        (todo::NAME, todo::run),
+        (unit::NAME, unit::run),
+        (upgrade::NAME, upgrade::run),
+        (upload::NAME, upload::run),
+        (weld::NAME, weld::run),
+        (which::NAME, which::run),
+        (work::NAME, work::run),
+    ]
+}
+
+#[test]
+fn all_ported_commands_are_registered() {
+    assert_eq!(COMMANDS.len(), expected_commands().len());
+    for (name, run) in expected_commands() {
+        assert!(
+            find_command(name).is_some_and(|f| std::ptr::fn_addr_eq(f, run)),
+            "command '{name}' is not registered"
+        );
+        assert!(
+            usage().contains(&format!("  {name}\n")),
+            "usage omits command '{name}'"
+        );
+    }
+}
+
+#[test]
+fn all_ported_commands_dispatch_through_main() {
+    for (name, _) in expected_commands() {
+        assert_eq!(
+            dispatch(&args(&[name, "--help"])),
+            ExitCode::SUCCESS,
+            "command '{name}' did not dispatch through main"
+        );
+    }
+}
