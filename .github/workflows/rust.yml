@@ -170,6 +170,13 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: rust/target/llvm-cov/lcov.info
           fail_ci_if_error: false
+      - name: upload test results to codecov
+        if: ${{ !cancelled() }} && hashFiles('rust/target/nextest/default/junit.xml') != ''
+        uses: codecov/test-results-action@v1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: rust/target/nextest/default/junit.xml
+          fail_ci_if_error: false
 
   go-tools-test:
     name: go ci-tools tests
@@ -182,6 +189,9 @@ jobs:
       - run: go test ./...
         working-directory: scripts/ci/go
 
+  # Every run keeps its release binaries as downloadable Actions artifacts
+  # (`arc-<target>.tar.gz` per OS, 14-day retention), so any commit's build
+  # can be fetched without cutting a tag release.
   build-release:
     name: release (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -196,13 +206,27 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release --locked
-      - name: smoke-test shipped binary
+      # Same package steps as release.yml: smoke-test the binary, then tar
+      # it as dist/arc-<target>.tar.gz.
+      - name: package binary
+        id: package
         shell: bash
         run: |
-          set -o pipefail
+          set -euo pipefail
+          target=$(rustc -vV | sed -n 's/^host: //p')
           bin=target/release/arc
           if [ "$RUNNER_OS" = "Windows" ]; then
             bin="$bin.exe"
           fi
           test -x "$bin"
           "$bin" --help | grep -q 'usage:'
+          mkdir -p dist
+          asset="dist/arc-$target.tar.gz"
+          tar -czf "$asset" -C target/release "$(basename "$bin")"
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arc-${{ steps.package.outputs.target }}
+          path: rust/dist/arc-*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
