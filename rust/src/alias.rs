@@ -820,44 +820,56 @@ pub fn run(argv: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
     if options.positional.is_empty() {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        return match execute_list(&cwd, config::arcrc_path().as_deref(), options.json) {
-            Ok(report) => {
-                print_report(&report);
-                ExitCode::SUCCESS
-            }
-            Err(message) => {
-                eprintln!("arc-rs {NAME}: {message}");
-                ExitCode::FAILURE
-            }
-        };
+        return run_list(&options);
     }
     if options.positional.len() == 1 {
-        let user_file = match user_file_or_error() {
-            Ok(path) => path,
-            Err(message) => {
-                eprintln!("arc-rs {NAME}: {message}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let stdin = std::io::stdin();
-        let mut locked = stdin.lock();
-        return match execute_delete(
-            &user_file,
-            &options.positional[0],
-            &mut locked,
-            prompt::stdin_is_terminal(),
-        ) {
-            Ok(report) => {
-                print_report(&report);
-                ExitCode::SUCCESS
-            }
-            Err(message) => {
-                eprintln!("arc-rs {NAME}: {message}");
-                ExitCode::FAILURE
-            }
-        };
+        return run_delete(&options);
     }
+    run_create(&options)
+}
+
+fn run_list(options: &Options) -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    match execute_list(&cwd, config::arcrc_path().as_deref(), options.json) {
+        Ok(report) => {
+            print_report(&report);
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("arc-rs {NAME}: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_delete(options: &Options) -> ExitCode {
+    let user_file = match user_file_or_error() {
+        Ok(path) => path,
+        Err(message) => {
+            eprintln!("arc-rs {NAME}: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let stdin = std::io::stdin();
+    let mut locked = stdin.lock();
+    match execute_delete(
+        &user_file,
+        &options.positional[0],
+        &mut locked,
+        prompt::stdin_is_terminal(),
+    ) {
+        Ok(report) => {
+            print_report(&report);
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("arc-rs {NAME}: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_create(options: &Options) -> ExitCode {
     let user_file = match user_file_or_error() {
         Ok(path) => path,
         Err(message) => {
