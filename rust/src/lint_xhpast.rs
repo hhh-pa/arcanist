@@ -59,6 +59,8 @@ mod xhp_decl;
 mod xhp_flow;
 #[path = "xhp_rem1.rs"]
 mod xhp_rem1;
+#[path = "xhp_rem2.rs"]
+mod xhp_rem2;
 #[path = "xhp_rem3.rs"]
 mod xhp_rem3;
 #[path = "xhp_style.rs"]
@@ -138,20 +140,38 @@ pub const RULE_TABLE: &[(u32, &str, &str)] = &[
     (47, "Empty Block Statement", SEVERITY_ADVICE),
     (48, "Array Separator", SEVERITY_ADVICE),
     (49, "Constructor Parentheses", SEVERITY_ADVICE),
+    (50, "Duplicate Case Statements", SEVERITY_ERROR),
     (51, "Use of Blacklisted Function", SEVERITY_ERROR),
+    (52, "Implicit Method Visibility", SEVERITY_ADVICE),
     (53, "Call-Time Pass-By-Reference", SEVERITY_ERROR),
     (54, "Formatted String", SEVERITY_ERROR),
+    (55, "Unnecessary Final Modifier", SEVERITY_ADVICE),
     (56, "Unnecessary Semicolon", SEVERITY_ADVICE),
+    (57, "Self Member Reference", SEVERITY_WARNING),
     (58, "Logical Operators", SEVERITY_ADVICE),
+    (59, "Inner Functions", SEVERITY_WARNING),
+    (60, "Default Parameters", SEVERITY_WARNING),
     (61, "Lowercase Functions", SEVERITY_ADVICE),
     (62, "Class Name Literal", SEVERITY_ADVICE),
+    (63, "Useless Overriding Method", SEVERITY_ADVICE),
+    (64, "No Parent Scope", SEVERITY_ERROR),
     (65, "Alias Functions", SEVERITY_ADVICE),
     (66, "Cast Spacing", SEVERITY_ADVICE),
+    (
+        67,
+        "Throwing Exception in `__toString` Method",
+        SEVERITY_ERROR,
+    ),
     (68, "`__lambda_func` Function", SEVERITY_ERROR),
+    (69, "`instanceof` Operator", SEVERITY_ERROR),
+    (70, "Invalid Default Parameter", SEVERITY_ERROR),
     (71, "Modifier Ordering", SEVERITY_ADVICE),
+    (72, "Invalid Modifiers", SEVERITY_ERROR),
     (73, "Space After Unary Prefix Operator", SEVERITY_WARNING),
     (74, "Object Operator Spacing", SEVERITY_WARNING),
     (75, "Space Before Unary Postfix Operator", SEVERITY_WARNING),
+    (76, "Array Element", SEVERITY_WARNING),
+    (77, "List Assignment", SEVERITY_WARNING),
     (78, "Inline HTML", SEVERITY_DISABLED),
     (79, "Global Variables", SEVERITY_WARNING),
     (80, "Questionable Use of `parse_str`", SEVERITY_ERROR),
@@ -226,32 +246,6 @@ pub fn rule_meta(id: u32) -> Option<(&'static str, &'static str)> {
 #[must_use]
 pub fn blocked_rules() -> Vec<(u32, &'static str, &'static str)> {
     vec![
-        (50, "ArcanistDuplicateSwitchCaseXHPASTLinterRule", NOT_YET),
-        (52, "ArcanistImplicitVisibilityXHPASTLinterRule", NOT_YET),
-        (
-            55,
-            "ArcanistUnnecessaryFinalModifierXHPASTLinterRule",
-            NOT_YET,
-        ),
-        (57, "ArcanistSelfMemberReferenceXHPASTLinterRule", NOT_YET),
-        (59, "ArcanistInnerFunctionXHPASTLinterRule", NOT_YET),
-        (60, "ArcanistDefaultParametersXHPASTLinterRule", NOT_YET),
-        (
-            63,
-            "ArcanistUselessOverridingMethodXHPASTLinterRule",
-            NOT_YET,
-        ),
-        (64, "ArcanistNoParentScopeXHPASTLinterRule", NOT_YET),
-        (67, "ArcanistToStringExceptionXHPASTLinterRule", NOT_YET),
-        (69, "ArcanistInstanceOfOperatorXHPASTLinterRule", NOT_YET),
-        (
-            70,
-            "ArcanistInvalidDefaultParameterXHPASTLinterRule",
-            NOT_YET,
-        ),
-        (72, "ArcanistInvalidModifiersXHPASTLinterRule", NOT_YET),
-        (76, "ArcanistArrayValueXHPASTLinterRule", NOT_YET),
-        (77, "ArcanistListAssignmentXHPASTLinterRule", NOT_YET),
         (
             134,
             "ArcanistProductNameLiteralXHPASTLinterRule",
@@ -394,6 +388,7 @@ pub fn lint_tree(
     xhp_decl::apply(&ctx, &mut findings);
     xhp_flow::apply(&ctx, &mut findings);
     xhp_rem1::apply(&ctx, &mut findings);
+    xhp_rem2::apply(&ctx, &mut findings);
     xhp_rem3::apply(&ctx, &mut findings);
     findings.sort_by_key(|finding| (finding.offset, finding.rule));
     findings
