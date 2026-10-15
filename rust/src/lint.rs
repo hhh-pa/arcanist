@@ -31,7 +31,9 @@
 //!   per-tool config keys) parse but are not applied, except
 //!   `text.max-line-length`. External tools run with default binaries.
 //! - `severity.rules` patterns are not validated as regular expressions.
-//! - Console markup (colors, `##inverse##` highlights) is stripped: output
+//! - Console markup (colors, `##inverse##` highlights) renders on TTYs
+//!   via the shared terminal styling helpers (see the `*_with_ansi`
+//!   seams) and is stripped otherwise: output
 //!   matches piped (non-TTY) `arc` exactly, verified against the golden
 //!   files in `src/lint/renderer/__tests__/data/`.
 //! - `phutil_console_wrap()` is approximated as word-wrap at 80 columns;
@@ -59,6 +61,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use arc_rs::{arclint, git, hg, svn};
+
+use crate::terminal::{self, TVal};
 
 pub const NAME: &str = "lint";
 
@@ -2605,6 +2609,7 @@ fn git_default_base(
     work: &WorkCopy,
     input: &mut dyn BufRead,
     output: &mut dyn FnMut(&str),
+    ansi: bool,
 ) -> Result<String, String> {
     if !git_repository_has_two_commits(&work.vcs_root) {
         return Ok(git::GIT_MAGIC_ROOT_COMMIT.to_string());
@@ -2630,7 +2635,7 @@ fn git_default_base(
     if let Some(relative) = read_default_relative_commit(&work.vcs_root) {
         return git_merge_base_with_head(&work.vcs_root, &relative);
     }
-    let relative = prompt_default_relative_commit(input, output);
+    let relative = prompt_default_relative_commit(input, output, ansi);
     git_check_relative_commit(&work.vcs_root, &relative)?;
     write_default_relative_commit(&work.vcs_root, &relative);
     git_merge_base_with_head(&work.vcs_root, &relative)
@@ -2680,15 +2685,32 @@ fn write_default_relative_commit(root: &Path, relative: &str) {
     std::fs::write(path, relative).ok();
 }
 
+/// Body of the "Select a Default Commit Range" prompt
+/// (`ArcanistGitAPI.php:320-360`).
+const DEFAULT_COMMIT_RANGE_TEXT: &str = "You're running a command which operates on a range of revisions (usually, from some revision to HEAD) but have not specified the revision that should determine the start of the range.\n\nPreviously, arc assumed you meant 'HEAD^' when you did not specify a start revision, but this behavior does not make much sense in most workflows outside of Facebook's historic git-svn workflow.\n\narc no longer assumes 'HEAD^'. You must specify a relative commit explicitly when you invoke a command (e.g., `arc diff HEAD^`, not just `arc diff`) or select a default for this working copy.\n\nIn most cases, the best default is 'origin/master'. You can also select 'HEAD^' to preserve the old behavior, or some other remote or branch. But you almost certainly want to select 'origin/master'.\n\n(Technically: the merge-base of the selected revision and HEAD is used to determine the start of the commit range.)";
+
 /// The "Select a Default Commit Range" prompt
-/// (`ArcanistGitAPI.php:320-360`), markup stripped. Returns the chosen
-/// relative commit (`origin/master` when the answer is blank).
-fn prompt_default_relative_commit(input: &mut dyn BufRead, output: &mut dyn FnMut(&str)) -> String {
-    output("** Select a Default Commit Range **\n\n");
-    output(&word_wrap(
-        "You're running a command which operates on a range of revisions (usually, from some revision to HEAD) but have not specified the revision that should determine the start of the range.\n\nPreviously, arc assumed you meant 'HEAD^' when you did not specify a start revision, but this behavior does not make much sense in most workflows outside of Facebook's historic git-svn workflow.\n\narc no longer assumes 'HEAD^'. You must specify a relative commit explicitly when you invoke a command (e.g., `arc diff HEAD^`, not just `arc diff`) or select a default for this working copy.\n\nIn most cases, the best default is 'origin/master'. You can also select 'HEAD^' to preserve the old behavior, or some other remote or branch. But you almost certainly want to select 'origin/master'.\n\n(Technically: the merge-base of the selected revision and HEAD is used to determine the start of the commit range.)",
-        0,
-    ));
+/// (`ArcanistGitAPI.php:320-360`). TTYs render the green header
+/// (`phutil_console_format("<bg:green>** %s **</bg>\n\n", ...)`) and
+/// wrap the body at 78 columns; non-TTYs keep the stripped rendering
+/// byte-identical. Returns the chosen relative commit (`origin/master`
+/// when the answer is blank).
+fn prompt_default_relative_commit(
+    input: &mut dyn BufRead,
+    output: &mut dyn FnMut(&str),
+    ansi: bool,
+) -> String {
+    if ansi {
+        output(&terminal::console_format(
+            "<bg:green>** %s **</bg>\n\n",
+            &["Select a Default Commit Range"],
+            true,
+        ));
+        output(&terminal::console_wrap(DEFAULT_COMMIT_RANGE_TEXT, 0, true));
+    } else {
+        output("** Select a Default Commit Range **\n\n");
+        output(&word_wrap(DEFAULT_COMMIT_RANGE_TEXT, 0));
+    }
     output("\n");
     output("What default do you want to use? [origin/master] ");
     let mut line = String::new();
@@ -3603,6 +3625,16 @@ fn wrap_push_word(
 /// (`ArcanistConsoleLintRenderer::renderLintResult()`, `:50-103`),
 /// markup stripped (non-TTY).
 pub fn render_console_result(result: &LintResult) -> Result<String, String> {
+    render_console_result_with_ansi(result, terminal::ansi_enabled())
+}
+
+/// Render one result in console format with an explicit ANSI flag:
+/// TTYs render the severity badge, bold `>>>`, and underlines like
+/// PHP; non-TTYs keep the stripped rendering byte-identical.
+pub fn render_console_result_with_ansi(result: &LintResult, ansi: bool) -> Result<String, String> {
+    if ansi {
+        return render_console_result_tty(result);
+    }
     let mut entries = Vec::new();
     for message in &result.messages {
         let severity = severity_display_name(&message.severity)?;
@@ -3627,6 +3659,40 @@ pub fn render_console_result(result: &LintResult) -> Result<String, String> {
     ))
 }
 
+/// TTY rendering for [`render_console_result_with_ansi`]:
+/// `phutil_console_format("  **<bg:COLOR> %s </bg>** (%s) __%s__\n%s\n",
+/// ...)` per message (`:83-88`, red for errors, yellow otherwise) plus
+/// the bold `**>>>**` prefix with the underlined path (`:95-99`).
+fn render_console_result_tty(result: &LintResult) -> Result<String, String> {
+    let mut entries = Vec::new();
+    for message in &result.messages {
+        let severity = severity_display_name(&message.severity)?;
+        let color = if message.is_error() { "red" } else { "yellow" };
+        let pattern = format!("  **<bg:{color}> %s </bg>** (%s) __%s__\n%s\n");
+        let description = terminal::console_wrap(&message.description, 4, true);
+        entries.push(terminal::console_format(
+            &pattern,
+            &[
+                severity,
+                message.code.as_str(),
+                message.name.as_str(),
+                description.as_str(),
+            ],
+            true,
+        ));
+        if message.has_file_context() {
+            entries.push(render_context_with_ansi(message, &result.data, true));
+        }
+    }
+    if entries.is_empty() {
+        return Ok(String::new());
+    }
+    let path = terminal::console_format("__%s__", &[&result.path], true);
+    let inner = format!("Lint for {path}:");
+    let prefix = terminal::console_format("**>>>** %s\n\n\n", &[&inner], true);
+    Ok(prefix + &entries.join("\n"))
+}
+
 /// Render one message's file context
 /// (`ArcanistConsoleLintRenderer::renderContext()`, `:105-336`).
 /// Highlights are stripped (non-TTY `##..##`); see the module docs.
@@ -3648,8 +3714,17 @@ fn split_keep_ends(text: &str) -> Vec<String> {
 }
 
 fn render_context(message: &LintMessage, data: &[u8]) -> String {
+    render_context_with_ansi(message, data, false)
+}
+
+/// Render one message's file context with an explicit ANSI flag.
+/// TTYs additionally wrap the changed ranges in `##` invert markers
+/// (`highlightText()`, `:377-383`, non-testable `tsprintf('##%s##',
+/// ...)`), applied before shrinking like PHP; non-TTYs render the
+/// stripped context byte-identical.
+fn render_context_with_ansi(message: &LintMessage, data: &[u8], ansi: bool) -> String {
     let data_text = String::from_utf8_lossy(data).into_owned();
-    let old_lines: Vec<String> = split_keep_ends(&data_text);
+    let mut old_lines: Vec<String> = split_keep_ends(&data_text);
 
     let (line, char, original, replacement) = trimmed_patch(message);
     let old_impact = original.bytes().filter(|b| *b == b'\n').count() + 1;
@@ -3670,13 +3745,100 @@ fn render_context(message: &LintMessage, data: &[u8]) -> String {
             replacement: replacement.as_deref(),
             old_impact,
         };
-        context_patch_impacts(&data_text, &old_lines, &mut new_lines, &mut start, &patch)
+        context_patch_impacts(
+            &data_text,
+            &mut old_lines,
+            &mut new_lines,
+            &mut start,
+            &patch,
+            ansi,
+        )
     } else {
+        if ansi {
+            highlight_single_line_old(&mut old_lines, start, char, &original, old_impact);
+        }
         (0, 0)
     };
 
     let specs = context_build_specs(&old_lines, &new_lines, start, old_impact, new_impact);
     context_render_specs(&specs, patchable, original.is_empty(), char)
+}
+
+/// The TTY form of `highlightText()` (`:377-383`): the text wrapped in
+/// `##` invert markers (non-testable `tsprintf('##%s##', ...)`).
+fn invert_highlight(text: &str) -> String {
+    terminal::tsprintf_ansi("##%s##", &[TVal::Text(text)], true)
+        .expect("fixed tsprintf pattern")
+        .as_str()
+        .to_string()
+}
+
+/// Splice `highlight` over `len` bytes at byte offset `at` in `line`
+/// (PHP `substr_replace()`, byte-based), lossy-decoding the result
+/// like the surrounding rendering.
+fn splice_highlight(line: &str, at: usize, len: usize, highlight: &str) -> String {
+    let bytes = line.as_bytes();
+    let at = at.min(bytes.len());
+    let end = at.saturating_add(len).min(bytes.len());
+    let mut out = Vec::with_capacity(bytes.len() + highlight.len());
+    out.extend_from_slice(&bytes[..at]);
+    out.extend_from_slice(highlight.as_bytes());
+    out.extend_from_slice(&bytes[end..]);
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Splice an invert highlight over the changed range of line `start`
+/// (1-based, `char` a 1-based byte offset). `create` mirrors PHP's
+/// auto-vivification for the boundary line past the end of the file;
+/// the new side (T13543) highlights only existing lines. Like the
+/// patch offset above, an unset (`0`) char highlights at the line
+/// start (PHP's `$char - 1` quirk for null chars is not replicated).
+fn highlight_line_at(lines: &mut Vec<String>, start: usize, char: usize, text: &str, create: bool) {
+    let highlight = invert_highlight(text);
+    let offset = char.saturating_sub(1);
+    if let Some(line) = lines.get_mut(start.wrapping_sub(1)) {
+        let spliced = splice_highlight(line, offset, text.len(), &highlight);
+        *line = spliced;
+    } else if create && start == lines.len() + 1 {
+        lines.push(splice_highlight("", offset, text.len(), &highlight));
+    }
+}
+
+/// Patchable single-line highlights on both sides (`:176-199`),
+/// before shrinking (T13543: the new side only when the line exists).
+/// Runs before [`shrink_ranges`], so `patch.line` is still the range
+/// start.
+fn highlight_patchable_lines(
+    old_lines: &mut Vec<String>,
+    new_lines: &mut Vec<String>,
+    patch: &ContextPatch,
+    new_impact: usize,
+) {
+    if patch.old_impact != 1 || new_impact != 1 {
+        return;
+    }
+    highlight_line_at(old_lines, patch.line, patch.char, patch.original, true);
+    highlight_line_at(
+        new_lines,
+        patch.line,
+        patch.char,
+        patch.replacement.unwrap_or_default(),
+        false,
+    );
+}
+
+/// Non-patchable single-line highlight on the old side (`:232-240`).
+fn highlight_single_line_old(
+    old_lines: &mut Vec<String>,
+    start: usize,
+    char: usize,
+    original: &str,
+    old_impact: usize,
+) {
+    if old_impact != 1 || original.is_empty() {
+        return;
+    }
+    highlight_line_at(old_lines, start, char, original, true);
 }
 
 /// PHI1782 warning when a message sits past the end of the file.
@@ -3724,10 +3886,11 @@ struct ContextPatch<'a> {
 /// and return the shrunk old/new impacts (adjusting `start`).
 fn context_patch_impacts(
     data_text: &str,
-    old_lines: &[String],
+    old_lines: &mut Vec<String>,
     new_lines: &mut Vec<String>,
     start: &mut usize,
     patch: &ContextPatch,
+    ansi: bool,
 ) -> (usize, usize) {
     let line_map = offset_map(data_text);
     let patch_offset =
@@ -3742,6 +3905,9 @@ fn context_patch_impacts(
     let new_text = String::from_utf8_lossy(&new_data).into_owned();
     *new_lines = split_keep_ends(&new_text);
     let new_impact = replacement_text.bytes().filter(|b| *b == b'\n').count() + 1;
+    if ansi {
+        highlight_patchable_lines(old_lines, new_lines, patch, new_impact);
+    }
     shrink_ranges(old_lines, new_lines, start, patch.old_impact, new_impact)
 }
 
@@ -3994,18 +4160,37 @@ fn render_line(number: Option<usize>, data: &str, chevron: bool, diff: Option<ch
 }
 
 /// `renderResultCode()` for console and summary: the `OKAY` line on
-/// success, else nothing.
-fn render_result_code_okay(result_code: i32) -> String {
-    if result_code == RESULT_OKAY {
-        "   OKAY  No lint messages.\n".to_string()
+/// success, else nothing. TTYs render the green log line
+/// (`PhutilConsoleLogLine::drawView()`, `tsprintf("<bg:green>** %s
+/// **</bg> %s\n", ...)`); non-TTYs keep the stripped rendering.
+fn render_result_code_okay(result_code: i32, ansi: bool) -> String {
+    if result_code != RESULT_OKAY {
+        return String::new();
+    }
+    if ansi {
+        terminal::tsprintf_ansi(
+            "<bg:green>** %s **</bg> %s\n",
+            &[TVal::Text("OKAY"), TVal::Text("No lint messages.")],
+            true,
+        )
+        .expect("fixed tsprintf pattern")
+        .as_str()
+        .to_string()
     } else {
-        String::new()
+        "   OKAY  No lint messages.\n".to_string()
     }
 }
 
 /// Render one result in summary format
 /// (`ArcanistSummaryLintRenderer.php:7-22`).
 pub fn render_summary_result(result: &LintResult) -> Result<String, String> {
+    render_summary_result_with_ansi(result, terminal::ansi_enabled())
+}
+
+/// Render one result in summary format with an explicit ANSI flag.
+/// The format carries no markup, so both modes render byte-identical
+/// text through the console formatter.
+pub fn render_summary_result_with_ansi(result: &LintResult, ansi: bool) -> Result<String, String> {
     let mut out = String::new();
     for message in &result.messages {
         let severity = severity_display_name(&message.severity)?;
@@ -4014,9 +4199,10 @@ pub fn render_summary_result(result: &LintResult) -> Result<String, String> {
         } else {
             message.line.to_string()
         };
-        out.push_str(&format!(
-            "{}:{line}:{severity}: {}\n",
-            result.path, message.name
+        out.push_str(&terminal::console_format(
+            "%s:%s:%s: %s\n",
+            &[&result.path, &line, severity, &message.name],
+            ansi,
         ));
     }
     Ok(out)
@@ -4025,12 +4211,27 @@ pub fn render_summary_result(result: &LintResult) -> Result<String, String> {
 /// Render one result in compiler format
 /// (`ArcanistCompilerLintRenderer.php:7-28`).
 pub fn render_compiler_result(result: &LintResult) -> Result<String, String> {
+    render_compiler_result_with_ansi(result, terminal::ansi_enabled())
+}
+
+/// Render one result in compiler format with an explicit ANSI flag.
+/// The format carries no markup, so both modes render byte-identical
+/// text through the console formatter.
+pub fn render_compiler_result_with_ansi(result: &LintResult, ansi: bool) -> Result<String, String> {
     let mut out = String::new();
     for message in &result.messages {
         let severity = severity_display_name(&message.severity)?;
-        out.push_str(&format!(
-            "{}:{}:{} ({}) {}\n",
-            result.path, message.line, severity, message.code, message.description,
+        let line = message.line.to_string();
+        out.push_str(&terminal::console_format(
+            "%s:%s:%s (%s) %s\n",
+            &[
+                &result.path,
+                &line,
+                severity,
+                &message.code,
+                &message.description,
+            ],
+            ansi,
         ));
     }
     Ok(out)
@@ -4384,7 +4585,8 @@ pub fn run_in_with_input(cwd: &Path, argv: &[String], input: &mut dyn BufRead) -
         }
         ParseOutcome::Args(options) => options,
     };
-    match run_workflow(cwd, &options, input) {
+    let ansi = terminal::ansi_enabled();
+    match run_workflow(cwd, &options, input, ansi) {
         Ok(code) => ExitCode::from(code as u8),
         Err(message) => {
             eprintln!("arc-rs {NAME}: {message}");
@@ -4393,7 +4595,12 @@ pub fn run_in_with_input(cwd: &Path, argv: &[String], input: &mut dyn BufRead) -
     }
 }
 
-fn run_workflow(cwd: &Path, options: &Options, input: &mut dyn BufRead) -> Result<i32, String> {
+fn run_workflow(
+    cwd: &Path,
+    options: &Options,
+    input: &mut dyn BufRead,
+    ansi: bool,
+) -> Result<i32, String> {
     let work = discover_working_copy(cwd)?;
     check_supports(options, work.vcs)?;
     reject_everything_with_paths(options)?;
@@ -4401,8 +4608,8 @@ fn run_workflow(cwd: &Path, options: &Options, input: &mut dyn BufRead) -> Resul
     if engine.is_empty() {
         return Err("No linters to run.".to_string());
     }
-    let mut results = workflow_gather(&work, cwd, options, &engine, input)?;
-    workflow_emit(&work, options, input, &mut results)
+    let mut results = workflow_gather(&work, cwd, options, &engine, input, ansi)?;
+    workflow_emit(&work, options, input, &mut results, ansi)
 }
 
 /// Reject `--everything` combined with explicit paths.
@@ -4421,8 +4628,9 @@ fn workflow_gather(
     options: &Options,
     engine: &Engine,
     input: &mut dyn BufRead,
+    ansi: bool,
 ) -> Result<Vec<LintResult>, String> {
-    let base = workflow_base(work, options, input)?;
+    let base = workflow_base(work, options, input, ansi)?;
     let selection = workflow_selection(work, cwd, options, base.as_deref(), engine)?;
     let messages = workflow_lint_selection(engine, work, &selection)?;
     let minimum = options.severity.as_deref().unwrap_or(DEFAULT_SEVERITY);
@@ -4440,6 +4648,7 @@ fn workflow_base(
     work: &WorkCopy,
     options: &Options,
     input: &mut dyn BufRead,
+    ansi: bool,
 ) -> Result<Option<String>, String> {
     let needs_base = options.rev.is_some() || (options.paths.is_empty() && !options.everything);
     if !needs_base || work.vcs == Vcs::Svn {
@@ -4448,7 +4657,7 @@ fn workflow_base(
     if let Some(rev) = &options.rev {
         return workflow_explicit_base(work, rev).map(Some);
     }
-    workflow_default_base(work, input)
+    workflow_default_base(work, input, ansi)
 }
 
 /// Base for an explicit `--rev` symbol.
@@ -4464,9 +4673,10 @@ fn workflow_explicit_base(work: &WorkCopy, rev: &str) -> Result<String, String> 
 fn workflow_default_base(
     work: &WorkCopy,
     input: &mut dyn BufRead,
+    ansi: bool,
 ) -> Result<Option<String>, String> {
     match work.vcs {
-        Vcs::Git => git_default_base(work, input, &mut |text| print!("{text}")).map(Some),
+        Vcs::Git => git_default_base(work, input, &mut |text| print!("{text}"), ansi).map(Some),
         Vcs::Hg => hg_base_for(work, None).map(Some),
         Vcs::Svn => Ok(None),
     }
@@ -4564,6 +4774,7 @@ fn workflow_emit(
     options: &Options,
     input: &mut dyn BufRead,
     results: &mut [LintResult],
+    ansi: bool,
 ) -> Result<i32, String> {
     let renderer_key = workflow_renderer(options)?;
     let mut sink = if options.outfile.is_some() {
@@ -4572,15 +4783,15 @@ fn workflow_emit(
         Sink::Stdout
     };
     let (wrote_to_disk, all_autofix) =
-        workflow_render(results, renderer_key, options, input, &mut sink)?;
+        workflow_render(results, renderer_key, options, input, &mut sink, ansi)?;
     // `--outfile` lands via temp file plus rename (PHP `TempFile`
     // plus `Filesystem::rename()`), before the amend prompt.
     if let Sink::Buffer(buffer) = &sink {
         flush_outfile(options.outfile.as_deref().unwrap_or_default(), buffer)?;
     }
-    maybe_amend(work, options, wrote_to_disk, all_autofix, input)?;
+    maybe_amend(work, options, wrote_to_disk, all_autofix, input, ansi)?;
     let code = result_code(results);
-    workflow_render_okay(renderer_key, options.outfile.as_deref(), code)?;
+    workflow_render_okay(renderer_key, options.outfile.as_deref(), code, ansi)?;
     Ok(code)
 }
 
@@ -4592,6 +4803,7 @@ fn workflow_render(
     options: &Options,
     input: &mut dyn BufRead,
     sink: &mut Sink,
+    ansi: bool,
 ) -> Result<(bool, bool), String> {
     if renderer_key == RENDERER_XML {
         sink.write(&render_xml_header());
@@ -4608,9 +4820,9 @@ fn workflow_render(
         if !result.is_all_autofix() {
             all_autofix = false;
         }
-        render_workflow_result(result, renderer_key, sink)?;
+        render_workflow_result(result, renderer_key, sink, ansi)?;
         if should_patch && result.is_patchable() {
-            wrote_to_disk |= apply_result_patch(result, prompt_patches, sink, input)?;
+            wrote_to_disk |= apply_result_patch(result, prompt_patches, sink, input, ansi)?;
         }
     }
     if renderer_key == RENDERER_XML {
@@ -4624,12 +4836,13 @@ fn render_workflow_result(
     result: &LintResult,
     renderer_key: &str,
     sink: &mut Sink,
+    ansi: bool,
 ) -> Result<(), String> {
     match renderer_key {
-        RENDERER_CONSOLE => sink.write(&render_console_result(result)?),
+        RENDERER_CONSOLE => sink.write(&render_console_result_with_ansi(result, ansi)?),
         RENDERER_JSON => sink.write(&format!("{}\n", render_json_result(result))),
-        RENDERER_SUMMARY => sink.write(&render_summary_result(result)?),
-        RENDERER_COMPILER => sink.write(&render_compiler_result(result)?),
+        RENDERER_SUMMARY => sink.write(&render_summary_result_with_ansi(result, ansi)?),
+        RENDERER_COMPILER => sink.write(&render_compiler_result_with_ansi(result, ansi)?),
         RENDERER_XML => sink.write(&render_xml_result(result)),
         RENDERER_NONE => {}
         _ => unreachable!("renderer validated above"),
@@ -4639,22 +4852,32 @@ fn render_workflow_result(
 
 /// Apply one result's patch (prompting unless autofix-only or
 /// `--apply-patches`). Returns true when patches reached disk.
+/// The patch-apply prompt (`promptForPatch()`, `:31-48`): the path
+/// is `__underlined__` on TTYs (`tsprintf('__%s__', ...)`), else
+/// plain.
+fn patch_prompt_with_ansi(path: &str, ansi: bool) -> String {
+    if ansi {
+        let underlined = terminal::tsprintf_ansi("__%s__", &[TVal::Text(path)], true)
+            .expect("fixed tsprintf pattern");
+        format!("Apply this patch to {}?", underlined.as_str())
+    } else {
+        format!("Apply this patch to {path}?")
+    }
+}
+
 fn apply_result_patch(
     result: &mut LintResult,
     prompt_patches: bool,
     sink: &mut Sink,
     input: &mut dyn BufRead,
+    ansi: bool,
 ) -> Result<bool, String> {
     let (patched, _) = build_patched_data(&result.data, &result.messages)?;
     let result_all_autofix = result.is_all_autofix();
     let mut apply = true;
     if prompt_patches && !result_all_autofix {
         prompt_for_patch(result, &patched, sink);
-        apply = confirm(
-            &format!("Apply this patch to {}?", result.path),
-            true,
-            input,
-        );
+        apply = confirm(&patch_prompt_with_ansi(&result.path, ansi), true, input);
     }
     if !apply {
         return Ok(false);
@@ -4673,11 +4896,12 @@ fn workflow_render_okay(
     renderer_key: &str,
     outfile: Option<&str>,
     code: i32,
+    ansi: bool,
 ) -> Result<(), String> {
     if !matches!(renderer_key, RENDERER_CONSOLE | RENDERER_SUMMARY) {
         return Ok(());
     }
-    let okay = render_result_code_okay(code);
+    let okay = render_result_code_okay(code, ansi);
     if let Some(out_path) = outfile {
         // `renderResultCode()` appends through the same sink.
         append_outfile(out_path, &okay)?;
@@ -4715,19 +4939,37 @@ fn append_outfile(out_path: &str, text: &str) -> Result<(), String> {
 
 /// Amend HEAD with applied patches
 /// (`ArcanistLintWorkflow.php:238-354`).
+/// The `LINT NOTICE` amend line (`ArcanistLintWorkflow.php`, the
+/// `writeOut("<bg:yellow>** %s **</bg> %s\n", ...)` call): TTYs render
+/// the yellow status line, non-TTYs keep the plain `** LINT NOTICE **`
+/// rendering byte-identical. Includes the trailing newline.
+fn lint_notice_line(ansi: bool) -> String {
+    if ansi {
+        terminal::format_status_message(
+            "yellow",
+            "LINT NOTICE",
+            "Automatically amending HEAD with lint patches.",
+            true,
+        )
+    } else {
+        "** LINT NOTICE ** Automatically amending HEAD with lint patches.\n".to_string()
+    }
+}
+
 fn maybe_amend(
     work: &WorkCopy,
     options: &Options,
     wrote_to_disk: bool,
     all_autofix: bool,
     input: &mut dyn BufRead,
+    ansi: bool,
 ) -> Result<(), String> {
     if !wrote_to_disk || !amend_enabled(work, options)? {
         return Ok(());
     }
     let automatic = options.amend_all || (options.amend_autofixes && all_autofix);
     let amend = if automatic {
-        println!("** LINT NOTICE ** Automatically amending HEAD with lint patches.");
+        print!("{}", lint_notice_line(ansi));
         true
     } else {
         confirm("Amend HEAD with lint patches?", true, input)

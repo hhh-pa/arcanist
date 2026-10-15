@@ -2707,3 +2707,400 @@ fn run_in_reports_success_and_failure() {
         ExitCode::FAILURE
     ));
 }
+
+fn ansi_io() -> Io {
+    let mut io = Io::canned(&[]);
+    io.ansi = true;
+    io
+}
+
+#[test]
+fn status_line_renders_blue_writer() {
+    assert_eq!(
+        status_line("OK", "done", "blue", true),
+        "\x1b[1m\x1b[44m OK \x1b[49m\x1b[m done\n"
+    );
+    assert_eq!(status_line("OK", "done", "blue", false), "** OK ** done\n");
+}
+
+#[test]
+fn out_push_status_with_ansi_writes_stderr() {
+    let mut out = Out::default();
+    out.push_status_with_ansi("OK", "done", "blue", true);
+    assert_eq!(out.stdout, "");
+    assert_eq!(out.stderr, "\x1b[1m\x1b[44m OK \x1b[49m\x1b[m done\n");
+    let mut plain = Out::default();
+    plain.push_status_with_ansi("OK", "done", "blue", false);
+    assert_eq!(plain.stderr, "** OK ** done\n");
+}
+
+#[test]
+fn io_push_status_follows_ansi_flag() {
+    let mut io = ansi_io();
+    io.push_status("OK", "done");
+    assert_eq!(io.out.stderr, "\x1b[1m\x1b[44m OK \x1b[49m\x1b[m done\n");
+    let mut plain = Io::canned(&[]);
+    assert!(!plain.ansi);
+    plain.push_status("OK", "done");
+    assert_eq!(plain.out.stderr, "** OK ** done\n");
+}
+
+#[test]
+fn push_banner_renders_badge() {
+    let mut io = ansi_io();
+    push_banner(&mut io, "HELLO", "body text");
+    assert_eq!(
+        io.out.stdout,
+        "\n\x1b[43m\x1b[1m <!> HELLO \x1b[m\x1b[49m\nbody text\n\n"
+    );
+    let mut plain = Io::canned(&[]);
+    push_banner(&mut plain, "HELLO", "body text");
+    assert_eq!(plain.out.stdout, "\n** HELLO **\nbody text\n\n");
+}
+
+#[test]
+fn push_banner_continued_keeps_single_trailing_newline() {
+    let mut io = ansi_io();
+    push_banner_continued(&mut io, "HELLO", "body text");
+    assert_eq!(
+        io.out.stdout,
+        "\n\x1b[43m\x1b[1m <!> HELLO \x1b[m\x1b[49m\nbody text\n"
+    );
+    let mut plain = Io::canned(&[]);
+    push_banner_continued(&mut plain, "HELLO", "body text");
+    assert_eq!(plain.out.stdout, "\n** HELLO **\nbody text\n");
+}
+
+#[test]
+fn push_banner_mode_unwrapped_keeps_long_body_verbatim_on_tty() {
+    let body = "word ".repeat(20);
+    let mut io = ansi_io();
+    push_banner_mode(&mut io, "HOLD CHANGES", &body, false);
+    assert_eq!(
+        io.out.stdout,
+        format!("\n\x1b[43m\x1b[1m <!> HOLD CHANGES \x1b[m\x1b[49m\n{body}\n\n")
+    );
+    let mut plain = Io::canned(&[]);
+    push_banner_mode(&mut plain, "HOLD CHANGES", &body, false);
+    assert_eq!(
+        plain.out.stdout,
+        format!("\n** HOLD CHANGES **\n{}\n\n", console_wrap(&body, 0, true))
+    );
+}
+
+#[test]
+fn render_hint_with_ansi_badges_question() {
+    assert_eq!(
+        render_hint_with_ansi("Use X.", true),
+        "\x1b[42m\x1b[1m  ?  \x1b[m\x1b[49m Use X."
+    );
+    assert_eq!(render_hint_with_ansi("Use X.", false), "  ?   Use X.");
+}
+
+#[test]
+fn ref_view_render_with_ansi_styles_badge_and_name() {
+    let view = RefView {
+        object_name: Some("D123".to_string()),
+        title: "Work".to_string(),
+        ..Default::default()
+    };
+    assert_eq!(
+        view.render_with_ansi(true),
+        "\x1b[46m\x1b[1m  *  \x1b[m\x1b[49m \x1b[1mD123\x1b[m Work\n"
+    );
+    assert_eq!(view.render_with_ansi(false), "  *   D123 Work\n");
+}
+
+#[test]
+fn ref_view_render_with_ansi_underlines_uri() {
+    let view = RefView {
+        uri: Some("https://phab.example/D123".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        view.render_with_ansi(true),
+        "\x1b[46m\x1b[1m  *  \x1b[m\x1b[49m \n\
+         \x1b[46m\x1b[1m :// \x1b[m\x1b[49m   \x1b[4mhttps://phab.example/D123\x1b[m\n"
+    );
+    assert_eq!(
+        view.render_with_ansi(false),
+        "  *   \n ://    https://phab.example/D123\n"
+    );
+}
+
+#[test]
+fn push_prompt_query_styles_marker() {
+    let mut io = ansi_io();
+    push_prompt_query(&mut io, "Land?");
+    assert_eq!(
+        io.out.stdout,
+        "\x1b[1m\x1b[46m >>> \x1b[49m\x1b[m Land? [y/N/?] "
+    );
+    let mut plain = Io::canned(&[]);
+    push_prompt_query(&mut plain, "Land?");
+    assert_eq!(plain.out.stdout, ">>> Land? [y/N/?] ");
+}
+
+#[test]
+fn push_saved_notice_closes_paren_on_tty() {
+    let mut io = ansi_io();
+    push_saved_notice(&mut io, "arc.land.confirm", "Land?", "y");
+    assert_eq!(
+        io.out.stdout,
+        "\x1b[46m\x1b[1m >>> \x1b[m\x1b[49m Land? \x1b[1m<y>\x1b[m\n\
+         \x1b[46m\x1b[1m >>> \x1b[m\x1b[49m \
+         (Using saved response to prompt \"arc.land.confirm\".)\n\n"
+    );
+    let mut plain = Io::canned(&[]);
+    push_saved_notice(&mut plain, "arc.land.confirm", "Land?", "y");
+    assert_eq!(
+        plain.out.stdout,
+        ">>> Land? <y>\n>>> (Using saved response to prompt \"arc.land.confirm\".\n\n"
+    );
+}
+
+#[test]
+fn push_save_notice_uses_green_writer() {
+    let mut io = ansi_io();
+    push_save_notice(&mut io, "k", "y");
+    assert_eq!(
+        io.out.stdout,
+        "\x1b[42m\x1b[1m SAVE PROMPT \x1b[m\x1b[49m Saving response \"y\" to prompt \"k\".\n"
+    );
+    let mut plain = Io::canned(&[]);
+    push_save_notice(&mut plain, "k", "y");
+    assert_eq!(
+        plain.out.stdout,
+        "** SAVE PROMPT ** Saving response \"y\" to prompt \"k\".\n"
+    );
+}
+
+#[test]
+fn push_prompt_help_renders_header_and_hints() {
+    let mut io = ansi_io();
+    push_prompt_help(&mut io, "arc.land.confirm");
+    assert_eq!(
+        io.out.stdout,
+        "\n\x1b[42m\x1b[1m PROMPT \x1b[m\x1b[49m \x1b[1marc.land.confirm\x1b[m\n\n\
+         Confirms that the correct changes have been selected to land.\n\n\
+         The default response to this prompt is \"n\".\n\n\
+         \x1b[42m\x1b[1m  ?  \x1b[m\x1b[49m \
+         Use \"*\" after a response to save it in user configuration.\n\
+         \x1b[42m\x1b[1m  ?  \x1b[m\x1b[49m \
+         Use \"!\" after a response to save it in working copy configuration.\n\
+         \x1b[42m\x1b[1m  ?  \x1b[m\x1b[49m \
+         Run \"arc help prompts\" for detailed help on configuring responses.\n\n"
+    );
+    let mut plain = Io::canned(&[]);
+    push_prompt_help(&mut plain, "arc.land.confirm");
+    assert_eq!(
+        plain.out.stdout,
+        "\n** PROMPT ** **arc.land.confirm**\n\n\
+         Confirms that the correct changes have been selected to land.\n\n\
+         The default response to this prompt is \"n\".\n\n\
+         \x20\x20?   Use \"*\" after a response to save it in user configuration.\n\
+         \x20\x20?   Use \"!\" after a response to save it in working copy configuration.\n\
+         \x20\x20?   Run \"arc help prompts\" for detailed help on configuring responses.\n\n"
+    );
+}
+
+#[test]
+fn select_strategy_with_ansi_reports_default() {
+    let (strategy, line) = select_strategy_with_ansi(None, None, true).unwrap();
+    assert_eq!(strategy, Strategy::Squash);
+    assert_eq!(
+        line,
+        "\x1b[1m\x1b[44m STRATEGY \x1b[49m\x1b[m \
+         Merging with \"squash\" strategy, the default strategy.\n"
+    );
+    let (_, plain) = select_strategy_with_ansi(None, None, false).unwrap();
+    assert_eq!(
+        plain,
+        "** STRATEGY ** Merging with \"squash\" strategy, the default strategy.\n"
+    );
+}
+
+#[test]
+fn format_skip_note_with_ansi_carries_no_markup() {
+    let expected =
+        "Note: revision info unavailable (boom); landing without revision association.\n";
+    assert_eq!(format_skip_note_with_ansi("boom", true), expected);
+    assert_eq!(format_skip_note_with_ansi("boom", false), expected);
+    assert!(!format_skip_note_with_ansi("boom", true).contains('\x1b'));
+}
+
+#[test]
+fn format_gate_preview_with_ansi_lists_findings_plain() {
+    assert_eq!(
+        format_gate_preview_with_ansi(&[], true),
+        "Pre-land checks passed.\n"
+    );
+    let findings = [land_checks::GateFinding {
+        prompt: "arc.land.confirm",
+        title: "T".to_string(),
+        query: "Q".to_string(),
+        count: 1,
+    }];
+    let expected = "Pre-land checks:\n  [arc.land.confirm] T: Q\n";
+    assert_eq!(format_gate_preview_with_ansi(&findings, true), expected);
+    assert_eq!(format_gate_preview_with_ansi(&findings, false), expected);
+}
+
+#[test]
+fn commit_set_line_highlights_implicit_on_tty() {
+    assert_eq!(
+        commit_set_line("abc", "subj", true, true),
+        "       ! \x1b[43m abc \x1b[49m subj\n"
+    );
+    assert_eq!(
+        commit_set_line("abc", "subj", true, false),
+        "       ! abc subj\n"
+    );
+    assert_eq!(
+        commit_set_line("abc", "subj", false, true),
+        "          abc  subj\n"
+    );
+    assert_eq!(
+        commit_set_line("abc", "subj", false, false),
+        "          abc  subj\n"
+    );
+}
+
+#[test]
+fn render_commit_set_with_ansi_styles_implicit() {
+    let mut commit = land_commit("abcdef123456", &[], "Do work");
+    commit.is_implicit = true;
+    let set = CommitSet {
+        revision: None,
+        commits: vec![0],
+        is_pick: false,
+    };
+    assert_eq!(
+        render_commit_set_with_ansi(&set, &[commit], &|hash| hash[..7].to_string(), true),
+        "\n  (no associated revision)\n       ! \x1b[43m abcdef1 \x1b[49m Do work\n"
+    );
+    let mut commit = land_commit("abcdef123456", &[], "Do work");
+    commit.is_implicit = true;
+    assert_eq!(
+        render_commit_set_with_ansi(&set, &[commit], &|hash| hash[..7].to_string(), false),
+        "\n  (no associated revision)\n       ! abcdef1 Do work\n"
+    );
+}
+
+#[test]
+fn shell_line_bolds_command_on_tty() {
+    assert_eq!(
+        shell_line("git push", true),
+        "    \x1b[1m$ git push\x1b[m\n"
+    );
+    assert_eq!(shell_line("git push", false), "    $ git push\n");
+}
+
+#[test]
+fn status_line_renders_warning_and_success_colors() {
+    assert_eq!(
+        status_line("TARGET", "fetching", "yellow", true),
+        "\x1b[1m\x1b[43m TARGET \x1b[49m\x1b[m fetching\n"
+    );
+    assert_eq!(
+        status_line("DONE", "Landed changes.", "green", true),
+        "\x1b[1m\x1b[42m DONE \x1b[49m\x1b[m Landed changes.\n"
+    );
+    assert_eq!(
+        status_line("TARGET", "fetching", "yellow", false),
+        "** TARGET ** fetching\n"
+    );
+    assert_eq!(
+        status_line("DONE", "Landed changes.", "green", false),
+        "** DONE ** Landed changes.\n"
+    );
+}
+
+#[test]
+fn io_push_status_with_ansi_colors_warnings() {
+    let mut io = ansi_io();
+    io.push_status_with_ansi("P4 MODE", "perforce", "yellow", io.ansi);
+    assert_eq!(
+        io.out.stderr,
+        "\x1b[1m\x1b[43m P4 MODE \x1b[49m\x1b[m perforce\n"
+    );
+    let mut plain = Io::canned(&[]);
+    plain.push_status_with_ansi("P4 MODE", "perforce", "yellow", plain.ansi);
+    assert_eq!(plain.out.stderr, "** P4 MODE ** perforce\n");
+}
+
+#[test]
+fn push_builds_banner_styles_title_on_tty() {
+    let mut io = ansi_io();
+    push_builds_banner(
+        &mut io,
+        "BUILD FAILURES",
+        "1 revision(s) have build failures:",
+    );
+    assert_eq!(
+        io.out.stdout,
+        "\x1b[43m\x1b[1m <!> BUILD FAILURES \x1b[m\x1b[49m\n1 revision(s) have build \
+         failures:\n\n"
+    );
+    let mut plain = Io::canned(&[]);
+    push_builds_banner(
+        &mut plain,
+        "BUILD FAILURES",
+        "1 revision(s) have build failures:",
+    );
+    assert_eq!(
+        plain.out.stdout,
+        "** BUILD FAILURES **\n1 revision(s) have build failures:\n\n"
+    );
+}
+
+#[test]
+fn push_state_banner_renders_working_copy_line() {
+    let files = vec!["a.txt".to_string()];
+    let lists = vec![("Added", files.as_slice())];
+    // `Path::display` uses the platform separator (`\tmp\wc` on Windows).
+    let dir_text = Path::new("/tmp/wc").display().to_string();
+    let mut io = ansi_io();
+    push_state_banner(&mut io, "TITLE", "message", Path::new("/tmp/wc"), &lists);
+    assert_eq!(
+        io.out.stdout,
+        format!(
+            "\n\x1b[43m\x1b[1m <!> TITLE \x1b[m\x1b[49m\nmessage\n\n    Working Copy: \
+             {dir_text}\n\nAdded\n\n    a.txt\n\n"
+        )
+    );
+    let mut plain = Io::canned(&[]);
+    push_state_banner(&mut plain, "TITLE", "message", Path::new("/tmp/wc"), &lists);
+    assert_eq!(
+        plain.out.stdout,
+        format!("\n** TITLE **\nmessage\n\n    Working Copy: {dir_text}\n\nAdded\n\n    a.txt\n\n")
+    );
+}
+
+#[test]
+fn render_file_lists_renders_titles_and_paths_in_both_modes() {
+    let added = vec!["a.txt".to_string()];
+    let empty: Vec<String> = Vec::new();
+    let removed = vec!["gone.txt".to_string()];
+    let lists = vec![
+        ("Added", added.as_slice()),
+        ("Empty", empty.as_slice()),
+        ("Removed", removed.as_slice()),
+    ];
+    let expected = "Added\n\n    a.txt\n\nRemoved\n\n    gone.txt\n\n";
+    assert_eq!(render_file_lists(&lists, true), expected);
+    assert_eq!(render_file_lists(&lists, false), expected);
+}
+
+#[test]
+fn console_wrap_at_hint_indent_matches_phutil_wrap() {
+    // Hand-traced `phutil_console_wrap($text, 6, false)`: width 72, the
+    // first line keeps no prefix and trims to "  ?", continuation
+    // lines gain six spaces.
+    let text = format!("  ?   {} {}", "a".repeat(66), "b".repeat(10));
+    assert_eq!(
+        console_wrap(&text, 6, false),
+        format!("  ?\n      {}\n      {}", "a".repeat(66), "b".repeat(10))
+    );
+    assert_eq!(console_wrap("  ?   Use X.", 6, false), "  ?   Use X.");
+}

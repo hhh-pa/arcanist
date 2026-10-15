@@ -698,10 +698,10 @@ fn result_code_prefers_errors_then_warnings() {
     // Applied patches do not count.
     assert_eq!(result_code(&[result("error", true)]), RESULT_OKAY);
     assert_eq!(
-        render_result_code_okay(RESULT_OKAY),
+        render_result_code_okay(RESULT_OKAY, false),
         "   OKAY  No lint messages.\n"
     );
-    assert_eq!(render_result_code_okay(RESULT_WARNINGS), "");
+    assert_eq!(render_result_code_okay(RESULT_WARNINGS, false), "");
 }
 
 // -( renderers )---------------------------------------------------------
@@ -1648,4 +1648,161 @@ fn confirm_honors_answers_and_defaults() {
     // Garbage re-prompts until an answer arrives.
     assert!(ask("huh\nY\n", false));
     assert!(!ask("huh\n", false));
+}
+
+fn error_message(code: &str, name: &str, description: &str) -> LintMessage {
+    LintMessage {
+        path: "f.c".to_string(),
+        line: 0,
+        col: 0,
+        code: code.to_string(),
+        severity: SEVERITY_ERROR.to_string(),
+        name: name.to_string(),
+        description: description.to_string(),
+        original: None,
+        replacement: None,
+    }
+}
+
+#[test]
+fn console_result_with_ansi_badges_severity() {
+    let result = console_result("f.c", b"x\n", vec![error_message("E1", "Bad", "Fix it.")]);
+    assert_eq!(
+        render_console_result_with_ansi(&result, true).unwrap(),
+        "\x1b[1m>>>\x1b[m Lint for \x1b[4mf.c\x1b[m:\n\n\n  \x1b[1m\x1b[41m Error \
+         \x1b[49m\x1b[m (E1) \x1b[4mBad\x1b[m\n    Fix it.\n"
+    );
+    assert_eq!(
+        render_console_result_with_ansi(&result, false).unwrap(),
+        ">>> Lint for f.c:\n\n\n   Error  (E1) Bad\n    Fix it.\n"
+    );
+    let warned = console_result("f.c", b"x\n", vec![warn123(0, 0, None, None)]);
+    let tty = render_console_result_with_ansi(&warned, true).unwrap();
+    assert!(tty.contains("\x1b[1m\x1b[43m Warning \x1b[49m\x1b[m"));
+    assert_eq!(
+        render_console_result_with_ansi(&warned, false).unwrap(),
+        render_console_result(&warned).unwrap()
+    );
+}
+
+#[test]
+fn summary_and_compiler_with_ansi_match_plain() {
+    let result = console_result(
+        "src/a.php",
+        b"ok\n",
+        vec![error_message("E1", "Bad", "Fix it.")],
+    );
+    assert_eq!(
+        render_summary_result_with_ansi(&result, true).unwrap(),
+        "src/a.php::Error: Bad\n"
+    );
+    assert_eq!(
+        render_summary_result_with_ansi(&result, false).unwrap(),
+        "src/a.php::Error: Bad\n"
+    );
+    assert_eq!(
+        render_compiler_result_with_ansi(&result, true).unwrap(),
+        "src/a.php:0:Error (E1) Fix it.\n"
+    );
+    assert_eq!(
+        render_compiler_result_with_ansi(&result, false).unwrap(),
+        "src/a.php:0:Error (E1) Fix it.\n"
+    );
+}
+
+#[test]
+fn result_code_okay_with_ansi_uses_green_writer() {
+    assert_eq!(
+        render_result_code_okay(RESULT_OKAY, true),
+        "\x1b[42m\x1b[1m OKAY \x1b[m\x1b[49m No lint messages.\n"
+    );
+    assert_eq!(
+        render_result_code_okay(RESULT_OKAY, false),
+        "   OKAY  No lint messages.\n"
+    );
+    assert_eq!(render_result_code_okay(RESULT_WARNINGS, true), "");
+}
+
+#[test]
+fn lint_notice_line_uses_yellow_writer() {
+    assert_eq!(
+        lint_notice_line(true),
+        "\x1b[43m\x1b[1m LINT NOTICE \x1b[m\x1b[49m Automatically amending HEAD with lint \
+         patches.\n"
+    );
+    assert_eq!(
+        lint_notice_line(false),
+        "** LINT NOTICE ** Automatically amending HEAD with lint patches.\n"
+    );
+}
+
+#[test]
+fn patch_prompt_with_ansi_underlines_path() {
+    assert_eq!(
+        patch_prompt_with_ansi("src/a.php", true),
+        "Apply this patch to \x1b[4msrc/a.php\x1b[m?"
+    );
+    assert_eq!(
+        patch_prompt_with_ansi("src/a.php", false),
+        "Apply this patch to src/a.php?"
+    );
+}
+
+#[test]
+fn commit_range_prompt_with_ansi_badges_header() {
+    let ask = |ansi: bool| {
+        let mut out = String::new();
+        let mut cursor = std::io::BufReader::new("origin/master\n".as_bytes());
+        let mut sink = |text: &str| out.push_str(text);
+        let relative = prompt_default_relative_commit(&mut cursor, &mut sink, ansi);
+        (relative, out)
+    };
+    let (relative, tty) = ask(true);
+    assert_eq!(relative, "origin/master");
+    assert!(tty.starts_with("\x1b[42m\x1b[1m Select a Default Commit Range \x1b[m\x1b[49m\n\n"));
+    for line in tty.lines() {
+        assert!(line.len() <= 78, "tty line overflows: {line:?}");
+    }
+    let (relative, plain) = ask(false);
+    assert_eq!(relative, "origin/master");
+    assert!(plain.starts_with("** Select a Default Commit Range **\n\n"));
+    assert!(plain.contains("Facebook's historic git-svn workflow"));
+}
+
+#[test]
+fn context_with_ansi_highlights_single_line_change() {
+    let message = LintMessage {
+        path: "f.c".to_string(),
+        line: 1,
+        col: 7,
+        code: "E1".to_string(),
+        severity: SEVERITY_ERROR.to_string(),
+        name: "Bad".to_string(),
+        description: "Fix it.".to_string(),
+        original: Some("world".to_string()),
+        replacement: Some("there".to_string()),
+    };
+    let tty = render_context_with_ansi(&message, b"hello world\nbye\n", true);
+    assert!(tty.contains(">>> -      1 hello \x1b[7mworld\x1b[m\n"));
+    assert!(tty.contains("        +        hello \x1b[7mthere\x1b[m\n"));
+    let plain = render_context_with_ansi(&message, b"hello world\nbye\n", false);
+    assert!(!plain.contains('\x1b'));
+    assert_eq!(plain, render_context(&message, b"hello world\nbye\n"));
+}
+
+#[test]
+fn context_with_ansi_skips_multiline_highlight() {
+    let message = LintMessage {
+        path: "f.c".to_string(),
+        line: 1,
+        col: 1,
+        code: "E1".to_string(),
+        severity: SEVERITY_ERROR.to_string(),
+        name: "Bad".to_string(),
+        description: "Fix it.".to_string(),
+        original: Some("one\ntwo".to_string()),
+        replacement: None,
+    };
+    let tty = render_context_with_ansi(&message, b"one\ntwo\n", true);
+    assert!(!tty.contains('\x1b'));
 }

@@ -13,9 +13,12 @@
 //! collect into the `ref` wildcard, `--bool=value` splices the value back
 //! as the next token, and `--help` short-circuits.
 //!
-//! Console rendering follows the diff port: `tsprintf` markup (`**bold**`,
-//! `<bg:...>`, `%!`/`%W`/`%?`/`%>` blocks) renders as plain text, and log
-//! statuses render as `** LABEL ** message`. Statuses go to stderr (like
+//! Console rendering goes through the shared terminal styling
+//! helpers with a tty-gated ANSI flag (`Io::ansi`, set once by the
+//! entry points): on TTYs, `tsprintf` markup (`**bold**`, `<bg:...>`,
+//! `%!`/`%W`/`%?`/`%>` blocks) and log-engine colors render like PHP;
+//! otherwise `tsprintf` markup renders as plain text and log statuses
+//! render as `** LABEL ** message`. Statuses go to stderr (like
 //! `ArcanistLogEngine::writeBytes()`); banners, commit lists, and prompts
 //! go to stdout (like PHP `echo`).
 //!
@@ -108,6 +111,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use arc_rs::{config, diff_submit, git, hg, land_checks};
+
+use crate::terminal::{self, TVal};
 
 /// Subcommand name, matching `arc land`.
 pub const NAME: &str = "land";
@@ -443,13 +448,31 @@ impl Out {
     /// One log line (`** LABEL ** message`), to stderr
     /// (`ArcanistLogEngine::writeMessage()`, `:30-40`, colors stripped).
     pub fn push_status(&mut self, label: &str, message: &str) {
-        self.push_err(&format!("** {label} ** {message}\n"));
+        self.push_status_with_ansi(label, message, "blue", terminal::ansi_enabled());
+    }
+
+    /// One log line with an explicit writer color and ANSI flag, to
+    /// stderr. TTYs render `tsprintf("**<bg:color> %s </bg>** %s\n",
+    /// ...)` like PHP `writeMessage()`; non-TTYs keep the stripped
+    /// `** LABEL ** message` rendering byte-identical.
+    pub fn push_status_with_ansi(&mut self, label: &str, message: &str, color: &str, ansi: bool) {
+        self.push_err(&status_line(label, message, color, ansi));
     }
 
     /// True when both streams are empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.stdout.is_empty() && self.stderr.is_empty()
+    }
+}
+
+/// One `** LABEL ** message` status line (see
+/// [`Out::push_status_with_ansi`]).
+fn status_line(label: &str, message: &str, color: &str, ansi: bool) -> String {
+    if ansi {
+        terminal::format_log(color, label, message, true)
+    } else {
+        format!("** {label} ** {message}\n")
     }
 }
 
@@ -477,6 +500,12 @@ pub struct Io {
     pub patch_stdin: Option<String>,
     /// Persists `*`/`!` prompt answers to configuration files, when set.
     pub config_writer: Option<ConfigWriter>,
+    /// True when console output may carry ANSI styling. Set once from
+    /// `terminal::ansi_enabled()` by the `run_in`/`execute` entry
+    /// points and threaded down to every render site; tests set it
+    /// explicitly (`false` keeps the historical plain rendering
+    /// byte-identical).
+    pub ansi: bool,
 }
 
 /// Configuration source scope holding saved prompt answers
@@ -572,9 +601,16 @@ impl Io {
         }
     }
 
-    /// One log line, to stderr.
+    /// One log line, to stderr (the `writeStatus` blue writer).
     pub fn push_status(&mut self, label: &str, message: &str) {
-        self.push_err(&format!("** {label} ** {message}\n"));
+        self.push_status_with_ansi(label, message, "blue", self.ansi);
+    }
+
+    /// One log line with an explicit writer color and ANSI flag, to
+    /// stderr (see [`Out::push_status_with_ansi`]), echoing live when
+    /// enabled.
+    pub fn push_status_with_ansi(&mut self, label: &str, message: &str, color: &str, ansi: bool) {
+        self.push_err(&status_line(label, message, color, ansi));
     }
 
     /// Read one answer line, without the trailing newline.
@@ -600,9 +636,6 @@ impl Io {
     }
 }
 
-/// Console wrap width (`phutil_console_wrap()`, `src/console/format.php:105`).
-const WRAP_WIDTH: usize = 78;
-
 /// Soft-wrap text for console display
 /// (`phutil_console_wrap()`, `src/console/format.php:102-191`).
 ///
@@ -610,105 +643,9 @@ const WRAP_WIDTH: usize = 78;
 /// newlines and ANSI color escapes (which do not count toward the width).
 /// Every emitted line but optionally the first gains `indent` spaces.
 /// Lines without a usable break (long words) overflow, like PHP.
+/// Delegates to the shared [`terminal::console_wrap`] port.
 pub fn console_wrap(text: &str, indent: usize, with_prefix: bool) -> String {
-    let width = WRAP_WIDTH.saturating_sub(indent);
-    let chars: Vec<char> = text.chars().collect();
-    let mut lines: Vec<Vec<char>> = Vec::new();
-    let mut line: Vec<char> = Vec::new();
-    let mut wrap = WrapState::default();
-    let mut index = 0;
-    while index < chars.len() {
-        if chars[index] == '\x1b' {
-            index = consume_escape(&chars, index, &mut line);
-            continue;
-        }
-        line.push(chars[index]);
-        wrap.advanced();
-        wrap.maybe_break(width, &mut line, &mut lines);
-        if chars[index] == ' ' {
-            wrap.mark_break(line.len());
-        }
-        if chars[index] == '\n' {
-            lines.push(std::mem::take(&mut line));
-            wrap = WrapState::default();
-        }
-        index += 1;
-    }
-    if !line.is_empty() {
-        lines.push(line);
-    }
-    prefix_wrapped_lines(&lines, indent, with_prefix)
-}
-
-/// Live line state for [`console_wrap`].
-#[derive(Debug, Default)]
-struct WrapState {
-    break_pos: Option<usize>,
-    len_after_break: usize,
-    line_len: usize,
-}
-
-impl WrapState {
-    /// Count one more character on the line (`:135-136`).
-    fn advanced(&mut self) {
-        self.line_len += 1;
-        self.len_after_break += 1;
-    }
-
-    /// Record a break after a space (`:154-157`).
-    fn mark_break(&mut self, pos: usize) {
-        self.break_pos = Some(pos);
-        self.len_after_break = 0;
-    }
-
-    /// Break the line at the last space when past `width` (`:138-152`).
-    fn maybe_break(&mut self, width: usize, line: &mut Vec<char>, lines: &mut Vec<Vec<char>>) {
-        if self.line_len <= width {
-            return;
-        }
-        let Some(pos) = self.break_pos else {
-            return;
-        };
-        let mut slice: Vec<char> = line[..pos].to_vec();
-        while slice.last() == Some(&' ') {
-            slice.pop();
-        }
-        slice.push('\n');
-        lines.push(slice);
-        *line = line[pos..].to_vec();
-        self.line_len = self.len_after_break;
-        self.len_after_break = 0;
-        self.break_pos = None;
-    }
-}
-
-/// Consume an ANSI escape (`ESC ... m`) into `line` without counting it
-/// (`src/console/format.php:123-131`). Returns the next index to visit.
-fn consume_escape(chars: &[char], start: usize, line: &mut Vec<char>) -> usize {
-    let mut index = start;
-    while index < chars.len() {
-        line.push(chars[index]);
-        let done = chars[index] == 'm';
-        index += 1;
-        if done {
-            break;
-        }
-    }
-    index
-}
-
-/// Indent wrapped lines: every line but optionally the first gains
-/// `indent` spaces (`src/console/format.php:175-190`).
-fn prefix_wrapped_lines(lines: &[Vec<char>], indent: usize, with_prefix: bool) -> String {
-    let prefix: String = " ".repeat(indent);
-    let mut out = String::new();
-    for (index, line) in lines.iter().enumerate() {
-        if index != 0 || with_prefix {
-            out.push_str(&prefix);
-        }
-        out.extend(line.iter());
-    }
-    out
+    terminal::console_wrap(text, indent, with_prefix)
 }
 
 /// Default truncation terminator: U+2026 HORIZONTAL ELLIPSIS
@@ -900,31 +837,71 @@ fn is_wide_codepoint(code: u32) -> bool {
 /// Render one banner block to stdout: a blank line, a `** TITLE **` line,
 /// the wrapped body, and a trailing blank line.
 ///
-/// Ports `echo tsprintf("\n%!\n%W\n\n", $title, $body)` with markup
-/// stripped (see the module docs); the body wraps at 78 columns like
-/// `%W` (`src/xsprintf/tsprintf.php:41-45`).
+/// Ports `echo tsprintf("\n%!\n%W\n\n", $title, $body)`; TTYs render
+/// the `%!`/`%W` markup, non-TTYs keep the stripped rendering.
 pub fn push_banner(io: &mut Io, title: &str, body: &str) {
-    io.push_out(&format!(
-        "\n** {title} **\n{}\n\n",
-        console_wrap(body, 0, true)
-    ));
+    push_banner_mode(io, title, body, true);
+}
+
+/// Banner core: `tsprintf("\n%!\n%BODY\n\n", ...)` on TTYs, else the
+/// plain `** TITLE **` rendering. `wrap_body` selects `%W` (most
+/// banners) vs `%s` (`HOLD CHANGES`, which PHP prints unwrapped,
+/// `ArcanistGitLandEngine.php:907-910`).
+fn push_banner_mode(io: &mut Io, title: &str, body: &str, wrap_body: bool) {
+    if io.ansi {
+        let pattern = if wrap_body {
+            "\n%!\n%W\n\n"
+        } else {
+            "\n%!\n%s\n\n"
+        };
+        let text = terminal::tsprintf_ansi(pattern, &[TVal::Text(title), TVal::Text(body)], true)
+            .expect("fixed tsprintf pattern");
+        io.push_out(text.as_str());
+    } else {
+        io.push_out(&format!(
+            "\n** {title} **\n{}\n\n",
+            console_wrap(body, 0, true)
+        ));
+    }
 }
 
 /// Render a banner with a single trailing newline
 /// (`echo tsprintf("\n%!\n%W\n", ...)`), for banners PHP follows with
 /// more output on the next line (`IMPLICIT COMMITS`,
 /// `ArcanistLandEngine.php:735-736`; `DISCARDING ANCESTORS`, `:1553-1558`).
+/// TTYs render the markup, non-TTYs keep the stripped rendering.
 pub fn push_banner_continued(io: &mut Io, title: &str, body: &str) {
-    io.push_out(&format!(
-        "\n** {title} **\n{}\n",
-        console_wrap(body, 0, true)
-    ));
+    if io.ansi {
+        let text =
+            terminal::tsprintf_ansi("\n%!\n%W\n", &[TVal::Text(title), TVal::Text(body)], true)
+                .expect("fixed tsprintf pattern");
+        io.push_out(text.as_str());
+    } else {
+        io.push_out(&format!(
+            "\n** {title} **\n{}\n",
+            console_wrap(body, 0, true)
+        ));
+    }
 }
 
 /// Render one `%?` hint line: the `?` marker plus wrapped text
 /// (`src/xsprintf/tsprintf.php:51-56`). Callers add the trailing newline.
 pub fn render_hint(text: &str) -> String {
-    console_wrap(&format!("  ?   {text}"), 6, false)
+    render_hint_with_ansi(text, terminal::ansi_enabled())
+}
+
+/// Render one `%?` hint line with an explicit ANSI flag: TTYs render
+/// the green `?` badge, non-TTYs keep the stripped rendering
+/// byte-identical. Callers add the trailing newline.
+pub fn render_hint_with_ansi(text: &str, ansi: bool) -> String {
+    if ansi {
+        terminal::tsprintf_ansi("%?", &[TVal::Text(text)], true)
+            .expect("fixed tsprintf pattern")
+            .as_str()
+            .to_string()
+    } else {
+        console_wrap(&format!("  ?   {text}"), 6, false)
+    }
 }
 
 /// One `ArcanistRefView` node (`src/ref/ArcanistRefView.php`): an object
@@ -956,9 +933,22 @@ impl RefView {
     /// stripped like the `>>>` prompt marker.
     #[must_use]
     pub fn render(&self) -> String {
-        let mut out = String::new();
-        self.render_at(0, &mut out);
-        out
+        self.render_with_ansi(terminal::ansi_enabled())
+    }
+
+    /// Render with an explicit ANSI flag: TTYs render the `tsprintf`
+    /// markup (`**bold**`, `<bg:cyan>`, `__underline__`) like
+    /// `ArcanistRefView::newLines()`; non-TTYs keep the stripped
+    /// rendering byte-identical.
+    #[must_use]
+    pub fn render_with_ansi(&self, ansi: bool) -> String {
+        if ansi {
+            to_terminal_view(self).render(0, REF_VIEW_TERMINAL_WIDTH, true)
+        } else {
+            let mut out = String::new();
+            self.render_at(0, &mut out);
+            out
+        }
     }
 
     /// Render at `indent` levels (`newLines($indent)`, `:69-144`).
@@ -988,6 +978,17 @@ impl RefView {
         for child in &self.children {
             child.render_at(indent + 1, out);
         }
+    }
+}
+
+/// Convert to the shared terminal ref view for TTY rendering.
+fn to_terminal_view(view: &RefView) -> terminal::RefView {
+    terminal::RefView {
+        object_name: view.object_name.clone(),
+        title: Some(view.title.clone()),
+        uri: view.uri.clone(),
+        lines: view.lines.clone(),
+        children: view.children.iter().map(to_terminal_view).collect(),
     }
 }
 
@@ -1089,12 +1090,29 @@ fn next_prompt_candidate(
     match saved_response.take() {
         Some(saved) => Ok((saved, true)),
         None => {
-            io.push_out(&format!(">>> {query} [y/N/?] "));
+            push_prompt_query(io, query);
             let Some(raw) = io.read_answer() else {
                 return Err(ABORT.to_string());
             };
             Ok((raw.trim().to_string(), false))
         }
+    }
+}
+
+/// One `>>>` prompt attempt line (`ArcanistPrompt.php:111-115`):
+/// `tsprintf('**<bg:cyan> %s </bg>** %s %s ', '>>>', $query, $options)`
+/// on TTYs, else the plain `>>>` rendering.
+fn push_prompt_query(io: &mut Io, query: &str) {
+    if io.ansi {
+        let text = terminal::tsprintf_ansi(
+            "**<bg:cyan> %s </bg>** %s %s ",
+            &[TVal::Text(">>>"), TVal::Text(query), TVal::Text("[y/N/?]")],
+            true,
+        )
+        .expect("fixed tsprintf pattern");
+        io.push_out(text.as_str());
+    } else {
+        io.push_out(&format!(">>> {query} [y/N/?] "));
     }
 }
 
@@ -1151,14 +1169,59 @@ fn finish_prompt(
         save_prompt_response(io, key, response, scope)?;
     }
     if is_saved {
-        io.push_out(&format!(
-            ">>> {query} <{response}>\n>>> (Using saved response to prompt \"{key}\".\n\n"
-        ));
+        push_saved_notice(io, key, query, response);
     }
     if result {
         Ok(())
     } else {
         Err(ABORT.to_string())
+    }
+}
+
+/// The saved-response notice (`ArcanistPrompt.php:238-249`):
+/// `tsprintf("<bg:cyan>** %s **</bg> %s **<%s>**\n<bg:cyan>** %s
+/// **</bg> (%s)\n\n", ...)` on TTYs, else the plain `>>>` rendering
+/// (which omits the closing parenthesis, unlike PHP).
+fn push_saved_notice(io: &mut Io, key: &str, query: &str, response: &str) {
+    if io.ansi {
+        let saved = format!("Using saved response to prompt \"{key}\".");
+        let text = terminal::tsprintf_ansi(
+            "<bg:cyan>** %s **</bg> %s **<%s>**\n<bg:cyan>** %s **</bg> (%s)\n\n",
+            &[
+                TVal::Text(">>>"),
+                TVal::Text(query),
+                TVal::Text(response),
+                TVal::Text(">>>"),
+                TVal::Text(&saved),
+            ],
+            true,
+        )
+        .expect("fixed tsprintf pattern");
+        io.push_out(text.as_str());
+    } else {
+        io.push_out(&format!(
+            ">>> {query} <{response}>\n>>> (Using saved response to prompt \"{key}\".\n\n"
+        ));
+    }
+}
+
+/// The `SAVE PROMPT` notice (`ArcanistPrompt.php:282-288`):
+/// `tsprintf("<bg:green>** %s **</bg> %s\n", ...)` on TTYs, else the
+/// plain `** SAVE PROMPT **` rendering.
+fn push_save_notice(io: &mut Io, key: &str, response: &str) {
+    if io.ansi {
+        let message = format!("Saving response \"{response}\" to prompt \"{key}\".");
+        let text = terminal::tsprintf_ansi(
+            "<bg:green>** %s **</bg> %s\n",
+            &[TVal::Text("SAVE PROMPT"), TVal::Text(&message)],
+            true,
+        )
+        .expect("fixed tsprintf pattern");
+        io.push_out(text.as_str());
+    } else {
+        io.push_out(&format!(
+            "** SAVE PROMPT ** Saving response \"{response}\" to prompt \"{key}\".\n"
+        ));
     }
 }
 
@@ -1173,9 +1236,7 @@ fn save_prompt_response(
     response: &str,
     scope: PromptScope,
 ) -> Result<(), String> {
-    io.push_out(&format!(
-        "** SAVE PROMPT ** Saving response \"{response}\" to prompt \"{key}\".\n"
-    ));
+    push_save_notice(io, key, response);
     let path = io.config_writer.as_ref().and_then(|writer| match scope {
         PromptScope::User => writer.user_path.clone(),
         _ => writer.local_path.clone(),
@@ -1289,16 +1350,32 @@ fn write_sibling_temp(path: &Path, content: &[u8]) -> Result<(), String> {
 /// save/config hints render as `%?` lines (`%?`, `tsprintf.php:51-56`).
 fn push_prompt_help(io: &mut Io, key: &str) {
     let description = land_checks::prompt_description(key).unwrap_or("");
-    io.push_out(&format!(
-        "\n** PROMPT ** **{key}**\n\n{description}\n\nThe default response to this prompt is \
-         \"n\".\n\n"
-    ));
+    let ansi = io.ansi;
+    if ansi {
+        let text = terminal::tsprintf_ansi(
+            "\n<bg:green>** %s **</bg> **%s**\n\n%s\n\n%s\n\n",
+            &[
+                TVal::Text("PROMPT"),
+                TVal::Text(key),
+                TVal::Text(description),
+                TVal::Text("The default response to this prompt is \"n\"."),
+            ],
+            true,
+        )
+        .expect("fixed tsprintf pattern");
+        io.push_out(text.as_str());
+    } else {
+        io.push_out(&format!(
+            "\n** PROMPT ** **{key}**\n\n{description}\n\nThe default response to this prompt is \
+             \"n\".\n\n"
+        ));
+    }
     for hint in [
         "Use \"*\" after a response to save it in user configuration.",
         "Use \"!\" after a response to save it in working copy configuration.",
         "Run \"arc help prompts\" for detailed help on configuring responses.",
     ] {
-        io.push_out(&render_hint(hint));
+        io.push_out(&render_hint_with_ansi(hint, ansi));
         io.push_out("\n");
     }
     io.push_out("\n");
@@ -1598,6 +1675,16 @@ pub fn select_strategy(
     argument: Option<&str>,
     config: Option<&str>,
 ) -> Result<(Strategy, String), String> {
+    select_strategy_with_ansi(argument, config, terminal::ansi_enabled())
+}
+
+/// Select the merge strategy with an explicit ANSI flag for the
+/// `STRATEGY` status line (the `writeStatus` blue writer).
+pub fn select_strategy_with_ansi(
+    argument: Option<&str>,
+    config: Option<&str>,
+    ansi: bool,
+) -> Result<(Strategy, String), String> {
     const SUPPORTED: &str = "merge, squash";
     if let Some(strategy) = argument {
         let parsed = parse_strategy_name(strategy).ok_or_else(|| {
@@ -1606,8 +1693,11 @@ pub fn select_strategy(
                  Supported merge strategies are: {SUPPORTED}."
             )
         })?;
-        let line = format!(
-            "** STRATEGY ** Merging with \"{strategy}\" strategy, selected with \"--strategy\".\n"
+        let line = status_line(
+            "STRATEGY",
+            &format!("Merging with \"{strategy}\" strategy, selected with \"--strategy\"."),
+            "blue",
+            ansi,
         );
         return Ok((parsed, line));
     }
@@ -1618,15 +1708,24 @@ pub fn select_strategy(
                  is unknown. Supported merge strategies are: {SUPPORTED}."
             )
         })?;
-        let line = format!(
-            "** STRATEGY ** Merging with \"{strategy}\" strategy, configured with \
-             \"arc.land.strategy\".\n"
+        let line = status_line(
+            "STRATEGY",
+            &format!(
+                "Merging with \"{strategy}\" strategy, configured with \"arc.land.strategy\"."
+            ),
+            "blue",
+            ansi,
         );
         return Ok((parsed, line));
     }
     Ok((
         Strategy::Squash,
-        "** STRATEGY ** Merging with \"squash\" strategy, the default strategy.\n".to_string(),
+        status_line(
+            "STRATEGY",
+            "Merging with \"squash\" strategy, the default strategy.",
+            "blue",
+            ansi,
+        ),
     ))
 }
 
@@ -1673,8 +1772,11 @@ fn validate_options(options: &Options, dir: &Path, io: &mut Io) -> Result<Valida
     let strategy_config = arcconfig_value(dir, "arc.land.strategy")
         .as_ref()
         .and_then(parse_string_config);
-    let (strategy, line) =
-        select_strategy(options.strategy.as_deref(), strategy_config.as_deref())?;
+    let (strategy, line) = select_strategy_with_ansi(
+        options.strategy.as_deref(),
+        strategy_config.as_deref(),
+        io.ansi,
+    )?;
     io.push_err(&line);
     if options.pick && strategy != Strategy::Squash {
         return Err("You can not \"--pick\" changes under the \"merge\" strategy.".to_string());
@@ -1728,7 +1830,18 @@ pub fn client_for_dir(
 /// Note printed when Conduit is unavailable and revision discovery is
 /// skipped (a port extension; PHP requires Conduit).
 pub fn format_skip_note(reason: &str) -> String {
-    format!("Note: revision info unavailable ({reason}); landing without revision association.\n")
+    format_skip_note_with_ansi(reason, terminal::ansi_enabled())
+}
+
+/// Format the Conduit-unavailable note with an explicit ANSI flag.
+/// The note carries no markup, so both modes render byte-identical
+/// text through the console formatter.
+pub fn format_skip_note_with_ansi(reason: &str, ansi: bool) -> String {
+    terminal::console_format(
+        "Note: revision info unavailable (%s); landing without revision association.\n",
+        &[reason],
+        ansi,
+    )
 }
 
 /// Load revision rows for `symbol` via `differential.revision.search`.
@@ -2245,21 +2358,33 @@ pub fn load_gate_findings(
 }
 
 /// One gate finding as an indented line.
-fn format_finding_line(finding: &land_checks::GateFinding) -> String {
-    format!(
-        "  [{}] {}: {}\n",
-        finding.prompt, finding.title, finding.query
+fn format_finding_line(finding: &land_checks::GateFinding, ansi: bool) -> String {
+    terminal::console_format(
+        "  [%s] %s: %s\n",
+        &[
+            finding.prompt,
+            finding.title.as_str(),
+            finding.query.as_str(),
+        ],
+        ansi,
     )
 }
 
 /// Advisory gate report for `--preview`: a pass line or listed findings.
 pub fn format_gate_preview(findings: &[land_checks::GateFinding]) -> String {
+    format_gate_preview_with_ansi(findings, terminal::ansi_enabled())
+}
+
+/// Advisory gate report with an explicit ANSI flag. The report
+/// carries no markup, so both modes render byte-identical text
+/// through the console formatter.
+pub fn format_gate_preview_with_ansi(findings: &[land_checks::GateFinding], ansi: bool) -> String {
     if findings.is_empty() {
         return "Pre-land checks passed.\n".to_string();
     }
     let mut out = "Pre-land checks:\n".to_string();
     for finding in findings {
-        out.push_str(&format_finding_line(finding));
+        out.push_str(&format_finding_line(finding, ansi));
     }
     out
 }
@@ -2496,21 +2621,27 @@ pub fn confirm_commit_count(
     push_banner(io, "LARGE WORKING SET", &message);
     const SHOW: usize = 5;
     for commit in commits.iter().take(SHOW) {
-        io.push_out(&format!(
-            "  {} {}\n",
-            display_hash(&commit.hash),
-            display_summary(&commit.summary)
+        let hash = display_hash(&commit.hash);
+        let summary = display_summary(&commit.summary);
+        io.push_out(&terminal::console_format(
+            "  %s %s\n",
+            &[&hash, &summary],
+            io.ansi,
         ));
     }
-    io.push_out(&format!(
-        "  < ... {} more commits ... >\n",
-        count - SHOW * 2
+    let more = (count - SHOW * 2).to_string();
+    io.push_out(&terminal::console_format(
+        "  < ... %s more commits ... >\n",
+        &[&more],
+        io.ansi,
     ));
     for commit in commits.iter().skip(count - SHOW) {
-        io.push_out(&format!(
-            "  {} {}\n",
-            display_hash(&commit.hash),
-            display_summary(&commit.summary)
+        let hash = display_hash(&commit.hash);
+        let summary = display_summary(&commit.summary);
+        io.push_out(&terminal::console_format(
+            "  %s %s\n",
+            &[&hash, &summary],
+            io.ansi,
         ));
     }
     let query = format!("Land {count} commit(s)?");
@@ -2729,7 +2860,7 @@ fn reject_ambiguous_commits(io: &mut Io, commits: &[LandCommit]) -> Result<(), S
         );
         push_banner(io, "AMBIGUOUS REVISION", &message);
         for related in &commit.related {
-            io.push_out(&revision_ref_view(related).render());
+            io.push_out(&revision_ref_view(related).render_with_ansi(io.ansi));
         }
         io.push_out("\n");
         return Err(format!(
@@ -3121,9 +3252,11 @@ pub fn git_select_onto_remote(
         ));
     }
     if perforce {
-        io.push_status(
+        io.push_status_with_ansi(
             "P4 MODE",
             "Operating in Git/Perforce mode after selecting a Perforce remote.",
+            "yellow",
+            io.ansi,
         );
         let squash = options
             .strategy
@@ -3250,23 +3383,27 @@ pub fn git_select_onto_refs(
             continue;
         }
         if let Some(cycle) = path.get_cycle() {
-            io.push_status(
+            io.push_status_with_ansi(
                 "LOCAL CYCLE",
                 &format!(
                     "Local branch \"{symbol}\" tracks an upstream, but following it leads to a \
                      local cycle; ignoring branch upstream."
                 ),
+                "yellow",
+                io.ansi,
             );
-            io.push_status("LOCAL CYCLE", &cycle.join(" -> "));
+            io.push_status_with_ansi("LOCAL CYCLE", &cycle.join(" -> "), "yellow", io.ansi);
             continue;
         }
         if !path.is_connected_to_remote() {
-            io.push_status(
+            io.push_status_with_ansi(
                 "NO PATH TO REMOTE",
                 &format!(
                     "Local branch \"{symbol}\" tracks an upstream, but there is no path to a \
                      remote; ignoring branch upstream."
                 ),
+                "yellow",
+                io.ansi,
             );
             continue;
         }
@@ -3362,14 +3499,19 @@ pub fn git_confirm_onto_refs(
         ),
     );
     for name in &new_markers {
-        io.push_out(&marker_ref_view(&format!("Branch \"{name}\""), "", "").render());
+        io.push_out(
+            &marker_ref_view(&format!("Branch \"{name}\""), "", "").render_with_ansi(io.ansi),
+        );
     }
     io.push_out("\n");
     if hold {
-        io.push_out(&render_hint(&format!(
-            "You are using \"--hold\", so execution will stop before the {count} branche(s) are \
-             actually created. You will be given instructions to create the branches."
-        )));
+        io.push_out(&render_hint_with_ansi(
+            &format!(
+                "You are using \"--hold\", so execution will stop before the {count} branche(s) \
+                 are actually created. You will be given instructions to create the branches."
+            ),
+            io.ansi,
+        ));
         io.push_out("\n");
     }
     let query = format!("Create {count} new branche(s) in the remote?");
@@ -3579,12 +3721,14 @@ fn git_fetch_target(
     if git::output(dir, &["rev-parse", "--verify", &full_ref])
         .is_ok_and(|out| !out.status.success())
     {
-        io.push_status(
+        io.push_status_with_ansi(
             "TARGET",
             &format!(
                 "No local copy of ref \"{name}\" in remote \"{remote}\" exists, attempting \
                  fetch..."
             ),
+            "yellow",
+            io.ansi,
         );
         git_fetch_quiet(dir, remote, name);
         if git::output(dir, &["rev-parse", "--verify", &full_ref])
@@ -4056,8 +4200,9 @@ fn git_merge_conflict(
     };
     push_banner(io, "MERGE CONFLICT", &message);
     if !incremental {
-        io.push_out(&render_hint(
+        io.push_out(&render_hint_with_ansi(
             "Use \"--incremental\" to merge and push changes one by one.",
+            io.ansi,
         ));
         io.push_out("\n\n");
     }
@@ -4252,10 +4397,8 @@ pub fn git_prune_branches(
                 "CLEANUP",
                 &format!("Cleaning up branch \"{branch}\". To recover, run:"),
             );
-            io.push_out(&format!(
-                "\n    $ git checkout -b {branch} {}\n\n",
-                git::display_hash(&hash)
-            ));
+            let recover = format!("git checkout -b {branch} {}", git::display_hash(&hash));
+            io.push_out(&format!("\n{}\n", shell_line(&recover, io.ansi)));
             git::output(dir, &["branch", "-D", "--", &branch]).ok();
             deleted.push(branch);
         }
@@ -4306,7 +4449,7 @@ pub fn git_cascade_state(
         {
             git::output(dir, &["rebase", "--abort"]).ok();
             git::output(dir, &["reset", "--hard", "HEAD", "--"]).ok();
-            io.push_status(
+            io.push_status_with_ansi(
                 "REBASE CONFLICT",
                 &format!(
                     "Branch \"{branch}\" does not rebase cleanly from \"{}\" onto \"{}\", \
@@ -4314,6 +4457,8 @@ pub fn git_cascade_state(
                     git::display_hash(old),
                     git::display_hash(rebase_target)
                 ),
+                "yellow",
+                io.ansi,
             );
         }
     }
@@ -4368,12 +4513,14 @@ fn git_reconcile_pull_branches(
     for branch in update_branches {
         let path = git::get_path_to_upstream(dir, branch)?;
         if path.get_cycle().is_some() {
-            io.push_status(
+            io.push_status_with_ansi(
                 "LOCAL CYCLE",
                 &format!(
                     "Local branch \"{branch}\" tracks an upstream but following it leads to a \
                      local cycle, ignoring branch."
                 ),
+                "yellow",
+                io.ansi,
             );
             continue;
         }
@@ -4547,7 +4694,7 @@ pub fn git_hold_text(
     } else {
         "Holding changes locally, they have not been pushed."
     };
-    push_banner(io, "HOLD CHANGES", message);
+    push_banner_mode(io, "HOLD CHANGES", message, false);
     let command = if perforce {
         format!("git p4 submit -M --commit {into_commit} --")
     } else {
@@ -4555,15 +4702,17 @@ pub fn git_hold_text(
         format!("git push -- {onto_remote} {}", refspecs.join(" "))
     };
     io.push_out("To push changes manually, run this command:\n\n");
-    io.push_out(&format!("    $ {command}\n\n"));
+    io.push_out(&format!("{}\n", shell_line(&command, io.ansi)));
     if !restore.is_empty() {
-        io.push_out(&format!(
-            "To go back to how things were before you ran \"arc land\", run these {} \
+        let count = restore.len().to_string();
+        io.push_out(&terminal::console_format(
+            "To go back to how things were before you ran \"arc land\", run these %s \
              command(s):\n\n",
-            restore.len()
+            &[&count],
+            io.ansi,
         ));
         for command in restore {
-            io.push_out(&format!("    $ {command}\n"));
+            io.push_out(&shell_line(command, io.ansi));
         }
         io.push_out("\n");
     }
@@ -4736,7 +4885,7 @@ fn hg_ambiguous_symbol(io: &mut Io, symbol: &str, marker_type: &str, hits: usize
         _ => format!("Marker \"{symbol}\""),
     };
     for _ in 0..hits {
-        io.push_out(&marker_ref_view(&display, "", "").render());
+        io.push_out(&marker_ref_view(&display, "", "").render_with_ansi(io.ansi));
     }
     io.push_out("\n");
     format!("Symbol \"{symbol}\" is ambiguous.")
@@ -4910,7 +5059,7 @@ pub fn hg_confirm_onto_refs_with(
              branches were selected:",
         );
         for branch in &branches {
-            io.push_out(&hg_branch_marker_view_with(dir, hg_cmd, branch).render());
+            io.push_out(&hg_branch_marker_view_with(dir, hg_cmd, branch).render_with_ansi(io.ansi));
         }
         io.push_out("\n");
         return Err(
@@ -4932,14 +5081,20 @@ pub fn hg_confirm_onto_refs_with(
             ),
         );
         for name in &new_markers {
-            io.push_out(&marker_ref_view(&format!("Bookmark \"{name}\""), "", "").render());
+            io.push_out(
+                &marker_ref_view(&format!("Bookmark \"{name}\""), "", "").render_with_ansi(io.ansi),
+            );
         }
         io.push_out("\n");
         if hold {
-            io.push_out(&render_hint(&format!(
-                "You are using \"--hold\", so execution will stop before the {count} bookmark(s) \
-                 are actually created. You will be given instructions to create the bookmarks."
-            )));
+            io.push_out(&render_hint_with_ansi(
+                &format!(
+                    "You are using \"--hold\", so execution will stop before the {count} \
+                     bookmark(s) are actually created. You will be given instructions to create \
+                     the bookmarks."
+                ),
+                io.ansi,
+            ));
             io.push_out("\n");
         }
         let query = format!("Create {count} new remote bookmark(s)?");
@@ -5473,10 +5628,11 @@ pub fn hg_hold_text(
     into_commit: &str,
     restore: &[String],
 ) {
-    push_banner(
+    push_banner_mode(
         io,
         "HOLD CHANGES",
         "Holding changes locally, they have not been pushed.",
+        false,
     );
     let mut commands: Vec<String> = Vec::new();
     for bookmark in bookmarks {
@@ -5494,22 +5650,26 @@ pub fn hg_hold_text(
         push.push_str(&format!(" -- {onto_remote}"));
         commands.push(push);
     }
-    io.push_out(&format!(
-        "To push changes manually, run these {} command(s):\n\n",
-        commands.len()
+    let count = commands.len().to_string();
+    io.push_out(&terminal::console_format(
+        "To push changes manually, run these %s command(s):\n\n",
+        &[&count],
+        io.ansi,
     ));
     for command in &commands {
-        io.push_out(&format!("    $ {command}\n"));
+        io.push_out(&shell_line(command, io.ansi));
     }
     io.push_out("\n");
     if !restore.is_empty() {
-        io.push_out(&format!(
-            "To go back to how things were before you ran \"arc land\", run these {} \
+        let count = restore.len().to_string();
+        io.push_out(&terminal::console_format(
+            "To go back to how things were before you ran \"arc land\", run these %s \
              command(s):\n\n",
-            restore.len()
+            &[&count],
+            io.ansi,
         ));
         for command in restore {
-            io.push_out(&format!("    $ {command}\n"));
+            io.push_out(&shell_line(command, io.ansi));
         }
         io.push_out("\n");
     }
@@ -5529,11 +5689,23 @@ pub fn render_commit_set(
     commits: &[LandCommit],
     display_hash: &dyn Fn(&str) -> String,
 ) -> String {
+    render_commit_set_with_ansi(set, commits, display_hash, terminal::ansi_enabled())
+}
+
+/// Render one commit set with an explicit ANSI flag: TTYs render the
+/// ref-view markup and the yellow `<bg:yellow>` implicit-commit
+/// highlight; non-TTYs keep the stripped rendering byte-identical.
+pub fn render_commit_set_with_ansi(
+    set: &CommitSet,
+    commits: &[LandCommit],
+    display_hash: &dyn Fn(&str) -> String,
+    ansi: bool,
+) -> String {
     let mut text = String::new();
     match &set.revision {
         Some(revision) => {
             text.push('\n');
-            text.push_str(&revision_ref_view(revision).render());
+            text.push_str(&revision_ref_view(revision).render_with_ansi(ansi));
         }
         None => text.push_str("\n  (no associated revision)\n"),
     }
@@ -5541,13 +5713,31 @@ pub fn render_commit_set(
         let commit = &commits[*index];
         let short = display_hash(&commit.hash);
         let summary = display_summary(&commit.summary);
-        if commit.is_implicit {
-            text.push_str(&format!("       ! {short} {summary}\n"));
-        } else {
-            text.push_str(&format!("          {short}  {summary}\n"));
-        }
+        text.push_str(&commit_set_line(&short, &summary, commit.is_implicit, ansi));
     }
     text
+}
+
+/// One `printCommitSet()` commit line (`:784-795`): implicit commits
+/// carry the yellow `<bg:yellow>` highlight on TTYs, else the plain
+/// rendering.
+fn commit_set_line(short: &str, summary: &str, implicit: bool, ansi: bool) -> String {
+    if !ansi {
+        return if implicit {
+            format!("       ! {short} {summary}\n")
+        } else {
+            format!("          {short}  {summary}\n")
+        };
+    }
+    let pattern = if implicit {
+        "       ! <bg:yellow> %s </bg> %s\n"
+    } else {
+        "          %s  %s\n"
+    };
+    terminal::tsprintf_ansi(pattern, &[TVal::Text(short), TVal::Text(summary)], true)
+        .expect("fixed tsprintf pattern")
+        .as_str()
+        .to_string()
 }
 
 /// Confirm implicitly-associated commits
@@ -5579,7 +5769,12 @@ pub fn confirm_implicit_sets(
         ),
     );
     for set in &implicit {
-        io.push_out(&render_commit_set(set, commits, display_hash));
+        io.push_out(&render_commit_set_with_ansi(
+            set,
+            commits,
+            display_hash,
+            io.ansi,
+        ));
     }
     prompt_for_key(
         io,
@@ -5701,11 +5896,12 @@ fn confirm_unauthored(
         // hardpoint the port shows the author PHID (see the module docs).
         let mut view = revision_ref_view(revision);
         view.lines.push(format!("Author: {}", revision.author_phid));
-        io.push_out(&view.render());
+        io.push_out(&view.render_with_ansi(io.ansi));
     }
     io.push_out("\n");
-    io.push_out(&render_hint(
+    io.push_out(&render_hint_with_ansi(
         "Use \"Commandeer\" in the web interface to become the author of a revision.",
+        io.ansi,
     ));
     io.push_out("\n");
     prompt_for_key(
@@ -5770,7 +5966,7 @@ fn confirm_status_group(
         if group == StatusGroup::NotAccepted {
             view.lines.push(format!("Status: {}", revision.status_name));
         }
-        io.push_out(&view.render());
+        io.push_out(&view.render_with_ansi(io.ansi));
     }
     prompt_for_key(io, finding.prompt, &finding.query)
 }
@@ -5806,7 +6002,7 @@ fn confirm_open_parents(
                 ));
             }
         }
-        io.push_out(&view.render());
+        io.push_out(&view.render_with_ansi(io.ansi));
     }
     prompt_for_key(io, finding.prompt, &finding.query)
 }
@@ -5852,6 +6048,23 @@ fn group_problem_builds<'a>(
 /// `:675-680`); each affected revision renders as a nested
 /// revision > buildable > builds tree (`:691-712`). Groups for
 /// revisions that are not landing are skipped.
+/// The builds-gate banner (`ArcanistLandEngine.php:668-683`):
+/// `tsprintf("%!\n%s\n", ...)` plus the blank line PHP echoes next,
+/// on TTYs; else the plain `** TITLE **` rendering.
+fn push_builds_banner(io: &mut Io, title: &str, message: &str) {
+    if io.ansi {
+        let text = terminal::tsprintf_ansi(
+            "%!\n%s\n\n",
+            &[TVal::Text(title), TVal::Text(message)],
+            true,
+        )
+        .expect("fixed tsprintf pattern");
+        io.push_out(text.as_str());
+    } else {
+        io.push_out(&format!("** {title} **\n{message}\n\n"));
+    }
+}
+
 fn confirm_builds(
     io: &mut Io,
     revisions: &[land_checks::RevisionView],
@@ -5873,7 +6086,7 @@ fn confirm_builds(
             format!("{count} revision(s) have ongoing builds:"),
         )
     };
-    io.push_out(&format!("** {title} **\n{message}\n\n"));
+    push_builds_banner(io, title, &message);
     for group in group_problem_builds(builds, &verdict.problems) {
         let Some(revision) = revisions
             .iter()
@@ -5889,7 +6102,7 @@ fn confirm_builds(
                 .push(build_ref_view(build.build_id, &build.build_name));
         }
         view.children.push(buildable);
-        io.push_out(&view.render());
+        io.push_out(&view.render_with_ansi(io.ansi));
         io.push_out("\n");
     }
     prompt_for_key(io, finding.prompt, &finding.query)
@@ -5924,7 +6137,12 @@ fn print_landing(
 ) {
     io.push_status("LANDING", "These changes will land:");
     for set in sets {
-        io.push_out(&render_commit_set(set, commits, display_hash));
+        io.push_out(&render_commit_set_with_ansi(
+            set,
+            commits,
+            display_hash,
+            io.ansi,
+        ));
     }
 }
 
@@ -5957,13 +6175,14 @@ fn execute_engine(
         online,
         &hash_display_for(vcs),
     )?;
+    let ansi = io.ansi;
     sets = filter_commit_sets(
         io,
         sets,
         &prep.commits,
         squash,
         options.pick,
-        &render_for(vcs, &prep.commits),
+        &render_for(vcs, &prep.commits, ansi),
     );
     if !options.preview {
         confirm_implicit_sets(
@@ -6072,7 +6291,7 @@ fn into_display_string(vcs: Vcs, into_commit: Option<&str>) -> Option<String> {
 /// Print the offline skip note when Conduit is unreachable.
 fn announce_offline_fallback(io: &mut Io, client: &Result<arc_rs::conduit::Client, String>) {
     if let Err(reason) = client {
-        io.push_err(&format_skip_note(reason));
+        io.push_err(&format_skip_note_with_ansi(reason, io.ansi));
     }
 }
 
@@ -6104,12 +6323,37 @@ fn hash_display_for(vcs: Vcs) -> Box<dyn Fn(&str) -> String> {
 }
 
 /// Set renderer per VCS (borrows the commit list).
-fn render_for<'a>(vcs: Vcs, commits: &'a [LandCommit]) -> Box<dyn Fn(&CommitSet) -> String + 'a> {
+fn render_for<'a>(
+    vcs: Vcs,
+    commits: &'a [LandCommit],
+    ansi: bool,
+) -> Box<dyn Fn(&CommitSet) -> String + 'a> {
     match vcs {
-        Vcs::Git => Box::new(|set| {
-            render_commit_set(set, commits, &|hash| git::display_hash(hash).to_string())
+        Vcs::Git => Box::new(move |set| {
+            render_commit_set_with_ansi(
+                set,
+                commits,
+                &|hash| git::display_hash(hash).to_string(),
+                ansi,
+            )
         }),
-        Vcs::Hg => Box::new(|set| render_commit_set(set, commits, &display_hash_12)),
+        Vcs::Hg => {
+            Box::new(move |set| render_commit_set_with_ansi(set, commits, &display_hash_12, ansi))
+        }
+    }
+}
+
+/// One `%> ` shell-command line (`tsprintf("%>", ...)`, e.g. the
+/// recovery commands, `ArcanistGitLandEngine.php:914-916`): bold
+/// `$ ...` on TTYs, else the plain rendering.
+fn shell_line(command: &str, ansi: bool) -> String {
+    if ansi {
+        terminal::tsprintf_ansi("%>", &[TVal::Text(command)], true)
+            .expect("fixed tsprintf pattern")
+            .as_str()
+            .to_string()
+    } else {
+        format!("    $ {command}\n")
     }
 }
 
@@ -6427,18 +6671,40 @@ fn push_state_banner(
     dir: &Path,
     lists: &[(&str, &[String])],
 ) {
-    io.push_out(&format!(
-        "\n** {title} **\n{}\n\n    Working Copy: {}\n\n{}",
-        console_wrap(message, 0, true),
-        dir.display(),
-        render_file_lists(lists),
-    ));
+    if io.ansi {
+        let dir_text = dir.display().to_string();
+        let working_copy = terminal::tsprintf_ansi(
+            "    %s: %s\n",
+            &[TVal::Text("Working Copy"), TVal::Text(&dir_text)],
+            true,
+        )
+        .expect("fixed tsprintf pattern");
+        let text = terminal::tsprintf_ansi(
+            "\n%!\n%W\n\n%s\n",
+            &[
+                TVal::Text(title),
+                TVal::Text(message),
+                TVal::Terminal(&working_copy),
+            ],
+            true,
+        )
+        .expect("fixed tsprintf pattern");
+        io.push_out(text.as_str());
+        io.push_out(&render_file_lists(lists, true));
+    } else {
+        io.push_out(&format!(
+            "\n** {title} **\n{}\n\n    Working Copy: {}\n\n{}",
+            console_wrap(message, 0, true),
+            dir.display(),
+            render_file_lists(lists, false),
+        ));
+    }
 }
 
 /// Render changed-file lists (`printFileLists()`, `:372-411`): each
 /// non-empty list prints its title, a blank line, and its indented
 /// paths; lists are blank-line separated with a trailing blank line.
-fn render_file_lists(lists: &[(&str, &[String])]) -> String {
+fn render_file_lists(lists: &[(&str, &[String])], ansi: bool) -> String {
     let mut out = String::new();
     let mut first = true;
     for (title, paths) in lists {
@@ -6449,10 +6715,9 @@ fn render_file_lists(lists: &[(&str, &[String])]) -> String {
             out.push('\n');
         }
         first = false;
-        out.push_str(title);
-        out.push_str("\n\n");
+        out.push_str(&terminal::console_format("%s\n\n", &[title], ansi));
         for path in *paths {
-            out.push_str(&format!("    {path}\n"));
+            out.push_str(&terminal::console_format("    %s\n", &[path], ansi));
         }
     }
     out.push('\n');
@@ -6492,9 +6757,14 @@ fn confirm_dirty_externals(io: &mut Io, externals: &[String]) -> Result<(), Stri
         "Some external changes (\"{}\") have uncommitted changes:",
         externals.len()
     );
-    io.push_out(&format!("{}\n\n", console_wrap(&message, 0, true)));
+    let wrapped = console_wrap(&message, 0, true);
+    io.push_out(&terminal::console_format("%s\n\n", &[&wrapped], io.ansi));
     for external in externals {
-        io.push_out(&format!("      - {external}\n"));
+        io.push_out(&terminal::console_format(
+            "      - %s\n",
+            &[external],
+            io.ansi,
+        ));
     }
     io.push_out("\n");
     let prompt = "These external changes have uncommitted changes, but the external changes will \
@@ -6533,7 +6803,7 @@ fn push_uncommitted_banner(
             ("Uncommitted Changes", &lists.uncommitted),
         ],
     );
-    io.push_out(&render_hint(ignore_hint));
+    io.push_out(&render_hint_with_ansi(ignore_hint, io.ansi));
     io.push_out("\n");
     true
 }
@@ -7063,7 +7333,7 @@ fn git_finish_landing(
             deleted,
         )?;
     }
-    io.push_status("DONE", "Landed changes.");
+    io.push_status_with_ansi("DONE", "Landed changes.", "green", io.ansi);
     Ok(())
 }
 
@@ -7276,7 +7546,7 @@ fn land_hg_inner_with(
         state.local_bookmark.as_deref(),
     );
     discard_local_state_hg_with(dir, hg_cmd, io, state)?;
-    io.push_status("DONE", "Landed changes.");
+    io.push_status_with_ansi("DONE", "Landed changes.", "green", io.ansi);
     Ok(())
 }
 
@@ -7316,12 +7586,16 @@ pub fn execute_with_io(dir: &Path, argv: &[String], io: &mut Io) -> Result<Out, 
 
 /// Run the workflow rooted at `dir` with buffered IO.
 pub fn execute(dir: &Path, argv: &[String]) -> Result<Out, String> {
-    execute_with_io(dir, argv, &mut Io::buffered())
+    let mut io = Io::buffered();
+    io.ansi = terminal::ansi_enabled();
+    execute_with_io(dir, argv, &mut io)
 }
 
 /// Run the workflow rooted at `dir` with live console IO.
 pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
-    match execute_with_io(dir, argv, &mut Io::live()) {
+    let mut io = Io::live();
+    io.ansi = terminal::ansi_enabled();
+    match execute_with_io(dir, argv, &mut io) {
         Ok(_) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("arc-rs land: {message}");

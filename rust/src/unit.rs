@@ -44,6 +44,8 @@ use arc_rs::unit_engine::{
 };
 use arc_rs::{config, unit_csharp, unit_nose, unit_phpunit, unit_phutil, unit_pytest, unit_xunit};
 
+use crate::terminal;
+
 pub const NAME: &str = "unit";
 
 /// Engines `--engine` accepts: `cargo` plus the PHP engine class names
@@ -2379,11 +2381,105 @@ pub fn format_time(seconds: f64) -> String {
 }
 
 /// Render one result, mirroring `renderUnitResult`
-/// (`ArcanistUnitConsoleRenderer.php:5-30`) in plain text: `  <LABEL>[ time]
-/// name`, plus `userData` for non-passing results. Labels match
-/// `getFormattedResult` (lines 32-54) without console colors.
+/// (`ArcanistUnitConsoleRenderer.php:5-30`): `  <LABEL>[ time] name`,
+/// plus `userData` for non-passing results. TTYs render the
+/// `getFormattedResult` badge (lines 32-54) and the `formatTestDuration`
+/// bucket color (lines 56-81); non-TTYs keep the historical plain
+/// rendering byte-identical.
 #[must_use]
 pub fn render_unit_result(result: &EngineUnitResult) -> String {
+    render_unit_result_with_ansi(result, terminal::ansi_enabled())
+}
+
+/// Render one result with an explicit ANSI flag (see
+/// [`render_unit_result`]).
+#[must_use]
+pub fn render_unit_result_with_ansi(result: &EngineUnitResult, ansi: bool) -> String {
+    if ansi {
+        render_unit_result_tty(result)
+    } else {
+        render_unit_result_plain(result)
+    }
+}
+
+/// One `getFormattedResult` badge (lines 32-54) with an explicit ANSI
+/// flag: `<bg:green/red/yellow>** LABEL **</bg>` like PHP. Like PHP,
+/// the stripped form keeps the badge padding, so only the TTY branch
+/// uses this; the plain rendering uses bare labels instead.
+fn format_result_label(code: &str, ansi: bool) -> String {
+    let (color, label) = match code {
+        arc_rs::unit_engine::RESULT_PASS => ("green", "PASS"),
+        arc_rs::unit_engine::RESULT_FAIL => ("red", "FAIL"),
+        arc_rs::unit_engine::RESULT_SKIP => ("yellow", "SKIP"),
+        arc_rs::unit_engine::RESULT_BROKEN => ("red", "BROKEN"),
+        arc_rs::unit_engine::RESULT_UNSOUND => ("yellow", "UNSOUND"),
+        _ => return String::new(),
+    };
+    terminal::console_format(&format!("<bg:{color}>** %s **</bg>"), &[label], ansi)
+}
+
+/// The fast-run star: U+2605, or `*` on Windows consoles (lines 60-64).
+fn duration_star() -> &'static str {
+    if cfg!(windows) { "*" } else { "\u{2605}" }
+}
+
+/// One `formatTestDuration` value (lines 56-81) with an explicit ANSI
+/// flag: at most 50ms green with a star, 200ms green, 500ms yellow,
+/// else red, each with two trailing spaces (one after the star).
+fn format_test_duration(seconds: f64, ansi: bool) -> String {
+    let duration = format_time(seconds);
+    let milliseconds = seconds * 1000.0;
+    if milliseconds <= 50.0 {
+        terminal::console_format(
+            "<fg:green>%s</fg><fg:yellow>%s</fg> ",
+            &[&duration, duration_star()],
+            ansi,
+        )
+    } else if milliseconds <= 200.0 {
+        terminal::console_format("<fg:green>%s</fg>  ", &[&duration], ansi)
+    } else if milliseconds <= 500.0 {
+        terminal::console_format("<fg:yellow>%s</fg>  ", &[&duration], ansi)
+    } else {
+        terminal::console_format("<fg:red>%s</fg>  ", &[&duration], ansi)
+    }
+}
+
+/// `namespace::name` (or bare `name`) for one result (lines 12-16).
+fn result_display_name(result: &EngineUnitResult) -> String {
+    match result.get_namespace() {
+        Some(namespace) if !namespace.is_empty() => {
+            format!("{}::{}", namespace, result.get_name())
+        }
+        _ => result.get_name().to_string(),
+    }
+}
+
+/// TTY rendering: the badge, duration, and name composed with
+/// `sprintf("  %s %s\n", ...)` like PHP, plus raw `userData`.
+fn render_unit_result_tty(result: &EngineUnitResult) -> String {
+    let code = result.get_result();
+    let label = format_result_label(code, true);
+    let duration = if code == arc_rs::unit_engine::RESULT_PASS {
+        format!(
+            " {}",
+            format_test_duration(result.get_duration().unwrap_or(0.0), true)
+        )
+    } else {
+        String::new()
+    };
+    let mut out = format!("  {label}{duration} {}\n", result_display_name(result));
+    if code != arc_rs::unit_engine::RESULT_PASS
+        && let Some(user_data) = result.get_user_data()
+        && !user_data.is_empty()
+    {
+        out.push_str(user_data);
+        out.push('\n');
+    }
+    out
+}
+
+/// Historical plain rendering, byte-identical.
+fn render_unit_result_plain(result: &EngineUnitResult) -> String {
     let code = result.get_result();
     let label = match code {
         arc_rs::unit_engine::RESULT_PASS => "PASS",
@@ -2471,9 +2567,10 @@ pub fn merge_file_coverage(
     (sorted, file_reports)
 }
 
-/// Render the coverage report (`ArcanistUnitWorkflow.php:218-239`) in plain
-/// text: `\nCOVERAGE REPORT\n` plus `    %3d%%     file` lines (PHP wraps
-/// both in `__`/`**` console markup) and optional detailed reports.
+/// Render the coverage report (`ArcanistUnitWorkflow.php:218-239`):
+/// `\nCOVERAGE REPORT\n` plus `    %3d%%     file` lines and optional
+/// detailed reports. TTYs render the `__`/`**` console markup like
+/// PHP; non-TTYs keep the historical plain rendering byte-identical.
 #[must_use]
 pub fn render_coverage_report(
     sorted: &[(String, f64)],
@@ -2481,29 +2578,118 @@ pub fn render_coverage_report(
     detailed: bool,
     project_root: &Path,
 ) -> String {
-    let mut out = String::from("\nCOVERAGE REPORT\n");
+    render_coverage_report_with_ansi(
+        sorted,
+        file_reports,
+        detailed,
+        project_root,
+        terminal::ansi_enabled(),
+    )
+}
+
+/// Render the coverage report with an explicit ANSI flag (see
+/// [`render_coverage_report`]).
+#[must_use]
+pub fn render_coverage_report_with_ansi(
+    sorted: &[(String, f64)],
+    file_reports: &HashMap<String, String>,
+    detailed: bool,
+    project_root: &Path,
+    ansi: bool,
+) -> String {
+    let mut out = if ansi {
+        terminal::console_format("\n__%s__\n", &["COVERAGE REPORT"], true)
+    } else {
+        String::from("\nCOVERAGE REPORT\n")
+    };
     for (file, fraction) in sorted {
         let pct = (100.0 * fraction) as i32;
-        out.push_str(&format!("    {pct:>3}%     {file}\n"));
+        out.push_str(&coverage_file_line(pct, file, ansi));
         if detailed {
             let full = project_root.join(file);
             if let Some(report) = file_reports.get(file)
                 && full.is_file()
                 && let Ok(data) = std::fs::read_to_string(&full)
             {
-                out.push_str(&render_detailed_coverage_report(&data, report));
+                out.push_str(&render_detailed_coverage_report_with_ansi(
+                    &data, report, ansi,
+                ));
             }
         }
     }
     out
 }
 
-/// Render one file's detailed coverage (`ArcanistUnitWorkflow.php:292-331`)
-/// in plain text: `%5d  [C] <80-col line>` per source line. PHP paints
-/// `<bg:green/red/magenta>` backgrounds for `C`/`U`/`X` (default `N` plain);
-/// the bracketed mark keeps the stripped colors observable.
+/// One `    **%3d%%**     file` coverage line (workflow line 222-224)
+/// with an explicit ANSI flag.
+fn coverage_file_line(pct: i32, file: &str, ansi: bool) -> String {
+    if ansi {
+        let pct_text = format!("{pct:>3}%");
+        terminal::console_format("    **%s**     %s\n", &[&pct_text, file], true)
+    } else {
+        format!("    {pct:>3}%     {file}\n")
+    }
+}
+
+/// Render one file's detailed coverage (`ArcanistUnitWorkflow.php:292-331`).
+/// TTYs paint `<bg:green/red/magenta>` backgrounds for `C`/`U`/`X`
+/// like PHP; non-TTYs keep the historical `%5d  [C] <80-col line>`
+/// rendering (whose bracketed mark keeps the stripped colors
+/// observable) byte-identical.
 #[must_use]
 pub fn render_detailed_coverage_report(data: &str, report: &str) -> String {
+    render_detailed_coverage_report_with_ansi(data, report, terminal::ansi_enabled())
+}
+
+/// Render one file's detailed coverage with an explicit ANSI flag
+/// (see [`render_detailed_coverage_report`]).
+#[must_use]
+pub fn render_detailed_coverage_report_with_ansi(data: &str, report: &str, ansi: bool) -> String {
+    if ansi {
+        render_detailed_tty(data, report)
+    } else {
+        render_detailed_plain(data, report)
+    }
+}
+
+/// TTY rendering: `%5d  ` plus the 80-column line wrapped in the
+/// mark's background (`C` green, `U` red, `X` magenta, else plain).
+fn render_detailed_tty(data: &str, report: &str) -> String {
+    let report_bytes = report.as_bytes();
+    let mut out = String::new();
+    for (n, line) in data.split('\n').enumerate() {
+        out.push_str(&detailed_tty_line(
+            n + 1,
+            line,
+            detail_mark(report_bytes.get(n).copied()),
+        ));
+    }
+    out
+}
+
+/// The effective mark for one line: PHP's `empty($report[$n])`
+/// maps a missing report byte (and `"0"`) to `N`.
+fn detail_mark(byte: Option<u8>) -> char {
+    match byte {
+        None | Some(b'0') => 'N',
+        Some(other) => other as char,
+    }
+}
+
+/// One TTY detailed-coverage line for `mark`.
+fn detailed_tty_line(number: usize, line: &str, mark: char) -> String {
+    let padded = format!("{line:<80}");
+    let painted = match mark {
+        'C' => terminal::console_format("<bg:green> %s </bg>", &[&padded], true),
+        'U' => terminal::console_format("<bg:red> %s </bg>", &[&padded], true),
+        'X' => terminal::console_format("<bg:magenta> %s </bg>", &[&padded], true),
+        _ => format!(" {padded} "),
+    };
+    format!("{number:>5}  {painted}\n")
+}
+
+/// Historical plain rendering, byte-identical.
+fn render_detailed_plain(data: &str, report: &str) -> String {
     let report_bytes = report.as_bytes();
     let mut out = String::new();
     for (n, line) in data.split('\n').enumerate() {
@@ -2935,28 +3121,61 @@ pub fn render_workflow_output(
     detailed: bool,
     project_root: &Path,
 ) -> String {
+    render_workflow_output_with_ansi(
+        results,
+        paths,
+        output_format,
+        detailed,
+        project_root,
+        terminal::ansi_enabled(),
+    )
+}
+
+/// Render the workflow output with an explicit ANSI flag: the `full`
+/// rendering threads it into the per-result and coverage renderers;
+/// `json`/`ugly`/`none` carry no markup in any mode.
+#[must_use]
+pub fn render_workflow_output_with_ansi(
+    results: &[EngineUnitResult],
+    paths: &[String],
+    output_format: &str,
+    detailed: bool,
+    project_root: &Path,
+    ansi: bool,
+) -> String {
     match output_format {
         "json" => results_to_json_text(results, true),
         "ugly" => results_to_json_text(results, false),
         "none" => String::new(),
-        _ => {
-            let mut out = String::new();
-            for result in results {
-                out.push_str(&render_unit_result(result));
-            }
-            let coverage = collect_coverage(results);
-            if !coverage.is_empty() {
-                let (sorted, reports) = merge_file_coverage(paths, &coverage);
-                out.push_str(&render_coverage_report(
-                    &sorted,
-                    &reports,
-                    detailed,
-                    project_root,
-                ));
-            }
-            out
-        }
+        _ => render_full_output(results, paths, detailed, project_root, ansi),
     }
+}
+
+/// The `full` rendering: per-result lines plus the coverage report
+/// when coverage is present.
+fn render_full_output(
+    results: &[EngineUnitResult],
+    paths: &[String],
+    detailed: bool,
+    project_root: &Path,
+    ansi: bool,
+) -> String {
+    let mut out = String::new();
+    for result in results {
+        out.push_str(&render_unit_result_with_ansi(result, ansi));
+    }
+    let coverage = collect_coverage(results);
+    if !coverage.is_empty() {
+        let (sorted, reports) = merge_file_coverage(paths, &coverage);
+        out.push_str(&render_coverage_report_with_ansi(
+            &sorted,
+            &reports,
+            detailed,
+            project_root,
+            ansi,
+        ));
+    }
+    out
 }
 
 /// Exit code for a workflow result (`RESULT_OKAY` 0, `RESULT_UNSOUND` 1,
@@ -3060,7 +3279,13 @@ fn run_cargo_selection(opts: &Options, cwd: &Path) -> ExitCode {
 }
 
 /// Run one engine named by `--engine` or `unit.engine`.
-fn run_single_selection(opts: &Options, cwd: &Path, class: &str, paths: &[String]) -> ExitCode {
+fn run_single_selection(
+    opts: &Options,
+    cwd: &Path,
+    class: &str,
+    paths: &[String],
+    ansi: bool,
+) -> ExitCode {
     if !opts.cargo_args.is_empty() {
         eprintln!("arc-rs unit: cargo test args after '--' require the cargo engine");
         return ExitCode::FAILURE;
@@ -3077,7 +3302,7 @@ fn run_single_selection(opts: &Options, cwd: &Path, class: &str, paths: &[String
         coverage,
         &runner,
     ) {
-        Ok(report) => finish_php_report(opts, &root, paths, &report),
+        Ok(report) => finish_php_report(opts, &root, paths, &report, ansi),
         Err(msg) => {
             eprintln!("arc-rs unit: {msg}");
             ExitCode::FAILURE
@@ -3091,6 +3316,7 @@ fn run_config_selection(
     engines: &[PlannedEngine],
     root: &Path,
     paths: &[String],
+    ansi: bool,
 ) -> ExitCode {
     if !opts.cargo_args.is_empty() {
         eprintln!("arc-rs unit: cargo test args after '--' require the cargo engine");
@@ -3107,7 +3333,7 @@ fn run_config_selection(
         coverage,
         &runner,
     ) {
-        Ok(report) => finish_php_report(opts, root, paths, &report),
+        Ok(report) => finish_php_report(opts, root, paths, &report, ansi),
         Err(msg) => {
             eprintln!("arc-rs unit: {msg}");
             ExitCode::FAILURE
@@ -3123,14 +3349,16 @@ fn finish_php_report(
     project_root: &Path,
     paths: &[String],
     report: &ConfigReport,
+    ansi: bool,
 ) -> ExitCode {
     let format = output_format(opts);
-    let text = render_workflow_output(
+    let text = render_workflow_output_with_ansi(
         &report.results,
         paths,
         &format,
         opts.detailed_coverage,
         project_root,
+        ansi,
     );
     print!("{text}");
     let overall = arc_rs::unit_engine::overall_result(&report.results);
@@ -3194,7 +3422,7 @@ fn discover_unit_selection(opts: &Options, cwd: &Path) -> Result<Selection, Exit
     }
 }
 
-fn run_single_paths(opts: &Options, cwd: &Path, class: &str) -> ExitCode {
+fn run_single_paths(opts: &Options, cwd: &Path, class: &str, ansi: bool) -> ExitCode {
     let root = project_root_path(cwd);
     let paths = match select_paths(opts, cwd, &root) {
         Ok(paths) => paths,
@@ -3203,7 +3431,7 @@ fn run_single_paths(opts: &Options, cwd: &Path, class: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    run_single_selection(opts, cwd, class, &paths)
+    run_single_selection(opts, cwd, class, &paths, ansi)
 }
 
 fn run_config_paths(
@@ -3211,6 +3439,7 @@ fn run_config_paths(
     cwd: &Path,
     engines: &[PlannedEngine],
     root: &Path,
+    ansi: bool,
 ) -> ExitCode {
     let paths = match select_paths(opts, cwd, root) {
         Ok(paths) => paths,
@@ -3219,14 +3448,14 @@ fn run_config_paths(
             return ExitCode::FAILURE;
         }
     };
-    run_config_selection(opts, engines, root, &paths)
+    run_config_selection(opts, engines, root, &paths, ansi)
 }
 
-fn run_unit_selection(opts: &Options, cwd: &Path, selection: Selection) -> ExitCode {
+fn run_unit_selection(opts: &Options, cwd: &Path, selection: Selection, ansi: bool) -> ExitCode {
     match selection {
         Selection::Cargo => run_cargo_selection(opts, cwd),
-        Selection::Single(class) => run_single_paths(opts, cwd, &class),
-        Selection::Config { engines, root } => run_config_paths(opts, cwd, &engines, &root),
+        Selection::Single(class) => run_single_paths(opts, cwd, &class, ansi),
+        Selection::Config { engines, root } => run_config_paths(opts, cwd, &engines, &root, ansi),
     }
 }
 
@@ -3246,7 +3475,7 @@ pub fn run(argv: &[String]) -> ExitCode {
         Ok(selection) => selection,
         Err(code) => return code,
     };
-    run_unit_selection(&opts, &cwd, selection)
+    run_unit_selection(&opts, &cwd, selection, terminal::ansi_enabled())
 }
 
 #[cfg(test)]
