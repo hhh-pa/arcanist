@@ -26,14 +26,14 @@ still in progress, so colored output may differ from `arc` for now.
 | `diff` | full (local stat/patch/`--json`; message/range parsing; `--create`/`--update`/`--only` submit; git/hg/svn) |
 | `download` | full (F123 download; `--as`/`--as -`; size-verified) |
 | `export` | full (`--git`/`--unified`/arcbundle; local or revision export) |
-| `get-config` | full* (precedence read; `--show-source`; builtins; see arcrc divergence) |
+| `get-config` | full (precedence read; `--show-source`; builtins; stock arcrc semantics) |
 | `inspect` | full (working-copy tree; `--explore`; browse view) |
 | `install-certificate` | full (token install; `--token`/`--force`; legacy exchange) |
 | `land` | full (squash/merge strategies; `--preview`/`--push`; pre-land gates; `--revision`) |
-| `liberate` | full* (create/rebuild libphutil libs; needs php; see exit-code divergence) |
+| `liberate` | full (create/rebuild libphutil libs; always exits 0 like PHP; needs php) |
 | `lint` | full (34 linters; per-linter config; severities; `.arclint`; `--json`; GEN/NOLINT) |
 | `linters` | full (registry; `--verbose`/`--search`/exact; engine config) |
-| `list` | full* (open revs, `*` = current WC; `--json`; see outside-repo divergence) |
+| `list` | full (open revs, `*` = current WC; `--json`; fails outside repos like PHP) |
 | `look` | full* (Arcventure clearing/remotes/published; see UTC-hour divergence) |
 | `markers` | full (branch/bookmark grid; `--type`/`--json`; Differential status via conduit) |
 | `paste` | full (read/create pastes; `--title`/`--lang`/`--input`) |
@@ -75,10 +75,7 @@ rcfiles) is supported.
 
 ### Known divergences from PHP `arc`
 
-- `liberate` exits non-zero on failure (PHP always exits 0).
-- `list` works outside a git repo with no markers (PHP fails).
 - `upgrade` is report-only; it never fetches or replaces the binary.
-- `get-config` treats `~/.arcrc` without a config section as empty user config.
 - `look` uses the UTC hour for its time-of-day flavor.
 - `XHP` reports parse failures only; the XHPAST rule tree is not ported.
 
