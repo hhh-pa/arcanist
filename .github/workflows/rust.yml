@@ -163,4 +163,4 @@ jobs:
             bin="$bin.exe"
           fi
           test -x "$bin"
-          "$bin" --help > /dev/null
+          "$bin" --help | grep -q 'usage:'

@@ -5,7 +5,7 @@ CLI behavior, ported workflow by workflow with `arc` as the reference.
 
 ## Status
 
-All 34 commands are full-state ports of their PHP workflows. Discipline:
+All 35 commands are full-state ports of their PHP workflows. Discipline:
 every gap-closing change updates this table in the same turn. Behavior
 is exact, including error strings and exit codes; the remaining
 edge divergences are listed below.
@@ -46,6 +46,7 @@ PHP `phutil_console_format` bytes on TTYs (plain text off-TTY).
 | `unit` | full (engine selection; `.arcunit`/`unit.engine`; `--engine`/`--everything`; cargo/phpunit/xunit) |
 | `upgrade` | full (version/status report; `--check`/`--json`; `--apply` self-updates with SHA-256 check) |
 | `upload` | full (chunked upload + fallback; `--temporary`/`--json`) |
+| `version` | full (toolset version info; git commit + date per library) |
 | `weld` | full (fuse files; +`--seed` deterministic mode) |
 | `which` | full (context report; `--head`/`--show-base`/`--json`) |
 | `work` | full (checkout/create local branch; `--start`) |
@@ -81,8 +82,17 @@ rcfiles) is supported.
   literals needing the libphutil runtime) remains, permanently unportable.
 - XHP9/XHP30 enforce default determinations; custom `xhpast.switchhook` /
   `xhpast.naminghook` PHP classes cannot run here.
-- `look` falls back to UTC where the OS zone is unreadable (Windows
-  without `TZ`); all CI platforms resolve the real zone.
+- XHP45 checks symbols against the vendored
+  `rust/resources/php/symbol-information.json` snapshot instead of a
+  live symbol table; XHP54 ports only the missing-format-string check
+  (`xsprintf()` conversion validation needs libphutil and is not
+  ported).
+- `look` falls back to UTC where the OS zone is unreadable (for
+  example Windows without `TZ`).
+- `shell-complete` is not ported: the 666-line bash completion
+  installer/engine is out of scope.
+- `prompts` is not ported: per-workflow prompt introspection and
+  saved-response review is out of scope.
 
 ## Gates
 
