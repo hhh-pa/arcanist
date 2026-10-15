@@ -24,6 +24,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Least privilege: jobs inherit read-only; artifact upload, the GHA
+# cache, and PR comments widen their own job below.
+permissions:
+  contents: read
+
 jobs:
   fmt-clippy:
     name: fmt + clippy
@@ -207,6 +212,9 @@ jobs:
   go-tools-test:
     name: go ci-tools tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout
+      actions: read # binary-cache restore (save owned by the gates job)
     steps:
       - uses: actions/checkout@v4
       # Same binary cache as the gates preamble: a hit means this
@@ -233,6 +241,9 @@ jobs:
   build-release:
     name: release (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read # checkout
+      actions: write # artifact upload
     strategy:
       fail-fast: false
       matrix:
