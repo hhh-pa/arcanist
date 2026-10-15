@@ -1599,6 +1599,35 @@ fn arclint_error(name: &str, detail: String) -> String {
     format!("Error in parsing '.arclint' file, for linter '{name}': {detail}")
 }
 
+/// Apply base/custom/lessc options in PHP table order, then validate the
+/// severity map; option errors are prefixed with the linter name.
+fn apply_section_options(
+    linter: &mut Box<dyn Linter>,
+    spec: &arclint::LinterSpec,
+    canonical: &str,
+    table: &[(&str, OptionType)],
+    ctx: &OptionContext,
+    custom_after_base: bool,
+) -> Result<arclint::SeverityOverrides, String> {
+    let mut severity;
+    if custom_after_base {
+        severity = apply_base_options(linter, spec, canonical, ctx)
+            .map_err(|detail| arclint_error(&spec.name, detail))?;
+        apply_custom_options(linter, spec, canonical, table, ctx)
+            .map_err(|detail| arclint_error(&spec.name, detail))?;
+        apply_lessc_options(linter, spec, canonical, ctx)
+            .map_err(|detail| arclint_error(&spec.name, detail))?;
+    } else {
+        apply_custom_options(linter, spec, canonical, table, ctx)
+            .map_err(|detail| arclint_error(&spec.name, detail))?;
+        severity = apply_base_options(linter, spec, canonical, ctx)
+            .map_err(|detail| arclint_error(&spec.name, detail))?;
+    }
+    severity.map = validate_severity_map(linter.as_ref(), &severity.map)
+        .map_err(|detail| arclint_error(&spec.name, detail))?;
+    Ok(severity)
+}
+
 /// Build one configured section: instantiate the linter by type,
 /// validate and apply options in PHP table order, validate severity
 /// codes, resolve `standard`, and compile routing.
@@ -1623,22 +1652,8 @@ fn build_section(
     )
     .map_err(|detail| arclint_error(&spec.name, detail))?;
     let ctx = OptionContext { project_root };
-    let mut severity;
-    if custom_after_base {
-        severity = apply_base_options(&mut linter, spec, canonical, &ctx)
-            .map_err(|detail| arclint_error(&spec.name, detail))?;
-        apply_custom_options(&mut linter, spec, canonical, table, &ctx)
-            .map_err(|detail| arclint_error(&spec.name, detail))?;
-        apply_lessc_options(&mut linter, spec, canonical, &ctx)
-            .map_err(|detail| arclint_error(&spec.name, detail))?;
-    } else {
-        apply_custom_options(&mut linter, spec, canonical, table, &ctx)
-            .map_err(|detail| arclint_error(&spec.name, detail))?;
-        severity = apply_base_options(&mut linter, spec, canonical, &ctx)
-            .map_err(|detail| arclint_error(&spec.name, detail))?;
-    }
-    severity.map = validate_severity_map(linter.as_ref(), &severity.map)
-        .map_err(|detail| arclint_error(&spec.name, detail))?;
+    let severity =
+        apply_section_options(&mut linter, spec, canonical, table, &ctx, custom_after_base)?;
     linter.set_custom_severity_map(&severity.map);
     linter.set_custom_severity_rules(&severity.rules);
     Ok(Section {
