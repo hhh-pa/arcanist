@@ -393,7 +393,7 @@ pub fn expand(argv: &[String], aliases: &[Alias], is_builtin: impl Fn(&str) -> b
         }
         // PHP renders the tail with `(string)csprintf('%LR', $alias_argv)`
         // (`EFFECT_ALIAS`): minimal `%R` quoting per word.
-        let display_argv = shell_display(&alias.command[1..]);
+        let display_argv = effect_display(&alias.command[1..]);
         hints.push(terminal::pht(
             "%s %s -> %s %s %s",
             &[
@@ -511,16 +511,22 @@ fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
-/// Render an argv for hints, one `%R`-quoted word per argument.
-///
-/// PHP renders `EFFECT_ALIAS` tails with `%LR` (this function exactly) but
-/// shell-alias hints with `%Ls`, which `escapeshellarg()`s every word even
-/// when bare-safe. Rust deliberately uses `%R`-style minimal quoting for
-/// both: the shell hint stays unambiguous and matches the prettier
-/// `EFFECT_ALIAS` style. Display-only; execution uses the raw argv.
-fn shell_display(argv: &[String]) -> String {
+/// Render an argv the way PHP `%LR` does: minimal quoting, one word
+/// per argument. Used for `EFFECT_ALIAS` tails.
+fn effect_display(argv: &[String]) -> String {
     argv.iter()
         .map(|word| shell_quote(word))
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
+/// Render an argv for shell-alias hints, one `%Ls`-quoted word per
+/// argument: PHP `escapeshellarg()`s every word even when bare-safe.
+/// Display uses Unix quoting on all platforms. Display-only; execution
+/// uses the raw argv.
+fn shell_display(argv: &[String]) -> String {
+    argv.iter()
+        .map(|word| format!("'{}'", word.replace('\'', "'\\''")))
         .collect::<Vec<String>>()
         .join(" ")
 }

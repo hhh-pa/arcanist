@@ -177,12 +177,16 @@ fn stored_alias_expands_through_main_dispatch() {
         serde_json::json!([{"trigger": "draft", "toolset": "arc", "command": ["diff", "--draft"]}]),
     ] {
         let aliases = stored_aliases(stored);
-        let expanded = pre_dispatch(args(&["draft", "extra"]), &aliases);
-        let alias::Expansion::Dispatch { argv, hints } = expanded else {
-            panic!("expected dispatch, got {expanded:?}");
+        let (outcome, notices) = alias::apply_expansion_with(
+            args(&["draft", "extra"]),
+            || Some((aliases, Vec::new())),
+            |_| panic!("no shell execution expected"),
+        );
+        let Ok(argv) = outcome else {
+            panic!("expected dispatch, got {outcome:?}");
         };
         assert_eq!(argv, args(&["diff", "--draft", "extra"]));
-        assert_eq!(hints.len(), 1);
+        assert_eq!(notices.len(), 1);
         assert!(
             std::ptr::fn_addr_eq(dispatch_target(&argv), diff::run as CommandFn),
             "expanded argv does not dispatch to diff"
@@ -191,48 +195,43 @@ fn stored_alias_expands_through_main_dispatch() {
 }
 
 #[test]
-fn pre_dispatch_leaves_builtins_and_flags_alone() {
-    let aliases = stored_aliases(serde_json::json!({"diff": ["lint"]}));
-    assert_eq!(
-        pre_dispatch(args(&["diff"]), &aliases),
-        alias::Expansion::Dispatch {
-            argv: args(&["diff"]),
-            hints: Vec::new(),
-        }
-    );
-    assert_eq!(
-        pre_dispatch(args(&["--help"]), &aliases),
-        alias::Expansion::Dispatch {
-            argv: args(&["--help"]),
-            hints: Vec::new(),
-        }
-    );
-    assert_eq!(
-        pre_dispatch(args(&["bogus"]), &aliases),
-        alias::Expansion::Dispatch {
-            argv: args(&["bogus"]),
-            hints: Vec::new(),
-        }
-    );
+fn expansion_leaves_builtins_and_flags_alone() {
+    for argv in [args(&["diff"]), args(&["--help"]), args(&["bogus"])] {
+        let aliases = stored_aliases(serde_json::json!({"diff": ["lint"]}));
+        let (outcome, notices) = alias::apply_expansion_with(
+            argv.clone(),
+            || Some((aliases, Vec::new())),
+            |_| panic!("no shell execution expected"),
+        );
+        assert_eq!(outcome, Ok(argv));
+        assert!(notices.is_empty());
+    }
 }
 
 #[test]
-fn pre_dispatch_reports_shell_and_broken_chains() {
+fn expansion_reports_shell_and_broken_chains() {
     let aliases = stored_aliases(serde_json::json!({"ls": ["!ls"]}));
-    let expanded = pre_dispatch(args(&["ls", "-la"]), &aliases);
-    assert_eq!(
-        expanded,
-        alias::Expansion::Shell {
-            argv: args(&["ls", "-la"]),
-            hint: "arc ls -> $ ls -la".to_string(),
-        }
+    let (outcome, notices) = alias::apply_expansion_with(
+        args(&["ls", "-la"]),
+        || Some((aliases, Vec::new())),
+        |shell| {
+            assert_eq!(shell, &args(&["ls", "-la"]));
+            Ok(alias::ShellStatus::Exited(0))
+        },
+    );
+    assert_eq!(outcome, Err(ExitCode::SUCCESS));
+    assert!(
+        notices.iter().any(|n| n.starts_with("SHELL ALIAS: ")),
+        "{notices:?}"
     );
 
     let aliases = stored_aliases(serde_json::json!({"a": ["gone"]}));
-    assert!(matches!(
-        pre_dispatch(args(&["a"]), &aliases),
-        alias::Expansion::Failed { .. }
-    ));
+    let (outcome, _) = alias::apply_expansion_with(
+        args(&["a"]),
+        || Some((aliases, Vec::new())),
+        |_| panic!("no shell execution expected"),
+    );
+    assert_eq!(outcome, Err(ExitCode::FAILURE));
 }
 
 /// Every ported subcommand: the (NAME, run) pairs that must be registered

@@ -194,7 +194,7 @@ fn expansion_resolves_shell_aliases() {
         panic!("expected shell, got {expanded:?}");
     };
     assert_eq!(argv, args(&["ls", "-la", "/tmp"]));
-    assert!(hint.contains("arc ls -> $ ls -la /tmp"), "{hint}");
+    assert!(hint.contains("arc ls -> $ 'ls' '-la' '/tmp'"), "{hint}");
 }
 
 #[test]
@@ -204,7 +204,7 @@ fn expansion_quotes_shell_display_words() {
         panic!("expected shell");
     };
     assert_eq!(argv, args(&["echo", "a b"]));
-    assert!(hint.contains("echo 'a b'"), "{hint}");
+    assert!(hint.contains("'echo' 'a b'"), "{hint}");
 }
 
 #[test]
@@ -231,7 +231,7 @@ fn display_quoting_matches_php_readable_charset() {
     assert_eq!(shell_quote("$HOME"), "'$HOME'");
     assert_eq!(
         shell_display(&args(&["echo", "a b", "--x"])),
-        "echo 'a b' --x"
+        "'echo' 'a b' '--x'"
     );
     assert_eq!(shell_display(&[]), "");
 }
@@ -316,7 +316,7 @@ fn expansion_multi_hop_to_shell_keeps_only_the_shell_hint() {
         panic!("expected shell, got {expanded:?}");
     };
     assert_eq!(argv, args(&["echo", "hi", "--from-a", "user-arg"]));
-    assert_eq!(hint, "arc b -> $ echo hi --from-a user-arg");
+    assert_eq!(hint, "arc b -> $ 'echo' 'hi' '--from-a' 'user-arg'");
 }
 
 #[test]
@@ -773,7 +773,10 @@ fn expansion_driver_dispatches_and_reports_shell_and_broken_chains() {
         },
     );
     assert_eq!(result, Err(ExitCode::SUCCESS));
-    assert_eq!(notices, vec!["SHELL ALIAS: arc g -> $ echo hi".to_string()]);
+    assert_eq!(
+        notices,
+        vec!["SHELL ALIAS: arc g -> $ 'echo' 'hi'".to_string()]
+    );
 
     let aliases = vec![alias("arc", "g", &["!echo"], "user")];
     let (result, notices) = apply_expansion_with(

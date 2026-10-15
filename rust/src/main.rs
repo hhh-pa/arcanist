@@ -202,68 +202,30 @@ fn find_command(name: &str) -> Option<CommandFn> {
         .map(|(_, run)| *run)
 }
 
-/// Expand `argv` through `aliases` before the `COMMANDS` lookup,
-/// mirroring `ArcanistRuntime` running `ArcanistAliasEngine` over the
-/// unconsumed argument vector. Leading flags are never commands (PHP
-/// consumes toolset arguments before aliases run).
-fn pre_dispatch(argv: Vec<String>, aliases: &[alias::Alias]) -> alias::Expansion {
-    if argv.first().is_some_and(|first| first.starts_with('-')) {
-        return alias::Expansion::Dispatch {
-            argv,
-            hints: Vec::new(),
-        };
-    }
-    alias::expand(&argv, aliases, alias::is_builtin_command)
-}
-
-/// Execute a shell alias, mirroring `ArcanistRuntime::executeShellAlias()`.
-fn execute_shell_alias(argv: &[String], hint: &str) -> ExitCode {
-    eprintln!("SHELL ALIAS: {hint}");
-    let Some((program, args)) = argv.split_first() else {
-        eprintln!("arc-rs: empty shell alias");
-        return ExitCode::FAILURE;
-    };
-    match std::process::Command::new(program).args(args).status() {
-        Ok(status) => status
-            .code()
-            .and_then(|code| u8::try_from(code).ok())
-            .map_or(ExitCode::FAILURE, ExitCode::from),
-        Err(e) => {
-            eprintln!("arc-rs: cannot execute shell alias: {e}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
 /// Expand `argv` through user aliases before dispatch. Returns the argv
 /// to dispatch, or an exit code when expansion fully handles the
 /// invocation (shell alias executed or broken chain). Unreadable
 /// configuration is a pass-through: each command surfaces its own
 /// config errors, so expansion must not break unrelated commands.
 fn apply_alias_expansion(argv: Vec<String>) -> Result<Vec<String>, ExitCode> {
-    if argv.first().is_none_or(|first| first.starts_with('-')) {
-        return Ok(argv);
+    let (outcome, notices) = alias::apply_expansion_with(
+        argv,
+        || alias::load_aliases().ok(),
+        |shell_argv| {
+            let Some((program, args)) = shell_argv.split_first() else {
+                return Err("empty shell alias".to_string());
+            };
+            std::process::Command::new(program)
+                .args(args)
+                .status()
+                .map(|status| alias::shell_status_from_exit_status(&status))
+                .map_err(|e| e.to_string())
+        },
+    );
+    for notice in &notices {
+        eprintln!("{notice}");
     }
-    let (aliases, warnings) = alias::load_aliases().unwrap_or_default();
-    for warning in &warnings {
-        eprintln!("ALIAS: {warning}");
-    }
-    match pre_dispatch(argv, &aliases) {
-        alias::Expansion::Dispatch { argv: next, hints } => {
-            for hint in &hints {
-                eprintln!("ALIAS: {hint}");
-            }
-            Ok(next)
-        }
-        alias::Expansion::Shell { argv: shell, hint } => Err(execute_shell_alias(&shell, &hint)),
-        alias::Expansion::Failed { message, hints } => {
-            for hint in &hints {
-                eprintln!("ALIAS: {hint}");
-            }
-            eprintln!("arc-rs: {message}");
-            Err(ExitCode::FAILURE)
-        }
-    }
+    outcome
 }
 
 /// Rewrite `help <cmd>` to `<cmd> --help`, mirroring PHP's help workflow
