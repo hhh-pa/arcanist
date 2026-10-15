@@ -10,8 +10,8 @@
 //! carries a syntax error, else `XHP2` "Unable to Parse"),
 //! mirroring PHP `resolveFuture()`. On a zero exit the JSON AST
 //! output is parsed (see [`xhp_ast`]) and the ported rule tree
-//! (`xhp_calls`, `xhp_style`, `xhp_flow`, plus the `xhp_decl`
-//! declaration rules once implemented) runs over it, emitting
+//! (`xhp_calls`, `xhp_style`, `xhp_flow`, `xhp_rem1`, plus the
+//! `xhp_decl` declaration rules once implemented) runs over it, emitting
 //! PHP-identical rule IDs, severities, and message text for the
 //! ported subset ([`RULE_TABLE`]); the unported remainder is listed
 //! in [`blocked_rules`]. When the binary is absent the linter is
@@ -57,6 +57,8 @@ mod xhp_calls;
 mod xhp_decl;
 #[path = "xhp_flow.rs"]
 mod xhp_flow;
+#[path = "xhp_rem1.rs"]
+mod xhp_rem1;
 #[path = "xhp_style.rs"]
 mod xhp_style;
 
@@ -95,27 +97,41 @@ pub const RULE_TABLE: &[(u32, &str, &str)] = &[
     (2, "Unable to Parse", SEVERITY_WARNING),
     (3, "Use of Variable Variable", SEVERITY_ERROR),
     (4, "Use of `extract`", SEVERITY_ERROR),
+    (5, "Use of Undeclared Variable", SEVERITY_ERROR),
     (6, "Use of Short Tag `<?`", SEVERITY_ERROR),
     (7, "Use of Echo Tag `<?=`", SEVERITY_ERROR),
     (8, "Use of Close Tag `?>`", SEVERITY_ERROR),
+    (9, "Naming Conventions", SEVERITY_WARNING),
+    (10, "Implicit Constructor", SEVERITY_ERROR),
     (12, "Dynamic `define`", SEVERITY_ERROR),
+    (13, "Use of `$this` in Static Context", SEVERITY_ERROR),
     (15, "Expected Open Tag", SEVERITY_ERROR),
     (16, "TODO Comment", SEVERITY_DISABLED),
+    (17, "`exit` Used as Expression", SEVERITY_ERROR),
     (18, "Comment Style", SEVERITY_ERROR),
+    (19, "Class-Filename Mismatch", SEVERITY_ERROR),
+    (20, "Tautological Expression", SEVERITY_ERROR),
     (21, "Not String Concatenation", SEVERITY_ERROR),
+    (22, "Duplicate Keys in Array", SEVERITY_ERROR),
+    (23, "Reuse of Iterator Variable", SEVERITY_ERROR),
+    (24, "Brace Placement", SEVERITY_WARNING),
     (25, "Spaces Inside Parentheses", SEVERITY_WARNING),
     (26, "Space After Control Statement", SEVERITY_WARNING),
     (27, "Space Around Binary Operator", SEVERITY_WARNING),
     (28, "Spacing Before Array Index", SEVERITY_WARNING),
+    (30, "Implicit Fallthrough", SEVERITY_WARNING),
+    (32, "Variable Reused As Iterator", SEVERITY_ERROR),
     (34, "Comment Spaces", SEVERITY_ADVICE),
     (36, "Slow Construct", SEVERITY_WARNING),
     (37, "Call Formatting", SEVERITY_WARNING),
     (38, "Declaration Formatting", SEVERITY_WARNING),
+    (39, "Reuse of Iterator References", SEVERITY_WARNING),
     (40, "Keyword Conventions", SEVERITY_WARNING),
     (41, "Unnecessary Double Quotes", SEVERITY_ADVICE),
     (42, "`elseif` Usage", SEVERITY_ADVICE),
     (43, "Semicolon Spacing", SEVERITY_ADVICE),
     (44, "Concatenation Spacing", SEVERITY_WARNING),
+    (45, "PHP Compatibility", SEVERITY_ERROR),
     (46, "Language Construct Parentheses", SEVERITY_WARNING),
     (47, "Empty Block Statement", SEVERITY_ADVICE),
     (48, "Array Separator", SEVERITY_ADVICE),
@@ -179,28 +195,6 @@ pub fn rule_meta(id: u32) -> Option<(&'static str, &'static str)> {
 #[must_use]
 pub fn blocked_rules() -> Vec<(u32, &'static str, &'static str)> {
     vec![
-        (5, "ArcanistUndeclaredVariableXHPASTLinterRule", NOT_YET),
-        (9, "ArcanistNamingConventionsXHPASTLinterRule", NOT_YET),
-        (10, "ArcanistImplicitConstructorXHPASTLinterRule", NOT_YET),
-        (13, "ArcanistStaticThisXHPASTLinterRule", NOT_YET),
-        (17, "ArcanistExitExpressionXHPASTLinterRule", NOT_YET),
-        (19, "ArcanistClassFilenameMismatchXHPASTLinterRule", NOT_YET),
-        (
-            20,
-            "ArcanistTautologicalExpressionXHPASTLinterRule",
-            NOT_YET,
-        ),
-        (22, "ArcanistDuplicateKeysInArrayXHPASTLinterRule", NOT_YET),
-        (23, "ArcanistReusedIteratorXHPASTLinterRule", NOT_YET),
-        (24, "ArcanistBraceFormattingXHPASTLinterRule", NOT_YET),
-        (30, "ArcanistImplicitFallthroughXHPASTLinterRule", NOT_YET),
-        (32, "ArcanistReusedAsIteratorXHPASTLinterRule", NOT_YET),
-        (
-            39,
-            "ArcanistReusedIteratorReferenceXHPASTLinterRule",
-            NOT_YET,
-        ),
-        (45, "ArcanistPHPCompatibilityXHPASTLinterRule", NOT_YET),
         (50, "ArcanistDuplicateSwitchCaseXHPASTLinterRule", NOT_YET),
         (52, "ArcanistImplicitVisibilityXHPASTLinterRule", NOT_YET),
         (
@@ -393,6 +387,7 @@ pub fn lint_tree(
     xhp_style::apply(&ctx, &mut findings);
     xhp_decl::apply(&ctx, &mut findings);
     xhp_flow::apply(&ctx, &mut findings);
+    xhp_rem1::apply(&ctx, &mut findings);
     findings.sort_by_key(|finding| (finding.offset, finding.rule));
     findings
         .into_iter()
