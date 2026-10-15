@@ -1,0 +1,5 @@
+# JUnit report for Codecov Test Analytics: every nextest run writes it
+# next to the coverage report (same dir the gates hand back to the host
+# steps), and rust.yml uploads it via codecov/test-results-action.
+[profile.default.junit]
+path = "target/llvm-cov/junit.xml"
