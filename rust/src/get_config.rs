@@ -17,12 +17,9 @@
 //! carries markup, `pht()` sites use `pht`, help wrapping uses
 //! `console_wrap`, and markup-free `sprintf` sites use plain `format!`.
 //!
-//! Deviation: a `~/.arcrc` without a `config` section yields an empty user
-//! config here, while stock PHP treats the whole file (including `hosts`)
-//! as config until the first `set-config` write. Credential-adjacent keys
-//! are never reported as configuration. Likewise, project-config lookup
-//! walks up from the working directory instead of reading only the VCS
-//! root, so `get-config` keeps working outside repositories.
+//! Deviation: project-config lookup walks up from the working directory
+//! instead of reading only the VCS root, so `get-config` keeps working
+//! outside repositories.
 
 // A crate cannot name itself in `use` (E0432), so alias the current crate
 // to keep the shared-helper paths (`arc_rs::git`, `arc_rs::config`)
@@ -308,10 +305,12 @@ pub fn read_local_config(dir: &Path) -> Result<serde_json::Map<String, serde_jso
     read_config_file(&file, &message)
 }
 
-/// Read the user config section from a `~/.arcrc` file: the `config`
-/// object, plus the top-level `aliases` key like the PHP manager does.
-/// A missing file yields an empty config. The parse error mirrors
-/// `readUserConfigurationFile()`, including its literal `~/.arcrc`.
+/// Read the user config from a `~/.arcrc` file, mirroring PHP's
+/// `readUserArcConfig()`: the `config` object when present (plus the
+/// top-level `aliases` key), else the whole file -- including `hosts`,
+/// exactly like stock PHP, which never redacts credential-adjacent keys
+/// on this path. A missing file yields an empty config. The parse error
+/// mirrors `readUserConfigurationFile()`, including its literal `~/.arcrc`.
 pub fn read_user_file(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     if !path.is_file() {
         return Ok(serde_json::Map::new());
@@ -327,8 +326,11 @@ pub fn read_user_file(path: &Path) -> Result<serde_json::Map<String, serde_json:
     let obj = doc
         .as_object()
         .ok_or_else(|| format!("'{}' is not a JSON object", path.display()))?;
+    // Stock PHP returns the whole file when `isset($config['config'])` is
+    // false (missing or null); only a present, non-null section narrows
+    // the user config.
     let mut map = match obj.get("config") {
-        None => serde_json::Map::new(),
+        None | Some(serde_json::Value::Null) => obj.clone(),
         Some(serde_json::Value::Object(config)) => config.clone(),
         Some(_) => {
             return Err(format!(

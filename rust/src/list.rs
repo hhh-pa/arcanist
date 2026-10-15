@@ -6,8 +6,11 @@
 //! copy, and prints them sorted like the PHP table (or as `--json`).
 //!
 //! Known limits (see T1128): output is plain text without the PHP status
-//! colors; outside a repository the command still works with no `*`
-//! markers instead of failing like the PHP reference.
+//! colors.
+//!
+//! Like the PHP runtime for `requiresRepositoryAPI()` workflows, [`run`]
+//! fails outside a repository before any Conduit call; [`execute_in`]
+//! stays lenient (no `*` markers) for direct callers.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -283,6 +286,10 @@ pub fn revisions_json(revisions: &[RevisionInfo]) -> serde_json::Value {
 }
 
 /// Query and render open revisions, resolving `*` markers against `cwd`.
+///
+/// Outside a repository no row is marked; the [`run`] entry point rejects
+/// that case with the exact PHP error instead (the runtime working-copy
+/// check for `requiresRepositoryAPI()` workflows).
 pub fn execute_in(
     client: &conduit::Client,
     options: &Options,
@@ -320,8 +327,23 @@ pub fn execute(client: &conduit::Client, options: &Options) -> Result<String, St
     execute_in(client, options, &cwd)
 }
 
-/// Entry point: `argv` excludes the subcommand name.
-pub fn run(argv: &[String]) -> ExitCode {
+/// Reject `cwd` outside a repository with the exact PHP error.
+///
+/// Mirrors the `arc` runtime working-copy check for workflows with
+/// `requiresRepositoryAPI()`: `arc list` fails before any Conduit call.
+fn require_working_copy(cwd: &Path) -> Result<(), String> {
+    if working_copy_root(cwd).is_some() {
+        Ok(())
+    } else {
+        Err(terminal::pht(
+            "This command must be run in a Git, Mercurial or Subversion working copy.",
+            &[],
+        ))
+    }
+}
+
+/// Entry point rooted at `cwd`: `argv` excludes the subcommand name.
+pub fn run_in(cwd: &Path, argv: &[String]) -> ExitCode {
     let options = match parse_args(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
@@ -333,6 +355,10 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Err(msg) = require_working_copy(cwd) {
+        eprintln!("arc-rs {NAME}: {msg}");
+        return ExitCode::FAILURE;
+    }
     let client = match config::client_for(options.conduit_uri.as_deref()) {
         Ok(client) => client,
         Err(msg) => {
@@ -340,7 +366,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match execute(&client, &options) {
+    match execute_in(&client, &options, cwd) {
         Ok(out) => {
             print!("{out}");
             ExitCode::SUCCESS
@@ -350,6 +376,12 @@ pub fn run(argv: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Entry point: `argv` excludes the subcommand name.
+pub fn run(argv: &[String]) -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    run_in(&cwd, argv)
 }
 
 #[cfg(test)]

@@ -282,8 +282,19 @@ fn user_file_reads_config_and_aliases() {
     assert_eq!(map["aliases"], serde_json::json!({"a": "b"}));
     assert!(!map.contains_key("hosts"));
 
+    // Without a `config` section, stock PHP returns the whole file --
+    // including `hosts` -- as the user config.
     std::fs::write(&missing, r#"{"hosts": {}}"#).unwrap();
-    assert!(read_user_file(&missing).unwrap().is_empty());
+    let whole = read_user_file(&missing).unwrap();
+    assert_eq!(whole.len(), 1);
+    assert_eq!(whole["hosts"], serde_json::json!({}));
+
+    // PHP `isset()` is false for null too, so a null section also falls
+    // back to the whole file.
+    std::fs::write(&missing, r#"{"config": null, "editor": "top"}"#).unwrap();
+    let whole = read_user_file(&missing).unwrap();
+    assert_eq!(whole["editor"], serde_json::json!("top"));
+    assert_eq!(whole["config"], serde_json::Value::Null);
     std::fs::write(&missing, "nope").unwrap();
     // PHP hardcodes the filename in this error.
     assert_eq!(
@@ -294,6 +305,36 @@ fn user_file_reads_config_and_aliases() {
     assert!(read_user_file(&missing).is_err());
     std::fs::write(&missing, r#"{"config": 7}"#).unwrap();
     assert!(read_user_file(&missing).is_err());
+}
+
+#[test]
+fn user_config_without_section_matches_stock_php() {
+    // A legacy `~/.arcrc` with credentials but no `config` section:
+    // stock PHP treats the whole file as user config, hosts included.
+    let tmp = TempDir::new("wholefile");
+    let arcrc = tmp.path.join(".arcrc");
+    std::fs::write(
+        &arcrc,
+        r#"{"hosts": {"https://h/api/": {"token": "t"}}, "editor": "top", "aliases": {"a": "b"}}"#,
+    )
+    .unwrap();
+    let sources = load_sources(&tmp.path, Some(&arcrc)).unwrap();
+    assert_eq!(
+        current_value("hosts", &sources).unwrap(),
+        (
+            "user",
+            serde_json::json!({"https://h/api/": {"token": "t"}})
+        )
+    );
+    assert_eq!(
+        current_value("editor", &sources).unwrap(),
+        ("user", serde_json::json!("top"))
+    );
+    assert!(all_keys(&sources).contains(&"hosts".to_string()));
+    assert_eq!(
+        render_ansi("hosts", &sources, false, false),
+        "hosts\n\n       Current Value: {\"https://h/api/\":{\"token\":\"t\"}}\n      Current Source: user\n"
+    );
 }
 
 #[test]

@@ -180,3 +180,49 @@ fn compares_paths() {
     assert!(same_path(&with_dot, &plain));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn require_working_copy_matches_php_error() {
+    let tag = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let base =
+        std::env::temp_dir().join(format!("arc-rs-list-require-{}-{tag}", std::process::id()));
+
+    let plain = base.join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    assert_eq!(
+        require_working_copy(&plain).unwrap_err(),
+        "This command must be run in a Git, Mercurial or Subversion working copy."
+    );
+
+    // Mercurial and Subversion checkouts pass without shelling out to git.
+    let hg = base.join("hg");
+    std::fs::create_dir_all(hg.join(".hg")).unwrap();
+    assert!(require_working_copy(&hg).is_ok());
+    let svn = base.join("svn");
+    std::fs::create_dir_all(svn.join(".svn")).unwrap();
+    assert!(require_working_copy(&svn).is_ok());
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn run_in_fails_outside_repo_before_conduit() {
+    let tag = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let plain =
+        std::env::temp_dir().join(format!("arc-rs-list-runin-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&plain).unwrap();
+
+    // No conduit is configured either, but the repository check fires
+    // first, exactly like the PHP runtime ordering.
+    assert_eq!(run_in(&plain, &args(&[])), ExitCode::FAILURE);
+    assert_eq!(run_in(&plain, &args(&["--bogus"])), ExitCode::FAILURE);
+    assert_eq!(run_in(&plain, &args(&["--help"])), ExitCode::SUCCESS);
+
+    std::fs::remove_dir_all(&plain).ok();
+}
