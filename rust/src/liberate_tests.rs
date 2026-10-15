@@ -221,15 +221,32 @@ fn finds_rebuild_script_upwards() {
 }
 
 #[test]
-fn out_of_tree_libraries_resolve_script_via_binary() {
-    // Nothing above a bare temp dir, so the lookup falls through to the
-    // binary-relative search, which finds the shipped script (the test
-    // binary lives under the worktree holding `support/`).
+fn exe_ancestor_search_finds_script_in_fake_tree() {
+    // Hermetic: the ancestor walk must not depend on where the test
+    // binary lives (`CARGO_TARGET_DIR` may sit outside the repo, as in
+    // CI's gates image), so exercise it against a fake install tree.
+    let dir = scratch("exe-search");
+    let script = dir.join("support/lib/rebuild-map.php");
+    std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+    std::fs::write(&script, "<?php\n").unwrap();
+    let fake_exe = dir.join("bin").join("arc");
+    assert_eq!(find_in_ancestors(&fake_exe), Some(script));
+
+    let bare = scratch("exe-search-bare");
+    std::fs::create_dir_all(bare.join("bin")).unwrap();
+    assert_eq!(find_in_ancestors(&bare.join("bin").join("arc")), None);
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&bare).ok();
+}
+
+#[test]
+fn out_of_tree_lookup_never_returns_garbage() {
+    // The public lookup may or may not resolve via the real binary
+    // location depending on the environment; either way it must never
+    // return a path that does not exist.
     let bare = scratch("out-of-tree");
-    assert_eq!(
-        find_rebuild_script(&bare, &bare),
-        Some(repo_root().join("support/lib/rebuild-map.php"))
-    );
+    let found = find_rebuild_script(&bare, &bare);
+    assert!(found.is_none_or(|path| path.is_file()));
     std::fs::remove_dir_all(&bare).ok();
 }
 

@@ -326,24 +326,30 @@ pub fn ensure_library(path: &Path, input: &mut dyn BufRead) -> Result<bool, Stri
 /// The binary search is the install story: `arc-rs` ships with a `support/`
 /// tree next to its install root (like PHP's install-relative bundled
 /// script), so out-of-tree libraries still resolve the script.
+/// Search `start` and its ancestors for `support/lib/rebuild-map.php`.
+/// Pure helper behind [`find_rebuild_script`]; split out so tests do not
+/// depend on where the test binary lives (e.g. `CARGO_TARGET_DIR` outside
+/// the repo, as in CI's gates image).
+fn find_in_ancestors(start: &Path) -> Option<PathBuf> {
+    start.ancestors().find_map(|ancestor| {
+        let candidate = ancestor.join("support/lib/rebuild-map.php");
+        candidate.is_file().then(|| candidate)
+    })
+}
+
 pub fn find_rebuild_script(path: &Path, fallback: &Path) -> Option<PathBuf> {
     for root in [path, fallback] {
-        for ancestor in root.ancestors() {
-            let candidate = ancestor.join("support/lib/rebuild-map.php");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
+        if let Some(found) = find_in_ancestors(root) {
+            return Some(found);
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        for ancestor in exe.ancestors() {
-            let candidate = ancestor.join("support/lib/rebuild-map.php");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+    // Installed binaries (`cargo install` lays out no `support/` tree)
+    // resolve the script only when run from a checkout carrying it,
+    // same as `anoid`. A dev binary under `rust/target/` additionally
+    // resolves via its own ancestors.
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| find_in_ancestors(&exe))
 }
 
 /// Rebuild one v2 library map via `php rebuild-map.php`.
