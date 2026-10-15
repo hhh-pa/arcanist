@@ -154,3 +154,90 @@ func TestExtractTarGzRejectsAbsoluteDotDotSymlink(t *testing.T) {
 		t.Fatal("escape wrote outside dest")
 	}
 }
+
+func TestExtractTarGzKeepsValidSymlink(t *testing.T) {
+	dir := t.TempDir()
+	probe := filepath.Join(dir, "probe")
+	if err := os.Symlink("target.txt", probe); err != nil {
+		t.Skipf("symlink creation unavailable: %v", err)
+	}
+	os.Remove(probe)
+	archive := filepath.Join(dir, "tool.tar.gz")
+	dest := filepath.Join(dir, "out")
+	writeTar(t, archive, []tarEntry{
+		{name: "target.txt", flag: tar.TypeReg, body: "data"},
+		{name: "link", linkname: "target.txt", flag: tar.TypeSymlink},
+		// Link stored before its destination: the lenient
+		// resolution must tolerate the missing leaf.
+		{name: "early", linkname: "later.txt", flag: tar.TypeSymlink},
+		{name: "later.txt", flag: tar.TypeReg, body: "late"},
+	})
+	if err := extractTarGz(archive, dest); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.Readlink(filepath.Join(dest, "link"))
+	if err != nil || got != "target.txt" {
+		t.Fatalf("readlink = %q, %v", got, err)
+	}
+	blob, err := os.ReadFile(filepath.Join(dest, "link"))
+	if err != nil || string(blob) != "data" {
+		t.Fatalf("through link = %q, %v", blob, err)
+	}
+	blob, err = os.ReadFile(filepath.Join(dest, "early"))
+	if err != nil || string(blob) != "late" {
+		t.Fatalf("through early link = %q, %v", blob, err)
+	}
+}
+
+func TestExtractTarGzKeepsValidHardlink(t *testing.T) {
+	dir := t.TempDir()
+	archive := filepath.Join(dir, "tool.tar.gz")
+	dest := filepath.Join(dir, "out")
+	writeTar(t, archive, []tarEntry{
+		{name: "orig.txt", flag: tar.TypeReg, body: "data"},
+		{name: "hard", linkname: "orig.txt", flag: tar.TypeLink},
+	})
+	if err := extractTarGz(archive, dest); err != nil {
+		t.Fatal(err)
+	}
+	blob, err := os.ReadFile(filepath.Join(dest, "hard"))
+	if err != nil || string(blob) != "data" {
+		t.Fatalf("through hardlink = %q, %v", blob, err)
+	}
+}
+
+func TestExtractTarGzRejectsLinksThroughPlantedSymlink(t *testing.T) {
+	cases := []struct {
+		name  string
+		entry tarEntry
+		want  string
+	}{
+		{"link-location", tarEntry{name: "escape/link", linkname: "victim", flag: tar.TypeSymlink}, "symlink location escapes"},
+		{"link-target", tarEntry{name: "link", linkname: "escape/victim", flag: tar.TypeSymlink}, "symlink escapes"},
+		{"hardlink-target", tarEntry{name: "hard", linkname: "escape/victim", flag: tar.TypeLink}, "hardlink escapes"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			outside := t.TempDir()
+			dest := filepath.Join(dir, "out")
+			if err := os.MkdirAll(dest, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			// Planted redirect, as an earlier archive entry could leave one.
+			if err := os.Symlink(outside, filepath.Join(dest, "escape")); err != nil {
+				t.Skipf("symlink creation unavailable: %v", err)
+			}
+			archive := filepath.Join(dir, "evil.tar.gz")
+			writeTar(t, archive, []tarEntry{c.entry})
+			err := extractTarGz(archive, dest)
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("err = %v, want %q", err, c.want)
+			}
+			left, readErr := os.ReadDir(outside)
+			if readErr != nil || len(left) != 0 {
+				t.Fatalf("planted escape wrote outside dest: %v %v", left, readErr)
+			}
+		})
+	}
+}

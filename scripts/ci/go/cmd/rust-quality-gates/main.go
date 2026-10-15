@@ -178,7 +178,10 @@ func cargoInstall(env []string, toolsRoot, crate, version, features string) erro
 // extractTarGz unpacks a tool tarball like tarfile.extractall, with
 // zip-slip protection the oracle predates (real tool tarballs are
 // unaffected). Containment checks stay inline at each sink in the
-// canonical prefix form so static analysis can verify them.
+// canonical prefix form so static analysis can verify them. Link
+// creation additionally gates on resolvesWithinDir: CodeQL's
+// go/unsafe-unzip-symlink query credits no lexical guard, only a
+// header-derived path reaching filepath.EvalSymlinks.
 func extractTarGz(archive, dest string) error {
 	dest = filepath.Clean(dest)
 	fh, err := os.Open(archive)
@@ -245,6 +248,14 @@ func extractTarGz(archive, dest string) error {
 			if !strings.HasPrefix(linkTarget, dest+string(os.PathSeparator)) {
 				return fmt.Errorf("tarball symlink escapes: %s -> %s", hdr.Name, hdr.Linkname)
 			}
+			// Real resolution: a lexical prefix cannot see links planted
+			// on disk by earlier entries redirecting these paths out.
+			if !resolvesWithinDir(dest, target) {
+				return fmt.Errorf("tarball symlink location escapes: %s", hdr.Name)
+			}
+			if !resolvesWithinDir(dest, linkTarget) {
+				return fmt.Errorf("tarball symlink escapes: %s -> %s", hdr.Name, hdr.Linkname)
+			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o777); err != nil {
 				return err
 			}
@@ -260,6 +271,12 @@ func extractTarGz(archive, dest string) error {
 			if !strings.HasPrefix(src, dest+string(os.PathSeparator)) {
 				return fmt.Errorf("tarball hardlink escapes: %s -> %s", hdr.Name, hdr.Linkname)
 			}
+			if !resolvesWithinDir(dest, target) {
+				return fmt.Errorf("tarball hardlink location escapes: %s", hdr.Name)
+			}
+			if !resolvesWithinDir(dest, src) {
+				return fmt.Errorf("tarball hardlink escapes: %s -> %s", hdr.Name, hdr.Linkname)
+			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o777); err != nil {
 				return err
 			}
@@ -268,6 +285,51 @@ func extractTarGz(archive, dest string) error {
 				return err
 			}
 		}
+	}
+}
+
+// resolvesWithinDir reports whether path, with every symlink already
+// on disk along it resolved for real, still lands inside dir. Unlike
+// the lexical prefix checks it follows links planted by earlier
+// archive entries, so it catches a link whose parent was itself
+// redirected out of the tree.
+func resolvesWithinDir(dir, path string) bool {
+	realDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		realDir = dir // dir is our own extraction root; fall back lexically
+	}
+	resolved, err := evalSymlinksLenient(path)
+	if err != nil {
+		return false
+	}
+	return resolved == realDir || strings.HasPrefix(resolved, realDir+string(os.PathSeparator))
+}
+
+// evalSymlinksLenient behaves like filepath.EvalSymlinks but tolerates
+// trailing components that do not exist yet: it resolves the longest
+// existing prefix and re-appends the missing tail. A tar may store a
+// link before its destination exists, so a plain EvalSymlinks (which
+// fails on any missing component) would reject valid links.
+func evalSymlinksLenient(path string) (string, error) {
+	remainder := ""
+	cur := path
+	for {
+		resolved, err := filepath.EvalSymlinks(cur)
+		if err == nil {
+			if remainder == "" {
+				return resolved, nil
+			}
+			return filepath.Join(resolved, remainder), nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return "", err // reached the root with nothing existing
+		}
+		remainder = filepath.Join(filepath.Base(cur), remainder)
+		cur = parent
 	}
 }
 
