@@ -175,6 +175,25 @@ func cargoInstall(env []string, toolsRoot, crate, version, features string) erro
 	return run(cmd, env, cwd)
 }
 
+// withinDir reports whether cleaned path stays inside dest.
+func withinDir(dest, path string) bool {
+	sep := string(os.PathSeparator)
+	return path == dest || strings.HasPrefix(path, filepath.Clean(dest)+sep)
+}
+
+// safeJoin resolves a tar entry name under dest, rejecting absolute
+// paths and ".." escapes (ZipSlip guard for extractTarGz).
+func safeJoin(dest, name string) (string, error) {
+	if filepath.IsAbs(name) {
+		return "", fmt.Errorf("tarball entry is absolute: %s", name)
+	}
+	target := filepath.Join(dest, name)
+	if !withinDir(dest, target) {
+		return "", fmt.Errorf("tarball entry escapes: %s", name)
+	}
+	return target, nil
+}
+
 // extractTarGz unpacks a tool tarball like tarfile.extractall, with
 // zip-slip protection the oracle predates (real tool tarballs are
 // unaffected).
@@ -198,9 +217,9 @@ func extractTarGz(archive, dest string) error {
 		if err != nil {
 			return err
 		}
-		target := filepath.Join(dest, hdr.Name)
-		if !strings.HasPrefix(target, dest+string(os.PathSeparator)) && target != dest {
-			return fmt.Errorf("tarball entry escapes: %s", hdr.Name)
+		target, err := safeJoin(dest, hdr.Name)
+		if err != nil {
+			return err
 		}
 		switch hdr.Typeflag {
 		case tar.TypeDir:
@@ -225,6 +244,13 @@ func extractTarGz(archive, dest string) error {
 				return closeErr
 			}
 		case tar.TypeSymlink:
+			resolved := hdr.Linkname
+			if !filepath.IsAbs(resolved) {
+				resolved = filepath.Join(filepath.Dir(target), resolved)
+			}
+			if !withinDir(dest, resolved) {
+				return fmt.Errorf("tarball symlink escapes: %s -> %s", hdr.Name, hdr.Linkname)
+			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o777); err != nil {
 				return err
 			}
@@ -233,11 +259,15 @@ func extractTarGz(archive, dest string) error {
 				return err
 			}
 		case tar.TypeLink:
+			src, err := safeJoin(dest, hdr.Linkname)
+			if err != nil {
+				return fmt.Errorf("tarball hardlink escapes: %s -> %s", hdr.Name, hdr.Linkname)
+			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o777); err != nil {
 				return err
 			}
 			os.Remove(target)
-			if err := os.Link(filepath.Join(dest, hdr.Linkname), target); err != nil {
+			if err := os.Link(src, target); err != nil {
 				return err
 			}
 		}
