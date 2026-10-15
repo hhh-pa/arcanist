@@ -1,0 +1,7 @@
+line one
+<<<<<<<
+ours
+=======
+theirs
+>>>>>>>
+line two

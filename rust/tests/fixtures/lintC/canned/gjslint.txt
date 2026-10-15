@@ -1,0 +1,4 @@
+----- FILE  :  sample.js -----
+Line 3, E:0001: Missing semicolon at end of line
+Line 7, E:0213: Extra semicolon after brace
+Found 2 errors in 1 files

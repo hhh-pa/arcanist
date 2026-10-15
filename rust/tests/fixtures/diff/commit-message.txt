@@ -1,0 +1,11 @@
+Add retry helper to uploader
+
+Retries failed chunk uploads with exponential backoff so flaky
+connections no longer fail the whole run.
+
+Summary: Retry failed chunk uploads with backoff.
+Test Plan: cargo test uploader
+Reviewers: alice, bob
+CC: carol
+Tasks: T123, T456
+Differential Revision: D789

@@ -1,0 +1,2 @@
+default                    1:bbb111222333
+stable                     0:aaa000111222 (inactive)

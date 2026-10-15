@@ -1,0 +1,2 @@
+SyntaxError: unrecognised input in sample.less on line 5, column 3:
+NameError: variable @missing is undefined in sample.less on line 2, column 12:

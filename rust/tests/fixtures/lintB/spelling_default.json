@@ -1,0 +1,53 @@
+{
+  "rules": {
+    "exact": {
+      "abandonning": "abandoning",
+      "abigious": "ambiguous",
+      "absense": "absence",
+      "accomodate": "accommodate",
+      "accesing": "accessing",
+      "adress": "address",
+      "arguement": "argument",
+      "begining": "beginning",
+      "calender": "calendar",
+      "changable": "changeable",
+      "commited": "committed",
+      "completly": "completely",
+      "definately": "definitely",
+      "delimeter": "delimiter",
+      "enviroment": "environment",
+      "expecially": "especially",
+      "familar": "familiar",
+      "guage": "gauge",
+      "incompatable": "incompatible",
+      "inconsistant": "inconsistent",
+      "independant": "independent",
+      "lauch": "launch",
+      "libary": "library",
+      "maintainance": "maintenance",
+      "managment": "management",
+      "neccessary": "necessary",
+      "noticable": "noticeable",
+      "persistant": "persistent",
+      "preceed": "precede",
+      "prefered": "preferred",
+      "reasearch": "research",
+      "retreive": "retrieve",
+      "seperate": "separate",
+      "speach": "speech",
+      "standart": "standard",
+      "succesful": "successful",
+      "supress": "suppress",
+      "teh": "the",
+      "unecessary": "unnecessary",
+      "wierd": "weird"
+    },
+    "partial": {
+      "recieve": "receive",
+      "uft8": "utf8",
+      "lenght": "length",
+      "heigth": "height",
+      "fuction": "function"
+    }
+  }
+}

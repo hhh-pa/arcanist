@@ -1,0 +1,3 @@
+target.py:1:1 undefined name 'foo'
+target.py:2:5 'os' imported but unused
+target.py:4:7 local variable 'x' referenced before assignment

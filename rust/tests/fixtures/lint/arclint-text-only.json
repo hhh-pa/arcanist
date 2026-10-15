@@ -1,0 +1,7 @@
+{
+  "linters": {
+    "text": {
+      "type": "text"
+    }
+  }
+}

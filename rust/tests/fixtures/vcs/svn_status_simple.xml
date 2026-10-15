@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<status>
+<target path=".">
+<entry path="modified.txt">
+<wc-status props="none" item="modified" revision="42">
+<commit revision="40">
+<author>alice</author>
+<date>2026-10-14T12:00:00.000000Z</date>
+</commit>
+</wc-status>
+</entry>
+<entry path="added.txt">
+<wc-status props="none" item="added" revision="42">
+</wc-status>
+</entry>
+<entry path="props.txt">
+<wc-status props="modified" item="normal" revision="42">
+</wc-status>
+</entry>
+<entry path="newdir">
+<wc-status props="none" item="unversioned">
+</wc-status>
+</entry>
+<entry path="gone.txt">
+<wc-status props="none" item="missing" revision="42">
+</wc-status>
+</entry>
+<entry path="del.txt">
+<wc-status props="none" item="deleted" revision="42">
+</wc-status>
+</entry>
+<entry path="conflict.txt">
+<wc-status props="none" item="conflicted" revision="42">
+</wc-status>
+</entry>
+<entry path="tree.txt">
+<wc-status props="none" item="normal" revision="42" tree-conflicted="true">
+</wc-status>
+</entry>
+</target>
+</status>

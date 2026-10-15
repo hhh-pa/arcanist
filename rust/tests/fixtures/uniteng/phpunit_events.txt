@@ -1,0 +1,6 @@
+{"event":"testStart","test":"CalcTest::testAdd"}
+{"event":"test","test":"CalcTest::testAdd","status":"pass","time":0.02}
+{"event":"testStart","test":"CalcTest::testDiv"}
+{"event":"test","test":"CalcTest::testDiv","status":"fail","message":"Failed asserting that 0 matches expected 1.","time":0.01,"trace":[{"file":"CalcTest.php","line":42}]}
+{"event":"testStart","test":"CalcTest::testSkip"}
+{"event":"test","test":"CalcTest::testSkip","status":"error","message":"Skipped Test: needs db","time":0}

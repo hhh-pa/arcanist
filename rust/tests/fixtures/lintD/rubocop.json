@@ -1,0 +1,1 @@
+{"files": [{"path": "scratch/target.rb", "offenses": [{"severity": "convention", "message": "Prefer single-quoted strings.", "cop_name": "Style/StringLiterals", "location": {"line": 2, "column": 7, "length": 5}}, {"severity": "error", "message": "Syntax error found.", "cop_name": "Lint/Syntax", "location": {"line": 9, "column": 1, "length": 1}}]}]}

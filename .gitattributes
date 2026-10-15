@@ -1,0 +1,2 @@
+# Byte-exact console-wrap fixtures: never convert line endings.
+rust/tests/fixtures/terminal-wrap/* -text

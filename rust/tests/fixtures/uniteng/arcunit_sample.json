@@ -1,0 +1,4 @@
+{"engines": {
+  "py": {"type": "phutil"},
+  "csharp": {"type": "xunit", "include": ["src/", "lib/"], "exclude": "gen/"}
+}}

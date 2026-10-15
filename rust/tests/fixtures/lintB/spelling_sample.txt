@@ -1,0 +1,4 @@
+The begining of the story.
+Teh main function recieves lenght and heigth.
+A clean line with nothing wrong.
+Adress the enviroment today.

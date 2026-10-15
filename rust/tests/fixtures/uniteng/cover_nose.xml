@@ -1,0 +1,17 @@
+<?xml version="1.0" ?>
+<coverage version="3.5">
+  <packages><package name="pkg"><classes>
+    <class filename="COVER_ROOT/pkg/mod.py" name="mod">
+      <lines>
+        <line number="1" hits="1"/>
+        <line number="2" hits="0"/>
+        <line number="4" hits="3"/>
+      </lines>
+    </class>
+    <class filename="/elsewhere/other.py" name="other">
+      <lines>
+        <line number="1" hits="1"/>
+      </lines>
+    </class>
+  </classes></package></packages>
+</coverage>

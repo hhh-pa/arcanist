@@ -1,0 +1,12 @@
+changeset:   15101:a21ccf4412d5223a9f4d5e6b7c8d9e0f1a2b3c4
+parent:      15095:ec222a29bdf0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6
+user:        Test User <t@example.test>
+date:        Thu Oct 14 12:34:56 2026 +0200
+summary:     second commit
+
+changeset:   15095:ec222a29bdf0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6
+user:        Test User <t@example.test>
+date:        Wed Oct 13 09:00:00 2026 +0200
+branch:      stable
+tag:         v1
+summary:     first commit

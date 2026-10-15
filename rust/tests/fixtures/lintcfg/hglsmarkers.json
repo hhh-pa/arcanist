@@ -1,0 +1,1 @@
+[{"type": "bookmark", "name": "review", "node": "abc123456789", "isActive": true, "description": "first line of description\nsecond line"}, {"type": "bookmark", "name": "wip", "node": "def012345678"}, {"type": "bookmark", "name": "old", "node": "aaaabbbbcccc", "isClosed": true}, {"type": "branch", "name": "default", "node": "bbbbccccdddd"}]

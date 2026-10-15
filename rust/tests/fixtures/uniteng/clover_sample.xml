@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<coverage generated="1">
+  <project timestamp="1">
+    <file name="COVER_ROOT/src/Calc.php">
+      <line num="1" type="stmt" count="2"/>
+      <line num="2" type="stmt" count="0"/>
+      <line num="3" type="method" count="0"/>
+    </file>
+  </project>
+</coverage>

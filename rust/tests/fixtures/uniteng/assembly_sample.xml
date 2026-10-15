@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<assembly name="App.Tests" total="3" passed="1" failed="1" skipped="1">
+  <test name="App.Tests.Calc.Adds" time="0.010" result="Pass"/>
+  <test name="App.Tests.Calc.Divides" time="0.020" result="Fail">
+    <failure><message>Expected 1 but got 0</message><stack-trace>at App.Tests.Calc.Divides()</stack-trace></failure>
+  </test>
+  <test name="App.Tests.Calc.Skips" time="0.000" result="Skip">
+    <reason><message>not implemented</message></reason>
+  </test>
+</assembly>

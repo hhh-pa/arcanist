@@ -1,0 +1,3 @@
+file.txt
+src/main.rs
+docs/readme.md

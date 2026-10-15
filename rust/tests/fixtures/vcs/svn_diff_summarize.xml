@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<diff>
+<paths>
+<path props="none" item="modified" kind="file">https://svn.example.test/repo/trunk/a.txt</path>
+<path props="none" item="added" kind="file">https://svn.example.test/repo/trunk/b.txt</path>
+<path props="none" item="deleted" kind="file">https://svn.example.test/repo/trunk/c.txt</path>
+</paths>
+</diff>

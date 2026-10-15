@@ -1,0 +1,2 @@
+target.py:2:5: E225 missing whitespace around operator
+target.py:4:80: W291 trailing whitespace

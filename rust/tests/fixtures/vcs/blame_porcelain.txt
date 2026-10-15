@@ -1,0 +1,9 @@
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA 1 1 1
+author Old One
+boundary
+filename app/main.rs
+	old line
+BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB 2 2 1
+author New One
+filename app/main.rs
+	new line

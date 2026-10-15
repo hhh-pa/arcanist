@@ -1,0 +1,387 @@
+//! `arc set-config` — write arc configuration settings.
+//!
+//! PHP reference: `src/workflow/ArcanistSetConfigWorkflow.php`, with value
+//! coercion from `src/configuration/ArcanistSettings.php` (`willWriteValue`)
+//! and storage paths from `src/configuration/ArcanistConfigurationManager.php`
+//! (`~/.arcrc`) plus
+//! `src/workingcopyidentity/ArcanistWorkingCopyIdentity.php`
+//! (`.git/arc/config`).
+//!
+//! User writes preserve the rest of `~/.arcrc` (hosts, aliases). An empty
+//! value deletes the key. Local writes only support git working copies
+//! (see T1128).
+//!
+//! Console output goes through the shared [`arc_rs::terminal`] API: the
+//! unknown-key warning is a true `tsprintf()` site (escaped `%s`
+//! conversions), `pht()` sites use `pht`, and markup-free `sprintf` sites
+//! use plain `format!`.
+
+extern crate self as arc_rs;
+
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use arc_rs::terminal::{PhtArg, TVal};
+use arc_rs::{config, get_config, git, terminal};
+
+/// Subcommand name, matching `arc set-config`.
+pub const NAME: &str = "set-config";
+
+const USAGE: &str = "usage: arc set-config [--local] [--] <name> <value>\n\
+\n\
+Write an arc configuration option. Writes user configuration (~/.arcrc)\n\
+by default, or the working copy's local configuration (.git/arc/config)\n\
+with --local. An empty value deletes the key.\n\
+\n\
+Options:\n\
+  --local         Write local (working-copy) config instead of user config.\n\
+  -h, --help      Show this help.\n";
+
+/// Setting type for coercion, mirroring the `ArcanistSettings` table
+/// (`string`, `bool`, `list`, `wild`, `aliases`). Unknown keys are `wild`.
+#[must_use]
+pub fn setting_type(key: &str) -> &'static str {
+    get_config::setting_type(key)
+}
+
+/// True when `key` is a setting arc recognizes.
+#[must_use]
+pub fn is_known(key: &str) -> bool {
+    setting_type(key) != "wild"
+}
+
+/// Coerce a CLI string into a config value, mirroring
+/// `ArcanistSettings::willWriteValue()`.
+///
+/// `list` accepts any JSON array or object: PHP decodes with `assoc=true`,
+/// so objects arrive as (accepted) arrays. `bool` folds the usual
+/// spellings; note PHP maps `''` to false too, though the CLI deletes on
+/// empty values before coercion ever runs.
+pub fn coerce_value(key: &str, raw: &str) -> Result<serde_json::Value, String> {
+    match setting_type(key) {
+        "bool" => {
+            let lower = raw.to_lowercase();
+            if ["false", "no", "off", "", "0"].contains(&lower.as_str()) {
+                Ok(serde_json::Value::Bool(false))
+            } else if ["true", "yes", "on", "1"].contains(&lower.as_str()) {
+                Ok(serde_json::Value::Bool(true))
+            } else {
+                Err(terminal::pht(
+                    "Type of setting '%s' must be boolean, like 'true' or 'false'.",
+                    &[PhtArg::Text(key)],
+                ))
+            }
+        }
+        "list" => {
+            let err = || {
+                terminal::pht(
+                    "Type of setting '%s' must be list. You can specify a list in JSON, like: %s",
+                    &[
+                        PhtArg::Text(key),
+                        PhtArg::Text("[\"apple\", \"banana\", \"cherry\"]"),
+                    ],
+                )
+            };
+            let parsed: serde_json::Value = serde_json::from_str(raw).map_err(|_| err())?;
+            if parsed.is_array() || parsed.is_object() {
+                Ok(parsed)
+            } else {
+                Err(err())
+            }
+        }
+        "aliases" => Err(terminal::pht(
+            "Use \"arc alias\" to configure aliases, not \"arc set-config\".",
+            &[],
+        )),
+        _ => Ok(serde_json::Value::String(raw.to_string())),
+    }
+}
+
+/// Format a value for display, mirroring
+/// `ArcanistSettings::formatConfigValueForDisplay()`.
+#[must_use]
+pub fn format_value(value: &serde_json::Value) -> String {
+    get_config::format_value("", value)
+}
+
+/// The `(was ...)` operand: PHP formats the old value (possibly null)
+/// before comparing, so a missing key renders as `null`.
+fn format_old(old: &Option<serde_json::Value>) -> String {
+    match old {
+        Some(previous) => format_value(previous),
+        None => "null".to_string(),
+    }
+}
+
+/// Warning text for an unrecognized key, or `None` when known, with the
+/// process ANSI setting. Like PHP, unknown keys warn-but-proceed.
+#[must_use]
+pub fn warn_if_unknown(key: &str) -> Option<String> {
+    warn_if_unknown_ansi(key, terminal::ansi_enabled())
+}
+
+/// Warning text with an explicit ANSI setting:
+/// `writeErr('%s', tsprintf("**%s:** %s\\n", pht('Warning'),
+/// pht('The configuration key "%s" is not recognized by arc. It may be
+/// misspelled or out of date.', $key)))`. This is a true `tsprintf()`
+/// site, so both conversions are escaping `%s`.
+#[must_use]
+pub fn warn_if_unknown_ansi(key: &str, ansi: bool) -> Option<String> {
+    if is_known(key) {
+        return None;
+    }
+    let warning = terminal::pht("Warning", &[]);
+    let detail = terminal::pht(
+        "The configuration key \"%s\" is not recognized by arc. It may be misspelled or out of date.",
+        &[PhtArg::Text(key)],
+    );
+    let text = terminal::tsprintf_ansi(
+        "**%s:** %s\n",
+        &[TVal::Text(&warning), TVal::Text(&detail)],
+        ansi,
+    )
+    .map(|t| t.to_string())
+    .unwrap_or_default();
+    Some(text.trim_end_matches('\n').to_string())
+}
+
+/// Read a whole `~/.arcrc` document; a missing file yields `{}`. The parse
+/// error mirrors `readUserConfigurationFile()`, including its literal
+/// `~/.arcrc`.
+pub fn read_user_doc(path: &Path) -> Result<serde_json::Value, String> {
+    if !path.is_file() {
+        return Ok(serde_json::json!({}));
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read '{}': {e}", path.display()))?;
+    let doc: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
+        terminal::pht(
+            "Your '%s' file is not a valid JSON file.",
+            &[PhtArg::Text("~/.arcrc")],
+        )
+    })?;
+    if doc.is_object() {
+        Ok(doc)
+    } else {
+        Err(format!("'{}' is not a JSON object", path.display()))
+    }
+}
+
+fn write_json_file(path: &Path, doc: &serde_json::Value, chmod_600: bool) -> Result<(), String> {
+    let mut text =
+        serde_json::to_string_pretty(doc).map_err(|e| format!("cannot encode JSON: {e}"))?;
+    text.push('\n');
+    std::fs::write(path, text).map_err(|e| format!("cannot write '{}': {e}", path.display()))?;
+    // The user file may hold tokens; PHP hardens it to 0600 on unix (the
+    // local file gets no chmod). Best effort: a chmod failure must not
+    // fail the write itself.
+    #[cfg(unix)]
+    if chmod_600 && let Ok(metadata) = std::fs::metadata(path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(path, permissions).ok();
+    }
+    #[cfg(not(unix))]
+    let _ = chmod_600;
+    Ok(())
+}
+
+/// Write a whole `~/.arcrc` document.
+pub fn write_user_doc(path: &Path, doc: &serde_json::Value) -> Result<(), String> {
+    write_json_file(path, doc, true)
+}
+
+/// Set or delete `key` in the user config, preserving the rest of the
+/// file. Returns the message to print. An empty `raw` deletes the key.
+pub fn apply_user(user_file: &Path, key: &str, raw: &str) -> Result<String, String> {
+    let mut doc = read_user_doc(user_file)?;
+    let message = {
+        let obj = doc.as_object_mut().expect("read_user_doc object");
+        let config_value = obj
+            .entry("config".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        let config = config_value.as_object_mut().ok_or_else(|| {
+            format!(
+                "'{}' has a non-object \"config\" section",
+                user_file.display()
+            )
+        })?;
+        apply_to_map(config, key, raw, "user")?
+    };
+    write_user_doc(user_file, &doc)?;
+    Ok(message)
+}
+
+/// Local config file for a repository root: `<root>/.git/arc/config`.
+#[must_use]
+pub fn local_config_path(repo_root: &Path) -> PathBuf {
+    repo_root.join(".git").join("arc").join("config")
+}
+
+/// Read a local config file; a missing file yields an empty config. The
+/// parse error mirrors `readLocalArcConfig()`.
+pub fn read_local_file(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    if !path.is_file() {
+        return Ok(serde_json::Map::new());
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read '{}': {e}", path.display()))?;
+    let doc: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
+        let name = path.display().to_string();
+        terminal::pht("Failed to parse '%s' as JSON.", &[PhtArg::Text(&name)])
+    })?;
+    doc.as_object()
+        .cloned()
+        .ok_or_else(|| format!("'{}' is not a JSON object", path.display()))
+}
+
+/// Write a local config file, creating `.git/arc/` as needed.
+pub fn write_local_file(
+    path: &Path,
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create '{}': {e}", parent.display()))?;
+    }
+    write_json_file(path, &serde_json::Value::Object(map.clone()), false)
+}
+
+/// Set or delete `key` in the local config of the repository rooted at
+/// `repo_root`. Returns the message to print.
+pub fn apply_local_at(repo_root: &Path, key: &str, raw: &str) -> Result<String, String> {
+    let path = local_config_path(repo_root);
+    let mut map = read_local_file(&path)?;
+    let message = apply_to_map(&mut map, key, raw, "local")?;
+    write_local_file(&path, &map)?;
+    Ok(message)
+}
+
+/// Set or delete `key` in the local config of the repository containing
+/// `dir`. Fails outside a git working copy with the stock
+/// `scripts/arcanist.php` usage error (`--local` requires a repository).
+pub fn apply_local(dir: &Path, key: &str, raw: &str) -> Result<String, String> {
+    if !git::is_inside_work_tree(dir) {
+        return Err(terminal::pht(
+            "This command must be run in a Git, Mercurial or Subversion working copy.",
+            &[],
+        ));
+    }
+    let top = git::stdout_text(dir, &["rev-parse", "--show-toplevel"])?;
+    apply_local_at(Path::new(&top), key, raw)
+}
+
+fn apply_to_map(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    raw: &str,
+    which: &str,
+) -> Result<String, String> {
+    let old = map.get(key).cloned();
+    // `pht('Deleted key "%s" from %s config.', ...)` vs
+    // `pht('Deleted key "%s" from %s config (was %s).', ...)`: PHP formats
+    // `$old` before the null check, so the `(was ...)` form always wins --
+    // even for keys that never existed (`(was null)`). Same quirk for the
+    // `pht('Set key ...')` pair. Both print through markup-free
+    // `tsprintf("%s\\n", $message)`, so plain `pht()` is exact.
+    if raw.is_empty() {
+        map.remove(key);
+        let was = format_old(&old);
+        Ok(terminal::pht(
+            "Deleted key \"%s\" from %s config (was %s).",
+            &[PhtArg::Text(key), PhtArg::Text(which), PhtArg::Text(&was)],
+        ))
+    } else {
+        let value = coerce_value(key, raw)?;
+        map.insert(key.to_string(), value.clone());
+        let display = format_value(&value);
+        let was = format_old(&old);
+        Ok(terminal::pht(
+            "Set key \"%s\" = %s in %s config (was %s).",
+            &[
+                PhtArg::Text(key),
+                PhtArg::Text(&display),
+                PhtArg::Text(which),
+                PhtArg::Text(&was),
+            ],
+        ))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Options {
+    local: bool,
+    key: String,
+    value: String,
+}
+
+fn parse_args(argv: &[String]) -> Result<Option<Options>, String> {
+    let mut local = false;
+    let mut positional = Vec::new();
+    let mut end_of_flags = false;
+    for arg in argv {
+        if end_of_flags {
+            positional.push(arg.clone());
+        } else if arg == "--" {
+            end_of_flags = true;
+        } else if arg == "--local" {
+            local = true;
+        } else if arg == "-h" || arg == "--help" {
+            return Ok(None);
+        } else if arg.starts_with('-') {
+            return Err(format!("unknown flag '{arg}'"));
+        } else {
+            positional.push(arg.clone());
+        }
+    }
+    if positional.len() != 2 {
+        return Err(terminal::pht("Specify a key and a value.", &[]));
+    }
+    Ok(Some(Options {
+        local,
+        key: positional[0].clone(),
+        value: positional[1].clone(),
+    }))
+}
+
+/// Entry point: `argv` excludes the subcommand name.
+pub fn run(argv: &[String]) -> ExitCode {
+    let options = match parse_args(argv) {
+        Ok(Some(options)) => options,
+        Ok(None) => {
+            print!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Err(message) => {
+            eprintln!("arc {NAME}: {message}\n\n{USAGE}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(warning) = warn_if_unknown(&options.key) {
+        eprintln!("{warning}");
+    }
+    let result = if options.local {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        apply_local(&cwd, &options.key, &options.value)
+    } else {
+        match config::arcrc_path() {
+            Some(path) => apply_user(&path, &options.key, &options.value),
+            None => Err("cannot locate ~/.arcrc (HOME/USERPROFILE is not set)".to_string()),
+        }
+    };
+    match result {
+        Ok(message) => {
+            println!("{message}");
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("arc {NAME}: {message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "set_config_tests.rs"]
+mod set_config_tests;
