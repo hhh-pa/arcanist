@@ -1055,54 +1055,100 @@ pub fn prompt_for_key(io: &mut Io, key: &str, query: &str) -> Result<(), String>
     io.push_out("\n");
     let mut saved_response = io.saved.get(key).map(|saved| saved.response.clone());
     let mut save_scope: Option<PromptScope> = None;
-    let mut is_saved;
-    let response: String;
-    let result: bool;
     loop {
-        let mut candidate = match saved_response.take() {
-            Some(saved) => {
-                is_saved = true;
-                saved
-            }
-            None => {
-                is_saved = false;
-                io.push_out(&format!(">>> {query} [y/N/?] "));
-                let Some(raw) = io.read_answer() else {
-                    return Err(ABORT.to_string());
-                };
-                raw.trim().to_string()
-            }
-        };
+        let (mut candidate, is_saved) = next_prompt_candidate(io, query, &mut saved_response)?;
         if !is_saved {
-            if let Some(stripped) = candidate.strip_suffix('*') {
-                save_scope = Some(PromptScope::User);
-                candidate = stripped.to_string();
-            } else if let Some(stripped) = candidate.strip_suffix('!') {
-                save_scope = Some(PromptScope::WorkingCopy);
-                candidate = stripped.to_string();
-            }
+            let (stripped, scope) = strip_prompt_save_suffix(candidate);
+            candidate = stripped;
+            save_scope = scope.or(save_scope);
             if candidate.is_empty() {
                 candidate = "n".to_string();
             }
         }
-        let lowered = candidate.to_lowercase();
-        if lowered == "y" {
-            response = candidate;
-            result = true;
-            break;
-        }
-        if lowered == "n" {
-            response = candidate;
-            result = false;
-            break;
-        }
-        if candidate == "?" {
-            push_prompt_help(io, key);
-            continue;
+        match classify_prompt_answer(&candidate) {
+            PromptVerdict::Yes => {
+                return finish_prompt(io, key, query, save_scope, is_saved, &candidate, true);
+            }
+            PromptVerdict::No => {
+                return finish_prompt(io, key, query, save_scope, is_saved, &candidate, false);
+            }
+            PromptVerdict::Help => push_prompt_help(io, key),
+            PromptVerdict::Invalid => {}
         }
     }
+}
+
+/// One prompt attempt: the saved response (once), else a printed `>>>`
+/// line plus a stdin answer. Returns the trimmed candidate and whether it
+/// came from a saved response.
+fn next_prompt_candidate(
+    io: &mut Io,
+    query: &str,
+    saved_response: &mut Option<String>,
+) -> Result<(String, bool), String> {
+    match saved_response.take() {
+        Some(saved) => Ok((saved, true)),
+        None => {
+            io.push_out(&format!(">>> {query} [y/N/?] "));
+            let Some(raw) = io.read_answer() else {
+                return Err(ABORT.to_string());
+            };
+            Ok((raw.trim().to_string(), false))
+        }
+    }
+}
+
+/// Split a `*`/`!` save suffix off a live answer, returning the remainder
+/// and the target scope (`saveResponse()`, `:253-285`).
+fn strip_prompt_save_suffix(candidate: String) -> (String, Option<PromptScope>) {
+    if let Some(stripped) = candidate.strip_suffix('*') {
+        return (stripped.to_string(), Some(PromptScope::User));
+    }
+    if let Some(stripped) = candidate.strip_suffix('!') {
+        return (stripped.to_string(), Some(PromptScope::WorkingCopy));
+    }
+    (candidate, None)
+}
+
+/// Classification of one prompt candidate.
+enum PromptVerdict {
+    /// `y` (any case): accept.
+    Yes,
+    /// `n` (any case): decline.
+    No,
+    /// `?`: print help and reprompt.
+    Help,
+    /// Anything else: reprompt silently.
+    Invalid,
+}
+
+/// Classify one prompt candidate (`ArcanistPrompt.php:191-237`).
+fn classify_prompt_answer(candidate: &str) -> PromptVerdict {
+    let lowered = candidate.to_lowercase();
+    if lowered == "y" {
+        PromptVerdict::Yes
+    } else if lowered == "n" {
+        PromptVerdict::No
+    } else if candidate == "?" {
+        PromptVerdict::Help
+    } else {
+        PromptVerdict::Invalid
+    }
+}
+
+/// Finish a prompt: persist a `*`/`!` answer, print the saved-response
+/// notice when the answer was saved, and map the verdict to `Ok`/abort.
+fn finish_prompt(
+    io: &mut Io,
+    key: &str,
+    query: &str,
+    save_scope: Option<PromptScope>,
+    is_saved: bool,
+    response: &str,
+    result: bool,
+) -> Result<(), String> {
     if let Some(scope) = save_scope {
-        save_prompt_response(io, key, &response, scope)?;
+        save_prompt_response(io, key, response, scope)?;
     }
     if is_saved {
         io.push_out(&format!(
@@ -2008,15 +2054,7 @@ pub fn fetch_build_views(
     revisions: &[land_checks::RevisionView],
     conduit_uri: Option<&str>,
 ) -> Result<Vec<land_checks::BuildView>, String> {
-    let mut diff_phids: Vec<String> = Vec::new();
-    for revision in revisions {
-        if let Some(diff) = &revision.diff_phid
-            && !diff.is_empty()
-            && !diff_phids.contains(diff)
-        {
-            diff_phids.push(diff.clone());
-        }
-    }
+    let diff_phids = collect_diff_phids(revisions);
     if diff_phids.is_empty() {
         return Ok(Vec::new());
     }
@@ -2027,14 +2065,7 @@ pub fn fetch_build_views(
     let rows = parse_buildable_rows(&buildables)?;
     // Join buildable objectPHID -> revision diffPHID, like
     // `confirmBuilds` (`ArcanistLandEngine.php:623-644`).
-    let mut buildable_to_revision: HashMap<String, String> = HashMap::new();
-    for row in &rows {
-        for revision in revisions {
-            if revision.diff_phid.as_deref() == Some(row.object_phid.as_str()) {
-                buildable_to_revision.insert(row.phid.clone(), revision.phid.clone());
-            }
-        }
-    }
+    let buildable_to_revision = join_buildable_revisions(&rows, revisions);
     if rows.is_empty() {
         return Ok(Vec::new());
     }
@@ -2044,6 +2075,56 @@ pub fn fetch_build_views(
         &serde_json::json!({"buildables": phids}),
     )?;
     let build_rows = parse_build_rows(&builds)?;
+    let behaviors = fetch_plan_behaviors(call, &build_rows)?;
+    let mut views = Vec::new();
+    for row in &build_rows {
+        if let Some(view) =
+            build_view_for_row(row, &rows, &buildable_to_revision, &behaviors, conduit_uri)
+        {
+            views.push(view);
+        }
+    }
+    Ok(views)
+}
+
+/// Distinct non-empty diff PHIDs of `revisions` (legacy rows without one
+/// contribute no builds).
+fn collect_diff_phids(revisions: &[land_checks::RevisionView]) -> Vec<String> {
+    let mut diff_phids: Vec<String> = Vec::new();
+    for revision in revisions {
+        if let Some(diff) = &revision.diff_phid
+            && !diff.is_empty()
+            && !diff_phids.contains(diff)
+        {
+            diff_phids.push(diff.clone());
+        }
+    }
+    diff_phids
+}
+
+/// Join buildable PHID -> landing revision PHID over the revisions'
+/// diff PHIDs (`ArcanistLandEngine.php:623-644`).
+fn join_buildable_revisions(
+    rows: &[BuildableRow],
+    revisions: &[land_checks::RevisionView],
+) -> HashMap<String, String> {
+    let mut buildable_to_revision: HashMap<String, String> = HashMap::new();
+    for row in rows {
+        for revision in revisions {
+            if revision.diff_phid.as_deref() == Some(row.object_phid.as_str()) {
+                buildable_to_revision.insert(row.phid.clone(), revision.phid.clone());
+            }
+        }
+    }
+    buildable_to_revision
+}
+
+/// Load `plan PHID -> arc-land behavior` for the plans referenced by
+/// `build_rows` (`ArcanistBuildBuildplanHardpointQuery.php:21-25`).
+fn fetch_plan_behaviors(
+    call: &diff_submit::ConduitCall<'_>,
+    build_rows: &[BuildRow],
+) -> Result<HashMap<String, String>, String> {
     let mut plan_phids: Vec<String> = build_rows
         .iter()
         .map(|row| row.plan_phid.clone())
@@ -2051,53 +2132,69 @@ pub fn fetch_build_views(
         .collect();
     plan_phids.sort();
     plan_phids.dedup();
-    let behaviors = if plan_phids.is_empty() {
-        HashMap::new()
-    } else {
-        let plans = call(
-            METHOD_BUILDPLAN_SEARCH,
-            &serde_json::json!({"phids": plan_phids}),
-        )?;
-        parse_plan_behaviors(&plans)?
-    };
-    let mut views = Vec::new();
-    for row in &build_rows {
-        let Some(revision_phid) = buildable_to_revision.get(&row.buildable_phid) else {
-            continue;
-        };
-        let behavior = if row.plan_phid.is_empty() {
-            // No plan ref: the build is skipped
-            // (`ArcanistLandEngine.php:578-581`).
-            None
-        } else {
-            Some(
-                behaviors
-                    .get(&row.plan_phid)
-                    .cloned()
-                    .unwrap_or_else(|| land_checks::PLAN_ALWAYS.to_string()),
-            )
-        };
-        let buildable = rows
-            .iter()
-            .find(|candidate| candidate.phid == row.buildable_phid);
-        let (monogram, uri) = match buildable {
-            Some(found) => (
-                found.monogram.clone(),
-                absolute_buildable_uri(conduit_uri, &found.monogram, found.uri.as_deref()),
-            ),
-            None => (String::new(), String::new()),
-        };
-        views.push(land_checks::BuildView {
-            status: row.status.clone(),
-            plan_behavior: behavior,
-            revision_phid: revision_phid.clone(),
-            build_id: row.id,
-            build_name: row.name.clone(),
-            buildable_monogram: monogram,
-            buildable_uri: uri,
-        });
+    if plan_phids.is_empty() {
+        return Ok(HashMap::new());
     }
-    Ok(views)
+    let plans = call(
+        METHOD_BUILDPLAN_SEARCH,
+        &serde_json::json!({"phids": plan_phids}),
+    )?;
+    parse_plan_behaviors(&plans)
+}
+
+/// One build view for `row`, or `None` when its buildable belongs to no
+/// landing revision.
+fn build_view_for_row(
+    row: &BuildRow,
+    rows: &[BuildableRow],
+    buildable_to_revision: &HashMap<String, String>,
+    behaviors: &HashMap<String, String>,
+    conduit_uri: Option<&str>,
+) -> Option<land_checks::BuildView> {
+    let revision_phid = buildable_to_revision.get(&row.buildable_phid)?;
+    let behavior = plan_behavior_for(row, behaviors);
+    let (monogram, uri) = buildable_display_for(rows, &row.buildable_phid, conduit_uri);
+    Some(land_checks::BuildView {
+        status: row.status.clone(),
+        plan_behavior: behavior,
+        revision_phid: revision_phid.clone(),
+        build_id: row.id,
+        build_name: row.name.clone(),
+        buildable_monogram: monogram,
+        buildable_uri: uri,
+    })
+}
+
+/// The arc-land behavior for one build row: `None` (skipped) without a
+/// plan ref (`ArcanistLandEngine.php:578-581`), else the plan's behavior.
+fn plan_behavior_for(row: &BuildRow, behaviors: &HashMap<String, String>) -> Option<String> {
+    if row.plan_phid.is_empty() {
+        return None;
+    }
+    Some(
+        behaviors
+            .get(&row.plan_phid)
+            .cloned()
+            .unwrap_or_else(|| land_checks::PLAN_ALWAYS.to_string()),
+    )
+}
+
+/// The `(monogram, uri)` display pair for one buildable PHID.
+fn buildable_display_for(
+    rows: &[BuildableRow],
+    buildable_phid: &str,
+    conduit_uri: Option<&str>,
+) -> (String, String) {
+    let buildable = rows
+        .iter()
+        .find(|candidate| candidate.phid == buildable_phid);
+    match buildable {
+        Some(found) => (
+            found.monogram.clone(),
+            absolute_buildable_uri(conduit_uri, &found.monogram, found.uri.as_deref()),
+        ),
+        None => (String::new(), String::new()),
+    }
 }
 
 /// Load one revision's landed commit message via
@@ -2762,17 +2859,43 @@ pub fn group_commit_sets(
     commits: &mut [LandCommit],
     display_hash: &dyn Fn(&str) -> String,
 ) -> Result<Vec<CommitSet>, String> {
+    let groups = resolve_group_keys(io, commits, display_hash)?;
+    // Order by ancestor walk over head commits (`:1164-1180`).
+    let order = order_group_phids(commits);
+    let mut sets = ordered_commit_sets(commits, &groups, &order)?;
+    push_unordered_groups(&mut sets, commits, &groups)?;
+    mark_implicit_commits(commits, &sets);
+    Ok(sets)
+}
+
+/// Resolve every commit to its revision PHID and bucket indexes by PHID
+/// (first-seen order). Unresolvable commits print the `UNKNOWN REVISION`
+/// banner and fail (`ArcanistLandEngine.php:1140-1159`).
+fn resolve_group_keys(
+    io: &mut Io,
+    commits: &[LandCommit],
+    display_hash: &dyn Fn(&str) -> String,
+) -> Result<Vec<(String, Vec<usize>)>, String> {
     let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
     for (index, commit) in commits.iter().enumerate() {
         let revision = resolve_commit_revision(commits, index)?
             .ok_or_else(|| unknown_revision(io, &commit.hash, display_hash))?;
-        let phid = revision.phid.clone();
-        match groups.iter_mut().find(|(key, _)| *key == phid) {
-            Some((_, members)) => members.push(index),
-            None => groups.push((phid, vec![index])),
-        }
+        push_group_member(&mut groups, revision.phid.clone(), index);
     }
-    // Order by ancestor walk over head commits (`:1164-1180`).
+    Ok(groups)
+}
+
+/// Append `index` to the `phid` bucket, creating it first-seen.
+fn push_group_member(groups: &mut Vec<(String, Vec<usize>)>, phid: String, index: usize) {
+    match groups.iter_mut().find(|(key, _)| *key == phid) {
+        Some((_, members)) => members.push(index),
+        None => groups.push((phid, vec![index])),
+    }
+}
+
+/// Revision PHIDs in landing order: the ancestor walk over head commits
+/// (`:1164-1180`).
+fn order_group_phids(commits: &[LandCommit]) -> Vec<String> {
     let mut order: Vec<String> = Vec::new();
     for (index, commit) in commits.iter().enumerate() {
         if !commit.is_head {
@@ -2784,34 +2907,62 @@ pub fn group_commit_sets(
             }
         }
     }
+    order
+}
+
+/// Commit sets for the ordered PHIDs, skipping groups with no members.
+fn ordered_commit_sets(
+    commits: &[LandCommit],
+    groups: &[(String, Vec<usize>)],
+    order: &[String],
+) -> Result<Vec<CommitSet>, String> {
     let mut sets = Vec::new();
     for phid in order {
-        let Some((_, members)) = groups.iter().find(|(key, _)| *key == phid) else {
+        let Some((_, members)) = groups.iter().find(|(key, _)| key == phid) else {
             continue;
         };
-        let revision = resolve_commit_revision(commits, members[0])?.expect("grouped revision");
-        sets.push(CommitSet {
-            revision: Some(revision),
-            commits: members.clone(),
-            is_pick: false,
-        });
+        sets.push(commit_set_for(commits, members)?);
     }
-    // Any group unreachable from a head (no heads marked) keeps map order.
-    for (phid, members) in &groups {
-        if sets
-            .iter()
-            .any(|set: &CommitSet| set.revision.as_ref().is_some_and(|rev| &rev.phid == phid))
-        {
+    Ok(sets)
+}
+
+/// Append groups unreachable from a head (no heads marked), keeping map
+/// order.
+fn push_unordered_groups(
+    sets: &mut Vec<CommitSet>,
+    commits: &[LandCommit],
+    groups: &[(String, Vec<usize>)],
+) -> Result<(), String> {
+    for (phid, members) in groups {
+        if sets_assembled(sets, phid) {
             continue;
         }
-        let revision = resolve_commit_revision(commits, members[0])?.expect("grouped revision");
-        sets.push(CommitSet {
-            revision: Some(revision),
-            commits: members.clone(),
-            is_pick: false,
-        });
+        sets.push(commit_set_for(commits, members)?);
     }
-    for set in &mut sets {
+    Ok(())
+}
+
+/// True when `sets` already holds a set for `phid`.
+fn sets_assembled(sets: &[CommitSet], phid: &str) -> bool {
+    sets.iter()
+        .any(|set: &CommitSet| set.revision.as_ref().is_some_and(|rev| rev.phid == phid))
+}
+
+/// One commit set for `members` (the first member's revision).
+fn commit_set_for(commits: &[LandCommit], members: &[usize]) -> Result<CommitSet, String> {
+    let revision = resolve_commit_revision(commits, members[0])?.expect("grouped revision");
+    Ok(CommitSet {
+        revision: Some(revision),
+        commits: members.to_vec(),
+        is_pick: false,
+    })
+}
+
+/// Flag implicitly-associated commits, like `setCommits()`
+/// (`ArcanistLandCommitSet.php:19-37`): commits whose explicit revision is
+/// not the set revision become implicit.
+fn mark_implicit_commits(commits: &mut [LandCommit], sets: &[CommitSet]) {
+    for set in sets {
         let phid = set.revision.as_ref().map(|rev| rev.phid.clone());
         for index in &set.commits {
             let commit = &mut commits[*index];
@@ -2824,7 +2975,6 @@ pub fn group_commit_sets(
             }
         }
     }
-    Ok(sets)
 }
 
 /// Print the `UNKNOWN REVISION` banner and build its error
@@ -5481,31 +5631,42 @@ pub fn confirm_revision_gates(
     findings: &[land_checks::GateFinding],
 ) -> Result<(), String> {
     for finding in findings {
-        match finding.prompt {
-            land_checks::PROMPT_UNAUTHORED => {
-                confirm_unauthored(io, revisions, viewer)?;
-            }
-            land_checks::PROMPT_CHANGES_PLANNED => {
-                confirm_status_group(io, revisions, finding, StatusGroup::Planned)?;
-            }
-            land_checks::PROMPT_PUBLISHED => {
-                confirm_status_group(io, revisions, finding, StatusGroup::Published)?;
-            }
-            land_checks::PROMPT_NOT_ACCEPTED => {
-                confirm_status_group(io, revisions, finding, StatusGroup::NotAccepted)?;
-            }
-            land_checks::PROMPT_OPEN_PARENTS => {
-                confirm_open_parents(io, revisions, links, finding)?;
-            }
-            land_checks::PROMPT_FAILED_BUILDS | land_checks::PROMPT_ONGOING_BUILDS => {
-                confirm_builds(io, revisions, builds, finding)?;
-            }
-            land_checks::PROMPT_LARGE_WORKING_SET => {
-                prompt_for_key(io, finding.prompt, &finding.query)?;
-            }
-            _ => {
-                prompt_for_key(io, finding.prompt, &finding.query)?;
-            }
+        confirm_single_gate(io, revisions, viewer, links, builds, finding)?;
+    }
+    Ok(())
+}
+
+/// Confirm one fired revision gate: print its banner and prompt its
+/// `arc.land.*` key. Declining aborts.
+fn confirm_single_gate(
+    io: &mut Io,
+    revisions: &[land_checks::RevisionView],
+    viewer: &ViewerIdentity,
+    links: &[land_checks::ParentLink],
+    builds: &[land_checks::BuildView],
+    finding: &land_checks::GateFinding,
+) -> Result<(), String> {
+    match finding.prompt {
+        land_checks::PROMPT_UNAUTHORED => {
+            confirm_unauthored(io, revisions, viewer)?;
+        }
+        land_checks::PROMPT_CHANGES_PLANNED => {
+            confirm_status_group(io, revisions, finding, StatusGroup::Planned)?;
+        }
+        land_checks::PROMPT_PUBLISHED => {
+            confirm_status_group(io, revisions, finding, StatusGroup::Published)?;
+        }
+        land_checks::PROMPT_NOT_ACCEPTED => {
+            confirm_status_group(io, revisions, finding, StatusGroup::NotAccepted)?;
+        }
+        land_checks::PROMPT_OPEN_PARENTS => {
+            confirm_open_parents(io, revisions, links, finding)?;
+        }
+        land_checks::PROMPT_FAILED_BUILDS | land_checks::PROMPT_ONGOING_BUILDS => {
+            confirm_builds(io, revisions, builds, finding)?;
+        }
+        _ => {
+            prompt_for_key(io, finding.prompt, &finding.query)?;
         }
     }
     Ok(())
@@ -5782,85 +5943,57 @@ fn execute_engine(
     io: &mut Io,
 ) -> Result<(), String> {
     let squash = validated.strategy == Strategy::Squash;
-    // Sources and remotes.
-    let (raw_symbols, onto_remote, onto_refs, into_commit, into_ref_for_reconcile, hg_branch) =
-        select_targets(dir, options, vcs, io)?;
-    let symbols_display = display_symbols(&raw_symbols);
-    // Commits.
-    let resolved = resolve_sources(dir, io, vcs, &raw_symbols)?;
-    let mut commits = select_source_commits(dir, vcs, &resolved, into_commit.as_deref())?;
-    link_commits(&mut commits);
-    let into_display = into_commit.as_deref().map(|hash| match vcs {
-        Vcs::Git => git::display_hash(hash).to_string(),
-        Vcs::Hg => display_hash_12(hash),
-    });
-    confirm_commit_count(
-        io,
-        &commits,
-        &symbols_display,
-        into_display.as_deref(),
-        &hash_display_for(vcs),
-    )?;
+    let mut prep = prepare_engine_commits(dir, options, vcs, io)?;
     // Conduit: online discovery, or the offline single set with a note.
     let client = client_for_dir(options.conduit_uri.as_deref(), dir);
     let online = client.as_ref().ok();
-    if online.is_none()
-        && let Err(reason) = &client
-    {
-        io.push_err(&format_skip_note(reason));
-    }
+    announce_offline_fallback(io, &client);
     let mut sets = build_sets(
         dir,
         io,
         vcs,
         validated,
-        &mut commits,
+        &mut prep.commits,
         online,
         &hash_display_for(vcs),
     )?;
     sets = filter_commit_sets(
         io,
         sets,
-        &commits,
+        &prep.commits,
         squash,
         options.pick,
-        &render_for(vcs, &commits),
+        &render_for(vcs, &prep.commits),
     );
     if !options.preview {
         confirm_implicit_sets(
             io,
             &sets,
-            &commits,
-            &symbols_display,
+            &prep.commits,
+            &prep.symbols_display,
             &hash_display_for(vcs),
         )?;
     }
-    print_landing(io, &sets, &commits, &hash_display_for(vcs));
+    print_landing(io, &sets, &prep.commits, &hash_display_for(vcs));
     if options.preview {
         io.push_status("PREVIEW", "Completed preview of land operation.");
         return Ok(());
     }
     prompt_for_key(io, land_checks::PROMPT_CONFIRM, "Land these changes?")?;
-    if let Some(client) = online {
-        let call = |method: &str, params: &serde_json::Value| {
-            client.call(method, params).map_err(|e| e.to_string())
-        };
-        let uri = resolve_conduit_uri(options.conduit_uri.as_deref(), dir);
-        confirm_online_gates(io, &call, &sets, &commits, uri.as_deref())?;
-    }
+    confirm_gates_if_online(dir, options, io, online, &sets, &prep.commits)?;
     match vcs {
         Vcs::Git => land_git(
             dir,
             io,
             options,
             squash,
-            &raw_symbols,
-            &onto_remote,
-            &onto_refs,
-            into_commit.as_deref(),
-            into_ref_for_reconcile.as_deref(),
+            &prep.raw_symbols,
+            &prep.onto_remote,
+            &prep.onto_refs,
+            prep.into_commit.as_deref(),
+            prep.into_ref.as_deref(),
             &sets,
-            &commits,
+            &prep.commits,
             online,
         ),
         Vcs::Hg => land_hg(
@@ -5868,16 +6001,98 @@ fn execute_engine(
             io,
             options,
             squash,
-            &raw_symbols,
-            &onto_remote,
-            &onto_refs,
-            into_commit.as_deref(),
-            hg_branch.as_deref(),
+            &prep.raw_symbols,
+            &prep.onto_remote,
+            &prep.onto_refs,
+            prep.into_commit.as_deref(),
+            prep.hg_branch.as_deref(),
             &sets,
-            &commits,
+            &prep.commits,
             online,
         ),
     }
+}
+
+/// Selected targets plus the confirmed landing commits.
+struct EnginePrep {
+    raw_symbols: Vec<String>,
+    onto_remote: String,
+    onto_refs: Vec<String>,
+    into_commit: Option<String>,
+    into_ref: Option<String>,
+    hg_branch: Option<String>,
+    symbols_display: String,
+    commits: Vec<LandCommit>,
+}
+
+/// Select targets and landing commits: sources and remotes, commit
+/// selection and linking, then the commit-count confirm.
+fn prepare_engine_commits(
+    dir: &Path,
+    options: &Options,
+    vcs: Vcs,
+    io: &mut Io,
+) -> Result<EnginePrep, String> {
+    // Sources and remotes.
+    let (raw_symbols, onto_remote, onto_refs, into_commit, into_ref, hg_branch) =
+        select_targets(dir, options, vcs, io)?;
+    let symbols_display = display_symbols(&raw_symbols);
+    // Commits.
+    let resolved = resolve_sources(dir, io, vcs, &raw_symbols)?;
+    let mut commits = select_source_commits(dir, vcs, &resolved, into_commit.as_deref())?;
+    link_commits(&mut commits);
+    let into_display = into_display_string(vcs, into_commit.as_deref());
+    confirm_commit_count(
+        io,
+        &commits,
+        &symbols_display,
+        into_display.as_deref(),
+        &hash_display_for(vcs),
+    )?;
+    Ok(EnginePrep {
+        raw_symbols,
+        onto_remote,
+        onto_refs,
+        into_commit,
+        into_ref,
+        hg_branch,
+        symbols_display,
+        commits,
+    })
+}
+
+/// The into commit for display, per VCS.
+fn into_display_string(vcs: Vcs, into_commit: Option<&str>) -> Option<String> {
+    into_commit.map(|hash| match vcs {
+        Vcs::Git => git::display_hash(hash).to_string(),
+        Vcs::Hg => display_hash_12(hash),
+    })
+}
+
+/// Print the offline skip note when Conduit is unreachable.
+fn announce_offline_fallback(io: &mut Io, client: &Result<arc_rs::conduit::Client, String>) {
+    if let Err(reason) = client {
+        io.push_err(&format_skip_note(reason));
+    }
+}
+
+/// Confirm the online revision gates when Conduit is reachable.
+fn confirm_gates_if_online(
+    dir: &Path,
+    options: &Options,
+    io: &mut Io,
+    online: Option<&arc_rs::conduit::Client>,
+    sets: &[CommitSet],
+    commits: &[LandCommit],
+) -> Result<(), String> {
+    let Some(client) = online else {
+        return Ok(());
+    };
+    let call = |method: &str, params: &serde_json::Value| {
+        client.call(method, params).map_err(|e| e.to_string())
+    };
+    let uri = resolve_conduit_uri(options.conduit_uri.as_deref(), dir);
+    confirm_online_gates(io, &call, sets, commits, uri.as_deref())
 }
 
 /// Display-hash resolver per VCS.
@@ -5898,61 +6113,74 @@ fn render_for<'a>(vcs: Vcs, commits: &'a [LandCommit]) -> Box<dyn Fn(&CommitSet)
     }
 }
 
+/// Source symbols, onto remote/refs, the into commit, the into ref
+/// for reconcile (git), and the branch marker (hg).
+type TargetSelection = (
+    Vec<String>,
+    String,
+    Vec<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 /// Source symbols, onto remote/refs, and the into commit, per VCS.
-#[allow(clippy::type_complexity)]
 fn select_targets(
     dir: &Path,
     options: &Options,
     vcs: Vcs,
     io: &mut Io,
-) -> Result<
-    (
-        Vec<String>,
-        String,
-        Vec<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ),
-    String,
-> {
+) -> Result<TargetSelection, String> {
     match vcs {
-        Vcs::Git => {
-            let raw = if options.refs.is_empty() {
-                git_default_symbols(dir, io)?
-            } else {
-                options.refs.clone()
-            };
-            let onto_remote = git_select_onto_remote(dir, io, options, &raw)?;
-            let onto_refs = git_select_onto_refs(dir, io, options, &raw)?;
-            git_confirm_onto_refs(dir, io, &onto_remote, &onto_refs, options.hold)?;
-            let into_state = select_into_state(io, options, &onto_remote, &onto_refs, &|remote| {
-                git::remote_fetch_uri(dir, remote).is_some()
-            })?;
-            let into_ref = match &into_state {
-                IntoState::Remote { name, .. } => Some(name.clone()),
-                _ => None,
-            };
-            let into_commit =
-                git_select_into_commit(dir, io, &into_state, options.into.as_deref())?;
-            Ok((raw, onto_remote, onto_refs, into_commit, into_ref, None))
-        }
-        Vcs::Hg => {
-            let raw = if options.refs.is_empty() {
-                hg_default_symbols(dir, io)?
-            } else {
-                options.refs.clone()
-            };
-            let onto_remote = hg_select_onto_remote(dir, io, options)?;
-            let onto_refs = hg_select_onto_refs(dir, io, options)?;
-            let branch = hg_confirm_onto_refs(dir, io, &onto_remote, &onto_refs, options.hold)?;
-            let into_state = select_into_state(io, options, &onto_remote, &onto_refs, &|remote| {
-                hg::ok(dir, &["paths", remote])
-            })?;
-            let into_commit = hg_select_into_commit(dir, io, &into_state, options.into.as_deref())?;
-            Ok((raw, onto_remote, onto_refs, into_commit, None, branch))
-        }
+        Vcs::Git => select_git_targets(dir, options, io),
+        Vcs::Hg => select_hg_targets(dir, options, io),
     }
+}
+
+/// Git source symbols, onto remote/refs, and the into commit.
+fn select_git_targets(
+    dir: &Path,
+    options: &Options,
+    io: &mut Io,
+) -> Result<TargetSelection, String> {
+    let raw = if options.refs.is_empty() {
+        git_default_symbols(dir, io)?
+    } else {
+        options.refs.clone()
+    };
+    let onto_remote = git_select_onto_remote(dir, io, options, &raw)?;
+    let onto_refs = git_select_onto_refs(dir, io, options, &raw)?;
+    git_confirm_onto_refs(dir, io, &onto_remote, &onto_refs, options.hold)?;
+    let into_state = select_into_state(io, options, &onto_remote, &onto_refs, &|remote| {
+        git::remote_fetch_uri(dir, remote).is_some()
+    })?;
+    let into_ref = match &into_state {
+        IntoState::Remote { name, .. } => Some(name.clone()),
+        _ => None,
+    };
+    let into_commit = git_select_into_commit(dir, io, &into_state, options.into.as_deref())?;
+    Ok((raw, onto_remote, onto_refs, into_commit, into_ref, None))
+}
+
+/// Mercurial source symbols, onto remote/refs, and the into commit.
+fn select_hg_targets(
+    dir: &Path,
+    options: &Options,
+    io: &mut Io,
+) -> Result<TargetSelection, String> {
+    let raw = if options.refs.is_empty() {
+        hg_default_symbols(dir, io)?
+    } else {
+        options.refs.clone()
+    };
+    let onto_remote = hg_select_onto_remote(dir, io, options)?;
+    let onto_refs = hg_select_onto_refs(dir, io, options)?;
+    let branch = hg_confirm_onto_refs(dir, io, &onto_remote, &onto_refs, options.hold)?;
+    let into_state = select_into_state(io, options, &onto_remote, &onto_refs, &|remote| {
+        hg::ok(dir, &["paths", remote])
+    })?;
+    let into_commit = hg_select_into_commit(dir, io, &into_state, options.into.as_deref())?;
+    Ok((raw, onto_remote, onto_refs, into_commit, None, branch))
 }
 
 /// Resolve source symbols to commits, per VCS.
@@ -6726,77 +6954,113 @@ fn land_git_inner(
             options.incremental,
             &message_of,
         )?);
-        let should_push = if options.hold {
-            false
-        } else if options.incremental {
-            true
-        } else {
-            index == last
-        };
-        if should_push {
-            if git_is_perforce_remote(dir, onto_remote) {
-                git_p4_submit(dir, io, onto_remote, cursor_or(cursor.as_deref()))?;
-            } else {
-                git_push_change(
-                    dir,
-                    io,
-                    onto_remote,
-                    onto_refs,
-                    cursor_or(cursor.as_deref()),
-                )?;
-            }
-            need_cascade.reverse();
-            for cascade_set in &need_cascade {
-                git_cascade_state(
-                    dir,
-                    io,
-                    cascade_set,
-                    commits,
-                    cursor_or(cursor.as_deref()),
-                    squash,
-                );
-            }
-            need_cascade.clear();
-            if !options.keep_branches {
-                deleted.extend(git_prune_branches(dir, io, &need_prune, commits));
-                need_prune.clear();
-            }
+        if git_should_push(options, index, last) {
+            git_push_and_update(
+                dir,
+                io,
+                onto_remote,
+                onto_refs,
+                cursor_or(cursor.as_deref()),
+                squash,
+                options.keep_branches,
+                &mut need_cascade,
+                &mut need_prune,
+                &mut deleted,
+                commits,
+            )?;
         }
     }
+    git_finish_landing(
+        dir,
+        io,
+        options.hold,
+        state,
+        onto_remote,
+        onto_refs,
+        cursor_or(cursor.as_deref()),
+        into_ref,
+        &deleted,
+    )
+}
+
+/// True when the loop pushes after set `index`: never under `--hold`,
+/// after every set under `--incremental`, else after the last set only.
+fn git_should_push(options: &Options, index: usize, last: usize) -> bool {
     if options.hold {
+        false
+    } else if options.incremental {
+        true
+    } else {
+        index == last
+    }
+}
+
+/// Push the merged cursor (Perforce submit under `p4`), then cascade
+/// state and prune branches.
+#[allow(clippy::too_many_arguments)]
+fn git_push_and_update(
+    dir: &Path,
+    io: &mut Io,
+    onto_remote: &str,
+    onto_refs: &[String],
+    cursor: &str,
+    squash: bool,
+    keep_branches: bool,
+    need_cascade: &mut Vec<CommitSet>,
+    need_prune: &mut Vec<CommitSet>,
+    deleted: &mut Vec<String>,
+    commits: &[LandCommit],
+) -> Result<(), String> {
+    if git_is_perforce_remote(dir, onto_remote) {
+        git_p4_submit(dir, io, onto_remote, cursor)?;
+    } else {
+        git_push_change(dir, io, onto_remote, onto_refs, cursor)?;
+    }
+    need_cascade.reverse();
+    for cascade_set in need_cascade.iter() {
+        git_cascade_state(dir, io, cascade_set, commits, cursor, squash);
+    }
+    need_cascade.clear();
+    if !keep_branches {
+        deleted.extend(git_prune_branches(dir, io, need_prune, commits));
+        need_prune.clear();
+    }
+    Ok(())
+}
+
+/// Finish a git land: hold instructions under `--hold`, else reconcile
+/// (Perforce or plain) and `DONE`.
+#[allow(clippy::too_many_arguments)]
+fn git_finish_landing(
+    dir: &Path,
+    io: &mut Io,
+    hold: bool,
+    state: &GitLocalState,
+    onto_remote: &str,
+    onto_refs: &[String],
+    cursor: &str,
+    into_ref: Option<&str>,
+    deleted: &[String],
+) -> Result<(), String> {
+    if hold {
         let restore = git_restore_commands(state);
         let perforce = git_is_perforce_remote(dir, onto_remote);
-        git_hold_text(
-            io,
-            onto_remote,
-            onto_refs,
-            cursor_or(cursor.as_deref()),
-            &restore,
-            perforce,
-        );
+        git_hold_text(io, onto_remote, onto_refs, cursor, &restore, perforce);
         discard_local_state_git(dir, io, state)?;
         return Ok(());
     }
     if git_is_perforce_remote(dir, onto_remote) {
-        git_reconcile_perforce(
-            dir,
-            io,
-            state,
-            into_ref,
-            onto_refs,
-            &deleted,
-            cursor_or(cursor.as_deref()),
-        )?;
+        git_reconcile_perforce(dir, io, state, into_ref, onto_refs, deleted, cursor)?;
     } else {
         git_reconcile(
             dir,
             io,
             state,
-            cursor_or(cursor.as_deref()),
+            cursor,
             into_ref,
             onto_remote,
             onto_refs,
-            &deleted,
+            deleted,
         )?;
     }
     io.push_status("DONE", "Landed changes.");

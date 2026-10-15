@@ -699,6 +699,16 @@ fn finalize_revision(
     Ok(format!("{}{}", report.stdout, report.stderr))
 }
 
+/// The resolved Subversion commit target: root, client, revision, and
+/// Differential message.
+struct SvnCommitTarget {
+    root: PathBuf,
+    client: Client,
+    revision: close_revision::Revision,
+    id: u64,
+    message: String,
+}
+
 /// Subversion flow (`run`, `:65-177`): resolve, check, commit, finalize.
 fn flow_svn(
     dir: &Path,
@@ -706,15 +716,36 @@ fn flow_svn(
     io: &mut land::Io,
     svn: &svn::SvnCommand,
 ) -> Result<String, String> {
+    let target = resolve_svn_commit_target(dir, options, io, svn)?;
+    if options.show {
+        return Ok(target.message);
+    }
+    io.push_out(&format!(
+        "Committing 'D{}: {}'...\n",
+        target.revision.id, target.revision.title
+    ));
+    let files = svn_commit_file_list(io, &target.client, svn, &target.root, target.id)?;
+    let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
+    let mut out = svn::commit_with(&target.root, svn, &file_refs, &target.message)?;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&finalize_revision(&target.client, options, dir, target.id)?);
+    Ok(out)
+}
+
+/// Resolve the revision to commit, run sanity checks (unless `--show`),
+/// and fetch its Differential message.
+fn resolve_svn_commit_target(
+    dir: &Path,
+    options: &Options,
+    io: &mut land::Io,
+    svn: &svn::SvnCommand,
+) -> Result<SvnCommitTarget, String> {
     let root = svn_root(dir)?;
     reject_git_only_options(options)?;
     let client = config::client_for(options.conduit_uri.as_deref())?;
-    let need_phid = options.revision.is_none() || !options.show;
-    let user_phid = if need_phid {
-        Some(close_revision::user_phid(&client)?)
-    } else {
-        None
-    };
+    let user_phid = resolve_svn_user_phid(&client, options)?;
     let (row, revision) = resolve_svn_revision(&client, options, user_phid.as_deref(), &root)?;
     if !options.show {
         svn_sanity_checks(
@@ -726,23 +757,34 @@ fn flow_svn(
             user_phid.as_deref().unwrap_or(""),
         )?;
     }
-    let id = amend::revision_numeric_id(&revision)?;
-    let message = normalize_message(&fetch_commit_message(&client, id)?)?;
-    if options.show {
-        return Ok(message);
+    let (id, message) = fetch_svn_commit_message(&client, &revision)?;
+    Ok(SvnCommitTarget {
+        root,
+        client,
+        revision,
+        id,
+        message,
+    })
+}
+
+/// The viewer PHID, needed to guess the revision (no `--revision`) or to
+/// run sanity checks (no `--show`).
+fn resolve_svn_user_phid(client: &Client, options: &Options) -> Result<Option<String>, String> {
+    if options.revision.is_none() || !options.show {
+        Ok(Some(close_revision::user_phid(client)?))
+    } else {
+        Ok(None)
     }
-    io.push_out(&format!(
-        "Committing 'D{}: {}'...\n",
-        revision.id, revision.title
-    ));
-    let files = svn_commit_file_list(io, &client, svn, &root, id)?;
-    let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
-    let mut out = svn::commit_with(&root, svn, &file_refs, &message)?;
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str(&finalize_revision(&client, options, dir, id)?);
-    Ok(out)
+}
+
+/// The numeric id plus the normalized Differential message for `revision`.
+fn fetch_svn_commit_message(
+    client: &Client,
+    revision: &close_revision::Revision,
+) -> Result<(u64, String), String> {
+    let id = amend::revision_numeric_id(revision)?;
+    let message = normalize_message(&fetch_commit_message(client, id)?)?;
+    Ok((id, message))
 }
 
 /// Run the workflow rooted at `dir` with `svn` as the Subversion backend,
