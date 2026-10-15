@@ -1,29 +1,16 @@
 //! `arc-rs look`: a small text adventure around the working copy.
 //!
 //! PHP reference: `src/workflow/ArcanistLookWorkflow.php` ("Arcventure").
-//! With no arguments it describes a clearing (with time-of-day flavor),
-//! `look remotes` lists git remotes through ref views, and `look published`
-//! lists published commits. Paragraphs render through the `%W` / `%!` /
-//! `%s` `tsprintf` conversions; remotes resolve repository display names
-//! via `diffusion.repository.search`, and published commits keep only
-//! permanent refs (`ArcanistRepositoryRef::isPermanentRef`).
 //!
-//! Known limits: the live clearing shows the system-timezone hour (read
-//! from the OS zone database on Unix with full DST history, honoring
-//! explicit `TZ` everywhere); where no zone data exists (notably Windows
-//! without `TZ`, whose system zone needs OS calls) it falls back to UTC,
-//! and the plain-text `render` builders stay UTC so an instant always
-//! renders identically. `regexp(...)` permanent-ref rules never match (no
-//! regex engine); without a usable Conduit client the command degrades to
-//! local-only data (repository names render as `-` and published lists
-//! every remote-tracking tip) instead of failing.
+//! With no arguments it describes a clearing with time-of-day flavor;
+//! `look remotes` lists git remotes and `look published` lists published
+//! commits (permanent refs only).
 //!
-//! Two renderings exist: the plain-text builders (`render`,
-//! `render_clearing`, `render_unknown`, `render_remote`, `render_remotes`,
-//! `render_published`) and the console builders used by `run`
-//! (`render_title`, `render_paragraph`, `render_markup`, `render_line`,
-//! `render_quiet_river`, `render_bubbles_tail`, `render_remote_view`),
-//! which use the `%W` / `%!` / `%s` conversions plus ref views.
+//! Limits: the live clearing uses the system-timezone hour and falls back
+//! to UTC where no zone data exists, while the plain-text builders stay
+//! UTC so an instant always renders identically; `regexp(...)`
+//! permanent-ref rules never match; without a usable Conduit client the
+//! command degrades to local-only data instead of failing.
 
 use std::path::Path;
 use std::process::ExitCode;

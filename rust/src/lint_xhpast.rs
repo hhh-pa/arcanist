@@ -1,4 +1,4 @@
-//! `arc-rs lint` XHPAST linter (T1128, divergence dv-c).
+//! `arc-rs lint` XHPAST linter.
 //!
 //! PHP reference: `src/lint/linter/ArcanistXHPASTLinter.php` (plus
 //! `ArcanistBaseXHPASTLinter.php` and the rules under
@@ -6,28 +6,21 @@
 //!
 //! Behavior: when the `xhpast` binary is present on `PATH`, it is run
 //! on the file; a nonzero exit yields one path-level message
-//! (`XHP1` "PHP Syntax Error!" at the reported line when stderr
-//! carries a syntax error, else `XHP2` "Unable to Parse"),
-//! mirroring PHP `resolveFuture()`. On a zero exit the JSON AST
-//! output is parsed (see [`xhp_ast`]) and the ported rule tree
-//! (`xhp_calls`, `xhp_style`, `xhp_flow`, `xhp_rem1`, plus the
-//! `xhp_decl` declaration rules once implemented) runs over it, emitting
+//! (`XHP1` at the reported line when stderr carries a syntax error,
+//! else `XHP2`). On a zero exit the JSON AST output is parsed (see
+//! [`xhp_ast`]) and the ported rule tree runs over it, emitting
 //! PHP-identical rule IDs, severities, and message text for the
 //! ported subset ([`RULE_TABLE`]); the unported remainder is listed
 //! in [`blocked_rules`]. When the binary is absent the linter is
 //! inactive and reports no messages.
 //!
 //! Divergences from PHP:
-//! - The real `xhpast` wire format is undocumented in-repo
-//!   (libphutil is not vendored), so this port defines a JSON AST
-//!   equivalent. Non-JSON tool output on a zero exit falls back to
-//!   the built-in tokenizer over the real file bytes, so rule
-//!   evaluation still runs.
+//! - Rule input is a JSON AST equivalent (see [`xhp_ast`]). Non-JSON
+//!   tool output on a zero exit falls back to the built-in tokenizer
+//!   over the real file bytes, so rule evaluation still runs.
 //! - XHP45 (PHP Compatibility) ports the `xhpast.php-version`
 //!   gating plus the PHP 5.3/5.4 syntax-feature checks; the
-//!   symbol-table checks need the 1.4MB
-//!   `resources/php/symbol-information.json` data file and are not
-//!   ported.
+//!   symbol-table checks are not ported.
 //! - XHP54 (Formatted String) ports the missing-format-string check;
 //!   libphutil `xsprintf()` conversion validation is not ported.
 //! - The `xhpast.switchhook` / `xhpast.naminghook` overrides name

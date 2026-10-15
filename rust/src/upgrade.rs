@@ -1,42 +1,19 @@
 //! `arc-rs upgrade` — report the running version, or self-update the binary.
 //!
-//! PHP reference: `src/workflow/ArcanistUpgradeWorkflow.php`, which pulls
-//! the tool's own checkout. Without flags this port reports the running
-//! version, the enclosing checkout's branch/HEAD, cleanliness, and
-//! ahead/behind counts versus the upstream, plus how to update manually.
-//! `--apply` self-updates the single static binary instead of reporting:
-//! it resolves the release channel, fetches the latest stable GitHub
-//! release, prompts, downloads the current-platform asset over plain
-//! HTTPS, verifies its size and SHA-256 checksum, and atomically
-//! replaces the running executable.
+//! PHP reference: `src/workflow/ArcanistUpgradeWorkflow.php`.
 //!
-//! Release channel: the `github.com` repo of the enclosing checkout's
-//! `fork` remote (else `origin`), or [`DEFAULT_RELEASE_REPO`] outside
-//! checkouts. The fork remote is this port's own release line; `origin`
-//! stays pointed at upstream Phabricator Arcanist (PHP sources, no
-//! `arc-rs` binaries), so it is only a fallback. `releases/latest` is
-//! the stable channel: GitHub's latest non-prerelease, non-draft.
-//! Assets are named `arc-rs-<os>-<arch>` (plus `.exe`), for example
-//! `arc-rs-windows-x86_64.exe`.
+//! Without flags this reports the running version plus the enclosing
+//! checkout's branch/HEAD, cleanliness, and ahead/behind counts versus
+//! its upstream. `--apply` instead replaces the running executable with
+//! the latest stable release asset for the current platform (see
+//! [`execute_apply`]).
 //!
-//! Status lines render through the log engine (`writeStatus` blue,
-//! `writeSuccess` green); the uncommitted-changes block wraps its
-//! paragraphs like `PhutilConsoleBlock` and escapes listed paths.
-//!
-//! Deviations: PHP upgrades the interpreter's library directory with
-//! `git pull --rebase`, while `--apply` replaces the running executable
-//! (a compiled binary has no library directory to pull); PHP asks no
-//! questions before pulling, while `--apply` confirms first (binary
-//! replacement is irreversible; `--yes` skips the prompt for scripts,
-//! and `--json` mode requires it); PHP requires a clean checkout on a
-//! supported branch, while `--apply` only requires a supported branch
-//! when run inside a checkout (installed binaries live outside
-//! checkouts, and there is no working copy to protect); Windows keeps
-//! the previous executable as `<exe>.old` (the running image is
-//! locked), removed on the next upgrade. The checkout-based helpers
-//! ([`resolve_apply_target`], [`run_apply`], [`uncommitted_paths`],
-//! [`render_uncommitted_block`]) remain as the faithful PHP port for
-//! library checkouts.
+//! Release repo: the `fork` remote's repo, else `origin`'s, else
+//! [`DEFAULT_RELEASE_REPO`]. `fork` is preferred because it carries
+//! this port's releases. [`resolve_apply_target`], [`run_apply`],
+//! [`uncommitted_paths`], and [`render_uncommitted_block`] remain as the
+//! checkout-based (`git pull`) port for library checkouts; the live
+//! `--apply` path replaces the binary and does not use them.
 
 extern crate self as arc_rs;
 
