@@ -28,6 +28,10 @@ impl Drop for TempDir {
     }
 }
 
+fn canned(source: &str) -> String {
+    xhp_ast::tokens_to_canned(source, &xhp_ast::tokenize(source))
+}
+
 #[test]
 fn linter_name_binary_and_flags_are_exact() {
     assert_eq!(XhpastLinter::new().name(), "XHP");
@@ -97,6 +101,156 @@ fn failed_parse_yields_one_unable_to_parse_warning() {
             messages[0].description
         );
     }
+}
+
+#[test]
+fn rule_table_covers_all_ported_ids() {
+    assert_eq!(RULE_TABLE.len(), 66);
+    let mut ids: Vec<u32> = RULE_TABLE.iter().map(|(id, _, _)| *id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 66);
+    for missing in [11, 14, 29, 31, 33, 35, 89, 93, 94] {
+        assert!(!ids.contains(&missing), "{missing}");
+    }
+    assert_eq!(rule_meta(42), Some(("`elseif` Usage", "advice")));
+    assert_eq!(rule_meta(1), Some(("PHP Syntax Error!", "error")));
+    assert_eq!(rule_meta(2), Some(("Unable to Parse", "warning")));
+    assert_eq!(rule_meta(16), Some(("TODO Comment", "disabled")));
+    assert_eq!(rule_meta(999), None);
+    for (id, _, _) in RULE_TABLE {
+        assert!((1..=134).contains(id), "{id}");
+    }
+    // Ported and blocked sets are disjoint and jointly exhaustive.
+    let blocked = blocked_rules();
+    assert_eq!(blocked.len(), 42);
+    let mut bids: Vec<u32> = blocked.iter().map(|(id, _, _)| *id).collect();
+    bids.sort_unstable();
+    bids.dedup();
+    assert_eq!(bids.len(), 42);
+    for (id, class, reason) in &blocked {
+        assert!(!ids.contains(id), "{id}");
+        assert!(class.starts_with("Arcanist"), "{class}");
+        assert!(!reason.is_empty(), "{id}");
+    }
+    assert_eq!(ids.len() + bids.len(), 108);
+    assert!(bids.contains(&5));
+    assert!(bids.contains(&134));
+}
+
+#[test]
+fn lint_canned_runs_rule_tree_with_exact_messages() {
+    let options = xhp_ast::XhpOptions::default();
+    let messages = lint_canned(
+        "src/a.php",
+        &canned("<?php if ($a) {\n} elseif ($b) {\n}\n"),
+        &options,
+    );
+    // PHP raises XHP81 (no blank line after `<?php`), XHP47 for each
+    // whitespace-only empty block, and XHP42 for `elseif`.
+    let codes: Vec<(&str, usize, usize)> = messages
+        .iter()
+        .map(|m| (m.code.as_str(), m.line, m.col))
+        .collect();
+    assert_eq!(
+        codes,
+        vec![
+            ("XHP81", 1, 6),
+            ("XHP47", 1, 15),
+            ("XHP42", 2, 3),
+            ("XHP47", 2, 15),
+        ]
+    );
+    assert_eq!(
+        messages[0].description,
+        "`<?php` should be separated from code by an empty line."
+    );
+    assert_eq!(
+        messages[1].description,
+        "Braces for an empty block statement shouldn't contain only whitespace."
+    );
+    let message = &messages[2];
+    assert_eq!(message.path, "src/a.php");
+    assert_eq!(message.code, "XHP42");
+    assert_eq!(message.severity, "advice");
+    assert_eq!(message.name, "`elseif` Usage");
+    assert_eq!(
+        message.description,
+        "Usage of `else if` is preferred over `elseif`."
+    );
+    assert_eq!(message.original, None);
+    assert_eq!(message.replacement, None);
+}
+
+#[test]
+fn lint_canned_rejects_garbage_with_unable_to_parse() {
+    let options = xhp_ast::XhpOptions::default();
+    let messages = lint_canned("a.php", "not json", &options);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].code, "XHP2");
+    assert_eq!((messages[0].line, messages[0].col), (0, 0));
+}
+
+#[test]
+fn parse_output_zero_exit_runs_canned_rules() {
+    let messages = parse_output("a.php", 0, &canned("<?php elseif ($x) {}\n"), "");
+    // `{}` holds no whitespace so XHP47 stays silent (PHP needs >2
+    // tokens); XHP81 fires (no blank line after `<?php`) plus XHP42.
+    let codes: Vec<(&str, usize, usize)> = messages
+        .iter()
+        .map(|m| (m.code.as_str(), m.line, m.col))
+        .collect();
+    assert_eq!(codes, vec![("XHP81", 1, 6), ("XHP42", 1, 7)]);
+}
+
+#[test]
+fn parse_output_syntax_stderr_yields_xhp1_at_line() {
+    let messages = parse_output(
+        "a.php",
+        1,
+        "",
+        "XHPAST Parse Error: syntax error, unexpected T_STRING on line 9",
+    );
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].code, "XHP1");
+    assert_eq!(messages[0].name, "PHP Syntax Error!");
+    assert_eq!(messages[0].severity, "error");
+    assert_eq!((messages[0].line, messages[0].col), (9, 1));
+    assert!(
+        messages[0]
+            .description
+            .starts_with("This file contains a syntax error: "),
+        "{}",
+        messages[0].description
+    );
+}
+
+#[test]
+fn options_map_fans_out_to_rule_tree() {
+    let mut map = std::collections::HashMap::new();
+    map.insert("xhpast.php-version".to_string(), serde_json::json!("5.3.0"));
+    map.insert(
+        "xhpast.blacklisted.function".to_string(),
+        serde_json::json!({"foo": "do not use foo"}),
+    );
+    map.insert(
+        "xhpast.printf-functions".to_string(),
+        serde_json::json!({"myprintf": 1, "other": "2"}),
+    );
+    map.insert(
+        "xhpast.dynamic-string.functions".to_string(),
+        serde_json::json!({"q": 0}),
+    );
+    let options = xhp_ast::XhpOptions::from_map(&map);
+    assert_eq!(options.php_version.as_deref(), Some("5.3.0"));
+    assert_eq!(
+        options.blacklisted,
+        vec![("foo".to_string(), "do not use foo".to_string())]
+    );
+    assert!(options.printf.contains(&("myprintf".to_string(), 1)));
+    assert!(options.printf.contains(&("other".to_string(), 2)));
+    assert_eq!(options.dynamic_functions.len(), 1);
+    assert!(options.php_version_windows.is_none());
 }
 
 #[test]
