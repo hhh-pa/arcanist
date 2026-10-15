@@ -333,7 +333,7 @@ pub fn ensure_library(path: &Path, input: &mut dyn BufRead) -> Result<bool, Stri
 fn find_in_ancestors(start: &Path) -> Option<PathBuf> {
     start.ancestors().find_map(|ancestor| {
         let candidate = ancestor.join("support/lib/rebuild-map.php");
-        candidate.is_file().then(|| candidate)
+        candidate.is_file().then_some(candidate)
     })
 }
 
