@@ -866,7 +866,7 @@ fn local_bundle_parts(
     client: &crate::conduit::Client,
 ) -> Result<(Vec<serde_json::Value>, serde_json::Value), String> {
     let bytes = local_diff_bytes(dir, Format::Git, base)?;
-    let parsed = crate::diff_local::parse_unified_diff(&String::from_utf8_lossy(&bytes));
+    let parsed = crate::diff_local::parse_unified_diff(&String::from_utf8_lossy(&bytes))?;
     let changes = changes_json(&parsed);
     let base_revision = crate::git::stdout_text(dir, &["rev-parse", base])?;
     let author_name = viewer_real_name(client)?;

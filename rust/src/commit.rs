@@ -680,6 +680,7 @@ fn svn_commit_file_list(
 fn finalize_revision(
     client: &Client,
     options: &Options,
+    dir: &Path,
     revision_id: u64,
 ) -> Result<String, String> {
     let close_options = close_revision::Options {
@@ -689,8 +690,12 @@ fn finalize_revision(
         json: false,
         force: false,
         conduit_uri: options.conduit_uri.clone(),
+        // Unresolvable (e.g. fake backends in tests) means untracked: close.
+        repository_phid: close_revision::resolve_repository_phid(client, dir)
+            .ok()
+            .flatten(),
     };
-    let report = close_revision::execute(client, &close_options, &|_| false)?;
+    let report = close_revision::execute(client, &close_options, &|_| Ok(false))?;
     Ok(format!("{}{}", report.stdout, report.stderr))
 }
 
@@ -736,7 +741,7 @@ fn flow_svn(
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
     }
-    out.push_str(&finalize_revision(&client, options, id)?);
+    out.push_str(&finalize_revision(&client, options, dir, id)?);
     Ok(out)
 }
 

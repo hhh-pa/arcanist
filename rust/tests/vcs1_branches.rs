@@ -215,7 +215,7 @@ fn outside_repo_fails() {
     let empty = Fixture::named("notrepo");
     let err = branches::execute(empty.path(), &args(&[])).unwrap_err();
     assert!(
-        err.contains("not inside a git or Mercurial working copy"),
+        err.contains("not inside a git repository"),
         "unexpected: {err}"
     );
     assert_eq!(

@@ -173,7 +173,7 @@ const SAMPLE_DIFF: &str = "diff --git a/f.txt b/f.txt\n\
 
 #[test]
 fn serializes_changes_with_stats_and_companions() {
-    let parsed = crate::diff_local::parse_unified_diff(SAMPLE_DIFF);
+    let parsed = crate::diff_local::parse_unified_diff(SAMPLE_DIFF).unwrap();
     assert_eq!(parsed.len(), 2);
     let dicts = changes_json(&parsed);
     assert_eq!(dicts.len(), 3);
