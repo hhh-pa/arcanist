@@ -68,7 +68,7 @@ jobs:
       # and runs the gates in it; a miss rebuilds, pushes, then runs.
       - name: compute image key
         run: |
-          key="${{ hashFiles('rust/Cargo.lock', 'scripts/ci/quality-gates.Dockerfile', 'scripts/ci/lib/*.py') }}"
+          key="${{ hashFiles('rust/Cargo.lock', 'scripts/ci/quality-gates.Dockerfile', 'scripts/ci/go/**') }}"
           echo "GATE_KEY=$key" >> "$GITHUB_ENV"
           echo "Gate image: $GATE_IMAGE:$key"
       - name: pull gate image
@@ -106,8 +106,57 @@ jobs:
             docker buildx build --load --cache-from type=gha --cache-to type=gha,mode=max \
               -t "$GATE_IMAGE:$GATE_KEY" -f scripts/ci/quality-gates.Dockerfile .
           fi
+      # Go CI-tools (T1148): the built binaries are cached by exact
+      # source hash, so runs without Go changes skip setup-go, test,
+      # and build entirely; a miss rebuilds (with the Go build cache
+      # warm) and re-saves only after a successful build. The live
+      # invocations below run ./ci-tools-bin (bind-mounted into the
+      # gate container where the gates need the provisioned image).
+      - name: restore ci-tools binaries
+        id: tools-bin-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ci-tools-bin
+          key: ci-tools-${{ runner.os }}-${{ hashFiles('scripts/ci/go/**') }}
+      - name: set up Go
+        if: steps.tools-bin-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: scripts/ci/go/go.mod
+          cache: false # stdlib-only module: nothing to cache but the build below
+      - name: cache Go build
+        if: steps.tools-bin-cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/go-build
+          key: go-build-${{ runner.os }}-${{ hashFiles('scripts/ci/go/**') }}
+          restore-keys: |
+            go-build-${{ runner.os }}-
+      - name: test Go CI-tools
+        if: steps.tools-bin-cache.outputs.cache-hit != 'true'
+        working-directory: scripts/ci/go
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test ./...
+      - name: build ci-tools binaries
+        id: build-tools
+        if: steps.tools-bin-cache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf ci-tools-bin && mkdir -p ci-tools-bin
+          cd scripts/ci/go
+          for tool in coverage-floor coverage-summary geiger complexity rust-quality-gates; do
+            CGO_ENABLED=0 go build -o "$GITHUB_WORKSPACE/ci-tools-bin/$tool" ./cmd/$tool
+          done
+          ls "$GITHUB_WORKSPACE/ci-tools-bin"
+      - name: save ci-tools binaries
+        if: steps.tools-bin-cache.outputs.cache-hit != 'true' && steps.build-tools.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ci-tools-bin
+          key: ci-tools-${{ runner.os }}-${{ hashFiles('scripts/ci/go/**') }}
       - name: run quality gates
-        run: docker run --rm -v "${{ github.workspace }}:/work" -w /work "$GATE_IMAGE:$GATE_KEY" python3 scripts/ci/lib/rust-quality-gates.py rust rust/target/llvm-cov nextest --run-ignored all --no-fail-fast
+        run: docker run --rm -v "${{ github.workspace }}:/work" -v "${{ github.workspace }}/ci-tools-bin:/tools" -w /work "$GATE_IMAGE:$GATE_KEY" /tools/rust-quality-gates rust rust/target/llvm-cov nextest --run-ignored all --no-fail-fast
       # The container runs as root; hand the report back so later steps can
       # read it.
       - name: take ownership of coverage report
@@ -118,7 +167,7 @@ jobs:
           fi
       - name: publish coverage summary
         if: always()
-        run: python3 scripts/ci/lib/coverage-summary.py --out rust/target/llvm-cov/coverage-comment.md rust/target/llvm-cov/lcov.info >> "$GITHUB_STEP_SUMMARY"
+        run: ./ci-tools-bin/coverage-summary --out rust/target/llvm-cov/coverage-comment.md rust/target/llvm-cov/lcov.info >> "$GITHUB_STEP_SUMMARY"
       - name: upload coverage report
         if: always() && hashFiles('rust/target/llvm-cov/lcov.info') != ''
         uses: actions/upload-artifact@v4
@@ -147,6 +196,29 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: rust/target/nextest/default/junit.xml
           fail_ci_if_error: false
+
+  go-tools-test:
+    name: go ci-tools tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Same binary cache as the gates preamble: a hit means this
+      # exact source hash already passed, so setup and tests skip.
+      # Restore-only here; the gates job owns the save.
+      - name: restore ci-tools binaries
+        id: tools-bin-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ci-tools-bin
+          key: ci-tools-${{ runner.os }}-${{ hashFiles('scripts/ci/go/**') }}
+      - uses: actions/setup-go@v5
+        if: steps.tools-bin-cache.outputs.cache-hit != 'true'
+        with:
+          go-version-file: scripts/ci/go/go.mod
+          cache: false # stdlib-only module: no go.sum to cache against
+      - run: go test ./...
+        if: steps.tools-bin-cache.outputs.cache-hit != 'true'
+        working-directory: scripts/ci/go
 
   # Every run keeps its release binaries as downloadable Actions artifacts
   # (`arc-<target>.tar.gz` per OS, 14-day retention), so any commit's build
