@@ -186,3 +186,23 @@ fn finds_rebuild_script_upwards() {
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(&bare).ok();
 }
+
+#[test]
+fn run_in_exits_zero_on_workflow_errors() {
+    // PHP runWorkflow always returns 0: finding no libraries is
+    // reported but still exits 0.
+    let dir = scratch("exit-zero");
+    assert_eq!(run_in(&dir, &argv(&[])), ExitCode::SUCCESS);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn run_in_fails_only_on_argument_errors() {
+    // Argument errors come from the toolset runtime outside the
+    // workflow, so they still fail; help still succeeds.
+    let dir = scratch("exit-args");
+    assert_eq!(run_in(&dir, &argv(&["a", "b"])), ExitCode::FAILURE);
+    assert_eq!(run_in(&dir, &argv(&["--bogus"])), ExitCode::FAILURE);
+    assert_eq!(run_in(&dir, &argv(&["--help"])), ExitCode::SUCCESS);
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -15,8 +15,10 @@
 //! plural variants (`Updated library.` / `Updated %s libraries.`).
 //!
 //! Like PHP, per-library rebuild failures report `ERROR` lines but still
-//! exit 0; usage errors (bad arguments, no libraries found, ancient or
-//! unknown library versions, declined prompts) fail instead.
+//! exit 0; only argument-parsing errors fail (raised by the toolset
+//! runtime outside the workflow, as in PHP). Every workflow failure --
+//! no libraries found, ancient or unknown library versions, declined
+//! prompts -- still exits 0 after reporting the error.
 //!
 //! Divergences:
 //! - The rebuild script is found by an upward `support/lib/rebuild-map.php`
@@ -470,7 +472,13 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
         }
         Err(message) => {
             eprintln!("arc-rs {NAME}: {message}");
-            ExitCode::FAILURE
+            // PHP `runWorkflow` always returns 0; only argument errors
+            // (raised by the toolset runtime, outside the workflow) fail.
+            if matches!(parse_args(argv), ParseOutcome::Error(_)) {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
         }
     }
 }
