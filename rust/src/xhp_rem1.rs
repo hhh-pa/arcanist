@@ -41,10 +41,18 @@
 //!   `version_compare()` order, which the shared dotted comparator
 //!   does not implement. `interface_exists()` guards are dropped:
 //!   PHP files them under an `interface` bucket no check reads.
-//!   Deliberate approximations: `use`/`namespace` import names are
-//!   not usages and are never flagged; member names after `->` and
-//!   `::` are class members, not global symbols; class-like
-//!   property types are not scanned.
+//!   Member names after `->`/`?->`/`::`, declaration names, `as`
+//!   aliases, `goto` targets, and statement-start labels are never
+//!   scanned (all `n_STRING`, never `n_SYMBOL_NAME`, per the parser
+//!   fixtures); each `use`/`namespace` name gets one lookup of its
+//!   full concrete string, exactly like its single `n_SYMBOL_NAME`
+//!   node, and so does every other qualified run (namespaced
+//!   constants live in the table); runs with interior whitespace
+//!   never look up (PHP's concrete string carries the spaces and
+//!   misses). Deliberate approximations: `use function`/`use const`
+//!   and group-`use` names are skipped (the stock grammar cannot
+//!   parse those files at all); a label directly after `:` still
+//!   scans; class-like property types are not scanned.
 //! - XHP9/XHP30: the `xhpast.naminghook` / `xhpast.switchhook`
 //!   overrides name custom PHP classes and cannot run here; default
 //!   determinations are enforced.
@@ -2630,6 +2638,12 @@ fn ref_reuse_message() -> &'static str {
      do not reuse."
 }
 
+/// PHP `!$version` / `empty($version)` gating: only `""` and
+/// `"0"` are falsy (`"0.0"` still gates).
+fn php_empty(version: &str) -> bool {
+    version.is_empty() || version == "0"
+}
+
 /// XHP45: version-gated symbol-table checks (functions, classes,
 /// constants, parameter versions, Windows availability) plus the
 /// PHP 5.3/5.4 syntax checks. Without `xhpast.php-version` nothing
@@ -2638,7 +2652,7 @@ fn rule_php_compatibility(ctx: &RuleCtx, out: &mut Vec<RawFinding>) {
     let Some(version) = ctx.options.php_version.as_deref() else {
         return;
     };
-    if version.is_empty() {
+    if php_empty(version) {
         return;
     }
     compat_symbols(ctx, version, out);
@@ -3324,7 +3338,7 @@ fn compat_windows(
     let Some(target) = windows else {
         return;
     };
-    if target.is_empty() {
+    if php_empty(target) {
         return;
     }
     match sym_windows(db, &call.name) {
@@ -3732,10 +3746,13 @@ fn return_type_end(tree: &Tree, first: usize) -> Option<usize> {
 }
 
 /// XHP45 constants: every `T_STRING` outside class-name positions
-/// (plus magic constants), with member, declaration, and import
-/// names excluded. PHP also scans function-call names here (noted
-/// as TODO upstream); the tables are disjoint so at most one leg
-/// fires per name.
+/// (plus magic constants), with member, declaration, label, and
+/// import-statement names excluded. `use`/`namespace` names get one
+/// lookup of their full concrete string each (see
+/// [`compat_constant_imports`]), and so does every other qualified
+/// run (namespaced constants live in the table). PHP also scans
+/// function-call names here (noted as TODO upstream); the tables
+/// are disjoint so at most one leg fires per name.
 fn compat_constants(
     tree: &Tree,
     db: &serde_json::Value,
@@ -3744,21 +3761,241 @@ fn compat_constants(
     class_tokens: &HashSet<usize>,
     out: &mut Vec<RawFinding>,
 ) {
+    let mut import_tokens = HashSet::new();
+    compat_constant_imports(tree, db, version, whitelist, &mut import_tokens, out);
     for (i, token) in tree.tokens.iter().enumerate() {
         if !is_const_token(&token.kind) {
             continue;
         }
-        if class_tokens.contains(&i) {
+        if class_tokens.contains(&i) || import_tokens.contains(&i) {
             continue;
         }
-        if !has_uppercase(&token.value) {
-            continue;
+        if token.kind == kinds::T_STRING {
+            compat_constant_string(tree, db, version, whitelist, i, &token.value, out);
+        } else {
+            if !has_uppercase(&token.value) {
+                continue;
+            }
+            compat_constant_hit(tree, db, version, whitelist, i, &token.value, out);
         }
-        if token.kind == kinds::T_STRING && const_name_excluded(tree, i) {
-            continue;
-        }
-        compat_constant_hit(tree, db, version, whitelist, i, &token.value, out);
     }
+}
+
+/// One `T_STRING`: non-head qualified segments defer to their run
+/// head, which looks up the FULL run text once (namespaced
+/// constants like `http\Client\Curl\AUTH_ANY` live in the table);
+/// single names look up as before.
+fn compat_constant_string(
+    tree: &Tree,
+    db: &serde_json::Value,
+    version: &str,
+    whitelist: &[WhiteEntry],
+    idx: usize,
+    name: &str,
+    out: &mut Vec<RawFinding>,
+) {
+    if qual_run_start(tree, idx) != idx {
+        return;
+    }
+    if const_name_excluded(tree, idx) {
+        return;
+    }
+    let last = qual_end(tree, idx);
+    if last == idx {
+        if !has_uppercase(name) {
+            return;
+        }
+        compat_constant_hit(tree, db, version, whitelist, idx, name, out);
+    } else if !const_run_gapped(tree, idx, last) {
+        let lookup = const_run_lookup(tree, idx, last);
+        if has_uppercase(&lookup) {
+            compat_constant_lookup(tree, db, version, whitelist, idx, &lookup, out);
+        }
+    }
+}
+
+/// Full lookup text of the qualified run `first..=last` (leading
+/// `\` kept, so `\`-prefixed names miss exactly like PHP's
+/// `getConcreteString()` lookups).
+fn const_run_lookup(tree: &Tree, first: usize, last: usize) -> String {
+    let leading = tree
+        .prev_semantic(first)
+        .is_some_and(|prev| tree.tokens[prev].kind == "\\");
+    qual_text(tree, first, last, leading)
+}
+
+/// True when a qualified run holds anything but bare separators
+/// between its segments (spaces, comments): PHP's concrete string
+/// then differs from the joined text and misses the table, so no
+/// lookup runs.
+fn const_run_gapped(tree: &Tree, first: usize, last: usize) -> bool {
+    let mut prev = first;
+    let mut cur = tree.next_semantic(first);
+    while let Some(idx) = cur {
+        if idx > last {
+            break;
+        }
+        if !tree.gap_text(prev, idx).is_empty() {
+            return true;
+        }
+        prev = idx;
+        cur = tree.next_semantic(idx);
+    }
+    false
+}
+
+/// Single-lookup pass for `use`/`namespace` names: each is one
+/// `n_SYMBOL_NAME` node in PHP (`use.php.test`,
+/// `namespace.php.test`), so the constants leg looks up its FULL
+/// concrete string once (only namespaced constants are tabled
+/// under multi-segment keys). `as` aliases are `n_STRING` and
+/// never scan. `use function`/`use const` and group-`use` are
+/// beyond the stock grammar (old `xhpast` reports only a syntax
+/// error there), so those statements are skipped.
+fn compat_constant_imports(
+    tree: &Tree,
+    db: &serde_json::Value,
+    version: &str,
+    whitelist: &[WhiteEntry],
+    import_tokens: &mut HashSet<usize>,
+    out: &mut Vec<RawFinding>,
+) {
+    for use_idx in import_use_idxs(tree) {
+        compat_constant_use(tree, db, version, whitelist, import_tokens, use_idx, out);
+    }
+    for (i, token) in tree.tokens.iter().enumerate() {
+        if token.kind == kinds::T_NAMESPACE {
+            compat_constant_namespace(tree, db, version, whitelist, import_tokens, i, out);
+        }
+    }
+}
+
+/// One `use` statement: comma-separated imports, each optionally
+/// `as`-aliased; one lookup per import name.
+fn compat_constant_use(
+    tree: &Tree,
+    db: &serde_json::Value,
+    version: &str,
+    whitelist: &[WhiteEntry],
+    import_tokens: &mut HashSet<usize>,
+    use_idx: usize,
+    out: &mut Vec<RawFinding>,
+) {
+    hide_use_statement(tree, use_idx, import_tokens);
+    let mut cur = tree.next_semantic(use_idx);
+    if cur.is_some_and(|idx| is_use_qualifier(tree, idx)) {
+        return;
+    }
+    while let Some(idx) = cur {
+        if !is_import_start(tree, idx) {
+            break;
+        }
+        let Some((first, last, name)) = import_name(tree, idx) else {
+            break;
+        };
+        if use_group_open(tree, last) {
+            return;
+        }
+        compat_constant_lookup(tree, db, version, whitelist, first, &name, out);
+        cur = use_next_import(tree, last);
+    }
+}
+
+/// `function`/`const` qualifiers after `use` (beyond stock grammar).
+fn is_use_qualifier(tree: &Tree, idx: usize) -> bool {
+    matches!(
+        tree.tokens[idx].kind.as_str(),
+        kinds::T_FUNCTION | kinds::T_CONST
+    )
+}
+
+/// A `T_STRING` or `\` starts an import name.
+fn is_import_start(tree: &Tree, idx: usize) -> bool {
+    matches!(tree.tokens[idx].kind.as_str(), kinds::T_STRING | "\\")
+}
+
+/// Qualified import name starting at `idx`: first/last token plus
+/// the concrete text (leading `\` kept, like PHP lookups).
+fn import_name(tree: &Tree, idx: usize) -> Option<(usize, usize, String)> {
+    let mut first = idx;
+    let mut leading = false;
+    if tree.tokens[idx].kind == "\\" {
+        leading = true;
+        first = tree.next_semantic(idx)?;
+    }
+    if tree.tokens[first].kind != kinds::T_STRING {
+        return None;
+    }
+    let last = qual_end(tree, first);
+    Some((first, last, qual_text(tree, first, last, leading)))
+}
+
+/// True when `{` opens right after an import name: group-`use`
+/// (`use A\{B};`), beyond the stock grammar.
+fn use_group_open(tree: &Tree, last: usize) -> bool {
+    tree.next_semantic(last)
+        .is_some_and(|next| tree.tokens[next].kind == "{")
+}
+
+/// Hide a whole `use` statement (`use` through its `;`) from the
+/// per-token scan: every name in it is served exactly once by the
+/// single-lookup pass, and aliases never scan.
+fn hide_use_statement(tree: &Tree, use_idx: usize, import_tokens: &mut HashSet<usize>) {
+    let mut depth = 0u32;
+    let mut i = use_idx;
+    while i < tree.tokens.len() {
+        import_tokens.insert(i);
+        match tree.tokens[i].kind.as_str() {
+            "{" => depth += 1,
+            "}" => depth = depth.saturating_sub(1),
+            ";" if depth == 0 => break,
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// Token starting the next import after the optional `as ALIAS`
+/// and `,` following one import; `None` ends the statement scan.
+fn use_next_import(tree: &Tree, last: usize) -> Option<usize> {
+    let mut cur = tree.next_semantic(last);
+    if cur.is_some_and(|idx| tree.tokens[idx].kind == kinds::T_AS) {
+        cur = cur
+            .and_then(|as_idx| tree.next_semantic(as_idx))
+            .and_then(|alias| tree.next_semantic(alias));
+    }
+    if cur.is_some_and(|idx| tree.tokens[idx].kind == ",") {
+        cur.and_then(|comma| tree.next_semantic(comma))
+    } else {
+        None
+    }
+}
+
+/// One `namespace` declaration name (`namespace\FOO` operator uses
+/// and bare `namespace {` blocks carry no name of their own; anything
+/// else there is invalid PHP, hidden so magic spellings never flag).
+fn compat_constant_namespace(
+    tree: &Tree,
+    db: &serde_json::Value,
+    version: &str,
+    whitelist: &[WhiteEntry],
+    import_tokens: &mut HashSet<usize>,
+    ns_idx: usize,
+    out: &mut Vec<RawFinding>,
+) {
+    let Some(next) = tree.next_semantic(ns_idx) else {
+        return;
+    };
+    if tree.tokens[next].kind != kinds::T_STRING {
+        if is_const_token(&tree.tokens[next].kind) {
+            import_tokens.insert(next);
+        }
+        return;
+    }
+    let Some((first, _, name)) = import_name(tree, next) else {
+        return;
+    };
+    compat_constant_lookup(tree, db, version, whitelist, first, &name, out);
 }
 
 fn is_const_token(kind: &str) -> bool {
@@ -3789,10 +4026,24 @@ fn compat_constant_hit(
     out: &mut Vec<RawFinding>,
 ) {
     let lookup = const_lookup_name(tree, idx, name);
-    if whitelisted(whitelist, WhiteKind::Constant, &lookup, idx) {
+    compat_constant_lookup(tree, db, version, whitelist, idx, &lookup, out);
+}
+
+/// One constants-table lookup (shared by the per-token scan and
+/// the single-lookup `use`/`namespace` pass below).
+fn compat_constant_lookup(
+    tree: &Tree,
+    db: &serde_json::Value,
+    version: &str,
+    whitelist: &[WhiteEntry],
+    idx: usize,
+    lookup: &str,
+    out: &mut Vec<RawFinding>,
+) {
+    if whitelisted(whitelist, WhiteKind::Constant, lookup, idx) {
         return;
     }
-    let (min, max) = sym_min_max(db, "constants", &lookup);
+    let (min, max) = sym_min_max(db, "constants", lookup);
     if let Some(introduced) = min.filter(|found| sym_gt(found, version)) {
         push(
             out,
@@ -3829,14 +4080,14 @@ fn const_lookup_name(tree: &Tree, idx: usize, name: &str) -> String {
     }
 }
 
-/// True for `T_STRING`s that are member, declaration, or import
-/// names rather than constant references.
+/// True for `T_STRING`s that are member, declaration, label,
+/// or import names rather than constant references.
 fn const_name_excluded(tree: &Tree, idx: usize) -> bool {
     const_after_member_op(tree, idx)
         || const_after_decl_kw(tree, idx)
         || const_after_attribute(tree, idx)
+        || const_is_label(tree, idx)
         || const_followed_by_assign(tree, idx)
-        || const_followed_by_separator(tree, idx)
 }
 
 /// Member names after `->`, `?->`, and `::`.
@@ -3878,18 +4129,32 @@ fn const_after_attribute(tree: &Tree, idx: usize) -> bool {
         .is_some_and(|prev| tree.tokens[prev].kind == kinds::T_ATTRIBUTE)
 }
 
+/// Labels (`FOO:`) are `n_LABEL`/`n_STRING` in PHP, never scanned;
+/// `case FOO:` and ternary branches are expressions and still
+/// scan, so only statement-start colons exclude. (A label directly
+/// after another `:` — `case 1: FOO:` — still scans; see the
+/// module notes.)
+fn const_is_label(tree: &Tree, idx: usize) -> bool {
+    if tree
+        .next_semantic(idx)
+        .is_none_or(|next| tree.tokens[next].kind != ":")
+    {
+        return false;
+    }
+    match tree.prev_semantic(idx) {
+        None => true,
+        Some(prev) => matches!(
+            tree.tokens[prev].kind.as_str(),
+            ";" | "{" | "}" | kinds::T_OPEN_TAG | kinds::T_OPEN_TAG_WITH_ECHO | kinds::T_CLOSE_TAG
+        ),
+    }
+}
+
 /// `const` multi-declarators (`const A = 1, B = 2`): a bare name
 /// followed by `=` can only declare a class constant.
 fn const_followed_by_assign(tree: &Tree, idx: usize) -> bool {
     tree.next_semantic(idx)
         .is_some_and(|next| tree.tokens[next].kind == "=")
-}
-
-/// Non-final segments of qualified names (`A\B`: `A` belongs to
-/// the name ending at `B`, and `B` misses via its `\` prefix).
-fn const_followed_by_separator(tree: &Tree, idx: usize) -> bool {
-    tree.next_semantic(idx)
-        .is_some_and(|next| tree.tokens[next].kind == "\\")
 }
 
 #[cfg(test)]

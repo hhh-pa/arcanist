@@ -19,8 +19,16 @@
 //!   tool output on a zero exit falls back to the built-in tokenizer
 //!   over the real file bytes, so rule evaluation still runs.
 //! - XHP45 (PHP Compatibility) ports the `xhpast.php-version`
-//!   gating plus the PHP 5.3/5.4 syntax-feature checks; the
-//!   symbol-table checks are not ported.
+//!   gating, the PHP 5.3/5.4 syntax-feature checks, and the
+//!   symbol-table checks (functions, classes, constants,
+//!   parameter versions, Windows availability, and the
+//!   conditional-usage whitelist) against the vendored
+//!   `resources/php/symbol-information.json`. Remaining
+//!   approximations: `interface_exists()` guards are dropped (PHP
+//!   files them under a bucket no check reads); `use
+//!   function`/`use const` and group-`use` names are skipped;
+//!   labels directly after `:` still scan; class-like property
+//!   types are not scanned.
 //! - XHP54 (Formatted String) ports the missing-format-string check;
 //!   libphutil `xsprintf()` conversion validation is not ported.
 //! - The `xhpast.switchhook` / `xhpast.naminghook` overrides name
