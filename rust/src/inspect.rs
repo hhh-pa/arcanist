@@ -12,6 +12,9 @@
 //! the commit message. `browse(<token>)` resolves through the shared
 //! browse engine (see `browse`); revision annotations stay unloaded
 //! (`revisionRefs`).
+//!
+//! The ref trees carry no console markup: every PHP `tsprintf` pattern
+//! here is markup-free, so both ANSI modes share the exact bytes.
 
 use std::path::Path;
 use std::process::ExitCode;

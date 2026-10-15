@@ -125,3 +125,18 @@ fn formats_uploaded_ref_json() {
         })
     );
 }
+
+#[test]
+fn ref_lines_carry_no_markup() {
+    let refs = vec![UploadedRef {
+        argument: "a.bin".to_string(),
+        id: 7,
+        phid: "PHID-FILE-x".to_string(),
+        name: "a.bin".to_string(),
+        uri: "https://h/F7".to_string(),
+    }];
+    let out = render_uploaded_refs(&refs, false).unwrap();
+    assert_eq!(out, "F7 a.bin\nhttps://h/F7\n");
+    assert!(!out.contains('\x1b'), "{out}");
+    assert!(!out.contains("**"), "{out}");
+}

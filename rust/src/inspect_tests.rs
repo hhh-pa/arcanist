@@ -324,3 +324,20 @@ fn explores_browse_tokens_through_the_engine() {
         std::process::ExitCode::SUCCESS
     );
 }
+
+#[test]
+fn ref_trees_carry_no_markup() {
+    let info = CommitInfo {
+        hash: "abc123".to_string(),
+        message: "hello".to_string(),
+    };
+    for explore in [false, true] {
+        let out = render_working_copy(&info, explore);
+        assert!(!out.contains('\x1b'), "{out}");
+        assert!(!out.contains("**"), "{out}");
+    }
+    let tmp = TempDir::new("nomarkup");
+    let out = render_browse(tmp.path(), "branch", false, None).unwrap();
+    assert!(!out.contains('\x1b'), "{out}");
+    assert!(!out.contains("**"), "{out}");
+}

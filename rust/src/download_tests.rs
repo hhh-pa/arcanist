@@ -157,3 +157,18 @@ fn resolves_targets_and_uniquifies() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn status_lines_carry_no_markup() {
+    let downloading = format_downloading("report.txt", 12_345, "report.txt");
+    assert_eq!(
+        downloading,
+        "Downloading \"report.txt\" (12,345 byte(s)) to \"report.txt\"...\n"
+    );
+    let saved = format_saved("report.txt", "report.txt");
+    assert_eq!(saved, "Saved \"report.txt\" as \"report.txt\".\n");
+    for line in [&downloading, &saved] {
+        assert!(!line.contains('\x1b'), "{line}");
+        assert!(!line.contains("**"), "{line}");
+    }
+}
