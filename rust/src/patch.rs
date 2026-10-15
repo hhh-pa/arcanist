@@ -90,7 +90,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use arc_rs::land::{self, Io, Out};
-use arc_rs::{diff_submit, git, hg, svn};
+use arc_rs::{diff_submit, git, hg, svn, terminal};
 
 /// Subcommand name, matching `arc patch`.
 pub const NAME: &str = "patch";
@@ -2295,9 +2295,20 @@ pub fn svn_tree_status(
     parse_svn_status_xml(&output)
 }
 
-/// `  Working copy: <path>` block (`:1025-1028`, markup stripped).
-fn working_copy_desc(dir: &Path) -> String {
-    format!("  Working copy: {}\n\n", dir.display())
+/// `  Working copy: <path>` block (`:1025-1028`) with an explicit ANSI
+/// setting.
+///
+/// PHP wraps the path in `__...__` (underline on TTYs, stripped
+/// otherwise); `ansi=false` renders byte-identical to the plain shape.
+fn working_copy_desc_ansi(dir: &Path, ansi: bool) -> String {
+    let path = dir.display().to_string();
+    terminal::tsprintf_ansi(
+        "  Working copy: __%R__\n\n",
+        &[terminal::TVal::Text(&path)],
+        ansi,
+    )
+    .map(|t| t.to_string())
+    .unwrap_or_else(|_| format!("  Working copy: {path}\n\n"))
 }
 
 /// Whether `arc.autostash` configuration permits autostashing
@@ -2346,6 +2357,18 @@ pub fn require_clean_tree(
     io: &mut Io,
     force: bool,
 ) -> Result<StashState, String> {
+    require_clean_tree_ansi(dir, vcs, backends, io, force, terminal::ansi_enabled())
+}
+
+/// [`require_clean_tree`] with an explicit ANSI setting.
+pub fn require_clean_tree_ansi(
+    dir: &Path,
+    vcs: Vcs,
+    backends: &Backends,
+    io: &mut Io,
+    force: bool,
+    ansi: bool,
+) -> Result<StashState, String> {
     if force {
         return Ok(StashState::Clean);
     }
@@ -2354,7 +2377,7 @@ pub fn require_clean_tree(
         Vcs::Hg => hg_tree_status(dir, &backends.hg, &["status"])?,
         Vcs::Svn => svn_tree_status(dir, &backends.svn, &["--xml", "status"])?,
     };
-    let desc = working_copy_desc(dir);
+    let desc = working_copy_desc_ansi(dir, ansi);
     fail_on_fatal_tree_state(&status, &desc)?;
     // Subversion externals are handled elsewhere; never prompt (`:1076-1080`).
     if vcs == Vcs::Svn {
@@ -2955,6 +2978,17 @@ pub fn git_submodule_update(dir: &Path, io: &mut Io) -> Result<(), String> {
 /// Failures print the verbatim `\n** Patch Failed! **\n` banner and fail
 /// with `Unable to apply patch!`.
 pub fn git_apply_patch(dir: &Path, bundle: &Bundle, io: &mut Io) -> Result<(), String> {
+    git_apply_patch_ansi(dir, bundle, io, terminal::ansi_enabled())
+}
+
+/// [`git_apply_patch`] with an explicit ANSI setting for the failure
+/// banner.
+pub fn git_apply_patch_ansi(
+    dir: &Path,
+    bundle: &Bundle,
+    io: &mut Io,
+    ansi: bool,
+) -> Result<(), String> {
     let patchfile = TempPatchFile::write(&bundle.text)?;
     let path = patchfile.path.to_string_lossy().to_string();
     let output = git::output(
@@ -2970,10 +3004,8 @@ pub fn git_apply_patch(dir: &Path, bundle: &Bundle, io: &mut Io) -> Result<(), S
         ],
     )?;
     if !output.status.success() {
-        io.push_out(&format!(
-            "{}\n** Patch Failed! **\n",
-            String::from_utf8_lossy(&output.stdout)
-        ));
+        io.push_out(&String::from_utf8_lossy(&output.stdout));
+        io.push_out(&patch_failed_banner_ansi(ansi));
         return Err("Unable to apply patch!".to_string());
     }
     io.push_out(&String::from_utf8_lossy(&output.stdout));
@@ -3016,10 +3048,33 @@ pub fn git_commit_patch(dir: &Path, bundle: &Bundle, message: &str) -> Result<()
     Ok(())
 }
 
+/// Format one `** TITLE ** message` status line with a background.
+///
+/// PHP renders `"<bg:color>** %s **</bg> %s\n"`
+/// (`ArcanistWorkflow.php:1571-1593`, `ArcanistPatchWorkflow.php:436-440,
+/// 677-681, 865-868`): TTYs gain the background plus the bold label
+/// (the `**` markers become codes), while `ansi=false` keeps the
+/// legacy `**`-marked plain bytes.
+fn status_line_ansi(color: &str, title: &str, message: &str, ansi: bool) -> String {
+    if !ansi {
+        return format!("** {title} ** {message}\n");
+    }
+    terminal::format_status_message(color, title, message, true)
+}
+
 /// Print a git success line to stderr (`writeOkay()`,
 /// `ArcanistWorkflow.php:1587-1593`).
-fn git_write_okay(io: &mut Io, title: &str, message: &str) {
-    io.push_err(&format!("** {title} ** {message}\n"));
+fn git_write_okay_ansi(io: &mut Io, title: &str, message: &str, ansi: bool) {
+    io.push_err(&status_line_ansi("green", title, message, ansi));
+}
+
+/// Cherry-pick failure banner (`"\n<bg:red>** %s**</bg>\n"`, no space
+/// before the closers, as in PHP `:787-789`).
+fn cherry_pick_failed_banner_ansi(ansi: bool) -> String {
+    if !ansi {
+        return "\n** Cherry Pick Failed!**\n".to_string();
+    }
+    terminal::console_format("\n<bg:red>** %s**</bg>\n", &["Cherry Pick Failed!"], true)
 }
 
 /// Cherry-pick the temp branch onto the original branch, then delete it
@@ -3033,6 +3088,23 @@ pub fn git_cherry_pick_temp(
     io: &mut Io,
     original_branch: &str,
     new_branch: &str,
+) -> Result<(), String> {
+    git_cherry_pick_temp_ansi(
+        dir,
+        io,
+        original_branch,
+        new_branch,
+        terminal::ansi_enabled(),
+    )
+}
+
+/// [`git_cherry_pick_temp`] with an explicit ANSI setting.
+pub fn git_cherry_pick_temp_ansi(
+    dir: &Path,
+    io: &mut Io,
+    original_branch: &str,
+    new_branch: &str,
+    ansi: bool,
 ) -> Result<(), String> {
     git::stdout_text(dir, &["checkout", original_branch, "--"])?;
     git_submodule_update(dir, io)?;
@@ -3056,7 +3128,7 @@ pub fn git_cherry_pick_temp(
     }
     git::output(dir, &["branch", "-D", "--", new_branch]).ok();
     if let Some(detail) = failure {
-        io.push_out("\n** Cherry Pick Failed!**\n");
+        io.push_out(&cherry_pick_failed_banner_ansi(ansi));
         return Err(detail.trim().to_string());
     }
     Ok(())
@@ -3092,21 +3164,47 @@ pub fn apply_git(
     original_branch: Option<&str>,
     new_branch: Option<&str>,
 ) -> Result<(), String> {
-    git_apply_patch(dir, bundle, io)?;
+    apply_git_ansi(
+        dir,
+        bundle,
+        options,
+        io,
+        call,
+        has_base_local,
+        original_branch,
+        new_branch,
+        terminal::ansi_enabled(),
+    )
+}
+
+/// [`apply_git`] with an explicit ANSI setting.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_git_ansi(
+    dir: &Path,
+    bundle: &Bundle,
+    options: &Options,
+    io: &mut Io,
+    call: Option<&diff_submit::ConduitCall<'_>>,
+    has_base_local: bool,
+    original_branch: Option<&str>,
+    new_branch: Option<&str>,
+    ansi: bool,
+) -> Result<(), String> {
+    git_apply_patch_ansi(dir, bundle, io, ansi)?;
     git_submodule_update(dir, io)?;
     if should_commit(options) {
         let message = resolve_commit_message(bundle, call)?;
         git_commit_patch(dir, bundle, &message)?;
-        git_write_okay(io, "COMMITTED", "Successfully committed patch.");
+        git_write_okay_ansi(io, "COMMITTED", "Successfully committed patch.", ansi);
     } else {
-        git_write_okay(io, "APPLIED", "Successfully applied patch.");
+        git_write_okay_ansi(io, "APPLIED", "Successfully applied patch.", ansi);
     }
     if !should_branch(options)
         && should_commit(options)
         && has_base_local
         && let (Some(original), Some(new)) = (original_branch, new_branch)
     {
-        git_cherry_pick_temp(dir, io, original, new)?;
+        git_cherry_pick_temp_ansi(dir, io, original, new, ansi)?;
     }
     Ok(())
 }
@@ -3194,6 +3292,46 @@ pub fn hg_create_bookmark(
     Ok(name)
 }
 
+/// Patch-failure banner (`"\n<bg:red>** %s **</bg>\n"`, `:713-715` for
+/// git, `:801-803` for hg).
+fn patch_failed_banner_ansi(ansi: bool) -> String {
+    if !ansi {
+        return "\n** Patch Failed! **\n".to_string();
+    }
+    terminal::console_format("\n<bg:red>** %s **</bg>\n", &["Patch Failed!"], true)
+}
+
+/// Rebase-failure banner (`"\n<bg:red>** %s**</bg>\n"`, no space before
+/// the closers, as in PHP `:854-857`).
+fn rebase_failed_banner_ansi(original_branch: &str, ansi: bool) -> String {
+    if !ansi {
+        return format!("\n** Rebase onto {original_branch} failed!**\n");
+    }
+    let message = format!("Rebase onto {original_branch} failed!");
+    terminal::console_format("\n<bg:red>** %s**</bg>\n", &[&message], true)
+}
+
+/// Case-folding warning (plain shape, verbatim from PHP).
+const HG_CASE_WARNING_PLAIN: &str = "\n** WARNING ** This patch may have failed because it attempts to change the case \
+     of a filename (for instance, from 'example.c' to 'Example.c'). Mercurial cannot \
+     apply patches like this on case-insensitive filesystems. You must apply this patch \
+     manually.\n";
+
+/// Case-folding warning with an explicit ANSI setting.
+///
+/// PHP renders `"\n<bg:yellow>** %s **</bg> %s\n"` (`:807-815`); the
+/// `**` markers stay in the pattern so TTYs gain the bold label,
+/// while `ansi=false` keeps the legacy `**`-marked plain bytes.
+fn hg_case_warning_ansi(ansi: bool) -> String {
+    if !ansi {
+        return HG_CASE_WARNING_PLAIN.to_string();
+    }
+    let rest = HG_CASE_WARNING_PLAIN
+        .strip_prefix("\n** WARNING ** ")
+        .unwrap_or(HG_CASE_WARNING_PLAIN);
+    terminal::console_format("\n<bg:yellow>** %s **</bg> %s", &["WARNING", rest], true)
+}
+
 /// Import the bundle with `hg import --no-commit -` (`:794-819`).
 ///
 /// Failures print the verbatim `\n** Patch Failed! **\n` banner, plus
@@ -3205,6 +3343,17 @@ pub fn hg_import_patch(
     bundle: &Bundle,
     io: &mut Io,
 ) -> Result<(), String> {
+    hg_import_patch_ansi(dir, hg, bundle, io, terminal::ansi_enabled())
+}
+
+/// [`hg_import_patch`] with an explicit ANSI setting.
+pub fn hg_import_patch_ansi(
+    dir: &Path,
+    hg: &hg::HgCommand,
+    bundle: &Bundle,
+    io: &mut Io,
+    ansi: bool,
+) -> Result<(), String> {
     // The patch travels via temp file instead of `-` stdin so custom
     // backends work; `hg import` accepts a file the same way.
     let patchfile = TempPatchFile::write(&bundle.text)?;
@@ -3214,15 +3363,10 @@ pub fn hg_import_patch(
         io.push_out(&String::from_utf8_lossy(&output.stdout));
         return Ok(());
     }
-    io.push_out("\n** Patch Failed! **\n");
+    io.push_out(&patch_failed_banner_ansi(ansi));
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     if stderr.contains("case-folding collision") {
-        io.push_out(
-            "\n** WARNING ** This patch may have failed because it attempts to change the case \
-             of a filename (for instance, from 'example.c' to 'Example.c'). Mercurial cannot \
-             apply patches like this on case-insensitive filesystems. You must apply this patch \
-             manually.\n",
-        );
+        io.push_out(&hg_case_warning_ansi(ansi));
     }
     Err(
         format!("{}{}", String::from_utf8_lossy(&output.stdout), stderr)
@@ -3273,6 +3417,24 @@ pub fn hg_rebase_temp(
     original_branch: &str,
     new_branch: &str,
 ) -> Result<(), String> {
+    hg_rebase_temp_ansi(
+        dir,
+        hg,
+        original_branch,
+        new_branch,
+        terminal::ansi_enabled(),
+    )
+}
+
+/// [`hg_rebase_temp`] with an explicit ANSI setting for the failure
+/// banner (PHP formats the banner into the thrown message, `:854-857`).
+pub fn hg_rebase_temp_ansi(
+    dir: &Path,
+    hg: &hg::HgCommand,
+    original_branch: &str,
+    new_branch: &str,
+    ansi: bool,
+) -> Result<(), String> {
     let original_rev = hg_canonical(dir, hg, original_branch)?;
     let current_parent = hg_canonical(dir, hg, &format!("{new_branch}^"))?;
     let mut failed = false;
@@ -3286,7 +3448,7 @@ pub fn hg_rebase_temp(
     hg::stdout_text_with(dir, hg, &["bookmark", "--delete", new_branch])?;
     if failed {
         let _ = hg::ok_with(dir, hg, &["rebase", "--abort"]);
-        return Err(format!("\n** Rebase onto {original_branch} failed!**\n"));
+        return Err(rebase_failed_banner_ansi(original_branch, ansi));
     }
     Ok(())
 }
@@ -3305,7 +3467,35 @@ pub fn apply_hg(
     original_branch: Option<&str>,
     new_branch: Option<&str>,
 ) -> Result<(), String> {
-    hg_import_patch(dir, hg, bundle, io)?;
+    apply_hg_ansi(
+        dir,
+        hg,
+        bundle,
+        options,
+        io,
+        call,
+        has_base_local,
+        original_branch,
+        new_branch,
+        terminal::ansi_enabled(),
+    )
+}
+
+/// [`apply_hg`] with an explicit ANSI setting.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_hg_ansi(
+    dir: &Path,
+    hg: &hg::HgCommand,
+    bundle: &Bundle,
+    options: &Options,
+    io: &mut Io,
+    call: Option<&diff_submit::ConduitCall<'_>>,
+    has_base_local: bool,
+    original_branch: Option<&str>,
+    new_branch: Option<&str>,
+    ansi: bool,
+) -> Result<(), String> {
+    hg_import_patch_ansi(dir, hg, bundle, io, ansi)?;
     if should_commit(options) {
         let message = resolve_commit_message(bundle, call)?;
         hg_commit_patch(dir, hg, bundle, &message)?;
@@ -3313,11 +3503,21 @@ pub fn apply_hg(
             && has_base_local
             && let (Some(original), Some(new)) = (original_branch, new_branch)
         {
-            hg_rebase_temp(dir, hg, original, new)?;
+            hg_rebase_temp_ansi(dir, hg, original, new, ansi)?;
         }
-        io.push_err("** OKAY ** Successfully committed patch.\n");
+        io.push_err(&status_line_ansi(
+            "green",
+            "OKAY",
+            "Successfully committed patch.",
+            ansi,
+        ));
     } else {
-        io.push_err("** OKAY ** Successfully applied patch.\n");
+        io.push_err(&status_line_ansi(
+            "green",
+            "OKAY",
+            "Successfully applied patch.",
+            ansi,
+        ));
     }
     Ok(())
 }
@@ -3797,6 +3997,28 @@ pub enum SvnOutcome {
     HunksFailed,
 }
 
+/// Svn hunks-failed warning (plain shape, verbatim from PHP).
+const SVN_HUNKS_WARNING_PLAIN: &str = "\n\n** WARNING ** Some hunks could not be applied cleanly by the unix 'patch' utility. \
+     Your working copy may be different from the revision's base, or you may be in the wrong \
+     subdirectory. You can export the raw patch file using 'arc export --unified', and then \
+     try to apply it by fiddling with options to 'patch' (particularly, -p), or manually. \
+     The output above, from 'patch', may be helpful in figuring out what went wrong.\n";
+
+/// Svn hunks-failed warning with an explicit ANSI setting.
+///
+/// PHP renders `"\n\n<bg:yellow>** %s **</bg> %s\n"` (`:683-700`); the
+/// `**` markers stay in the pattern so TTYs gain the bold label,
+/// while `ansi=false` keeps the legacy `**`-marked plain bytes.
+fn svn_hunks_warning_ansi(ansi: bool) -> String {
+    if !ansi {
+        return SVN_HUNKS_WARNING_PLAIN.to_string();
+    }
+    let rest = SVN_HUNKS_WARNING_PLAIN
+        .strip_prefix("\n\n** WARNING ** ")
+        .unwrap_or(SVN_HUNKS_WARNING_PLAIN);
+    terminal::console_format("\n\n<bg:yellow>** %s **</bg> %s", &["WARNING", rest], true)
+}
+
 /// Apply bundle changes under svn (`:476-700`).
 ///
 /// Collects copies/deletes/patches/propsets/adds/symlinks (prompting
@@ -3815,6 +4037,30 @@ pub fn apply_svn(
     run_touch: &mut dyn FnMut(&str) -> Result<(), String>,
     run_link: &mut dyn FnMut(&str, &str) -> Result<(), String>,
 ) -> Result<SvnOutcome, String> {
+    apply_svn_ansi(
+        dir,
+        svn,
+        changes,
+        io,
+        run_patch,
+        run_touch,
+        run_link,
+        terminal::ansi_enabled(),
+    )
+}
+
+/// [`apply_svn`] with an explicit ANSI setting.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_svn_ansi(
+    dir: &Path,
+    svn: &svn::SvnCommand,
+    changes: &[SvnChange],
+    io: &mut Io,
+    run_patch: PatchRunner<'_>,
+    run_touch: &mut dyn FnMut(&str) -> Result<(), String>,
+    run_link: &mut dyn FnMut(&str, &str) -> Result<(), String>,
+    ansi: bool,
+) -> Result<SvnOutcome, String> {
     let plan = plan_svn_changes(dir, changes, io)?;
     create_svn_parents(dir, svn, &plan)?;
     run_svn_copies_deletes(dir, svn, &plan)?;
@@ -3822,16 +4068,15 @@ pub fn apply_svn(
     let patch_err = run_svn_patches(&plan, io, run_patch, run_touch)?;
     run_svn_adds_props(dir, svn, &plan)?;
     if !patch_err {
-        io.push_out("** OKAY ** Successfully applied patch to the working copy.\n");
+        io.push_out(&status_line_ansi(
+            "green",
+            "OKAY",
+            "Successfully applied patch to the working copy.",
+            ansi,
+        ));
         return Ok(SvnOutcome::Applied);
     }
-    io.push_out(
-        "\n\n** WARNING ** Some hunks could not be applied cleanly by the unix 'patch' utility. \
-         Your working copy may be different from the revision's base, or you may be in the wrong \
-         subdirectory. You can export the raw patch file using 'arc export --unified', and then \
-         try to apply it by fiddling with options to 'patch' (particularly, -p), or manually. \
-         The output above, from 'patch', may be helpful in figuring out what went wrong.\n",
-    );
+    io.push_out(&svn_hunks_warning_ansi(ansi));
     Ok(SvnOutcome::HunksFailed)
 }
 
@@ -4263,7 +4508,18 @@ pub fn ensure_base_present(
     bundle: &Bundle,
     io: &mut Io,
 ) -> Result<bool, String> {
-    ensure_base_present_with(dir, vcs, bundle, io, &Backends::default())
+    ensure_base_present_ansi(dir, vcs, bundle, io, terminal::ansi_enabled())
+}
+
+/// [`ensure_base_present`] with an explicit ANSI setting.
+pub fn ensure_base_present_ansi(
+    dir: &Path,
+    vcs: Vcs,
+    bundle: &Bundle,
+    io: &mut Io,
+    ansi: bool,
+) -> Result<bool, String> {
+    ensure_base_present_with_ansi(dir, vcs, bundle, io, &Backends::default(), ansi)
 }
 
 /// [`ensure_base_present`] with injectable hg/svn backends (test seam).
@@ -4277,6 +4533,18 @@ pub fn ensure_base_present_with(
     io: &mut Io,
     backends: &Backends,
 ) -> Result<bool, String> {
+    ensure_base_present_with_ansi(dir, vcs, bundle, io, backends, terminal::ansi_enabled())
+}
+
+/// [`ensure_base_present_with`] with an explicit ANSI setting.
+pub fn ensure_base_present_with_ansi(
+    dir: &Path,
+    vcs: Vcs,
+    bundle: &Bundle,
+    io: &mut Io,
+    backends: &Backends,
+    ansi: bool,
+) -> Result<bool, String> {
     let mut present = match vcs {
         Vcs::Git => git::has_local_commit(dir, bundle.base_revision.as_deref()),
         Vcs::Hg => bundle
@@ -4286,7 +4554,12 @@ pub fn ensure_base_present_with(
         Vcs::Svn => false,
     };
     if !present && vcs == Vcs::Git {
-        io.push_out("** INFO ** Base commit is not in local repository; trying to fetch.\n");
+        io.push_out(&status_line_ansi(
+            "blue",
+            "INFO",
+            "Base commit is not in local repository; trying to fetch.",
+            ansi,
+        ));
         git::output(dir, &["fetch", "--quiet", "--all"]).ok();
         present = git::has_local_commit(dir, bundle.base_revision.as_deref());
     }
@@ -4567,6 +4840,7 @@ fn run_patch_flow(
     options: &Options,
     io: &mut Io,
     backends: &Backends,
+    ansi: bool,
 ) -> Result<FlowOutcome, String> {
     let source = select_source(options)?;
     let Some(vcs) = detect_vcs(dir) else {
@@ -4576,8 +4850,8 @@ fn run_patch_flow(
     if options.update {
         update_working_copy(dir, vcs, backends, io)?;
     }
-    let stash = require_clean_tree(dir, vcs, backends, io, options.force)?;
-    let outcome = run_patch_flow_inner(dir, options, io, backends, &source, vcs);
+    let stash = require_clean_tree_ansi(dir, vcs, backends, io, options.force, ansi)?;
+    let outcome = run_patch_flow_inner(dir, options, io, backends, &source, vcs, ansi);
     let pop = unstash_changes(dir, stash);
     match (outcome, pop) {
         (Ok(outcome), Ok(())) => Ok(outcome),
@@ -4594,6 +4868,7 @@ fn run_patch_flow_inner(
     backends: &Backends,
     source: &Source,
     vcs: Vcs,
+    ansi: bool,
 ) -> Result<FlowOutcome, String> {
     let client = match source {
         Source::Patch(_) => None,
@@ -4610,7 +4885,8 @@ fn run_patch_flow_inner(
         .as_ref()
         .map(|_| &call as &dyn Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>);
     let loaded = load_bundle(source, options, io, call_option)?;
-    let has_base_local = ensure_base_present_with(dir, vcs, &loaded.bundle, io, backends)?;
+    let has_base_local =
+        ensure_base_present_with_ansi(dir, vcs, &loaded.bundle, io, backends, ansi)?;
     let branch = maybe_create_branch(
         dir,
         vcs,
@@ -4629,6 +4905,7 @@ fn run_patch_flow_inner(
         vcs,
         has_base_local,
         call_option,
+        ansi,
     )?;
     if !options.force {
         sanity_check(
@@ -4652,6 +4929,7 @@ fn run_patch_flow_inner(
         &branch,
         has_base_local,
         call_option,
+        ansi,
     )
 }
 
@@ -4667,13 +4945,14 @@ fn run_patch_dependencies(
     vcs: Vcs,
     has_base_local: bool,
     call_option: Option<&diff_submit::ConduitCall<'_>>,
+    ansi: bool,
 ) -> Result<(), String> {
     if !has_base_local && should_apply_dependencies(bundle, options, vcs) {
         let call_ref = call_option.expect("conduit for dependencies");
         let children =
             plan_dependency_children_with(dir, vcs, bundle, options, io, call_ref, backends)?;
         for child_options in &children {
-            match run_patch_flow(dir, child_options, io, backends)? {
+            match run_patch_flow(dir, child_options, io, backends, ansi)? {
                 FlowOutcome::Done => {}
                 FlowOutcome::SvnHunksFailed => return Err(String::new()),
             }
@@ -4695,10 +4974,11 @@ fn apply_patch_bundle(
     branch: &BranchState,
     has_base_local: bool,
     call_option: Option<&diff_submit::ConduitCall<'_>>,
+    ansi: bool,
 ) -> Result<FlowOutcome, String> {
     match vcs {
         Vcs::Git => {
-            apply_git(
+            apply_git_ansi(
                 dir,
                 bundle,
                 options,
@@ -4707,11 +4987,12 @@ fn apply_patch_bundle(
                 has_base_local,
                 branch.original.as_deref(),
                 branch.new.as_deref(),
+                ansi,
             )?;
             Ok(FlowOutcome::Done)
         }
         Vcs::Hg => {
-            apply_hg(
+            apply_hg_ansi(
                 dir,
                 &backends.hg,
                 bundle,
@@ -4721,10 +5002,11 @@ fn apply_patch_bundle(
                 has_base_local,
                 branch.original.as_deref(),
                 branch.new.as_deref(),
+                ansi,
             )?;
             Ok(FlowOutcome::Done)
         }
-        Vcs::Svn => apply_patch_svn(dir, backends, bundle, arcbundle_dicts, io),
+        Vcs::Svn => apply_patch_svn(dir, backends, bundle, arcbundle_dicts, io, ansi),
     }
 }
 
@@ -4736,12 +5018,13 @@ fn apply_patch_svn(
     bundle: &Bundle,
     arcbundle_dicts: Option<&(Vec<serde_json::Value>, Vec<Vec<String>>)>,
     io: &mut Io,
+    ansi: bool,
 ) -> Result<FlowOutcome, String> {
     let changes = match arcbundle_dicts {
         Some((dicts, corpora)) => svn_changes_from_dicts(dicts, corpora),
         None => parse_git_patch_for_svn(&bundle.text),
     };
-    let outcome = apply_svn(
+    let outcome = apply_svn_ansi(
         dir,
         &backends.svn,
         &changes,
@@ -4749,6 +5032,7 @@ fn apply_patch_svn(
         &mut |_, patch| run_patch_file(dir, patch),
         &mut |path| run_touch_file(dir, path),
         &mut |target, path| run_symlink(dir, target, path),
+        ansi,
     )?;
     Ok(match outcome {
         SvnOutcome::Applied => FlowOutcome::Done,
@@ -4769,6 +5053,17 @@ pub fn execute_with_io(
     io: &mut Io,
     backends: &Backends,
 ) -> Result<Out, String> {
+    execute_with_io_ansi(dir, argv, io, backends, terminal::ansi_enabled())
+}
+
+/// [`execute_with_io`] with an explicit ANSI setting.
+pub fn execute_with_io_ansi(
+    dir: &Path,
+    argv: &[String],
+    io: &mut Io,
+    backends: &Backends,
+    ansi: bool,
+) -> Result<Out, String> {
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
@@ -4780,7 +5075,7 @@ pub fn execute_with_io(
     if options.preview {
         return execute_preview(dir, &options, io);
     }
-    match run_patch_flow(dir, &options, io, backends)? {
+    match run_patch_flow(dir, &options, io, backends, ansi)? {
         FlowOutcome::Done => Ok(std::mem::take(&mut io.out)),
         FlowOutcome::SvnHunksFailed => Err(String::new()),
     }
@@ -4810,19 +5105,35 @@ fn execute_preview(dir: &Path, options: &Options, io: &mut Io) -> Result<Out, St
 
 /// Run the workflow with scripted stdin patch text.
 pub fn execute_with_stdin(dir: &Path, argv: &[String], stdin: Option<&str>) -> Result<Out, String> {
+    execute_with_stdin_ansi(dir, argv, stdin, terminal::ansi_enabled())
+}
+
+/// [`execute_with_stdin`] with an explicit ANSI setting.
+pub fn execute_with_stdin_ansi(
+    dir: &Path,
+    argv: &[String],
+    stdin: Option<&str>,
+    ansi: bool,
+) -> Result<Out, String> {
     let mut io = Io::buffered();
     io.patch_stdin = stdin.map(str::to_string);
-    execute_with_io(dir, argv, &mut io, &Backends::default())
+    execute_with_io_ansi(dir, argv, &mut io, &Backends::default(), ansi)
 }
 
 /// Run the workflow rooted at `dir` with buffered IO.
 pub fn execute(dir: &Path, argv: &[String]) -> Result<Out, String> {
-    execute_with_io(dir, argv, &mut Io::buffered(), &Backends::default())
+    execute_ansi(dir, argv, terminal::ansi_enabled())
+}
+
+/// [`execute`] with an explicit ANSI setting.
+pub fn execute_ansi(dir: &Path, argv: &[String], ansi: bool) -> Result<Out, String> {
+    execute_with_io_ansi(dir, argv, &mut Io::buffered(), &Backends::default(), ansi)
 }
 
 /// Run the workflow rooted at `dir` with live console IO.
 pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
-    match execute_with_io(dir, argv, &mut Io::live(), &Backends::default()) {
+    let ansi = terminal::ansi_enabled();
+    match execute_with_io_ansi(dir, argv, &mut Io::live(), &Backends::default(), ansi) {
         Ok(_) => ExitCode::SUCCESS,
         Err(message) if message.is_empty() => ExitCode::FAILURE,
         Err(message) => {

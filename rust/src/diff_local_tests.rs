@@ -3975,3 +3975,145 @@ fn gap2_calculate_should_amend_decisions() {
         "R9:abc123"
     );
 }
+
+#[test]
+fn ansi_lint_banners_gain_backgrounds() {
+    let dir = std::env::temp_dir();
+    let run = |outcome: ChildOutcome| move |_: &Path, _: &[String]| outcome.clone();
+    for (code, plain_banner, colored_banner) in [
+        (
+            LINT_RESULT_OKAY,
+            "** LINT OKAY ** No lint problems.\n",
+            "\x1b[42m\x1b[1m LINT OKAY \x1b[m\x1b[49m No lint problems.\n",
+        ),
+        (
+            LINT_RESULT_WARNINGS,
+            "** LINT MESSAGES ** Lint issued unresolved warnings.\n",
+            "\x1b[43m\x1b[1m LINT MESSAGES \x1b[m\x1b[49m Lint issued unresolved warnings.\n",
+        ),
+        (
+            LINT_RESULT_ERRORS,
+            "** LINT ERRORS ** Lint raised errors!\n",
+            "\x1b[41m\x1b[1m LINT ERRORS \x1b[m\x1b[49m Lint raised errors!\n",
+        ),
+    ] {
+        let mut out = Vec::new();
+        run_lint_ansi(
+            &dir,
+            None,
+            &[],
+            false,
+            &run(ChildOutcome::Code(code)),
+            &mut out,
+            false,
+        )
+        .unwrap();
+        assert_eq!(out, format!("Linting...\n{plain_banner}").into_bytes());
+        let mut out = Vec::new();
+        run_lint_ansi(
+            &dir,
+            None,
+            &[],
+            false,
+            &run(ChildOutcome::Code(code)),
+            &mut out,
+            true,
+        )
+        .unwrap();
+        assert_eq!(out, format!("Linting...\n{colored_banner}").into_bytes());
+    }
+}
+
+#[test]
+fn ansi_unit_banners_gain_backgrounds() {
+    let dir = std::env::temp_dir();
+    let run = |outcome: ChildOutcome| move |_: &Path, _: &[String]| outcome.clone();
+    for (code, plain_banner, colored_banner) in [
+        (
+            UNIT_RESULT_OKAY,
+            "** UNIT OKAY ** No unit test failures.\n",
+            "\x1b[42m\x1b[1m UNIT OKAY \x1b[m\x1b[49m No unit test failures.\n",
+        ),
+        (
+            UNIT_RESULT_FAIL,
+            "** UNIT ERRORS ** Unit testing raised errors!\n",
+            "\x1b[41m\x1b[1m UNIT ERRORS \x1b[m\x1b[49m Unit testing raised errors!\n",
+        ),
+    ] {
+        let mut input = std::io::BufReader::new(std::io::empty());
+        let mut out = Vec::new();
+        run_unit_ansi(
+            &dir,
+            None,
+            &[],
+            false,
+            &run(ChildOutcome::Code(code)),
+            &mut input,
+            &mut out,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            format!("Running unit tests...\n{plain_banner}").into_bytes()
+        );
+        let mut input = std::io::BufReader::new(std::io::empty());
+        let mut out = Vec::new();
+        run_unit_ansi(
+            &dir,
+            None,
+            &[],
+            false,
+            &run(ChildOutcome::Code(code)),
+            &mut input,
+            &mut out,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            format!("Running unit tests...\n{colored_banner}").into_bytes()
+        );
+    }
+    // Unsound prompts (default yes), then prints the yellow banner.
+    use std::io::Cursor;
+    for (ansi, banner) in [
+        (
+            false,
+            "** UNIT UNSOUND ** Unit testing raised errors, but all failing tests are unsound.\n",
+        ),
+        (
+            true,
+            "\x1b[43m\x1b[1m UNIT UNSOUND \x1b[m\x1b[49m Unit testing raised errors, but all failing tests are unsound.\n",
+        ),
+    ] {
+        let mut input = Cursor::new(b"y\n".to_vec());
+        let mut out = Vec::new();
+        run_unit_ansi(
+            &dir,
+            None,
+            &[],
+            false,
+            &run(ChildOutcome::Code(UNIT_RESULT_UNSOUND)),
+            &mut input,
+            &mut out,
+            ansi,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains(banner), "{text:?}");
+        assert_eq!(text.contains('\x1b'), ansi, "{text:?}");
+    }
+}
+
+#[test]
+fn ansi_working_copy_desc_underlines_path() {
+    assert_eq!(
+        working_copy_desc_ansi("/repo", false),
+        "  Working copy: /repo\n\n"
+    );
+    assert_eq!(
+        working_copy_desc_ansi("/repo", true),
+        "  Working copy: \x1b[4m/repo\x1b[m\n\n"
+    );
+}

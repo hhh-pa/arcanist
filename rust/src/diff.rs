@@ -33,7 +33,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use arc_rs::{config, diff_local, diff_submit, get_config, hg, svn};
+use arc_rs::{config, diff_local, diff_submit, get_config, hg, svn, terminal};
 
 /// Subcommand name, matching `arc diff`.
 pub const NAME: &str = "diff";
@@ -1306,18 +1306,19 @@ fn set_child_flags(options: &Options) -> (Vec<String>, Vec<String>) {
 /// Notices print to stdout even under `--json`: PHP captures them into
 /// the `human` field, which in-process runs cannot do (same `human`
 /// divergence as the submit report).
-fn run_lint_unit_stdio(
+fn run_lint_unit_stdio_ansi(
     cwd: &Path,
     options: &Options,
     base: Option<&str>,
     head: Option<&str>,
     is_raw: bool,
+    ansi: bool,
 ) -> Result<diff_local::LintUnitReport, String> {
     let (lint_flags, unit_flags) = set_child_flags(options);
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let mut out = std::io::stdout();
-    diff_local::run_lint_unit(
+    diff_local::run_lint_unit_ansi(
         cwd,
         base,
         &lint_flags,
@@ -1328,6 +1329,7 @@ fn run_lint_unit_stdio(
         &diff_local::run_unit_in_process,
         &mut input,
         &mut out,
+        ansi,
     )
 }
 
@@ -1409,18 +1411,52 @@ pub struct SubmitReport {
     pub uri: Option<String>,
 }
 
+/// Format one submit report: plain lead, bold label, underlined URI.
+///
+/// PHP prints the lead with plain `%s` and the URI line as
+/// `"**%s** __%s__"` (`:414-420`, `:554-558`); `ansi=false` strips to
+/// the plain shape, byte-identical to the historical `format!` output.
+fn format_submit_report_ansi(
+    lead: &str,
+    label: &str,
+    uri: &str,
+    included: &str,
+    ansi: bool,
+) -> String {
+    terminal::tsprintf_ansi(
+        "%R\n        **%R** __%R__\n\n%R",
+        &[
+            terminal::TVal::Text(lead),
+            terminal::TVal::Text(label),
+            terminal::TVal::Text(uri),
+            terminal::TVal::Text(included),
+        ],
+        ansi,
+    )
+    .map(|t| t.to_string())
+    .unwrap_or_else(|_| format!("{lead}\n        {label} {uri}\n\n{included}"))
+}
+
 /// Call order mirrors `run()` (`src/workflow/ArcanistDiffWorkflow.php:382-410,
 /// 463-465,525-527`): `differential.creatediff`, the
 /// `differential.setdiffproperty` writes, then the revision call. Output
 /// follows `:414-420` (diff-only), `:476,554-558` (update),
 /// `:551-558` (create), plus `Included changes:` (`:565-568`).
 ///
-/// Divergence: console markup (`**bold**`, `__underline__`) renders as plain
-/// text, and diff-only `--json` reports `"human": ""` (this port buffers no
-/// human output, `:421-429`).
+/// Divergence: diff-only `--json` reports `"human": ""` (this port buffers
+/// no human output, `:421-429`).
 pub fn submit_over_with_uri(
     call: &diff_submit::ConduitCall<'_>,
     input: &SubmitInput,
+) -> Result<SubmitReport, String> {
+    submit_over_with_uri_ansi(call, input, terminal::ansi_enabled())
+}
+
+/// [`submit_over_with_uri`] with an explicit ANSI setting.
+pub fn submit_over_with_uri_ansi(
+    call: &diff_submit::ConduitCall<'_>,
+    input: &SubmitInput,
+    ansi: bool,
 ) -> Result<SubmitReport, String> {
     let created = diff_submit::create_diff(call, &input.spec)?;
     diff_submit::set_diff_properties(call, created.diff_id, &input.properties)?;
@@ -1442,9 +1478,12 @@ pub fn submit_over_with_uri(
                 });
             }
             Ok(SubmitReport {
-                text: format!(
-                    "Created a new Differential diff:\n        Diff URI: {}\n\n{}",
-                    created.uri, input.included_changes
+                text: format_submit_report_ansi(
+                    "Created a new Differential diff:",
+                    "Diff URI:",
+                    &created.uri,
+                    &input.included_changes,
+                    ansi,
                 ),
                 uri: Some(created.uri),
             })
@@ -1460,9 +1499,12 @@ pub fn submit_over_with_uri(
             );
             let updated = diff_submit::update_revision(call, &params)?;
             Ok(SubmitReport {
-                text: format!(
-                    "Updated an existing Differential revision:\n        Revision URI: {}\n\n{}",
-                    updated.uri, input.included_changes
+                text: format_submit_report_ansi(
+                    "Updated an existing Differential revision:",
+                    "Revision URI:",
+                    &updated.uri,
+                    &input.included_changes,
+                    ansi,
                 ),
                 uri: Some(updated.uri),
             })
@@ -1473,9 +1515,12 @@ pub fn submit_over_with_uri(
             let params = diff_submit::create_revision_params(input.fields.clone(), created.diff_id);
             let revision = diff_submit::create_revision_legacy(call, &params)?;
             Ok(SubmitReport {
-                text: format!(
-                    "Created a new Differential revision:\n        Revision URI: {}\n\n{}",
-                    revision.uri, input.included_changes
+                text: format_submit_report_ansi(
+                    "Created a new Differential revision:",
+                    "Revision URI:",
+                    &revision.uri,
+                    &input.included_changes,
+                    ansi,
                 ),
                 uri: Some(revision.uri),
             })
@@ -1489,21 +1534,36 @@ pub fn submit_over(
     call: &diff_submit::ConduitCall<'_>,
     input: &SubmitInput,
 ) -> Result<String, String> {
-    submit_over_with_uri(call, input).map(|report| report.text)
+    submit_over_ansi(call, input, terminal::ansi_enabled())
+}
+
+/// [`submit_over`] with an explicit ANSI setting.
+pub fn submit_over_ansi(
+    call: &diff_submit::ConduitCall<'_>,
+    input: &SubmitInput,
+    ansi: bool,
+) -> Result<String, String> {
+    submit_over_with_uri_ansi(call, input, ansi).map(|report| report.text)
 }
 
 /// Collect a submit locally, then run it over a real Conduit client.
-fn submit_via_client(cwd: &Path, options: &Options, mode: &SubmitMode) -> Result<String, String> {
+fn submit_via_client_ansi(
+    cwd: &Path,
+    options: &Options,
+    mode: &SubmitMode,
+    ansi: bool,
+) -> Result<String, String> {
     let range = resolve_range(cwd, options)?;
     let head = range.head.as_deref();
     let is_raw = diff_local::is_raw_diff_source(options.raw, options.raw_command.as_deref());
-    let report = run_lint_unit_stdio(cwd, options, Some(range.base.as_str()), head, is_raw)?;
+    let report =
+        run_lint_unit_stdio_ansi(cwd, options, Some(range.base.as_str()), head, is_raw, ansi)?;
     let input = prepare_submit_with_report(cwd, options, mode, &report)?;
     let client = config::client_for(options.conduit_uri.as_deref())?;
     let call = |method: &str, params: &serde_json::Value| {
         client.call(method, params).map_err(|e| e.to_string())
     };
-    submit_over_with_browse(cwd, options, &call, &input)
+    submit_over_with_browse_ansi(cwd, options, &call, &input, ansi)
 }
 
 /// Inspect `cwd` per `options`, returning the bytes for stdout.
@@ -1540,11 +1600,16 @@ fn inspect_json_git(cwd: &Path, options: &Options, range: &Range) -> Result<Vec<
 }
 
 pub fn inspect(cwd: &Path, options: &Options) -> Result<Vec<u8>, String> {
+    inspect_ansi(cwd, options, terminal::ansi_enabled())
+}
+
+/// [`inspect`] with an explicit ANSI setting for submit reports.
+pub fn inspect_ansi(cwd: &Path, options: &Options, ansi: bool) -> Result<Vec<u8>, String> {
     // Full-state routing (merge): raw sources and non-git working copies
     // take the parallel G1 pipeline; git and vcs-less shells keep the
     // locked baseline contract below.
     if uses_full_pipeline(cwd, options) {
-        return inspect_full(cwd, options);
+        return inspect_full_ansi(cwd, options, ansi);
     }
     let resolved = prepare(cwd, options)?;
     let options = &resolved;
@@ -1552,7 +1617,7 @@ pub fn inspect(cwd: &Path, options: &Options) -> Result<Vec<u8>, String> {
         return Err("not inside a git repository".to_string());
     }
     if let Some(mode) = submit_mode(options)? {
-        return submit_via_client(cwd, options, &mode).map(String::into_bytes);
+        return submit_via_client_ansi(cwd, options, &mode, ansi).map(String::into_bytes);
     }
     let range = resolve_range(cwd, options)?;
     if options.json {
@@ -1576,7 +1641,8 @@ pub fn run(argv: &[String]) -> ExitCode {
         }
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
-    match inspect(&cwd, &options) {
+    let ansi = terminal::ansi_enabled();
+    match inspect_ansi(&cwd, &options, ansi) {
         Ok(out) => {
             use std::io::Write;
             if std::io::stdout().write_all(&out).is_err() {
@@ -1609,108 +1675,12 @@ pub const FULL_HELP: &str = "Supports: git, svn, hg\nGenerate a Differential dif
 
 /// Wrap console text to 78 columns with an `indent`-space prefix.
 ///
-/// PHP: `phutil_console_wrap()` (`src/console/format.php:102-191`):
-/// greedy break at the last space past the width, ANSI escapes free,
-/// explicit newlines flush, every line (except the first when
-/// `with_prefix` is false) gains the indent.
-/// Mutable cursor for [`console_wrap`].
-struct WrapCursor {
-    line: Vec<char>,
-    break_pos: Option<usize>,
-    len_after_break: usize,
-    line_len: usize,
-}
-
-/// Copy one ANSI escape (`ESC ... m`) into `line`, advancing `index`.
-fn consume_ansi_escape(chars: &[char], index: &mut usize, line: &mut Vec<char>) {
-    loop {
-        line.push(chars[*index]);
-        let done = chars[*index] == 'm';
-        *index += 1;
-        if done || *index >= chars.len() {
-            break;
-        }
-    }
-}
-
-/// Greedy-break the current line past `width`, trimming trailing spaces.
-fn try_wrap_break(cursor: &mut WrapCursor, lines: &mut Vec<Vec<char>>, width: usize) {
-    if cursor.line_len <= width {
-        return;
-    }
-    let Some(pos) = cursor.break_pos else {
-        return;
-    };
-    let mut slice = cursor.line[..pos].to_vec();
-    while slice.last() == Some(&' ') {
-        slice.pop();
-    }
-    slice.push('\n');
-    lines.push(slice);
-    cursor.line = cursor.line[pos..].to_vec();
-    cursor.line_len = cursor.len_after_break;
-    cursor.len_after_break = 0;
-    cursor.break_pos = None;
-}
-
-/// Render wrapped lines with the indent prefix.
-fn apply_wrap_prefix(lines: &[Vec<char>], indent: usize, with_prefix: bool) -> String {
-    let prefix = if indent > 0 {
-        " ".repeat(indent)
-    } else {
-        String::new()
-    };
-    let mut out = String::new();
-    for (number, wrapped) in lines.iter().enumerate() {
-        let body: String = wrapped.iter().collect();
-        if number == 0 && !with_prefix {
-            out.push_str(&body);
-        } else {
-            out.push_str(&prefix);
-            out.push_str(&body);
-        }
-    }
-    out
-}
-
+/// PHP: `phutil_console_wrap()` (`src/console/format.php:102-191`).
+/// Delegates to [`terminal::console_wrap`] so all wrapping renders
+/// through the shared ANSI-aware helper.
 #[must_use]
 pub fn console_wrap(text: &str, indent: usize, with_prefix: bool) -> String {
-    let width = 78usize.saturating_sub(indent);
-    let chars: Vec<char> = text.chars().collect();
-    let mut lines: Vec<Vec<char>> = Vec::new();
-    let mut cursor = WrapCursor {
-        line: Vec::new(),
-        break_pos: None,
-        len_after_break: 0,
-        line_len: 0,
-    };
-    let mut index = 0;
-    while index < chars.len() {
-        let chr = chars[index];
-        if chr == '\u{1b}' {
-            consume_ansi_escape(&chars, &mut index, &mut cursor.line);
-            continue;
-        }
-        cursor.line.push(chr);
-        cursor.line_len += 1;
-        cursor.len_after_break += 1;
-        try_wrap_break(&mut cursor, &mut lines, width);
-        if chr == ' ' {
-            cursor.break_pos = Some(cursor.line.len());
-            cursor.len_after_break = 0;
-        }
-        if chr == '\n' {
-            lines.push(std::mem::take(&mut cursor.line));
-            cursor.len_after_break = 0;
-            cursor.line_len = 0;
-            cursor.break_pos = None;
-        }
-        index += 1;
-    }
-    if !cursor.line.is_empty() {
-        lines.push(cursor.line);
-    }
-    apply_wrap_prefix(&lines, indent, with_prefix)
+    terminal::console_wrap(text, indent, with_prefix)
 }
 
 /// Render a `phutil_console_confirm()` prompt: blank lines plus the wrapped
@@ -1724,7 +1694,7 @@ pub fn format_confirm_prompt(prompt: &str, default_no: bool) -> String {
     let options = if default_no { "[y/N]" } else { "[Y/n]" };
     format!(
         "\n\n{}",
-        console_wrap(&format!("{prompt} {options} "), 4, true)
+        terminal::console_wrap(&format!("{prompt} {options} "), 4, true)
     )
 }
 
@@ -2686,10 +2656,15 @@ fn inspect_full_text(cwd: &Path, options: &Options, kind: VcsKind) -> Result<Vec
 }
 
 pub fn inspect_full(cwd: &Path, options: &Options) -> Result<Vec<u8>, String> {
+    inspect_full_ansi(cwd, options, terminal::ansi_enabled())
+}
+
+/// [`inspect_full`] with an explicit ANSI setting for submit reports.
+pub fn inspect_full_ansi(cwd: &Path, options: &Options, ansi: bool) -> Result<Vec<u8>, String> {
     let (resolved, kind) = prepare_full(cwd, options)?;
     let options = &resolved;
     if let Some(mode) = submit_mode(options)? {
-        return submit_full_via_client(cwd, options, &mode).map(String::into_bytes);
+        return submit_full_via_client_ansi(cwd, options, &mode, ansi).map(String::into_bytes);
     }
     if diff_local::is_raw_diff_source(options.raw, options.raw_command.as_deref()) {
         return read_raw_diff_text(options).map(String::into_bytes);
@@ -2705,10 +2680,11 @@ pub fn inspect_full(cwd: &Path, options: &Options) -> Result<Vec<u8>, String> {
 }
 
 /// Collect a full-state submit locally, then run it over a real client.
-fn submit_full_via_client(
+fn submit_full_via_client_ansi(
     cwd: &Path,
     options: &Options,
     mode: &SubmitMode,
+    ansi: bool,
 ) -> Result<String, String> {
     let is_raw = diff_local::is_raw_diff_source(options.raw, options.raw_command.as_deref());
     let kind = if is_raw { None } else { detect_vcs_kind(cwd) };
@@ -2720,14 +2696,14 @@ fn submit_full_via_client(
     } else {
         let (base, head) = lint_unit_base(cwd, options, kind, is_raw)?;
         let head_ref = head.as_deref();
-        run_lint_unit_stdio(cwd, options, base.as_deref(), head_ref, is_raw)?
+        run_lint_unit_stdio_ansi(cwd, options, base.as_deref(), head_ref, is_raw, ansi)?
     };
     let input = prepare_submit_full_with_report(cwd, options, mode, &report)?;
     let client = config::client_for(options.conduit_uri.as_deref())?;
     let call = |method: &str, params: &serde_json::Value| {
         client.call(method, params).map_err(|e| e.to_string())
     };
-    submit_over_with_browse(cwd, options, &call, &input)
+    submit_over_with_browse_ansi(cwd, options, &call, &input, ansi)
 }
 
 /// Base commit plus head for lint/unit `--rev`, by repository kind.
@@ -3271,13 +3247,14 @@ pub fn open_submit_result_in_browser(
 /// PHP echoes the success report before a browser failure throws
 /// (`:431-433`, `:560-562`), so the report prints to stdout on that
 /// path and the browser error still propagates.
-fn submit_over_with_browse(
+fn submit_over_with_browse_ansi(
     cwd: &Path,
     options: &Options,
     call: &diff_submit::ConduitCall<'_>,
     input: &SubmitInput,
+    ansi: bool,
 ) -> Result<String, String> {
-    let report = submit_over_with_uri(call, input)?;
+    let report = submit_over_with_uri_ansi(call, input, ansi)?;
     if let Err(error) = open_submit_result_in_browser(
         report.uri.as_deref(),
         options.browse,
@@ -3347,17 +3324,42 @@ pub enum CleanWorktreeIssue {
     Missing,
 }
 
-/// `  Working copy: {path}` block for worktree errors (`:1025-1028`,
-/// markup stripped).
+/// `  Working copy: {path}` block for worktree errors (`:1025-1028`).
+///
+/// PHP wraps the path in `__...__` (underline on TTYs, stripped
+/// otherwise); `ansi=false` renders byte-identical to the plain shape.
 #[must_use]
 pub fn working_copy_desc(path: &str) -> String {
-    format!("  Working copy: {path}\n\n")
+    working_copy_desc_ansi(path, terminal::ansi_enabled())
+}
+
+/// [`working_copy_desc`] with an explicit ANSI setting.
+#[must_use]
+pub fn working_copy_desc_ansi(path: &str, ansi: bool) -> String {
+    terminal::tsprintf_ansi(
+        "  Working copy: __%R__\n\n",
+        &[terminal::TVal::Text(path)],
+        ansi,
+    )
+    .map(|t| t.to_string())
+    .unwrap_or_else(|_| format!("  Working copy: {path}\n\n"))
 }
 
 /// Usage error for a fatal working-copy state (`:1032-1072`).
 #[must_use]
 pub fn clean_worktree_error(issue: CleanWorktreeIssue, workdir: &str, paths: &[String]) -> String {
-    let desc = working_copy_desc(workdir);
+    clean_worktree_error_ansi(issue, workdir, paths, terminal::ansi_enabled())
+}
+
+/// [`clean_worktree_error`] with an explicit ANSI setting.
+#[must_use]
+pub fn clean_worktree_error_ansi(
+    issue: CleanWorktreeIssue,
+    workdir: &str,
+    paths: &[String],
+    ansi: bool,
+) -> String {
+    let desc = working_copy_desc_ansi(workdir, ansi);
     let list = paths.join("\n    ");
     match issue {
         CleanWorktreeIssue::Incomplete => format!(
@@ -3389,7 +3391,18 @@ pub fn untracked_hint(vcs_name: &str) -> &'static str {
 /// Full untracked-files notice block (`:1121-1149`).
 #[must_use]
 pub fn untracked_block(workdir: &str, vcs_name: &str, untracked: &[String]) -> String {
-    let desc = working_copy_desc(workdir);
+    untracked_block_ansi(workdir, vcs_name, untracked, terminal::ansi_enabled())
+}
+
+/// [`untracked_block`] with an explicit ANSI setting.
+#[must_use]
+pub fn untracked_block_ansi(
+    workdir: &str,
+    vcs_name: &str,
+    untracked: &[String],
+    ansi: bool,
+) -> String {
+    let desc = working_copy_desc_ansi(workdir, ansi);
     let hint = format!(
         "(To ignore these {} change(s), add them to \"{}\".",
         untracked.len(),
@@ -3413,7 +3426,18 @@ pub fn untracked_prompt(count: usize) -> String {
 /// Full uncommitted-changes notice block (`:1169-1192`).
 #[must_use]
 pub fn uncommitted_block(workdir: &str, unstaged: &[String], uncommitted: &[String]) -> String {
-    let desc = working_copy_desc(workdir);
+    uncommitted_block_ansi(workdir, unstaged, uncommitted, terminal::ansi_enabled())
+}
+
+/// [`uncommitted_block`] with an explicit ANSI setting.
+#[must_use]
+pub fn uncommitted_block_ansi(
+    workdir: &str,
+    unstaged: &[String],
+    uncommitted: &[String],
+    ansi: bool,
+) -> String {
+    let desc = working_copy_desc_ansi(workdir, ansi);
     let mut lists = Vec::new();
     if !unstaged.is_empty() {
         lists.push(format!(

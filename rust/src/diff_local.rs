@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
-use arc_rs::{diff, diff_submit, git, hg, lint, svn, unit};
+use arc_rs::{diff, diff_submit, git, hg, lint, svn, terminal, unit};
 
 /* -(  Commit Messages  )---------------------------------------------------- */
 
@@ -2075,10 +2075,34 @@ pub fn run_unit_in_process(cwd: &Path, argv: &[String]) -> ChildOutcome {
     ChildOutcome::Code(exit_code_value(unit::run(argv)))
 }
 
-/// Print a lint/unit result banner (`** TITLE ** detail`), with console
-/// markup stripped to plain text like the submit reports.
-fn write_banner(out: &mut dyn Write, title: &str, detail: &str) -> Result<(), String> {
-    writeln!(out, "** {title} ** {detail}").map_err(|e| format!("failed to write output: {e}"))
+/// Background color for a lint/unit banner title.
+fn banner_color(title: &str) -> &'static str {
+    match title {
+        "LINT OKAY" | "UNIT OKAY" => "green",
+        "LINT ERRORS" | "UNIT ERRORS" => "red",
+        _ => "yellow",
+    }
+}
+
+/// Print a lint/unit result banner (`** TITLE ** detail`).
+///
+/// PHP renders `"<bg:color>** %s **</bg> %s\n"` (`:1175-1193`,
+/// `:1236-1262`): TTYs gain the status background plus the bold label
+/// (the `**` markers become codes), while `ansi=false` keeps the
+/// legacy `**`-marked plain bytes.
+fn write_banner_ansi(
+    out: &mut dyn Write,
+    title: &str,
+    detail: &str,
+    ansi: bool,
+) -> Result<(), String> {
+    let line = if ansi {
+        terminal::format_status_message(banner_color(title), title, detail, true)
+    } else {
+        format!("** {title} ** {detail}\n")
+    };
+    out.write_all(line.as_bytes())
+        .map_err(|e| format!("failed to write output: {e}"))
 }
 
 /// Run lint (`runLint()`, `:1146-1207`).
@@ -2104,6 +2128,27 @@ pub fn run_lint<W: Write>(
     run_child: &dyn Fn(&Path, &[String]) -> ChildOutcome,
     out: &mut W,
 ) -> Result<Option<i32>, String> {
+    run_lint_ansi(
+        cwd,
+        base,
+        set_flags,
+        skip,
+        run_child,
+        out,
+        terminal::ansi_enabled(),
+    )
+}
+
+/// [`run_lint`] with an explicit ANSI setting for banners.
+pub fn run_lint_ansi<W: Write>(
+    cwd: &Path,
+    base: Option<&str>,
+    set_flags: &[String],
+    skip: bool,
+    run_child: &dyn Fn(&Path, &[String]) -> ChildOutcome,
+    out: &mut W,
+    ansi: bool,
+) -> Result<Option<i32>, String> {
     if skip {
         return Ok(Some(LINT_RESULT_SKIP));
     }
@@ -2122,7 +2167,7 @@ pub fn run_lint<W: Write>(
         ChildOutcome::Failed(message) => Err(message),
         ChildOutcome::Code(result) => {
             if let Some((title, detail)) = lint_result_notice(result) {
-                write_banner(out, title, detail)?;
+                write_banner_ansi(out, title, detail, ansi)?;
             }
             Ok(Some(result))
         }
@@ -2146,10 +2191,11 @@ fn write_unit_line<W: Write>(out: &mut W, text: &str) -> Result<(), String> {
 }
 
 /// Report one unit result code: the unsound confirm plus the banner.
-fn handle_unit_code<R: BufRead, W: Write>(
+fn handle_unit_code_ansi<R: BufRead, W: Write>(
     input: &mut R,
     out: &mut W,
     result: i32,
+    ansi: bool,
 ) -> Result<Option<i32>, String> {
     if result == UNIT_RESULT_UNSOUND
         && !diff::prompt_confirm_from(input, out, UNSOUND_PROMPT, false)?
@@ -2157,7 +2203,7 @@ fn handle_unit_code<R: BufRead, W: Write>(
         return Err(USER_ABORT.to_string());
     }
     if let Some((title, detail)) = unit_result_notice(result) {
-        write_banner(out, title, detail)?;
+        write_banner_ansi(out, title, detail, ansi)?;
     }
     Ok(Some(result))
 }
@@ -2170,6 +2216,30 @@ pub fn run_unit<R: BufRead, W: Write>(
     run_child: &dyn Fn(&Path, &[String]) -> ChildOutcome,
     input: &mut R,
     out: &mut W,
+) -> Result<Option<i32>, String> {
+    run_unit_ansi(
+        cwd,
+        base,
+        set_flags,
+        skip,
+        run_child,
+        input,
+        out,
+        terminal::ansi_enabled(),
+    )
+}
+
+/// [`run_unit`] with an explicit ANSI setting for banners.
+#[allow(clippy::too_many_arguments)]
+pub fn run_unit_ansi<R: BufRead, W: Write>(
+    cwd: &Path,
+    base: Option<&str>,
+    set_flags: &[String],
+    skip: bool,
+    run_child: &dyn Fn(&Path, &[String]) -> ChildOutcome,
+    input: &mut R,
+    out: &mut W,
+    ansi: bool,
 ) -> Result<Option<i32>, String> {
     if skip {
         return Ok(Some(UNIT_RESULT_SKIP));
@@ -2186,7 +2256,7 @@ pub fn run_unit<R: BufRead, W: Write>(
             Ok(None)
         }
         ChildOutcome::Failed(message) => Err(message),
-        ChildOutcome::Code(result) => handle_unit_code(input, out, result),
+        ChildOutcome::Code(result) => handle_unit_code_ansi(input, out, result, ansi),
     }
 }
 
@@ -2207,8 +2277,47 @@ pub fn run_lint_unit<R: BufRead, W: Write>(
     input: &mut R,
     out: &mut W,
 ) -> Result<LintUnitReport, String> {
-    let lint_result = run_lint(cwd, base, lint_flags, skip_lint, run_lint_child, out)?;
-    let unit_result = run_unit(cwd, base, unit_flags, skip_unit, run_unit_child, input, out)?;
+    run_lint_unit_ansi(
+        cwd,
+        base,
+        lint_flags,
+        unit_flags,
+        skip_lint,
+        skip_unit,
+        run_lint_child,
+        run_unit_child,
+        input,
+        out,
+        terminal::ansi_enabled(),
+    )
+}
+
+/// [`run_lint_unit`] with an explicit ANSI setting for banners.
+#[allow(clippy::too_many_arguments)]
+pub fn run_lint_unit_ansi<R: BufRead, W: Write>(
+    cwd: &Path,
+    base: Option<&str>,
+    lint_flags: &[String],
+    unit_flags: &[String],
+    skip_lint: bool,
+    skip_unit: bool,
+    run_lint_child: &dyn Fn(&Path, &[String]) -> ChildOutcome,
+    run_unit_child: &dyn Fn(&Path, &[String]) -> ChildOutcome,
+    input: &mut R,
+    out: &mut W,
+    ansi: bool,
+) -> Result<LintUnitReport, String> {
+    let lint_result = run_lint_ansi(cwd, base, lint_flags, skip_lint, run_lint_child, out, ansi)?;
+    let unit_result = run_unit_ansi(
+        cwd,
+        base,
+        unit_flags,
+        skip_unit,
+        run_unit_child,
+        input,
+        out,
+        ansi,
+    )?;
     Ok(LintUnitReport {
         lint_result,
         unresolved_lint: Vec::new(),
@@ -5245,7 +5354,7 @@ fn confirm_message_reedit<R: BufRead, W: Write>(
         .map_err(|error| format!("failed to write prompt: {error}"))?;
     let mut issues = vec![RESOLVE_THESE_ERRORS.to_string()];
     for error in errors {
-        let line = diff::console_wrap(&format!("- {error}\n"), 6, true);
+        let line = terminal::console_wrap(&format!("- {error}\n"), 6, true);
         writer
             .write_all(line.as_bytes())
             .map_err(|error| format!("failed to write prompt: {error}"))?;
@@ -5295,7 +5404,7 @@ fn save_message_draft<R: BufRead, W: Write>(
 
 /// Echo the saved-copy note for a fatal loop error (`:1546-1550`).
 fn echo_saved_copy_note<W: Write>(writer: &mut W, where_path: &str) -> Result<(), String> {
-    let note = diff::console_wrap(&format!("{}\n", message_saved_to(where_path)), 0, true);
+    let note = terminal::console_wrap(&format!("{}\n", message_saved_to(where_path)), 0, true);
     writer
         .write_all(note.as_bytes())
         .map_err(|error| format!("failed to write prompt: {error}"))
@@ -5724,11 +5833,23 @@ pub fn svn_working_copy_changes(status: &BTreeMap<String, u32>) -> WorkingCopyCh
 /// `Working copy:` description line (`:1025-1029`).
 ///
 /// PHP wraps the path in `__...__` console markup (underline when
-/// colorized, stripped otherwise); the port never colorizes, so the
-/// plain shape renders.
+/// colorized, stripped otherwise); `ansi=false` renders byte-identical
+/// to the plain shape.
 #[must_use]
 pub fn working_copy_desc(work_path: &str) -> String {
-    format!("  Working copy: {work_path}\n\n")
+    working_copy_desc_ansi(work_path, terminal::ansi_enabled())
+}
+
+/// [`working_copy_desc`] with an explicit ANSI setting.
+#[must_use]
+pub fn working_copy_desc_ansi(work_path: &str, ansi: bool) -> String {
+    terminal::tsprintf_ansi(
+        "  Working copy: __%R__\n\n",
+        &[terminal::TVal::Text(work_path)],
+        ansi,
+    )
+    .map(|t| t.to_string())
+    .unwrap_or_else(|_| format!("  Working copy: {work_path}\n\n"))
 }
 
 /// Incomplete-checkout error (`:1032-1048`).
@@ -6188,7 +6309,19 @@ pub fn require_clean_working_copy<R: BufRead, W: Write>(
     changes: &WorkingCopyChanges,
     mode: CommitMode,
 ) -> Result<CleanCheckOutcome, String> {
-    let desc = working_copy_desc(&vcs.work_path);
+    require_clean_working_copy_ansi(reader, writer, vcs, changes, mode, terminal::ansi_enabled())
+}
+
+/// [`require_clean_working_copy`] with an explicit ANSI setting.
+pub fn require_clean_working_copy_ansi<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    vcs: &CleanCheckVcs<'_>,
+    changes: &WorkingCopyChanges,
+    mode: CommitMode,
+    ansi: bool,
+) -> Result<CleanCheckOutcome, String> {
+    let desc = working_copy_desc_ansi(&vcs.work_path, ansi);
     if !changes.incomplete.is_empty() {
         return Err(incomplete_checkout_error(&desc, &changes.incomplete));
     }
