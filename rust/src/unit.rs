@@ -2578,7 +2578,13 @@ pub fn render_coverage_report(
     detailed: bool,
     project_root: &Path,
 ) -> String {
-    render_coverage_report_with_ansi(sorted, file_reports, detailed, project_root, terminal::ansi_enabled())
+    render_coverage_report_with_ansi(
+        sorted,
+        file_reports,
+        detailed,
+        project_root,
+        terminal::ansi_enabled(),
+    )
 }
 
 /// Render the coverage report with an explicit ANSI flag (see
@@ -2638,11 +2644,7 @@ pub fn render_detailed_coverage_report(data: &str, report: &str) -> String {
 /// Render one file's detailed coverage with an explicit ANSI flag
 /// (see [`render_detailed_coverage_report`]).
 #[must_use]
-pub fn render_detailed_coverage_report_with_ansi(
-    data: &str,
-    report: &str,
-    ansi: bool,
-) -> String {
+pub fn render_detailed_coverage_report_with_ansi(data: &str, report: &str, ansi: bool) -> String {
     if ansi {
         render_detailed_tty(data, report)
     } else {
@@ -3166,7 +3168,11 @@ fn render_full_output(
     if !coverage.is_empty() {
         let (sorted, reports) = merge_file_coverage(paths, &coverage);
         out.push_str(&render_coverage_report_with_ansi(
-            &sorted, &reports, detailed, project_root, ansi,
+            &sorted,
+            &reports,
+            detailed,
+            project_root,
+            ansi,
         ));
     }
     out
@@ -3445,12 +3451,7 @@ fn run_config_paths(
     run_config_selection(opts, engines, root, &paths, ansi)
 }
 
-fn run_unit_selection(
-    opts: &Options,
-    cwd: &Path,
-    selection: Selection,
-    ansi: bool,
-) -> ExitCode {
+fn run_unit_selection(opts: &Options, cwd: &Path, selection: Selection, ansi: bool) -> ExitCode {
     match selection {
         Selection::Cargo => run_cargo_selection(opts, cwd),
         Selection::Single(class) => run_single_paths(opts, cwd, &class, ansi),

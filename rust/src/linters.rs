@@ -1394,10 +1394,7 @@ fn render_entry_header(
     detail: &str,
     ansi: bool,
 ) {
-    let pattern = format!(
-        "<bg:{}>** %s **</bg> **%s** (%s)\n",
-        status_color(status)
-    );
+    let pattern = format!("<bg:{}>** %s **</bg> **%s** (%s)\n", status_color(status));
     let text = format!("{:<10}", status.text());
     out.push_str(&terminal::console_format(
         &pattern,
@@ -1406,7 +1403,7 @@ fn render_entry_header(
     ));
 }
 
-/// Render entries (`renderLinters()`), markup stripped.
+/// Render entries (`renderLinters()`) with the process ANSI setting.
 pub fn render_entries(entries: &[&LinterEntry], verbose: bool) -> String {
     render_entries_with_ansi(entries, verbose, terminal::ansi_enabled())
 }
@@ -1414,11 +1411,7 @@ pub fn render_entries(entries: &[&LinterEntry], verbose: bool) -> String {
 /// Render entries with an explicit ANSI flag: TTYs render the status
 /// badges, bold names, and underlines like PHP; non-TTYs keep the
 /// stripped rendering byte-identical.
-pub fn render_entries_with_ansi(
-    entries: &[&LinterEntry],
-    verbose: bool,
-    ansi: bool,
-) -> String {
+pub fn render_entries_with_ansi(entries: &[&LinterEntry], verbose: bool, ansi: bool) -> String {
     let mut out = String::new();
     for entry in entries {
         if verbose {
@@ -1436,13 +1429,7 @@ pub fn render_entries_with_ansi(
 /// One non-verbose entry line.
 fn render_brief_entry(entry: &LinterEntry, out: &mut String, ansi: bool) {
     let meta = entry.meta;
-    render_entry_header(
-        out,
-        entry.status,
-        meta.config_name,
-        meta.info_name,
-        ansi,
-    );
+    render_entry_header(out, entry.status, meta.config_name, meta.info_name, ansi);
 }
 
 /// One verbose entry: header plus error, version, description, options,
@@ -1545,8 +1532,11 @@ fn render_entry_options(entry: &LinterEntry, out: &mut String, ansi: bool) -> bo
             .iter()
             .map(|option| {
                 let help = terminal::console_wrap(&meta.option_help(option), 6, true);
-                terminal::console_format("%s__%s__ (%s)\n", &[PAD, option.name, option.option_type], true)
-                    + &terminal::console_format("%s\n", &[help.as_str()], true)
+                terminal::console_format(
+                    "%s__%s__ (%s)\n",
+                    &[PAD, option.name, option.option_type],
+                    true,
+                ) + &terminal::console_format("%s\n", &[help.as_str()], true)
             })
             .collect();
         out.push_str(&rendered.join("\n"));
@@ -1729,9 +1719,11 @@ mod linters_ansi_tests {
         ));
         let error = ansi_entry("ArcanistPhpLinter", LinterStatus::Error);
         let tty = render_entries_with_ansi(&[&error], false, true);
-        assert!(tty.starts_with(
-            "\x1b[41m\x1b[1m ERROR      \x1b[m\x1b[49m \x1b[1mphp\x1b[m (php -l)\n"
-        ));
+        assert!(
+            tty.starts_with(
+                "\x1b[41m\x1b[1m ERROR      \x1b[m\x1b[49m \x1b[1mphp\x1b[m (php -l)\n"
+            )
+        );
         assert_eq!(
             render_entries_with_ansi(&[&error], false, false),
             render_entries(&[&error], false)
@@ -1784,8 +1776,7 @@ mod linters_ansi_tests {
     #[test]
     fn no_match_message_with_ansi_matches_plain() {
         let exact = vec!["frobnicate".to_string()];
-        let expected =
-            "No match found. Try `arc linters --search frobnicate` to search for a \
+        let expected = "No match found. Try `arc linters --search frobnicate` to search for a \
              linter.\n";
         assert_eq!(no_match_message_with_ansi(&exact, true), expected);
         assert_eq!(no_match_message_with_ansi(&exact, false), expected);

@@ -2706,11 +2706,7 @@ fn prompt_default_relative_commit(
             &["Select a Default Commit Range"],
             true,
         ));
-        output(&terminal::console_wrap(
-            DEFAULT_COMMIT_RANGE_TEXT,
-            0,
-            true,
-        ));
+        output(&terminal::console_wrap(DEFAULT_COMMIT_RANGE_TEXT, 0, true));
     } else {
         output("** Select a Default Commit Range **\n\n");
         output(&word_wrap(DEFAULT_COMMIT_RANGE_TEXT, 0));
@@ -3635,10 +3631,7 @@ pub fn render_console_result(result: &LintResult) -> Result<String, String> {
 /// Render one result in console format with an explicit ANSI flag:
 /// TTYs render the severity badge, bold `>>>`, and underlines like
 /// PHP; non-TTYs keep the stripped rendering byte-identical.
-pub fn render_console_result_with_ansi(
-    result: &LintResult,
-    ansi: bool,
-) -> Result<String, String> {
+pub fn render_console_result_with_ansi(result: &LintResult, ansi: bool) -> Result<String, String> {
     if ansi {
         return render_console_result_tty(result);
     }
@@ -3800,13 +3793,7 @@ fn splice_highlight(line: &str, at: usize, len: usize, highlight: &str) -> Strin
 /// the new side (T13543) highlights only existing lines. Like the
 /// patch offset above, an unset (`0`) char highlights at the line
 /// start (PHP's `$char - 1` quirk for null chars is not replicated).
-fn highlight_line_at(
-    lines: &mut Vec<String>,
-    start: usize,
-    char: usize,
-    text: &str,
-    create: bool,
-) {
+fn highlight_line_at(lines: &mut Vec<String>, start: usize, char: usize, text: &str, create: bool) {
     let highlight = invert_highlight(text);
     let offset = char.saturating_sub(1);
     if let Some(line) = lines.get_mut(start.wrapping_sub(1)) {
@@ -4203,10 +4190,7 @@ pub fn render_summary_result(result: &LintResult) -> Result<String, String> {
 /// Render one result in summary format with an explicit ANSI flag.
 /// The format carries no markup, so both modes render byte-identical
 /// text through the console formatter.
-pub fn render_summary_result_with_ansi(
-    result: &LintResult,
-    ansi: bool,
-) -> Result<String, String> {
+pub fn render_summary_result_with_ansi(result: &LintResult, ansi: bool) -> Result<String, String> {
     let mut out = String::new();
     for message in &result.messages {
         let severity = severity_display_name(&message.severity)?;
@@ -4233,10 +4217,7 @@ pub fn render_compiler_result(result: &LintResult) -> Result<String, String> {
 /// Render one result in compiler format with an explicit ANSI flag.
 /// The format carries no markup, so both modes render byte-identical
 /// text through the console formatter.
-pub fn render_compiler_result_with_ansi(
-    result: &LintResult,
-    ansi: bool,
-) -> Result<String, String> {
+pub fn render_compiler_result_with_ansi(result: &LintResult, ansi: bool) -> Result<String, String> {
     let mut out = String::new();
     for message in &result.messages {
         let severity = severity_display_name(&message.severity)?;

@@ -1666,11 +1666,7 @@ fn error_message(code: &str, name: &str, description: &str) -> LintMessage {
 
 #[test]
 fn console_result_with_ansi_badges_severity() {
-    let result = console_result(
-        "f.c",
-        b"x\n",
-        vec![error_message("E1", "Bad", "Fix it.")],
-    );
+    let result = console_result("f.c", b"x\n", vec![error_message("E1", "Bad", "Fix it.")]);
     assert_eq!(
         render_console_result_with_ansi(&result, true).unwrap(),
         "\x1b[1m>>>\x1b[m Lint for \x1b[4mf.c\x1b[m:\n\n\n  \x1b[1m\x1b[41m Error \
@@ -1763,9 +1759,7 @@ fn commit_range_prompt_with_ansi_badges_header() {
     };
     let (relative, tty) = ask(true);
     assert_eq!(relative, "origin/master");
-    assert!(tty.starts_with(
-        "\x1b[42m\x1b[1m Select a Default Commit Range \x1b[m\x1b[49m\n\n"
-    ));
+    assert!(tty.starts_with("\x1b[42m\x1b[1m Select a Default Commit Range \x1b[m\x1b[49m\n\n"));
     for line in tty.lines() {
         assert!(line.len() <= 78, "tty line overflows: {line:?}");
     }

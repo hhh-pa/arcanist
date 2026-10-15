@@ -2784,10 +2784,7 @@ fn push_banner_mode_unwrapped_keeps_long_body_verbatim_on_tty() {
     push_banner_mode(&mut plain, "HOLD CHANGES", &body, false);
     assert_eq!(
         plain.out.stdout,
-        format!(
-            "\n** HOLD CHANGES **\n{}\n\n",
-            console_wrap(&body, 0, true)
-        )
+        format!("\n** HOLD CHANGES **\n{}\n\n", console_wrap(&body, 0, true))
     );
 }
 
@@ -2992,7 +2989,10 @@ fn render_commit_set_with_ansi_styles_implicit() {
 
 #[test]
 fn shell_line_bolds_command_on_tty() {
-    assert_eq!(shell_line("git push", true), "    \x1b[1m$ git push\x1b[m\n");
+    assert_eq!(
+        shell_line("git push", true),
+        "    \x1b[1m$ git push\x1b[m\n"
+    );
     assert_eq!(shell_line("git push", false), "    $ git push\n");
 }
 
@@ -3032,14 +3032,22 @@ fn io_push_status_with_ansi_colors_warnings() {
 #[test]
 fn push_builds_banner_styles_title_on_tty() {
     let mut io = ansi_io();
-    push_builds_banner(&mut io, "BUILD FAILURES", "1 revision(s) have build failures:");
+    push_builds_banner(
+        &mut io,
+        "BUILD FAILURES",
+        "1 revision(s) have build failures:",
+    );
     assert_eq!(
         io.out.stdout,
         "\x1b[43m\x1b[1m <!> BUILD FAILURES \x1b[m\x1b[49m\n1 revision(s) have build \
          failures:\n\n"
     );
     let mut plain = Io::canned(&[]);
-    push_builds_banner(&mut plain, "BUILD FAILURES", "1 revision(s) have build failures:");
+    push_builds_banner(
+        &mut plain,
+        "BUILD FAILURES",
+        "1 revision(s) have build failures:",
+    );
     assert_eq!(
         plain.out.stdout,
         "** BUILD FAILURES **\n1 revision(s) have build failures:\n\n"

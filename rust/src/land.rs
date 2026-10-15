@@ -455,13 +455,7 @@ impl Out {
     /// stderr. TTYs render `tsprintf("**<bg:color> %s </bg>** %s\n",
     /// ...)` like PHP `writeMessage()`; non-TTYs keep the stripped
     /// `** LABEL ** message` rendering byte-identical.
-    pub fn push_status_with_ansi(
-        &mut self,
-        label: &str,
-        message: &str,
-        color: &str,
-        ansi: bool,
-    ) {
+    pub fn push_status_with_ansi(&mut self, label: &str, message: &str, color: &str, ansi: bool) {
         self.push_err(&status_line(label, message, color, ansi));
     }
 
@@ -615,13 +609,7 @@ impl Io {
     /// One log line with an explicit writer color and ANSI flag, to
     /// stderr (see [`Out::push_status_with_ansi`]), echoing live when
     /// enabled.
-    pub fn push_status_with_ansi(
-        &mut self,
-        label: &str,
-        message: &str,
-        color: &str,
-        ansi: bool,
-    ) {
+    pub fn push_status_with_ansi(&mut self, label: &str, message: &str, color: &str, ansi: bool) {
         self.push_err(&status_line(label, message, color, ansi));
     }
 
@@ -866,12 +854,8 @@ fn push_banner_mode(io: &mut Io, title: &str, body: &str, wrap_body: bool) {
         } else {
             "\n%!\n%s\n\n"
         };
-        let text = terminal::tsprintf_ansi(
-            pattern,
-            &[TVal::Text(title), TVal::Text(body)],
-            true,
-        )
-        .expect("fixed tsprintf pattern");
+        let text = terminal::tsprintf_ansi(pattern, &[TVal::Text(title), TVal::Text(body)], true)
+            .expect("fixed tsprintf pattern");
         io.push_out(text.as_str());
     } else {
         io.push_out(&format!(
@@ -888,12 +872,9 @@ fn push_banner_mode(io: &mut Io, title: &str, body: &str, wrap_body: bool) {
 /// TTYs render the markup, non-TTYs keep the stripped rendering.
 pub fn push_banner_continued(io: &mut Io, title: &str, body: &str) {
     if io.ansi {
-        let text = terminal::tsprintf_ansi(
-            "\n%!\n%W\n",
-            &[TVal::Text(title), TVal::Text(body)],
-            true,
-        )
-        .expect("fixed tsprintf pattern");
+        let text =
+            terminal::tsprintf_ansi("\n%!\n%W\n", &[TVal::Text(title), TVal::Text(body)], true)
+                .expect("fixed tsprintf pattern");
         io.push_out(text.as_str());
     } else {
         io.push_out(&format!(
@@ -1125,11 +1106,7 @@ fn push_prompt_query(io: &mut Io, query: &str) {
     if io.ansi {
         let text = terminal::tsprintf_ansi(
             "**<bg:cyan> %s </bg>** %s %s ",
-            &[
-                TVal::Text(">>>"),
-                TVal::Text(query),
-                TVal::Text("[y/N/?]"),
-            ],
+            &[TVal::Text(">>>"), TVal::Text(query), TVal::Text("[y/N/?]")],
             true,
         )
         .expect("fixed tsprintf pattern");
@@ -2385,7 +2362,7 @@ fn format_finding_line(finding: &land_checks::GateFinding, ansi: bool) -> String
     terminal::console_format(
         "  [%s] %s: %s\n",
         &[
-            finding.prompt.as_str(),
+            finding.prompt,
             finding.title.as_str(),
             finding.query.as_str(),
         ],
@@ -2401,10 +2378,7 @@ pub fn format_gate_preview(findings: &[land_checks::GateFinding]) -> String {
 /// Advisory gate report with an explicit ANSI flag. The report
 /// carries no markup, so both modes render byte-identical text
 /// through the console formatter.
-pub fn format_gate_preview_with_ansi(
-    findings: &[land_checks::GateFinding],
-    ansi: bool,
-) -> String {
+pub fn format_gate_preview_with_ansi(findings: &[land_checks::GateFinding], ansi: bool) -> String {
     if findings.is_empty() {
         return "Pre-land checks passed.\n".to_string();
     }
@@ -4423,10 +4397,7 @@ pub fn git_prune_branches(
                 "CLEANUP",
                 &format!("Cleaning up branch \"{branch}\". To recover, run:"),
             );
-            let recover = format!(
-                "git checkout -b {branch} {}",
-                git::display_hash(&hash)
-            );
+            let recover = format!("git checkout -b {branch} {}", git::display_hash(&hash));
             io.push_out(&format!("\n{}\n", shell_line(&recover, io.ansi)));
             git::output(dir, &["branch", "-D", "--", &branch]).ok();
             deleted.push(branch);
@@ -5088,9 +5059,7 @@ pub fn hg_confirm_onto_refs_with(
              branches were selected:",
         );
         for branch in &branches {
-            io.push_out(
-                &hg_branch_marker_view_with(dir, hg_cmd, branch).render_with_ansi(io.ansi),
-            );
+            io.push_out(&hg_branch_marker_view_with(dir, hg_cmd, branch).render_with_ansi(io.ansi));
         }
         io.push_out("\n");
         return Err(
@@ -5113,8 +5082,7 @@ pub fn hg_confirm_onto_refs_with(
         );
         for name in &new_markers {
             io.push_out(
-                &marker_ref_view(&format!("Bookmark \"{name}\""), "", "")
-                    .render_with_ansi(io.ansi),
+                &marker_ref_view(&format!("Bookmark \"{name}\""), "", "").render_with_ansi(io.ansi),
             );
         }
         io.push_out("\n");
@@ -6369,9 +6337,9 @@ fn render_for<'a>(
                 ansi,
             )
         }),
-        Vcs::Hg => Box::new(move |set| {
-            render_commit_set_with_ansi(set, commits, &display_hash_12, ansi)
-        }),
+        Vcs::Hg => {
+            Box::new(move |set| render_commit_set_with_ansi(set, commits, &display_hash_12, ansi))
+        }
     }
 }
 

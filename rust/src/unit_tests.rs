@@ -1905,18 +1905,9 @@ fn test_duration_buckets_match_php() {
         format_test_duration(0.049, true),
         format!("\x1b[32m 49ms\x1b[39m\x1b[33m{star}\x1b[39m ")
     );
-    assert_eq!(
-        format_test_duration(0.051, true),
-        "\x1b[32m 51ms\x1b[39m  "
-    );
-    assert_eq!(
-        format_test_duration(0.3, true),
-        "\x1b[33m300ms\x1b[39m  "
-    );
-    assert_eq!(
-        format_test_duration(1.0, true),
-        "\x1b[31m 1.0s\x1b[39m  "
-    );
+    assert_eq!(format_test_duration(0.051, true), "\x1b[32m 51ms\x1b[39m  ");
+    assert_eq!(format_test_duration(0.3, true), "\x1b[33m300ms\x1b[39m  ");
+    assert_eq!(format_test_duration(1.0, true), "\x1b[31m 1.0s\x1b[39m  ");
     assert_eq!(format_test_duration(0.3, false), "300ms  ");
 }
 
@@ -1942,7 +1933,9 @@ fn render_unit_result_with_ansi_stars_fast_pass() {
     pass.set_duration(0.005);
     assert_eq!(
         render_unit_result_with_ansi(&pass, true),
-        format!("  \x1b[42m\x1b[1m PASS \x1b[m\x1b[49m \x1b[32m  5ms\x1b[39m\x1b[33m{star}\x1b[39m  t\n")
+        format!(
+            "  \x1b[42m\x1b[1m PASS \x1b[m\x1b[49m \x1b[32m  5ms\x1b[39m\x1b[33m{star}\x1b[39m  t\n"
+        )
     );
     assert_eq!(
         render_unit_result_with_ansi(&pass, false),
@@ -2011,9 +2004,10 @@ fn render_detailed_with_ansi_paints_marks() {
         )
     );
     let magenta = format!("{:<80}", "ccc");
-    assert!(render_detailed_coverage_report_with_ansi("ccc", "X", true).contains(&format!(
-        "\x1b[45m {magenta} \x1b[49m"
-    )));
+    assert!(
+        render_detailed_coverage_report_with_ansi("ccc", "X", true)
+            .contains(&format!("\x1b[45m {magenta} \x1b[49m"))
+    );
     // `N`, missing bytes, and `"0"` stay plain like PHP's default arm.
     for report in ["N", "", "0"] {
         let out = render_detailed_coverage_report_with_ansi("only", report, true);
@@ -2033,7 +2027,10 @@ fn workflow_output_with_ansi_threads_flag() {
     let mut pass = engine_result("t", "pass");
     pass.set_duration(0.125);
     let full = render_workflow_output_with_ansi(&[pass.clone()], &[], "full", false, &root, true);
-    assert!(full.contains("\x1b[42m\x1b[1m PASS \x1b[m\x1b[49m"), "{full}");
+    assert!(
+        full.contains("\x1b[42m\x1b[1m PASS \x1b[m\x1b[49m"),
+        "{full}"
+    );
     let plain = render_workflow_output_with_ansi(&[pass.clone()], &[], "full", false, &root, false);
     assert_eq!(plain, "  PASS 125ms t\n");
     // Machine formats carry no markup in either mode.
