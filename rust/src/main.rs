@@ -7,7 +7,7 @@
 use std::process::ExitCode;
 
 use arc_rs::{
-    amend, anoid, bookmarks, branches, browse, close_revision, commit, config, cover, diff,
+    alias, amend, anoid, bookmarks, branches, browse, close_revision, commit, config, cover, diff,
     download, export, get_config, inspect, install_certificate, land, liberate, lint, linters,
     list, look, markers, paste, patch, set_config, tasks, todo, unit, upgrade, upload, weld, which,
     work,
@@ -15,8 +15,46 @@ use arc_rs::{
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+type CommandFn = fn(&[String]) -> ExitCode;
+
+const COMMANDS: &[(&str, CommandFn)] = &[
+    (alias::NAME, alias::run),
+    (amend::NAME, amend::run),
+    (anoid::NAME, anoid::run),
+    (bookmarks::NAME, bookmarks::run),
+    (branches::NAME, branches::run),
+    (browse::NAME, browse::run),
+    (close_revision::NAME, close_revision::run),
+    (commit::NAME, commit::run),
+    (cover::NAME, cover::run),
+    (diff::NAME, diff::run),
+    (download::NAME, download::run),
+    (export::NAME, export::run),
+    (get_config::NAME, get_config::run),
+    (inspect::NAME, inspect::run),
+    (install_certificate::NAME, install_certificate::run),
+    (land::NAME, land::run),
+    (liberate::NAME, liberate::run),
+    (lint::NAME, lint::run),
+    (linters::NAME, linters::run),
+    (list::NAME, list::run),
+    (look::NAME, look::run),
+    (markers::NAME, markers::run),
+    (paste::NAME, paste::run),
+    (patch::NAME, patch::run),
+    (set_config::NAME, set_config::run),
+    (tasks::NAME, tasks::run),
+    (todo::NAME, todo::run),
+    (unit::NAME, unit::run),
+    (upgrade::NAME, upgrade::run),
+    (upload::NAME, upload::run),
+    (weld::NAME, weld::run),
+    (which::NAME, which::run),
+    (work::NAME, work::run),
+];
+
 fn usage() -> String {
-    "usage: arc-rs [--version] [--help] <command>\n\ncommands (see <command> --help):\n  amend\n  anoid\n  bookmarks\n  branches\n  browse\n  call-conduit\n  close-revision\n  commit\n  cover\n  diff\n  download\n  export\n  get-config\n  inspect\n  install-certificate\n  land\n  liberate\n  lint\n  linters\n  list\n  look\n  markers\n  paste\n  patch\n  set-config\n  tasks\n  todo\n  unit\n  upgrade\n  upload\n  weld\n  which\n  work\n"
+    "usage: arc-rs [--version] [--help] <command>\n\ncommands (see <command> --help):\n  alias\n  amend\n  anoid\n  bookmarks\n  branches\n  browse\n  call-conduit\n  close-revision\n  commit\n  cover\n  diff\n  download\n  export\n  get-config\n  inspect\n  install-certificate\n  land\n  liberate\n  lint\n  linters\n  list\n  look\n  markers\n  paste\n  patch\n  set-config\n  tasks\n  todo\n  unit\n  upgrade\n  upload\n  weld\n  which\n  work\n"
         .to_string()
 }
 
@@ -156,50 +194,75 @@ fn run_call_conduit(args: &CallArgs) -> ExitCode {
     run_call_conduit_with(args, stdin.lock(), &mut stdout.lock())
 }
 
-type CommandFn = fn(&[String]) -> ExitCode;
-
-/// Every ported subcommand. `call-conduit` stays in [`classify`] because it
-/// needs custom argv parsing; everything else dispatches through this table.
-const COMMANDS: &[(&str, CommandFn)] = &[
-    (amend::NAME, amend::run),
-    (anoid::NAME, anoid::run),
-    (bookmarks::NAME, bookmarks::run),
-    (branches::NAME, branches::run),
-    (browse::NAME, browse::run),
-    (close_revision::NAME, close_revision::run),
-    (commit::NAME, commit::run),
-    (cover::NAME, cover::run),
-    (diff::NAME, diff::run),
-    (download::NAME, download::run),
-    (export::NAME, export::run),
-    (get_config::NAME, get_config::run),
-    (inspect::NAME, inspect::run),
-    (install_certificate::NAME, install_certificate::run),
-    (land::NAME, land::run),
-    (liberate::NAME, liberate::run),
-    (lint::NAME, lint::run),
-    (linters::NAME, linters::run),
-    (list::NAME, list::run),
-    (look::NAME, look::run),
-    (markers::NAME, markers::run),
-    (paste::NAME, paste::run),
-    (patch::NAME, patch::run),
-    (set_config::NAME, set_config::run),
-    (tasks::NAME, tasks::run),
-    (todo::NAME, todo::run),
-    (unit::NAME, unit::run),
-    (upgrade::NAME, upgrade::run),
-    (upload::NAME, upload::run),
-    (weld::NAME, weld::run),
-    (which::NAME, which::run),
-    (work::NAME, work::run),
-];
-
 fn find_command(name: &str) -> Option<CommandFn> {
     COMMANDS
         .iter()
         .find(|(n, _)| *n == name)
         .map(|(_, run)| *run)
+}
+
+/// Expand `argv` through `aliases` before the `COMMANDS` lookup,
+/// mirroring `ArcanistRuntime` running `ArcanistAliasEngine` over the
+/// unconsumed argument vector. Leading flags are never commands (PHP
+/// consumes toolset arguments before aliases run).
+fn pre_dispatch(argv: Vec<String>, aliases: &[alias::Alias]) -> alias::Expansion {
+    if argv.first().is_some_and(|first| first.starts_with('-')) {
+        return alias::Expansion::Dispatch {
+            argv,
+            hints: Vec::new(),
+        };
+    }
+    alias::expand(&argv, aliases, alias::is_builtin_command)
+}
+
+/// Execute a shell alias, mirroring `ArcanistRuntime::executeShellAlias()`.
+fn execute_shell_alias(argv: &[String], hint: &str) -> ExitCode {
+    eprintln!("SHELL ALIAS: {hint}");
+    let Some((program, args)) = argv.split_first() else {
+        eprintln!("arc-rs: empty shell alias");
+        return ExitCode::FAILURE;
+    };
+    match std::process::Command::new(program).args(args).status() {
+        Ok(status) => status
+            .code()
+            .and_then(|code| u8::try_from(code).ok())
+            .map_or(ExitCode::FAILURE, ExitCode::from),
+        Err(e) => {
+            eprintln!("arc-rs: cannot execute shell alias: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Expand `argv` through user aliases before dispatch. Returns the argv
+/// to dispatch, or an exit code when expansion fully handles the
+/// invocation (shell alias executed or broken chain). Unreadable
+/// configuration is a pass-through: each command surfaces its own
+/// config errors, so expansion must not break unrelated commands.
+fn apply_alias_expansion(argv: Vec<String>) -> Result<Vec<String>, ExitCode> {
+    if argv.first().is_none_or(|first| first.starts_with('-')) {
+        return Ok(argv);
+    }
+    let (aliases, warnings) = alias::load_aliases().unwrap_or_default();
+    for warning in &warnings {
+        eprintln!("ALIAS: {warning}");
+    }
+    match pre_dispatch(argv, &aliases) {
+        alias::Expansion::Dispatch { argv: next, hints } => {
+            for hint in &hints {
+                eprintln!("ALIAS: {hint}");
+            }
+            Ok(next)
+        }
+        alias::Expansion::Shell { argv: shell, hint } => Err(execute_shell_alias(&shell, &hint)),
+        alias::Expansion::Failed { message, hints } => {
+            for hint in &hints {
+                eprintln!("ALIAS: {hint}");
+            }
+            eprintln!("arc-rs: {message}");
+            Err(ExitCode::FAILURE)
+        }
+    }
 }
 
 fn dispatch(argv: &[String]) -> ExitCode {
@@ -235,6 +298,10 @@ fn dispatch(argv: &[String]) -> ExitCode {
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    let argv = match apply_alias_expansion(argv) {
+        Ok(argv) => argv,
+        Err(code) => return code,
+    };
     dispatch(&argv)
 }
 

@@ -1,3 +1,4 @@
+pub mod alias;
 pub mod amend;
 pub mod anoid;
 pub mod arclint;

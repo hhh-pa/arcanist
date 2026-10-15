@@ -133,6 +133,106 @@ fn usage_lists_commands() {
     let u = usage();
     assert!(u.contains("call-conduit"));
     assert!(u.contains("diff"));
+    assert!(u.contains("alias"));
+}
+
+#[test]
+fn alias_command_is_registered() {
+    let run = COMMANDS
+        .iter()
+        .find(|(name, _)| *name == alias::NAME)
+        .map(|(_, run)| *run);
+    let Some(run) = run else {
+        panic!("alias is not registered");
+    };
+    assert_eq!(run(&args(&["--help"])), ExitCode::SUCCESS);
+}
+
+#[test]
+fn builtin_set_matches_dispatch_table() {
+    for (name, _) in COMMANDS {
+        assert!(alias::is_builtin_command(name), "{name}");
+    }
+    assert!(alias::is_builtin_command("call-conduit"));
+    assert!(alias::is_builtin_command("help"));
+    assert_eq!(alias::builtin_names().len(), COMMANDS.len() + 2);
+}
+
+fn stored_aliases(value: serde_json::Value) -> Vec<alias::Alias> {
+    let (aliases, warnings) = alias::aliases_from_storage(&value, "user (test)");
+    assert!(warnings.is_empty());
+    aliases
+}
+
+fn dispatch_target(argv: &[String]) -> &'static str {
+    let cmd = argv.first().expect("expanded argv has a command");
+    COMMANDS
+        .iter()
+        .find(|(name, _)| *name == cmd.as_str())
+        .map(|(name, _)| *name)
+        .unwrap_or_else(|| panic!("{cmd} is not registered"))
+}
+
+#[test]
+fn stored_alias_expands_through_main_dispatch() {
+    for stored in [
+        serde_json::json!({"draft": ["diff", "--draft"]}),
+        serde_json::json!([{"trigger": "draft", "toolset": "arc", "command": ["diff", "--draft"]}]),
+    ] {
+        let aliases = stored_aliases(stored);
+        let expanded = pre_dispatch(args(&["draft", "extra"]), &aliases);
+        let alias::Expansion::Dispatch { argv, hints } = expanded else {
+            panic!("expected dispatch, got {expanded:?}");
+        };
+        assert_eq!(argv, args(&["diff", "--draft", "extra"]));
+        assert_eq!(hints.len(), 1);
+        assert_eq!(dispatch_target(&argv), diff::NAME);
+    }
+}
+
+#[test]
+fn pre_dispatch_leaves_builtins_and_flags_alone() {
+    let aliases = stored_aliases(serde_json::json!({"diff": ["lint"]}));
+    assert_eq!(
+        pre_dispatch(args(&["diff"]), &aliases),
+        alias::Expansion::Dispatch {
+            argv: args(&["diff"]),
+            hints: Vec::new(),
+        }
+    );
+    assert_eq!(
+        pre_dispatch(args(&["--help"]), &aliases),
+        alias::Expansion::Dispatch {
+            argv: args(&["--help"]),
+            hints: Vec::new(),
+        }
+    );
+    assert_eq!(
+        pre_dispatch(args(&["bogus"]), &aliases),
+        alias::Expansion::Dispatch {
+            argv: args(&["bogus"]),
+            hints: Vec::new(),
+        }
+    );
+}
+
+#[test]
+fn pre_dispatch_reports_shell_and_broken_chains() {
+    let aliases = stored_aliases(serde_json::json!({"ls": ["!ls"]}));
+    let expanded = pre_dispatch(args(&["ls", "-la"]), &aliases);
+    assert_eq!(
+        expanded,
+        alias::Expansion::Shell {
+            argv: args(&["ls", "-la"]),
+            hint: "arc ls -> $ ls -la".to_string(),
+        }
+    );
+
+    let aliases = stored_aliases(serde_json::json!({"a": ["gone"]}));
+    assert!(matches!(
+        pre_dispatch(args(&["a"]), &aliases),
+        alias::Expansion::Failed { .. }
+    ));
 }
 
 /// Every ported subcommand: the (NAME, run) pairs that must be registered
@@ -141,6 +241,7 @@ fn usage_lists_commands() {
 /// dispatches through `classify`, not the table.
 fn expected_commands() -> Vec<(&'static str, CommandFn)> {
     vec![
+        (alias::NAME, alias::run),
         (amend::NAME, amend::run),
         (anoid::NAME, anoid::run),
         (bookmarks::NAME, bookmarks::run),

@@ -1,0 +1,530 @@
+use super::*;
+use std::io::Cursor;
+
+fn args(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+fn alias(toolset: &str, trigger: &str, command: &[&str], source: &str) -> Alias {
+    Alias {
+        toolset: toolset.to_string(),
+        trigger: trigger.to_string(),
+        command: args(command),
+        source: source.to_string(),
+    }
+}
+
+fn builtin(name: &str) -> bool {
+    is_builtin_command(name)
+}
+
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path =
+            std::env::temp_dir().join(format!("arc-rs-alias-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn arcrc(&self) -> PathBuf {
+        self.path.join(".arcrc")
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+#[test]
+fn builtin_set_covers_registered_commands() {
+    for name in [
+        "alias",
+        "amend",
+        "diff",
+        "close-revision",
+        "get-config",
+        "install-certificate",
+        "set-config",
+        "work",
+        "call-conduit",
+        "help",
+    ] {
+        assert!(is_builtin_command(name), "{name}");
+    }
+    assert!(!is_builtin_command("draft"));
+    assert!(!is_builtin_command(""));
+    assert!(!is_builtin_command("--help"));
+}
+
+#[test]
+fn parses_old_and_new_storage_formats() {
+    let old = serde_json::json!(["diff", "--draft"]);
+    let parsed = parse_entry("draft", &old).unwrap();
+    assert_eq!(parsed.toolset, "arc");
+    assert_eq!(parsed.trigger, "draft");
+    assert_eq!(parsed.command, args(&["diff", "--draft"]));
+
+    let new = serde_json::json!({
+        "trigger": "draft",
+        "toolset": "arc",
+        "command": ["diff", "--draft"],
+    });
+    assert_eq!(parse_entry("0", &new).unwrap().trigger, "draft");
+
+    assert!(parse_entry("bad", &serde_json::json!("diff")).is_err());
+    assert!(parse_entry("bad", &serde_json::json!(42)).is_err());
+    assert!(
+        parse_entry(
+            "bad",
+            &serde_json::json!({"trigger": "x", "toolset": "arc", "command": "diff"}),
+        )
+        .is_err()
+    );
+    assert!(
+        parse_entry(
+            "bad",
+            &serde_json::json!({"trigger": "x", "toolset": "arc"}),
+        )
+        .is_err()
+    );
+    assert!(parse_entry("bad", &serde_json::json!(["diff", 42])).is_err());
+}
+
+#[test]
+fn storage_parse_warns_and_ignores_invalid_entries() {
+    let value = serde_json::json!([
+        {"trigger": "draft", "toolset": "arc", "command": ["diff"]},
+        {"trigger": "broken", "toolset": "arc"},
+    ]);
+    let (aliases, warnings) = aliases_from_storage(&value, "user (u)");
+    assert_eq!(aliases.len(), 1);
+    assert_eq!(aliases[0].trigger, "draft");
+    assert_eq!(aliases[0].source, "user (u)");
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("user (u)"), "{}", warnings[0]);
+    assert!(warnings[0].contains("ignored"), "{}", warnings[0]);
+
+    let (aliases, warnings) = aliases_from_storage(&serde_json::json!("nope"), "user (u)");
+    assert!(aliases.is_empty());
+    assert_eq!(warnings.len(), 1);
+}
+
+#[test]
+fn detects_shell_commands() {
+    assert!(is_shell_command(&args(&["!ls"])));
+    assert!(is_shell_command(&args(&["!ls", "-la"])));
+    assert!(!is_shell_command(&args(&["diff"])));
+    assert!(!is_shell_command(&[]));
+    assert!(!is_shell_command(&args(&["diff", "!x"])));
+}
+
+#[test]
+fn expansion_passes_builtins_through_untouched() {
+    let aliases = vec![alias("arc", "diff", &["lint"], "user")];
+    assert_eq!(
+        expand(&args(&["diff", "--lintall"]), &aliases, builtin),
+        Expansion::Dispatch {
+            argv: args(&["diff", "--lintall"]),
+            hints: Vec::new(),
+        }
+    );
+}
+
+#[test]
+fn expansion_appends_user_args_after_alias_args() {
+    let aliases = vec![alias("arc", "draft", &["diff", "--draft"], "user")];
+    let expanded = expand(&args(&["draft", "extra"]), &aliases, builtin);
+    let Expansion::Dispatch { argv, hints } = expanded else {
+        panic!("expected dispatch, got {expanded:?}");
+    };
+    assert_eq!(argv, args(&["diff", "--draft", "extra"]));
+    assert_eq!(hints.len(), 1);
+    assert!(
+        hints[0].contains("arc draft -> arc diff --draft"),
+        "{}",
+        hints[0]
+    );
+}
+
+#[test]
+fn expansion_resolves_chains() {
+    let aliases = vec![
+        alias("arc", "a", &["b", "--from-a"], "user"),
+        alias("arc", "b", &["diff"], "user"),
+    ];
+    let expanded = expand(&args(&["a", "user-arg"]), &aliases, builtin);
+    let Expansion::Dispatch { argv, hints } = expanded else {
+        panic!("expected dispatch, got {expanded:?}");
+    };
+    assert_eq!(argv, args(&["diff", "--from-a", "user-arg"]));
+    assert_eq!(hints.len(), 2);
+}
+
+#[test]
+fn expansion_resolves_shell_aliases() {
+    let aliases = vec![alias("arc", "ls", &["!ls", "-la"], "user")];
+    let expanded = expand(&args(&["ls", "/tmp"]), &aliases, builtin);
+    let Expansion::Shell { argv, hint } = expanded else {
+        panic!("expected shell, got {expanded:?}");
+    };
+    assert_eq!(argv, args(&["ls", "-la", "/tmp"]));
+    assert!(hint.contains("arc ls -> $ ls -la /tmp"), "{hint}");
+}
+
+#[test]
+fn expansion_quotes_shell_display_words() {
+    let aliases = vec![alias("arc", "g", &["!echo", "a b"], "user")];
+    let Expansion::Shell { argv, hint } = expand(&args(&["g"]), &aliases, builtin) else {
+        panic!("expected shell");
+    };
+    assert_eq!(argv, args(&["echo", "a b"]));
+    assert!(hint.contains("echo 'a b'"), "{hint}");
+}
+
+#[test]
+fn expansion_reports_cycles() {
+    let aliases = vec![
+        alias("arc", "a", &["b"], "user"),
+        alias("arc", "b", &["a"], "user"),
+    ];
+    let expanded = expand(&args(&["a"]), &aliases, builtin);
+    let Expansion::Failed { message, .. } = expanded else {
+        panic!("expected failure, got {expanded:?}");
+    };
+    assert!(message.contains("cycle"), "{message}");
+    assert!(message.contains("b -> a -> b"), "{message}");
+}
+
+#[test]
+fn expansion_reports_dangling_chains_but_passes_unknown_through() {
+    let aliases = vec![alias("arc", "a", &["gone"], "user")];
+    let expanded = expand(&args(&["a"]), &aliases, builtin);
+    let Expansion::Failed { message, hints } = expanded else {
+        panic!("expected failure, got {expanded:?}");
+    };
+    assert!(message.contains("Alias resolved to \"gone\""), "{message}");
+    assert_eq!(hints.len(), 1);
+
+    let expanded = expand(&args(&["hlep"]), &aliases, builtin);
+    assert_eq!(
+        expanded,
+        Expansion::Dispatch {
+            argv: args(&["hlep"]),
+            hints: Vec::new(),
+        }
+    );
+}
+
+#[test]
+fn expansion_suggests_cross_toolset_aliases() {
+    let aliases = vec![alias("phage", "draft", &["diff"], "user")];
+    let expanded = expand(&args(&["draft"]), &aliases, builtin);
+    let Expansion::Dispatch { argv, hints } = expanded else {
+        panic!("expected dispatch, got {expanded:?}");
+    };
+    assert_eq!(argv, args(&["draft"]));
+    assert_eq!(hints.len(), 1);
+    assert!(hints[0].contains("did you mean"), "{}", hints[0]);
+    assert!(hints[0].contains("phage draft"), "{}", hints[0]);
+}
+
+#[test]
+fn expansion_prefers_last_definition_and_hints_shadowed_ones() {
+    let aliases = vec![
+        alias("arc", "draft", &["lint"], "user"),
+        alias("arc", "draft", &["diff"], "local"),
+    ];
+    let expanded = expand(&args(&["draft"]), &aliases, builtin);
+    let Expansion::Dispatch { argv, hints } = expanded else {
+        panic!("expected dispatch, got {expanded:?}");
+    };
+    assert_eq!(argv, args(&["diff"]));
+    assert!(hints.iter().any(|h| h.contains("Multiple")), "{hints:?}");
+    assert!(
+        hints.iter().any(|h| h.contains("will be ignored")),
+        "{hints:?}"
+    );
+}
+
+#[test]
+fn expansion_enforces_stack_limit() {
+    let mut aliases = Vec::new();
+    for index in 0..20 {
+        aliases.push(Alias {
+            toolset: TOOLSET.to_string(),
+            trigger: format!("a{index}"),
+            command: vec![format!("a{}", index + 1)],
+            source: "user".to_string(),
+        });
+    }
+    let expanded = expand(&args(&["a0"]), &aliases, builtin);
+    let Expansion::Failed { message, .. } = expanded else {
+        panic!("expected failure, got {expanded:?}");
+    };
+    assert!(message.contains("unreasonably deep"), "{message}");
+}
+
+#[test]
+fn expansion_handles_empty_argv_and_empty_commands() {
+    assert_eq!(
+        expand(&[], &[], builtin),
+        Expansion::Dispatch {
+            argv: Vec::new(),
+            hints: Vec::new(),
+        }
+    );
+    let aliases = vec![alias("arc", "empty", &[], "user")];
+    assert!(matches!(
+        expand(&args(&["empty"]), &aliases, builtin),
+        Expansion::Failed { .. }
+    ));
+}
+
+#[test]
+fn effective_aliases_dedupe_and_sort() {
+    let aliases = vec![
+        alias("arc", "zebra", &["diff"], "user"),
+        alias("phage", "aaa", &["diff"], "user"),
+        alias("arc", "apple", &["lint"], "system"),
+        alias("arc", "apple", &["diff"], "user"),
+    ];
+    let effective = effective_aliases(&aliases);
+    let triggers: Vec<&str> = effective.iter().map(|a| a.trigger.as_str()).collect();
+    assert_eq!(triggers, vec!["apple", "zebra"]);
+    assert_eq!(effective[0].command, args(&["diff"]));
+}
+
+#[test]
+fn renders_list_table_and_empty_state() {
+    assert_eq!(render_list(&[]), "You have not defined any aliases yet.\n");
+    let aliases = vec![
+        alias("arc", "ls", &["!ls"], "user"),
+        alias("arc", "draft", &["diff", "--draft"], "user"),
+    ];
+    let effective = effective_aliases(&aliases);
+    let text = render_list(&effective);
+    assert!(text.contains("Alias"), "{text}");
+    assert!(text.contains("arc draft"), "{text}");
+    assert!(text.contains("arc diff --draft"), "{text}");
+    assert!(text.contains("Arcanist Command"), "{text}");
+    assert!(text.contains("arc ls"), "{text}");
+    assert!(text.contains("Shell Command"), "{text}");
+    assert!(!text.contains('!'), "{text}");
+    assert!(text.find("arc draft").unwrap() < text.find("arc ls").unwrap());
+}
+
+#[test]
+fn builds_json_document() {
+    let aliases = vec![alias("arc", "draft", &["diff"], "user")];
+    let effective = effective_aliases(&aliases);
+    assert_eq!(
+        aliases_json(&effective),
+        serde_json::json!([{
+            "trigger": "draft",
+            "toolset": "arc",
+            "command": ["diff"],
+        }])
+    );
+}
+
+#[test]
+fn parses_args_with_terminator_and_json() {
+    assert_eq!(
+        parse_args(&args(&[])).unwrap().unwrap(),
+        Options {
+            json: false,
+            positional: Vec::new(),
+        }
+    );
+    let options = parse_args(&args(&["draft", "diff", "--", "--draft"]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(options.positional, args(&["draft", "diff", "--draft"]));
+    assert!(!options.json);
+    let options = parse_args(&args(&["--json"])).unwrap().unwrap();
+    assert!(options.json);
+    assert!(parse_args(&args(&["--help"])).unwrap().is_none());
+    assert!(parse_args(&args(&["-h"])).unwrap().is_none());
+    assert!(
+        parse_args(&args(&["--bogus"]))
+            .unwrap_err()
+            .contains("unknown flag")
+    );
+}
+
+#[test]
+fn validates_builtin_triggers() {
+    assert!(validate_trigger("draft").is_ok());
+    let err = validate_trigger("diff").unwrap_err();
+    assert!(
+        err.contains("You can not define an alias for \"diff\""),
+        "{err}"
+    );
+    assert!(validate_trigger("alias").is_err());
+    assert!(validate_trigger("call-conduit").is_err());
+    assert!(validate_trigger("help").is_err());
+}
+
+#[test]
+fn create_stores_new_format_and_preserves_rest_of_file() {
+    let tmp = TempDir::new("create");
+    let arcrc = tmp.arcrc();
+    std::fs::write(
+        &arcrc,
+        r#"{"hosts": {"x": 1}, "config": {"editor": "vim"}, "aliases": {"old": ["diff"]}}"#,
+    )
+    .unwrap();
+
+    let report = execute_create(&arcrc, "draft", &args(&["diff", "--draft"])).unwrap();
+    assert_eq!(
+        report.text,
+        "Aliased \"arc draft\" to \"arc diff --draft\".\n"
+    );
+    assert!(report.warnings.is_empty());
+
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&arcrc).unwrap()).unwrap();
+    assert_eq!(doc["hosts"], serde_json::json!({"x": 1}));
+    assert_eq!(doc["config"], serde_json::json!({"editor": "vim"}));
+    assert_eq!(
+        doc["aliases"],
+        serde_json::json!([
+            {"trigger": "old", "toolset": "arc", "command": ["diff"]},
+            {"trigger": "draft", "toolset": "arc", "command": ["diff", "--draft"]},
+        ])
+    );
+}
+
+#[test]
+fn create_replaces_previous_definition_and_reports_shell() {
+    let tmp = TempDir::new("replace");
+    let arcrc = tmp.arcrc();
+    execute_create(&arcrc, "ls", &args(&["!ls"])).unwrap();
+    let report = execute_create(&arcrc, "ls", &args(&["!ls", "-la"])).unwrap();
+    assert_eq!(
+        report.text,
+        "Aliased \"arc ls\" to shell command \"ls -la\".\n"
+    );
+
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&arcrc).unwrap()).unwrap();
+    assert_eq!(
+        doc["aliases"],
+        serde_json::json!([
+            {"trigger": "ls", "toolset": "arc", "command": ["!ls", "-la"]},
+        ])
+    );
+}
+
+#[test]
+fn create_rejects_builtins_and_bad_storage() {
+    let tmp = TempDir::new("reject");
+    let arcrc = tmp.arcrc();
+    assert!(execute_create(&arcrc, "diff", &args(&["lint"])).is_err());
+    assert!(!arcrc.is_file());
+
+    std::fs::write(&arcrc, r#"{"aliases": 42}"#).unwrap();
+    assert!(execute_create(&arcrc, "draft", &args(&["diff"])).is_err());
+}
+
+#[test]
+fn delete_removes_after_confirmation() {
+    let tmp = TempDir::new("delete");
+    let arcrc = tmp.arcrc();
+    execute_create(&arcrc, "draft", &args(&["diff"])).unwrap();
+
+    let mut input = Cursor::new(b"y\n".to_vec());
+    let report = execute_delete(&arcrc, "draft", &mut input, true).unwrap();
+    assert!(
+        report.text.contains("currently aliased to \"arc diff\""),
+        "{}",
+        report.text
+    );
+    assert!(
+        report.text.contains("Removed alias \"arc draft\"."),
+        "{}",
+        report.text
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&arcrc).unwrap()).unwrap();
+    assert_eq!(doc["aliases"], serde_json::json!([]));
+}
+
+#[test]
+fn delete_aborts_on_decline_and_reports_missing() {
+    let tmp = TempDir::new("decline");
+    let arcrc = tmp.arcrc();
+    execute_create(&arcrc, "draft", &args(&["diff"])).unwrap();
+
+    let mut input = Cursor::new(b"n\n".to_vec());
+    assert_eq!(
+        execute_delete(&arcrc, "draft", &mut input, true).unwrap_err(),
+        "User aborted the workflow."
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&arcrc).unwrap()).unwrap();
+    assert_eq!(doc["aliases"].as_array().unwrap().len(), 1);
+
+    let mut input = Cursor::new(b"y\n".to_vec());
+    let report = execute_delete(&arcrc, "missing", &mut input, true).unwrap();
+    assert_eq!(report.text, "No alias \"missing\" to remove.\n");
+}
+
+#[test]
+fn delete_requires_interactive_stdin() {
+    let tmp = TempDir::new("tty");
+    let arcrc = tmp.arcrc();
+    execute_create(&arcrc, "draft", &args(&["diff"])).unwrap();
+    let mut input = Cursor::new(b"y\n".to_vec());
+    assert!(execute_delete(&arcrc, "draft", &mut input, false).is_err());
+}
+
+#[test]
+fn list_reads_user_file_and_json() {
+    let tmp = TempDir::new("list");
+    let arcrc = tmp.arcrc();
+    execute_create(&arcrc, "draft", &args(&["diff"])).unwrap();
+
+    let report = execute_list(tmp.path(), Some(&arcrc), false).unwrap();
+    assert!(report.text.contains("arc draft"), "{}", report.text);
+
+    let report = execute_list(tmp.path(), Some(&arcrc), true).unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&report.text).unwrap();
+    assert_eq!(
+        doc,
+        serde_json::json!([{
+            "trigger": "draft",
+            "toolset": "arc",
+            "command": ["diff"],
+        }])
+    );
+
+    let report = execute_list(tmp.path(), None, false).unwrap();
+    assert_eq!(report.text, "You have not defined any aliases yet.\n");
+}
+
+#[test]
+fn load_merges_user_aliases() {
+    let tmp = TempDir::new("load");
+    let arcrc = tmp.arcrc();
+    std::fs::write(&arcrc, r#"{"aliases": {"draft": ["diff"]}}"#).unwrap();
+    let (aliases, warnings) = load_aliases_in(tmp.path(), Some(&arcrc)).unwrap();
+    assert!(warnings.is_empty());
+    assert!(
+        aliases
+            .iter()
+            .any(|a| a.trigger == "draft" && a.toolset == "arc")
+    );
+}
