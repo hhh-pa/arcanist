@@ -573,39 +573,49 @@ pub fn decode_bytes(bytes: &[u8], encoding: Option<&str>) -> String {
     }
 }
 
+/// Windows-1252 scalars for `0x80..0xA0` in byte order; `None` marks the
+/// 5 undefined bytes (`0x81,0x8D,0x8F,0x90,0x9D`), which decode as U+FFFD.
+const CP1252_80_9F: [Option<char>; 32] = [
+    Some('€'),
+    None,
+    Some('‚'),
+    Some('ƒ'),
+    Some('„'),
+    Some('…'),
+    Some('†'),
+    Some('‡'),
+    Some('ˆ'),
+    Some('‰'),
+    Some('Š'),
+    Some('‹'),
+    Some('Œ'),
+    None,
+    Some('Ž'),
+    None,
+    None,
+    Some('‘'),
+    Some('’'),
+    Some('“'),
+    Some('”'),
+    Some('•'),
+    Some('–'),
+    Some('—'),
+    Some('˜'),
+    Some('™'),
+    Some('š'),
+    Some('›'),
+    Some('œ'),
+    None,
+    Some('ž'),
+    Some('Ÿ'),
+];
+
 /// Map one byte through Windows-1252; undefined bytes become U+FFFD.
 fn decode_cp1252(byte: u8) -> char {
-    match byte {
-        0x80 => '€',
-        0x82 => '‚',
-        0x83 => 'ƒ',
-        0x84 => '„',
-        0x85 => '…',
-        0x86 => '†',
-        0x87 => '‡',
-        0x88 => 'ˆ',
-        0x89 => '‰',
-        0x8A => 'Š',
-        0x8B => '‹',
-        0x8C => 'Œ',
-        0x8E => 'Ž',
-        0x91 => '‘',
-        0x92 => '’',
-        0x93 => '“',
-        0x94 => '”',
-        0x95 => '•',
-        0x96 => '–',
-        0x97 => '—',
-        0x98 => '˜',
-        0x99 => '™',
-        0x9A => 'š',
-        0x9B => '›',
-        0x9C => 'œ',
-        0x9E => 'ž',
-        0x9F => 'Ÿ',
-        0x81 | 0x8D | 0x8F | 0x90 | 0x9D => '\u{FFFD}',
-        _ => byte as char,
+    if (0x80..0xA0).contains(&byte) {
+        return CP1252_80_9F[(byte - 0x80) as usize].unwrap_or('\u{FFFD}');
     }
+    byte as char
 }
 
 /// Read patch bytes from `path` or `-` (stdin).
@@ -870,12 +880,33 @@ pub fn validate_patch_text(text: &str) -> Result<(), String> {
     if text.trim().is_empty() {
         return Err(EMPTY_DIFF_ERROR.to_string());
     }
+    let lines = preprocess_patch_lines(text);
+    let idx = skip_patch_comments(&lines);
+    if idx >= lines.len() {
+        return Err(format_parse_error(EXPECTED_HUNK_HEADER, &lines, idx));
+    }
+    let first = lines[idx].trim_end_matches(['\r', '\n']);
+    if is_diff_header(first) {
+        return Ok(());
+    }
+    if probe_hg_export_header(&lines, idx) {
+        return Ok(());
+    }
+    Err(format_parse_error(EXPECTED_HUNK_HEADER, &lines, idx))
+}
+
+/// Strip ANSI colors and leading whitespace, then split into lines that
+/// retain their endings.
+fn preprocess_patch_lines(text: &str) -> Vec<String> {
     let mut owned = text.to_string();
     if has_leading_ansi(&owned) {
         owned = strip_ansi_codes(&owned);
     }
-    let trimmed = ltrim_php(&owned).to_string();
-    let lines = split_retain_lines(&trimmed);
+    split_retain_lines(ltrim_php(&owned))
+}
+
+/// Skip leading `#` comment lines, returning the first content line index.
+fn skip_patch_comments(lines: &[String]) -> usize {
     let mut idx = 0;
     while idx < lines.len() {
         let cur = lines[idx].trim_end_matches(['\r', '\n']);
@@ -885,44 +916,43 @@ pub fn validate_patch_text(text: &str) -> Result<(), String> {
             break;
         }
     }
-    if idx >= lines.len() {
-        return Err(format_parse_error(EXPECTED_HUNK_HEADER, &lines, idx));
-    }
-    let first = lines[idx].trim_end_matches(['\r', '\n']);
-    if !is_diff_header(first) {
-        // `hg export` extended diffs: search forward for `diff -r` or
-        // `diff --git` when still on the first non-empty line.
-        let mut only_first = true;
-        for (i, line) in lines.iter().enumerate() {
-            let t = line.trim_end_matches(['\r', '\n']);
-            if t.trim().is_empty() || t.starts_with('#') {
-                continue;
-            }
-            if i != idx {
-                only_first = false;
-            }
-            break;
+    idx
+}
+
+/// True when a later `diff -r`/`diff --git` opener excuses the failing
+/// first line (`hg export` extended diffs).
+///
+/// Skips the failing line itself: a malformed `diff -r`/`diff --git`
+/// opener must still fail; only a later opener excuses the preamble.
+fn probe_hg_export_header(lines: &[String], idx: usize) -> bool {
+    let mut only_first = true;
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim_end_matches(['\r', '\n']);
+        if t.trim().is_empty() || t.starts_with('#') {
+            continue;
         }
-        if only_first {
-            // Skip the failing line itself: a malformed `diff -r`/`diff --git`
-            // opener must still fail; only a later opener excuses the preamble.
-            let mut probe = idx + 1;
-            while probe < lines.len() {
-                let t = lines[probe].trim_end_matches(['\r', '\n']);
-                if t.starts_with("diff -r ") || t.starts_with("diff --git ") {
-                    return Ok(());
-                }
-                // Match PHP's `^\s*diff\s+-(?:r|-git)` loosely.
-                let trimmed_start = t.trim_start();
-                if trimmed_start.starts_with("diff -r") || trimmed_start.starts_with("diff --git") {
-                    return Ok(());
-                }
-                probe += 1;
-            }
+        if i != idx {
+            only_first = false;
         }
-        return Err(format_parse_error(EXPECTED_HUNK_HEADER, &lines, idx));
+        break;
     }
-    Ok(())
+    if !only_first {
+        return false;
+    }
+    let mut probe = idx + 1;
+    while probe < lines.len() {
+        let t = lines[probe].trim_end_matches(['\r', '\n']);
+        if t.starts_with("diff -r ") || t.starts_with("diff --git ") {
+            return true;
+        }
+        // Match PHP's `^\s*diff\s+-(?:r|-git)` loosely.
+        let trimmed_start = t.trim_start();
+        if trimmed_start.starts_with("diff -r") || trimmed_start.starts_with("diff --git") {
+            return true;
+        }
+        probe += 1;
+    }
+    false
 }
 
 /// Load a `--patch` bundle from a file or `-`
@@ -1641,78 +1671,49 @@ pub fn render_git_patch(changes: &mut Vec<BundleChange>) -> Result<String, Strin
     decompose_multicopies(changes)?;
     let mut result = String::new();
     for change in changes.iter() {
-        if change.file_type == FILE_DIRECTORY {
-            continue;
-        }
-        if change.change_type == TYPE_MOVE_AWAY {
-            continue;
-        }
-        if change.file_type == FILE_IMAGE || change.file_type == FILE_BINARY {
-            return Err("binary patches are not yet ported by arc-rs patch".to_string());
-        }
-        let body: String = change.hunks.concat();
-        if change.change_type == TYPE_COPY_AWAY
-            && body.is_empty()
-            && change.defaulted_old_mode() == change.defaulted_new_mode()
-        {
-            continue;
-        }
-        let (old_index, old_target) = match &change.old_path {
-            None => (
-                format!("a/{}", change.current_path.clone().unwrap_or_default()),
-                "/dev/null".to_string(),
-            ),
-            Some(old) => (format!("a/{old}"), format!("a/{old}")),
-        };
-        let (cur_index, cur_target) = match &change.current_path {
-            None => (
-                format!("b/{}", change.old_path.clone().unwrap_or_default()),
-                "/dev/null".to_string(),
-            ),
-            Some(cur) => (format!("b/{cur}"), format!("b/{cur}")),
-        };
-        result.push_str(&format!("diff --git {old_index} {cur_index}\n"));
-        if change.change_type == TYPE_ADD {
-            result.push_str(&format!("new file mode {}\n", change.defaulted_new_mode()));
-        }
-        if matches!(
-            change.change_type,
-            TYPE_COPY_HERE | TYPE_MOVE_HERE | TYPE_COPY_AWAY | TYPE_CHANGE
-        ) && change.defaulted_old_mode() != change.defaulted_new_mode()
-        {
-            result.push_str(&format!("old mode {}\n", change.defaulted_old_mode()));
-            result.push_str(&format!("new mode {}\n", change.defaulted_new_mode()));
-        }
-        if change.change_type == TYPE_COPY_HERE {
-            result.push_str(&format!(
-                "copy from {}\ncopy to {}\n",
-                change.old_path.clone().unwrap_or_default(),
-                change.current_path.clone().unwrap_or_default()
-            ));
-        } else if change.change_type == TYPE_MOVE_HERE {
-            result.push_str(&format!(
-                "rename from {}\nrename to {}\n",
-                change.old_path.clone().unwrap_or_default(),
-                change.current_path.clone().unwrap_or_default()
-            ));
-        } else if change.change_type == TYPE_DELETE || change.change_type == TYPE_MULTICOPY {
-            // Unlike the header above, the deleted mode prints only when
-            // properties carry it (`:468-471`).
-            if let Some(old_mode) = &change.old_mode {
-                result.push_str(&format!("deleted file mode {old_mode}\n"));
-            }
-        }
-        if !body.is_empty() {
-            result.push_str(&format!("--- {}\n", quote_git_target(&old_target)));
-            result.push_str(&format!("+++ {}\n", quote_git_target(&cur_target)));
-            result.push_str(&body);
-            if !body.ends_with('\n') {
-                result.push('\n');
-            }
-        }
+        render_text_change(change, &mut result)?;
     }
     result.push('\n');
     Ok(result)
+}
+
+/// Render one text change into `result` (directories and move-aways are
+/// skipped; binary and image changes fail).
+fn render_text_change(change: &BundleChange, result: &mut String) -> Result<(), String> {
+    if change.file_type == FILE_DIRECTORY {
+        return Ok(());
+    }
+    if change.change_type == TYPE_MOVE_AWAY {
+        return Ok(());
+    }
+    if change.file_type == FILE_IMAGE || change.file_type == FILE_BINARY {
+        return Err("binary patches are not yet ported by arc-rs patch".to_string());
+    }
+    let body: String = change.hunks.concat();
+    if change.change_type == TYPE_COPY_AWAY
+        && body.is_empty()
+        && change.defaulted_old_mode() == change.defaulted_new_mode()
+    {
+        return Ok(());
+    }
+    let (old_index, old_target, cur_index, cur_target) = git_patch_paths(change);
+    result.push_str(&format!("diff --git {old_index} {cur_index}\n"));
+    push_change_headers(change, result);
+    if body.is_empty() {
+        return Ok(());
+    }
+    push_text_body(result, &old_target, &cur_target, &body);
+    Ok(())
+}
+
+/// Append the `---`/`+++` headers and hunk body for one text change.
+fn push_text_body(result: &mut String, old_target: &str, cur_target: &str, body: &str) {
+    result.push_str(&format!("--- {}\n", quote_git_target(old_target)));
+    result.push_str(&format!("+++ {}\n", quote_git_target(cur_target)));
+    result.push_str(body);
+    if !body.ends_with('\n') {
+        result.push('\n');
+    }
 }
 
 /// Decompose `MULTICOPY` changes into one `MOVE_HERE` plus `COPY_HERE`
@@ -1746,34 +1747,13 @@ fn decompose_multicopies(changes: &mut Vec<BundleChange>) -> Result<(), String> 
 /// overrides the bundle metadata encoding.
 pub fn load_arcbundle(path: &str, encoding: Option<&str>) -> Result<Bundle, String> {
     let members = tar_list(path)?;
-    let meta = if members.iter().any(|member| member == "meta.json") {
-        parse_bundle_meta(&tar_extract(path, "meta.json")?)
-    } else {
-        BundleMeta::default()
-    };
-    if !members.iter().any(|member| member == "changes.json") {
-        return Err(format!(
-            "failed to read arcbundle '{path}': member 'changes.json' is missing"
-        ));
-    }
+    let meta = arcbundle_meta(path, &members)?;
+    require_arcbundle_member(path, &members, "changes.json")?;
     let raw = tar_extract(path, "changes.json")?;
     let dicts: Vec<serde_json::Value> = serde_json::from_slice(&raw)
         .map_err(|e| format!("failed to read arcbundle '{path}': {e}"))?;
     let decode_as = encoding.or(meta.encoding.as_deref());
-    let mut changes = Vec::new();
-    for dict in &dicts {
-        let mut hunks = Vec::new();
-        if let Some(items) = dict.get("hunks").and_then(|v| v.as_array()) {
-            for hunk in items {
-                let index = hunk.get("corpus").and_then(|v| v.as_u64()).ok_or_else(|| {
-                    format!("failed to read arcbundle '{path}': hunk corpus is not an index")
-                })?;
-                let bytes = tar_extract(path, &format!("hunks/{index}"))?;
-                hunks.push(decode_bytes(&bytes, decode_as));
-            }
-        }
-        changes.push(parse_bundle_change(dict, hunks));
-    }
+    let mut changes = arcbundle_changes(path, &dicts, decode_as)?;
     let text = render_git_patch_with_blobs(&mut changes, &|phid: &str| {
         tar_extract(path, &format!("blobs/{phid}"))
     })?;
@@ -1785,6 +1765,62 @@ pub fn load_arcbundle(path: &str, encoding: Option<&str>) -> Result<Bundle, Stri
         author_name: meta.author_name,
         author_email: meta.author_email,
     })
+}
+
+/// Read `meta.json` from an arcbundle, or defaults when absent (old
+/// bundles predate `meta.json`).
+fn arcbundle_meta(path: &str, members: &[String]) -> Result<BundleMeta, String> {
+    if members.iter().any(|member| member == "meta.json") {
+        Ok(parse_bundle_meta(&tar_extract(path, "meta.json")?))
+    } else {
+        Ok(BundleMeta::default())
+    }
+}
+
+/// Fail when an arcbundle member is absent.
+fn require_arcbundle_member(path: &str, members: &[String], member: &str) -> Result<(), String> {
+    if members.iter().any(|candidate| candidate == member) {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to read arcbundle '{path}': member '{member}' is missing"
+        ))
+    }
+}
+
+/// Parse one [`BundleChange`] per dict, decoding each hunk corpus.
+fn arcbundle_changes(
+    path: &str,
+    dicts: &[serde_json::Value],
+    decode_as: Option<&str>,
+) -> Result<Vec<BundleChange>, String> {
+    let mut changes = Vec::new();
+    for dict in dicts {
+        changes.push(parse_bundle_change(
+            dict,
+            arcbundle_corpora(path, dict, decode_as)?,
+        ));
+    }
+    Ok(changes)
+}
+
+/// Decode one change dict's hunk corpora from the `hunks/N` members.
+fn arcbundle_corpora(
+    path: &str,
+    dict: &serde_json::Value,
+    decode_as: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut hunks = Vec::new();
+    if let Some(items) = dict.get("hunks").and_then(|v| v.as_array()) {
+        for hunk in items {
+            let index = hunk.get("corpus").and_then(|v| v.as_u64()).ok_or_else(|| {
+                format!("failed to read arcbundle '{path}': hunk corpus is not an index")
+            })?;
+            let bytes = tar_extract(path, &format!("hunks/{index}"))?;
+            hunks.push(decode_bytes(&bytes, decode_as));
+        }
+    }
+    Ok(hunks)
 }
 
 /// One `differential.querydiffs` row.
@@ -1995,52 +2031,70 @@ pub fn parse_porcelain_v2(output: &[u8]) -> Result<TreeStatus, String> {
     let text = String::from_utf8_lossy(output);
     let mut parts: VecDeque<&str> = text.split('\0').collect();
     let mut status = TreeStatus::default();
-    let push = |path: &str, unstaged: bool, external: bool, status: &mut TreeStatus| {
-        if external {
-            status.externals.push(path.to_string());
-        }
-        if unstaged {
-            status.unstaged.push(path.to_string());
-        } else {
-            status.uncommitted.push(path.to_string());
-        }
-    };
     while parts.len() > 1 {
         let entry = parts.pop_front().unwrap_or("");
         if entry.is_empty() {
             continue;
         }
-        let kind = entry.as_bytes().first().copied().unwrap_or(b' ');
-        if kind == b'?' {
-            if let Some(path) = entry.split(' ').nth(1) {
-                status.untracked.push(path.to_string());
-            }
-            continue;
-        }
-        let fields: Vec<&str> = entry.split(' ').collect();
-        if fields.len() < 3 {
-            continue;
-        }
-        let (path, xy, subm) = match kind {
-            b'1' if fields.len() >= 9 => (fields[8], fields[1], fields[2]),
-            b'2' if fields.len() >= 10 => (fields[9], fields[1], fields[2]),
-            b'u' if fields.len() >= 11 => (fields[10], fields[1], fields[2]),
-            _ => continue,
-        };
-        let xy = xy.as_bytes();
-        let unstaged = xy.get(1).is_some_and(|state| *state != b'.');
-        let subm = subm.as_bytes();
-        let external = subm.get(2) == Some(&b'M') || subm.get(3) == Some(&b'U');
-        push(path, unstaged, external, &mut status);
-        if kind == b'2'
-            && let Some(orig) = parts.pop_front()
-            && !orig.is_empty()
-        {
-            push(orig, unstaged, external, &mut status);
-        }
+        parse_porcelain_entry(entry, &mut parts, &mut status);
     }
     sort_status(&mut status);
     Ok(status)
+}
+
+/// Parse one porcelain entry into the status buckets, consuming the rename
+/// origin for `2` entries.
+fn parse_porcelain_entry(entry: &str, parts: &mut VecDeque<&str>, status: &mut TreeStatus) {
+    let kind = entry.as_bytes().first().copied().unwrap_or(b' ');
+    if kind == b'?' {
+        if let Some(path) = entry.split(' ').nth(1) {
+            status.untracked.push(path.to_string());
+        }
+        return;
+    }
+    let fields: Vec<&str> = entry.split(' ').collect();
+    if fields.len() < 3 {
+        return;
+    }
+    let Some((path, xy, subm)) = porcelain_indexed_parts(kind, &fields) else {
+        return;
+    };
+    let xy = xy.as_bytes();
+    let unstaged = xy.get(1).is_some_and(|state| *state != b'.');
+    let subm = subm.as_bytes();
+    let external = subm.get(2) == Some(&b'M') || subm.get(3) == Some(&b'U');
+    push_porcelain_entry(status, path, unstaged, external);
+    if kind == b'2'
+        && let Some(orig) = parts.pop_front()
+        && !orig.is_empty()
+    {
+        push_porcelain_entry(status, orig, unstaged, external);
+    }
+}
+
+/// Extract the `(path, xy, submodule)` fields of a `1`/`2`/`u` entry.
+fn porcelain_indexed_parts<'a>(
+    kind: u8,
+    fields: &[&'a str],
+) -> Option<(&'a str, &'a str, &'a str)> {
+    match kind {
+        b'1' if fields.len() >= 9 => Some((fields[8], fields[1], fields[2])),
+        b'2' if fields.len() >= 10 => Some((fields[9], fields[1], fields[2])),
+        b'u' if fields.len() >= 11 => Some((fields[10], fields[1], fields[2])),
+        _ => None,
+    }
+}
+
+/// Record one path as external and unstaged or uncommitted.
+fn push_porcelain_entry(status: &mut TreeStatus, path: &str, unstaged: bool, external: bool) {
+    if external {
+        status.externals.push(path.to_string());
+    }
+    if unstaged {
+        status.unstaged.push(path.to_string());
+    } else {
+        status.uncommitted.push(path.to_string());
+    }
 }
 
 /// Sort every status bucket (PHP `ksort`s the status map).
@@ -2171,31 +2225,54 @@ pub fn parse_svn_status_xml(output: &str) -> Result<TreeStatus, String> {
             .unwrap_or(rest.len());
         let block = &rest[start..block_end];
         rest = &rest[block_end.min(rest.len())..];
-        let Some((mut path, props, item, conflicted)) = svn_entry_status(block) else {
-            continue;
-        };
-        path = path.replace('\\', "/");
-        if !matches!(props.as_str(), "none" | "normal" | "modified") {
-            return Err(format!("Unrecognized property status '{props}'."));
-        }
-        let (mut buckets, external) = svn_item_flags(&item)?;
-        if external {
-            externals.push(path.clone());
-        }
-        if conflicted {
-            buckets.push("conflicts");
-        }
-        for bucket in buckets {
-            match bucket {
-                "externals" => status.externals.push(path.clone()),
-                "untracked" => status.untracked.push(path.clone()),
-                "missing" => status.missing.push(path.clone()),
-                "conflicts" => status.conflicts.push(path.clone()),
-                "incomplete" => status.incomplete.push(path.clone()),
-                _ => {}
-            }
-        }
+        parse_svn_entry_block(block, &mut status, &mut externals)?;
     }
+    prune_svn_externals(&mut status, &externals);
+    sort_status(&mut status);
+    Ok(status)
+}
+
+/// Parse one `<entry>` block into the status buckets.
+fn parse_svn_entry_block(
+    block: &str,
+    status: &mut TreeStatus,
+    externals: &mut Vec<String>,
+) -> Result<(), String> {
+    let Some((mut path, props, item, conflicted)) = svn_entry_status(block) else {
+        return Ok(());
+    };
+    path = path.replace('\\', "/");
+    if !matches!(props.as_str(), "none" | "normal" | "modified") {
+        return Err(format!("Unrecognized property status '{props}'."));
+    }
+    let (mut buckets, external) = svn_item_flags(&item)?;
+    if external {
+        externals.push(path.clone());
+    }
+    if conflicted {
+        buckets.push("conflicts");
+    }
+    for bucket in buckets {
+        push_svn_bucket(status, bucket, &path);
+    }
+    Ok(())
+}
+
+/// Push one path into the named status bucket.
+fn push_svn_bucket(status: &mut TreeStatus, bucket: &str, path: &str) {
+    match bucket {
+        "externals" => status.externals.push(path.to_string()),
+        "untracked" => status.untracked.push(path.to_string()),
+        "missing" => status.missing.push(path.to_string()),
+        "conflicts" => status.conflicts.push(path.to_string()),
+        "incomplete" => status.incomplete.push(path.to_string()),
+        _ => {}
+    }
+}
+
+/// Drop external paths from the plain buckets (externals are reported
+/// separately, not as untracked/missing/conflicted/incomplete).
+fn prune_svn_externals(status: &mut TreeStatus, externals: &[String]) {
     for path in externals {
         for bucket in [
             &mut status.untracked,
@@ -2203,11 +2280,9 @@ pub fn parse_svn_status_xml(output: &str) -> Result<TreeStatus, String> {
             &mut status.conflicts,
             &mut status.incomplete,
         ] {
-            bucket.retain(|candidate| candidate != &path);
+            bucket.retain(|candidate| candidate != path);
         }
     }
-    sort_status(&mut status);
-    Ok(status)
 }
 
 /// Read the svn working-tree status via `svn --xml status`.
@@ -2280,6 +2355,23 @@ pub fn require_clean_tree(
         Vcs::Svn => svn_tree_status(dir, &backends.svn, &["--xml", "status"])?,
     };
     let desc = working_copy_desc(dir);
+    fail_on_fatal_tree_state(&status, &desc)?;
+    // Subversion externals are handled elsewhere; never prompt (`:1076-1080`).
+    if vcs == Vcs::Svn {
+        status.externals.clear();
+    }
+    confirm_tree_externals(io, &status)?;
+    confirm_tree_untracked(io, vcs, &status, &desc)?;
+    prune_tree_overlaps(&mut status);
+    if status.unstaged.is_empty() && status.uncommitted.is_empty() {
+        return Ok(StashState::Clean);
+    }
+    resolve_uncommitted_tree(dir, vcs, io, &status, &desc)
+}
+
+/// Fail on incomplete directories, conflicts, and missing files with the
+/// verbatim errors.
+fn fail_on_fatal_tree_state(status: &TreeStatus, desc: &str) -> Result<(), String> {
     if !status.incomplete.is_empty() {
         // The trailing `')` is verbatim from PHP (`:1036-1038`).
         return Err(format!(
@@ -2306,52 +2398,80 @@ pub fn require_clean_tree(
             status.missing.join("\n    ")
         ));
     }
-    // Subversion externals are handled elsewhere; never prompt (`:1076-1080`).
-    if vcs == Vcs::Svn {
-        status.externals.clear();
+    Ok(())
+}
+
+/// Prompt to ignore dirty externals/submodules (declining aborts).
+fn confirm_tree_externals(io: &mut Io, status: &TreeStatus) -> Result<(), String> {
+    if status.externals.is_empty() {
+        return Ok(());
     }
-    if !status.externals.is_empty() {
-        let count = status.externals.len();
-        io.push_out(&format!(
-            "{count} submodule(s) have uncommitted or untracked changes:\n"
-        ));
-        for external in &status.externals {
-            io.push_out(&format!("    {external}\n"));
-        }
-        let query = format!("Ignore the changes to these {count} submodule(s) and continue?");
-        if !land::console_confirm(io, &query, false)? {
-            return Err(land::ABORT.to_string());
-        }
+    let count = status.externals.len();
+    io.push_out(&format!(
+        "{count} submodule(s) have uncommitted or untracked changes:\n"
+    ));
+    for external in &status.externals {
+        io.push_out(&format!("    {external}\n"));
     }
-    if !status.untracked.is_empty() {
-        let count = status.untracked.len();
-        let place = match vcs {
-            Vcs::Git => ".git/info/exclude",
-            Vcs::Svn => "svn:ignore",
-            Vcs::Hg => ".hgignore",
-        };
-        io.push_out(&format!(
-            "You have untracked files in this working copy.\n\n{desc}"
-        ));
-        io.push_out(&format!(
-            "  Untracked changes in working copy:\n  (To ignore these {count} change(s), add them \
-             to \"{place}\".)\n    {}\n",
-            status.untracked.join("\n    ")
-        ));
-        let query = format!("Ignore these {count} untracked file(s) and continue?");
-        if !land::console_confirm(io, &query, true)? {
-            return Err(land::ABORT.to_string());
-        }
+    let query = format!("Ignore the changes to these {count} submodule(s) and continue?");
+    if !land::console_confirm(io, &query, false)? {
+        return Err(land::ABORT.to_string());
     }
+    Ok(())
+}
+
+/// Prompt to ignore untracked files (declining aborts).
+fn confirm_tree_untracked(
+    io: &mut Io,
+    vcs: Vcs,
+    status: &TreeStatus,
+    desc: &str,
+) -> Result<(), String> {
+    if status.untracked.is_empty() {
+        return Ok(());
+    }
+    let count = status.untracked.len();
+    let place = match vcs {
+        Vcs::Git => ".git/info/exclude",
+        Vcs::Svn => "svn:ignore",
+        Vcs::Hg => ".hgignore",
+    };
+    io.push_out(&format!(
+        "You have untracked files in this working copy.\n\n{desc}"
+    ));
+    io.push_out(&format!(
+        "  Untracked changes in working copy:\n  (To ignore these {count} change(s), add them \
+         to \"{place}\".)\n    {}\n",
+        status.untracked.join("\n    ")
+    ));
+    let query = format!("Ignore these {count} untracked file(s) and continue?");
+    if !land::console_confirm(io, &query, true)? {
+        return Err(land::ABORT.to_string());
+    }
+    Ok(())
+}
+
+/// Drop externals from the unstaged bucket and unstaged/externals from the
+/// uncommitted bucket.
+fn prune_tree_overlaps(status: &mut TreeStatus) {
     status
         .unstaged
         .retain(|path| !status.externals.contains(path));
     status
         .uncommitted
         .retain(|path| !status.unstaged.contains(path) && !status.externals.contains(path));
-    if status.unstaged.is_empty() && status.uncommitted.is_empty() {
-        return Ok(StashState::Clean);
-    }
+}
+
+/// Print the uncommitted/unstaged lists and resolve them: offering a new
+/// commit (yes fails without an interactive editor), autostashing under
+/// git with `arc.autostash`, else failing with the verbatim error.
+fn resolve_uncommitted_tree(
+    dir: &Path,
+    vcs: Vcs,
+    io: &mut Io,
+    status: &TreeStatus,
+    desc: &str,
+) -> Result<StashState, String> {
     io.push_out(&format!(
         "You have uncommitted changes in this working copy.\n\n{desc}"
     ));
@@ -2646,34 +2766,16 @@ pub fn sanity_check(
     bundle: &Bundle,
     has_local_commit: bool,
 ) -> Result<(), String> {
-    let hash_type = match vcs {
-        Vcs::Git => "gtcm",
-        Vcs::Hg => "hgcm",
-        Vcs::Svn => return Ok(()),
+    let Some(hash_type) = sanity_hash_type(vcs) else {
+        return Ok(());
     };
     if !bundle.has_base_revision() || has_local_commit {
         return Ok(());
     }
     let base = bundle.base_revision.clone().unwrap_or_default();
-    let source_base = match vcs {
-        Vcs::Git => git::working_copy_revision(dir)?,
-        Vcs::Hg => hg::stdout_text_with(
-            dir,
-            &backends.hg,
-            &["log", "-r", ".", "--template", "{node}"],
-        )?,
-        Vcs::Svn => return Ok(()),
-    };
-    let mut bundle_str = base.clone();
-    let mut source_str = source_base.clone();
-    if let Some(call) = call {
-        if let Some(suffix) = revision_suffix_for_hash(call, hash_type, &base) {
-            bundle_str.push_str(&suffix);
-        }
-        if let Some(suffix) = revision_suffix_for_hash(call, hash_type, &source_base) {
-            source_str.push_str(&suffix);
-        }
-    }
+    let source_base = working_source_revision(dir, vcs, backends)?;
+    let bundle_str = suffixed_revision(call, hash_type, &base);
+    let source_str = suffixed_revision(call, hash_type, &source_base);
     let query = format!(
         "This diff is against commit {bundle_str}, but the commit is nowhere in the working \
          copy. Try to apply it against the current working copy state? ({source_str})"
@@ -2682,6 +2784,46 @@ pub fn sanity_check(
         return Err(land::ABORT.to_string());
     }
     Ok(())
+}
+
+/// Commit-hash query key for the sanity check (`None` under svn, which has
+/// no local commits to check).
+fn sanity_hash_type(vcs: Vcs) -> Option<&'static str> {
+    match vcs {
+        Vcs::Git => Some("gtcm"),
+        Vcs::Hg => Some("hgcm"),
+        Vcs::Svn => None,
+    }
+}
+
+/// Current working-copy revision (git `HEAD` or the hg `.` node).
+fn working_source_revision(dir: &Path, vcs: Vcs, backends: &Backends) -> Result<String, String> {
+    match vcs {
+        Vcs::Git => git::working_copy_revision(dir),
+        Vcs::Hg => hg::stdout_text_with(
+            dir,
+            &backends.hg,
+            &["log", "-r", ".", "--template", "{node}"],
+        ),
+        // Unreachable: svn returns early via [`sanity_hash_type`].
+        Vcs::Svn => Ok(String::new()),
+    }
+}
+
+/// A commit hash plus its ` \ D123` suffix when Conduit reports a closed
+/// revision for it.
+fn suffixed_revision(
+    call: Option<&diff_submit::ConduitCall<'_>>,
+    hash_type: &str,
+    hash: &str,
+) -> String {
+    let mut text = hash.to_string();
+    if let Some(call) = call
+        && let Some(suffix) = revision_suffix_for_hash(call, hash_type, hash)
+    {
+        text.push_str(&suffix);
+    }
+    text
 }
 
 /// Exact `$EDITOR` template for patch commit messages
@@ -3375,55 +3517,112 @@ fn parse_svn_section(section: &str) -> Vec<SvnChange> {
         file_type: FILE_TEXT,
         ..SvnChange::default()
     };
-    let mut old_mode: Option<String> = None;
-    let mut new_mode: Option<String> = None;
-    let mut rename_from: Option<String> = None;
-    let mut rename_to: Option<String> = None;
-    let mut copy_from: Option<String> = None;
-    let mut copy_to: Option<String> = None;
-    let mut is_new = false;
-    let mut is_deleted = false;
-    let mut is_binary = false;
-    let mut body_start: Option<usize> = None;
+    let (headers, body_start) = parse_svn_section_headers(&lines, &mut change);
+    svn_section_fallback_paths(&lines, &mut change);
+    change.hunks = svn_section_body(&lines, body_start, headers.is_binary);
+    svn_section_modes(&mut change, &headers);
+    svn_section_symlink(&mut change);
+    svn_section_classify(change, &headers)
+}
+
+/// Parsed `diff --git` section headers (before the first `@@`).
+#[derive(Debug, Default)]
+struct SvnSectionHeaders {
+    old_mode: Option<String>,
+    new_mode: Option<String>,
+    rename_from: Option<String>,
+    rename_to: Option<String>,
+    copy_from: Option<String>,
+    copy_to: Option<String>,
+    is_new: bool,
+    is_deleted: bool,
+    is_binary: bool,
+}
+
+/// Parse the section headers, filling `---`/`+++` paths into `change`.
+/// Returns the headers plus the first `@@` line index, if any.
+fn parse_svn_section_headers(
+    lines: &[&str],
+    change: &mut SvnChange,
+) -> (SvnSectionHeaders, Option<usize>) {
+    let mut headers = SvnSectionHeaders::default();
+    let mut body_start = None;
     for (index, line) in lines.iter().enumerate() {
         if line.starts_with("@@") {
             body_start = Some(index);
             break;
         }
-        if let Some(rest) = line.strip_prefix("new file mode ") {
-            is_new = true;
-            new_mode = Some(rest.to_string());
-        } else if let Some(rest) = line.strip_prefix("deleted file mode ") {
-            is_deleted = true;
-            old_mode = Some(rest.to_string());
-        } else if let Some(rest) = line.strip_prefix("old mode ") {
-            old_mode = Some(rest.to_string());
-        } else if let Some(rest) = line.strip_prefix("new mode ") {
-            new_mode = Some(rest.to_string());
-        } else if let Some(rest) = line.strip_prefix("rename from ") {
-            rename_from = Some(unquote_git_path(rest));
-        } else if let Some(rest) = line.strip_prefix("rename to ") {
-            rename_to = Some(unquote_git_path(rest));
-        } else if let Some(rest) = line.strip_prefix("copy from ") {
-            copy_from = Some(unquote_git_path(rest));
-        } else if let Some(rest) = line.strip_prefix("copy to ") {
-            copy_to = Some(unquote_git_path(rest));
-        } else if let Some(rest) = line.strip_prefix("--- ") {
-            let path = rest.split('\t').next().unwrap_or("");
-            if path != "/dev/null" {
-                change.old_path = Some(strip_git_prefix(path));
-            }
-        } else if let Some(rest) = line.strip_prefix("+++ ") {
-            let path = rest.split('\t').next().unwrap_or("");
-            if path != "/dev/null" {
-                change.current_path = Some(strip_git_prefix(path));
-            }
-        } else if line.starts_with("Binary files ") || line.starts_with("GIT binary patch") {
-            is_binary = true;
+        if apply_svn_mode_line(&mut headers, line) {
+            continue;
+        }
+        if apply_svn_copy_line(&mut headers, line) {
+            continue;
+        }
+        if apply_svn_path_line(change, line) {
+            continue;
+        }
+        if line.starts_with("Binary files ") || line.starts_with("GIT binary patch") {
+            headers.is_binary = true;
         }
     }
-    // Fall back to the `diff --git` line when `---`/`+++` are missing
-    // (mode-only changes).
+    (headers, body_start)
+}
+
+/// Apply one mode header line; true when the line was a mode header.
+fn apply_svn_mode_line(headers: &mut SvnSectionHeaders, line: &str) -> bool {
+    if let Some(rest) = line.strip_prefix("new file mode ") {
+        headers.is_new = true;
+        headers.new_mode = Some(rest.to_string());
+    } else if let Some(rest) = line.strip_prefix("deleted file mode ") {
+        headers.is_deleted = true;
+        headers.old_mode = Some(rest.to_string());
+    } else if let Some(rest) = line.strip_prefix("old mode ") {
+        headers.old_mode = Some(rest.to_string());
+    } else if let Some(rest) = line.strip_prefix("new mode ") {
+        headers.new_mode = Some(rest.to_string());
+    } else {
+        return false;
+    }
+    true
+}
+
+/// Apply one rename/copy header line; true when the line matched.
+fn apply_svn_copy_line(headers: &mut SvnSectionHeaders, line: &str) -> bool {
+    if let Some(rest) = line.strip_prefix("rename from ") {
+        headers.rename_from = Some(unquote_git_path(rest));
+    } else if let Some(rest) = line.strip_prefix("rename to ") {
+        headers.rename_to = Some(unquote_git_path(rest));
+    } else if let Some(rest) = line.strip_prefix("copy from ") {
+        headers.copy_from = Some(unquote_git_path(rest));
+    } else if let Some(rest) = line.strip_prefix("copy to ") {
+        headers.copy_to = Some(unquote_git_path(rest));
+    } else {
+        return false;
+    }
+    true
+}
+
+/// Apply one `---`/`+++` path line into `change`; true when matched.
+fn apply_svn_path_line(change: &mut SvnChange, line: &str) -> bool {
+    if let Some(rest) = line.strip_prefix("--- ") {
+        let path = rest.split('\t').next().unwrap_or("");
+        if path != "/dev/null" {
+            change.old_path = Some(strip_git_prefix(path));
+        }
+    } else if let Some(rest) = line.strip_prefix("+++ ") {
+        let path = rest.split('\t').next().unwrap_or("");
+        if path != "/dev/null" {
+            change.current_path = Some(strip_git_prefix(path));
+        }
+    } else {
+        return false;
+    }
+    true
+}
+
+/// Fall back to the `diff --git` line when `---`/`+++` are missing
+/// (mode-only changes).
+fn svn_section_fallback_paths(lines: &[&str], change: &mut SvnChange) {
     if change.old_path.is_none()
         && change.current_path.is_none()
         && let Some(header) = lines.first()
@@ -3432,6 +3631,11 @@ fn parse_svn_section(section: &str) -> Vec<SvnChange> {
         change.old_path = Some(strip_git_prefix(&old));
         change.current_path = Some(strip_git_prefix(&new));
     }
+}
+
+/// Collect the hunk body (everything from the first `@@` on), dropping it
+/// for binary sections.
+fn svn_section_body(lines: &[&str], body_start: Option<usize>, is_binary: bool) -> String {
     let mut body = match body_start {
         Some(start) => lines[start..].join("\n"),
         None => String::new(),
@@ -3441,13 +3645,21 @@ fn parse_svn_section(section: &str) -> Vec<SvnChange> {
     } else if !body.is_empty() && !body.ends_with('\n') {
         body.push('\n');
     }
-    change.hunks = body;
-    if let Some(mode) = old_mode {
+    body
+}
+
+/// Record parsed modes as `unix:filemode` properties.
+fn svn_section_modes(change: &mut SvnChange, headers: &SvnSectionHeaders) {
+    if let Some(mode) = headers.old_mode.clone() {
         change.old_props.insert("unix:filemode".to_string(), mode);
     }
-    if let Some(mode) = new_mode {
+    if let Some(mode) = headers.new_mode.clone() {
         change.new_props.insert("unix:filemode".to_string(), mode);
     }
+}
+
+/// Mark `120000`-mode changes as symlinks, resolving the target.
+fn svn_section_symlink(change: &mut SvnChange) {
     if change
         .new_props
         .get("unix:filemode")
@@ -3460,32 +3672,55 @@ fn parse_svn_section(section: &str) -> Vec<SvnChange> {
         change.file_type = FILE_SYMLINK;
         change.symlink_target = symlink_target_from_hunks(FILE_SYMLINK, &change.hunks);
     }
-    if is_new {
+}
+
+/// Classify the change type from the headers, expanding renames into a
+/// `MOVE_AWAY` plus a `MOVE_HERE`.
+fn svn_section_classify(mut change: SvnChange, headers: &SvnSectionHeaders) -> Vec<SvnChange> {
+    if headers.is_new {
         change.change_type = TYPE_ADD;
         change.old_path = None;
-    } else if is_deleted {
+    } else if headers.is_deleted {
         change.change_type = TYPE_DELETE;
         change.current_path = None;
-    } else if rename_from.is_some() || rename_to.is_some() {
-        let old = rename_from.or_else(|| change.old_path.clone());
-        let new = rename_to.or_else(|| change.current_path.clone());
-        let mut away = SvnChange {
-            change_type: TYPE_MOVE_AWAY,
-            file_type: change.file_type,
-            current_path: old.clone(),
-            ..SvnChange::default()
-        };
-        away.old_path = old.clone();
-        change.change_type = TYPE_MOVE_HERE;
-        change.old_path = old;
-        change.current_path = new;
-        return vec![away, change];
-    } else if copy_from.is_some() || copy_to.is_some() {
+    } else if headers.rename_from.is_some() || headers.rename_to.is_some() {
+        return svn_section_rename(change, headers);
+    } else if headers.copy_from.is_some() || headers.copy_to.is_some() {
         change.change_type = TYPE_COPY_HERE;
-        change.old_path = copy_from.or_else(|| change.old_path.clone());
-        change.current_path = copy_to.or_else(|| change.current_path.clone());
+        change.old_path = headers
+            .copy_from
+            .clone()
+            .or_else(|| change.old_path.clone());
+        change.current_path = headers
+            .copy_to
+            .clone()
+            .or_else(|| change.current_path.clone());
     }
     vec![change]
+}
+
+/// Expand a rename into a `MOVE_AWAY` (deleted old path) plus a `MOVE_HERE`.
+fn svn_section_rename(change: SvnChange, headers: &SvnSectionHeaders) -> Vec<SvnChange> {
+    let mut change = change;
+    let old = headers
+        .rename_from
+        .clone()
+        .or_else(|| change.old_path.clone());
+    let new = headers
+        .rename_to
+        .clone()
+        .or_else(|| change.current_path.clone());
+    let mut away = SvnChange {
+        change_type: TYPE_MOVE_AWAY,
+        file_type: change.file_type,
+        current_path: old.clone(),
+        ..SvnChange::default()
+    };
+    away.old_path = old.clone();
+    change.change_type = TYPE_MOVE_HERE;
+    change.old_path = old;
+    change.current_path = new;
+    vec![away, change]
 }
 
 /// Render one svn change as a `-p0` unified diff
@@ -3580,99 +3815,187 @@ pub fn apply_svn(
     run_touch: &mut dyn FnMut(&str) -> Result<(), String>,
     run_link: &mut dyn FnMut(&str, &str) -> Result<(), String>,
 ) -> Result<SvnOutcome, String> {
-    let mut copies: Vec<(String, String)> = Vec::new();
-    let mut deletes: Vec<String> = Vec::new();
-    let mut patches: Vec<(String, String)> = Vec::new();
-    let mut propset: Vec<(String, String, Option<String>)> = Vec::new();
-    let mut adds: Vec<String> = Vec::new();
-    let mut symlinks: Vec<&SvnChange> = Vec::new();
+    let plan = plan_svn_changes(dir, changes, io)?;
+    create_svn_parents(dir, svn, &plan)?;
+    run_svn_copies_deletes(dir, svn, &plan)?;
+    run_svn_symlinks(&plan.symlinks, run_link)?;
+    let patch_err = run_svn_patches(&plan, io, run_patch, run_touch)?;
+    run_svn_adds_props(dir, svn, &plan)?;
+    if !patch_err {
+        io.push_out("** OKAY ** Successfully applied patch to the working copy.\n");
+        return Ok(SvnOutcome::Applied);
+    }
+    io.push_out(
+        "\n\n** WARNING ** Some hunks could not be applied cleanly by the unix 'patch' utility. \
+         Your working copy may be different from the revision's base, or you may be in the wrong \
+         subdirectory. You can export the raw patch file using 'arc export --unified', and then \
+         try to apply it by fiddling with options to 'patch' (particularly, -p), or manually. \
+         The output above, from 'patch', may be helpful in figuring out what went wrong.\n",
+    );
+    Ok(SvnOutcome::HunksFailed)
+}
+
+/// Collected svn apply operations.
+#[derive(Debug, Default)]
+struct SvnPlan {
+    copies: Vec<(String, String)>,
+    deletes: Vec<String>,
+    patches: Vec<(String, String)>,
+    propset: Vec<(String, String, Option<String>)>,
+    adds: Vec<String>,
+    symlinks: Vec<SvnChange>,
+}
+
+/// Collect copies/deletes/patches/propsets/adds/symlinks for the svn flow,
+/// prompting before skipping missing delete/copy sources.
+fn plan_svn_changes(dir: &Path, changes: &[SvnChange], io: &mut Io) -> Result<SvnPlan, String> {
+    let mut plan = SvnPlan::default();
     for change in changes {
-        let mut should_patch = true;
-        if change.file_type == FILE_SYMLINK {
+        plan_one_svn_change(dir, change, io, &mut plan)?;
+    }
+    Ok(plan)
+}
+
+/// Collect the operations for one change.
+fn plan_one_svn_change(
+    dir: &Path,
+    change: &SvnChange,
+    io: &mut Io,
+    plan: &mut SvnPlan,
+) -> Result<(), String> {
+    let mut should_patch = true;
+    if change.file_type == FILE_SYMLINK {
+        should_patch = false;
+        plan.symlinks.push(change.clone());
+    }
+    match change.change_type {
+        x if x == TYPE_MOVE_AWAY || x == TYPE_MULTICOPY || x == TYPE_DELETE => {
+            plan_svn_delete(dir, change, io, plan)?;
             should_patch = false;
-            symlinks.push(change);
         }
-        match change.change_type {
-            x if x == TYPE_MOVE_AWAY || x == TYPE_MULTICOPY || x == TYPE_DELETE => {
-                let path = change.current_path.clone().unwrap_or_default();
-                if !dir.join(&path).exists() {
-                    let query = format!(
-                        "Patch deletes file '{path}', but the file does not exist in the working \
-                         copy. Continue anyway?"
-                    );
-                    if !land::console_confirm(io, &query, true)? {
-                        return Err(land::ABORT.to_string());
-                    }
-                } else {
-                    deletes.push(path);
-                }
-                should_patch = false;
-            }
-            x if x == TYPE_COPY_HERE || x == TYPE_MOVE_HERE => {
-                let path = change.old_path.clone().unwrap_or_default();
-                if !dir.join(&path).exists() {
-                    let current = change.current_path.clone().unwrap_or_default();
-                    let verbs = if change.change_type == TYPE_COPY_HERE {
-                        "copies"
-                    } else {
-                        "moves"
-                    };
-                    let query = format!(
-                        "Patch {verbs} '{path}' to '{current}', but source path does not exist \
-                         in the working copy. Continue anyway?"
-                    );
-                    if !land::console_confirm(io, &query, true)? {
-                        return Err(land::ABORT.to_string());
-                    }
-                } else {
-                    copies.push((path, change.current_path.clone().unwrap_or_default()));
-                }
-            }
-            x if x == TYPE_ADD => {
-                adds.push(change.current_path.clone().unwrap_or_default());
-            }
-            _ => {}
+        x if x == TYPE_COPY_HERE || x == TYPE_MOVE_HERE => {
+            plan_svn_copy(dir, change, io, plan)?;
         }
-        if should_patch {
-            let path = change.current_path.clone().unwrap_or_default();
-            patches.push((path.clone(), unified_for_svn(change)));
-            let mut keys: Vec<String> = change.old_props.keys().cloned().collect();
-            for key in change.new_props.keys() {
-                if !keys.contains(key) {
-                    keys.push(key.clone());
-                }
-            }
-            for key in keys {
-                if change.old_props.get(&key) != change.new_props.get(&key) {
-                    propset.push((
-                        path.clone(),
-                        key.clone(),
-                        change.new_props.get(&key).cloned(),
-                    ));
-                }
-            }
+        x if x == TYPE_ADD => {
+            plan.adds
+                .push(change.current_path.clone().unwrap_or_default());
+        }
+        _ => {}
+    }
+    if should_patch {
+        plan_svn_patch(change, plan);
+    }
+    Ok(())
+}
+
+/// Plan a delete, prompting when the file is already missing.
+fn plan_svn_delete(
+    dir: &Path,
+    change: &SvnChange,
+    io: &mut Io,
+    plan: &mut SvnPlan,
+) -> Result<(), String> {
+    let path = change.current_path.clone().unwrap_or_default();
+    if !dir.join(&path).exists() {
+        let query = format!(
+            "Patch deletes file '{path}', but the file does not exist in the working \
+             copy. Continue anyway?"
+        );
+        if !land::console_confirm(io, &query, true)? {
+            return Err(land::ABORT.to_string());
+        }
+    } else {
+        plan.deletes.push(path);
+    }
+    Ok(())
+}
+
+/// Plan a copy/move, prompting when the source path is missing.
+fn plan_svn_copy(
+    dir: &Path,
+    change: &SvnChange,
+    io: &mut Io,
+    plan: &mut SvnPlan,
+) -> Result<(), String> {
+    let path = change.old_path.clone().unwrap_or_default();
+    if !dir.join(&path).exists() {
+        let current = change.current_path.clone().unwrap_or_default();
+        let verbs = if change.change_type == TYPE_COPY_HERE {
+            "copies"
+        } else {
+            "moves"
+        };
+        let query = format!(
+            "Patch {verbs} '{path}' to '{current}', but source path does not exist \
+             in the working copy. Continue anyway?"
+        );
+        if !land::console_confirm(io, &query, true)? {
+            return Err(land::ABORT.to_string());
+        }
+    } else {
+        plan.copies
+            .push((path, change.current_path.clone().unwrap_or_default()));
+    }
+    Ok(())
+}
+
+/// Plan the per-file unified diff and property changes for one change.
+fn plan_svn_patch(change: &SvnChange, plan: &mut SvnPlan) {
+    let path = change.current_path.clone().unwrap_or_default();
+    plan.patches.push((path.clone(), unified_for_svn(change)));
+    let mut keys: Vec<String> = change.old_props.keys().cloned().collect();
+    for key in change.new_props.keys() {
+        if !keys.contains(key) {
+            keys.push(key.clone());
         }
     }
-    for (_, dst) in &copies {
+    for key in keys {
+        if change.old_props.get(&key) != change.new_props.get(&key) {
+            plan.propset.push((
+                path.clone(),
+                key.clone(),
+                change.new_props.get(&key).cloned(),
+            ));
+        }
+    }
+}
+
+/// Create parent directories for every copy destination, patch path, and
+/// added path.
+fn create_svn_parents(dir: &Path, svn: &svn::SvnCommand, plan: &SvnPlan) -> Result<(), String> {
+    for (_, dst) in &plan.copies {
         svn_create_parents(dir, svn, dst)?;
     }
-    for (path, _) in &patches {
+    for (path, _) in &plan.patches {
         svn_create_parents(dir, svn, path)?;
     }
-    for add in &adds {
+    for add in &plan.adds {
         svn_create_parents(dir, svn, add)?;
     }
-    for (src, dst) in &copies {
+    Ok(())
+}
+
+/// Run the `svn cp` and `svn rm` operations.
+fn run_svn_copies_deletes(dir: &Path, svn: &svn::SvnCommand, plan: &SvnPlan) -> Result<(), String> {
+    for (src, dst) in &plan.copies {
         svn::stdout_text_with(
             dir,
             svn,
             &["cp", &escape_svn_path(src), &escape_svn_path(dst)],
         )?;
     }
-    for delete in &deletes {
+    for delete in &plan.deletes {
         svn::stdout_text_with(dir, svn, &["rm", &escape_svn_path(delete)])?;
     }
-    for symlink in &symlinks {
+    Ok(())
+}
+
+/// Link added/changed symlinks.
+fn run_svn_symlinks(
+    symlinks: &[SvnChange],
+    run_link: &mut dyn FnMut(&str, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    for symlink in symlinks {
         match symlink.change_type {
             x if x == TYPE_ADD
                 || x == TYPE_CHANGE
@@ -3686,8 +4009,19 @@ pub fn apply_svn(
             _ => {}
         }
     }
+    Ok(())
+}
+
+/// Apply each per-file unified diff (`touch` when empty); returns whether
+/// any hunks failed.
+fn run_svn_patches(
+    plan: &SvnPlan,
+    io: &mut Io,
+    run_patch: PatchRunner<'_>,
+    run_touch: &mut dyn FnMut(&str) -> Result<(), String>,
+) -> Result<bool, String> {
     let mut patch_err = false;
-    for (path, patch) in &patches {
+    for (path, patch) in &plan.patches {
         if patch.is_empty() {
             if run_touch(path).is_err() {
                 patch_err = true;
@@ -3704,10 +4038,16 @@ pub fn apply_svn(
             }
         }
     }
-    for add in &adds {
+    Ok(patch_err)
+}
+
+/// Run the `svn add` and property operations (`unix:filemode` becomes
+/// `svn:executable`).
+fn run_svn_adds_props(dir: &Path, svn: &svn::SvnCommand, plan: &SvnPlan) -> Result<(), String> {
+    for add in &plan.adds {
         svn::stdout_text_with(dir, svn, &["add", &escape_svn_path(add)])?;
     }
-    for (path, prop, value) in &propset {
+    for (path, prop, value) in &plan.propset {
         let (prop, value) = svn_prop_mapping(prop, value.clone());
         match value {
             None => {
@@ -3722,18 +4062,7 @@ pub fn apply_svn(
             }
         }
     }
-    if !patch_err {
-        io.push_out("** OKAY ** Successfully applied patch to the working copy.\n");
-        return Ok(SvnOutcome::Applied);
-    }
-    io.push_out(
-        "\n\n** WARNING ** Some hunks could not be applied cleanly by the unix 'patch' utility. \
-         Your working copy may be different from the revision's base, or you may be in the wrong \
-         subdirectory. You can export the raw patch file using 'arc export --unified', and then \
-         try to apply it by fiddling with options to 'patch' (particularly, -p), or manually. \
-         The output above, from 'patch', may be helpful in figuring out what went wrong.\n",
-    );
-    Ok(SvnOutcome::HunksFailed)
+    Ok(())
 }
 
 /// Map an svn property change: `unix:filemode` becomes `svn:executable`
@@ -3831,40 +4160,60 @@ pub fn load_bundle(
     call: Option<&diff_submit::ConduitCall<'_>>,
 ) -> Result<LoadedBundle, String> {
     match source {
-        Source::Named(id) | Source::Revision(id) => {
-            let call = require_call(call)?;
-            let revision_id = id
-                .parse::<u64>()
-                .map_err(|_| format!("invalid revision '{id}': expected D12345"))?;
-            Ok(LoadedBundle {
-                bundle: fetch_revision_bundle(call, revision_id)?,
-                arcbundle_dicts: None,
-            })
-        }
-        Source::Diff(id) => {
-            let call = require_call(call)?;
-            let diff_id = id
-                .parse::<u64>()
-                .map_err(|_| format!("invalid diff '{id}': expected D12345"))?;
-            Ok(LoadedBundle {
-                bundle: fetch_diff_bundle(call, diff_id)?,
-                arcbundle_dicts: None,
-            })
-        }
+        Source::Named(id) | Source::Revision(id) => load_revision_source_bundle(id, call),
+        Source::Diff(id) => load_diff_source_bundle(id, call),
         Source::Arcbundle(path) => {
-            require_call(call)?;
-            let (bundle, dicts, corpora) =
-                load_arcbundle_with_dicts(path, options.encoding.as_deref())?;
-            Ok(LoadedBundle {
-                bundle,
-                arcbundle_dicts: Some((dicts, corpora)),
-            })
+            load_arcbundle_source_bundle(path, options.encoding.as_deref(), call)
         }
         Source::Patch(path) => Ok(LoadedBundle {
             bundle: load_file_bundle(path, options.encoding.as_deref(), io)?,
             arcbundle_dicts: None,
         }),
     }
+}
+
+/// Load the bundle for a `--revision` / positional `D123` source.
+fn load_revision_source_bundle(
+    id: &str,
+    call: Option<&diff_submit::ConduitCall<'_>>,
+) -> Result<LoadedBundle, String> {
+    let call = require_call(call)?;
+    let revision_id = id
+        .parse::<u64>()
+        .map_err(|_| format!("invalid revision '{id}': expected D12345"))?;
+    Ok(LoadedBundle {
+        bundle: fetch_revision_bundle(call, revision_id)?,
+        arcbundle_dicts: None,
+    })
+}
+
+/// Load the bundle for a `--diff` source.
+fn load_diff_source_bundle(
+    id: &str,
+    call: Option<&diff_submit::ConduitCall<'_>>,
+) -> Result<LoadedBundle, String> {
+    let call = require_call(call)?;
+    let diff_id = id
+        .parse::<u64>()
+        .map_err(|_| format!("invalid diff '{id}': expected D12345"))?;
+    Ok(LoadedBundle {
+        bundle: fetch_diff_bundle(call, diff_id)?,
+        arcbundle_dicts: None,
+    })
+}
+
+/// Load the bundle plus raw change dicts for an `--arcbundle` source.
+fn load_arcbundle_source_bundle(
+    path: &str,
+    encoding: Option<&str>,
+    call: Option<&diff_submit::ConduitCall<'_>>,
+) -> Result<LoadedBundle, String> {
+    require_call(call)?;
+    let (bundle, dicts, corpora) = load_arcbundle_with_dicts(path, encoding)?;
+    Ok(LoadedBundle {
+        bundle,
+        arcbundle_dicts: Some((dicts, corpora)),
+    })
 }
 
 /// Require an authenticated Conduit call, or fail like the runner would
@@ -3889,30 +4238,14 @@ fn load_arcbundle_with_dicts(
 ) -> Result<ArcbundleWithDicts, String> {
     let bundle = load_arcbundle(path, encoding)?;
     let members = tar_list(path)?;
-    let meta = if members.iter().any(|member| member == "meta.json") {
-        parse_bundle_meta(&tar_extract(path, "meta.json")?)
-    } else {
-        BundleMeta::default()
-    };
+    let meta = arcbundle_meta(path, &members)?;
     let raw = tar_extract(path, "changes.json")?;
     let dicts: Vec<serde_json::Value> = serde_json::from_slice(&raw)
         .map_err(|e| format!("failed to read arcbundle '{path}': {e}"))?;
     let decode_as = encoding.or(meta.encoding.as_deref());
     let mut corpora = Vec::new();
     for dict in &dicts {
-        let mut hunks = Vec::new();
-        if let Some(items) = dict.get("hunks").and_then(|v| v.as_array()) {
-            for hunk in items {
-                let index = hunk.get("corpus").and_then(|v| v.as_u64()).ok_or_else(|| {
-                    format!("failed to read arcbundle '{path}': hunk corpus is not an index")
-                })?;
-                hunks.push(decode_bytes(
-                    &tar_extract(path, &format!("hunks/{index}"))?,
-                    decode_as,
-                ));
-            }
-        }
-        corpora.push(hunks);
+        corpora.push(arcbundle_corpora(path, dict, decode_as)?);
     }
     Ok((bundle, dicts, corpora))
 }
@@ -4054,20 +4387,53 @@ pub fn plan_dependency_children_with(
     let Some(start_id) = bundle.revision_id else {
         return Ok(Vec::new());
     };
-    let hash_key = match vcs {
-        Vcs::Git => "gtcm",
-        Vcs::Hg => "hgcm",
-        Vcs::Svn => return Ok(Vec::new()),
+    let Some(hash_key) = dependency_hash_key(vcs) else {
+        return Ok(Vec::new());
     };
-    let has_local = |hash: Option<&str>| match vcs {
-        Vcs::Git => git::has_local_commit(dir, hash),
-        _ => hash.is_some_and(|hash| hg::ok_with(dir, &backends.hg, &["log", "-r", hash])),
-    };
-    let (nodes, start_phid) = load_dependency_nodes(call, start_id, &has_local, hash_key)?;
+    let (nodes, start_phid) = load_dependency_nodes(
+        call,
+        start_id,
+        &|hash: Option<&str>| dependency_is_local(dir, vcs, backends, hash),
+        hash_key,
+    )?;
     if nodes.is_empty() {
         return Ok(Vec::new());
     }
-    let (order, cyclic) = order_dependencies(&nodes);
+    let (phids, cyclic) = order_dependency_phids(&nodes);
+    if !confirm_dependency_cycle(io, cyclic)? {
+        return Ok(Vec::new());
+    }
+    let monograms = fetch_dependency_monograms(call, &phids)?;
+    Ok(build_dependency_children(
+        options,
+        &phids,
+        &start_phid,
+        &monograms,
+    ))
+}
+
+/// Commit-hash query key for dependency pruning (`None` under svn, which
+/// never applies dependencies).
+fn dependency_hash_key(vcs: Vcs) -> Option<&'static str> {
+    match vcs {
+        Vcs::Git => Some("gtcm"),
+        Vcs::Hg => Some("hgcm"),
+        Vcs::Svn => None,
+    }
+}
+
+/// True when the commit for `hash` is already local.
+fn dependency_is_local(dir: &Path, vcs: Vcs, backends: &Backends, hash: Option<&str>) -> bool {
+    match vcs {
+        Vcs::Git => git::has_local_commit(dir, hash),
+        _ => hash.is_some_and(|hash| hg::ok_with(dir, &backends.hg, &["log", "-r", hash])),
+    }
+}
+
+/// Order dependency PHIDs parents-first (discovery order on cycles),
+/// reporting whether the graph is cyclic.
+fn order_dependency_phids(nodes: &[DependencyNode]) -> (Vec<String>, bool) {
+    let (order, cyclic) = order_dependencies(nodes);
     let phids: Vec<String> = if cyclic {
         nodes.iter().map(|node| node.phid.clone()).collect()
     } else {
@@ -4076,13 +4442,25 @@ pub fn plan_dependency_children_with(
             .map(|index| nodes[*index].phid.clone())
             .collect()
     };
-    if cyclic {
-        let issue = "The dependencies for this patch have a cycle. Applying them is not \
-             guaranteed to work. Continue anyway?";
-        if !land::console_confirm(io, issue, true)? {
-            return Ok(Vec::new());
-        }
+    (phids, cyclic)
+}
+
+/// Confirm past a dependency cycle (true when acyclic); declining means
+/// silently skipping the dependencies.
+fn confirm_dependency_cycle(io: &mut Io, cyclic: bool) -> Result<bool, String> {
+    if !cyclic {
+        return Ok(true);
     }
+    let issue = "The dependencies for this patch have a cycle. Applying them is not \
+         guaranteed to work. Continue anyway?";
+    land::console_confirm(io, issue, true)
+}
+
+/// Resolve dependency PHIDs to `D123` monograms via `differential.query`.
+fn fetch_dependency_monograms(
+    call: &diff_submit::ConduitCall<'_>,
+    phids: &[String],
+) -> Result<std::collections::HashMap<String, String>, String> {
     let result = call(
         diff_submit::METHOD_QUERY,
         &serde_json::json!({"phids": phids}),
@@ -4097,9 +4475,21 @@ pub fn plan_dependency_children_with(
             monograms.insert(phid.to_string(), format!("D{id}"));
         }
     }
+    Ok(monograms)
+}
+
+/// Build one child option set per non-start dependency:
+/// `--force --skip-dependencies --nobranch` (plus `--nocommit` when the
+/// parent would not commit).
+fn build_dependency_children(
+    options: &Options,
+    phids: &[String],
+    start_phid: &str,
+    monograms: &std::collections::HashMap<String, String>,
+) -> Vec<Options> {
     let mut children = Vec::new();
-    for phid in &phids {
-        if *phid == start_phid {
+    for phid in phids {
+        if phid.as_str() == start_phid {
             continue;
         }
         let Some(monogram) = monograms.get(phid) else {
@@ -4115,7 +4505,7 @@ pub fn plan_dependency_children_with(
             ..Options::default()
         });
     }
-    Ok(children)
+    children
 }
 
 /// Apply revision dependencies oldest-first (`applyDependencies()`,
@@ -4220,13 +4610,68 @@ fn run_patch_flow_inner(
         .as_ref()
         .map(|_| &call as &dyn Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>);
     let loaded = load_bundle(source, options, io, call_option)?;
-    let bundle = loaded.bundle;
-    let has_base_local = ensure_base_present_with(dir, vcs, &bundle, io, backends)?;
-    let branch = maybe_create_branch(dir, vcs, backends, &bundle, options, io, has_base_local)?;
-    if !has_base_local && should_apply_dependencies(&bundle, options, vcs) {
+    let has_base_local = ensure_base_present_with(dir, vcs, &loaded.bundle, io, backends)?;
+    let branch = maybe_create_branch(
+        dir,
+        vcs,
+        backends,
+        &loaded.bundle,
+        options,
+        io,
+        has_base_local,
+    )?;
+    run_patch_dependencies(
+        dir,
+        options,
+        io,
+        backends,
+        &loaded.bundle,
+        vcs,
+        has_base_local,
+        call_option,
+    )?;
+    if !options.force {
+        sanity_check(
+            dir,
+            vcs,
+            backends,
+            io,
+            call_option,
+            &loaded.bundle,
+            has_base_local,
+        )?;
+    }
+    apply_patch_bundle(
+        dir,
+        options,
+        io,
+        backends,
+        &loaded.bundle,
+        loaded.arcbundle_dicts.as_ref(),
+        vcs,
+        &branch,
+        has_base_local,
+        call_option,
+    )
+}
+
+/// Apply revision dependencies oldest-first when the base is not local and
+/// the bundle/options/VCS call for it.
+#[allow(clippy::too_many_arguments)]
+fn run_patch_dependencies(
+    dir: &Path,
+    options: &Options,
+    io: &mut Io,
+    backends: &Backends,
+    bundle: &Bundle,
+    vcs: Vcs,
+    has_base_local: bool,
+    call_option: Option<&diff_submit::ConduitCall<'_>>,
+) -> Result<(), String> {
+    if !has_base_local && should_apply_dependencies(bundle, options, vcs) {
         let call_ref = call_option.expect("conduit for dependencies");
         let children =
-            plan_dependency_children_with(dir, vcs, &bundle, options, io, call_ref, backends)?;
+            plan_dependency_children_with(dir, vcs, bundle, options, io, call_ref, backends)?;
         for child_options in &children {
             match run_patch_flow(dir, child_options, io, backends)? {
                 FlowOutcome::Done => {}
@@ -4234,14 +4679,28 @@ fn run_patch_flow_inner(
             }
         }
     }
-    if !options.force {
-        sanity_check(dir, vcs, backends, io, call_option, &bundle, has_base_local)?;
-    }
+    Ok(())
+}
+
+/// Apply the loaded bundle under `vcs`.
+#[allow(clippy::too_many_arguments)]
+fn apply_patch_bundle(
+    dir: &Path,
+    options: &Options,
+    io: &mut Io,
+    backends: &Backends,
+    bundle: &Bundle,
+    arcbundle_dicts: Option<&(Vec<serde_json::Value>, Vec<Vec<String>>)>,
+    vcs: Vcs,
+    branch: &BranchState,
+    has_base_local: bool,
+    call_option: Option<&diff_submit::ConduitCall<'_>>,
+) -> Result<FlowOutcome, String> {
     match vcs {
         Vcs::Git => {
             apply_git(
                 dir,
-                &bundle,
+                bundle,
                 options,
                 io,
                 call_option,
@@ -4255,7 +4714,7 @@ fn run_patch_flow_inner(
             apply_hg(
                 dir,
                 &backends.hg,
-                &bundle,
+                bundle,
                 options,
                 io,
                 call_option,
@@ -4265,26 +4724,36 @@ fn run_patch_flow_inner(
             )?;
             Ok(FlowOutcome::Done)
         }
-        Vcs::Svn => {
-            let changes = match loaded.arcbundle_dicts {
-                Some((dicts, corpora)) => svn_changes_from_dicts(&dicts, &corpora),
-                None => parse_git_patch_for_svn(&bundle.text),
-            };
-            let outcome = apply_svn(
-                dir,
-                &backends.svn,
-                &changes,
-                io,
-                &mut |_, patch| run_patch_file(dir, patch),
-                &mut |path| run_touch_file(dir, path),
-                &mut |target, path| run_symlink(dir, target, path),
-            )?;
-            Ok(match outcome {
-                SvnOutcome::Applied => FlowOutcome::Done,
-                SvnOutcome::HunksFailed => FlowOutcome::SvnHunksFailed,
-            })
-        }
+        Vcs::Svn => apply_patch_svn(dir, backends, bundle, arcbundle_dicts, io),
     }
+}
+
+/// Apply the loaded bundle under svn, from arcbundle dicts (with decoded
+/// corpora) or parsed git-patch text.
+fn apply_patch_svn(
+    dir: &Path,
+    backends: &Backends,
+    bundle: &Bundle,
+    arcbundle_dicts: Option<&(Vec<serde_json::Value>, Vec<Vec<String>>)>,
+    io: &mut Io,
+) -> Result<FlowOutcome, String> {
+    let changes = match arcbundle_dicts {
+        Some((dicts, corpora)) => svn_changes_from_dicts(dicts, corpora),
+        None => parse_git_patch_for_svn(&bundle.text),
+    };
+    let outcome = apply_svn(
+        dir,
+        &backends.svn,
+        &changes,
+        io,
+        &mut |_, patch| run_patch_file(dir, patch),
+        &mut |path| run_touch_file(dir, path),
+        &mut |target, path| run_symlink(dir, target, path),
+    )?;
+    Ok(match outcome {
+        SvnOutcome::Applied => FlowOutcome::Done,
+        SvnOutcome::HunksFailed => FlowOutcome::SvnHunksFailed,
+    })
 }
 
 /// Run the workflow with scripted or live IO, returning collected output.
@@ -4309,29 +4778,34 @@ pub fn execute_with_io(
         Err(message) => return Err(format!("{message}\n\n{USAGE}")),
     };
     if options.preview {
-        let source = select_source(&options)?;
-        let client = match &source {
-            Source::Patch(_) => None,
-            _ => Some(land::client_for_dir(options.conduit_uri.as_deref(), dir)?),
-        };
-        let call = |method: &str, params: &serde_json::Value| {
-            client
-                .as_ref()
-                .expect("conduit client")
-                .call(method, params)
-                .map_err(|e| e.to_string())
-        };
-        let call_option: Option<&diff_submit::ConduitCall<'_>> = client.as_ref().map(|_| {
-            &call as &dyn Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>
-        });
-        let loaded = load_bundle(&source, &options, io, call_option)?;
-        io.push_out(&loaded.bundle.text);
-        return Ok(std::mem::take(&mut io.out));
+        return execute_preview(dir, &options, io);
     }
     match run_patch_flow(dir, &options, io, backends)? {
         FlowOutcome::Done => Ok(std::mem::take(&mut io.out)),
         FlowOutcome::SvnHunksFailed => Err(String::new()),
     }
+}
+
+/// Print the patch for `--preview` without touching the working copy.
+fn execute_preview(dir: &Path, options: &Options, io: &mut Io) -> Result<Out, String> {
+    let source = select_source(options)?;
+    let client = match &source {
+        Source::Patch(_) => None,
+        _ => Some(land::client_for_dir(options.conduit_uri.as_deref(), dir)?),
+    };
+    let call = |method: &str, params: &serde_json::Value| {
+        client
+            .as_ref()
+            .expect("conduit client")
+            .call(method, params)
+            .map_err(|e| e.to_string())
+    };
+    let call_option: Option<&diff_submit::ConduitCall<'_>> = client
+        .as_ref()
+        .map(|_| &call as &dyn Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>);
+    let loaded = load_bundle(&source, options, io, call_option)?;
+    io.push_out(&loaded.bundle.text);
+    Ok(std::mem::take(&mut io.out))
 }
 
 /// Run the workflow with scripted stdin patch text.
