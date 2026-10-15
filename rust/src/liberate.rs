@@ -20,10 +20,11 @@
 //! no libraries found, ancient or unknown library versions, declined
 //! prompts -- still exits 0 after reporting the error.
 //!
+//! The rebuild script ships in-tree under `support/` (restored from the
+//! PHP master); it is found by an upward `support/lib/rebuild-map.php`
+//! search instead of PHP's install-relative bundled path.
+//!
 //! Divergences:
-//! - The rebuild script is found by an upward `support/lib/rebuild-map.php`
-//!   search instead of the install-relative bundled path (arc-rs ships no
-//!   PHP runtime files).
 //! - A declined directory prompt fails with `cancelled: ...` instead of
 //!   the PHP prompt abort, and end-of-input while naming a library fails
 //!   instead of re-prompting forever.

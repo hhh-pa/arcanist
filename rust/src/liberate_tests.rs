@@ -187,6 +187,67 @@ fn finds_rebuild_script_upwards() {
     std::fs::remove_dir_all(&bare).ok();
 }
 
+/// Repo root above `rust/` (compile-time manifest dir), holding `support/`.
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("rust/ lives one level below the repo root")
+        .to_path_buf()
+}
+
+#[test]
+fn rebuild_script_ships_in_tree() {
+    // Temp-stub tests alone cannot catch a deleted script: assert the
+    // real `support/lib/rebuild-map.php` plus the bits it needs at
+    // runtime (the init bootstrap it requires, and the symbol extractor
+    // `PhutilLibraryMapBuilder` shells out to) ship in the source tree.
+    let root = repo_root();
+    let script = root.join("support/lib/rebuild-map.php");
+    assert!(script.is_file(), "missing {}", script.display());
+    let body = std::fs::read_to_string(&script).unwrap();
+    assert!(
+        body.contains("PhutilLibraryMapBuilder"),
+        "unexpected rebuild-map.php body"
+    );
+    assert!(body.contains("buildAndWriteMap"), "unexpected body");
+    assert!(root.join("support/init/init-script.php").is_file());
+    assert!(root.join("support/lib/extract-symbols.php").is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["rebuild-map.php", "extract-symbols.php"] {
+            let mode = std::fs::metadata(root.join("support/lib").join(name))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0o111, "{name} lost its exec bit");
+        }
+    }
+}
+
+#[test]
+fn finds_shipped_rebuild_script_from_tree() {
+    // The upward search resolves the SHIPPED script (not a temp stub)
+    // for libraries inside the checkout.
+    let root = repo_root();
+    let deep = root.join("rust").join("src");
+    assert_eq!(
+        find_rebuild_script(&deep, &deep),
+        Some(root.join("support/lib/rebuild-map.php"))
+    );
+}
+
+#[test]
+fn missing_script_stays_per_library_failure() {
+    // No script above a bare temp dir: per-library failure text (exit 0
+    // at the `run_in` layer, as in PHP where a failing passthru still
+    // returns 0 from `runWorkflow`).
+    let dir = scratch("noscript-msg");
+    let message = rebuild_map(&dir, false, None).expect("expected failure text");
+    assert!(message.contains("rebuild-map.php"), "{message}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn run_in_exits_zero_on_workflow_errors() {
     // PHP runWorkflow always returns 0: finding no libraries is
