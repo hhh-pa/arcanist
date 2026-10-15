@@ -294,9 +294,13 @@ func extractTarGz(archive, dest string) error {
 // archive entries, so it catches a link whose parent was itself
 // redirected out of the tree.
 func resolvesWithinDir(dir, path string) bool {
-	realDir, err := filepath.EvalSymlinks(dir)
+	// Resolve leniently too: dir may not exist yet (a link stored
+	// before any dir entry), and under a symlinked ancestor (macOS
+	// /tmp) a lexical fallback would never prefix-match the
+	// resolved candidate.
+	realDir, err := evalSymlinksLenient(dir)
 	if err != nil {
-		realDir = dir // dir is our own extraction root; fall back lexically
+		realDir = dir // unresolvable root; fall back lexically
 	}
 	resolved, err := evalSymlinksLenient(path)
 	if err != nil {

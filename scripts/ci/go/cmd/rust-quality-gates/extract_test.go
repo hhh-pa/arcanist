@@ -214,6 +214,7 @@ func TestExtractTarGzRejectsLinksThroughPlantedSymlink(t *testing.T) {
 	}{
 		{"link-location", tarEntry{name: "escape/link", linkname: "victim", flag: tar.TypeSymlink}, "symlink location escapes"},
 		{"link-target", tarEntry{name: "link", linkname: "escape/victim", flag: tar.TypeSymlink}, "symlink escapes"},
+		{"hardlink-location", tarEntry{name: "escape/hard", linkname: "orig.txt", flag: tar.TypeLink}, "hardlink location escapes"},
 		{"hardlink-target", tarEntry{name: "hard", linkname: "escape/victim", flag: tar.TypeLink}, "hardlink escapes"},
 	}
 	for _, c := range cases {
@@ -239,5 +240,61 @@ func TestExtractTarGzRejectsLinksThroughPlantedSymlink(t *testing.T) {
 				t.Fatalf("planted escape wrote outside dest: %v %v", left, readErr)
 			}
 		})
+	}
+}
+
+func TestExtractTarGzRejectsAbsoluteLinkThroughPlantedSymlink(t *testing.T) {
+	dir := t.TempDir()
+	outside := t.TempDir()
+	dest := filepath.Join(dir, "out")
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dest, "escape")); err != nil {
+		t.Skipf("symlink creation unavailable: %v", err)
+	}
+	// Absolute target under dest/escape: passes the lexical Clean
+	// check, so only real resolution can catch the redirect.
+	archive := filepath.Join(dir, "evil.tar.gz")
+	writeTar(t, archive, []tarEntry{{
+		name:     "link",
+		linkname: filepath.Join(dest, "escape", "victim"),
+		flag:     tar.TypeSymlink,
+	}})
+	err := extractTarGz(archive, dest)
+	if err == nil || !strings.Contains(err.Error(), "symlink escapes") {
+		t.Fatalf("err = %v, want %q", err, "symlink escapes")
+	}
+	left, readErr := os.ReadDir(outside)
+	if readErr != nil || len(left) != 0 {
+		t.Fatalf("planted escape wrote outside dest: %v %v", left, readErr)
+	}
+}
+
+func TestExtractTarGzKeepsFirstEntryLinkUnderSymlinkedAncestor(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(dir, "alias")
+	if err := os.Symlink(real, alias); err != nil {
+		t.Skipf("symlink creation unavailable: %v", err)
+	}
+	// Dest missing with a symlinked ancestor (macOS TMPDIR): the
+	// root and the candidate must resolve against the same real
+	// prefix or a valid link is falsely rejected.
+	dest := filepath.Join(alias, "out")
+	archive := filepath.Join(dir, "tool.tar.gz")
+	writeTar(t, archive, []tarEntry{
+		{name: "link", linkname: "target.txt", flag: tar.TypeSymlink},
+		{name: "target.txt", flag: tar.TypeReg, body: "data"},
+	})
+	if err := extractTarGz(archive, dest); err != nil {
+		t.Fatal(err)
+	}
+	blob, err := os.ReadFile(filepath.Join(dest, "link"))
+	if err != nil || string(blob) != "data" {
+		t.Fatalf("through link = %q, %v", blob, err)
 	}
 }
