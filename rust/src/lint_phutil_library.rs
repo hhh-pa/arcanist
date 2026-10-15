@@ -65,6 +65,14 @@ impl Linter for PhutilLibraryLinter {
         "PHL"
     }
 
+    fn cache_granularity(&self) -> u8 {
+        arc_rs::lint::GRANULARITY_GLOBAL
+    }
+
+    fn severity_lookup_code<'a>(&self, full_code: &'a str) -> &'a str {
+        full_code.strip_prefix("PHL").unwrap_or(full_code)
+    }
+
     fn priority(&self) -> f64 {
         2.0
     }

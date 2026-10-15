@@ -12,10 +12,10 @@
 //!
 //! Only `.js` files are examined; binary data (NUL byte) is skipped.
 //! Directories and symlinks are skipped by `Engine::lint_file` before bytes
-//! reach here. Linter configuration (`jshint.jshintrc`,
-//! `jshint.jshintignore`, custom `bin`/`flags`) is not supported. The tool
-//! lints a temp copy of the input, so config discovery relative to the
-//! source file does not apply.
+//! reach here. The `bin`, `flags`, `version`, `jshint.jshintrc`, and
+//! `jshint.jshintignore` linter options apply (N4). The tool lints a
+//! temp copy of the input, so config discovery relative to the source
+//! file does not apply.
 
 extern crate self as arc_rs;
 
@@ -23,7 +23,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arc_rs::lint::{LintMessage, Linter};
+use arc_rs::lint::{LintMessage, Linter, OptionContext};
+use arc_rs::lint_external::{ToolOptions, apply_tool_option, version_requirement_satisfied};
+use arc_rs::linters::version_pattern_for;
 
 /// Registry name, matching PHP `getLinterName()`.
 pub const LINTER_NAME: &str = "JSHint";
@@ -62,12 +64,15 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Default)]
 pub struct JshintLinter {
     binary: Option<PathBuf>,
+    options: ToolOptions,
+    jshintrc: Option<String>,
+    jshintignore: Option<String>,
 }
 
 impl JshintLinter {
     #[must_use]
     pub fn new() -> Self {
-        Self { binary: None }
+        Self::default()
     }
 
     /// Override the tool binary (mirrors PHP `setBinary()`); used by tests
@@ -76,6 +81,9 @@ impl JshintLinter {
     pub fn with_binary(path: &Path) -> Self {
         Self {
             binary: Some(path.to_path_buf()),
+            options: ToolOptions::default(),
+            jshintrc: None,
+            jshintignore: None,
         }
     }
 
@@ -83,7 +91,23 @@ impl JshintLinter {
         if let Some(path) = &self.binary {
             return path.is_file().then(|| path.clone());
         }
+        if let Some(path) = &self.options.bin {
+            return Some(path.clone());
+        }
         find_on_path(BINARY)
+    }
+
+    /// Effective tool flags (without the file): mandatory plus
+    /// configured-or-default, mirroring `getCommandFlags()`.
+    fn tool_flags(&self, reporter: &str) -> Vec<String> {
+        let mut mandatory = vec![format!("--reporter={reporter}")];
+        if let Some(jshintrc) = &self.jshintrc {
+            mandatory.push(format!("--config={jshintrc}"));
+        }
+        if let Some(jshintignore) = &self.jshintignore {
+            mandatory.push(format!("--exclude-path={jshintignore}"));
+        }
+        self.options.command_flags(&mandatory, &[])
     }
 }
 
@@ -99,6 +123,16 @@ impl Linter for JshintLinter {
         let Some(binary) = self.resolve_binary() else {
             return Vec::new();
         };
+        if let Some(requirement) = &self.options.version
+            && !version_requirement_satisfied(
+                version_pattern_for("jshint"),
+                &binary,
+                requirement,
+                "ArcanistJSHintLinter",
+            )
+        {
+            return Vec::new();
+        }
         let Some(input) = write_temp_file(SLUG, path, "js", data) else {
             return Vec::new();
         };
@@ -107,10 +141,8 @@ impl Linter for JshintLinter {
             std::fs::remove_file(&input).ok();
             return Vec::new();
         };
-        let args = vec![
-            format!("--reporter={}", reporter.display()),
-            input.display().to_string(),
-        ];
+        let mut args = self.tool_flags(&reporter.display().to_string());
+        args.push(input.display().to_string());
         let found =
             run_tool(&binary, &args).map_or_else(Vec::new, |out| {
                 match parse_reporter_output(path, &out.stdout) {
@@ -122,6 +154,41 @@ impl Linter for JshintLinter {
         std::fs::remove_file(&input).ok();
         std::fs::remove_file(&reporter).ok();
         found
+    }
+
+    fn set_option(
+        &mut self,
+        key: &str,
+        value: &serde_json::Value,
+        ctx: &OptionContext,
+    ) -> Result<(), String> {
+        if key == "jshint.jshintrc" || key == "jshint.jshintignore" {
+            let Some(text) = value.as_str() else {
+                return Err(format!("'{key}' must be a string"));
+            };
+            if key == "jshint.jshintrc" {
+                self.jshintrc = Some(text.to_string());
+            } else {
+                self.jshintignore = Some(text.to_string());
+            }
+            return Ok(());
+        }
+        apply_tool_option(&mut self.options, key, value, ctx.project_root)
+    }
+
+    fn validate_severity_code(&self, code: &str) -> Result<String, String> {
+        // `/^(E|W)\d+$/`, like PHP: raw codes, no brackets.
+        let bytes = code.as_bytes();
+        let ok = bytes.len() > 1
+            && matches!(bytes.first(), Some(b'E' | b'W'))
+            && bytes[1..].iter().all(|b| b.is_ascii_digit());
+        if ok {
+            return Ok(code.to_string());
+        }
+        Err(format!(
+            "Unrecognized lint message code \"{code}\". Expected a valid JSHint lint code like \
+             \"E033\" or \"W093\"."
+        ))
     }
 }
 

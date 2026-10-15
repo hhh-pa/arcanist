@@ -59,3 +59,21 @@ fn missing_binary_is_silent() {
 fn lookup_miss_reports_no_tool() {
     assert!(find_on_path("arc-rs-definitely-missing-tool").is_none());
 }
+
+#[test]
+fn severity_codes_are_raw_like_php() {
+    let linter = JshintLinter::new();
+    for code in ["E033", "W093"] {
+        assert_eq!(linter.validate_severity_code(code), Ok(code.to_string()));
+    }
+    for code in ["", "E", "C901", "[E033]", "e033"] {
+        assert_eq!(
+            linter.validate_severity_code(code),
+            Err(format!(
+                "Unrecognized lint message code \"{code}\". Expected a valid JSHint lint code \
+                 like \"E033\" or \"W093\"."
+            )),
+            "{code:?}"
+        );
+    }
+}

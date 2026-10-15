@@ -303,7 +303,7 @@ fn lessc_runs_tool_and_parses_lint_stderr() {
         lint_lessc::LesscLinter::with_binary(tool.script()).lint_bytes("sample.less", &input);
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].code, "LESSCSyntaxError");
-    assert_eq!(messages[0].name, "Syntax Error");
+    assert_eq!(messages[0].name, "Unknown lint message!");
     assert_eq!((messages[0].line, messages[0].col), (5, 3));
     assert_eq!(messages[1].code, "LESSCNameError");
     let args = tool.args_text();

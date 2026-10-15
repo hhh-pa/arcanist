@@ -63,3 +63,10 @@ fn missing_binary_falls_back_to_native_check() {
 fn lookup_miss_reports_no_tool() {
     assert!(find_on_path("arc-rs-definitely-missing-tool").is_none());
 }
+
+#[test]
+fn ucfirst_is_byte_based_like_php() {
+    assert_eq!(ucfirst("parse error"), "Parse error");
+    assert_eq!(ucfirst("école"), "école");
+    assert_eq!(ucfirst(""), "");
+}

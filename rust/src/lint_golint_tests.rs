@@ -106,4 +106,7 @@ fn ucfirst_uppercases_only_the_first_character() {
     assert_eq!(ucfirst(""), "");
     assert_eq!(ucfirst("aBC"), "ABC");
     assert_eq!(ucfirst(" already"), " already");
+    // PHP `ucfirst()` is byte-based: non-ASCII initials are untouched.
+    assert_eq!(ucfirst("école"), "école");
+    assert_eq!(ucfirst("ßeta"), "ßeta");
 }

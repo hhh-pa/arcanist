@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn name_and_binary_match_php() {
     assert_eq!(PyFlakesLinter::new().name(), "PYFLAKES");
-    assert_eq!(PyFlakesLinter.name(), "PYFLAKES");
+    assert_eq!(PyFlakesLinter::new().name(), "PYFLAKES");
     assert_eq!(BINARY, "pyflakes");
     assert!(mandatory_flags().is_empty());
 }

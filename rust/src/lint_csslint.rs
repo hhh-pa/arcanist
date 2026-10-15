@@ -10,9 +10,9 @@
 //!
 //! Only `.css` files are examined; binary data (NUL byte) is skipped.
 //! Directories and symlinks are skipped by `Engine::lint_file` before bytes
-//! reach here. Custom `bin`/`flags` configuration is not supported. The
-//! tool lints a temp copy of the input, so config discovery relative to
-//! the source file does not apply.
+//! reach here. The `bin`, `flags`, and `version` linter options apply
+//! (N4). The tool lints a temp copy of the input, so config discovery
+//! relative to the source file does not apply.
 //!
 //! Divergence: the PHP iterates every child node of `file` (including text
 //! nodes); this port only reads `issue` elements, so whitespace between
@@ -24,7 +24,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arc_rs::lint::{LintMessage, Linter};
+use arc_rs::lint::{LintMessage, Linter, OptionContext};
+use arc_rs::lint_external::{ToolOptions, apply_tool_option, version_requirement_satisfied};
+use arc_rs::linters::version_pattern_for;
 
 /// Registry name, matching PHP `getLinterName()`.
 pub const LINTER_NAME: &str = "CSSLint";
@@ -41,12 +43,13 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Default)]
 pub struct CsslintLinter {
     binary: Option<PathBuf>,
+    options: ToolOptions,
 }
 
 impl CsslintLinter {
     #[must_use]
     pub fn new() -> Self {
-        Self { binary: None }
+        Self::default()
     }
 
     /// Override the tool binary (mirrors PHP `setBinary()`); used by tests
@@ -55,6 +58,7 @@ impl CsslintLinter {
     pub fn with_binary(path: &Path) -> Self {
         Self {
             binary: Some(path.to_path_buf()),
+            options: ToolOptions::default(),
         }
     }
 
@@ -62,13 +66,28 @@ impl CsslintLinter {
         if let Some(path) = &self.binary {
             return path.is_file().then(|| path.clone());
         }
+        if let Some(path) = &self.options.bin {
+            return Some(path.clone());
+        }
         find_on_path(BINARY)
+    }
+
+    /// Effective tool flags (without the file): mandatory plus
+    /// configured-or-default, mirroring `getCommandFlags()`.
+    fn tool_flags(&self) -> Vec<String> {
+        self.options
+            .command_flags(&["--format=lint-xml".to_string()], &[])
     }
 }
 
 impl Linter for CsslintLinter {
     fn name(&self) -> &'static str {
         LINTER_NAME
+    }
+
+    fn applies_custom_severities(&self) -> bool {
+        // The PHP linter never consults custom severity maps or rules.
+        false
     }
 
     fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {
@@ -78,10 +97,21 @@ impl Linter for CsslintLinter {
         let Some(binary) = self.resolve_binary() else {
             return Vec::new();
         };
+        if let Some(requirement) = &self.options.version
+            && !version_requirement_satisfied(
+                version_pattern_for("csslint"),
+                &binary,
+                requirement,
+                "ArcanistCSSLintLinter",
+            )
+        {
+            return Vec::new();
+        }
         let Some(input) = write_temp_file(SLUG, path, "css", data) else {
             return Vec::new();
         };
-        let args = vec!["--format=lint-xml".to_string(), input.display().to_string()];
+        let mut args = self.tool_flags();
+        args.push(input.display().to_string());
         let found =
             run_tool(&binary, &args).map_or_else(Vec::new, |out| {
                 match parse_lint_xml_output(path, &out.stdout) {
@@ -92,6 +122,24 @@ impl Linter for CsslintLinter {
             });
         std::fs::remove_file(&input).ok();
         found
+    }
+
+    fn set_option(
+        &mut self,
+        key: &str,
+        value: &serde_json::Value,
+        ctx: &OptionContext,
+    ) -> Result<(), String> {
+        apply_tool_option(&mut self.options, key, value, ctx.project_root)
+    }
+
+    fn validate_severity_code(&self, _code: &str) -> Result<String, String> {
+        // Rules can't be identified from messages, like PHP.
+        Err(
+            "CSSLint does not currently support custom severity levels, because rules can't be \
+             identified from messages in output."
+                .to_string(),
+        )
     }
 }
 
@@ -115,7 +163,7 @@ pub fn parse_lint_xml_output(path: &str, stdout: &str) -> Result<Vec<LintMessage
             severity: severity.to_string(),
             name: LINTER_NAME.to_string(),
             description: attr(&attrs, "reason").to_string(),
-            original: None,
+            original: Some(original_text(&attrs)),
             replacement: None,
         });
     }
@@ -309,6 +357,47 @@ fn attr<'a>(attrs: &'a [(String, String)], name: &str) -> &'a str {
 
 fn attr_usize(attrs: &[(String, String)], name: &str) -> usize {
     attr(attrs, name).parse::<usize>().unwrap_or(1).max(1)
+}
+
+/// Original text: the `evidence` attribute, sliced at byte `char - 1`
+/// when `char` is non-empty, mirroring
+/// `substr($original_text, $char - 1)` (byte offsets; out-of-range
+/// slices become the empty string like PHP's `false` coerced to text).
+fn original_text(attrs: &[(String, String)]) -> String {
+    let evidence = attr(attrs, "evidence");
+    let char_attr = attr(attrs, "char");
+    if char_attr.is_empty() {
+        return evidence.to_string();
+    }
+    php_substr_from(evidence, php_int(char_attr).saturating_sub(1))
+}
+
+/// PHP `(int)` cast: leading whitespace, optional sign, digit run.
+fn php_int(text: &str) -> i64 {
+    let trimmed = text.trim_start();
+    let (negative, rest) = match trimmed.strip_prefix(['+', '-']) {
+        Some(rest) => (trimmed.starts_with('-'), rest),
+        None => (false, trimmed),
+    };
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    let value = digits.parse::<i64>().unwrap_or(0);
+    if negative { -value } else { value }
+}
+
+/// PHP `substr($text, $start)` over bytes; negative starts count from
+/// the end and out-of-range starts yield the empty string.
+fn php_substr_from(text: &str, start: i64) -> String {
+    let bytes = text.as_bytes();
+    let len = bytes.len() as i64;
+    let offset = if start < 0 { len + start } else { start };
+    if offset < 0 || offset > len {
+        return String::new();
+    }
+    let mut offset = offset as usize;
+    while offset < bytes.len() && !text.is_char_boundary(offset) {
+        offset += 1;
+    }
+    text[offset..].to_string()
 }
 
 fn should_lint(path: &str) -> bool {

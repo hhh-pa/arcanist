@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn name_binary_and_flags_match_php() {
     assert_eq!(RubyLinter::new().name(), "RUBY");
-    assert_eq!(RubyLinter.name(), "RUBY");
+    assert_eq!(RubyLinter::new().name(), "RUBY");
     assert_eq!(BINARY, "ruby");
     assert_eq!(mandatory_flags(), vec!["-w", "-c"]);
 }
@@ -129,4 +129,26 @@ fn skips_lines_with_broken_positions() {
     assert!(parse_output("a.rb", "target.rb:xx: nope\n").is_empty());
     assert!(parse_output("a.rb", "target.rb:: nope\n").is_empty());
     assert!(parse_output("a.rb", "\n").is_empty());
+}
+
+#[test]
+fn custom_severities_apply_by_message_head_like_php() {
+    use std::collections::HashMap;
+    let linter = RubyLinter::new();
+    assert!(!linter.applies_custom_severities());
+    let mut map = HashMap::new();
+    map.insert("boom".to_string(), "warning".to_string());
+    let overrides = SeverityOverrides {
+        map,
+        rules: Vec::new(),
+    };
+    let messages = parse_output_with(
+        "a.rb",
+        "target.rb:3: boom, with detail\ntarget.rb:4: other thing\n",
+        &overrides,
+    );
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].severity, "warning");
+    assert_eq!(messages[0].description, "boom, with detail");
+    assert_eq!(messages[1].severity, "error");
 }

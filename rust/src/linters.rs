@@ -974,6 +974,38 @@ pub struct LinterError {
     pub message: String,
 }
 
+/// PHP class name for a canonical `.arclint` configuration name, for
+/// cache-version computation (`get_class($linter)`). The `closure`
+/// alias resolves to the `gjslint` entry; `filename` has no registry
+/// entry and maps directly.
+#[must_use]
+pub fn class_for_config(config_name: &str) -> Option<&'static str> {
+    if config_name == "filename" {
+        return Some("ArcanistFilenameLinter");
+    }
+    let lookup = if config_name == "closure" {
+        "gjslint"
+    } else {
+        config_name
+    };
+    LINTERS
+        .iter()
+        .find(|meta| meta.config_name == lookup)
+        .map(|meta| meta.class)
+}
+
+/// Version detection pattern for a `.arclint` configuration name, if
+/// the linter implements `getVersion()`. Used for N4 `version`
+/// requirement checks against configured binaries.
+#[must_use]
+pub fn version_pattern_for(config_name: &str) -> Option<VersionPattern> {
+    LINTERS
+        .iter()
+        .find(|meta| meta.config_name == config_name)
+        .and_then(|meta| meta.external)
+        .and_then(|external| external.version)
+}
+
 /// Probe a configured linter's version (`getVersion()`): `Ok(None)`
 /// keeps the configured status without a version; `Err` flips the
 /// status to error.
@@ -1017,6 +1049,29 @@ pub fn probe_version(meta: &LinterMeta) -> Result<Option<String>, LinterError> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     Ok(parse_version(pattern, &stdout, &stderr))
+}
+
+/// Probe an explicit `binary` for `pattern` (`<binary> --version`, or
+/// the PHP version command), returning the parsed version. Probe
+/// failures and unparseable output yield `None` (N4 `version` checks
+/// treat the linter as inactive then, like a missing binary).
+#[must_use]
+pub fn probe_binary_version(pattern: VersionPattern, binary: &Path) -> Option<String> {
+    let mut command = Command::new(binary);
+    if pattern == VersionPattern::PhpVersion {
+        command.arg("--run").arg("echo phpversion();");
+    } else {
+        command.arg("--version");
+    }
+    let output = arc_rs::lint::spawn_with_retry(&mut command).ok()?;
+    if !output.status.success() && pattern != VersionPattern::LenientTriple {
+        return None;
+    }
+    parse_version(
+        pattern,
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    )
 }
 
 /// Ported XHP rules as (id, class, name), for the additional

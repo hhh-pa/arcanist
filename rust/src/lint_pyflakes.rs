@@ -14,12 +14,14 @@
 //! `before assignment`, mirroring the PHP check. A missing column maps
 //! to 1; code and name are always `PYFLAKES`.
 //!
-//! Out of scope (the Rust engine has no per-linter config plumbing):
-//! custom binaries, extra flags, and version requirements.
+//! The `bin`, `flags`, and `version` linter options apply (N4).
+//! `severity` keys are rejected (`canCustomize` is false).
 
 extern crate self as arc_rs;
 
-use arc_rs::lint::{LintMessage, Linter};
+use arc_rs::lint::{LintMessage, Linter, OptionContext};
+use arc_rs::lint_external::{ToolOptions, apply_tool_option, version_requirement_satisfied};
+use arc_rs::linters::version_pattern_for;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -35,6 +37,16 @@ pub fn mandatory_flags() -> Vec<&'static str> {
     Vec::new()
 }
 
+/// Default flags, mirroring `getDefaultFlags()`: none.
+fn default_flags() -> Vec<String> {
+    Vec::new()
+}
+
+/// Mandatory flags as owned strings for flag composition.
+fn mandatory_flag_strings() -> Vec<String> {
+    mandatory_flags().into_iter().map(str::to_string).collect()
+}
+
 /// True for paths this linter applies to: `.py`/`.pyw` files.
 #[must_use]
 pub fn is_supported_path(path: &str) -> bool {
@@ -47,13 +59,15 @@ pub fn is_supported_path(path: &str) -> bool {
 
 /// Python PyFlakes linter (external `pyflakes` wrapper).
 #[derive(Debug, Default)]
-pub struct PyFlakesLinter;
+pub struct PyFlakesLinter {
+    options: ToolOptions,
+}
 
 impl PyFlakesLinter {
     /// Create the linter.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -66,14 +80,53 @@ impl Linter for PyFlakesLinter {
         if !is_supported_path(path) || data.contains(&0) {
             return Vec::new();
         }
-        let tool = binary_on_path(BINARY);
-        lint_with_binary(path, data, tool.as_deref())
+        let tool = self.options.bin.clone().or_else(|| binary_on_path(BINARY));
+        let Some(ref tool) = tool else {
+            return Vec::new();
+        };
+        if let Some(requirement) = &self.options.version
+            && !version_requirement_satisfied(
+                version_pattern_for("pyflakes"),
+                tool,
+                requirement,
+                "ArcanistPyFlakesLinter",
+            )
+        {
+            return Vec::new();
+        }
+        let flags = self
+            .options
+            .command_flags(&mandatory_flag_strings(), &default_flags());
+        lint_with_binary_and_flags(path, data, Some(tool), &flags)
+    }
+
+    fn can_customize_severities(&self) -> bool {
+        false
+    }
+
+    fn set_option(
+        &mut self,
+        key: &str,
+        value: &serde_json::Value,
+        ctx: &OptionContext,
+    ) -> Result<(), String> {
+        apply_tool_option(&mut self.options, key, value, ctx.project_root)
     }
 }
 
 /// Lint with an explicit tool binary (test seam mirroring bundle E);
 /// `None` means the tool is not installed and reports nothing.
 pub fn lint_with_binary(path: &str, data: &[u8], binary: Option<&Path>) -> Vec<LintMessage> {
+    lint_with_binary_and_flags(path, data, binary, &mandatory_flag_strings())
+}
+
+/// Linter body with explicit flags (configured flags replace defaults).
+fn lint_with_binary_and_flags(
+    path: &str,
+    data: &[u8],
+    binary: Option<&Path>,
+    flags: &[String],
+) -> Vec<LintMessage> {
     let Some(tool) = binary else {
         // Inactive when the tool is not installed, mirroring PHP.
         return Vec::new();
@@ -83,7 +136,7 @@ pub fn lint_with_binary(path: &str, data: &[u8], binary: Option<&Path>) -> Vec<L
     };
     let mut command = Command::new(tool);
     command
-        .args(mandatory_flags())
+        .args(flags)
         .arg(&scratch.file)
         .current_dir(&scratch.cwd);
     let output = arc_rs::lint::spawn_with_retry(&mut command);

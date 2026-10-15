@@ -45,10 +45,11 @@
 //! - `--engine ArcanistUnitTestableLintEngine` and unknown engine classes
 //!   are rejected with the not-a-subclass error; PHP could instantiate
 //!   other custom engines.
-//! - `script-and-regex` `halt` groups and `original`/`replacement` groups
-//!   behave like `stop` / are dropped (see `lint_script_and_regex`).
-//! - Obsolete-message filtering and lint caching are not ported; no
-//!   ported linter emits obsolete messages or reads caches.
+//! - Obsolete-message filtering is not ported: `setObsolete()` has no
+//!   caller in the lint surface (producers live in other flows), so no
+//!   ported message is ever obsolete. Cached results
+//!   (`setCachedResults()`) are honored with per-linter granularity;
+//!   cache versions are port-local (PHP mixes linter-file md5s).
 
 extern crate self as arc_rs;
 
@@ -75,6 +76,14 @@ pub const SEVERITY_WARNING: &str = "warning";
 pub const SEVERITY_AUTOFIX: &str = "autofix";
 pub const SEVERITY_ADVICE: &str = "advice";
 pub const SEVERITY_DISABLED: &str = "disabled";
+/// PHP `ArcanistLinter::GRANULARITY_FILE` (`:12`).
+pub const GRANULARITY_FILE: u8 = 1;
+/// PHP `ArcanistLinter::GRANULARITY_DIRECTORY` (`:13`).
+pub const GRANULARITY_DIRECTORY: u8 = 2;
+/// PHP `ArcanistLinter::GRANULARITY_REPOSITORY` (`:14`).
+pub const GRANULARITY_REPOSITORY: u8 = 3;
+/// PHP `ArcanistLinter::GRANULARITY_GLOBAL` (`:15`).
+pub const GRANULARITY_GLOBAL: u8 = 4;
 
 /// Default minimum severity, mirroring
 /// `ArcanistLintWorkflow::DEFAULT_SEVERITY`
@@ -364,7 +373,10 @@ impl LintMessage {
 ///
 /// The defaulted methods mirror `ArcanistLinter` predicates:
 /// [`Linter::priority`] is `getLinterPriority()` (default 1.0) and the
-/// `should_lint_*` methods are the `shouldLint*()` path filters.
+/// `should_lint_*` methods are the `shouldLint*()` path filters. The
+/// configuration methods mirror `getLinterConfigurationOptions()` /
+/// `setLinterConfigurationValue()` plus the severity hooks; the engine
+/// only calls [`Linter::set_option`] for keys the linter declares.
 pub trait Linter {
     fn name(&self) -> &'static str;
     fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage>;
@@ -384,6 +396,84 @@ pub trait Linter {
     fn should_lint_symbolic_links(&self) -> bool {
         false
     }
+    /// The code form severity maps and rules match against: `raiseLintAt*`
+    /// linters look up the short code (display prefix stripped),
+    /// direct-message linters the full code (`getLintMessageSeverity()`).
+    fn severity_lookup_code<'a>(&self, full_code: &'a str) -> &'a str {
+        full_code
+    }
+    /// False for linters that reject `severity`/`severity.rules`/`standard`
+    /// keys (`canCustomizeLintSeverities()`).
+    fn can_customize_severities(&self) -> bool {
+        true
+    }
+    /// False for linters whose messages never consult custom severity
+    /// maps: PHP only applies `severity`/`severity.rules` inside
+    /// `getLintMessageSeverity()`, so linters setting severities
+    /// directly (or never calling it) silently ignore configured maps.
+    fn applies_custom_severities(&self) -> bool {
+        true
+    }
+    /// Cache granularity (`getCacheGranularity()`): file by default;
+    /// only the phutil-library linter overrides it (global).
+    fn cache_granularity(&self) -> u8 {
+        GRANULARITY_FILE
+    }
+    /// Linter cache version (`getCacheVersion()`): `0` everywhere in
+    /// the port (PHP's XHPAST rule/binary mix is unreproducible
+    /// without rules, and reduces to `0` here anyway).
+    fn cache_version(&self) -> &'static str {
+        "0"
+    }
+    /// Validate and normalize one `severity` map key
+    /// (`getLintCodeFromLinterConfigurationKey()`); the default accepts
+    /// any code unchanged.
+    fn validate_severity_code(&self, code: &str) -> Result<String, String> {
+        Ok(code.to_string())
+    }
+    /// Validate one `severity` map entry, defaulting to code-only
+    /// validation. Overridden where the severity value matters (C#
+    /// forbids disabling `SA` rules).
+    fn validate_severity_entry(&self, code: &str, _severity: &str) -> Result<String, String> {
+        self.validate_severity_code(code)
+    }
+    /// Apply one declared configuration value
+    /// (`setLinterConfigurationValue()`). The engine type-checks
+    /// values against the linter's option table first and only calls
+    /// this for declared keys; errors abort configuration with a
+    /// config error, like PHP.
+    fn set_option(
+        &mut self,
+        key: &str,
+        _value: &serde_json::Value,
+        _ctx: &OptionContext,
+    ) -> Result<(), String> {
+        Err(format!("unknown option '{key}'."))
+    }
+    /// Take a pending halt-everything request (`stopAllLinters()`):
+    /// true once when this linter halted all other linters on the
+    /// current path (script-and-regex `halt` groups).
+    fn take_halt(&self) -> bool {
+        false
+    }
+    /// Receive the section's validated custom severity map, for
+    /// linters whose own phase gates consult `isMessageEnabled()`
+    /// (the text linter's `didStopAllLinters()` gates). The default
+    /// ignores it.
+    fn set_custom_severity_map(&mut self, _map: &HashMap<String, String>) {}
+    /// Receive the section's `severity.rules` in config order, for
+    /// linters applying custom severities internally because their
+    /// lookup key is not the message code (RuboCop, ruby). The
+    /// default ignores it.
+    fn set_custom_severity_rules(&mut self, _rules: &[(String, String)]) {}
+}
+
+/// Context for [`Linter::set_option`]: the project root resolves
+/// relative `bin` candidates and tool config paths, like PHP.
+#[derive(Debug, Clone, Copy)]
+pub struct OptionContext<'a> {
+    /// Project root (`.arclint` directory).
+    pub project_root: &'a Path,
 }
 
 /// Basic text linter: all nine `ArcanistTextLinter` rules
@@ -391,9 +481,10 @@ pub trait Linter {
 #[derive(Debug)]
 pub struct TextLinter {
     max_line_length: usize,
-    /// Exact-code severity map: DOS-newline and bad-charset stops
-    /// only fire for enabled codes (`isMessageEnabled()`).
-    severity_map: HashMap<String, String>,
+    /// Custom severity overrides: DOS-newline and bad-charset stops
+    /// only fire for enabled codes (`isMessageEnabled()`, exact map
+    /// plus `severity.rules`).
+    severity: arclint::SeverityOverrides,
 }
 
 impl TextLinter {
@@ -401,7 +492,7 @@ impl TextLinter {
     pub fn new() -> Self {
         Self {
             max_line_length: DEFAULT_MAX_LINE_LENGTH,
-            severity_map: HashMap::new(),
+            severity: arclint::SeverityOverrides::default(),
         }
     }
 
@@ -410,7 +501,7 @@ impl TextLinter {
     pub fn with_max_line_length(max_line_length: usize) -> Self {
         Self {
             max_line_length,
-            severity_map: HashMap::new(),
+            severity: arclint::SeverityOverrides::default(),
         }
     }
 
@@ -419,7 +510,10 @@ impl TextLinter {
     pub fn with_severity_map(severity_map: HashMap<String, String>) -> Self {
         Self {
             max_line_length: DEFAULT_MAX_LINE_LENGTH,
-            severity_map,
+            severity: arclint::SeverityOverrides {
+                map: severity_map,
+                rules: Vec::new(),
+            },
         }
     }
 
@@ -428,18 +522,12 @@ impl TextLinter {
         self.max_line_length
     }
 
-    /// True when a stop code is not custom-disabled, keyed by full
-    /// code then short code (`TXT1` or `1`).
+    /// True when a stop code is not custom-disabled
+    /// (`isMessageEnabled()`): exact map plus `severity.rules` by
+    /// short code.
     fn stop_enabled(&self, full_code: &str) -> bool {
-        if let Some(severity) = self.severity_map.get(full_code) {
-            return severity != SEVERITY_DISABLED;
-        }
-        if let Some(short) = full_code.strip_prefix("TXT")
-            && let Some(severity) = self.severity_map.get(short)
-        {
-            return severity != SEVERITY_DISABLED;
-        }
-        true
+        let lookup = self.severity_lookup_code(full_code);
+        self.severity.severity_for(lookup, SEVERITY_ERROR) != SEVERITY_DISABLED
     }
 }
 
@@ -468,30 +556,30 @@ fn is_php_space(byte: u8) -> bool {
     byte.is_ascii_whitespace() || byte == 0x0B
 }
 
-/// Nine positional fields mirror the PHP message constructor; a
-/// struct would only rename the same call sites.
-#[allow(clippy::too_many_arguments)]
-fn text_message(
-    path: &str,
+/// Parameter bundle for [`text_message`]: the nine PHP message fields.
+struct TextMessageSpec<'a> {
+    path: &'a str,
     line: usize,
     col: usize,
-    code: &str,
-    severity: &str,
-    name: &str,
+    code: &'a str,
+    severity: &'a str,
+    name: &'a str,
     description: String,
     original: Option<String>,
     replacement: Option<String>,
-) -> LintMessage {
+}
+
+fn text_message(spec: TextMessageSpec<'_>) -> LintMessage {
     LintMessage {
-        path: path.to_string(),
-        line,
-        col,
-        code: code.to_string(),
-        severity: severity.to_string(),
-        name: name.to_string(),
-        description,
-        original,
-        replacement,
+        path: spec.path.to_string(),
+        line: spec.line,
+        col: spec.col,
+        code: spec.code.to_string(),
+        severity: spec.severity.to_string(),
+        name: spec.name.to_string(),
+        description: spec.description,
+        original: spec.original,
+        replacement: spec.replacement,
     }
 }
 
@@ -502,6 +590,34 @@ impl Linter for TextLinter {
 
     fn priority(&self) -> f64 {
         0.5
+    }
+
+    fn severity_lookup_code<'a>(&self, full_code: &'a str) -> &'a str {
+        full_code.strip_prefix("TXT").unwrap_or(full_code)
+    }
+
+    fn set_option(
+        &mut self,
+        key: &str,
+        value: &serde_json::Value,
+        _ctx: &OptionContext,
+    ) -> Result<(), String> {
+        match key {
+            "text.max-line-length" => {
+                let length = value.as_u64().unwrap_or(DEFAULT_MAX_LINE_LENGTH as u64);
+                self.max_line_length = usize::try_from(length).unwrap_or(usize::MAX);
+                Ok(())
+            }
+            _ => Err(format!("unknown option '{key}'.")),
+        }
+    }
+
+    fn set_custom_severity_map(&mut self, map: &HashMap<String, String>) {
+        self.severity.map.clone_from(map);
+    }
+
+    fn set_custom_severity_rules(&mut self, rules: &[(String, String)]) {
+        self.severity.rules = rules.to_vec();
     }
 
     fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {
@@ -553,17 +669,17 @@ fn lint_empty_file(path: &str, data: &[u8], out: &mut Vec<LintMessage>) -> bool 
     // `/^\s*$/`: without `D`, `$` also matches before a trailing `\n`,
     // so any all-whitespace byte string matches.
     if data.iter().all(|byte| is_php_space(*byte)) {
-        out.push(text_message(
+        out.push(text_message(TextMessageSpec {
             path,
-            0,
-            0,
-            CODE_EMPTY_FILE,
-            SEVERITY_ERROR,
-            NAME_EMPTY_FILE,
-            DESC_EMPTY_FILE.to_string(),
-            None,
-            None,
-        ));
+            line: 0,
+            col: 0,
+            code: CODE_EMPTY_FILE,
+            severity: SEVERITY_ERROR,
+            name: NAME_EMPTY_FILE,
+            description: DESC_EMPTY_FILE.to_string(),
+            original: None,
+            replacement: None,
+        }));
         return true;
     }
     false
@@ -579,17 +695,17 @@ fn lint_dos_newlines(path: &str, data: &[u8], out: &mut Vec<LintMessage>) -> boo
     }
     let original = String::from_utf8_lossy(data).into_owned();
     let replacement = original.replace("\r\n", "\n");
-    out.push(text_message(
+    out.push(text_message(TextMessageSpec {
         path,
-        1,
-        1,
-        CODE_DOS_NEWLINE,
-        SEVERITY_ERROR,
-        NAME_DOS_NEWLINE,
-        DESC_DOS_NEWLINE.to_string(),
-        Some(original),
-        Some(replacement),
-    ));
+        line: 1,
+        col: 1,
+        code: CODE_DOS_NEWLINE,
+        severity: SEVERITY_ERROR,
+        name: NAME_DOS_NEWLINE,
+        description: DESC_DOS_NEWLINE.to_string(),
+        original: Some(original),
+        replacement: Some(replacement),
+    }));
     true
 }
 
@@ -600,17 +716,17 @@ fn lint_tabs(path: &str, data: &[u8], out: &mut Vec<LintMessage>) {
         return;
     };
     let (line, col) = line_col_for_offset(data, offset);
-    out.push(text_message(
+    out.push(text_message(TextMessageSpec {
         path,
         line,
         col,
-        CODE_TAB,
-        SEVERITY_ERROR,
-        NAME_TAB,
-        DESC_TAB.to_string(),
-        Some("\t".to_string()),
-        None,
-    ));
+        code: CODE_TAB,
+        severity: SEVERITY_ERROR,
+        name: NAME_TAB,
+        description: DESC_TAB.to_string(),
+        original: Some("\t".to_string()),
+        replacement: None,
+    }));
 }
 
 /// `lintLineLength()` (`ArcanistTextLinter.php:179-197`): lines longer
@@ -618,21 +734,21 @@ fn lint_tabs(path: &str, data: &[u8], out: &mut Vec<LintMessage>) {
 fn lint_line_length(path: &str, data: &[u8], width: usize, out: &mut Vec<LintMessage>) {
     for (index, line) in split_lines(data).iter().enumerate() {
         if line.len() > width {
-            out.push(text_message(
+            out.push(text_message(TextMessageSpec {
                 path,
-                index + 1,
-                1,
-                CODE_LINE_WRAP,
-                SEVERITY_WARNING,
-                NAME_LINE_WRAP,
-                format!(
+                line: index + 1,
+                col: 1,
+                code: CODE_LINE_WRAP,
+                severity: SEVERITY_WARNING,
+                name: NAME_LINE_WRAP,
+                description: format!(
                     "This line is {} characters long, but the convention is {} characters.",
                     format_number(line.len()),
                     format_number(width),
                 ),
-                Some(String::from_utf8_lossy(line).into_owned()),
-                None,
-            ));
+                original: Some(String::from_utf8_lossy(line).into_owned()),
+                replacement: None,
+            }));
         }
     }
 }
@@ -644,17 +760,17 @@ fn lint_eof_newline(path: &str, data: &[u8], out: &mut Vec<LintMessage>) {
         return;
     }
     let (line, col) = line_col_for_offset(data, data.len());
-    out.push(text_message(
+    out.push(text_message(TextMessageSpec {
         path,
         line,
         col,
-        CODE_EOF_NEWLINE,
-        SEVERITY_ERROR,
-        NAME_EOF_NEWLINE,
-        DESC_EOF_NEWLINE.to_string(),
-        Some(String::new()),
-        Some("\n".to_string()),
-    ));
+        code: CODE_EOF_NEWLINE,
+        severity: SEVERITY_ERROR,
+        name: NAME_EOF_NEWLINE,
+        description: DESC_EOF_NEWLINE.to_string(),
+        original: Some(String::new()),
+        replacement: Some("\n".to_string()),
+    }));
 }
 
 /// True for bytes outside `[\x09\x0A\x20-\x7E]`
@@ -683,17 +799,17 @@ fn lint_charset(path: &str, data: &[u8], out: &mut Vec<LintMessage>) -> bool {
         if let Some(start) = first {
             let span = &line[start..=last];
             let (line_no, col) = line_col_for_offset(data, offset + start);
-            out.push(text_message(
+            out.push(text_message(TextMessageSpec {
                 path,
-                line_no,
+                line: line_no,
                 col,
-                CODE_BAD_CHARSET,
-                SEVERITY_ERROR,
-                NAME_BAD_CHARSET,
-                DESC_BAD_CHARSET.to_string(),
-                Some(String::from_utf8_lossy(span).into_owned()),
-                None,
-            ));
+                code: CODE_BAD_CHARSET,
+                severity: SEVERITY_ERROR,
+                name: NAME_BAD_CHARSET,
+                description: DESC_BAD_CHARSET.to_string(),
+                original: Some(String::from_utf8_lossy(span).into_owned()),
+                replacement: None,
+            }));
             fired = true;
         }
         offset += line.len() + 1;
@@ -707,17 +823,17 @@ fn lint_charset(path: &str, data: &[u8], out: &mut Vec<LintMessage>) -> bool {
 fn lint_trailing_whitespace(path: &str, data: &[u8], out: &mut Vec<LintMessage>) {
     for (offset, len) in trailing_spans(data) {
         let (line, col) = line_col_for_offset(data, offset);
-        out.push(text_message(
+        out.push(text_message(TextMessageSpec {
             path,
             line,
             col,
-            CODE_TRAILING,
-            SEVERITY_AUTOFIX,
-            NAME_TRAILING,
-            DESC_TRAILING.to_string(),
-            Some(String::from_utf8_lossy(&data[offset..offset + len]).into_owned()),
-            Some(String::new()),
-        ));
+            code: CODE_TRAILING,
+            severity: SEVERITY_AUTOFIX,
+            name: NAME_TRAILING,
+            description: DESC_TRAILING.to_string(),
+            original: Some(String::from_utf8_lossy(&data[offset..offset + len]).into_owned()),
+            replacement: Some(String::new()),
+        }));
     }
 }
 
@@ -737,17 +853,17 @@ fn lint_bof_whitespace(path: &str, data: &[u8], out: &mut Vec<LintMessage>) {
     if match_end == 0 {
         return;
     }
-    out.push(text_message(
+    out.push(text_message(TextMessageSpec {
         path,
-        1,
-        1,
-        CODE_BOF_WHITESPACE,
-        SEVERITY_AUTOFIX,
-        NAME_BOF_WHITESPACE,
-        DESC_BOF_WHITESPACE.to_string(),
-        Some(String::from_utf8_lossy(&data[..match_end]).into_owned()),
-        Some(String::new()),
-    ));
+        line: 1,
+        col: 1,
+        code: CODE_BOF_WHITESPACE,
+        severity: SEVERITY_AUTOFIX,
+        name: NAME_BOF_WHITESPACE,
+        description: DESC_BOF_WHITESPACE.to_string(),
+        original: Some(String::from_utf8_lossy(&data[..match_end]).into_owned()),
+        replacement: Some(String::new()),
+    }));
 }
 
 /// `lintEOFWhitespace()` (`ArcanistTextLinter.php:295-316`):
@@ -765,17 +881,17 @@ fn lint_eof_whitespace(path: &str, data: &[u8], out: &mut Vec<LintMessage>) {
         return;
     };
     let (line, col) = line_col_for_offset(data, start);
-    out.push(text_message(
+    out.push(text_message(TextMessageSpec {
         path,
         line,
         col,
-        CODE_EOF_WHITESPACE,
-        SEVERITY_AUTOFIX,
-        NAME_EOF_WHITESPACE,
-        DESC_EOF_WHITESPACE.to_string(),
-        Some(String::from_utf8_lossy(&data[start..]).into_owned()),
-        Some(String::new()),
-    ));
+        code: CODE_EOF_WHITESPACE,
+        severity: SEVERITY_AUTOFIX,
+        name: NAME_EOF_WHITESPACE,
+        description: DESC_EOF_WHITESPACE.to_string(),
+        original: Some(String::from_utf8_lossy(&data[start..]).into_owned()),
+        replacement: Some(String::new()),
+    }));
 }
 
 /// Split bytes on `\n`, dropping the terminators (PHP `explode()`).
@@ -849,66 +965,319 @@ fn trailing_in_line(data: &[u8], start: usize, end: usize) -> Option<(usize, usi
     }
 }
 
-/// Runs a set of linters over files.
+/// Runs a set of linters over files: one section per configured
+/// linter, each with its own routed paths, severity overrides, and
+/// tool options, like PHP's `buildLinters()`.
 pub struct Engine {
-    linters: Vec<Box<dyn Linter>>,
-    /// Exact-code severity overrides per display name, merged first-wins
-    /// from every config section selecting that linter.
-    severity_maps: HashMap<String, HashMap<String, String>>,
+    sections: Vec<Section>,
     /// Route linters per path like [`ENGINE_COMPREHENSIVE`].
     comprehensive: bool,
+    /// Injected prior results by path and cache version
+    /// (`setCachedResults()`).
+    cached: CachedResults,
+    /// Current repository version for cache granularity checks.
+    repository_version: Option<String>,
+}
+
+/// One configured linter section: a linter instance plus the routing,
+/// severity overrides, and applied options from its `.arclint`
+/// section (`ArcanistConfigurationDrivenLintEngine::buildLinters()`).
+struct Section {
+    linter: Box<dyn Linter>,
+    /// PHP class name, for cache-version computation.
+    class: &'static str,
+    routing: arclint::SectionRouting,
+    severity: arclint::SeverityOverrides,
+}
+
+impl Section {
+    /// An unconfigured section running `linter` on every path.
+    fn open(class: &'static str, linter: Box<dyn Linter>) -> Self {
+        Self {
+            linter,
+            class,
+            routing: arclint::SectionRouting::default(),
+            severity: arclint::SeverityOverrides::default(),
+        }
+    }
+}
+
+/// Cached lint results by path and cache version
+/// (`setCachedResults()`): path -> version -> results.
+pub type CachedResults = HashMap<String, HashMap<u32, CachedPathResults>>;
+
+/// One path's cached results at one cache version.
+#[derive(Debug, Clone, Default)]
+pub struct CachedPathResults {
+    /// `repository_version` recorded with the results.
+    pub repository_version: Option<String>,
+    /// Section index that stopped the path, if any (`stopped`).
+    pub stopped: Option<usize>,
+    /// Cached messages with their recorded granularity.
+    pub messages: Vec<CachedMessage>,
+}
+
+/// One cached message (`newFromDictionary()` shape): the message plus
+/// its recorded granularity (`None` when unknown, which never reuses
+/// the cache, like PHP's `default` branch).
+#[derive(Debug, Clone)]
+pub struct CachedMessage {
+    /// Reconstructed message.
+    pub message: LintMessage,
+    /// Recorded granularity.
+    pub granularity: Option<u8>,
+}
+
+impl CachedMessage {
+    /// Rebuild a cached message from a `toDictionary()` map
+    /// (`newFromDictionary()`); returns `None` when required keys
+    /// are missing or mistyped. `locations`/`bypassChangedLineFiltering`
+    /// have no port fields and are dropped.
+    #[must_use]
+    pub fn from_dict(dict: &HashMap<String, serde_json::Value>) -> Option<Self> {
+        let text = |key: &str| dict.get(key).and_then(|value| value.as_str());
+        let message = LintMessage {
+            path: text("path")?.to_string(),
+            line: dict
+                .get("line")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|line| usize::try_from(line).ok())
+                .unwrap_or(0),
+            col: dict
+                .get("char")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|col| usize::try_from(col).ok())
+                .unwrap_or(0),
+            code: text("code")?.to_string(),
+            severity: text("severity")?.to_string(),
+            name: text("name")?.to_string(),
+            description: text("description")?.to_string(),
+            original: text("original").map(str::to_string),
+            replacement: text("replacement").map(str::to_string),
+        };
+        let granularity = dict
+            .get("granularity")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|granularity| u8::try_from(granularity).ok());
+        Some(Self {
+            message,
+            granularity,
+        })
+    }
 }
 
 /// Every ported linter, in registration order. `lint_external` stays out:
 /// the PHP base class is abstract and defines no linter of its own.
 #[must_use]
 pub fn all_linters() -> Vec<Box<dyn Linter>> {
-    all_linters_with_text_options(DEFAULT_MAX_LINE_LENGTH, HashMap::new())
+    all_linter_pairs()
+        .into_iter()
+        .map(|(_, linter)| linter)
+        .collect()
 }
 
-/// Every ported linter with custom text options.
-fn all_linters_with_text_options(
-    max_line_length: usize,
-    text_severity_map: HashMap<String, String>,
-) -> Vec<Box<dyn Linter>> {
-    let mut text = TextLinter::with_max_line_length(max_line_length);
-    text.severity_map = text_severity_map;
+/// Every ported linter with its canonical `.arclint` configuration
+/// name (for cache-version class lookup).
+fn all_linter_pairs() -> Vec<(&'static str, Box<dyn Linter>)> {
     vec![
-        Box::new(text),
-        Box::new(crate::lint_chmod::ChmodLinter::new()),
-        Box::new(crate::lint_closure::ClosureLinter::new()),
-        Box::new(crate::lint_coffeelint::CoffeelintLinter::new()),
-        Box::new(crate::lint_composer::ComposerLinter::new()),
-        Box::new(crate::lint_cppcheck::CppcheckLinter::new()),
-        Box::new(crate::lint_cpplint::CpplintLinter::new()),
-        Box::new(crate::lint_csharp::CsharpLinter::new()),
-        Box::new(crate::lint_csslint::CsslintLinter::new()),
-        Box::new(crate::lint_filename::FilenameLinter::new()),
-        Box::new(crate::lint_flake8::Flake8Linter::new()),
-        Box::new(crate::lint_generated::GeneratedLinter::new()),
-        Box::new(crate::lint_golint::GolintLinter::new()),
-        Box::new(crate::lint_hlint::HlintLinter::new()),
-        Box::new(crate::lint_jscs::JscsLinter::new()),
-        Box::new(crate::lint_jshint::JshintLinter::new()),
-        Box::new(crate::lint_json::JsonLinter::new()),
-        Box::new(crate::lint_jsonlint::JsonlintLinter::new()),
-        Box::new(crate::lint_lessc::LesscLinter::new()),
-        Box::new(crate::lint_merge_conflict::MergeConflictLinter::new()),
-        Box::new(crate::lint_nolint::NoLintLinter::new()),
-        Box::new(crate::lint_pep8::Pep8Linter::new()),
-        Box::new(crate::lint_php::PhpLinter::new()),
-        Box::new(crate::lint_phpcs::PhpcsLinter::new()),
-        Box::new(crate::lint_phutil_library::PhutilLibraryLinter::new()),
-        Box::new(crate::lint_puppetlint::PuppetlintLinter::new()),
-        Box::new(crate::lint_pyflakes::PyFlakesLinter::new()),
-        Box::new(crate::lint_pylint::PyLintLinter::new()),
-        Box::new(crate::lint_rubocop::RuboCopLinter::new()),
-        Box::new(crate::lint_ruby::RubyLinter::new()),
-        Box::new(crate::lint_script_and_regex::ScriptAndRegexLinter::new()),
-        Box::new(crate::lint_spelling::SpellingLinter::new()),
-        Box::new(crate::lint_xhpast::XhpastLinter::new()),
-        Box::new(crate::lint_xml::XmlLinter::new()),
+        ("text", Box::new(TextLinter::new())),
+        ("chmod", Box::new(crate::lint_chmod::ChmodLinter::new())),
+        (
+            "closure",
+            Box::new(crate::lint_closure::ClosureLinter::new()),
+        ),
+        (
+            "coffeelint",
+            Box::new(crate::lint_coffeelint::CoffeelintLinter::new()),
+        ),
+        (
+            "composer",
+            Box::new(crate::lint_composer::ComposerLinter::new()),
+        ),
+        (
+            "cppcheck",
+            Box::new(crate::lint_cppcheck::CppcheckLinter::new()),
+        ),
+        (
+            "cpplint",
+            Box::new(crate::lint_cpplint::CpplintLinter::new()),
+        ),
+        ("csharp", Box::new(crate::lint_csharp::CsharpLinter::new())),
+        (
+            "csslint",
+            Box::new(crate::lint_csslint::CsslintLinter::new()),
+        ),
+        (
+            "filename",
+            Box::new(crate::lint_filename::FilenameLinter::new()),
+        ),
+        ("flake8", Box::new(crate::lint_flake8::Flake8Linter::new())),
+        (
+            "generated",
+            Box::new(crate::lint_generated::GeneratedLinter::new()),
+        ),
+        ("golint", Box::new(crate::lint_golint::GolintLinter::new())),
+        ("hlint", Box::new(crate::lint_hlint::HlintLinter::new())),
+        ("jscs", Box::new(crate::lint_jscs::JscsLinter::new())),
+        ("jshint", Box::new(crate::lint_jshint::JshintLinter::new())),
+        ("json", Box::new(crate::lint_json::JsonLinter::new())),
+        (
+            "jsonlint",
+            Box::new(crate::lint_jsonlint::JsonlintLinter::new()),
+        ),
+        ("lessc", Box::new(crate::lint_lessc::LesscLinter::new())),
+        (
+            "merge-conflict",
+            Box::new(crate::lint_merge_conflict::MergeConflictLinter::new()),
+        ),
+        ("nolint", Box::new(crate::lint_nolint::NoLintLinter::new())),
+        ("pep8", Box::new(crate::lint_pep8::Pep8Linter::new())),
+        ("php", Box::new(crate::lint_php::PhpLinter::new())),
+        ("phpcs", Box::new(crate::lint_phpcs::PhpcsLinter::new())),
+        (
+            "phutil-library",
+            Box::new(crate::lint_phutil_library::PhutilLibraryLinter::new()),
+        ),
+        (
+            "puppet-lint",
+            Box::new(crate::lint_puppetlint::PuppetlintLinter::new()),
+        ),
+        (
+            "pyflakes",
+            Box::new(crate::lint_pyflakes::PyFlakesLinter::new()),
+        ),
+        ("pylint", Box::new(crate::lint_pylint::PyLintLinter::new())),
+        (
+            "rubocop",
+            Box::new(crate::lint_rubocop::RuboCopLinter::new()),
+        ),
+        ("ruby", Box::new(crate::lint_ruby::RubyLinter::new())),
+        (
+            "script-and-regex",
+            Box::new(crate::lint_script_and_regex::ScriptAndRegexLinter::new()),
+        ),
+        (
+            "spelling",
+            Box::new(crate::lint_spelling::SpellingLinter::new()),
+        ),
+        ("xhpast", Box::new(crate::lint_xhpast::XhpastLinter::new())),
+        ("xml", Box::new(crate::lint_xml::XmlLinter::new())),
     ]
+}
+
+/// Open sections from canonical-name pairs, resolving PHP classes.
+fn sections_from_pairs(pairs: Vec<(&'static str, Box<dyn Linter>)>) -> Vec<Section> {
+    pairs
+        .into_iter()
+        .map(|(canonical, linter)| {
+            let class =
+                crate::linters::class_for_config(canonical).unwrap_or("ArcanistUnknownLinter");
+            Section::open(class, linter)
+        })
+        .collect()
+}
+
+/// IEEE CRC32 (`crc32()`), bitwise (no table): polynomial
+/// `0xEDB88320`, init/xor `0xFFFFFFFF`.
+fn crc32_ieee(bytes: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let mask = crc & 1;
+            crc >>= 1;
+            if mask != 0 {
+                crc ^= 0xEDB8_8320;
+            }
+        }
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+/// True when cached results may be reused (`shouldUseCache()`):
+/// file granularity always, directory/repository only when the
+/// repository version matches, anything else never.
+fn should_use_cache(
+    granularity: Option<u8>,
+    cached_repository: Option<&str>,
+    current_repository: Option<&str>,
+) -> bool {
+    match granularity {
+        Some(GRANULARITY_FILE) => true,
+        Some(GRANULARITY_DIRECTORY | GRANULARITY_REPOSITORY) => {
+            current_repository == cached_repository
+        }
+        _ => false,
+    }
+}
+
+/// Build the linter for a `.arclint` `type`: exact configuration names
+/// first, then display-name aliases (first configuration with that
+/// display), mirroring [`arclint::canonical_config_name`].
+fn linter_for_type(linter_type: &str) -> Option<Box<dyn Linter>> {
+    let canonical = arclint::canonical_config_name(linter_type)?;
+    linter_for_text_to_flake8(canonical)
+        .or_else(|| linter_for_generated_to_pep8(canonical))
+        .or_else(|| linter_for_php_to_xml(canonical))
+}
+
+/// Construct a linter for a canonical config name in `text..=flake8`.
+fn linter_for_text_to_flake8(canonical: &str) -> Option<Box<dyn Linter>> {
+    let linter: Box<dyn Linter> = match canonical {
+        "text" => Box::new(TextLinter::new()),
+        "chmod" => Box::new(crate::lint_chmod::ChmodLinter::new()),
+        "closure" | "gjslint" => Box::new(crate::lint_closure::ClosureLinter::new()),
+        "coffeelint" => Box::new(crate::lint_coffeelint::CoffeelintLinter::new()),
+        "composer" => Box::new(crate::lint_composer::ComposerLinter::new()),
+        "cppcheck" => Box::new(crate::lint_cppcheck::CppcheckLinter::new()),
+        "cpplint" => Box::new(crate::lint_cpplint::CpplintLinter::new()),
+        "csharp" => Box::new(crate::lint_csharp::CsharpLinter::new()),
+        "csslint" => Box::new(crate::lint_csslint::CsslintLinter::new()),
+        "filename" => Box::new(crate::lint_filename::FilenameLinter::new()),
+        "flake8" => Box::new(crate::lint_flake8::Flake8Linter::new()),
+        _ => return None,
+    };
+    Some(linter)
+}
+
+/// Construct a linter for a canonical config name in
+/// `generated..=pep8`.
+fn linter_for_generated_to_pep8(canonical: &str) -> Option<Box<dyn Linter>> {
+    let linter: Box<dyn Linter> = match canonical {
+        "generated" => Box::new(crate::lint_generated::GeneratedLinter::new()),
+        "golint" => Box::new(crate::lint_golint::GolintLinter::new()),
+        "hlint" => Box::new(crate::lint_hlint::HlintLinter::new()),
+        "jscs" => Box::new(crate::lint_jscs::JscsLinter::new()),
+        "jshint" => Box::new(crate::lint_jshint::JshintLinter::new()),
+        "json" => Box::new(crate::lint_json::JsonLinter::new()),
+        "jsonlint" => Box::new(crate::lint_jsonlint::JsonlintLinter::new()),
+        "lessc" => Box::new(crate::lint_lessc::LesscLinter::new()),
+        "merge-conflict" => Box::new(crate::lint_merge_conflict::MergeConflictLinter::new()),
+        "nolint" => Box::new(crate::lint_nolint::NoLintLinter::new()),
+        "pep8" => Box::new(crate::lint_pep8::Pep8Linter::new()),
+        _ => return None,
+    };
+    Some(linter)
+}
+
+/// Construct a linter for a canonical config name in `php..=xml`.
+fn linter_for_php_to_xml(canonical: &str) -> Option<Box<dyn Linter>> {
+    let linter: Box<dyn Linter> = match canonical {
+        "php" => Box::new(crate::lint_php::PhpLinter::new()),
+        "phpcs" => Box::new(crate::lint_phpcs::PhpcsLinter::new()),
+        "phutil-library" => Box::new(crate::lint_phutil_library::PhutilLibraryLinter::new()),
+        "puppet-lint" => Box::new(crate::lint_puppetlint::PuppetlintLinter::new()),
+        "pyflakes" => Box::new(crate::lint_pyflakes::PyFlakesLinter::new()),
+        "pylint" => Box::new(crate::lint_pylint::PyLintLinter::new()),
+        "rubocop" => Box::new(crate::lint_rubocop::RuboCopLinter::new()),
+        "ruby" => Box::new(crate::lint_ruby::RubyLinter::new()),
+        "script-and-regex" => Box::new(crate::lint_script_and_regex::ScriptAndRegexLinter::new()),
+        "spelling" => Box::new(crate::lint_spelling::SpellingLinter::new()),
+        "xhpast" => Box::new(crate::lint_xhpast::XhpastLinter::new()),
+        "xml" => Box::new(crate::lint_xml::XmlLinter::new()),
+        _ => return None,
+    };
+    Some(linter)
 }
 
 /// File extensions routed to the text linters by
@@ -963,106 +1332,618 @@ pub fn discover_arclint(start: &Path) -> Option<PathBuf> {
 /// Read `text.max-line-length` from the first `text` section defining it.
 /// PHP validates `optional int` per section; a non-integer value is a
 /// config error.
-fn text_length_from_config(config: &arclint::ArclintConfig) -> Result<usize, String> {
-    for spec in &config.linters {
-        if spec.display != "TXT" {
-            continue;
-        }
-        let Some(value) = spec.extra.get("text.max-line-length") else {
-            continue;
-        };
-        let Some(length) = value.as_u64() else {
-            return Err(format!(
-                "Error in parsing '.arclint' file, for linter '{}': 'text.max-line-length' must be an integer",
-                spec.name,
-            ));
-        };
-        let Ok(length) = usize::try_from(length) else {
-            return Err(format!(
-                "Error in parsing '.arclint' file, for linter '{}': 'text.max-line-length' is too large",
-                spec.name,
-            ));
-        };
-        return Ok(length);
-    }
-    Ok(DEFAULT_MAX_LINE_LENGTH)
+/// Expected value shape for a linter-specific option, mirroring the
+/// PhutilTypeSpec types in `getLinterConfigurationOptions()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptionType {
+    /// `string`
+    Str,
+    /// `bool`
+    Bool,
+    /// `int`
+    Int,
+    /// `list<string>`
+    StrList,
+    /// `string | list<string>`
+    StrOrStrList,
+    /// `regex` (a string compiling as PCRE)
+    Regex,
+    /// `map<string, list<string>>`
+    MapStrList,
+    /// `map<string, string>`
+    MapStrStr,
+    /// `map<string, int>`
+    MapStrInt,
 }
 
-/// Merge exact-code severity maps per display name, first config section
-/// wins per code.
-fn severity_maps_from_config(
-    config: &arclint::ArclintConfig,
-) -> HashMap<String, HashMap<String, String>> {
-    let mut maps: HashMap<String, HashMap<String, String>> = HashMap::new();
-    // Iterate in reverse so the first section wins via `extend`.
-    for spec in config.linters.iter().rev() {
-        maps.entry(spec.display.clone())
-            .or_default()
-            .extend(spec.severity.map.clone());
+/// Linter-specific option keys in PHP table order (without `type`,
+/// `include`, `exclude`, `severity`, `severity.rules`, `standard`,
+/// which the engine handles), plus whether custom keys apply after
+/// the base options (lessc, csharp, and xhpast append the parent
+/// table instead of prepending it).
+fn linter_option_table(config_name: &str) -> (&'static [(&'static str, OptionType)], bool) {
+    const TOOL: &[(&str, OptionType)] = &[
+        ("bin", OptionType::StrOrStrList),
+        ("flags", OptionType::StrList),
+        ("version", OptionType::Str),
+    ];
+    match config_name {
+        "text" => (&[("text.max-line-length", OptionType::Int)], false),
+        "coffeelint" => (
+            &[
+                ("coffeelint.config", OptionType::Str),
+                ("bin", OptionType::StrOrStrList),
+                ("flags", OptionType::StrList),
+                ("version", OptionType::Str),
+            ],
+            false,
+        ),
+        "jscs" => (
+            &[
+                ("jscs.config", OptionType::Str),
+                ("jscs.preset", OptionType::Str),
+                ("bin", OptionType::StrOrStrList),
+                ("flags", OptionType::StrList),
+                ("version", OptionType::Str),
+            ],
+            false,
+        ),
+        "jshint" => (
+            &[
+                ("jshint.jshintignore", OptionType::Str),
+                ("jshint.jshintrc", OptionType::Str),
+                ("bin", OptionType::StrOrStrList),
+                ("flags", OptionType::StrList),
+                ("version", OptionType::Str),
+            ],
+            false,
+        ),
+        "phpcs" => (
+            &[
+                ("phpcs.standard", OptionType::Str),
+                ("bin", OptionType::StrOrStrList),
+                ("flags", OptionType::StrList),
+                ("version", OptionType::Str),
+            ],
+            false,
+        ),
+        "puppet-lint" => (
+            &[
+                ("puppet-lint.config", OptionType::Str),
+                ("bin", OptionType::StrOrStrList),
+                ("flags", OptionType::StrList),
+                ("version", OptionType::Str),
+            ],
+            false,
+        ),
+        "pylint" => (
+            &[
+                ("pylint.config", OptionType::Str),
+                ("bin", OptionType::StrOrStrList),
+                ("flags", OptionType::StrList),
+                ("version", OptionType::Str),
+            ],
+            false,
+        ),
+        "rubocop" => (
+            &[
+                ("rubocop.config", OptionType::Str),
+                ("bin", OptionType::StrOrStrList),
+                ("flags", OptionType::StrList),
+                ("version", OptionType::Str),
+            ],
+            false,
+        ),
+        "csharp" => (
+            &[
+                ("discovery", OptionType::MapStrList),
+                ("binary", OptionType::Str),
+            ],
+            true,
+        ),
+        "spelling" => (&[("spelling.dictionaries", OptionType::StrList)], false),
+        "script-and-regex" => (
+            &[
+                ("script-and-regex.script", OptionType::Str),
+                ("script-and-regex.regex", OptionType::Regex),
+            ],
+            false,
+        ),
+        "xhpast" => (
+            &[
+                ("xhpast.php-version", OptionType::Str),
+                ("xhpast.php-version.windows", OptionType::Str),
+                ("xhpast.blacklisted.function", OptionType::MapStrStr),
+                ("xhpast.deprecated.functions", OptionType::MapStrStr),
+                ("xhpast.printf-functions", OptionType::MapStrInt),
+                ("xhpast.switchhook", OptionType::Str),
+                ("xhpast.naminghook", OptionType::Str),
+                ("xhpast.dynamic-string.classes", OptionType::MapStrStr),
+                ("xhpast.dynamic-string.functions", OptionType::MapStrStr),
+            ],
+            true,
+        ),
+        other => linter_tool_option_table(other, TOOL),
     }
-    maps
+}
+
+/// Option table for linters sharing the `bin`/`flags`/`version` tool
+/// keys without custom options (lessc appends its custom keys after
+/// the base options, hence `true`).
+fn linter_tool_option_table(
+    config_name: &str,
+    tool: &'static [(&'static str, OptionType)],
+) -> (&'static [(&'static str, OptionType)], bool) {
+    match config_name {
+        "lessc" => (tool, true),
+        "closure" | "gjslint" | "cppcheck" | "cpplint" | "csslint" | "flake8" | "golint"
+        | "hlint" | "jsonlint" | "pep8" | "php" | "pyflakes" | "ruby" => (tool, false),
+        _ => (&[], false),
+    }
+}
+
+/// Lessc appends its custom keys after the base options; they live
+/// outside [`linter_option_table`] so the table stays a plain slice.
+const LESSC_CUSTOM_OPTIONS: &[(&str, OptionType)] = &[
+    ("lessc.strict-math", OptionType::Bool),
+    ("lessc.strict-units", OptionType::Bool),
+];
+
+/// Type-check one option value, mirroring the `checkMap()` type
+/// validation (inner phutil messages are not reproducible here; the
+/// shape follows the established local config-error text).
+fn check_option_type(
+    key: &str,
+    expected: OptionType,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    if option_value_matches(expected, value) {
+        return Ok(());
+    }
+    Err(format!(
+        "'{key}' must be {}",
+        option_type_expectation(expected)
+    ))
+}
+
+/// True when `value` has the JSON shape of `expected`.
+fn option_value_matches(expected: OptionType, value: &serde_json::Value) -> bool {
+    match expected {
+        OptionType::Str => value.is_string(),
+        OptionType::Bool => value.is_boolean(),
+        OptionType::Int => value.as_u64().is_some(),
+        OptionType::StrList => is_str_list_value(value),
+        OptionType::StrOrStrList => is_str_or_str_list_value(value),
+        OptionType::Regex => is_valid_regex_value(value),
+        OptionType::MapStrList => is_map_str_list_value(value),
+        OptionType::MapStrStr => is_map_str_str_value(value),
+        OptionType::MapStrInt => is_map_str_int_value(value),
+    }
+}
+
+/// Human-readable expectation for an [`OptionType`], used in the
+/// config-error text.
+fn option_type_expectation(expected: OptionType) -> &'static str {
+    match expected {
+        OptionType::Str => "a string",
+        OptionType::Bool => "a boolean",
+        OptionType::Int => "an integer",
+        OptionType::StrList => "a list of strings",
+        OptionType::StrOrStrList => "a string or a list of strings",
+        OptionType::Regex => "a valid regular expression",
+        OptionType::MapStrList => "a map from strings to lists of strings",
+        OptionType::MapStrStr => "a map from strings to strings",
+        OptionType::MapStrInt => "a map from strings to integers",
+    }
+}
+
+/// True for a JSON array of strings.
+fn is_str_list_value(value: &serde_json::Value) -> bool {
+    value
+        .as_array()
+        .is_some_and(|items| items.iter().all(|item| item.is_string()))
+}
+
+/// True for a JSON string or an array of strings.
+fn is_str_or_str_list_value(value: &serde_json::Value) -> bool {
+    value.is_string() || is_str_list_value(value)
+}
+
+/// True for a string compiling as PCRE.
+fn is_valid_regex_value(value: &serde_json::Value) -> bool {
+    value
+        .as_str()
+        .is_some_and(|pattern| arclint::compile_pcre(pattern).is_ok())
+}
+
+/// True for a JSON object whose values are arrays of strings.
+fn is_map_str_list_value(value: &serde_json::Value) -> bool {
+    value
+        .as_object()
+        .is_some_and(|map| map.values().all(is_str_list_value))
+}
+
+/// True for a JSON object whose values are strings.
+fn is_map_str_str_value(value: &serde_json::Value) -> bool {
+    value
+        .as_object()
+        .is_some_and(|map| map.values().all(|entry| entry.is_string()))
+}
+
+/// True for a JSON object whose values are integers.
+fn is_map_str_int_value(value: &serde_json::Value) -> bool {
+    value
+        .as_object()
+        .is_some_and(|map| map.values().all(|entry| entry.as_u64().is_some()))
+}
+
+/// The `phutil.xhpast` standard's severity map (rule ID to severity),
+/// applied to XHP sections naming the standard.
+const PHUTIL_XHPAST_STANDARD_SEVERITY: &[(&str, &str)] =
+    &[("16", "advice"), ("34", "error"), ("87", "warning")];
+
+/// The `phutil.xhpast` standard's rule configuration, applied through
+/// the XHP linter like PHP's `setLinterConfigurationValue()` loop.
+fn phutil_xhpast_standard_config() -> serde_json::Value {
+    serde_json::json!({
+        "xhpast.blacklisted.function": {},
+        "xhpast.php-version": "5.3.0",
+        "xhpast.php-version.windows": "5.4.0",
+        "xhpast.dynamic-string.classes": {},
+        "xhpast.dynamic-string.functions": {},
+    })
+}
+
+/// Build one configured section: instantiate the linter by type,
+/// validate and apply options in PHP table order, validate severity
+/// codes, resolve `standard`, and compile routing.
+fn build_section(
+    spec: &arclint::LinterSpec,
+    global_exclude: &[String],
+    project_root: &Path,
+) -> Result<Section, String> {
+    let mut linter = linter_for_type(&spec.linter_type).ok_or_else(|| {
+        format!(
+            "Error in parsing '.arclint' file: unknown linter type '{}'.",
+            spec.linter_type
+        )
+    })?;
+    let fail = |detail: String| {
+        format!(
+            "Error in parsing '.arclint' file, for linter '{}': {detail}",
+            spec.name
+        )
+    };
+    let canonical = arclint::canonical_config_name(&spec.linter_type).unwrap_or("text");
+    let (table, custom_after_base) = linter_option_table(canonical);
+    reject_unknown_options(
+        &spec.extra,
+        table,
+        canonical,
+        linter.can_customize_severities(),
+    )
+    .map_err(&fail)?;
+    let ctx = OptionContext { project_root };
+    let mut severity;
+    if custom_after_base {
+        severity = apply_base_options(&mut linter, spec, canonical, &ctx).map_err(&fail)?;
+        apply_custom_options(&mut linter, spec, canonical, table, &ctx).map_err(&fail)?;
+        apply_lessc_options(&mut linter, spec, canonical, &ctx).map_err(&fail)?;
+    } else {
+        apply_custom_options(&mut linter, spec, canonical, table, &ctx).map_err(&fail)?;
+        severity = apply_base_options(&mut linter, spec, canonical, &ctx).map_err(&fail)?;
+    }
+    severity.map = validate_severity_map(linter.as_ref(), &severity.map).map_err(&fail)?;
+    linter.set_custom_severity_map(&severity.map);
+    linter.set_custom_severity_rules(&severity.rules);
+    Ok(Section {
+        linter,
+        class: crate::linters::class_for_config(canonical).unwrap_or("ArcanistUnknownLinter"),
+        routing: arclint::SectionRouting::new(&spec.include, &spec.exclude, global_exclude),
+        severity,
+    })
+}
+
+/// Reject `.arclint` keys no linter table declares, in sorted order
+/// for deterministic errors (PHP's `checkMap()` rejects surplus keys
+/// before applying any value).
+fn reject_unknown_options(
+    extra: &HashMap<String, serde_json::Value>,
+    table: &[(&str, OptionType)],
+    canonical: &str,
+    can_customize: bool,
+) -> Result<(), String> {
+    let mut keys: Vec<&str> = extra.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    for key in keys {
+        if key == "standard" {
+            if can_customize {
+                continue;
+            }
+            return Err("unknown option 'standard'.".to_string());
+        }
+        if table.iter().any(|(known, _)| *known == key) {
+            continue;
+        }
+        if canonical == "lessc" && LESSC_CUSTOM_OPTIONS.iter().any(|(known, _)| *known == key) {
+            continue;
+        }
+        return Err(format!("unknown option '{key}'."));
+    }
+    Ok(())
+}
+
+/// Apply linter-specific options in PHP table order (type-check, then
+/// `set_option`, like `checkMap()` feeding
+/// `setLinterConfigurationValue()`).
+fn apply_custom_options(
+    linter: &mut Box<dyn Linter>,
+    spec: &arclint::LinterSpec,
+    canonical: &str,
+    table: &[(&str, OptionType)],
+    ctx: &OptionContext,
+) -> Result<(), String> {
+    for (key, expected) in table {
+        let Some(value) = spec.extra.get(*key) else {
+            continue;
+        };
+        if canonical == "text" && *key == "text.max-line-length" {
+            apply_max_line_length(linter, value, ctx)?;
+            continue;
+        }
+        check_option_type(key, *expected, value)?;
+        linter.set_option(key, value, ctx)?;
+    }
+    Ok(())
+}
+
+/// Lessc's custom keys apply after the base options.
+fn apply_lessc_options(
+    linter: &mut Box<dyn Linter>,
+    spec: &arclint::LinterSpec,
+    canonical: &str,
+    ctx: &OptionContext,
+) -> Result<(), String> {
+    if canonical != "lessc" {
+        return Ok(());
+    }
+    for (key, expected) in LESSC_CUSTOM_OPTIONS {
+        let Some(value) = spec.extra.get(*key) else {
+            continue;
+        };
+        check_option_type(key, *expected, value)?;
+        linter.set_option(key, value, ctx)?;
+    }
+    Ok(())
+}
+
+/// Apply `text.max-line-length`, preserving the long-standing error
+/// texts for non-integer and overflowing values.
+fn apply_max_line_length(
+    linter: &mut Box<dyn Linter>,
+    value: &serde_json::Value,
+    ctx: &OptionContext,
+) -> Result<(), String> {
+    check_option_type("text.max-line-length", OptionType::Int, value)
+        .map_err(|_| "'text.max-line-length' must be an integer".to_string())?;
+    let length = value.as_u64().unwrap_or(DEFAULT_MAX_LINE_LENGTH as u64);
+    if usize::try_from(length).is_err() {
+        return Err("'text.max-line-length' is too large".to_string());
+    }
+    linter.set_option("text.max-line-length", value, ctx)
+}
+
+/// Apply the base options: reject `severity` keys for linters that
+/// cannot customize severities, and resolve `standard` names.
+fn apply_base_options(
+    linter: &mut Box<dyn Linter>,
+    spec: &arclint::LinterSpec,
+    canonical: &str,
+    ctx: &OptionContext,
+) -> Result<arclint::SeverityOverrides, String> {
+    let mut severity = spec.severity.clone();
+    if !linter.can_customize_severities() {
+        if !severity.map.is_empty() {
+            return Err("unknown option 'severity'.".to_string());
+        }
+        if !severity.rules.is_empty() {
+            return Err("unknown option 'severity.rules'.".to_string());
+        }
+        if spec.extra.contains_key("standard") {
+            return Err("unknown option 'standard'.".to_string());
+        }
+        return Ok(severity);
+    }
+    let Some(standard) = spec.extra.get("standard") else {
+        return Ok(severity);
+    };
+    check_option_type("standard", OptionType::StrOrStrList, standard)?;
+    let mut names = Vec::new();
+    if let Some(name) = standard.as_str() {
+        names.push(name.to_string());
+    } else if let Some(items) = standard.as_array() {
+        for item in items {
+            names.push(item.as_str().unwrap_or_default().to_string());
+        }
+    }
+    for name in names {
+        apply_standard(&mut severity, linter, canonical, &name, ctx)?;
+    }
+    Ok(severity)
+}
+
+/// Resolve one `standard` name: only `phutil.xhpast` on the XHP linter
+/// exists (`ArcanistLinterStandard::getStandard()`); anything else is
+/// a configuration error.
+fn apply_standard(
+    severity: &mut arclint::SeverityOverrides,
+    linter: &mut Box<dyn Linter>,
+    canonical: &str,
+    name: &str,
+    ctx: &OptionContext,
+) -> Result<(), String> {
+    if name != "phutil.xhpast" || canonical != "xhpast" {
+        let available = if canonical == "xhpast" {
+            "phutil.xhpast"
+        } else {
+            ""
+        };
+        return Err(format!(
+            "No such linter standard. Available standards are: {available}."
+        ));
+    }
+    // `addCustomSeverityMap()`: existing entries win over the standard.
+    for (code, standard_severity) in PHUTIL_XHPAST_STANDARD_SEVERITY {
+        severity
+            .map
+            .entry((*code).to_string())
+            .or_insert_with(|| (*standard_severity).to_string());
+    }
+    // The standard's rule configuration feeds the linter like PHP's
+    // `setLinterConfigurationValue()` loop (explicit keys apply after
+    // and overwrite these).
+    let config = phutil_xhpast_standard_config();
+    let serde_json::Value::Object(entries) = &config else {
+        return Ok(());
+    };
+    let mut keys: Vec<&String> = entries.keys().collect();
+    keys.sort();
+    for key in keys {
+        linter.set_option(key, &entries[key], ctx)?;
+    }
+    Ok(())
+}
+
+/// Validate `severity` map codes through the linter
+/// (`getLintCodeFromLinterConfigurationKey()`), normalizing keys.
+fn validate_severity_map(
+    linter: &dyn Linter,
+    map: &HashMap<String, String>,
+) -> Result<HashMap<String, String>, String> {
+    let mut out = HashMap::new();
+    let mut codes: Vec<&String> = map.keys().collect();
+    codes.sort();
+    for code in codes {
+        let normalized = linter.validate_severity_entry(code, &map[code])?;
+        out.insert(normalized, map[code].clone());
+    }
+    Ok(out)
 }
 
 impl Engine {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            linters: all_linters(),
-            severity_maps: HashMap::new(),
+            sections: sections_from_pairs(all_linter_pairs()),
             comprehensive: false,
+            cached: CachedResults::new(),
+            repository_version: None,
         }
     }
 
-    /// An engine running only the linters `config` selects, matched by
-    /// exact PHP display name against [`all_linters`], with exact-code
-    /// severity maps and `text.max-line-length` applied.
-    #[must_use]
-    pub fn from_config(config: &arclint::ArclintConfig) -> Self {
-        let max_line_length = text_length_from_config(config).unwrap_or(DEFAULT_MAX_LINE_LENGTH);
-        let severity_maps = severity_maps_from_config(config);
-        let text_map = severity_maps.get("TXT").cloned().unwrap_or_default();
-        let mut linters = all_linters_with_text_options(max_line_length, text_map);
-        arclint::retain_selected(&mut linters, |linter| linter.name(), config);
-        Self {
-            linters,
-            severity_maps,
-            comprehensive: false,
+    /// An engine running one section per configured linter, each with
+    /// its own routed paths, severity overrides, and tool options
+    /// (`buildLinters()`). `project_root` resolves relative `bin`
+    /// candidates and tool config paths. Configuration failures
+    /// (unknown options, bad values, unlocatable binaries, unknown
+    /// standards) are errors, like PHP.
+    pub fn from_config(
+        config: &arclint::ArclintConfig,
+        project_root: &Path,
+    ) -> Result<Self, String> {
+        let mut sections = Vec::new();
+        for spec in &config.linters {
+            sections.push(build_section(spec, &config.global_exclude, project_root)?);
         }
+        Ok(Self {
+            sections,
+            comprehensive: false,
+            cached: CachedResults::new(),
+            repository_version: None,
+        })
     }
 
     /// A comprehensive engine: every ported linter, routed per path by
-    /// [`comprehensive_linters_for`].
+    /// [`comprehensive_linters_for`]. The PEP8 section carries the
+    /// comprehensive `--ignore` flags, like PHP.
     #[must_use]
     pub fn comprehensive() -> Self {
+        let pairs: Vec<(&'static str, Box<dyn Linter>)> = all_linter_pairs()
+            .into_iter()
+            .map(|(canonical, linter)| {
+                if linter.name() == "PEP8" {
+                    (
+                        canonical,
+                        Box::new(crate::lint_pep8::Pep8Linter::comprehensive()) as Box<dyn Linter>,
+                    )
+                } else {
+                    (canonical, linter)
+                }
+            })
+            .collect();
         Self {
-            linters: all_linters(),
-            severity_maps: HashMap::new(),
+            sections: sections_from_pairs(pairs),
             comprehensive: true,
+            cached: CachedResults::new(),
+            repository_version: None,
         }
     }
 
-    /// Keep only the linter with display name `display`.
+    /// Keep only sections running the linter with display name `display`.
     pub fn retain_display(&mut self, display: &str) {
-        self.linters.retain(|linter| linter.name() == display);
+        self.sections
+            .retain(|section| section.linter.name() == display);
     }
 
     #[must_use]
     pub fn empty() -> Self {
         Self {
-            linters: Vec::new(),
-            severity_maps: HashMap::new(),
+            sections: Vec::new(),
             comprehensive: false,
+            cached: CachedResults::new(),
+            repository_version: None,
         }
     }
 
     pub fn add_linter(&mut self, linter: Box<dyn Linter>) {
-        self.linters.push(linter);
+        self.sections
+            .push(Section::open("ArcanistUnknownLinter", linter));
+    }
+
+    /// Inject prior results by path and cache version
+    /// (`setCachedResults()`).
+    pub fn set_cached_results(&mut self, cached: CachedResults) {
+        self.cached = cached;
+    }
+
+    /// Set the current repository version for cache granularity
+    /// checks.
+    pub fn set_repository_version(&mut self, version: Option<String>) {
+        self.repository_version = version;
+    }
+
+    /// Engine cache version (`crc32(implode("\n", $versions))`): the
+    /// engine base (`1`) plus `Class:version` per section, in section
+    /// order. PHP also mixes each linter file's md5, which has no
+    /// port equivalent, so values are port-local (deterministic, but
+    /// never equal to PHP's).
+    #[must_use]
+    pub fn cache_version(&self) -> u32 {
+        let mut parts = vec!["1".to_string()];
+        for section in &self.sections {
+            parts.push(format!(
+                "{}:{}",
+                section.class,
+                section.linter.cache_version()
+            ));
+        }
+        crc32_ieee(parts.join("\n").as_bytes())
     }
 
     /// True when the engine runs no linters (`'No linters to run.'`).
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.linters.is_empty()
+        self.sections.is_empty()
     }
 
     /// True for [`Engine::comprehensive`].
@@ -1071,56 +1952,145 @@ impl Engine {
         self.comprehensive
     }
 
-    /// Resolve the effective severity for a message, mirroring
-    /// `getLintMessageSeverity()`
-    /// (`src/lint/linter/ArcanistLinter.php:350-368`): the exact custom
-    /// map first (keyed by full code, then by the short code with the
-    /// display-name prefix stripped), else the linter's own severity.
-    /// `severity.rules` patterns need a regex engine and never match.
+    /// Resolve the effective severity for a message through the first
+    /// section running `display`, mirroring `getLintMessageSeverity()`
+    /// (`src/lint/linter/ArcanistLinter.php:350-360`): the exact custom
+    /// map first (keyed by the lookup code: short codes for
+    /// `raiseLintAt*` linters, full codes for direct-message
+    /// linters), then the first matching `severity.rules` pattern,
+    /// else the linter's own severity.
     #[must_use]
     pub fn severity_for(&self, display: &str, full_code: &str, default: &str) -> String {
-        let Some(map) = self.severity_maps.get(display) else {
+        let Some(section) = self
+            .sections
+            .iter()
+            .find(|section| section.linter.name() == display)
+        else {
             return default.to_string();
         };
-        if let Some(severity) = map.get(full_code) {
-            return severity.clone();
-        }
-        if let Some(short) = full_code.strip_prefix(display)
-            && let Some(severity) = map.get(short)
-        {
-            return severity.clone();
-        }
-        default.to_string()
+        let lookup = section.linter.severity_lookup_code(full_code);
+        section.severity.severity_for(lookup, default)
     }
 
-    /// Linters in execution order: stable by ascending
+    /// Sections in execution order: stable by ascending
     /// [`Linter::priority`] (`msort($linters, 'getLinterPriority')`,
-    /// `ArcanistLintEngine.php:165`).
-    fn ordered_linters(&self) -> Vec<&dyn Linter> {
-        let mut linters: Vec<&dyn Linter> = self.linters.iter().map(AsRef::as_ref).collect();
-        linters.sort_by(|a, b| {
-            a.priority()
-                .partial_cmp(&b.priority())
+    /// `ArcanistLintEngine.php:165`), with build-order indexes (for
+    /// cached `stopped` markers, which record build-order linter IDs).
+    fn ordered_sections(&self) -> Vec<(usize, &Section)> {
+        let mut sections: Vec<(usize, &Section)> = self.sections.iter().enumerate().collect();
+        sections.sort_by(|a, b| {
+            a.1.linter
+                .priority()
+                .partial_cmp(&b.1.linter.priority())
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        linters
+        sections
     }
 
-    fn apply_severity_maps(&self, display: &str, messages: &mut [LintMessage]) {
-        if !self.severity_maps.contains_key(display) {
+    /// This path's cached results at the current cache version, if any.
+    fn cache_entry_for(&self, path: &str) -> Option<&CachedPathResults> {
+        self.cached
+            .get(path)
+            .and_then(|by_version| by_version.get(&self.cache_version()))
+    }
+
+    /// Per-section prelude for [`Engine::lint_bytes`]: comprehensive
+    /// allow-listing, path routing, and the cache short-circuit
+    /// (`ArcanistLintEngine.php:511-526`). Restores a recorded stop
+    /// and reports whether the caller should skip execution.
+    fn section_preskip(
+        &self,
+        section: &Section,
+        path: &str,
+        allowed: &Option<Vec<&'static str>>,
+        entry: Option<&CachedPathResults>,
+        index: usize,
+        stopped: &mut bool,
+    ) -> bool {
+        if let Some(names) = allowed
+            && !names.contains(&section.linter.name())
+        {
+            return true;
+        }
+        if !section.routing.allows(path) {
+            return true;
+        }
+        let Some(entry) = entry else {
+            return false;
+        };
+        if !should_use_cache(
+            Some(section.linter.cache_granularity()),
+            entry.repository_version.as_deref(),
+            self.repository_version.as_deref(),
+        ) {
+            return false;
+        }
+        if entry.stopped == Some(index) {
+            *stopped = true;
+        }
+        true
+    }
+
+    /// Merge reusable cached messages for `path`
+    /// (`ArcanistLintEngine.php:224-240`): file granularity always,
+    /// directory/repository only on repository-version match.
+    fn merge_cached_messages(&self, path: &str, out: &mut Vec<LintMessage>) {
+        let Some(entry) = self.cache_entry_for(path) else {
+            return;
+        };
+        let cached_repository = entry.repository_version.as_deref();
+        for cached in &entry.messages {
+            if should_use_cache(
+                cached.granularity,
+                cached_repository,
+                self.repository_version.as_deref(),
+            ) {
+                out.push(cached.message.clone());
+            }
+        }
+    }
+
+    /// Apply one section's severity overrides to its messages.
+    fn apply_section_severity(section: &Section, messages: &mut [LintMessage]) {
+        if !section.linter.applies_custom_severities() {
             return;
         }
         for message in messages.iter_mut() {
-            message.severity = self.severity_for(display, &message.code.clone(), &message.severity);
+            let lookup = section.linter.severity_lookup_code(&message.code);
+            let lookup = lookup.to_string();
+            message.severity = section
+                .severity
+                .severity_for(&lookup, &message.severity.clone());
+        }
+    }
+
+    /// Text stop rules for [`Engine::lint_bytes`]: an empty file
+    /// always stops the engine; DOS newlines and bad charsets stop
+    /// unless custom-disabled for the section.
+    fn apply_text_stops(section: &Section, messages: &[LintMessage], stopped: &mut bool) {
+        if messages.iter().any(|m| m.code == CODE_EMPTY_FILE) {
+            *stopped = true;
+        } else {
+            if messages.iter().any(|m| m.code == CODE_DOS_NEWLINE)
+                && Self::text_stop_enabled(section, CODE_DOS_NEWLINE)
+            {
+                *stopped = true;
+            }
+            if messages.iter().any(|m| m.code == CODE_BAD_CHARSET)
+                && Self::text_stop_enabled(section, CODE_BAD_CHARSET)
+            {
+                *stopped = true;
+            }
         }
     }
 
     /// True when a text stop code fired and is not custom-disabled,
     /// mirroring `isMessageEnabled()`
-    /// (`ArcanistLinter.php:374-377`): only the exact custom map can
-    /// disable it here.
-    fn text_stop_enabled(&self, full_code: &str) -> bool {
-        self.severity_for("TXT", full_code, SEVERITY_ERROR) != SEVERITY_DISABLED
+    /// (`ArcanistLinter.php:374-377`): the exact custom map and
+    /// `severity.rules` both apply, like `getLintMessageSeverity()`.
+    fn text_stop_enabled(section: &Section, full_code: &str) -> bool {
+        let lookup = section.linter.severity_lookup_code(full_code);
+        section.severity.severity_for(lookup, SEVERITY_ERROR) != SEVERITY_DISABLED
     }
 
     #[must_use]
@@ -1131,7 +2101,9 @@ impl Engine {
         }
         let allowed = routed.flatten();
         let runs = |name: &str| {
-            self.linters.iter().any(|linter| linter.name() == name)
+            self.sections
+                .iter()
+                .any(|section| section.linter.name() == name && section.routing.allows(path))
                 && allowed.as_ref().is_none_or(|names| names.contains(&name))
         };
 
@@ -1146,38 +2118,26 @@ impl Engine {
 
         let mut out = Vec::new();
         let mut stopped = false;
-        for linter in self.ordered_linters() {
+        let entry = self.cache_entry_for(path);
+        for (index, section) in self.ordered_sections() {
             if stopped {
                 break;
             }
-            if let Some(names) = &allowed
-                && !names.contains(&linter.name())
-            {
+            if self.section_preskip(section, path, &allowed, entry, index, &mut stopped) {
                 continue;
             }
-            let mut messages = linter.lint_bytes(path, data);
-            self.apply_severity_maps(linter.name(), &mut messages);
+            let mut messages = section.linter.lint_bytes(path, data);
+            Self::apply_section_severity(section, &mut messages);
+            stopped |= section.linter.take_halt();
             // Text stops (`lintEmptyFile`, `lintNewlines`, `lintCharset`):
             // an empty file always stops; DOS newlines and bad charsets
             // stop unless custom-disabled.
-            if linter.name() == "TXT" {
-                if messages.iter().any(|m| m.code == CODE_EMPTY_FILE) {
-                    stopped = true;
-                } else {
-                    if messages.iter().any(|m| m.code == CODE_DOS_NEWLINE)
-                        && self.text_stop_enabled(CODE_DOS_NEWLINE)
-                    {
-                        stopped = true;
-                    }
-                    if messages.iter().any(|m| m.code == CODE_BAD_CHARSET)
-                        && self.text_stop_enabled(CODE_BAD_CHARSET)
-                    {
-                        stopped = true;
-                    }
-                }
+            if section.linter.name() == "TXT" {
+                Self::apply_text_stops(section, &messages, &mut stopped);
             }
             out.extend(messages);
         }
+        self.merge_cached_messages(path, &mut out);
         out.sort_by(|a, b| {
             (&a.path, a.line, a.col, &a.code).cmp(&(&b.path, b.line, b.col, &b.code))
         });
@@ -1223,23 +2183,38 @@ impl Engine {
         data: &[u8],
         filter: impl Fn(&dyn Linter) -> bool,
     ) -> Vec<LintMessage> {
-        let mut linters = self.ordered_linters();
-        linters.retain(|linter| filter(*linter));
+        let mut sections = self.ordered_sections();
+        sections.retain(|(_, section)| filter(section.linter.as_ref()));
         let allowed = self
             .comprehensive
             .then(|| comprehensive_linters_for(path))
             .flatten();
         let mut out = Vec::new();
-        for linter in linters {
+        let entry = self.cache_entry_for(path);
+        for (_, section) in sections {
             if let Some(names) = &allowed
-                && !names.contains(&linter.name())
+                && !names.contains(&section.linter.name())
             {
                 continue;
             }
-            let mut messages = linter.lint_bytes(path, data);
-            self.apply_severity_maps(linter.name(), &mut messages);
+            if !section.routing.allows(path) {
+                continue;
+            }
+            // Cached results skip execution, like `lint_bytes()`.
+            if let Some(entry) = entry
+                && should_use_cache(
+                    Some(section.linter.cache_granularity()),
+                    entry.repository_version.as_deref(),
+                    self.repository_version.as_deref(),
+                )
+            {
+                continue;
+            }
+            let mut messages = section.linter.lint_bytes(path, data);
+            Self::apply_section_severity(section, &mut messages);
             out.extend(messages);
         }
+        self.merge_cached_messages(path, &mut out);
         out.sort_by(|a, b| {
             (&a.path, a.line, a.col, &a.code).cmp(&(&b.path, b.line, b.col, &b.code))
         });
@@ -1372,9 +2347,9 @@ fn project_root_for(vcs_root: PathBuf, start: &Path, vcs: Vcs) -> PathBuf {
     vcs_root
 }
 
-/// Read one key from the project `.arcconfig` (`getConfigFromAnySource()`
-/// restricted to the project layer). A missing file yields `None`; an
-/// invalid one is an error.
+/// Read one key from the project `.arcconfig` only (the project layer;
+/// [`config_value`] reads the full local > project > user > system
+/// cascade). A missing file yields `None`; an invalid one is an error.
 pub fn arcconfig_value(
     project_root: &Path,
     key: &str,
@@ -1390,8 +2365,66 @@ pub fn arcconfig_value(
     Ok(parsed.get(key).cloned())
 }
 
-fn arcconfig_string(project_root: &Path, key: &str) -> Result<Option<String>, String> {
-    match arcconfig_value(project_root, key)? {
+/// Read one key through the local > project > user > system cascade
+/// (`getConfigFromAnySource()`), with `willReadValue()` type checks.
+/// Every non-null layer value is type-checked in precedence order
+/// (PHP builds the full map before picking the winner); the first
+/// non-null value wins. Layer paths are explicit for testability.
+fn config_value_in(
+    project_root: &Path,
+    local_path: Option<&Path>,
+    user_path: Option<&Path>,
+    system_path: Option<&Path>,
+    key: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let project_file = project_root.join(".arcconfig");
+    let mut layers: Vec<(&Path, bool)> = Vec::new();
+    if let Some(path) = local_path {
+        layers.push((path, false));
+    }
+    layers.push((&project_file, false));
+    if let Some(path) = user_path {
+        layers.push((path, true));
+    }
+    if let Some(path) = system_path {
+        layers.push((path, false));
+    }
+    let mut winner: Option<serde_json::Value> = None;
+    for (path, user_layer) in layers {
+        let Some(found) = read_config_layer(path, key, user_layer)? else {
+            continue;
+        };
+        if found.is_null() {
+            continue;
+        }
+        check_config_type(key, &found)?;
+        if winner.is_none() {
+            winner = Some(found);
+        }
+    }
+    Ok(winner)
+}
+
+/// Read one key through the configuration cascade with default user
+/// and system locations from the environment (`HOME`/`APPDATA`,
+/// `/etc/arcconfig`/`ProgramData`). Skips the interactive
+/// `~/.arcrc` permission prompt (always reads).
+fn config_value(work: &WorkCopy, key: &str) -> Result<Option<serde_json::Value>, String> {
+    let local = local_config_path(work);
+    config_value_in(
+        &work.project_root,
+        local.as_deref(),
+        default_user_config_path().as_deref(),
+        default_system_config_path().as_deref(),
+        key,
+    )
+}
+
+/// Cascade string reader: empty strings read as missing (PHP falsy);
+/// non-strings read as missing for `wild` keys (PHP passes those
+/// through, but no lint caller accepts them).
+fn config_string(work: &WorkCopy, key: &str) -> Result<Option<String>, String> {
+    match config_value(work, key)? {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(serde_json::Value::String(text)) if text.is_empty() => Ok(None),
         Some(serde_json::Value::String(text)) => Ok(Some(text)),
@@ -1399,10 +2432,111 @@ fn arcconfig_string(project_root: &Path, key: &str) -> Result<Option<String>, St
     }
 }
 
-fn arcconfig_bool(project_root: &Path, key: &str) -> Result<Option<bool>, String> {
-    match arcconfig_value(project_root, key)? {
+/// Cascade boolean reader.
+fn config_bool(work: &WorkCopy, key: &str) -> Result<Option<bool>, String> {
+    match config_value(work, key)? {
         Some(serde_json::Value::Bool(value)) => Ok(Some(value)),
         _ => Ok(None),
+    }
+}
+
+/// Read `key` from one layer file: missing files and non-object JSON
+/// contribute nothing; invalid JSON is an error. User files read the
+/// nested `config` map when present, else the top level.
+fn read_config_layer(
+    path: &Path,
+    key: &str,
+    user_layer: bool,
+) -> Result<Option<serde_json::Value>, String> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read '{}': {e}", path.display()))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).map_err(|_| invalid_config_text(path, user_layer))?;
+    let Some(object) = parsed.as_object() else {
+        return Ok(None);
+    };
+    if user_layer {
+        match object.get("config") {
+            None | Some(serde_json::Value::Null) => Ok(object.get(key).cloned()),
+            Some(nested) => Ok(nested.as_object().and_then(|map| map.get(key)).cloned()),
+        }
+    } else {
+        Ok(object.get(key).cloned())
+    }
+}
+
+/// Invalid-JSON error text per layer.
+fn invalid_config_text(path: &Path, user_layer: bool) -> String {
+    if user_layer {
+        "Your '~/.arcrc' file is not a valid JSON file.".to_string()
+    } else if path.ends_with(".arcconfig") {
+        format!("Unable to parse '.arcconfig' file '{}'.", path.display())
+    } else {
+        format!("Your '{}' file is not a valid JSON file.", path.display())
+    }
+}
+
+/// `willReadValue()` type checks for the keys lint reads
+/// (`lint.engine` is a string, `history.immutable` is a bool,
+/// everything else is `wild`).
+fn check_config_type(key: &str, value: &serde_json::Value) -> Result<(), String> {
+    let want = match key {
+        "lint.engine" if !value.is_string() => "string",
+        "history.immutable" if !value.is_boolean() => "boolean",
+        _ => return Ok(()),
+    };
+    Err(format!("Type of setting '{key}' must be {want}."))
+}
+
+/// Local layer path: `<metadata>/arc/config` for the working copy's
+/// VCS, following gitfile pointers (linked worktrees, submodules).
+fn local_config_path(work: &WorkCopy) -> Option<PathBuf> {
+    let meta = match work.vcs {
+        Vcs::Git => ".git",
+        Vcs::Hg => ".hg",
+        Vcs::Svn => ".svn",
+    };
+    let dir = work.vcs_root.join(meta);
+    if dir.is_dir() {
+        return Some(dir.join("arc/config"));
+    }
+    if matches!(work.vcs, Vcs::Git)
+        && dir.is_file()
+        && let Ok(text) = std::fs::read_to_string(&dir)
+        && let Some(target) = text.strip_prefix("gitdir:").map(str::trim)
+    {
+        let target = Path::new(target);
+        let base = if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            work.vcs_root.join(target)
+        };
+        return Some(base.join("arc/config"));
+    }
+    None
+}
+
+/// Default user layer path: `$HOME/.arcrc`, or `%APPDATA%/.arcrc` on
+/// Windows.
+fn default_user_config_path() -> Option<PathBuf> {
+    if cfg!(windows) {
+        std::env::var_os("APPDATA").map(|dir| Path::new(&dir).join(".arcrc"))
+    } else {
+        std::env::var_os("HOME").map(|dir| Path::new(&dir).join(".arcrc"))
+    }
+}
+
+/// Default system layer path: `/etc/arcconfig`, or
+/// `%ProgramData%/Phabricator/Arcanist/config` on Windows.
+fn default_system_config_path() -> Option<PathBuf> {
+    if cfg!(windows) {
+        std::env::var_os("ProgramData")
+            .map(|dir| Path::new(&dir).join("Phabricator/Arcanist/config"))
+    } else {
+        Some(PathBuf::from("/etc/arcconfig"))
     }
 }
 
@@ -1433,7 +2567,7 @@ fn git_default_base(
     if !git_repository_has_two_commits(&work.vcs_root) {
         return Ok(git::GIT_MAGIC_ROOT_COMMIT.to_string());
     }
-    if let Some(relative) = arcconfig_string(&work.project_root, "git.default-relative-commit")? {
+    if let Some(relative) = config_string(work, "git.default-relative-commit")? {
         return git_merge_base_with_head(&work.vcs_root, &relative);
     }
     if let Ok(out) = git::output(
@@ -2036,7 +3170,8 @@ fn check_supports(options: &Options, vcs: Vcs) -> Result<(), String> {
 /* -(  Engines  )-------------------------------------------------------------- */
 
 /// Resolve the lint engine (`ArcanistWorkflow::newLintEngine()`,
-/// `:2056-2095`): `--engine`, else `.arcconfig` `lint.engine`, else the
+/// `:2056-2095`): `--engine`, else `lint.engine` from any config
+/// source (local > project > user > system), else the
 /// configuration-driven engine when `.arclint` exists at the project
 /// root, else the no-engine error.
 pub fn engine_for_workcopy(work: &WorkCopy, cli_engine: Option<&str>) -> Result<Engine, String> {
@@ -2044,7 +3179,7 @@ pub fn engine_for_workcopy(work: &WorkCopy, cli_engine: Option<&str>) -> Result<
         .filter(|name| !name.is_empty())
         .map(str::to_string);
     if class.is_none() {
-        class = arcconfig_string(&work.project_root, "lint.engine")?;
+        class = config_string(work, "lint.engine")?;
     }
     if class.is_none() && work.project_root.join(arclint::CONFIG_FILE_NAME).is_file() {
         class = Some(ENGINE_CONFIGURATION_DRIVEN.to_string());
@@ -2056,7 +3191,7 @@ pub fn engine_for_workcopy(work: &WorkCopy, cli_engine: Option<&str>) -> Result<
     match class.as_str() {
         ENGINE_CONFIGURATION_DRIVEN => {
             let config = arclint::load_arclint(&work.project_root)?;
-            Ok(Engine::from_config(&config))
+            Engine::from_config(&config, &work.project_root)
         }
         ENGINE_COMPREHENSIVE => Ok(Engine::comprehensive()),
         ENGINE_SINGLE => single_engine(work),
@@ -2070,7 +3205,7 @@ pub fn engine_for_workcopy(work: &WorkCopy, cli_engine: Option<&str>) -> Result<
 /// `lint.engine.single.linter` on every path.
 fn single_engine(work: &WorkCopy) -> Result<Engine, String> {
     const KEY: &str = "lint.engine.single.linter";
-    let name = arcconfig_string(&work.project_root, KEY)?;
+    let name = config_string(work, KEY)?;
     let Some(name) = name else {
         return Err(format!(
             "You must configure '{KEY}' with the name of a linter in order to use {ENGINE_SINGLE}."
@@ -2779,10 +3914,34 @@ pub fn render_json_result(result: &LintResult) -> String {
         .collect();
     let mut map = serde_json::Map::new();
     map.insert(result.path.clone(), serde_json::Value::Array(dicts));
-    // PHP `json_encode()` escapes `/` as `\/`.
-    serde_json::to_string(&map)
+    // PHP `json_encode()` (default flags) escapes `/` as `\/` and every
+    // non-ASCII char as `\uXXXX`.
+    let rendered = serde_json::to_string(&map)
         .unwrap_or_else(|_| "{}".to_string())
-        .replace('/', "\\/")
+        .replace('/', "\\/");
+    json_escape_nonascii(&rendered)
+}
+
+/// Escape non-ASCII text like PHP `json_encode()`: every char at or
+/// above DEL becomes `\uXXXX` (surrogate pairs above the BMP).
+/// Serialized JSON syntax is ASCII-only, so only string contents (and
+/// raw UTF-8 in them) change; existing escapes pass through.
+fn json_escape_nonascii(rendered: &str) -> String {
+    if rendered.chars().all(|ch| (ch as u32) < 0x7f) {
+        return rendered.to_string();
+    }
+    let mut out = String::with_capacity(rendered.len());
+    for ch in rendered.chars() {
+        if (ch as u32) < 0x7f {
+            out.push(ch);
+        } else {
+            let mut encoded = [0u16; 2];
+            for unit in ch.encode_utf16(&mut encoded) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    out
 }
 
 /// Escape XML attribute text like `XMLWriter`.
@@ -3284,7 +4443,7 @@ fn maybe_amend(
 ) -> Result<(), String> {
     let mut should_amend = options.amend_all || options.amend_autofixes;
     if should_amend {
-        let immutable = arcconfig_bool(&work.project_root, "history.immutable")?
+        let immutable = config_bool(work, "history.immutable")?
             .unwrap_or_else(|| work.vcs.is_history_default_immutable());
         should_amend = work.vcs.supports_amend(&work.vcs_root) && !immutable;
     }

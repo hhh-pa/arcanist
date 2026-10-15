@@ -18,7 +18,7 @@
 
 extern crate self as arc_rs;
 
-use arc_rs::lint::{LintMessage, Linter};
+use arc_rs::lint::{LintMessage, Linter, OptionContext};
 
 /// Full code for exact-word findings (`SPELL` + `LINT_SPELLING_EXACT`).
 pub const CODE_EXACT: &str = "SPELL1";
@@ -168,6 +168,35 @@ impl Default for SpellingLinter {
 impl Linter for SpellingLinter {
     fn name(&self) -> &'static str {
         "SPELL"
+    }
+
+    fn severity_lookup_code<'a>(&self, full_code: &'a str) -> &'a str {
+        full_code.strip_prefix("SPELL").unwrap_or(full_code)
+    }
+
+    fn set_option(
+        &mut self,
+        key: &str,
+        value: &serde_json::Value,
+        ctx: &OptionContext,
+    ) -> Result<(), String> {
+        if key != "spelling.dictionaries" {
+            return Err(format!("unknown option '{key}'."));
+        }
+        let Some(items) = value.as_array() else {
+            return Err("'spelling.dictionaries' must be a list of strings".to_string());
+        };
+        for item in items {
+            let Some(relative) = item.as_str() else {
+                return Err("'spelling.dictionaries' must be a list of strings".to_string());
+            };
+            // PHP resolves against the process working directory; the
+            // port resolves against the project root like every other
+            // tool path.
+            let path = ctx.project_root.join(relative);
+            self.load_dictionary_file(&path)?;
+        }
+        Ok(())
     }
 
     fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {

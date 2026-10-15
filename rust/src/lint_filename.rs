@@ -44,6 +44,10 @@ impl Linter for FilenameLinter {
         "NAME"
     }
 
+    fn severity_lookup_code<'a>(&self, full_code: &'a str) -> &'a str {
+        full_code.strip_prefix("NAME").unwrap_or(full_code)
+    }
+
     // PHP lints binary files, directories, and symlinks with this
     // linter (`ArcanistFilenameLinter.php:28-54`).
     fn should_lint_binary_files(&self) -> bool {

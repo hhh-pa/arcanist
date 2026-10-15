@@ -11,9 +11,9 @@
 //!
 //! Only `.coffee` files are examined; binary data (NUL byte) is skipped.
 //! Directories and symlinks are skipped by `Engine::lint_file` before bytes
-//! reach here. Linter configuration (`coffeelint.config`, custom
-//! `bin`/`flags`) is not supported. The tool lints a temp copy of the
-//! input, so config discovery relative to the source file does not apply.
+//! reach here. The `bin`, `flags`, `version`, and `coffeelint.config`
+//! linter options apply (N4). The tool lints a temp copy of the input,
+//! so config discovery relative to the source file does not apply.
 
 extern crate self as arc_rs;
 
@@ -21,7 +21,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arc_rs::lint::{LintMessage, Linter};
+use arc_rs::lint::{LintMessage, Linter, OptionContext};
+use arc_rs::lint_external::{ToolOptions, apply_tool_option, version_requirement_satisfied};
+use arc_rs::linters::version_pattern_for;
 
 /// Registry name, matching PHP `getLinterName()`.
 pub const LINTER_NAME: &str = "COFFEE";
@@ -38,12 +40,14 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Default)]
 pub struct CoffeelintLinter {
     binary: Option<PathBuf>,
+    options: ToolOptions,
+    config: Option<String>,
 }
 
 impl CoffeelintLinter {
     #[must_use]
     pub fn new() -> Self {
-        Self { binary: None }
+        Self::default()
     }
 
     /// Override the tool binary (mirrors PHP `setBinary()`); used by tests
@@ -52,6 +56,8 @@ impl CoffeelintLinter {
     pub fn with_binary(path: &Path) -> Self {
         Self {
             binary: Some(path.to_path_buf()),
+            options: ToolOptions::default(),
+            config: None,
         }
     }
 
@@ -59,13 +65,31 @@ impl CoffeelintLinter {
         if let Some(path) = &self.binary {
             return path.is_file().then(|| path.clone());
         }
+        if let Some(path) = &self.options.bin {
+            return Some(path.clone());
+        }
         find_on_path(BINARY)
+    }
+
+    /// Effective tool flags (without the file): mandatory plus
+    /// configured-or-default, mirroring `getCommandFlags()`.
+    fn tool_flags(&self) -> Vec<String> {
+        let mut mandatory = vec!["--reporter=raw".to_string()];
+        if let Some(config) = &self.config {
+            mandatory.push(format!("--file={config}"));
+        }
+        self.options.command_flags(&mandatory, &[])
     }
 }
 
 impl Linter for CoffeelintLinter {
     fn name(&self) -> &'static str {
         LINTER_NAME
+    }
+
+    fn applies_custom_severities(&self) -> bool {
+        // The PHP linter never consults custom severity maps or rules.
+        false
     }
 
     fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {
@@ -75,10 +99,21 @@ impl Linter for CoffeelintLinter {
         let Some(binary) = self.resolve_binary() else {
             return Vec::new();
         };
+        if let Some(requirement) = &self.options.version
+            && !version_requirement_satisfied(
+                version_pattern_for("coffeelint"),
+                &binary,
+                requirement,
+                "ArcanistCoffeeLintLinter",
+            )
+        {
+            return Vec::new();
+        }
         let Some(input) = write_temp_file(SLUG, path, "coffee", data) else {
             return Vec::new();
         };
-        let args = vec!["--reporter=raw".to_string(), input.display().to_string()];
+        let mut args = self.tool_flags();
+        args.push(input.display().to_string());
         let found = run_tool(&binary, &args).map_or_else(Vec::new, |out| {
             match parse_raw_output(path, &out.stdout) {
                 Ok(parsed) => finish(path, &out, parsed),
@@ -88,6 +123,31 @@ impl Linter for CoffeelintLinter {
         });
         std::fs::remove_file(&input).ok();
         found
+    }
+
+    fn set_option(
+        &mut self,
+        key: &str,
+        value: &serde_json::Value,
+        ctx: &OptionContext,
+    ) -> Result<(), String> {
+        if key == "coffeelint.config" {
+            let Some(config) = value.as_str() else {
+                return Err("'coffeelint.config' must be a string".to_string());
+            };
+            self.config = Some(config.to_string());
+            return Ok(());
+        }
+        apply_tool_option(&mut self.options, key, value, ctx.project_root)
+    }
+
+    fn validate_severity_code(&self, _code: &str) -> Result<String, String> {
+        // Rules can't be identified from messages, like PHP.
+        Err(
+            "CoffeeLint does not currently support custom severity levels, because rules can't \
+             be identified from messages in output."
+                .to_string(),
+        )
     }
 }
 
@@ -135,7 +195,10 @@ pub fn parse_raw_output(path: &str, stdout: &str) -> Result<Vec<LintMessage>, St
             severity: severity.to_string(),
             name: ucwords(&raw_name.replace('_', " ")),
             description: message.to_string(),
-            original: None,
+            original: item
+                .get("line")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
             replacement: None,
         });
     }
@@ -146,22 +209,19 @@ fn json_usize(value: &serde_json::Value) -> Option<usize> {
     value.as_u64().and_then(|n| usize::try_from(n).ok())
 }
 
-/// Uppercase the first letter of every whitespace-separated word.
+/// Uppercase ASCII initials after whitespace, mirroring PHP `ucwords()`
+/// (byte-based: only `a-z` change, so non-ASCII bytes pass through).
 fn ucwords(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut new_word = true;
-    for ch in text.chars() {
-        if ch.is_whitespace() {
-            new_word = true;
-            out.push(ch);
-        } else if new_word {
-            out.extend(ch.to_uppercase());
-            new_word = false;
-        } else {
-            out.push(ch);
+    let mut out = text.as_bytes().to_vec();
+    let mut start = true;
+    for byte in &mut out {
+        if start {
+            byte.make_ascii_uppercase();
         }
+        start = matches!(*byte, b' ' | b'\t' | b'\r' | b'\n' | b'\x0C' | b'\x0B');
     }
-    out
+    // ASCII case mapping preserves UTF-8 validity.
+    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
 }
 
 fn should_lint(path: &str) -> bool {

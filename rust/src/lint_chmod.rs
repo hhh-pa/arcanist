@@ -297,6 +297,10 @@ impl Linter for ChmodLinter {
         "CHMOD"
     }
 
+    fn severity_lookup_code<'a>(&self, full_code: &'a str) -> &'a str {
+        full_code.strip_prefix("CHMOD").unwrap_or(full_code)
+    }
+
     // PHP lints binaries with this linter
     // (`ArcanistChmodLinter.php:40-42`).
     fn should_lint_binary_files(&self) -> bool {

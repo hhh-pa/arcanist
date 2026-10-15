@@ -59,25 +59,6 @@ fn args(list: &[&str]) -> Vec<String> {
     list.iter().map(|item| (*item).to_string()).collect()
 }
 
-/// Test-only PCRE-subset evaluator for the fixture patterns, standing in
-/// for the caller-supplied engine: `(\.ext$)` suffix, `(^prefix)` prefix,
-/// otherwise substring.
-fn fixture_matcher(pattern: &str, path: &str) -> bool {
-    if let Some(ext) = pattern
-        .strip_prefix("(\\.")
-        .and_then(|rest| rest.strip_suffix("$)"))
-    {
-        return path.ends_with(&format!(".{ext}"));
-    }
-    if let Some(prefix) = pattern
-        .strip_prefix("(^")
-        .and_then(|rest| rest.strip_suffix(")"))
-    {
-        return path.starts_with(prefix);
-    }
-    path.contains(pattern)
-}
-
 #[test]
 fn module_names_match() {
     assert_eq!(markers::NAME, "markers");
@@ -95,14 +76,13 @@ fn arclint_sample_plans_paths() {
         .iter()
         .map(|item| (*item).to_string())
         .collect::<Vec<_>>();
-    let plans = arclint::plan_for_paths(&config, &paths, fixture_matcher);
+    let plans = arclint::plan_for_paths(&config, &paths);
     assert_eq!(plans.len(), 3);
-    // The global exclude drops externals for every linter.
-    assert!(
-        plans
-            .iter()
-            .all(|plan| { !plan.paths.iter().any(|path| path.contains("externals/")) })
-    );
+    // The fixture's global `externals/` pattern has no PCRE delimiters,
+    // so it never matches (PHP warns and returns false); every path
+    // without an include list is kept.
+    let text = plans.iter().find(|plan| plan.display == "TXT").unwrap();
+    assert_eq!(text.paths, paths);
     let json = plans.iter().find(|plan| plan.display == "JSON").unwrap();
     assert_eq!(json.paths, vec!["data/c.json".to_string()]);
 }

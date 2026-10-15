@@ -12,21 +12,26 @@
 //! description, and severity 0=advice, 1=autofix, 2=warning, 3=error,
 //! 4=disabled.
 //!
-//! Known limits (see T1128): the `discovery` and `binary` linter options
-//! are not supported (empty discovery map, PATH lookup); only one file is
-//! passed per invocation (PHP batches paths up to the command-line
-//! limit); a nonzero tool exit or invalid JSON yields no messages (the
-//! PHP linter raises, but the [`Linter`](arc_rs::lint::Linter) trait has
-//! no error channel); reported paths are the display paths passed to
+//! Known limits (see T1128): only one file is passed per invocation
+//! (PHP batches paths up to the command-line limit); a nonzero tool exit
+//! or invalid JSON yields no messages (the PHP linter raises, but the
+//! [`Linter`](arc_rs::lint::Linter) trait has no error channel); reported
+//! paths are the display paths passed to
 //! [`lint_bytes`](arc_rs::lint::Linter::lint_bytes), never the staged
-//! temp-file paths.
+//! temp-file paths. A missing tool, a missing Mono runtime, or a cslint
+//! version other than 1 makes the linter inactive (the PHP linter raises;
+//! same silent-inactive treatment as other external tools here). The
+//! `binary` hint resolves against the project root (PHP resolves against
+//! the process working directory). Discovery-map keys serialize in sorted
+//! order (the JSON map preserves no insertion order here).
 
 extern crate self as arc_rs;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use arc_rs::lint::{LintMessage, Linter, SEVERITY_AUTOFIX, SEVERITY_ERROR};
+use arc_rs::lint::{LintMessage, Linter, OptionContext, SEVERITY_AUTOFIX, SEVERITY_ERROR};
 
 /// Companion severities mirroring `ArcanistLintSeverity`; `lint.rs` only
 /// defines the severities the text linter uses.
@@ -36,14 +41,34 @@ const SEVERITY_DISABLED: &str = "disabled";
 
 /// C# linter: `cslint.exe` findings via an external binary.
 #[derive(Debug, Default)]
-pub struct CsharpLinter;
+pub struct CsharpLinter {
+    binary_hint: Option<PathBuf>,
+    discovery: Option<BTreeMap<String, Vec<String>>>,
+}
 
 impl CsharpLinter {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Resolve the tool honoring the configured `binary` hint and
+    /// discovery map, mirroring `loadEnvironment()`; `None` means
+    /// inactive (tool, runtime, or supported version missing).
+    fn resolve(&self) -> Option<(PathBuf, Vec<String>)> {
+        let path = std::env::var_os("PATH")?;
+        let settings = settings_base64(self.discovery.as_ref());
+        let (program, prefix) = resolve_command_in(&path, self.binary_hint.as_deref(), &settings)?;
+        if version_supported(&program, &prefix) {
+            Some((program, prefix))
+        } else {
+            None
+        }
     }
 }
+
+/// `SUPPORTED_VERSION`: only cslint 1 is accepted, like PHP.
+const SUPPORTED_VERSION: i64 = 1;
 
 /// Analyzer binary name, mirroring the `cslint.exe` PATH lookup.
 #[must_use]
@@ -67,10 +92,112 @@ pub fn default_settings_base64() -> &'static str {
 /// `--settings-base64=<...>` then `-r=.`.
 #[must_use]
 pub fn command_flags() -> Vec<String> {
-    vec![
-        format!("--settings-base64={}", default_settings_base64()),
-        "-r=.".to_string(),
-    ]
+    command_flags_for(default_settings_base64())
+}
+
+/// Same, for an explicit `--settings-base64` payload.
+#[must_use]
+pub fn command_flags_for(settings: &str) -> Vec<String> {
+    vec![format!("--settings-base64={settings}"), "-r=.".to_string()]
+}
+
+/// `--settings-base64` payload: base64 of the discovery-map JSON, or
+/// base64(`null`) without a configured map, like PHP.
+#[must_use]
+pub fn settings_base64(discovery: Option<&BTreeMap<String, Vec<String>>>) -> String {
+    match discovery {
+        None => default_settings_base64().to_string(),
+        Some(map) => base64_encode(discovery_json(map).as_bytes()),
+    }
+}
+
+/// Discovery map rendered exactly like PHP `json_encode()` (compact,
+/// `/` escaped, non-ASCII as `\uXXXX`), keys in sorted order.
+fn discovery_json(map: &BTreeMap<String, Vec<String>>) -> String {
+    let mut out = String::from("{");
+    for (index, (key, values)) in map.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(&php_json_escape(key));
+        out.push_str("\":[");
+        for (item_index, value) in values.iter().enumerate() {
+            if item_index > 0 {
+                out.push(',');
+            }
+            out.push('"');
+            out.push_str(&php_json_escape(value));
+            out.push('"');
+        }
+        out.push(']');
+    }
+    out.push('}');
+    out
+}
+
+/// PHP `json_encode()` string escaping for valid UTF-8 input.
+fn php_json_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        push_json_char(&mut out, ch);
+    }
+    out
+}
+
+/// Push one char with PHP `json_encode()` escaping: structural
+/// punctuation here, controls and non-ASCII below.
+fn push_json_char(out: &mut String, ch: char) {
+    match ch {
+        '"' => out.push_str("\\\""),
+        '\\' => out.push_str("\\\\"),
+        '/' => out.push_str("\\/"),
+        _ => push_json_escape_tail(out, ch),
+    }
+}
+
+/// Push one char that is not structural JSON punctuation: short
+/// escapes, `\u00XX` controls, ASCII passthrough, or UTF-16
+/// `\uXXXX` pairs.
+fn push_json_escape_tail(out: &mut String, ch: char) {
+    match ch {
+        '\u{08}' => out.push_str("\\b"),
+        '\u{0C}' => out.push_str("\\f"),
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        '\t' => out.push_str("\\t"),
+        ch if (ch as u32) < 0x20 || ch as u32 == 0x7f => {
+            out.push_str(&format!("\\u{:04x}", ch as u32));
+        }
+        ch if (ch as u32) < 0x80 => out.push(ch),
+        ch => {
+            let mut encoded = [0u16; 2];
+            for unit in ch.encode_utf16(&mut encoded) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+}
+
+/// Standard base64 with padding, byte-for-byte like PHP
+/// `base64_encode()`.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let mut word: u32 = 0;
+        for (index, byte) in chunk.iter().enumerate() {
+            word |= u32::from(*byte) << (8 * (2 - index));
+        }
+        for index in 0..4 {
+            if index <= chunk.len() {
+                out.push(ALPHABET[((word >> (6 * (3 - index))) & 0x3f) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 fn is_supported(path: &str) -> bool {
@@ -108,11 +235,21 @@ fn find_on_path(path_env: &std::ffi::OsStr, binary: &str) -> Option<PathBuf> {
 }
 
 /// Resolved `(program, prefix_argv)` for a `$PATH`-style search string:
-/// `cslint.exe` directly on Windows, `mono cslint.exe` elsewhere. `None`
-/// means the linter is inactive.
-fn resolve_command_in(path_env: &std::ffi::OsStr) -> Option<(PathBuf, Vec<String>)> {
-    let cslint = find_on_path(path_env, binary_name())?;
-    let mut prefix = command_flags();
+/// `cslint.exe` directly on Windows, `mono cslint.exe` elsewhere. A
+/// `binary` hint pointing at an existing file wins over the `PATH`
+/// lookup, like PHP. `None` means the linter is inactive. This is the
+/// pure lookup half of `loadEnvironment()`; the version probe runs
+/// separately in [`version_supported`].
+fn resolve_command_in(
+    path_env: &std::ffi::OsStr,
+    hint: Option<&Path>,
+    settings: &str,
+) -> Option<(PathBuf, Vec<String>)> {
+    let cslint = hint
+        .filter(|path| path.is_file())
+        .map(Path::to_path_buf)
+        .or_else(|| find_on_path(path_env, binary_name()))?;
+    let mut prefix = command_flags_for(settings);
     if cfg!(windows) {
         Some((cslint, prefix))
     } else {
@@ -122,12 +259,58 @@ fn resolve_command_in(path_env: &std::ffi::OsStr) -> Option<(PathBuf, Vec<String
     }
 }
 
-/// Resolve the tool on the real `$PATH`; `None` means the linter is
-/// inactive and reports no messages.
+/// Resolve the tool on the real `$PATH` with default settings; `None`
+/// means the linter is inactive and reports no messages. Test seam;
+/// linting goes through the version-gated `CsharpLinter::resolve`.
 #[must_use]
 pub fn resolve_command() -> Option<(PathBuf, Vec<String>)> {
     let path = std::env::var_os("PATH")?;
-    resolve_command_in(&path)
+    resolve_command_in(&path, None, default_settings_base64())
+}
+
+/// True when `<program> -v` (plus the cslint path under Mono, which is
+/// `prefix[0]` there by construction) reports exactly
+/// [`SUPPORTED_VERSION`], mirroring the `loadEnvironment()` gate: a
+/// failing probe or any other version makes the linter inactive.
+fn version_supported(program: &Path, prefix: &[String]) -> bool {
+    let mut command = Command::new(program);
+    if !cfg!(windows) {
+        let Some(cslint) = prefix.first() else {
+            return false;
+        };
+        command.arg(cslint);
+    }
+    command.arg("-v").stdin(Stdio::null());
+    let Ok(output) = arc_rs::lint::spawn_with_retry(&mut command) else {
+        return false;
+    };
+    let code = output.status.code().unwrap_or(1);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    version_output_supported(code, &stdout)
+}
+
+/// Pure half of the version gate: the probe must exit 0 and its stdout
+/// must cast to [`SUPPORTED_VERSION`], like `(int)$stdout`.
+fn version_output_supported(exit_code: i32, stdout: &str) -> bool {
+    if exit_code != 0 {
+        return false;
+    }
+    php_int_cast(stdout) == SUPPORTED_VERSION
+}
+
+/// PHP `(int)` cast: leading whitespace, optional sign, digit run.
+fn php_int_cast(text: &str) -> i64 {
+    let trimmed = text.trim_start();
+    let (negative, rest) = match trimmed.strip_prefix(['+', '-']) {
+        Some(rest) => (trimmed.starts_with('-'), rest),
+        None => (false, trimmed),
+    };
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return 0;
+    }
+    let value = digits.parse::<i64>().unwrap_or(i64::MAX);
+    if negative { -value } else { value }
 }
 
 /// Staged copy of the linted bytes: the external tool needs a real file.
@@ -267,8 +450,14 @@ fn parse_issue(path: &str, issue: &serde_json::Value) -> Option<LintMessage> {
         severity: cslint_severity(index.get("Severity")).to_string(),
         name: text("Name").to_string(),
         description,
-        original: None,
-        replacement: None,
+        original: issue
+            .get("OriginalText")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        replacement: issue
+            .get("ReplacementText")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -484,12 +673,70 @@ impl Linter for CsharpLinter {
         if data.contains(&0) {
             return Vec::new();
         }
-        let command = resolve_command();
+        let command = self.resolve();
         let borrowed = command
             .as_ref()
             .map(|(program, prefix)| (program.as_path(), prefix.as_slice()));
         lint_with_command(path, data, borrowed)
     }
+
+    fn set_option(
+        &mut self,
+        key: &str,
+        value: &serde_json::Value,
+        ctx: &OptionContext,
+    ) -> Result<(), String> {
+        match key {
+            "binary" => {
+                let Some(hint) = value.as_str() else {
+                    return Err("'binary' must be a string".to_string());
+                };
+                self.binary_hint = Some(ctx.project_root.join(hint));
+                Ok(())
+            }
+            "discovery" => {
+                self.discovery = Some(read_discovery_map(value));
+                Ok(())
+            }
+            _ => Err(format!("unknown option '{key}'.")),
+        }
+    }
+
+    fn validate_severity_entry(&self, code: &str, severity: &str) -> Result<String, String> {
+        // StyleCop rules may not be disabled, like PHP's
+        // `setCustomSeverityMap()` veto.
+        if code.starts_with("SA") && severity == "disabled" {
+            return Err(
+                "In order to keep StyleCop integration with IDEs and other tools consistent \
+                 with lint results, you aren't permitted to disable StyleCop rules within \
+                 '.arclint'. Instead configure the severity using the StyleCop settings dialog \
+                 (usually accessible from within your IDE). StyleCop settings for your project \
+                 will be used when linting."
+                    .to_string(),
+            );
+        }
+        self.validate_severity_code(code)
+    }
+}
+
+/// Read a `map<string, list<string>>` discovery map, skipping malformed
+/// entries (the engine type-checks the shape first).
+fn read_discovery_map(value: &serde_json::Value) -> BTreeMap<String, Vec<String>> {
+    let mut out = BTreeMap::new();
+    let Some(entries) = value.as_object() else {
+        return out;
+    };
+    for (key, items) in entries {
+        let Some(items) = items.as_array() else {
+            continue;
+        };
+        let values: Vec<String> = items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .collect();
+        out.insert(key.clone(), values);
+    }
+    out
 }
 
 #[cfg(test)]

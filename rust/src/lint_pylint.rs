@@ -16,13 +16,14 @@
 //! (pylint reports 0-based columns; `-1` becomes 0 per T9257).
 //!
 //! Known limits: pylint exit status 32 (usage error) makes PHP raise;
-//! without an error channel the linter stays silent instead. Out of
-//! scope (no per-linter config plumbing): the `pylint.config` rcfile
-//! option, custom binaries, extra flags, and version requirements.
+//! without an error channel the linter stays silent instead. The `bin`,
+//! `flags`, `version`, and `pylint.config` linter options apply (N4).
 
 extern crate self as arc_rs;
 
-use arc_rs::lint::{LintMessage, Linter};
+use arc_rs::lint::{LintMessage, Linter, OptionContext};
+use arc_rs::lint_external::{ToolOptions, apply_tool_option, version_requirement_satisfied};
+use arc_rs::linters::version_pattern_for;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -42,6 +43,21 @@ pub fn mandatory_flags() -> Vec<&'static str> {
     ]
 }
 
+/// Default flags, mirroring `getDefaultFlags()`: none.
+fn default_flags() -> Vec<String> {
+    Vec::new()
+}
+
+/// Mandatory flags as owned strings for flag composition, plus
+/// `--rcfile=` when a config file is configured.
+fn mandatory_flag_strings(config: Option<&str>) -> Vec<String> {
+    let mut flags: Vec<String> = mandatory_flags().into_iter().map(str::to_string).collect();
+    if let Some(config) = config {
+        flags.push(format!("--rcfile={config}"));
+    }
+    flags
+}
+
 /// True for paths this linter applies to: `.py`/`.pyw` files.
 #[must_use]
 pub fn is_supported_path(path: &str) -> bool {
@@ -54,13 +70,16 @@ pub fn is_supported_path(path: &str) -> bool {
 
 /// PyLint analyzer (external `pylint` wrapper).
 #[derive(Debug, Default)]
-pub struct PyLintLinter;
+pub struct PyLintLinter {
+    options: ToolOptions,
+    config: Option<String>,
+}
 
 impl PyLintLinter {
     /// Create the linter.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -73,14 +92,72 @@ impl Linter for PyLintLinter {
         if !is_supported_path(path) || data.contains(&0) {
             return Vec::new();
         }
-        let tool = binary_on_path(BINARY);
-        lint_with_binary(path, data, tool.as_deref())
+        let tool = self.options.bin.clone().or_else(|| binary_on_path(BINARY));
+        let Some(ref tool) = tool else {
+            return Vec::new();
+        };
+        if let Some(requirement) = &self.options.version
+            && !version_requirement_satisfied(
+                version_pattern_for("pylint"),
+                tool,
+                requirement,
+                "ArcanistPyLintLinter",
+            )
+        {
+            return Vec::new();
+        }
+        let flags = self.options.command_flags(
+            &mandatory_flag_strings(self.config.as_deref()),
+            &default_flags(),
+        );
+        lint_with_binary_and_flags(path, data, Some(tool), &flags)
+    }
+
+    fn set_option(
+        &mut self,
+        key: &str,
+        value: &serde_json::Value,
+        ctx: &OptionContext,
+    ) -> Result<(), String> {
+        if key == "pylint.config" {
+            let Some(config) = value.as_str() else {
+                return Err("'pylint.config' must be a string".to_string());
+            };
+            self.config = Some(config.to_string());
+            return Ok(());
+        }
+        apply_tool_option(&mut self.options, key, value, ctx.project_root)
+    }
+
+    fn validate_severity_code(&self, code: &str) -> Result<String, String> {
+        // `/^(R|C|W|E|F)\d{4}$/`, like PHP: restricted letter, 4 digits.
+        let bytes = code.as_bytes();
+        let ok = bytes.len() == 5
+            && matches!(bytes.first(), Some(b'R' | b'C' | b'W' | b'E' | b'F'))
+            && bytes[1..].iter().all(|b| b.is_ascii_digit());
+        if ok {
+            return Ok(code.to_string());
+        }
+        Err(format!(
+            "Unrecognized lint message code \"{code}\". Expected a valid Pylint lint code like \
+             \"C0111\", or \"E0602\", or \"W0611\"."
+        ))
     }
 }
 
 /// Lint with an explicit tool binary (test seam mirroring bundle E);
 /// `None` means the tool is not installed and reports nothing.
 pub fn lint_with_binary(path: &str, data: &[u8], binary: Option<&Path>) -> Vec<LintMessage> {
+    lint_with_binary_and_flags(path, data, binary, &mandatory_flag_strings(None))
+}
+
+/// Linter body with explicit flags (configured flags replace defaults).
+fn lint_with_binary_and_flags(
+    path: &str,
+    data: &[u8],
+    binary: Option<&Path>,
+    flags: &[String],
+) -> Vec<LintMessage> {
     let Some(tool) = binary else {
         // Inactive when the tool is not installed, mirroring PHP.
         return Vec::new();
@@ -90,7 +167,7 @@ pub fn lint_with_binary(path: &str, data: &[u8], binary: Option<&Path>) -> Vec<L
     };
     let mut command = Command::new(tool);
     command
-        .args(mandatory_flags())
+        .args(flags)
         .arg(&scratch.file)
         .current_dir(&scratch.cwd);
     let output = arc_rs::lint::spawn_with_retry(&mut command);
@@ -150,24 +227,19 @@ fn parse_line(path: &str, line: &str) -> Option<LintMessage> {
     })
 }
 
-/// Mirror PHP `ucwords(str_replace('-', ' ', $symbol))`.
+/// Mirror PHP `ucwords(str_replace('-', ' ', $symbol))` (byte-based).
 fn display_name(symbol: &str) -> String {
-    let mut out = String::with_capacity(symbol.len());
-    let mut upper = true;
-    for ch in symbol.replace('-', " ").chars() {
-        if ch.is_whitespace() {
-            upper = true;
-            out.push(ch);
-        } else if upper {
-            upper = false;
-            for upper_ch in ch.to_uppercase() {
-                out.push(upper_ch);
-            }
-        } else {
-            out.push(ch);
+    let text = symbol.replace('-', " ");
+    let mut out = text.as_bytes().to_vec();
+    let mut start = true;
+    for byte in &mut out {
+        if start {
+            byte.make_ascii_uppercase();
         }
+        start = matches!(*byte, b' ' | b'\t' | b'\r' | b'\n' | b'\x0C' | b'\x0B');
     }
-    out
+    // ASCII case mapping preserves UTF-8 validity.
+    String::from_utf8(out).unwrap_or(text)
 }
 
 /// Severity for a pylint message id. `None` means PHP's

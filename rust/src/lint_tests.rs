@@ -322,7 +322,7 @@ fn dos_and_charset_stops_honor_custom_severity_maps() {
         r#"{"linters": {"dos": {"type": "text", "severity": {"1": "disabled"}}}}"#,
     )
     .unwrap();
-    let engine = Engine::from_config(&config);
+    let engine = Engine::from_config(&config, Path::new(".")).unwrap();
     // TXT1 disabled: no stop, so the charset phase flags the `\r`.
     // The disabled TXT1 is still raised (the minimum filter drops it).
     let found = engine.lint_bytes("d.txt", b"a\r\n");
@@ -332,16 +332,49 @@ fn dos_and_charset_stops_honor_custom_severity_maps() {
         engine.severity_for("TXT", "TXT1", SEVERITY_ERROR),
         SEVERITY_DISABLED
     );
-    // Full-code keys work too.
+    // Full-code keys do not match for `raiseLintAt*` linters (PHP looks
+    // up the short code), so the default survives.
     let config = arclint::parse_arclint(
         r#"{"linters": {"t": {"type": "text", "severity": {"TXT6": "warning"}}}}"#,
     )
     .unwrap();
-    let engine = Engine::from_config(&config);
+    let engine = Engine::from_config(&config, Path::new(".")).unwrap();
     assert_eq!(
         engine.severity_for("TXT", "TXT6", SEVERITY_AUTOFIX),
-        SEVERITY_WARNING
+        SEVERITY_AUTOFIX
     );
+}
+
+#[test]
+fn direct_severity_linters_ignore_custom_maps_like_php() {
+    // `xml` sets severities directly; a `severity` map is accepted
+    // (identity validator) but never consulted, so the finding stays
+    // an error.
+    let config = arclint::parse_arclint(
+        r#"{"linters": {"x": {"type": "xml", "severity": {"XML1": "disabled"}}}}"#,
+    )
+    .unwrap();
+    let engine = Engine::from_config(&config, Path::new(".")).unwrap();
+    let found = engine.lint_bytes("a.xml", b"<a>\n");
+    assert_eq!(codes(&found), vec!["XML1"]);
+    assert_eq!(found[0].severity, SEVERITY_ERROR);
+    assert!(!crate::lint_golint::GolintLinter::new().applies_custom_severities());
+    assert!(!crate::lint_xml::XmlLinter.applies_custom_severities());
+    assert!(crate::lint_flake8::Flake8Linter::new().applies_custom_severities());
+}
+
+#[test]
+fn text_stops_honor_severity_rules_like_php() {
+    // A `severity.rules` pattern disabling short code `1` (DOS
+    // newlines) suppresses the stop, like `isMessageEnabled()`.
+    let config = arclint::parse_arclint(
+        r#"{"linters": {"t": {"type": "text", "severity.rules": {"/^1$/": "disabled"}}}}"#,
+    )
+    .unwrap();
+    let engine = Engine::from_config(&config, Path::new(".")).unwrap();
+    let found = engine.lint_bytes("d.txt", b"a\r\n");
+    assert_eq!(codes(&found), vec!["TXT1", "TXT5"]);
+    assert_eq!(found[0].severity, SEVERITY_DISABLED);
 }
 
 #[test]
@@ -350,14 +383,16 @@ fn config_text_length_reaches_the_linter() {
         r#"{"linters": {"t": {"type": "text", "text.max-line-length": 4}}}"#,
     )
     .unwrap();
-    let engine = Engine::from_config(&config);
+    let engine = Engine::from_config(&config, Path::new(".")).unwrap();
     assert_eq!(codes(&engine.lint_bytes("c.txt", b"12345\n")), vec!["TXT3"]);
-    assert!(text_length_from_config(&config).is_ok());
     let bad = arclint::parse_arclint(
         r#"{"linters": {"t": {"type": "text", "text.max-line-length": "wide"}}}"#,
     )
     .unwrap();
-    assert!(text_length_from_config(&bad).is_err());
+    assert_eq!(
+        Engine::from_config(&bad, Path::new(".")).err().unwrap(),
+        "Error in parsing '.arclint' file, for linter 't': 'text.max-line-length' must be an integer"
+    );
 }
 
 #[test]
@@ -1017,6 +1052,17 @@ fn json_renderer_escapes_slashes_and_adds_context() {
     assert!(text.contains("\"line\":null"));
     assert!(text.contains("\"char\":null"));
     assert!(text.contains("\"context\":\"\""));
+    // Non-ASCII text escapes like PHP `json_encode()` (default flags).
+    let mut message = warn123(1, 1, None, None);
+    message.description = "café 𝄞".to_string();
+    let result = console_result("dossier/é.txt", b"x\n", vec![message]);
+    let text = render_json_result(&result);
+    assert!(text.starts_with("{\"dossier\\/\\u00e9.txt\":[{"));
+    assert!(text.contains("\"description\":\"caf\\u00e9 \\ud834\\udd1e\""));
+    assert_eq!(
+        json_escape_nonascii("plain ascii \\u00e9 \\/"),
+        "plain ascii \\u00e9 \\/"
+    );
 }
 
 #[test]
@@ -1172,17 +1218,318 @@ fn arcconfig_reader_serves_lint_keys() {
         ".arcconfig",
         r#"{"lint.engine": "E", "history.immutable": true}"#,
     );
+    // Project-only cascade reads (hermetic: no ambient user/system files).
+    let project_only = |key: &str| config_value_in(tmp.path(), None, None, None, key).unwrap();
+    assert_eq!(project_only("lint.engine"), Some(serde_json::json!("E")));
     assert_eq!(
-        arcconfig_string(tmp.path(), "lint.engine").unwrap(),
-        Some("E".to_string())
+        project_only("history.immutable"),
+        Some(serde_json::json!(true))
     );
-    assert_eq!(
-        arcconfig_bool(tmp.path(), "history.immutable").unwrap(),
-        Some(true)
-    );
-    assert_eq!(arcconfig_bool(tmp.path(), "lint.engine").unwrap(), None);
     tmp.write(".arcconfig", "{broken");
     assert!(arcconfig_value(tmp.path(), "lint.engine").is_err());
+}
+
+#[test]
+fn config_cascade_prefers_local_over_project_over_user_over_system() {
+    let tmp = TempDir::new("cascade");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let local = tmp.path().join("local");
+    let user = tmp.path().join("user");
+    let system = tmp.path().join("system");
+    std::fs::write(&system, r#"{"lint.engine": "System"}"#).unwrap();
+    // System only.
+    assert_eq!(
+        config_value_in(&project, None, None, Some(&system), "lint.engine").unwrap(),
+        Some(serde_json::json!("System"))
+    );
+    // User beats system; nested `config` wins over top level.
+    std::fs::write(
+        &user,
+        r#"{"lint.engine": "UserTop", "config": {"lint.engine": "UserNested"}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        config_value_in(&project, None, Some(&user), Some(&system), "lint.engine").unwrap(),
+        Some(serde_json::json!("UserNested"))
+    );
+    // Project beats user.
+    std::fs::write(project.join(".arcconfig"), r#"{"lint.engine": "Project"}"#).unwrap();
+    assert_eq!(
+        config_value_in(&project, None, Some(&user), Some(&system), "lint.engine").unwrap(),
+        Some(serde_json::json!("Project"))
+    );
+    // Local beats project.
+    std::fs::write(&local, r#"{"lint.engine": "Local"}"#).unwrap();
+    assert_eq!(
+        config_value_in(
+            &project,
+            Some(&local),
+            Some(&user),
+            Some(&system),
+            "lint.engine"
+        )
+        .unwrap(),
+        Some(serde_json::json!("Local"))
+    );
+    // Null values fall through to the next layer.
+    std::fs::write(&local, r#"{"lint.engine": null}"#).unwrap();
+    assert_eq!(
+        config_value_in(
+            &project,
+            Some(&local),
+            Some(&user),
+            Some(&system),
+            "lint.engine"
+        )
+        .unwrap(),
+        Some(serde_json::json!("Project"))
+    );
+    // Flat user files read top-level keys.
+    std::fs::write(&user, r#"{"lint.engine": "UserFlat"}"#).unwrap();
+    std::fs::remove_file(project.join(".arcconfig")).unwrap();
+    assert_eq!(
+        config_value_in(&project, None, Some(&user), None, "lint.engine").unwrap(),
+        Some(serde_json::json!("UserFlat"))
+    );
+}
+
+#[test]
+fn config_cascade_validates_types_and_json_like_php() {
+    let tmp = TempDir::new("cascade-err");
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let user = tmp.path().join("user");
+    let system = tmp.path().join("system");
+    // Wrong types throw, even in losing layers.
+    std::fs::write(project.join(".arcconfig"), r#"{"lint.engine": 5}"#).unwrap();
+    std::fs::write(&system, r#"{"lint.engine": "System"}"#).unwrap();
+    assert_eq!(
+        config_value_in(&project, None, None, Some(&system), "lint.engine").unwrap_err(),
+        "Type of setting 'lint.engine' must be string."
+    );
+    std::fs::write(
+        project.join(".arcconfig"),
+        r#"{"history.immutable": "yes"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        config_value_in(&project, None, None, None, "history.immutable").unwrap_err(),
+        "Type of setting 'history.immutable' must be boolean."
+    );
+    // Wild keys pass anything through.
+    std::fs::write(
+        project.join(".arcconfig"),
+        r#"{"lint.engine.single.linter": 5}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        config_value_in(&project, None, None, None, "lint.engine.single.linter").unwrap(),
+        Some(serde_json::json!(5))
+    );
+    // Invalid JSON errors per layer.
+    std::fs::write(&user, "{broken").unwrap();
+    assert_eq!(
+        config_value_in(&project, None, Some(&user), None, "lint.engine").unwrap_err(),
+        "Your '~/.arcrc' file is not a valid JSON file."
+    );
+    std::fs::write(&system, "{broken").unwrap();
+    let error = config_value_in(&project, None, None, Some(&system), "lint.engine").unwrap_err();
+    assert!(
+        error.starts_with("Your '") && error.ends_with("file is not a valid JSON file."),
+        "{error}"
+    );
+}
+
+#[test]
+fn local_config_path_follows_vcs_metadata_and_gitfiles() {
+    let tmp = TempDir::new("local-path");
+    let root = tmp.path().join("repo");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let work = WorkCopy {
+        vcs: Vcs::Git,
+        vcs_root: root.clone(),
+        project_root: root.clone(),
+    };
+    assert_eq!(local_config_path(&work), Some(root.join(".git/arc/config")));
+    // Linked worktrees keep a `gitdir:` pointer file instead.
+    std::fs::remove_dir_all(root.join(".git")).unwrap();
+    let target = std::env::current_dir()
+        .unwrap()
+        .join(tmp.path())
+        .join("real.git");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(root.join(".git"), format!("gitdir: {}", target.display())).unwrap();
+    assert_eq!(local_config_path(&work), Some(target.join("arc/config")));
+    let hg = WorkCopy {
+        vcs: Vcs::Hg,
+        vcs_root: root.clone(),
+        project_root: root.clone(),
+    };
+    assert_eq!(local_config_path(&hg), None);
+    std::fs::create_dir_all(root.join(".hg")).unwrap();
+    assert_eq!(local_config_path(&hg), Some(root.join(".hg/arc/config")));
+}
+
+#[test]
+fn crc32_matches_standard_vectors() {
+    assert_eq!(crc32_ieee(b""), 0);
+    assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
+    assert_eq!(
+        crc32_ieee(b"1\nArcanistTextLinter:0"),
+        crc32_ieee(b"1\nArcanistTextLinter:0")
+    );
+}
+
+#[test]
+fn every_canonical_linter_resolves_a_php_class() {
+    for (canonical, _) in all_linter_pairs() {
+        assert!(
+            crate::linters::class_for_config(canonical).is_some(),
+            "{canonical}"
+        );
+    }
+    assert_eq!(
+        crate::linters::class_for_config("closure"),
+        Some("ArcanistClosureLinter")
+    );
+    assert_eq!(
+        crate::linters::class_for_config("filename"),
+        Some("ArcanistFilenameLinter")
+    );
+    assert_eq!(crate::linters::class_for_config("bogus"), None);
+}
+
+#[test]
+fn cache_version_is_deterministic_and_section_sensitive() {
+    let config = arclint::parse_arclint(r#"{"linters": {"t": {"type": "text"}}}"#).unwrap();
+    let left = Engine::from_config(&config, Path::new(".")).unwrap();
+    let right = Engine::from_config(&config, Path::new(".")).unwrap();
+    assert_eq!(left.cache_version(), right.cache_version());
+    let other =
+        arclint::parse_arclint(r#"{"linters": {"t": {"type": "text"}, "j": {"type": "json"}}}"#)
+            .unwrap();
+    let other = Engine::from_config(&other, Path::new(".")).unwrap();
+    assert_ne!(left.cache_version(), other.cache_version());
+}
+
+#[test]
+fn cached_results_skip_execution_and_merge_like_php() {
+    let config = arclint::parse_arclint(r#"{"linters": {"t": {"type": "text"}}}"#).unwrap();
+    let mut engine = Engine::from_config(&config, Path::new(".")).unwrap();
+    let version = engine.cache_version();
+    // Fresh run raises TXT5 for the bad byte.
+    let fresh = engine.lint_bytes("a.txt", b"ok\x01\n");
+    assert!(fresh.iter().any(|m| m.code == "TXT5"));
+    // A file-granularity cache entry skips the linter and merges its
+    // own messages instead.
+    let cached_message = CachedMessage {
+        message: LintMessage {
+            path: "a.txt".to_string(),
+            line: 3,
+            col: 1,
+            code: "TXT2".to_string(),
+            severity: SEVERITY_WARNING.to_string(),
+            name: "Tab".to_string(),
+            description: "cached".to_string(),
+            original: None,
+            replacement: None,
+        },
+        granularity: Some(GRANULARITY_FILE),
+    };
+    let mut by_version = HashMap::new();
+    by_version.insert(
+        version,
+        CachedPathResults {
+            repository_version: None,
+            stopped: None,
+            messages: vec![cached_message],
+        },
+    );
+    let mut cached = CachedResults::new();
+    cached.insert("a.txt".to_string(), by_version);
+    engine.set_cached_results(cached);
+    let merged = engine.lint_bytes("a.txt", b"ok\x01\n");
+    assert_eq!(codes(&merged), vec!["TXT2"]);
+    assert_eq!(merged[0].description, "cached");
+}
+
+#[test]
+fn cache_granularity_gates_reuse_like_php() {
+    assert!(should_use_cache(Some(GRANULARITY_FILE), None, Some("r2")));
+    assert!(should_use_cache(Some(GRANULARITY_FILE), Some("r1"), None));
+    assert!(should_use_cache(
+        Some(GRANULARITY_REPOSITORY),
+        Some("abc"),
+        Some("abc")
+    ));
+    assert!(!should_use_cache(
+        Some(GRANULARITY_REPOSITORY),
+        Some("abc"),
+        Some("def")
+    ));
+    assert!(!should_use_cache(
+        Some(GRANULARITY_DIRECTORY),
+        None,
+        Some("abc")
+    ));
+    assert!(should_use_cache(Some(GRANULARITY_DIRECTORY), None, None));
+    assert!(!should_use_cache(Some(GRANULARITY_GLOBAL), None, None));
+    assert!(!should_use_cache(None, None, None));
+    assert_ne!(
+        crate::lint_phutil_library::PhutilLibraryLinter.cache_granularity(),
+        GRANULARITY_FILE
+    );
+}
+
+#[test]
+fn cached_stopped_markers_stop_later_sections() {
+    let config =
+        arclint::parse_arclint(r#"{"linters": {"t": {"type": "text"}, "j": {"type": "json"}}}"#)
+            .unwrap();
+    let mut engine = Engine::from_config(&config, Path::new(".")).unwrap();
+    let version = engine.cache_version();
+    // Section 0 (text) stopped the path in the cached run: with a
+    // usable cache entry, the JSON section never runs fresh.
+    let mut by_version = HashMap::new();
+    by_version.insert(
+        version,
+        CachedPathResults {
+            repository_version: None,
+            stopped: Some(0),
+            messages: Vec::new(),
+        },
+    );
+    let mut cached = CachedResults::new();
+    cached.insert("a.json".to_string(), by_version);
+    engine.set_cached_results(cached);
+    assert!(engine.lint_bytes("a.json", b"{broken\n").is_empty());
+}
+
+#[test]
+fn cached_message_from_dict_mirrors_new_from_dictionary() {
+    let mut dict = HashMap::new();
+    for (key, value) in [
+        ("path", serde_json::json!("a.txt")),
+        ("line", serde_json::json!(7)),
+        ("char", serde_json::json!(3)),
+        ("code", serde_json::json!("TXT2")),
+        ("severity", serde_json::json!("warning")),
+        ("name", serde_json::json!("Tab")),
+        ("description", serde_json::json!("d")),
+        ("original", serde_json::json!("o")),
+        ("replacement", serde_json::json!("r")),
+        ("granularity", serde_json::json!(1)),
+    ] {
+        dict.insert(key.to_string(), value);
+    }
+    let cached = CachedMessage::from_dict(&dict).unwrap();
+    assert_eq!(cached.message.path, "a.txt");
+    assert_eq!((cached.message.line, cached.message.col), (7, 3));
+    assert_eq!(cached.message.original.as_deref(), Some("o"));
+    assert_eq!(cached.granularity, Some(1));
+    dict.remove("code");
+    assert!(CachedMessage::from_dict(&dict).is_none());
 }
 
 fn engine_error(work: &WorkCopy, cli_engine: Option<&str>) -> String {

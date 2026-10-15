@@ -13,13 +13,13 @@
 //! `C` are advice, `W` warning, anything else error. A missing column
 //! maps to 1; the reported path is always the linted path.
 //!
-//! Out of scope (the Rust engine has no per-linter config plumbing):
-//! custom binaries, extra flags, version requirements, and per-code
-//! severity overrides.
+//! The `bin`, `flags`, and `version` linter options apply (N4).
 
 extern crate self as arc_rs;
 
-use arc_rs::lint::{LintMessage, Linter};
+use arc_rs::lint::{LintMessage, Linter, OptionContext};
+use arc_rs::lint_external::{ToolOptions, apply_tool_option, version_requirement_satisfied};
+use arc_rs::linters::version_pattern_for;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -36,6 +36,16 @@ pub fn mandatory_flags() -> Vec<&'static str> {
     Vec::new()
 }
 
+/// Default flags, mirroring `getDefaultFlags()`: none.
+fn default_flags() -> Vec<String> {
+    Vec::new()
+}
+
+/// Mandatory flags as owned strings for flag composition.
+fn mandatory_flag_strings() -> Vec<String> {
+    mandatory_flags().into_iter().map(str::to_string).collect()
+}
+
 /// True for paths this linter applies to: `.py`/`.pyw` files.
 #[must_use]
 pub fn is_supported_path(path: &str) -> bool {
@@ -48,13 +58,15 @@ pub fn is_supported_path(path: &str) -> bool {
 
 /// Python Flake8 multi-linter (external `flake8` wrapper).
 #[derive(Debug, Default)]
-pub struct Flake8Linter;
+pub struct Flake8Linter {
+    options: ToolOptions,
+}
 
 impl Flake8Linter {
     /// Create the linter.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -67,14 +79,64 @@ impl Linter for Flake8Linter {
         if !is_supported_path(path) || data.contains(&0) {
             return Vec::new();
         }
-        let tool = binary_on_path(BINARY);
-        lint_with_binary(path, data, tool.as_deref())
+        let tool = self.options.bin.clone().or_else(|| binary_on_path(BINARY));
+        let Some(ref tool) = tool else {
+            return Vec::new();
+        };
+        if let Some(requirement) = &self.options.version
+            && !version_requirement_satisfied(
+                version_pattern_for("flake8"),
+                tool,
+                requirement,
+                "ArcanistFlake8Linter",
+            )
+        {
+            return Vec::new();
+        }
+        let flags = self
+            .options
+            .command_flags(&mandatory_flag_strings(), &default_flags());
+        lint_with_binary_and_flags(path, data, Some(tool), &flags)
+    }
+
+    fn set_option(
+        &mut self,
+        key: &str,
+        value: &serde_json::Value,
+        ctx: &OptionContext,
+    ) -> Result<(), String> {
+        apply_tool_option(&mut self.options, key, value, ctx.project_root)
+    }
+
+    fn validate_severity_code(&self, code: &str) -> Result<String, String> {
+        // `/^[A-Z]\d+$/`, like PHP: exactly one uppercase letter.
+        let bytes = code.as_bytes();
+        let ok = bytes.len() > 1
+            && bytes[0].is_ascii_uppercase()
+            && bytes[1..].iter().all(|b| b.is_ascii_digit());
+        if ok {
+            return Ok(code.to_string());
+        }
+        Err(format!(
+            "Unrecognized lint message code \"{code}\". Expected a valid flake8 lint code like \
+             \"E225\", or \"W291\", or \"F811\", or \"C901\"."
+        ))
     }
 }
 
 /// Lint with an explicit tool binary (test seam mirroring bundle E);
 /// `None` means the tool is not installed and reports nothing.
 pub fn lint_with_binary(path: &str, data: &[u8], binary: Option<&Path>) -> Vec<LintMessage> {
+    lint_with_binary_and_flags(path, data, binary, &mandatory_flag_strings())
+}
+
+/// Linter body with explicit flags (configured flags replace defaults).
+fn lint_with_binary_and_flags(
+    path: &str,
+    data: &[u8],
+    binary: Option<&Path>,
+    flags: &[String],
+) -> Vec<LintMessage> {
     let Some(tool) = binary else {
         // Inactive when the tool is not installed, mirroring PHP.
         return Vec::new();
@@ -84,7 +146,7 @@ pub fn lint_with_binary(path: &str, data: &[u8], binary: Option<&Path>) -> Vec<L
     };
     let mut command = Command::new(tool);
     command
-        .args(mandatory_flags())
+        .args(flags)
         .arg(&scratch.file)
         .current_dir(&scratch.cwd);
     let output = arc_rs::lint::spawn_with_retry(&mut command);

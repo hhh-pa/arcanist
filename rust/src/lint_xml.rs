@@ -24,7 +24,7 @@ extern crate self as arc_rs;
 use arc_rs::lint::{LintMessage, Linter};
 
 const CODE_XML_ERROR: &str = "XML1";
-const NAME_XML_ERROR: &str = "XML Error";
+const NAME_XML_ERROR: &str = "LibXML Error";
 
 /// Maximum element nesting before the checker bails out (recursion guard,
 /// mirroring libxml2's 256-level parser limit).
@@ -96,6 +96,12 @@ pub fn check_well_formed(data: &[u8]) -> Result<(), XmlError> {
 impl Linter for XmlLinter {
     fn name(&self) -> &'static str {
         "XML"
+    }
+
+    fn applies_custom_severities(&self) -> bool {
+        // The PHP linter sets severities directly and never consults
+        // custom severity maps.
+        false
     }
 
     fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {
