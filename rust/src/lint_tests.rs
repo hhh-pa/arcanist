@@ -698,10 +698,10 @@ fn result_code_prefers_errors_then_warnings() {
     // Applied patches do not count.
     assert_eq!(result_code(&[result("error", true)]), RESULT_OKAY);
     assert_eq!(
-        render_result_code_okay(RESULT_OKAY),
+        render_result_code_okay(RESULT_OKAY, false),
         "   OKAY  No lint messages.\n"
     );
-    assert_eq!(render_result_code_okay(RESULT_WARNINGS), "");
+    assert_eq!(render_result_code_okay(RESULT_WARNINGS, false), "");
 }
 
 // -( renderers )---------------------------------------------------------
