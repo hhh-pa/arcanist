@@ -17,10 +17,13 @@
 //! marker list; `--conduit-uri` overrides conduit discovery like the other
 //! commands.
 //!
+//! Console output goes through the shared terminal API: marker labels
+//! use the `ArcanistCommitGraphSetView.php:336-345` patterns (active:
+//! `<bg:green>**%s**</bg> **%s**`, inactive: `**%s**`) and revision
+//! statuses use the `:509-524` `<fg:color>` wrap, all gated on the
+//! process TTY setting like `tsprintf()`.
+//!
 //! Divergences:
-//! - No ANSI styling: the active marker shows as ` *  name` and revision
-//!   statuses render as plain text instead of the TTY-only bold and color
-//!   labels (`ArcanistCommitGraphSetView.php:336-345,509-524`).
 //! - Conduit is opportunistic: without credentials the revision and
 //!   published-ref annotation is empty and the grid still renders. PHP
 //!   fails the whole workflow when conduit calls fail.
@@ -40,7 +43,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use crate::{commitgraph, config, grid, hg, revision};
+use crate::terminal::TVal;
+use crate::{commitgraph, config, grid, hg, revision, terminal};
 
 pub const NAME: &str = "markers";
 
@@ -1524,6 +1528,45 @@ struct RowData<'a> {
     depth: usize,
     has_children: bool,
     terminal: Option<usize>,
+    ansi: bool,
+}
+
+/// Active-marker label: `tsprintf('<bg:green>**%s**</bg> **%s**', ' * ',
+/// $name)`, which strips to ` *  name` without a TTY.
+fn active_marker_label(name: &str, ansi: bool) -> String {
+    terminal::tsprintf_ansi(
+        "<bg:green>**%s**</bg> **%s**",
+        &[TVal::Text(" * "), TVal::Text(name)],
+        ansi,
+    )
+    .map(|styled| styled.to_string())
+    .unwrap_or_default()
+}
+
+/// Inactive-marker label: `tsprintf('**%s**', $name)`.
+fn inactive_marker_label(name: &str, ansi: bool) -> String {
+    terminal::tsprintf_ansi("**%s**", &[TVal::Text(name)], ansi)
+        .map(|styled| styled.to_string())
+        .unwrap_or_default()
+}
+
+/// Revision status label: `drawRevisionStatus()` wraps the short (under
+/// 120 columns) or full display name in `<fg:color>` when the server
+/// sent a truthy ANSI color.
+fn revision_status_label(reference: &revision::RevisionRef, narrow: bool, ansi: bool) -> String {
+    let status = if narrow {
+        reference.status_short_name()
+    } else {
+        reference.status_display_name()
+    }
+    .unwrap_or("");
+    let color = reference.status_ansi_color().unwrap_or("");
+    if color.is_empty() || color == "0" {
+        return status.to_string();
+    }
+    terminal::tsprintf_ansi(&format!("<fg:{color}>%s</fg>"), &[TVal::Text(status)], ansi)
+        .map(|styled| styled.to_string())
+        .unwrap_or_else(|_| status.to_string())
 }
 
 /// Commit label for the first row: one short hash, or a first..last
@@ -1565,6 +1608,7 @@ fn marker_item_label(
     is_first: bool,
     commit_label: &str,
     members: usize,
+    ansi: bool,
 ) -> String {
     if let Some(marker) = &item.marker {
         let width = if marker.active {
@@ -1574,9 +1618,9 @@ fn marker_item_label(
         };
         let name = grid::truncate_glyphs(&marker.name, width);
         if marker.active {
-            format!(" *  {name}")
+            active_marker_label(&name, ansi)
         } else {
-            name
+            inactive_marker_label(&name, ansi)
         }
     } else if item.group {
         format!(
@@ -1645,7 +1689,14 @@ fn draw_marker_cell(data: &RowData<'_>) -> Vec<String> {
     for (key, item) in items.iter().enumerate() {
         let is_first = key == 0;
         let is_last = key == last_key;
-        let label = marker_item_label(item, available, is_first, &commit_label, data.members);
+        let label = marker_item_label(
+            item,
+            available,
+            is_first,
+            &commit_label,
+            data.members,
+            data.ansi,
+        );
         let indent = if display_depth > 2 {
             " ".repeat(display_depth - 2)
         } else {
@@ -1691,13 +1742,8 @@ fn draw_status_cell(data: &RowData<'_>) -> Vec<String> {
         .iter()
         .map(|item| {
             if let Some(index) = item.revision {
-                let reference = &data.revisions[index];
-                let status = if narrow {
-                    reference.status_short_name()
-                } else {
-                    reference.status_display_name()
-                };
-                format!("{}\n", status.unwrap_or(""))
+                let label = revision_status_label(&data.revisions[index], narrow, data.ansi);
+                format!("{label}\n")
             } else {
                 "\n".to_string()
             }
@@ -1727,6 +1773,7 @@ fn draw_messages_cell(data: &RowData<'_>) -> Vec<String> {
 }
 
 /// Draw one grid row for a set view.
+#[allow(clippy::too_many_arguments)]
 fn draw_view_row(
     commits: &[(String, String)],
     revisions: &[revision::RevisionRef],
@@ -1735,6 +1782,7 @@ fn draw_view_row(
     depth: usize,
     has_children: bool,
     terminal: Option<usize>,
+    ansi: bool,
 ) -> Vec<grid::GridCell> {
     let data = RowData {
         commits,
@@ -1744,6 +1792,7 @@ fn draw_view_row(
         depth,
         has_children,
         terminal,
+        ansi,
     };
     vec![
         grid::GridCell::new("marker", draw_marker_cell(&data)),
@@ -1761,6 +1810,7 @@ fn render_partition(
     revisions: &HashMap<String, Vec<revision::RevisionRef>>,
     groups: &HashMap<String, Vec<MarkerRef>>,
     terminal: Option<usize>,
+    ansi: bool,
 ) -> Result<Vec<Vec<grid::GridCell>>, String> {
     let by_id: HashMap<u64, &commitgraph::CommitSet> =
         sets.iter().map(|set| (set.set_id(), set)).collect();
@@ -1829,6 +1879,7 @@ fn render_partition(
                 view.depth,
                 !view.children.is_empty(),
                 terminal,
+                ansi,
             ));
         }
     }
@@ -1848,7 +1899,29 @@ pub fn run_workflow(
     client: Option<&crate::conduit::Client>,
     terminal: Option<usize>,
 ) -> Result<String, String> {
-    run_workflow_with(
+    run_workflow_ansi(
+        dir,
+        vcs,
+        marker_type,
+        include_remote,
+        client,
+        terminal,
+        terminal::ansi_enabled(),
+    )
+}
+
+/// Run the markers workflow with an explicit ANSI setting
+/// (deterministic under test).
+pub fn run_workflow_ansi(
+    dir: &Path,
+    vcs: &str,
+    marker_type: &str,
+    include_remote: bool,
+    client: Option<&crate::conduit::Client>,
+    terminal: Option<usize>,
+    ansi: bool,
+) -> Result<String, String> {
+    run_workflow_with_ansi(
         dir,
         &hg::HgCommand::system(),
         vcs,
@@ -1856,6 +1929,7 @@ pub fn run_workflow(
         include_remote,
         client,
         terminal,
+        ansi,
     )
 }
 
@@ -2060,6 +2134,7 @@ fn order_partitions(vectors: &[commitgraph::SortVector]) -> Vec<usize> {
 }
 
 /// Render every partition's rows into the markers grid.
+#[allow(clippy::too_many_arguments)]
 fn render_marker_grid(
     partitions: &[commitgraph::Partition],
     partition_sets: &[Vec<commitgraph::CommitSet>],
@@ -2068,6 +2143,7 @@ fn render_marker_grid(
     revisions: &HashMap<String, Vec<revision::RevisionRef>>,
     groups: &HashMap<String, Vec<MarkerRef>>,
     terminal: Option<usize>,
+    ansi: bool,
 ) -> Result<String, String> {
     let mut grid = grid::GridView::new();
     grid.new_column("marker");
@@ -2077,7 +2153,14 @@ fn render_marker_grid(
     grid.new_column("messages").set_minimum_width(12);
     for index in order {
         partitions.get(*index).expect("partition order covers all");
-        for row in render_partition(&partition_sets[*index], states, revisions, groups, terminal)? {
+        for row in render_partition(
+            &partition_sets[*index],
+            states,
+            revisions,
+            groups,
+            terminal,
+            ansi,
+        )? {
             grid.new_row(row);
         }
     }
@@ -2093,6 +2176,31 @@ pub fn run_workflow_with(
     include_remote: bool,
     client: Option<&crate::conduit::Client>,
     terminal: Option<usize>,
+) -> Result<String, String> {
+    run_workflow_with_ansi(
+        dir,
+        hg_command,
+        vcs,
+        marker_type,
+        include_remote,
+        client,
+        terminal,
+        terminal::ansi_enabled(),
+    )
+}
+
+/// Run the markers workflow with a custom `hg` program and an explicit
+/// ANSI setting (deterministic under test).
+#[allow(clippy::too_many_arguments)]
+pub fn run_workflow_with_ansi(
+    dir: &Path,
+    hg_command: &hg::HgCommand,
+    vcs: &str,
+    marker_type: &str,
+    include_remote: bool,
+    client: Option<&crate::conduit::Client>,
+    terminal: Option<usize>,
+    ansi: bool,
 ) -> Result<String, String> {
     let markers = query_workflow_markers(dir, hg_command, vcs, marker_type, include_remote)?;
     let tails = query_workflow_tails(dir, hg_command, vcs, client)?;
@@ -2118,6 +2226,7 @@ pub fn run_workflow_with(
         &revisions,
         &groups,
         terminal,
+        ansi,
     )
 }
 
@@ -2231,7 +2340,13 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
         Err(message) => return Err(format!("{message}\n\n{}", usage())),
     };
     let owned_client = config::client_for(options.conduit_uri.as_deref()).ok();
-    execute_core(dir, &options, grid::terminal_width(), owned_client.as_ref())
+    execute_core(
+        dir,
+        &options,
+        grid::terminal_width(),
+        owned_client.as_ref(),
+        terminal::ansi_enabled(),
+    )
 }
 
 /// Run the workflow with an explicit terminal width and conduit client.
@@ -2248,7 +2363,7 @@ pub fn execute_with_client(
         Ok(None) => return Ok(usage()),
         Err(message) => return Err(format!("{message}\n\n{}", usage())),
     };
-    execute_core(dir, &options, terminal, client)
+    execute_core(dir, &options, terminal, client, terminal::ansi_enabled())
 }
 
 fn execute_core(
@@ -2256,6 +2371,7 @@ fn execute_core(
     options: &Options,
     terminal: Option<usize>,
     client: Option<&crate::conduit::Client>,
+    ansi: bool,
 ) -> Result<String, String> {
     let marker_type = resolve_type(dir, options.marker_type.as_deref())?;
     if options.json {
@@ -2272,7 +2388,7 @@ fn execute_core(
     if !supports_marker_type(vcs, &marker_type) {
         return Err(support_error(vcs, &marker_type));
     }
-    run_workflow(dir, vcs, &marker_type, false, client, terminal)
+    run_workflow_ansi(dir, vcs, &marker_type, false, client, terminal, ansi)
 }
 
 pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {

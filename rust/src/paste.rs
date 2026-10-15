@@ -10,6 +10,10 @@
 //! When reading, `--lang`, `--title`, `--browse`, and `--input` are usage
 //! errors, mirroring the PHP workflow. When creating, `--browse` opens the
 //! new paste in a browser (see [`crate::browser`]).
+//!
+//! The creation line carries no console markup: PHP reports creates with
+//! a log-engine line plus a ref view (both styled), while this port keeps
+//! its own one-line summary, so both ANSI modes share the exact bytes.
 
 use std::path::Path;
 use std::process::ExitCode;

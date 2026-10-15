@@ -5,6 +5,10 @@
 //! The file is resolved over Conduit (`file.search` by ID), then fetched
 //! from its data URI and written to disk (or stdout with `--as -`). The
 //! downloaded size is verified against the expected size.
+//!
+//! The status lines carry no console markup: PHP styles only the log
+//! labels (`DATA`/`DONE`, blue on stderr) and keeps these message words
+//! plain, so both ANSI modes share the exact bytes.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -394,10 +398,7 @@ pub fn download_file_for_symbol(
 
     let target = resolve_target(dir, save_as, &file)?;
     let display_path = readable_path(dir, &target);
-    let mut out = format!(
-        "Downloading \"{display_name}\" ({} byte(s)) to \"{display_path}\"...\n",
-        format_count(file.size)
-    );
+    let mut out = format_downloading(&display_name, file.size, &display_path);
     let data = download_bytes_with_timeout(&file.data_uri, download_timeout(file.size))?;
     if data.len() as u64 != file.size {
         return Err(size_mismatch_error(data.len() as u64, file.size));
@@ -406,10 +407,22 @@ pub fn download_file_for_symbol(
         std::fs::remove_file(&target).ok();
         return Err(format!("failed to write \"{display_path}\": {e}"));
     }
-    out.push_str(&format!(
-        "Saved \"{display_name}\" as \"{display_path}\".\n"
-    ));
+    out.push_str(&format_saved(&display_name, &display_path));
     Ok(out)
+}
+
+/// `Downloading "name" (N byte(s)) to "path"...`: the words PHP passes
+/// to `writeStatus` unstyled.
+fn format_downloading(display_name: &str, size: u64, display_path: &str) -> String {
+    format!(
+        "Downloading \"{display_name}\" ({} byte(s)) to \"{display_path}\"...\n",
+        format_count(size)
+    )
+}
+
+/// `Saved "name" as "path".`: likewise unstyled in PHP.
+fn format_saved(display_name: &str, display_path: &str) -> String {
+    format!("Saved \"{display_name}\" as \"{display_path}\".\n")
 }
 
 /// Run the workflow rooted at `dir`, returning stdout text or an error message.

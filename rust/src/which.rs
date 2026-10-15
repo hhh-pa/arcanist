@@ -9,6 +9,12 @@
 //! are not word-wrapped; only git working copies are detected; revision
 //! matching is opportunistic — when no conduit client is available the
 //! matching section says why instead of failing like PHP.
+//!
+//! Console colors follow the PHP markup sites on TTYs: every section
+//! header renders bold (PHP wraps its `REPOSITORY`, `COMMIT RANGE`, and
+//! `MATCHING REVISIONS` titles in `**`), as do the `created`/`updated`
+//! verdicts in the guidance sentences. The multi-revision guidance stays
+//! plain like PHP (it never passes through `phutil_console_format`).
 
 extern crate self as arc_rs;
 
@@ -16,7 +22,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use arc_rs::{conduit, config, get_config, git};
+use arc_rs::{conduit, config, get_config, git, terminal};
 
 /// Subcommand name, matching `arc which`.
 pub const NAME: &str = "which";
@@ -1566,8 +1572,15 @@ pub fn load_context(
     })
 }
 
-fn render_working_copy(ctx: &Context, out: &mut String) {
-    out.push_str("WORKING COPY\n");
+/// Bold a section header or verdict word on TTYs (`**%s**`), plain
+/// otherwise — the same markup PHP applies to these words.
+fn bold(text: &str, ansi: bool) -> String {
+    terminal::console_format("**%s**", &[text], ansi)
+}
+
+fn render_working_copy(ctx: &Context, out: &mut String, ansi: bool) {
+    out.push_str(&bold("WORKING COPY", ansi));
+    out.push('\n');
     out.push_str(&format!("    Directory: {}\n", ctx.dir));
     match (&ctx.vcs_root, ctx.vcs) {
         (Some(root), vcs) => out.push_str(&format!("    VCS: {vcs} (root {root})\n")),
@@ -1581,8 +1594,10 @@ fn render_working_copy(ctx: &Context, out: &mut String) {
     }
 }
 
-fn render_repository(ctx: &Context, out: &mut String) {
-    out.push_str("\nREPOSITORY\n");
+fn render_repository(ctx: &Context, out: &mut String, ansi: bool) {
+    out.push('\n');
+    out.push_str(&bold("REPOSITORY", ansi));
+    out.push('\n');
     out.push_str(&format!(
         "    Branch: {}\n",
         ctx.branch.as_deref().unwrap_or("HEAD (detached)")
@@ -1605,8 +1620,10 @@ fn render_repository(ctx: &Context, out: &mut String) {
     }
 }
 
-fn render_conduit(ctx: &Context, out: &mut String) {
-    out.push_str("\nCONDUIT\n");
+fn render_conduit(ctx: &Context, out: &mut String, ansi: bool) {
+    out.push('\n');
+    out.push_str(&bold("CONDUIT", ansi));
+    out.push('\n');
     match &ctx.conduit_uri {
         Some(uri) => out.push_str(&format!("    URI: {uri} (from {})\n", ctx.conduit_source)),
         None => out.push_str("    URI: none configured\n"),
@@ -1618,8 +1635,10 @@ fn render_conduit(ctx: &Context, out: &mut String) {
     }
 }
 
-fn render_range(ctx: &Context, out: &mut String) {
-    out.push_str("\nCOMMIT RANGE\n");
+fn render_range(ctx: &Context, out: &mut String, ansi: bool) {
+    out.push('\n');
+    out.push_str(&bold("COMMIT RANGE", ansi));
+    out.push('\n');
     match (&ctx.base, &ctx.base_explanation) {
         (Some(base), Some(why)) => {
             out.push_str(&format!("    Base: {base} ({why})\n"));
@@ -1638,8 +1657,33 @@ fn render_range(ctx: &Context, out: &mut String) {
     }
 }
 
-fn render_matching(ctx: &Context, out: &mut String) {
-    out.push_str("\nMATCHING REVISIONS\n");
+/// `created` guidance: PHP bolds the verdict (`**created**`) in the
+/// same sentence, so it substitutes as a marked value here.
+fn created_guidance(diff_arg: &str, ansi: bool) -> String {
+    let command = format!("arc diff{diff_arg}");
+    terminal::console_format(
+        "Since there are no revisions in Differential which match this working copy, a \
+         new revision will be **%s** if you run '%s'.\n\n",
+        &["created", &command],
+        ansi,
+    )
+}
+
+/// `updated` guidance: same shape, PHP bolds `**updated**`.
+fn updated_guidance(diff_arg: &str, ansi: bool) -> String {
+    let command = format!("arc diff{diff_arg}");
+    terminal::console_format(
+        "Since exactly one revision in Differential matches this working copy, it \
+         will be **%s** if you run '%s'.\n\n",
+        &["updated", &command],
+        ansi,
+    )
+}
+
+fn render_matching(ctx: &Context, out: &mut String, ansi: bool) {
+    out.push('\n');
+    out.push_str(&bold("MATCHING REVISIONS", ansi));
+    out.push('\n');
     match &ctx.matching {
         Matching::OutsideRepo => {
             out.push_str("    (No revisions match outside a working copy.)\n");
@@ -1649,11 +1693,7 @@ fn render_matching(ctx: &Context, out: &mut String) {
         }
         Matching::Found(revisions) if revisions.is_empty() => {
             out.push_str("    (No revisions match.)\n\n");
-            out.push_str(&format!(
-                "Since there are no revisions in Differential which match this working copy, a \
-                 new revision will be created if you run 'arc diff{}'.\n\n",
-                ctx.diff_arg
-            ));
+            out.push_str(&created_guidance(&ctx.diff_arg, ansi));
         }
         Matching::Found(revisions) => {
             for revision in revisions {
@@ -1669,11 +1709,7 @@ fn render_matching(ctx: &Context, out: &mut String) {
                 out.push_str(&format!("        Reason: {}\n\n", revision.why));
             }
             if revisions.len() == 1 {
-                out.push_str(&format!(
-                    "Since exactly one revision in Differential matches this working copy, it \
-                     will be updated if you run 'arc diff{}'.\n\n",
-                    ctx.diff_arg
-                ));
+                out.push_str(&updated_guidance(&ctx.diff_arg, ansi));
             } else {
                 out.push_str(&format!(
                     "Since more than one revision in Differential matches this working copy, you \
@@ -1685,15 +1721,22 @@ fn render_matching(ctx: &Context, out: &mut String) {
     }
 }
 
-/// Render the human-readable report.
+/// Render the human-readable report with the process ANSI setting.
 #[must_use]
 pub fn render(ctx: &Context) -> String {
+    render_ansi(ctx, terminal::ansi_enabled())
+}
+
+/// Render the human-readable report with an explicit ANSI setting
+/// (deterministic under test).
+#[must_use]
+pub fn render_ansi(ctx: &Context, ansi: bool) -> String {
     let mut out = String::new();
-    render_working_copy(ctx, &mut out);
-    render_repository(ctx, &mut out);
-    render_conduit(ctx, &mut out);
-    render_range(ctx, &mut out);
-    render_matching(ctx, &mut out);
+    render_working_copy(ctx, &mut out, ansi);
+    render_repository(ctx, &mut out, ansi);
+    render_conduit(ctx, &mut out, ansi);
+    render_range(ctx, &mut out, ansi);
+    render_matching(ctx, &mut out, ansi);
     out
 }
 

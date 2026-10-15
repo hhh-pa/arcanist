@@ -174,3 +174,15 @@ fn browse_opens_the_created_paste() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn created_line_carries_no_markup() {
+    let created = CreatedPaste {
+        id: 5,
+        uri: "https://h.example/P5".to_string(),
+    };
+    let out = format_created(&created);
+    assert_eq!(out, "Created paste P5: https://h.example/P5\n");
+    assert!(!out.contains('\x1b'), "{out}");
+    assert!(!out.contains("**"), "{out}");
+}

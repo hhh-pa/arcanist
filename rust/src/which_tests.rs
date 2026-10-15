@@ -665,3 +665,108 @@ fn local_commits_carry_trees_and_messages() {
     let all = git_commit_messages(&repo.path, GIT_MAGIC_ROOT_COMMIT, "HEAD").unwrap();
     assert_eq!(all.len(), 2);
 }
+
+fn ansi_context(matching: Matching) -> Context {
+    Context {
+        dir: "/tmp/demo".to_string(),
+        vcs: "git",
+        vcs_root: Some("/tmp/demo".to_string()),
+        project_root: None,
+        project_file: None,
+        branch: Some("master".to_string()),
+        head: Some("abc".to_string()),
+        head_subject: Some("subject".to_string()),
+        remote_url: None,
+        callsign: None,
+        callsign_source: None,
+        conduit_uri: None,
+        conduit_source: "none",
+        token_installed: None,
+        base: Some("def".to_string()),
+        base_explanation: Some("why".to_string()),
+        head_ref: "HEAD".to_string(),
+        commits: Vec::new(),
+        diff_arg: String::new(),
+        matching,
+    }
+}
+
+fn matched(monogram: &str) -> MatchedRevision {
+    MatchedRevision {
+        monogram: monogram.to_string(),
+        title: "title".to_string(),
+        author: None,
+        why: "reason".to_string(),
+    }
+}
+
+#[test]
+fn section_headers_bold_only_on_tty() {
+    let ctx = ansi_context(Matching::OutsideRepo);
+    let plain = render_ansi(&ctx, false);
+    for header in [
+        "WORKING COPY",
+        "REPOSITORY",
+        "CONDUIT",
+        "COMMIT RANGE",
+        "MATCHING REVISIONS",
+    ] {
+        assert!(plain.contains(&format!("{header}\n")), "{plain}");
+    }
+    assert!(!plain.contains('\x1b'), "{plain}");
+
+    let styled = render_ansi(&ctx, true);
+    for header in [
+        "WORKING COPY",
+        "REPOSITORY",
+        "CONDUIT",
+        "COMMIT RANGE",
+        "MATCHING REVISIONS",
+    ] {
+        assert!(
+            styled.contains(&format!("\x1b[1m{header}\x1b[m\n")),
+            "{styled}"
+        );
+    }
+}
+
+#[test]
+fn verdict_words_bold_only_on_tty() {
+    let ctx = ansi_context(Matching::Found(Vec::new()));
+    let plain = render_ansi(&ctx, false);
+    assert!(
+        plain.contains("a new revision will be created if you run 'arc diff'.\n\n"),
+        "{plain}"
+    );
+    assert!(!plain.contains('\x1b'), "{plain}");
+    let styled = render_ansi(&ctx, true);
+    assert!(
+        styled.contains("a new revision will be \x1b[1mcreated\x1b[m if you run 'arc diff'.\n\n"),
+        "{styled}"
+    );
+
+    let ctx = ansi_context(Matching::Found(vec![matched("D1")]));
+    let plain = render_ansi(&ctx, false);
+    assert!(
+        plain.contains("it will be updated if you run 'arc diff'.\n\n"),
+        "{plain}"
+    );
+    let styled = render_ansi(&ctx, true);
+    assert!(
+        styled.contains("it will be \x1b[1mupdated\x1b[m if you run 'arc diff'.\n\n"),
+        "{styled}"
+    );
+}
+
+#[test]
+fn multi_revision_guidance_stays_plain() {
+    // PHP never passes the multi-revision sentence through
+    // `phutil_console_format`, so both modes share the exact bytes.
+    let ctx = ansi_context(Matching::Found(vec![matched("D1"), matched("D2")]));
+    let sentence =
+        "you will be asked which revision you want to update if you run 'arc diff '.\n\n";
+    let plain = render_ansi(&ctx, false);
+    assert!(plain.contains(sentence), "{plain}");
+    let styled = render_ansi(&ctx, true);
+    assert!(styled.contains(sentence), "{styled}");
+}

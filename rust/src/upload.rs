@@ -9,6 +9,11 @@
 //! without `file.allocate` fall back to a single `file.upload` call.
 //! Uploaded files are resolved with `file.search` for display. `--browse`
 //! opens the uploaded files in a browser (see [`crate::browser`]).
+//!
+//! The per-file lines carry no console markup: PHP renders each upload
+//! as a (styled) ref view, while this port keeps plain `F123 name` lines,
+//! so both ANSI modes share the exact bytes. Chunk progress already goes
+//! to stderr unstyled, like PHP.
 
 use std::path::Path;
 use std::process::ExitCode;
