@@ -21,9 +21,11 @@
 //! - Submitted changes carry file metadata only (no hunk corpora): the
 //!   unified-diff parser (`generateChanges()`, `:802-1026`) is not ported.
 //! - All 30 flags parse, but only the read-only and submit flows run: raw
-//!   stdin/command sources, `--edit`, `--verbatim`, `--draft`, lint/unit
-//!   execution, commit amend, and browser opening are still pending, as are
-//!   hg/svn working copies and `.arcconfig` custom arguments.
+//!   stdin/command sources, `--edit`, `--verbatim`, `--draft`, and commit
+//!   amend are still pending, as are hg/svn working copies and
+//!   `.arcconfig` custom arguments. Lint/unit children run in-process;
+//!   unresolved message dictionaries stay empty (see
+//!   [`diff_local::run_lint`]).
 
 extern crate self as arc_rs;
 
@@ -31,7 +33,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use arc_rs::{config, diff_local, diff_submit, svn};
+use arc_rs::{config, diff_local, diff_submit, get_config, hg, svn};
 
 /// Subcommand name, matching `arc diff`.
 pub const NAME: &str = "diff";
@@ -1245,7 +1247,7 @@ fn diff_properties(
             .iter()
             .map(diff_local::LocalCommitInfo::to_json)
             .collect();
-        let data = serde_json::to_string(&commits)
+        let data = diff_submit::php_json_encode(&serde_json::Value::Array(commits))
             .map_err(|e| format!("failed to encode local commits: {e}"))?;
         properties.push(diff_submit::DiffProperty {
             name: diff_submit::PROP_LOCAL_COMMITS.to_string(),
@@ -1259,7 +1261,7 @@ fn diff_properties(
             .iter()
             .map(diff_local::OntoTarget::to_json)
             .collect();
-        let data = serde_json::to_string(&rendered)
+        let data = diff_submit::php_json_encode(&serde_json::Value::Array(rendered))
             .map_err(|e| format!("failed to encode onto targets: {e}"))?;
         properties.push(diff_submit::DiffProperty {
             name: diff_submit::PROP_ONTO.to_string(),
@@ -1269,11 +1271,82 @@ fn diff_properties(
     Ok(properties)
 }
 
+/// User-set passthrough flags for the lint/unit children, in spec order
+/// (see [`diff_local::passthru_argv`]).
+fn set_child_flags(options: &Options) -> (Vec<String>, Vec<String>) {
+    let is_set = |name: &str| match name {
+        "apply-patches" => options.apply_patches,
+        "never-apply-patches" => options.never_apply_patches,
+        "amend-all" => options.amend_all,
+        "amend-autofixes" => options.amend_autofixes,
+        "coverage" => options.coverage,
+        "no-coverage" => options.no_coverage,
+        _ => false,
+    };
+    let lint = diff_local::LINT_PASSTHRU_FLAGS
+        .iter()
+        .filter(|flag| is_set(flag))
+        .map(|flag| flag.to_string())
+        .collect();
+    let unit = diff_local::UNIT_PASSTHRU_FLAGS
+        .iter()
+        .filter(|flag| is_set(flag))
+        .map(|flag| flag.to_string())
+        .collect();
+    (lint, unit)
+}
+
+/// Run lint and unit over the process stdio (`runLintUnit()`, `:1131-1140`).
+///
+/// `base` carries `--rev` (commit-range repositories only); `head` and
+/// `is_raw` drive the skip checks. Callers resolve the base first so the
+/// canonical "not inside a working copy" errors surface before any child
+/// runs, like PHP's repository setup preceding `:363`.
+///
+/// Notices print to stdout even under `--json`: PHP captures them into
+/// the `human` field, which in-process runs cannot do (same `human`
+/// divergence as the submit report).
+fn run_lint_unit_stdio(
+    cwd: &Path,
+    options: &Options,
+    base: Option<&str>,
+    head: Option<&str>,
+    is_raw: bool,
+) -> Result<diff_local::LintUnitReport, String> {
+    let (lint_flags, unit_flags) = set_child_flags(options);
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let mut out = std::io::stdout();
+    diff_local::run_lint_unit(
+        cwd,
+        base,
+        &lint_flags,
+        &unit_flags,
+        diff_local::should_skip_lint(options.nolint, is_raw, head),
+        diff_local::should_skip_unit(options.nounit, is_raw, head),
+        &diff_local::run_lint_in_process,
+        &diff_local::run_unit_in_process,
+        &mut input,
+        &mut out,
+    )
+}
+
 /// Collect everything a submit sends, without touching Conduit.
 pub fn prepare_submit(
     cwd: &Path,
     options: &Options,
     mode: &SubmitMode,
+) -> Result<SubmitInput, String> {
+    prepare_submit_with_report(cwd, options, mode, &diff_local::LintUnitReport::empty())
+}
+
+/// Collect a submit, stamping the diff spec with `report`'s lint/unit
+/// status words (`run()`, `:375-379`).
+pub fn prepare_submit_with_report(
+    cwd: &Path,
+    options: &Options,
+    mode: &SubmitMode,
+    report: &diff_local::LintUnitReport,
 ) -> Result<SubmitInput, String> {
     let range = resolve_range(cwd, options)?;
     let head = range.head.as_deref();
@@ -1299,8 +1372,8 @@ pub fn prepare_submit(
     };
     let spec = diff_submit::diff_spec_json(
         &changes,
-        diff_local::lint_status(None),
-        diff_local::unit_status(None),
+        diff_local::lint_status(report.lint_result),
+        diff_local::unit_status(report.unit_result),
         &spec_input,
     );
     let fields = match mode {
@@ -1327,6 +1400,15 @@ pub fn prepare_submit(
 
 /// Run a submit over `call`, returning the stdout text.
 ///
+/// Submit report text plus the created object URI for `--browse`
+/// (`:431-433`, `:560-562`).
+pub struct SubmitReport {
+    /// Human-readable report (also the `--json` document when requested).
+    pub text: String,
+    /// Created diff/revision URI, when the mode yields one.
+    pub uri: Option<String>,
+}
+
 /// Call order mirrors `run()` (`src/workflow/ArcanistDiffWorkflow.php:382-410,
 /// 463-465,525-527`): `differential.creatediff`, the
 /// `differential.setdiffproperty` writes, then the revision call. Output
@@ -1336,29 +1418,36 @@ pub fn prepare_submit(
 /// Divergence: console markup (`**bold**`, `__underline__`) renders as plain
 /// text, and diff-only `--json` reports `"human": ""` (this port buffers no
 /// human output, `:421-429`).
-pub fn submit_over(
+pub fn submit_over_with_uri(
     call: &diff_submit::ConduitCall<'_>,
     input: &SubmitInput,
-) -> Result<String, String> {
+) -> Result<SubmitReport, String> {
     let created = diff_submit::create_diff(call, &input.spec)?;
     diff_submit::set_diff_properties(call, created.diff_id, &input.properties)?;
     match &input.mode {
         SubmitMode::Only => {
             if input.json {
+                let uri = created.uri.clone();
                 let doc = serde_json::json!({
                     "diffURI": created.uri,
                     "diffID": created.diff_id,
                     "human": "",
                 });
-                let mut text = serde_json::to_string(&doc)
+                let mut text = diff_submit::php_json_encode(&doc)
                     .map_err(|e| format!("failed to encode JSON: {e}"))?;
                 text.push('\n');
-                return Ok(text);
+                return Ok(SubmitReport {
+                    text,
+                    uri: Some(uri),
+                });
             }
-            Ok(format!(
-                "Created a new Differential diff:\n        Diff URI: {}\n\n{}",
-                created.uri, input.included_changes
-            ))
+            Ok(SubmitReport {
+                text: format!(
+                    "Created a new Differential diff:\n        Diff URI: {}\n\n{}",
+                    created.uri, input.included_changes
+                ),
+                uri: Some(created.uri),
+            })
         }
         SubmitMode::Update(id) => {
             let revision_id =
@@ -1370,32 +1459,51 @@ pub fn submit_over(
                 input.message.as_deref().unwrap_or(""),
             );
             let updated = diff_submit::update_revision(call, &params)?;
-            Ok(format!(
-                "Updated an existing Differential revision:\n        Revision URI: {}\n\n{}",
-                updated.uri, input.included_changes
-            ))
+            Ok(SubmitReport {
+                text: format!(
+                    "Updated an existing Differential revision:\n        Revision URI: {}\n\n{}",
+                    updated.uri, input.included_changes
+                ),
+                uri: Some(updated.uri),
+            })
         }
         SubmitMode::Create => {
             // No server transactions are available locally, so the legacy
             // `differential.createrevision` path applies (`:478-531`).
             let params = diff_submit::create_revision_params(input.fields.clone(), created.diff_id);
             let revision = diff_submit::create_revision_legacy(call, &params)?;
-            Ok(format!(
-                "Created a new Differential revision:\n        Revision URI: {}\n\n{}",
-                revision.uri, input.included_changes
-            ))
+            Ok(SubmitReport {
+                text: format!(
+                    "Created a new Differential revision:\n        Revision URI: {}\n\n{}",
+                    revision.uri, input.included_changes
+                ),
+                uri: Some(revision.uri),
+            })
         }
     }
 }
 
+/// Run a submit over `call`, returning the report text (see
+/// [`submit_over_with_uri`]).
+pub fn submit_over(
+    call: &diff_submit::ConduitCall<'_>,
+    input: &SubmitInput,
+) -> Result<String, String> {
+    submit_over_with_uri(call, input).map(|report| report.text)
+}
+
 /// Collect a submit locally, then run it over a real Conduit client.
 fn submit_via_client(cwd: &Path, options: &Options, mode: &SubmitMode) -> Result<String, String> {
-    let input = prepare_submit(cwd, options, mode)?;
+    let range = resolve_range(cwd, options)?;
+    let head = range.head.as_deref();
+    let is_raw = diff_local::is_raw_diff_source(options.raw, options.raw_command.as_deref());
+    let report = run_lint_unit_stdio(cwd, options, Some(range.base.as_str()), head, is_raw)?;
+    let input = prepare_submit_with_report(cwd, options, mode, &report)?;
     let client = config::client_for(options.conduit_uri.as_deref())?;
     let call = |method: &str, params: &serde_json::Value| {
         client.call(method, params).map_err(|e| e.to_string())
     };
-    submit_over(&call, &input)
+    submit_over_with_browse(cwd, options, &call, &input)
 }
 
 /// Inspect `cwd` per `options`, returning the bytes for stdout.
@@ -1429,7 +1537,7 @@ pub fn inspect(cwd: &Path, options: &Options) -> Result<Vec<u8>, String> {
             let fields = collect_fields(cwd, options, &range.base, range.head.as_deref())?;
             doc["fields"] = fields_json(&fields);
         }
-        let mut text = serde_json::to_string_pretty(&doc)
+        let mut text = diff_submit::php_json_encode_pretty(&doc)
             .map_err(|e| format!("failed to encode JSON: {e}"))?;
         text.push('\n');
         Ok(text.into_bytes())
@@ -1581,12 +1689,15 @@ pub fn format_confirm_prompt(prompt: &str, default_no: bool) -> String {
 /// Interpret one confirm answer: `y`/`n`/empty decide, anything else
 /// reprompts (`None`).
 ///
-/// PHP: the `do/while` in `phutil_console_confirm()` (`:14-24`).
-///
-/// Divergence: PHP trims ASCII whitespace; this trims Unicode whitespace.
+/// PHP: the `do/while` in `phutil_console_confirm()`
+/// (`src/console/format.php:14-24`): `$c = trim(strtolower($response))`.
+/// `strtolower()` is ASCII-only and `trim()` strips `" \t\n\r\0\x0B"`
+/// only, so Unicode whitespace (e.g. NBSP) is NOT trimmed and reprompts.
 #[must_use]
 pub fn interpret_confirm_answer(response: &str, default_no: bool) -> Option<bool> {
-    match response.trim().to_lowercase().as_str() {
+    let lowered = response.to_ascii_lowercase();
+    let trimmed = lowered.trim_matches([' ', '\t', '\n', '\r', '\0', '\x0B']);
+    match trimmed {
         "y" => Some(true),
         "n" => Some(false),
         "" => Some(!default_no),
@@ -1631,15 +1742,23 @@ pub fn prompt_confirm_from<R: std::io::BufRead, W: std::io::Write>(
     }
 }
 
-/// Run a confirm prompt on the real stdio, requiring a TTY.
+/// Whether the TTY gate can block prompting right now.
+///
+/// PHP: `phutil_console_require_tty()` (`src/console/format.php:194-198`)
+/// throws only when `posix_isatty` exists AND stdin is not a TTY. On
+/// Windows (and any platform without POSIX) there is no check at all,
+/// so prompting proceeds to read stdin.
+fn tty_gate_blocks() -> bool {
+    cfg!(unix) && !std::io::IsTerminal::is_terminal(&std::io::stdin())
+}
+
+/// Run a confirm prompt on the real stdio, requiring a TTY where PHP
+/// does (Unix with piped stdin).
 ///
 /// PHP: `phutil_console_prompt()` (`:42-52`) echoes the prompt before the
 /// TTY check throws, which this mirrors on stdout.
-///
-/// Divergence: PHP skips the TTY check on Windows (no `posix_isatty`);
-/// this checks on every platform.
 pub fn prompt_confirm(prompt: &str, default_no: bool) -> Result<bool, String> {
-    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+    if tty_gate_blocks() {
         print!("{}", format_confirm_prompt(prompt, default_no));
         let _ = std::io::Write::flush(&mut std::io::stdout());
         return Err(STDIN_NOT_TTY.to_string());
@@ -1749,6 +1868,7 @@ pub fn submit_change_from_parsed(change: &diff_local::ParsedChange) -> diff_subm
     let mut out = diff_submit::DiffChange::new_text(&change.old_path, &change.current_path);
     out.change_type = i64::from(change.change_type);
     out.file_type = i64::from(change.file_type);
+    out.away_paths = change.away_paths.clone();
     out.commit_hash = change.commit_hash.clone();
     out.hunks = change.hunks.iter().map(submit_hunk_from_parsed).collect();
     out
@@ -1756,11 +1876,12 @@ pub fn submit_change_from_parsed(change: &diff_local::ParsedChange) -> diff_subm
 
 /// Parse raw diff text into submit payload changes, dropping `TYPE_MESSAGE`
 /// pseudo-changes (`generateChanges()`, `:820-827`).
-pub fn parse_raw_diff_changes(text: &str) -> Vec<diff_submit::DiffChange> {
-    diff_local::without_message_changes(&diff_local::parse_unified_diff(text))
+pub fn parse_raw_diff_changes(text: &str) -> Result<Vec<diff_submit::DiffChange>, String> {
+    let parsed = diff_local::parse_unified_diff(text)?;
+    Ok(diff_local::without_message_changes(&parsed)
         .iter()
         .map(submit_change_from_parsed)
-        .collect()
+        .collect())
 }
 
 /// Build an `Included changes:` entry from a parsed change, counting
@@ -1782,7 +1903,7 @@ pub fn change_entry_from_parsed(change: &diff_local::ParsedChange) -> diff_local
             }
             _ => None,
         },
-        away_paths: Vec::new(),
+        away_paths: change.away_paths.clone(),
         current: FileDiff {
             path: change.current_path.clone(),
             added,
@@ -1829,8 +1950,17 @@ pub fn detect_vcs_kind(cwd: &Path) -> Option<VcsKind> {
 /// PHP: `getCanonicalRevisionName()`-style `log -l 1 --template {node} -r`
 /// (`ArcanistMercurialAPI.php:58-64`). `None` when unresolvable.
 pub fn hg_rev_to_commit(cwd: &Path, rev: &str) -> Option<String> {
-    let out =
-        arc_rs::hg::output(cwd, &["log", "-l", "1", "--template", "{node}", "-r", rev]).ok()?;
+    hg_rev_to_commit_with(cwd, &hg::HgCommand::default(), rev)
+}
+
+/// [`hg_rev_to_commit`] over an injected `hg` backend.
+pub fn hg_rev_to_commit_with(cwd: &Path, hg_cmd: &hg::HgCommand, rev: &str) -> Option<String> {
+    let out = hg::output_with(
+        cwd,
+        hg_cmd,
+        &["log", "-l", "1", "--template", "{node}", "-r", rev],
+    )
+    .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -1844,9 +1974,23 @@ pub fn hg_rev_to_commit(cwd: &Path, rev: &str) -> Option<String> {
 /// (`ArcanistMercurialAPI.php:805-807`), mirroring git's merge-base for an
 /// explicit base commit.
 pub fn hg_ancestor(cwd: &Path, commit: &str, working_rev: &str) -> Result<String, String> {
+    hg_ancestor_with(cwd, &hg::HgCommand::default(), commit, working_rev)
+}
+
+/// [`hg_ancestor`] over an injected `hg` backend.
+pub fn hg_ancestor_with(
+    cwd: &Path,
+    hg_cmd: &hg::HgCommand,
+    commit: &str,
+    working_rev: &str,
+) -> Result<String, String> {
     let revset = format!("ancestor({working_rev},{commit})");
-    let out = arc_rs::hg::output(cwd, &["log", "--template", "{node}", "--rev", &revset])
-        .map_err(|e| format!("failed to run hg: {e}"))?;
+    let out = hg::output_with(
+        cwd,
+        hg_cmd,
+        &["log", "--template", "{node}", "--rev", &revset],
+    )
+    .map_err(|e| format!("failed to run hg: {e}"))?;
     if !out.status.success() {
         return Err(format!("Unable to find any hg commit named '{commit}'."));
     }
@@ -1864,45 +2008,121 @@ pub fn hg_ancestor(cwd: &Path, commit: &str, working_rev: &str) -> Result<String
 /// (`resolveBaseCommitRule()`) needs `.arcconfig` configuration sources,
 /// which are not ported.
 pub fn resolve_hg_base(cwd: &Path, options: &Options) -> Result<String, String> {
+    resolve_hg_base_with(cwd, &hg::HgCommand::default(), options)
+}
+
+/// [`resolve_hg_base`] over an injected `hg` backend.
+pub fn resolve_hg_base_with(
+    cwd: &Path,
+    hg_cmd: &hg::HgCommand,
+    options: &Options,
+) -> Result<String, String> {
     if options.base.is_some() && options.commit.is_some() {
         return Err("'--base' can not be used with a base commit.".to_string());
     }
     if let Some(rev) = options.base.as_deref() {
-        return hg_rev_to_commit(cwd, rev)
+        return hg_rev_to_commit_with(cwd, hg_cmd, rev)
             .ok_or_else(|| format!("Unable to find any hg commit named '{rev}'."));
     }
     if let Some(commit) = options.commit.as_deref() {
-        return hg_ancestor(cwd, commit, ".");
+        return hg_ancestor_with(cwd, hg_cmd, commit, ".");
     }
-    let branch = diff_local::get_hg_branch_name(cwd)?;
-    arc_rs::hg::auto_base_commit(cwd, &branch, ".")
+    let branch = diff_local::get_hg_branch_name_with(cwd, hg_cmd)?;
+    hg::auto_base_commit_with(cwd, hg_cmd, &branch, ".")
         .map(|(base, _)| base)
         .map_err(|e| format!("failed to determine hg base commit: {e}"))
 }
 
 /// Collect submit payload changes with hunks for any VCS or raw source.
 ///
+/// Collect svn submit changes through the per-path fan-out.
+///
+/// PHP: the Subversion branch of `generateChanges()`
+/// (`:832-884`): argv-limited status, externals warn/confirm, the
+/// base-revision check, and one `--depth empty` diff per path.
+fn collect_svn_submit_changes<R: std::io::BufRead, W: std::io::Write>(
+    cwd: &Path,
+    svn_cmd: &svn::SvnCommand,
+    options: &Options,
+    io: &mut diff_local::SvnPromptIo<'_, R, W>,
+) -> Result<Vec<diff_submit::DiffChange>, String> {
+    let script = diff_local::default_svn_diff_cmd().map(|path| path.to_string_lossy().into_owned());
+    let config = svn::SvnDiffConfig {
+        context: diff_local::DEFAULT_DIFF_CONTEXT_LINES,
+        diff_cmd: script.as_deref(),
+        diff_program: "diff",
+        diff_prefix: &[],
+    };
+    let parsed =
+        diff_local::collect_svn_parsed_changes_with_io(cwd, svn_cmd, &options.paths, &config, io)?;
+    Ok(parsed.iter().map(submit_change_from_parsed).collect())
+}
+
+/// Real-stdio prompt state for the svn externals confirm.
+fn stdio_prompt_io<'a>(
+    reader: &'a mut std::io::BufReader<std::io::Stdin>,
+    writer: &'a mut std::io::Stdout,
+) -> diff_local::SvnPromptIo<'a, std::io::BufReader<std::io::Stdin>, std::io::Stdout> {
+    diff_local::SvnPromptIo {
+        reader,
+        writer,
+        warned_externals: false,
+    }
+}
+
 /// PHP: `generateChanges()` (`:802-901`): raw text parses directly
 /// (`:820-827`); git/hg diffs require non-empty output (`:884-898`); svn
-/// diffs parse whole-worktree (or path-limited) output.
-///
-/// Divergence: svn runs one recursive `svn diff` instead of per-path
-/// `--depth empty` diffs plus `binary_safe_diff.sh`; output text is
-/// equivalent for file changes.
+/// fans out to per-path `--depth empty` diffs (`:832-884`).
 pub fn collect_submit_changes(
     cwd: &Path,
     options: &Options,
     base: &str,
     head: Option<&str>,
 ) -> Result<Vec<diff_submit::DiffChange>, String> {
+    collect_submit_changes_with(
+        cwd,
+        &hg::HgCommand::default(),
+        &svn::SvnCommand::default(),
+        options,
+        base,
+        head,
+    )
+}
+
+/// [`collect_submit_changes`] over injected `hg`/`svn` backends (the git
+/// arm always uses the system binary). The svn externals prompt uses real
+/// stdio; [`collect_submit_changes_with_io`] injects it.
+pub fn collect_submit_changes_with(
+    cwd: &Path,
+    hg_cmd: &hg::HgCommand,
+    svn_cmd: &svn::SvnCommand,
+    options: &Options,
+    base: &str,
+    head: Option<&str>,
+) -> Result<Vec<diff_submit::DiffChange>, String> {
+    let mut reader = std::io::BufReader::new(std::io::stdin());
+    let mut writer = std::io::stdout();
+    let mut io = stdio_prompt_io(&mut reader, &mut writer);
+    collect_submit_changes_with_io(cwd, hg_cmd, svn_cmd, options, base, head, &mut io)
+}
+
+/// [`collect_submit_changes_with`] with injected prompt stdio for the svn
+/// externals confirm.
+pub fn collect_submit_changes_with_io<R: std::io::BufRead, W: std::io::Write>(
+    cwd: &Path,
+    hg_cmd: &hg::HgCommand,
+    svn_cmd: &svn::SvnCommand,
+    options: &Options,
+    base: &str,
+    head: Option<&str>,
+    io: &mut diff_local::SvnPromptIo<'_, R, W>,
+) -> Result<Vec<diff_submit::DiffChange>, String> {
     if diff_local::is_raw_diff_source(options.raw, options.raw_command.as_deref()) {
-        return Ok(parse_raw_diff_changes(&read_raw_diff_text(options)?));
+        return parse_raw_diff_changes(&read_raw_diff_text(options)?);
     }
-    let convert = |text: &str| {
-        diff_local::parse_unified_diff(text)
-            .iter()
-            .map(submit_change_from_parsed)
-            .collect::<Vec<_>>()
+    let convert = |text: &str| -> Result<Vec<diff_submit::DiffChange>, String> {
+        let parsed = diff_local::parse_unified_diff(text)?;
+        Ok(parsed.iter().map(submit_change_from_parsed).collect())
     };
     match detect_vcs_kind(cwd) {
         Some(VcsKind::Git) => {
@@ -1915,32 +2135,21 @@ pub fn collect_submit_changes(
             if text.is_empty() {
                 return Err(diff_local::NO_CHANGES_FOUND.to_string());
             }
-            Ok(convert(&text))
+            Ok(convert(&text)?)
         }
         Some(VcsKind::Hg) => {
-            let text =
-                diff_local::get_full_hg_diff(cwd, base, diff_local::DEFAULT_DIFF_CONTEXT_LINES)?;
+            let text = diff_local::get_full_hg_diff_with(
+                cwd,
+                hg_cmd,
+                base,
+                diff_local::DEFAULT_DIFF_CONTEXT_LINES,
+            )?;
             if text.is_empty() {
                 return Err(diff_local::NO_CHANGES_FOUND.to_string());
             }
-            Ok(convert(&text))
+            Ok(convert(&text)?)
         }
-        Some(VcsKind::Svn) => {
-            let mut argv = vec!["diff".to_string()];
-            if !options.paths.is_empty() {
-                argv.push("--".to_string());
-                argv.extend(options.paths.iter().cloned());
-            }
-            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-            let out = svn::output(cwd, &refs)?;
-            if !out.status.success() {
-                return Err(format!(
-                    "svn diff failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ));
-            }
-            Ok(convert(&String::from_utf8_lossy(&out.stdout)))
-        }
+        Some(VcsKind::Svn) => collect_svn_submit_changes(cwd, svn_cmd, options, io),
         None => Err("not inside a git, hg, or svn working copy".to_string()),
     }
 }
@@ -1956,6 +2165,58 @@ pub fn prepare_submit_full(
     cwd: &Path,
     options: &Options,
     mode: &SubmitMode,
+) -> Result<SubmitInput, String> {
+    prepare_submit_full_with_report(cwd, options, mode, &diff_local::LintUnitReport::empty())
+}
+
+/// Collect a full-state submit, stamping the diff spec with `report`'s
+/// lint/unit status words (`run()`, `:375-379`).
+pub fn prepare_submit_full_with_report(
+    cwd: &Path,
+    options: &Options,
+    mode: &SubmitMode,
+    report: &diff_local::LintUnitReport,
+) -> Result<SubmitInput, String> {
+    prepare_submit_full_with_commands(
+        cwd,
+        &hg::HgCommand::default(),
+        &svn::SvnCommand::default(),
+        options,
+        mode,
+        report,
+    )
+}
+
+/// [`prepare_submit_full_with_report`] over injected `hg`/`svn` backends
+/// (fake binaries in tests; the git arms always use the system binary).
+/// The svn externals prompt uses real stdio; the `_io` variant injects it.
+pub fn prepare_submit_full_with_commands(
+    cwd: &Path,
+    hg_cmd: &hg::HgCommand,
+    svn_cmd: &svn::SvnCommand,
+    options: &Options,
+    mode: &SubmitMode,
+    report: &diff_local::LintUnitReport,
+) -> Result<SubmitInput, String> {
+    let mut reader = std::io::BufReader::new(std::io::stdin());
+    let mut writer = std::io::stdout();
+    let mut io = stdio_prompt_io(&mut reader, &mut writer);
+    prepare_submit_full_with_commands_io(cwd, hg_cmd, svn_cmd, options, mode, report, &mut io)
+}
+
+/// [`prepare_submit_full_with_commands`] with injected prompt stdio.
+///
+/// Subversion collects its parsed changes once and derives both the
+/// submit payload and the included-changes entries from them, like PHP's
+/// single `generateChanges()` result.
+pub fn prepare_submit_full_with_commands_io<R: std::io::BufRead, W: std::io::Write>(
+    cwd: &Path,
+    hg_cmd: &hg::HgCommand,
+    svn_cmd: &svn::SvnCommand,
+    options: &Options,
+    mode: &SubmitMode,
+    report: &diff_local::LintUnitReport,
+    io: &mut diff_local::SvnPromptIo<'_, R, W>,
 ) -> Result<SubmitInput, String> {
     let is_raw = diff_local::is_raw_diff_source(options.raw, options.raw_command.as_deref());
     let (base, head) = if is_raw {
@@ -1978,7 +2239,7 @@ pub fn prepare_submit_full(
                     resolved.commit =
                         diff_local::parse_base_commit_argument(true, &resolved.paths)?;
                 }
-                (resolve_hg_base(cwd, &resolved)?, None)
+                (resolve_hg_base_with(cwd, hg_cmd, &resolved)?, None)
             }
             Some(VcsKind::Svn) => (String::new(), None),
             None => return Err("not inside a git, hg, or svn working copy".to_string()),
@@ -1986,16 +2247,38 @@ pub fn prepare_submit_full(
     };
     let kind = if is_raw { None } else { detect_vcs_kind(cwd) };
     let head_ref = head.as_deref();
-    let changes = collect_submit_changes(cwd, options, &base, head_ref)?;
+    let svn_parsed = if !is_raw && kind == Some(VcsKind::Svn) {
+        let script =
+            diff_local::default_svn_diff_cmd().map(|path| path.to_string_lossy().into_owned());
+        let config = svn::SvnDiffConfig {
+            context: diff_local::DEFAULT_DIFF_CONTEXT_LINES,
+            diff_cmd: script.as_deref(),
+            diff_program: "diff",
+            diff_prefix: &[],
+        };
+        Some(diff_local::collect_svn_parsed_changes_with_io(
+            cwd,
+            svn_cmd,
+            &options.paths,
+            &config,
+            io,
+        )?)
+    } else {
+        None
+    };
+    let changes = match &svn_parsed {
+        Some(parsed) => parsed.iter().map(submit_change_from_parsed).collect(),
+        None => collect_submit_changes_with_io(cwd, hg_cmd, svn_cmd, options, &base, head_ref, io)?,
+    };
     diff_submit::require_changes(changes.len())?;
-    let spec_input = full_spec_input(cwd, kind, &base)?;
+    let spec_input = full_spec_input_with(cwd, hg_cmd, svn_cmd, kind, &base)?;
     let spec = diff_submit::diff_spec_json(
         &changes,
-        diff_local::lint_status(None),
-        diff_local::unit_status(None),
+        diff_local::lint_status(report.lint_result),
+        diff_local::unit_status(report.unit_result),
         &spec_input,
     );
-    let fields = full_submit_fields(cwd, options, kind, mode, &base, head_ref)?;
+    let fields = full_submit_fields_with(cwd, hg_cmd, options, kind, mode, &base, head_ref)?;
     if matches!(mode, SubmitMode::Create) {
         diff_submit::check_draft_create(options.draft, false)?;
     }
@@ -2004,19 +2287,22 @@ pub fn prepare_submit_full(
         _ => None,
     };
     let entries: Vec<diff_local::ChangeEntry> = if is_raw {
-        diff_local::without_message_changes(&diff_local::parse_unified_diff(&read_raw_diff_text(
-            options,
-        )?))
-        .iter()
-        .map(change_entry_from_parsed)
-        .collect()
+        let parsed = diff_local::parse_unified_diff(&read_raw_diff_text(options)?)?;
+        diff_local::without_message_changes(&parsed)
+            .iter()
+            .map(change_entry_from_parsed)
+            .collect()
+    } else if let Some(parsed) = svn_parsed.as_ref() {
+        parsed.iter().map(change_entry_from_parsed).collect()
     } else {
         match detect_vcs_kind(cwd) {
             Some(VcsKind::Git) => diff_local::collect_change_entries(cwd, &base, head_ref)?,
-            _ => diff_local::parse_unified_diff(&svn_or_hg_diff_text(cwd, options, &base)?)
-                .iter()
-                .map(change_entry_from_parsed)
-                .collect(),
+            _ => {
+                let parsed = diff_local::parse_unified_diff(&svn_or_hg_diff_text_with(
+                    cwd, hg_cmd, svn_cmd, options, &base,
+                )?)?;
+                parsed.iter().map(change_entry_from_parsed).collect()
+            }
         }
     };
     Ok(SubmitInput {
@@ -2024,7 +2310,7 @@ pub fn prepare_submit_full(
         message,
         fields,
         spec,
-        properties: full_submit_properties(cwd, kind, &base, head_ref)?,
+        properties: full_submit_properties_with(cwd, hg_cmd, kind, &base, head_ref)?,
         included_changes: diff_local::render_included_changes(&entries),
         json: options.json,
     })
@@ -2032,10 +2318,30 @@ pub fn prepare_submit_full(
 
 /// Read the unified diff text for hg/svn entry rendering.
 fn svn_or_hg_diff_text(cwd: &Path, options: &Options, base: &str) -> Result<String, String> {
+    svn_or_hg_diff_text_with(
+        cwd,
+        &hg::HgCommand::default(),
+        &svn::SvnCommand::default(),
+        options,
+        base,
+    )
+}
+
+/// [`svn_or_hg_diff_text`] over injected `hg`/`svn` backends.
+fn svn_or_hg_diff_text_with(
+    cwd: &Path,
+    hg_cmd: &hg::HgCommand,
+    svn_cmd: &svn::SvnCommand,
+    options: &Options,
+    base: &str,
+) -> Result<String, String> {
     match detect_vcs_kind(cwd) {
-        Some(VcsKind::Hg) => {
-            diff_local::get_full_hg_diff(cwd, base, diff_local::DEFAULT_DIFF_CONTEXT_LINES)
-        }
+        Some(VcsKind::Hg) => diff_local::get_full_hg_diff_with(
+            cwd,
+            hg_cmd,
+            base,
+            diff_local::DEFAULT_DIFF_CONTEXT_LINES,
+        ),
         Some(VcsKind::Svn) => {
             let mut argv = vec!["diff".to_string()];
             if !options.paths.is_empty() {
@@ -2043,7 +2349,7 @@ fn svn_or_hg_diff_text(cwd: &Path, options: &Options, base: &str) -> Result<Stri
                 argv.extend(options.paths.iter().cloned());
             }
             let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-            let out = svn::output(cwd, &refs)?;
+            let out = svn::output_with(cwd, svn_cmd, &refs)?;
             if !out.status.success() {
                 return Err(format!(
                     "svn diff failed: {}",
@@ -2116,10 +2422,11 @@ pub fn inspect_full(cwd: &Path, options: &Options) -> Result<Vec<u8>, String> {
         let head_ref = head.as_deref();
         let entries: Vec<diff_local::ChangeEntry> = match kind {
             VcsKind::Git => diff_local::collect_change_entries(cwd, &base, head_ref)?,
-            _ => diff_local::parse_unified_diff(&svn_or_hg_diff_text(cwd, options, &base)?)
-                .iter()
-                .map(change_entry_from_parsed)
-                .collect(),
+            _ => {
+                let parsed =
+                    diff_local::parse_unified_diff(&svn_or_hg_diff_text(cwd, options, &base)?)?;
+                parsed.iter().map(change_entry_from_parsed).collect()
+            }
         };
         let files: Vec<FileDiff> = entries.iter().map(|entry| entry.current.clone()).collect();
         let mut doc = diff_json(&base, &files);
@@ -2131,7 +2438,7 @@ pub fn inspect_full(cwd: &Path, options: &Options) -> Result<Vec<u8>, String> {
                 doc["fields"] = serde_json::json!({});
             }
         }
-        let mut text = serde_json::to_string_pretty(&doc)
+        let mut text = diff_submit::php_json_encode_pretty(&doc)
             .map_err(|e| format!("failed to encode JSON: {e}"))?;
         text.push('\n');
         return Ok(text.into_bytes());
@@ -2165,12 +2472,53 @@ fn submit_full_via_client(
     options: &Options,
     mode: &SubmitMode,
 ) -> Result<String, String> {
-    let input = prepare_submit_full(cwd, options, mode)?;
+    let is_raw = diff_local::is_raw_diff_source(options.raw, options.raw_command.as_deref());
+    let kind = if is_raw { None } else { detect_vcs_kind(cwd) };
+    // Outside a working copy the prepare step reports the canonical
+    // error; lint/unit stay unrunnable (PHP's repository setup throws
+    // before `:363` just the same).
+    let report = if !is_raw && kind.is_none() {
+        diff_local::LintUnitReport::empty()
+    } else {
+        let (base, head) = lint_unit_base(cwd, options, kind, is_raw)?;
+        let head_ref = head.as_deref();
+        run_lint_unit_stdio(cwd, options, base.as_deref(), head_ref, is_raw)?
+    };
+    let input = prepare_submit_full_with_report(cwd, options, mode, &report)?;
     let client = config::client_for(options.conduit_uri.as_deref())?;
     let call = |method: &str, params: &serde_json::Value| {
         client.call(method, params).map_err(|e| e.to_string())
     };
-    submit_over(&call, &input)
+    submit_over_with_browse(cwd, options, &call, &input)
+}
+
+/// Base commit plus head for lint/unit `--rev`, by repository kind.
+///
+/// Git resolves the range, hg its base, and svn/raw sources yield no
+/// base (svn supports no commit ranges; raw sources skip the children).
+fn lint_unit_base(
+    cwd: &Path,
+    options: &Options,
+    kind: Option<VcsKind>,
+    is_raw: bool,
+) -> Result<(Option<String>, Option<String>), String> {
+    if is_raw {
+        return Ok((None, None));
+    }
+    match kind {
+        Some(VcsKind::Git) => {
+            let range = resolve_range(cwd, options)?;
+            Ok((Some(range.base), range.head))
+        }
+        Some(VcsKind::Hg) => {
+            let mut resolved = options.clone();
+            if !resolved.paths.is_empty() {
+                resolved.commit = diff_local::parse_base_commit_argument(true, &resolved.paths)?;
+            }
+            Ok((Some(resolve_hg_base(cwd, &resolved)?), None))
+        }
+        _ => Ok((None, None)),
+    }
 }
 
 /* -(  Full-State Editor and Scratch Files (G1)  )-------------------------------- */
@@ -2388,6 +2736,43 @@ pub fn scratch_file_path(metadata_dir: &Path, name: &str) -> PathBuf {
     metadata_dir.join("arc").join(name)
 }
 
+/// Collapse `.` and `..` segments lexically (the `resolvePath()` subset
+/// `readablePath()` needs for its second attempt).
+fn lexically_normal_root(root: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in root.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Human-readable scratch path: relative to the work root when under it,
+/// else absolute.
+///
+/// PHP: `ArcanistRepositoryAPI::getReadableScratchFilePath()`
+/// (`src/repository/api/ArcanistRepositoryAPI.php:519-529`) via
+/// `Filesystem::readablePath()` (`src/filesystem/Filesystem.php`): strip
+/// a trailing-separator root prefix, trying the root as given and then
+/// resolved.
+#[must_use]
+pub fn readable_scratch_file_path(metadata_dir: &Path, work_root: &Path, name: &str) -> String {
+    let full = scratch_file_path(metadata_dir, name);
+    if let Ok(relative) = full.strip_prefix(work_root) {
+        return relative.to_string_lossy().into_owned();
+    }
+    let normal = lexically_normal_root(work_root);
+    if let Ok(relative) = full.strip_prefix(&normal) {
+        return relative.to_string_lossy().into_owned();
+    }
+    full.to_string_lossy().into_owned()
+}
+
 /// Read a scratch file, `None` on any failure (`:436-453`).
 #[must_use]
 pub fn read_scratch_file(metadata_dir: &Path, name: &str) -> Option<String> {
@@ -2421,7 +2806,7 @@ pub fn read_scratch_json(metadata_dir: &Path, name: &str) -> serde_json::Value {
 
 /// Write a scratch JSON file (`:1734-1736`).
 pub fn write_scratch_json(metadata_dir: &Path, name: &str, data: &serde_json::Value) -> bool {
-    match serde_json::to_string(data) {
+    match diff_submit::php_json_encode(data) {
         Ok(text) => write_scratch_file(metadata_dir, name, &text),
         Err(_) => false,
     }
@@ -2509,6 +2894,126 @@ pub fn open_uri_in_browser(uri: &str, browser_argv: &[String]) -> Result<(), Str
     }
 }
 
+/// Read the `browser` command from any config source (`:2172-2175`).
+///
+/// Scalar strings become one argv word; lists of strings become argv;
+/// empty or mistyped values are falsy in PHP and yield `None`.
+/// `user_file` is the `~/.arcrc` path (`None` skips the user source).
+pub fn configured_browser_command_in(cwd: &Path, user_file: Option<&Path>) -> Option<Vec<String>> {
+    let sources = get_config::load_sources(cwd, user_file).ok()?;
+    let (_, value) = get_config::current_value("browser", &sources)?;
+    match value {
+        serde_json::Value::String(word) if !word.is_empty() => Some(vec![word]),
+        serde_json::Value::Array(words) => {
+            let argv: Vec<String> = words
+                .iter()
+                .filter_map(|word| word.as_str().map(str::to_string))
+                .collect();
+            if argv.is_empty() { None } else { Some(argv) }
+        }
+        _ => None,
+    }
+}
+
+/// Read the `browser` command for `cwd`, including the user source.
+pub fn configured_browser_command(cwd: &Path) -> Option<Vec<String>> {
+    let user_file = config::arcrc_path();
+    configured_browser_command_in(cwd, user_file.as_deref())
+}
+
+/// True when `name` names a runnable file under one of `dirs`.
+///
+/// Unix requires an execute bit; elsewhere any plain file counts.
+/// Backs [`binary_exists_on_path`]; split out so tests need no `PATH`
+/// mutation.
+fn binary_exists_in_dirs(name: &str, dirs: &[PathBuf]) -> bool {
+    dirs.iter().any(|dir| {
+        let candidate = dir.join(name);
+        candidate.is_file() && is_runnable(&candidate)
+    })
+}
+
+#[cfg(unix)]
+fn is_runnable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_runnable(_path: &Path) -> bool {
+    true
+}
+
+/// True when `name` resolves to a runnable file on `PATH`, standing in
+/// for `Filesystem::binaryExists()` in the browser scan (`:2199-2203`).
+///
+/// Only the fixed `sensible-browser` / `xdg-open` / `open` probes use
+/// this (Windows takes `cmd /c start` without probing), so `PATHEXT`
+/// handling is intentionally absent.
+pub fn binary_exists_on_path(name: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let dirs: Vec<PathBuf> = std::env::split_paths(&paths).collect();
+    binary_exists_in_dirs(name, &dirs)
+}
+
+/// Browser opener seam: open `uri` with `browser_argv` (without the
+/// URI), like [`open_uri_in_browser`].
+pub type BrowserRunner<'a> = &'a dyn Fn(&str, &[String]) -> Result<(), String>;
+
+/// Open the created object URI after submit (`:431-433`, `:560-562`).
+///
+/// No-op without a URI or without `--browse`
+/// ([`diff_local::should_open_in_browser`]); otherwise resolves the
+/// browser via [`browser_open_argv`] and opens through `run`, which
+/// spawns like [`open_uri_in_browser`]. Mirrors `openURIsInBrowser()`
+/// over the single created URI, including the failure text.
+pub fn open_submit_result_in_browser(
+    uri: Option<&str>,
+    browse: bool,
+    configured: Option<&[String]>,
+    binary_exists: &dyn Fn(&str) -> bool,
+    run: BrowserRunner<'_>,
+) -> Result<(), String> {
+    let Some(uri) = uri else {
+        return Ok(());
+    };
+    if !diff_local::should_open_in_browser(browse) {
+        return Ok(());
+    }
+    let full = browser_open_argv(uri, configured, binary_exists)?;
+    let browser = &full[..full.len() - 1];
+    run(uri, browser)
+}
+
+/// Run `submit_over_with_uri` over `call`, then `--browse` handling.
+///
+/// PHP echoes the success report before a browser failure throws
+/// (`:431-433`, `:560-562`), so the report prints to stdout on that
+/// path and the browser error still propagates.
+fn submit_over_with_browse(
+    cwd: &Path,
+    options: &Options,
+    call: &diff_submit::ConduitCall<'_>,
+    input: &SubmitInput,
+) -> Result<String, String> {
+    let report = submit_over_with_uri(call, input)?;
+    if let Err(error) = open_submit_result_in_browser(
+        report.uri.as_deref(),
+        options.browse,
+        configured_browser_command(cwd).as_deref(),
+        &binary_exists_on_path,
+        &open_uri_in_browser,
+    ) {
+        print!("{}", report.text);
+        return Err(error);
+    }
+    Ok(report.text)
+}
+
 /// Amend the git worktree message (`ArcanistGitAPI::amendCommit()` with a
 /// message, `:829-841`).
 pub fn amend_worktree_message_git(dir: &Path, message: &str) -> Result<(), String> {
@@ -2542,7 +3047,13 @@ pub fn amend_worktree_message_git(dir: &Path, message: &str) -> Result<(), Strin
 /// (`ArcanistMercurialAPI::supportsAmend()`, `:469-476`).
 #[must_use]
 pub fn hg_supports_amend(dir: &Path) -> bool {
-    arc_rs::hg::output(dir, &["help", "commit"])
+    hg_supports_amend_with(dir, &hg::HgCommand::default())
+}
+
+/// [`hg_supports_amend`] over an injected `hg` backend.
+#[must_use]
+pub fn hg_supports_amend_with(dir: &Path, hg_cmd: &hg::HgCommand) -> bool {
+    hg::output_with(dir, hg_cmd, &["help", "commit"])
         .map(|out| out.status.success() && String::from_utf8_lossy(&out.stdout).contains("amend"))
         .unwrap_or(false)
 }
@@ -2700,6 +3211,23 @@ pub fn full_spec_input(
     kind: Option<VcsKind>,
     base: &str,
 ) -> Result<diff_submit::DiffSpecInput, String> {
+    full_spec_input_with(
+        cwd,
+        &hg::HgCommand::default(),
+        &svn::SvnCommand::default(),
+        kind,
+        base,
+    )
+}
+
+/// [`full_spec_input`] over injected `hg`/`svn` backends.
+pub fn full_spec_input_with(
+    cwd: &Path,
+    hg_cmd: &hg::HgCommand,
+    svn_cmd: &svn::SvnCommand,
+    kind: Option<VcsKind>,
+    base: &str,
+) -> Result<diff_submit::DiffSpecInput, String> {
     let machine = diff_local::default_source_machine_name();
     match kind {
         None => {
@@ -2729,8 +3257,8 @@ pub fn full_spec_input(
             })
         }
         Some(VcsKind::Hg) => {
-            let branch = diff_local::get_hg_branch_name(cwd)?;
-            let root = arc_rs::hg::stdout_text(cwd, &["root"])?;
+            let branch = diff_local::get_hg_branch_name_with(cwd, hg_cmd)?;
+            let root = hg::stdout_text_with(cwd, hg_cmd, &["root"])?;
             Ok(diff_submit::DiffSpecInput {
                 source_machine: machine,
                 source_path: Some(root),
@@ -2743,7 +3271,7 @@ pub fn full_spec_input(
             })
         }
         Some(VcsKind::Svn) => {
-            let info = diff_local::get_svn_info(cwd, "/")?;
+            let info = diff_local::get_svn_info_with(cwd, svn_cmd, "/")?;
             let url = info.get("URL").cloned().unwrap_or_default();
             let root = info.get("Repository Root").cloned().unwrap_or_default();
             let rev = info.get("Revision").cloned().unwrap_or_default();
@@ -2775,6 +3303,27 @@ pub fn full_submit_fields(
     base: &str,
     head: Option<&str>,
 ) -> Result<serde_json::Value, String> {
+    full_submit_fields_with(
+        cwd,
+        &hg::HgCommand::default(),
+        options,
+        kind,
+        mode,
+        base,
+        head,
+    )
+}
+
+/// [`full_submit_fields`] over an injected `hg` backend.
+pub fn full_submit_fields_with(
+    cwd: &Path,
+    hg_cmd: &hg::HgCommand,
+    options: &Options,
+    kind: Option<VcsKind>,
+    mode: &SubmitMode,
+    base: &str,
+    head: Option<&str>,
+) -> Result<serde_json::Value, String> {
     match mode {
         SubmitMode::Only => Ok(serde_json::Value::Null),
         SubmitMode::Update(_) if !options.verbatim => Ok(serde_json::json!({})),
@@ -2789,10 +3338,10 @@ pub fn full_submit_fields(
                 None => Ok(serde_json::json!({})),
                 Some(VcsKind::Git) => Ok(fields_json(&collect_fields(cwd, options, base, head)?)),
                 Some(VcsKind::Hg) => {
-                    let branch = diff_local::get_hg_branch_name(cwd)?;
+                    let branch = diff_local::get_hg_branch_name_with(cwd, hg_cmd)?;
                     let argv = diff_local::hg_commit_log_argv(base, &branch);
                     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-                    let text = arc_rs::hg::stdout_text(cwd, &refs)?;
+                    let text = hg::stdout_text_with(cwd, hg_cmd, &refs)?;
                     let mut oldest_first: Vec<String> = diff_local::parse_hg_commit_log(&text)
                         .into_iter()
                         .map(|(_, desc)| desc)
@@ -2826,17 +3375,28 @@ pub fn full_submit_properties(
     base: &str,
     head: Option<&str>,
 ) -> Result<Vec<diff_submit::DiffProperty>, String> {
+    full_submit_properties_with(cwd, &hg::HgCommand::default(), kind, base, head)
+}
+
+/// [`full_submit_properties`] over an injected `hg` backend.
+pub fn full_submit_properties_with(
+    cwd: &Path,
+    hg_cmd: &hg::HgCommand,
+    kind: Option<VcsKind>,
+    base: &str,
+    head: Option<&str>,
+) -> Result<Vec<diff_submit::DiffProperty>, String> {
     match kind {
         None | Some(VcsKind::Svn) => Ok(Vec::new()),
         Some(VcsKind::Git) => diff_properties(cwd, base, head),
         Some(VcsKind::Hg) => {
-            let branch = diff_local::get_hg_branch_name(cwd)?;
-            let commits = diff_local::get_hg_local_commits(cwd, base, &branch)?;
+            let branch = diff_local::get_hg_branch_name_with(cwd, hg_cmd)?;
+            let commits = diff_local::get_hg_local_commits_with(cwd, hg_cmd, base, &branch)?;
             let mut properties = Vec::new();
             if diff_local::should_update_local_property(false, !commits.is_empty()) {
                 let rendered: Vec<serde_json::Value> =
                     commits.iter().map(|commit| commit.to_json()).collect();
-                let data = serde_json::to_string(&rendered)
+                let data = diff_submit::php_json_encode(&serde_json::Value::Array(rendered))
                     .map_err(|e| format!("failed to encode local commits: {e}"))?;
                 properties.push(diff_submit::DiffProperty {
                     name: diff_submit::PROP_LOCAL_COMMITS.to_string(),

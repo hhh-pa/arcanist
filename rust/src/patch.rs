@@ -23,20 +23,32 @@
 //! - Conduit bundles load hunks via `differential.getrawdiff` instead of
 //!   rendering change dictionaries (`toGitPatch()`), but still query
 //!   `differential.querydiffs` for the base revision, revision ID, and
-//!   author metadata. The applied result is equivalent for text changes.
+//!   author metadata. The applied result is equivalent for text and
+//!   binary changes (the server renders `GIT binary` patches); local
+//!   binary rendering via `file.download` blobs is available through
+//!   `fetch_file_blob()` plus `render_git_patch_with_blobs()`.
 //! - Arcbundles reconstruct a git patch from `changes.json` plus `hunks/N`
-//!   members via the system `tar` binary (like PHP's `ExecFuture('tar
-//!   ...')`). Text add/change/delete/rename/mode changes render; binary,
-//!   image, and multicopy changes fail with a not-ported error (PHP
-//!   renders `GIT binary` patches from conduit blobs).
-//! - `--patch` text is not pre-parsed (`ArcanistDiffParser` is not
-//!   ported); malformed patches fail at `git apply` / `hg import` /
-//!   `patch -p0` instead.
+//!   and `blobs/<phid>` members via the system `tar` binary (like PHP's
+//!   `ExecFuture('tar ...')`). Text and `GIT binary` (binary/image,
+//!   including multicopy decomposes) changes render; binary bodies use
+//!   stored-zlib compression (PHP uses `gzcompress()`), which inflates
+//!   identically for `git apply`.
+//! - `--patch` text is pre-parsed like `ArcanistDiffParser::parseDiff()`
+//!   (empty + header validation with byte-for-byte `didFailParse()`
+//!   errors); valid patches pass through verbatim (PHP re-renders via
+//!   `toGitPatch()`, equivalent for git patches). Hunk-body line counts
+//!   and unified-to-git conversion are left to the VCS binaries.
 //! - Non-UTF-8 `--encoding` values decode bytes through a Windows-1252
-//!   table (`phutil_utf8_convert()` is not ported); UTF-8 input passes
-//!   through. The repository-encoding lookup (`getRepositoryEncoding()`,
-//!   UTF-8 by default) is not ported: conduit sources always decode as
-//!   UTF-8 unless `--encoding` says otherwise.
+//!   table. PHP's `phutil_utf8_convert()` (`src/utils/utf8.php:683-733`)
+//!   is a thin `mb_convert_encoding()` wrapper with no vendored table;
+//!   the port's 256-entry table matches the Windows-1252 standard
+//!   byte-for-byte (27 defined `0x80..0x9F` scalars, 5 undefined bytes
+//!   to U+FFFD, all others to the identical Latin-1 scalar). Other
+//!   source encodings still decode as Windows-1252 (PHP supports any
+//!   `mbstring` encoding). UTF-8 input passes through. The
+//!   repository-encoding lookup (`getRepositoryEncoding()`, UTF-8 by
+//!   default) is not ported: conduit sources always decode as UTF-8
+//!   unless `--encoding` says otherwise.
 //! - Interactive editors are not ported: commit-message editing (patch
 //!   commits, and the clean-check "create a commit" yes-path) fails with
 //!   a guidance error naming `--nocommit` instead of opening `$EDITOR`.
@@ -50,8 +62,20 @@
 //!   banner text renders unwrapped.
 //! - Prompt answers ending in `*` or `!` are accepted with the suffix
 //!   stripped (see `land`); persisting is not ported.
-//! - Mercurial `hg import` merge three-dot revsets and the `dotencode`
-//!   extension details are passed through to `hg` unchanged.
+//! - Revision text (including three-dot `...` revsets) passes verbatim
+//!   to `hg`/`git`: PHP formats revisions with `%s`/`hgsprintf` and
+//!   never interprets them (`getBranchName():224-226`,
+//!   `getBookmarkName():265-267`, `createBranch():302-305,328-335`,
+//!   `checkout %s --`, `cherry-pick -- %s`, `rebase --dest %s --rev %s`
+//!   with `hgsprintf`, `getCanonicalRevisionName(hgsprintf('%s^', …))`),
+//!   so the binary alone gives `...` meaning. The `dotencode`
+//!   extension details are likewise untouched.
+//! - Patch output is plain text on both sides: PHP's patch workflow
+//!   never calls `json_encode` (0 hits in `ArcanistPatchWorkflow.php`;
+//!   the 2 hits in `ArcanistBundle.php` are `writeToDisk()` export
+//!   only), and this port has no JSON emit sites on the patch path
+//!   (only `from_slice`/`from_str` parsing and conduit `json!` params),
+//!   so no `\/` escaping applies anywhere on the patch path.
 //! - Dependency child runs execute in-process with
 //!   `--force --skip-dependencies --nobranch` (plus `--nocommit` when the
 //!   parent used it), like PHP's passthru `arc patch`.
@@ -534,7 +558,13 @@ fn is_utf8_name(encoding: &str) -> bool {
 /// `convertNonUTF8Diff()`, `src/parser/ArcanistBundle.php:72-88,493-498`).
 ///
 /// UTF-8 (or no encoding) decodes lossily; anything else decodes through
-/// a Windows-1252 table (see the module docs).
+/// a Windows-1252 table (see the module docs). The table is complete
+/// and verified byte-for-byte against the Windows-1252 standard:
+/// bytes outside `0x80..0xA0` map to the identical Latin-1 scalar, the
+/// 27 defined `0x80..0xA0` bytes map per the standard, and the 5
+/// undefined bytes (`0x81,0x8D,0x8F,0x90,0x9D`) become U+FFFD (PHP
+/// delegates to `mb_convert_encoding()` with no vendored table;
+/// U+FFFD matches Rust lossy conversion and `phutil_utf8ize()`).
 pub fn decode_bytes(bytes: &[u8], encoding: Option<&str>) -> String {
     match encoding {
         None => String::from_utf8_lossy(bytes).into_owned(),
@@ -596,18 +626,321 @@ pub fn read_patch_bytes(path: &str, io: &mut Io) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|e| format!("Failed to read patch file '{path}': {e}"))
 }
 
-/// Load a `--patch` bundle from a file or `-`
-/// (`ArcanistPatchWorkflow.php:610-638`).
+/// Empty-diff parse error (`ArcanistDiffParser.php:189-192`).
+pub const EMPTY_DIFF_ERROR: &str = "Can't parse an empty diff!";
+
+/// Malformed header error (`ArcanistDiffParser.php:275-287`).
+const EXPECTED_HUNK_HEADER: &str = "Expected a hunk header, like 'Index: /path/to/file.ext' \
+     (svn), 'Property changes on: /path/to/file.ext' (svn properties), 'commit \
+     59bcc3ad6775562f845953cf01624225' (git show), 'diff --git' (git diff), '--- \
+     filename' (unified diff), or 'diff -r' (hg diff or patch).";
+
+/// Split like `phutil_split_lines($text, true)`: after each `\n`,
+/// keeping endings; `""` yields `[""]`.
+fn split_retain_lines(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    text.split_inclusive('\n').map(str::to_string).collect()
+}
+
+/// True for PCRE `\s` (ASCII whitespace incl. vertical tab).
+fn is_pcre_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0C | 0x0B)
+}
+
+/// True when any line starts with an ANSI color code
+/// (`ArcanistDiffParser.php:1101-1104`).
+fn has_leading_ansi(text: &str) -> bool {
+    for line in text.split('\n') {
+        let bytes = line.as_bytes();
+        if bytes.len() >= 3 && bytes[0] == 0x1B && bytes[1] == b'[' {
+            let mut i = 2;
+            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b';') {
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b'm' {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Strip all `\x1B\[[\d;]*m` sequences.
+fn strip_ansi_codes(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1B && bytes.get(i + 1) == Some(&b'[') {
+            let mut j = i + 2;
+            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'm' {
+                i = j + 1;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// PHP `ltrim()` without charlist: space, tab, newline, CR, NUL, VT.
+fn ltrim_php(text: &str) -> &str {
+    text.trim_start_matches([' ', '\t', '\n', '\r', '\0', '\x0B'])
+}
+
+/// True for `YYYY-MM-DD` at the start of `text` (10 ASCII chars).
+fn is_date_prefix(text: &str) -> bool {
+    let b = text.as_bytes();
+    b.len() >= 10
+        && b[0..4].iter().all(|d| d.is_ascii_digit())
+        && b[4] == b'-'
+        && b[5..7].iter().all(|d| d.is_ascii_digit())
+        && b[7] == b'-'
+        && b[8..10].iter().all(|d| d.is_ascii_digit())
+}
+
+/// True when `rest` (after `--- `) holds `<old><ws><date>` with
+/// non-empty old (`ArcanistDiffParser.php:244`).
+fn has_unified_date(rest: &str) -> bool {
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i + 10 <= bytes.len() {
+        if is_date_prefix(&rest[i..]) {
+            let mut ws_start = i;
+            while ws_start > 0 && is_pcre_space(bytes[ws_start - 1]) {
+                ws_start -= 1;
+            }
+            if ws_start > 0 && ws_start < i {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// True for `commit <hex>[ (<any>)]` (`ArcanistDiffParser.php:237`).
+fn is_commit_header(rest: &str) -> bool {
+    let mut hex_end = 0;
+    for b in rest.bytes() {
+        if b.is_ascii_digit() || (b'a'..=b'f').contains(&b) {
+            hex_end += 1;
+        } else {
+            break;
+        }
+    }
+    if hex_end == 0 {
+        return false;
+    }
+    let tail = &rest[hex_end..];
+    if tail.is_empty() {
+        return true;
+    }
+    tail.starts_with(" (") && tail.ends_with(')')
+}
+
+/// True for `diff -r <hex> [-r <hex> ]<cur>`
+/// (`ArcanistDiffParser.php:250`).
+fn is_hg_header(rest: &str) -> bool {
+    let mut hex_end = 0;
+    for b in rest.bytes() {
+        if b.is_ascii_digit() || (b'a'..=b'f').contains(&b) {
+            hex_end += 1;
+        } else {
+            break;
+        }
+    }
+    if hex_end == 0 {
+        return false;
+    }
+    let tail = &rest[hex_end..];
+    if !tail.starts_with(' ') {
+        return false;
+    }
+    let after = &tail[1..];
+    if let Some(second) = after.strip_prefix("-r ") {
+        let mut hex2 = 0;
+        for b in second.bytes() {
+            if b.is_ascii_digit() || (b'a'..=b'f').contains(&b) {
+                hex2 += 1;
+            } else {
+                break;
+            }
+        }
+        if hex2 == 0 {
+            return false;
+        }
+        let tail2 = &second[hex2..];
+        return tail2.starts_with(' ') && tail2.len() > 1;
+    }
+    !after.is_empty()
+}
+
+/// True for binary unified headers (`ArcanistDiffParser.php:245-247`).
+fn is_binary_unified(line: &str) -> bool {
+    let rest = if let Some(tail) = line.strip_prefix("Binary files ") {
+        tail
+    } else if let Some(tail) = line.strip_prefix("Files ") {
+        tail
+    } else {
+        return false;
+    };
+    let Some(and_at) = rest.find(" and ") else {
+        return false;
+    };
+    let (old_part, after_and) = (&rest[..and_at], &rest[and_at + 5..]);
+    let Some(differ_at) = after_and.rfind(" differ") else {
+        return false;
+    };
+    let new_part = &after_and[..differ_at];
+    has_unified_date(old_part) && has_unified_date(new_part)
+}
+
+/// True when `line` (trimmed of `\r\n`) matches any diff header
+/// (`ArcanistDiffParser.php:228-251`).
+fn is_diff_header(line: &str) -> bool {
+    if line.starts_with("Index: ") && line.len() > 7 {
+        return true;
+    }
+    for prefix in ["Modified: ", "Added: ", "Deleted: ", "Copied: "] {
+        if line.starts_with(prefix) && line.len() > prefix.len() {
+            return true;
+        }
+    }
+    if line.starts_with("Property changes on: ") && line.len() > 21 {
+        return true;
+    }
+    if let Some(rest) = line.strip_prefix("commit ") {
+        return is_commit_header(rest);
+    }
+    if line.starts_with("diff --git ") {
+        return true;
+    }
+    if line.starts_with("rcsdiff -u ") {
+        return true;
+    }
+    if let Some(rest) = line.strip_prefix("--- ") {
+        return has_unified_date(rest);
+    }
+    if is_binary_unified(line) {
+        return true;
+    }
+    if let Some(rest) = line.strip_prefix("diff -r ") {
+        return is_hg_header(rest);
+    }
+    false
+}
+
+/// Format a `didFailParse()` error (`ArcanistDiffParser.php:1198-1227`).
 ///
-/// Empty stdin fails with [`NO_STDIN_PATCH`]; file text decodes with
-/// `encoding` and carries no metadata.
+/// `lines` retain endings; `idx` is the current line (may equal
+/// `lines.len()` at EOF, yielding no `>>>` marker, like PHP).
+/// `writeDiffOnFailure` is false for `--patch` (`newFromDiff()` never
+/// sets it), so no raw-file line is emitted.
+pub fn format_parse_error(message: &str, lines: &[String], idx: usize) -> String {
+    let min = idx.saturating_sub(5);
+    let max = (idx + 5).min(lines.len().saturating_sub(1));
+    let mut context = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i < min || i > max {
+            continue;
+        }
+        let marker = if i == idx { ">>>  " } else { "" };
+        context.push_str(&format!("{:>8} {:>6}   {}", marker, i + 1, line));
+    }
+    format!("Diff Parse Exception: {message}\n\n{context}")
+}
+
+/// Validate `--patch` text like `ArcanistBundle::newFromDiff()`
+/// (`ArcanistPatchWorkflow.php:376`, `ArcanistDiffParser.php:189-287`).
+///
+/// Rejects empty diffs, strips ANSI colors and leading whitespace,
+/// skips `#` comments, and requires a diff header; malformed input
+/// fails with byte-for-byte `didFailParse()` errors. Successful
+/// patches pass through verbatim (PHP re-renders via `toGitPatch()`,
+/// which is equivalent for git patches; unified-to-git conversion and
+/// hunk-body line-count checks are left to `git apply`/`hg import`).
+pub fn validate_patch_text(text: &str) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Err(EMPTY_DIFF_ERROR.to_string());
+    }
+    let mut owned = text.to_string();
+    if has_leading_ansi(&owned) {
+        owned = strip_ansi_codes(&owned);
+    }
+    let trimmed = ltrim_php(&owned).to_string();
+    let lines = split_retain_lines(&trimmed);
+    let mut idx = 0;
+    while idx < lines.len() {
+        let cur = lines[idx].trim_end_matches(['\r', '\n']);
+        if cur.starts_with('#') {
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+    if idx >= lines.len() {
+        return Err(format_parse_error(EXPECTED_HUNK_HEADER, &lines, idx));
+    }
+    let first = lines[idx].trim_end_matches(['\r', '\n']);
+    if !is_diff_header(first) {
+        // `hg export` extended diffs: search forward for `diff -r` or
+        // `diff --git` when still on the first non-empty line.
+        let mut only_first = true;
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_end_matches(['\r', '\n']);
+            if t.trim().is_empty() || t.starts_with('#') {
+                continue;
+            }
+            if i != idx {
+                only_first = false;
+            }
+            break;
+        }
+        if only_first {
+            // Skip the failing line itself: a malformed `diff -r`/`diff --git`
+            // opener must still fail; only a later opener excuses the preamble.
+            let mut probe = idx + 1;
+            while probe < lines.len() {
+                let t = lines[probe].trim_end_matches(['\r', '\n']);
+                if t.starts_with("diff -r ") || t.starts_with("diff --git ") {
+                    return Ok(());
+                }
+                // Match PHP's `^\s*diff\s+-(?:r|-git)` loosely.
+                let trimmed_start = t.trim_start();
+                if trimmed_start.starts_with("diff -r") || trimmed_start.starts_with("diff --git") {
+                    return Ok(());
+                }
+                probe += 1;
+            }
+        }
+        return Err(format_parse_error(EXPECTED_HUNK_HEADER, &lines, idx));
+    }
+    Ok(())
+}
+
+/// Load a `--patch` bundle from a file or `-`
+/// (`ArcanistPatchWorkflow.php:361-377` via `ArcanistBundle::newFromDiff()`).
+///
+/// Empty stdin fails with [`NO_STDIN_PATCH`]; decoded text is
+/// pre-parsed like `ArcanistDiffParser::parseDiff()` (empty and
+/// malformed headers fail with byte-for-byte parse errors) and
+/// carries no metadata. Valid patches pass through verbatim.
 pub fn load_file_bundle(path: &str, encoding: Option<&str>, io: &mut Io) -> Result<Bundle, String> {
     let bytes = read_patch_bytes(path, io)?;
     if path == "-" && bytes.is_empty() {
         return Err(NO_STDIN_PATCH.to_string());
     }
+    let text = decode_bytes(&bytes, encoding);
+    validate_patch_text(&text)?;
     Ok(Bundle {
-        text: decode_bytes(&bytes, encoding),
+        text,
         ..Bundle::default()
     })
 }
@@ -731,6 +1064,17 @@ pub struct BundleChange {
     pub new_mode: Option<String>,
     /// Decoded hunk corpora.
     pub hunks: Vec<String>,
+    /// `old:binary-phid` metadata for binary/image changes.
+    pub old_binary_phid: Option<String>,
+    /// `new:binary-phid` metadata for binary/image changes.
+    pub new_binary_phid: Option<String>,
+    /// Away paths for move/copy sources (`awayPaths`).
+    pub away_paths: Vec<String>,
+    /// Original file bytes when carried inline (rare; conduit and
+    /// arcbundles use phids instead).
+    pub original_file_data: Option<Vec<u8>>,
+    /// Current file bytes when carried inline.
+    pub current_file_data: Option<Vec<u8>>,
 }
 
 impl BundleChange {
@@ -772,6 +1116,28 @@ fn parse_bundle_change(value: &serde_json::Value, hunks: Vec<String>) -> BundleC
         old_mode: mode("oldProperties"),
         new_mode: mode("newProperties"),
         hunks,
+        old_binary_phid: value
+            .get("metadata")
+            .and_then(|m| m.get("old:binary-phid"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        new_binary_phid: value
+            .get("metadata")
+            .and_then(|m| m.get("new:binary-phid"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        away_paths: value
+            .get("awayPaths")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        original_file_data: None,
+        current_file_data: None,
     }
 }
 
@@ -800,6 +1166,469 @@ pub fn quote_git_target(path: &str) -> String {
     }
     quoted.push('"');
     quoted
+}
+
+/// Rotate `v` left by `n` bits (SHA-1 helper).
+fn rotl32(v: u32, n: u32) -> u32 {
+    v.rotate_left(n)
+}
+
+/// Compress one 64-byte SHA-1 block into `state`.
+fn sha1_block(state: &mut [u32; 5], block: &[u8; 64]) {
+    let mut w = [0u32; 80];
+    for (i, word) in w.iter_mut().enumerate().take(16) {
+        let o = i * 4;
+        *word = (u32::from(block[o]) << 24)
+            | (u32::from(block[o + 1]) << 16)
+            | (u32::from(block[o + 2]) << 8)
+            | u32::from(block[o + 3]);
+    }
+    for i in 16..80 {
+        w[i] = rotl32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    }
+    let (mut a, mut b, mut c, mut d, mut e) = (state[0], state[1], state[2], state[3], state[4]);
+    for (i, word) in w.iter().enumerate() {
+        let (f, k) = if i < 20 {
+            ((b & c) | ((!b) & d), 0x5A827999u32)
+        } else if i < 40 {
+            (b ^ c ^ d, 0x6ED9EBA1u32)
+        } else if i < 60 {
+            ((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32)
+        } else {
+            (b ^ c ^ d, 0xCA62C1D6u32)
+        };
+        let temp = rotl32(a, 5)
+            .wrapping_add(f)
+            .wrapping_add(e)
+            .wrapping_add(k)
+            .wrapping_add(*word);
+        e = d;
+        d = c;
+        c = rotl32(b, 30);
+        b = a;
+        a = temp;
+    }
+    state[0] = state[0].wrapping_add(a);
+    state[1] = state[1].wrapping_add(b);
+    state[2] = state[2].wrapping_add(c);
+    state[3] = state[3].wrapping_add(d);
+    state[4] = state[4].wrapping_add(e);
+}
+
+/// SHA-1 hex digest of `data` (40 lowercase hex chars).
+pub fn sha1_hex(data: &[u8]) -> String {
+    let mut state = [
+        0x67452301u32,
+        0xEFCDAB89,
+        0x98BADCFE,
+        0x10325476,
+        0xC3D2E1F0,
+    ];
+    let mut padded = data.to_vec();
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+    for block in padded.as_chunks::<64>().0 {
+        sha1_block(&mut state, block);
+    }
+    let mut out = String::with_capacity(40);
+    for word in state {
+        out.push_str(&format!("{word:08x}"));
+    }
+    out
+}
+
+/// Git blob SHA-1 for `data`: `sha1("blob <len>\\0" + data)`.
+pub fn git_blob_sha1(data: &[u8]) -> String {
+    let mut prefixed = format!("blob {}\0", data.len()).into_bytes();
+    prefixed.extend_from_slice(data);
+    sha1_hex(&prefixed)
+}
+
+/// Adler-32 checksum (zlib trailer).
+pub fn adler32(data: &[u8]) -> u32 {
+    const MOD: u32 = 65521;
+    let mut s1: u32 = 1;
+    let mut s2: u32 = 0;
+    for byte in data {
+        s1 = (s1 + u32::from(*byte)) % MOD;
+        s2 = (s2 + s1) % MOD;
+    }
+    (s2 << 16) | s1
+}
+
+/// Zlib-encode `data` with stored (uncompressed) deflate blocks.
+///
+/// PHP uses `gzcompress()` (compressed deflate); stored blocks are
+/// larger but equally valid zlib, so `git apply` accepts them. Exact
+/// compressed bytes need not match PHP; the inflated result does.
+pub fn zlib_store(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 11);
+    out.push(0x78);
+    out.push(0x01);
+    let chunks: Vec<&[u8]> = if data.is_empty() {
+        vec![&[]]
+    } else {
+        data.chunks(65535).collect()
+    };
+    let last = chunks.len() - 1;
+    for (i, chunk) in chunks.iter().enumerate() {
+        out.push(u8::from(i == last));
+        let len = chunk.len() as u16;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes());
+        out.extend_from_slice(chunk);
+    }
+    out.extend_from_slice(&adler32(data).to_be_bytes());
+    out
+}
+
+/// Git base85 alphabet (`base85.c`, `ArcanistBundle.php:893-979`).
+const BASE85_MAP: &[u8; 85] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWX\
+    YZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~";
+
+/// Length character for one base85 line (`ArcanistBundle.php:981-988`):
+/// 0 maps to `@`, 1-26 to `A`-`Z`, 27-52 to `a`-`z`.
+fn base85_len_char(len: usize) -> char {
+    if len <= 26 {
+        (len as u8 + b'A' - 1) as char
+    } else {
+        (len as u8 - 26 + b'a' - 1) as char
+    }
+}
+
+/// Encode 4-byte groups of `chunk` (last group zero-padded) as base85.
+fn base85_encode_groups(chunk: &[u8], buf: &mut String) {
+    let mut pos = 0;
+    let mut remaining = chunk.len();
+    while remaining > 0 {
+        let mut accum: u32 = 0;
+        for shift in [24u32, 16, 8, 0] {
+            if remaining == 0 {
+                break;
+            }
+            accum += u32::from(chunk[pos]) << shift;
+            pos += 1;
+            remaining -= 1;
+            if remaining == 0 {
+                break;
+            }
+        }
+        let mut slice = [0u8; 5];
+        let mut value = accum;
+        for slot in &mut slice {
+            *slot = BASE85_MAP[(value % 85) as usize];
+            value /= 85;
+        }
+        slice.reverse();
+        buf.push_str(std::str::from_utf8(&slice).unwrap_or(""));
+    }
+}
+
+/// Base85-encode `input` like `ArcanistBundle::newBase85Data()`.
+///
+/// Splits into 52-byte lines, prefixes each with its length char,
+/// encodes groups, and terminates every line with `\n`. Empty input
+/// encodes to `"@\n"`, like PHP's `str_split('', 52)` path.
+pub fn base85_encode(input: &[u8]) -> String {
+    if input.is_empty() {
+        return "@\n".to_string();
+    }
+    let mut buf = String::new();
+    for chunk in input.chunks(52) {
+        buf.push(base85_len_char(chunk.len()));
+        base85_encode_groups(chunk, &mut buf);
+        buf.push('\n');
+    }
+    buf
+}
+
+/// Emit one `GIT binary patch` literal body for `data`.
+///
+/// Compresses with [`zlib_store`] (PHP uses `gzcompress()`; both
+/// inflate identically) then [`base85_encode`]s. The result ends with
+/// `\n` per line; callers append one more `\n` for the blank line.
+pub fn emit_binary_body(data: &[u8]) -> String {
+    base85_encode(&zlib_store(data))
+}
+
+/// Map one base64 character to its 6-bit value (`=` is padding).
+fn base64_val(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        b'=' => None,
+        _ => None,
+    }
+}
+
+/// Decode standard base64 (RFC 4648) like PHP's `base64_decode()`.
+///
+/// ASCII whitespace is ignored; other invalid bytes fail. Padding
+/// (`=`/`==`) is allowed only at the very end.
+pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    let bytes: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if !bytes.len().is_multiple_of(4) {
+        return Err("invalid base64 length".to_string());
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for (i, quad) in bytes.as_chunks::<4>().0.iter().enumerate() {
+        let is_last = i == bytes.len() / 4 - 1;
+        let pad = quad.iter().rev().take_while(|b| **b == b'=').count();
+        if pad > 2 || (!is_last && pad > 0) {
+            return Err("invalid base64 padding".to_string());
+        }
+        if quad[..4 - pad].contains(&b'=') {
+            return Err("invalid base64 padding".to_string());
+        }
+        let mut accum: u32 = 0;
+        for (j, byte) in quad.iter().enumerate() {
+            if j >= 4 - pad {
+                accum <<= 6;
+                continue;
+            }
+            let val = base64_val(*byte).ok_or_else(|| "invalid base64 byte".to_string())?;
+            accum = (accum << 6) | u32::from(val);
+        }
+        out.push((accum >> 16) as u8);
+        if pad < 2 {
+            out.push((accum >> 8) as u8);
+        }
+        if pad == 0 {
+            out.push(accum as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// Fetch one binary blob via `file.download`
+/// (`ArcanistBundle::getBlob()`, `src/parser/ArcanistBundle.php:709-738`).
+///
+/// PHP decodes the base64 response with `base64_decode()`; conduit
+/// serves file bytes only through `file.download` (querydiffs returns
+/// change dictionaries with `old:binary-phid`/`new:binary-phid`).
+pub fn fetch_file_blob(call: &diff_submit::ConduitCall<'_>, phid: &str) -> Result<Vec<u8>, String> {
+    let result = call("file.download", &serde_json::json!({"phid": phid}))?;
+    match result.as_str() {
+        Some(data) => base64_decode(data),
+        None => Err("file.download returned an unexpected response".to_string()),
+    }
+}
+
+/// Resolve binary bytes from inline data or a blob phid.
+fn resolve_blob_bytes(
+    direct: &Option<Vec<u8>>,
+    phid: &Option<String>,
+    loader: &dyn Fn(&str) -> Result<Vec<u8>, String>,
+) -> Result<Option<Vec<u8>>, String> {
+    if let Some(data) = direct {
+        return Ok(Some(data.clone()));
+    }
+    match phid {
+        Some(id) => Ok(Some(loader(id)?)),
+        None => Ok(None),
+    }
+}
+
+/// Blob bytes plus git SHA-1: missing blobs become empty with zero SHA
+/// (`ArcanistBundle.php:781-786,801-806`).
+fn blob_sha_pair(data: Option<Vec<u8>>) -> (Vec<u8>, String) {
+    match data {
+        None => (Vec::new(), "0".repeat(40)),
+        Some(bytes) => {
+            let sha = git_blob_sha1(&bytes);
+            (bytes, sha)
+        }
+    }
+}
+
+/// Old blob inputs for [`build_binary_change`].
+fn old_blob_inputs(
+    change: &BundleChange,
+    old_source: Option<&BundleChange>,
+) -> (Option<Vec<u8>>, Option<String>) {
+    match old_source {
+        Some(src) if src.original_file_data.is_some() => (src.original_file_data.clone(), None),
+        Some(src) => (None, src.old_binary_phid.clone()),
+        None => (
+            change.original_file_data.clone(),
+            change.old_binary_phid.clone(),
+        ),
+    }
+}
+
+/// Render one binary/image change (`ArcanistBundle::buildBinaryChange()`,
+/// `src/parser/ArcanistBundle.php:740-819`).
+///
+/// `old_source` is the away change for moves/copies (from
+/// [`collect_binary_sources`]); `loader` fetches blob bytes by phid
+/// (local `blobs/` tar members or `file.download`). Emits `index`,
+/// `GIT binary patch`, and both `literal` blocks with base85 bodies.
+pub fn build_binary_change(
+    change: &BundleChange,
+    old_source: Option<&BundleChange>,
+    loader: &dyn Fn(&str) -> Result<Vec<u8>, String>,
+) -> Result<String, String> {
+    let (old_direct, old_phid) = old_blob_inputs(change, old_source);
+    let old_data = resolve_blob_bytes(&old_direct, &old_phid, loader)?;
+    let (old_bytes, old_sha) = blob_sha_pair(old_data);
+    let new_data = resolve_blob_bytes(&change.current_file_data, &change.new_binary_phid, loader)?;
+    let (new_bytes, new_sha) = blob_sha_pair(new_data);
+    let mut content = String::new();
+    content.push_str(&format!("index {old_sha}..{new_sha}\n"));
+    content.push_str("GIT binary patch\n");
+    content.push_str(&format!("literal {}\n", new_bytes.len()));
+    content.push_str(&emit_binary_body(&new_bytes));
+    content.push('\n');
+    content.push_str(&format!("literal {}\n", old_bytes.len()));
+    content.push_str(&emit_binary_body(&old_bytes));
+    content.push('\n');
+    Ok(content)
+}
+
+/// True for binary/image file types (`ArcanistBundle::isGitBinaryChange()`,
+/// `src/parser/ArcanistBundle.php:487-491`).
+fn is_binary_change(change: &BundleChange) -> bool {
+    change.file_type == FILE_BINARY || change.file_type == FILE_IMAGE
+}
+
+/// Map away destinations to their away change for binary moves/copies
+/// (`ArcanistBundle.php:321-335`). Built before multicopy decomposition.
+pub fn collect_binary_sources(
+    changes: &[BundleChange],
+) -> std::collections::BTreeMap<String, BundleChange> {
+    let mut sources = std::collections::BTreeMap::new();
+    for change in changes {
+        if !is_binary_change(change) {
+            continue;
+        }
+        let away = matches!(
+            change.change_type,
+            x if x == TYPE_MOVE_AWAY || x == TYPE_COPY_AWAY || x == TYPE_MULTICOPY
+        );
+        if !away {
+            continue;
+        }
+        for path in &change.away_paths {
+            sources.insert(path.clone(), change.clone());
+        }
+    }
+    sources
+}
+
+/// Git index/target paths for one change (shared by text and binary).
+fn git_patch_paths(change: &BundleChange) -> (String, String, String, String) {
+    let (old_index, old_target) = match &change.old_path {
+        None => (
+            format!("a/{}", change.current_path.clone().unwrap_or_default()),
+            "/dev/null".to_string(),
+        ),
+        Some(old) => (format!("a/{old}"), format!("a/{old}")),
+    };
+    let (cur_index, cur_target) = match &change.current_path {
+        None => (
+            format!("b/{}", change.old_path.clone().unwrap_or_default()),
+            "/dev/null".to_string(),
+        ),
+        Some(cur) => (format!("b/{cur}"), format!("b/{cur}")),
+    };
+    (old_index, old_target, cur_index, cur_target)
+}
+
+/// Append mode/copy/rename/delete headers for one change
+/// (`ArcanistBundle.php:446-472`).
+fn push_change_headers(change: &BundleChange, result: &mut String) {
+    if change.change_type == TYPE_ADD {
+        result.push_str(&format!("new file mode {}\n", change.defaulted_new_mode()));
+    }
+    if matches!(
+        change.change_type,
+        x if x == TYPE_COPY_HERE || x == TYPE_MOVE_HERE || x == TYPE_COPY_AWAY || x == TYPE_CHANGE
+    ) && change.defaulted_old_mode() != change.defaulted_new_mode()
+    {
+        result.push_str(&format!("old mode {}\n", change.defaulted_old_mode()));
+        result.push_str(&format!("new mode {}\n", change.defaulted_new_mode()));
+    }
+    if change.change_type == TYPE_COPY_HERE {
+        result.push_str(&format!(
+            "copy from {}\ncopy to {}\n",
+            change.old_path.clone().unwrap_or_default(),
+            change.current_path.clone().unwrap_or_default()
+        ));
+    } else if change.change_type == TYPE_MOVE_HERE {
+        result.push_str(&format!(
+            "rename from {}\nrename to {}\n",
+            change.old_path.clone().unwrap_or_default(),
+            change.current_path.clone().unwrap_or_default()
+        ));
+    } else if (change.change_type == TYPE_DELETE || change.change_type == TYPE_MULTICOPY)
+        && let Some(old_mode) = &change.old_mode
+    {
+        result.push_str(&format!("deleted file mode {old_mode}\n"));
+    }
+}
+
+/// Render bundle changes as a git patch with binary blobs
+/// (`ArcanistBundle::toGitPatch()` full form, `:313-485`).
+///
+/// Like [`render_git_patch`] but binary/image changes render `GIT
+/// binary` patches via `loader` (local `blobs/` members or
+/// `file.download`) instead of failing. Text rendering is identical.
+pub fn render_git_patch_with_blobs(
+    changes: &mut Vec<BundleChange>,
+    loader: &dyn Fn(&str) -> Result<Vec<u8>, String>,
+) -> Result<String, String> {
+    let sources = collect_binary_sources(changes);
+    decompose_multicopies(changes)?;
+    let mut result = String::new();
+    for change in changes.iter() {
+        if change.file_type == FILE_DIRECTORY {
+            continue;
+        }
+        if change.change_type == TYPE_MOVE_AWAY {
+            continue;
+        }
+        let binary = is_binary_change(change);
+        let body = if binary {
+            let old_source = change
+                .current_path
+                .as_deref()
+                .and_then(|cur| sources.get(cur));
+            build_binary_change(change, old_source, loader)?
+        } else {
+            change.hunks.concat()
+        };
+        if change.change_type == TYPE_COPY_AWAY
+            && body.is_empty()
+            && change.defaulted_old_mode() == change.defaulted_new_mode()
+        {
+            continue;
+        }
+        let (old_index, old_target, cur_index, cur_target) = git_patch_paths(change);
+        result.push_str(&format!("diff --git {old_index} {cur_index}\n"));
+        push_change_headers(change, &mut result);
+        if body.is_empty() {
+            continue;
+        }
+        if !binary {
+            result.push_str(&format!("--- {}\n", quote_git_target(&old_target)));
+            result.push_str(&format!("+++ {}\n", quote_git_target(&cur_target)));
+            result.push_str(&body);
+            if !body.ends_with('\n') {
+                result.push('\n');
+            }
+        } else {
+            result.push_str(&body);
+        }
+    }
+    result.push('\n');
+    Ok(result)
 }
 
 /// Render bundle changes as a git patch (`ArcanistBundle::toGitPatch()`,
@@ -945,7 +1774,9 @@ pub fn load_arcbundle(path: &str, encoding: Option<&str>) -> Result<Bundle, Stri
         }
         changes.push(parse_bundle_change(dict, hunks));
     }
-    let text = render_git_patch(&mut changes)?;
+    let text = render_git_patch_with_blobs(&mut changes, &|phid: &str| {
+        tar_extract(path, &format!("blobs/{phid}"))
+    })?;
     let text = decode_bytes(text.as_bytes(), decode_as);
     Ok(Bundle {
         text,
@@ -3099,12 +3930,26 @@ pub fn ensure_base_present(
     bundle: &Bundle,
     io: &mut Io,
 ) -> Result<bool, String> {
+    ensure_base_present_with(dir, vcs, bundle, io, &Backends::default())
+}
+
+/// [`ensure_base_present`] with injectable hg/svn backends (test seam).
+///
+/// Mercurial presence checks run through `backends.hg`; git uses the
+/// system binary and svn is never local, like PHP.
+pub fn ensure_base_present_with(
+    dir: &Path,
+    vcs: Vcs,
+    bundle: &Bundle,
+    io: &mut Io,
+    backends: &Backends,
+) -> Result<bool, String> {
     let mut present = match vcs {
         Vcs::Git => git::has_local_commit(dir, bundle.base_revision.as_deref()),
         Vcs::Hg => bundle
             .base_revision
             .as_deref()
-            .is_some_and(|base| hg::ok(dir, &["log", "-r", base])),
+            .is_some_and(|base| hg::ok_with(dir, &backends.hg, &["log", "-r", base])),
         Vcs::Svn => false,
     };
     if !present && vcs == Vcs::Git {
@@ -3190,6 +4035,22 @@ pub fn plan_dependency_children(
     io: &mut Io,
     call: &diff_submit::ConduitCall<'_>,
 ) -> Result<Vec<Options>, String> {
+    plan_dependency_children_with(dir, vcs, bundle, options, io, call, &Backends::default())
+}
+
+/// [`plan_dependency_children`] with injectable hg/svn backends.
+///
+/// Mercurial local-commit probes run through `backends.hg`; git uses
+/// the system binary, like PHP.
+pub fn plan_dependency_children_with(
+    dir: &Path,
+    vcs: Vcs,
+    bundle: &Bundle,
+    options: &Options,
+    io: &mut Io,
+    call: &diff_submit::ConduitCall<'_>,
+    backends: &Backends,
+) -> Result<Vec<Options>, String> {
     let Some(start_id) = bundle.revision_id else {
         return Ok(Vec::new());
     };
@@ -3200,7 +4061,7 @@ pub fn plan_dependency_children(
     };
     let has_local = |hash: Option<&str>| match vcs {
         Vcs::Git => git::has_local_commit(dir, hash),
-        _ => hash.is_some_and(|hash| hg::ok(dir, &["log", "-r", hash])),
+        _ => hash.is_some_and(|hash| hg::ok_with(dir, &backends.hg, &["log", "-r", hash])),
     };
     let (nodes, start_phid) = load_dependency_nodes(call, start_id, &has_local, hash_key)?;
     if nodes.is_empty() {
@@ -3268,7 +4129,33 @@ pub fn apply_dependencies(
     call: &diff_submit::ConduitCall<'_>,
     child: &mut dyn FnMut(&Options) -> Result<(), String>,
 ) -> Result<(), String> {
-    for child_options in plan_dependency_children(dir, vcs, bundle, options, io, call)? {
+    apply_dependencies_with(
+        dir,
+        vcs,
+        bundle,
+        options,
+        io,
+        call,
+        &Backends::default(),
+        child,
+    )
+}
+
+/// [`apply_dependencies`] with injectable hg/svn backends (test seam).
+#[allow(clippy::too_many_arguments)]
+pub fn apply_dependencies_with(
+    dir: &Path,
+    vcs: Vcs,
+    bundle: &Bundle,
+    options: &Options,
+    io: &mut Io,
+    call: &diff_submit::ConduitCall<'_>,
+    backends: &Backends,
+    child: &mut dyn FnMut(&Options) -> Result<(), String>,
+) -> Result<(), String> {
+    for child_options in
+        plan_dependency_children_with(dir, vcs, bundle, options, io, call, backends)?
+    {
         child(&child_options)?;
     }
     Ok(())
@@ -3334,11 +4221,12 @@ fn run_patch_flow_inner(
         .map(|_| &call as &dyn Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>);
     let loaded = load_bundle(source, options, io, call_option)?;
     let bundle = loaded.bundle;
-    let has_base_local = ensure_base_present(dir, vcs, &bundle, io)?;
+    let has_base_local = ensure_base_present_with(dir, vcs, &bundle, io, backends)?;
     let branch = maybe_create_branch(dir, vcs, backends, &bundle, options, io, has_base_local)?;
     if !has_base_local && should_apply_dependencies(&bundle, options, vcs) {
         let call_ref = call_option.expect("conduit for dependencies");
-        let children = plan_dependency_children(dir, vcs, &bundle, options, io, call_ref)?;
+        let children =
+            plan_dependency_children_with(dir, vcs, &bundle, options, io, call_ref, backends)?;
         for child_options in &children {
             match run_patch_flow(dir, child_options, io, backends)? {
                 FlowOutcome::Done => {}

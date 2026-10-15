@@ -52,6 +52,8 @@ pub const METHOD_QUERY_DIFFS: &str = "differential.querydiffs";
 /// `differential.parsecommitmessage`
 /// (`ArcanistDifferentialCommitMessage.php:53`).
 pub const METHOD_PARSE_COMMIT_MESSAGE: &str = "differential.parsecommitmessage";
+/// `diffusion.querycommits` (`ArcanistWorkflow.php:1313`).
+pub const METHOD_QUERY_COMMITS: &str = "diffusion.querycommits";
 
 /// Diff property holding unresolved lint messages
 /// (`ArcanistDiffWorkflow.php:2300`).
@@ -421,6 +423,16 @@ pub fn commit_message_update_params(
     })
 }
 
+/// Build the `--update` message `differential.getcommitmessage` params:
+/// `revision_id`, `edit` = `edit` (`ArcanistDiffWorkflow.php:1600-1603`).
+#[must_use]
+pub fn get_commit_message_edit_params(revision_id: i64) -> serde_json::Value {
+    serde_json::json!({
+        "revision_id": revision_id,
+        "edit": "edit",
+    })
+}
+
 /// Build the create-template `differential.getcommitmessage` params:
 /// `revision_id` = null, `edit` = `create`, `fields`
 /// (`ArcanistDiffWorkflow.php:1416-1422`).
@@ -466,6 +478,13 @@ pub fn differential_query_params(ids: &[i64]) -> serde_json::Value {
 #[must_use]
 pub fn user_query_params(phids: &[&str]) -> serde_json::Value {
     serde_json::json!({"phids": phids})
+}
+
+/// Build the `diffusion.querycommits` params: `names`
+/// (`ArcanistWorkflow.php:1311-1314`).
+#[must_use]
+pub fn diffusion_query_commits_params(names: &[&str]) -> serde_json::Value {
+    serde_json::json!({"names": names})
 }
 
 /// Build the `differential.revision.search` params: `constraints` + `ids`
@@ -1055,13 +1074,20 @@ pub const CONTINUE_DESPITE_AWAY: &str = "Continue even though reviewers are unav
 /// Abort message when the user stops over away reviewers (`:1706-1707`).
 pub const SPECIFY_AVAILABLE_REVIEWERS: &str = "Specify available reviewers and retry.";
 
-/// Format a unix timestamp like `date('l, M j Y', $ts)` (`:1682,1696`).
+/// Format a unix timestamp like `date('l, M j Y', $ts)` (`:1682,1696`),
+/// shifted by `offset_seconds` east of UTC.
 ///
-/// Renders `Thursday, Jan 1 1970` for `0`.
+/// Renders `Thursday, Jan 1 1970` for `(0, 0)`.
 ///
-/// Divergence: PHP uses the server's default timezone; this renders UTC.
+/// Divergence: PHP renders in the server's default timezone, which this
+/// port cannot observe: Rust's standard library has no local-time API,
+/// reading `TZ`/system zone files is not portable, and new timezone
+/// crates are unavailable (`Cargo.toml`/`Cargo.lock` are shared and
+/// read-only). Production therefore passes `0` (UTC) via
+/// [`format_phab_date`]; a future timezone source plugs in here. The
+/// civil-date math itself is exact for every offset.
 #[must_use]
-pub fn format_phab_date(timestamp: i64) -> String {
+pub fn format_phab_date_with_offset(timestamp: i64, offset_seconds: i64) -> String {
     const WEEKDAYS: [&str; 7] = [
         "Thursday",
         "Friday",
@@ -1074,7 +1100,7 @@ pub fn format_phab_date(timestamp: i64) -> String {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
-    let days = timestamp.div_euclid(86_400);
+    let days = timestamp.saturating_add(offset_seconds).div_euclid(86_400);
     let weekday = WEEKDAYS[days.rem_euclid(7) as usize];
     // Howard Hinnant's civil_from_days.
     let z = days + 719_468;
@@ -1090,6 +1116,15 @@ pub fn format_phab_date(timestamp: i64) -> String {
         year += 1;
     }
     format!("{weekday}, {} {day} {year}", MONTHS[(month - 1) as usize])
+}
+
+/// Format a unix timestamp like `date('l, M j Y', $ts)` in UTC.
+///
+/// Production entry point (see [`format_phab_date_with_offset`] for the
+/// server-timezone divergence): renders `Thursday, Jan 1 1970` for `0`.
+#[must_use]
+pub fn format_phab_date(timestamp: i64) -> String {
+    format_phab_date_with_offset(timestamp, 0)
 }
 
 /// Numeric `currentStatusUntil`, defaulting to `0` when absent.
@@ -1108,18 +1143,22 @@ pub fn away_earliest_return(aways: &[AwayReviewer]) -> Option<i64> {
 }
 
 /// Full away-reviewers notice block, or `None` when nobody is away
-/// (`:1676-1702`).
+/// (`:1676-1702`), with dates shifted by `offset_seconds` east of UTC.
 ///
 /// The header is followed by a blank line, then one 6-space-indented item
 /// per reviewer (`PhutilConsoleList`, `src/console/view/PhutilConsoleList.php:39-61`).
 #[must_use]
-pub fn away_reviewers_block(aways: &[AwayReviewer], total_reviewers: usize) -> Option<String> {
+pub fn away_reviewers_block_with_offset(
+    aways: &[AwayReviewer],
+    total_reviewers: usize,
+    offset_seconds: i64,
+) -> Option<String> {
     if aways.is_empty() {
         return None;
     }
     let header = if aways.len() == total_reviewers {
         let earliest = away_earliest_return(aways).unwrap_or(0);
-        away_reviewers_all_message(&format_phab_date(earliest))
+        away_reviewers_all_message(&format_phab_date_with_offset(earliest, offset_seconds))
     } else {
         AWAY_SOME_MESSAGE.to_string()
     };
@@ -1127,11 +1166,18 @@ pub fn away_reviewers_block(aways: &[AwayReviewer], total_reviewers: usize) -> O
     for away in aways {
         let item = away_reviewer_list_item(
             &away.name,
-            &format_phab_date(away_until_timestamp(&away.until)),
+            &format_phab_date_with_offset(away_until_timestamp(&away.until), offset_seconds),
         );
         block.push_str(&format!("      {item}\n"));
     }
     Some(block)
+}
+
+/// Full away-reviewers notice block in UTC (see
+/// [`format_phab_date_with_offset`] for the server-timezone divergence).
+#[must_use]
+pub fn away_reviewers_block(aways: &[AwayReviewer], total_reviewers: usize) -> Option<String> {
+    away_reviewers_block_with_offset(aways, total_reviewers, 0)
 }
 
 /* -(  Autotargets and Staging Property (G1 full-state)  )---------------------- */
@@ -1257,14 +1303,50 @@ pub fn update_autotargets(
     true
 }
 
+/// Escape `/` as `\/` in encoded JSON, like PHP `json_encode()`.
+///
+/// `serde_json` never escapes forward slashes; PHP escapes them by
+/// default. Every diff JSON emit site (submit `--json`, diff property
+/// payloads, scratch files) must pass through this so bytes match PHP.
+#[must_use]
+pub fn php_escape_json_slashes(text: &str) -> String {
+    text.replace('/', "\\/")
+}
+
+/// Encode a value exactly like PHP `json_encode()` (compact form).
+///
+/// This is `serde_json::to_string` plus [`php_escape_json_slashes`].
+/// Remaining `serde_json`-vs-`json_encode` divergences, audited 2026-10:
+/// non-ASCII bytes stay raw UTF-8 here but PHP emits `\uXXXX` (with
+/// surrogate pairs); object key order is serde's sorted order here
+/// while PHP preserves insertion order (callers with ordered objects,
+/// like [`staging_property_data`], hand-render keys); float formatting
+/// edge cases may differ. Empty PHP arrays encode as `[]`: callers must
+/// build `Value::Array` (not `Value::Object`) where PHP has a list.
+pub fn php_json_encode(value: &serde_json::Value) -> Result<String, serde_json::Error> {
+    serde_json::to_string(value).map(|text| php_escape_json_slashes(&text))
+}
+
+/// Encode a value like PHP `json_encode()` with pretty printing.
+///
+/// Same slash escaping as [`php_json_encode`]; used for human-facing
+/// `--json` inspection output (an arc-rs extension: PHP has no
+/// inspect `--json`, but its bytes stay slash-consistent regardless).
+pub fn php_json_encode_pretty(value: &serde_json::Value) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(value).map(|text| php_escape_json_slashes(&text))
+}
+
 /// `arc.staging` diff property payload (`:2598-2620`).
 ///
 /// Keys render `status` first like `phutil_json_encode()`; `refs` is the
 /// pushed-ref list (empty on skip).
 #[must_use]
 pub fn staging_property_data(status: &str, refs: &[serde_json::Value]) -> String {
-    let status = serde_json::to_string(status).unwrap_or_else(|_| "\"\"".to_string());
-    let refs = serde_json::to_string(refs).unwrap_or_else(|_| "[]".to_string());
+    let status = php_escape_json_slashes(
+        &serde_json::to_string(status).unwrap_or_else(|_| "\"\"".to_string()),
+    );
+    let refs =
+        php_escape_json_slashes(&serde_json::to_string(refs).unwrap_or_else(|_| "[]".to_string()));
     format!("{{\"status\":{status},\"refs\":{refs}}}")
 }
 

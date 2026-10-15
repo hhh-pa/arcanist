@@ -995,6 +995,343 @@ fn skip_predicates_cover_nolint_nounit_raw_head() {
 }
 
 #[test]
+fn gap2_run_lint_maps_codes_and_outcomes() {
+    use std::cell::RefCell;
+    let dir = std::env::temp_dir();
+    let run = |outcome: ChildOutcome| move |_: &Path, _: &[String]| outcome.clone();
+    // Skip short-circuits silently.
+    let calls = RefCell::new(0);
+    let counting = |_: &Path, _: &[String]| {
+        *calls.borrow_mut() += 1;
+        ChildOutcome::Code(0)
+    };
+    let mut out = Vec::new();
+    assert_eq!(
+        run_lint(&dir, Some("abc"), &[], true, &counting, &mut out).unwrap(),
+        Some(LINT_RESULT_SKIP)
+    );
+    assert_eq!(*calls.borrow(), 0);
+    assert!(out.is_empty());
+    // Result codes map to banners.
+    for (code, banner) in [
+        (0, "** LINT OKAY ** No lint problems.\n"),
+        (1, "** LINT MESSAGES ** Lint issued unresolved warnings.\n"),
+        (2, "** LINT ERRORS ** Lint raised errors!\n"),
+    ] {
+        let mut out = Vec::new();
+        assert_eq!(
+            run_lint(
+                &dir,
+                None,
+                &[],
+                false,
+                &run(ChildOutcome::Code(code)),
+                &mut out
+            )
+            .unwrap(),
+            Some(code)
+        );
+        assert_eq!(out, format!("Linting...\n{banner}").into_bytes());
+    }
+    // A SKIP code from the child prints no banner.
+    let mut out = Vec::new();
+    assert_eq!(
+        run_lint(
+            &dir,
+            None,
+            &[],
+            false,
+            &run(ChildOutcome::Code(3)),
+            &mut out
+        )
+        .unwrap(),
+        Some(3)
+    );
+    assert_eq!(out, b"Linting...\n");
+    // No engine / no effect print notices and yield None.
+    let mut out = Vec::new();
+    assert_eq!(
+        run_lint(
+            &dir,
+            None,
+            &[],
+            false,
+            &run(ChildOutcome::NoEngine),
+            &mut out
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(
+        out,
+        b"Linting...\nNo lint engine configured for this project.\n"
+    );
+    let mut out = Vec::new();
+    assert_eq!(
+        run_lint(
+            &dir,
+            None,
+            &[],
+            false,
+            &run(ChildOutcome::NoEffect("nothing to lint".to_string())),
+            &mut out,
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(out, b"Linting...\nnothing to lint\n");
+    // Child failures abort after the start notice.
+    let mut out = Vec::new();
+    assert_eq!(
+        run_lint(
+            &dir,
+            None,
+            &[],
+            false,
+            &run(ChildOutcome::Failed("boom".to_string())),
+            &mut out,
+        )
+        .unwrap_err(),
+        "boom"
+    );
+    assert_eq!(out, b"Linting...\n");
+    // Argv carries passthrough flags plus --rev.
+    let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    let capture = |_: &Path, argv: &[String]| {
+        *seen.borrow_mut() = argv.to_vec();
+        ChildOutcome::Code(0)
+    };
+    let flags = ["amend-all".to_string(), "apply-patches".to_string()];
+    let mut out = Vec::new();
+    run_lint(&dir, Some("abc123"), &flags, false, &capture, &mut out).unwrap();
+    assert_eq!(
+        *seen.borrow(),
+        ["--apply-patches", "--amend-all", "--rev", "abc123"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    );
+    let mut out = Vec::new();
+    run_lint(&dir, None, &[], false, &capture, &mut out).unwrap();
+    assert!(seen.borrow().is_empty());
+}
+
+#[test]
+fn gap2_run_unit_confirms_unsound_and_maps_codes() {
+    use std::cell::RefCell;
+    use std::io::Cursor;
+    let dir = std::env::temp_dir();
+    let run = |outcome: ChildOutcome| move |_: &Path, _: &[String]| outcome.clone();
+    let mut out = Vec::new();
+    let mut input = Cursor::new(b"".to_vec());
+    assert_eq!(
+        run_unit(
+            &dir,
+            None,
+            &[],
+            true,
+            &run(ChildOutcome::Code(0)),
+            &mut input,
+            &mut out
+        )
+        .unwrap(),
+        Some(UNIT_RESULT_SKIP)
+    );
+    assert!(out.is_empty());
+    for (code, banner) in [
+        (0, "** UNIT OKAY ** No unit test failures.\n"),
+        (2, "** UNIT ERRORS ** Unit testing raised errors!\n"),
+    ] {
+        let mut out = Vec::new();
+        let mut input = Cursor::new(b"".to_vec());
+        assert_eq!(
+            run_unit(
+                &dir,
+                None,
+                &[],
+                false,
+                &run(ChildOutcome::Code(code)),
+                &mut input,
+                &mut out,
+            )
+            .unwrap(),
+            Some(code)
+        );
+        assert_eq!(out, format!("Running unit tests...\n{banner}").into_bytes());
+    }
+    // Unsound prompts (default yes); declining aborts.
+    for answer in ["y\n", "\n"] {
+        let mut out = Vec::new();
+        let mut input = Cursor::new(answer.as_bytes().to_vec());
+        assert_eq!(
+            run_unit(
+                &dir,
+                None,
+                &[],
+                false,
+                &run(ChildOutcome::Code(UNIT_RESULT_UNSOUND)),
+                &mut input,
+                &mut out,
+            )
+            .unwrap(),
+            Some(UNIT_RESULT_UNSOUND)
+        );
+        let text = String::from_utf8(out).unwrap();
+        // The prompt renderer wraps long prompts; both halves show.
+        assert!(
+            text.contains("Unit test results included failures"),
+            "{text}"
+        );
+        assert!(text.contains("Ignore unsound test failures?"), "{text}");
+        assert!(text.contains("** UNIT UNSOUND **"), "{text}");
+    }
+    let mut out = Vec::new();
+    let mut input = Cursor::new(b"n\n".to_vec());
+    assert_eq!(
+        run_unit(
+            &dir,
+            None,
+            &[],
+            false,
+            &run(ChildOutcome::Code(UNIT_RESULT_UNSOUND)),
+            &mut input,
+            &mut out,
+        )
+        .unwrap_err(),
+        USER_ABORT
+    );
+    assert!(
+        !String::from_utf8(out)
+            .unwrap()
+            .contains("** UNIT UNSOUND **")
+    );
+    // No engine yields None.
+    let mut out = Vec::new();
+    let mut input = Cursor::new(b"".to_vec());
+    assert_eq!(
+        run_unit(
+            &dir,
+            None,
+            &[],
+            false,
+            &run(ChildOutcome::NoEngine),
+            &mut input,
+            &mut out
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(
+        out,
+        b"Running unit tests...\nNo unit test engine is configured for this project.\n"
+    );
+    // Unit argv carries coverage flags plus --rev.
+    let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    let capture = |_: &Path, argv: &[String]| {
+        *seen.borrow_mut() = argv.to_vec();
+        ChildOutcome::Code(0)
+    };
+    let mut out = Vec::new();
+    let mut input = Cursor::new(b"".to_vec());
+    run_unit(
+        &dir,
+        Some("def456"),
+        &["coverage".to_string()],
+        false,
+        &capture,
+        &mut input,
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(
+        *seen.borrow(),
+        ["--coverage", "--rev", "def456"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn gap2_run_lint_unit_combines_reports() {
+    use std::cell::RefCell;
+    use std::io::Cursor;
+    let dir = std::env::temp_dir();
+    let lint = |_: &Path, _: &[String]| ChildOutcome::Code(0);
+    let unit_calls = RefCell::new(0);
+    let unit = |_: &Path, _: &[String]| {
+        *unit_calls.borrow_mut() += 1;
+        ChildOutcome::Code(2)
+    };
+    let mut out = Vec::new();
+    let mut input = Cursor::new(b"".to_vec());
+    let report = run_lint_unit(
+        &dir,
+        None,
+        &[],
+        &[],
+        false,
+        false,
+        &lint,
+        &unit,
+        &mut input,
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(report.lint_result, Some(0));
+    assert_eq!(report.unit_result, Some(2));
+    assert!(report.unresolved_lint.is_empty());
+    assert!(report.test_results.is_empty());
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.starts_with("Linting...\n** LINT OKAY **"), "{text}");
+    assert!(
+        text.contains("Running unit tests...\n** UNIT ERRORS **"),
+        "{text}"
+    );
+    assert_eq!(*unit_calls.borrow(), 1);
+    // A lint failure aborts before unit runs.
+    let failing = |_: &Path, _: &[String]| ChildOutcome::Failed("lint blew up".to_string());
+    let mut out = Vec::new();
+    let mut input = Cursor::new(b"".to_vec());
+    assert_eq!(
+        run_lint_unit(
+            &dir,
+            None,
+            &[],
+            &[],
+            false,
+            false,
+            &failing,
+            &unit,
+            &mut input,
+            &mut out
+        )
+        .unwrap_err(),
+        "lint blew up"
+    );
+    assert_eq!(*unit_calls.borrow(), 1);
+}
+
+#[test]
+fn gap2_in_process_probes_detect_missing_engines() {
+    // Marker-only repo (no shell): discovery succeeds, selection finds
+    // no engine.
+    let dir = std::env::temp_dir().join(format!("arc-rs-diff-d2-lint-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    assert_eq!(
+        run_lint_in_process(&dir, &[]),
+        ChildOutcome::NoEngine,
+        "lint without .arclint"
+    );
+    assert_eq!(
+        run_unit_in_process(&dir, &[]),
+        ChildOutcome::NoEngine,
+        "unit without configs"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn passthru_argv_uses_spec_order() {
     let flags = ["amend-all".to_string(), "apply-patches".to_string()];
     assert_eq!(
@@ -1148,7 +1485,7 @@ fn workflow_predicates_follow_php_branches() {
 #[test]
 fn unified_diff_parses_git_change() {
     let text = "diff --git a/f.txt b/f.txt\nindex 111..222 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1,3 @@\n a\n+b\n c\n";
-    let changes = parse_unified_diff(text);
+    let changes = parse_unified_diff(text).unwrap();
     assert_eq!(changes.len(), 1);
     let change = &changes[0];
     assert_eq!(change.old_path, "f.txt");
@@ -1175,33 +1512,33 @@ fn unified_diff_parses_git_change() {
 #[test]
 fn unified_diff_handles_add_delete_rename_binary() {
     let add = "diff --git a/new.txt b/new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hi\n";
-    let changes = parse_unified_diff(add);
+    let changes = parse_unified_diff(add).unwrap();
     assert_eq!(changes[0].change_type, TYPE_ADD);
     assert_eq!(changes[0].current_path, "new.txt");
 
     let delete = "diff --git a/old.txt b/old.txt\ndeleted file mode 100644\n--- a/old.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-bye\n";
-    let changes = parse_unified_diff(delete);
+    let changes = parse_unified_diff(delete).unwrap();
     assert_eq!(changes[0].change_type, TYPE_DELETE);
     assert_eq!(changes[0].current_path, "old.txt");
 
     let rename = "diff --git a/a.txt b/b.txt\nsimilarity index 90%\nrename from a.txt\nrename to b.txt\n--- a/a.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-x\n+y\n";
-    let changes = parse_unified_diff(rename);
+    let changes = parse_unified_diff(rename).unwrap();
     assert_eq!(changes[0].change_type, TYPE_MOVE_HERE);
     assert_eq!(changes[0].old_path, "a.txt");
     assert_eq!(changes[0].current_path, "b.txt");
 
     let copy = "diff --git a/a.txt b/c.txt\ncopy from a.txt\ncopy to c.txt\n--- a/a.txt\n+++ b/c.txt\n@@ -1 +1 @@\n x\n";
-    let changes = parse_unified_diff(copy);
+    let changes = parse_unified_diff(copy).unwrap();
     assert_eq!(changes[0].change_type, TYPE_COPY_HERE);
 
     let binary = "diff --git a/img.png b/img.png\nBinary files a/img.png and b/img.png differ\n";
-    let changes = parse_unified_diff(binary);
+    let changes = parse_unified_diff(binary).unwrap();
     assert_eq!(changes[0].file_type, FILE_BINARY);
     assert!(changes[0].hunks.is_empty());
 
     let git_binary =
         "diff --git a/bin.dat b/bin.dat\nGIT binary patch\nliteral 3\nabc\n\nliteral 3\ndef\n\n";
-    let changes = parse_unified_diff(git_binary);
+    let changes = parse_unified_diff(git_binary).unwrap();
     assert_eq!(changes[0].file_type, FILE_BINARY);
     assert!(changes[0].hunks.is_empty());
 }
@@ -1209,14 +1546,14 @@ fn unified_diff_handles_add_delete_rename_binary() {
 #[test]
 fn unified_diff_handles_hg_and_svn_headers() {
     let hg = "diff -r abc123 f.txt\n--- f.txt\tThu Jan 01 00:00:00 2026\n+++ f.txt\tThu Jan 01 00:00:00 2026\n@@ -1 +1 @@\n-a\n+b\n";
-    let changes = parse_unified_diff(hg);
+    let changes = parse_unified_diff(hg).unwrap();
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].current_path, "f.txt");
     assert_eq!(changes[0].hunks.len(), 1);
 
     let svn =
         "Index: f.txt\n--- f.txt\t(revision 5)\n+++ f.txt\t(working copy)\n@@ -1 +1 @@\n-a\n+b\n";
-    let changes = parse_unified_diff(svn);
+    let changes = parse_unified_diff(svn).unwrap();
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].current_path, "f.txt");
     assert_eq!(changes[0].old_path, "f.txt");
@@ -1225,7 +1562,7 @@ fn unified_diff_handles_hg_and_svn_headers() {
 #[test]
 fn unified_diff_message_changes_filter() {
     let text = "commit abc123def\nAuthor: A U Thor\n\n    add feature\n\ndiff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-a\n+b\n";
-    let changes = parse_unified_diff(text);
+    let changes = parse_unified_diff(text).unwrap();
     assert_eq!(changes.len(), 2);
     assert!(changes[0].is_message());
     assert_eq!(changes[0].commit_hash.as_deref(), Some("abc123def"));
@@ -1240,7 +1577,68 @@ fn unified_diff_message_changes_filter() {
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].current_path, "f.txt");
     assert!(without_message_changes(&[]).is_empty());
-    assert!(parse_unified_diff("").is_empty());
+    assert!(parse_unified_diff("").unwrap().is_empty());
+}
+
+#[test]
+fn gap2_combined_hunk_header_fails_like_php() {
+    let text = "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@@ -1,2 -1,2 +1,3 @@@\n  a\n- b\n+B\n";
+    let err = parse_unified_diff(text).unwrap_err();
+    // PHP `didFailParse()`: message, blank line, then the ±5-line context
+    // with `%8.8s %6.6s   %s` rows (`:1198-1226`).
+    let expected = "Diff Parse Exception: Expected hunk header '@@ -NN,NN +NN,NN @@'.\n\n\
+        \u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}1   diff --git a/f.txt b/f.txt\n\
+        \u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}2   --- a/f.txt\n\
+        \u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}3   +++ b/f.txt\n\
+        \u{20}\u{20}\u{20}>>>        4   @@@ -1,2 -1,2 +1,3 @@@\n\
+        \u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}5     a\n\
+        \u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}6   - b\n\
+        \u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}7   +B\n";
+    assert_eq!(err, expected);
+}
+
+#[test]
+fn gap2_combined_hunk_after_first_hunk_fails_like_php() {
+    let text = "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n a\n@@@ -1 -1 +1 @@@\n b\n";
+    let err = parse_unified_diff(text).unwrap_err();
+    assert!(
+        err.starts_with("Diff Parse Exception: Expected hunk header '@@ -NN,NN +NN,NN @@'.\n\n"),
+        "{err:?}"
+    );
+    assert!(err.contains(">>>"), "{err:?}");
+    assert!(err.contains("@@@ -1 -1 +1 @@@"), "{err:?}");
+}
+
+#[test]
+fn gap2_diff_cc_header_fails_like_php() {
+    let text = "diff --cc f.txt\nindex 111,222..333\n--- a/f.txt\n+++ b/f.txt\n@@@ -1,2 -1,2 +1,3 @@@\n  a\n";
+    let err = parse_unified_diff(text).unwrap_err();
+    let expected = "Diff Parse Exception: Expected a hunk header, like 'Index: /path/to/file.ext' (svn), 'Property changes on: /path/to/file.ext' (svn properties), 'commit 59bcc3ad6775562f845953cf01624225' (git show), 'diff --git' (git diff), '--- filename' (unified diff), or 'diff -r' (hg diff or patch).\n\n\
+        \u{20}\u{20}\u{20}>>>        1   diff --cc f.txt\n\
+        \u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}2   index 111,222..333\n\
+        \u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}3   --- a/f.txt\n\
+        \u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}4   +++ b/f.txt\n\
+        \u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}5   @@@ -1,2 -1,2 +1,3 @@@\n\
+        \u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}\u{20}6     a\n";
+    assert_eq!(err, expected);
+}
+
+#[test]
+fn gap2_diff_cc_mid_diff_fails_without_recovery() {
+    let text = "diff --git a/g.txt b/g.txt\n--- a/g.txt\n+++ b/g.txt\n@@ -1 +1 @@\n-a\n+b\n\ndiff --cc f.txt\n";
+    let err = parse_unified_diff(text).unwrap_err();
+    assert!(err.contains(EXPECTED_DIFF_START), "{err:?}");
+    // Failing line is the 1-based `diff --cc` line (8).
+    assert!(err.contains(">        8   diff --cc f.txt"), "{err:?}");
+}
+
+#[test]
+fn gap2_leading_diff_cc_recovers_to_later_git_block() {
+    let text = "diff --cc f.txt\n# stray comment\n\ndiff --git a/g.txt b/g.txt\n--- a/g.txt\n+++ b/g.txt\n@@ -1 +1 @@\n-a\n+b\n";
+    let changes = parse_unified_diff(text).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].current_path, "g.txt");
+    assert_eq!(changes[0].hunks.len(), 1);
 }
 
 struct FailingReader;
@@ -1826,4 +2224,1754 @@ fn staging_and_upload_helpers() {
     assert!(AMEND_UNSUPPORTED.contains("only supported in git and hg"));
     assert!(should_open_in_browser(true));
     assert!(!should_open_in_browser(false));
+}
+
+/* Gap2 D5/D11: svn affected paths + per-path diff fan-out. */
+
+fn gap2_svn_scratch(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("arc-rs-diff-d5-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn gap2_status_map(entries: &[(&str, u32)]) -> svn::StatusMap {
+    entries
+        .iter()
+        .map(|(path, mask)| ((*path).to_string(), *mask))
+        .collect()
+}
+
+#[test]
+fn gap2_split_svn_externals_keeps_and_warns() {
+    let status = gap2_status_map(&[
+        ("plain.txt", svn::FLAG_MODIFIED),
+        ("added.txt", svn::FLAG_ADDED),
+        ("ext-mod.txt", svn::FLAG_EXTERNALS | svn::FLAG_MODIFIED),
+        ("ext-add.txt", svn::FLAG_EXTERNALS | svn::FLAG_ADDED),
+        ("ext-del.txt", svn::FLAG_EXTERNALS | svn::FLAG_DELETED),
+        ("ext-clean.txt", svn::FLAG_EXTERNALS),
+        (
+            "ext-untracked.txt",
+            svn::FLAG_EXTERNALS | svn::FLAG_UNTRACKED,
+        ),
+    ]);
+    let (kept, warn) = split_svn_externals(&status);
+    assert_eq!(
+        kept.keys().cloned().collect::<Vec<_>>(),
+        vec!["added.txt".to_string(), "plain.txt".to_string()]
+    );
+    assert_eq!(
+        warn,
+        vec![
+            "ext-add.txt".to_string(),
+            "ext-del.txt".to_string(),
+            "ext-mod.txt".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn gap2_svn_file_list_contains() {
+    let root = gap2_svn_scratch("filelist");
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("sub").join("a.txt"), "a").unwrap();
+    std::fs::write(root.join("sub2.txt"), "b").unwrap();
+    std::fs::write(root.join("top.txt"), "c").unwrap();
+
+    let empty = SvnFileList::new(&root, &[]);
+    assert!(empty.contains(&root, "sub/a.txt"));
+    assert!(empty.contains(&root, "anything/at/all.txt"));
+
+    let file = SvnFileList::new(&root, &["top.txt".to_string()]);
+    assert!(file.contains(&root, "top.txt"));
+    assert!(!file.contains(&root, "sub/a.txt"));
+
+    let dir = SvnFileList::new(&root, &["sub".to_string()]);
+    assert!(dir.contains(&root, "sub/a.txt"));
+    assert!(!dir.contains(&root, "top.txt"));
+    // A sibling prefix is not a parent: `sub/` never matches `sub2.txt`.
+    assert!(!dir.contains(&root, "sub2.txt"));
+
+    // Dot segments collapse lexically.
+    let dotted = SvnFileList::new(&root, &["./sub/../sub".to_string()]);
+    assert!(dotted.contains(&root, "sub/a.txt"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn gap2_check_svn_base_revision_strings_exact() {
+    assert_eq!(check_svn_base_revision_strings(&[]).unwrap(), None);
+    assert_eq!(check_svn_base_revision_strings(&[("n", "")]).unwrap(), None);
+    assert_eq!(
+        check_svn_base_revision_strings(&[("n", "0")]).unwrap(),
+        None
+    );
+    assert_eq!(
+        check_svn_base_revision_strings(&[("a", "9"), ("b", "9")]).unwrap(),
+        Some("9".to_string())
+    );
+    // Strict string compare: zero-padded revisions mismatch.
+    let err = check_svn_base_revision_strings(&[("a", "09"), ("b", "9")]).unwrap_err();
+    assert_eq!(
+        err,
+        "Base revisions of changed paths are mismatched. Update all paths to the same base \
+         revision before creating a diff: \n\n    Revision 09, a\n    Revision 9, b"
+    );
+    // Non-numeric revisions stay (PHP 8 lexicographic `<=`) and mismatch.
+    let err = check_svn_base_revision_strings(&[("a", "xx"), ("b", "9")]).unwrap_err();
+    assert!(err.contains("    Revision xx, a"), "{err}");
+    assert!(err.contains("    Revision 9, b"), "{err}");
+}
+
+#[test]
+fn gap2_confirm_svn_externals_bytes() {
+    use std::io::Cursor;
+
+    // No externals, or an already-warned workflow: silent success.
+    let mut warned = false;
+    let mut out = Vec::new();
+    confirm_svn_externals(&mut Cursor::new(b"".to_vec()), &mut out, &mut warned, &[]).unwrap();
+    assert!(out.is_empty());
+    assert!(!warned);
+    let mut warned = true;
+    let mut out = Vec::new();
+    confirm_svn_externals(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &mut warned,
+        &["ext.txt".to_string()],
+    )
+    .unwrap();
+    assert!(out.is_empty());
+
+    // Acceptance writes the warning plus prompt and flips the flag. The
+    // wrapped file list is dropped like PHP's `sprintf` (never printed).
+    let mut warned = false;
+    let mut out = Vec::new();
+    confirm_svn_externals(
+        &mut Cursor::new(b"y\n".to_vec()),
+        &mut out,
+        &mut warned,
+        &["ext.txt".to_string()],
+    )
+    .unwrap();
+    assert!(warned);
+    let expected = format!(
+        "{}\n\n{}\n",
+        svn_externals_warning(),
+        diff::format_confirm_prompt(PROMPT_SVN_EXTERNALS_ANYWAY, true)
+    );
+    assert_eq!(String::from_utf8(out).unwrap(), expected);
+
+    // Refusal aborts; EOF answers the default (no) and aborts too.
+    for answer in ["n\n", ""] {
+        let mut warned = false;
+        let mut out = Vec::new();
+        let err = confirm_svn_externals(
+            &mut Cursor::new(answer.as_bytes().to_vec()),
+            &mut out,
+            &mut warned,
+            &["ext.txt".to_string()],
+        )
+        .unwrap_err();
+        assert_eq!(err, USER_ABORT);
+        assert!(!warned);
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .starts_with(&svn_externals_warning())
+        );
+    }
+}
+
+#[test]
+fn gap2_svn_skeleton_change_types() {
+    let root = gap2_svn_scratch("skeleton");
+    std::fs::create_dir_all(root.join("adir")).unwrap();
+    std::fs::write(root.join("a.txt"), "a").unwrap();
+
+    let added = svn_skeleton_change(&root, "a.txt", svn::FLAG_ADDED);
+    assert_eq!(added.change_type, TYPE_ADD);
+    assert_eq!(added.file_type, FILE_TEXT);
+    assert_eq!(added.current_path, "a.txt");
+    assert!(added.old_path.is_empty());
+    assert!(added.hunks.is_empty() && added.away_paths.is_empty());
+
+    let deleted = svn_skeleton_change(&root, "a.txt", svn::FLAG_DELETED);
+    assert_eq!(deleted.change_type, TYPE_DELETE);
+    let modified = svn_skeleton_change(&root, "a.txt", svn::FLAG_MODIFIED);
+    assert_eq!(modified.change_type, TYPE_CHANGE);
+
+    let dir = svn_skeleton_change(&root, "adir", svn::FLAG_MODIFIED);
+    assert_eq!(dir.change_type, TYPE_CHANGE);
+    assert_eq!(dir.file_type, FILE_DIRECTORY);
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(root.join("a.txt"), root.join("link.txt")).unwrap();
+        let link = svn_skeleton_change(&root, "link.txt", svn::FLAG_MODIFIED);
+        assert_eq!(link.file_type, FILE_SYMLINK);
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn gap2_svn_copy_old_path_shapes() {
+    let root = "https://s.example/r/trunk";
+    // Same revision: plain relative path.
+    assert_eq!(
+        svn_copy_old_path("https://s.example/r/trunk/old.txt", "9", "9", root),
+        Some("old.txt".to_string())
+    );
+    // Differing revision: `@rev` suffix (loose compare).
+    assert_eq!(
+        svn_copy_old_path("https://s.example/r/trunk/old.txt", "7", "9", root),
+        Some("old.txt@7".to_string())
+    );
+    // Loose numeric compare: zero-padded revisions match.
+    assert_eq!(
+        svn_copy_old_path("https://s.example/r/trunk/old.txt", "09", "9", root),
+        Some("old.txt".to_string())
+    );
+    // Missing copy revision: no suffix.
+    assert_eq!(
+        svn_copy_old_path("https://s.example/r/trunk/old.txt", "", "9", root),
+        Some("old.txt".to_string())
+    );
+    // Outside the root, or empty: no old path.
+    assert_eq!(
+        svn_copy_old_path("https://s.example/r/branches/x/old.txt", "7", "9", root),
+        None
+    );
+    assert_eq!(svn_copy_old_path("", "7", "9", root), None);
+}
+
+fn gap2_path_data(
+    path: &str,
+    flags: u32,
+    info: &[(&str, &str)],
+    diff: Option<&str>,
+) -> SvnPathData {
+    use std::collections::BTreeMap;
+    SvnPathData {
+        path: path.to_string(),
+        flags,
+        info: info
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect::<BTreeMap<_, _>>(),
+        diff: diff.map(|text| text.as_bytes().to_vec()),
+    }
+}
+
+#[test]
+fn gap2_apply_svn_copy_info_flows() {
+    // Move: the deleted origin becomes MOVE_AWAY, the new path MOVE_HERE.
+    let mut changes = vec![
+        svn_skeleton_change(Path::new("."), "old.txt", svn::FLAG_DELETED),
+        svn_skeleton_change(Path::new("."), "new.txt", svn::FLAG_ADDED),
+    ];
+    let moved = vec![gap2_path_data(
+        "new.txt",
+        svn::FLAG_ADDED,
+        &[
+            ("Copied From URL", "https://s.example/r/trunk/old.txt"),
+            ("Copied From Rev", "9"),
+            ("Revision", "9"),
+        ],
+        None,
+    )];
+    apply_svn_copy_info(&mut changes, &moved, Some("https://s.example/r/trunk")).unwrap();
+    assert_eq!(changes[0].change_type, TYPE_MOVE_AWAY);
+    assert_eq!(changes[0].away_paths, vec!["new.txt".to_string()]);
+    assert_eq!(changes[1].change_type, TYPE_MOVE_HERE);
+    assert_eq!(changes[1].old_path, "old.txt");
+
+    // A `@rev` origin never matches a working-copy skeleton: the origin is
+    // fresh, so the change copies here instead of moving.
+    let mut changes = vec![
+        svn_skeleton_change(Path::new("."), "old.txt", svn::FLAG_DELETED),
+        svn_skeleton_change(Path::new("."), "new.txt", svn::FLAG_ADDED),
+    ];
+    let at_rev = vec![gap2_path_data(
+        "new.txt",
+        svn::FLAG_ADDED,
+        &[
+            ("Copied From URL", "https://s.example/r/trunk/old.txt"),
+            ("Copied From Rev", "7"),
+            ("Revision", "9"),
+        ],
+        None,
+    )];
+    apply_svn_copy_info(&mut changes, &at_rev, Some("https://s.example/r/trunk")).unwrap();
+    assert_eq!(changes.len(), 3);
+    assert_eq!(changes[1].change_type, TYPE_COPY_HERE);
+    assert_eq!(changes[1].old_path, "old.txt@7");
+    assert_eq!(changes[2].current_path, "old.txt@7");
+    assert_eq!(changes[2].change_type, TYPE_COPY_AWAY);
+
+    // Copy of an unmodified path: fresh origin (CHANGE) becomes COPY_AWAY.
+    let mut changes = vec![svn_skeleton_change(
+        Path::new("."),
+        "copy.txt",
+        svn::FLAG_ADDED,
+    )];
+    let data = vec![gap2_path_data(
+        "copy.txt",
+        svn::FLAG_ADDED,
+        &[
+            ("Copied From URL", "https://s.example/r/trunk/orig.txt"),
+            ("Copied From Rev", "9"),
+            ("Revision", "9"),
+        ],
+        None,
+    )];
+    apply_svn_copy_info(&mut changes, &data, Some("https://s.example/r/trunk")).unwrap();
+    assert_eq!(changes.len(), 2);
+    assert_eq!(changes[0].change_type, TYPE_COPY_HERE);
+    assert_eq!(changes[0].old_path, "orig.txt");
+    assert_eq!(changes[1].current_path, "orig.txt");
+    assert_eq!(changes[1].change_type, TYPE_COPY_AWAY);
+    assert_eq!(changes[1].away_paths, vec!["copy.txt".to_string()]);
+
+    // A copy-here change whose origin is absent stays untouched.
+    let mut changes = vec![ParsedChange {
+        old_path: "orig.txt".to_string(),
+        current_path: "copy.txt".to_string(),
+        change_type: TYPE_COPY_HERE,
+        file_type: FILE_TEXT,
+        hunks: Vec::new(),
+        away_paths: Vec::new(),
+        commit_hash: None,
+        message: None,
+    }];
+    apply_svn_copy_info(&mut changes, &data, Some("https://s.example/r/trunk")).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].change_type, TYPE_COPY_HERE);
+
+    // Bad origin states fail like PHP.
+    let mut changes = vec![
+        ParsedChange {
+            old_path: String::new(),
+            current_path: "orig.txt".to_string(),
+            change_type: TYPE_MESSAGE,
+            file_type: FILE_TEXT,
+            hunks: Vec::new(),
+            away_paths: Vec::new(),
+            commit_hash: None,
+            message: None,
+        },
+        svn_skeleton_change(Path::new("."), "copy.txt", svn::FLAG_ADDED),
+    ];
+    let err =
+        apply_svn_copy_info(&mut changes, &data, Some("https://s.example/r/trunk")).unwrap_err();
+    assert_eq!(err, "Bad origin state 9.");
+}
+
+#[test]
+fn gap2_merge_svn_path_diffs_shapes() {
+    let root = gap2_svn_scratch("merge");
+    std::fs::write(root.join("a.txt"), "a\n").unwrap();
+    std::fs::write(root.join("b.bin"), b"\x00\x01").unwrap();
+
+    // Hunkless skeleton for paths without diff text.
+    let data = vec![gap2_path_data("a.txt", svn::FLAG_MODIFIED, &[], None)];
+    let changes = merge_svn_path_diffs(&root, &data, None).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].change_type, TYPE_CHANGE);
+    assert!(changes[0].hunks.is_empty());
+
+    // Parsed hunks merge into the skeleton; the `---` target sets old path;
+    // the current path stays pinned to the `Index:` header.
+    let text = "Index: a.txt\n===================================================================\n--- a.txt\t(revision 9)\n+++ a.txt\t(working copy)\n@@ -1 +1 @@\n-a\n+b\n";
+    let data = vec![gap2_path_data("a.txt", svn::FLAG_MODIFIED, &[], Some(text))];
+    let changes = merge_svn_path_diffs(&root, &data, None).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].current_path, "a.txt");
+    assert_eq!(changes[0].old_path, "a.txt");
+    assert_eq!(changes[0].hunks.len(), 1);
+
+    // Skeleton types survive the parse (an added file has no git markers).
+    let added_text = "Index: n.txt\n===================================================================\n--- n.txt\t(revision 0)\n+++ n.txt\t(working copy)\n@@ -0,0 +1 @@\n+x\n";
+    let data = vec![gap2_path_data(
+        "n.txt",
+        svn::FLAG_ADDED,
+        &[],
+        Some(added_text),
+    )];
+    let changes = merge_svn_path_diffs(&root, &data, None).unwrap();
+    assert_eq!(changes[0].change_type, TYPE_ADD);
+
+    // The synthetic-unchanged suffix strips; current path pins to `Index:`.
+    let synth = "Index: a.txt\n===================================================================\n--- a.txt (synthetic)\n+++ a.txt (synthetic)\n@@ -1,1 +1,1 @@\n a\n";
+    let data = vec![gap2_path_data(
+        "a.txt",
+        svn::FLAG_MODIFIED,
+        &[],
+        Some(synth),
+    )];
+    let changes = merge_svn_path_diffs(&root, &data, None).unwrap();
+    assert_eq!(changes[0].current_path, "a.txt");
+    assert_eq!(changes[0].old_path, "a.txt");
+    assert_eq!(changes[0].hunks.len(), 1);
+
+    // The svn binary marker sets `FILE_BINARY` with no hunks.
+    let binary = "Index: b.bin\n===================================================================\nCannot display: file marked as a binary type.\nsvn:mime-type = application/octet-stream\n";
+    let data = vec![gap2_path_data(
+        "b.bin",
+        svn::FLAG_MODIFIED,
+        &[],
+        Some(binary),
+    )];
+    let changes = merge_svn_path_diffs(&root, &data, None).unwrap();
+    assert_eq!(changes[0].file_type, FILE_BINARY);
+    assert!(changes[0].hunks.is_empty());
+
+    // T5555: a repeat path drops earlier hunks; the later block wins.
+    let dir_text = "Index: a.txt\n===================================================================\n--- a.txt\t(revision 9)\n+++ a.txt\t(working copy)\n@@ -1 +1 @@\n-dir\n+dir2\n";
+    let file_text = "Index: a.txt\n===================================================================\n--- a.txt\t(revision 9)\n+++ a.txt\t(working copy)\n@@ -1 +1 @@\n-file\n+file2\n";
+    let data = vec![
+        gap2_path_data("sub", svn::FLAG_ADDED, &[], Some(dir_text)),
+        gap2_path_data("a.txt", svn::FLAG_MODIFIED, &[], Some(file_text)),
+    ];
+    let changes = merge_svn_path_diffs(&root, &data, None).unwrap();
+    assert_eq!(changes.len(), 2);
+    let file = changes.iter().find(|c| c.current_path == "a.txt").unwrap();
+    assert_eq!(file.hunks.len(), 1);
+    assert!(
+        file.hunks[0].corpus.contains("-file\n"),
+        "{}",
+        file.hunks[0].corpus
+    );
+
+    // Blank-only diff text fails like PHP's `parseDiff()` guard.
+    let data = vec![gap2_path_data(
+        "a.txt",
+        svn::FLAG_MODIFIED,
+        &[],
+        Some("  \n"),
+    )];
+    assert_eq!(
+        merge_svn_path_diffs(&root, &data, None).unwrap_err(),
+        EMPTY_DIFF
+    );
+
+    // Deleted directories report `FILE_DIRECTORY` from `Node Kind`.
+    let data = vec![gap2_path_data(
+        "gone",
+        svn::FLAG_DELETED,
+        &[("Node Kind", "directory")],
+        None,
+    )];
+    let changes = merge_svn_path_diffs(&root, &data, None).unwrap();
+    assert_eq!(changes[0].file_type, FILE_DIRECTORY);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn gap2_svn_binary_marker_matches_php() {
+    assert!(is_svn_binary_marker(
+        "Cannot display: file marked as a binary type."
+    ));
+    assert!(is_svn_binary_marker(
+        "Cannot display: file marked as a binary type.  "
+    ));
+    assert!(!is_svn_binary_marker(
+        " Cannot display: file marked as a binary type."
+    ));
+    assert!(!is_svn_binary_marker("Binary files a and b differ"));
+}
+
+#[test]
+fn gap2_default_svn_diff_cmd_shape() {
+    #[cfg(windows)]
+    assert_eq!(default_svn_diff_cmd(), None);
+    #[cfg(not(windows))]
+    {
+        let script = default_svn_diff_cmd().unwrap();
+        assert!(
+            script.ends_with("scripts/repository/binary_safe_diff.sh"),
+            "{script:?}"
+        );
+    }
+}
+
+/* Gap2 D10: pullDataFromConduit. */
+
+#[test]
+fn gap2_pull_data_from_conduit_assigns_fields() {
+    let seen = std::cell::RefCell::new((String::new(), serde_json::json!(null)));
+    let call = |method: &str, params: &serde_json::Value| {
+        *seen.borrow_mut() = (method.to_string(), params.clone());
+        Ok(serde_json::json!({
+            "fields": {
+                "title": "Hello",
+                "reviewerPHIDs": ["PHID-USER-1", "PHID-USER-2"],
+                "count": 7,
+            },
+            "transactions": [{"type": "title"}],
+            "errors": [],
+        }))
+    };
+    let mut message = CommitMessage::new_from_raw_corpus("Hello\n").unwrap();
+    assert!(message.get_fields().is_empty());
+    assert_eq!(message.get_transactions(), None);
+    message.pull_data_from_conduit(&call, true).unwrap();
+
+    let (method, params) = seen.borrow().clone();
+    assert_eq!(method, "differential.parsecommitmessage");
+    assert_eq!(params["corpus"], serde_json::json!("Hello\n"));
+    assert_eq!(params["partial"], serde_json::json!(true));
+
+    assert_eq!(
+        message.get_field_value("title"),
+        Some(&FieldValue::Text("Hello".to_string()))
+    );
+    assert_eq!(
+        message.get_field_value("reviewerPHIDs"),
+        Some(&FieldValue::List(vec![
+            "PHID-USER-1".to_string(),
+            "PHID-USER-2".to_string()
+        ]))
+    );
+    assert_eq!(
+        message.get_field_value("count"),
+        Some(&FieldValue::Text("7".to_string()))
+    );
+    assert_eq!(message.get_field_value("missing"), None);
+    assert_eq!(
+        message.get_transactions(),
+        Some(&serde_json::json!([{"type": "title"}]))
+    );
+
+    message.set_field_value("title", FieldValue::Text("Changed".to_string()));
+    assert_eq!(
+        message.get_fields().get("title"),
+        Some(&FieldValue::Text("Changed".to_string()))
+    );
+}
+
+#[test]
+fn gap2_pull_data_parser_errors_carry_list() {
+    let call = |_: &str, _: &serde_json::Value| {
+        Ok(serde_json::json!({
+            "fields": {"title": "Hello"},
+            "errors": ["first problem", "second problem"],
+        }))
+    };
+    let mut message = CommitMessage::new_from_raw_corpus("Hello\n").unwrap();
+    let err = message.pull_data_from_conduit(&call, false).unwrap_err();
+    // Fields assign before the throw, like PHP.
+    assert_eq!(
+        message.get_field_value("title"),
+        Some(&FieldValue::Text("Hello".to_string()))
+    );
+    // Pre-October-2017 responses carry no transactions.
+    assert_eq!(message.get_transactions(), None);
+    assert_eq!(
+        err,
+        PullDataError::Parser(vec![
+            "first problem".to_string(),
+            "second problem".to_string()
+        ])
+    );
+    assert_eq!(err.into_message(), "first problem");
+
+    let transport = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        Err("down".into())
+    };
+    let mut message = CommitMessage::new_from_raw_corpus("Hello\n").unwrap();
+    let err = message
+        .pull_data_from_conduit(&transport, false)
+        .unwrap_err();
+    assert_eq!(err, PullDataError::Other("down".to_string()));
+    assert_eq!(err.into_message(), "down");
+}
+
+#[test]
+fn gap2_commit_message_monogram_and_defaults() {
+    let message =
+        CommitMessage::new_from_raw_corpus("Title\n\nDifferential Revision: D123\n").unwrap();
+    assert_eq!(message.revision_id, Some(123));
+    assert_eq!(message.get_revision_monogram(), Some("D123".to_string()));
+    let plain = CommitMessage::new_from_raw_corpus("Title\n").unwrap();
+    assert_eq!(plain.get_revision_monogram(), None);
+}
+
+/* Gap2 D1: create-message edit loop. */
+
+fn gap2_d1_scratch(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("arc-rs-diff-d1-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    dir
+}
+
+fn gap2_d1_ok_call(method: &str, _params: &serde_json::Value) -> Result<serde_json::Value, String> {
+    match method {
+        "differential.parsecommitmessage" => Ok(serde_json::json!({
+            "fields": {"title": "Hello"},
+            "errors": [],
+        })),
+        "differential.query" => Ok(serde_json::json!([
+            {"id": 7, "title": "Mine", "authorPHID": "PHID-USER-me", "statusName": "Accepted"},
+        ])),
+        "user.query" => Ok(serde_json::json!({})),
+        "differential.getcommitmessage" => Ok(serde_json::json!("Template title\n")),
+        other => Err(format!("unexpected conduit call {other}")),
+    }
+}
+
+#[test]
+fn gap2_build_editor_template_shapes() {
+    assert_eq!(
+        build_editor_template("Title\n", &[]),
+        "Title\n\n\n".to_string()
+    );
+    assert_eq!(
+        build_editor_template("Title\r\n\r\n", &["one".to_string(), "two  ".to_string()]),
+        "Title\n\n# one\n# two\n\n".to_string()
+    );
+    assert_eq!(
+        build_editor_template("", &["".to_string()]),
+        "\n\n#\n\n".to_string()
+    );
+}
+
+#[test]
+fn gap2_resolve_saved_template_flows() {
+    use std::io::Cursor;
+    let root = gap2_d1_scratch("saved");
+    let meta = root.join(".git");
+
+    // No scratch file, or verbatim: nothing to resume.
+    let mut out = Vec::new();
+    assert_eq!(
+        resolve_saved_template(
+            &mut Cursor::new(b"".to_vec()),
+            &mut out,
+            &meta,
+            &root,
+            false
+        )
+        .unwrap(),
+        None
+    );
+    assert!(out.is_empty());
+    diff::write_scratch_file(&meta, SCRATCH_CREATE_MESSAGE, "Saved title\nBody\n");
+    let mut out = Vec::new();
+    assert_eq!(
+        resolve_saved_template(&mut Cursor::new(b"".to_vec()), &mut out, &meta, &root, true)
+            .unwrap(),
+        None
+    );
+    assert!(out.is_empty());
+
+    // Acceptance reuses the template after the exact notice bytes.
+    let mut out = Vec::new();
+    let reused = resolve_saved_template(
+        &mut Cursor::new(b"y\n".to_vec()),
+        &mut out,
+        &meta,
+        &root,
+        false,
+    )
+    .unwrap();
+    assert_eq!(reused, Some("Saved title\nBody\n".to_string()));
+    let readable = diff::readable_scratch_file_path(&meta, &root, SCRATCH_CREATE_MESSAGE);
+    let expected = format!(
+        "{}\n\n{}\n",
+        saved_message_notice(&readable, &truncate_preview_64("Saved title\nBody\n")),
+        diff::format_confirm_prompt(PROMPT_USE_SAVED_MESSAGE, false).trim_start_matches("\n\n")
+    );
+    assert_eq!(String::from_utf8(out).unwrap(), expected);
+
+    // Refusal deletes the scratch file.
+    let mut out = Vec::new();
+    let reused = resolve_saved_template(
+        &mut Cursor::new(b"n\n".to_vec()),
+        &mut out,
+        &meta,
+        &root,
+        false,
+    )
+    .unwrap();
+    assert_eq!(reused, None);
+    assert!(diff::read_scratch_file(&meta, SCRATCH_CREATE_MESSAGE).is_none());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn gap2_check_revision_ownership_flows() {
+    use std::io::Cursor;
+    let mine = serde_json::json!({"id": 1, "title": "T", "authorPHID": "PHID-USER-me"});
+    let mut out = Vec::new();
+    check_revision_ownership(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &mine,
+        "PHID-USER-me",
+    )
+    .unwrap();
+    assert!(out.is_empty());
+
+    let other = serde_json::json!({"id": 2, "title": "O", "authorPHID": "PHID-USER-you"});
+    let mut out = Vec::new();
+    check_revision_ownership(
+        &mut Cursor::new(b"y\n".to_vec()),
+        &mut out,
+        &other,
+        "PHID-USER-me",
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("You don't own revision D2: \"O\"."), "{text}");
+
+    let mut out = Vec::new();
+    let err = check_revision_ownership(
+        &mut Cursor::new(b"n\n".to_vec()),
+        &mut out,
+        &other,
+        "PHID-USER-me",
+    )
+    .unwrap_err();
+    assert_eq!(err, diff_submit::OWNERSHIP_ABORT);
+}
+
+#[test]
+fn gap2_validate_commit_message_flows() {
+    use std::io::Cursor;
+
+    // No revision, no reviewers: silent success, no conduit calls.
+    let message = CommitMessage::new_from_raw_corpus("Title\n").unwrap();
+    let fail = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        Err("must not call".to_string())
+    };
+    let mut out = Vec::new();
+    validate_commit_message(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &fail,
+        &message,
+        "PHID-USER-me",
+        0,
+    )
+    .unwrap();
+    assert!(out.is_empty());
+
+    // Unknown revision id.
+    let message =
+        CommitMessage::new_from_raw_corpus("Title\n\nDifferential Revision: D9\n").unwrap();
+    let empty = |_: &str, _: &serde_json::Value| Ok(serde_json::json!([]));
+    let mut out = Vec::new();
+    let err = validate_commit_message(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &empty,
+        &message,
+        "PHID-USER-me",
+        0,
+    )
+    .unwrap_err();
+    assert_eq!(err, "There is no revision D9.");
+
+    // Owned revision validates (PHP takes the first row without
+    // comparing ids, so the canned D7 row satisfies the D9 message).
+    let mut out = Vec::new();
+    validate_commit_message(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &gap2_d1_ok_call,
+        &message,
+        "PHID-USER-me",
+        0,
+    )
+    .unwrap();
+    assert!(out.is_empty());
+}
+
+#[test]
+fn gap2_validate_reviewer_availability_flows() {
+    use std::io::Cursor;
+    let mut message = CommitMessage::new_from_raw_corpus("Title\n").unwrap();
+    message.set_field_value(
+        "reviewerPHIDs",
+        FieldValue::List(vec!["PHID-USER-away".to_string()]),
+    );
+    let away_user = |_: &str, _: &serde_json::Value| {
+        Ok(serde_json::json!({
+            "PHID-USER-away": {
+                "phid": "PHID-USER-away",
+                "userName": "away",
+                "realName": "",
+                "isDisabled": false,
+                "isAway": true,
+                "currentStatus": "away",
+                "currentStatusUntil": 1_700_000_000u64,
+            },
+        }))
+    };
+
+    let mut out = Vec::new();
+    validate_commit_message(
+        &mut Cursor::new(b"y\n".to_vec()),
+        &mut out,
+        &away_user,
+        &message,
+        "PHID-USER-me",
+        0,
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("away (until"), "{text}");
+    assert!(text.contains(diff_submit::CONTINUE_DESPITE_AWAY), "{text}");
+
+    let mut out = Vec::new();
+    let err = validate_commit_message(
+        &mut Cursor::new(b"n\n".to_vec()),
+        &mut out,
+        &away_user,
+        &message,
+        "PHID-USER-me",
+        0,
+    )
+    .unwrap_err();
+    assert_eq!(err, diff_submit::SPECIFY_AVAILABLE_REVIEWERS);
+}
+
+#[test]
+fn gap2_unresolved_errors_error_shapes() {
+    assert_eq!(
+        unresolved_errors_error(Some("somewhere")),
+        "Message has unresolved errors. A copy was saved to somewhere."
+    );
+    assert_eq!(
+        unresolved_errors_error(None),
+        "Message has unresolved errors. "
+    );
+}
+
+#[test]
+fn gap2_edit_create_message_first_pass() {
+    use std::io::Cursor;
+    let root = gap2_d1_scratch("loop-first");
+    let meta = root.join(".git");
+    let calls = std::cell::RefCell::new(0usize);
+    let edit = |_: &str| -> Result<String, String> {
+        *calls.borrow_mut() += 1;
+        Ok("Edited\n".to_string())
+    };
+
+    // Verbatim skips the editor on the first pass for non-default templates.
+    let mut input = Cursor::new(b"".to_vec());
+    let mut out = Vec::new();
+    let mut editor = CreateMessageEditor {
+        reader: &mut input,
+        writer: &mut out,
+        call: &gap2_d1_ok_call,
+        metadata_dir: &meta,
+        work_root: &root,
+        edit: &edit,
+        amend_commit: None,
+        user_phid: "PHID-USER-me",
+        away_offset: 0,
+    };
+    let message = edit_create_message(
+        &mut editor,
+        "Raw template\n",
+        "Raw template\n",
+        false,
+        true,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(*calls.borrow(), 0);
+    assert_eq!(message.raw_corpus, "Raw template\n");
+    assert_eq!(
+        diff::read_scratch_file(&meta, SCRATCH_CREATE_MESSAGE),
+        Some("Raw template\n".to_string())
+    );
+
+    // Default templates saved unedited fail.
+    let passthrough = |template: &str| -> Result<String, String> { Ok(template.to_string()) };
+    let mut input = Cursor::new(b"".to_vec());
+    let mut out = Vec::new();
+    let mut editor = CreateMessageEditor {
+        reader: &mut input,
+        writer: &mut out,
+        call: &gap2_d1_ok_call,
+        metadata_dir: &meta,
+        work_root: &root,
+        edit: &passthrough,
+        amend_commit: None,
+        user_phid: "PHID-USER-me",
+        away_offset: 0,
+    };
+    let err = edit_create_message(&mut editor, "Title\n", "Title\n", true, false, &[]).unwrap_err();
+    assert_eq!(err, TEMPLATE_NOT_EDITED);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn gap2_edit_create_message_reedits_on_parser_errors() {
+    use std::io::Cursor;
+    let root = gap2_d1_scratch("loop-reedit");
+    let meta = root.join(".git");
+    let flaky = |method: &str, params: &serde_json::Value| -> Result<serde_json::Value, String> {
+        if method == "differential.parsecommitmessage"
+            && params["corpus"].as_str().unwrap_or("").contains("Bad")
+        {
+            return Ok(serde_json::json!({
+                "fields": {},
+                "errors": ["Title is required."],
+            }));
+        }
+        gap2_d1_ok_call(method, params)
+    };
+    let calls = std::cell::RefCell::new(0usize);
+    let edit = |_: &str| -> Result<String, String> {
+        *calls.borrow_mut() += 1;
+        if *calls.borrow() == 1 {
+            return Ok("Bad\n".to_string());
+        }
+        Ok("Good title\n".to_string())
+    };
+
+    let mut input = Cursor::new(b"y\n".to_vec());
+    let mut out = Vec::new();
+    let mut editor = CreateMessageEditor {
+        reader: &mut input,
+        writer: &mut out,
+        call: &flaky,
+        metadata_dir: &meta,
+        work_root: &root,
+        edit: &edit,
+        amend_commit: None,
+        user_phid: "PHID-USER-me",
+        away_offset: 0,
+    };
+    let message = edit_create_message(&mut editor, "Seed\n", "Seed\n", false, false, &[]).unwrap();
+    assert_eq!(*calls.borrow(), 2);
+    assert_eq!(message.raw_corpus, "Good title\n");
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains(COMMIT_MESSAGE_HAS_ERRORS), "{text}");
+    assert!(text.contains("Title is required."), "{text}");
+    assert!(text.contains(MUST_RESOLVE_ERRORS), "{text}");
+    assert!(text.contains(PROMPT_EDIT_MESSAGE_AGAIN), "{text}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn gap2_edit_create_message_aborts_unresolved() {
+    use std::io::Cursor;
+    let root = gap2_d1_scratch("loop-abort");
+    let meta = root.join(".git");
+    let failing =
+        |_: &str, _: &serde_json::Value| Ok(serde_json::json!({"fields": {}, "errors": ["Nope."]}));
+    let edit = |_: &str| -> Result<String, String> { Ok("Bad\n".to_string()) };
+
+    let mut input = Cursor::new(b"n\n".to_vec());
+    let mut out = Vec::new();
+    let mut editor = CreateMessageEditor {
+        reader: &mut input,
+        writer: &mut out,
+        call: &failing,
+        metadata_dir: &meta,
+        work_root: &root,
+        edit: &edit,
+        amend_commit: None,
+        user_phid: "PHID-USER-me",
+        away_offset: 0,
+    };
+    let err = edit_create_message(&mut editor, "Seed\n", "Seed\n", false, false, &[]).unwrap_err();
+    let readable = diff::readable_scratch_file_path(&meta, &root, SCRATCH_CREATE_MESSAGE);
+    assert_eq!(
+        err,
+        format!("Message has unresolved errors. A copy was saved to '{readable}'.")
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn gap2_edit_create_message_amends_single_commit() {
+    use std::io::Cursor;
+    let root = gap2_d1_scratch("loop-amend");
+    let meta = root.join(".git");
+    let amended = std::cell::RefCell::new(Vec::<String>::new());
+    let amend = |message: &str| -> Result<(), String> {
+        amended.borrow_mut().push(message.to_string());
+        Ok(())
+    };
+    let edit = |_: &str| -> Result<String, String> { Ok("Amended title\n".to_string()) };
+
+    let mut input = Cursor::new(b"".to_vec());
+    let mut out = Vec::new();
+    let mut editor = CreateMessageEditor {
+        reader: &mut input,
+        writer: &mut out,
+        call: &gap2_d1_ok_call,
+        metadata_dir: &meta,
+        work_root: &root,
+        edit: &edit,
+        amend_commit: Some(&amend),
+        user_phid: "PHID-USER-me",
+        away_offset: 0,
+    };
+    let message = edit_create_message(&mut editor, "Old\n", "Old\n", false, false, &[]).unwrap();
+    assert_eq!(message.raw_corpus, "Amended title\n");
+    assert_eq!(amended.borrow().as_slice(), ["Amended title\n".to_string()]);
+    // Amending never touches the scratch file.
+    assert!(diff::read_scratch_file(&meta, SCRATCH_CREATE_MESSAGE).is_none());
+
+    // An unchanged message skips the amend hook.
+    let edit_same = |_: &str| -> Result<String, String> { Ok("Old\n".to_string()) };
+    let mut input = Cursor::new(b"".to_vec());
+    let mut out = Vec::new();
+    let mut editor = CreateMessageEditor {
+        reader: &mut input,
+        writer: &mut out,
+        call: &gap2_d1_ok_call,
+        metadata_dir: &meta,
+        work_root: &root,
+        edit: &edit_same,
+        amend_commit: Some(&amend),
+        user_phid: "PHID-USER-me",
+        away_offset: 0,
+    };
+    edit_create_message(&mut editor, "Old\n", "Old\n", false, false, &[]).unwrap();
+    assert_eq!(amended.borrow().len(), 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn gap2_d1_local_commit(commit: &str, summary: &str, message: &str) -> LocalCommitInfo {
+    LocalCommitInfo {
+        commit: commit.to_string(),
+        tree: "t".to_string(),
+        parents: Vec::new(),
+        time: "0".to_string(),
+        author: "a".to_string(),
+        summary: summary.to_string(),
+        message: message.to_string(),
+        author_email: "a@x".to_string(),
+    }
+}
+
+#[test]
+fn gap2_get_default_create_fields_merges_oldest_first() {
+    let call = |_: &str, params: &serde_json::Value| -> Result<serde_json::Value, String> {
+        let corpus = params["corpus"].as_str().unwrap_or("");
+        if corpus.contains("Newest") {
+            return Ok(serde_json::json!({
+                "fields": {"title": "Newest title", "summary": "Newest summary"},
+                "errors": [],
+            }));
+        }
+        if corpus.contains("Oldest") {
+            return Ok(serde_json::json!({
+                "fields": {"title": "Oldest title"},
+                "errors": [],
+            }));
+        }
+        Ok(serde_json::json!({"fields": {}, "errors": []}))
+    };
+    let local = vec![
+        gap2_d1_local_commit("newest111111", "Newest", "Newest\n"),
+        gap2_d1_local_commit("oldest222222", "Oldest", "Oldest\n"),
+    ];
+    let (fields, included, notes) =
+        get_default_create_fields_with(&call, &local, true, Some("r1"), Some("c1"), false).unwrap();
+    // Faux flags first, then newest-first commits.
+    assert_eq!(included.len(), 3);
+    assert!(included[0].contains("Command-Line Flags"), "{included:?}");
+    assert_eq!(included[1], "newest111111 Newest");
+    assert_eq!(included[2], "oldest222222 Oldest");
+    assert!(notes.is_empty());
+    // Oldest title wins; the newest title demotes to summary.
+    assert_eq!(
+        fields.get("title"),
+        Some(&FieldValue::Text("Oldest title".to_string()))
+    );
+
+    // Parse failures become notes (verbatim rethrows the first error).
+    let flaky = |_: &str, params: &serde_json::Value| -> Result<serde_json::Value, String> {
+        if params["corpus"].as_str().unwrap_or("").contains("Oldest") {
+            return Ok(serde_json::json!({"fields": {}, "errors": ["Bad tag."]}));
+        }
+        call("differential.parsecommitmessage", params)
+    };
+    let (_, _, notes) =
+        get_default_create_fields_with(&flaky, &local, true, None, None, false).unwrap();
+    assert_eq!(notes.len(), 2);
+    assert!(notes[0].contains("oldest222222"), "{notes:?}");
+    assert_eq!(notes[1], "  - Bad tag.");
+    let err = get_default_create_fields_with(&flaky, &local, true, None, None, true).unwrap_err();
+    assert_eq!(err, "Bad tag.");
+}
+
+#[test]
+fn gap2_get_commit_message_from_file_and_revision() {
+    use std::io::Cursor;
+    let root = gap2_d1_scratch("from-file");
+    let file = root.join("msg.txt");
+    std::fs::write(&file, "File title\n").unwrap();
+
+    let mut out = Vec::new();
+    let message = get_commit_message_from_file_with(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &gap2_d1_ok_call,
+        &file,
+        "PHID-USER-me",
+        0,
+    )
+    .unwrap();
+    assert_eq!(message.raw_corpus, "File title\n");
+    assert_eq!(
+        message.get_field_value("title"),
+        Some(&FieldValue::Text("Hello".to_string()))
+    );
+
+    // Unknown revisions fail before any prompt.
+    let empty = |_: &str, _: &serde_json::Value| Ok(serde_json::json!([]));
+    let mut out = Vec::new();
+    let err = get_commit_message_from_revision_with(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &empty,
+        "42",
+        "PHID-USER-me",
+    )
+    .unwrap_err();
+    assert_eq!(err, "Revision '42' does not exist!");
+
+    // Owned draft revisions return the template plus the draft flag.
+    let draft = |method: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        if method == "differential.query" {
+            return Ok(serde_json::json!([
+                {"id": 7, "title": "Mine", "authorPHID": "PHID-USER-me", "statusName": "Draft"},
+            ]));
+        }
+        gap2_d1_ok_call(method, &serde_json::json!(null))
+    };
+    let mut out = Vec::new();
+    let (message, is_draft) = get_commit_message_from_revision_with(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &draft,
+        "7",
+        "PHID-USER-me",
+    )
+    .unwrap();
+    assert!(is_draft);
+    assert_eq!(message.raw_corpus, "Template title\n");
+
+    // Non-string templates and non-numeric ids fail exactly.
+    let broken = |method: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        if method == "differential.getcommitmessage" {
+            return Ok(serde_json::json!(null));
+        }
+        draft(method, &serde_json::json!(null))
+    };
+    let mut out = Vec::new();
+    let err = get_commit_message_from_revision_with(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &broken,
+        "7",
+        "PHID-USER-me",
+    )
+    .unwrap_err();
+    assert_eq!(err, FAILED_TO_RETRIEVE_TEMPLATE);
+    // `D`-prefixed ids normalize, like `submit_mode` (`normalizeRevisionID`).
+    let mut out = Vec::new();
+    let (message, is_draft) = get_commit_message_from_revision_with(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &draft,
+        "D7",
+        "PHID-USER-me",
+    )
+    .unwrap();
+    assert!(is_draft);
+    assert_eq!(message.raw_corpus, "Template title\n");
+    // Non-numeric ids fail exactly.
+    let mut out = Vec::new();
+    let err = get_commit_message_from_revision_with(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &draft,
+        "nope",
+        "PHID-USER-me",
+    )
+    .unwrap_err();
+    assert_eq!(err, diff_submit::UPDATE_PARAM_MUST_BE_NUMBER);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn gap2_resolve_message_source_dispatch() {
+    assert_eq!(
+        resolve_message_source(true, false, false, None, None, false, None).unwrap(),
+        MessageSource::None
+    );
+    assert_eq!(
+        resolve_message_source(false, false, false, None, None, true, None).unwrap(),
+        MessageSource::None
+    );
+    assert_eq!(
+        resolve_message_source(false, true, false, None, None, false, None).unwrap(),
+        MessageSource::CreateFromUser
+    );
+    assert_eq!(
+        resolve_message_source(false, false, false, None, None, false, Some(&[])).unwrap(),
+        MessageSource::CreateFromUser
+    );
+    assert_eq!(
+        resolve_message_source(
+            false,
+            false,
+            false,
+            None,
+            None,
+            false,
+            Some(&[(7, "Mine".to_string())]),
+        )
+        .unwrap(),
+        MessageSource::UpdateFromRevision(7)
+    );
+    let err = resolve_message_source(
+        false,
+        false,
+        false,
+        None,
+        None,
+        false,
+        Some(&[(7, "A".to_string()), (8, "B".to_string())]),
+    )
+    .unwrap_err();
+    assert!(err.contains("several revisions"), "{err}");
+    assert!(err.contains("D7: A"), "{err}");
+    assert_eq!(
+        resolve_message_source(false, false, true, None, Some("m.txt"), false, None).unwrap(),
+        MessageSource::CreateFromFile("m.txt".to_string())
+    );
+    assert_eq!(
+        resolve_message_source(false, false, true, None, None, false, None).unwrap(),
+        MessageSource::CreateFromUser
+    );
+    assert_eq!(
+        resolve_message_source(false, false, false, Some("9"), None, false, None).unwrap(),
+        MessageSource::UpdateFromRevision(9)
+    );
+    assert_eq!(
+        resolve_message_source(false, false, false, Some("D9"), None, false, None).unwrap(),
+        MessageSource::UpdateFromRevision(9)
+    );
+    let err =
+        resolve_message_source(false, false, false, Some("nope"), None, false, None).unwrap_err();
+    assert_eq!(err, diff_submit::UPDATE_PARAM_MUST_BE_NUMBER);
+}
+
+/* Gap2 D3: clean working-copy check. */
+
+fn gap2_d3_vcs<'a>(edit: &'a dyn Fn(&str) -> Result<String, String>) -> CleanCheckVcs<'a> {
+    CleanCheckVcs {
+        kind: diff::VcsKind::Git,
+        work_path: "/repo".to_string(),
+        supports_local_commits: true,
+        can_stash: true,
+        autostash: false,
+        require_clean_untracked: true,
+        should_amend: false,
+        head_commit_message: None,
+        add_to_commit: None,
+        stash_changes: None,
+        do_commit: None,
+        amend_commit: None,
+        edit,
+    }
+}
+
+#[test]
+fn gap2_resolve_commit_mode_selection() {
+    assert_eq!(resolve_commit_mode(true, false), CommitMode::Enable);
+    assert_eq!(resolve_commit_mode(false, true), CommitMode::Disable);
+    assert_eq!(resolve_commit_mode(false, false), CommitMode::Allow);
+    assert_eq!(resolve_commit_mode(true, true), CommitMode::Enable);
+}
+
+#[test]
+fn gap2_working_copy_changes_from_masks() {
+    use std::collections::BTreeMap;
+    let status: BTreeMap<String, u32> = [
+        ("b.txt".to_string(), git::FLAG_UNCOMMITTED),
+        (
+            "a.txt".to_string(),
+            git::FLAG_UNSTAGED | git::FLAG_UNCOMMITTED,
+        ),
+        ("u.txt".to_string(), git::FLAG_UNTRACKED),
+        ("c.txt".to_string(), git::FLAG_CONFLICT),
+    ]
+    .into_iter()
+    .collect();
+    let changes = git_working_copy_changes(&status);
+    assert!(changes.incomplete.is_empty() && changes.missing.is_empty());
+    assert_eq!(changes.conflicts, vec!["c.txt".to_string()]);
+    assert_eq!(
+        changes.uncommitted,
+        vec!["a.txt".to_string(), "b.txt".to_string()]
+    );
+    assert_eq!(changes.unstaged, vec!["a.txt".to_string()]);
+    assert_eq!(changes.untracked, vec!["u.txt".to_string()]);
+
+    let svn_status: BTreeMap<String, u32> = [
+        ("i".to_string(), svn::FLAG_INCOMPLETE),
+        ("m".to_string(), svn::FLAG_MISSING),
+    ]
+    .into_iter()
+    .collect();
+    let changes = svn_working_copy_changes(&svn_status);
+    assert_eq!(changes.incomplete, vec!["i".to_string()]);
+    assert_eq!(changes.missing, vec!["m".to_string()]);
+}
+
+#[test]
+fn gap2_clean_check_fatal_gates() {
+    use std::io::Cursor;
+    let edit = |_: &str| -> Result<String, String> { Ok(String::new()) };
+    let vcs = gap2_d3_vcs(&edit);
+    let desc = working_copy_desc("/repo");
+
+    let changes = WorkingCopyChanges {
+        incomplete: vec!["sub".to_string()],
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    let err = require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Allow,
+    )
+    .unwrap_err();
+    assert_eq!(err, incomplete_checkout_error(&desc, &["sub".to_string()]));
+    assert!(err.contains("proceeding.'"), "{err}");
+    assert!(err.contains("  Working copy: /repo\n\n"), "{err}");
+
+    let changes = WorkingCopyChanges {
+        conflicts: vec!["c.txt".to_string()],
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    let err = require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Allow,
+    )
+    .unwrap_err();
+    assert!(err.contains("Conflicts in working copy:"), "{err}");
+
+    let changes = WorkingCopyChanges {
+        missing: vec!["m.txt".to_string()],
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    let err = require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Allow,
+    )
+    .unwrap_err();
+    assert!(err.ends_with("    m.txt\n"), "{err}");
+}
+
+#[test]
+fn gap2_clean_check_externals_gate() {
+    use std::io::Cursor;
+    let edit = |_: &str| -> Result<String, String> { Ok(String::new()) };
+    let vcs = gap2_d3_vcs(&edit);
+    let changes = WorkingCopyChanges {
+        externals: vec!["ext".to_string()],
+        ..Default::default()
+    };
+
+    let mut out = Vec::new();
+    let outcome = require_clean_working_copy(
+        &mut Cursor::new(b"y\n".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Allow,
+    )
+    .unwrap();
+    assert!(!outcome.stashed);
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("1 submodule(s) have uncommitted or untracked changes:\n\n      ext\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Ignore the changes to these 1 submodule(s) and continue?"),
+        "{text}"
+    );
+
+    let mut out = Vec::new();
+    let err = require_clean_working_copy(
+        &mut Cursor::new(b"n\n".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Allow,
+    )
+    .unwrap_err();
+    assert_eq!(err, USER_ABORT);
+
+    // Subversion zeroes the externals list: no prompt, no output.
+    let mut svn_vcs = gap2_d3_vcs(&edit);
+    svn_vcs.kind = diff::VcsKind::Svn;
+    let mut out = Vec::new();
+    require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &svn_vcs,
+        &changes,
+        CommitMode::Allow,
+    )
+    .unwrap();
+    assert!(out.is_empty());
+}
+
+#[test]
+fn gap2_clean_check_untracked_gate() {
+    use std::io::Cursor;
+    let edit = |_: &str| -> Result<String, String> { Ok(String::new()) };
+    let vcs = gap2_d3_vcs(&edit);
+    let changes = WorkingCopyChanges {
+        untracked: vec!["u.txt".to_string()],
+        ..Default::default()
+    };
+
+    let mut out = Vec::new();
+    require_clean_working_copy(
+        &mut Cursor::new(b"y\n".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Allow,
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains(UNTRACKED_FILES_HERE), "{text}");
+    assert!(text.contains(".git/info/exclude"), "{text}");
+    assert!(
+        text.contains("Ignore these 1 untracked file(s) and continue?"),
+        "{text}"
+    );
+
+    assert!(untracked_hint(diff::VcsKind::Svn, 2).contains("svn:ignore"));
+    assert!(untracked_hint(diff::VcsKind::Hg, 2).contains(".hgignore"));
+
+    let mut out = Vec::new();
+    let err = require_clean_working_copy(
+        &mut Cursor::new(b"n\n".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Allow,
+    )
+    .unwrap_err();
+    assert_eq!(err, USER_ABORT);
+
+    // `--allow-untracked` skips the gate silently.
+    let mut lax = gap2_d3_vcs(&edit);
+    lax.require_clean_untracked = false;
+    let mut out = Vec::new();
+    require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &lax,
+        &changes,
+        CommitMode::Allow,
+    )
+    .unwrap();
+    assert!(out.is_empty());
+}
+
+#[test]
+fn gap2_clean_check_commit_decisions() {
+    use std::io::Cursor;
+    let edit = |_: &str| -> Result<String, String> { Ok("Msg\n".to_string()) };
+    let added = std::cell::RefCell::new(Vec::<String>::new());
+    let add = |paths: &[String]| -> Result<(), String> {
+        added.borrow_mut().extend(paths.iter().cloned());
+        Ok(())
+    };
+    let committed = std::cell::RefCell::new(Vec::<String>::new());
+    let commit = |message: &str| -> Result<(), String> {
+        committed.borrow_mut().push(message.to_string());
+        Ok(())
+    };
+    let mut vcs = gap2_d3_vcs(&edit);
+    vcs.add_to_commit = Some(&add);
+    vcs.do_commit = Some(&commit);
+
+    let changes = WorkingCopyChanges {
+        unstaged: vec!["s.txt".to_string()],
+        uncommitted: vec!["c.txt".to_string()],
+        ..Default::default()
+    };
+
+    // Prompted commit: staged paths are added, the editor message commits.
+    let mut out = Vec::new();
+    let outcome = require_clean_working_copy(
+        &mut Cursor::new(b"y\n".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Allow,
+    )
+    .unwrap();
+    assert!(!outcome.stashed);
+    assert_eq!(added.borrow().as_slice(), ["s.txt".to_string()]);
+    assert_eq!(committed.borrow().as_slice(), ["Msg\n".to_string()]);
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains(UNCOMMITTED_CHANGES_HERE), "{text}");
+    // The unstaged header is indented, the uncommitted header is not.
+    assert!(
+        text.contains("  Unstaged changes in working copy:\n    s.txt"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Uncommitted changes in working copy:\n    c.txt"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Do you want to create a new commit with these 2 change(s)?"),
+        "{text}"
+    );
+
+    // `--add-all` skips the prompt (empty input is never read).
+    added.borrow_mut().clear();
+    committed.borrow_mut().clear();
+    let mut out = Vec::new();
+    require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Enable,
+    )
+    .unwrap();
+    assert_eq!(added.borrow().len(), 1);
+    assert_eq!(committed.borrow().len(), 1);
+
+    // `--uncommitted` refuses without autostash.
+    let mut out = Vec::new();
+    let err = require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Disable,
+    )
+    .unwrap_err();
+    assert_eq!(err, CANNOT_CONTINUE_UNCOMMITTED);
+
+    // Autostash stashes instead of failing.
+    let stashed = std::cell::Cell::new(false);
+    let stash = || -> Result<(), String> {
+        stashed.set(true);
+        Ok(())
+    };
+    vcs.autostash = true;
+    vcs.stash_changes = Some(&stash);
+    let mut out = Vec::new();
+    let outcome = require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Disable,
+    )
+    .unwrap();
+    assert!(outcome.stashed);
+    assert!(stashed.get());
+    assert!(
+        String::from_utf8(out)
+            .unwrap()
+            .contains(STASHING_UNCOMMITTED)
+    );
+}
+
+#[test]
+fn gap2_clean_check_commit_ux() {
+    use std::io::Cursor;
+    let edit = |template: &str| -> Result<String, String> {
+        assert!(template.starts_with("\n\n# Enter a commit message.\n#\n# Changes:\n#\n"));
+        assert!(template.contains("#     a.txt\n#     b.txt\n"));
+        Ok("My commit\n".to_string())
+    };
+    let committed = std::cell::RefCell::new(Vec::<String>::new());
+    let commit = |message: &str| -> Result<(), String> {
+        committed.borrow_mut().push(message.to_string());
+        Ok(())
+    };
+    let mut vcs = gap2_d3_vcs(&edit);
+    vcs.do_commit = Some(&commit);
+    let changes = WorkingCopyChanges {
+        uncommitted: vec!["b.txt".to_string(), "a.txt".to_string()],
+        ..Default::default()
+    };
+
+    let mut out = Vec::new();
+    require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Enable,
+    )
+    .unwrap();
+    assert_eq!(committed.borrow().as_slice(), ["My commit\n".to_string()]);
+
+    // Unedited templates fail.
+    let passthrough = |template: &str| -> Result<String, String> { Ok(template.to_string()) };
+    let mut vcs = gap2_d3_vcs(&passthrough);
+    vcs.do_commit = Some(&commit);
+    let mut out = Vec::new();
+    let err = require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Enable,
+    )
+    .unwrap_err();
+    assert_eq!(err, MUST_PROVIDE_MESSAGE);
+
+    // Amending passes the head message through.
+    let amended = std::cell::RefCell::new(Vec::<String>::new());
+    let amend = |message: &str| -> Result<(), String> {
+        amended.borrow_mut().push(message.to_string());
+        Ok(())
+    };
+    let mut vcs = gap2_d3_vcs(&edit);
+    vcs.should_amend = true;
+    vcs.head_commit_message = Some("Head msg\n".to_string());
+    vcs.amend_commit = Some(&amend);
+    let mut out = Vec::new();
+    require_clean_working_copy(
+        &mut Cursor::new(b"y\n".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Allow,
+    )
+    .unwrap();
+    assert_eq!(amended.borrow().as_slice(), ["Head msg\n".to_string()]);
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("Do you want to amend these 2 change(s) to the current commit?"),
+        "{text}"
+    );
+}
+
+#[test]
+fn gap2_format_count_grouping() {
+    assert_eq!(format_count(0), "0");
+    assert_eq!(format_count(5), "5");
+    assert_eq!(format_count(999), "999");
+    assert_eq!(format_count(1000), "1,000");
+    assert_eq!(format_count(1_234_567), "1,234,567");
+}
+
+#[test]
+fn gap2_calculate_should_amend_decisions() {
+    let no_revisions = || -> Result<Vec<(i64, String)>, String> { Ok(Vec::new()) };
+    let fail_call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        Err("must not call".to_string())
+    };
+    let head = gap2_d1_local_commit("abc123", "Work", "Work\n");
+    let base = || AmendCheck {
+        history_immutable: false,
+        supports_amend: true,
+        head: Some(head.clone()),
+        api_author: "a",
+        create: false,
+        repository: None,
+        load_open_revisions: &no_revisions,
+        call: &fail_call,
+    };
+
+    // No revision id: amend.
+    assert!(calculate_should_amend(&base()).unwrap());
+    // Immutable history, no amend support, no commits, foreign author.
+    let mut check = base();
+    check.history_immutable = true;
+    assert!(!calculate_should_amend(&check).unwrap());
+    let mut check = base();
+    check.supports_amend = false;
+    assert!(!calculate_should_amend(&check).unwrap());
+    let mut check = base();
+    check.head = None;
+    assert!(!calculate_should_amend(&check).unwrap());
+    let mut check = base();
+    check.api_author = "someone-else";
+    assert!(!calculate_should_amend(&check).unwrap());
+    // git-svn messages never amend.
+    let mut check = base();
+    check.head.as_mut().unwrap().message = "Work\n\ngit-svn-id: https://x/y@9 uuid\n".to_string();
+    assert!(!calculate_should_amend(&check).unwrap());
+    // Revision ids only amend outside `--create` with an open revision.
+    let mut check = base();
+    check.head.as_mut().unwrap().message = "Work\n\nDifferential Revision: D1\n".to_string();
+    check.create = true;
+    assert!(!calculate_should_amend(&check).unwrap());
+    check.create = false;
+    assert!(!calculate_should_amend(&check).unwrap());
+    let open = || -> Result<Vec<(i64, String)>, String> { Ok(vec![(1, "R".to_string())]) };
+    check.load_open_revisions = &open;
+    assert!(calculate_should_amend(&check).unwrap());
+
+    // Published commits never amend.
+    let known = |_: &str, _: &serde_json::Value| {
+        Ok(serde_json::json!({"identifierMap": {"rXabc123": {"id": 1}}}))
+    };
+    let mut check = base();
+    check.repository = Some(AmendRepository {
+        id: 9,
+        callsign: Some("X".to_string()),
+    });
+    check.call = &known;
+    assert!(!calculate_should_amend(&check).unwrap());
+    assert_eq!(
+        amend_commit_name(check.repository.as_ref().unwrap(), "abc123"),
+        "rXabc123"
+    );
+    let unknown = |_: &str, _: &serde_json::Value| Ok(serde_json::json!({"identifierMap": {}}));
+    check.call = &unknown;
+    assert!(calculate_should_amend(&check).unwrap());
+    check.repository = Some(AmendRepository {
+        id: 9,
+        callsign: None,
+    });
+    assert_eq!(
+        amend_commit_name(check.repository.as_ref().unwrap(), "abc123"),
+        "R9:abc123"
+    );
 }

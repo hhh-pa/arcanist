@@ -12,23 +12,46 @@
 
 extern crate self as arc_rs;
 
-use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 
-use arc_rs::{diff, git};
+use arc_rs::{diff, diff_submit, git, hg, lint, svn, unit};
 
 /* -(  Commit Messages  )---------------------------------------------------- */
 
-/// A parsed commit message: the local subset of
-/// `ArcanistDifferentialCommitMessage` without the Conduit round-trip.
+/// Failure to pull commit-message data from Conduit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PullDataError {
+    /// Parser errors from `differential.parsecommitmessage`
+    /// (`ArcanistDifferentialCommitMessageParserException`, carrying the
+    /// error list; the exception message is the first error).
+    Parser(Vec<String>),
+    /// Transport or malformed-response failure.
+    Other(String),
+}
+
+impl PullDataError {
+    /// Render for string-error contexts: the first parser error, or the
+    /// transport message.
+    #[must_use]
+    pub fn into_message(self) -> String {
+        match self {
+            PullDataError::Parser(errors) => errors.into_iter().next().unwrap_or_default(),
+            PullDataError::Other(message) => message,
+        }
+    }
+}
+
+/// A parsed commit message: `ArcanistDifferentialCommitMessage` with the
+/// Conduit round-trip.
 ///
 /// PHP: `src/differential/ArcanistDifferentialCommitMessage.php:6-15`
 /// (properties) and `newFromRawCorpus()` at `:17-31`.
 ///
-/// Divergence: `pullDataFromConduit()` (`:48-70`, server call
-/// `differential.parsecommitmessage`) is not ported; field tags are parsed
-/// locally by [`parse_field_tags`], and user/project names are never
-/// resolved to PHIDs.
+/// Divergence: [`parse_field_tags`] stays as the offline field parser
+/// for the merge flows; Conduit-resolved fields (names to PHIDs) only
+/// exist after [`CommitMessage::pull_data_from_conduit`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitMessage {
     /// Verbatim corpus, as passed to `newFromRawCorpus()`.
@@ -41,6 +64,67 @@ pub struct CommitMessage {
     pub git_svn_base_path: Option<String>,
     /// `git-svn-id` UUID, if present.
     pub git_svn_uuid: Option<String>,
+    /// Parsed fields, empty until [`CommitMessage::pull_data_from_conduit`].
+    pub fields: CommitFields,
+    /// Server transactions, when the response carries them.
+    pub xactions: Option<serde_json::Value>,
+}
+
+/// Coerce one conduit field value to a [`FieldValue`]: strings stay text,
+/// arrays become lists (non-string items render as JSON), anything else
+/// renders as JSON text.
+fn conduit_field_value(value: &serde_json::Value) -> FieldValue {
+    match value {
+        serde_json::Value::String(text) => FieldValue::Text(text.clone()),
+        serde_json::Value::Array(items) => FieldValue::List(
+            items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| item.to_string())
+                })
+                .collect(),
+        ),
+        other => FieldValue::Text(other.to_string()),
+    }
+}
+
+/// Coerce the `fields` member of a `parsecommitmessage` result.
+///
+/// PHP assigns `$result['fields']` verbatim (possibly null); a missing or
+/// non-object member yields no fields here.
+fn conduit_fields(result: &serde_json::Value) -> CommitFields {
+    result
+        .get("fields")
+        .and_then(serde_json::Value::as_object)
+        .map(|map| {
+            map.iter()
+                .map(|(key, value)| (key.clone(), conduit_field_value(value)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parser errors from a `parsecommitmessage` result: a non-empty `errors`
+/// array, else none. PHP throws on any non-empty `errors`; non-array
+/// members never occur from real servers and are ignored.
+fn conduit_parser_errors(result: &serde_json::Value) -> Option<Vec<String>> {
+    let errors = result.get("errors")?.as_array()?;
+    if errors.is_empty() {
+        return None;
+    }
+    Some(
+        errors
+            .iter()
+            .map(|error| {
+                error
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| error.to_string())
+            })
+            .collect(),
+    )
 }
 
 impl CommitMessage {
@@ -63,7 +147,62 @@ impl CommitMessage {
             git_svn_base_revision,
             git_svn_base_path,
             git_svn_uuid,
+            fields: CommitFields::new(),
+            xactions: None,
         })
+    }
+
+    /// Pull parsed fields and transactions from Conduit.
+    ///
+    /// PHP: `pullDataFromConduit()`
+    /// (`src/differential/ArcanistDifferentialCommitMessage.php:48-70`):
+    /// `differential.parsecommitmessage` with `corpus` and `partial`;
+    /// assigns `fields` plus `transactions` (absent before late October
+    /// 2017), then throws the parser errors when `errors` is non-empty.
+    pub fn pull_data_from_conduit(
+        &mut self,
+        call: &diff_submit::ConduitCall<'_>,
+        partial: bool,
+    ) -> Result<(), PullDataError> {
+        let params = diff_submit::parse_commit_message_params(&self.raw_corpus, partial);
+        let result = call(diff_submit::METHOD_PARSE_COMMIT_MESSAGE, &params)
+            .map_err(PullDataError::Other)?;
+        self.fields = conduit_fields(&result);
+        self.xactions = result.get("transactions").cloned();
+        if let Some(errors) = conduit_parser_errors(&result) {
+            return Err(PullDataError::Parser(errors));
+        }
+        Ok(())
+    }
+
+    /// Read one parsed field (`getFieldValue()`, `:72-77`).
+    #[must_use]
+    pub fn get_field_value(&self, key: &str) -> Option<&FieldValue> {
+        self.fields.get(key)
+    }
+
+    /// Write one parsed field (`setFieldValue()`, `:79-82`).
+    pub fn set_field_value(&mut self, key: &str, value: FieldValue) {
+        self.fields.insert(key.to_string(), value);
+    }
+
+    /// All parsed fields (`getFields()`, `:84-86`).
+    #[must_use]
+    pub fn get_fields(&self) -> &CommitFields {
+        &self.fields
+    }
+
+    /// Server transactions (`getTransactions()`, `:105-107`).
+    #[must_use]
+    pub fn get_transactions(&self) -> Option<&serde_json::Value> {
+        self.xactions.as_ref()
+    }
+
+    /// `D123` for the revision ID, if present (`getRevisionMonogram()`,
+    /// `:40-45`).
+    #[must_use]
+    pub fn get_revision_monogram(&self) -> Option<String> {
+        self.revision_id.map(|id| format!("D{id}"))
     }
 }
 
@@ -620,8 +759,8 @@ fn merge_occupied_field(slot: &mut FieldValue, value: &FieldValue) {
 /// PHP: `getCommitMessageFromFile()`
 /// (`src/workflow/ArcanistDiffWorkflow.php:1561-1571`): `readFile`,
 /// `newFromRawCorpus`, Conduit pull, validate. Only the read and the local
-/// parse are ported; validation needs Conduit (`validateCommitMessage()`,
-/// `:1620-1714`) and belongs to D2.
+/// parse happen here; [`get_commit_message_from_file_with`] adds the
+/// Conduit pull and [`validate_commit_message`].
 pub fn commit_message_from_file(path: &Path) -> Result<CommitMessage, String> {
     let data = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read message file '{}': {e}", path.display()))?;
@@ -1803,13 +1942,8 @@ pub fn passthru_argv(command: &str, set_flags: &[String]) -> Vec<String> {
 ///
 /// PHP: `runLint()` (`src/workflow/ArcanistDiffWorkflow.php:1157-1161`) and
 /// `runUnit()` (`:1225-1229`) append `--rev` plus the base commit when the
-/// repository supports commit ranges.
-///
-/// Divergence: git always supports commit ranges, so the flag is appended
-/// whenever a base commit is given. Engine execution itself (child
-/// workflows, `setShouldAmendChanges`, result messages at `:1163-1207` and
-/// `:1230-1278`) belongs to D2: `arc-rs lint` does not implement `--rev`
-/// yet.
+/// repository supports commit ranges (git/hg; svn never). Callers pass
+/// `None` for repositories without commit ranges.
 #[must_use]
 pub fn lint_unit_argv(passthru: &[String], base_commit: Option<&str>) -> Vec<String> {
     let mut argv = passthru.to_vec();
@@ -1849,6 +1983,222 @@ impl LintUnitReport {
             "testResults": self.test_results,
         })
     }
+
+    /// Empty report: no engines ran (`None` codes, empty dictionaries).
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            lint_result: None,
+            unresolved_lint: Vec::new(),
+            unit_result: None,
+            test_results: Vec::new(),
+        }
+    }
+}
+
+/// Outcome of a lint/unit child run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChildOutcome {
+    /// Workflow result code (`RESULT_OKAY`/`WARNINGS`/`ERRORS`/`SKIP` for
+    /// lint; `RESULT_OKAY`/`UNSOUND`/`FAIL`/`SKIP` for unit).
+    Code(i32),
+    /// `ArcanistNoEngineException`: nothing is configured.
+    NoEngine,
+    /// `ArcanistNoEffectException`, with its message.
+    NoEffect(String),
+    /// The child failed outside its result codes (configuration or
+    /// runtime error); the diff aborts with the message, like PHP's
+    /// uncaught child exceptions.
+    Failed(String),
+}
+
+/// Abort message, from `ArcanistUserAbortException`
+/// (`src/exception/usage/ArcanistUserAbortException.php:9-11`).
+pub const USER_ABORT: &str = "User aborted the workflow.";
+
+/// Numeric value of a lint/unit child exit code (0-3).
+///
+/// Both workflows return their result code verbatim (`ExitCode::from`)
+/// or `FAILURE` for internal errors; anything unrecognized maps to
+/// `1` (warnings/unsound), matching the `FAILURE` shape.
+fn exit_code_value(code: std::process::ExitCode) -> i32 {
+    use std::process::ExitCode;
+    if code == ExitCode::SUCCESS {
+        0
+    } else if code == ExitCode::from(2) {
+        2
+    } else if code == ExitCode::from(3) {
+        3
+    } else {
+        1
+    }
+}
+
+/// Prefix of lint's no-engine error
+/// (`lint::engine_for_dir` → "No lint engine is configured ...").
+const LINT_NO_ENGINE_PREFIX: &str = "No lint engine is configured";
+
+/// Run `lint` in-process, mapping to a [`ChildOutcome`].
+///
+/// `NoEngine` is probed via [`lint::engine_for_dir`]; anything else that
+/// fails before the workflow runs aborts. Result codes come from the
+/// workflow exit code verbatim.
+///
+/// Divergence: a workflow error inside `lint::run_in` (bad configuration
+/// surfacing late, patch-application failures) exits `FAILURE` and maps
+/// to `Code(1)` (`RESULT_WARNINGS`) instead of aborting: `run_in`
+/// cannot distinguish its own errors from result codes. Surfacing real
+/// errors needs a fallible lint entry point (lint owner).
+pub fn run_lint_in_process(cwd: &Path, argv: &[String]) -> ChildOutcome {
+    match lint::engine_for_dir(cwd) {
+        Ok(_) => {}
+        Err(message) if message.starts_with(LINT_NO_ENGINE_PREFIX) => {
+            return ChildOutcome::NoEngine;
+        }
+        Err(message) => return ChildOutcome::Failed(message),
+    }
+    ChildOutcome::Code(exit_code_value(lint::run_in(cwd, argv)))
+}
+
+/// Run `unit` in-process, mapping to a [`ChildOutcome`].
+///
+/// `NoEngine` mirrors PHP's engine lookup (`--engine` never passes
+/// through from `diff`, so only `unit.engine` and `.arcunit` count).
+/// Same late-workflow-error caveat as [`run_lint_in_process`].
+///
+/// The caller must pass the process working directory: `unit::run` has
+/// no `cwd` parameter (a `unit::run_in` is unit-owner work).
+pub fn run_unit_in_process(cwd: &Path, argv: &[String]) -> ChildOutcome {
+    if unit::find_unit_engine_from(cwd).is_none() && unit::find_arcunit_from(cwd).is_none() {
+        return ChildOutcome::NoEngine;
+    }
+    ChildOutcome::Code(exit_code_value(unit::run(argv)))
+}
+
+/// Print a lint/unit result banner (`** TITLE ** detail`), with console
+/// markup stripped to plain text like the submit reports.
+fn write_banner(out: &mut dyn Write, title: &str, detail: &str) -> Result<(), String> {
+    writeln!(out, "** {title} ** {detail}").map_err(|e| format!("failed to write output: {e}"))
+}
+
+/// Run lint (`runLint()`, `:1146-1207`).
+///
+/// `base` is `Some` only when the repository supports commit ranges
+/// (git/hg); `set_flags` holds the user's set passthrough flags;
+/// `skip` is [`should_skip_lint`]; `run_child` executes the child (see
+/// [`run_lint_in_process`]). Notices and banners go to `out`. Returns
+/// the lint result, or `None` when no engine ran.
+///
+/// Divergence: `setShouldAmendChanges()` (bare, from `diff`'s
+/// `shouldAmend()`) has no argv form, so plain `arc diff` runs lint
+/// without amending; explicit `--amend-all` / `--amend-autofixes`
+/// pass through exactly. Unresolved message dictionaries are always
+/// empty: in-process runs return only the result code (a
+/// message-returning lint API is lint-owner work, and would also feed
+/// the `arc:lint` diff property).
+pub fn run_lint<W: Write>(
+    cwd: &Path,
+    base: Option<&str>,
+    set_flags: &[String],
+    skip: bool,
+    run_child: &dyn Fn(&Path, &[String]) -> ChildOutcome,
+    out: &mut W,
+) -> Result<Option<i32>, String> {
+    if skip {
+        return Ok(Some(LINT_RESULT_SKIP));
+    }
+    let argv = lint_unit_argv(&passthru_argv("lint", set_flags), base);
+    writeln!(out, "{LINTING}").map_err(|e| format!("failed to write output: {e}"))?;
+    match run_child(cwd, &argv) {
+        ChildOutcome::NoEngine => {
+            writeln!(out, "{NO_LINT_ENGINE}")
+                .map_err(|e| format!("failed to write output: {e}"))?;
+            Ok(None)
+        }
+        ChildOutcome::NoEffect(message) => {
+            writeln!(out, "{message}").map_err(|e| format!("failed to write output: {e}"))?;
+            Ok(None)
+        }
+        ChildOutcome::Failed(message) => Err(message),
+        ChildOutcome::Code(result) => {
+            if let Some((title, detail)) = lint_result_notice(result) {
+                write_banner(out, title, detail)?;
+            }
+            Ok(Some(result))
+        }
+    }
+}
+
+/// Run unit tests (`runUnit()`, `:1213-1278`).
+///
+/// Shape mirrors [`run_lint`]; the `RESULT_UNSOUND` prompt reads from
+/// `input` (default yes, like `phutil_console_confirm()`), and declining
+/// aborts with [`USER_ABORT`]. Test-result dictionaries are always
+/// empty (same in-process caveat as [`run_lint`]).
+pub fn run_unit<R: BufRead, W: Write>(
+    cwd: &Path,
+    base: Option<&str>,
+    set_flags: &[String],
+    skip: bool,
+    run_child: &dyn Fn(&Path, &[String]) -> ChildOutcome,
+    input: &mut R,
+    out: &mut W,
+) -> Result<Option<i32>, String> {
+    if skip {
+        return Ok(Some(UNIT_RESULT_SKIP));
+    }
+    let argv = lint_unit_argv(&passthru_argv("unit", set_flags), base);
+    writeln!(out, "{RUNNING_UNIT_TESTS}").map_err(|e| format!("failed to write output: {e}"))?;
+    match run_child(cwd, &argv) {
+        ChildOutcome::NoEngine => {
+            writeln!(out, "{NO_UNIT_ENGINE}")
+                .map_err(|e| format!("failed to write output: {e}"))?;
+            Ok(None)
+        }
+        ChildOutcome::NoEffect(message) => {
+            writeln!(out, "{message}").map_err(|e| format!("failed to write output: {e}"))?;
+            Ok(None)
+        }
+        ChildOutcome::Failed(message) => Err(message),
+        ChildOutcome::Code(result) => {
+            if result == UNIT_RESULT_UNSOUND
+                && !diff::prompt_confirm_from(input, out, UNSOUND_PROMPT, false)?
+            {
+                return Err(USER_ABORT.to_string());
+            }
+            if let Some((title, detail)) = unit_result_notice(result) {
+                write_banner(out, title, detail)?;
+            }
+            Ok(Some(result))
+        }
+    }
+}
+
+/// Run lint and unit together (`runLintUnit()`, `:1131-1140`).
+///
+/// Returns the combined [`LintUnitReport`] (dictionaries always empty;
+/// see [`run_lint`]).
+#[allow(clippy::too_many_arguments)]
+pub fn run_lint_unit<R: BufRead, W: Write>(
+    cwd: &Path,
+    base: Option<&str>,
+    lint_flags: &[String],
+    unit_flags: &[String],
+    skip_lint: bool,
+    skip_unit: bool,
+    run_lint_child: &dyn Fn(&Path, &[String]) -> ChildOutcome,
+    run_unit_child: &dyn Fn(&Path, &[String]) -> ChildOutcome,
+    input: &mut R,
+    out: &mut W,
+) -> Result<LintUnitReport, String> {
+    let lint_result = run_lint(cwd, base, lint_flags, skip_lint, run_lint_child, out)?;
+    let unit_result = run_unit(cwd, base, unit_flags, skip_unit, run_unit_child, input, out)?;
+    Ok(LintUnitReport {
+        lint_result,
+        unresolved_lint: Vec::new(),
+        unit_result,
+        test_results: Vec::new(),
+    })
 }
 
 /// Diff property holding unresolved lint (`updateLintDiffProperty()`, `:2296-2304`).
@@ -2222,6 +2572,9 @@ pub struct ParsedChange {
     pub file_type: u32,
     /// Parsed hunks (empty for binary and message changes).
     pub hunks: Vec<ParsedHunk>,
+    /// Destination paths for old-location changes (`getAwayPaths()`),
+    /// filled by the Subversion copy/move pass, else empty.
+    pub away_paths: Vec<String>,
     /// Commit hash for `TYPE_MESSAGE` changes, else `None`.
     pub commit_hash: Option<String>,
     /// Message body for `TYPE_MESSAGE` changes, else `None`.
@@ -2252,13 +2605,16 @@ impl ParsedChange {
 /// `git show`/`git log`. Unknown text between blocks is skipped, mirroring
 /// the PHP parser's tolerance for extended headers.
 ///
-/// Divergence: combined-diff (`@@@`) headers are not parsed; they are
-/// treated as hunk body text.
-#[must_use]
-pub fn parse_unified_diff(text: &str) -> Vec<ParsedChange> {
+/// Combined diffs fail with PHP's `didFailParse()` errors: `diff --cc` /
+/// `diff --combined` headers match no PHP header pattern (`:276-283`),
+/// and `@@@` hunks match no PHP hunk pattern (`:897-920`). A leading
+/// `diff --cc` line recovers past itself only when a later `diff -r` /
+/// `diff --git` line starts a real block (`:260-272`), like PHP.
+pub fn parse_unified_diff(text: &str) -> Result<Vec<ParsedChange>, String> {
     let mut changes: Vec<ParsedChange> = Vec::new();
     let mut pending_message: Option<(String, Vec<String>)> = None;
     let lines: Vec<&str> = text.lines().collect();
+    let raw: Vec<&str> = split_keep_endings(text);
     let mut index = 0;
     while index < lines.len() {
         let line = lines[index];
@@ -2277,10 +2633,24 @@ pub fn parse_unified_diff(text: &str) -> Vec<ParsedChange> {
             {
                 changes.push(message_change(&done_hash, &body));
             }
-            let (change, next) = parse_file_block(&lines, index);
+            let (change, next) = parse_file_block(&lines, &raw, index)?;
             changes.push(change);
             index = next;
             continue;
+        }
+        if is_combined_diff_header(line) {
+            // PHP recovers past a leading `diff --cc` line only when a
+            // later `diff -r` / `diff --git` line starts a real block
+            // (`:260-272`); otherwise (and always mid-diff) it fails at
+            // this line (`:273-283`).
+            if is_first_content_line(&lines, index)
+                && let Some(found) = next_diff_start(&lines, index)
+                && is_diff_header(lines[found])
+            {
+                index = found;
+                continue;
+            }
+            return Err(diff_parse_error(&raw, index, EXPECTED_DIFF_START));
         }
         if let Some((_, body)) = pending_message.as_mut() {
             body.push(line.to_string());
@@ -2290,7 +2660,102 @@ pub fn parse_unified_diff(text: &str) -> Vec<ParsedChange> {
     if let Some((hash, body)) = pending_message {
         changes.push(message_change(&hash, &body));
     }
-    changes
+    Ok(changes)
+}
+
+/// Split text into lines retaining endings, like `phutil_split_lines()`.
+///
+/// Indices correspond 1:1 with `str::lines()`; used for parse-error
+/// context, where PHP echoes raw lines verbatim.
+fn split_keep_endings(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        Vec::new()
+    } else {
+        text.split_inclusive('\n').collect()
+    }
+}
+
+/// `didFailParse()` message for a bad hunk header (`:917-920`).
+pub const EXPECTED_HUNK_HEADER: &str = "Expected hunk header '@@ -NN,NN +NN,NN @@'.";
+
+/// `didFailParse()` message when no diff header matches (`:276-283`).
+///
+/// Used here only for combined-diff (`diff --cc`) headers; other
+/// unrecognized text between blocks stays skipped (see the
+/// [`parse_unified_diff`] docs).
+pub const EXPECTED_DIFF_START: &str = "Expected a hunk header, like 'Index: /path/to/file.ext' (svn), 'Property changes on: /path/to/file.ext' (svn properties), 'commit 59bcc3ad6775562f845953cf01624225' (git show), 'diff --git' (git diff), '--- filename' (unified diff), or 'diff -r' (hg diff or patch).";
+
+/// Combined-diff header (`git diff --cc` / `git diff --combined`).
+fn is_combined_diff_header(line: &str) -> bool {
+    line.starts_with("diff --cc") || line.starts_with("diff --combined")
+}
+
+/// Whether `lines[index]` is the first content line, like PHP's
+/// `isFirstNonEmptyLine()` (`:1162-1181`): blank and `#`-comment lines
+/// do not count.
+fn is_first_content_line(lines: &[&str], index: usize) -> bool {
+    for (position, line) in lines.iter().enumerate() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        return position == index;
+    }
+    false
+}
+
+/// Whether a line looks like a diff start, like PHP's
+/// `nextLineThatLooksLikeDiffStart()` (`:1151-1158`):
+/// `/^\s*diff\s+-(?:r|-git)/`.
+fn looks_like_diff_start(line: &str) -> bool {
+    const WS: [char; 5] = [' ', '\t', '\r', '\x0C', '\x0B'];
+    let rest = line.trim_start_matches(WS);
+    let Some(after_diff) = rest.strip_prefix("diff") else {
+        return false;
+    };
+    let trimmed = after_diff.trim_start_matches(WS);
+    if trimmed.len() == after_diff.len() {
+        return false;
+    }
+    let Some(after_dash) = trimmed.strip_prefix('-') else {
+        return false;
+    };
+    after_dash.starts_with('r') || after_dash.starts_with("-git")
+}
+
+/// Find the next diff-start-looking line after `index`, like PHP's
+/// `nextLineThatLooksLikeDiffStart()`.
+fn next_diff_start(lines: &[&str], index: usize) -> Option<usize> {
+    (index + 1..lines.len()).find(|&position| looks_like_diff_start(lines[position]))
+}
+
+/// Right-align `text` in `width` columns, truncating like `%8.8s`.
+///
+/// Markers and line numbers are ASCII, so char truncation matches PHP's
+/// byte truncation exactly.
+fn fit_right(text: &str, width: usize) -> String {
+    let clipped: String = text.chars().take(width).collect();
+    format!("{clipped:>width$}")
+}
+
+/// Render PHP's `didFailParse()` exception text (`:1198-1226`).
+///
+/// `raw` holds the input lines with endings; `line` is the 0-based
+/// failing index. `writeDiffOnFailure` defaults off, so only the message
+/// plus the ±5-line context render, joined by a blank line.
+fn diff_parse_error(raw: &[&str], line: usize, message: &str) -> String {
+    let min = line.saturating_sub(5);
+    let max = (line + 5).min(raw.len().saturating_sub(1));
+    let mut context = String::new();
+    for (number, raw_line) in raw.iter().enumerate().take(max + 1).skip(min) {
+        let marker = if number == line { ">>>  " } else { "" };
+        context.push_str(&format!(
+            "{} {}   {}",
+            fit_right(marker, 8),
+            fit_right(&(number + 1).to_string(), 6),
+            raw_line
+        ));
+    }
+    format!("Diff Parse Exception: {message}\n\n{context}")
 }
 
 /// Drop `TYPE_MESSAGE` changes from a raw parse (`:821-826`).
@@ -2314,9 +2779,22 @@ fn message_change(hash: &str, body: &[String]) -> ParsedChange {
         change_type: TYPE_MESSAGE,
         file_type: FILE_TEXT,
         hunks: Vec::new(),
+        away_paths: Vec::new(),
         commit_hash: Some(hash.to_string()),
         message: Some(body.join("\n")),
     }
+}
+
+/// Subversion binary-file marker (`parseIndexHunk()`,
+/// `src/parser/ArcanistDiffParser.php:734-738`).
+pub const SVN_BINARY_MARKER: &str = "Cannot display: file marked as a binary type.";
+
+/// True for the Subversion binary-file marker line. PHP matches the
+/// right-trimmed line exactly (`:735-738`), so leading whitespace
+/// disqualifies (hunk content never matches).
+#[must_use]
+pub fn is_svn_binary_marker(line: &str) -> bool {
+    line.trim_end() == SVN_BINARY_MARKER
 }
 
 fn is_diff_header(line: &str) -> bool {
@@ -2327,7 +2805,13 @@ fn is_diff_header(line: &str) -> bool {
 }
 
 /// Parse one `diff`/`Index:` block starting at `lines[start]`.
-fn parse_file_block(lines: &[&str], start: usize) -> (ParsedChange, usize) {
+///
+/// `raw` parallels `lines` with endings retained, for parse errors.
+fn parse_file_block(
+    lines: &[&str],
+    raw: &[&str],
+    start: usize,
+) -> Result<(ParsedChange, usize), String> {
     let mut old_path = String::new();
     let mut new_path = String::new();
     let mut change_type = TYPE_CHANGE;
@@ -2367,6 +2851,7 @@ fn parse_file_block(lines: &[&str], start: usize) -> (ParsedChange, usize) {
         if line.starts_with("--- ")
             || line.starts_with("Binary files ")
             || line.starts_with("GIT binary patch")
+            || is_svn_binary_marker(line)
             || line.starts_with("@@ ")
             || is_diff_header(line)
             || line.starts_with("commit ")
@@ -2393,9 +2878,13 @@ fn parse_file_block(lines: &[&str], start: usize) -> (ParsedChange, usize) {
         index += 1;
     }
 
+    // `Index:` blocks key on the header path; `---`/`+++` only supply
+    // the old path with `(...)` suffixes stripped (`parseHunkTarget()`,
+    // `src/parser/ArcanistDiffParser.php:840-878`).
+    let index_block = header.starts_with("Index: ");
     // `---` / `+++` path lines.
     if index < lines.len() && lines[index].starts_with("--- ") {
-        let old = diff_path_value(lines[index]);
+        let old = diff_path_value(lines[index], index_block);
         if old == "/dev/null" {
             new_file = true;
         } else if !old.is_empty() {
@@ -2404,7 +2893,7 @@ fn parse_file_block(lines: &[&str], start: usize) -> (ParsedChange, usize) {
         index += 1;
     }
     if index < lines.len() && lines[index].starts_with("+++ ") {
-        let new = diff_path_value(lines[index]);
+        let new = diff_path_value(lines[index], index_block);
         if new == "/dev/null" {
             deleted_file = true;
             new_path.clone_from(&old_path);
@@ -2412,6 +2901,9 @@ fn parse_file_block(lines: &[&str], start: usize) -> (ParsedChange, usize) {
             new_path = new;
         }
         index += 1;
+    }
+    if index_block {
+        new_path = header["Index: ".len()..].trim().to_string();
     }
     if new_path.is_empty() {
         new_path.clone_from(&old_path);
@@ -2423,8 +2915,21 @@ fn parse_file_block(lines: &[&str], start: usize) -> (ParsedChange, usize) {
     // Body: binary markers and hunks until the next block.
     while index < lines.len() {
         let line = lines[index];
-        if is_diff_header(line) || line.starts_with("commit ") {
+        if is_diff_header(line) || is_combined_diff_header(line) || line.starts_with("commit ") {
             break;
+        }
+        if is_svn_binary_marker(line) {
+            // `Cannot display: ...` plus its `svn:mime-type` line
+            // (`:739-743`); the mime line is the next non-empty line.
+            binary = true;
+            index += 1;
+            while index < lines.len() && lines[index].trim().is_empty() {
+                index += 1;
+            }
+            if index < lines.len() {
+                index += 1;
+            }
+            continue;
         }
         if line.starts_with("Binary files ") || line.starts_with("GIT binary patch") {
             binary = true;
@@ -2432,7 +2937,9 @@ fn parse_file_block(lines: &[&str], start: usize) -> (ParsedChange, usize) {
             // Skip binary payload lines (`literal ...`, base85, ...).
             while index < lines.len()
                 && !lines[index].starts_with("@@ ")
+                && !lines[index].starts_with("@@@")
                 && !is_diff_header(lines[index])
+                && !is_combined_diff_header(lines[index])
                 && !lines[index].starts_with("commit ")
             {
                 index += 1;
@@ -2444,6 +2951,9 @@ fn parse_file_block(lines: &[&str], start: usize) -> (ParsedChange, usize) {
             hunks.push(hunk);
             index = next;
             continue;
+        }
+        if line.starts_with("@@@") {
+            return Err(diff_parse_error(raw, index, EXPECTED_HUNK_HEADER));
         }
         index += 1;
     }
@@ -2473,18 +2983,19 @@ fn parse_file_block(lines: &[&str], start: usize) -> (ParsedChange, usize) {
         old_path.clear();
     }
 
-    (
+    Ok((
         ParsedChange {
             old_path,
             current_path: new_path,
             change_type,
             file_type,
             hunks,
+            away_paths: Vec::new(),
             commit_hash: None,
             message: None,
         },
         index,
-    )
+    ))
 }
 
 fn strip_ab_prefix(path: &str) -> &str {
@@ -2495,16 +3006,35 @@ fn strip_ab_prefix(path: &str) -> &str {
     }
 }
 
+/// Strip a trailing ` (...)` hunk-target suffix (`parseHunkTarget()`,
+/// `src/parser/ArcanistDiffParser.php:840-862`).
+///
+/// PHP's non-git remainder is `(?:\s*\(.*\))?$` with a lazy path, so a
+/// value ending in `)` truncates at the first `(`.
+fn strip_svn_paren_suffix(path: &str) -> &str {
+    if !path.ends_with(')') {
+        return path;
+    }
+    match path.find('(') {
+        Some(open) => path[..open].trim_end(),
+        None => path,
+    }
+}
+
 /// Extract the path from a `---`/`+++` line, dropping hg/svn suffixes.
 ///
 /// Handles `a/f`, `b/f`, bare `f`, quoted `"f"`, svn `f (revision N)` /
-/// `f (working copy)` suffixes, and hg tab-separated date suffixes.
-fn diff_path_value(line: &str) -> String {
+/// `f (working copy)` / `f (synthetic)` suffixes, and hg tab-separated
+/// date suffixes. `Index:` blocks strip every trailing ` (...)`
+/// (`parseHunkTarget()`); other blocks keep the legacy suffix checks.
+fn diff_path_value(line: &str, strip_paren_suffix: bool) -> String {
     let value = line[4..].trim_end();
     // Tab separates svn/hg metadata suffixes.
     let path = value.split('\t').next().unwrap_or("").trim();
     // Svn appends ` (revision N)` / ` (working copy)` after a space.
-    let path = if path.contains(" (revision ") || path.ends_with(" (working copy)") {
+    let path = if strip_paren_suffix {
+        strip_svn_paren_suffix(path)
+    } else if path.contains(" (revision ") || path.ends_with(" (working copy)") {
         path.rsplit_once(" (").map_or(path, |(head, _)| head)
     } else {
         path
@@ -2551,7 +3081,12 @@ fn collect_hunk(
     let mut index = start + 1;
     while index < lines.len() {
         let line = lines[index];
-        if line.starts_with("@@ ") || is_diff_header(line) || line.starts_with("commit ") {
+        if line.starts_with("@@ ")
+            || line.starts_with("@@@")
+            || is_diff_header(line)
+            || is_combined_diff_header(line)
+            || line.starts_with("commit ")
+        {
             break;
         }
         corpus.push_str(line);
@@ -2680,9 +3215,20 @@ pub fn hg_full_diff_argv(base: &str, context_lines: u32) -> Vec<String> {
 /// PHP: `getFullMercurialDiff()` (`ArcanistMercurialAPI.php:382-384`).
 /// Like [`get_full_git_diff`], output decodes lossy.
 pub fn get_full_hg_diff(dir: &Path, base: &str, context_lines: u32) -> Result<String, String> {
+    get_full_hg_diff_with(dir, &hg::HgCommand::default(), base, context_lines)
+}
+
+/// [`get_full_hg_diff`] over an injected `hg` backend (fake binaries in
+/// tests).
+pub fn get_full_hg_diff_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    base: &str,
+    context_lines: u32,
+) -> Result<String, String> {
     let argv = hg_full_diff_argv(base, context_lines);
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let out = arc_rs::hg::output(dir, &refs)?;
+    let out = hg::output_with(dir, hg_cmd, &refs)?;
     if !out.status.success() {
         return Err(format!(
             "hg diff failed: {}",
@@ -2700,7 +3246,12 @@ pub fn hg_branch_argv() -> Vec<String> {
 
 /// Read the Mercurial branch name (trimmed stdout).
 pub fn get_hg_branch_name(dir: &Path) -> Result<String, String> {
-    let out = arc_rs::hg::stdout_text(dir, &["branch"])?;
+    get_hg_branch_name_with(dir, &hg::HgCommand::default())
+}
+
+/// [`get_hg_branch_name`] over an injected `hg` backend.
+pub fn get_hg_branch_name_with(dir: &Path, hg_cmd: &hg::HgCommand) -> Result<String, String> {
+    let out = hg::stdout_text_with(dir, hg_cmd, &["branch"])?;
     Ok(out.trim().to_string())
 }
 
@@ -2940,22 +3491,46 @@ pub fn svn_base_rev_line(baserev: i64, path: &str) -> String {
     format!("    Revision {baserev}, {path}")
 }
 
-/// Require consistent svn base revisions; new files (`<= 0`) are ignored.
+/// Render one `svn status` base-revision line from a raw revision string (`:854`).
+#[must_use]
+pub fn svn_base_rev_line_str(baserev: &str, path: &str) -> String {
+    format!("    Revision {baserev}, {path}")
+}
+
+/// True for base revisions PHP drops (`$bases[$path] <= 0`, `:843-847`):
+/// empty or numerically non-positive. Non-numeric strings compare
+/// lexicographically under PHP 8 (`"abc" <= "0"` is false), so they stay.
+fn svn_baserev_is_new(baserev: &str) -> bool {
+    if baserev.is_empty() {
+        return true;
+    }
+    match baserev.parse::<i64>() {
+        Ok(number) => number <= 0,
+        Err(_) => false,
+    }
+}
+
+/// Require consistent svn base revisions over raw revision strings.
 ///
 /// PHP: `generateChanges()` (`src/workflow/ArcanistDiffWorkflow.php:840-878`).
-/// Returns the effective base revision (the common value).
-pub fn check_svn_base_consistency(bases: &[(&str, i64)]) -> Result<i64, String> {
-    let live: Vec<(&str, i64)> = bases.iter().copied().filter(|(_, rev)| *rev > 0).collect();
-    if live.is_empty() {
-        return Ok(0);
-    }
-    let rev = live[0].1;
-    if live.iter().all(|(_, other)| *other == rev) {
-        return Ok(rev);
+/// Comparison is strict (`!==`) on the raw strings, so `"09"` and `"9"`
+/// mismatch; the first surviving value wins. Returns the effective base
+/// revision, or `None` when every path is new (`:852` skips the override).
+pub fn check_svn_base_revision_strings(bases: &[(&str, &str)]) -> Result<Option<String>, String> {
+    let live: Vec<(&str, &str)> = bases
+        .iter()
+        .copied()
+        .filter(|(_, rev)| !svn_baserev_is_new(rev))
+        .collect();
+    let Some((_, first)) = live.first() else {
+        return Ok(None);
+    };
+    if live.iter().all(|(_, other)| *other == *first) {
+        return Ok(Some((*first).to_string()));
     }
     let revlist = live
         .iter()
-        .map(|(path, baserev)| svn_base_rev_line(*baserev, path))
+        .map(|(path, baserev)| svn_base_rev_line_str(baserev, path))
         .collect::<Vec<_>>()
         .join("\n");
     Err(format!(
@@ -2964,11 +3539,33 @@ pub fn check_svn_base_consistency(bases: &[(&str, i64)]) -> Result<i64, String> 
     ))
 }
 
+/// Require consistent svn base revisions; new files (`<= 0`) are ignored.
+///
+/// PHP: `generateChanges()` (`src/workflow/ArcanistDiffWorkflow.php:840-878`).
+/// Returns the effective base revision (the common value), or 0 when
+/// every path is new.
+pub fn check_svn_base_consistency(bases: &[(&str, i64)]) -> Result<i64, String> {
+    let rendered: Vec<String> = bases.iter().map(|(_, rev)| rev.to_string()).collect();
+    let refs: Vec<(&str, &str)> = bases
+        .iter()
+        .zip(rendered.iter())
+        .map(|((path, _), rev)| (*path, rev.as_str()))
+        .collect();
+    match check_svn_base_revision_strings(&refs)? {
+        // The revision strings above were formatted from `i64`, so parsing
+        // back cannot fail.
+        Some(rev) => Ok(rev.parse::<i64>().unwrap_or(0)),
+        None => Ok(0),
+    }
+}
+
 /// Warning printed when `svn:externals` paths carry local modifications.
 ///
 /// PHP: `generateAffectedPaths()`
-/// (`src/workflow/ArcanistDiffWorkflow.php:768-779`). The trailing wrapped
-/// path list is appended by the caller.
+/// (`src/workflow/ArcanistDiffWorkflow.php:768-779`). The echo format has
+/// two verbs but three arguments, so `sprintf` silently drops the wrapped
+/// path list: PHP prints these two paragraphs plus `"\n\n"` and never the
+/// file list. Callers must not append the list.
 #[must_use]
 pub fn svn_externals_warning() -> String {
     "The working copy includes changes to 'svn:externals' paths. These changes will not be \
@@ -3451,6 +4048,550 @@ pub fn failed_binary_upload(name: &str) -> String {
     format!("Failed to upload binary \"{name}\".")
 }
 
+/* -(  SVN affected paths + per-path diff fan-out (D5/D11)  )------------------------- */
+
+/// Split `svn:externals` entries out of a status map.
+///
+/// PHP: `generateAffectedPaths()`
+/// (`src/workflow/ArcanistDiffWorkflow.php:756-766`). Externals are always
+/// dropped; the ones carrying add/modify/delete flags are returned second
+/// for the warning prompt, in status order.
+#[must_use]
+pub fn split_svn_externals(status: &svn::StatusMap) -> (svn::StatusMap, Vec<String>) {
+    let mut kept = svn::StatusMap::new();
+    let mut warn = Vec::new();
+    for (path, mask) in status {
+        if mask & svn::FLAG_EXTERNALS == 0 {
+            kept.insert(path.clone(), *mask);
+            continue;
+        }
+        let modified = mask & (svn::FLAG_ADDED | svn::FLAG_MODIFIED | svn::FLAG_DELETED) != 0;
+        if modified {
+            warn.push(path.clone());
+        }
+    }
+    (kept, warn)
+}
+
+/// Lexically absolutize `path` against `base` (`Filesystem::resolvePath()`
+/// subset for `FileList`).
+///
+/// Separators normalize to `/`; `.` and `..` collapse lexically. Like PHP,
+/// a trailing `/` marks directories (via a filesystem check).
+fn resolve_list_path(base: &Path, path: &str) -> String {
+    let joined = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        base.join(path)
+    };
+    let mut parts: Vec<String> = Vec::new();
+    let mut rooted = false;
+    for component in joined.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => {
+                parts.push(prefix.as_os_str().to_string_lossy().into_owned());
+            }
+            std::path::Component::RootDir => rooted = true,
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            std::path::Component::Normal(part) => {
+                parts.push(part.to_string_lossy().into_owned());
+            }
+        }
+    }
+    let mut out = parts.join("/");
+    if rooted {
+        out.insert(0, '/');
+    }
+    if out != "/" && joined.is_dir() {
+        out.push('/');
+    }
+    out
+}
+
+/// CLI path filter (`FileList`, `src/filesystem/FileList.php:33-81`).
+///
+/// An empty list contains every path; otherwise a candidate matches by
+/// exact resolved path or when a listed directory is its parent
+/// (`contains($path, true)`, `:56-81`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SvnFileList {
+    files: Vec<String>,
+    dirs: BTreeSet<String>,
+}
+
+impl SvnFileList {
+    /// Resolve CLI `paths` against the process working directory (`:33-45`).
+    #[must_use]
+    pub fn new(cwd: &Path, paths: &[String]) -> Self {
+        let mut files = Vec::new();
+        let mut dirs = BTreeSet::new();
+        for path in paths {
+            let resolved = resolve_list_path(cwd, path);
+            if resolved.ends_with('/') {
+                dirs.insert(resolved.clone());
+            }
+            files.push(resolved);
+        }
+        Self { files, dirs }
+    }
+
+    /// True when the repo-relative `path` (joined to the working-copy
+    /// `root`, like `$repository_api->getPath($path)`) is listed (`:56-81`).
+    #[must_use]
+    pub fn contains(&self, root: &Path, repo_path: &str) -> bool {
+        if self.files.is_empty() {
+            return true;
+        }
+        let candidate = resolve_list_path(root, repo_path);
+        for file in &self.files {
+            if *file == candidate {
+                return true;
+            }
+            if self.dirs.contains(file) && candidate.starts_with(file.as_str()) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Drop untracked paths from affected paths (`:793-797`).
+#[must_use]
+pub fn drop_untracked_svn_paths(status: &svn::StatusMap) -> svn::StatusMap {
+    status
+        .iter()
+        .filter(|(_, mask)| *mask & svn::FLAG_UNTRACKED == 0)
+        .map(|(path, mask)| (path.clone(), *mask))
+        .collect()
+}
+
+/// Injected prompt stdio plus the externals warning flag for the svn
+/// fan-out: `warned_externals` is the workflow's `hasWarnedExternals`.
+pub struct SvnPromptIo<'a, R: BufRead, W: Write> {
+    /// Prompt input.
+    pub reader: &'a mut R,
+    /// Warning and prompt output.
+    pub writer: &'a mut W,
+    /// Whether the externals warning already printed.
+    pub warned_externals: bool,
+}
+
+/// Warn once about modified externals and confirm generation (`:768-787`).
+///
+/// Writes [`svn_externals_warning`] plus `"\n\n"` (the dropped-`sprintf`-arg
+/// shape), then confirms with [`PROMPT_SVN_EXTERNALS_ANYWAY`] (default no).
+/// A refusal fails with [`USER_ABORT`]; `warned` is the workflow's
+/// `hasWarnedExternals` flag.
+pub fn confirm_svn_externals<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    warned: &mut bool,
+    externals: &[String],
+) -> Result<(), String> {
+    if externals.is_empty() || *warned {
+        return Ok(());
+    }
+    let text = format!("{}\n\n", svn_externals_warning());
+    writer
+        .write_all(text.as_bytes())
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    if !diff::prompt_confirm_from(reader, writer, PROMPT_SVN_EXTERNALS_ANYWAY, true)? {
+        return Err(USER_ABORT.to_string());
+    }
+    *warned = true;
+    Ok(())
+}
+
+/// Skeleton change for one svn path (`parseSubversionDiff()`,
+/// `src/parser/ArcanistDiffParser.php:63-90`).
+///
+/// The type comes from the status flags (added, deleted, else changed);
+/// directories and symlinks set the file type (the link check runs after
+/// the directory check, so link-to-dir reports symlink). Parsed hunks
+/// merge into the skeleton later; the old path stays empty (PHP `null`)
+/// until the `---` target or the copy pass sets it.
+#[must_use]
+pub fn svn_skeleton_change(root: &Path, path: &str, flags: u32) -> ParsedChange {
+    let change_type = if flags & svn::FLAG_ADDED != 0 {
+        TYPE_ADD
+    } else if flags & svn::FLAG_DELETED != 0 {
+        TYPE_DELETE
+    } else {
+        TYPE_CHANGE
+    };
+    let absolute = root.join(path);
+    let mut file_type = FILE_TEXT;
+    if absolute.is_dir() {
+        file_type = FILE_DIRECTORY;
+    }
+    if absolute.is_symlink() {
+        file_type = FILE_SYMLINK;
+    }
+    ParsedChange {
+        old_path: String::new(),
+        current_path: path.to_string(),
+        change_type,
+        file_type,
+        hunks: Vec::new(),
+        away_paths: Vec::new(),
+        commit_hash: None,
+        message: None,
+    }
+}
+
+/// Fanned-out per-path working-copy data: status flags, `svn info` fields,
+/// and the raw `--depth empty` diff text (`None` when svn reports none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SvnPathData {
+    /// Repo-relative path.
+    pub path: String,
+    /// Status `FLAG_*` mask.
+    pub flags: u32,
+    /// Parsed `svn info` fields.
+    pub info: BTreeMap<String, String>,
+    /// Raw per-path diff bytes, if any.
+    pub diff: Option<Vec<u8>>,
+}
+
+/// Fan out over status paths (D5): `svn info` plus the per-path
+/// `--depth empty` diff for each usable path.
+///
+/// PHP: `primeSubversionWorkingCopyData()` plus the `getRawDiffText()`
+/// loop (`ArcanistDiffWorkflow.php:1068-1094`,
+/// `ArcanistDiffParser.php:92-94`). Untracked, conflicted, and missing
+/// paths are dropped (`:54-60`). Iteration follows the (sorted) status
+/// map; PHP follows `svn --xml status` order.
+pub fn collect_svn_path_data_with(
+    dir: &Path,
+    svn_cmd: &svn::SvnCommand,
+    status: &svn::StatusMap,
+    config: &svn::SvnDiffConfig<'_>,
+) -> Result<Vec<SvnPathData>, String> {
+    let mut data = Vec::new();
+    for (path, flags) in status {
+        if flags & (svn::FLAG_UNTRACKED | svn::FLAG_CONFLICT | svn::FLAG_MISSING) != 0 {
+            continue;
+        }
+        let info = svn::get_svn_info_with(dir, svn_cmd, path)?;
+        let diff = svn::get_raw_diff_text_with(dir, svn_cmd, path, status, config)?;
+        data.push(SvnPathData {
+            path: path.clone(),
+            flags: *flags,
+            info,
+            diff,
+        });
+    }
+    Ok(data)
+}
+
+/// Empty-diff parse failure (`parseDiff()`,
+/// `src/parser/ArcanistDiffParser.php:191-193`).
+pub const EMPTY_DIFF: &str = "Can't parse an empty diff!";
+
+/// Merge one parsed block into the keyed change set.
+///
+/// Matching skeletons gain the parsed hunks and old path (PHP's
+/// `setOldPath()` from `---`, plus `markBinary()`); new paths append
+/// as-is. A repeat path drops the earlier hunks so the later block wins
+/// (T5555, `parseChangeset()`,
+/// `src/parser/ArcanistDiffParser.php:880-887`).
+fn merge_one_svn_block(
+    changes: &mut Vec<ParsedChange>,
+    index: &mut BTreeMap<String, usize>,
+    parsed: ParsedChange,
+) {
+    match index.get(&parsed.current_path).copied() {
+        Some(at) => {
+            let target = &mut changes[at];
+            target.hunks = parsed.hunks;
+            target.old_path = parsed.old_path;
+            if parsed.file_type == FILE_BINARY {
+                target.file_type = FILE_BINARY;
+            }
+        }
+        None => {
+            index.insert(parsed.current_path.clone(), changes.len());
+            changes.push(parsed);
+        }
+    }
+}
+
+/// Deleted-or-moved-away directories report `FILE_DIRECTORY` (`:128-136`).
+fn apply_svn_delete_dir_types(changes: &mut [ParsedChange], data: &[SvnPathData]) {
+    for datum in data {
+        let is_dir = datum
+            .info
+            .get("Node Kind")
+            .is_some_and(|kind| kind == "directory");
+        if !is_dir {
+            continue;
+        }
+        if let Some(change) = changes
+            .iter_mut()
+            .find(|change| change.current_path == datum.path)
+            && (change.change_type == TYPE_DELETE || change.change_type == TYPE_MOVE_AWAY)
+        {
+            change.file_type = FILE_DIRECTORY;
+        }
+    }
+}
+
+/// PHP loose `!=` over revision strings: two numeric strings compare
+/// numerically, anything else compares as strings.
+fn php_loose_not_equal(left: &str, right: &str) -> bool {
+    match (left.parse::<i64>(), right.parse::<i64>()) {
+        (Ok(a), Ok(b)) => a != b,
+        _ => left != right,
+    }
+}
+
+/// Root-relative copy source for a `Copied From URL` (`:96-124`).
+///
+/// Returns `None` for empty sources and sources outside the working-copy
+/// root. Otherwise the root prefix (plus `/`) is stripped, and `@rev` is
+/// appended when `Copied From Rev` differs loosely from `Revision`.
+#[must_use]
+pub fn svn_copy_old_path(
+    copied_from_url: &str,
+    copied_from_rev: &str,
+    revision: &str,
+    root_url: &str,
+) -> Option<String> {
+    if copied_from_url.is_empty() {
+        return None;
+    }
+    let root = format!("{root_url}/");
+    let cpath = copied_from_url.strip_prefix(root.as_str())?;
+    let mut out = cpath.to_string();
+    if !copied_from_rev.is_empty() && php_loose_not_equal(copied_from_rev, revision) {
+        out.push('@');
+        out.push_str(copied_from_rev);
+    }
+    Some(out)
+}
+
+/// Origin-type transition for a copy/move source (`:148-166`).
+fn origin_transition(change_type: u32) -> Result<u32, String> {
+    match change_type {
+        TYPE_MULTICOPY | TYPE_COPY_AWAY | TYPE_ADD => Ok(change_type),
+        TYPE_DELETE => Ok(TYPE_MOVE_AWAY),
+        TYPE_MOVE_AWAY => Ok(TYPE_MULTICOPY),
+        TYPE_CHANGE => Ok(TYPE_COPY_AWAY),
+        other => Err(format!("Bad origin state {other}.")),
+    }
+}
+
+/// New-location type from the transitioned origin type (`:168-183`).
+fn here_type(origin_type: u32) -> Result<u32, String> {
+    match origin_type {
+        TYPE_MULTICOPY | TYPE_MOVE_AWAY => Ok(TYPE_MOVE_HERE),
+        TYPE_ADD | TYPE_COPY_AWAY => Ok(TYPE_COPY_HERE),
+        other => Err(format!("Bad origin state {other}.")),
+    }
+}
+
+/// Fresh origin change (`buildChange()` default: `TYPE_CHANGE`, text).
+fn fresh_origin_change(origin: &str) -> ParsedChange {
+    ParsedChange {
+        old_path: String::new(),
+        current_path: origin.to_string(),
+        change_type: TYPE_CHANGE,
+        file_type: FILE_TEXT,
+        hunks: Vec::new(),
+        away_paths: Vec::new(),
+        commit_hash: None,
+        message: None,
+    }
+}
+
+/// Apply `Copied From` old paths plus the origin copy/move pass (`:96-184`).
+///
+/// `root_url` is the working-copy root URL (`getSVNInfo('.')['URL']`),
+/// fetched lazily by the caller only when a copied path exists.
+pub fn apply_svn_copy_info(
+    changes: &mut Vec<ParsedChange>,
+    data: &[SvnPathData],
+    root_url: Option<&str>,
+) -> Result<(), String> {
+    let mut from: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(root) = root_url {
+        for datum in data {
+            let copied = datum
+                .info
+                .get("Copied From URL")
+                .map(String::as_str)
+                .unwrap_or("");
+            let from_rev = datum
+                .info
+                .get("Copied From Rev")
+                .map(String::as_str)
+                .unwrap_or("");
+            let revision = datum.info.get("Revision").map(String::as_str).unwrap_or("");
+            if let Some(cpath) = svn_copy_old_path(copied, from_rev, revision, root) {
+                if let Some(change) = changes.iter_mut().find(|c| c.current_path == datum.path) {
+                    change.old_path = cpath.clone();
+                }
+                from.insert(datum.path.clone(), cpath);
+            }
+        }
+    }
+    let mut index: BTreeMap<String, usize> = BTreeMap::new();
+    for (at, change) in changes.iter().enumerate() {
+        index.insert(change.current_path.clone(), at);
+    }
+    for (path, origin) in &from {
+        let Some(at) = index.get(path).copied() else {
+            continue;
+        };
+        if !index.contains_key(origin) && changes[at].change_type == TYPE_COPY_HERE {
+            continue;
+        }
+        let origin_at = match index.get(origin).copied() {
+            Some(at) => at,
+            None => {
+                changes.push(fresh_origin_change(origin));
+                let at = changes.len() - 1;
+                index.insert(origin.clone(), at);
+                at
+            }
+        };
+        changes[origin_at].away_paths.push(path.clone());
+        let transitioned = origin_transition(changes[origin_at].change_type)?;
+        changes[origin_at].change_type = transitioned;
+        changes[at].change_type = here_type(transitioned)?;
+    }
+    Ok(())
+}
+
+/// Parse fanned-out per-path texts into changes (`parseSubversionDiff()`).
+///
+/// Every path gets a skeleton; non-empty texts parse and merge (blank-only
+/// texts fail like PHP's `parseDiff()` guard). Delete-dir file types and
+/// the copy/move pass apply after the merge.
+pub fn merge_svn_path_diffs(
+    root: &Path,
+    data: &[SvnPathData],
+    root_url: Option<&str>,
+) -> Result<Vec<ParsedChange>, String> {
+    let mut changes: Vec<ParsedChange> = data
+        .iter()
+        .map(|datum| svn_skeleton_change(root, &datum.path, datum.flags))
+        .collect();
+    let mut index: BTreeMap<String, usize> = BTreeMap::new();
+    for (at, change) in changes.iter().enumerate() {
+        index.insert(change.current_path.clone(), at);
+    }
+    for datum in data {
+        let Some(bytes) = datum.diff.as_ref() else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(bytes);
+        if text.trim().is_empty() {
+            return Err(EMPTY_DIFF.to_string());
+        }
+        for parsed in parse_unified_diff(&text)? {
+            merge_one_svn_block(&mut changes, &mut index, parsed);
+        }
+    }
+    apply_svn_delete_dir_types(&mut changes, data);
+    apply_svn_copy_info(&mut changes, data, root_url)?;
+    Ok(changes)
+}
+
+/// Working-copy root for `cwd`: the parent of the nearest `.svn`
+/// directory (`ArcanistSubversionAPI::$path`), else `cwd` itself.
+#[must_use]
+pub fn svn_working_copy_root(cwd: &Path) -> PathBuf {
+    svn::find_metadata_path(cwd)
+        .and_then(|marker| marker.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| cwd.to_path_buf())
+}
+
+/// Default `--diff-cmd` script (`buildDiffFuture()`,
+/// `ArcanistSubversionAPI.php:281-313`).
+///
+/// Windows uses the plain `diff --depth empty` shape (`None`); Unix
+/// resolves `<exe>/../scripts/repository/binary_safe_diff.sh`, mirroring
+/// PHP's `$root.'/../scripts/repository/binary_safe_diff.sh'`.
+#[must_use]
+pub fn default_svn_diff_cmd() -> Option<PathBuf> {
+    if cfg!(windows) {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    Some(dir.join("../scripts/repository/binary_safe_diff.sh"))
+}
+
+/// Collect submit-ready parsed changes from an svn working copy.
+///
+/// PHP: the Subversion branch of `generateChanges()` plus
+/// `generateAffectedPaths()`
+/// (`ArcanistDiffWorkflow.php:746-799,832-884`): argv-limited status with
+/// externals, `FileList` limiting, the externals warn/confirm, the
+/// base-revision consistency check, the per-path fan-out, and the
+/// svn-only gigantic-diff throw (`:915-922`).
+///
+/// Divergence: `svn::get_raw_diff_text_with` re-reads `svn info` for
+/// copied adds (PHP's `svnInfo` cache has no port), so copied adds cost
+/// one redundant `info` call with identical behavior.
+pub fn collect_svn_parsed_changes_with_io<R: BufRead, W: Write>(
+    cwd: &Path,
+    svn_cmd: &svn::SvnCommand,
+    cli_paths: &[String],
+    config: &svn::SvnDiffConfig<'_>,
+    io: &mut SvnPromptIo<'_, R, W>,
+) -> Result<Vec<ParsedChange>, String> {
+    let root = svn_working_copy_root(cwd);
+    let path_refs: Vec<&str> = cli_paths.iter().map(String::as_str).collect();
+    let status = svn::get_svn_status_with(&root, svn_cmd, &path_refs, true)?;
+    let list = SvnFileList::new(cwd, cli_paths);
+    let limited: svn::StatusMap = status
+        .files
+        .iter()
+        .filter(|(path, _)| list.contains(&root, path))
+        .map(|(path, mask)| (path.clone(), *mask))
+        .collect();
+    let (paths, warn) = split_svn_externals(&limited);
+    confirm_svn_externals(io.reader, io.writer, &mut io.warned_externals, &warn)?;
+    let paths = drop_untracked_svn_paths(&paths);
+    let base_pairs: Vec<(&str, &str)> = status
+        .base_revisions
+        .iter()
+        .map(|(path, rev)| (path.as_str(), rev.as_str()))
+        .collect();
+    check_svn_base_revision_strings(&base_pairs)?;
+    let data = collect_svn_path_data_with(&root, svn_cmd, &paths, config)?;
+    let root_url = if data.iter().any(|datum| {
+        datum
+            .info
+            .get("Copied From URL")
+            .is_some_and(|url| !url.is_empty())
+    }) {
+        svn::get_svn_info_with(&root, svn_cmd, ".")?
+            .get("URL")
+            .cloned()
+    } else {
+        None
+    };
+    let changes = merge_svn_path_diffs(&root, &data, root_url.as_deref())?;
+    for change in &changes {
+        if change.corpus_size() > GIGANTIC_DIFF_LIMIT_BYTES {
+            return Err(gigantic_svn_error(
+                &change.current_path,
+                change.corpus_size(),
+            ));
+        }
+    }
+    Ok(changes)
+}
+
 /// Confirm prompt after upload failures (`:2563`).
 pub const PROMPT_CONTINUE: &str = "Continue?";
 
@@ -3646,15 +4787,25 @@ pub fn get_hg_local_commits(
     base: &str,
     branch: &str,
 ) -> Result<Vec<HgLocalCommit>, String> {
+    get_hg_local_commits_with(dir, &hg::HgCommand::default(), base, branch)
+}
+
+/// [`get_hg_local_commits`] over an injected `hg` backend.
+pub fn get_hg_local_commits_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    base: &str,
+    branch: &str,
+) -> Result<Vec<HgLocalCommit>, String> {
     let argv = hg_local_commit_argv(base, branch);
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let text = arc_rs::hg::stdout_text(dir, &refs)?;
+    let text = hg::stdout_text_with(dir, hg_cmd, &refs)?;
     let mut commits = parse_hg_local_commits(&text);
     for commit in &mut commits {
         if commit.parents.is_none() {
             let argv = hg_parents_argv(&commit.node);
             let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-            let parents = arc_rs::hg::stdout_text(dir, &refs)?;
+            let parents = hg::stdout_text_with(dir, hg_cmd, &refs)?;
             commit.parents = Some(
                 parents
                     .lines()
@@ -3688,9 +4839,18 @@ pub fn parse_svn_info(output: &str) -> BTreeMap<String, String> {
 ///
 /// PHP: `getSVNInfo()` (`:326-337`), including the nonzero-exit error.
 pub fn get_svn_info(dir: &Path, path: &str) -> Result<BTreeMap<String, String>, String> {
+    get_svn_info_with(dir, &svn::SvnCommand::default(), path)
+}
+
+/// [`get_svn_info`] over an injected `svn` backend.
+pub fn get_svn_info_with(
+    dir: &Path,
+    svn_cmd: &svn::SvnCommand,
+    path: &str,
+) -> Result<BTreeMap<String, String>, String> {
     let argv = svn_info_argv(path);
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let out = arc_rs::svn::output(dir, &refs)?;
+    let out = svn::output_with(dir, svn_cmd, &refs)?;
     if !out.status.success() {
         return Err(format!(
             "Error #{} executing svn info against '{path}'.",
@@ -3698,6 +4858,1273 @@ pub fn get_svn_info(dir: &Path, path: &str) -> Result<BTreeMap<String, String>, 
         ));
     }
     Ok(parse_svn_info(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/* -(  Create-message edit loop (D1)  )-------------------------------------- */
+
+/// Scratch file holding the in-progress create message (`:1382`).
+pub const SCRATCH_CREATE_MESSAGE: &str = "create-message";
+
+/// PHP `rtrim()` default charlist (also `trim()` and `ltrim()`).
+const PHP_TRIM_CHARS: [char; 6] = [' ', '\t', '\n', '\r', '\0', '\x0B'];
+
+/// Build the editor template: message, blank line, `#`-comment issues,
+/// trailing blank line (`getCommitMessageFromUser()`, `:1467-1474`).
+#[must_use]
+pub fn build_editor_template(template: &str, issues: &[String]) -> String {
+    let mut out = format!("{}\n\n", template.trim_end_matches(['\r', '\n']));
+    for issue in issues {
+        out.push_str(format!("# {issue}").trim_end_matches(PHP_TRIM_CHARS));
+        out.push('\n');
+    }
+    out.push('\n');
+    out
+}
+
+/// Saved-message resume block (`getCommitMessageFromUser()`, `:1362-1400`).
+///
+/// Skipped for `--verbatim`. A saved `create-message` scratch template
+/// prints the saved notice and confirms reuse (`[Y/n]`); a refusal
+/// deletes the scratch file. Returns the reused template, if any.
+pub fn resolve_saved_template<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    metadata_dir: &Path,
+    work_root: &Path,
+    verbatim: bool,
+) -> Result<Option<String>, String> {
+    if verbatim {
+        return Ok(None);
+    }
+    let Some(saved) = diff::read_scratch_file(metadata_dir, SCRATCH_CREATE_MESSAGE) else {
+        return Ok(None);
+    };
+    if saved.is_empty() {
+        return Ok(None);
+    }
+    let preview = truncate_preview_64(&saved);
+    let where_path =
+        diff::readable_scratch_file_path(metadata_dir, work_root, SCRATCH_CREATE_MESSAGE);
+    let notice = saved_message_notice(&where_path, &preview);
+    writer
+        .write_all(notice.as_bytes())
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    if diff::prompt_confirm_from(reader, writer, PROMPT_USE_SAVED_MESSAGE, false)? {
+        return Ok(Some(saved));
+    }
+    diff::remove_scratch_file(metadata_dir, SCRATCH_CREATE_MESSAGE);
+    Ok(None)
+}
+
+/// Refuse (after confirm) to update someone else's revision (`:2446-2467`).
+pub fn check_revision_ownership<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    revision: &serde_json::Value,
+    user_phid: &str,
+) -> Result<(), String> {
+    let author = revision
+        .get("authorPHID")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !diff_submit::needs_ownership_confirm(author, user_phid) {
+        return Ok(());
+    }
+    let id = revision
+        .get("id")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let title = revision
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let prompt = diff_submit::ownership_prompt(id, title);
+    if !diff::prompt_confirm_from(reader, writer, &prompt, true)? {
+        return Err(diff_submit::OWNERSHIP_ABORT.to_string());
+    }
+    Ok(())
+}
+
+/// `reviewerPHIDs` as a string list, else empty (`getFieldValue()`, `:1634`).
+fn message_reviewer_phids(message: &CommitMessage) -> Vec<&str> {
+    match message.get_field_value("reviewerPHIDs") {
+        Some(FieldValue::List(phids)) => phids.iter().map(String::as_str).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Filter `user.query` rows to the requested reviewers, in reviewer order
+/// (`array_select_keys()`, `:1641`).
+fn select_reviewer_users<'a>(
+    users: &'a serde_json::Value,
+    reviewers: &[&str],
+) -> Vec<&'a serde_json::Value> {
+    let mut out = Vec::new();
+    if let serde_json::Value::Object(map) = users {
+        for phid in reviewers {
+            if let Some(user) = map.get(*phid) {
+                out.push(user);
+            }
+        }
+    }
+    out
+}
+
+/// Away-reviewer block of `validateCommitMessage()` (`:1633-1712`).
+fn validate_reviewer_availability<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    call: &diff_submit::ConduitCall<'_>,
+    reviewers: &[&str],
+    away_offset: i64,
+) -> Result<(), String> {
+    if reviewers.is_empty() {
+        return Ok(());
+    }
+    let params = diff_submit::user_query_params(reviewers);
+    let users = call(diff_submit::METHOD_USER_QUERY, &params)?;
+    let selected: Vec<serde_json::Value> = select_reviewer_users(&users, reviewers)
+        .into_iter()
+        .cloned()
+        .collect();
+    let away = diff_submit::away_reviewers(&serde_json::Value::Array(selected));
+    let Some(block) =
+        diff_submit::away_reviewers_block_with_offset(&away, reviewers.len(), away_offset)
+    else {
+        return Ok(());
+    };
+    writer
+        .write_all(block.as_bytes())
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    if !diff::prompt_confirm_from(reader, writer, diff_submit::CONTINUE_DESPITE_AWAY, true)? {
+        return Err(diff_submit::SPECIFY_AVAILABLE_REVIEWERS.to_string());
+    }
+    Ok(())
+}
+
+/// Validate a message against Conduit (`validateCommitMessage()`, `:1620-1649`).
+///
+/// With a `Differential Revision:` field, `differential.query` must find
+/// the row (else `There is no revision D{id}.`), then the ownership
+/// check runs. `reviewerPHIDs` fields trigger the away-reviewer block.
+pub fn validate_commit_message<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    call: &diff_submit::ConduitCall<'_>,
+    message: &CommitMessage,
+    user_phid: &str,
+    away_offset: i64,
+) -> Result<(), String> {
+    if let Some(id) = message.revision_id {
+        let id_arg = i64::try_from(id).unwrap_or(i64::MAX);
+        let params = diff_submit::differential_query_params(&[id_arg]);
+        let result = call(diff_submit::METHOD_QUERY, &params)?;
+        let row = result.as_array().and_then(|rows| rows.first());
+        match row {
+            Some(row) => check_revision_ownership(reader, writer, row, user_phid)?,
+            None => return Err(diff_submit::missing_revision_message(id_arg)),
+        }
+    }
+    let reviewers = message_reviewer_phids(message);
+    validate_reviewer_availability(reader, writer, call, &reviewers, away_offset)
+}
+
+/// Commit hook: message text to outcome (`doCommit()`/`amendCommit()`).
+pub type MessageHook<'a> = &'a dyn Fn(&str) -> Result<(), String>;
+/// Add-to-commit hook: paths to outcome (`addToCommit()`).
+pub type PathsHook<'a> = &'a dyn Fn(&[String]) -> Result<(), String>;
+
+/// Seams plus context for the create-message edit loop.
+pub struct CreateMessageEditor<'a, R: BufRead, W: Write> {
+    /// Prompt input.
+    pub reader: &'a mut R,
+    /// Echo plus prompt output.
+    pub writer: &'a mut W,
+    /// Conduit caller.
+    pub call: &'a diff_submit::ConduitCall<'a>,
+    /// VCS metadata dir (scratch files).
+    pub metadata_dir: &'a Path,
+    /// Work root (readable scratch paths).
+    pub work_root: &'a Path,
+    /// Interactive editor: template text to edited text.
+    pub edit: &'a dyn Fn(&str) -> Result<String, String>,
+    /// Amend hook when a single worktree commit absorbs the message
+    /// (`shouldAmend()`); `None` saves to scratch instead.
+    pub amend_commit: Option<MessageHook<'a>>,
+    /// Viewer PHID (ownership checks).
+    pub user_phid: &'a str,
+    /// Server-tz offset seconds (away-reviewer dates).
+    pub away_offset: i64,
+}
+
+/// One parse/validate attempt inside the loop.
+enum AttemptError {
+    /// Conduit parser errors: re-editable.
+    Parser(Vec<String>),
+    /// Anything else: fatal after the saved-copy note.
+    Other(String),
+}
+
+/// Parse, pull, and validate one draft (`:1516-1522`).
+fn attempt_message<R: BufRead, W: Write>(
+    editor: &mut CreateMessageEditor<'_, R, W>,
+    template: &str,
+) -> Result<CommitMessage, AttemptError> {
+    let mut message = CommitMessage::new_from_raw_corpus(template).map_err(AttemptError::Other)?;
+    message
+        .pull_data_from_conduit(editor.call, false)
+        .map_err(|error| match error {
+            PullDataError::Parser(errors) => AttemptError::Parser(errors),
+            PullDataError::Other(text) => AttemptError::Other(text),
+        })?;
+    validate_commit_message(
+        &mut *editor.reader,
+        &mut *editor.writer,
+        editor.call,
+        &message,
+        editor.user_phid,
+        editor.away_offset,
+    )
+    .map_err(AttemptError::Other)?;
+    Ok(message)
+}
+
+/// Unresolved-errors abort (`:1541-1544`): with a saved copy the suffix
+/// names it, else PHP's `" ...errors." . " "` trailing space survives.
+#[must_use]
+pub fn unresolved_errors_error(saved_where: Option<&str>) -> String {
+    match saved_where {
+        Some(where_path) => format!(
+            "{} {}",
+            MESSAGE_HAS_UNRESOLVED_ERRORS,
+            copy_saved_to(where_path)
+        ),
+        None => format!("{MESSAGE_HAS_UNRESOLVED_ERRORS} "),
+    }
+}
+
+/// Echo parser errors and confirm re-editing (`:1524-1540`).
+///
+/// Returns the next-round issues on re-edit, or the abort error on refusal.
+fn confirm_message_reedit<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    errors: &[String],
+    saved_where: Option<&str>,
+) -> Result<Vec<String>, String> {
+    writer
+        .write_all(format!("{COMMIT_MESSAGE_HAS_ERRORS}\n\n").as_bytes())
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    let mut issues = vec![RESOLVE_THESE_ERRORS.to_string()];
+    for error in errors {
+        let line = diff::console_wrap(&format!("- {error}\n"), 6, true);
+        writer
+            .write_all(line.as_bytes())
+            .map_err(|error| format!("failed to write prompt: {error}"))?;
+        issues.push(format!("  - {error}"));
+    }
+    writer
+        .write_all(b"\n")
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    writer
+        .write_all(MUST_RESOLVE_ERRORS.as_bytes())
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    if !diff::prompt_confirm_from(reader, writer, PROMPT_EDIT_MESSAGE_AGAIN, false)? {
+        return Err(unresolved_errors_error(saved_where));
+    }
+    Ok(issues)
+}
+
+/// Amend-or-scratch the draft (`:1502-1514`).
+///
+/// Returns `(wrote, where)`: `where` is `None` only when amending left
+/// the message unchanged.
+fn save_message_draft<R: BufRead, W: Write>(
+    editor: &CreateMessageEditor<'_, R, W>,
+    old_message: &str,
+    template: &str,
+) -> Result<(bool, Option<String>), String> {
+    if let Some(amend) = editor.amend_commit {
+        let wrote = old_message.trim_end_matches(PHP_TRIM_CHARS)
+            != template.trim_end_matches(PHP_TRIM_CHARS);
+        if wrote {
+            amend(template)?;
+            return Ok((true, Some(WHERE_COMMIT_MESSAGE.to_string())));
+        }
+        return Ok((false, None));
+    }
+    let wrote = diff::write_scratch_file(editor.metadata_dir, SCRATCH_CREATE_MESSAGE, template);
+    let where_path = format!(
+        "'{}'",
+        diff::readable_scratch_file_path(
+            editor.metadata_dir,
+            editor.work_root,
+            SCRATCH_CREATE_MESSAGE
+        )
+    );
+    Ok((wrote, Some(where_path)))
+}
+
+/// Echo the saved-copy note for a fatal loop error (`:1546-1550`).
+fn echo_saved_copy_note<W: Write>(writer: &mut W, where_path: &str) -> Result<(), String> {
+    let note = diff::console_wrap(&format!("{}\n", message_saved_to(where_path)), 0, true);
+    writer
+        .write_all(note.as_bytes())
+        .map_err(|error| format!("failed to write prompt: {error}"))
+}
+
+/// Interactively build a create message (`getCommitMessageFromUser()`,
+/// `:1359-1559`).
+///
+/// `template`/`old_message` are the starting and pre-edit templates,
+/// `issues` the first-round `#` comments, `template_is_default` whether
+/// the template came from the server default, and `verbatim` the flag
+/// (skips the editor on the first pass for non-default templates).
+/// Returns the parsed, pulled, validated message.
+pub fn edit_create_message<R: BufRead, W: Write>(
+    editor: &mut CreateMessageEditor<'_, R, W>,
+    template: &str,
+    old_message: &str,
+    template_is_default: bool,
+    verbatim: bool,
+    issues: &[String],
+) -> Result<CommitMessage, String> {
+    let mut template = template.to_string();
+    let mut issues = issues.to_vec();
+    let mut first = true;
+    loop {
+        let edit_text = build_editor_template(&template, &issues);
+        let new_template = if first && verbatim && !template_is_default {
+            template.clone()
+        } else {
+            let edited = (editor.edit)(&edit_text)?;
+            let stripped = remove_comments(&edited);
+            if template_is_default && stripped == template {
+                return Err(TEMPLATE_NOT_EDITED.to_string());
+            }
+            stripped
+        };
+        first = false;
+        template = new_template;
+        let (wrote, where_path) = save_message_draft(editor, old_message, &template)?;
+        match attempt_message(editor, &template) {
+            Ok(message) => return Ok(message),
+            Err(AttemptError::Parser(errors)) => {
+                issues = confirm_message_reedit(
+                    &mut *editor.reader,
+                    &mut *editor.writer,
+                    &errors,
+                    where_path.as_deref(),
+                )?;
+            }
+            Err(AttemptError::Other(error)) => {
+                if wrote && let Some(where_path) = where_path {
+                    echo_saved_copy_note(&mut *editor.writer, &where_path)?;
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+/// Twelve-char hash prefix (`substr($commit, 0, 12)`, `:1853-1855`).
+fn short_commit_hash(hash: &str) -> String {
+    hash.chars().take(12).collect()
+}
+
+/// One default-field message outcome.
+enum CreateFieldOutcome {
+    /// Pulled fields.
+    Fields(CommitFields),
+    /// Parse-failure note lines.
+    Notes(Vec<String>),
+}
+
+/// Parse one message for default fields (`:1874-1886`).
+///
+/// Usage errors from the corpus parser and transport failures propagate;
+/// conduit parser errors become note lines (verbatim rethrows the first).
+fn parse_create_message_fields(
+    call: &diff_submit::ConduitCall<'_>,
+    hash: &str,
+    message: &str,
+    verbatim: bool,
+) -> Result<CreateFieldOutcome, String> {
+    let mut parsed = CommitMessage::new_from_raw_corpus(message)?;
+    match parsed.pull_data_from_conduit(call, true) {
+        Ok(()) => Ok(CreateFieldOutcome::Fields(parsed.fields)),
+        Err(PullDataError::Parser(errors)) => {
+            if verbatim {
+                return Err(errors.into_iter().next().unwrap_or_default());
+            }
+            let mut notes = vec![commit_parse_note(&short_commit_hash(hash))];
+            notes.extend(errors.iter().map(|error| format!("  - {error}")));
+            Ok(CreateFieldOutcome::Notes(notes))
+        }
+        Err(PullDataError::Other(error)) => Err(error),
+    }
+}
+
+/// Default create fields from local commits (`getDefaultCreateFields()`,
+/// `:1770-1848`).
+///
+/// `local` is newest-first (as returned); `reviewers`/`cc` build the faux
+/// flag message. Returns merged fields, `Included commits` lines
+/// (newest-first, faux first), and parse notes.
+/// `getDependsOnRevisionRef()` always returns null in PHP (`:1993-1996`
+/// TODO), so no dependency line is emitted. The
+/// `TYPE_DIFF_WILLBUILDMESSAGE` event (`:2431-2444`) has no port: there
+/// are no extensions to dispatch to.
+pub fn get_default_create_fields_with(
+    call: &diff_submit::ConduitCall<'_>,
+    local: &[LocalCommitInfo],
+    create: bool,
+    reviewers: Option<&str>,
+    cc: Option<&str>,
+    verbatim: bool,
+) -> Result<(CommitFields, Vec<String>, Vec<String>), String> {
+    let mut messages: Vec<(String, String, String)> = Vec::new();
+    if let Some(faux) = faux_flag_message(reviewers, cc) {
+        messages.push((
+            FLAGS_COMMIT_HASH.to_string(),
+            faux,
+            "Command-Line Flags".to_string(),
+        ));
+    }
+    for info in local {
+        messages.push((
+            info.commit.clone(),
+            info.message.clone(),
+            info.summary.clone(),
+        ));
+    }
+    let mut included = Vec::new();
+    for (hash, _, summary) in &messages {
+        included.push(included_commit_line(hash, summary));
+    }
+    messages.reverse();
+    let mut dicts = Vec::new();
+    let mut notes = Vec::new();
+    for (hash, message, _) in &messages {
+        match parse_create_message_fields(call, hash, message, verbatim)? {
+            CreateFieldOutcome::Fields(dict) => dicts.push(dict),
+            CreateFieldOutcome::Notes(mut lines) => notes.append(&mut lines),
+        }
+    }
+    let mut fields = merge_fields_oldest_first(&dicts);
+    if create {
+        fields.remove(FIELD_REVISION_ID);
+    }
+    Ok((fields, included, notes))
+}
+
+/// Failure to fetch the `--update` template (`:1606-1610`).
+pub const FAILED_TO_RETRIEVE_TEMPLATE: &str =
+    "Failed to retrieve commit message template from server.";
+
+/// Message from `--message-file` (`getCommitMessageFromFile()`, `:1561-1575`).
+pub fn get_commit_message_from_file_with<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    call: &diff_submit::ConduitCall<'_>,
+    path: &Path,
+    user_phid: &str,
+    away_offset: i64,
+) -> Result<CommitMessage, String> {
+    let mut message = commit_message_from_file(path)?;
+    message
+        .pull_data_from_conduit(call, false)
+        .map_err(PullDataError::into_message)?;
+    validate_commit_message(reader, writer, call, &message, user_phid, away_offset)?;
+    Ok(message)
+}
+
+/// Message from `--update` (`getCommitMessageFromRevision()`, `:1577-1618`).
+///
+/// Returns the message plus whether the revision is a draft. Unlike the
+/// create paths, PHP never validates here (no away-reviewer block).
+pub fn get_commit_message_from_revision_with<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    call: &diff_submit::ConduitCall<'_>,
+    revision_id: &str,
+    user_phid: &str,
+) -> Result<(CommitMessage, bool), String> {
+    let id_arg = i64::try_from(parse_update_revision_id(revision_id)?).unwrap_or(i64::MAX);
+    let params = diff_submit::differential_query_params(&[id_arg]);
+    let result = call(diff_submit::METHOD_QUERY, &params)?;
+    let row = result
+        .as_array()
+        .and_then(|rows| rows.first())
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if row.is_null() {
+        return Err(diff_submit::unknown_revision_message(revision_id));
+    }
+    check_revision_ownership(reader, writer, &row, user_phid)?;
+    let is_draft = row.get("statusName").and_then(serde_json::Value::as_str) == Some("Draft");
+    let params = diff_submit::get_commit_message_edit_params(id_arg);
+    let template = call(diff_submit::METHOD_GET_COMMIT_MESSAGE, &params)?;
+    let Some(corpus) = template.as_str() else {
+        return Err(FAILED_TO_RETRIEVE_TEMPLATE.to_string());
+    };
+    let mut message = CommitMessage::new_from_raw_corpus(corpus)?;
+    message
+        .pull_data_from_conduit(call, false)
+        .map_err(PullDataError::into_message)?;
+    Ok((message, is_draft))
+}
+
+/// Resolved `buildCommitMessage()` source (`:1292-1357`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageSource {
+    /// `--only` or raw: no message.
+    None,
+    /// `--create --message-file`: from file.
+    CreateFromFile(String),
+    /// Create (or `--verbatim`): interactive editor.
+    CreateFromUser,
+    /// `--update`: from revision (numeric id).
+    UpdateFromRevision(u64),
+}
+
+/// Dispatch `buildCommitMessage()` (`:1292-1357`).
+///
+/// `loaded` carries the working-copy revision lookup (id, title) when the
+/// caller ran it; it is required unless `only`, raw, `create`, or
+/// `update` short-circuits. Zero revisions create; one updates; several
+/// fail. The lookup itself (`loadWorkingCopyDifferentialRevisions()`)
+/// is caller-provided: per-VCS discovery plus Conduit.
+pub fn resolve_message_source(
+    only: bool,
+    verbatim: bool,
+    create: bool,
+    update: Option<&str>,
+    message_file: Option<&str>,
+    is_raw: bool,
+    loaded: Option<&[(i64, String)]>,
+) -> Result<MessageSource, String> {
+    if only || is_raw {
+        return Ok(MessageSource::None);
+    }
+    if verbatim {
+        return Ok(MessageSource::CreateFromUser);
+    }
+    if !create && update.is_none() {
+        let revisions = loaded.unwrap_or(&[]);
+        if revisions.is_empty() {
+            return Ok(MessageSource::CreateFromUser);
+        }
+        if revisions.len() > 1 {
+            let list: Vec<(i64, &str)> = revisions
+                .iter()
+                .map(|(id, title)| (*id, title.as_str()))
+                .collect();
+            return Err(diff_submit::several_revisions_error(
+                &diff_submit::render_revision_list(&list),
+            ));
+        }
+        return Ok(MessageSource::UpdateFromRevision(
+            u64::try_from(revisions[0].0).unwrap_or(0),
+        ));
+    }
+    if create {
+        if let Some(file) = message_file {
+            return Ok(MessageSource::CreateFromFile(file.to_string()));
+        }
+        return Ok(MessageSource::CreateFromUser);
+    }
+    match update {
+        Some(id) => Ok(MessageSource::UpdateFromRevision(parse_update_revision_id(
+            id,
+        )?)),
+        // Unreachable: `!create && update.is_none()` returned above.
+        None => Ok(MessageSource::CreateFromUser),
+    }
+}
+
+/* -(  Clean working-copy check (D3)  )--------------------------------------- */
+
+/// Commit-mode state machine (`COMMIT_DISABLE/ENABLE/ALLOW`,
+/// `src/workflow/ArcanistWorkflow.php`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitMode {
+    /// `--uncommitted`: never offer to commit.
+    Disable,
+    /// `--add-all`: always commit without asking.
+    Enable,
+    /// Neither flag: prompt.
+    Allow,
+}
+
+/// Commit-mode selection (`runDiffSetupBasics()`,
+/// `src/workflow/ArcanistDiffWorkflow.php:608-614`).
+#[must_use]
+pub fn resolve_commit_mode(add_all: bool, uncommitted: bool) -> CommitMode {
+    if add_all {
+        CommitMode::Enable
+    } else if uncommitted {
+        CommitMode::Disable
+    } else {
+        CommitMode::Allow
+    }
+}
+
+/// Working-copy change lists: mask-filtered status
+/// (`getUncommittedStatus()` plus the `get*Changes()` getters,
+/// `src/repository/api/ArcanistRepositoryAPI.php:380-440`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkingCopyChanges {
+    /// `FLAG_INCOMPLETE` paths (svn only).
+    pub incomplete: Vec<String>,
+    /// `FLAG_CONFLICT` paths.
+    pub conflicts: Vec<String>,
+    /// `FLAG_MISSING` paths.
+    pub missing: Vec<String>,
+    /// `FLAG_EXTERNALS` paths.
+    pub externals: Vec<String>,
+    /// `FLAG_UNCOMMITTED` paths.
+    pub uncommitted: Vec<String>,
+    /// `FLAG_UNSTAGED` paths.
+    pub unstaged: Vec<String>,
+    /// `FLAG_UNTRACKED` paths.
+    pub untracked: Vec<String>,
+}
+
+/// Mask-filter one status map into change lists.
+///
+/// PHP `ksort()`s the status first; `BTreeMap` iteration is already
+/// sorted. Masks arrive as
+/// `[incomplete, conflict, missing, externals, uncommitted, unstaged, untracked]`.
+fn changes_from_status(status: &BTreeMap<String, u32>, masks: [u32; 7]) -> WorkingCopyChanges {
+    let mut out = WorkingCopyChanges::default();
+    for (path, mask) in status {
+        if mask & masks[0] != 0 {
+            out.incomplete.push(path.clone());
+        }
+        if mask & masks[1] != 0 {
+            out.conflicts.push(path.clone());
+        }
+        if mask & masks[2] != 0 {
+            out.missing.push(path.clone());
+        }
+        if mask & masks[3] != 0 {
+            out.externals.push(path.clone());
+        }
+        if mask & masks[4] != 0 {
+            out.uncommitted.push(path.clone());
+        }
+        if mask & masks[5] != 0 {
+            out.unstaged.push(path.clone());
+        }
+        if mask & masks[6] != 0 {
+            out.untracked.push(path.clone());
+        }
+    }
+    out
+}
+
+/// Git change lists from `git::uncommitted_status()`.
+#[must_use]
+pub fn git_working_copy_changes(status: &BTreeMap<String, u32>) -> WorkingCopyChanges {
+    changes_from_status(
+        status,
+        [
+            git::FLAG_INCOMPLETE,
+            git::FLAG_CONFLICT,
+            git::FLAG_MISSING,
+            git::FLAG_EXTERNALS,
+            git::FLAG_UNCOMMITTED,
+            git::FLAG_UNSTAGED,
+            git::FLAG_UNTRACKED,
+        ],
+    )
+}
+
+/// Mercurial change lists from `hg::get_uncommitted_status_with()`.
+#[must_use]
+pub fn hg_working_copy_changes(status: &BTreeMap<String, u32>) -> WorkingCopyChanges {
+    changes_from_status(
+        status,
+        [
+            hg::FLAG_INCOMPLETE,
+            hg::FLAG_CONFLICT,
+            hg::FLAG_MISSING,
+            hg::FLAG_EXTERNALS,
+            hg::FLAG_UNCOMMITTED,
+            hg::FLAG_UNSTAGED,
+            hg::FLAG_UNTRACKED,
+        ],
+    )
+}
+
+/// Subversion change lists from `svn::get_svn_status_with()`.
+#[must_use]
+pub fn svn_working_copy_changes(status: &BTreeMap<String, u32>) -> WorkingCopyChanges {
+    changes_from_status(
+        status,
+        [
+            svn::FLAG_INCOMPLETE,
+            svn::FLAG_CONFLICT,
+            svn::FLAG_MISSING,
+            svn::FLAG_EXTERNALS,
+            svn::FLAG_UNCOMMITTED,
+            svn::FLAG_UNSTAGED,
+            svn::FLAG_UNTRACKED,
+        ],
+    )
+}
+
+/// `Working copy:` description line (`:1025-1029`).
+///
+/// PHP wraps the path in `__...__` console markup (underline when
+/// colorized, stripped otherwise); the port never colorizes, so the
+/// plain shape renders.
+#[must_use]
+pub fn working_copy_desc(work_path: &str) -> String {
+    format!("  Working copy: {work_path}\n\n")
+}
+
+/// Incomplete-checkout error (`:1032-1048`).
+///
+/// The stray apostrophe in `proceeding.'` is upstream verbatim.
+#[must_use]
+pub fn incomplete_checkout_error(desc: &str, incomplete: &[String]) -> String {
+    format!(
+        "{}\n\n{}  {}\n    {}\n\n{}",
+        "You have incompletely checked out directories in this working copy. Fix them before \
+         proceeding.'",
+        desc,
+        "Incomplete directories in working copy:",
+        incomplete.join("\n    "),
+        "You can fix these paths by running 'svn update' on them."
+    )
+}
+
+/// Merge-conflict error (`:1050-1062`).
+#[must_use]
+pub fn merge_conflicts_error(desc: &str, conflicts: &[String]) -> String {
+    format!(
+        "{}\n\n{}  {}\n    {}",
+        "You have merge conflicts in this working copy. Resolve merge conflicts before proceeding.",
+        desc,
+        "Conflicts in working copy:",
+        conflicts.join("\n    ")
+    )
+}
+
+/// Missing-files error (`:1064-1078`): note the trailing newline.
+#[must_use]
+pub fn missing_files_error(desc: &str, missing: &[String]) -> String {
+    format!(
+        "{}\n\n{}  {}\n    {}\n",
+        "You have missing files in this working copy. Revert or formally remove them (with `svn \
+         rm`) before proceeding.",
+        desc,
+        "Missing files in working copy:",
+        missing.join("\n    ")
+    )
+}
+
+/// Thousands-grouped count (`PhutilNumber` via `formatNumber()`,
+/// `src/internationalization/PhutilTranslator.php:249-256`).
+#[must_use]
+pub fn format_count(count: usize) -> String {
+    let digits = count.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, byte) in digits.bytes().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(byte as char);
+    }
+    out
+}
+
+/// Dirty-externals notice block (`:1088-1103`): paragraph plus one
+/// 6-space-indented item per path (`PhutilConsoleBlock`/`PhutilConsoleList`).
+#[must_use]
+pub fn dirty_externals_block(externals: &[String]) -> String {
+    let mut out = format!(
+        "{} submodule(s) have uncommitted or untracked changes:\n\n",
+        format_count(externals.len())
+    );
+    for external in externals {
+        out.push_str(&format!("      {external}\n"));
+    }
+    out
+}
+
+/// Prompt to ignore dirty externals (`:1090-1094`, default yes).
+#[must_use]
+pub fn ignore_externals_prompt(count: usize) -> String {
+    format!(
+        "Ignore the changes to these {} submodule(s) and continue?",
+        format_count(count)
+    )
+}
+
+/// Untracked-files lead (`:1123-1126`).
+pub const UNTRACKED_FILES_HERE: &str = "You have untracked files in this working copy.";
+/// Untracked-files list header (`:1149`).
+pub const UNTRACKED_CHANGES_IN: &str = "Untracked changes in working copy:";
+/// Unstaged-files list header (`:1177`).
+pub const UNSTAGED_CHANGES_IN: &str = "Unstaged changes in working copy:";
+/// Uncommitted-files list header (`:1185`).
+pub const UNCOMMITTED_CHANGES_IN: &str = "Uncommitted changes in working copy:";
+/// Uncommitted-changes lead (`:1168-1170`).
+pub const UNCOMMITTED_CHANGES_HERE: &str = "You have uncommitted changes in this working copy.";
+
+/// Ignore hint naming the per-VCS ignore file (`:1129-1143`).
+#[must_use]
+pub fn untracked_hint(kind: diff::VcsKind, count: usize) -> String {
+    let file = match kind {
+        diff::VcsKind::Git => ".git/info/exclude",
+        diff::VcsKind::Svn => "svn:ignore",
+        diff::VcsKind::Hg => ".hgignore",
+    };
+    format!(
+        "(To ignore these {} change(s), add them to \"{file}\".)",
+        format_count(count)
+    )
+}
+
+/// Untracked-files list echo (`:1147-1151`).
+#[must_use]
+pub fn untracked_list_echo(hint: &str, untracked: &[String]) -> String {
+    format!(
+        "  {}\n  {}\n    {}",
+        UNTRACKED_CHANGES_IN,
+        hint,
+        untracked.join("\n    ")
+    )
+}
+
+/// Prompt to ignore untracked files (`:1153-1157`, default no).
+#[must_use]
+pub fn ignore_untracked_prompt(count: usize) -> String {
+    format!(
+        "Ignore these {} untracked file(s) and continue?",
+        format_count(count)
+    )
+}
+
+/// Unstaged list echo: the header carries two leading spaces (`:1175-1180`).
+#[must_use]
+pub fn unstaged_list_echo(unstaged: &[String]) -> String {
+    format!("  {}\n    {}", UNSTAGED_CHANGES_IN, unstaged.join("\n    "))
+}
+
+/// Uncommitted list echo: no header indent (`:1183-1188`).
+#[must_use]
+pub fn uncommitted_list_echo(uncommitted: &[String]) -> String {
+    format!(
+        "{}\n    {}",
+        UNCOMMITTED_CHANGES_IN,
+        uncommitted.join("\n    ")
+    )
+}
+
+/// Prompt to amend the current commit (`:1350-1354`, default no).
+#[must_use]
+pub fn amend_changes_prompt(count: usize) -> String {
+    format!(
+        "Do you want to amend these {} change(s) to the current commit?",
+        format_count(count)
+    )
+}
+
+/// Prompt to create a new commit (`:1355-1359`, default no).
+#[must_use]
+pub fn create_commit_prompt(count: usize) -> String {
+    format!(
+        "Do you want to create a new commit with these {} change(s)?",
+        format_count(count)
+    )
+}
+
+/// Refusal to continue with uncommitted changes (`:1209-1213`).
+pub const CANNOT_CONTINUE_UNCOMMITTED: &str =
+    "You can not continue with uncommitted changes. Commit or discard them before proceeding.";
+/// Autostash notice (`:1202-1205`).
+pub const STASHING_UNCOMMITTED: &str =
+    "Stashing uncommitted changes. (You can restore them with `git stash pop`).";
+/// Empty commit-template error (`:1246-1249`).
+pub const MUST_PROVIDE_MESSAGE: &str = "You must provide a commit message.";
+/// Empty commit-message error (`:1255-1258`, dead in PHP: comment removal
+/// always leaves the trailing newline, so the length is never zero).
+pub const MUST_PROVIDE_NONEMPTY_MESSAGE: &str = "You must provide a nonempty commit message.";
+/// Commit-template editor name (`:1236`).
+pub const NAME_COMMIT_MESSAGE: &str = "commit-message";
+/// Commit-template editor task (`:1237-1240`).
+pub const TASK_SUPPLY_COMMIT_MESSAGE: &str =
+    "Supply commit message for uncommitted changes, then save and exit.";
+
+/// Commit-message editor template (`:1224-1233`): sorted unique paths.
+#[must_use]
+pub fn commit_editor_template(paths: &[String]) -> String {
+    let mut sorted: Vec<&str> = paths.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut out = "\n\n# Enter a commit message.\n#\n# Changes:\n#\n".to_string();
+    for path in sorted {
+        out.push_str(&format!("#     {path}\n"));
+    }
+    out
+}
+
+/// Commit-mode prompt decision (`askForAdd()`, `:1330-1344`).
+pub fn ask_for_add<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    mode: CommitMode,
+    should_amend: bool,
+    files: &[String],
+) -> Result<bool, String> {
+    match mode {
+        CommitMode::Disable => Ok(false),
+        CommitMode::Enable => Ok(true),
+        CommitMode::Allow => {
+            let prompt = if should_amend {
+                amend_changes_prompt(files.len())
+            } else {
+                create_commit_prompt(files.len())
+            };
+            Ok(diff::prompt_confirm_from(reader, writer, &prompt, true)?)
+        }
+    }
+}
+
+/// VCS hooks for the clean check.
+pub struct CleanCheckVcs<'a> {
+    /// Working-copy kind (svn zeroes the externals list, `:1083-1086`).
+    pub kind: diff::VcsKind,
+    /// `getPath()` for the `Working copy:` description.
+    pub work_path: String,
+    /// `supportsLocalCommits()`.
+    pub supports_local_commits: bool,
+    /// `canStashChanges()`.
+    pub can_stash: bool,
+    /// `arc.autostash` configuration.
+    pub autostash: bool,
+    /// `shouldRequireCleanUntrackedFiles()` (false under
+    /// `--allow-untracked`).
+    pub require_clean_untracked: bool,
+    /// Precomputed `getShouldAmend()`.
+    pub should_amend: bool,
+    /// Head local-commit message, when amending may apply.
+    pub head_commit_message: Option<String>,
+    /// `addToCommit()`.
+    pub add_to_commit: Option<PathsHook<'a>>,
+    /// `stashChanges()`.
+    pub stash_changes: Option<&'a dyn Fn() -> Result<(), String>>,
+    /// `doCommit()`.
+    pub do_commit: Option<MessageHook<'a>>,
+    /// `amendCommit()`.
+    pub amend_commit: Option<MessageHook<'a>>,
+    /// Commit-message editor: template text to edited text.
+    pub edit: &'a dyn Fn(&str) -> Result<String, String>,
+}
+
+/// Clean-check outcome: whether the flow stashed (`$this->stashed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CleanCheckOutcome {
+    /// True after autostashing.
+    pub stashed: bool,
+}
+
+/// Order-preserving difference (`array_diff()`, `:1113-1115`).
+fn without_paths(paths: &[String], remove: &[&[String]]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|path| !remove.iter().any(|list| list.contains(path)))
+        .cloned()
+        .collect()
+}
+
+/// Dirty-externals gate (`:1080-1107`).
+fn check_dirty_externals<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    kind: diff::VcsKind,
+    externals: &[String],
+) -> Result<(), String> {
+    let mut externals = externals.to_vec();
+    if kind == diff::VcsKind::Svn {
+        externals.clear();
+    }
+    if externals.is_empty() {
+        return Ok(());
+    }
+    let block = dirty_externals_block(&externals);
+    writer
+        .write_all(block.as_bytes())
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    if !diff::prompt_confirm_from(
+        reader,
+        writer,
+        &ignore_externals_prompt(externals.len()),
+        false,
+    )? {
+        return Err(USER_ABORT.to_string());
+    }
+    Ok(())
+}
+
+/// Untracked-files gate (`:1117-1159`).
+fn check_untracked_files<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    vcs: &CleanCheckVcs<'_>,
+    desc: &str,
+    untracked: &[String],
+) -> Result<(), String> {
+    if untracked.is_empty() || !vcs.require_clean_untracked {
+        return Ok(());
+    }
+    let echo = format!("{UNTRACKED_FILES_HERE}\n\n{desc}");
+    writer
+        .write_all(echo.as_bytes())
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    let hint = untracked_hint(vcs.kind, untracked.len());
+    let list = untracked_list_echo(&hint, untracked);
+    writer
+        .write_all(list.as_bytes())
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    if !diff::prompt_confirm_from(
+        reader,
+        writer,
+        &ignore_untracked_prompt(untracked.len()),
+        true,
+    )? {
+        return Err(USER_ABORT.to_string());
+    }
+    Ok(())
+}
+
+/// Uncommitted-changes gate (`:1162-1215`).
+///
+/// Returns whether the flow should commit.
+fn check_uncommitted_changes<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    vcs: &CleanCheckVcs<'_>,
+    desc: &str,
+    unstaged: &[String],
+    uncommitted: &[String],
+    mode: CommitMode,
+) -> Result<bool, String> {
+    if unstaged.is_empty() && uncommitted.is_empty() {
+        return Ok(false);
+    }
+    let echo = format!("{UNCOMMITTED_CHANGES_HERE}\n\n{desc}");
+    writer
+        .write_all(echo.as_bytes())
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    let mut lists = Vec::new();
+    if !unstaged.is_empty() {
+        lists.push(unstaged_list_echo(unstaged));
+    }
+    if !uncommitted.is_empty() {
+        lists.push(uncommitted_list_echo(uncommitted));
+    }
+    writer
+        .write_all(format!("{}\n", lists.join("\n\n")).as_bytes())
+        .map_err(|error| format!("failed to write prompt: {error}"))?;
+    let mut all = unstaged.to_vec();
+    all.extend(uncommitted.iter().cloned());
+    if ask_for_add(reader, writer, mode, vcs.should_amend, &all)? {
+        if !unstaged.is_empty()
+            && let Some(add) = vcs.add_to_commit
+        {
+            add(unstaged)?;
+        }
+        return Ok(true);
+    }
+    if vcs.autostash
+        && vcs.can_stash
+        && let Some(stash) = vcs.stash_changes
+    {
+        writer
+            .write_all(format!("{STASHING_UNCOMMITTED}\n").as_bytes())
+            .map_err(|error| format!("failed to write prompt: {error}"))?;
+        stash()?;
+        return Ok(false);
+    }
+    if vcs.autostash && vcs.can_stash {
+        return Ok(false);
+    }
+    Err(CANNOT_CONTINUE_UNCOMMITTED.to_string())
+}
+
+/// Commit-or-amend UX (`:1217-1261`).
+fn commit_clean_check_changes(
+    vcs: &CleanCheckVcs<'_>,
+    unstaged: &[String],
+    uncommitted: &[String],
+) -> Result<(), String> {
+    if vcs.should_amend {
+        let Some(head) = vcs.head_commit_message.clone() else {
+            return Err("cannot amend without a local commit".to_string());
+        };
+        if let Some(amend) = vcs.amend_commit {
+            amend(&head)?;
+        }
+        return Ok(());
+    }
+    if !vcs.supports_local_commits {
+        return Ok(());
+    }
+    let mut paths = uncommitted.to_vec();
+    paths.extend(unstaged.iter().cloned());
+    let template = commit_editor_template(&paths);
+    let edited = (vcs.edit)(&template)?;
+    if edited == template {
+        return Err(MUST_PROVIDE_MESSAGE.to_string());
+    }
+    let message = remove_comments(&edited);
+    if message.is_empty() {
+        return Err(MUST_PROVIDE_NONEMPTY_MESSAGE.to_string());
+    }
+    if let Some(commit) = vcs.do_commit {
+        commit(&message)?;
+    }
+    Ok(())
+}
+
+/// Require a clean working copy (`requireCleanWorkingCopy()`,
+/// `src/workflow/ArcanistWorkflow.php:1014-1262`).
+///
+/// Runs the fatal gates (incomplete, conflicts, missing), the
+/// externals/untracked confirms, the commit-or-stash decision, and the
+/// commit/amend UX. VCS state arrives precomputed in `changes`; effects
+/// run through `vcs` hooks.
+pub fn require_clean_working_copy<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    vcs: &CleanCheckVcs<'_>,
+    changes: &WorkingCopyChanges,
+    mode: CommitMode,
+) -> Result<CleanCheckOutcome, String> {
+    let desc = working_copy_desc(&vcs.work_path);
+    if !changes.incomplete.is_empty() {
+        return Err(incomplete_checkout_error(&desc, &changes.incomplete));
+    }
+    if !changes.conflicts.is_empty() {
+        return Err(merge_conflicts_error(&desc, &changes.conflicts));
+    }
+    if !changes.missing.is_empty() {
+        return Err(missing_files_error(&desc, &changes.missing));
+    }
+    check_dirty_externals(reader, writer, vcs.kind, &changes.externals)?;
+    let unstaged = without_paths(&changes.unstaged, &[&changes.externals]);
+    let uncommitted = without_paths(&changes.uncommitted, &[&unstaged, &changes.externals]);
+    check_untracked_files(reader, writer, vcs, &desc, &changes.untracked)?;
+    let should_commit =
+        check_uncommitted_changes(reader, writer, vcs, &desc, &unstaged, &uncommitted, mode)?;
+    // The gate stashes exactly when the lists are non-empty, no commit
+    // was requested, and autostashing applies (`$this->stashed`).
+    let stashed = !should_commit
+        && (!unstaged.is_empty() || !uncommitted.is_empty())
+        && vcs.autostash
+        && vcs.can_stash;
+    if should_commit {
+        commit_clean_check_changes(vcs, &unstaged, &uncommitted)?;
+    }
+    Ok(CleanCheckOutcome { stashed })
+}
+
+/// Project repository reference for the amend check (`id`, `callsign`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmendRepository {
+    /// Diffusion repository id.
+    pub id: i64,
+    /// Repository callsign, when set.
+    pub callsign: Option<String>,
+}
+
+/// Inputs for the amend decision (`calculateShouldAmend()`,
+/// `src/workflow/ArcanistWorkflow.php:1268-1330`).
+pub struct AmendCheck<'a> {
+    /// `history.immutable` configuration.
+    pub history_immutable: bool,
+    /// `supportsAmend()`.
+    pub supports_amend: bool,
+    /// Head local commit, newest first.
+    pub head: Option<LocalCommitInfo>,
+    /// `getAuthor()`.
+    pub api_author: &'a str,
+    /// `--create` was given.
+    pub create: bool,
+    /// Project repository (`loadProjectRepository()`), when known.
+    pub repository: Option<AmendRepository>,
+    /// Open working-copy revisions for the viewer
+    /// (`loadWorkingCopyDifferentialRevisions()`, `status-open`).
+    pub load_open_revisions: &'a dyn Fn() -> Result<Vec<(i64, String)>, String>,
+    /// Conduit caller (`diffusion.querycommits`).
+    pub call: &'a diff_submit::ConduitCall<'a>,
+}
+
+/// PHP truthiness for conduit values: null, false, 0, `""`, and empty
+/// arrays/objects are falsy.
+fn conduit_truthy(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(flag) => *flag,
+        serde_json::Value::Number(number) => {
+            number.as_i64().is_some_and(|n| n != 0) || number.as_f64().is_some_and(|n| n != 0.0)
+        }
+        serde_json::Value::String(text) => !text.is_empty() && text != "0",
+        serde_json::Value::Array(items) => !items.is_empty(),
+        serde_json::Value::Object(map) => !map.is_empty(),
+    }
+}
+
+/// Commit name for the published check (`:1304-1309`): old-style
+/// `r{callsign}{hash}` when a callsign exists, else `R{id}:{hash}`.
+#[must_use]
+pub fn amend_commit_name(repository: &AmendRepository, commit_hash: &str) -> String {
+    match &repository.callsign {
+        Some(callsign) => format!("r{callsign}{commit_hash}"),
+        None => format!("R{}:{commit_hash}", repository.id),
+    }
+}
+
+/// Decide whether uncommitted changes amend the head commit
+/// (`calculateShouldAmend()`, `:1268-1330`).
+pub fn calculate_should_amend(check: &AmendCheck) -> Result<bool, String> {
+    if check.history_immutable || !check.supports_amend {
+        return Ok(false);
+    }
+    let Some(head) = &check.head else {
+        return Ok(false);
+    };
+    let message = CommitMessage::new_from_raw_corpus(&head.message)?;
+    if message.git_svn_base_revision.is_some() {
+        return Ok(false);
+    }
+    if check.api_author != head.author {
+        return Ok(false);
+    }
+    if message.revision_id.is_some() && check.create {
+        return Ok(false);
+    }
+    if let Some(repository) = &check.repository {
+        let name = amend_commit_name(repository, &head.commit);
+        let params = diff_submit::diffusion_query_commits_params(&[name.as_str()]);
+        let result = (check.call)(diff_submit::METHOD_QUERY_COMMITS, &params)?;
+        let known = result
+            .get("identifierMap")
+            .and_then(|map| map.get(name.as_str()))
+            .unwrap_or(&serde_json::Value::Null);
+        if conduit_truthy(known) {
+            return Ok(false);
+        }
+    }
+    if message.revision_id.is_none() {
+        return Ok(true);
+    }
+    Ok(!(check.load_open_revisions)()?.is_empty())
 }
 
 #[cfg(test)]

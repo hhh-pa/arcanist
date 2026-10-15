@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use arc_rs::{land, land_checks};
+use arc_rs::{hg, land, land_checks};
 
 mod common;
 
@@ -189,6 +189,8 @@ fn preview_lists_commits_without_changing_anything() {
 #[test]
 fn lands_squash_onto_master() {
     let (repo, bare) = repo_with_origin("land-basic");
+    repo.git(&["fetch", "-q", "origin"]);
+    repo.git(&["branch", "--set-upstream-to=origin/master", "master"]);
 
     let out = run_engine(repo.path(), &[], &["y", "y"]).unwrap();
     assert!(
@@ -198,7 +200,9 @@ fn lands_squash_onto_master() {
     );
 
     assert_eq!(repo.git(&["symbolic-ref", "--short", "HEAD"]), "master");
-    // The squash lands on the remote; the local onto ref stays stale.
+    assert!(out.stderr.contains("** UPDATE **"), "{}", out.stderr);
+    assert!(out.stderr.contains("** CHECKOUT **"), "{}", out.stderr);
+    // The squash lands on the remote and updates the tracking local ref.
     let body = bare.git(&["log", "-1", "--format=%B", "refs/heads/master"]);
     assert!(body.contains("Land feature"), "unexpected message: {body}");
     assert!(
@@ -206,8 +210,11 @@ fn lands_squash_onto_master() {
         "missing commits: {body}"
     );
     assert_eq!(bare.git(&["rev-list", "--count", "refs/heads/master"]), "2");
-    assert_eq!(repo.git(&["rev-list", "--count", "master"]), "1");
-    assert!(!repo.path().join("a.txt").exists());
+    assert_eq!(repo.git(&["rev-list", "--count", "master"]), "2");
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+        "a\n"
+    );
     // Landed branches are pruned by default.
     assert!(repo.git(&["branch", "--list", "feature"]).is_empty());
 }
@@ -236,19 +243,47 @@ fn keep_branches_preserves_feature() {
         out.stderr
     );
     assert!(!repo.git(&["branch", "--list", "feature"]).is_empty());
+    assert!(out.stderr.contains("** RETURN **"), "{}", out.stderr);
 }
 
 #[test]
-fn dirty_tree_blocks_land_but_not_preview() {
+fn dirty_tree_stashes_and_restores() {
     let (repo, _bare) = repo_with_origin("dirty");
     repo.write("a.txt", "uncommitted\n");
 
-    let err = run_engine(repo.path(), &[], &["y", "y"]).unwrap_err();
-    assert!(err.contains("not clean"), "unexpected: {err}");
-    assert!(land::ensure_clean_tree(repo.path(), land::Vcs::Git).is_err());
-
     run_engine(repo.path(), &["--preview"], &[]).expect("preview allows dirt");
-    assert_eq!(repo.git(&["symbolic-ref", "--short", "HEAD"]), "feature");
+
+    // Accepting the stash prompt lands, then applies the stash back.
+    let out = run_engine(repo.path(), &[], &["y", "y"]).unwrap();
+    assert!(
+        out.stdout.contains("** UNCOMMITTED CHANGES **"),
+        "{}",
+        out.stdout
+    );
+    assert!(out.stderr.contains("** SAVE STASH **"), "{}", out.stderr);
+    // Nothing tracks the pushed ref, so the stash applies onto the detached
+    // landed commit.
+    assert!(out.stderr.contains("** DETACHED HEAD **"), "{}", out.stderr);
+    assert!(out.stderr.contains("** LOAD STASH **"), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("** DONE ** Landed changes."),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+        "uncommitted\n"
+    );
+}
+
+#[test]
+fn dirty_tree_decline_aborts() {
+    let (repo, _bare) = repo_with_origin("dirty-decline");
+    repo.write("a.txt", "uncommitted\n");
+    let err = run_engine(repo.path(), &[], &["y", "n"]).unwrap_err();
+    assert_eq!(err, "User aborted the workflow.");
+    // Nothing landed: the feature branch still exists.
+    assert!(!repo.git(&["branch", "--list", "feature"]).is_empty());
 }
 
 #[test]
@@ -295,6 +330,8 @@ fn onto_flag_targets_another_branch() {
     repo.git(&["branch", "stable"]);
     repo.git(&["push", "-q", "origin", "stable"]);
     repo.git(&["checkout", "-q", "feature"]);
+    repo.git(&["fetch", "-q", "origin"]);
+    repo.git(&["branch", "--set-upstream-to=origin/stable", "stable"]);
     let master_before = repo.git(&["rev-parse", "master"]);
 
     let out = run_engine(repo.path(), &["--onto", "stable"], &["y", "y"]).unwrap();
@@ -305,6 +342,7 @@ fn onto_flag_targets_another_branch() {
     );
 
     assert_eq!(repo.git(&["symbolic-ref", "--short", "HEAD"]), "stable");
+    assert!(out.stderr.contains("** UPDATE **"), "{}", out.stderr);
     assert_eq!(repo.git(&["rev-parse", "master"]), master_before);
     let body = bare.git(&["log", "-1", "--format=%B", "refs/heads/stable"]);
     assert!(body.contains("Land feature"), "unexpected message: {body}");
@@ -379,6 +417,8 @@ fn revision_preview_skips_gates_without_conduit() {
 #[test]
 fn revision_land_skips_gates_without_conduit() {
     let (repo, _bare) = repo_with_origin("revskip-land");
+    repo.git(&["fetch", "-q", "origin"]);
+    repo.git(&["branch", "--set-upstream-to=origin/master", "master"]);
 
     let out = run_engine(repo.path(), &["--revision", "123"], &["y", "y"]).unwrap();
     assert!(
@@ -552,4 +592,348 @@ fn gates_over_seam_report_status() {
             .unwrap()
             .is_empty()
     );
+}
+
+/* L10: hg land flows through HgCommand with a fake binary. */
+
+/// Scratch dir with an `.hg` marker for fake-hg tests.
+fn hg_fixture(name: &str) -> Fixture {
+    let repo = Fixture::named(name);
+    std::fs::create_dir_all(repo.path().join(".hg")).unwrap();
+    repo
+}
+
+/// Fake `hg` for land tests: a `.cmd` forwarder driving the `.ps1` fake on
+/// Windows (PowerShell `-File` binding rejects the bare `-` of `--logfile -`,
+/// so the forwarder re-quotes that one token; quoted template argv keeps its
+/// quotes through `%1`, so the commit-list `|` survives cmd.exe), shell
+/// elsewhere. Mirrors the D13 fake-binary pattern.
+fn fake_hg_land_command(dir: &Path) -> hg::HgCommand {
+    #[cfg(windows)]
+    {
+        let script = dir.join("fakehg-land.ps1");
+        std::fs::write(&script, include_str!("fixtures/vcs/fakehg-land.ps1")).unwrap();
+        let forward = dir.join("fakehg-land.cmd");
+        std::fs::write(&forward, include_str!("fixtures/vcs/fakehg-land.cmd")).unwrap();
+        // `cmd /d /c call ...`: `/d` skips AutoRun (its output would pollute
+        // the fake's stdout); the leading `call` keeps the `/c` string from
+        // starting with a quote, defeating cmd's quote-strip rule.
+        hg::HgCommand::custom("cmd", &["/d", "/c", "call", &forward.to_string_lossy()])
+    }
+    #[cfg(not(windows))]
+    {
+        let script = dir.join("fakehg-land.sh");
+        std::fs::write(&script, include_str!("fixtures/vcs/fakehg-land.sh")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        hg::HgCommand::custom(&script.to_string_lossy(), &[])
+    }
+}
+
+fn fake_log(repo: &Fixture) -> String {
+    std::fs::read_to_string(repo.path().join(".fakehg.log")).unwrap_or_default()
+}
+
+const FAKE_NODE: &str = "0123456789abcdef0123456789abcdef01234567";
+const FAKE_TIP: &str = "89abcdef0123456789abcdef0123456789abcdef01";
+
+#[test]
+fn hg_selection_flow_through_fake_binary() {
+    let repo = hg_fixture("hg-select");
+    let hg_cmd = fake_hg_land_command(repo.path());
+    let mut io = land::Io::canned(&[]);
+
+    let symbols = land::hg_default_symbols_with(repo.path(), &hg_cmd, &mut io).unwrap();
+    assert_eq!(symbols, vec!["feature".to_string()]);
+    assert!(io.out.stderr.contains("Landing the active bookmark"));
+
+    let resolved = land::hg_resolve_symbols_with(repo.path(), &hg_cmd, &mut io, &symbols).unwrap();
+    assert_eq!(resolved, vec![FAKE_NODE.to_string()]);
+
+    let options = land::Options::default();
+    let remote = land::hg_select_onto_remote_with(repo.path(), &hg_cmd, &mut io, &options).unwrap();
+    assert_eq!(remote, "default");
+
+    let refs = land::hg_select_onto_refs(repo.path(), &mut io, &options).unwrap();
+    assert_eq!(refs, vec!["default".to_string()]);
+
+    // `default` exists remotely and is not a local branch: no prompt.
+    let marker =
+        land::hg_confirm_onto_refs_with(repo.path(), &hg_cmd, &mut io, &remote, &refs, false)
+            .unwrap();
+    assert_eq!(marker, None);
+
+    let into = land::hg_select_into_commit_with(
+        repo.path(),
+        &hg_cmd,
+        &mut io,
+        &land::IntoState::Remote {
+            remote: "default".to_string(),
+            name: "default".to_string(),
+        },
+        None,
+    )
+    .unwrap();
+    assert_eq!(into.as_deref(), Some(FAKE_NODE));
+
+    repo.write(
+        ".fakehg-log-commits",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb -add a\n",
+    );
+    let symbols = vec![land::GitSymbol {
+        symbol: "feature".to_string(),
+        commit: FAKE_NODE.to_string(),
+    }];
+    let commits =
+        land::hg_select_commits_with(repo.path(), &hg_cmd, &symbols, into.as_deref()).unwrap();
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].summary, "add a");
+    assert_eq!(commits[0].direct_symbols, vec!["feature".to_string()]);
+
+    let log = fake_log(&repo);
+    assert!(log.contains("bookmarks"), "{log}");
+    assert!(log.contains("paths default"), "{log}");
+    assert!(log.contains("pull --rev default default"), "{log}");
+}
+
+#[test]
+fn hg_land_loop_lands_through_fake_binary() {
+    let repo = hg_fixture("hg-land");
+    let hg_cmd = fake_hg_land_command(repo.path());
+    let options = land::Options::default();
+    let commits = vec![land::LandCommit {
+        hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        parents: vec!["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()],
+        summary: "add a".to_string(),
+        direct_symbols: vec!["feature".to_string()],
+        indirect_symbols: vec!["feature".to_string()],
+        explicit: None,
+        related: Vec::new(),
+        is_head: true,
+        is_implicit: false,
+    }];
+    let sets = vec![land::CommitSet {
+        revision: None,
+        commits: vec![0],
+        is_pick: false,
+    }];
+    let mut io = land::Io::canned(&[]);
+    land::land_hg_with(
+        repo.path(),
+        &hg_cmd,
+        &mut io,
+        &options,
+        true,
+        &["feature".to_string()],
+        "default",
+        &["feature".to_string()],
+        Some(FAKE_NODE),
+        None,
+        &sets,
+        &commits,
+        None,
+    )
+    .unwrap();
+    assert!(
+        io.out.stderr.contains("** DONE ** Landed changes."),
+        "{:?}",
+        io.out.stderr
+    );
+    let log = fake_log(&repo);
+    // The bookmark moves onto the rebased tip before the push.
+    assert!(
+        log.contains(&format!("bookmark --force --rev {FAKE_TIP} -- feature")),
+        "{log}"
+    );
+    for command in [
+        "update --rev",
+        "rebase --dest",
+        "push --bookmark feature",
+        "pull --bookmark feature",
+        "strip --rev",
+        "update --",
+    ] {
+        assert!(log.contains(command), "{command} missing from:\n{log}");
+    }
+}
+
+#[test]
+fn hg_land_hold_prints_restore_commands() {
+    let repo = hg_fixture("hg-hold");
+    let hg_cmd = fake_hg_land_command(repo.path());
+    let options = land::Options {
+        hold: true,
+        ..land::Options::default()
+    };
+    let commits = vec![land::LandCommit {
+        hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        parents: Vec::new(),
+        summary: "add a".to_string(),
+        direct_symbols: vec!["feature".to_string()],
+        indirect_symbols: vec!["feature".to_string()],
+        explicit: None,
+        related: Vec::new(),
+        is_head: true,
+        is_implicit: false,
+    }];
+    let sets = vec![land::CommitSet {
+        revision: None,
+        commits: vec![0],
+        is_pick: false,
+    }];
+    let mut io = land::Io::canned(&[]);
+    land::land_hg_with(
+        repo.path(),
+        &hg_cmd,
+        &mut io,
+        &options,
+        true,
+        &["feature".to_string()],
+        "default",
+        &["feature".to_string()],
+        Some(FAKE_NODE),
+        None,
+        &sets,
+        &commits,
+        None,
+    )
+    .unwrap();
+    assert!(
+        io.out.stdout.contains("** HOLD CHANGES **"),
+        "{}",
+        io.out.stdout
+    );
+    assert!(
+        io.out.stdout.contains("hg push --bookmark feature"),
+        "{}",
+        io.out.stdout
+    );
+    // Restore commands come from the saved state: the working-copy
+    // parent, the branch, and the active bookmark.
+    assert!(
+        io.out.stdout.contains("hg update -- 0123456789ab"),
+        "{}",
+        io.out.stdout
+    );
+    assert!(
+        io.out.stdout.contains("hg branch --force -- default"),
+        "{}",
+        io.out.stdout
+    );
+    assert!(
+        io.out.stdout.contains("hg bookmark --force -- feature"),
+        "{}",
+        io.out.stdout
+    );
+}
+
+#[test]
+fn hg_stash_flow_shelves_through_fake_binary() {
+    let repo = hg_fixture("hg-stash");
+    repo.write(".fakehg-status", "M file.txt\n? new.txt\n");
+    let hg_cmd = fake_hg_land_command(repo.path());
+    let mut io = land::Io::canned(&["y"]);
+    let state = land::save_local_state_hg_with(repo.path(), &hg_cmd, &mut io).unwrap();
+    assert_eq!(state.local_commit, FAKE_NODE);
+    assert_eq!(state.local_branch, "default");
+    assert_eq!(state.local_bookmark.as_deref(), Some("feature"));
+    let stash = state.stash.clone().expect("shelved");
+    assert!(stash.starts_with("arc-"), "{stash}");
+    assert_eq!(stash.len(), 16);
+    assert!(
+        io.out.stdout.contains("** UNCOMMITTED CHANGES **"),
+        "{}",
+        io.out.stdout
+    );
+    assert!(io.out.stderr.contains("** SHELVE **"), "{}", io.out.stderr);
+    land::discard_local_state_hg_with(repo.path(), &hg_cmd, &mut io, &state).unwrap();
+    assert!(
+        io.out.stderr.contains("** UNSHELVE **"),
+        "{}",
+        io.out.stderr
+    );
+    let log = fake_log(&repo);
+    assert!(
+        log.contains(&format!("shelve --unknown --name {stash} --")),
+        "{log}"
+    );
+    assert!(
+        log.contains(&format!("unshelve --keep --name {stash} --")),
+        "{log}"
+    );
+    assert!(
+        log.contains(&format!("shelve --delete {stash} --")),
+        "{log}"
+    );
+}
+
+#[test]
+fn hg_shelve_unsupported_fails() {
+    let repo = hg_fixture("hg-no-shelve");
+    repo.write(".fakehg-status", "M file.txt\n");
+    repo.write(".fakehg-fail-shelve", "");
+    let hg_cmd = fake_hg_land_command(repo.path());
+    let mut io = land::Io::canned(&["y"]);
+    let err = land::save_local_state_hg_with(repo.path(), &hg_cmd, &mut io).unwrap_err();
+    assert!(err.contains("Shelving is not supported"), "{err}");
+}
+
+#[test]
+fn hg_merge_failure_restores_saved_state() {
+    let repo = hg_fixture("hg-restore");
+    repo.write(".fakehg-fail-rebase", "");
+    let hg_cmd = fake_hg_land_command(repo.path());
+    let options = land::Options::default();
+    let commits = vec![land::LandCommit {
+        hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        parents: Vec::new(),
+        summary: "add a".to_string(),
+        direct_symbols: vec!["feature".to_string()],
+        indirect_symbols: vec!["feature".to_string()],
+        explicit: None,
+        related: Vec::new(),
+        is_head: true,
+        is_implicit: false,
+    }];
+    let sets = vec![land::CommitSet {
+        revision: None,
+        commits: vec![0],
+        is_pick: false,
+    }];
+    let mut io = land::Io::canned(&[]);
+    let err = land::land_hg_with(
+        repo.path(),
+        &hg_cmd,
+        &mut io,
+        &options,
+        true,
+        &["feature".to_string()],
+        "default",
+        &["feature".to_string()],
+        Some(FAKE_NODE),
+        None,
+        &sets,
+        &commits,
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(err, "rebase failed");
+    assert!(
+        io.out.stderr.contains("** LOAD STATE **"),
+        "{:?}",
+        io.out.stderr
+    );
+}
+
+#[test]
+fn svn_working_copy_is_rejected_like_any_non_git_hg_tree() {
+    // `arc land` supports git and Mercurial only; Subversion working
+    // copies fail detection with the shared error (PHP parity), so no
+    // SvnCommand path exists for land.
+    let svn = Fixture::named("svn-tree");
+    std::fs::create_dir_all(svn.path().join(".svn")).unwrap();
+    let err = land::execute(svn.path(), &args(&[])).unwrap_err();
+    assert_eq!(err, land::NOT_GIT_OR_HG);
 }

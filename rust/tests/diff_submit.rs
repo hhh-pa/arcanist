@@ -5,7 +5,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use arc_rs::{diff_submit, land_checks};
+use arc_rs::{diff, diff_local, diff_submit, hg, land_checks, svn};
 
 /* G1 full-state integration tests: revision flow, away reviewers, autotargets. */
 
@@ -525,4 +525,566 @@ fn mixed_land_state_fires_every_gate_in_order() {
         .find(|finding| finding.prompt == "arc.land.open-parents")
         .unwrap();
     assert_eq!(parents.count, 1);
+}
+
+/* Gap2 D13: hg/svn happy-path submit prep over fake binaries. */
+
+/// Scratch repo with a VCS marker plus canned fake-binary outputs.
+struct FakeRepo {
+    dir: std::path::PathBuf,
+}
+
+impl FakeRepo {
+    fn named(tag: &str, marker: &str) -> Self {
+        let dir =
+            std::env::temp_dir().join(format!("arc-rs-diff-d13-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(marker)).unwrap();
+        Self { dir }
+    }
+
+    fn write(&self, name: &str, content: &str) {
+        std::fs::write(self.dir.join(name), content).unwrap();
+    }
+
+    fn read_log(&self, name: &str) -> String {
+        std::fs::read_to_string(self.dir.join(name)).unwrap_or_default()
+    }
+}
+
+/// PowerShell fake on Windows: the local-commit template argv contains
+/// `|` (which cmd.exe parses as a pipe). Unix shells pass pipes
+/// through, so the shell fake suffices there.
+fn fake_hg_command(dir: &std::path::Path) -> hg::HgCommand {
+    #[cfg(windows)]
+    {
+        let script = dir.join("fakehg-d13.ps1");
+        std::fs::write(&script, include_str!("fixtures/vcs/fakehg.ps1")).unwrap();
+        hg::HgCommand::custom(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                &script.to_string_lossy(),
+            ],
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let script = dir.join("fakehg-d13.sh");
+        std::fs::write(&script, include_str!("fixtures/vcs/fakehg.sh")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        hg::HgCommand::custom(&script.to_string_lossy(), &[])
+    }
+}
+
+fn fake_svn_command(dir: &std::path::Path) -> svn::SvnCommand {
+    #[cfg(windows)]
+    let (name, content) = ("fakesvn-d13.bat", include_str!("fixtures/vcs/fakesvn.bat"));
+    #[cfg(not(windows))]
+    let (name, content) = ("fakesvn-d13.sh", include_str!("fixtures/vcs/fakesvn.sh"));
+    let script = dir.join(name);
+    std::fs::write(&script, content).unwrap();
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        svn::SvnCommand::custom("cmd", &["/C", &script.to_string_lossy()])
+    }
+    #[cfg(not(windows))]
+    {
+        svn::SvnCommand::custom(&script.to_string_lossy(), &[])
+    }
+}
+
+#[test]
+fn gap2_hg_submit_happy_path_via_fake() {
+    use serde_json::json;
+    let repo = FakeRepo::named("hg", ".hg");
+    let node = "0123456789abcdef0123456789abcdef01234567";
+    repo.write(
+        ".fakehg-diff",
+        "diff -r aaaaaaaa -r bbbbbbbb h.txt\n--- a/h.txt\n+++ b/h.txt\n@@ -1 +1 @@\n-a\n+b\n",
+    );
+    // `{node}\1{rev}\1{author}\1{hgdate}\1{branch}\1{tag}\1{parents}\1{desc}\2`
+    repo.write(
+        ".fakehg-log-info",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\x011\x01Test User <t@example.test>\x011767225600 0\x01default\x01\x01\x01Add feature\x02",
+    );
+    repo.write(
+        ".fakehg-log-msg",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\x01Add feature title\x02",
+    );
+    let hg_cmd = fake_hg_command(&repo.dir);
+    let svn_cmd = svn::SvnCommand::default();
+
+    let options = diff::Options {
+        base: Some("tip".to_string()),
+        reviewers: Some("alice".to_string()),
+        ..Default::default()
+    };
+    let report = diff_local::LintUnitReport::empty();
+    let input = diff::prepare_submit_full_with_commands(
+        &repo.dir,
+        &hg_cmd,
+        &svn_cmd,
+        &options,
+        &diff::SubmitMode::Create,
+        &report,
+    )
+    .unwrap();
+
+    assert_eq!(input.spec["sourceControlSystem"], json!("hg"));
+    assert_eq!(input.spec["sourceControlBaseRevision"], json!(node));
+    assert_eq!(input.spec["changes"][0]["currentPath"], json!("h.txt"));
+    assert_eq!(input.fields["title"], json!("Add feature title"));
+    assert!(
+        input.included_changes.contains("h.txt"),
+        "{}",
+        input.included_changes
+    );
+    let local: Vec<&diff_submit::DiffProperty> = input
+        .properties
+        .iter()
+        .filter(|property| property.name == "local:commits")
+        .collect();
+    assert_eq!(local.len(), 1);
+    assert!(
+        local[0]
+            .data
+            .contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        "{}",
+        local[0].data
+    );
+
+    let log = repo.read_log(".fakehg.log");
+    assert!(log.contains("log -l 1 --template {node} -r tip"), "{log}");
+    assert!(log.contains("branch"), "{log}");
+    assert!(log.contains("diff --git -U32767 --rev"), "{log}");
+    assert!(log.contains("root"), "{log}");
+}
+
+#[test]
+fn gap2_svn_submit_happy_path_via_fake() {
+    use serde_json::json;
+    let repo = FakeRepo::named("svn", ".svn");
+    repo.write(
+        ".fakesvn-status",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<status>\n<target path=\".\">\n<entry path=\"s.txt\">\n<wc-status props=\"none\" item=\"modified\" revision=\"42\">\n</wc-status>\n</entry>\n</target>\n</status>\n",
+    );
+    repo.write(
+        ".fakesvn-diff",
+        "Index: s.txt\n===================================================================\n--- s.txt\t(revision 1)\n+++ s.txt\t(working copy)\n@@ -1 +1 @@\n-a\n+b\n",
+    );
+    repo.write(
+        ".fakesvn-info",
+        "Path: .\nURL: https://svn.example.test/repo/trunk\nRepository Root: https://svn.example.test/repo\nRevision: 42\n",
+    );
+    let hg_cmd = hg::HgCommand::default();
+    let svn_cmd = fake_svn_command(&repo.dir);
+
+    let options = diff::Options {
+        reviewers: Some("bob".to_string()),
+        ..Default::default()
+    };
+    let report = diff_local::LintUnitReport::empty();
+    let input = diff::prepare_submit_full_with_commands(
+        &repo.dir,
+        &hg_cmd,
+        &svn_cmd,
+        &options,
+        &diff::SubmitMode::Create,
+        &report,
+    )
+    .unwrap();
+
+    assert_eq!(input.spec["sourceControlSystem"], json!("svn"));
+    assert_eq!(
+        input.spec["sourceControlBaseRevision"],
+        json!("https://svn.example.test/repo/trunk@42")
+    );
+    assert_eq!(input.spec["changes"][0]["currentPath"], json!("s.txt"));
+    assert!(input.properties.is_empty());
+    assert!(
+        input.included_changes.contains("s.txt"),
+        "{}",
+        input.included_changes
+    );
+
+    let log = repo.read_log(".fakesvn.log");
+    assert!(log.contains("info ."), "{log}");
+    assert!(log.contains("diff"), "{log}");
+}
+
+/* Gap2 D5/D11: svn per-path fan-out + externals over a path-aware fake. */
+
+fn fake_svn_d5_command(dir: &std::path::Path) -> svn::SvnCommand {
+    #[cfg(windows)]
+    let (name, content) = (
+        "fakesvn-d5.bat",
+        include_str!("fixtures/vcs/fakesvn-d5.bat"),
+    );
+    #[cfg(not(windows))]
+    let (name, content) = ("fakesvn-d5.sh", include_str!("fixtures/vcs/fakesvn-d5.sh"));
+    let script = dir.join(name);
+    std::fs::write(&script, content).unwrap();
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        svn::SvnCommand::custom("cmd", &["/C", &script.to_string_lossy()])
+    }
+    #[cfg(not(windows))]
+    {
+        svn::SvnCommand::custom(&script.to_string_lossy(), &[])
+    }
+}
+
+fn gap2_d5_plain_info() -> String {
+    "Path: a.txt\nURL: https://svn.example.test/repo/trunk/a.txt\nRepository Root: https://svn.example.test/repo\nRevision: 9\nNode Kind: file\n"
+        .to_string()
+}
+
+fn gap2_d5_status(entries: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<status>\n<target path=\".\">\n{entries}</target>\n</status>\n"
+    )
+}
+
+fn gap2_d5_entry(path: &str, item: &str, revision: Option<&str>) -> String {
+    match revision {
+        Some(rev) => format!(
+            "<entry path=\"{path}\">\n<wc-status props=\"none\" item=\"{item}\" revision=\"{rev}\">\n</wc-status>\n</entry>\n"
+        ),
+        None => format!(
+            "<entry path=\"{path}\">\n<wc-status props=\"none\" item=\"{item}\">\n</wc-status>\n</entry>\n"
+        ),
+    }
+}
+
+fn gap2_d5_diff(path: &str, old: &str, new: &str) -> String {
+    format!(
+        "Index: {path}\n===================================================================\n--- {path}\t(revision 9)\n+++ {path}\t(working copy)\n@@ -1 +1 @@\n-{old}\n+{new}\n"
+    )
+}
+
+#[test]
+fn gap2_svn_fanout_per_path_diffs_via_fake() {
+    use std::io::Cursor;
+    let repo = FakeRepo::named("svn-d5", ".svn");
+    std::fs::write(repo.dir.join("a.txt"), "a\n").unwrap();
+    std::fs::write(repo.dir.join("n.txt"), "new\n").unwrap();
+    std::fs::write(repo.dir.join("s.txt"), "hello\n").unwrap();
+    std::fs::write(repo.dir.join("u.txt"), "untracked\n").unwrap();
+    std::fs::create_dir_all(repo.dir.join("ext")).unwrap();
+    std::fs::write(repo.dir.join("ext").join("inner.txt"), "inner\n").unwrap();
+    repo.write(
+        ".fakesvn-d5-status",
+        &gap2_d5_status(
+            &[
+                gap2_d5_entry("a.txt", "modified", Some("9")),
+                gap2_d5_entry("n.txt", "added", None),
+                gap2_d5_entry("s.txt", "modified", Some("9")),
+                gap2_d5_entry("u.txt", "unversioned", None),
+                gap2_d5_entry("ext", "external", Some("9")),
+                gap2_d5_entry("ext/inner.txt", "modified", Some("9")),
+            ]
+            .join(""),
+        ),
+    );
+    repo.write(".fakesvn-d5-info-a.txt", &gap2_d5_plain_info());
+    repo.write(".fakesvn-d5-info-n.txt", &gap2_d5_plain_info());
+    repo.write(".fakesvn-d5-info-s.txt", &gap2_d5_plain_info());
+    repo.write(".fakesvn-d5-diff-a.txt", &gap2_d5_diff("a.txt", "a", "b"));
+    repo.write(
+        ".fakesvn-d5-diff-n.txt",
+        "Index: n.txt\n===================================================================\n--- n.txt\t(revision 0)\n+++ n.txt\t(working copy)\n@@ -0,0 +1 @@\n+new\n",
+    );
+    // Empty canned diff: the synthetic-unchanged path reads the workfile.
+    repo.write(".fakesvn-d5-diff-s.txt", "");
+    let svn_cmd = fake_svn_d5_command(&repo.dir);
+    let config = svn::SvnDiffConfig {
+        context: 3,
+        diff_cmd: None,
+        diff_program: "diff",
+        diff_prefix: &[],
+    };
+
+    let mut input = Cursor::new(b"y\n".to_vec());
+    let mut out = Vec::new();
+    let mut io = diff_local::SvnPromptIo {
+        reader: &mut input,
+        writer: &mut out,
+        warned_externals: false,
+    };
+    let changes =
+        diff_local::collect_svn_parsed_changes_with_io(&repo.dir, &svn_cmd, &[], &config, &mut io)
+            .unwrap();
+
+    assert!(io.warned_externals);
+    let paths: Vec<&str> = changes.iter().map(|c| c.current_path.as_str()).collect();
+    assert_eq!(paths, vec!["a.txt", "n.txt", "s.txt"]);
+    assert_eq!(changes[0].change_type, diff_local::TYPE_CHANGE);
+    assert_eq!(changes[0].hunks.len(), 1);
+    assert_eq!(changes[1].change_type, diff_local::TYPE_ADD);
+    assert_eq!(changes[1].hunks.len(), 1);
+    assert_eq!(changes[2].change_type, diff_local::TYPE_CHANGE);
+    assert_eq!(changes[2].hunks.len(), 1);
+    assert!(
+        changes[2].hunks[0].corpus.contains(" hello\n"),
+        "{}",
+        changes[2].hunks[0].corpus
+    );
+
+    let expected = format!(
+        "{}\n\n{}\n",
+        diff_local::svn_externals_warning(),
+        diff::format_confirm_prompt(diff_local::PROMPT_SVN_EXTERNALS_ANYWAY, true)
+    );
+    assert_eq!(String::from_utf8(out).unwrap(), expected);
+
+    let log = repo.read_log(".fakesvn-d5.log");
+    let status_line = log
+        .lines()
+        .find(|line| line.starts_with("--xml status"))
+        .unwrap();
+    assert_eq!(status_line, "--xml status");
+    for path in ["a.txt", "n.txt", "s.txt"] {
+        assert!(log.contains(&format!("diff --depth empty {path}")), "{log}");
+    }
+    let diff_a = log.find("diff --depth empty a.txt").unwrap();
+    let diff_n = log.find("diff --depth empty n.txt").unwrap();
+    let diff_s = log.find("diff --depth empty s.txt").unwrap();
+    assert!(diff_a < diff_n && diff_n < diff_s, "{log}");
+    assert!(!log.contains("u.txt"), "{log}");
+    assert!(!log.contains("inner.txt"), "{log}");
+}
+
+#[test]
+fn gap2_svn_fanout_refuses_externals() {
+    use std::io::Cursor;
+    let repo = FakeRepo::named("svn-d5-no", ".svn");
+    std::fs::write(repo.dir.join("a.txt"), "a\n").unwrap();
+    repo.write(
+        ".fakesvn-d5-status",
+        &gap2_d5_status(
+            &[
+                gap2_d5_entry("a.txt", "modified", Some("9")),
+                gap2_d5_entry("ext", "external", Some("9")),
+                gap2_d5_entry("ext/inner.txt", "modified", Some("9")),
+            ]
+            .join(""),
+        ),
+    );
+    let svn_cmd = fake_svn_d5_command(&repo.dir);
+    let config = svn::SvnDiffConfig {
+        context: 3,
+        diff_cmd: None,
+        diff_program: "diff",
+        diff_prefix: &[],
+    };
+
+    let mut input = Cursor::new(b"n\n".to_vec());
+    let mut out = Vec::new();
+    let mut io = diff_local::SvnPromptIo {
+        reader: &mut input,
+        writer: &mut out,
+        warned_externals: false,
+    };
+    let err =
+        diff_local::collect_svn_parsed_changes_with_io(&repo.dir, &svn_cmd, &[], &config, &mut io)
+            .unwrap_err();
+    assert_eq!(err, diff_local::USER_ABORT);
+    assert!(!io.warned_externals);
+
+    // The abort precedes the fan-out: no per-path calls ran.
+    let log = repo.read_log(".fakesvn-d5.log");
+    assert!(log.contains("--xml status"), "{log}");
+    assert!(!log.contains("diff --depth"), "{log}");
+}
+
+#[test]
+fn gap2_svn_fanout_limits_to_cli_paths() {
+    use std::io::Cursor;
+    let repo = FakeRepo::named("svn-d5-limit", ".svn");
+    std::fs::write(repo.dir.join("a.txt"), "a\n").unwrap();
+    std::fs::write(repo.dir.join("b.txt"), "b\n").unwrap();
+    repo.write(
+        ".fakesvn-d5-status",
+        &gap2_d5_status(
+            &[
+                gap2_d5_entry("a.txt", "modified", Some("9")),
+                gap2_d5_entry("b.txt", "modified", Some("9")),
+            ]
+            .join(""),
+        ),
+    );
+    repo.write(".fakesvn-d5-info-a.txt", &gap2_d5_plain_info());
+    repo.write(".fakesvn-d5-diff-a.txt", &gap2_d5_diff("a.txt", "a", "b"));
+    let svn_cmd = fake_svn_d5_command(&repo.dir);
+    let config = svn::SvnDiffConfig {
+        context: 3,
+        diff_cmd: None,
+        diff_program: "diff",
+        diff_prefix: &[],
+    };
+
+    let mut input = Cursor::new(b"".to_vec());
+    let mut out = Vec::new();
+    let mut io = diff_local::SvnPromptIo {
+        reader: &mut input,
+        writer: &mut out,
+        warned_externals: false,
+    };
+    let changes = diff_local::collect_svn_parsed_changes_with_io(
+        &repo.dir,
+        &svn_cmd,
+        &["a.txt".to_string()],
+        &config,
+        &mut io,
+    )
+    .unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].current_path, "a.txt");
+    assert!(out.is_empty());
+
+    let log = repo.read_log(".fakesvn-d5.log");
+    let status_line = log
+        .lines()
+        .find(|line| line.starts_with("--xml status"))
+        .unwrap();
+    assert!(status_line.contains("a.txt"), "{status_line}");
+    assert!(!log.contains("diff --depth empty b.txt"), "{log}");
+}
+
+#[test]
+fn gap2_svn_fanout_rejects_mismatched_bases() {
+    use std::io::Cursor;
+    let repo = FakeRepo::named("svn-d5-bases", ".svn");
+    repo.write(
+        ".fakesvn-d5-status",
+        &gap2_d5_status(
+            &[
+                gap2_d5_entry("a.txt", "modified", Some("9")),
+                gap2_d5_entry("b.txt", "modified", Some("10")),
+            ]
+            .join(""),
+        ),
+    );
+    let svn_cmd = fake_svn_d5_command(&repo.dir);
+    let config = svn::SvnDiffConfig {
+        context: 3,
+        diff_cmd: None,
+        diff_program: "diff",
+        diff_prefix: &[],
+    };
+
+    let mut input = Cursor::new(b"".to_vec());
+    let mut out = Vec::new();
+    let mut io = diff_local::SvnPromptIo {
+        reader: &mut input,
+        writer: &mut out,
+        warned_externals: false,
+    };
+    let err =
+        diff_local::collect_svn_parsed_changes_with_io(&repo.dir, &svn_cmd, &[], &config, &mut io)
+            .unwrap_err();
+    assert_eq!(
+        err,
+        "Base revisions of changed paths are mismatched. Update all paths to the same base \
+         revision before creating a diff: \n\n    Revision 9, a.txt\n    Revision 10, b.txt"
+    );
+    let log = repo.read_log(".fakesvn-d5.log");
+    assert!(!log.contains("diff --depth"), "{log}");
+}
+
+#[test]
+fn gap2_svn_fanout_copied_add_via_fake() {
+    use std::io::Cursor;
+    let repo = FakeRepo::named("svn-d5-copy", ".svn");
+    std::fs::write(repo.dir.join("copy.txt"), "new\n").unwrap();
+    repo.write(
+        ".fakesvn-d5-status",
+        &gap2_d5_status(&gap2_d5_entry("copy.txt", "added", None)),
+    );
+    repo.write(
+        ".fakesvn-d5-info-copy.txt",
+        "Path: copy.txt\nURL: https://svn.example.test/repo/trunk/copy.txt\nRepository Root: https://svn.example.test/repo\nRevision: 9\nNode Kind: file\nCopied From URL: https://svn.example.test/repo/trunk/orig.txt\nCopied From Rev: 9\n",
+    );
+    repo.write(
+        ".fakesvn-d5-info-root",
+        "Path: .\nURL: https://svn.example.test/repo/trunk\nRepository Root: https://svn.example.test/repo\nRevision: 9\nNode Kind: directory\n",
+    );
+    repo.write(".fakesvn-d5-cat", "old\n");
+    repo.write(
+        ".fakediff-canned",
+        "--- a/orig.txt\n+++ b/copy.txt\n@@ -1 +1 @@\n-old\n+new\n",
+    );
+    #[cfg(windows)]
+    let (diff_name, diff_content) = ("fakediff-d5.bat", include_str!("fixtures/vcs/fakediff.bat"));
+    #[cfg(not(windows))]
+    let (diff_name, diff_content) = ("fakediff-d5.sh", include_str!("fixtures/vcs/fakediff.sh"));
+    let diff_script = repo.dir.join(diff_name);
+    std::fs::write(&diff_script, diff_content).unwrap();
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&diff_script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&diff_script, perms).unwrap();
+    }
+    let svn_cmd = fake_svn_d5_command(&repo.dir);
+    let script = diff_script.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    let (program, prefix): (&str, &[&str]) = ("cmd", &["/C", script.as_str()]);
+    #[cfg(not(windows))]
+    let (program, prefix): (&str, &[&str]) = (script.as_str(), &[]);
+    let config = svn::SvnDiffConfig {
+        context: 3,
+        diff_cmd: None,
+        diff_program: program,
+        diff_prefix: prefix,
+    };
+
+    let mut input = Cursor::new(b"".to_vec());
+    let mut out = Vec::new();
+    let mut io = diff_local::SvnPromptIo {
+        reader: &mut input,
+        writer: &mut out,
+        warned_externals: false,
+    };
+    let changes =
+        diff_local::collect_svn_parsed_changes_with_io(&repo.dir, &svn_cmd, &[], &config, &mut io)
+            .unwrap();
+
+    assert_eq!(changes.len(), 2);
+    assert_eq!(changes[0].current_path, "copy.txt");
+    assert_eq!(changes[0].change_type, diff_local::TYPE_COPY_HERE);
+    assert_eq!(changes[0].old_path, "orig.txt");
+    assert_eq!(changes[0].hunks.len(), 1);
+    assert_eq!(changes[1].current_path, "orig.txt");
+    assert_eq!(changes[1].change_type, diff_local::TYPE_COPY_AWAY);
+    assert_eq!(changes[1].away_paths, vec!["copy.txt".to_string()]);
+    assert!(out.is_empty());
+
+    let log = repo.read_log(".fakesvn-d5.log");
+    assert!(
+        log.contains("cat https://svn.example.test/repo/trunk/orig.txt@9"),
+        "{log}"
+    );
 }

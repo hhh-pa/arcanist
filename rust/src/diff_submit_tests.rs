@@ -107,6 +107,43 @@ fn g1_away_reviewer_helpers() {
 }
 
 #[test]
+fn gap2_phab_date_offset_shifts_midnight_boundaries() {
+    // 23:00 UTC Thursday: UTC keeps Thursday, +2h rolls to Friday.
+    assert_eq!(
+        format_phab_date_with_offset(82_800, 0),
+        "Thursday, Jan 1 1970"
+    );
+    assert_eq!(
+        format_phab_date_with_offset(82_800, 7_200),
+        "Friday, Jan 2 1970"
+    );
+    // 01:00 UTC Thursday: -2h rolls back to Wednesday.
+    assert_eq!(
+        format_phab_date_with_offset(3_600, -7_200),
+        "Wednesday, Dec 31 1969"
+    );
+    // Zero offset matches the UTC entry point everywhere.
+    for ts in [0, 82_800, 1_767_225_600, -1, -86_400] {
+        assert_eq!(format_phab_date_with_offset(ts, 0), format_phab_date(ts));
+    }
+    let aways = vec![AwayReviewer {
+        name: "a".to_string(),
+        until: json!(82_800),
+    }];
+    let utc = away_reviewers_block(&aways, 1).unwrap();
+    assert!(utc.contains("(until Thursday, Jan 1 1970)"), "{utc}");
+    let shifted = away_reviewers_block_with_offset(&aways, 1, 7_200).unwrap();
+    assert!(
+        shifted.starts_with("All reviewers are away until Friday, Jan 2 1970:\n\n"),
+        "{shifted}"
+    );
+    assert!(
+        shifted.contains("      a (until Friday, Jan 2 1970)\n"),
+        "{shifted}"
+    );
+}
+
+#[test]
 fn g1_autotarget_helpers() {
     assert_eq!(METHOD_QUERY_AUTOTARGETS, "harbormaster.queryautotargets");
     assert_eq!(METHOD_SENDMESSAGE, "harbormaster.sendmessage");
@@ -217,6 +254,46 @@ fn g1_staging_property_data_orders_keys() {
     assert_eq!(
         staging_property_data("user.skip", &[]),
         "{\"status\":\"user.skip\",\"refs\":[]}"
+    );
+}
+
+#[test]
+fn gap2_php_json_encode_escapes_slashes_like_php() {
+    let doc = json!({
+        "diffURI": "http://phab/D1",
+        "path": "src/a/b.rs",
+    });
+    let text = php_json_encode(&doc).unwrap();
+    assert_eq!(
+        text,
+        "{\"diffURI\":\"http:\\/\\/phab\\/D1\",\"path\":\"src\\/a\\/b.rs\"}"
+    );
+    // Escaped output still parses to the identical value.
+    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed, doc);
+    // Slash-free documents encode exactly like serde.
+    let plain = json!({"a": 1, "b": [true, null]});
+    assert_eq!(
+        php_json_encode(&plain).unwrap(),
+        serde_json::to_string(&plain).unwrap()
+    );
+}
+
+#[test]
+fn gap2_php_json_encode_pretty_escapes_slashes_like_php() {
+    let doc = json!({"diffURI": "http://phab/D1"});
+    let text = php_json_encode_pretty(&doc).unwrap();
+    assert!(text.contains("http:\\/\\/phab\\/D1"), "{text:?}");
+    assert!(text.contains('\n'), "{text:?}");
+    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed, doc);
+}
+
+#[test]
+fn gap2_staging_property_data_escapes_slashes() {
+    assert_eq!(
+        staging_property_data("ok", &[json!({"ref": "refs/heads/x"})]),
+        "{\"status\":\"ok\",\"refs\":[{\"ref\":\"refs\\/heads\\/x\"}]}"
     );
 }
 

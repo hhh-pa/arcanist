@@ -39,6 +39,7 @@ fn make_repo(name: &str) -> PathBuf {
     git(&dir, &["config", "user.email", "land@test"]);
     git(&dir, &["config", "user.name", "Land Test"]);
     git(&dir, &["config", "commit.gpgsign", "false"]);
+    git(&dir, &["config", "core.autocrlf", "false"]);
     std::fs::write(dir.join("file.txt"), "base\n").unwrap();
     git(&dir, &["add", "."]);
     git(&dir, &["commit", "-m", "base"]);
@@ -290,32 +291,102 @@ fn prompt_help_lists_description() {
 }
 
 #[test]
-fn prompt_strips_save_suffixes() {
+fn prompt_saves_star_suffix_to_user_config() {
+    let dir = temp_dir("prompt-save-user");
+    let user = dir.join("arcrc");
     let mut io = Io::canned(&["y*"]);
+    io.config_writer = Some(ConfigWriter {
+        user_path: Some(user.clone()),
+        local_path: None,
+    });
     assert!(prompt_for_key(&mut io, "k", "q?").is_ok());
+    assert!(
+        io.out
+            .stdout
+            .contains("** SAVE PROMPT ** Saving response \"y\" to prompt \"k\".\n")
+    );
+    let saved = load_saved_prompts_from(&[(user, PromptScope::User)]);
+    assert_eq!(
+        saved.get("k"),
+        Some(&SavedResponse {
+            response: "y".to_string(),
+            scope: PromptScope::User,
+        })
+    );
+    // Without a writer, saving fails like PHP's missing-source throw.
+    let mut io = Io::canned(&["y*"]);
+    assert_eq!(
+        prompt_for_key(&mut io, "k", "q?").unwrap_err(),
+        "Unable to save response to config: no writable configuration source for scope \
+         (\"user\")."
+    );
+    // `!` targets the working-copy config and still declines.
+    let dir = temp_dir("prompt-save-local");
+    let local = dir.join("nested").join("config");
     let mut io = Io::canned(&["n!"]);
-    assert!(prompt_for_key(&mut io, "k", "q?").is_err());
+    io.config_writer = Some(ConfigWriter {
+        user_path: None,
+        local_path: Some(local.clone()),
+    });
+    assert_eq!(
+        prompt_for_key(&mut io, "k", "q?").unwrap_err(),
+        "User aborted the workflow."
+    );
+    assert!(
+        io.out
+            .stdout
+            .contains("** SAVE PROMPT ** Saving response \"n\" to prompt \"k\".\n")
+    );
+    let saved = load_saved_prompts_from(&[(local, PromptScope::WorkingCopy)]);
+    assert_eq!(saved.get("k").map(|s| s.response.as_str()), Some("n"));
 }
 
 #[test]
 fn prompt_honors_saved_responses() {
     let mut io = Io::canned(&[]);
-    io.saved.insert("arc.land.confirm".to_string(), true);
+    io.saved.insert(
+        "arc.land.confirm".to_string(),
+        SavedResponse {
+            response: "y".to_string(),
+            scope: PromptScope::User,
+        },
+    );
     assert!(prompt_for_key(&mut io, "arc.land.confirm", "Land these changes?").is_ok());
-    assert!(io.out.stdout.contains("Using saved response"));
+    assert_eq!(
+        io.out.stdout,
+        "\n>>> Land these changes? <y>\n>>> (Using saved response to prompt \
+         \"arc.land.confirm\".\n\n"
+    );
     let mut io = Io::canned(&[]);
-    io.saved.insert("arc.land.confirm".to_string(), false);
+    io.saved.insert(
+        "arc.land.confirm".to_string(),
+        SavedResponse {
+            response: "n".to_string(),
+            scope: PromptScope::Project,
+        },
+    );
     assert!(prompt_for_key(&mut io, "arc.land.confirm", "Land these changes?").is_err());
+    // Saved garbage falls through to an interactive prompt, like PHP.
+    let mut io = Io::canned(&["y"]);
+    io.saved.insert(
+        "k".to_string(),
+        SavedResponse {
+            response: "yes".to_string(),
+            scope: PromptScope::User,
+        },
+    );
+    assert!(prompt_for_key(&mut io, "k", "q?").is_ok());
+    assert_eq!(io.out.stdout, "\n>>> q? [y/N/?] ");
 }
 
 #[test]
 fn confirm_renders_options_and_defaults() {
     let mut io = Io::canned(&[""]);
     assert!(!console_confirm(&mut io, "Delete?", true).unwrap());
-    assert_eq!(io.out.stdout, "\n\nDelete? [y/N] \n");
+    assert_eq!(io.out.stdout, "\n\n    Delete? [y/N] \n");
     let mut io = Io::canned(&[""]);
     assert!(console_confirm(&mut io, "Apply?", false).unwrap());
-    assert_eq!(io.out.stdout, "\n\nApply? [Y/n] \n");
+    assert_eq!(io.out.stdout, "\n\n    Apply? [Y/n] \n");
     let mut io = Io::canned(&["bogus", "N"]);
     assert!(!console_confirm(&mut io, "Delete?", true).unwrap());
 }
@@ -505,7 +576,8 @@ fn build_views_join_buildable_build_plan() {
         (
             METHOD_BUILD_SEARCH,
             serde_json::json!({"data": [
-                {"fields": {
+                {"id": 42, "fields": {
+                    "name": "Lint",
                     "buildStatus": {"value": "failed"},
                     "buildablePHID": "PHID-HMBB-7",
                     "buildPlanPHID": "PHID-HMPA-1",
@@ -520,11 +592,16 @@ fn build_views_join_buildable_build_plan() {
         ),
     ]);
     let revisions = vec![view(89, "accepted", "Accepted", false, "PHID-USER-a")];
-    let builds = fetch_build_views(&call, &revisions).unwrap();
+    let builds =
+        fetch_build_views(&call, &revisions, Some("https://phab.example.com/api/")).unwrap();
     assert_eq!(builds.len(), 1);
     assert_eq!(builds[0].status, "failed");
     assert_eq!(builds[0].plan_behavior.as_deref(), Some("always"));
     assert_eq!(builds[0].revision_phid, "PHID-DREV-89");
+    assert_eq!(builds[0].build_id, 42);
+    assert_eq!(builds[0].build_name, "Lint");
+    assert_eq!(builds[0].buildable_monogram, "B7");
+    assert_eq!(builds[0].buildable_uri, "https://phab.example.com/B7");
 }
 
 #[test]
@@ -532,8 +609,29 @@ fn build_views_skip_revisions_without_diff_phids() {
     let call = canned(vec![]);
     let mut revision = view(89, "accepted", "Accepted", false, "PHID-USER-a");
     revision.diff_phid = None;
-    let builds = fetch_build_views(&call, &[revision]).unwrap();
+    let builds = fetch_build_views(&call, &[revision], None).unwrap();
     assert!(builds.is_empty());
+}
+
+#[test]
+fn absolute_buildable_uri_keeps_domains_and_guesses_paths() {
+    assert_eq!(
+        absolute_buildable_uri(
+            Some("https://phab.example.com/api/"),
+            "B7",
+            Some("https://x.test/B7")
+        ),
+        "https://x.test/B7"
+    );
+    assert_eq!(
+        absolute_buildable_uri(Some("https://phab.example.com/api/"), "B7", Some("/B7")),
+        "https://phab.example.com/B7"
+    );
+    assert_eq!(
+        absolute_buildable_uri(Some("https://phab.example.com/api/"), "B7", None),
+        "https://phab.example.com/B7"
+    );
+    assert_eq!(absolute_buildable_uri(None, "B7", Some("/B7")), "/B7");
 }
 
 #[test]
@@ -551,6 +649,23 @@ fn commit_message_requires_a_string() {
         serde_json::json!({"message": "nope"}),
     )]);
     assert!(fetch_commit_message(&call, 89).is_err());
+}
+
+#[test]
+fn commit_message_requests_no_edit() {
+    use std::cell::RefCell;
+    let seen = RefCell::new(serde_json::json!(null));
+    let call = |method: &str, params: &serde_json::Value| {
+        assert_eq!(method, diff_submit::METHOD_GET_COMMIT_MESSAGE);
+        *seen.borrow_mut() = params.clone();
+        Ok::<serde_json::Value, String>(serde_json::json!("D89: Work"))
+    };
+    assert_eq!(fetch_commit_message(&call, 89).unwrap(), "D89: Work");
+    // PHP asks with `'edit' => false` and never opens an editor (L1).
+    assert_eq!(
+        *seen.borrow(),
+        serde_json::json!({"revision_id": 89, "edit": false})
+    );
 }
 
 #[test]
@@ -619,8 +734,109 @@ fn display_summary_truncates_long_subjects() {
     assert_eq!(display_summary("short"), "short");
     let long = "x".repeat(100);
     let shown = display_summary(&long);
-    assert_eq!(shown.len(), 64 + 3);
-    assert!(shown.ends_with("..."));
+    assert_eq!(shown, format!("{}…", "x".repeat(63)));
+    // Word boundaries win over the raw cutoff.
+    let words = "Fix the thing that was broken by the other thing completely now";
+    assert_eq!(display_summary(words), words);
+    let longer = format!("{words} and then some more words to push past sixty-four glyphs total");
+    let shown = display_summary(&longer);
+    assert!(shown.ends_with('…'));
+    assert!(!shown.contains("  "));
+    // Sentence stops cut without a terminator when the stop sits
+    // right before the last break in range.
+    let sentence = format!("{}. {}", "a".repeat(50), "b".repeat(30));
+    assert_eq!(display_summary(&sentence), format!("{}.", "a".repeat(50)));
+}
+
+#[test]
+fn console_wrap_matches_phutil_boundaries() {
+    assert_eq!(console_wrap("", 0, true), "");
+    assert_eq!(console_wrap("short", 0, true), "short");
+    // 79 characters with no space overflow, like PHP.
+    let word = "x".repeat(79);
+    assert_eq!(console_wrap(&word, 0, true), word);
+    // Breaks at the last space past column 78.
+    let text = format!("{} {}", "a".repeat(70), "b".repeat(20));
+    assert_eq!(
+        console_wrap(&text, 0, true),
+        format!("{}\n{}", "a".repeat(70), "b".repeat(20))
+    );
+    // Embedded newlines flush the line and survive.
+    assert_eq!(console_wrap("a\n\nb", 0, true), "a\n\nb");
+    // Indent prefixes every line but optionally the first.
+    assert_eq!(console_wrap("a\nb", 4, true), "    a\n    b");
+    assert_eq!(console_wrap("a\nb", 4, false), "a\n    b");
+    // ANSI escapes do not count toward the width.
+    let colored = format!("\x1b[1m{}\x1b[m {}", "a".repeat(70), "b");
+    assert_eq!(console_wrap(&colored, 0, true), colored);
+}
+
+#[test]
+fn truncate_glyphs_matches_phutil_truncator() {
+    assert_eq!(truncate_glyphs("short", 64), "short");
+    assert_eq!(truncate_glyphs("", 64), "");
+    // Byte fast path: short byte strings return unchanged.
+    assert_eq!(truncate_glyphs("é", 4), "é");
+    // No usable break: hard cut at max - 1 plus the terminator.
+    assert_eq!(truncate_glyphs("abcdef", 4), "abc…");
+    // Word boundary backward search.
+    assert_eq!(truncate_glyphs("hello world foo", 8), "hello…");
+    // Sentence stop cuts without a terminator (the scan stops one
+    // word back, so the stop must sit right before the last break).
+    assert_eq!(truncate_glyphs("hello. world of friends", 10), "hello.");
+    // A stop further back is out of reach: plain word cut instead.
+    assert_eq!(truncate_glyphs("hi. there friend", 8), "hi. the…");
+    // Combining marks stay glued to their base.
+    assert_eq!(truncate_glyphs("e\u{301}tudex", 4), "e\u{301}tu…");
+    // Zero room yields just the terminator.
+    assert_eq!(truncate_glyphs("abcdef", 1), "…");
+}
+
+#[test]
+fn console_strlen_counts_glyphs_and_wide_chars() {
+    assert_eq!(console_strlen(""), 0);
+    assert_eq!(console_strlen("hello"), 5);
+    assert_eq!(console_strlen("\x1b[1mhi\x1b[m"), 2);
+    assert_eq!(console_strlen("e\u{301}"), 1);
+    assert_eq!(console_strlen("日本"), 4);
+}
+
+#[test]
+fn ref_view_renders_markers_and_children() {
+    let revision = view(12, "accepted", "Accepted", false, "PHID-USER-a");
+    let rendered = revision_ref_view(&revision);
+    assert_eq!(rendered.render(), "  *   D12 Work 12\n");
+    // Long titles truncate to the usable width (80 - 6 - name - 1).
+    let mut named = view(1, "accepted", "Accepted", false, "PHID-USER-a");
+    named.name = "w".repeat(100);
+    let rendered = revision_ref_view(&named).render();
+    assert!(rendered.starts_with("  *   D1 "));
+    assert!(rendered.ends_with("…\n"));
+    // Name-only markers keep PHP's `" "` title, trailing space included.
+    let marker = marker_ref_view("Branch \"fresh\"", "", "");
+    assert_eq!(marker.render(), "  *   Branch \"fresh\"  \n");
+    // URIs, lines, and children indent one level deeper.
+    let mut parent = revision_ref_view(&revision);
+    parent.lines.push("Status: Accepted".to_string());
+    parent
+        .children
+        .push(buildable_ref_view("B7", "https://phab.example.com/B7"));
+    let mut expected = String::from("  *   D12 Work 12\n");
+    expected.push_str("        Status: Accepted\n");
+    expected.push_str("  *     B7 Buildable \"B7\"\n");
+    expected.push_str(" ://      https://phab.example.com/B7\n");
+    assert_eq!(parent.render(), expected);
+    let build = build_ref_view(42, "Lint");
+    assert_eq!(build.render(), "  *   Build 42 Lint\n");
+}
+
+#[test]
+fn render_hint_prefixes_and_wraps() {
+    assert_eq!(render_hint("Use x."), "  ?   Use x.");
+    let long = "word ".repeat(30);
+    let rendered = render_hint(long.trim());
+    assert!(rendered.starts_with("  ?   word"));
+    assert!(rendered.contains("\n      word"));
 }
 
 #[test]
@@ -1091,6 +1307,46 @@ fn confirm_gates_cover_every_prompt() {
 }
 
 #[test]
+fn confirm_gates_name_example_status() {
+    let planned = view(
+        3,
+        "changes-planned",
+        "Changes Planned",
+        false,
+        "PHID-USER-a",
+    );
+    let published = view(4, "published", "Published", true, "PHID-USER-a");
+    let viewer = ViewerIdentity {
+        phid: "PHID-USER-a".to_string(),
+        name: "alice".to_string(),
+    };
+    for (revision, status) in [(&planned, "Changes Planned"), (&published, "Published")] {
+        let findings = land_checks::evaluate_gates(
+            std::slice::from_ref(revision),
+            &viewer.phid,
+            &[],
+            &[revision.phid.as_str()],
+            &[],
+            Some(1),
+        );
+        assert_eq!(findings.len(), 1);
+        let mut io = Io::canned(&["y"]);
+        confirm_revision_gates(
+            &mut io,
+            std::slice::from_ref(revision),
+            &viewer,
+            &[],
+            &[],
+            &findings,
+        )
+        .unwrap();
+        // The banner wraps, so compare with newlines flattened.
+        let flat = io.out.stdout.replace('\n', " ");
+        assert!(flat.contains(&format!("\"{status}\"")), "{}", io.out.stdout);
+    }
+}
+
+#[test]
 fn confirm_gates_render_parents_and_builds() {
     let child = view(2, "accepted", "Accepted", false, "PHID-USER-a");
     let parent = view(1, "needs-review", "Needs Review", false, "PHID-USER-a");
@@ -1107,6 +1363,10 @@ fn confirm_gates_render_parents_and_builds() {
         status: "failed".to_string(),
         plan_behavior: Some("always".to_string()),
         revision_phid: "PHID-DREV-2".to_string(),
+        build_id: 42,
+        build_name: "Lint".to_string(),
+        buildable_monogram: "B7".to_string(),
+        buildable_uri: "https://phab.example.com/B7".to_string(),
     }];
     let groups = land_checks::open_parent_groups(&links, &["PHID-DREV-2"]);
     assert_eq!(groups.len(), 1);
@@ -1125,7 +1385,21 @@ fn confirm_gates_render_parents_and_builds() {
     confirm_revision_gates(&mut io, &revisions, &viewer, &links, &builds, &findings).unwrap();
     assert!(io.out.stdout.contains("** 1 OPEN PARENT REVISION(S) **"));
     assert!(io.out.stdout.contains("Parent of: D2 Work 2"));
-    assert!(io.out.stdout.contains("** BUILD FAILURES **"));
+    // The builds banner has no leading blank line; each affected revision
+    // renders as a nested revision > buildable > builds tree.
+    assert!(
+        io.out
+            .stdout
+            .contains("** BUILD FAILURES **\n1 revision(s) have build failures:\n\n")
+    );
+    assert!(io.out.stdout.contains("  *   D2 Work 2\n"));
+    assert!(io.out.stdout.contains("  *     B7 Buildable \"B7\"\n"));
+    assert!(
+        io.out
+            .stdout
+            .contains(" ://      https://phab.example.com/B7\n")
+    );
+    assert!(io.out.stdout.contains("  *       Build 42 Lint\n"));
 }
 
 #[test]
@@ -1165,22 +1439,103 @@ fn onto_config_parses_string_and_list() {
 #[test]
 fn saved_prompts_read_map_and_list() {
     let dir = temp_dir("prompts");
+    let project = dir.join(".arcconfig");
     std::fs::write(
-        dir.join(".arcconfig"),
+        &project,
         r#"{"prompts": {"arc.land.confirm": "y", "arc.land.create": "n"}}"#,
     )
     .unwrap();
-    let saved = load_saved_prompts(&dir);
-    assert_eq!(saved.get("arc.land.confirm"), Some(&true));
-    assert_eq!(saved.get("arc.land.create"), Some(&false));
+    let saved = load_saved_prompts_from(&[(project, PromptScope::Project)]);
+    assert_eq!(
+        saved.get("arc.land.confirm").map(|s| s.response.as_str()),
+        Some("y")
+    );
+    assert_eq!(
+        saved.get("arc.land.confirm").map(|s| s.scope),
+        Some(PromptScope::Project)
+    );
     let dir = temp_dir("prompts-list");
+    let project = dir.join(".arcconfig");
     std::fs::write(
-        dir.join(".arcconfig"),
+        &project,
         r#"{"prompts": [{"prompt": "k", "response": "YES"}]}"#,
     )
     .unwrap();
-    assert_eq!(load_saved_prompts(&dir).get("k"), Some(&true));
-    assert!(load_saved_prompts(&temp_dir("prompts-none")).is_empty());
+    let saved = load_saved_prompts_from(&[(project, PromptScope::Project)]);
+    assert_eq!(saved.get("k").map(|s| s.response.as_str()), Some("YES"));
+    assert!(load_saved_prompts_from(&[]).is_empty());
+}
+
+#[test]
+fn saved_prompts_last_match_wins_across_sources() {
+    let dir = temp_dir("prompts-order");
+    let system = dir.join("system");
+    let user = dir.join("user");
+    let project = dir.join("project");
+    let local = dir.join("local");
+    std::fs::write(
+        &system,
+        r#"{"prompts": [{"prompt": "k", "response": "n"}]}"#,
+    )
+    .unwrap();
+    std::fs::write(&user, r#"{"prompts": [{"prompt": "k", "response": "y"}]}"#).unwrap();
+    std::fs::write(&project, r#"{"other": true}"#).unwrap();
+    std::fs::write(&local, "not json").unwrap();
+    let saved = load_saved_prompts_from(&[
+        (system, PromptScope::System),
+        (user, PromptScope::User),
+        (project, PromptScope::Project),
+        (local, PromptScope::WorkingCopy),
+    ]);
+    // Later sources win; missing keys and invalid files read empty.
+    assert_eq!(saved.get("k").map(|s| s.response.as_str()), Some("y"));
+    assert_eq!(saved.get("k").map(|s| s.scope), Some(PromptScope::User));
+}
+
+#[test]
+fn write_saved_prompt_replaces_and_appends() {
+    let dir = temp_dir("prompts-write");
+    // The parent directory does not exist yet; writing creates it.
+    let path = dir.join("sub").join("arcrc");
+    write_saved_prompt(&path, "k", "y").unwrap();
+    write_saved_prompt(&path, "other", "n").unwrap();
+    write_saved_prompt(&path, "k", "n").unwrap();
+    // No staging files leak next to the destination.
+    let mut entries: Vec<String> = std::fs::read_dir(dir.join("sub"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
+    assert_eq!(entries, vec!["arcrc".to_string()]);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.ends_with('\n'));
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        json.get("prompts").unwrap(),
+        &serde_json::json!([
+            {"prompt": "other", "response": "n"},
+            {"prompt": "k", "response": "n"},
+        ])
+    );
+    // Map-form values convert to lists; other keys survive.
+    std::fs::write(&path, r#"{"hosts": {"x": 1}, "prompts": {"k": "y"}}"#).unwrap();
+    write_saved_prompt(&path, "z", "n").unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        json.get("prompts").unwrap(),
+        &serde_json::json!([
+            {"prompt": "k", "response": "y"},
+            {"prompt": "z", "response": "n"},
+        ])
+    );
+    assert!(json.get("hosts").is_some());
+    // Malformed `prompts` values fail like PHP.
+    std::fs::write(&path, r#"{"prompts": 42}"#).unwrap();
+    assert_eq!(
+        write_saved_prompt(&path, "k", "y").unwrap_err(),
+        "Expected a natural list!"
+    );
 }
 
 #[test]
@@ -1341,6 +1696,81 @@ fn git_onto_remote_prefers_flag_config_upstream_origin() {
 }
 
 #[test]
+fn git_onto_remote_selects_perforce_mode() {
+    let repo = make_repo("onto-p4");
+    // A `p4` remote without `refs/remotes/p4` is not a Perforce remote.
+    assert!(!git_is_perforce_remote(&repo, "p4"));
+    assert!(!git_is_perforce_remote(&repo, "origin"));
+    std::fs::create_dir_all(repo.join(".git").join("refs").join("remotes").join("p4")).unwrap();
+    assert!(git_is_perforce_remote(&repo, "p4"));
+    let mut io = Io::canned(&[]);
+    let options = Options {
+        onto_remote: Some("p4".to_string()),
+        ..Options::default()
+    };
+    assert_eq!(
+        git_select_onto_remote(&repo, &mut io, &options, &["master".to_string()]).unwrap(),
+        "p4"
+    );
+    assert!(io.out.stderr.contains("** P4 MODE **"));
+    // Merge strategy is banned in Perforce mode.
+    let mut io = Io::canned(&[]);
+    let options = Options {
+        onto_remote: Some("p4".to_string()),
+        strategy: Some("merge".to_string()),
+        ..Options::default()
+    };
+    assert_eq!(
+        git_select_onto_remote(&repo, &mut io, &options, &["master".to_string()]).unwrap_err(),
+        "Perforce mode does not support the \"merge\" land strategy. Use the \"squash\" land \
+         strategy when landing to a Perforce remote (you can use \"--squash\" to select this \
+         strategy)."
+    );
+}
+
+#[test]
+fn git_p4_submit_argv_matches_php_passthru() {
+    assert_eq!(
+        git_p4_submit_argv("aaa"),
+        vec![
+            "-c",
+            "git-p4.skipSubmitEdit=true",
+            "-c",
+            "git-p4.skipSubmitEditCheck=true",
+            "p4",
+            "submit",
+            "--disable-rebase",
+            "-M",
+            "--conflict=quit",
+            "--commit",
+            "aaa",
+            "--",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn git_p4_submit_maps_failures_through_seam() {
+    // Spawning a directory always fails, on every platform: the seam maps
+    // spawn failures to the verbatim submit error, like PHP passthru.
+    let dir = temp_dir("p4-missing");
+    let program = dir.to_string_lossy().into_owned();
+    let mut io = Io::canned(&[]);
+    assert_eq!(
+        git_p4_submit_with(&dir, &program, &[], &mut io, "p4", "aaa",).unwrap_err(),
+        "Submit failed! Fix the error and run \"arc land\" again."
+    );
+    assert!(io.out.stderr.contains("** SUBMITTING **"));
+    assert_eq!(
+        git_p4_sync_with(&dir, &program, &[], "p4", "master",).unwrap_err(),
+        "Perforce sync failed! Fix the error and run \"arc land\" again."
+    );
+}
+
+#[test]
 fn git_onto_refs_follow_flag_config_upstream_default() {
     let (repo, _bare) = repo_with_origin("onto-refs");
     let options = Options {
@@ -1385,6 +1815,8 @@ fn git_confirm_onto_refs_prompts_for_new_branches() {
     git_confirm_onto_refs(&repo, &mut io, "origin", &["fresh".to_string()], true).unwrap();
     assert!(io.out.stdout.contains("** CREATE 1 BRANCHE(S) **"));
     assert!(io.out.stdout.contains("--hold"));
+    // New markers render as ref views outside the banner body.
+    assert!(io.out.stdout.contains("  *   Branch \"fresh\"  \n"));
     let mut io = Io::canned(&["n"]);
     assert!(
         git_confirm_onto_refs(&repo, &mut io, "origin", &["fresh".to_string()], false).is_err()
@@ -1611,20 +2043,236 @@ fn git_cascade_rebases_descendants() {
     assert!(io.out.is_empty());
 }
 
+fn saved_state(repo: &Path) -> GitLocalState {
+    save_local_state_git(repo, &mut Io::canned(&[])).unwrap()
+}
+
+fn repo_with_tracking_master(name: &str) -> PathBuf {
+    let repo = make_repo(name);
+    let bare = temp_dir(&format!("{name}-bare"));
+    git(&bare, &["init", "--bare", "-q"]);
+    git(&repo, &["remote", "add", "origin", &bare.to_string_lossy()]);
+    git(&repo, &["push", "-q", "origin", "master"]);
+    git(&repo, &["fetch", "-q", "origin"]);
+    git(
+        &repo,
+        &["branch", "--set-upstream-to=origin/master", "master"],
+    );
+    repo
+}
+
 #[test]
-fn git_reconcile_prefers_original_then_onto() {
-    let repo = make_repo("reconcile");
-    git(&repo, &["checkout", "-b", "feature"]);
-    git_reconcile(&repo, Some("feature"), None, &["master".to_string()], &[]);
-    assert_eq!(git(&repo, &["branch", "--show-current"]), "feature");
+fn git_reconcile_updates_tracking_branches_to_landed_commit() {
+    let repo = repo_with_tracking_master("reconcile-update");
+    git(&repo, &["checkout", "-qb", "feature"]);
+    let state = saved_state(&repo);
+    // Simulated landed squash on a detached head, then the pruned branch.
+    git(&repo, &["checkout", "-q", "--detach", "master"]);
+    let landed = commit_file(&repo, "landed.txt", "landed\n", "squash");
+    git(&repo, &["branch", "-D", "feature"]);
+    let mut io = Io::canned(&[]);
     git_reconcile(
         &repo,
-        Some("feature"),
+        &mut io,
+        &state,
+        &landed,
+        Some("master"),
+        "origin",
+        &["master".to_string(), "missing".to_string()],
+        &["feature".to_string()],
+    )
+    .unwrap();
+    assert!(io.out.stderr.contains("** UPDATE **"), "{}", io.out.stderr);
+    assert!(
+        io.out.stderr.contains("** CHECKOUT **"),
+        "{}",
+        io.out.stderr
+    );
+    assert_eq!(git(&repo, &["rev-parse", "master"]), landed);
+    assert_eq!(git(&repo, &["branch", "--show-current"]), "master");
+}
+
+#[test]
+fn git_reconcile_returns_to_unimpacted_original_branch() {
+    let repo = make_repo("reconcile-return");
+    git(&repo, &["checkout", "-qb", "feature"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    let state = saved_state(&repo);
+    let mut io = Io::canned(&[]);
+    git_reconcile(
+        &repo,
+        &mut io,
+        &state,
+        &head,
         None,
+        "origin",
+        &["master".to_string()],
+        &[],
+    )
+    .unwrap();
+    assert!(io.out.stderr.contains("** RETURN **"), "{}", io.out.stderr);
+    assert!(
+        io.out.stderr.contains("** LOAD STATE **"),
+        "{}",
+        io.out.stderr
+    );
+    assert_eq!(git(&repo, &["branch", "--show-current"]), "feature");
+}
+
+#[test]
+fn git_reconcile_stays_detached_without_pull_path() {
+    let repo = make_repo("reconcile-detached");
+    git(&repo, &["checkout", "-qb", "feature"]);
+    let state = saved_state(&repo);
+    git(&repo, &["checkout", "-q", "--detach", "master"]);
+    let landed = commit_file(&repo, "landed.txt", "landed\n", "squash");
+    git(&repo, &["branch", "-D", "feature"]);
+    let mut io = Io::canned(&[]);
+    git_reconcile(
+        &repo,
+        &mut io,
+        &state,
+        &landed,
+        Some("master"),
+        "origin",
         &["master".to_string()],
         &["feature".to_string()],
+    )
+    .unwrap();
+    assert!(
+        io.out.stderr.contains("** DETACHED HEAD **"),
+        "{}",
+        io.out.stderr
     );
-    assert_eq!(git(&repo, &["branch", "--show-current"]), "master");
+    assert_eq!(git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]), "HEAD");
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), landed);
+    // Nothing tracks the pushed ref, so local master stays stale.
+    assert_ne!(git(&repo, &["rev-parse", "master"]), landed);
+}
+
+#[test]
+fn git_reconcile_stops_at_branch_with_unpublished_changes() {
+    let repo = repo_with_tracking_master("reconcile-local-changes");
+    // Local-only commit on master, past the landed state.
+    let local = commit_file(&repo, "local.txt", "local\n", "local only");
+    git(&repo, &["checkout", "-qb", "feature"]);
+    let state = saved_state(&repo);
+    // Landed squash based on the pushed base, without the local commit.
+    git(&repo, &["checkout", "-q", "--detach", "origin/master"]);
+    let landed = commit_file(&repo, "landed.txt", "landed\n", "squash");
+    git(&repo, &["branch", "-D", "feature"]);
+    let mut io = Io::canned(&[]);
+    git_reconcile(
+        &repo,
+        &mut io,
+        &state,
+        &landed,
+        Some("master"),
+        "origin",
+        &["master".to_string()],
+        &["feature".to_string()],
+    )
+    .unwrap();
+    assert!(
+        io.out.stderr.contains("** LOCAL CHANGES **"),
+        "{}",
+        io.out.stderr
+    );
+    assert!(
+        io.out.stderr.contains("** DETACHED HEAD **"),
+        "{}",
+        io.out.stderr
+    );
+    assert!(!io.out.stderr.contains("** UPDATE **"));
+    assert!(!io.out.stderr.contains("** CHECKOUT **"));
+    assert_eq!(git(&repo, &["rev-parse", "master"]), local);
+    assert_eq!(git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]), "HEAD");
+}
+
+#[test]
+fn git_reconcile_ignores_cyclic_upstreams() {
+    let repo = make_repo("reconcile-cycle");
+    git(&repo, &["checkout", "-qb", "feature"]);
+    git(&repo, &["config", "branch.feature.remote", "."]);
+    git(
+        &repo,
+        &["config", "branch.feature.merge", "refs/heads/master"],
+    );
+    git(&repo, &["config", "branch.master.remote", "."]);
+    git(
+        &repo,
+        &["config", "branch.master.merge", "refs/heads/feature"],
+    );
+    let state = saved_state(&repo);
+    git(&repo, &["checkout", "-q", "--detach", "master"]);
+    let landed = commit_file(&repo, "landed.txt", "landed\n", "squash");
+    let mut io = Io::canned(&[]);
+    git_reconcile(
+        &repo,
+        &mut io,
+        &state,
+        &landed,
+        Some("master"),
+        "origin",
+        &["master".to_string()],
+        &[],
+    )
+    .unwrap();
+    assert!(
+        io.out.stderr.contains("** LOCAL CYCLE **"),
+        "{}",
+        io.out.stderr
+    );
+    // Every candidate cycles, so the surviving original branch is restored.
+    assert!(io.out.stderr.contains("** RETURN **"), "{}", io.out.stderr);
+    assert_eq!(git(&repo, &["branch", "--show-current"]), "feature");
+}
+
+#[test]
+fn git_reconcile_ignores_branches_tracking_other_remotes_or_refs() {
+    let repo = repo_with_tracking_master("reconcile-foreign");
+    git(&repo, &["checkout", "-qb", "feature"]);
+    let state = saved_state(&repo);
+    git(&repo, &["checkout", "-q", "--detach", "master"]);
+    let landed = commit_file(&repo, "landed.txt", "landed\n", "squash");
+    git(&repo, &["branch", "-D", "feature"]);
+    // Pushed to another remote: master tracks origin, not other.
+    let mut io = Io::canned(&[]);
+    git_reconcile(
+        &repo,
+        &mut io,
+        &state,
+        &landed,
+        Some("master"),
+        "other",
+        &["master".to_string()],
+        &["feature".to_string()],
+    )
+    .unwrap();
+    assert!(
+        io.out.stderr.contains("** DETACHED HEAD **"),
+        "{}",
+        io.out.stderr
+    );
+    // Pushed to another ref: master tracks origin/master, not stable.
+    let mut io = Io::canned(&[]);
+    git_reconcile(
+        &repo,
+        &mut io,
+        &state,
+        &landed,
+        Some("master"),
+        "origin",
+        &["stable".to_string()],
+        &["feature".to_string()],
+    )
+    .unwrap();
+    assert!(
+        io.out.stderr.contains("** DETACHED HEAD **"),
+        "{}",
+        io.out.stderr
+    );
+    assert_ne!(git(&repo, &["rev-parse", "master"]), landed);
 }
 
 #[test]
@@ -1636,6 +2284,7 @@ fn git_hold_text_lists_push_and_restore() {
         &["master".to_string()],
         "abcdef1234567890",
         &["git checkout feature --".to_string()],
+        false,
     );
     assert!(io.out.stdout.contains("** HOLD CHANGES **"));
     assert!(
@@ -1645,6 +2294,22 @@ fn git_hold_text_lists_push_and_restore() {
     );
     assert!(io.out.stdout.contains("git checkout feature --"));
     assert!(io.out.stdout.contains("same state as before"));
+    // Perforce mode: "submitted", and the manual `git p4 submit` command.
+    let mut io = Io::canned(&[]);
+    git_hold_text(
+        &mut io,
+        "p4",
+        &["master".to_string()],
+        "abcdef1234567890",
+        &[],
+        true,
+    );
+    assert!(io.out.stdout.contains("they have not been submitted."));
+    assert!(
+        io.out
+            .stdout
+            .contains("git p4 submit -M --commit abcdef1234567890 --")
+    );
 }
 
 #[test]
@@ -1732,11 +2397,19 @@ fn merge_conflict_banner_names_symbols_and_hints() {
         is_pick: false,
     };
     let mut io = Io::canned(&[]);
-    let err = git_merge_conflict(&mut io, &commits, &set, "aaa", "bbb", true);
+    let err = git_merge_conflict(&mut io, &commits, &set, "aaa", "bbb", false);
     assert_eq!(err, "Encountered a merge conflict.");
     assert!(io.out.stdout.contains("** MERGE CONFLICT **"));
     assert!(io.out.stdout.contains("\"feature\""));
-    assert!(io.out.stdout.contains("--incremental"));
+    // The hint renders as a `%?` line, and only without `--incremental`.
+    assert!(
+        io.out
+            .stdout
+            .contains("  ?   Use \"--incremental\" to merge and push changes one by one.\n\n")
+    );
+    let mut io = Io::canned(&[]);
+    git_merge_conflict(&mut io, &commits, &set, "aaa", "bbb", true);
+    assert!(!io.out.stdout.contains("--incremental"));
 }
 
 #[test]
@@ -1863,14 +2536,120 @@ fn hg_merge_and_push_surface_limits() {
 }
 
 #[test]
-fn ensure_clean_tree_checks_git() {
-    let repo = make_repo("clean");
-    ensure_clean_tree(&repo, Vcs::Git).unwrap();
-    std::fs::write(repo.join("file.txt"), "dirty\n").unwrap();
+fn save_local_state_captures_clean_git_tree() {
+    let repo = make_repo("local-clean");
+    git(&repo, &["checkout", "-b", "feature"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    let mut io = Io::canned(&[]);
+    let state = save_local_state_git(&repo, &mut io).unwrap();
     assert_eq!(
-        ensure_clean_tree(&repo, Vcs::Git).unwrap_err(),
-        "working tree is not clean; commit or stash your changes first (or use --preview)"
+        state,
+        GitLocalState {
+            local_ref: Some("feature".to_string()),
+            local_commit: head,
+            local_path: Some(git::UpstreamPath::new()),
+            stashed: false,
+        }
     );
+    assert!(io.out.is_empty());
+}
+
+#[test]
+fn save_local_state_stashes_dirty_git_tree() {
+    let repo = make_repo("local-dirty");
+    git(&repo, &["checkout", "-b", "feature"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    std::fs::write(repo.join("file.txt"), "dirty\n").unwrap();
+    std::fs::write(repo.join("new.txt"), "new\n").unwrap();
+    let mut io = Io::canned(&["y"]);
+    let state = save_local_state_git(&repo, &mut io).unwrap();
+    assert!(state.stashed);
+    assert_eq!(state.local_ref.as_deref(), Some("feature"));
+    assert_eq!(state.local_commit, head);
+    assert!(io.out.stdout.contains("** UNCOMMITTED CHANGES **"));
+    assert!(io.out.stdout.contains("Untracked Changes"));
+    assert!(io.out.stdout.contains("Unstaged Changes"));
+    assert!(io.out.stdout.contains(".git/info/exclude"));
+    assert!(io.out.stderr.contains("** SAVE STASH **"));
+    // The tree is clean again; discarding applies the stash back.
+    assert_eq!(git(&repo, &["status", "--porcelain"]), "");
+    discard_local_state_git(&repo, &mut io, &state).unwrap();
+    assert!(io.out.stderr.contains("** LOAD STASH **"));
+    assert_eq!(
+        std::fs::read_to_string(repo.join("file.txt")).unwrap(),
+        "dirty\n"
+    );
+    assert!(repo.join("new.txt").is_file());
+    // Declining the stash prompt aborts.
+    std::fs::write(repo.join("file.txt"), "dirty\n").unwrap();
+    let mut io = Io::canned(&["n"]);
+    assert_eq!(
+        save_local_state_git(&repo, &mut io).unwrap_err(),
+        "User aborted the workflow."
+    );
+}
+
+#[test]
+fn restore_local_state_checks_out_saved_git_ref() {
+    let repo = make_repo("local-restore");
+    git(&repo, &["checkout", "-b", "feature"]);
+    commit_file(&repo, "f.txt", "f\n", "feature work");
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    let mut io = Io::canned(&[]);
+    let state = save_local_state_git(&repo, &mut io).unwrap();
+    git(&repo, &["checkout", "master"]);
+    restore_local_state_git(&repo, &mut io, &state).unwrap();
+    assert_eq!(git(&repo, &["branch", "--show-current"]), "feature");
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), head);
+    assert!(io.out.stderr.contains("** LOAD STATE **"));
+    assert_eq!(
+        git_restore_commands(&state),
+        vec![format!(
+            "git checkout -B feature {} --",
+            head.chars().take(12).collect::<String>()
+        )]
+    );
+    // Detached HEAD restores the commit and renders without `-B`.
+    git(&repo, &["checkout", "--detach", "HEAD"]);
+    let detached = save_local_state_git(&repo, &mut Io::canned(&[])).unwrap();
+    assert_eq!(detached.local_ref, None);
+    assert_eq!(
+        git_restore_commands(&detached),
+        vec![format!(
+            "git checkout {} --",
+            head.chars().take(12).collect::<String>()
+        )]
+    );
+}
+
+#[test]
+fn change_lists_split_status_masks() {
+    let mut status = std::collections::BTreeMap::new();
+    status.insert("clean.txt".to_string(), 0);
+    status.insert("added.txt".to_string(), git::FLAG_UNTRACKED);
+    status.insert(
+        "edit.txt".to_string(),
+        git::FLAG_UNCOMMITTED | git::FLAG_UNSTAGED,
+    );
+    status.insert("stage.txt".to_string(), git::FLAG_UNCOMMITTED);
+    let lists = change_lists(&status, &GIT_CHANGE_FLAGS);
+    assert_eq!(lists.conflicts, Vec::<String>::new());
+    assert_eq!(lists.untracked, vec!["added.txt".to_string()]);
+    assert_eq!(lists.unstaged, vec!["edit.txt".to_string()]);
+    assert_eq!(lists.uncommitted, vec!["stage.txt".to_string()]);
+}
+
+#[test]
+fn gate_merge_conflicts_lists_files_and_fails() {
+    let dir = temp_dir("local-conflicts");
+    let mut io = Io::canned(&[]);
+    assert!(gate_merge_conflicts(&mut io, &dir, &[]).is_ok());
+    let mut io = Io::canned(&[]);
+    let err = gate_merge_conflicts(&mut io, &dir, &["a.txt".to_string()]).unwrap_err();
+    assert_eq!(err, "Resolve merge conflicts before proceeding.");
+    assert!(io.out.stdout.contains("** MERGE CONFLICTS **"));
+    assert!(io.out.stdout.contains("Untracked Changes"));
+    assert!(io.out.stdout.contains("    a.txt\n"));
 }
 
 #[test]

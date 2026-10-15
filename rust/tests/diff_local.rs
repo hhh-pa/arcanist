@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use arc_rs::diff_local;
+use arc_rs::{diff, diff_local};
 
 /* G1 full-state integration tests: parser on real diffs, VCS helpers. */
 
@@ -16,7 +16,7 @@ fn g1_unified_parser_on_real_git_diff() {
     let first = fx.commit_all("one");
     fx.write("f.txt", "a\nB2\nB3\nc\n");
     let text = diff_local::get_full_git_diff(fx.path(), &first, None, 3).unwrap();
-    let changes = diff_local::parse_unified_diff(&text);
+    let changes = diff_local::parse_unified_diff(&text).unwrap();
     assert_eq!(changes.len(), 1);
     let change = &changes[0];
     assert_eq!(change.current_path, "f.txt");
@@ -36,17 +36,20 @@ fn g1_unified_parser_on_real_git_diff() {
 #[test]
 fn g1_unified_parser_vcs_shapes() {
     let hg = "diff -r abc f.txt\n--- f.txt\tdate\n+++ f.txt\tdate\n@@ -1 +1 @@\n-a\n+b\n";
-    let changes = diff_local::parse_unified_diff(hg);
+    let changes = diff_local::parse_unified_diff(hg).unwrap();
     assert_eq!(changes[0].current_path, "f.txt");
     assert_eq!(changes[0].hunks.len(), 1);
 
     let svn =
         "Index: s.txt\n--- s.txt\t(revision 5)\n+++ s.txt\t(working copy)\n@@ -1 +1 @@\n-a\n+b\n";
-    assert_eq!(diff_local::parse_unified_diff(svn)[0].current_path, "s.txt");
+    assert_eq!(
+        diff_local::parse_unified_diff(svn).unwrap()[0].current_path,
+        "s.txt"
+    );
 
     let rename =
         "diff --git a/a b/b\nrename from a\nrename to b\n--- a/a\n+++ b/b\n@@ -1 +1 @@\n x\n";
-    let change = &diff_local::parse_unified_diff(rename)[0];
+    let change = &diff_local::parse_unified_diff(rename).unwrap()[0];
     assert_eq!(change.change_type, diff_local::TYPE_MOVE_HERE);
     assert_eq!(
         (change.old_path.as_str(), change.current_path.as_str()),
@@ -54,13 +57,13 @@ fn g1_unified_parser_vcs_shapes() {
     );
 
     let binary = "diff --git a/i.png b/i.png\nBinary files a/i.png and b/i.png differ\n";
-    let change = &diff_local::parse_unified_diff(binary)[0];
+    let change = &diff_local::parse_unified_diff(binary).unwrap()[0];
     assert_eq!(change.file_type, diff_local::FILE_BINARY);
     assert!(change.hunks.is_empty());
 
     let show =
         "commit abc\n\n    subject\n\ndiff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n";
-    let changes = diff_local::parse_unified_diff(show);
+    let changes = diff_local::parse_unified_diff(show).unwrap();
     assert_eq!(changes.len(), 2);
     assert!(changes[0].is_message());
     assert_eq!(changes[0].commit_hash.as_deref(), Some("abc"));
@@ -620,4 +623,190 @@ fn upstream_branch_feeds_onto_targets() {
 
     let configured = diff_local::diff_onto_targets(None, Some("stable"));
     assert_eq!(configured[0].kind, diff_local::DIFF_ONTO_CONFIG_KEY);
+}
+
+/* Gap2 D1: create-message edit loop over canned conduit. */
+
+#[test]
+fn gap2_create_message_loop_reedits_then_succeeds() {
+    use std::io::Cursor;
+    let fx = Fixture::named("gap2-d1-loop");
+    let meta = fx.path().join(".git");
+    std::fs::create_dir_all(&meta).unwrap();
+
+    let flaky = |method: &str, params: &serde_json::Value| -> Result<serde_json::Value, String> {
+        if method == "differential.parsecommitmessage"
+            && params["corpus"].as_str().unwrap_or("").contains("Bad")
+        {
+            return Ok(serde_json::json!({"fields": {}, "errors": ["Title is required."]}));
+        }
+        match method {
+            "differential.parsecommitmessage" => {
+                Ok(serde_json::json!({"fields": {"title": "Good"}, "errors": []}))
+            }
+            "differential.query" => Ok(serde_json::json!([])),
+            "user.query" => Ok(serde_json::json!({})),
+            other => Err(format!("unexpected conduit call {other}")),
+        }
+    };
+    let calls = std::cell::RefCell::new(0usize);
+    let edit = |_: &str| -> Result<String, String> {
+        *calls.borrow_mut() += 1;
+        if *calls.borrow() == 1 {
+            return Ok("Bad\n".to_string());
+        }
+        Ok("Good title\n".to_string())
+    };
+
+    let mut input = Cursor::new(b"y\n".to_vec());
+    let mut out = Vec::new();
+    let mut editor = diff_local::CreateMessageEditor {
+        reader: &mut input,
+        writer: &mut out,
+        call: &flaky,
+        metadata_dir: &meta,
+        work_root: fx.path(),
+        edit: &edit,
+        amend_commit: None,
+        user_phid: "PHID-USER-me",
+        away_offset: 0,
+    };
+    let message =
+        diff_local::edit_create_message(&mut editor, "Seed\n", "Seed\n", false, false, &[])
+            .unwrap();
+    assert_eq!(*calls.borrow(), 2);
+    assert_eq!(message.raw_corpus, "Good title\n");
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains(diff_local::COMMIT_MESSAGE_HAS_ERRORS),
+        "{text}"
+    );
+    assert!(text.contains("Title is required."), "{text}");
+    assert!(text.contains(diff_local::MUST_RESOLVE_ERRORS), "{text}");
+    // The final draft lands in the scratch file.
+    assert_eq!(
+        diff::read_scratch_file(&meta, diff_local::SCRATCH_CREATE_MESSAGE).as_deref(),
+        Some("Good title\n")
+    );
+}
+
+#[test]
+fn gap2_saved_template_resume_roundtrip() {
+    use std::io::Cursor;
+    let fx = Fixture::named("gap2-d1-resume");
+    let meta = fx.path().join(".git");
+    assert!(diff::write_scratch_file(
+        &meta,
+        diff_local::SCRATCH_CREATE_MESSAGE,
+        "Saved title\n"
+    ));
+
+    let mut out = Vec::new();
+    let reused = diff_local::resolve_saved_template(
+        &mut Cursor::new(b"y\n".to_vec()),
+        &mut out,
+        &meta,
+        fx.path(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(reused.as_deref(), Some("Saved title\n"));
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("You have a saved revision message"), "{text}");
+    assert!(
+        text.contains(diff_local::PROMPT_USE_SAVED_MESSAGE),
+        "{text}"
+    );
+}
+
+/* Gap2 D3: clean working-copy check over seams. */
+
+#[test]
+fn gap2_clean_check_commits_unstaged() {
+    use std::io::Cursor;
+    let added = std::cell::RefCell::new(Vec::<String>::new());
+    let add = |paths: &[String]| -> Result<(), String> {
+        added.borrow_mut().extend(paths.iter().cloned());
+        Ok(())
+    };
+    let committed = std::cell::RefCell::new(Vec::<String>::new());
+    let commit = |message: &str| -> Result<(), String> {
+        committed.borrow_mut().push(message.to_string());
+        Ok(())
+    };
+    let edit = |_: &str| -> Result<String, String> { Ok("Msg\n".to_string()) };
+    let vcs = diff_local::CleanCheckVcs {
+        kind: diff::VcsKind::Git,
+        work_path: "/repo".to_string(),
+        supports_local_commits: true,
+        can_stash: true,
+        autostash: false,
+        require_clean_untracked: true,
+        should_amend: false,
+        head_commit_message: None,
+        add_to_commit: Some(&add),
+        stash_changes: None,
+        do_commit: Some(&commit),
+        amend_commit: None,
+        edit: &edit,
+    };
+    let changes = diff_local::WorkingCopyChanges {
+        unstaged: vec!["s.txt".to_string()],
+        ..Default::default()
+    };
+
+    let mut out = Vec::new();
+    let outcome = diff_local::require_clean_working_copy(
+        &mut Cursor::new(b"y\n".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        diff_local::CommitMode::Allow,
+    )
+    .unwrap();
+    assert!(!outcome.stashed);
+    assert_eq!(added.borrow().as_slice(), ["s.txt".to_string()]);
+    assert_eq!(committed.borrow().as_slice(), ["Msg\n".to_string()]);
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains(diff_local::UNCOMMITTED_CHANGES_HERE),
+        "{text}"
+    );
+}
+
+#[test]
+fn gap2_clean_check_fatal_conflicts() {
+    use std::io::Cursor;
+    let edit = |_: &str| -> Result<String, String> { Ok(String::new()) };
+    let vcs = diff_local::CleanCheckVcs {
+        kind: diff::VcsKind::Git,
+        work_path: "/repo".to_string(),
+        supports_local_commits: true,
+        can_stash: true,
+        autostash: false,
+        require_clean_untracked: true,
+        should_amend: false,
+        head_commit_message: None,
+        add_to_commit: None,
+        stash_changes: None,
+        do_commit: None,
+        amend_commit: None,
+        edit: &edit,
+    };
+    let changes = diff_local::WorkingCopyChanges {
+        conflicts: vec!["c.txt".to_string()],
+        ..Default::default()
+    };
+
+    let mut out = Vec::new();
+    let err = diff_local::require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        diff_local::CommitMode::Allow,
+    )
+    .unwrap_err();
+    assert!(err.contains("Conflicts in working copy:"), "{err}");
+    assert!(err.contains("    c.txt"), "{err}");
 }

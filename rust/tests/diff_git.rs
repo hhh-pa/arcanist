@@ -738,6 +738,137 @@ fn create_submit_sends_fields_over_seam() {
 }
 
 #[test]
+fn gap2_browse_opens_created_uri_through_fake_opener() {
+    let fx = Fixture::named("gap2-browse");
+    fx.init_repo();
+    fx.write("f.txt", "a\n");
+    fx.commit_all("one");
+    fx.write("f.txt", "a\nb\n");
+
+    let opts = options(None, false);
+    let input = diff::prepare_submit(fx.path(), &opts, &diff::SubmitMode::Only).unwrap();
+    let canned = Canned::default()
+        .with("differential.creatediff", wire_fixture("creatediff"))
+        .with(
+            "differential.setdiffproperty",
+            wire_fixture("setdiffproperty"),
+        );
+    let call = |method: &str, params: &serde_json::Value| canned.call(method, params);
+    let report = diff::submit_over_with_uri(&call, &input).unwrap();
+    assert_eq!(
+        report.uri.as_deref(),
+        Some("https://phab.example.test/differential/diff/42/")
+    );
+    assert!(
+        report.text.contains("Created a new Differential diff:"),
+        "{}",
+        report.text
+    );
+
+    // Fake opener records instead of spawning a real browser.
+    let seen: RefCell<Vec<(String, Vec<String>)>> = RefCell::new(Vec::new());
+    let fake_open = |uri: &str, browser: &[String]| {
+        seen.borrow_mut().push((uri.to_string(), browser.to_vec()));
+        Ok(())
+    };
+    let never = |_: &str| false;
+    let configured = vec!["fake-browser".to_string()];
+    diff::open_submit_result_in_browser(
+        report.uri.as_deref(),
+        true,
+        Some(&configured),
+        &never,
+        &fake_open,
+    )
+    .unwrap();
+    assert_eq!(
+        *seen.borrow(),
+        vec![(
+            "https://phab.example.test/differential/diff/42/".to_string(),
+            configured.clone()
+        )]
+    );
+    // Without --browse the opener stays shut.
+    diff::open_submit_result_in_browser(
+        report.uri.as_deref(),
+        false,
+        Some(&configured),
+        &never,
+        &fake_open,
+    )
+    .unwrap();
+    assert_eq!(seen.borrow().len(), 1);
+}
+
+#[test]
+fn gap2_submit_report_uris_per_mode() {
+    let fx = Fixture::named("gap2-report-uris");
+    fx.init_repo();
+    fx.write("f.txt", "a\n");
+    fx.commit_all("one");
+    fx.write("f.txt", "a\nb\n");
+
+    let mut opts = options(None, false);
+    opts.message = Some("take two".to_string());
+    let input = diff::prepare_submit(fx.path(), &opts, &diff::SubmitMode::Update(123)).unwrap();
+    let canned = Canned::default()
+        .with("differential.creatediff", wire_fixture("creatediff"))
+        .with(
+            "differential.setdiffproperty",
+            wire_fixture("setdiffproperty"),
+        )
+        .with(
+            "differential.updaterevision",
+            wire_fixture("updaterevision"),
+        );
+    let call = |method: &str, params: &serde_json::Value| canned.call(method, params);
+    let report = diff::submit_over_with_uri(&call, &input).unwrap();
+    assert_eq!(
+        report.uri.as_deref(),
+        Some("https://phab.example.test/D123")
+    );
+
+    let fx = Fixture::named("gap2-report-uris-create");
+    fx.init_repo();
+    fx.write("f.txt", "a\n");
+    let first = fx.commit_all("one");
+    fx.write("f.txt", "a\nb\n");
+    fx.commit_all("Add feature");
+    fx.write("f.txt", "a\nb\nc\n");
+    let opts = options(Some(&first), false);
+    let input = diff::prepare_submit(fx.path(), &opts, &diff::SubmitMode::Create).unwrap();
+    let canned = Canned::default()
+        .with("differential.creatediff", wire_fixture("creatediff"))
+        .with(
+            "differential.setdiffproperty",
+            wire_fixture("setdiffproperty"),
+        )
+        .with(
+            "differential.createrevision",
+            wire_fixture("createrevision"),
+        );
+    let call = |method: &str, params: &serde_json::Value| canned.call(method, params);
+    let report = diff::submit_over_with_uri(&call, &input).unwrap();
+    assert_eq!(
+        report.uri.as_deref(),
+        Some("https://phab.example.test/D124")
+    );
+}
+
+#[test]
+fn gap2_browser_open_failure_names_uri_and_browser() {
+    let err = diff::open_uri_in_browser(
+        "http://x/D1",
+        &["definitely-not-a-browser-gap2".to_string()],
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        "Failed to open URI \"http://x/D1\" in browser (\"definitely-not-a-browser-gap2\"). Check your \"browser\" config option."
+    );
+}
+
+#[test]
 fn submit_with_no_changes_fails() {
     let fx = Fixture::named("submit-empty");
     fx.init_repo();
