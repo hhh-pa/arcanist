@@ -23,7 +23,7 @@ use crate::{
     amend, anoid, bookmarks, branches, browse, close_revision, commit, config, cover, diff,
     download, export, get_config, inspect, install_certificate, land, liberate, lint, linters,
     list, look, markers, paste, patch, prompt, set_config, tasks, terminal, todo, unit, upgrade,
-    upload, weld, which, work,
+    upload, version, weld, which, work,
 };
 
 /// Subcommand name, matching `arc alias`.
@@ -84,6 +84,7 @@ const BUILTINS: &[&str] = &[
     unit::NAME,
     upgrade::NAME,
     upload::NAME,
+    version::NAME,
     weld::NAME,
     which::NAME,
     work::NAME,
