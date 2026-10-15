@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/m-hu/arcanist/scripts/ci/go/internal/executil"
+	"github.com/m-hu/arcanist/scripts/ci/go/internal/pyjson"
 )
 
 const usage = `cargo-geiger gate (T968): fail when workspace ` + "`unsafe`" + ` grows.
@@ -278,8 +279,11 @@ func run(argv []string) int {
 			Comment     string `json:"_comment"`
 			UnsafeTotal int64  `json:"unsafe_total"`
 		}{baselineComment, total}
-		data, _ := json.MarshalIndent(base, "", " ")
-		data = append(data, '\n')
+		data, err := pyjson.MarshalIndent1(base)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cannot write baseline %s: %v\n", baselinePath, err)
+			return 1
+		}
 		if err := os.WriteFile(baselinePath, data, 0o666); err != nil {
 			fmt.Fprintf(os.Stderr, "cannot write baseline %s: %v\n", baselinePath, err)
 			return 1
