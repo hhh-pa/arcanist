@@ -717,15 +717,7 @@ impl<'a> Lexer<'a> {
     fn lex_php(&mut self) {
         let byte = self.bytes[self.pos];
         if self.starts_with(b"?>") {
-            let start = self.pos;
-            self.in_php = false;
-            let mut end = start + 2;
-            if self.bytes.get(end..end + 2) == Some(b"\r\n") {
-                end += 2;
-            } else if self.bytes.get(end) == Some(&b'\n') {
-                end += 1;
-            }
-            self.push(kinds::T_CLOSE_TAG, start, end);
+            self.lex_close_tag();
         } else if is_space_byte(byte) {
             self.lex_whitespace();
         } else if self.starts_with(b"//") || self.starts_with(b"#") || self.starts_with(b"/*") {
@@ -740,17 +732,33 @@ impl<'a> Lexer<'a> {
             self.lex_heredoc_or_shl();
         } else if byte == b'$' {
             self.lex_variable();
-        } else if byte.is_ascii_digit()
-            || (byte == b'.'
-                && self.pos + 1 < self.bytes.len()
-                && self.bytes[self.pos + 1].is_ascii_digit())
-        {
+        } else if self.at_number_start(byte) {
             self.lex_number();
         } else if is_label_start(byte) {
             self.lex_label();
         } else {
             self.lex_operator();
         }
+    }
+
+    fn lex_close_tag(&mut self) {
+        let start = self.pos;
+        self.in_php = false;
+        let mut end = start + 2;
+        if self.bytes.get(end..end + 2) == Some(b"\r\n") {
+            end += 2;
+        } else if self.bytes.get(end) == Some(&b'\n') {
+            end += 1;
+        }
+        self.push(kinds::T_CLOSE_TAG, start, end);
+    }
+
+    fn at_number_start(&self, byte: u8) -> bool {
+        byte.is_ascii_digit() || self.at_fraction_start(byte)
+    }
+
+    fn at_fraction_start(&self, byte: u8) -> bool {
+        byte == b'.' && self.pos + 1 < self.bytes.len() && self.bytes[self.pos + 1].is_ascii_digit()
     }
 
     fn lex_whitespace(&mut self) {
@@ -919,9 +927,15 @@ fn has_interpolation(literal: &[u8]) -> bool {
 /// Scan a heredoc/nowdoc at `start` (which points at `<<<`).
 /// Returns the one-past-end offset and whether it is a nowdoc.
 fn scan_heredoc(bytes: &[u8], start: usize) -> Option<(usize, bool)> {
+    let (label, body_start, quoted) = scan_heredoc_opener(bytes, start)?;
+    let end = scan_heredoc_body(bytes, body_start, label);
+    Some((end, quoted == Some(b'\'')))
+}
+
+fn scan_heredoc_opener(bytes: &[u8], start: usize) -> Option<(&[u8], usize, Option<u8>)> {
     let mut i = start + 3;
     let mut quoted: Option<u8> = None;
-    if i < bytes.len() && (bytes[i] == b'\'' || bytes[i] == b'"') {
+    if is_heredoc_quote(bytes, i) {
         quoted = Some(bytes[i]);
         i += 1;
     }
@@ -933,100 +947,165 @@ fn scan_heredoc(bytes: &[u8], start: usize) -> Option<(usize, bool)> {
         i += 1;
     }
     let label = &bytes[label_start..i];
-    if let Some(q) = quoted {
-        if i >= bytes.len() || bytes[i] != q {
-            return None;
-        }
-        i += 1;
-    }
-    if i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
+    let after_quote = skip_heredoc_quote(bytes, i, quoted)?;
+    if after_quote < bytes.len() && !is_line_break(bytes[after_quote]) {
         return None;
     }
-    while i < bytes.len() && (bytes[i] == b'\r' || bytes[i] == b'\n') {
+    let body_start = skip_line_breaks(bytes, after_quote);
+    Some((label, body_start, quoted))
+}
+
+fn is_heredoc_quote(bytes: &[u8], i: usize) -> bool {
+    i < bytes.len() && (bytes[i] == b'\'' || bytes[i] == b'"')
+}
+
+fn skip_heredoc_quote(bytes: &[u8], i: usize, quoted: Option<u8>) -> Option<usize> {
+    let Some(q) = quoted else {
+        return Some(i);
+    };
+    if i >= bytes.len() || bytes[i] != q {
+        return None;
+    }
+    Some(i + 1)
+}
+
+fn is_line_break(byte: u8) -> bool {
+    byte == b'\n' || byte == b'\r'
+}
+
+fn skip_line_breaks(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && is_line_break(bytes[i]) {
         i += 1;
     }
-    let body_start = i;
+    i
+}
+
+fn scan_heredoc_body(bytes: &[u8], body_start: usize, label: &[u8]) -> usize {
     let mut line_start = body_start;
-    i = body_start;
+    let mut i = body_start;
     while i <= bytes.len() {
-        let at_end = i == bytes.len();
-        let is_break = !at_end && (bytes[i] == b'\n' || bytes[i] == b'\r');
-        if at_end || is_break {
-            let mut j = line_start;
-            while j < i && (bytes[j] == b' ' || bytes[j] == b'\t') {
-                j += 1;
+        if heredoc_line_end(bytes, i) {
+            if let Some(end) = heredoc_close_at(bytes, line_start, i, label) {
+                return end;
             }
-            if bytes[j..i.min(bytes.len())].starts_with(label) {
-                let after = j + label.len();
-                let ok = after >= bytes.len()
-                    || (!is_label_char(bytes[after]) && bytes[after] != b'\x80');
-                if ok && after <= i {
-                    return Some((after, quoted == Some(b'\'')));
-                }
-            }
-            if at_end {
+            if i == bytes.len() {
                 break;
             }
-            while i < bytes.len() && (bytes[i] == b'\r' || bytes[i] == b'\n') {
-                i += 1;
-            }
+            i = skip_line_breaks(bytes, i);
             line_start = i;
             continue;
         }
         i += 1;
     }
-    Some((bytes.len(), quoted == Some(b'\'')))
+    bytes.len()
+}
+
+fn heredoc_line_end(bytes: &[u8], i: usize) -> bool {
+    i == bytes.len() || is_line_break(bytes[i])
+}
+
+fn heredoc_close_at(bytes: &[u8], line_start: usize, i: usize, label: &[u8]) -> Option<usize> {
+    let mut j = line_start;
+    while j < i && (bytes[j] == b' ' || bytes[j] == b'\t') {
+        j += 1;
+    }
+    if !bytes[j..i.min(bytes.len())].starts_with(label) {
+        return None;
+    }
+    let after = j + label.len();
+    if heredoc_close_ok(bytes, after, i) {
+        return Some(after);
+    }
+    None
+}
+
+fn heredoc_close_ok(bytes: &[u8], after: usize, i: usize) -> bool {
+    let ok = after >= bytes.len() || (!is_label_char(bytes[after]) && bytes[after] != b'\x80');
+    ok && after <= i
 }
 
 /// Scan a numeric literal; maximal munch keeps invalid literals
 /// (like `08`) whole for XHP125.
 fn scan_number(bytes: &[u8], start: usize) -> usize {
-    let mut i = start;
-    if bytes[i] == b'0' && i + 1 < bytes.len() && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X') {
-        i += 2;
-        let digits = i;
-        while i < bytes.len() && (bytes[i].is_ascii_hexdigit() || bytes[i] == b'_') {
-            i += 1;
-        }
-        return if i == digits { start + 1 } else { i };
+    if let Some(end) = scan_radix_int(bytes, start) {
+        return end;
     }
-    if bytes[i] == b'0' && i + 1 < bytes.len() && (bytes[i + 1] == b'b' || bytes[i + 1] == b'B') {
-        i += 2;
-        let digits = i;
-        while i < bytes.len() && (bytes[i] == b'0' || bytes[i] == b'1' || bytes[i] == b'_') {
-            i += 1;
-        }
-        return if i == digits { start + 1 } else { i };
+    let after_int = scan_digit_run(bytes, start);
+    let after_fraction = scan_fraction(bytes, after_int);
+    scan_exponent(bytes, after_fraction).max(start + 1)
+}
+
+fn scan_radix_int(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes[start] != b'0' || start + 1 >= bytes.len() {
+        return None;
     }
+    let marker = bytes[start + 1];
+    if marker == b'x' || marker == b'X' {
+        Some(scan_prefixed_run(bytes, start, true))
+    } else if marker == b'b' || marker == b'B' {
+        Some(scan_prefixed_run(bytes, start, false))
+    } else {
+        None
+    }
+}
+
+fn scan_prefixed_run(bytes: &[u8], start: usize, hex: bool) -> usize {
+    let mut i = start + 2;
+    let digits = i;
+    while i < bytes.len() && is_radix_digit(bytes[i], hex) {
+        i += 1;
+    }
+    if i == digits { start + 1 } else { i }
+}
+
+fn is_radix_digit(byte: u8, hex: bool) -> bool {
+    if hex {
+        byte.is_ascii_hexdigit() || byte == b'_'
+    } else {
+        byte == b'0' || byte == b'1' || byte == b'_'
+    }
+}
+
+fn scan_digit_run(bytes: &[u8], mut i: usize) -> usize {
     while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'_') {
         i += 1;
     }
-    if i < bytes.len() && bytes[i] == b'.' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
-        i += 1;
-        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'_') {
-            i += 1;
-        }
-    } else if i < bytes.len()
-        && bytes[i] == b'.'
-        && i + 1 < bytes.len()
-        && is_label_start(bytes[i + 1])
-    {
-        i += 1;
+    i
+}
+
+fn scan_fraction(bytes: &[u8], i: usize) -> usize {
+    if at_fraction_dot(bytes, i) {
+        scan_digit_run(bytes, i + 1)
+    } else if at_concat_dot(bytes, i) {
+        i + 1
+    } else {
+        i
     }
-    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
-        let mut j = i + 1;
-        if j < bytes.len() && (bytes[j] == b'+' || bytes[j] == b'-') {
-            j += 1;
-        }
-        if j < bytes.len() && bytes[j].is_ascii_digit() {
-            j += 1;
-            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b'_') {
-                j += 1;
-            }
-            i = j;
-        }
+}
+
+fn at_fraction_dot(bytes: &[u8], i: usize) -> bool {
+    i + 1 < bytes.len() && bytes[i] == b'.' && bytes[i + 1].is_ascii_digit()
+}
+
+fn at_concat_dot(bytes: &[u8], i: usize) -> bool {
+    i + 1 < bytes.len() && bytes[i] == b'.' && is_label_start(bytes[i + 1])
+}
+
+fn scan_exponent(bytes: &[u8], i: usize) -> usize {
+    if i >= bytes.len() || (bytes[i] != b'e' && bytes[i] != b'E') {
+        return i;
     }
-    i.max(start + 1)
+    scan_exponent_digits(bytes, i + 1).unwrap_or(i)
+}
+
+fn scan_exponent_digits(bytes: &[u8], mut j: usize) -> Option<usize> {
+    if j < bytes.len() && (bytes[j] == b'+' || bytes[j] == b'-') {
+        j += 1;
+    }
+    if j < bytes.len() && bytes[j].is_ascii_digit() {
+        return Some(scan_digit_run(bytes, j + 1));
+    }
+    None
 }
 
 fn match_operator(rest: &[u8]) -> (&'static str, usize) {
@@ -1170,27 +1249,15 @@ pub fn unquote_plain_string(literal: &str) -> Option<String> {
         return None;
     }
     let inner = literal.get(1..literal.len() - 1)?;
+    unquote_inner(inner, single)
+}
+
+fn unquote_inner(inner: &str, single: bool) -> Option<String> {
     let mut out = String::new();
     let mut chars = inner.chars();
     while let Some(ch) = chars.next() {
         if ch == '\\' {
-            let Some(next) = chars.next() else {
-                out.push('\\');
-                break;
-            };
-            if single {
-                if next == '\\' || next == '\'' {
-                    out.push(next);
-                } else {
-                    out.push('\\');
-                    out.push(next);
-                }
-            } else if next == '"' || next == '\\' || next == '$' {
-                out.push(next);
-            } else {
-                out.push('\\');
-                out.push(next);
-            }
+            push_unquote_escape(&mut chars, &mut out, single);
             continue;
         }
         if !single && ch == '$' {
@@ -1199,6 +1266,36 @@ pub fn unquote_plain_string(literal: &str) -> Option<String> {
         out.push(ch);
     }
     Some(out)
+}
+
+fn push_unquote_escape(chars: &mut std::str::Chars<'_>, out: &mut String, single: bool) {
+    let Some(next) = chars.next() else {
+        out.push('\\');
+        return;
+    };
+    if single {
+        push_single_escape(out, next);
+    } else {
+        push_double_escape(out, next);
+    }
+}
+
+fn push_single_escape(out: &mut String, next: char) {
+    if next == '\\' || next == '\'' {
+        out.push(next);
+    } else {
+        out.push('\\');
+        out.push(next);
+    }
+}
+
+fn push_double_escape(out: &mut String, next: char) {
+    if next == '"' || next == '\\' || next == '$' {
+        out.push(next);
+    } else {
+        out.push('\\');
+        out.push(next);
+    }
 }
 
 /// Interpolated variables in a double-quoted / heredoc / backtick
@@ -1824,6 +1921,13 @@ impl Tree {
     }
 
     fn block_at(&self, i: usize, tails: &[usize]) -> Option<Block> {
+        if let Some(block) = self.control_block_at(i, tails) {
+            return Some(block);
+        }
+        self.decl_block_at(i)
+    }
+
+    fn control_block_at(&self, i: usize, tails: &[usize]) -> Option<Block> {
         use kinds::*;
         match self.tokens[i].kind.as_str() {
             T_IF => Some(self.parse_paren_block(BlockKind::If, i)),
@@ -1837,6 +1941,14 @@ impl Tree {
             T_TRY => Some(self.parse_brace_only(BlockKind::Try, i)),
             T_CATCH => Some(self.parse_paren_block(BlockKind::Catch, i)),
             T_FINALLY => Some(self.parse_brace_only(BlockKind::Finally, i)),
+            T_DECLARE => Some(self.parse_paren_block(BlockKind::Declare, i)),
+            _ => None,
+        }
+    }
+
+    fn decl_block_at(&self, i: usize) -> Option<Block> {
+        use kinds::*;
+        match self.tokens[i].kind.as_str() {
             T_FUNCTION => self.parse_function(i),
             T_FN => Some(self.parse_arrow(i)),
             T_CLASS if self.class_is_declaration(i) => {
@@ -1845,7 +1957,6 @@ impl Tree {
             T_INTERFACE => Some(self.parse_class_like(BlockKind::Interface, i)),
             T_TRAIT => Some(self.parse_class_like(BlockKind::Trait, i)),
             T_ENUM => Some(self.parse_class_like(BlockKind::Enum, i)),
-            T_DECLARE => Some(self.parse_paren_block(BlockKind::Declare, i)),
             T_NAMESPACE => Some(self.parse_namespace(i)),
             _ => None,
         }
@@ -2105,6 +2216,24 @@ impl Tree {
     fn parse_function(&self, kw: usize) -> Option<Block> {
         let mut block = Block::new(BlockKind::Function, kw);
         block.modifiers = self.modifiers_before(kw);
+        let cur = self.function_name_end(kw, &mut block)?;
+        if self.tokens[cur].kind != "(" {
+            return None;
+        }
+        block.lparen = Some(cur);
+        block.rparen = self.match_close(cur);
+        let rparen = block.rparen.unwrap_or(cur);
+        block.params = self.parse_params(cur, rparen);
+        let after_use = self.closure_use_end(rparen, &mut block);
+        let after = self.skip_return_type(after_use);
+        let Some(body_at) = after else {
+            return Some(block);
+        };
+        block.body = self.body_from(body_at);
+        Some(block)
+    }
+
+    fn function_name_end(&self, kw: usize, block: &mut Block) -> Option<usize> {
         let mut cur = self.next_semantic(kw)?;
         if self.tokens[cur].kind == "&" {
             cur = self.next_semantic(cur)?;
@@ -2118,43 +2247,52 @@ impl Tree {
         } else {
             return None;
         }
-        if self.tokens[cur].kind != "(" {
-            return None;
+        Some(cur)
+    }
+
+    fn closure_use_end(&self, rparen: usize, block: &mut Block) -> Option<usize> {
+        let after = self.next_semantic(rparen);
+        if after.is_none_or(|a| self.tokens[a].kind != kinds::T_USE) {
+            return after;
         }
-        block.lparen = Some(cur);
-        block.rparen = self.match_close(cur);
-        let rparen = block.rparen.unwrap_or(cur);
-        block.params = self.parse_params(cur, rparen);
-        let mut after = self.next_semantic(rparen);
-        if after.is_some_and(|a| self.tokens[a].kind == kinds::T_USE) {
-            let use_kw = after.unwrap_or(rparen);
-            if let Some(lp) = self.next_semantic(use_kw)
-                && self.tokens[lp].kind == "("
-                && let Some(rp) = self.match_close(lp)
-            {
-                block.closure_use = Some((lp, rp));
-                after = self.next_semantic(rp);
-            }
+        let use_kw = after.unwrap_or(rparen);
+        if let Some(lp) = self.next_semantic(use_kw)
+            && self.tokens[lp].kind == "("
+            && let Some(rp) = self.match_close(lp)
+        {
+            block.closure_use = Some((lp, rp));
+            return self.next_semantic(rp);
         }
-        if after.is_some_and(|a| self.tokens[a].kind == ":") {
-            after = self.next_semantic(after.unwrap_or(rparen));
-            if let Some(ty) = after {
-                after = self.next_semantic(ty);
-                while after.is_some_and(|a| {
-                    matches!(
-                        self.tokens[a].kind.as_str(),
-                        "|" | "&" | kinds::T_STRING | "\\"
-                    )
-                }) {
-                    after = self.next_semantic(after.unwrap_or(ty));
-                }
-            }
-        }
-        let Some(body_at) = after else {
-            return Some(block);
+        after
+    }
+
+    fn skip_return_type(&self, after: Option<usize>) -> Option<usize> {
+        let Some(colon) = after else {
+            return after;
         };
-        block.body = self.body_from(body_at);
-        Some(block)
+        if self.tokens[colon].kind != ":" {
+            return after;
+        }
+        let first = self.next_semantic(colon)?;
+        self.union_type_end(first)
+    }
+
+    fn union_type_end(&self, first: usize) -> Option<usize> {
+        let mut next = self.next_semantic(first);
+        while let Some(a) = next {
+            if !self.is_union_member(a) {
+                break;
+            }
+            next = self.next_semantic(a);
+        }
+        next
+    }
+
+    fn is_union_member(&self, a: usize) -> bool {
+        matches!(
+            self.tokens[a].kind.as_str(),
+            "|" | "&" | kinds::T_STRING | "\\"
+        )
     }
 
     fn parse_arrow(&self, kw: usize) -> Block {
@@ -2214,39 +2352,12 @@ impl Tree {
     fn parse_class_like(&self, kind: BlockKind, kw: usize) -> Block {
         let mut block = Block::new(kind, kw);
         block.modifiers = self.modifiers_before(kw);
-        let Some(mut cur) = self.next_semantic(kw) else {
+        let Some(first) = self.next_semantic(kw) else {
             return block;
         };
-        if self.tokens[cur].kind == kinds::T_STRING {
-            block.name = Some(self.tokens[cur].value.clone());
-            block.name_idx = Some(cur);
-            cur = self.next_semantic(cur).unwrap_or(cur);
-        } else {
-            block.is_anonymous = kind == BlockKind::Class;
-        }
+        let mut cur = self.class_name_end(first, kind, &mut block);
         while cur < self.tokens.len() {
-            let kind_name = self.tokens[cur].kind.as_str();
-            if kind_name == kinds::T_EXTENDS {
-                if let Some(name_idx) = self.next_semantic(cur) {
-                    block.extends = Some((self.qualified_name(name_idx), name_idx));
-                    cur = name_idx;
-                }
-            } else if kind_name == kinds::T_IMPLEMENTS {
-                cur = self.parse_implements(&mut block, cur);
-            } else if kind_name == "{" || kind_name == ";" {
-                block.body = self.body_from(cur);
-                break;
-            } else if kind_name == "(" {
-                if let Some(close) = self.match_close(cur) {
-                    cur = close;
-                }
-            } else if is_semantic(&self.tokens[cur])
-                && kind_name != kinds::T_STRING
-                && kind_name != "\\"
-            {
-                break;
-            }
-            let Some(next) = self.next_semantic(cur) else {
+            let Some(next) = self.class_header_step(&mut block, cur) else {
                 break;
             };
             if next == cur {
@@ -2255,6 +2366,62 @@ impl Tree {
             cur = next;
         }
         block
+    }
+
+    fn class_name_end(&self, first: usize, kind: BlockKind, block: &mut Block) -> usize {
+        if self.tokens[first].kind == kinds::T_STRING {
+            block.name = Some(self.tokens[first].value.clone());
+            block.name_idx = Some(first);
+            self.next_semantic(first).unwrap_or(first)
+        } else {
+            block.is_anonymous = kind == BlockKind::Class;
+            first
+        }
+    }
+
+    /// Process one header token; returns the next cursor, or `None`
+    /// to stop scanning the header.
+    fn class_header_step(&self, block: &mut Block, cur: usize) -> Option<usize> {
+        let kind_name = self.tokens[cur].kind.as_str();
+        if kind_name == kinds::T_EXTENDS {
+            return self.class_extends_end(block, cur);
+        }
+        if kind_name == kinds::T_IMPLEMENTS {
+            let after = self.parse_implements(block, cur);
+            return self.next_semantic(after);
+        }
+        if kind_name == "{" || kind_name == ";" {
+            block.body = self.body_from(cur);
+            return None;
+        }
+        if kind_name == "(" {
+            return self.class_paren_end(cur);
+        }
+        if Self::class_header_breaks(&self.tokens[cur], kind_name) {
+            return None;
+        }
+        self.next_semantic(cur)
+    }
+
+    fn class_header_breaks(token: &Token, kind_name: &str) -> bool {
+        is_semantic(token) && kind_name != kinds::T_STRING && kind_name != "\\"
+    }
+
+    fn class_extends_end(&self, block: &mut Block, cur: usize) -> Option<usize> {
+        let mut end = cur;
+        if let Some(name_idx) = self.next_semantic(cur) {
+            block.extends = Some((self.qualified_name(name_idx), name_idx));
+            end = name_idx;
+        }
+        self.next_semantic(end)
+    }
+
+    fn class_paren_end(&self, cur: usize) -> Option<usize> {
+        let mut end = cur;
+        if let Some(close) = self.match_close(cur) {
+            end = close;
+        }
+        self.next_semantic(end)
     }
 
     fn qualified_name(&self, mut idx: usize) -> String {
@@ -2357,56 +2524,12 @@ impl Tree {
     }
 
     fn parse_param(&self, first: usize, last: usize) -> Option<Param> {
-        let mut name_idx = None;
-        let mut eq_at = None;
-        let mut depth: u32 = 0;
-        let mut i = first;
-        while i <= last {
-            let kind_name = self.tokens[i].kind.as_str();
-            if is_open(kind_name) {
-                depth += 1;
-            } else if is_close(kind_name) {
-                depth = depth.saturating_sub(1);
-            } else if depth == 0 && kind_name == "=" && eq_at.is_none() {
-                eq_at = Some(i);
-            } else if depth == 0 && kind_name == kinds::T_VARIABLE && name_idx.is_none() {
-                name_idx = Some(i);
-            }
-            i += 1;
-        }
+        let (name_idx, eq_at) = scan_param_name(self, first, last);
         let name_idx = name_idx?;
         let name = self.tokens[name_idx].value.clone();
-        let mut by_ref = false;
-        let mut variadic = false;
-        let mut j = first;
-        while j < name_idx {
-            match self.tokens[j].kind.as_str() {
-                "&" => by_ref = true,
-                kinds::T_ELLIPSIS => variadic = true,
-                _ => {}
-            }
-            j += 1;
-        }
-        let ty_end = walker_before_name(self, first, name_idx);
-        let ty = ty_end.and_then(|end| {
-            let mut start = first;
-            while start <= end && !is_semantic(&self.tokens[start]) {
-                start += 1;
-            }
-            if start <= end {
-                Some((start, end))
-            } else {
-                None
-            }
-        });
-        let default = eq_at.and_then(|eq| {
-            let start = eq + 1;
-            if start <= last {
-                trim_trivia(self, start, last)
-            } else {
-                None
-            }
-        });
+        let (by_ref, variadic) = scan_param_flags(self, first, name_idx);
+        let ty = param_ty_range(self, first, name_idx);
+        let default = param_default_range(self, eq_at, last);
         Some(Param {
             name,
             name_idx,
@@ -2415,6 +2538,73 @@ impl Tree {
             by_ref,
             variadic,
         })
+    }
+}
+
+fn scan_param_name(tree: &Tree, first: usize, last: usize) -> (Option<usize>, Option<usize>) {
+    let mut name_idx = None;
+    let mut eq_at = None;
+    let mut depth: u32 = 0;
+    let mut i = first;
+    while i <= last {
+        let kind_name = tree.tokens[i].kind.as_str();
+        if is_open(kind_name) {
+            depth += 1;
+        } else if is_close(kind_name) {
+            depth = depth.saturating_sub(1);
+        } else if param_name_eq(kind_name, depth, eq_at) {
+            eq_at = Some(i);
+        } else if param_name_var(kind_name, depth, name_idx) {
+            name_idx = Some(i);
+        }
+        i += 1;
+    }
+    (name_idx, eq_at)
+}
+
+fn param_name_eq(kind_name: &str, depth: u32, eq_at: Option<usize>) -> bool {
+    depth == 0 && kind_name == "=" && eq_at.is_none()
+}
+
+fn param_name_var(kind_name: &str, depth: u32, name_idx: Option<usize>) -> bool {
+    depth == 0 && kind_name == kinds::T_VARIABLE && name_idx.is_none()
+}
+
+fn scan_param_flags(tree: &Tree, first: usize, name_idx: usize) -> (bool, bool) {
+    let mut by_ref = false;
+    let mut variadic = false;
+    let mut j = first;
+    while j < name_idx {
+        match tree.tokens[j].kind.as_str() {
+            "&" => by_ref = true,
+            kinds::T_ELLIPSIS => variadic = true,
+            _ => {}
+        }
+        j += 1;
+    }
+    (by_ref, variadic)
+}
+
+fn param_ty_range(tree: &Tree, first: usize, name_idx: usize) -> Option<(usize, usize)> {
+    let end = walker_before_name(tree, first, name_idx)?;
+    let mut start = first;
+    while start <= end && !is_semantic(&tree.tokens[start]) {
+        start += 1;
+    }
+    if start <= end {
+        Some((start, end))
+    } else {
+        None
+    }
+}
+
+fn param_default_range(tree: &Tree, eq_at: Option<usize>, last: usize) -> Option<(usize, usize)> {
+    let eq = eq_at?;
+    let start = eq + 1;
+    if start <= last {
+        trim_trivia(tree, start, last)
+    } else {
+        None
     }
 }
 

@@ -42,6 +42,11 @@
 //! - 128: ArcanistContinueInsideSwitchXHPASTLinterRule
 //! - 132: ArcanistPartialCatchXHPASTLinterRule (`catch (Exception`)
 //!
+//! Ported in this subset: 3, 79, 90, 97, 98, 99. The rest (5, 17,
+//! 20, 22, 23, 30, 32, 39, 45, 50, 69, 76, 77, 128, 132) are
+//! deferred to a follow-up increment; see
+//! `super::blocked_rules`.
+//!
 //! Contract: read each PHP rule's `process()` and reproduce its
 //! trigger conditions against [`super::xhp_ast`] (`Tree::blocks`
 //! with `cases`/`linked`, token scans). Emit
@@ -119,7 +124,10 @@ fn rule_nested_namespaces(ctx: &RuleCtx, out: &mut Vec<RawFinding>) {
         if block.kind != BlockKind::Namespace {
             continue;
         }
-        if block.parent.is_some_and(|p| blocks[p].kind == BlockKind::Namespace) {
+        if block
+            .parent
+            .is_some_and(|p| blocks[p].kind == BlockKind::Namespace)
+        {
             push(
                 out,
                 90,
@@ -404,71 +412,101 @@ fn statement_node_type(tree: &Tree, first: usize) -> &'static str {
     if let Some(mapped) = keyword_statement_type(kind) {
         return mapped;
     }
-    match kind {
-        ";" => "n_EMPTY",
-        "{" => "n_STATEMENT_LIST",
-        kinds::T_VARIABLE => variable_statement_type(tree, first),
-        kinds::T_STRING => string_statement_type(tree, first),
-        kinds::T_LNUMBER | kinds::T_DNUMBER => "n_NUMERIC_SCALAR",
-        kinds::T_CONSTANT_ENCAPSED_STRING => "n_STRING_SCALAR",
-        kinds::T_INTERPOLATED_STRING => "n_CONCATENATION_LIST",
-        kinds::T_HEREDOC | kinds::T_NOWDOC => "n_HEREDOC",
-        kinds::T_BACKTICK => "n_BACKTICKS_EXPRESSION",
-        "(" => "n_PARENTHETICAL_EXPRESSION",
-        "[" => "n_ARRAY_LITERAL",
-        "$" => "n_VARIABLE_VARIABLE",
-        kinds::T_INC | kinds::T_DEC => "n_UNARY_POSTFIX_EXPRESSION",
-        "+" | "-" | "!" | "~" | "@" => "n_UNARY_PREFIX_EXPRESSION",
-        kinds::T_CLASS_C
-        | kinds::T_FUNC_C
-        | kinds::T_METHOD_C
-        | kinds::T_FILE
-        | kinds::T_DIR
-        | kinds::T_LINE
-        | kinds::T_NS_C
-        | kinds::T_TRAIT_C => "n_MAGIC_SCALAR",
-        kinds::T_INLINE_HTML => "n_INLINE_HTML",
-        kinds::T_CLOSE_TAG => "n_EMPTY",
-        _ => "n_STATEMENT",
+    if kind == kinds::T_VARIABLE {
+        return variable_statement_type(tree, first);
     }
+    if kind == kinds::T_STRING {
+        return string_statement_type(tree, first);
+    }
+    symbol_statement_type(kind)
+}
+
+fn symbol_statement_type(kind: &str) -> &'static str {
+    const TABLE: &[(&str, &str)] = &[
+        (";", "n_EMPTY"),
+        ("{", "n_STATEMENT_LIST"),
+        (kinds::T_LNUMBER, "n_NUMERIC_SCALAR"),
+        (kinds::T_DNUMBER, "n_NUMERIC_SCALAR"),
+        (kinds::T_CONSTANT_ENCAPSED_STRING, "n_STRING_SCALAR"),
+        (kinds::T_INTERPOLATED_STRING, "n_CONCATENATION_LIST"),
+        (kinds::T_HEREDOC, "n_HEREDOC"),
+        (kinds::T_NOWDOC, "n_HEREDOC"),
+        (kinds::T_BACKTICK, "n_BACKTICKS_EXPRESSION"),
+        ("(", "n_PARENTHETICAL_EXPRESSION"),
+        ("[", "n_ARRAY_LITERAL"),
+        ("$", "n_VARIABLE_VARIABLE"),
+        (kinds::T_INC, "n_UNARY_POSTFIX_EXPRESSION"),
+        (kinds::T_DEC, "n_UNARY_POSTFIX_EXPRESSION"),
+        ("+", "n_UNARY_PREFIX_EXPRESSION"),
+        ("-", "n_UNARY_PREFIX_EXPRESSION"),
+        ("!", "n_UNARY_PREFIX_EXPRESSION"),
+        ("~", "n_UNARY_PREFIX_EXPRESSION"),
+        ("@", "n_UNARY_PREFIX_EXPRESSION"),
+        (kinds::T_CLASS_C, "n_MAGIC_SCALAR"),
+        (kinds::T_FUNC_C, "n_MAGIC_SCALAR"),
+        (kinds::T_METHOD_C, "n_MAGIC_SCALAR"),
+        (kinds::T_FILE, "n_MAGIC_SCALAR"),
+        (kinds::T_DIR, "n_MAGIC_SCALAR"),
+        (kinds::T_LINE, "n_MAGIC_SCALAR"),
+        (kinds::T_NS_C, "n_MAGIC_SCALAR"),
+        (kinds::T_TRAIT_C, "n_MAGIC_SCALAR"),
+        (kinds::T_INLINE_HTML, "n_INLINE_HTML"),
+        (kinds::T_CLOSE_TAG, "n_EMPTY"),
+    ];
+    lookup_statement_type(TABLE, kind).unwrap_or("n_STATEMENT")
+}
+
+fn lookup_statement_type(
+    table: &[(&'static str, &'static str)],
+    kind: &str,
+) -> Option<&'static str> {
+    table
+        .iter()
+        .find(|(key, _)| *key == kind)
+        .map(|(_, value)| *value)
 }
 
 fn keyword_statement_type(kind: &str) -> Option<&'static str> {
-    match kind {
-        kinds::T_ECHO | kinds::T_PRINT => Some("n_ECHO_LIST"),
-        kinds::T_INCLUDE | kinds::T_INCLUDE_ONCE | kinds::T_REQUIRE | kinds::T_REQUIRE_ONCE => {
-            Some("n_INCLUDE_FILE")
-        }
-        kinds::T_IF => Some("n_IF"),
-        kinds::T_FUNCTION => Some("n_FUNCTION_DECLARATION"),
-        kinds::T_CLASS | kinds::T_TRAIT => Some("n_CLASS_DECLARATION"),
-        kinds::T_INTERFACE => Some("n_INTERFACE_DECLARATION"),
-        kinds::T_RETURN => Some("n_RETURN"),
-        kinds::T_FOREACH => Some("n_FOREACH"),
-        kinds::T_FOR => Some("n_FOR"),
-        kinds::T_WHILE => Some("n_WHILE"),
-        kinds::T_DO => Some("n_DO_WHILE"),
-        kinds::T_SWITCH => Some("n_SWITCH"),
-        kinds::T_TRY => Some("n_TRY"),
-        kinds::T_THROW => Some("n_THROW"),
-        kinds::T_BREAK => Some("n_BREAK"),
-        kinds::T_CONTINUE => Some("n_CONTINUE"),
-        kinds::T_GLOBAL => Some("n_GLOBAL_DECLARATION_LIST"),
-        kinds::T_STATIC => Some("n_STATIC_DECLARATION_LIST"),
-        kinds::T_CONST => Some("n_CONSTANT_DECLARATION_LIST"),
-        kinds::T_USE => Some("n_USE_LIST"),
-        kinds::T_DECLARE => Some("n_DECLARE"),
-        kinds::T_GOTO => Some("n_GOTO"),
-        kinds::T_UNSET => Some("n_UNSET_LIST"),
-        kinds::T_YIELD => Some("n_YIELD"),
-        kinds::T_CLONE => Some("n_UNARY_PREFIX_EXPRESSION"),
-        kinds::T_EXIT => Some("n_UNARY_PREFIX_EXPRESSION"),
-        kinds::T_ISSET | kinds::T_EMPTY | kinds::T_EVAL => Some("n_FUNCTION_CALL"),
-        kinds::T_NAMESPACE => Some("n_NAMESPACE"),
-        kinds::T_LIST => Some("n_BINARY_EXPRESSION"),
-        kinds::T_NEW => Some("n_NEW"),
-        _ => None,
-    }
+    const TABLE: &[(&str, &str)] = &[
+        (kinds::T_ECHO, "n_ECHO_LIST"),
+        (kinds::T_PRINT, "n_ECHO_LIST"),
+        (kinds::T_INCLUDE, "n_INCLUDE_FILE"),
+        (kinds::T_INCLUDE_ONCE, "n_INCLUDE_FILE"),
+        (kinds::T_REQUIRE, "n_INCLUDE_FILE"),
+        (kinds::T_REQUIRE_ONCE, "n_INCLUDE_FILE"),
+        (kinds::T_IF, "n_IF"),
+        (kinds::T_FUNCTION, "n_FUNCTION_DECLARATION"),
+        (kinds::T_CLASS, "n_CLASS_DECLARATION"),
+        (kinds::T_TRAIT, "n_CLASS_DECLARATION"),
+        (kinds::T_INTERFACE, "n_INTERFACE_DECLARATION"),
+        (kinds::T_RETURN, "n_RETURN"),
+        (kinds::T_FOREACH, "n_FOREACH"),
+        (kinds::T_FOR, "n_FOR"),
+        (kinds::T_WHILE, "n_WHILE"),
+        (kinds::T_DO, "n_DO_WHILE"),
+        (kinds::T_SWITCH, "n_SWITCH"),
+        (kinds::T_TRY, "n_TRY"),
+        (kinds::T_THROW, "n_THROW"),
+        (kinds::T_BREAK, "n_BREAK"),
+        (kinds::T_CONTINUE, "n_CONTINUE"),
+        (kinds::T_GLOBAL, "n_GLOBAL_DECLARATION_LIST"),
+        (kinds::T_STATIC, "n_STATIC_DECLARATION_LIST"),
+        (kinds::T_CONST, "n_CONSTANT_DECLARATION_LIST"),
+        (kinds::T_USE, "n_USE_LIST"),
+        (kinds::T_DECLARE, "n_DECLARE"),
+        (kinds::T_GOTO, "n_GOTO"),
+        (kinds::T_UNSET, "n_UNSET_LIST"),
+        (kinds::T_YIELD, "n_YIELD"),
+        (kinds::T_CLONE, "n_UNARY_PREFIX_EXPRESSION"),
+        (kinds::T_EXIT, "n_UNARY_PREFIX_EXPRESSION"),
+        (kinds::T_ISSET, "n_FUNCTION_CALL"),
+        (kinds::T_EMPTY, "n_FUNCTION_CALL"),
+        (kinds::T_EVAL, "n_FUNCTION_CALL"),
+        (kinds::T_NAMESPACE, "n_NAMESPACE"),
+        (kinds::T_LIST, "n_BINARY_EXPRESSION"),
+        (kinds::T_NEW, "n_NEW"),
+    ];
+    lookup_statement_type(TABLE, kind)
 }
 
 fn variable_statement_type(tree: &Tree, first: usize) -> &'static str {

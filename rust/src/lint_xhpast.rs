@@ -10,10 +10,12 @@
 //! carries a syntax error, else `XHP2` "Unable to Parse"),
 //! mirroring PHP `resolveFuture()`. On a zero exit the JSON AST
 //! output is parsed (see [`xhp_ast`]) and the ported rule tree
-//! (`xhp_calls`, `xhp_style`, `xhp_decl`, `xhp_flow`) runs over it,
-//! emitting PHP-identical rule IDs, severities, and message text.
-//! When the binary is absent the linter is inactive and reports no
-//! messages.
+//! (`xhp_calls`, `xhp_style`, `xhp_flow`, plus the `xhp_decl`
+//! declaration rules once implemented) runs over it, emitting
+//! PHP-identical rule IDs, severities, and message text for the
+//! ported subset ([`RULE_TABLE`]); the unported remainder is listed
+//! in [`blocked_rules`]. When the binary is absent the linter is
+//! inactive and reports no messages.
 //!
 //! Divergences from PHP:
 //! - The real `xhpast` wire format is undocumented in-repo
@@ -83,85 +85,55 @@ pub fn command_flags() -> Vec<String> {
     Vec::new()
 }
 
-/// Rule metadata: (ID, lint name, severity), mirroring the PHP
-/// `getLintName()` / `getLintSeverity()` pairs (rules without an
-/// override default to error, per `ArcanistXHPASTLinterRule`).
+/// Rule metadata for PORTED rules: (ID, lint name, severity),
+/// mirroring the PHP `getLintName()` / `getLintSeverity()` pairs
+/// (rules without an override default to error, per
+/// `ArcanistXHPASTLinterRule`). Unported rules live in
+/// [`blocked_rules`].
 pub const RULE_TABLE: &[(u32, &str, &str)] = &[
     (1, "PHP Syntax Error!", SEVERITY_ERROR),
     (2, "Unable to Parse", SEVERITY_WARNING),
     (3, "Use of Variable Variable", SEVERITY_ERROR),
     (4, "Use of `extract`", SEVERITY_ERROR),
-    (5, "Use of Undeclared Variable", SEVERITY_ERROR),
     (6, "Use of Short Tag `<?`", SEVERITY_ERROR),
     (7, "Use of Echo Tag `<?=`", SEVERITY_ERROR),
     (8, "Use of Close Tag `?>`", SEVERITY_ERROR),
-    (9, "Naming Conventions", SEVERITY_WARNING),
-    (10, "Implicit Constructor", SEVERITY_ERROR),
     (12, "Dynamic `define`", SEVERITY_ERROR),
-    (13, "Use of `$this` in Static Context", SEVERITY_ERROR),
     (15, "Expected Open Tag", SEVERITY_ERROR),
     (16, "TODO Comment", SEVERITY_DISABLED),
-    (17, "`exit` Used as Expression", SEVERITY_ERROR),
     (18, "Comment Style", SEVERITY_ERROR),
-    (19, "Class-Filename Mismatch", SEVERITY_ERROR),
-    (20, "Tautological Expression", SEVERITY_ERROR),
     (21, "Not String Concatenation", SEVERITY_ERROR),
-    (22, "Duplicate Keys in Array", SEVERITY_ERROR),
-    (23, "Reuse of Iterator Variable", SEVERITY_ERROR),
-    (24, "Brace Placement", SEVERITY_WARNING),
     (25, "Spaces Inside Parentheses", SEVERITY_WARNING),
     (26, "Space After Control Statement", SEVERITY_WARNING),
     (27, "Space Around Binary Operator", SEVERITY_WARNING),
     (28, "Spacing Before Array Index", SEVERITY_WARNING),
-    (30, "Implicit Fallthrough", SEVERITY_WARNING),
-    (32, "Variable Reused As Iterator", SEVERITY_ERROR),
     (34, "Comment Spaces", SEVERITY_ADVICE),
     (36, "Slow Construct", SEVERITY_WARNING),
     (37, "Call Formatting", SEVERITY_WARNING),
     (38, "Declaration Formatting", SEVERITY_WARNING),
-    (39, "Reuse of Iterator References", SEVERITY_WARNING),
     (40, "Keyword Conventions", SEVERITY_WARNING),
     (41, "Unnecessary Double Quotes", SEVERITY_ADVICE),
     (42, "`elseif` Usage", SEVERITY_ADVICE),
     (43, "Semicolon Spacing", SEVERITY_ADVICE),
     (44, "Concatenation Spacing", SEVERITY_WARNING),
-    (45, "PHP Compatibility", SEVERITY_ERROR),
     (46, "Language Construct Parentheses", SEVERITY_WARNING),
     (47, "Empty Block Statement", SEVERITY_ADVICE),
     (48, "Array Separator", SEVERITY_ADVICE),
     (49, "Constructor Parentheses", SEVERITY_ADVICE),
-    (50, "Duplicate Case Statements", SEVERITY_ERROR),
     (51, "Use of Blacklisted Function", SEVERITY_ERROR),
-    (52, "Implicit Method Visibility", SEVERITY_ADVICE),
     (53, "Call-Time Pass-By-Reference", SEVERITY_ERROR),
     (54, "Formatted String", SEVERITY_ERROR),
-    (55, "Unnecessary Final Modifier", SEVERITY_ADVICE),
     (56, "Unnecessary Semicolon", SEVERITY_ADVICE),
-    (57, "Self Member Reference", SEVERITY_WARNING),
     (58, "Logical Operators", SEVERITY_ADVICE),
-    (59, "Inner Functions", SEVERITY_WARNING),
-    (60, "Default Parameters", SEVERITY_WARNING),
     (61, "Lowercase Functions", SEVERITY_ADVICE),
     (62, "Class Name Literal", SEVERITY_ADVICE),
-    (63, "Useless Overriding Method", SEVERITY_ADVICE),
-    (64, "No Parent Scope", SEVERITY_ERROR),
     (65, "Alias Functions", SEVERITY_ADVICE),
     (66, "Cast Spacing", SEVERITY_ADVICE),
-    (
-        67,
-        "Throwing Exception in `__toString` Method",
-        SEVERITY_ERROR,
-    ),
     (68, "`__lambda_func` Function", SEVERITY_ERROR),
-    (69, "`instanceof` Operator", SEVERITY_ERROR),
-    (70, "Invalid Default Parameter", SEVERITY_ERROR),
     (71, "Modifier Ordering", SEVERITY_ADVICE),
-    (72, "Invalid Modifiers", SEVERITY_ERROR),
     (73, "Space After Unary Prefix Operator", SEVERITY_WARNING),
     (74, "Object Operator Spacing", SEVERITY_WARNING),
     (75, "Space Before Unary Postfix Operator", SEVERITY_WARNING),
-    (76, "Array Element", SEVERITY_WARNING),
-    (77, "List Assignment", SEVERITY_WARNING),
     (78, "Inline HTML", SEVERITY_DISABLED),
     (79, "Global Variables", SEVERITY_WARNING),
     (80, "Questionable Use of `parse_str`", SEVERITY_ERROR),
@@ -171,12 +143,7 @@ pub const RULE_TABLE: &[(u32, &str, &str)] = &[
     (84, "`array_combine()` Unreliable", SEVERITY_DISABLED),
     (85, "Use of Deprecated Function", SEVERITY_WARNING),
     (86, "Unsafe Usage of Dynamic String", SEVERITY_ERROR),
-    (87, "Class Not `abstract` Or `final`", SEVERITY_DISABLED),
-    (88, "Class Not Extending `Phobject`", SEVERITY_DISABLED),
     (90, "Nested `namespace` Statements", SEVERITY_ERROR),
-    (91, "`$this` Reassignment", SEVERITY_ERROR),
-    (92, "Unexpected `return` Value", SEVERITY_WARNING),
-    (95, "Self Class Reference", SEVERITY_WARNING),
     (96, "Paamayim Nekudotayim Spacing", SEVERITY_WARNING),
     (97, "`use` Statement Namespace Prefix", SEVERITY_WARNING),
     (
@@ -186,39 +153,14 @@ pub const RULE_TABLE: &[(u32, &str, &str)] = &[
     ),
     (99, "Unnecessary Symbol Alias", SEVERITY_WARNING),
     (105, "Function Call Should Be Type Cast", SEVERITY_ADVICE),
-    (
-        107,
-        "`abstract` Method Cannot Be Declared `private`",
-        SEVERITY_ERROR,
-    ),
-    (108, "`abstract` Method Cannot Contain Body", SEVERITY_ERROR),
     (111, "`is_a` Should Be `instanceof`", SEVERITY_ADVICE),
-    (
-        113,
-        "`class` Containing `abstract` Methods Must Be Declared `abstract`",
-        SEVERITY_ERROR,
-    ),
-    (
-        114,
-        "`interface` Method Cannot Contain Body",
-        SEVERITY_ERROR,
-    ),
-    (
-        118,
-        "`interface` Methods Cannot Be Marked `abstract`",
-        SEVERITY_ERROR,
-    ),
     (119, "Curly Brace Array Index", SEVERITY_WARNING),
     (123, "Variable Reference Spacing", SEVERITY_WARNING),
     (125, "Invalid Octal Numeric Scalar", SEVERITY_ERROR),
     (127, "Hexadecimal Integer Casing", SEVERITY_WARNING),
-    (128, "Continue Inside Switch", SEVERITY_ERROR),
     (129, "Implode With Glue First", SEVERITY_ERROR),
-    (130, "Use of `public` Properties", SEVERITY_ADVICE),
     (131, "Binary Integer Casing", SEVERITY_WARNING),
-    (132, "Partial Catch", SEVERITY_WARNING),
     (133, "Use of Removed Function \"each()\"", SEVERITY_ERROR),
-    (134, "Use of Product Name Literal", SEVERITY_WARNING),
 ];
 
 /// Look up rule metadata (name, severity) by rule ID.
@@ -230,13 +172,97 @@ pub fn rule_meta(id: u32) -> Option<(&'static str, &'static str)> {
         .map(|(_, name, severity)| (*name, *severity))
 }
 
-/// Rules with no meaningful static port: (ID, PHP class, reason).
+/// Rules with no port in this subset: (ID, PHP class, reason).
 /// Every other rule under `src/lint/linter/xhpast/rules/` (plus ID
-/// 78, `ArcanistInlineHTMLXHPASTLinterRule`) is ported.
+/// 78, `ArcanistInlineHTMLXHPASTLinterRule`) is ported; see
+/// [`RULE_TABLE`].
 #[must_use]
 pub fn blocked_rules() -> Vec<(u32, &'static str, &'static str)> {
-    Vec::new()
+    vec![
+        (5, "ArcanistUndeclaredVariableXHPASTLinterRule", NOT_YET),
+        (9, "ArcanistNamingConventionsXHPASTLinterRule", NOT_YET),
+        (10, "ArcanistImplicitConstructorXHPASTLinterRule", NOT_YET),
+        (13, "ArcanistStaticThisXHPASTLinterRule", NOT_YET),
+        (17, "ArcanistExitExpressionXHPASTLinterRule", NOT_YET),
+        (19, "ArcanistClassFilenameMismatchXHPASTLinterRule", NOT_YET),
+        (
+            20,
+            "ArcanistTautologicalExpressionXHPASTLinterRule",
+            NOT_YET,
+        ),
+        (22, "ArcanistDuplicateKeysInArrayXHPASTLinterRule", NOT_YET),
+        (23, "ArcanistReusedIteratorXHPASTLinterRule", NOT_YET),
+        (24, "ArcanistBraceFormattingXHPASTLinterRule", NOT_YET),
+        (30, "ArcanistImplicitFallthroughXHPASTLinterRule", NOT_YET),
+        (32, "ArcanistReusedAsIteratorXHPASTLinterRule", NOT_YET),
+        (
+            39,
+            "ArcanistReusedIteratorReferenceXHPASTLinterRule",
+            NOT_YET,
+        ),
+        (45, "ArcanistPHPCompatibilityXHPASTLinterRule", NOT_YET),
+        (50, "ArcanistDuplicateSwitchCaseXHPASTLinterRule", NOT_YET),
+        (52, "ArcanistImplicitVisibilityXHPASTLinterRule", NOT_YET),
+        (
+            55,
+            "ArcanistUnnecessaryFinalModifierXHPASTLinterRule",
+            NOT_YET,
+        ),
+        (57, "ArcanistSelfMemberReferenceXHPASTLinterRule", NOT_YET),
+        (59, "ArcanistInnerFunctionXHPASTLinterRule", NOT_YET),
+        (60, "ArcanistDefaultParametersXHPASTLinterRule", NOT_YET),
+        (
+            63,
+            "ArcanistUselessOverridingMethodXHPASTLinterRule",
+            NOT_YET,
+        ),
+        (64, "ArcanistNoParentScopeXHPASTLinterRule", NOT_YET),
+        (67, "ArcanistToStringExceptionXHPASTLinterRule", NOT_YET),
+        (69, "ArcanistInstanceOfOperatorXHPASTLinterRule", NOT_YET),
+        (
+            70,
+            "ArcanistInvalidDefaultParameterXHPASTLinterRule",
+            NOT_YET,
+        ),
+        (72, "ArcanistInvalidModifiersXHPASTLinterRule", NOT_YET),
+        (76, "ArcanistArrayValueXHPASTLinterRule", NOT_YET),
+        (77, "ArcanistListAssignmentXHPASTLinterRule", NOT_YET),
+        (87, "ArcanistRaggedClassTreeEdgeXHPASTLinterRule", NOT_YET),
+        (88, "ArcanistClassExtendsObjectXHPASTLinterRule", NOT_YET),
+        (91, "ArcanistThisReassignmentXHPASTLinterRule", NOT_YET),
+        (92, "ArcanistUnexpectedReturnValueXHPASTLinterRule", NOT_YET),
+        (95, "ArcanistSelfClassReferenceXHPASTLinterRule", NOT_YET),
+        (
+            107,
+            "ArcanistAbstractPrivateMethodXHPASTLinterRule",
+            NOT_YET,
+        ),
+        (108, "ArcanistAbstractMethodBodyXHPASTLinterRule", NOT_YET),
+        (
+            113,
+            "ArcanistClassMustBeDeclaredAbstractXHPASTLinterRule",
+            NOT_YET,
+        ),
+        (114, "ArcanistInterfaceMethodBodyXHPASTLinterRule", NOT_YET),
+        (
+            118,
+            "ArcanistInterfaceAbstractMethodXHPASTLinterRule",
+            NOT_YET,
+        ),
+        (128, "ArcanistContinueInsideSwitchXHPASTLinterRule", NOT_YET),
+        (130, "ArcanistPublicPropertyXHPASTLinterRule", NOT_YET),
+        (132, "ArcanistPartialCatchXHPASTLinterRule", NOT_YET),
+        (
+            134,
+            "ArcanistProductNameLiteralXHPASTLinterRule",
+            "product names come from libphutil runtime; cannot run here",
+        ),
+    ]
 }
+
+/// Shared reason for follow-up rules: portable, but deferred to a
+/// later dv-c increment so this subset lands fully verified.
+const NOT_YET: &str = "not yet ported; deferred to a follow-up increment";
 
 fn is_supported(path: &str) -> bool {
     const EXTENSIONS: &[&str] = &["php", "phtml", "inc"];

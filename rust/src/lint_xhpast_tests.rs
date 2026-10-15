@@ -105,11 +105,11 @@ fn failed_parse_yields_one_unable_to_parse_warning() {
 
 #[test]
 fn rule_table_covers_all_ported_ids() {
-    assert_eq!(RULE_TABLE.len(), 108);
+    assert_eq!(RULE_TABLE.len(), 66);
     let mut ids: Vec<u32> = RULE_TABLE.iter().map(|(id, _, _)| *id).collect();
     ids.sort_unstable();
     ids.dedup();
-    assert_eq!(ids.len(), 108);
+    assert_eq!(ids.len(), 66);
     for missing in [11, 14, 29, 31, 33, 35, 89, 93, 94] {
         assert!(!ids.contains(&missing), "{missing}");
     }
@@ -121,6 +121,21 @@ fn rule_table_covers_all_ported_ids() {
     for (id, _, _) in RULE_TABLE {
         assert!((1..=134).contains(id), "{id}");
     }
+    // Ported and blocked sets are disjoint and jointly exhaustive.
+    let blocked = blocked_rules();
+    assert_eq!(blocked.len(), 42);
+    let mut bids: Vec<u32> = blocked.iter().map(|(id, _, _)| *id).collect();
+    bids.sort_unstable();
+    bids.dedup();
+    assert_eq!(bids.len(), 42);
+    for (id, class, reason) in &blocked {
+        assert!(!ids.contains(id), "{id}");
+        assert!(class.starts_with("Arcanist"), "{class}");
+        assert!(!reason.is_empty(), "{id}");
+    }
+    assert_eq!(ids.len() + bids.len(), 108);
+    assert!(bids.contains(&5));
+    assert!(bids.contains(&134));
 }
 
 #[test]
@@ -131,10 +146,31 @@ fn lint_canned_runs_rule_tree_with_exact_messages() {
         &canned("<?php if ($a) {\n} elseif ($b) {\n}\n"),
         &options,
     );
-    assert_eq!(messages.len(), 1);
-    let message = &messages[0];
+    // PHP raises XHP81 (no blank line after `<?php`), XHP47 for each
+    // whitespace-only empty block, and XHP42 for `elseif`.
+    let codes: Vec<(&str, usize, usize)> = messages
+        .iter()
+        .map(|m| (m.code.as_str(), m.line, m.col))
+        .collect();
+    assert_eq!(
+        codes,
+        vec![
+            ("XHP81", 1, 6),
+            ("XHP47", 1, 15),
+            ("XHP42", 2, 3),
+            ("XHP47", 2, 15),
+        ]
+    );
+    assert_eq!(
+        messages[0].description,
+        "`<?php` should be separated from code by an empty line."
+    );
+    assert_eq!(
+        messages[1].description,
+        "Braces for an empty block statement shouldn't contain only whitespace."
+    );
+    let message = &messages[2];
     assert_eq!(message.path, "src/a.php");
-    assert_eq!((message.line, message.col), (2, 3));
     assert_eq!(message.code, "XHP42");
     assert_eq!(message.severity, "advice");
     assert_eq!(message.name, "`elseif` Usage");
@@ -158,8 +194,13 @@ fn lint_canned_rejects_garbage_with_unable_to_parse() {
 #[test]
 fn parse_output_zero_exit_runs_canned_rules() {
     let messages = parse_output("a.php", 0, &canned("<?php elseif ($x) {}\n"), "");
-    assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].code, "XHP42");
+    // `{}` holds no whitespace so XHP47 stays silent (PHP needs >2
+    // tokens); XHP81 fires (no blank line after `<?php`) plus XHP42.
+    let codes: Vec<(&str, usize, usize)> = messages
+        .iter()
+        .map(|m| (m.code.as_str(), m.line, m.col))
+        .collect();
+    assert_eq!(codes, vec![("XHP81", 1, 6), ("XHP42", 1, 7)]);
 }
 
 #[test]

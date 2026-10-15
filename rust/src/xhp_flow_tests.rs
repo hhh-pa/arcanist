@@ -4,10 +4,7 @@ fn check(source: &str) -> Vec<(u32, usize, usize, String)> {
     check_with_options(source, &ast::XhpOptions::default())
 }
 
-fn check_with_options(
-    source: &str,
-    options: &ast::XhpOptions,
-) -> Vec<(u32, usize, usize, String)> {
+fn check_with_options(source: &str, options: &ast::XhpOptions) -> Vec<(u32, usize, usize, String)> {
     let canned = ast::tokens_to_canned(source, &ast::tokenize(source));
     let tree = ast::tree_from_canned(&canned).expect("canned output must parse");
     let ctx = ast::RuleCtx {

@@ -93,10 +93,7 @@ fn elseif_usage_message_is_exact() {
 
 #[test]
 fn logical_operators_flag_and_or_only() {
-    assert_eq!(
-        for_rule("<?php if ($a and $b) {}\n", 58).len(),
-        1
-    );
+    assert_eq!(for_rule("<?php if ($a and $b) {}\n", 58).len(), 1);
     assert_eq!(for_rule("<?php if ($a or $b) {}\n", 58).len(), 1);
     assert!(for_rule("<?php if ($a && $b) {}\n", 58).is_empty());
     assert!(for_rule("<?php if ($a xor $b) {}\n", 58).is_empty());
@@ -168,7 +165,10 @@ fn control_spacing_wants_single_space() {
     assert!(for_rule("<?php if ($x) {}\n", 26).is_empty());
     let hits = for_rule("<?php if($x) {}\n", 26);
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].2, "Convention: put a space after control statements.");
+    assert_eq!(
+        hits[0].2,
+        "Convention: put a space after control statements."
+    );
     let hits = for_rule("<?php if  ($x) {}\n", 26);
     assert_eq!(hits.len(), 1);
     assert_eq!(
@@ -282,7 +282,13 @@ fn parent_ref_prefers_parent_keyword() {
     let hits = for_rule(src, 83);
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].2, "Use `parent::` to call parent method.");
-    assert!(for_rule("<?php class C extends P { function f() { parent::foo(); } }\n", 83).is_empty());
+    assert!(
+        for_rule(
+            "<?php class C extends P { function f() { parent::foo(); } }\n",
+            83
+        )
+        .is_empty()
+    );
     assert!(for_rule("<?php class C { function f() { P::foo(); } }\n", 83).is_empty());
 }
 
@@ -298,7 +304,10 @@ fn binary_spacing_matches_php_fixture() {
     assert!(for_rule("<?php $a.$b;\n", 27).is_empty());
     assert_eq!(for_rule("<?php function x($n=null) {}\n", 27).len(), 1);
     assert!(for_rule("<?php $y /* ! */ += // ?\n$z;\n", 27).is_empty());
-    assert_eq!(for_rule("<?php if ($x instanceof z &&$w) {}\n", 27).len(), 1);
+    assert_eq!(
+        for_rule("<?php if ($x instanceof z &&$w) {}\n", 27).len(),
+        1
+    );
     assert_eq!(for_rule("<?php f(1,2);\n", 27).len(), 1);
     assert_eq!(
         for_rule("<?php $a+$b;\n", 27)[0].2,
@@ -335,8 +344,14 @@ fn decl_parens_distinguishes_anonymous() {
     assert!(for_rule("<?php $f = function ($x) {};\n", 38).is_empty());
     assert_eq!(for_rule("<?php $f = function($x) {};\n", 38).len(), 1);
     assert_eq!(for_rule("<?php function foo($x ) {}\n", 38).len(), 1);
-    assert_eq!(for_rule("<?php $f = function ($x)use ($y) {};\n", 38).len(), 1);
-    assert_eq!(for_rule("<?php $f = function ($x)use($y) {};\n", 38).len(), 2);
+    assert_eq!(
+        for_rule("<?php $f = function ($x)use ($y) {};\n", 38).len(),
+        1
+    );
+    assert_eq!(
+        for_rule("<?php $f = function ($x)use($y) {};\n", 38).len(),
+        2
+    );
     assert!(for_rule("<?php $f = function ($x) use ($y) {};\n", 38).is_empty());
 }
 
@@ -352,7 +367,11 @@ fn keyword_casing_flags_uppercase_keywords() {
     assert_eq!(for_rule("<?php echo __file__;\n", 40).len(), 1);
     assert!(for_rule("<?php echo __FILE__;\n", 40).is_empty());
     assert_eq!(
-        for_rule("<?php class C extends P { function f() { SELF::x(); } }\n", 40).len(),
+        for_rule(
+            "<?php class C extends P { function f() { SELF::x(); } }\n",
+            40
+        )
+        .len(),
         1
     );
 }
@@ -400,7 +419,10 @@ fn modifier_ordering_flags_bad_order() {
         1
     );
     assert!(for_rule("<?php class C { public static function f() {} }\n", 71).is_empty());
-    assert_eq!(for_rule("<?php class C { static public $x; }\n", 71).len(), 1);
+    assert_eq!(
+        for_rule("<?php class C { static public $x; }\n", 71).len(),
+        1
+    );
     assert!(for_rule("<?php class C { public static $x; }\n", 71).is_empty());
     assert!(for_rule("<?php class C { var $x; }\n", 71).is_empty());
     assert_eq!(

@@ -26,7 +26,10 @@ fn tokenizes_open_tags_and_html() {
 #[test]
 fn close_tag_consumes_one_newline() {
     let tokens = tokenize("<?php echo; ?>\nnext");
-    let close = tokens.iter().find(|t| t.kind == kinds::T_CLOSE_TAG).unwrap();
+    let close = tokens
+        .iter()
+        .find(|t| t.kind == kinds::T_CLOSE_TAG)
+        .unwrap();
     assert_eq!(close.value, "?>\n");
     let after: Vec<&Token> = tokens
         .iter()
@@ -131,7 +134,11 @@ fn float_member_dot_stays_in_number() {
     assert!(!tokens.iter().any(|t| t.kind == "." && t.value == ".foo"));
     let dots: Vec<&Token> = tokens.iter().filter(|t| t.kind == ".").collect();
     assert_eq!(dots.len(), 1);
-    assert!(tokens.iter().any(|t| t.kind == kinds::T_DNUMBER && t.value == "1."));
+    assert!(
+        tokens
+            .iter()
+            .any(|t| t.kind == kinds::T_DNUMBER && t.value == "1.")
+    );
 }
 
 #[test]

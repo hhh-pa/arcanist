@@ -139,19 +139,34 @@ fn rule_short_tag(ctx: &RuleCtx, out: &mut Vec<RawFinding>) {
 fn rule_echo_tag(ctx: &RuleCtx, out: &mut Vec<RawFinding>) {
     for token in &ctx.tree.tokens {
         if token.kind == kinds::T_OPEN_TAG_WITH_ECHO {
-            push(out, 7, token.offset, "Avoid the PHP echo short form, `<?=`.");
+            push(
+                out,
+                7,
+                token.offset,
+                "Avoid the PHP echo short form, `<?=`.",
+            );
         }
     }
 }
 
 /// XHP8: `?>` is flagged unless the file has inline HTML.
 fn rule_close_tag(ctx: &RuleCtx, out: &mut Vec<RawFinding>) {
-    if ctx.tree.tokens.iter().any(|t| t.kind == kinds::T_INLINE_HTML) {
+    if ctx
+        .tree
+        .tokens
+        .iter()
+        .any(|t| t.kind == kinds::T_INLINE_HTML)
+    {
         return;
     }
     for token in &ctx.tree.tokens {
         if token.kind == kinds::T_CLOSE_TAG {
-            push(out, 8, token.offset, "Do not use the PHP closing tag, `?>`.");
+            push(
+                out,
+                8,
+                token.offset,
+                "Do not use the PHP closing tag, `?>`.",
+            );
         }
     }
 }
@@ -260,7 +275,12 @@ fn rule_inline_html(ctx: &RuleCtx, out: &mut Vec<RawFinding>) {
         if token.value.bytes().all(|b| b.is_ascii_whitespace()) {
             continue;
         }
-        push(out, 78, token.offset, "PHP files must only contain PHP code.");
+        push(
+            out,
+            78,
+            token.offset,
+            "PHP files must only contain PHP code.",
+        );
         break;
     }
 }
@@ -445,6 +465,15 @@ fn hug_message() -> &'static str {
 /// Call, declaration, control, `array()`, and `list()` parens.
 fn paren_groups(tree: &Tree) -> Vec<(usize, usize)> {
     let mut groups = Vec::new();
+    block_parens(tree, &mut groups);
+    call_parens(tree, &mut groups);
+    method_parens(tree, &mut groups);
+    keyword_parens(tree, &mut groups);
+    new_arg_parens(tree, &mut groups);
+    groups
+}
+
+fn block_parens(tree: &Tree, groups: &mut Vec<(usize, usize)>) {
     for block in tree.blocks() {
         if block.kind == BlockKind::Declare {
             continue;
@@ -453,6 +482,9 @@ fn paren_groups(tree: &Tree) -> Vec<(usize, usize)> {
             groups.push((lparen, rparen));
         }
     }
+}
+
+fn call_parens(tree: &Tree, groups: &mut Vec<(usize, usize)>) {
     for call in tree.calls() {
         if call.is_construct {
             continue;
@@ -461,11 +493,17 @@ fn paren_groups(tree: &Tree) -> Vec<(usize, usize)> {
             groups.push((call.lparen, rparen));
         }
     }
+}
+
+fn method_parens(tree: &Tree, groups: &mut Vec<(usize, usize)>) {
     for call in method_call_sites(tree) {
         if let Some(rparen) = call.rparen {
             groups.push((call.lparen, rparen));
         }
     }
+}
+
+fn keyword_parens(tree: &Tree, groups: &mut Vec<(usize, usize)>) {
     for (i, token) in tree.tokens.iter().enumerate() {
         if token.kind != kinds::T_ARRAY && token.kind != kinds::T_LIST {
             continue;
@@ -480,8 +518,6 @@ fn paren_groups(tree: &Tree) -> Vec<(usize, usize)> {
             groups.push((lparen, rparen));
         }
     }
-    new_arg_parens(tree, &mut groups);
-    groups
 }
 
 /// `new X(...)` argument parens.
@@ -571,7 +607,12 @@ fn rule_index_spacing(ctx: &RuleCtx, out: &mut Vec<RawFinding>) {
         let gap = tree.gap_text(prev, i);
         if is_only_spaces(&gap) {
             let offset = tree.tokens[prev].offset + tree.tokens[prev].value.len();
-            push(out, 28, offset, "Convention: no spaces before index access.");
+            push(
+                out,
+                28,
+                offset,
+                "Convention: no spaces before index access.",
+            );
         }
     }
 }
@@ -624,7 +665,8 @@ fn rule_call_parens(ctx: &RuleCtx, out: &mut Vec<RawFinding>) {
     for group in call_paren_groups(tree) {
         let gap = tree.gap_text(group.name_idx, group.lparen);
         if is_all_whitespace(&gap) {
-            let offset = tree.tokens[group.name_idx].offset + tree.tokens[group.name_idx].value.len();
+            let offset =
+                tree.tokens[group.name_idx].offset + tree.tokens[group.name_idx].value.len();
             push(
                 out,
                 37,
@@ -780,7 +822,12 @@ fn rule_semicolon_spacing(ctx: &RuleCtx, out: &mut Vec<RawFinding>) {
             continue;
         }
         if tree.tokens[i - 1].kind == kinds::T_WHITESPACE {
-            push(out, 43, tree.tokens[i - 1].offset, "Space found before semicolon.");
+            push(
+                out,
+                43,
+                tree.tokens[i - 1].offset,
+                "Space found before semicolon.",
+            );
         }
     }
 }
@@ -796,7 +843,11 @@ fn rule_concat_spacing(ctx: &RuleCtx, out: &mut Vec<RawFinding>) {
             concat_side(tree, i - 1, None, out);
         }
         if i + 1 < tree.tokens.len() {
-            let after = if i + 2 < tree.tokens.len() { Some(i + 2) } else { None };
+            let after = if i + 2 < tree.tokens.len() {
+                Some(i + 2)
+            } else {
+                None
+            };
             concat_side(tree, i + 1, after, out);
         }
     }
@@ -876,10 +927,7 @@ fn exempt_brace_opens(blocks: &[Block]) -> Vec<usize> {
 /// Walk back over the indexed object expression.
 fn index_object_start(tree: &Tree, brace: usize) -> usize {
     let mut start = brace;
-    loop {
-        let Some(prev) = tree.prev_semantic(start) else {
-            break;
-        };
+    while let Some(prev) = tree.prev_semantic(start) {
         match tree.tokens[prev].kind.as_str() {
             kinds::T_VARIABLE
             | kinds::T_STRING
@@ -969,12 +1017,22 @@ fn rule_unnecessary_semicolon(ctx: &RuleCtx, out: &mut Vec<RawFinding>) {
         }
         if empty_semis.contains(&i) {
             if !declare_empty_semi(&blocks, i) {
-                push(out, 56, token.offset, "Unnecessary semicolons after statement.");
+                push(
+                    out,
+                    56,
+                    token.offset,
+                    "Unnecessary semicolons after statement.",
+                );
             }
             continue;
         }
         if lone_semicolon(tree, i) {
-            push(out, 56, token.offset, "Unnecessary semicolons after statement.");
+            push(
+                out,
+                56,
+                token.offset,
+                "Unnecessary semicolons after statement.",
+            );
         }
     }
 }
@@ -1176,9 +1234,11 @@ fn ref_amp_position(tree: &Tree, amp: usize) -> bool {
 fn rule_parent_ref(ctx: &RuleCtx, out: &mut Vec<RawFinding>) {
     let tree = ctx.tree;
     let blocks = tree.blocks();
-    let version_ok = ctx.options.php_version.as_ref().is_none_or(|v| {
-        xhp_ast::version_compare(v, "5.4.0") != std::cmp::Ordering::Less
-    });
+    let version_ok = ctx
+        .options
+        .php_version
+        .as_ref()
+        .is_none_or(|v| xhp_ast::version_compare(v, "5.4.0") != std::cmp::Ordering::Less);
     for block in &blocks {
         if block.kind != BlockKind::Class {
             continue;
@@ -1222,7 +1282,12 @@ fn parent_ref_in_span(
                 .map(|t| t.value.as_str())
                 .collect();
             if name.eq_ignore_ascii_case(parent) && (version_ok || !in_closure(blocks, tree, i)) {
-                push(out, 83, tree.tokens[name_start].offset, "Use `parent::` to call parent method.");
+                push(
+                    out,
+                    83,
+                    tree.tokens[name_start].offset,
+                    "Use `parent::` to call parent method.",
+                );
             }
         }
         i += 1;
@@ -1374,25 +1439,18 @@ fn is_decl_equals(tree: &Tree, equals: usize) -> bool {
     })
 }
 
-fn binary_op_spacing(tree: &Tree, declare_ranges: &[(usize, usize)], i: usize, out: &mut Vec<RawFinding>) {
+fn binary_op_spacing(
+    tree: &Tree,
+    declare_ranges: &[(usize, usize)],
+    i: usize,
+    out: &mut Vec<RawFinding>,
+) {
     let kind = tree.tokens[i].kind.as_str();
-    if kind == "+" || kind == "-" || kind == "&" {
-        if !prev_is_operand(tree, i) {
-            return;
-        }
-    } else if !BINARY_OPS.contains(&kind) {
+    if !is_binary_op(tree, kind, i) {
         return;
     }
-    if kind == "=" {
-        if tree.next_semantic(i).is_some_and(|n| tree.tokens[n].kind == "&") {
-            return;
-        }
-        if declare_ranges.iter().any(|(s, e)| i > *s && i < *e) {
-            return;
-        }
-        if is_decl_equals(tree, i) {
-            return;
-        }
+    if kind == "=" && is_exempt_equals(tree, declare_ranges, i) {
+        return;
     }
     let before_empty = tree
         .prev_semantic(i)
@@ -1408,6 +1466,26 @@ fn binary_op_spacing(tree: &Tree, declare_ranges: &[(usize, usize)], i: usize, o
             "Convention: logical and arithmetic operators should be surrounded by whitespace.",
         );
     }
+}
+
+fn is_binary_op(tree: &Tree, kind: &str, i: usize) -> bool {
+    if kind == "+" || kind == "-" || kind == "&" {
+        return prev_is_operand(tree, i);
+    }
+    BINARY_OPS.contains(&kind)
+}
+
+fn is_exempt_equals(tree: &Tree, declare_ranges: &[(usize, usize)], i: usize) -> bool {
+    if tree
+        .next_semantic(i)
+        .is_some_and(|n| tree.tokens[n].kind == "&")
+    {
+        return true;
+    }
+    if declare_ranges.iter().any(|(s, e)| i > *s && i < *e) {
+        return true;
+    }
+    is_decl_equals(tree, i)
 }
 
 fn comma_spacing(tree: &Tree, comma: usize, out: &mut Vec<RawFinding>) {
@@ -1518,7 +1596,10 @@ fn decl_use_spacing(tree: &Tree, block: &Block, out: &mut Vec<RawFinding>) {
     let Some(use_idx) = use_idx else {
         return;
     };
-    if tree.prev_semantic(use_idx).is_some_and(|p| tree.gap_text(p, use_idx).is_empty()) {
+    if tree
+        .prev_semantic(use_idx)
+        .is_some_and(|p| tree.gap_text(p, use_idx).is_empty())
+    {
         push(
             out,
             38,
@@ -1632,13 +1713,21 @@ fn rule_keyword_casing(ctx: &RuleCtx, out: &mut Vec<RawFinding>) {
                     out,
                     40,
                     token.offset,
-                    &format!("Convention: spell keyword `{}` as `{}`.", token.value, lower),
+                    &format!(
+                        "Convention: spell keyword `{}` as `{}`.",
+                        token.value, lower
+                    ),
                 );
             }
         } else if MAGIC_CONST_KINDS.contains(&token.kind.as_str()) {
             let upper = token.value.to_ascii_uppercase();
             if token.value != upper {
-                push(out, 40, token.offset, "Magic constants should be uppercase.");
+                push(
+                    out,
+                    40,
+                    token.offset,
+                    "Magic constants should be uppercase.",
+                );
             }
         }
     }
@@ -1740,7 +1829,10 @@ fn boolean_null_casing(tree: &Tree, out: &mut Vec<RawFinding>) {
             out,
             40,
             token.offset,
-            &format!("Convention: spell keyword `{}` as `{}`.", token.value, lower),
+            &format!(
+                "Convention: spell keyword `{}` as `{}`.",
+                token.value, lower
+            ),
         );
     }
 }
@@ -1780,7 +1872,8 @@ fn rule_array_separator(ctx: &RuleCtx, out: &mut Vec<RawFinding>) {
         if values.is_empty() {
             continue;
         }
-        let multiline = tree.line_of(tree.tokens[open].offset) != tree.line_of(tree.tokens[close].offset);
+        let multiline =
+            tree.line_of(tree.tokens[open].offset) != tree.line_of(tree.tokens[close].offset);
         let (first, last) = values[values.len() - 1];
         let comma = last + 1 < tree.tokens.len() && tree.tokens[last + 1].kind == ",";
         if multiline {
@@ -1815,7 +1908,12 @@ fn array_multiline(
             "Multi-lined arrays should have trailing commas.",
         );
     } else if tree.line_of(tree.tokens[first].offset) == tree.line_of(tree.tokens[close].offset) {
-        push(out, 48, tree.tokens[close].offset, "Closing parenthesis should be on a new line.");
+        push(
+            out,
+            48,
+            tree.tokens[close].offset,
+            "Closing parenthesis should be on a new line.",
+        );
     }
 }
 
@@ -1857,10 +1955,12 @@ fn array_literals(tree: &Tree) -> Vec<(usize, usize)> {
             if let Some(rparen) = tree.match_close(lparen) {
                 out.push((lparen, rparen));
             }
-        } else if token.kind == "[" && !is_index_bracket(tree, i) && !is_attribute_bracket(tree, i) {
-            if let Some(close) = tree.match_close(i) {
-                out.push((i, close));
-            }
+        } else if token.kind == "["
+            && !is_index_bracket(tree, i)
+            && !is_attribute_bracket(tree, i)
+            && let Some(close) = tree.match_close(i)
+        {
+            out.push((i, close));
         }
     }
     out
@@ -1879,14 +1979,21 @@ fn rule_modifier_ordering(ctx: &RuleCtx, out: &mut Vec<RawFinding>) {
         if block.kind != BlockKind::Function || !tree.is_method(&blocks, idx) {
             continue;
         }
-        check_modifier_run(tree, &method_modifier_run(tree, block), &METHOD_ORDER, out);
+        check_modifier_run(tree, &method_modifier_run(tree, block), METHOD_ORDER, out);
     }
     for (start, end) in class_body_ranges(tree) {
         check_property_runs(tree, start, end, out);
     }
 }
 
-const METHOD_ORDER: &[&str] = &["abstract", "final", "public", "protected", "private", "static"];
+const METHOD_ORDER: &[&str] = &[
+    "abstract",
+    "final",
+    "public",
+    "protected",
+    "private",
+    "static",
+];
 const PROPERTY_ORDER: &[&str] = &["public", "protected", "private", "static"];
 
 fn method_modifier_run(tree: &Tree, block: &Block) -> Vec<(String, usize)> {
@@ -1926,12 +2033,21 @@ fn is_modifier_word(kind: &str) -> bool {
     )
 }
 
-fn check_modifier_run(tree: &Tree, run: &[(String, usize)], canon: &[&str], out: &mut Vec<RawFinding>) {
+fn check_modifier_run(
+    tree: &Tree,
+    run: &[(String, usize)],
+    canon: &[&str],
+    out: &mut Vec<RawFinding>,
+) {
     if run.is_empty() {
         return;
     }
     let words: Vec<&str> = run.iter().map(|(w, _)| w.as_str()).collect();
-    let expected: Vec<&str> = canon.iter().filter(|m| words.contains(m)).copied().collect();
+    let expected: Vec<&str> = canon
+        .iter()
+        .filter(|m| words.contains(m))
+        .copied()
+        .collect();
     if words.len() != expected.len() {
         return;
     }
@@ -1953,12 +2069,12 @@ fn check_property_runs(tree: &Tree, start: usize, end: usize, out: &mut Vec<RawF
             i = tree.match_close(i).map_or(end, |c| c + 1);
             continue;
         }
-        if is_modifier_word(kind) || kind == kinds::T_VARIABLE {
-            if let Some(stmt_end) = statement_end(tree, i, end) {
-                check_property_statement(tree, i, stmt_end, out);
-                i = stmt_end + 1;
-                continue;
-            }
+        if (is_modifier_word(kind) || kind == kinds::T_VARIABLE)
+            && let Some(stmt_end) = statement_end(tree, i, end)
+        {
+            check_property_statement(tree, i, stmt_end, out);
+            i = stmt_end + 1;
+            continue;
         }
         i += 1;
     }
@@ -2004,7 +2120,11 @@ fn check_property_statement(tree: &Tree, from: usize, end: usize, out: &mut Vec<
     }
     let offset = tree.tokens[run[0].1].offset;
     let words: Vec<&str> = run.iter().map(|(w, _)| w.as_str()).collect();
-    let expected: Vec<&str> = PROPERTY_ORDER.iter().filter(|m| words.contains(m)).copied().collect();
+    let expected: Vec<&str> = PROPERTY_ORDER
+        .iter()
+        .filter(|m| words.contains(m))
+        .copied()
+        .collect();
     if words.len() == expected.len() && words != expected {
         push(out, 71, offset, "Non-conventional modifier ordering.");
     }
