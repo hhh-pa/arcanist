@@ -237,6 +237,50 @@ fn script_command_quotes_the_path() {
 }
 
 #[test]
+fn windows_quote_neutralizes_cmd_metacharacters() {
+    // `cmd.exe` expands `%VAR%` even inside double quotes (and `!VAR!`
+    // under delayed expansion); PHP's `escapeshellarg()` blanks `%`,
+    // `!`, and `"` on Windows (php-src `php_escape_shell_arg`,
+    // `PHP_WIN32` branch). `&` is untouched: harmless inside quotes.
+    assert_eq!(shell_quote_windows("%COMSPEC%"), "\" COMSPEC \"");
+    assert_eq!(shell_quote_windows("%PATH%"), "\" PATH \"");
+    assert_eq!(shell_quote_windows("!PATH!"), "\" PATH \"");
+    assert_eq!(
+        shell_quote_windows("say \"hi\" & bye"),
+        "\"say  hi  & bye\""
+    );
+    assert_eq!(shell_quote_windows("plain.txt"), "\"plain.txt\"");
+    assert_eq!(shell_quote_windows("my file.txt"), "\"my file.txt\"");
+    assert_eq!(shell_quote_windows(""), "\"\"");
+}
+
+#[test]
+fn windows_quote_doubles_odd_trailing_backslashes() {
+    // Otherwise the closing quote would be escaped and the argument
+    // left unterminated (same trailing-`\` fixup as PHP).
+    assert_eq!(shell_quote_windows("C:\\dir\\"), "\"C:\\dir\\\\\"");
+    assert_eq!(shell_quote_windows("C:\\dir\\\\"), "\"C:\\dir\\\\\"");
+    assert_eq!(shell_quote_windows("\\"), "\"\\\\\"");
+}
+
+#[test]
+fn windows_quote_leaves_no_expandable_characters() {
+    for hostile in [
+        "%COMSPEC% /c calc",
+        "x!y!z",
+        "a\"b",
+        "%PATH%;C:\\evil",
+        "100% \"quoted\"!",
+    ] {
+        let quoted = shell_quote_windows(hostile);
+        let inner = &quoted[1..quoted.len() - 1];
+        assert!(!inner.contains('%'), "percent survives in {quoted}");
+        assert!(!inner.contains('!'), "bang survives in {quoted}");
+        assert!(!inner.contains('"'), "quote survives in {quoted}");
+    }
+}
+
+#[test]
 fn pcre_parse_matches_the_php_doc_example() {
     let pattern =
         compile_pcre("/^(?P<severity>warning|error):(?P<line>\\d+) (?P<message>.*)$/m").unwrap();
