@@ -644,15 +644,8 @@ impl Partition {
     }
 }
 
-/// Partition heads by walking parents, merging on shared ancestors.
-///
-/// Mirrors `ArcanistCommitGraphPartitionQuery::execute()`, including the
-/// `TODO: WARNING` echo for heads with no graph node.
-pub fn partition_query(
-    graph: &CommitGraph,
-    heads: &[String],
-    hashes: Option<&[String]>,
-) -> Result<Vec<Partition>, String> {
+/// Deduplicated query heads, in first-appearance order.
+fn fuse_heads(heads: &[String]) -> Result<Vec<String>, String> {
     let mut fused: Vec<String> = Vec::new();
     for head in heads {
         if !fused.contains(head) {
@@ -662,13 +655,20 @@ pub fn partition_query(
     if fused.is_empty() {
         return Err("Partition query requires heads.".to_string());
     }
-    let waypoints = fused.clone();
-    let mut live_heads = fused.clone();
+    Ok(fused)
+}
+
+/// Seed one partition identity per known head; unknown heads echo the PHP
+/// `TODO: WARNING` and are skipped.
+fn seed_partitions(
+    graph: &CommitGraph,
+    fused: &[String],
+) -> (OrderedMap<usize>, Vec<BTreeSet<usize>>, Vec<String>) {
     let mut partitions: OrderedMap<usize> = OrderedMap::new();
     let mut identities: Vec<BTreeSet<usize>> = Vec::new();
     let mut stack: Vec<String> = Vec::new();
     let mut next_id = 0;
-    for hash in fused.iter() {
+    for hash in fused {
         if graph.node(hash).is_none() {
             println!("TODO: WARNING: Bad hash {hash}");
             continue;
@@ -680,57 +680,131 @@ pub fn partition_query(
         next_id += 1;
         stack.push(hash.clone());
     }
-    let scope: Option<HashMap<&str, ()>> =
-        hashes.map(|list| list.iter().map(|hash| (hash.as_str(), ())).collect());
-    let mut leaves: HashMap<String, ()> = HashMap::new();
+    (partitions, identities, stack)
+}
+
+/// Optional walk scope: only these hashes are followed.
+fn partition_scope(hashes: Option<&[String]>) -> Option<HashMap<&str, ()>> {
+    let list = hashes?;
+    let mut scope: HashMap<&str, ()> = HashMap::new();
+    for hash in list {
+        scope.insert(hash.as_str(), ());
+    }
+    Some(scope)
+}
+
+/// Fuse the node's identity set with an already-partitioned parent's.
+fn merge_partition_identities(
+    identities: &mut [BTreeSet<usize>],
+    node_partition: &BTreeSet<usize>,
+    parent_id: usize,
+) {
+    let parent_partition = identities[parent_id].clone();
+    let merged: BTreeSet<usize> = node_partition.union(&parent_partition).copied().collect();
+    if *node_partition != merged {
+        for id in node_partition {
+            identities[*id] = merged.clone();
+        }
+    }
+    if parent_partition != merged {
+        for id in &parent_partition {
+            identities[*id] = merged.clone();
+        }
+    }
+}
+
+/// Identity snapshot of the node being visited: its partition slot and
+/// fused identity set.
+struct VisitNode<'a> {
+    id: usize,
+    partition: &'a BTreeSet<usize>,
+}
+
+/// Follow one parent edge. Returns false when the parent is out of scope
+/// (the caller then leaves `saw_parent` clear).
+fn visit_partition_parent(
+    partitions: &mut OrderedMap<usize>,
+    identities: &mut [BTreeSet<usize>],
+    live_heads: &mut Vec<String>,
+    stack: &mut Vec<String>,
+    scope: &Option<HashMap<&str, ()>>,
+    node: VisitNode<'_>,
+    parent: &str,
+) -> bool {
+    if let Some(scope) = scope
+        && !scope.contains_key(parent)
+    {
+        return false;
+    }
+    if let Some(&parent_id) = partitions.get(parent) {
+        live_heads.retain(|head| head != parent);
+        merge_partition_identities(identities, node.partition, parent_id);
+        return true;
+    }
+    partitions.insert(parent.to_string(), node.id);
+    stack.push(parent.to_string());
+    true
+}
+
+/// Walk parents from the seeded heads, merging identities on shared
+/// ancestors and recording scope leaves.
+fn walk_partitions(
+    graph: &CommitGraph,
+    partitions: &mut OrderedMap<usize>,
+    identities: &mut [BTreeSet<usize>],
+    live_heads: &mut Vec<String>,
+    stack: &mut Vec<String>,
+    scope: &Option<HashMap<&str, ()>>,
+    leaves: &mut HashMap<String, ()>,
+) {
     while let Some(hash) = stack.pop() {
         let node = graph.node(&hash).expect("stack holds known nodes");
         let node_id = *partitions.get(&hash).expect("stack holds assigned nodes");
         let node_partition = identities[node_id].clone();
         let mut saw_parent = false;
         for parent in node.parents() {
-            if let Some(scope) = &scope
-                && !scope.contains_key(parent.as_str())
-            {
-                continue;
+            let visited = VisitNode {
+                id: node_id,
+                partition: &node_partition,
+            };
+            if visit_partition_parent(
+                partitions, identities, live_heads, stack, scope, visited, parent,
+            ) {
+                saw_parent = true;
             }
-            saw_parent = true;
-            if let Some(&parent_id) = partitions.get(parent) {
-                live_heads.retain(|head| head != parent);
-                let parent_partition = identities[parent_id].clone();
-                let merged: BTreeSet<usize> =
-                    node_partition.union(&parent_partition).copied().collect();
-                if node_partition != merged {
-                    for id in &node_partition {
-                        identities[*id] = merged.clone();
-                    }
-                }
-                if parent_partition != merged {
-                    for id in &parent_partition {
-                        identities[*id] = merged.clone();
-                    }
-                }
-                continue;
-            }
-            partitions.insert(parent.clone(), node_id);
-            stack.push(parent.clone());
         }
         if !saw_parent {
             leaves.insert(hash, ());
         }
     }
+}
+
+/// Append `hash` to partition `resolved`'s list, creating it on demand.
+fn push_partition_hash(lists: &mut OrderedMap<Vec<String>>, resolved: usize, hash: &str) {
+    let key = resolved.to_string();
+    if !lists.contains(&key) {
+        lists.insert(key.clone(), Vec::new());
+    }
+    if let Some(list) = lists.get_mut(&key) {
+        list.push(hash.to_string());
+    }
+}
+
+/// Group walked hashes by resolved identity into partitions.
+fn collect_partitions(
+    partitions: &OrderedMap<usize>,
+    identities: &[BTreeSet<usize>],
+    live_heads: &[String],
+    waypoints: &[String],
+    leaves: &HashMap<String, ()>,
+) -> Vec<Partition> {
     let mut lists: OrderedMap<Vec<String>> = OrderedMap::new();
     let mut list_heads: HashMap<usize, Vec<String>> = HashMap::new();
     let mut list_waypoints: HashMap<usize, Vec<String>> = HashMap::new();
     let mut list_leaves: HashMap<usize, Vec<String>> = HashMap::new();
     for (hash, id) in partitions.iter() {
         let resolved = *identities[*id].iter().next().expect("identity is nonempty");
-        lists
-            .get_mut(&resolved.to_string())
-            .map(|list| list.push(hash.clone()))
-            .unwrap_or_else(|| {
-                lists.insert(resolved.to_string(), vec![hash.clone()]);
-            });
+        push_partition_hash(&mut lists, resolved, hash);
         if live_heads.contains(hash) {
             list_heads.entry(resolved).or_default().push(hash.clone());
         }
@@ -754,7 +828,40 @@ pub fn partition_query(
             waypoints: list_waypoints.remove(&id).unwrap_or_default(),
         });
     }
-    Ok(results)
+    results
+}
+
+/// Partition heads by walking parents, merging on shared ancestors.
+///
+/// Mirrors `ArcanistCommitGraphPartitionQuery::execute()`, including the
+/// `TODO: WARNING` echo for heads with no graph node.
+pub fn partition_query(
+    graph: &CommitGraph,
+    heads: &[String],
+    hashes: Option<&[String]>,
+) -> Result<Vec<Partition>, String> {
+    let fused = fuse_heads(heads)?;
+    let waypoints = fused.clone();
+    let mut live_heads = fused.clone();
+    let (mut partitions, mut identities, mut stack) = seed_partitions(graph, &fused);
+    let scope = partition_scope(hashes);
+    let mut leaves: HashMap<String, ()> = HashMap::new();
+    walk_partitions(
+        graph,
+        &mut partitions,
+        &mut identities,
+        &mut live_heads,
+        &mut stack,
+        &scope,
+        &mut leaves,
+    );
+    Ok(collect_partitions(
+        &partitions,
+        &identities,
+        &live_heads,
+        &waypoints,
+        &leaves,
+    ))
 }
 
 /// A waypoint color: fused revision ids, or `Open` for uncolored paint.
@@ -855,21 +962,20 @@ impl CommitSet {
     }
 }
 
-/// Paint a partition from its tails and collect same-color sets.
-///
-/// Mirrors `ArcanistCommitGraphSetQuery::execute()`; `waypoint_map` maps a
-/// commit hash to its revision ids, and `set_counter` is the shared
-/// process-wide set id counter (PHP's `static $set_n`, starting at 1).
-pub fn set_query(
-    graph: &CommitGraph,
-    partition: &Partition,
-    waypoint_map: &HashMap<String, Vec<u32>>,
-    set_counter: &mut u64,
-) -> Result<Vec<CommitSet>, String> {
+/// Fuse each waypoint hash's revision ids into its paint color.
+fn fuse_waypoint_colors(waypoint_map: &HashMap<String, Vec<u32>>) -> HashMap<String, SetColor> {
     let mut waypoint_color: HashMap<String, SetColor> = HashMap::new();
     for (hash, ids) in waypoint_map {
         waypoint_color.insert(hash.clone(), SetColor::Fused(fuse_ids(ids)));
     }
+    waypoint_color
+}
+
+/// Seed paint colors from the partition tails (waypoint color or open).
+fn seed_set_colors(
+    partition: &Partition,
+    waypoint_color: &HashMap<String, SetColor>,
+) -> (OrderedMap<SetColor>, Vec<String>) {
     let mut colors: OrderedMap<SetColor> = OrderedMap::new();
     let mut stack: Vec<String> = Vec::new();
     for hash in partition.tails() {
@@ -877,11 +983,36 @@ pub fn set_query(
         let color = waypoint_color.get(hash).cloned().unwrap_or(SetColor::Open);
         colors.insert(hash.clone(), color);
     }
-    let in_partition: HashMap<&str, ()> = partition
-        .hashes()
-        .iter()
-        .map(|hash| (hash.as_str(), ()))
-        .collect();
+    (colors, stack)
+}
+
+/// Partition membership for the merge-wait computation.
+fn partition_membership(partition: &Partition) -> HashMap<&str, ()> {
+    let mut in_partition: HashMap<&str, ()> = HashMap::new();
+    for hash in partition.hashes() {
+        in_partition.insert(hash.as_str(), ());
+    }
+    in_partition
+}
+
+/// Count of a node's parents inside the partition.
+fn count_partition_parents(node: &CommitNode, in_partition: &HashMap<&str, ()>) -> usize {
+    let mut need = 0;
+    for parent in node.parents() {
+        if in_partition.contains_key(parent.as_str()) {
+            need += 1;
+        }
+    }
+    need
+}
+
+/// Merge commits needing paint from two or more in-partition parents
+/// before their children paint.
+fn set_wait_counts(
+    graph: &CommitGraph,
+    partition: &Partition,
+    in_partition: &HashMap<&str, ()>,
+) -> HashMap<String, usize> {
     let mut wait: HashMap<String, usize> = HashMap::new();
     for hash in partition.hashes() {
         let Some(node) = graph.node(hash) else {
@@ -890,26 +1021,44 @@ pub fn set_query(
         if node.parents().len() < 2 {
             continue;
         }
-        let need = node
-            .parents()
-            .iter()
-            .filter(|parent| in_partition.contains_key(parent.as_str()))
-            .count();
+        let need = count_partition_parents(node, in_partition);
         if need >= 2 {
             wait.insert(hash.clone(), need);
         }
     }
+    wait
+}
+
+/// Paint color for a child: its waypoint color, else the merge of its
+/// existing color with the parent's, else the parent's.
+fn child_paint_color(
+    waypoint_color: &HashMap<String, SetColor>,
+    colors: &OrderedMap<SetColor>,
+    node_color: &SetColor,
+    child: &str,
+) -> SetColor {
+    if let Some(waypoint) = waypoint_color.get(child) {
+        waypoint.clone()
+    } else if let Some(existing) = colors.get(child) {
+        merge_colors(existing, node_color)
+    } else {
+        node_color.clone()
+    }
+}
+
+/// Paint the partition from the seeded tails toward the heads.
+fn paint_partition_sets(
+    graph: &CommitGraph,
+    colors: &mut OrderedMap<SetColor>,
+    stack: &mut Vec<String>,
+    waypoint_color: &HashMap<String, SetColor>,
+    wait: &mut HashMap<String, usize>,
+) {
     while let Some(hash) = stack.pop() {
         let node_color = colors.get(&hash).cloned().unwrap_or(SetColor::Open);
         let node = graph.node(&hash).expect("painted nodes exist");
         for child in node.children() {
-            let color = if let Some(waypoint) = waypoint_color.get(child) {
-                waypoint.clone()
-            } else if let Some(existing) = colors.get(child) {
-                merge_colors(existing, &node_color)
-            } else {
-                node_color.clone()
-            };
+            let color = child_paint_color(waypoint_color, colors, &node_color, child);
             colors.insert(child.clone(), color);
             if let Some(need) = wait.get_mut(child) {
                 *need -= 1;
@@ -921,9 +1070,43 @@ pub fn set_query(
             stack.push(child.clone());
         }
     }
-    if !wait.is_empty() {
-        return Err("Did not reach every wait node??".to_string());
+}
+
+/// Flood one same-color set from `hash` over parents and children.
+fn flood_color_set(
+    graph: &CommitGraph,
+    colors: &OrderedMap<SetColor>,
+    seen: &mut HashMap<String, ()>,
+    hash: &str,
+    color: &SetColor,
+) -> Vec<String> {
+    let mut in_set = vec![hash.to_string()];
+    let mut flood = vec![hash.to_string()];
+    while let Some(current) = flood.pop() {
+        let node = graph.node(&current).expect("flooded nodes exist");
+        let nearby = node.parents().iter().chain(node.children().iter());
+        for hash in nearby {
+            if seen.contains_key(hash) {
+                continue;
+            }
+            if colors.get(hash) != Some(color) {
+                continue;
+            }
+            seen.insert(hash.clone(), ());
+            in_set.push(hash.clone());
+            flood.push(hash.clone());
+        }
     }
+    in_set
+}
+
+/// Collect same-color painted hashes into sets, numbered from
+/// `set_counter`.
+fn collect_color_sets(
+    graph: &CommitGraph,
+    colors: &OrderedMap<SetColor>,
+    set_counter: &mut u64,
+) -> Vec<CommitSet> {
     let mut seen: HashMap<String, ()> = HashMap::new();
     let mut sets = Vec::new();
     for (hash, color) in colors.iter() {
@@ -931,23 +1114,7 @@ pub fn set_query(
             continue;
         }
         seen.insert(hash.clone(), ());
-        let mut in_set = vec![hash.clone()];
-        let mut flood = vec![hash.clone()];
-        while let Some(current) = flood.pop() {
-            let node = graph.node(&current).expect("flooded nodes exist");
-            let nearby = node.parents().iter().chain(node.children().iter());
-            for hash in nearby {
-                if seen.contains_key(hash) {
-                    continue;
-                }
-                if colors.get(hash) != Some(color) {
-                    continue;
-                }
-                seen.insert(hash.clone(), ());
-                in_set.push(hash.clone());
-                flood.push(hash.clone());
-            }
-        }
+        let in_set = flood_color_set(graph, colors, &mut seen, hash, color);
         let set_id = *set_counter;
         *set_counter += 1;
         sets.push(CommitSet {
@@ -961,6 +1128,29 @@ pub fn set_query(
             display_child_sets: Vec::new(),
         });
     }
+    sets
+}
+
+/// Paint a partition from its tails and collect same-color sets.
+///
+/// Mirrors `ArcanistCommitGraphSetQuery::execute()`; `waypoint_map` maps a
+/// commit hash to its revision ids, and `set_counter` is the shared
+/// process-wide set id counter (PHP's `static $set_n`, starting at 1).
+pub fn set_query(
+    graph: &CommitGraph,
+    partition: &Partition,
+    waypoint_map: &HashMap<String, Vec<u32>>,
+    set_counter: &mut u64,
+) -> Result<Vec<CommitSet>, String> {
+    let waypoint_color = fuse_waypoint_colors(waypoint_map);
+    let (mut colors, mut stack) = seed_set_colors(partition, &waypoint_color);
+    let in_partition = partition_membership(partition);
+    let mut wait = set_wait_counts(graph, partition, &in_partition);
+    paint_partition_sets(graph, &mut colors, &mut stack, &waypoint_color, &mut wait);
+    if !wait.is_empty() {
+        return Err("Did not reach every wait node??".to_string());
+    }
+    let mut sets = collect_color_sets(graph, &colors, set_counter);
     link_sets(graph, &mut sets);
     build_display_layout(&mut sets);
     Ok(sets)
@@ -991,6 +1181,66 @@ fn link_sets(graph: &CommitGraph, sets: &mut [CommitSet]) {
     }
 }
 
+/// Push `edge` unless it stays inside set `index` or is already listed.
+fn push_crossing_edge(
+    set_map: &HashMap<String, usize>,
+    index: usize,
+    edges: &mut Vec<String>,
+    edge: &str,
+) {
+    if set_map.get(edge) == Some(&index) {
+        return;
+    }
+    for existing in edges.iter() {
+        if existing == edge {
+            return;
+        }
+    }
+    edges.push(edge.to_string());
+}
+
+/// Parent and child hashes crossing out of one set, in first-appearance
+/// order.
+fn crossing_hashes(
+    graph: &CommitGraph,
+    set_map: &HashMap<String, usize>,
+    index: usize,
+    set: &CommitSet,
+) -> (Vec<String>, Vec<String>) {
+    let mut parents: Vec<String> = Vec::new();
+    let mut children: Vec<String> = Vec::new();
+    for hash in set.hashes() {
+        let Some(node) = graph.node(hash) else {
+            continue;
+        };
+        for edge in node.parents() {
+            push_crossing_edge(set_map, index, &mut parents, edge);
+        }
+        for edge in node.children() {
+            push_crossing_edge(set_map, index, &mut children, edge);
+        }
+    }
+    (parents, children)
+}
+
+/// Set ids adjacent over `edges`, in first-appearance order.
+fn adjacent_set_ids(
+    set_map: &HashMap<String, usize>,
+    set_ids: &[u64],
+    edges: &[String],
+) -> Vec<u64> {
+    let mut ids = Vec::new();
+    for edge in edges {
+        if let Some(&adjacent) = set_map.get(edge) {
+            let id = set_ids[adjacent];
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
 /// Edges crossing out of one set: parent/child hashes plus the adjacent
 /// set ids in first-appearance order.
 fn link_one_set(
@@ -1000,41 +1250,9 @@ fn link_one_set(
     index: usize,
     set: &CommitSet,
 ) -> SetLinks {
-    let mut parents: Vec<String> = Vec::new();
-    let mut children: Vec<String> = Vec::new();
-    for hash in set.hashes() {
-        let Some(node) = graph.node(hash) else {
-            continue;
-        };
-        for edge in node.parents() {
-            if set_map.get(edge) != Some(&index) && !parents.contains(edge) {
-                parents.push(edge.clone());
-            }
-        }
-        for edge in node.children() {
-            if set_map.get(edge) != Some(&index) && !children.contains(edge) {
-                children.push(edge.clone());
-            }
-        }
-    }
-    let mut parent_sets = Vec::new();
-    for edge in &parents {
-        if let Some(&adjacent) = set_map.get(edge) {
-            let id = set_ids[adjacent];
-            if !parent_sets.contains(&id) {
-                parent_sets.push(id);
-            }
-        }
-    }
-    let mut child_sets = Vec::new();
-    for edge in &children {
-        if let Some(&adjacent) = set_map.get(edge) {
-            let id = set_ids[adjacent];
-            if !child_sets.contains(&id) {
-                child_sets.push(id);
-            }
-        }
-    }
+    let (parents, children) = crossing_hashes(graph, set_map, index, set);
+    let parent_sets = adjacent_set_ids(set_map, set_ids, &parents);
+    let child_sets = adjacent_set_ids(set_map, set_ids, &children);
     (parents, children, parent_sets, child_sets)
 }
 
@@ -1216,6 +1434,78 @@ fn compare_left(a: &[u8], ai: &mut usize, b: &[u8], bi: &mut usize) -> i32 {
     }
 }
 
+/// Skip leading zeros once, keeping one digit of the run.
+fn skip_leading_zeros(bytes: &[u8], mut index: usize) -> usize {
+    while index + 1 < bytes.len() && bytes[index] == b'0' && bytes[index + 1].is_ascii_digit() {
+        index += 1;
+    }
+    index
+}
+
+/// Skip whitespace from `index`, returning the current byte (NUL past
+/// the end, like the C version's over-reads).
+fn skip_natural_spaces(bytes: &[u8], index: &mut usize, mut current: u8) -> u8 {
+    while natural_is_space(current) {
+        *index += 1;
+        current = *bytes.get(*index).unwrap_or(&0);
+    }
+    current
+}
+
+/// Ordering once either side runs out of bytes, if either side did.
+fn natural_end_ordering(
+    a_len: usize,
+    b_len: usize,
+    ai: usize,
+    bi: usize,
+) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    let a_end = ai >= a_len;
+    let b_end = bi >= b_len;
+    if a_end && b_end {
+        Some(Ordering::Equal)
+    } else if a_end {
+        Some(Ordering::Less)
+    } else if b_end {
+        Some(Ordering::Greater)
+    } else {
+        None
+    }
+}
+
+/// Compare the digit runs at `ai`/`bi` numerically, advancing past them.
+///
+/// Returns the decided ordering, or `None` to fall through with `ca`/`cb`
+/// reloaded (PHP compares the bytes after the runs instead of restarting
+/// the loop).
+fn natural_digit_run(
+    a: &[u8],
+    ai: &mut usize,
+    b: &[u8],
+    bi: &mut usize,
+    ca: &mut u8,
+    cb: &mut u8,
+) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    let fractional = *ca == b'0' || *cb == b'0';
+    let result = if fractional {
+        compare_left(a, ai, b, bi)
+    } else {
+        compare_right(a, ai, b, bi)
+    };
+    match result.cmp(&0) {
+        Ordering::Less => return Some(Ordering::Less),
+        Ordering::Greater => return Some(Ordering::Greater),
+        Ordering::Equal => {}
+    }
+    if let Some(order) = natural_end_ordering(a.len(), b.len(), *ai, *bi) {
+        return Some(order);
+    }
+    *ca = a[*ai];
+    *cb = b[*bi];
+    None
+}
+
 /// Natural-order byte comparison, ported from php-src
 /// `ext/standard/strnatcmp.c` (`strnatcasecmp()` when
 /// `case_insensitive`).
@@ -1228,51 +1518,21 @@ pub fn natural_cmp(a: &[u8], b: &[u8], case_insensitive: bool) -> std::cmp::Orde
         return a.len().cmp(&b.len());
     }
     // Skip leading zeros once, before the main loop.
-    let mut ai = 0;
-    while ai + 1 < a.len() && a[ai] == b'0' && a[ai + 1].is_ascii_digit() {
-        ai += 1;
-    }
-    let mut bi = 0;
-    while bi + 1 < b.len() && b[bi] == b'0' && b[bi + 1].is_ascii_digit() {
-        bi += 1;
-    }
+    let mut ai = skip_leading_zeros(a, 0);
+    let mut bi = skip_leading_zeros(b, 0);
     let mut ca = a[ai];
     let mut cb = b[bi];
     loop {
-        while natural_is_space(ca) {
-            ai += 1;
-            ca = *a.get(ai).unwrap_or(&0);
-        }
-        while natural_is_space(cb) {
-            bi += 1;
-            cb = *b.get(bi).unwrap_or(&0);
-        }
+        ca = skip_natural_spaces(a, &mut ai, ca);
+        cb = skip_natural_spaces(b, &mut bi, cb);
         // Digit runs on both sides compare numerically; afterwards PHP
         // falls through to compare the bytes after the runs, it does not
         // restart the loop.
-        if ca.is_ascii_digit() && cb.is_ascii_digit() {
-            let fractional = ca == b'0' || cb == b'0';
-            let result = if fractional {
-                compare_left(a, &mut ai, b, &mut bi)
-            } else {
-                compare_right(a, &mut ai, b, &mut bi)
-            };
-            match result.cmp(&0) {
-                Ordering::Less => return Ordering::Less,
-                Ordering::Greater => return Ordering::Greater,
-                Ordering::Equal => {}
-            }
-            let a_end = ai >= a.len();
-            let b_end = bi >= b.len();
-            if a_end && b_end {
-                return Ordering::Equal;
-            } else if a_end {
-                return Ordering::Less;
-            } else if b_end {
-                return Ordering::Greater;
-            }
-            ca = a[ai];
-            cb = b[bi];
+        if ca.is_ascii_digit()
+            && cb.is_ascii_digit()
+            && let Some(order) = natural_digit_run(a, &mut ai, b, &mut bi, &mut ca, &mut cb)
+        {
+            return order;
         }
         if case_insensitive {
             ca = ca.to_ascii_uppercase();
@@ -1285,14 +1545,8 @@ pub fn natural_cmp(a: &[u8], b: &[u8], case_insensitive: bool) -> std::cmp::Orde
         }
         ai += 1;
         bi += 1;
-        let a_end = ai >= a.len();
-        let b_end = bi >= b.len();
-        if a_end && b_end {
-            return Ordering::Equal;
-        } else if a_end {
-            return Ordering::Less;
-        } else if b_end {
-            return Ordering::Greater;
+        if let Some(order) = natural_end_ordering(a.len(), b.len(), ai, bi) {
+            return order;
         }
         ca = a[ai];
         cb = b[bi];

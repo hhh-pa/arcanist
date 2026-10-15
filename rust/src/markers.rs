@@ -736,6 +736,106 @@ pub struct StateCommit {
     pub message: String,
 }
 
+/// Empty revision-ref lists keyed by state hash.
+fn empty_revision_refs(states: &[StateCommit]) -> HashMap<String, Vec<revision::RevisionRef>> {
+    let mut refs: HashMap<String, Vec<revision::RevisionRef>> = HashMap::new();
+    for state in states {
+        refs.insert(state.hash.clone(), Vec::new());
+    }
+    refs
+}
+
+/// State commit refs carry no tree hash, so only `gtcm` pairs apply.
+fn state_hash_pairs(states: &[StateCommit]) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for state in states {
+        pairs.push(("gtcm".to_string(), state.hash.clone()));
+    }
+    pairs
+}
+
+/// Merge hash-query refs into the per-hash lists.
+fn merge_hash_query_refs(
+    client: &crate::conduit::Client,
+    states: &[StateCommit],
+    merged: &mut HashMap<String, Vec<revision::RevisionRef>>,
+) -> Result<(), String> {
+    let pairs = state_hash_pairs(states);
+    for (key, reference) in revision::load_by_commit_hashes(client, &pairs)? {
+        if let Some(hash) = key.strip_prefix("gtcm:")
+            && let Some(list) = merged.get_mut(hash)
+        {
+            list.push(reference);
+        }
+    }
+    Ok(())
+}
+
+/// Map revision ids from commit messages to state hashes, plus the
+/// first-seen id order for the conduit query.
+fn revision_id_index(states: &[StateCommit]) -> (HashMap<u32, Vec<String>>, Vec<u32>) {
+    let mut id_map: HashMap<u32, Vec<String>> = HashMap::new();
+    let mut id_order: Vec<u32> = Vec::new();
+    for state in states {
+        // Usage errors (invalid fields) skip the commit, like the PHP
+        // message query's `catch (ArcanistUsageException)`.
+        let Ok(id) = revision::revision_id_from_message(&state.message) else {
+            continue;
+        };
+        let Some(id) = id else {
+            continue;
+        };
+        if let Some(hashes) = id_map.get_mut(&id) {
+            hashes.push(state.hash.clone());
+        } else {
+            id_order.push(id);
+            id_map.insert(id, vec![state.hash.clone()]);
+        }
+    }
+    (id_map, id_order)
+}
+
+/// Push `reference` onto `hash`'s list unless its PHID is already there.
+fn push_revision_ref_once(
+    merged: &mut HashMap<String, Vec<revision::RevisionRef>>,
+    hash: &str,
+    reference: &revision::RevisionRef,
+) {
+    let Some(list) = merged.get_mut(hash) else {
+        return;
+    };
+    let mut duplicate = false;
+    if reference.phid().is_some() {
+        for item in list.iter() {
+            if item.phid() == reference.phid() {
+                duplicate = true;
+                break;
+            }
+        }
+    }
+    if !duplicate {
+        list.push(reference.clone());
+    }
+}
+
+/// Merge message-query (id) refs into the per-hash lists.
+fn merge_id_query_refs(
+    client: &crate::conduit::Client,
+    ids: &[u32],
+    id_map: &HashMap<u32, Vec<String>>,
+    merged: &mut HashMap<String, Vec<revision::RevisionRef>>,
+) -> Result<(), String> {
+    for reference in revision::load_by_ids(client, ids)? {
+        let id = reference.id();
+        if let Some(hashes) = id_map.get(&id) {
+            for hash in hashes {
+                push_revision_ref_once(merged, hash, &reference);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Load revision refs for every state hash: hash-query refs first, then
 /// message-query refs, deduplicated by PHID.
 ///
@@ -746,60 +846,208 @@ pub fn load_revision_refs(
     client: Option<&crate::conduit::Client>,
     states: &[StateCommit],
 ) -> Result<HashMap<String, Vec<revision::RevisionRef>>, String> {
-    let mut refs: HashMap<String, Vec<revision::RevisionRef>> = HashMap::new();
-    for state in states {
-        refs.insert(state.hash.clone(), Vec::new());
-    }
+    let mut merged = empty_revision_refs(states);
     let Some(client) = client else {
-        return Ok(refs);
+        return Ok(merged);
     };
-    // State commit refs carry no tree hash, so only `gtcm` pairs apply.
-    let pairs: Vec<(String, String)> = states
-        .iter()
-        .map(|state| ("gtcm".to_string(), state.hash.clone()))
-        .collect();
-    let mut merged = refs;
-    for (key, reference) in revision::load_by_commit_hashes(client, &pairs)? {
-        if let Some(hash) = key.strip_prefix("gtcm:")
-            && let Some(list) = merged.get_mut(hash)
-        {
-            list.push(reference);
+    merge_hash_query_refs(client, states, &mut merged)?;
+    let (id_map, ids) = revision_id_index(states);
+    merge_id_query_refs(client, &ids, &id_map, &mut merged)?;
+    Ok(merged)
+}
+
+/// True when any marker on `hash` is the active marker.
+fn hash_has_active_marker(groups: &HashMap<String, Vec<MarkerRef>>, hash: &str) -> bool {
+    let Some(markers) = groups.get(hash) else {
+        return false;
+    };
+    for marker in markers {
+        if marker.active {
+            return true;
         }
     }
-    let mut id_map: HashMap<u32, Vec<String>> = HashMap::new();
-    let mut id_order: Vec<u32> = Vec::new();
-    for state in states {
-        // Usage errors (invalid fields) skip the commit, like the PHP
-        // message query's `catch (ArcanistUsageException)`.
-        let Ok(id) = revision::revision_id_from_message(&state.message) else {
-            continue;
-        };
-        if let Some(id) = id {
-            id_map
-                .entry(id)
-                .or_insert_with(|| {
-                    id_order.push(id);
-                    Vec::new()
-                })
-                .push(state.hash.clone());
+    false
+}
+
+/// True when any commit in `set` carries an active marker.
+fn set_has_active_marker(
+    set: &commitgraph::CommitSet,
+    groups: &HashMap<String, Vec<MarkerRef>>,
+) -> bool {
+    for hash in set.hashes() {
+        if hash_has_active_marker(groups, hash) {
+            return true;
         }
     }
-    let ids = id_order;
-    for reference in revision::load_by_ids(client, &ids)? {
-        let id = reference.id();
-        if let Some(hashes) = id_map.get(&id) {
-            for hash in hashes {
-                if let Some(list) = merged.get_mut(hash) {
-                    let duplicate = reference.phid().is_some()
-                        && list.iter().any(|item| item.phid() == reference.phid());
-                    if !duplicate {
-                        list.push(reference.clone());
-                    }
-                }
+    false
+}
+
+/// Ids of sets holding an active marker.
+fn find_active_sets(
+    sets: &[commitgraph::CommitSet],
+    groups: &HashMap<String, Vec<MarkerRef>>,
+) -> HashMap<u64, ()> {
+    let mut active: HashMap<u64, ()> = HashMap::new();
+    for set in sets {
+        if set_has_active_marker(set, groups) {
+            active.insert(set.set_id(), ());
+        }
+    }
+    active
+}
+
+/// Parent set ids of set `id`.
+fn parent_set_ids(sets: &[commitgraph::CommitSet], id: u64) -> Vec<u64> {
+    for set in sets {
+        if set.set_id() == id {
+            return set.parent_sets().to_vec();
+        }
+    }
+    Vec::new()
+}
+
+/// Mark ancestors of active sets active too.
+fn mark_set_ancestors(sets: &[commitgraph::CommitSet], active: &mut HashMap<u64, ()>) {
+    let mut stack: Vec<u64> = Vec::new();
+    for set in sets {
+        if active.contains_key(&set.set_id()) {
+            stack.push(set.set_id());
+        }
+    }
+    while let Some(id) = stack.pop() {
+        for parent in parent_set_ids(sets, id) {
+            if active.contains_key(&parent) {
+                continue;
+            }
+            active.insert(parent, ());
+            stack.push(parent);
+        }
+    }
+}
+
+/// Borrowed view of owned marker names for natural-order comparison.
+fn borrowed_names(marker_names: &[String]) -> Vec<&str> {
+    let mut borrowed = Vec::new();
+    for name in marker_names {
+        borrowed.push(name.as_str());
+    }
+    borrowed
+}
+
+/// The (has-markers, max-name) vector parts for one set's marker names,
+/// recording the max name for the partition vector.
+fn set_marker_parts(marker_names: &[String], partition_names: &mut Vec<String>) -> (i64, String) {
+    if marker_names.is_empty() {
+        return (0, String::new());
+    }
+    let borrowed = borrowed_names(marker_names);
+    let max = commitgraph::natural_max(&borrowed)
+        .unwrap_or("")
+        .to_string();
+    partition_names.push(max.clone());
+    (1, max)
+}
+
+/// Sort vector for one set: active flag, newest epoch, marker presence
+/// and max name. Folds the set's epoch and max name into the partition
+/// accumulators.
+fn set_sort_vector(
+    graph: &commitgraph::CommitGraph,
+    set: &commitgraph::CommitSet,
+    groups: &HashMap<String, Vec<MarkerRef>>,
+    has_active: bool,
+    partition_epoch: &mut i64,
+    partition_names: &mut Vec<String>,
+) -> commitgraph::SortVector {
+    let mut max_epoch = 0;
+    let mut marker_names: Vec<String> = Vec::new();
+    for hash in set.hashes() {
+        if let Some(node) = graph.node(hash) {
+            max_epoch = max_epoch.max(node.epoch().unwrap_or(0));
+        }
+        if let Some(markers) = groups.get(hash) {
+            for marker in markers {
+                marker_names.push(marker.name.clone());
             }
         }
     }
-    Ok(merged)
+    *partition_epoch = (*partition_epoch).max(max_epoch);
+    let (has_markers, max_name) = set_marker_parts(&marker_names, partition_names);
+    let mut vector = commitgraph::SortVector::new();
+    vector.add_int(i64::from(has_active));
+    vector.add_int(max_epoch);
+    vector.add_int(has_markers);
+    vector
+        .add_string(&max_name)
+        .expect("marker names lack NUL bytes");
+    vector
+}
+
+/// Compare set order entries by vector, ties by original position.
+fn set_order_cmp(left: &(String, usize), right: &(String, usize)) -> std::cmp::Ordering {
+    commitgraph::natural_cmp(left.0.as_bytes(), right.0.as_bytes(), true).then(left.1.cmp(&right.1))
+}
+
+/// Set ids ordered by their sort vectors, byte-compared and stable.
+fn order_sets_by_vector(vectors: &[(u64, commitgraph::SortVector)]) -> Vec<u64> {
+    let mut order: Vec<(String, usize)> = Vec::new();
+    for (index, (_, vector)) in vectors.iter().enumerate() {
+        order.push((vector.sort_string(), index));
+    }
+    order.sort_by(set_order_cmp);
+    let mut keys = Vec::new();
+    for (_, index) in &order {
+        keys.push(vectors[*index].0);
+    }
+    keys
+}
+
+/// Position of set `id`, which vector keys always cover.
+fn find_set_position(sets: &[commitgraph::CommitSet], id: u64) -> usize {
+    for (position, set) in sets.iter().enumerate() {
+        if set.set_id() == id {
+            return position;
+        }
+    }
+    panic!("vector keys cover every set");
+}
+
+/// Restrict display children to `vector_keys` and reorder the sets.
+fn reorder_sets(sets: &mut Vec<commitgraph::CommitSet>, vector_keys: &[u64]) {
+    for set in sets.iter_mut() {
+        set.reorder_display_children(vector_keys);
+    }
+    let mut ordered: Vec<commitgraph::CommitSet> = Vec::with_capacity(sets.len());
+    for id in vector_keys {
+        ordered.push(sets[find_set_position(sets, *id)].clone());
+    }
+    *sets = ordered;
+}
+
+/// Partition sort vector: any-active flag, newest epoch, marker presence
+/// and max name.
+fn partition_sort_vector(
+    any_active: bool,
+    partition_epoch: i64,
+    partition_names: &[String],
+) -> commitgraph::SortVector {
+    let mut vector = commitgraph::SortVector::new();
+    vector.add_int(i64::from(any_active));
+    vector.add_int(partition_epoch);
+    if partition_names.is_empty() {
+        vector.add_int(0);
+        vector.add_string("").expect("marker names lack NUL bytes");
+    } else {
+        let borrowed = borrowed_names(partition_names);
+        let max = commitgraph::natural_max(&borrowed)
+            .unwrap_or("")
+            .to_string();
+        vector.add_int(1);
+        vector
+            .add_string(&max)
+            .expect("marker names lack NUL bytes");
+    }
+    vector
 }
 
 /// Sort a partition's sets and restrict their display children, returning
@@ -813,114 +1061,26 @@ pub fn sort_sets(
     sets: &mut Vec<commitgraph::CommitSet>,
     groups: &HashMap<String, Vec<MarkerRef>>,
 ) -> commitgraph::SortVector {
-    let mut active: HashMap<u64, ()> = HashMap::new();
-    for set in sets.iter() {
-        let has_active = set.hashes().iter().any(|hash| {
-            groups
-                .get(hash)
-                .is_some_and(|markers| markers.iter().any(|marker| marker.active))
-        });
-        if has_active {
-            active.insert(set.set_id(), ());
-        }
-    }
-    let mut stack: Vec<u64> = sets
-        .iter()
-        .filter(|set| active.contains_key(&set.set_id()))
-        .map(|set| set.set_id())
-        .collect();
-    let parents_of = |id: u64| -> Vec<u64> {
-        sets.iter()
-            .find(|set| set.set_id() == id)
-            .map(|set| set.parent_sets().to_vec())
-            .unwrap_or_default()
-    };
-    while let Some(id) = stack.pop() {
-        for parent in parents_of(id) {
-            if active.contains_key(&parent) {
-                continue;
-            }
-            active.insert(parent, ());
-            stack.push(parent);
-        }
-    }
+    let mut active = find_active_sets(sets, groups);
+    mark_set_ancestors(sets, &mut active);
     let mut vectors: Vec<(u64, commitgraph::SortVector)> = Vec::new();
     let mut partition_epoch = 0;
     let mut partition_names: Vec<String> = Vec::new();
     for set in sets.iter() {
         let has_active = active.contains_key(&set.set_id());
-        let mut max_epoch = 0;
-        let mut marker_names: Vec<String> = Vec::new();
-        for hash in set.hashes() {
-            if let Some(node) = graph.node(hash) {
-                max_epoch = max_epoch.max(node.epoch().unwrap_or(0));
-            }
-            if let Some(markers) = groups.get(hash) {
-                marker_names.extend(markers.iter().map(|marker| marker.name.clone()));
-            }
-        }
-        partition_epoch = partition_epoch.max(max_epoch);
-        let (has_markers, max_name) = if marker_names.is_empty() {
-            (0, String::new())
-        } else {
-            let borrowed: Vec<&str> = marker_names.iter().map(String::as_str).collect();
-            let max = commitgraph::natural_max(&borrowed)
-                .unwrap_or("")
-                .to_string();
-            partition_names.push(max.clone());
-            (1, max)
-        };
-        let mut vector = commitgraph::SortVector::new();
-        vector.add_int(i64::from(has_active));
-        vector.add_int(max_epoch);
-        vector.add_int(has_markers);
-        vector
-            .add_string(&max_name)
-            .expect("marker names lack NUL bytes");
+        let vector = set_sort_vector(
+            graph,
+            set,
+            groups,
+            has_active,
+            &mut partition_epoch,
+            &mut partition_names,
+        );
         vectors.push((set.set_id(), vector));
     }
-    let mut order: Vec<(String, usize)> = vectors
-        .iter()
-        .enumerate()
-        .map(|(index, (_, vector))| (vector.sort_string(), index))
-        .collect();
-    order.sort_by(|left, right| {
-        commitgraph::natural_cmp(left.0.as_bytes(), right.0.as_bytes(), true)
-            .then(left.1.cmp(&right.1))
-    });
-    let vector_keys: Vec<u64> = order.iter().map(|(_, index)| vectors[*index].0).collect();
-    for set in sets.iter_mut() {
-        set.reorder_display_children(&vector_keys);
-    }
-    let mut ordered: Vec<commitgraph::CommitSet> = Vec::with_capacity(sets.len());
-    for id in &vector_keys {
-        let position = sets
-            .iter()
-            .position(|set| set.set_id() == *id)
-            .expect("vector keys cover every set");
-        ordered.push(sets[position].clone());
-    }
-    *sets = ordered;
-    let any_active = !active.is_empty();
-    let (has_markers, partition_name) = if partition_names.is_empty() {
-        (0, String::new())
-    } else {
-        let borrowed: Vec<&str> = partition_names.iter().map(String::as_str).collect();
-        (
-            1,
-            commitgraph::natural_max(&borrowed)
-                .unwrap_or("")
-                .to_string(),
-        )
-    };
-    let mut vector = commitgraph::SortVector::new();
-    vector.add_int(i64::from(any_active));
-    vector.add_int(partition_epoch);
-    vector.add_int(has_markers);
-    vector
-        .add_string(&partition_name)
-        .expect("marker names lack NUL bytes");
-    vector
+    let vector_keys = order_sets_by_vector(&vectors);
+    reorder_sets(sets, &vector_keys);
+    partition_sort_vector(!active.is_empty(), partition_epoch, &partition_names)
 }
 
 /// One set tree view (`ArcanistCommitGraphSetView`): hierarchy, grouping,
@@ -976,76 +1136,114 @@ fn build_set_views(sets: &HashMap<u64, &commitgraph::CommitSet>, root: u64) -> V
     views
 }
 
+/// Position of the view for set `id`, which always resolves.
+fn view_index(views: &[SetView], id: u64) -> usize {
+    for (index, view) in views.iter().enumerate() {
+        if view.set_id == id {
+            return index;
+        }
+    }
+    panic!("view ids resolve");
+}
+
+/// Group for one view (`getGroupForView()`): revised, marked, and
+/// childless views group alone, otherwise a view joins its parent's
+/// group when it is the only child.
+fn group_for_view(
+    views: &[SetView],
+    position: usize,
+    revisions: &HashMap<u64, bool>,
+    marked: &HashMap<u64, bool>,
+) -> u64 {
+    let id = views[position].set_id;
+    if revisions.get(&id).copied().unwrap_or(false)
+        || marked.get(&id).copied().unwrap_or(false)
+        || views[position].children.is_empty()
+    {
+        return id;
+    }
+    let Some(parent) = views[position].parent else {
+        return id;
+    };
+    let siblings = views[view_index(views, parent)].children.len();
+    if siblings != 1 {
+        id
+    } else {
+        views[view_index(views, parent)].group
+    }
+}
+
+/// Assign each view to a group. Views run preorder, so parents group
+/// before their children.
+fn assign_view_groups(
+    views: &mut [SetView],
+    revisions: &HashMap<u64, bool>,
+    marked: &HashMap<u64, bool>,
+) {
+    for position in 0..views.len() {
+        let grouped = group_for_view(views, position, revisions, marked);
+        views[position].group = grouped;
+    }
+}
+
+/// Collect each view id into its group's member list.
+fn collect_view_members(views: &mut [SetView]) {
+    for position in 0..views.len() {
+        let group = views[position].group;
+        let member = views[position].set_id;
+        let target = view_index(views, group);
+        views[target].members.push(member);
+    }
+}
+
+/// Break groups of 2-3 members apart into singletons.
+fn split_small_groups(views: &mut [SetView]) {
+    for position in 0..views.len() {
+        let count = views[position].members.len();
+        if count > 1 && count < 4 {
+            let members = views[position].members.clone();
+            for member in members {
+                let target = view_index(views, member);
+                views[target].group = member;
+                views[target].members = vec![member];
+            }
+        }
+    }
+}
+
+/// Depth of one view from its parent's group holder.
+fn view_depth(views: &[SetView], position: usize) -> usize {
+    let Some(parent) = views[position].parent else {
+        return 0;
+    };
+    let group = views[view_index(views, parent)].group;
+    let holder = view_index(views, group);
+    let base = views[holder].depth;
+    if views[holder].members.len() > 1 {
+        base + 2
+    } else {
+        base + 1
+    }
+}
+
+/// Assign depths from parent groups.
+fn assign_view_depths(views: &mut [SetView]) {
+    for position in 0..views.len() {
+        let depth = view_depth(views, position);
+        views[position].depth = depth;
+    }
+}
+
 /// Assign each view to a group (`getGroupForView()`).
 ///
 /// `revisions` maps a set id to whether the set's head commit carries an
 /// unpublished revision; `marked` maps a set id to whether any commit in
 /// the set carries a marker.
 fn group_views(views: &mut [SetView], revisions: &HashMap<u64, bool>, marked: &HashMap<u64, bool>) {
-    let index_of = |views: &[SetView], id: u64| -> usize {
-        views
-            .iter()
-            .position(|view| view.set_id == id)
-            .expect("view ids resolve")
-    };
-    // Views run preorder, so parents group before their children.
-    for position in 0..views.len() {
-        let id = views[position].set_id;
-        let grouped = if revisions.get(&id).copied().unwrap_or(false)
-            || marked.get(&id).copied().unwrap_or(false)
-            || views[position].children.is_empty()
-        {
-            id
-        } else {
-            match views[position].parent {
-                None => id,
-                Some(parent) => {
-                    let siblings = views[index_of(views, parent)].children.len();
-                    if siblings != 1 {
-                        id
-                    } else {
-                        views[index_of(views, parent)].group
-                    }
-                }
-            }
-        };
-        views[position].group = grouped;
-    }
-    for position in 0..views.len() {
-        let group = views[position].group;
-        let member = views[position].set_id;
-        let target = index_of(views, group);
-        views[target].members.push(member);
-    }
-    // Break small groups apart.
-    for position in 0..views.len() {
-        let count = views[position].members.len();
-        if count > 1 && count < 4 {
-            let members = views[position].members.clone();
-            for member in members {
-                let target = index_of(views, member);
-                views[target].group = member;
-                views[target].members = vec![member];
-            }
-        }
-    }
-    // Assign depths from parent groups.
-    for position in 0..views.len() {
-        let depth = match views[position].parent {
-            None => 0,
-            Some(parent) => {
-                let group = views[index_of(views, parent)].group;
-                let holder = index_of(views, group);
-                let base = views[holder].depth;
-                if views[holder].members.len() > 1 {
-                    base + 2
-                } else {
-                    base + 1
-                }
-            }
-        };
-        views[position].depth = depth;
-    }
+    assign_view_groups(views, revisions, marked);
+    collect_view_members(views);
+    split_small_groups(views);
+    assign_view_depths(views);
 }
 
 /// One laid-out row item: a commit, a revision, a marker, a collapse
@@ -1065,12 +1263,8 @@ fn merge_key(text: &str) -> String {
     grid::utf8_lower(&prefix)
 }
 
-/// Lay out a view's commits, revisions, and markers into items.
-fn build_items(
-    commits: &[(String, String)],
-    revisions: &[revision::RevisionRef],
-    markers: &HashMap<String, Vec<MarkerRef>>,
-) -> Vec<Item> {
+/// Revision indexes keyed by merge key: lowercase first 32 summary bytes.
+fn revision_merge_strings(revisions: &[revision::RevisionRef]) -> HashMap<String, Vec<usize>> {
     let mut merge_strings: HashMap<String, Vec<usize>> = HashMap::new();
     for (index, reference) in revisions.iter().enumerate() {
         merge_strings
@@ -1078,41 +1272,85 @@ fn build_items(
             .or_default()
             .push(index);
     }
+    merge_strings
+}
+
+/// Revision index merging with one commit message: the single revision,
+/// or the unique revision sharing the commit summary's merge key.
+fn commit_merge_target(
+    revisions: &[revision::RevisionRef],
+    merge_strings: &HashMap<String, Vec<usize>>,
+    message: &str,
+) -> Option<usize> {
+    if revisions.len() == 1 {
+        return Some(0);
+    }
+    let key = merge_key(&commitgraph::commit_summary(message));
+    match merge_strings.get(&key) {
+        Some(refs) if refs.len() == 1 => Some(refs[0]),
+        _ => None,
+    }
+}
+
+/// Commit indexes keyed by merged revision PHID.
+fn commit_merge_map(
+    commits: &[(String, String)],
+    revisions: &[revision::RevisionRef],
+    merge_strings: &HashMap<String, Vec<usize>>,
+) -> HashMap<String, Vec<usize>> {
     let mut merge_map: HashMap<String, Vec<usize>> = HashMap::new();
     for (commit_index, (_, message)) in commits.iter().enumerate() {
-        let merge_with = if revisions.len() == 1 {
-            Some(0)
-        } else {
-            let key = merge_key(&commitgraph::commit_summary(message));
-            match merge_strings.get(&key) {
-                Some(refs) if refs.len() == 1 => Some(refs[0]),
-                _ => None,
-            }
+        let Some(index) = commit_merge_target(revisions, merge_strings, message) else {
+            continue;
         };
-        if let Some(index) = merge_with
-            && let Some(phid) = revisions[index].phid()
-        {
-            merge_map
-                .entry(phid.to_string())
-                .or_default()
-                .push(commit_index);
+        let Some(phid) = revisions[index].phid() else {
+            continue;
+        };
+        merge_map
+            .entry(phid.to_string())
+            .or_default()
+            .push(commit_index);
+    }
+    merge_map
+}
+
+/// Index of the revision carrying `phid`.
+fn find_revision_by_phid(revisions: &[revision::RevisionRef], phid: &str) -> Option<usize> {
+    for (index, reference) in revisions.iter().enumerate() {
+        if reference.phid() == Some(phid) {
+            return Some(index);
         }
     }
-    // `result_map`: commit hash to revision, only for 1:1 merges.
+    None
+}
+
+/// `result_map` (commit hash to revision, only for 1:1 merges) plus the
+/// merged PHIDs.
+fn paired_revision_indexes(
+    commits: &[(String, String)],
+    revisions: &[revision::RevisionRef],
+    merge_map: &HashMap<String, Vec<usize>>,
+) -> (HashMap<String, usize>, HashMap<String, ()>) {
     let mut result_map: HashMap<String, usize> = HashMap::new();
     let mut merged_phids: HashMap<String, ()> = HashMap::new();
-    for (phid, commit_list) in &merge_map {
+    for (phid, commit_list) in merge_map {
         if commit_list.len() != 1 {
             continue;
         }
-        let position = revisions
-            .iter()
-            .position(|reference| reference.phid() == Some(phid.as_str()));
-        if let Some(index) = position {
-            result_map.insert(commits[commit_list[0]].0.clone(), index);
-            merged_phids.insert(phid.clone(), ());
-        }
+        let Some(index) = find_revision_by_phid(revisions, phid) else {
+            continue;
+        };
+        result_map.insert(commits[commit_list[0]].0.clone(), index);
+        merged_phids.insert(phid.clone(), ());
     }
+    (result_map, merged_phids)
+}
+
+/// One item per unmerged revision.
+fn revision_items(
+    revisions: &[revision::RevisionRef],
+    merged_phids: &HashMap<String, ()>,
+) -> Vec<Item> {
     let mut items = Vec::new();
     for (index, reference) in revisions.iter().enumerate() {
         let phid = reference.phid().unwrap_or("").to_string();
@@ -1124,6 +1362,12 @@ fn build_items(
             ..Item::default()
         });
     }
+    items
+}
+
+/// One item per commit, carrying its paired revision if any.
+fn commit_items(commits: &[(String, String)], result_map: &HashMap<String, usize>) -> Vec<Item> {
+    let mut items = Vec::new();
     for (commit_index, (hash, _)) in commits.iter().enumerate() {
         items.push(Item {
             commit: Some(commit_index),
@@ -1131,28 +1375,110 @@ fn build_items(
             ..Item::default()
         });
     }
-    // Attach markers: the head marker joins the commit item, extras get
-    // their own marker-only items.
+    items
+}
+
+/// Non-empty marker list for an item's commit, if any.
+fn commit_marker_list(
+    item: &Item,
+    commits: &[(String, String)],
+    markers: &HashMap<String, Vec<MarkerRef>>,
+) -> Option<Vec<MarkerRef>> {
+    let index = item.commit?;
+    let found = markers.get(&commits[index].0)?;
+    if found.is_empty() {
+        return None;
+    }
+    Some(found.clone())
+}
+
+/// Attach markers: the head marker joins the commit item, extras get
+/// their own marker-only items.
+fn attach_markers(
+    items: Vec<Item>,
+    commits: &[(String, String)],
+    markers: &HashMap<String, Vec<MarkerRef>>,
+) -> Vec<Item> {
     let mut with_markers = Vec::new();
     for mut item in items {
-        let hash = item.commit.map(|index| commits[index].0.clone());
-        let marker_list = hash.as_ref().and_then(|hash| markers.get(hash));
-        match marker_list {
-            Some(list) if !list.is_empty() => {
-                let mut list = list.clone();
-                item.marker = Some(list.remove(0));
-                with_markers.push(item);
-                for marker in list {
-                    with_markers.push(Item {
-                        marker: Some(marker),
-                        ..Item::default()
-                    });
-                }
+        if let Some(mut list) = commit_marker_list(&item, commits, markers) {
+            item.marker = Some(list.remove(0));
+            with_markers.push(item);
+            for marker in list {
+                with_markers.push(Item {
+                    marker: Some(marker),
+                    ..Item::default()
+                });
             }
-            _ => with_markers.push(item),
+        } else {
+            with_markers.push(item);
         }
     }
-    collapse_items(with_markers)
+    with_markers
+}
+
+/// Lay out a view's commits, revisions, and markers into items.
+fn build_items(
+    commits: &[(String, String)],
+    revisions: &[revision::RevisionRef],
+    markers: &HashMap<String, Vec<MarkerRef>>,
+) -> Vec<Item> {
+    let merge_strings = revision_merge_strings(revisions);
+    let merge_map = commit_merge_map(commits, revisions, &merge_strings);
+    let (result_map, merged_phids) = paired_revision_indexes(commits, revisions, &merge_map);
+    let mut items = revision_items(revisions, &merged_phids);
+    items.extend(commit_items(commits, &result_map));
+    collapse_items(attach_markers(items, commits, markers))
+}
+
+/// True for bare commit items, the only collapsible kind.
+fn is_collapsible_item(item: &Item) -> bool {
+    item.commit.is_some()
+        && item.revision.is_none()
+        && item.marker.is_none()
+        && !item.group
+        && item.collapse.is_none()
+}
+
+/// Partition flags into runs of equal values, keys preserved.
+fn collapsible_runs(collapsible: &[bool]) -> Vec<(bool, Vec<usize>)> {
+    let mut runs: Vec<(bool, Vec<usize>)> = Vec::new();
+    for (index, value) in collapsible.iter().enumerate() {
+        let extend = match runs.last() {
+            Some((head, _)) => head == value,
+            None => false,
+        };
+        if extend {
+            if let Some((_, run)) = runs.last_mut() {
+                run.push(index);
+            }
+        } else {
+            runs.push((*value, vec![index]));
+        }
+    }
+    runs
+}
+
+/// Context items kept on each side of a collapsed run.
+const COLLAPSE_CONTEXT: usize = 3;
+
+/// Collapse one long run: the first middle item becomes a placeholder
+/// carrying the full run count, the rest of the middle is dropped.
+fn collapse_run(items: &mut Vec<Item>, run: &[usize]) {
+    let middle = &run[COLLAPSE_CONTEXT..run.len() - COLLAPSE_CONTEXT];
+    let mut first = true;
+    let mut drop = Vec::new();
+    for key in middle {
+        if first {
+            items[*key].collapse = Some(run.len());
+            first = false;
+        } else {
+            drop.push(*key);
+        }
+    }
+    for key in drop.into_iter().rev() {
+        items.remove(key);
+    }
 }
 
 /// Collapse long leading runs of bare commits, keeping 3 of context on
@@ -1162,46 +1488,19 @@ fn build_items(
 /// run, so only a leading collapsible run ever collapses; the
 /// placeholder carries the full run count, not the hidden count.
 fn collapse_items(mut items: Vec<Item>) -> Vec<Item> {
-    const SHOW_CONTEXT: usize = 3;
-    let collapsible: Vec<bool> = items
-        .iter()
-        .map(|item| {
-            item.commit.is_some()
-                && item.revision.is_none()
-                && item.marker.is_none()
-                && !item.group
-                && item.collapse.is_none()
-        })
-        .collect();
-    // Partition into runs of equal values, keys preserved.
-    let mut runs: Vec<(bool, Vec<usize>)> = Vec::new();
-    for (index, value) in collapsible.iter().enumerate() {
-        match runs.last_mut() {
-            Some((head, run)) if head == value => run.push(index),
-            _ => runs.push((*value, vec![index])),
-        }
+    const MIN_RUN: usize = COLLAPSE_CONTEXT * 2 + 3;
+    let mut collapsible = Vec::new();
+    for item in &items {
+        collapsible.push(is_collapsible_item(item));
     }
-    for (value, run) in &runs {
+    for (value, run) in &collapsible_runs(&collapsible) {
         if !value {
             break;
         }
-        if run.len() < SHOW_CONTEXT * 2 + 3 {
+        if run.len() < MIN_RUN {
             continue;
         }
-        let middle = &run[SHOW_CONTEXT..run.len() - SHOW_CONTEXT];
-        let mut first = true;
-        let mut drop = Vec::new();
-        for key in middle {
-            if first {
-                items[*key].collapse = Some(run.len());
-                first = false;
-            } else {
-                drop.push(*key);
-            }
-        }
-        for key in drop.into_iter().rev() {
-            items.remove(key);
-        }
+        collapse_run(&mut items, run);
     }
     items
 }
@@ -1227,6 +1526,108 @@ struct RowData<'a> {
     terminal: Option<usize>,
 }
 
+/// Commit label for the first row: one short hash, or a first..last
+/// range for multi-commit views.
+fn commit_range_label(commits: &[(String, String)]) -> String {
+    if commits.len() == 1 {
+        return short_hash(&commits[0].0).to_string();
+    }
+    if commits.is_empty() {
+        return String::new();
+    }
+    let first = commits
+        .first()
+        .map(|commit| commit.0.as_str())
+        .unwrap_or("");
+    let last = commits.last().map(|commit| commit.0.as_str()).unwrap_or("");
+    format!("{}..{}", short_hash(first), short_hash(last))
+}
+
+/// Display depth (capped by terminal width) and available label width.
+fn marker_cell_geometry(depth: usize, terminal: Option<usize>) -> (usize, usize) {
+    let width = terminal.unwrap_or(0);
+    let max_depth = 3 + width.saturating_sub(72) / 6;
+    let display_depth = if depth <= max_depth {
+        depth * 2
+    } else {
+        max_depth * 2
+    };
+    let max_width = max_depth * 2 + 16;
+    (display_depth, max_width.saturating_sub(display_depth))
+}
+
+/// Label for one marker-cell row: the marker name (active markers get a
+/// ` *  ` prefix), the group trailer, the commit label on the first row,
+/// or empty.
+fn marker_item_label(
+    item: &Item,
+    available: usize,
+    is_first: bool,
+    commit_label: &str,
+    members: usize,
+) -> String {
+    if let Some(marker) = &item.marker {
+        let width = if marker.active {
+            available.saturating_sub(4)
+        } else {
+            available
+        };
+        let name = grid::truncate_glyphs(&marker.name, width);
+        if marker.active {
+            format!(" *  {name}")
+        } else {
+            name
+        }
+    } else if item.group {
+        format!(
+            "(... {} more revisions ...)",
+            grid::group_number(members.saturating_sub(1) as u64)
+        )
+    } else if is_first {
+        commit_label.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Tree path for the first row of a marker cell.
+fn first_row_path(display_depth: usize, has_children: bool, is_last: bool) -> String {
+    if display_depth == 0 {
+        format!("{MARK_BULLET} ")
+    } else if has_children {
+        format!("{MARK_NE}{MARK_EW}{MARK_ESW} ")
+    } else if !is_last {
+        format!("{MARK_NE}{MARK_EW}{MARK_ESW_LIGHT} ")
+    } else {
+        format!("{MARK_NE}{MARK_EW}{MARK_EW} ")
+    }
+}
+
+/// Tree path for one marker-cell row.
+fn marker_item_path(
+    item: &Item,
+    is_first: bool,
+    is_last: bool,
+    display_depth: usize,
+    has_children: bool,
+) -> String {
+    if is_first {
+        return first_row_path(display_depth, has_children, is_last);
+    }
+    if item.group {
+        return format!("{MARK_NE}/{MARK_SW} ");
+    }
+    let mut path = if is_last && !has_children {
+        format!("{MARK_NE_LIGHT} ")
+    } else {
+        format!("{MARK_NS_LIGHT} ")
+    };
+    if display_depth > 0 {
+        path = format!("  {path}");
+    }
+    path
+}
+
 /// Draw the marker cell: tree path plus marker names, commit labels, and
 /// the group trailer.
 fn draw_marker_cell(data: &RowData<'_>) -> Vec<String> {
@@ -1237,91 +1638,20 @@ fn draw_marker_cell(data: &RowData<'_>) -> Vec<String> {
             ..Item::default()
         });
     }
-    let commit_label = if data.commits.len() == 1 {
-        short_hash(&data.commits[0].0).to_string()
-    } else if data.commits.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "{}..{}",
-            short_hash(
-                data.commits
-                    .first()
-                    .map(|commit| commit.0.as_str())
-                    .unwrap_or("")
-            ),
-            short_hash(
-                data.commits
-                    .last()
-                    .map(|commit| commit.0.as_str())
-                    .unwrap_or("")
-            )
-        )
-    };
-    let width = data.terminal.unwrap_or(0);
-    let max_depth = 3 + width.saturating_sub(72) / 6;
-    let (display_depth, _squished) = if data.depth <= max_depth {
-        (data.depth * 2, false)
-    } else {
-        (max_depth * 2, true)
-    };
-    let max_width = max_depth * 2 + 16;
-    let available = max_width.saturating_sub(display_depth);
+    let commit_label = commit_range_label(data.commits);
+    let (display_depth, available) = marker_cell_geometry(data.depth, data.terminal);
     let last_key = items.len().saturating_sub(1);
     let mut cell = Vec::new();
     for (key, item) in items.iter().enumerate() {
         let is_first = key == 0;
         let is_last = key == last_key;
-        let label = if let Some(marker) = &item.marker {
-            let width = if marker.active {
-                available.saturating_sub(4)
-            } else {
-                available
-            };
-            let name = grid::truncate_glyphs(&marker.name, width);
-            if marker.active {
-                format!(" *  {name}")
-            } else {
-                name
-            }
-        } else if item.group {
-            format!(
-                "(... {} more revisions ...)",
-                grid::group_number(data.members.saturating_sub(1) as u64)
-            )
-        } else if is_first {
-            commit_label.clone()
-        } else {
-            String::new()
-        };
+        let label = marker_item_label(item, available, is_first, &commit_label, data.members);
         let indent = if display_depth > 2 {
             " ".repeat(display_depth - 2)
         } else {
             String::new()
         };
-        let path = if is_first {
-            if display_depth == 0 {
-                format!("{MARK_BULLET} ")
-            } else if data.has_children {
-                format!("{MARK_NE}{MARK_EW}{MARK_ESW} ")
-            } else if !is_last {
-                format!("{MARK_NE}{MARK_EW}{MARK_ESW_LIGHT} ")
-            } else {
-                format!("{MARK_NE}{MARK_EW}{MARK_EW} ")
-            }
-        } else if item.group {
-            format!("{MARK_NE}/{MARK_SW} ")
-        } else {
-            let mut path = if is_last && !data.has_children {
-                format!("{MARK_NE_LIGHT} ")
-            } else {
-                format!("{MARK_NS_LIGHT} ")
-            };
-            if display_depth > 0 {
-                path = format!("  {path}");
-            }
-            path
-        };
+        let path = marker_item_path(item, is_first, is_last, display_depth, data.has_children);
         cell.push(format!("{indent}{path}{label}\n"));
     }
     cell
@@ -1529,6 +1859,231 @@ pub fn run_workflow(
     )
 }
 
+/// Workflow markers: local markers of `marker_type`, plus
+/// remote-tracking branches when `include_remote` applies.
+fn query_workflow_markers(
+    dir: &Path,
+    hg_command: &hg::HgCommand,
+    vcs: &str,
+    marker_type: &str,
+    include_remote: bool,
+) -> Result<Vec<MarkerRef>, String> {
+    let mut markers = match vcs {
+        "git" => query_git_markers(dir, marker_type, false)?,
+        "hg" => query_hg_markers_with(dir, hg_command, marker_type)?,
+        other => return Err(support_error(other, marker_type)),
+    };
+    if include_remote && vcs == "git" && marker_type == MARKER_TYPE_BRANCH {
+        markers.extend(query_git_markers(dir, marker_type, true)?);
+    }
+    Ok(markers)
+}
+
+/// Published-commit tails bounding the unpublished walk.
+fn query_workflow_tails(
+    dir: &Path,
+    hg_command: &hg::HgCommand,
+    vcs: &str,
+    client: Option<&crate::conduit::Client>,
+) -> Result<Vec<String>, String> {
+    match vcs {
+        "git" => published_git_hashes(dir, client),
+        _ => published_hg_hashes_with(dir, hg_command),
+    }
+}
+
+/// Walk unpublished commits from `heads` down to `tails`, enforcing the
+/// unpublished-commit guard.
+fn run_head_query(
+    graph: &mut commitgraph::CommitGraph,
+    dir: &Path,
+    hg_command: &hg::HgCommand,
+    vcs: &str,
+    heads: &[String],
+    tails: &[String],
+) -> Result<Vec<String>, String> {
+    let tails_option = if tails.is_empty() { None } else { Some(tails) };
+    let limited = commitgraph::QueryBounds::limit(UNPUBLISHED_LIMIT + 1);
+    let seen = match vcs {
+        "git" => commitgraph::run_git_query(graph, dir, Some(heads), tails_option, None, &limited)?,
+        _ => commitgraph::run_hg_query(
+            graph,
+            dir,
+            hg_command,
+            Some(heads),
+            tails_option,
+            None,
+            &limited,
+        )?,
+    };
+    check_limit(seen.len())?;
+    Ok(seen)
+}
+
+/// Load marker heads missing from the walk exactly: markers pointing at
+/// already-published commits never surface in the walk, and must not
+/// vanish from the output.
+fn load_disjoint_heads(
+    graph: &mut commitgraph::CommitGraph,
+    dir: &Path,
+    hg_command: &hg::HgCommand,
+    vcs: &str,
+    heads: &[String],
+    nodes: &mut Vec<String>,
+) -> Result<(), String> {
+    let mut disjoint: Vec<String> = Vec::new();
+    for head in heads {
+        if !nodes.contains(head) {
+            disjoint.push(head.clone());
+        }
+    }
+    if disjoint.is_empty() {
+        return Ok(());
+    }
+    let unbounded = commitgraph::QueryBounds::unbounded();
+    let extra = match vcs {
+        "git" => commitgraph::run_git_query(graph, dir, None, None, Some(&disjoint), &unbounded)?,
+        _ => commitgraph::run_hg_query(
+            graph,
+            dir,
+            hg_command,
+            None,
+            None,
+            Some(&disjoint),
+            &unbounded,
+        )?,
+    };
+    for hash in extra {
+        if !nodes.contains(&hash) {
+            nodes.push(hash);
+        }
+    }
+    Ok(())
+}
+
+/// Working-copy states for the walked nodes, as a map and in graph order.
+fn collect_workflow_states(
+    graph: &commitgraph::CommitGraph,
+    nodes: &[String],
+) -> (HashMap<String, String>, Vec<StateCommit>) {
+    let mut states: HashMap<String, String> = HashMap::new();
+    let mut ordered_states = Vec::new();
+    for hash in nodes {
+        let mut message = "";
+        if let Some(node) = graph.node(hash) {
+            message = node.message().unwrap_or("");
+        }
+        states.insert(hash.clone(), message.to_string());
+        ordered_states.push(StateCommit {
+            hash: hash.clone(),
+            message: message.to_string(),
+        });
+    }
+    (states, ordered_states)
+}
+
+/// Markers grouped by the commit hash they point at.
+fn group_markers_by_hash(markers: &[MarkerRef]) -> HashMap<String, Vec<MarkerRef>> {
+    let mut groups: HashMap<String, Vec<MarkerRef>> = HashMap::new();
+    for marker in markers {
+        groups
+            .entry(marker.commit_hash.clone())
+            .or_default()
+            .push(marker.clone());
+    }
+    groups
+}
+
+/// Deduplicated revision ids per state hash for the set query.
+fn revision_waypoint_map(
+    revisions: &HashMap<String, Vec<revision::RevisionRef>>,
+) -> HashMap<String, Vec<u32>> {
+    let mut waypoint_map: HashMap<String, Vec<u32>> = HashMap::new();
+    for (hash, refs) in revisions {
+        let mut ids = Vec::new();
+        for reference in refs {
+            if !ids.contains(&reference.id()) {
+                ids.push(reference.id());
+            }
+        }
+        waypoint_map.insert(hash.clone(), ids);
+    }
+    waypoint_map
+}
+
+/// Sorted sets and sort vectors for every partition.
+fn build_partition_sets(
+    graph: &commitgraph::CommitGraph,
+    partitions: &[commitgraph::Partition],
+    revisions: &HashMap<String, Vec<revision::RevisionRef>>,
+    groups: &HashMap<String, Vec<MarkerRef>>,
+) -> Result<
+    (
+        Vec<Vec<commitgraph::CommitSet>>,
+        Vec<commitgraph::SortVector>,
+    ),
+    String,
+> {
+    let waypoint_map = revision_waypoint_map(revisions);
+    let mut partition_sets = Vec::new();
+    let mut partition_vectors = Vec::new();
+    let mut set_counter = 1;
+    for partition in partitions {
+        let mut sets = commitgraph::set_query(graph, partition, &waypoint_map, &mut set_counter)?;
+        let vector = sort_sets(graph, &mut sets, groups);
+        partition_sets.push(sets);
+        partition_vectors.push(vector);
+    }
+    Ok((partition_sets, partition_vectors))
+}
+
+/// Compare partition order entries by vector bytes, ties by position.
+fn partition_order_cmp(left: &(String, usize), right: &(String, usize)) -> std::cmp::Ordering {
+    left.0
+        .as_bytes()
+        .cmp(right.0.as_bytes())
+        .then(left.1.cmp(&right.1))
+}
+
+/// Partition indexes ordered by their vectors, byte-compared and stable.
+fn order_partitions(vectors: &[commitgraph::SortVector]) -> Vec<usize> {
+    let mut order: Vec<(String, usize)> = Vec::new();
+    for (index, vector) in vectors.iter().enumerate() {
+        order.push((vector.sort_string(), index));
+    }
+    order.sort_by(partition_order_cmp);
+    let mut keys = Vec::new();
+    for (_, index) in &order {
+        keys.push(*index);
+    }
+    keys
+}
+
+/// Render every partition's rows into the markers grid.
+fn render_marker_grid(
+    partitions: &[commitgraph::Partition],
+    partition_sets: &[Vec<commitgraph::CommitSet>],
+    order: &[usize],
+    states: &HashMap<String, String>,
+    revisions: &HashMap<String, Vec<revision::RevisionRef>>,
+    groups: &HashMap<String, Vec<MarkerRef>>,
+    terminal: Option<usize>,
+) -> Result<String, String> {
+    let mut grid = grid::GridView::new();
+    grid.new_column("marker");
+    grid.new_column("commits");
+    grid.new_column("status");
+    grid.new_column("revisions");
+    grid.new_column("messages").set_minimum_width(12);
+    for index in order {
+        partitions.get(*index).expect("partition order covers all");
+        for row in render_partition(&partition_sets[*index], states, revisions, groups, terminal)? {
+            grid.new_row(row);
+        }
+    }
+    Ok(grid.draw(terminal))
+}
+
 /// Run the markers workflow invoking a custom `hg` program (test seam).
 pub fn run_workflow_with(
     dir: &Path,
@@ -1539,152 +2094,31 @@ pub fn run_workflow_with(
     client: Option<&crate::conduit::Client>,
     terminal: Option<usize>,
 ) -> Result<String, String> {
-    let mut markers = match vcs {
-        "git" => query_git_markers(dir, marker_type, false)?,
-        "hg" => query_hg_markers_with(dir, hg_command, marker_type)?,
-        other => return Err(support_error(other, marker_type)),
-    };
-    if include_remote && vcs == "git" && marker_type == MARKER_TYPE_BRANCH {
-        markers.extend(query_git_markers(dir, marker_type, true)?);
+    let markers = query_workflow_markers(dir, hg_command, vcs, marker_type, include_remote)?;
+    let tails = query_workflow_tails(dir, hg_command, vcs, client)?;
+    let mut heads: Vec<String> = Vec::new();
+    for marker in &markers {
+        heads.push(marker.commit_hash.clone());
     }
-    let tails = match vcs {
-        "git" => published_git_hashes(dir, client)?,
-        _ => published_hg_hashes_with(dir, hg_command)?,
-    };
-    let heads: Vec<String> = markers
-        .iter()
-        .map(|marker| marker.commit_hash.clone())
-        .collect();
-    let tails_option = if tails.is_empty() {
-        None
-    } else {
-        Some(tails.as_slice())
-    };
     let mut graph = commitgraph::CommitGraph::new();
-    let limited = commitgraph::QueryBounds::limit(UNPUBLISHED_LIMIT + 1);
-    let seen = match vcs {
-        "git" => {
-            commitgraph::run_git_query(&mut graph, dir, Some(&heads), tails_option, None, &limited)?
-        }
-        _ => commitgraph::run_hg_query(
-            &mut graph,
-            dir,
-            hg_command,
-            Some(&heads),
-            tails_option,
-            None,
-            &limited,
-        )?,
-    };
-    check_limit(seen.len())?;
-    let mut nodes = seen;
-    // Markers pointing at already-published commits never surface in the
-    // walk; load them exactly so they don't vanish from the output.
-    let disjoint: Vec<String> = heads
-        .iter()
-        .filter(|head| !nodes.contains(head))
-        .cloned()
-        .collect();
-    if !disjoint.is_empty() {
-        let unbounded = commitgraph::QueryBounds::unbounded();
-        let extra = match vcs {
-            "git" => commitgraph::run_git_query(
-                &mut graph,
-                dir,
-                None,
-                None,
-                Some(&disjoint),
-                &unbounded,
-            )?,
-            _ => commitgraph::run_hg_query(
-                &mut graph,
-                dir,
-                hg_command,
-                None,
-                None,
-                Some(&disjoint),
-                &unbounded,
-            )?,
-        };
-        for hash in extra {
-            if !nodes.contains(&hash) {
-                nodes.push(hash);
-            }
-        }
-    }
-    let mut states: HashMap<String, String> = HashMap::new();
-    let mut ordered_states = Vec::new();
-    for hash in &nodes {
-        let message = graph
-            .node(hash)
-            .and_then(|node| node.message())
-            .unwrap_or("")
-            .to_string();
-        states.insert(hash.clone(), message.clone());
-        ordered_states.push(StateCommit {
-            hash: hash.clone(),
-            message,
-        });
-    }
+    let mut nodes = run_head_query(&mut graph, dir, hg_command, vcs, &heads, &tails)?;
+    load_disjoint_heads(&mut graph, dir, hg_command, vcs, &heads, &mut nodes)?;
+    let (states, ordered_states) = collect_workflow_states(&graph, &nodes);
     let revisions = load_revision_refs(client, &ordered_states)?;
     let partitions = commitgraph::partition_query(&graph, &heads, Some(&nodes))?;
-    let mut groups: HashMap<String, Vec<MarkerRef>> = HashMap::new();
-    for marker in &markers {
-        groups
-            .entry(marker.commit_hash.clone())
-            .or_default()
-            .push(marker.clone());
-    }
-    let mut partition_sets = Vec::new();
-    let mut partition_vectors = Vec::new();
-    let mut set_counter = 1;
-    for partition in &partitions {
-        let mut waypoint_map: HashMap<String, Vec<u32>> = HashMap::new();
-        for (hash, refs) in &revisions {
-            let mut ids = Vec::new();
-            for reference in refs {
-                if !ids.contains(&reference.id()) {
-                    ids.push(reference.id());
-                }
-            }
-            waypoint_map.insert(hash.clone(), ids);
-        }
-        let mut sets = commitgraph::set_query(&graph, partition, &waypoint_map, &mut set_counter)?;
-        let vector = sort_sets(&graph, &mut sets, &groups);
-        partition_sets.push(sets);
-        partition_vectors.push(vector);
-    }
-    // Order partitions by their vectors, byte-compared and stable.
-    let mut order: Vec<(String, usize)> = partition_vectors
-        .iter()
-        .enumerate()
-        .map(|(index, vector)| (vector.sort_string(), index))
-        .collect();
-    order.sort_by(|left, right| {
-        left.0
-            .as_bytes()
-            .cmp(right.0.as_bytes())
-            .then(left.1.cmp(&right.1))
-    });
-    let mut grid = grid::GridView::new();
-    grid.new_column("marker");
-    grid.new_column("commits");
-    grid.new_column("status");
-    grid.new_column("revisions");
-    grid.new_column("messages").set_minimum_width(12);
-    for (_, index) in &order {
-        partitions.get(*index).expect("partition order covers all");
-        for row in render_partition(
-            &partition_sets[*index],
-            &states,
-            &revisions,
-            &groups,
-            terminal,
-        )? {
-            grid.new_row(row);
-        }
-    }
-    Ok(grid.draw(terminal))
+    let groups = group_markers_by_hash(&markers);
+    let (partition_sets, partition_vectors) =
+        build_partition_sets(&graph, &partitions, &revisions, &groups)?;
+    let order = order_partitions(&partition_vectors);
+    render_marker_grid(
+        &partitions,
+        &partition_sets,
+        &order,
+        &states,
+        &revisions,
+        &groups,
+        terminal,
+    )
 }
 
 /// List local git branches as plain markers (the `--json` shape).

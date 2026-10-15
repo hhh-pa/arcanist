@@ -84,6 +84,36 @@ fn combine_glyphs(chars: &[char]) -> Vec<Vec<char>> {
     glyphs
 }
 
+/// Wide-character ranges from `phutil_utf8_console_strlen()`, as
+/// inclusive (lo, hi) pairs. `0x303F` is excluded separately.
+const WIDE_RANGES: &[(u32, u32)] = &[
+    (0x1100, 0x115F),
+    (0x2329, 0x2329),
+    (0x232A, 0x232A),
+    (0x2E80, 0xA4CF),
+    (0xAC00, 0xD7A3),
+    (0xF900, 0xFAFF),
+    (0xFE10, 0xFE19),
+    (0xFE30, 0xFE6F),
+    (0xFF00, 0xFF60),
+    (0xFFE0, 0xFFE6),
+    (0x20000, 0x2FFFD),
+    (0x30000, 0x3FFFD),
+];
+
+/// True when `codepoint` takes two console columns.
+fn is_wide_codepoint(codepoint: u32) -> bool {
+    if codepoint == 0x303F {
+        return false;
+    }
+    for &(lo, hi) in WIDE_RANGES {
+        if (lo..=hi).contains(&codepoint) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Display width of the first codepoint of a glyph.
 ///
 /// Mirrors the wide-character ranges in `phutil_utf8_console_strlen()`; a
@@ -92,20 +122,7 @@ fn glyph_width(codepoint: u32) -> usize {
     if codepoint == 0 {
         return 0;
     }
-    let wide = codepoint >= 0x1100
-        && (codepoint <= 0x115F
-            || codepoint == 0x2329
-            || codepoint == 0x232A
-            || (0x2E80..=0xA4CF).contains(&codepoint) && codepoint != 0x303F
-            || (0xAC00..=0xD7A3).contains(&codepoint)
-            || (0xF900..=0xFAFF).contains(&codepoint)
-            || (0xFE10..=0xFE19).contains(&codepoint)
-            || (0xFE30..=0xFE6F).contains(&codepoint)
-            || (0xFF00..=0xFF60).contains(&codepoint)
-            || (0xFFE0..=0xFFE6).contains(&codepoint)
-            || (0x20000..=0x2FFFD).contains(&codepoint)
-            || (0x30000..=0x3FFFD).contains(&codepoint));
-    if wide { 2 } else { 1 }
+    if is_wide_codepoint(codepoint) { 2 } else { 1 }
 }
 
 /// Strip ANSI color sequences (`ESC [ digits m`), like
