@@ -329,6 +329,69 @@ fn decodes_bytes() {
 }
 
 #[test]
+fn gap2_cp1252_table_covers_all_bytes() {
+    // Full Windows-1252 table check: the 27 defined 0x80-0x9F bytes map
+    // per the standard, the 5 undefined bytes become U+FFFD, and every
+    // other byte maps to the identical Latin-1 scalar.
+    let specials: &[(u8, char)] = &[
+        (0x80, '€'),
+        (0x82, '‚'),
+        (0x83, 'ƒ'),
+        (0x84, '„'),
+        (0x85, '…'),
+        (0x86, '†'),
+        (0x87, '‡'),
+        (0x88, 'ˆ'),
+        (0x89, '‰'),
+        (0x8A, 'Š'),
+        (0x8B, '‹'),
+        (0x8C, 'Œ'),
+        (0x8E, 'Ž'),
+        (0x91, '‘'),
+        (0x92, '’'),
+        (0x93, '“'),
+        (0x94, '”'),
+        (0x95, '•'),
+        (0x96, '–'),
+        (0x97, '—'),
+        (0x98, '˜'),
+        (0x99, '™'),
+        (0x9A, 'š'),
+        (0x9B, '›'),
+        (0x9C, 'œ'),
+        (0x9E, 'ž'),
+        (0x9F, 'Ÿ'),
+    ];
+    assert_eq!(specials.len(), 27);
+    for (byte, expected) in specials {
+        assert_eq!(
+            decode_bytes(&[*byte], Some("windows-1252")),
+            expected.to_string(),
+            "byte 0x{byte:02X}"
+        );
+    }
+    for byte in [0x81u8, 0x8D, 0x8F, 0x90, 0x9D] {
+        assert_eq!(
+            decode_bytes(&[byte], Some("windows-1252")),
+            "\u{FFFD}",
+            "byte 0x{byte:02X}"
+        );
+    }
+    for byte in 0u8..=255 {
+        if (0x80..0xA0).contains(&byte) {
+            continue;
+        }
+        let expected = char::from_u32(u32::from(byte)).unwrap().to_string();
+        assert_eq!(
+            decode_bytes(&[byte], Some("cp1252")),
+            expected,
+            "byte 0x{byte:02X}"
+        );
+    }
+    assert_eq!(decode_bytes(&[0x80], None), "\u{FFFD}");
+}
+
+#[test]
 fn reads_patch_bytes_from_file() {
     let dir = temp_dir("patch_bytes");
     let path = dir.join("fix.patch");
@@ -357,13 +420,13 @@ fn file_bundle_rejects_empty_stdin() {
         load_file_bundle("-", None, &mut io).unwrap_err(),
         NO_STDIN_PATCH
     );
-    io.patch_stdin = Some("text\n".to_string());
+    io.patch_stdin = Some("diff --git a/f.txt b/f.txt\n".to_string());
     let bundle = load_file_bundle("-", Some("utf-8"), &mut io).unwrap();
-    assert_eq!(bundle.text, "text\n");
+    assert_eq!(bundle.text, "diff --git a/f.txt b/f.txt\n");
     assert_eq!(
         bundle,
         Bundle {
-            text: "text\n".to_string(),
+            text: "diff --git a/f.txt b/f.txt\n".to_string(),
             ..Bundle::default()
         }
     );
@@ -373,10 +436,16 @@ fn file_bundle_rejects_empty_stdin() {
 fn file_bundle_decodes_with_encoding() {
     let dir = temp_dir("file_bundle_enc");
     let path = dir.join("fix.patch");
-    std::fs::write(&path, [0x80, 0x0A]).unwrap();
+    let mut bytes = b"diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+".to_vec();
+    bytes.push(0x80);
+    bytes.push(b'\n');
+    std::fs::write(&path, &bytes).unwrap();
     let mut io = Io::buffered();
     let bundle = load_file_bundle(&path.to_string_lossy(), Some("latin1"), &mut io).unwrap();
-    assert_eq!(bundle.text, "€\n");
+    assert_eq!(
+        bundle.text,
+        "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+€\n"
+    );
 }
 
 #[test]
@@ -398,6 +467,11 @@ fn bundle_change(change_type: u32, old: Option<&str>, current: Option<&str>) -> 
         old_mode: None,
         new_mode: None,
         hunks: Vec::new(),
+        old_binary_phid: None,
+        new_binary_phid: None,
+        away_paths: Vec::new(),
+        original_file_data: None,
+        current_file_data: None,
     }
 }
 
@@ -774,7 +848,7 @@ fn revision_suffix_finds_latest_closed() {
 fn loads_each_bundle_kind() {
     let dir = temp_dir("load_bundle");
     let patch_path = dir.join("fix.patch");
-    std::fs::write(&patch_path, "file text\n").unwrap();
+    std::fs::write(&patch_path, "diff --git a/f b/f\n").unwrap();
     let options = Options::default();
     let mut io = Io::buffered();
     let loaded = load_bundle(
@@ -784,7 +858,7 @@ fn loads_each_bundle_kind() {
         None,
     )
     .unwrap();
-    assert_eq!(loaded.bundle.text, "file text\n");
+    assert_eq!(loaded.bundle.text, "diff --git a/f b/f\n");
     assert!(loaded.arcbundle_dicts.is_none());
 
     let call = stub_call(diff_responses(serde_json::json!("raw")));
@@ -1641,6 +1715,54 @@ fn cherry_pick_failure_banner_and_cleanup() {
     assert!(!git(&repo, &["branch", "--list", "temp"]).contains("temp"));
 }
 
+/// Fake `hg` backend logging argv to `.fakehg.log` (portable .bat/.sh).
+fn fake_hg_backend(dir: &std::path::Path) -> hg::HgCommand {
+    #[cfg(windows)]
+    let (name, content) = (
+        "fakehg-gap2.bat",
+        include_str!("../tests/fixtures/vcs/fakehg.bat"),
+    );
+    #[cfg(not(windows))]
+    let (name, content) = (
+        "fakehg-gap2.sh",
+        include_str!("../tests/fixtures/vcs/fakehg.sh"),
+    );
+    let script = dir.join(name);
+    std::fs::write(&script, content).unwrap();
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        hg::HgCommand::custom("cmd", &["/C", &script.to_string_lossy()])
+    }
+    #[cfg(not(windows))]
+    {
+        hg::HgCommand::custom(&script.to_string_lossy(), &[])
+    }
+}
+
+#[test]
+fn gap2_hg_dotted_revisions_pass_verbatim() {
+    // PHP never interprets revision text in the patch flow: revisions
+    // ride `%s` / `hgsprintf` straight into `hg` argv (e.g.
+    // `ArcanistPatchWorkflow.php:795`, `getBookmarkName()`), so `hg`
+    // alone gives `...` meaning. The port must not parse or split them.
+    let dir = temp_dir("hg_dots_verbatim");
+    let hg = fake_hg_backend(&dir);
+    hg_rebase_temp(&dir, &hg, "master...tip", "tempmark").unwrap();
+    let log = std::fs::read_to_string(dir.join(".fakehg.log")).unwrap();
+    assert!(
+        log.contains("-r master...tip"),
+        "three-dot revision must reach hg unmodified: {log:?}"
+    );
+    assert!(log.contains("bookmark --delete tempmark"), "{log:?}");
+}
+
 #[test]
 fn hg_and_svn_flows_fail_without_binaries() {
     // No hg/svn binaries ship on this machine; the flows must surface the
@@ -2219,6 +2341,28 @@ fn commit_template_is_verbatim() {
 }
 
 #[test]
+fn gap2_preview_passes_patch_bytes_through_verbatim() {
+    // Neither PHP (`ArcanistPatchWorkflow` has no `json_encode`) nor
+    // this port emits JSON on the patch path, so slashes, quotes, and
+    // non-ASCII bytes must never gain `\/` / `\uXXXX` escapes.
+    let dir = temp_dir("preview_verbatim");
+    let body = "diff --git a/u/ñ.txt b/u/ñ.txt\n--- \"a/u/ñ.txt\"\n+++ \"b/u/ñ.txt\"\n@@ -1 +1 @@\n-https://phab.test/D1\n+\"quoted\" \\ backslash\n";
+    std::fs::write(dir.join("fix.patch"), body).unwrap();
+    let patch = dir.join("fix.patch").to_string_lossy().to_string();
+    let backends = Backends::default();
+    let mut io = Io::buffered();
+    let out = execute_with_io(
+        &dir,
+        &argv(&["--preview", "--patch", &patch]),
+        &mut io,
+        &backends,
+    )
+    .unwrap();
+    assert_eq!(out.stdout, body);
+    assert!(!out.stdout.contains("\\/"), "{}", out.stdout);
+}
+
+#[test]
 fn execute_help_preview_and_errors() {
     let dir = temp_dir("exec_help");
     let backends = Backends::default();
@@ -2229,7 +2373,7 @@ fn execute_help_preview_and_errors() {
     let error = execute_with_io(&dir, &argv(&["--bogus"]), &mut io, &backends).unwrap_err();
     assert!(error.ends_with(USAGE), "{error}");
     // `--preview` needs no repository for file sources.
-    std::fs::write(dir.join("fix.patch"), "preview me\n").unwrap();
+    std::fs::write(dir.join("fix.patch"), "diff --git a/f b/f\n").unwrap();
     let patch = dir.join("fix.patch").to_string_lossy().to_string();
     let mut io = Io::buffered();
     let out = execute_with_io(
@@ -2239,14 +2383,14 @@ fn execute_help_preview_and_errors() {
         &backends,
     )
     .unwrap();
-    assert_eq!(out.stdout, "preview me\n");
+    assert_eq!(out.stdout, "diff --git a/f b/f\n");
     let out = execute_with_stdin(
         &dir,
         &argv(&["--preview", "--patch", "-"]),
-        Some("via stdin\n"),
+        Some("diff --git a/g b/g\n"),
     )
     .unwrap();
-    assert_eq!(out.stdout, "via stdin\n");
+    assert_eq!(out.stdout, "diff --git a/g b/g\n");
     // Real flows need a working copy and a source.
     let mut io = Io::buffered();
     assert_eq!(
@@ -2320,7 +2464,11 @@ fn execute_pops_stash_on_failure() {
     std::fs::write(repo.join(".arcconfig"), r#"{"arc.autostash": true}"#).unwrap();
     std::fs::write(repo.join("file.txt"), "dirty\n").unwrap();
     let patch = repo.join("fix.patch");
-    std::fs::write(&patch, "not a patch\n").unwrap();
+    std::fs::write(
+        &patch,
+        "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-a\n+b\n",
+    )
+    .unwrap();
     let patch = patch.to_string_lossy().to_string();
     let backends = Backends::default();
     let mut io = Io::canned(&["y", "n"]);
@@ -2347,4 +2495,325 @@ fn run_entry_points() {
     assert_eq!(run_in(&dir, &argv(&["--help"])), ExitCode::SUCCESS);
     assert_eq!(execute(&dir, &argv(&["--help"])).unwrap().stdout, USAGE);
     assert_eq!(run(&argv(&["--help"])), ExitCode::SUCCESS);
+}
+
+#[test]
+fn gap2_sha1_vectors() {
+    assert_eq!(sha1_hex(b""), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+    assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+    assert_eq!(
+        git_blob_sha1(b""),
+        "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+    );
+    assert_eq!(
+        git_blob_sha1(b"test\n"),
+        "9daeafb9864cf43055ae93beb0afd6c7d144bfa4"
+    );
+}
+
+#[test]
+fn gap2_adler_and_zlib_store() {
+    assert_eq!(adler32(b""), 1);
+    assert_eq!(adler32(b"a"), 0x00620062);
+    assert_eq!(adler32(b"abc"), 0x024D0127);
+    assert_eq!(
+        zlib_store(b""),
+        vec![
+            0x78, 0x01, 0x01, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x01
+        ]
+    );
+    let stored = zlib_store(b"hi");
+    assert_eq!(&stored[0..2], &[0x78, 0x01]);
+    assert_eq!(&stored[stored.len() - 4..], &adler32(b"hi").to_be_bytes());
+}
+
+#[test]
+fn gap2_base85_shapes() {
+    assert_eq!(base85_encode(b""), "@\n");
+    let one = base85_encode(b"a");
+    assert!(one.starts_with('A'), "{one:?}");
+    assert!(one.ends_with('\n'), "{one:?}");
+    assert_eq!(one.len(), 1 + 5 + 1);
+    for byte in one.bytes() {
+        assert!(
+            byte.is_ascii() && !byte.is_ascii_control() || byte == b'\n',
+            "{one:?}"
+        );
+    }
+    let long = base85_encode(&[7u8; 100]);
+    assert_eq!(long.lines().count(), 2);
+    assert!(long.starts_with('z'), "{long:?}");
+}
+
+#[test]
+fn gap2_base64_roundtrip() {
+    assert_eq!(base64_decode("dGVzdA==").unwrap(), b"test");
+    assert_eq!(base64_decode("TQ==").unwrap(), b"M");
+    assert_eq!(base64_decode("").unwrap(), Vec::<u8>::new());
+    assert_eq!(base64_decode("dGVz\ndA==").unwrap(), b"test");
+    assert!(base64_decode("abc").is_err());
+    assert!(base64_decode("====").is_err());
+    assert!(base64_decode("ab=c").is_err());
+}
+
+#[test]
+fn gap2_build_binary_add() {
+    let change = BundleChange {
+        file_type: FILE_BINARY,
+        current_file_data: Some(b"hi".to_vec()),
+        ..bundle_change(TYPE_ADD, None, Some("a.bin"))
+    };
+    let fail = |_: &str| -> Result<Vec<u8>, String> { panic!("no blobs needed") };
+    let body = build_binary_change(&change, None, &fail).unwrap();
+    assert!(body.contains("GIT binary patch\n"), "{body}");
+    assert!(body.contains("literal 2\n"), "{body}");
+    assert!(body.contains("literal 0\n"), "{body}");
+    assert!(body.contains(&"0".repeat(40)), "{body}");
+    assert!(body.contains(&git_blob_sha1(b"hi")), "{body}");
+}
+
+#[test]
+fn gap2_render_with_blobs_matches_text() {
+    let mut text_changes = vec![BundleChange {
+        hunks: vec!["@@ -1 +1 @@\n-a\n+b\n".to_string()],
+        ..bundle_change(TYPE_CHANGE, Some("a.txt"), Some("a.txt"))
+    }];
+    let expected = render_git_patch(&mut text_changes.clone()).unwrap();
+    let fail = |_: &str| -> Result<Vec<u8>, String> { panic!("no blobs") };
+    let actual = render_git_patch_with_blobs(&mut text_changes, &fail).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn gap2_render_binary_image() {
+    let mut changes = vec![
+        BundleChange {
+            file_type: FILE_BINARY,
+            current_file_data: Some(vec![0, 1, 2, 3]),
+            ..bundle_change(TYPE_ADD, None, Some("a.bin"))
+        },
+        BundleChange {
+            file_type: FILE_IMAGE,
+            current_file_data: Some(vec![9, 9]),
+            original_file_data: Some(vec![8]),
+            ..bundle_change(TYPE_CHANGE, Some("b.png"), Some("b.png"))
+        },
+    ];
+    let fail = |_: &str| -> Result<Vec<u8>, String> { panic!("inline data") };
+    let text = render_git_patch_with_blobs(&mut changes, &fail).unwrap();
+    assert!(text.contains("diff --git a/a.bin b/a.bin\n"), "{text}");
+    assert!(text.contains("new file mode 100644\n"), "{text}");
+    assert!(!text.contains("--- /dev/null"), "{text}");
+    assert_eq!(text.matches("GIT binary patch\n").count(), 2);
+}
+
+#[test]
+fn gap2_fetch_file_blob_decodes() {
+    let call = stub_call(std::collections::HashMap::from([(
+        "file.download".to_string(),
+        serde_json::json!("aGk="),
+    )]));
+    assert_eq!(fetch_file_blob(&call, "PHID-FILE-1").unwrap(), b"hi");
+    let bad = stub_call(std::collections::HashMap::from([(
+        "file.download".to_string(),
+        serde_json::json!({"nope": true}),
+    )]));
+    assert_eq!(
+        fetch_file_blob(&bad, "PHID-FILE-1").unwrap_err(),
+        "file.download returned an unexpected response"
+    );
+}
+
+#[test]
+fn gap2_arcbundle_binary_roundtrip() {
+    let dir = temp_dir("arcbundle_bin");
+    let new_bytes: &[u8] = &[0, 1, 2, 3, 250, 251];
+    let changes = [
+        br#"[{"type":1,"fileType":3,"currentPath":"a.bin","metadata":"#.as_slice(),
+        br#"{"new:binary-phid":"PHID-FILE-NEW"},"hunks":[]}]"#.as_slice(),
+    ]
+    .concat();
+    let bundle_path = write_arcbundle(
+        &dir,
+        "bin.bundle",
+        &[
+            ("meta.json", br#"{"revisionID": 11}"#),
+            ("changes.json", &changes),
+            ("blobs/PHID-FILE-NEW", new_bytes),
+        ],
+    );
+    let bundle = load_arcbundle(&bundle_path.to_string_lossy(), None).unwrap();
+    assert_eq!(bundle.revision_id, Some(11));
+    assert!(
+        bundle.text.contains("GIT binary patch\n"),
+        "{}",
+        bundle.text
+    );
+    assert!(bundle.text.contains("literal 6\n"), "{}", bundle.text);
+    assert!(
+        bundle.text.contains(&git_blob_sha1(new_bytes)),
+        "{}",
+        bundle.text
+    );
+}
+
+#[test]
+fn gap2_binary_patch_applies_via_git() {
+    let repo = make_repo("bin_apply");
+    let old_bytes: &[u8] = &[0, 1, 2, 3, 4, 5, 250, 251, 252];
+    let new_bytes: &[u8] = &[0, 1, 2, 3, 9, 9, 9, 250, 251, 252, 10, 11];
+    std::fs::write(repo.join("a.bin"), old_bytes).unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "bin"]);
+    let mut changes = vec![BundleChange {
+        file_type: FILE_BINARY,
+        original_file_data: Some(old_bytes.to_vec()),
+        current_file_data: Some(new_bytes.to_vec()),
+        ..bundle_change(TYPE_CHANGE, Some("a.bin"), Some("a.bin"))
+    }];
+    let fail = |_: &str| -> Result<Vec<u8>, String> { panic!("inline") };
+    let text = render_git_patch_with_blobs(&mut changes, &fail).unwrap();
+    let bundle = Bundle {
+        text,
+        ..Bundle::default()
+    };
+    let mut io = Io::buffered();
+    git_apply_patch(&repo, &bundle, &mut io).unwrap();
+    assert_eq!(std::fs::read(repo.join("a.bin")).unwrap(), new_bytes);
+}
+
+#[test]
+fn gap2_validate_empty_and_headers() {
+    assert_eq!(validate_patch_text("").unwrap_err(), EMPTY_DIFF_ERROR);
+    assert_eq!(
+        validate_patch_text("  \n\t\n").unwrap_err(),
+        EMPTY_DIFF_ERROR
+    );
+    assert_eq!(validate_patch_text("diff --git a/f b/f\n"), Ok(()));
+    for valid in [
+        "Index: /path/to/file.ext\n",
+        "Modified: foo\n",
+        "Property changes on: foo\n",
+        "commit 59bcc3ad6775562f845953cf01624225\n",
+        "commit abc123 (tag)\n",
+        "diff --git a/f b/f\n",
+        "rcsdiff -u a b\n",
+        "--- a/old.txt\t2024-01-02 03:04:05\n",
+        "Binary files a 2024-01-02 and b 2024-01-02 differ\n",
+        "diff -r abc123 file.txt\n",
+        "diff -r abc123 -r def456 file.txt\n",
+        "# comment\ndiff --git a/f b/f\n",
+        "\n\n diff --git a/f b/f\n",
+    ] {
+        assert!(validate_patch_text(valid).is_ok(), "{valid:?}");
+    }
+    for invalid in [
+        "commit ABC123\n",
+        "commit \n",
+        "diff -r XYZ file\n",
+        "--- no-date-here\n",
+        "Binary files a and b differ\n",
+    ] {
+        let err = validate_patch_text(invalid).unwrap_err();
+        assert!(
+            err.starts_with("Diff Parse Exception: Expected a hunk header"),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn gap2_malformed_header_error_is_verbatim() {
+    let err = validate_patch_text("not a patch\n").unwrap_err();
+    let message = "Expected a hunk header, like 'Index: /path/to/file.ext' (svn), \
+         'Property changes on: /path/to/file.ext' (svn properties), \
+         'commit 59bcc3ad6775562f845953cf01624225' (git show), 'diff --git' \
+         (git diff), '--- filename' (unified diff), or 'diff -r' (hg diff or patch).";
+    let full = format!("Diff Parse Exception: {message}\n\n   >>>        1   not a patch\n");
+    assert_eq!(err, full);
+}
+
+#[test]
+fn gap2_load_file_bundle_validates() {
+    let dir = temp_dir("validate_load");
+    std::fs::write(dir.join("empty.patch"), "").unwrap();
+    std::fs::write(dir.join("bad.patch"), "hello\n").unwrap();
+    std::fs::write(dir.join("good.patch"), "diff --git a/f b/f\n").unwrap();
+    let mut io = Io::buffered();
+    assert_eq!(
+        load_file_bundle(&dir.join("empty.patch").to_string_lossy(), None, &mut io).unwrap_err(),
+        EMPTY_DIFF_ERROR
+    );
+    let err =
+        load_file_bundle(&dir.join("bad.patch").to_string_lossy(), None, &mut io).unwrap_err();
+    assert!(err.starts_with("Diff Parse Exception: "), "{err}");
+    let bundle =
+        load_file_bundle(&dir.join("good.patch").to_string_lossy(), None, &mut io).unwrap();
+    assert_eq!(bundle.text, "diff --git a/f b/f\n");
+}
+
+#[test]
+fn gap2_ensure_base_present_with_uses_fake_hg() {
+    let dir = temp_dir("base_with_fake");
+    let hg = fake_hg_backend(&dir);
+    let backends = Backends {
+        hg,
+        svn: svn::SvnCommand::system(),
+    };
+    let bundle = Bundle {
+        base_revision: Some("abc123".to_string()),
+        ..Bundle::default()
+    };
+    let mut io = Io::buffered();
+    assert!(ensure_base_present_with(&dir, Vcs::Hg, &bundle, &mut io, &backends).unwrap());
+    let log = std::fs::read_to_string(dir.join(".fakehg.log")).unwrap();
+    assert!(log.contains("log -r abc123"), "{log}");
+    std::fs::write(dir.join(".fakehg-fail-log"), "").unwrap();
+    let mut io = Io::buffered();
+    assert!(!ensure_base_present_with(&dir, Vcs::Hg, &bundle, &mut io, &backends).unwrap());
+}
+
+#[test]
+fn gap2_plan_children_with_uses_fake_hg() {
+    let dir = temp_dir("plan_with_fake");
+    let hg = fake_hg_backend(&dir);
+    let backends = Backends {
+        hg,
+        svn: svn::SvnCommand::system(),
+    };
+    let bundle = Bundle {
+        revision_id: Some(1),
+        ..Bundle::default()
+    };
+    let options = Options::default();
+    let mut io = Io::buffered();
+    let start = serde_json::json!([{
+        "phid": "PHID-DREV-1", "id": 1,
+        "auxiliary": {"phabricator:depends-on": ["PHID-DREV-2"]}
+    }]);
+    let dep = serde_json::json!([{
+        "phid": "PHID-DREV-2", "id": 2, "hashes": {"hgcm": "nope-missing"},
+        "auxiliary": {}
+    }]);
+    let both = serde_json::json!([
+        {"phid": "PHID-DREV-1", "id": 1},
+        {"phid": "PHID-DREV-2", "id": 2}
+    ]);
+    let graph = |_: &str, params: &serde_json::Value| {
+        let text = params.to_string();
+        if text.contains("\"ids\"") {
+            Ok(start.clone())
+        } else if text.contains("PHID-DREV-1") {
+            Ok(both.clone())
+        } else {
+            Ok(dep.clone())
+        }
+    };
+    let children =
+        plan_dependency_children_with(&dir, Vcs::Hg, &bundle, &options, &mut io, &graph, &backends)
+            .unwrap();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].revision.as_deref(), Some("D2"));
+    let log = std::fs::read_to_string(dir.join(".fakehg.log")).unwrap();
+    assert!(log.contains("nope-missing"), "{log}");
 }

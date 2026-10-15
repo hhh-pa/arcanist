@@ -2761,11 +2761,7 @@ fn lexically_normal_root(root: &Path) -> PathBuf {
 /// a trailing-separator root prefix, trying the root as given and then
 /// resolved.
 #[must_use]
-pub fn readable_scratch_file_path(
-    metadata_dir: &Path,
-    work_root: &Path,
-    name: &str,
-) -> String {
+pub fn readable_scratch_file_path(metadata_dir: &Path, work_root: &Path, name: &str) -> String {
     let full = scratch_file_path(metadata_dir, name);
     if let Ok(relative) = full.strip_prefix(work_root) {
         return relative.to_string_lossy().into_owned();

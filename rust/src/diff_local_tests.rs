@@ -2781,17 +2781,21 @@ fn gap2_pull_data_parser_errors_carry_list() {
     );
     assert_eq!(err.into_message(), "first problem");
 
-    let transport =
-        |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> { Err("down".into()) };
+    let transport = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        Err("down".into())
+    };
     let mut message = CommitMessage::new_from_raw_corpus("Hello\n").unwrap();
-    let err = message.pull_data_from_conduit(&transport, false).unwrap_err();
+    let err = message
+        .pull_data_from_conduit(&transport, false)
+        .unwrap_err();
     assert_eq!(err, PullDataError::Other("down".to_string()));
     assert_eq!(err.into_message(), "down");
 }
 
 #[test]
 fn gap2_commit_message_monogram_and_defaults() {
-    let message = CommitMessage::new_from_raw_corpus("Title\n\nDifferential Revision: D123\n").unwrap();
+    let message =
+        CommitMessage::new_from_raw_corpus("Title\n\nDifferential Revision: D123\n").unwrap();
     assert_eq!(message.revision_id, Some(123));
     assert_eq!(message.get_revision_monogram(), Some("D123".to_string()));
     let plain = CommitMessage::new_from_raw_corpus("Title\n").unwrap();
@@ -2807,10 +2811,7 @@ fn gap2_d1_scratch(tag: &str) -> std::path::PathBuf {
     dir
 }
 
-fn gap2_d1_ok_call(
-    method: &str,
-    _params: &serde_json::Value,
-) -> Result<serde_json::Value, String> {
+fn gap2_d1_ok_call(method: &str, _params: &serde_json::Value) -> Result<serde_json::Value, String> {
     match method {
         "differential.parsecommitmessage" => Ok(serde_json::json!({
             "fields": {"title": "Hello"},
@@ -2850,8 +2851,14 @@ fn gap2_resolve_saved_template_flows() {
     // No scratch file, or verbatim: nothing to resume.
     let mut out = Vec::new();
     assert_eq!(
-        resolve_saved_template(&mut Cursor::new(b"".to_vec()), &mut out, &meta, &root, false)
-            .unwrap(),
+        resolve_saved_template(
+            &mut Cursor::new(b"".to_vec()),
+            &mut out,
+            &meta,
+            &root,
+            false
+        )
+        .unwrap(),
         None
     );
     assert!(out.is_empty());
@@ -2879,8 +2886,7 @@ fn gap2_resolve_saved_template_flows() {
     let expected = format!(
         "{}\n\n{}\n",
         saved_message_notice(&readable, &truncate_preview_64("Saved title\nBody\n")),
-        diff::format_confirm_prompt(PROMPT_USE_SAVED_MESSAGE, false)
-            .trim_start_matches("\n\n")
+        diff::format_confirm_prompt(PROMPT_USE_SAVED_MESSAGE, false).trim_start_matches("\n\n")
     );
     assert_eq!(String::from_utf8(out).unwrap(), expected);
 
@@ -3044,7 +3050,10 @@ fn gap2_unresolved_errors_error_shapes() {
         unresolved_errors_error(Some("somewhere")),
         "Message has unresolved errors. A copy was saved to somewhere."
     );
-    assert_eq!(unresolved_errors_error(None), "Message has unresolved errors. ");
+    assert_eq!(
+        unresolved_errors_error(None),
+        "Message has unresolved errors. "
+    );
 }
 
 #[test]
@@ -3072,8 +3081,15 @@ fn gap2_edit_create_message_first_pass() {
         user_phid: "PHID-USER-me",
         away_offset: 0,
     };
-    let message = edit_create_message(&mut editor, "Raw template\n", "Raw template\n", false, true, &[])
-        .unwrap();
+    let message = edit_create_message(
+        &mut editor,
+        "Raw template\n",
+        "Raw template\n",
+        false,
+        true,
+        &[],
+    )
+    .unwrap();
     assert_eq!(*calls.borrow(), 0);
     assert_eq!(message.raw_corpus, "Raw template\n");
     assert_eq!(
@@ -3140,8 +3156,7 @@ fn gap2_edit_create_message_reedits_on_parser_errors() {
         user_phid: "PHID-USER-me",
         away_offset: 0,
     };
-    let message =
-        edit_create_message(&mut editor, "Seed\n", "Seed\n", false, false, &[]).unwrap();
+    let message = edit_create_message(&mut editor, "Seed\n", "Seed\n", false, false, &[]).unwrap();
     assert_eq!(*calls.borrow(), 2);
     assert_eq!(message.raw_corpus, "Good title\n");
     let text = String::from_utf8(out).unwrap();
@@ -3158,9 +3173,8 @@ fn gap2_edit_create_message_aborts_unresolved() {
     use std::io::Cursor;
     let root = gap2_d1_scratch("loop-abort");
     let meta = root.join(".git");
-    let failing = |_: &str, _: &serde_json::Value| {
-        Ok(serde_json::json!({"fields": {}, "errors": ["Nope."]}))
-    };
+    let failing =
+        |_: &str, _: &serde_json::Value| Ok(serde_json::json!({"fields": {}, "errors": ["Nope."]}));
     let edit = |_: &str| -> Result<String, String> { Ok("Bad\n".to_string()) };
 
     let mut input = Cursor::new(b"n\n".to_vec());
@@ -3211,8 +3225,7 @@ fn gap2_edit_create_message_amends_single_commit() {
         user_phid: "PHID-USER-me",
         away_offset: 0,
     };
-    let message =
-        edit_create_message(&mut editor, "Old\n", "Old\n", false, false, &[]).unwrap();
+    let message = edit_create_message(&mut editor, "Old\n", "Old\n", false, false, &[]).unwrap();
     assert_eq!(message.raw_corpus, "Amended title\n");
     assert_eq!(amended.borrow().as_slice(), ["Amended title\n".to_string()]);
     // Amending never touches the scratch file.
@@ -3378,12 +3391,25 @@ fn gap2_get_commit_message_from_file_and_revision() {
     )
     .unwrap_err();
     assert_eq!(err, FAILED_TO_RETRIEVE_TEMPLATE);
+    // `D`-prefixed ids normalize, like `submit_mode` (`normalizeRevisionID`).
+    let mut out = Vec::new();
+    let (message, is_draft) = get_commit_message_from_revision_with(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &draft,
+        "D7",
+        "PHID-USER-me",
+    )
+    .unwrap();
+    assert!(is_draft);
+    assert_eq!(message.raw_corpus, "Template title\n");
+    // Non-numeric ids fail exactly.
     let mut out = Vec::new();
     let err = get_commit_message_from_revision_with(
         &mut Cursor::new(b"".to_vec()),
         &mut out,
         &draft,
-        "D7",
+        "nope",
         "PHID-USER-me",
     )
     .unwrap_err();
@@ -3447,8 +3473,12 @@ fn gap2_resolve_message_source_dispatch() {
         resolve_message_source(false, false, false, Some("9"), None, false, None).unwrap(),
         MessageSource::UpdateFromRevision(9)
     );
+    assert_eq!(
+        resolve_message_source(false, false, false, Some("D9"), None, false, None).unwrap(),
+        MessageSource::UpdateFromRevision(9)
+    );
     let err =
-        resolve_message_source(false, false, false, Some("D9"), None, false, None).unwrap_err();
+        resolve_message_source(false, false, false, Some("nope"), None, false, None).unwrap_err();
     assert_eq!(err, diff_submit::UPDATE_PARAM_MUST_BE_NUMBER);
 }
 
@@ -3485,7 +3515,10 @@ fn gap2_working_copy_changes_from_masks() {
     use std::collections::BTreeMap;
     let status: BTreeMap<String, u32> = [
         ("b.txt".to_string(), git::FLAG_UNCOMMITTED),
-        ("a.txt".to_string(), git::FLAG_UNSTAGED | git::FLAG_UNCOMMITTED),
+        (
+            "a.txt".to_string(),
+            git::FLAG_UNSTAGED | git::FLAG_UNCOMMITTED,
+        ),
         ("u.txt".to_string(), git::FLAG_UNTRACKED),
         ("c.txt".to_string(), git::FLAG_CONFLICT),
     ]
@@ -3494,7 +3527,10 @@ fn gap2_working_copy_changes_from_masks() {
     let changes = git_working_copy_changes(&status);
     assert!(changes.incomplete.is_empty() && changes.missing.is_empty());
     assert_eq!(changes.conflicts, vec!["c.txt".to_string()]);
-    assert_eq!(changes.uncommitted, vec!["a.txt".to_string(), "b.txt".to_string()]);
+    assert_eq!(
+        changes.uncommitted,
+        vec!["a.txt".to_string(), "b.txt".to_string()]
+    );
     assert_eq!(changes.unstaged, vec!["a.txt".to_string()]);
     assert_eq!(changes.untracked, vec!["u.txt".to_string()]);
 
@@ -3516,8 +3552,10 @@ fn gap2_clean_check_fatal_gates() {
     let vcs = gap2_d3_vcs(&edit);
     let desc = working_copy_desc("/repo");
 
-    let mut changes = WorkingCopyChanges::default();
-    changes.incomplete = vec!["sub".to_string()];
+    let changes = WorkingCopyChanges {
+        incomplete: vec!["sub".to_string()],
+        ..Default::default()
+    };
     let mut out = Vec::new();
     let err = require_clean_working_copy(
         &mut Cursor::new(b"".to_vec()),
@@ -3531,8 +3569,10 @@ fn gap2_clean_check_fatal_gates() {
     assert!(err.contains("proceeding.'"), "{err}");
     assert!(err.contains("  Working copy: /repo\n\n"), "{err}");
 
-    let mut changes = WorkingCopyChanges::default();
-    changes.conflicts = vec!["c.txt".to_string()];
+    let changes = WorkingCopyChanges {
+        conflicts: vec!["c.txt".to_string()],
+        ..Default::default()
+    };
     let mut out = Vec::new();
     let err = require_clean_working_copy(
         &mut Cursor::new(b"".to_vec()),
@@ -3544,8 +3584,10 @@ fn gap2_clean_check_fatal_gates() {
     .unwrap_err();
     assert!(err.contains("Conflicts in working copy:"), "{err}");
 
-    let mut changes = WorkingCopyChanges::default();
-    changes.missing = vec!["m.txt".to_string()];
+    let changes = WorkingCopyChanges {
+        missing: vec!["m.txt".to_string()],
+        ..Default::default()
+    };
     let mut out = Vec::new();
     let err = require_clean_working_copy(
         &mut Cursor::new(b"".to_vec()),
@@ -3563,8 +3605,10 @@ fn gap2_clean_check_externals_gate() {
     use std::io::Cursor;
     let edit = |_: &str| -> Result<String, String> { Ok(String::new()) };
     let vcs = gap2_d3_vcs(&edit);
-    let mut changes = WorkingCopyChanges::default();
-    changes.externals = vec!["ext".to_string()];
+    let changes = WorkingCopyChanges {
+        externals: vec!["ext".to_string()],
+        ..Default::default()
+    };
 
     let mut out = Vec::new();
     let outcome = require_clean_working_copy(
@@ -3617,8 +3661,10 @@ fn gap2_clean_check_untracked_gate() {
     use std::io::Cursor;
     let edit = |_: &str| -> Result<String, String> { Ok(String::new()) };
     let vcs = gap2_d3_vcs(&edit);
-    let mut changes = WorkingCopyChanges::default();
-    changes.untracked = vec!["u.txt".to_string()];
+    let changes = WorkingCopyChanges {
+        untracked: vec!["u.txt".to_string()],
+        ..Default::default()
+    };
 
     let mut out = Vec::new();
     require_clean_working_copy(
@@ -3632,7 +3678,10 @@ fn gap2_clean_check_untracked_gate() {
     let text = String::from_utf8(out).unwrap();
     assert!(text.contains(UNTRACKED_FILES_HERE), "{text}");
     assert!(text.contains(".git/info/exclude"), "{text}");
-    assert!(text.contains("Ignore these 1 untracked file(s) and continue?"), "{text}");
+    assert!(
+        text.contains("Ignore these 1 untracked file(s) and continue?"),
+        "{text}"
+    );
 
     assert!(untracked_hint(diff::VcsKind::Svn, 2).contains("svn:ignore"));
     assert!(untracked_hint(diff::VcsKind::Hg, 2).contains(".hgignore"));
@@ -3681,9 +3730,11 @@ fn gap2_clean_check_commit_decisions() {
     vcs.add_to_commit = Some(&add);
     vcs.do_commit = Some(&commit);
 
-    let mut changes = WorkingCopyChanges::default();
-    changes.unstaged = vec!["s.txt".to_string()];
-    changes.uncommitted = vec!["c.txt".to_string()];
+    let changes = WorkingCopyChanges {
+        unstaged: vec!["s.txt".to_string()],
+        uncommitted: vec!["c.txt".to_string()],
+        ..Default::default()
+    };
 
     // Prompted commit: staged paths are added, the editor message commits.
     let mut out = Vec::new();
@@ -3701,8 +3752,14 @@ fn gap2_clean_check_commit_decisions() {
     let text = String::from_utf8(out).unwrap();
     assert!(text.contains(UNCOMMITTED_CHANGES_HERE), "{text}");
     // The unstaged header is indented, the uncommitted header is not.
-    assert!(text.contains("  Unstaged changes in working copy:\n    s.txt"), "{text}");
-    assert!(text.contains("Uncommitted changes in working copy:\n    c.txt"), "{text}");
+    assert!(
+        text.contains("  Unstaged changes in working copy:\n    s.txt"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Uncommitted changes in working copy:\n    c.txt"),
+        "{text}"
+    );
     assert!(
         text.contains("Do you want to create a new commit with these 2 change(s)?"),
         "{text}"
@@ -3754,7 +3811,11 @@ fn gap2_clean_check_commit_decisions() {
     .unwrap();
     assert!(outcome.stashed);
     assert!(stashed.get());
-    assert!(String::from_utf8(out).unwrap().contains(STASHING_UNCOMMITTED));
+    assert!(
+        String::from_utf8(out)
+            .unwrap()
+            .contains(STASHING_UNCOMMITTED)
+    );
 }
 
 #[test]
@@ -3772,8 +3833,10 @@ fn gap2_clean_check_commit_ux() {
     };
     let mut vcs = gap2_d3_vcs(&edit);
     vcs.do_commit = Some(&commit);
-    let mut changes = WorkingCopyChanges::default();
-    changes.uncommitted = vec!["b.txt".to_string(), "a.txt".to_string()];
+    let changes = WorkingCopyChanges {
+        uncommitted: vec!["b.txt".to_string(), "a.txt".to_string()],
+        ..Default::default()
+    };
 
     let mut out = Vec::new();
     require_clean_working_copy(
@@ -3823,7 +3886,7 @@ fn gap2_clean_check_commit_ux() {
     assert_eq!(amended.borrow().as_slice(), ["Head msg\n".to_string()]);
     let text = String::from_utf8(out).unwrap();
     assert!(
-        text.contains("Do you want to amend these 1 change(s) to the current commit?"),
+        text.contains("Do you want to amend these 2 change(s) to the current commit?"),
         "{text}"
     );
 }
@@ -3890,7 +3953,10 @@ fn gap2_calculate_should_amend_decisions() {
         Ok(serde_json::json!({"identifierMap": {"rXabc123": {"id": 1}}}))
     };
     let mut check = base();
-    check.repository = Some(AmendRepository { id: 9, callsign: Some("X".to_string()) });
+    check.repository = Some(AmendRepository {
+        id: 9,
+        callsign: Some("X".to_string()),
+    });
     check.call = &known;
     assert!(!calculate_should_amend(&check).unwrap());
     assert_eq!(
@@ -3900,7 +3966,10 @@ fn gap2_calculate_should_amend_decisions() {
     let unknown = |_: &str, _: &serde_json::Value| Ok(serde_json::json!({"identifierMap": {}}));
     check.call = &unknown;
     assert!(calculate_should_amend(&check).unwrap());
-    check.repository = Some(AmendRepository { id: 9, callsign: None });
+    check.repository = Some(AmendRepository {
+        id: 9,
+        callsign: None,
+    });
     assert_eq!(
         amend_commit_name(check.repository.as_ref().unwrap(), "abc123"),
         "R9:abc123"

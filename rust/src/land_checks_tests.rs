@@ -180,6 +180,12 @@ fn parses_builds_with_behavior_default() {
     assert_eq!(parsed.status, "failed");
     assert_eq!(parsed.plan_behavior.as_deref(), Some("never"));
     assert_eq!(parsed.revision_phid, "PHID-DREV-7");
+    assert_eq!(parsed.build_id, 0);
+    assert_eq!(parsed.build_name, "");
+    let named = json!({"id": 42, "fields": {"name": "Lint"}});
+    let with_name = parse_build(&named, Some(&plan), "r");
+    assert_eq!(with_name.build_id, 42);
+    assert_eq!(with_name.build_name, "Lint");
     let defaulted = parse_build(&build, Some(&json!({"fields": {}})), "r");
     assert_eq!(defaulted.plan_behavior.as_deref(), Some("always"));
     let planless = parse_build(&build, None, "r");
@@ -206,6 +212,10 @@ fn classifies_builds_with_plan_filters() {
         status: status.to_string(),
         plan_behavior: behavior.map(str::to_string),
         revision_phid: revision.to_string(),
+        build_id: 0,
+        build_name: String::new(),
+        buildable_monogram: String::new(),
+        buildable_uri: String::new(),
     };
     let builds = [
         mk("passed", Some("always"), "r1"),
@@ -353,6 +363,10 @@ fn evaluate_gates_runs_in_php_order() {
         status: "failed".to_string(),
         plan_behavior: Some("always".to_string()),
         revision_phid: "PHID-DREV-7".to_string(),
+        build_id: 0,
+        build_name: String::new(),
+        buildable_monogram: String::new(),
+        buildable_uri: String::new(),
     }];
     let findings = evaluate_gates(&revisions, "PHID-USER-1", &[open], &[], &builds, Some(60));
     let prompts: Vec<&str> = findings.iter().map(|finding| finding.prompt).collect();
@@ -388,6 +402,7 @@ fn prompt_descriptions_cover_every_land_prompt() {
         "arc.land.failed-builds",
         "arc.land.ongoing-builds",
         "arc.land.create",
+        "arc.state.stash",
     ] {
         assert!(
             prompt_description(key).is_some_and(|text| !text.is_empty()),

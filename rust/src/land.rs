@@ -33,23 +33,48 @@
 //!   same for `--update`). PHP casts through `(int)$matches[1]`
 //!   (`ArcanistSimpleSymbolRef.php:34`), which yields 0 for `D123`; matching
 //!   that cast bug would break the flag, so the port resolves the digits.
-//! - Interactive editors are not ported: flows that open `$EDITOR` in PHP
-//!   (commit-message fallback) fail with a guidance error instead.
-//! - Prompt answers ending in `*` or `!` are accepted with the suffix
-//!   stripped; persisting the answer to configuration is not ported.
-//! - `phutil_console_wrap()` line wrapping is not ported; prompt and banner
-//!   text renders unwrapped.
-//! - Display summaries truncate to 64 characters plus `...`; PHP truncates
-//!   to 64 glyphs via `PhutilUTF8StringTruncator` (exact ellipsis behavior
-//!   unverified).
-//! - Revision/marker "ref views" render in a stable plain-text shape; the
-//!   `ArcanistRefView` box drawing is not ported.
-//! - `git-p4`/Perforce remotes are rejected with a not-ported error (PHP
-//!   submits via `git p4`; no `p4` binary is assumed).
-//! - Saved prompt responses read `.arcconfig` `prompts` (a map or a list of
-//!   `{prompt, response}` objects); the PHP configuration-source plumbing
-//!   around `ArcanistPromptResponse` is not ported.
+//! - Land messages come from `differential.getcommitmessage`
+//!   (`'edit' => false`,
+//!   `src/ref/revision/ArcanistRevisionCommitMessageHardpointQuery.php:24-29`)
+//!   and commit via stdin (`git commit -F -`,
+//!   `ArcanistGitLandEngine.php:1792-1796`; `hg rebase --logfile -`,
+//!   `ArcanistMercurialLandEngine.php:837-842`). Verified: PHP opens no
+//!   `$EDITOR` anywhere in the land workflow or engines (the only editor
+//!   mention is skipping `git p4 submit`'s editor with
+//!   `-c git-p4.skipSubmitEdit=true`, `:553-561`), there is no amend
+//!   step, and commit messages arrive verbatim from Conduit — so the
+//!   port has no editor seam.
+//! - Prompt answers ending in `*` save to user configuration (`~/.arcrc`)
+//!   and `!` to the working-copy local config (`.git/arc/config`,
+//!   `.hg/arc/config`), like `ArcanistPrompt::saveResponse()`.
+//! - Banner bodies wrap at 78 columns (`%W`), `%?` hints wrap with the
+//!   `?` marker and 6-space indent, and confirm prompts wrap with a
+//!   4-space indent, all via a faithful `phutil_console_wrap()` port.
+//! - Display summaries truncate to 64 glyphs via a faithful
+//!   `PhutilUTF8StringTruncator` port (word boundaries, sentence-stop
+//!   cuts, the `…` terminator).
+//! - Revision/marker/buildable/build ref views render the
+//!   `ArcanistRefView` `*`/`://` marker lines with glyph-truncated
+//!   titles. Titles measure against a fixed 80-column terminal (PHP
+//!   probes `tput cols`, which yields 80 in practice); the 16-glyph
+//!   floor for missing widths is kept.
+//! - Git/Perforce mode is supported: a `p4` remote selects it with the
+//!   `P4 MODE` warning, requires squash, syncs (`P4 SYNC`), submits via
+//!   `git p4 submit` (stdio inherited, like PHP passthru), and
+//!   reconciles per `reconcileLocalState()`. PHP's automatic `p4`
+//!   remote fallback (`ArcanistGitLandEngine.php:1241-1253`) checks a
+//!   leftover variable that is always null there, so it never fires;
+//!   the port follows the effective behavior (fall through to `origin`).
+//! - Saved prompt responses concatenate the system, user, project, and
+//!   local `prompts` lists in order with last-match-wins, like the PHP
+//!   multi-source option. PHP requires list form and throws on anything
+//!   else; the port also accepts a `{prompt: response}` map and skips
+//!   malformed entries.
 //! - `arc.land.onto` configuration accepts one string or a list of strings.
+//! - The `NOT REVISION AUTHOR` gate shows the author PHID; PHP shows the
+//!   author monogram (via the user hardpoint, which the port skips).
+//! - The `MULTIPLE "ONTO" BRANCHES` error renders branch views from the
+//!   local branch tips; PHP renders remote marker data.
 //! - `history.immutable` legacy-strategy ambiguity check
 //!   (`ArcanistGitLandEngine.php:1649-1693`) is not ported: without
 //!   `--strategy` or `arc.land.strategy` configuration the port always
@@ -61,14 +86,24 @@
 //!   `reverse(ancestors(symbol))`; PHP passes the null into-commit instead
 //!   (`ArcanistMercurialLandEngine.php:711-716`), which looks like an
 //!   upstream bug.
-//! - Local-state capture/restore around the merge loop
-//!   (`ArcanistRepositoryLocalState`) is not ported: on failure the port
-//!   checks the original ref back out when it still exists, and the hold
-//!   output lists the manual recovery commands.
+//! - Local-state capture/restore wraps the merge loop
+//!   (`ArcanistRepositoryLocalState`): merge conflicts fail, dirty
+//!   externals confirm, uncommitted changes stash after prompting (git
+//!   stash, Mercurial shelve), failures restore the saved state, and
+//!   the hold output lists the manual recovery commands. The `SAVE
+//!   STATE` trace line is not printed (PHP only shows it with tracing
+//!   enabled).
+//! - Verified: PHP never updates the onto ref after pushing (it is set
+//!   once in `execute()`, `ArcanistLandEngine.php:1120-1125`); neither
+//!   does this port.
+//! - `--preview` matches PHP (`ArcanistLandWorkflow.php:185-189`,
+//!   `ArcanistLandEngine.php:1207-1212`): the run stops after the
+//!   landing list with `PREVIEW`. Only `--conduit-uri` is a port
+//!   extension (PHP has no such land flag).
 
 extern crate self as arc_rs;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -422,16 +457,17 @@ impl Out {
 ///
 /// `canned` holds scripted prompt answers, consumed front to back; when it
 /// is empty, answers come from real stdin. `saved` holds saved prompt
-/// responses keyed by prompt key (from `.arcconfig` `prompts`). `live`
-/// echoes every output byte to the real stdout/stderr as it is written, so
-/// interactive users see prompts before answering; when `live`, `run_in`
-/// prints nothing more, since everything already echoed.
+/// responses keyed by prompt key. `live` echoes every output byte to the
+/// real stdout/stderr as it is written, so interactive users see prompts
+/// before answering; when `live`, `run_in` prints nothing more, since
+/// everything already echoed. `config_writer` persists `*`/`!` answers
+/// back to configuration files.
 #[derive(Debug, Default)]
 pub struct Io {
     /// Scripted answers for tests; empty means read real stdin.
     pub canned: VecDeque<String>,
     /// Saved prompt responses by prompt key.
-    pub saved: HashMap<String, bool>,
+    pub saved: HashMap<String, SavedResponse>,
     /// Collected output.
     pub out: Out,
     /// Echo output to the real console as it is written.
@@ -439,6 +475,56 @@ pub struct Io {
     /// Scripted `--patch -` text for tests; `None` reads real stdin.
     /// Used only by `patch`; ignored by `land`.
     pub patch_stdin: Option<String>,
+    /// Persists `*`/`!` prompt answers to configuration files, when set.
+    pub config_writer: Option<ConfigWriter>,
+}
+
+/// Configuration source scope holding saved prompt answers
+/// (`ArcanistConfigurationSource::SCOPE_*`,
+/// `src/config/source/ArcanistConfigurationSource.php:6-7`, plus the
+/// read-only system and project sources).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptScope {
+    /// `/etc/arcconfig` (or `%ProgramData%` on Windows): read-only.
+    System,
+    /// `~/.arcrc`: the `*` suffix target.
+    User,
+    /// `.arcconfig`: read-only.
+    Project,
+    /// The working-copy local config (`.git/arc/config` or
+    /// `.hg/arc/config`): the `!` suffix target.
+    WorkingCopy,
+}
+
+impl PromptScope {
+    /// The PHP scope name (`user` / `working-copy`) for writable scopes.
+    fn name(self) -> &'static str {
+        match self {
+            PromptScope::User => "user",
+            _ => "working-copy",
+        }
+    }
+}
+
+/// A saved prompt answer from configuration
+/// (`ArcanistPromptResponse`, `src/toolset/ArcanistPromptResponse.php`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedResponse {
+    /// The raw saved answer string (e.g. `y`).
+    pub response: String,
+    /// The source scope the answer was read from.
+    pub scope: PromptScope,
+}
+
+/// Writes saved prompt answers back to configuration files
+/// (`ArcanistPrompt::saveResponse()`, `src/toolset/ArcanistPrompt.php:253-285`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfigWriter {
+    /// User config file (`~/.arcrc`) for `*` answers, when known.
+    pub user_path: Option<PathBuf>,
+    /// Working-copy local config (`.git/arc/config`, `.hg/arc/config`)
+    /// for `!` answers, when known.
+    pub local_path: Option<PathBuf>,
 }
 
 impl Io {
@@ -514,13 +600,445 @@ impl Io {
     }
 }
 
+/// Console wrap width (`phutil_console_wrap()`, `src/console/format.php:105`).
+const WRAP_WIDTH: usize = 78;
+
+/// Soft-wrap text for console display
+/// (`phutil_console_wrap()`, `src/console/format.php:102-191`).
+///
+/// Wraps at spaces past column `78 - indent`, preserving embedded
+/// newlines and ANSI color escapes (which do not count toward the width).
+/// Every emitted line but optionally the first gains `indent` spaces.
+/// Lines without a usable break (long words) overflow, like PHP.
+pub fn console_wrap(text: &str, indent: usize, with_prefix: bool) -> String {
+    let width = WRAP_WIDTH.saturating_sub(indent);
+    let chars: Vec<char> = text.chars().collect();
+    let mut lines: Vec<Vec<char>> = Vec::new();
+    let mut line: Vec<char> = Vec::new();
+    let mut wrap = WrapState::default();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '\x1b' {
+            index = consume_escape(&chars, index, &mut line);
+            continue;
+        }
+        line.push(chars[index]);
+        wrap.advanced();
+        wrap.maybe_break(width, &mut line, &mut lines);
+        if chars[index] == ' ' {
+            wrap.mark_break(line.len());
+        }
+        if chars[index] == '\n' {
+            lines.push(std::mem::take(&mut line));
+            wrap = WrapState::default();
+        }
+        index += 1;
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    prefix_wrapped_lines(&lines, indent, with_prefix)
+}
+
+/// Live line state for [`console_wrap`].
+#[derive(Debug, Default)]
+struct WrapState {
+    break_pos: Option<usize>,
+    len_after_break: usize,
+    line_len: usize,
+}
+
+impl WrapState {
+    /// Count one more character on the line (`:135-136`).
+    fn advanced(&mut self) {
+        self.line_len += 1;
+        self.len_after_break += 1;
+    }
+
+    /// Record a break after a space (`:154-157`).
+    fn mark_break(&mut self, pos: usize) {
+        self.break_pos = Some(pos);
+        self.len_after_break = 0;
+    }
+
+    /// Break the line at the last space when past `width` (`:138-152`).
+    fn maybe_break(&mut self, width: usize, line: &mut Vec<char>, lines: &mut Vec<Vec<char>>) {
+        if self.line_len <= width {
+            return;
+        }
+        let Some(pos) = self.break_pos else {
+            return;
+        };
+        let mut slice: Vec<char> = line[..pos].to_vec();
+        while slice.last() == Some(&' ') {
+            slice.pop();
+        }
+        slice.push('\n');
+        lines.push(slice);
+        *line = line[pos..].to_vec();
+        self.line_len = self.len_after_break;
+        self.len_after_break = 0;
+        self.break_pos = None;
+    }
+}
+
+/// Consume an ANSI escape (`ESC ... m`) into `line` without counting it
+/// (`src/console/format.php:123-131`). Returns the next index to visit.
+fn consume_escape(chars: &[char], start: usize, line: &mut Vec<char>) -> usize {
+    let mut index = start;
+    while index < chars.len() {
+        line.push(chars[index]);
+        let done = chars[index] == 'm';
+        index += 1;
+        if done {
+            break;
+        }
+    }
+    index
+}
+
+/// Indent wrapped lines: every line but optionally the first gains
+/// `indent` spaces (`src/console/format.php:175-190`).
+fn prefix_wrapped_lines(lines: &[Vec<char>], indent: usize, with_prefix: bool) -> String {
+    let prefix: String = " ".repeat(indent);
+    let mut out = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        if index != 0 || with_prefix {
+            out.push_str(&prefix);
+        }
+        out.extend(line.iter());
+    }
+    out
+}
+
+/// Default truncation terminator: U+2026 HORIZONTAL ELLIPSIS
+/// (`PhutilUTF8StringTruncator.php:39`).
+pub const TRUNCATION_TERMINATOR: &str = "…";
+
+/// True for Unicode combining codepoints
+/// (`phutil_utf8_is_combining_character()`, `src/utils/utf8.php:856-874`).
+fn is_combining_mark(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x0300..=0x036F | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE20..=0xFE2F
+    )
+}
+
+/// Split text into glyphs: base characters with combining marks merged
+/// (`phutil_utf8v_combine_characters()`, `src/utils/utf8.php:899-935`).
+///
+/// A leading combining mark attaches to a synthetic space, and
+/// single-byte characters pass through (none of them combine).
+fn split_glyphs(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return Vec::new();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mut buf: Option<String> = if is_combining_mark(chars[0]) {
+        Some(" ".to_string())
+    } else {
+        None
+    };
+    for ch in chars {
+        if ch.len_utf8() > 1 && is_combining_mark(ch) {
+            match &mut buf {
+                Some(pending) => pending.push(ch),
+                None => buf = Some(ch.to_string()),
+            }
+        } else {
+            if let Some(pending) = buf.take() {
+                parts.push(pending);
+            }
+            buf = Some(ch.to_string());
+        }
+    }
+    if let Some(pending) = buf {
+        parts.push(pending);
+    }
+    parts
+}
+
+/// Truncate text to `max_glyphs` glyphs
+/// (`PhutilUTF8StringTruncator::truncateString()` in glyph mode,
+/// `src/utils/PhutilUTF8StringTruncator.php:86-293`).
+///
+/// Short strings return unchanged; longer ones keep `max_glyphs - 1`
+/// glyphs plus the `…` terminator, preferring word breaks (`space`,
+/// newline, `;`, `:`, `[`, `(`, `,`, `-`) and cutting without a
+/// terminator at sentence stops (`.`, `!`, `?`).
+pub fn truncate_glyphs(text: &str, max_glyphs: usize) -> String {
+    if text.len() <= max_glyphs {
+        return text.to_string();
+    }
+    let glyphs = split_glyphs(text);
+    if glyphs.len() <= max_glyphs {
+        return text.to_string();
+    }
+    let cutoff = max_glyphs.saturating_sub(1);
+    if cutoff == 0 {
+        return TRUNCATION_TERMINATOR.to_string();
+    }
+    truncate_at_boundary(&glyphs, cutoff)
+}
+
+/// Cut `glyphs` at a word boundary near `cutoff`
+/// (`src/utils/PhutilUTF8StringTruncator.php:239-293`).
+fn truncate_at_boundary(glyphs: &[String], cutoff: usize) -> String {
+    const BREAK: &[&str] = &[" ", "\n", ";", ":", "[", "(", ",", "-"];
+    const STOP: &[&str] = &[".", "!", "?"];
+    // PHP divides by 2 in floats (`$cutoff / 2`); `div_ceil` is the
+    // same integer bound.
+    let search = cutoff.saturating_sub(256).max(cutoff.div_ceil(2));
+    let start = cutoff.min(glyphs.len().saturating_sub(1));
+    let mut word_boundary: Option<usize> = None;
+    let mut stop_boundary: Option<usize> = None;
+    let mut any_nonboundary = false;
+    for index in (search..=start).rev() {
+        let glyph = glyphs[index].as_str();
+        if BREAK.contains(&glyph) {
+            word_boundary = Some(index);
+        } else if STOP.contains(&glyph) {
+            stop_boundary = Some(index + 1);
+            break;
+        } else {
+            any_nonboundary = true;
+            if word_boundary.is_some() {
+                break;
+            }
+        }
+    }
+    if let Some(stop) = stop_boundary {
+        return glyphs[..stop].concat();
+    }
+    let end = match word_boundary {
+        Some(found) if any_nonboundary => found,
+        _ => cutoff,
+    };
+    format!("{}{TRUNCATION_TERMINATOR}", glyphs[..end].concat())
+}
+
+/// Console display width of text
+/// (`phutil_utf8_console_strlen()`, `src/utils/utf8.php:316-361`).
+///
+/// ANSI color escapes contribute nothing; ASCII counts one column per
+/// byte; other glyphs count their first codepoint, double for wide
+/// (CJK) characters.
+pub fn console_strlen(text: &str) -> usize {
+    let stripped = strip_ansi_colors(text);
+    if stripped.bytes().all(|byte| (1..=0x7F).contains(&byte)) {
+        return stripped.len();
+    }
+    let mut width = 0;
+    for glyph in split_glyphs(&stripped) {
+        let Some(first) = glyph.chars().next() else {
+            continue;
+        };
+        let code = first as u32;
+        if code == 0 {
+            continue;
+        }
+        width += 1 + usize::from(is_wide_codepoint(code));
+    }
+    width
+}
+
+/// Strip ANSI `ESC [ digits m` color escapes, like the console-length
+/// fast path (`src/utils/utf8.php:320`).
+fn strip_ansi_colors(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '\x1b'
+            && let Some(end) = ansi_color_end(&chars, index)
+        {
+            index = end;
+            continue;
+        }
+        out.push(chars[index]);
+        index += 1;
+    }
+    out
+}
+
+/// End index past an ANSI color escape at `start`, or `None`
+/// (`/\x1B\[\d*m/`, digits optional).
+fn ansi_color_end(chars: &[char], start: usize) -> Option<usize> {
+    let mut index = start + 1;
+    if chars.get(index) != Some(&'[') {
+        return None;
+    }
+    index += 1;
+    while chars.get(index).is_some_and(|ch| ch.is_ascii_digit()) {
+        index += 1;
+    }
+    if chars.get(index) != Some(&'m') {
+        return None;
+    }
+    Some(index + 1)
+}
+
+/// Wide (double-column) codepoints, after `wcwidth.c`
+/// (`src/utils/utf8.php:341-354`).
+fn is_wide_codepoint(code: u32) -> bool {
+    code >= 0x1100
+        && (code <= 0x115F
+            || code == 0x2329
+            || code == 0x232A
+            || (0x2E80..=0xA4CF).contains(&code) && code != 0x303F
+            || (0xAC00..=0xD7A3).contains(&code)
+            || (0xF900..=0xFAFF).contains(&code)
+            || (0xFE10..=0xFE19).contains(&code)
+            || (0xFE30..=0xFE6F).contains(&code)
+            || (0xFF00..=0xFF60).contains(&code)
+            || (0xFFE0..=0xFFE6).contains(&code)
+            || (0x20000..=0x2FFFD).contains(&code)
+            || (0x30000..=0x3FFFD).contains(&code))
+}
+
 /// Render one banner block to stdout: a blank line, a `** TITLE **` line,
-/// the body lines, and a trailing blank line.
+/// the wrapped body, and a trailing blank line.
 ///
 /// Ports `echo tsprintf("\n%!\n%W\n\n", $title, $body)` with markup
-/// stripped (see the module docs).
+/// stripped (see the module docs); the body wraps at 78 columns like
+/// `%W` (`src/xsprintf/tsprintf.php:41-45`).
 pub fn push_banner(io: &mut Io, title: &str, body: &str) {
-    io.push_out(&format!("\n** {title} **\n{body}\n\n"));
+    io.push_out(&format!(
+        "\n** {title} **\n{}\n\n",
+        console_wrap(body, 0, true)
+    ));
+}
+
+/// Render a banner with a single trailing newline
+/// (`echo tsprintf("\n%!\n%W\n", ...)`), for banners PHP follows with
+/// more output on the next line (`IMPLICIT COMMITS`,
+/// `ArcanistLandEngine.php:735-736`; `DISCARDING ANCESTORS`, `:1553-1558`).
+pub fn push_banner_continued(io: &mut Io, title: &str, body: &str) {
+    io.push_out(&format!(
+        "\n** {title} **\n{}\n",
+        console_wrap(body, 0, true)
+    ));
+}
+
+/// Render one `%?` hint line: the `?` marker plus wrapped text
+/// (`src/xsprintf/tsprintf.php:51-56`). Callers add the trailing newline.
+pub fn render_hint(text: &str) -> String {
+    console_wrap(&format!("  ?   {text}"), 6, false)
+}
+
+/// One `ArcanistRefView` node (`src/ref/ArcanistRefView.php`): an object
+/// name, a title, an optional URI, plain lines, and child views.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefView {
+    /// Bold object name (`D123`, `Branch "x"`), if any.
+    pub object_name: Option<String>,
+    /// Title, truncated to the usable width when rendered.
+    pub title: String,
+    /// Optional underlined URI line.
+    pub uri: Option<String>,
+    /// Plain indented lines.
+    pub lines: Vec<String>,
+    /// Child views, rendered one indent deeper.
+    pub children: Vec<RefView>,
+}
+
+/// Terminal width for ref-view titles. PHP probes `tput cols`
+/// (`PhutilConsoleMetrics::getTerminalWidth()`), which yields 80 in
+/// practice; the port fixes 80 so output is deterministic (see the
+/// module docs).
+pub const REF_VIEW_TERMINAL_WIDTH: usize = 80;
+
+impl RefView {
+    /// Render the view: the `*` title line, the `://` URI line, the
+    /// plain lines, then children (`ArcanistRefView::newLines()`,
+    /// `src/ref/ArcanistRefView.php:69-144`), with `tsprintf` markup
+    /// stripped like the `>>>` prompt marker.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        self.render_at(0, &mut out);
+        out
+    }
+
+    /// Render at `indent` levels (`newLines($indent)`, `:69-144`).
+    fn render_at(&self, indent: usize, out: &mut String) {
+        let reserve = self
+            .object_name
+            .as_ref()
+            .map(|name| console_strlen(name) + 1)
+            .unwrap_or(0);
+        let pad: String = "  ".repeat(indent);
+        let usable = REF_VIEW_TERMINAL_WIDTH
+            .saturating_sub(6 + reserve + pad.len())
+            .max(16);
+        let title = truncate_glyphs(&self.title, usable);
+        let display = match (&self.object_name, title.is_empty()) {
+            (Some(name), false) => format!("{name} {title}"),
+            (Some(name), true) => name.clone(),
+            (None, _) => title,
+        };
+        out.push_str(&format!("  *   {pad}{display}\n"));
+        if let Some(uri) = &self.uri {
+            out.push_str(&format!(" ://    {pad}{uri}\n"));
+        }
+        for line in &self.lines {
+            out.push_str(&format!("        {pad}{line}\n"));
+        }
+        for child in &self.children {
+            child.render_at(indent + 1, out);
+        }
+    }
+}
+
+/// Revision ref view (`ArcanistRevisionRef::buildRefView()`,
+/// `src/ref/revision/ArcanistRevisionRef.php:213-217`).
+#[must_use]
+pub fn revision_ref_view(revision: &land_checks::RevisionView) -> RefView {
+    RefView {
+        object_name: Some(revision.monogram.clone()),
+        title: revision.name.clone(),
+        ..Default::default()
+    }
+}
+
+/// Marker ref view (`ArcanistMarkerRef::buildRefView()`,
+/// `src/repository/marker/ArcanistMarkerRef.php:185-194`).
+///
+/// `display_name` is `Branch "x"` / `Bookmark "x"` / `Marker "x"`
+/// (`getRefDisplayName()`, `:27-36`); `hash` is the 12-character
+/// display hash. Name-only markers (empty hash and summary) render
+/// the `" "` title PHP builds from two nulls, trailing space included.
+#[must_use]
+pub fn marker_ref_view(display_name: &str, hash: &str, summary: &str) -> RefView {
+    RefView {
+        object_name: Some(display_name.to_string()),
+        title: format!("{hash} {summary}"),
+        ..Default::default()
+    }
+}
+
+/// Buildable ref view (`ArcanistBuildableRef::buildRefView()`,
+/// `src/ref/buildable/ArcanistBuildableRef.php:45-49`).
+#[must_use]
+pub fn buildable_ref_view(monogram: &str, uri: &str) -> RefView {
+    RefView {
+        object_name: Some(monogram.to_string()),
+        title: format!("Buildable \"{monogram}\""),
+        uri: Some(uri.to_string()),
+        ..Default::default()
+    }
+}
+
+/// Build ref view (`ArcanistBuildRef::buildRefView()`,
+/// `src/ref/build/ArcanistBuildRef.php:38-42`).
+#[must_use]
+pub fn build_ref_view(id: i64, name: &str) -> RefView {
+    RefView {
+        object_name: Some(format!("Build {id}")),
+        title: name.to_string(),
+        ..Default::default()
+    }
 }
 
 /// Execute an `arc.land.*` prompt: print `>>>`, loop until `y`/`n`.
@@ -528,72 +1046,230 @@ pub fn push_banner(io: &mut Io, title: &str, body: &str) {
 /// Ports `ArcanistPrompt::execute()` (`src/toolset/ArcanistPrompt.php:47-254`)
 /// in plain text: a leading blank line, then `>>> {query} [y/N/?] ` per
 /// attempt. Empty answers mean `n`; `?` prints the prompt help; answers
-/// ending in `*` or `!` strip the suffix (persisting the answer is not
-/// ported). A saved response answers immediately with the
-/// `Using saved response` notice. Declining — or end of input — aborts
-/// with [`ABORT`].
+/// ending in `*` save to user configuration and `!` to working-copy
+/// configuration (`saveResponse()`, `:253-285`). A saved response runs
+/// the same loop without prompting, and the `Using saved response`
+/// notice prints after the loop (`:238-249`). Declining — or end of
+/// input — aborts with [`ABORT`].
 pub fn prompt_for_key(io: &mut Io, key: &str, query: &str) -> Result<(), String> {
-    if let Some(saved) = io.saved.get(key).copied() {
-        io.push_out(&format!(
-            ">>> {query} <{}>\n>>> (Using saved response to prompt \"{key}\".\n\n",
-            if saved { "y" } else { "n" }
-        ));
-        return if saved {
-            Ok(())
-        } else {
-            Err(ABORT.to_string())
-        };
-    }
     io.push_out("\n");
+    let mut saved_response = io.saved.get(key).map(|saved| saved.response.clone());
+    let mut save_scope: Option<PromptScope> = None;
+    let mut is_saved;
+    let response: String;
+    let result: bool;
     loop {
-        io.push_out(&format!(">>> {query} [y/N/?] "));
-        let Some(raw) = io.read_answer() else {
-            return Err(ABORT.to_string());
+        let mut candidate = match saved_response.take() {
+            Some(saved) => {
+                is_saved = true;
+                saved
+            }
+            None => {
+                is_saved = false;
+                io.push_out(&format!(">>> {query} [y/N/?] "));
+                let Some(raw) = io.read_answer() else {
+                    return Err(ABORT.to_string());
+                };
+                raw.trim().to_string()
+            }
         };
-        let mut response = raw.trim().to_string();
-        if response.is_empty() {
-            response = "n".to_string();
+        if !is_saved {
+            if let Some(stripped) = candidate.strip_suffix('*') {
+                save_scope = Some(PromptScope::User);
+                candidate = stripped.to_string();
+            } else if let Some(stripped) = candidate.strip_suffix('!') {
+                save_scope = Some(PromptScope::WorkingCopy);
+                candidate = stripped.to_string();
+            }
+            if candidate.is_empty() {
+                candidate = "n".to_string();
+            }
         }
-        // Strip the save-to-config suffixes (`ArcanistPrompt.php:167-179`);
-        // persisting is not ported.
-        if let Some(stripped) = response
-            .strip_suffix('*')
-            .or_else(|| response.strip_suffix('!'))
-        {
-            response = stripped.to_string();
-        }
-        let lowered = response.to_lowercase();
+        let lowered = candidate.to_lowercase();
         if lowered == "y" {
-            return Ok(());
+            response = candidate;
+            result = true;
+            break;
         }
         if lowered == "n" {
-            return Err(ABORT.to_string());
+            response = candidate;
+            result = false;
+            break;
         }
-        if lowered == "?" {
+        if candidate == "?" {
             push_prompt_help(io, key);
             continue;
         }
     }
+    if let Some(scope) = save_scope {
+        save_prompt_response(io, key, &response, scope)?;
+    }
+    if is_saved {
+        io.push_out(&format!(
+            ">>> {query} <{response}>\n>>> (Using saved response to prompt \"{key}\".\n\n"
+        ));
+    }
+    if result {
+        Ok(())
+    } else {
+        Err(ABORT.to_string())
+    }
+}
+
+/// Persist an answer to configuration
+/// (`ArcanistPrompt::saveResponse()`, `src/toolset/ArcanistPrompt.php:253-285`).
+///
+/// Prints the `SAVE PROMPT` notice, then replaces any saved answer for
+/// `key` in the scope file and appends `{prompt, response}`.
+fn save_prompt_response(
+    io: &mut Io,
+    key: &str,
+    response: &str,
+    scope: PromptScope,
+) -> Result<(), String> {
+    io.push_out(&format!(
+        "** SAVE PROMPT ** Saving response \"{response}\" to prompt \"{key}\".\n"
+    ));
+    let path = io.config_writer.as_ref().and_then(|writer| match scope {
+        PromptScope::User => writer.user_path.clone(),
+        _ => writer.local_path.clone(),
+    });
+    let Some(path) = path else {
+        return Err(format!(
+            "Unable to save response to config: no writable configuration source for scope \
+             (\"{}\").",
+            scope.name()
+        ));
+    };
+    write_saved_prompt(&path, key, response)
+}
+
+/// Replace-or-append one `{prompt, response}` entry in the `prompts` list
+/// of the JSON config file at `path`, creating parent directories.
+///
+/// PHP writes pretty-printed JSON (`FilesystemConfigurationSource.php:38-56`
+/// with `PhutilJSON::encodeFormatted()`); the port stages the new
+/// content in a sibling temp file and renames it over the destination.
+pub fn write_saved_prompt(path: &Path, key: &str, response: &str) -> Result<(), String> {
+    let mut values = read_config_map(path)?;
+    let mut entries = prompts_list(&values)?;
+    entries.retain(|entry| entry_key(entry) != Some(key));
+    entries.push(prompt_entry(key, response));
+    values.insert("prompts".to_string(), serde_json::Value::Array(entries));
+    let content = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&values).unwrap_or_default()
+    );
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("Unable to write configuration file: {err}"))?;
+    }
+    write_sibling_temp(path, content.as_bytes())
+}
+
+/// Read a JSON config file as a map; missing or blank files read empty.
+/// Invalid JSON fails, like PHP's `phutil_json_decode()`.
+fn read_config_map(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    if text.trim().is_empty() {
+        return Ok(serde_json::Map::new());
+    }
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(serde_json::Value::Object(map)) => Ok(map),
+        _ => Err(format!(
+            "Unable to read configuration file \"{}\": invalid JSON.",
+            path.display()
+        )),
+    }
+}
+
+/// Read the `prompts` list for writing: a list of entries, a `{prompt:
+/// response}` map (accepted on read), or empty when absent. Anything
+/// else fails like PHP (`ArcanistPromptsConfigOption.php:10-17`).
+fn prompts_list(
+    values: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let Some(prompts) = values.get("prompts") else {
+        return Ok(Vec::new());
+    };
+    if let Some(list) = prompts.as_array() {
+        return Ok(list.clone());
+    }
+    if let Some(map) = prompts.as_object() {
+        let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+        entries.sort_by(|left, right| left.0.cmp(right.0));
+        return Ok(entries
+            .into_iter()
+            .filter_map(|(key, value)| value.as_str().map(|response| prompt_entry(key, response)))
+            .collect());
+    }
+    Err("Expected a natural list!".to_string())
+}
+
+/// One `{prompt, response}` storage entry
+/// (`ArcanistPromptResponse::getStorageDictionary()`).
+fn prompt_entry(key: &str, response: &str) -> serde_json::Value {
+    serde_json::json!({"prompt": key, "response": response})
+}
+
+/// The `prompt` key of a storage entry, when it is well-formed.
+fn entry_key(entry: &serde_json::Value) -> Option<&str> {
+    match (entry.get("prompt"), entry.get("response")) {
+        (Some(key), Some(_)) => key.as_str(),
+        _ => None,
+    }
+}
+
+/// Write `content` to `path` via a sibling temp file plus rename.
+fn write_sibling_temp(path: &Path, content: &[u8]) -> Result<(), String> {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let staging = path.with_file_name(format!("{file_name}.tmp-{}", std::process::id()));
+    std::fs::write(&staging, content)
+        .map_err(|err| format!("Unable to write configuration file: {err}"))?;
+    std::fs::rename(&staging, path)
+        .map_err(|err| format!("Unable to write configuration file: {err}"))?;
+    Ok(())
 }
 
 /// Print the `?` help for a prompt (`ArcanistPrompt.php:191-230`).
+///
+/// The header, description, and default lines print verbatim; the three
+/// save/config hints render as `%?` lines (`%?`, `tsprintf.php:51-56`).
 fn push_prompt_help(io: &mut Io, key: &str) {
     let description = land_checks::prompt_description(key).unwrap_or("");
     io.push_out(&format!(
-        "\n** PROMPT ** **{key}**\n\n{description}\n\nThe default response to this prompt is \"n\".\n\nUse \"*\" after a response to save it in user configuration.\nUse \"!\" after a response to save it in working copy configuration.\nRun \"arc help prompts\" for detailed help on configuring responses.\n\n"
+        "\n** PROMPT ** **{key}**\n\n{description}\n\nThe default response to this prompt is \
+         \"n\".\n\n"
     ));
+    for hint in [
+        "Use \"*\" after a response to save it in user configuration.",
+        "Use \"!\" after a response to save it in working copy configuration.",
+        "Run \"arc help prompts\" for detailed help on configuring responses.",
+    ] {
+        io.push_out(&render_hint(hint));
+        io.push_out("\n");
+    }
+    io.push_out("\n");
 }
 
 /// Ask a yes/no question, returning the answer.
 ///
 /// Ports `phutil_console_confirm()` (`src/console/format.php:11-25`):
-/// prints two blank lines plus `{query} [y/N]` (or `[Y/n]` when
-/// `default_no` is false), loops until `y`/`n`/empty, then prints a blank
-/// line. End of input aborts with [`ABORT`].
+/// prints two blank lines plus the query and `[y/N]` (or `[Y/n]` when
+/// `default_no` is false) wrapped with a 4-space indent
+/// (`phutil_console_prompt()`, `:42-45`), loops until `y`/`n`/empty,
+/// then prints a blank line. End of input aborts with [`ABORT`].
 pub fn console_confirm(io: &mut Io, query: &str, default_no: bool) -> Result<bool, String> {
     let options = if default_no { "[y/N]" } else { "[Y/n]" };
+    let prompt = console_wrap(&format!("{query} {options} "), 4, true);
     loop {
-        io.push_out(&format!("\n\n{query} {options} "));
+        io.push_out(&format!("\n\n{prompt}"));
         let Some(raw) = io.read_answer() else {
             return Err(ABORT.to_string());
         };
@@ -630,6 +1306,17 @@ fn find_dot_dir(start: &Path, name: &str) -> Option<PathBuf> {
     for ancestor in start.ancestors() {
         let candidate = ancestor.join(name);
         if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Walk toward the filesystem root for a config file.
+fn find_dot_file(start: &Path, name: &str) -> Option<PathBuf> {
+    for ancestor in start.ancestors() {
+        let candidate = ancestor.join(name);
+        if candidate.is_file() {
             return Some(candidate);
         }
     }
@@ -683,41 +1370,105 @@ fn parse_string_config(value: &serde_json::Value) -> Option<String> {
     value.as_str().map(str::to_string)
 }
 
-/// Load saved prompt responses from `.arcconfig` `prompts`.
+/// System-wide config file (`ArcanistConfigurationEngine.php:39-50`).
+fn system_config_path() -> PathBuf {
+    if cfg!(windows) {
+        let root = std::env::var("ProgramData").unwrap_or_default();
+        PathBuf::from(root)
+            .join("Phabricator")
+            .join("Arcanist")
+            .join("config")
+    } else {
+        PathBuf::from("/etc/arcconfig")
+    }
+}
+
+/// Load saved prompt responses from every configuration source.
 ///
-/// Accepts a map (`{"arc.land.confirm": "y"}`) or a list of
-/// `{prompt, response}` objects. Responses compare case-insensitively;
-/// anything but `y`/`yes` counts as `n`.
-fn load_saved_prompts(dir: &Path) -> HashMap<String, bool> {
+/// Ports the multi-source read: system, user (`~/.arcrc`), project
+/// (`.arcconfig`), and local (`.git/arc/config`, `.hg/arc/config`)
+/// sources concatenate their `prompts` lists in order
+/// (`ArcanistConfigurationEngine.php:32-63`,
+/// `ArcanistMultiSourceConfigOption.php:6-30`), and the last answer
+/// for a prompt key wins (`ArcanistPrompt::getSavedResponse()`,
+/// `ArcanistPrompt.php:289-303`).
+///
+/// PHP requires each `prompts` value to be a list of `{prompt,
+/// response}` maps (`ArcanistPromptsConfigOption.php:10-25`); the port
+/// also accepts a `{prompt: response}` map and skips malformed entries.
+fn load_saved_prompts(dir: &Path) -> HashMap<String, SavedResponse> {
+    let mut files: Vec<(PathBuf, PromptScope)> = vec![(system_config_path(), PromptScope::System)];
+    if let Some(user) = config::arcrc_path() {
+        files.push((user, PromptScope::User));
+    }
+    if let Some(project) = find_dot_file(dir, ".arcconfig") {
+        files.push((project, PromptScope::Project));
+    }
+    let git_local = dir.join(".git").join("arc").join("config");
+    if git_local.is_file() {
+        files.push((git_local, PromptScope::WorkingCopy));
+    }
+    let hg_local = dir.join(".hg").join("arc").join("config");
+    if hg_local.is_file() {
+        files.push((hg_local, PromptScope::WorkingCopy));
+    }
+    load_saved_prompts_from(&files)
+}
+
+/// Load saved prompt responses from explicit `(file, scope)` sources,
+/// last match wins. Missing, blank, or invalid files read empty.
+pub fn load_saved_prompts_from(files: &[(PathBuf, PromptScope)]) -> HashMap<String, SavedResponse> {
     let mut saved = HashMap::new();
-    let Some(value) = arcconfig_value(dir, "prompts") else {
-        return saved;
-    };
-    match &value {
-        serde_json::Value::Object(map) => {
-            for (key, response) in map {
-                if let Some(text) = response.as_str() {
-                    saved.insert(key.clone(), is_yes(text));
-                }
-            }
+    for (path, scope) in files {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        if text.trim().is_empty() {
+            continue;
         }
-        serde_json::Value::Array(items) => {
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        collect_saved_prompts(json.get("prompts"), *scope, &mut saved);
+    }
+    saved
+}
+
+/// Collect one `prompts` value (list or map form) into `saved`.
+fn collect_saved_prompts(
+    value: Option<&serde_json::Value>,
+    scope: PromptScope,
+    saved: &mut HashMap<String, SavedResponse>,
+) {
+    match value {
+        Some(serde_json::Value::Array(items)) => {
             for item in items {
                 let prompt = item.get("prompt").and_then(|v| v.as_str());
                 let response = item.get("response").and_then(|v| v.as_str());
                 if let (Some(prompt), Some(response)) = (prompt, response) {
-                    saved.insert(prompt.to_string(), is_yes(response));
+                    saved.insert(
+                        prompt.to_string(),
+                        SavedResponse {
+                            response: response.to_string(),
+                            scope,
+                        },
+                    );
+                }
+            }
+        }
+        Some(serde_json::Value::Object(map)) => {
+            for (key, response) in map {
+                if let Some(text) = response.as_str() {
+                    saved.insert(
+                        key.clone(),
+                        SavedResponse {
+                            response: text.to_string(),
+                            scope,
+                        },
+                    );
                 }
             }
         }
         _ => {}
     }
-    saved
-}
-
-/// True for `y`/`yes` answers, case-insensitively.
-fn is_yes(text: &str) -> bool {
-    matches!(text.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
 /// A `--revision` symbol: a numeric ID or a revision PHID
@@ -897,6 +1648,16 @@ struct Validated {
     revision: Option<RevisionSymbol>,
 }
 
+/// Resolve the conduit URI: the flag, `ARC_CONDUIT_URI`, or the
+/// `.arcconfig` walk-up from `dir` (like the diff port's
+/// `discover_from(&dir)`, not the process working directory).
+pub fn resolve_conduit_uri(conduit_uri: Option<&str>, dir: &Path) -> Option<String> {
+    conduit_uri
+        .map(str::to_string)
+        .or_else(|| std::env::var("ARC_CONDUIT_URI").ok())
+        .or_else(|| config::discover_from(dir))
+}
+
 /// Resolve the conduit URI (flag, `ARC_CONDUIT_URI`, or `.arcconfig`
 /// walk-up from `dir`) and build an authenticated client from `~/.arcrc`.
 ///
@@ -907,15 +1668,11 @@ pub fn client_for_dir(
     conduit_uri: Option<&str>,
     dir: &Path,
 ) -> Result<arc_rs::conduit::Client, String> {
-    let uri = conduit_uri
-        .map(str::to_string)
-        .or_else(|| std::env::var("ARC_CONDUIT_URI").ok())
-        .or_else(|| config::discover_from(dir))
-        .ok_or_else(|| {
-            "no conduit URI: pass --conduit-uri, set ARC_CONDUIT_URI, or run inside a project \
-             with .arcconfig"
-                .to_string()
-        })?;
+    let uri = resolve_conduit_uri(conduit_uri, dir).ok_or_else(|| {
+        "no conduit URI: pass --conduit-uri, set ARC_CONDUIT_URI, or run inside a project \
+         with .arcconfig"
+            .to_string()
+    })?;
     let token = config::arcrc_path()
         .and_then(|path| config::token_for_file(&path, &uri))
         .ok_or_else(|| format!("no token for {uri} in ~/.arcrc"))?;
@@ -1068,11 +1825,14 @@ pub fn fetch_parent_links(
 struct BuildableRow {
     phid: String,
     object_phid: String,
+    monogram: String,
+    uri: Option<String>,
 }
 
 /// Parse `harbormaster.buildable.search` data rows
 /// (`ArcanistBuildableRef::newFromConduit()`, `getObjectPHID()`,
-/// `src/ref/buildable/ArcanistBuildableRef.php:23-39`).
+/// `getMonogram()`, `getURI()`,
+/// `src/ref/buildable/ArcanistBuildableRef.php:23-63`).
 fn parse_buildable_rows(result: &serde_json::Value) -> Result<Vec<BuildableRow>, String> {
     let items = result
         .get("data")
@@ -1089,12 +1849,35 @@ fn parse_buildable_rows(result: &serde_json::Value) -> Result<Vec<BuildableRow>,
         if phid.is_empty() || object.is_empty() {
             continue;
         }
+        let monogram = item
+            .get("id")
+            .and_then(json_id)
+            .map(|id| format!("B{id}"))
+            .unwrap_or_else(|| "B".to_string());
+        let uri = item
+            .get("fields")
+            .and_then(|fields| fields.get("uri"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         rows.push(BuildableRow {
             phid: phid.to_string(),
             object_phid: object.to_string(),
+            monogram,
+            uri,
         });
     }
     Ok(rows)
+}
+
+/// Read a numeric `id` field (number or numeric string), like the
+/// revision parser.
+fn json_id(value: &serde_json::Value) -> Option<i64> {
+    value.as_i64().or_else(|| {
+        value
+            .as_u64()
+            .and_then(|n| i64::try_from(n).ok())
+            .or_else(|| value.as_str().and_then(|s| s.parse::<i64>().ok()))
+    })
 }
 
 /// One build row as `harbormaster.build.search` returns it.
@@ -1103,10 +1886,12 @@ struct BuildRow {
     status: String,
     buildable_phid: String,
     plan_phid: String,
+    id: i64,
+    name: String,
 }
 
 /// Parse `harbormaster.build.search` data rows
-/// (`ArcanistBuildRef`, `src/ref/build/ArcanistBuildRef.php:48-58`).
+/// (`ArcanistBuildRef`, `src/ref/build/ArcanistBuildRef.php:26-62`).
 fn parse_build_rows(result: &serde_json::Value) -> Result<Vec<BuildRow>, String> {
     let items = result
         .get("data")
@@ -1128,13 +1913,55 @@ fn parse_build_rows(result: &serde_json::Value) -> Result<Vec<BuildRow>, String>
             .and_then(|fields| fields.get("buildPlanPHID"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let name = fields
+            .and_then(|fields| fields.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         rows.push(BuildRow {
             status: status.to_string(),
             buildable_phid: buildable.to_string(),
             plan_phid: plan.to_string(),
+            id: item.get("id").and_then(json_id).unwrap_or(0),
+            name: name.to_string(),
         });
     }
     Ok(rows)
+}
+
+/// Guess the absolute URI for a buildable, like
+/// `ArcanistWorkflow::getAbsoluteURI()` (`src/workflow/ArcanistWorkflow.php:2423-2440`):
+/// URIs with a domain stay as-is, otherwise the conduit URI's
+/// scheme-plus-authority replaces the missing domain and the raw path
+/// is kept (query strings dropped). Without a conduit URI the raw URI
+/// (or the `/{monogram}` fallback, `ArcanistBuildableRef.php:55-63`)
+/// is returned unchanged.
+pub fn absolute_buildable_uri(
+    conduit_uri: Option<&str>,
+    monogram: &str,
+    raw_uri: Option<&str>,
+) -> String {
+    let raw = raw_uri.unwrap_or_default();
+    if raw.contains("://") {
+        return raw.to_string();
+    }
+    let fallback = format!("/{monogram}");
+    let path = if raw.is_empty() { &fallback } else { raw };
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let Some(base) = conduit_uri.map(conduit_base_uri) else {
+        return path.to_string();
+    };
+    format!("{base}{path}")
+}
+
+/// Scheme plus authority of a conduit URI
+/// (`https://phab.example.com/api/` -> `https://phab.example.com`).
+fn conduit_base_uri(conduit_uri: &str) -> String {
+    let (scheme, rest) = match conduit_uri.split_once("://") {
+        Some((scheme, rest)) => (scheme, rest),
+        None => ("https", conduit_uri),
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    format!("{scheme}://{authority}")
 }
 
 /// Parse `harbormaster.buildplan.search` data rows into
@@ -1174,10 +2001,12 @@ fn parse_plan_behaviors(result: &serde_json::Value) -> Result<HashMap<String, St
 /// (`ArcanistBuildableBuildsHardpointQuery.php:19-23`), and
 /// `harbormaster.buildplan.search` with `phids`
 /// (`ArcanistBuildBuildplanHardpointQuery.php:21-25`). Revisions without a
-/// diff PHID (legacy rows) contribute no builds.
+/// diff PHID (legacy rows) contribute no builds. `conduit_uri`
+/// absolutizes buildable URIs (see [`absolute_buildable_uri`]).
 pub fn fetch_build_views(
     call: &diff_submit::ConduitCall<'_>,
     revisions: &[land_checks::RevisionView],
+    conduit_uri: Option<&str>,
 ) -> Result<Vec<land_checks::BuildView>, String> {
     let mut diff_phids: Vec<String> = Vec::new();
     for revision in revisions {
@@ -1248,10 +2077,24 @@ pub fn fetch_build_views(
                     .unwrap_or_else(|| land_checks::PLAN_ALWAYS.to_string()),
             )
         };
+        let buildable = rows
+            .iter()
+            .find(|candidate| candidate.phid == row.buildable_phid);
+        let (monogram, uri) = match buildable {
+            Some(found) => (
+                found.monogram.clone(),
+                absolute_buildable_uri(conduit_uri, &found.monogram, found.uri.as_deref()),
+            ),
+            None => (String::new(), String::new()),
+        };
         views.push(land_checks::BuildView {
             status: row.status.clone(),
             plan_behavior: behavior,
             revision_phid: revision_phid.clone(),
+            build_id: row.id,
+            build_name: row.name.clone(),
+            buildable_monogram: monogram,
+            buildable_uri: uri,
         });
     }
     Ok(views)
@@ -1292,7 +2135,8 @@ pub fn load_gate_findings(
     let viewer = fetch_viewer_phid(call).unwrap_or(fallback);
     let links = fetch_parent_links(call, revisions)?;
     let landing: Vec<&str> = revisions.iter().map(|rev| rev.phid.as_str()).collect();
-    let builds = fetch_build_views(call, revisions)?;
+    // Gate verdicts never render URIs, so no conduit URI is needed.
+    let builds = fetch_build_views(call, revisions, None)?;
     Ok(land_checks::evaluate_gates(
         revisions,
         &viewer,
@@ -1347,17 +2191,12 @@ pub struct LandCommit {
     pub is_implicit: bool,
 }
 
-/// Display summary: the subject truncated to 64 characters plus `...`
+/// Display summary: the subject truncated to 64 glyphs
 /// (`ArcanistLandCommit::getDisplaySummary()`,
-/// `src/land/ArcanistLandCommit.php:38-45`; ellipsis behavior approximate,
-/// see the module docs).
+/// `src/land/ArcanistLandCommit.php:38-45`, via
+/// `PhutilUTF8StringTruncator`).
 pub fn display_summary(summary: &str) -> String {
-    const LIMIT: usize = 64;
-    if summary.chars().count() <= LIMIT {
-        return summary.to_string();
-    }
-    let truncated: String = summary.chars().take(LIMIT).collect();
-    format!("{truncated}...")
+    truncate_glyphs(summary, 64)
 }
 
 /// One `git log --format=%H%x00%P%x00%s%x00` line, split into fields.
@@ -1774,17 +2613,17 @@ fn apply_forced_revision(
 
 /// Fail on commits related to several revisions without a forced selection
 /// (`ArcanistLandEngine.php:922-980`).
+///
+/// Related revisions render as ref views (`:966-970`). PHP interpolates
+/// the leftover `$hash` loop variable instead of the ambiguous commit
+/// (`:944`) and joins raw (unquoted) symbols; the port reports the
+/// actual commit and matches the unquoted join.
 fn reject_ambiguous_commits(io: &mut Io, commits: &[LandCommit]) -> Result<(), String> {
     for commit in commits {
         if commit.explicit.is_some() || commit.related.is_empty() {
             continue;
         }
-        let symbols = commit
-            .indirect_symbols
-            .iter()
-            .map(|symbol| format!("\"{symbol}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let symbols = commit.indirect_symbols.join(", ");
         let short = commit.hash.chars().take(12).collect::<String>();
         let message = format!(
             "The revision associated with commit \"{short}\" (an ancestor of: {symbols}) is \
@@ -1793,7 +2632,7 @@ fn reject_ambiguous_commits(io: &mut Io, commits: &[LandCommit]) -> Result<(), S
         );
         push_banner(io, "AMBIGUOUS REVISION", &message);
         for related in &commit.related {
-            io.push_out(&format!("  {} {}\n", related.monogram, related.name));
+            io.push_out(&revision_ref_view(related).render());
         }
         io.push_out("\n");
         return Err(format!(
@@ -2032,7 +2871,7 @@ pub fn filter_commit_sets(
             }
         });
         if !discarded.is_empty() {
-            push_banner(
+            push_banner_continued(
                 io,
                 "DISCARDING ANCESTORS",
                 "Some ancestor commits are associated with revisions that have already been \
@@ -2090,11 +2929,12 @@ pub fn git_resolve_symbols(dir: &Path, symbols: &[String]) -> Result<Vec<String>
     Ok(commits)
 }
 
-/// Reject Perforce remotes, which this port does not drive (PHP submits
-/// via `git p4`; see the module docs).
-fn reject_perforce_remote(dir: &Path, remote: &str) -> Result<(), String> {
+/// True when `remote` is a Perforce remote: named `p4` with
+/// `refs/remotes/p4` present (`ArcanistGitAPI::isPerforceRemote()`,
+/// `src/repository/api/ArcanistGitAPI.php:1522-1540`).
+pub fn git_is_perforce_remote(dir: &Path, remote: &str) -> bool {
     if remote != "p4" {
-        return Ok(());
+        return false;
     }
     let git_dir = git::output(dir, &["rev-parse", "--git-dir"])
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -2104,18 +2944,17 @@ fn reject_perforce_remote(dir: &Path, remote: &str) -> Result<(), String> {
     } else {
         dir.join(git_dir)
     };
-    if root.join("refs").join("remotes").join("p4").exists() {
-        return Err("Perforce remotes are not yet ported by arc-rs land (see T1128)".to_string());
-    }
-    Ok(())
+    root.join("refs").join("remotes").join("p4").exists()
 }
 
 /// Select the git onto remote: `--onto-remote`, then `arc.land.onto-remote`
-/// configuration, then symbol upstreams, then the `p4` remote, then
-/// `origin` (`ArcanistGitLandEngine::selectOntoRemote()`/`newOntoRemote()`,
+/// configuration, then symbol upstreams, then `origin`
+/// (`ArcanistGitLandEngine::selectOntoRemote()`/`newOntoRemote()`,
 /// `:1140-1264`).
 ///
-/// Returns the remote; the `ONTO REMOTE` status line is pushed.
+/// Returns the remote; the `ONTO REMOTE` status line is pushed. A
+/// Perforce remote selects Git/Perforce mode with the `P4 MODE` warning
+/// and requires the squash strategy (`:1157-1173`).
 pub fn git_select_onto_remote(
     dir: &Path,
     io: &mut Io,
@@ -2123,12 +2962,31 @@ pub fn git_select_onto_remote(
     symbols: &[String],
 ) -> Result<String, String> {
     let remote = git_new_onto_remote(dir, io, options, symbols)?;
-    reject_perforce_remote(dir, &remote)?;
-    if git::remote_push_uri(dir, &remote).is_none() {
+    let pushable = git::remote_push_uri(dir, &remote).is_some();
+    let perforce = git_is_perforce_remote(dir, &remote);
+    if !pushable && !perforce {
         return Err(format!(
             "No pushable remote \"{remote}\" exists. Use the \"--onto-remote\" flag to choose a \
              valid, pushable remote to land changes onto."
         ));
+    }
+    if perforce {
+        io.push_status(
+            "P4 MODE",
+            "Operating in Git/Perforce mode after selecting a Perforce remote.",
+        );
+        let squash = options
+            .strategy
+            .as_deref()
+            .is_none_or(|name| name == "squash");
+        if !squash {
+            return Err(
+                "Perforce mode does not support the \"merge\" land strategy. Use the \
+                        \"squash\" land strategy when landing to a Perforce remote (you can use \
+                        \"--squash\" to select this strategy)."
+                    .to_string(),
+            );
+        }
     }
     Ok(remote)
 }
@@ -2187,31 +3045,17 @@ fn git_new_onto_remote(
         );
         return Ok(remote);
     }
-    // The `p4` remote implies a Perforce-synchronized working copy
-    // (`:1241-1253`); reject it here with the not-ported error when it
-    // would apply, so selection never silently lands past it.
-    if is_perforce_working_copy(dir) {
-        return Err("Perforce remotes are not yet ported by arc-rs land (see T1128)".to_string());
-    }
+    // NOTE: PHP checks `isPerforceRemote($remote)` here (`:1241-1253`),
+    // but `$remote` is the leftover loop variable (always null at this
+    // point: any non-null remote would have returned above), so the
+    // check never fires and selection falls through to `origin`. The
+    // port follows the effective behavior; explicit `--onto-remote p4`
+    // still selects Perforce mode in `git_select_onto_remote()`.
     io.push_status(
         "ONTO REMOTE",
         "Landing onto remote \"origin\", the default remote under Git.",
     );
     Ok("origin".to_string())
-}
-
-/// True when `.git/refs/remotes/p4` exists
-/// (`ArcanistGitAPI::isPerforceRemote()`, `:1522-1540`).
-fn is_perforce_working_copy(dir: &Path) -> bool {
-    let git_dir = git::output(dir, &["rev-parse", "--git-dir"])
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        .unwrap_or_else(|_| ".git".to_string());
-    let root = if Path::new(&git_dir).is_absolute() {
-        PathBuf::from(git_dir)
-    } else {
-        dir.join(git_dir)
-    };
-    root.join("refs").join("remotes").join("p4").exists()
 }
 
 /// Select the git onto refs: `--onto`, then `arc.land.onto`
@@ -2359,23 +3203,24 @@ pub fn git_confirm_onto_refs(
         return Ok(());
     }
     let count = new_markers.len();
-    let list = new_markers
-        .iter()
-        .map(|name| format!("  {name}\n"))
-        .collect::<String>();
     push_banner(
         io,
         &format!("CREATE {count} BRANCHE(S)"),
         &format!(
             "These {count} symbol(s) do not exist in the remote. They will be created as new \
-             branches:\n\n{list}"
+             branches:"
         ),
     );
+    for name in &new_markers {
+        io.push_out(&marker_ref_view(&format!("Branch \"{name}\""), "", "").render());
+    }
+    io.push_out("\n");
     if hold {
-        io.push_out(&format!(
+        io.push_out(&render_hint(&format!(
             "You are using \"--hold\", so execution will stop before the {count} branche(s) are \
-             actually created. You will be given instructions to create the branches.\n"
-        ));
+             actually created. You will be given instructions to create the branches."
+        )));
+        io.push_out("\n");
     }
     let query = format!("Create {count} new branche(s) in the remote?");
     prompt_for_key(io, land_checks::PROMPT_CREATE, &query)
@@ -2558,15 +3403,28 @@ pub fn git_select_into_commit(
 /// Fetch a git land target, returning its remote commit
 /// (`ArcanistGitLandEngine::fetchTarget()`, `:183-248`).
 ///
-/// When no local copy exists, the first fetch ignores failures; a still
-/// missing ref resolves to `None` (the caller implies `--into-empty`).
-/// Returns the `refs/remotes/REMOTE/REF` commit otherwise.
+/// In Perforce mode the target always syncs from Perforce (`:192-209`).
+/// Otherwise, when no local copy exists, the first fetch ignores
+/// failures; a still missing ref resolves to `None` (the caller implies
+/// `--into-empty`). Returns the `refs/remotes/REMOTE/REF` commit
+/// otherwise.
 fn git_fetch_target(
     dir: &Path,
     io: &mut Io,
     remote: &str,
     name: &str,
 ) -> Result<Option<String>, String> {
+    if git_is_perforce_remote(dir, remote) {
+        io.push_status(
+            "P4 SYNC",
+            &format!("Synchronizing \"{name}\" from Perforce..."),
+        );
+        git_p4_sync(dir, remote, name)?;
+        return Ok(Some(git_remote_commit(
+            dir,
+            &format!("refs/remotes/{remote}/{name}"),
+        )));
+    }
     let full_ref = format!("refs/remotes/{remote}/{name}");
     if git::output(dir, &["rev-parse", "--verify", &full_ref])
         .is_ok_and(|out| !out.status.success())
@@ -2865,7 +3723,8 @@ fn git_merge_attempt(
 /// Returns the new cursor. Empty diffs fail (usually: already landed);
 /// every approach failing prints the `MERGE CONFLICT` banner and fails
 /// with `Encountered a merge conflict.`. `message_of` provides the landed
-/// commit message for the set.
+/// commit message for the set. `incremental` selects the one-by-one hint
+/// (`!$use_incremental`, `:498-500`).
 #[allow(clippy::too_many_arguments)]
 pub fn git_execute_merge(
     dir: &Path,
@@ -2874,7 +3733,7 @@ pub fn git_execute_merge(
     commits: &[LandCommit],
     into_commit: Option<&str>,
     squash: bool,
-    has_unpushed: bool,
+    incremental: bool,
     message_of: &dyn Fn(&CommitSet) -> Result<String, String>,
 ) -> Result<String, String> {
     let min_hash = commits[set.commits[0]].hash.clone();
@@ -2939,7 +3798,7 @@ pub fn git_execute_merge(
             set,
             &max_hash,
             &into_commit,
-            has_unpushed,
+            incremental,
         ));
     };
     io.push_status("DONE", "Merge succeeded.");
@@ -3022,7 +3881,7 @@ fn git_merge_conflict(
     set: &CommitSet,
     max_hash: &str,
     into_commit: &str,
-    has_unpushed: bool,
+    incremental: bool,
 ) -> String {
     let max = &commits[set.commits[set.commits.len() - 1]];
     let short_max = git::display_hash(max_hash);
@@ -3046,8 +3905,11 @@ fn git_merge_conflict(
         )
     };
     push_banner(io, "MERGE CONFLICT", &message);
-    if has_unpushed {
-        io.push_out("Use \"--incremental\" to merge and push changes one by one.\n\n");
+    if !incremental {
+        io.push_out(&render_hint(
+            "Use \"--incremental\" to merge and push changes one by one.",
+        ));
+        io.push_out("\n\n");
     }
     "Encountered a merge conflict.".to_string()
 }
@@ -3078,6 +3940,94 @@ pub fn git_push_change(
         return Err("Push failed! Fix the error and run \"arc land\" again.".to_string());
     }
     Ok(())
+}
+
+/// `git p4 submit` argv for Perforce mode (`pushChange()`, `:551-585`):
+/// skip the submit editor and its confirmation, disable the implicit
+/// rebase, detect moves, and quit on conflict.
+pub fn git_p4_submit_argv(into_commit: &str) -> Vec<String> {
+    vec![
+        "-c".to_string(),
+        "git-p4.skipSubmitEdit=true".to_string(),
+        "-c".to_string(),
+        "git-p4.skipSubmitEditCheck=true".to_string(),
+        "p4".to_string(),
+        "submit".to_string(),
+        "--disable-rebase".to_string(),
+        "-M".to_string(),
+        "--conflict=quit".to_string(),
+        "--commit".to_string(),
+        into_commit.to_string(),
+        "--".to_string(),
+    ]
+}
+
+/// Submit one landed commit in Perforce mode (`pushChange()`, `:540-593`).
+pub fn git_p4_submit(
+    dir: &Path,
+    io: &mut Io,
+    onto_remote: &str,
+    into_commit: &str,
+) -> Result<(), String> {
+    git_p4_submit_with(dir, "git", &[], io, onto_remote, into_commit)
+}
+
+/// [`git_p4_submit`] with the `git` invocation overridden by `program`
+/// plus `prefix` (test seam). Like PHP's passthru, `git` inherits
+/// stdio; any failure maps to the verbatim submit error.
+pub fn git_p4_submit_with(
+    dir: &Path,
+    program: &str,
+    prefix: &[String],
+    io: &mut Io,
+    onto_remote: &str,
+    into_commit: &str,
+) -> Result<(), String> {
+    io.push_status(
+        "SUBMITTING",
+        &format!("Submitting changes to \"{onto_remote}\"."),
+    );
+    let argv = git_p4_submit_argv(into_commit);
+    let mut command = std::process::Command::new(program);
+    command.current_dir(dir).args(prefix).args(&argv);
+    let ok = command.status().is_ok_and(|status| status.success());
+    if ok {
+        Ok(())
+    } else {
+        Err("Submit failed! Fix the error and run \"arc land\" again.".to_string())
+    }
+}
+
+/// Synchronize one target from Perforce (`fetchTarget()`, `:192-209`),
+/// with the `git` invocation overridden (test seam; see
+/// [`git_p4_submit_with`]).
+pub fn git_p4_sync_with(
+    dir: &Path,
+    program: &str,
+    prefix: &[String],
+    remote: &str,
+    name: &str,
+) -> Result<(), String> {
+    let mut command = std::process::Command::new(program);
+    command.current_dir(dir).args(prefix).args([
+        "p4",
+        "sync",
+        "--silent",
+        "--branch",
+        &format!("{remote}/{name}"),
+        "--",
+    ]);
+    let ok = command.status().is_ok_and(|status| status.success());
+    if ok {
+        Ok(())
+    } else {
+        Err("Perforce sync failed! Fix the error and run \"arc land\" again.".to_string())
+    }
+}
+
+/// Synchronize one target from Perforce (`fetchTarget()`, `:192-209`).
+pub fn git_p4_sync(dir: &Path, remote: &str, name: &str) -> Result<(), String> {
+    git_p4_sync_with(dir, "git", &[], remote, name)
 }
 
 /// Parse `git for-each-ref --format %(refname) %(objectname)` lines into
@@ -3219,61 +4169,243 @@ pub fn git_cascade_state(
     }
 }
 
-/// Check out the best surviving local branch after landing.
+/// Candidate branches for [`git_reconcile`] (`:638-677`): the original
+/// ref, its saved upstream path, the into ref, and the onto refs, minus
+/// deleted and missing branches, deduplicated like `array_fuse()`.
 ///
-/// Ports the core of `reconcileLocalState()`
-/// (`ArcanistGitLandEngine.php:611-677`): prefer the original ref, then the
-/// into ref (unless empty/local), then the onto refs, skipping deleted and
-/// missing branches. Prints nothing; the caller prints `DONE`.
-pub fn git_reconcile(
+/// `into_ref` is `None` for the empty and local into states, which PHP
+/// skips (`:652-654`); the option already encodes that.
+fn git_reconcile_candidates(
     dir: &Path,
-    original: Option<&str>,
+    state: &GitLocalState,
     into_ref: Option<&str>,
     onto_refs: &[String],
     deleted: &[String],
-) {
-    let mut candidates: Vec<String> = Vec::new();
-    if let Some(local_ref) = original {
-        candidates.push(local_ref.to_string());
-    }
-    if let Some(into) = into_ref {
-        candidates.push(into.to_string());
-    }
-    candidates.extend(onto_refs.iter().cloned());
-    candidates.retain(|branch| !deleted.contains(branch));
-    for branch in candidates {
-        if git::output(dir, &["rev-parse", "--verify", &branch])
-            .is_ok_and(|out| out.status.success())
-        {
-            git::output(dir, &["checkout", &branch, "--"]).ok();
-            return;
+) -> Vec<String> {
+    let mut update = Vec::new();
+    if let Some(local_ref) = &state.local_ref {
+        update.push(local_ref.clone());
+        if let Some(path) = &state.local_path {
+            update.extend(path.get_local_branches());
         }
     }
+    update.extend(into_ref.map(str::to_string));
+    update.extend(onto_refs.iter().cloned());
+    let mut branches: Vec<String> = Vec::new();
+    for branch in update {
+        if !branches.contains(&branch) {
+            branches.push(branch);
+        }
+    }
+    branches.retain(|branch| !deleted.contains(branch));
+    branches.retain(|branch| {
+        git::output(dir, &["rev-parse", "--verify", branch]).is_ok_and(|out| out.status.success())
+    });
+    branches
+}
+
+/// Pull list for [`git_reconcile`] (`:732-776`): local branches of the
+/// first candidate whose upstream path reaches the pushed remote and ref,
+/// closest to the upstream first. Cyclic upstreams warn and are skipped.
+fn git_reconcile_pull_branches(
+    dir: &Path,
+    io: &mut Io,
+    update_branches: &[String],
+    onto_remote: &str,
+    onto_refs: &[String],
+) -> Result<Vec<String>, String> {
+    let mut pull_branches: Vec<String> = Vec::new();
+    for branch in update_branches {
+        let path = git::get_path_to_upstream(dir, branch)?;
+        if path.get_cycle().is_some() {
+            io.push_status(
+                "LOCAL CYCLE",
+                &format!(
+                    "Local branch \"{branch}\" tracks an upstream but following it leads to a \
+                     local cycle, ignoring branch."
+                ),
+            );
+            continue;
+        }
+        if !path.is_connected_to_remote() {
+            continue;
+        }
+        if path.get_remote_remote_name() != Some(onto_remote) {
+            continue;
+        }
+        if !onto_refs
+            .iter()
+            .any(|onto| Some(onto.as_str()) == path.get_remote_branch_name())
+        {
+            continue;
+        }
+        pull_branches = path.get_local_branches();
+        break;
+    }
+    pull_branches.reverse();
+    let mut fused: Vec<String> = Vec::new();
+    for branch in pull_branches {
+        if !fused.contains(&branch) {
+            fused.push(branch);
+        }
+    }
+    Ok(fused)
+}
+
+/// Reconcile after a land (`reconcileLocalState()`, `:611-677,731-852`,
+/// non-Perforce half): update the local branches connected to the pushed
+/// remote ref, check the last one out, then discard the saved state.
+///
+/// Each pull branch at-or-behind the landed commit is force-updated to
+/// it. A surviving original ref outside the pull list is restored
+/// instead (`RETURN`); with no pull list the checkout stays detached.
+#[allow(clippy::too_many_arguments)]
+pub fn git_reconcile(
+    dir: &Path,
+    io: &mut Io,
+    state: &GitLocalState,
+    into_commit: &str,
+    into_ref: Option<&str>,
+    onto_remote: &str,
+    onto_refs: &[String],
+    deleted: &[String],
+) -> Result<(), String> {
+    let update_branches = git_reconcile_candidates(dir, state, into_ref, onto_refs, deleted);
+    let pull_branches =
+        git_reconcile_pull_branches(dir, io, &update_branches, onto_remote, onto_refs)?;
+
+    if let Some(local_ref) = &state.local_ref
+        && update_branches.contains(local_ref)
+        && !pull_branches.contains(local_ref)
+    {
+        io.push_status(
+            "RETURN",
+            &format!("Returning to original branch \"{local_ref}\" in original state."),
+        );
+        return restore_local_state_git(dir, io, state);
+    }
+
+    let mut dst_branch = None;
+    for branch in &pull_branches {
+        if !git_is_ancestor_of(dir, branch, into_commit)? {
+            io.push_status(
+                "LOCAL CHANGES",
+                &format!("Local branch \"{branch}\" has unpublished changes, ending updates."),
+            );
+            break;
+        }
+        io.push_status("UPDATE", &format!("Updating local branch \"{branch}\"..."));
+        git::stdout_text(dir, &["branch", "-f", branch, into_commit, "--"])?;
+        dst_branch = Some(branch.clone());
+    }
+
+    if let Some(dst) = dst_branch {
+        io.push_status("CHECKOUT", &format!("Checking out \"{dst}\"."));
+        git::stdout_text(dir, &["checkout", &dst, "--"])?;
+    } else {
+        io.push_status(
+            "DETACHED HEAD",
+            "Unable to find any local branches to update, staying on detached head.",
+        );
+    }
+    discard_local_state_git(dir, io, state)
+}
+
+/// True when `branch` is an ancestor of (or equal to) `commit`
+/// (`ArcanistGitLandEngine::isAncestorOf()`, `:854-869`).
+fn git_is_ancestor_of(dir: &Path, branch: &str, commit: &str) -> Result<bool, String> {
+    let base = git::stdout_text(dir, &["merge-base", "--", branch, commit])?;
+    let hash = git::stdout_text(dir, &["rev-parse", "--verify", branch])?;
+    Ok(base == hash)
+}
+
+/// Reconcile after a Perforce-mode land (`reconcileLocalState()`,
+/// `:679-730`): switch to the most desirable surviving branch (resetting
+/// it when it holds no unpublished changes), then discard the saved
+/// state.
+#[allow(clippy::too_many_arguments)]
+pub fn git_reconcile_perforce(
+    dir: &Path,
+    io: &mut Io,
+    state: &GitLocalState,
+    into_ref: Option<&str>,
+    onto_refs: &[String],
+    deleted: &[String],
+    into_commit: &str,
+) -> Result<(), String> {
+    let mut update: Vec<String> = Vec::new();
+    if let Some(local_ref) = &state.local_ref {
+        update.push(local_ref.clone());
+        if let Some(path) = &state.local_path {
+            update.extend(path.get_local_branches());
+        }
+    }
+    update.extend(into_ref.map(str::to_string));
+    update.extend(onto_refs.iter().cloned());
+    update.retain(|branch| !deleted.contains(branch));
+    update.retain(|branch| {
+        git::output(dir, &["rev-parse", "--verify", branch]).is_ok_and(|out| out.status.success())
+    });
+    // Deduplicate like `array_fuse()`, keeping first occurrences.
+    let mut unique: Vec<String> = Vec::new();
+    for branch in update {
+        if !unique.contains(&branch) {
+            unique.push(branch);
+        }
+    }
+    let Some(dst) = unique.into_iter().next() else {
+        io.push_status(
+            "DETACHED HEAD",
+            "Unable to find any local branches to update, staying on detached head.",
+        );
+        return discard_local_state_git(dir, io, state);
+    };
+    if !git_is_ancestor_of(dir, &dst, into_commit)? {
+        io.push_status(
+            "CHECKOUT",
+            &format!(
+                "Local branch \"{dst}\" has unpublished changes, checking it out but leaving them \
+                 in place."
+            ),
+        );
+        git::stdout_text(dir, &["checkout", &dst, "--"])?;
+    } else {
+        io.push_status("UPDATE", &format!("Switching to local branch \"{dst}\"."));
+        git::stdout_text(dir, &["checkout", &dst, "--"])?;
+        git::stdout_text(dir, &["reset", "--hard", into_commit, "--"])?;
+    }
+    discard_local_state_git(dir, io, state)
 }
 
 /// Print the hold instructions
 /// (`ArcanistGitLandEngine::didHoldChanges()`, `:888-940`).
 ///
 /// Shows the `HOLD CHANGES` banner, the manual push command, the restore
-/// commands, and the branches-unchanged note.
+/// commands, and the branches-unchanged note. In Perforce mode (`:892-898`)
+/// the changes "have not been submitted" and the manual command is
+/// `git p4 submit`.
 pub fn git_hold_text(
     io: &mut Io,
     onto_remote: &str,
     onto_refs: &[String],
     into_commit: &str,
     restore: &[String],
+    perforce: bool,
 ) {
-    push_banner(
-        io,
-        "HOLD CHANGES",
-        "Holding changes locally, they have not been pushed.",
-    );
-    let refspecs = git_onto_refspecs(onto_refs, into_commit);
+    let message = if perforce {
+        "Holding changes locally, they have not been submitted."
+    } else {
+        "Holding changes locally, they have not been pushed."
+    };
+    push_banner(io, "HOLD CHANGES", message);
+    let command = if perforce {
+        format!("git p4 submit -M --commit {into_commit} --")
+    } else {
+        let refspecs = git_onto_refspecs(onto_refs, into_commit);
+        format!("git push -- {onto_remote} {}", refspecs.join(" "))
+    };
     io.push_out("To push changes manually, run this command:\n\n");
-    io.push_out(&format!(
-        "    $ git push -- {onto_remote} {}\n\n",
-        refspecs.join(" ")
-    ));
+    io.push_out(&format!("    $ {command}\n\n"));
     if !restore.is_empty() {
         io.push_out(&format!(
             "To go back to how things were before you ran \"arc land\", run these {} \
@@ -3336,7 +4468,16 @@ pub fn parse_hg_branches(output: &str) -> Vec<String> {
 /// branch, else the active commit
 /// (`ArcanistMercurialLandEngine::getDefaultSymbols()`, `:11-75`).
 pub fn hg_default_symbols(dir: &Path, io: &mut Io) -> Result<Vec<String>, String> {
-    let bookmarks = hg::stdout_text(dir, &["bookmarks"]).unwrap_or_default();
+    hg_default_symbols_with(dir, &hg::HgCommand::system(), io)
+}
+
+/// [`hg_default_symbols`] driving `hg` through `hg_cmd` (test seam).
+pub fn hg_default_symbols_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    io: &mut Io,
+) -> Result<Vec<String>, String> {
+    let bookmarks = hg::stdout_text_with(dir, hg_cmd, &["bookmarks"]).unwrap_or_default();
     if let Some((bookmark, _)) = parse_hg_bookmarks(&bookmarks)
         .into_iter()
         .find(|(_, active)| *active)
@@ -3347,7 +4488,7 @@ pub fn hg_default_symbols(dir: &Path, io: &mut Io) -> Result<Vec<String>, String
         );
         return Ok(vec![bookmark]);
     }
-    if let Ok(branch) = hg::stdout_text(dir, &["branch"]) {
+    if let Ok(branch) = hg::stdout_text_with(dir, hg_cmd, &["branch"]) {
         let branch = branch.trim().to_string();
         if !branch.is_empty() {
             io.push_status(
@@ -3357,7 +4498,11 @@ pub fn hg_default_symbols(dir: &Path, io: &mut Io) -> Result<Vec<String>, String
             return Ok(vec![branch]);
         }
     }
-    let commit = hg::stdout_text(dir, &["log", "-l", "1", "--template", "{node}", "-r", "."])?;
+    let commit = hg::stdout_text_with(
+        dir,
+        hg_cmd,
+        &["log", "-l", "1", "--template", "{node}", "-r", "."],
+    )?;
     let short = commit.chars().take(12).collect::<String>();
     io.push_status(
         "SOURCE",
@@ -3377,28 +4522,38 @@ pub fn hg_resolve_symbols(
     io: &mut Io,
     symbols: &[String],
 ) -> Result<Vec<String>, String> {
-    let bookmarks = hg::stdout_text(dir, &["bookmarks"]).unwrap_or_default();
+    hg_resolve_symbols_with(dir, &hg::HgCommand::system(), io, symbols)
+}
+
+/// [`hg_resolve_symbols`] driving `hg` through `hg_cmd` (test seam).
+pub fn hg_resolve_symbols_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    io: &mut Io,
+    symbols: &[String],
+) -> Result<Vec<String>, String> {
+    let bookmarks = hg::stdout_text_with(dir, hg_cmd, &["bookmarks"]).unwrap_or_default();
     let bookmark_names: Vec<String> = parse_hg_bookmarks(&bookmarks)
         .into_iter()
         .map(|(name, _)| name)
         .collect();
-    let branches = hg::stdout_text(dir, &["branches"]).unwrap_or_default();
+    let branches = hg::stdout_text_with(dir, hg_cmd, &["branches"]).unwrap_or_default();
     let branch_names = parse_hg_branches(&branches);
     let mut commits = Vec::new();
     for symbol in symbols {
         let bookmark_hits = bookmark_names.iter().filter(|name| *name == symbol).count();
         let branch_hits = branch_names.iter().filter(|name| *name == symbol).count();
         if bookmark_hits > 1 {
-            return Err(hg_ambiguous_symbol(io, symbol, "bookmark"));
+            return Err(hg_ambiguous_symbol(io, symbol, "bookmark", bookmark_hits));
         }
         if branch_hits > 1 {
-            return Err(hg_ambiguous_symbol(io, symbol, "branch"));
+            return Err(hg_ambiguous_symbol(io, symbol, "branch", branch_hits));
         }
         if bookmark_hits == 1 || branch_hits == 1 {
-            commits.push(hg_canonical(dir, symbol)?);
+            commits.push(hg_canonical_with(dir, hg_cmd, symbol)?);
             continue;
         }
-        match hg_canonical(dir, symbol) {
+        match hg_canonical_with(dir, hg_cmd, symbol) {
             Ok(commit) => commits.push(commit),
             Err(_) => {
                 return Err(format!(
@@ -3412,7 +4567,11 @@ pub fn hg_resolve_symbols(
 
 /// Print the `AMBIGUOUS SYMBOL` banner and return its error
 /// (`ArcanistMercurialLandEngine.php:102-122`).
-fn hg_ambiguous_symbol(io: &mut Io, symbol: &str, marker_type: &str) -> String {
+///
+/// Each matching marker renders as a ref view (`:112-114`). Markers
+/// that share one name are indistinguishable to the port, so each
+/// view shows the name alone.
+fn hg_ambiguous_symbol(io: &mut Io, symbol: &str, marker_type: &str, hits: usize) -> String {
     push_banner(
         io,
         "AMBIGUOUS SYMBOL",
@@ -3421,14 +4580,25 @@ fn hg_ambiguous_symbol(io: &mut Io, symbol: &str, marker_type: &str) -> String {
              \"{marker_type}\"). Use an unambiguous identifier."
         ),
     );
+    let display = match marker_type {
+        "bookmark" => format!("Bookmark \"{symbol}\""),
+        "branch" => format!("Branch \"{symbol}\""),
+        _ => format!("Marker \"{symbol}\""),
+    };
+    for _ in 0..hits {
+        io.push_out(&marker_ref_view(&display, "", "").render());
+    }
+    io.push_out("\n");
     format!("Symbol \"{symbol}\" is ambiguous.")
 }
 
 /// Resolve one Mercurial revision to its node hash
-/// (`ArcanistMercurialAPI::getCanonicalRevisionName()`, `:57-64`).
-fn hg_canonical(dir: &Path, symbol: &str) -> Result<String, String> {
-    hg::stdout_text(
+/// (`ArcanistMercurialAPI::getCanonicalRevisionName()`, `:57-64`),
+/// driving `hg` through `hg_cmd` (test seam).
+fn hg_canonical_with(dir: &Path, hg_cmd: &hg::HgCommand, symbol: &str) -> Result<String, String> {
+    hg::stdout_text_with(
         dir,
+        hg_cmd,
         &["log", "-l", "1", "--template", "{node}", "-r", symbol, "--"],
     )
 }
@@ -3440,6 +4610,16 @@ fn hg_canonical(dir: &Path, symbol: &str) -> Result<String, String> {
 /// The remote must exist (`hg paths NAME`); pushes the `ONTO REMOTE`
 /// status line.
 pub fn hg_select_onto_remote(dir: &Path, io: &mut Io, options: &Options) -> Result<String, String> {
+    hg_select_onto_remote_with(dir, &hg::HgCommand::system(), io, options)
+}
+
+/// [`hg_select_onto_remote`] driving `hg` through `hg_cmd` (test seam).
+pub fn hg_select_onto_remote_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    io: &mut Io,
+    options: &Options,
+) -> Result<String, String> {
     let remote = if let Some(remote) = options.onto_remote.as_deref() {
         io.push_status(
             "ONTO REMOTE",
@@ -3465,7 +4645,7 @@ pub fn hg_select_onto_remote(dir: &Path, io: &mut Io, options: &Options) -> Resu
         );
         "default".to_string()
     };
-    if !hg::ok(dir, &["paths", &remote]) {
+    if !hg::ok_with(dir, hg_cmd, &["paths", &remote]) {
         return Err(format!("No remote \"{remote}\" exists in this repository."));
     }
     Ok(remote)
@@ -3509,17 +4689,18 @@ pub fn hg_select_onto_refs(
     Ok(vec!["default".to_string()])
 }
 
-/// True when `name` names a local branch (vs a bookmark).
-fn hg_is_branch(dir: &Path, name: &str) -> bool {
-    let branches = hg::stdout_text(dir, &["branches"]).unwrap_or_default();
+/// True when `name` names a local branch (vs a bookmark), driving
+/// `hg` through `hg_cmd` (test seam).
+fn hg_is_branch_with(dir: &Path, hg_cmd: &hg::HgCommand, name: &str) -> bool {
+    let branches = hg::stdout_text_with(dir, hg_cmd, &["branches"]).unwrap_or_default();
     parse_hg_branches(&branches).contains(&name.to_string())
 }
 
 /// Probe whether `name` exists in `remote` via
 /// `hg identify --id --rev NAME REMOTE`; probe failures count as missing
-/// (see the module docs).
-fn hg_remote_ref_exists(dir: &Path, remote: &str, name: &str) -> bool {
-    hg::output(dir, &["identify", "--id", "--rev", name, remote])
+/// (see the module docs). Drives `hg` through `hg_cmd` (test seam).
+fn hg_remote_ref_exists_with(dir: &Path, hg_cmd: &hg::HgCommand, remote: &str, name: &str) -> bool {
+    hg::output_with(dir, hg_cmd, &["identify", "--id", "--rev", name, remote])
         .is_ok_and(|out| out.status.success())
 }
 
@@ -3537,6 +4718,25 @@ pub fn hg_confirm_onto_refs(
     onto_refs: &[String],
     hold: bool,
 ) -> Result<Option<String>, String> {
+    hg_confirm_onto_refs_with(
+        dir,
+        &hg::HgCommand::system(),
+        io,
+        onto_remote,
+        onto_refs,
+        hold,
+    )
+}
+
+/// [`hg_confirm_onto_refs`] driving `hg` through `hg` (test seam).
+pub fn hg_confirm_onto_refs_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    io: &mut Io,
+    onto_remote: &str,
+    onto_refs: &[String],
+    hold: bool,
+) -> Result<Option<String>, String> {
     for onto_ref in onto_refs {
         if onto_ref.is_empty() {
             return Err(format!(
@@ -3547,56 +4747,73 @@ pub fn hg_confirm_onto_refs(
     }
     let branches: Vec<&String> = onto_refs
         .iter()
-        .filter(|name| hg_is_branch(dir, name))
+        .filter(|name| hg_is_branch_with(dir, hg_cmd, name))
         .collect();
     if branches.len() > 1 {
-        let list = branches
-            .iter()
-            .map(|name| format!("  {name}\n"))
-            .collect::<String>();
         push_banner(
             io,
             "MULTIPLE \"ONTO\" BRANCHES",
-            &format!(
-                "You have selected multiple branches to push changes onto. Pushing to multiple \
-                 branches is not supported by \"arc land\" in Mercurial: Mercurial commits may \
-                 only belong to one branch, so this operation can not be executed atomically.\n\nYou \
-                 may land one branches and any number of bookmarks in a single operation.\n\nThese \
-                 branches were selected:\n\n{list}"
-            ),
+            "You have selected multiple branches to push changes onto. Pushing to multiple \
+             branches is not supported by \"arc land\" in Mercurial: Mercurial commits may only \
+             belong to one branch, so this operation can not be executed atomically.\n\nYou may \
+             land one branches and any number of bookmarks in a single operation.\n\nThese \
+             branches were selected:",
         );
+        for branch in &branches {
+            io.push_out(&hg_branch_marker_view_with(dir, hg_cmd, branch).render());
+        }
+        io.push_out("\n");
         return Err(
             "Landing onto multiple branches at once is not supported in Mercurial.".to_string(),
         );
     }
     let new_markers: Vec<&String> = onto_refs
         .iter()
-        .filter(|name| !hg_remote_ref_exists(dir, onto_remote, name))
+        .filter(|name| !hg_remote_ref_exists_with(dir, hg_cmd, onto_remote, name))
         .collect();
     if !new_markers.is_empty() {
         let count = new_markers.len();
-        let list = new_markers
-            .iter()
-            .map(|name| format!("  {name}\n"))
-            .collect::<String>();
         push_banner(
             io,
             &format!("CREATE {count} BOOKMARK(S)"),
             &format!(
                 "These {count} symbol(s) do not exist in the remote. They will be created as new \
-                 bookmarks:\n\n{list}"
+                 bookmarks:"
             ),
         );
+        for name in &new_markers {
+            io.push_out(&marker_ref_view(&format!("Bookmark \"{name}\""), "", "").render());
+        }
+        io.push_out("\n");
         if hold {
-            io.push_out(&format!(
+            io.push_out(&render_hint(&format!(
                 "You are using \"--hold\", so execution will stop before the {count} bookmark(s) \
-                 are actually created. You will be given instructions to create the bookmarks.\n"
-            ));
+                 are actually created. You will be given instructions to create the bookmarks."
+            )));
+            io.push_out("\n");
         }
         let query = format!("Create {count} new remote bookmark(s)?");
         prompt_for_key(io, land_checks::PROMPT_CREATE, &query)?;
     }
     Ok(branches.into_iter().next().cloned())
+}
+
+/// Branch marker view for the multiple-branches error: the local tip
+/// hash and summary. PHP renders remote marker data; the port reads
+/// the local branch tip (see the module docs).
+fn hg_branch_marker_view_with(dir: &Path, hg_cmd: &hg::HgCommand, branch: &str) -> RefView {
+    let hash = hg_canonical_with(dir, hg_cmd, branch)
+        .map(|node| display_hash_12(&node))
+        .unwrap_or_default();
+    let summary = hg::stdout_text_with(dir, hg_cmd, &["log", "-r", branch, "--template", "{desc}"])
+        .map(|desc| first_summary_line(&desc))
+        .unwrap_or_default();
+    marker_ref_view(&format!("Branch \"{branch}\""), &hash, &summary)
+}
+
+/// First line of a commit message, like `{desc|firstline}`.
+fn first_summary_line(desc: &str) -> String {
+    desc.split('\n').next().unwrap_or("").trim().to_string()
 }
 
 /// Resolve the Mercurial into state to a commit, pulling when remote
@@ -3610,13 +4827,24 @@ pub fn hg_select_into_commit(
     state: &IntoState,
     into_argument: Option<&str>,
 ) -> Result<Option<String>, String> {
+    hg_select_into_commit_with(dir, &hg::HgCommand::system(), io, state, into_argument)
+}
+
+/// [`hg_select_into_commit`] driving `hg` through `hg_cmd` (test seam).
+pub fn hg_select_into_commit_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    io: &mut Io,
+    state: &IntoState,
+    into_argument: Option<&str>,
+) -> Result<Option<String>, String> {
     match state {
         IntoState::Empty => {
             io.push_status("INTO COMMIT", "Preparing merge into the empty state.");
             Ok(None)
         }
         IntoState::Local(local_ref) => {
-            let into_commit = hg_canonical(dir, local_ref)
+            let into_commit = hg_canonical_with(dir, hg_cmd, local_ref)
                 .map_err(|_| format!("Local ref \"{local_ref}\" does not exist."))?;
             io.push_status(
                 "INTO COMMIT",
@@ -3630,8 +4858,8 @@ pub fn hg_select_into_commit(
         IntoState::Remote { remote, name } => {
             // Pull the ref, then resolve it locally; failures leave the
             // previous state alone, like the git ignore-failure fetch.
-            hg::output(dir, &["pull", "--rev", name, remote]).ok();
-            if let Ok(commit) = hg_canonical(dir, name) {
+            hg::output_with(dir, hg_cmd, &["pull", "--rev", name, remote]).ok();
+            if let Ok(commit) = hg_canonical_with(dir, hg_cmd, name) {
                 io.push_status(
                     "INTO COMMIT",
                     &format!(
@@ -3677,6 +4905,16 @@ pub fn hg_select_commits(
     symbols: &[GitSymbol],
     into_commit: Option<&str>,
 ) -> Result<Vec<LandCommit>, String> {
+    hg_select_commits_with(dir, &hg::HgCommand::system(), symbols, into_commit)
+}
+
+/// [`hg_select_commits`] driving `hg` through `hg_cmd` (test seam).
+pub fn hg_select_commits_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    symbols: &[GitSymbol],
+    into_commit: Option<&str>,
+) -> Result<Vec<LandCommit>, String> {
     let template = "{node}-{parents % '{node} '}-{desc|firstline}\\n";
     let mut commits = Vec::new();
     for symbol in symbols {
@@ -3687,8 +4925,9 @@ pub fn hg_select_commits(
                 symbol.commit, into
             ),
         };
-        let output = hg::stdout_text(
+        let output = hg::stdout_text_with(
             dir,
+            hg_cmd,
             &["log", "--rev", &revset, "--template", template, "--"],
         )?;
         collect_hg_commits(&mut commits, &output, &symbol.symbol)?;
@@ -3708,6 +4947,32 @@ pub fn hg_select_commits(
 #[allow(clippy::too_many_arguments)]
 pub fn hg_execute_merge(
     dir: &Path,
+    io: &mut Io,
+    set: &CommitSet,
+    commits: &[LandCommit],
+    into_commit: Option<&str>,
+    squash: bool,
+    branch_marker: Option<&str>,
+    message_of: &dyn Fn(&CommitSet) -> Result<String, String>,
+) -> Result<String, String> {
+    hg_execute_merge_with(
+        dir,
+        &hg::HgCommand::system(),
+        io,
+        set,
+        commits,
+        into_commit,
+        squash,
+        branch_marker,
+        message_of,
+    )
+}
+
+/// [`hg_execute_merge`] driving `hg` through `hg_cmd` (test seam).
+#[allow(clippy::too_many_arguments)]
+pub fn hg_execute_merge_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
     _io: &mut Io,
     set: &CommitSet,
     commits: &[LandCommit],
@@ -3722,23 +4987,24 @@ pub fn hg_execute_merge(
     let Some(into_commit) = into_commit else {
         return Err("landing into the empty state is not supported under Mercurial".to_string());
     };
-    let before = hg::stdout_text(dir, &["bookmarks"]).unwrap_or_default();
+    let before = hg::stdout_text_with(dir, hg_cmd, &["bookmarks"]).unwrap_or_default();
     let mut bookmark_positions: Vec<(String, String)> = Vec::new();
     for (name, _) in parse_hg_bookmarks(&before) {
-        if let Some(position) = hg_bookmark_position(dir, &name) {
+        if let Some(position) = hg_bookmark_position_with(dir, hg_cmd, &name) {
             bookmark_positions.push((name, position));
         }
     }
-    hg::stdout_text(dir, &["update", "--rev", into_commit])?;
+    hg::stdout_text_with(dir, hg_cmd, &["update", "--rev", into_commit])?;
     if let Some(branch) = branch_marker {
-        hg::stdout_text(dir, &["branch", "--", branch])?;
+        hg::stdout_text_with(dir, hg_cmd, &["branch", "--", branch])?;
     }
     let min = &commits[set.commits[0]].hash;
     let max = &commits[set.commits[set.commits.len() - 1]].hash;
     let message = message_of(set)?;
     let range = format!("{min}..{max}");
-    let wrote = hg_write_stdin(
+    let wrote = hg_write_stdin_with(
         dir,
+        hg_cmd,
         &[
             "rebase",
             "--dest",
@@ -3753,7 +5019,7 @@ pub fn hg_execute_merge(
         &message,
     );
     if !wrote {
-        hg::output(dir, &["rebase", "--abort"]).ok();
+        hg::output_with(dir, hg_cmd, &["rebase", "--abort"]).ok();
         return Err("rebase failed".to_string());
     }
     // Put back bookmarks the rebase moved (`:853-873`).
@@ -3764,16 +5030,27 @@ pub fn hg_execute_merge(
         .collect();
     for (name, position) in &bookmark_positions {
         if obsolete.contains(&position.as_str()) {
-            hg::output(dir, &["bookmark", "--force", "--rev", position, "--", name]).ok();
+            hg::output_with(
+                dir,
+                hg_cmd,
+                &["bookmark", "--force", "--rev", position, "--", name],
+            )
+            .ok();
         }
     }
-    let tip = hg::stdout_text(dir, &["log", "--rev", "tip", "--template", "{node}"])?;
+    let tip = hg::stdout_text_with(
+        dir,
+        hg_cmd,
+        &["log", "--rev", "tip", "--template", "{node}"],
+    )?;
     Ok(tip.trim().to_string())
 }
 
-/// Current position of bookmark `name`, if any.
-fn hg_bookmark_position(dir: &Path, name: &str) -> Option<String> {
-    let output = hg::stdout_text(dir, &["log", "--rev", name, "--template", "{node}"]).ok()?;
+/// Current position of bookmark `name`, if any, driving `hg`
+/// through `hg_cmd` (test seam).
+fn hg_bookmark_position_with(dir: &Path, hg_cmd: &hg::HgCommand, name: &str) -> Option<String> {
+    let output =
+        hg::stdout_text_with(dir, hg_cmd, &["log", "--rev", name, "--template", "{node}"]).ok()?;
     let trimmed = output.trim().to_string();
     if trimmed.is_empty() {
         None
@@ -3783,13 +5060,19 @@ fn hg_bookmark_position(dir: &Path, name: &str) -> Option<String> {
 }
 
 /// Run `hg` with `args` in `dir`, writing `stdin_text` to its stdin.
-/// Returns success.
-fn hg_write_stdin(dir: &Path, args: &[&str], stdin_text: &str) -> bool {
+/// Returns success. Drives `hg` through `hg_cmd` (test seam).
+fn hg_write_stdin_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    args: &[&str],
+    stdin_text: &str,
+) -> bool {
     use std::io::Write;
     use std::process::Stdio;
-    let mut command = std::process::Command::new("hg");
+    let mut command = std::process::Command::new(&hg_cmd.program);
     command
         .current_dir(dir)
+        .args(&hg_cmd.prefix)
         .args(hg::HG_ENCODING_ARGS)
         .args(args)
         .env(hg::HGPLAIN.0, hg::HGPLAIN.1)
@@ -3822,6 +5105,25 @@ fn hg_write_stdin(dir: &Path, args: &[&str], stdin_text: &str) -> bool {
 /// `Push failed! ...`.
 pub fn hg_push_change(
     dir: &Path,
+    io: &mut Io,
+    onto_remote: &str,
+    bookmarks: &[String],
+    into_commit: &str,
+) -> Result<(), String> {
+    hg_push_change_with(
+        dir,
+        &hg::HgCommand::system(),
+        io,
+        onto_remote,
+        bookmarks,
+        into_commit,
+    )
+}
+
+/// [`hg_push_change`] driving `hg` through `hg_cmd` (test seam).
+pub fn hg_push_change_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
     _io: &mut Io,
     onto_remote: &str,
     bookmarks: &[String],
@@ -3829,12 +5131,13 @@ pub fn hg_push_change(
 ) -> Result<(), String> {
     let mut restore: Vec<(String, String)> = Vec::new();
     for bookmark in bookmarks {
-        let old = hg_bookmark_position(dir, bookmark);
+        let old = hg_bookmark_position_with(dir, hg_cmd, bookmark);
         if old.as_deref() == Some(into_commit) {
             continue;
         }
-        hg::stdout_text(
+        hg::stdout_text_with(
             dir,
+            hg_cmd,
             &["bookmark", "--force", "--rev", into_commit, "--", bookmark],
         )?;
         if let Some(old) = old {
@@ -3854,10 +5157,10 @@ pub fn hg_push_change(
     args.push("--".to_string());
     args.push(onto_remote.to_string());
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    let pushed = hg::output(dir, &argv).is_ok_and(|out| out.status.success());
+    let pushed = hg::output_with(dir, hg_cmd, &argv).is_ok_and(|out| out.status.success());
     if !pushed {
         for (bookmark, old) in &restore {
-            hg::output(dir, &["bookmark", "--force", "--rev", old]).ok();
+            hg::output_with(dir, hg_cmd, &["bookmark", "--force", "--rev", old]).ok();
             let _ = bookmark;
         }
         return Err("Push failed! Fix the error and run \"arc land\" again.".to_string());
@@ -3871,7 +5174,7 @@ pub fn hg_push_change(
         }
         let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
         pull.extend(refs);
-        hg::output(dir, &pull).ok();
+        hg::output_with(dir, hg_cmd, &pull).ok();
     }
     Ok(())
 }
@@ -3885,12 +5188,32 @@ pub fn hg_cascade_state(
     new_commit: &str,
     squash: bool,
 ) -> Result<(), String> {
+    hg_cascade_state_with(
+        dir,
+        &hg::HgCommand::system(),
+        set,
+        commits,
+        new_commit,
+        squash,
+    )
+}
+
+/// [`hg_cascade_state`] driving `hg` through `hg_cmd` (test seam).
+pub fn hg_cascade_state_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    set: &CommitSet,
+    commits: &[LandCommit],
+    new_commit: &str,
+    squash: bool,
+) -> Result<(), String> {
     if !squash {
         return Ok(());
     }
     let old = &commits[set.commits[set.commits.len() - 1]].hash;
-    let output = hg::stdout_text(
+    let output = hg::stdout_text_with(
         dir,
+        hg_cmd,
         &[
             "log",
             "--rev",
@@ -3905,8 +5228,9 @@ pub fn hg_cascade_state(
         if child.is_empty() {
             continue;
         }
-        if hg::output(
+        if hg::output_with(
             dir,
+            hg_cmd,
             &[
                 "rebase",
                 "--source",
@@ -3919,7 +5243,7 @@ pub fn hg_cascade_state(
         )
         .is_ok_and(|out| !out.status.success())
         {
-            hg::output(dir, &["rebase", "--abort"]).ok();
+            hg::output_with(dir, hg_cmd, &["rebase", "--abort"]).ok();
             return Err(format!("rebase of \"{child}\" onto landed state failed"));
         }
     }
@@ -3936,6 +5260,17 @@ pub fn hg_prune_branches(
     sets: &[CommitSet],
     commits: &[LandCommit],
 ) -> Result<(), String> {
+    hg_prune_branches_with(dir, &hg::HgCommand::system(), io, sets, commits)
+}
+
+/// [`hg_prune_branches`] driving `hg` through `hg_cmd` (test seam).
+pub fn hg_prune_branches_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    io: &mut Io,
+    sets: &[CommitSet],
+    commits: &[LandCommit],
+) -> Result<(), String> {
     let mut revs: Vec<String> = Vec::new();
     let mut obsolete: Vec<&str> = Vec::new();
     for set in sets.iter().rev() {
@@ -3946,16 +5281,16 @@ pub fn hg_prune_branches(
             obsolete.push(commits[*index].hash.as_str());
         }
     }
-    let before = hg::stdout_text(dir, &["bookmarks"]).unwrap_or_default();
+    let before = hg::stdout_text_with(dir, hg_cmd, &["bookmarks"]).unwrap_or_default();
     for (name, _) in parse_hg_bookmarks(&before) {
-        let position = hg_bookmark_position(dir, &name);
+        let position = hg_bookmark_position_with(dir, hg_cmd, &name);
         if position.is_some_and(|hash| obsolete.contains(&hash.as_str())) {
             io.push_status("CLEANUP", &format!("Deleting bookmark \"{name}\"."));
-            hg::stdout_text(dir, &["bookmark", "--delete", "--", &name])?;
+            hg::stdout_text_with(dir, hg_cmd, &["bookmark", "--delete", "--", &name])?;
         }
     }
     let revset = format!("({})", revs.join(") or ("));
-    hg::stdout_text(dir, &["strip", "--rev", &revset])?;
+    hg::stdout_text_with(dir, hg_cmd, &["strip", "--rev", &revset])?;
     Ok(())
 }
 
@@ -3965,8 +5300,18 @@ pub fn hg_prune_branches(
 /// (`ArcanistMercurialLandEngine.php:1178-1198`); the rebased-active-commit
 /// half is not ported (see the module docs on local state).
 pub fn hg_reconcile(dir: &Path, local_commit: &str, local_bookmark: Option<&str>) {
+    hg_reconcile_with(dir, &hg::HgCommand::system(), local_commit, local_bookmark);
+}
+
+/// [`hg_reconcile`] driving `hg` through `hg_cmd` (test seam).
+pub fn hg_reconcile_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    local_commit: &str,
+    local_bookmark: Option<&str>,
+) {
     let marker = local_bookmark.unwrap_or(local_commit);
-    hg::output(dir, &["update", "--", marker]).ok();
+    hg::output_with(dir, hg_cmd, &["update", "--", marker]).ok();
 }
 
 /// Print the Mercurial hold instructions
@@ -4024,7 +5369,7 @@ pub fn hg_hold_text(
     );
 }
 
-/// Render one commit set: the revision line plus its commits
+/// Render one commit set: the revision ref view plus its commits
 /// (`ArcanistLandEngine::printCommitSet()`, `:768-796`).
 ///
 /// Implicit commits are marked with `!` (plain-text rendering of the
@@ -4037,7 +5382,8 @@ pub fn render_commit_set(
     let mut text = String::new();
     match &set.revision {
         Some(revision) => {
-            text.push_str(&format!("\n  {} {}\n", revision.monogram, revision.name));
+            text.push('\n');
+            text.push_str(&revision_ref_view(revision).render());
         }
         None => text.push_str("\n  (no associated revision)\n"),
     }
@@ -4073,7 +5419,7 @@ pub fn confirm_implicit_sets(
     if implicit.is_empty() {
         return Ok(());
     }
-    push_banner(
+    push_banner_continued(
         io,
         "IMPLICIT COMMITS",
         &format!(
@@ -4190,10 +5536,17 @@ fn confirm_unauthored(
     );
     for index in land_checks::unauthored_indexes(revisions, &viewer.phid) {
         let revision = &revisions[index];
-        io.push_out(&format!("  {} {}\n", revision.monogram, revision.name));
-        io.push_out(&format!("  Author: {}\n", revision.author_phid));
+        // PHP shows the author monogram (`:310-316`); without the user
+        // hardpoint the port shows the author PHID (see the module docs).
+        let mut view = revision_ref_view(revision);
+        view.lines.push(format!("Author: {}", revision.author_phid));
+        io.push_out(&view.render());
     }
-    io.push_out("Use \"Commandeer\" in the web interface to become the author of a revision.\n\n");
+    io.push_out("\n");
+    io.push_out(&render_hint(
+        "Use \"Commandeer\" in the web interface to become the author of a revision.",
+    ));
+    io.push_out("\n");
     prompt_for_key(
         io,
         land_checks::PROMPT_UNAUTHORED,
@@ -4215,23 +5568,28 @@ fn confirm_status_group(
         StatusGroup::NotAccepted => &partition.not_accepted,
     };
     let count = indexes.len();
+    let example_status = indexes
+        .first()
+        .map(|index| revisions[*index].status_name.as_str())
+        .unwrap_or("");
     let (title, intro) = match group {
         StatusGroup::Planned => (
             format!("{count} REVISION(S) HAVE CHANGES PLANNED"),
             format!(
-                "You are landing {count} revision(s) which are currently in a state indicating \
-                 that you expect to revise them before moving forward.\n\nNormally, you should \
-                 update these {count} revision(s), submit them for review, and wait for reviewers \
-                 to accept them before you continue. To resubmit a revision for review, either: \
-                 update the revision with revised changes; or use \"Request Review\" from the web \
-                 interface.\n\nThese {count} revision(s) have changes planned:"
+                "You are landing {count} revision(s) which are currently in the state \
+                 \"{example_status}\", indicating that you expect to revise them before moving \
+                 forward.\n\nNormally, you should update these {count} revision(s), submit them \
+                 for review, and wait for reviewers to accept them before you continue. To \
+                 resubmit a revision for review, either: update the revision with revised \
+                 changes; or use \"Request Review\" from the web interface.\n\nThese {count} \
+                 revision(s) have changes planned:"
             ),
         ),
         StatusGroup::Published => (
             format!("{count} REVISION(S) ARE ALREADY PUBLISHED"),
             format!(
-                "You are landing {count} revision(s) which are already in a published state, \
-                 indicating that they have previously landed:"
+                "You are landing {count} revision(s) which are already in the state \
+                 \"{example_status}\", indicating that they have previously landed:"
             ),
         ),
         StatusGroup::NotAccepted => (
@@ -4247,10 +5605,11 @@ fn confirm_status_group(
     push_banner(io, &title, &intro);
     for index in indexes {
         let revision = &revisions[*index];
-        io.push_out(&format!("  {} {}\n", revision.monogram, revision.name));
+        let mut view = revision_ref_view(revision);
         if group == StatusGroup::NotAccepted {
-            io.push_out(&format!("  Status: {}\n", revision.status_name));
+            view.lines.push(format!("Status: {}", revision.status_name));
         }
+        io.push_out(&view.render());
     }
     prompt_for_key(io, finding.prompt, &finding.query)
 }
@@ -4275,24 +5634,63 @@ fn confirm_open_parents(
         ),
     );
     for group in &groups {
-        io.push_out(&format!(
-            "  {} {}\n",
-            group.parent.monogram, group.parent.name
-        ));
-        io.push_out(&format!("  Status: {}\n", group.parent.status_name));
+        let mut view = revision_ref_view(&group.parent);
+        view.lines
+            .push(format!("Status: {}", group.parent.status_name));
         for child in &group.children {
             if let Some(revision) = revisions.get(*child) {
-                io.push_out(&format!(
-                    "  Parent of: {} {}\n",
+                view.lines.push(format!(
+                    "Parent of: {} {}",
                     revision.monogram, revision.name
                 ));
             }
         }
+        io.push_out(&view.render());
     }
     prompt_for_key(io, finding.prompt, &finding.query)
 }
 
+/// Problem builds grouped by landing revision, first-seen order
+/// (PHP `$build_map`, `ArcanistLandEngine.php:623-644`).
+struct BuildGroup<'a> {
+    revision_phid: String,
+    buildable_monogram: String,
+    buildable_uri: String,
+    builds: Vec<&'a land_checks::BuildView>,
+}
+
+/// Group problem builds by revision, first-seen over `problems`.
+fn group_problem_builds<'a>(
+    builds: &'a [land_checks::BuildView],
+    problems: &[usize],
+) -> Vec<BuildGroup<'a>> {
+    let mut groups: Vec<BuildGroup<'a>> = Vec::new();
+    for index in problems {
+        let Some(build) = builds.get(*index) else {
+            continue;
+        };
+        match groups
+            .iter_mut()
+            .find(|group| group.revision_phid == build.revision_phid)
+        {
+            Some(group) => group.builds.push(build),
+            None => groups.push(BuildGroup {
+                revision_phid: build.revision_phid.clone(),
+                buildable_monogram: build.buildable_monogram.clone(),
+                buildable_uri: build.buildable_uri.clone(),
+                builds: vec![build],
+            }),
+        }
+    }
+    groups
+}
+
 /// Print the builds banner and prompt (`:646-717`).
+///
+/// The banner has no leading blank line (`"%!\n%s\n"`, `:668-671` /
+/// `:675-680`); each affected revision renders as a nested
+/// revision > buildable > builds tree (`:691-712`). Groups for
+/// revisions that are not landing are skipped.
 fn confirm_builds(
     io: &mut Io,
     revisions: &[land_checks::RevisionView],
@@ -4301,54 +5699,39 @@ fn confirm_builds(
 ) -> Result<(), String> {
     let verdict = land_checks::classify_builds(builds);
     let count = verdict.affected_revisions;
-    if verdict.failures > 0 {
+    let (title, message) = if verdict.failures > 0 {
         let message = if verdict.ongoing > 0 {
             format!("{count} revision(s) have build failures or ongoing builds:")
         } else {
             format!("{count} revision(s) have build failures:")
         };
-        push_banner(io, "BUILD FAILURES", &message);
+        ("BUILD FAILURES", message)
     } else {
-        push_banner(
-            io,
+        (
             "ONGOING BUILDS",
-            &format!("{count} revision(s) have ongoing builds:"),
-        );
-    }
-    for revision in revisions {
-        io.push_out(&format!("  {} {}\n", revision.monogram, revision.name));
-    }
-    for build in builds {
-        io.push_out(&format!(
-            "  Build {} for {}\n",
-            build.status, build.revision_phid
-        ));
+            format!("{count} revision(s) have ongoing builds:"),
+        )
+    };
+    io.push_out(&format!("** {title} **\n{message}\n\n"));
+    for group in group_problem_builds(builds, &verdict.problems) {
+        let Some(revision) = revisions
+            .iter()
+            .find(|revision| revision.phid == group.revision_phid)
+        else {
+            continue;
+        };
+        let mut view = revision_ref_view(revision);
+        let mut buildable = buildable_ref_view(&group.buildable_monogram, &group.buildable_uri);
+        for build in group.builds {
+            buildable
+                .children
+                .push(build_ref_view(build.build_id, &build.build_name));
+        }
+        view.children.push(buildable);
+        io.push_out(&view.render());
+        io.push_out("\n");
     }
     prompt_for_key(io, finding.prompt, &finding.query)
-}
-
-/// Fail unless the working tree has no changes.
-///
-/// Git reads `git status --porcelain`; Mercurial reads `hg status`. A
-/// dirty tree fails with the port safeguard error (PHP stashes via local
-/// state, which is not ported; see the module docs).
-pub fn ensure_clean_tree(dir: &Path, vcs: Vcs) -> Result<(), String> {
-    let dirty = match vcs {
-        Vcs::Git => !git::stdout_text(dir, &["status", "--porcelain"])?.is_empty(),
-        Vcs::Hg => {
-            let output = hg::stdout_text(dir, &["status"]).unwrap_or_default();
-            !hg::parse_mercurial_status(&output)
-                .map(|map| map.is_empty())
-                .unwrap_or(true)
-        }
-    };
-    if dirty {
-        return Err(
-            "working tree is not clean; commit or stash your changes first (or use --preview)"
-                .to_string(),
-        );
-    }
-    Ok(())
 }
 
 /// Build the offline landed message for one unassociated set.
@@ -4457,13 +5840,13 @@ fn execute_engine(
         io.push_status("PREVIEW", "Completed preview of land operation.");
         return Ok(());
     }
-    ensure_clean_tree(dir, vcs)?;
     prompt_for_key(io, land_checks::PROMPT_CONFIRM, "Land these changes?")?;
     if let Some(client) = online {
         let call = |method: &str, params: &serde_json::Value| {
             client.call(method, params).map_err(|e| e.to_string())
         };
-        confirm_online_gates(io, &call, &sets, &commits)?;
+        let uri = resolve_conduit_uri(options.conduit_uri.as_deref(), dir);
+        confirm_online_gates(io, &call, &sets, &commits, uri.as_deref())?;
     }
     match vcs {
         Vcs::Git => land_git(
@@ -4673,12 +6056,13 @@ fn commit_hash_reader(dir: &Path, vcs: Vcs) -> HashReader<'_> {
 
 /// Confirm the online revision gates: load parents, builds, and the
 /// viewer identity, evaluate every gate, then confirm each finding
-/// interactively.
+/// interactively. `conduit_uri` absolutizes buildable URIs for display.
 fn confirm_online_gates(
     io: &mut Io,
     call: &diff_submit::ConduitCall<'_>,
     sets: &[CommitSet],
     commits: &[LandCommit],
+    conduit_uri: Option<&str>,
 ) -> Result<(), String> {
     let revisions: Vec<land_checks::RevisionView> =
         sets.iter().filter_map(|set| set.revision.clone()).collect();
@@ -4691,7 +6075,7 @@ fn confirm_online_gates(
     });
     let links = fetch_parent_links(call, &revisions)?;
     let landing: Vec<&str> = revisions.iter().map(|rev| rev.phid.as_str()).collect();
-    let builds = fetch_build_views(call, &revisions)?;
+    let builds = fetch_build_views(call, &revisions, conduit_uri)?;
     let findings = land_checks::evaluate_gates(
         &revisions,
         &viewer.phid,
@@ -4703,12 +6087,569 @@ fn confirm_online_gates(
     confirm_revision_gates(io, &revisions, &viewer, &links, &builds, &findings)
 }
 
+/// Saved git state (`ArcanistRepositoryLocalState` plus
+/// `ArcanistGitLocalState.php:6-16`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitLocalState {
+    /// Branch name at save time, or `None` on a detached HEAD.
+    pub local_ref: Option<String>,
+    /// `HEAD` at save time.
+    pub local_commit: String,
+    /// Upstream path of the saved branch, or `None` on a detached HEAD.
+    pub local_path: Option<git::UpstreamPath>,
+    /// A stash entry was saved and must be applied back.
+    pub stashed: bool,
+}
+
+/// Saved Mercurial state (`ArcanistMercurialLocalState.php:6-12`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HgLocalState {
+    /// Working-copy parent at save time.
+    pub local_commit: String,
+    /// Active branch at save time.
+    pub local_branch: String,
+    /// Active bookmark at save time, if any.
+    pub local_bookmark: Option<String>,
+    /// Shelve name, when changes were shelved.
+    pub stash: Option<String>,
+}
+
+/// Uncommitted-status flags per VCS (same values both sides, from
+/// `ArcanistRepositoryAPI.php`; kept separate so each side reads its
+/// own module's constants).
+#[derive(Debug, Clone, Copy)]
+struct ChangeFlags {
+    conflict: u32,
+    externals: u32,
+    untracked: u32,
+    unstaged: u32,
+    uncommitted: u32,
+}
+
+/// Git status flags (`git::FLAG_*`).
+const GIT_CHANGE_FLAGS: ChangeFlags = ChangeFlags {
+    conflict: git::FLAG_CONFLICT,
+    externals: git::FLAG_EXTERNALS,
+    untracked: git::FLAG_UNTRACKED,
+    unstaged: git::FLAG_UNSTAGED,
+    uncommitted: git::FLAG_UNCOMMITTED,
+};
+
+/// Mercurial status flags (`hg::FLAG_*`).
+const HG_CHANGE_FLAGS: ChangeFlags = ChangeFlags {
+    conflict: hg::FLAG_CONFLICT,
+    externals: hg::FLAG_EXTERNALS,
+    untracked: hg::FLAG_UNTRACKED,
+    unstaged: hg::FLAG_UNSTAGED,
+    uncommitted: hg::FLAG_UNCOMMITTED,
+};
+
+/// Sorted paths carrying `mask` in an uncommitted-status map
+/// (`getUntrackedChanges()` and siblings,
+/// `ArcanistRepositoryAPI.php:158-184`).
+fn status_paths(status: &BTreeMap<String, u32>, mask: u32) -> Vec<String> {
+    status
+        .iter()
+        .filter(|(_, flags)| **flags & mask != 0)
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
+/// Uncommitted changes split into the display lists
+/// (`saveLocalState()`, `ArcanistRepositoryLocalState.php:59-134`).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ChangeLists {
+    conflicts: Vec<String>,
+    externals: Vec<String>,
+    untracked: Vec<String>,
+    unstaged: Vec<String>,
+    uncommitted: Vec<String>,
+}
+
+/// Split a status map: unstaged changes exclude externals, and
+/// uncommitted changes exclude both (`:107-134`).
+fn change_lists(status: &BTreeMap<String, u32>, flags: &ChangeFlags) -> ChangeLists {
+    let conflicts = status_paths(status, flags.conflict);
+    let externals = status_paths(status, flags.externals);
+    let untracked = status_paths(status, flags.untracked);
+    let unstaged: Vec<String> = status_paths(status, flags.unstaged)
+        .into_iter()
+        .filter(|path| !externals.contains(path))
+        .collect();
+    let uncommitted: Vec<String> = status_paths(status, flags.uncommitted)
+        .into_iter()
+        .filter(|path| !unstaged.contains(path) && !externals.contains(path))
+        .collect();
+    ChangeLists {
+        conflicts,
+        externals,
+        untracked,
+        unstaged,
+        uncommitted,
+    }
+}
+
+/// Print a local-state banner: the title, the wrapped message, the
+/// working-copy path, and the changed-file lists (`saveLocalState()`,
+/// `:78-96`).
+fn push_state_banner(
+    io: &mut Io,
+    title: &str,
+    message: &str,
+    dir: &Path,
+    lists: &[(&str, &[String])],
+) {
+    io.push_out(&format!(
+        "\n** {title} **\n{}\n\n    Working Copy: {}\n\n{}",
+        console_wrap(message, 0, true),
+        dir.display(),
+        render_file_lists(lists),
+    ));
+}
+
+/// Render changed-file lists (`printFileLists()`, `:372-411`): each
+/// non-empty list prints its title, a blank line, and its indented
+/// paths; lists are blank-line separated with a trailing blank line.
+fn render_file_lists(lists: &[(&str, &[String])]) -> String {
+    let mut out = String::new();
+    let mut first = true;
+    for (title, paths) in lists {
+        if paths.is_empty() {
+            continue;
+        }
+        if !first {
+            out.push('\n');
+        }
+        first = false;
+        out.push_str(title);
+        out.push_str("\n\n");
+        for path in *paths {
+            out.push_str(&format!("    {path}\n"));
+        }
+    }
+    out.push('\n');
+    out
+}
+
+/// Fail on unresolved merge conflicts (`:62-98`).
+///
+/// Like PHP, conflicts print under the `Untracked Changes` list title
+/// (`printFileLists($conflicts, ...)`, `:91-95`).
+fn gate_merge_conflicts(io: &mut Io, dir: &Path, conflicts: &[String]) -> Result<(), String> {
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+    let message = format!(
+        "You have unresolved merge conflicts (\"{}\") in this working copy.",
+        conflicts.len()
+    );
+    push_state_banner(
+        io,
+        "MERGE CONFLICTS",
+        &message,
+        dir,
+        &[
+            ("Untracked Changes", conflicts),
+            ("Unstaged Changes", &[]),
+            ("Uncommitted Changes", &[]),
+        ],
+    );
+    Err("Resolve merge conflicts before proceeding.".to_string())
+}
+
+/// Confirm past dirty externals (`:103-132`): the wrapped message, a
+/// blank line, each external as a `- ` item, then a default-yes confirm.
+fn confirm_dirty_externals(io: &mut Io, externals: &[String]) -> Result<(), String> {
+    let message = format!(
+        "Some external changes (\"{}\") have uncommitted changes:",
+        externals.len()
+    );
+    io.push_out(&format!("{}\n\n", console_wrap(&message, 0, true)));
+    for external in externals {
+        io.push_out(&format!("      - {external}\n"));
+    }
+    io.push_out("\n");
+    let prompt = "These external changes have uncommitted changes, but the external changes will \
+                  not be stashed. They will remain in the working copy. Continue?";
+    if console_confirm(io, prompt, false)? {
+        Ok(())
+    } else {
+        Err(ABORT.to_string())
+    }
+}
+
+/// Print the uncommitted-changes banner with file lists and ignore hints
+/// (`:135-190`). Returns true when changes need stashing.
+fn push_uncommitted_banner(
+    io: &mut Io,
+    dir: &Path,
+    lists: &ChangeLists,
+    ignore_hint: &str,
+) -> bool {
+    let total = lists.untracked.len() + lists.unstaged.len() + lists.uncommitted.len();
+    if total == 0 {
+        return false;
+    }
+    let message = format!(
+        "You have uncommitted changes in this working copy: these {total} change(s) are not part \
+         of any commit."
+    );
+    push_state_banner(
+        io,
+        "UNCOMMITTED CHANGES",
+        &message,
+        dir,
+        &[
+            ("Untracked Changes", &lists.untracked),
+            ("Unstaged Changes", &lists.unstaged),
+            ("Uncommitted Changes", &lists.uncommitted),
+        ],
+    );
+    io.push_out(&render_hint(ignore_hint));
+    io.push_out("\n");
+    true
+}
+
+/// Save git working-copy state, stashing uncommitted changes after
+/// prompting (`saveLocalState()`, `:59-231`, with the git halves).
+///
+/// The `SAVE STATE` trace line is not printed: PHP only shows trace
+/// output with tracing enabled. Failures before capture (conflicts,
+/// stashing) propagate without restoring, like PHP.
+pub fn save_local_state_git(dir: &Path, io: &mut Io) -> Result<GitLocalState, String> {
+    let status = git::uncommitted_status(dir)?;
+    let lists = change_lists(&status, &GIT_CHANGE_FLAGS);
+    gate_merge_conflicts(io, dir, &lists.conflicts)?;
+    if !lists.externals.is_empty() {
+        confirm_dirty_externals(io, &lists.externals)?;
+    }
+    let mut stashed = false;
+    if push_uncommitted_banner(
+        io,
+        dir,
+        &lists,
+        "To configure Git to ignore certain files in this working copy, add the file paths to \
+         \".git/info/exclude\".",
+    ) {
+        prompt_for_key(
+            io,
+            land_checks::PROMPT_STASH,
+            "Stash these changes and continue?",
+        )?;
+        git::stdout_text(dir, &["stash", "push", "--include-untracked", "--"])?;
+        io.push_status("SAVE STASH", "Saved uncommitted changes from working copy.");
+        stashed = true;
+    }
+    let local_commit = git::working_copy_revision(dir)?;
+    let branch = git::branch_name(dir)?;
+    let local_path = match &branch {
+        Some(name) => Some(git::get_path_to_upstream(dir, name)?),
+        None => None,
+    };
+    Ok(GitLocalState {
+        local_ref: branch,
+        local_commit,
+        local_path,
+        stashed,
+    })
+}
+
+/// Save Mercurial working-copy state, driving `hg` through the system
+/// binary (see [`save_local_state_hg_with`]).
+pub fn save_local_state_hg(dir: &Path, io: &mut Io) -> Result<HgLocalState, String> {
+    save_local_state_hg_with(dir, &hg::HgCommand::system(), io)
+}
+
+/// Save Mercurial working-copy state, stashing uncommitted changes
+/// after prompting (`saveLocalState()`, `:59-231`, with the Mercurial
+/// halves), driving `hg` through `hg_cmd` (test seam).
+pub fn save_local_state_hg_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    io: &mut Io,
+) -> Result<HgLocalState, String> {
+    let status = hg::get_uncommitted_status_with(dir, hg_cmd)?;
+    let lists = change_lists(&status, &HG_CHANGE_FLAGS);
+    gate_merge_conflicts(io, dir, &lists.conflicts)?;
+    if !lists.externals.is_empty() {
+        confirm_dirty_externals(io, &lists.externals)?;
+    }
+    let mut stash = None;
+    if push_uncommitted_banner(
+        io,
+        dir,
+        &lists,
+        "To configure Mercurial to ignore certain files in the working copy, add them to \
+         \".hgignore\".",
+    ) {
+        if !hg::mercurial_feature_supported_with(dir, hg_cmd, "shelve").unwrap_or(false) {
+            return Err(
+                "You can not continue with uncommitted changes in the working copy. \
+                        Shelving is not supported, and these changes prevent \"arc land\" from \
+                        operating safely. Commit or discard these changes to continue."
+                    .to_string(),
+            );
+        }
+        prompt_for_key(
+            io,
+            land_checks::PROMPT_STASH,
+            "Stash these changes and continue?",
+        )?;
+        let name = new_shelve_name();
+        hg::exec_with_extension_with(
+            dir,
+            hg_cmd,
+            "shelve",
+            &["shelve", "--unknown", "--name", &name, "--"],
+            None,
+        )?;
+        io.push_status("SHELVE", "Shelving uncommitted changes from working copy.");
+        stash = Some(name);
+    }
+    let local_commit = hg::stdout_text_with(
+        dir,
+        hg_cmd,
+        &["log", "-l", "1", "--template", "{node}", "-r", "."],
+    )?;
+    let branch = hg::stdout_text_with(dir, hg_cmd, &["branch"])?;
+    let bookmarks = hg::stdout_text_with(dir, hg_cmd, &["bookmarks"]).unwrap_or_default();
+    let local_bookmark = parse_hg_bookmarks(&bookmarks)
+        .into_iter()
+        .find(|(_, active)| *active)
+        .map(|(name, _)| name);
+    Ok(HgLocalState {
+        local_commit: local_commit.trim().to_string(),
+        local_branch: branch.trim().to_string(),
+        local_bookmark,
+        stash,
+    })
+}
+
+/// `arc-` plus 12 random `[a-z2-7]` characters, like
+/// `Filesystem::readRandomCharacters(12)`
+/// (`src/filesystem/Filesystem.php:538-558`).
+fn new_shelve_name() -> String {
+    const MAP: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        ^ (std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut state = seed | 1;
+    let mut name = String::from("arc-");
+    for _ in 0..12 {
+        // xorshift64*; the high 5 bits index the map, like PHP.
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let byte = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        name.push(MAP[(byte >> 59) as usize] as char);
+    }
+    name
+}
+
+/// Restore saved git state (`restoreLocalState()`, `:248-282`): check
+/// the saved ref or commit back out, update submodules, then apply the
+/// stash back.
+pub fn restore_local_state_git(
+    dir: &Path,
+    io: &mut Io,
+    state: &GitLocalState,
+) -> Result<(), String> {
+    match &state.local_ref {
+        Some(reference) => {
+            io.push_status(
+                "LOAD STATE",
+                &format!(
+                    "Restoring local state (to ref \"{reference}\" at commit \"{}\").",
+                    git::display_hash(&state.local_commit)
+                ),
+            );
+            git::stdout_text(
+                dir,
+                &["checkout", "-B", reference, &state.local_commit, "--"],
+            )?;
+        }
+        None => {
+            io.push_status(
+                "LOAD STATE",
+                &format!(
+                    "Restoring local state (to detached commit \"{}\").",
+                    git::display_hash(&state.local_commit)
+                ),
+            );
+            git::stdout_text(dir, &["checkout", &state.local_commit, "--"])?;
+        }
+    }
+    git::stdout_text(dir, &["submodule", "update", "--init", "--recursive"])?;
+    apply_stash_git(dir, io, state)
+}
+
+/// Apply the saved stash back and drop it (`applyStash()` plus
+/// `restoreStash()`/`discardStash()`, `:294-327`).
+fn apply_stash_git(dir: &Path, io: &mut Io, state: &GitLocalState) -> Result<(), String> {
+    if !state.stashed {
+        return Ok(());
+    }
+    io.push_status(
+        "LOAD STASH",
+        "Restoring uncommitted changes to working copy.",
+    );
+    git::stdout_text(dir, &["stash", "apply"])?;
+    git::stdout_text(dir, &["stash", "drop"])?;
+    Ok(())
+}
+
+/// Discard saved git state (`discardLocalState()`, `:334-358`): apply
+/// the stash back; on failure restore first, then report the original
+/// error.
+pub fn discard_local_state_git(
+    dir: &Path,
+    io: &mut Io,
+    state: &GitLocalState,
+) -> Result<(), String> {
+    match apply_stash_git(dir, io, state) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            restore_local_state_git(dir, io, state)?;
+            Err(err)
+        }
+    }
+}
+
+/// Restore commands for display (`newRestoreCommandsForDisplay()`,
+/// `ArcanistGitLocalState.php:86-108`).
+pub fn git_restore_commands(state: &GitLocalState) -> Vec<String> {
+    match &state.local_ref {
+        Some(reference) => vec![format!(
+            "git checkout -B {reference} {} --",
+            git::display_hash(&state.local_commit)
+        )],
+        None => vec![format!(
+            "git checkout {} --",
+            git::display_hash(&state.local_commit)
+        )],
+    }
+}
+
+/// Restore saved Mercurial state, driving `hg` through the system
+/// binary (see [`restore_local_state_hg_with`]).
+pub fn restore_local_state_hg(dir: &Path, io: &mut Io, state: &HgLocalState) -> Result<(), String> {
+    restore_local_state_hg_with(dir, &hg::HgCommand::system(), io, state)
+}
+
+/// Restore saved Mercurial state (`restoreLocalState()`, `:248-282`,
+/// with `ArcanistMercurialLocalState.php:90-115`), driving `hg` through
+/// `hg_cmd` (test seam).
+pub fn restore_local_state_hg_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    io: &mut Io,
+    state: &HgLocalState,
+) -> Result<(), String> {
+    match &state.local_bookmark {
+        Some(bookmark) => io.push_status(
+            "LOAD STATE",
+            &format!(
+                "Restoring local state (at \"{}\" on branch \"{}\", bookmarked as \
+                 \"{bookmark}\").",
+                display_hash_12(&state.local_commit),
+                state.local_branch
+            ),
+        ),
+        None => io.push_status(
+            "LOAD STATE",
+            &format!(
+                "Restoring local state (at \"{}\" on branch \"{}\").",
+                display_hash_12(&state.local_commit),
+                state.local_branch
+            ),
+        ),
+    }
+    hg::stdout_text_with(dir, hg_cmd, &["update", "--", &state.local_commit])?;
+    hg::stdout_text_with(
+        dir,
+        hg_cmd,
+        &["branch", "--force", "--", &state.local_branch],
+    )?;
+    if let Some(bookmark) = &state.local_bookmark {
+        hg::stdout_text_with(dir, hg_cmd, &["bookmark", "--force", "--", bookmark])?;
+    }
+    apply_shelve_with(dir, hg_cmd, io, state)
+}
+
+/// Unshelve saved changes and delete the shelf (`applyStash()` plus
+/// `restoreStash()`/`discardStash()`, `:294-327`).
+fn apply_shelve_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    io: &mut Io,
+    state: &HgLocalState,
+) -> Result<(), String> {
+    let Some(name) = &state.stash else {
+        return Ok(());
+    };
+    io.push_status("UNSHELVE", "Restoring uncommitted changes to working copy.");
+    hg::exec_with_extension_with(
+        dir,
+        hg_cmd,
+        "shelve",
+        &["unshelve", "--keep", "--name", name, "--"],
+        None,
+    )?;
+    hg::exec_with_extension_with(
+        dir,
+        hg_cmd,
+        "shelve",
+        &["shelve", "--delete", name, "--"],
+        None,
+    )?;
+    Ok(())
+}
+
+/// Discard saved Mercurial state, driving `hg` through the system
+/// binary (see [`discard_local_state_hg_with`]).
+pub fn discard_local_state_hg(dir: &Path, io: &mut Io, state: &HgLocalState) -> Result<(), String> {
+    discard_local_state_hg_with(dir, &hg::HgCommand::system(), io, state)
+}
+
+/// Discard saved Mercurial state (`discardLocalState()`, `:334-358`),
+/// driving `hg` through `hg_cmd` (test seam).
+pub fn discard_local_state_hg_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    io: &mut Io,
+    state: &HgLocalState,
+) -> Result<(), String> {
+    match apply_shelve_with(dir, hg_cmd, io, state) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            restore_local_state_hg_with(dir, hg_cmd, io, state)?;
+            Err(err)
+        }
+    }
+}
+
+/// Restore commands for display (`newRestoreCommandsForDisplay()`,
+/// `ArcanistMercurialLocalState.php:134-153`).
+pub fn hg_restore_commands(state: &HgLocalState) -> Vec<String> {
+    let mut commands = vec![
+        format!("hg update -- {}", display_hash_12(&state.local_commit)),
+        format!("hg branch --force -- {}", state.local_branch),
+    ];
+    if let Some(bookmark) = &state.local_bookmark {
+        commands.push(format!("hg bookmark --force -- {bookmark}"));
+    }
+    commands
+}
+
 /// Run the git merge/push loop
 /// (`ArcanistLandEngine.php:1234-1332`, git halves).
 ///
-/// Merges every set, pushing per `--hold`/`--incremental`, cascading and
-/// pruning after each push, then reconciles (or prints hold instructions)
-/// and `DONE`. Failures check the original ref back out best-effort.
+/// Saves local state first, merges every set (pushing per
+/// `--hold`/`--incremental`), cascades and prunes after each push,
+/// then reconciles (or prints hold instructions) and `DONE`. Failures
+/// restore the saved state before propagating.
 #[allow(clippy::too_many_arguments)]
 fn land_git(
     dir: &Path,
@@ -4724,10 +6665,7 @@ fn land_git(
     commits: &[LandCommit],
     online: Option<&arc_rs::conduit::Client>,
 ) -> Result<(), String> {
-    let original = git::branch_name(dir)
-        .ok()
-        .flatten()
-        .or_else(|| git::working_copy_revision(dir).ok());
+    let state = save_local_state_git(dir, io)?;
     let outcome = land_git_inner(
         dir,
         io,
@@ -4741,14 +6679,15 @@ fn land_git(
         sets,
         commits,
         online,
-        original.as_deref(),
+        &state,
     );
-    if outcome.is_err()
-        && let Some(restore) = original.as_deref()
-    {
-        git::output(dir, &["checkout", restore, "--"]).ok();
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            restore_local_state_git(dir, io, &state)?;
+            Err(err)
+        }
     }
-    outcome
 }
 
 /// The git merge/push loop proper (see [`land_git`]).
@@ -4766,10 +6705,9 @@ fn land_git_inner(
     sets: &[CommitSet],
     commits: &[LandCommit],
     online: Option<&arc_rs::conduit::Client>,
-    original: Option<&str>,
+    state: &GitLocalState,
 ) -> Result<(), String> {
     let mut cursor = into_commit.map(str::to_string);
-    let mut has_unpushed = false;
     let mut need_cascade: Vec<CommitSet> = Vec::new();
     let mut need_prune: Vec<CommitSet> = Vec::new();
     let mut deleted: Vec<String> = Vec::new();
@@ -4785,10 +6723,9 @@ fn land_git_inner(
             commits,
             cursor.as_deref(),
             squash,
-            has_unpushed,
+            options.incremental,
             &message_of,
         )?);
-        has_unpushed = true;
         let should_push = if options.hold {
             false
         } else if options.incremental {
@@ -4797,14 +6734,17 @@ fn land_git_inner(
             index == last
         };
         if should_push {
-            git_push_change(
-                dir,
-                io,
-                onto_remote,
-                onto_refs,
-                cursor_or(cursor.as_deref()),
-            )?;
-            has_unpushed = false;
+            if git_is_perforce_remote(dir, onto_remote) {
+                git_p4_submit(dir, io, onto_remote, cursor_or(cursor.as_deref()))?;
+            } else {
+                git_push_change(
+                    dir,
+                    io,
+                    onto_remote,
+                    onto_refs,
+                    cursor_or(cursor.as_deref()),
+                )?;
+            }
             need_cascade.reverse();
             for cascade_set in &need_cascade {
                 git_cascade_state(
@@ -4824,20 +6764,41 @@ fn land_git_inner(
         }
     }
     if options.hold {
-        let restore: Vec<String> = original
-            .map(|name| format!("git checkout {name} --"))
-            .into_iter()
-            .collect();
+        let restore = git_restore_commands(state);
+        let perforce = git_is_perforce_remote(dir, onto_remote);
         git_hold_text(
             io,
             onto_remote,
             onto_refs,
             cursor_or(cursor.as_deref()),
             &restore,
+            perforce,
         );
+        discard_local_state_git(dir, io, state)?;
         return Ok(());
     }
-    git_reconcile(dir, original, into_ref, onto_refs, &deleted);
+    if git_is_perforce_remote(dir, onto_remote) {
+        git_reconcile_perforce(
+            dir,
+            io,
+            state,
+            into_ref,
+            onto_refs,
+            &deleted,
+            cursor_or(cursor.as_deref()),
+        )?;
+    } else {
+        git_reconcile(
+            dir,
+            io,
+            state,
+            cursor_or(cursor.as_deref()),
+            into_ref,
+            onto_remote,
+            onto_refs,
+            &deleted,
+        )?;
+    }
     io.push_status("DONE", "Landed changes.");
     Ok(())
 }
@@ -4891,15 +6852,9 @@ fn land_hg(
     commits: &[LandCommit],
     online: Option<&arc_rs::conduit::Client>,
 ) -> Result<(), String> {
-    let local_commit = hg::stdout_text(dir, &["log", "-l", "1", "--template", "{node}", "-r", "."])
-        .unwrap_or_default();
-    let bookmarks = hg::stdout_text(dir, &["bookmarks"]).unwrap_or_default();
-    let local_bookmark = parse_hg_bookmarks(&bookmarks)
-        .into_iter()
-        .find(|(_, active)| *active)
-        .map(|(name, _)| name);
-    let outcome = land_hg_inner(
+    land_hg_with(
         dir,
+        &hg::HgCommand::system(),
         io,
         options,
         squash,
@@ -4911,17 +6866,18 @@ fn land_hg(
         sets,
         commits,
         online,
-    );
-    if outcome.is_err() {
-        hg_reconcile(dir, &local_commit, local_bookmark.as_deref());
-    }
-    outcome
+    )
 }
 
-/// The Mercurial merge/push loop proper (see [`land_hg`]).
+/// Run the Mercurial merge/push loop, driving `hg` through `hg_cmd`
+/// (test seam).
+///
+/// Saves local state first; failures restore the saved state before
+/// propagating (`ArcanistLandEngine.php:1227-1332`, hg halves).
 #[allow(clippy::too_many_arguments)]
-fn land_hg_inner(
+pub fn land_hg_with(
     dir: &Path,
+    hg_cmd: &hg::HgCommand,
     io: &mut Io,
     options: &Options,
     squash: bool,
@@ -4933,6 +6889,50 @@ fn land_hg_inner(
     sets: &[CommitSet],
     commits: &[LandCommit],
     online: Option<&arc_rs::conduit::Client>,
+) -> Result<(), String> {
+    let state = save_local_state_hg_with(dir, hg_cmd, io)?;
+    let outcome = land_hg_inner_with(
+        dir,
+        hg_cmd,
+        io,
+        options,
+        squash,
+        raw_symbols,
+        onto_remote,
+        onto_refs,
+        into_commit,
+        branch_marker,
+        sets,
+        commits,
+        online,
+        &state,
+    );
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            restore_local_state_hg_with(dir, hg_cmd, io, &state)?;
+            Err(err)
+        }
+    }
+}
+
+/// The Mercurial merge/push loop proper (see [`land_hg_with`]).
+#[allow(clippy::too_many_arguments)]
+fn land_hg_inner_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    io: &mut Io,
+    options: &Options,
+    squash: bool,
+    raw_symbols: &[String],
+    onto_remote: &str,
+    onto_refs: &[String],
+    into_commit: Option<&str>,
+    branch_marker: Option<&str>,
+    sets: &[CommitSet],
+    commits: &[LandCommit],
+    online: Option<&arc_rs::conduit::Client>,
+    state: &HgLocalState,
 ) -> Result<(), String> {
     let push_bookmarks: Vec<String> = onto_refs
         .iter()
@@ -4947,8 +6947,9 @@ fn land_hg_inner(
         need_prune.push(set.clone());
         need_cascade.push(set.clone());
         let message_of = git_message_closure(raw_symbols, onto_refs, commits, online);
-        let merged = hg_execute_merge(
+        let merged = hg_execute_merge_with(
             dir,
+            hg_cmd,
             io,
             set,
             commits,
@@ -4966,8 +6967,9 @@ fn land_hg_inner(
             index == last
         };
         if should_push {
-            hg_push_change(
+            hg_push_change_with(
                 dir,
+                hg_cmd,
                 io,
                 onto_remote,
                 &push_bookmarks,
@@ -4975,8 +6977,9 @@ fn land_hg_inner(
             )?;
             need_cascade.reverse();
             for cascade_set in &need_cascade {
-                hg_cascade_state(
+                hg_cascade_state_with(
                     dir,
+                    hg_cmd,
                     cascade_set,
                     commits,
                     cursor_or(cursor.as_deref()),
@@ -4985,32 +6988,30 @@ fn land_hg_inner(
             }
             need_cascade.clear();
             if !options.keep_branches {
-                hg_prune_branches(dir, io, &need_prune, commits)?;
+                hg_prune_branches_with(dir, hg_cmd, io, &need_prune, commits)?;
                 need_prune.clear();
             }
         }
     }
     if options.hold {
-        let local_commit =
-            hg::stdout_text(dir, &["log", "-l", "1", "--template", "{node}", "-r", "."])
-                .unwrap_or_default();
+        let restore = hg_restore_commands(state);
         hg_hold_text(
             io,
             &push_bookmarks,
             onto_remote,
             cursor_or(cursor.as_deref()),
-            &[format!("hg update -- {local_commit}")],
+            &restore,
         );
+        discard_local_state_hg_with(dir, hg_cmd, io, state)?;
         return Ok(());
     }
-    let local_commit = hg::stdout_text(dir, &["log", "-l", "1", "--template", "{node}", "-r", "."])
-        .unwrap_or_default();
-    let bookmarks = hg::stdout_text(dir, &["bookmarks"]).unwrap_or_default();
-    let local_bookmark = parse_hg_bookmarks(&bookmarks)
-        .into_iter()
-        .find(|(_, active)| *active)
-        .map(|(name, _)| name);
-    hg_reconcile(dir, &local_commit, local_bookmark.as_deref());
+    hg_reconcile_with(
+        dir,
+        hg_cmd,
+        &state.local_commit,
+        state.local_bookmark.as_deref(),
+    );
+    discard_local_state_hg_with(dir, hg_cmd, io, state)?;
     io.push_status("DONE", "Landed changes.");
     Ok(())
 }
@@ -5033,6 +7034,16 @@ pub fn execute_with_io(dir: &Path, argv: &[String], io: &mut Io) -> Result<Out, 
     };
     for (key, answer) in load_saved_prompts(dir) {
         io.saved.entry(key).or_insert(answer);
+    }
+    if io.config_writer.is_none() {
+        let metadata = match vcs {
+            Vcs::Git => ".git",
+            Vcs::Hg => ".hg",
+        };
+        io.config_writer = Some(ConfigWriter {
+            user_path: config::arcrc_path(),
+            local_path: Some(dir.join(metadata).join("arc").join("config")),
+        });
     }
     let validated = validate_options(&options, dir, io)?;
     execute_engine(dir, &options, vcs, &validated, io)?;

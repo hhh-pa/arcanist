@@ -194,6 +194,19 @@ pub struct BuildView {
     /// buildable `objectPHID` -> revision `diffPHID`,
     /// `ArcanistLandEngine.php:623-644`).
     pub revision_phid: String,
+    /// Build `id`, for the `Build {id}` ref-view object name
+    /// (`ArcanistBuildRef.php:16-18`); 0 when the row has no id (PHP
+    /// formats null with `%d`).
+    pub build_id: i64,
+    /// `fields.name`, the build ref-view title
+    /// (`ArcanistBuildRef.php:38-42`).
+    pub build_name: String,
+    /// Owning buildable `B{id}` monogram
+    /// (`ArcanistBuildableRef.php:41-43`); `B` when the row has no id.
+    pub buildable_monogram: String,
+    /// Owning buildable URI, absolutized like
+    /// `ArcanistWorkflow::getAbsoluteURI()` (`ArcanistWorkflow.php:2423`).
+    pub buildable_uri: String,
 }
 
 /// Outcome of `confirmBuilds` filtering
@@ -442,10 +455,22 @@ pub fn parse_build(
             .unwrap_or(PLAN_ALWAYS)
             .to_string()
     });
+    // `parse_build` sees only the build row: the buildable display
+    // fields stay empty and the caller fills them from the buildable
+    // row (like `fetch_build_views` does).
     BuildView {
         status: status.to_string(),
         plan_behavior,
         revision_phid: revision_phid.to_string(),
+        build_id: build_json.get("id").and_then(json_i64).unwrap_or(0),
+        build_name: build_json
+            .get("fields")
+            .and_then(|fields| fields.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        buildable_monogram: String::new(),
+        buildable_uri: String::new(),
     }
 }
 
@@ -685,9 +710,14 @@ pub const PROMPT_IMPLICIT: &str = "arc.land.implicit";
 /// (`ArcanistGitLandEngine.php:1029`,
 /// `ArcanistMercurialLandEngine.php:377`).
 pub const PROMPT_CREATE: &str = "arc.land.create";
+/// Prompt for stashing uncommitted changes before landing
+/// (`ArcanistWorkflow.php:2350-2351`, asked by
+/// `ArcanistRepositoryLocalState::saveLocalState()`, `:209-230`).
+pub const PROMPT_STASH: &str = "arc.state.stash";
 
 /// Description of every `arc land` prompt, verbatim from `newPrompts()`
-/// (`ArcanistLandWorkflow.php:237-289`).
+/// (`ArcanistLandWorkflow.php:237-289`; `arc.state.stash` from
+/// `ArcanistWorkflow.php:2350-2351`).
 ///
 /// Shown by the `?` prompt help (`ArcanistPrompt.php:191-231`). Returns
 /// `None` for unknown keys.
@@ -714,6 +744,10 @@ pub fn prompt_description(key: &str) -> Option<&'static str> {
         PROMPT_CREATE => {
             Some("Confirms that new branches or bookmarks should be created in the remote.")
         }
+        PROMPT_STASH => Some(
+            "Prompts the user to stash changes and continue when the working copy has untracked, \
+             uncommitted, or unstaged changes.",
+        ),
         _ => None,
     }
 }

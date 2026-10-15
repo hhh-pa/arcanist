@@ -677,13 +677,15 @@ fn gap2_create_message_loop_reedits_then_succeeds() {
     assert_eq!(*calls.borrow(), 2);
     assert_eq!(message.raw_corpus, "Good title\n");
     let text = String::from_utf8(out).unwrap();
-    assert!(text.contains(diff_local::COMMIT_MESSAGE_HAS_ERRORS), "{text}");
+    assert!(
+        text.contains(diff_local::COMMIT_MESSAGE_HAS_ERRORS),
+        "{text}"
+    );
     assert!(text.contains("Title is required."), "{text}");
     assert!(text.contains(diff_local::MUST_RESOLVE_ERRORS), "{text}");
     // The final draft lands in the scratch file.
     assert_eq!(
-        diff::read_scratch_file(&meta, diff_local::SCRATCH_CREATE_MESSAGE)
-            .as_deref(),
+        diff::read_scratch_file(&meta, diff_local::SCRATCH_CREATE_MESSAGE).as_deref(),
         Some("Good title\n")
     );
 }
@@ -711,7 +713,10 @@ fn gap2_saved_template_resume_roundtrip() {
     assert_eq!(reused.as_deref(), Some("Saved title\n"));
     let text = String::from_utf8(out).unwrap();
     assert!(text.contains("You have a saved revision message"), "{text}");
-    assert!(text.contains(diff_local::PROMPT_USE_SAVED_MESSAGE), "{text}");
+    assert!(
+        text.contains(diff_local::PROMPT_USE_SAVED_MESSAGE),
+        "{text}"
+    );
 }
 
 /* Gap2 D3: clean working-copy check over seams. */
@@ -745,8 +750,10 @@ fn gap2_clean_check_commits_unstaged() {
         amend_commit: None,
         edit: &edit,
     };
-    let mut changes = diff_local::WorkingCopyChanges::default();
-    changes.unstaged = vec!["s.txt".to_string()];
+    let changes = diff_local::WorkingCopyChanges {
+        unstaged: vec!["s.txt".to_string()],
+        ..Default::default()
+    };
 
     let mut out = Vec::new();
     let outcome = diff_local::require_clean_working_copy(
@@ -761,7 +768,10 @@ fn gap2_clean_check_commits_unstaged() {
     assert_eq!(added.borrow().as_slice(), ["s.txt".to_string()]);
     assert_eq!(committed.borrow().as_slice(), ["Msg\n".to_string()]);
     let text = String::from_utf8(out).unwrap();
-    assert!(text.contains(diff_local::UNCOMMITTED_CHANGES_HERE), "{text}");
+    assert!(
+        text.contains(diff_local::UNCOMMITTED_CHANGES_HERE),
+        "{text}"
+    );
 }
 
 #[test]
@@ -783,8 +793,10 @@ fn gap2_clean_check_fatal_conflicts() {
         amend_commit: None,
         edit: &edit,
     };
-    let mut changes = diff_local::WorkingCopyChanges::default();
-    changes.conflicts = vec!["c.txt".to_string()];
+    let changes = diff_local::WorkingCopyChanges {
+        conflicts: vec!["c.txt".to_string()],
+        ..Default::default()
+    };
 
     let mut out = Vec::new();
     let err = diff_local::require_clean_working_copy(

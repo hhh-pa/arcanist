@@ -80,7 +80,9 @@ fn conduit_field_value(value: &serde_json::Value) -> FieldValue {
             items
                 .iter()
                 .map(|item| {
-                    item.as_str().map(str::to_string).unwrap_or_else(|| item.to_string())
+                    item.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| item.to_string())
                 })
                 .collect(),
         ),
@@ -5027,6 +5029,11 @@ pub fn validate_commit_message<R: BufRead, W: Write>(
     validate_reviewer_availability(reader, writer, call, &reviewers, away_offset)
 }
 
+/// Commit hook: message text to outcome (`doCommit()`/`amendCommit()`).
+pub type MessageHook<'a> = &'a dyn Fn(&str) -> Result<(), String>;
+/// Add-to-commit hook: paths to outcome (`addToCommit()`).
+pub type PathsHook<'a> = &'a dyn Fn(&[String]) -> Result<(), String>;
+
 /// Seams plus context for the create-message edit loop.
 pub struct CreateMessageEditor<'a, R: BufRead, W: Write> {
     /// Prompt input.
@@ -5043,7 +5050,7 @@ pub struct CreateMessageEditor<'a, R: BufRead, W: Write> {
     pub edit: &'a dyn Fn(&str) -> Result<String, String>,
     /// Amend hook when a single worktree commit absorbs the message
     /// (`shouldAmend()`); `None` saves to scratch instead.
-    pub amend_commit: Option<&'a dyn Fn(&str) -> Result<(), String>>,
+    pub amend_commit: Option<MessageHook<'a>>,
     /// Viewer PHID (ownership checks).
     pub user_phid: &'a str,
     /// Server-tz offset seconds (away-reviewer dates).
@@ -5063,8 +5070,7 @@ fn attempt_message<R: BufRead, W: Write>(
     editor: &mut CreateMessageEditor<'_, R, W>,
     template: &str,
 ) -> Result<CommitMessage, AttemptError> {
-    let mut message =
-        CommitMessage::new_from_raw_corpus(template).map_err(AttemptError::Other)?;
+    let mut message = CommitMessage::new_from_raw_corpus(template).map_err(AttemptError::Other)?;
     message
         .pull_data_from_conduit(editor.call, false)
         .map_err(|error| match error {
@@ -5139,8 +5145,8 @@ fn save_message_draft<R: BufRead, W: Write>(
     template: &str,
 ) -> Result<(bool, Option<String>), String> {
     if let Some(amend) = editor.amend_commit {
-        let wrote =
-            old_message.trim_end_matches(PHP_TRIM_CHARS) != template.trim_end_matches(PHP_TRIM_CHARS);
+        let wrote = old_message.trim_end_matches(PHP_TRIM_CHARS)
+            != template.trim_end_matches(PHP_TRIM_CHARS);
         if wrote {
             amend(template)?;
             return Ok((true, Some(WHERE_COMMIT_MESSAGE.to_string())));
@@ -5150,16 +5156,17 @@ fn save_message_draft<R: BufRead, W: Write>(
     let wrote = diff::write_scratch_file(editor.metadata_dir, SCRATCH_CREATE_MESSAGE, template);
     let where_path = format!(
         "'{}'",
-        diff::readable_scratch_file_path(editor.metadata_dir, editor.work_root, SCRATCH_CREATE_MESSAGE)
+        diff::readable_scratch_file_path(
+            editor.metadata_dir,
+            editor.work_root,
+            SCRATCH_CREATE_MESSAGE
+        )
     );
     Ok((wrote, Some(where_path)))
 }
 
 /// Echo the saved-copy note for a fatal loop error (`:1546-1550`).
-fn echo_saved_copy_note<W: Write>(
-    writer: &mut W,
-    where_path: &str,
-) -> Result<(), String> {
+fn echo_saved_copy_note<W: Write>(writer: &mut W, where_path: &str) -> Result<(), String> {
     let note = diff::console_wrap(&format!("{}\n", message_saved_to(where_path)), 0, true);
     writer
         .write_all(note.as_bytes())
@@ -5211,10 +5218,8 @@ pub fn edit_create_message<R: BufRead, W: Write>(
                 )?;
             }
             Err(AttemptError::Other(error)) => {
-                if wrote {
-                    if let Some(where_path) = where_path {
-                        echo_saved_copy_note(&mut *editor.writer, &where_path)?;
-                    }
+                if wrote && let Some(where_path) = where_path {
+                    echo_saved_copy_note(&mut *editor.writer, &where_path)?;
                 }
                 return Err(error);
             }
@@ -5287,7 +5292,11 @@ pub fn get_default_create_fields_with(
         ));
     }
     for info in local {
-        messages.push((info.commit.clone(), info.message.clone(), info.summary.clone()));
+        messages.push((
+            info.commit.clone(),
+            info.message.clone(),
+            info.summary.clone(),
+        ));
     }
     let mut included = Vec::new();
     for (hash, _, summary) in &messages {
@@ -5353,8 +5362,7 @@ pub fn get_commit_message_from_revision_with<R: BufRead, W: Write>(
         return Err(diff_submit::unknown_revision_message(revision_id));
     }
     check_revision_ownership(reader, writer, &row, user_phid)?;
-    let is_draft =
-        row.get("statusName").and_then(serde_json::Value::as_str) == Some("Draft");
+    let is_draft = row.get("statusName").and_then(serde_json::Value::as_str) == Some("Draft");
     let params = diff_submit::get_commit_message_edit_params(id_arg);
     let template = call(diff_submit::METHOD_GET_COMMIT_MESSAGE, &params)?;
     let Some(corpus) = template.as_str() else {
@@ -5427,7 +5435,9 @@ pub fn resolve_message_source(
         return Ok(MessageSource::CreateFromUser);
     }
     match update {
-        Some(id) => Ok(MessageSource::UpdateFromRevision(parse_update_revision_id(id)?)),
+        Some(id) => Ok(MessageSource::UpdateFromRevision(parse_update_revision_id(
+            id,
+        )?)),
         // Unreachable: `!create && update.is_none()` returned above.
         None => Ok(MessageSource::CreateFromUser),
     }
@@ -5702,11 +5712,7 @@ pub fn ignore_untracked_prompt(count: usize) -> String {
 /// Unstaged list echo: the header carries two leading spaces (`:1175-1180`).
 #[must_use]
 pub fn unstaged_list_echo(unstaged: &[String]) -> String {
-    format!(
-        "  {}\n    {}",
-        UNSTAGED_CHANGES_IN,
-        unstaged.join("\n    ")
-    )
+    format!("  {}\n    {}", UNSTAGED_CHANGES_IN, unstaged.join("\n    "))
 }
 
 /// Uncommitted list echo: no header indent (`:1183-1188`).
@@ -5809,13 +5815,13 @@ pub struct CleanCheckVcs<'a> {
     /// Head local-commit message, when amending may apply.
     pub head_commit_message: Option<String>,
     /// `addToCommit()`.
-    pub add_to_commit: Option<&'a dyn Fn(&[String]) -> Result<(), String>>,
+    pub add_to_commit: Option<PathsHook<'a>>,
     /// `stashChanges()`.
     pub stash_changes: Option<&'a dyn Fn() -> Result<(), String>>,
     /// `doCommit()`.
-    pub do_commit: Option<&'a dyn Fn(&str) -> Result<(), String>>,
+    pub do_commit: Option<MessageHook<'a>>,
     /// `amendCommit()`.
-    pub amend_commit: Option<&'a dyn Fn(&str) -> Result<(), String>>,
+    pub amend_commit: Option<MessageHook<'a>>,
     /// Commit-message editor: template text to edited text.
     pub edit: &'a dyn Fn(&str) -> Result<String, String>,
 }
@@ -5828,7 +5834,7 @@ pub struct CleanCheckOutcome {
 }
 
 /// Order-preserving difference (`array_diff()`, `:1113-1115`).
-fn without_paths(paths: &[String], remove: &[Vec<String>]) -> Vec<String> {
+fn without_paths(paths: &[String], remove: &[&[String]]) -> Vec<String> {
     paths
         .iter()
         .filter(|path| !remove.iter().any(|list| list.contains(path)))
@@ -5854,8 +5860,12 @@ fn check_dirty_externals<R: BufRead, W: Write>(
     writer
         .write_all(block.as_bytes())
         .map_err(|error| format!("failed to write prompt: {error}"))?;
-    if !diff::prompt_confirm_from(reader, writer, &ignore_externals_prompt(externals.len()), false)?
-    {
+    if !diff::prompt_confirm_from(
+        reader,
+        writer,
+        &ignore_externals_prompt(externals.len()),
+        false,
+    )? {
         return Err(USER_ABORT.to_string());
     }
     Ok(())
@@ -5931,7 +5941,8 @@ fn check_uncommitted_changes<R: BufRead, W: Write>(
         }
         return Ok(true);
     }
-    if vcs.autostash && vcs.can_stash
+    if vcs.autostash
+        && vcs.can_stash
         && let Some(stash) = vcs.stash_changes
     {
         writer
@@ -6006,8 +6017,8 @@ pub fn require_clean_working_copy<R: BufRead, W: Write>(
         return Err(missing_files_error(&desc, &changes.missing));
     }
     check_dirty_externals(reader, writer, vcs.kind, &changes.externals)?;
-    let unstaged = without_paths(&changes.unstaged, &[changes.externals.clone()]);
-    let uncommitted = without_paths(&changes.uncommitted, &[unstaged.clone(), changes.externals.clone()]);
+    let unstaged = without_paths(&changes.unstaged, &[&changes.externals]);
+    let uncommitted = without_paths(&changes.uncommitted, &[&unstaged, &changes.externals]);
     check_untracked_files(reader, writer, vcs, &desc, &changes.untracked)?;
     let should_commit =
         check_uncommitted_changes(reader, writer, vcs, &desc, &unstaged, &uncommitted, mode)?;
@@ -6061,8 +6072,7 @@ fn conduit_truthy(value: &serde_json::Value) -> bool {
         serde_json::Value::Null => false,
         serde_json::Value::Bool(flag) => *flag,
         serde_json::Value::Number(number) => {
-            number.as_i64().is_some_and(|n| n != 0)
-                || number.as_f64().is_some_and(|n| n != 0.0)
+            number.as_i64().is_some_and(|n| n != 0) || number.as_f64().is_some_and(|n| n != 0.0)
         }
         serde_json::Value::String(text) => !text.is_empty() && text != "0",
         serde_json::Value::Array(items) => !items.is_empty(),

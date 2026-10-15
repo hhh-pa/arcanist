@@ -5,7 +5,7 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use arc_rs::{conduit, export, land, patch};
+use arc_rs::{conduit, export, hg, land, patch, svn};
 
 /// Unique scratch dir for one test; removed on drop (best effort).
 struct Fixture {
@@ -190,10 +190,10 @@ fn patch_preview_reads_stdin_patch() {
     let out = patch::execute_with_stdin(
         fx.path(),
         &argv(&["--patch", "-", "--preview"]),
-        Some("x\n"),
+        Some("diff --git a/f b/f\n"),
     )
     .unwrap();
-    assert_eq!(out.stdout, "x\n");
+    assert_eq!(out.stdout, "diff --git a/f b/f\n");
     let err = patch::execute_with_stdin(fx.path(), &argv(&["--patch", "-", "--preview"]), Some(""))
         .unwrap_err();
     assert!(err.contains("stdin"), "{err}");
@@ -471,4 +471,216 @@ fn export_local_requires_repo() {
     let fx = Fixture::named("exnorepo");
     let err = export::execute(fx.path(), &argv(&["--git"])).unwrap_err();
     assert!(err.contains("working copy"), "{err}");
+}
+
+fn fake_hg_for_patch(dir: &Path) -> hg::HgCommand {
+    #[cfg(windows)]
+    let (name, content) = ("fakehg-patch.bat", include_str!("fixtures/vcs/fakehg.bat"));
+    #[cfg(not(windows))]
+    let (name, content) = ("fakehg-patch.sh", include_str!("fixtures/vcs/fakehg.sh"));
+    let script = dir.join(name);
+    std::fs::write(&script, content).unwrap();
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        hg::HgCommand::custom("cmd", &["/C", &script.to_string_lossy()])
+    }
+    #[cfg(not(windows))]
+    {
+        hg::HgCommand::custom(&script.to_string_lossy(), &[])
+    }
+}
+
+fn fake_svn_for_patch(dir: &Path) -> svn::SvnCommand {
+    #[cfg(windows)]
+    let (name, content) = (
+        "fakesvn-patch.bat",
+        include_str!("fixtures/vcs/fakesvn.bat"),
+    );
+    #[cfg(not(windows))]
+    let (name, content) = ("fakesvn-patch.sh", include_str!("fixtures/vcs/fakesvn.sh"));
+    let script = dir.join(name);
+    std::fs::write(&script, content).unwrap();
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        svn::SvnCommand::custom("cmd", &["/C", &script.to_string_lossy()])
+    }
+    #[cfg(not(windows))]
+    {
+        svn::SvnCommand::custom(&script.to_string_lossy(), &[])
+    }
+}
+
+#[test]
+fn patch_hg_flow_via_fake_binary() {
+    let fx = Fixture::named("hg-fake");
+    std::fs::create_dir(fx.dir.join(".hg")).unwrap();
+    let hg_cmd = fake_hg_for_patch(fx.path());
+    let backends = patch::Backends {
+        hg: hg_cmd,
+        svn: svn::SvnCommand::system(),
+    };
+    fx.write("fix.patch", RAW_DIFF);
+    let patch_path = fx.dir.join("fix.patch").to_string_lossy().to_string();
+    let mut io = land::Io::buffered();
+    let out = patch::execute_with_io(
+        fx.path(),
+        &argv(&[
+            "--patch",
+            &patch_path,
+            "--force",
+            "--nocommit",
+            "--nobranch",
+        ]),
+        &mut io,
+        &backends,
+    )
+    .unwrap();
+    assert!(out.stderr.contains("OKAY"), "{}", out.stderr);
+    let log = std::fs::read_to_string(fx.dir.join(".fakehg.log")).unwrap();
+    assert!(log.contains("import --no-commit"), "{log}");
+}
+
+#[test]
+fn patch_svn_mode_change_via_fake_binary() {
+    let fx = Fixture::named("svn-fake");
+    std::fs::create_dir(fx.dir.join(".svn")).unwrap();
+    let svn_cmd = fake_svn_for_patch(fx.path());
+    let backends = patch::Backends {
+        hg: hg::HgCommand::system(),
+        svn: svn_cmd,
+    };
+    fx.write(
+        "fix.patch",
+        "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n",
+    );
+    let patch_path = fx.dir.join("fix.patch").to_string_lossy().to_string();
+    let mut io = land::Io::buffered();
+    let out = patch::execute_with_io(
+        fx.path(),
+        &argv(&["--patch", &patch_path, "--force"]),
+        &mut io,
+        &backends,
+    )
+    .unwrap();
+    assert!(out.stdout.contains("OKAY"), "{}", out.stdout);
+    let log = std::fs::read_to_string(fx.dir.join(".fakesvn.log")).unwrap();
+    assert!(log.contains("propset"), "{log}");
+    assert!(log.contains("svn:executable"), "{log}");
+}
+
+#[test]
+fn patch_binary_renders_and_applies() {
+    assert_eq!(
+        patch::sha1_hex(b"abc"),
+        "a9993e364706816aba3e25717850c26c9cd0d89d"
+    );
+    assert_eq!(patch::base85_encode(b""), "@\n");
+    assert_eq!(patch::base64_decode("aGk=").unwrap(), b"hi");
+    let fx = Fixture::named("bin-int");
+    fx.init_repo();
+    let old_bytes: &[u8] = &[0, 1, 2, 3, 4, 5, 250, 251, 252];
+    let new_bytes: &[u8] = &[0, 1, 2, 3, 9, 9, 9, 250, 251, 252, 10, 11];
+    std::fs::write(fx.dir.join("a.bin"), old_bytes).unwrap();
+    fx.git(&["add", "."]);
+    fx.git(&["commit", "-m", "bin"]);
+    let mut changes = vec![patch::BundleChange {
+        change_type: 2,
+        file_type: 3,
+        old_path: Some("a.bin".to_string()),
+        current_path: Some("a.bin".to_string()),
+        old_mode: None,
+        new_mode: None,
+        hunks: Vec::new(),
+        old_binary_phid: None,
+        new_binary_phid: None,
+        away_paths: Vec::new(),
+        original_file_data: Some(old_bytes.to_vec()),
+        current_file_data: Some(new_bytes.to_vec()),
+    }];
+    let text =
+        patch::render_git_patch_with_blobs(&mut changes, &|_: &str| panic!("inline")).unwrap();
+    assert!(text.contains("GIT binary patch\n"), "{text}");
+    let bundle = patch::Bundle {
+        text,
+        ..Default::default()
+    };
+    let mut io = land::Io::buffered();
+    patch::git_apply_patch(fx.path(), &bundle, &mut io).unwrap();
+    assert_eq!(std::fs::read(fx.dir.join("a.bin")).unwrap(), new_bytes);
+}
+
+#[test]
+fn patch_rejects_malformed_patch_file() {
+    let fx = Fixture::named("malformed");
+    fx.init_repo();
+    fx.write("bad.patch", "not a patch\n");
+    let bad = fx.dir.join("bad.patch").to_string_lossy().to_string();
+    let err = patch::execute(fx.path(), &argv(&["--patch", &bad, "--force"])).unwrap_err();
+    assert!(
+        err.starts_with("Diff Parse Exception: Expected a hunk header"),
+        "{err}"
+    );
+    fx.write("empty.patch", "");
+    let empty = fx.dir.join("empty.patch").to_string_lossy().to_string();
+    assert_eq!(
+        patch::execute(fx.path(), &argv(&["--patch", &empty, "--force"])).unwrap_err(),
+        "Can't parse an empty diff!"
+    );
+}
+
+#[test]
+fn patch_gap2_helpers_cover_all_cases() {
+    for valid in [
+        "Index: /path/to/file.ext\n",
+        "Modified: foo\n",
+        "Property changes on: foo\n",
+        "commit 59bcc3ad6775562f845953cf01624225\n",
+        "diff --git a/f b/f\n",
+        "rcsdiff -u a b\n",
+        "--- a/old.txt\t2024-01-02 03:04:05\n",
+        "Binary files a 2024-01-02 and b 2024-01-02 differ\n",
+        "diff -r abc123 file.txt\n",
+        "# c\ndiff --git a/f b/f\n",
+    ] {
+        assert!(patch::validate_patch_text(valid).is_ok(), "{valid:?}");
+    }
+    for invalid in ["commit XYZ\n", "--- no-date\n", "hello\n"] {
+        assert!(patch::validate_patch_text(invalid).is_err(), "{invalid:?}");
+    }
+    let err = patch::validate_patch_text("not a patch\n").unwrap_err();
+    let message = "Expected a hunk header, like 'Index: /path/to/file.ext' (svn), \
+         'Property changes on: /path/to/file.ext' (svn properties), \
+         'commit 59bcc3ad6775562f845953cf01624225' (git show), 'diff --git' \
+         (git diff), '--- filename' (unified diff), or 'diff -r' (hg diff or patch).";
+    let full = format!("Diff Parse Exception: {message}\n\n   >>>        1   not a patch\n");
+    assert_eq!(err, full);
+    let fx = Fixture::named("with-seam");
+    let hg_cmd = fake_hg_for_patch(fx.path());
+    let backends = patch::Backends {
+        hg: hg_cmd,
+        svn: svn::SvnCommand::system(),
+    };
+    let bundle = patch::Bundle {
+        base_revision: Some("abc123".to_string()),
+        ..Default::default()
+    };
+    let mut io = land::Io::buffered();
+    assert!(
+        patch::ensure_base_present_with(fx.path(), patch::Vcs::Hg, &bundle, &mut io, &backends)
+            .unwrap()
+    );
 }
