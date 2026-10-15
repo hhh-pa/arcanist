@@ -257,3 +257,93 @@ fn immutable_prompt_keys_match_php() {
     assert_eq!(PROMPT_AUTHOR, "arc.amend.author");
     assert_eq!(PROMPT_IMMUTABLE, "arc.amend.immutable");
 }
+
+#[test]
+fn ref_view_line_ansi_modes() {
+    assert_eq!(
+        ref_view_line_ansi("D123", "Title", false),
+        "**  *  ** D123 Title\n"
+    );
+    assert_eq!(
+        ref_view_line_ansi("@alice", "", false),
+        "**  *  ** @alice\n"
+    );
+    assert_eq!(
+        ref_view_line_ansi("D123", "Title", true),
+        "\x1b[46m\x1b[1m  *  \x1b[m\x1b[49m \x1b[1mD123\x1b[m Title\n"
+    );
+    assert_eq!(
+        ref_view_line_ansi("@alice", "", true),
+        "\x1b[46m\x1b[1m  *  \x1b[m\x1b[49m \x1b[1m@alice\x1b[m\n"
+    );
+}
+
+#[test]
+fn ref_view_line_tty_truncates_long_titles() {
+    let long = "x".repeat(100);
+    assert!(ref_view_line_ansi("D123", &long, false).contains(&long));
+    assert_eq!(
+        ref_view_line_ansi("D123", &long, true),
+        format!(
+            "\x1b[46m\x1b[1m  *  \x1b[m\x1b[49m \x1b[1mD123\x1b[m {}\u{2026}\n",
+            "x".repeat(68)
+        )
+    );
+}
+
+#[test]
+fn select_guessed_ansi_lists_candidates() {
+    let mut io = land::Io::buffered();
+    let err = select_guessed_ansi(
+        &mut io,
+        vec![revision("1", "One"), revision("2", "Two")],
+        false,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        "Use \"--revision <id>\" to specify which revision you want to amend."
+    );
+    assert!(io.out.stdout.contains("**  *  ** D1 One\n"));
+    assert!(io.out.stdout.contains("**  *  ** D2 Two\n"));
+
+    let mut io = land::Io::buffered();
+    select_guessed_ansi(
+        &mut io,
+        vec![revision("1", "One"), revision("2", "Two")],
+        true,
+    )
+    .unwrap_err();
+    assert!(
+        io.out
+            .stdout
+            .contains("\x1b[46m\x1b[1m  *  \x1b[m\x1b[49m \x1b[1mD1\x1b[m One\n"),
+        "unexpected: {}",
+        io.out.stdout
+    );
+    assert!(
+        io.out
+            .stdout
+            .contains("\x1b[46m\x1b[1m  *  \x1b[m\x1b[49m \x1b[1mD2\x1b[m Two\n"),
+        "unexpected: {}",
+        io.out.stdout
+    );
+
+    let mut io = land::Io::buffered();
+    let only = select_guessed_ansi(&mut io, vec![revision("9", "Nine")], true).unwrap();
+    assert_eq!(only.id, "9");
+    assert!(io.out.stdout.is_empty());
+}
+
+#[test]
+fn announce_text_modes() {
+    let rev = revision("123", "Fix it");
+    assert_eq!(
+        announce_text(&rev, false),
+        "Amending commit message to reflect revision:\n\n**  *  ** D123 Fix it\n\n"
+    );
+    assert_eq!(
+        announce_text(&rev, true),
+        "Amending commit message to reflect revision:\n\n\x1b[46m\x1b[1m  *  \x1b[m\x1b[49m \x1b[1mD123\x1b[m Fix it\n\n"
+    );
+}
