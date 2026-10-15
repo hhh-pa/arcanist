@@ -280,3 +280,35 @@ fn file_warnings_confirm_or_abort() {
     let mut io = land::Io::canned(&["y", "y"]);
     confirm_all(&mut io, &["One?".to_string(), "Two?".to_string()]).unwrap();
 }
+
+#[test]
+fn message_files_are_unique_under_concurrency() {
+    // Regression: pid+nanos names collided when parallel tests wrote
+    // within one clock tick (macOS vcs1_commit flake). A barrier forces
+    // all threads to write simultaneously.
+    const N: usize = 32;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+    let handles: Vec<_> = (0..N)
+        .map(|i| {
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                let message = format!("message {i}");
+                let path = write_message_file("test-race", &message).unwrap();
+                (path, message)
+            })
+        })
+        .collect();
+    let mut paths = Vec::with_capacity(N);
+    for handle in handles {
+        let (path, message) = handle.join().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), message);
+        paths.push(path);
+    }
+    paths.sort();
+    paths.dedup();
+    assert_eq!(paths.len(), N);
+    for path in &paths {
+        std::fs::remove_file(path).ok();
+    }
+}

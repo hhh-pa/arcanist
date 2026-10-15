@@ -25,6 +25,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::conduit::Client;
 use crate::{amend, close_revision, config, git, land, svn};
@@ -294,18 +295,32 @@ fn resolve_message(options: &Options) -> Result<String, String> {
     Err("commit requires a message: pass --message <text> or --revision <id>".to_string())
 }
 
+/// Monotonic message-file disambiguator: process-unique names without
+/// relying on clock granularity (parallel tests share one clock tick).
+static MESSAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn write_message_file(tag: &str, message: &str) -> Result<std::path::PathBuf, String> {
-    let path = std::env::temp_dir().join(format!(
-        "arc-rs-{tag}-{}-{}.msg",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::write(&path, message)
-        .map_err(|e| format!("failed to write commit message file: {e}"))?;
-    Ok(path)
+    for _ in 0..100 {
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-{tag}-{}-{}.msg",
+            std::process::id(),
+            MESSAGE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                std::io::Write::write_all(&mut file, message.as_bytes())
+                    .map_err(|e| format!("failed to write commit message file: {e}"))?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("failed to write commit message file: {error}")),
+        }
+    }
+    Err("failed to allocate a unique commit message file".to_string())
 }
 
 /// Git flow (arc-rs extension): create a local commit from an explicit
