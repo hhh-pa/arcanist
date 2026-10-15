@@ -6,5 +6,9 @@ description = "Rust port of Arcanist (arc)"
 license = "Apache-2.0"
 
 [dependencies]
+base64 = "0.22"
+flate2 = "1"
 reqwest = { version = "0.12", features = ["blocking"] }
+rsa = "0.9"
 serde_json = "1"
+sha1 = { version = "0.10", features = ["oid"] }

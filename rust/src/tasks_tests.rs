@@ -9,6 +9,7 @@ fn task(id: u64, title: &str) -> Task {
         id: id.to_string(),
         title: title.to_string(),
         priority: "Normal".to_string(),
+        priority_color: None,
         status_name: "Open".to_string(),
         is_closed: Some(false),
     }
@@ -120,8 +121,14 @@ fn parses_task_rows() {
     assert_eq!(task.id, "42");
     assert_eq!(task.title, "Fix login");
     assert_eq!(task.priority, "High");
+    assert_eq!(task.priority_color, Some("red".to_string()));
     assert_eq!(task.status_name, "Open");
     assert_eq!(task.is_closed, Some(false));
+    let numeric = parse_task(&serde_json::json!({"id": 1, "isClosed": 1})).unwrap();
+    assert_eq!(numeric.is_closed, Some(true));
+    let missing =
+        parse_task(&serde_json::json!({"id": 1, "isClosed": serde_json::Value::Null})).unwrap();
+    assert_eq!(missing.is_closed, None);
     assert!(parse_task(&serde_json::json!({"title": "no id"})).is_none());
 }
 
@@ -138,15 +145,24 @@ fn parses_list_and_map_results() {
 
 #[test]
 fn renders_table_rows() {
-    let out = render_table(&[task(7, "First"), task(123, "Second")]);
-    let lines: Vec<&str> = out.lines().collect();
-    assert_eq!(lines.len(), 2);
-    assert!(lines[0].starts_with("T7"), "{out}");
-    assert!(lines[0].contains("First"), "{out}");
-    assert!(lines[1].starts_with("T123"), "{out}");
-    assert!(lines[1].contains("Second"), "{out}");
-    assert!(out.contains("Normal"), "{out}");
-    assert!(out.contains("Open"), "{out}");
+    let out = render_table(&[task(7, "First"), task(123, "Second")], false);
+    assert_eq!(
+        out,
+        "T7   First    Normal   Open\nT123 Second   Normal   Open\n"
+    );
+}
+
+#[test]
+fn blank_status_without_is_closed() {
+    let mut row = task(7, "First");
+    row.is_closed = None;
+    let out = render_table(&[row], false);
+    assert!(!out.contains("Open"), "{out}");
+    assert!(out.contains("First"), "{out}");
+    assert_eq!(priority_color(Some("red")), "red");
+    assert_eq!(priority_color(Some("lightsky")), "blue");
+    assert_eq!(priority_color(Some("chartreuse")), "white");
+    assert_eq!(priority_color(None), "white");
 }
 
 #[test]

@@ -9,9 +9,9 @@
 //!
 //! Scope: `working-copy(<commit>)` resolves the commit with git and renders
 //! the `ArcanistWorkingCopyStateRef` tree; `--explore` additionally loads
-//! the commit message. `browse(<token>)` needs Conduit and is not yet
-//! ported, as are revision annotations (`revisionRefs` always renders
-//! unloaded).
+//! the commit message. `browse(<token>)` resolves through the shared
+//! browse engine (see `browse`); revision annotations stay unloaded
+//! (`revisionRefs`).
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -20,7 +20,7 @@ use std::process::ExitCode;
 // into lib.rs and when included standalone by an integration test.
 extern crate self as arc_rs;
 
-use arc_rs::git;
+use arc_rs::{browse, config, diff_submit, git};
 
 /// Subcommand name, matching `arc inspect`.
 pub const NAME: &str = "inspect";
@@ -40,8 +40,7 @@ fn usage() -> String {
      \x20 --explore     Load all object hardpoints.\n\
      \x20 -h, --help    Show this help.\n\
      \n\
-     Not yet ported (see T1128): browse(<token>) via Conduit and revision\n\
-     annotations (revisionRefs).\n"
+     Not yet ported (see T1128): revision annotations (revisionRefs).\n"
         .to_string()
 }
 
@@ -128,22 +127,26 @@ pub fn parse_spec(text: &str) -> Result<ObjectSpec, String> {
 }
 
 /// Render a string hardpoint value, mirroring `describeValue`: truncate to
-/// 64 characters and escape newlines, tabs, backslashes, and quotes.
+/// 64 bytes (like `substr`) and escape newlines, tabs, backslashes, and
+/// quotes (like `addcslashes`). A multibyte character split by the cut
+/// renders as U+FFFD instead of PHP's raw partial bytes.
 pub fn render_value(value: &str) -> String {
-    let mut escaped = String::new();
-    escaped.push('"');
-    for ch in value.chars().take(64) {
-        match ch {
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            _ => escaped.push(ch),
+    let bytes = value.as_bytes();
+    let cut = &bytes[..bytes.len().min(64)];
+    let mut escaped: Vec<u8> = Vec::with_capacity(cut.len() + 2);
+    escaped.push(b'"');
+    for &byte in cut {
+        match byte {
+            b'\n' => escaped.extend_from_slice(b"\\n"),
+            b'\r' => escaped.extend_from_slice(b"\\r"),
+            b'\t' => escaped.extend_from_slice(b"\\t"),
+            b'\\' => escaped.extend_from_slice(b"\\\\"),
+            b'"' => escaped.extend_from_slice(b"\\\""),
+            _ => escaped.push(byte),
         }
     }
-    escaped.push('"');
-    escaped
+    escaped.push(b'"');
+    String::from_utf8_lossy(&escaped).into_owned()
 }
 
 /// Commit data backing a `working-copy(...)` ref.
@@ -192,8 +195,65 @@ pub fn render_working_copy(info: &CommitInfo, explore: bool) -> String {
     text
 }
 
+const BROWSE: &str = "[ArcanistBrowseRef]";
+const BROWSE_URI: &str = "[ArcanistBrowseURIRef]";
+const VECTOR: &str = "[ArcanistVectorHardpoint]";
+
+/// Render a `browse(<token>)` tree; with `ctx`, `--explore` loads the
+/// commits (plus messages) and URIs through the browse engine.
+pub fn render_browse(
+    dir: &Path,
+    token: &str,
+    explore: bool,
+    ctx: Option<&mut browse::BrowseCtx>,
+) -> Result<String, String> {
+    let mut out = format!("+ {BROWSE} Browse Query \"{token}\"\n");
+    let Some(ctx) = ctx.filter(|_| explore) else {
+        out.push_str(&format!(" o {VECTOR} commitRefs\n"));
+        out.push_str(&format!(" o {VECTOR} uris\n"));
+        return Ok(out);
+    };
+    let refs = vec![browse::BrowseRef {
+        token: Some(token.to_string()),
+        types: Vec::new(),
+        branch: None,
+    }];
+    let resolved = browse::resolve_refs(ctx, &refs)?;
+    let hit = &resolved[0];
+    out.push_str(&format!(" * {VECTOR} commitRefs\n"));
+    for hash in &hit.commits {
+        out.push_str(&format!("  + [ArcanistCommitRef] Commit \"{hash}\"\n"));
+        let message = read_commit(dir, hash).unwrap_or_else(|_| CommitInfo {
+            hash: hash.clone(),
+            message: String::new(),
+        });
+        out.push_str("   * [ArcanistScalarHardpoint] message\n");
+        out.push_str(&format!("    > {}\n", render_value(&message.message)));
+        out.push_str("   o [ArcanistScalarHardpoint] upstream\n");
+    }
+    out.push_str(&format!(" * {VECTOR} uris\n"));
+    for uri in &hit.uris {
+        out.push_str(&format!(
+            "  + {BROWSE_URI} Browse URI \"{u}\"\n",
+            u = uri.uri
+        ));
+    }
+    Ok(out)
+}
+
 /// Render one object specification, or the failure message.
 pub fn inspect_one(dir: &Path, spec: &str, explore: bool) -> Result<String, String> {
+    inspect_one_with(dir, spec, explore, None)
+}
+
+/// Render one object specification with an optional browse context for
+/// `browse(<token>)` exploration.
+pub fn inspect_one_with(
+    dir: &Path,
+    spec: &str,
+    explore: bool,
+    ctx: Option<&mut browse::BrowseCtx>,
+) -> Result<String, String> {
     let parsed = parse_spec(spec)?;
     if !SUPPORTED_TYPES.contains(&parsed.function.as_str()) {
         let mut names = SUPPORTED_TYPES.to_vec();
@@ -215,19 +275,24 @@ pub fn inspect_one(dir: &Path, spec: &str, explore: bool) -> Result<String, Stri
             Ok(render_working_copy(&read_commit(dir, &argument)?, explore))
         }
         "browse" => {
-            if parsed.arguments.is_none() {
+            let Some(token) = parsed.arguments else {
                 return Err(
                     "Expected exactly one argument to \"browse(...)\" with a token.".to_string(),
                 );
-            }
-            Err("\"browse(...)\" is not yet ported (requires Conduit; see T1128)".to_string())
+            };
+            render_browse(dir, &token, explore, ctx)
         }
         _ => unreachable!("supported types are dispatched above"),
     }
 }
 
-/// Inspect in `dir` per `argv`.
-pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
+/// Inspect in `dir` per `argv`, with an injected Conduit caller (`None`
+/// builds one from config, only when `--explore` meets `browse(...)`).
+pub fn run_in_with(
+    dir: &Path,
+    argv: &[String],
+    call: Option<&diff_submit::ConduitCall>,
+) -> ExitCode {
     let options = match parse_args(argv) {
         ParseOutcome::Help => {
             print!("{}", usage());
@@ -248,9 +313,38 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
         print!("{text}");
         return ExitCode::SUCCESS;
     }
+    let wants_browse = options.explore
+        && options.objects.iter().any(|spec| {
+            parse_spec(spec)
+                .map(|parsed| parsed.function == "browse")
+                .unwrap_or(false)
+        });
+    let client;
+    let live;
+    let call: Option<&diff_submit::ConduitCall> = match (wants_browse, call) {
+        (false, _) => None,
+        (true, Some(call)) => Some(call),
+        (true, None) => match config::client_for(None) {
+            Ok(built) => {
+                client = built;
+                live = |method: &str, params: &serde_json::Value| {
+                    client.call(method, params).map_err(|e| e.to_string())
+                };
+                Some(&live)
+            }
+            Err(message) => {
+                eprintln!("arc-rs {NAME}: {message}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let mut ctx_holder = None;
+    if let Some(call) = call {
+        ctx_holder = Some(browse::BrowseCtx::new(dir, call, ""));
+    }
     let mut blocks = Vec::new();
     for spec in &options.objects {
-        match inspect_one(dir, spec, options.explore) {
+        match inspect_one_with(dir, spec, options.explore, ctx_holder.as_mut()) {
             Ok(block) => blocks.push(block),
             Err(message) => {
                 eprintln!("arc-rs {NAME}: {message}");
@@ -260,6 +354,11 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
     }
     print!("{}", blocks.join("\n"));
     ExitCode::SUCCESS
+}
+
+/// Inspect in `dir` per `argv`.
+pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
+    run_in_with(dir, argv, None)
 }
 
 /// Entry point: `argv` excludes the subcommand name.

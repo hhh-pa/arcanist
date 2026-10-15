@@ -96,11 +96,22 @@ fn sorts_by_exists_status_then_id() {
 
 #[test]
 fn renders_rows_with_marker() {
-    assert_eq!(render_row(&info("9", 2, true)), "* Accepted D9: Title 9");
     assert_eq!(
-        render_row(&info("10", 0, false)),
-        "  Needs Review D10: Title 10"
+        render_table(&[info("9", 2, true)], false),
+        "* Accepted D9: Title 9\n"
     );
+    assert_eq!(
+        render_table(&[info("10", 0, false)], false),
+        " Needs Review D10: Title 10\n"
+    );
+    assert_eq!(
+        render_table(&[info("9", 2, true), info("10", 0, false)], false),
+        "* Accepted     D9: Title 9\n  Needs Review D10: Title 10\n"
+    );
+    assert_eq!(status_color("Accepted"), "green");
+    assert_eq!(status_color("Needs Review"), "magenta");
+    assert_eq!(status_color("Abandoned"), "default");
+    assert_eq!(status_color("In Preparation"), "default");
 }
 
 #[test]
@@ -115,6 +126,40 @@ fn builds_revisions_json() {
             "exists": true,
         }])
     );
+}
+
+#[test]
+fn finds_hg_and_svn_roots() {
+    let tag = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let base = std::env::temp_dir().join(format!("arc-rs-list-roots-{}-{tag}", std::process::id()));
+
+    let hg_nested = base.join("hg").join("sub");
+    std::fs::create_dir_all(base.join("hg").join(".hg")).unwrap();
+    std::fs::create_dir_all(&hg_nested).unwrap();
+    // `find_hg_root` walks up without shelling out.
+    assert_eq!(find_hg_root(&hg_nested), Some(base.join("hg")), "hg root");
+
+    let svn_nested = base.join("svn").join("sub");
+    std::fs::create_dir_all(base.join("svn").join(".svn")).unwrap();
+    std::fs::create_dir_all(&svn_nested).unwrap();
+    assert_eq!(
+        working_copy_root(&svn_nested),
+        Some(base.join("svn").to_string_lossy().to_string()),
+        "svn root"
+    );
+    assert_eq!(
+        working_copy_root(&hg_nested),
+        Some(base.join("hg").to_string_lossy().to_string()),
+        "hg root via working_copy_root"
+    );
+
+    let plain = base.join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    assert_eq!(find_hg_root(&plain), None);
+    std::fs::remove_dir_all(&base).ok();
 }
 
 #[test]

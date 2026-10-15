@@ -7,13 +7,22 @@
 //! `src/configuration/ArcanistConfigurationManager.php`:
 //! local > project > user > system > default.
 //!
-//! `--show-source` (alias `--verbose`) prints every source's value,
-//! otherwise only the winning value and its source are shown.
+//! `--verbose` prints every source's value, otherwise only the winning
+//! value and its source are shown. `--show-source` is an arc-rs alias for
+//! `--verbose` (PHP only accepts `--verbose`).
+//!
+//! Console output goes through the shared [`arc_rs::terminal`] API:
+//! `writeOut()` sites (interpret pattern, substitute raw) use
+//! `tsprintf_ansi` with the `%R` (raw string) conversion where the pattern
+//! carries markup, `pht()` sites use `pht`, help wrapping uses
+//! `console_wrap`, and markup-free `sprintf` sites use plain `format!`.
 //!
 //! Deviation: a `~/.arcrc` without a `config` section yields an empty user
 //! config here, while stock PHP treats the whole file (including `hosts`)
 //! as config until the first `set-config` write. Credential-adjacent keys
-//! are never reported as configuration.
+//! are never reported as configuration. Likewise, project-config lookup
+//! walks up from the working directory instead of reading only the VCS
+//! root, so `get-config` keeps working outside repositories.
 
 // A crate cannot name itself in `use` (E0432), so alias the current crate
 // to keep the shared-helper paths (`arc_rs::git`, `arc_rs::config`)
@@ -24,12 +33,13 @@ extern crate self as arc_rs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use arc_rs::{config, git};
+use arc_rs::terminal::{PhtArg, TVal};
+use arc_rs::{config, git, terminal};
 
 /// Subcommand name, matching `arc get-config`.
 pub const NAME: &str = "get-config";
 
-const USAGE: &str = "usage: arc-rs get-config [--show-source] [--verbose] [--] [NAME...]\n\
+const USAGE: &str = "usage: arc-rs get-config [--verbose] [--] [NAME...]\n\
 \n\
 Read arc configuration. With no NAME, show all known and configured keys.\n\
 \n\
@@ -37,8 +47,8 @@ Precedence (highest wins): local (.git/arc/config), project (.arcconfig),\n\
 user (~/.arcrc), system (/etc/arcconfig), default.\n\
 \n\
 Options:\n\
-  --show-source   Show the value from every source (alias: --verbose).\n\
-  --verbose       Alias for --show-source.\n\
+  --verbose       Show detailed information about each option.\n\
+  --show-source   Alias for --verbose.\n\
   -h, --help      Show this help.\n";
 
 const SOURCE_LOCAL: &str = "local";
@@ -63,7 +73,8 @@ struct Setting {
     legacy: &'static str,
 }
 
-/// Builtin settings, mirroring `ArcanistSettings::getOptions()`.
+/// Builtin settings, mirroring `ArcanistSettings::getOptions()` verbatim
+/// (with `pht()` substitutions applied).
 const SETTINGS: [Setting; 15] = [
     Setting {
         key: "aliases",
@@ -75,98 +86,98 @@ const SETTINGS: [Setting; 15] = [
     Setting {
         key: "arc.autostash",
         type_name: "bool",
-        help: "Whether arc may automatically stash working-copy changes when it needs a clean tree. Enable only if you know how to restore the stash after an unrecoverable error.",
+        help: "Whether arc should permit the automatic stashing of changes in the working directory when requiring a clean working copy. This option should only be used when users understand how to restore their working directory from the local stash if an operation causes an unrecoverable error.",
         example: "false",
         legacy: "",
     },
     Setting {
         key: "arc.land.onto.default",
         type_name: "string",
-        help: "Default branch to land changes onto when \"arc land\" runs without --onto.",
+        help: "The name of the default branch to land changes onto when `arc land` is run.",
         example: "\"develop\"",
         legacy: "",
     },
     Setting {
         key: "base",
         type_name: "string",
-        help: "Base commit ruleset used to find the start of a commit range. See \"Arcanist User Guide: Commit Ranges\".",
+        help: "Base commit ruleset to invoke when determining the start of a commit range. See \"Arcanist User Guide: Commit Ranges\" for details.",
         example: "\"arc:amended, arc:prompt\"",
         legacy: "",
     },
     Setting {
         key: "browser",
         type_name: "string",
-        help: "Command used to open a web browser.",
+        help: "Command to use to invoke a web browser.",
         example: "\"gnome-www-browser\"",
         legacy: "",
     },
     Setting {
         key: "default",
         type_name: "string",
-        help: "Server URI to connect to when arc runs outside a project or in a project without a configured URI.",
+        help: "The URI of a server to connect to by default, if arc is run in a project without a configured URI or run outside of a project.",
         example: "\"http://devtools.example.com/\"",
         legacy: "",
     },
     Setting {
         key: "editor",
         type_name: "string",
-        help: "Command used to open an interactive editor, like \"nano\" or \"vim\". Overrides $EDITOR.",
+        help: "Command to use to invoke an interactive editor, like `nano` or `vim`. This setting overrides the EDITOR environmental variable.",
         example: "\"nano\"",
         legacy: "",
     },
     Setting {
         key: "events.listeners",
         type_name: "list",
-        help: "Event listener classes to install at startup.",
+        help: "List of event listener classes to install at startup.",
         example: "[\"ExampleEventListener\"]",
         legacy: "",
     },
     Setting {
         key: "history.immutable",
         type_name: "bool",
-        help: "When true, arc never rewrites repository history (no amend or rebase). Defaults to true in Mercurial and false in Git; no effect in Subversion.",
+        help: "If true, arc will never change repository history (e.g., through amending or rebasing). Defaults to true in Mercurial and false in Git. This setting has no effect in Subversion.",
         example: "false",
         legacy: "immutable_history",
     },
     Setting {
         key: "https.cabundle",
         type_name: "string",
-        help: "Path to a custom CA bundle for TLS requests, for conduit endpoints behind an internal CA.",
+        help: "Path to a custom CA bundle file to be used for cURL calls. This is used primarily when your conduit endpoint is behind HTTPS signed by your organization's internal CA.",
         example: "support/yourca.pem",
         legacy: "",
     },
     Setting {
         key: "lint.engine",
         type_name: "string",
-        help: "Default lint engine when the project does not specify one.",
+        help: "The name of a default lint engine to use, if no lint engine is specified by the current project.",
         example: "\"ExampleLintEngine\"",
         legacy: "lint_engine",
     },
     Setting {
         key: "load",
         type_name: "list",
-        help: "Paths to phutil libraries to load at startup, making extra classes (lint or unit engines) available.",
+        help: "A list of paths to phutil libraries that should be loaded at startup. This can be used to make classes available, like lint or unit test engines.",
         example: "[\"/var/arc/customlib/src\"]",
         legacy: "phutil_libraries",
     },
     Setting {
         key: "phabricator.uri",
         type_name: "string",
-        help: "Associates the working copy with a specific server.",
+        help: "Associates this working copy with a specific server.",
         example: "\"https://devtools.example.com/\"",
         legacy: "conduit_uri",
     },
     Setting {
         key: "repository.callsign",
         type_name: "string",
-        help: "Pins the working copy to a specific repository callsign when arc cannot figure out the association itself.",
+        help: "Associate the working copy with a specific repository. Normally, arc can figure this association out on its own, but if your setup is unusual you can use this option to tell it what the desired value is.",
         example: "\"X\"",
         legacy: "",
     },
     Setting {
         key: "unit.engine",
         type_name: "string",
-        help: "Default unit test engine when the project does not specify one.",
+        help: "The name of a default unit test engine to use, if no unit test engine is specified by the current project.",
         example: "\"ExampleUnitTestEngine\"",
         legacy: "unit_engine",
     },
@@ -223,7 +234,10 @@ pub fn default_config() -> serde_json::Map<String, serde_json::Value> {
 }
 
 /// Format a value for display, mirroring
-/// `ArcanistSettings::formatConfigValueForDisplay()`.
+/// `ArcanistSettings::formatConfigValueForDisplay()`. `serde_json` never
+/// escapes `/`, which matches PHP's display-time `\/` unescaping.
+/// Divergences: non-ASCII strings (PHP's `json_encode` emits `\uXXXX`)
+/// and whole floats (PHP prints `1.0` as `1`).
 #[must_use]
 pub fn format_value(key: &str, value: &serde_json::Value) -> String {
     let _ = key;
@@ -239,7 +253,25 @@ pub fn format_value(key: &str, value: &serde_json::Value) -> String {
     }
 }
 
-/// Read the nearest enclosing `.arcconfig` above `dir`.
+/// Read a JSON object file, reporting `parse_message` when the content is
+/// not JSON. Each config source has its own PHP error text, supplied by
+/// the caller.
+fn read_config_file(
+    path: &Path,
+    parse_message: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read '{}': {e}", path.display()))?;
+    let doc: serde_json::Value =
+        serde_json::from_str(&text).map_err(|_| parse_message.to_string())?;
+    doc.as_object()
+        .cloned()
+        .ok_or_else(|| format!("'{}' is not a JSON object", path.display()))
+}
+
+/// Read the nearest enclosing `.arcconfig` above `dir`. The parse error
+/// mirrors `ArcanistWorkingCopyIdentity::parseRawConfigFile()`; the
+/// non-object rejection is arc-rs strictness (PHP tolerates it).
 pub fn read_project_config(
     dir: &Path,
 ) -> Result<(Option<PathBuf>, serde_json::Map<String, serde_json::Value>), String> {
@@ -248,21 +280,20 @@ pub fn read_project_config(
         if !file.is_file() {
             continue;
         }
-        let text = std::fs::read_to_string(&file)
-            .map_err(|e| format!("cannot read '{}': {e}", file.display()))?;
-        let doc: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| format!("cannot parse '{}' as JSON: {e}", file.display()))?;
-        let map = doc
-            .as_object()
-            .cloned()
-            .ok_or_else(|| format!("'{}' is not a JSON object", file.display()))?;
+        let from_where = file.display().to_string();
+        let message = terminal::pht(
+            "Unable to parse '%s' file '%s'.",
+            &[PhtArg::Text(".arcconfig"), PhtArg::Text(&from_where)],
+        );
+        let map = read_config_file(&file, &message)?;
         return Ok((Some(file), map));
     }
     Ok((None, serde_json::Map::new()))
 }
 
 /// Read the working copy's local config (`.git/arc/config`); empty outside
-/// a git repository. Only git is supported (see T1128).
+/// a git repository. Only git is supported (see T1128). The parse error
+/// mirrors `readLocalArcConfig()`: `Failed to parse '%s' as JSON.`
 pub fn read_local_config(dir: &Path) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     if !git::is_inside_work_tree(dir) {
         return Ok(serde_json::Map::new());
@@ -272,20 +303,27 @@ pub fn read_local_config(dir: &Path) -> Result<serde_json::Map<String, serde_jso
     if !file.is_file() {
         return Ok(serde_json::Map::new());
     }
-    read_config_file(&file)
+    let path = file.display().to_string();
+    let message = terminal::pht("Failed to parse '%s' as JSON.", &[PhtArg::Text(&path)]);
+    read_config_file(&file, &message)
 }
 
 /// Read the user config section from a `~/.arcrc` file: the `config`
 /// object, plus the top-level `aliases` key like the PHP manager does.
-/// A missing file yields an empty config.
+/// A missing file yields an empty config. The parse error mirrors
+/// `readUserConfigurationFile()`, including its literal `~/.arcrc`.
 pub fn read_user_file(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     if !path.is_file() {
         return Ok(serde_json::Map::new());
     }
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read '{}': {e}", path.display()))?;
-    let doc: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| format!("'{}' is not a valid JSON file: {e}", path.display()))?;
+    let doc: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
+        terminal::pht(
+            "Your '%s' file is not a valid JSON file.",
+            &[PhtArg::Text("~/.arcrc")],
+        )
+    })?;
     let obj = doc
         .as_object()
         .ok_or_else(|| format!("'{}' is not a JSON object", path.display()))?;
@@ -305,16 +343,6 @@ pub fn read_user_file(path: &Path) -> Result<serde_json::Map<String, serde_json:
     Ok(map)
 }
 
-fn read_config_file(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read '{}': {e}", path.display()))?;
-    let doc: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| format!("cannot parse '{}' as JSON: {e}", path.display()))?;
-    doc.as_object()
-        .cloned()
-        .ok_or_else(|| format!("'{}' is not a JSON object", path.display()))
-}
-
 /// Location of the system config, mirroring
 /// `ArcanistConfigurationManager::getSystemArcConfigLocation()`.
 #[must_use]
@@ -329,14 +357,20 @@ pub fn system_config_path() -> PathBuf {
     }
 }
 
-/// Read a system config file; a missing file yields an empty config.
+/// Read a system config file; a missing file yields an empty config. The
+/// parse error mirrors `readSystemArcConfig()`.
 pub fn read_system_config_from(
     path: &Path,
 ) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     if !path.is_file() {
         return Ok(serde_json::Map::new());
     }
-    read_config_file(path)
+    let name = path.display().to_string();
+    let message = terminal::pht(
+        "Your '%s' file is not a valid JSON file.",
+        &[PhtArg::Text(&name)],
+    );
+    read_config_file(path, &message)
 }
 
 /// Read the system config from its standard location.
@@ -429,34 +463,56 @@ fn row(label: &str, value: &str, out: &mut String) {
     out.push_str(&format!("{label:>20}: {value}\n"));
 }
 
-/// Render one key's block, briefly or with per-source detail.
+/// Render one key's block with the process ANSI setting.
 #[must_use]
 pub fn render(key: &str, sources: &Sources, detailed: bool) -> String {
-    let mut out = format!("{key}\n\n");
+    render_ansi(key, sources, detailed, terminal::ansi_enabled())
+}
+
+/// Render one key's block, briefly or with per-source detail, through the
+/// workflow's `writeOut()` calls: the header is
+/// `writeOut("**%s**\\n\\n", $key)` (interpreted pattern, raw
+/// substitution, hence `%R`), help goes through
+/// `phutil_console_wrap($help, 4)`, labels are `pht()` texts
+/// (`pht('Example Value')`, `pht('Current Value')`,
+/// `pht('Current Source')`, `pht('%s Value', $source)` with lowercase
+/// source names), and a missing example prints empty.
+#[must_use]
+pub fn render_ansi(key: &str, sources: &Sources, detailed: bool, ansi: bool) -> String {
+    let head = terminal::tsprintf_ansi("**%R**\n\n", &[TVal::Text(key)], ansi)
+        .map(|t| t.to_string())
+        .unwrap_or_default();
+    let mut out = head;
     if detailed {
-        match help_for(key) {
-            Some(help) => out.push_str(&format!("    {help}\n\n")),
-            None => out.push_str(
-                "    (This configuration value is not recognized by arc. It may be misspelled or out of date.)\n\n",
+        let help = match help_for(key) {
+            Some(help) => help.to_string(),
+            None => terminal::pht(
+                "(This configuration value is not recognized by arc. It may be misspelled or out of date.)",
+                &[],
             ),
-        }
-        row("Example Value", example_for(key).unwrap_or("-"), &mut out);
+        };
+        out.push_str(&terminal::console_wrap(&help, 4, true));
+        out.push_str("\n\n");
+        let example = terminal::pht("Example Value", &[]);
+        row(&example, example_for(key).unwrap_or(""), &mut out);
         out.push('\n');
     }
+    let value_label = terminal::pht("Current Value", &[]);
+    let source_label = terminal::pht("Current Source", &[]);
     match current_value(key, sources) {
         Some((source, value)) => {
-            row("Current Value", &format_value(key, &value), &mut out);
-            row("Current Source", source, &mut out);
+            row(&value_label, &format_value(key, &value), &mut out);
+            row(&source_label, source, &mut out);
         }
         None => {
-            row("Current Value", "-", &mut out);
-            row("Current Source", "-", &mut out);
+            row(&value_label, "-", &mut out);
+            row(&source_label, "-", &mut out);
         }
     }
     if detailed {
         out.push('\n');
         for source in SOURCES {
-            let label = format!("{} Value", capitalize(source));
+            let label = terminal::pht("%s Value", &[PhtArg::Text(source)]);
             match value_at(key, source, sources) {
                 Some(value) => row(&label, &format_value(key, &value), &mut out),
                 None => row(&label, "-", &mut out),
@@ -466,31 +522,30 @@ pub fn render(key: &str, sources: &Sources, detailed: bool) -> String {
     out
 }
 
-fn capitalize(source: &str) -> String {
-    let mut chars = source.chars();
-    match chars.next() {
-        Some(first) => format!(
-            "{}{}",
-            first.to_ascii_uppercase(),
-            chars.collect::<String>()
-        ),
-        None => String::new(),
-    }
-}
-
-/// Render every requested key, with the `--show-source` hint when brief.
+/// Render every requested key with the process ANSI setting.
 #[must_use]
 pub fn render_all(keys: &[String], sources: &Sources, detailed: bool) -> String {
+    render_all_ansi(keys, sources, detailed, terminal::ansi_enabled())
+}
+
+/// Render every requested key, with the `--verbose` hint when brief:
+/// `writeOut("(%s)\\n", pht('Run with %s for more details.', '--verbose'))`.
+#[must_use]
+pub fn render_all_ansi(keys: &[String], sources: &Sources, detailed: bool, ansi: bool) -> String {
     let mut out = String::new();
     let multi = keys.len() > 1;
     for key in keys {
-        out.push_str(&render(key, sources, detailed));
+        out.push_str(&render_ansi(key, sources, detailed, ansi));
         if multi {
             out.push('\n');
         }
     }
     if !detailed {
-        out.push_str("(Run with --show-source for more details.)\n");
+        let hint = terminal::pht(
+            "Run with %s for more details.",
+            &[PhtArg::Text("--verbose")],
+        );
+        out.push_str(&format!("({hint})\n"));
     }
     out
 }

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 
-use arc_rs::{close_revision, conduit, config, git, list, tasks, todo};
+use arc_rs::{close_revision, conduit, config, git, list, tasks, todo, upload};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc;
@@ -95,6 +95,7 @@ fn options_close(revision: &str) -> close_revision::Options {
         json: false,
         force: false,
         conduit_uri: None,
+        repository_phid: None,
     }
 }
 
@@ -210,20 +211,21 @@ fn closes_accepted_own_revision() {
 
     let never = |_: &str| panic!("own revision must not prompt");
     let report = close_revision::execute(&client, &options_close("D123"), &never).unwrap();
+    // PHP writeInfo/writeOkay go to stderr; only the push hint is stdout.
     assert!(
-        report.stdout.contains("Closing revision"),
+        report.stderr.contains("Closing revision"),
         "{}",
-        report.stdout
+        report.stderr
     );
     assert!(
-        report.stdout.contains("D123 Fix the thing"),
+        report.stderr.contains("D123 Fix the thing"),
         "{}",
-        report.stdout
+        report.stderr
     );
     assert!(
-        report.stdout.contains("Done, closed revision."),
+        report.stderr.contains("Done, closed revision."),
         "{}",
-        report.stdout
+        report.stderr
     );
     assert!(
         report
@@ -232,7 +234,6 @@ fn closes_accepted_own_revision() {
         "{}",
         report.stdout
     );
-    assert!(report.stderr.is_empty(), "{}", report.stderr);
 
     let mut methods = vec![recv(&seen).0, recv(&seen).0, recv(&seen).0];
     methods.sort();
@@ -257,7 +258,7 @@ fn close_sends_revision_id_to_differential_close() {
     let (base, seen) = serve(routes, 3);
     let client = client_for(&base);
 
-    close_revision::execute(&client, &options_close("123"), &|_| true).unwrap();
+    close_revision::execute(&client, &options_close("123"), &|_| Ok(true)).unwrap();
     let mut calls = [recv(&seen), recv(&seen), recv(&seen)];
     calls.sort();
     let close = calls
@@ -283,7 +284,7 @@ fn refuses_non_accepted_revision() {
     let (base, seen) = serve(routes, 1);
     let client = client_for(&base);
 
-    let err = close_revision::execute(&client, &options_close("D9"), &|_| true).unwrap_err();
+    let err = close_revision::execute(&client, &options_close("D9"), &|_| Ok(true)).unwrap_err();
     assert!(err.contains("can not be closed"), "{err}");
     assert!(err.contains("accepted"), "{err}");
     assert_eq!(recv(&seen).0, "differential.query");
@@ -296,12 +297,12 @@ fn missing_revision_errors_but_finalize_leaves_it_open() {
     let (base, seen) = serve(routes, 2);
     let client = client_for(&base);
 
-    let err = close_revision::execute(&client, &options_close("D404"), &|_| true).unwrap_err();
+    let err = close_revision::execute(&client, &options_close("D404"), &|_| Ok(true)).unwrap_err();
     assert!(err.contains("does not exist"), "{err}");
 
     let mut finalize = options_close("D404");
     finalize.finalize = true;
-    let report = close_revision::execute(&client, &finalize, &|_| true).unwrap();
+    let report = close_revision::execute(&client, &finalize, &|_| Ok(true)).unwrap();
     assert_eq!(report.stdout, "Done.\n");
     assert_eq!(recv(&seen).0, "differential.query");
     assert_eq!(recv(&seen).0, "differential.query");
@@ -319,7 +320,7 @@ fn finalize_warns_and_skips_unaccepted_revision() {
 
     let mut options = options_close("D9");
     options.finalize = true;
-    let report = close_revision::execute(&client, &options, &|_| true).unwrap();
+    let report = close_revision::execute(&client, &options, &|_| Ok(true)).unwrap();
     assert!(report.stderr.contains("OPEN REVISION"), "{}", report.stderr);
     assert!(report.stderr.contains("left open"), "{}", report.stderr);
     assert!(
@@ -328,6 +329,74 @@ fn finalize_warns_and_skips_unaccepted_revision() {
         report.stdout
     );
     assert_eq!(recv(&seen).0, "differential.query");
+}
+
+#[test]
+fn finalize_skips_tracked_repository_silently() {
+    // A `--finalize` close in a tracked working copy (repository PHID
+    // identified) leaves the revision alone with no close call and no
+    // warning, mirroring `getRepositoryPHID()`.
+    let mut routes = HashMap::new();
+    routes.insert(
+        "differential.query".to_string(),
+        envelope(&accepted_revision("PHID-USER-1")),
+    );
+    let (base, seen) = serve(routes, 1);
+    let client = client_for(&base);
+
+    let mut options = options_close("D123");
+    options.finalize = true;
+    options.repository_phid = Some("PHID-REPO-1".to_string());
+    let report = close_revision::execute(&client, &options, &|_| {
+        panic!("tracked finalize must not prompt")
+    })
+    .unwrap();
+    assert!(
+        !report.stdout.contains("Closing revision"),
+        "{}",
+        report.stdout
+    );
+    assert!(report.stderr.is_empty(), "{}", report.stderr);
+    assert_eq!(recv(&seen).0, "differential.query");
+}
+
+#[test]
+fn resolve_repository_phid_queries_by_callsign() {
+    let mut routes = HashMap::new();
+    routes.insert(
+        "repository.query".to_string(),
+        envelope(r#"[{"phid": "PHID-REPO-9", "callsign": "X"}]"#),
+    );
+    let (base, seen) = serve(routes, 1);
+    let client = client_for(&base);
+
+    let fx = Fixture::named("close-repo-phid");
+    std::fs::write(fx.dir.join(".arcconfig"), r#"{"repository.callsign": "X"}"#).unwrap();
+    assert_eq!(
+        close_revision::resolve_repository_phid(&client, &fx.dir).unwrap(),
+        Some("PHID-REPO-9".to_string())
+    );
+    let query = recv(&seen);
+    assert_eq!(query.0, "repository.query");
+    assert!(query.1.contains("callsigns"), "{}", query.1);
+}
+
+#[test]
+fn resolve_repository_phid_treats_old_servers_as_untracked() {
+    let mut routes = HashMap::new();
+    routes.insert(
+        "repository.query".to_string(),
+        r#"{"result": null, "error_code": "ERR-CONDUIT-CALL", "error_info": "old"}"#.to_string(),
+    );
+    let (base, _seen) = serve(routes, 1);
+    let client = client_for(&base);
+
+    let fx = Fixture::named("close-repo-old");
+    std::fs::write(fx.dir.join(".arcconfig"), r#"{"repository.callsign": "X"}"#).unwrap();
+    assert_eq!(
+        close_revision::resolve_repository_phid(&client, &fx.dir).unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -350,10 +419,10 @@ fn prompts_before_closing_someone_elses_revision() {
     let prompted = std::cell::RefCell::new(Vec::new());
     let err = close_revision::execute(&client, &options_close("D123"), &|prompt| {
         prompted.borrow_mut().push(prompt.to_string());
-        false
+        Ok(false)
     })
     .unwrap_err();
-    assert_eq!(err, "Aborted.");
+    assert_eq!(err, "User aborted the workflow.");
     let prompted = prompted.borrow();
     assert_eq!(prompted.len(), 1);
     assert!(prompted[0].contains("not the author"), "{}", prompted[0]);
@@ -372,11 +441,11 @@ fn prompts_before_closing_someone_elses_revision() {
     routes.insert("differential.close".to_string(), envelope("null"));
     let (base, seen) = serve(routes, 3);
     let client = client_for(&base);
-    let report = close_revision::execute(&client, &options_close("D123"), &|_| true).unwrap();
+    let report = close_revision::execute(&client, &options_close("D123"), &|_| Ok(true)).unwrap();
     assert!(
-        report.stdout.contains("Done, closed revision."),
+        report.stderr.contains("Done, closed revision."),
         "{}",
-        report.stdout
+        report.stderr
     );
     assert_eq!(recv(&seen).0, "differential.query");
     assert_eq!(recv(&seen).0, "user.whoami");
@@ -403,9 +472,9 @@ fn force_skips_the_author_prompt() {
     let report =
         close_revision::execute(&client, &options, &|_| panic!("force must not prompt")).unwrap();
     assert!(
-        report.stdout.contains("Done, closed revision."),
+        report.stderr.contains("Done, closed revision."),
         "{}",
-        report.stdout
+        report.stderr
     );
     assert_eq!(recv(&seen).0, "differential.query");
     assert_eq!(recv(&seen).0, "user.whoami");
@@ -429,7 +498,7 @@ fn close_json_reports_result_on_stdout() {
 
     let mut options = options_close("D123");
     options.json = true;
-    let report = close_revision::execute(&client, &options, &|_| true).unwrap();
+    let report = close_revision::execute(&client, &options, &|_| Ok(true)).unwrap();
     let doc: serde_json::Value = serde_json::from_str(&report.stdout).unwrap();
     assert_eq!(
         doc,
@@ -658,7 +727,8 @@ fn creates_task_owned_by_viewer() {
     assert_eq!(recv(&seen).0, "user.whoami");
     let create = recv(&seen);
     assert_eq!(create.0, "maniphest.createtask");
-    assert!(create.1.contains("Do+thing"), "{}", create.1);
+    // PHP `rawurlencode()` encodes spaces as `%20` (never `+`).
+    assert!(create.1.contains("Do%20thing"), "{}", create.1);
     assert!(create.1.contains("PHID-USER-1"), "{}", create.1);
 }
 
@@ -741,14 +811,61 @@ fn unknown_project_slug_fails() {
     assert_eq!(err, "No such project: \"nope\"");
 }
 
+/// A fake browser command which exits zero without doing anything.
+#[cfg(windows)]
+fn null_browser_config() -> &'static str {
+    r#"{"browser": ["cmd", "/c", "rem"]}"#
+}
+
+/// A fake browser command which exits zero without doing anything.
+#[cfg(not(windows))]
+fn null_browser_config() -> &'static str {
+    r#"{"browser": ["true"]}"#
+}
+
 #[test]
-fn browse_fails_before_any_conduit_call() {
-    // Unroutable client: any IO attempt would fail differently.
-    let client = conduit::Client::new("http://127.0.0.1:9/", "t").unwrap();
-    let mut options = options_todo(&["t"]);
+fn browse_opens_the_created_task() {
+    let fx = Fixture::named("todo-browse");
+    std::fs::write(fx.dir.join(".arcconfig"), null_browser_config()).unwrap();
+    let mut routes = HashMap::new();
+    routes.insert(
+        "user.whoami".to_string(),
+        envelope(r#"{"phid": "PHID-USER-1"}"#),
+    );
+    routes.insert(
+        "maniphest.createtask".to_string(),
+        envelope(r#"{"id": 55, "title": "Do thing", "uri": "https://example.test/T55"}"#),
+    );
+    let (base, _seen) = serve(routes, 2);
+    let client = client_for(&base);
+
+    let mut options = options_todo(&["Do", "thing"]);
     options.browse = true;
-    let err = todo::execute(&client, &options).unwrap_err();
-    assert!(err.contains("--browse is not yet ported"), "{err}");
+    let out = todo::execute_in(&fx.dir, &client, &options).unwrap();
+    assert_eq!(
+        out,
+        "Created task T55: 'Do thing' at https://example.test/T55\n"
+    );
+
+    // A failing browser command fails the workflow with PHP's error.
+    std::fs::write(
+        fx.dir.join(".arcconfig"),
+        r#"{"browser": ["definitely-not-a-browser-xyz"]}"#,
+    )
+    .unwrap();
+    let mut routes = HashMap::new();
+    routes.insert(
+        "user.whoami".to_string(),
+        envelope(r#"{"phid": "PHID-USER-1"}"#),
+    );
+    routes.insert(
+        "maniphest.createtask".to_string(),
+        envelope(r#"{"id": 55, "title": "Do thing", "uri": "https://example.test/T55"}"#),
+    );
+    let (base, _seen) = serve(routes, 2);
+    let client = client_for(&base);
+    let err = todo::execute_in(&fx.dir, &client, &options).unwrap_err();
+    assert!(err.contains("Failed to open URI"), "{err}");
 }
 
 #[test]
@@ -839,7 +956,13 @@ fn list_marks_and_sorts_revisions() {
     // PHP sort key (exists, status, id) ascending: the foreign revision first.
     assert!(lines[0].contains("D2"), "{out}");
     assert!(!lines[0].starts_with('*'), "{out}");
-    assert!(lines[1].starts_with("* Accepted D1: Here work"), "{out}");
+    // PhutilConsoleTable pads the status column to the widest cell
+    // ("Needs Review") plus one separator space.
+    assert_eq!(
+        lines[1],
+        format!("* {:<12} D1: Here work", "Accepted"),
+        "{out}"
+    );
 }
 
 #[test]
@@ -894,6 +1017,33 @@ fn list_outside_repo_marks_nothing() {
     let out = list::execute_in(&client, &options_list(), &plain.dir).unwrap();
     assert!(!out.contains('*'), "{out}");
     assert!(out.contains("D1"), "{out}");
+}
+
+#[test]
+fn upload_continues_past_a_missing_file_then_reports_it() {
+    // PHP uploads every file first, then throws the first file's errors.
+    let mut routes = HashMap::new();
+    routes.insert(
+        "file.allocate".to_string(),
+        envelope(r#"{"filePHID": "PHID-FILE-1", "upload": false}"#),
+    );
+    let (base, seen) = serve(routes, 1);
+    let client = client_for(&base);
+
+    let fx = Fixture::named("upload-continue");
+    std::fs::write(fx.dir.join("good.bin"), b"data").unwrap();
+    let err = upload::upload_paths(
+        &client,
+        &fx.dir,
+        &["missing.bin".to_string(), "good.bin".to_string()],
+        false,
+        false,
+        None,
+    )
+    .unwrap_err();
+    assert!(err.contains("missing.bin"), "{err}");
+    // The good file still reached the server.
+    assert_eq!(recv(&seen).0, "file.allocate");
 }
 
 #[test]

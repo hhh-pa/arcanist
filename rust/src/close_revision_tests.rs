@@ -24,6 +24,7 @@ fn parses_revision_and_defaults() {
     assert!(!options.json);
     assert!(!options.force);
     assert_eq!(options.conduit_uri, None);
+    assert_eq!(options.repository_phid, None);
 }
 
 #[test]
@@ -76,14 +77,16 @@ fn rejects_bad_args() {
 
 #[test]
 fn normalizes_revision_ids() {
-    assert_eq!(normalize_revision_id("123").unwrap(), "123");
-    assert_eq!(normalize_revision_id("D123").unwrap(), "123");
-    assert_eq!(normalize_revision_id("d123").unwrap(), "123");
-    assert!(normalize_revision_id("").is_err());
-    assert!(normalize_revision_id("D").is_err());
-    assert!(normalize_revision_id("abc").is_err());
-    assert!(normalize_revision_id("12x").is_err());
-    assert!(normalize_revision_id("DD123").is_err());
+    assert_eq!(normalize_revision_id("123"), "123");
+    assert_eq!(normalize_revision_id("D123"), "123");
+    assert_eq!(normalize_revision_id("d123"), "123");
+    // Upstream never validates the format: one prefix is stripped and the
+    // rest flows to `differential.query` untouched.
+    assert_eq!(normalize_revision_id(""), "");
+    assert_eq!(normalize_revision_id("D"), "");
+    assert_eq!(normalize_revision_id("abc"), "abc");
+    assert_eq!(normalize_revision_id("12x"), "12x");
+    assert_eq!(normalize_revision_id("DD123"), "D123");
 }
 
 #[test]
@@ -147,4 +150,111 @@ fn builds_result_json() {
 #[test]
 fn close_targets_revision_id_number() {
     assert_eq!(id_param("123"), serde_json::json!(123));
+}
+
+#[test]
+fn finalize_skips_tracked_repositories() {
+    // No conduit traffic: the client points at a dead port and the skip
+    // happens before any call.
+    let client = conduit::Client::new("http://127.0.0.1:9/", "t").unwrap();
+    let rev = parse_revision(&revision(2, "PHID-USER-1")).unwrap();
+    let mut options = parse_args(&args(&["--finalize", "D123"])).unwrap().unwrap();
+    options.repository_phid = Some("PHID-REPO-1".to_string());
+    let step = close_if_accepted(&client, &options, &rev, "123", "D123", false).unwrap();
+    assert!(!step.closed);
+    assert!(step.progress.is_empty());
+    assert!(step.warnings.is_empty());
+}
+
+#[test]
+fn selects_only_unique_repository_matches() {
+    assert_eq!(
+        select_unique_phid(&serde_json::json!([{"phid": "PHID-REPO-1"}])),
+        Some("PHID-REPO-1".to_string())
+    );
+    assert_eq!(select_unique_phid(&serde_json::json!([])), None);
+    assert_eq!(
+        select_unique_phid(&serde_json::json!([{"phid": "A"}, {"phid": "B"}])),
+        None
+    );
+    assert_eq!(
+        select_unique_phid(&serde_json::json!([{"callsign": "X"}])),
+        None
+    );
+}
+
+fn empty_sources() -> get_config::Sources {
+    get_config::Sources {
+        local: serde_json::Map::new(),
+        project: serde_json::Map::new(),
+        user: serde_json::Map::new(),
+        system: serde_json::Map::new(),
+        default: get_config::default_config(),
+        project_file: None,
+    }
+}
+
+#[test]
+fn repository_query_orders_callsign_uuid_remote() {
+    let mut with_callsign = empty_sources();
+    with_callsign
+        .project
+        .insert("repository.callsign".to_string(), serde_json::json!("X"));
+    assert_eq!(configured_callsign(&with_callsign), Some("X".to_string()));
+    assert_eq!(
+        select_repository_query(&with_callsign, Some("uuid-1"), Some("https://x.test/")),
+        Some(serde_json::json!({"callsigns": ["X"]}))
+    );
+
+    let empty = empty_sources();
+    assert_eq!(configured_callsign(&empty), None);
+    assert_eq!(
+        select_repository_query(&empty, Some("uuid-1"), Some("https://x.test/")),
+        Some(serde_json::json!({"uuids": ["uuid-1"]}))
+    );
+    assert_eq!(
+        select_repository_query(&empty, None, Some("https://x.test/")),
+        Some(serde_json::json!({"remoteURIs": ["https://x.test/"]}))
+    );
+    assert_eq!(select_repository_query(&empty, None, None), None);
+}
+
+#[test]
+fn repository_query_prefers_configured_callsign() {
+    let tag = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "arc-rs-close-callsign-{}-{tag}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    // The project source beats user/system sources, so this holds no
+    // matter what the ambient machine configures.
+    std::fs::write(dir.join(".arcconfig"), r#"{"repository.callsign": "X"}"#).unwrap();
+    assert_eq!(
+        repository_query(&dir).unwrap(),
+        Some(serde_json::json!({"callsigns": ["X"]}))
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn detects_working_copy_flavors() {
+    let tag = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let base = std::env::temp_dir().join(format!("arc-rs-close-vcs-{}-{tag}", std::process::id()));
+    let hg = base.join("hg");
+    std::fs::create_dir_all(hg.join(".hg")).unwrap();
+    assert!(matches!(detect_working_copy(&hg), Some(WorkingCopy::Hg)));
+    let svn = base.join("svn");
+    std::fs::create_dir_all(svn.join(".svn")).unwrap();
+    assert!(matches!(detect_working_copy(&svn), Some(WorkingCopy::Svn)));
+    let plain = base.join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    assert!(detect_working_copy(&plain).is_none());
+    std::fs::remove_dir_all(&base).ok();
 }

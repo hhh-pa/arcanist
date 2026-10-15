@@ -259,16 +259,18 @@ fn markers_lists_git_branches_as_grid() {
     assert!(found[0].active);
     assert_eq!(found[0].name, "feature");
 
-    let text = markers::execute(tmp.path(), &[]).unwrap();
+    // Fixed width: message truncation depends on the terminal.
+    let text = markers::execute_with_client(tmp.path(), &[], Some(150), None).unwrap();
     let feature = git(tmp.path(), &["rev-parse", "--short", "feature"]);
-    assert!(text.contains("• * feature"), "got: {text}");
-    assert!(text.contains(&feature), "got: {text}");
+    // The tree grid follows graph order: master (first commit) renders
+    // first, the active feature marker second.
     assert!(text.contains("• master"), "got: {text}");
+    assert!(text.contains("└  *  feature"), "got: {text}");
+    assert!(text.contains(&feature), "got: {text}");
     assert!(text.contains("add thing"), "got: {text}");
-    // Active marker sorts first.
     let feature_at = text.find("feature").unwrap();
     let master_at = text.find("master").unwrap();
-    assert!(feature_at < master_at, "got: {text}");
+    assert!(master_at < feature_at, "got: {text}");
     assert!(text.ends_with('\n'));
 
     let json = markers::execute(tmp.path(), &args(&["--json"])).unwrap();

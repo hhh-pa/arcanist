@@ -32,6 +32,7 @@ fn usage() -> String {
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
     file_id: u64,
+    symbol: String,
     save_as: Option<String>,
     conduit_uri: Option<String>,
 }
@@ -42,20 +43,29 @@ enum ParseOutcome {
     Error(String),
 }
 
-/// `F123` or `123` to a numeric file ID.
+/// `F123` or `123` to a numeric file ID, mirroring `/^F?\d+$/` (uppercase
+/// `F` only, no trimming).
 pub fn parse_file_symbol(text: &str) -> Result<u64, String> {
-    let trimmed = text.trim();
-    let digits = trimmed
-        .strip_prefix('F')
-        .or_else(|| trimmed.strip_prefix('f'))
-        .unwrap_or(trimmed);
+    let digits = text.strip_prefix('F').unwrap_or(text);
     if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
-        digits
-            .parse::<u64>()
-            .map_err(|_| format!("Specify file by ID, e.g. F123 (got '{text}')."))
+        // PHP `(int)` casts saturate at `PHP_INT_MAX`.
+        Ok(digits.parse::<u64>().unwrap_or(i64::MAX as u64))
     } else {
-        Err(format!("Specify file by ID, e.g. F123 (got '{text}')."))
+        Err("Specify file by ID, e.g. F123.".to_string())
     }
+}
+
+/// Thousands separators, mirroring `PhutilNumber` for counts.
+pub fn format_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, byte) in digits.bytes().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(byte as char);
+    }
+    out
 }
 
 fn take_value(iter: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<String, ParseOutcome> {
@@ -159,6 +169,7 @@ impl Parser {
         };
         ParseOutcome::Args(Options {
             file_id,
+            symbol: self.positionals[0].clone(),
             save_as: self.save_as,
             conduit_uri: self.conduit_uri,
         })
@@ -208,6 +219,16 @@ fn first_search_hit(result: &serde_json::Value) -> Option<&serde_json::Value> {
 
 /// Resolve a file by ID via `file.search`.
 pub fn fetch_file_ref(client: &crate::conduit::Client, file_id: u64) -> Result<FileRef, String> {
+    fetch_file_ref_for_symbol(client, file_id, &format!("F{file_id}"))
+}
+
+/// Resolve a file, echoing the user's original symbol in the not-found
+/// error like PHP (`loadFileForSymbol($file_symbol)`).
+pub fn fetch_file_ref_for_symbol(
+    client: &crate::conduit::Client,
+    file_id: u64,
+    symbol: &str,
+) -> Result<FileRef, String> {
     let result = client
         .call(
             "file.search",
@@ -215,7 +236,7 @@ pub fn fetch_file_ref(client: &crate::conduit::Client, file_id: u64) -> Result<F
         )
         .map_err(|e| e.to_string())?;
     let hit = first_search_hit(&result).ok_or_else(|| {
-        format!("File \"F{file_id}\" does not exist, or you do not have permission to view it.")
+        format!("File \"{symbol}\" does not exist, or you do not have permission to view it.")
     })?;
     let id = hit
         .get("id")
@@ -244,10 +265,21 @@ pub fn fetch_file_ref(client: &crate::conduit::Client, file_id: u64) -> Result<F
     })
 }
 
-/// Fetch raw bytes from a data URI.
+/// Fetch raw bytes from a data URI with the default timeout.
 pub fn download_bytes(url: &str) -> Result<Vec<u8>, String> {
+    download_bytes_with_timeout(url, DOWNLOAD_TIMEOUT)
+}
+
+/// Timeout for file downloads, mirroring PHP: 120 seconds plus one second
+/// per 32 KiB of expected size.
+pub fn download_timeout(expected_bytes: u64) -> Duration {
+    Duration::from_secs(120 + expected_bytes / (32 * 1024))
+}
+
+/// Fetch raw bytes from a data URI with an explicit timeout.
+pub fn download_bytes_with_timeout(url: &str, timeout: Duration) -> Result<Vec<u8>, String> {
     let http = reqwest::blocking::Client::builder()
-        .timeout(DOWNLOAD_TIMEOUT)
+        .timeout(timeout)
         .no_proxy()
         .build()
         .map_err(|e| format!("failed to build HTTP client: {e}"))?;
@@ -307,6 +339,24 @@ pub fn resolve_target(
     }
 }
 
+fn size_mismatch_error(got: u64, expected: u64) -> String {
+    format!(
+        "Downloaded file size ({} bytes) does not match expected file size ({} bytes). \
+         This download may be incomplete or corrupt.",
+        format_count(got),
+        format_count(expected)
+    )
+}
+
+/// Mirror `Filesystem::readablePath()`: paths under `dir` show relative.
+fn readable_path(dir: &Path, target: &Path) -> String {
+    target
+        .strip_prefix(dir)
+        .unwrap_or(target)
+        .display()
+        .to_string()
+}
+
 /// Download one file with an existing client.
 ///
 /// With `save_as == Some("-")`, the file bytes are written to stdout
@@ -317,18 +367,24 @@ pub fn download_file(
     file_id: u64,
     save_as: Option<&str>,
 ) -> Result<String, String> {
-    let file = fetch_file_ref(client, file_id)?;
+    download_file_for_symbol(client, dir, file_id, &format!("F{file_id}"), save_as)
+}
+
+/// Download one file, echoing the user's original symbol in errors.
+pub fn download_file_for_symbol(
+    client: &crate::conduit::Client,
+    dir: &Path,
+    file_id: u64,
+    symbol: &str,
+    save_as: Option<&str>,
+) -> Result<String, String> {
+    let file = fetch_file_ref_for_symbol(client, file_id, symbol)?;
     let display_name = file.display_name();
 
     if save_as == Some("-") {
         let data = download_bytes(&file.data_uri)?;
         if data.len() as u64 != file.size {
-            return Err(format!(
-                "Downloaded file size ({} bytes) does not match expected file size ({} bytes). \
-                 This download may be incomplete or corrupt.",
-                data.len(),
-                file.size
-            ));
+            return Err(size_mismatch_error(data.len() as u64, file.size));
         }
         std::io::stdout()
             .write_all(&data)
@@ -337,19 +393,14 @@ pub fn download_file(
     }
 
     let target = resolve_target(dir, save_as, &file)?;
-    let display_path = target.display().to_string();
+    let display_path = readable_path(dir, &target);
     let mut out = format!(
         "Downloading \"{display_name}\" ({} byte(s)) to \"{display_path}\"...\n",
-        file.size
+        format_count(file.size)
     );
-    let data = download_bytes(&file.data_uri)?;
+    let data = download_bytes_with_timeout(&file.data_uri, download_timeout(file.size))?;
     if data.len() as u64 != file.size {
-        return Err(format!(
-            "Downloaded file size ({} bytes) does not match expected file size ({} bytes). \
-             This download may be incomplete or corrupt.",
-            data.len(),
-            file.size
-        ));
+        return Err(size_mismatch_error(data.len() as u64, file.size));
     }
     if let Err(e) = std::fs::write(&target, &data) {
         std::fs::remove_file(&target).ok();
@@ -369,7 +420,13 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
         ParseOutcome::Error(message) => return Err(format!("{message}\n\n{}", usage())),
     };
     let client = crate::config::client_for(opts.conduit_uri.as_deref())?;
-    download_file(&client, dir, opts.file_id, opts.save_as.as_deref())
+    download_file_for_symbol(
+        &client,
+        dir,
+        opts.file_id,
+        &opts.symbol,
+        opts.save_as.as_deref(),
+    )
 }
 
 pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {

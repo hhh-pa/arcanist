@@ -2,35 +2,36 @@
 //!
 //! PHP reference: `src/workflow/ArcanistBranchesWorkflow.php` (through
 //! `src/workflow/ArcanistMarkersWorkflow.php`), which lists branch markers
-//! annotated with Differential review status. This port lists local git
-//! branches — current marker, short hash, subject, upstream tracking — and
-//! adds `--all` (remote-tracking branches) and `--json`.
+//! annotated with Differential review status. The text output renders the
+//! full markers engine (commit graph, partitions, sets, tree grid); see
+//! `markers` for the shared implementation.
 //!
-//! Not yet ported (see T1128): Differential review-status annotation.
+//! Extensions over `arc branches` (which takes no arguments): `--all`
+//! heads remote-tracking branches too, `--json` emits branch objects, and
+//! `--conduit-uri` overrides conduit discovery.
 
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::git;
+use crate::{config, git, grid, markers};
 
 pub const NAME: &str = "branches";
 
 fn usage() -> String {
     format!(
-        "usage: arc-rs {NAME} [--all] [--json]\n\
+        "usage: arc-rs {NAME} [--all] [--json] [--conduit-uri URI]\n\
          \n\
          Show an enhanced view of branches in the working copy.\n\
          \n\
          Options:\n\
-         \x20 --all         include remote-tracking branches\n\
-         \x20 --json        emit a JSON array of branch objects\n\
-         \x20 -h, --help    show this help\n\
-         \n\
-         Not yet ported (see T1128): Differential review-status annotation.\n"
+         \x20 --all              include remote-tracking branches\n\
+         \x20 --json             emit a JSON array of branch objects\n\
+         \x20 --conduit-uri URI  conduit server (or ARC_CONDUIT_URI)\n\
+         \x20 -h, --help         show this help\n"
     )
 }
 
-/// One listed branch.
+/// One listed branch (the `--json` shape).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Branch {
     pub name: String,
@@ -47,6 +48,7 @@ pub struct Branch {
 pub struct Options {
     pub all: bool,
     pub json: bool,
+    pub conduit_uri: Option<String>,
 }
 
 /// Parse `argv` (excluding the subcommand name).
@@ -55,11 +57,20 @@ pub struct Options {
 pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
     let mut all = false;
     let mut json = false;
-    for arg in argv {
+    let mut conduit_uri = None;
+    let mut iter = argv.iter();
+    while let Some(arg) = iter.next() {
         if arg == "--all" {
             all = true;
         } else if arg == "--json" {
             json = true;
+        } else if arg == "--conduit-uri" {
+            let Some(value) = iter.next() else {
+                return Err("--conduit-uri requires a value".to_string());
+            };
+            conduit_uri = Some(value.clone());
+        } else if let Some(value) = arg.strip_prefix("--conduit-uri=") {
+            conduit_uri = Some(value.to_string());
         } else if arg == "-h" || arg == "--help" {
             return Ok(None);
         } else if arg == "--" {
@@ -70,7 +81,11 @@ pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
             return Err(format!("unexpected argument '{arg}'"));
         }
     }
-    Ok(Some(Options { all, json }))
+    Ok(Some(Options {
+        all,
+        json,
+        conduit_uri,
+    }))
 }
 
 const REF_FORMAT: &str =
@@ -152,29 +167,6 @@ pub fn list(dir: &Path, all: bool) -> Result<Vec<Branch>, String> {
     Ok(branches)
 }
 
-/// Render branches as text, one line per branch.
-#[must_use]
-pub fn format_text(branches: &[Branch]) -> String {
-    let mut out = String::new();
-    for branch in branches {
-        let marker = if branch.current { '*' } else { ' ' };
-        out.push_str(&format!(
-            "{marker} {} {} {}",
-            branch.name, branch.hash, branch.subject
-        ));
-        if branch.remote {
-            out.push_str(" (remote)");
-        } else if let Some(upstream) = &branch.upstream {
-            out.push_str(&format!(" -> {upstream}"));
-            if !branch.track.is_empty() {
-                out.push_str(&format!(" {}", branch.track));
-            }
-        }
-        out.push('\n');
-    }
-    out
-}
-
 /// Render branches as a JSON array of branch objects.
 #[must_use]
 pub fn format_json(branches: &[Branch]) -> serde_json::Value {
@@ -196,6 +188,18 @@ pub fn format_json(branches: &[Branch]) -> serde_json::Value {
     )
 }
 
+fn detect_vcs(dir: &Path) -> Option<&'static str> {
+    if git::is_inside_work_tree(dir) {
+        Some("git")
+    } else if markers::find_hg_root(dir).is_some() {
+        Some("hg")
+    } else if markers::find_svn_root(dir).is_some() {
+        Some("svn")
+    } else {
+        None
+    }
+}
+
 /// Run the workflow rooted at `dir`, returning stdout text or an error message.
 pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
     let options = match parse_options(argv) {
@@ -203,15 +207,75 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
         Ok(None) => return Ok(usage()),
         Err(message) => return Err(format!("{message}\n\n{}", usage())),
     };
-    let branches = list(dir, options.all)?;
+    let owned_client = config::client_for(options.conduit_uri.as_deref()).ok();
+    execute_core(dir, &options, grid::terminal_width(), owned_client.as_ref())
+}
+
+/// Run the workflow with an explicit terminal width and conduit client.
+///
+/// Test seam: production callers use [`execute`].
+pub fn execute_with_client(
+    dir: &Path,
+    argv: &[String],
+    terminal: Option<usize>,
+    client: Option<&crate::conduit::Client>,
+) -> Result<String, String> {
+    let options = match parse_options(argv) {
+        Ok(Some(options)) => options,
+        Ok(None) => return Ok(usage()),
+        Err(message) => return Err(format!("{message}\n\n{}", usage())),
+    };
+    execute_core(dir, &options, terminal, client)
+}
+
+fn execute_core(
+    dir: &Path,
+    options: &Options,
+    terminal: Option<usize>,
+    client: Option<&crate::conduit::Client>,
+) -> Result<String, String> {
     if options.json {
-        let mut text = serde_json::to_string_pretty(&format_json(&branches))
-            .map_err(|e| format!("failed to encode JSON: {e}"))?;
-        text.push('\n');
-        Ok(text)
-    } else {
-        Ok(format_text(&branches))
+        return match detect_vcs(dir) {
+            Some("hg") => {
+                let found = markers::list(dir, markers::MARKER_TYPE_BRANCH)?;
+                let branches: Vec<Branch> = found
+                    .iter()
+                    .map(|marker| Branch {
+                        name: marker.name.clone(),
+                        current: marker.active,
+                        hash: markers::short_hash(&marker.hash).to_string(),
+                        subject: marker.subject.clone(),
+                        upstream: None,
+                        track: String::new(),
+                        remote: false,
+                    })
+                    .collect();
+                let mut text = serde_json::to_string_pretty(&format_json(&branches))
+                    .map_err(|e| format!("failed to encode JSON: {e}"))?;
+                text.push('\n');
+                Ok(text)
+            }
+            _ => {
+                let branches = list(dir, options.all)?;
+                let mut text = serde_json::to_string_pretty(&format_json(&branches))
+                    .map_err(|e| format!("failed to encode JSON: {e}"))?;
+                text.push('\n');
+                Ok(text)
+            }
+        };
     }
+    let vcs = detect_vcs(dir).ok_or_else(|| "not inside a git repository".to_string())?;
+    if !markers::supports_marker_type(vcs, markers::MARKER_TYPE_BRANCH) {
+        return Err(markers::support_error(vcs, markers::MARKER_TYPE_BRANCH));
+    }
+    markers::run_workflow(
+        dir,
+        vcs,
+        markers::MARKER_TYPE_BRANCH,
+        options.all,
+        client,
+        terminal,
+    )
 }
 
 pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {

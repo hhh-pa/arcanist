@@ -131,6 +131,16 @@ fn renders_values_with_escapes_and_truncation() {
     );
     let long = "x".repeat(100);
     assert_eq!(render_value(&long), format!("\"{}\"", "x".repeat(64)));
+    // The cut counts bytes, not characters: 40 two-byte characters keep 32.
+    assert_eq!(
+        render_value(&"é".repeat(40)),
+        format!("\"{}\"", "é".repeat(32))
+    );
+    // A character split by the cut renders as U+FFFD.
+    assert_eq!(
+        render_value(&format!("{}é", "x".repeat(63))),
+        format!("\"{}\u{fffd}\"", "x".repeat(63))
+    );
 }
 
 #[test]
@@ -185,10 +195,21 @@ fn inspects_single_objects() {
 
     assert!(inspect_one(tmp.path(), "working-copy", false).is_err());
     assert!(inspect_one(tmp.path(), "browse", false).is_err());
-    assert_eq!(
-        inspect_one(tmp.path(), "browse(token)", false),
-        Err("\"browse(...)\" is not yet ported (requires Conduit; see T1128)".to_string())
+
+    let block = inspect_one(tmp.path(), "browse(HEAD)", false).unwrap();
+    assert!(
+        block.contains("+ [ArcanistBrowseRef] Browse Query \"HEAD\""),
+        "{block}"
     );
+    assert!(
+        block.contains(" o [ArcanistVectorHardpoint] commitRefs"),
+        "{block}"
+    );
+    assert!(
+        block.contains(" o [ArcanistVectorHardpoint] uris"),
+        "{block}"
+    );
+
     let unknown = inspect_one(tmp.path(), "commit(HEAD)", false).unwrap_err();
     assert!(unknown.contains("Unknown object type \"commit\""));
     assert!(unknown.contains("browse, working-copy"));
@@ -235,4 +256,71 @@ fn run_in_lists_types_and_joins_blocks() {
 fn run_reports_help_and_usage_errors() {
     assert_eq!(run(&args(&["--help"])), std::process::ExitCode::SUCCESS);
     assert_eq!(run(&args(&["--bogus"])), std::process::ExitCode::FAILURE);
+}
+
+#[test]
+fn explores_browse_tokens_through_the_engine() {
+    use std::collections::HashMap;
+    let tmp = init_repo("browsex");
+    std::fs::write(tmp.path().join("f.txt"), "one\n").unwrap();
+    git(tmp.path(), &["add", "f.txt"]);
+    git(tmp.path(), &["commit", "-m", "first subject"]);
+    let head = git(tmp.path(), &["rev-parse", "HEAD"]);
+
+    let mut routes = HashMap::new();
+    routes.insert("repository.query".to_string(), serde_json::json!([]));
+    routes.insert(
+        "phid.lookup".to_string(),
+        serde_json::json!({"nope": {"uri": "https://phab.example/nope"}}),
+    );
+    routes.insert("differential.query".to_string(), serde_json::json!([]));
+    let call = move |method: &str, _: &serde_json::Value| {
+        routes
+            .get(method)
+            .cloned()
+            .ok_or_else(|| format!("unexpected call {method}"))
+    };
+    // HEAD resolves to a commit but no URIs (no repo configured, the
+    // object lookup misses, the revision query is empty).
+    let mut ctx = browse::BrowseCtx::new(tmp.path(), &call, "");
+    let block = inspect_one_with(tmp.path(), "browse(HEAD)", true, Some(&mut ctx)).unwrap();
+    assert!(
+        block.contains("+ [ArcanistBrowseRef] Browse Query \"HEAD\""),
+        "{block}"
+    );
+    assert!(
+        block.contains(" * [ArcanistVectorHardpoint] commitRefs"),
+        "{block}"
+    );
+    assert!(block.contains(&format!("Commit \"{head}\"")), "{block}");
+    assert!(block.contains("first subject"), "{block}");
+    assert!(
+        block.contains(" * [ArcanistVectorHardpoint] uris"),
+        "{block}"
+    );
+
+    // End to end through run_in_with with an injected caller.
+    let mut routes = HashMap::new();
+    routes.insert("repository.query".to_string(), serde_json::json!([]));
+    routes.insert("phid.lookup".to_string(), serde_json::json!({}));
+    routes.insert("differential.query".to_string(), serde_json::json!([]));
+    let call = move |method: &str, _: &serde_json::Value| {
+        routes
+            .get(method)
+            .cloned()
+            .ok_or_else(|| format!("unexpected call {method}"))
+    };
+    assert_eq!(
+        run_in_with(
+            tmp.path(),
+            &args(&["--explore", "browse(HEAD)"]),
+            Some(&call)
+        ),
+        std::process::ExitCode::SUCCESS
+    );
+    // Without --explore, no Conduit is needed at all.
+    assert_eq!(
+        run_in_with(tmp.path(), &args(&["browse(HEAD)"]), None),
+        std::process::ExitCode::SUCCESS
+    );
 }

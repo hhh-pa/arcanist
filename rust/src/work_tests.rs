@@ -142,9 +142,9 @@ fn resolves_branches_commits_and_default_start() {
     assert!(!branch_exists(tmp.path(), "D123"));
 
     let head = git(tmp.path(), &["rev-parse", "HEAD"]);
-    assert_eq!(resolve_commit(tmp.path(), "HEAD"), Some(head.clone()));
-    assert_eq!(resolve_commit(tmp.path(), &head), Some(head.clone()));
-    assert_eq!(resolve_commit(tmp.path(), "no-such-rev"), None);
+    assert_eq!(canonical_revision(tmp.path(), "HEAD"), Some(head.clone()));
+    assert_eq!(canonical_revision(tmp.path(), &head), Some(head.clone()));
+    assert_eq!(canonical_revision(tmp.path(), "no-such-rev"), None);
     assert_eq!(default_start(tmp.path()), Some(branch));
 }
 
@@ -202,16 +202,29 @@ fn rejects_bad_startpoints_and_conduit_symbols() {
         run_in(tmp.path(), &args(&["--start", "no-such-rev", "feature"])),
         std::process::ExitCode::FAILURE
     );
+    // Unknown revision/task symbols fail through the mocked search (no
+    // network), and bare IDs never become branch names.
+    let empty = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({"data": []}))
+    };
+    let mut input = std::io::Cursor::new(b"");
     assert_eq!(
-        run_in(tmp.path(), &args(&["D123"])),
+        run_in_with(tmp.path(), &args(&["D123"]), Some(&empty), &mut input),
         std::process::ExitCode::FAILURE
     );
+    let mut input = std::io::Cursor::new(b"");
     assert_eq!(
-        run_in(tmp.path(), &args(&["T1"])),
+        run_in_with(tmp.path(), &args(&["T1"]), Some(&empty), &mut input),
+        std::process::ExitCode::FAILURE
+    );
+    let mut input = std::io::Cursor::new(b"");
+    assert_eq!(
+        run_in_with(tmp.path(), &args(&["123"]), Some(&empty), &mut input),
         std::process::ExitCode::FAILURE
     );
     // None of the failures created a branch.
     assert!(!branch_exists(tmp.path(), "feature"));
+    assert!(!branch_exists(tmp.path(), "123"));
 }
 
 #[test]
@@ -234,4 +247,429 @@ fn run_reports_help_and_usage_errors() {
     assert_eq!(run(&args(&["--help"])), std::process::ExitCode::SUCCESS);
     assert_eq!(run(&args(&[])), std::process::ExitCode::FAILURE);
     assert_eq!(run(&args(&["a", "b"])), std::process::ExitCode::FAILURE);
+}
+
+#[test]
+fn parses_object_symbols_like_php() {
+    use ObjectSymbol::{Id, Phid};
+    assert_eq!(revision_symbol("D123"), Some(Id("0".to_string())));
+    assert_eq!(revision_symbol("123"), Some(Id("123".to_string())));
+    assert_eq!(revision_symbol("d7"), Some(Id("0".to_string())));
+    assert_eq!(
+        revision_symbol("PHID-DREV-abc"),
+        Some(Phid("PHID-DREV-abc".to_string()))
+    );
+    for bad in [
+        "D",
+        "D0",
+        "0",
+        "D12x",
+        "T123",
+        "PHID-DREV-",
+        "PHID-DREV-a b",
+        "feature",
+        "",
+    ] {
+        assert_eq!(revision_symbol(bad), None, "{bad}");
+    }
+    assert_eq!(task_symbol("T123"), Some(Id("0".to_string())));
+    assert_eq!(task_symbol("123"), Some(Id("123".to_string())));
+    assert_eq!(task_symbol("t9"), Some(Id("0".to_string())));
+    assert_eq!(
+        task_symbol("PHID-TASK-abc"),
+        Some(Phid("PHID-TASK-abc".to_string()))
+    );
+    for bad in ["T", "T0", "D123", "PHID-TASK-", "feature"] {
+        assert_eq!(task_symbol(bad), None, "{bad}");
+    }
+    // Bare IDs parse as both; revisions win the dispatch order.
+    assert!(looks_like_revision("123"));
+    assert!(looks_like_task("123"));
+    assert!(symbol_needs_conduit("D1"));
+    assert!(!symbol_needs_conduit("feature"));
+}
+
+fn search_mock() -> impl Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String> {
+    |method: &str, params: &serde_json::Value| {
+        if method == "differential.revision.search" {
+            let ids = params
+                .get("constraints")
+                .and_then(|c| c.get("ids"))
+                .cloned()
+                .unwrap_or_default();
+            if ids == serde_json::json!([123]) {
+                return Ok(serde_json::json!({"data": [{
+                    "id": 123,
+                    "phid": "PHID-DREV-1",
+                    "fields": {"title": "Fix it"},
+                }]}));
+            }
+            return Ok(serde_json::json!({"data": []}));
+        }
+        if method == "maniphest.search" {
+            return Ok(serde_json::json!({"data": [{
+                "id": 7,
+                "phid": "PHID-TASK-1",
+            }]}));
+        }
+        Ok(serde_json::json!({"data": []}))
+    }
+}
+
+#[test]
+fn loads_revision_and_task_objects() {
+    let call = search_mock();
+    let revision = load_revision(&call, &ObjectSymbol::Id("123".to_string()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(revision.monogram, "D123");
+    assert_eq!(revision.title, "Fix it");
+    assert_eq!(revision.phid, "PHID-DREV-1");
+    assert!(
+        load_revision(&call, &ObjectSymbol::Id("999".to_string()))
+            .unwrap()
+            .is_none()
+    );
+    // Rows whose ID differs from the requested one do not match, and
+    // monogram symbols (ID 0 upstream) never match.
+    let mismatch = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({"data": [{"id": 123, "phid": "PHID-DREV-1"}]}))
+    };
+    assert!(
+        load_revision(&mismatch, &ObjectSymbol::Id("999".to_string()))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        load_revision(&mismatch, &ObjectSymbol::Id("0".to_string()))
+            .unwrap()
+            .is_none()
+    );
+    let task = load_task(&call, &ObjectSymbol::Id("7".to_string()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.monogram, "T7");
+}
+
+#[test]
+fn renders_ref_views_and_ambiguous_block() {
+    let revision = Revision {
+        id: "123".to_string(),
+        phid: "PHID-DREV-1".to_string(),
+        monogram: "D123".to_string(),
+        title: "Fix it".to_string(),
+    };
+    assert_eq!(
+        revision_ref_view(&revision, 80, false),
+        "  *   D123 Fix it\n"
+    );
+    let untitled = Revision {
+        title: String::new(),
+        ..revision
+    };
+    assert_eq!(revision_ref_view(&untitled, 80, false), "  *   D123\n");
+    let tip = BranchTip {
+        name: "feature".to_string(),
+        commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+        tree: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        epoch: 9,
+        summary: "work".to_string(),
+        message: "work".to_string(),
+    };
+    assert_eq!(
+        marker_ref_view(&tip, 80, false),
+        "  *   Branch \"feature\" 0123456789ab work\n"
+    );
+    let block = ambiguous_marker_block("D123", std::slice::from_ref(&tip), 80, false);
+    assert!(block.starts_with("\n <!> AMBIGUOUS MARKER \n"), "{block}");
+    assert!(block.contains("using the most recent one."), "{block}");
+    assert!(block.contains("Branch \"feature\""), "{block}");
+    assert!(block.ends_with("\n\n"), "{block:?}");
+}
+
+#[test]
+fn groups_dirty_paths_by_state() {
+    let tmp = init_repo("dirty");
+    commit_file(tmp.path(), "a.txt", "one");
+    commit_file(tmp.path(), "b.txt", "two");
+    // Unstaged modification, staged addition, untracked file.
+    std::fs::write(tmp.path().join("a.txt"), "changed\n").unwrap();
+    std::fs::write(tmp.path().join("c.txt"), "staged\n").unwrap();
+    git(tmp.path(), &["add", "c.txt"]);
+    std::fs::write(tmp.path().join("new.txt"), "untracked\n").unwrap();
+    let lists = dirty_lists(tmp.path()).unwrap();
+    assert_eq!(lists.untracked, vec!["new.txt".to_string()]);
+    assert_eq!(lists.unstaged, vec!["a.txt".to_string()]);
+    assert_eq!(lists.uncommitted, vec!["c.txt".to_string()]);
+    assert!(lists.externals.is_empty());
+
+    let block = render_uncommitted_block(tmp.path(), &lists, false);
+    assert!(block.contains(" <!> UNCOMMITTED CHANGES "), "{block}");
+    assert!(
+        block.contains("Untracked changes in working copy:"),
+        "{block}"
+    );
+    assert!(block.contains("    new.txt\n"), "{block}");
+    assert!(
+        block.contains("Unstaged changes in working copy:"),
+        "{block}"
+    );
+    assert!(
+        block.contains("Uncommitted changes in working copy:"),
+        "{block}"
+    );
+    assert!(block.contains("  ?   To configure Git"), "{block}");
+
+    let externals = render_externals_block(&["sub".to_string()], false);
+    assert!(
+        externals.contains("A submodule has uncommitted or untracked changes:"),
+        "{externals}"
+    );
+    assert!(externals.contains("      - sub\n"), "{externals}");
+    let many = render_externals_block(&["a".to_string(), "b".to_string()], false);
+    assert!(
+        many.contains("Submodules have uncommitted or untracked changes:"),
+        "{many}"
+    );
+    assert_eq!(
+        externals_query(1),
+        "Ignore the changes to this submodule and continue?"
+    );
+    assert_eq!(
+        externals_query(3),
+        "Ignore the changes to these submodules and continue?"
+    );
+}
+
+#[test]
+fn prompts_accept_retry_and_abort() {
+    let mut yes = std::io::Cursor::new(b"y\n");
+    assert!(console_confirm(&mut yes, "Go?", true).unwrap());
+    let mut empty_no = std::io::Cursor::new(b"\n");
+    assert!(!console_confirm(&mut empty_no, "Go?", true).unwrap());
+    let mut empty_yes = std::io::Cursor::new(b"\n");
+    assert!(console_confirm(&mut empty_yes, "Go?", false).unwrap());
+    let mut retry = std::io::Cursor::new(b"maybe\nn\n");
+    assert!(!console_confirm(&mut retry, "Go?", false).unwrap());
+    let mut eof = std::io::Cursor::new(b"");
+    assert!(!console_confirm(&mut eof, "Go?", true).unwrap());
+
+    let mut stash = std::io::Cursor::new(b"y\n");
+    assert!(stash_prompt(&mut stash, "Stash?").is_ok());
+    let mut saved = std::io::Cursor::new(b"?\ny*\n");
+    assert!(stash_prompt(&mut saved, "Stash?").is_ok());
+    let mut no = std::io::Cursor::new(b"\n");
+    assert_eq!(stash_prompt(&mut no, "Stash?").unwrap_err(), ABORT);
+    let mut eof = std::io::Cursor::new(b"");
+    assert_eq!(stash_prompt(&mut eof, "Stash?").unwrap_err(), ABORT);
+}
+
+fn stash_list(dir: &Path) -> String {
+    let output = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["stash", "list"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+#[test]
+fn stashes_dirty_trees_around_branch_creation() {
+    let tmp = init_repo("stash");
+    commit_file(tmp.path(), "f.txt", "one");
+    std::fs::write(tmp.path().join("extra.txt"), "untracked\n").unwrap();
+    let mut input = std::io::Cursor::new(b"y\n");
+    assert_eq!(
+        run_in_with(tmp.path(), &args(&["feature"]), None, &mut input),
+        std::process::ExitCode::SUCCESS
+    );
+    assert_eq!(current_branch(tmp.path()), "feature");
+    // The stash was re-applied and dropped.
+    assert!(tmp.path().join("extra.txt").is_file());
+    assert!(stash_list(tmp.path()).is_empty());
+    assert!(
+        dirty_lists(tmp.path())
+            .unwrap()
+            .untracked
+            .contains(&"extra.txt".to_string())
+    );
+}
+
+#[test]
+fn declining_the_stash_aborts() {
+    let tmp = init_repo("nostash");
+    commit_file(tmp.path(), "f.txt", "one");
+    std::fs::write(tmp.path().join("f.txt"), "dirty\n").unwrap();
+    let mut input = std::io::Cursor::new(b"n\n");
+    assert_eq!(
+        run_in_with(tmp.path(), &args(&["feature"]), None, &mut input),
+        std::process::ExitCode::FAILURE
+    );
+    assert!(!branch_exists(tmp.path(), "feature"));
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("f.txt")).unwrap(),
+        "dirty\n"
+    );
+}
+
+#[test]
+fn failures_restore_state_and_stash() {
+    let tmp = init_repo("restore");
+    commit_file(tmp.path(), "f.txt", "one");
+    let first = current_branch(tmp.path());
+    std::fs::write(tmp.path().join("f.txt"), "dirty\n").unwrap();
+    // "HEAD" is not a valid new branch name, so creation fails after the
+    // stash; the failure must restore the branch and the stashed change.
+    let mut input = std::io::Cursor::new(b"y\n");
+    assert_eq!(
+        run_in_with(tmp.path(), &args(&["HEAD"]), None, &mut input),
+        std::process::ExitCode::FAILURE
+    );
+    assert_eq!(current_branch(tmp.path()), first);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("f.txt")).unwrap(),
+        "dirty\n"
+    );
+    assert!(stash_list(tmp.path()).is_empty());
+}
+
+#[test]
+fn missing_tasks_fail_and_existing_tasks_hit_todo() {
+    let tmp = init_repo("tasks");
+    commit_file(tmp.path(), "f.txt", "one");
+    let empty = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({"data": []}))
+    };
+    let mut input = std::io::Cursor::new(b"");
+    assert_eq!(
+        run_in_with(tmp.path(), &args(&["T1"]), Some(&empty), &mut input),
+        std::process::ExitCode::FAILURE
+    );
+    // Monograms resolve to ID 0 upstream, so they never match, even when
+    // the object exists; bare IDs hit the upstream TODO instead.
+    let call = search_mock();
+    let mut input = std::io::Cursor::new(b"");
+    assert_eq!(
+        run_in_with(tmp.path(), &args(&["T7"]), Some(&call), &mut input),
+        std::process::ExitCode::FAILURE
+    );
+    let mut input = std::io::Cursor::new(b"");
+    assert_eq!(
+        run_in_with(tmp.path(), &args(&["7"]), Some(&call), &mut input),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+fn commit_with_footer(dir: &Path, name: &str, footer: &str) {
+    let message = format!("subject {name}\n\nDifferential Revision: {footer}\n");
+    std::fs::write(dir.join(name), "x\n").unwrap();
+    git(dir, &["add", name]);
+    git(dir, &["commit", "-m", &message]);
+}
+
+#[test]
+fn revision_symbols_switch_to_the_associated_branch() {
+    let tmp = init_repo("revwork");
+    commit_file(tmp.path(), "f.txt", "one");
+    let first = current_branch(tmp.path());
+    git(tmp.path(), &["checkout", "-q", "-b", "feature"]);
+    commit_with_footer(tmp.path(), "g.txt", "D123");
+    git(tmp.path(), &["checkout", "-q", &first]);
+
+    let call = search_mock();
+    let mut input = std::io::Cursor::new(b"");
+    assert_eq!(
+        run_in_with(tmp.path(), &args(&["123"]), Some(&call), &mut input),
+        std::process::ExitCode::SUCCESS
+    );
+    assert_eq!(current_branch(tmp.path()), "feature");
+}
+
+#[test]
+fn unassociated_revisions_fail_without_switching() {
+    let tmp = init_repo("revnone");
+    commit_file(tmp.path(), "f.txt", "one");
+    let first = current_branch(tmp.path());
+    let call = search_mock();
+    let mut input = std::io::Cursor::new(b"");
+    assert_eq!(
+        run_in_with(tmp.path(), &args(&["123"]), Some(&call), &mut input),
+        std::process::ExitCode::FAILURE
+    );
+    assert_eq!(current_branch(tmp.path()), first);
+}
+
+fn commit_at_date(dir: &Path, name: &str, footer: &str, date: &str) {
+    let message = format!("subject {name}\n\nDifferential Revision: {footer}\n");
+    std::fs::write(dir.join(name), "x\n").unwrap();
+    git(dir, &["add", name]);
+    let status = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["commit", "-m", &message])
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn ambiguous_revisions_pick_the_most_recent_branch() {
+    let tmp = init_repo("revamb");
+    commit_file(tmp.path(), "f.txt", "one");
+    let first = current_branch(tmp.path());
+    git(tmp.path(), &["checkout", "-q", "-b", "older"]);
+    commit_at_date(tmp.path(), "o.txt", "D123", "2005-01-01T00:00:00");
+    git(tmp.path(), &["checkout", "-q", &first]);
+    git(tmp.path(), &["checkout", "-q", "-b", "newer"]);
+    commit_at_date(tmp.path(), "n.txt", "D123", "2025-01-01T00:00:00");
+    git(tmp.path(), &["checkout", "-q", &first]);
+
+    let call = search_mock();
+    let mut input = std::io::Cursor::new(b"");
+    assert_eq!(
+        run_in_with(tmp.path(), &args(&["123"]), Some(&call), &mut input),
+        std::process::ExitCode::SUCCESS
+    );
+    assert_eq!(current_branch(tmp.path()), "newer");
+}
+
+#[test]
+fn monogram_symbols_never_match_upstream() {
+    let tmp = init_repo("revmono");
+    commit_file(tmp.path(), "f.txt", "one");
+    let first = current_branch(tmp.path());
+    git(tmp.path(), &["checkout", "-q", "-b", "feature"]);
+    commit_with_footer(tmp.path(), "g.txt", "D123");
+    git(tmp.path(), &["checkout", "-q", &first]);
+    // The same fixture resolves under the bare ID but not the monogram.
+    let call = search_mock();
+    let mut input = std::io::Cursor::new(b"");
+    assert_eq!(
+        run_in_with(tmp.path(), &args(&["D123"]), Some(&call), &mut input),
+        std::process::ExitCode::FAILURE
+    );
+    assert_eq!(current_branch(tmp.path()), first);
+}
+
+#[test]
+fn save_and_restore_roundtrips_branches() {
+    let tmp = init_repo("savestate");
+    commit_file(tmp.path(), "f.txt", "one");
+    let first = current_branch(tmp.path());
+    let state = save_work_state(tmp.path()).unwrap();
+    assert_eq!(state.ref_name.as_deref(), Some(first.as_str()));
+    git(tmp.path(), &["checkout", "-q", "-b", "other"]);
+    restore_work_state(tmp.path(), &state).unwrap();
+    assert_eq!(current_branch(tmp.path()), first);
+
+    git(tmp.path(), &["checkout", "-q", "--detach", "HEAD"]);
+    let detached = save_work_state(tmp.path()).unwrap();
+    assert!(detached.ref_name.is_none());
+    git(tmp.path(), &["checkout", "-q", &first]);
+    restore_work_state(tmp.path(), &detached).unwrap();
+    assert_eq!(
+        git(tmp.path(), &["rev-parse", "HEAD"]),
+        git(tmp.path(), &["rev-parse", &detached.commit])
+    );
 }

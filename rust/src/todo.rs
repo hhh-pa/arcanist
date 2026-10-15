@@ -4,18 +4,16 @@
 //! with `user.query` and `--project` slugs with `project.query`, then creates
 //! the task with `maniphest.createtask` owned by the authenticated user.
 //!
-//! Known limits (see T1128): `--browse` is not yet ported and fails before
-//! any task is created; output is plain text without the PHP colors.
+//! Known limits (see T1128): output is plain text without the PHP colors.
 
 use std::process::ExitCode;
 
-use crate::{conduit, config};
+use crate::{conduit, config, terminal};
 
 /// Subcommand name, matching `arc todo`.
 pub const NAME: &str = "todo";
 
-const USAGE: &str =
-    "usage: arc-rs todo SUMMARY [--cc USER] [--project SLUG] [--json] [--conduit-uri URI]\n";
+const USAGE: &str = "usage: arc-rs todo SUMMARY [--cc USER] [--project SLUG] [--json] [--browse] [--conduit-uri URI]\n";
 
 /// Parsed `todo` options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,7 +24,7 @@ pub struct Options {
     pub cc: Vec<String>,
     /// Project slugs to attach (`--project`, repeatable).
     pub projects: Vec<String>,
-    /// Open the new task in a browser (not yet ported).
+    /// Open the new task in a browser.
     pub browse: bool,
     /// Emit the created task as JSON.
     pub json: bool,
@@ -231,7 +229,8 @@ pub fn resolve_project_phids(
     for slug in slugs {
         let phid = slug_map
             .and_then(|map| map.get(slug))
-            .and_then(|v| v.as_str());
+            .and_then(|v| v.as_str())
+            .filter(|phid| !phid.is_empty() && *phid != "0");
         let Some(phid) = phid else {
             return Err(format!("No such project: \"{slug}\""));
         };
@@ -275,12 +274,19 @@ pub fn parse_created(value: &serde_json::Value) -> Option<CreatedTask> {
     })
 }
 
-/// Render the creation confirmation line.
+/// Render the creation confirmation line: the title and URI keep console
+/// colors (TTY) but substitute raw, like `phutil_console_format()`.
 #[must_use]
-pub fn render_created(task: &CreatedTask) -> String {
-    format!(
-        "Created task T{}: '{}' at {}\n",
-        task.id, task.title, task.uri
+pub fn render_created(task: &CreatedTask, ansi: bool) -> String {
+    let title = terminal::console_format("<fg:green>**%s**</fg>", &[&task.title], ansi);
+    let uri = terminal::console_format("<fg:blue>**%s**</fg>", &[&task.uri], ansi);
+    terminal::pht(
+        "Created task %s: '%s' at %s\n",
+        &[
+            terminal::PhtArg::Text(&format!("T{}", task.id)),
+            terminal::PhtArg::Text(&title),
+            terminal::PhtArg::Text(&uri),
+        ],
     )
 }
 
@@ -297,13 +303,24 @@ pub fn created_json(task: &CreatedTask) -> serde_json::Value {
 /// Create the task per `options`, returning the stdout text.
 ///
 /// Like the PHP reference, a blank summary prints a message and creates
-/// nothing. `--browse` fails before any conduit call.
+/// nothing. `--browse` opens the new task, resolving the browser command
+/// from the config for the current directory.
 pub fn execute(client: &conduit::Client, options: &Options) -> Result<String, String> {
-    if options.browse {
-        return Err("--browse is not yet ported (see T1128)".to_string());
-    }
+    let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    execute_in(&dir, client, options)
+}
+
+/// Create the task per `options` with `dir` pinning config discovery.
+pub fn execute_in(
+    dir: &std::path::Path,
+    client: &conduit::Client,
+    options: &Options,
+) -> Result<String, String> {
     let summary = options.summary.join(" ");
-    if summary.trim().is_empty() {
+    if summary
+        .trim_matches([' ', '\t', '\n', '\r', '\0', '\u{b}'])
+        .is_empty()
+    {
         return Ok("Please provide a summary.\n".to_string());
     }
 
@@ -334,13 +351,20 @@ pub fn execute(client: &conduit::Client, options: &Options) -> Result<String, St
         .map_err(|e| e.to_string())?;
     let task = parse_created(&result)
         .ok_or_else(|| "conduit maniphest.createtask response has no id".to_string())?;
+    if options.browse {
+        let configured = crate::browser::configured_browser(dir);
+        crate::browser::open_uris_in_browser(
+            std::slice::from_ref(&task.uri),
+            configured.as_deref(),
+        )?;
+    }
     if options.json {
         let mut doc = serde_json::to_string_pretty(&created_json(&task))
             .map_err(|e| format!("failed to encode JSON: {e}"))?;
         doc.push('\n');
         return Ok(doc);
     }
-    Ok(render_created(&task))
+    Ok(render_created(&task, terminal::ansi_enabled()))
 }
 
 /// Entry point: `argv` excludes the subcommand name.

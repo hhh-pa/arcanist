@@ -434,6 +434,50 @@ fn upload_paths_rejects_missing_file_without_io() {
     assert!(err.contains("cannot read"), "{err}");
 }
 
+/// A fake browser command which exits zero without doing anything.
+#[cfg(windows)]
+fn null_browser_config() -> &'static str {
+    r#"{"browser": ["cmd", "/c", "rem"]}"#
+}
+
+/// A fake browser command which exits zero without doing anything.
+#[cfg(not(windows))]
+fn null_browser_config() -> &'static str {
+    r#"{"browser": ["true"]}"#
+}
+
+#[test]
+fn upload_browse_opens_uploaded_files() {
+    let fx = Fixture::named("up-browse");
+    fx.write("a.txt", b"aaa");
+    fx.write(".arcconfig", null_browser_config().as_bytes());
+    let search = serde_json::json!({
+        "result": {
+            "data": [
+                {"id": 11, "phid": "PHID-FILE-11", "fields": {"name": "a.txt", "uri": "/F11"}},
+            ],
+        },
+        "error_code": null,
+    })
+    .to_string();
+    let (base, _rx) = serve_seq(vec![
+        r#"{"result": {"filePHID": "PHID-FILE-11", "upload": false}, "error_code": null}"#
+            .to_string(),
+        search,
+    ]);
+    let out = upload::upload_paths_with_browse(
+        &client_for(&base),
+        fx.path(),
+        &["a.txt".to_string()],
+        false,
+        false,
+        true,
+        Some("https://phab.example/"),
+    )
+    .unwrap();
+    assert!(out.contains("https://phab.example/F11"), "{out}");
+}
+
 // --- paste ---------------------------------------------------------------
 
 #[test]
@@ -586,12 +630,13 @@ fn liberate_rejects_ancient_and_unknown_versions() {
 fn liberate_creates_init_then_reports_missing_rebuild_script() {
     let fx = Fixture::named("lib-create");
     std::fs::create_dir_all(fx.dir.join("newlib")).unwrap();
-    let err =
-        liberate::execute_with_input(fx.path(), &argv(&["newlib"]), &mut filled_input("my-lib\n"))
-            .unwrap_err();
     // Creation succeeded (init file written) but no rebuild script exists
-    // above a temp dir, so the rebuild step fails deterministically.
-    assert!(err.contains("rebuild-map.php"), "{err}");
+    // above a temp dir, so the rebuild step fails deterministically. Like
+    // `arc liberate`, per-library rebuild failures still exit 0.
+    let out =
+        liberate::execute_with_input(fx.path(), &argv(&["newlib"]), &mut filled_input("my-lib\n"))
+            .unwrap();
+    assert!(out.contains("rebuild-map.php"), "{out}");
     let init =
         std::fs::read_to_string(fx.dir.join("newlib").join("__phutil_library_init__.php")).unwrap();
     assert!(init.contains("phutil_register_library('my-lib'"), "{init}");
@@ -605,13 +650,13 @@ fn liberate_missing_directory_decline_and_accept() {
     assert!(err.contains("does not exist"), "{err}");
     assert!(!fx.dir.join("ghost").exists());
 
-    let err = liberate::execute_with_input(
+    let out = liberate::execute_with_input(
         fx.path(),
         &argv(&["fresh"]),
         &mut filled_input("yes\nfresh-lib\n"),
     )
-    .unwrap_err();
-    assert!(err.contains("rebuild-map.php"), "{err}");
+    .unwrap();
+    assert!(out.contains("rebuild-map.php"), "{out}");
     assert!(
         fx.dir
             .join("fresh")
@@ -634,9 +679,14 @@ fn liberate_v2_reports_missing_rebuild_script() {
         "<?php // @phutil-library-version 2\n",
     )
     .unwrap();
-    let err =
-        liberate::execute_with_input(fx.path(), &argv(&["v2lib"]), &mut empty_input()).unwrap_err();
-    assert!(err.contains("rebuild-map.php"), "{err}");
+    let out =
+        liberate::execute_with_input(fx.path(), &argv(&["v2lib"]), &mut empty_input()).unwrap();
+    assert!(out.contains("rebuild-map.php"), "{out}");
+    // Per-library rebuild failures still exit 0, like `arc liberate`.
+    assert_eq!(
+        liberate::run_in(fx.path(), &argv(&["v2lib"])),
+        ExitCode::SUCCESS
+    );
 }
 
 #[test]
@@ -648,8 +698,8 @@ fn liberate_scan_updates_found_library() {
         "<?php\n",
     )
     .unwrap();
-    // v1 (no map): deterministic failure naming the library.
+    // v1 (no map): a fatal usage error aborting the workflow, like
+    // `arc liberate` (the library was named on the WORK line instead).
     let err = liberate::execute_with_input(fx.path(), &argv(&[]), &mut empty_input()).unwrap_err();
     assert!(err.contains("no longer supported"), "{err}");
-    assert!(err.contains("found"), "{err}");
 }

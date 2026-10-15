@@ -93,8 +93,23 @@ fn renders_created_line() {
         uri: "https://example.test/T55".to_string(),
     };
     assert_eq!(
-        render_created(&task),
+        render_created(&task, false),
         "Created task T55: 'Do thing' at https://example.test/T55\n"
+    );
+    // Titles substitute raw (never escaped) and keep colors on TTYs.
+    let tricky = CreatedTask {
+        id: "1".to_string(),
+        title: "a\nb".to_string(),
+        uri: "u".to_string(),
+    };
+    assert_eq!(
+        render_created(&tricky, false),
+        "Created task T1: 'a\nb' at u\n"
+    );
+    assert_eq!(
+        render_created(&task, true),
+        "Created task T55: '\u{1b}[32m\u{1b}[1mDo thing\u{1b}[m\u{1b}[39m' at \
+         \u{1b}[34m\u{1b}[1mhttps://example.test/T55\u{1b}[m\u{1b}[39m\n"
     );
 }
 

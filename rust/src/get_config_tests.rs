@@ -23,6 +23,17 @@ impl Drop for TempDir {
     }
 }
 
+fn empty_sources() -> Sources {
+    Sources {
+        local: serde_json::Map::new(),
+        project: serde_json::Map::new(),
+        user: serde_json::Map::new(),
+        system: serde_json::Map::new(),
+        default: default_config(),
+        project_file: None,
+    }
+}
+
 #[test]
 fn keys_cover_builtins_in_sorted_order() {
     let keys = known_keys();
@@ -43,23 +54,127 @@ fn keys_cover_builtins_in_sorted_order() {
 }
 
 #[test]
-fn metadata_matches_php_settings() {
-    assert!(
-        help_for("phabricator.uri")
-            .unwrap()
-            .contains("specific server")
-    );
+fn settings_table_matches_php_verbatim() {
+    // (key, type, help, example, legacy) traced to
+    // `ArcanistSettings::getOptions()`.
+    type ExpectedSetting<'a> = (&'a str, &'a str, &'a str, Option<&'a str>, Option<&'a str>);
+    let expected: &[ExpectedSetting] = &[
+        (
+            "aliases",
+            "aliases",
+            "Configured command aliases. Use \"arc alias\" to define aliases.",
+            None,
+            None,
+        ),
+        (
+            "arc.autostash",
+            "bool",
+            "Whether arc should permit the automatic stashing of changes in the working directory when requiring a clean working copy. This option should only be used when users understand how to restore their working directory from the local stash if an operation causes an unrecoverable error.",
+            Some("false"),
+            None,
+        ),
+        (
+            "arc.land.onto.default",
+            "string",
+            "The name of the default branch to land changes onto when `arc land` is run.",
+            Some("\"develop\""),
+            None,
+        ),
+        (
+            "base",
+            "string",
+            "Base commit ruleset to invoke when determining the start of a commit range. See \"Arcanist User Guide: Commit Ranges\" for details.",
+            Some("\"arc:amended, arc:prompt\""),
+            None,
+        ),
+        (
+            "browser",
+            "string",
+            "Command to use to invoke a web browser.",
+            Some("\"gnome-www-browser\""),
+            None,
+        ),
+        (
+            "default",
+            "string",
+            "The URI of a server to connect to by default, if arc is run in a project without a configured URI or run outside of a project.",
+            Some("\"http://devtools.example.com/\""),
+            None,
+        ),
+        (
+            "editor",
+            "string",
+            "Command to use to invoke an interactive editor, like `nano` or `vim`. This setting overrides the EDITOR environmental variable.",
+            Some("\"nano\""),
+            None,
+        ),
+        (
+            "events.listeners",
+            "list",
+            "List of event listener classes to install at startup.",
+            Some("[\"ExampleEventListener\"]"),
+            None,
+        ),
+        (
+            "history.immutable",
+            "bool",
+            "If true, arc will never change repository history (e.g., through amending or rebasing). Defaults to true in Mercurial and false in Git. This setting has no effect in Subversion.",
+            Some("false"),
+            Some("immutable_history"),
+        ),
+        (
+            "https.cabundle",
+            "string",
+            "Path to a custom CA bundle file to be used for cURL calls. This is used primarily when your conduit endpoint is behind HTTPS signed by your organization's internal CA.",
+            Some("support/yourca.pem"),
+            None,
+        ),
+        (
+            "lint.engine",
+            "string",
+            "The name of a default lint engine to use, if no lint engine is specified by the current project.",
+            Some("\"ExampleLintEngine\""),
+            Some("lint_engine"),
+        ),
+        (
+            "load",
+            "list",
+            "A list of paths to phutil libraries that should be loaded at startup. This can be used to make classes available, like lint or unit test engines.",
+            Some("[\"/var/arc/customlib/src\"]"),
+            Some("phutil_libraries"),
+        ),
+        (
+            "phabricator.uri",
+            "string",
+            "Associates this working copy with a specific server.",
+            Some("\"https://devtools.example.com/\""),
+            Some("conduit_uri"),
+        ),
+        (
+            "repository.callsign",
+            "string",
+            "Associate the working copy with a specific repository. Normally, arc can figure this association out on its own, but if your setup is unusual you can use this option to tell it what the desired value is.",
+            Some("\"X\""),
+            None,
+        ),
+        (
+            "unit.engine",
+            "string",
+            "The name of a default unit test engine to use, if no unit test engine is specified by the current project.",
+            Some("\"ExampleUnitTestEngine\""),
+            Some("unit_engine"),
+        ),
+    ];
+    assert_eq!(expected.len(), known_keys().len());
+    for (key, type_name, help, example, legacy) in expected {
+        assert_eq!(setting_type(key), *type_name, "type of {key}");
+        assert_eq!(help_for(key), Some(*help), "help of {key}");
+        assert_eq!(example_for(key), *example, "example of {key}");
+        assert_eq!(legacy_name(key), *legacy, "legacy of {key}");
+    }
     assert!(help_for("nope").is_none());
-    assert_eq!(example_for("editor"), Some("\"nano\""));
-    assert_eq!(example_for("aliases"), None);
     assert_eq!(example_for("nope"), None);
-    assert_eq!(setting_type("history.immutable"), "bool");
-    assert_eq!(setting_type("load"), "list");
-    assert_eq!(setting_type("editor"), "string");
-    assert_eq!(setting_type("aliases"), "aliases");
     assert_eq!(setting_type("nope"), "wild");
-    assert_eq!(legacy_name("phabricator.uri"), Some("conduit_uri"));
-    assert_eq!(legacy_name("load"), Some("phutil_libraries"));
     assert_eq!(legacy_name("editor"), None);
 }
 
@@ -82,7 +197,37 @@ fn values_format_like_php() {
         format_value("k", &serde_json::json!(["a", "b"])),
         "[\"a\",\"b\"]"
     );
+    assert_eq!(format_value("k", &serde_json::json!({"a": 1})), "{\"a\":1}");
     assert_eq!(format_value("k", &serde_json::json!(7)), "7");
+    // Slashes stay literal, like PHP's display-time `\/` unescaping.
+    assert_eq!(format_value("k", &serde_json::json!(["a/b"])), "[\"a/b\"]");
+}
+
+#[test]
+fn verbose_help_goes_through_console_wrap() {
+    use arc_rs::terminal;
+    // Hand-traced through the PHP algorithm: 89 chars at width 74 break
+    // after "misspelled", consuming the space.
+    assert_eq!(
+        terminal::console_wrap(
+            "(This configuration value is not recognized by arc. It may be misspelled or out of date.)",
+            4,
+            true,
+        ),
+        "    (This configuration value is not recognized by arc. It may be misspelled\n    or out of date.)"
+    );
+    // Hand-traced: the editor help breaks after "`vim`." (69 + 57 chars).
+    assert_eq!(
+        terminal::console_wrap(help_for("editor").unwrap(), 4, true),
+        "    Command to use to invoke an interactive editor, like `nano` or `vim`.\n    This setting overrides the EDITOR environmental variable."
+    );
+    // Every builtin help fits 78 columns once wrapped at indent 4.
+    for key in known_keys() {
+        for line in terminal::console_wrap(help_for(key).unwrap(), 4, true).lines() {
+            assert!(line.len() <= 78, "{key}: {line}");
+            assert!(line.starts_with("    "), "{key}: {line}");
+        }
+    }
 }
 
 #[test]
@@ -105,7 +250,12 @@ fn project_config_walks_up_and_validates() {
     assert!(none.is_none() && empty.is_empty());
 
     std::fs::write(tmp.path.join(".arcconfig"), "not json").unwrap();
-    assert!(read_project_config(&tmp.path).is_err());
+    let err = read_project_config(&tmp.path).unwrap_err();
+    assert!(
+        err.starts_with("Unable to parse '.arcconfig' file '"),
+        "{err}"
+    );
+    assert!(err.ends_with(".arcconfig'."));
     std::fs::write(tmp.path.join(".arcconfig"), "[1]").unwrap();
     assert!(read_project_config(&tmp.path).is_err());
 }
@@ -135,7 +285,11 @@ fn user_file_reads_config_and_aliases() {
     std::fs::write(&missing, r#"{"hosts": {}}"#).unwrap();
     assert!(read_user_file(&missing).unwrap().is_empty());
     std::fs::write(&missing, "nope").unwrap();
-    assert!(read_user_file(&missing).is_err());
+    // PHP hardcodes the filename in this error.
+    assert_eq!(
+        read_user_file(&missing).unwrap_err(),
+        "Your '~/.arcrc' file is not a valid JSON file."
+    );
     std::fs::write(&missing, "[1]").unwrap();
     assert!(read_user_file(&missing).is_err());
     std::fs::write(&missing, r#"{"config": 7}"#).unwrap();
@@ -148,7 +302,9 @@ fn system_file_missing_is_empty_and_invalid_fails() {
     let missing = tmp.path.join("arcconfig");
     assert!(read_system_config_from(&missing).unwrap().is_empty());
     std::fs::write(&missing, "nope").unwrap();
-    assert!(read_system_config_from(&missing).is_err());
+    let err = read_system_config_from(&missing).unwrap_err();
+    assert!(err.starts_with("Your '"), "{err}");
+    assert!(err.ends_with("file is not a valid JSON file."), "{err}");
     let path = system_config_path();
     if cfg!(windows) {
         assert!(path.ends_with(Path::new("Phabricator").join("Arcanist").join("config")));
@@ -211,28 +367,93 @@ fn project_legacy_names_apply() {
 }
 
 #[test]
-fn rendering_shows_values_sources_and_details() {
-    let tmp = TempDir::new("render");
+fn brief_render_matches_php_bytes() {
+    let tmp = TempDir::new("brief");
     std::fs::write(tmp.path.join(".arcconfig"), r#"{"editor": "nano"}"#).unwrap();
     let sources = load_sources(&tmp.path, None).unwrap();
-    let brief = render("editor", &sources, false);
-    assert!(brief.contains("editor"), "{brief}");
-    assert!(brief.contains("\"nano\""), "{brief}");
-    assert!(brief.contains("project"), "{brief}");
-    let detailed = render("editor", &sources, true);
-    assert!(detailed.contains("interactive editor"), "{detailed}");
-    assert!(detailed.contains("Local Value"), "{detailed}");
-    assert!(detailed.contains("Project Value"), "{detailed}");
-    let unknown = render("bogus.key", &sources, true);
-    assert!(unknown.contains("not recognized"), "{unknown}");
-    let all = render_all(&["editor".to_string()], &sources, false);
-    assert!(all.contains("--show-source"), "{all}");
-    let multi = render_all(&["a".to_string(), "b".to_string()], &sources, false);
+    assert_eq!(
+        render_ansi("editor", &sources, false, false),
+        "editor\n\n       Current Value: \"nano\"\n      Current Source: project\n"
+    );
+    assert_eq!(
+        render_ansi("never-set", &sources, false, false),
+        "never-set\n\n       Current Value: -\n      Current Source: -\n"
+    );
+    let all = render_all_ansi(&["editor".to_string()], &sources, false, false);
+    assert_eq!(
+        all,
+        "editor\n\n       Current Value: \"nano\"\n      Current Source: project\n(Run with --verbose for more details.)\n"
+    );
+}
+
+#[test]
+fn verbose_render_matches_php_bytes() {
+    let tmp = TempDir::new("verbose");
+    std::fs::write(tmp.path.join(".arcconfig"), r#"{"editor": "nano"}"#).unwrap();
+    let sources = load_sources(&tmp.path, None).unwrap();
+    // Source labels keep PHP's lowercase names; the example row prints
+    // empty (not `-`) when the key has no example.
+    assert_eq!(
+        render_ansi("editor", &sources, true, false),
+        "editor\n\
+         \n\
+         \x20   Command to use to invoke an interactive editor, like `nano` or `vim`.\n\
+         \x20   This setting overrides the EDITOR environmental variable.\n\
+         \n\
+         \x20      Example Value: \"nano\"\n\
+         \n\
+         \x20      Current Value: \"nano\"\n\
+         \x20     Current Source: project\n\
+         \n\
+         \x20        local Value: -\n\
+         \x20      project Value: \"nano\"\n\
+         \x20         user Value: -\n\
+         \x20       system Value: -\n\
+         \x20      default Value: -\n"
+    );
+    assert_eq!(
+        render_ansi("bogus.key", &sources, true, false),
+        "bogus.key\n\
+         \n\
+         \x20   (This configuration value is not recognized by arc. It may be misspelled\n\
+         \x20   or out of date.)\n\
+         \n\
+         \x20      Example Value: \n\
+         \n\
+         \x20      Current Value: -\n\
+         \x20     Current Source: -\n\
+         \n\
+         \x20        local Value: -\n\
+         \x20      project Value: -\n\
+         \x20         user Value: -\n\
+         \x20       system Value: -\n\
+         \x20      default Value: -\n"
+    );
+    assert!(!render_all_ansi(&["a".to_string()], &sources, true, false).contains("Run with"));
+}
+
+#[test]
+fn ansi_render_bolds_only_the_header() {
+    let sources = empty_sources();
+    assert_eq!(
+        render_ansi("editor", &sources, false, true),
+        "\x1b[1meditor\x1b[m\n\n       Current Value: -\n      Current Source: -\n"
+    );
+}
+
+#[test]
+fn multi_key_output_separates_blocks() {
+    let sources = empty_sources();
+    let multi = render_all_ansi(&["a".to_string(), "b".to_string()], &sources, false, false);
     assert!(
-        multi.ends_with("(Run with --show-source for more details.)\n"),
+        multi.ends_with("(Run with --verbose for more details.)\n"),
         "{multi}"
     );
-    assert!(!render_all(&["a".to_string()], &sources, true).contains("Run with"));
+    // Each brief block ends with a blank line separator when multi.
+    assert_eq!(
+        multi,
+        "a\n\n       Current Value: -\n      Current Source: -\n\nb\n\n       Current Value: -\n      Current Source: -\n\n(Run with --verbose for more details.)\n"
+    );
 }
 
 #[test]

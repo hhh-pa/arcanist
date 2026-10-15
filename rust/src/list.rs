@@ -6,13 +6,13 @@
 //! copy, and prints them sorted like the PHP table (or as `--json`).
 //!
 //! Known limits (see T1128): output is plain text without the PHP status
-//! colors; outside a git repository the command still works with no `*`
+//! colors; outside a repository the command still works with no `*`
 //! markers instead of failing like the PHP reference.
 
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::{conduit, config, git};
+use crate::{conduit, config, git, svn, terminal};
 
 /// Subcommand name, matching `arc list`.
 pub const NAME: &str = "list";
@@ -146,19 +146,33 @@ pub fn parse_revisions(result: &serde_json::Value) -> Vec<RevisionInfo> {
     items.into_iter().filter_map(parse_revision).collect()
 }
 
-/// Sort like the PHP table key (`exists`, `status`, `id` ascending).
+/// Sort like the PHP table key: `sprintf('%d%04d%08d', exists, status,
+/// id)` ascending.
 pub fn sort_revisions(revisions: &mut [RevisionInfo]) {
     revisions.sort_by(|a, b| {
         let key = |r: &RevisionInfo| {
-            (
-                r.exists,
+            format!(
+                "{}{:04}{:08}",
+                r.exists as u8,
                 r.status,
-                r.id.parse::<u64>().unwrap_or(u64::MAX),
-                r.id.clone(),
+                terminal::php_int_cast(&r.id)
             )
         };
         key(a).cmp(&key(b))
     });
+}
+
+/// Map a revision status name to a terminal color, defaulting like PHP.
+#[must_use]
+pub fn status_color(status_name: &str) -> &'static str {
+    match status_name {
+        "Closed" => "cyan",
+        "Needs Review" => "magenta",
+        "Needs Revision" | "Changes Planned" => "red",
+        "Accepted" => "green",
+        "No Revision" => "blue",
+        _ => "default",
+    }
 }
 
 /// True when two paths name the same location (symlinks resolved), mirroring
@@ -174,6 +188,30 @@ pub fn same_path(a: &str, b: &str) -> bool {
     }
 }
 
+/// Walk toward the filesystem root for a Mercurial `.hg` dir.
+#[must_use]
+pub fn find_hg_root(start: &Path) -> Option<std::path::PathBuf> {
+    start
+        .ancestors()
+        .find(|dir| dir.join(".hg").exists())
+        .map(Path::to_path_buf)
+}
+
+/// Working-copy root for `*` markers: git first, then Mercurial, then
+/// Subversion, mirroring the PHP repository API detection.
+#[must_use]
+pub fn working_copy_root(cwd: &Path) -> Option<String> {
+    if let Ok(top) = git::stdout_text(cwd, &["rev-parse", "--show-toplevel"]) {
+        return Some(top);
+    }
+    if let Some(root) = find_hg_root(cwd) {
+        return Some(root.to_string_lossy().to_string());
+    }
+    svn::find_metadata_path(cwd)
+        .and_then(|meta| meta.parent().map(Path::to_path_buf))
+        .map(|root| root.to_string_lossy().to_string())
+}
+
 /// Authenticated user's PHID via `user.whoami`.
 pub fn user_phid(client: &conduit::Client) -> Result<String, String> {
     let who = client
@@ -185,14 +223,44 @@ pub fn user_phid(client: &conduit::Client) -> Result<String, String> {
         .ok_or_else(|| "conduit user.whoami response has no phid".to_string())
 }
 
-/// Render one revision row, `*`-marked when it lives in this working copy.
+/// Render revisions as a console table, `*`-marking rows that live in
+/// this working copy.
 #[must_use]
-pub fn render_row(revision: &RevisionInfo) -> String {
-    let marker = if revision.exists { "*" } else { " " };
-    format!(
-        "{marker} {} D{}: {}",
-        revision.status_name, revision.id, revision.title
-    )
+pub fn render_table(revisions: &[RevisionInfo], ansi: bool) -> String {
+    let rows: Vec<Vec<terminal::TableCell>> = revisions
+        .iter()
+        .map(|r| {
+            let exists = if r.exists {
+                terminal::TableCell::Terminal(
+                    terminal::tsprintf_ansi("**%s**", &[terminal::TVal::Text("*")], ansi)
+                        .unwrap_or_default(),
+                )
+            } else {
+                terminal::TableCell::Text(String::new())
+            };
+            let status = terminal::tsprintf_ansi(
+                &format!("<fg:{}>%s</fg>", status_color(&r.status_name)),
+                &[terminal::TVal::Text(&r.status_name)],
+                ansi,
+            )
+            .unwrap_or_default();
+            let title = terminal::tsprintf_ansi(
+                "**D%d:** %s",
+                &[
+                    terminal::TVal::Int(terminal::php_int_cast(&r.id)),
+                    terminal::TVal::Text(&r.title),
+                ],
+                ansi,
+            )
+            .unwrap_or_default();
+            vec![
+                exists,
+                terminal::TableCell::Terminal(status),
+                terminal::TableCell::Terminal(title),
+            ]
+        })
+        .collect();
+    terminal::console_table(&["", "Status", "Title"], &rows)
 }
 
 /// Build the `--json` document.
@@ -231,8 +299,7 @@ pub fn execute_in(
     if revisions.is_empty() {
         return Ok("You have no open Differential revisions.\n".to_string());
     }
-    let toplevel = git::stdout_text(cwd, &["rev-parse", "--show-toplevel"]).ok();
-    if let Some(top) = toplevel {
+    if let Some(top) = working_copy_root(cwd) {
         for revision in &mut revisions {
             revision.exists = same_path(&revision.source_path, &top);
         }
@@ -244,12 +311,7 @@ pub fn execute_in(
         doc.push('\n');
         return Ok(doc);
     }
-    let mut out = String::new();
-    for revision in &revisions {
-        out += &render_row(revision);
-        out.push('\n');
-    }
-    Ok(out)
+    Ok(render_table(&revisions, terminal::ansi_enabled()))
 }
 
 /// Query and render open revisions against the current directory.
