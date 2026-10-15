@@ -6,8 +6,9 @@
 //! renderers (`renderLinters()`, `:206-306`).
 //!
 //! Divergences from PHP:
-//! - Markup (colors, bold) is stripped: output matches piped (non-TTY)
-//!   `arc`.
+//! - Markup (colors, bold) renders on TTYs via the shared terminal
+//!   styling helpers (see [`render_entries_with_ansi`]) and is stripped
+//!   otherwise: non-TTY output matches piped `arc`.
 //! - `phutil_console_wrap()` is approximated as word-wrap at 80 columns
 //!   (see [`arc_rs::lint::word_wrap`]).
 //! - Version-probe failure text cannot match phutil's `CommandException`
@@ -25,7 +26,12 @@ extern crate self as arc_rs;
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
+use crate::terminal;
+
 pub const NAME: &str = "linters";
+
+/// Status-line indent (`$pad`, `:61`).
+const PAD: &str = "    ";
 
 fn usage() -> String {
     "usage: arc-rs linters [--verbose] [--search TERM] [NAME...]\n\
@@ -1369,14 +1375,56 @@ pub fn sort_entries(entries: Vec<&LinterEntry>) -> Vec<&LinterEntry> {
 
 /* -(  Rendering  )------------------------------------------------------------- */
 
+/// Console badge color for a linter status (`$color_map`, `:63-67`):
+/// configured green, available yellow, error red.
+fn status_color(status: LinterStatus) -> &'static str {
+    match status {
+        LinterStatus::Configured => "green",
+        LinterStatus::Available => "yellow",
+        LinterStatus::Error => "red",
+    }
+}
+
+/// One status header line (`$console->writeOut("<bg:COLOR>** %s
+/// **</bg> **%s** (%s)\n", ...)`, `:99-104`).
+fn render_entry_header(
+    out: &mut String,
+    status: LinterStatus,
+    name: &str,
+    detail: &str,
+    ansi: bool,
+) {
+    let pattern = format!(
+        "<bg:{}>** %s **</bg> **%s** (%s)\n",
+        status_color(status)
+    );
+    let text = format!("{:<10}", status.text());
+    out.push_str(&terminal::console_format(
+        &pattern,
+        &[&text, name, detail],
+        ansi,
+    ));
+}
+
 /// Render entries (`renderLinters()`), markup stripped.
 pub fn render_entries(entries: &[&LinterEntry], verbose: bool) -> String {
+    render_entries_with_ansi(entries, verbose, terminal::ansi_enabled())
+}
+
+/// Render entries with an explicit ANSI flag: TTYs render the status
+/// badges, bold names, and underlines like PHP; non-TTYs keep the
+/// stripped rendering byte-identical.
+pub fn render_entries_with_ansi(
+    entries: &[&LinterEntry],
+    verbose: bool,
+    ansi: bool,
+) -> String {
     let mut out = String::new();
     for entry in entries {
         if verbose {
-            render_verbose_entry(entry, &mut out);
+            render_verbose_entry(entry, &mut out, ansi);
         } else {
-            render_brief_entry(entry, &mut out);
+            render_brief_entry(entry, &mut out, ansi);
         }
     }
     if !verbose {
@@ -1386,32 +1434,28 @@ pub fn render_entries(entries: &[&LinterEntry], verbose: bool) -> String {
 }
 
 /// One non-verbose entry line.
-fn render_brief_entry(entry: &LinterEntry, out: &mut String) {
+fn render_brief_entry(entry: &LinterEntry, out: &mut String, ansi: bool) {
     let meta = entry.meta;
-    out.push_str(&format!(
-        " {:<10}  {} ({})\n",
-        entry.status.text(),
+    render_entry_header(
+        out,
+        entry.status,
         meta.config_name,
-        meta.info_name
-    ));
+        meta.info_name,
+        ansi,
+    );
 }
 
 /// One verbose entry: header plus error, version, description, options,
 /// and XHP rules sections.
-fn render_verbose_entry(entry: &LinterEntry, out: &mut String) {
+fn render_verbose_entry(entry: &LinterEntry, out: &mut String, ansi: bool) {
     let meta = entry.meta;
     out.push('\n');
-    out.push_str(&format!(
-        " {:<10}  {} ({})\n",
-        entry.status.text(),
-        meta.info_name,
-        meta.class
-    ));
+    render_entry_header(out, entry.status, meta.info_name, meta.class, ansi);
     let mut tail = false;
-    tail |= render_entry_error(entry, out);
-    tail |= render_entry_version(entry, out);
-    tail |= render_entry_description(entry, out);
-    tail |= render_entry_options(entry, out);
+    tail |= render_entry_error(entry, out, ansi);
+    tail |= render_entry_version(entry, out, ansi);
+    tail |= render_entry_description(entry, out, ansi);
+    tail |= render_entry_options(entry, out, ansi);
     if meta.class == "ArcanistXHPASTLinter" {
         out.push_str("\n    Linter Rules\n\n");
         out.push_str(&xhpast_rules_table());
@@ -1421,75 +1465,125 @@ fn render_verbose_entry(entry: &LinterEntry, out: &mut String) {
     }
 }
 
-/// A probe failure, shown as an exception. Returns true when written.
-fn render_entry_error(entry: &LinterEntry, out: &mut String) -> bool {
+/// A probe failure, shown as an exception (`:112-118`). Returns true
+/// when written.
+fn render_entry_error(entry: &LinterEntry, out: &mut String, ansi: bool) -> bool {
     let Some(error) = &entry.error else {
         return false;
     };
-    out.push('\n');
-    out.push_str(&format!("    {}\n", error.class));
-    out.push_str(&arc_rs::lint::word_wrap(&error.message, 4));
-    out.push('\n');
+    if ansi {
+        let message = terminal::console_wrap(&error.message, 4, true);
+        out.push_str(&terminal::console_format(
+            "\n%s**%s**\n%s\n",
+            &[PAD, error.class, message.as_str()],
+            true,
+        ));
+    } else {
+        out.push('\n');
+        out.push_str(&format!("    {}\n", error.class));
+        out.push_str(&arc_rs::lint::word_wrap(&error.message, 4));
+        out.push('\n');
+    }
     true
 }
 
-/// The version/URI block. Returns true when written.
-fn render_entry_version(entry: &LinterEntry, out: &mut String) -> bool {
+/// The version/URI block (`:121-127`). Returns true when written.
+fn render_entry_version(entry: &LinterEntry, out: &mut String, ansi: bool) -> bool {
     let meta = entry.meta;
     if entry.version.is_none() && meta.uri.is_none() {
         return false;
     }
     out.push('\n');
     if let Some(version) = &entry.version {
-        out.push_str(&format!("    Version {version}\n"));
+        out.push_str(&terminal::console_format(
+            "%s%s **%s**\n",
+            &[PAD, "Version", version.as_str()],
+            ansi,
+        ));
     }
     if let Some(uri) = meta.uri {
-        out.push_str(&format!("    {uri}\n"));
+        out.push_str(&terminal::console_format("%s__%s__\n", &[PAD, uri], ansi));
     }
     true
 }
 
-/// The description block. Returns true when written.
-fn render_entry_description(entry: &LinterEntry, out: &mut String) -> bool {
+/// The description block (`:129-133`). Returns true when written.
+fn render_entry_description(entry: &LinterEntry, out: &mut String, ansi: bool) -> bool {
     let Some(description) = entry.meta.description else {
         return false;
     };
-    out.push('\n');
-    out.push_str(&arc_rs::lint::word_wrap(description, 4));
-    out.push('\n');
+    if ansi {
+        let wrapped = terminal::console_wrap(description, 4, true);
+        out.push_str(&terminal::console_format(
+            "\n%s\n",
+            &[wrapped.as_str()],
+            true,
+        ));
+    } else {
+        out.push('\n');
+        out.push_str(&arc_rs::lint::word_wrap(description, 4));
+        out.push('\n');
+    }
     true
 }
 
-/// The configuration-options block. Returns true when written.
-fn render_entry_options(entry: &LinterEntry, out: &mut String) -> bool {
+/// The configuration-options block (`:135-152`). Returns true when
+/// written.
+fn render_entry_options(entry: &LinterEntry, out: &mut String, ansi: bool) -> bool {
     let meta = entry.meta;
     let options = meta.options();
     if options.is_empty() {
         return false;
     }
-    out.push_str("\n    Configuration Options\n\n");
-    let rendered: Vec<String> = options
-        .iter()
-        .map(|option| {
-            format!(
-                "    {} ({})\n{}\n",
-                option.name,
-                option.option_type,
-                arc_rs::lint::word_wrap(&meta.option_help(option), 6)
-            )
-        })
-        .collect();
-    out.push_str(&rendered.join("\n"));
+    if ansi {
+        out.push_str(&terminal::console_format(
+            "\n%s**%s**\n\n",
+            &[PAD, "Configuration Options"],
+            true,
+        ));
+        let rendered: Vec<String> = options
+            .iter()
+            .map(|option| {
+                let help = terminal::console_wrap(&meta.option_help(option), 6, true);
+                terminal::console_format("%s__%s__ (%s)\n", &[PAD, option.name, option.option_type], true)
+                    + &terminal::console_format("%s\n", &[help.as_str()], true)
+            })
+            .collect();
+        out.push_str(&rendered.join("\n"));
+    } else {
+        out.push_str("\n    Configuration Options\n\n");
+        let rendered: Vec<String> = options
+            .iter()
+            .map(|option| {
+                format!(
+                    "    {} ({})\n{}\n",
+                    option.name,
+                    option.option_type,
+                    arc_rs::lint::word_wrap(&meta.option_help(option), 6)
+                )
+            })
+            .collect();
+        out.push_str(&rendered.join("\n"));
+    }
     true
 }
 
 /// The exact-match failure message (`renderLinters()`, `:226-235`).
 #[must_use]
 pub fn no_match_message(exact: &[String]) -> String {
-    format!(
-        "No match found. Try `arc linters --search {}` to search for a linter.\n",
+    no_match_message_with_ansi(exact, terminal::ansi_enabled())
+}
+
+/// The exact-match failure message with an explicit ANSI flag. The
+/// message carries no markup, so both modes render byte-identical
+/// text through the console formatter.
+#[must_use]
+pub fn no_match_message_with_ansi(exact: &[String], ansi: bool) -> String {
+    let inner = format!(
+        "No match found. Try `arc linters --search {}` to search for a linter.",
         exact.join(",")
-    )
+    );
+    terminal::console_format("%s\n", &[&inner], ansi)
 }
 
 /* -(  Entry points  )---------------------------------------------------------- */
@@ -1575,25 +1669,125 @@ pub fn run_in(cwd: &Path, argv: &[String]) -> ExitCode {
     };
     let entries = collect_entries(&configured);
     let verbose = options.verbose || !options.exact.is_empty();
+    let ansi = terminal::ansi_enabled();
     if !options.exact.is_empty() {
         let selected = sort_entries(filter_exact(&entries, &options.exact));
         if selected.is_empty() {
-            print!("{}", no_match_message(&options.exact));
+            print!("{}", no_match_message_with_ansi(&options.exact, ansi));
             return ExitCode::SUCCESS;
         }
-        print!("{}", render_entries(&selected, verbose));
+        print!("{}", render_entries_with_ansi(&selected, verbose, ansi));
         return ExitCode::SUCCESS;
     }
     if !options.search.is_empty() {
         let selected = sort_entries(filter_search(&entries, &options.search));
-        print!("{}", render_entries(&selected, verbose));
+        print!("{}", render_entries_with_ansi(&selected, verbose, ansi));
         return ExitCode::SUCCESS;
     }
     let selected = sort_entries(entries.iter().collect());
-    print!("{}", render_entries(&selected, verbose));
+    print!("{}", render_entries_with_ansi(&selected, verbose, ansi));
     ExitCode::SUCCESS
 }
 
 #[cfg(test)]
 #[path = "linters_tests.rs"]
 mod linters_tests;
+
+#[cfg(test)]
+mod linters_ansi_tests {
+    //! TTY/non-TTY tests for [`super::render_entries_with_ansi`].
+    //! (The `linters_tests` module is owned by another agent.)
+
+    use super::*;
+
+    fn ansi_entry(class: &str, status: LinterStatus) -> LinterEntry {
+        LinterEntry {
+            meta: LINTERS.iter().find(|meta| meta.class == class).unwrap(),
+            status,
+            version: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn brief_headers_badge_status_on_tty() {
+        let configured = ansi_entry("ArcanistTextLinter", LinterStatus::Configured);
+        assert_eq!(
+            render_entries_with_ansi(&[&configured], false, true),
+            "\x1b[42m\x1b[1m CONFIGURED \x1b[m\x1b[49m \x1b[1mtext\x1b[m (Basic Text \
+             Linter)\n(Run `arc linters --verbose` for more details.)\n"
+        );
+        assert_eq!(
+            render_entries_with_ansi(&[&configured], false, false),
+            " CONFIGURED  text (Basic Text Linter)\n(Run `arc linters --verbose` for \
+             more details.)\n"
+        );
+        let available = ansi_entry("ArcanistTextLinter", LinterStatus::Available);
+        let tty = render_entries_with_ansi(&[&available], false, true);
+        assert!(tty.starts_with(
+            "\x1b[43m\x1b[1m AVAILABLE  \x1b[m\x1b[49m \x1b[1mtext\x1b[m (Basic Text Linter)\n"
+        ));
+        let error = ansi_entry("ArcanistPhpLinter", LinterStatus::Error);
+        let tty = render_entries_with_ansi(&[&error], false, true);
+        assert!(tty.starts_with(
+            "\x1b[41m\x1b[1m ERROR      \x1b[m\x1b[49m \x1b[1mphp\x1b[m (php -l)\n"
+        ));
+        assert_eq!(
+            render_entries_with_ansi(&[&error], false, false),
+            render_entries(&[&error], false)
+        );
+    }
+
+    #[test]
+    fn verbose_renders_badges_and_bold_sections() {
+        let mut text = ansi_entry("ArcanistTextLinter", LinterStatus::Configured);
+        text.version = Some("9.9".to_string());
+        let tty = render_entries_with_ansi(&[&text], true, true);
+        assert!(tty.starts_with(
+            "\n\x1b[42m\x1b[1m CONFIGURED \x1b[m\x1b[49m \x1b[1mBasic Text \
+             Linter\x1b[m (ArcanistTextLinter)\n\n    Version \x1b[1m9.9\x1b[m\n"
+        ));
+        assert!(tty.contains("\n    Basic linting for text files.\n"));
+        assert!(tty.contains("\n    \x1b[1mConfiguration Options\x1b[m\n\n"));
+        assert!(tty.contains("    \x1b[4mseverity\x1b[m (optional map<string, string>)\n"));
+        assert_eq!(
+            render_entries_with_ansi(&[&text], true, false),
+            render_entries(&[&text], true)
+        );
+    }
+
+    #[test]
+    fn verbose_underlines_uri_and_bolds_error_class() {
+        let meta = LINTERS.iter().find(|meta| meta.uri.is_some()).unwrap();
+        let uri = meta.uri.unwrap();
+        let entry = LinterEntry {
+            meta,
+            status: LinterStatus::Available,
+            version: None,
+            error: None,
+        };
+        let tty = render_entries_with_ansi(&[&entry], true, true);
+        assert!(tty.contains(&format!("    \x1b[4m{uri}\x1b[m\n")));
+        let mut error = ansi_entry("ArcanistPhpLinter", LinterStatus::Error);
+        error.error = Some(LinterError {
+            class: "CommandException",
+            message: "boom".to_string(),
+        });
+        let tty = render_entries_with_ansi(&[&error], true, true);
+        assert!(tty.contains("\n    \x1b[1mCommandException\x1b[m\n    boom\n"));
+        assert_eq!(
+            render_entries_with_ansi(&[&error], true, false),
+            render_entries(&[&error], true)
+        );
+    }
+
+    #[test]
+    fn no_match_message_with_ansi_matches_plain() {
+        let exact = vec!["frobnicate".to_string()];
+        let expected =
+            "No match found. Try `arc linters --search frobnicate` to search for a \
+             linter.\n";
+        assert_eq!(no_match_message_with_ansi(&exact, true), expected);
+        assert_eq!(no_match_message_with_ansi(&exact, false), expected);
+    }
+}

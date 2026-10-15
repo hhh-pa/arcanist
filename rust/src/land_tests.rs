@@ -2995,3 +2995,104 @@ fn shell_line_bolds_command_on_tty() {
     assert_eq!(shell_line("git push", true), "    \x1b[1m$ git push\x1b[m\n");
     assert_eq!(shell_line("git push", false), "    $ git push\n");
 }
+
+#[test]
+fn status_line_renders_warning_and_success_colors() {
+    assert_eq!(
+        status_line("TARGET", "fetching", "yellow", true),
+        "\x1b[1m\x1b[43m TARGET \x1b[49m\x1b[m fetching\n"
+    );
+    assert_eq!(
+        status_line("DONE", "Landed changes.", "green", true),
+        "\x1b[1m\x1b[42m DONE \x1b[49m\x1b[m Landed changes.\n"
+    );
+    assert_eq!(
+        status_line("TARGET", "fetching", "yellow", false),
+        "** TARGET ** fetching\n"
+    );
+    assert_eq!(
+        status_line("DONE", "Landed changes.", "green", false),
+        "** DONE ** Landed changes.\n"
+    );
+}
+
+#[test]
+fn io_push_status_with_ansi_colors_warnings() {
+    let mut io = ansi_io();
+    io.push_status_with_ansi("P4 MODE", "perforce", "yellow", io.ansi);
+    assert_eq!(
+        io.out.stderr,
+        "\x1b[1m\x1b[43m P4 MODE \x1b[49m\x1b[m perforce\n"
+    );
+    let mut plain = Io::canned(&[]);
+    plain.push_status_with_ansi("P4 MODE", "perforce", "yellow", plain.ansi);
+    assert_eq!(plain.out.stderr, "** P4 MODE ** perforce\n");
+}
+
+#[test]
+fn push_builds_banner_styles_title_on_tty() {
+    let mut io = ansi_io();
+    push_builds_banner(&mut io, "BUILD FAILURES", "1 revision(s) have build failures:");
+    assert_eq!(
+        io.out.stdout,
+        "\x1b[43m\x1b[1m <!> BUILD FAILURES \x1b[m\x1b[49m\n1 revision(s) have build \
+         failures:\n\n"
+    );
+    let mut plain = Io::canned(&[]);
+    push_builds_banner(&mut plain, "BUILD FAILURES", "1 revision(s) have build failures:");
+    assert_eq!(
+        plain.out.stdout,
+        "** BUILD FAILURES **\n1 revision(s) have build failures:\n\n"
+    );
+}
+
+#[test]
+fn push_state_banner_renders_working_copy_line() {
+    let files = vec!["a.txt".to_string()];
+    let lists = vec![("Added", files.as_slice())];
+    // `Path::display` uses the platform separator (`\tmp\wc` on Windows).
+    let dir_text = Path::new("/tmp/wc").display().to_string();
+    let mut io = ansi_io();
+    push_state_banner(&mut io, "TITLE", "message", Path::new("/tmp/wc"), &lists);
+    assert_eq!(
+        io.out.stdout,
+        format!(
+            "\n\x1b[43m\x1b[1m <!> TITLE \x1b[m\x1b[49m\nmessage\n\n    Working Copy: \
+             {dir_text}\n\nAdded\n\n    a.txt\n\n"
+        )
+    );
+    let mut plain = Io::canned(&[]);
+    push_state_banner(&mut plain, "TITLE", "message", Path::new("/tmp/wc"), &lists);
+    assert_eq!(
+        plain.out.stdout,
+        format!("\n** TITLE **\nmessage\n\n    Working Copy: {dir_text}\n\nAdded\n\n    a.txt\n\n")
+    );
+}
+
+#[test]
+fn render_file_lists_renders_titles_and_paths_in_both_modes() {
+    let added = vec!["a.txt".to_string()];
+    let empty: Vec<String> = Vec::new();
+    let removed = vec!["gone.txt".to_string()];
+    let lists = vec![
+        ("Added", added.as_slice()),
+        ("Empty", empty.as_slice()),
+        ("Removed", removed.as_slice()),
+    ];
+    let expected = "Added\n\n    a.txt\n\nRemoved\n\n    gone.txt\n\n";
+    assert_eq!(render_file_lists(&lists, true), expected);
+    assert_eq!(render_file_lists(&lists, false), expected);
+}
+
+#[test]
+fn console_wrap_at_hint_indent_matches_phutil_wrap() {
+    // Hand-traced `phutil_console_wrap($text, 6, false)`: width 72, the
+    // first line keeps no prefix and trims to "  ?", continuation
+    // lines gain six spaces.
+    let text = format!("  ?   {} {}", "a".repeat(66), "b".repeat(10));
+    assert_eq!(
+        console_wrap(&text, 6, false),
+        format!("  ?\n      {}\n      {}", "a".repeat(66), "b".repeat(10))
+    );
+    assert_eq!(console_wrap("  ?   Use X.", 6, false), "  ?   Use X.");
+}

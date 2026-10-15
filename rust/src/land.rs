@@ -2384,7 +2384,11 @@ pub fn load_gate_findings(
 fn format_finding_line(finding: &land_checks::GateFinding, ansi: bool) -> String {
     terminal::console_format(
         "  [%s] %s: %s\n",
-        &[&finding.prompt, &finding.title, &finding.query],
+        &[
+            finding.prompt.as_str(),
+            finding.title.as_str(),
+            finding.query.as_str(),
+        ],
         ansi,
     )
 }

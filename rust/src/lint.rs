@@ -3819,21 +3819,25 @@ fn highlight_line_at(
 
 /// Patchable single-line highlights on both sides (`:176-199`),
 /// before shrinking (T13543: the new side only when the line exists).
+/// Runs before [`shrink_ranges`], so `patch.line` is still the range
+/// start.
 fn highlight_patchable_lines(
     old_lines: &mut Vec<String>,
     new_lines: &mut Vec<String>,
-    start: usize,
-    char: usize,
-    original: &str,
-    replacement: &str,
-    old_impact: usize,
+    patch: &ContextPatch,
     new_impact: usize,
 ) {
-    if old_impact != 1 || new_impact != 1 {
+    if patch.old_impact != 1 || new_impact != 1 {
         return;
     }
-    highlight_line_at(old_lines, start, char, original, true);
-    highlight_line_at(new_lines, start, char, replacement, false);
+    highlight_line_at(old_lines, patch.line, patch.char, patch.original, true);
+    highlight_line_at(
+        new_lines,
+        patch.line,
+        patch.char,
+        patch.replacement.unwrap_or_default(),
+        false,
+    );
 }
 
 /// Non-patchable single-line highlight on the old side (`:232-240`).
@@ -3915,16 +3919,7 @@ fn context_patch_impacts(
     *new_lines = split_keep_ends(&new_text);
     let new_impact = replacement_text.bytes().filter(|b| *b == b'\n').count() + 1;
     if ansi {
-        highlight_patchable_lines(
-            old_lines,
-            new_lines,
-            *start,
-            patch.char,
-            patch.original,
-            replacement_text,
-            patch.old_impact,
-            new_impact,
-        );
+        highlight_patchable_lines(old_lines, new_lines, patch, new_impact);
     }
     shrink_ranges(old_lines, new_lines, start, patch.old_impact, new_impact)
 }
