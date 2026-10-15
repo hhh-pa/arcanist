@@ -2,4 +2,11 @@
 # only on NEW advisories. Each entry must name the remediation; drop entries
 # as migrations land.
 [advisories]
-ignore = []
+ignore = [
+    # RUSTSEC-2023-0071 (Marvin): RSA PKCS#1 v1.5 *decryption* timing oracle
+    # in rsa 0.9.10 (no fixed upgrade available). arc-rs uses rsa only for
+    # Pkcs1v15Sign signatures in conduit certificate auth (conduit.rs; no
+    # decrypt operations), so the oracle does not apply. Remediation:
+    # drop when rsa ships a fix or conduit auth stops needing RSA.
+    "RUSTSEC-2023-0071",
+]

@@ -24,6 +24,7 @@ skip = [
     # entries as dependents unify.
     "base64@0.22",
     "core-foundation@0.9",
+    "getrandom@0.2",
     "syn@2.0",
 ]
 [sources]
