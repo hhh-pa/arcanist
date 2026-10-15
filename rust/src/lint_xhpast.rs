@@ -57,6 +57,8 @@ mod xhp_calls;
 mod xhp_decl;
 #[path = "xhp_flow.rs"]
 mod xhp_flow;
+#[path = "xhp_rem3.rs"]
+mod xhp_rem3;
 #[path = "xhp_style.rs"]
 mod xhp_style;
 
@@ -143,7 +145,12 @@ pub const RULE_TABLE: &[(u32, &str, &str)] = &[
     (84, "`array_combine()` Unreliable", SEVERITY_DISABLED),
     (85, "Use of Deprecated Function", SEVERITY_WARNING),
     (86, "Unsafe Usage of Dynamic String", SEVERITY_ERROR),
+    (87, "Class Not `abstract` Or `final`", SEVERITY_DISABLED),
+    (88, "Class Not Extending `Phobject`", SEVERITY_DISABLED),
     (90, "Nested `namespace` Statements", SEVERITY_ERROR),
+    (91, "`$this` Reassignment", SEVERITY_ERROR),
+    (92, "Unexpected `return` Value", SEVERITY_WARNING),
+    (95, "Self Class Reference", SEVERITY_WARNING),
     (96, "Paamayim Nekudotayim Spacing", SEVERITY_WARNING),
     (97, "`use` Statement Namespace Prefix", SEVERITY_WARNING),
     (
@@ -153,13 +160,37 @@ pub const RULE_TABLE: &[(u32, &str, &str)] = &[
     ),
     (99, "Unnecessary Symbol Alias", SEVERITY_WARNING),
     (105, "Function Call Should Be Type Cast", SEVERITY_ADVICE),
+    (
+        107,
+        "`abstract` Method Cannot Be Declared `private`",
+        SEVERITY_ERROR,
+    ),
+    (108, "`abstract` Method Cannot Contain Body", SEVERITY_ERROR),
     (111, "`is_a` Should Be `instanceof`", SEVERITY_ADVICE),
+    (
+        113,
+        "`class` Containing `abstract` Methods Must Be Declared `abstract`",
+        SEVERITY_ERROR,
+    ),
+    (
+        114,
+        "`interface` Method Cannot Contain Body",
+        SEVERITY_ERROR,
+    ),
+    (
+        118,
+        "`interface` Methods Cannot Be Marked `abstract`",
+        SEVERITY_ERROR,
+    ),
     (119, "Curly Brace Array Index", SEVERITY_WARNING),
     (123, "Variable Reference Spacing", SEVERITY_WARNING),
     (125, "Invalid Octal Numeric Scalar", SEVERITY_ERROR),
     (127, "Hexadecimal Integer Casing", SEVERITY_WARNING),
+    (128, "Continue Inside Switch", SEVERITY_ERROR),
     (129, "Implode With Glue First", SEVERITY_ERROR),
+    (130, "Use of `public` Properties", SEVERITY_ADVICE),
     (131, "Binary Integer Casing", SEVERITY_WARNING),
+    (132, "Partial Catch", SEVERITY_WARNING),
     (133, "Use of Removed Function \"each()\"", SEVERITY_ERROR),
 ];
 
@@ -227,31 +258,6 @@ pub fn blocked_rules() -> Vec<(u32, &'static str, &'static str)> {
         (72, "ArcanistInvalidModifiersXHPASTLinterRule", NOT_YET),
         (76, "ArcanistArrayValueXHPASTLinterRule", NOT_YET),
         (77, "ArcanistListAssignmentXHPASTLinterRule", NOT_YET),
-        (87, "ArcanistRaggedClassTreeEdgeXHPASTLinterRule", NOT_YET),
-        (88, "ArcanistClassExtendsObjectXHPASTLinterRule", NOT_YET),
-        (91, "ArcanistThisReassignmentXHPASTLinterRule", NOT_YET),
-        (92, "ArcanistUnexpectedReturnValueXHPASTLinterRule", NOT_YET),
-        (95, "ArcanistSelfClassReferenceXHPASTLinterRule", NOT_YET),
-        (
-            107,
-            "ArcanistAbstractPrivateMethodXHPASTLinterRule",
-            NOT_YET,
-        ),
-        (108, "ArcanistAbstractMethodBodyXHPASTLinterRule", NOT_YET),
-        (
-            113,
-            "ArcanistClassMustBeDeclaredAbstractXHPASTLinterRule",
-            NOT_YET,
-        ),
-        (114, "ArcanistInterfaceMethodBodyXHPASTLinterRule", NOT_YET),
-        (
-            118,
-            "ArcanistInterfaceAbstractMethodXHPASTLinterRule",
-            NOT_YET,
-        ),
-        (128, "ArcanistContinueInsideSwitchXHPASTLinterRule", NOT_YET),
-        (130, "ArcanistPublicPropertyXHPASTLinterRule", NOT_YET),
-        (132, "ArcanistPartialCatchXHPASTLinterRule", NOT_YET),
         (
             134,
             "ArcanistProductNameLiteralXHPASTLinterRule",
@@ -393,6 +399,7 @@ pub fn lint_tree(
     xhp_style::apply(&ctx, &mut findings);
     xhp_decl::apply(&ctx, &mut findings);
     xhp_flow::apply(&ctx, &mut findings);
+    xhp_rem3::apply(&ctx, &mut findings);
     findings.sort_by_key(|finding| (finding.offset, finding.rule));
     findings
         .into_iter()
