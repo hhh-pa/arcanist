@@ -158,6 +158,7 @@ jobs:
       - name: smoke-test shipped binary
         shell: bash
         run: |
+          set -o pipefail
           bin=target/release/arc
           if [ "$RUNNER_OS" = "Windows" ]; then
             bin="$bin.exe"

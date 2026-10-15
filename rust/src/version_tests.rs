@@ -148,17 +148,39 @@ fn splits_log_output_on_unit_separator() {
 #[test]
 fn formats_php_day_month_year_dates() {
     // Oracle: `date -u -r <epoch> +'%-d %b %Y'`.
-    assert_eq!(format_version_date(0), "1 Jan 1970");
-    assert_eq!(format_version_date(-1), "31 Dec 1969");
-    assert_eq!(format_version_date(946_684_800), "1 Jan 2000");
-    assert_eq!(format_version_date(1_791_158_400), "5 Oct 2026");
-    assert_eq!(format_version_date(1_798_675_200), "31 Dec 2026");
+    assert_eq!(format_version_date_in(0, 0), "1 Jan 1970");
+    assert_eq!(format_version_date_in(-1, 0), "31 Dec 1969");
+    assert_eq!(format_version_date_in(946_684_800, 0), "1 Jan 2000");
+    assert_eq!(format_version_date_in(1_791_158_400, 0), "5 Oct 2026");
+    assert_eq!(format_version_date_in(1_798_675_200, 0), "31 Dec 2026");
+}
+
+#[test]
+fn fixed_offsets_shift_across_day_boundaries() {
+    // 2026-10-05 23:30:00 UTC rolls to Oct 6 at +1h, stays Oct 5 at -1h.
+    assert_eq!(format_version_date_in(1_791_243_000, 3600), "6 Oct 2026");
+    assert_eq!(format_version_date_in(1_791_243_000, -3600), "5 Oct 2026");
+    // 2026-10-05 00:30:00 UTC rolls back to Oct 4 at -1h.
+    assert_eq!(format_version_date_in(1_791_160_200, -3600), "4 Oct 2026");
+    assert_eq!(format_version_date_in(1_791_160_200, 3600), "5 Oct 2026");
+}
+
+#[test]
+fn live_date_matches_fixed_offset_rendering() {
+    // Zone-independent: the live render equals the fixed-offset render
+    // at the live offset, whatever the machine zone is.
+    for timestamp in [0, 1_791_243_000, 1_791_158_400] {
+        let live = format_version_date(timestamp);
+        let now = u64::try_from(timestamp).unwrap_or(0);
+        let offset = look::local_utc_offset(now);
+        assert_eq!(live, format_version_date_in(timestamp, offset));
+    }
 }
 
 #[test]
 fn renders_php_version_line() {
     assert_eq!(
-        render_version_line("abc123", 0),
+        render_version_line_in("abc123", 0, 0),
         "arcanist abc123 (1 Jan 1970)\n"
     );
 }
@@ -170,9 +192,13 @@ fn reports_fixture_checkout_version() {
     let hash = git_output(&repo.path, &["rev-parse", "HEAD"]);
     assert_eq!(hash.len(), 40);
     assert_eq!(
-        version_text(&repo.path),
+        version_text_in(&repo.path, 0),
         Ok(format!("arcanist {hash} (5 Oct 2026)\n"))
     );
+    // Live render keeps the PHP line shape in any zone.
+    let live = version_text(&repo.path).unwrap();
+    assert!(live.starts_with(&format!("arcanist {hash} (")));
+    assert!(live.ends_with(")\n"));
 }
 
 #[test]
@@ -186,7 +212,7 @@ fn resolves_library_root_from_subdirectory() {
     assert_eq!(root, PathBuf::from(expected.as_str()));
     let hash = git_output(&repo.path, &["rev-parse", "HEAD"]);
     assert_eq!(
-        version_text(&nested),
+        version_text_in(&nested, 0),
         Ok(format!("arcanist {hash} (5 Oct 2026)\n"))
     );
 }

@@ -145,11 +145,11 @@ pub fn update_available(status: &Status) -> Option<bool> {
 /// How to update arc manually.
 #[must_use]
 pub fn how_to_update() -> &'static str {
-    "To update the checkout: run `git pull --rebase` in the arc-rs checkout, then `cargo build` (or `cargo install --path rust`). To update the arc binary itself: run `arc upgrade --apply`. Without --apply, arc never updates itself."
+    "To update the checkout: run `git pull --rebase` in the arc checkout, then `cargo build` (or `cargo install --path rust`). To update the arc binary itself: run `arc upgrade --apply`. Without --apply, arc never updates itself."
 }
 
 /// Library name `--apply` upgrades, mirroring PHP's `$library`.
-pub const APPLY_LIBRARY: &str = "arc-rs";
+pub const APPLY_LIBRARY: &str = "arcanist";
 
 /// Branches eligible for automatic upgrades.
 pub const APPLY_BRANCHES: &[&str] = &["master", "stable"];
@@ -1056,13 +1056,13 @@ pub fn install_bytes_at(exe: &Path, bytes: &[u8]) -> Result<Option<PathBuf>, Str
 }
 
 /// Staging path next to the executable (same filesystem, so the final
-/// rename is atomic): `<exe>.arc-rs-new`.
+/// rename is atomic): `<exe>.arc-new`.
 fn sibling_temp(exe: &Path) -> PathBuf {
     let file = exe
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "arc-rs".to_string());
-    parent_or_dot(exe).join(format!("{file}.arc-rs-new"))
+        .unwrap_or_else(|| "arc".to_string());
+    parent_or_dot(exe).join(format!("{file}.arc-new"))
 }
 
 /// `chmod 755` the staged binary on unix; a no-op on Windows.

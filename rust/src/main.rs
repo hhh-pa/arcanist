@@ -9,8 +9,8 @@ use std::process::ExitCode;
 use arc_rs::{
     alias, amend, anoid, bookmarks, branches, browse, close_revision, commit, config, cover, diff,
     download, export, get_config, inspect, install_certificate, land, liberate, lint, linters,
-    list, look, markers, paste, patch, set_config, tasks, todo, unit, upgrade, upload, version,
-    weld, which, work,
+    list, look, markers, paste, patch, set_config, tasks, terminal, todo, unit, upgrade, upload,
+    version, weld, which, work,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -70,10 +70,29 @@ enum Action {
     Help,
     Version,
     CallConduit(CallArgs),
+    CallConduitHelp,
     Unknown(String),
     Missing,
     Error(String),
 }
+
+/// `call-conduit` help: PHP synopsis (`Call Conduit API methods.`),
+/// example (`call-conduit -- method`), and workflow information body
+/// from `ArcanistCallConduitWorkflow::getWorkflowInformation`.
+const CALL_CONDUIT_USAGE: &str = "call-conduit -- method
+Call Conduit API methods.
+
+Allows you to make a raw Conduit method call:
+
+  - Run this command from a working directory.
+  - Call parameters are required, and read as a JSON blob from stdin.
+  - Results are written to stdout as a JSON blob.
+
+This workflow is primarily useful for writing scripts. Examples:
+
+  $ echo '{}' | arc call-conduit -- conduit.ping
+  $ echo '{\"phid\":\"PHID-FILE-xxxx\"}' | arc call-conduit -- file.download
+";
 
 fn parse_call_conduit(rest: &[String]) -> Result<CallArgs, String> {
     // PHP (`ArcanistCallConduitWorkflow.php:31-44`): `method` is a wildcard
@@ -113,10 +132,16 @@ fn classify(argv: &[String]) -> Action {
     match cmd.as_str() {
         "-h" | "--help" | "help" => Action::Help,
         "-V" | "--version" => Action::Version,
-        "call-conduit" => match parse_call_conduit(&argv[1..]) {
-            Ok(args) => Action::CallConduit(args),
-            Err(msg) => Action::Error(msg),
-        },
+        "call-conduit" => {
+            if call_conduit_wants_help(&argv[1..]) {
+                Action::CallConduitHelp
+            } else {
+                match parse_call_conduit(&argv[1..]) {
+                    Ok(args) => Action::CallConduit(args),
+                    Err(msg) => Action::Error(msg),
+                }
+            }
+        }
         c => Action::Unknown(c.to_string()),
     }
 }
@@ -233,17 +258,67 @@ fn apply_alias_expansion(argv: Vec<String>) -> Result<Vec<String>, ExitCode> {
 /// `PhutilHelpArgumentWorkflow`). Bare `help` (and `-h`/`--help`) passes
 /// through to the full command list; words after the command name are
 /// dropped, and an unknown name flows into the unknown-command error below.
-fn forward_help(argv: &[String]) -> Vec<String> {
-    if argv.first().is_some_and(|first| first == "help") && argv.len() > 1 {
-        vec![argv[1].clone(), "--help".to_string()]
-    } else {
-        argv.to_vec()
+/// `-h`/`--help` before any `--` separator requests `call-conduit` help
+/// (PHP's global argument parser also accepts help flags on any
+/// workflow). A `--help` after `--` stays a positional method name.
+fn call_conduit_wants_help(rest: &[String]) -> bool {
+    rest.iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg == "-h" || arg == "--help")
+}
+
+fn find_command_ci(name: &str) -> Option<CommandFn> {
+    COMMANDS
+        .iter()
+        .find(|(known, _)| known.eq_ignore_ascii_case(name))
+        .map(|(_, run)| *run)
+}
+
+/// `**NAME WORKFLOW**` header from `PhutilHelpArgumentWorkflow`
+/// (`'%s WORKFLOW'`, uppercased name), console-formatted.
+fn workflow_header(name: &str, ansi: bool) -> String {
+    terminal::console_format(
+        "**%s**",
+        &[&format!("{} WORKFLOW", name.to_uppercase())],
+        ansi,
+    )
+}
+
+/// `There is no ... workflow.` body from `renderWorkflowHelp`
+/// (shown when `help <name>` names nothing known), console-formatted.
+fn no_workflow_line(name: &str, ansi: bool) -> String {
+    terminal::console_format("There is no **%s** workflow.", &[name], ansi)
+}
+
+/// `help [name ...]`, mirroring `PhutilHelpArgumentWorkflow::execute`:
+/// bare `help` prints the command list; otherwise each name (matched
+/// case-insensitively like PHP's `strtolower` lookup) prints a
+/// `**NAME WORKFLOW**` header plus that workflow's help, or a
+/// no-workflow message when nothing matches. Always exits 0; PHP's
+/// pager is intentionally not ported.
+fn run_help(names: &[String]) -> ExitCode {
+    if names.is_empty() {
+        print!("{}", usage());
+        return ExitCode::SUCCESS;
     }
+    let ansi = terminal::ansi_enabled();
+    for name in names {
+        println!("{}\n", workflow_header(name, ansi));
+        if name.eq_ignore_ascii_case("call-conduit") {
+            print!("{CALL_CONDUIT_USAGE}");
+        } else if let Some(run) = find_command_ci(name) {
+            run(&["--help".to_string()]);
+        } else {
+            println!("{}\n", no_workflow_line(name, ansi));
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 fn dispatch(argv: &[String]) -> ExitCode {
-    let forwarded = forward_help(argv);
-    let argv = forwarded.as_slice();
+    if argv.first().is_some_and(|first| first == "help") {
+        return run_help(&argv[1..]);
+    }
     if let Some(cmd) = argv.first()
         && let Some(run) = find_command(cmd)
     {
@@ -259,6 +334,10 @@ fn dispatch(argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Action::CallConduit(args) => run_call_conduit(&args),
+        Action::CallConduitHelp => {
+            print!("{CALL_CONDUIT_USAGE}");
+            ExitCode::SUCCESS
+        }
         Action::Missing => {
             eprintln!("{}", usage());
             ExitCode::FAILURE

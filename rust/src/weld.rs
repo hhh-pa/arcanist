@@ -19,7 +19,7 @@ fn usage() -> String {
          with a randomly blended overlap region; empty files are skipped.\n\
          \n\
          Options:\n\
-         \x20 --seed N       deterministic output from seed N (arc-rs extension;\n\
+         \x20 --seed N       deterministic output from seed N (arc extension;\n\
          \x20                PHP welds randomly and has no equivalent)\n\
          \x20 -h, --help     show this help\n"
     )

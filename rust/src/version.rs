@@ -6,21 +6,22 @@
 //! root resolved to its git working copy (`:43-57`), and the
 //! `"%s %s (%s)\n"` render of the HEAD commit hash and date (`:59-70`).
 //!
-//! Divergences:
-//! - PHP resolves the library root from the running source tree
-//!   (`phutil_get_library_root('arcanist')`); the compiled binary has no
-//!   source tree, so the checkout is resolved from the running
-//!   executable's directory instead (`run_in` takes it explicitly, so
-//!   tests use fixture checkouts). The git-missing and
-//!   not-a-git-working-copy errors keep the PHP text.
-//! - The date renders in UTC. PHP's `date()` uses the process timezone,
-//!   which `std` cannot query without extra dependencies.
+//! Divergence: PHP resolves the library root from the running source
+//! tree (`phutil_get_library_root('arcanist')`); the compiled binary has
+//! no source tree, so the checkout is resolved from the running
+//! executable's directory instead (`run_in` takes it explicitly, so
+//! tests use fixture checkouts). The git-missing and
+//! not-a-git-working-copy errors keep the PHP text.
+//!
+//! The date renders in the process timezone like PHP's `date()`, via
+//! `look`'s std-only zone lookup (explicit `TZ`, `/etc/localtime`,
+//! `/etc/timezone`, else UTC).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::terminal::PhtArg;
-use crate::{anoid, git, terminal};
+use crate::{anoid, git, look, terminal};
 
 /// Subcommand name, matching `arc version`.
 pub const NAME: &str = "version";
@@ -135,28 +136,67 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
+/// Live process-timezone offset for `timestamp` (UTC fallback).
+fn live_offset(timestamp: i64) -> i64 {
+    look::local_utc_offset(u64::try_from(timestamp).unwrap_or(0))
+}
+
 /// Format `timestamp` like PHP `date('j M Y')` (day without leading
-/// zeros), in UTC (see the module docs).
+/// zeros) at a fixed seconds-east-of-UTC `offset`; pure for tests.
 #[must_use]
-pub fn format_version_date(timestamp: i64) -> String {
-    let (year, month, day) = civil_from_days(timestamp.div_euclid(86_400));
+pub fn format_version_date_in(timestamp: i64, offset: i64) -> String {
+    let shifted = timestamp + offset;
+    let (year, month, day) = civil_from_days(shifted.div_euclid(86_400));
     format!("{day} {} {year:04}", MONTHS[(month - 1) as usize])
 }
 
-/// Render the version line (PHP `:65-70`): `arcanist <hash> (<date>)`.
+/// Format `timestamp` like PHP `date('j M Y')` in the process timezone.
 #[must_use]
-pub fn render_version_line(commit: &str, timestamp: i64) -> String {
-    format!("{LIBRARY} {commit} ({})\n", format_version_date(timestamp))
+pub fn format_version_date(timestamp: i64) -> String {
+    format_version_date_in(timestamp, live_offset(timestamp))
 }
 
-/// Full `version` output for the checkout containing `tool_dir`.
-pub fn version_text(tool_dir: &Path) -> Result<String, String> {
+/// Render the version line (PHP `:65-70`): `arcanist <hash> (<date>)`,
+/// at a fixed offset; pure for tests.
+#[must_use]
+pub fn render_version_line_in(commit: &str, timestamp: i64, offset: i64) -> String {
+    format!(
+        "{LIBRARY} {commit} ({})\n",
+        format_version_date_in(timestamp, offset)
+    )
+}
+
+/// Render the version line in the process timezone.
+#[must_use]
+pub fn render_version_line(commit: &str, timestamp: i64) -> String {
+    render_version_line_in(commit, timestamp, live_offset(timestamp))
+}
+
+/// `(timestamp, commit)` for the checkout containing `tool_dir`.
+fn head_of(tool_dir: &Path) -> Result<(i64, String), String> {
     if !git_binary_available() {
         return Err(missing_git_message());
     }
     let root = library_root(tool_dir)?;
-    let (timestamp, commit) = head_commit(&root)?;
-    Ok(render_version_line(&commit, timestamp))
+    head_commit(&root)
+}
+
+/// Full `version` output for the checkout containing `tool_dir`, at a
+/// fixed offset; pure for tests.
+pub fn version_text_in(tool_dir: &Path, offset: i64) -> Result<String, String> {
+    let (timestamp, commit) = head_of(tool_dir)?;
+    Ok(render_version_line_in(&commit, timestamp, offset))
+}
+
+/// Full `version` output for the checkout containing `tool_dir`, in the
+/// process timezone.
+pub fn version_text(tool_dir: &Path) -> Result<String, String> {
+    let (timestamp, commit) = head_of(tool_dir)?;
+    Ok(render_version_line_in(
+        &commit,
+        timestamp,
+        live_offset(timestamp),
+    ))
 }
 
 /// Directory the library checkout is resolved from: the running

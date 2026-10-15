@@ -38,7 +38,7 @@ byte-identical to `bin/arc`: `ArcanistRuntime` dispatches on
 toolset instead of the `arc` toolset. That toolset is a remote-agent
 framework whose bootloader concatenates PHP files (`PhutilBallOfPHP`)
 and ships them to remote PHP agents. It is a separate surface from the
-32 `arc` commands and is inherently PHP-runtime-bound, so it is
+35 `arc` commands and is inherently PHP-runtime-bound, so it is
 intentionally not ported. Only `arc` is shipped.
 
 ## Gates

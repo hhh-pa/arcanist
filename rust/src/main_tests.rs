@@ -304,29 +304,65 @@ fn all_ported_commands_dispatch_through_main() {
 }
 
 #[test]
-fn help_forwards_to_command_help() {
-    assert_eq!(
-        forward_help(&args(&["help", "diff"])),
-        args(&["diff", "--help"])
-    );
-    assert_eq!(
-        forward_help(&args(&["help", "version"])),
-        args(&["version", "--help"])
-    );
+fn help_dispatches_each_name_with_workflow_header() {
     assert_eq!(dispatch(&args(&["help", "diff"])), ExitCode::SUCCESS);
     assert_eq!(dispatch(&args(&["help", "version"])), ExitCode::SUCCESS);
+    // PHP renders every name, not just the first.
+    assert_eq!(
+        dispatch(&args(&["help", "diff", "version"])),
+        ExitCode::SUCCESS
+    );
+    // PHP lowercases names before lookup.
+    assert_eq!(dispatch(&args(&["help", "DIFF"])), ExitCode::SUCCESS);
+    // `help help` succeeds: unknown names print a no-workflow message
+    // (`PhutilHelpArgumentWorkflow` always returns 0).
+    assert_eq!(dispatch(&args(&["help", "help"])), ExitCode::SUCCESS);
 }
 
 #[test]
-fn help_keeps_bare_list_and_rejects_unknown_names() {
-    assert_eq!(forward_help(&args(&["help"])), args(&["help"]));
-    assert_eq!(forward_help(&args(&["--help"])), args(&["--help"]));
-    assert_eq!(forward_help(&args(&[])), args(&[]));
-    assert_eq!(
-        forward_help(&args(&["help", "diff", "extra"])),
-        args(&["diff", "--help"])
-    );
+fn help_unknown_name_succeeds_with_no_workflow_message() {
     assert_eq!(dispatch(&args(&["help"])), ExitCode::SUCCESS);
-    assert_eq!(dispatch(&args(&["help", "help"])), ExitCode::SUCCESS);
-    assert_eq!(dispatch(&args(&["help", "bogus"])), ExitCode::FAILURE);
+    assert_eq!(dispatch(&args(&["help", "bogus"])), ExitCode::SUCCESS);
+}
+
+#[test]
+fn workflow_header_and_no_workflow_line_match_php() {
+    assert_eq!(workflow_header("bogus", false), "BOGUS WORKFLOW");
+    assert_eq!(
+        no_workflow_line("bogus", false),
+        "There is no bogus workflow."
+    );
+    // Bold markers are interpreted on TTYs (exact ANSI bytes are
+    // covered by the terminal console-format tests).
+    assert!(workflow_header("bogus", true).contains('\x1b'));
+    assert!(no_workflow_line("bogus", true).contains('\x1b'));
+}
+
+#[test]
+fn call_conduit_accepts_help_flags() {
+    assert_eq!(
+        classify(&args(&["call-conduit", "--help"])),
+        Action::CallConduitHelp
+    );
+    assert_eq!(
+        classify(&args(&["call-conduit", "-h"])),
+        Action::CallConduitHelp
+    );
+    assert_eq!(
+        dispatch(&args(&["call-conduit", "--help"])),
+        ExitCode::SUCCESS
+    );
+    assert_eq!(
+        dispatch(&args(&["help", "call-conduit"])),
+        ExitCode::SUCCESS
+    );
+    assert!(CALL_CONDUIT_USAGE.contains("Call Conduit API methods."));
+    assert!(CALL_CONDUIT_USAGE.contains("call-conduit -- method"));
+    assert!(CALL_CONDUIT_USAGE.contains("conduit.ping"));
+}
+
+#[test]
+fn call_conduit_help_flag_after_separator_stays_positional() {
+    assert!(!call_conduit_wants_help(&args(&["--", "--help"])));
+    assert!(parse_call_conduit(&args(&["--", "--help"])).is_ok());
 }

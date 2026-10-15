@@ -27,7 +27,7 @@
 //! The rebuild script ships in-tree under `support/` (restored from the
 //! PHP master). It is found by an upward `support/lib/rebuild-map.php`
 //! search above the library first, then above the running binary: an
-//! installed `arc-rs` (e.g. `<prefix>/bin/arc-rs` with the tree at
+//! installed `arc` (e.g. `<prefix>/bin/arc` with the tree at
 //! `<prefix>/support/...`) resolves just like PHP's install-relative
 //! bundled path, and so do out-of-tree libraries.
 //!
@@ -323,7 +323,7 @@ pub fn ensure_library(path: &Path, input: &mut dyn BufRead) -> Result<bool, Stri
 /// Find `support/lib/rebuild-map.php` above `path`, then above `fallback`,
 /// then above the running binary.
 ///
-/// The binary search is the install story: `arc-rs` ships with a `support/`
+/// The binary search is the install story: `arc` ships with a `support/`
 /// tree next to its install root (like PHP's install-relative bundled
 /// script), so out-of-tree libraries still resolve the script.
 /// Search `start` and its ancestors for `support/lib/rebuild-map.php`.

@@ -222,7 +222,7 @@ fn wraps_uncommitted_block_paragraphs() {
     assert_eq!(
         block,
         "You have uncommitted changes in the working copy (\"r\") for this library\n\
-         (\"arc-rs\"):\n\
+         (\"arcanist\"):\n\
          \n\
          \x20     - a.txt\n\
          \n\
@@ -463,7 +463,7 @@ fn assert_no_leftovers(dir: &Path) {
     assert!(
         !names
             .iter()
-            .any(|name| name.contains(".arc-rs-new") || name.contains("writable")),
+            .any(|name| name.contains(".arc-new") || name.contains("writable")),
         "{names:?}"
     );
 }
@@ -874,7 +874,7 @@ fn install_refuses_readonly_keeping_old() {
 fn prompt_names_library_and_versions() {
     assert_eq!(
         upgrade_prompt("0.1.0", "v0.1.1"),
-        "Upgrade \"arc-rs\" from \"0.1.0\" to \"v0.1.1\"?"
+        "Upgrade \"arcanist\" from \"0.1.0\" to \"v0.1.1\"?"
     );
 }
 
@@ -883,13 +883,13 @@ fn status_lines_match_php_without_tty() {
     let preparing = preparing_line(false);
     assert!(preparing.contains("PREPARING"), "{preparing:?}");
     assert!(
-        preparing.contains("Preparing to upgrade \"arc-rs\"..."),
+        preparing.contains("Preparing to upgrade \"arcanist\"..."),
         "{preparing:?}"
     );
     assert!(!preparing.contains('\x1b'));
     let upgrading = upgrading_line("stable", false);
     assert!(
-        upgrading.contains("Upgrading \"arc-rs\" (on branch \"stable\")."),
+        upgrading.contains("Upgrading \"arcanist\" (on branch \"stable\")."),
         "{upgrading:?}"
     );
     assert!(!upgrading.contains('\x1b'));
