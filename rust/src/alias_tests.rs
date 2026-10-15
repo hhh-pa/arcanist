@@ -108,17 +108,31 @@ fn storage_parse_warns_and_ignores_invalid_entries() {
         {"trigger": "draft", "toolset": "arc", "command": ["diff"]},
         {"trigger": "broken", "toolset": "arc"},
     ]);
-    let (aliases, warnings) = aliases_from_storage(&value, "user (u)");
+    let (aliases, warnings) = aliases_from_storage(&value, "user (u)").unwrap();
     assert_eq!(aliases.len(), 1);
     assert_eq!(aliases[0].trigger, "draft");
     assert_eq!(aliases[0].source, "user (u)");
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].contains("user (u)"), "{}", warnings[0]);
     assert!(warnings[0].contains("ignored"), "{}", warnings[0]);
+}
 
-    let (aliases, warnings) = aliases_from_storage(&serde_json::json!("nope"), "user (u)");
-    assert!(aliases.is_empty());
-    assert_eq!(warnings.len(), 1);
+#[test]
+fn storage_parse_rejects_non_array_values() {
+    // PHP-fatal: `ArcanistAliasesConfigOption` throws here and startup
+    // validation does not catch it, so a non-array whole value errors
+    // instead of warning.
+    for value in [
+        serde_json::json!("nope"),
+        serde_json::json!(42),
+        serde_json::json!(null),
+        serde_json::json!(true),
+    ] {
+        let err = aliases_from_storage(&value, "user (u)").unwrap_err();
+        assert!(err.contains("user (u)"), "{err}");
+        assert!(err.contains("is not valid"), "{err}");
+        assert!(err.contains("Expected a list or dictionary!"), "{err}");
+    }
 }
 
 #[test]
@@ -194,6 +208,55 @@ fn expansion_quotes_shell_display_words() {
 }
 
 #[test]
+fn display_quoting_matches_php_readable_charset() {
+    // PHP `%R` stays bare only for `^[a-zA-Z0-9:/@._+-]+$`
+    // (`xsprintf_command`); `%`, `=`, `,` and friends quote.
+    for bare in [
+        "ls",
+        "-la",
+        "--draft",
+        "/tmp/x",
+        "a:b@c.d_e+f-g",
+        "9",
+        "UPPER",
+    ] {
+        assert_eq!(shell_quote(bare), bare, "{bare}");
+    }
+    assert_eq!(shell_quote(""), "''");
+    assert_eq!(shell_quote("a b"), "'a b'");
+    assert_eq!(shell_quote("a=b"), "'a=b'");
+    assert_eq!(shell_quote("100%"), "'100%'");
+    assert_eq!(shell_quote("a,b"), "'a,b'");
+    assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    assert_eq!(shell_quote("$HOME"), "'$HOME'");
+    assert_eq!(
+        shell_display(&args(&["echo", "a b", "--x"])),
+        "echo 'a b' --x"
+    );
+    assert_eq!(shell_display(&[]), "");
+}
+
+#[test]
+fn expansion_quotes_effect_alias_tail_like_pct_lr() {
+    // PHP renders the `EFFECT_ALIAS` tail with `%LR`: words needing
+    // quoting are quoted, safe words stay bare.
+    let aliases = vec![alias("arc", "draft", &["diff", "a b", "--x"], "user")];
+    let expanded = expand(&args(&["draft"]), &aliases, builtin);
+    let Expansion::Dispatch { argv, hints } = expanded else {
+        panic!("expected dispatch, got {expanded:?}");
+    };
+    assert_eq!(argv, args(&["diff", "a b", "--x"]));
+    assert_eq!(hints.len(), 1);
+    assert_eq!(hints[0], "arc draft -> arc diff 'a b' --x");
+
+    let aliases = vec![alias("arc", "eq", &["diff", "a=b"], "user")];
+    let Expansion::Dispatch { hints, .. } = expand(&args(&["eq"]), &aliases, builtin) else {
+        panic!("expected dispatch");
+    };
+    assert_eq!(hints[0], "arc eq -> arc diff 'a=b'");
+}
+
+#[test]
 fn expansion_reports_cycles() {
     let aliases = vec![
         alias("arc", "a", &["b"], "user"),
@@ -205,6 +268,55 @@ fn expansion_reports_cycles() {
     };
     assert!(message.contains("cycle"), "{message}");
     assert!(message.contains("b -> a -> b"), "{message}");
+}
+
+#[test]
+fn expansion_reports_self_cycles() {
+    let aliases = vec![alias("arc", "loop", &["loop"], "user")];
+    let expanded = expand(&args(&["loop"]), &aliases, builtin);
+    let Expansion::Failed { message, hints } = expanded else {
+        panic!("expected failure, got {expanded:?}");
+    };
+    assert!(message.contains("cycle"), "{message}");
+    assert!(message.contains("loop -> loop"), "{message}");
+    assert_eq!(hints.len(), 1);
+}
+
+#[test]
+fn expansion_chain_ending_at_builtin_keeps_every_hint() {
+    let aliases = vec![
+        alias("arc", "a", &["b"], "user"),
+        alias("arc", "b", &["diff", "--all"], "user"),
+    ];
+    let expanded = expand(&args(&["a", "user-arg"]), &aliases, builtin);
+    let Expansion::Dispatch { argv, hints } = expanded else {
+        panic!("expected dispatch, got {expanded:?}");
+    };
+    assert_eq!(argv, args(&["diff", "--all", "user-arg"]));
+    assert_eq!(
+        hints,
+        vec![
+            "arc a -> arc b ".to_string(),
+            "arc b -> arc diff --all".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn expansion_multi_hop_to_shell_keeps_only_the_shell_hint() {
+    // PHP parity: `ArcanistRuntime` returns `executeShellAlias()` on the
+    // first `EFFECT_SHELL` and prints only its message, so earlier
+    // `EFFECT_ALIAS` hints never surface for shell chains.
+    let aliases = vec![
+        alias("arc", "a", &["b", "--from-a"], "user"),
+        alias("arc", "b", &["!echo", "hi"], "user"),
+    ];
+    let expanded = expand(&args(&["a", "user-arg"]), &aliases, builtin);
+    let Expansion::Shell { argv, hint } = expanded else {
+        panic!("expected shell, got {expanded:?}");
+    };
+    assert_eq!(argv, args(&["echo", "hi", "--from-a", "user-arg"]));
+    assert_eq!(hint, "arc b -> $ echo hi --from-a user-arg");
 }
 
 #[test]
@@ -526,5 +638,199 @@ fn load_merges_user_aliases() {
         aliases
             .iter()
             .any(|a| a.trigger == "draft" && a.toolset == "arc")
+    );
+}
+
+#[test]
+fn list_fails_on_non_array_aliases_value() {
+    let tmp = TempDir::new("badvalue");
+    let arcrc = tmp.arcrc();
+    std::fs::write(&arcrc, r#"{"aliases": 42}"#).unwrap();
+    let err = execute_list(tmp.path(), Some(&arcrc), false).unwrap_err();
+    assert!(err.contains("is not valid"), "{err}");
+    assert!(err.contains("Expected a list or dictionary!"), "{err}");
+}
+
+#[test]
+fn shell_status_mapping_passes_codes_and_fails_signals() {
+    assert_eq!(
+        shell_status_exit_code(ShellStatus::Exited(0)),
+        ExitCode::SUCCESS
+    );
+    assert_eq!(
+        shell_status_exit_code(ShellStatus::Exited(3)),
+        ExitCode::from(3)
+    );
+    // Unrepresentable codes fail instead of wrapping.
+    assert_eq!(
+        shell_status_exit_code(ShellStatus::Exited(256)),
+        ExitCode::FAILURE
+    );
+    assert_eq!(
+        shell_status_exit_code(ShellStatus::Exited(-1)),
+        ExitCode::FAILURE
+    );
+    // Signal deaths have no single PHP value (`proc_close()` returns the
+    // raw wait status, `-1`, or `128+N` depending on build and shell), so
+    // they map to a fixed failure.
+    assert_eq!(
+        shell_status_exit_code(ShellStatus::Signaled(9)),
+        ExitCode::FAILURE
+    );
+    assert_eq!(
+        shell_status_exit_code(ShellStatus::Signaled(15)),
+        ExitCode::FAILURE
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_status_from_real_children() {
+    let exited = std::process::Command::new("sh")
+        .args(["-c", "exit 3"])
+        .status()
+        .unwrap();
+    assert_eq!(
+        shell_status_from_exit_status(&exited),
+        ShellStatus::Exited(3)
+    );
+    let signaled = std::process::Command::new("sh")
+        .args(["-c", "kill -TERM $$"])
+        .status()
+        .unwrap();
+    assert_eq!(
+        shell_status_from_exit_status(&signaled),
+        ShellStatus::Signaled(15)
+    );
+}
+
+#[test]
+fn shell_runner_maps_spawn_outcomes() {
+    let (code, notices) = run_shell_alias_with(
+        &args(&["echo", "hi"]),
+        "arc g -> $ echo hi",
+        |program, argv| {
+            assert_eq!(program, "echo");
+            assert_eq!(argv, &["hi".to_string()]);
+            Ok(ShellStatus::Exited(0))
+        },
+    );
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(notices, vec!["SHELL ALIAS: arc g -> $ echo hi".to_string()]);
+
+    let (code, notices) =
+        run_shell_alias_with(&args(&["echo"]), "h", |_, _| Ok(ShellStatus::Exited(7)));
+    assert_eq!(code, ExitCode::from(7));
+    assert_eq!(notices.len(), 1);
+
+    let (code, notices) =
+        run_shell_alias_with(&args(&["echo"]), "h", |_, _| Ok(ShellStatus::Signaled(9)));
+    assert_eq!(code, ExitCode::FAILURE);
+    assert_eq!(notices.len(), 1);
+
+    let (code, notices) = run_shell_alias_with(&args(&["missing"]), "h", |_, _| {
+        Err::<ShellStatus, String>("not found".to_string())
+    });
+    assert_eq!(code, ExitCode::FAILURE);
+    assert_eq!(notices.len(), 2);
+    assert!(
+        notices[1].contains("cannot execute shell alias"),
+        "{}",
+        notices[1]
+    );
+    assert!(notices[1].contains("not found"), "{}", notices[1]);
+
+    let (code, notices) = run_shell_alias_with(&[], "h", |_, _| Ok(ShellStatus::Exited(0)));
+    assert_eq!(code, ExitCode::FAILURE);
+    assert!(notices[1].contains("empty shell alias"), "{}", notices[1]);
+}
+
+fn loaded(aliases: Vec<Alias>) -> Option<(Vec<Alias>, Vec<String>)> {
+    Some((aliases, Vec::new()))
+}
+
+#[test]
+fn expansion_driver_dispatches_and_reports_shell_and_broken_chains() {
+    let aliases = vec![alias("arc", "draft", &["diff", "--draft"], "user")];
+    let (result, notices) = apply_expansion_with(
+        args(&["draft", "extra"]),
+        || loaded(aliases),
+        |_| panic!("must not spawn for dispatch"),
+    );
+    assert_eq!(result, Ok(args(&["diff", "--draft", "extra"])));
+    assert_eq!(
+        notices,
+        vec!["ALIAS: arc draft -> arc diff --draft".to_string()]
+    );
+
+    let aliases = vec![alias("arc", "g", &["!echo", "hi"], "user")];
+    let (result, notices) = apply_expansion_with(
+        args(&["g"]),
+        || loaded(aliases),
+        |shell| {
+            assert_eq!(shell, &args(&["echo", "hi"]));
+            Ok(ShellStatus::Exited(0))
+        },
+    );
+    assert_eq!(result, Err(ExitCode::SUCCESS));
+    assert_eq!(notices, vec!["SHELL ALIAS: arc g -> $ echo hi".to_string()]);
+
+    let aliases = vec![alias("arc", "g", &["!echo"], "user")];
+    let (result, notices) = apply_expansion_with(
+        args(&["g"]),
+        || loaded(aliases),
+        |_| Ok(ShellStatus::Exited(4)),
+    );
+    assert_eq!(result, Err(ExitCode::from(4)));
+    assert_eq!(notices.len(), 1);
+
+    let aliases = vec![alias("arc", "a", &["gone"], "user")];
+    let (result, notices) = apply_expansion_with(
+        args(&["a"]),
+        || loaded(aliases),
+        |_| panic!("must not spawn for broken chains"),
+    );
+    assert_eq!(result, Err(ExitCode::FAILURE));
+    assert_eq!(notices.len(), 2);
+    assert!(notices[0].starts_with("ALIAS: "), "{}", notices[0]);
+    assert!(
+        notices[1].contains("Alias resolved to \"gone\""),
+        "{}",
+        notices[1]
+    );
+}
+
+#[test]
+fn expansion_driver_passes_through_flags_and_unreadable_config() {
+    let (result, notices) = apply_expansion_with(
+        args(&["--help"]),
+        || panic!("must not load"),
+        |_| panic!("must not spawn"),
+    );
+    assert_eq!(result, Ok(args(&["--help"])));
+    assert!(notices.is_empty());
+
+    let (result, notices) =
+        apply_expansion_with(args(&["diff"]), || None, |_| panic!("must not spawn"));
+    assert_eq!(result, Ok(args(&["diff"])));
+    assert!(notices.is_empty());
+}
+
+#[test]
+fn expansion_driver_emits_configuration_warnings_first() {
+    let aliases = vec![alias("arc", "draft", &["diff"], "user")];
+    let warning = "Configuration source (\"user\") defines an invalid alias".to_string();
+    let (result, notices) = apply_expansion_with(
+        args(&["draft"]),
+        || Some((aliases, vec![warning.clone()])),
+        |_| panic!("must not spawn for dispatch"),
+    );
+    assert_eq!(result, Ok(args(&["diff"])));
+    assert_eq!(notices.len(), 2);
+    assert_eq!(notices[0], format!("ALIAS: {warning}"));
+    assert!(
+        notices[1].starts_with("ALIAS: arc draft -> "),
+        "{}",
+        notices[1]
     );
 }
