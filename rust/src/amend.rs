@@ -16,8 +16,9 @@
 //!   change, but its own TODO calls that overly broad:
 //!   `ArcanistAmendWorkflow.php:170-171`). Under Mercurial, dirty tracked
 //!   files are refused while untracked files are allowed.
-//! - Banners and ref views render as plain text, following the crate's
-//!   markup-stripped convention (see `land::push_banner`); prompt queries,
+//! - Banners render as plain text through `land::push_banner` (that module
+//!   owns TTY styling); ref views colorize on TTYs via `terminal::RefView`
+//!   and keep the legacy `**`-marked plain text otherwise. Prompt queries,
 //!   error sentences, and ref lines keep the PHP wording.
 //! - Guessing scans the HEAD commit only (explicit `Differential Revision:`
 //!   ID, else the HEAD commit and tree hashes), where PHP resolves the full
@@ -35,7 +36,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use crate::conduit::Client;
-use crate::{close_revision, config, diff_local, get_config, git, hg, land, svn};
+use crate::{close_revision, config, diff_local, get_config, git, hg, land, svn, terminal};
 
 pub const NAME: &str = "amend";
 
@@ -396,12 +397,23 @@ pub fn local_revision_ids(
         .collect())
 }
 
-/// Pick the single guessed revision (`selectRevisionRef`, `:180-203`):
-/// none and multiple are usage errors; the multiple case lists the
-/// candidates first, like PHP.
+/// Pick the single guessed revision with the process ANSI setting
+/// (`selectRevisionRef`, `:180-203`).
 pub fn select_guessed(
     io: &mut land::Io,
     revisions: Vec<close_revision::Revision>,
+) -> Result<close_revision::Revision, String> {
+    select_guessed_ansi(io, revisions, terminal::ansi_enabled())
+}
+
+/// Pick the single guessed revision with an explicit ANSI setting
+/// (deterministic under test): none and multiple are usage errors; the
+/// multiple case lists the candidates first, like PHP. The banner stays
+/// plain (rendered by `land`); the ref-view list colorizes on TTYs.
+pub fn select_guessed_ansi(
+    io: &mut land::Io,
+    revisions: Vec<close_revision::Revision>,
+    ansi: bool,
 ) -> Result<close_revision::Revision, String> {
     if revisions.is_empty() {
         return Err("No revision specified with \"--revision\", and no revisions found that match the current working copy state. Use \"--revision <id>\" to specify which revision you want to amend."
@@ -414,9 +426,10 @@ pub fn select_guessed(
             "More than one revision was found in the working copy:",
         );
         for revision in &revisions {
-            io.push_out(&ref_view_line(
+            io.push_out(&ref_view_line_ansi(
                 &format!("D{}", revision.id),
                 &revision.title,
+                ansi,
             ));
         }
         return Err(
@@ -458,11 +471,33 @@ pub fn revision_numeric_id(revision: &close_revision::Revision) -> Result<u64, S
         .map_err(|_| format!("revision D{} has a non-numeric id", revision.id))
 }
 
-/// One plain-text `ArcanistRefView` line (`src/ref/ArcanistRefView.php`):
-/// `**  *  ** D123 Title`. Colors are stripped per the crate's plain-text
-/// convention; terminal-width title truncation is not ported.
+/// One `ArcanistRefView` line (`src/ref/ArcanistRefView.php`) with the
+/// process ANSI setting.
 #[must_use]
 pub fn ref_view_line(object: &str, title: &str) -> String {
+    ref_view_line_ansi(object, title, terminal::ansi_enabled())
+}
+
+/// One `ArcanistRefView` line with an explicit ANSI setting (deterministic
+/// under test): the legacy `**`-marked plain text without ANSI, else the
+/// cyan-marker/bold-object TTY rendering through [`terminal::RefView`]
+/// (matching PHP `phutil_console_format` byte-for-byte, title truncation
+/// included).
+#[must_use]
+pub fn ref_view_line_ansi(object: &str, title: &str, ansi: bool) -> String {
+    if !ansi {
+        return ref_view_plain(object, title);
+    }
+    terminal::RefView {
+        object_name: Some(object.to_string()),
+        title: Some(title.to_string()),
+        ..terminal::RefView::default()
+    }
+    .render(0, land::REF_VIEW_TERMINAL_WIDTH, true)
+}
+
+/// The legacy plain-text ref-view line: `**  *  ** D123 Title`.
+fn ref_view_plain(object: &str, title: &str) -> String {
     if title.is_empty() {
         format!("**  *  ** {object}\n")
     } else {
@@ -559,6 +594,7 @@ fn confirm_author(
     io: &mut land::Io,
     client: &Client,
     revision: &close_revision::Revision,
+    ansi: bool,
 ) -> Result<(), String> {
     let viewer = close_revision::user_phid(client)?;
     if viewer == revision.author_phid || revision.author_phid.is_empty() {
@@ -580,7 +616,7 @@ fn confirm_author(
     } else {
         format!("({real})")
     };
-    io.push_out(&ref_view_line(&format!("@{username}"), &title));
+    io.push_out(&ref_view_line_ansi(&format!("@{username}"), &title, ansi));
     land::prompt_for_key(
         io,
         PROMPT_AUTHOR,
@@ -734,6 +770,7 @@ fn resolve_revision(
     io: &mut land::Io,
     hints: &Hints,
     hash_kind: &str,
+    ansi: bool,
 ) -> Result<(Client, close_revision::Revision), String> {
     if let Some(symbol) = &options.revision {
         let id = parse_revision_id(symbol)?;
@@ -742,14 +779,30 @@ fn resolve_revision(
         return Ok((client, revision));
     }
     let client = revision_client(options)?;
-    let revision = select_guessed(io, guess_revisions(&client, hints, hash_kind)?)?;
+    let revision = select_guessed_ansi(io, guess_revisions(&client, hints, hash_kind)?, ansi)?;
     Ok((client, revision))
 }
 
-/// Print `Amending commit message to reflect revision:` plus the ref view,
-/// then run the author and unrelated-revision confirmations (`:107-115`).
-/// Guessed revisions skip the unrelated check: they are local by
-/// construction.
+/// `echo tsprintf("%s\n\n%s\n", ...)` (`:107-112`): the announce line plus
+/// the revision ref view (a terminal value, substituted raw).
+fn announce_text(revision: &close_revision::Revision, ansi: bool) -> String {
+    let line = ref_view_line_ansi(&format!("D{}", revision.id), &revision.title, ansi);
+    let view = terminal::TerminalString::new(line);
+    terminal::tsprintf_ansi(
+        "%s\n\n%s\n",
+        &[
+            terminal::TVal::Text("Amending commit message to reflect revision:"),
+            terminal::TVal::Terminal(&view),
+        ],
+        ansi,
+    )
+    .map(|rendered| rendered.to_string())
+    .unwrap_or_default()
+}
+
+/// Print the announce text, then run the author and unrelated-revision
+/// confirmations (`:107-115`). Guessed revisions skip the unrelated
+/// check: they are local by construction.
 fn announce_and_confirm(
     io: &mut land::Io,
     client: &Client,
@@ -757,12 +810,10 @@ fn announce_and_confirm(
     revision: &close_revision::Revision,
     hints: &Hints,
     hash_kind: &str,
+    ansi: bool,
 ) -> Result<(), String> {
-    io.push_out(&format!(
-        "Amending commit message to reflect revision:\n\n{}\n",
-        ref_view_line(&format!("D{}", revision.id), &revision.title)
-    ));
-    confirm_author(io, client, revision)?;
+    io.push_out(&announce_text(revision, ansi));
+    confirm_author(io, client, revision, ansi)?;
     if options.revision.is_some() {
         let local = local_revision_ids(client, hints, hash_kind)?;
         confirm_related(io, &local, revision)?;
@@ -867,7 +918,12 @@ fn message_for_revision(
 
 /// Git flow: support checks, revision resolution, confirmations, then the
 /// message is printed (`--show`) or amended into HEAD.
-fn flow_git(dir: &Path, options: &Options, io: &mut land::Io) -> Result<String, String> {
+fn flow_git(
+    dir: &Path,
+    options: &Options,
+    io: &mut land::Io,
+    ansi: bool,
+) -> Result<String, String> {
     if !options.show {
         require_git_amend_support(dir, io)?;
     }
@@ -875,9 +931,9 @@ fn flow_git(dir: &Path, options: &Options, io: &mut land::Io) -> Result<String, 
         return finish_git(dir, options, &message);
     }
     let hints = git_hints(dir)?;
-    let (client, revision) = resolve_revision(options, io, &hints, "gtcm")?;
+    let (client, revision) = resolve_revision(options, io, &hints, "gtcm", ansi)?;
     if !options.show {
-        announce_and_confirm(io, &client, options, &revision, &hints, "gtcm")?;
+        announce_and_confirm(io, &client, options, &revision, &hints, "gtcm", ansi)?;
     }
     let message = message_for_revision(&client, &revision)?;
     finish_git(dir, options, &message)
@@ -889,6 +945,7 @@ fn flow_hg(
     options: &Options,
     io: &mut land::Io,
     hg: &hg::HgCommand,
+    ansi: bool,
 ) -> Result<String, String> {
     if !options.show {
         require_hg_amend_support(dir, hg, io)?;
@@ -897,22 +954,35 @@ fn flow_hg(
         return finish_hg(dir, options, hg, &message);
     }
     let hints = hg_hints(dir, hg)?;
-    let (client, revision) = resolve_revision(options, io, &hints, "hgcm")?;
+    let (client, revision) = resolve_revision(options, io, &hints, "hgcm", ansi)?;
     if !options.show {
-        announce_and_confirm(io, &client, options, &revision, &hints, "hgcm")?;
+        announce_and_confirm(io, &client, options, &revision, &hints, "hgcm", ansi)?;
     }
     let message = message_for_revision(&client, &revision)?;
     finish_hg(dir, options, hg, &message)
 }
 
-/// Run the workflow rooted at `dir` with `hg` as the Mercurial backend,
-/// returning stdout text or an error message. Prompts and banners go to
-/// `io`; with a live `io` they echo as the workflow runs.
+/// Run the workflow rooted at `dir` with `hg` as the Mercurial backend and
+/// the process ANSI setting, returning stdout text or an error message.
+/// Prompts and banners go to `io`; with a live `io` they echo as the
+/// workflow runs.
 pub fn execute_with_io_backends(
     dir: &Path,
     argv: &[String],
     io: &mut land::Io,
     hg: &hg::HgCommand,
+) -> Result<String, String> {
+    execute_with_io_backends_ansi(dir, argv, io, hg, terminal::ansi_enabled())
+}
+
+/// [`execute_with_io_backends`] with an explicit ANSI setting
+/// (deterministic under test).
+pub fn execute_with_io_backends_ansi(
+    dir: &Path,
+    argv: &[String],
+    io: &mut land::Io,
+    hg: &hg::HgCommand,
+    ansi: bool,
 ) -> Result<String, String> {
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
@@ -928,10 +998,10 @@ pub fn execute_with_io_backends(
         return show_without_state(&options);
     }
     if git::is_inside_work_tree(dir) {
-        return flow_git(dir, &options, io);
+        return flow_git(dir, &options, io, ansi);
     }
     if hg::find_root(dir).is_some() {
-        return flow_hg(dir, &options, io, hg);
+        return flow_hg(dir, &options, io, hg, ansi);
     }
     if svn::find_metadata_path(dir).is_some() {
         return Err("\"arc amend\" must be run from inside a working copy of a repository using a version control system that supports amending commits, like Git or Mercurial."
