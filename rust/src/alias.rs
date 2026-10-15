@@ -53,6 +53,9 @@ Options:\n\
 /// Every command `main` dispatches without aliases: the `COMMANDS` table
 /// plus `call-conduit` (parsed by `classify`) and `help` (also handled by
 /// `classify`, a builtin workflow in PHP). An alias can never shadow these.
+/// `call-conduit` is unshadowable: PHP registers `ArcanistCallConduitWorkflow`
+/// (`extends ArcanistArcWorkflow`, name `call-conduit`) in `$workflows`, so the
+/// engine's `isset($workflows[$command])` check always wins over aliases.
 const BUILTINS: &[&str] = &[
     NAME,
     amend::NAME,
@@ -206,9 +209,15 @@ fn invalid_warning(source: &str, detail: &str) -> String {
 }
 
 /// Parse one source's `aliases` storage value (old dict or new list),
-/// collecting invalid-entry warnings. A non-array value warns like an
-/// invalid entry (PHP throws `Expected a list or dictionary!` here).
-pub fn aliases_from_storage(value: &serde_json::Value, source: &str) -> (Vec<Alias>, Vec<String>) {
+/// collecting invalid-entry warnings. A non-array whole value is a hard
+/// error, mirroring PHP: `ArcanistAliasesConfigOption` throws `Expected a
+/// list or dictionary!`, which `validateConfiguration()` wraps as
+/// `Configuration value ("aliases") ... is not valid` before any dispatch,
+/// and `ArcanistRuntime::execute()` does not catch it (PHP-fatal).
+pub fn aliases_from_storage(
+    value: &serde_json::Value,
+    source: &str,
+) -> Result<(Vec<Alias>, Vec<String>), String> {
     let entries: Vec<(String, &serde_json::Value)> = match value {
         serde_json::Value::Array(items) => items
             .iter()
@@ -220,7 +229,14 @@ pub fn aliases_from_storage(value: &serde_json::Value, source: &str) -> (Vec<Ali
         }
         _ => {
             let detail = terminal::pht("Expected a list or dictionary!", &[]);
-            return (Vec::new(), vec![invalid_warning(source, &detail)]);
+            return Err(terminal::pht(
+                "Configuration value (\"%s\") defined in source \"%s\" is not valid: %s",
+                &[
+                    PhtArg::Text("aliases"),
+                    PhtArg::Text(source),
+                    PhtArg::Text(&detail),
+                ],
+            ));
         }
     };
     let mut aliases = Vec::new();
@@ -234,7 +250,7 @@ pub fn aliases_from_storage(value: &serde_json::Value, source: &str) -> (Vec<Ali
             Err(detail) => warnings.push(invalid_warning(source, &detail)),
         }
     }
-    (aliases, warnings)
+    Ok((aliases, warnings))
 }
 
 fn take_source(
@@ -242,17 +258,20 @@ fn take_source(
     source: &str,
     aliases: &mut Vec<Alias>,
     warnings: &mut Vec<String>,
-) {
+) -> Result<(), String> {
     if let Some(value) = map.get("aliases") {
-        let (mut found, mut found_warnings) = aliases_from_storage(value, source);
+        let (mut found, mut found_warnings) = aliases_from_storage(value, source)?;
         aliases.append(&mut found);
         warnings.append(&mut found_warnings);
     }
+    Ok(())
 }
 
 /// Load aliases from every file source, least to most specific (system,
 /// user, project, local), mirroring the PHP source order. Later entries
-/// win during resolution.
+/// win during resolution. A non-array `aliases` value in any source is a
+/// hard error (PHP-fatal at startup validation); invalid single entries
+/// warn and are ignored.
 pub fn load_aliases_in(
     dir: &Path,
     user_file: Option<&Path>,
@@ -266,7 +285,7 @@ pub fn load_aliases_in(
         &format!("system ({})", system_path.display()),
         &mut aliases,
         &mut warnings,
-    );
+    )?;
     if let Some(path) = user_file {
         let user = get_config::read_user_file(path)?;
         take_source(
@@ -274,16 +293,16 @@ pub fn load_aliases_in(
             &format!("user ({})", path.display()),
             &mut aliases,
             &mut warnings,
-        );
+        )?;
     }
     let (project_file, project) = get_config::read_project_config(dir)?;
     let project_source = project_file.map_or_else(
         || "project".to_string(),
         |file| format!("project ({})", file.display()),
     );
-    take_source(&project, &project_source, &mut aliases, &mut warnings);
+    take_source(&project, &project_source, &mut aliases, &mut warnings)?;
     let local = get_config::read_local_config(dir)?;
-    take_source(&local, "local", &mut aliases, &mut warnings);
+    take_source(&local, "local", &mut aliases, &mut warnings)?;
     Ok((aliases, warnings))
 }
 
@@ -372,6 +391,9 @@ pub fn expand(argv: &[String], aliases: &[Alias], is_builtin: impl Fn(&str) -> b
                 hints,
             };
         }
+        // PHP renders the tail with `(string)csprintf('%LR', $alias_argv)`
+        // (`EFFECT_ALIAS`): minimal `%R` quoting per word.
+        let display_argv = shell_display(&alias.command[1..]);
         hints.push(terminal::pht(
             "%s %s -> %s %s %s",
             &[
@@ -379,7 +401,7 @@ pub fn expand(argv: &[String], aliases: &[Alias], is_builtin: impl Fn(&str) -> b
                 PhtArg::Text(&command),
                 PhtArg::Text(TOOLSET),
                 PhtArg::Text(head),
-                PhtArg::Text(&alias.command[1..].join(" ")),
+                PhtArg::Text(&display_argv),
             ],
         ));
         let mut next = alias.command[1..].to_vec();
@@ -475,16 +497,13 @@ fn expand_shell(alias: &Alias, command: &str, rest: &[String]) -> Expansion {
     Expansion::Shell { argv: shell, hint }
 }
 
-/// Quote one shell-display word, `escapeshellarg()`-like: bare when it
-/// needs no quoting, single-quoted otherwise. Display-only.
+/// Quote one display word with PHP `%R` ("readable") semantics
+/// (`xsprintf_command`): bare when it matches `^[a-zA-Z0-9:/@._+-]+$`,
+/// `escapeshellarg()`-quoted otherwise. Display-only.
 fn shell_quote(text: &str) -> String {
     let bare = !text.is_empty()
         && text.bytes().all(|b| {
-            b.is_ascii_alphanumeric()
-                || matches!(
-                    b,
-                    b'_' | b'-' | b'.' | b'/' | b':' | b'@' | b'%' | b'+' | b'=' | b','
-                )
+            b.is_ascii_alphanumeric() || matches!(b, b':' | b'/' | b'@' | b'.' | b'_' | b'+' | b'-')
         });
     if bare {
         return text.to_string();
@@ -492,12 +511,133 @@ fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
-/// Render a shell argv for hints, mirroring `csprintf('%Ls', ...)`.
+/// Render an argv for hints, one `%R`-quoted word per argument.
+///
+/// PHP renders `EFFECT_ALIAS` tails with `%LR` (this function exactly) but
+/// shell-alias hints with `%Ls`, which `escapeshellarg()`s every word even
+/// when bare-safe. Rust deliberately uses `%R`-style minimal quoting for
+/// both: the shell hint stays unambiguous and matches the prettier
+/// `EFFECT_ALIAS` style. Display-only; execution uses the raw argv.
 fn shell_display(argv: &[String]) -> String {
     argv.iter()
         .map(|word| shell_quote(word))
         .collect::<Vec<String>>()
         .join(" ")
+}
+
+/// How a shell-alias child terminated: a normal exit code, or death by
+/// signal. Mirrors the `proc_close()` result `phutil_passthru()` returns
+/// from `PhutilExecPassthru::executeCommand()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellStatus {
+    Exited(i32),
+    Signaled(i32),
+}
+
+/// Build a [`ShellStatus`] from a finished child. Unix only in practice
+/// (only Unix reports fatal signals); elsewhere a missing code maps to
+/// `Signaled(-1)`.
+#[cfg(unix)]
+#[must_use]
+pub fn shell_status_from_exit_status(status: &std::process::ExitStatus) -> ShellStatus {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(code) = status.code() {
+        ShellStatus::Exited(code)
+    } else {
+        ShellStatus::Signaled(status.signal().unwrap_or(-1))
+    }
+}
+
+/// Build a [`ShellStatus`] from a finished child (non-Unix fallback).
+#[cfg(not(unix))]
+#[must_use]
+pub fn shell_status_from_exit_status(status: &std::process::ExitStatus) -> ShellStatus {
+    status
+        .code()
+        .map_or(ShellStatus::Signaled(-1), ShellStatus::Exited)
+}
+
+/// Map a shell-alias termination to an exit code, mirroring
+/// `phutil_passthru()` returning `proc_close()` verbatim (`exit($err)`):
+/// normal exits pass through, unrepresentable codes fail. Signal deaths
+/// map to `FAILURE`: PHP returns the raw wait status there (e.g. the bare
+/// signal number), `-1` under `--enable-sigchild` (where the manual calls
+/// the return "undefined"), or `128+N` when `sh` interposes between
+/// `proc_open()` and the real child — there is no single PHP value to
+/// match, so Rust uses a fixed failure.
+#[must_use]
+pub fn shell_status_exit_code(status: ShellStatus) -> ExitCode {
+    match status {
+        ShellStatus::Exited(code) => u8::try_from(code).map_or(ExitCode::FAILURE, ExitCode::from),
+        ShellStatus::Signaled(_) => ExitCode::FAILURE,
+    }
+}
+
+/// Run a resolved shell alias through an injected spawner, mirroring
+/// `ArcanistRuntime::executeShellAlias()` (hint first, then execute).
+/// Returns the exit code plus stderr lines in order; the caller prints
+/// each line. A spawn failure reports `cannot execute shell alias` and
+/// fails (PHP throws an uncaught `Failed to passthru proc_open()` here,
+/// which Rust softens to a reported failure).
+pub fn run_shell_alias_with(
+    shell_argv: &[String],
+    hint: &str,
+    spawn: impl FnOnce(&str, &[String]) -> Result<ShellStatus, String>,
+) -> (ExitCode, Vec<String>) {
+    let mut notices = vec![format!("SHELL ALIAS: {hint}")];
+    let Some((program, args)) = shell_argv.split_first() else {
+        notices.push("arc-rs: empty shell alias".to_string());
+        return (ExitCode::FAILURE, notices);
+    };
+    match spawn(program, args) {
+        Ok(status) => (shell_status_exit_code(status), notices),
+        Err(error) => {
+            notices.push(format!("arc-rs: cannot execute shell alias: {error}"));
+            (ExitCode::FAILURE, notices)
+        }
+    }
+}
+
+/// Injectable equivalent of `main`'s alias-expansion step: expand `argv`
+/// through loaded aliases, running shell aliases via `spawn`. `load`
+/// supplies aliases plus configuration warnings (`None` means unreadable
+/// configuration, which passes through untouched so each command can
+/// surface its own config errors). Returns the argv to dispatch (or the
+/// handling exit code) plus stderr lines in order; the caller prints each
+/// line. Leading-dash invocations never expand (PHP consumes toolset
+/// arguments before aliases run).
+pub fn apply_expansion_with(
+    argv: Vec<String>,
+    load: impl FnOnce() -> Option<(Vec<Alias>, Vec<String>)>,
+    spawn: impl FnOnce(&[String]) -> Result<ShellStatus, String>,
+) -> (Result<Vec<String>, ExitCode>, Vec<String>) {
+    if argv.first().is_none_or(|first| first.starts_with('-')) {
+        return (Ok(argv), Vec::new());
+    }
+    let Some((aliases, warnings)) = load() else {
+        return (Ok(argv), Vec::new());
+    };
+    let mut notices: Vec<String> = warnings.iter().map(|w| format!("ALIAS: {w}")).collect();
+    match expand(&argv, &aliases, is_builtin_command) {
+        Expansion::Dispatch { argv: next, hints } => {
+            notices.extend(hints.iter().map(|h| format!("ALIAS: {h}")));
+            (Ok(next), notices)
+        }
+        Expansion::Shell { argv: shell, hint } => {
+            let (code, mut shell_notices) = run_shell_alias_with(&shell, &hint, |program, args| {
+                let mut full = vec![program.to_string()];
+                full.extend(args.iter().cloned());
+                spawn(&full)
+            });
+            notices.append(&mut shell_notices);
+            (Err(code), notices)
+        }
+        Expansion::Failed { message, hints } => {
+            notices.extend(hints.iter().map(|h| format!("ALIAS: {h}")));
+            notices.push(format!("arc-rs: {message}"));
+            (Err(ExitCode::FAILURE), notices)
+        }
+    }
 }
 
 /// Last-wins effective `arc` aliases, sorted by trigger.
@@ -624,7 +764,7 @@ fn user_entries(
         return Ok((Vec::new(), Vec::new()));
     };
     if let Some(items) = stored.as_array() {
-        let (_, warnings) = aliases_from_storage(stored, source);
+        let (_, warnings) = aliases_from_storage(stored, source)?;
         return Ok((items.clone(), warnings));
     }
     let Some(map) = stored.as_object() else {

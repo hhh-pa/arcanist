@@ -159,18 +159,15 @@ fn builtin_set_matches_dispatch_table() {
 }
 
 fn stored_aliases(value: serde_json::Value) -> Vec<alias::Alias> {
-    let (aliases, warnings) = alias::aliases_from_storage(&value, "user (test)");
+    let (aliases, warnings) =
+        alias::aliases_from_storage(&value, "user (test)").expect("test aliases are valid storage");
     assert!(warnings.is_empty());
     aliases
 }
 
-fn dispatch_target(argv: &[String]) -> &'static str {
+fn dispatch_target(argv: &[String]) -> CommandFn {
     let cmd = argv.first().expect("expanded argv has a command");
-    COMMANDS
-        .iter()
-        .find(|(name, _)| *name == cmd.as_str())
-        .map(|(name, _)| *name)
-        .unwrap_or_else(|| panic!("{cmd} is not registered"))
+    find_command(cmd).unwrap_or_else(|| panic!("{cmd} is not registered"))
 }
 
 #[test]
@@ -186,7 +183,10 @@ fn stored_alias_expands_through_main_dispatch() {
         };
         assert_eq!(argv, args(&["diff", "--draft", "extra"]));
         assert_eq!(hints.len(), 1);
-        assert_eq!(dispatch_target(&argv), diff::NAME);
+        assert!(
+            std::ptr::fn_addr_eq(dispatch_target(&argv), diff::run as CommandFn),
+            "expanded argv does not dispatch to diff"
+        );
     }
 }
 
