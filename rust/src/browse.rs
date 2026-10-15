@@ -73,46 +73,137 @@ fn take_value(iter: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<Str
     }
 }
 
-fn parse_args(argv: &[String]) -> Parsed {
-    let mut branch = None;
-    let mut types = Vec::new();
-    let mut force = false;
-    let mut targets = Vec::new();
-    let mut end_of_flags = false;
-    let mut iter = argv.iter();
-    while let Some(arg) = iter.next() {
-        if !end_of_flags && arg == "--" {
-            end_of_flags = true;
-        } else if !end_of_flags && arg == "--branch" {
-            match take_value(&mut iter, "--branch") {
-                Ok(value) => branch = Some(value),
-                Err(outcome) => return outcome,
-            }
-        } else if !end_of_flags && arg.starts_with("--branch=") {
-            branch = Some(arg["--branch=".len()..].to_string());
-        } else if !end_of_flags && arg == "--types" {
-            match take_value(&mut iter, "--types") {
-                Ok(value) => types = split_types(&value),
-                Err(outcome) => return outcome,
-            }
-        } else if !end_of_flags && arg.starts_with("--types=") {
-            types = split_types(&arg["--types=".len()..]);
-        } else if !end_of_flags && arg == "--force" {
-            force = true;
-        } else if !end_of_flags && (arg == "-h" || arg == "--help") {
-            return Parsed::Help;
-        } else if !end_of_flags && arg.starts_with('-') {
-            return Parsed::Error(format!("unknown flag '{arg}'"));
-        } else {
-            targets.push(arg.clone());
+/// Incremental `parse_args` state.
+#[derive(Default)]
+struct ArgState {
+    branch: Option<String>,
+    types: Vec<String>,
+    force: bool,
+    targets: Vec<String>,
+    end_of_flags: bool,
+}
+
+impl ArgState {
+    fn into_parsed(self) -> Parsed {
+        Parsed::Options(BrowseOptions {
+            branch: self.branch,
+            types: self.types,
+            force: self.force,
+            targets: self.targets,
+        })
+    }
+}
+
+/// One classified command-line token.
+enum FlagKind {
+    EndOfFlags,
+    Branch,
+    BranchEq(String),
+    Types,
+    TypesEq(String),
+    Force,
+    Help,
+    Unknown,
+    Positional,
+}
+
+/// Classify one token (mirrors the `parse_args` flag order).
+fn classify_flag(arg: &str) -> FlagKind {
+    if arg == "--" {
+        FlagKind::EndOfFlags
+    } else if arg == "--branch" {
+        FlagKind::Branch
+    } else if let Some(value) = arg.strip_prefix("--branch=") {
+        FlagKind::BranchEq(value.to_string())
+    } else if arg == "--types" {
+        FlagKind::Types
+    } else if let Some(value) = arg.strip_prefix("--types=") {
+        FlagKind::TypesEq(value.to_string())
+    } else if arg == "--force" {
+        FlagKind::Force
+    } else if arg == "-h" || arg == "--help" {
+        FlagKind::Help
+    } else if arg.starts_with('-') {
+        FlagKind::Unknown
+    } else {
+        FlagKind::Positional
+    }
+}
+
+/// Apply `--branch` with a separate value.
+fn apply_branch_value(
+    state: &mut ArgState,
+    iter: &mut std::slice::Iter<'_, String>,
+) -> Option<Parsed> {
+    match take_value(iter, "--branch") {
+        Ok(value) => {
+            state.branch = Some(value);
+            None
+        }
+        Err(outcome) => Some(outcome),
+    }
+}
+
+/// Apply `--types` with a separate value.
+fn apply_types_value(
+    state: &mut ArgState,
+    iter: &mut std::slice::Iter<'_, String>,
+) -> Option<Parsed> {
+    match take_value(iter, "--types") {
+        Ok(value) => {
+            state.types = split_types(&value);
+            None
+        }
+        Err(outcome) => Some(outcome),
+    }
+}
+
+/// Apply one classified token; `Some` ends parsing early.
+fn apply_flag(
+    state: &mut ArgState,
+    iter: &mut std::slice::Iter<'_, String>,
+    arg: &str,
+    kind: FlagKind,
+) -> Option<Parsed> {
+    match kind {
+        FlagKind::EndOfFlags => {
+            state.end_of_flags = true;
+            None
+        }
+        FlagKind::Branch => apply_branch_value(state, iter),
+        FlagKind::BranchEq(value) => {
+            state.branch = Some(value);
+            None
+        }
+        FlagKind::Types => apply_types_value(state, iter),
+        FlagKind::TypesEq(value) => {
+            state.types = split_types(&value);
+            None
+        }
+        FlagKind::Force => {
+            state.force = true;
+            None
+        }
+        FlagKind::Help => Some(Parsed::Help),
+        FlagKind::Unknown => Some(Parsed::Error(format!("unknown flag '{arg}'"))),
+        FlagKind::Positional => {
+            state.targets.push(arg.to_string());
+            None
         }
     }
-    Parsed::Options(BrowseOptions {
-        branch,
-        types,
-        force,
-        targets,
-    })
+}
+
+fn parse_args(argv: &[String]) -> Parsed {
+    let mut state = ArgState::default();
+    let mut iter = argv.iter();
+    while let Some(arg) = iter.next() {
+        if state.end_of_flags {
+            state.targets.push(arg.clone());
+        } else if let Some(done) = apply_flag(&mut state, &mut iter, arg, classify_flag(arg)) {
+            return done;
+        }
+    }
+    state.into_parsed()
 }
 
 /// Split a `--types` value on whitespace/comma runs, keeping empty parts
@@ -268,6 +359,79 @@ fn remote_uri(dir: &Path) -> Option<String> {
         .filter(|uri| !uri.is_empty())
 }
 
+/// The configured `repository.callsign`, when set and non-empty.
+fn configured_callsign(dir: &Path) -> Option<String> {
+    let sources = get_config::load_sources(dir, config::arcrc_path().as_deref());
+    let loaded = sources.ok()?;
+    let (_, value) = get_config::current_value("repository.callsign", &loaded)?;
+    match value.as_str() {
+        Some(text) if !text.is_empty() => Some(text.to_string()),
+        _ => None,
+    }
+}
+
+/// The `repository.query` constraints (callsign config, else remote URI),
+/// or `None` outside a working copy or with no identifier.
+fn repo_query(dir: &Path) -> Option<serde_json::Value> {
+    if !git::is_inside_work_tree(dir) {
+        return None;
+    }
+    if let Some(callsign) = configured_callsign(dir) {
+        return Some(serde_json::json!({"callsigns": [callsign]}));
+    }
+    if let Some(uri) = remote_uri(dir) {
+        return Some(serde_json::json!({"remoteURIs": [uri]}));
+    }
+    None
+}
+
+/// Run `repository.query`; an old server (`ERR-CONDUIT-CALL`) means "no
+/// repository" rather than an error.
+fn call_repo_query(
+    call: &diff_submit::ConduitCall,
+    query: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, String> {
+    match call("repository.query", query) {
+        Ok(result) => Ok(Some(result)),
+        Err(message) if message.contains("ERR-CONDUIT-CALL") => Ok(None),
+        Err(message) => Err(message),
+    }
+}
+
+/// The default branch of a `repository.query` row (`fields` first, then
+/// top level, else `master`).
+fn default_branch_of(row: &serde_json::Value) -> String {
+    if let Some(fields) = row.get("fields")
+        && let Some(serde_json::Value::String(branch)) = fields.get("defaultBranch")
+    {
+        return branch.clone();
+    }
+    if let Some(serde_json::Value::String(branch)) = row.get("defaultBranch") {
+        return branch.clone();
+    }
+    "master".to_string()
+}
+
+/// Build `RepoInfo` from a `repository.query` result; zero or several
+/// matches, or a missing row, mean "no repository".
+fn repo_info_from_result(result: &serde_json::Value) -> Option<RepoInfo> {
+    let rows = query_rows(result);
+    if rows.len() != 1 {
+        return None;
+    }
+    let row = rows[0];
+    let phid = row_string(row, "phid");
+    let browse_uri = row_string(row, "uri");
+    if phid.is_empty() || browse_uri.is_empty() {
+        return None;
+    }
+    Some(RepoInfo {
+        phid,
+        browse_uri,
+        default_branch: default_branch_of(row),
+    })
+}
+
 /// Identify the working-copy repository via `repository.query`
 /// (callsign config, else remote URI). Zero or several matches, a
 /// missing row, or an old server mean "no repository".
@@ -275,49 +439,13 @@ pub fn resolve_repo(
     dir: &Path,
     call: &diff_submit::ConduitCall,
 ) -> Result<Option<RepoInfo>, String> {
-    if !git::is_inside_work_tree(dir) {
-        return Ok(None);
-    }
-    let sources = get_config::load_sources(dir, config::arcrc_path().as_deref());
-    let callsign = sources
-        .ok()
-        .and_then(|loaded| get_config::current_value("repository.callsign", &loaded))
-        .and_then(|(_, value)| value.as_str().map(str::to_string))
-        .filter(|callsign| !callsign.is_empty());
-    let query = if let Some(callsign) = callsign {
-        serde_json::json!({"callsigns": [callsign]})
-    } else if let Some(uri) = remote_uri(dir) {
-        serde_json::json!({"remoteURIs": [uri]})
-    } else {
+    let Some(query) = repo_query(dir) else {
         return Ok(None);
     };
-    let result = match call("repository.query", &query) {
-        Ok(result) => result,
-        Err(message) if message.contains("ERR-CONDUIT-CALL") => return Ok(None),
-        Err(message) => return Err(message),
+    let Some(result) = call_repo_query(call, &query)? else {
+        return Ok(None);
     };
-    let rows = query_rows(&result);
-    if rows.len() != 1 {
-        return Ok(None);
-    }
-    let row = rows[0];
-    let phid = row_string(row, "phid");
-    let browse_uri = row_string(row, "uri");
-    if phid.is_empty() || browse_uri.is_empty() {
-        return Ok(None);
-    }
-    let default_branch = row
-        .get("fields")
-        .and_then(|fields| fields.get("defaultBranch"))
-        .and_then(|v| v.as_str())
-        .or_else(|| row.get("defaultBranch").and_then(|v| v.as_str()))
-        .unwrap_or("master")
-        .to_string();
-    Ok(Some(RepoInfo {
-        phid,
-        browse_uri,
-        default_branch,
-    }))
+    Ok(repo_info_from_result(&result))
 }
 
 /// Commit URIs via `diffusion.querycommits` (batched over hashes).
@@ -565,6 +693,53 @@ fn footer_ids(dir: &Path, hashes: &[String]) -> BTreeMap<String, Vec<usize>> {
     by_id
 }
 
+/// One id constraint value: numbers stay numeric, anything else is a string.
+fn id_param(id: &str) -> serde_json::Value {
+    match id.parse::<u64>() {
+        Ok(number) => serde_json::Value::from(number),
+        Err(_) => serde_json::Value::String(id.to_string()),
+    }
+}
+
+/// The id of a `differential.revision.search` row (string or integer).
+fn row_id_string(row: &serde_json::Value) -> String {
+    match row.get("id") {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Number(number)) => match number.as_u64() {
+            Some(value) => value.to_string(),
+            None => match number.as_i64() {
+                Some(value) => value.to_string(),
+                None => String::new(),
+            },
+        },
+        _ => String::new(),
+    }
+}
+
+/// The URI of a search row, defaulting to `/D{id}`.
+fn row_uri(row: &serde_json::Value, id: &str) -> String {
+    if let Some(fields) = row.get("fields")
+        && let Some(serde_json::Value::String(uri)) = fields.get("uri")
+    {
+        return uri.clone();
+    }
+    format!("/D{id}")
+}
+
+/// Whether a search row is closed.
+fn row_closed(row: &serde_json::Value) -> bool {
+    let Some(fields) = row.get("fields") else {
+        return false;
+    };
+    let Some(status) = fields.get("status") else {
+        return false;
+    };
+    let Some(closed) = status.get("closed") else {
+        return false;
+    };
+    closed.as_bool().unwrap_or(false)
+}
+
 /// Modern `differential.revision.search` rows: (id, uri, closed).
 fn search_revision_hits(
     call: &diff_submit::ConduitCall,
@@ -573,45 +748,23 @@ fn search_revision_hits(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let ids: Vec<serde_json::Value> = ids
-        .iter()
-        .map(|id| {
-            id.parse::<u64>().map_or_else(
-                |_| serde_json::Value::String(id.clone()),
-                serde_json::Value::from,
-            )
-        })
-        .collect();
+    let mut query_ids = Vec::new();
+    for id in ids {
+        query_ids.push(id_param(id));
+    }
     let result = call(
         "differential.revision.search",
-        &serde_json::json!({"constraints": {"ids": ids}}),
+        &serde_json::json!({"constraints": {"ids": query_ids}}),
     )?;
     let mut hits = Vec::new();
-    if let Some(rows) = result.get("data").and_then(|data| data.as_array()) {
-        for row in rows {
-            let id = row
-                .get("id")
-                .and_then(|v| {
-                    v.as_str().map(str::to_string).or_else(|| {
-                        v.as_u64()
-                            .map(|n| n.to_string())
-                            .or_else(|| v.as_i64().map(|n| n.to_string()))
-                    })
-                })
-                .unwrap_or_default();
-            let uri = row
-                .get("fields")
-                .and_then(|fields| fields.get("uri"))
-                .and_then(|uri| uri.as_str())
-                .map_or_else(|| format!("/D{id}"), str::to_string);
-            let closed = row
-                .get("fields")
-                .and_then(|fields| fields.get("status"))
-                .and_then(|status| status.get("closed"))
-                .and_then(|closed| closed.as_bool())
-                .unwrap_or(false);
-            hits.push((id, uri, closed));
-        }
+    let empty = Vec::new();
+    let rows = match result.get("data") {
+        Some(serde_json::Value::Array(items)) => items,
+        _ => &empty,
+    };
+    for row in rows {
+        let id = row_id_string(row);
+        hits.push((id.clone(), row_uri(row, &id), row_closed(row)));
     }
     Ok(hits)
 }
@@ -660,108 +813,188 @@ pub struct ResolvedRef {
     pub uris: Vec<BrowseUri>,
 }
 
+/// Canonical commits for one ref (only commit/revision-typed refs resolve).
+fn commits_for_one_ref(dir: &Path, rf: &BrowseRef) -> Vec<String> {
+    if rf.is_untyped() || rf.has_type(BROWSE_COMMIT) || rf.has_type(BROWSE_REVISION) {
+        commit_hashes(dir, &rf.token)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Canonical commits for every ref, in order.
+fn commits_for_refs(dir: &Path, refs: &[BrowseRef]) -> Vec<Vec<String>> {
+    let mut commits = Vec::new();
+    for rf in refs {
+        commits.push(commits_for_one_ref(dir, rf));
+    }
+    commits
+}
+
+/// Hashes wanted for one commit-backed kind, in ref order.
+fn wanted_hashes(refs: &[BrowseRef], commits: &[Vec<String>], kind: &str) -> Vec<String> {
+    let mut wanted = Vec::new();
+    for (rf, hashes) in refs.iter().zip(commits) {
+        if rf.is_untyped() || rf.has_type(kind) {
+            wanted.extend(hashes.iter().cloned());
+        }
+    }
+    wanted
+}
+
+/// Tokens wanted for object resolution, in ref order.
+fn wanted_object_tokens(refs: &[BrowseRef]) -> Vec<String> {
+    let mut wanted = Vec::new();
+    for rf in refs {
+        if (rf.is_untyped() || rf.has_type(BROWSE_OBJECT))
+            && let Some(token) = &rf.token
+        {
+            wanted.push(token.clone());
+        }
+    }
+    wanted
+}
+
+/// True when any ref resolves paths.
+fn any_wants_path(refs: &[BrowseRef]) -> bool {
+    for rf in refs {
+        if rf.is_untyped() || rf.has_type(BROWSE_PATH) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Batched commit/revision/object hits for every ref.
+struct RefHits {
+    commits: BTreeMap<String, String>,
+    revisions: BTreeMap<String, Vec<String>>,
+    objects: BTreeMap<String, String>,
+}
+
+/// Batch every Conduit query kind (commit, revision, object) like PHP.
+fn batch_hits(
+    ctx: &mut BrowseCtx,
+    refs: &[BrowseRef],
+    commits: &[Vec<String>],
+) -> Result<RefHits, String> {
+    let wanted_commits = wanted_hashes(refs, commits, BROWSE_COMMIT);
+    let wanted_revisions = wanted_hashes(refs, commits, BROWSE_REVISION);
+    let mut hits = RefHits {
+        commits: commit_uris(ctx, &wanted_commits)?,
+        revisions: BTreeMap::new(),
+        objects: BTreeMap::new(),
+    };
+    for (hash, uris) in revision_uris(ctx, &wanted_revisions)? {
+        hits.revisions.insert(hash, uris);
+    }
+    hits.objects = object_uris(ctx, &wanted_object_tokens(refs))?;
+    Ok(hits)
+}
+
+/// Push commit URIs for one ref's hashes.
+fn push_commit_uris(
+    uris: &mut Vec<BrowseUri>,
+    rf: &BrowseRef,
+    hashes: &[String],
+    hits: &BTreeMap<String, String>,
+) {
+    if !rf.is_untyped() && !rf.has_type(BROWSE_COMMIT) {
+        return;
+    }
+    for hash in hashes {
+        if let Some(uri) = hits.get(hash) {
+            uris.push(BrowseUri {
+                uri: uri.clone(),
+                kind: BROWSE_COMMIT.to_string(),
+            });
+        }
+    }
+}
+
+/// Push the object URI for one ref's token.
+fn push_object_uri(uris: &mut Vec<BrowseUri>, rf: &BrowseRef, hits: &BTreeMap<String, String>) {
+    if !rf.is_untyped() && !rf.has_type(BROWSE_OBJECT) {
+        return;
+    }
+    let Some(token) = &rf.token else {
+        return;
+    };
+    let Some(uri) = hits.get(token) else {
+        return;
+    };
+    uris.push(BrowseUri {
+        uri: uri.clone(),
+        kind: BROWSE_OBJECT.to_string(),
+    });
+}
+
+/// Push the path URI for one ref.
+fn push_path_uri(ctx: &mut BrowseCtx, uris: &mut Vec<BrowseUri>, rf: &BrowseRef, repo: &RepoInfo) {
+    if !rf.is_untyped() && !rf.has_type(BROWSE_PATH) {
+        return;
+    }
+    if let Some(found) = path_uri(ctx, rf, repo) {
+        uris.push(found);
+    }
+}
+
+/// Push revision URIs for one ref's hashes.
+fn push_revision_uris(
+    uris: &mut Vec<BrowseUri>,
+    rf: &BrowseRef,
+    hashes: &[String],
+    hits: &BTreeMap<String, Vec<String>>,
+) {
+    if !rf.is_untyped() && !rf.has_type(BROWSE_REVISION) {
+        return;
+    }
+    for hash in hashes {
+        let Some(found) = hits.get(hash) else {
+            continue;
+        };
+        for uri in found {
+            uris.push(BrowseUri {
+                uri: uri.clone(),
+                kind: BROWSE_REVISION.to_string(),
+            });
+        }
+    }
+}
+
+/// Assemble one resolved ref from the batched hits.
+fn assemble_one_ref(
+    ctx: &mut BrowseCtx,
+    rf: &BrowseRef,
+    hashes: &[String],
+    hits: &RefHits,
+    repo: Option<&RepoInfo>,
+) -> ResolvedRef {
+    let mut uris = Vec::new();
+    push_commit_uris(&mut uris, rf, hashes, &hits.commits);
+    push_object_uri(&mut uris, rf, &hits.objects);
+    if let Some(repo) = repo {
+        push_path_uri(ctx, &mut uris, rf, repo);
+    }
+    push_revision_uris(&mut uris, rf, hashes, &hits.revisions);
+    ResolvedRef {
+        commits: hashes.to_vec(),
+        uris,
+    }
+}
+
 /// Resolve every ref, batching Conduit calls per query kind like PHP.
 pub fn resolve_refs(ctx: &mut BrowseCtx, refs: &[BrowseRef]) -> Result<Vec<ResolvedRef>, String> {
-    let commits: Vec<Vec<String>> = refs
-        .iter()
-        .map(|rf| {
-            if rf.is_untyped() || rf.has_type(BROWSE_COMMIT) || rf.has_type(BROWSE_REVISION) {
-                commit_hashes(ctx.dir, &rf.token)
-            } else {
-                Vec::new()
-            }
-        })
-        .collect();
-
-    let mut commit_hits: BTreeMap<String, String> = BTreeMap::new();
-    let mut revision_hits: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let wanted_commits: Vec<String> = refs
-        .iter()
-        .zip(&commits)
-        .flat_map(|(rf, hashes)| {
-            if rf.is_untyped() || rf.has_type(BROWSE_COMMIT) {
-                hashes.clone()
-            } else {
-                Vec::new()
-            }
-        })
-        .collect();
-    let wanted_revisions: Vec<String> = refs
-        .iter()
-        .zip(&commits)
-        .flat_map(|(rf, hashes)| {
-            if rf.is_untyped() || rf.has_type(BROWSE_REVISION) {
-                hashes.clone()
-            } else {
-                Vec::new()
-            }
-        })
-        .collect();
-    commit_hits.extend(commit_uris(ctx, &wanted_commits)?);
-    for (hash, uris) in revision_uris(ctx, &wanted_revisions)? {
-        revision_hits.insert(hash, uris);
-    }
-
-    let wanted_objects: Vec<String> = refs
-        .iter()
-        .filter(|rf| rf.is_untyped() || rf.has_type(BROWSE_OBJECT))
-        .filter_map(|rf| rf.token.clone())
-        .collect();
-    let object_hits = object_uris(ctx, &wanted_objects)?;
-
-    let wants_path = refs
-        .iter()
-        .any(|rf| rf.is_untyped() || rf.has_type(BROWSE_PATH));
-    let repo = if wants_path {
+    let commits = commits_for_refs(ctx.dir, refs);
+    let hits = batch_hits(ctx, refs, &commits)?;
+    let repo = if any_wants_path(refs) {
         ctx.repo()?.cloned()
     } else {
         None
     };
-
     let mut resolved = Vec::new();
     for (rf, hashes) in refs.iter().zip(&commits) {
-        let mut uris = Vec::new();
-        if rf.is_untyped() || rf.has_type(BROWSE_COMMIT) {
-            for hash in hashes {
-                if let Some(uri) = commit_hits.get(hash) {
-                    uris.push(BrowseUri {
-                        uri: uri.clone(),
-                        kind: BROWSE_COMMIT.to_string(),
-                    });
-                }
-            }
-        }
-        if (rf.is_untyped() || rf.has_type(BROWSE_OBJECT))
-            && let Some(token) = &rf.token
-            && let Some(uri) = object_hits.get(token)
-        {
-            uris.push(BrowseUri {
-                uri: uri.clone(),
-                kind: BROWSE_OBJECT.to_string(),
-            });
-        }
-        if (rf.is_untyped() || rf.has_type(BROWSE_PATH))
-            && let Some(repo) = &repo
-            && let Some(found) = path_uri(ctx, rf, repo)
-        {
-            uris.push(found);
-        }
-        if rf.is_untyped() || rf.has_type(BROWSE_REVISION) {
-            for hash in hashes {
-                if let Some(found) = revision_hits.get(hash) {
-                    for uri in found {
-                        uris.push(BrowseUri {
-                            uri: uri.clone(),
-                            kind: BROWSE_REVISION.to_string(),
-                        });
-                    }
-                }
-            }
-        }
-        resolved.push(ResolvedRef {
-            commits: hashes.clone(),
-            uris,
-        });
+        resolved.push(assemble_one_ref(ctx, rf, hashes, &hits, repo.as_ref()));
     }
     Ok(resolved)
 }

@@ -48,47 +48,13 @@ impl RevisionRef {
             .cloned()
             .unwrap_or(serde_json::Value::Null);
         let is_closed = matches!(status_name.as_str(), Some("Abandoned" | "Closed"));
-        let status_value = match row.get("status").and_then(|value| {
-            if let Some(number) = value.as_u64() {
-                Some(number.to_string())
-            } else {
-                value.as_str().map(str::to_string)
-            }
-        }) {
-            Some(code) => match code.as_str() {
-                "0" => Some("needs-review"),
-                "1" => Some("needs-revision"),
-                "2" => Some("accepted"),
-                "3" => Some("published"),
-                "4" => Some("abandoned"),
-                "5" => Some("changes-planned"),
-                _ => None,
-            },
-            None => None,
-        };
-        let ansi_color = match status_value {
-            Some("needs-review") => Some("magenta"),
-            Some("needs-revision" | "changes-planned") => Some("red"),
-            Some("accepted") => Some("green"),
-            Some("published") => Some("cyan"),
-            _ => None,
-        };
+        let status_value = status_value_from_row(row);
+        let ansi_color = ansi_color_for_status(status_value);
         let mut merged = row.clone();
         if let Some(object) = merged.as_object_mut() {
             object.insert(
                 "fields".to_string(),
-                serde_json::json!({
-                    "uri": row.get("uri").cloned().unwrap_or(serde_json::Value::Null),
-                    "title": row.get("title").cloned().unwrap_or(serde_json::Value::Null),
-                    "authorPHID": row.get("authorPHID").cloned().unwrap_or(serde_json::Value::Null),
-                    "status": {
-                        "name": status_name,
-                        "closed": is_closed,
-                        "value": status_value,
-                        "color.ansi": ansi_color,
-                    },
-                    "dateCreated": row.get("dateCreated").and_then(serde_json::Value::as_i64),
-                }),
+                mangled_fields(row, status_name, is_closed, status_value, ansi_color),
             );
         }
         Self { params: merged }
@@ -170,6 +136,69 @@ impl RevisionRef {
         self.status_field("color.ansi")
             .and_then(serde_json::Value::as_str)
     }
+}
+
+/// The legacy `status` code of a `differential.query` row (a number or
+/// a numeric string).
+fn status_code_text(row: &serde_json::Value) -> Option<String> {
+    let value = row.get("status")?;
+    match value {
+        serde_json::Value::Number(number) => number.as_u64().map(|code| code.to_string()),
+        serde_json::Value::String(text) => Some(text.clone()),
+        _ => None,
+    }
+}
+
+/// The modern status value for a legacy status code.
+fn status_value_for_code(code: &str) -> Option<&'static str> {
+    match code {
+        "0" => Some("needs-review"),
+        "1" => Some("needs-revision"),
+        "2" => Some("accepted"),
+        "3" => Some("published"),
+        "4" => Some("abandoned"),
+        "5" => Some("changes-planned"),
+        _ => None,
+    }
+}
+
+/// The modern status value of a legacy query row.
+fn status_value_from_row(row: &serde_json::Value) -> Option<&'static str> {
+    let code = status_code_text(row)?;
+    status_value_for_code(&code)
+}
+
+/// The ANSI status color for a modern status value.
+fn ansi_color_for_status(status: Option<&str>) -> Option<&'static str> {
+    match status {
+        Some("needs-review") => Some("magenta"),
+        Some("needs-revision" | "changes-planned") => Some("red"),
+        Some("accepted") => Some("green"),
+        Some("published") => Some("cyan"),
+        _ => None,
+    }
+}
+
+/// The modern `fields` dict mangled from a legacy query row.
+fn mangled_fields(
+    row: &serde_json::Value,
+    status_name: serde_json::Value,
+    is_closed: bool,
+    status_value: Option<&str>,
+    ansi_color: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "uri": row.get("uri").cloned().unwrap_or(serde_json::Value::Null),
+        "title": row.get("title").cloned().unwrap_or(serde_json::Value::Null),
+        "authorPHID": row.get("authorPHID").cloned().unwrap_or(serde_json::Value::Null),
+        "status": {
+            "name": status_name,
+            "closed": is_closed,
+            "value": status_value,
+            "color.ansi": ansi_color,
+        },
+        "dateCreated": row.get("dateCreated").and_then(serde_json::Value::as_i64),
+    })
 }
 
 /// Leading-integer parse like PHP's `(int)` cast: optional whitespace and
@@ -434,6 +463,69 @@ fn valid_host(host: &str) -> bool {
     bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
 }
 
+/// True for ambiguous `scheme://host?query:with-colon` URIs, which are
+/// rejected outright.
+fn is_ambiguous_query_uri(uri: &str) -> bool {
+    let Some(scheme_end) = uri.find("://") else {
+        return false;
+    };
+    let (scheme, after) = (&uri[..scheme_end], &uri[scheme_end + 3..]);
+    if scheme.contains(['/', ':']) {
+        return false;
+    }
+    let Some(host_end) = after.find('/') else {
+        return false;
+    };
+    let authority = &after[..host_end];
+    authority.contains(['?', '#']) && after.contains(':')
+}
+
+/// Split a leading `scheme:` off `uri` (empty scheme when absent).
+fn split_scheme(uri: &str) -> (String, &str) {
+    let Some(colon) = uri.find(':') else {
+        return (String::new(), uri);
+    };
+    let candidate = &uri[..colon];
+    if candidate.is_empty() {
+        return (String::new(), uri);
+    }
+    if !matches!(
+        candidate.bytes().next(),
+        Some(byte) if byte.is_ascii_alphabetic()
+    ) {
+        return (String::new(), uri);
+    }
+    if !candidate.bytes().all(is_scheme_char) {
+        return (String::new(), uri);
+    }
+    (candidate.to_string(), &uri[colon + 1..])
+}
+
+fn is_digit_byte(byte: u8) -> bool {
+    byte.is_ascii_digit()
+}
+
+/// Split a leading `//authority` off `rest`, returning the host and the
+/// remainder. `None` means the host is invalid (the whole URI is empty).
+fn split_authority(rest: &str) -> Option<(String, &str)> {
+    let after = rest.strip_prefix("//")?;
+    let authority_end = after.find('/').unwrap_or(after.len());
+    let authority = &after[..authority_end];
+    let rest = &after[authority_end..];
+    let host_port = match authority.rsplit_once('@') {
+        Some((_, host)) => host,
+        None => authority,
+    };
+    let host = match host_port.rsplit_once(':') {
+        Some((host, port)) if port.bytes().all(is_digit_byte) => host,
+        _ => host_port,
+    };
+    if !host.is_empty() && !valid_host(host) {
+        return None;
+    }
+    Some((host.to_string(), rest))
+}
+
 fn parse_standard_uri(uri: &str) -> ParsedUri {
     let empty = ParsedUri {
         protocol: String::new(),
@@ -444,55 +536,29 @@ fn parse_standard_uri(uri: &str) -> ParsedUri {
         return empty;
     }
     // Reject ambiguous `scheme://host?query:with-colon` URIs outright.
-    if let Some(scheme_end) = uri.find("://") {
-        let (scheme, after) = (&uri[..scheme_end], &uri[scheme_end + 3..]);
-        if !scheme.contains(['/', ':'])
-            && let Some(host_end) = after.find('/')
-        {
-            let authority = &after[..host_end];
-            if authority.contains(['?', '#']) && after.contains(':') {
-                return empty;
-            }
-        }
+    if is_ambiguous_query_uri(uri) {
+        return empty;
     }
-    let mut rest = uri;
-    let mut protocol = String::new();
-    if let Some(colon) = rest.find(':') {
-        let candidate = &rest[..colon];
-        if !candidate.is_empty()
-            && candidate
-                .bytes()
-                .next()
-                .is_some_and(|byte| byte.is_ascii_alphabetic())
-            && candidate.bytes().all(is_scheme_char)
-        {
-            protocol = candidate.to_string();
-            rest = &rest[colon + 1..];
-        }
-    }
-    let mut domain = String::new();
-    if let Some(after) = rest.strip_prefix("//") {
-        let authority_end = after.find('/').unwrap_or(after.len());
-        let authority = &after[..authority_end];
-        rest = &after[authority_end..];
-        let host_port = match authority.rsplit_once('@') {
-            Some((_, host)) => host,
-            None => authority,
-        };
-        let host = match host_port.rsplit_once(':') {
-            Some((host, port)) if port.bytes().all(|byte| byte.is_ascii_digit()) => host,
-            _ => host_port,
-        };
-        if !host.is_empty() && !valid_host(host) {
-            return empty;
-        }
-        domain = host.to_string();
-    }
+    let (protocol, rest) = split_scheme(uri);
+    let (domain, rest) = match split_authority_optional(rest) {
+        Some(pair) => pair,
+        None => return empty,
+    };
     let path_end = rest.find(['?', '#']).unwrap_or(rest.len());
     ParsedUri {
         protocol,
         domain,
         path: rest[..path_end].to_string(),
+    }
+}
+
+/// Split `//authority` when present (else an empty domain); `None` means
+/// the host is invalid.
+fn split_authority_optional(rest: &str) -> Option<(String, &str)> {
+    if rest.starts_with("//") {
+        split_authority(rest)
+    } else {
+        Some((String::new(), rest))
     }
 }
 
@@ -937,108 +1003,138 @@ impl<'a> PatternParser<'a> {
     }
 }
 
+/// Match one literal at `pos` (the position after, when matched).
+fn match_literal(expected: char, chars: &[char], pos: usize) -> Vec<usize> {
+    if chars.get(pos) == Some(&expected) {
+        vec![pos + 1]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Match `.` at `pos` (any character but a newline).
+fn match_any(chars: &[char], pos: usize) -> Vec<usize> {
+    if pos < chars.len() && chars[pos] != '\n' {
+        vec![pos + 1]
+    } else {
+        Vec::new()
+    }
+}
+
+/// True when `value` falls in one of the class ranges.
+fn class_contains(ranges: &[(char, char)], value: char) -> bool {
+    for (low, high) in ranges {
+        if value >= *low && value <= *high {
+            return true;
+        }
+    }
+    false
+}
+
+/// Match a character class at `pos`, honoring negation.
+fn match_class(negated: bool, ranges: &[(char, char)], chars: &[char], pos: usize) -> Vec<usize> {
+    let Some(value) = chars.get(pos) else {
+        return Vec::new();
+    };
+    if class_contains(ranges, *value) != negated {
+        vec![pos + 1]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Match an anchor (`^`/`$`): `pos` itself when `matched`.
+fn match_anchor(matched: bool, pos: usize) -> Vec<usize> {
+    if matched { vec![pos] } else { Vec::new() }
+}
+
+/// Match concatenated parts in sequence.
+fn match_concat(parts: &[Pattern], chars: &[char], pos: usize) -> Vec<usize> {
+    let mut positions = vec![pos];
+    for part in parts {
+        let mut next = Vec::new();
+        for at in positions {
+            next.extend(match_here(part, chars, at));
+        }
+        positions = next;
+        if positions.is_empty() {
+            break;
+        }
+    }
+    positions
+}
+
+/// Match alternates, collecting every option's positions.
+fn match_alternate(options: &[Pattern], chars: &[char], pos: usize) -> Vec<usize> {
+    let mut positions = Vec::new();
+    for option in options {
+        positions.extend(match_here(option, chars, pos));
+    }
+    positions
+}
+
+/// Advance one repetition round, dropping empty matches.
+fn repeat_advance(inner: &Pattern, chars: &[char], counts: &[usize]) -> Vec<usize> {
+    let mut advanced = Vec::new();
+    for at in counts {
+        for next in match_here(inner, chars, *at) {
+            if next != *at {
+                advanced.push(next);
+            }
+        }
+    }
+    advanced
+}
+
+/// Match a repetition, collecting positions with at least `min` rounds.
+fn match_repeat(
+    inner: &Pattern,
+    min: usize,
+    max: Option<usize>,
+    chars: &[char],
+    pos: usize,
+) -> Vec<usize> {
+    let mut counts = vec![pos];
+    let mut longest = Vec::new();
+    if min == 0 {
+        longest.push(pos);
+    }
+    let mut depth = 0;
+    loop {
+        if let Some(bound) = max
+            && depth >= bound
+        {
+            break;
+        }
+        let advanced = repeat_advance(inner, chars, &counts);
+        if advanced.is_empty() {
+            break;
+        }
+        depth += 1;
+        if depth >= min {
+            longest.extend(advanced.iter().copied());
+        }
+        counts = advanced;
+        if depth > chars.len() + 1 {
+            break;
+        }
+    }
+    longest.sort_unstable();
+    longest.dedup();
+    longest
+}
+
 fn match_here(pattern: &Pattern, chars: &[char], pos: usize) -> Vec<usize> {
     match pattern {
         Pattern::Empty => vec![pos],
-        Pattern::Literal(expected) => {
-            if chars.get(pos) == Some(expected) {
-                vec![pos + 1]
-            } else {
-                Vec::new()
-            }
-        }
-        Pattern::Any => {
-            if pos < chars.len() && chars[pos] != '\n' {
-                vec![pos + 1]
-            } else {
-                Vec::new()
-            }
-        }
-        Pattern::Class { negated, ranges } => match chars.get(pos) {
-            Some(char) => {
-                let inside = ranges
-                    .iter()
-                    .any(|&(low, high)| *char >= low && *char <= high);
-                if inside != *negated {
-                    vec![pos + 1]
-                } else {
-                    Vec::new()
-                }
-            }
-            None => Vec::new(),
-        },
-        Pattern::Start => {
-            if pos == 0 {
-                vec![pos]
-            } else {
-                Vec::new()
-            }
-        }
-        Pattern::End => {
-            if pos == chars.len() {
-                vec![pos]
-            } else {
-                Vec::new()
-            }
-        }
-        Pattern::Concat(parts) => {
-            let mut positions = vec![pos];
-            for part in parts {
-                let mut next = Vec::new();
-                for at in positions {
-                    next.extend(match_here(part, chars, at));
-                }
-                positions = next;
-                if positions.is_empty() {
-                    break;
-                }
-            }
-            positions
-        }
-        Pattern::Alternate(options) => {
-            let mut positions = Vec::new();
-            for option in options {
-                positions.extend(match_here(option, chars, pos));
-            }
-            positions
-        }
-        Pattern::Repeat(inner, min, max) => {
-            let mut counts = vec![pos];
-            let mut longest = Vec::new();
-            if *min == 0 {
-                longest.push(pos);
-            }
-            let mut depth = 0;
-            loop {
-                if let Some(bound) = max
-                    && depth >= *bound
-                {
-                    break;
-                }
-                let mut advanced = Vec::new();
-                for at in &counts {
-                    for next in match_here(inner, chars, *at) {
-                        if next != *at {
-                            advanced.push(next);
-                        }
-                    }
-                }
-                if advanced.is_empty() {
-                    break;
-                }
-                depth += 1;
-                if depth >= *min {
-                    longest.extend(advanced.iter().copied());
-                }
-                counts = advanced;
-                if depth > chars.len() + 1 {
-                    break;
-                }
-            }
-            longest.sort_unstable();
-            longest.dedup();
-            longest
-        }
+        Pattern::Literal(expected) => match_literal(*expected, chars, pos),
+        Pattern::Any => match_any(chars, pos),
+        Pattern::Class { negated, ranges } => match_class(*negated, ranges, chars, pos),
+        Pattern::Start => match_anchor(pos == 0, pos),
+        Pattern::End => match_anchor(pos == chars.len(), pos),
+        Pattern::Concat(parts) => match_concat(parts, chars, pos),
+        Pattern::Alternate(options) => match_alternate(options, chars, pos),
+        Pattern::Repeat(inner, min, max) => match_repeat(inner, *min, *max, chars, pos),
     }
 }
 
