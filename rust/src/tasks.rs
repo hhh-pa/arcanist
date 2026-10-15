@@ -10,7 +10,7 @@
 
 use std::process::ExitCode;
 
-use crate::{conduit, config};
+use crate::{conduit, config, terminal};
 
 /// Subcommand name, matching `arc tasks`.
 pub const NAME: &str = "tasks";
@@ -231,6 +231,7 @@ pub struct Task {
     pub id: String,
     pub title: String,
     pub priority: String,
+    pub priority_color: Option<String>,
     pub status_name: String,
     pub is_closed: Option<bool>,
 }
@@ -256,19 +257,27 @@ pub fn parse_task(value: &serde_json::Value) -> Option<Task> {
             .get("title")
             .and_then(|v| v.as_str())
             .unwrap_or("")
-            .trim_end()
+            .trim_end_matches([' ', '\t', '\n', '\r', '\0', '\u{b}'])
             .to_string(),
         priority: value
             .get("priority")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
+        priority_color: value
+            .get("priorityColor")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
         status_name: value
             .get("statusName")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        is_closed: value.get("isClosed").and_then(|v| v.as_bool()),
+        is_closed: value.get("isClosed").and_then(|v| {
+            v.as_bool()
+                .or_else(|| v.as_i64().map(|n| n != 0))
+                .or_else(|| v.as_u64().map(|n| n != 0))
+        }),
     })
 }
 
@@ -346,42 +355,69 @@ pub fn find_owner_phid(client: &conduit::Client, owner: &str) -> Result<Option<S
         .map(str::to_string))
 }
 
-/// Render tasks as an aligned plain-text table (ID, Title, Priority, Status).
+/// Map a Maniphest priority color to a terminal color, defaulting to
+/// white like the PHP reference.
 #[must_use]
-pub fn render_table(tasks: &[Task]) -> String {
-    let mut widths = [2usize, 5, 8, 6];
-    let rows: Vec<[String; 4]> = tasks
+pub fn priority_color(web_color: Option<&str>) -> &'static str {
+    match web_color {
+        Some("violet" | "indigo" | "lightindigo" | "lightviolet") => "magenta",
+        Some("orange" | "red" | "lightred" | "lightorange") => "red",
+        Some("sky" | "cyan") => "cyan",
+        Some("yellow" | "lightyellow") => "yellow",
+        Some("green" | "lightgreen") => "green",
+        Some("blue" | "lightblue" | "lightsky") => "blue",
+        Some("magenta") => "magenta",
+        _ => "white",
+    }
+}
+
+/// Render tasks as a console table (ID, Title, Priority, Status),
+/// mirroring the PHP `PhutilConsoleTable` cells.
+#[must_use]
+pub fn render_table(tasks: &[Task], ansi: bool) -> String {
+    let rows: Vec<Vec<terminal::TableCell>> = tasks
         .iter()
         .map(|t| {
-            [
-                format!("T{}", t.id),
-                t.title.clone(),
-                t.priority.clone(),
-                t.status_name.clone(),
+            let id = terminal::tsprintf_ansi(
+                "**%s**",
+                &[terminal::TVal::Text(&format!("T{}", t.id))],
+                ansi,
+            )
+            .unwrap_or_default();
+            let priority = terminal::tsprintf_ansi(
+                &format!(
+                    "<bg:{}> </bg> %s",
+                    priority_color(t.priority_color.as_deref())
+                ),
+                &[terminal::TVal::Text(&t.priority)],
+                ansi,
+            )
+            .unwrap_or_default();
+            let status = match t.is_closed {
+                // PHP leaves the status column blank when `isClosed` is
+                // missing from the row.
+                None => terminal::TableCell::Text(String::new()),
+                Some(closed) => {
+                    let color = if closed { "red" } else { "green" };
+                    terminal::TableCell::Terminal(
+                        terminal::tsprintf_ansi(
+                            &format!("<bg:{color}> </bg> %s"),
+                            &[terminal::TVal::Text(&t.status_name)],
+                            ansi,
+                        )
+                        .unwrap_or_default(),
+                    )
+                }
+            };
+            vec![
+                terminal::TableCell::Terminal(id),
+                terminal::TableCell::Text(t.title.clone()),
+                terminal::TableCell::Terminal(priority),
+                status,
             ]
         })
         .collect();
-    for row in &rows {
-        for (i, cell) in row.iter().enumerate() {
-            widths[i] = widths[i].max(cell.len());
-        }
-    }
-    let mut out = String::new();
-    for row in rows {
-        let line = format!(
-            "{:<w0$}  {:<w1$}  {:<w2$}  {}",
-            row[0],
-            row[1],
-            row[2],
-            row[3],
-            w0 = widths[0],
-            w1 = widths[1],
-            w2 = widths[2],
-        );
-        out += line.trim_end();
-        out.push('\n');
-    }
-    out
+    terminal::console_table(&["ID", "Title", "Priority", "Status"], &rows)
 }
 
 /// Build the `--json` document.
@@ -431,7 +467,7 @@ pub fn execute(client: &conduit::Client, options: &Options) -> Result<String, St
         doc.push('\n');
         return Ok(doc);
     }
-    Ok(render_table(&tasks))
+    Ok(render_table(&tasks, terminal::ansi_enabled()))
 }
 
 /// Entry point: `argv` excludes the subcommand name.

@@ -56,11 +56,23 @@ fn module_name_matches_arc() {
     assert_eq!(which::NAME, "which");
 }
 
+fn never_prompt(_: &str) -> Option<String> {
+    None
+}
+
+fn offline_resolution(runtime_rules: &str) -> which::Resolution<'_> {
+    which::Resolution {
+        runtime_rules,
+        prompt: &never_prompt,
+        match_config: which::MatchConfig::Unavailable("no conduit in test".to_string()),
+    }
+}
+
 #[test]
 fn run_help_unported_and_flag_errors() {
     assert_eq!(which::run(&["--help".to_string()]), ExitCode::SUCCESS);
+    // `--base` without rules is a usage error, not an unported flag.
     assert_eq!(which::run(&["--base".to_string()]), ExitCode::FAILURE);
-    assert_eq!(which::run(&["--any-status".to_string()]), ExitCode::FAILURE);
     assert_eq!(which::run(&["--bogus".to_string()]), ExitCode::FAILURE);
     assert_eq!(
         which::run(&["a".to_string(), "b".to_string()]),
@@ -105,7 +117,18 @@ fn fixture_context_resolves_every_section() {
     )
     .unwrap();
 
-    let ctx = which::load_context(tmp.path(), Some(&user_file), None, None, None, "HEAD").unwrap();
+    let resolution = offline_resolution("");
+    let ctx = which::load_context(
+        tmp.path(),
+        Some(&user_file),
+        None,
+        None,
+        None,
+        "HEAD",
+        false,
+        &resolution,
+    )
+    .unwrap();
     assert_eq!(ctx.vcs, "git");
     assert_eq!(ctx.branch.as_deref(), Some("master"));
     assert_eq!(
@@ -131,6 +154,97 @@ fn fixture_context_resolves_every_section() {
     assert_eq!(uri.as_deref(), Some("https://flag.example/"));
     assert!(source.contains("--conduit-uri"));
 
-    let missing = which::load_context(tmp.path(), None, None, None, None, "HEAD").unwrap();
+    let resolution = offline_resolution("");
+    let missing = which::load_context(
+        tmp.path(),
+        None,
+        None,
+        None,
+        None,
+        "HEAD",
+        false,
+        &resolution,
+    )
+    .unwrap();
     assert_eq!(missing.token_installed, Some(false));
+}
+
+fn fixture_git_repo(tag: &str, commits: usize) -> TempDir {
+    let tmp = TempDir::new(tag);
+    run_git(tmp.path(), &["init", "-q", "-b", "master"]);
+    run_git(tmp.path(), &["config", "user.email", "t@t"]);
+    run_git(tmp.path(), &["config", "user.name", "t"]);
+    run_git(tmp.path(), &["config", "commit.gpgsign", "false"]);
+    for n in 0..commits {
+        let name = format!("f{n}.txt");
+        std::fs::write(tmp.path().join(&name), "x\n").unwrap();
+        run_git(tmp.path(), &["add", &name]);
+        run_git(tmp.path(), &["commit", "-qm", &name]);
+    }
+    tmp
+}
+
+fn resolve_with_rules(dir: &Path, runtime_rules: &str) -> Result<(String, String), String> {
+    let loaded = which::load_config_sources(dir, None).unwrap();
+    let inputs = which::BaseInputs {
+        runtime_rules,
+        prompt: &never_prompt,
+    };
+    which::resolve_base(dir, None, "HEAD", false, &loaded, &inputs)
+}
+
+#[test]
+fn base_empty_repo_reports_no_commits() {
+    let tmp = fixture_git_repo("empty", 0);
+    let (base, why) = resolve_with_rules(tmp.path(), "").unwrap();
+    assert_eq!(base, which::GIT_MAGIC_ROOT_COMMIT);
+    assert!(why.contains("no commits"), "{why}");
+}
+
+#[test]
+fn base_single_commit_repo_uses_empty_tree() {
+    let tmp = fixture_git_repo("single", 1);
+    let (base, why) = resolve_with_rules(tmp.path(), "").unwrap();
+    assert_eq!(base, which::GIT_MAGIC_ROOT_COMMIT);
+    assert!(why.contains("only one commit"), "{why}");
+}
+
+#[test]
+fn base_explicit_unknown_commit_errors() {
+    let tmp = fixture_git_repo("unknown", 2);
+    let loaded = which::load_config_sources(tmp.path(), None).unwrap();
+    let inputs = which::BaseInputs {
+        runtime_rules: "",
+        prompt: &never_prompt,
+    };
+    let err = which::resolve_base(
+        tmp.path(),
+        Some("no-such-rev"),
+        "HEAD",
+        false,
+        &loaded,
+        &inputs,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        "Unable to find any git commit named 'no-such-rev' in this repository."
+    );
+}
+
+#[test]
+fn base_garbage_rule_string_errors() {
+    let tmp = fixture_git_repo("garbage", 2);
+    let err = resolve_with_rules(tmp.path(), "{{not valid").unwrap_err();
+    assert!(
+        err.contains("is invalid, it must have a type and name"),
+        "{err}"
+    );
+}
+
+#[test]
+fn base_exec_rule_runs_command() {
+    let tmp = fixture_git_repo("exec", 2);
+    let (base, _) = resolve_with_rules(tmp.path(), "arc:exec(echo hi)").unwrap();
+    assert_eq!(base, "hi");
 }

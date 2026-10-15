@@ -147,15 +147,142 @@ fn args_cover_check_json_apply_and_help() {
     assert!(matches!(parse_args(&["--help".to_string()]), Parsed::Help));
     assert!(matches!(
         parse_args(&["--apply".to_string()]),
-        Parsed::NotYetPorted(_)
+        Parsed::Options(Options { apply: true, .. })
     ));
+    // `--yes` is accepted and ignored: upgrade never prompts.
     assert!(matches!(
         parse_args(&["--yes".to_string()]),
-        Parsed::NotYetPorted(_)
+        Parsed::Options(Options { apply: false, .. })
     ));
     assert!(matches!(
         parse_args(&["--bogus".to_string()]),
         Parsed::Error(_)
     ));
     assert!(matches!(parse_args(&["pos".to_string()]), Parsed::Error(_)));
+}
+
+#[test]
+fn apply_target_requires_git_and_supported_branch() {
+    let plain = TempDir::new("nogit");
+    let err = resolve_apply_target(&plain.path).unwrap_err();
+    assert!(err.contains("is not a Git working copy"), "{err}");
+    assert!(err.contains("arc upgrade"), "{err}");
+
+    let repo = fresh_repo("branch");
+    commit(&repo.path, "a.txt");
+    let target = resolve_apply_target(&repo.path).unwrap();
+    assert_eq!(target.branch, "master");
+    assert_eq!(
+        target.root.canonicalize().unwrap(),
+        repo.path.canonicalize().unwrap()
+    );
+
+    git(&repo.path, &["checkout", "-q", "-b", "feature"]);
+    let err = resolve_apply_target(&repo.path).unwrap_err();
+    assert!(
+        err.contains("not supported for automatic upgrades"),
+        "{err}"
+    );
+    assert!(err.contains("master, stable"), "{err}");
+}
+
+#[test]
+fn uncommitted_paths_cover_all_entry_kinds() {
+    let repo = fresh_repo("dirty");
+    commit(&repo.path, "a.txt");
+    commit(&repo.path, "b.txt");
+    // Modified (worktree), untracked, and a staged rename (both sides).
+    std::fs::write(repo.path.join("a.txt"), "worktree\n").unwrap();
+    std::fs::write(repo.path.join("new.txt"), "untracked\n").unwrap();
+    git(&repo.path, &["mv", "b.txt", "c.txt"]);
+    let paths = uncommitted_paths(&repo.path).unwrap();
+    assert_eq!(paths, vec!["a.txt", "b.txt", "c.txt", "new.txt"]);
+
+    let block = render_uncommitted_block(&repo.path, &paths, false);
+    assert!(block.contains("You have uncommitted changes"), "{block}");
+    assert!(block.contains("      - a.txt\n"), "{block}");
+    assert!(
+        block.contains("Discard these changes before running \"arc upgrade\"."),
+        "{block}"
+    );
+
+    let clean = fresh_repo("clean");
+    commit(&clean.path, "a.txt");
+    assert!(uncommitted_paths(&clean.path).unwrap().is_empty());
+}
+
+#[test]
+fn wraps_uncommitted_block_paragraphs() {
+    // The opening paragraph always exceeds 78 columns, so it wraps at
+    // the last space; the closing paragraph fits on one line.
+    let block = render_uncommitted_block(&PathBuf::from("r"), &["a.txt".to_string()], false);
+    assert_eq!(
+        block,
+        "You have uncommitted changes in the working copy (\"r\") for this library\n\
+         (\"arc-rs\"):\n\
+         \n\
+         \x20     - a.txt\n\
+         \n\
+         Discard these changes before running \"arc upgrade\".\n\
+         \n"
+    );
+}
+
+#[test]
+fn uncommitted_block_escapes_listed_paths() {
+    let block = render_uncommitted_block(&PathBuf::from("r"), &["a\u{7}b".to_string()], false);
+    assert!(block.contains("      - a<BEL>b\n"), "{block}");
+}
+
+#[test]
+fn wraps_long_paragraphs_at_word_boundaries() {
+    let message = format!("{} {}", "a".repeat(70), "b".repeat(20));
+    assert_eq!(
+        wrap_paragraph(&message, false),
+        format!("{}\n{}", "a".repeat(70), "b".repeat(20))
+    );
+    assert_eq!(wrap_paragraph("short", false), "short");
+}
+
+#[test]
+fn apply_refuses_dirty_checkouts() {
+    let repo = fresh_repo("dirtyapply");
+    commit(&repo.path, "a.txt");
+    std::fs::write(repo.path.join("a.txt"), "dirty\n").unwrap();
+    let target = resolve_apply_target(&repo.path).unwrap();
+    let err = run_apply(&target).unwrap_err();
+    assert_eq!(
+        err,
+        "\"arc upgrade\" can only upgrade clean working copies."
+    );
+}
+
+#[test]
+fn apply_pulls_from_origin() {
+    let origin = TempDir::new("applyorigin");
+    git(&origin.path, &["init", "-q", "--bare"]);
+    let seed = fresh_repo("applyseed");
+    commit(&seed.path, "a.txt");
+    git(
+        &seed.path,
+        &["remote", "add", "origin", &origin.path.to_string_lossy()],
+    );
+    git(&seed.path, &["push", "-q", "-u", "origin", "master"]);
+
+    let work = TempDir::new("applywork");
+    git(
+        &work.path,
+        &["clone", "-q", &origin.path.to_string_lossy(), "."],
+    );
+    git(&work.path, &["config", "user.email", "t@t"]);
+    git(&work.path, &["config", "user.name", "t"]);
+    git(&work.path, &["config", "commit.gpgsign", "false"]);
+
+    commit(&seed.path, "b.txt");
+    git(&seed.path, &["push", "-q", "origin", "master"]);
+
+    let target = resolve_apply_target(&work.path).unwrap();
+    run_apply(&target).unwrap();
+    assert!(work.path.join("b.txt").is_file());
+    assert!(rebuild_note().contains("cargo build"));
 }

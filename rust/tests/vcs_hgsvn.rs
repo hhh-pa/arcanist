@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use arc_rs::{bookmarks, hg, svn};
+use arc_rs::{hg, svn};
 
 const HG_STATUS_SIMPLE: &str = include_str!("fixtures/vcs/hg_status_simple.txt");
 const HG_STATUS_COPIES: &str = include_str!("fixtures/vcs/hg_status_copies.txt");
@@ -644,12 +644,8 @@ fn hg_bookmarks_runner_lists_canned() {
         b"* active 12:abc123def456\n  other 3:789abcdef012\n",
     );
     let output = hg::get_bookmarks_with(tmp.path(), &hg).unwrap();
-    let marks = bookmarks::parse_bookmarks(&output).unwrap();
-    assert_eq!(marks.len(), 2);
-    assert_eq!(marks[0].name, "active");
-    assert!(marks[0].active);
-    assert_eq!(marks[1].name, "other");
-    assert!(!marks[1].active);
+    assert!(output.contains("* active 12:abc123def456"));
+    assert!(output.contains("other 3:789abcdef012"));
     assert!(tmp.read_log(".fakehg.log").contains("bookmarks"));
 }
 

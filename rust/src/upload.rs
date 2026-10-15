@@ -7,9 +7,8 @@
 //! size, SHA-256 content hash); when the server asks for data, missing
 //! chunks are sent with `file.querychunks` + `file.uploadchunk`. Servers
 //! without `file.allocate` fall back to a single `file.upload` call.
-//! Uploaded files are resolved with `file.search` for display.
-//!
-//! Out of scope (rejected with a not-yet-ported message): `--browse`.
+//! Uploaded files are resolved with `file.search` for display. `--browse`
+//! opens the uploaded files in a browser (see [`crate::browser`]).
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -21,17 +20,16 @@ const TEMPORARY_TTL_SECS: u64 = 24 * 60 * 60;
 
 fn usage() -> String {
     format!(
-        "usage: arc-rs {NAME} [--json] [--temporary] [--conduit-uri URI] -- FILE [FILE ...]\n\
+        "usage: arc-rs {NAME} [--json] [--temporary] [--browse] [--conduit-uri URI] -- FILE [FILE ...]\n\
          \n\
          Upload one or more files from local disk.\n\
          \n\
          Options:\n\
          \x20 --json         output upload information in JSON format\n\
          \x20 --temporary    mark files temporary (deleted after 24 hours)\n\
+         \x20 --browse       after the upload completes, open the files in a web browser\n\
          \x20 --conduit-uri URI  conduit server (or ARC_CONDUIT_URI / .arcconfig)\n\
-         \x20 -h, --help     show this help\n\
-         \n\
-         Not yet ported (see T1128): --browse.\n"
+         \x20 -h, --help     show this help\n"
     )
 }
 
@@ -40,13 +38,13 @@ struct Options {
     paths: Vec<String>,
     json: bool,
     temporary: bool,
+    browse: bool,
     conduit_uri: Option<String>,
 }
 
 enum ParseOutcome {
     Args(Options),
     Help,
-    NotYetPorted(String),
     Error(String),
 }
 
@@ -61,6 +59,7 @@ fn parse_args(argv: &[String]) -> ParseOutcome {
     let mut paths: Vec<String> = Vec::new();
     let mut json = false;
     let mut temporary = false;
+    let mut browse = false;
     let mut conduit_uri: Option<String> = None;
     let mut end_of_flags = false;
 
@@ -84,9 +83,7 @@ fn parse_args(argv: &[String]) -> ParseOutcome {
         } else if arg == "-h" || arg == "--help" {
             return ParseOutcome::Help;
         } else if arg == "--browse" {
-            return ParseOutcome::NotYetPorted(format!(
-                "arc-rs {NAME}: --browse is not yet ported (see T1128)"
-            ));
+            browse = true;
         } else if arg.starts_with('-') {
             return ParseOutcome::Error(format!("unknown flag '{arg}'"));
         } else {
@@ -103,6 +100,7 @@ fn parse_args(argv: &[String]) -> ParseOutcome {
         paths,
         json,
         temporary,
+        browse,
         conduit_uri,
     })
 }
@@ -265,6 +263,22 @@ fn phid_of(value: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// PHP truthiness for boolean-ish Conduit fields (`upload`, `complete`).
+fn conduit_truthy(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(flag)) => *flag,
+        Some(serde_json::Value::Number(number)) => {
+            number.as_i64().is_none_or(|n| n != 0)
+                && number.as_u64().is_none_or(|n| n != 0)
+                && number.as_f64().is_none_or(|n| n != 0.0)
+        }
+        Some(serde_json::Value::String(text)) => !text.is_empty() && text != "0",
+        Some(serde_json::Value::Array(items)) => !items.is_empty(),
+        Some(serde_json::Value::Object(map)) => !map.is_empty(),
+    }
+}
+
 fn upload_missing_chunks(
     client: &crate::conduit::Client,
     data: &[u8],
@@ -280,12 +294,25 @@ fn upload_missing_chunks(
     let chunks = chunks.as_array().ok_or_else(|| {
         format!("file.querychunks for \"{display}\" returned an unexpected response")
     })?;
+    let remaining = chunks
+        .iter()
+        .filter(|chunk| !conduit_truthy(chunk.get("complete")))
+        .count();
+    // PHP `writeStatus()` goes to stderr.
+    if remaining == chunks.len() {
+        eprintln!(
+            "Uploading chunks ({} chunks to upload).",
+            crate::download::format_count(remaining as u64)
+        );
+    } else {
+        eprintln!(
+            "Resuming upload ({} of {} chunks remain).",
+            crate::download::format_count(remaining as u64),
+            crate::download::format_count(chunks.len() as u64)
+        );
+    }
     for chunk in chunks {
-        if chunk
-            .get("complete")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
+        if conduit_truthy(chunk.get("complete")) {
             continue;
         }
         let start = chunk
@@ -341,10 +368,7 @@ pub fn upload_data(
     }
     match client.call("file.allocate", &params) {
         Ok(allocated) => {
-            let wants_upload = allocated
-                .get("upload")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
+            let wants_upload = conduit_truthy(allocated.get("upload"));
             let phid = allocated
                 .get("filePHID")
                 .and_then(|v| v.as_str())
@@ -469,18 +493,55 @@ pub fn upload_paths(
     json: bool,
     conduit_uri: Option<&str>,
 ) -> Result<String, String> {
+    upload_paths_with_browse(client, dir, paths, temporary, json, false, conduit_uri)
+}
+
+/// Upload `paths`, opening the uploaded files in a browser when `browse`.
+pub fn upload_paths_with_browse(
+    client: &crate::conduit::Client,
+    dir: &Path,
+    paths: &[String],
+    temporary: bool,
+    json: bool,
+    browse: bool,
+    conduit_uri: Option<&str>,
+) -> Result<String, String> {
+    // PHP uploads every file first, then throws the first file's errors.
     let mut uploads: Vec<(String, String)> = Vec::with_capacity(paths.len());
+    let mut first_error: Option<String> = None;
     for path in paths {
         let disk = dir.join(path);
-        let data = std::fs::read(&disk).map_err(|e| format!("cannot read \"{path}\": {e}"))?;
+        let data = match std::fs::read(&disk) {
+            Ok(data) => data,
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(format!("cannot read \"{path}\": {e}"));
+                }
+                continue;
+            }
+        };
         let name = disk
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path.clone());
-        let phid = upload_data(client, &name, &data, temporary)?;
-        uploads.push((path.clone(), phid));
+        match upload_data(client, &name, &data, temporary) {
+            Ok(phid) => uploads.push((path.clone(), phid)),
+            Err(message) => {
+                if first_error.is_none() {
+                    first_error = Some(message);
+                }
+            }
+        }
+    }
+    if let Some(message) = first_error {
+        return Err(message);
     }
     let refs = resolve_refs(client, &uploads, conduit_uri)?;
+    if browse {
+        let uris: Vec<String> = refs.iter().map(|r| r.uri.clone()).collect();
+        let configured = crate::browser::configured_browser(dir);
+        crate::browser::open_uris_in_browser(&uris, configured.as_deref())?;
+    }
     if json {
         let list: Vec<serde_json::Value> = refs.iter().map(UploadedRef::to_json).collect();
         let mut text = serde_json::to_string_pretty(&list)
@@ -506,17 +567,17 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
     let opts = match parse_args(argv) {
         ParseOutcome::Args(opts) => opts,
         ParseOutcome::Help => return Ok(usage()),
-        ParseOutcome::NotYetPorted(message) => return Err(message),
         ParseOutcome::Error(message) => return Err(format!("{message}\n\n{}", usage())),
     };
     let client = crate::config::client_for(opts.conduit_uri.as_deref())?;
     let base = resolve_conduit_uri(opts.conduit_uri.as_deref());
-    upload_paths(
+    upload_paths_with_browse(
         &client,
         dir,
         &opts.paths,
         opts.temporary,
         opts.json,
+        opts.browse,
         base.as_deref(),
     )
 }

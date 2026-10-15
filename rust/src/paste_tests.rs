@@ -46,11 +46,10 @@ fn rejects_read_mode_creation_flags() {
 }
 
 #[test]
-fn defers_browse_on_create() {
-    let ParseOutcome::NotYetPorted(message) = parse_args(&argv(&["--browse"])) else {
-        panic!("expected not-yet-ported for --browse");
-    };
-    assert!(message.contains("not yet ported"), "{message}");
+fn parses_browse_on_create() {
+    let opts = args_of(&["--browse"]);
+    assert!(opts.browse);
+    assert!(!args_of(&[]).browse);
 }
 
 #[test]
@@ -95,4 +94,83 @@ fn reads_created_ids_and_phids() {
         created_uri_of(&serde_json::json!({"uri": "/P1"})),
         Some("/P1".to_string())
     );
+}
+
+/// Serve one canned Conduit response; returns the base URI.
+fn serve_once(canned: &'static str) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8(head).unwrap();
+        let len: usize = head
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length: ")
+                    .or_else(|| line.strip_prefix("content-length: "))
+                    .map(|v| v.trim().parse().unwrap())
+            })
+            .unwrap_or(0);
+        let mut body = vec![0u8; len];
+        stream.read_exact(&mut body).unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            canned.len(),
+            canned
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    base
+}
+
+/// A fake browser command which exits zero without doing anything.
+#[cfg(windows)]
+fn null_browser_config() -> &'static str {
+    r#"{"browser": ["cmd", "/c", "rem"]}"#
+}
+
+/// A fake browser command which exits zero without doing anything.
+#[cfg(not(windows))]
+fn null_browser_config() -> &'static str {
+    r#"{"browser": ["true"]}"#
+}
+
+#[test]
+fn browse_opens_the_created_paste() {
+    let dir = std::env::temp_dir().join(format!(
+        "arc-rs-paste-browse-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(".arcconfig"), null_browser_config()).unwrap();
+
+    let base = serve_once(r#"{"result": {"id": 5, "uri": "/P5"}, "error_code": null}"#);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    let opts = args_of(&["--browse"]);
+    let out = create_paste_output(&dir, &client, &opts, Some("hello")).unwrap();
+    assert!(out.contains("Created paste P5"), "{out}");
+
+    // A failing browser command fails the workflow with PHP's error.
+    std::fs::write(
+        dir.join(".arcconfig"),
+        r#"{"browser": ["definitely-not-a-browser-xyz"]}"#,
+    )
+    .unwrap();
+    let base = serve_once(r#"{"result": {"id": 5, "uri": "/P5"}, "error_code": null}"#);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    let err = create_paste_output(&dir, &client, &opts, Some("hello")).unwrap_err();
+    assert!(err.contains("Failed to open URI"), "{err}");
+
+    std::fs::remove_dir_all(&dir).ok();
 }

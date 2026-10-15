@@ -7,9 +7,9 @@
 //! `--input` or stdin via `paste.create`, falling back to `paste.edit`
 //! transactions on servers without it.
 //!
-//! Out of scope (rejected with a not-yet-ported message): `--browse` when
-//! creating. When reading, `--lang`, `--title`, `--browse`, and `--input`
-//! are usage errors, mirroring the PHP workflow.
+//! When reading, `--lang`, `--title`, `--browse`, and `--input` are usage
+//! errors, mirroring the PHP workflow. When creating, `--browse` opens the
+//! new paste in a browser (see [`crate::browser`]).
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -20,7 +20,7 @@ const DEFAULT_TITLE: &str = "Command-Line Input";
 
 fn usage() -> String {
     format!(
-        "usage: arc-rs {NAME} [--title TITLE] [--lang LANG] [--input PATH]\n\
+        "usage: arc-rs {NAME} [--title TITLE] [--lang LANG] [--input PATH] [--browse]\n\
          \x20      arc-rs {NAME} P123\n\
          \n\
          Share and grab text using the Paste application. To create a paste,\n\
@@ -31,10 +31,9 @@ fn usage() -> String {
          \x20 --title TITLE  title for the paste\n\
          \x20 --lang LANG    language for the paste\n\
          \x20 --input PATH   create a paste from a file ('-' reads stdin)\n\
+         \x20 --browse       after creating a paste, open it in a web browser\n\
          \x20 --conduit-uri URI  conduit server (or ARC_CONDUIT_URI / .arcconfig)\n\
-         \x20 -h, --help     show this help\n\
-         \n\
-         Not yet ported (see T1128): --browse.\n"
+         \x20 -h, --help     show this help\n"
     )
 }
 
@@ -58,7 +57,6 @@ struct Options {
 enum ParseOutcome {
     Args(Options),
     Help,
-    NotYetPorted(String),
     Error(String),
 }
 
@@ -229,10 +227,6 @@ impl Parser {
                     "Flag \"--input\" is not supported when reading pastes.".to_string(),
                 );
             }
-        } else if self.browse {
-            return ParseOutcome::NotYetPorted(format!(
-                "arc-rs {NAME}: --browse is not yet ported (see T1128)"
-            ));
         }
         ParseOutcome::Args(Options {
             title: self.title,
@@ -582,6 +576,13 @@ fn create_paste_output(
         &content,
         base.as_deref(),
     )?;
+    if opts.browse {
+        let configured = crate::browser::configured_browser(dir);
+        crate::browser::open_uris_in_browser(
+            std::slice::from_ref(&created.uri),
+            configured.as_deref(),
+        )?;
+    }
     Ok(format_created(&created))
 }
 
@@ -595,7 +596,6 @@ pub fn execute_with_stdin(
     let opts = match parse_args(argv) {
         ParseOutcome::Args(opts) => opts,
         ParseOutcome::Help => return Ok(usage()),
-        ParseOutcome::NotYetPorted(message) => return Err(message),
         ParseOutcome::Error(message) => return Err(format!("{message}\n\n{}", usage())),
     };
     let client = crate::config::client_for(opts.conduit_uri.as_deref())?;

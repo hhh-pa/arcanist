@@ -44,19 +44,30 @@ fn coercion_matches_php_write_rules() {
             serde_json::json!(true)
         );
     }
-    for raw in ["false", "no", "off", "0", "NO"] {
+    for raw in ["false", "no", "off", "0", "NO", ""] {
         assert_eq!(
             coerce_value("history.immutable", raw).unwrap(),
             serde_json::json!(false)
         );
     }
-    assert!(coerce_value("history.immutable", "perhaps").is_err());
+    assert_eq!(
+        coerce_value("history.immutable", "perhaps").unwrap_err(),
+        "Type of setting 'history.immutable' must be boolean, like 'true' or 'false'."
+    );
     assert_eq!(
         coerce_value("load", r#"["a", "b"]"#).unwrap(),
         serde_json::json!(["a", "b"])
     );
-    assert!(coerce_value("load", "a, b").is_err());
-    assert!(coerce_value("load", r#"{"a": 1}"#).is_err());
+    // PHP decodes with assoc=true, so JSON objects are accepted lists.
+    assert_eq!(
+        coerce_value("load", r#"{"a": 1}"#).unwrap(),
+        serde_json::json!({"a": 1})
+    );
+    assert_eq!(
+        coerce_value("load", "a, b").unwrap_err(),
+        "Type of setting 'load' must be list. You can specify a list in JSON, like: [\"apple\", \"banana\", \"cherry\"]"
+    );
+    assert!(coerce_value("load", "7").is_err());
     assert_eq!(
         coerce_value("editor", "nano").unwrap(),
         serde_json::json!("nano")
@@ -65,20 +76,27 @@ fn coercion_matches_php_write_rules() {
         coerce_value("custom.key", "v").unwrap(),
         serde_json::json!("v")
     );
-    assert!(
-        coerce_value("aliases", "x")
-            .unwrap_err()
-            .contains("arc alias")
+    assert_eq!(
+        coerce_value("aliases", "x").unwrap_err(),
+        "Use \"arc alias\" to configure aliases, not \"arc set-config\"."
     );
 }
 
 #[test]
 fn display_and_warnings() {
     assert_eq!(format_value(&serde_json::json!(true)), "true");
+    assert_eq!(format_value(&serde_json::json!(null)), "null");
     assert_eq!(format_value(&serde_json::json!("x")), "\"x\"");
     assert_eq!(format_value(&serde_json::json!([1])), "[1]");
-    assert!(warn_if_unknown("editor").is_none());
-    assert!(warn_if_unknown("bogus").unwrap().contains("not recognized"));
+    assert!(warn_if_unknown_ansi("editor", false).is_none());
+    assert_eq!(
+        warn_if_unknown_ansi("bogus", false).unwrap(),
+        "Warning: The configuration key \"bogus\" is not recognized by arc. It may be misspelled or out of date."
+    );
+    assert_eq!(
+        warn_if_unknown_ansi("bogus", true).unwrap(),
+        "\x1b[1mWarning:\x1b[m The configuration key \"bogus\" is not recognized by arc. It may be misspelled or out of date."
+    );
 }
 
 #[test]
@@ -87,7 +105,10 @@ fn user_doc_handles_missing_and_broken_files() {
     let path = tmp.path.join(".arcrc");
     assert_eq!(read_user_doc(&path).unwrap(), serde_json::json!({}));
     std::fs::write(&path, "nope").unwrap();
-    assert!(read_user_doc(&path).is_err());
+    assert_eq!(
+        read_user_doc(&path).unwrap_err(),
+        "Your '~/.arcrc' file is not a valid JSON file."
+    );
     std::fs::write(&path, "[1]").unwrap();
     assert!(read_user_doc(&path).is_err());
     let doc = serde_json::json!({"config": {"a": "b"}});
@@ -101,13 +122,15 @@ fn apply_user_sets_deletes_and_preserves_hosts() {
     let path = tmp.path.join(".arcrc");
     std::fs::write(&path, r#"{"hosts": {"https://h/api/": {"token": "t"}}}"#).unwrap();
 
-    let set = apply_user(&path, "editor", "nano").unwrap();
-    assert!(
-        set.contains("Set key \"editor\" = \"nano\" in user config."),
-        "{set}"
+    // PHP always prints `(was ...)`: a missing key renders as `null`.
+    assert_eq!(
+        apply_user(&path, "editor", "nano").unwrap(),
+        "Set key \"editor\" = \"nano\" in user config (was null)."
     );
-    let again = apply_user(&path, "editor", "vim").unwrap();
-    assert!(again.contains("(was \"nano\")"), "{again}");
+    assert_eq!(
+        apply_user(&path, "editor", "vim").unwrap(),
+        "Set key \"editor\" = \"vim\" in user config (was \"nano\")."
+    );
     let doc = read_user_doc(&path).unwrap();
     assert_eq!(doc["config"]["editor"], serde_json::json!("vim"));
     assert_eq!(
@@ -115,11 +138,14 @@ fn apply_user_sets_deletes_and_preserves_hosts() {
         serde_json::json!("t")
     );
 
-    let deleted = apply_user(&path, "editor", "").unwrap();
-    assert!(deleted.contains("Deleted key \"editor\""), "{deleted}");
-    assert!(deleted.contains("(was \"vim\")"), "{deleted}");
-    let missing = apply_user(&path, "editor", "").unwrap();
-    assert!(!missing.contains("(was"), "{missing}");
+    assert_eq!(
+        apply_user(&path, "editor", "").unwrap(),
+        "Deleted key \"editor\" from user config (was \"vim\")."
+    );
+    assert_eq!(
+        apply_user(&path, "editor", "").unwrap(),
+        "Deleted key \"editor\" from user config (was null)."
+    );
 
     assert!(apply_user(&path, "history.immutable", "perhaps").is_err());
     assert!(apply_user(&path, "aliases", "x").is_err());
@@ -135,8 +161,10 @@ fn local_files_roundtrip_at_explicit_roots() {
     assert!(path.ends_with(Path::new(".git").join("arc").join("config")));
     assert!(read_local_file(&path).unwrap().is_empty());
 
-    let set = apply_local_at(&root, "history.immutable", "true").unwrap();
-    assert!(set.contains("in local config"), "{set}");
+    assert_eq!(
+        apply_local_at(&root, "history.immutable", "true").unwrap(),
+        "Set key \"history.immutable\" = true in local config (was null)."
+    );
     assert!(path.is_file());
     let mut map = read_local_file(&path).unwrap();
     assert_eq!(map["history.immutable"], serde_json::json!(true));
@@ -149,19 +177,40 @@ fn local_files_roundtrip_at_explicit_roots() {
     );
 
     std::fs::write(&path, "nope").unwrap();
-    assert!(read_local_file(&path).is_err());
+    let err = read_local_file(&path).unwrap_err();
+    assert!(err.starts_with("Failed to parse '"), "{err}");
+    assert!(err.ends_with("as JSON."), "{err}");
     std::fs::write(&path, "[1]").unwrap();
     assert!(read_local_file(&path).is_err());
 
     let deleted = apply_local_at(&root, "editor", "").unwrap_err();
-    assert!(deleted.contains("JSON"), "{deleted}");
+    assert!(deleted.ends_with("is not a JSON object"), "{deleted}");
+}
+
+#[cfg(unix)]
+#[test]
+fn only_user_writes_harden_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new("perms");
+    let user_file = tmp.path.join(".arcrc");
+    apply_user(&user_file, "editor", "nano").unwrap();
+    let mode = std::fs::metadata(&user_file).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "user file must be 0600");
+
+    let root = tmp.path.join("repo");
+    apply_local_at(&root, "editor", "nano").unwrap();
+    let local = local_config_path(&root);
+    let mode = std::fs::metadata(&local).unwrap().permissions().mode() & 0o777;
+    assert_ne!(mode, 0o600, "local file must not be hardened");
 }
 
 #[test]
 fn local_apply_requires_a_repo() {
     let tmp = TempDir::new("norepo");
-    let err = apply_local(&tmp.path, "editor", "x").unwrap_err();
-    assert!(err.contains("working copy"), "{err}");
+    assert_eq!(
+        apply_local(&tmp.path, "editor", "x").unwrap_err(),
+        "This command must be run in a Git, Mercurial or Subversion working copy."
+    );
 }
 
 #[test]

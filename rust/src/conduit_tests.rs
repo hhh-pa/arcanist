@@ -1,5 +1,11 @@
 use super::*;
 
+const TEST_RSA_PRIVATE_PEM: &str = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAk4vwzs7Ymnq9esaKniWhO4/4GKw7dNPLQ53ZaBbQdhd81ayy\nAIC99YRn94My8A4uEPa91BD46gZ2SZmE/rXlLrODHR7n2MevP3SRnL414esRGsLW\n7qd18YBg/idBa0ZPvT527ACEGMEGMN1twza3SB7oLaBmI7w/Ch9YqsSV0jDN2T1n\nmCQsuKwOZJheRMevWsok5QHqysMOwusXB9F0LIAWecDt5IcDhbhuhzF7irSgoV7P\n7qLiVN+uiDy1B77/D4jZuMknR/FIam1LsEMeBEfVW/wnjnAVU1zA16cySFq+YHfW\nEjZ1eoX7VdjkCNjyNLNTwJ4hc98a9etlrGiyJQIDAQABAoIBAHXs9z6TnBN73k1u\nugPEV6VfYA94ON0bGe6lDspe0aZRB3lQWcSFIU5F0ULGHcQ30SHF09rW5dtF5uzU\nQrPBdbdpynVP6kYc8zhoVqlMbYxvcHBPIbIFLgMjdGItxd+Ths/eSPY/Q1T1kZkk\noUHRTZPa//7XoEsXfdr9SsTR8lzXZkMkL3JRDjjUHXMUaOpXKvANu9GJeNuEh5Vs\nKC2Gh4csqzJW1g4Ur7Jfl4ApxvX+0vv61lHo481xeSl3ce5YI8G1aFXqGLttqFFI\neQx7Z1UfMMrX1Eipu/YzdK2ghU6hVOmcwwKUiCc1iE0OA1L+8T3+mQTGbSFd4+B/\nt0O9LVECgYEAwui2PPv2HPuTLW7uVnHGIsnS4SIjey1nLNW+HZ/slw/gxYy5LZFO\nTf8ie5ry/SOvxrAwR1uop1K7l6oJnxmfKlJnyvDc3AFx2lg+yI8MH1BaQhBmKYHZ\n4g5suUhnDvFA3f0hoDGi/QR8u3zmf5W4SYr4BQOVJtFwbmWU6ZqpQM8CgYEAwcrs\nJW/R3Risx1qRwAt25e47pjc9jUkxF9qV3mZbHPi1g0BDCvXcCTi0R87G3/6OupIz\nn+ma3CSetdRm/g0ypZiV5RDUoFPboFt8/epHVtRFIMPA2Vo6LY+oj+5kT0qim4pA\nY+ZdbCpuIH8+IAWPt9Qsnvjv8kmzwXhVRhOQUssCgYEAgeQKBsw3MQtrAt0pkoxR\n6b8sfQJ+OMmCN7vd7eo1Blr7hUuJ4Nc0IwCDX3Jcutw8eSHTmsp3s8KL57/Wl6PA\nkbjHGNS5qxh/Ym5qsMe74WZwMBSzsLerl13bkQKyQ5/9hbL65MIPh6Sk52GOTrpd\nTQ2CyfygOnVbAwdJXQDICLsCgYEAs4u9VEYQiybkVWMdLG+yvf8F9s6xUWhherdD\nKSVt/x6SlUMBmnMFZOnLZcg3S6p+NG9mMx9tIc8v2EktDu3NYc1H+02noc9v6Vc6\nK8pWRCUw0tVqpDXLNxElXAzDlQ8SLsddNvFk1uVM2QDq3yIn8Go82SDMto8AYxyI\n7P8NNRcCgYB/wfEkLThqICjJHMlPCOB30I1PHkviJH0CvBmJE6E3Gy5HFamR5UNj\ncypPFpQWzecTFG0ElxCMriNKEZ6eTLj+Av6/btzm5BC5d26WX/iJTxxtmlATO+7S\nNswSK/f39vtjEYLDfvQHvV9M1UOrU8HgkEJcBCBqqMhFAXVbOseH8w==\n-----END RSA PRIVATE KEY-----\n";
+
+fn test_client() -> Client {
+    Client::new("https://conduit.test/", "api-test").unwrap()
+}
+
 #[test]
 fn normalizes_base_uris() {
     assert_eq!(
@@ -21,17 +27,107 @@ fn normalizes_base_uris() {
 }
 
 #[test]
-fn builds_params_blob_with_auth() {
+fn rejects_uri_without_host() {
+    // `ConduitClient::__construct()` message, byte for byte.
+    assert_eq!(
+        Client::new("not-a-uri", "t").unwrap_err(),
+        Error::Transport("Conduit URI 'not-a-uri' must include a valid host.".to_string())
+    );
+    assert_eq!(
+        Client::new("https://", "t").unwrap_err(),
+        Error::Transport("Conduit URI 'https://' must include a valid host.".to_string())
+    );
+    assert_eq!(
+        Client::new("https:///api/m", "t").unwrap_err(),
+        Error::Transport("Conduit URI 'https:///api/m' must include a valid host.".to_string())
+    );
+}
+
+#[test]
+fn splits_uri_parts() {
+    assert_eq!(
+        split_uri("https://orsay.hhh.pa/api/").unwrap(),
+        ("https".to_string(), "orsay.hhh.pa".to_string(), None)
+    );
+    assert_eq!(
+        split_uri("http://127.0.0.1:9/x").unwrap(),
+        ("http".to_string(), "127.0.0.1".to_string(), Some(9))
+    );
+    assert_eq!(
+        split_uri("https://user@example.test:8443/").unwrap(),
+        ("https".to_string(), "example.test".to_string(), Some(8443))
+    );
+    assert_eq!(
+        split_uri("http://[::1]:8080/api").unwrap(),
+        ("http".to_string(), "::1".to_string(), Some(8080))
+    );
+    // Port 0 behaves like no port (PHP `!$port` branches).
+    assert_eq!(
+        split_uri("http://example.test:0/").unwrap(),
+        ("http".to_string(), "example.test".to_string(), None)
+    );
+}
+
+#[test]
+fn host_strings_follow_php_port_rules() {
+    let client = test_client();
+    assert_eq!(client.host_for_header(), "conduit.test");
+    assert_eq!(client.host_for_signature(), "conduit.test:443");
+
+    let plain = Client::new("http://example.test/", "t").unwrap();
+    assert_eq!(plain.host_for_header(), "example.test");
+    assert_eq!(plain.host_for_signature(), "example.test:80");
+
+    let custom = Client::new("https://example.test:8443/", "t").unwrap();
+    assert_eq!(custom.host_for_header(), "example.test:8443");
+    assert_eq!(custom.host_for_signature(), "example.test:8443");
+
+    let implicit = Client::new("https://example.test:443/", "t").unwrap();
+    assert_eq!(implicit.host_for_header(), "example.test");
+
+    let mut overridden = test_client();
+    overridden.set_host("node-7.internal");
+    assert_eq!(overridden.host_for_header(), "node-7.internal");
+    assert_eq!(overridden.host_for_signature(), "node-7.internal:443");
+}
+
+#[test]
+fn builds_meta_with_auth() {
+    let client = test_client();
     let params = serde_json::json!({"constraints": {"query": "x"}});
-    let blob = build_params(&params, "api-test").unwrap();
-    let back: serde_json::Value = serde_json::from_str(&blob).unwrap();
-    assert_eq!(back["constraints"]["query"], "x");
-    assert_eq!(back["__conduit__"]["token"], "api-test");
+    let meta = client.build_meta("m", params.as_object().unwrap()).unwrap();
+    assert_eq!(meta["token"], "api-test");
+    assert!(!meta.contains_key("sessionKey"));
+    assert!(!meta.contains_key("auth.type"));
+
+    let mut anonymous = Client::new("https://conduit.test/", "").unwrap();
+    anonymous.set_oauth_token("oauth-1");
+    let meta = anonymous
+        .build_meta("m", params.as_object().unwrap())
+        .unwrap();
+    // PHP only sends `token` when it is truthy.
+    assert!(!meta.contains_key("token"));
+    assert_eq!(meta["access_token"], "oauth-1");
+}
+
+#[test]
+fn stores_session_from_connect_result() {
+    let client = test_client();
+    client.store_session(&serde_json::json!({
+        "sessionKey": "sess-1",
+        "connectionID": 7,
+    }));
+    let params = serde_json::Map::new();
+    let meta = client.build_meta("differential.query", &params).unwrap();
+    assert_eq!(meta["sessionKey"], "sess-1");
+    // Non-string values are dropped, like PHP's falsy `idx()` results.
+    assert!(!meta.contains_key("connectionID"));
 }
 
 #[test]
 fn rejects_non_object_params() {
-    let err = build_params(&serde_json::json!([1]), "t").unwrap_err();
+    let client = test_client();
+    let err = client.call("m", &serde_json::json!([1])).unwrap_err();
     assert_eq!(
         err,
         Error::Protocol("params must be a JSON object".to_string())
@@ -40,34 +136,282 @@ fn rejects_non_object_params() {
 
 #[test]
 fn parses_success_response() {
-    let v = parse_response(r#"{"result": {"a": 1}, "error_code": null}"#).unwrap();
+    let v = parse_response(r#"{"result": {"a": 1}, "error_code": null}"#, "m").unwrap();
     assert_eq!(v, serde_json::json!({"a": 1}));
+    // A missing `result` decodes to null, like PHP's null `idx()`.
+    let v = parse_response(r#"{"error_code": null}"#, "m").unwrap();
+    assert_eq!(v, serde_json::Value::Null);
 }
 
 #[test]
-fn parses_api_error() {
-    let err =
-        parse_response(r#"{"result": null, "error_code": "E", "error_info": "no"}"#).unwrap_err();
+fn parses_api_error_with_method_prefix() {
+    // PHP `ConduitClientException` messages are `<method> info`.
+    let err = parse_response(
+        r#"{"result": null, "error_code": "E", "error_info": "no"}"#,
+        "user.whoami",
+    )
+    .unwrap_err();
     assert_eq!(
         err,
         Error::Api {
             code: "E".to_string(),
-            info: "no".to_string()
+            info: "<user.whoami> no".to_string()
         }
     );
 }
 
 #[test]
+fn falsy_error_codes_are_success() {
+    for body in [
+        r#"{"result": 1, "error_code": false}"#,
+        r#"{"result": 1, "error_code": 0}"#,
+        r#"{"result": 1, "error_code": ""}"#,
+        r#"{"result": 1, "error_code": "0"}"#,
+        r#"{"result": 1, "error_code": []}"#,
+        r#"{"result": 1}"#,
+    ] {
+        assert_eq!(
+            parse_response(body, "m").unwrap(),
+            serde_json::json!(1),
+            "{body}"
+        );
+    }
+}
+
+#[test]
 fn rejects_malformed_response() {
     assert!(matches!(
-        parse_response("not json"),
+        parse_response("not json", "m"),
         Err(Error::Protocol(_))
     ));
-    assert!(matches!(parse_response("[1]"), Err(Error::Protocol(_))));
+    assert!(matches!(
+        parse_response("[1]", "m"),
+        Err(Error::Protocol(_))
+    ));
+    // PHP `ConduitFuture` message, byte for byte.
+    assert_eq!(
+        parse_response("not json", "m").unwrap_err(),
+        Error::Protocol(
+            "Host returned HTTP/200, but invalid JSON data in response to a Conduit method call."
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn strips_response_shield() {
+    let v = parse_response(r#"for(;;);{"result": 7, "error_code": null}"#, "m").unwrap();
+    assert_eq!(v, serde_json::json!(7));
 }
 
 #[test]
 fn request_timeout_matches_php_default() {
     // `ConduitClient::$timeout` is 300 seconds in PHP.
     assert_eq!(REQUEST_TIMEOUT, std::time::Duration::from_secs(300));
+    assert_eq!(test_client().timeout, std::time::Duration::from_secs(300));
+}
+
+#[test]
+fn rawurlencode_matches_php() {
+    assert_eq!(rawurlencode("abcXYZ019-_.~"), "abcXYZ019-_.~");
+    assert_eq!(rawurlencode("a b"), "a%20b");
+    assert_eq!(rawurlencode("{}"), "%7B%7D");
+    assert_eq!(rawurlencode("ü"), "%C3%BC");
+    assert_eq!(rawurlencode("a+b=c&d"), "a%2Bb%3Dc%26d");
+}
+
+#[test]
+fn build_query_matches_php_form_fields() {
+    // PHP posts `params`, `output=json`, `__conduit__=1` (bool true encodes
+    // as `1` in the querystring).
+    assert_eq!(
+        build_query(r#"{"a":1}"#),
+        "params=%7B%22a%22%3A1%7D&output=json&__conduit__=1"
+    );
+}
+
+#[test]
+fn connect_signature_matches_sha1_vector() {
+    // `sha1("1700000000CERT")`, verified with an independent SHA1.
+    assert_eq!(
+        connect_signature("1700000000", "CERT"),
+        "cf26184c8ab0511d44d2ef42efcfb8ba7b2dad87"
+    );
+}
+
+#[test]
+fn connect_auth_swaps_certificate() {
+    let mut map = serde_json::json!({
+        "certificate": "CERT",
+        "user": "alice",
+    })
+    .as_object()
+    .cloned()
+    .unwrap();
+    apply_connect_auth(&mut map);
+    assert!(!map.contains_key("certificate"));
+    assert_eq!(map["user"], "alice");
+    let token = map["authToken"].as_u64().unwrap();
+    assert!(token > 1_700_000_000);
+    assert_eq!(
+        map["authSignature"],
+        serde_json::Value::String(connect_signature(&token.to_string(), "CERT"))
+    );
+
+    // Falsy certificates are dropped without signing, like PHP.
+    let mut map = serde_json::json!({"certificate": ""})
+        .as_object()
+        .cloned()
+        .unwrap();
+    apply_connect_auth(&mut map);
+    assert!(!map.contains_key("certificate"));
+    assert!(!map.contains_key("authToken"));
+}
+
+#[test]
+fn php_truthiness_matches() {
+    assert!(!php_truthy(&serde_json::json!(null)));
+    assert!(!php_truthy(&serde_json::json!(false)));
+    assert!(php_truthy(&serde_json::json!(true)));
+    assert!(!php_truthy(&serde_json::json!(0)));
+    assert!(php_truthy(&serde_json::json!(7)));
+    assert!(!php_truthy(&serde_json::json!("")));
+    assert!(!php_truthy(&serde_json::json!("0")));
+    assert!(php_truthy(&serde_json::json!("0.0")));
+    assert!(!php_truthy(&serde_json::json!([])));
+    assert!(php_truthy(&serde_json::json!([null])));
+    assert_eq!(php_stringify(&serde_json::json!(null)), "");
+    assert_eq!(php_stringify(&serde_json::json!(true)), "1");
+    assert_eq!(php_stringify(&serde_json::json!(12)), "12");
+}
+
+#[test]
+fn signature_encoding_matches_php_vector() {
+    // Oracle: `ConduitClientTestCase::testConduitRequestEncoding`.
+    // Note: PHP's empty array takes the list branch, so `empty` is `[]`.
+    let input = serde_json::json!({
+        "z": {"nothing": null, "emptystring": ""},
+        "empty": [],
+        "list": [15, "quack", true, false],
+        "a": {"key": "value", "key2": "value2"},
+    });
+    assert_eq!(
+        encode_raw_data_for_signature(&input).unwrap(),
+        "O4:S1:aO2:S3:keyS5:valueS4:key2S6:value2S5:emptyA0:S4:listA4:I2:15\
+         S5:quackB1:B0:S1:zO2:S11:emptystringS0:S7:nothingN:"
+    );
+}
+
+#[test]
+fn signature_encoding_rejects_floats() {
+    assert_eq!(
+        encode_raw_data_for_signature(&serde_json::json!({"x": 1.5})).unwrap_err(),
+        Error::Protocol("Unexpected data type in request data: double.".to_string())
+    );
+}
+
+#[test]
+fn gzip_round_trips() {
+    let data = b"params=%7B%7D&output=json&__conduit__=1".as_slice();
+    let gzipped = gzip_bytes(data);
+    assert_ne!(gzipped, data);
+    assert_eq!(&gzipped[..2], &[0x1f, 0x8b]);
+    let mut decoder = flate2::read::GzDecoder::new(gzipped.as_slice());
+    let mut back = Vec::new();
+    use std::io::Read;
+    decoder.read_to_end(&mut back).unwrap();
+    assert_eq!(back, data);
+}
+
+#[test]
+fn capabilities_enable_gzip() {
+    let client = test_client();
+    assert!(!client.uses_gzip());
+    client.enable_capabilities(&["gzip".to_string(), "other".to_string()]);
+    assert!(client.uses_gzip());
+}
+
+#[test]
+fn signs_requests_with_consign_prefix() {
+    let params = serde_json::json!({"user": "alice"})
+        .as_object()
+        .cloned()
+        .unwrap();
+    let mut meta = serde_json::Map::new();
+    meta.insert("auth.type".to_string(), json_string("asymmetric"));
+    meta.insert("auth.key".to_string(), json_string("test-key"));
+    meta.insert("auth.host".to_string(), json_string("conduit.test:443"));
+    let first = sign_request("user.whoami", &params, &meta, TEST_RSA_PRIVATE_PEM).unwrap();
+    let second = sign_request("user.whoami", &params, &meta, TEST_RSA_PRIVATE_PEM).unwrap();
+    // PKCS#1 v1.5 signatures are deterministic.
+    assert_eq!(first, second);
+    assert!(first.starts_with(SIGNATURE_CONSIGN_1), "{first}");
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(&first[SIGNATURE_CONSIGN_1.len()..])
+        .unwrap();
+    assert_eq!(raw.len(), 256);
+
+    // The signature verifies as RSA/SHA1 PKCS#1 v1.5 (the `openssl_sign()`
+    // default), pinning the algorithm independently of the signer.
+    use rsa::pkcs1::DecodeRsaPrivateKey;
+    let private = rsa::RsaPrivateKey::from_pkcs1_pem(TEST_RSA_PRIVATE_PEM).unwrap();
+    let public = rsa::RsaPublicKey::from(&private);
+    let structure = serde_json::json!({
+        "method": "user.whoami",
+        "protocol": meta,
+        "parameters": params,
+    });
+    let input = encode_raw_data_for_signature(&structure).unwrap();
+    use sha1::Digest;
+    let digest = sha1::Sha1::digest(input.as_bytes());
+    public
+        .verify(rsa::Pkcs1v15Sign::new::<sha1::Sha1>(), &digest, &raw)
+        .unwrap();
+
+    assert_eq!(
+        sign_request("user.whoami", &params, &meta, "not a key").unwrap_err(),
+        Error::Protocol("Unable to sign Conduit request with signing key.".to_string())
+    );
+}
+
+#[test]
+fn signing_meta_flows_into_requests() {
+    let mut client = test_client();
+    client.set_signing_keys("test-key", TEST_RSA_PRIVATE_PEM);
+    let params = serde_json::json!({"user": "alice"});
+    let meta = client
+        .build_meta("user.whoami", params.as_object().unwrap())
+        .unwrap();
+    assert_eq!(meta["auth.type"], "asymmetric");
+    assert_eq!(meta["auth.key"], "test-key");
+    assert_eq!(meta["auth.host"], "conduit.test:443");
+    assert!(
+        meta["auth.signature"]
+            .as_str()
+            .unwrap()
+            .starts_with(SIGNATURE_CONSIGN_1)
+    );
+}
+
+#[test]
+fn signs_requests_with_known_vector() {
+    // Fixed vector: RSA/SHA1 PKCS#1 v1.5 over the consigned encoding above,
+    // independently verified (DigestInfo `30213009...` + SHA1 of the input
+    // recovered via textbook RSA verification).
+    let params = serde_json::json!({"user": "alice"})
+        .as_object()
+        .cloned()
+        .unwrap();
+    let mut meta = serde_json::Map::new();
+    meta.insert("auth.type".to_string(), json_string("asymmetric"));
+    meta.insert("auth.key".to_string(), json_string("test-key"));
+    meta.insert("auth.host".to_string(), json_string("conduit.test:443"));
+    assert_eq!(
+        sign_request("user.whoami", &params, &meta, TEST_RSA_PRIVATE_PEM).unwrap(),
+        "Consign1.0/eZ9bsSgjO3lvQcn9/4GLXfFcNWxK9kukYJLnj6mlhdJLDZpGcYzgvIUIwNnRvWEHiYq9pRCI05CaiMsFBAKMAkOLqN\
+         CPkOVhWm9lM7/vFB9/6u9ToVeU/tyM62oYWs7S2gAkvnS+8NYIEO2sYv77m5nmVE99qXD/SLiCMAZsYT3NLN+QgGBojwNrcfg\
+         of9Lip9ivQppVi+Srhwam3Zjmg2VUDWb/JUfQt4Fb9CwUWpVgiy+4JJaN7ZU4UnDhP6d7udHk/9BdOcKNj3M5rYgP75ILXDTL\
+         EkNIkhFwvCIsCTgj+/AokXD+Ozpue+wARFT2/pR1lsKb4LXyv8uG0f/fbg=="
+    );
 }

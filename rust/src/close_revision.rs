@@ -5,15 +5,15 @@
 //! `--finalize` is the soft variant used by other workflows: a revision which
 //! is missing or not accepted is left open with a warning instead of failing.
 //!
-//! Known limits (see T1128): the tracked-repository check in `--finalize`
-//! mode is skipped (arc-rs cannot resolve the repository PHID yet), so
-//! finalize always attempts the close for accepted revisions; only the git
-//! finalized message is reproduced; `--force` is a port affordance for
-//! non-interactive closes of revisions owned by someone else.
+//! Known limits (see T1128): `--force` is a port affordance for
+//! non-interactive closes of revisions owned by someone else (PHP has no
+//! `--force` flag; it skips only the not-the-author prompt). Outside a
+//! repository the git finalized message prints; PHP fatals there instead.
 
+use std::path::Path;
 use std::process::ExitCode;
 
-use crate::{conduit, config};
+use crate::{conduit, config, get_config, git, hg, prompt, svn, terminal};
 
 /// Subcommand name, matching `arc close-revision`.
 pub const NAME: &str = "close-revision";
@@ -40,6 +40,10 @@ pub struct Options {
     pub force: bool,
     /// Explicit conduit URI override.
     pub conduit_uri: Option<String>,
+    /// Working copy's repository PHID, when identified. `--finalize`
+    /// skips the close for tracked (identified) repositories, mirroring
+    /// `getRepositoryPHID()`. Resolved by [`run`]; tests set it directly.
+    pub repository_phid: Option<String>,
 }
 
 /// One argument's parse step: consumed, `--help`, or a fatal error.
@@ -151,6 +155,7 @@ impl Parser {
             json: self.json,
             force: self.force,
             conduit_uri: self.conduit_uri,
+            repository_phid: None,
         }))
     }
 }
@@ -171,17 +176,14 @@ pub fn parse_args(argv: &[String]) -> Result<Option<Options>, String> {
     parser.finish()
 }
 
-/// Strip a leading `D` (like `ArcanistWorkflow::normalizeRevisionID`) and
-/// require a numeric id.
-pub fn normalize_revision_id(raw: &str) -> Result<String, String> {
-    let stripped = raw
-        .strip_prefix('D')
+/// Strip one leading `D`, like `ArcanistWorkflow::normalizeRevisionID`
+/// (no format validation upstream).
+#[must_use]
+pub fn normalize_revision_id(raw: &str) -> String {
+    raw.strip_prefix('D')
         .or_else(|| raw.strip_prefix('d'))
-        .unwrap_or(raw);
-    if stripped.is_empty() || !stripped.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(format!("invalid revision '{raw}'"));
-    }
-    Ok(stripped.to_string())
+        .unwrap_or(raw)
+        .to_string()
 }
 
 /// Revision fields `close-revision` needs from `differential.query`.
@@ -344,14 +346,15 @@ fn confirm_ownership(
     options: &Options,
     rev: &Revision,
     object_name: &str,
-    confirm: &dyn Fn(&str) -> bool,
+    confirm: &dyn Fn(&str) -> Result<bool, String>,
 ) -> Result<(), String> {
     if !options.finalize && rev.author_phid != user_phid(client)? && !options.force {
         let prompt = format!(
             "You are not the author of revision \"{object_name}\", are you sure you want to close it?"
         );
-        if !confirm(&prompt) {
-            return Err("Aborted.".to_string());
+        if !confirm(&prompt)? {
+            // `ArcanistUserAbortException`: 'User aborted the workflow.'
+            return Err("User aborted the workflow.".to_string());
         }
     }
     Ok(())
@@ -372,27 +375,48 @@ fn close_if_accepted(
     rev: &Revision,
     id: &str,
     object_name: &str,
+    ansi: bool,
 ) -> Result<CloseStep, String> {
+    // `--finalize` closes only untracked repositories: a tracked working
+    // copy is left alone silently, mirroring `getRepositoryPHID()`.
+    if options.finalize && options.repository_phid.is_some() {
+        return Ok(CloseStep {
+            progress: String::new(),
+            warnings: String::new(),
+            closed: false,
+        });
+    }
     // See T13458: the server rejects a close transition unless the
     // revision is accepted, so finalize mode skips the attempt.
     if options.finalize && rev.status != STATUS_ACCEPTED {
+        let warnings = terminal::format_status_message(
+            "yellow",
+            "OPEN REVISION",
+            &format!(
+                "Revision \"{object_name}\" is not in state \"Accepted\", so it will be left open."
+            ),
+            ansi,
+        );
         return Ok(CloseStep {
             progress: String::new(),
-            warnings: format!(
-                "OPEN REVISION: Revision \"{object_name}\" is not in state \"Accepted\", so it will be left open.\n"
-            ),
+            warnings,
             closed: false,
         });
     }
     let display = format!("{object_name} {}", rev.title);
-    let mut progress = format!("Closing revision \"{display}\"...\n");
+    let mut progress = terminal::format_status_message(
+        "blue",
+        "CLOSE",
+        &format!("Closing revision \"{display}\"..."),
+        ansi,
+    );
     client
         .call(
             "differential.close",
             &serde_json::json!({"revisionID": id_param(id)}),
         )
         .map_err(|e| e.to_string())?;
-    progress += "Done, closed revision.\n";
+    progress += &terminal::format_status_message("green", "CLOSE", "Done, closed revision.", ansi);
     Ok(CloseStep {
         progress,
         warnings: String::new(),
@@ -400,9 +424,26 @@ fn close_if_accepted(
     })
 }
 
+/// The per-VCS finalized message, wrapped like
+/// `echo phutil_console_wrap($message)."\n"`.
+fn finalized_message(vcs: Option<&WorkingCopy>) -> String {
+    let message = match vcs {
+        Some(WorkingCopy::Hg) => {
+            "You may now push this commit upstream, as appropriate (e.g. with \
+             'hg push' or by printing and faxing it)."
+                .to_string()
+        }
+        Some(WorkingCopy::Svn) => "Done.".to_string(),
+        Some(WorkingCopy::Git) | None => "You may now push this commit upstream, as appropriate \
+             (e.g. with 'git push', or 'git svn dcommit', or by printing and faxing it)."
+            .to_string(),
+    };
+    format!("{}\n", terminal::console_wrap(&message, 0, true))
+}
+
 /// The final message: empty with `--quiet`, else the push hint for a
 /// finalized revision or a plain `Done.`.
-fn closing_message(revision: &Option<Revision>, quiet: bool) -> String {
+fn closing_message(revision: &Option<Revision>, quiet: bool, dir: &Path) -> String {
     if quiet {
         return String::new();
     }
@@ -410,8 +451,7 @@ fn closing_message(revision: &Option<Revision>, quiet: bool) -> String {
         if (rev.status == STATUS_ACCEPTED || rev.status == STATUS_CLOSED)
             && rev.commits.is_empty());
     if finalized {
-        "You may now push this commit upstream, as appropriate (e.g. with 'git push', or 'git svn dcommit', or by printing and faxing it).\n"
-            .to_string()
+        finalized_message(detect_working_copy(dir).as_ref())
     } else {
         "Done.\n".to_string()
     }
@@ -432,12 +472,12 @@ fn render_report(
         doc.push('\n');
         Ok(Report {
             stdout: doc,
-            stderr: format!("{progress}{closing}{warnings}"),
+            stderr: format!("{progress}{warnings}{closing}"),
         })
     } else {
         Ok(Report {
-            stdout: format!("{progress}{closing}"),
-            stderr: warnings.to_string(),
+            stdout: closing.to_string(),
+            stderr: format!("{progress}{warnings}"),
         })
     }
 }
@@ -448,25 +488,37 @@ fn render_report(
 pub fn execute(
     client: &conduit::Client,
     options: &Options,
-    confirm: &dyn Fn(&str) -> bool,
+    confirm: &dyn Fn(&str) -> Result<bool, String>,
 ) -> Result<Report, String> {
-    let id = normalize_revision_id(&options.revision)?;
+    let dir = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    execute_in(&dir, client, options, confirm)
+}
+
+/// [`execute`] with `dir` pinning working-copy detection.
+pub fn execute_in(
+    dir: &Path,
+    client: &conduit::Client,
+    options: &Options,
+    confirm: &dyn Fn(&str) -> Result<bool, String>,
+) -> Result<Report, String> {
+    let id = normalize_revision_id(&options.revision);
     let object_name = format!("D{id}");
     let revision = query_revision(client, &id)?;
     check_closable(&revision, options, &object_name)?;
 
+    let ansi = terminal::ansi_enabled();
     let mut progress = String::new();
     let mut warnings = String::new();
     let mut closed = false;
     if let Some(rev) = &revision {
         confirm_ownership(client, options, rev, &object_name, confirm)?;
-        let step = close_if_accepted(client, options, rev, &id, &object_name)?;
+        let step = close_if_accepted(client, options, rev, &id, &object_name, ansi)?;
         progress += &step.progress;
         warnings += &step.warnings;
         closed = step.closed;
     }
 
-    let closing = closing_message(&revision, options.quiet);
+    let closing = closing_message(&revision, options.quiet, dir);
     render_report(
         options,
         &object_name,
@@ -478,19 +530,113 @@ pub fn execute(
     )
 }
 
-fn confirm_interactive(prompt: &str) -> bool {
-    use std::io::BufRead;
-    eprint!("{prompt} [y/N] ");
-    let mut line = String::new();
-    match std::io::stdin().lock().read_line(&mut line) {
-        Ok(_) => matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
-        Err(_) => false,
+/// `repository.callsign` from any config source, when set and non-empty.
+fn configured_callsign(sources: &get_config::Sources) -> Option<String> {
+    let (_, value) = get_config::current_value("repository.callsign", sources)?;
+    let callsign = value.as_str()?.trim().to_string();
+    (!callsign.is_empty()).then_some(callsign)
+}
+
+/// The `repository.query` constraint, mirroring `getRepositoryQuery()`:
+/// configured callsign first, then the VCS UUID, then the remote URI.
+fn select_repository_query(
+    sources: &get_config::Sources,
+    uuid: Option<&str>,
+    remote: Option<&str>,
+) -> Option<serde_json::Value> {
+    if let Some(callsign) = configured_callsign(sources) {
+        return Some(serde_json::json!({"callsigns": [callsign]}));
     }
+    if let Some(uuid) = uuid {
+        return Some(serde_json::json!({"uuids": [uuid]}));
+    }
+    remote.map(|remote| serde_json::json!({"remoteURIs": [remote]}))
+}
+
+enum WorkingCopy {
+    Git,
+    Hg,
+    Svn,
+}
+
+fn detect_working_copy(dir: &Path) -> Option<WorkingCopy> {
+    if git::is_inside_work_tree(dir) {
+        return Some(WorkingCopy::Git);
+    }
+    if crate::list::find_hg_root(dir).is_some() {
+        return Some(WorkingCopy::Hg);
+    }
+    if svn::find_metadata_path(dir).is_some() {
+        return Some(WorkingCopy::Svn);
+    }
+    None
+}
+
+/// The `repository.query` constraint for `dir`, mirroring
+/// `getRepositoryQuery()`: configured callsign first, then the VCS UUID
+/// (Subversion only), then the remote URI.
+fn repository_query(dir: &Path) -> Result<Option<serde_json::Value>, String> {
+    let user_file = config::arcrc_path();
+    let sources = get_config::load_sources(dir, user_file.as_deref())?;
+    if configured_callsign(&sources).is_some() {
+        return Ok(select_repository_query(&sources, None, None));
+    }
+    let Some(vcs) = detect_working_copy(dir) else {
+        return Ok(None);
+    };
+    let (uuid, remote) = match vcs {
+        WorkingCopy::Git => (None, git::remote_uri(dir)?),
+        WorkingCopy::Hg => (hg::get_repository_uuid(), hg::get_remote_uri(dir)?),
+        WorkingCopy::Svn => (svn::get_repository_uuid(dir)?, svn::get_remote_uri(dir)?),
+    };
+    Ok(select_repository_query(
+        &sources,
+        uuid.as_deref(),
+        remote.as_deref(),
+    ))
+}
+
+/// PHID of the Phabricator repository for `dir`, or `None` when no
+/// repository can be identified, mirroring `getRepositoryPHID()`: only a
+/// unique `repository.query` match counts, and an outdated server
+/// (`ERR-CONDUIT-CALL`) means untracked.
+pub fn resolve_repository_phid(
+    client: &conduit::Client,
+    dir: &Path,
+) -> Result<Option<String>, String> {
+    let Some(query) = repository_query(dir)? else {
+        return Ok(None);
+    };
+    let results = match client.call("repository.query", &query) {
+        Ok(results) => results,
+        Err(conduit::Error::Api { code, .. }) if code == "ERR-CONDUIT-CALL" => {
+            return Ok(None);
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    Ok(select_unique_phid(&results))
+}
+
+/// The identified repository PHID: only a unique match counts, mirroring
+/// `loadRepositoryInformation()`.
+fn select_unique_phid(results: &serde_json::Value) -> Option<String> {
+    let matches = results.as_array()?;
+    if matches.len() != 1 {
+        return None;
+    }
+    matches[0]
+        .get("phid")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+fn confirm_interactive(query: &str) -> Result<bool, String> {
+    prompt::console_confirm(&mut std::io::stdin().lock(), query, false)
 }
 
 /// Entry point: `argv` excludes the subcommand name.
 pub fn run(argv: &[String]) -> ExitCode {
-    let options = match parse_args(argv) {
+    let mut options = match parse_args(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
             print!("{USAGE}");
@@ -508,7 +654,17 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match execute(&client, &options, &confirm_interactive) {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    if options.finalize {
+        match resolve_repository_phid(&client, &cwd) {
+            Ok(phid) => options.repository_phid = phid,
+            Err(msg) => {
+                eprintln!("arc-rs {NAME}: {msg}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    match execute_in(&cwd, &client, &options, &confirm_interactive) {
         Ok(report) => {
             print!("{}", report.stdout);
             eprint!("{}", report.stderr);

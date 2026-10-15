@@ -4,42 +4,44 @@ fn args(list: &[&str]) -> Vec<String> {
     list.iter().map(|item| (*item).to_string()).collect()
 }
 
-fn options(all: bool, json: bool, conduit_uri: Option<&str>) -> Options {
-    Options {
-        all,
-        json,
-        conduit_uri: conduit_uri.map(str::to_string),
-    }
-}
-
 #[test]
 fn parses_defaults() {
     assert_eq!(
         parse_options(&args(&[])),
-        Ok(Some(options(false, false, None)))
+        Ok(Some(Options {
+            all: false,
+            json: false,
+            conduit_uri: None,
+        }))
     );
 }
 
 #[test]
-fn parses_all_and_json() {
+fn parses_all_json_and_conduit_uri() {
     assert_eq!(
         parse_options(&args(&["--all", "--json"])),
-        Ok(Some(options(true, true, None)))
-    );
-}
-
-#[test]
-fn parses_conduit_uri() {
-    assert_eq!(
-        parse_options(&args(&["--conduit-uri", "http://x/"])),
-        Ok(Some(options(false, false, Some("http://x/"))))
+        Ok(Some(Options {
+            all: true,
+            json: true,
+            conduit_uri: None,
+        }))
     );
     assert_eq!(
-        parse_options(&args(&["--conduit-uri=http://x/"])),
-        Ok(Some(options(false, false, Some("http://x/"))))
+        parse_options(&args(&["--conduit-uri", "https://host/api/"])),
+        Ok(Some(Options {
+            all: false,
+            json: false,
+            conduit_uri: Some("https://host/api/".to_string()),
+        }))
     );
-    assert!(parse_options(&args(&["--conduit-uri"])).is_err());
-    assert!(parse_options(&args(&["--conduit-uri="])).is_err());
+    assert_eq!(
+        parse_options(&args(&["--conduit-uri=https://host/api/"])),
+        Ok(Some(Options {
+            all: false,
+            json: false,
+            conduit_uri: Some("https://host/api/".to_string()),
+        }))
+    );
 }
 
 #[test]
@@ -57,6 +59,8 @@ fn rejects_bad_arguments() {
     assert!(err.contains("unexpected argument"), "unexpected: {err}");
     let err = parse_options(&args(&["--"])).unwrap_err();
     assert!(err.contains("unexpected argument"), "unexpected: {err}");
+    let err = parse_options(&args(&["--conduit-uri"])).unwrap_err();
+    assert!(err.contains("requires a value"), "unexpected: {err}");
 }
 
 #[test]
@@ -77,7 +81,6 @@ fn parses_ref_line_with_upstream() {
             upstream: Some("origin/feature".to_string()),
             track: "[ahead 2]".to_string(),
             remote: false,
-            revisions: Vec::new(),
         }
     );
 }
@@ -115,83 +118,6 @@ fn rejects_malformed_ref_lines() {
     assert!(parse_ref_line("a\x1fb\x1fc\x1fd\x1fe\x1fextra", None, false).is_err());
 }
 
-fn plain(name: &str) -> Branch {
-    Branch {
-        name: name.to_string(),
-        current: false,
-        hash: "abc1234".to_string(),
-        subject: "subject".to_string(),
-        upstream: None,
-        track: String::new(),
-        remote: false,
-        revisions: Vec::new(),
-    }
-}
-
-fn annotated(name: &str) -> Branch {
-    let mut branch = plain(name);
-    branch.revisions = vec![amend::AnnotatedRevision {
-        monogram: "D123".to_string(),
-        status: "Accepted".to_string(),
-        title: "Title".to_string(),
-    }];
-    branch
-}
-
-#[test]
-fn formats_text_with_marker_and_tracking() {
-    let branches = vec![
-        Branch {
-            name: "main".to_string(),
-            current: true,
-            hash: "abc1234".to_string(),
-            subject: "first".to_string(),
-            upstream: None,
-            track: String::new(),
-            remote: false,
-            revisions: Vec::new(),
-        },
-        Branch {
-            name: "feature".to_string(),
-            current: false,
-            hash: "def5678".to_string(),
-            subject: "add thing".to_string(),
-            upstream: Some("origin/feature".to_string()),
-            track: "[ahead 2]".to_string(),
-            remote: false,
-            revisions: Vec::new(),
-        },
-        Branch {
-            name: "origin/main".to_string(),
-            current: false,
-            hash: "abc1234".to_string(),
-            subject: "first".to_string(),
-            upstream: None,
-            track: String::new(),
-            remote: true,
-            revisions: Vec::new(),
-        },
-    ];
-    let text = format_text(&branches);
-    let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines.len(), 3);
-    assert!(lines[0].starts_with("* main abc1234 first"), "got: {text}");
-    assert!(
-        lines[1].starts_with("  feature def5678 add thing -> origin/feature [ahead 2]"),
-        "got: {text}"
-    );
-    assert!(lines[2].ends_with("(remote)"), "got: {text}");
-}
-
-#[test]
-fn formats_text_with_annotations() {
-    let text = format_text(&[annotated("feature")]);
-    assert!(
-        text.contains("feature abc1234 subject [D123 Accepted]"),
-        "got: {text}"
-    );
-}
-
 #[test]
 fn formats_json_objects() {
     let branches = vec![Branch {
@@ -202,7 +128,6 @@ fn formats_json_objects() {
         upstream: None,
         track: String::new(),
         remote: false,
-        revisions: Vec::new(),
     }];
     let value = format_json(&branches);
     assert_eq!(
@@ -215,28 +140,14 @@ fn formats_json_objects() {
             "upstream": null,
             "track": "",
             "remote": false,
-            "revisions": [],
         }])
     );
 }
 
 #[test]
-fn formats_json_with_annotations() {
-    let value = format_json(&[annotated("feature")]);
-    assert_eq!(
-        value[0]["revisions"],
-        serde_json::json!([{
-            "monogram": "D123",
-            "status": "Accepted",
-            "title": "Title",
-        }])
-    );
-}
-
-#[test]
-fn usage_covers_options_and_limits() {
+fn usage_covers_options() {
     let text = usage();
     assert!(text.contains("usage: arc-rs branches"));
     assert!(text.contains("--all") && text.contains("--json"));
-    assert!(text.contains("review-status"));
+    assert!(text.contains("--conduit-uri"));
 }

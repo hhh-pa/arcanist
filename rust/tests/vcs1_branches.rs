@@ -6,6 +6,49 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use arc_rs::branches;
+use arc_rs::conduit::Client;
+
+/// Scripted mock conduit server: serves each canned body in order,
+/// capturing (request line, body) per request.
+fn serve_script(
+    script: Vec<&'static str>,
+) -> (String, std::sync::mpsc::Receiver<(String, String)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for canned in script {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8(head).unwrap();
+            let len: usize = head
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("Content-Length: ")
+                        .or_else(|| line.strip_prefix("content-length: "))
+                        .map(|v| v.trim().parse().unwrap())
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).unwrap();
+            let request_line = head.lines().next().unwrap_or("").to_string();
+            tx.send((request_line, String::from_utf8(body).unwrap()))
+                .unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                canned.len(),
+                canned
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    (base, rx)
+}
 
 /// Unique scratch dir for one test; removed on drop (best effort).
 struct Fixture {
@@ -123,11 +166,14 @@ fn lists_branches_with_current_marker() {
     assert_eq!(branches[1].name, "feature");
     assert!(!branches[1].current);
 
-    let out = branches::execute(repo.path(), &args(&[])).unwrap();
+    // Fixed width: message truncation depends on the terminal.
+    let out = branches::execute_with_client(repo.path(), &args(&[]), Some(150), None).unwrap();
+    // Both markers point at the same commit, so one tree view holds two
+    // marker items: the plain marker first, the active one second.
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(lines.len(), 2, "unexpected: {out}");
-    assert!(lines[0].starts_with("* master"), "unexpected: {out}");
-    assert!(lines[1].starts_with("  feature"), "unexpected: {out}");
+    assert!(lines[0].starts_with("• feature"), "unexpected: {out}");
+    assert!(lines[1].starts_with("└  *  master"), "unexpected: {out}");
     let short = repo.git(&["rev-parse", "--short", "HEAD"]);
     assert!(out.contains(&short), "missing hash: {out}");
     assert!(out.contains("initial commit"), "missing subject: {out}");
@@ -141,19 +187,22 @@ fn detached_head_has_no_current_branch() {
     let branches = branches::list(repo.path(), false).unwrap();
     assert_eq!(branches.len(), 1);
     assert!(!branches[0].current);
-    let out = branches::execute(repo.path(), &args(&[])).unwrap();
-    assert!(
-        out.lines().all(|line| !line.starts_with('*')),
-        "unexpected: {out}"
-    );
+    let out = branches::execute_with_client(repo.path(), &args(&[]), Some(150), None).unwrap();
+    assert!(!out.contains(" *  "), "unexpected: {out}");
+    assert!(out.contains("• master"), "unexpected: {out}");
 }
 
 #[test]
-fn empty_repo_lists_nothing() {
+fn empty_repo_matches_php_partition_error() {
     let repo = Fixture::named("empty");
     repo.git(&["init", "-q", "-b", "master", "."]);
     assert_eq!(branches::list(repo.path(), false).unwrap(), Vec::new());
-    assert_eq!(branches::execute(repo.path(), &args(&[])).unwrap(), "");
+    // No markers means no heads; PHP throws out of the graph query.
+    let err = branches::execute(repo.path(), &args(&[])).unwrap_err();
+    assert!(
+        err.contains("Need head hashes or exact hashes!"),
+        "unexpected: {err}"
+    );
     let out = branches::execute(repo.path(), &args(&["--json"])).unwrap();
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&out).unwrap(),
@@ -202,8 +251,13 @@ fn upstream_tracking_is_shown() {
     assert_eq!(master.upstream.as_deref(), Some("frozen"));
     assert_eq!(master.track, "[ahead 1]");
 
-    let out = branches::execute(repo.path(), &args(&[])).unwrap();
-    assert!(out.contains("-> frozen [ahead 1]"), "unexpected: {out}");
+    // The tree grid shows no upstream tracking (matching `arc`); the
+    // tracking data stays available through `list()`.
+    let out = branches::execute_with_client(repo.path(), &args(&[]), Some(150), None).unwrap();
+    assert!(out.contains("• frozen"), "unexpected: {out}");
+    assert!(out.contains("└  *  master"), "unexpected: {out}");
+    assert!(out.contains("second commit"), "unexpected: {out}");
+    assert!(!out.contains("[ahead 1]"), "unexpected: {out}");
 }
 
 #[test]
@@ -213,15 +267,26 @@ fn all_includes_remote_tracking_branches() {
     repo.git(&["remote", "add", "origin", &bare.dir.to_string_lossy()]);
     repo.git(&["push", "-q", "origin", "master"]);
 
-    let local_only = branches::execute(repo.path(), &args(&[])).unwrap();
-    assert!(
-        !local_only.contains("origin/master"),
+    let local_only =
+        branches::execute_with_client(repo.path(), &args(&[]), Some(150), None).unwrap();
+    assert_eq!(
+        local_only
+            .lines()
+            .filter(|line| line.contains("master"))
+            .count(),
+        1,
         "unexpected: {local_only}"
     );
 
-    let all = branches::execute(repo.path(), &args(&["--all"])).unwrap();
-    assert!(all.contains("origin/master"), "unexpected: {all}");
-    assert!(all.contains("(remote)"), "unexpected: {all}");
+    // Remote-tracking markers render under their branch name, so `--all`
+    // adds a second `master` item for `origin/master`.
+    let all =
+        branches::execute_with_client(repo.path(), &args(&["--all"]), Some(150), None).unwrap();
+    assert_eq!(
+        all.lines().filter(|line| line.contains("master")).count(),
+        2,
+        "unexpected: {all}"
+    );
 
     let branches = branches::list(repo.path(), true).unwrap();
     let remote = branches.iter().find(|b| b.name == "origin/master").unwrap();
@@ -254,254 +319,65 @@ fn svn_working_copy_reports_no_branch_support() {
     assert!(err.contains("\"svn\""), "unexpected: {err}");
 }
 
-mod common;
-
-use common::{HomeGuard, with_owned_home};
-
-/// One canned route: `(method_substring, result_json)`.
-fn route(method: &str, canned: &str) -> (String, String) {
-    (method.to_string(), canned.to_string())
-}
-
-/// Serve canned Conduit responses, returning the base URI.
-fn serve_routes(routes: Vec<(String, String)>) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let base = format!("http://{}/", listener.local_addr().unwrap());
-    std::thread::spawn(move || {
-        let mut pending = routes;
-        while !pending.is_empty() {
-            let Ok((mut stream, _)) = listener.accept() else {
-                break;
-            };
-            let mut head = Vec::new();
-            let mut byte = [0u8; 1];
-            while !head.ends_with(b"\r\n\r\n") {
-                if stream.read_exact(&mut byte).is_err() {
-                    break;
-                }
-                head.push(byte[0]);
-            }
-            let head = String::from_utf8_lossy(&head).into_owned();
-            let len: usize = head
-                .lines()
-                .find_map(|line| {
-                    line.strip_prefix("Content-Length: ")
-                        .or_else(|| line.strip_prefix("content-length: "))
-                        .and_then(|v| v.trim().parse().ok())
-                })
-                .unwrap_or(0);
-            let mut body = vec![0u8; len];
-            if !body.is_empty() {
-                let _ = stream.read_exact(&mut body);
-            }
-            let request_line = head.lines().next().unwrap_or("").to_string();
-            let position = pending
-                .iter()
-                .position(|(method, _)| request_line.contains(method))
-                .unwrap_or(0);
-            let (_, canned) = pending.remove(position);
-            let envelope =
-                format!("{{\"error_code\":null,\"error_info\":null,\"result\":{canned}}}");
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                envelope.len(),
-                envelope
-            );
-            let _ = stream.write_all(response.as_bytes());
-        }
-    });
-    base
-}
-
-/// Write an `.arcrc` for `base` under a fresh home dir, and install the
-/// home override. Returns the override guard.
-fn arcrc_for(base: &str, name: &str) -> HomeGuard {
-    let dir = std::env::temp_dir().join(format!(
-        "arc-rs-vcs1-branches-home-{name}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::remove_dir_all(&dir).ok();
-    std::fs::create_dir_all(&dir).unwrap();
-    let uri = base.trim_end_matches('/');
-    let doc = serde_json::json!({
-        "hosts": {
-            format!("{uri}/api/"): {"token": "vcs1-branches-token"},
-        },
-    });
-    std::fs::write(dir.join(".arcrc"), serde_json::to_string(&doc).unwrap()).unwrap();
-    with_owned_home(dir)
-}
-
-/// Minimal fake-`hg` working copy with the listing fake installed.
-struct HgRepo {
-    dir: PathBuf,
-}
-
-impl HgRepo {
-    fn named(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "arc-rs-vcs1-branches-hg-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(dir.join(".hg")).unwrap();
-        let name = if cfg!(windows) {
-            "fakehg_marks.bat"
-        } else {
-            "fakehg_marks.sh"
-        };
-        let from = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests")
-            .join("fixtures")
-            .join("vcs")
-            .join(name);
-        let to = dir.join(name);
-        std::fs::copy(from, &to).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&to).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&to, perms).unwrap();
-        }
-        Self { dir }
-    }
-
-    fn write(&self, name: &str, body: &[u8]) {
-        std::fs::write(self.dir.join(name), body).unwrap();
-    }
-
-    fn backend(&self) -> arc_rs::hg::HgCommand {
-        let name = if cfg!(windows) {
-            "fakehg_marks.bat"
-        } else {
-            "fakehg_marks.sh"
-        };
-        let script = self.dir.join(name);
-        #[cfg(windows)]
-        {
-            arc_rs::hg::HgCommand::custom("cmd", &["/C", &script.to_string_lossy()])
-        }
-        #[cfg(not(windows))]
-        {
-            arc_rs::hg::HgCommand::custom(&script.to_string_lossy(), &[])
-        }
-    }
-}
-
-impl Drop for HgRepo {
-    fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.dir).ok();
-    }
-}
-
 #[test]
-fn lists_hg_branches_via_fake() {
-    let repo = HgRepo::named("list");
-    repo.write(
-        ".fakehg-branches",
-        b"default 15101:a21ccf4412d5\nmy feature 14900:deadbeef1234 (inactive)\n",
-    );
-    repo.write(".fakehg-branch", b"my feature\n");
-    repo.write(".fakehg-msg", b"Head subject\n\nBody.\n");
-    let out = branches::execute_with(&repo.dir, &args(&[]), &repo.backend()).unwrap();
-    let lines: Vec<&str> = out.lines().collect();
-    assert_eq!(lines.len(), 2, "unexpected: {out}");
-    // Current branch first, inactive suffix parsed away.
-    assert!(
-        lines[0].starts_with("* my feature deadbeef1234 Head subject"),
-        "unexpected: {out}"
-    );
-    assert!(
-        lines[1].starts_with("  default a21ccf4412d5 Head subject"),
-        "unexpected: {out}"
-    );
-}
-
-#[test]
-fn annotates_git_branches_with_conduit() {
-    let repo = Fixture::named("annotate");
-    repo.git(&["init", "-q", "-b", "master", "."]);
-    repo.git(&["config", "user.email", "vcs1-test@example.test"]);
-    repo.git(&["config", "user.name", "VCS1 Test"]);
-    repo.git(&["config", "commit.gpgsign", "false"]);
-    repo.write("file.txt", "base\n");
-    repo.git(&["add", "file.txt"]);
-    repo.git(&[
-        "commit",
-        "-q",
-        "-m",
-        "base",
-        "-m",
-        "Differential Revision: D11",
-    ]);
-    repo.git(&["branch", "feature"]);
-    repo.git(&["checkout", "-q", "feature"]);
-    repo.write("feat.txt", "feat\n");
-    repo.git(&["add", "feat.txt"]);
-    repo.git(&[
-        "commit",
-        "-q",
-        "-m",
-        "feat",
-        "-m",
-        "Differential Revision: D22",
-    ]);
-
-    let rows = r#"[{"id":22,"title":"Twenty","status":2,"statusName":"Accepted","authorPHID":"PHID-USER-1"},{"id":11,"title":"Eleven","status":1,"statusName":"Needs Review","authorPHID":"PHID-USER-1"}]"#;
-    // One query per `execute` call below.
-    let base = serve_routes(vec![
-        route("differential.query", rows),
-        route("differential.query", rows),
-    ]);
-    let _home = arcrc_for(&base, "annotate-home");
-    let out = branches::execute(repo.path(), &args(&["--conduit-uri", &base])).unwrap();
-    assert!(
-        out.contains("feature ") && out.contains("[D22 Accepted]"),
-        "unexpected: {out}"
-    );
-    assert!(
-        out.contains("master ") && out.contains("[D11 Needs Review]"),
-        "unexpected: {out}"
-    );
-
-    let out = branches::execute(repo.path(), &args(&["--conduit-uri", &base, "--json"])).unwrap();
-    let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
-    let feature = doc
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|entry| entry["name"] == serde_json::json!("feature"))
+fn mock_server_answers_direct_calls() {
+    let (base, seen) = serve_script(vec![r#"{"result": [], "error_code": null}"#]);
+    let client = Client::new(&base, "test-token").unwrap();
+    let result = client
+        .call(
+            "differential.query",
+            &serde_json::json!({"commitHashes": []}),
+        )
         .unwrap();
-    assert_eq!(
-        feature["revisions"][0]["monogram"],
-        serde_json::json!("D22")
-    );
-}
-
-#[test]
-fn annotates_hg_branches_with_conduit() {
-    let repo = HgRepo::named("annotate");
-    repo.write(".fakehg-branches", b"default 15101:a21ccf4412d5\n");
-    repo.write(".fakehg-branch", b"default\n");
-    repo.write(".fakehg-msg", b"work\n\nDifferential Revision: D40\n");
-    let base = serve_routes(vec![route(
-        "differential.query",
-        r#"[{"id":40,"title":"Forty","status":2,"statusName":"Accepted","authorPHID":"PHID-USER-1"}]"#,
-    )]);
-    let _home = arcrc_for(&base, "hg-annotate-home");
-    let out = branches::execute_with(&repo.dir, &args(&["--conduit-uri", &base]), &repo.backend())
+    assert_eq!(result, serde_json::json!([]));
+    let (request_line, _) = seen
+        .recv_timeout(std::time::Duration::from_secs(10))
         .unwrap();
     assert!(
-        out.contains("* default a21ccf4412d5 ") && out.contains("[D40 Accepted]"),
-        "unexpected: {out}"
+        request_line.contains("differential.query"),
+        "{request_line}"
     );
+}
+
+#[test]
+fn conduit_revisions_annotate_the_grid() {
+    let repo = Fixture::init_repo("annotated");
+    repo.git(&["checkout", "-qb", "feature"]);
+    repo.commit_file("extra.txt", "extra\n", "second commit");
+    let head = repo.git(&["rev-parse", "HEAD"]);
+
+    let row = format!(
+        r#"{{"id": 1, "phid": "PHID-DREV-1", "status": "0", "statusName": "Needs Review", "title": "Add the thing", "uri": "/D1", "authorPHID": "PHID-USER-1", "dateCreated": 1, "hashes": [["gtcm", "{head}"]]}}"#
+    );
+    let body: &'static str =
+        Box::leak(format!(r#"{{"result": [{row}], "error_code": null}}"#).into_boxed_str());
+    let (base, seen) = serve_script(vec![body]);
+    let client = Client::new(&base, "test-token").unwrap();
+
+    // Wide terminal: full status display names.
+    let out =
+        branches::execute_with_client(repo.path(), &args(&[]), Some(150), Some(&client)).unwrap();
+    assert!(out.contains("D1"), "unexpected: {out}");
+    assert!(out.contains("Needs Review"), "unexpected: {out}");
+    // The waypoint color splits the commits into two sets and two rows.
+    assert!(out.contains("• master"), "unexpected: {out}");
+    assert!(out.contains("┗━━"), "unexpected: {out}");
+    // Merged revisions replace the commit summary in messages.
+    assert!(out.contains("Add the thing"), "unexpected: {out}");
+    assert!(!out.contains("second commit"), "unexpected: {out}");
+
+    let (request_line, params) = seen
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    assert!(
+        request_line.starts_with("POST /api/differential.query "),
+        "{request_line}"
+    );
+    assert!(params.contains("commitHashes"), "{params}");
+    assert!(params.contains(&head), "{params}");
+
+    // Without a client the same grid renders with blank annotation.
+    let plain = branches::execute_with_client(repo.path(), &args(&[]), Some(150), None).unwrap();
+    assert!(!plain.contains("D1"), "unexpected: {plain}");
+    assert!(plain.contains("second commit"), "unexpected: {plain}");
 }

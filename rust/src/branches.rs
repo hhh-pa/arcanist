@@ -2,22 +2,18 @@
 //!
 //! PHP reference: `src/workflow/ArcanistBranchesWorkflow.php` (through
 //! `src/workflow/ArcanistMarkersWorkflow.php`), which lists branch markers
-//! annotated with Differential review status. This port lists local git
-//! branches — current marker, short hash, subject, upstream tracking —
-//! Mercurial branches under hg, and annotates heads with Differential
-//! review status via `--conduit-uri`. `--all` adds remote-tracking
-//! branches, `--json` emits branch objects.
+//! annotated with Differential review status. The text output renders the
+//! full markers engine (commit graph, partitions, sets, tree grid); see
+//! `markers` for the shared implementation.
 //!
-//! Divergence: PHP lays out a commit-graph grid through the `arc-hg`
-//! extension; this lists plain `git for-each-ref` / `hg branches` rows,
-//! and annotates each head from its commit message in one batched
-//! `differential.query`.
+//! Extensions over `arc branches` (which takes no arguments): `--all`
+//! heads remote-tracking branches too, `--json` emits branch objects, and
+//! `--conduit-uri` overrides conduit discovery.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::{amend, config, git, hg, svn};
+use crate::{config, git, grid, markers};
 
 pub const NAME: &str = "branches";
 
@@ -28,15 +24,14 @@ fn usage() -> String {
          Show an enhanced view of branches in the working copy.\n\
          \n\
          Options:\n\
-         \x20 --all            include remote-tracking branches\n\
-         \x20 --json           emit a JSON array of branch objects\n\
-         \x20 --conduit-uri URI annotate branches with Differential\n\
-         \x20                   review-status ([D123 Accepted])\n\
-         \x20 -h, --help       show this help\n"
+         \x20 --all              include remote-tracking branches\n\
+         \x20 --json             emit a JSON array of branch objects\n\
+         \x20 --conduit-uri URI  conduit server (or ARC_CONDUIT_URI)\n\
+         \x20 -h, --help         show this help\n"
     )
 }
 
-/// One listed branch.
+/// One listed branch (the `--json` shape).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Branch {
     pub name: String,
@@ -46,8 +41,6 @@ pub struct Branch {
     pub upstream: Option<String>,
     pub track: String,
     pub remote: bool,
-    /// Review-status annotations, filled by [`annotate`] (`--conduit-uri`).
-    pub revisions: Vec<amend::AnnotatedRevision>,
 }
 
 /// Parsed `branches` options.
@@ -73,16 +66,10 @@ pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
             json = true;
         } else if arg == "--conduit-uri" {
             let Some(value) = iter.next() else {
-                return Err("--conduit-uri requires a non-empty value".to_string());
+                return Err("--conduit-uri requires a value".to_string());
             };
-            if value.is_empty() {
-                return Err("--conduit-uri requires a non-empty value".to_string());
-            }
             conduit_uri = Some(value.clone());
         } else if let Some(value) = arg.strip_prefix("--conduit-uri=") {
-            if value.is_empty() {
-                return Err("--conduit-uri requires a non-empty value".to_string());
-            }
             conduit_uri = Some(value.to_string());
         } else if arg == "-h" || arg == "--help" {
             return Ok(None);
@@ -139,7 +126,6 @@ fn parse_ref_line(line: &str, current: Option<&str>, remote: bool) -> Result<Bra
         },
         track: track.to_string(),
         remote,
-        revisions: Vec::new(),
     })
 }
 
@@ -158,9 +144,18 @@ fn refs_in(
         .collect()
 }
 
-/// Sort branches: current first, then locals before remotes, then
-/// case-insensitive name order.
-fn sort_branches(branches: &mut [Branch]) {
+/// List branches under `dir`: local branches, plus remote-tracking ones
+/// when `all` is set. The current branch sorts first, then locals before
+/// remotes, then case-insensitive name order.
+pub fn list(dir: &Path, all: bool) -> Result<Vec<Branch>, String> {
+    if !git::is_inside_work_tree(dir) {
+        return Err("not inside a git repository".to_string());
+    }
+    let current = current_branch(dir);
+    let mut branches = refs_in(dir, "refs/heads", current.as_deref(), false)?;
+    if all {
+        branches.extend(refs_in(dir, "refs/remotes", current.as_deref(), true)?);
+    }
     branches.sort_by(|a, b| {
         (!a.current, a.remote, a.name.to_lowercase(), &a.name).cmp(&(
             !b.current,
@@ -169,186 +164,7 @@ fn sort_branches(branches: &mut [Branch]) {
             &b.name,
         ))
     });
-}
-
-/// List git branches under `dir`: local branches, plus remote-tracking
-/// ones when `all` is set.
-fn list_git(dir: &Path, all: bool) -> Result<Vec<Branch>, String> {
-    let current = current_branch(dir);
-    let mut branches = refs_in(dir, "refs/heads", current.as_deref(), false)?;
-    if all {
-        branches.extend(refs_in(dir, "refs/remotes", current.as_deref(), true)?);
-    }
-    sort_branches(&mut branches);
     Ok(branches)
-}
-
-/// One Mercurial branch row: subject from the head commit.
-fn hg_branch(
-    dir: &Path,
-    hg: &hg::HgCommand,
-    name: &str,
-    head: &hg::HgBranch,
-    current: &str,
-) -> Result<Branch, String> {
-    let subject = hg::get_commit_summary_with(dir, hg, &head.rev)?;
-    Ok(Branch {
-        name: name.to_string(),
-        current: name == current,
-        hash: head.rev.clone(),
-        subject,
-        upstream: None,
-        track: String::new(),
-        remote: false,
-        revisions: Vec::new(),
-    })
-}
-
-/// List Mercurial branches under `dir` (`hg branches`).
-fn list_hg(dir: &Path, hg: &hg::HgCommand) -> Result<Vec<Branch>, String> {
-    let output = hg::get_branches_with(dir, hg)?;
-    let heads = hg::parse_mercurial_branches(&output)?;
-    let current = hg::get_branch_name_with(dir, hg)?;
-    let mut branches = Vec::with_capacity(heads.len());
-    for (name, head) in &heads {
-        branches.push(hg_branch(dir, hg, name, head, &current)?);
-    }
-    sort_branches(&mut branches);
-    Ok(branches)
-}
-
-/// List branches under `dir` through `hg` for Mercurial working copies:
-/// local branches, plus remote-tracking ones when `all` is set (git).
-pub fn list_with(dir: &Path, all: bool, hg: &hg::HgCommand) -> Result<Vec<Branch>, String> {
-    if git::is_inside_work_tree(dir) {
-        return list_git(dir, all);
-    }
-    if hg::find_root(dir).is_some() {
-        return list_hg(dir, hg);
-    }
-    if svn::find_metadata_path(dir).is_some() {
-        return Err(
-            "The version control system (\"svn\") in the current working copy does not support branches."
-                .to_string(),
-        );
-    }
-    Err("not inside a git or Mercurial working copy".to_string())
-}
-
-/// List branches under `dir`: local branches, plus remote-tracking ones
-/// when `all` is set.
-pub fn list(dir: &Path, all: bool) -> Result<Vec<Branch>, String> {
-    list_with(dir, all, &hg::HgCommand::system())
-}
-
-/// Attach annotations from per-head ids plus the batched lookup map.
-fn attach_annotations(
-    branches: &mut [Branch],
-    head_ids: &[Option<u64>],
-    annotations: &BTreeMap<String, amend::AnnotatedRevision>,
-) {
-    for (branch, id) in branches.iter_mut().zip(head_ids.iter()) {
-        if let Some(id) = id
-            && let Some(note) = annotations.get(&id.to_string())
-        {
-            branch.revisions.push(note.clone());
-        }
-    }
-}
-
-/// Annotate git branches with their head revisions' review status: one
-/// `git log` per head plus one batched `differential.query`.
-pub fn annotate_git(
-    dir: &Path,
-    branches: &mut [Branch],
-    client: &crate::conduit::Client,
-) -> Result<(), String> {
-    let mut messages = Vec::with_capacity(branches.len());
-    for branch in branches.iter() {
-        messages.push(git::commit_message(dir, &branch.name)?);
-    }
-    let (head_ids, annotations) = amend::annotations_for_messages(client, &messages)?;
-    attach_annotations(branches, &head_ids, &annotations);
-    Ok(())
-}
-
-/// Annotate Mercurial branches with their head revisions' review status:
-/// one `hg log` per head plus one batched `differential.query`.
-pub fn annotate_hg(
-    dir: &Path,
-    hg: &hg::HgCommand,
-    branches: &mut [Branch],
-    client: &crate::conduit::Client,
-) -> Result<(), String> {
-    let mut messages = Vec::with_capacity(branches.len());
-    for branch in branches.iter() {
-        messages.push(hg::get_commit_message_with(dir, hg, &branch.name)?);
-    }
-    let (head_ids, annotations) = amend::annotations_for_messages(client, &messages)?;
-    attach_annotations(branches, &head_ids, &annotations);
-    Ok(())
-}
-
-/// Annotate branches through the VCS they were listed from.
-fn annotate(
-    dir: &Path,
-    hg: &hg::HgCommand,
-    branches: &mut [Branch],
-    client: &crate::conduit::Client,
-) -> Result<(), String> {
-    if git::is_inside_work_tree(dir) {
-        annotate_git(dir, branches, client)
-    } else {
-        annotate_hg(dir, hg, branches, client)
-    }
-}
-
-/// Render one `[D123 Accepted]` annotation suffix per revision.
-fn annotation_suffix(branch: &Branch) -> String {
-    let mut suffix = String::new();
-    for note in &branch.revisions {
-        suffix.push_str(&format!(" [{} {}]", note.monogram, note.status));
-    }
-    suffix
-}
-
-/// Render branches as text, one line per branch.
-#[must_use]
-pub fn format_text(branches: &[Branch]) -> String {
-    let mut out = String::new();
-    for branch in branches {
-        let marker = if branch.current { '*' } else { ' ' };
-        out.push_str(&format!(
-            "{marker} {} {} {}",
-            branch.name, branch.hash, branch.subject
-        ));
-        if branch.remote {
-            out.push_str(" (remote)");
-        } else if let Some(upstream) = &branch.upstream {
-            out.push_str(&format!(" -> {upstream}"));
-            if !branch.track.is_empty() {
-                out.push_str(&format!(" {}", branch.track));
-            }
-        }
-        out.push_str(&annotation_suffix(branch));
-        out.push('\n');
-    }
-    out
-}
-
-/// Render one branch's annotations as JSON objects.
-fn revisions_json(branch: &Branch) -> Vec<serde_json::Value> {
-    branch
-        .revisions
-        .iter()
-        .map(|note| {
-            serde_json::json!({
-                "monogram": note.monogram,
-                "status": note.status,
-                "title": note.title,
-            })
-        })
-        .collect()
 }
 
 /// Render branches as a JSON array of branch objects.
@@ -366,39 +182,100 @@ pub fn format_json(branches: &[Branch]) -> serde_json::Value {
                     "upstream": branch.upstream,
                     "track": branch.track,
                     "remote": branch.remote,
-                    "revisions": revisions_json(branch),
                 })
             })
             .collect(),
     )
 }
 
-/// Run the workflow rooted at `dir` through `hg` for Mercurial working
-/// copies (test seam).
-pub fn execute_with(dir: &Path, argv: &[String], hg: &hg::HgCommand) -> Result<String, String> {
-    let options = match parse_options(argv) {
-        Ok(Some(options)) => options,
-        Ok(None) => return Ok(usage()),
-        Err(message) => return Err(format!("{message}\n\n{}", usage())),
-    };
-    let mut branches = list_with(dir, options.all, hg)?;
-    if let Some(uri) = options.conduit_uri.as_deref() {
-        let client = config::client_for(Some(uri))?;
-        annotate(dir, hg, &mut branches, &client)?;
-    }
-    if options.json {
-        let mut text = serde_json::to_string_pretty(&format_json(&branches))
-            .map_err(|e| format!("failed to encode JSON: {e}"))?;
-        text.push('\n');
-        Ok(text)
+fn detect_vcs(dir: &Path) -> Option<&'static str> {
+    if git::is_inside_work_tree(dir) {
+        Some("git")
+    } else if markers::find_hg_root(dir).is_some() {
+        Some("hg")
+    } else if markers::find_svn_root(dir).is_some() {
+        Some("svn")
     } else {
-        Ok(format_text(&branches))
+        None
     }
 }
 
 /// Run the workflow rooted at `dir`, returning stdout text or an error message.
 pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
-    execute_with(dir, argv, &hg::HgCommand::system())
+    let options = match parse_options(argv) {
+        Ok(Some(options)) => options,
+        Ok(None) => return Ok(usage()),
+        Err(message) => return Err(format!("{message}\n\n{}", usage())),
+    };
+    let owned_client = config::client_for(options.conduit_uri.as_deref()).ok();
+    execute_core(dir, &options, grid::terminal_width(), owned_client.as_ref())
+}
+
+/// Run the workflow with an explicit terminal width and conduit client.
+///
+/// Test seam: production callers use [`execute`].
+pub fn execute_with_client(
+    dir: &Path,
+    argv: &[String],
+    terminal: Option<usize>,
+    client: Option<&crate::conduit::Client>,
+) -> Result<String, String> {
+    let options = match parse_options(argv) {
+        Ok(Some(options)) => options,
+        Ok(None) => return Ok(usage()),
+        Err(message) => return Err(format!("{message}\n\n{}", usage())),
+    };
+    execute_core(dir, &options, terminal, client)
+}
+
+fn execute_core(
+    dir: &Path,
+    options: &Options,
+    terminal: Option<usize>,
+    client: Option<&crate::conduit::Client>,
+) -> Result<String, String> {
+    if options.json {
+        return match detect_vcs(dir) {
+            Some("hg") => {
+                let found = markers::list(dir, markers::MARKER_TYPE_BRANCH)?;
+                let branches: Vec<Branch> = found
+                    .iter()
+                    .map(|marker| Branch {
+                        name: marker.name.clone(),
+                        current: marker.active,
+                        hash: markers::short_hash(&marker.hash).to_string(),
+                        subject: marker.subject.clone(),
+                        upstream: None,
+                        track: String::new(),
+                        remote: false,
+                    })
+                    .collect();
+                let mut text = serde_json::to_string_pretty(&format_json(&branches))
+                    .map_err(|e| format!("failed to encode JSON: {e}"))?;
+                text.push('\n');
+                Ok(text)
+            }
+            _ => {
+                let branches = list(dir, options.all)?;
+                let mut text = serde_json::to_string_pretty(&format_json(&branches))
+                    .map_err(|e| format!("failed to encode JSON: {e}"))?;
+                text.push('\n');
+                Ok(text)
+            }
+        };
+    }
+    let vcs = detect_vcs(dir).ok_or_else(|| "not inside a git repository".to_string())?;
+    if !markers::supports_marker_type(vcs, markers::MARKER_TYPE_BRANCH) {
+        return Err(markers::support_error(vcs, markers::MARKER_TYPE_BRANCH));
+    }
+    markers::run_workflow(
+        dir,
+        vcs,
+        markers::MARKER_TYPE_BRANCH,
+        options.all,
+        client,
+        terminal,
+    )
 }
 
 pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {

@@ -38,11 +38,10 @@ fn requires_paths_and_rejects_unknown_flags() {
 }
 
 #[test]
-fn defers_browse() {
-    let ParseOutcome::NotYetPorted(message) = parse_args(&argv(&["--browse", "a"])) else {
-        panic!("expected not-yet-ported for --browse");
-    };
-    assert!(message.contains("not yet ported"), "{message}");
+fn parses_browse() {
+    let opts = args_of(&["--browse", "a"]);
+    assert!(opts.browse);
+    assert!(!args_of(&["a"]).browse);
 }
 
 #[test]
@@ -91,6 +90,19 @@ fn absolutizes_uris() {
     assert_eq!(absolute_uri(None, "/F1"), "/F1");
     assert_eq!(conduit_root("https://h/api/"), "https://h");
     assert_eq!(conduit_root("https://h/"), "https://h");
+}
+
+#[test]
+fn conduit_flags_follow_php_truthiness() {
+    assert!(!conduit_truthy(None));
+    assert!(!conduit_truthy(Some(&serde_json::json!(null))));
+    assert!(conduit_truthy(Some(&serde_json::json!(true))));
+    assert!(!conduit_truthy(Some(&serde_json::json!(false))));
+    assert!(conduit_truthy(Some(&serde_json::json!(1))));
+    assert!(!conduit_truthy(Some(&serde_json::json!(0))));
+    assert!(!conduit_truthy(Some(&serde_json::json!(""))));
+    assert!(!conduit_truthy(Some(&serde_json::json!("0"))));
+    assert!(conduit_truthy(Some(&serde_json::json!("yes"))));
 }
 
 #[test]

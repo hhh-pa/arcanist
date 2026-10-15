@@ -47,14 +47,41 @@ fn parses_path_and_clean() {
 }
 
 #[test]
+fn rejects_second_path_with_full_text() {
+    let ParseOutcome::Error(message) = parse_args(&argv(&["a", "b"])) else {
+        panic!("expected an error");
+    };
+    assert_eq!(message, one_path_error());
+    assert!(message.contains("Provide only one path to \"arc liberate\"."));
+    assert!(message.contains("create or update a library"));
+}
+
+#[test]
+fn renders_readable_paths() {
+    let dir = scratch("readable");
+    assert_eq!(readable_path(&dir, &dir.join("liba")), "liba");
+    let outside = std::env::temp_dir().join("arc-rs-liberate-elsewhere");
+    assert_eq!(readable_path(&dir, &outside), outside.display().to_string());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn parses_map_versions() {
     assert_eq!(parse_map_version("@phutil-library-version 2\n"), Some(2));
-    assert_eq!(
-        parse_map_version("x @phutil-library-version   12 y"),
-        Some(12)
-    );
+    // PHP requires exactly one space before the digits.
+    assert_eq!(parse_map_version("x @phutil-library-version   12 y"), None);
     assert_eq!(parse_map_version("no marker here"), None);
     assert_eq!(parse_map_version("@phutil-library-version x"), None);
+    // Later markers still match when an early one has no digits.
+    assert_eq!(
+        parse_map_version("@phutil-library-version x @phutil-library-version 4"),
+        Some(4)
+    );
+    // Huge versions saturate like PHP's `(int)` cast.
+    assert_eq!(
+        parse_map_version("@phutil-library-version 99999999999999999999999"),
+        Some(i64::MAX)
+    );
 }
 
 #[test]
@@ -113,6 +140,35 @@ fn declines_missing_directory() {
     assert!(ensure_library(&lib, &mut input).is_err());
     assert!(!lib.exists());
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn pluralizes_done_messages() {
+    assert_eq!(done_message(1), "Updated library.");
+    assert_eq!(done_message(2), "Updated 2 libraries.");
+    assert_eq!(done_message(12), "Updated 12 libraries.");
+}
+
+#[test]
+fn renders_missing_directory_banners() {
+    // `%!` is `<bg:yellow>** <!> %s **</bg>` stripped: the spaces
+    // inside the markers survive; `%W` wraps the paragraph.
+    assert_eq!(
+        new_library_block("/x", false),
+        " <!> NEW LIBRARY \nThe directory \"/x\" does not exist. Do you want to create it?\n"
+    );
+}
+
+#[test]
+fn renders_no_library_lines() {
+    assert_eq!(
+        no_library_line("/x", false),
+        "No library currently exists at the path \"/x\"...\n"
+    );
+    assert_eq!(
+        no_library_line("a\u{1}b", false),
+        "No library currently exists at the path \"a<0x01>b\"...\n"
+    );
 }
 
 #[test]

@@ -18,38 +18,33 @@ fn scratch(name: &str) -> std::path::PathBuf {
     dir
 }
 
-fn options(json: bool, conduit_uri: Option<&str>) -> Options {
-    Options {
-        json,
-        conduit_uri: conduit_uri.map(str::to_string),
-    }
-}
-
 #[test]
 fn parses_defaults() {
-    assert_eq!(parse_options(&args(&[])), Ok(Some(options(false, None))));
+    assert_eq!(
+        parse_options(&args(&[])),
+        Ok(Some(Options {
+            json: false,
+            conduit_uri: None,
+        }))
+    );
 }
 
 #[test]
-fn parses_json() {
+fn parses_json_and_conduit_uri() {
     assert_eq!(
         parse_options(&args(&["--json"])),
-        Ok(Some(options(true, None)))
-    );
-}
-
-#[test]
-fn parses_conduit_uri() {
-    assert_eq!(
-        parse_options(&args(&["--conduit-uri", "http://x/"])),
-        Ok(Some(options(false, Some("http://x/"))))
+        Ok(Some(Options {
+            json: true,
+            conduit_uri: None,
+        }))
     );
     assert_eq!(
-        parse_options(&args(&["--conduit-uri=http://x/"])),
-        Ok(Some(options(false, Some("http://x/"))))
+        parse_options(&args(&["--conduit-uri=https://host/api/"])),
+        Ok(Some(Options {
+            json: false,
+            conduit_uri: Some("https://host/api/".to_string()),
+        }))
     );
-    assert!(parse_options(&args(&["--conduit-uri"])).is_err());
-    assert!(parse_options(&args(&["--conduit-uri="])).is_err());
 }
 
 #[test]
@@ -66,50 +61,8 @@ fn rejects_bad_arguments() {
     assert!(err.contains("unexpected argument"), "unexpected: {err}");
     let err = parse_options(&args(&["--"])).unwrap_err();
     assert!(err.contains("unexpected argument"), "unexpected: {err}");
-}
-
-#[test]
-fn parses_bookmark_entries() {
-    let marks = parse_bookmarks(" * active   12:abc123def456\n   other    3:789abc\n").unwrap();
-    assert_eq!(
-        marks,
-        vec![
-            Bookmark {
-                name: "active".to_string(),
-                active: true,
-                rev: "12".to_string(),
-                node: "abc123def456".to_string(),
-                revisions: Vec::new(),
-            },
-            Bookmark {
-                name: "other".to_string(),
-                active: false,
-                rev: "3".to_string(),
-                node: "789abc".to_string(),
-                revisions: Vec::new(),
-            },
-        ]
-    );
-}
-
-#[test]
-fn parses_empty_output() {
-    assert_eq!(parse_bookmarks(""), Ok(Vec::new()));
-    assert_eq!(parse_bookmarks("\n\n"), Ok(Vec::new()));
-}
-
-#[test]
-fn rejects_malformed_lines() {
-    let err = parse_bookmarks("lonely\n").unwrap_err();
-    assert!(err.contains("malformed"), "unexpected: {err}");
-}
-
-#[test]
-fn tolerates_nodes_without_rev() {
-    let marks = parse_bookmarks("   mark   abc123\n").unwrap();
-    assert_eq!(marks.len(), 1);
-    assert_eq!(marks[0].rev, "");
-    assert_eq!(marks[0].node, "abc123");
+    let err = parse_options(&args(&["--conduit-uri"])).unwrap_err();
+    assert!(err.contains("requires a value"), "unexpected: {err}");
 }
 
 #[test]
@@ -123,50 +76,15 @@ fn finds_hg_root_upward() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-fn annotated(name: &str) -> Bookmark {
-    Bookmark {
-        name: name.to_string(),
-        active: false,
-        rev: "12".to_string(),
-        node: "abc123".to_string(),
-        revisions: vec![amend::AnnotatedRevision {
-            monogram: "D123".to_string(),
-            status: "Accepted".to_string(),
-            title: "Title".to_string(),
-        }],
-    }
-}
-
 #[test]
-fn formats_text_with_active_marker() {
-    let marks = vec![
-        Bookmark {
-            name: "active".to_string(),
-            active: true,
-            rev: "12".to_string(),
-            node: "abc123".to_string(),
-            revisions: Vec::new(),
-        },
-        Bookmark {
-            name: "other".to_string(),
-            active: false,
-            rev: "3".to_string(),
-            node: "789abc".to_string(),
-            revisions: Vec::new(),
-        },
-    ];
-    assert_eq!(
-        format_text(&marks),
-        "* active 12:abc123\n  other 3:789abc\n"
+fn fails_like_arc_outside_mercurial() {
+    let dir = scratch("nowhere");
+    let err = list(&dir).unwrap_err();
+    assert!(
+        err.contains("not inside a working copy"),
+        "unexpected: {err}"
     );
-}
-
-#[test]
-fn formats_text_with_annotations() {
-    assert_eq!(
-        format_text(&[annotated("mark")]),
-        "  mark 12:abc123 [D123 Accepted]\n"
-    );
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -174,39 +92,25 @@ fn formats_json_objects() {
     let marks = vec![Bookmark {
         name: "active".to_string(),
         active: true,
-        rev: "12".to_string(),
+        rev: String::new(),
         node: "abc123".to_string(),
-        revisions: Vec::new(),
     }];
     assert_eq!(
         format_json(&marks),
         serde_json::json!([{
             "name": "active",
             "active": true,
-            "rev": "12",
+            "rev": "",
             "node": "abc123",
-            "revisions": [],
         }])
     );
 }
 
 #[test]
-fn formats_json_with_annotations() {
-    let doc = format_json(&[annotated("mark")]);
-    assert_eq!(
-        doc[0]["revisions"],
-        serde_json::json!([{
-            "monogram": "D123",
-            "status": "Accepted",
-            "title": "Title",
-        }])
-    );
-}
-
-#[test]
-fn usage_covers_options_and_limits() {
+fn usage_covers_options() {
     let text = usage();
     assert!(text.contains("usage: arc-rs bookmarks"));
     assert!(text.contains("--json"));
+    assert!(text.contains("--conduit-uri"));
     assert!(text.contains("Mercurial"));
 }
