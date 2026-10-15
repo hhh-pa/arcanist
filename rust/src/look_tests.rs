@@ -489,3 +489,486 @@ fn published_hashes_keep_permanent_push_refs() {
     );
     assert!(published_hashes(&markers, &remotes, &[]).is_empty());
 }
+
+/// 2026-01-15T12:00:00Z (northern winter).
+const WINTER: u64 = 1_768_478_400;
+/// 2026-07-15T12:00:00Z (northern summer).
+const SUMMER: u64 = 1_784_116_800;
+/// Heartbeats around the 2026 US spring-forward (Mar 8, 07:00:00Z).
+const SPRING_BEFORE: u64 = 1_772_953_199;
+const SPRING_AFTER: u64 = 1_772_953_201;
+/// Heartbeats around the 2026 US fall-back (Nov 1, 06:00:00Z).
+const FALL_BEFORE: u64 = 1_793_512_799;
+const FALL_AFTER: u64 = 1_793_512_801;
+/// 2000-07-01T12:00:00Z, before the fixtures' first transitions.
+const PRE_FIRST: u64 = 962_452_800;
+/// 2030-07-01T12:00:00Z, after the fixtures' last transitions.
+const POST_LAST: u64 = 1_909_137_600;
+
+/// US Eastern POSIX rules with explicit 02:00 transition times.
+const EASTERN_POSIX: &str = "EST5EDT,M3.2.0/2,M11.1.0/2";
+
+/// `zic` output for a 2007-max Eastern zone (slim: one explicit
+/// transition plus the `EST5EDT,M3.2.0,M11.1.0` footer).
+const TESTBURG_SLIM: &[u8] = &[
+    0x54, 0x5a, 0x69, 0x66, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x54, 0x5a, 0x69, 0x66, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00,
+    0x00, 0x00, 0x00, 0x45, 0xf3, 0xa8, 0xf0, 0x00, 0xff, 0xff, 0xc7, 0xc0, 0x01, 0x00, 0x45, 0x44,
+    0x54, 0x00, 0x0a, 0x45, 0x53, 0x54, 0x35, 0x45, 0x44, 0x54, 0x2c, 0x4d, 0x33, 0x2e, 0x32, 0x2e,
+    0x30, 0x2c, 0x4d, 0x31, 0x31, 0x2e, 0x31, 0x2e, 0x30, 0x0a,
+];
+
+/// `zic -b fat` output for a 2025-2027 Eastern zone (six explicit
+/// transitions plus the fixed `EST5` footer).
+const TESTBURG_FAT: &[u8] = &[
+    0x54, 0x5a, 0x69, 0x66, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x08, 0x67, 0xcd, 0x3c, 0x70,
+    0x69, 0x06, 0xf3, 0x60, 0x69, 0xad, 0x1e, 0x70, 0x6a, 0xe6, 0xd5, 0x60, 0x6b, 0x96, 0x3a, 0xf0,
+    0x6c, 0xcf, 0xf1, 0xe0, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0xff, 0xff, 0xb9, 0xb0, 0x00, 0x04,
+    0xff, 0xff, 0xc7, 0xc0, 0x01, 0x00, 0xff, 0xff, 0xc7, 0xc0, 0x01, 0x00, 0xff, 0xff, 0xb9, 0xb0,
+    0x00, 0x04, 0x45, 0x44, 0x54, 0x00, 0x45, 0x53, 0x54, 0x00, 0x54, 0x5a, 0x69, 0x66, 0x32, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00,
+    0x00, 0x04, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x67, 0xcd, 0x3c, 0x70, 0x00, 0x00,
+    0x00, 0x00, 0x69, 0x06, 0xf3, 0x60, 0x00, 0x00, 0x00, 0x00, 0x69, 0xad, 0x1e, 0x70, 0x00, 0x00,
+    0x00, 0x00, 0x6a, 0xe6, 0xd5, 0x60, 0x00, 0x00, 0x00, 0x00, 0x6b, 0x96, 0x3a, 0xf0, 0x00, 0x00,
+    0x00, 0x00, 0x6c, 0xcf, 0xf1, 0xe0, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0xff, 0xff, 0xb9, 0xb0,
+    0x00, 0x04, 0xff, 0xff, 0xc7, 0xc0, 0x01, 0x00, 0xff, 0xff, 0xc7, 0xc0, 0x01, 0x00, 0xff, 0xff,
+    0xb9, 0xb0, 0x00, 0x04, 0x45, 0x44, 0x54, 0x00, 0x45, 0x53, 0x54, 0x00, 0x0a, 0x45, 0x53, 0x54,
+    0x35, 0x0a,
+];
+
+/// Minimal v1 (32-bit, footerless) Eastern zone with the two 2026
+/// transitions, verified with `zdump`.
+const TESTBURG_V1: &[u8] = &[
+    0x54, 0x5a, 0x69, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x08, 0x69, 0xad, 0x1e, 0x70,
+    0x6a, 0xe6, 0xd5, 0x60, 0x01, 0x00, 0xff, 0xff, 0xb9, 0xb0, 0x00, 0x00, 0xff, 0xff, 0xc7, 0xc0,
+    0x01, 0x04, 0x45, 0x53, 0x54, 0x00, 0x45, 0x44, 0x54, 0x00,
+];
+
+#[test]
+fn applies_utc_offsets_to_hours() {
+    assert_eq!(hour_with_offset(0, 0), 0);
+    assert_eq!(hour_with_offset(3_600 * 13 + 59, 0), 13);
+    assert_eq!(hour_with_offset(0, 3_600), 1);
+    assert_eq!(hour_with_offset(0, -3_600), 23);
+    // Half-hour zones and the date line wrap within the day.
+    assert_eq!(hour_with_offset(12 * 3_600, 19_800), 17);
+    assert_eq!(hour_with_offset(12 * 3_600, -19_800), 6);
+    assert_eq!(hour_with_offset(0, 14 * 3_600), 14);
+    assert_eq!(hour_with_offset(0, -12 * 3_600), 12);
+    assert_eq!(hour_with_offset(3_600 * 24 - 1, 1), 0);
+}
+
+#[test]
+fn civil_calendar_round_trips() {
+    assert_eq!(days_from_civil(1970, 1, 1), 0);
+    assert_eq!(days_from_civil(2026, 1, 1), 20_454);
+    assert_eq!(days_from_civil(2026, 3, 8), 20_520);
+    for (year, month, day) in [
+        (1970, 1, 1),
+        (2026, 1, 15),
+        (2000, 2, 29),
+        (1900, 2, 28),
+        (1969, 12, 31),
+        (2038, 1, 19),
+    ] {
+        assert_eq!(
+            civil_from_days(days_from_civil(year, month, day)),
+            (year, month, day)
+        );
+    }
+    assert_eq!(civil_from_days(0), (1970, 1, 1));
+    assert_eq!(civil_from_days(-1), (1969, 12, 31));
+    assert!(is_leap_year(2000));
+    assert!(!is_leap_year(1900));
+    assert!(is_leap_year(2024));
+    assert!(!is_leap_year(2026));
+    // 2026-03-08 is a Sunday.
+    assert_eq!(weekday_sunday_zero(20_520), 0);
+}
+
+#[test]
+fn computes_dst_rule_dates() {
+    // Second Sunday of March 2026 and first Sunday of November 2026.
+    assert_eq!(
+        dst_rule_month_day(
+            DstRule::MonthWeekday {
+                month: 3,
+                week: 2,
+                day: 0
+            },
+            2026
+        ),
+        (3, 8)
+    );
+    assert_eq!(
+        dst_rule_month_day(
+            DstRule::MonthWeekday {
+                month: 11,
+                week: 1,
+                day: 0
+            },
+            2026
+        ),
+        (11, 1)
+    );
+    // Week 5 means the last matching weekday of the month.
+    assert_eq!(
+        dst_rule_month_day(
+            DstRule::MonthWeekday {
+                month: 10,
+                week: 5,
+                day: 0
+            },
+            2026
+        ),
+        (10, 25)
+    );
+    assert_eq!(
+        dst_rule_month_day(
+            DstRule::MonthWeekday {
+                month: 2,
+                week: 5,
+                day: 0
+            },
+            2026
+        ),
+        (2, 22)
+    );
+    // Julian days skip (J) or count (n) the leap day.
+    assert_eq!(dst_rule_month_day(DstRule::JulianSkip(60), 2026), (3, 1));
+    assert_eq!(dst_rule_month_day(DstRule::JulianSkip(60), 2000), (3, 1));
+    assert_eq!(dst_rule_month_day(DstRule::JulianCount(59), 2026), (3, 1));
+    assert_eq!(dst_rule_month_day(DstRule::JulianCount(59), 2000), (2, 29));
+    assert_eq!(
+        dst_rule_month_day(DstRule::JulianCount(365), 2026),
+        (12, 31)
+    );
+}
+
+#[test]
+fn parses_posix_zone_strings() {
+    let eastern = parse_posix_tz(EASTERN_POSIX).expect("parse eastern");
+    assert_eq!(eastern.std_offset, -18_000);
+    let dst = eastern.dst.expect("eastern dst");
+    assert_eq!(dst.offset, -14_400);
+    assert_eq!(
+        dst.start,
+        (
+            DstRule::MonthWeekday {
+                month: 3,
+                week: 2,
+                day: 0
+            },
+            7_200
+        )
+    );
+    assert_eq!(
+        dst.end,
+        (
+            DstRule::MonthWeekday {
+                month: 11,
+                week: 1,
+                day: 0
+            },
+            7_200
+        )
+    );
+    // Fixed zones have no daylight half.
+    assert_eq!(parse_posix_tz("EST5").expect("parse").std_offset, -18_000);
+    assert!(parse_posix_tz("EST5").expect("parse").dst.is_none());
+    // A bare name needs the zoneinfo file (the offset is required, like
+    // glibc); `TZ=UTC` still resolves through the file or UTC fallback.
+    assert_eq!(parse_posix_tz("UTC"), None);
+    assert_eq!(parse_posix_tz("UTC0").expect("parse").std_offset, 0);
+    // POSIX offsets count west as positive, so negative values sit east.
+    assert_eq!(parse_posix_tz("CET-1").expect("parse").std_offset, 3_600);
+    assert_eq!(
+        parse_posix_tz("NST3:30").expect("parse").std_offset,
+        -12_600
+    );
+    assert_eq!(parse_posix_tz("<-03>3").expect("parse").std_offset, -10_800);
+    // Bare `dst` defaults to one hour east with US rules.
+    let bare = parse_posix_tz("EST5EDT").expect("parse");
+    let bare_dst = bare.dst.expect("bare dst");
+    assert_eq!(bare_dst.offset, -14_400);
+    assert_eq!(
+        bare_dst.start.0,
+        DstRule::MonthWeekday {
+            month: 3,
+            week: 2,
+            day: 0
+        }
+    );
+    assert_eq!(
+        bare_dst.end.0,
+        DstRule::MonthWeekday {
+            month: 11,
+            week: 1,
+            day: 0
+        }
+    );
+    // Julian rule spellings.
+    let julian = parse_posix_tz("EST5EDT,J59/2,J300/2")
+        .expect("parse")
+        .dst
+        .expect("dst");
+    assert_eq!(julian.start.0, DstRule::JulianSkip(59));
+    assert_eq!(julian.end.0, DstRule::JulianSkip(300));
+    let counted = parse_posix_tz("EST5EDT,59/2,300/2")
+        .expect("parse")
+        .dst
+        .expect("dst");
+    assert_eq!(counted.start.0, DstRule::JulianCount(59));
+    // Malformed strings fail closed (the lookup falls back to UTC).
+    for bad in [
+        "",
+        "5EST",
+        "EST",
+        "<>",
+        "EST5EDT,",
+        "EST5EDT,M3.2.0",
+        "EST5EDT,M13.1.0/2,M11.1.0/2",
+        "EST5EDT,M3.2.0/2,M11.1.0/2,",
+    ] {
+        assert_eq!(parse_posix_tz(bad), None, "for {bad:?}");
+    }
+}
+
+#[test]
+fn evaluates_posix_offsets_at_boundaries() {
+    for (now, want) in [
+        (WINTER, -18_000),
+        (SUMMER, -14_400),
+        (SPRING_BEFORE, -18_000),
+        (SPRING_AFTER, -14_400),
+        (FALL_BEFORE, -14_400),
+        (FALL_AFTER, -18_000),
+    ] {
+        assert_eq!(
+            posix_offset(EASTERN_POSIX, now as i64),
+            Some(want),
+            "for {now}"
+        );
+    }
+    // Fixed zones ignore the calendar; southern zones wrap the year end.
+    assert_eq!(posix_offset("EST5", SUMMER as i64), Some(-18_000));
+    assert_eq!(posix_offset("UTC0", SUMMER as i64), Some(0));
+    assert_eq!(
+        posix_offset("AEST-10AEDT,M10.1.0/2,M4.1.0/2", WINTER as i64),
+        Some(39_600)
+    );
+    assert_eq!(
+        posix_offset("AEST-10AEDT,M10.1.0/2,M4.1.0/2", SUMMER as i64),
+        Some(36_000)
+    );
+    assert_eq!(posix_offset("bogus", WINTER as i64), None);
+}
+
+#[test]
+fn reads_zic_slim_footer_zone() {
+    assert_eq!(TESTBURG_SLIM.len(), 138);
+    let parsed = parse_tzif(TESTBURG_SLIM).expect("parse slim");
+    // One explicit transition (2007-03-11T07:00:00Z); everything modern
+    // resolves through the footer.
+    assert_eq!(parsed.transitions, vec![(1_173_596_400, 0)]);
+    assert_eq!(parsed.footer.as_deref(), Some("EST5EDT,M3.2.0,M11.1.0"));
+    for (now, want) in [
+        (WINTER, -18_000),
+        (SUMMER, -14_400),
+        (SPRING_BEFORE, -18_000),
+        (SPRING_AFTER, -14_400),
+        (FALL_BEFORE, -14_400),
+        (FALL_AFTER, -18_000),
+        (POST_LAST, -14_400),
+    ] {
+        assert_eq!(
+            tzif_offset(TESTBURG_SLIM, now as i64),
+            Some(want),
+            "for {now}"
+        );
+    }
+    // Before the first transition the only type (daylight) applies.
+    assert_eq!(tzif_offset(TESTBURG_SLIM, PRE_FIRST as i64), Some(-14_400));
+}
+
+#[test]
+fn reads_zic_fat_explicit_zone() {
+    assert_eq!(TESTBURG_FAT.len(), 242);
+    let parsed = parse_tzif(TESTBURG_FAT).expect("parse fat");
+    assert_eq!(parsed.transitions.len(), 6);
+    assert_eq!(parsed.footer.as_deref(), Some("EST5"));
+    for (now, want) in [
+        (WINTER, -18_000),
+        (SUMMER, -14_400),
+        (SPRING_BEFORE, -18_000),
+        (SPRING_AFTER, -14_400),
+        (FALL_BEFORE, -14_400),
+        (FALL_AFTER, -18_000),
+    ] {
+        assert_eq!(
+            tzif_offset(TESTBURG_FAT, now as i64),
+            Some(want),
+            "for {now}"
+        );
+    }
+    // Before the first transition the standard type applies; after the
+    // last one the fixed `EST5` footer does.
+    assert_eq!(tzif_offset(TESTBURG_FAT, PRE_FIRST as i64), Some(-18_000));
+    assert_eq!(tzif_offset(TESTBURG_FAT, POST_LAST as i64), Some(-18_000));
+}
+
+#[test]
+fn reads_v1_narrow_zone() {
+    assert_eq!(TESTBURG_V1.len(), 74);
+    let parsed = parse_tzif(TESTBURG_V1).expect("parse v1");
+    assert_eq!(parsed.transitions.len(), 2);
+    assert_eq!(parsed.footer, None);
+    for (now, want) in [
+        (WINTER, -18_000),
+        (SUMMER, -14_400),
+        (SPRING_BEFORE, -18_000),
+        (SPRING_AFTER, -14_400),
+        (FALL_BEFORE, -14_400),
+        (FALL_AFTER, -18_000),
+        (PRE_FIRST, -18_000),
+        // Footerless files hold the last type past the last transition.
+        (POST_LAST, -18_000),
+    ] {
+        assert_eq!(
+            tzif_offset(TESTBURG_V1, now as i64),
+            Some(want),
+            "for {now}"
+        );
+    }
+}
+
+#[test]
+fn rejects_corrupt_zoneinfo() {
+    assert_eq!(parse_tzif(b""), None);
+    assert_eq!(parse_tzif(b"TZif"), None);
+    assert_eq!(parse_tzif(&TESTBURG_SLIM[..40]), None);
+    assert_eq!(parse_tzif(&TESTBURG_FAT[..100]), None);
+    let mut bad = TESTBURG_FAT.to_vec();
+    bad[0] = b'X';
+    assert_eq!(parse_tzif(&bad), None);
+    bad = TESTBURG_FAT.to_vec();
+    bad[4] = b'9';
+    assert_eq!(parse_tzif(&bad), None);
+}
+
+#[test]
+fn reads_system_new_york_when_present() {
+    // Unix zoneinfo layout; skipped silently where it does not exist
+    // (Windows). Expectations pin the file's zone, never the machine's.
+    let Ok(bytes) = std::fs::read("/usr/share/zoneinfo/America/New_York") else {
+        return;
+    };
+    for (now, want) in [
+        (WINTER, -18_000),
+        (SUMMER, -14_400),
+        (SPRING_BEFORE, -18_000),
+        (SPRING_AFTER, -14_400),
+        (FALL_BEFORE, -14_400),
+        (FALL_AFTER, -18_000),
+    ] {
+        assert_eq!(tzif_offset(&bytes, now as i64), Some(want), "for {now}");
+    }
+}
+
+/// Zone-independent sanity for the machine zone: current IANA offsets
+/// stay within UTC-12..UTC+14 at minute granularity.
+fn assert_local_invariants() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(WINTER);
+    let offset = local_utc_offset(now);
+    assert!((-43_200..=50_400).contains(&offset), "offset {offset}");
+    assert_eq!(offset % 60, 0, "offset {offset}");
+    assert_eq!(local_utc_offset(now), offset);
+    assert_eq!(local_hour(now), hour_with_offset(now, offset));
+}
+
+#[test]
+fn local_lookup_invariants_hold_in_machine_zone() {
+    assert_local_invariants();
+}
+
+/// Probe body for `fixed_tz_subprocesses_match_oracles`: asserts exact
+/// offsets under a pinned `TZ`, or machine-zone invariants otherwise.
+/// Never spawns; the parent filter runs only this test in each child.
+#[test]
+fn tz_probe_child_fixed() {
+    println!("LOOK-TZ-PROBE-OK");
+    match std::env::var("TZ").as_deref() {
+        Ok("UTC0") => {
+            for now in [
+                WINTER,
+                SUMMER,
+                SPRING_BEFORE,
+                SPRING_AFTER,
+                FALL_BEFORE,
+                FALL_AFTER,
+            ] {
+                assert_eq!(local_utc_offset(now), 0, "for {now}");
+                assert_eq!(local_hour(now), hour_of(now), "for {now}");
+            }
+        }
+        Ok("EST5") => {
+            for now in [
+                WINTER,
+                SUMMER,
+                SPRING_BEFORE,
+                SPRING_AFTER,
+                FALL_BEFORE,
+                FALL_AFTER,
+            ] {
+                assert_eq!(local_utc_offset(now), -18_000, "for {now}");
+            }
+            assert_eq!(local_hour(WINTER), 7);
+            assert_eq!(local_hour(SUMMER), 7);
+        }
+        Ok(tz) if tz == EASTERN_POSIX => {
+            assert_eq!(local_utc_offset(WINTER), -18_000);
+            assert_eq!(local_utc_offset(SUMMER), -14_400);
+            assert_eq!(local_utc_offset(SPRING_BEFORE), -18_000);
+            assert_eq!(local_utc_offset(SPRING_AFTER), -14_400);
+            assert_eq!(local_utc_offset(FALL_BEFORE), -14_400);
+            assert_eq!(local_utc_offset(FALL_AFTER), -18_000);
+            assert_eq!(local_hour(WINTER), 7);
+            assert_eq!(local_hour(SUMMER), 8);
+        }
+        _ => assert_local_invariants(),
+    }
+}
+
+/// Fixed-`TZ` subprocess oracle: each child re-runs only the probe test
+/// with a pinned zone, so the suite never mutates its own `TZ`.
+#[test]
+fn fixed_tz_subprocesses_match_oracles() {
+    let exe = std::env::current_exe().expect("test binary path");
+    for tz in ["UTC0", "EST5", EASTERN_POSIX] {
+        let out = std::process::Command::new(&exe)
+            .env("TZ", tz)
+            .args(["--nocapture", "tz_probe_child_fixed"])
+            .output()
+            .expect("spawn probe child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success()
+                && stdout.contains("1 passed")
+                && stdout.contains("LOOK-TZ-PROBE-OK"),
+            "TZ={tz} probe child failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+        );
+    }
+}

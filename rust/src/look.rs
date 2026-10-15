@@ -8,11 +8,15 @@
 //! via `diffusion.repository.search`, and published commits keep only
 //! permanent refs (`ArcanistRepositoryRef::isPermanentRef`).
 //!
-//! Known limits: the hour is UTC (the PHP uses local time via `date('G')`,
-//! which needs platform timezone data); `regexp(...)` permanent-ref rules
-//! never match (no regex engine); without a usable Conduit client the
-//! command degrades to local-only data (repository names render as `-` and
-//! published lists every remote-tracking tip) instead of failing.
+//! Known limits: the live clearing shows the system-timezone hour (read
+//! from the OS zone database on Unix with full DST history, honoring
+//! explicit `TZ` everywhere); where no zone data exists (notably Windows
+//! without `TZ`, whose system zone needs OS calls) it falls back to UTC,
+//! and the plain-text `render` builders stay UTC so an instant always
+//! renders identically. `regexp(...)` permanent-ref rules never match (no
+//! regex engine); without a usable Conduit client the command degrades to
+//! local-only data (repository names render as `-` and published lists
+//! every remote-tracking tip) instead of failing.
 //!
 //! Two renderings exist: the plain-text builders (`render`,
 //! `render_clearing`, `render_unknown`, `render_remote`, `render_remotes`,
@@ -57,9 +61,672 @@ pub fn parse_args(argv: &[String]) -> Result<Option<Vec<String>>, String> {
 }
 
 /// Hour of day (0-23) for a unix timestamp, in UTC.
+///
+/// The deterministic flavor used by the plain-text `render` builders; the
+/// live `run` path uses `local_hour` (system timezone) instead.
 #[must_use]
 pub fn hour_of(now_unix: u64) -> u32 {
     ((now_unix / 3600) % 24) as u32
+}
+
+/// Hour of day (0-23) for `now_unix` shifted by `offset_secs`, the seconds
+/// east of UTC in effect at that instant (negative west of Greenwich).
+/// Pure: DST handling belongs to the caller, which supplies the offset
+/// already in effect (see `local_utc_offset`).
+#[must_use]
+pub fn hour_with_offset(now_unix: u64, offset_secs: i64) -> u32 {
+    ((now_unix as i64)
+        .saturating_add(offset_secs)
+        .rem_euclid(86_400)
+        / 3_600) as u32
+}
+
+/// Days from 1970-01-01 to the civil date (Howard Hinnant's algorithm).
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let adjusted = if month <= 2 { year - 1 } else { year };
+    let era = adjusted.div_euclid(400);
+    let year_of_era = adjusted.rem_euclid(400);
+    let month_prime = (month + 9) % 12;
+    let day_of_year = (153 * i64::from(month_prime) + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// Civil date for days since 1970-01-01, the inverse of `days_from_civil`.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_prime + 2) / 5 + 1) as u32;
+    let month = (if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    }) as u32;
+    let full_year = if month <= 2 { year + 1 } else { year };
+    (full_year, month, day)
+}
+
+/// Weekday with Sunday = 0 (1970-01-01 was a Thursday).
+fn weekday_sunday_zero(days: i64) -> u32 {
+    (days + 4).rem_euclid(7) as u32
+}
+
+/// Gregorian leap year.
+fn is_leap_year(year: i64) -> bool {
+    year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0)
+}
+
+/// Days in `month` (1-12) of `year`.
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
+    }
+}
+
+/// Month/day for a 1-based day-of-year (`ordinal` counts Feb 29 in leap
+/// years and must not exceed the days in `year`).
+fn month_day_of_ordinal(year: i64, mut ordinal: u32) -> (u32, u32) {
+    let mut month = 1;
+    while month < 12 && ordinal > days_in_month(year, month) {
+        ordinal -= days_in_month(year, month);
+        month += 1;
+    }
+    (month, ordinal)
+}
+
+/// Day-of-month for `Mm.w.d`: weekday `day` (Sunday = 0) of week `week`
+/// (5 means the last one) of `month`.
+fn month_weekday_day(year: i64, month: u32, week: u32, day: u32) -> u32 {
+    let first = weekday_sunday_zero(days_from_civil(year, month, 1));
+    let mut date = 1 + (day + 7 - first) % 7 + (week - 1) * 7;
+    if date > days_in_month(year, month) {
+        date -= 7;
+    }
+    date
+}
+
+/// A POSIX `TZ` daylight-saving transition rule (`Jn`, `n`, `Mm.w.d`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DstRule {
+    /// Julian day 1-365; leap days are not counted.
+    JulianSkip(u16),
+    /// Zero-based day 0-365; leap days are counted.
+    JulianCount(u16),
+    /// Month/week/weekday (week 5 means last, Sunday is 0).
+    MonthWeekday { month: u32, week: u32, day: u32 },
+}
+
+/// Daylight-saving half of a POSIX `TZ` string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DstSpec {
+    /// Seconds east of UTC while daylight saving is in effect.
+    offset: i64,
+    /// Start transition as (rule, wall-clock seconds in standard time).
+    start: (DstRule, i64),
+    /// End transition as (rule, wall-clock seconds in daylight time).
+    end: (DstRule, i64),
+}
+
+/// A parsed POSIX `TZ` string (`std offset[dst[offset][,start,end]]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PosixTz {
+    /// Seconds east of UTC in standard time.
+    std_offset: i64,
+    dst: Option<DstSpec>,
+}
+
+/// Split a run of ASCII digits off `text`.
+fn take_tz_number(text: &str) -> Option<(i64, &str)> {
+    let len = text.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if len == 0 {
+        return None;
+    }
+    Some((text[..len].parse().ok()?, &text[len..]))
+}
+
+/// Split a zone abbreviation (`EST` or `<-03>`) off `text`.
+fn take_tz_name(text: &str) -> Option<(&str, &str)> {
+    if let Some(rest) = text.strip_prefix('<') {
+        let end = rest.find('>')?;
+        if end == 0 {
+            return None;
+        }
+        return Some((&rest[..end], &rest[end + 1..]));
+    }
+    let len = text.bytes().take_while(|b| b.is_ascii_alphabetic()).count();
+    if len == 0 {
+        return None;
+    }
+    Some((&text[..len], &text[len..]))
+}
+
+/// Split a `[+|-]hh[:mm[:ss]]` offset off `text`, returning raw seconds
+/// (POSIX offsets count west as positive) plus the remainder.
+fn take_tz_offset(text: &str) -> Option<(i64, &str)> {
+    let (negative, rest) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (hours, mut rest) = take_tz_number(rest)?;
+    let mut seconds = hours.saturating_mul(3_600);
+    for factor in [60, 1] {
+        if let Some(tail) = rest.strip_prefix(':') {
+            let (part, next) = take_tz_number(tail)?;
+            seconds = seconds.saturating_add(part.saturating_mul(factor));
+            rest = next;
+        }
+    }
+    if negative {
+        seconds = seconds.saturating_neg();
+    }
+    Some((seconds, rest))
+}
+
+/// Split one `Mm.w.d` rule (after the `M`) off `text`.
+fn take_month_weekday_rule(tail: &str) -> Option<(DstRule, &str)> {
+    let (month, rest) = take_tz_number(tail)?;
+    let (week, rest) = take_tz_number(rest.strip_prefix('.')?)?;
+    let (day, rest) = take_tz_number(rest.strip_prefix('.')?)?;
+    if !(1..=12).contains(&month) || !(1..=5).contains(&week) || !(0..=6).contains(&day) {
+        return None;
+    }
+    Some((
+        DstRule::MonthWeekday {
+            month: month as u32,
+            week: week as u32,
+            day: day as u32,
+        },
+        rest,
+    ))
+}
+
+/// Split one DST rule head (`Jn`, `n`, `Mm.w.d`) off `text`.
+fn take_dst_rule_head(text: &str) -> Option<(DstRule, &str)> {
+    if let Some(tail) = text.strip_prefix('J') {
+        let (day, rest) = take_tz_number(tail)?;
+        if !(1..=365).contains(&day) {
+            return None;
+        }
+        return Some((DstRule::JulianSkip(day as u16), rest));
+    }
+    if let Some(tail) = text.strip_prefix('M') {
+        return take_month_weekday_rule(tail);
+    }
+    let (day, rest) = take_tz_number(text)?;
+    if !(0..=365).contains(&day) {
+        return None;
+    }
+    Some((DstRule::JulianCount(day as u16), rest))
+}
+
+/// Split one DST rule (with optional `/time`, default 02:00) off `text`.
+fn take_dst_rule(text: &str) -> Option<(DstRule, i64, &str)> {
+    let (rule, rest) = take_dst_rule_head(text)?;
+    let (time, rest) = match rest.strip_prefix('/') {
+        Some(tail) => take_tz_offset(tail)?,
+        None => (7_200, rest),
+    };
+    Some((rule, time, rest))
+}
+
+/// Parse a POSIX `TZ` string. Bare `dst` sits one hour east of standard
+/// time with the POSIX default rules (`M3.2.0`/`M11.1.0`).
+fn parse_posix_tz(text: &str) -> Option<PosixTz> {
+    let (_, rest) = take_tz_name(text)?;
+    let (std_west, rest) = take_tz_offset(rest)?;
+    let std_offset = std_west.saturating_neg();
+    if rest.is_empty() {
+        return Some(PosixTz {
+            std_offset,
+            dst: None,
+        });
+    }
+    let (_, rest) = take_tz_name(rest)?;
+    let (dst_west, rest) = match take_tz_offset(rest) {
+        Some((offset, rest)) => (offset, rest),
+        None => (std_west.saturating_sub(3_600), rest),
+    };
+    let dst = if rest.is_empty() {
+        DstSpec {
+            offset: dst_west.saturating_neg(),
+            start: (
+                DstRule::MonthWeekday {
+                    month: 3,
+                    week: 2,
+                    day: 0,
+                },
+                7_200,
+            ),
+            end: (
+                DstRule::MonthWeekday {
+                    month: 11,
+                    week: 1,
+                    day: 0,
+                },
+                7_200,
+            ),
+        }
+    } else {
+        let rest = rest.strip_prefix(',')?;
+        let (start_rule, start_time, rest) = take_dst_rule(rest)?;
+        let rest = rest.strip_prefix(',')?;
+        let (end_rule, end_time, rest) = take_dst_rule(rest)?;
+        if !rest.is_empty() {
+            return None;
+        }
+        DstSpec {
+            offset: dst_west.saturating_neg(),
+            start: (start_rule, start_time),
+            end: (end_rule, end_time),
+        }
+    };
+    Some(PosixTz {
+        std_offset,
+        dst: Some(dst),
+    })
+}
+
+/// Month/day of `rule` in `year`.
+fn dst_rule_month_day(rule: DstRule, year: i64) -> (u32, u32) {
+    match rule {
+        DstRule::JulianSkip(day) => {
+            let mut ordinal = u32::from(day);
+            if is_leap_year(year) && ordinal > 59 {
+                ordinal += 1;
+            }
+            month_day_of_ordinal(year, ordinal)
+        }
+        DstRule::JulianCount(day) => {
+            let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+            month_day_of_ordinal(year, (u32::from(day) + 1).min(days_in_year))
+        }
+        DstRule::MonthWeekday { month, week, day } => {
+            (month, month_weekday_day(year, month, week, day))
+        }
+    }
+}
+
+/// Unix instant of `rule` at wall-clock `time` in `year`, interpreted
+/// with `base_offset` (seconds east) already in effect.
+fn dst_rule_instant(rule: DstRule, time: i64, year: i64, base_offset: i64) -> i64 {
+    let (month, day) = dst_rule_month_day(rule, year);
+    days_from_civil(year, month, day)
+        .saturating_mul(86_400)
+        .saturating_add(time)
+        .saturating_sub(base_offset)
+}
+
+/// Seconds east of UTC at `now` under POSIX `TZ` string `text`.
+fn posix_offset(text: &str, now: i64) -> Option<i64> {
+    let parsed = parse_posix_tz(text)?;
+    let Some(dst) = parsed.dst else {
+        return Some(parsed.std_offset);
+    };
+    let (year, _, _) = civil_from_days(now.div_euclid(86_400));
+    let start = dst_rule_instant(dst.start.0, dst.start.1, year, parsed.std_offset);
+    let end = dst_rule_instant(dst.end.0, dst.end.1, year, dst.offset);
+    if start == end {
+        return Some(parsed.std_offset);
+    }
+    let in_dst = if start < end {
+        now >= start && now < end
+    } else {
+        // Southern hemisphere: daylight saving wraps the year end.
+        now >= start || now < end
+    };
+    Some(if in_dst {
+        dst.offset
+    } else {
+        parsed.std_offset
+    })
+}
+
+/// One TZif local-time type: fixed offset plus DST flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TzifType {
+    utoff: i64,
+    is_dst: bool,
+}
+
+/// One TZif data block: transitions plus their types.
+type TzBlock = (Vec<(i64, usize)>, Vec<TzifType>);
+
+/// Parsed TZif data: explicit transitions plus the POSIX footer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TzifData {
+    transitions: Vec<(i64, usize)>,
+    types: Vec<TzifType>,
+    default_type: usize,
+    footer: Option<String>,
+}
+
+/// Bounds-checked big-endian reader over TZif bytes.
+struct TzCursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> TzCursor<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(len)?;
+        if end > self.data.len() {
+            return None;
+        }
+        let out = &self.data[self.pos..end];
+        self.pos = end;
+        Some(out)
+    }
+
+    fn byte(&mut self) -> Option<u8> {
+        self.take(1).map(|bytes| bytes[0])
+    }
+
+    fn be_u32(&mut self) -> Option<u32> {
+        self.take(4)
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn be_i32(&mut self) -> Option<i32> {
+        self.take(4)
+            .map(|b| i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn be_i64(&mut self) -> Option<i64> {
+        self.take(8)
+            .map(|b| i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    }
+}
+
+/// The six TZif header counts, in file order.
+struct TzCounts {
+    ut_indicators: u32,
+    std_indicators: u32,
+    leaps: u32,
+    transitions: u32,
+    types: u32,
+    chars: u32,
+}
+
+/// Read the six header counts after the magic, version, and reserved bytes.
+fn read_tz_counts(cursor: &mut TzCursor) -> Option<TzCounts> {
+    Some(TzCounts {
+        ut_indicators: cursor.be_u32()?,
+        std_indicators: cursor.be_u32()?,
+        leaps: cursor.be_u32()?,
+        transitions: cursor.be_u32()?,
+        types: cursor.be_u32()?,
+        chars: cursor.be_u32()?,
+    })
+}
+
+/// Skip a data block's leap-second and indicator tails (leaps are wider
+/// in 64-bit blocks).
+fn skip_tz_tail(cursor: &mut TzCursor, counts: &TzCounts, wide: bool) -> Option<()> {
+    let leap_len = if wide { 12 } else { 8 };
+    let leaps = usize::try_from(counts.leaps).ok()?;
+    cursor.take(leaps.checked_mul(leap_len)?)?;
+    let indicators = usize::try_from(counts.std_indicators)
+        .ok()?
+        .checked_add(usize::try_from(counts.ut_indicators).ok()?)?;
+    cursor.take(indicators)?;
+    Some(())
+}
+
+/// Skip one data block without retaining it (the 32-bit block when a
+/// 64-bit block follows).
+fn skip_tz_block(cursor: &mut TzCursor, counts: &TzCounts) -> Option<()> {
+    let times = usize::try_from(counts.transitions).ok()?;
+    let types = usize::try_from(counts.types).ok()?;
+    cursor.take(times.checked_mul(5)?.checked_add(types.checked_mul(6)?)?)?;
+    cursor.take(usize::try_from(counts.chars).ok()?)?;
+    skip_tz_tail(cursor, counts, false)
+}
+
+/// Read one data block's transition instants (narrow or wide). Never
+/// preallocates from the file's counts, so corrupt headers cannot exhaust
+/// memory; every push is gated by bytes actually present.
+fn read_tz_instants(cursor: &mut TzCursor, count: u32, wide: bool) -> Option<Vec<i64>> {
+    let mut instants = Vec::new();
+    for _ in 0..count {
+        let at = if wide {
+            cursor.be_i64()?
+        } else {
+            i64::from(cursor.be_i32()?)
+        };
+        instants.push(at);
+    }
+    Some(instants)
+}
+
+/// Pair transition instants with their type indices, rejecting indices
+/// past the type table.
+fn read_tz_indices(
+    cursor: &mut TzCursor,
+    instants: Vec<i64>,
+    type_count: usize,
+) -> Option<Vec<(i64, usize)>> {
+    let mut transitions = Vec::new();
+    for at in instants {
+        let index = usize::from(cursor.byte()?);
+        if index >= type_count {
+            return None;
+        }
+        transitions.push((at, index));
+    }
+    Some(transitions)
+}
+
+/// Read one data block's local-time type table.
+fn read_tz_types(cursor: &mut TzCursor, count: u32) -> Option<Vec<TzifType>> {
+    let mut types = Vec::new();
+    for _ in 0..count {
+        let utoff = i64::from(cursor.be_i32()?);
+        let is_dst = cursor.byte()? != 0;
+        cursor.byte()?;
+        types.push(TzifType { utoff, is_dst });
+    }
+    Some(types)
+}
+
+/// Read one data block's transitions and types (narrow or wide instants).
+fn read_tz_block(cursor: &mut TzCursor, counts: &TzCounts, wide: bool) -> Option<TzBlock> {
+    let instants = read_tz_instants(cursor, counts.transitions, wide)?;
+    let type_count = usize::try_from(counts.types).ok()?;
+    let transitions = read_tz_indices(cursor, instants, type_count)?;
+    let types = read_tz_types(cursor, counts.types)?;
+    if types.is_empty() {
+        return None;
+    }
+    cursor.take(usize::try_from(counts.chars).ok()?)?;
+    skip_tz_tail(cursor, counts, wide)?;
+    Some((transitions, types))
+}
+
+/// Type index for instants before the first transition: the first
+/// standard-time type, falling back to type 0.
+fn default_tz_type(types: &[TzifType]) -> usize {
+    types.iter().position(|tt| !tt.is_dst).unwrap_or(0)
+}
+
+/// The trailing `\n<posix-tz>\n` of a v2+ block, if well-formed.
+fn read_tz_footer(cursor: &TzCursor) -> Option<String> {
+    let text = str::from_utf8(cursor.data.get(cursor.pos..)?).ok()?;
+    let body = text.strip_prefix('\n')?.strip_suffix('\n')?;
+    if body.is_empty() || body.contains('\n') {
+        return None;
+    }
+    Some(body.to_string())
+}
+
+/// One TZif header: the version byte plus the six counts.
+struct TzHeader {
+    version: u8,
+    counts: TzCounts,
+}
+
+/// Read one header's magic, version, reserved bytes, and counts.
+fn read_tz_header(cursor: &mut TzCursor) -> Option<TzHeader> {
+    if cursor.take(4)? != b"TZif" {
+        return None;
+    }
+    let version = cursor.byte()?;
+    cursor.take(15)?;
+    let counts = read_tz_counts(cursor)?;
+    Some(TzHeader { version, counts })
+}
+
+/// Assemble parsed transitions, types, and footer into zone data.
+fn finish_tzif(
+    transitions: Vec<(i64, usize)>,
+    types: Vec<TzifType>,
+    footer: Option<String>,
+) -> TzifData {
+    TzifData {
+        default_type: default_tz_type(&types),
+        transitions,
+        types,
+        footer,
+    }
+}
+
+/// Parse TZif bytes (v1 narrow, or v2+ wide with a POSIX footer).
+fn parse_tzif(data: &[u8]) -> Option<TzifData> {
+    let mut cursor = TzCursor::new(data);
+    let header = read_tz_header(&mut cursor)?;
+    if header.version == 0 {
+        let (transitions, types) = read_tz_block(&mut cursor, &header.counts, false)?;
+        return Some(finish_tzif(transitions, types, None));
+    }
+    if !matches!(header.version, b'2' | b'3' | b'4') {
+        return None;
+    }
+    skip_tz_block(&mut cursor, &header.counts)?;
+    let header = read_tz_header(&mut cursor)?;
+    let (transitions, types) = read_tz_block(&mut cursor, &header.counts, true)?;
+    let footer = read_tz_footer(&cursor);
+    Some(finish_tzif(transitions, types, footer))
+}
+
+/// Seconds east of UTC at `now` under TZif `data`: the last explicit
+/// transition at or before `now`, the default type before the first one,
+/// or the POSIX footer after the last one.
+fn tzif_offset(data: &[u8], now: i64) -> Option<i64> {
+    let parsed = parse_tzif(data)?;
+    let mut current = parsed.default_type;
+    let mut after_last = true;
+    for (at, index) in parsed.transitions.iter().copied() {
+        if at <= now {
+            current = index;
+        } else {
+            after_last = false;
+        }
+    }
+    if after_last
+        && let Some(footer) = parsed.footer.as_deref()
+        && let Some(offset) = posix_offset(footer, now)
+    {
+        return Some(offset);
+    }
+    Some(parsed.types[current].utoff)
+}
+
+/// Zoneinfo files to try for a `TZ` name, in order (a slash also tries
+/// the name as a literal path first).
+fn tz_file_candidates(name: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    if name.contains('/') {
+        paths.push(name.to_string());
+    }
+    for dir in [
+        "/usr/share/zoneinfo",
+        "/var/db/timezone/zoneinfo",
+        "/usr/lib/zoneinfo",
+        "/etc/zoneinfo",
+    ] {
+        paths.push(format!("{dir}/{name}"));
+    }
+    paths
+}
+
+/// Offset from the first candidate file that parses as TZif.
+fn files_tz_offset(paths: &[String], now: i64) -> Option<i64> {
+    for path in paths {
+        if let Ok(bytes) = std::fs::read(path)
+            && let Some(offset) = tzif_offset(&bytes, now)
+        {
+            return Some(offset);
+        }
+    }
+    None
+}
+
+/// Offset for an explicit `TZ` value: `:path` reads one file, anything
+/// else tries zoneinfo files first (like glibc) then POSIX rules.
+fn env_tz_offset(tz: &str, now: i64) -> i64 {
+    if let Some(path) = tz.strip_prefix(':') {
+        return std::fs::read(path)
+            .ok()
+            .and_then(|bytes| tzif_offset(&bytes, now))
+            .unwrap_or(0);
+    }
+    if let Some(offset) = files_tz_offset(&tz_file_candidates(tz), now) {
+        return offset;
+    }
+    posix_offset(tz, now).unwrap_or(0)
+}
+
+/// Offset with `TZ` unset or empty: the system zone database, else UTC.
+fn system_tz_offset(now: i64) -> i64 {
+    if let Ok(bytes) = std::fs::read("/etc/localtime")
+        && let Some(offset) = tzif_offset(&bytes, now)
+    {
+        return offset;
+    }
+    if let Ok(name) = std::fs::read_to_string("/etc/timezone") {
+        let name = name.trim();
+        if !name.is_empty()
+            && let Some(offset) = files_tz_offset(&tz_file_candidates(name), now)
+        {
+            return offset;
+        }
+    }
+    0
+}
+
+/// Seconds east of UTC in effect at `now_unix` under the system timezone:
+/// explicit `TZ` first, then `/etc/localtime` (with `/etc/timezone` as a
+/// fallback), else UTC. Never fails; unreadable data falls back to UTC.
+pub fn local_utc_offset(now_unix: u64) -> i64 {
+    let now = now_unix as i64;
+    match std::env::var("TZ") {
+        Ok(tz) if !tz.is_empty() => env_tz_offset(&tz, now),
+        _ => system_tz_offset(now),
+    }
+}
+
+/// Local hour (0-23) for `now_unix` under the system timezone, mirroring
+/// PHP `date('G', $now)` (including DST) for the live clearing.
+#[must_use]
+pub fn local_hour(now_unix: u64) -> u32 {
+    hour_with_offset(now_unix, local_utc_offset(now_unix))
 }
 
 /// Approximate lunar phase for flavor text.
@@ -564,7 +1231,8 @@ pub fn query_published(cwd: &Path) -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// Plain-text clearing description for `now_unix` (no console markup).
+/// Plain-text clearing description for `now_unix` (no console markup),
+/// in UTC so an instant always renders identically.
 #[must_use]
 pub fn render_clearing(now_unix: u64) -> String {
     let mut out = format!("{}\n\n", clearing_text());
@@ -766,7 +1434,7 @@ fn render_published_output(hashes: &[String], ansi: bool) -> Result<String, Stri
 
 fn run_clearing(ansi: bool) -> ExitCode {
     let now = now_unix();
-    let time = hour_text(hour_of(now), lunar_phase(now as i64));
+    let time = hour_text(local_hour(now), lunar_phase(now as i64));
     let parts = [
         render_title(ansi),
         render_paragraph(clearing_text(), ansi),
