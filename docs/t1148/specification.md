@@ -52,8 +52,10 @@ one space matches Python `indent=1`).
   module is stdlib-only), `actions/cache` on `~/.cache/go-build`
   keyed by OS + `hashFiles('scripts/ci/go/**')`, then
   `gofmt`/`vet`/`test` and a `go build` of the five tools into
-  `./ci-tools-bin`. No Go code change = warm cache + fast rebuild;
-  no Docker image, no registry credentials involved.
+  `./ci-tools-bin`. The binaries themselves are also cached by
+  exact source hash: a hit skips setup/test/build entirely, and a
+  miss re-saves only after a successful build. No Docker image, no
+  registry credentials involved.
 - Gate invocation bind-mounts the host dir into the gate container
   (`docker run -v ./ci-tools-bin:/tools ... /tools/rust-quality-gates`);
   sibling tools resolve next to the running executable (the `LIB_DIR`
