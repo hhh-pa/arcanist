@@ -1,0 +1,6 @@
+# Go stub-test fixtures are fake inputs for the CI-tools tests —
+# including .rs files the Rust coverage report can never cover —
+# so they are excluded from coverage accounting. Real Go sources
+# are covered by the coverprofile the go-tools-test job uploads.
+ignore:
+  - "scripts/ci/go/**/testdata/**"
