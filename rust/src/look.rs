@@ -87,7 +87,7 @@ pub fn lunar_fraction(epoch: i64) -> f64 {
 #[must_use]
 pub fn lunar_phase(epoch: i64) -> LunarPhase {
     let phase = lunar_fraction(epoch);
-    if phase < 0.02 || phase > 0.98 {
+    if !(0.02..=0.98).contains(&phase) {
         LunarPhase::New
     } else if (phase - 0.5).abs() < 0.02 {
         LunarPhase::Full
