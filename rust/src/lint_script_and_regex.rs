@@ -420,6 +420,10 @@ fn is_executable_file(path: &std::path::Path) -> bool {
 }
 
 /// Shell command running `script` with the linted `path` appended.
+///
+/// The path is quoted with `escapeshellarg()` parity (see
+/// [`shell_quote_windows`]), matching the `%s` conversion of the PHP
+/// `ExecFuture('%C %s', $script, $path)`.
 #[must_use]
 pub fn script_command(script: &str, path: &str) -> String {
     format!("{script} {}", shell_quote(path))
@@ -469,8 +473,38 @@ fn shell_quote(argument: &str) -> String {
     }
     #[cfg(windows)]
     {
-        format!("\"{}\"", argument.replace('"', "\"\""))
+        shell_quote_windows(argument)
     }
+}
+
+/// Quote one argument for `cmd /C`, mirroring PHP's `escapeshellarg()`.
+///
+/// Ported from `php_escape_shell_arg()` (`ext/standard/exec.c`,
+/// `PHP_WIN32` branch), which is what the `%s` conversion of the PHP
+/// `ExecFuture('%C %s', $script, $path)` applies to the linted path
+/// (libphutil `xsprintf_command()`; `%C` passes the script through
+/// raw). `"`/`%`/`!` each become a space: `cmd.exe` expands `%VAR%`
+/// even inside double quotes (and `!VAR!` under delayed expansion),
+/// while a literal `"` would break out of the quoting, so a hostile
+/// filename must not survive. A trailing run of `\` with odd length
+/// gains one more `\` so the closing quote is not escaped. Pure and
+/// platform-independent so unit tests pin it on every OS (Rust `&str`
+/// is always valid UTF-8, so PHP's "drop invalid multibyte sequences"
+/// step is a no-op here).
+#[must_use]
+pub fn shell_quote_windows(argument: &str) -> String {
+    let mut inner = String::with_capacity(argument.len());
+    for ch in argument.chars() {
+        match ch {
+            '"' | '%' | '!' => inner.push(' '),
+            _ => inner.push(ch),
+        }
+    }
+    let trailing = inner.bytes().rev().take_while(|&b| b == b'\\').count();
+    if trailing % 2 == 1 {
+        inner.push('\\');
+    }
+    format!("\"{inner}\"")
 }
 
 fn nonempty(value: &Option<String>) -> Option<&str> {
