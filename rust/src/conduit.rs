@@ -152,16 +152,27 @@ impl Client {
         method: &str,
         params: &serde_json::Value,
     ) -> Result<serde_json::Value, Error> {
-        let mut map = match params {
-            serde_json::Value::Object(map) => map.clone(),
-            _ => return Err(Error::Protocol("params must be a JSON object".to_string())),
-        };
+        let mut map = call_params_map(params)?;
         if method == "conduit.connect" {
             apply_connect_auth(&mut map);
         }
-        let meta = self.build_meta(method, &map)?;
+        let (body, gzipped) = self.encode_call_body(method, &mut map)?;
+        let text = self.post_call_body(method, body, gzipped)?;
+        let result = parse_response(&text, method)?;
+        if method == "conduit.connect" {
+            self.store_session(&result);
+        }
+        Ok(result)
+    }
+
+    fn encode_call_body(
+        &self,
+        method: &str,
+        map: &mut serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(Vec<u8>, bool), Error> {
+        let meta = self.build_meta(method, map)?;
         map.insert("__conduit__".to_string(), serde_json::Value::Object(meta));
-        let json = serde_json::to_string(&map).map_err(|e| Error::Protocol(e.to_string()))?;
+        let json = serde_json::to_string(&map).map_err(json_protocol_error)?;
         // PHP `json_encode()` escapes `/` as `\/`; serde does not.
         let json = json.replace('/', "\\/");
         let query = build_query(&json);
@@ -171,7 +182,10 @@ impl Client {
         } else {
             query.into_bytes()
         };
+        Ok((body, gzipped))
+    }
 
+    fn post_call_body(&self, method: &str, body: Vec<u8>, gzipped: bool) -> Result<String, Error> {
         let url = format!("{}{}", self.base, method);
         // PHP sends `Content-Type: application/x-www-form-urlencoded` (cURL
         // default for POST fields) with the raw querystring body.
@@ -193,30 +207,19 @@ impl Client {
         if let Some((username, password)) = &self.basic_auth {
             request = request.basic_auth(username, Some(password));
         }
-        let response = request
-            .send()
-            .map_err(|e| Error::Transport(e.to_string()))?;
-        let status = response.status();
-        if !(200..300).contains(&status.as_u16()) {
-            return Err(Error::Transport(format!(
-                "Host returned HTTP/{} in response to a Conduit method call.",
-                status.as_u16()
-            )));
-        }
+        let response = request.send().map_err(transport_error)?;
+        check_call_status(response.status())?;
+        self.absorb_capabilities(&response);
+        response.text().map_err(transport_error)
+    }
+
+    fn absorb_capabilities(&self, response: &reqwest::blocking::Response) {
         if let Some(raw) = response.headers().get("x-conduit-capabilities")
             && let Ok(text) = raw.to_str()
         {
             let caps: Vec<String> = text.split(' ').map(str::to_string).collect();
             self.enable_capabilities(&caps);
         }
-        let text = response
-            .text()
-            .map_err(|e| Error::Transport(e.to_string()))?;
-        let result = parse_response(&text, method)?;
-        if method == "conduit.connect" {
-            self.store_session(&result);
-        }
-        Ok(result)
     }
 
     fn build_meta(
@@ -436,6 +439,34 @@ fn rawurlencode(input: &str) -> String {
         }
     }
     out
+}
+
+fn call_params_map(
+    params: &serde_json::Value,
+) -> Result<serde_json::Map<String, serde_json::Value>, Error> {
+    match params {
+        serde_json::Value::Object(map) => Ok(map.clone()),
+        _ => Err(Error::Protocol("params must be a JSON object".to_string())),
+    }
+}
+
+fn transport_error(error: reqwest::Error) -> Error {
+    Error::Transport(error.to_string())
+}
+
+fn json_protocol_error(error: serde_json::Error) -> Error {
+    Error::Protocol(error.to_string())
+}
+
+fn check_call_status(status: reqwest::StatusCode) -> Result<(), Error> {
+    if (200..300).contains(&status.as_u16()) {
+        Ok(())
+    } else {
+        Err(Error::Transport(format!(
+            "Host returned HTTP/{} in response to a Conduit method call.",
+            status.as_u16()
+        )))
+    }
 }
 
 fn build_query(params_json: &str) -> String {

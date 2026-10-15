@@ -402,13 +402,8 @@ impl<'a> Engine<'a> {
         }
     }
 
-    fn resolve_arc_rule(
-        &mut self,
-        rule: &str,
-        name: &str,
-        source: &'static str,
-    ) -> Result<RuleOutcome, String> {
-        let name = match name {
+    fn translate_legacy_arc_name<'b>(&mut self, name: &'b str) -> &'b str {
+        match name {
             "global" => {
                 self.log("Translating legacy name 'global' to 'user'");
                 "user"
@@ -418,34 +413,40 @@ impl<'a> Engine<'a> {
                 "runtime"
             }
             other => other,
+        }
+    }
+
+    fn resolve_arc_verbose(&mut self) -> Result<RuleOutcome, String> {
+        self.verbose = true;
+        self.log("Enabled verbose mode.");
+        Ok(RuleOutcome::NoMatch)
+    }
+
+    fn resolve_arc_prompt(&mut self) -> Result<RuleOutcome, String> {
+        self.explain("it is what you typed when prompted.".to_string());
+        let answer = (self.prompt)("Against which commit?").unwrap_or_default();
+        if answer.is_empty() {
+            Ok(RuleOutcome::NoMatch)
+        } else {
+            Ok(RuleOutcome::Commit(answer))
+        }
+    }
+
+    fn resolve_arc_source(&mut self, name: &str) -> Result<RuleOutcome, String> {
+        let target: &'static str = match name {
+            "local" => "local",
+            "user" => "user",
+            "project" => "project",
+            "runtime" => "runtime",
+            _ => "system",
         };
+        self.retry.insert(0, target);
+        self.log(&format!("Switching to source '{name}'."));
+        Ok(RuleOutcome::NextRuleset)
+    }
+
+    fn resolve_arc_flow(&mut self, name: &str, source: &str) -> Result<RuleOutcome, String> {
         match name {
-            "verbose" => {
-                self.verbose = true;
-                self.log("Enabled verbose mode.");
-                Ok(RuleOutcome::NoMatch)
-            }
-            "prompt" => {
-                self.explain("it is what you typed when prompted.".to_string());
-                let answer = (self.prompt)("Against which commit?").unwrap_or_default();
-                if answer.is_empty() {
-                    Ok(RuleOutcome::NoMatch)
-                } else {
-                    Ok(RuleOutcome::Commit(answer))
-                }
-            }
-            "local" | "user" | "project" | "runtime" | "system" => {
-                let target: &'static str = match name {
-                    "local" => "local",
-                    "user" => "user",
-                    "project" => "project",
-                    "runtime" => "runtime",
-                    _ => "system",
-                };
-                self.retry.insert(0, target);
-                self.log(&format!("Switching to source '{name}'."));
-                Ok(RuleOutcome::NextRuleset)
-            }
             "yield" => {
                 let head = self.retry.remove(0);
                 self.retry.push(head);
@@ -457,23 +458,54 @@ impl<'a> Engine<'a> {
                 self.log("Halting all rule processing.");
                 Ok(RuleOutcome::NextRuleset)
             }
-            "skip" => Ok(RuleOutcome::NoMatch),
-            "empty" | "upstream" | "outgoing" | "bookmark" | "amended" | "this" => Ok(self
-                .resolve_git_rule(rule, name, source)?
-                .map_or(RuleOutcome::NoMatch, RuleOutcome::Commit)),
-            _ => {
-                if let Some(inner) = strip_wrapped(name, "exec(", ")") {
-                    return Ok(self
-                        .run_exec(inner)
-                        .map_or(RuleOutcome::NoMatch, RuleOutcome::Commit));
-                }
-                if strip_wrapped(name, "nodiff(", ")").is_some() {
-                    return Ok(self
-                        .resolve_git_rule(rule, name, source)?
-                        .map_or(RuleOutcome::NoMatch, RuleOutcome::Commit));
-                }
-                Err(unknown_rule(rule, source))
+            _ => Ok(RuleOutcome::NoMatch),
+        }
+    }
+
+    fn resolve_arc_git(
+        &mut self,
+        rule: &str,
+        name: &str,
+        source: &'static str,
+    ) -> Result<RuleOutcome, String> {
+        Ok(self
+            .resolve_git_rule(rule, name, source)?
+            .map_or(RuleOutcome::NoMatch, RuleOutcome::Commit))
+    }
+
+    fn resolve_arc_fallback(
+        &mut self,
+        rule: &str,
+        name: &str,
+        source: &'static str,
+    ) -> Result<RuleOutcome, String> {
+        if let Some(inner) = strip_wrapped(name, "exec(", ")") {
+            return Ok(self
+                .run_exec(inner)
+                .map_or(RuleOutcome::NoMatch, RuleOutcome::Commit));
+        }
+        if strip_wrapped(name, "nodiff(", ")").is_some() {
+            return self.resolve_arc_git(rule, name, source);
+        }
+        Err(unknown_rule(rule, source))
+    }
+
+    fn resolve_arc_rule(
+        &mut self,
+        rule: &str,
+        name: &str,
+        source: &'static str,
+    ) -> Result<RuleOutcome, String> {
+        let name = self.translate_legacy_arc_name(name);
+        match name {
+            "verbose" => self.resolve_arc_verbose(),
+            "prompt" => self.resolve_arc_prompt(),
+            "local" | "user" | "project" | "runtime" | "system" => self.resolve_arc_source(name),
+            "yield" | "halt" | "skip" => self.resolve_arc_flow(name, source),
+            "empty" | "upstream" | "outgoing" | "bookmark" | "amended" | "this" => {
+                self.resolve_arc_git(rule, name, source)
             }
+            _ => self.resolve_arc_fallback(rule, name, source),
         }
     }
 
@@ -1213,6 +1245,95 @@ fn row_string(row: &serde_json::Value, key: &str) -> String {
 /// Differential revisions matching the working copy, mirroring
 /// `ArcanistGitAPI::loadWorkingCopyDifferentialRevisions()`: explicit
 /// `Differential Revision` footers first, commit/tree hashes second.
+fn conduit_error_text(error: conduit::Error) -> String {
+    error.to_string()
+}
+
+fn hash_prefix(hash: &str) -> String {
+    hash.chars().take(16).collect()
+}
+
+fn collect_explicit_revision_ids(
+    messages: &[(String, String)],
+) -> Result<
+    (
+        Vec<serde_json::Value>,
+        std::collections::BTreeMap<String, String>,
+    ),
+    String,
+> {
+    let mut ids: Vec<serde_json::Value> = Vec::new();
+    let mut reasons: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for (hash, corpus) in messages {
+        if let Some(id) = revision_id_from_corpus(corpus)? {
+            ids.push(id_number(&id));
+            reasons.insert(id, hash.clone());
+        }
+    }
+    Ok((ids, reasons))
+}
+
+fn query_revisions_by_hashes(
+    client: &conduit::Client,
+    dir: &Path,
+    base: &str,
+    head: &str,
+    status: &str,
+) -> Result<Vec<(String, String, String, String)>, String> {
+    let info = local_commit_information(dir, base, head)?;
+    let mut hashes: Vec<serde_json::Value> = Vec::new();
+    for commit in &info {
+        hashes.push(serde_json::json!(["gtcm", commit.commit]));
+        hashes.push(serde_json::json!(["gttr", commit.tree]));
+    }
+    let result = client
+        .call(
+            "differential.query",
+            &serde_json::json!({"status": status, "commitHashes": hashes}),
+        )
+        .map_err(conduit_error_text)?;
+    let mut rows = Vec::new();
+    for row in query_rows(&result) {
+        rows.push((
+            row_string(row, "id"),
+            row_string(row, "title"),
+            row_string(row, "authorPHID"),
+            "A git commit or tree hash in the commit range is already attached to the Differential revision."
+                .to_string(),
+        ));
+    }
+    Ok(rows)
+}
+
+fn query_revisions_by_ids(
+    client: &conduit::Client,
+    ids: Vec<serde_json::Value>,
+    reasons: &std::collections::BTreeMap<String, String>,
+    status: &str,
+) -> Result<Vec<(String, String, String, String)>, String> {
+    let result = client
+        .call(
+            "differential.query",
+            &serde_json::json!({"status": status, "ids": ids}),
+        )
+        .map_err(conduit_error_text)?;
+    let mut rows = Vec::new();
+    for row in query_rows(&result) {
+        let id = row_string(row, "id");
+        let hash16: String = reasons
+            .get(&id)
+            .map(|hash| hash_prefix(hash))
+            .unwrap_or_default();
+        rows.push((
+            id,
+            row_string(row, "title"),
+            row_string(row, "authorPHID"),
+            format!("Commit message for '{hash16}' has explicit 'Differential Revision'."),
+        ));
+    }
+    Ok(rows)
+}
+
 pub fn match_working_copy_revisions(
     client: &conduit::Client,
     dir: &Path,
@@ -1229,63 +1350,11 @@ pub fn match_working_copy_revisions(
     } else {
         "status-open"
     };
-    let mut ids: Vec<serde_json::Value> = Vec::new();
-    let mut reasons: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    for (hash, corpus) in &messages {
-        if let Some(id) = revision_id_from_corpus(corpus)? {
-            ids.push(id_number(&id));
-            reasons.insert(id, hash.clone());
-        }
-    }
-    let rows: Vec<(String, String, String, String)> = if ids.is_empty() {
-        let info = local_commit_information(dir, base, head)?;
-        let mut hashes: Vec<serde_json::Value> = Vec::new();
-        for commit in &info {
-            hashes.push(serde_json::json!(["gtcm", commit.commit]));
-            hashes.push(serde_json::json!(["gttr", commit.tree]));
-        }
-        let result = client
-            .call(
-                "differential.query",
-                &serde_json::json!({"status": status, "commitHashes": hashes}),
-            )
-            .map_err(|e| e.to_string())?;
-        query_rows(&result)
-            .into_iter()
-            .map(|row| {
-                (
-                    row_string(row, "id"),
-                    row_string(row, "title"),
-                    row_string(row, "authorPHID"),
-                    "A git commit or tree hash in the commit range is already attached to the \
-                     Differential revision."
-                        .to_string(),
-                )
-            })
-            .collect()
+    let (ids, reasons) = collect_explicit_revision_ids(&messages)?;
+    let rows = if ids.is_empty() {
+        query_revisions_by_hashes(client, dir, base, head, status)?
     } else {
-        let result = client
-            .call(
-                "differential.query",
-                &serde_json::json!({"status": status, "ids": ids}),
-            )
-            .map_err(|e| e.to_string())?;
-        query_rows(&result)
-            .into_iter()
-            .map(|row| {
-                let id = row_string(row, "id");
-                let hash16: String = reasons
-                    .get(&id)
-                    .map(|h| h.chars().take(16).collect())
-                    .unwrap_or_default();
-                (
-                    id,
-                    row_string(row, "title"),
-                    row_string(row, "authorPHID"),
-                    format!("Commit message for '{hash16}' has explicit 'Differential Revision'."),
-                )
-            })
-            .collect()
+        query_revisions_by_ids(client, ids, &reasons, status)?
     };
     attach_authors(client, rows)
 }
@@ -1337,6 +1406,98 @@ fn attach_authors(
 /// `ARC_CONDUIT_URI` value, `explicit_base` pins the base, `head_ref`
 /// pins the range end, and `resolution` carries `--base` rules, the
 /// prompt hook, and revision matching.
+fn path_display(path: PathBuf) -> String {
+    path.to_string_lossy().to_string()
+}
+
+struct RepoIdentity {
+    vcs_root: Option<String>,
+    branch: Option<String>,
+    head: Option<String>,
+    head_subject: Option<String>,
+    remote_url: Option<String>,
+}
+
+fn load_repo_identity(dir: &Path, head_ref: &str, in_repo: bool) -> RepoIdentity {
+    if !in_repo {
+        return RepoIdentity {
+            vcs_root: None,
+            branch: None,
+            head: None,
+            head_subject: None,
+            remote_url: None,
+        };
+    }
+    let root = git::stdout_text(dir, &["rev-parse", "--show-toplevel"]).ok();
+    let branch = git::stdout_text(dir, &["symbolic-ref", "--short", "HEAD"]).ok();
+    let head = rev_to_commit(dir, head_ref);
+    let head_subject = match &head {
+        Some(sha) => git::stdout_text(dir, &["log", "-1", "--format=%s", sha]).ok(),
+        None => None,
+    };
+    let remote = git::stdout_text(dir, &["config", "--get", "remote.origin.url"]).ok();
+    RepoIdentity {
+        vcs_root: root,
+        branch,
+        head,
+        head_subject,
+        remote_url: remote,
+    }
+}
+
+struct RangeResolution {
+    base: String,
+    explanation: String,
+    commits: Vec<Commit>,
+    matching: Matching,
+}
+
+fn resolve_report_range(
+    dir: &Path,
+    user_file: Option<&Path>,
+    explicit_base: Option<&str>,
+    head_ref: &str,
+    head_explicit: bool,
+    resolution: &Resolution<'_>,
+) -> Result<RangeResolution, String> {
+    let loaded = load_config_sources(dir, user_file)?;
+    let inputs = BaseInputs {
+        runtime_rules: resolution.runtime_rules,
+        prompt: resolution.prompt,
+    };
+    let (base, why) = resolve_base(
+        dir,
+        explicit_base,
+        head_ref,
+        head_explicit,
+        &loaded,
+        &inputs,
+    )?;
+    if !has_any_commit(dir) {
+        return Err(
+            "You can't get local commit information for a repository with no commits.".to_string(),
+        );
+    }
+    let resolved_head = resolve_head(dir, head_ref)?;
+    if head_explicit && base != GIT_MAGIC_ROOT_COMMIT {
+        check_range_direction(dir, &base, &resolved_head, head_ref)?;
+    }
+    let commits = commits_between(dir, &base, head_ref)?;
+    let matching =
+        match &resolution.match_config {
+            MatchConfig::Unavailable(reason) => Matching::Unavailable(reason.clone()),
+            MatchConfig::Live { client, any_status } => Matching::Found(
+                match_working_copy_revisions(client, dir, &base, head_ref, *any_status)?,
+            ),
+        };
+    Ok(RangeResolution {
+        base,
+        explanation: why,
+        commits,
+        matching,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn load_context(
     dir: &Path,
@@ -1349,18 +1510,7 @@ pub fn load_context(
     resolution: &Resolution<'_>,
 ) -> Result<Context, String> {
     let in_repo = git::is_inside_work_tree(dir);
-    let (vcs_root, branch, head, head_subject, remote_url) = if in_repo {
-        let root = git::stdout_text(dir, &["rev-parse", "--show-toplevel"]).ok();
-        let branch = git::stdout_text(dir, &["symbolic-ref", "--short", "HEAD"]).ok();
-        let head = rev_to_commit(dir, head_ref);
-        let head_subject = head
-            .as_ref()
-            .and_then(|sha| git::stdout_text(dir, &["log", "-1", "--format=%s", sha]).ok());
-        let remote = git::stdout_text(dir, &["config", "--get", "remote.origin.url"]).ok();
-        (root, branch, head, head_subject, remote)
-    } else {
-        (None, None, None, None, None)
-    };
+    let identity = load_repo_identity(dir, head_ref, in_repo);
     let (project_root, project_file) = find_project(dir);
     let callsign = read_callsign(project_file.as_deref(), user_file);
     let (conduit_uri, conduit_source) = resolve_conduit_in(dir, flag_uri, env);
@@ -1368,52 +1518,39 @@ pub fn load_context(
         .as_ref()
         .map(|uri| token_installed(user_file, uri));
     let (base, explanation, commits, matching) = if in_repo {
-        let loaded = load_config_sources(dir, user_file)?;
-        let inputs = BaseInputs {
-            runtime_rules: resolution.runtime_rules,
-            prompt: resolution.prompt,
-        };
-        let (base, why) = resolve_base(
+        let range = resolve_report_range(
             dir,
+            user_file,
             explicit_base,
             head_ref,
             head_explicit,
-            &loaded,
-            &inputs,
+            resolution,
         )?;
-        if !has_any_commit(dir) {
-            return Err(
-                "You can't get local commit information for a repository with no commits."
-                    .to_string(),
-            );
-        }
-        let resolved_head = resolve_head(dir, head_ref)?;
-        if head_explicit && base != GIT_MAGIC_ROOT_COMMIT {
-            check_range_direction(dir, &base, &resolved_head, head_ref)?;
-        }
-        let commits = commits_between(dir, &base, head_ref)?;
-        let matching = match &resolution.match_config {
-            MatchConfig::Unavailable(reason) => Matching::Unavailable(reason.clone()),
-            MatchConfig::Live { client, any_status } => Matching::Found(
-                match_working_copy_revisions(client, dir, &base, head_ref, *any_status)?,
-            ),
-        };
-        (Some(base), Some(why), commits, matching)
+        (
+            Some(range.base),
+            Some(range.explanation),
+            range.commits,
+            range.matching,
+        )
     } else {
         (None, None, Vec::new(), Matching::OutsideRepo)
+    };
+    let (callsign_name, callsign_source) = match callsign {
+        Some((name, source)) => (Some(name), Some(source)),
+        None => (None, None),
     };
     Ok(Context {
         dir: dir.to_string_lossy().to_string(),
         vcs: if in_repo { "git" } else { "none" },
-        vcs_root,
-        project_root: project_root.map(|p| p.to_string_lossy().to_string()),
-        project_file: project_file.map(|p| p.to_string_lossy().to_string()),
-        branch,
-        head,
-        head_subject,
-        remote_url,
-        callsign: callsign.as_ref().map(|(name, _)| name.clone()),
-        callsign_source: callsign.map(|(_, source)| source),
+        vcs_root: identity.vcs_root,
+        project_root: project_root.map(path_display),
+        project_file: project_file.map(path_display),
+        branch: identity.branch,
+        head: identity.head,
+        head_subject: identity.head_subject,
+        remote_url: identity.remote_url,
+        callsign: callsign_name,
+        callsign_source,
         conduit_uri,
         conduit_source,
         token_installed: token,
@@ -1421,7 +1558,10 @@ pub fn load_context(
         base_explanation: explanation,
         head_ref: head_ref.to_string(),
         commits,
-        diff_arg: explicit_base.map_or_else(String::new, |c| format!(" {c}")),
+        diff_arg: match explicit_base {
+            Some(base) => format!(" {base}"),
+            None => String::new(),
+        },
         matching,
     })
 }

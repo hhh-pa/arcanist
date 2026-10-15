@@ -745,59 +745,110 @@ fn run_certificate_flow(
     }
 }
 
-/// Entry point: `argv` excludes the subcommand name.
-pub fn run(argv: &[String]) -> ExitCode {
-    let options = match install_options(argv) {
-        Ok(options) => options,
-        Err(code) => return code,
+struct InstallPlan {
+    options: Options,
+    uri: String,
+    arcrc: PathBuf,
+    doc: serde_json::Value,
+}
+
+fn prepare_install(argv: &[String]) -> Result<InstallPlan, ExitCode> {
+    let options = install_options(argv)?;
+    let cwd = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(_) => PathBuf::from("."),
     };
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let uri = match resolve_install_uri(&options, &cwd) {
-        Ok(uri) => uri,
-        Err(code) => return code,
-    };
-    let arcrc = match install_arcrc() {
-        Ok(path) => path,
-        Err(code) => return code,
-    };
-    let mut doc = match read_token_doc(&arcrc) {
+    let uri = resolve_install_uri(&options, &cwd)?;
+    let arcrc = install_arcrc()?;
+    let doc = match read_token_doc(&arcrc) {
         Ok(doc) => doc,
-        Err(message) => return fail(message),
+        Err(message) => return Err(fail(message)),
     };
-    let ansi = terminal::ansi_enabled();
-    eprint!("{}", render_connect(&uri, ansi));
-    let mut client = match conduit::Client::new(&uri, "") {
+    Ok(InstallPlan {
+        options,
+        uri,
+        arcrc,
+        doc,
+    })
+}
+
+fn connect_install_client(uri: &str, ansi: bool) -> Result<(conduit::Client, bool), ExitCode> {
+    eprint!("{}", render_connect(uri, ansi));
+    let client = match conduit::Client::new(uri, "") {
         Ok(client) => client,
-        Err(e) => return fail(format!("Failed to connect to server ({uri}): {e}")),
+        Err(e) => {
+            return Err(fail(format!("Failed to connect to server ({uri}): {e}")));
+        }
     };
     let call = |method: &str, params: &serde_json::Value| {
         client.call(method, params).map_err(|e| e.to_string())
     };
-    if let Err(message) = ping_with(&call, &uri) {
-        return fail(message);
+    if let Err(message) = ping_with(&call, uri) {
+        return Err(fail(message));
     }
     let is_token_auth = detect_token_auth(&call);
+    Ok((client, is_token_auth))
+}
+
+fn read_install_token(
+    uri: &str,
+    is_token_auth: bool,
+    ansi: bool,
+    options: &Options,
+) -> Result<String, ExitCode> {
     match render_login_header(ansi) {
         Ok(header) => print!("{header}"),
-        Err(message) => return fail(message),
+        Err(message) => return Err(fail(message)),
     }
-    let token_url = token_login_url(&uri, is_token_auth);
+    let token_url = token_login_url(uri, is_token_auth);
     println!("{}", login_page_block(&token_url));
-    let token = match install_token_value(&options) {
+    install_token_value(options)
+}
+
+fn run_install_flow(
+    uri: &str,
+    token: &str,
+    arcrc: &Path,
+    doc: &mut serde_json::Value,
+    force: bool,
+    client: &mut conduit::Client,
+    is_token_auth: bool,
+) -> Result<(), ExitCode> {
+    let flow = if is_token_auth {
+        run_token_flow(uri, token, arcrc, doc, force, client)
+    } else {
+        run_certificate_flow(uri, token, arcrc, doc, client)
+    };
+    flow?;
+    println!("{}", writing_message());
+    write_token_doc(arcrc, doc).map_err(fail)
+}
+
+/// Entry point: `argv` excludes the subcommand name.
+pub fn run(argv: &[String]) -> ExitCode {
+    let mut plan = match prepare_install(argv) {
+        Ok(plan) => plan,
+        Err(code) => return code,
+    };
+    let ansi = terminal::ansi_enabled();
+    let (mut client, is_token_auth) = match connect_install_client(&plan.uri, ansi) {
+        Ok(pair) => pair,
+        Err(code) => return code,
+    };
+    let token = match read_install_token(&plan.uri, is_token_auth, ansi, &plan.options) {
         Ok(token) => token,
         Err(code) => return code,
     };
-    let flow = if is_token_auth {
-        run_token_flow(&uri, &token, &arcrc, &mut doc, options.force, &mut client)
-    } else {
-        run_certificate_flow(&uri, &token, &arcrc, &mut doc, &client)
-    };
-    if let Err(code) = flow {
+    if let Err(code) = run_install_flow(
+        &plan.uri,
+        &token,
+        &plan.arcrc,
+        &mut plan.doc,
+        plan.options.force,
+        &mut client,
+        is_token_auth,
+    ) {
         return code;
-    }
-    println!("{}", writing_message());
-    if let Err(message) = write_token_doc(&arcrc, &doc) {
-        return fail(message);
     }
     print!("{}", render_success(is_token_auth, ansi));
     ExitCode::SUCCESS

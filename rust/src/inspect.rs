@@ -286,65 +286,51 @@ pub fn inspect_one_with(
     }
 }
 
-/// Inspect in `dir` per `argv`, with an injected Conduit caller (`None`
-/// builds one from config, only when `--explore` meets `browse(...)`).
-pub fn run_in_with(
-    dir: &Path,
-    argv: &[String],
-    call: Option<&diff_submit::ConduitCall>,
-) -> ExitCode {
-    let options = match parse_args(argv) {
+fn conduit_error_text(error: arc_rs::conduit::Error) -> String {
+    error.to_string()
+}
+
+fn parse_inspect_options(argv: &[String]) -> Result<Options, ExitCode> {
+    match parse_args(argv) {
         ParseOutcome::Help => {
             print!("{}", usage());
-            return ExitCode::SUCCESS;
+            Err(ExitCode::SUCCESS)
         }
         ParseOutcome::Error(message) => {
             eprintln!("arc-rs {NAME}: {message}\n\n{}", usage());
-            return ExitCode::FAILURE;
+            Err(ExitCode::FAILURE)
         }
-        ParseOutcome::Args(options) => options,
-    };
-    if options.objects.is_empty() {
-        let mut text = "Choose an object to inspect:\n\n".to_string();
-        for name in SUPPORTED_TYPES {
-            text.push_str(&format!("    - {name}\n"));
-        }
-        text.push('\n');
-        print!("{text}");
-        return ExitCode::SUCCESS;
+        ParseOutcome::Args(options) => Ok(options),
     }
-    let wants_browse = options.explore
-        && options.objects.iter().any(|spec| {
-            parse_spec(spec)
-                .map(|parsed| parsed.function == "browse")
-                .unwrap_or(false)
-        });
-    let client;
-    let live;
-    let call: Option<&diff_submit::ConduitCall> = match (wants_browse, call) {
-        (false, _) => None,
-        (true, Some(call)) => Some(call),
-        (true, None) => match config::client_for(None) {
-            Ok(built) => {
-                client = built;
-                live = |method: &str, params: &serde_json::Value| {
-                    client.call(method, params).map_err(|e| e.to_string())
-                };
-                Some(&live)
-            }
-            Err(message) => {
-                eprintln!("arc-rs {NAME}: {message}");
-                return ExitCode::FAILURE;
-            }
-        },
-    };
-    let mut ctx_holder = None;
-    if let Some(call) = call {
-        ctx_holder = Some(browse::BrowseCtx::new(dir, call, ""));
+}
+
+fn print_object_choices() {
+    let mut text = "Choose an object to inspect:\n\n".to_string();
+    for name in SUPPORTED_TYPES {
+        text.push_str(&format!("    - {name}\n"));
     }
+    text.push('\n');
+    print!("{text}");
+}
+
+fn is_browse_spec(spec: &str) -> bool {
+    parse_spec(spec)
+        .map(|parsed| parsed.function == "browse")
+        .unwrap_or(false)
+}
+
+fn wants_browse_client(options: &Options) -> bool {
+    options.explore && options.objects.iter().any(|spec| is_browse_spec(spec))
+}
+
+fn finish_inspect_blocks(
+    dir: &Path,
+    options: &Options,
+    mut ctx: Option<&mut browse::BrowseCtx>,
+) -> ExitCode {
     let mut blocks = Vec::new();
     for spec in &options.objects {
-        match inspect_one_with(dir, spec, options.explore, ctx_holder.as_mut()) {
+        match inspect_one_with(dir, spec, options.explore, ctx.as_deref_mut()) {
             Ok(block) => blocks.push(block),
             Err(message) => {
                 eprintln!("arc-rs {NAME}: {message}");
@@ -354,6 +340,53 @@ pub fn run_in_with(
     }
     print!("{}", blocks.join("\n"));
     ExitCode::SUCCESS
+}
+
+fn run_inspect_objects(
+    dir: &Path,
+    options: &Options,
+    call: Option<&diff_submit::ConduitCall>,
+) -> ExitCode {
+    if !wants_browse_client(options) {
+        return finish_inspect_blocks(dir, options, None);
+    }
+    match call {
+        Some(call) => {
+            let mut ctx = browse::BrowseCtx::new(dir, call, "");
+            finish_inspect_blocks(dir, options, Some(&mut ctx))
+        }
+        None => match config::client_for(None) {
+            Ok(client) => {
+                let live = |method: &str, params: &serde_json::Value| {
+                    client.call(method, params).map_err(conduit_error_text)
+                };
+                let mut ctx = browse::BrowseCtx::new(dir, &live, "");
+                finish_inspect_blocks(dir, options, Some(&mut ctx))
+            }
+            Err(message) => {
+                eprintln!("arc-rs {NAME}: {message}");
+                ExitCode::FAILURE
+            }
+        },
+    }
+}
+
+/// Inspect in `dir` per `argv`, with an injected Conduit caller (`None`
+/// builds one from config, only when `--explore` meets `browse(...)`).
+pub fn run_in_with(
+    dir: &Path,
+    argv: &[String],
+    call: Option<&diff_submit::ConduitCall>,
+) -> ExitCode {
+    let options = match parse_inspect_options(argv) {
+        Ok(options) => options,
+        Err(code) => return code,
+    };
+    if options.objects.is_empty() {
+        print_object_choices();
+        return ExitCode::SUCCESS;
+    }
+    run_inspect_objects(dir, &options, call)
 }
 
 /// Inspect in `dir` per `argv`.
