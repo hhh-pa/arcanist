@@ -3,9 +3,18 @@
 # Cached on Docker Hub content-addressed by dependency inputs (see the job's
 # key): a cache hit pulls this image and runs the gates inside it; a miss
 # rebuilds here and pushes, then runs the gates. Pinned tool versions come
-# from scripts/ci/lib/rust-quality-gates.py via --provision-only, so the
-# image and the run cannot disagree; only the base stable toolchain floats
-# (same as the dtolnay stable toolchain this replaces, lagged by rebuilds).
+# from the Go gates binary via --provision-only, so the image and the run
+# cannot disagree; only the base stable toolchain floats (same as the
+# dtolnay stable toolchain this replaces, lagged by rebuilds).
+
+# The gates binary for provisioning (siblings are never called by
+# --provision-only, so only it is built here).
+ARG GO_VERSION=1.27
+FROM golang:${GO_VERSION}-trixie AS gobuild
+WORKDIR /src
+COPY scripts/ci/go/ ./go/
+RUN cd go && CGO_ENABLED=0 go build -o /tools/rust-quality-gates ./cmd/rust-quality-gates
+
 FROM rust:slim-trixie
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -32,10 +41,10 @@ RUN git config --system --add safe.directory /work
 # Provision every pinned gate tool. Prebuilt downloads that cannot execute
 # on this libc compile here once (see ensure_tool), so runtime provisioning
 # inside CI is always a fast no-op.
-COPY scripts/ci/lib/ /tmp/gates-lib/
+COPY --from=gobuild /tools/rust-quality-gates /tmp/gates-bin/rust-quality-gates
 RUN mkdir -p /tmp/prov-work \
-    && python3 /tmp/gates-lib/rust-quality-gates.py /tmp/prov-work --provision-only \
-    && rm -rf /tmp/prov-work /tmp/gates-lib /usr/local/cargo/registry
+    && /tmp/gates-bin/rust-quality-gates /tmp/prov-work --provision-only \
+    && rm -rf /tmp/prov-work /tmp/gates-bin /usr/local/cargo/registry
 
 # Prebuilt dependency tree ("builder" layer): compiling the workspace's
 # dependencies once here means gate runs rebuild arc-rs itself only.
@@ -54,11 +63,11 @@ RUN mkdir -p /tmp/prov-work \
 # re-extraction would stale every prebuilt unit.
 ENV CARGO_TARGET_DIR=/opt/target
 COPY rust/Cargo.toml rust/Cargo.lock /tmp/warm/rust/
-COPY scripts/ci/lib/rust-quality-gates.py /tmp/warm/pins.py
+COPY scripts/ci/go/cmd/rust-quality-gates/main.go /tmp/warm/pins.go
 RUN mkdir -p /tmp/warm/rust/src && printf 'fn main() {}\n' > /tmp/warm/rust/src/main.rs \
     && cd /tmp/warm/rust && cargo fetch \
     && cargo test --no-run \
-    && NIGHTLY=$(grep -E '^UDEPS_NIGHTLY = ' /tmp/warm/pins.py | cut -d'"' -f2) \
+    && NIGHTLY=$(grep -E '^\s*UDEPSNightly = ' /tmp/warm/pins.go | cut -d'"' -f2) \
     && [ -n "$NIGHTLY" ] \
     && UDEPS_LOG=/tmp/warm/udeps.log \
     && { NIGHTLY_TARGET="${CARGO_TARGET_DIR}/nightly"; \

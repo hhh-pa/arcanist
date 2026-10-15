@@ -68,7 +68,7 @@ jobs:
       # and runs the gates in it; a miss rebuilds, pushes, then runs.
       - name: compute image key
         run: |
-          key="${{ hashFiles('rust/Cargo.lock', 'scripts/ci/quality-gates.Dockerfile', 'scripts/ci/lib/*.py') }}"
+          key="${{ hashFiles('rust/Cargo.lock', 'scripts/ci/quality-gates.Dockerfile', 'scripts/ci/go/**') }}"
           echo "GATE_KEY=$key" >> "$GITHUB_ENV"
           echo "Gate image: $GATE_IMAGE:$key"
       - name: pull gate image
@@ -107,9 +107,9 @@ jobs:
               -t "$GATE_IMAGE:$GATE_KEY" -f scripts/ci/quality-gates.Dockerfile .
           fi
       # Go CI-tools (T1148): setup-go plus the Actions build cache
-      # (no Docker image). The binaries land in ./ci-tools-bin but
-      # the live invocations below stay on Python until the Go path
-      # is green on CI (caller switch + .py removal are later slices).
+      # (no Docker image). The binaries land in ./ci-tools-bin and
+      # the live invocations below run them (bind-mounted into the
+      # gate container where the gates need the provisioned image).
       - name: set up Go
         uses: actions/setup-go@v5
         with:
@@ -137,7 +137,7 @@ jobs:
           done
           ls "$GITHUB_WORKSPACE/ci-tools-bin"
       - name: run quality gates
-        run: docker run --rm -v "${{ github.workspace }}:/work" -w /work "$GATE_IMAGE:$GATE_KEY" python3 scripts/ci/lib/rust-quality-gates.py rust rust/target/llvm-cov nextest --run-ignored all --no-fail-fast
+        run: docker run --rm -v "${{ github.workspace }}:/work" -v "${{ github.workspace }}/ci-tools-bin:/tools" -w /work "$GATE_IMAGE:$GATE_KEY" /tools/rust-quality-gates rust rust/target/llvm-cov nextest --run-ignored all --no-fail-fast
       # The container runs as root; hand the report back so later steps can
       # read it.
       - name: take ownership of coverage report
@@ -148,7 +148,7 @@ jobs:
           fi
       - name: publish coverage summary
         if: always()
-        run: python3 scripts/ci/lib/coverage-summary.py --out rust/target/llvm-cov/coverage-comment.md rust/target/llvm-cov/lcov.info >> "$GITHUB_STEP_SUMMARY"
+        run: ./ci-tools-bin/coverage-summary --out rust/target/llvm-cov/coverage-comment.md rust/target/llvm-cov/lcov.info >> "$GITHUB_STEP_SUMMARY"
       - name: upload coverage report
         if: always() && hashFiles('rust/target/llvm-cov/lcov.info') != ''
         uses: actions/upload-artifact@v4
