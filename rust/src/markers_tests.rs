@@ -427,7 +427,7 @@ fn draws_tree_cells_for_a_view() {
         vec![marker_ref("main", true, "aaa1111")],
     );
     let items = build_items(&commits, &revisions, &markers);
-    let cells = draw_view_row(&commits, &revisions, items, 1, 0, false, Some(120));
+    let cells = draw_view_row(&commits, &revisions, items, 1, 0, false, Some(120), false);
     assert_eq!(cells.len(), 5);
     let marker = cells[0].display_lines().join("\n");
     assert!(marker.contains("•"), "got: {marker}");
@@ -452,6 +452,7 @@ fn draws_group_trailers_for_collapsed_members() {
         1,
         true,
         Some(80),
+        false,
     );
     let marker = cells[0].display_lines().join("\n");
     assert!(
@@ -464,4 +465,99 @@ fn draws_group_trailers_for_collapsed_members() {
 fn merge_keys_use_byte_prefixes() {
     assert_eq!(merge_key("ABC"), "abc");
     assert_eq!(merge_key(&"x".repeat(40)), "x".repeat(32));
+}
+
+fn colored_revision(color: &str) -> revision::RevisionRef {
+    revision::RevisionRef::from_search_hit(&serde_json::json!({
+        "id": 7,
+        "phid": "PHID-DREV-7",
+        "fields": {
+            "title": "colored",
+            "status": {
+                "value": "needs-review",
+                "name": "Needs Review",
+                "color.ansi": color,
+            },
+        },
+    }))
+}
+
+#[test]
+fn marker_labels_style_active_and_inactive() {
+    assert_eq!(active_marker_label("main", false), " *  main");
+    assert_eq!(inactive_marker_label("dev", false), "dev");
+    assert_eq!(
+        active_marker_label("main", true),
+        "\x1b[42m\x1b[1m * \x1b[m\x1b[49m \x1b[1mmain\x1b[m"
+    );
+    assert_eq!(inactive_marker_label("dev", true), "\x1b[1mdev\x1b[m");
+}
+
+#[test]
+fn status_labels_colorize_on_tty() {
+    let reference = colored_revision("red");
+    // Narrow terminals show the short name, wide ones the full name.
+    assert_eq!(revision_status_label(&reference, true, false), "Review");
+    assert_eq!(
+        revision_status_label(&reference, false, false),
+        "Needs Review"
+    );
+    assert_eq!(
+        revision_status_label(&reference, true, true),
+        "\x1b[31mReview\x1b[39m"
+    );
+    assert_eq!(
+        revision_status_label(&reference, false, true),
+        "\x1b[31mNeeds Review\x1b[39m"
+    );
+    // Falsy server colors ("", "0") and missing colors stay plain.
+    for color in ["", "0"] {
+        let plain = colored_revision(color);
+        assert_eq!(revision_status_label(&plain, false, true), "Needs Review");
+    }
+    let uncolored = revision(1, "PHID-DREV-1", "plain", false);
+    assert_eq!(
+        revision_status_label(&uncolored, false, true),
+        "Needs Review"
+    );
+}
+
+#[test]
+fn styled_rows_carry_escapes_only_on_tty() {
+    let commits = vec![("aaa1111".to_string(), "first\n".to_string())];
+    let revisions = vec![colored_revision("green")];
+    let mut markers = HashMap::new();
+    markers.insert(
+        "aaa1111".to_string(),
+        vec![marker_ref("main", true, "aaa1111")],
+    );
+    let items = build_items(&commits, &revisions, &markers);
+    let plain = draw_view_row(
+        &commits,
+        &revisions,
+        items.clone(),
+        1,
+        0,
+        false,
+        Some(120),
+        false,
+    );
+    let marker = plain[0].display_lines().join("\n");
+    assert!(marker.contains(" *  main"), "got: {marker}");
+    assert!(!marker.contains('\x1b'), "got: {marker}");
+    let status = plain[2].display_lines().join("\n");
+    assert!(status.contains("Needs Review"), "got: {status}");
+    assert!(!status.contains('\x1b'), "got: {status}");
+
+    let styled = draw_view_row(&commits, &revisions, items, 1, 0, false, Some(120), true);
+    let marker = styled[0].display_lines().join("\n");
+    assert!(
+        marker.contains("\x1b[42m\x1b[1m * \x1b[m\x1b[49m \x1b[1mmain\x1b[m"),
+        "got: {marker}"
+    );
+    let status = styled[2].display_lines().join("\n");
+    assert!(
+        status.contains("\x1b[32mNeeds Review\x1b[39m"),
+        "got: {status}"
+    );
 }

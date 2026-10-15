@@ -4,7 +4,8 @@
 //! with `user.query` and `--project` slugs with `project.query`, then creates
 //! the task with `maniphest.createtask` owned by the authenticated user.
 //!
-//! Known limits (see T1128): output is plain text without the PHP colors.
+//! The creation line keeps the PHP console colors (green title, blue URI)
+//! on TTYs, gated on the process ANSI setting like `tsprintf()`.
 
 use std::process::ExitCode;
 
@@ -349,6 +350,7 @@ fn finish_created_task(
     dir: &std::path::Path,
     task: &CreatedTask,
     options: &Options,
+    ansi: bool,
 ) -> Result<String, String> {
     if options.browse {
         let configured = crate::browser::configured_browser(dir);
@@ -363,7 +365,7 @@ fn finish_created_task(
         doc.push('\n');
         return Ok(doc);
     }
-    Ok(render_created(task, terminal::ansi_enabled()))
+    Ok(render_created(task, ansi))
 }
 
 /// Create the task per `options`, returning the stdout text.
@@ -372,11 +374,21 @@ fn finish_created_task(
 /// nothing. `--browse` opens the new task, resolving the browser command
 /// from the config for the current directory.
 pub fn execute(client: &conduit::Client, options: &Options) -> Result<String, String> {
+    execute_ansi(client, options, terminal::ansi_enabled())
+}
+
+/// Create the task per `options` with an explicit ANSI setting
+/// (deterministic under test).
+pub fn execute_ansi(
+    client: &conduit::Client,
+    options: &Options,
+    ansi: bool,
+) -> Result<String, String> {
     let dir = match std::env::current_dir() {
         Ok(dir) => dir,
         Err(_) => std::path::PathBuf::from("."),
     };
-    execute_in(&dir, client, options)
+    execute_in_ansi(&dir, client, options, ansi)
 }
 
 /// Create the task per `options` with `dir` pinning config discovery.
@@ -384,6 +396,17 @@ pub fn execute_in(
     dir: &std::path::Path,
     client: &conduit::Client,
     options: &Options,
+) -> Result<String, String> {
+    execute_in_ansi(dir, client, options, terminal::ansi_enabled())
+}
+
+/// Create the task per `options` in `dir` with an explicit ANSI setting
+/// (deterministic under test).
+pub fn execute_in_ansi(
+    dir: &std::path::Path,
+    client: &conduit::Client,
+    options: &Options,
+    ansi: bool,
 ) -> Result<String, String> {
     let summary = options.summary.join(" ");
     if is_blank_summary(&summary) {
@@ -394,7 +417,7 @@ pub fn execute_in(
         .call("maniphest.createtask", &serde_json::Value::Object(params))
         .map_err(conduit_error_text)?;
     let task = parse_created(&result).ok_or_else(missing_task_id)?;
-    finish_created_task(dir, &task, options)
+    finish_created_task(dir, &task, options, ansi)
 }
 
 /// Entry point: `argv` excludes the subcommand name.
@@ -417,7 +440,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match execute(&client, &options) {
+    match execute_ansi(&client, &options, terminal::ansi_enabled()) {
         Ok(out) => {
             print!("{out}");
             ExitCode::SUCCESS

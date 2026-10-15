@@ -113,6 +113,49 @@ fn renders_created_line() {
     );
 }
 
+fn plain_options(summary: &[&str]) -> Options {
+    Options {
+        summary: args(summary),
+        cc: Vec::new(),
+        projects: Vec::new(),
+        browse: false,
+        json: false,
+        conduit_uri: None,
+    }
+}
+
+#[test]
+fn execute_threads_ansi_through_finish() {
+    let task = CreatedTask {
+        id: "55".to_string(),
+        title: "Do thing".to_string(),
+        uri: "https://example.test/T55".to_string(),
+    };
+    let options = plain_options(&["Do", "thing"]);
+    let dir = std::env::temp_dir();
+    assert_eq!(
+        finish_created_task(&dir, &task, &options, false).unwrap(),
+        render_created(&task, false)
+    );
+    let styled = finish_created_task(&dir, &task, &options, true).unwrap();
+    assert_eq!(styled, render_created(&task, true));
+    assert!(styled.contains('\u{1b}'), "got: {styled}");
+}
+
+#[test]
+fn blank_summary_creates_nothing_in_both_modes() {
+    // No conduit traffic: the client points at a dead port and blank
+    // summaries return before any call.
+    let client = conduit::Client::new("http://127.0.0.1:9/", "t").unwrap();
+    let options = plain_options(&[]);
+    for ansi in [false, true] {
+        assert_eq!(
+            execute_in_ansi(std::env::temp_dir().as_path(), &client, &options, ansi).unwrap(),
+            "Please provide a summary.\n"
+        );
+    }
+}
+
 #[test]
 fn builds_created_json() {
     let task = CreatedTask {
