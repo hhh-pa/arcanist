@@ -553,3 +553,404 @@ fn compat54_features_and_incompat() {
         1
     );
 }
+
+fn versioned_windows(version: &str, windows: &str) -> ast::XhpOptions {
+    ast::XhpOptions {
+        php_version: Some(version.to_string()),
+        php_version_windows: Some(windows.to_string()),
+        ..ast::XhpOptions::default()
+    }
+}
+
+#[test]
+fn compat_symbol_functions() {
+    let options = versioned("5.3.0");
+    let hits = for_rule_with("<?php array_column(array(), 'x');\n", "a.php", &options, 45);
+    assert_eq!(hits.len(), 1);
+    assert_eq!((hits[0].0, hits[0].1), (1, 7));
+    assert_eq!(
+        hits[0].2,
+        "This codebase targets PHP 5.3.0, but `array_column()` was not introduced until PHP 5.5.0."
+    );
+    assert!(
+        for_rule_with(
+            "<?php array_column(array(), 'x');\n",
+            "a.php",
+            &versioned("5.5.0"),
+            45
+        )
+        .is_empty()
+    );
+    let removed = versioned("5.4.0");
+    let hits = for_rule_with("<?php define_syslog_variables();\n", "a.php", &removed, 45);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].2,
+        "This codebase targets PHP 5.4.0, but `define_syslog_variables()` was removed in PHP 5.3.29."
+    );
+    assert!(
+        for_rule_with(
+            "<?php define_syslog_variables();\n",
+            "a.php",
+            &versioned("5.2.0"),
+            45
+        )
+        .is_empty()
+    );
+    assert!(for_rule_with("<?php isset($x);\n", "a.php", &options, 45).is_empty());
+    // Exact-name matching like PHP: case and `\` prefixes miss the table.
+    assert!(for_rule_with("<?php ARRAY_COLUMN(array());\n", "a.php", &options, 45).is_empty());
+    assert!(for_rule_with("<?php \\array_column(array());\n", "a.php", &options, 45).is_empty());
+    assert!(
+        for_rule_with(
+            "<?php array_column(array());\n",
+            "a.php",
+            &ast::XhpOptions::default(),
+            45
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn compat_symbol_params() {
+    let options = versioned("5.2.3");
+    let hits = for_rule_with("<?php getopt('a', $b);\n", "a.php", &options, 45);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].2,
+        "This codebase targets PHP 5.2.3, but parameter 2 of `getopt()` was not introduced until \
+         PHP 5.3.0."
+    );
+    assert!(for_rule_with("<?php getopt('a');\n", "a.php", &options, 45).is_empty());
+    // A firing min suppresses the parameter leg (PHP else-if chain).
+    let old = versioned("5.2.0");
+    let hits = for_rule_with("<?php idn_to_ascii($a, $b, $c);\n", "a.php", &old, 45);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].2,
+        "This codebase targets PHP 5.2.0, but `idn_to_ascii()` was not introduced until PHP 5.2.4."
+    );
+    // Prerelease table versions compare below their release.
+    let mid = versioned("5.3.0");
+    assert_eq!(
+        for_rule_with("<?php idn_to_ascii($a, $b, $c);\n", "a.php", &mid, 45).len(),
+        1
+    );
+    assert!(
+        for_rule_with(
+            "<?php idn_to_ascii($a, $b, $c);\n",
+            "a.php",
+            &versioned("5.4.0"),
+            45
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn compat_symbol_windows() {
+    let options = versioned_windows("5.2.3", "5.3.0");
+    let hits = for_rule_with("<?php chroot('/tmp');\n", "a.php", &options, 45);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].2,
+        "This codebase targets PHP 5.3.0 on Windows, but `chroot()` is not available there."
+    );
+    let old_win = versioned_windows("5.2.3", "5.2.0");
+    let hits = for_rule_with("<?php getopt('a');\n", "a.php", &old_win, 45);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].2,
+        "This codebase targets PHP 5.2.0 on Windows, but `getopt()` is not available there until \
+         PHP 5.3.0."
+    );
+    assert!(for_rule_with("<?php getopt('a');\n", "a.php", &options, 45).is_empty());
+    assert!(for_rule_with("<?php chroot('/tmp');\n", "a.php", &versioned("5.2.3"), 45).is_empty());
+    let windows_only = ast::XhpOptions {
+        php_version: None,
+        php_version_windows: Some("5.2.0".to_string()),
+        ..ast::XhpOptions::default()
+    };
+    assert!(for_rule_with("<?php chroot('/tmp');\n", "a.php", &windows_only, 45).is_empty());
+}
+
+#[test]
+fn compat_symbol_classes() {
+    let options = versioned("5.3.0");
+    let hits = for_rule_with("<?php new CURLFile('');\n", "a.php", &options, 45);
+    assert_eq!(hits.len(), 1);
+    assert_eq!((hits[0].0, hits[0].1), (1, 11));
+    assert_eq!(
+        hits[0].2,
+        "This codebase targets PHP 5.3.0, but `CURLFile` was not introduced until PHP 5.5.0."
+    );
+    assert!(
+        for_rule_with(
+            "<?php new CURLFile('');\n",
+            "a.php",
+            &versioned("5.5.0"),
+            45
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        for_rule_with(
+            "<?php class X extends DateTimeImmutable {}\n",
+            "a.php",
+            &options,
+            45
+        )
+        .len(),
+        1
+    );
+    assert_eq!(
+        for_rule_with("<?php CURLFile::create();\n", "a.php", &options, 45).len(),
+        1
+    );
+    assert_eq!(
+        for_rule_with(
+            "<?php if ($x instanceof CURLFile) {}\n",
+            "a.php",
+            &options,
+            45
+        )
+        .len(),
+        1
+    );
+    assert_eq!(
+        for_rule_with(
+            "<?php try {} catch (CURLFile $e) {}\n",
+            "a.php",
+            &options,
+            45
+        )
+        .len(),
+        1
+    );
+    assert_eq!(
+        for_rule_with(
+            "<?php try {} catch (Exception | CURLFile $e) {}\n",
+            "a.php",
+            &options,
+            45
+        )
+        .len(),
+        1
+    );
+    assert_eq!(
+        for_rule_with("<?php function f(CURLFile $x) {}\n", "a.php", &options, 45).len(),
+        1
+    );
+    assert_eq!(
+        for_rule_with("<?php function f(): CURLFile {}\n", "a.php", &options, 45).len(),
+        1
+    );
+    assert_eq!(
+        for_rule_with(
+            "<?php class X implements DateTimeInterface {}\n",
+            "a.php",
+            &versioned("5.4.0"),
+            45
+        )
+        .len(),
+        1
+    );
+    assert_eq!(
+        for_rule_with(
+            "<?php new HttpException('x');\n",
+            "a.php",
+            &versioned("5.6.0"),
+            45
+        )
+        .len(),
+        1
+    );
+    assert!(
+        for_rule_with(
+            "<?php new HttpException('x');\n",
+            "a.php",
+            &versioned("5.5.0"),
+            45
+        )
+        .is_empty()
+    );
+    // Declaration names are n_CLASS_NAME nodes in PHP, so they flag too.
+    assert_eq!(
+        for_rule_with("<?php class CURLFile {}\n", "a.php", &options, 45).len(),
+        1
+    );
+    // Qualified names miss the table, exactly like PHP lookups.
+    assert!(for_rule_with("<?php new \\CURLFile('');\n", "a.php", &options, 45).is_empty());
+}
+
+#[test]
+fn compat_symbol_constants() {
+    let options = versioned("5.3.0");
+    let hits = for_rule_with("<?php echo JSON_PRETTY_PRINT;\n", "a.php", &options, 45);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].2,
+        "This codebase targets PHP 5.3.0, but `JSON_PRETTY_PRINT` was not introduced until PHP \
+         5.4.0."
+    );
+    assert!(
+        for_rule_with(
+            "<?php echo JSON_PRETTY_PRINT;\n",
+            "a.php",
+            &versioned("5.4.0"),
+            45
+        )
+        .is_empty()
+    );
+    let old = versioned("5.2.3");
+    assert_eq!(
+        for_rule_with("<?php echo __DIR__;\n", "a.php", &old, 45).len(),
+        1
+    );
+    assert!(for_rule_with("<?php echo __DIR__;\n", "a.php", &options, 45).is_empty());
+    let removed = versioned("5.4.0");
+    let hits = for_rule_with(
+        "<?php var_dump(STREAM_ENFORCE_SAFE_MODE);\n",
+        "a.php",
+        &removed,
+        45,
+    );
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].2,
+        "This codebase targets PHP 5.4.0, but `STREAM_ENFORCE_SAFE_MODE` was removed in PHP 5.3.29."
+    );
+    assert_eq!(
+        for_rule_with(
+            "<?php switch ($x) { case JSON_PRETTY_PRINT: break; }\n",
+            "a.php",
+            &options,
+            45
+        )
+        .len(),
+        1
+    );
+    assert!(for_rule_with("<?php $x->JSON_PRETTY_PRINT;\n", "a.php", &options, 45).is_empty());
+    assert!(for_rule_with("<?php Foo::JSON_PRETTY_PRINT;\n", "a.php", &options, 45).is_empty());
+    assert!(
+        for_rule_with(
+            "<?php function JSON_PRETTY_PRINT() {}\n",
+            "a.php",
+            &options,
+            45
+        )
+        .is_empty()
+    );
+    assert!(
+        for_rule_with(
+            "<?php class C { const JSON_PRETTY_PRINT = 1; }\n",
+            "a.php",
+            &options,
+            45
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn compat_symbol_whitelist() {
+    let options = versioned("5.3.0");
+    assert!(
+        for_rule_with(
+            "<?php if (function_exists('array_column')) { array_column(array(), 'x'); }\n",
+            "a.php",
+            &options,
+            45
+        )
+        .is_empty()
+    );
+    assert!(
+        for_rule_with(
+            "<?php if (function_exists('array_column'))\n  array_column(array(), 'x');\n",
+            "a.php",
+            &options,
+            45
+        )
+        .is_empty()
+    );
+    assert!(
+        for_rule_with(
+            "<?php if (class_exists('CURLFile')) { new CURLFile(''); }\n",
+            "a.php",
+            &options,
+            45
+        )
+        .is_empty()
+    );
+    assert!(
+        for_rule_with(
+            "<?php if (defined('JSON_PRETTY_PRINT')) { echo JSON_PRETTY_PRINT; }\n",
+            "a.php",
+            &options,
+            45
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        for_rule_with(
+            "<?php if (function_exists('array_column')) {} else { array_column(array()); }\n",
+            "a.php",
+            &options,
+            45
+        )
+        .len(),
+        1
+    );
+    assert_eq!(
+        for_rule_with(
+            "<?php if (!function_exists('array_column')) { array_column(array()); }\n",
+            "a.php",
+            &options,
+            45
+        )
+        .len(),
+        1
+    );
+    assert!(for_rule_with("<?php if (SomeClass::m($p)) {}\n", "a.php", &options, 45).is_empty());
+    assert!(for_rule_with("<?php $v = 'f'; if ($v()) {}\n", "a.php", &options, 45).is_empty());
+    assert_eq!(
+        for_rule_with(
+            "<?php if (function_exists($v)) { array_column(array()); }\n",
+            "a.php",
+            &options,
+            45
+        )
+        .len(),
+        1
+    );
+    // interface_exists guards file under a bucket no check reads, so uses still flag.
+    assert_eq!(
+        for_rule_with(
+            "<?php if (interface_exists('DateTimeInterface')) { class X implements \
+             DateTimeInterface {} }\n",
+            "a.php",
+            &versioned("5.4.0"),
+            45
+        )
+        .len(),
+        1
+    );
+}
+
+#[test]
+fn compat_symbol_gating() {
+    let plain = ast::XhpOptions::default();
+    assert!(for_rule_with("<?php array_column(array());\n", "a.php", &plain, 45).is_empty());
+    assert!(for_rule_with("<?php new CURLFile('');\n", "a.php", &plain, 45).is_empty());
+    assert!(for_rule_with("<?php echo __DIR__;\n", "a.php", &plain, 45).is_empty());
+    assert!(
+        for_rule_with(
+            "<?php array_column(array());\n",
+            "a.php",
+            &versioned(""),
+            45
+        )
+        .is_empty()
+    );
+}
