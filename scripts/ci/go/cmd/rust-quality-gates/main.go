@@ -236,6 +236,11 @@ func extractTarGz(archive, dest string) error {
 			linkTarget := hdr.Linkname
 			if !filepath.IsAbs(linkTarget) {
 				linkTarget = filepath.Join(filepath.Dir(target), linkTarget)
+			} else {
+				// Absolute targets skip Join's Clean: normalize so a
+				// `<dest>/../evil` Linkname cannot pass the prefix
+				// check lexically while resolving outside dest.
+				linkTarget = filepath.Clean(linkTarget)
 			}
 			if !strings.HasPrefix(linkTarget, dest+string(os.PathSeparator)) {
 				return fmt.Errorf("tarball symlink escapes: %s -> %s", hdr.Name, hdr.Linkname)

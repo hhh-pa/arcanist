@@ -112,6 +112,11 @@ func TestExtractTarGzRejectsEscapes(t *testing.T) {
 			tarEntry{name: "link", linkname: "../evil", flag: tar.TypeLink},
 			"hardlink escapes",
 		},
+		{
+			"hardlink-absolute",
+			tarEntry{name: "link", linkname: "/etc/passwd", flag: tar.TypeLink},
+			"hardlink escapes",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -127,5 +132,25 @@ func TestExtractTarGzRejectsEscapes(t *testing.T) {
 				t.Fatal("escape wrote outside dest")
 			}
 		})
+	}
+}
+
+func TestExtractTarGzRejectsAbsoluteDotDotSymlink(t *testing.T) {
+	dir := t.TempDir()
+	archive := filepath.Join(dir, "evil.tar.gz")
+	dest := filepath.Join(dir, "out")
+	// Absolute target that starts with dest lexically but resolves
+	// outside it: must fail the (cleaned) containment check.
+	writeTar(t, archive, []tarEntry{{
+		name:     "link",
+		linkname: dest + string(filepath.Separator) + ".." + string(filepath.Separator) + "evil",
+		flag:     tar.TypeSymlink,
+	}})
+	err := extractTarGz(archive, dest)
+	if err == nil || !strings.Contains(err.Error(), "symlink escapes") {
+		t.Fatalf("err = %v, want %q", err, "symlink escapes")
+	}
+	if _, statErr := os.Lstat(filepath.Join(dir, "evil")); !os.IsNotExist(statErr) {
+		t.Fatal("escape wrote outside dest")
 	}
 }

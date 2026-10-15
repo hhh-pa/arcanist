@@ -33,8 +33,10 @@ entirely unvalidated).
 - `publish` (release.yml) adds `actions: write` next to its
   `contents: write` (artifact download; same-repo scope, and the
   job already holds release rights).
-- `quality-gates` keeps its existing block. All other jobs
-  inherit read-only.
+- `go-tools-test` (rust.yml) adds `actions: read`
+  (binary-cache restore; the gates job owns the save).
+- `quality-gates` keeps its existing block. `fmt-clippy` and
+  `test` inherit read-only.
 
 ## Dismissals (alerts 9,10; warning, false positive)
 
