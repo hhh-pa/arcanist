@@ -6,7 +6,7 @@ it sends code for review, downloads patches, transfers files, shows
 status, makes API calls, and everything else `arc` does. Behavior —
 including output text, error strings, and exit codes — matches PHP `arc`.
 
-All 32 commands are ported; per-command status and the remaining edge
+All 34 commands are ported; per-command status and the remaining edge
 divergences are tracked in [rust/README.md](rust/README.md).
 
 ## Build and run

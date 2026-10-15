@@ -5,20 +5,22 @@ CLI behavior, ported workflow by workflow with `arc` as the reference.
 
 ## Status
 
-All 32 commands are full-state ports of their PHP workflows. Discipline:
+All 34 commands are full-state ports of their PHP workflows. Discipline:
 every gap-closing change updates this table in the same turn. Behavior
-is exact, including error strings and exit codes; the one remaining
-edge divergence (XHP134) is listed below.
+is exact, including error strings and exit codes; the remaining
+edge divergences are listed below.
 
 Console colors: plain-text output matches PHP, and ANSI styling matches
 PHP `phutil_console_format` bytes on TTYs (plain text off-TTY).
 
 | Command | State |
 |---|---|
+| `alias` | full (list/define shorthand; `!shell` targets; runs before dispatch; `--json`) |
 | `amend` | full (git/hg/svn message amend; `-m`/`--revision`/`--show`) |
 | `anoid` | full (passthru to support/arcanoid via python3) |
 | `bookmarks` | full (hg markers grid via arc-hg; `--json`/`--conduit-uri`; git/svn fail like arc) |
 | `branches` | full (git branch list + hg markers grid; `--all`/`--json`/`--conduit-uri`) |
+| `browse` | full (open file/commit/revision in web browser; `--branch`/`--types`/`--force`) |
 | `call-conduit` | full (direct HTTP/S; `~/.arcrc` token; stdin envelope) |
 | `close-revision` | full (differential.close; `--finalize`/`--quiet`/`--json`/`--force`; author prompt) |
 | `commit` | full (git + svn flows; `-m`/`--revision`/`--show`; finalize handoff) |
@@ -77,6 +79,10 @@ rcfiles) is supported.
 
 - `XHP` ports 107/108 XHPAST rules natively; only XHP134 (product-name
   literals needing the libphutil runtime) remains, permanently unportable.
+- XHP9/XHP30 enforce default determinations; custom `xhpast.switchhook` /
+  `xhpast.naminghook` PHP classes cannot run here.
+- `look` falls back to UTC where the OS zone is unreadable (Windows
+  without `TZ`); all CI platforms resolve the real zone.
 
 ## Gates
 
