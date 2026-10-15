@@ -245,18 +245,12 @@ pub fn rule_meta(id: u32) -> Option<(&'static str, &'static str)> {
 /// [`RULE_TABLE`].
 #[must_use]
 pub fn blocked_rules() -> Vec<(u32, &'static str, &'static str)> {
-    vec![
-        (
-            134,
-            "ArcanistProductNameLiteralXHPASTLinterRule",
-            "product names come from libphutil runtime; cannot run here",
-        ),
-    ]
+    vec![(
+        134,
+        "ArcanistProductNameLiteralXHPASTLinterRule",
+        "product names come from libphutil runtime; cannot run here",
+    )]
 }
-
-/// Shared reason for follow-up rules: portable, but deferred to a
-/// later dv-c increment so this subset lands fully verified.
-const NOT_YET: &str = "not yet ported; deferred to a follow-up increment";
 
 fn is_supported(path: &str) -> bool {
     const EXTENSIONS: &[&str] = &["php", "phtml", "inc"];
