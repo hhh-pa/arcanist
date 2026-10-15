@@ -264,7 +264,7 @@ fn run_uses_current_dir() {
 fn help_succeeds_and_prints_usage() {
     let repo = Fixture::init_repo("help");
     let out = amend::execute(repo.path(), &args(&["--help"])).unwrap();
-    assert!(out.contains("usage: arc-rs amend"), "unexpected: {out}");
+    assert!(out.contains("usage: arc amend"), "unexpected: {out}");
     assert_eq!(
         amend::run_in(repo.path(), &args(&["--help"])),
         ExitCode::SUCCESS

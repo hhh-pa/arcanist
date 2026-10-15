@@ -1,4 +1,4 @@
-//! `arc-rs cover`: show blame for changed lines.
+//! `arc cover`: show blame for changed lines.
 //!
 //! PHP reference: `src/workflow/ArcanistCoverWorkflow.php` with changed
 //! lines from `ArcanistDiffHunk::getChangedLines('cover')`
@@ -46,7 +46,7 @@ use arc_rs::{git, terminal};
 pub const NAME: &str = "cover";
 
 fn usage() -> String {
-    "usage: arc-rs cover [--rev REV] [PATH...]\n\
+    "usage: arc cover [--rev REV] [PATH...]\n\
      \n\
      Cover your... professional reputation. Show blame for the lines you\n\
      changed in your working copy (or since some commit), grouped by author.\n\
@@ -664,7 +664,7 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         ParseOutcome::Error(message) => {
-            eprintln!("arc-rs {NAME}: {message}\n\n{}", usage());
+            eprintln!("arc {NAME}: {message}\n\n{}", usage());
             return ExitCode::FAILURE;
         }
         ParseOutcome::Args(options) => options,
@@ -675,7 +675,7 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             ExitCode::FAILURE
         }
     }

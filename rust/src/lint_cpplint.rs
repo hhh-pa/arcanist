@@ -1,4 +1,4 @@
-//! `arc-rs lint` Cpplint linter (T1128).
+//! `arc lint` Cpplint linter (T1128).
 //!
 //! PHP reference: `src/lint/linter/ArcanistCpplintLinter.php` (an
 //! `ArcanistExternalLinter` wrapping Google's `cpplint.py`).

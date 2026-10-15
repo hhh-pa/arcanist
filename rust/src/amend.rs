@@ -1,4 +1,4 @@
-//! `arc-rs amend`: amend the working copy, synchronizing the local commit
+//! `arc amend`: amend the working copy, synchronizing the local commit
 //! message from Differential.
 //!
 //! PHP reference: `src/workflow/ArcanistAmendWorkflow.php`. Under git the
@@ -49,7 +49,7 @@ pub const PROMPT_IMMUTABLE: &str = "arc.amend.immutable";
 
 fn usage() -> String {
     format!(
-        "usage: arc-rs {NAME} [(-m MESSAGE | --revision ID)] [--show]\n\
+        "usage: arc {NAME} [(-m MESSAGE | --revision ID)] [--show]\n\
          \n\
          Amend the HEAD commit message. The message comes from -m/--message\n\
          (repeatable, joined with a blank line), or from Differential via\n\
@@ -1031,7 +1031,7 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             ExitCode::FAILURE
         }
     }

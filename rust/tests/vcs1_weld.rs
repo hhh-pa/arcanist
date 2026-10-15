@@ -67,7 +67,7 @@ fn help_succeeds_and_prints_usage() {
     let dir = Fixture::named("help");
     let out = weld::execute(dir.path(), &args(&["--help"])).unwrap();
     let text = String::from_utf8(out).unwrap();
-    assert!(text.contains("usage: arc-rs weld"), "unexpected: {text}");
+    assert!(text.contains("usage: arc weld"), "unexpected: {text}");
     assert_eq!(
         weld::run_in(dir.path(), &args(&["--help"])),
         ExitCode::SUCCESS

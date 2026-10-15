@@ -1,4 +1,4 @@
-//! `arc-rs close-revision`: explicitly close an accepted revision.
+//! `arc close-revision`: explicitly close an accepted revision.
 //!
 //! Port of `src/workflow/ArcanistCloseRevisionWorkflow.php`: resolves one
 //! revision with `differential.query` and closes it with `differential.close`.
@@ -23,7 +23,7 @@ pub const STATUS_ACCEPTED: i64 = 2;
 /// Differential "Closed" status.
 pub const STATUS_CLOSED: i64 = 3;
 
-const USAGE: &str = "usage: arc-rs close-revision [--finalize] [--quiet] [--json] [--force] [--conduit-uri URI] REVISION\n";
+const USAGE: &str = "usage: arc close-revision [--finalize] [--quiet] [--json] [--force] [--conduit-uri URI] REVISION\n";
 
 /// Parsed `close-revision` options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -643,14 +643,14 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(msg) => {
-            eprintln!("arc-rs {NAME}: {msg}\n\n{USAGE}");
+            eprintln!("arc {NAME}: {msg}\n\n{USAGE}");
             return ExitCode::FAILURE;
         }
     };
     let client = match config::client_for(options.conduit_uri.as_deref()) {
         Ok(client) => client,
         Err(msg) => {
-            eprintln!("arc-rs {NAME}: {msg}");
+            eprintln!("arc {NAME}: {msg}");
             return ExitCode::FAILURE;
         }
     };
@@ -659,7 +659,7 @@ pub fn run(argv: &[String]) -> ExitCode {
         match resolve_repository_phid(&client, &cwd) {
             Ok(phid) => options.repository_phid = phid,
             Err(msg) => {
-                eprintln!("arc-rs {NAME}: {msg}");
+                eprintln!("arc {NAME}: {msg}");
                 return ExitCode::FAILURE;
             }
         }
@@ -671,7 +671,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(msg) => {
-            eprintln!("arc-rs {NAME}: {msg}");
+            eprintln!("arc {NAME}: {msg}");
             ExitCode::FAILURE
         }
     }

@@ -1,4 +1,4 @@
-//! `arc-rs install-certificate` — install Conduit credentials.
+//! `arc install-certificate` — install Conduit credentials.
 //!
 //! PHP reference: `src/workflow/ArcanistInstallCertificateWorkflow.php`
 //! (prompts: `phutil_console_prompt` / `phutil_console_confirm` in
@@ -28,7 +28,7 @@ use arc_rs::{conduit, config, diff_submit, prompt, terminal};
 /// Subcommand name, matching `arc install-certificate`.
 pub const NAME: &str = "install-certificate";
 
-const USAGE: &str = "usage: arc-rs install-certificate [URI] [--conduit-uri URI] [--token TOKEN] [--force]\n\
+const USAGE: &str = "usage: arc install-certificate [URI] [--conduit-uri URI] [--token TOKEN] [--force]\n\
 \n\
 Install Conduit credentials into ~/.arcrc for URI. Without URI, the URI\n\
 comes from --conduit-uri, $ARC_CONDUIT_URI, or the enclosing .arcconfig.\n\
@@ -635,7 +635,7 @@ fn install_options(argv: &[String]) -> Result<Options, ExitCode> {
             Err(ExitCode::SUCCESS)
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}\n\n{USAGE}");
+            eprintln!("arc {NAME}: {message}\n\n{USAGE}");
             Err(ExitCode::FAILURE)
         }
     }
@@ -651,14 +651,14 @@ fn resolve_install_uri(options: &Options, cwd: &Path) -> Result<String, ExitCode
     ) {
         Ok(uri) => Ok(uri),
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             Err(ExitCode::FAILURE)
         }
     }
 }
 
 fn fail(message: String) -> ExitCode {
-    eprintln!("arc-rs {NAME}: {message}");
+    eprintln!("arc {NAME}: {message}");
     ExitCode::FAILURE
 }
 

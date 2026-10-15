@@ -1,4 +1,4 @@
-//! Local-depth helpers for `arc-rs diff` (bundle D1, task T1128).
+//! Local-depth helpers for `arc diff` (bundle D1, task T1128).
 //!
 //! Pure-local half of `src/workflow/ArcanistDiffWorkflow.php`: commit-message
 //! field parsing, base/revision-range spec parsing, preview/stat/patch-set

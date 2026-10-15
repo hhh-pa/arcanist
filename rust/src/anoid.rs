@@ -1,4 +1,4 @@
-//! `arc-rs anoid`: pilot a probe from the vessel "Arcanoid".
+//! `arc anoid`: pilot a probe from the vessel "Arcanoid".
 //!
 //! PHP reference: `src/workflow/ArcanistAnoidWorkflow.php`: requires
 //! `python3` on `$PATH`, then passes control to
@@ -16,7 +16,7 @@ use std::process::ExitCode;
 pub const NAME: &str = "anoid";
 
 fn usage() -> String {
-    "usage: arc-rs anoid\n\
+    "usage: arc anoid\n\
      \n\
      Pilot a probe from the vessel \"Arcanoid\".\n\
      \n\
@@ -120,20 +120,20 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}\n\n{}", usage());
+            eprintln!("arc {NAME}: {message}\n\n{}", usage());
             return ExitCode::FAILURE;
         }
         Ok(Some(())) => {}
     }
     let Some(python) = python3_on_path() else {
         eprintln!(
-            "arc-rs {NAME}: The \"arc-rs anoid\" workflow requires Python 3 on your $PATH (python3, or python on Windows)."
+            "arc {NAME}: The \"arc anoid\" workflow requires Python 3 on your $PATH (python3, or python on Windows)."
         );
         return ExitCode::FAILURE;
     };
     let Some(script) = find_script(dir) else {
         eprintln!(
-            "arc-rs {NAME}: cannot find support/arcanoid/arcanoid.py above '{}'",
+            "arc {NAME}: cannot find support/arcanoid/arcanoid.py above '{}'",
             dir.display()
         );
         return ExitCode::FAILURE;
@@ -142,7 +142,7 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
     match passthru(&python, &[script_arg.as_str()], dir) {
         Ok(code) => code,
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             ExitCode::FAILURE
         }
     }

@@ -1,4 +1,4 @@
-//! `arc-rs browse`: open files and objects in a web browser.
+//! `arc browse`: open files and objects in a web browser.
 //!
 //! PHP references: `src/browse/workflow/ArcanistBrowseWorkflow.php` and
 //! `src/browse/query/ArcanistBrowse{Commit,CommitURI,ObjectNameURI,PathURI,
@@ -40,7 +40,7 @@ pub const BROWSE_REVISION: &str = "revision";
 /// Abort text for end of input during the pick prompt.
 pub const ABORT: &str = "User aborted the workflow.";
 
-const USAGE: &str = "usage: arc-rs browse [--branch BRANCH] [--types TYPES] [--force] [--] [TARGET ...]\n\
+const USAGE: &str = "usage: arc browse [--branch BRANCH] [--types TYPES] [--force] [--] [TARGET ...]\n\
 \n\
 Open a file, commit, object, or revision in a web browser. With no\n\
 target, opens the current working copy. TYPES is a comma- or\n\
@@ -1346,7 +1346,7 @@ pub fn run_in_with(
             return ExitCode::SUCCESS;
         }
         Parsed::Error(message) => {
-            eprintln!("arc-rs {NAME}: {message}\n\n{USAGE}");
+            eprintln!("arc {NAME}: {message}\n\n{USAGE}");
             return ExitCode::FAILURE;
         }
         Parsed::Options(options) => options,
@@ -1370,7 +1370,7 @@ pub fn run_in_with(
     let client = match config::client_for(None) {
         Ok(client) => client,
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             return ExitCode::FAILURE;
         }
     };
@@ -1393,13 +1393,13 @@ pub fn run_prepared(
     let uris = match execute_refs(&mut ctx, &refs, input, terminal::ansi_enabled()) {
         Ok(uris) => uris,
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             return ExitCode::FAILURE;
         }
     };
     let configured = browser::configured_browser(dir);
     if let Err(message) = browser::open_uris_in_browser(&uris, configured.as_deref()) {
-        eprintln!("arc-rs {NAME}: {message}");
+        eprintln!("arc {NAME}: {message}");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS

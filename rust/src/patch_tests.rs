@@ -558,7 +558,7 @@ fn rejects_binary_and_image() {
     }];
     assert_eq!(
         render_git_patch(&mut changes).unwrap_err(),
-        "binary patches are not yet ported by arc-rs patch"
+        "binary patches are not yet ported by arc patch"
     );
     let mut changes = vec![BundleChange {
         file_type: FILE_IMAGE,
@@ -566,7 +566,7 @@ fn rejects_binary_and_image() {
     }];
     assert_eq!(
         render_git_patch(&mut changes).unwrap_err(),
-        "binary patches are not yet ported by arc-rs patch"
+        "binary patches are not yet ported by arc patch"
     );
 }
 

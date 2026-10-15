@@ -148,7 +148,7 @@ fn run_uses_current_dir() {
 fn help_succeeds_and_prints_usage() {
     let repo = Fixture::init_repo("help");
     let out = branches::execute(repo.path(), &args(&["--help"])).unwrap();
-    assert!(out.contains("usage: arc-rs branches"), "unexpected: {out}");
+    assert!(out.contains("usage: arc branches"), "unexpected: {out}");
     assert_eq!(
         branches::run_in(repo.path(), &args(&["--help"])),
         ExitCode::SUCCESS

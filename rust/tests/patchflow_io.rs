@@ -148,7 +148,7 @@ fn help_succeeds_for_all_commands() {
     assert!(
         download::execute(fx.path(), &argv(&["--help"]))
             .unwrap()
-            .contains("usage: arc-rs download")
+            .contains("usage: arc download")
     );
     assert!(
         liberate::execute(fx.path(), &argv(&["--help"]))

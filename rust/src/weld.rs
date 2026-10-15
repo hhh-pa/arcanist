@@ -1,4 +1,4 @@
-//! `arc-rs weld`: robustly fuse two or more files together.
+//! `arc weld`: robustly fuse two or more files together.
 //!
 //! PHP reference: `src/workflow/ArcanistWeldWorkflow.php`. Each input file
 //! is appended to the joint with a randomly blended overlap of 16-32
@@ -13,7 +13,7 @@ pub const NAME: &str = "weld";
 
 fn usage() -> String {
     format!(
-        "usage: arc-rs {NAME} [options] -- <file> <file> [...]\n\
+        "usage: arc {NAME} [options] -- <file> <file> [...]\n\
          \n\
          Robustly fuse two or more files together. Files are concatenated\n\
          with a randomly blended overlap region; empty files are skipped.\n\
@@ -342,13 +342,13 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
         Ok(bytes) => {
             use std::io::Write;
             if std::io::stdout().write_all(&bytes).is_err() {
-                eprintln!("arc-rs {NAME}: failed to write output");
+                eprintln!("arc {NAME}: failed to write output");
                 return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             ExitCode::FAILURE
         }
     }

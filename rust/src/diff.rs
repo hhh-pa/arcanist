@@ -1,4 +1,4 @@
-//! `arc-rs diff`: local change inspection, plus opt-in Differential submit.
+//! `arc diff`: local change inspection, plus opt-in Differential submit.
 //!
 //! Read-only half of `src/workflow/ArcanistDiffWorkflow.php` by default:
 //! shows the working copy diff against a base revision as text or JSON.
@@ -38,7 +38,7 @@ use arc_rs::{config, diff_local, diff_submit, get_config, hg, svn, terminal};
 /// Subcommand name, matching `arc diff`.
 pub const NAME: &str = "diff";
 
-const USAGE: &str = "usage: arc-rs diff [--message MSG] [--message-file FILE] [--edit] [--raw] [--raw-command CMD] [--create | --update ID] [--draft] [--nounit] [--nolint] [--only] [--allow-untracked] [--apply-patches | --never-apply-patches] [--amend-all] [--amend-autofixes] [-a] [--json] [--no-amend] [--uncommitted] [--verbatim] [--reviewers NAMES] [--cc NAMES] [--skip-binaries] [--skip-staging] [--base REV] [--coverage | --no-coverage] [--browse] [--head REV] [--conduit-uri URI] [commit]\n";
+const USAGE: &str = "usage: arc diff [--message MSG] [--message-file FILE] [--edit] [--raw] [--raw-command CMD] [--create | --update ID] [--draft] [--nounit] [--nolint] [--only] [--allow-untracked] [--apply-patches | --never-apply-patches] [--amend-all] [--amend-autofixes] [-a] [--json] [--no-amend] [--uncommitted] [--verbatim] [--reviewers NAMES] [--cc NAMES] [--skip-binaries] [--skip-staging] [--base REV] [--coverage | --no-coverage] [--browse] [--head REV] [--conduit-uri URI] [commit]\n";
 
 /// Parsed `diff` options.
 ///
@@ -1636,7 +1636,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(msg) => {
-            eprintln!("arc-rs diff: {msg}\n\n{USAGE}");
+            eprintln!("arc diff: {msg}\n\n{USAGE}");
             return ExitCode::FAILURE;
         }
     };
@@ -1646,13 +1646,13 @@ pub fn run(argv: &[String]) -> ExitCode {
         Ok(out) => {
             use std::io::Write;
             if std::io::stdout().write_all(&out).is_err() {
-                eprintln!("arc-rs diff: failed to write output");
+                eprintln!("arc diff: failed to write output");
                 return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS
         }
         Err(msg) => {
-            eprintln!("arc-rs diff: {msg}");
+            eprintln!("arc diff: {msg}");
             ExitCode::FAILURE
         }
     }

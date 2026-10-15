@@ -1,4 +1,4 @@
-//! `arc-rs upgrade` — report the running version, or self-update the binary.
+//! `arc upgrade` — report the running version, or self-update the binary.
 //!
 //! PHP reference: `src/workflow/ArcanistUpgradeWorkflow.php`.
 //!
@@ -29,9 +29,9 @@ use arc_rs::terminal::{self, PhtArg, TVal};
 /// Subcommand name, matching `arc upgrade`.
 pub const NAME: &str = "upgrade";
 
-const USAGE: &str = "usage: arc-rs upgrade [--check] [--json] [--apply] [--yes]\n\
+const USAGE: &str = "usage: arc upgrade [--check] [--json] [--apply] [--yes]\n\
 \n\
-Report the running arc-rs version and whether the enclosing git checkout\n\
+Report the running arc version and whether the enclosing git checkout\n\
 is behind its upstream. With --apply, replace the running executable\n\
 with the latest stable release instead of reporting (--check is\n\
 ignored; --json prints the result as JSON).\n\
@@ -52,7 +52,7 @@ pub fn version() -> &'static str {
 
 /// Update status of one directory.
 pub struct Status {
-    /// Running `arc-rs` version.
+    /// Running `arc` version.
     pub version: String,
     /// Whether `dir` is inside a git working tree.
     pub in_repo: bool,
@@ -142,10 +142,10 @@ pub fn update_available(status: &Status) -> Option<bool> {
     status.behind.map(|behind| behind > 0)
 }
 
-/// How to update arc-rs manually.
+/// How to update arc manually.
 #[must_use]
 pub fn how_to_update() -> &'static str {
-    "To update the checkout: run `git pull --rebase` in the arc-rs checkout, then `cargo build` (or `cargo install --path rust`). To update the arc-rs binary itself: run `arc-rs upgrade --apply`. Without --apply, arc-rs never updates itself."
+    "To update the checkout: run `git pull --rebase` in the arc-rs checkout, then `cargo build` (or `cargo install --path rust`). To update the arc binary itself: run `arc upgrade --apply`. Without --apply, arc never updates itself."
 }
 
 /// Library name `--apply` upgrades, mirroring PHP's `$library`.
@@ -291,7 +291,7 @@ pub fn resolve_apply_target(dir: &Path) -> Result<ApplyTarget, String> {
 /// predates the upgraded checkout, so it must be rebuilt.
 #[must_use]
 pub fn rebuild_note() -> &'static str {
-    "Rebuild arc-rs from the upgraded checkout before using it (e.g. `cargo build` in the checkout root)."
+    "Rebuild arc from the upgraded checkout before using it (e.g. `cargo build` in the checkout root)."
 }
 
 /// Run `git pull --rebase origin -- <branch>` in `root`, returning stdout
@@ -367,7 +367,7 @@ pub fn run_apply(target: &ApplyTarget) -> Result<(), String> {
 /// Render the human-readable report.
 #[must_use]
 pub fn render(status: &Status) -> String {
-    let mut out = format!("arc-rs {}\n\n", status.version);
+    let mut out = format!("arc {}\n\n", status.version);
     if !status.in_repo {
         out.push_str("Not inside a git checkout; newest available is unknown.\n\n");
         out.push_str(how_to_update());
@@ -431,7 +431,7 @@ pub fn report_json(status: &Status) -> serde_json::Value {
 }
 
 /// Default release repository: the fork whose GitHub releases carry
-/// the `arc-rs` binaries. Checkouts whose `fork` (else `origin`)
+/// the `arc` binaries. Checkouts whose `fork` (else `origin`)
 /// remote points at another `github.com` repo use that repo instead.
 pub const DEFAULT_RELEASE_REPO: &str = "m-hu/arcanist";
 
@@ -446,7 +446,7 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
 /// One installable release binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseAsset {
-    /// Asset file name (e.g. `arc-rs-windows-x86_64.exe`).
+    /// Asset file name (e.g. `arc-windows-x86_64.exe`).
     pub name: String,
     /// Expected byte size, verified after download.
     pub size: u64,
@@ -575,7 +575,7 @@ pub fn resolve_release_target(dir: &Path) -> Result<ReleaseTarget, String> {
 
 /// Current platform tag (`os-arch`, e.g. `windows-x86_64`), from
 /// `std::env::consts`. Release binaries are published as
-/// `arc-rs-<tag>` (plus `.exe` on Windows).
+/// `arc-<tag>` (plus `.exe` on Windows).
 #[must_use]
 pub fn platform_tag() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
@@ -583,10 +583,7 @@ pub fn platform_tag() -> String {
 
 /// Exact asset names for `platform`, in preference order.
 fn platform_asset_names(platform: &str) -> [String; 2] {
-    [
-        format!("arc-rs-{platform}.exe"),
-        format!("arc-rs-{platform}"),
-    ]
+    [format!("arc-{platform}.exe"), format!("arc-{platform}")]
 }
 
 /// `releases/latest` API URL for `repo` under `api_base` (the stable
@@ -642,7 +639,7 @@ pub fn release_tag(release: &serde_json::Value) -> Result<String, String> {
 }
 
 /// Pick the current-platform binary from a release document: an exact
-/// `arc-rs-<tag>[.exe]` name wins, else a lone `arc-rs*` asset;
+/// `arc-<tag>[.exe]` name wins, else a lone `arc-*` asset;
 /// anything else is a clean error (never a guess between candidates).
 pub fn select_asset(release: &serde_json::Value, platform: &str) -> Result<ReleaseAsset, String> {
     let assets = release
@@ -696,7 +693,7 @@ fn asset_for_platform(assets: &[ReleaseAsset], platform: &str) -> Result<Release
     }
     let candidates: Vec<&ReleaseAsset> = assets
         .iter()
-        .filter(|asset| asset.name.starts_with("arc-rs"))
+        .filter(|asset| asset.name.starts_with("arc-"))
         .collect();
     match candidates.as_slice() {
         [only] => Ok((*only).clone()),
@@ -1242,7 +1239,7 @@ fn downloading_line(name: &str, size: u64, ansi: bool) -> String {
 fn replaced_line(exe: &Path, latest: &str, backup: Option<&Path>, ansi: bool) -> String {
     let exe_text = exe.display().to_string();
     let mut out = detail_line(
-        "Replaced \"%s\" with arc-rs \"%s\".\n",
+        "Replaced \"%s\" with arc \"%s\".\n",
         &[TVal::Text(&exe_text), TVal::Text(latest)],
         ansi,
     );
@@ -1259,7 +1256,7 @@ fn replaced_line(exe: &Path, latest: &str, backup: Option<&Path>, ansi: bool) ->
 
 fn already_line(current: &str, latest: &str, ansi: bool) -> String {
     detail_line(
-        "arc-rs \"%s\" is already up to date (latest release: \"%s\").\n",
+        "arc \"%s\" is already up to date (latest release: \"%s\").\n",
         &[TVal::Text(current), TVal::Text(latest)],
         ansi,
     )
@@ -1486,7 +1483,7 @@ fn run_apply_command(cwd: &Path, options: &Options) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             ExitCode::FAILURE
         }
     }
@@ -1500,7 +1497,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Parsed::Error(message) => {
-            eprintln!("arc-rs {NAME}: {message}\n\n{USAGE}");
+            eprintln!("arc {NAME}: {message}\n\n{USAGE}");
             return ExitCode::FAILURE;
         }
         Parsed::Options(options) => options,
@@ -1512,7 +1509,7 @@ pub fn run(argv: &[String]) -> ExitCode {
     let status = match inspect(&cwd) {
         Ok(status) => status,
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             return ExitCode::FAILURE;
         }
     };

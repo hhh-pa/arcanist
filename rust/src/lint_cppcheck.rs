@@ -1,4 +1,4 @@
-//! `arc-rs lint` Cppcheck linter (T1128).
+//! `arc lint` Cppcheck linter (T1128).
 //!
 //! PHP reference: `src/lint/linter/ArcanistCppcheckLinter.php` (an
 //! `ArcanistExternalLinter`).

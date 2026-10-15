@@ -1,4 +1,4 @@
-//! `arc-rs get-config` — read arc configuration settings.
+//! `arc get-config` — read arc configuration settings.
 //!
 //! PHP reference: `src/workflow/ArcanistGetConfigWorkflow.php`, with setting
 //! metadata from `src/configuration/ArcanistSettings.php` (no
@@ -36,7 +36,7 @@ use arc_rs::{config, git, terminal};
 /// Subcommand name, matching `arc get-config`.
 pub const NAME: &str = "get-config";
 
-const USAGE: &str = "usage: arc-rs get-config [--verbose] [--] [NAME...]\n\
+const USAGE: &str = "usage: arc get-config [--verbose] [--] [NAME...]\n\
 \n\
 Read arc configuration. With no NAME, show all known and configured keys.\n\
 \n\
@@ -589,7 +589,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}\n\n{USAGE}");
+            eprintln!("arc {NAME}: {message}\n\n{USAGE}");
             return ExitCode::FAILURE;
         }
     };
@@ -598,7 +598,7 @@ pub fn run(argv: &[String]) -> ExitCode {
     let sources = match load_sources(&cwd, user_file.as_deref()) {
         Ok(sources) => sources,
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             return ExitCode::FAILURE;
         }
     };

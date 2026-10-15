@@ -1,4 +1,4 @@
-//! `arc-rs inspect`: show internal object information.
+//! `arc inspect`: show internal object information.
 //!
 //! PHP reference: `src/workflow/ArcanistInspectWorkflow.php` with the
 //! `browse` and `working-copy` inspectors
@@ -32,7 +32,7 @@ pub const NAME: &str = "inspect";
 pub const SUPPORTED_TYPES: &[&str] = &["browse", "working-copy"];
 
 fn usage() -> String {
-    "usage: arc-rs inspect [--explore] [-- OBJECT...]\n\
+    "usage: arc inspect [--explore] [-- OBJECT...]\n\
      \n\
      Show internal object information.\n\
      \n\
@@ -163,7 +163,7 @@ pub struct CommitInfo {
 pub fn read_commit(dir: &Path, rev: &str) -> Result<CommitInfo, String> {
     if !git::is_inside_work_tree(dir) {
         return Err(
-            "\"arc-rs inspect\" must be run in a Git working copy to inspect \"working-copy(...)\"."
+            "\"arc inspect\" must be run in a Git working copy to inspect \"working-copy(...)\"."
                 .to_string(),
         );
     }
@@ -300,7 +300,7 @@ fn parse_inspect_options(argv: &[String]) -> Result<Options, ExitCode> {
             Err(ExitCode::SUCCESS)
         }
         ParseOutcome::Error(message) => {
-            eprintln!("arc-rs {NAME}: {message}\n\n{}", usage());
+            eprintln!("arc {NAME}: {message}\n\n{}", usage());
             Err(ExitCode::FAILURE)
         }
         ParseOutcome::Args(options) => Ok(options),
@@ -336,7 +336,7 @@ fn finish_inspect_blocks(
         match inspect_one_with(dir, spec, options.explore, ctx.as_deref_mut()) {
             Ok(block) => blocks.push(block),
             Err(message) => {
-                eprintln!("arc-rs {NAME}: {message}");
+                eprintln!("arc {NAME}: {message}");
                 return ExitCode::FAILURE;
             }
         }
@@ -367,7 +367,7 @@ fn run_inspect_objects(
                 finish_inspect_blocks(dir, options, Some(&mut ctx))
             }
             Err(message) => {
-                eprintln!("arc-rs {NAME}: {message}");
+                eprintln!("arc {NAME}: {message}");
                 ExitCode::FAILURE
             }
         },

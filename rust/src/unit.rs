@@ -1,4 +1,4 @@
-//! `arc-rs unit` — full-state port of `arc unit` plus a cargo adapter.
+//! `arc unit` — full-state port of `arc unit` plus a cargo adapter.
 //!
 //! PHP references: `src/workflow/ArcanistUnitWorkflow.php` (`getArguments`
 //! lines 38-107, engine setup lines 151-168, per-result rendering lines
@@ -76,7 +76,7 @@ pub const CONFIG_AVAILABLE: &[&str] = &[
     "phutil",
 ];
 
-pub const USAGE: &str = "usage: arc-rs unit [--rev REV] [--engine ENGINE] [--coverage] [--no-coverage] [--detailed-coverage] [--json] [--output FORMAT] [--target PHID] [--everything] [--ugly] [--conduit-uri URI] [paths...] [-- <cargo-test-args>]\n";
+pub const USAGE: &str = "usage: arc unit [--rev REV] [--engine ENGINE] [--coverage] [--no-coverage] [--detailed-coverage] [--json] [--output FORMAT] [--target PHID] [--everything] [--ugly] [--conduit-uri URI] [paths...] [-- <cargo-test-args>]\n";
 
 /// Number of trailing output lines echoed after the one-line summary.
 pub const TAIL_LINES: usize = 20;
@@ -1193,13 +1193,13 @@ pub fn cargo_test_argv(opts: &Options) -> Vec<String> {
 pub fn cargo_coverage_warning(opts: &Options) -> Option<String> {
     if opts.detailed_coverage {
         Some(
-            "arc-rs unit: warning: the cargo engine does not support coverage; \
+            "arc unit: warning: the cargo engine does not support coverage; \
              ignoring --detailed-coverage"
                 .to_string(),
         )
     } else if opts.coverage {
         Some(
-            "arc-rs unit: warning: the cargo engine does not support coverage; \
+            "arc unit: warning: the cargo engine does not support coverage; \
              ignoring --coverage"
                 .to_string(),
         )
@@ -3251,7 +3251,7 @@ fn empty_json_object(_: serde_json::Error) -> String {
 /// nothing. Failures exit `2` (`RESULT_FAIL`); successes exit `0`.
 fn run_cargo_selection(opts: &Options, cwd: &Path) -> ExitCode {
     if let Err(msg) = check_everything_paths(opts.everything, &opts.paths) {
-        eprintln!("arc-rs unit: {msg}");
+        eprintln!("arc unit: {msg}");
         return ExitCode::FAILURE;
     }
     if let Some(warning) = cargo_coverage_warning(opts) {
@@ -3262,7 +3262,7 @@ fn run_cargo_selection(opts: &Options, cwd: &Path) -> ExitCode {
             let format = output_format(opts);
             print_cargo_output(&report, &format);
             if let Err(msg) = upload_cargo_target(opts, &report) {
-                eprintln!("arc-rs unit: {msg}");
+                eprintln!("arc unit: {msg}");
                 return ExitCode::FAILURE;
             }
             if report.success {
@@ -3272,7 +3272,7 @@ fn run_cargo_selection(opts: &Options, cwd: &Path) -> ExitCode {
             }
         }
         Err(msg) => {
-            eprintln!("arc-rs unit: {msg}");
+            eprintln!("arc unit: {msg}");
             ExitCode::FAILURE
         }
     }
@@ -3287,7 +3287,7 @@ fn run_single_selection(
     ansi: bool,
 ) -> ExitCode {
     if !opts.cargo_args.is_empty() {
-        eprintln!("arc-rs unit: cargo test args after '--' require the cargo engine");
+        eprintln!("arc unit: cargo test args after '--' require the cargo engine");
         return ExitCode::FAILURE;
     }
     let root = project_root_path(cwd);
@@ -3304,7 +3304,7 @@ fn run_single_selection(
     ) {
         Ok(report) => finish_php_report(opts, &root, paths, &report, ansi),
         Err(msg) => {
-            eprintln!("arc-rs unit: {msg}");
+            eprintln!("arc unit: {msg}");
             ExitCode::FAILURE
         }
     }
@@ -3319,7 +3319,7 @@ fn run_config_selection(
     ansi: bool,
 ) -> ExitCode {
     if !opts.cargo_args.is_empty() {
-        eprintln!("arc-rs unit: cargo test args after '--' require the cargo engine");
+        eprintln!("arc unit: cargo test args after '--' require the cargo engine");
         return ExitCode::FAILURE;
     }
     let root_string = root.to_string_lossy().replace('\\', "/");
@@ -3335,7 +3335,7 @@ fn run_config_selection(
     ) {
         Ok(report) => finish_php_report(opts, root, paths, &report, ansi),
         Err(msg) => {
-            eprintln!("arc-rs unit: {msg}");
+            eprintln!("arc unit: {msg}");
             ExitCode::FAILURE
         }
     }
@@ -3370,7 +3370,7 @@ fn finish_php_report(
             opts.conduit_uri.as_deref(),
         )
     {
-        eprintln!("arc-rs unit: {msg}");
+        eprintln!("arc unit: {msg}");
         return ExitCode::FAILURE;
     }
     exit_code_for_overall(overall)
@@ -3384,7 +3384,7 @@ fn parse_unit_options(argv: &[String]) -> Result<Options, ExitCode> {
             Err(ExitCode::SUCCESS)
         }
         Err(msg) => {
-            eprintln!("arc-rs unit: {msg}\n\n{USAGE}");
+            eprintln!("arc unit: {msg}\n\n{USAGE}");
             Err(ExitCode::FAILURE)
         }
     }
@@ -3394,7 +3394,7 @@ fn unit_working_dir() -> Result<PathBuf, ExitCode> {
     match std::env::current_dir() {
         Ok(dir) => Ok(dir),
         Err(e) => {
-            eprintln!("arc-rs unit: cannot read current directory: {e}");
+            eprintln!("arc unit: cannot read current directory: {e}");
             Err(ExitCode::FAILURE)
         }
     }
@@ -3404,7 +3404,7 @@ fn check_unit_supports(cwd: &Path, opts: &Options) -> Result<(), ExitCode> {
     if let Some(vcs) = detect_vcs(cwd)
         && let Err(msg) = check_supports(vcs, &opts.provided)
     {
-        eprintln!("arc-rs unit: {msg}");
+        eprintln!("arc unit: {msg}");
         return Err(ExitCode::FAILURE);
     }
     Ok(())
@@ -3416,7 +3416,7 @@ fn discover_unit_selection(opts: &Options, cwd: &Path) -> Result<Selection, Exit
     match discover_selection(opts, cwd) {
         Ok(selection) => Ok(selection),
         Err(msg) => {
-            eprintln!("arc-rs unit: {msg}");
+            eprintln!("arc unit: {msg}");
             Err(ExitCode::FAILURE)
         }
     }
@@ -3427,7 +3427,7 @@ fn run_single_paths(opts: &Options, cwd: &Path, class: &str, ansi: bool) -> Exit
     let paths = match select_paths(opts, cwd, &root) {
         Ok(paths) => paths,
         Err(msg) => {
-            eprintln!("arc-rs unit: {msg}");
+            eprintln!("arc unit: {msg}");
             return ExitCode::FAILURE;
         }
     };
@@ -3444,7 +3444,7 @@ fn run_config_paths(
     let paths = match select_paths(opts, cwd, root) {
         Ok(paths) => paths,
         Err(msg) => {
-            eprintln!("arc-rs unit: {msg}");
+            eprintln!("arc unit: {msg}");
             return ExitCode::FAILURE;
         }
     };

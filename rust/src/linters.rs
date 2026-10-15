@@ -1,4 +1,4 @@
-//! `arc-rs linters`: list and inspect lint rules.
+//! `arc linters`: list and inspect lint rules.
 //!
 //! Port of `src/workflow/ArcanistLintersWorkflow.php`, including exact
 //! and search selection (`:66-141`), status detection with version
@@ -34,7 +34,7 @@ pub const NAME: &str = "linters";
 const PAD: &str = "    ";
 
 fn usage() -> String {
-    "usage: arc-rs linters [--verbose] [--search TERM] [NAME...]\n\
+    "usage: arc linters [--verbose] [--search TERM] [NAME...]\n\
      \n\
      Lists the available linters.\n\
      \n\
@@ -1645,7 +1645,7 @@ pub fn run_in(cwd: &Path, argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         ParseOutcome::Error(message) => {
-            eprintln!("arc-rs {NAME}: {message}\n\n{}", usage());
+            eprintln!("arc {NAME}: {message}\n\n{}", usage());
             return ExitCode::FAILURE;
         }
         ParseOutcome::Args(options) => options,
@@ -1653,7 +1653,7 @@ pub fn run_in(cwd: &Path, argv: &[String]) -> ExitCode {
     let configured = match configured_classes(cwd) {
         Ok(configured) => configured,
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             return ExitCode::FAILURE;
         }
     };

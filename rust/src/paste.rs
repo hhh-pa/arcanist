@@ -24,8 +24,8 @@ const DEFAULT_TITLE: &str = "Command-Line Input";
 
 fn usage() -> String {
     format!(
-        "usage: arc-rs {NAME} [--title TITLE] [--lang LANG] [--input PATH] [--browse]\n\
-         \x20      arc-rs {NAME} P123\n\
+        "usage: arc {NAME} [--title TITLE] [--lang LANG] [--input PATH] [--browse]\n\
+         \x20      arc {NAME} P123\n\
          \n\
          Share and grab text using the Paste application. To create a paste,\n\
          use --input or provide the text on stdin; to retrieve one, give\n\
@@ -632,7 +632,7 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             ExitCode::FAILURE
         }
     }

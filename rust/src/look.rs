@@ -1,4 +1,4 @@
-//! `arc-rs look`: a small text adventure around the working copy.
+//! `arc look`: a small text adventure around the working copy.
 //!
 //! PHP reference: `src/workflow/ArcanistLookWorkflow.php` ("Arcventure").
 //!
@@ -20,7 +20,7 @@ use crate::{conduit, config, diff_submit, git, terminal};
 /// Subcommand name, matching `arc look`.
 pub const NAME: &str = "look";
 
-const USAGE: &str = "usage: arc-rs look [-- THING...]\n";
+const USAGE: &str = "usage: arc look [-- THING...]\n";
 
 /// `pht('Arcventure')`, the `%!` banner title.
 pub const TITLE: &str = "Arcventure";
@@ -1356,7 +1356,7 @@ fn look_conduit_client() -> Option<conduit::Client> {
 }
 
 fn fail(message: String) -> ExitCode {
-    eprintln!("arc-rs {NAME}: {message}");
+    eprintln!("arc {NAME}: {message}");
     ExitCode::FAILURE
 }
 
@@ -1500,7 +1500,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(msg) => {
-            eprintln!("arc-rs {NAME}: {msg}\n\n{USAGE}");
+            eprintln!("arc {NAME}: {msg}\n\n{USAGE}");
             return ExitCode::FAILURE;
         }
     };

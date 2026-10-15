@@ -1,4 +1,4 @@
-//! `arc-rs tasks`: view assigned Maniphest tasks.
+//! `arc tasks`: view assigned Maniphest tasks.
 //!
 //! Port of `src/workflow/ArcanistTasksWorkflow.php`: resolves the owner (you
 //! by default, `--owner`, `--unassigned`, or `@all` for everyone) and lists
@@ -15,7 +15,7 @@ use crate::{conduit, config, terminal};
 /// Subcommand name, matching `arc tasks`.
 pub const NAME: &str = "tasks";
 
-const USAGE: &str = "usage: arc-rs tasks [--status STATUS] [--owner USER] [--order ORDER] [--limit N] [--unassigned] [--json] [--conduit-uri URI]\n";
+const USAGE: &str = "usage: arc tasks [--status STATUS] [--owner USER] [--order ORDER] [--limit N] [--unassigned] [--json] [--conduit-uri URI]\n";
 
 /// Parsed `tasks` options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -479,14 +479,14 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(msg) => {
-            eprintln!("arc-rs {NAME}: {msg}\n\n{USAGE}");
+            eprintln!("arc {NAME}: {msg}\n\n{USAGE}");
             return ExitCode::FAILURE;
         }
     };
     let client = match config::client_for(options.conduit_uri.as_deref()) {
         Ok(client) => client,
         Err(msg) => {
-            eprintln!("arc-rs {NAME}: {msg}");
+            eprintln!("arc {NAME}: {msg}");
             return ExitCode::FAILURE;
         }
     };
@@ -496,7 +496,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(msg) => {
-            eprintln!("arc-rs {NAME}: {msg}");
+            eprintln!("arc {NAME}: {msg}");
             ExitCode::FAILURE
         }
     }

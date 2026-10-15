@@ -313,7 +313,7 @@ fn resolves_types_against_detected_vcs() {
 #[test]
 fn usage_covers_options() {
     let text = usage();
-    assert!(text.contains("usage: arc-rs markers"));
+    assert!(text.contains("usage: arc markers"));
     assert!(text.contains("--type") && text.contains("--json"));
     assert!(text.contains("--conduit-uri"));
 }

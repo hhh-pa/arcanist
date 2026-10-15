@@ -1,4 +1,4 @@
-//! `arc-rs markers`: list branch/bookmark markers with commit context.
+//! `arc markers`: list branch/bookmark markers with commit context.
 //!
 //! PHP reference: `src/workflow/ArcanistMarkersWorkflow.php` (the engine),
 //! `src/workflow/ArcanistBookmarksWorkflow.php` and
@@ -63,7 +63,7 @@ pub const UNPUBLISHED_LIMIT: usize = 1000;
 
 fn usage() -> String {
     format!(
-        "usage: arc-rs {NAME} [--type branch|bookmark] [--json] [--conduit-uri URI]\n\
+        "usage: arc {NAME} [--type branch|bookmark] [--json] [--conduit-uri URI]\n\
          \n\
          Show an enhanced view of markers in the working copy.\n\
          Without --type, git checkouts list branches and Mercurial\n\
@@ -2398,7 +2398,7 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             ExitCode::FAILURE
         }
     }

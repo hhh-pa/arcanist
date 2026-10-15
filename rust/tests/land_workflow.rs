@@ -153,7 +153,7 @@ fn run_uses_current_dir() {
 fn help_succeeds_and_prints_usage() {
     let repo = Fixture::init_repo("help");
     let out = land::execute(repo.path(), &args(&["--help"])).unwrap();
-    assert!(out.stdout.contains("usage: arc-rs land"), "{}", out.stdout);
+    assert!(out.stdout.contains("usage: arc land"), "{}", out.stdout);
     assert_eq!(
         land::run_in(repo.path(), &args(&["--help"])),
         ExitCode::SUCCESS

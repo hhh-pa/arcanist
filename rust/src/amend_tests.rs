@@ -105,7 +105,7 @@ fn normalizes_messages() {
 #[test]
 fn usage_covers_options_and_limits() {
     let text = usage();
-    assert!(text.contains("usage: arc-rs amend"));
+    assert!(text.contains("usage: arc amend"));
     assert!(text.contains("--revision") && text.contains("--show"));
     assert!(text.contains("history.immutable"));
 }

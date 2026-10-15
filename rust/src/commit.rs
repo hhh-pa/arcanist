@@ -1,4 +1,4 @@
-//! `arc-rs commit`: commit an accepted revision, or create a git commit.
+//! `arc commit`: commit an accepted revision, or create a git commit.
 //!
 //! PHP reference: `src/workflow/ArcanistCommitWorkflow.php`, which commits
 //! an accepted Differential revision via `svn commit`. Under Subversion
@@ -34,7 +34,7 @@ pub const NAME: &str = "commit";
 
 fn usage() -> String {
     format!(
-        "usage: arc-rs {NAME} [(-m MESSAGE | --revision ID)] [--all] [--allow-empty] [--show]\n\
+        "usage: arc {NAME} [(-m MESSAGE | --revision ID)] [--all] [--allow-empty] [--show]\n\
          \n\
          Under git, create a local commit. The message comes from\n\
          -m/--message (repeatable, joined with a blank line), or from\n\
@@ -846,7 +846,7 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             ExitCode::FAILURE
         }
     }

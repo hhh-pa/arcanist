@@ -28,9 +28,9 @@ pub const NAME: &str = "export";
 
 fn usage() -> String {
     format!(
-        "usage: arc-rs {NAME} (--git | --unified | --arcbundle PATH) [BASE]\n\
-         \x20      arc-rs {NAME} (--git | --unified | --arcbundle PATH) --revision ID\n\
-         \x20      arc-rs {NAME} (--git | --unified | --arcbundle PATH) --diff ID\n\
+        "usage: arc {NAME} (--git | --unified | --arcbundle PATH) [BASE]\n\
+         \x20      arc {NAME} (--git | --unified | --arcbundle PATH) --revision ID\n\
+         \x20      arc {NAME} (--git | --unified | --arcbundle PATH) --diff ID\n\
          \n\
          Export the working copy changes against BASE (default: HEAD), or a\n\
          Differential revision/diff, to stdout as a patch, or to PATH as an\n\
@@ -963,7 +963,7 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             ExitCode::FAILURE
         }
     }

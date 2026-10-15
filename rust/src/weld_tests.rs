@@ -167,7 +167,7 @@ fn terminator_prefers_the_later_line() {
 #[test]
 fn usage_covers_files_and_seed() {
     let text = usage();
-    assert!(text.contains("usage: arc-rs weld"));
+    assert!(text.contains("usage: arc weld"));
     assert!(text.contains("<file>"));
     assert!(text.contains("--seed"));
 }

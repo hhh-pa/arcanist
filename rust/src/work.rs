@@ -1,4 +1,4 @@
-//! `arc-rs work`: begin or resume work on a branch.
+//! `arc work`: begin or resume work on a branch.
 //!
 //! PHP references: `src/workflow/ArcanistWorkWorkflow.php` (exactly one
 //! symbol, `--start`), `src/work/ArcanistWorkEngine.php` (local-state
@@ -35,7 +35,7 @@ pub const ABORT: &str = "User aborted the workflow.";
 pub const NAME: &str = "work";
 
 fn usage() -> String {
-    "usage: arc-rs work [--start START] SYMBOL\n\
+    "usage: arc work [--start START] SYMBOL\n\
      \n\
      Begin or resume work on a branch.\n\
      \n\
@@ -588,9 +588,9 @@ pub fn ambiguous_marker_block(
 
 fn work_outside_repo(dir: &Path) -> ExitCode {
     if dir.join(".hg").is_dir() {
-        eprintln!("arc-rs {NAME}: Mercurial working copies are not yet ported (see T1128)");
+        eprintln!("arc {NAME}: Mercurial working copies are not yet ported (see T1128)");
     } else {
-        eprintln!("arc-rs {NAME}: \"arc-rs work\" must be run in a Git or Mercurial working copy.");
+        eprintln!("arc {NAME}: \"arc work\" must be run in a Git or Mercurial working copy.");
     }
     ExitCode::FAILURE
 }
@@ -1078,14 +1078,14 @@ fn fail_with_restore(dir: &Path, state: &WorkState, stashed: bool, message: Stri
     // Mirror the destructor restore: check the saved position back out,
     // re-apply the stash, then report the original error.
     if let Err(restore) = restore_work_state(dir, state) {
-        eprintln!("arc-rs {NAME}: {restore}");
+        eprintln!("arc {NAME}: {restore}");
         return ExitCode::FAILURE;
     }
     if stashed && let Err(message) = apply_stash(dir) {
-        eprintln!("arc-rs {NAME}: {message}");
+        eprintln!("arc {NAME}: {message}");
         return ExitCode::FAILURE;
     }
-    eprintln!("arc-rs {NAME}: {message}");
+    eprintln!("arc {NAME}: {message}");
     ExitCode::FAILURE
 }
 
@@ -1098,32 +1098,32 @@ fn execute_parsed(
     let state = match save_work_state(dir) {
         Ok(state) => state,
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             return ExitCode::FAILURE;
         }
     };
     let lists = match dirty_lists(dir) {
         Ok(lists) => lists,
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             return ExitCode::FAILURE;
         }
     };
     if let Err(message) = confirm_externals(input, &lists) {
-        eprintln!("arc-rs {NAME}: {message}");
+        eprintln!("arc {NAME}: {message}");
         return ExitCode::FAILURE;
     }
     let stashed = match maybe_stash(dir, input, &lists) {
         Ok(stashed) => stashed,
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             return ExitCode::FAILURE;
         }
     };
     match dispatch_symbol(dir, &options.symbol, options.start.clone(), call) {
         Ok(()) => {
             if stashed && let Err(message) = apply_stash(dir) {
-                eprintln!("arc-rs {NAME}: {message}");
+                eprintln!("arc {NAME}: {message}");
                 return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS
@@ -1139,7 +1139,7 @@ fn parse_or_report(argv: &[String]) -> Result<Options, ExitCode> {
             Err(ExitCode::SUCCESS)
         }
         ParseOutcome::Error(message) => {
-            eprintln!("arc-rs {NAME}: {message}\n\n{}", usage());
+            eprintln!("arc {NAME}: {message}\n\n{}", usage());
             Err(ExitCode::FAILURE)
         }
         ParseOutcome::Args(options) => Ok(options),
@@ -1169,7 +1169,7 @@ pub fn run_in_with(
         let client = match config::client_for(None) {
             Ok(client) => client,
             Err(message) => {
-                eprintln!("arc-rs {NAME}: {message}");
+                eprintln!("arc {NAME}: {message}");
                 return ExitCode::FAILURE;
             }
         };

@@ -120,7 +120,7 @@ fn normalizes_messages() {
 #[test]
 fn usage_covers_options_and_limits() {
     let text = usage();
-    assert!(text.contains("usage: arc-rs commit"));
+    assert!(text.contains("usage: arc commit"));
     assert!(text.contains("--revision") && text.contains("--show"));
     assert!(text.contains("--conduit-uri"));
 }
