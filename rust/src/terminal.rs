@@ -129,53 +129,84 @@ fn color_number(name: &str) -> Option<u8> {
     }
 }
 
+/// The next `<` at or after `from`.
+fn find_tag_open(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut index = from;
+    while index < bytes.len() {
+        if bytes[index] == b'<' {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Match a `<fg:color>body</color>` tag at `open`: (color number, is
+/// foreground, body start, body end, tag end). Unknown colors, missing
+/// closers, and non-color tags do not match.
+fn match_color_tag(text: &str, open: usize) -> Option<(u8, bool, usize, usize, usize)> {
+    let rest = text.get(open..)?;
+    let is_fg = if rest.starts_with("<fg:") {
+        true
+    } else if rest.starts_with("<bg:") {
+        false
+    } else {
+        return None;
+    };
+    let after = rest.get(4..)?;
+    let end = after.find('>')?;
+    let number = color_number(&after[..end])?;
+    let closer = if is_fg { "</fg>" } else { "</bg>" };
+    let body_start = open + 4 + end + 1;
+    let tail = text.get(body_start..)?;
+    let close_at = tail.find(closer)?;
+    Some((
+        number,
+        is_fg,
+        body_start,
+        body_start + close_at,
+        body_start + close_at + closer.len(),
+    ))
+}
+
+/// Push a color-tag body, ANSI-wrapped or bare.
+fn push_colored(
+    out: &mut String,
+    text: &str,
+    body: (usize, usize),
+    number: u8,
+    is_fg: bool,
+    ansi: bool,
+) {
+    if ansi {
+        let (code, default) = if is_fg {
+            (30 + number, 39)
+        } else {
+            (40 + number, 49)
+        };
+        out.push_str(&format!(
+            "\x1b[{code}m{}\x1b[{default}m",
+            &text[body.0..body.1]
+        ));
+    } else {
+        out.push_str(&text[body.0..body.1]);
+    }
+}
+
 /// One `<fg:color>`/`<bg:color>` pass over `text`, stripped or ANSI.
 fn interpret_colors(text: &str, ansi: bool) -> String {
     let bytes = text.as_bytes();
     let mut out = String::new();
     let mut index = 0;
     while index < bytes.len() {
-        let Some(open) = bytes[index..]
-            .iter()
-            .position(|&b| b == b'<')
-            .map(|at| at + index)
-        else {
+        let Some(open) = find_tag_open(bytes, index) else {
             out.push_str(&text[index..]);
             break;
         };
-        let rest = &text[open..];
-        let kind = if rest.starts_with("<fg:") {
-            Some("fg")
-        } else if rest.starts_with("<bg:") {
-            Some("bg")
-        } else {
-            None
-        };
-        let matched = kind.and_then(|kind| {
-            let after = &rest[4..];
-            let end = after.find('>')?;
-            let name = &after[..end];
-            let number = color_number(name)?;
-            let closer = if kind == "fg" { "</fg>" } else { "</bg>" };
-            let body_start = open + 4 + end + 1;
-            let tail = text.get(body_start..)?;
-            let close_at = tail.find(closer)?;
-            let body = &tail[..close_at];
-            Some((number, kind, body, body_start + close_at + closer.len()))
-        });
-        match matched {
-            Some((number, kind, body, end)) => {
+        match match_color_tag(text, open) {
+            Some((number, is_fg, body_start, body_end, end)) => {
                 out.push_str(&text[index..open]);
-                if ansi {
-                    let (code, default) = if kind == "fg" {
-                        (30 + number, 39)
-                    } else {
-                        (40 + number, 49)
-                    };
-                    out.push_str(&format!("\x1b[{code}m{body}\x1b[{default}m"));
-                } else {
-                    out.push_str(body);
-                }
+                push_colored(&mut out, text, (body_start, body_end), number, is_fg, ansi);
                 index = end;
             }
             None => {
@@ -285,75 +316,105 @@ pub fn escape_value(value: &str, allow_whitespace: bool) -> String {
     String::from_utf8(out).unwrap_or_default()
 }
 
+/// Copy an ANSI escape (through `m`) into `line`; the next index after.
+fn copy_escape(chars: &[char], mut index: usize, line: &mut Vec<char>) -> usize {
+    while index < chars.len() {
+        line.push(chars[index]);
+        if chars[index] == 'm' {
+            break;
+        }
+        index += 1;
+    }
+    index + 1
+}
+
+/// Incremental `console_wrap` line state.
+#[derive(Default)]
+struct WrapState {
+    lines: Vec<Vec<char>>,
+    line: Vec<char>,
+    line_len: i64,
+    len_after_break: i64,
+    break_pos: Option<usize>,
+}
+
+impl WrapState {
+    /// Break the line at the last space when past `width`.
+    fn wrap_if_needed(&mut self, width: i64) {
+        if self.line_len <= width {
+            return;
+        }
+        let Some(at) = self.break_pos else {
+            return;
+        };
+        let mut slice = self.line[..at].to_vec();
+        while slice.last() == Some(&' ') {
+            slice.pop();
+        }
+        slice.push('\n');
+        self.lines.push(slice);
+        self.line = self.line[at..].to_vec();
+        self.line_len = self.len_after_break;
+        self.len_after_break = 0;
+        self.break_pos = None;
+    }
+
+    /// Push one character, wrapping and tracking breaks.
+    fn push_char(&mut self, current: char, width: i64) {
+        self.line.push(current);
+        self.line_len += 1;
+        self.len_after_break += 1;
+        self.wrap_if_needed(width);
+        if current == ' ' {
+            self.break_pos = Some(self.line.len());
+            self.len_after_break = 0;
+        }
+        if current == '\n' {
+            self.lines.push(std::mem::take(&mut self.line));
+            self.len_after_break = 0;
+            self.line_len = 0;
+            self.break_pos = None;
+        }
+    }
+
+    /// Render wrapped lines with the indent prefix.
+    fn finish(self, indent: usize, with_prefix: bool) -> String {
+        let mut lines = self.lines;
+        if !self.line.is_empty() {
+            lines.push(self.line);
+        }
+        let prefix: String = if indent > 0 {
+            " ".repeat(indent)
+        } else {
+            String::new()
+        };
+        let mut out = String::new();
+        for (number, wrapped) in lines.iter().enumerate() {
+            if number > 0 || with_prefix {
+                out.push_str(&prefix);
+            }
+            out.extend(wrapped.iter());
+        }
+        out
+    }
+}
+
 /// Soft-wrap text at column 78 minus `indent`.
 #[must_use]
 pub fn console_wrap(text: &str, indent: usize, with_prefix: bool) -> String {
     let width = 78i64 - indent as i64;
     let chars: Vec<char> = text.chars().collect();
-    let mut lines: Vec<Vec<char>> = Vec::new();
-    let mut line: Vec<char> = Vec::new();
-    let mut line_len: i64 = 0;
-    let mut len_after_break: i64 = 0;
-    let mut break_pos: Option<usize> = None;
+    let mut state = WrapState::default();
     let mut index = 0;
     while index < chars.len() {
-        let current = chars[index];
-        if current == '\x1b' {
-            while index < chars.len() {
-                line.push(chars[index]);
-                if chars[index] == 'm' {
-                    break;
-                }
-                index += 1;
-            }
-            index += 1;
+        if chars[index] == '\x1b' {
+            index = copy_escape(&chars, index, &mut state.line);
             continue;
         }
-        line.push(current);
-        line_len += 1;
-        len_after_break += 1;
-        if line_len > width
-            && let Some(at) = break_pos
-        {
-            let mut slice = line[..at].to_vec();
-            while slice.last() == Some(&' ') {
-                slice.pop();
-            }
-            slice.push('\n');
-            lines.push(slice);
-            line = line[at..].to_vec();
-            line_len = len_after_break;
-            len_after_break = 0;
-            break_pos = None;
-        }
-        if current == ' ' {
-            break_pos = Some(line.len());
-            len_after_break = 0;
-        }
-        if current == '\n' {
-            lines.push(std::mem::take(&mut line));
-            len_after_break = 0;
-            line_len = 0;
-            break_pos = None;
-        }
+        state.push_char(chars[index], width);
         index += 1;
     }
-    if !line.is_empty() {
-        lines.push(line);
-    }
-    let prefix: String = if indent > 0 {
-        " ".repeat(indent)
-    } else {
-        String::new()
-    };
-    let mut out = String::new();
-    for (number, wrapped) in lines.iter().enumerate() {
-        if number > 0 || with_prefix {
-            out.push_str(&prefix);
-        }
-        out.extend(wrapped.iter());
-    }
-    out
+    state.finish(indent, with_prefix)
 }
 
 /// PHP `(int)` cast of a string: leading whitespace, an optional sign,
@@ -380,40 +441,34 @@ pub fn php_int_cast(text: &str) -> i64 {
     if any { value } else { 0 }
 }
 
-/// Format one `tsprintf` conversion; `pattern_so_far` mirrors the
-/// partially rewritten pattern for error messages.
-fn convert(
+/// Escape a conversion value unless it is already terminal text.
+fn escaped_text(value: &TVal, text: &str, allow_whitespace: bool) -> String {
+    if value.is_terminal() {
+        text.to_string()
+    } else {
+        escape_value(text, allow_whitespace)
+    }
+}
+
+/// Format a `%d` conversion (integers directly, else a PHP int cast).
+fn convert_int(value: &TVal, text: &str) -> String {
+    match value {
+        TVal::Int(number) => number.to_string(),
+        _ => php_int_cast(text).to_string(),
+    }
+}
+
+/// Format a markup-building conversion (`!`, `?`, `>`); anything else is
+/// an unsupported escape. `pattern_so_far` mirrors the partially
+/// rewritten pattern for error messages.
+fn convert_markup(
     conversion: u8,
     value: &TVal,
     pattern_so_far: &mut [u8],
     pos: usize,
     ansi: bool,
 ) -> Result<String, String> {
-    let text = value.as_text();
-    let escaped = |allow_whitespace: bool| {
-        if value.is_terminal() {
-            text.clone()
-        } else {
-            escape_value(&text, allow_whitespace)
-        }
-    };
     match conversion {
-        b's' => {
-            pattern_so_far[pos] = b's';
-            Ok(escaped(false))
-        }
-        b'B' => {
-            pattern_so_far[pos] = b's';
-            Ok(escaped(true))
-        }
-        b'R' => {
-            pattern_so_far[pos] = b's';
-            Ok(text)
-        }
-        b'W' => {
-            pattern_so_far[pos] = b's';
-            Ok(console_wrap(&escaped(true), 0, true))
-        }
         b'!' => {
             pattern_so_far[pos] = b's';
             tsprintf_ansi(
@@ -437,13 +492,6 @@ fn convert(
             tsprintf_ansi("    **$ %s**\n", std::slice::from_ref(value), ansi)
                 .map(|t| t.to_string())
         }
-        b'd' => {
-            pattern_so_far[pos] = b'd';
-            Ok(match value {
-                TVal::Int(number) => number.to_string(),
-                _ => php_int_cast(&text).to_string(),
-            })
-        }
         _ => Err(format!(
             "Unsupported escape sequence \"{}\" found in pattern: {}",
             conversion as char,
@@ -452,55 +500,133 @@ fn convert(
     }
 }
 
+/// Format one `tsprintf` conversion; `pattern_so_far` mirrors the
+/// partially rewritten pattern for error messages.
+fn convert(
+    conversion: u8,
+    value: &TVal,
+    pattern_so_far: &mut [u8],
+    pos: usize,
+    ansi: bool,
+) -> Result<String, String> {
+    let text = value.as_text();
+    match conversion {
+        b's' => {
+            pattern_so_far[pos] = b's';
+            Ok(escaped_text(value, &text, false))
+        }
+        b'B' => {
+            pattern_so_far[pos] = b's';
+            Ok(escaped_text(value, &text, true))
+        }
+        b'R' => {
+            pattern_so_far[pos] = b's';
+            Ok(text)
+        }
+        b'W' => {
+            pattern_so_far[pos] = b's';
+            Ok(console_wrap(&escaped_text(value, &text, true), 0, true))
+        }
+        b'd' => {
+            pattern_so_far[pos] = b'd';
+            Ok(convert_int(value, &text))
+        }
+        other => convert_markup(other, value, pattern_so_far, pos, ansi),
+    }
+}
+
+/// Incremental `tsprintf_ansi` formatting state.
+struct SprintfState {
+    pattern_so_far: Vec<u8>,
+    out: Vec<u8>,
+    arg: usize,
+    conv: bool,
+}
+
+impl SprintfState {
+    fn new(bytes: &[u8]) -> Self {
+        Self {
+            pattern_so_far: bytes.to_vec(),
+            out: Vec::new(),
+            arg: 0,
+            conv: false,
+        }
+    }
+
+    /// Format one conversion after `%` (modifiers are unsupported); the
+    /// next index after.
+    fn step_conversion(
+        &mut self,
+        bytes: &[u8],
+        args: &[TVal],
+        index: usize,
+        ansi: bool,
+    ) -> Result<usize, String> {
+        let byte = bytes[index];
+        if matches!(byte, b'\'' | b'-' | b'0'..=b'9' | b'.' | b'$' | b'+') {
+            return Err(format!(
+                "xsprintf() does not support the \"%{}\" modifier.",
+                byte as char
+            ));
+        }
+        self.conv = false;
+        if self.arg >= args.len() {
+            return Err("Too few arguments to xsprintf().".to_string());
+        }
+        let replacement = convert(byte, &args[self.arg], &mut self.pattern_so_far, index, ansi)?;
+        self.arg += 1;
+        self.out.extend_from_slice(replacement.as_bytes());
+        Ok(index + 1)
+    }
+
+    /// Process the byte at `index`; the next index after.
+    fn step(
+        &mut self,
+        bytes: &[u8],
+        args: &[TVal],
+        index: usize,
+        ansi: bool,
+    ) -> Result<usize, String> {
+        let byte = bytes[index];
+        if self.conv && byte != b'%' {
+            return self.step_conversion(bytes, args, index, ansi);
+        }
+        if byte == b'%' {
+            if self.conv {
+                self.out.push(b'%');
+            }
+            self.conv = !self.conv;
+        } else {
+            self.out.push(byte);
+        }
+        Ok(index + 1)
+    }
+
+    /// Finish formatting, checking the argument count.
+    fn finish(self, expected: usize) -> Result<TerminalString, String> {
+        let mut out = self.out;
+        if self.conv {
+            out.push(b'%');
+        }
+        if self.arg != expected {
+            return Err("Too many arguments to xsprintf().".to_string());
+        }
+        Ok(TerminalString::new(
+            String::from_utf8(out).unwrap_or_default(),
+        ))
+    }
+}
+
 /// Format with an explicit ANSI setting (deterministic under test).
 pub fn tsprintf_ansi(pattern: &str, args: &[TVal], ansi: bool) -> Result<TerminalString, String> {
     let interpreted = interpret(pattern, ansi);
     let bytes = interpreted.as_bytes();
-    let mut pattern_so_far = bytes.to_vec();
-    let mut out: Vec<u8> = Vec::new();
-    let mut arg = 0;
-    let mut conv = false;
+    let mut state = SprintfState::new(bytes);
     let mut index = 0;
     while index < bytes.len() {
-        let byte = bytes[index];
-        if conv {
-            if matches!(byte, b'\'' | b'-' | b'0'..=b'9' | b'.' | b'$' | b'+') {
-                return Err(format!(
-                    "xsprintf() does not support the \"%{}\" modifier.",
-                    byte as char
-                ));
-            }
-            if byte != b'%' {
-                conv = false;
-                if arg >= args.len() {
-                    return Err("Too few arguments to xsprintf().".to_string());
-                }
-                let replacement = convert(byte, &args[arg], &mut pattern_so_far, index, ansi)?;
-                arg += 1;
-                out.extend_from_slice(replacement.as_bytes());
-                index += 1;
-                continue;
-            }
-        }
-        if byte == b'%' {
-            if conv {
-                out.push(b'%');
-            }
-            conv = !conv;
-        } else {
-            out.push(byte);
-        }
-        index += 1;
+        index = state.step(bytes, args, index, ansi)?;
     }
-    if conv {
-        out.push(b'%');
-    }
-    if arg != args.len() {
-        return Err("Too many arguments to xsprintf().".to_string());
-    }
-    Ok(TerminalString::new(
-        String::from_utf8(out).unwrap_or_default(),
-    ))
+    state.finish(args.len())
 }
 
 /// Format with the process ANSI setting.
@@ -582,8 +708,8 @@ enum Variant {
     Nested([[&'static str; 2]; 2]),
 }
 
-/// The merged `en_US` translation map (Arcanist + libphutil).
-fn lookup_translation(pattern: &str) -> Option<Variant> {
+/// Arcanist-side `en_US` translations (first half of the map).
+fn lookup_translation_arcanist(pattern: &str) -> Option<Variant> {
     match pattern {
         "%s locally modified path(s) are not included in this revision:" => Some(Variant::Pair(
             "A locally modified path is not included in this revision:",
@@ -627,6 +753,13 @@ fn lookup_translation(pattern: &str) -> Option<Variant> {
             "(To ignore these changes, add them to \"%2$s\".)",
         )),
         "%s line(s)" => Some(Variant::Pair("line", "lines")),
+        _ => None,
+    }
+}
+
+/// libphutil-side `en_US` translations (second half of the map).
+fn lookup_translation_libphutil(pattern: &str) -> Option<Variant> {
+    match pattern {
         "%s assertion(s) passed." => Some(Variant::Pair(
             "%s assertion passed.",
             "%s assertions passed.",
@@ -670,6 +803,14 @@ fn lookup_translation(pattern: &str) -> Option<Variant> {
         )),
         _ => None,
     }
+}
+
+/// The merged `en_US` translation map (Arcanist + libphutil).
+fn lookup_translation(pattern: &str) -> Option<Variant> {
+    if let Some(variant) = lookup_translation_arcanist(pattern) {
+        return Some(variant);
+    }
+    lookup_translation_libphutil(pattern)
 }
 
 fn invalid_variant(pattern: &str, pos: &str, kind: &str) -> String {
@@ -720,6 +861,72 @@ fn pht_arg_text(arg: &PhtArg) -> String {
     }
 }
 
+/// Scan `%` digits and an optional `$`: (positional index, digits, cursor).
+fn scan_placement(bytes: &[u8], index: usize) -> (usize, String, usize) {
+    let mut cursor = index + 1;
+    let mut digits = String::new();
+    while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+        digits.push(bytes[cursor] as char);
+        cursor += 1;
+    }
+    let positional = if !digits.is_empty() && cursor < bytes.len() && bytes[cursor] == b'$' {
+        cursor += 1;
+        digits.parse::<usize>().unwrap_or(0)
+    } else {
+        0
+    };
+    (positional, digits, cursor)
+}
+
+/// Push one `%s`/`%d` argument (`%d` renders integers, casting text).
+fn push_pht_arg(out: &mut Vec<u8>, conversion: u8, arg: &PhtArg) {
+    if conversion == b'd' {
+        let text = match arg {
+            PhtArg::Int(number) => number.to_string(),
+            PhtArg::Number(value, _) => value.to_string(),
+            PhtArg::Text(text) => php_int_cast(text).to_string(),
+        };
+        out.extend_from_slice(text.as_bytes());
+    } else {
+        out.extend_from_slice(pht_arg_text(arg).as_bytes());
+    }
+}
+
+/// Process one `%` placeholder at `index`; the next index after, or
+/// `None` for an invalid translation.
+fn vsprintf_step(
+    bytes: &[u8],
+    args: &[PhtArg],
+    index: usize,
+    sequential: &mut usize,
+    out: &mut Vec<u8>,
+) -> Option<usize> {
+    let (positional, digits, cursor) = scan_placement(bytes, index);
+    if cursor >= bytes.len() {
+        out.push(b'%');
+        out.extend_from_slice(digits.as_bytes());
+        return Some(bytes.len());
+    }
+    let conversion = bytes[cursor];
+    if conversion == b'%' && positional == 0 && digits.is_empty() {
+        out.push(b'%');
+        return Some(cursor + 1);
+    }
+    if !matches!(conversion, b's' | b'd') {
+        return None;
+    }
+    let which = if positional > 0 {
+        positional - 1
+    } else {
+        let next = *sequential;
+        *sequential += 1;
+        next
+    };
+    let arg = args.get(which)?;
+    push_pht_arg(out, conversion, arg);
+    Some(cursor + 1)
+}
+
 /// Minimal `vsprintf`: `%%`, `%s`, `%d`, and `%N$s`/`%N$d`.
 fn vsprintf(translation: &str, args: &[PhtArg]) -> String {
     let bytes = translation.as_bytes();
@@ -732,52 +939,10 @@ fn vsprintf(translation: &str, args: &[PhtArg]) -> String {
             index += 1;
             continue;
         }
-        let mut cursor = index + 1;
-        let mut digits = String::new();
-        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
-            digits.push(bytes[cursor] as char);
-            cursor += 1;
+        match vsprintf_step(bytes, args, index, &mut sequential, &mut out) {
+            Some(next) => index = next,
+            None => return format!("[Invalid Translation!] {translation}"),
         }
-        let positional = if !digits.is_empty() && cursor < bytes.len() && bytes[cursor] == b'$' {
-            cursor += 1;
-            digits.parse::<usize>().unwrap_or(0)
-        } else {
-            0
-        };
-        if cursor >= bytes.len() {
-            out.push(b'%');
-            out.extend_from_slice(digits.as_bytes());
-            break;
-        }
-        let conversion = bytes[cursor];
-        if conversion == b'%' && positional == 0 && digits.is_empty() {
-            out.push(b'%');
-            index = cursor + 1;
-            continue;
-        }
-        if !matches!(conversion, b's' | b'd') {
-            return format!("[Invalid Translation!] {translation}");
-        }
-        let which = if positional > 0 {
-            positional - 1
-        } else {
-            sequential += 1;
-            sequential - 1
-        };
-        let Some(arg) = args.get(which) else {
-            return format!("[Invalid Translation!] {translation}");
-        };
-        if conversion == b'd' {
-            let text = match arg {
-                PhtArg::Int(number) => number.to_string(),
-                PhtArg::Number(value, _) => value.to_string(),
-                PhtArg::Text(text) => php_int_cast(text).to_string(),
-            };
-            out.extend_from_slice(text.as_bytes());
-        } else {
-            out.extend_from_slice(pht_arg_text(arg).as_bytes());
-        }
-        index = cursor + 1;
     }
     String::from_utf8(out).unwrap_or_default()
 }
