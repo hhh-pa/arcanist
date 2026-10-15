@@ -62,9 +62,6 @@ jobs:
       # read+write on the namespace). Without the token the image builds
       # local-only and the gates still run (fork PRs stay green, slower).
       GATE_IMAGE: ${{ vars.GATE_IMAGE || 'hhhpa/arcanist' }}
-      # Image repo for the cached Go CI-tools file carrier (same
-      # convention; the image is pulled + `docker cp`'d, never run).
-      TOOLS_IMAGE: ${{ vars.TOOLS_IMAGE || 'hhhpa/arcanist-ci-tools' }}
     steps:
       - uses: actions/checkout@v4
       # Cache key: every input the image depends on. A hit pulls the image
@@ -109,55 +106,36 @@ jobs:
             docker buildx build --load --cache-from type=gha --cache-to type=gha,mode=max \
               -t "$GATE_IMAGE:$GATE_KEY" -f scripts/ci/quality-gates.Dockerfile .
           fi
-      # Go CI-tools file carrier (T1148): same cache convention as
-      # the gate image. The binaries land in ./ci-tools-bin but the
-      # live invocations below stay on Python until the Go path is
-      # green on CI (caller switch + .py removal are later slices).
-      - name: compute tools key
-        run: |
-          key="${{ hashFiles('scripts/ci/go/**', 'scripts/ci/ci-tools.Dockerfile') }}"
-          echo "TOOLS_KEY=$key" >> "$GITHUB_ENV"
-          echo "Tools image: $TOOLS_IMAGE:$key"
-      - name: pull tools image
-        id: tools-pull
-        continue-on-error: true
-        run: docker pull "$TOOLS_IMAGE:$TOOLS_KEY"
-      - name: set up tools buildx
-        if: steps.tools-pull.outcome == 'failure'
-        uses: docker/setup-buildx-action@v3
-      - name: check tools push credentials
-        id: tools-creds
-        if: steps.tools-pull.outcome == 'failure'
-        run: |
-          if [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-          fi
-      - name: tools hub login
-        if: steps.tools-pull.outcome == 'failure' && steps.tools-creds.outputs.available == 'true'
-        uses: docker/login-action@v3
+      # Go CI-tools (T1148): setup-go plus the Actions build cache
+      # (no Docker image). The binaries land in ./ci-tools-bin but
+      # the live invocations below stay on Python until the Go path
+      # is green on CI (caller switch + .py removal are later slices).
+      - name: set up Go
+        uses: actions/setup-go@v5
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: build tools image
-        if: steps.tools-pull.outcome == 'failure'
+          go-version-file: scripts/ci/go/go.mod
+          cache: false # stdlib-only module: nothing to cache but the build below
+      - name: cache Go build
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/go-build
+          key: go-build-${{ runner.os }}-${{ hashFiles('scripts/ci/go/**') }}
+          restore-keys: |
+            go-build-${{ runner.os }}-
+      - name: test Go CI-tools
+        working-directory: scripts/ci/go
         run: |
-          if [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
-            docker buildx build --push --cache-from type=gha --cache-to type=gha,mode=max \
-              -t "$TOOLS_IMAGE:$TOOLS_KEY" -f scripts/ci/ci-tools.Dockerfile .
-          else
-            echo '::warning::DOCKERHUB_TOKEN not set; tools image stays local.'
-            docker buildx build --load --cache-from type=gha --cache-to type=gha,mode=max \
-              -t "$TOOLS_IMAGE:$TOOLS_KEY" -f scripts/ci/ci-tools.Dockerfile .
-          fi
-      - name: extract ci-tools binaries
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test ./...
+      - name: build ci-tools binaries
         run: |
           rm -rf ci-tools-bin && mkdir -p ci-tools-bin
-          ctr="$(docker create "$TOOLS_IMAGE:$TOOLS_KEY")"
-          docker cp "$ctr:/tools/." ./ci-tools-bin/
-          docker rm "$ctr"
-          ls ./ci-tools-bin
+          cd scripts/ci/go
+          for tool in coverage-floor coverage-summary geiger complexity rust-quality-gates; do
+            CGO_ENABLED=0 go build -o "$GITHUB_WORKSPACE/ci-tools-bin/$tool" ./cmd/$tool
+          done
+          ls "$GITHUB_WORKSPACE/ci-tools-bin"
       - name: run quality gates
         run: docker run --rm -v "${{ github.workspace }}:/work" -w /work "$GATE_IMAGE:$GATE_KEY" python3 scripts/ci/lib/rust-quality-gates.py rust rust/target/llvm-cov nextest --run-ignored all --no-fail-fast
       # The container runs as root; hand the report back so later steps can
