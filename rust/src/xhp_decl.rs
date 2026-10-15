@@ -38,6 +38,12 @@
 //! - 118: ArcanistInterfaceAbstractMethodXHPASTLinterRule
 //! - 130: ArcanistPublicPropertyXHPASTLinterRule (`public` props)
 //!
+//! Ported by the remainder increment: all 26 assigned rules now
+//! live in `super::xhp_rem1` (9, 10, 13, 19, 24),
+//! `super::xhp_rem2` (52, 55, 57, 59, 60, 63, 64, 67, 70, 72),
+//! and `super::xhp_rem3` (87, 88, 91, 92, 95, 107, 108, 113, 114,
+//! 118, 130); this module's `apply` stays a no-op seam.
+//!
 //! Contract: read each PHP rule's `process()` and reproduce its
 //! trigger conditions against [`super::xhp_ast`] (`Tree::blocks`,
 //! `Tree::is_method`, `Tree::enclosing_class`, token scans for
@@ -59,7 +65,7 @@ use super::xhp_ast::{RawFinding, RuleCtx};
 
 /// Run all declaration rules, pushing findings into `out`.
 pub fn apply(_ctx: &RuleCtx, _out: &mut Vec<RawFinding>) {
-    // TODO(dv-c): implement assigned rules.
+    // Assigned rules were ported in xhp_rem1/2/3; nothing runs here.
 }
 
 #[cfg(test)]

@@ -43,9 +43,9 @@
 //! - 132: ArcanistPartialCatchXHPASTLinterRule (`catch (Exception`)
 //!
 //! Ported in this subset: 3, 79, 90, 97, 98, 99. The rest (5, 17,
-//! 20, 22, 23, 30, 32, 39, 45, 50, 69, 76, 77, 128, 132) are
-//! deferred to a follow-up increment; see
-//! `super::blocked_rules`.
+//! 20, 22, 23, 30, 32, 39, 45, 50, 69, 76, 77, 128, 132) were
+//! deferred, then ported by the remainder increment; see
+//! `super::xhp_rem1`, `super::xhp_rem2`, `super::xhp_rem3`.
 //!
 //! Contract: read each PHP rule's `process()` and reproduce its
 //! trigger conditions against [`super::xhp_ast`] (`Tree::blocks`

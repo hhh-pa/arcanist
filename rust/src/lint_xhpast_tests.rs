@@ -105,11 +105,11 @@ fn failed_parse_yields_one_unable_to_parse_warning() {
 
 #[test]
 fn rule_table_covers_all_ported_ids() {
-    assert_eq!(RULE_TABLE.len(), 80);
+    assert_eq!(RULE_TABLE.len(), 107);
     let mut ids: Vec<u32> = RULE_TABLE.iter().map(|(id, _, _)| *id).collect();
     ids.sort_unstable();
     ids.dedup();
-    assert_eq!(ids.len(), 80);
+    assert_eq!(ids.len(), 107);
     for missing in [11, 14, 29, 31, 33, 35, 89, 93, 94] {
         assert!(!ids.contains(&missing), "{missing}");
     }
@@ -123,11 +123,11 @@ fn rule_table_covers_all_ported_ids() {
     }
     // Ported and blocked sets are disjoint and jointly exhaustive.
     let blocked = blocked_rules();
-    assert_eq!(blocked.len(), 28);
+    assert_eq!(blocked.len(), 1);
     let mut bids: Vec<u32> = blocked.iter().map(|(id, _, _)| *id).collect();
     bids.sort_unstable();
     bids.dedup();
-    assert_eq!(bids.len(), 28);
+    assert_eq!(bids.len(), 1);
     for (id, class, reason) in &blocked {
         assert!(!ids.contains(id), "{id}");
         assert!(class.starts_with("Arcanist"), "{class}");

@@ -6,9 +6,9 @@ CLI behavior, ported workflow by workflow with `arc` as the reference.
 ## Status
 
 All 32 commands are full-state ports of their PHP workflows. Discipline:
-every gap-closing change updates this table in the same turn. `full*`
-marks commands with a documented edge divergence (listed below); behavior
-is otherwise exact, including error strings and exit codes.
+every gap-closing change updates this table in the same turn. Behavior
+is exact, including error strings and exit codes; the one remaining
+edge divergence (XHP134) is listed below.
 
 Console colors: plain-text output matches PHP, and ANSI styling matches
 PHP `phutil_console_format` bytes on TTYs (plain text off-TTY).
@@ -34,7 +34,7 @@ PHP `phutil_console_format` bytes on TTYs (plain text off-TTY).
 | `lint` | full (34 linters; per-linter config; severities; `.arclint`; `--json`; GEN/NOLINT) |
 | `linters` | full (registry; `--verbose`/`--search`/exact; engine config) |
 | `list` | full (open revs, `*` = current WC; `--json`; fails outside repos like PHP) |
-| `look` | full* (Arcventure clearing/remotes/published; see UTC-hour divergence) |
+| `look` | full (Arcventure clearing/remotes/published; local-tz hour like PHP) |
 | `markers` | full (branch/bookmark grid; `--type`/`--json`; Differential status via conduit) |
 | `paste` | full (read/create pastes; `--title`/`--lang`/`--input`) |
 | `patch` | full (apply revision/diff/patch/arcbundle; `--preview`/`--force`) |
@@ -67,7 +67,7 @@ PHP `phutil_console_format` bytes on TTYs (plain text off-TTY).
 | `JSHint` `JSCS` `CSSLint` `LESSC` `GJSLINT` `COFFEE` | external JS/CSS tools (silent if uninstalled; rc/flags config supported) |
 | `flake8` `PYFLAKES` `PyLint` `PEP8` `RuboCop` `RUBY` | external Python/Ruby tools (silent if uninstalled; config supported) |
 | `cppcheck` `C++ Google's Styleguide` `GOLINT` `HLINT` `C#` `PHPCS` `PHP` `PUPPETLINT` | external compiled-language tools (silent if uninstalled; config supported) |
-| `XHP` | native subset (66/108 rules; XHP2 unable-to-parse; rest in `blocked_rules()`) |
+| `XHP` | native 107/108 rules (XHP2 unable-to-parse; only XHP134 in `blocked_rules()`) |
 
 External linters skip silently when their binary is missing. Per-linter
 configuration (`bin`, `flags`, `version`, `interpreter`, standards,
@@ -75,9 +75,8 @@ rcfiles) is supported.
 
 ### Known divergences from PHP `arc`
 
-- `look` uses the UTC hour for its time-of-day flavor.
-- `XHP` ports 66/108 XHPAST rules natively; the rest (42 in `blocked_rules()`,
-  incl. XHP134 product-name literals needing the libphutil runtime) are follow-up.
+- `XHP` ports 107/108 XHPAST rules natively; only XHP134 (product-name
+  literals needing the libphutil runtime) remains, permanently unportable.
 
 ## Gates
 
