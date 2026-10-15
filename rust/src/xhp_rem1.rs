@@ -29,12 +29,22 @@
 //!
 //! Port notes (sub-checks that cannot be ported meaningfully, plus
 //! fixture-derived quirks):
-//! - XHP45: the symbol-table checks (functions, classes, constants,
-//!   parameter versions, Windows availability, and the
-//!   `class_exists`/`function_exists` conditional-usage whitelist)
-//!   need `resources/php/symbol-information.json` and are not ported;
-//!   the `xhpast.php-version` gating plus the PHP 5.3/5.4
-//!   syntax-feature checks are ported exactly.
+//! - XHP45: the symbol-table checks (functions, classes,
+//!   constants, parameter versions, Windows availability, and the
+//!   `class_exists`/`function_exists`/`defined` conditional-usage
+//!   whitelist) are ported against the vendored
+//!   `rust/resources/php/symbol-information.json` (embedded via
+//!   `include_str!`, byte-identical to the PHP-side copy), plus the
+//!   `xhpast.php-version` gating and the PHP 5.3/5.4
+//!   syntax-feature checks. Prerelease table versions
+//!   (`5.4.0RC3`, `5.6.0beta1`) compare in PHP
+//!   `version_compare()` order, which the shared dotted comparator
+//!   does not implement. `interface_exists()` guards are dropped:
+//!   PHP files them under an `interface` bucket no check reads.
+//!   Deliberate approximations: `use`/`namespace` import names are
+//!   not usages and are never flagged; member names after `->` and
+//!   `::` are class members, not global symbols; class-like
+//!   property types are not scanned.
 //! - XHP9/XHP30: the `xhpast.naminghook` / `xhpast.switchhook`
 //!   overrides name custom PHP classes and cannot run here; default
 //!   determinations are enforced.
@@ -65,13 +75,14 @@
 //! (named private fns, same file; closures count into parents);
 //! `cargo clippy --offline --all-targets -- -D warnings` clean;
 //! `cargo fmt --check` clean. Touch ONLY this file and
-//! `xhp_rem1_tests.rs` (plus the `lint_xhpast.rs` wiring).
+//! `xhp_rem1_tests.rs` (plus the `lint_xhpast.rs` wiring and the
+//! vendored `resources/php/symbol-information.json` data).
 
 use std::collections::{HashMap, HashSet};
 
 use super::xhp_ast::{
-    Block, BlockKind, BodySpan, RawFinding, RuleCtx, Tree, is_semantic, kinds, string_variables,
-    unquote_plain_string, version_compare,
+    Block, BlockKind, BodySpan, CallSite, RawFinding, RuleCtx, Token, Tree, is_semantic, kinds,
+    string_variables, unquote_plain_string, version_compare,
 };
 
 /// Run all batch-1 remaining rules, pushing findings into `out`.
@@ -2619,10 +2630,10 @@ fn ref_reuse_message() -> &'static str {
      do not reuse."
 }
 
-/// XHP45: version-gated syntax checks. Without `xhpast.php-version`
-/// nothing fires. The symbol-table checks (functions, classes,
-/// constants, parameters, Windows availability) need
-/// `resources/php/symbol-information.json` and are not ported.
+/// XHP45: version-gated symbol-table checks (functions, classes,
+/// constants, parameter versions, Windows availability) plus the
+/// PHP 5.3/5.4 syntax checks. Without `xhpast.php-version` nothing
+/// fires.
 fn rule_php_compatibility(ctx: &RuleCtx, out: &mut Vec<RawFinding>) {
     let Some(version) = ctx.options.php_version.as_deref() else {
         return;
@@ -2630,6 +2641,7 @@ fn rule_php_compatibility(ctx: &RuleCtx, out: &mut Vec<RawFinding>) {
     if version.is_empty() {
         return;
     }
+    compat_symbols(ctx, version, out);
     if version_compare(version, "5.3.0") == std::cmp::Ordering::Less {
         compat53_features(ctx, version, out);
     }
@@ -2988,6 +3000,896 @@ fn break_arg_bad(tree: &Tree, kw: usize) -> Option<usize> {
 fn compat54_break_message() -> &'static str {
     "The `break` and `continue` statements no longer accept \
      variable arguments."
+}
+
+/// Vendored `resources/php/symbol-information.json` (byte-identical
+/// to the PHP-side copy): introduction/removal versions for
+/// functions, classes, interfaces, constants, parameter positions,
+/// and Windows availability. Parsed once per process.
+const SYMBOL_JSON: &str = include_str!("../resources/php/symbol-information.json");
+
+fn compat_db() -> &'static serde_json::Value {
+    static DB: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    DB.get_or_init(|| serde_json::from_str(SYMBOL_JSON).unwrap_or(serde_json::Value::Null))
+}
+
+/// (`php.min`, `php.max`) for `name` in `section` (`functions`,
+/// `classes`, `interfaces`, `constants`); missing entries yield
+/// (`None`, `None`), mirroring PHP `idx()` defaults.
+fn sym_min_max<'a>(
+    db: &'a serde_json::Value,
+    section: &str,
+    name: &str,
+) -> (Option<&'a str>, Option<&'a str>) {
+    let entry = db.get(section).and_then(|entries| entries.get(name));
+    match entry {
+        Some(found) => (
+            found.get("php.min").and_then(serde_json::Value::as_str),
+            found.get("php.max").and_then(serde_json::Value::as_str),
+        ),
+        None => (None, None),
+    }
+}
+
+/// True when `name` has a per-parameter version row (PHP checks
+/// `array_key_exists` on the params table, not the function table).
+fn sym_has_params(db: &serde_json::Value, name: &str) -> bool {
+    db.get("params")
+        .and_then(|params| params.get(name))
+        .is_some()
+}
+
+/// Minimum version for positional parameter `idx` of `name`.
+fn sym_param_min<'a>(db: &'a serde_json::Value, name: &str, idx: usize) -> Option<&'a str> {
+    db.get("params")?.get(name)?.get(idx)?.as_str()
+}
+
+/// Windows availability of a function: no special considerations,
+/// never available, or available since a version.
+enum WinAvail<'a> {
+    Plain,
+    Unavailable,
+    Since(&'a str),
+}
+
+fn sym_windows<'a>(db: &'a serde_json::Value, name: &str) -> WinAvail<'a> {
+    let entry = db
+        .get("functions_windows")
+        .and_then(|table| table.get(name));
+    match entry {
+        Some(serde_json::Value::Bool(false)) => WinAvail::Unavailable,
+        Some(serde_json::Value::String(since)) => WinAvail::Since(since),
+        _ => WinAvail::Plain,
+    }
+}
+
+/// Rank of a prerelease tag in PHP `version_compare()` order
+/// (`dev < alpha = a < beta = b < RC = rc < release < pl = p`).
+/// Unknown tags rank as release.
+fn sym_tag_rank(tag: &str) -> i32 {
+    match tag.to_ascii_lowercase().as_str() {
+        "dev" => 0,
+        "alpha" | "a" => 1,
+        "beta" | "b" => 2,
+        "rc" => 3,
+        "pl" | "p" => 5,
+        _ => 4,
+    }
+}
+
+/// Split `5.4.0RC3` into core (`5.4.0`) plus (rank, number);
+/// plain releases yield (`version`, (4, 0)).
+fn sym_split_release(version: &str) -> (&str, (i32, u64)) {
+    let bytes = version.as_bytes();
+    let mut end = bytes.len();
+    let mut start = end;
+    while start > 0 && bytes[start - 1].is_ascii_digit() {
+        start -= 1;
+    }
+    let num = version[start..end].parse::<u64>().unwrap_or(0);
+    end = start;
+    while start > 0 && bytes[start - 1].is_ascii_alphabetic() {
+        start -= 1;
+    }
+    if start == end {
+        return (version, (4, 0));
+    }
+    (&version[..start], (sym_tag_rank(&version[start..end]), num))
+}
+
+/// PHP `version_compare()` order for symbol-table versions, which
+/// may carry prerelease suffixes (`5.4.0RC3`, `5.6.0beta1`); the
+/// shared [`version_compare`] compares suffixes lexically, which
+/// wrongly orders `5.4.0RC3` above `5.4.0`.
+fn sym_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    let (left_core, left_rank) = sym_split_release(left);
+    let (right_core, right_rank) = sym_split_release(right);
+    version_compare(left_core, right_core).then(left_rank.cmp(&right_rank))
+}
+
+fn sym_gt(left: &str, right: &str) -> bool {
+    sym_cmp(left, right) == std::cmp::Ordering::Greater
+}
+
+fn sym_lt(left: &str, right: &str) -> bool {
+    sym_cmp(left, right) == std::cmp::Ordering::Less
+}
+
+/// Whitelist bucket for conditionally-guarded symbols. PHP also
+/// files `interface_exists()` guards under an `interface` bucket
+/// that no check ever reads; those guards are dropped here with
+/// identical observable behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhiteKind {
+    Class,
+    Function,
+    Constant,
+}
+
+/// One `if (xxx_exists('sym'))` guard: the guarded symbol plus the
+/// then-branch token span.
+struct WhiteEntry {
+    kind: WhiteKind,
+    symbol: String,
+    first: usize,
+    last: usize,
+}
+
+/// Guards from `if` conditions that are exactly one existence
+/// check. `elseif` never guards: PHP selects `n_IF` only, and
+/// `n_ELSEIF` is a separate node type.
+fn compat_whitelist(tree: &Tree, blocks: &[Block]) -> Vec<WhiteEntry> {
+    let mut out = Vec::new();
+    for block in blocks {
+        if block.kind != BlockKind::If {
+            continue;
+        }
+        if let Some(entry) = white_entry(tree, block) {
+            out.push(entry);
+        }
+    }
+    out
+}
+
+/// The guard of one `if`, when its condition is exactly
+/// `xxx_exists(<static scalar>, ...)`: a bare call, nothing else.
+/// Negated or compound conditions do not guard, exactly like PHP.
+fn white_entry(tree: &Tree, block: &Block) -> Option<WhiteEntry> {
+    let lparen = block.lparen?;
+    let rparen = block.rparen?;
+    let name_idx = tree.next_semantic(lparen)?;
+    if name_idx >= rparen {
+        return None;
+    }
+    let kind = white_kind(&tree.tokens[name_idx])?;
+    let open = tree.next_semantic(name_idx)?;
+    if tree.tokens[open].kind != "(" {
+        return None;
+    }
+    let close = tree.match_close(open)?;
+    if tree.next_semantic(close) != Some(rparen) {
+        return None;
+    }
+    let args = tree.split_top_level(open, close);
+    let (first, last) = *args.first()?;
+    let symbol = tree.static_scalar_text(first, last)?;
+    let (span_first, span_last) = body_range(tree, block)?;
+    Some(WhiteEntry {
+        kind,
+        symbol,
+        first: span_first.min(span_last),
+        last: span_first.max(span_last),
+    })
+}
+
+fn white_kind(token: &Token) -> Option<WhiteKind> {
+    if token.kind != kinds::T_STRING {
+        return None;
+    }
+    match token.value.as_str() {
+        "class_exists" => Some(WhiteKind::Class),
+        "function_exists" => Some(WhiteKind::Function),
+        "defined" => Some(WhiteKind::Constant),
+        _ => None,
+    }
+}
+
+fn whitelisted(entries: &[WhiteEntry], kind: WhiteKind, symbol: &str, idx: usize) -> bool {
+    entries.iter().any(|entry| {
+        entry.kind == kind && entry.symbol == symbol && in_range(idx, entry.first, entry.last)
+    })
+}
+
+/// XHP45 symbol legs: functions (plus parameter versions and
+/// Windows availability), classes/interfaces, then constants.
+/// Class-name token positions feed the constants leg so class
+/// names are never double-scanned as constants.
+fn compat_symbols(ctx: &RuleCtx, version: &str, out: &mut Vec<RawFinding>) {
+    let tree = ctx.tree;
+    let db = compat_db();
+    let blocks = tree.blocks();
+    let whitelist = compat_whitelist(tree, &blocks);
+    let windows = ctx.options.php_version_windows.as_deref();
+    compat_functions(tree, db, version, windows, &whitelist, out);
+    let mut class_tokens = HashSet::new();
+    compat_classes(
+        tree,
+        &blocks,
+        db,
+        version,
+        &whitelist,
+        &mut class_tokens,
+        out,
+    );
+    compat_constants(tree, db, version, &whitelist, &class_tokens, out);
+}
+
+fn compat_functions(
+    tree: &Tree,
+    db: &serde_json::Value,
+    version: &str,
+    windows: Option<&str>,
+    whitelist: &[WhiteEntry],
+    out: &mut Vec<RawFinding>,
+) {
+    for call in tree.calls() {
+        if call.is_construct {
+            continue;
+        }
+        if has_leading_backslash(tree, call.name_idx) {
+            continue;
+        }
+        compat_function_call(tree, db, &call, version, windows, whitelist, out);
+    }
+}
+
+/// True when a call name carries a `\` prefix, so PHP's concrete
+/// string (backslash included) misses the symbol table.
+fn has_leading_backslash(tree: &Tree, name_idx: usize) -> bool {
+    tree.prev_semantic(name_idx)
+        .is_some_and(|prev| tree.tokens[prev].kind == "\\")
+}
+
+fn compat_function_call(
+    tree: &Tree,
+    db: &serde_json::Value,
+    call: &CallSite,
+    version: &str,
+    windows: Option<&str>,
+    whitelist: &[WhiteEntry],
+    out: &mut Vec<RawFinding>,
+) {
+    let name = call.name.as_str();
+    if whitelisted(whitelist, WhiteKind::Function, name, call.name_idx) {
+        return;
+    }
+    let (min, max) = sym_min_max(db, "functions", name);
+    if let Some(introduced) = min.filter(|found| sym_gt(found, version)) {
+        push(
+            out,
+            45,
+            tree.tokens[call.name_idx].offset,
+            &format!(
+                "This codebase targets PHP {version}, but `{name}()` was not \
+                 introduced until PHP {introduced}."
+            ),
+        );
+    } else if let Some(removed) = max.filter(|found| sym_lt(found, version)) {
+        push(
+            out,
+            45,
+            tree.tokens[call.name_idx].offset,
+            &format!(
+                "This codebase targets PHP {version}, but `{name}()` was removed in PHP {removed}."
+            ),
+        );
+    } else if sym_has_params(db, name) {
+        compat_call_params(tree, db, call, version, out);
+    }
+    compat_windows(tree, db, call, windows, out);
+}
+
+fn compat_call_params(
+    tree: &Tree,
+    db: &serde_json::Value,
+    call: &CallSite,
+    version: &str,
+    out: &mut Vec<RawFinding>,
+) {
+    for (i, (first, _)) in call.args.iter().enumerate() {
+        let need = sym_param_min(db, &call.name, i).filter(|found| sym_gt(found, version));
+        if let Some(introduced) = need {
+            let position = i + 1;
+            push(
+                out,
+                45,
+                tree.tokens[*first].offset,
+                &format!(
+                    "This codebase targets PHP {version}, but parameter {position} of `{}()` was not \
+                     introduced until PHP {introduced}.",
+                    call.name
+                ),
+            );
+        }
+    }
+}
+
+fn compat_windows(
+    tree: &Tree,
+    db: &serde_json::Value,
+    call: &CallSite,
+    windows: Option<&str>,
+    out: &mut Vec<RawFinding>,
+) {
+    let Some(target) = windows else {
+        return;
+    };
+    if target.is_empty() {
+        return;
+    }
+    match sym_windows(db, &call.name) {
+        WinAvail::Plain => {}
+        WinAvail::Unavailable => push(
+            out,
+            45,
+            tree.tokens[call.name_idx].offset,
+            &format!(
+                "This codebase targets PHP {target} on Windows, but `{}()` is not available there.",
+                call.name
+            ),
+        ),
+        WinAvail::Since(since) => {
+            if sym_gt(since, target) {
+                push(
+                    out,
+                    45,
+                    tree.tokens[call.name_idx].offset,
+                    &format!(
+                        "This codebase targets PHP {target} on Windows, but `{}()` is not \
+                         available there until PHP {since}.",
+                        call.name
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// One class-name occurrence: first/last token indices plus the
+/// concrete name (leading `\` kept, so qualified names miss the
+/// table exactly like PHP's `getConcreteString()` lookups).
+struct ClassHit {
+    first: usize,
+    last: usize,
+    name: String,
+}
+
+fn compat_classes(
+    tree: &Tree,
+    blocks: &[Block],
+    db: &serde_json::Value,
+    version: &str,
+    whitelist: &[WhiteEntry],
+    class_tokens: &mut HashSet<usize>,
+    out: &mut Vec<RawFinding>,
+) {
+    let mut hits = Vec::new();
+    compat_class_new(tree, &mut hits);
+    compat_class_static(tree, &mut hits);
+    compat_class_decl_names(blocks, &mut hits);
+    compat_class_inheritance(tree, &mut hits);
+    compat_class_instanceof(tree, &mut hits);
+    compat_class_catch(tree, blocks, &mut hits);
+    compat_class_param_types(tree, blocks, &mut hits);
+    compat_class_return_types(tree, blocks, &mut hits);
+    hits.sort_by_key(|hit| hit.first);
+    hits.dedup_by_key(|hit| hit.first);
+    for hit in &hits {
+        for idx in hit.first..=hit.last {
+            class_tokens.insert(idx);
+        }
+        compat_class_hit(tree, db, version, whitelist, hit, out);
+    }
+}
+
+fn compat_class_hit(
+    tree: &Tree,
+    db: &serde_json::Value,
+    version: &str,
+    whitelist: &[WhiteEntry],
+    hit: &ClassHit,
+    out: &mut Vec<RawFinding>,
+) {
+    if whitelisted(whitelist, WhiteKind::Class, &hit.name, hit.first) {
+        return;
+    }
+    let in_classes = db
+        .get("classes")
+        .and_then(|classes| classes.get(hit.name.as_str()))
+        .is_some();
+    let section = if in_classes { "classes" } else { "interfaces" };
+    let (min, max) = sym_min_max(db, section, &hit.name);
+    if let Some(introduced) = min.filter(|found| sym_gt(found, version)) {
+        push(
+            out,
+            45,
+            tree.tokens[hit.first].offset,
+            &format!(
+                "This codebase targets PHP {version}, but `{}` was not introduced until PHP \
+                 {introduced}.",
+                hit.name
+            ),
+        );
+    } else if let Some(removed) = max.filter(|found| sym_lt(found, version)) {
+        push(
+            out,
+            45,
+            tree.tokens[hit.first].offset,
+            &format!(
+                "This codebase targets PHP {version}, but `{}` was removed in PHP {removed}.",
+                hit.name
+            ),
+        );
+    }
+}
+
+/// Last token index of the qualified run starting at `idx`
+/// (`T_STRING` or `\` segments).
+fn qual_end(tree: &Tree, mut idx: usize) -> usize {
+    while let Some(next) = tree.next_semantic(idx) {
+        let kind = tree.tokens[next].kind.as_str();
+        if kind != kinds::T_STRING && kind != "\\" {
+            break;
+        }
+        idx = next;
+    }
+    idx
+}
+
+/// First segment of the qualified run ending at `last` (walk left
+/// over `\` + `T_STRING` pairs).
+fn qual_run_start(tree: &Tree, last: usize) -> usize {
+    let mut first = last;
+    while let Some(sep) = tree.prev_semantic(first) {
+        if tree.tokens[sep].kind != "\\" {
+            break;
+        }
+        let Some(prev) = tree.prev_semantic(sep) else {
+            break;
+        };
+        if tree.tokens[prev].kind != kinds::T_STRING {
+            break;
+        }
+        first = prev;
+    }
+    first
+}
+
+/// Concrete text of a qualified run: `T_STRING`/`\` values from
+/// `first` to `end`, with an optional leading `\`.
+fn qual_text(tree: &Tree, first: usize, end: usize, leading: bool) -> String {
+    let mut name = String::new();
+    if leading {
+        name.push('\\');
+    }
+    let mut i = first;
+    while i <= end && i < tree.tokens.len() {
+        let kind = tree.tokens[i].kind.as_str();
+        if kind == kinds::T_STRING || kind == "\\" {
+            name.push_str(&tree.tokens[i].value);
+        }
+        i += 1;
+    }
+    name
+}
+
+/// Qualified name starting AT `idx` (`T_STRING`, `\`, or a lone
+/// `static`); `None` for anything else.
+fn qual_from(tree: &Tree, idx: usize) -> Option<ClassHit> {
+    if tree.tokens[idx].kind == kinds::T_STATIC {
+        return Some(ClassHit {
+            first: idx,
+            last: idx,
+            name: tree.tokens[idx].value.clone(),
+        });
+    }
+    let mut first = idx;
+    let mut leading = false;
+    if tree.tokens[idx].kind == "\\" {
+        leading = true;
+        first = tree.next_semantic(idx)?;
+    }
+    if tree.tokens[first].kind != kinds::T_STRING {
+        return None;
+    }
+    let last = qual_end(tree, first);
+    Some(ClassHit {
+        first,
+        last,
+        name: qual_text(tree, first, last, leading),
+    })
+}
+
+/// Qualified name starting after `idx` (one optional leading `\`
+/// skipped).
+fn qual_after(tree: &Tree, idx: usize) -> Option<ClassHit> {
+    let next = tree.next_semantic(idx)?;
+    qual_from(tree, next)
+}
+
+/// Qualified name ending before `idx` (the `::` receiver); `None`
+/// for `$var::`-style receivers.
+fn qual_before(tree: &Tree, idx: usize) -> Option<ClassHit> {
+    let end = tree.prev_semantic(idx)?;
+    if tree.tokens[end].kind == kinds::T_STATIC {
+        return Some(ClassHit {
+            first: end,
+            last: end,
+            name: tree.tokens[end].value.clone(),
+        });
+    }
+    if tree.tokens[end].kind != kinds::T_STRING {
+        return None;
+    }
+    let first = qual_run_start(tree, end);
+    let leading = tree
+        .prev_semantic(first)
+        .is_some_and(|prev| tree.tokens[prev].kind == "\\");
+    Some(ClassHit {
+        first,
+        last: end,
+        name: qual_text(tree, first, end, leading),
+    })
+}
+
+fn compat_class_new(tree: &Tree, hits: &mut Vec<ClassHit>) {
+    for (i, token) in tree.tokens.iter().enumerate() {
+        if token.kind != kinds::T_NEW {
+            continue;
+        }
+        if let Some(hit) = qual_after(tree, i) {
+            hits.push(hit);
+        }
+    }
+}
+
+fn compat_class_static(tree: &Tree, hits: &mut Vec<ClassHit>) {
+    for (i, token) in tree.tokens.iter().enumerate() {
+        if token.kind != kinds::T_PAAMAYIM_NEKUDOTAYIM {
+            continue;
+        }
+        if let Some(hit) = qual_before(tree, i) {
+            hits.push(hit);
+        }
+    }
+}
+
+/// Class-like declaration names, which PHP models as
+/// `n_CLASS_NAME` children of the declaration node.
+fn compat_class_decl_names(blocks: &[Block], hits: &mut Vec<ClassHit>) {
+    for block in blocks {
+        let class_like = matches!(
+            block.kind,
+            BlockKind::Class | BlockKind::Interface | BlockKind::Trait | BlockKind::Enum
+        );
+        if !class_like {
+            continue;
+        }
+        if let (Some(name), Some(idx)) = (block.name.as_deref(), block.name_idx) {
+            hits.push(ClassHit {
+                first: idx,
+                last: idx,
+                name: name.to_string(),
+            });
+        }
+    }
+}
+
+fn compat_class_inheritance(tree: &Tree, hits: &mut Vec<ClassHit>) {
+    for (i, token) in tree.tokens.iter().enumerate() {
+        if token.kind != kinds::T_EXTENDS && token.kind != kinds::T_IMPLEMENTS {
+            continue;
+        }
+        inheritance_names(tree, i, hits);
+    }
+}
+
+/// Comma-separated qualified names after `extends`/`implements`.
+fn inheritance_names(tree: &Tree, kw_idx: usize, hits: &mut Vec<ClassHit>) {
+    let mut cur = tree.next_semantic(kw_idx);
+    while let Some(idx) = cur {
+        if !is_name_token(&tree.tokens[idx].kind) {
+            break;
+        }
+        let Some(hit) = qual_from(tree, idx) else {
+            break;
+        };
+        cur = tree.next_semantic(hit.last);
+        hits.push(hit);
+        if cur.is_some_and(|next| tree.tokens[next].kind == ",") {
+            cur = cur.and_then(|next| tree.next_semantic(next));
+        } else {
+            break;
+        }
+    }
+}
+
+fn compat_class_instanceof(tree: &Tree, hits: &mut Vec<ClassHit>) {
+    for (i, token) in tree.tokens.iter().enumerate() {
+        if token.kind != kinds::T_INSTANCEOF {
+            continue;
+        }
+        if let Some(hit) = qual_after(tree, i) {
+            hits.push(hit);
+        }
+    }
+}
+
+fn compat_class_catch(tree: &Tree, blocks: &[Block], hits: &mut Vec<ClassHit>) {
+    for block in blocks {
+        if block.kind != BlockKind::Catch {
+            continue;
+        }
+        let (Some(lparen), Some(rparen)) = (block.lparen, block.rparen) else {
+            continue;
+        };
+        if lparen < rparen.saturating_sub(1) {
+            compat_type_names(tree, lparen + 1, rparen - 1, hits);
+        }
+    }
+}
+
+fn compat_class_param_types(tree: &Tree, blocks: &[Block], hits: &mut Vec<ClassHit>) {
+    for block in blocks {
+        for param in &block.params {
+            if let Some((first, last)) = param.ty {
+                compat_type_names(tree, first, last, hits);
+            }
+        }
+    }
+}
+
+fn compat_class_return_types(tree: &Tree, blocks: &[Block], hits: &mut Vec<ClassHit>) {
+    for block in blocks {
+        if !matches!(block.kind, BlockKind::Function | BlockKind::ArrowFn) {
+            continue;
+        }
+        if let Some((first, last)) = return_type_range(tree, block) {
+            compat_type_names(tree, first, last, hits);
+        }
+    }
+}
+
+/// Class-name starts in a type-ish token range (catch headers,
+/// parameter/return types): name tokens that do not continue a
+/// qualified run.
+fn compat_type_names(tree: &Tree, first: usize, last: usize, hits: &mut Vec<ClassHit>) {
+    let mut i = first;
+    while i <= last && i < tree.tokens.len() {
+        if is_name_token(&tree.tokens[i].kind)
+            && is_type_name_start(tree, first, i)
+            && let Some(hit) = qual_from(tree, i)
+        {
+            i = hit.last + 1;
+            hits.push(hit);
+            continue;
+        }
+        i += 1;
+    }
+}
+
+fn is_name_token(kind: &str) -> bool {
+    kind == kinds::T_STRING || kind == "\\" || kind == kinds::T_STATIC
+}
+
+/// True when `i` starts a name: the previous semantic token (if
+/// any, inside the range) is not a `T_STRING`/`\` continuation.
+fn is_type_name_start(tree: &Tree, first: usize, i: usize) -> bool {
+    let Some(prev) = tree.prev_semantic(i) else {
+        return true;
+    };
+    if prev < first {
+        return true;
+    }
+    !matches!(tree.tokens[prev].kind.as_str(), kinds::T_STRING | "\\")
+}
+
+/// Token range of a declared return type (`: Type` after the
+/// parameter list or closure `use`), if any.
+fn return_type_range(tree: &Tree, block: &Block) -> Option<(usize, usize)> {
+    let after = block
+        .closure_use
+        .map_or(block.rparen, |(_, close)| Some(close))?;
+    let colon = tree.next_semantic(after)?;
+    if tree.tokens[colon].kind != ":" {
+        return None;
+    }
+    let first = tree.next_semantic(colon)?;
+    return_type_end(tree, first).map(|last| (first, last))
+}
+
+/// Last token before the `{` / `;` / `=>` terminating a return type.
+fn return_type_end(tree: &Tree, first: usize) -> Option<usize> {
+    let mut depth: u32 = 0;
+    let mut last = None;
+    let mut i = first;
+    while i < tree.tokens.len() {
+        let kind = tree.tokens[i].kind.as_str();
+        if depth == 0 && (kind == "{" || kind == ";" || kind == kinds::T_DOUBLE_ARROW) {
+            break;
+        }
+        if kind == "(" || kind == "[" {
+            depth += 1;
+        } else if kind == ")" || kind == "]" {
+            depth = depth.saturating_sub(1);
+        }
+        if is_semantic(&tree.tokens[i]) {
+            last = Some(i);
+        }
+        i += 1;
+    }
+    last
+}
+
+/// XHP45 constants: every `T_STRING` outside class-name positions
+/// (plus magic constants), with member, declaration, and import
+/// names excluded. PHP also scans function-call names here (noted
+/// as TODO upstream); the tables are disjoint so at most one leg
+/// fires per name.
+fn compat_constants(
+    tree: &Tree,
+    db: &serde_json::Value,
+    version: &str,
+    whitelist: &[WhiteEntry],
+    class_tokens: &HashSet<usize>,
+    out: &mut Vec<RawFinding>,
+) {
+    for (i, token) in tree.tokens.iter().enumerate() {
+        if !is_const_token(&token.kind) {
+            continue;
+        }
+        if class_tokens.contains(&i) {
+            continue;
+        }
+        if !has_uppercase(&token.value) {
+            continue;
+        }
+        if token.kind == kinds::T_STRING && const_name_excluded(tree, i) {
+            continue;
+        }
+        compat_constant_hit(tree, db, version, whitelist, i, &token.value, out);
+    }
+}
+
+fn is_const_token(kind: &str) -> bool {
+    kind == kinds::T_STRING
+        || kind == kinds::T_CLASS_C
+        || kind == kinds::T_FUNC_C
+        || kind == kinds::T_METHOD_C
+        || kind == kinds::T_FILE
+        || kind == kinds::T_DIR
+        || kind == kinds::T_LINE
+        || kind == kinds::T_NS_C
+        || kind == kinds::T_TRAIT_C
+}
+
+/// True when `value` holds an ASCII uppercase letter; every
+/// `constants` table key does, so anything else cannot match.
+fn has_uppercase(value: &str) -> bool {
+    value.bytes().any(|byte| byte.is_ascii_uppercase())
+}
+
+fn compat_constant_hit(
+    tree: &Tree,
+    db: &serde_json::Value,
+    version: &str,
+    whitelist: &[WhiteEntry],
+    idx: usize,
+    name: &str,
+    out: &mut Vec<RawFinding>,
+) {
+    let lookup = const_lookup_name(tree, idx, name);
+    if whitelisted(whitelist, WhiteKind::Constant, &lookup, idx) {
+        return;
+    }
+    let (min, max) = sym_min_max(db, "constants", &lookup);
+    if let Some(introduced) = min.filter(|found| sym_gt(found, version)) {
+        push(
+            out,
+            45,
+            tree.tokens[idx].offset,
+            &format!(
+                "This codebase targets PHP {version}, but `{lookup}` was not introduced until PHP \
+                 {introduced}."
+            ),
+        );
+    } else if let Some(removed) = max.filter(|found| sym_lt(found, version)) {
+        push(
+            out,
+            45,
+            tree.tokens[idx].offset,
+            &format!(
+                "This codebase targets PHP {version}, but `{lookup}` was removed in PHP {removed}."
+            ),
+        );
+    }
+}
+
+/// Lookup name for a constant token: a `\`-prefixed name keeps its
+/// separator so qualified names miss the table like PHP's
+/// `getConcreteString()` lookups.
+fn const_lookup_name(tree: &Tree, idx: usize, name: &str) -> String {
+    let qualified = tree
+        .prev_semantic(idx)
+        .is_some_and(|prev| tree.tokens[prev].kind == "\\");
+    if qualified {
+        format!("\\{name}")
+    } else {
+        name.to_string()
+    }
+}
+
+/// True for `T_STRING`s that are member, declaration, or import
+/// names rather than constant references.
+fn const_name_excluded(tree: &Tree, idx: usize) -> bool {
+    const_after_member_op(tree, idx)
+        || const_after_decl_kw(tree, idx)
+        || const_after_attribute(tree, idx)
+        || const_followed_by_assign(tree, idx)
+        || const_followed_by_separator(tree, idx)
+}
+
+/// Member names after `->`, `?->`, and `::`.
+fn const_after_member_op(tree: &Tree, idx: usize) -> bool {
+    tree.prev_semantic(idx).is_some_and(|prev| {
+        matches!(
+            tree.tokens[prev].kind.as_str(),
+            kinds::T_OBJECT_OPERATOR
+                | kinds::T_NULLSAFE_OBJECT_OPERATOR
+                | kinds::T_PAAMAYIM_NEKUDOTAYIM
+        )
+    })
+}
+
+/// Declaration and import names: after `function` (allowing `&`),
+/// `use`, `as`, `namespace`, `const`, or `goto`.
+fn const_after_decl_kw(tree: &Tree, idx: usize) -> bool {
+    let start = qual_run_start(tree, idx);
+    let mut prev = tree.prev_semantic(start);
+    if prev.is_some_and(|found| tree.tokens[found].kind == "&") {
+        prev = prev.and_then(|found| tree.prev_semantic(found));
+    }
+    prev.is_some_and(|found| {
+        matches!(
+            tree.tokens[found].kind.as_str(),
+            kinds::T_FUNCTION
+                | kinds::T_USE
+                | kinds::T_AS
+                | kinds::T_NAMESPACE
+                | kinds::T_CONST
+                | kinds::T_GOTO
+        )
+    })
+}
+
+/// Attribute names (`#[FOO]`).
+fn const_after_attribute(tree: &Tree, idx: usize) -> bool {
+    tree.prev_semantic(idx)
+        .is_some_and(|prev| tree.tokens[prev].kind == kinds::T_ATTRIBUTE)
+}
+
+/// `const` multi-declarators (`const A = 1, B = 2`): a bare name
+/// followed by `=` can only declare a class constant.
+fn const_followed_by_assign(tree: &Tree, idx: usize) -> bool {
+    tree.next_semantic(idx)
+        .is_some_and(|next| tree.tokens[next].kind == "=")
+}
+
+/// Non-final segments of qualified names (`A\B`: `A` belongs to
+/// the name ending at `B`, and `B` misses via its `\` prefix).
+fn const_followed_by_separator(tree: &Tree, idx: usize) -> bool {
+    tree.next_semantic(idx)
+        .is_some_and(|next| tree.tokens[next].kind == "\\")
 }
 
 #[cfg(test)]
