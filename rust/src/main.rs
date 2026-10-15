@@ -55,7 +55,7 @@ const COMMANDS: &[(&str, CommandFn)] = &[
 ];
 
 fn usage() -> String {
-    "usage: arc-rs [--version] [--help] <command>\n\ncommands (see <command> --help):\n  alias\n  amend\n  anoid\n  bookmarks\n  branches\n  browse\n  call-conduit\n  close-revision\n  commit\n  cover\n  diff\n  download\n  export\n  get-config\n  inspect\n  install-certificate\n  land\n  liberate\n  lint\n  linters\n  list\n  look\n  markers\n  paste\n  patch\n  set-config\n  tasks\n  todo\n  unit\n  upgrade\n  upload\n  version\n  weld\n  which\n  work\n"
+    "usage: arc [--version] [--help] <command>\n\ncommands (see <command> --help):\n  alias\n  amend\n  anoid\n  bookmarks\n  branches\n  browse\n  call-conduit\n  close-revision\n  commit\n  cover\n  diff\n  download\n  export\n  get-config\n  inspect\n  install-certificate\n  land\n  liberate\n  lint\n  linters\n  list\n  look\n  markers\n  paste\n  patch\n  set-config\n  tasks\n  todo\n  unit\n  upgrade\n  upload\n  version\n  weld\n  which\n  work\n"
         .to_string()
 }
 
@@ -158,14 +158,14 @@ fn run_call_conduit_with<R: std::io::Read, W: std::io::Write>(
     let params = match read_params_json(stdin) {
         Ok(value) => value,
         Err(msg) => {
-            eprintln!("arc-rs: {msg}");
+            eprintln!("arc: {msg}");
             return ExitCode::FAILURE;
         }
     };
     let client = match config::client_for(args.conduit_uri.as_deref()) {
         Ok(client) => client,
         Err(msg) => {
-            eprintln!("arc-rs: {msg}");
+            eprintln!("arc: {msg}");
             return ExitCode::FAILURE;
         }
     };
@@ -177,13 +177,13 @@ fn run_call_conduit_with<R: std::io::Read, W: std::io::Write>(
             render_envelope(Some((&code, &info)), serde_json::Value::Null)
         }
         Err(e) => {
-            eprintln!("arc-rs: {e}");
+            eprintln!("arc: {e}");
             return ExitCode::FAILURE;
         }
     };
     // No trailing newline: PHP `echo`s the encoded blob as-is (`:67`).
     if stdout.write_all(text.as_bytes()).is_err() {
-        eprintln!("arc-rs: failed to write output");
+        eprintln!("arc: failed to write output");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
@@ -255,7 +255,7 @@ fn dispatch(argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Action::Version => {
-            println!("arc-rs {VERSION}");
+            println!("arc {VERSION}");
             ExitCode::SUCCESS
         }
         Action::CallConduit(args) => run_call_conduit(&args),
@@ -264,11 +264,11 @@ fn dispatch(argv: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
         Action::Unknown(c) => {
-            eprintln!("arc-rs: unknown command '{c}'\n\n{}", usage());
+            eprintln!("arc: unknown command '{c}'\n\n{}", usage());
             ExitCode::FAILURE
         }
         Action::Error(msg) => {
-            eprintln!("arc-rs: {msg}\n\n{}", usage());
+            eprintln!("arc: {msg}\n\n{}", usage());
             ExitCode::FAILURE
         }
     }

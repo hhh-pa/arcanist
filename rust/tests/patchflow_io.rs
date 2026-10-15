@@ -153,7 +153,7 @@ fn help_succeeds_for_all_commands() {
     assert!(
         liberate::execute(fx.path(), &argv(&["--help"]))
             .unwrap()
-            .contains("usage: arc-rs liberate")
+            .contains("usage: arc liberate")
     );
 }
 

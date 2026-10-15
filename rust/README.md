@@ -1,6 +1,6 @@
 # arc-rs — Rust port of Arcanist
 
-Tracks T1128. Goal: a single static `arc-rs` binary matching the PHP `arc`
+Tracks T1128. Goal: a single static `arc` binary matching the PHP `arc`
 CLI behavior, ported workflow by workflow with `arc` as the reference.
 
 ## Status

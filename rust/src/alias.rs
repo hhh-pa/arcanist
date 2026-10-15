@@ -29,15 +29,15 @@ use crate::{
 /// Subcommand name, matching `arc alias`.
 pub const NAME: &str = "alias";
 
-/// Toolset key of this binary (`arc-rs` is single-toolset).
+/// Toolset key of this binary (`arc` is single-toolset).
 pub const TOOLSET: &str = "arc";
 
 /// Maximum alias-chain depth, mirroring `ArcanistAliasEngine`.
 const STACK_LIMIT: usize = 16;
 
-const USAGE: &str = "usage: arc-rs alias [--json]\n\
-       arc-rs alias <name>\n\
-       arc-rs alias <name> <target> -- [arguments]\n\
+const USAGE: &str = "usage: arc alias [--json]\n\
+       arc alias <name>\n\
+       arc alias <name> <target> -- [arguments]\n\
 \n\
 Create and modify command aliases.\n\
 \n\
@@ -592,13 +592,13 @@ pub fn run_shell_alias_with(
 ) -> (ExitCode, Vec<String>) {
     let mut notices = vec![format!("SHELL ALIAS: {hint}")];
     let Some((program, args)) = shell_argv.split_first() else {
-        notices.push("arc-rs: empty shell alias".to_string());
+        notices.push("arc: empty shell alias".to_string());
         return (ExitCode::FAILURE, notices);
     };
     match spawn(program, args) {
         Ok(status) => (shell_status_exit_code(status), notices),
         Err(error) => {
-            notices.push(format!("arc-rs: cannot execute shell alias: {error}"));
+            notices.push(format!("arc: cannot execute shell alias: {error}"));
             (ExitCode::FAILURE, notices)
         }
     }
@@ -640,7 +640,7 @@ pub fn apply_expansion_with(
         }
         Expansion::Failed { message, hints } => {
             notices.extend(hints.iter().map(|h| format!("ALIAS: {h}")));
-            notices.push(format!("arc-rs: {message}"));
+            notices.push(format!("arc: {message}"));
             (Err(ExitCode::FAILURE), notices)
         }
     }
@@ -952,13 +952,13 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}\n\n{USAGE}");
+            eprintln!("arc {NAME}: {message}\n\n{USAGE}");
             return ExitCode::FAILURE;
         }
     };
     if options.json && !options.positional.is_empty() {
         eprintln!(
-            "arc-rs {NAME}: {}",
+            "arc {NAME}: {}",
             terminal::pht(
                 "The \"--json\" argument may only be used when listing aliases.",
                 &[]
@@ -983,7 +983,7 @@ fn run_list(options: &Options) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             ExitCode::FAILURE
         }
     }
@@ -993,7 +993,7 @@ fn run_delete(options: &Options) -> ExitCode {
     let user_file = match user_file_or_error() {
         Ok(path) => path,
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             return ExitCode::FAILURE;
         }
     };
@@ -1010,7 +1010,7 @@ fn run_delete(options: &Options) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             ExitCode::FAILURE
         }
     }
@@ -1020,7 +1020,7 @@ fn run_create(options: &Options) -> ExitCode {
     let user_file = match user_file_or_error() {
         Ok(path) => path,
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             return ExitCode::FAILURE;
         }
     };
@@ -1030,7 +1030,7 @@ fn run_create(options: &Options) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             ExitCode::FAILURE
         }
     }

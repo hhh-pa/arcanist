@@ -29,7 +29,7 @@ pub const NAME: &str = "version";
 pub const LIBRARY: &str = "arcanist";
 
 fn usage() -> String {
-    "usage: arc-rs version\n\
+    "usage: arc version\n\
      \n\
      Show toolset version information.\n\
      \n\
@@ -177,7 +177,7 @@ pub fn run_in(tool_dir: &Path, argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}\n\n{}", usage());
+            eprintln!("arc {NAME}: {message}\n\n{}", usage());
             return ExitCode::FAILURE;
         }
         Ok(Some(())) => {}
@@ -188,7 +188,7 @@ pub fn run_in(tool_dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             ExitCode::FAILURE
         }
     }

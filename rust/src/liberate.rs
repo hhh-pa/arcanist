@@ -52,7 +52,7 @@ const VERSION_MARKER: &str = "@phutil-library-version";
 
 fn usage() -> String {
     format!(
-        "usage: arc-rs {NAME} [--clean] [PATH]\n\
+        "usage: arc {NAME} [--clean] [PATH]\n\
          \n\
          Create or update a libphutil library. Without PATH, libraries one\n\
          level below the current directory are updated.\n\
@@ -358,7 +358,7 @@ pub fn rebuild_map(path: &Path, clean: bool, script: Option<&Path>) -> Option<St
     );
     let Some(script) = script else {
         return Some(format!(
-            "cannot rebuild '{}': support/lib/rebuild-map.php was not found above the library or the arc-rs binary",
+            "cannot rebuild '{}': support/lib/rebuild-map.php was not found above the library or the arc binary",
             path.display()
         ));
     };
@@ -496,7 +496,7 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             // Usage-class failures (argument errors, no libraries found,
             // ancient/unknown versions, declined prompts) throw
             // `ArcanistUsageException` in PHP, which escapes the runtime

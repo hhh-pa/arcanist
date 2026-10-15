@@ -119,7 +119,7 @@ fn rejects_arguments_and_flags() {
 #[test]
 fn usage_names_command_and_synopsis() {
     let text = usage();
-    assert!(text.starts_with("usage: arc-rs version\n"), "{text}");
+    assert!(text.starts_with("usage: arc version\n"), "{text}");
     assert!(text.contains("Show toolset version information."), "{text}");
     assert!(text.contains("Shows the current version."), "{text}");
 }
