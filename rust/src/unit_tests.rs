@@ -1865,3 +1865,189 @@ fn single_wrapper_matches_php_seam_for_non_phutil() {
     assert_eq!(plain, seamed);
     std::fs::remove_dir_all(&root).ok();
 }
+
+fn expected_star() -> &'static str {
+    if cfg!(windows) { "*" } else { "\u{2605}" }
+}
+
+#[test]
+fn result_label_badges_match_php() {
+    assert_eq!(
+        format_result_label("pass", true),
+        "\x1b[42m\x1b[1m PASS \x1b[m\x1b[49m"
+    );
+    assert_eq!(
+        format_result_label("fail", true),
+        "\x1b[41m\x1b[1m FAIL \x1b[m\x1b[49m"
+    );
+    assert_eq!(
+        format_result_label("skip", true),
+        "\x1b[43m\x1b[1m SKIP \x1b[m\x1b[49m"
+    );
+    assert_eq!(
+        format_result_label("broken", true),
+        "\x1b[41m\x1b[1m BROKEN \x1b[m\x1b[49m"
+    );
+    assert_eq!(
+        format_result_label("unsound", true),
+        "\x1b[43m\x1b[1m UNSOUND \x1b[m\x1b[49m"
+    );
+    assert_eq!(format_result_label("bogus", true), "");
+    // Like PHP, the stripped badge keeps its padding; the plain
+    // workflow rendering uses bare labels instead.
+    assert_eq!(format_result_label("pass", false), " PASS ");
+}
+
+#[test]
+fn test_duration_buckets_match_php() {
+    let star = expected_star();
+    assert_eq!(
+        format_test_duration(0.049, true),
+        format!("\x1b[32m 49ms\x1b[39m\x1b[33m{star}\x1b[39m ")
+    );
+    assert_eq!(
+        format_test_duration(0.051, true),
+        "\x1b[32m 51ms\x1b[39m  "
+    );
+    assert_eq!(
+        format_test_duration(0.3, true),
+        "\x1b[33m300ms\x1b[39m  "
+    );
+    assert_eq!(
+        format_test_duration(1.0, true),
+        "\x1b[31m 1.0s\x1b[39m  "
+    );
+    assert_eq!(format_test_duration(0.3, false), "300ms  ");
+}
+
+#[test]
+fn render_unit_result_with_ansi_styles_pass_line() {
+    let mut pass = engine_result("t", "pass");
+    pass.set_namespace("ns");
+    pass.set_duration(0.125);
+    assert_eq!(
+        render_unit_result_with_ansi(&pass, true),
+        "  \x1b[42m\x1b[1m PASS \x1b[m\x1b[49m \x1b[32m125ms\x1b[39m   ns::t\n"
+    );
+    assert_eq!(
+        render_unit_result_with_ansi(&pass, false),
+        "  PASS 125ms ns::t\n"
+    );
+}
+
+#[test]
+fn render_unit_result_with_ansi_stars_fast_pass() {
+    let star = expected_star();
+    let mut pass = engine_result("t", "pass");
+    pass.set_duration(0.005);
+    assert_eq!(
+        render_unit_result_with_ansi(&pass, true),
+        format!("  \x1b[42m\x1b[1m PASS \x1b[m\x1b[49m \x1b[32m  5ms\x1b[39m\x1b[33m{star}\x1b[39m  t\n")
+    );
+    assert_eq!(
+        render_unit_result_with_ansi(&pass, false),
+        "  PASS   5ms t\n"
+    );
+}
+
+#[test]
+fn render_unit_result_with_ansi_appends_user_data_raw() {
+    let mut fail = engine_result("t", "fail");
+    fail.set_user_data("oops");
+    assert_eq!(
+        render_unit_result_with_ansi(&fail, true),
+        "  \x1b[41m\x1b[1m FAIL \x1b[m\x1b[49m t\noops\n"
+    );
+    assert_eq!(
+        render_unit_result_with_ansi(&fail, false),
+        "  FAIL t\noops\n"
+    );
+    assert_eq!(
+        render_unit_result_with_ansi(&engine_result("t", "bogus"), true),
+        "   t\n"
+    );
+}
+
+#[test]
+fn coverage_file_line_bolds_percent_on_tty() {
+    assert_eq!(
+        coverage_file_line(100, "f.php", true),
+        "    \x1b[1m100%\x1b[m     f.php\n"
+    );
+    assert_eq!(
+        coverage_file_line(100, "f.php", false),
+        "    100%     f.php\n"
+    );
+    assert_eq!(
+        coverage_file_line(5, "g.php", true),
+        "    \x1b[1m  5%\x1b[m     g.php\n"
+    );
+}
+
+#[test]
+fn render_coverage_report_with_ansi_underlines_header() {
+    let root = unique_dir("cov-ansi");
+    let sorted = vec![("f.php".to_string(), 1.0)];
+    let reports = HashMap::from([("f.php".to_string(), "C".to_string())]);
+    assert_eq!(
+        render_coverage_report_with_ansi(&sorted, &reports, false, &root, true),
+        "\n\x1b[4mCOVERAGE REPORT\x1b[m\n    \x1b[1m100%\x1b[m     f.php\n"
+    );
+    assert_eq!(
+        render_coverage_report_with_ansi(&sorted, &reports, false, &root, false),
+        "\nCOVERAGE REPORT\n    100%     f.php\n"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn render_detailed_with_ansi_paints_marks() {
+    let covered = format!("{:<80}", "a");
+    assert_eq!(
+        render_detailed_coverage_report_with_ansi("a\nbb", "CU", true),
+        format!(
+            "    1  \x1b[42m {covered} \x1b[49m\n    2  \x1b[41m {:<80} \x1b[49m\n",
+            "bb"
+        )
+    );
+    let magenta = format!("{:<80}", "ccc");
+    assert!(render_detailed_coverage_report_with_ansi("ccc", "X", true).contains(&format!(
+        "\x1b[45m {magenta} \x1b[49m"
+    )));
+    // `N`, missing bytes, and `"0"` stay plain like PHP's default arm.
+    for report in ["N", "", "0"] {
+        let out = render_detailed_coverage_report_with_ansi("only", report, true);
+        assert_eq!(out, format!("    1   {:<80} \n", "only"));
+    }
+    // Plain keeps the bracketed marks.
+    let plain = render_detailed_coverage_report_with_ansi("a\nbb", "CU", false);
+    assert!(plain.contains("[C]"), "{plain}");
+    assert!(plain.contains("[U]"), "{plain}");
+    assert!(!plain.contains('\x1b'), "{plain}");
+}
+
+#[test]
+fn workflow_output_with_ansi_threads_flag() {
+    let root = unique_dir("wf-ansi");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut pass = engine_result("t", "pass");
+    pass.set_duration(0.125);
+    let full = render_workflow_output_with_ansi(&[pass.clone()], &[], "full", false, &root, true);
+    assert!(full.contains("\x1b[42m\x1b[1m PASS \x1b[m\x1b[49m"), "{full}");
+    let plain = render_workflow_output_with_ansi(&[pass.clone()], &[], "full", false, &root, false);
+    assert_eq!(plain, "  PASS 125ms t\n");
+    // Machine formats carry no markup in either mode.
+    let json = render_workflow_output_with_ansi(&[pass.clone()], &[], "json", false, &root, true);
+    assert!(!json.contains('\x1b'), "{json}");
+    assert_eq!(
+        json,
+        render_workflow_output_with_ansi(&[pass.clone()], &[], "json", false, &root, false)
+    );
+    let ugly = render_workflow_output_with_ansi(&[pass], &[], "ugly", false, &root, true);
+    assert!(!ugly.contains('\x1b'), "{ugly}");
+    assert_eq!(
+        render_workflow_output_with_ansi(&[], &[], "none", false, &root, true),
+        ""
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
