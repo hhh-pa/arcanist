@@ -202,10 +202,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Same binary cache as the gates preamble: a hit means this
+      # exact source hash already passed, so setup and tests skip.
+      # Restore-only here; the gates job owns the save.
+      - name: restore ci-tools binaries
+        id: tools-bin-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ci-tools-bin
+          key: ci-tools-${{ runner.os }}-${{ hashFiles('scripts/ci/go/**') }}
       - uses: actions/setup-go@v5
+        if: steps.tools-bin-cache.outputs.cache-hit != 'true'
         with:
           go-version-file: scripts/ci/go/go.mod
+          cache: false # stdlib-only module: no go.sum to cache against
       - run: go test ./...
+        if: steps.tools-bin-cache.outputs.cache-hit != 'true'
         working-directory: scripts/ci/go
 
   # Every run keeps its release binaries as downloadable Actions artifacts
