@@ -1,6 +1,13 @@
 name: rust
 
 on:
+  # Daily master build (default branch only, full job matrix, no path
+  # filter): catches toolchain drift and flaky gates even on quiet
+  # days. Off-peak minute to dodge the top-of-hour queue.
+  schedule:
+    - cron: "30 5 * * *"
+  # Manual full runs (same unfiltered matrix as the schedule).
+  workflow_dispatch:
   push:
     paths:
       - "rust/**"
