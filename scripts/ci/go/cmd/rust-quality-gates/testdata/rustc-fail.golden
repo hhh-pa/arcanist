@@ -30,10 +30,10 @@ stub: suite ran
 + cargo llvm-cov report --lcov --output-path $REPORT/lcov.info
 WARNING: $REPORT/lcov.info has absurd count 18446744073709551615 at src/absurd.rs DA:1; clamped to 0
 + cargo llvm-cov report --html --output-dir $REPORT
-+ /Users/hhu/workspace/arcanist/.muse/worktrees/subagent-v2-01a13f14-73bf-7903-a773-f537a3233d19-01a14087-4543-7ff1-ac92-67b4f6a649f1/scripts/ci/go/cmd/rust-quality-gates/testdata/stubs/llvm-profdata merge -sparse ... (1 profraw) -o $WS/target/llvm-cov-target/canonical.profdata
-+ /Users/hhu/workspace/arcanist/.muse/worktrees/subagent-v2-01a13f14-73bf-7903-a773-f537a3233d19-01a14087-4543-7ff1-ac92-67b4f6a649f1/scripts/ci/go/cmd/rust-quality-gates/testdata/stubs/llvm-cov export -instr-profile=$WS/target/llvm-cov-target/canonical.profdata --format=lcov ... (1 objects)
++ $STUBS/llvm-profdata merge -sparse ... (1 profraw) -o $WS/target/llvm-cov-target/canonical.profdata
++ $STUBS/llvm-cov export -instr-profile=$WS/target/llvm-cov-target/canonical.profdata --format=lcov ... (1 objects)
 WARNING: raw export has absurd count 18446744073709551615 at $WS/crates/app/tests/../src/tour.rs DA:2; clamped to 0
-+ /Users/hhu/workspace/arcanist/.muse/worktrees/subagent-v2-01a13f14-73bf-7903-a773-f537a3233d19-01a14087-4543-7ff1-ac92-67b4f6a649f1/scripts/ci/go/cmd/rust-quality-gates/testdata/stubs/llvm-cov show -instr-profile=$WS/target/llvm-cov-target/canonical.profdata --format=html --output-dir=$REPORT/html.canonical -object ... (1 objects)
++ $STUBS/llvm-cov show -instr-profile=$WS/target/llvm-cov-target/canonical.profdata --format=html --output-dir=$REPORT/html.canonical -object ... (1 objects)
 canonical coverage: cargo 8/9 lines -> canonical 10/12 (recovered 2 genuinely-executed lines)
 coverage for $WS: 83.33% lines (10/12, 3 files)
     0.00%     0/1     src/absurd.rs

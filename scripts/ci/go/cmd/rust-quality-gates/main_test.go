@@ -146,16 +146,28 @@ func copyTreeFixture(t *testing.T, src, dst string) {
 
 var seedTime = regexp.MustCompile(`seeded in [0-9.]+s`)
 
-// normalize replaces machine paths with placeholders.
-func normalize(out, ws, report, bin, sysroot string) string {
+// normalize replaces machine paths with placeholders (stubs covers
+// the PATH-fallback llvm tool lines when the stub sysroot is refused).
+func normalize(out, ws, report, bin, sysroot, stubs string) string {
 	for old, new := range map[string]string{
 		ws: "$WS", report: "$REPORT", bin: "$BIN", sysroot: "$SYS",
+		stubs: "$STUBS",
 	} {
 		if old != "" {
 			out = strings.ReplaceAll(out, old, new)
 		}
 	}
 	return seedTime.ReplaceAllString(out, "seeded in Ns")
+}
+
+// stubsDir is the absolute stub-tools dir, for normalization.
+func stubsDir(t *testing.T) string {
+	t.Helper()
+	abs, err := filepath.Abs("testdata/stubs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return abs
 }
 
 func sysrootOf(env []string) string {
@@ -177,8 +189,8 @@ func runGates(t *testing.T, name string, extra []string, runner []string, wantEx
 	if code != wantExit {
 		t.Fatalf("%s: exit = %d, want %d\nstdout:\n%s\nstderr:\n%s", name, code, wantExit, stdout, stderr)
 	}
-	return normalize(stdout, ws, report, bin, sysrootOf(env)),
-		normalize(stderr, ws, report, bin, sysrootOf(env)), ws, report
+	return normalize(stdout, ws, report, bin, sysrootOf(env), stubsDir(t)),
+		normalize(stderr, ws, report, bin, sysrootOf(env), stubsDir(t)), ws, report
 }
 
 func TestStubGoldens(t *testing.T) {
@@ -258,7 +270,7 @@ func TestPreseededSkipsSeedAndPurges(t *testing.T) {
 	if stderr != "" {
 		t.Fatalf("unexpected stderr:\n%s", stderr)
 	}
-	got := normalize(stdout, ws, report, bin, sysrootOf(env))
+	got := normalize(stdout, ws, report, bin, sysrootOf(env), stubsDir(t))
 	if want := cmdtest.Golden(t, "testdata/preseeded.golden"); got != want {
 		t.Fatalf("stdout mismatch:\n got: %q\nwant: %q", got, want)
 	}
@@ -278,7 +290,7 @@ func TestProvisionOnlyGolden(t *testing.T) {
 	if stderr != "" {
 		t.Fatalf("unexpected stderr:\n%s", stderr)
 	}
-	got := normalize(stdout, ws, "", bin, sysrootOf(env))
+	got := normalize(stdout, ws, "", bin, sysrootOf(env), stubsDir(t))
 	if want := cmdtest.Golden(t, "testdata/provision-only.golden"); got != want {
 		t.Fatalf("stdout mismatch:\n got: %q\nwant: %q", got, want)
 	}
