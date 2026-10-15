@@ -50,7 +50,20 @@ via API with reason `false positive` and this rationale.
 2. YAML parses; branch CI green (proves permission blocks suffice).
 3. Code-scanning shows 0 open alerts afterward.
 
+## Follow-up fixes (CI-driven)
+
+- CodeQL did not accept the `safeJoin` helper as a sanitizer (2
+  high annotations on the PR): containment checks are inline at
+  each sink in canonical `filepath.Join` + `HasPrefix` form, with
+  `dest` cleaned once at the top. Same behavior, same messages.
+- Master CI exposed a live `run(&["--apply"])` integration test:
+  publishing v0.1.0 flipped it FAILURE → SUCCESS (and a future
+  release would make the test replace its own binary). Removed
+  from the integration suite; apply paths stay covered by the
+  hermetic `upgrade_tests`; `run` docs warn against re-adding.
+
 ## Slices
 
 1. Spec (this file). 2. Go extractor + tests. 3. Workflow
    permissions. 4. Dismissals. 5. Push, PR, verify 0 open.
+6. Inline extractor form + hermetic upgrade test (this section).
