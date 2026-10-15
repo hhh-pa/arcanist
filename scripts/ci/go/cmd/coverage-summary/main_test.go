@@ -93,7 +93,10 @@ func TestOracleDiff(t *testing.T) {
 	if err != nil {
 		t.Skip("python3 not on PATH")
 	}
-	oracle := "../../lib/coverage-summary.py"
+	oracle, err := filepath.Abs("../../../lib/coverage-summary.py")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := os.Stat(oracle); err != nil {
 		t.Skip("oracle removed; golden tests own the contract now")
 	}
