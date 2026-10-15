@@ -177,8 +177,10 @@ func cargoInstall(env []string, toolsRoot, crate, version, features string) erro
 
 // extractTarGz unpacks a tool tarball like tarfile.extractall, with
 // zip-slip protection the oracle predates (real tool tarballs are
-// unaffected).
+// unaffected). Containment checks stay inline at each sink in the
+// canonical prefix form so static analysis can verify them.
 func extractTarGz(archive, dest string) error {
+	dest = filepath.Clean(dest)
 	fh, err := os.Open(archive)
 	if err != nil {
 		return err
@@ -198,8 +200,14 @@ func extractTarGz(archive, dest string) error {
 		if err != nil {
 			return err
 		}
+		if filepath.IsAbs(hdr.Name) {
+			return fmt.Errorf("tarball entry is absolute: %s", hdr.Name)
+		}
 		target := filepath.Join(dest, hdr.Name)
-		if !strings.HasPrefix(target, dest+string(os.PathSeparator)) && target != dest {
+		if target == dest {
+			continue // degenerate "." entry: the destination itself
+		}
+		if !strings.HasPrefix(target, filepath.Clean(dest)+string(os.PathSeparator)) {
 			return fmt.Errorf("tarball entry escapes: %s", hdr.Name)
 		}
 		switch hdr.Typeflag {
@@ -225,6 +233,18 @@ func extractTarGz(archive, dest string) error {
 				return closeErr
 			}
 		case tar.TypeSymlink:
+			linkTarget := hdr.Linkname
+			if !filepath.IsAbs(linkTarget) {
+				linkTarget = filepath.Join(filepath.Dir(target), linkTarget)
+			} else {
+				// Absolute targets skip Join's Clean: normalize so a
+				// `<dest>/../evil` Linkname cannot pass the prefix
+				// check lexically while resolving outside dest.
+				linkTarget = filepath.Clean(linkTarget)
+			}
+			if !strings.HasPrefix(linkTarget, dest+string(os.PathSeparator)) {
+				return fmt.Errorf("tarball symlink escapes: %s -> %s", hdr.Name, hdr.Linkname)
+			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o777); err != nil {
 				return err
 			}
@@ -233,11 +253,18 @@ func extractTarGz(archive, dest string) error {
 				return err
 			}
 		case tar.TypeLink:
+			if filepath.IsAbs(hdr.Linkname) {
+				return fmt.Errorf("tarball hardlink escapes: %s -> %s", hdr.Name, hdr.Linkname)
+			}
+			src := filepath.Join(dest, hdr.Linkname)
+			if !strings.HasPrefix(src, dest+string(os.PathSeparator)) {
+				return fmt.Errorf("tarball hardlink escapes: %s -> %s", hdr.Name, hdr.Linkname)
+			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o777); err != nil {
 				return err
 			}
 			os.Remove(target)
-			if err := os.Link(filepath.Join(dest, hdr.Linkname), target); err != nil {
+			if err := os.Link(src, target); err != nil {
 				return err
 			}
 		}

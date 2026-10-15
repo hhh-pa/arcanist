@@ -56,7 +56,11 @@ fn run_help_json_and_unported_paths() {
     assert_eq!(upgrade::run(&["--help".to_string()]), ExitCode::SUCCESS);
     assert_eq!(upgrade::run(&[]), ExitCode::SUCCESS);
     assert_eq!(upgrade::run(&["--json".to_string()]), ExitCode::SUCCESS);
-    assert_eq!(upgrade::run(&["--apply".to_string()]), ExitCode::FAILURE);
+    // No `run(&["--apply"])` here: it performs a live self-update
+    // (network fetch against the real releases API, then replaces
+    // the running executable), so its outcome depends on published
+    // state — publishing v0.1.0 flipped it from FAILURE to SUCCESS.
+    // Apply paths are covered hermetically in upgrade_tests.
     assert_eq!(upgrade::run(&["--bogus".to_string()]), ExitCode::FAILURE);
     assert_eq!(upgrade::run(&["extra".to_string()]), ExitCode::FAILURE);
 }
