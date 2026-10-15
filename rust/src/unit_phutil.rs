@@ -474,7 +474,7 @@ if ($coverage !== false) {
     // and run uncovered by default.
     if ($coverage === true) {
       $emit(array('error' => 'Coverage for PhutilUnitTestEngine requires '.
-        'an Arcanist working copy, which is unavailable when arc-rs runs '.
+        'an Arcanist working copy, which is unavailable when arc runs '.
         'phutil tests out-of-process; run without --coverage.'));
       exit(0);
     }

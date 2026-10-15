@@ -2669,7 +2669,7 @@ fn execute_help_parse_error_and_non_repo() {
     assert_eq!(out.stdout, USAGE);
     let err = execute_with_io(&dir, &args(&["--nope"]), &mut Io::canned(&[])).unwrap_err();
     assert!(err.starts_with("Unknown argument 'nope'."));
-    assert!(err.contains("usage: arc-rs land"));
+    assert!(err.contains("usage: arc land"));
     let err = execute_with_io(&dir, &args(&["--preview"]), &mut Io::canned(&[])).unwrap_err();
     assert_eq!(err, NOT_GIT_OR_HG);
     let out = execute(&dir, &args(&["--help"])).unwrap();

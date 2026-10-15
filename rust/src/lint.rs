@@ -1,4 +1,4 @@
-//! `arc-rs lint`: run lint rules on changes.
+//! `arc lint`: run lint rules on changes.
 //!
 //! Full-state port of `src/workflow/ArcanistLintWorkflow.php` (`run()`,
 //! `:147-387`), `src/lint/engine/ArcanistLintEngine.php` (severity filter,
@@ -166,7 +166,7 @@ pub const JSON_LINES_OF_CONTEXT: usize = 3;
 pub const DIFF_CONTEXT_LINES: u32 = 3;
 
 fn usage() -> String {
-    "usage: arc-rs lint [--lintall] [--rev REV] [--output FORMAT] [--outfile FILE] [--engine CLASS] [--apply-patches | --never-apply-patches] [--amend-all] [--amend-autofixes] [--everything] [--severity LEVEL] [PATHS...]\n\
+    "usage: arc lint [--lintall] [--rev REV] [--output FORMAT] [--outfile FILE] [--engine CLASS] [--apply-patches | --never-apply-patches] [--amend-all] [--amend-autofixes] [--everything] [--severity LEVEL] [PATHS...]\n\
      \n\
      Run static analysis on changes to check for mistakes. If no files\n\
      are specified, lint will be run on all files which have been modified.\n\
@@ -4557,7 +4557,7 @@ pub fn run(argv: &[String]) -> ExitCode {
     let cwd = match std::env::current_dir() {
         Ok(dir) => dir,
         Err(error) => {
-            eprintln!("arc-rs {NAME}: cannot determine current directory: {error}");
+            eprintln!("arc {NAME}: cannot determine current directory: {error}");
             return ExitCode::FAILURE;
         }
     };
@@ -4580,7 +4580,7 @@ pub fn run_in_with_input(cwd: &Path, argv: &[String], input: &mut dyn BufRead) -
             return ExitCode::SUCCESS;
         }
         ParseOutcome::Error(message) => {
-            eprintln!("arc-rs {NAME}: {message}\n\n{}", usage());
+            eprintln!("arc {NAME}: {message}\n\n{}", usage());
             return ExitCode::FAILURE;
         }
         ParseOutcome::Args(options) => options,
@@ -4589,7 +4589,7 @@ pub fn run_in_with_input(cwd: &Path, argv: &[String], input: &mut dyn BufRead) -
     match run_workflow(cwd, &options, input, ansi) {
         Ok(code) => ExitCode::from(code as u8),
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             ExitCode::FAILURE
         }
     }

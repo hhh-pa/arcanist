@@ -1299,15 +1299,13 @@ fn cargo_coverage_warning_names_the_flag() {
     opts.coverage = true;
     assert_eq!(
         cargo_coverage_warning(&opts).as_deref(),
-        Some(
-            "arc-rs unit: warning: the cargo engine does not support coverage; ignoring --coverage"
-        )
+        Some("arc unit: warning: the cargo engine does not support coverage; ignoring --coverage")
     );
     opts.detailed_coverage = true;
     assert_eq!(
         cargo_coverage_warning(&opts).as_deref(),
         Some(
-            "arc-rs unit: warning: the cargo engine does not support coverage; ignoring --detailed-coverage"
+            "arc unit: warning: the cargo engine does not support coverage; ignoring --detailed-coverage"
         )
     );
 }

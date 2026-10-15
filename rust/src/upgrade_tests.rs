@@ -620,8 +620,8 @@ fn select_asset_prefers_exact_platform() {
         "tag_name": "v9.9.9",
         "assets": [
             {"name": "checksums.txt", "size": 100, "browser_download_url": "http://x/sums"},
-            {"name": "arc-rs-linux-x86_64", "size": 10, "browser_download_url": "http://x/lin"},
-            {"name": "arc-rs-windows-x86_64.exe", "size": 20, "browser_download_url": "http://x/win"},
+            {"name": "arc-linux-x86_64", "size": 10, "browser_download_url": "http://x/lin"},
+            {"name": "arc-windows-x86_64.exe", "size": 20, "browser_download_url": "http://x/win"},
         ]
     });
     let win = select_asset(&doc, "windows-x86_64").unwrap();
@@ -636,7 +636,7 @@ fn select_asset_falls_back_to_lone_candidate() {
     let doc = serde_json::json!({
         "tag_name": "v9.9.9",
         "assets": [
-            {"name": "arc-rs-mystery", "size": 7, "browser_download_url": "http://x/only"},
+            {"name": "arc-mystery", "size": 7, "browser_download_url": "http://x/only"},
         ]
     });
     let only = select_asset(&doc, "plan9-arm").unwrap();
@@ -653,9 +653,9 @@ fn select_asset_refuses_missing_and_ambiguous() {
     let bad = serde_json::json!({
         "tag_name": "v9",
         "assets": [
-            {"name": "arc-rs-windows-x86_64.exe", "size": 0, "browser_download_url": "http://x/e"},
+            {"name": "arc-windows-x86_64.exe", "size": 0, "browser_download_url": "http://x/e"},
             {"name": "", "size": 5, "browser_download_url": "http://x/n"},
-            {"name": "arc-rs-x", "size": 5},
+            {"name": "arc-x", "size": 5},
         ]
     });
     let err = select_asset(&bad, "windows-x86_64").unwrap_err();
@@ -664,12 +664,12 @@ fn select_asset_refuses_missing_and_ambiguous() {
     let multi = serde_json::json!({
         "tag_name": "v9",
         "assets": [
-            {"name": "arc-rs-a", "size": 1, "browser_download_url": "http://x/a"},
-            {"name": "arc-rs-b", "size": 2, "browser_download_url": "http://x/b"},
+            {"name": "arc-a", "size": 1, "browser_download_url": "http://x/a"},
+            {"name": "arc-b", "size": 2, "browser_download_url": "http://x/b"},
         ]
     });
     let err = select_asset(&multi, "windows-x86_64").unwrap_err();
-    assert!(err.contains("candidates: arc-rs-a, arc-rs-b"), "{err}");
+    assert!(err.contains("candidates: arc-a, arc-b"), "{err}");
 
     let no_list = serde_json::json!({"tag_name": "v9"});
     let err = select_asset(&no_list, "windows-x86_64").unwrap_err();
@@ -913,12 +913,12 @@ fn detail_lines_are_plain_and_escaped() {
     );
     assert_eq!(
         already_line("0.1.0", "v0.1.1", false),
-        "arc-rs \"0.1.0\" is already up to date (latest release: \"v0.1.1\").\n"
+        "arc \"0.1.0\" is already up to date (latest release: \"v0.1.1\").\n"
     );
     let exe = PathBuf::from("tool.exe");
     assert_eq!(
         replaced_line(&exe, "v0.1.1", None, false),
-        "Replaced \"tool.exe\" with arc-rs \"v0.1.1\".\n"
+        "Replaced \"tool.exe\" with arc \"v0.1.1\".\n"
     );
     let old = PathBuf::from("tool.exe.old");
     let both = replaced_line(&exe, "v0.1.1", Some(&old), false);
@@ -936,7 +936,7 @@ fn execute_apply_updates_copy_end_to_end() {
     let tmp = TempDir::new("e2e");
     let exe = exe_copy(&tmp.path, "tool-copy.exe", b"old-bytes");
     let body = b"new-binary-bytes-v999";
-    let name = format!("arc-rs-{}.exe", platform_tag());
+    let name = format!("arc-{}.exe", platform_tag());
     let (listener, base, seen) = mock_listener();
     let doc = release_doc(
         "v9.9.9",
@@ -1033,7 +1033,7 @@ fn execute_apply_decline_aborts_cleanly() {
     let tmp = TempDir::new("decline");
     let exe = exe_copy(&tmp.path, "tool-copy.exe", b"old-bytes");
     let body = b"new-bytes";
-    let name = format!("arc-rs-{}.exe", platform_tag());
+    let name = format!("arc-{}.exe", platform_tag());
     let (listener, base, seen) = mock_listener();
     let doc = release_doc(
         "v9.9.9",
@@ -1061,7 +1061,7 @@ fn execute_apply_json_needs_yes() {
     let tmp = TempDir::new("jsonyes");
     let exe = exe_copy(&tmp.path, "tool-copy.exe", b"old-bytes");
     let (listener, base, seen) = mock_listener();
-    let name = format!("arc-rs-{}.exe", platform_tag());
+    let name = format!("arc-{}.exe", platform_tag());
     let doc = release_doc("v9.9.9", &format!("[{}]", asset_entry(&name, 3, &base)));
     run_mock(
         listener,
@@ -1081,7 +1081,7 @@ fn execute_apply_json_reports_result() {
     let tmp = TempDir::new("jsonresult");
     let exe = exe_copy(&tmp.path, "tool-copy.exe", b"old-bytes");
     let body = b"new-bytes";
-    let name = format!("arc-rs-{}.exe", platform_tag());
+    let name = format!("arc-{}.exe", platform_tag());
     let (listener, base, _) = mock_listener();
     let doc = release_doc(
         "v9.9.9",
@@ -1112,7 +1112,7 @@ fn execute_apply_json_reports_result() {
 fn execute_apply_download_failure_keeps_old() {
     let tmp = TempDir::new("dlfail");
     let exe = exe_copy(&tmp.path, "tool-copy.exe", b"old-bytes");
-    let name = format!("arc-rs-{}.exe", platform_tag());
+    let name = format!("arc-{}.exe", platform_tag());
     let (listener, base, _) = mock_listener();
     let doc = release_doc(
         "v9.9.9",
@@ -1138,7 +1138,7 @@ fn execute_apply_checksum_mismatch_keeps_old() {
     let tmp = TempDir::new("sumfail");
     let exe = exe_copy(&tmp.path, "tool-copy.exe", b"old-bytes");
     let body = b"tampered-bytes";
-    let name = format!("arc-rs-{}.exe", platform_tag());
+    let name = format!("arc-{}.exe", platform_tag());
     let (listener, base, seen) = mock_listener();
     // Well-formed size, but the checksum is for different bytes.
     let wrong = format!("sha256:{}", sha256_hex(b"genuine-bytes"));
@@ -1168,7 +1168,7 @@ fn execute_apply_missing_digest_downloads_nothing() {
     let tmp = TempDir::new("nodigest");
     let exe = exe_copy(&tmp.path, "tool-copy.exe", b"old-bytes");
     let body = b"new-bytes";
-    let name = format!("arc-rs-{}.exe", platform_tag());
+    let name = format!("arc-{}.exe", platform_tag());
     let (listener, base, seen) = mock_listener();
     // No `digest` key at all: refused before any download.
     let doc = release_doc(
@@ -1196,7 +1196,7 @@ fn execute_apply_missing_digest_downloads_nothing() {
 fn execute_apply_readonly_fails_before_download() {
     let tmp = TempDir::new("rofail");
     let exe = exe_copy(&tmp.path, "tool-copy.exe", b"old-bytes");
-    let name = format!("arc-rs-{}.exe", platform_tag());
+    let name = format!("arc-{}.exe", platform_tag());
     let (listener, base, seen) = mock_listener();
     let doc = release_doc(
         "v9.9.9",

@@ -1,4 +1,4 @@
-//! `arc-rs patch`: apply a Differential change to the working copy.
+//! `arc patch`: apply a Differential change to the working copy.
 //!
 //! Full-state port of `src/workflow/ArcanistPatchWorkflow.php`
 //! (arguments, source selection, the git/hg/svn flows) plus the pieces of
@@ -95,7 +95,7 @@ use arc_rs::{diff_submit, git, hg, svn, terminal};
 /// Subcommand name, matching `arc patch`.
 pub const NAME: &str = "patch";
 
-const USAGE: &str = "usage: arc-rs patch [--revision ID] [--diff ID] [--arcbundle FILE] [--patch FILE] [--encoding NAME] [--update] [--nocommit] [--skip-dependencies] [--nobranch] [--force] [--preview] [--conduit-uri URI] [D12345]\n";
+const USAGE: &str = "usage: arc patch [--revision ID] [--diff ID] [--arcbundle FILE] [--patch FILE] [--encoding NAME] [--update] [--nocommit] [--skip-dependencies] [--nobranch] [--force] [--preview] [--conduit-uri URI] [D12345]\n";
 
 /// Error when no working copy is detected (established port message; see
 /// the module docs).
@@ -1687,7 +1687,7 @@ fn render_text_change(change: &BundleChange, result: &mut String) -> Result<(), 
         return Ok(());
     }
     if change.file_type == FILE_IMAGE || change.file_type == FILE_BINARY {
-        return Err("binary patches are not yet ported by arc-rs patch".to_string());
+        return Err("binary patches are not yet ported by arc patch".to_string());
     }
     let body: String = change.hunks.concat();
     if change.change_type == TYPE_COPY_AWAY
@@ -5137,7 +5137,7 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
         Ok(_) => ExitCode::SUCCESS,
         Err(message) if message.is_empty() => ExitCode::FAILURE,
         Err(message) => {
-            eprintln!("arc-rs patch: {message}");
+            eprintln!("arc patch: {message}");
             ExitCode::FAILURE
         }
     }

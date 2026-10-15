@@ -1,4 +1,4 @@
-//! `arc-rs set-config` — write arc configuration settings.
+//! `arc set-config` — write arc configuration settings.
 //!
 //! PHP reference: `src/workflow/ArcanistSetConfigWorkflow.php`, with value
 //! coercion from `src/configuration/ArcanistSettings.php` (`willWriteValue`)
@@ -27,7 +27,7 @@ use arc_rs::{config, get_config, git, terminal};
 /// Subcommand name, matching `arc set-config`.
 pub const NAME: &str = "set-config";
 
-const USAGE: &str = "usage: arc-rs set-config [--local] [--] <name> <value>\n\
+const USAGE: &str = "usage: arc set-config [--local] [--] <name> <value>\n\
 \n\
 Write an arc configuration option. Writes user configuration (~/.arcrc)\n\
 by default, or the working copy's local configuration (.git/arc/config)\n\
@@ -354,7 +354,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}\n\n{USAGE}");
+            eprintln!("arc {NAME}: {message}\n\n{USAGE}");
             return ExitCode::FAILURE;
         }
     };
@@ -376,7 +376,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             ExitCode::FAILURE
         }
     }

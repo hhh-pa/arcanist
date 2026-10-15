@@ -1,4 +1,4 @@
-//! `arc-rs lint` PHP linter (T1128).
+//! `arc lint` PHP linter (T1128).
 //!
 //! PHP reference: `src/lint/linter/ArcanistPhpLinter.php` (an
 //! `ArcanistExternalLinter` wrapping `php -l`).

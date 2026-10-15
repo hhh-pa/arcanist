@@ -1,4 +1,4 @@
-//! `arc-rs list`: list your open Differential revisions.
+//! `arc list`: list your open Differential revisions.
 //!
 //! Port of `src/workflow/ArcanistListWorkflow.php`: queries
 //! `differential.query` for open revisions authored by the authenticated
@@ -20,7 +20,7 @@ use crate::{conduit, config, git, svn, terminal};
 /// Subcommand name, matching `arc list`.
 pub const NAME: &str = "list";
 
-const USAGE: &str = "usage: arc-rs list [--json] [--conduit-uri URI]\n";
+const USAGE: &str = "usage: arc list [--json] [--conduit-uri URI]\n";
 
 /// Parsed `list` options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,18 +351,18 @@ pub fn run_in(cwd: &Path, argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(msg) => {
-            eprintln!("arc-rs {NAME}: {msg}\n\n{USAGE}");
+            eprintln!("arc {NAME}: {msg}\n\n{USAGE}");
             return ExitCode::FAILURE;
         }
     };
     if let Err(msg) = require_working_copy(cwd) {
-        eprintln!("arc-rs {NAME}: {msg}");
+        eprintln!("arc {NAME}: {msg}");
         return ExitCode::FAILURE;
     }
     let client = match config::client_for(options.conduit_uri.as_deref()) {
         Ok(client) => client,
         Err(msg) => {
-            eprintln!("arc-rs {NAME}: {msg}");
+            eprintln!("arc {NAME}: {msg}");
             return ExitCode::FAILURE;
         }
     };
@@ -372,7 +372,7 @@ pub fn run_in(cwd: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(msg) => {
-            eprintln!("arc-rs {NAME}: {msg}");
+            eprintln!("arc {NAME}: {msg}");
             ExitCode::FAILURE
         }
     }

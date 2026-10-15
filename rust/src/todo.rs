@@ -1,4 +1,4 @@
-//! `arc-rs todo`: quickly create a Maniphest task for yourself.
+//! `arc todo`: quickly create a Maniphest task for yourself.
 //!
 //! Port of `src/workflow/ArcanistTodoWorkflow.php`: resolves `--cc` users
 //! with `user.query` and `--project` slugs with `project.query`, then creates
@@ -14,7 +14,7 @@ use crate::{conduit, config, terminal};
 /// Subcommand name, matching `arc todo`.
 pub const NAME: &str = "todo";
 
-const USAGE: &str = "usage: arc-rs todo SUMMARY [--cc USER] [--project SLUG] [--json] [--browse] [--conduit-uri URI]\n";
+const USAGE: &str = "usage: arc todo SUMMARY [--cc USER] [--project SLUG] [--json] [--browse] [--conduit-uri URI]\n";
 
 /// Parsed `todo` options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -429,14 +429,14 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(msg) => {
-            eprintln!("arc-rs {NAME}: {msg}\n\n{USAGE}");
+            eprintln!("arc {NAME}: {msg}\n\n{USAGE}");
             return ExitCode::FAILURE;
         }
     };
     let client = match config::client_for(options.conduit_uri.as_deref()) {
         Ok(client) => client,
         Err(msg) => {
-            eprintln!("arc-rs {NAME}: {msg}");
+            eprintln!("arc {NAME}: {msg}");
             return ExitCode::FAILURE;
         }
     };
@@ -446,7 +446,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(msg) => {
-            eprintln!("arc-rs {NAME}: {msg}");
+            eprintln!("arc {NAME}: {msg}");
             ExitCode::FAILURE
         }
     }

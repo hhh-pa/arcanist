@@ -21,7 +21,7 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn usage() -> String {
     format!(
-        "usage: arc-rs {NAME} [--as PATH] [--conduit-uri URI] -- F123\n\
+        "usage: arc {NAME} [--as PATH] [--conduit-uri URI] -- F123\n\
          \n\
          Download a file to local disk. Without --as, the file is saved\n\
          under its own name; `--as -` writes it to stdout.\n\
@@ -449,7 +449,7 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             ExitCode::FAILURE
         }
     }

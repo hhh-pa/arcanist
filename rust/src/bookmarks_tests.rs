@@ -109,7 +109,7 @@ fn formats_json_objects() {
 #[test]
 fn usage_covers_options() {
     let text = usage();
-    assert!(text.contains("usage: arc-rs bookmarks"));
+    assert!(text.contains("usage: arc bookmarks"));
     assert!(text.contains("--json"));
     assert!(text.contains("--conduit-uri"));
     assert!(text.contains("Mercurial"));

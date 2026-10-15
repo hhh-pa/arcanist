@@ -1,4 +1,4 @@
-//! `arc-rs bookmarks`: list bookmarks in the working copy.
+//! `arc bookmarks`: list bookmarks in the working copy.
 //!
 //! PHP reference: `src/workflow/ArcanistBookmarksWorkflow.php` (through
 //! `src/workflow/ArcanistMarkersWorkflow.php`). Bookmarks are a Mercurial
@@ -19,7 +19,7 @@ pub const NAME: &str = "bookmarks";
 
 fn usage() -> String {
     format!(
-        "usage: arc-rs {NAME} [--json] [--conduit-uri URI]\n\
+        "usage: arc {NAME} [--json] [--conduit-uri URI]\n\
          \n\
          Show an enhanced view of bookmarks in the working copy.\n\
          Bookmarks are a Mercurial concept; under git this command fails,\n\
@@ -228,7 +228,7 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             ExitCode::FAILURE
         }
     }

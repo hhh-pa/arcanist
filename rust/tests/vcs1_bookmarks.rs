@@ -87,7 +87,7 @@ fn run_uses_current_dir() {
 fn help_succeeds_and_prints_usage() {
     let empty = Fixture::named("help");
     let out = bookmarks::execute(empty.path(), &args(&["--help"])).unwrap();
-    assert!(out.contains("usage: arc-rs bookmarks"), "unexpected: {out}");
+    assert!(out.contains("usage: arc bookmarks"), "unexpected: {out}");
     assert_eq!(
         bookmarks::run_in(empty.path(), &args(&["--help"])),
         ExitCode::SUCCESS

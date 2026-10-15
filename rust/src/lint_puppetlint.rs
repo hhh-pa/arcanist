@@ -1,4 +1,4 @@
-//! `arc-rs lint` PuppetLint linter (T1128).
+//! `arc lint` PuppetLint linter (T1128).
 //!
 //! PHP reference: `src/lint/linter/ArcanistPuppetLintLinter.php` (an
 //! `ArcanistExternalLinter`).

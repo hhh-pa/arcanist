@@ -25,7 +25,7 @@ const TEMPORARY_TTL_SECS: u64 = 24 * 60 * 60;
 
 fn usage() -> String {
     format!(
-        "usage: arc-rs {NAME} [--json] [--temporary] [--browse] [--conduit-uri URI] -- FILE [FILE ...]\n\
+        "usage: arc {NAME} [--json] [--temporary] [--browse] [--conduit-uri URI] -- FILE [FILE ...]\n\
          \n\
          Upload one or more files from local disk.\n\
          \n\
@@ -662,7 +662,7 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             ExitCode::FAILURE
         }
     }

@@ -1,4 +1,4 @@
-//! Integration tests for `arc-rs look` through the wired library.
+//! Integration tests for `arc look` through the wired library.
 //! Git fixtures are local temp repos only.
 
 use std::path::PathBuf;

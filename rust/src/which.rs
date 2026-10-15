@@ -1,4 +1,4 @@
-//! `arc-rs which` — explain the resolved config/repo context.
+//! `arc which` — explain the resolved config/repo context.
 //!
 //! PHP reference: `src/workflow/ArcanistWhichWorkflow.php`, the base
 //! commit rules (`src/parser/ArcanistBaseCommitParser.php`), and the git
@@ -31,9 +31,9 @@ pub const NAME: &str = "which";
 /// (`ArcanistGitAPI::GIT_MAGIC_ROOT_COMMIT`).
 pub const GIT_MAGIC_ROOT_COMMIT: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
-const USAGE: &str = "usage: arc-rs which [--conduit-uri URI] [--head COMMIT] [--show-base] [--json] [--base RULES] [--any-status] [COMMIT]\n\
+const USAGE: &str = "usage: arc which [--conduit-uri URI] [--head COMMIT] [--show-base] [--json] [--base RULES] [--any-status] [COMMIT]\n\
 |\n\
-|Explain how arc-rs resolves the working copy, project, conduit, and\n\
+|Explain how arc resolves the working copy, project, conduit, and\n\
 |commit-range context for the current directory. Optional COMMIT pins the\n\
 |base of the reported range; --head pins its end (default HEAD).\n\
 |\n\
@@ -1630,7 +1630,7 @@ fn render_conduit(ctx: &Context, out: &mut String, ansi: bool) {
     }
     match ctx.token_installed {
         Some(true) => out.push_str("    Token: installed\n"),
-        Some(false) => out.push_str("    Token: missing (run `arc-rs install-certificate`)\n"),
+        Some(false) => out.push_str("    Token: missing (run `arc install-certificate`)\n"),
         None => out.push_str("    Token: unknown (no conduit URI)\n"),
     }
 }
@@ -1993,7 +1993,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Parsed::Error(message) => {
-            eprintln!("arc-rs {NAME}: {message}\n\n{USAGE}");
+            eprintln!("arc {NAME}: {message}\n\n{USAGE}");
             return ExitCode::FAILURE;
         }
         Parsed::Options(options) => options,
@@ -2036,7 +2036,7 @@ pub fn run(argv: &[String]) -> ExitCode {
     ) {
         Ok(ctx) => ctx,
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             return ExitCode::FAILURE;
         }
     };
@@ -2061,13 +2061,13 @@ fn run_show_base(
     runtime_rules: &str,
 ) -> ExitCode {
     if !git::is_inside_work_tree(cwd) {
-        eprintln!("arc-rs {NAME}: no commit range outside a working copy");
+        eprintln!("arc {NAME}: no commit range outside a working copy");
         return ExitCode::FAILURE;
     }
     let loaded = match load_config_sources(cwd, user_file) {
         Ok(loaded) => loaded,
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             return ExitCode::FAILURE;
         }
     };
@@ -2081,7 +2081,7 @@ fn run_show_base(
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             ExitCode::FAILURE
         }
     }

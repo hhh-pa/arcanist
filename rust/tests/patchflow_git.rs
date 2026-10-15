@@ -172,7 +172,7 @@ fn patch_help_succeeds() {
         ExitCode::SUCCESS
     );
     let out = patch::execute(fx.path(), &argv(&["--help"])).unwrap();
-    assert!(out.stdout.contains("usage: arc-rs patch"), "{}", out.stdout);
+    assert!(out.stdout.contains("usage: arc patch"), "{}", out.stdout);
 }
 
 #[test]

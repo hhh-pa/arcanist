@@ -147,7 +147,7 @@ fn formats_json_objects() {
 #[test]
 fn usage_covers_options() {
     let text = usage();
-    assert!(text.contains("usage: arc-rs branches"));
+    assert!(text.contains("usage: arc branches"));
     assert!(text.contains("--all") && text.contains("--json"));
     assert!(text.contains("--conduit-uri"));
 }

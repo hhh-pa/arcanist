@@ -1,4 +1,4 @@
-//! `arc-rs lint` GoLint linter (T1128).
+//! `arc lint` GoLint linter (T1128).
 //!
 //! PHP reference: `src/lint/linter/ArcanistGoLintLinter.php` (an
 //! `ArcanistExternalLinter`).

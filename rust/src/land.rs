@@ -1,4 +1,4 @@
-//! `arc-rs land`: publish reviewed changes.
+//! `arc land`: publish reviewed changes.
 //!
 //! Full-state port of `src/workflow/ArcanistLandWorkflow.php` (arguments,
 //! prompts, usage strings) and the land engines
@@ -117,7 +117,7 @@ use crate::terminal::{self, TVal};
 /// Subcommand name, matching `arc land`.
 pub const NAME: &str = "land";
 
-const USAGE: &str = "usage: arc-rs land [--hold] [--keep-branches] [--onto-remote REMOTE] [--onto BRANCH] [--strategy NAME] [--revision REV] [--preview] [--into REF] [--into-remote REMOTE] [--into-local] [--into-empty] [--incremental] [--pick] [--conduit-uri URI] [-- ref ...]\n";
+const USAGE: &str = "usage: arc land [--hold] [--keep-branches] [--onto-remote REMOTE] [--onto BRANCH] [--strategy NAME] [--revision REV] [--preview] [--into REF] [--into-remote REMOTE] [--into-local] [--into-empty] [--incremental] [--pick] [--conduit-uri URI] [-- ref ...]\n";
 
 /// `user.whoami` Conduit method; the result's `phid` is the viewer PHID
 /// (`src/workflow/ArcanistWorkflow.php:489-494`).
@@ -7598,7 +7598,7 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
     match execute_with_io(dir, argv, &mut io) {
         Ok(_) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("arc-rs land: {message}");
+            eprintln!("arc land: {message}");
             ExitCode::FAILURE
         }
     }

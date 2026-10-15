@@ -1,4 +1,4 @@
-//! `arc-rs branches`: list branches in the working copy.
+//! `arc branches`: list branches in the working copy.
 //!
 //! PHP reference: `src/workflow/ArcanistBranchesWorkflow.php` (through
 //! `src/workflow/ArcanistMarkersWorkflow.php`), which lists branch markers
@@ -19,7 +19,7 @@ pub const NAME: &str = "branches";
 
 fn usage() -> String {
     format!(
-        "usage: arc-rs {NAME} [--all] [--json] [--conduit-uri URI]\n\
+        "usage: arc {NAME} [--all] [--json] [--conduit-uri URI]\n\
          \n\
          Show an enhanced view of branches in the working copy.\n\
          \n\
@@ -285,7 +285,7 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc-rs {NAME}: {message}");
+            eprintln!("arc {NAME}: {message}");
             ExitCode::FAILURE
         }
     }

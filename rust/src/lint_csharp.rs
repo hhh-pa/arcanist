@@ -1,4 +1,4 @@
-//! `arc-rs lint` C# linter (T1128).
+//! `arc lint` C# linter (T1128).
 //!
 //! PHP reference: `src/lint/linter/ArcanistCSharpLinter.php`.
 //!
