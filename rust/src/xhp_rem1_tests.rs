@@ -954,3 +954,248 @@ fn compat_symbol_gating() {
         .is_empty()
     );
 }
+
+#[test]
+fn compat_db_shape_pins_vendored_json() {
+    // The runtime parses the vendored table fail-soft (`Null` on
+    // any corruption, silently disabling every symbol finding), so
+    // pin its shape loudly here.
+    let db = super::compat_db();
+    for section in [
+        "functions",
+        "classes",
+        "interfaces",
+        "constants",
+        "params",
+        "functions_windows",
+    ] {
+        assert!(
+            db.get(section).is_some_and(|value| value.is_object()),
+            "missing symbol-table section: {section}"
+        );
+    }
+    // The `has_uppercase` pre-filter relies on every constants key
+    // carrying an uppercase letter.
+    let constants = db.get("constants").expect("constants section");
+    let map = constants.as_object().expect("constants object");
+    assert!(!map.is_empty());
+    for key in map.keys() {
+        assert!(
+            key.bytes().any(|byte| byte.is_ascii_uppercase()),
+            "lowercase constants key: {key}"
+        );
+    }
+    // `\`-prefixed lookups always miss: no key starts with one
+    // (qualified keys like `http\Client\Curl\AUTH_ANY` do exist and
+    // are matched by full-text run lookups).
+    for section in ["functions", "classes", "interfaces", "constants"] {
+        let entries = db.get(section).expect("lookup section");
+        for key in entries.as_object().expect("lookup object").keys() {
+            assert!(!key.starts_with('\\'), "slashed key in {section}: {key}");
+        }
+    }
+    assert!(
+        db.get("constants")
+            .and_then(|entries| entries.get("http\\Client\\Curl\\AUTH_ANY"))
+            .is_some(),
+        "namespaced constant missing from table"
+    );
+    // Spot-check known symbols against the PHP-side table values.
+    let min = |section: &str, name: &str| {
+        db.get(section)
+            .and_then(|entries| entries.get(name))
+            .and_then(|entry| entry.get("php.min"))
+            .and_then(serde_json::Value::as_str)
+    };
+    assert_eq!(min("constants", "JSON_PRETTY_PRINT"), Some("5.4.0"));
+    assert_eq!(min("functions", "array_column"), Some("5.5.0"));
+    assert_eq!(min("classes", "CURLFile"), Some("5.5.0"));
+}
+
+#[test]
+fn compat_version_zero_is_falsy() {
+    // PHP `!$version`: "0" disables the rule just like "" does.
+    let zero = versioned("0");
+    assert!(for_rule_with("<?php array_column(array());\n", "a.php", &zero, 45).is_empty());
+    assert!(for_rule_with("<?php new CURLFile('');\n", "a.php", &zero, 45).is_empty());
+    assert!(for_rule_with("<?php echo JSON_PRETTY_PRINT;\n", "a.php", &zero, 45).is_empty());
+    assert!(for_rule_with("<?php namespace a;\n", "a.php", &zero, 45).is_empty());
+    let zero_win = versioned_windows("5.2.3", "0");
+    assert!(for_rule_with("<?php chroot('/tmp');\n", "a.php", &zero_win, 45).is_empty());
+    // ...but "0.0" is truthy in PHP and still gates.
+    assert_eq!(
+        for_rule_with(
+            "<?php array_column(array());\n",
+            "a.php",
+            &versioned("0.0"),
+            45
+        )
+        .len(),
+        1
+    );
+}
+
+#[test]
+fn compat_symbol_constant_imports() {
+    let options = versioned("5.3.0");
+    // Single-segment import names are n_SYMBOL_NAME in PHP: one lookup.
+    let hits = for_rule_with("<?php use JSON_PRETTY_PRINT;\n", "a.php", &options, 45);
+    assert_eq!(hits.len(), 1);
+    assert_eq!((hits[0].0, hits[0].1), (1, 11));
+    assert_eq!(
+        hits[0].2,
+        "This codebase targets PHP 5.3.0, but `JSON_PRETTY_PRINT` was not introduced until PHP \
+         5.4.0."
+    );
+    let hits = for_rule_with(
+        "<?php namespace JSON_PRETTY_PRINT;\n",
+        "a.php",
+        &options,
+        45,
+    );
+    assert_eq!(hits.len(), 1);
+    // Multi-segment and `\`-prefixed names miss, like PHP's full-string lookup.
+    assert!(for_rule_with("<?php use A\\JSON_PRETTY_PRINT;\n", "a.php", &options, 45).is_empty());
+    assert!(
+        for_rule_with(
+            "<?php namespace A\\JSON_PRETTY_PRINT;\n",
+            "a.php",
+            &options,
+            45
+        )
+        .is_empty()
+    );
+    assert!(for_rule_with("<?php use \\JSON_PRETTY_PRINT;\n", "a.php", &options, 45).is_empty());
+    // `as` aliases are n_STRING: never scanned.
+    assert!(for_rule_with("<?php use C as JSON_PRETTY_PRINT;\n", "a.php", &options, 45).is_empty());
+    // Comma-separated imports each scan once.
+    assert_eq!(
+        for_rule_with("<?php use E, JSON_PRETTY_PRINT;\n", "a.php", &options, 45).len(),
+        1
+    );
+    // `namespace\FOO` operator uses carry no declaration name.
+    assert!(
+        for_rule_with(
+            "<?php echo namespace\\JSON_PRETTY_PRINT;\n",
+            "a.php",
+            &options,
+            45
+        )
+        .is_empty()
+    );
+    // Beyond-stock-grammar statements are skipped, never flagged.
+    assert!(
+        for_rule_with(
+            "<?php use const JSON_PRETTY_PRINT;\n",
+            "a.php",
+            &options,
+            45
+        )
+        .is_empty()
+    );
+    assert!(for_rule_with("<?php use A\\{JSON_PRETTY_PRINT};\n", "a.php", &options, 45).is_empty());
+    // Trait uses are n_CLASS_NAME, not constants.
+    assert!(
+        for_rule_with(
+            "<?php class C { use JSON_PRETTY_PRINT; }\n",
+            "a.php",
+            &options,
+            45
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn compat_symbol_constant_labels() {
+    let options = versioned("5.3.0");
+    // Labels are n_LABEL/n_STRING in PHP: never scanned.
+    assert!(
+        for_rule_with(
+            "<?php function f() { goto JSON_PRETTY_PRINT; JSON_PRETTY_PRINT: return; }\n",
+            "a.php",
+            &options,
+            45
+        )
+        .is_empty()
+    );
+    assert!(for_rule_with("<?php JSON_PRETTY_PRINT: echo 1;\n", "a.php", &options, 45).is_empty());
+    assert!(
+        for_rule_with(
+            "<?php function g() { JSON_PRETTY_PRINT: return; }\n",
+            "a.php",
+            &options,
+            45
+        )
+        .is_empty()
+    );
+    // ...but `case` values and ternary branches are expressions.
+    assert_eq!(
+        for_rule_with(
+            "<?php switch ($x) { case JSON_PRETTY_PRINT: break; }\n",
+            "a.php",
+            &options,
+            45
+        )
+        .len(),
+        1
+    );
+    assert_eq!(
+        for_rule_with(
+            "<?php $y = $x ? JSON_PRETTY_PRINT : 0;\n",
+            "a.php",
+            &options,
+            45
+        )
+        .len(),
+        1
+    );
+}
+
+#[test]
+fn compat_symbol_constant_namespaced() {
+    let old = versioned("5.2.0");
+    // Namespaced constants live in the table: full-text run lookup.
+    let hits = for_rule_with(
+        "<?php echo http\\Client\\Curl\\AUTH_ANY;\n",
+        "a.php",
+        &old,
+        45,
+    );
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].2,
+        "This codebase targets PHP 5.2.0, but `http\\Client\\Curl\\AUTH_ANY` was not introduced \
+         until PHP 5.3.0."
+    );
+    assert!(
+        for_rule_with(
+            "<?php echo http\\Client\\Curl\\AUTH_ANY;\n",
+            "a.php",
+            &versioned("5.3.0"),
+            45
+        )
+        .is_empty()
+    );
+    // `\`-prefixed and gapped spellings miss, like PHP's concrete string.
+    assert!(
+        for_rule_with(
+            "<?php echo \\http\\Client\\Curl\\AUTH_ANY;\n",
+            "a.php",
+            &old,
+            45
+        )
+        .is_empty()
+    );
+    assert!(
+        for_rule_with(
+            "<?php echo http \\Client\\Curl\\AUTH_ANY;\n",
+            "a.php",
+            &old,
+            45
+        )
+        .is_empty()
+    );
+    // Ordinary qualified names still miss.
+    assert!(for_rule_with("<?php echo A\\B;\n", "a.php", &old, 45).is_empty());
+}
