@@ -204,7 +204,10 @@ func extractTarGz(archive, dest string) error {
 			return fmt.Errorf("tarball entry is absolute: %s", hdr.Name)
 		}
 		target := filepath.Join(dest, hdr.Name)
-		if target != dest && !strings.HasPrefix(target, dest+string(os.PathSeparator)) {
+		if target == dest {
+			continue // degenerate "." entry: the destination itself
+		}
+		if !strings.HasPrefix(target, filepath.Clean(dest)+string(os.PathSeparator)) {
 			return fmt.Errorf("tarball entry escapes: %s", hdr.Name)
 		}
 		switch hdr.Typeflag {

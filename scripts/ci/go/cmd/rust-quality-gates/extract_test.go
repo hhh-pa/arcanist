@@ -71,6 +71,23 @@ func TestExtractTarGzKeepsNormalTree(t *testing.T) {
 	}
 }
 
+func TestExtractTarGzSkipsDegenerateDotEntries(t *testing.T) {
+	dir := t.TempDir()
+	archive := filepath.Join(dir, "dot.tar.gz")
+	dest := filepath.Join(dir, "out")
+	writeTar(t, archive, []tarEntry{
+		{name: "./", flag: tar.TypeDir, mode: 0o755},
+		{name: "ok", flag: tar.TypeReg, body: "fine"},
+	})
+	if err := extractTarGz(archive, dest); err != nil {
+		t.Fatal(err)
+	}
+	blob, err := os.ReadFile(filepath.Join(dest, "ok"))
+	if err != nil || string(blob) != "fine" {
+		t.Fatalf("blob = %q, %v", blob, err)
+	}
+}
+
 func TestExtractTarGzRejectsEscapes(t *testing.T) {
 	cases := []struct {
 		name  string
