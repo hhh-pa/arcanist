@@ -11,7 +11,8 @@
 //! `Parse Error`) instead of going fully silent, so `.json` files are still
 //! checked. Only `.json` files are examined; binary data (NUL byte) is
 //! skipped. Directories and symlinks are skipped by `Engine::lint_file`
-//! before bytes reach here.
+//! before bytes reach here. The `bin`, `flags`, and `version` linter
+//! options apply (N4).
 
 extern crate self as arc_rs;
 
@@ -19,7 +20,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arc_rs::lint::{LintMessage, Linter};
+use arc_rs::lint::{LintMessage, Linter, OptionContext};
+use arc_rs::lint_external::{ToolOptions, apply_tool_option, version_requirement_satisfied};
+use arc_rs::linters::version_pattern_for;
 
 /// Registry name, matching PHP `getLinterName()`.
 pub const LINTER_NAME: &str = "JSON";
@@ -40,12 +43,13 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Default)]
 pub struct JsonlintLinter {
     binary: Option<PathBuf>,
+    options: ToolOptions,
 }
 
 impl JsonlintLinter {
     #[must_use]
     pub fn new() -> Self {
-        Self { binary: None }
+        Self::default()
     }
 
     /// Override the tool binary (mirrors PHP `setBinary()`); used by tests
@@ -54,6 +58,7 @@ impl JsonlintLinter {
     pub fn with_binary(path: &Path) -> Self {
         Self {
             binary: Some(path.to_path_buf()),
+            options: ToolOptions::default(),
         }
     }
 
@@ -61,13 +66,28 @@ impl JsonlintLinter {
         if let Some(path) = &self.binary {
             return path.is_file().then(|| path.clone());
         }
+        if let Some(path) = &self.options.bin {
+            return Some(path.clone());
+        }
         find_on_path(BINARY)
+    }
+
+    /// Effective tool flags (without the file): mandatory plus
+    /// configured-or-default, mirroring `getCommandFlags()`.
+    fn tool_flags(&self) -> Vec<String> {
+        self.options.command_flags(&["--compact".to_string()], &[])
     }
 }
 
 impl Linter for JsonlintLinter {
     fn name(&self) -> &'static str {
         LINTER_NAME
+    }
+
+    fn applies_custom_severities(&self) -> bool {
+        // The PHP linter sets severities directly and never consults
+        // custom severity maps.
+        false
     }
 
     fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {
@@ -77,16 +97,36 @@ impl Linter for JsonlintLinter {
         let Some(binary) = self.resolve_binary() else {
             return native_json_check(path, data);
         };
+        if let Some(requirement) = &self.options.version
+            && !version_requirement_satisfied(
+                version_pattern_for("jsonlint"),
+                &binary,
+                requirement,
+                "ArcanistJSONLintLinter",
+            )
+        {
+            return Vec::new();
+        }
         let Some(input) = write_temp_file(SLUG, path, "json", data) else {
             return Vec::new();
         };
-        let args = vec!["--compact".to_string(), input.display().to_string()];
+        let mut args = self.tool_flags();
+        args.push(input.display().to_string());
         let found = run_tool(&binary, &args).map_or_else(Vec::new, |out| {
             let parsed = parse_compact_output(path, &out.stderr);
             finish(path, &out, parsed)
         });
         std::fs::remove_file(&input).ok();
         found
+    }
+
+    fn set_option(
+        &mut self,
+        key: &str,
+        value: &serde_json::Value,
+        ctx: &OptionContext,
+    ) -> Result<(), String> {
+        apply_tool_option(&mut self.options, key, value, ctx.project_root)
     }
 }
 
@@ -153,12 +193,15 @@ fn parse_digits(text: &str) -> Option<usize> {
     text.parse::<usize>().ok()
 }
 
+/// Uppercase a leading ASCII lowercase byte, mirroring PHP `ucfirst()`
+/// (byte-based: non-ASCII initials pass through unchanged).
 fn ucfirst(text: &str) -> String {
-    let mut chars = text.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
+    let mut bytes = text.as_bytes().to_vec();
+    if let Some(first) = bytes.first_mut() {
+        first.make_ascii_uppercase();
     }
+    // ASCII case mapping preserves UTF-8 validity.
+    String::from_utf8(bytes).unwrap_or_else(|_| text.to_string())
 }
 
 /// Native JSON validation used when the `jsonlint` binary is absent,

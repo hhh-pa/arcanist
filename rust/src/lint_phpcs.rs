@@ -10,17 +10,18 @@
 //! description; warnings map to `warning` and errors to `error`.
 //! A zero tool exit means no findings and yields no messages.
 //!
-//! Known limits (see T1128): the `phpcs.standard` linter option is not
-//! supported (the tool default standard applies); invalid XML yields no
-//! messages (the PHP linter raises, but the
-//! [`Linter`](arc_rs::lint::Linter) trait has no error channel).
+//! The `bin`, `flags`, `version`, and `phpcs.standard` linter options
+//! apply (N4). Invalid XML yields no messages (the PHP linter raises,
+//! but the [`Linter`](arc_rs::lint::Linter) trait has no error channel).
 
 extern crate self as arc_rs;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use arc_rs::lint::{LintMessage, Linter, SEVERITY_ERROR};
+use arc_rs::lint::{LintMessage, Linter, OptionContext, SEVERITY_ERROR};
+use arc_rs::lint_external::{ToolOptions, apply_tool_option, version_requirement_satisfied};
+use arc_rs::linters::version_pattern_for;
 
 /// Severity mirroring `ArcanistLintSeverity`; `lint.rs` only defines the
 /// severities the text linter uses.
@@ -28,12 +29,15 @@ const SEVERITY_WARNING: &str = "warning";
 
 /// PHPCS linter: PHP_CodeSniffer findings via an external binary.
 #[derive(Debug, Default)]
-pub struct PhpcsLinter;
+pub struct PhpcsLinter {
+    options: ToolOptions,
+    standard: Option<String>,
+}
 
 impl PhpcsLinter {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -47,7 +51,24 @@ pub fn binary_name() -> &'static str {
 /// configured standard.
 #[must_use]
 pub fn command_flags() -> Vec<String> {
-    vec!["--report=xml".to_string()]
+    let mut flags = mandatory_flags(None);
+    flags.extend(default_flags());
+    flags
+}
+
+/// Mandatory flags, mirroring `getMandatoryFlags()`: `--report=xml`
+/// plus `--standard=` when a standard is configured.
+fn mandatory_flags(standard: Option<&str>) -> Vec<String> {
+    let mut flags = vec!["--report=xml".to_string()];
+    if let Some(standard) = standard {
+        flags.push(format!("--standard={standard}"));
+    }
+    flags
+}
+
+/// Default flags, mirroring `getDefaultFlags()`: none.
+fn default_flags() -> Vec<String> {
+    Vec::new()
 }
 
 fn is_supported(path: &str) -> bool {
@@ -150,9 +171,9 @@ fn staged_name(display_path: &str) -> String {
     }
 }
 
-fn run_tool(binary: &Path, file: &Path) -> Option<(i32, String, String)> {
+fn run_tool(binary: &Path, file: &Path, flags: &[String]) -> Option<(i32, String, String)> {
     let mut command = Command::new(binary);
-    command.args(command_flags()).arg(file).stdin(Stdio::null());
+    command.args(flags).arg(file).stdin(Stdio::null());
     let output = arc_rs::lint::spawn_with_retry(&mut command).ok()?;
     let code = output.status.code().unwrap_or(1);
     Some((
@@ -165,13 +186,23 @@ fn run_tool(binary: &Path, file: &Path) -> Option<(i32, String, String)> {
 /// Linter body with an explicit tool path (mirrors the PHP `bin` option).
 /// `None` (tool absent) reports no messages.
 pub fn lint_with_binary(path: &str, data: &[u8], binary: Option<&Path>) -> Vec<LintMessage> {
+    lint_with_binary_and_flags(path, data, binary, &command_flags())
+}
+
+/// Linter body with explicit flags (configured flags replace defaults).
+fn lint_with_binary_and_flags(
+    path: &str,
+    data: &[u8],
+    binary: Option<&Path>,
+    flags: &[String],
+) -> Vec<LintMessage> {
     let Some(binary) = binary else {
         return Vec::new();
     };
     let Ok(staged) = StagedFile::stage(path, data) else {
         return Vec::new();
     };
-    let Some((code, stdout, stderr)) = run_tool(binary, staged.path()) else {
+    let Some((code, stdout, stderr)) = run_tool(binary, staged.path(), flags) else {
         return Vec::new();
     };
     parse_output(path, code, &stdout, &stderr)
@@ -418,7 +449,54 @@ impl Linter for PhpcsLinter {
         if data.contains(&0) {
             return Vec::new();
         }
-        lint_with_binary(path, data, binary_on_path().as_deref())
+        let binary = self.options.bin.clone().or_else(binary_on_path);
+        let Some(ref binary) = binary else {
+            return Vec::new();
+        };
+        if let Some(requirement) = &self.options.version
+            && !version_requirement_satisfied(
+                version_pattern_for("phpcs"),
+                binary,
+                requirement,
+                "ArcanistPhpcsLinter",
+            )
+        {
+            return Vec::new();
+        }
+        let flags = self
+            .options
+            .command_flags(&mandatory_flags(self.standard.as_deref()), &default_flags());
+        lint_with_binary_and_flags(path, data, Some(binary), &flags)
+    }
+
+    fn set_option(
+        &mut self,
+        key: &str,
+        value: &serde_json::Value,
+        ctx: &OptionContext,
+    ) -> Result<(), String> {
+        if key == "phpcs.standard" {
+            let Some(standard) = value.as_str() else {
+                return Err("'phpcs.standard' must be a string".to_string());
+            };
+            self.standard = Some(standard.to_string());
+            return Ok(());
+        }
+        apply_tool_option(&mut self.options, key, value, ctx.project_root)
+    }
+
+    fn validate_severity_code(&self, code: &str) -> Result<String, String> {
+        // `/^PHPCS\.(E|W)\./` must match a prefix, like PHP; the full
+        // code is kept.
+        let tail = code.strip_prefix("PHPCS.").unwrap_or_default();
+        let mut bytes = tail.bytes();
+        let ok = matches!(bytes.next(), Some(b'E' | b'W')) && matches!(bytes.next(), Some(b'.'));
+        if ok {
+            return Ok(code.to_string());
+        }
+        Err(format!(
+            "Invalid severity code '{code}', should begin with 'PHPCS.'."
+        ))
     }
 }
 

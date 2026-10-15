@@ -114,3 +114,11 @@ fn messages_may_contain_pipes() {
 fn empty_output_yields_no_messages() {
     assert!(parse_output("site.pp", 0, "", "").is_empty());
 }
+
+#[test]
+fn case_helpers_are_byte_based_like_php() {
+    assert_eq!(ucfirst("warn"), "Warn");
+    assert_eq!(ucfirst("école"), "école");
+    assert_eq!(ucwords("double quoted"), "Double Quoted");
+    assert_eq!(ucwords("école x"), "école X");
+}

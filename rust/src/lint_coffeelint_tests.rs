@@ -54,3 +54,35 @@ fn missing_binary_is_silent() {
 fn lookup_miss_reports_no_tool() {
     assert!(find_on_path("arc-rs-definitely-missing-tool").is_none());
 }
+
+#[test]
+fn custom_severities_are_rejected_like_php() {
+    let linter = CoffeelintLinter::new();
+    assert_eq!(
+        linter.validate_severity_code("COFFEE"),
+        Err(
+            "CoffeeLint does not currently support custom severity levels, because rules can't \
+             be identified from messages in output."
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn ucwords_is_byte_based_like_php() {
+    assert_eq!(ucwords("no trailing"), "No Trailing");
+    assert_eq!(ucwords("a\tb\nc"), "A\tB\nC");
+    assert_eq!(ucwords("école x"), "école X");
+}
+
+#[test]
+fn reports_carry_the_source_line_as_original() {
+    let messages = parse_raw_output("a.coffee", canned()).unwrap();
+    assert_eq!(messages[0].original.as_deref(), Some("x = 1;"));
+    let missing = parse_raw_output(
+        "a.coffee",
+        r#"{"a.coffee": [{"lineNumber": 1, "name": "x", "message": "m", "level": "warn"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(missing[0].original, None);
+}

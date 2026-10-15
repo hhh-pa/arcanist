@@ -212,3 +212,20 @@ fn attribute_edges_reject_fallback_and_default() {
     assert_eq!(lines, vec![7, 8, 1, 1]);
     assert_eq!(messages[3].col, 1);
 }
+
+#[test]
+fn severity_codes_need_the_phpcs_kind_prefix() {
+    let linter = PhpcsLinter::new();
+    for code in ["PHPCS.E.Whitespace", "PHPCS.W.Generic"] {
+        assert_eq!(linter.validate_severity_code(code), Ok(code.to_string()));
+    }
+    for code in ["", "PHPCS", "PHPCS.X.A", "PHPCS.E", "E.Whitespace"] {
+        assert_eq!(
+            linter.validate_severity_code(code),
+            Err(format!(
+                "Invalid severity code '{code}', should begin with 'PHPCS.'."
+            )),
+            "{code:?}"
+        );
+    }
+}

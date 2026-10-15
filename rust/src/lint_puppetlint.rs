@@ -12,15 +12,17 @@
 //! description; `warning`/`error` kinds map to those severities and
 //! anything else to advice, mirroring `parseLinterOutput()`.
 //!
-//! Known limits (see T1128): the `puppet-lint.config` linter option is
-//! not supported; lines that do not parse are skipped.
+//! The `bin`, `flags`, `version`, and `puppet-lint.config` linter
+//! options apply (N4). Lines that do not parse are skipped.
 
 extern crate self as arc_rs;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use arc_rs::lint::{LintMessage, Linter, SEVERITY_ERROR};
+use arc_rs::lint::{LintMessage, Linter, OptionContext, SEVERITY_ERROR};
+use arc_rs::lint_external::{ToolOptions, apply_tool_option, version_requirement_satisfied};
+use arc_rs::linters::version_pattern_for;
 
 /// Companion severities mirroring `ArcanistLintSeverity`; `lint.rs` only
 /// defines the severities the text linter uses.
@@ -29,12 +31,15 @@ const SEVERITY_ADVICE: &str = "advice";
 
 /// PuppetLint linter: Puppet style-guide findings via an external binary.
 #[derive(Debug, Default)]
-pub struct PuppetlintLinter;
+pub struct PuppetlintLinter {
+    options: ToolOptions,
+    config: Option<String>,
+}
 
 impl PuppetlintLinter {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -44,13 +49,29 @@ pub fn binary_name() -> &'static str {
     "puppet-lint"
 }
 
-/// Exact tool argv flags, mirroring `getMandatoryFlags()`.
+/// Exact tool argv flags, mirroring `getMandatoryFlags()` without a
+/// configured config file.
 #[must_use]
 pub fn command_flags() -> Vec<String> {
+    let mut flags = mandatory_flags();
+    flags.extend(default_flags(None));
+    flags
+}
+
+/// Mandatory flags, mirroring `getMandatoryFlags()`.
+fn mandatory_flags() -> Vec<String> {
     vec![
         "--error-level=all".to_string(),
         "--log-format=%{linenumber}|%{column}|%{kind}|%{check}|%{message}".to_string(),
     ]
+}
+
+/// Default flags, mirroring `getDefaultFlags()`: `--config=` when a
+/// config file is configured (custom `flags` replace this).
+fn default_flags(config: Option<&str>) -> Vec<String> {
+    config
+        .map(|path| vec![format!("--config={path}")])
+        .unwrap_or_default()
 }
 
 fn is_supported(path: &str) -> bool {
@@ -147,9 +168,9 @@ fn staged_name(display_path: &str) -> String {
     }
 }
 
-fn run_tool(binary: &Path, file: &Path) -> Option<(i32, String, String)> {
+fn run_tool(binary: &Path, file: &Path, flags: &[String]) -> Option<(i32, String, String)> {
     let mut command = Command::new(binary);
-    command.args(command_flags()).arg(file).stdin(Stdio::null());
+    command.args(flags).arg(file).stdin(Stdio::null());
     let output = arc_rs::lint::spawn_with_retry(&mut command).ok()?;
     let code = output.status.code().unwrap_or(1);
     Some((
@@ -162,13 +183,23 @@ fn run_tool(binary: &Path, file: &Path) -> Option<(i32, String, String)> {
 /// Linter body with an explicit tool path (mirrors the PHP `bin` option).
 /// `None` (tool absent) reports no messages.
 pub fn lint_with_binary(path: &str, data: &[u8], binary: Option<&Path>) -> Vec<LintMessage> {
+    lint_with_binary_and_flags(path, data, binary, &command_flags())
+}
+
+/// Linter body with explicit flags (configured flags replace defaults).
+fn lint_with_binary_and_flags(
+    path: &str,
+    data: &[u8],
+    binary: Option<&Path>,
+    flags: &[String],
+) -> Vec<LintMessage> {
     let Some(binary) = binary else {
         return Vec::new();
     };
     let Ok(staged) = StagedFile::stage(path, data) else {
         return Vec::new();
     };
-    let Some((code, stdout, stderr)) = run_tool(binary, staged.path()) else {
+    let Some((code, stdout, stderr)) = run_tool(binary, staged.path(), flags) else {
         return Vec::new();
     };
     parse_output(path, code, &stdout, &stderr)
@@ -216,41 +247,41 @@ fn parse_num(text: &str) -> usize {
     text.trim().parse::<usize>().unwrap_or(1).max(1)
 }
 
-/// Uppercase the first character, mirroring PHP `ucfirst()` (Unicode-aware).
+/// Uppercase a leading ASCII lowercase byte, mirroring PHP `ucfirst()`
+/// (byte-based: non-ASCII initials pass through unchanged).
 fn ucfirst(text: &str) -> String {
-    let mut chars = text.chars();
-    let Some(first) = chars.next() else {
-        return String::new();
-    };
-    let mut out = String::with_capacity(text.len());
-    for upper in first.to_uppercase() {
-        out.push(upper);
+    let mut bytes = text.as_bytes().to_vec();
+    if let Some(first) = bytes.first_mut() {
+        first.make_ascii_uppercase();
     }
-    out.push_str(chars.as_str());
-    out
+    // ASCII case mapping preserves UTF-8 validity.
+    String::from_utf8(bytes).unwrap_or_else(|_| text.to_string())
 }
 
-/// Uppercase the first character of each word, mirroring PHP `ucwords()`
-/// (Unicode-aware).
+/// Uppercase ASCII initials after whitespace, mirroring PHP `ucwords()`
+/// (byte-based: only `a-z` change, so non-ASCII bytes pass through).
 fn ucwords(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+    let mut out = text.as_bytes().to_vec();
     let mut start = true;
-    for c in text.chars() {
+    for byte in &mut out {
         if start {
-            for upper in c.to_uppercase() {
-                out.push(upper);
-            }
-        } else {
-            out.push(c);
+            byte.make_ascii_uppercase();
         }
-        start = c.is_whitespace();
+        start = matches!(*byte, b' ' | b'\t' | b'\r' | b'\n' | b'\x0C' | b'\x0B');
     }
-    out
+    // ASCII case mapping preserves UTF-8 validity.
+    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
 }
 
 impl Linter for PuppetlintLinter {
     fn name(&self) -> &'static str {
         "PUPPETLINT"
+    }
+
+    fn applies_custom_severities(&self) -> bool {
+        // The PHP linter sets severities directly and never consults
+        // custom severity maps.
+        false
     }
 
     fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {
@@ -260,7 +291,40 @@ impl Linter for PuppetlintLinter {
         if data.contains(&0) {
             return Vec::new();
         }
-        lint_with_binary(path, data, binary_on_path().as_deref())
+        let binary = self.options.bin.clone().or_else(binary_on_path);
+        let Some(ref binary) = binary else {
+            return Vec::new();
+        };
+        if let Some(requirement) = &self.options.version
+            && !version_requirement_satisfied(
+                version_pattern_for("puppet-lint"),
+                binary,
+                requirement,
+                "ArcanistPuppetLintLinter",
+            )
+        {
+            return Vec::new();
+        }
+        let flags = self
+            .options
+            .command_flags(&mandatory_flags(), &default_flags(self.config.as_deref()));
+        lint_with_binary_and_flags(path, data, Some(binary), &flags)
+    }
+
+    fn set_option(
+        &mut self,
+        key: &str,
+        value: &serde_json::Value,
+        ctx: &OptionContext,
+    ) -> Result<(), String> {
+        if key == "puppet-lint.config" {
+            let Some(config) = value.as_str() else {
+                return Err("'puppet-lint.config' must be a string".to_string());
+            };
+            self.config = Some(config.to_string());
+            return Ok(());
+        }
+        apply_tool_option(&mut self.options, key, value, ctx.project_root)
     }
 }
 

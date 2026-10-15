@@ -15,12 +15,15 @@
 //! (the PHP linter uses the base-class default severity); the column
 //! is always 1 since the tool reports none.
 //!
-//! Out of scope (the Rust engine has no per-linter config plumbing):
-//! custom binaries, extra flags, and version requirements.
+//! The `bin`, `flags`, and `version` linter options apply (N4).
 
 extern crate self as arc_rs;
 
-use arc_rs::lint::{LintMessage, Linter};
+use arc_rs::arclint::SeverityOverrides;
+use arc_rs::lint::{LintMessage, Linter, OptionContext};
+use arc_rs::lint_external::{ToolOptions, apply_tool_option, version_requirement_satisfied};
+use arc_rs::linters::version_pattern_for;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -33,6 +36,16 @@ const SEVERITY_ERROR: &str = "error";
 #[must_use]
 pub fn mandatory_flags() -> Vec<&'static str> {
     vec!["-w", "-c"]
+}
+
+/// Default flags, mirroring `getDefaultFlags()`: none.
+fn default_flags() -> Vec<String> {
+    Vec::new()
+}
+
+/// Mandatory flags as owned strings for flag composition.
+fn mandatory_flag_strings() -> Vec<String> {
+    mandatory_flags().into_iter().map(str::to_string).collect()
 }
 
 /// True for paths this linter applies to: Ruby files.
@@ -53,13 +66,16 @@ pub fn is_supported_path(path: &str) -> bool {
 
 /// Ruby syntax linter (external `ruby -w -c` wrapper).
 #[derive(Debug, Default)]
-pub struct RubyLinter;
+pub struct RubyLinter {
+    options: ToolOptions,
+    severity: SeverityOverrides,
+}
 
 impl RubyLinter {
     /// Create the linter.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -72,14 +88,71 @@ impl Linter for RubyLinter {
         if !is_supported_path(path) || data.contains(&0) {
             return Vec::new();
         }
-        let tool = binary_on_path(BINARY);
-        lint_with_binary(path, data, tool.as_deref())
+        let tool = self.options.bin.clone().or_else(|| binary_on_path(BINARY));
+        let Some(ref tool) = tool else {
+            return Vec::new();
+        };
+        if let Some(requirement) = &self.options.version
+            && !version_requirement_satisfied(
+                version_pattern_for("ruby"),
+                tool,
+                requirement,
+                "ArcanistRubyLinter",
+            )
+        {
+            return Vec::new();
+        }
+        let flags = self
+            .options
+            .command_flags(&mandatory_flag_strings(), &default_flags());
+        lint_with_binary_and_flags(path, data, Some(tool), &flags, &self.severity)
+    }
+
+    fn set_option(
+        &mut self,
+        key: &str,
+        value: &serde_json::Value,
+        ctx: &OptionContext,
+    ) -> Result<(), String> {
+        apply_tool_option(&mut self.options, key, value, ctx.project_root)
+    }
+
+    fn applies_custom_severities(&self) -> bool {
+        // The PHP linter looks severities up by the message head (text
+        // before the first comma), not the message code, so overrides
+        // apply internally during parsing instead of in the engine.
+        false
+    }
+
+    fn set_custom_severity_map(&mut self, map: &HashMap<String, String>) {
+        self.severity.map.clone_from(map);
+    }
+
+    fn set_custom_severity_rules(&mut self, rules: &[(String, String)]) {
+        self.severity.rules = rules.to_vec();
     }
 }
 
 /// Lint with an explicit tool binary (test seam mirroring bundle E);
 /// `None` means the tool is not installed and reports nothing.
 pub fn lint_with_binary(path: &str, data: &[u8], binary: Option<&Path>) -> Vec<LintMessage> {
+    lint_with_binary_and_flags(
+        path,
+        data,
+        binary,
+        &mandatory_flag_strings(),
+        &SeverityOverrides::default(),
+    )
+}
+
+/// Linter body with explicit flags (configured flags replace defaults).
+fn lint_with_binary_and_flags(
+    path: &str,
+    data: &[u8],
+    binary: Option<&Path>,
+    flags: &[String],
+    overrides: &SeverityOverrides,
+) -> Vec<LintMessage> {
     let Some(tool) = binary else {
         // Inactive when the tool is not installed, mirroring PHP.
         return Vec::new();
@@ -89,13 +162,13 @@ pub fn lint_with_binary(path: &str, data: &[u8], binary: Option<&Path>) -> Vec<L
     };
     let mut command = Command::new(tool);
     command
-        .args(mandatory_flags())
+        .args(flags)
         .arg(&scratch.file)
         .current_dir(&scratch.cwd);
     let output = arc_rs::lint::spawn_with_retry(&mut command);
     let mut messages = Vec::new();
     if let Ok(output) = output {
-        messages = parse_output(path, &String::from_utf8_lossy(&output.stderr));
+        messages = parse_output_with(path, &String::from_utf8_lossy(&output.stderr), overrides);
     }
     scratch.cleanup();
     messages
@@ -105,10 +178,22 @@ pub fn lint_with_binary(path: &str, data: &[u8], binary: Option<&Path>) -> Vec<L
 /// `parseLinterOutput()`. Unparseable lines are skipped.
 #[must_use]
 pub fn parse_output(path: &str, stderr: &str) -> Vec<LintMessage> {
+    parse_output_with(path, stderr, &SeverityOverrides::default())
+}
+
+/// Parse with custom severity overrides applied by message head (text
+/// before the first comma), like PHP
+/// `getLintMessageSeverity(head(explode(',', $message)))`.
+#[must_use]
+pub fn parse_output_with(
+    path: &str,
+    stderr: &str,
+    overrides: &SeverityOverrides,
+) -> Vec<LintMessage> {
     let mut out = Vec::new();
     for raw in stderr.split('\n') {
         let line = raw.strip_suffix('\r').unwrap_or(raw);
-        if let Some(message) = parse_line(path, line) {
+        if let Some(message) = parse_line(path, line, overrides) {
             out.push(message);
         }
     }
@@ -117,25 +202,31 @@ pub fn parse_output(path: &str, stderr: &str) -> Vec<LintMessage> {
 
 /// Try each `:` left to right (the PHP regex is unanchored with a lazy
 /// path group, so the leftmost viable split wins).
-fn parse_line(path: &str, line: &str) -> Option<LintMessage> {
+fn parse_line(path: &str, line: &str, overrides: &SeverityOverrides) -> Option<LintMessage> {
     for (index, _) in line.char_indices().filter(|(_, c)| *c == ':') {
-        if let Some(message) = parse_at(path, line, index) {
+        if let Some(message) = parse_at(path, line, index, overrides) {
             return Some(message);
         }
     }
     None
 }
 
-fn parse_at(path: &str, line: &str, colon: usize) -> Option<LintMessage> {
+fn parse_at(
+    path: &str,
+    line: &str,
+    colon: usize,
+    overrides: &SeverityOverrides,
+) -> Option<LintMessage> {
     let after_path = line.get(colon + 1..)?;
     let (line_no, rest) = take_digits(after_path)?;
     let description = rest.strip_prefix(": ")?.trim().to_string();
+    let head = description.split(',').next().unwrap_or(&description);
     Some(LintMessage {
         path: path.to_string(),
         line: line_no,
         col: 1,
         code: "RUBY".to_string(),
-        severity: SEVERITY_ERROR.to_string(),
+        severity: overrides.severity_for(head, SEVERITY_ERROR),
         name: "Syntax Error".to_string(),
         description,
         original: None,

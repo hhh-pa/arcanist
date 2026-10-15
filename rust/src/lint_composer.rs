@@ -41,6 +41,10 @@ impl Linter for ComposerLinter {
         "COMPOSER"
     }
 
+    fn severity_lookup_code<'a>(&self, full_code: &'a str) -> &'a str {
+        full_code.strip_prefix("COMPOSER").unwrap_or(full_code)
+    }
+
     fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {
         if !is_composer_json(path) || data.contains(&0) {
             return Vec::new();

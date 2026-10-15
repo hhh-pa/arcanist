@@ -134,3 +134,55 @@ fn loads_dictionary_file_from_disk() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn dictionaries_option_loads_files_from_project_root() {
+    let dir = std::env::temp_dir().join(format!("arc-rs-spelling-opt-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("custom.json"),
+        r#"{"rules": {"exact": {"teh": "the"}}}"#,
+    )
+    .unwrap();
+    let ctx = OptionContext { project_root: &dir };
+    let mut linter = SpellingLinter::empty();
+    linter
+        .set_option(
+            "spelling.dictionaries",
+            &serde_json::json!(["custom.json"]),
+            &ctx,
+        )
+        .unwrap();
+    assert_eq!(linter.rule_counts(), (1, 0));
+    let messages = lint(&linter, "teh cat\n");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].code, "SPELL1");
+    assert!(
+        linter
+            .set_option("bogus", &serde_json::json!(1), &ctx)
+            .is_err()
+    );
+    assert!(
+        linter
+            .set_option("spelling.dictionaries", &serde_json::json!("x"), &ctx)
+            .is_err()
+    );
+    assert!(
+        linter
+            .set_option(
+                "spelling.dictionaries",
+                &serde_json::json!(["nope.json"]),
+                &ctx
+            )
+            .is_err()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn severity_lookup_strips_the_spell_prefix() {
+    let linter = SpellingLinter::new();
+    assert_eq!(linter.severity_lookup_code("SPELL1"), "1");
+    assert_eq!(linter.severity_lookup_code("SPELL"), "");
+    assert_eq!(linter.severity_lookup_code("OTHER"), "OTHER");
+}

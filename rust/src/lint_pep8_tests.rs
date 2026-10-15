@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn name_and_binary_match_php() {
     assert_eq!(Pep8Linter::new().name(), "PEP8");
-    assert_eq!(Pep8Linter.name(), "PEP8");
+    assert_eq!(Pep8Linter::new().name(), "PEP8");
     assert_eq!(BINARY, "pep8");
     assert!(mandatory_flags().is_empty());
 }
@@ -101,4 +101,31 @@ fn skips_lines_with_broken_columns() {
     assert!(parse_output("a.py", "f.py:3:5 E225 x\n").is_empty());
     assert!(parse_output("a.py", "f.py:1:1: \n").is_empty());
     assert!(parse_output("a.py", "\n").is_empty());
+}
+
+#[test]
+fn comprehensive_mode_ignores_text_covered_codes() {
+    let linter = Pep8Linter::comprehensive();
+    assert_eq!(
+        linter.options.flags,
+        Some(vec!["--ignore=E101,E501,W291,W292,W293".to_string()])
+    );
+}
+
+#[test]
+fn severity_codes_are_raw_like_php() {
+    let linter = Pep8Linter::new();
+    for code in ["E101", "W291"] {
+        assert_eq!(linter.validate_severity_code(code), Ok(code.to_string()));
+    }
+    for code in ["", "E", "C901", "N999", "[E101]", "e101"] {
+        assert_eq!(
+            linter.validate_severity_code(code),
+            Err(format!(
+                "Unrecognized lint message code \"{code}\". Expected a valid PEP8 lint code like \
+                 \"E101\" or \"W291\"."
+            )),
+            "{code:?}"
+        );
+    }
 }

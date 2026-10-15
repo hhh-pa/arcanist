@@ -10,9 +10,10 @@
 //!
 //! Only `.js` files are examined; binary data (NUL byte) is skipped.
 //! Directories and symlinks are skipped by `Engine::lint_file` before bytes
-//! reach here. Linter configuration (`jscs.config`, `jscs.preset`, custom
-//! `bin`/`flags`) is not supported. The tool lints a temp copy of the
-//! input, so config discovery relative to the source file does not apply.
+//! reach here. The `bin`, `flags`, `version`, `jscs.config`, and
+//! `jscs.preset` linter options apply (N4). The tool lints a temp copy
+//! of the input, so config discovery relative to the source file does
+//! not apply.
 
 extern crate self as arc_rs;
 
@@ -20,7 +21,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arc_rs::lint::{LintMessage, Linter};
+use arc_rs::lint::{LintMessage, Linter, OptionContext};
+use arc_rs::lint_external::{ToolOptions, apply_tool_option, version_requirement_satisfied};
+use arc_rs::linters::version_pattern_for;
 
 /// Registry name, matching PHP `getLinterName()`.
 pub const LINTER_NAME: &str = "JSCS";
@@ -37,12 +40,15 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Default)]
 pub struct JscsLinter {
     binary: Option<PathBuf>,
+    options: ToolOptions,
+    config: Option<String>,
+    preset: Option<String>,
 }
 
 impl JscsLinter {
     #[must_use]
     pub fn new() -> Self {
-        Self { binary: None }
+        Self::default()
     }
 
     /// Override the tool binary (mirrors PHP `setBinary()`); used by tests
@@ -51,6 +57,9 @@ impl JscsLinter {
     pub fn with_binary(path: &Path) -> Self {
         Self {
             binary: Some(path.to_path_buf()),
+            options: ToolOptions::default(),
+            config: None,
+            preset: None,
         }
     }
 
@@ -58,13 +67,37 @@ impl JscsLinter {
         if let Some(path) = &self.binary {
             return path.is_file().then(|| path.clone());
         }
+        if let Some(path) = &self.options.bin {
+            return Some(path.clone());
+        }
         find_on_path(BINARY)
+    }
+
+    /// Effective tool flags (without the file): mandatory plus
+    /// configured-or-default, mirroring `getCommandFlags()`.
+    fn tool_flags(&self) -> Vec<String> {
+        let mut mandatory = vec![
+            "--reporter=checkstyle".to_string(),
+            "--no-colors".to_string(),
+        ];
+        if let Some(config) = &self.config {
+            mandatory.push(format!("--config={config}"));
+        }
+        if let Some(preset) = &self.preset {
+            mandatory.push(format!("--preset={preset}"));
+        }
+        self.options.command_flags(&mandatory, &[])
     }
 }
 
 impl Linter for JscsLinter {
     fn name(&self) -> &'static str {
         LINTER_NAME
+    }
+
+    fn applies_custom_severities(&self) -> bool {
+        // The PHP linter never consults custom severity maps or rules.
+        false
     }
 
     fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {
@@ -74,14 +107,21 @@ impl Linter for JscsLinter {
         let Some(binary) = self.resolve_binary() else {
             return Vec::new();
         };
+        if let Some(requirement) = &self.options.version
+            && !version_requirement_satisfied(
+                version_pattern_for("jscs"),
+                &binary,
+                requirement,
+                "ArcanistJscsLinter",
+            )
+        {
+            return Vec::new();
+        }
         let Some(input) = write_temp_file(SLUG, path, "js", data) else {
             return Vec::new();
         };
-        let args = vec![
-            "--reporter=checkstyle".to_string(),
-            "--no-colors".to_string(),
-            input.display().to_string(),
-        ];
+        let mut args = self.tool_flags();
+        args.push(input.display().to_string());
         let found = run_tool(&binary, &args).map_or_else(Vec::new, |out| {
             match parse_checkstyle_output(path, &out.stdout) {
                 Ok(parsed) => finish(path, &out, parsed),
@@ -91,6 +131,35 @@ impl Linter for JscsLinter {
         });
         std::fs::remove_file(&input).ok();
         found
+    }
+
+    fn set_option(
+        &mut self,
+        key: &str,
+        value: &serde_json::Value,
+        ctx: &OptionContext,
+    ) -> Result<(), String> {
+        if key == "jscs.config" || key == "jscs.preset" {
+            let Some(text) = value.as_str() else {
+                return Err(format!("'{key}' must be a string"));
+            };
+            if key == "jscs.config" {
+                self.config = Some(text.to_string());
+            } else {
+                self.preset = Some(text.to_string());
+            }
+            return Ok(());
+        }
+        apply_tool_option(&mut self.options, key, value, ctx.project_root)
+    }
+
+    fn validate_severity_code(&self, _code: &str) -> Result<String, String> {
+        // Rules can't be identified from messages, like PHP.
+        Err(
+            "JSCS does not currently support custom severity levels, because rules can't be \
+             identified from messages in output."
+                .to_string(),
+        )
     }
 }
 

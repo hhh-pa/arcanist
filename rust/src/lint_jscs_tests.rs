@@ -61,3 +61,16 @@ fn missing_binary_is_silent() {
 fn lookup_miss_reports_no_tool() {
     assert!(find_on_path("arc-rs-definitely-missing-tool").is_none());
 }
+
+#[test]
+fn custom_severities_are_rejected_like_php() {
+    let linter = JscsLinter::new();
+    assert_eq!(
+        linter.validate_severity_code("JSCS"),
+        Err(
+            "JSCS does not currently support custom severity levels, because rules can't be \
+             identified from messages in output."
+                .to_string()
+        )
+    );
+}

@@ -104,7 +104,7 @@ fn lint_message_shape() {
     assert_eq!(found[0].path, "f.xml");
     assert_eq!(found[0].code, "XML1");
     assert_eq!(found[0].severity, "error");
-    assert_eq!(found[0].name, "XML Error");
+    assert_eq!(found[0].name, "LibXML Error");
     assert!(found[0].description.contains("unclosed"));
 }
 

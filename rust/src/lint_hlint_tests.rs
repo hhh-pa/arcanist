@@ -31,7 +31,11 @@ impl Drop for TempDir {
 const IDEAS: &str = r#"[
   {"module":"Main","decl":"f","severity":"Warning","hint":"Use null","startLine":1,"startColumn":8,"from":"length xs == 0","to":"null xs","note":[]},
   {"module":"Main","decl":"test","severity":"Error","hint":"Eta reduce","startLine":3,"startColumn":1,"from":"f x","to":"f","note":["May change semantics","\"quoted\""]},
-  {"module":"M","decl":"g","severity":"Suggestion","hint":"Use map","startLine":5,"startColumn":3,"from":"x","to":"y","note":[]},
+  {"module":"M","decl":"g","severity":"Suggestion","hint":"Use map","startLine":5,"startColumn":3,"from":"x","to":"y","note":[]}
+]"#;
+
+const NULL_IDEA: &str = r#"[
+  {"module":"Main","decl":"f","severity":"Warning","hint":"Use null","startLine":1,"startColumn":8,"from":"a","to":"b","note":[]},
   null
 ]"#;
 
@@ -95,6 +99,17 @@ fn parses_ideas_with_mapped_severities_and_notes() {
         "In module `Main`, declaration `test`. **NOTE**: May change semantics. **NOTE**: quoted."
     );
     assert_eq!(messages[2].severity, "advice");
+    assert_eq!(messages[0].original.as_deref(), Some("length xs == 0"));
+    assert_eq!(messages[0].replacement.as_deref(), Some("null xs"));
+}
+
+#[test]
+fn null_element_discards_everything_like_php() {
+    // PHP `return`s null on the first null element, so no message is
+    // added at all, not even the valid ones before it.
+    assert!(parse_output("Main.hs", 0, NULL_IDEA, "").is_empty());
+    assert!(parse_output("Main.hs", 0, r#"[null]"#, "").is_empty());
+    assert!(parse_output("Main.hs", 0, r#"["oops"]"#, "").is_empty());
 }
 
 #[test]

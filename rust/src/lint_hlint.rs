@@ -10,17 +10,19 @@
 //! `Warning` to `warning`, and anything else to `advice`, mirroring
 //! `parseLinterOutput()`.
 //!
-//! Known limits (see T1128): the `bin`, `flags`, and `version` linter
-//! options are not supported; invalid JSON yields no messages (the PHP
-//! linter raises, but the [`Linter`](arc_rs::lint::Linter) trait has no
-//! error channel); null array elements are skipped.
+//! The `bin`, `flags`, and `version` linter options apply (N4).
+//! Invalid JSON yields no messages (the PHP linter raises, but the
+//! [`Linter`](arc_rs::lint::Linter) trait has no error channel); null
+//! array elements are skipped.
 
 extern crate self as arc_rs;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use arc_rs::lint::{LintMessage, Linter, SEVERITY_ERROR};
+use arc_rs::lint::{LintMessage, Linter, OptionContext, SEVERITY_ERROR};
+use arc_rs::lint_external::{ToolOptions, apply_tool_option, version_requirement_satisfied};
+use arc_rs::linters::version_pattern_for;
 
 /// Companion severities mirroring `ArcanistLintSeverity`; `lint.rs` only
 /// defines the severities the text linter uses.
@@ -29,12 +31,14 @@ const SEVERITY_ADVICE: &str = "advice";
 
 /// HLint linter: Haskell suggestions via an external binary.
 #[derive(Debug, Default)]
-pub struct HlintLinter;
+pub struct HlintLinter {
+    options: ToolOptions,
+}
 
 impl HlintLinter {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -44,10 +48,22 @@ pub fn binary_name() -> &'static str {
     "hlint"
 }
 
+/// Mandatory flags, mirroring `getMandatoryFlags()`.
+fn mandatory_flags() -> Vec<String> {
+    vec!["--json".to_string()]
+}
+
+/// Default flags, mirroring `getDefaultFlags()`: none.
+fn default_flags() -> Vec<String> {
+    Vec::new()
+}
+
 /// Exact tool argv flags, mirroring `getMandatoryFlags()`.
 #[must_use]
 pub fn command_flags() -> Vec<String> {
-    vec!["--json".to_string()]
+    let mut flags = mandatory_flags();
+    flags.extend(default_flags());
+    flags
 }
 
 fn is_supported(path: &str) -> bool {
@@ -150,9 +166,9 @@ fn staged_name(display_path: &str) -> String {
     }
 }
 
-fn run_tool(binary: &Path, file: &Path) -> Option<(i32, String, String)> {
+fn run_tool(binary: &Path, file: &Path, flags: &[String]) -> Option<(i32, String, String)> {
     let mut command = Command::new(binary);
-    command.args(command_flags()).arg(file).stdin(Stdio::null());
+    command.args(flags).arg(file).stdin(Stdio::null());
     let output = arc_rs::lint::spawn_with_retry(&mut command).ok()?;
     let code = output.status.code().unwrap_or(1);
     Some((
@@ -165,13 +181,23 @@ fn run_tool(binary: &Path, file: &Path) -> Option<(i32, String, String)> {
 /// Linter body with an explicit tool path (mirrors the PHP `bin` option).
 /// `None` (tool absent) reports no messages.
 pub fn lint_with_binary(path: &str, data: &[u8], binary: Option<&Path>) -> Vec<LintMessage> {
+    lint_with_binary_and_flags(path, data, binary, &command_flags())
+}
+
+/// Linter body with explicit flags (configured flags replace defaults).
+fn lint_with_binary_and_flags(
+    path: &str,
+    data: &[u8],
+    binary: Option<&Path>,
+    flags: &[String],
+) -> Vec<LintMessage> {
     let Some(binary) = binary else {
         return Vec::new();
     };
     let Ok(staged) = StagedFile::stage(path, data) else {
         return Vec::new();
     };
-    let Some((code, stdout, stderr)) = run_tool(binary, staged.path()) else {
+    let Some((code, stdout, stderr)) = run_tool(binary, staged.path(), flags) else {
         return Vec::new();
     };
     parse_output(path, code, &stdout, &stderr)
@@ -187,6 +213,12 @@ pub fn parse_output(path: &str, _exit_code: i32, stdout: &str, _stderr: &str) ->
     };
     let mut out = Vec::new();
     for idea in &ideas {
+        if !idea.is_object() {
+            // PHP `return`s (null) on the first null element, which the
+            // caller treats as no messages at all; a non-object element
+            // fatals the same way. Either discards everything so far.
+            return Vec::new();
+        }
         let Some(message) = parse_idea(path, idea) else {
             continue;
         };
@@ -228,8 +260,14 @@ fn parse_idea(path: &str, idea: &serde_json::Value) -> Option<LintMessage> {
         severity: severity.to_string(),
         name: hint.to_string(),
         description,
-        original: None,
-        replacement: None,
+        original: idea
+            .get("from")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        replacement: idea
+            .get("to")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -257,6 +295,12 @@ impl Linter for HlintLinter {
         "HLINT"
     }
 
+    fn applies_custom_severities(&self) -> bool {
+        // The PHP linter sets severities directly and never consults
+        // custom severity maps.
+        false
+    }
+
     fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {
         if !is_supported(path) {
             return Vec::new();
@@ -264,7 +308,33 @@ impl Linter for HlintLinter {
         if data.contains(&0) {
             return Vec::new();
         }
-        lint_with_binary(path, data, binary_on_path().as_deref())
+        let binary = self.options.bin.clone().or_else(binary_on_path);
+        let Some(ref binary) = binary else {
+            return Vec::new();
+        };
+        if let Some(requirement) = &self.options.version
+            && !version_requirement_satisfied(
+                version_pattern_for("hlint"),
+                binary,
+                requirement,
+                "ArcanistHLintLinter",
+            )
+        {
+            return Vec::new();
+        }
+        let flags = self
+            .options
+            .command_flags(&mandatory_flags(), &default_flags());
+        lint_with_binary_and_flags(path, data, Some(binary), &flags)
+    }
+
+    fn set_option(
+        &mut self,
+        key: &str,
+        value: &serde_json::Value,
+        ctx: &OptionContext,
+    ) -> Result<(), String> {
+        apply_tool_option(&mut self.options, key, value, ctx.project_root)
     }
 }
 

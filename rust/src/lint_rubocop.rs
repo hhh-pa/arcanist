@@ -17,13 +17,16 @@
 //! path (the tool only ever sees the scratch file). Invalid JSON or
 //! malformed offenses yield no messages.
 //!
-//! Out of scope (the Rust engine has no per-linter config plumbing):
-//! the `rubocop.config` option, custom binaries, extra flags, and
-//! version requirements.
+//! The `bin`, `flags`, `version`, and `rubocop.config` linter options
+//! apply (N4).
 
 extern crate self as arc_rs;
 
-use arc_rs::lint::{LintMessage, Linter};
+use arc_rs::arclint::SeverityOverrides;
+use arc_rs::lint::{LintMessage, Linter, OptionContext};
+use arc_rs::lint_external::{ToolOptions, apply_tool_option, version_requirement_satisfied};
+use arc_rs::linters::version_pattern_for;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -38,6 +41,21 @@ const SEVERITY_ADVICE: &str = "advice";
 #[must_use]
 pub fn mandatory_flags() -> Vec<&'static str> {
     vec!["--format=json"]
+}
+
+/// Default flags, mirroring `getDefaultFlags()`: none.
+fn default_flags() -> Vec<String> {
+    Vec::new()
+}
+
+/// Mandatory flags as owned strings for flag composition, plus
+/// `--config=` when a config file is configured.
+fn mandatory_flag_strings(config: Option<&str>) -> Vec<String> {
+    let mut flags: Vec<String> = mandatory_flags().into_iter().map(str::to_string).collect();
+    if let Some(config) = config {
+        flags.push(format!("--config={config}"));
+    }
+    flags
 }
 
 /// True for paths this linter applies to: Ruby files.
@@ -58,13 +76,17 @@ pub fn is_supported_path(path: &str) -> bool {
 
 /// Ruby static code analyzer (external `rubocop` wrapper).
 #[derive(Debug, Default)]
-pub struct RuboCopLinter;
+pub struct RuboCopLinter {
+    options: ToolOptions,
+    config: Option<String>,
+    severity: SeverityOverrides,
+}
 
 impl RuboCopLinter {
     /// Create the linter.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -77,14 +99,79 @@ impl Linter for RuboCopLinter {
         if !is_supported_path(path) || data.contains(&0) {
             return Vec::new();
         }
-        let tool = binary_on_path(BINARY);
-        lint_with_binary(path, data, tool.as_deref())
+        let tool = self.options.bin.clone().or_else(|| binary_on_path(BINARY));
+        let Some(ref tool) = tool else {
+            return Vec::new();
+        };
+        if let Some(requirement) = &self.options.version
+            && !version_requirement_satisfied(
+                version_pattern_for("rubocop"),
+                tool,
+                requirement,
+                "ArcanistRuboCopLinter",
+            )
+        {
+            return Vec::new();
+        }
+        let flags = self.options.command_flags(
+            &mandatory_flag_strings(self.config.as_deref()),
+            &default_flags(),
+        );
+        lint_with_binary_and_flags(path, data, Some(tool), &flags, &self.severity)
+    }
+
+    fn applies_custom_severities(&self) -> bool {
+        // The PHP linter looks severities up by the offense severity
+        // word, not the message code, so overrides apply internally
+        // during parsing instead of in the engine.
+        false
+    }
+
+    fn set_custom_severity_map(&mut self, map: &HashMap<String, String>) {
+        self.severity.map.clone_from(map);
+    }
+
+    fn set_custom_severity_rules(&mut self, rules: &[(String, String)]) {
+        self.severity.rules = rules.to_vec();
+    }
+
+    fn set_option(
+        &mut self,
+        key: &str,
+        value: &serde_json::Value,
+        ctx: &OptionContext,
+    ) -> Result<(), String> {
+        if key == "rubocop.config" {
+            let Some(config) = value.as_str() else {
+                return Err("'rubocop.config' must be a string".to_string());
+            };
+            self.config = Some(config.to_string());
+            return Ok(());
+        }
+        apply_tool_option(&mut self.options, key, value, ctx.project_root)
     }
 }
 
 /// Lint with an explicit tool binary (test seam mirroring bundle E);
 /// `None` means the tool is not installed and reports nothing.
 pub fn lint_with_binary(path: &str, data: &[u8], binary: Option<&Path>) -> Vec<LintMessage> {
+    lint_with_binary_and_flags(
+        path,
+        data,
+        binary,
+        &mandatory_flag_strings(None),
+        &SeverityOverrides::default(),
+    )
+}
+
+/// Linter body with explicit flags (configured flags replace defaults).
+fn lint_with_binary_and_flags(
+    path: &str,
+    data: &[u8],
+    binary: Option<&Path>,
+    flags: &[String],
+    overrides: &SeverityOverrides,
+) -> Vec<LintMessage> {
     let Some(tool) = binary else {
         // Inactive when the tool is not installed, mirroring PHP.
         return Vec::new();
@@ -94,13 +181,13 @@ pub fn lint_with_binary(path: &str, data: &[u8], binary: Option<&Path>) -> Vec<L
     };
     let mut command = Command::new(tool);
     command
-        .args(mandatory_flags())
+        .args(flags)
         .arg(&scratch.file)
         .current_dir(&scratch.cwd);
     let output = arc_rs::lint::spawn_with_retry(&mut command);
     let mut messages = Vec::new();
     if let Ok(output) = output {
-        messages = parse_output(path, &String::from_utf8_lossy(&output.stdout));
+        messages = parse_output_with(path, &String::from_utf8_lossy(&output.stdout), overrides);
     }
     scratch.cleanup();
     messages
@@ -111,6 +198,17 @@ pub fn lint_with_binary(path: &str, data: &[u8], binary: Option<&Path>) -> Vec<L
 /// messages; malformed offenses are skipped.
 #[must_use]
 pub fn parse_output(path: &str, stdout: &str) -> Vec<LintMessage> {
+    parse_output_with(path, stdout, &SeverityOverrides::default())
+}
+
+/// Parse with custom severity overrides applied by offense severity
+/// word, like PHP `getLintMessageSeverity($offense['severity'])`.
+#[must_use]
+pub fn parse_output_with(
+    path: &str,
+    stdout: &str,
+    overrides: &SeverityOverrides,
+) -> Vec<LintMessage> {
     let mut out = Vec::new();
     let Ok(json) = serde_json::from_str::<serde_json::Value>(stdout) else {
         return Vec::new();
@@ -123,7 +221,7 @@ pub fn parse_output(path: &str, stdout: &str) -> Vec<LintMessage> {
             continue;
         };
         for offense in offenses {
-            if let Some(message) = parse_offense(path, offense) {
+            if let Some(message) = parse_offense(path, offense, overrides) {
                 out.push(message);
             }
         }
@@ -131,7 +229,11 @@ pub fn parse_output(path: &str, stdout: &str) -> Vec<LintMessage> {
     out
 }
 
-fn parse_offense(path: &str, offense: &serde_json::Value) -> Option<LintMessage> {
+fn parse_offense(
+    path: &str,
+    offense: &serde_json::Value,
+    overrides: &SeverityOverrides,
+) -> Option<LintMessage> {
     let description = offense.get("message")?.as_str()?.to_string();
     let location = offense.get("location")?;
     let line = location.get("line")?.as_u64()? as usize;
@@ -143,7 +245,7 @@ fn parse_offense(path: &str, offense: &serde_json::Value) -> Option<LintMessage>
         line,
         col,
         code: code.to_string(),
-        severity: severity_for(severity_word).to_string(),
+        severity: overrides.severity_for(severity_word, severity_for(severity_word)),
         name: "RuboCop".to_string(),
         description,
         original: None,

@@ -5,21 +5,20 @@
 //! Runs `lessc --lint --no-color --strict-math=off --strict-units=off
 //! <file>` when `lessc` is on `PATH` and parses stderr lines shaped
 //! `Name: description in path on line L, column C:`. Every finding is an
-//! error with code `LESSC<Name>` and the mapped human name (`Runtime
-//! Error`, `Argument Error`, `File Error`, `Name Error`, `Operation
-//! Error`, `Parse Error`, `Syntax Error`). When the binary is absent the
-//! linter is inactive and reports nothing.
+//! error with code `LESSC<Name>` and name `Unknown lint message!` (the
+//! PHP name-map miss). When the binary is absent the linter is inactive
+//! and reports nothing.
 //!
 //! Only `.less` files are examined; binary data (NUL byte) is skipped.
 //! Directories and symlinks are skipped by `Engine::lint_file` before bytes
-//! reach here. Linter configuration (`lessc.strict-math`,
-//! `lessc.strict-units`, custom `bin`/`flags`) is not supported; strict
-//! modes default to `off` like the PHP. The tool lints a temp copy of the
-//! input, so config discovery relative to the source file does not apply.
+//! reach here. The `bin`, `flags`, `version`, `lessc.strict-math`, and
+//! `lessc.strict-units` linter options apply (N4); strict modes default
+//! to `off` like the PHP. The tool lints a temp copy of the input, so
+//! config discovery relative to the source file does not apply.
 //!
-//! Divergence: the PHP looks up the message name with the string error
-//! name against an integer-keyed map, so it always reports `Unknown lint
-//! message!`; this port uses the intended names from the PHP name map.
+//! Quirk preserved: the PHP looks up the message name with the string
+//! error name against an integer-keyed map, so every finding reports
+//! `Unknown lint message!`.
 
 extern crate self as arc_rs;
 
@@ -27,7 +26,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arc_rs::lint::{LintMessage, Linter};
+use arc_rs::lint::{LintMessage, Linter, OptionContext};
+use arc_rs::lint_external::{ToolOptions, apply_tool_option, version_requirement_satisfied};
+use arc_rs::linters::version_pattern_for;
 
 /// Registry name, matching PHP `getLinterName()`.
 pub const LINTER_NAME: &str = "LESSC";
@@ -44,12 +45,15 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Default)]
 pub struct LesscLinter {
     binary: Option<PathBuf>,
+    options: ToolOptions,
+    strict_math: bool,
+    strict_units: bool,
 }
 
 impl LesscLinter {
     #[must_use]
     pub fn new() -> Self {
-        Self { binary: None }
+        Self::default()
     }
 
     /// Override the tool binary (mirrors PHP `setBinary()`); used by tests
@@ -58,6 +62,9 @@ impl LesscLinter {
     pub fn with_binary(path: &Path) -> Self {
         Self {
             binary: Some(path.to_path_buf()),
+            options: ToolOptions::default(),
+            strict_math: false,
+            strict_units: false,
         }
     }
 
@@ -65,13 +72,35 @@ impl LesscLinter {
         if let Some(path) = &self.binary {
             return path.is_file().then(|| path.clone());
         }
+        if let Some(path) = &self.options.bin {
+            return Some(path.clone());
+        }
         find_on_path(BINARY)
+    }
+
+    /// Effective tool flags (without the file): mandatory plus
+    /// configured-or-default, mirroring `getCommandFlags()`.
+    fn tool_flags(&self) -> Vec<String> {
+        let on_off = |on: bool| if on { "on" } else { "off" };
+        let mandatory = vec![
+            "--lint".to_string(),
+            "--no-color".to_string(),
+            format!("--strict-math={}", on_off(self.strict_math)),
+            format!("--strict-units={}", on_off(self.strict_units)),
+        ];
+        self.options.command_flags(&mandatory, &[])
     }
 }
 
 impl Linter for LesscLinter {
     fn name(&self) -> &'static str {
         LINTER_NAME
+    }
+
+    fn severity_lookup_code<'a>(&self, full_code: &'a str) -> &'a str {
+        // PHP looks severities up by the string error name (the code
+        // with the `LESSC` prefix stripped).
+        full_code.strip_prefix(LINTER_NAME).unwrap_or(full_code)
     }
 
     fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {
@@ -81,16 +110,21 @@ impl Linter for LesscLinter {
         let Some(binary) = self.resolve_binary() else {
             return Vec::new();
         };
+        if let Some(requirement) = &self.options.version
+            && !version_requirement_satisfied(
+                version_pattern_for("lessc"),
+                &binary,
+                requirement,
+                "ArcanistLesscLinter",
+            )
+        {
+            return Vec::new();
+        }
         let Some(input) = write_temp_file(SLUG, path, "less", data) else {
             return Vec::new();
         };
-        let args = vec![
-            "--lint".to_string(),
-            "--no-color".to_string(),
-            "--strict-math=off".to_string(),
-            "--strict-units=off".to_string(),
-            input.display().to_string(),
-        ];
+        let mut args = self.tool_flags();
+        args.push(input.display().to_string());
         let found = run_tool(&binary, &args).map_or_else(Vec::new, |out| {
             let parsed = parse_lint_output(path, &out.stderr);
             finish(path, &out, parsed)
@@ -98,37 +132,63 @@ impl Linter for LesscLinter {
         std::fs::remove_file(&input).ok();
         found
     }
+
+    fn set_option(
+        &mut self,
+        key: &str,
+        value: &serde_json::Value,
+        ctx: &OptionContext,
+    ) -> Result<(), String> {
+        if key == "lessc.strict-math" || key == "lessc.strict-units" {
+            let Some(on) = value.as_bool() else {
+                return Err(format!("'{key}' must be a boolean"));
+            };
+            if key == "lessc.strict-math" {
+                self.strict_math = on;
+            } else {
+                self.strict_units = on;
+            }
+            return Ok(());
+        }
+        apply_tool_option(&mut self.options, key, value, ctx.project_root)
+    }
 }
+
+/// PHP's `getLintMessageName()` fallback: the lessc name map is keyed by
+/// integer codes but looked up with the string error name, so every
+/// finding reports this name.
+const NAME_UNKNOWN: &str = "Unknown lint message!";
 
 /// Parse `lessc --lint` stderr into lint messages. Lines that do not match
 /// `Name: description in path on line L, column C:` are skipped, like the
-/// PHP. A matching line with an unrecognized error name becomes one error
-/// message (the PHP throws on those).
+/// PHP. A matching line with an unrecognized error name aborts the whole
+/// parse with a single failure message (the PHP throws on those,
+/// discarding every finding).
 pub fn parse_lint_output(path: &str, stderr: &str) -> Vec<LintMessage> {
     let mut messages = Vec::new();
     for line in stderr.lines() {
         let Some((name, description, line_no, col_no)) = parse_lint_line(line) else {
             continue;
         };
-        match lessc_name(&name) {
-            Some(human) => messages.push(LintMessage {
-                path: path.to_string(),
-                line: line_no,
-                col: col_no,
-                code: format!("{LINTER_NAME}{name}"),
-                severity: arc_rs::lint::SEVERITY_ERROR.to_string(),
-                name: human.to_string(),
-                description: ucfirst(&description),
-                original: None,
-                replacement: None,
-            }),
-            None => messages.push(failure_message(
+        if !is_known_error(&name) {
+            return vec![failure_message(
                 path,
                 &format!("Unrecognized lessc error {name:?}."),
                 line_no,
                 col_no,
-            )),
+            )];
         }
+        messages.push(LintMessage {
+            path: path.to_string(),
+            line: line_no,
+            col: col_no,
+            code: format!("{LINTER_NAME}{name}"),
+            severity: arc_rs::lint::SEVERITY_ERROR.to_string(),
+            name: NAME_UNKNOWN.to_string(),
+            description: ucfirst(&description),
+            original: None,
+            replacement: None,
+        });
     }
     messages
 }
@@ -156,18 +216,19 @@ fn parse_lint_line(line: &str) -> Option<(String, String, usize, usize)> {
     Some((name.to_string(), description.to_string(), line_no, col_no))
 }
 
-/// Human names from the PHP `getLintNameMap()`.
-fn lessc_name(name: &str) -> Option<&'static str> {
-    match name {
-        "RuntimeError" => Some("Runtime Error"),
-        "ArgumentError" => Some("Argument Error"),
-        "FileError" => Some("File Error"),
-        "NameError" => Some("Name Error"),
-        "OperationError" => Some("Operation Error"),
-        "ParseError" => Some("Parse Error"),
-        "SyntaxError" => Some("Syntax Error"),
-        _ => None,
-    }
+/// Error names from the PHP `switch ($matches['name'])`; anything else
+/// makes the PHP throw `Unrecognized lint message code`.
+fn is_known_error(name: &str) -> bool {
+    matches!(
+        name,
+        "RuntimeError"
+            | "ArgumentError"
+            | "FileError"
+            | "NameError"
+            | "OperationError"
+            | "ParseError"
+            | "SyntaxError"
+    )
 }
 
 fn parse_digits(text: &str) -> Option<usize> {
@@ -177,12 +238,15 @@ fn parse_digits(text: &str) -> Option<usize> {
     text.parse::<usize>().ok()
 }
 
+/// Uppercase a leading ASCII lowercase byte, mirroring PHP `ucfirst()`
+/// (byte-based: non-ASCII initials pass through unchanged).
 fn ucfirst(text: &str) -> String {
-    let mut chars = text.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
+    let mut bytes = text.as_bytes().to_vec();
+    if let Some(first) = bytes.first_mut() {
+        first.make_ascii_uppercase();
     }
+    // ASCII case mapping preserves UTF-8 validity.
+    String::from_utf8(bytes).unwrap_or_else(|_| text.to_string())
 }
 
 fn should_lint(path: &str) -> bool {

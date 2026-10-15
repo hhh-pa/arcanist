@@ -4,31 +4,35 @@
 //!
 //! Scope: the named-group to message semantics are ported exactly
 //! ([`parse_output_with`]): `message`/`name`/`code`/`file` defaults,
-//! the severity mapping, `line`/`char`/`offset` handling, and the
-//! `ignore`/`stop`/`halt`/`throw` control groups. Configuration (the script
-//! command and the output parser) is constructor-provided; the default
-//! linter is unconfigured and stays silent until engine config plumbing
-//! lands.
+//! the severity mapping, `line`/`char`/`offset` handling, the
+//! `original`/`replacement` groups, and the
+//! `ignore`/`stop`/`halt`/`throw` control groups. The
+//! `script-and-regex.script` and `script-and-regex.regex` options apply
+//! (N4/N8); the script runs from the project root with the linted path
+//! appended, and stdout is matched with the N1 PCRE shim
+//! ([`parse_pcre_output`]). A custom [`OutputParser`] matcher remains
+//! available to direct callers.
 //!
 //! Out of scope / divergences:
 //!
-//! - PCRE matching itself is the caller's job ([`OutputParser`]): the
-//!   dependency set has no regex engine, so callers port their
-//!   `script-and-regex.regex` to a matcher function returning
-//!   [`ScriptRegexMatch`] values.
-//! - `halt` (stop every linter on this file) behaves like `stop` (stop this
-//!   linter on this file): `lint_bytes` has no engine handle.
-//! - Script failures, a missing script binary, and `throw` matches make
-//!   `lint_bytes` return no messages (PHP raises); the fallible
-//!   [`parse_output_with`] surfaces `throw`, and [`run_script_for_path`] is
-//!   available to direct callers.
-//! - `original`/`replacement` groups are dropped ([`LintMessage`] has no
-//!   such fields). Whole-file messages use line/column 1 (the Rust message
-//!   has no null line).
+//! - Script failures and `throw` matches make `lint_bytes` return no
+//!   messages (PHP raises); the fallible [`parse_output_with`] surfaces
+//!   `throw`, and [`run_script_for_path`] is available to direct callers.
+//! - Whole-file messages use line/column 1 (the Rust message has no null
+//!   line); negative captures clamp to 1 for the same reason.
+//! - `offset` always resolves against the linted bytes, even when a `file`
+//!   group names another file (PHP reads that file's data).
+//! - Custom `severity` maps are accepted but ignored, like PHP (the PHP
+//!   linter never consults them, despite what its `code` docs suggest).
 
 extern crate self as arc_rs;
 
-use arc_rs::lint::{LintMessage, Linter, SEVERITY_AUTOFIX, SEVERITY_ERROR};
+use std::cell::Cell;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+use arc_rs::arclint::compile_pcre;
+use arc_rs::lint::{LintMessage, Linter, OptionContext, SEVERITY_AUTOFIX, SEVERITY_ERROR};
 
 /// Default message code (the PHP linter name) when no `code` group matches.
 pub const CODE_DEFAULT: &str = "S&RX";
@@ -45,9 +49,10 @@ pub const SEVERITY_DISABLED: &str = "disabled";
 
 /// Named groups captured from one script-output match.
 ///
-/// Each field mirrors a `(?P<name>...)` group from the PHP docs. `None` (or
-/// an empty string) means the group did not participate, matching PHP's
-/// `empty($match[...])` / `idx(...)` checks.
+/// Each field mirrors a `(?P<name>...)` group from the PHP docs. `None`
+/// means the regex has no such group (PHP's `idx()` default applies);
+/// `Some("")` means the group exists but captured nothing (PHP's `empty()`
+/// checks treat it as absent, while `idx()` returns the empty string).
 #[derive(Debug, Clone, Default)]
 pub struct ScriptRegexMatch {
     /// `message` group: text describing the finding.
@@ -84,6 +89,10 @@ pub struct ScriptRegexMatch {
     pub halt: Option<String>,
     /// `throw` group: nonempty aborts with an error.
     pub throw: Option<String>,
+    /// `original` group: text the message affects.
+    pub original: Option<String>,
+    /// `replacement` group: autofix replacement text.
+    pub replacement: Option<String>,
 }
 
 impl ScriptRegexMatch {
@@ -105,6 +114,9 @@ pub type OutputParser = fn(&str) -> Vec<ScriptRegexMatch>;
 pub struct ScriptAndRegexLinter {
     script: Option<String>,
     parser: Option<OutputParser>,
+    pattern: Option<regex::Regex>,
+    root: Option<PathBuf>,
+    halted: Cell<bool>,
 }
 
 impl ScriptAndRegexLinter {
@@ -116,12 +128,15 @@ impl ScriptAndRegexLinter {
 
     /// Linter running `script` with the linted path appended, parsing
     /// stdout with `parser`. The script runs from the process working
-    /// directory (PHP runs it from the project root).
+    /// directory (configured linters run it from the project root).
     #[must_use]
     pub fn with_script_and_parser(script: &str, parser: OutputParser) -> Self {
         Self {
             script: Some(script.to_string()),
             parser: Some(parser),
+            pattern: None,
+            root: None,
+            halted: Cell::new(false),
         }
     }
 }
@@ -132,20 +147,67 @@ impl Linter for ScriptAndRegexLinter {
     }
 
     fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {
-        let (Some(script), Some(parser)) = (self.script.as_deref(), self.parser) else {
+        self.halted.set(false);
+        let Some(script) = self.script.as_deref() else {
             return Vec::new();
         };
         if data.contains(&0) || script.trim().is_empty() {
             return Vec::new();
         }
-        let argv0 = script.split_whitespace().next().unwrap_or("");
-        if !binary_exists(argv0) {
-            return Vec::new();
-        }
-        let Ok(output) = run_script_for_path(script, path) else {
+        let Ok(output) = run_script_for_path_in(script, path, self.root.as_deref()) else {
             return Vec::new();
         };
-        parse_output_with(parser, &output, path, data).unwrap_or_default()
+        if let Some(parser) = self.parser {
+            let (messages, halted) =
+                messages_from_matches(parser(&output), &output, path, data).unwrap_or_default();
+            self.halted.set(halted);
+            return messages;
+        }
+        let Some(pattern) = &self.pattern else {
+            return Vec::new();
+        };
+        match parse_pcre_output(pattern, &output, path, data) {
+            Ok((messages, halted)) => {
+                self.halted.set(halted);
+                messages
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn set_option(
+        &mut self,
+        key: &str,
+        value: &serde_json::Value,
+        ctx: &OptionContext,
+    ) -> Result<(), String> {
+        self.root = Some(ctx.project_root.to_path_buf());
+        match key {
+            "script-and-regex.script" => {
+                let Some(script) = value.as_str() else {
+                    return Err("'script-and-regex.script' must be a string".to_string());
+                };
+                self.script = Some(script.to_string());
+                Ok(())
+            }
+            "script-and-regex.regex" => {
+                let Some(pattern) = value.as_str() else {
+                    return Err("'script-and-regex.regex' must be a string".to_string());
+                };
+                self.pattern = Some(compile_pcre(pattern)?);
+                Ok(())
+            }
+            _ => Err(format!("unknown option '{key}'.")),
+        }
+    }
+
+    fn applies_custom_severities(&self) -> bool {
+        // The PHP linter never consults custom severity maps.
+        false
+    }
+
+    fn take_halt(&self) -> bool {
+        self.halted.replace(false)
     }
 }
 
@@ -163,15 +225,82 @@ pub fn parse_output_with(
     if output.is_empty() {
         return Ok(Vec::new());
     }
+    messages_from_matches(parser(output), output, path, data).map(|(messages, _)| messages)
+}
+
+/// Parse one compiled PCRE pattern's matches (`PREG_SET_ORDER`) into
+/// `(messages, halted)`, mirroring `lintPath()`. Groups the pattern
+/// defines but a match leaves unmatched read as empty strings, like PHP.
+pub fn parse_pcre_output(
+    pattern: &regex::Regex,
+    output: &str,
+    path: &str,
+    data: &[u8],
+) -> Result<(Vec<LintMessage>, bool), String> {
+    if output.is_empty() {
+        return Ok((Vec::new(), false));
+    }
+    let known: HashSet<&str> = pattern.capture_names().flatten().collect();
+    let matches = pattern
+        .captures_iter(output)
+        .map(|captured| match_from_captures(&captured, &known))
+        .collect();
+    messages_from_matches(matches, output, path, data)
+}
+
+/// Read the documented named groups from one regex match.
+fn match_from_captures(captured: &regex::Captures<'_>, known: &HashSet<&str>) -> ScriptRegexMatch {
+    let group = |name: &str| {
+        known.contains(name).then(|| {
+            captured
+                .name(name)
+                .map_or(String::new(), |found| found.as_str().to_string())
+        })
+    };
+    ScriptRegexMatch {
+        message: group("message"),
+        name: group("name"),
+        severity: group("severity"),
+        error: group("error"),
+        warning: group("warning"),
+        advice: group("advice"),
+        autofix: group("autofix"),
+        disabled: group("disabled"),
+        file: group("file"),
+        line: group("line"),
+        char: group("char"),
+        offset: group("offset"),
+        code: group("code"),
+        ignore: group("ignore"),
+        stop: group("stop"),
+        halt: group("halt"),
+        throw: group("throw"),
+        original: group("original"),
+        replacement: group("replacement"),
+    }
+}
+
+/// Turn matches into `(messages, halted)`, applying the PHP per-match
+/// rules: `throw` aborts, `halt` stops everything, `stop` stops this
+/// file, `ignore` skips the match.
+fn messages_from_matches(
+    matches: Vec<ScriptRegexMatch>,
+    output: &str,
+    path: &str,
+    data: &[u8],
+) -> Result<(Vec<LintMessage>, bool), String> {
     let mut out = Vec::new();
-    for captured in parser(output) {
+    for captured in matches {
         if let Some(thrown) = nonempty(&captured.throw) {
             return Err(format!(
                 "ArcanistScriptAndRegexLinter: configuration captured a 'throw' \
                  named capturing group, '{thrown}'. Script output:\n{output}"
             ));
         }
-        if nonempty(&captured.halt).is_some() || nonempty(&captured.stop).is_some() {
+        if nonempty(&captured.halt).is_some() {
+            return Ok((out, true));
+        }
+        if nonempty(&captured.stop).is_some() {
             break;
         }
         if nonempty(&captured.ignore).is_some() {
@@ -179,20 +308,22 @@ pub fn parse_output_with(
         }
         let (line, col) = match_line_and_char(&captured, data);
         out.push(LintMessage {
-            path: nonempty(&captured.file).unwrap_or(path).to_string(),
+            path: captured.file.as_deref().unwrap_or(path).to_string(),
             line,
             col,
-            code: nonempty(&captured.code).unwrap_or(CODE_DEFAULT).to_string(),
+            code: captured.code.as_deref().unwrap_or(CODE_DEFAULT).to_string(),
             severity: match_severity(&captured).to_string(),
-            name: nonempty(&captured.name).unwrap_or(NAME_DEFAULT).to_string(),
-            description: nonempty(&captured.message)
+            name: captured.name.as_deref().unwrap_or(NAME_DEFAULT).to_string(),
+            description: captured
+                .message
+                .as_deref()
                 .unwrap_or(MESSAGE_DEFAULT)
                 .to_string(),
-            original: None,
-            replacement: None,
+            original: captured.original.clone(),
+            replacement: captured.replacement.clone(),
         });
     }
-    Ok(out)
+    Ok((out, false))
 }
 
 /// Severity for one match, ported exactly from `getMatchSeverity`.
@@ -297,8 +428,19 @@ pub fn script_command(script: &str, path: &str) -> String {
 /// Run `script` with the linted path appended, returning stdout.
 ///
 /// Mirrors `ExecFuture('%C %s', $script, $path)`: stderr is ignored and a
-/// nonzero exit is an error.
+/// nonzero exit is an error. Runs from the process working directory; use
+/// [`run_script_for_path_in`] to run from the project root like PHP.
 pub fn run_script_for_path(script: &str, path: &str) -> Result<String, String> {
+    run_script_for_path_in(script, path, None)
+}
+
+/// Run `script` with the linted path appended from `cwd` (the project
+/// root, like PHP), returning stdout.
+pub fn run_script_for_path_in(
+    script: &str,
+    path: &str,
+    cwd: Option<&Path>,
+) -> Result<String, String> {
     let command = script_command(script, path);
     #[cfg(unix)]
     let mut spawned_command = std::process::Command::new("sh");
@@ -308,6 +450,9 @@ pub fn run_script_for_path(script: &str, path: &str) -> Result<String, String> {
     spawned_command.arg("-c").arg(&command);
     #[cfg(windows)]
     spawned_command.arg("/C").arg(&command);
+    if let Some(dir) = cwd {
+        spawned_command.current_dir(dir);
+    }
     let spawned = arc_rs::lint::spawn_with_retry(&mut spawned_command);
     let output = spawned.map_err(|error| format!("failed to run script: {error}"))?;
     if !output.status.success() {

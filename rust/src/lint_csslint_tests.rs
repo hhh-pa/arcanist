@@ -69,3 +69,43 @@ fn missing_binary_is_silent() {
 fn lookup_miss_reports_no_tool() {
     assert!(find_on_path("arc-rs-definitely-missing-tool").is_none());
 }
+
+#[test]
+fn custom_severities_are_rejected_like_php() {
+    let linter = CsslintLinter::new();
+    assert_eq!(
+        linter.validate_severity_code("CSSLint"),
+        Err(
+            "CSSLint does not currently support custom severity levels, because rules can't be \
+             identified from messages in output."
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn original_text_is_evidence_sliced_at_char() {
+    let messages = parse_lint_xml_output("a.css", canned()).unwrap();
+    assert_eq!(messages[0].original.as_deref(), Some(" color: red; "));
+    assert_eq!(messages[1].original.as_deref(), Some(""));
+    let no_char = parse_lint_xml_output(
+        "a.css",
+        "<lint><file name=\"a.css\">\
+         <issue line=\"1\" severity=\"error\" reason=\"r\" evidence=\"full\"/>\
+         </file></lint>",
+    )
+    .unwrap();
+    assert_eq!(no_char[0].original.as_deref(), Some("full"));
+}
+
+#[test]
+fn php_int_cast_and_substr_match_edge_cases() {
+    assert_eq!(php_int(""), 0);
+    assert_eq!(php_int("abc"), 0);
+    assert_eq!(php_int("  -12abc"), -12);
+    assert_eq!(php_int("+7"), 7);
+    assert_eq!(php_substr_from("hello", 1), "ello");
+    assert_eq!(php_substr_from("hello", -2), "lo");
+    assert_eq!(php_substr_from("hello", 9), "");
+    assert_eq!(php_substr_from("hello", -9), "");
+}

@@ -10,26 +10,30 @@
 //! ("Fatal Error"); both are error severity. Like `php -l`, only the
 //! first error is reported.
 //!
-//! Known limits (see T1128): the `bin`, `flags`, and `version` linter
-//! options are not supported; an unrecognized error type yields no
-//! messages (the PHP linter raises, but the
-//! [`Linter`](arc_rs::lint::Linter) trait has no error channel).
+//! The `bin`, `flags`, and `version` linter options apply (N4). An
+//! unrecognized error type yields no messages (the PHP linter raises,
+//! but the [`Linter`](arc_rs::lint::Linter) trait has no error
+//! channel). `severity` keys are rejected (`canCustomize` is false).
 
 extern crate self as arc_rs;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use arc_rs::lint::{LintMessage, Linter, SEVERITY_ERROR};
+use arc_rs::lint::{LintMessage, Linter, OptionContext, SEVERITY_ERROR};
+use arc_rs::lint_external::{ToolOptions, apply_tool_option, version_requirement_satisfied};
+use arc_rs::linters::version_pattern_for;
 
 /// PHP linter: syntax errors via `php -l`.
 #[derive(Debug, Default)]
-pub struct PhpLinter;
+pub struct PhpLinter {
+    options: ToolOptions,
+}
 
 impl PhpLinter {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -39,10 +43,22 @@ pub fn binary_name() -> &'static str {
     "php"
 }
 
+/// Mandatory flags, mirroring `getMandatoryFlags()`.
+fn mandatory_flags() -> Vec<String> {
+    vec!["-l".to_string()]
+}
+
+/// Default flags, mirroring `getDefaultFlags()`: none.
+fn default_flags() -> Vec<String> {
+    Vec::new()
+}
+
 /// Exact tool argv flags, mirroring `getMandatoryFlags()`.
 #[must_use]
 pub fn command_flags() -> Vec<String> {
-    vec!["-l".to_string()]
+    let mut flags = mandatory_flags();
+    flags.extend(default_flags());
+    flags
 }
 
 fn is_supported(path: &str) -> bool {
@@ -145,9 +161,9 @@ fn staged_name(display_path: &str) -> String {
     }
 }
 
-fn run_tool(binary: &Path, file: &Path) -> Option<(i32, String, String)> {
+fn run_tool(binary: &Path, file: &Path, flags: &[String]) -> Option<(i32, String, String)> {
     let mut command = Command::new(binary);
-    command.args(command_flags()).arg(file).stdin(Stdio::null());
+    command.args(flags).arg(file).stdin(Stdio::null());
     let output = arc_rs::lint::spawn_with_retry(&mut command).ok()?;
     let code = output.status.code().unwrap_or(1);
     Some((
@@ -160,13 +176,23 @@ fn run_tool(binary: &Path, file: &Path) -> Option<(i32, String, String)> {
 /// Linter body with an explicit tool path (mirrors the PHP `bin` option).
 /// `None` (tool absent) reports no messages.
 pub fn lint_with_binary(path: &str, data: &[u8], binary: Option<&Path>) -> Vec<LintMessage> {
+    lint_with_binary_and_flags(path, data, binary, &command_flags())
+}
+
+/// Linter body with explicit flags (configured flags replace defaults).
+fn lint_with_binary_and_flags(
+    path: &str,
+    data: &[u8],
+    binary: Option<&Path>,
+    flags: &[String],
+) -> Vec<LintMessage> {
     let Some(binary) = binary else {
         return Vec::new();
     };
     let Ok(staged) = StagedFile::stage(path, data) else {
         return Vec::new();
     };
-    let Some((code, stdout, stderr)) = run_tool(binary, staged.path()) else {
+    let Some((code, stdout, stderr)) = run_tool(binary, staged.path(), flags) else {
         return Vec::new();
     };
     parse_output(path, code, &stdout, &stderr)
@@ -266,7 +292,37 @@ impl Linter for PhpLinter {
         if data.contains(&0) {
             return Vec::new();
         }
-        lint_with_binary(path, data, binary_on_path().as_deref())
+        let binary = self.options.bin.clone().or_else(binary_on_path);
+        let Some(ref binary) = binary else {
+            return Vec::new();
+        };
+        if let Some(requirement) = &self.options.version
+            && !version_requirement_satisfied(
+                version_pattern_for("php"),
+                binary,
+                requirement,
+                "ArcanistPhpLinter",
+            )
+        {
+            return Vec::new();
+        }
+        let flags = self
+            .options
+            .command_flags(&mandatory_flags(), &default_flags());
+        lint_with_binary_and_flags(path, data, Some(binary), &flags)
+    }
+
+    fn can_customize_severities(&self) -> bool {
+        false
+    }
+
+    fn set_option(
+        &mut self,
+        key: &str,
+        value: &serde_json::Value,
+        ctx: &OptionContext,
+    ) -> Result<(), String> {
+        apply_tool_option(&mut self.options, key, value, ctx.project_root)
     }
 }
 

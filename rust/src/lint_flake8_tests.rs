@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn name_and_binary_match_php() {
     assert_eq!(Flake8Linter::new().name(), "flake8");
-    assert_eq!(Flake8Linter.name(), "flake8");
+    assert_eq!(Flake8Linter::new().name(), "flake8");
     assert_eq!(BINARY, "flake8");
     assert!(mandatory_flags().is_empty());
 }
@@ -135,4 +135,22 @@ fn skips_lines_with_broken_columns() {
     assert!(parse_output("a.py", "f.py:3:5 E000 x\n").is_empty());
     assert!(parse_output("a.py", "f.py:1:1: \n").is_empty());
     assert!(parse_output("a.py", "\n").is_empty());
+}
+
+#[test]
+fn severity_codes_need_one_letter_like_php() {
+    let linter = Flake8Linter::new();
+    for code in ["E225", "W291", "F811", "C901"] {
+        assert_eq!(linter.validate_severity_code(code), Ok(code.to_string()));
+    }
+    for code in ["", "E", "EE225", "e225", "E22a", "[E225]"] {
+        assert_eq!(
+            linter.validate_severity_code(code),
+            Err(format!(
+                "Unrecognized lint message code \"{code}\". Expected a valid flake8 lint code \
+                 like \"E225\", or \"W291\", or \"F811\", or \"C901\"."
+            )),
+            "{code:?}"
+        );
+    }
 }

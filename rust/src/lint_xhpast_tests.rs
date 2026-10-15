@@ -98,3 +98,32 @@ fn failed_parse_yields_one_unable_to_parse_warning() {
         );
     }
 }
+
+#[test]
+fn rule_options_are_accepted_and_short_codes_look_up() {
+    let ctx = OptionContext {
+        project_root: Path::new("."),
+    };
+    let mut linter = XhpastLinter::new();
+    for (key, value) in [
+        ("xhpast.php-version", serde_json::json!("5.3.0")),
+        ("xhpast.php-version.windows", serde_json::json!("5.4.0")),
+        ("xhpast.blacklisted.function", serde_json::json!({})),
+        ("xhpast.deprecated.functions", serde_json::json!({})),
+        ("xhpast.printf-functions", serde_json::json!({})),
+        ("xhpast.switchhook", serde_json::json!("hook")),
+        ("xhpast.naminghook", serde_json::json!("hook")),
+        ("xhpast.dynamic-string.classes", serde_json::json!({})),
+        ("xhpast.dynamic-string.functions", serde_json::json!({})),
+    ] {
+        linter.set_option(key, &value, &ctx).unwrap();
+    }
+    assert!(
+        linter
+            .set_option("bin", &serde_json::json!("x"), &ctx)
+            .is_err()
+    );
+    assert_eq!(linter.severity_lookup_code("XHP2"), "2");
+    assert_eq!(linter.severity_lookup_code("XHP"), "");
+    assert_eq!(linter.severity_lookup_code("OTHER"), "OTHER");
+}

@@ -24,7 +24,7 @@ extern crate self as arc_rs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use arc_rs::lint::{LintMessage, Linter};
+use arc_rs::lint::{LintMessage, Linter, OptionContext};
 
 /// Severity mirroring `ArcanistLintSeverity`; `lint.rs` only defines the
 /// severities the text linter uses.
@@ -32,12 +32,14 @@ const SEVERITY_WARNING: &str = "warning";
 
 /// XHPAST linter: PHP parse check via the `xhpast` binary.
 #[derive(Debug, Default)]
-pub struct XhpastLinter;
+pub struct XhpastLinter {
+    options: std::collections::HashMap<String, serde_json::Value>,
+}
 
 impl XhpastLinter {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -211,6 +213,10 @@ impl Linter for XhpastLinter {
         "XHP"
     }
 
+    fn severity_lookup_code<'a>(&self, full_code: &'a str) -> &'a str {
+        full_code.strip_prefix("XHP").unwrap_or(full_code)
+    }
+
     fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {
         if !is_supported(path) {
             return Vec::new();
@@ -219,6 +225,31 @@ impl Linter for XhpastLinter {
             return Vec::new();
         }
         lint_with_binary(path, data, binary_on_path().as_deref())
+    }
+
+    fn set_option(
+        &mut self,
+        key: &str,
+        value: &serde_json::Value,
+        _ctx: &OptionContext,
+    ) -> Result<(), String> {
+        // PHP fans these out to the XHPAST rules; no rules are ported,
+        // so values are retained but inert.
+        match key {
+            "xhpast.php-version"
+            | "xhpast.php-version.windows"
+            | "xhpast.blacklisted.function"
+            | "xhpast.deprecated.functions"
+            | "xhpast.printf-functions"
+            | "xhpast.switchhook"
+            | "xhpast.naminghook"
+            | "xhpast.dynamic-string.classes"
+            | "xhpast.dynamic-string.functions" => {
+                self.options.insert(key.to_string(), value.clone());
+                Ok(())
+            }
+            _ => Err(format!("unknown option '{key}'.")),
+        }
     }
 }
 

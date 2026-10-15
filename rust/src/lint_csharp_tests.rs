@@ -83,22 +83,171 @@ fn absent_or_broken_command_reports_nothing() {
 #[test]
 fn command_lookup_needs_analyzer_and_runtime() {
     let tmp = TempDir::new("lookup");
-    assert!(resolve_command_in(tmp.path().as_os_str()).is_none());
+    let settings = default_settings_base64();
+    assert!(resolve_command_in(tmp.path().as_os_str(), None, settings).is_none());
     let cslint = tmp.path().join(binary_name());
     std::fs::write(&cslint, b"x").unwrap();
     if cfg!(windows) {
-        let (program, prefix) = resolve_command_in(tmp.path().as_os_str()).unwrap();
+        let (program, prefix) = resolve_command_in(tmp.path().as_os_str(), None, settings).unwrap();
         assert_eq!(program, cslint);
         assert_eq!(prefix, command_flags());
     } else {
-        assert!(resolve_command_in(tmp.path().as_os_str()).is_none());
+        assert!(resolve_command_in(tmp.path().as_os_str(), None, settings).is_none());
         let mono = tmp.path().join(runtime_name());
         std::fs::write(&mono, b"x").unwrap();
-        let (program, prefix) = resolve_command_in(tmp.path().as_os_str()).unwrap();
+        let (program, prefix) = resolve_command_in(tmp.path().as_os_str(), None, settings).unwrap();
         assert_eq!(program, mono);
         assert_eq!(prefix[0], cslint.to_string_lossy());
         assert_eq!(&prefix[1..], command_flags().as_slice());
     }
+}
+
+#[test]
+fn existing_binary_hint_wins_over_path_lookup() {
+    let tmp = TempDir::new("hint");
+    let settings = default_settings_base64();
+    let hint = tmp.path().join("custom-cslint.exe");
+    std::fs::write(&hint, b"x").unwrap();
+    #[cfg(not(windows))]
+    std::fs::write(tmp.path().join(runtime_name()), b"x").unwrap();
+    let (program, prefix) =
+        resolve_command_in(tmp.path().as_os_str(), Some(&hint), settings).unwrap();
+    if cfg!(windows) {
+        assert_eq!(program, hint);
+    } else {
+        assert_eq!(prefix[0], hint.to_string_lossy());
+    }
+    // A missing hint falls back to the `PATH` lookup, like PHP.
+    let missing = tmp.path().join("no-such-cslint.exe");
+    assert!(resolve_command_in(tmp.path().as_os_str(), Some(&missing), settings).is_none());
+    let cslint = tmp.path().join(binary_name());
+    std::fs::write(&cslint, b"x").unwrap();
+    let (program, prefix) =
+        resolve_command_in(tmp.path().as_os_str(), Some(&missing), settings).unwrap();
+    if cfg!(windows) {
+        assert_eq!(program, cslint);
+    } else {
+        assert_eq!(prefix[0], cslint.to_string_lossy());
+    }
+}
+
+#[test]
+fn settings_payload_matches_php_json_and_base64() {
+    assert_eq!(settings_base64(None), "bnVsbA==");
+    let mut map = BTreeMap::new();
+    map.insert("b".to_string(), vec!["y".to_string()]);
+    map.insert("a".to_string(), vec!["x".to_string()]);
+    assert_eq!(discovery_json(&map), r#"{"a":["x"],"b":["y"]}"#);
+    assert_eq!(settings_base64(Some(&map)), "eyJhIjpbIngiXSwiYiI6WyJ5Il19");
+    let flags = command_flags_for(&settings_base64(Some(&map)));
+    assert_eq!(flags[0], "--settings-base64=eyJhIjpbIngiXSwiYiI6WyJ5Il19");
+}
+
+#[test]
+fn base64_matches_rfc_vectors() {
+    for (raw, encoded) in [
+        ("", ""),
+        ("f", "Zg=="),
+        ("fo", "Zm8="),
+        ("foo", "Zm9v"),
+        ("foob", "Zm9vYg=="),
+        ("fooba", "Zm9vYmE="),
+        ("foobar", "Zm9vYmFy"),
+        ("null", "bnVsbA=="),
+    ] {
+        assert_eq!(base64_encode(raw.as_bytes()), encoded, "{raw}");
+    }
+}
+
+#[test]
+fn php_json_escape_matches_json_encode() {
+    assert_eq!(php_json_escape("a/b"), "a\\/b");
+    assert_eq!(php_json_escape("q\"q"), "q\\\"q");
+    assert_eq!(php_json_escape("b\\b"), "b\\\\b");
+    assert_eq!(php_json_escape("a\nb"), "a\\nb");
+    assert_eq!(php_json_escape("a\x01b"), "a\\u0001b");
+    assert_eq!(php_json_escape("caf\u{e9}"), "caf\\u00e9");
+    assert_eq!(php_json_escape("\u{1d11e}"), "\\ud834\\udd1e");
+}
+
+#[test]
+fn version_gate_accepts_only_cslint_1() {
+    assert!(version_output_supported(0, "1"));
+    assert!(version_output_supported(0, "1\n"));
+    assert!(version_output_supported(0, "  1"));
+    assert!(version_output_supported(0, "1.5"));
+    for stdout in ["", "0", "2", "10", "v1", "version 1", "cslint 1"] {
+        assert!(!version_output_supported(0, stdout), "{stdout:?}");
+    }
+    assert!(!version_output_supported(1, "1"));
+}
+
+#[test]
+fn stylecop_rules_may_not_be_disabled() {
+    let linter = CsharpLinter::new();
+    assert_eq!(
+        linter.validate_severity_entry("SA1600", "disabled"),
+        Err(
+            "In order to keep StyleCop integration with IDEs and other tools consistent with lint \
+             results, you aren't permitted to disable StyleCop rules within '.arclint'. Instead \
+             configure the severity using the StyleCop settings dialog (usually accessible from \
+             within your IDE). StyleCop settings for your project will be used when linting."
+                .to_string()
+        )
+    );
+    assert_eq!(
+        linter.validate_severity_entry("SA1600", "warning"),
+        Ok("SA1600".to_string())
+    );
+    assert_eq!(
+        linter.validate_severity_entry("CS0001", "disabled"),
+        Ok("CS0001".to_string())
+    );
+    assert_eq!(
+        linter.validate_severity_entry("S", "disabled"),
+        Ok("S".to_string())
+    );
+}
+
+#[test]
+fn binary_and_discovery_options_apply() {
+    let tmp = TempDir::new("options");
+    let ctx = OptionContext {
+        project_root: tmp.path(),
+    };
+    let mut linter = CsharpLinter::new();
+    linter
+        .set_option(
+            "binary",
+            &serde_json::Value::String("tools/cslint.exe".to_string()),
+            &ctx,
+        )
+        .unwrap();
+    assert_eq!(
+        linter.binary_hint,
+        Some(tmp.path().join("tools/cslint.exe"))
+    );
+    linter
+        .set_option("discovery", &serde_json::json!({"a": ["x"]}), &ctx)
+        .unwrap();
+    assert_eq!(
+        settings_base64(linter.discovery.as_ref()),
+        "eyJhIjpbIngiXX0="
+    );
+    assert!(
+        linter
+            .set_option("bogus", &serde_json::json!(1), &ctx)
+            .is_err()
+    );
+}
+
+#[test]
+fn issues_carry_original_and_replacement_text() {
+    let messages = parse_output("Foo.cs", 0, RESULTS, "");
+    assert_eq!(messages[0].original.as_deref(), Some("x"));
+    assert_eq!(messages[0].replacement.as_deref(), Some("y"));
+    assert_eq!(messages[1].original, None);
+    assert_eq!(messages[1].replacement, None);
 }
 
 #[test]

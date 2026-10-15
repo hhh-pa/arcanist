@@ -43,6 +43,10 @@ impl Linter for MergeConflictLinter {
         "MERGECONFLICT"
     }
 
+    fn severity_lookup_code<'a>(&self, full_code: &'a str) -> &'a str {
+        full_code.strip_prefix("MERGECONFLICT").unwrap_or(full_code)
+    }
+
     fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {
         if data.contains(&0) || is_skippable_filesystem_object(path) {
             return Vec::new();

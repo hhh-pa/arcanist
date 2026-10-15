@@ -37,6 +37,132 @@ use std::cmp::Ordering;
 /// must never appear in the linter registry.
 pub const NAME_LOCAL: &str = "external";
 
+/// Configured `bin` / `flags` / `version` options shared by every
+/// external linter (N4). Linters store one of these, apply `.arclint`
+/// values through [`apply_tool_option`], and read it back when
+/// composing argv.
+#[derive(Debug, Clone, Default)]
+pub struct ToolOptions {
+    /// Configured binary (resolved at config time), else the default.
+    pub bin: Option<std::path::PathBuf>,
+    /// Configured flags, replacing defaults when non-empty (PHP
+    /// `nonempty($this->flags, $this->getDefaultFlags())`: an
+    /// explicitly empty list keeps the defaults).
+    pub flags: Option<Vec<String>>,
+    /// Trimmed version requirement (`setVersionRequirement()`).
+    pub version: Option<String>,
+}
+
+impl ToolOptions {
+    /// Effective flags: mandatory plus configured-or-default, mirroring
+    /// `getCommandFlags()`.
+    #[must_use]
+    pub fn command_flags(&self, mandatory: &[String], defaults: &[String]) -> Vec<String> {
+        let mut out = mandatory.to_vec();
+        match &self.flags {
+            Some(flags) if !flags.is_empty() => out.extend(flags.iter().cloned()),
+            _ => out.extend(defaults.iter().cloned()),
+        }
+        out
+    }
+}
+
+/// Apply one tool option (`bin`, `flags`, `version`) to `options`,
+/// mirroring `ArcanistExternalLinter::setLinterConfigurationValue()`.
+/// Values are already type-checked by the engine. `project_root`
+/// resolves relative `bin` candidates, like PHP.
+pub fn apply_tool_option(
+    options: &mut ToolOptions,
+    key: &str,
+    value: &serde_json::Value,
+    project_root: &std::path::Path,
+) -> Result<(), String> {
+    match key {
+        "bin" => {
+            options.bin = Some(resolve_configured_bin(value, project_root)?);
+            Ok(())
+        }
+        "flags" => {
+            let serde_json::Value::Array(flags) = value else {
+                return Err("'flags' must be a list of strings".to_string());
+            };
+            let mut out = Vec::new();
+            for flag in flags {
+                let serde_json::Value::String(flag) = flag else {
+                    return Err("'flags' must be a list of strings".to_string());
+                };
+                out.push(flag.clone());
+            }
+            options.flags = Some(out);
+            Ok(())
+        }
+        "version" => {
+            let serde_json::Value::String(version) = value else {
+                return Err("'version' must be a string".to_string());
+            };
+            options.version = Some(version.trim().to_string());
+            Ok(())
+        }
+        _ => Err(format!("unknown option '{key}'.")),
+    }
+}
+
+/// Resolve a `bin` value (string or list) to the first locatable
+/// binary: each candidate as given, else resolved against
+/// `project_root` (`ArcanistExternalLinter.php:524-544`). No
+/// candidate locatable is a configuration error.
+pub fn resolve_configured_bin(
+    value: &serde_json::Value,
+    project_root: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let mut candidates = Vec::new();
+    match value {
+        serde_json::Value::String(candidate) => candidates.push(candidate.clone()),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                let serde_json::Value::String(candidate) = item else {
+                    return Err("'bin' must be a string or a list of strings".to_string());
+                };
+                candidates.push(candidate.clone());
+            }
+        }
+        _ => return Err("'bin' must be a string or a list of strings".to_string()),
+    }
+    for candidate in &candidates {
+        if binary_exists(candidate) {
+            return Ok(std::path::PathBuf::from(candidate));
+        }
+        let resolved = project_root.join(candidate);
+        if binary_exists(resolved.to_string_lossy().as_ref()) {
+            return Ok(resolved);
+        }
+    }
+    Err("None of the configured binaries can be located.".to_string())
+}
+
+/// Enforce a configured `version` requirement against `binary`,
+/// probing `<binary> --version` like `getVersion()`. Returns `false`
+/// when the linter must stay inactive (unknown version or mismatch);
+/// PHP raises `ArcanistMissingLinterException` there, which fails the
+/// run, but the port stays silent for unusable tools, exactly like a
+/// missing default binary.
+pub fn version_requirement_satisfied(
+    pattern: Option<crate::linters::VersionPattern>,
+    binary: &std::path::Path,
+    requirement: &str,
+    linter_class: &str,
+) -> bool {
+    let version = pattern.and_then(|pattern| crate::linters::probe_binary_version(pattern, binary));
+    check_version_requirement(
+        linter_class,
+        &binary.to_string_lossy(),
+        version.as_deref(),
+        requirement,
+        None,
+    )
+    .is_ok()
+}
+
 /// Configuration for one external tool invocation.
 #[derive(Debug, Clone)]
 pub struct ExternalToolConfig {

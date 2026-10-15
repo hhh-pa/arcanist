@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn name_binary_and_flags_match_php() {
     assert_eq!(PyLintLinter::new().name(), "PyLint");
-    assert_eq!(PyLintLinter.name(), "PyLint");
+    assert_eq!(PyLintLinter::new().name(), "PyLint");
     assert_eq!(BINARY, "pylint");
     assert_eq!(
         mandatory_flags(),
@@ -137,4 +137,28 @@ fn skips_lines_with_broken_fields() {
     assert!(parse_output("a.py", 1, "xx|0|E0602|s|m\n").is_empty());
     assert!(parse_output("a.py", 1, "nocolumns\n").is_empty());
     assert!(parse_output("a.py", 1, "\n").is_empty());
+}
+
+#[test]
+fn display_names_humanize_symbols_byte_based() {
+    assert_eq!(display_name("missing-docstring"), "Missing Docstring");
+    assert_eq!(display_name("école-x"), "école X");
+}
+
+#[test]
+fn severity_codes_need_a_letter_and_four_digits_like_php() {
+    let linter = PyLintLinter::new();
+    for code in ["C0111", "E0602", "W0611", "R0903", "F0001"] {
+        assert_eq!(linter.validate_severity_code(code), Ok(code.to_string()));
+    }
+    for code in ["", "C011", "C01111", "X0111", "c0111", "C011a"] {
+        assert_eq!(
+            linter.validate_severity_code(code),
+            Err(format!(
+                "Unrecognized lint message code \"{code}\". Expected a valid Pylint lint code \
+                 like \"C0111\", or \"E0602\", or \"W0611\"."
+            )),
+            "{code:?}"
+        );
+    }
 }

@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn name_binary_and_flags_match_php() {
     assert_eq!(RuboCopLinter::new().name(), "RuboCop");
-    assert_eq!(RuboCopLinter.name(), "RuboCop");
+    assert_eq!(RuboCopLinter::new().name(), "RuboCop");
     assert_eq!(BINARY, "rubocop");
     assert_eq!(mandatory_flags(), vec!["--format=json"]);
 }
@@ -170,4 +170,29 @@ fn skips_offenses_with_broken_locations() {
         )
         .is_empty()
     );
+}
+
+#[test]
+fn custom_severities_apply_by_offense_word_like_php() {
+    use std::collections::HashMap;
+    let stdout = r#"{"files": [{"path": "x", "offenses": [
+        {"severity": "convention", "message": "m", "cop_name": "Style/X",
+         "location": {"line": 1, "column": 1}},
+        {"severity": "error", "message": "m", "cop_name": "Lint/Y",
+         "location": {"line": 2, "column": 1}}
+    ]}]}"#;
+    let linter = RuboCopLinter::new();
+    assert!(!linter.applies_custom_severities());
+    let mut map = HashMap::new();
+    map.insert("convention".to_string(), "error".to_string());
+    // Cop-name keys never match: PHP looks up the severity word.
+    map.insert("Lint/Y".to_string(), "advice".to_string());
+    let overrides = SeverityOverrides {
+        map,
+        rules: vec![("/^err/".to_string(), "disabled".to_string())],
+    };
+    let messages = parse_output_with("a.rb", stdout, &overrides);
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].severity, "error");
+    assert_eq!(messages[1].severity, "disabled");
 }

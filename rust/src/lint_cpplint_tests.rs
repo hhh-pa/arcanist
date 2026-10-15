@@ -112,3 +112,35 @@ fn matches_php_on_unanchored_and_empty_cases() {
     assert_eq!(messages[1].line, 3);
     assert_eq!(messages[1].description, "");
 }
+
+#[test]
+fn severity_codes_match_the_php_category_shape() {
+    let linter = CpplintLinter::new();
+    for code in [
+        "build/include_order",
+        "whitespace/braces",
+        "runtime/casting",
+        "a/b2_c+d",
+    ] {
+        assert_eq!(linter.validate_severity_code(code), Ok(code.to_string()));
+    }
+    for code in [
+        "",
+        "build",
+        "/braces",
+        "build/",
+        "Build/braces",
+        "build/Braces",
+        "a/b/c",
+        "build/in clude",
+    ] {
+        assert_eq!(
+            linter.validate_severity_code(code),
+            Err(format!(
+                "Unrecognized lint message code \"{code}\". Expected a valid cpplint lint code \
+                 like \"build/include_order\" or \"whitespace/braces\"."
+            )),
+            "{code:?}"
+        );
+    }
+}

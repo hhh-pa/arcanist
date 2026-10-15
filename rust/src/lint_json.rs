@@ -63,6 +63,14 @@ impl Linter for JsonLinter {
         "JSON"
     }
 
+    fn severity_lookup_code<'a>(&self, full_code: &'a str) -> &'a str {
+        full_code.strip_prefix("JSON").unwrap_or(full_code)
+    }
+
+    fn can_customize_severities(&self) -> bool {
+        false
+    }
+
     fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {
         if !is_json_path(path) || data.contains(&0) || is_skippable_filesystem_object(path) {
             return Vec::new();

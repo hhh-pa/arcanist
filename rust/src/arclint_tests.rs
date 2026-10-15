@@ -1,10 +1,5 @@
 use super::*;
 
-fn contains_matcher(pattern: &str, path: &str) -> bool {
-    // Test-only stand-in for PCRE: treat the pattern as a substring probe.
-    path.contains(pattern)
-}
-
 #[test]
 fn parses_sample_config() {
     let text = include_str!("../tests/fixtures/lintcfg/arclint.sample.json");
@@ -131,10 +126,21 @@ fn validates_severity_values() {
         err,
         "Error in parsing '.arclint' file, for linter 'a': Unknown lint severity \"bogus\". Valid severities are: error, warning, autofix, advice, disabled."
     );
-    let err =
-        parse_arclint(r#"{"linters": {"a": {"type": "text", "severity.rules": {"x": "bogus"}}}}"#)
-            .unwrap_err();
+    let err = parse_arclint(
+        r#"{"linters": {"a": {"type": "text", "severity.rules": {"/x/": "bogus"}}}}"#,
+    )
+    .unwrap_err();
     assert!(err.contains("Unknown lint severity"), "unexpected: {err}");
+
+    // Invalid `severity.rules` patterns are config errors, like PHP.
+    let err = parse_arclint(
+        r#"{"linters": {"a": {"type": "text", "severity.rules": {"(": "warning"}}}}"#,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        "Error in parsing '.arclint' file, for linter 'a': Severity rule \"(\" is not a valid regular expression."
+    );
 
     for level in SEVERITIES {
         let text = format!(
@@ -163,22 +169,13 @@ fn severity_resolution_prefers_map_then_rules_then_default() {
     let config = parse_arclint(
         r#"{"linters": {"a": {"type": "text",
           "severity": {"TXT2": "disabled"},
-          "severity.rules": {"TXT": "warning"}}}}"#,
+          "severity.rules": {"/TXT/": "warning"}}}}"#,
     )
     .unwrap();
     let severity = &config.linters[0].severity;
-    assert_eq!(
-        severity.severity_for("TXT2", "error", contains_matcher),
-        "disabled"
-    );
-    assert_eq!(
-        severity.severity_for("TXT6", "error", contains_matcher),
-        "warning"
-    );
-    assert_eq!(
-        severity.severity_for("OTHER", "error", contains_matcher),
-        "error"
-    );
+    assert_eq!(severity.severity_for("TXT2", "error"), "disabled");
+    assert_eq!(severity.severity_for("TXT6", "error"), "warning");
+    assert_eq!(severity.severity_for("OTHER", "error"), "error");
 }
 
 #[test]
@@ -188,33 +185,35 @@ fn routes_paths_through_include_exclude_and_global() {
         .map(|item| (*item).to_string())
         .collect::<Vec<_>>();
     // No includes: everything kept except excludes.
-    let routed = route_paths(&paths, &[], &[], &[], contains_matcher);
+    let routed = route_paths(&paths, &[], &[], &[]);
     assert_eq!(routed, paths);
     // Include narrows; exclude and global-exclude remove.
     let routed = route_paths(
         &paths,
-        &[".php".to_string()],
-        &["docs/".to_string()],
-        &["externals/".to_string()],
-        contains_matcher,
+        &["/\\.php$/".to_string()],
+        &["/docs\\//".to_string()],
+        &["/externals\\//".to_string()],
     );
     assert_eq!(routed, vec!["a.php".to_string()]);
+    // Invalid patterns never match, like PHP's false return.
+    let routed = route_paths(&paths, &["(".to_string()], &[], &[]);
+    assert!(routed.is_empty());
 }
 
 #[test]
 fn plans_paths_per_linter_in_spec_order() {
     let config = parse_arclint(
-        r#"{"exclude": "generated/",
+        r#"{"exclude": "/generated\\//",
           "linters": {
             "all-text": {"type": "text"},
-            "just-php": {"type": "php", "include": ".php"}}}"#,
+            "just-php": {"type": "php", "include": "/\\.php$/"}}}"#,
     )
     .unwrap();
     let paths = ["a.php", "generated/b.php", "c.txt"]
         .iter()
         .map(|item| (*item).to_string())
         .collect::<Vec<_>>();
-    let plans = plan_for_paths(&config, &paths, contains_matcher);
+    let plans = plan_for_paths(&config, &paths);
     assert_eq!(plans.len(), 2);
     assert_eq!(plans[0].display, "TXT");
     assert_eq!(
@@ -223,6 +222,77 @@ fn plans_paths_per_linter_in_spec_order() {
     );
     assert_eq!(plans[1].display, "PHP");
     assert_eq!(plans[1].paths, vec!["a.php".to_string()]);
+}
+
+#[test]
+fn pcre_matches_like_preg_match() {
+    // Unanchored search with several delimiters.
+    assert!(pcre_matches("/\\.php$/", "src/a.php"));
+    assert!(!pcre_matches("/\\.php$/", "src/a.phps"));
+    assert!(pcre_matches("#\\.php$#", "src/a.php"));
+    assert!(pcre_matches("@^src/@", "src/a.php"));
+    assert!(!pcre_matches("@^src/@", "lib/a.php"));
+    assert!(pcre_matches("(\\.php$)", "src/a.php"));
+    assert!(pcre_matches("{^src/}", "src/a.php"));
+    // Escaped delimiters and delimiters inside classes.
+    assert!(pcre_matches("/a\\/b/", "a/b"));
+    assert!(pcre_matches("/[/]/", "/"));
+    assert!(pcre_matches("/[]]/", "]"));
+    // Flags.
+    assert!(pcre_matches("/^src/i", "SRC/a.php"));
+    assert!(!pcre_matches("/^src/", "SRC/a.php"));
+    assert!(pcre_matches("/^b/m", "a\nb"));
+    assert!(!pcre_matches("/^b/", "a\nb"));
+    assert!(pcre_matches("/a.b/s", "a\nb"));
+    assert!(!pcre_matches("/a.b/", "a\nb"));
+    assert!(pcre_matches("/a b/x", "ab"));
+    // `$` matches before a trailing newline without `m`/`D`, like PCRE.
+    assert!(pcre_matches("/foo$/", "foo\n"));
+    assert!(pcre_matches("/foo$/", "foo"));
+    assert!(!pcre_matches("/foo$/D", "foo\n"));
+    assert!(pcre_matches("/foo$/D", "foo"));
+    assert!(pcre_matches("/foo$/m", "foo\nbar"));
+    // Named groups in every spelling.
+    let re = compile_pcre("/^(?P<line>\\d+):(?<code>\\w+):(?'name'\\w+)$/").unwrap();
+    let caps = re.captures("42:E1:oops").unwrap();
+    assert_eq!(caps.name("line").unwrap().as_str(), "42");
+    assert_eq!(caps.name("code").unwrap().as_str(), "E1");
+    assert_eq!(caps.name("name").unwrap().as_str(), "oops");
+    // Emulated escapes.
+    assert!(pcre_matches("/a\\hb/", "a b"));
+    assert!(pcre_matches("/a\\vb/", "a\nb"));
+    assert!(pcre_matches("/a\\Rb/", "a\r\nb"));
+    assert!(pcre_matches("/foo\\Z/", "foo\n"));
+    assert!(pcre_matches("/\\Qa+b\\E/", "a+b"));
+    assert!(!pcre_matches("/\\Qa+b\\E/", "aab"));
+    assert!(pcre_matches("/a\\0b/", "a\x00b"));
+}
+
+#[test]
+fn pcre_rejects_invalid_patterns() {
+    for bad in [
+        "",
+        "abc",
+        "TXT",
+        "(unclosed",
+        "/unclosed",
+        "//",
+        "/a/unknown",
+        "/a/z",
+        "/a/e",
+        "/a/U",
+        "/([a]/",
+        "/(?=lookahead)/",
+        "/(a)\\1/",
+        "1abc1",
+    ] {
+        assert!(compile_pcre(bad).is_err(), "for {bad}");
+        assert!(!pcre_matches(bad, "anything"), "for {bad}");
+    }
+    // Valid patterns compile.
+    for good in ["/a/", "/a/i", "#a#ms", "(a)", "[a]", "{a}", "<a>", "/\\//"] {
+        assert!(compile_pcre(good).is_ok(), "for {good}");
+    }
 }
 
 #[test]

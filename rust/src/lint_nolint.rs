@@ -42,6 +42,10 @@ impl Linter for NoLintLinter {
         "NOLINT"
     }
 
+    fn can_customize_severities(&self) -> bool {
+        false
+    }
+
     fn priority(&self) -> f64 {
         0.25
     }
