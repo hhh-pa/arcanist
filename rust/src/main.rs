@@ -253,18 +253,22 @@ fn apply_alias_expansion(argv: Vec<String>) -> Result<Vec<String>, ExitCode> {
     outcome
 }
 
-/// Rewrite `help <cmd>` to `<cmd> --help`, mirroring PHP's help workflow
-/// rendering the named command's help (`ArcanistHelpWorkflow` delegates to
-/// `PhutilHelpArgumentWorkflow`). Bare `help` (and `-h`/`--help`) passes
-/// through to the full command list; words after the command name are
-/// dropped, and an unknown name flows into the unknown-command error below.
 /// `-h`/`--help` before any `--` separator requests `call-conduit` help
 /// (PHP's global argument parser also accepts help flags on any
-/// workflow). A `--help` after `--` stays a positional method name.
+/// workflow). A `--help` after `--` stays a positional method name, as
+/// does one consumed as a `--conduit-uri` value, mirroring the parser.
 fn call_conduit_wants_help(rest: &[String]) -> bool {
-    rest.iter()
-        .take_while(|arg| arg.as_str() != "--")
-        .any(|arg| arg == "-h" || arg == "--help")
+    let mut skip_next = false;
+    for arg in rest.iter().take_while(|arg| arg.as_str() != "--") {
+        if skip_next {
+            skip_next = false;
+        } else if arg == "--conduit-uri" {
+            skip_next = true;
+        } else if arg == "-h" || arg == "--help" {
+            return true;
+        }
+    }
+    false
 }
 
 fn find_command_ci(name: &str) -> Option<CommandFn> {

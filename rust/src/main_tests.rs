@@ -366,3 +366,17 @@ fn call_conduit_help_flag_after_separator_stays_positional() {
     assert!(!call_conduit_wants_help(&args(&["--", "--help"])));
     assert!(parse_call_conduit(&args(&["--", "--help"])).is_ok());
 }
+
+#[test]
+fn call_conduit_help_flag_as_uri_value_is_not_help() {
+    // Mirrors the parser: `--conduit-uri` consumes the next token.
+    assert!(!call_conduit_wants_help(&args(&[
+        "--conduit-uri",
+        "--help"
+    ])));
+    assert!(parse_call_conduit(&args(&["--conduit-uri", "--help"])).is_err());
+    assert_eq!(
+        classify(&args(&["call-conduit", "--conduit-uri", "--help"])),
+        Action::Error("Provide exactly one Conduit method name to call.".to_string())
+    );
+}
