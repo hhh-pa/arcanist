@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "Rust port of Arcanist (arc)"
 license = "Apache-2.0"
+autobins = false
+
+[[bin]]
+name = "arc"
+path = "src/main.rs"
 
 [dependencies]
 base64 = "0.22"

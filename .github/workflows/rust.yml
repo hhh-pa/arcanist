@@ -155,3 +155,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release --locked
+      - name: smoke-test shipped binary
+        shell: bash
+        run: |
+          bin=target/release/arc
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            bin="$bin.exe"
+          fi
+          test -x "$bin"
+          "$bin" --help > /dev/null

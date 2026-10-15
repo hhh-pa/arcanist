@@ -14,8 +14,32 @@ divergences are tracked in [rust/README.md](rust/README.md).
 ```sh
 cd rust
 cargo build --release
-./target/release/arc-rs --help
+./target/release/arc --help
 ```
+
+The shipped binary is named `arc` (the cargo package stays `arc-rs`).
+
+## Install to PATH
+
+From the repository root:
+
+```sh
+cargo install --path rust
+```
+
+This installs `arc` into `~/.cargo/bin`; keep that directory on your
+`PATH`. Reinstall after `git pull` to pick up updates.
+
+## Not ported: `phage`
+
+PHP Arcanist shipped a second entrypoint, `bin/phage`, which was
+byte-identical to `bin/arc`: `ArcanistRuntime` dispatches on
+`basename($argv[0])`, so invoking it as `phage` selects the `phage`
+toolset instead of the `arc` toolset. That toolset is a remote-agent
+framework whose bootloader concatenates PHP files (`PhutilBallOfPHP`)
+and ships them to remote PHP agents. It is a separate surface from the
+32 `arc` commands and is inherently PHP-runtime-bound, so it is
+intentionally not ported. Only `arc` is shipped.
 
 ## Gates
 
