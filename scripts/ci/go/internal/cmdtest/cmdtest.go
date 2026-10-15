@@ -1,0 +1,58 @@
+// Package cmdtest builds cmd binaries and runs them against golden
+// files. Goldens were generated from the Python oracles and diffed
+// byte-for-byte at generation time.
+package cmdtest
+
+import (
+	"bytes"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+)
+
+// Build compiles the main package in dir to a temp binary.
+func Build(t *testing.T, dir string) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "tool")
+	cmd := exec.Command("go", "build", "-o", bin, ".")
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build %s: %v\n%s", dir, err, out)
+	}
+	return bin
+}
+
+// Run executes bin with args in workdir, returning stdout and exit code.
+// Stderr must stay empty: the Python oracles print everything to stdout.
+func Run(t *testing.T, bin, workdir string, args ...string) (string, int) {
+	t.Helper()
+	cmd := exec.Command(bin, args...)
+	cmd.Dir = workdir
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if stderr.Len() != 0 {
+		t.Fatalf("%s %v wrote to stderr:\n%s", bin, args, stderr.String())
+	}
+	code := 0
+	if err != nil {
+		if exit, ok := err.(*exec.ExitError); ok {
+			code = exit.ExitCode()
+		} else {
+			t.Fatalf("%s %v failed to run: %v", bin, args, err)
+		}
+	}
+	return stdout.String(), code
+}
+
+// Golden reads a testdata golden file.
+func Golden(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
