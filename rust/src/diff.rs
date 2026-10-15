@@ -1512,13 +1512,38 @@ fn submit_via_client(cwd: &Path, options: &Options, mode: &SubmitMode) -> Result
 /// gains a `fields` object only when field flags are given, so default
 /// output is byte-identical to before. With `--create`, `--update`, or
 /// `--only`, the diff is submitted over Conduit instead.
+/// True when raw sources or non-git working copies take the G1 pipeline.
+fn uses_full_pipeline(cwd: &Path, options: &Options) -> bool {
+    diff_local::is_raw_diff_source(options.raw, options.raw_command.as_deref())
+        || matches!(detect_vcs(cwd), Some(vcs) if vcs != Vcs::Git)
+}
+
+/// True when field-affecting flags were given.
+fn has_field_flags(options: &Options) -> bool {
+    options.message_file.is_some() || options.reviewers.is_some() || options.cc.is_some()
+}
+
+/// Render the git read-only `--json` document for `range`.
+fn inspect_json_git(cwd: &Path, options: &Options, range: &Range) -> Result<Vec<u8>, String> {
+    let files = numstat_range(cwd, &range.base, range.head.as_deref())?;
+    let mut doc = diff_json(&range.base, &files);
+    if has_field_flags(options) {
+        let fields = collect_fields(cwd, options, &range.base, range.head.as_deref())?;
+        doc["fields"] = fields_json(&fields);
+    }
+    let mut text = match diff_submit::php_json_encode_pretty(&doc) {
+        Ok(text) => text,
+        Err(e) => return Err(format!("failed to encode JSON: {e}")),
+    };
+    text.push('\n');
+    Ok(text.into_bytes())
+}
+
 pub fn inspect(cwd: &Path, options: &Options) -> Result<Vec<u8>, String> {
     // Full-state routing (merge): raw sources and non-git working copies
     // take the parallel G1 pipeline; git and vcs-less shells keep the
     // locked baseline contract below.
-    if diff_local::is_raw_diff_source(options.raw, options.raw_command.as_deref())
-        || matches!(detect_vcs(cwd), Some(vcs) if vcs != Vcs::Git)
-    {
+    if uses_full_pipeline(cwd, options) {
         return inspect_full(cwd, options);
     }
     let resolved = prepare(cwd, options)?;
@@ -1531,16 +1556,7 @@ pub fn inspect(cwd: &Path, options: &Options) -> Result<Vec<u8>, String> {
     }
     let range = resolve_range(cwd, options)?;
     if options.json {
-        let files = numstat_range(cwd, &range.base, range.head.as_deref())?;
-        let mut doc = diff_json(&range.base, &files);
-        if options.message_file.is_some() || options.reviewers.is_some() || options.cc.is_some() {
-            let fields = collect_fields(cwd, options, &range.base, range.head.as_deref())?;
-            doc["fields"] = fields_json(&fields);
-        }
-        let mut text = diff_submit::php_json_encode_pretty(&doc)
-            .map_err(|e| format!("failed to encode JSON: {e}"))?;
-        text.push('\n');
-        Ok(text.into_bytes())
+        inspect_json_git(cwd, options, &range)
     } else {
         default_diff_output_range(cwd, &range.base, range.head.as_deref())
     }
@@ -1597,78 +1613,104 @@ pub const FULL_HELP: &str = "Supports: git, svn, hg\nGenerate a Differential dif
 /// greedy break at the last space past the width, ANSI escapes free,
 /// explicit newlines flush, every line (except the first when
 /// `with_prefix` is false) gains the indent.
-#[must_use]
-pub fn console_wrap(text: &str, indent: usize, with_prefix: bool) -> String {
-    let width = 78usize.saturating_sub(indent);
-    let chars: Vec<char> = text.chars().collect();
-    let mut lines: Vec<Vec<char>> = Vec::new();
-    let mut line: Vec<char> = Vec::new();
-    let mut break_pos: Option<usize> = None;
-    let mut len_after_break: usize = 0;
-    let mut line_len: usize = 0;
-    let mut index = 0;
-    while index < chars.len() {
-        let chr = chars[index];
-        if chr == '\u{1b}' {
-            loop {
-                line.push(chars[index]);
-                let done = chars[index] == 'm';
-                index += 1;
-                if done || index >= chars.len() {
-                    break;
-                }
-            }
-            continue;
+/// Mutable cursor for [`console_wrap`].
+struct WrapCursor {
+    line: Vec<char>,
+    break_pos: Option<usize>,
+    len_after_break: usize,
+    line_len: usize,
+}
+
+/// Copy one ANSI escape (`ESC ... m`) into `line`, advancing `index`.
+fn consume_ansi_escape(chars: &[char], index: &mut usize, line: &mut Vec<char>) {
+    loop {
+        line.push(chars[*index]);
+        let done = chars[*index] == 'm';
+        *index += 1;
+        if done || *index >= chars.len() {
+            break;
         }
-        line.push(chr);
-        line_len += 1;
-        len_after_break += 1;
-        if line_len > width
-            && let Some(pos) = break_pos
-        {
-            let mut slice = line[..pos].to_vec();
-            while slice.last() == Some(&' ') {
-                slice.pop();
-            }
-            slice.push('\n');
-            lines.push(slice);
-            line = line[pos..].to_vec();
-            line_len = len_after_break;
-            len_after_break = 0;
-            break_pos = None;
-        }
-        if chr == ' ' {
-            break_pos = Some(line.len());
-            len_after_break = 0;
-        }
-        if chr == '\n' {
-            lines.push(std::mem::take(&mut line));
-            len_after_break = 0;
-            line_len = 0;
-            break_pos = None;
-        }
-        index += 1;
     }
-    if !line.is_empty() {
-        lines.push(line);
+}
+
+/// Greedy-break the current line past `width`, trimming trailing spaces.
+fn try_wrap_break(cursor: &mut WrapCursor, lines: &mut Vec<Vec<char>>, width: usize) {
+    if cursor.line_len <= width {
+        return;
     }
+    let Some(pos) = cursor.break_pos else {
+        return;
+    };
+    let mut slice = cursor.line[..pos].to_vec();
+    while slice.last() == Some(&' ') {
+        slice.pop();
+    }
+    slice.push('\n');
+    lines.push(slice);
+    cursor.line = cursor.line[pos..].to_vec();
+    cursor.line_len = cursor.len_after_break;
+    cursor.len_after_break = 0;
+    cursor.break_pos = None;
+}
+
+/// Render wrapped lines with the indent prefix.
+fn apply_wrap_prefix(lines: &[Vec<char>], indent: usize, with_prefix: bool) -> String {
     let prefix = if indent > 0 {
         " ".repeat(indent)
     } else {
         String::new()
     };
-    lines
-        .iter()
-        .enumerate()
-        .map(|(number, wrapped)| {
-            let body: String = wrapped.iter().collect();
-            if number == 0 && !with_prefix {
-                body
-            } else {
-                format!("{prefix}{body}")
-            }
-        })
-        .collect()
+    let mut out = String::new();
+    for (number, wrapped) in lines.iter().enumerate() {
+        let body: String = wrapped.iter().collect();
+        if number == 0 && !with_prefix {
+            out.push_str(&body);
+        } else {
+            out.push_str(&prefix);
+            out.push_str(&body);
+        }
+    }
+    out
+}
+
+#[must_use]
+pub fn console_wrap(text: &str, indent: usize, with_prefix: bool) -> String {
+    let width = 78usize.saturating_sub(indent);
+    let chars: Vec<char> = text.chars().collect();
+    let mut lines: Vec<Vec<char>> = Vec::new();
+    let mut cursor = WrapCursor {
+        line: Vec::new(),
+        break_pos: None,
+        len_after_break: 0,
+        line_len: 0,
+    };
+    let mut index = 0;
+    while index < chars.len() {
+        let chr = chars[index];
+        if chr == '\u{1b}' {
+            consume_ansi_escape(&chars, &mut index, &mut cursor.line);
+            continue;
+        }
+        cursor.line.push(chr);
+        cursor.line_len += 1;
+        cursor.len_after_break += 1;
+        try_wrap_break(&mut cursor, &mut lines, width);
+        if chr == ' ' {
+            cursor.break_pos = Some(cursor.line.len());
+            cursor.len_after_break = 0;
+        }
+        if chr == '\n' {
+            lines.push(std::mem::take(&mut cursor.line));
+            cursor.len_after_break = 0;
+            cursor.line_len = 0;
+            cursor.break_pos = None;
+        }
+        index += 1;
+    }
+    if !cursor.line.is_empty() {
+        lines.push(cursor.line);
+    }
+    apply_wrap_prefix(&lines, indent, with_prefix)
 }
 
 /// Render a `phutil_console_confirm()` prompt: blank lines plus the wrapped
@@ -2204,6 +2246,181 @@ pub fn prepare_submit_full_with_commands(
     prepare_submit_full_with_commands_io(cwd, hg_cmd, svn_cmd, options, mode, report, &mut io)
 }
 
+/// Resolve the hg base for a full-state submit, rejecting `--head`.
+fn submit_full_hg_base(
+    cwd: &Path,
+    hg_cmd: &hg::HgCommand,
+    options: &Options,
+) -> Result<String, String> {
+    if options.head.is_some() {
+        return Err(
+            "Option '--head' is not supported under hg. Mercurial does not support --head yet."
+                .to_string(),
+        );
+    }
+    let mut resolved = options.clone();
+    if !resolved.paths.is_empty() {
+        resolved.commit = diff_local::parse_base_commit_argument(true, &resolved.paths)?;
+    }
+    resolve_hg_base_with(cwd, hg_cmd, &resolved)
+}
+
+/// Base commit plus head for a full-state submit.
+fn submit_full_base_head(
+    cwd: &Path,
+    hg_cmd: &hg::HgCommand,
+    options: &Options,
+    is_raw: bool,
+) -> Result<(String, Option<String>), String> {
+    if is_raw {
+        return Ok((String::new(), None));
+    }
+    match detect_vcs_kind(cwd) {
+        Some(VcsKind::Git) => {
+            let range = resolve_range(cwd, options)?;
+            Ok((range.base, range.head))
+        }
+        Some(VcsKind::Hg) => Ok((submit_full_hg_base(cwd, hg_cmd, options)?, None)),
+        Some(VcsKind::Svn) => Ok((String::new(), None)),
+        None => Err("not inside a git, hg, or svn working copy".to_string()),
+    }
+}
+
+/// Working-copy kind for a full-state submit (`None` for raw sources).
+fn submit_full_kind(cwd: &Path, is_raw: bool) -> Option<VcsKind> {
+    if is_raw { None } else { detect_vcs_kind(cwd) }
+}
+
+/// Render an svn diff-command path for [`svn::SvnDiffConfig`].
+fn svn_diff_cmd_string(path: PathBuf) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+/// Subversion parsed changes for a full-state submit, collected once.
+fn submit_svn_parsed<R: std::io::BufRead, W: std::io::Write>(
+    cwd: &Path,
+    svn_cmd: &svn::SvnCommand,
+    options: &Options,
+    is_raw: bool,
+    kind: Option<VcsKind>,
+    io: &mut diff_local::SvnPromptIo<'_, R, W>,
+) -> Result<Option<Vec<diff_local::ParsedChange>>, String> {
+    if is_raw || kind != Some(VcsKind::Svn) {
+        return Ok(None);
+    }
+    let script = diff_local::default_svn_diff_cmd().map(svn_diff_cmd_string);
+    let config = svn::SvnDiffConfig {
+        context: diff_local::DEFAULT_DIFF_CONTEXT_LINES,
+        diff_cmd: script.as_deref(),
+        diff_program: "diff",
+        diff_prefix: &[],
+    };
+    Ok(Some(diff_local::collect_svn_parsed_changes_with_io(
+        cwd,
+        svn_cmd,
+        &options.paths,
+        &config,
+        io,
+    )?))
+}
+
+/// Submit payload changes from collected svn parses.
+fn changes_from_parsed(parsed: &[diff_local::ParsedChange]) -> Vec<diff_submit::DiffChange> {
+    let mut changes = Vec::new();
+    for change in parsed {
+        changes.push(submit_change_from_parsed(change));
+    }
+    changes
+}
+
+/// Submit payload changes, reusing the collected svn parse when present.
+#[allow(clippy::too_many_arguments)]
+fn submit_full_changes<R: std::io::BufRead, W: std::io::Write>(
+    cwd: &Path,
+    hg_cmd: &hg::HgCommand,
+    svn_cmd: &svn::SvnCommand,
+    options: &Options,
+    base: &str,
+    head: Option<&str>,
+    svn_parsed: &Option<Vec<diff_local::ParsedChange>>,
+    io: &mut diff_local::SvnPromptIo<'_, R, W>,
+) -> Result<Vec<diff_submit::DiffChange>, String> {
+    if let Some(parsed) = svn_parsed {
+        return Ok(changes_from_parsed(parsed));
+    }
+    collect_submit_changes_with_io(cwd, hg_cmd, svn_cmd, options, base, head, io)
+}
+
+/// Reject `--draft --create` without server transactions (`:515-521`).
+fn check_submit_draft(mode: &SubmitMode, draft: bool) -> Result<(), String> {
+    if matches!(mode, SubmitMode::Create) {
+        diff_submit::check_draft_create(draft, false)?;
+    }
+    Ok(())
+}
+
+/// Update message for a full-state submit, if the mode needs one.
+fn submit_full_message(options: &Options, mode: &SubmitMode) -> Result<Option<String>, String> {
+    match mode {
+        SubmitMode::Update(_) => Ok(Some(update_message(options.message.as_deref())?)),
+        _ => Ok(None),
+    }
+}
+
+/// `Included changes:` entries from parsed changes.
+fn entries_from_parsed(parsed: &[diff_local::ParsedChange]) -> Vec<diff_local::ChangeEntry> {
+    let mut entries = Vec::new();
+    for change in parsed {
+        entries.push(change_entry_from_parsed(change));
+    }
+    entries
+}
+
+/// `Included changes:` entries for a raw full-state submit.
+fn submit_raw_entries(options: &Options) -> Result<Vec<diff_local::ChangeEntry>, String> {
+    let parsed = diff_local::parse_unified_diff(&read_raw_diff_text(options)?)?;
+    let changes = diff_local::without_message_changes(&parsed);
+    Ok(entries_from_parsed(&changes))
+}
+
+/// `Included changes:` entries for git or the hg/svn fallback.
+fn submit_repo_entries(
+    cwd: &Path,
+    hg_cmd: &hg::HgCommand,
+    svn_cmd: &svn::SvnCommand,
+    options: &Options,
+    base: &str,
+    head: Option<&str>,
+) -> Result<Vec<diff_local::ChangeEntry>, String> {
+    if detect_vcs_kind(cwd) == Some(VcsKind::Git) {
+        return diff_local::collect_change_entries(cwd, base, head);
+    }
+    let text = svn_or_hg_diff_text_with(cwd, hg_cmd, svn_cmd, options, base)?;
+    let parsed = diff_local::parse_unified_diff(&text)?;
+    Ok(entries_from_parsed(&parsed))
+}
+
+/// `Included changes:` entries for a full-state submit.
+#[allow(clippy::too_many_arguments)]
+fn submit_full_entries(
+    cwd: &Path,
+    hg_cmd: &hg::HgCommand,
+    svn_cmd: &svn::SvnCommand,
+    options: &Options,
+    base: &str,
+    head: Option<&str>,
+    is_raw: bool,
+    svn_parsed: &Option<Vec<diff_local::ParsedChange>>,
+) -> Result<Vec<diff_local::ChangeEntry>, String> {
+    if is_raw {
+        return submit_raw_entries(options);
+    }
+    if let Some(parsed) = svn_parsed {
+        return Ok(entries_from_parsed(parsed));
+    }
+    submit_repo_entries(cwd, hg_cmd, svn_cmd, options, base, head)
+}
+
 /// [`prepare_submit_full_with_commands`] with injected prompt stdio.
 ///
 /// Subversion collects its parsed changes once and derives both the
@@ -2219,57 +2436,20 @@ pub fn prepare_submit_full_with_commands_io<R: std::io::BufRead, W: std::io::Wri
     io: &mut diff_local::SvnPromptIo<'_, R, W>,
 ) -> Result<SubmitInput, String> {
     let is_raw = diff_local::is_raw_diff_source(options.raw, options.raw_command.as_deref());
-    let (base, head) = if is_raw {
-        (String::new(), None)
-    } else {
-        match detect_vcs_kind(cwd) {
-            Some(VcsKind::Git) => {
-                let range = resolve_range(cwd, options)?;
-                (range.base, range.head)
-            }
-            Some(VcsKind::Hg) => {
-                if options.head.is_some() {
-                    return Err(
-                        "Option '--head' is not supported under hg. Mercurial does not support --head yet."
-                            .to_string(),
-                    );
-                }
-                let mut resolved = options.clone();
-                if !resolved.paths.is_empty() {
-                    resolved.commit =
-                        diff_local::parse_base_commit_argument(true, &resolved.paths)?;
-                }
-                (resolve_hg_base_with(cwd, hg_cmd, &resolved)?, None)
-            }
-            Some(VcsKind::Svn) => (String::new(), None),
-            None => return Err("not inside a git, hg, or svn working copy".to_string()),
-        }
-    };
-    let kind = if is_raw { None } else { detect_vcs_kind(cwd) };
+    let (base, head) = submit_full_base_head(cwd, hg_cmd, options, is_raw)?;
+    let kind = submit_full_kind(cwd, is_raw);
     let head_ref = head.as_deref();
-    let svn_parsed = if !is_raw && kind == Some(VcsKind::Svn) {
-        let script =
-            diff_local::default_svn_diff_cmd().map(|path| path.to_string_lossy().into_owned());
-        let config = svn::SvnDiffConfig {
-            context: diff_local::DEFAULT_DIFF_CONTEXT_LINES,
-            diff_cmd: script.as_deref(),
-            diff_program: "diff",
-            diff_prefix: &[],
-        };
-        Some(diff_local::collect_svn_parsed_changes_with_io(
-            cwd,
-            svn_cmd,
-            &options.paths,
-            &config,
-            io,
-        )?)
-    } else {
-        None
-    };
-    let changes = match &svn_parsed {
-        Some(parsed) => parsed.iter().map(submit_change_from_parsed).collect(),
-        None => collect_submit_changes_with_io(cwd, hg_cmd, svn_cmd, options, &base, head_ref, io)?,
-    };
+    let svn_parsed = submit_svn_parsed(cwd, svn_cmd, options, is_raw, kind, io)?;
+    let changes = submit_full_changes(
+        cwd,
+        hg_cmd,
+        svn_cmd,
+        options,
+        &base,
+        head_ref,
+        &svn_parsed,
+        io,
+    )?;
     diff_submit::require_changes(changes.len())?;
     let spec_input = full_spec_input_with(cwd, hg_cmd, svn_cmd, kind, &base)?;
     let spec = diff_submit::diff_spec_json(
@@ -2279,32 +2459,18 @@ pub fn prepare_submit_full_with_commands_io<R: std::io::BufRead, W: std::io::Wri
         &spec_input,
     );
     let fields = full_submit_fields_with(cwd, hg_cmd, options, kind, mode, &base, head_ref)?;
-    if matches!(mode, SubmitMode::Create) {
-        diff_submit::check_draft_create(options.draft, false)?;
-    }
-    let message = match mode {
-        SubmitMode::Update(_) => Some(update_message(options.message.as_deref())?),
-        _ => None,
-    };
-    let entries: Vec<diff_local::ChangeEntry> = if is_raw {
-        let parsed = diff_local::parse_unified_diff(&read_raw_diff_text(options)?)?;
-        diff_local::without_message_changes(&parsed)
-            .iter()
-            .map(change_entry_from_parsed)
-            .collect()
-    } else if let Some(parsed) = svn_parsed.as_ref() {
-        parsed.iter().map(change_entry_from_parsed).collect()
-    } else {
-        match detect_vcs_kind(cwd) {
-            Some(VcsKind::Git) => diff_local::collect_change_entries(cwd, &base, head_ref)?,
-            _ => {
-                let parsed = diff_local::parse_unified_diff(&svn_or_hg_diff_text_with(
-                    cwd, hg_cmd, svn_cmd, options, &base,
-                )?)?;
-                parsed.iter().map(change_entry_from_parsed).collect()
-            }
-        }
-    };
+    check_submit_draft(mode, options.draft)?;
+    let message = submit_full_message(options, mode)?;
+    let entries = submit_full_entries(
+        cwd,
+        hg_cmd,
+        svn_cmd,
+        options,
+        &base,
+        head_ref,
+        is_raw,
+        &svn_parsed,
+    )?;
     Ok(SubmitInput {
         mode: mode.clone(),
         message,
@@ -2398,6 +2564,127 @@ pub fn prepare_full(cwd: &Path, options: &Options) -> Result<(Options, Option<Vc
 /// Inspect with full-state flows: raw/hg/svn sources plus hunk-carrying
 /// submits. Read-only output matches [`inspect`] for git; hg/svn/raw emit
 /// unified diff text (or a hunk-counted `--json` document).
+/// Base commit plus head for a full-state `--json` document, by VCS kind.
+fn inspect_full_json_base(
+    cwd: &Path,
+    options: &Options,
+    kind: VcsKind,
+) -> Result<(String, Option<String>), String> {
+    match kind {
+        VcsKind::Git => {
+            let range = resolve_range(cwd, options)?;
+            Ok((range.base, range.head))
+        }
+        VcsKind::Hg => Ok((resolve_hg_base(cwd, options)?, None)),
+        VcsKind::Svn => Ok((String::new(), None)),
+    }
+}
+
+/// Change entries for a full-state `--json` document, by VCS kind.
+fn inspect_full_json_entries(
+    cwd: &Path,
+    options: &Options,
+    kind: VcsKind,
+    base: &str,
+    head: Option<&str>,
+) -> Result<Vec<diff_local::ChangeEntry>, String> {
+    if kind == VcsKind::Git {
+        return diff_local::collect_change_entries(cwd, base, head);
+    }
+    let text = svn_or_hg_diff_text(cwd, options, base)?;
+    let parsed = diff_local::parse_unified_diff(&text)?;
+    let mut entries = Vec::new();
+    for change in &parsed {
+        entries.push(change_entry_from_parsed(change));
+    }
+    Ok(entries)
+}
+
+/// Project change entries to their numstat rows.
+fn inspect_full_json_files(entries: &[diff_local::ChangeEntry]) -> Vec<FileDiff> {
+    let mut files = Vec::new();
+    for entry in entries {
+        files.push(entry.current.clone());
+    }
+    files
+}
+
+/// Attach `fields` to a full-state `--json` document when field flags exist.
+fn attach_inspect_full_fields(
+    cwd: &Path,
+    options: &Options,
+    kind: VcsKind,
+    base: &str,
+    head: Option<&str>,
+    doc: &mut serde_json::Value,
+) -> Result<(), String> {
+    if !has_field_flags(options) {
+        return Ok(());
+    }
+    if kind == VcsKind::Git {
+        let fields = collect_fields(cwd, options, base, head)?;
+        doc["fields"] = fields_json(&fields);
+    } else {
+        doc["fields"] = serde_json::json!({});
+    }
+    Ok(())
+}
+
+/// Encode a `--json` document with its trailing newline.
+fn encode_json_doc(doc: &serde_json::Value) -> Result<Vec<u8>, String> {
+    let mut text = match diff_submit::php_json_encode_pretty(doc) {
+        Ok(text) => text,
+        Err(e) => return Err(format!("failed to encode JSON: {e}")),
+    };
+    text.push('\n');
+    Ok(text.into_bytes())
+}
+
+/// Render a full-state read-only `--json` document for `kind`.
+fn inspect_full_json(cwd: &Path, options: &Options, kind: VcsKind) -> Result<Vec<u8>, String> {
+    let (base, head) = inspect_full_json_base(cwd, options, kind)?;
+    let head_ref = head.as_deref();
+    let entries = inspect_full_json_entries(cwd, options, kind, &base, head_ref)?;
+    let files = inspect_full_json_files(&entries);
+    let mut doc = diff_json(&base, &files);
+    attach_inspect_full_fields(cwd, options, kind, &base, head_ref, &mut doc)?;
+    encode_json_doc(&doc)
+}
+
+/// Read-only git text output for [`inspect_full`].
+fn inspect_full_text_git(cwd: &Path, options: &Options) -> Result<Vec<u8>, String> {
+    let range = resolve_range(cwd, options)?;
+    default_diff_output_range(cwd, &range.base, range.head.as_deref())
+}
+
+/// Read-only hg text output for [`inspect_full`].
+fn inspect_full_text_hg(cwd: &Path, options: &Options) -> Result<Vec<u8>, String> {
+    let base = resolve_hg_base(cwd, options)?;
+    let text = svn_or_hg_diff_text(cwd, options, &base)?;
+    if text.is_empty() {
+        return Err(diff_local::NO_CHANGES_FOUND.to_string());
+    }
+    Ok(text.into_bytes())
+}
+
+/// Read-only svn text output for [`inspect_full`].
+fn inspect_full_text_svn(cwd: &Path, options: &Options) -> Result<Vec<u8>, String> {
+    let text = svn_or_hg_diff_text(cwd, options, "")?;
+    if text.is_empty() {
+        return Err(diff_local::NO_CHANGES_FOUND.to_string());
+    }
+    Ok(text.into_bytes())
+}
+
+/// Read-only text output for [`inspect_full`], by VCS kind.
+fn inspect_full_text(cwd: &Path, options: &Options, kind: VcsKind) -> Result<Vec<u8>, String> {
+    match kind {
+        VcsKind::Git => inspect_full_text_git(cwd, options),
+        VcsKind::Hg => inspect_full_text_hg(cwd, options),
+        VcsKind::Svn => inspect_full_text_svn(cwd, options),
+    }
+}
+
 pub fn inspect_full(cwd: &Path, options: &Options) -> Result<Vec<u8>, String> {
     let (resolved, kind) = prepare_full(cwd, options)?;
     let options = &resolved;
@@ -2411,58 +2698,9 @@ pub fn inspect_full(cwd: &Path, options: &Options) -> Result<Vec<u8>, String> {
         return Err("not inside a git, hg, or svn working copy".to_string());
     };
     if options.json {
-        let (base, head) = match kind {
-            VcsKind::Git => {
-                let range = resolve_range(cwd, options)?;
-                (range.base, range.head)
-            }
-            VcsKind::Hg => (resolve_hg_base(cwd, options)?, None),
-            VcsKind::Svn => (String::new(), None),
-        };
-        let head_ref = head.as_deref();
-        let entries: Vec<diff_local::ChangeEntry> = match kind {
-            VcsKind::Git => diff_local::collect_change_entries(cwd, &base, head_ref)?,
-            _ => {
-                let parsed =
-                    diff_local::parse_unified_diff(&svn_or_hg_diff_text(cwd, options, &base)?)?;
-                parsed.iter().map(change_entry_from_parsed).collect()
-            }
-        };
-        let files: Vec<FileDiff> = entries.iter().map(|entry| entry.current.clone()).collect();
-        let mut doc = diff_json(&base, &files);
-        if options.message_file.is_some() || options.reviewers.is_some() || options.cc.is_some() {
-            if kind == VcsKind::Git {
-                let fields = collect_fields(cwd, options, &base, head_ref)?;
-                doc["fields"] = fields_json(&fields);
-            } else {
-                doc["fields"] = serde_json::json!({});
-            }
-        }
-        let mut text = diff_submit::php_json_encode_pretty(&doc)
-            .map_err(|e| format!("failed to encode JSON: {e}"))?;
-        text.push('\n');
-        return Ok(text.into_bytes());
-    }
-    match kind {
-        VcsKind::Git => {
-            let range = resolve_range(cwd, options)?;
-            default_diff_output_range(cwd, &range.base, range.head.as_deref())
-        }
-        VcsKind::Hg => {
-            let base = resolve_hg_base(cwd, options)?;
-            let text = svn_or_hg_diff_text(cwd, options, &base)?;
-            if text.is_empty() {
-                return Err(diff_local::NO_CHANGES_FOUND.to_string());
-            }
-            Ok(text.into_bytes())
-        }
-        VcsKind::Svn => {
-            let text = svn_or_hg_diff_text(cwd, options, "")?;
-            if text.is_empty() {
-                return Err(diff_local::NO_CHANGES_FOUND.to_string());
-            }
-            Ok(text.into_bytes())
-        }
+        inspect_full_json(cwd, options, kind)
+    } else {
+        inspect_full_text(cwd, options, kind)
     }
 }
 
@@ -2661,6 +2899,81 @@ pub fn unique_temp_subdir(prefix: &str) -> Result<PathBuf, String> {
 /// document is written to `edit.*/{name}`, the editor runs through the
 /// shell with stdio inherited, and the file is read back. Newlines convert
 /// to CRLF and back on Windows (`:61-63,132-134`).
+/// Editor-bound newlines: CRLF on Windows, verbatim elsewhere (`:61-63`).
+fn edit_content_for_platform(initial: &str) -> String {
+    if cfg!(windows) {
+        initial.replace('\n', "\r\n")
+    } else {
+        initial.to_string()
+    }
+}
+
+/// Convert editor output newlines back (`:132-134`).
+fn edit_result_for_platform(result: String) -> String {
+    if cfg!(windows) {
+        result.replace("\r\n", "\n")
+    } else {
+        result
+    }
+}
+
+/// Write the editor document to `edit.*/{name}`, returning `(dir, path)`.
+fn create_edit_document(initial: &str, name: &str) -> Result<(PathBuf, PathBuf), String> {
+    let content = edit_content_for_platform(initial);
+    let dir = unique_temp_subdir("edit.")?;
+    let path = dir.join(editor_file_name(name));
+    if std::fs::write(&path, &content).is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err("failed to write editor temporary file".to_string());
+    }
+    Ok((dir, path))
+}
+
+/// Shell command running `editor` over `path` at `line_offset`.
+fn editor_shell_command(editor: &str, line_offset: u32, path: &Path) -> String {
+    let flag = editor_offset_flag(editor, line_offset);
+    let path_text = path.to_string_lossy();
+    if flag.is_empty() {
+        format!("{} {}", editor, shell_quote(&path_text))
+    } else {
+        format!("{} {} {}", editor, flag, shell_quote(&path_text))
+    }
+}
+
+/// Forgive a nonzero editor exit for `vi`/`vim` when the `+Q +q`
+/// diagnostic also fails (`:94-117`).
+fn maybe_forgive_editor_exit(editor: &str, code: i32) -> i32 {
+    if code == 0 {
+        return code;
+    }
+    let binary = editor.rsplit(['/', '\\']).next().unwrap_or(editor);
+    if binary != "vi" && binary != "vim" {
+        return code;
+    }
+    let diagnostic_failed = match diff_local::shell_command_status(&format!("{binary} +Q +q")) {
+        Ok(status) => !status.success(),
+        Err(_) => true,
+    };
+    if forgive_editor_exit(binary, diagnostic_failed) {
+        0
+    } else {
+        code
+    }
+}
+
+/// Read the editor result back, converting newlines and cleaning up.
+fn finish_edit_document(path: &Path, dir: &Path) -> Result<String, String> {
+    let result = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(dir);
+            return Err("failed to read editor temporary file".to_string());
+        }
+    };
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(edit_result_for_platform(result))
+}
+
 pub fn edit_interactively(
     initial: &str,
     name: &str,
@@ -2668,17 +2981,7 @@ pub fn edit_interactively(
     preferred_editor: Option<&str>,
     line_offset: u32,
 ) -> Result<String, String> {
-    let content = if cfg!(windows) {
-        initial.replace('\n', "\r\n")
-    } else {
-        initial.to_string()
-    };
-    let dir = unique_temp_subdir("edit.")?;
-    let path = dir.join(editor_file_name(name));
-    if std::fs::write(&path, &content).is_err() {
-        let _ = std::fs::remove_dir_all(&dir);
-        return Err("failed to write editor temporary file".to_string());
-    }
+    let (dir, path) = create_edit_document(initial, name)?;
     let editor_env = std::env::var("EDITOR").ok();
     let editor = resolve_editor(
         preferred_editor,
@@ -2690,40 +2993,14 @@ pub fn edit_interactively(
     if let Some(message) = task_message {
         println!("{message}");
     }
-    let flag = editor_offset_flag(&editor, line_offset);
-    let path_text = path.to_string_lossy();
-    let command = if flag.is_empty() {
-        format!("{} {}", editor, shell_quote(&path_text))
-    } else {
-        format!("{} {} {}", editor, flag, shell_quote(&path_text))
-    };
+    let command = editor_shell_command(&editor, line_offset, &path);
     let status = diff_local::shell_command_status(&command)?;
-    let mut code = status.code().unwrap_or(1);
-    if code != 0 {
-        let binary = editor.rsplit(['/', '\\']).next().unwrap_or(&editor);
-        if binary == "vi" || binary == "vim" {
-            let diagnostic_failed = diff_local::shell_command_status(&format!("{binary} +Q +q"))
-                .map(|s| !s.success())
-                .unwrap_or(true);
-            if forgive_editor_exit(binary, diagnostic_failed) {
-                code = 0;
-            }
-        }
-    }
+    let code = maybe_forgive_editor_exit(&editor, status.code().unwrap_or(1));
     if code != 0 {
         let _ = std::fs::remove_dir_all(&dir);
         return Err(editor_exit_error(code));
     }
-    let result = std::fs::read_to_string(&path).map_err(|_| {
-        let _ = std::fs::remove_dir_all(&dir);
-        "failed to read editor temporary file".to_string()
-    })?;
-    let _ = std::fs::remove_dir_all(&dir);
-    if cfg!(windows) {
-        Ok(result.replace("\r\n", "\n"))
-    } else {
-        Ok(result)
-    }
+    finish_edit_document(&path, &dir)
 }
 
 /// Scratch file path under a VCS metadata dir: `<metadata>/arc/<name>`.
