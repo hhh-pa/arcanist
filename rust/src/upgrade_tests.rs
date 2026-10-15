@@ -102,7 +102,7 @@ fn fresh_repo_reports_branch_head_and_cleanliness() {
 #[test]
 fn behind_counts_come_from_local_refs_only() {
     let origin = TempDir::new("origin");
-    git(&origin.path, &["init", "-q", "--bare"]);
+    git(&origin.path, &["init", "-q", "--bare", "-b", "master"]);
     let repo = fresh_repo("ahead");
     commit(&repo.path, "a.txt");
     git(
@@ -263,7 +263,7 @@ fn apply_refuses_dirty_checkouts() {
 #[test]
 fn apply_pulls_from_origin() {
     let origin = TempDir::new("applyorigin");
-    git(&origin.path, &["init", "-q", "--bare"]);
+    git(&origin.path, &["init", "-q", "--bare", "-b", "master"]);
     let seed = fresh_repo("applyseed");
     commit(&seed.path, "a.txt");
     git(
@@ -410,6 +410,15 @@ fn release_doc(tag: &str, assets: &str) -> String {
 fn asset_entry(name: &str, size: u64, base: &str) -> String {
     format!(
         "{{\"name\": \"{name}\", \"size\": {size}, \"browser_download_url\": \"{base}dl/{name}\"}}"
+    )
+}
+
+/// A release asset whose size and SHA-256 checksum match `body`.
+fn asset_entry_checked(name: &str, body: &[u8], base: &str) -> String {
+    format!(
+        "{{\"name\": \"{name}\", \"size\": {}, \"browser_download_url\": \"{base}dl/{name}\", \"digest\": \"sha256:{}\"}}",
+        body.len(),
+        sha256_hex(body)
     )
 }
 
@@ -714,7 +723,8 @@ fn download_accepts_matching_size() {
         vec![route("/dl/", "200 OK", b"payload-bytes".to_vec())],
         Arc::new(Mutex::new(Vec::new())),
     );
-    let bytes = download_release_bytes(&format!("{base}dl/x"), 13).unwrap();
+    let digest = format!("sha256:{}", sha256_hex(b"payload-bytes"));
+    let bytes = download_release_bytes(&format!("{base}dl/x"), 13, Some(&digest)).unwrap();
     assert_eq!(bytes, b"payload-bytes");
 }
 
@@ -726,7 +736,8 @@ fn download_refuses_mismatch_empty_and_http_errors() {
         vec![route("/dl/", "200 OK", b"short".to_vec())],
         Arc::new(Mutex::new(Vec::new())),
     );
-    let err = download_release_bytes(&format!("{base}dl/x"), 50).unwrap_err();
+    let digest = format!("sha256:{}", sha256_hex(b"short"));
+    let err = download_release_bytes(&format!("{base}dl/x"), 50, Some(&digest)).unwrap_err();
     assert!(err.contains("does not match expected file size"), "{err}");
 
     let (listener, base, _) = mock_listener();
@@ -735,7 +746,7 @@ fn download_refuses_mismatch_empty_and_http_errors() {
         vec![route("/dl/", "200 OK", Vec::new())],
         Arc::new(Mutex::new(Vec::new())),
     );
-    let err = download_release_bytes(&format!("{base}dl/x"), 0).unwrap_err();
+    let err = download_release_bytes(&format!("{base}dl/x"), 0, None).unwrap_err();
     assert!(err.contains("empty release asset"), "{err}");
 
     let (listener, base, _) = mock_listener();
@@ -744,8 +755,68 @@ fn download_refuses_mismatch_empty_and_http_errors() {
         vec![route("/dl/", "500 Internal Server Error", b"boom".to_vec())],
         Arc::new(Mutex::new(Vec::new())),
     );
-    let err = download_release_bytes(&format!("{base}dl/x"), 4).unwrap_err();
+    let digest = format!("sha256:{}", sha256_hex(b"boom"));
+    let err = download_release_bytes(&format!("{base}dl/x"), 4, Some(&digest)).unwrap_err();
     assert!(err.contains("download failed"), "{err}");
+}
+
+#[test]
+fn sha256_matches_standard_vectors() {
+    // Independently verified with `sha256sum`.
+    assert_eq!(
+        sha256_hex(b""),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert_eq!(
+        sha256_hex(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(
+        sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+    );
+    // Multi-block input (200 bytes cross block and padding boundaries).
+    let long = vec![0x61u8; 200];
+    assert_eq!(
+        sha256_hex(&long),
+        "c2a908d98f5df987ade41b5fce213067efbcc21ef2240212a41e54b5e7c28ae5"
+    );
+}
+
+#[test]
+fn download_refuses_checksum_problems_before_and_after_fetch() {
+    // Missing, foreign-algorithm, and malformed checksums fail before
+    // any fetch: no routes are served, and the request log stays empty.
+    for (digest, needle) in [
+        (None, "without a SHA-256 checksum"),
+        (
+            Some("md5:d41d8cd98f00b204e9800998ecf8427e"),
+            "unsupported checksum",
+        ),
+        (Some("sha256:xyz"), "malformed SHA-256 checksum"),
+        (Some("  "), "without a SHA-256 checksum"),
+    ] {
+        let (listener, base, seen) = mock_listener();
+        run_mock(listener, vec![], seen.clone());
+        let err = download_release_bytes(&format!("{base}dl/x"), 13, digest).unwrap_err();
+        assert!(err.contains(needle), "{err}");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "pre-download gate must not fetch: {:?}",
+            seen.lock().unwrap()
+        );
+    }
+
+    // A well-formed checksum for different bytes fails after the fetch.
+    let (listener, base, _) = mock_listener();
+    run_mock(
+        listener,
+        vec![route("/dl/", "200 OK", b"payload-bytes".to_vec())],
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let other = format!("sha256:{}", sha256_hex(b"other-bytes!"));
+    let err = download_release_bytes(&format!("{base}dl/other"), 13, Some(&other)).unwrap_err();
+    assert!(err.contains("does not match the release checksum"), "{err}");
 }
 
 #[test]
@@ -869,7 +940,7 @@ fn execute_apply_updates_copy_end_to_end() {
     let (listener, base, seen) = mock_listener();
     let doc = release_doc(
         "v9.9.9",
-        &format!("[{}]", asset_entry(&name, body.len() as u64, &base)),
+        &format!("[{}]", asset_entry_checked(&name, body, &base)),
     );
     run_mock(
         listener,
@@ -922,6 +993,10 @@ fn execute_apply_updates_copy_end_to_end() {
     assert_eq!(json["updated"], serde_json::json!(true));
     assert_eq!(json["asset"]["name"], serde_json::json!(name));
     assert_eq!(json["latest"], serde_json::json!("v9.9.9"));
+    assert_eq!(
+        json["asset"]["digest"],
+        serde_json::json!(format!("sha256:{}", sha256_hex(body)))
+    );
 }
 
 #[test]
@@ -962,7 +1037,7 @@ fn execute_apply_decline_aborts_cleanly() {
     let (listener, base, seen) = mock_listener();
     let doc = release_doc(
         "v9.9.9",
-        &format!("[{}]", asset_entry(&name, body.len() as u64, &base)),
+        &format!("[{}]", asset_entry_checked(&name, body, &base)),
     );
     run_mock(
         listener,
@@ -1010,7 +1085,7 @@ fn execute_apply_json_reports_result() {
     let (listener, base, _) = mock_listener();
     let doc = release_doc(
         "v9.9.9",
-        &format!("[{}]", asset_entry(&name, body.len() as u64, &base)),
+        &format!("[{}]", asset_entry_checked(&name, body, &base)),
     );
     run_mock(
         listener,
@@ -1039,7 +1114,10 @@ fn execute_apply_download_failure_keeps_old() {
     let exe = exe_copy(&tmp.path, "tool-copy.exe", b"old-bytes");
     let name = format!("arc-rs-{}.exe", platform_tag());
     let (listener, base, _) = mock_listener();
-    let doc = release_doc("v9.9.9", &format!("[{}]", asset_entry(&name, 9, &base)));
+    let doc = release_doc(
+        "v9.9.9",
+        &format!("[{}]", asset_entry_checked(&name, b"new-bytes", &base)),
+    );
     run_mock(
         listener,
         vec![
@@ -1056,12 +1134,74 @@ fn execute_apply_download_failure_keeps_old() {
 }
 
 #[test]
+fn execute_apply_checksum_mismatch_keeps_old() {
+    let tmp = TempDir::new("sumfail");
+    let exe = exe_copy(&tmp.path, "tool-copy.exe", b"old-bytes");
+    let body = b"tampered-bytes";
+    let name = format!("arc-rs-{}.exe", platform_tag());
+    let (listener, base, seen) = mock_listener();
+    // Well-formed size, but the checksum is for different bytes.
+    let wrong = format!("sha256:{}", sha256_hex(b"genuine-bytes"));
+    let doc = format!(
+        "{{\"tag_name\": \"v9.9.9\", \"assets\": [{{\"name\": \"{name}\", \"size\": {}, \
+         \"browser_download_url\": \"{base}dl/{name}\", \"digest\": \"{wrong}\"}}]}}",
+        body.len()
+    );
+    run_mock(
+        listener,
+        vec![
+            json_route("releases/latest", &doc),
+            route("/dl/", "200 OK", body.to_vec()),
+        ],
+        seen.clone(),
+    );
+    let opts = apply_opts(&base, "0.1.0", &exe);
+    let err = execute_apply(&tmp.path, &opts, &confirm_yes).unwrap_err();
+    assert!(err.contains("does not match the release checksum"), "{err}");
+    assert_eq!(std::fs::read(&exe).unwrap(), b"old-bytes");
+    assert!(saw(&seen, "/dl/"));
+    assert_no_leftovers(&tmp.path);
+}
+
+#[test]
+fn execute_apply_missing_digest_downloads_nothing() {
+    let tmp = TempDir::new("nodigest");
+    let exe = exe_copy(&tmp.path, "tool-copy.exe", b"old-bytes");
+    let body = b"new-bytes";
+    let name = format!("arc-rs-{}.exe", platform_tag());
+    let (listener, base, seen) = mock_listener();
+    // No `digest` key at all: refused before any download.
+    let doc = release_doc(
+        "v9.9.9",
+        &format!("[{}]", asset_entry(&name, body.len() as u64, &base)),
+    );
+    run_mock(
+        listener,
+        vec![
+            json_route("releases/latest", &doc),
+            route("/dl/", "200 OK", body.to_vec()),
+        ],
+        seen.clone(),
+    );
+    let opts = apply_opts(&base, "0.1.0", &exe);
+    let err = execute_apply(&tmp.path, &opts, &confirm_yes).unwrap_err();
+    assert!(err.contains("without a SHA-256 checksum"), "{err}");
+    assert_eq!(std::fs::read(&exe).unwrap(), b"old-bytes");
+    assert!(saw(&seen, "releases/latest"));
+    assert!(!saw(&seen, "/dl/"));
+    assert_no_leftovers(&tmp.path);
+}
+
+#[test]
 fn execute_apply_readonly_fails_before_download() {
     let tmp = TempDir::new("rofail");
     let exe = exe_copy(&tmp.path, "tool-copy.exe", b"old-bytes");
     let name = format!("arc-rs-{}.exe", platform_tag());
     let (listener, base, seen) = mock_listener();
-    let doc = release_doc("v9.9.9", &format!("[{}]", asset_entry(&name, 9, &base)));
+    let doc = release_doc(
+        "v9.9.9",
+        &format!("[{}]", asset_entry_checked(&name, b"new-bytes", &base)),
+    );
     run_mock(
         listener,
         vec![

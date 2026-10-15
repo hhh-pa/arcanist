@@ -7,8 +7,8 @@
 //! `--apply` self-updates the single static binary instead of reporting:
 //! it resolves the release channel, fetches the latest stable GitHub
 //! release, prompts, downloads the current-platform asset over plain
-//! HTTPS, verifies its size, and atomically replaces the running
-//! executable.
+//! HTTPS, verifies its size and SHA-256 checksum, and atomically
+//! replaces the running executable.
 //!
 //! Release channel: the `github.com` repo of the enclosing checkout's
 //! `fork` remote (else `origin`), or [`DEFAULT_RELEASE_REPO`] outside
@@ -475,6 +475,9 @@ pub struct ReleaseAsset {
     pub size: u64,
     /// Public download URL (`browser_download_url`).
     pub url: String,
+    /// Release checksum (`digest`, e.g. `sha256:<hex>`); `None` when the
+    /// release carries none (installation is then refused).
+    pub digest: Option<String>,
 }
 
 /// Where `--apply` upgrades from.
@@ -673,7 +676,9 @@ pub fn select_asset(release: &serde_json::Value, platform: &str) -> Result<Relea
 }
 
 /// Installable candidates: assets with a name, a URL, and a nonzero
-/// size (checksum files and malformed entries never qualify).
+/// size (sidecar checksum files and malformed entries never qualify).
+/// The checksum rides along for the install-time gate; selection itself
+/// is by name only.
 fn parse_assets(raw: &[serde_json::Value]) -> Vec<ReleaseAsset> {
     let mut out = Vec::new();
     for asset in raw {
@@ -692,10 +697,16 @@ fn parse_assets(raw: &[serde_json::Value]) -> Vec<ReleaseAsset> {
         if name.is_empty() || url.is_empty() || size == 0 {
             continue;
         }
+        let digest = asset
+            .get("digest")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string);
         out.push(ReleaseAsset {
             name: name.to_string(),
             size,
             url: url.to_string(),
+            digest,
         });
     }
     out
@@ -808,13 +819,180 @@ fn newer_suffix(latest: Option<&str>, current: Option<&str>) -> bool {
 }
 
 /// Download the release binary over plain HTTPS (size-scaled timeout)
-/// and verify its size; any failure leaves the executable untouched.
-pub fn download_release_bytes(url: &str, expected_size: u64) -> Result<Vec<u8>, String> {
+/// and verify its size and SHA-256 checksum; any failure leaves the
+/// executable untouched.
+pub fn download_release_bytes(
+    url: &str,
+    expected_size: u64,
+    digest: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    let want_hex = pre_download_checks(expected_size, digest)?;
     let bytes =
         download::download_bytes_with_timeout(url, download::download_timeout(expected_size))?;
     verify_download_size(bytes.len() as u64, expected_size)?;
+    verify_sha256_hex(&bytes, &want_hex)?;
     Ok(bytes)
 }
+
+/// Pre-download gate: refuse empty assets and releases without a usable
+/// SHA-256 checksum, before any byte is fetched.
+fn pre_download_checks(expected_size: u64, digest: Option<&str>) -> Result<String, String> {
+    if expected_size == 0 {
+        return Err("refusing to install an empty release asset (expected size 0).".to_string());
+    }
+    require_sha256_hex(digest)
+}
+
+/// The expected SHA-256 hex from a release `digest` value
+/// (`sha256:<hex>`); fail-closed on missing, foreign-algorithm, or
+/// malformed checksums.
+fn require_sha256_hex(digest: Option<&str>) -> Result<String, String> {
+    let Some(value) = digest.map(str::trim).filter(|text| !text.is_empty()) else {
+        return Err("refusing to install a release asset without a SHA-256 checksum.".to_string());
+    };
+    let Some(hex) = value
+        .strip_prefix("sha256:")
+        .or_else(|| value.strip_prefix("SHA256:"))
+    else {
+        return Err(format!(
+            "refusing to install a release asset with an unsupported checksum ({value:?}); want \"sha256:<hex>\"."
+        ));
+    };
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(
+            "refusing to install a release asset with a malformed SHA-256 checksum.".to_string(),
+        );
+    }
+    Ok(hex.to_ascii_lowercase())
+}
+
+/// Fail when the downloaded bytes do not match the release checksum.
+fn verify_sha256_hex(bytes: &[u8], want_hex: &str) -> Result<(), String> {
+    let got_hex = sha256_hex(bytes);
+    if got_hex != want_hex {
+        return Err(format!(
+            "Downloaded file checksum ({got_hex}) does not match the release checksum ({want_hex}). \
+             This download may be incomplete or corrupt."
+        ));
+    }
+    Ok(())
+}
+
+/// Lowercase SHA-256 hex of `data` (FIPS 180-4, dependency-free).
+#[must_use]
+pub fn sha256_hex(data: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::with_capacity(64);
+    for byte in sha256_digest(data) {
+        text.push(HEX[usize::from(byte >> 4)] as char);
+        text.push(HEX[usize::from(byte & 15)] as char);
+    }
+    text
+}
+
+fn sha256_digest(data: &[u8]) -> [u8; 32] {
+    let mut state = [
+        0x6a09_e667u32,
+        0xbb67_ae85,
+        0x3c6e_f372,
+        0xa54f_f53a,
+        0x510e_527f,
+        0x9b05_688c,
+        0x1f83_d9ab,
+        0x5be0_cd19,
+    ];
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut input = data.to_vec();
+    input.push(0x80);
+    while input.len() % 64 != 56 {
+        input.push(0);
+    }
+    input.extend_from_slice(&bit_len.to_be_bytes());
+    for block in input.as_chunks::<64>().0 {
+        sha256_compress(&mut state, block);
+    }
+    let mut digest = [0u8; 32];
+    for (index, word) in state.iter().enumerate() {
+        digest[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    digest
+}
+
+fn sha256_compress(state: &mut [u32; 8], block: &[u8; 64]) {
+    let schedule = sha256_schedule(block);
+    let mut work = *state;
+    for (index, round) in SHA256_K.iter().enumerate() {
+        sha256_round(&mut work, schedule[index], *round);
+    }
+    for (slot, word) in state.iter_mut().zip(work) {
+        *slot = slot.wrapping_add(word);
+    }
+}
+
+fn sha256_schedule(block: &[u8; 64]) -> [u32; 64] {
+    let mut schedule = [0u32; 64];
+    for (index, word) in schedule.iter_mut().take(16).enumerate() {
+        let start = index * 4;
+        *word = u32::from_be_bytes([
+            block[start],
+            block[start + 1],
+            block[start + 2],
+            block[start + 3],
+        ]);
+    }
+    for index in 16..64 {
+        let low = schedule[index - 15];
+        let high = schedule[index - 2];
+        let small0 = low.rotate_right(7) ^ low.rotate_right(18) ^ (low >> 3);
+        let small1 = high.rotate_right(17) ^ high.rotate_right(19) ^ (high >> 10);
+        schedule[index] = schedule[index - 16]
+            .wrapping_add(small0)
+            .wrapping_add(schedule[index - 7])
+            .wrapping_add(small1);
+    }
+    schedule
+}
+
+fn sha256_round(work: &mut [u32; 8], schedule_word: u32, round: u32) {
+    let sum1 = work[4].rotate_right(6) ^ work[4].rotate_right(11) ^ work[4].rotate_right(25);
+    let choice = (work[4] & work[5]) ^ ((!work[4]) & work[6]);
+    let temp1 = work[7]
+        .wrapping_add(sum1)
+        .wrapping_add(choice)
+        .wrapping_add(round)
+        .wrapping_add(schedule_word);
+    let sum0 = work[0].rotate_right(2) ^ work[0].rotate_right(13) ^ work[0].rotate_right(22);
+    let majority = (work[0] & work[1]) ^ (work[0] & work[2]) ^ (work[1] & work[2]);
+    let temp2 = sum0.wrapping_add(majority);
+    work[7] = work[6];
+    work[6] = work[5];
+    work[5] = work[4];
+    work[4] = work[3].wrapping_add(temp1);
+    work[3] = work[2];
+    work[2] = work[1];
+    work[1] = work[0];
+    work[0] = temp1.wrapping_add(temp2);
+}
+
+#[rustfmt::skip]
+const SHA256_K: [u32; 64] = [
+    0x428a_2f98, 0x7137_4491, 0xb5c0_fbcf, 0xe9b5_dba5,
+    0x3956_c25b, 0x59f1_11f1, 0x923f_82a4, 0xab1c_5ed5,
+    0xd807_aa98, 0x1283_5b01, 0x2431_85be, 0x550c_7dc3,
+    0x72be_5d74, 0x80de_b1fe, 0x9bdc_06a7, 0xc19b_f174,
+    0xe49b_69c1, 0xefbe_4786, 0x0fc1_9dc6, 0x240c_a1cc,
+    0x2de9_2c6f, 0x4a74_84aa, 0x5cb0_a9dc, 0x76f9_88da,
+    0x983e_5152, 0xa831_c66d, 0xb003_27c8, 0xbf59_7fc7,
+    0xc6e0_0bf3, 0xd5a7_9147, 0x06ca_6351, 0x1429_2967,
+    0x27b7_0a85, 0x2e1b_2138, 0x4d2c_6dfc, 0x5338_0d13,
+    0x650a_7354, 0x766a_0abb, 0x81c2_c92e, 0x9272_2c85,
+    0xa2bf_e8a1, 0xa81a_664b, 0xc24b_8b70, 0xc76c_51a3,
+    0xd192_e819, 0xd699_0624, 0xf40e_3585, 0x106a_a070,
+    0x19a4_c116, 0x1e37_6c08, 0x2748_774c, 0x34b0_bcb5,
+    0x391c_0cb3, 0x4ed8_aa4a, 0x5b9c_ca4f, 0x682e_6ff3,
+    0x748f_82ee, 0x78a5_636f, 0x84c8_7814, 0x8cc7_0208,
+    0x90be_fffa, 0xa450_6ceb, 0xbef9_a3f7, 0xc671_78f2,
+];
 
 fn verify_download_size(got: u64, expected: u64) -> Result<(), String> {
     if expected == 0 {
@@ -1062,6 +1240,7 @@ pub fn apply_result_json(report: &ApplyReport) -> serde_json::Value {
             "name": asset.name,
             "size": asset.size,
             "url": asset.url,
+            "digest": asset.digest,
         })),
         "path": report.path.display().to_string(),
         "backup": report.backup.as_ref().map(|path| path.display().to_string()),
@@ -1219,7 +1398,7 @@ fn download_install_report(
     asset: &ReleaseAsset,
 ) -> Result<ApplyReport, String> {
     let upgrading = upgrading_line(&target.channel, opts.ansi);
-    let bytes = download_release_bytes(&asset.url, asset.size)?;
+    let bytes = download_release_bytes(&asset.url, asset.size, asset.digest.as_deref())?;
     let backup = install_bytes_at(exe, &bytes)?;
     let mut stdout_text = downloading_line(&asset.name, asset.size, opts.ansi);
     stdout_text.push_str(&replaced_line(exe, latest, backup.as_deref(), opts.ansi));
