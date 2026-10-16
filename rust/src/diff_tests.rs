@@ -2041,3 +2041,19 @@ fn revision_uri_derives_from_diff_origin() {
     );
     assert_eq!(revision_uri_from_diff_uri("garbage", 7), "/D7");
 }
+
+#[test]
+fn r9_core62_no_browser_message_matches_ceb() {
+    // PHP `ArcanistWorkflow.php:2204-2206` @ ceb082ef renders exactly this.
+    let expected = "Unable to find a browser command to run. Set 'browser' in your Arcanist config to specify a command to use.";
+    assert_eq!(NO_BROWSER_MESSAGE, expected);
+    // The scan-failure path surfaces the same bytes (off Windows, where
+    // `cmd /c start` always resolves).
+    if !cfg!(windows) {
+        let none = |_: &str| false;
+        assert_eq!(
+            browser_open_argv("http://example.test/", None, &none).unwrap_err(),
+            expected
+        );
+    }
+}

@@ -112,3 +112,17 @@ fn missing_binaries_fall_back_to_the_scan_error() {
     assert_eq!(err, diff::NO_BROWSER_MESSAGE);
     assert!(!binary_exists("definitely-not-a-binary-xyz"));
 }
+
+#[test]
+#[cfg(not(windows))]
+fn r9_browse_b24_no_browser_scan_error_matches_ceb() {
+    // `open_uris_in_browser` propagates the `browser_open_argv` scan error
+    // unchanged, so this locks the exact bytes the browse (BROWSE-B24),
+    // upload --browse (UPLOAD-U13), and todo --browse (RB-D29c) paths
+    // surface when no browser resolves.
+    let err = diff::browser_open_argv("http://example.test/", None, &|_| false).unwrap_err();
+    assert_eq!(
+        err,
+        "Unable to find a browser command to run. Set 'browser' in your Arcanist config to specify a command to use."
+    );
+}
