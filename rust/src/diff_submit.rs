@@ -204,6 +204,16 @@ pub struct DiffHunk {
     pub old_length: i64,
     /// `newLength`.
     pub new_length: i64,
+    /// True when the hunk header spelled the old `,length` (T1153
+    /// EXPORT-E11: PHP keeps the regex captures as strings
+    /// (`ArcanistDiffParser.php:919-935`), so offsets render as strings
+    /// and lengths render as strings when explicit, integer `1` when
+    /// omitted). Parsed paths set both from
+    /// [`crate::diff_local::HunkLenExplicit`].
+    pub old_len_explicit: bool,
+    /// True when the hunk header spelled the new `,length` (T1153
+    /// EXPORT-E11, as above).
+    pub new_len_explicit: bool,
     /// `addLines`.
     pub add_lines: i64,
     /// `delLines`.
@@ -222,8 +232,9 @@ pub struct DiffHunk {
 pub struct DiffChange {
     /// `metadata`.
     pub metadata: serde_json::Value,
-    /// `oldPath`.
-    pub old_path: String,
+    /// `oldPath`, null when PHP never sets it (T1153 EXPORT-E14:
+    /// move/copy-away companions report null).
+    pub old_path: Option<String>,
     /// `currentPath`.
     pub current_path: String,
     /// `awayPaths`.
@@ -249,7 +260,8 @@ impl Default for DiffChange {
         Self {
             // DIFF-D18: PHP `$metadata = array()` encodes as `[]`, not `{}`.
             metadata: serde_json::Value::Array(Vec::new()),
-            old_path: String::new(),
+            // T1153 EXPORT-E14: PHP's `oldPath` property defaults to null.
+            old_path: None,
             current_path: String::new(),
             away_paths: Vec::new(),
             old_properties: serde_json::Value::Array(Vec::new()),
@@ -267,21 +279,49 @@ impl DiffChange {
     #[must_use]
     pub fn new_text(old_path: &str, current_path: &str) -> Self {
         Self {
-            old_path: old_path.to_string(),
+            old_path: Some(old_path.to_string()),
             current_path: current_path.to_string(),
+            ..Self::default()
+        }
+    }
+
+    /// A move/copy-away companion (T1153 EXPORT-E14): null old path, no
+    /// hunks, PHP defaults otherwise.
+    #[must_use]
+    pub fn new_companion(change_type: i64, current_path: &str, away_paths: &[String]) -> Self {
+        Self {
+            old_path: None,
+            current_path: current_path.to_string(),
+            away_paths: away_paths.to_vec(),
+            change_type,
             ..Self::default()
         }
     }
 }
 
+/// Render a hunk length in `toDictionary` shape (T1153 EXPORT-E11):
+/// the spelled string when the header carried `,length`, else the
+/// integer the parser substitutes (`ArcanistDiffParser.php:922-933`).
+fn hunk_len_json(length: i64, explicit: bool) -> serde_json::Value {
+    if explicit {
+        serde_json::Value::String(length.to_string())
+    } else {
+        serde_json::json!(length)
+    }
+}
+
 /// Render a hunk with verbatim `ArcanistDiffHunk::toDictionary` keys.
+///
+/// Offsets render as strings and lengths as strings-when-explicit
+/// (T1153 EXPORT-E11: `ArcanistDiffParser.php:919-933` keeps the regex
+/// captures, `ArcanistDiffHunk.php:18-30` passes them through).
 #[must_use]
 pub fn hunk_json(hunk: &DiffHunk) -> serde_json::Value {
     serde_json::json!({
-        "oldOffset": hunk.old_offset,
-        "newOffset": hunk.new_offset,
-        "oldLength": hunk.old_length,
-        "newLength": hunk.new_length,
+        "oldOffset": hunk.old_offset.to_string(),
+        "newOffset": hunk.new_offset.to_string(),
+        "oldLength": hunk_len_json(hunk.old_length, hunk.old_len_explicit),
+        "newLength": hunk_len_json(hunk.new_length, hunk.new_len_explicit),
         "addLines": hunk.add_lines,
         "delLines": hunk.del_lines,
         "isMissingOldNewline": hunk.is_missing_old_newline,
@@ -296,7 +336,7 @@ pub fn change_json(change: &DiffChange) -> serde_json::Value {
     let hunks: Vec<serde_json::Value> = change.hunks.iter().map(hunk_json).collect();
     serde_json::json!({
         "metadata": change.metadata,
-        "oldPath": change.old_path,
+        "oldPath": opt_json(&change.old_path),
         "currentPath": change.current_path,
         "awayPaths": change.away_paths,
         "oldProperties": change.old_properties,

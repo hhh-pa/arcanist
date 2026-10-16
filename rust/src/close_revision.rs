@@ -295,15 +295,14 @@ pub fn query_revision(client: &conduit::Client, id: &str) -> Result<Option<Revis
     Ok(first_row(&result).and_then(parse_revision))
 }
 
-/// Authenticated user's PHID via `user.whoami`.
+/// Authenticated user's PHID, reusing the handshake identity (T1153
+/// LAND-22: PHP's close/amend/commit ownership checks read the cached
+/// `userPHID` from `authenticateConduit()`
+/// (`src/workflow/ArcanistWorkflow.php:494,572`, via `getUserPHID()`),
+/// never a fresh `user.whoami` per close). On a cache miss the identity
+/// is resolved once and cached for later callers.
 pub fn user_phid(client: &conduit::Client) -> Result<String, String> {
-    let who = client
-        .call("user.whoami", &serde_json::json!({}))
-        .map_err(|e| e.to_string())?;
-    who.get("phid")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| "conduit user.whoami response has no phid".to_string())
+    client.cached_user_phid()
 }
 
 /// Output of [`execute`]: warnings and progress go to stderr in `--json`

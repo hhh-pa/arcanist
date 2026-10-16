@@ -1008,12 +1008,12 @@ fn gap2_run_lint_maps_codes_and_outcomes() {
     let calls = RefCell::new(0);
     let counting = |_: &Path, _: &[String]| {
         *calls.borrow_mut() += 1;
-        ChildOutcome::Code(0)
+        ChildOutcome::Code(0, Vec::new())
     };
     let mut out = Vec::new();
     assert_eq!(
         run_lint(&dir, Some("abc"), &[], true, &counting, &mut out).unwrap(),
-        Some(LINT_RESULT_SKIP)
+        (Some(LINT_RESULT_SKIP), Vec::new())
     );
     assert_eq!(*calls.borrow(), 0);
     assert!(out.is_empty());
@@ -1030,11 +1030,11 @@ fn gap2_run_lint_maps_codes_and_outcomes() {
                 None,
                 &[],
                 false,
-                &run(ChildOutcome::Code(code)),
+                &run(ChildOutcome::Code(code, Vec::new())),
                 &mut out
             )
             .unwrap(),
-            Some(code)
+            (Some(code), Vec::new())
         );
         assert_eq!(out, format!("Linting...\n{banner}").into_bytes());
     }
@@ -1046,11 +1046,11 @@ fn gap2_run_lint_maps_codes_and_outcomes() {
             None,
             &[],
             false,
-            &run(ChildOutcome::Code(3)),
+            &run(ChildOutcome::Code(3, Vec::new())),
             &mut out
         )
         .unwrap(),
-        Some(3)
+        (Some(3), Vec::new())
     );
     assert_eq!(out, b"Linting...\n");
     // No engine / no effect print notices and yield None.
@@ -1065,7 +1065,7 @@ fn gap2_run_lint_maps_codes_and_outcomes() {
             &mut out
         )
         .unwrap(),
-        None
+        (None, Vec::new())
     );
     assert_eq!(
         out,
@@ -1082,7 +1082,7 @@ fn gap2_run_lint_maps_codes_and_outcomes() {
             &mut out,
         )
         .unwrap(),
-        None
+        (None, Vec::new())
     );
     assert_eq!(out, b"Linting...\nnothing to lint\n");
     // Child failures abort after the start notice.
@@ -1104,7 +1104,7 @@ fn gap2_run_lint_maps_codes_and_outcomes() {
     let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
     let capture = |_: &Path, argv: &[String]| {
         *seen.borrow_mut() = argv.to_vec();
-        ChildOutcome::Code(0)
+        ChildOutcome::Code(0, Vec::new())
     };
     let flags = ["amend-all".to_string(), "apply-patches".to_string()];
     let mut out = Vec::new();
@@ -1135,12 +1135,12 @@ fn gap2_run_unit_confirms_unsound_and_maps_codes() {
             None,
             &[],
             true,
-            &run(ChildOutcome::Code(0)),
+            &run(ChildOutcome::Code(0, Vec::new())),
             &mut input,
             &mut out
         )
         .unwrap(),
-        Some(UNIT_RESULT_SKIP)
+        (Some(UNIT_RESULT_SKIP), Vec::new())
     );
     assert!(out.is_empty());
     for (code, banner) in [
@@ -1155,12 +1155,12 @@ fn gap2_run_unit_confirms_unsound_and_maps_codes() {
                 None,
                 &[],
                 false,
-                &run(ChildOutcome::Code(code)),
+                &run(ChildOutcome::Code(code, Vec::new())),
                 &mut input,
                 &mut out,
             )
             .unwrap(),
-            Some(code)
+            (Some(code), Vec::new())
         );
         assert_eq!(out, format!("Running unit tests...\n{banner}").into_bytes());
     }
@@ -1174,12 +1174,12 @@ fn gap2_run_unit_confirms_unsound_and_maps_codes() {
                 None,
                 &[],
                 false,
-                &run(ChildOutcome::Code(UNIT_RESULT_UNSOUND)),
+                &run(ChildOutcome::Code(UNIT_RESULT_UNSOUND, Vec::new())),
                 &mut input,
                 &mut out,
             )
             .unwrap(),
-            Some(UNIT_RESULT_UNSOUND)
+            (Some(UNIT_RESULT_UNSOUND), Vec::new())
         );
         let text = String::from_utf8(out).unwrap();
         // The prompt renderer wraps long prompts; both halves show.
@@ -1200,7 +1200,7 @@ fn gap2_run_unit_confirms_unsound_and_maps_codes() {
                 None,
                 &[],
                 false,
-                &run(ChildOutcome::Code(UNIT_RESULT_UNSOUND)),
+                &run(ChildOutcome::Code(UNIT_RESULT_UNSOUND, Vec::new())),
                 &mut input,
                 &mut out,
             )
@@ -1227,7 +1227,7 @@ fn gap2_run_unit_confirms_unsound_and_maps_codes() {
             &mut out
         )
         .unwrap(),
-        None
+        (None, Vec::new())
     );
     assert_eq!(
         out,
@@ -1237,7 +1237,7 @@ fn gap2_run_unit_confirms_unsound_and_maps_codes() {
     let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
     let capture = |_: &Path, argv: &[String]| {
         *seen.borrow_mut() = argv.to_vec();
-        ChildOutcome::Code(0)
+        ChildOutcome::Code(0, Vec::new())
     };
     let mut out = Vec::new();
     let mut input = Cursor::new(b"".to_vec());
@@ -1265,11 +1265,11 @@ fn gap2_run_lint_unit_combines_reports() {
     use std::cell::RefCell;
     use std::io::Cursor;
     let dir = std::env::temp_dir();
-    let lint = |_: &Path, _: &[String]| ChildOutcome::Code(0);
+    let lint = |_: &Path, _: &[String]| ChildOutcome::Code(0, Vec::new());
     let unit_calls = RefCell::new(0);
     let unit = |_: &Path, _: &[String]| {
         *unit_calls.borrow_mut() += 1;
-        ChildOutcome::Code(2)
+        ChildOutcome::Code(2, Vec::new())
     };
     let mut out = Vec::new();
     let mut input = Cursor::new(b"".to_vec());
@@ -1290,6 +1290,34 @@ fn gap2_run_lint_unit_combines_reports() {
     assert_eq!(report.unit_result, Some(2));
     assert!(report.unresolved_lint.is_empty());
     assert!(report.test_results.is_empty());
+    // T1153 DIFF-D22: child dicts flow into the report (they feed the
+    // `arc:lint`/`arc:unit` diff properties).
+    {
+        let lint_dicts =
+            |_: &Path, _: &[String]| ChildOutcome::Code(1, vec![serde_json::json!({"code": "X"})]);
+        let unit_dicts =
+            |_: &Path, _: &[String]| ChildOutcome::Code(0, vec![serde_json::json!({"name": "t"})]);
+        let mut out = Vec::new();
+        let mut input = Cursor::new(b"".to_vec());
+        let report = run_lint_unit(
+            &dir,
+            None,
+            &[],
+            &[],
+            false,
+            false,
+            &lint_dicts,
+            &unit_dicts,
+            &mut input,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(
+            report.unresolved_lint,
+            vec![serde_json::json!({"code": "X"})]
+        );
+        assert_eq!(report.test_results, vec![serde_json::json!({"name": "t"})]);
+    }
     let text = String::from_utf8(out).unwrap();
     assert!(text.starts_with("Linting...\n** LINT OKAY **"), "{text}");
     assert!(
@@ -2089,6 +2117,102 @@ fn e20_synthetic_predicate_flags_pure_moves() {
 
     let plain = parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\n+b\n")).unwrap();
     assert!(!needs_synthetic_git_hunks(&plain[0]));
+}
+
+#[test]
+fn e14_single_move_gains_away_companion() {
+    // T1153 EXPORT-E14: one rename yields the here-change plus a
+    // `MOVE_AWAY` companion (null old path, away path set) right after
+    // it, like PHP's `buildChange($oldPath)` (`:668-687`).
+    let text = "diff --git a/g.txt b/h.txt\nsimilarity index 90%\nrename from g.txt\nrename to h.txt\n--- a/g.txt\n+++ b/h.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    let full = with_companions(&parse_unified_diff(text).unwrap());
+    assert_eq!(full.len(), 2);
+    assert_eq!(full[0].change_type, TYPE_MOVE_HERE);
+    assert_eq!(full[1].change_type, TYPE_MOVE_AWAY);
+    assert_eq!(full[1].current_path, "g.txt");
+    assert!(full[1].old_path.is_empty());
+    assert_eq!(full[1].away_paths, vec!["h.txt".to_string()]);
+    assert!(full[1].hunks.is_empty());
+    assert_eq!(full[1].file_type, FILE_TEXT);
+}
+
+#[test]
+fn e14_repeats_from_one_source_fold_to_one_companion() {
+    // T1153 EXPORT-E14: two copies from one source fold to one
+    // `COPY_AWAY` with both away paths (`:654-666`); a move folded
+    // onto it retypes to `MULTICOPY` (`:677-678`).
+    let text = "diff --git a/src b/one\ncopy from src\ncopy to one\n--- a/src\n+++ b/one\n@@ -1 +1 @@\n-a\n+b\n\
+        diff --git a/src b/two\ncopy from src\ncopy to two\n--- a/src\n+++ b/two\n@@ -1 +1 @@\n-a\n+b\n";
+    let full = with_companions(&parse_unified_diff(text).unwrap());
+    assert_eq!(full.len(), 3);
+    assert_eq!(full[1].change_type, TYPE_COPY_AWAY);
+    assert_eq!(full[1].current_path, "src");
+    assert_eq!(
+        full[1].away_paths,
+        vec!["one".to_string(), "two".to_string()]
+    );
+    // A move onto the copy-away retypes to multicopy.
+    let mut fold = CompanionFold::new();
+    let (at, is_new) = fold.fold(TYPE_COPY_HERE, "src", "one");
+    assert!(is_new);
+    let (again, is_new) = fold.fold(TYPE_MOVE_HERE, "src", "two");
+    assert!(!is_new);
+    assert_eq!(again, at);
+    assert_eq!(fold.companion(at).change_type, TYPE_MULTICOPY);
+    assert_eq!(
+        fold.companion(at).away_paths,
+        vec!["one".to_string(), "two".to_string()]
+    );
+}
+
+#[test]
+fn e14_with_companions_skips_paired_and_repeats() {
+    // T1153 EXPORT-E14: here-changes the Subversion collector already
+    // paired keep their companion (no double), and re-running the
+    // fold is a no-op.
+    let text =
+        "diff --git a/g.txt b/h.txt\nsimilarity index 100%\nrename from g.txt\nrename to h.txt\n";
+    let once = with_companions(&parse_unified_diff(text).unwrap());
+    assert_eq!(once.len(), 2);
+    let twice = with_companions(&once);
+    assert_eq!(twice, once);
+    // Non-moves pass through untouched.
+    let plain = parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\n+b\n")).unwrap();
+    assert_eq!(with_companions(&plain), plain);
+}
+
+#[test]
+fn e20_attach_fabricates_here_and_companion_hunks() {
+    // T1153 EXPORT-E20: `attach_synthetic_git_hunks` runs the
+    // `loadSyntheticData()` fabrication over folded companions too:
+    // the here-change gains context hunks (counts kept from the
+    // add-side reparse), the move-away companion delete-side hunks.
+    let text =
+        "diff --git a/o.txt b/n.txt\nsimilarity index 100%\nrename from o.txt\nrename to n.txt\n";
+    let mut full = with_companions(&parse_unified_diff(text).unwrap());
+    assert_eq!(full.len(), 2);
+    let raw_for = |path: &str| -> Result<String, String> {
+        if path == "n.txt" {
+            Ok("diff --git a/n.txt b/n.txt\nnew file mode 100644\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1,2 @@\n+one\n+two\n".to_string())
+        } else {
+            Ok("diff --git a/o.txt b/o.txt\ndeleted file mode 100644\n--- a/o.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-one\n-two\n".to_string())
+        }
+    };
+    attach_synthetic_git_hunks(&mut full, &raw_for).unwrap();
+    assert_eq!(full[0].hunks.len(), 1);
+    assert_eq!(full[0].hunks[0].corpus, " one\n two\n");
+    assert_eq!(hunk_counts(&full[0].hunks[0]), (2, 0));
+    assert_eq!(full[1].hunks.len(), 1);
+    assert_eq!(full[1].hunks[0].corpus, "-one\n-two\n");
+    assert_eq!(hunk_counts(&full[1].hunks[0]), (0, 2));
+    // Paths with no reparse match keep no hunks, like PHP.
+    let mut lonely = with_companions(&parse_unified_diff(text).unwrap());
+    let empty = |_: &str| -> Result<String, String> {
+        Ok("diff --git a/q b/q\n--- a/q\n+++ b/q\n@@ -1 +1 @@\n-a\n+b\n".to_string())
+    };
+    attach_synthetic_git_hunks(&mut lonely, &empty).unwrap();
+    assert!(lonely[0].hunks.is_empty());
+    assert!(lonely[1].hunks.is_empty());
 }
 
 #[test]
@@ -4493,7 +4617,7 @@ fn ansi_lint_banners_gain_backgrounds() {
             None,
             &[],
             false,
-            &run(ChildOutcome::Code(code)),
+            &run(ChildOutcome::Code(code, Vec::new())),
             &mut out,
             false,
         )
@@ -4505,7 +4629,7 @@ fn ansi_lint_banners_gain_backgrounds() {
             None,
             &[],
             false,
-            &run(ChildOutcome::Code(code)),
+            &run(ChildOutcome::Code(code, Vec::new())),
             &mut out,
             true,
         )
@@ -4537,7 +4661,7 @@ fn ansi_unit_banners_gain_backgrounds() {
             None,
             &[],
             false,
-            &run(ChildOutcome::Code(code)),
+            &run(ChildOutcome::Code(code, Vec::new())),
             &mut input,
             &mut out,
             false,
@@ -4554,7 +4678,7 @@ fn ansi_unit_banners_gain_backgrounds() {
             None,
             &[],
             false,
-            &run(ChildOutcome::Code(code)),
+            &run(ChildOutcome::Code(code, Vec::new())),
             &mut input,
             &mut out,
             true,
@@ -4584,7 +4708,7 @@ fn ansi_unit_banners_gain_backgrounds() {
             None,
             &[],
             false,
-            &run(ChildOutcome::Code(UNIT_RESULT_UNSOUND)),
+            &run(ChildOutcome::Code(UNIT_RESULT_UNSOUND, Vec::new())),
             &mut input,
             &mut out,
             ansi,
@@ -4680,12 +4804,12 @@ fn r5_diff_d16_unsound_shows_y_n_default() {
     // unsound prompt renders `[y/N]` and Enter declines.
     use std::io::Cursor;
     let dir = std::env::temp_dir();
-    let run = |_: &Path, _: &[String]| ChildOutcome::Code(UNIT_RESULT_UNSOUND);
+    let run = |_: &Path, _: &[String]| ChildOutcome::Code(UNIT_RESULT_UNSOUND, Vec::new());
     let mut out = Vec::new();
     let mut input = Cursor::new(b"y\n".to_vec());
     assert_eq!(
         run_unit(&dir, None, &[], false, &run, &mut input, &mut out).unwrap(),
-        Some(UNIT_RESULT_UNSOUND)
+        (Some(UNIT_RESULT_UNSOUND), Vec::new())
     );
     let text = String::from_utf8(out).unwrap();
     assert!(text.contains("[y/N]"), "{text}");

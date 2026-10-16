@@ -625,3 +625,48 @@ fn write_patch_to_disk_roundtrip() {
     assert!(applied.iter().any(|flag| *flag));
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "ok\n");
 }
+
+#[test]
+fn d22_child_collecting_returns_unresolved_dicts() {
+    // T1153 DIFF-D22: the collecting child run returns the result code
+    // plus `toDictionary()` dicts for unresolved messages.
+    let tmp = git_repo("d22-collect");
+    tmp.write("warn.txt", "ok\nx\ty\n");
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-m", "base"]);
+    let argv = args(&["warn.txt", "--output", "none"]);
+    let mut empty = BufReader::new("".as_bytes());
+    let report = lint::run_child_collecting(tmp.path(), &argv, false, &mut empty, false).unwrap();
+    assert_eq!(report.code, 2);
+    assert_eq!(report.unresolved.len(), 1);
+    assert_eq!(report.unresolved[0]["severity"], serde_json::json!("error"));
+    assert_eq!(report.unresolved[0]["path"], serde_json::json!("warn.txt"));
+    assert!(
+        report.unresolved[0]
+            .get("bypassChangedLineFiltering")
+            .is_some()
+    );
+}
+
+#[test]
+fn d22_bare_child_amend_prompts_and_resolves() {
+    // T1153 DIFF-D22: diff's bare amend intent prompts once patches
+    // reach disk (default yes), and applied messages resolve out of
+    // the unresolved dicts.
+    let tmp = git_repo("d22-amend");
+    git(tmp.path(), &["config", "user.email", "lint@test"]);
+    git(tmp.path(), &["config", "user.name", "lint"]);
+    tmp.write("fix.txt", "ok  \n");
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-m", "base"]);
+    let argv = args(&["fix.txt", "--apply-patches"]);
+    let mut input = Cursor::new("y\n".as_bytes().to_vec());
+    // Injected input models a TTY session, like `run_in_with_input`.
+    let report = lint::run_child_collecting(tmp.path(), &argv, true, &mut input, true).unwrap();
+    assert_eq!(report.code, 0);
+    assert!(report.unresolved.is_empty());
+    assert_eq!(
+        git(tmp.path(), &["show", "HEAD:fix.txt"]),
+        "ok\n".to_string()
+    );
+}

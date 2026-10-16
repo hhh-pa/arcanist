@@ -21,9 +21,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use crate::conduit::{self, EnvelopeKind};
-use crate::diff_local::{
-    FILE_TEXT, TYPE_ADD, TYPE_COPY_AWAY, TYPE_COPY_HERE, TYPE_MOVE_AWAY, TYPE_MOVE_HERE,
-};
+use crate::diff_local::TYPE_ADD;
 
 pub const NAME: &str = "export";
 
@@ -706,62 +704,34 @@ fn ensure_trailing_newline(mut text: String) -> String {
 /// Bundle metadata version, mirroring `writeToDisk()`.
 pub const BUNDLE_VERSION: u64 = 5;
 
-/// Added/del counts plus missing-newline flags for one hunk corpus,
-/// simulating the PHP parser's length-driven loop (the corpus starts
-/// with the `@@` header line).
-fn hunk_stats(corpus: &str, old_len: u64, new_len: u64) -> (u64, u64, bool, bool) {
-    let mut add = 0;
-    let mut del = 0;
-    let mut missing_old = false;
-    let mut missing_new = false;
-    let mut old_left = old_len;
-    let mut new_left = new_len;
-    let lines = corpus.lines();
-    for line in lines {
-        if line.starts_with("\\ No newline at end of file") {
-            if new_left > 0 {
-                missing_old = true;
-            } else {
-                missing_new = true;
-            }
-            if new_left == 0 {
-                break;
-            }
-            continue;
-        }
-        match line.as_bytes().first().copied().unwrap_or(b' ') {
-            b'+' => {
-                add += 1;
-                new_left = new_left.saturating_sub(1);
-            }
-            b'-' => {
-                if old_left == 0 {
-                    break;
-                }
-                del += 1;
-                old_left -= 1;
-            }
-            b' ' => {
-                if old_left == 0 && new_left == 0 {
-                    break;
-                }
-                old_left = old_left.saturating_sub(1);
-                new_left = new_left.saturating_sub(1);
-            }
-            _ => break,
-        }
+/// One hunk length in `toDictionary()` shape (T1153 EXPORT-E11): the
+/// spelled string when the header carried `,length`, else the integer
+/// the parser substitutes (`ArcanistDiffParser.php:922-933`).
+fn hunk_len_dict(length: u64, explicit: bool) -> serde_json::Value {
+    if explicit {
+        serde_json::Value::String(length.to_string())
+    } else {
+        serde_json::json!(length)
     }
-    (add, del, missing_old, missing_new)
 }
 
-/// One hunk in `toDictionary()` shape (corpus still inline).
-fn hunk_dict(hunk: &crate::diff_local::ParsedHunk) -> serde_json::Value {
-    let (add, del, missing_old, missing_new) = hunk_stats(&hunk.corpus, hunk.old_len, hunk.new_len);
+/// One hunk in `toDictionary()` shape (corpus still inline). Offsets are
+/// strings and lengths strings-when-explicit (T1153 EXPORT-E11:
+/// `ArcanistDiffParser.php:919-933`); counts and missing-newline flags
+/// come from the shared length-driven loop (T1153 EXPORT-E15).
+fn hunk_dict(
+    hunk: &crate::diff_local::ParsedHunk,
+    explicit: &crate::diff_local::HunkLenExplicit,
+) -> serde_json::Value {
+    // Counts honor the synthetic pre-rewrite override (T1153 EXPORT-E20).
+    let (add, del) = crate::diff_local::hunk_counts(hunk);
+    let (_, _, missing_old, missing_new) =
+        crate::diff_local::hunk_stats(&hunk.corpus, hunk.old_len, hunk.new_len);
     serde_json::json!({
-        "oldOffset": hunk.old_start,
-        "newOffset": hunk.new_start,
-        "oldLength": hunk.old_len,
-        "newLength": hunk.new_len,
+        "oldOffset": hunk.old_start.to_string(),
+        "newOffset": hunk.new_start.to_string(),
+        "oldLength": hunk_len_dict(hunk.old_len, explicit.old_explicit),
+        "newLength": hunk_len_dict(hunk.new_len, explicit.new_explicit),
         "addLines": add,
         "delLines": del,
         "isMissingOldNewline": missing_old,
@@ -770,65 +740,60 @@ fn hunk_dict(hunk: &crate::diff_local::ParsedHunk) -> serde_json::Value {
     })
 }
 
+/// One `unix:filemode` property dict (T1153 EXPORT-E13): PHP sets the
+/// property from the diff's mode lines
+/// (`ArcanistDiffParser.php:622-627`) and `toDictionary()` passes it
+/// through; absent modes stay `[]`
+/// (empty PHP arrays encode as `[]`).
+fn filemode_dict(mode: Option<&str>) -> serde_json::Value {
+    match mode {
+        Some(mode) => serde_json::json!({"unix:filemode": mode}),
+        None => serde_json::json!([]),
+    }
+}
+
 /// One change in `toDictionary()` shape. Adds report `/dev/null` like the
 /// PHP parser (which overwrites the seeded path from the `---` line);
-/// properties stay empty (the diff parser drops filemodes).
+/// move/copy-away companions report a null old path (PHP never sets it).
 fn change_dict(change: &crate::diff_local::ParsedChange) -> serde_json::Value {
     let old_path = if change.change_type == TYPE_ADD {
-        "/dev/null"
+        serde_json::Value::String("/dev/null".to_string())
+    } else if crate::diff_local::is_companion_type(change.change_type) {
+        serde_json::Value::Null
     } else {
-        change.old_path.as_str()
+        serde_json::Value::String(change.old_path.clone())
     };
+    // `hunk_len_explicit` runs parallel to `hunks` (EXPORT-E11).
+    let hunks: Vec<serde_json::Value> = change
+        .hunks
+        .iter()
+        .zip(change.hunk_len_explicit.iter())
+        .map(|(hunk, explicit)| hunk_dict(hunk, explicit))
+        .collect();
     // Empty PHP arrays encode as `[]`, not `{}`.
     serde_json::json!({
         "metadata": [],
         "oldPath": old_path,
         "currentPath": change.current_path,
-        "awayPaths": [],
-        "oldProperties": [],
-        "newProperties": [],
+        "awayPaths": change.away_paths,
+        "oldProperties": filemode_dict(change.old_mode.as_deref()),
+        "newProperties": filemode_dict(change.new_mode.as_deref()),
         "type": change.change_type,
         "fileType": change.file_type,
         "commitHash": change.commit_hash,
-        "hunks": change.hunks.iter().map(hunk_dict).collect::<Vec<_>>(),
+        "hunks": hunks,
     })
 }
 
-/// The `MOVE_AWAY`/`COPY_AWAY` companion the PHP parser builds for
-/// renames and copies (old path, no hunks, away path set).
-fn move_companion(change: &crate::diff_local::ParsedChange) -> Option<serde_json::Value> {
-    let away_type = match change.change_type {
-        TYPE_MOVE_HERE => TYPE_MOVE_AWAY,
-        TYPE_COPY_HERE => TYPE_COPY_AWAY,
-        _ => return None,
-    };
-    if change.old_path.is_empty() || change.old_path == change.current_path {
-        return None;
-    }
-    Some(serde_json::json!({
-        "metadata": [],
-        "oldPath": null,
-        "currentPath": change.old_path,
-        "awayPaths": [change.current_path],
-        "oldProperties": [],
-        "newProperties": [],
-        "type": away_type,
-        "fileType": FILE_TEXT,
-        "commitHash": null,
-        "hunks": [],
-    }))
-}
-
-/// Local changes in `toDictionary()` shape, with rename companions.
+/// Local changes in `toDictionary()` shape, with folded rename
+/// companions (T1153 EXPORT-E14: shared [`with_companions`], so
+/// repeats from one old path fold to one away/multicopy change like
+/// PHP's keyed `buildChange($oldPath)`).
 pub fn changes_json(changes: &[crate::diff_local::ParsedChange]) -> Vec<serde_json::Value> {
-    let mut out = Vec::new();
-    for change in changes {
-        out.push(change_dict(change));
-        if let Some(companion) = move_companion(change) {
-            out.push(companion);
-        }
-    }
-    out
+    crate::diff_local::with_companions(changes)
+        .iter()
+        .map(change_dict)
+        .collect()
 }
 
 /// PHP `nonempty($value, array())` for change-dict lists: missing and
@@ -1191,7 +1156,13 @@ fn local_bundle_parts(
     let bytes = local_diff_bytes(dir, Format::Git, base)?;
     reject_empty_diff(&bytes)?;
     let parsed = crate::diff_local::parse_unified_diff(&String::from_utf8_lossy(&bytes))?;
-    let changes = changes_json(&parsed);
+    // T1153 EXPORT-E20: PHP's local export parses with a repository API
+    // (`ArcanistExportWorkflow.php:187`), so `loadSyntheticData()`
+    // fabricates pure-move hunks for local bundles too.
+    let mut full = crate::diff_local::with_companions(&parsed);
+    let raw_for = |path: &str| crate::diff_local::get_raw_diff_text(dir, base, path);
+    crate::diff_local::attach_synthetic_git_hunks(&mut full, &raw_for)?;
+    let changes = changes_json(&full);
     let base_revision = crate::git::stdout_text(dir, &["rev-parse", base])?;
     // PHP builds `sprintf('%s <%s>', $realName, $email)` and parses it back
     // with `PhutilEmailAddress` (T1153 EXPORT-E32).
@@ -1646,6 +1617,8 @@ fn break_export_hunk(base: &crate::diff_local::ParsedHunk) -> Vec<crate::diff_lo
             new_start: (new_offset as i64 - back).max(0) as u64,
             new_len: count_length - scan.old_lines,
             corpus,
+            // Splitter hunks count from the corpus (T1153 EXPORT-E20).
+            synthetic_counts: None,
         });
         old_offset += (jj - ii) as u64 - scan.new_lines;
         new_offset += (jj - ii) as u64 - scan.old_lines;

@@ -643,3 +643,21 @@ fn unit_u21_sendmessage_params_keep_php_order() {
         .collect();
     assert_eq!(keys, vec!["buildTargetPHID", "unit", "type", "__conduit__"]);
 }
+
+#[test]
+fn d22_child_collecting_returns_cargo_results() {
+    // T1153 DIFF-D22: the collecting child run returns the exit code
+    // plus per-test results (the failing sample yields one fail).
+    let root = fixture_copy("d22");
+    std::process::Command::new("git")
+        .current_dir(&root)
+        .args(["init", "-q"])
+        .status()
+        .unwrap();
+    let report =
+        unit::run_in_collecting(&root, &args(&["--engine", "cargo", "--output", "none"])).unwrap();
+    assert_eq!(report.code, std::process::ExitCode::from(2));
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].get_result(), "fail");
+    assert_eq!(report.results[0].get_name(), "cargo");
+}

@@ -499,6 +499,7 @@ fn parsed_hunk(
         new_start,
         new_len,
         corpus: corpus.to_string(),
+        synthetic_counts: None,
     }
 }
 

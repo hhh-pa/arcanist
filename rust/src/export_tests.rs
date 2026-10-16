@@ -202,11 +202,19 @@ fn serializes_changes_with_stats_and_companions() {
     assert_eq!(add["currentPath"], serde_json::json!("f.txt"));
     assert_eq!(add["type"], serde_json::json!(1));
     assert_eq!(add["metadata"], serde_json::json!([]));
+    // T1153 EXPORT-E13: `new file mode` rides the new properties.
+    assert_eq!(add["oldProperties"], serde_json::json!([]));
+    assert_eq!(
+        add["newProperties"],
+        serde_json::json!({"unix:filemode": "100644"})
+    );
     let hunk = &add["hunks"][0];
-    assert_eq!(hunk["oldOffset"], serde_json::json!(0));
-    assert_eq!(hunk["oldLength"], serde_json::json!(0));
-    assert_eq!(hunk["newOffset"], serde_json::json!(1));
-    assert_eq!(hunk["newLength"], serde_json::json!(2));
+    // T1153 EXPORT-E11: `@@ -0,0 +1,2 @@` spells both lengths, so
+    // offsets and lengths all render as strings.
+    assert_eq!(hunk["oldOffset"], serde_json::json!("0"));
+    assert_eq!(hunk["oldLength"], serde_json::json!("0"));
+    assert_eq!(hunk["newOffset"], serde_json::json!("1"));
+    assert_eq!(hunk["newLength"], serde_json::json!("2"));
     assert_eq!(hunk["addLines"], serde_json::json!(2));
     assert_eq!(hunk["delLines"], serde_json::json!(0));
     assert_eq!(hunk["isMissingOldNewline"], serde_json::json!(false));
@@ -214,6 +222,13 @@ fn serializes_changes_with_stats_and_companions() {
 
     let moved = &dicts[1];
     assert_eq!(moved["type"], serde_json::json!(6));
+    // T1153 EXPORT-E11: `@@ -1 +1 @@` omits both lengths, so they
+    // render as integer 1 while offsets stay strings.
+    let relocated = &moved["hunks"][0];
+    assert_eq!(relocated["oldOffset"], serde_json::json!("1"));
+    assert_eq!(relocated["oldLength"], serde_json::json!(1));
+    assert_eq!(relocated["newOffset"], serde_json::json!("1"));
+    assert_eq!(relocated["newLength"], serde_json::json!(1));
     let away = &dicts[2];
     assert_eq!(away["type"], serde_json::json!(4));
     assert_eq!(away["currentPath"], serde_json::json!("g.txt"));
@@ -224,12 +239,19 @@ fn serializes_changes_with_stats_and_companions() {
 
 #[test]
 fn counts_missing_newlines_like_php() {
+    // T1153 EXPORT-E15: the shared length-driven loop (the marker flags
+    // the old side while new lines remain, the new side once exhausted).
     let (add, del, missing_old, missing_new) =
-        hunk_stats("-old\n\\ No newline at end of file\n+new\n", 1, 1);
+        crate::diff_local::hunk_stats("-old\n\\ No newline at end of file\n+new\n", 1, 1);
     assert_eq!((add, del, missing_old, missing_new), (1, 1, true, false));
     let (add, del, missing_old, missing_new) =
-        hunk_stats("-old\n+new\n\\ No newline at end of file\n", 1, 1);
+        crate::diff_local::hunk_stats("-old\n+new\n\\ No newline at end of file\n", 1, 1);
     assert_eq!((add, del, missing_old, missing_new), (1, 1, false, true));
+    // A pure-deletion hunk flags the NEW side (new length is exhausted):
+    // `if ($new_len)` at `:951`.
+    let (_, _, missing_old, missing_new) =
+        crate::diff_local::hunk_stats("-x\n\\ No newline at end of file\n", 1, 0);
+    assert_eq!((missing_old, missing_new), (false, true));
 }
 
 #[test]
@@ -397,7 +419,8 @@ fn local_bundle_roundtrips_through_tar() {
     assert_eq!(changes[0]["hunks"][0]["corpus"], serde_json::json!(0));
     let corpus = std::fs::read_to_string(unpacked.join("hunks/0")).unwrap();
     assert_eq!(corpus, " one\n+two\n");
-    assert_eq!(changes[0]["hunks"][0]["oldOffset"], serde_json::json!(1));
+    // T1153 EXPORT-E11: offsets render as strings in local bundles.
+    assert_eq!(changes[0]["hunks"][0]["oldOffset"], serde_json::json!("1"));
 
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(&unpacked).ok();

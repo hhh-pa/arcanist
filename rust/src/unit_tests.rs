@@ -2897,3 +2897,25 @@ fn unit_u26_empty_rev_takes_plain_status_path() {
     assert!(select_paths_with(&bogus, &dir, &dir, &hg, &svn).is_err());
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn d22_cargo_aggregate_results_convert_to_engine_dicts() {
+    // T1153 DIFF-D22: the cargo aggregate becomes one pass/fail engine
+    // result named after the engine, serializable via `results_to_json`.
+    let report = EngineReport {
+        engine: "cargo".to_string(),
+        passed: 3,
+        failed: 0,
+        duration_ms: 1500,
+        success: true,
+        tail: String::new(),
+        results: vec![UnitResult::new("cargo", Outcome::Pass, 1.5)],
+    };
+    let converted = cargo_aggregate_results(&report).unwrap();
+    assert_eq!(converted.len(), 1);
+    assert_eq!(converted[0].get_name(), "cargo");
+    assert_eq!(converted[0].get_result(), "pass");
+    let json = results_to_json(&converted);
+    assert_eq!(json[0]["name"], serde_json::json!("cargo"));
+    assert_eq!(json[0]["result"], serde_json::json!("pass"));
+}

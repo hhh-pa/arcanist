@@ -391,6 +391,29 @@ impl LintMessage {
         )
     }
 
+    /// The message as an `ArcanistLintMessage::toDictionary()` dict
+    /// (T1153 DIFF-D22: `src/lint/ArcanistLintMessage.php:56-71`): the 12
+    /// keys in PHP order. Unset line/char render null (0 means unset).
+    #[must_use]
+    pub fn to_dictionary(&self) -> serde_json::Value {
+        let locations: Vec<serde_json::Value> =
+            self.locations.iter().map(location_json_dict).collect();
+        serde_json::json!({
+            "path": self.path,
+            "line": if self.line == 0 { serde_json::Value::Null } else { serde_json::json!(self.line) },
+            "char": if self.col == 0 { serde_json::Value::Null } else { serde_json::json!(self.col) },
+            "code": self.code,
+            "severity": self.severity,
+            "name": self.name,
+            "description": self.description,
+            "original": self.original,
+            "replacement": self.replacement,
+            "granularity": self.granularity,
+            "locations": locations,
+            "bypassChangedLineFiltering": self.bypass_changed_line_filtering,
+        })
+    }
+
     #[must_use]
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
@@ -3292,6 +3315,10 @@ pub struct Options {
     /// Canonical long flag names in first-provision order (PHP `$dict`
     /// insertion order). Empty for hand-built options.
     pub provided: Vec<&'static str>,
+    /// Bare amend intent from `diff`'s `shouldAmend()` (T1153 DIFF-D22:
+    /// `setShouldAmendChanges()` has no argv form). Prompts like a
+    /// default-yes confirm once patches reach disk.
+    child_amend: bool,
 }
 
 /// A value-taking `lint` flag.
@@ -4658,7 +4685,8 @@ pub fn render_compiler_result_with_ansi(result: &LintResult, ansi: bool) -> Resu
 }
 
 /// One message as a JSON-renderer dictionary: `toDictionary()` plus
-/// `context`, minus `path`. Key order matches PHP's insertion order
+/// `context`, minus `path` (T1153 DIFF-D22: built from the shared
+/// dict so both agree). Key order matches PHP's insertion order
 /// (`line` through `bypassChangedLineFiltering`, then `context`).
 fn message_json_dict(message: &LintMessage, data: &[u8]) -> serde_json::Value {
     let text = String::from_utf8_lossy(data);
@@ -4671,22 +4699,15 @@ fn message_json_dict(message: &LintMessage, data: &[u8]) -> serde_json::Value {
         .take(JSON_LINES_OF_CONTEXT * 2 + 1)
         .copied()
         .collect();
-    let locations: Vec<serde_json::Value> =
-        message.locations.iter().map(location_json_dict).collect();
-    serde_json::json!({
-        "line": if message.line == 0 { serde_json::Value::Null } else { serde_json::json!(message.line) },
-        "char": if message.col == 0 { serde_json::Value::Null } else { serde_json::json!(message.col) },
-        "code": message.code,
-        "severity": message.severity,
-        "name": message.name,
-        "description": message.description,
-        "original": message.original,
-        "replacement": message.replacement,
-        "granularity": message.granularity,
-        "locations": locations,
-        "bypassChangedLineFiltering": message.bypass_changed_line_filtering,
-        "context": context.join("\n"),
-    })
+    let mut dict = message.to_dictionary();
+    if let Some(map) = dict.as_object_mut() {
+        map.shift_remove("path");
+        map.insert(
+            "context".to_string(),
+            serde_json::Value::String(context.join("\n")),
+        );
+    }
+    dict
 }
 
 /// One `locations` entry as JSON: the `getOtherLocation()` dict shape
@@ -5117,6 +5138,18 @@ fn run_workflow_classified(
     ansi: bool,
     stdin_tty: bool,
 ) -> Result<i32, ClassifiedError> {
+    run_workflow_collecting(cwd, options, input, ansi, stdin_tty).map(|(code, _)| code)
+}
+
+/// [`run_workflow_classified`] that also returns the per-path results,
+/// so `diff` can collect unresolved message dicts (T1153 DIFF-D22).
+fn run_workflow_collecting(
+    cwd: &Path,
+    options: &Options,
+    input: &mut dyn BufRead,
+    ansi: bool,
+    stdin_tty: bool,
+) -> Result<(i32, Vec<LintResult>), ClassifiedError> {
     let work = discover_working_copy(cwd).map_err(ClassifiedError::usage)?;
     check_supports(options, work.vcs).map_err(ClassifiedError::usage)?;
     reject_everything_with_paths(options).map_err(ClassifiedError::usage)?;
@@ -5129,7 +5162,70 @@ fn run_workflow_classified(
     }
     let mut results = workflow_gather(&work, cwd, options, &engine, input, ansi)
         .map_err(classify_gather_error)?;
-    workflow_emit(&work, options, input, &mut results, ansi, stdin_tty).map_err(classify_emit_error)
+    let code = workflow_emit(&work, options, input, &mut results, ansi, stdin_tty)
+        .map_err(classify_emit_error)?;
+    Ok((code, results))
+}
+
+/// Unresolved message dicts: messages whose patches were not applied
+/// (T1153 DIFF-D22: `ArcanistLintWorkflow.php:360-375` feeds
+/// `getUnresolvedMessages()` into `diff`'s `unresolvedLint`).
+#[must_use]
+pub fn unresolved_dicts(results: &[LintResult]) -> Vec<serde_json::Value> {
+    let mut dicts = Vec::new();
+    for result in results {
+        for (message, applied) in result.messages.iter().zip(result.applied.iter()) {
+            if !applied {
+                dicts.push(message.to_dictionary());
+            }
+        }
+    }
+    dicts
+}
+
+/// Report of a collecting child lint run (T1153 DIFF-D22).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildLintReport {
+    /// Workflow result code.
+    pub code: i32,
+    /// Unresolved message dicts (`unresolvedLint`).
+    pub unresolved: Vec<serde_json::Value>,
+}
+
+/// Run lint as `diff`'s child, collecting unresolved message dicts
+/// (T1153 DIFF-D22: `runLint()`,
+/// `src/workflow/ArcanistDiffWorkflow.php:1146-1207`). `amend` is
+/// diff's `shouldAmend()` (bare `setShouldAmendChanges()`, no argv
+/// form). Renders and prompts like the standalone run; errors return
+/// unreported for the caller to map (`NoEffect` prints with exit 0,
+/// everything else aborts the diff, like PHP's child catches).
+pub fn run_child_collecting(
+    cwd: &Path,
+    argv: &[String],
+    amend: bool,
+    input: &mut dyn BufRead,
+    stdin_tty: bool,
+) -> Result<ChildLintReport, ClassifiedError> {
+    let mut options = match parse_args(argv) {
+        ParseOutcome::Help => {
+            print!("{}", usage());
+            return Err(ClassifiedError::usage(
+                "unexpected --help in child lint argv".to_string(),
+            ));
+        }
+        // T1153 R4 (LINT-2): usage errors abort the diff unreported
+        // here (the caller renders them); the standalone entry reports
+        // `Usage Exception:` with no usage dump instead.
+        ParseOutcome::Error(message) => return Err(ClassifiedError::usage(message)),
+        ParseOutcome::Args(options) => options,
+    };
+    options.child_amend = amend;
+    let ansi = terminal::ansi_enabled();
+    let (code, results) = run_workflow_collecting(cwd, &options, input, ansi, stdin_tty)?;
+    Ok(ChildLintReport {
+        code,
+        unresolved: unresolved_dicts(&results),
+    })
 }
 
 /// String-error entry kept for API stability; production uses
@@ -5538,9 +5634,10 @@ fn maybe_amend(
 }
 
 /// True when the amend flags request an amend the VCS allows: the VCS
-/// must support amend and history must be mutable.
+/// must support amend and history must be mutable. A bare child amend
+/// (T1153 DIFF-D22) gates the same way (`:248-252`).
 fn amend_enabled(work: &WorkCopy, options: &Options) -> Result<bool, String> {
-    if !(options.amend_all || options.amend_autofixes) {
+    if !(options.amend_all || options.amend_autofixes || options.child_amend) {
         return Ok(false);
     }
     let immutable = config_bool(work, "history.immutable")?
