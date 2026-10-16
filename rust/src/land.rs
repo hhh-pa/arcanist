@@ -4270,6 +4270,84 @@ fn git_apply_commit(
     git::stdout_text(dir, &["rev-parse", "--verify", "HEAD"])
 }
 
+/// Resolve the into commit, writing a scratch empty commit when
+/// landing into the empty state. Returns the commit and whether the
+/// state was empty.
+fn resolve_merge_into(dir: &Path, into_commit: Option<&str>) -> Result<(String, bool), String> {
+    let is_empty = into_commit.is_none();
+    // Merge onto a scratch empty commit when landing into the empty
+    // state (`:257-261`): an empty tree with no author, committer, or
+    // message, written with `hash-object` (no git identity needed).
+    let into_commit = match into_commit {
+        Some(commit) => commit.to_string(),
+        None => git_write_raw_commit(dir, &RawCommit::empty())?,
+    };
+    Ok((into_commit, is_empty))
+}
+
+/// Reject merges whose into..max diff is empty (already landed).
+fn ensure_merge_nonempty(dir: &Path, into_commit: &str, max_hash: &str) -> Result<(), String> {
+    let changes = git::stdout_text(
+        dir,
+        &[
+            "diff",
+            "--no-ext-diff",
+            &format!("{into_commit}..{max_hash}"),
+            "--",
+        ],
+    )?;
+    if changes.trim().is_empty() {
+        return Err(format!(
+            "Merging local \"{}\" into \"{}\" produces an empty diff. This usually means these \
+             changes have already landed.",
+            git::display_hash(max_hash),
+            git::display_hash(into_commit)
+        ));
+    }
+    Ok(())
+}
+
+/// Merge the commit range: squash (non-empty) rebases the range onto
+/// the into state, then merges; anything else merges the max commit
+/// directly (`:322-345`).
+fn apply_merge_range(
+    dir: &Path,
+    min_hash: &str,
+    max_hash: &str,
+    into_commit: &str,
+    squash: bool,
+    is_empty: bool,
+) -> Result<String, String> {
+    if squash && !is_empty {
+        git_apply_rebase(dir, min_hash, max_hash, into_commit).and_then(|merged| {
+            git_apply_merge(dir, &merged, into_commit, squash, is_empty).map(|()| merged)
+        })
+    } else {
+        git_apply_merge(dir, max_hash, into_commit, squash, is_empty).map(|()| max_hash.to_string())
+    }
+}
+
+/// Drop the scratch empty parent (T12876, `:417-437`): re-read the
+/// raw commit, replace its parents (none under squash, the merged
+/// hash under merge), and write it back, preserving the tree, author,
+/// committer, and message bytes.
+fn drop_scratch_empty_parent(
+    dir: &Path,
+    cursor: &str,
+    squash: bool,
+    merged_hash: String,
+) -> Result<String, String> {
+    let mut raw = git_read_raw_commit(dir, cursor)?;
+    raw.parents = if squash {
+        Vec::new()
+    } else {
+        vec![merged_hash]
+    };
+    let cursor = git_write_raw_commit(dir, &raw)?;
+    git::stdout_text(dir, &["checkout", &cursor, "--"])?;
+    Ok(cursor)
+}
+
 /// Merge one commit set into `into_commit`
 /// (`ArcanistGitLandEngine::executeMerge()`, `:250-440`).
 ///
@@ -4295,44 +4373,13 @@ pub fn git_execute_merge(
     let min_hash = commits[set.commits[0]].hash.clone();
     let max_hash = commits[set.commits[set.commits.len() - 1]].hash.clone();
     let max_summary = display_summary(&commits[set.commits[set.commits.len() - 1]].summary);
-    let is_empty = into_commit.is_none();
-    // Merge onto a scratch empty commit when landing into the empty
-    // state (`:257-261`): an empty tree with no author, committer, or
-    // message, written with `hash-object` (no git identity needed).
-    let into_commit = match into_commit {
-        Some(commit) => commit.to_string(),
-        None => git_write_raw_commit(dir, &RawCommit::empty())?,
-    };
-    let changes = git::stdout_text(
-        dir,
-        &[
-            "diff",
-            "--no-ext-diff",
-            &format!("{into_commit}..{max_hash}"),
-            "--",
-        ],
-    )?;
-    if changes.trim().is_empty() {
-        return Err(format!(
-            "Merging local \"{}\" into \"{}\" produces an empty diff. This usually means these \
-             changes have already landed.",
-            git::display_hash(&max_hash),
-            git::display_hash(&into_commit)
-        ));
-    }
+    let (into_commit, is_empty) = resolve_merge_into(dir, into_commit)?;
+    ensure_merge_nonempty(dir, &into_commit, &max_hash)?;
     io.push_status(
         "MERGING",
         &format!("{} {max_summary}", git::display_hash(&max_hash)),
     );
-    // Squash (non-empty) rebases the range onto the into state, then
-    // merges; anything else merges the max commit directly (`:322-345`).
-    let merged = if squash && !is_empty {
-        git_apply_rebase(dir, &min_hash, &max_hash, &into_commit).and_then(|merged| {
-            git_apply_merge(dir, &merged, &into_commit, squash, is_empty).map(|()| merged)
-        })
-    } else {
-        git_apply_merge(dir, &max_hash, &into_commit, squash, is_empty).map(|()| max_hash.clone())
-    };
+    let merged = apply_merge_range(dir, &min_hash, &max_hash, &into_commit, squash, is_empty);
     let merged_hash = match merged {
         Ok(merged) => merged,
         Err(_) => {
@@ -4350,18 +4397,7 @@ pub fn git_execute_merge(
     let message = message_of(set)?;
     let mut cursor = git_apply_commit(dir, &message, Some(&author), Some(&date), false)?;
     if is_empty {
-        // Drop the scratch empty parent (T12876, `:417-437`): re-read
-        // the raw commit, replace its parents (none under squash, the
-        // merged hash under merge), and write it back, preserving the
-        // tree, author, committer, and message bytes.
-        let mut raw = git_read_raw_commit(dir, &cursor)?;
-        raw.parents = if squash {
-            Vec::new()
-        } else {
-            vec![merged_hash]
-        };
-        cursor = git_write_raw_commit(dir, &raw)?;
-        git::stdout_text(dir, &["checkout", &cursor, "--"])?;
+        cursor = drop_scratch_empty_parent(dir, &cursor, squash, merged_hash)?;
     }
     Ok(cursor)
 }
@@ -8057,6 +8093,78 @@ pub fn land_hg_with(
     }
 }
 
+/// Bookmarks to push: every onto ref except the branch marker.
+fn push_bookmarks_for(onto_refs: &[String], branch_marker: Option<&str>) -> Vec<String> {
+    onto_refs
+        .iter()
+        .filter(|name| Some(name.as_str()) != branch_marker)
+        .cloned()
+        .collect()
+}
+
+/// Push after this set: never under `--hold`, always under
+/// `--incremental`, else only after the last set.
+fn should_push_hg_set(options: &Options, index: usize, last: usize) -> bool {
+    if options.hold {
+        false
+    } else if options.incremental {
+        true
+    } else {
+        index == last
+    }
+}
+
+/// Push the cursor, cascade landed state, and prune landed branches.
+#[allow(clippy::too_many_arguments)]
+fn push_and_cascade_hg(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    io: &mut Io,
+    options: &Options,
+    onto_remote: &str,
+    push_bookmarks: &[String],
+    cursor: Option<&str>,
+    commits: &[LandCommit],
+    squash: bool,
+    need_cascade: &mut Vec<CommitSet>,
+    need_prune: &mut Vec<CommitSet>,
+) -> Result<(), String> {
+    hg_push_change_with(
+        dir,
+        hg_cmd,
+        io,
+        onto_remote,
+        push_bookmarks,
+        cursor_or(cursor),
+    )?;
+    need_cascade.reverse();
+    for cascade_set in need_cascade.iter() {
+        hg_cascade_state_with(dir, hg_cmd, cascade_set, commits, cursor_or(cursor), squash)?;
+    }
+    need_cascade.clear();
+    if !options.keep_branches {
+        hg_prune_branches_with(dir, hg_cmd, io, need_prune, commits)?;
+        need_prune.clear();
+    }
+    Ok(())
+}
+
+/// Print hold instructions and drop the saved local state.
+fn finish_hg_hold(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    io: &mut Io,
+    onto_remote: &str,
+    push_bookmarks: &[String],
+    cursor: Option<&str>,
+    state: &HgLocalState,
+) -> Result<(), String> {
+    let restore = hg_restore_commands(state);
+    hg_hold_text(io, push_bookmarks, onto_remote, cursor_or(cursor), &restore);
+    discard_local_state_hg_with(dir, hg_cmd, io, state)?;
+    Ok(())
+}
+
 /// The Mercurial merge/push loop proper (see [`land_hg_with`]).
 #[allow(clippy::too_many_arguments)]
 fn land_hg_inner_with(
@@ -8075,11 +8183,7 @@ fn land_hg_inner_with(
     online: Option<&arc_rs::conduit::Client>,
     state: &HgLocalState,
 ) -> Result<(), String> {
-    let push_bookmarks: Vec<String> = onto_refs
-        .iter()
-        .filter(|name| Some(name.as_str()) != branch_marker)
-        .cloned()
-        .collect();
+    let push_bookmarks = push_bookmarks_for(onto_refs, branch_marker);
     let mut cursor = into_commit.map(str::to_string);
     let mut need_cascade: Vec<CommitSet> = Vec::new();
     let mut need_prune: Vec<CommitSet> = Vec::new();
@@ -8109,51 +8213,32 @@ fn land_hg_inner_with(
             &message_of,
         )?;
         cursor = Some(merged);
-        let should_push = if options.hold {
-            false
-        } else if options.incremental {
-            true
-        } else {
-            index == last
-        };
-        if should_push {
-            hg_push_change_with(
+        if should_push_hg_set(options, index, last) {
+            push_and_cascade_hg(
                 dir,
                 hg_cmd,
                 io,
+                options,
                 onto_remote,
                 &push_bookmarks,
-                cursor_or(cursor.as_deref()),
+                cursor.as_deref(),
+                commits,
+                squash,
+                &mut need_cascade,
+                &mut need_prune,
             )?;
-            need_cascade.reverse();
-            for cascade_set in &need_cascade {
-                hg_cascade_state_with(
-                    dir,
-                    hg_cmd,
-                    cascade_set,
-                    commits,
-                    cursor_or(cursor.as_deref()),
-                    squash,
-                )?;
-            }
-            need_cascade.clear();
-            if !options.keep_branches {
-                hg_prune_branches_with(dir, hg_cmd, io, &need_prune, commits)?;
-                need_prune.clear();
-            }
         }
     }
     if options.hold {
-        let restore = hg_restore_commands(state);
-        hg_hold_text(
+        return finish_hg_hold(
+            dir,
+            hg_cmd,
             io,
-            &push_bookmarks,
             onto_remote,
-            cursor_or(cursor.as_deref()),
-            &restore,
+            &push_bookmarks,
+            cursor.as_deref(),
+            state,
         );
-        discard_local_state_hg_with(dir, hg_cmd, io, state)?;
-        return Ok(());
     }
     hg_reconcile_with(
         dir,

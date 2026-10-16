@@ -3914,68 +3914,94 @@ pub fn result_code(results: &[LintResult]) -> i32 {
 /// last space (the break space is dropped, interior spacing kept),
 /// embedded newlines flush the line as-is, and every emitted line is
 /// prefixed with `indent` spaces. No trailing newline is synthesized.
-pub fn word_wrap(text: &str, indent: usize) -> String {
-    let width = 78usize.saturating_sub(indent);
-    let chars: Vec<char> = text.chars().collect();
-    let mut lines: Vec<Vec<char>> = Vec::new();
-    let mut line: Vec<char> = Vec::new();
-    let mut line_len: usize = 0;
-    let mut break_pos: Option<usize> = None;
-    let mut len_after_break: usize = 0;
-    let mut index = 0;
-    while index < chars.len() {
-        // ANSI escapes ride along without counting toward the width.
-        if chars[index] == '\x1b' {
-            while index < chars.len() {
-                line.push(chars[index]);
-                let done = chars[index] == 'm';
-                index += 1;
-                if done {
-                    break;
-                }
+/// Mutable line state for [`word_wrap`].
+#[derive(Default)]
+struct WrapState {
+    lines: Vec<Vec<char>>,
+    line: Vec<char>,
+    line_len: usize,
+    break_pos: Option<usize>,
+    len_after_break: usize,
+}
+
+impl WrapState {
+    /// Copy one ANSI escape (`ESC ... m`) onto the line verbatim,
+    /// returning the index past the terminator.
+    fn push_escape(&mut self, chars: &[char], mut index: usize) -> usize {
+        while index < chars.len() {
+            self.line.push(chars[index]);
+            let done = chars[index] == 'm';
+            index += 1;
+            if done {
+                break;
             }
-            continue;
         }
-        let chr = chars[index];
-        index += 1;
-        line.push(chr);
-        line_len += 1;
-        len_after_break += 1;
-        if line_len > width
-            && let Some(at) = break_pos
+        index
+    }
+
+    /// Append one display char, wrapping at the last blank when the
+    /// line overflows and flushing at newlines.
+    fn push_char(&mut self, chr: char, width: usize) {
+        self.line.push(chr);
+        self.line_len += 1;
+        self.len_after_break += 1;
+        if self.line_len > width
+            && let Some(at) = self.break_pos
         {
-            let mut slice: Vec<char> = line[..at].to_vec();
+            let mut slice: Vec<char> = self.line[..at].to_vec();
             while slice.last() == Some(&' ') {
                 slice.pop();
             }
             slice.push('\n');
-            lines.push(slice);
-            line = line[at..].to_vec();
-            line_len = len_after_break;
-            len_after_break = 0;
-            break_pos = None;
+            self.lines.push(slice);
+            self.line = self.line[at..].to_vec();
+            self.line_len = self.len_after_break;
+            self.len_after_break = 0;
+            self.break_pos = None;
         }
         if chr == ' ' {
-            break_pos = Some(line.len());
-            len_after_break = 0;
+            self.break_pos = Some(self.line.len());
+            self.len_after_break = 0;
         }
         if chr == '\n' {
-            lines.push(std::mem::take(&mut line));
-            len_after_break = 0;
-            line_len = 0;
-            break_pos = None;
+            self.lines.push(std::mem::take(&mut self.line));
+            self.len_after_break = 0;
+            self.line_len = 0;
+            self.break_pos = None;
         }
     }
-    if !line.is_empty() {
-        lines.push(line);
+
+    /// Flush the tail line and indent every line.
+    fn finish(mut self, indent: usize) -> String {
+        if !self.line.is_empty() {
+            self.lines.push(std::mem::take(&mut self.line));
+        }
+        let prefix = " ".repeat(indent);
+        let mut out = String::new();
+        for line in &self.lines {
+            out.push_str(&prefix);
+            out.extend(line.iter());
+        }
+        out
     }
-    let prefix = " ".repeat(indent);
-    let mut out = String::new();
-    for line in &lines {
-        out.push_str(&prefix);
-        out.extend(line.iter());
+}
+
+pub fn word_wrap(text: &str, indent: usize) -> String {
+    let width = 78usize.saturating_sub(indent);
+    let chars: Vec<char> = text.chars().collect();
+    let mut state = WrapState::default();
+    let mut index = 0;
+    while index < chars.len() {
+        // ANSI escapes ride along without counting toward the width.
+        if chars[index] == '\x1b' {
+            index = state.push_escape(&chars, index);
+            continue;
+        }
+        let chr = chars[index];
+        index += 1;
+        state.push_char(chr, width);
     }
-    out
+    state.finish(indent)
 }
 
 /// Render one result in console format
