@@ -111,6 +111,15 @@ LAND-0a/b/c, AMEND-0, LAND-1 nest under `constraints` via the shared
 | CORE-18 (SIGINT routing) | UNPORTED (Rule 3) | no signal API in std; libc transitive-only, Cargo.toml frozen |
 | DIFF-D6..21, PATCH-P3..13 (sans done) | FIXED (Rule 0) | D8 bare-git submits via detection; D9 raw message ride-through (ported into `collect_mode_payload` at merge); D11/D12 re-verified faithful. D2 verified CLEAN (no edit). Carry: DIFF-D22, DL-D11 |
 
+### Wave 2 remediation (CI-driven)
+
+| Finding | Decision | Trigger / note |
+|---|---|---|
+| RB-D5 `--help` shape vs release gate | BOTH (gate wins the token, finding wins the body) | `arc --help` leads with the historical `usage:` line (release smoke greps it) ahead of the full WORKFLOWS reference; `arc help` stays pure `renderHelp`. No PHP byte spec either way |
+| `ARCANIST` classic export (`scripts/arcanist.php:229`) | PARTIAL (Rule 3-adjacent) | global flags moved from `set_var` (`unsafe` in edition 2024) to `globals` cells (zero `unsafe` per geiger policy); in-process readers see identical values. Known gap: hook children no longer inherit `ARCANIST` (would need per-spawn `.env()`); zero in-tree consumers/tests |
+| LINT-10 separator preservation | FIXED (Rule 0) | `normalize_lexical` returns dot-free paths byte-identical (a `PathBuf` rebuild converts `/`→`\` on Windows and broke `^externals/` routing + displays); `..` resolution unchanged |
+| Complexity ratchet (28) + platform tests | FIXED | three agents split Wave-2's over-threshold functions (verified 0 violations via local rca replication); d7 identity, root-chmod, and 4 Windows failures fixed (hg CRLF tolerance, unix-gated stubs, drive-absolute bin, separator preservation) |
+
 ### Keep-list (Rule 2, recorded early per task §10 step 4)
 
 | Finding | Criterion | Rationale |
