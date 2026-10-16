@@ -164,7 +164,8 @@ fn t1153_upx_u3_upload_prints_before_browse() {
     let mut printed = String::new();
     let code = upload::run_in_with_sink(
         &dir,
-        &argv(&["--conduit-uri", &base, "--browse", "a.bin"]),
+        // T1153 BROWSE-B21: piped runs carry `--`.
+        &argv(&["--conduit-uri", &base, "--browse", "a.bin", "--"]),
         &mut |text| printed.push_str(text),
     );
     assert!(printed.contains("F7 a.bin"), "{printed:?}");
@@ -201,6 +202,7 @@ fn t1153_upx_p3_paste_prints_before_browse() {
     let mut printed = String::new();
     let code = paste::run_in_with_sink(
         &dir,
+        // T1153 BROWSE-B21: piped runs carry `--`.
         &argv(&[
             "--conduit-uri",
             &base,
@@ -209,6 +211,7 @@ fn t1153_upx_p3_paste_prints_before_browse() {
             "body.txt",
             "--title",
             "t",
+            "--",
         ]),
         &mut |text| printed.push_str(text),
     );
@@ -227,10 +230,13 @@ fn t1153_upx_p18_paste_envelope_classes() {
     let (base, rx) = serve_log(HashMap::new(), 0);
     let (_home, _guard) = home_with_token("p18-home", &base);
     let mut printed = String::new();
-    let code =
-        paste::run_in_with_sink(&dir, &argv(&["--conduit-uri", &base, "Px!"]), &mut |text| {
-            printed.push_str(text)
-        });
+    // T1153 BROWSE-B21: `--` present, so symbol validation (not
+    // the terminator) reports.
+    let code = paste::run_in_with_sink(
+        &dir,
+        &argv(&["--conduit-uri", &base, "Px!", "--"]),
+        &mut |text| printed.push_str(text),
+    );
     assert_eq!(code, std::process::ExitCode::FAILURE);
     assert!(printed.is_empty(), "{printed:?}");
     assert!(seen(&rx).is_empty());
@@ -459,4 +465,90 @@ fn t1153_upx_e1_default_base_end_to_end() {
     assert!(text.contains("+two\n"), "{text}");
     assert_eq!(seen(&rx).len(), 2);
     std::fs::remove_dir_all(&scratch).ok();
+}
+
+fn piped_stdin() -> bool {
+    use std::io::IsTerminal;
+    !std::io::stdin().is_terminal()
+}
+
+#[test]
+fn b21_upload_requires_terminator_when_piped() {
+    // T1153 BROWSE-B21: `upload` is a toolset workflow, so piped
+    // runs without `--` fail (exit 1), even for `--help`; `--`
+    // proceeds to normal handling.
+    if !piped_stdin() {
+        return;
+    }
+    let dir = std::env::temp_dir();
+    assert_eq!(
+        upload::run_in(&dir, &argv(&["--help"])),
+        std::process::ExitCode::FAILURE
+    );
+    assert_eq!(
+        upload::run_in(&dir, &argv(&["a.bin"])),
+        std::process::ExitCode::FAILURE
+    );
+    assert_eq!(
+        upload::run_in(&dir, &argv(&["--help", "--"])),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
+#[test]
+fn b21_paste_requires_terminator_when_piped() {
+    // T1153 BROWSE-B21: `paste` is a toolset workflow (same gate as
+    // `upload` above).
+    if !piped_stdin() {
+        return;
+    }
+    let dir = std::env::temp_dir();
+    assert_eq!(
+        paste::run_in(&dir, &argv(&["--help"])),
+        std::process::ExitCode::FAILURE
+    );
+    assert_eq!(
+        paste::run_in(&dir, &argv(&["P123"])),
+        std::process::ExitCode::FAILURE
+    );
+    assert_eq!(
+        paste::run_in(&dir, &argv(&["--help", "--"])),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
+#[test]
+fn b21_export_needs_no_terminator_when_piped() {
+    // T1153 BROWSE-B21 VERIFIED for `export`: it is a classic
+    // workflow, so PHP never requires `--` (the
+    // `scripts/arcanist.php` re-exec sets no terminator
+    // requirement). `--help` without `--` still succeeds.
+    if !piped_stdin() {
+        return;
+    }
+    let dir = std::env::temp_dir();
+    assert_eq!(
+        export::run_in(&dir, &argv(&["--help"])),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
+#[test]
+fn b23_upx_help_exits_zero_with_terminator() {
+    // T1153 BROWSE-B23: TTY-independent -- `--` satisfies the check
+    // everywhere. Help bodies are pinned byte for byte in the
+    // module unit tests.
+    let dir = std::env::temp_dir();
+    assert_eq!(
+        upload::run_in(&dir, &argv(&["--help", "--"])),
+        std::process::ExitCode::SUCCESS
+    );
+    assert_eq!(
+        paste::run_in(&dir, &argv(&["--help", "--"])),
+        std::process::ExitCode::SUCCESS
+    );
+    assert_eq!(
+        export::run_in(&dir, &argv(&["--help", "--"])),
+        std::process::ExitCode::SUCCESS
+    );
 }

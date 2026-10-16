@@ -27,26 +27,104 @@ use crate::diff_local::{
 
 pub const NAME: &str = "export";
 
-fn usage() -> String {
-    format!(
-        "usage: arc {NAME} (--git | --unified | --arcbundle PATH) [BASE]\n\
-         \x20      arc {NAME} (--git | --unified | --arcbundle PATH) --revision ID\n\
-         \x20      arc {NAME} (--git | --unified | --arcbundle PATH) --diff ID\n\
-         \n\
-         Export the working copy changes against BASE (default: HEAD), or a\n\
-         Differential revision/diff, to stdout as a patch, or to PATH as an\n\
-         arc bundle.\n\
-         \n\
-         Options:\n\
-         \x20 --git          export as a git patch (applies with `git apply`)\n\
-         \x20 --unified      export as a plain unified patch (applies with `patch`)\n\
-         \x20 --arcbundle PATH  export as an arc bundle written to PATH\n\
-         \x20 --revision ID  export a Differential revision (D123 or 123)\n\
-         \x20 --diff ID      export one Differential diff by numeric ID\n\
-         \x20 --encoding ENCODING  convert a non-UTF-8 patch from ENCODING\n\
-         \x20 --conduit-uri URI  conduit server (or ARC_CONDUIT_URI / .arcconfig)\n\
-         \x20 -h, --help     show this help\n"
+/// T1153 BROWSE-B23: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`
+/// over `newLegacyPhutilWorkflow()`), not a short custom usage string.
+/// `export` is a classic workflow, so the examples fall back to the
+/// `PhutilArgumentWorkflow` default while the synopsis and help come
+/// from `getCommandSynopses()`/`getCommandHelp()`.
+const HELP_EXAMPLES: &str = "**export**";
+const HELP_SYNOPSIS: &str = "\
+     \x20     **export** [__paths__] __format__ (svn)\n\
+     \x20     **export** [__commit_range__] __format__ (git, hg)\n\
+     \x20     **export** __--revision__ __revision_id__ __format__\n\
+     \x20     **export** __--diff__ __diff_id__ __format__";
+const HELP_TEXT: &str = "\
+     \x20         Supports: svn, git, hg\n\
+     \x20         Export the local changeset (or a Differential changeset) to a file,\n\
+     \x20         in some __format__: git diff (__--git__), unified diff\n\
+     \x20         (__--unified__), or arc bundle (__--arcbundle__ __path__) format.";
+/// Non-wildcard argument specs in `msort` order: (name, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, &str)] = &[
+    (
+        "arcbundle",
+        Some("file"),
+        "Export change as an arc bundle. This format can represent all changes. These bundles can be applied with 'arc patch'.",
+    ),
+    (
+        "diff",
+        Some("diff_id"),
+        "Instead of exporting changes from the working copy, export them from a Differential diff.",
+    ),
+    (
+        "encoding",
+        Some("encoding"),
+        "Attempt to convert non UTF-8 patch into specified encoding.",
+    ),
+    (
+        "git",
+        None,
+        "Export change as a git patch. This format is more complete than unified, but less complete than arc bundles. These patches can be applied with 'git apply' or 'arc patch'.",
+    ),
+    (
+        "revision",
+        Some("revision_id"),
+        "Instead of exporting changes from the working copy, export them from a Differential revision.",
+    ),
+    (
+        "unified",
+        None,
+        "Export change as a unified patch. This format is less complete than git patches or arc bundles. These patches can be applied with 'patch' or 'arc patch'.",
+    ),
+];
+
+/// `PhutilArgumentParser::indent()`: interpret markup, then wrap.
+fn help_indent(level: usize, text: &str, ansi: bool) -> String {
+    crate::terminal::console_wrap(
+        &crate::terminal::console_format(text, &[], ansi),
+        level,
+        true,
     )
+}
+
+/// `renderArgumentSpecs()` for the workflow arguments.
+fn help_specs(ansi: bool) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for (name, param, help) in HELP_SPECS {
+        let mut first = help_indent(6, &format!("__--{name}__"), ansi);
+        if let Some(param) = param {
+            first.push_str(&crate::terminal::console_format(
+                &format!(" __{param}__"),
+                &[],
+                ansi,
+            ));
+        }
+        out.push(first);
+        out.push(help_indent(10, help, ansi));
+        out.push(String::new());
+    }
+    out.join("\n")
+}
+
+/// The full `--help` text: `**EXPORT WORKFLOW**` header plus the
+/// detailed workflow help and a trailing blank line.
+fn usage_text(ansi: bool) -> String {
+    let header = crate::terminal::console_format("**%s**\n\n", &["EXPORT WORKFLOW"], ansi);
+    let body = [
+        help_indent(0, HELP_EXAMPLES, ansi),
+        help_indent(0, HELP_SYNOPSIS, ansi),
+        String::new(),
+        help_indent(0, HELP_TEXT, ansi),
+        String::new(),
+        help_specs(ansi),
+        String::new(),
+    ]
+    .join("\n");
+    format!("{header}{body}\n")
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

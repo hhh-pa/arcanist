@@ -13,7 +13,8 @@ fn args_of(words: &[&str]) -> Options {
 
 #[test]
 fn parses_paths_and_flags() {
-    let opts = args_of(&["a.bin", "b.bin"]);
+    // T1153 BROWSE-B21: piped runs carry `--`.
+    let opts = args_of(&["a.bin", "b.bin", "--"]);
     assert_eq!(opts.paths, vec!["a.bin".to_string(), "b.bin".to_string()]);
     assert!(!opts.json);
     assert!(!opts.temporary);
@@ -26,7 +27,9 @@ fn parses_paths_and_flags() {
 
 #[test]
 fn requires_paths_and_rejects_unknown_flags() {
-    let ParseOutcome::Error(message) = parse_args(&argv(&[])) else {
+    // T1153 BROWSE-B21: `--` present, so validation (not the
+    // terminator) reports.
+    let ParseOutcome::Error(message) = parse_args(&argv(&["--"])) else {
         panic!("expected error for no paths");
     };
     assert!(message.contains("one or more paths"), "{message}");
@@ -39,9 +42,10 @@ fn requires_paths_and_rejects_unknown_flags() {
 
 #[test]
 fn parses_browse() {
-    let opts = args_of(&["--browse", "a"]);
+    // T1153 BROWSE-B21: piped runs carry `--`.
+    let opts = args_of(&["--browse", "a", "--"]);
     assert!(opts.browse);
-    assert!(!args_of(&["a"]).browse);
+    assert!(!args_of(&["a", "--"]).browse);
 }
 
 #[test]
@@ -251,7 +255,9 @@ fn r4_uploadu15_aggregate_errors_are_fatal() {
     // `upload` is a toolset workflow: aggregate and resolve errors
     // are uncaught `Exception`s (fatal, 255), while argument errors
     // stay toolset usage (exit 1) with no usage dump.
-    match execute(&std::env::temp_dir(), &argv(&[])) {
+    // T1153 BROWSE-B21: `--` present, so validation (not the
+    // terminator) reports.
+    match execute(&std::env::temp_dir(), &argv(&["--"])) {
         Err(message) => assert!(!message.contains("usage:"), "{message}"),
         _ => panic!("expected parse error"),
     }
@@ -261,10 +267,16 @@ fn r4_uploadu15_aggregate_errors_are_fatal() {
     );
     // Conduit setup failures (deterministic: no token can exist for
     // `.invalid`) escape into a fatal, like aggregate errors.
+    // T1153 BROWSE-B21: piped runs carry `--`.
     assert_eq!(
         run_in(
             &std::env::temp_dir(),
-            &argv(&["--conduit-uri", "https://upload-test.invalid/", "f.bin"])
+            &argv(&[
+                "--conduit-uri",
+                "https://upload-test.invalid/",
+                "f.bin",
+                "--"
+            ])
         ),
         std::process::ExitCode::from(255)
     );
@@ -480,4 +492,78 @@ fn upload_u12_allocates_sequentially_in_order() {
     assert!(seen[0].contains("first.bin"), "{}", seen[0]);
     assert!(seen[1].contains("second.bin"), "{}", seen[1]);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn upx_b21_upload_requires_terminator_when_piped() {
+    // Piped without `--`: the terminator reports, even for `--help`
+    // and missing paths (PHP's `parseFull` runs before
+    // `didParseArguments`).
+    assert!(matches!(
+        parse_args_with_tty(&argv(&["a.bin"]), false),
+        ParseOutcome::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&argv(&["--help"]), false),
+        ParseOutcome::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&argv(&[]), false),
+        ParseOutcome::MissingTerminator
+    ));
+    // Unknown flags still report first.
+    assert!(matches!(
+        parse_args_with_tty(&argv(&["--bogus"]), false),
+        ParseOutcome::Error(_)
+    ));
+    // `--` (or a TTY) proceeds to normal validation.
+    assert!(matches!(
+        parse_args_with_tty(&argv(&["--", "a.bin"]), false),
+        ParseOutcome::Args(_)
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&argv(&["a.bin"]), true),
+        ParseOutcome::Args(_)
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&argv(&["--"]), false),
+        ParseOutcome::Error(_)
+    ));
+    assert_eq!(
+        MISSING_TERMINATOR,
+        "Missing required \"--\" in argument list."
+    );
+}
+
+#[test]
+fn upx_b23_upload_help_matches_generated_format() {
+    assert_eq!(
+        usage_text(false),
+        "UPLOAD WORKFLOW\n\
+         \n\
+         upload [options] -- file [file ...]\n\
+         Upload files.\n\
+         \n\
+         Upload one or more files from local disk to Phabricator.\n\
+         \n\
+         \x20     --browse\n\
+         \x20         After the upload completes, open the files in a web browser.\n\
+         \n\
+         \x20     --json\n\
+         \x20         Output upload information in JSON format.\n\
+         \n\
+         \x20     --temporary\n\
+         \x20         Mark the file as temporary. Temporary files will be deleted after\n\
+         \x20         24 hours.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `--help` still exits zero once `--` satisfies the terminator.
+    match execute(&std::env::temp_dir(), &argv(&["--help", "--"])) {
+        Ok(text) => assert!(text.contains("UPLOAD WORKFLOW"), "{text}"),
+        Err(message) => panic!("expected help, got {message}"),
+    }
 }

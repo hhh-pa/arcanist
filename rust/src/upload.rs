@@ -26,19 +26,74 @@ pub const NAME: &str = "upload";
 /// Temporary files expire after 24 hours, like the PHP workflow.
 const TEMPORARY_TTL_SECS: u64 = 24 * 60 * 60;
 
-fn usage() -> String {
-    format!(
-        "usage: arc {NAME} [--json] [--temporary] [--browse] [--conduit-uri URI] -- FILE [FILE ...]\n\
-         \n\
-         Upload one or more files from local disk.\n\
-         \n\
-         Options:\n\
-         \x20 --json         output upload information in JSON format\n\
-         \x20 --temporary    mark files temporary (deleted after 24 hours)\n\
-         \x20 --browse       after the upload completes, open the files in a web browser\n\
-         \x20 --conduit-uri URI  conduit server (or ARC_CONDUIT_URI / .arcconfig)\n\
-         \x20 -h, --help     show this help\n"
+/// T1153 BROWSE-B23: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string.
+const HELP_EXAMPLES: &str = "**upload** [__options__] -- __file__ [__file__ ...]";
+const HELP_SYNOPSIS: &str = "Upload files.";
+const HELP_TEXT: &str = "Upload one or more files from local disk to Phabricator.";
+/// Non-wildcard argument specs in `msort` order: (name, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, &str)] = &[
+    (
+        "browse",
+        None,
+        "After the upload completes, open the files in a web browser.",
+    ),
+    ("json", None, "Output upload information in JSON format."),
+    (
+        "temporary",
+        None,
+        "Mark the file as temporary. Temporary files will be deleted after 24 hours.",
+    ),
+];
+
+/// `PhutilArgumentParser::indent()`: interpret markup, then wrap.
+fn help_indent(level: usize, text: &str, ansi: bool) -> String {
+    crate::terminal::console_wrap(
+        &crate::terminal::console_format(text, &[], ansi),
+        level,
+        true,
     )
+}
+
+/// `renderArgumentSpecs()` for the workflow arguments.
+fn help_specs(ansi: bool) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for (name, param, help) in HELP_SPECS {
+        let mut first = help_indent(6, &format!("__--{name}__"), ansi);
+        if let Some(param) = param {
+            first.push_str(&crate::terminal::console_format(
+                &format!(" __{param}__"),
+                &[],
+                ansi,
+            ));
+        }
+        out.push(first);
+        out.push(help_indent(10, help, ansi));
+        out.push(String::new());
+    }
+    out.join("\n")
+}
+
+/// The full `--help` text: `**UPLOAD WORKFLOW**` header plus the
+/// detailed workflow help and a trailing blank line.
+fn usage_text(ansi: bool) -> String {
+    let header = crate::terminal::console_format("**%s**\n\n", &["UPLOAD WORKFLOW"], ansi);
+    let body = [
+        help_indent(0, HELP_EXAMPLES, ansi),
+        help_indent(0, HELP_SYNOPSIS, ansi),
+        String::new(),
+        help_indent(0, HELP_TEXT, ansi),
+        String::new(),
+        help_specs(ansi),
+        String::new(),
+    ]
+    .join("\n");
+    format!("{header}{body}\n")
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -54,6 +109,8 @@ enum ParseOutcome {
     Args(Options),
     Help,
     Error(String),
+    /// T1153 BROWSE-B21: stdin is piped and argv carries no `--`.
+    MissingTerminator,
 }
 
 fn take_value(iter: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<String, ParseOutcome> {
@@ -63,54 +120,177 @@ fn take_value(iter: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<Str
     }
 }
 
-fn parse_args(argv: &[String]) -> ParseOutcome {
-    let mut paths: Vec<String> = Vec::new();
-    let mut json = false;
-    let mut temporary = false;
-    let mut browse = false;
-    let mut conduit_uri: Option<String> = None;
-    let mut end_of_flags = false;
+/// One argument's parse step: consumed, or a terminal outcome.
+enum Step {
+    Handled,
+    Done(ParseOutcome),
+}
 
-    let mut iter = argv.iter();
-    while let Some(arg) = iter.next() {
-        if end_of_flags {
-            paths.push(arg.clone());
-        } else if arg == "--" {
-            end_of_flags = true;
-        } else if arg == "--json" {
-            json = true;
-        } else if arg == "--temporary" {
-            temporary = true;
-        } else if arg == "--conduit-uri" {
-            match take_value(&mut iter, "--conduit-uri") {
-                Ok(value) => conduit_uri = Some(value),
-                Err(outcome) => return outcome,
-            }
-        } else if let Some(value) = arg.strip_prefix("--conduit-uri=") {
-            conduit_uri = Some(value.to_string());
-        } else if arg == "-h" || arg == "--help" {
-            return ParseOutcome::Help;
-        } else if arg == "--browse" {
-            browse = true;
-        } else if arg.starts_with('-') {
-            return ParseOutcome::Error(format!("unknown flag '{arg}'"));
-        } else {
-            paths.push(arg.clone());
+struct Parser {
+    paths: Vec<String>,
+    json: bool,
+    temporary: bool,
+    browse: bool,
+    conduit_uri: Option<String>,
+    end_of_flags: bool,
+}
+
+impl Parser {
+    fn new() -> Self {
+        Self {
+            paths: Vec::new(),
+            json: false,
+            temporary: false,
+            browse: false,
+            conduit_uri: None,
+            end_of_flags: false,
         }
     }
 
-    if paths.is_empty() {
-        return ParseOutcome::Error(
-            "Specify one or more paths to files you want to upload.".to_string(),
+    fn flag_conduit(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Option<Step> {
+        if arg == "--conduit-uri" {
+            match take_value(iter, "--conduit-uri") {
+                Ok(value) => self.conduit_uri = Some(value),
+                Err(outcome) => return Some(Step::Done(outcome)),
+            }
+            return Some(Step::Handled);
+        }
+        if let Some(value) = arg.strip_prefix("--conduit-uri=") {
+            self.conduit_uri = Some(value.to_string());
+            return Some(Step::Handled);
+        }
+        None
+    }
+
+    fn tail(&mut self, arg: &str) -> Step {
+        if arg == "--" {
+            self.end_of_flags = true;
+            Step::Handled
+        } else if arg == "--json" {
+            self.json = true;
+            Step::Handled
+        } else if arg == "--temporary" {
+            self.temporary = true;
+            Step::Handled
+        } else if arg == "--browse" {
+            self.browse = true;
+            Step::Handled
+        } else if arg == "-h" || arg == "--help" {
+            Step::Done(ParseOutcome::Help)
+        } else if arg.starts_with('-') {
+            Step::Done(ParseOutcome::Error(format!("unknown flag '{arg}'")))
+        } else {
+            self.paths.push(arg.to_string());
+            Step::Handled
+        }
+    }
+
+    fn consume(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Step {
+        if self.end_of_flags {
+            self.paths.push(arg.to_string());
+            return Step::Handled;
+        }
+        if let Some(step) = self.flag_conduit(arg, iter) {
+            return step;
+        }
+        self.tail(arg)
+    }
+
+    fn finish(self, missing_terminator: bool) -> ParseOutcome {
+        // T1153 BROWSE-B21: the terminator check runs after flag
+        // scanning (unknown flags report first, like PHP's
+        // `parseFull()`), but before workflow validation (PHP's
+        // `didParseArguments` runs after it).
+        if missing_terminator {
+            return ParseOutcome::MissingTerminator;
+        }
+        if self.paths.is_empty() {
+            return ParseOutcome::Error(
+                "Specify one or more paths to files you want to upload.".to_string(),
+            );
+        }
+        ParseOutcome::Args(Options {
+            paths: self.paths,
+            json: self.json,
+            temporary: self.temporary,
+            browse: self.browse,
+            conduit_uri: self.conduit_uri,
+        })
+    }
+}
+
+/// T1153 BROWSE-B21: noninteractive runs must carry `--`
+/// (`ArcanistRuntime.php:80-86`, enforced by
+/// `PhutilArgumentParser::parseFull()`). Any standalone `--` token
+/// satisfies PHP: the standard-arguments scan that records it never
+/// consumes workflow flag values.
+fn terminator_missing(argv: &[String], stdin_tty: bool) -> bool {
+    !stdin_tty && !argv.iter().any(|arg| arg == "--")
+}
+
+const MISSING_TERMINATOR: &str = "Missing required \"--\" in argument list.";
+
+/// The three cyan `USAGE` hints PHP prints before the terminator
+/// error (`ArcanistRuntime.php:172-188`), on stderr like PHP.
+fn print_terminator_hints(ansi: bool) {
+    use crate::terminal::{PhtArg, TVal};
+    let usage = crate::terminal::pht("USAGE", &[]);
+    for hint in [
+        crate::terminal::pht(
+            "\"%s\" is being run noninteractively, but the argument list is missing \"--\" to indicate end of flags.",
+            &[PhtArg::Text("arc")],
+        ),
+        crate::terminal::pht(
+            "When running noninteractively, you MUST provide \"--\" to all commands (even if they take no arguments).",
+            &[],
+        ),
+    ] {
+        eprint!(
+            "{}",
+            crate::terminal::format_log("cyan", &usage, &hint, ansi)
         );
     }
-    ParseOutcome::Args(Options {
-        paths,
-        json,
-        temporary,
-        browse,
-        conduit_uri,
-    })
+    // `tsprintf('%s <__%s__>', ...)` nested like PHP: the inner line
+    // passes through the outer `%s` unescaped (`TVal::Terminal`).
+    let inner = crate::terminal::tsprintf_ansi(
+        "%s <__%s__>",
+        &[
+            TVal::Text(&crate::terminal::pht("Learn More:", &[])),
+            TVal::Text("https://phurl.io/u/noninteractive"),
+        ],
+        ansi,
+    )
+    .expect("fixed tsprintf pattern");
+    let line = crate::terminal::tsprintf_ansi(
+        "**<bg:cyan> %s </bg>** %s\n",
+        &[TVal::Text(&usage), TVal::Terminal(&inner)],
+        ansi,
+    )
+    .expect("fixed tsprintf pattern");
+    eprint!("{}", line.as_str());
+}
+
+fn parse_args(argv: &[String]) -> ParseOutcome {
+    parse_args_with_tty(argv, crate::prompt::stdin_is_terminal())
+}
+
+/// [`parse_args`] with an injected TTY flag (deterministic tests).
+fn parse_args_with_tty(argv: &[String], stdin_tty: bool) -> ParseOutcome {
+    let missing = terminator_missing(argv, stdin_tty);
+    let mut parser = Parser::new();
+    let mut iter = argv.iter();
+    while let Some(arg) = iter.next() {
+        match parser.consume(arg, &mut iter) {
+            Step::Handled => {}
+            // `--help` reroutes through the help workflow in PHP,
+            // which still requires the terminator.
+            Step::Done(ParseOutcome::Help) if missing => {
+                return ParseOutcome::MissingTerminator;
+            }
+            Step::Done(outcome) => return outcome,
+        }
+    }
+    parser.finish(missing)
 }
 
 // --- base64 (RFC 4648, standard alphabet) -----------------------------------
@@ -897,6 +1077,7 @@ fn execute_parts(dir: &Path, argv: &[String]) -> Result<UploadParts, String> {
                 browse: false,
             });
         }
+        ParseOutcome::MissingTerminator => return Err(MISSING_TERMINATOR.to_string()),
         // T1153 R4 (UPLOAD-U15): PHP renders usage errors with no dump.
         ParseOutcome::Error(message) => return Err(message),
     };
@@ -950,7 +1131,13 @@ pub fn run_in_with_sink(dir: &Path, argv: &[String], sink: &mut dyn FnMut(&str))
             // EXCEPTION` label (exit 1); aggregate and resolve errors
             // are uncaught `Exception`s: fatal (255)
             // (`ArcanistUploadWorkflow.php:43,77-93`).
-            let kind = if matches!(parse_args(argv), ParseOutcome::Error(_)) {
+            if message == MISSING_TERMINATOR {
+                print_terminator_hints(crate::terminal::ansi_enabled());
+            }
+            let kind = if matches!(
+                parse_args(argv),
+                ParseOutcome::Error(_) | ParseOutcome::MissingTerminator
+            ) {
                 EnvelopeKind::ToolsetUsage
             } else {
                 EnvelopeKind::Fatal

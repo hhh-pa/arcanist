@@ -122,7 +122,11 @@ fn commands_reject_bad_args_without_io() {
     assert_eq!(upload::run(&argv(&[])), ExitCode::FAILURE);
     // T1153 R4 (UPLOAD-U15): `--browse f` parses fine; the failure is
     // conduit setup, which escapes the toolset runtime into a fatal.
-    assert_eq!(upload::run(&argv(&["--browse", "f"])), ExitCode::from(255));
+    // T1153 BROWSE-B21: piped runs carry `--`.
+    assert_eq!(
+        upload::run(&argv(&["--browse", "f", "--"])),
+        ExitCode::from(255)
+    );
     assert_eq!(paste::run(&argv(&["P1", "P2"])), ExitCode::FAILURE);
     assert_eq!(paste::run(&argv(&["P1", "--lang", "x"])), ExitCode::FAILURE);
     assert_eq!(liberate::run(&argv(&["a", "b"])), ExitCode::FAILURE);
@@ -137,11 +141,11 @@ fn help_succeeds_for_all_commands() {
         ExitCode::SUCCESS
     );
     assert_eq!(
-        upload::run_in(fx.path(), &argv(&["--help"])),
+        upload::run_in(fx.path(), &argv(&["--help", "--"])),
         ExitCode::SUCCESS
     );
     assert_eq!(
-        paste::run_in(fx.path(), &argv(&["--help"])),
+        paste::run_in(fx.path(), &argv(&["--help", "--"])),
         ExitCode::SUCCESS
     );
     assert_eq!(

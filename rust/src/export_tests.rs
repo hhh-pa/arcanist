@@ -1019,3 +1019,71 @@ fn export_e18_bundle_json_escapes_slash_and_unicode() {
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(&unpacked).ok();
 }
+
+#[test]
+fn upx_b21_export_needs_no_terminator() {
+    // T1153 BROWSE-B21 VERIFIED for `export`: it is a classic
+    // workflow (`ArcanistWorkflow`, `supportsToolset()` false), so
+    // PHP runs it via the `scripts/arcanist.php` re-exec, which
+    // never requires `--`. Parsing takes no TTY input, so
+    // piped-style argv parses directly, and `--help` without `--`
+    // still succeeds.
+    let opts = args_of(&["--git", "HEAD"]);
+    assert_eq!(opts.format, Format::Git);
+    match execute(&std::env::temp_dir(), &argv(&["--help"])) {
+        Ok(text) => assert!(text.contains("EXPORT WORKFLOW"), "{text}"),
+        Err(message) => panic!("expected help, got {message}"),
+    }
+}
+
+#[test]
+fn upx_b23_export_help_matches_generated_format() {
+    // Legacy generated help: the `PhutilArgumentWorkflow` default
+    // example, `getCommandSynopses()`/`getCommandHelp()` bodies, and
+    // the legacy specs in `msort` order.
+    assert_eq!(
+        usage_text(false),
+        "EXPORT WORKFLOW\n\
+         \n\
+         export\n\
+         \x20     export [paths] format (svn)\n\
+         \x20     export [commit_range] format (git, hg)\n\
+         \x20     export --revision revision_id format\n\
+         \x20     export --diff diff_id format\n\
+         \n\
+         \x20         Supports: svn, git, hg\n\
+         \x20         Export the local changeset (or a Differential changeset) to a file,\n\
+         \x20         in some format: git diff (--git), unified diff\n\
+         \x20         (--unified), or arc bundle (--arcbundle path) format.\n\
+         \n\
+         \x20     --arcbundle file\n\
+         \x20         Export change as an arc bundle. This format can represent all\n\
+         \x20         changes. These bundles can be applied with 'arc patch'.\n\
+         \n\
+         \x20     --diff diff_id\n\
+         \x20         Instead of exporting changes from the working copy, export them\n\
+         \x20         from a Differential diff.\n\
+         \n\
+         \x20     --encoding encoding\n\
+         \x20         Attempt to convert non UTF-8 patch into specified encoding.\n\
+         \n\
+         \x20     --git\n\
+         \x20         Export change as a git patch. This format is more complete than\n\
+         \x20         unified, but less complete than arc bundles. These patches can be\n\
+         \x20         applied with 'git apply' or 'arc patch'.\n\
+         \n\
+         \x20     --revision revision_id\n\
+         \x20         Instead of exporting changes from the working copy, export them\n\
+         \x20         from a Differential revision.\n\
+         \n\
+         \x20     --unified\n\
+         \x20         Export change as a unified patch. This format is less complete than\n\
+         \x20         git patches or arc bundles. These patches can be applied with\n\
+         \x20         'patch' or 'arc patch'.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+}
