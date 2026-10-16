@@ -506,6 +506,11 @@ pub struct Io {
     /// explicitly (`false` keeps the historical plain rendering
     /// byte-identical).
     pub ansi: bool,
+    /// True when stdin is an interactive terminal. Scripted
+    /// (`canned`) IO sets this, modelling a TTY session; `buffered`
+    /// and `live` IO read the real stdin state, so piped input fails
+    /// prompts like `phutil_console_require_tty()`.
+    pub stdin_tty: bool,
 }
 
 /// Configuration source scope holding saved prompt answers
@@ -560,7 +565,10 @@ impl Io {
     /// Buffered IO reading real stdin (for `execute`).
     #[must_use]
     pub fn buffered() -> Self {
-        Self::default()
+        Self {
+            stdin_tty: crate::prompt::stdin_is_terminal(),
+            ..Self::default()
+        }
     }
 
     /// Live IO reading real stdin (for `run_in`).
@@ -568,15 +576,17 @@ impl Io {
     pub fn live() -> Self {
         Self {
             live: true,
+            stdin_tty: crate::prompt::stdin_is_terminal(),
             ..Self::default()
         }
     }
 
-    /// Scripted answers, for tests.
+    /// Scripted answers, for tests (models a TTY session).
     #[must_use]
     pub fn canned(answers: &[&str]) -> Self {
         Self {
             canned: answers.iter().map(|answer| (*answer).to_string()).collect(),
+            stdin_tty: true,
             ..Self::default()
         }
     }
@@ -1051,8 +1061,14 @@ pub fn build_ref_view(id: i64, name: &str) -> RefView {
 /// configuration (`saveResponse()`, `:253-285`). A saved response runs
 /// the same loop without prompting, and the `Using saved response`
 /// notice prints after the loop (`:238-249`). Declining — or end of
-/// input — aborts with [`ABORT`].
+/// input — aborts with [`ABORT`]. Non-interactive stdin echoes the
+/// query and fails first, even with a saved response
+/// (`phutil_console_require_tty()`, `:77-88`).
 pub fn prompt_for_key(io: &mut Io, key: &str, query: &str) -> Result<(), String> {
+    if !io.stdin_tty {
+        io.push_out(&format!("{query}\n"));
+        return Err(crate::prompt::NOT_INTERACTIVE.to_string());
+    }
     io.push_out("\n");
     let mut saved_response = io.saved.get(key).map(|saved| saved.response.clone());
     let mut save_scope: Option<PromptScope> = None;
@@ -1388,11 +1404,16 @@ fn push_prompt_help(io: &mut Io, key: &str) {
 /// `default_no` is false) wrapped with a 4-space indent
 /// (`phutil_console_prompt()`, `:42-45`), loops until `y`/`n`/empty,
 /// then prints a blank line. End of input aborts with [`ABORT`].
+/// Non-interactive stdin echoes the prompt once, then fails with the
+/// `phutil_console_require_tty()` error (`:46-52`).
 pub fn console_confirm(io: &mut Io, query: &str, default_no: bool) -> Result<bool, String> {
     let options = if default_no { "[y/N]" } else { "[Y/n]" };
     let prompt = console_wrap(&format!("{query} {options} "), 4, true);
     loop {
         io.push_out(&format!("\n\n{prompt}"));
+        if !io.stdin_tty {
+            return Err(crate::prompt::NOT_INTERACTIVE.to_string());
+        }
         let Some(raw) = io.read_answer() else {
             return Err(ABORT.to_string());
         };

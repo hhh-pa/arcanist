@@ -3244,3 +3244,46 @@ fn r3_land16_build_searches_paginate() {
         ]
     );
 }
+
+// -( R5 TTY gating: LAND-10 )------------------------------------------------
+
+#[test]
+fn r5_land10_prompt_requires_tty_first() {
+    // `ArcanistPrompt.php:77-88`: piped stdin echoes the raw query,
+    // then throws — before any saved response is consulted.
+    let mut io = Io::canned(&["y"]);
+    io.stdin_tty = false;
+    assert_eq!(
+        prompt_for_key(&mut io, "k", "Land these changes?").unwrap_err(),
+        crate::prompt::NOT_INTERACTIVE
+    );
+    assert_eq!(io.out.stdout, "Land these changes?\n");
+    // A saved response does not bypass the gate.
+    let mut io = Io::canned(&[]);
+    io.stdin_tty = false;
+    io.saved.insert(
+        "k".to_string(),
+        SavedResponse {
+            response: "y".to_string(),
+            scope: PromptScope::User,
+        },
+    );
+    assert_eq!(
+        prompt_for_key(&mut io, "k", "q?").unwrap_err(),
+        crate::prompt::NOT_INTERACTIVE
+    );
+    assert_eq!(io.out.stdout, "q?\n");
+}
+
+#[test]
+fn r5_land10_console_confirm_requires_tty() {
+    // `phutil_console_prompt()` echoes, then `require_tty()` throws
+    // (`src/console/format.php:42-52`).
+    let mut io = Io::canned(&["y"]);
+    io.stdin_tty = false;
+    assert_eq!(
+        console_confirm(&mut io, "Delete?", true).unwrap_err(),
+        crate::prompt::NOT_INTERACTIVE
+    );
+    assert_eq!(io.out.stdout, "\n\n    Delete? [y/N] ");
+}

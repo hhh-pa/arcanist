@@ -185,10 +185,18 @@ fn renders_borderless_tables() {
 
 #[test]
 fn selects_picks_and_aborts_on_eof() {
+    // BROWSE-B3: scripted sessions inject a TTY; `console_select` gates
+    // on the real stdin state.
     let mut input = std::io::Cursor::new(b"nope\n99\n2\n");
-    assert_eq!(console_select(&mut input, "Pick?", 1, 3).unwrap(), 2);
+    assert_eq!(
+        console_select_with_tty(&mut input, "Pick?", 1, 3, true).unwrap(),
+        2
+    );
     let mut eof = std::io::Cursor::new(b"");
-    assert_eq!(console_select(&mut eof, "Pick?", 1, 3).unwrap_err(), ABORT);
+    assert_eq!(
+        console_select_with_tty(&mut eof, "Pick?", 1, 3, true).unwrap_err(),
+        ABORT
+    );
 }
 
 #[test]
@@ -473,7 +481,8 @@ fn disambiguates_single_refs_by_pick() {
     let mut input = std::io::Cursor::new(b"2\n");
     let mut ctx = BrowseCtx::new(&tmp.path, &call, "https://phab.example/api/");
     let refs = build_refs(&options);
-    let uris = execute_refs(&mut ctx, &refs, &mut input, false).unwrap();
+    // BROWSE-B3: scripted sessions inject a TTY.
+    let uris = execute_refs_with_tty(&mut ctx, &refs, &mut input, false, true).unwrap();
     assert_eq!(uris, vec!["https://phab.example/object/HEAD".to_string()]);
 }
 
@@ -619,4 +628,18 @@ fn r3_browseb7_revision_search_follows_after_cursor() {
     assert_eq!(seen.len(), 2);
     assert!(seen[0].get("after").is_none());
     assert_eq!(seen[1]["after"], serde_json::json!("p2"));
+}
+
+// -( R5 TTY gating: BROWSE-B3 )------------------------------------------------
+
+#[test]
+fn r5_browse_b3_non_tty_throws_after_echo() {
+    // `phutil_console_select()` funnels through
+    // `phutil_console_prompt()`, which echoes, then `require_tty()`
+    // throws (`src/console/format.php:26-52`).
+    let mut piped = std::io::Cursor::new(b"2\n");
+    assert_eq!(
+        console_select_with_tty(&mut piped, "Pick?", 1, 3, false).unwrap_err(),
+        crate::prompt::NOT_INTERACTIVE
+    );
 }

@@ -1167,14 +1167,22 @@ pub fn select_prompt(prompt: &str, min: u64, max: u64) -> String {
 
 /// `phutil_console_select()`: `{prompt} [{min} - {max}]` until a number
 /// in range; end of input aborts.
-pub fn console_select(
+///
+/// The TTY is injected: scripted sessions pass `true`, production
+/// passes the real stdin state, and piped input echoes the prompt
+/// once, then fails with the `phutil_console_require_tty()` error.
+pub fn console_select_with_tty(
     input: &mut dyn BufRead,
     prompt: &str,
     min: u64,
     max: u64,
+    stdin_tty: bool,
 ) -> Result<u64, String> {
     loop {
         print!("\n\n{}", select_prompt(prompt, min, max));
+        if !stdin_tty {
+            return Err(crate::prompt::NOT_INTERACTIVE.to_string());
+        }
         let Some(raw) = read_answer(input) else {
             return Err(ABORT.to_string());
         };
@@ -1188,6 +1196,16 @@ pub fn console_select(
             return Ok(pick);
         }
     }
+}
+
+/// [`console_select_with_tty`] on real stdin.
+pub fn console_select(
+    input: &mut dyn BufRead,
+    prompt: &str,
+    min: u64,
+    max: u64,
+) -> Result<u64, String> {
+    console_select_with_tty(input, prompt, min, max, crate::prompt::stdin_is_terminal())
 }
 
 /// One warning/info line on stderr, through the log engine
@@ -1218,11 +1236,14 @@ pub fn absolute_uri(conduit_uri: &str, raw: &str) -> String {
 }
 
 /// Report ambiguity, list the table, and pick one URI for single refs.
-fn disambiguate(
+/// Pick URIs for ambiguous refs, with an injected TTY flag
+/// (deterministic tests); production passes the real stdin state.
+fn disambiguate_with_tty(
     refs: &[BrowseRef],
     resolved: &[ResolvedRef],
     input: &mut dyn BufRead,
     ansi: bool,
+    stdin_tty: bool,
 ) -> Result<Vec<BrowseUri>, String> {
     let ambiguous = terminal::pht("AMBIGUOUS", &[]);
     for (rf, hit) in refs.iter().zip(resolved) {
@@ -1251,7 +1272,7 @@ fn disambiguate(
         .map(|hit| hit.uris.len() as u64)
         .sum::<u64>();
     let prompt = terminal::pht("Which URI do you want to open?", &[]);
-    let pick = console_select(input, &prompt, 1, max)?;
+    let pick = console_select_with_tty(input, &prompt, 1, max, stdin_tty)?;
     let mut ordered: Vec<BrowseUri> = Vec::new();
     for hit in resolved {
         if hit.uris.len() > 1 {
@@ -1292,6 +1313,17 @@ fn execute_refs(
     input: &mut dyn BufRead,
     ansi: bool,
 ) -> Result<Vec<String>, String> {
+    execute_refs_with_tty(ctx, refs, input, ansi, crate::prompt::stdin_is_terminal())
+}
+
+/// [`execute_refs`] with an injected TTY flag (deterministic tests).
+fn execute_refs_with_tty(
+    ctx: &mut BrowseCtx,
+    refs: &[BrowseRef],
+    input: &mut dyn BufRead,
+    ansi: bool,
+    stdin_tty: bool,
+) -> Result<Vec<String>, String> {
     let resolved = resolve_refs(ctx, refs)?;
     let mut open: Vec<BrowseUri> = Vec::new();
     for hit in &resolved {
@@ -1300,7 +1332,9 @@ fn execute_refs(
         }
     }
     if any_many(&resolved) {
-        open.extend(disambiguate(refs, &resolved, input, ansi)?);
+        open.extend(disambiguate_with_tty(
+            refs, &resolved, input, ansi, stdin_tty,
+        )?);
     }
     print!("{}", render_unresolved(refs, &resolved, ansi));
     Ok(open

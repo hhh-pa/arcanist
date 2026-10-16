@@ -630,8 +630,11 @@ fn select_unique_phid(results: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Ownership confirm: PHP `phutil_console_confirm($prompt)` defaults to
+/// no (`[y/N]`), so Enter aborts the close
+/// (`ArcanistCloseRevisionWorkflow.php:121`).
 fn confirm_interactive(query: &str) -> Result<bool, String> {
-    prompt::console_confirm(&mut std::io::stdin().lock(), query, false)
+    prompt::console_confirm(&mut std::io::stdin().lock(), query, true)
 }
 
 /// Entry point: `argv` excludes the subcommand name.

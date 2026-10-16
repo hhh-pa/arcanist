@@ -168,3 +168,65 @@ fn saved_response_echo_shape() {
         " >>>  Go? <y>\n >>>  (Using saved response to prompt \"k\".)\n\n"
     );
 }
+
+// -( R5 TTY gating + prompt core )-----------------------------------------
+
+#[test]
+fn r5_land20_close_default_no_enter_aborts() {
+    // `ArcanistCloseRevisionWorkflow.php:121` calls
+    // `phutil_console_confirm($prompt)` with the default `$default_no`,
+    // so Enter declines (`[y/N]`) and aborts the close.
+    let mut input = cursor("\n");
+    assert_eq!(
+        prompt::console_confirm_with_tty(&mut input, "Sure?", "[y/N]", true, true),
+        Ok(false)
+    );
+}
+
+#[test]
+fn r5_lint8_confirm_rejects_yes_no_words() {
+    // `phutil_console_confirm()` answers `y`/`n`/empty only; `yes` and
+    // `no` re-prompt (`src/console/format.php:14-24`).
+    let mut input = cursor("yes\nn\n");
+    assert_eq!(
+        prompt::console_confirm_with_tty(&mut input, "Sure?", "[Y/n]", false, true),
+        Ok(false)
+    );
+    let mut input = cursor("no\ny\n");
+    assert_eq!(
+        prompt::console_confirm_with_tty(&mut input, "Sure?", "[y/N]", true, true),
+        Ok(true)
+    );
+}
+
+#[test]
+fn r5_core39_prompt_requires_tty() {
+    // CLEAN: `phutil_console_prompt()` requires a TTY
+    // (`src/console/format.php:46-52`), so the token prompt's gate
+    // matches PHP; piped input throws after the echo.
+    let mut input = cursor("cli-token\n");
+    assert_eq!(
+        prompt::console_prompt_with_tty(&mut input, "Paste API Token from that page:", false),
+        Err(prompt::NOT_INTERACTIVE.to_string())
+    );
+}
+
+#[test]
+fn r5_core40_install_anyway_defaults_no() {
+    // CLEAN: `ArcanistInstallCertificateWorkflow.php:126` calls
+    // `phutil_console_confirm()` with the default `$default_no`, so
+    // Enter declines (`[y/N]`) and the token is not installed. (The
+    // default-YES confirm at `ArcanistConfigurationManager.php:198` is
+    // the chmod prompt, which Rust does not implement — CORE-41.)
+    let mut input = cursor("\n");
+    assert_eq!(
+        prompt::console_confirm_with_tty(
+            &mut input,
+            "Install this token anyway?",
+            "[y/N]",
+            true,
+            true
+        ),
+        Ok(false)
+    );
+}
