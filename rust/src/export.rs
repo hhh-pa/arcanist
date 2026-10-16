@@ -1253,10 +1253,12 @@ fn local_render_changes(
     head: &str,
     parsed: &[crate::diff_local::ParsedChange],
 ) -> Vec<crate::patch::BundleChange> {
+    // T1153 OLD-PATH: ADD old paths are `/dev/null` like the parser;
+    // they carry no mode and never hit the filesystem.
     let old_paths: Vec<String> = parsed
         .iter()
         .map(|change| change.old_path.clone())
-        .filter(|path| !path.is_empty())
+        .filter(|path| !path.is_empty() && path != "/dev/null")
         .collect();
     let new_paths: Vec<String> = parsed
         .iter()
@@ -1271,7 +1273,9 @@ fn local_render_changes(
             let mut change = crate::patch::BundleChange {
                 change_type: parsed.change_type,
                 file_type: parsed.file_type,
-                old_path: if parsed.old_path.is_empty() {
+                // T1153 OLD-PATH: `/dev/null` (ADD) maps to no old
+                // path for rendering, like empty.
+                old_path: if parsed.old_path.is_empty() || parsed.old_path == "/dev/null" {
                     None
                 } else {
                     Some(parsed.old_path.clone())
@@ -1291,7 +1295,10 @@ fn local_render_changes(
                 current_file_data: None,
             };
             if parsed.file_type == crate::diff_local::FILE_BINARY {
-                change.original_file_data = file_data_at_revision(dir, base, &parsed.old_path);
+                // T1153 OLD-PATH: no old bytes for `/dev/null` (ADD).
+                if parsed.old_path != "/dev/null" {
+                    change.original_file_data = file_data_at_revision(dir, base, &parsed.old_path);
+                }
                 change.current_file_data = file_data_at_revision(dir, head, &parsed.current_path);
             }
             change

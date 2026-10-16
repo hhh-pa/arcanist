@@ -238,6 +238,29 @@ fn serializes_changes_with_stats_and_companions() {
 }
 
 #[test]
+fn old_path_local_render_maps_dev_null_to_no_old_path() {
+    // T1153 OLD-PATH: local bundles map the parser's `/dev/null`
+    // (ADD) to no old path, so renders emit `--- /dev/null`
+    // without a mode lookup or blob fetch for it.
+    let dir = fixture_repo("oldpath");
+    std::fs::write(dir.join("f.txt"), "one\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-qm", "one"]);
+    let parsed = crate::diff_local::parse_unified_diff(SAMPLE_DIFF).unwrap();
+    assert_eq!(parsed[0].old_path, "/dev/null");
+    let head = resolve_export_head(&dir).unwrap();
+    let rendered = local_render_changes(&dir, "HEAD", &head, &parsed);
+    assert_eq!(rendered[0].old_path, None);
+    assert_eq!(rendered[0].current_path.as_deref(), Some("f.txt"));
+    assert_eq!(rendered[0].old_mode, None);
+    // The git render still emits the `/dev/null` old target.
+    let mut changes = rendered;
+    let patch = render_export_git_patch(&mut changes, &export_e_no_blobs).unwrap();
+    assert!(patch.contains("--- /dev/null\n+++ b/f.txt\n"), "{patch}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn counts_missing_newlines_like_php() {
     // T1153 EXPORT-E15: the shared length-driven loop (the marker flags
     // the old side while new lines remain, the new side once exhausted).

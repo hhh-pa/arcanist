@@ -2999,7 +2999,7 @@ pub struct HunkLenExplicit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedChange {
     /// Old path; equals `current_path` except for renames, copies, and
-    /// adds (empty here; `/dev/null` upstream).
+    /// adds (`/dev/null` like upstream, T1153 OLD-PATH).
     pub old_path: String,
     /// Current path (`getCurrentPath()`).
     pub current_path: String,
@@ -3846,7 +3846,9 @@ fn scan_extended_headers(lines: &[&str], state: &mut FileBlockState, mut index: 
 ///
 /// The literal path is recorded for duplicate-block merges (PHP's
 /// `setOldPath()` overwrite, EXPORT-E24); a `/dev/null` target marks
-/// a new file without touching the seeded path.
+/// a new file and overwrites the seeded path like PHP (T1153
+/// OLD-PATH: `ArcanistDiffParser.php:801-808` unconditionally
+/// `setOldPath($old_file)`, so ADD carries `/dev/null`).
 fn consume_minus_path_line(
     lines: &[&str],
     index: usize,
@@ -3860,6 +3862,10 @@ fn consume_minus_path_line(
     state.minus_literal = Some(old.clone());
     if old == "/dev/null" {
         state.new_file = true;
+        // T1153 OLD-PATH: PHP overwrites the seeded path with the
+        // literal `/dev/null` (`:808`), so ADD reports `/dev/null`
+        // instead of the current path.
+        state.old_path = old;
     } else if !old.is_empty() {
         state.old_path = old;
     }
@@ -4104,9 +4110,9 @@ fn finish_file_block(
         old_path = minus_literal.unwrap_or(from);
         new_path = to;
     }
-    if old_path == "/dev/null" {
-        old_path.clear();
-    }
+    // T1153 OLD-PATH: PHP keeps the literal `/dev/null` from the
+    // `---` line as the old path for ADD
+    // (`ArcanistDiffParser.php:801-808`); no clearing to empty.
     (
         ParsedChange {
             old_path,
