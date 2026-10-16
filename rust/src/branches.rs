@@ -290,6 +290,19 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
+            // T1153 CORE-5: auth-coded query failures render login
+            // guidance (the toolset runtime's auth arm). The calls
+            // went out on a strict client, re-resolved here for the
+            // mapping context (config reads only, no I/O).
+            let client = parse_options(argv)
+                .ok()
+                .flatten()
+                .and_then(|options| config::client_for(options.conduit_uri.as_deref()).ok());
+            if let Some(client) = client
+                && let Some(code) = conduit::auth_report_for(&client, &message)
+            {
+                return code;
+            }
             // T1153 R4 (RB-D4): `branches` runs in the toolset
             // runtime (via `ArcanistMarkersWorkflow`). Argument,
             // support-gate, and limit errors render the red `USAGE

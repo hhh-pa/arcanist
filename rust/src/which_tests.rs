@@ -132,6 +132,10 @@ fn project_and_callsign_discovery() {
     let tmp = TempDir::new("proj");
     let child = tmp.path.join("sub");
     std::fs::create_dir_all(&child).unwrap();
+    // T1153 CORE-33: discovery is working-copy-scoped, so the fixture
+    // needs a VCS marker; a stray `.arcconfig` in a plain directory is
+    // ignored like PHP ignores it.
+    std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
     std::fs::write(
         tmp.path.join(".arcconfig"),
         r#"{"repository.callsign": "X", "phabricator.uri": "https://h.example/"}"#,
@@ -141,6 +145,9 @@ fn project_and_callsign_discovery() {
     assert_eq!(root.unwrap(), tmp.path);
     assert!(file.unwrap().ends_with(".arcconfig"));
     assert_eq!(find_project(&TempDir::new("noroot").path), (None, None));
+    let stray = TempDir::new("stray");
+    std::fs::write(stray.path.join(".arcconfig"), "{}").unwrap();
+    assert_eq!(find_project(&stray.path), (None, None));
 
     let callsign = read_callsign(Some(&tmp.path.join(".arcconfig")), None).unwrap();
     assert_eq!(callsign, ("X".to_string(), "project (.arcconfig)"));
@@ -847,4 +854,136 @@ fn r4_rbd4_parse_error_has_no_dump() {
         run(&["--bogus".to_string()]),
         std::process::ExitCode::FAILURE
     );
+}
+
+#[test]
+fn rbd8_matching_reuses_cached_viewer_without_whoami() {
+    // PHP resolves whoami once at startup auth; revision matching then
+    // reuses the cached viewer (`getUserPHID()`). The mock serves
+    // exactly the two workflow calls — a third `user.whoami` would
+    // fail the match.
+    use std::io::{Read, Write};
+    let repo = fresh_repo("rbd8");
+    commit(&repo.path, "a.txt");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let served = seen.clone();
+    std::thread::spawn(move || {
+        for canned in [
+            "{\"error_code\": null, \"result\": [{\"id\": 7, \"title\": \"T\", \
+             \"authorPHID\": \"PHID-USER-9\"}]}",
+            "{\"error_code\": null, \"result\": [{\"phid\": \"PHID-USER-9\", \
+             \"userName\": \"bob\"}]}",
+        ] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8(head).unwrap();
+            let len: usize = head
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("content-length: ")
+                        .map(|v| v.trim().parse().unwrap())
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).unwrap();
+            let request = head.lines().next().unwrap_or("").to_string();
+            served.lock().unwrap().push(request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                canned.len(),
+                canned
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    let client = conduit::Client::new(&base, "t").unwrap();
+    client.set_authenticated_user("alice", "PHID-USER-1");
+    let matched =
+        match_working_copy_revisions(&client, &repo.path, GIT_MAGIC_ROOT_COMMIT, "HEAD", false)
+            .unwrap();
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].monogram, "D7");
+    assert_eq!(matched[0].author.as_deref(), Some("bob"));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert!(seen[0].contains("differential.query"), "{seen:?}");
+    assert!(seen[1].contains("user.query"), "{seen:?}");
+}
+
+#[test]
+fn core33_find_project_matches_vcs_scoping() {
+    // Git: a subdir `.arcconfig` is invisible; only the root file counts.
+    let tmp = TempDir::new("core33git");
+    let child = tmp.path.join("sub");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
+    std::fs::write(child.join(".arcconfig"), "{}").unwrap();
+    assert_eq!(find_project(&child), (None, None));
+    // Subversion: nearest `.arcconfig` from `dir` up to the root wins.
+    let tmp = TempDir::new("core33svn");
+    let child = tmp.path.join("a").join("b");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::create_dir_all(tmp.path.join(".svn")).unwrap();
+    std::fs::write(tmp.path.join(".arcconfig"), "{}").unwrap();
+    std::fs::write(tmp.path.join("a").join(".arcconfig"), "{}").unwrap();
+    let (root, file) = find_project(&child);
+    assert_eq!(root.unwrap(), tmp.path.join("a"));
+    assert_eq!(file.unwrap(), tmp.path.join("a").join(".arcconfig"));
+}
+
+#[test]
+fn core30_callsign_reads_modern_top_level_user_keys() {
+    // No `config` section: the whole user file is the config, so a
+    // top-level `repository.callsign` resolves (classic `readUserArcConfig`).
+    let tmp = TempDir::new("core30call");
+    let arcrc = tmp.path.join(".arcrc");
+    std::fs::write(&arcrc, r#"{"repository.callsign": "U"}"#).unwrap();
+    assert_eq!(
+        read_callsign(None, Some(&arcrc)),
+        Some(("U".to_string(), "user (~/.arcrc)"))
+    );
+    // With a section, only the section answers.
+    std::fs::write(
+        &arcrc,
+        r#"{"config": {"repository.callsign": "S"}, "repository.callsign": "T"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        read_callsign(None, Some(&arcrc)),
+        Some(("S".to_string(), "user (~/.arcrc)"))
+    );
+}
+
+#[test]
+fn carryover_conduit_labels_name_the_merged_source() {
+    // Wave-2 carry-over: local URIs label with their VCS metadata dir
+    // instead of the old hardcoded `project (.arcconfig)`. Local outranks
+    // project/user, so ambient `~/.arcrc` cannot disturb these.
+    for (meta, label) in [
+        (".git", "local (.git/arc/config)"),
+        (".hg", "local (.hg/arc/config)"),
+        (".svn", "local (.svn/arc/config)"),
+    ] {
+        let tmp = TempDir::new("carrylocal");
+        let child = tmp.path.join("sub");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir_all(tmp.path.join(meta).join("arc")).unwrap();
+        std::fs::write(
+            tmp.path.join(meta).join("arc").join("config"),
+            r#"{"phabricator.uri": "https://local.example/"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_conduit_in(&child, None, None),
+            (Some("https://local.example/".to_string()), label),
+            "{meta}"
+        );
+    }
 }

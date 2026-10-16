@@ -17,7 +17,7 @@ use std::process::ExitCode;
 
 use crate::{
     conduit::{self, EnvelopeKind},
-    config, diff_submit, git, terminal,
+    config, diff_submit, get_config, git, terminal,
 };
 
 /// Subcommand name, matching `arc look`.
@@ -1358,11 +1358,14 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Best-effort Conduit client for repository mapping (`None` degrades to
-/// local-only data).
-fn look_conduit_client() -> Option<conduit::Client> {
+/// Tokenless-capable Conduit client for repository mapping: `None`
+/// only when no URI resolves at all (T1153 CORE-4/RB-D12). Missing
+/// credentials yield a tokenless client whose calls fail mapped
+/// (T1153 CORE-5), like PHP's engine.
+fn look_conduit_client(cwd: &Path, user_file: Option<&Path>) -> Option<conduit::Client> {
     // NOTE: `conduit::Client` is not `Debug`; keep the error private.
-    config::client_for(None).ok()
+    config::client_for_tokenless_with(None, cwd, user_file, &get_config::LoadOptions::default())
+        .ok()
 }
 
 fn fail(message: String) -> ExitCode {
@@ -1371,6 +1374,16 @@ fn fail(message: String) -> ExitCode {
     // errors escape into a PHP fatal (255). PHP never throws here,
     // but the envelope's fatal arm is the faithful default.
     conduit::report(EnvelopeKind::Fatal, &message)
+}
+
+/// Fail a conduit-backed data load: auth-coded failures render login
+/// guidance (T1153 CORE-5, the toolset runtime's auth arm), anything
+/// else escapes fatal like [`fail`].
+fn fail_mapped(client: &conduit::Client, message: String) -> ExitCode {
+    if let Some(code) = conduit::auth_report_for(client, &message) {
+        return code;
+    }
+    fail(message)
 }
 
 fn conduit_error_text(error: conduit::Error) -> String {
@@ -1386,13 +1399,6 @@ fn call_or_unavailable(
         Some(client) => client.call(method, params).map_err(conduit_error_text),
         None => Err("conduit unavailable".to_string()),
     }
-}
-
-fn optional_call<'a>(
-    client: &'a Option<conduit::Client>,
-    call: &'a dyn Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>,
-) -> Option<&'a diff_submit::ConduitCall<'a>> {
-    if client.is_some() { Some(call) } else { None }
 }
 
 fn render_remotes_output(remotes: &[RemoteInfo], ansi: bool) -> Result<String, String> {
@@ -1454,13 +1460,19 @@ fn run_clearing(ansi: bool) -> ExitCode {
 }
 
 fn run_remotes(cwd: &Path, ansi: bool) -> ExitCode {
-    let client = look_conduit_client();
-    let call = |method: &str, params: &serde_json::Value| {
-        call_or_unavailable(client.as_ref(), method, params)
+    // T1153 RB-D12: PHP resolves repository hardpoints through
+    // Conduit here, so a missing URI fails (fatal, like the
+    // `raiseURIException()` escape) instead of rendering degraded.
+    let user_file = config::arcrc_path();
+    let Some(client) = look_conduit_client(cwd, user_file.as_deref()) else {
+        return fail(conduit::no_uri_block());
     };
-    let remotes = match look_remotes_data(cwd, optional_call(&client, &call)) {
+    let call = |method: &str, params: &serde_json::Value| {
+        call_or_unavailable(Some(&client), method, params)
+    };
+    let remotes = match look_remotes_data(cwd, Some(&call)) {
         Ok(remotes) => remotes,
-        Err(message) => return fail(message),
+        Err(message) => return fail_mapped(&client, message),
     };
     match render_remotes_output(&remotes, ansi) {
         Ok(out) => {
@@ -1472,13 +1484,19 @@ fn run_remotes(cwd: &Path, ansi: bool) -> ExitCode {
 }
 
 fn run_published(cwd: &Path, ansi: bool) -> ExitCode {
-    let client = look_conduit_client();
-    let call = |method: &str, params: &serde_json::Value| {
-        call_or_unavailable(client.as_ref(), method, params)
+    // T1153 RB-D12: `getPublishedCommitHashes()` filters through
+    // repository hardpoints in PHP — no all-tips fallback exists —
+    // so a missing URI fails instead of rendering every tip.
+    let user_file = config::arcrc_path();
+    let Some(client) = look_conduit_client(cwd, user_file.as_deref()) else {
+        return fail(conduit::no_uri_block());
     };
-    let hashes = match look_published_data(cwd, optional_call(&client, &call)) {
+    let call = |method: &str, params: &serde_json::Value| {
+        call_or_unavailable(Some(&client), method, params)
+    };
+    let hashes = match look_published_data(cwd, Some(&call)) {
         Ok(hashes) => hashes,
-        Err(message) => return fail(message),
+        Err(message) => return fail_mapped(&client, message),
     };
     match render_published_output(&hashes, ansi) {
         Ok(out) => {
@@ -1506,6 +1524,12 @@ fn run_unknown(thing: &[String], ansi: bool) -> ExitCode {
 
 /// Entry point: `argv` excludes the subcommand name.
 pub fn run(argv: &[String]) -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    run_in(&cwd, argv)
+}
+
+/// Entry point rooted at `dir`: `argv` excludes the subcommand name.
+pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
     let thing = match parse_args(argv) {
         Ok(Some(thing)) => thing,
         Ok(None) => {
@@ -1518,16 +1542,15 @@ pub fn run(argv: &[String]) -> ExitCode {
             return conduit::report(EnvelopeKind::ToolsetUsage, &msg);
         }
     };
-    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
     let ansi = terminal::ansi_enabled();
     if thing.is_empty() {
         return run_clearing(ansi);
     }
     if thing == ["remotes"] {
-        return run_remotes(&cwd, ansi);
+        return run_remotes(dir, ansi);
     }
     if thing == ["published"] {
-        return run_published(&cwd, ansi);
+        return run_published(dir, ansi);
     }
     run_unknown(&thing, ansi)
 }

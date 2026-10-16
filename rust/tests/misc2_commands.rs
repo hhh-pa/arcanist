@@ -250,3 +250,43 @@ fn cover_handles_clean_and_changed_trees() {
     assert_eq!(cover::blame_file(tmp.path(), "f.txt").unwrap().len(), 2);
     assert_eq!(cover::readable_sequence(&[1, 2, 3, 5]), "1-3, 5");
 }
+
+// T1153 Wave-2 imports for the appended finding tests below (kept here
+// so the shared suite stays append-only).
+mod common;
+use arc_rs::{conduit, look};
+use common::with_temp_home;
+
+// T1153 RB-D12: `look remotes`/`published` resolve repository
+// hardpoints through Conduit in PHP, so a missing URI fails fatal
+// (255, like the `raiseURIException()` escape) instead of rendering
+// degraded output. The bare clearing needs no conduit and still works.
+#[test]
+fn rbd12_look_conduit_modes_fail_without_uri() {
+    let tmp = init_repo("rbd12");
+    commit_file(tmp.path(), "f.txt", "one\n");
+    let home = TempDir::new("rbd12-home");
+    let _guard = with_temp_home(home.path());
+    let fatal = std::process::ExitCode::from(conduit::EXIT_FATAL);
+    assert_eq!(look::run_in(tmp.path(), &args(&["remotes"])), fatal);
+    assert_eq!(look::run_in(tmp.path(), &args(&["published"])), fatal);
+    assert_eq!(
+        look::run_in(tmp.path(), &args(&[])),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
+// T1153 CORE-4: `inspect --explore browse(...)` builds its engine
+// tokenless; with no URI anywhere it fails fatal with the toolset
+// no-URI block instead of the strict "no token" path.
+#[test]
+fn core4_inspect_browse_fails_without_uri() {
+    let tmp = init_repo("core4-inspect");
+    commit_file(tmp.path(), "f.txt", "one\n");
+    let home = TempDir::new("core4-inspect-home");
+    let _guard = with_temp_home(home.path());
+    assert_eq!(
+        inspect::run_in(tmp.path(), &args(&["--explore", "browse(HEAD)"])),
+        std::process::ExitCode::from(conduit::EXIT_FATAL)
+    );
+}

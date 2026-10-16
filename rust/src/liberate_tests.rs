@@ -416,3 +416,80 @@ fn r4_core21_decline_reports_user_abort() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn core50_rebuild_failure_still_succeeds_silently() {
+    // No `support/` tree above scratch: the rebuild fails, but the
+    // run still succeeds with no failure text (DONE prints always).
+    let dir = scratch("core50");
+    let lib = dir.join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(lib.join(INIT_FILE), "<?php\n").unwrap();
+    std::fs::write(lib.join(MAP_FILE), "@phutil-library-version 2\n").unwrap();
+    let mut input = BufReader::new(std::io::Cursor::new(""));
+    let out = execute_with_input(&dir, &argv(&["lib"]), &mut input).unwrap();
+    assert!(out.is_empty(), "{out:?}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn core51_decline_renders_php_abort_text() {
+    let error = classify_error(
+        &argv(&["newlib"]),
+        format!("cancelled: {}", crate::prompt::ABORT),
+    );
+    assert_eq!(error.kind, crate::conduit::EnvelopeKind::UserAbort);
+    assert_eq!(error.message, crate::prompt::ABORT);
+}
+
+#[test]
+fn core52_prompt_engine_drives_liberate_confirms() {
+    let dir = scratch("core52");
+    let lib = dir.join("newlib");
+    // Decline through the engine.
+    let mut input = BufReader::new(std::io::Cursor::new("n\n"));
+    let mut noop = |_: crate::prompts::PromptScope, _: &str| Ok(());
+    let err = ensure_library_with(&lib, &mut input, true, None, &mut noop).unwrap_err();
+    assert!(err.starts_with("cancelled: "), "{err}");
+    assert!(!lib.exists());
+    // `?` then accept, with a `*` save suffix captured.
+    std::fs::create_dir_all(&lib).unwrap();
+    let mut input = BufReader::new(std::io::Cursor::new("my-lib\n"));
+    let mut saved_calls = Vec::new();
+    let created = ensure_library_with(&lib, &mut input, true, None, &mut |scope, response| {
+        saved_calls.push((scope, response.to_string()));
+        Ok(())
+    })
+    .unwrap();
+    assert!(created);
+    assert!(saved_calls.is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn core53_parse_errors_keep_red_arm_with_parser_texts() {
+    // The arm stays `ToolsetUsage` (R4-locked exit mapping); only the
+    // texts follow the toolset parser.
+    let error = classify_error(&argv(&["--bogus"]), "x".to_string());
+    assert_eq!(error.kind, crate::conduit::EnvelopeKind::ToolsetUsage);
+    let ParseOutcome::Error(message) = parse_args(&argv(&["--bogus"])) else {
+        panic!("expected an error");
+    };
+    assert_eq!(
+        message,
+        "Argument \"--bogus\" is unrecognized. Use \"--\" to indicate the end of flags."
+    );
+    assert!(matches!(
+        parse_args(&argv(&["--clean", "--clean"])),
+        ParseOutcome::Error(_)
+    ));
+    assert!(matches!(
+        parse_args(&argv(&["--clean=x"])),
+        ParseOutcome::Error(_)
+    ));
+    // `--help` after `--` is a positional path, not help.
+    assert!(matches!(
+        parse_args(&argv(&["--", "--help"])),
+        ParseOutcome::Args(_)
+    ));
+}

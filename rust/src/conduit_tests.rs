@@ -145,7 +145,9 @@ fn parses_success_response() {
 
 #[test]
 fn parses_api_error_with_method_prefix() {
-    // PHP `ConduitClientException` messages are `<method> info`.
+    // T1153 CORE-1: at ceb `ConduitClientException` is `"{code}: {info}"`
+    // with no `<method>` infix (the infix was a newer-baseline artifact);
+    // `info` is the raw `error_info`.
     let err = parse_response(
         r#"{"result": null, "error_code": "E", "error_info": "no"}"#,
         "user.whoami",
@@ -155,7 +157,7 @@ fn parses_api_error_with_method_prefix() {
         err,
         Error::Api {
             code: "E".to_string(),
-            info: "<user.whoami> no".to_string()
+            info: "no".to_string()
         }
     );
 }
@@ -540,4 +542,177 @@ fn r4_core6_usage_bold_on_tty() {
     let banner = EnvelopeKind::Exception.render("boom", true);
     assert!(banner.contains("\x1b[41m"), "{banner:?}");
     assert!(banner.contains("Exception"), "{banner:?}");
+}
+
+#[test]
+fn core3_base_uri_strips_configured_path() {
+    // PHP replaces the whole path (`setPath('/api/'.$method)`), so a
+    // configured path never leaks into the request path.
+    assert_eq!(
+        normalize_base("http://h.test:8080/foo"),
+        "http://h.test:8080/api/"
+    );
+    assert_eq!(
+        normalize_base("https://h.test/foo/bar/"),
+        "https://h.test/api/"
+    );
+    assert_eq!(test_client().base_uri(), "https://conduit.test/api/");
+}
+
+#[test]
+fn core5_auth_guidance_login_blocks() {
+    // Tokenless `ERR-INVALID-SESSION` maps to the login block with the
+    // server domain and the install command (path `/`).
+    let guidance =
+        auth_guidance("ERR-INVALID-SESSION", false, "https://phab.example/api/").unwrap();
+    assert_eq!(guidance.title, "LOGIN REQUIRED");
+    assert_eq!(guidance.summary, "Conduit API login required.");
+    assert!(guidance.body.contains("phab.example"), "{}", guidance.body);
+    assert!(
+        guidance
+            .body
+            .contains("arc install-certificate https://phab.example/"),
+        "{}",
+        guidance.body
+    );
+    assert!(
+        guidance.body.contains("run this command:"),
+        "{}",
+        guidance.body
+    );
+}
+
+#[test]
+fn core5_auth_guidance_invalid_credentials() {
+    // `ERR-INVALID-AUTH` maps with or without a token.
+    for has_token in [false, true] {
+        let guidance = auth_guidance(
+            "ERR-INVALID-AUTH",
+            has_token,
+            "http://h.test:8080/api/conduit.ping",
+        )
+        .unwrap();
+        assert_eq!(guidance.title, "INVALID CREDENTIALS");
+        assert_eq!(guidance.summary, "Invalid Conduit API credentials.");
+        // The prose domain excludes the port; the install URI keeps it.
+        assert!(guidance.body.contains("\"h.test\""), "{}", guidance.body);
+        assert!(
+            guidance
+                .body
+                .contains("arc install-certificate http://h.test:8080/"),
+            "{}",
+            guidance.body
+        );
+    }
+}
+
+#[test]
+fn core5_auth_guidance_passthrough() {
+    // A tokened `ERR-INVALID-SESSION` rethrows the original (`break`),
+    // and unknown codes never map.
+    assert_eq!(
+        auth_guidance("ERR-INVALID-SESSION", true, "https://h/"),
+        None
+    );
+    assert_eq!(auth_guidance("ERR-CONDUIT-CORE", false, "https://h/"), None);
+    assert_eq!(auth_guidance("ERR-OTHER", true, "https://h/"), None);
+    assert_eq!(
+        auth_error_code("ERR-INVALID-AUTH: bad"),
+        Some("ERR-INVALID-AUTH")
+    );
+    assert_eq!(
+        auth_error_code("ERR-INVALID-SESSION: gone"),
+        Some("ERR-INVALID-SESSION")
+    );
+    assert_eq!(auth_error_code("query failed: ERR-INVALID-AUTH: bad"), None);
+    assert_eq!(auth_error_code("boom"), None);
+}
+
+#[test]
+fn core5_no_uri_block_shape() {
+    // `raiseURIException()` block: wrapped paragraph, blank line,
+    // three `      - ` items, trailing blank line.
+    let block = no_uri_block();
+    assert!(
+        block.starts_with("This command needs to communicate with Phabricator,"),
+        "{block:?}"
+    );
+    for item in [
+        "Run in a working copy with \"phabricator.uri\" set in \".arcconfig\".",
+        "Set a default URI with `arc set-config phabricator.uri <uri>`.",
+        "Specify a URI explicitly with `--config phabricator.uri=<uri>`.",
+    ] {
+        assert!(block.contains(&format!("      - {item}")), "{block:?}");
+    }
+    assert!(block.ends_with("\n\n"), "{block:?}");
+    assert_eq!(
+        toolset_setup_message("no conduit URI: pass --conduit-uri"),
+        block
+    );
+    assert_eq!(
+        toolset_setup_message("Custom arcrc file was specified, but it was not found!"),
+        "Custom arcrc file was specified, but it was not found!"
+    );
+}
+
+#[test]
+fn core8_tls_trusts_listed_domains() {
+    let tls = TlsConfig {
+        cabundle: None,
+        blind_trust: vec!["phab.example".to_string()],
+    };
+    assert!(tls.trusts_domain("https://phab.example/api/"));
+    assert!(tls.trusts_domain("https://PHAB.EXAMPLE:8080/foo"));
+    assert!(!tls.trusts_domain("https://other.example/"));
+    assert!(!TlsConfig::default().trusts_domain("https://phab.example/"));
+}
+
+#[test]
+fn core8_tls_client_build_paths() {
+    // Blind trust builds (no I/O); a missing bundle fails transport-class.
+    let tls = TlsConfig {
+        cabundle: None,
+        blind_trust: vec!["phab.example".to_string()],
+    };
+    let client = Client::new_with_tls("https://phab.example/", "t", &tls).unwrap();
+    assert_eq!(client.base_uri(), "https://phab.example/api/");
+    let tls = TlsConfig {
+        cabundle: Some(std::path::PathBuf::from("/nonexistent-ca-bundle.pem")),
+        blind_trust: Vec::new(),
+    };
+    let err = Client::new_with_tls("https://phab.example/", "t", &tls).unwrap_err();
+    assert!(
+        err.to_string().contains("failed to read CA bundle"),
+        "{err}"
+    );
+}
+
+#[test]
+fn rbd8_auth_identity_cache_roundtrips() {
+    // PHP caches the auth identity on the workflow; `user_phid`
+    // helpers consult this before calling `user.whoami`.
+    let client = test_client();
+    assert_eq!(client.authenticated_user(), None);
+    client.set_authenticated_user("alice", "PHID-USER-1");
+    assert_eq!(
+        client.authenticated_user(),
+        Some(("alice".to_string(), "PHID-USER-1".to_string()))
+    );
+}
+
+#[test]
+fn core16_toolset_parse_error_is_bold() {
+    // Bold `**Usage Exception:**` rendering like `Usage` (the toolset
+    // `parse()` catch), exit 1; `report()` rethrows only
+    // `Usage`/`Exception` under `--trace`, never this arm.
+    let rendered = EnvelopeKind::ToolsetParseError.render("boom", false);
+    assert_eq!(rendered, "Usage Exception: boom\n");
+    assert_eq!(
+        EnvelopeKind::ToolsetParseError.exit_code(),
+        std::process::ExitCode::FAILURE
+    );
+    assert_eq!(
+        ClassifiedError::toolset_parse_error("boom".to_string()).report(),
+        std::process::ExitCode::FAILURE
+    );
 }

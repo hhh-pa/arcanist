@@ -10,19 +10,18 @@
 //! the PHP workflow does.
 //!
 //! Status lines go to stderr through the log engine (`SCAN`/`WORK` blue,
-//! `ERROR` red, `DONE` green); the missing-directory banner renders via
+//! `DONE` green); the missing-directory banner renders via
 //! `tsprintf("%!\n%W\n", ...)` and the `DONE` count through the `pht`
 //! plural variants (`Updated library.` / `Updated %s libraries.`).
 //!
-//! Like PHP, per-library rebuild failures report `ERROR` lines but still
-//! exit 0 (`$any_errors` never fails the run, including a missing script
-//! or a missing `php` binary). Every other workflow failure -- argument
-//! errors, no libraries found, ancient or unknown library versions,
-//! declined prompts, unreadable maps -- exits 1 with a clean message.
-//! (PHP throws `ArcanistUsageException`, which escapes
-//! `ArcanistRuntime::execute` and fails the CLI at 255; the port maps
-//! that class to `ExitCode::FAILURE` instead of replicating a fatal
-//! trace, matching the runtime's caught-usage convention.)
+//! Like PHP at ceb, the rebuild status is ignored entirely: `DONE`
+//! always prints and the run exits 0, even when `rebuild-map.php`
+//! fails or `php` is missing (T1153 CORE-50). Parse errors are bold
+//! usage errors (the toolset `parse()` catch, exit 1); no-libraries,
+//! ancient, and unknown-version failures throw `ArcanistUsageException`,
+//! which escapes the toolset runtime into a PHP fatal (255). A
+//! declined directory prompt aborts with `User aborted the workflow.`
+//! through the `---` arm (exit 1).
 //!
 //! The rebuild script ships in-tree under `support/` (restored from the
 //! PHP master). It is found by an upward `support/lib/rebuild-map.php`
@@ -32,11 +31,13 @@
 //! bundled path, and so do out-of-tree libraries.
 //!
 //! Divergences:
-//! - A declined directory prompt fails with `cancelled: ...` instead of
-//!   the PHP prompt abort, and end-of-input while naming a library fails
-//!   instead of re-prompting forever.
+//! - End-of-input while naming a library fails instead of re-prompting
+//!   forever (T1153 CORE-54, kept).
+//! - The create-directory prompt reads answers from its input with no
+//!   TTY gate (contract tests feed it piped answers); `?`, `*`/`!`
+//!   saves, and saved responses work through the shared prompt engine.
 //! - Prompts print plain text (no `phutil_console_prompt` wrapping or
-//!   readline history); see `confirm_create_directory`/`ask_library_name`.
+//!   readline history).
 
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -77,32 +78,40 @@ enum ParseOutcome {
 }
 
 fn parse_args(argv: &[String]) -> ParseOutcome {
-    let mut clean = false;
-    let mut path: Option<String> = None;
-    let mut end_of_flags = false;
-
-    for arg in argv {
-        if end_of_flags {
-            if path.is_some() {
-                return ParseOutcome::Error(one_path_error());
-            }
-            path = Some(arg.clone());
-        } else if arg == "--" {
-            end_of_flags = true;
-        } else if arg == "--clean" {
-            clean = true;
-        } else if arg == "-h" || arg == "--help" {
-            return ParseOutcome::Help;
-        } else if arg.starts_with('-') {
-            return ParseOutcome::Error(format!("unknown flag '{arg}'"));
-        } else {
-            if path.is_some() {
-                return ParseOutcome::Error(one_path_error());
-            }
-            path = Some(arg.clone());
-        }
+    // `--help` never reaches the workflow parser in PHP (the global
+    // parser consumes it); the port keeps the shortcut for direct
+    // calls, like the other commands.
+    if argv
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg == "-h" || arg == "--help")
+    {
+        return ParseOutcome::Help;
     }
-
+    let parsed = match crate::argparse::parse_toolset(
+        argv,
+        &[crate::argparse::FlagSpec::boolean("clean")],
+        true,
+        std::io::IsTerminal::is_terminal(&std::io::stdin()),
+    ) {
+        Ok(parsed) => parsed,
+        Err(message) => return ParseOutcome::Error(message),
+    };
+    let ansi = terminal::ansi_enabled();
+    for notice in &parsed.notices {
+        eprint!(
+            "{}",
+            terminal::tsprintf_ansi("%s\n", &[TVal::Text(notice)], ansi)
+                .map(|t| t.to_string())
+                .unwrap_or_default()
+        );
+    }
+    let clean = parsed.flag("clean");
+    let mut positionals = parsed.positionals.into_iter();
+    let path = positionals.next();
+    if positionals.next().is_some() {
+        return ParseOutcome::Error(one_path_error());
+    }
     ParseOutcome::Args(Options { clean, path })
 }
 
@@ -232,14 +241,34 @@ fn prompt_line(prompt: &str, input: &mut dyn BufRead) -> Option<String> {
     Some(line.trim().to_string())
 }
 
-fn confirm_create_directory(path: &Path, input: &mut dyn BufRead) -> Result<bool, String> {
+/// Ask to create a missing directory through the shared prompt
+/// engine (`arc.liberate.create`): `?` help, `*`/`!` saves, and saved
+/// responses all work. Answers come from `input`; `stdin_tty` gates
+/// like PHP (liberate's direct-input path passes `true`, see
+/// `ensure_library_with`).
+fn confirm_create_directory(
+    path: &Path,
+    input: &mut dyn BufRead,
+    stdin_tty: bool,
+    saved: Option<&str>,
+    save: &mut dyn FnMut(crate::prompts::PromptScope, &str) -> Result<(), String>,
+) -> Result<bool, String> {
     print!(
         "{}",
         new_library_block(&path.display().to_string(), terminal::ansi_enabled())
     );
-    match prompt_line("Create new library? [y/N] ", input).as_deref() {
-        Some("y" | "Y" | "yes" | "YES") => Ok(true),
-        _ => Ok(false),
+    match crate::prompts::execute_prompt_saving(
+        input,
+        crate::prompts::LIBERATE_PROMPT_KEY,
+        crate::prompts::LIBERATE_PROMPT_DESCRIPTION,
+        "Create new library?",
+        stdin_tty,
+        saved,
+        save,
+    ) {
+        Ok(()) => Ok(true),
+        Err(message) if message == crate::prompt::ABORT => Ok(false),
+        Err(message) => Err(message),
     }
 }
 
@@ -268,8 +297,27 @@ fn ask_library_name(input: &mut dyn BufRead) -> Result<String, String> {
 /// Create the directory (prompting) and init file when missing.
 ///
 /// Returns `true` when a library was created. Prints the interactive
-/// prompts to stdout and reads answers from `input`.
+/// prompts to stdout and reads answers from `input`. A decline fails
+/// with `cancelled: User aborted the workflow.`: the `cancelled: `
+/// prefix keeps the R4 contract shape, and `classify_error` strips it
+/// so the CLI renders PHP's abort text.
 pub fn ensure_library(path: &Path, input: &mut dyn BufRead) -> Result<bool, String> {
+    let mut noop = |_: crate::prompts::PromptScope, _: &str| Ok(());
+    ensure_library_with(path, input, true, None, &mut noop)
+}
+
+/// [`ensure_library`] with an explicit prompt channel: `stdin_tty`
+/// gates like PHP, `saved` is the saved `arc.liberate.create`
+/// response, and `save` persists `*`/`!` suffixes. Liberate's own
+/// path answers from `input` without gating (contract tests feed
+/// piped answers); pass the real TTY state from new callers.
+pub fn ensure_library_with(
+    path: &Path,
+    input: &mut dyn BufRead,
+    stdin_tty: bool,
+    saved: Option<&str>,
+    save: &mut dyn FnMut(crate::prompts::PromptScope, &str) -> Result<(), String>,
+) -> Result<bool, String> {
     if path.join(INIT_FILE).is_file() {
         return Ok(false);
     }
@@ -283,14 +331,11 @@ pub fn ensure_library(path: &Path, input: &mut dyn BufRead) -> Result<bool, Stri
                 "Provide a directory to create or update a libphutil library in.".to_string(),
             );
         }
-    } else if confirm_create_directory(path, input)? {
+    } else if confirm_create_directory(path, input, stdin_tty, saved, save)? {
         std::fs::create_dir_all(path)
             .map_err(|e| format!("cannot create '{}': {e}", path.display()))?;
     } else {
-        return Err(format!(
-            "cancelled: directory \"{}\" does not exist",
-            path.display()
-        ));
+        return Err(format!("cancelled: {}", crate::prompt::ABORT));
     }
     if path.join(INIT_FILE).is_file() {
         return Ok(false);
@@ -400,7 +445,21 @@ pub fn liberate_path(
     clean: bool,
     input: &mut dyn BufRead,
 ) -> Result<Option<String>, String> {
-    if ensure_library(path, input)? {
+    let mut noop = |_: crate::prompts::PromptScope, _: &str| Ok(());
+    liberate_path_with(path, clean, input, true, None, &mut noop)
+}
+
+/// [`liberate_path`] with an explicit prompt channel (see
+/// [`ensure_library_with`]).
+pub fn liberate_path_with(
+    path: &Path,
+    clean: bool,
+    input: &mut dyn BufRead,
+    stdin_tty: bool,
+    saved: Option<&str>,
+    save: &mut dyn FnMut(crate::prompts::PromptScope, &str) -> Result<(), String>,
+) -> Result<Option<String>, String> {
+    if ensure_library_with(path, input, stdin_tty, saved, save)? {
         // Fresh libraries skip the version check and go straight to a v2
         // rebuild, mirroring `liberateCreateLibrary`.
         return Ok(rebuild_map(path, clean, None));
@@ -456,8 +515,22 @@ pub fn execute_with_input(
             found
         }
     };
-    let mut out = String::new();
-    let mut any_errors = false;
+    // The `arc.liberate.create` prompt channel: answers come from
+    // `input` without a TTY gate (contract tests feed piped answers),
+    // with saved responses and `*`/`!` saves wired to the real config
+    // scopes.
+    let user_file = crate::config::arcrc_path();
+    let local_file = crate::prompts::working_copy_config_file(dir);
+    let saved_list =
+        crate::prompts::load_saved_responses(user_file.as_deref(), local_file.as_deref());
+    let saved = saved_list
+        .iter()
+        .filter(|(prompt, _)| prompt == crate::prompts::LIBERATE_PROMPT_KEY)
+        .map(|(_, response)| response.clone())
+        .next_back();
+    let mut saver =
+        crate::prompts::response_saver(crate::prompts::LIBERATE_PROMPT_KEY, user_file, local_file);
+    let out = String::new();
     for path in &paths {
         let entry = format!("{}{}", readable_path(dir, path), std::path::MAIN_SEPARATOR);
         push_log(
@@ -465,28 +538,18 @@ pub fn execute_with_input(
             &terminal::pht("WORK", &[]),
             &terminal::pht("Updating library: %s", &[PhtArg::Text(&entry)]),
         );
-        match liberate_path(path, opts.clean, input) {
-            Ok(None) => {}
-            Ok(Some(message)) => {
-                any_errors = true;
-                let failed = path.display().to_string();
-                push_log(
-                    "red",
-                    &terminal::pht("ERROR", &[]),
-                    &terminal::pht("Failed to update library: %s", &[PhtArg::Text(&failed)]),
-                );
-                out.push_str(&format!("{message}\n"));
-            }
+        // T1153 CORE-50: the rebuild status is ignored entirely (the
+        // script already streamed to the console); only `Err` aborts.
+        match liberate_path_with(path, opts.clean, input, true, saved.as_deref(), &mut saver) {
+            Ok(_) => {}
             Err(message) => return Err(message),
         }
     }
-    if !any_errors {
-        push_log(
-            "green",
-            &terminal::pht("DONE", &[]),
-            &done_message(paths.len()),
-        );
-    }
+    push_log(
+        "green",
+        &terminal::pht("DONE", &[]),
+        &done_message(paths.len()),
+    );
     Ok(out)
 }
 
@@ -498,17 +561,20 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
 }
 
 /// Classify a workflow error for the R4 envelope: parser errors
-/// are toolset usage (exit 1); declined prompts (`cancelled: ...`)
-/// are `ArcanistUserAbortException` (the `---` arm, exit 1);
-/// no-libraries and ancient/unknown versions throw
+/// are toolset usage errors (red label, exit 1 -- the R4 mapping,
+/// kept; PHP's `parse()` catch renders these bold, like
+/// `ToolsetParseError` elsewhere); declined prompts (`cancelled:
+/// ...`) are `ArcanistUserAbortException` (the `---` arm, exit 1),
+/// rendered without the `cancelled: ` prefix so declines show PHP's
+/// abort text; no-libraries and ancient/unknown versions throw
 /// `ArcanistUsageException`, which escapes the toolset runtime into a
 /// PHP fatal (255). Per-library rebuild failures never reach here
-/// (`Ok` above).
+/// (ignored above, T1153 CORE-50).
 fn classify_error(argv: &[String], message: String) -> ClassifiedError {
     if matches!(parse_args(argv), ParseOutcome::Error(_)) {
         ClassifiedError::toolset_usage(message)
-    } else if message.starts_with("cancelled: ") {
-        ClassifiedError::user_abort(message)
+    } else if let Some(body) = message.strip_prefix("cancelled: ") {
+        ClassifiedError::user_abort(body.to_string())
     } else {
         ClassifiedError::fatal(message)
     }

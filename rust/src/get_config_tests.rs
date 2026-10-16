@@ -293,7 +293,9 @@ fn user_file_reads_config_and_aliases() {
     .unwrap();
     let map = read_user_file(&missing).unwrap();
     assert_eq!(map["editor"], serde_json::json!("nano"));
-    assert_eq!(map["aliases"], serde_json::json!({"a": "b"}));
+    // T1153 CORE-30: with a `config` section, classic `readUserArcConfig()`
+    // returns ONLY the section; top-level `aliases` siblings are dropped.
+    assert!(!map.contains_key("aliases"));
     assert!(!map.contains_key("hosts"));
 
     // Without a `config` section, stock PHP returns the whole file --
@@ -788,4 +790,166 @@ fn r6_core34_cli_flags_parse_both_forms() {
     assert_eq!(cli.config_files, [PathBuf::from("f")]);
     assert_eq!(cli.arcrc_file, Some(PathBuf::from("g")));
     assert!(load_options_from_cli(&["lone".to_string()], &[], None).is_err());
+}
+
+#[test]
+fn core28_toolset_user_file_merges_section_and_top_level() {
+    let tmp = TempDir::new("core28");
+    let file = tmp.path.join(".arcrc");
+    std::fs::write(
+        &file,
+        r#"{
+            "hosts": {"https://h/api/": {"token": "t"}},
+            "config": {"editor": "nano", "aliases": ["section"]},
+            "aliases": ["top"],
+            "prompts": []
+        }"#,
+    )
+    .unwrap();
+    let map = read_user_file_toolset(&file).unwrap();
+    // Section wins collisions; other top-level keys merge in.
+    assert_eq!(map["editor"], serde_json::json!("nano"));
+    assert_eq!(map["aliases"], serde_json::json!(["section"]));
+    assert_eq!(map["prompts"], serde_json::json!([]));
+    // `hosts` and `config` are subtracted like PHP's `$subtract`.
+    assert!(!map.contains_key("hosts"));
+    assert!(!map.contains_key("config"));
+
+    // Without a section, the whole file minus `hosts`/`config` merges.
+    std::fs::write(&file, r#"{"hosts": {}, "aliases": ["top"]}"#).unwrap();
+    let map = read_user_file_toolset(&file).unwrap();
+    assert_eq!(map["aliases"], serde_json::json!(["top"]));
+    assert!(!map.contains_key("hosts"));
+
+    assert!(
+        read_user_file_toolset(&tmp.path.join("missing"))
+            .unwrap()
+            .is_empty()
+    );
+    std::fs::write(&file, "broken").unwrap();
+    assert!(
+        read_user_file_toolset(&file)
+            .unwrap_err()
+            .contains("~/.arcrc")
+    );
+}
+
+#[test]
+fn core30_classic_user_file_drops_all_top_level_siblings() {
+    // `user_file_reads_config_and_aliases` pins `aliases`/`hosts`; this
+    // pins every other top-level sibling next to a `config` section.
+    let tmp = TempDir::new("core30");
+    let file = tmp.path.join(".arcrc");
+    std::fs::write(
+        &file,
+        r#"{"config": {"editor": "nano"}, "editor": "top", "prompts": [], "other": 1}"#,
+    )
+    .unwrap();
+    let map = read_user_file(&file).unwrap();
+    assert_eq!(map.len(), 1);
+    assert_eq!(map["editor"], serde_json::json!("nano"));
+}
+
+#[test]
+fn core31_project_empty_key_answers_keys_without_legacy() {
+    let mut sources = empty_sources();
+    sources
+        .project
+        .insert("".to_string(), serde_json::json!("fallback"));
+    // `editor` has no legacy name, so PHP's null-key lookup hits `""`.
+    assert_eq!(
+        value_at("editor", "project", &sources).unwrap(),
+        serde_json::json!("fallback")
+    );
+    // Unknown keys behave the same (no setting row, no legacy name).
+    assert_eq!(
+        value_at("whatever.custom", "project", &sources).unwrap(),
+        serde_json::json!("fallback")
+    );
+    // Other sources never consult `""`.
+    sources.user.insert("".to_string(), serde_json::json!("u"));
+    assert!(value_at("editor", "user", &sources).is_none());
+    assert!(value_at("editor", "local", &sources).is_none());
+    // A canonical value wins over `""`.
+    sources
+        .project
+        .insert("editor".to_string(), serde_json::json!("vi"));
+    assert_eq!(
+        value_at("editor", "project", &sources).unwrap(),
+        serde_json::json!("vi")
+    );
+    // A key WITH a legacy name consults only that name, never `""`.
+    let mut sources = empty_sources();
+    sources
+        .project
+        .insert("".to_string(), serde_json::json!("fallback"));
+    assert!(value_at("phabricator.uri", "project", &sources).is_none());
+    sources.project.insert(
+        "conduit_uri".to_string(),
+        serde_json::json!("https://legacy.example/"),
+    );
+    assert_eq!(
+        value_at("phabricator.uri", "project", &sources).unwrap(),
+        serde_json::json!("https://legacy.example/")
+    );
+}
+
+#[test]
+fn core32_local_config_reads_git_hg_and_svn() {
+    for meta in [".git", ".hg", ".svn"] {
+        let tmp = TempDir::new("core32");
+        let child = tmp.path.join("sub");
+        std::fs::create_dir_all(&child).unwrap();
+        // The marker sits at the working-copy root, like PHP's
+        // `$localMetaDir`; reads from a subdirectory find it.
+        std::fs::create_dir_all(tmp.path.join(meta).join("arc")).unwrap();
+        std::fs::write(
+            tmp.path.join(meta).join("arc").join("config"),
+            r#"{"editor": "local"}"#,
+        )
+        .unwrap();
+        let map = read_local_config(&child).unwrap();
+        assert_eq!(map["editor"], serde_json::json!("local"), "{meta}");
+    }
+    // Present marker without a config file still reads empty.
+    let tmp = TempDir::new("core32empty");
+    std::fs::create_dir_all(tmp.path.join(".hg")).unwrap();
+    assert!(read_local_config(&tmp.path).unwrap().is_empty());
+}
+
+#[test]
+fn core33_project_discovery_svn_nearest_hg_root() {
+    // Subversion: nearest `.arcconfig` from `dir` up to the root wins.
+    let tmp = TempDir::new("core33svn");
+    let child = tmp.path.join("a").join("b");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::create_dir_all(tmp.path.join(".svn")).unwrap();
+    std::fs::write(
+        tmp.path.join(".arcconfig"),
+        r#"{"phabricator.uri": "https://root.example/"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path.join("a").join(".arcconfig"),
+        r#"{"phabricator.uri": "https://near.example/"}"#,
+    )
+    .unwrap();
+    let (file, map) = read_project_config(&child).unwrap();
+    assert_eq!(file.unwrap().parent().unwrap(), tmp.path.join("a"));
+    assert_eq!(
+        map["phabricator.uri"],
+        serde_json::json!("https://near.example/")
+    );
+    // Mercurial: root-only, like git; a subdir file is invisible.
+    let tmp = TempDir::new("core33hg");
+    let child = tmp.path.join("a");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::create_dir_all(tmp.path.join(".hg")).unwrap();
+    std::fs::write(
+        tmp.path.join("a").join(".arcconfig"),
+        r#"{"phabricator.uri": "https://sub.example/"}"#,
+    )
+    .unwrap();
+    let (none, empty) = read_project_config(&child).unwrap();
+    assert!(none.is_none() && empty.is_empty());
 }
