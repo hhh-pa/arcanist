@@ -271,3 +271,21 @@ fn r6_core12_bare_discovery_under_temp_home() {
         Some("https://d.example/".to_string())
     );
 }
+
+#[test]
+fn carryover_user_uri_labels_the_user_source() {
+    // Wave-2 carry-over: a user-file URI labels `user (~/.arcrc)` from
+    // `merged_value`, not the old hardcoded `project (.arcconfig)`.
+    let home = TempDir::new("carryhome");
+    let _home = with_temp_home(home.path());
+    let bare = TempDir::new("carrybare");
+    std::fs::write(
+        home.path().join(".arcrc"),
+        r#"{"config": {"phabricator.uri": "https://u.example/"}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        which::resolve_conduit_in(bare.path(), None, None),
+        (Some("https://u.example/".to_string()), "user (~/.arcrc)")
+    );
+}

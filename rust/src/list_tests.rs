@@ -260,3 +260,12 @@ fn r4_rbd4_parse_and_working_copy_are_usage() {
     assert_eq!(run_in(&dir, &args(&[])), std::process::ExitCode::FAILURE);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn rbd8_user_phid_prefers_cached_identity() {
+    // The startup-auth identity answers without I/O: an unroutable
+    // client still resolves when cached.
+    let client = conduit::Client::new("http://127.0.0.1:9/", "t").unwrap();
+    client.set_authenticated_user("alice", "PHID-USER-1");
+    assert_eq!(user_phid(&client).unwrap(), "PHID-USER-1");
+}

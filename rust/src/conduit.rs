@@ -30,8 +30,9 @@ impl std::fmt::Display for Error {
         // exception message goes under the envelope banner (subprocess)
         // or into the fatal trace (toolset runtime). API failures render
         // exactly like `ConduitClientException` (`"{code}: {info}"`,
-        // `src/conduit/ConduitClientException.php:7-9`). The `<method>`
-        // infix baked into `info` above is CORE-1's, left untouched.
+        // `src/conduit/ConduitClientException.php:7-9` @ ceb — no
+        // `<method>` infix; T1153 CORE-1 dropped the newer-baseline
+        // infix from `parse_response` so `info` is the raw `error_info`).
         match self {
             Error::Transport(msg) => write!(f, "{msg}"),
             Error::Protocol(msg) => write!(f, "{msg}"),
@@ -53,12 +54,88 @@ struct SessionState {
     session_key: Option<String>,
     connection_id: Option<String>,
     capabilities: BTreeSet<String>,
+    auth_user: Option<(String, String)>,
 }
 
 #[derive(Debug)]
 struct SigningKeys {
     public_key: String,
     private_pem: String,
+}
+
+/// Base HTTP client builder: the 300s PHP timeout with default proxy
+/// handling. T1153 CORE-7: PHP's conduit stack is cURL-based, which
+/// honors `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` on its own (no arc
+/// extension provides a proxy; `HTTPSFuture.php:230` only consults
+/// extensions and applies the result). reqwest's default proxy matcher
+/// implements the same curl-compatible env rules, so no `.no_proxy()`.
+fn http_client_builder() -> reqwest::blocking::ClientBuilder {
+    reqwest::blocking::Client::builder().timeout(REQUEST_TIMEOUT)
+}
+
+/// TLS options for [`Client::new_with_tls`], mirroring the
+/// `scripts/arcanist.php` startup reads of `https.cabundle` (a global
+/// CA bundle path, resolved against the project root) and
+/// `https.blindly-trust-domains` (peer verification off for listed
+/// domains via `ArcanistBlindlyTrustHTTPEngineExtension`).
+#[derive(Debug, Clone, Default)]
+pub struct TlsConfig {
+    /// PEM CA bundle path (`https.cabundle`), already resolved.
+    pub cabundle: Option<std::path::PathBuf>,
+    /// Lowercased blind-trust domains (`https.blindly-trust-domains`).
+    pub blind_trust: Vec<String>,
+}
+
+impl TlsConfig {
+    /// True when `uri`'s domain is blind-trusted. Both sides compare
+    /// lowercased, mirroring `phutil_utf8_strtolower()` in the
+    /// extension's setter and matcher.
+    #[must_use]
+    pub fn trusts_domain(&self, uri: &str) -> bool {
+        let domain = uri
+            .split("://")
+            .nth(1)
+            .unwrap_or(uri)
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .rsplit('@')
+            .next()
+            .unwrap_or("");
+        let domain = domain
+            .rsplit_once(':')
+            .map_or(domain, |(host, _)| host)
+            .to_ascii_lowercase();
+        self.blind_trust.iter().any(|d| d == &domain)
+    }
+}
+
+/// Apply [`TlsConfig`] to a client builder. A missing/unreadable bundle
+/// fails here (PHP fails at connect time instead, but construction
+/// always immediately precedes the first call, so the observable is a
+/// transport-class failure either way). Blind trust maps to
+/// `danger_accept_invalid_certs`: reqwest cannot express PHP's exact
+/// "peer off, hostname on" split (`CURLOPT_SSL_VERIFYHOST` stays `2`
+/// in `HTTPSFuture`), so listed domains skip both — the closest
+/// equivalent for an explicitly trust-anything list.
+fn tls_client_builder(
+    tls: &TlsConfig,
+    uri: &str,
+) -> Result<reqwest::blocking::ClientBuilder, Error> {
+    let mut builder = http_client_builder();
+    if let Some(path) = &tls.cabundle {
+        let pem = std::fs::read(path)
+            .map_err(|e| Error::Transport(format!("failed to read CA bundle: {e}")))?;
+        let certs = reqwest::Certificate::from_pem_bundle(&pem)
+            .map_err(|e| Error::Transport(format!("invalid CA bundle: {e}")))?;
+        for cert in certs {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+    if tls.trusts_domain(uri) {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    Ok(builder)
 }
 
 pub struct Client {
@@ -80,14 +157,46 @@ pub struct Client {
 impl Client {
     pub fn new(conduit_uri: &str, token: &str) -> Result<Self, Error> {
         let (scheme, host, port) = split_uri(conduit_uri)?;
-        let http = reqwest::blocking::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            // Intranet hosts are reached directly; proxy env vars must not
-            // reroute API calls (and this keeps tests hermetic).
-            .no_proxy()
+        let http = http_client_builder()
             .build()
             .map_err(|e| Error::Transport(e.to_string()))?;
-        Ok(Self {
+        Ok(Self::from_parts(
+            conduit_uri,
+            token,
+            scheme,
+            host,
+            port,
+            http,
+        ))
+    }
+
+    /// [`Client::new`] with [`TlsConfig`] (`https.cabundle` /
+    /// `https.blindly-trust-domains`, T1153 CORE-8).
+    pub fn new_with_tls(conduit_uri: &str, token: &str, tls: &TlsConfig) -> Result<Self, Error> {
+        let (scheme, host, port) = split_uri(conduit_uri)?;
+        let http = tls_client_builder(tls, conduit_uri)?
+            .build()
+            .map_err(|e| Error::Transport(e.to_string()))?;
+        Ok(Self::from_parts(
+            conduit_uri,
+            token,
+            scheme,
+            host,
+            port,
+            http,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_parts(
+        conduit_uri: &str,
+        token: &str,
+        scheme: String,
+        host: String,
+        port: Option<u16>,
+        http: reqwest::blocking::Client,
+    ) -> Self {
+        Self {
             base: normalize_base(conduit_uri),
             scheme,
             host,
@@ -100,13 +209,52 @@ impl Client {
             http,
             state: Mutex::new(SessionState::default()),
             signing: None,
-        })
+        }
     }
 
     /// The normalized API base URI (for absolutizing relative URIs).
     #[must_use]
     pub fn base_uri(&self) -> &str {
         &self.base
+    }
+
+    /// Whether the client carries a token (`getConduitToken()`
+    /// non-null on the engine).
+    #[must_use]
+    pub fn has_token(&self) -> bool {
+        !self.token.is_empty()
+    }
+
+    /// Record the authenticated identity, mirroring the workflow's
+    /// cached `userName`/`userPHID` after `authenticateConduit()`
+    /// (T1153 RB-D8: PHP resolves whoami once first, then reuses it).
+    pub fn set_authenticated_user(&self, user: &str, phid: &str) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.auth_user = Some((user.to_string(), phid.to_string()));
+    }
+
+    /// The cached authenticated `(user_name, user_phid)`, if any.
+    #[must_use]
+    pub fn authenticated_user(&self) -> Option<(String, String)> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .auth_user
+            .clone()
+    }
+
+    /// Translate a toolset API failure into login guidance, if any
+    /// (T1153 CORE-5): the `ArcanistConduitCallFuture` mapping turns
+    /// `ERR-INVALID-SESSION` (tokenless engine) and `ERR-INVALID-AUTH`
+    /// into guidance rendered with [`report_auth`]. Returns `None`
+    /// when `error` is not a mapped auth failure (classic workflows
+    /// never call this: their raw client raises unmapped errors).
+    #[must_use]
+    pub fn auth_guidance_for(&self, error: &Error) -> Option<AuthGuidance> {
+        match error {
+            Error::Api { code, .. } => auth_guidance(code, self.has_token(), &self.base),
+            _ => None,
+        }
     }
 
     /// Override the host identity, mirroring `ConduitClient::setHost()`.
@@ -313,12 +461,14 @@ fn implicit_port(scheme: &str) -> u16 {
 }
 
 fn normalize_base(uri: &str) -> String {
-    let trimmed = uri.trim_end_matches('/');
-    if let Some(root) = trimmed.strip_suffix("/api") {
-        format!("{root}/api/")
-    } else {
-        format!("{trimmed}/api/")
-    }
+    // T1153 CORE-3: PHP replaces the whole path (`setPath('/api/'.$method)`
+    // per call; `setPath('/api/')` at startup), so a configured path like
+    // `http://host:port/foo` posts to `/api/<method>`, never
+    // `/foo/api/<method>`. Keep only scheme + authority here.
+    let after_scheme = uri.split("://").nth(1).unwrap_or(uri);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    let scheme = uri.split("://").next().unwrap_or("https");
+    format!("{scheme}://{authority}/api/")
 }
 
 /// Split a Conduit URI into (scheme, host, port), mirroring the
@@ -598,11 +748,12 @@ fn parse_response(text: &str, method: &str) -> Result<serde_json::Value, Error> 
             .and_then(|v| v.as_str())
             .unwrap_or("ERR-UNKNOWN")
             .to_string();
-        // PHP parity: `ConduitClientException` messages are `<method> info`.
-        return Err(Error::Api {
-            code,
-            info: format!("<{method}> {info}"),
-        });
+        // T1153 CORE-1: at ceb `ConduitClientException` is exactly
+        // `"{code}: {info}"` (`ConduitClientException.php:7-9`) — the
+        // `<method>` infix is a newer-baseline artifact. `Display`
+        // adds the code prefix; `info` stays the raw `error_info`.
+        let _ = method;
+        return Err(Error::Api { code, info });
     }
     Ok(obj
         .get("result")
@@ -613,6 +764,199 @@ fn parse_response(text: &str, method: &str) -> Result<serde_json::Value, Error> 
 /// PHP `if ($data['error_code'])`: only truthy codes are failures.
 fn has_error_code(code: Option<&serde_json::Value>) -> bool {
     code.is_some_and(php_truthy)
+}
+
+/// Login guidance for a failed toolset call, mirroring
+/// `ArcanistConduitAuthenticationException` (T1153 CORE-5): the
+/// `ArcanistConduitCallFuture::didReceiveException()` mapping
+/// (`src/conduit/ArcanistConduitCallFuture.php:74-88`) turns
+/// `ERR-INVALID-SESSION` (tokenless engine) and `ERR-INVALID-AUTH`
+/// into this title + multi-part body, rendered by the toolset
+/// runtime's fourth catch arm (`ArcanistRuntime.php:42-44`) via
+/// `writeError($title, $body)` and exiting 1. The original server
+/// error is discarded, not chained, like PHP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthGuidance {
+    /// `LOGIN REQUIRED` / `INVALID CREDENTIALS` label.
+    pub title: String,
+    /// One-line summary (`ConduitClientException`-style message).
+    pub summary: String,
+    /// Wrapped paragraphs + install command block.
+    pub body: String,
+}
+
+/// Map an API error code to login guidance, if any. `has_token` is
+/// whether the engine carries a token (`getConduitToken()`); `uri` is
+/// the engine URI (displayed with path `/`, domain extracted for the
+/// prose). Classic workflows never call this: their raw
+/// `ConduitClient` raises unmapped `ConduitClientException`s, and
+/// their startup gate lives in `config::require_auth_*`.
+#[must_use]
+pub fn auth_guidance(code: &str, has_token: bool, uri: &str) -> Option<AuthGuidance> {
+    // `didReceiveException()`: a tokenless `ERR-INVALID-SESSION` needs
+    // login; with a token the original error is rethrown (`break`).
+    // `ERR-INVALID-AUTH` always maps.
+    let login = match code {
+        "ERR-INVALID-SESSION" if !has_token => true,
+        "ERR-INVALID-AUTH" => false,
+        _ => return None,
+    };
+    let (domain, install_uri) = guidance_uri_parts(uri);
+    let summary = if login {
+        "Conduit API login required."
+    } else {
+        "Invalid Conduit API credentials."
+    };
+    let problem = if login {
+        format!(
+            "You are trying to connect to a server (\"{domain}\") that you do not have any \
+             stored credentials for, but the command you are running requires authentication."
+        )
+    } else {
+        format!(
+            "Your stored credentials for the server you are trying to connect to (\"{domain}\") \
+             are not valid."
+        )
+    };
+    let remedy = if login {
+        "To log in and save credentials for this server, run this command:"
+    } else {
+        "To log in and save valid credentials for this server, run this command:"
+    };
+    let install = format!("arc install-certificate {}", shell_arg(&install_uri));
+    let body = format!(
+        "{}{}{}",
+        tsprintf_wrapped("\n\n%W\n\n", &problem),
+        tsprintf_wrapped("%W\n\n", remedy),
+        tsprintf_wrapped("%>", &install),
+    );
+    Some(AuthGuidance {
+        title: if login {
+            "LOGIN REQUIRED".to_string()
+        } else {
+            "INVALID CREDENTIALS".to_string()
+        },
+        summary: summary.to_string(),
+        body,
+    })
+}
+
+/// Render one guidance part through `tsprintf` with the process ANSI
+/// setting (`%W` wraps, `%>` indents as a shell command).
+fn tsprintf_wrapped(pattern: &str, text: &str) -> String {
+    crate::terminal::tsprintf(pattern, &[crate::terminal::TVal::Text(text)])
+        .map(|t| t.to_string())
+        .unwrap_or_default()
+}
+
+/// Split an engine URI into the prose domain and the install-command
+/// URI (`getConduitURI()` clones the engine URI and sets path `/`).
+/// The domain excludes any port (`PhutilURI::getDomain()`); the
+/// install URI keeps the full authority.
+fn guidance_uri_parts(uri: &str) -> (String, String) {
+    let after_scheme = uri.split("://").nth(1).unwrap_or(uri);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    let hostport = authority.rsplit('@').next().unwrap_or("");
+    let (domain, _) = split_authority(hostport);
+    let scheme = uri.split("://").next().unwrap_or("https");
+    (domain, format!("{scheme}://{authority}/"))
+}
+
+/// `csprintf` `%s` escaping (`PhutilCommandString::escapeLinux()`):
+/// safe shell words pass through, anything else is single-quoted like
+/// `escapeshellarg()`.
+fn shell_arg(value: &str) -> String {
+    let safe = !value.is_empty()
+        && value.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b':' | b'/' | b'@' | b'.' | b'_' | b'+' | b'-')
+        });
+    if safe {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+/// Report login guidance like the toolset runtime's auth arm: the red
+/// title label plus the body on stderr, exit 1. The body passes as
+/// terminal text (PHP's body is an array of `PhutilTerminalString`,
+/// which `%s` casts raw), so its newlines render instead of escaping
+/// to `<LF>`.
+pub fn report_auth(title: &str, body: &str) -> std::process::ExitCode {
+    let body = crate::terminal::TerminalString::new(body.to_string());
+    let text = crate::terminal::tsprintf(
+        "**<bg:red> %s </bg>** %s\n",
+        &[
+            crate::terminal::TVal::Text(title),
+            crate::terminal::TVal::Terminal(&body),
+        ],
+    )
+    .map(|t| t.to_string())
+    .unwrap_or_default();
+    eprint!("{text}");
+    std::process::ExitCode::FAILURE
+}
+
+/// The auth error code when `message` is an API failure Display
+/// (`"{code}: {info}"`), for toolset fail arms whose conduit errors
+/// arrive stringified (T1153 CORE-5). Only prefix-matching: PHP maps
+/// by code in every toolset context, so a leading auth code is always
+/// a mapped failure; wrapped messages fall through to the fatal arm
+/// as before.
+#[must_use]
+pub fn auth_error_code(message: &str) -> Option<&str> {
+    ["ERR-INVALID-SESSION:", "ERR-INVALID-AUTH:"]
+        .into_iter()
+        .find(|prefix| message.starts_with(prefix))
+        .map(|prefix| prefix.trim_end_matches(':'))
+}
+
+/// Report a stringified toolset conduit failure (T1153 CORE-5): when
+/// `message` carries a code [`auth_guidance`] maps for `client`,
+/// render login guidance (exit 1); else `None` and the caller keeps
+/// its fatal arm. `client` is the engine the calls went out on (its
+/// token presence selects the mapping, its URI feeds the hint).
+#[must_use]
+pub fn auth_report_for(client: &Client, message: &str) -> Option<std::process::ExitCode> {
+    let code = auth_error_code(message)?;
+    let guidance = auth_guidance(code, client.has_token(), client.base_uri())?;
+    Some(report_auth(&guidance.title, &guidance.body))
+}
+
+/// The toolset no-URI error text: `ArcanistConduitEngine::raiseURIException()`
+/// throws the `PhutilConsoleBlock` string (paragraph + 3-item list) as
+/// `ArcanistUsageException`, which escapes the toolset runtime into a
+/// fatal (255). Byte layout follows `drawView`/`drawLines`: wrapped
+/// paragraph, blank line, `      - ` items, trailing blank line.
+#[must_use]
+pub fn no_uri_block() -> String {
+    let para =
+        "This command needs to communicate with Phabricator, but no Phabricator URI is configured.";
+    let mut out = crate::terminal::console_wrap(para, 0, true);
+    out.push_str("\n\n");
+    for item in [
+        "Run in a working copy with \"phabricator.uri\" set in \".arcconfig\".",
+        "Set a default URI with `arc set-config phabricator.uri <uri>`.",
+        "Specify a URI explicitly with `--config phabricator.uri=<uri>`.",
+    ] {
+        out.push_str("      - ");
+        out.push_str(&crate::terminal::console_wrap(item, 8, false));
+        out.push('\n');
+    }
+    out.push('\n');
+    out
+}
+
+/// Map a tokenless-engine setup failure to its toolset report text:
+/// the no-URI block for missing URIs, anything else unchanged (it
+/// already reads as a fatal-class message).
+#[must_use]
+pub fn toolset_setup_message(message: &str) -> String {
+    if message.starts_with("no conduit URI") {
+        no_uri_block()
+    } else {
+        message.to_string()
+    }
 }
 
 /// Fetch every page of a new-style `.search` call through the
@@ -685,6 +1029,13 @@ pub enum EnvelopeKind {
     /// Toolset `ArcanistUserAbortException`: red `---` label on
     /// stderr, exit 1 (`ArcanistRuntime.php:40-41`).
     UserAbort,
+    /// Toolset workflow-argument parse error (`PhutilArgumentParser::parse()`
+    /// catch): bold `**Usage Exception:**` like [`Self::Usage`], exit 1.
+    /// Unlike [`Self::Usage`] this arm never rethrows under `--trace`:
+    /// the toolset parser catches with or without trace mode, while only
+    /// the classic subprocess rethrows (`scripts/arcanist.php:443-446`).
+    /// (T1153 CORE-16/RB-D1.)
+    ToolsetParseError,
     /// Anything uncaught in the toolset runtime: the raw message on
     /// stderr, exit 255. PHP prints a fatal trace with file paths and
     /// line numbers, which is unportable; the message plus the 255
@@ -703,6 +1054,7 @@ impl EnvelopeKind {
             | Self::Exception
             | Self::ToolsetUsage
             | Self::ToolsetConduit
+            | Self::ToolsetParseError
             | Self::UserAbort => std::process::ExitCode::FAILURE,
         }
     }
@@ -736,6 +1088,11 @@ impl EnvelopeKind {
                 crate::terminal::format_log("red", "USAGE EXCEPTION", message, ansi)
             }
             Self::ToolsetConduit => crate::terminal::format_log("red", "CONDUIT", message, ansi),
+            Self::ToolsetParseError => crate::terminal::console_format(
+                "**%s** %s\n",
+                &["Usage Exception:", rtrim_php(message)],
+                ansi,
+            ),
             Self::UserAbort => crate::terminal::format_log("red", "---", message, ansi),
             Self::Fatal => format!("{message}\n"),
         }
@@ -801,6 +1158,12 @@ impl ClassifiedError {
         Self::new(EnvelopeKind::UserAbort, message)
     }
 
+    /// [`EnvelopeKind::ToolsetParseError`] constructor (for `map_err`).
+    #[must_use]
+    pub fn toolset_parse_error(message: String) -> Self {
+        Self::new(EnvelopeKind::ToolsetParseError, message)
+    }
+
     /// [`EnvelopeKind::Fatal`] constructor (for `map_err`).
     #[must_use]
     pub fn fatal(message: String) -> Self {
@@ -816,6 +1179,18 @@ impl ClassifiedError {
 /// Report `message` through the envelope arm `kind`: print to the
 /// arm's stream and return its exit code.
 pub fn report(kind: EnvelopeKind, message: &str) -> std::process::ExitCode {
+    // T1153 CORE-15: under `--trace` the classic handler rethrows, so
+    // usage and generic errors become fatal traces (newline, raw
+    // message, backtrace, exit 255) instead of their envelopes. The
+    // toolset arms keep their rendering: the toolset runtime catches
+    // them with or without `--trace`.
+    if crate::terminal::trace_enabled()
+        && matches!(kind, EnvelopeKind::Usage | EnvelopeKind::Exception)
+    {
+        let trace = std::backtrace::Backtrace::capture();
+        eprint!("\n{message}\n{trace}");
+        return std::process::ExitCode::from(EXIT_FATAL);
+    }
     let text = kind.render(message, crate::terminal::ansi_enabled());
     if kind.uses_stdout() {
         print!("{text}");

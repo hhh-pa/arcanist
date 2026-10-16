@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use arc_rs::terminal::{PhtArg, TVal};
-use arc_rs::{config, git, set_config, terminal};
+use arc_rs::{config, set_config, terminal};
 
 /// Subcommand name, matching `arc get-config`.
 pub const NAME: &str = "get-config";
@@ -50,8 +50,8 @@ const USAGE: &str = "usage: arc get-config [--verbose] [--config K=V] [--config-
 \n\
 Read arc configuration. With no NAME, show all known and configured keys.\n\
 \n\
-Precedence (highest wins): local (.git/arc/config), project (.arcconfig),\n\
-user (~/.arcrc), system (/etc/arcconfig), default.\n\
+Precedence (highest wins): local (.<vcs>/arc/config: .git, .hg, .svn),\n\
+project (.arcconfig), user (~/.arcrc), system (/etc/arcconfig), default.\n\
 \n\
 Options:\n\
   --verbose       Show detailed information about each option.\n\
@@ -64,11 +64,13 @@ Options:\n\
 /// Source name for `--config` runtime values in merged reads.
 pub const SOURCE_RUNTIME: &str = "runtime";
 
-const SOURCE_LOCAL: &str = "local";
-const SOURCE_PROJECT: &str = "project";
-const SOURCE_USER: &str = "user";
-const SOURCE_SYSTEM: &str = "system";
-const SOURCE_DEFAULT: &str = "default";
+/// Source names for merged reads (T1153 Wave-2 carry-over: `which`
+/// labels conduit sources from [`merged_value`]).
+pub const SOURCE_LOCAL: &str = "local";
+pub const SOURCE_PROJECT: &str = "project";
+pub const SOURCE_USER: &str = "user";
+pub const SOURCE_SYSTEM: &str = "system";
+pub const SOURCE_DEFAULT: &str = "default";
 
 const SOURCES: [&str; 5] = [
     SOURCE_LOCAL,
@@ -357,15 +359,22 @@ fn read_project_file(
     Ok((Some(file.to_path_buf()), map))
 }
 
-/// Read the working copy's local config (`.git/arc/config`); empty outside
-/// a git repository. Only git is supported (see T1128). The parse error
-/// mirrors `readLocalArcConfig()`: `Failed to parse '%s' as JSON.`
+/// Read the working copy's local config (`arc/config` under the VCS
+/// metadata directory: `.git`, `.hg`, or `.svn` at the working-copy
+/// root, mirroring `ArcanistWorkingCopyIdentity::$localMetaDir`); empty
+/// outside a working copy. T1153 CORE-32: Mercurial and Subversion read
+/// like git. The parse error mirrors `readLocalArcConfig()`:
+/// `Failed to parse '%s' as JSON.`
 pub fn read_local_config(dir: &Path) -> Result<serde_json::Map<String, serde_json::Value>, String> {
-    if !git::is_inside_work_tree(dir) {
+    let Some((kind, root)) = find_vcs_root(dir) else {
         return Ok(serde_json::Map::new());
-    }
-    let top = git::stdout_text(dir, &["rev-parse", "--show-toplevel"])?;
-    let file = PathBuf::from(top).join(".git").join("arc").join("config");
+    };
+    let meta = match kind {
+        VcsKind::Git => ".git",
+        VcsKind::Hg => ".hg",
+        VcsKind::Svn => ".svn",
+    };
+    let file = root.join(meta).join("arc").join("config");
     if !file.is_file() {
         return Ok(serde_json::Map::new());
     }
@@ -375,12 +384,59 @@ pub fn read_local_config(dir: &Path) -> Result<serde_json::Map<String, serde_jso
 }
 
 /// Read the user config from a `~/.arcrc` file, mirroring PHP's
-/// `readUserArcConfig()`: the `config` object when present (plus the
-/// top-level `aliases` key), else the whole file -- including `hosts`,
-/// exactly like stock PHP, which never redacts credential-adjacent keys
-/// on this path. A missing file yields an empty config. The parse error
-/// mirrors `readUserConfigurationFile()`, including its literal `~/.arcrc`.
+/// `readUserArcConfig()`: ONLY the `config` object when present (T1153
+/// CORE-30: top-level siblings like `aliases` are dropped on this path),
+/// else the whole file -- including `hosts`, exactly like stock PHP,
+/// which never redacts credential-adjacent keys on this path. A missing
+/// file yields an empty config. The parse error mirrors
+/// `readUserConfigurationFile()`, including its literal `~/.arcrc`.
 pub fn read_user_file(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let obj = read_user_doc(path)?;
+    // Stock PHP returns the whole file when `isset($config['config'])` is
+    // false (missing or null); only a present, non-null section narrows
+    // the user config.
+    match obj.get("config") {
+        None | Some(serde_json::Value::Null) => Ok(obj),
+        Some(serde_json::Value::Object(config)) => Ok(config.clone()),
+        Some(_) => Err(format!(
+            "'{}' has a non-object \"config\" section",
+            path.display()
+        )),
+    }
+}
+
+/// Read the user config through the toolset transform, mirroring
+/// `ArcanistUserConfigurationSource::getAllValues()`: the `config`
+/// section plus every top-level key except `hosts` and `config` itself,
+/// with the section winning collisions (T1153 CORE-28: `$result +=
+/// $config` keeps the section's value). Toolset workflows (`alias`,
+/// `prompts`) read user config on this path; classic workflows use
+/// [`read_user_file`]. Load and shape errors match [`read_user_file`].
+pub fn read_user_file_toolset(
+    path: &Path,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let obj = read_user_doc(path)?;
+    let mut map = match obj.get("config") {
+        None | Some(serde_json::Value::Null) => serde_json::Map::new(),
+        Some(serde_json::Value::Object(config)) => config.clone(),
+        Some(_) => {
+            return Err(format!(
+                "'{}' has a non-object \"config\" section",
+                path.display()
+            ));
+        }
+    };
+    for (key, value) in &obj {
+        if key != "hosts" && key != "config" && !map.contains_key(key) {
+            map.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(map)
+}
+
+/// Load a `~/.arcrc` file as a JSON object: missing files read empty,
+/// with the `readUserConfigurationFile()` parse error.
+fn read_user_doc(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     if !path.is_file() {
         return Ok(serde_json::Map::new());
     }
@@ -392,26 +448,9 @@ pub fn read_user_file(path: &Path) -> Result<serde_json::Map<String, serde_json:
             &[PhtArg::Text("~/.arcrc")],
         )
     })?;
-    let obj = doc
-        .as_object()
-        .ok_or_else(|| format!("'{}' is not a JSON object", path.display()))?;
-    // Stock PHP returns the whole file when `isset($config['config'])` is
-    // false (missing or null); only a present, non-null section narrows
-    // the user config.
-    let mut map = match obj.get("config") {
-        None | Some(serde_json::Value::Null) => obj.clone(),
-        Some(serde_json::Value::Object(config)) => config.clone(),
-        Some(_) => {
-            return Err(format!(
-                "'{}' has a non-object \"config\" section",
-                path.display()
-            ));
-        }
-    };
-    if let Some(aliases) = obj.get("aliases") {
-        map.insert("aliases".to_string(), aliases.clone());
-    }
-    Ok(map)
+    doc.as_object()
+        .cloned()
+        .ok_or_else(|| format!("'{}' is not a JSON object", path.display()))
 }
 
 /// Location of the system config, mirroring
@@ -487,6 +526,27 @@ pub struct LoadOptions {
     pub arcrc_file: Option<PathBuf>,
 }
 
+impl LoadOptions {
+    /// Overlay the dispatcher's global `--config`/`--config-file`/
+    /// `--arcrc-file` (T1153 CORE-10/11 family): explicit per-command
+    /// values win (runtime per key, `arcrc_file` when set),
+    /// config-file lists concatenate (global first, later files win).
+    /// [`load_merged`] applies this, so globals reach every command.
+    #[must_use]
+    pub fn with_global(&self) -> LoadOptions {
+        let global = crate::config::global_load_options();
+        let mut runtime = global.runtime;
+        runtime.extend(self.runtime.clone());
+        let mut config_files = global.config_files;
+        config_files.extend(self.config_files.iter().cloned());
+        LoadOptions {
+            runtime,
+            config_files,
+            arcrc_file: self.arcrc_file.clone().or(global.arcrc_file),
+        }
+    }
+}
+
 /// Configuration from every source, plus the `--config` runtime map.
 ///
 /// Display (`render`, `all_keys`) covers the five static [`Sources`]
@@ -541,6 +601,8 @@ pub fn load_merged(
     user_file: Option<&Path>,
     opts: &LoadOptions,
 ) -> Result<MergedConfig, String> {
+    let opts = opts.with_global();
+    let opts = &opts;
     let (project_file, project) = read_project_config(dir)?;
     let local = read_local_config(dir)?;
     let (user, system) = if opts.config_files.is_empty() {
@@ -595,16 +657,22 @@ fn map_for<'a>(
 }
 
 /// The value of `key` at one source. The project source also accepts the
-/// key's legacy name, mirroring the PHP working copy identity.
+/// key's legacy name, mirroring the PHP working copy identity -- including
+/// its `null`-key quirk (T1153 CORE-31): `getLegacyName()` returns `null`
+/// when a key has no legacy name, and `array_key_exists(null, ...)`
+/// coerces to `''`, so a project `{"": v}` entry answers every key
+/// without a legacy name.
 #[must_use]
 pub fn value_at(key: &str, source: &str, sources: &Sources) -> Option<serde_json::Value> {
     if let Some(value) = map_for(source, sources).get(key) {
         return Some(value.clone());
     }
-    if source == SOURCE_PROJECT
-        && let Some(legacy) = legacy_name(key)
-    {
-        return map_for(source, sources).get(legacy).cloned();
+    if source == SOURCE_PROJECT {
+        let map = map_for(source, sources);
+        if let Some(legacy) = legacy_name(key) {
+            return map.get(legacy).cloned();
+        }
+        return map.get("").cloned();
     }
     None
 }

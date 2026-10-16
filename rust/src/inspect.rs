@@ -26,7 +26,7 @@ extern crate self as arc_rs;
 use arc_rs::{
     browse,
     conduit::{self, EnvelopeKind},
-    config, diff_submit, git,
+    config, diff_submit, get_config, git,
 };
 
 /// Subcommand name, matching `arc inspect`.
@@ -351,12 +351,20 @@ fn finish_inspect_blocks(
     dir: &Path,
     options: &Options,
     mut ctx: Option<&mut browse::BrowseCtx>,
+    auth_client: Option<&conduit::Client>,
 ) -> ExitCode {
     let mut blocks = Vec::new();
     for spec in &options.objects {
         match inspect_one_with(dir, spec, options.explore, ctx.as_deref_mut()) {
             Ok(block) => blocks.push(block),
             Err(message) => {
+                // T1153 CORE-5: auth-coded browse failures render login
+                // guidance (the toolset runtime's auth arm).
+                if let Some(client) = auth_client
+                    && let Some(code) = conduit::auth_report_for(client, &message)
+                {
+                    return code;
+                }
                 // T1153 R4 (RB-D4): spec-shape errors are toolset
                 // usage (exit 1); the rest escape into a fatal (255).
                 let kind = if is_toolset_usage_message(&message) {
@@ -378,23 +386,37 @@ fn run_inspect_objects(
     call: Option<&diff_submit::ConduitCall>,
 ) -> ExitCode {
     if !wants_browse_client(options) {
-        return finish_inspect_blocks(dir, options, None);
+        return finish_inspect_blocks(dir, options, None, None);
     }
     match call {
         Some(call) => {
             let mut ctx = browse::BrowseCtx::new(dir, call, "");
-            finish_inspect_blocks(dir, options, Some(&mut ctx))
+            finish_inspect_blocks(dir, options, Some(&mut ctx), None)
         }
-        None => match config::client_for(None) {
-            Ok(client) => {
-                let live = |method: &str, params: &serde_json::Value| {
-                    client.call(method, params).map_err(conduit_error_text)
-                };
-                let mut ctx = browse::BrowseCtx::new(dir, &live, "");
-                finish_inspect_blocks(dir, options, Some(&mut ctx))
+        None => {
+            // T1153 CORE-4: the browse engine runs tokenless; a missing
+            // URI fails with the toolset no-URI block (fatal, like the
+            // `raiseURIException()` escape).
+            let user_file = config::arcrc_path();
+            match config::client_for_tokenless_with(
+                None,
+                dir,
+                user_file.as_deref(),
+                &get_config::LoadOptions::default(),
+            ) {
+                Ok(client) => {
+                    let live = |method: &str, params: &serde_json::Value| {
+                        client.call(method, params).map_err(conduit_error_text)
+                    };
+                    let mut ctx = browse::BrowseCtx::new(dir, &live, "");
+                    finish_inspect_blocks(dir, options, Some(&mut ctx), Some(&client))
+                }
+                Err(message) => conduit::report(
+                    EnvelopeKind::Fatal,
+                    &conduit::toolset_setup_message(&message),
+                ),
             }
-            Err(message) => conduit::report(EnvelopeKind::Fatal, &message),
-        },
+        }
     }
 }
 

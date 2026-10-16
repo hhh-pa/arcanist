@@ -17,7 +17,7 @@ use std::process::ExitCode;
 
 use crate::{
     conduit::{self, EnvelopeKind},
-    config, git, svn, terminal,
+    config, get_config, git, svn, terminal,
 };
 
 /// Subcommand name, matching `arc list`.
@@ -218,8 +218,13 @@ pub fn working_copy_root(cwd: &Path) -> Option<String> {
         .map(|root| root.to_string_lossy().to_string())
 }
 
-/// Authenticated user's PHID via `user.whoami`.
+/// Authenticated user's PHID: the identity cached at startup auth,
+/// else one `user.whoami` call (T1153 RB-D8: PHP resolves whoami once
+/// first, then reuses the cached PHID).
 pub fn user_phid(client: &conduit::Client) -> Result<String, String> {
+    if let Some((_, phid)) = client.authenticated_user() {
+        return Ok(phid);
+    }
     let who = client
         .call("user.whoami", &serde_json::json!({}))
         .map_err(|e| e.to_string())?;
@@ -362,11 +367,19 @@ pub fn run_in(cwd: &Path, argv: &[String]) -> ExitCode {
         // The working-copy gate is a usage error (same envelope).
         return conduit::report(EnvelopeKind::Usage, &msg);
     }
-    let client = match config::client_for(options.conduit_uri.as_deref()) {
+    // T1153 CORE-4/CORE-9: classic `requiresAuthentication` startup
+    // (tokenless engine, credential gate, `user.whoami` /
+    // `conduit.connect` verification).
+    let user_file = config::arcrc_path();
+    let client = match config::authed_client_for(
+        options.conduit_uri.as_deref(),
+        cwd,
+        user_file.as_deref(),
+        &get_config::LoadOptions::default(),
+        &config::command_description(),
+    ) {
         Ok(client) => client,
-        // Conduit setup and query failures are generic exceptions
-        // under the red banner (`:449-468`).
-        Err(msg) => return conduit::report(EnvelopeKind::Exception, &msg),
+        Err(error) => return error.report(),
     };
     match execute_in(&client, &options, cwd) {
         Ok(out) => {

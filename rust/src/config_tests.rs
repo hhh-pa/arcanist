@@ -212,3 +212,152 @@ fn r6_core34_runtime_config_beats_static_sources() {
     assert_eq!(discover_uri_with(&dir, Some(&user), &shadow), None);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn core4_credentials_gate_matrix() {
+    // The classic `$need_auth` gate: a token or a complete legacy pair,
+    // all under `empty()` semantics (`"0"` counts as missing).
+    let full = Credentials {
+        token: Some("t".to_string()),
+        user: None,
+        cert: None,
+    };
+    assert!(full.has_any());
+    let legacy = Credentials {
+        token: None,
+        user: Some("u".to_string()),
+        cert: Some("c".to_string()),
+    };
+    assert!(legacy.has_any());
+    for creds in [
+        Credentials::default(),
+        Credentials {
+            token: Some("0".to_string()),
+            user: None,
+            cert: None,
+        },
+        Credentials {
+            token: None,
+            user: Some("u".to_string()),
+            cert: None,
+        },
+        Credentials {
+            token: None,
+            user: Some("0".to_string()),
+            cert: Some("c".to_string()),
+        },
+    ] {
+        assert!(!creds.has_any(), "{creds:?}");
+    }
+}
+
+#[test]
+fn core4_credentials_for_reads_legacy_pair() {
+    let dir = std::env::temp_dir().join(format!("arc-rs-core4-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let user = dir.join("arcrc.json");
+    std::fs::write(
+        &user,
+        r#"{"hosts": {"https://h.test/api/": {"user": "u", "cert": "c"}}}"#,
+    )
+    .unwrap();
+    let creds = credentials_for(Some(&user), "https://h.test/", None);
+    assert_eq!(creds.token, None);
+    assert_eq!(creds.user.as_deref(), Some("u"));
+    assert_eq!(creds.cert.as_deref(), Some("c"));
+    assert!(creds.has_any());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn core4_tokenless_client_builds_without_credentials() {
+    // PHP's engine construction never fails for missing credentials.
+    // The URI rides `--config` runtime (no VCS root needed), and the
+    // shadow keeps ambient user/system sources out.
+    let (dir, mut shadow) = r6_shadowed("core4");
+    shadow.runtime.insert(
+        "phabricator.uri".to_string(),
+        serde_json::json!("https://h.test/"),
+    );
+    let user = dir.join("arcrc.json");
+    std::fs::write(&user, "{}").unwrap();
+    let client = client_for_tokenless_with(None, &dir, Some(&user), &shadow).unwrap();
+    assert!(!client.has_token());
+    assert_eq!(client.base_uri(), "https://h.test/api/");
+    // The strict path still errors (other scopes pin the message).
+    let err = client_for_with(None, &dir, Some(&user), &shadow).unwrap_err();
+    assert!(err.starts_with("no token for https://h.test/"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn core4_require_auth_gate_text() {
+    let text = require_auth_text("phab.example", None);
+    assert!(
+        text.contains("YOU NEED TO AUTHENTICATE TO CONTINUE"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "You are trying to connect to a server (phab.example) that you do not have any \
+             credentials stored for."
+        ),
+        "{text}"
+    );
+    // The `**` markers are pattern markup: stripped without ANSI,
+    // like PHP's `interpretFormat`.
+    assert!(text.contains("$ arc install-certificate"), "{text}");
+    assert!(!text.contains("**"), "{text}");
+    let forced = require_auth_text("h.test", Some("https://h.test/api/"));
+    assert!(
+        forced.contains("$ arc --conduit-uri=https://h.test/api/ install-certificate"),
+        "{forced}"
+    );
+}
+
+#[test]
+fn core4_uri_domain_strips_port_and_userinfo() {
+    assert_eq!(uri_domain("https://h.test/api/"), "h.test");
+    assert_eq!(uri_domain("http://h.test:8080/foo"), "h.test");
+    assert_eq!(uri_domain("https://u@h.test/"), "h.test");
+    assert_eq!(uri_domain("https://[::1]:8080/"), "[::1]");
+}
+
+#[test]
+fn core8_tls_cabundle_missing_fails_client() {
+    let (dir, mut shadow) = r6_shadowed("core8");
+    shadow.runtime.insert(
+        "phabricator.uri".to_string(),
+        serde_json::json!("https://h.test/"),
+    );
+    shadow.runtime.insert(
+        "https.cabundle".to_string(),
+        serde_json::json!("/nonexistent-ca-bundle.pem"),
+    );
+    let user = dir.join("arcrc.json");
+    std::fs::write(
+        &user,
+        r#"{"hosts": {"https://h.test/api/": {"token": "t"}}}"#,
+    )
+    .unwrap();
+    let err = client_for_with(None, &dir, Some(&user), &shadow).unwrap_err();
+    assert!(err.contains("failed to read CA bundle"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn core10_force_token_overrides_file() {
+    assert_eq!(
+        resolve_token(Some("forced"), Some("file".to_string())),
+        Some("forced".to_string())
+    );
+    assert_eq!(
+        resolve_token(None, Some("file".to_string())),
+        Some("file".to_string())
+    );
+    assert_eq!(
+        resolve_token(Some(""), Some("file".to_string())),
+        Some("file".to_string())
+    );
+    assert_eq!(resolve_token(None, None), None);
+}

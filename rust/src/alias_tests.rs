@@ -500,10 +500,8 @@ fn create_stores_new_format_and_preserves_rest_of_file() {
     .unwrap();
 
     let report = execute_create(&arcrc, "draft", &args(&["diff", "--draft"])).unwrap();
-    assert_eq!(
-        report.text,
-        "Aliased \"arc draft\" to \"arc diff --draft\".\n"
-    );
+    // T1153 CORE-25: creation appends silently (no confirmation text).
+    assert_eq!(report.text, "");
     assert!(report.warnings.is_empty());
 
     let doc: serde_json::Value =
@@ -525,16 +523,16 @@ fn create_replaces_previous_definition_and_reports_shell() {
     let arcrc = tmp.arcrc();
     execute_create(&arcrc, "ls", &args(&["!ls"])).unwrap();
     let report = execute_create(&arcrc, "ls", &args(&["!ls", "-la"])).unwrap();
-    assert_eq!(
-        report.text,
-        "Aliased \"arc ls\" to shell command \"ls -la\".\n"
-    );
+    // T1153 CORE-25: creation appends silently (no confirmation text).
+    assert_eq!(report.text, "");
 
     let doc: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&arcrc).unwrap()).unwrap();
+    // T1153 CORE-25: duplicates accumulate (the engine last-wins).
     assert_eq!(
         doc["aliases"],
         serde_json::json!([
+            {"trigger": "ls", "toolset": "arc", "command": ["!ls"]},
             {"trigger": "ls", "toolset": "arc", "command": ["!ls", "-la"]},
         ])
     );
@@ -710,13 +708,23 @@ fn shell_runner_maps_spawn_outcomes() {
         &args(&["echo", "hi"]),
         "arc g -> $ echo hi",
         |program, argv| {
-            assert_eq!(program, "echo");
-            assert_eq!(argv, &["hi".to_string()]);
+            // T1153 CORE-23: Unix mediates the shell (`sh -c`).
+            if cfg!(unix) {
+                assert_eq!(program, "sh");
+                assert_eq!(argv, &["-c".to_string(), "'echo' 'hi'".to_string()]);
+            } else {
+                assert_eq!(program, "echo");
+                assert_eq!(argv, &["hi".to_string()]);
+            }
             Ok(ShellStatus::Exited(0))
         },
     );
     assert_eq!(code, ExitCode::SUCCESS);
-    assert_eq!(notices, vec!["SHELL ALIAS: arc g -> $ echo hi".to_string()]);
+    // T1153 CORE-23: cyan log-engine hint (` SHELL ALIAS  ...` plain).
+    assert_eq!(
+        notices,
+        vec![" SHELL ALIAS  arc g -> $ echo hi".to_string()]
+    );
 
     let (code, notices) =
         run_shell_alias_with(&args(&["echo"]), "h", |_, _| Ok(ShellStatus::Exited(7)));
@@ -740,9 +748,11 @@ fn shell_runner_maps_spawn_outcomes() {
     );
     assert!(notices[1].contains("not found"), "{}", notices[1]);
 
+    // T1153 CORE-23: an empty shell command exits 0 like PHP's
+    // `passthru('')`.
     let (code, notices) = run_shell_alias_with(&[], "h", |_, _| Ok(ShellStatus::Exited(0)));
-    assert_eq!(code, ExitCode::FAILURE);
-    assert!(notices[1].contains("empty shell alias"), "{}", notices[1]);
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(notices.len(), 1);
 }
 
 fn loaded(aliases: Vec<Alias>) -> Option<(Vec<Alias>, Vec<String>)> {
@@ -758,9 +768,10 @@ fn expansion_driver_dispatches_and_reports_shell_and_broken_chains() {
         |_| panic!("must not spawn for dispatch"),
     );
     assert_eq!(result, Ok(args(&["diff", "--draft", "extra"])));
+    // T1153 CORE-23: cyan log-engine hint (` ALIAS  ...` plain).
     assert_eq!(
         notices,
-        vec!["ALIAS: arc draft -> arc diff --draft".to_string()]
+        vec![" ALIAS  arc draft -> arc diff --draft".to_string()]
     );
 
     let aliases = vec![alias("arc", "g", &["!echo", "hi"], "user")];
@@ -768,14 +779,20 @@ fn expansion_driver_dispatches_and_reports_shell_and_broken_chains() {
         args(&["g"]),
         || loaded(aliases),
         |shell| {
-            assert_eq!(shell, &args(&["echo", "hi"]));
+            // T1153 CORE-23: Unix mediates the shell (`sh -c`).
+            if cfg!(unix) {
+                assert_eq!(shell, &args(&["sh", "-c", "'echo' 'hi'"]));
+            } else {
+                assert_eq!(shell, &args(&["echo", "hi"]));
+            }
             Ok(ShellStatus::Exited(0))
         },
     );
     assert_eq!(result, Err(ExitCode::SUCCESS));
+    // T1153 CORE-23: cyan log-engine hint (` SHELL ALIAS  ...` plain).
     assert_eq!(
         notices,
-        vec!["SHELL ALIAS: arc g -> $ 'echo' 'hi'".to_string()]
+        vec![" SHELL ALIAS  arc g -> $ 'echo' 'hi'".to_string()]
     );
 
     let aliases = vec![alias("arc", "g", &["!echo"], "user")];
@@ -795,7 +812,8 @@ fn expansion_driver_dispatches_and_reports_shell_and_broken_chains() {
     );
     assert_eq!(result, Err(ExitCode::FAILURE));
     assert_eq!(notices.len(), 2);
-    assert!(notices[0].starts_with("ALIAS: "), "{}", notices[0]);
+    // T1153 CORE-23: cyan log-engine hint (` ALIAS  ...` plain).
+    assert!(notices[0].starts_with(" ALIAS  "), "{}", notices[0]);
     assert!(
         notices[1].contains("Alias resolved to \"gone\""),
         "{}",
@@ -830,10 +848,102 @@ fn expansion_driver_emits_configuration_warnings_first() {
     );
     assert_eq!(result, Ok(args(&["diff"])));
     assert_eq!(notices.len(), 2);
-    assert_eq!(notices[0], format!("ALIAS: {warning}"));
+    // T1153 CORE-23: cyan log-engine hints (` ALIAS  ...` plain).
+    assert_eq!(notices[0], format!(" ALIAS  {warning}"));
     assert!(
-        notices[1].starts_with("ALIAS: arc draft -> "),
+        notices[1].starts_with(" ALIAS  arc draft -> "),
         "{}",
         notices[1]
+    );
+}
+
+#[test]
+fn rbd2_json_rejects_repeats() {
+    let error = parse_args(&args(&["--json", "--json"])).unwrap_err();
+    assert_eq!(error, "Argument \"--json\" was provided twice.");
+}
+
+#[test]
+fn rbd25_json_rejects_inline_values() {
+    let error = parse_args(&args(&["--json=x"])).unwrap_err();
+    assert_eq!(error, "Argument \"--json\" does not take a parameter.");
+}
+
+#[test]
+fn rbd6_lone_dash_is_positional() {
+    let options = parse_args(&args(&["-"])).unwrap().unwrap();
+    assert_eq!(options.positional, vec!["-".to_string()]);
+}
+
+#[test]
+fn core16_toolset_names_match_ceb() {
+    let names = toolset_names();
+    assert_eq!(names.len(), 20);
+    for name in [
+        "alias",
+        "amend",
+        "anoid",
+        "bookmarks",
+        "branches",
+        "call-conduit",
+        "download",
+        "help",
+        "inspect",
+        "land",
+        "liberate",
+        "look",
+        "paste",
+        "prompts",
+        "shell-complete",
+        "upload",
+        "upgrade",
+        "version",
+        "weld",
+        "work",
+    ] {
+        assert!(names.contains(&name), "{name}");
+    }
+    for name in ["diff", "list", "which", "markers", "browse", "arc"] {
+        assert!(!names.contains(&name), "{name}");
+    }
+}
+
+#[test]
+fn core21_alias_errors_use_toolset_arms() {
+    assert_eq!(run(&args(&["--bogus"])), std::process::ExitCode::FAILURE);
+    assert_eq!(
+        run(&args(&["--json", "x"])),
+        std::process::ExitCode::FAILURE
+    );
+    // Builtin triggers fail before touching the filesystem.
+    assert_eq!(
+        run(&args(&["diff", "land"])),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn core28_user_aliases_prefer_config_section_on_collision() {
+    // The toolset `ArcanistUserConfigurationSource` transform keeps the
+    // section's `aliases` value when both layers define the key (`$result
+    // += $config` never overwrites); the union is per-key, so the whole
+    // top-level value drops, not just the colliding trigger.
+    let tmp = TempDir::new("core28");
+    let arcrc = tmp.arcrc();
+    std::fs::write(
+        &arcrc,
+        r#"{
+            "config": {"aliases": {"draft": ["diff", "--section"]}},
+            "aliases": {"draft": ["diff", "--top"]}
+        }"#,
+    )
+    .unwrap();
+    let (aliases, warnings) = load_aliases_in(tmp.path(), Some(&arcrc)).unwrap();
+    assert!(warnings.is_empty());
+    assert_eq!(aliases.len(), 1);
+    assert_eq!(aliases[0].trigger, "draft");
+    assert_eq!(
+        aliases[0].command,
+        vec!["diff".to_string(), "--section".to_string()]
     );
 }

@@ -146,7 +146,11 @@ pub struct Resolution<'a> {
 }
 
 /// Resolve the conduit URI with its source, mirroring
-/// [`config::client_for`] precedence: flag, environment, `.arcconfig`.
+/// [`config::client_for`] precedence: flag, environment, then the merged
+/// `phabricator.uri` (else `default`, like [`config::discover_from`]).
+/// T1153 Wave-2 carry-over: the merged source label comes from
+/// [`get_config::merged_value`], so user/system/local URIs are no longer
+/// misreported as `project (.arcconfig)`.
 #[must_use]
 pub fn resolve_conduit_in(
     dir: &Path,
@@ -159,9 +163,44 @@ pub fn resolve_conduit_in(
     if let Some(uri) = env.filter(|v| !v.trim().is_empty()) {
         return (Some(uri.to_string()), "environment (ARC_CONDUIT_URI)");
     }
-    match config::discover_from(dir) {
-        Some(uri) => (Some(uri), "project (.arcconfig)"),
+    let user_file = config::arcrc_path();
+    let opts = get_config::LoadOptions::default();
+    let Ok(merged) = get_config::load_merged(dir, user_file.as_deref(), &opts) else {
+        return (None, "none");
+    };
+    let hit = get_config::merged_value("phabricator.uri", &merged)
+        .or_else(|| get_config::merged_value("default", &merged));
+    match hit {
+        Some((source, value)) => match value.as_str() {
+            Some(uri) => (Some(uri.to_string()), merged_source_label(source, dir)),
+            None => (None, "none"),
+        },
         None => (None, "none"),
+    }
+}
+
+/// Display label for a [`get_config::merged_value`] source, parallel to
+/// the `read_callsign` labels. The local label names the VCS metadata
+/// directory holding `arc/config`.
+fn merged_source_label(source: &str, dir: &Path) -> &'static str {
+    match source {
+        get_config::SOURCE_RUNTIME => "command line (--config)",
+        get_config::SOURCE_LOCAL => match get_config::find_vcs_root(dir).map(|(kind, _)| kind) {
+            Some(get_config::VcsKind::Hg) => "local (.hg/arc/config)",
+            Some(get_config::VcsKind::Svn) => "local (.svn/arc/config)",
+            Some(get_config::VcsKind::Git) => "local (.git/arc/config)",
+            None => "local",
+        },
+        get_config::SOURCE_PROJECT => "project (.arcconfig)",
+        get_config::SOURCE_USER => "user (~/.arcrc)",
+        get_config::SOURCE_SYSTEM => {
+            if cfg!(windows) {
+                "system (ProgramData\\Phabricator\\Arcanist\\config)"
+            } else {
+                "system (/etc/arcconfig)"
+            }
+        }
+        _ => "default",
     }
 }
 
@@ -177,18 +216,39 @@ pub fn token_installed(user_file: Option<&Path>, uri: &str) -> bool {
 
 /// Find the nearest `.arcconfig` above `dir`: `(root, file)`.
 #[must_use]
+/// Locate the project root and `.arcconfig` for `dir`, mirroring
+/// `ArcanistWorkingCopyIdentity::newFromPathWithConfig()` (T1153
+/// CORE-33): git and Mercurial read `.arcconfig` ONLY at the
+/// working-copy root, Subversion takes the nearest `.arcconfig` from
+/// `dir` up to the root, and outside any working copy there is no
+/// project at all. Infallible like before: unreadable files simply miss.
 pub fn find_project(dir: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
-    for ancestor in dir.ancestors() {
-        let file = ancestor.join(".arcconfig");
-        if file.is_file() {
-            return (Some(ancestor.to_path_buf()), Some(file));
+    let Some((kind, root)) = get_config::find_vcs_root(dir) else {
+        return (None, None);
+    };
+    if kind == get_config::VcsKind::Svn {
+        for ancestor in dir.ancestors() {
+            let file = ancestor.join(".arcconfig");
+            if file.is_file() {
+                return (Some(ancestor.to_path_buf()), Some(file));
+            }
+            if ancestor == root.as_path() {
+                break;
+            }
         }
+        return (None, None);
+    }
+    let file = root.join(".arcconfig");
+    if file.is_file() {
+        return (Some(root), Some(file));
     }
     (None, None)
 }
 
-/// Read `repository.callsign` from the project file, else the user file's
-/// `config` section.
+/// Read `repository.callsign` from the project file, else the user file
+/// through the classic `readUserArcConfig()` transform (T1153 CORE-30:
+/// the `config` section when present, else the whole file, so modern
+/// top-level keys resolve).
 #[must_use]
 pub fn read_callsign(
     project_file: Option<&Path>,
@@ -202,12 +262,8 @@ pub fn read_callsign(
         return Some((callsign.to_string(), "project (.arcconfig)"));
     }
     if let Some(path) = user_file
-        && let Ok(text) = std::fs::read_to_string(path)
-        && let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text)
-        && let Some(callsign) = doc
-            .get("config")
-            .and_then(|c| c.get("repository.callsign"))
-            .and_then(|v| v.as_str())
+        && let Ok(user) = get_config::read_user_file(path)
+        && let Some(callsign) = user.get("repository.callsign").and_then(|v| v.as_str())
     {
         return Some((callsign.to_string(), "user (~/.arcrc)"));
     }
@@ -1414,10 +1470,20 @@ fn attach_authors(
     client: &conduit::Client,
     rows: Vec<(String, String, String, String)>,
 ) -> Result<Vec<MatchedRevision>, String> {
-    let who = client
-        .call("user.whoami", &serde_json::json!({}))
-        .map_err(|e| e.to_string())?;
-    let own = who.get("phid").and_then(|v| v.as_str()).unwrap_or("");
+    // T1153 RB-D8: PHP resolves whoami once at startup auth, then
+    // reuses the cached viewer PHID (`getUserPHID()`); only call when
+    // uncached (e.g. direct library use without `config::authenticate`).
+    let cached = client.authenticated_user();
+    let who;
+    let own = match &cached {
+        Some((_, phid)) => phid.as_str(),
+        None => {
+            who = client
+                .call("user.whoami", &serde_json::json!({}))
+                .map_err(|e| e.to_string())?;
+            who.get("phid").and_then(|v| v.as_str()).unwrap_or("")
+        }
+    };
     let mut others: Vec<String> = Vec::new();
     for (_, _, author, _) in &rows {
         if author != own && !others.iter().any(|p| p == author) {
@@ -2078,12 +2144,33 @@ pub fn run(argv: &[String]) -> ExitCode {
             options.base_rules.as_deref().unwrap_or(""),
         );
     }
-    let owned_client = config::client_for(options.conduit_uri.as_deref());
-    let match_config = match &owned_client {
-        Ok(client) => MatchConfig::Live {
-            client,
-            any_status: options.any_status,
-        },
+    // T1153 CORE-4/CORE-9: tokenless engine, then the classic
+    // credential check. Without credentials the report stays lenient
+    // (matching unavailable, exit 0) as before; with credentials the
+    // client verifies like `authenticateConduit()` (`user.whoami` /
+    // `conduit.connect`), failing the command on rejection, and the
+    // verified identity feeds revision matching (T1153 RB-D8).
+    let mut owned_client = config::client_for_tokenless_with(
+        options.conduit_uri.as_deref(),
+        &cwd,
+        user_file.as_deref(),
+        &get_config::LoadOptions::default(),
+    );
+    let match_config = match &mut owned_client {
+        Ok(client) => {
+            let creds = config::credentials_for(user_file.as_deref(), client.base_uri(), None);
+            if !creds.has_any() {
+                MatchConfig::Unavailable(format!("no token for {} in ~/.arcrc", client.base_uri()))
+            } else {
+                match config::authenticate(client, &creds, &config::command_description()) {
+                    Ok(_) => MatchConfig::Live {
+                        client,
+                        any_status: options.any_status,
+                    },
+                    Err(error) => return error.report(),
+                }
+            }
+        }
         Err(message) => MatchConfig::Unavailable(message.clone()),
     };
     let resolution = Resolution {
