@@ -2389,3 +2389,108 @@ fn lint44_backslash_hidden_is_not_a_dotfile() {
     assert_eq!(codes(&text("foo\\.hidden", b"")), vec!["TXT10"]);
     assert!(text(".hidden", b"").is_empty());
 }
+
+#[test]
+fn d22_message_to_dictionary_has_php_keys() {
+    // T1153 DIFF-D22: `unresolvedLint` dicts carry the 12
+    // `toDictionary()` keys (`ArcanistLintMessage.php:56-71`).
+    let message = LintMessage {
+        path: "f.php".to_string(),
+        line: 3,
+        col: 7,
+        code: "X".to_string(),
+        severity: SEVERITY_WARNING.to_string(),
+        name: "n".to_string(),
+        description: "d".to_string(),
+        original: Some("a".to_string()),
+        replacement: Some("b".to_string()),
+        granularity: Some(2),
+        locations: Vec::new(),
+        bypass_changed_line_filtering: Some(true),
+        original_bytes: None,
+        replacement_bytes: None,
+    };
+    assert_eq!(
+        message.to_dictionary(),
+        serde_json::json!({
+            "path": "f.php",
+            "line": 3,
+            "char": 7,
+            "code": "X",
+            "severity": "warning",
+            "name": "n",
+            "description": "d",
+            "original": "a",
+            "replacement": "b",
+            "granularity": 2,
+            "locations": [],
+            "bypassChangedLineFiltering": true,
+        })
+    );
+    // Unset line/char render null.
+    let path_level = LintMessage {
+        line: 0,
+        col: 0,
+        ..message
+    };
+    let dict = path_level.to_dictionary();
+    assert_eq!(dict["line"], serde_json::Value::Null);
+    assert_eq!(dict["char"], serde_json::Value::Null);
+}
+
+#[test]
+fn d22_unresolved_dicts_skip_applied_messages() {
+    // T1153 DIFF-D22: applied patches resolve their messages
+    // (`ArcanistLintWorkflow.php:360-375`).
+    let mut result = LintResult::new("f".to_string(), std::path::PathBuf::from("f"), Vec::new());
+    let kept = LintMessage {
+        path: "f".to_string(),
+        line: 1,
+        col: 1,
+        code: "K".to_string(),
+        severity: SEVERITY_ERROR.to_string(),
+        name: "n".to_string(),
+        description: "kept".to_string(),
+        original: None,
+        replacement: None,
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
+    };
+    let fixed = LintMessage {
+        code: "F".to_string(),
+        description: "fixed".to_string(),
+        ..kept.clone()
+    };
+    result.add_message(kept);
+    result.add_message(fixed);
+    result.applied = vec![false, true];
+    let dicts = unresolved_dicts(std::slice::from_ref(&result));
+    assert_eq!(dicts.len(), 1);
+    assert_eq!(dicts[0]["description"], serde_json::json!("kept"));
+}
+
+#[test]
+fn d22_bare_child_amend_gates_like_argv_flags() {
+    // T1153 DIFF-D22: `diff`'s bare amend intent enables the amend
+    // prompt (gated on VCS support + mutable history, `:248-252`).
+    let tmp = TempDir::new("d22-amend");
+    let root = tmp.path().join("repo");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let work = WorkCopy {
+        vcs: Vcs::Git,
+        vcs_root: root.clone(),
+        project_root: root.clone(),
+    };
+    let bare = Options {
+        child_amend: true,
+        ..Default::default()
+    };
+    assert!(amend_enabled(&work, &bare).unwrap());
+    assert!(!amend_enabled(&work, &Options::default()).unwrap());
+    // Immutable history disables even the bare intent.
+    std::fs::write(root.join(".arcconfig"), r#"{"history.immutable": true}"#).unwrap();
+    assert!(!amend_enabled(&work, &bare).unwrap());
+}

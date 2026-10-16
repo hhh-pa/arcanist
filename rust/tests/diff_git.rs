@@ -955,3 +955,57 @@ fn git_submit_carries_parsed_hunks() {
     );
     assert!(hunks[0].get("oldOffset").is_some(), "{}", sent[0]);
 }
+
+#[test]
+fn g1_pure_rename_submit_carries_synthetic_hunks_and_companion() {
+    // T1153 EXPORT-E14/E20 (+E11 types, E36 invocation): a pure `git mv`
+    // submits the here-change with fabricated context hunks and a folded
+    // `MOVE_AWAY` companion with delete-side hunks — like PHP's parser
+    // with `loadSyntheticData()` — on both the fast and full pipelines.
+    let fx = Fixture::named("g1-rename-synth");
+    fx.init_repo();
+    fx.write("o.txt", "one\ntwo\n");
+    let base = fx.commit_all("Base");
+    fx.git(&["mv", "o.txt", "n.txt"]);
+    let opts = options(Some(&base), false);
+    let inputs = [
+        diff::prepare_submit(fx.path(), &opts, &diff::SubmitMode::Only).unwrap(),
+        diff::prepare_submit_full(fx.path(), &opts, &diff::SubmitMode::Only).unwrap(),
+    ];
+    for input in &inputs {
+        let canned = Canned::default().with("differential.creatediff", wire_fixture("creatediff"));
+        let call = |method: &str, params: &serde_json::Value| canned.call(method, params);
+        diff::submit_over(&call, input).unwrap();
+        let sent = canned.params_for("differential.creatediff");
+        assert_eq!(sent.len(), 1);
+        let changes = sent[0]["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), 2, "{sent:?}");
+        let here = &changes[0];
+        assert_eq!(here["type"], serde_json::json!(6));
+        assert_eq!(here["currentPath"], serde_json::json!("n.txt"));
+        assert_eq!(here["oldPath"], serde_json::json!("o.txt"));
+        let hunks = here["hunks"].as_array().unwrap();
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0]["corpus"], serde_json::json!(" one\n two\n"));
+        assert_eq!(hunks[0]["oldOffset"], serde_json::json!("0"));
+        assert_eq!(hunks[0]["oldLength"], serde_json::json!("0"));
+        assert_eq!(hunks[0]["newOffset"], serde_json::json!("1"));
+        assert_eq!(hunks[0]["newLength"], serde_json::json!("2"));
+        assert_eq!(hunks[0]["addLines"], serde_json::json!(2));
+        assert_eq!(hunks[0]["delLines"], serde_json::json!(0));
+        let away = &changes[1];
+        assert_eq!(away["type"], serde_json::json!(4));
+        assert_eq!(away["currentPath"], serde_json::json!("o.txt"));
+        assert_eq!(away["oldPath"], serde_json::Value::Null);
+        assert_eq!(away["awayPaths"], serde_json::json!(["n.txt"]));
+        let hunks = away["hunks"].as_array().unwrap();
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0]["corpus"], serde_json::json!("-one\n-two\n"));
+        assert_eq!(hunks[0]["oldOffset"], serde_json::json!("1"));
+        assert_eq!(hunks[0]["oldLength"], serde_json::json!("2"));
+        assert_eq!(hunks[0]["newOffset"], serde_json::json!("0"));
+        assert_eq!(hunks[0]["newLength"], serde_json::json!("0"));
+        assert_eq!(hunks[0]["addLines"], serde_json::json!(0));
+        assert_eq!(hunks[0]["delLines"], serde_json::json!(2));
+    }
+}

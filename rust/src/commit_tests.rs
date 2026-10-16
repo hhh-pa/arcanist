@@ -312,3 +312,107 @@ fn message_files_are_unique_under_concurrency() {
         std::fs::remove_file(path).ok();
     }
 }
+
+/// Serve conduit routes, recording `(method, body)` pairs.
+fn serve_recording(
+    routes: std::collections::HashMap<String, String>,
+    expected: usize,
+) -> (String, std::sync::mpsc::Receiver<(String, String)>) {
+    use std::io::{Read, Write};
+    let (send, recv) = std::sync::mpsc::channel();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for _ in 0..expected {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            let head_text = String::from_utf8_lossy(&head).to_string();
+            let len: usize = head_text
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(key, value)| {
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).unwrap();
+            let method = head_text
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .strip_prefix("/api/")
+                .unwrap_or("")
+                .to_string();
+            send.send((method.clone(), String::from_utf8_lossy(&body).to_string()))
+                .ok();
+            let canned = routes
+                .get(&method)
+                .cloned()
+                .unwrap_or_else(|| r#"{"result": null, "error_code": "ERR-NO-ROUTE"}"#.to_string());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                canned.len(),
+                canned
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    (base, recv)
+}
+
+#[test]
+fn commit_c3_looksoon_nudges_repository_and_swallows_failures() {
+    // T1153 COMMIT-C3: after resolving the repository, `commit` sends
+    // the advisory `diffusion.looksoon`; a failing nudge is swallowed.
+    let dir = std::env::temp_dir().join(format!("arc-rs-commit-c3-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::write(dir.join(".arcconfig"), r#"{"repository.callsign": "X"}"#).unwrap();
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "repository.query".to_string(),
+        r#"{"result": [{"phid": "PHID-REPO-1"}], "error_code": null, "error_info": null}"#
+            .to_string(),
+    );
+    routes.insert(
+        "diffusion.looksoon".to_string(),
+        r#"{"result": null, "error_code": "ERR-CONDUIT-CALL", "error_info": "nope"}"#.to_string(),
+    );
+    let (base, seen) = serve_recording(routes, 2);
+    let client = Client::new(&base, "t").unwrap();
+    ask_for_repository_update(&client, &dir);
+    // Bounded receives: a wiring regression must fail, never hang the suite.
+    let wait = std::time::Duration::from_secs(30);
+    let mut calls = [
+        seen.recv_timeout(wait).unwrap(),
+        seen.recv_timeout(wait).unwrap(),
+    ];
+    calls.sort();
+    assert_eq!(calls[0].0, "diffusion.looksoon");
+    // The nudge names the resolved repository PHID.
+    assert!(calls[0].1.contains("PHID-REPO-1"), "{}", calls[0].1);
+    assert_eq!(calls[1].0, "repository.query");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn commit_c3_looksoon_skips_untracked_working_copies() {
+    // T1153 COMMIT-C3: with no identifiable repository, no call runs.
+    let dir = std::env::temp_dir().join(format!("arc-rs-commit-c3-bare-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let client = Client::new("https://conduit.test/", "t").unwrap();
+    // No identifiable repository (and no network): silently skipped.
+    ask_for_repository_update(&client, &dir);
+    std::fs::remove_dir_all(&dir).ok();
+}

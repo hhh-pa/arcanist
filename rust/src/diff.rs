@@ -34,8 +34,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use arc_rs::{
-    close_revision, conduit, config, diff_local, diff_submit, get_config, git, hg, list, svn,
-    terminal,
+    amend, close_revision, conduit, config, diff_local, diff_submit, get_config, git, hg, list,
+    svn, terminal,
 };
 
 /// Subcommand name, matching `arc diff`.
@@ -1280,9 +1280,8 @@ pub struct SubmitInput {
 
 /// Convert a local change entry to a submit payload change.
 ///
-/// Divergence: hunks are empty and away paths unpaired. Faithful hunks need
-/// the unified-diff parser (`generateChanges()`,
-/// `src/workflow/ArcanistDiffWorkflow.php:802-1026`), which is not ported.
+/// Hunks, modes, and companions attach in [`submit_changes_with_hunks`]
+/// from the parsed range text (T1153 EXPORT-E11/E13/E14).
 fn submit_change(entry: &diff_local::ChangeEntry) -> diff_submit::DiffChange {
     let old_path = match entry.change_type {
         diff_local::TYPE_MOVE_HERE | diff_local::TYPE_COPY_HERE => {
@@ -1296,22 +1295,101 @@ fn submit_change(entry: &diff_local::ChangeEntry) -> diff_submit::DiffChange {
     change
 }
 
+/// Attach a parsed change's hunks and modes to a skeleton (T1153
+/// EXPORT-E11/E13: `,length` bits ride alongside the hunks, filemodes
+/// ride the properties).
+fn attach_parsed_content(change: &mut diff_submit::DiffChange, found: &diff_local::ParsedChange) {
+    change.old_properties = filemode_properties(found.old_mode.as_deref());
+    change.new_properties = filemode_properties(found.new_mode.as_deref());
+    change.hunks = found
+        .hunks
+        .iter()
+        .zip(found.hunk_len_explicit.iter())
+        .map(|(hunk, explicit)| submit_hunk_from_parsed(hunk, explicit))
+        .collect();
+}
+
+/// A folded companion for one here entry (T1153 EXPORT-E14): content
+/// (synthetic delete-side hunks for pure moves) attaches from the
+/// parsed companion twin by old path.
+fn entry_companion(
+    companion: &diff_local::AwayCompanion,
+    parsed: &[diff_local::ParsedChange],
+) -> diff_submit::DiffChange {
+    let mut out = diff_submit::DiffChange::new_companion(
+        i64::from(companion.change_type),
+        &companion.current_path,
+        &companion.away_paths,
+    );
+    if let Some(twin) = parsed.iter().find(|parsed| {
+        parsed.current_path == companion.current_path
+            && diff_local::is_companion_type(parsed.change_type)
+    }) {
+        attach_parsed_content(&mut out, twin);
+        out.file_type = i64::from(twin.file_type);
+    }
+    out
+}
+
+/// Fold one entry's companion, emitting or updating it in `changes`
+/// (T1153 EXPORT-E14: shared fold, PHP's first-reference order).
+fn fold_entry_companion(
+    fold: &mut diff_local::CompanionFold,
+    slots: &mut Vec<usize>,
+    changes: &mut Vec<diff_submit::DiffChange>,
+    entry: &diff_local::ChangeEntry,
+    parsed: &[diff_local::ParsedChange],
+) {
+    let Some(old) = entry.old_path.as_deref() else {
+        return;
+    };
+    if !matches!(
+        entry.change_type,
+        diff_local::TYPE_MOVE_HERE | diff_local::TYPE_COPY_HERE
+    ) || old.is_empty()
+        || old == entry.current.path
+    {
+        return;
+    }
+    let (slot, is_new) = fold.fold(entry.change_type, old, &entry.current.path);
+    if is_new {
+        slots.push(changes.len());
+        changes.push(entry_companion(fold.companion(slot), parsed));
+    } else if let Some(&at) = slots.get(slot) {
+        changes[at] = entry_companion(fold.companion(slot), parsed);
+    }
+}
+
 /// Build submit changes for the git range: entry skeletons plus hunks
 /// parsed from the range diff text (`generateChanges()`, `:802-827`).
 /// Entries keep their type/path mapping; hunks attach by current path.
 /// A range whose text does not parse fails like PHP's `didFailParse()`.
+///
+/// The range diff runs with the pinned `getFullGitDiff()` invocation
+/// (T1153 EXPORT-E36: `ArcanistGitAPI.php:464-491`), so renames parse
+/// as renames and hunks carry whole-file context like PHP's. Pure
+/// moves gain fabricated hunks (T1153 EXPORT-E20), and renames/copies
+/// gain folded away companions (T1153 EXPORT-E14).
 fn submit_changes_with_hunks(
     cwd: &Path,
     base: &str,
     head: Option<&str>,
     entries: &[diff_local::ChangeEntry],
 ) -> Result<Vec<diff_submit::DiffChange>, String> {
-    let mut args = vec!["--no-pager", "diff", "--no-color", base];
+    let options = diff_local::full_diff_options(diff_local::DEFAULT_DIFF_CONTEXT_LINES);
+    let mut args: Vec<String> = diff_local::DIFF_CONFIG_OPTIONS
+        .iter()
+        .map(|option| (*option).to_string())
+        .collect();
+    args.push("diff".to_string());
+    args.extend(options);
+    args.push(base.to_string());
     if let Some(rev) = head {
-        args.push(rev);
+        args.push(rev.to_string());
     }
-    args.push("--");
-    let out = git_output(cwd, &args)?;
+    args.push("--".to_string());
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = git_output(cwd, &arg_refs)?;
     if !out.status.success() {
         return Err(format!(
             "git diff failed: {}",
@@ -1319,17 +1397,31 @@ fn submit_changes_with_hunks(
         ));
     }
     let text = crate::patch::decode_bytes(&out.stdout, None)?;
-    let parsed = diff_local::parse_unified_diff(&text)?;
+    let mut full = diff_local::with_companions(&diff_local::parse_unified_diff(&text)?);
+    let raw_for = |path: &str| diff_local::get_raw_diff_text(cwd, base, path);
+    diff_local::attach_synthetic_git_hunks(&mut full, &raw_for)?;
+    let mut fold = diff_local::CompanionFold::new();
+    let mut slots: Vec<usize> = Vec::new();
     let mut changes = Vec::with_capacity(entries.len());
     for entry in entries {
         let mut change = submit_change(entry);
-        if let Some(found) = parsed
+        // Prefer the here-change twin: a companion for a rename chain
+        // (`R a->b`, `R b->c`) shares the middle path (T1153 EXPORT-E14).
+        let found = full
             .iter()
-            .find(|parsed| parsed.current_path == entry.current.path)
-        {
-            change.hunks = found.hunks.iter().map(submit_hunk_from_parsed).collect();
+            .find(|parsed| {
+                parsed.current_path == entry.current.path
+                    && !diff_local::is_companion_type(parsed.change_type)
+            })
+            .or_else(|| {
+                full.iter()
+                    .find(|parsed| parsed.current_path == entry.current.path)
+            });
+        if let Some(found) = found {
+            attach_parsed_content(&mut change, found);
         }
         changes.push(change);
+        fold_entry_companion(&mut fold, &mut slots, &mut changes, entry, &full);
     }
     Ok(changes)
 }
@@ -1438,6 +1530,19 @@ fn set_child_flags(options: &Options) -> (Vec<String>, Vec<String>) {
 /// Notices print to stdout even under `--json`: PHP captures them into
 /// the `human` field, which in-process runs cannot do (same `human`
 /// divergence as the submit report).
+/// Default `history.immutable` for `cwd`'s VCS (T1153 DIFF-D22):
+/// `isHistoryDefaultImmutable()` when no config value is set.
+fn history_default_immutable(cwd: &Path) -> bool {
+    match detect_vcs_kind(cwd) {
+        Some(VcsKind::Git) => git::is_history_default_immutable(),
+        Some(VcsKind::Hg) => hg::is_history_default_immutable(),
+        Some(VcsKind::Svn) => svn::is_history_default_immutable(),
+        // Unreachable for non-raw runs (base resolution fails outside a
+        // working copy first); raw runs never amend.
+        None => false,
+    }
+}
+
 fn run_lint_unit_stdio_ansi(
     cwd: &Path,
     options: &Options,
@@ -1450,6 +1555,17 @@ fn run_lint_unit_stdio_ansi(
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let mut out = std::io::stdout();
+    // T1153 DIFF-D22: the lint child amends when `shouldAmend()`
+    // (bare `setShouldAmendChanges()`), like PHP's `runLint()`.
+    let amend_lint = diff_local::should_amend(
+        is_raw,
+        options.no_amend,
+        head,
+        amend::history_is_immutable(cwd, history_default_immutable(cwd))?,
+    );
+    let run_lint_child = |dir: &Path, argv: &[String]| {
+        diff_local::run_lint_in_process_with_amend(dir, argv, amend_lint)
+    };
     diff_local::run_lint_unit_ansi(
         cwd,
         base,
@@ -1457,7 +1573,7 @@ fn run_lint_unit_stdio_ansi(
         &unit_flags,
         diff_local::should_skip_lint(options.nolint, is_raw, head),
         diff_local::should_skip_unit(options.nounit, is_raw, head),
-        &diff_local::run_lint_in_process,
+        &run_lint_child,
         &diff_local::run_unit_in_process,
         &mut input,
         &mut out,
@@ -2344,54 +2460,43 @@ pub fn read_raw_diff_text(options: &Options) -> Result<String, String> {
 
 /* -(  Full-State Change Collection (G1)  )---------------------------------------- */
 
-/// Count added/deleted body lines in a hunk corpus (header skipped).
-fn count_hunk_lines(corpus: &str) -> (i64, i64) {
-    let mut adds = 0;
-    let mut dels = 0;
-    for line in corpus.lines() {
-        match line.as_bytes().first() {
-            Some(b'+') => adds += 1,
-            Some(b'-') => dels += 1,
-            _ => {}
-        }
-    }
-    (adds, dels)
-}
-
-/// Missing-newline flags from `\ No newline` markers: the marker inherits
-/// the side of the line it follows.
-fn missing_newlines(corpus: &str) -> (bool, bool) {
-    let mut missing_old = false;
-    let mut missing_new = false;
-    let mut previous: u8 = 0;
-    for line in corpus.lines() {
-        if line.starts_with("\\ No newline") {
-            if previous == b'-' {
-                missing_old = true;
-            }
-            if previous == b'+' {
-                missing_new = true;
-            }
-        }
-        previous = line.as_bytes().first().copied().unwrap_or(0);
-    }
-    (missing_old, missing_new)
-}
-
-/// Convert a parsed hunk to a submit payload hunk (`toDictionary` fields).
-pub fn submit_hunk_from_parsed(hunk: &diff_local::ParsedHunk) -> diff_submit::DiffHunk {
-    let (adds, dels) = count_hunk_lines(&hunk.corpus);
-    let (missing_old, missing_new) = missing_newlines(&hunk.corpus);
+/// Convert a parsed hunk to a submit payload hunk (`toDictionary`
+/// fields). `explicit` is the hunk's `,length` spelling bits (T1153
+/// EXPORT-E11); counts and missing-newline flags come from the shared
+/// length-driven loop, where a `\ No newline` marker flags the old side
+/// while new lines remain and the new side once exhausted (T1153
+/// EXPORT-E15: `ArcanistDiffParser.php:939-997`).
+pub fn submit_hunk_from_parsed(
+    hunk: &diff_local::ParsedHunk,
+    explicit: &diff_local::HunkLenExplicit,
+) -> diff_submit::DiffHunk {
+    // Counts honor the synthetic pre-rewrite override (T1153 EXPORT-E20).
+    let (adds, dels) = diff_local::hunk_counts(hunk);
+    let (_, _, missing_old, missing_new) =
+        diff_local::hunk_stats(&hunk.corpus, hunk.old_len, hunk.new_len);
     diff_submit::DiffHunk {
         old_offset: i64::try_from(hunk.old_start).unwrap_or(i64::MAX),
         new_offset: i64::try_from(hunk.new_start).unwrap_or(i64::MAX),
         old_length: i64::try_from(hunk.old_len).unwrap_or(i64::MAX),
         new_length: i64::try_from(hunk.new_len).unwrap_or(i64::MAX),
-        add_lines: adds,
-        del_lines: dels,
+        old_len_explicit: explicit.old_explicit,
+        new_len_explicit: explicit.new_explicit,
+        add_lines: i64::try_from(adds).unwrap_or(i64::MAX),
+        del_lines: i64::try_from(dels).unwrap_or(i64::MAX),
         is_missing_old_newline: missing_old,
         is_missing_new_newline: missing_new,
         corpus: hunk.corpus.clone(),
+    }
+}
+
+/// One `unix:filemode` property value (T1153 EXPORT-E13): PHP sets the
+/// property from the diff's mode lines
+/// (`ArcanistDiffParser.php:622-627`) and `toDictionary()` passes it
+/// through; absent modes stay `[]`.
+fn filemode_properties(mode: Option<&str>) -> serde_json::Value {
+    match mode {
+        Some(mode) => serde_json::json!({"unix:filemode": mode}),
+        None => serde_json::Value::Array(Vec::new()),
     }
 }
 
@@ -2401,22 +2506,48 @@ pub fn submit_hunk_from_parsed(hunk: &diff_local::ParsedHunk) -> diff_submit::Di
 /// `/dev/null` by the parser).
 pub fn submit_change_from_parsed(change: &diff_local::ParsedChange) -> diff_submit::DiffChange {
     let mut out = diff_submit::DiffChange::new_text(&change.old_path, &change.current_path);
+    // T1153 EXPORT-E14: companions report a null old path (PHP never
+    // sets it on the `buildChange($oldPath)` twin).
+    if diff_local::is_companion_type(change.change_type) {
+        out.old_path = None;
+    }
     out.change_type = i64::from(change.change_type);
     out.file_type = i64::from(change.file_type);
     out.away_paths = change.away_paths.clone();
     out.commit_hash = change.commit_hash.clone();
-    out.hunks = change.hunks.iter().map(submit_hunk_from_parsed).collect();
+    // T1153 EXPORT-E13: filemodes ride the properties, like PHP's
+    // `setOldProperty()`/`setNewProperty()`.
+    out.old_properties = filemode_properties(change.old_mode.as_deref());
+    out.new_properties = filemode_properties(change.new_mode.as_deref());
+    // `hunk_len_explicit` runs parallel to `hunks` (T1153 EXPORT-E11).
+    out.hunks = change
+        .hunks
+        .iter()
+        .zip(change.hunk_len_explicit.iter())
+        .map(|(hunk, explicit)| submit_hunk_from_parsed(hunk, explicit))
+        .collect();
     out
+}
+
+/// Submit payload changes from parsed changes, companions included
+/// (T1153 EXPORT-E14: PHP's parser emits the folded away changes, so
+/// every parsed submit path routes through here).
+pub fn submit_changes_from_parsed(
+    changes: &[diff_local::ParsedChange],
+) -> Vec<diff_submit::DiffChange> {
+    diff_local::with_companions(changes)
+        .iter()
+        .map(submit_change_from_parsed)
+        .collect()
 }
 
 /// Parse raw diff text into submit payload changes, dropping `TYPE_MESSAGE`
 /// pseudo-changes (`generateChanges()`, `:820-827`).
 pub fn parse_raw_diff_changes(text: &str) -> Result<Vec<diff_submit::DiffChange>, String> {
     let parsed = diff_local::parse_unified_diff(text)?;
-    Ok(diff_local::without_message_changes(&parsed)
-        .iter()
-        .map(submit_change_from_parsed)
-        .collect())
+    Ok(submit_changes_from_parsed(
+        &diff_local::without_message_changes(&parsed),
+    ))
 }
 
 /// Build an `Included changes:` entry from a parsed change, counting
@@ -2425,9 +2556,11 @@ pub fn change_entry_from_parsed(change: &diff_local::ParsedChange) -> diff_local
     let mut added = 0u64;
     let mut deleted = 0u64;
     for hunk in &change.hunks {
-        let (adds, dels) = count_hunk_lines(&hunk.corpus);
-        added += u64::try_from(adds).unwrap_or(0);
-        deleted += u64::try_from(dels).unwrap_or(0);
+        // Counts come from the shared loop, honoring the synthetic
+        // pre-rewrite override (T1153 EXPORT-E15/E20).
+        let (adds, dels) = diff_local::hunk_counts(hunk);
+        added += adds;
+        deleted += dels;
     }
     diff_local::ChangeEntry {
         change_type: change.change_type,
@@ -2590,7 +2723,7 @@ fn collect_svn_submit_changes<R: std::io::BufRead, W: std::io::Write>(
     };
     let parsed =
         diff_local::collect_svn_parsed_changes_with_io(cwd, svn_cmd, &options.paths, &config, io)?;
-    Ok(parsed.iter().map(submit_change_from_parsed).collect())
+    Ok(submit_changes_from_parsed(&parsed))
 }
 
 /// Real-stdio prompt state for the svn externals confirm.
@@ -2657,7 +2790,7 @@ pub fn collect_submit_changes_with_io<R: std::io::BufRead, W: std::io::Write>(
     }
     let convert = |text: &str| -> Result<Vec<diff_submit::DiffChange>, String> {
         let parsed = diff_local::parse_unified_diff(text)?;
-        Ok(parsed.iter().map(submit_change_from_parsed).collect())
+        Ok(submit_changes_from_parsed(&parsed))
     };
     match detect_vcs_kind(cwd) {
         Some(VcsKind::Git) => {
@@ -2670,7 +2803,12 @@ pub fn collect_submit_changes_with_io<R: std::io::BufRead, W: std::io::Write>(
             if text.is_empty() {
                 return Err(diff_local::NO_CHANGES_FOUND.to_string());
             }
-            Ok(convert(&text)?)
+            // T1153 EXPORT-E20: pure moves gain fabricated hunks
+            // (`loadSyntheticData()` runs on git submits in PHP).
+            let mut full = diff_local::with_companions(&diff_local::parse_unified_diff(&text)?);
+            let raw_for = |path: &str| diff_local::get_raw_diff_text(cwd, base, path);
+            diff_local::attach_synthetic_git_hunks(&mut full, &raw_for)?;
+            Ok(submit_changes_from_parsed(&full))
         }
         Some(VcsKind::Hg) => {
             let text = diff_local::get_full_hg_diff_with(
@@ -2819,11 +2957,7 @@ fn submit_svn_parsed<R: std::io::BufRead, W: std::io::Write>(
 
 /// Submit payload changes from collected svn parses.
 fn changes_from_parsed(parsed: &[diff_local::ParsedChange]) -> Vec<diff_submit::DiffChange> {
-    let mut changes = Vec::new();
-    for change in parsed {
-        changes.push(submit_change_from_parsed(change));
-    }
-    changes
+    submit_changes_from_parsed(parsed)
 }
 
 /// Submit payload changes, reusing the collected svn parse when present.

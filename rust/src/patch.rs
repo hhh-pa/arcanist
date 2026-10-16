@@ -1817,6 +1817,8 @@ fn break_hunk_into_small_hunks(base: &ParsedHunk) -> Vec<ParsedHunk> {
             new_start: (new_offset as i64 - back).max(0) as u64,
             new_len: count_length - scan.old_lines,
             corpus,
+            // Splitter hunks count from the corpus (T1153 EXPORT-E20).
+            synthetic_counts: None,
         });
         old_offset += (jj - ii) as u64 - scan.new_lines;
         new_offset += (jj - ii) as u64 - scan.old_lines;
@@ -2046,6 +2048,8 @@ fn arcbundle_corpora(
                 new_start,
                 new_len,
                 corpus: decode_bytes(&bytes, decode_as)?,
+                // Bundle hunks count from the corpus (T1153 EXPORT-E20).
+                synthetic_counts: None,
             });
         }
     }
@@ -2073,6 +2077,8 @@ pub fn conduit_hunks_from_dict(dict: &serde_json::Value) -> Vec<ParsedHunk> {
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string(),
+                        // Conduit hunks count from the corpus (T1153 EXPORT-E20).
+                        synthetic_counts: None,
                     }
                 })
                 .collect()

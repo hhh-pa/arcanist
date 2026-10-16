@@ -857,30 +857,46 @@ fn g1_raw_diff_source() {
 
 #[test]
 fn g1_hunk_and_change_conversion() {
+    // Corpora are body-only (the `@@` header is consumed by the parser,
+    // never stored); `,length` bits ride alongside (T1153 EXPORT-E11).
+    let both_explicit = diff_local::HunkLenExplicit {
+        old_explicit: true,
+        new_explicit: true,
+    };
     let hunk = diff_local::ParsedHunk {
         old_start: 1,
         old_len: 2,
         new_start: 1,
         new_len: 3,
-        corpus: "@@ -1,2 +1,3 @@\n a\n+b\n-c\n".to_string(),
+        corpus: " a\n+b\n-c\n".to_string(),
+        synthetic_counts: None,
     };
-    let submit = submit_hunk_from_parsed(&hunk);
+    let submit = submit_hunk_from_parsed(&hunk, &both_explicit);
     assert_eq!(submit.old_offset, 1);
     assert_eq!(submit.old_length, 2);
     assert_eq!(submit.new_length, 3);
+    assert!(submit.old_len_explicit);
+    assert!(submit.new_len_explicit);
     assert_eq!(submit.add_lines, 1);
     assert_eq!(submit.del_lines, 1);
     assert!(!submit.is_missing_old_newline);
     assert!(!submit.is_missing_new_newline);
 
+    let neither_explicit = diff_local::HunkLenExplicit {
+        old_explicit: false,
+        new_explicit: false,
+    };
     let missing = diff_local::ParsedHunk {
         old_start: 1,
         old_len: 1,
         new_start: 1,
         new_len: 1,
-        corpus: "@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+b\n".to_string(),
+        corpus: "-a\n\\ No newline at end of file\n+b\n".to_string(),
+        synthetic_counts: None,
     };
-    let submit = submit_hunk_from_parsed(&missing);
+    let submit = submit_hunk_from_parsed(&missing, &neither_explicit);
+    assert!(!submit.old_len_explicit);
+    assert!(!submit.new_len_explicit);
     assert!(submit.is_missing_old_newline);
     assert!(!submit.is_missing_new_newline);
 
@@ -901,7 +917,7 @@ fn g1_hunk_and_change_conversion() {
         message: None,
     };
     let submit = submit_change_from_parsed(&change);
-    assert_eq!(submit.old_path, "o.txt");
+    assert_eq!(submit.old_path.as_deref(), Some("o.txt"));
     assert_eq!(submit.current_path, "n.txt");
     assert_eq!(submit.change_type, i64::from(diff_local::TYPE_MOVE_HERE));
     assert_eq!(submit.hunks.len(), 1);

@@ -310,3 +310,15 @@ fn land32_close_sends_string_revision_ids() {
     assert_eq!(id_param("123"), serde_json::json!("123"));
     assert_eq!(id_param("D123"), serde_json::json!("D123"));
 }
+
+#[test]
+fn land22_user_phid_reuses_handshake_identity() {
+    // T1153 LAND-22: `user_phid` answers from the cached handshake
+    // identity without a `user.whoami` call (no network here: the
+    // client points at an unroutable host, so a call would fail).
+    // Amend (`confirm_author`) and commit (`resolve_svn_user_phid`)
+    // share this helper, so both adopt the cache too.
+    let client = conduit::Client::new("https://conduit.test/", "api-test").unwrap();
+    client.set_authenticated_user("alice", "PHID-USER-1");
+    assert_eq!(user_phid(&client).unwrap(), "PHID-USER-1");
+}

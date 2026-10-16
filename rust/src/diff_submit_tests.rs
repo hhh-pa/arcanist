@@ -317,6 +317,9 @@ fn sample_change() -> DiffChange {
         new_offset: 1,
         old_length: 1,
         new_length: 2,
+        // T1153 EXPORT-E11: `@@ -1 +1,2 @@` spells only the new length.
+        old_len_explicit: false,
+        new_len_explicit: true,
         add_lines: 1,
         del_lines: 0,
         is_missing_old_newline: false,
@@ -406,11 +409,15 @@ fn change_defaults_match_php() {
 
 #[test]
 fn hunk_json_uses_verbatim_keys() {
+    // T1153 EXPORT-E11: offsets are strings; `@@ -3,7 +5,9 @@` spells
+    // both lengths, so both render as strings.
     let value = hunk_json(&DiffHunk {
         old_offset: 3,
         new_offset: 5,
         old_length: 7,
         new_length: 9,
+        old_len_explicit: true,
+        new_len_explicit: true,
         add_lines: 2,
         del_lines: 1,
         is_missing_old_newline: true,
@@ -420,10 +427,10 @@ fn hunk_json_uses_verbatim_keys() {
     assert_eq!(
         value,
         json!({
-            "oldOffset": 3,
-            "newOffset": 5,
-            "oldLength": 7,
-            "newLength": 9,
+            "oldOffset": "3",
+            "newOffset": "5",
+            "oldLength": "7",
+            "newLength": "9",
             "addLines": 2,
             "delLines": 1,
             "isMissingOldNewline": true,
@@ -431,6 +438,26 @@ fn hunk_json_uses_verbatim_keys() {
             "corpus": "body",
         })
     );
+}
+
+#[test]
+fn hunk_json_renders_omitted_lengths_as_int_one() {
+    // T1153 EXPORT-E11: `@@ -1 +1 @@` omits both lengths, so PHP
+    // substitutes integer 1 (`ArcanistDiffParser.php:922-933`) while
+    // offsets stay strings.
+    let value = hunk_json(&DiffHunk {
+        old_offset: 1,
+        new_offset: 1,
+        old_length: 1,
+        new_length: 1,
+        old_len_explicit: false,
+        new_len_explicit: false,
+        ..DiffHunk::default()
+    });
+    assert_eq!(value["oldOffset"], json!("1"));
+    assert_eq!(value["newOffset"], json!("1"));
+    assert_eq!(value["oldLength"], json!(1));
+    assert_eq!(value["newLength"], json!(1));
 }
 
 #[test]

@@ -3646,27 +3646,49 @@ fn empty_json_object(_: serde_json::Error) -> String {
 /// `json` pretty-prints the aggregate; `ugly` compacts it; `none` prints
 /// nothing. Failures exit `2` (`RESULT_FAIL`); successes exit `0`.
 fn run_cargo_selection(opts: &Options, cwd: &Path) -> ExitCode {
+    match run_cargo_collecting(opts, cwd) {
+        Ok((code, _)) => code,
+        Err(error) => error.report(),
+    }
+}
+
+/// [`run_cargo_selection`] that also returns the aggregate results as
+/// engine dicts, so `diff` can collect them (T1153 DIFF-D22).
+fn run_cargo_collecting(
+    opts: &Options,
+    cwd: &Path,
+) -> Result<(ExitCode, Vec<EngineUnitResult>), ClassifiedError> {
     // The `--everything` plus paths gate already ran in `plan_run`.
     if let Some(warning) = cargo_coverage_warning(opts) {
         eprintln!("{warning}");
     }
-    match execute(opts, cwd, None) {
-        Ok(report) => {
-            let format = output_format(opts);
-            print_cargo_output(&report, &format);
-            if let Err(msg) = upload_cargo_target(opts, &report) {
-                // T1153 R4 (UNIT-U5): upload failures are generic.
-                return conduit::report(EnvelopeKind::Exception, &msg);
-            }
-            if report.success {
-                ExitCode::SUCCESS
-            } else {
-                exit_code_for_overall(arc_rs::unit_engine::WORKFLOW_RESULT_FAIL)
-            }
-        }
-        // T1153 R4 (UNIT-U5): cargo failures are generic exceptions.
-        Err(msg) => conduit::report(EnvelopeKind::Exception, &msg),
+    // T1153 R4 (UNIT-U5): cargo and upload failures are generic.
+    let report = execute(opts, cwd, None).map_err(ClassifiedError::exception)?;
+    let format = output_format(opts);
+    print_cargo_output(&report, &format);
+    upload_cargo_target(opts, &report).map_err(ClassifiedError::exception)?;
+    let code = if report.success {
+        ExitCode::SUCCESS
+    } else {
+        exit_code_for_overall(arc_rs::unit_engine::WORKFLOW_RESULT_FAIL)
+    };
+    let results = cargo_aggregate_results(&report).map_err(ClassifiedError::exception)?;
+    Ok((code, results))
+}
+
+/// Cargo aggregate results as engine results (T1153 DIFF-D22): one
+/// pass/fail result named after the engine, like PHP's
+/// `getTestResults()` entries.
+fn cargo_aggregate_results(report: &EngineReport) -> Result<Vec<EngineUnitResult>, String> {
+    let mut out = Vec::with_capacity(report.results.len());
+    for result in &report.results {
+        let mut converted = EngineUnitResult::new();
+        converted.set_name(&result.name)?;
+        converted.set_result(result.outcome.as_str());
+        converted.set_duration(result.duration_secs);
+        out.push(converted);
     }
+    Ok(out)
 }
 
 /// Run one engine named by `--engine` or `unit.engine`.
@@ -3677,13 +3699,27 @@ fn run_single_selection(
     paths: &[String],
     ansi: bool,
 ) -> ExitCode {
+    match run_single_collecting(opts, cwd, class, paths, ansi) {
+        Ok((code, _)) => code,
+        Err(error) => error.report(),
+    }
+}
+
+/// [`run_single_selection`] that also returns the per-test results, so
+/// `diff` can collect them (T1153 DIFF-D22).
+fn run_single_collecting(
+    opts: &Options,
+    cwd: &Path,
+    class: &str,
+    paths: &[String],
+    ansi: bool,
+) -> Result<(ExitCode, Vec<EngineUnitResult>), ClassifiedError> {
     if !opts.cargo_args.is_empty() {
         // T1153 R4 (UNIT-U4): an invocation mistake (Rust-only; PHP
         // has no cargo engine), reported as usage.
-        return conduit::report(
-            EnvelopeKind::Usage,
-            "cargo test args after '--' require the cargo engine",
-        );
+        return Err(ClassifiedError::usage(
+            "cargo test args after '--' require the cargo engine".to_string(),
+        ));
     }
     let root = project_root_path(cwd);
     let root_string = root.to_string_lossy().replace('\\', "/");
@@ -3699,8 +3735,8 @@ fn run_single_selection(
         coverage,
         &runner,
     ) {
-        Ok(report) => finish_php_report(opts, &root, paths, &report, ansi, None),
-        Err(error) => error.report(),
+        Ok(report) => finish_php_report_collecting(opts, &root, paths, &report, ansi, None),
+        Err(error) => Err(error),
     }
 }
 
@@ -3712,12 +3748,26 @@ fn run_config_selection(
     paths: &[String],
     ansi: bool,
 ) -> ExitCode {
+    match run_config_collecting(opts, engines, root, paths, ansi) {
+        Ok((code, _)) => code,
+        Err(error) => error.report(),
+    }
+}
+
+/// [`run_config_selection`] that also returns the per-test results, so
+/// `diff` can collect them (T1153 DIFF-D22).
+fn run_config_collecting(
+    opts: &Options,
+    engines: &[PlannedEngine],
+    root: &Path,
+    paths: &[String],
+    ansi: bool,
+) -> Result<(ExitCode, Vec<EngineUnitResult>), ClassifiedError> {
     if !opts.cargo_args.is_empty() {
         // T1153 R4 (UNIT-U4): an invocation mistake (see above).
-        return conduit::report(
-            EnvelopeKind::Usage,
-            "cargo test args after '--' require the cargo engine",
-        );
+        return Err(ClassifiedError::usage(
+            "cargo test args after '--' require the cargo engine".to_string(),
+        ));
     }
     let root_string = root.to_string_lossy().replace('\\', "/");
     let runner = RealRunner;
@@ -3733,8 +3783,10 @@ fn run_config_selection(
         &runner,
         &resolve_php_prefix,
     ) {
-        Ok((report, echo)) => finish_php_report(opts, root, paths, &report, ansi, Some(&echo)),
-        Err(error) => error.report(),
+        Ok((report, echo)) => {
+            finish_php_report_collecting(opts, root, paths, &report, ansi, Some(&echo))
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -3742,14 +3794,16 @@ fn run_config_selection(
 /// set, and map the overall result to the process exit code
 /// (`ArcanistUnitWorkflow.php:184-282`). `echo` gates per-result lines
 /// (UNIT-U1): `None` echoes all (single runs), `Some` masks (config runs).
-fn finish_php_report(
+/// Also returns the per-test results, so `diff` can collect them (T1153
+/// DIFF-D22).
+fn finish_php_report_collecting(
     opts: &Options,
     project_root: &Path,
     paths: &[String],
     report: &ConfigReport,
     ansi: bool,
     echo: Option<&[bool]>,
-) -> ExitCode {
+) -> Result<(ExitCode, Vec<EngineUnitResult>), ClassifiedError> {
     let format = output_format(opts);
     let text = render_workflow_output_with_echo(
         &report.results,
@@ -3767,9 +3821,9 @@ fn finish_php_report(
             upload_results_for_options(opts, project_root, target, overall, &report.results)
     {
         // T1153 R4 (UNIT-U5): upload failures are generic.
-        return conduit::report(EnvelopeKind::Exception, &msg);
+        return Err(ClassifiedError::exception(msg));
     }
-    exit_code_for_overall(overall)
+    Ok((exit_code_for_overall(overall), report.results.clone()))
 }
 
 /// Upload through [`upload_results_with`] with the run's config overrides.
@@ -3894,6 +3948,49 @@ fn plan_run(opts: &Options, cwd: &Path) -> Result<PlannedRun, ClassifiedError> {
             })
         }
     }
+}
+
+/// Report of a collecting child unit run (T1153 DIFF-D22).
+#[derive(Debug, Clone)]
+pub struct ChildUnitReport {
+    /// Workflow exit code.
+    pub code: ExitCode,
+    /// Per-test results (`testResults`).
+    pub results: Vec<EngineUnitResult>,
+}
+
+/// Run unit as `diff`'s child in `cwd`, collecting test-result dicts
+/// (T1153 DIFF-D22: `runUnit()`,
+/// `src/workflow/ArcanistDiffWorkflow.php:1213-1278`). Renders and
+/// uploads like the standalone run; errors return unreported for the
+/// caller to map (`NoEffect` prints with exit 0, everything else
+/// aborts the diff, like PHP's child catches).
+pub fn run_in_collecting(cwd: &Path, argv: &[String]) -> Result<ChildUnitReport, ClassifiedError> {
+    let opts = match parse_options(argv) {
+        Ok(Some(opts)) => opts,
+        Ok(None) => {
+            print!("{USAGE}");
+            return Err(ClassifiedError::usage(
+                "unexpected --help in child unit argv".to_string(),
+            ));
+        }
+        // T1153 R4 (UNIT-U4): usage errors abort the diff unreported
+        // here (the caller renders them).
+        Err(message) => return Err(ClassifiedError::usage(message)),
+    };
+    let ansi = terminal::ansi_enabled();
+    let (code, results) = match plan_run(&opts, cwd)? {
+        PlannedRun::Cargo => run_cargo_collecting(&opts, cwd)?,
+        PlannedRun::Single { class, paths } => {
+            run_single_collecting(&opts, cwd, &class, &paths, ansi)?
+        }
+        PlannedRun::Config {
+            engines,
+            root,
+            paths,
+        } => run_config_collecting(&opts, &engines, &root, &paths, ansi)?,
+    };
+    Ok(ChildUnitReport { code, results })
 }
 
 pub fn run(argv: &[String]) -> ExitCode {

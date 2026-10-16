@@ -2247,9 +2247,11 @@ impl LintUnitReport {
 /// Outcome of a lint/unit child run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChildOutcome {
-    /// Workflow result code (`RESULT_OKAY`/`WARNINGS`/`ERRORS`/`SKIP` for
-    /// lint; `RESULT_OKAY`/`UNSOUND`/`FAIL`/`SKIP` for unit).
-    Code(i32),
+    /// Workflow result code plus message dicts (T1153 DIFF-D22):
+    /// `RESULT_OKAY`/`WARNINGS`/`ERRORS`/`SKIP` for lint with the
+    /// unresolved message dicts, `RESULT_OKAY`/`UNSOUND`/`FAIL`/`SKIP`
+    /// for unit with the test-result dicts.
+    Code(i32, Vec<serde_json::Value>),
     /// `ArcanistNoEngineException`: nothing is configured.
     NoEngine,
     /// `ArcanistNoEffectException`, with its message.
@@ -2286,18 +2288,31 @@ fn exit_code_value(code: std::process::ExitCode) -> i32 {
 /// (`lint::engine_for_dir` → "No lint engine is configured ...").
 const LINT_NO_ENGINE_PREFIX: &str = "No lint engine is configured";
 
+/// Map a collecting child's classified error (T1153 DIFF-D22):
+/// `NoEffect` prints with exit 0, everything else aborts the diff,
+/// like PHP's child catches.
+fn map_child_error(error: arc_rs::conduit::ClassifiedError) -> ChildOutcome {
+    if error.kind == arc_rs::conduit::EnvelopeKind::NoEffect {
+        ChildOutcome::NoEffect(error.message)
+    } else {
+        ChildOutcome::Failed(error.message)
+    }
+}
+
 /// Run `lint` in-process, mapping to a [`ChildOutcome`].
 ///
 /// `NoEngine` is probed via [`lint::engine_for_dir`]; anything else that
-/// fails before the workflow runs aborts. Result codes come from the
-/// workflow exit code verbatim.
-///
-/// Divergence: a workflow error inside `lint::run_in` (bad configuration
-/// surfacing late, patch-application failures) exits `FAILURE` and maps
-/// to `Code(1)` (`RESULT_WARNINGS`) instead of aborting: `run_in`
-/// cannot distinguish its own errors from result codes. Surfacing real
-/// errors needs a fallible lint entry point (lint owner).
+/// fails before the workflow runs aborts. The collecting run returns
+/// the result code plus unresolved message dicts (T1153 DIFF-D22);
+/// late workflow errors abort instead of masquerading as result codes.
 pub fn run_lint_in_process(cwd: &Path, argv: &[String]) -> ChildOutcome {
+    run_lint_in_process_with_amend(cwd, argv, false)
+}
+
+/// [`run_lint_in_process`] with diff's `shouldAmend()` (T1153 DIFF-D22:
+/// bare `setShouldAmendChanges()`, no argv form): applied patches
+/// prompt to amend HEAD, like PHP's child workflow.
+pub fn run_lint_in_process_with_amend(cwd: &Path, argv: &[String], amend: bool) -> ChildOutcome {
     match lint::engine_for_dir(cwd) {
         Ok(_) => {}
         Err(message) if message.starts_with(LINT_NO_ENGINE_PREFIX) => {
@@ -2305,22 +2320,38 @@ pub fn run_lint_in_process(cwd: &Path, argv: &[String]) -> ChildOutcome {
         }
         Err(message) => return ChildOutcome::Failed(message),
     }
-    ChildOutcome::Code(exit_code_value(lint::run_in(cwd, argv)))
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    match lint::run_child_collecting(
+        cwd,
+        argv,
+        amend,
+        &mut input,
+        arc_rs::prompt::stdin_is_terminal(),
+    ) {
+        Ok(report) => ChildOutcome::Code(report.code, report.unresolved),
+        Err(error) => map_child_error(error),
+    }
 }
 
-/// Run `unit` in-process, mapping to a [`ChildOutcome`].
+/// Run `unit` in-process in `cwd`, mapping to a [`ChildOutcome`]
+/// (T1153 DIFF-D22).
 ///
 /// `NoEngine` mirrors PHP's engine lookup (`--engine` never passes
 /// through from `diff`, so only `unit.engine` and `.arcunit` count).
-/// Same late-workflow-error caveat as [`run_lint_in_process`].
-///
-/// The caller must pass the process working directory: `unit::run` has
-/// no `cwd` parameter (a `unit::run_in` is unit-owner work).
+/// The collecting run returns the result code plus test-result dicts.
 pub fn run_unit_in_process(cwd: &Path, argv: &[String]) -> ChildOutcome {
     if unit::find_unit_engine_from(cwd).is_none() && unit::find_arcunit_from(cwd).is_none() {
         return ChildOutcome::NoEngine;
     }
-    ChildOutcome::Code(exit_code_value(unit::run(argv)))
+    match unit::run_in_collecting(cwd, argv) {
+        Ok(report) => {
+            let dicts = unit::results_to_json(&report.results);
+            let dicts = dicts.as_array().cloned().unwrap_or_default();
+            ChildOutcome::Code(exit_code_value(report.code), dicts)
+        }
+        Err(error) => map_child_error(error),
+    }
 }
 
 /// Background color for a lint/unit banner title.
@@ -2359,15 +2390,13 @@ fn write_banner_ansi(
 /// (git/hg); `set_flags` holds the user's set passthrough flags;
 /// `skip` is [`should_skip_lint`]; `run_child` executes the child (see
 /// [`run_lint_in_process`]). Notices and banners go to `out`. Returns
-/// the lint result, or `None` when no engine ran.
+/// the lint result (or `None` when no engine ran) plus the unresolved
+/// message dicts (T1153 DIFF-D22), which feed the `arc:lint` property.
 ///
-/// Divergence: `setShouldAmendChanges()` (bare, from `diff`'s
-/// `shouldAmend()`) has no argv form, so plain `arc diff` runs lint
-/// without amending; explicit `--amend-all` / `--amend-autofixes`
-/// pass through exactly. Unresolved message dictionaries are always
-/// empty: in-process runs return only the result code (a
-/// message-returning lint API is lint-owner work, and would also feed
-/// the `arc:lint` diff property).
+/// Amend intent rides the child runner (see
+/// [`run_lint_in_process_with_amend`]): bare, from `diff`'s
+/// `shouldAmend()`; explicit `--amend-all` / `--amend-autofixes` pass
+/// through exactly.
 pub fn run_lint<W: Write>(
     cwd: &Path,
     base: Option<&str>,
@@ -2375,7 +2404,7 @@ pub fn run_lint<W: Write>(
     skip: bool,
     run_child: &dyn Fn(&Path, &[String]) -> ChildOutcome,
     out: &mut W,
-) -> Result<Option<i32>, String> {
+) -> Result<(Option<i32>, Vec<serde_json::Value>), String> {
     run_lint_ansi(
         cwd,
         base,
@@ -2396,9 +2425,9 @@ pub fn run_lint_ansi<W: Write>(
     run_child: &dyn Fn(&Path, &[String]) -> ChildOutcome,
     out: &mut W,
     ansi: bool,
-) -> Result<Option<i32>, String> {
+) -> Result<(Option<i32>, Vec<serde_json::Value>), String> {
     if skip {
-        return Ok(Some(LINT_RESULT_SKIP));
+        return Ok((Some(LINT_RESULT_SKIP), Vec::new()));
     }
     let argv = lint_unit_argv(&passthru_argv("lint", set_flags), base);
     writeln!(out, "{LINTING}").map_err(|e| format!("failed to write output: {e}"))?;
@@ -2406,29 +2435,24 @@ pub fn run_lint_ansi<W: Write>(
         ChildOutcome::NoEngine => {
             writeln!(out, "{NO_LINT_ENGINE}")
                 .map_err(|e| format!("failed to write output: {e}"))?;
-            Ok(None)
+            Ok((None, Vec::new()))
         }
         ChildOutcome::NoEffect(message) => {
             writeln!(out, "{message}").map_err(|e| format!("failed to write output: {e}"))?;
-            Ok(None)
+            Ok((None, Vec::new()))
         }
         ChildOutcome::Failed(message) => Err(message),
-        ChildOutcome::Code(result) => {
+        ChildOutcome::Code(result, dicts) => {
             if let Some((title, detail)) = lint_result_notice(result) {
                 write_banner_ansi(out, title, detail, ansi)?;
             }
-            Ok(Some(result))
+            Ok((Some(result), dicts))
         }
     }
 }
 
 /// Run unit tests (`runUnit()`, `:1213-1278`).
 ///
-/// Shape mirrors [`run_lint`]; the `RESULT_UNSOUND` prompt reads from
-/// `input` (default no, like `phutil_console_confirm()` with its
-/// default `$default_no`), and declining aborts with [`USER_ABORT`].
-/// Test-result dictionaries are always
-/// empty (same in-process caveat as [`run_lint`]).
 /// Render a lint/unit output failure.
 fn write_output_error(error: std::io::Error) -> String {
     format!("failed to write output: {error}")
@@ -2457,6 +2481,14 @@ fn handle_unit_code_ansi<R: BufRead, W: Write>(
     Ok(Some(result))
 }
 
+/// Run unit tests (`runUnit()`, `:1213-1278`).
+///
+/// Shape mirrors [`run_lint`]; the `RESULT_UNSOUND` prompt reads from
+/// `input` (default no, like `phutil_console_confirm()` with its
+/// default `$default_no`), and declining aborts with [`USER_ABORT`].
+/// Returns the unit result (or `None` when no engine ran) plus the
+/// test-result dicts (T1153 DIFF-D22), which feed the `arc:unit`
+/// property.
 pub fn run_unit<R: BufRead, W: Write>(
     cwd: &Path,
     base: Option<&str>,
@@ -2465,7 +2497,7 @@ pub fn run_unit<R: BufRead, W: Write>(
     run_child: &dyn Fn(&Path, &[String]) -> ChildOutcome,
     input: &mut R,
     out: &mut W,
-) -> Result<Option<i32>, String> {
+) -> Result<(Option<i32>, Vec<serde_json::Value>), String> {
     run_unit_ansi(
         cwd,
         base,
@@ -2489,30 +2521,33 @@ pub fn run_unit_ansi<R: BufRead, W: Write>(
     input: &mut R,
     out: &mut W,
     ansi: bool,
-) -> Result<Option<i32>, String> {
+) -> Result<(Option<i32>, Vec<serde_json::Value>), String> {
     if skip {
-        return Ok(Some(UNIT_RESULT_SKIP));
+        return Ok((Some(UNIT_RESULT_SKIP), Vec::new()));
     }
     let argv = lint_unit_argv(&passthru_argv("unit", set_flags), base);
     write_unit_line(out, RUNNING_UNIT_TESTS)?;
     match run_child(cwd, &argv) {
         ChildOutcome::NoEngine => {
             write_unit_line(out, NO_UNIT_ENGINE)?;
-            Ok(None)
+            Ok((None, Vec::new()))
         }
         ChildOutcome::NoEffect(message) => {
             write_unit_line(out, &message)?;
-            Ok(None)
+            Ok((None, Vec::new()))
         }
         ChildOutcome::Failed(message) => Err(message),
-        ChildOutcome::Code(result) => handle_unit_code_ansi(input, out, result, ansi),
+        ChildOutcome::Code(result, dicts) => {
+            let code = handle_unit_code_ansi(input, out, result, ansi)?;
+            Ok((code, dicts))
+        }
     }
 }
 
 /// Run lint and unit together (`runLintUnit()`, `:1131-1140`).
 ///
-/// Returns the combined [`LintUnitReport`] (dictionaries always empty;
-/// see [`run_lint`]).
+/// Returns the combined [`LintUnitReport`] with collected message
+/// dicts (T1153 DIFF-D22).
 #[allow(clippy::too_many_arguments)]
 pub fn run_lint_unit<R: BufRead, W: Write>(
     cwd: &Path,
@@ -2556,8 +2591,9 @@ pub fn run_lint_unit_ansi<R: BufRead, W: Write>(
     out: &mut W,
     ansi: bool,
 ) -> Result<LintUnitReport, String> {
-    let lint_result = run_lint_ansi(cwd, base, lint_flags, skip_lint, run_lint_child, out, ansi)?;
-    let unit_result = run_unit_ansi(
+    let (lint_result, unresolved_lint) =
+        run_lint_ansi(cwd, base, lint_flags, skip_lint, run_lint_child, out, ansi)?;
+    let (unit_result, test_results) = run_unit_ansi(
         cwd,
         base,
         unit_flags,
@@ -2569,9 +2605,9 @@ pub fn run_lint_unit_ansi<R: BufRead, W: Write>(
     )?;
     Ok(LintUnitReport {
         lint_result,
-        unresolved_lint: Vec::new(),
+        unresolved_lint,
         unit_result,
-        test_results: Vec::new(),
+        test_results,
     })
 }
 
@@ -2928,6 +2964,13 @@ pub struct ParsedHunk {
     /// (EXPORT-E12): CRLF diffs keep `\r\n`, and an unterminated final
     /// line stays unterminated, exactly as PHP's `$real` accumulation.
     pub corpus: String,
+    /// Pre-rewrite `(add_lines, del_lines)` for synthetic hunks (T1153
+    /// EXPORT-E20): `loadSyntheticData()`
+    /// (`ArcanistDiffParser.php:1269-1280`) rewrites the corpus (`+` to
+    /// context) but attaches the hunk with its parsed counts, so the
+    /// wire keeps the add-side counts beside the context corpus.
+    /// `None` for ordinary hunks (counts come from the corpus).
+    pub synthetic_counts: Option<(u64, u64)>,
 }
 
 /// Whether the `,length` parts of one hunk header were explicit
@@ -3220,6 +3263,61 @@ pub fn without_message_changes(changes: &[ParsedChange]) -> Vec<ParsedChange> {
         .collect()
 }
 
+/// Added/deleted counts plus missing-newline flags for one hunk corpus.
+///
+/// Port of the `parseChangeset()` body loop (`ArcanistDiffParser.php:939-997`,
+/// T1153 EXPORT-E15): `+`/`-` lines decrement the remaining lengths, a `\ No
+/// newline at end of file` marker flags the old side while new lines remain
+/// and the new side once exhausted (ending the hunk), and `-` past exhaustion
+/// or anything else ends the hunk. Both `toDictionary` renderers (submit and
+/// bundle) share this so the flags agree with the parser; corpora are
+/// pre-validated body-only text (EXPORT-E10/E15), so saturating and exact
+/// countdowns coincide.
+#[must_use]
+pub fn hunk_stats(corpus: &str, old_len: u64, new_len: u64) -> (u64, u64, bool, bool) {
+    let mut add = 0;
+    let mut del = 0;
+    let mut missing_old = false;
+    let mut missing_new = false;
+    let mut old_left = old_len;
+    let mut new_left = new_len;
+    for line in corpus.lines() {
+        if line.starts_with("\\ No newline at end of file") {
+            if new_left > 0 {
+                missing_old = true;
+            } else {
+                missing_new = true;
+            }
+            if new_left == 0 {
+                break;
+            }
+            continue;
+        }
+        match line.as_bytes().first().copied().unwrap_or(b' ') {
+            b'+' => {
+                add += 1;
+                new_left = new_left.saturating_sub(1);
+            }
+            b'-' => {
+                if old_left == 0 {
+                    break;
+                }
+                del += 1;
+                old_left -= 1;
+            }
+            b' ' => {
+                if old_left == 0 && new_left == 0 {
+                    break;
+                }
+                old_left = old_left.saturating_sub(1);
+                new_left = new_left.saturating_sub(1);
+            }
+            _ => break,
+        }
+    }
+    (add, del, missing_old, missing_new)
+}
+
 /// Synthetic hunks fabricated for one pure move/copy, à la
 /// `loadSyntheticData()` (EXPORT-E20).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3228,23 +3326,39 @@ pub struct SyntheticHunks {
     pub file_type: u32,
     /// Fabricated hunks (`+` rewritten to context).
     pub hunks: Vec<ParsedHunk>,
+    /// `,length` explicitness per hunk, parallel to `hunks` (T1153
+    /// EXPORT-E11/E20: the reparse headers spell the bits).
+    pub hunk_len_explicit: Vec<HunkLenExplicit>,
 }
 
 /// True when `change` needs `loadSyntheticData()` fabrication: a
-/// hunkless move/copy target (the `:599-616` early return, EXPORT-E20).
+/// hunkless move/copy target (the `:599-616` early return, EXPORT-E20),
+/// or the hunkless move-away companion PHP flags alongside it
+/// (`$move_source`, `:612-615`; the flag persists when later folds
+/// retype the companion to `TYPE_MULTICOPY`). Copy-away companions are
+/// never flagged.
 ///
 /// PHP also flags hunkless adds/deletes, but fabricating those is a
 /// no-op (an empty file reparse yields no hunks), so the predicate
-/// covers only renames and copies. Moves and copies can only come
-/// from git header lines, so svn/hg blocks never match.
+/// covers only renames, copies, and their move companions. Moves and
+/// copies can only come from git header lines, so svn/hg blocks never
+/// match (T1153 EXPORT-E20).
 #[must_use]
 pub fn needs_synthetic_git_hunks(change: &ParsedChange) -> bool {
-    matches!(change.change_type, TYPE_MOVE_HERE | TYPE_COPY_HERE) && change.hunks.is_empty()
+    if !change.hunks.is_empty() {
+        return false;
+    }
+    matches!(
+        change.change_type,
+        TYPE_MOVE_HERE | TYPE_COPY_HERE | TYPE_MOVE_AWAY | TYPE_MULTICOPY
+    )
 }
 
 /// Rewrite one hunk's added lines to context (`preg_replace('/^\+/m',
-/// ' ', ...)`).
+/// ' ', ...)`), keeping the parsed counts (T1153 EXPORT-E20: PHP
+/// attaches the rewritten hunk with its original add/del counts).
 fn rewrite_synthetic_hunk(hunk: &ParsedHunk) -> ParsedHunk {
+    let (adds, dels, _, _) = hunk_stats(&hunk.corpus, hunk.old_len, hunk.new_len);
     let corpus: String = hunk
         .corpus
         .split_inclusive('\n')
@@ -3262,6 +3376,7 @@ fn rewrite_synthetic_hunk(hunk: &ParsedHunk) -> ParsedHunk {
         new_start: hunk.new_start,
         new_len: hunk.new_len,
         corpus,
+        synthetic_counts: Some((adds, dels)),
     }
 }
 
@@ -3283,10 +3398,250 @@ pub fn synthetic_hunks_for_path(
             return Ok(Some(SyntheticHunks {
                 file_type: change.file_type,
                 hunks,
+                hunk_len_explicit: change.hunk_len_explicit.clone(),
             }));
         }
     }
     Ok(None)
+}
+
+/// Added/deleted counts for one hunk: the pre-rewrite counts for
+/// synthetic hunks (T1153 EXPORT-E20), else the shared length-driven
+/// loop (T1153 EXPORT-E15).
+#[must_use]
+pub fn hunk_counts(hunk: &ParsedHunk) -> (u64, u64) {
+    if let Some(counts) = hunk.synthetic_counts {
+        return counts;
+    }
+    let (adds, dels, _, _) = hunk_stats(&hunk.corpus, hunk.old_len, hunk.new_len);
+    (adds, dels)
+}
+
+/// Companion type after folding one copy onto `existing` (T1153
+/// EXPORT-E14): a copy onto a move-away folds to multicopy, anything
+/// else (fresh included) lands copy-away
+/// (`ArcanistDiffParser.php:654-666`).
+fn copy_folded_type(existing: u32) -> u32 {
+    if existing == TYPE_MOVE_AWAY {
+        TYPE_MULTICOPY
+    } else {
+        TYPE_COPY_AWAY
+    }
+}
+
+/// Companion type after folding one move onto `existing` (T1153
+/// EXPORT-E14): moves accumulate to multicopy
+/// (`ArcanistDiffParser.php:668-687`).
+fn move_folded_type(existing: u32) -> u32 {
+    // The `:673-681` arms collapse: multicopy stays, away folds up,
+    // fresh lands move-away.
+    if existing == TYPE_MULTICOPY || existing == TYPE_MOVE_AWAY || existing == TYPE_COPY_AWAY {
+        TYPE_MULTICOPY
+    } else {
+        TYPE_MOVE_AWAY
+    }
+}
+
+/// One folded move/copy-away companion: the old path, its folded type,
+/// and the here-paths pointing at it (`addAwayPath()`, `:665-686`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AwayCompanion {
+    /// Folded `TYPE_*` (away or multicopy).
+    pub change_type: u32,
+    /// The old path (the companion's current path).
+    pub current_path: String,
+    /// Here-paths, in fold order.
+    pub away_paths: Vec<String>,
+}
+
+/// Stateful fold of here-changes into away companions (T1153 EXPORT-E14),
+/// mirroring PHP's keyed `buildChange($oldPath)` reuse
+/// (`ArcanistDiffParser.php:654-687`): the first here-change for an old
+/// path creates the companion, later ones retype it and extend its away
+/// paths. Shared by the submit and bundle emitters so both agree.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompanionFold {
+    /// Companions in first-reference order.
+    companions: Vec<AwayCompanion>,
+    /// Old path to companion slot.
+    index: std::collections::HashMap<String, usize>,
+}
+
+impl CompanionFold {
+    /// Empty fold.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold one here-change (`TYPE_MOVE_HERE`/`TYPE_COPY_HERE` with its
+    /// old and current paths). Returns the companion slot plus whether
+    /// the companion is new (emit it) or existing (update the emitted
+    /// copy: retype plus the extended away paths).
+    pub fn fold(&mut self, here_type: u32, old_path: &str, current_path: &str) -> (usize, bool) {
+        if let Some(&at) = self.index.get(old_path) {
+            let companion = &mut self.companions[at];
+            companion.change_type = if here_type == TYPE_COPY_HERE {
+                copy_folded_type(companion.change_type)
+            } else {
+                move_folded_type(companion.change_type)
+            };
+            companion.away_paths.push(current_path.to_string());
+            return (at, false);
+        }
+        // Fresh `ArcanistDiffChange` defaults to `TYPE_CHANGE`
+        // (`ArcanistDiffChange.php:18-19`).
+        let change_type = if here_type == TYPE_COPY_HERE {
+            copy_folded_type(TYPE_CHANGE)
+        } else {
+            move_folded_type(TYPE_CHANGE)
+        };
+        let at = self.companions.len();
+        self.companions.push(AwayCompanion {
+            change_type,
+            current_path: old_path.to_string(),
+            away_paths: vec![current_path.to_string()],
+        });
+        self.index.insert(old_path.to_string(), at);
+        (at, true)
+    }
+
+    /// The companion at `slot` (from [`CompanionFold::fold`]).
+    #[must_use]
+    pub fn companion(&self, slot: usize) -> &AwayCompanion {
+        &self.companions[slot]
+    }
+}
+
+/// True for away/multicopy companion types (T1153 EXPORT-E14).
+#[must_use]
+pub fn is_companion_type(change_type: u32) -> bool {
+    matches!(
+        change_type,
+        TYPE_MOVE_AWAY | TYPE_COPY_AWAY | TYPE_MULTICOPY
+    )
+}
+
+/// True when `change` is a here-change needing a companion: a
+/// move/copy-here with a usable old path distinct from the current one.
+fn needs_companion(change: &ParsedChange) -> bool {
+    matches!(change.change_type, TYPE_MOVE_HERE | TYPE_COPY_HERE)
+        && !change.old_path.is_empty()
+        && change.old_path != change.current_path
+}
+
+/// True when `changes` already carry an away companion for `old_path`
+/// (the Subversion collector emits its own via
+/// [`apply_svn_copy_info`]).
+fn has_companion(changes: &[ParsedChange], old_path: &str) -> bool {
+    changes
+        .iter()
+        .any(|change| change.current_path == old_path && is_companion_type(change.change_type))
+}
+
+/// Fresh away companion as a parsed change (T1153 EXPORT-E14): a bare
+/// `ArcanistDiffChange` (null old path, text file, no hunks/modes) with
+/// the folded type and away paths.
+fn companion_change(companion: &AwayCompanion) -> ParsedChange {
+    ParsedChange {
+        old_path: String::new(),
+        current_path: companion.current_path.clone(),
+        change_type: companion.change_type,
+        file_type: FILE_TEXT,
+        hunks: Vec::new(),
+        hunk_len_explicit: Vec::new(),
+        old_mode: None,
+        new_mode: None,
+        away_paths: companion.away_paths.clone(),
+        commit_hash: None,
+        message: None,
+    }
+}
+
+/// Parsed changes plus their folded away companions (T1153 EXPORT-E14).
+///
+/// Each companion lands right after its first here-change (PHP's
+/// insertion order), already-folded repeats merge into it, and
+/// here-changes the Subversion collector already paired are left alone
+/// (idempotent). Callers that need synthetic content run
+/// [`attach_synthetic_git_hunks`] on the result.
+#[must_use]
+pub fn with_companions(changes: &[ParsedChange]) -> Vec<ParsedChange> {
+    let mut fold = CompanionFold::new();
+    // Companion slot to output position, for merged updates.
+    let mut slots: Vec<usize> = Vec::new();
+    let mut out: Vec<ParsedChange> = Vec::with_capacity(changes.len());
+    for change in changes {
+        out.push(change.clone());
+        if !needs_companion(change) || has_companion(changes, &change.old_path) {
+            continue;
+        }
+        let (slot, is_new) = fold.fold(change.change_type, &change.old_path, &change.current_path);
+        if is_new {
+            slots.push(out.len());
+            out.push(companion_change(fold.companion(slot)));
+        } else if let Some(&at) = slots.get(slot) {
+            out[at].change_type = fold.companion(slot).change_type;
+            out[at].away_paths = fold.companion(slot).away_paths.clone();
+        }
+    }
+    out
+}
+
+/// Raw diff text of `path` without move detection (T1153 EXPORT-E20).
+///
+/// PHP: `ArcanistGitAPI::getRawDiffText()`
+/// (`src/repository/api/ArcanistGitAPI.php:499-507`): the full diff
+/// options minus `-M`/`-C`, base commit only (no head: the worktree is
+/// always the other side), scoped to `path`.
+pub fn get_raw_diff_text(dir: &Path, base: &str, path: &str) -> Result<String, String> {
+    let mut options: Vec<String> = DIFF_BASE_OPTIONS
+        .iter()
+        .map(|option| (*option).to_string())
+        .collect();
+    options.push("--no-color".to_string());
+    options.push("--src-prefix=a/".to_string());
+    options.push("--dst-prefix=b/".to_string());
+    options.push(format!("-U{}", DEFAULT_DIFF_CONTEXT_LINES));
+    let mut args: Vec<&str> = Vec::with_capacity(options.len() + 5);
+    args.extend_from_slice(DIFF_CONFIG_OPTIONS);
+    args.push("diff");
+    args.extend(options.iter().map(String::as_str));
+    args.push(base);
+    args.push("--");
+    args.push(path);
+    let out = crate::git::output(dir, &args)?;
+    if !out.status.success() {
+        return Err(format!(
+            "git diff failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Attach fabricated hunks to every change needing them (T1153
+/// EXPORT-E20: `loadSyntheticData()`, `:1237-1289`). `raw_diff_for`
+/// re-diffs one path without move detection (see
+/// [`get_raw_diff_text`]); paths with no reparse match keep no hunks,
+/// like PHP. Runs after [`with_companions`] so move-away companions
+/// gain their delete-side hunks too.
+pub fn attach_synthetic_git_hunks(
+    changes: &mut [ParsedChange],
+    raw_diff_for: &dyn Fn(&str) -> Result<String, String>,
+) -> Result<(), String> {
+    for change in changes.iter_mut() {
+        if !needs_synthetic_git_hunks(change) {
+            continue;
+        }
+        let raw = raw_diff_for(&change.current_path)?;
+        if let Some(made) = synthetic_hunks_for_path(&raw, &change.current_path)? {
+            change.file_type = made.file_type;
+            change.hunks = made.hunks;
+            change.hunk_len_explicit = made.hunk_len_explicit;
+        }
+    }
+    Ok(())
 }
 
 fn body_is_empty(body: &[String]) -> bool {
@@ -4296,6 +4651,9 @@ fn collect_hunk(
         new_start: header.new_start,
         new_len: header.new_len,
         corpus,
+        // Ordinary parsed hunks count from the corpus (T1153 EXPORT-E20:
+        // only synthetic rewrites carry pre-rewrite counts).
+        synthetic_counts: None,
     };
     Ok((hunk, index))
 }

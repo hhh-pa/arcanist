@@ -12,9 +12,6 @@
 //!
 //! Divergences from PHP (all deliberate):
 //!
-//! - `askForRepositoryUpdate` (the advisory `diffusion.looksoon` hint) is
-//!   skipped: arc-rs cannot resolve the repository PHID yet, the same
-//!   known limit `close_revision` documents.
 //! - Banners and prompts render as plain text through `land::console_confirm`
 //!   (the `phutil_console_confirm` port); prompt queries and error
 //!   sentences keep the PHP wording.
@@ -690,6 +687,23 @@ fn svn_commit_file_list(
     Ok(files)
 }
 
+/// Ask Phabricator to pick up the push soon (T1153 COMMIT-C3):
+/// `askForRepositoryUpdate()` (`ArcanistWorkflow.php:2218-2235`) sends
+/// an advisory `diffusion.looksoon` for the working copy's repository.
+/// Fully best-effort: repository-resolution failures are swallowed
+/// like the nudge itself (the commit already landed, so failing here
+/// would report failure for a success), matching
+/// [`finalize_revision`]'s untracked swallowing.
+fn ask_for_repository_update(client: &Client, dir: &Path) {
+    let Ok(Some(phid)) = close_revision::resolve_repository_phid(client, dir) else {
+        return;
+    };
+    let _ = client.call(
+        "diffusion.looksoon",
+        &serde_json::json!({"repositories": [phid]}),
+    );
+}
+
 /// Close the committed revision softly, like the `close-revision
 /// --finalize` child workflow (`:168-174`). `--finalize` never prompts.
 fn finalize_revision(
@@ -745,6 +759,9 @@ fn flow_svn(
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
     }
+    // T1153 COMMIT-C3: the advisory nudge runs after the commit and
+    // before the finalize child (`:165-174`).
+    ask_for_repository_update(&target.client, dir);
     out.push_str(&finalize_revision(&target.client, options, dir, target.id)?);
     Ok(out)
 }
