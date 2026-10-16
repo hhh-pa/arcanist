@@ -63,9 +63,17 @@ via API with reason `false positive` and this rationale.
   release would make the test replace its own binary). Removed
   from the integration suite; apply paths stay covered by the
   hermetic `upgrade_tests`; `run` docs warn against re-adding.
+- Post-merge default-branch analysis filed two new
+  `go/unsafe-unzip-symlink` alerts (14, 15): that query credits
+  no lexical barrier, only a header-derived path reaching
+  `filepath.EvalSymlinks`. Link creation now gates on
+  `resolvesWithinDir` (lenient resolution + containment in the
+  resolved dest), which also catches redirects planted on disk
+  by earlier entries.
 
 ## Slices
 
 1. Spec (this file). 2. Go extractor + tests. 3. Workflow
    permissions. 4. Dismissals. 5. Push, PR, verify 0 open.
-6. Inline extractor form + hermetic upgrade test (this section).
+6. Inline extractor form + hermetic upgrade test.
+7. Real link resolution (this section).
