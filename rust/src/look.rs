@@ -56,6 +56,18 @@ pub const TITLE: &str = "Arcventure";
 ///
 /// Returns `Ok(None)` when `--help` was requested.
 pub fn parse_args(argv: &[String]) -> Result<Option<Vec<String>>, String> {
+    parse_args_with_tty(argv, crate::prompt::stdin_is_terminal())
+}
+
+/// [`parse_args`] with an injected TTY flag (deterministic tests).
+/// T1153 B21/B23: piped runs without `--` fail with
+/// `MISSING_TERMINATOR` (checked after unknown-flag scanning, like
+/// PHP's `parseFull()`, but before success). `--help` without `--`
+/// when piped reports the terminator. Vs ceb
+/// `ArcanistRuntime.php:80-86,172-188` and
+/// `PhutilArgumentParser.php:331-336`.
+fn parse_args_with_tty(argv: &[String], stdin_tty: bool) -> Result<Option<Vec<String>>, String> {
+    let missing = crate::help::terminator_missing(argv, stdin_tty);
     let mut thing = Vec::new();
     let mut end_of_flags = false;
     for arg in argv {
@@ -64,12 +76,18 @@ pub fn parse_args(argv: &[String]) -> Result<Option<Vec<String>>, String> {
         } else if arg == "--" {
             end_of_flags = true;
         } else if arg == "--help" || arg == "-h" {
+            if missing {
+                return Err(crate::help::MISSING_TERMINATOR.to_string());
+            }
             return Ok(None);
         } else if arg.starts_with('-') {
             return Err(format!("unknown flag '{arg}'"));
         } else {
             thing.push(arg.clone());
         }
+    }
+    if missing {
+        return Err(crate::help::MISSING_TERMINATOR.to_string());
     }
     Ok(Some(thing))
 }
@@ -1519,6 +1537,11 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(msg) => {
+            // T1153 B21/B23: the terminator failure prints the three
+            // cyan hints first (like `ArcanistRuntime.php:172-188`).
+            if msg == crate::help::MISSING_TERMINATOR {
+                crate::help::print_terminator_hints(terminal::ansi_enabled());
+            }
             // T1153 RB-D4 (R4): toolset parser errors render the red
             // `USAGE EXCEPTION` label with no usage dump.
             return conduit::report(EnvelopeKind::ToolsetUsage, &msg);

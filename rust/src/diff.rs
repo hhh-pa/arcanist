@@ -41,7 +41,9 @@ use arc_rs::{
 /// Subcommand name, matching `arc diff`.
 pub const NAME: &str = "diff";
 
-const USAGE: &str = "usage: arc diff [--message MSG] [--message-file FILE] [--edit] [--raw] [--raw-command CMD] [--create | --update ID] [--draft] [--nounit] [--nolint] [--only] [--allow-untracked] [--apply-patches | --never-apply-patches] [--amend-all] [--amend-autofixes] [-a] [--json] [--no-amend] [--uncommitted] [--verbatim] [--reviewers NAMES] [--cc NAMES] [--skip-binaries] [--skip-staging] [--base REV] [--coverage | --no-coverage] [--browse] [--head REV] [--conduit-uri URI] [commit]\n";
+fn usage() -> String {
+    help_text(crate::terminal::ansi_enabled())
+}
 
 /// Parsed `diff` options.
 ///
@@ -2285,7 +2287,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(msg) => {
-            eprintln!("arc diff: {msg}\n\n{USAGE}");
+            eprintln!("arc diff: {msg}\n\n{}", usage());
             return ExitCode::FAILURE;
         }
     };

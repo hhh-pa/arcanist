@@ -152,7 +152,8 @@ fn alias_command_is_registered() {
     let Some(run) = run else {
         panic!("alias is not registered");
     };
-    assert_eq!(run(&args(&["--help"])), ExitCode::SUCCESS);
+    // T1153 B21/B23: piped runs carry `--`.
+    assert_eq!(run(&args(&["--help", "--"])), ExitCode::SUCCESS);
 }
 
 #[test]

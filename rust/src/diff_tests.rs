@@ -762,6 +762,7 @@ fn merge_help_text_combines_usage_and_full_help() {
     let text = help_text(false);
     assert!(text.starts_with("DIFF WORKFLOW\n"), "{text:?}");
     assert!(text.contains("Supports: git, svn, hg"), "{text:?}");
+    assert!(text.contains("--verbatim"), "{text:?}");
 }
 
 #[test]
@@ -3338,4 +3339,29 @@ fn r10_diff_help_matches_generated_format() {
     assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
     // `run()` prints the same text with ambient ANSI mode.
     assert!(help_text(crate::terminal::ansi_enabled()).contains("DIFF WORKFLOW"));
+}
+
+#[test]
+fn b21_diff_needs_no_terminator() {
+    // T1153 B21/B23 VERIFIED for `diff`: it is a classic workflow,
+    // so PHP runs it via the `scripts/arcanist.php` re-exec, which
+    // never requires `--`. Parsing takes no TTY input, so
+    // piped-style argv parses directly, and `--help` without `--`
+    // still succeeds.
+    assert!(parse_options(&args(&["--verbatim"])).unwrap().is_some());
+    assert_eq!(parse_options(&args(&["--help"])).unwrap(), None);
+    let text = help_text(false);
+    assert!(text.contains("DIFF WORKFLOW"), "{text}");
+}
+
+#[test]
+fn b23_diff_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help diff`.
+    let text = help_text(false);
+    assert!(text.starts_with("DIFF WORKFLOW\n"), "{text}");
+    assert!(text.contains("--reviewers"), "{text}");
+    assert!(text.contains("--base"), "{text}");
+    let ansi = help_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }

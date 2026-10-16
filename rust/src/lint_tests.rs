@@ -2559,3 +2559,31 @@ fn r10_lint_help_matches_generated_format() {
     // `run()` prints `usage()` (same text, ambient ANSI mode).
     assert!(usage().contains("LINT WORKFLOW"), "{}", usage());
 }
+
+#[test]
+fn b21_lint_needs_no_terminator() {
+    // T1153 B21/B23 VERIFIED for `lint`: it is a classic workflow,
+    // so PHP runs it via the `scripts/arcanist.php` re-exec, which
+    // never requires `--`. Parsing takes no TTY input, so
+    // piped-style argv parses directly, and `--help` without `--`
+    // still succeeds.
+    assert!(matches!(
+        parse_args(&args(&["--lintall"])),
+        ParseOutcome::Args(_)
+    ));
+    assert!(matches!(parse_args(&args(&["--help"])), ParseOutcome::Help));
+    let text = usage_text(false);
+    assert!(text.contains("LINT WORKFLOW"), "{text}");
+}
+
+#[test]
+fn b23_lint_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help lint`.
+    let text = usage_text(false);
+    assert!(text.starts_with("LINT WORKFLOW\n"), "{text}");
+    assert!(text.contains("Run static analysis on changes"), "{text}");
+    assert!(text.contains("--severity"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+}

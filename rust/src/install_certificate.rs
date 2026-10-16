@@ -29,21 +29,6 @@ use arc_rs::{conduit, config, diff_submit, get_config, prompt, terminal};
 /// Subcommand name, matching `arc install-certificate`.
 pub const NAME: &str = "install-certificate";
 
-const USAGE: &str = "usage: arc install-certificate [URI] [--conduit-uri URI] [--token TOKEN] [--force] [--config K=V] [--config-file FILE] [--arcrc-file FILE]\n\
-\n\
-Install Conduit credentials into ~/.arcrc for URI. Without URI, the URI\n\
-comes from --conduit-uri, $ARC_CONDUIT_URI, or the merged configuration.\n\
-Without --token, the token is read from stdin after printing the login page.\n\
-\n\
-Options:\n\
-  --conduit-uri URI   Conduit server URI (under the positional URI).\n\
-  --token TOKEN       API token (else prompt via stdin).\n\
-  --force             Install standard api- tokens without prompting.\n\
-  --config K=V        Runtime value (repeatable).\n\
-  --config-file F     Read F instead of the system/user files (repeatable).\n\
-  --arcrc-file F      Read/write credentials at F instead of ~/.arcrc.\n\
-  -h, --help          Show this help.\n";
-
 /// T1153 R10: `--help` renders the generated workflow help
 /// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
 /// not the short usage line. The renderer is the shared
@@ -862,7 +847,7 @@ fn install_options(argv: &[String]) -> Result<Options, ExitCode> {
             Err(ExitCode::SUCCESS)
         }
         Err(message) => {
-            eprintln!("arc {NAME}: {message}\n\n{USAGE}");
+            eprintln!("arc {NAME}: {message}\n\n{}", usage());
             Err(ExitCode::FAILURE)
         }
     }

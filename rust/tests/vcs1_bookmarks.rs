@@ -78,7 +78,8 @@ fn run_uses_current_dir() {
     let dir = Fixture::named("run-contract");
     let old = std::env::current_dir().unwrap();
     std::env::set_current_dir(dir.path()).unwrap();
-    let code = bookmarks::run(&args(&["--help"]));
+    // T1153 B21/B23: piped runs carry `--`.
+    let code = bookmarks::run(&args(&["--help", "--"]));
     std::env::set_current_dir(&old).unwrap();
     assert_eq!(code, ExitCode::SUCCESS);
 }
@@ -86,11 +87,12 @@ fn run_uses_current_dir() {
 #[test]
 fn help_succeeds_and_prints_usage() {
     let empty = Fixture::named("help");
-    let out = bookmarks::execute(empty.path(), &args(&["--help"])).unwrap();
-    // T1153 R10: `--help` renders the generated workflow help.
+    // T1153 B21/B23: piped runs carry `--`; `--help` renders the
+    // generated workflow help.
+    let out = bookmarks::execute(empty.path(), &args(&["--help", "--"])).unwrap();
     assert!(out.contains("BOOKMARKS WORKFLOW"), "unexpected: {out}");
     assert_eq!(
-        bookmarks::run_in(empty.path(), &args(&["--help"])),
+        bookmarks::run_in(empty.path(), &args(&["--help", "--"])),
         ExitCode::SUCCESS
     );
 }
@@ -99,17 +101,18 @@ fn help_succeeds_and_prints_usage() {
 fn git_working_copy_reports_no_bookmark_support() {
     let repo = Fixture::init_repo("git-nosupport");
     // Matches the `arc bookmarks` error under git.
-    let err = bookmarks::execute(repo.path(), &args(&[])).unwrap_err();
+    // T1153 B21/B23: piped runs carry `--`.
+    let err = bookmarks::execute(repo.path(), &args(&["--"])).unwrap_err();
     assert!(
         err.contains("does not support bookmarks"),
         "unexpected: {err}"
     );
     assert!(err.contains("\"git\""), "unexpected: {err}");
     assert_eq!(
-        bookmarks::run_in(repo.path(), &args(&[])),
+        bookmarks::run_in(repo.path(), &args(&["--"])),
         ExitCode::FAILURE
     );
-    let err = bookmarks::execute(repo.path(), &args(&["--json"])).unwrap_err();
+    let err = bookmarks::execute(repo.path(), &args(&["--json", "--"])).unwrap_err();
     assert!(
         err.contains("does not support bookmarks"),
         "unexpected: {err}"
@@ -132,13 +135,14 @@ fn list_under_git_reports_no_bookmark_support() {
 fn outside_any_working_copy_fails() {
     let empty = Fixture::named("notrepo");
     assert_eq!(bookmarks::find_hg_root(empty.path()), None);
-    let err = bookmarks::execute(empty.path(), &args(&[])).unwrap_err();
+    // T1153 B21/B23: piped runs carry `--`.
+    let err = bookmarks::execute(empty.path(), &args(&["--"])).unwrap_err();
     assert!(
         err.contains("not inside a working copy"),
         "unexpected: {err}"
     );
     assert_eq!(
-        bookmarks::run_in(empty.path(), &args(&[])),
+        bookmarks::run_in(empty.path(), &args(&["--"])),
         ExitCode::FAILURE
     );
 }
@@ -156,9 +160,13 @@ fn missing_hg_binary_fails() {
         bookmarks::find_hg_root(broken.path()),
         Some(broken.path().to_path_buf())
     );
-    let err =
-        bookmarks::execute_with_binary(broken.path(), &args(&[]), "arc-rs-definitely-missing-hg")
-            .unwrap_err();
+    // T1153 B21/B23: piped runs carry `--`.
+    let err = bookmarks::execute_with_binary(
+        broken.path(),
+        &args(&["--"]),
+        "arc-rs-definitely-missing-hg",
+    )
+    .unwrap_err();
     assert!(err.contains("failed to run"), "unexpected: {err}");
 }
 
@@ -174,9 +182,12 @@ fn hg_root_is_found_from_a_subdirectory() {
 #[test]
 fn bad_flags_fail() {
     let empty = Fixture::named("flags");
+    // T1153 B21/B23: unknown flags report before the terminator check,
+    // so no `--` is needed for these; positionals need `--` to reach
+    // validation.
     let err = bookmarks::execute(empty.path(), &args(&["--bogus"])).unwrap_err();
     assert!(err.contains("unknown flag"), "unexpected: {err}");
-    let err = bookmarks::execute(empty.path(), &args(&["mark"])).unwrap_err();
+    let err = bookmarks::execute(empty.path(), &args(&["mark", "--"])).unwrap_err();
     assert!(err.contains("unexpected argument"), "unexpected: {err}");
     assert_eq!(
         bookmarks::run_in(empty.path(), &args(&["--bogus"])),
@@ -188,7 +199,8 @@ fn bad_flags_fail() {
 fn svn_working_copy_reports_no_bookmark_support() {
     let empty = Fixture::named("svn-nosupport");
     std::fs::create_dir_all(empty.path().join(".svn")).unwrap();
-    let err = bookmarks::execute(empty.path(), &args(&[])).unwrap_err();
+    // T1153 B21/B23: piped runs carry `--`.
+    let err = bookmarks::execute(empty.path(), &args(&["--"])).unwrap_err();
     assert!(
         err.contains("does not support bookmarks"),
         "unexpected: {err}"

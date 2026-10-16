@@ -46,21 +46,6 @@ use arc_rs::{config, set_config, terminal};
 /// Subcommand name, matching `arc get-config`.
 pub const NAME: &str = "get-config";
 
-const USAGE: &str = "usage: arc get-config [--verbose] [--config K=V] [--config-file FILE] [--arcrc-file FILE] [--] [NAME...]\n\
-\n\
-Read arc configuration. With no NAME, show all known and configured keys.\n\
-\n\
-Precedence (highest wins): local (.<vcs>/arc/config: .git, .hg, .svn),\n\
-project (.arcconfig), user (~/.arcrc), system (/etc/arcconfig), default.\n\
-\n\
-Options:\n\
-  --verbose       Show detailed information about each option.\n\
-  --show-source   Alias for --verbose.\n\
-  --config K=V    Runtime value, validated like --config elsewhere (not shown).\n\
-  --config-file F Read F instead of the system/user files (repeatable).\n\
-  --arcrc-file F  Read user config from F instead of ~/.arcrc.\n\
-  -h, --help      Show this help.\n";
-
 /// T1153 R10: `--help` renders the generated workflow help
 /// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
 /// not the short error-dump usage. The renderer is the shared
@@ -994,7 +979,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(message) => {
-            eprintln!("arc {NAME}: {message}\n\n{USAGE}");
+            eprintln!("arc {NAME}: {message}\n\n{}", usage());
             return ExitCode::FAILURE;
         }
     };

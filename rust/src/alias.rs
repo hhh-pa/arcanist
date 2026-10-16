@@ -863,6 +863,18 @@ pub struct Options {
 /// stays the legacy `unknown flag` wording (locked by contract tests;
 /// PHP reports `Argument "--x" is unrecognized. ...`).
 pub fn parse_args(argv: &[String]) -> Result<Option<Options>, String> {
+    parse_args_with_tty(argv, crate::prompt::stdin_is_terminal())
+}
+
+/// [`parse_args`] with an injected TTY flag (deterministic tests).
+/// T1153 B21/B23: piped runs without `--` fail with
+/// `MISSING_TERMINATOR` (checked after unknown-flag scanning, like
+/// PHP's `parseFull()`, but before success). `--help` without `--`
+/// when piped reports the terminator. Vs ceb
+/// `ArcanistRuntime.php:80-86,172-188` and
+/// `PhutilArgumentParser.php:331-336`.
+fn parse_args_with_tty(argv: &[String], stdin_tty: bool) -> Result<Option<Options>, String> {
+    let missing = crate::help::terminator_missing(argv, stdin_tty);
     let mut json = false;
     let mut positional = Vec::new();
     let mut end_of_flags = false;
@@ -877,6 +889,9 @@ pub fn parse_args(argv: &[String]) -> Result<Option<Options>, String> {
             }
             json = true;
         } else if arg == "-h" || arg == "--help" {
+            if missing {
+                return Err(crate::help::MISSING_TERMINATOR.to_string());
+            }
             return Ok(None);
         } else if arg == "-" {
             positional.push(arg.clone());
@@ -888,6 +903,9 @@ pub fn parse_args(argv: &[String]) -> Result<Option<Options>, String> {
         } else {
             positional.push(arg.clone());
         }
+    }
+    if missing {
+        return Err(crate::help::MISSING_TERMINATOR.to_string());
     }
     Ok(Some(Options { json, positional }))
 }
@@ -1094,6 +1112,14 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(message) => {
+            // T1153 B21/B23: the terminator failure prints the three
+            // cyan hints first (like `ArcanistRuntime.php:172-188`)
+            // and reports through the toolset usage arm (exit 1);
+            // other parse errors keep the bold parse-error arm.
+            if message == crate::help::MISSING_TERMINATOR {
+                crate::help::print_terminator_hints(crate::terminal::ansi_enabled());
+                return conduit::report(conduit::EnvelopeKind::ToolsetUsage, &message);
+            }
             return conduit::report(conduit::EnvelopeKind::ToolsetParseError, &message);
         }
     };

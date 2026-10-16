@@ -124,39 +124,44 @@ fn canned(
 
 #[test]
 fn parse_defaults_are_empty() {
-    let options = parse_options(&args(&[])).unwrap().unwrap();
+    // T1153 B21/B23: TTY runs need no `--`.
+    let options = parse_options_with_tty(&args(&[]), true).unwrap().unwrap();
     assert_eq!(options, Options::default());
     assert!(options.provided.is_empty());
 }
 
 #[test]
 fn parse_covers_every_flag() {
-    let options = parse_options(&args(&[
-        "--hold",
-        "--keep-branches",
-        "--onto-remote",
-        "fork",
-        "--onto",
-        "stable",
-        "--onto=next",
-        "--strategy",
-        "merge",
-        "--revision",
-        "D89",
-        "--preview",
-        "--into",
-        "release",
-        "--into-remote",
-        "upstream",
-        "--into-local",
-        "--into-empty",
-        "--incremental",
-        "--pick",
-        "--conduit-uri",
-        "https://phab.example/api/",
-        "--",
-        "feature",
-    ]))
+    // T1153 B21/B23: TTY runs need no `--` (argv already carries `--`).
+    let options = parse_options_with_tty(
+        &args(&[
+            "--hold",
+            "--keep-branches",
+            "--onto-remote",
+            "fork",
+            "--onto",
+            "stable",
+            "--onto=next",
+            "--strategy",
+            "merge",
+            "--revision",
+            "D89",
+            "--preview",
+            "--into",
+            "release",
+            "--into-remote",
+            "upstream",
+            "--into-local",
+            "--into-empty",
+            "--incremental",
+            "--pick",
+            "--conduit-uri",
+            "https://phab.example/api/",
+            "--",
+            "feature",
+        ]),
+        true,
+    )
     .unwrap()
     .unwrap();
     assert!(options.hold);
@@ -200,14 +205,26 @@ fn parse_covers_every_flag() {
 
 #[test]
 fn parse_positionals_collect_into_refs() {
-    let options = parse_options(&args(&["a", "--", "b"])).unwrap().unwrap();
+    // T1153 B21/B23: TTY runs need no `--` (argv already carries `--`).
+    let options = parse_options_with_tty(&args(&["a", "--", "b"]), true)
+        .unwrap()
+        .unwrap();
     assert_eq!(options.refs, vec!["a".to_string(), "b".to_string()]);
 }
 
 #[test]
 fn parse_help_short_circuits() {
-    assert!(parse_options(&args(&["--help"])).unwrap().is_none());
-    assert!(parse_options(&args(&["--hold", "-h"])).unwrap().is_none());
+    // T1153 B21/B23: TTY runs need no `--`.
+    assert!(
+        parse_options_with_tty(&args(&["--help"]), true)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        parse_options_with_tty(&args(&["--hold", "-h"]), true)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -232,7 +249,10 @@ fn parse_missing_param_errors() {
 
 #[test]
 fn parse_bool_value_splices_back() {
-    let options = parse_options(&args(&["--hold=x"])).unwrap().unwrap();
+    // T1153 B21/B23: TTY runs need no `--`.
+    let options = parse_options_with_tty(&args(&["--hold=x"]), true)
+        .unwrap()
+        .unwrap();
     assert!(options.hold);
     assert_eq!(options.refs, vec!["x".to_string()]);
 }
@@ -2794,20 +2814,21 @@ fn execute_help_parse_error_and_non_repo() {
     // bytes locked by `r10_land_help_matches_generated_format`).
     let dir = temp_dir("exec-misc");
     let mut io = Io::canned(&[]);
-    let out = execute_with_io(&dir, &args(&["--help"]), &mut io).unwrap();
+    let out = execute_with_io(&dir, &args(&["--help", "--"]), &mut io).unwrap();
     assert_eq!(out.stdout, usage_text(false));
     // T1153 R4 (LAND-37): PHP renders usage errors with no usage
     // dump; the envelope (`USAGE EXCEPTION` label) applies at `run_in`.
     let err = execute_with_io(&dir, &args(&["--nope"]), &mut Io::canned(&[])).unwrap_err();
     assert_eq!(err, "Unknown argument 'nope'. Try 'arc help'.");
-    let err = execute_with_io(&dir, &args(&["--preview"]), &mut Io::canned(&[])).unwrap_err();
+    let err = execute_with_io(&dir, &args(&["--preview", "--"]), &mut Io::canned(&[])).unwrap_err();
     assert_eq!(err, NOT_GIT_OR_HG);
-    let out = execute(&dir, &args(&["--help"])).unwrap();
+    let out = execute(&dir, &args(&["--help", "--"])).unwrap();
     assert!(out.stdout.contains("LAND WORKFLOW"));
 }
 
 #[test]
 fn execute_preview_without_conduit_fails() {
+    // T1153 B21/B23: piped runs carry `--`.
     // LAND-6: even `--preview` needs Conduit (PHP resolves the viewer
     // before the engine runs); there is no offline land anymore.
     let (repo, _bare) = repo_with_origin("preview");
@@ -2821,15 +2842,16 @@ fn execute_preview_without_conduit_fails() {
     )
     .unwrap();
     let mut io = Io::canned(&[]);
-    let err = execute_with_io(&repo, &args(&["--preview", "feature"]), &mut io).unwrap_err();
+    let err = execute_with_io(&repo, &args(&["--preview", "--", "feature"]), &mut io).unwrap_err();
     assert!(err.contains("no token for"), "{err}");
 }
 
 #[test]
 fn run_in_reports_success_and_failure() {
+    // T1153 B21/B23: piped runs carry `--` (`--nope` stays bare: scan errors report first).
     let dir = temp_dir("run-misc");
     assert!(matches!(
-        run_in(&dir, &args(&["--help"])),
+        run_in(&dir, &args(&["--help", "--"])),
         ExitCode::SUCCESS
     ));
     assert!(matches!(
@@ -2837,7 +2859,7 @@ fn run_in_reports_success_and_failure() {
         ExitCode::FAILURE
     ));
     assert!(matches!(
-        run_in(&dir, &args(&["--preview"])),
+        run_in(&dir, &args(&["--preview", "--"])),
         ExitCode::FAILURE
     ));
 }
@@ -3547,14 +3569,18 @@ fn r6_land13_strategy_and_remote_merge() {
 
 #[test]
 fn r6_core34_land_config_flags_parse() {
-    let opts = parse_options(&args(&[
-        "--config",
-        "a=1",
-        "--config=b=2",
-        "--config-file",
-        "f",
-        "--arcrc-file=g",
-    ]))
+    // T1153 B21/B23: TTY runs need no `--`.
+    let opts = parse_options_with_tty(
+        &args(&[
+            "--config",
+            "a=1",
+            "--config=b=2",
+            "--config-file",
+            "f",
+            "--arcrc-file=g",
+        ]),
+        true,
+    )
     .unwrap()
     .unwrap();
     assert_eq!(opts.config, ["a=1", "b=2"]);
@@ -3564,14 +3590,15 @@ fn r6_core34_land_config_flags_parse() {
 
 #[test]
 fn r4_land37_classified_parse_and_non_repo_are_usage() {
+    // T1153 B21/B23: piped runs carry `--` to reach the non-repo arm (`--nope` stays bare: scan first).
     use arc_rs::conduit::EnvelopeKind;
     let dir = temp_dir("r4-land37");
     let err =
         execute_with_io_classified(&dir, &args(&["--nope"]), &mut Io::canned(&[])).unwrap_err();
     assert_eq!(err.kind, EnvelopeKind::ToolsetUsage);
     assert_eq!(err.message, "Unknown argument 'nope'. Try 'arc help'.");
-    let err =
-        execute_with_io_classified(&dir, &args(&["--preview"]), &mut Io::canned(&[])).unwrap_err();
+    let err = execute_with_io_classified(&dir, &args(&["--preview", "--"]), &mut Io::canned(&[]))
+        .unwrap_err();
     assert_eq!(err.kind, EnvelopeKind::ToolsetUsage);
     assert_eq!(err.message, NOT_GIT_OR_HG);
 }
@@ -4507,13 +4534,14 @@ fn land40_unresolved_revision_echoes_raw_symbol() {
 
 #[test]
 fn land15_invalid_symbol_fails_before_onto_output() {
+    // T1153 B21/B23: piped runs carry `--`.
     // Resolution runs before onto/into selection: an invalid symbol
     // fails with no target output at all.
     let (repo, _bare) = repo_with_origin("land15-order");
     git(&repo, &["checkout", "-b", "feature"]);
     commit_file(&repo, "f.txt", "f\n", "feature work");
     let mut io = Io::canned(&[]);
-    let err = execute_with_io(&repo, &args(&["nope"]), &mut io).unwrap_err();
+    let err = execute_with_io(&repo, &args(&["--", "nope"]), &mut io).unwrap_err();
     assert!(err.contains("nope"), "{err}");
     assert!(!io.out.stderr.contains("ONTO"), "{}", io.out.stderr);
     assert!(!io.out.stderr.contains("INTO"), "{}", io.out.stderr);
@@ -4717,4 +4745,56 @@ fn r10_land_help_matches_generated_format() {
     assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
     // `execute_with_io` pushes the same text with the IO ANSI mode.
     assert!(usage_text(true).contains("LAND WORKFLOW"));
+}
+
+#[test]
+fn b21_land_requires_terminator_when_piped() {
+    // T1153 B21/B23: piped without `--` reports the terminator, even
+    // for `--help` and empty argv. Unknown flags still report first.
+    assert_eq!(
+        parse_options_with_tty(&args(&[]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    assert_eq!(
+        parse_options_with_tty(&args(&["--help"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    assert_eq!(
+        parse_options_with_tty(&args(&["--preview"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    let err = parse_options_with_tty(&args(&["--nope"]), false).unwrap_err();
+    assert_eq!(err, "Unknown argument 'nope'. Try 'arc help'.");
+    assert!(
+        parse_options_with_tty(&args(&["--"]), false)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        parse_options_with_tty(&args(&["--preview", "--", "feature"]), false)
+            .unwrap()
+            .is_some()
+    );
+    assert!(parse_options_with_tty(&args(&[]), true).unwrap().is_some());
+    assert_eq!(
+        crate::help::MISSING_TERMINATOR,
+        "Missing required \"--\" in argument list."
+    );
+}
+
+#[test]
+fn b23_land_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help land`.
+    let text = usage_text(false);
+    assert!(
+        text.starts_with("LAND WORKFLOW\n"),
+        "{}",
+        &text[..200.min(text.len())]
+    );
+    assert!(text.contains("Publish reviewed changes."), "{text}");
+    assert!(text.contains("--strategy"), "{text}");
+    assert!(text.contains("--onto"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }

@@ -76,6 +76,7 @@ fn command_names_match_arc() {
 
 #[test]
 fn every_command_reports_help() {
+    // T1153 B21/B23: piped `work` runs carry `--` (`cover` is classic, exempt).
     assert_eq!(
         linters::run(&args(&["--help"])),
         std::process::ExitCode::SUCCESS
@@ -86,11 +87,12 @@ fn every_command_reports_help() {
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(
-        work::run(&args(&["--help"])),
+        work::run(&args(&["--help", "--"])),
         std::process::ExitCode::SUCCESS
     );
+    // T1153 B21/B23: piped `inspect` runs carry `--`.
     assert_eq!(
-        inspect::run(&args(&["--help"])),
+        inspect::run(&args(&["--help", "--"])),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(
@@ -192,12 +194,13 @@ fn anoid_discovers_scripts_and_binaries() {
 
 #[test]
 fn work_tracks_branch_switches() {
+    // T1153 B21/B23: piped `work` runs carry `--`.
     let tmp = init_repo("work-switch");
     commit_file(tmp.path(), "f.txt", "one");
     let first = git(tmp.path(), &["symbolic-ref", "--short", "HEAD"]);
 
     assert_eq!(
-        work::run_in(tmp.path(), &args(&["feature"])),
+        work::run_in(tmp.path(), &args(&["--", "feature"])),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(
@@ -206,7 +209,7 @@ fn work_tracks_branch_switches() {
     );
 
     assert_eq!(
-        work::run_in(tmp.path(), &args(&[&first])),
+        work::run_in(tmp.path(), &args(&["--", first.as_str()])),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(git(tmp.path(), &["symbolic-ref", "--short", "HEAD"]), first);
@@ -227,8 +230,9 @@ fn inspect_shows_working_copy_state() {
     let explored = inspect::inspect_one(tmp.path(), "working-copy(HEAD)", true).unwrap();
     assert!(explored.contains(&head), "{explored}");
     assert!(explored.contains("one"));
+    // T1153 B21/B23: piped `inspect` runs carry `--`.
     assert_eq!(
-        inspect::run_in(tmp.path(), &args(&[])),
+        inspect::run_in(tmp.path(), &args(&["--"])),
         std::process::ExitCode::SUCCESS
     );
 }
@@ -272,10 +276,11 @@ fn rbd12_look_conduit_modes_fail_without_uri() {
     let home = TempDir::new("rbd12-home");
     let _guard = with_temp_home(home.path());
     let fatal = std::process::ExitCode::from(conduit::EXIT_FATAL);
-    assert_eq!(look::run_in(tmp.path(), &args(&["remotes"])), fatal);
-    assert_eq!(look::run_in(tmp.path(), &args(&["published"])), fatal);
+    // T1153 B21/B23: piped `look` runs carry `--`.
+    assert_eq!(look::run_in(tmp.path(), &args(&["--", "remotes"])), fatal);
+    assert_eq!(look::run_in(tmp.path(), &args(&["--", "published"])), fatal);
     assert_eq!(
-        look::run_in(tmp.path(), &args(&[])),
+        look::run_in(tmp.path(), &args(&["--"])),
         std::process::ExitCode::SUCCESS
     );
 }
@@ -289,8 +294,9 @@ fn core4_inspect_browse_fails_without_uri() {
     commit_file(tmp.path(), "f.txt", "one\n");
     let home = TempDir::new("core4-inspect-home");
     let _guard = with_temp_home(home.path());
+    // T1153 B21/B23: piped `inspect` runs carry `--`.
     assert_eq!(
-        inspect::run_in(tmp.path(), &args(&["--explore", "browse(HEAD)"])),
+        inspect::run_in(tmp.path(), &args(&["--explore", "--", "browse(HEAD)"])),
         std::process::ExitCode::from(conduit::EXIT_FATAL)
     );
 }

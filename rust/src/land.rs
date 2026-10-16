@@ -628,6 +628,18 @@ fn parse_long_flag(
 /// `-x` token errors like an unknown long name. Returns `Ok(None)` when
 /// `--help` was requested.
 pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
+    parse_options_with_tty(argv, crate::prompt::stdin_is_terminal())
+}
+
+/// [`parse_options`] with an injected TTY flag (deterministic tests).
+/// T1153 B21/B23: piped runs without `--` fail with
+/// `MISSING_TERMINATOR` (checked after unknown-flag scanning, like
+/// PHP's `parseFull()`, but before success). `--help` without `--`
+/// when piped reports the terminator. Vs ceb
+/// `ArcanistRuntime.php:80-86,172-188` and
+/// `PhutilArgumentParser.php:331-336`.
+fn parse_options_with_tty(argv: &[String], stdin_tty: bool) -> Result<Option<Options>, String> {
+    let missing = crate::help::terminator_missing(argv, stdin_tty);
     let mut options = Options::default();
     let mut queue: VecDeque<String> = argv.iter().cloned().collect();
     let mut end_of_flags = false;
@@ -641,6 +653,9 @@ pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
             continue;
         }
         if arg == "--help" || arg == "-h" {
+            if missing {
+                return Err(crate::help::MISSING_TERMINATOR.to_string());
+            }
             return Ok(None);
         }
         if let Some(name) = arg.strip_prefix("--") {
@@ -653,6 +668,9 @@ pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
             return Err(format!("Unknown argument '{spelling}'. Try 'arc help'."));
         }
         options.refs.push(arg);
+    }
+    if missing {
+        return Err(crate::help::MISSING_TERMINATOR.to_string());
     }
     Ok(Some(options))
 }
@@ -8616,7 +8634,14 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
     io.ansi = terminal::ansi_enabled();
     match execute_with_io_classified(dir, argv, &mut io) {
         Ok(_) => ExitCode::SUCCESS,
-        Err(error) => error.report(),
+        Err(error) => {
+            // T1153 B21/B23: the terminator failure prints the three
+            // cyan hints first (like `ArcanistRuntime.php:172-188`).
+            if error.message == crate::help::MISSING_TERMINATOR {
+                crate::help::print_terminator_hints(crate::terminal::ansi_enabled());
+            }
+            error.report()
+        }
     }
 }
 

@@ -1,4 +1,9 @@
 //! `branches` behavior through the wired library.
+//!
+//! T1153 B21/B23: piped runs carry `--` throughout (the toolset
+//! terminator gate); `--help` asserts the generated `BRANCHES
+//! WORKFLOW` help; `--bogus`/`master` stay bare to lock that scan
+//! errors report before the terminator check.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -165,7 +170,7 @@ fn run_uses_current_dir() {
     let (base, _client, _seen) = empty_conduit(false);
     let old = std::env::current_dir().unwrap();
     std::env::set_current_dir(repo.path()).unwrap();
-    let code = branches::run(&args(&["--conduit-uri", &base]));
+    let code = branches::run(&args(&["--conduit-uri", &base, "--"]));
     std::env::set_current_dir(&old).unwrap();
     assert_eq!(code, ExitCode::SUCCESS);
 }
@@ -173,11 +178,11 @@ fn run_uses_current_dir() {
 #[test]
 fn help_succeeds_and_prints_usage() {
     let repo = Fixture::init_repo("help");
-    let out = branches::execute(repo.path(), &args(&["--help"])).unwrap();
+    let out = branches::execute(repo.path(), &args(&["--help", "--"])).unwrap();
     // T1153 R10: `--help` renders the generated workflow help.
     assert!(out.contains("BRANCHES WORKFLOW"), "unexpected: {out}");
     assert_eq!(
-        branches::run_in(repo.path(), &args(&["--help"])),
+        branches::run_in(repo.path(), &args(&["--help", "--"])),
         ExitCode::SUCCESS
     );
 }
@@ -197,8 +202,8 @@ fn lists_branches_with_current_marker() {
     assert!(!branches[1].current);
 
     // Fixed width: message truncation depends on the terminal.
-    let out =
-        branches::execute_with_client(repo.path(), &args(&[]), Some(150), Some(&client)).unwrap();
+    let out = branches::execute_with_client(repo.path(), &args(&["--"]), Some(150), Some(&client))
+        .unwrap();
     // Both markers point at the same commit, so one tree view holds two
     // marker items: the plain marker first, the active one second.
     let lines: Vec<&str> = out.lines().collect();
@@ -210,7 +215,7 @@ fn lists_branches_with_current_marker() {
     assert!(out.contains("initial commit"), "missing subject: {out}");
     let (base, _client, _seen) = empty_conduit(false);
     assert_eq!(
-        branches::run_in(repo.path(), &args(&["--conduit-uri", &base])),
+        branches::run_in(repo.path(), &args(&["--conduit-uri", &base, "--"])),
         ExitCode::SUCCESS
     );
 }
@@ -225,8 +230,8 @@ fn detached_head_has_no_current_branch() {
     let branches = branches::list(repo.path(), false).unwrap();
     assert_eq!(branches.len(), 1);
     assert!(!branches[0].current);
-    let out =
-        branches::execute_with_client(repo.path(), &args(&[]), Some(150), Some(&client)).unwrap();
+    let out = branches::execute_with_client(repo.path(), &args(&["--"]), Some(150), Some(&client))
+        .unwrap();
     assert!(!out.contains(" *  "), "unexpected: {out}");
     assert!(out.contains("• master"), "unexpected: {out}");
 }
@@ -242,13 +247,13 @@ fn empty_repo_matches_php_partition_error() {
     add_remote(&repo);
     let (_base, client, _seen) = empty_conduit(false);
     // No markers means no heads; PHP throws out of the graph query.
-    let err = branches::execute_with_client(repo.path(), &args(&[]), Some(150), Some(&client))
+    let err = branches::execute_with_client(repo.path(), &args(&["--"]), Some(150), Some(&client))
         .unwrap_err();
     assert!(
         err.contains("Need head hashes or exact hashes!"),
         "unexpected: {err}"
     );
-    let out = branches::execute(repo.path(), &args(&["--json"])).unwrap();
+    let out = branches::execute(repo.path(), &args(&["--json", "--"])).unwrap();
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&out).unwrap(),
         serde_json::json!([])
@@ -258,7 +263,7 @@ fn empty_repo_matches_php_partition_error() {
 #[test]
 fn outside_repo_fails() {
     let empty = Fixture::named("notrepo");
-    let err = branches::execute(empty.path(), &args(&[])).unwrap_err();
+    let err = branches::execute(empty.path(), &args(&["--"])).unwrap_err();
     // T1153 LAND-28: outside a repository PHP fails the support
     // check against a `filesystem` API.
     assert_eq!(
@@ -266,7 +271,7 @@ fn outside_repo_fails() {
         "The version control system (\"filesystem\") in the current working copy does not support branches."
     );
     assert_eq!(
-        branches::run_in(empty.path(), &args(&[])),
+        branches::run_in(empty.path(), &args(&["--"])),
         ExitCode::FAILURE
     );
 }
@@ -274,7 +279,7 @@ fn outside_repo_fails() {
 #[test]
 fn json_lists_branch_objects() {
     let repo = Fixture::init_repo("json");
-    let out = branches::execute(repo.path(), &args(&["--json"])).unwrap();
+    let out = branches::execute(repo.path(), &args(&["--json", "--"])).unwrap();
     let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
     let entries = doc.as_array().unwrap();
     assert_eq!(entries.len(), 1, "{doc}");
@@ -303,8 +308,8 @@ fn upstream_tracking_is_shown() {
 
     // The tree grid shows no upstream tracking (matching `arc`); the
     // tracking data stays available through `list()`.
-    let out =
-        branches::execute_with_client(repo.path(), &args(&[]), Some(150), Some(&client)).unwrap();
+    let out = branches::execute_with_client(repo.path(), &args(&["--"]), Some(150), Some(&client))
+        .unwrap();
     assert!(out.contains("• frozen"), "unexpected: {out}");
     assert!(out.contains("└  *  master"), "unexpected: {out}");
     assert!(out.contains("second commit"), "unexpected: {out}");
@@ -322,7 +327,8 @@ fn all_includes_remote_tracking_branches() {
     // lookup fires first for these remote-tracking markers).
     let (_base, client, _seen) = empty_conduit(true);
     let local_only =
-        branches::execute_with_client(repo.path(), &args(&[]), Some(150), Some(&client)).unwrap();
+        branches::execute_with_client(repo.path(), &args(&["--"]), Some(150), Some(&client))
+            .unwrap();
     assert_eq!(
         local_only
             .lines()
@@ -335,9 +341,13 @@ fn all_includes_remote_tracking_branches() {
     // Remote-tracking markers render under their branch name, so `--all`
     // adds a second `master` item for `origin/master`.
     let (_base, client, _seen) = empty_conduit(true);
-    let all =
-        branches::execute_with_client(repo.path(), &args(&["--all"]), Some(150), Some(&client))
-            .unwrap();
+    let all = branches::execute_with_client(
+        repo.path(),
+        &args(&["--all", "--"]),
+        Some(150),
+        Some(&client),
+    )
+    .unwrap();
     assert_eq!(
         all.lines().filter(|line| line.contains("master")).count(),
         2,
@@ -371,7 +381,7 @@ fn bad_flags_fail() {
 fn svn_working_copy_reports_no_branch_support() {
     let empty = Fixture::named("svn-nosupport");
     std::fs::create_dir_all(empty.path().join(".svn")).unwrap();
-    let err = branches::execute(empty.path(), &args(&[])).unwrap_err();
+    let err = branches::execute(empty.path(), &args(&["--"])).unwrap_err();
     assert!(
         err.contains("does not support branches"),
         "unexpected: {err}"
@@ -418,8 +428,8 @@ fn conduit_revisions_annotate_the_grid() {
     let client = Client::new(&base, "test-token").unwrap();
 
     // Wide terminal: full status display names.
-    let out =
-        branches::execute_with_client(repo.path(), &args(&[]), Some(150), Some(&client)).unwrap();
+    let out = branches::execute_with_client(repo.path(), &args(&["--"]), Some(150), Some(&client))
+        .unwrap();
     assert!(out.contains("D1"), "unexpected: {out}");
     assert!(out.contains("Needs Review"), "unexpected: {out}");
     // The waypoint color splits the commits into two sets and two rows.
@@ -441,7 +451,8 @@ fn conduit_revisions_annotate_the_grid() {
 
     // T1153 LAND-23: without a client the grid fails like PHP
     // instead of rendering with blank annotation.
-    let err = branches::execute_with_client(repo.path(), &args(&[]), Some(150), None).unwrap_err();
+    let err =
+        branches::execute_with_client(repo.path(), &args(&["--"]), Some(150), None).unwrap_err();
     assert!(
         err.contains("This command needs to communicate with Phabricator"),
         "unexpected: {err}"

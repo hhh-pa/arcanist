@@ -53,16 +53,26 @@ fn module_name_matches_arc() {
 
 #[test]
 fn run_help_json_and_unported_paths() {
-    assert_eq!(upgrade::run(&["--help".to_string()]), ExitCode::SUCCESS);
-    assert_eq!(upgrade::run(&[]), ExitCode::SUCCESS);
-    assert_eq!(upgrade::run(&["--json".to_string()]), ExitCode::SUCCESS);
+    // T1153 B21/B23: piped runs carry `--`; `--bogus` stays bare to lock scan-first ordering.
+    assert_eq!(
+        upgrade::run(&["--help".to_string(), "--".to_string()]),
+        ExitCode::SUCCESS
+    );
+    assert_eq!(upgrade::run(&["--".to_string()]), ExitCode::SUCCESS);
+    assert_eq!(
+        upgrade::run(&["--json".to_string(), "--".to_string()]),
+        ExitCode::SUCCESS
+    );
     // No `run(&["--apply"])` here: it performs a live self-update
     // (network fetch against the real releases API, then replaces
     // the running executable), so its outcome depends on published
     // state — publishing v0.1.0 flipped it from FAILURE to SUCCESS.
     // Apply paths are covered hermetically in upgrade_tests.
     assert_eq!(upgrade::run(&["--bogus".to_string()]), ExitCode::FAILURE);
-    assert_eq!(upgrade::run(&["extra".to_string()]), ExitCode::FAILURE);
+    assert_eq!(
+        upgrade::run(&["extra".to_string(), "--".to_string()]),
+        ExitCode::FAILURE
+    );
 }
 
 #[test]

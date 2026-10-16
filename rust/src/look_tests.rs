@@ -6,26 +6,78 @@ fn args(v: &[&str]) -> Vec<String> {
 
 #[test]
 fn parses_empty_and_thing_words() {
-    assert_eq!(parse_args(&args(&[])).unwrap(), Some(Vec::new()));
+    // T1153 B21/B23: TTY runs need no `--`.
     assert_eq!(
-        parse_args(&args(&["remotes"])).unwrap(),
+        parse_args_with_tty(&args(&[]), true).unwrap(),
+        Some(Vec::new())
+    );
+    assert_eq!(
+        parse_args_with_tty(&args(&["remotes"]), true).unwrap(),
         Some(args(&["remotes"]))
     );
     assert_eq!(
-        parse_args(&args(&["--", "big", "rock"])).unwrap(),
+        parse_args_with_tty(&args(&["--", "big", "rock"]), true).unwrap(),
         Some(args(&["big", "rock"]))
     );
 }
 
 #[test]
 fn parses_help() {
-    assert_eq!(parse_args(&args(&["--help"])).unwrap(), None);
-    assert_eq!(parse_args(&args(&["-h"])).unwrap(), None);
+    // T1153 B21/B23: TTY runs need no `--`.
+    assert_eq!(parse_args_with_tty(&args(&["--help"]), true).unwrap(), None);
+    assert_eq!(parse_args_with_tty(&args(&["-h"]), true).unwrap(), None);
 }
 
 #[test]
 fn rejects_unknown_flags() {
-    assert!(parse_args(&args(&["--bogus"])).is_err());
+    // T1153 B21/B23: TTY runs need no `--`.
+    assert!(parse_args_with_tty(&args(&["--bogus"]), true).is_err());
+}
+
+#[test]
+fn b21_look_requires_terminator_when_piped() {
+    // T1153 B21/B23: piped without `--` reports the terminator, even
+    // for `--help` and empty argv. Unknown flags still report first.
+    assert_eq!(
+        parse_args_with_tty(&args(&[]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    assert_eq!(
+        parse_args_with_tty(&args(&["--help"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    assert_eq!(
+        parse_args_with_tty(&args(&["remotes"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    let err = parse_args_with_tty(&args(&["--bogus"]), false).unwrap_err();
+    assert!(err.contains("unknown flag"), "unexpected: {err}");
+    assert!(
+        parse_args_with_tty(&args(&["--"]), false)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        parse_args_with_tty(&args(&["--", "remotes"]), false)
+            .unwrap()
+            .is_some()
+    );
+    assert!(parse_args_with_tty(&args(&[]), true).unwrap().is_some());
+    assert_eq!(
+        crate::help::MISSING_TERMINATOR,
+        "Missing required \"--\" in argument list."
+    );
+}
+
+#[test]
+fn b23_look_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help look`.
+    let text = usage_text(false);
+    assert!(text.starts_with("LOOK WORKFLOW\n"), "{text}");
+    assert!(text.contains("small clearing"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
 
 #[test]

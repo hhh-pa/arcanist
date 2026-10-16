@@ -63,11 +63,28 @@ pub struct Options {
 ///
 /// Returns `Ok(None)` when `--help` was requested.
 pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
+    parse_options_with_tty(argv, crate::prompt::stdin_is_terminal())
+}
+
+/// [`parse_options`] with an injected TTY flag (deterministic tests).
+/// T1153 B21/B23: piped runs without `--` fail with
+/// `MISSING_TERMINATOR` (checked after unknown-flag scanning, like
+/// PHP's `parseFull()`, but before success). A lone `--` is the
+/// terminator (accepted); `--help` after `--` is a positional
+/// (rejected, like PHP). Vs ceb `ArcanistRuntime.php:80-86,172-188`
+/// and `PhutilArgumentParser.php:331-336`.
+fn parse_options_with_tty(argv: &[String], stdin_tty: bool) -> Result<Option<Options>, String> {
+    let missing = crate::help::terminator_missing(argv, stdin_tty);
     let mut json = false;
     let mut conduit_uri = None;
+    let mut end_of_flags = false;
     let mut iter = argv.iter();
     while let Some(arg) = iter.next() {
-        if arg == "--json" {
+        if end_of_flags {
+            return Err(format!("unexpected argument '{arg}'"));
+        } else if arg == "--" {
+            end_of_flags = true;
+        } else if arg == "--json" {
             json = true;
         } else if arg == "--conduit-uri" {
             let Some(value) = iter.next() else {
@@ -77,14 +94,18 @@ pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
         } else if let Some(value) = arg.strip_prefix("--conduit-uri=") {
             conduit_uri = Some(value.to_string());
         } else if arg == "-h" || arg == "--help" {
+            if missing {
+                return Err(crate::help::MISSING_TERMINATOR.to_string());
+            }
             return Ok(None);
-        } else if arg == "--" {
-            return Err("unexpected argument '--': bookmarks takes no paths".to_string());
         } else if arg.starts_with('-') {
             return Err(format!("unknown flag '{arg}'"));
         } else {
             return Err(format!("unexpected argument '{arg}'"));
         }
+    }
+    if missing {
+        return Err(crate::help::MISSING_TERMINATOR.to_string());
     }
     Ok(Some(Options { json, conduit_uri }))
 }
@@ -166,6 +187,9 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => return Ok(usage()),
+        // T1153 B21/B23: the terminator failure carries no usage dump
+        // (toolset `USAGE EXCEPTION`, like PHP).
+        Err(message) if message == crate::help::MISSING_TERMINATOR => return Err(message),
         Err(message) => return Err(format!("{message}\n\n{}", usage())),
     };
     let owned_client = config::client_for(options.conduit_uri.as_deref()).ok();
@@ -183,6 +207,8 @@ pub fn execute_with_binary(dir: &Path, argv: &[String], hg_binary: &str) -> Resu
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => return Ok(usage()),
+        // T1153 B21/B23: the terminator failure carries no usage dump.
+        Err(message) if message == crate::help::MISSING_TERMINATOR => return Err(message),
         Err(message) => return Err(format!("{message}\n\n{}", usage())),
     };
     let owned_client = config::client_for(options.conduit_uri.as_deref()).ok();
@@ -239,6 +265,16 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
+            // T1153 B21/B23: the terminator failure prints the three
+            // cyan hints first (like `ArcanistRuntime.php:172-188`)
+            // and reports through the toolset usage arm (exit 1).
+            if message == crate::help::MISSING_TERMINATOR {
+                crate::help::print_terminator_hints(crate::terminal::ansi_enabled());
+                return crate::conduit::report(
+                    crate::conduit::EnvelopeKind::ToolsetUsage,
+                    &message,
+                );
+            }
             eprintln!("arc {NAME}: {message}");
             ExitCode::FAILURE
         }

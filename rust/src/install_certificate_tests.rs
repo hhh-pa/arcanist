@@ -725,3 +725,33 @@ fn r10_install_certificate_help_matches_generated_format() {
         usage()
     );
 }
+
+#[test]
+fn b21_install_certificate_needs_no_terminator() {
+    // T1153 B21/B23 VERIFIED for `install-certificate`: it is a
+    // classic workflow, so PHP runs it via the
+    // `scripts/arcanist.php` re-exec, which never requires `--`.
+    // Parsing takes no TTY input, so piped-style argv parses
+    // directly, and `--help` without `--` still succeeds.
+    assert!(
+        parse_args(&["https://host/".to_string()])
+            .unwrap()
+            .is_some()
+    );
+    assert!(parse_args(&["--help".to_string()]).unwrap().is_none());
+    let text = usage_text(false);
+    assert!(text.contains("INSTALL-CERTIFICATE WORKFLOW"), "{text}");
+}
+
+#[test]
+fn b23_install_certificate_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to
+    // `arc help install-certificate`. Extensions stay undocumented.
+    let text = usage_text(false);
+    assert!(text.starts_with("INSTALL-CERTIFICATE WORKFLOW\n"), "{text}");
+    assert!(text.contains("Installs Conduit credentials"), "{text}");
+    assert!(!text.contains("--token"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+}

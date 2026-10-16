@@ -82,15 +82,17 @@ fn look_name_matches_arc() {
 
 #[test]
 fn look_runs_help_and_usage_paths() {
-    assert_eq!(look::run(&args(&["--help"])), ExitCode::SUCCESS);
+    // T1153 B21/B23: piped runs carry `--`; `--bogus` stays bare to lock scan-first ordering.
+    assert_eq!(look::run(&args(&["--help", "--"])), ExitCode::SUCCESS);
     assert_eq!(look::run(&args(&["--bogus"])), ExitCode::FAILURE);
 }
 
 #[test]
 fn look_with_no_arguments_succeeds() {
     // No git interaction on the clearing path; the real cwd is fine.
-    assert_eq!(look::run(&args(&[])), ExitCode::SUCCESS);
-    assert_eq!(look::run(&args(&["big", "rock"])), ExitCode::FAILURE);
+    // T1153 B21/B23: piped runs carry `--`.
+    assert_eq!(look::run(&args(&["--"])), ExitCode::SUCCESS);
+    assert_eq!(look::run(&args(&["--", "big", "rock"])), ExitCode::FAILURE);
 }
 
 #[test]

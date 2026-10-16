@@ -129,7 +129,8 @@ fn commands_reject_bad_args_without_io() {
     );
     assert_eq!(paste::run(&argv(&["P1", "P2"])), ExitCode::FAILURE);
     assert_eq!(paste::run(&argv(&["P1", "--lang", "x"])), ExitCode::FAILURE);
-    assert_eq!(liberate::run(&argv(&["a", "b"])), ExitCode::FAILURE);
+    // T1153 B21/B23: piped runs carry `--` to reach path-count validation.
+    assert_eq!(liberate::run(&argv(&["a", "b", "--"])), ExitCode::FAILURE);
 }
 
 #[test]
@@ -149,7 +150,7 @@ fn help_succeeds_for_all_commands() {
         ExitCode::SUCCESS
     );
     assert_eq!(
-        liberate::run_in(fx.path(), &argv(&["--help"])),
+        liberate::run_in(fx.path(), &argv(&["--help", "--"])),
         ExitCode::SUCCESS
     );
     // T1153 BROWSE-B21 (terminator) + BROWSE-B23 (generated help).
@@ -160,7 +161,7 @@ fn help_succeeds_for_all_commands() {
     );
     // T1153 R10: `--help` renders the generated workflow help.
     assert!(
-        liberate::execute(fx.path(), &argv(&["--help"]))
+        liberate::execute(fx.path(), &argv(&["--help", "--"]))
             .unwrap()
             .contains("LIBERATE WORKFLOW")
     );
@@ -721,8 +722,10 @@ fn liberate_v2_ignores_rebuild_status() {
     let out = liberate::execute_with_input(fx.path(), &argv(&["v2lib"]), &mut empty_input(), true)
         .unwrap();
     assert!(!out.contains("rebuild-map.php"), "{out}");
+    // T1153 B21/B23: piped `run_in` carries `--` (`execute_with_input`
+    // models a TTY above, so it needs none).
     assert_eq!(
-        liberate::run_in(fx.path(), &argv(&["v2lib"])),
+        liberate::run_in(fx.path(), &argv(&["--", "v2lib"])),
         ExitCode::SUCCESS
     );
 }

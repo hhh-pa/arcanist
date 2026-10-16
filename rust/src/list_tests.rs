@@ -290,3 +290,32 @@ fn r10_list_help_matches_generated_format() {
     // `run()` prints `usage()` (same text, ambient ANSI mode).
     assert!(usage().contains("LIST WORKFLOW"), "{}", usage());
 }
+
+#[test]
+fn b21_list_needs_no_terminator() {
+    // T1153 B21/B23 VERIFIED for `list`: it is a classic workflow,
+    // so PHP runs it via the `scripts/arcanist.php` re-exec, which
+    // never requires `--`. Parsing takes no TTY input, so
+    // piped-style argv parses directly, and `--help` without `--`
+    // still succeeds.
+    assert!(parse_args(&args(&["--json"])).unwrap().is_some());
+    assert_eq!(parse_args(&args(&["--help"])).unwrap(), None);
+    let text = usage_text(false);
+    assert!(text.contains("LIST WORKFLOW"), "{text}");
+}
+
+#[test]
+fn b23_list_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help list`.
+    // Extensions stay undocumented.
+    let text = usage_text(false);
+    assert!(text.starts_with("LIST WORKFLOW\n"), "{text}");
+    assert!(
+        text.contains("List your open Differential revisions."),
+        "{text}"
+    );
+    assert!(!text.contains("--json"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+}

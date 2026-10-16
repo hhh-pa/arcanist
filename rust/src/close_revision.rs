@@ -25,8 +25,6 @@ pub const STATUS_ACCEPTED: i64 = 2;
 /// Differential "Closed" status.
 pub const STATUS_CLOSED: i64 = 3;
 
-const USAGE: &str = "usage: arc close-revision [--finalize] [--quiet] [--json] [--force] [--conduit-uri URI] REVISION\n";
-
 /// T1153 R10: `--help` renders the generated workflow help
 /// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
 /// not the short error-dump usage. The renderer is the shared
@@ -705,7 +703,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(msg) => {
-            eprintln!("arc {NAME}: {msg}\n\n{USAGE}");
+            eprintln!("arc {NAME}: {msg}\n\n{}", usage());
             return ExitCode::FAILURE;
         }
     };

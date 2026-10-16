@@ -103,10 +103,24 @@ pub enum ParseOutcome {
     Args(Options),
     Help,
     Error(String),
+    /// T1153 B21/B23: stdin is piped and argv carries no `--`.
+    MissingTerminator,
 }
 
 /// Parse `argv` (excluding the subcommand name).
 pub fn parse_args(argv: &[String]) -> ParseOutcome {
+    parse_args_with_tty(argv, arc_rs::prompt::stdin_is_terminal())
+}
+
+/// [`parse_args`] with an injected TTY flag (deterministic tests).
+/// T1153 B21/B23: piped runs without `--` fail with
+/// `MissingTerminator` (checked after unknown-flag scanning, like
+/// PHP's `parseFull()`, but before symbol-count validation). `--help`
+/// without `--` when piped reports the terminator. Vs ceb
+/// `ArcanistRuntime.php:80-86,172-188` and
+/// `PhutilArgumentParser.php:331-336`.
+fn parse_args_with_tty(argv: &[String], stdin_tty: bool) -> ParseOutcome {
+    let missing = arc_rs::help::terminator_missing(argv, stdin_tty);
     let mut start = None;
     let mut symbols = Vec::new();
     let mut end_of_flags = false;
@@ -124,12 +138,18 @@ pub fn parse_args(argv: &[String]) -> ParseOutcome {
         } else if let Some(value) = arg.strip_prefix("--start=") {
             start = Some(value.to_string());
         } else if arg == "-h" || arg == "--help" {
+            if missing {
+                return ParseOutcome::MissingTerminator;
+            }
             return ParseOutcome::Help;
         } else if arg.starts_with('-') {
             return ParseOutcome::Error(format!("unknown flag '{arg}'"));
         } else {
             symbols.push(arg.clone());
         }
+    }
+    if missing {
+        return ParseOutcome::MissingTerminator;
     }
     if symbols.is_empty() {
         return ParseOutcome::Error(
@@ -1885,6 +1905,16 @@ fn parse_or_report(argv: &[String]) -> Result<Options, ExitCode> {
         ParseOutcome::Help => {
             print!("{}", usage());
             Err(ExitCode::SUCCESS)
+        }
+        // T1153 B21/B23: the terminator failure prints the three cyan
+        // hints first (like `ArcanistRuntime.php:172-188`) and reports
+        // through the toolset usage arm (exit 1).
+        ParseOutcome::MissingTerminator => {
+            arc_rs::help::print_terminator_hints(arc_rs::terminal::ansi_enabled());
+            Err(arc_rs::conduit::report(
+                arc_rs::conduit::EnvelopeKind::ToolsetUsage,
+                arc_rs::help::MISSING_TERMINATOR,
+            ))
         }
         ParseOutcome::Error(message) => {
             eprintln!("arc {NAME}: {message}\n\n{}", usage());

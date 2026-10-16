@@ -1252,3 +1252,30 @@ fn r10_which_help_matches_generated_format() {
     // `run()` prints `usage()` (same text, ambient ANSI mode).
     assert!(usage().contains("WHICH WORKFLOW"), "{}", usage());
 }
+
+#[test]
+fn b21_which_needs_no_terminator() {
+    // T1153 B21/B23 VERIFIED for `which`: it is a classic workflow,
+    // so PHP runs it via the `scripts/arcanist.php` re-exec, which
+    // never requires `--`. Parsing takes no TTY input, so
+    // piped-style argv parses directly, and `--help` without `--`
+    // still succeeds.
+    assert!(matches!(parse_args(&[]), Parsed::Options(_)));
+    assert!(matches!(parse_args(&["--help".to_string()]), Parsed::Help));
+    let text = usage_text(false);
+    assert!(text.contains("WHICH WORKFLOW"), "{text}");
+}
+
+#[test]
+fn b23_which_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help which`.
+    // Extensions stay undocumented.
+    let text = usage_text(false);
+    assert!(text.starts_with("WHICH WORKFLOW\n"), "{text}");
+    assert!(text.contains("Shows which repository"), "{text}");
+    assert!(text.contains("--show-base"), "{text}");
+    assert!(!text.contains("--json"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+}

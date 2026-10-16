@@ -2978,3 +2978,33 @@ fn r10_unit_help_matches_generated_format() {
     // `run()` prints `usage()` (same text, ambient ANSI mode).
     assert!(usage().contains("UNIT WORKFLOW"), "{}", usage());
 }
+
+#[test]
+fn b21_unit_needs_no_terminator() {
+    // T1153 B21/B23 VERIFIED for `unit`: it is a classic workflow,
+    // so PHP runs it via the `scripts/arcanist.php` re-exec, which
+    // never requires `--`. Parsing takes no TTY input, so
+    // piped-style argv parses directly, and `--help` without `--`
+    // still succeeds.
+    assert!(parse_options(&args(&["--coverage"])).unwrap().is_some());
+    assert_eq!(parse_options(&args(&["--help"])).unwrap(), None);
+    let text = usage_text(false);
+    assert!(text.contains("UNIT WORKFLOW"), "{text}");
+}
+
+#[test]
+fn b23_unit_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help unit`.
+    // Extensions stay undocumented.
+    let text = usage_text(false);
+    assert!(text.starts_with("UNIT WORKFLOW\n"), "{text}");
+    assert!(
+        text.contains("Run unit tests that cover specified paths."),
+        "{text}"
+    );
+    assert!(text.contains("--detailed-coverage"), "{text}");
+    assert!(!text.contains("--conduit-uri"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+}

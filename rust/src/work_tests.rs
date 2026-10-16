@@ -68,53 +68,58 @@ fn current_branch(dir: &Path) -> String {
 
 #[test]
 fn parses_symbol_and_start_forms() {
+    // T1153 B21/B23: TTY runs need no `--`.
     assert_eq!(
-        parse_args(&args(&["feature"])),
+        parse_args_with_tty(&args(&["feature"]), true),
         ParseOutcome::Args(Options {
             start: None,
             symbol: "feature".to_string(),
         })
     );
     assert_eq!(
-        parse_args(&args(&["--start", "main", "feature"])),
+        parse_args_with_tty(&args(&["--start", "main", "feature"]), true),
         ParseOutcome::Args(Options {
             start: Some("main".to_string()),
             symbol: "feature".to_string(),
         })
     );
     assert_eq!(
-        parse_args(&args(&["--start=HEAD~1", "--", "feature"])),
+        parse_args_with_tty(&args(&["--start=HEAD~1", "--", "feature"]), true),
         ParseOutcome::Args(Options {
             start: Some("HEAD~1".to_string()),
             symbol: "feature".to_string(),
         })
     );
-    assert_eq!(parse_args(&args(&["--help"])), ParseOutcome::Help);
+    assert_eq!(
+        parse_args_with_tty(&args(&["--help"]), true),
+        ParseOutcome::Help
+    );
 }
 
 #[test]
 fn rejects_missing_extra_and_empty_symbols() {
+    // T1153 B21/B23: TTY runs need no `--`.
     assert_eq!(
-        parse_args(&args(&[])),
+        parse_args_with_tty(&args(&[]), true),
         ParseOutcome::Error(
             "Provide a branch, bookmark, task, or revision name to begin or resume work on."
                 .to_string()
         )
     );
     assert_eq!(
-        parse_args(&args(&["a", "b"])),
+        parse_args_with_tty(&args(&["a", "b"]), true),
         ParseOutcome::Error("Too many arguments: provide exactly one argument.".to_string())
     );
     assert_eq!(
-        parse_args(&args(&[""])),
+        parse_args_with_tty(&args(&[""]), true),
         ParseOutcome::Error("Provide a nonempty symbol to begin or resume work on.".to_string())
     );
     assert_eq!(
-        parse_args(&args(&["--start"])),
+        parse_args_with_tty(&args(&["--start"]), true),
         ParseOutcome::Error("--start requires a value".to_string())
     );
     assert_eq!(
-        parse_args(&args(&["--bogus", "a"])),
+        parse_args_with_tty(&args(&["--bogus", "a"]), true),
         ParseOutcome::Error("unknown flag '--bogus'".to_string())
     );
 }
@@ -134,6 +139,7 @@ fn classifies_revision_and_task_monograms() {
 
 #[test]
 fn resolves_branches_commits_and_default_start() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = init_repo("resolve");
     commit_file(tmp.path(), "f.txt", "one");
     let branch = current_branch(tmp.path());
@@ -150,12 +156,13 @@ fn resolves_branches_commits_and_default_start() {
 
 #[test]
 fn creates_and_resumes_branches() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = init_repo("create");
     commit_file(tmp.path(), "f.txt", "one");
     let first = current_branch(tmp.path());
 
     assert_eq!(
-        run_in(tmp.path(), &args(&["feature"])),
+        run_in(tmp.path(), &args(&["--", "feature"])),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(current_branch(tmp.path()), "feature");
@@ -167,7 +174,7 @@ fn creates_and_resumes_branches() {
     );
 
     assert_eq!(
-        run_in(tmp.path(), &args(&[&first])),
+        run_in(tmp.path(), &args(&["--", first.as_str()])),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(current_branch(tmp.path()), first);
@@ -175,20 +182,24 @@ fn creates_and_resumes_branches() {
 
 #[test]
 fn creates_from_explicit_startpoints() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = init_repo("start");
     commit_file(tmp.path(), "f.txt", "one");
     commit_file(tmp.path(), "f.txt", "two");
     let base = git(tmp.path(), &["rev-parse", "HEAD~1"]);
 
     assert_eq!(
-        run_in(tmp.path(), &args(&["--start", "HEAD~1", "older"])),
+        run_in(tmp.path(), &args(&["--start", "HEAD~1", "--", "older"])),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(git(tmp.path(), &["rev-parse", "older"]), base);
 
     git(tmp.path(), &["checkout", "--quiet", "older"]);
     assert_eq!(
-        run_in(tmp.path(), &args(&[&format!("--start={base}"), "from-sha"])),
+        run_in(
+            tmp.path(),
+            &args(&[&format!("--start={base}"), "--", "from-sha"])
+        ),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(git(tmp.path(), &["rev-parse", "from-sha"]), base);
@@ -196,10 +207,14 @@ fn creates_from_explicit_startpoints() {
 
 #[test]
 fn rejects_bad_startpoints_and_conduit_symbols() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = init_repo("reject");
     commit_file(tmp.path(), "f.txt", "one");
     assert_eq!(
-        run_in(tmp.path(), &args(&["--start", "no-such-rev", "feature"])),
+        run_in(
+            tmp.path(),
+            &args(&["--start", "no-such-rev", "--", "feature"])
+        ),
         std::process::ExitCode::FAILURE
     );
     // Unknown revision/task symbols fail through the mocked search (no
@@ -209,17 +224,17 @@ fn rejects_bad_startpoints_and_conduit_symbols() {
     };
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["D123"]), Some(&empty), &mut input),
+        run_in_with(tmp.path(), &args(&["--", "D123"]), Some(&empty), &mut input),
         std::process::ExitCode::FAILURE
     );
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["T1"]), Some(&empty), &mut input),
+        run_in_with(tmp.path(), &args(&["--", "T1"]), Some(&empty), &mut input),
         std::process::ExitCode::FAILURE
     );
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["123"]), Some(&empty), &mut input),
+        run_in_with(tmp.path(), &args(&["--", "123"]), Some(&empty), &mut input),
         std::process::ExitCode::FAILURE
     );
     // None of the failures created a branch.
@@ -229,9 +244,10 @@ fn rejects_bad_startpoints_and_conduit_symbols() {
 
 #[test]
 fn requires_a_supported_working_copy() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = TempDir::new("plain");
     assert_eq!(
-        run_in(tmp.path(), &args(&["feature"])),
+        run_in(tmp.path(), &args(&["--", "feature"])),
         std::process::ExitCode::FAILURE
     );
     // Hermetic: real `hg` treats a bare `.hg` as operable (`log`
@@ -240,7 +256,7 @@ fn requires_a_supported_working_copy() {
     // engine through an always-failing command instead (T1153 WORK-HG).
     let hg = TempDir::new("hg");
     std::fs::create_dir(hg.path().join(".hg")).unwrap();
-    let options = match parse_args(&args(&["feature"])) {
+    let options = match parse_args_with_tty(&args(&["feature"]), true) {
         ParseOutcome::Args(options) => options,
         _ => panic!("feature parses"),
     };
@@ -254,9 +270,16 @@ fn requires_a_supported_working_copy() {
 
 #[test]
 fn run_reports_help_and_usage_errors() {
-    assert_eq!(run(&args(&["--help"])), std::process::ExitCode::SUCCESS);
-    assert_eq!(run(&args(&[])), std::process::ExitCode::FAILURE);
-    assert_eq!(run(&args(&["a", "b"])), std::process::ExitCode::FAILURE);
+    // T1153 B21/B23: piped runs carry `--` to reach each arm.
+    assert_eq!(
+        run(&args(&["--help", "--"])),
+        std::process::ExitCode::SUCCESS
+    );
+    assert_eq!(run(&args(&["--"])), std::process::ExitCode::FAILURE);
+    assert_eq!(
+        run(&args(&["a", "b", "--"])),
+        std::process::ExitCode::FAILURE
+    );
 }
 
 #[test]
@@ -487,12 +510,13 @@ fn stash_list(dir: &Path) -> String {
 
 #[test]
 fn stashes_dirty_trees_around_branch_creation() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = init_repo("stash");
     commit_file(tmp.path(), "f.txt", "one");
     std::fs::write(tmp.path().join("extra.txt"), "untracked\n").unwrap();
     let mut input = std::io::Cursor::new(b"y\n");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["feature"]), None, &mut input),
+        run_in_with(tmp.path(), &args(&["--", "feature"]), None, &mut input),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(current_branch(tmp.path()), "feature");
@@ -509,12 +533,13 @@ fn stashes_dirty_trees_around_branch_creation() {
 
 #[test]
 fn declining_the_stash_aborts() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = init_repo("nostash");
     commit_file(tmp.path(), "f.txt", "one");
     std::fs::write(tmp.path().join("f.txt"), "dirty\n").unwrap();
     let mut input = std::io::Cursor::new(b"n\n");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["feature"]), None, &mut input),
+        run_in_with(tmp.path(), &args(&["--", "feature"]), None, &mut input),
         std::process::ExitCode::FAILURE
     );
     assert!(!branch_exists(tmp.path(), "feature"));
@@ -526,6 +551,7 @@ fn declining_the_stash_aborts() {
 
 #[test]
 fn failures_restore_state_and_stash() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = init_repo("restore");
     commit_file(tmp.path(), "f.txt", "one");
     let first = current_branch(tmp.path());
@@ -534,7 +560,7 @@ fn failures_restore_state_and_stash() {
     // stash; the failure must restore the branch and the stashed change.
     let mut input = std::io::Cursor::new(b"y\n");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["HEAD"]), None, &mut input),
+        run_in_with(tmp.path(), &args(&["--", "HEAD"]), None, &mut input),
         std::process::ExitCode::FAILURE
     );
     assert_eq!(current_branch(tmp.path()), first);
@@ -547,6 +573,7 @@ fn failures_restore_state_and_stash() {
 
 #[test]
 fn missing_tasks_fail_and_existing_tasks_hit_todo() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = init_repo("tasks");
     commit_file(tmp.path(), "f.txt", "one");
     let empty = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
@@ -554,7 +581,7 @@ fn missing_tasks_fail_and_existing_tasks_hit_todo() {
     };
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["T1"]), Some(&empty), &mut input),
+        run_in_with(tmp.path(), &args(&["--", "T1"]), Some(&empty), &mut input),
         std::process::ExitCode::FAILURE
     );
     // Monograms resolve to ID 0 upstream, so they never match, even when
@@ -562,12 +589,12 @@ fn missing_tasks_fail_and_existing_tasks_hit_todo() {
     let call = search_mock();
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["T7"]), Some(&call), &mut input),
+        run_in_with(tmp.path(), &args(&["--", "T7"]), Some(&call), &mut input),
         std::process::ExitCode::FAILURE
     );
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["7"]), Some(&call), &mut input),
+        run_in_with(tmp.path(), &args(&["--", "7"]), Some(&call), &mut input),
         std::process::ExitCode::FAILURE
     );
 }
@@ -581,6 +608,7 @@ fn commit_with_footer(dir: &Path, name: &str, footer: &str) {
 
 #[test]
 fn revision_symbols_switch_to_the_associated_branch() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = init_repo("revwork");
     commit_file(tmp.path(), "f.txt", "one");
     let first = current_branch(tmp.path());
@@ -591,7 +619,7 @@ fn revision_symbols_switch_to_the_associated_branch() {
     let call = search_mock();
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["123"]), Some(&call), &mut input),
+        run_in_with(tmp.path(), &args(&["--", "123"]), Some(&call), &mut input),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(current_branch(tmp.path()), "feature");
@@ -599,13 +627,14 @@ fn revision_symbols_switch_to_the_associated_branch() {
 
 #[test]
 fn unassociated_revisions_fail_without_switching() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = init_repo("revnone");
     commit_file(tmp.path(), "f.txt", "one");
     let first = current_branch(tmp.path());
     let call = search_mock();
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["123"]), Some(&call), &mut input),
+        run_in_with(tmp.path(), &args(&["--", "123"]), Some(&call), &mut input),
         std::process::ExitCode::FAILURE
     );
     assert_eq!(current_branch(tmp.path()), first);
@@ -627,6 +656,7 @@ fn commit_at_date(dir: &Path, name: &str, footer: &str, date: &str) {
 
 #[test]
 fn ambiguous_revisions_pick_the_most_recent_branch() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = init_repo("revamb");
     commit_file(tmp.path(), "f.txt", "one");
     let first = current_branch(tmp.path());
@@ -640,7 +670,7 @@ fn ambiguous_revisions_pick_the_most_recent_branch() {
     let call = search_mock();
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["123"]), Some(&call), &mut input),
+        run_in_with(tmp.path(), &args(&["--", "123"]), Some(&call), &mut input),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(current_branch(tmp.path()), "newer");
@@ -648,6 +678,7 @@ fn ambiguous_revisions_pick_the_most_recent_branch() {
 
 #[test]
 fn monogram_symbols_never_match_upstream() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = init_repo("revmono");
     commit_file(tmp.path(), "f.txt", "one");
     let first = current_branch(tmp.path());
@@ -658,7 +689,7 @@ fn monogram_symbols_never_match_upstream() {
     let call = search_mock();
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["D123"]), Some(&call), &mut input),
+        run_in_with(tmp.path(), &args(&["--", "D123"]), Some(&call), &mut input),
         std::process::ExitCode::FAILURE
     );
     assert_eq!(current_branch(tmp.path()), first);
@@ -736,6 +767,45 @@ fn hg_parses_bookmarks_and_active_mark() {
             ("feat".to_string(), "abc123".to_string()),
             ("active".to_string(), "def456".to_string()),
         ]
+    );
+}
+
+#[test]
+fn b21_work_requires_terminator_when_piped() {
+    // T1153 B21/B23: piped without `--` reports the terminator, even
+    // for `--help` and missing symbols. Unknown flags still report
+    // first; symbol-count validation runs after the terminator check.
+    assert!(matches!(
+        parse_args_with_tty(&args(&["feature"]), false),
+        ParseOutcome::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&args(&["--help"]), false),
+        ParseOutcome::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&args(&[]), false),
+        ParseOutcome::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&args(&["a", "b"]), false),
+        ParseOutcome::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&args(&["--bogus", "a"]), false),
+        ParseOutcome::Error(_)
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&args(&["--", "feature"]), false),
+        ParseOutcome::Args(_)
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&args(&["feature"]), true),
+        ParseOutcome::Args(_)
+    ));
+    assert_eq!(
+        arc_rs::help::MISSING_TERMINATOR,
+        "Missing required \"--\" in argument list."
     );
 }
 
@@ -1000,4 +1070,16 @@ fn r10_work_help_matches_generated_format() {
     assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
     // `run()` prints `usage()` (same text, ambient ANSI mode).
     assert!(usage().contains("WORK WORKFLOW"), "{}", usage());
+}
+
+#[test]
+fn b23_work_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help work`.
+    let text = usage_text(false);
+    assert!(text.starts_with("WORK WORKFLOW\n"), "{text}");
+    assert!(text.contains("Begin or resume work."), "{text}");
+    assert!(text.contains("--start"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }

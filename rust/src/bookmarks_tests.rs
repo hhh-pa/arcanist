@@ -20,8 +20,9 @@ fn scratch(name: &str) -> std::path::PathBuf {
 
 #[test]
 fn parses_defaults() {
+    // T1153 B21/B23: TTY runs need no `--`.
     assert_eq!(
-        parse_options(&args(&[])),
+        parse_options_with_tty(&args(&[]), true),
         Ok(Some(Options {
             json: false,
             conduit_uri: None,
@@ -31,15 +32,16 @@ fn parses_defaults() {
 
 #[test]
 fn parses_json_and_conduit_uri() {
+    // T1153 B21/B23: TTY runs need no `--`.
     assert_eq!(
-        parse_options(&args(&["--json"])),
+        parse_options_with_tty(&args(&["--json"]), true),
         Ok(Some(Options {
             json: true,
             conduit_uri: None,
         }))
     );
     assert_eq!(
-        parse_options(&args(&["--conduit-uri=https://host/api/"])),
+        parse_options_with_tty(&args(&["--conduit-uri=https://host/api/"]), true),
         Ok(Some(Options {
             json: false,
             conduit_uri: Some("https://host/api/".to_string()),
@@ -49,19 +51,27 @@ fn parses_json_and_conduit_uri() {
 
 #[test]
 fn help_returns_none() {
-    assert_eq!(parse_options(&args(&["--help"])), Ok(None));
-    assert_eq!(parse_options(&args(&["-h"])), Ok(None));
+    // T1153 B21/B23: TTY runs need no `--`.
+    assert_eq!(parse_options_with_tty(&args(&["--help"]), true), Ok(None));
+    assert_eq!(parse_options_with_tty(&args(&["-h"]), true), Ok(None));
 }
 
 #[test]
 fn rejects_bad_arguments() {
-    let err = parse_options(&args(&["--bogus"])).unwrap_err();
+    // T1153 B21/B23: TTY runs need no `--`; a lone `--` is the
+    // terminator (accepted), and `--help` after `--` is positional.
+    let err = parse_options_with_tty(&args(&["--bogus"]), true).unwrap_err();
     assert!(err.contains("unknown flag"), "unexpected: {err}");
-    let err = parse_options(&args(&["mark"])).unwrap_err();
+    let err = parse_options_with_tty(&args(&["mark"]), true).unwrap_err();
     assert!(err.contains("unexpected argument"), "unexpected: {err}");
-    let err = parse_options(&args(&["--"])).unwrap_err();
+    assert!(
+        parse_options_with_tty(&args(&["--"]), true)
+            .unwrap()
+            .is_some()
+    );
+    let err = parse_options_with_tty(&args(&["--", "--help"]), true).unwrap_err();
     assert!(err.contains("unexpected argument"), "unexpected: {err}");
-    let err = parse_options(&args(&["--conduit-uri"])).unwrap_err();
+    let err = parse_options_with_tty(&args(&["--conduit-uri"]), true).unwrap_err();
     assert!(err.contains("requires a value"), "unexpected: {err}");
 }
 
@@ -108,11 +118,18 @@ fn formats_json_objects() {
 
 #[test]
 fn usage_covers_options() {
-    // T1153 R10: `--help` is the generated workflow help (ceb takes no
-    // arguments; `--json`/`--conduit-uri` stay parser-accepted).
-    let text = usage();
-    assert!(text.contains("BOOKMARKS WORKFLOW"));
-    assert!(text.contains("Show an enhanced view of bookmarks in the working copy."));
+    // T1153 B21/B23: `--help` renders the generated workflow help
+    // (ceb takes no arguments, so extensions stay undocumented).
+    let text = usage_text(false);
+    assert!(text.contains("BOOKMARKS WORKFLOW"), "{text}");
+    assert!(
+        text.contains("Show an enhanced view of bookmarks in the working copy."),
+        "{text}"
+    );
+    assert!(!text.contains("--json"), "{text}");
+    assert!(!text.contains("--conduit-uri"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
 #[test]
 fn r10_bookmarks_help_matches_generated_format() {
@@ -134,4 +151,55 @@ fn r10_bookmarks_help_matches_generated_format() {
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
     // `run()` prints `usage()` (same text, ambient ANSI mode).
     assert!(usage().contains("BOOKMARKS WORKFLOW"), "{}", usage());
+}
+
+#[test]
+fn b21_bookmarks_requires_terminator_when_piped() {
+    // T1153 B21/B23: piped without `--` reports the terminator, even
+    // for `--help` and empty argv (PHP's `parseFull` runs before
+    // workflow validation). Unknown flags still report first.
+    assert_eq!(
+        parse_options_with_tty(&args(&[]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    assert_eq!(
+        parse_options_with_tty(&args(&["--help"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    assert_eq!(
+        parse_options_with_tty(&args(&["--json"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    let err = parse_options_with_tty(&args(&["--bogus"]), false).unwrap_err();
+    assert!(err.contains("unknown flag"), "unexpected: {err}");
+    assert!(
+        parse_options_with_tty(&args(&["--"]), false)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        parse_options_with_tty(&args(&["--json", "--"]), false)
+            .unwrap()
+            .is_some()
+    );
+    assert!(parse_options_with_tty(&args(&[]), true).unwrap().is_some());
+    assert_eq!(
+        crate::help::MISSING_TERMINATOR,
+        "Missing required \"--\" in argument list."
+    );
+}
+
+#[test]
+fn b23_bookmarks_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help bookmarks`.
+    // No specs and no `__param__` markers, so no underline codes.
+    let text = usage_text(false);
+    assert!(text.starts_with("BOOKMARKS WORKFLOW\n"), "{text}");
+    assert!(
+        text.contains("Lists bookmarks in the working copy"),
+        "{text}"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }

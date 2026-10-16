@@ -100,7 +100,9 @@ use arc_rs::{
 /// Subcommand name, matching `arc patch`.
 pub const NAME: &str = "patch";
 
-const USAGE: &str = "usage: arc patch [--revision ID] [--diff ID] [--arcbundle FILE] [--patch FILE] [--encoding NAME] [--update] [--nocommit] [--skip-dependencies] [--nobranch] [--force] [--preview] [--conduit-uri URI] [D12345]\n";
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
+}
 
 /// T1153 R10: `--help` renders the generated workflow help
 /// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
@@ -6055,7 +6057,7 @@ pub fn execute_with_io_ansi(
             io.push_out(&usage_text(ansi));
             return Ok(std::mem::take(&mut io.out));
         }
-        Err(message) => return Err(format!("{message}\n\n{USAGE}")),
+        Err(message) => return Err(format!("{message}\n\n{}", usage())),
     };
     if options.preview {
         return execute_preview(dir, &options, io);

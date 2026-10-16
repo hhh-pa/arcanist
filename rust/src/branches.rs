@@ -90,7 +90,22 @@ fn wants_help(argv: &[String]) -> bool {
 /// `PhutilArgumentParser` (`parseWorkflowsFull`), so this shares the
 /// ported texts with `markers` (see there for the full list).
 pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
+    parse_options_with_tty(argv, crate::prompt::stdin_is_terminal())
+}
+
+/// [`parse_options`] with an injected TTY flag (deterministic tests).
+/// T1153 B21/B23: piped runs without `--` fail with
+/// `MISSING_TERMINATOR` (checked after unknown-flag scanning, like
+/// PHP's `parseFull()`, but before success). `--help` without `--`
+/// when piped reports the terminator. Vs ceb
+/// `ArcanistRuntime.php:80-86,172-188` and
+/// `PhutilArgumentParser.php:331-336`.
+fn parse_options_with_tty(argv: &[String], stdin_tty: bool) -> Result<Option<Options>, String> {
+    let missing = crate::help::terminator_missing(argv, stdin_tty);
     if wants_help(argv) {
+        if missing {
+            return Err(crate::help::MISSING_TERMINATOR.to_string());
+        }
         return Ok(None);
     }
     let parsed = argparse::parse_toolset(
@@ -103,6 +118,9 @@ pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
         false,
         false,
     )?;
+    if missing {
+        return Err(crate::help::MISSING_TERMINATOR.to_string());
+    }
     Ok(Some(Options {
         all: parsed.flag("all"),
         json: parsed.flag("json"),
@@ -341,6 +359,11 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
+            // T1153 B21/B23: the terminator failure prints the three
+            // cyan hints first (like `ArcanistRuntime.php:172-188`).
+            if message == crate::help::MISSING_TERMINATOR {
+                crate::help::print_terminator_hints(crate::terminal::ansi_enabled());
+            }
             // T1153 CORE-5: auth-coded query failures render login
             // guidance (the toolset runtime's auth arm). The calls
             // went out on a strict client, re-resolved here for the

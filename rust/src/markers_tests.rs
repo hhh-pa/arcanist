@@ -392,10 +392,14 @@ fn resolves_types_against_detected_vcs() {
 
 #[test]
 fn usage_covers_options() {
+    // T1153 B21/B23 KEPT (Rule 2b): `markers` is abstract at ceb
+    // (`ArcanistMarkersWorkflow` has no concrete workflow, so there
+    // are no generated help bytes to match); the custom usage stays.
     let text = usage();
     assert!(text.contains("usage: arc markers"));
     assert!(text.contains("--type") && text.contains("--json"));
     assert!(text.contains("--conduit-uri"));
+    assert!(!text.contains("MARKERS WORKFLOW"), "{text}");
 }
 
 fn revision(id: u32, phid: &str, title: &str, published: bool) -> revision::RevisionRef {
@@ -785,4 +789,30 @@ fn rbd32_revision_ref_lists_key_by_phid() {
     // Unknown hashes are ignored, like PHP's `$map` miss.
     push_revision_ref_once(&mut merged, "zzz", &other);
     assert!(!merged.contains_key("zzz"));
+}
+
+#[test]
+fn b21_markers_terminator_gate_stays_global() {
+    // T1153 B21/B23 KEPT (Rule 2b): `markers` is abstract at ceb
+    // (Rust-only extra, no PHP workflow), so there is no per-command
+    // terminator behavior to match. The library parse takes no TTY
+    // input and succeeds without `--`; the binary gate still covers
+    // `arc markers` when piped (`main.rs needs_terminator_error`,
+    // `TOOLSET_EXTRA_COMMANDS`).
+    assert!(parse_options(&args(&[])).unwrap().is_some());
+    assert_eq!(parse_options(&args(&["--help"])).unwrap(), None);
+    assert!(
+        parse_options(&args(&["--type", "branch"]))
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn b23_markers_help_stays_custom() {
+    // T1153 B21/B23 KEPT (Rule 2b): abstract at ceb, so the custom
+    // usage stays instead of generated workflow help.
+    let text = usage();
+    assert!(text.starts_with("usage: arc markers"), "{text}");
+    assert!(!text.contains("WORKFLOW"), "{text}");
 }

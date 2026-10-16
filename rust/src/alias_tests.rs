@@ -454,24 +454,31 @@ fn builds_json_document() {
 
 #[test]
 fn parses_args_with_terminator_and_json() {
+    // T1153 B21/B23: TTY runs need no `--`.
     assert_eq!(
-        parse_args(&args(&[])).unwrap().unwrap(),
+        parse_args_with_tty(&args(&[]), true).unwrap().unwrap(),
         Options {
             json: false,
             positional: Vec::new(),
         }
     );
-    let options = parse_args(&args(&["draft", "diff", "--", "--draft"]))
+    let options = parse_args_with_tty(&args(&["draft", "diff", "--", "--draft"]), true)
         .unwrap()
         .unwrap();
     assert_eq!(options.positional, args(&["draft", "diff", "--draft"]));
     assert!(!options.json);
-    let options = parse_args(&args(&["--json"])).unwrap().unwrap();
+    let options = parse_args_with_tty(&args(&["--json"]), true)
+        .unwrap()
+        .unwrap();
     assert!(options.json);
-    assert!(parse_args(&args(&["--help"])).unwrap().is_none());
-    assert!(parse_args(&args(&["-h"])).unwrap().is_none());
     assert!(
-        parse_args(&args(&["--bogus"]))
+        parse_args_with_tty(&args(&["--help"]), true)
+            .unwrap()
+            .is_none()
+    );
+    assert!(parse_args_with_tty(&args(&["-h"]), true).unwrap().is_none());
+    assert!(
+        parse_args_with_tty(&args(&["--bogus"]), true)
             .unwrap_err()
             .contains("unknown flag")
     );
@@ -861,19 +868,22 @@ fn expansion_driver_emits_configuration_warnings_first() {
 
 #[test]
 fn rbd2_json_rejects_repeats() {
-    let error = parse_args(&args(&["--json", "--json"])).unwrap_err();
+    // T1153 B21/B23: TTY runs need no `--`.
+    let error = parse_args_with_tty(&args(&["--json", "--json"]), true).unwrap_err();
     assert_eq!(error, "Argument \"--json\" was provided twice.");
 }
 
 #[test]
 fn rbd25_json_rejects_inline_values() {
-    let error = parse_args(&args(&["--json=x"])).unwrap_err();
+    // T1153 B21/B23: TTY runs need no `--`.
+    let error = parse_args_with_tty(&args(&["--json=x"]), true).unwrap_err();
     assert_eq!(error, "Argument \"--json\" does not take a parameter.");
 }
 
 #[test]
 fn rbd6_lone_dash_is_positional() {
-    let options = parse_args(&args(&["-"])).unwrap().unwrap();
+    // T1153 B21/B23: TTY runs need no `--`.
+    let options = parse_args_with_tty(&args(&["-"]), true).unwrap().unwrap();
     assert_eq!(options.positional, vec!["-".to_string()]);
 }
 
@@ -1033,4 +1043,54 @@ fn r10_alias_help_matches_generated_format() {
     assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
     // `run()` prints `usage()` (same text, ambient ANSI mode).
     assert!(usage().contains("ALIAS WORKFLOW"), "{}", usage());
+}
+
+#[test]
+fn b21_alias_requires_terminator_when_piped() {
+    // T1153 B21/B23: piped without `--` reports the terminator, even
+    // for `--help` and empty argv. Unknown flags still report first.
+    assert_eq!(
+        parse_args_with_tty(&args(&[]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    assert_eq!(
+        parse_args_with_tty(&args(&["--help"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    assert_eq!(
+        parse_args_with_tty(&args(&["--json"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    let err = parse_args_with_tty(&args(&["--bogus"]), false).unwrap_err();
+    assert!(err.contains("unknown flag"), "unexpected: {err}");
+    assert!(
+        parse_args_with_tty(&args(&["--"]), false)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        parse_args_with_tty(&args(&["draft", "diff", "--", "--draft"]), false)
+            .unwrap()
+            .is_some()
+    );
+    assert!(parse_args_with_tty(&args(&[]), true).unwrap().is_some());
+    assert_eq!(
+        crate::help::MISSING_TERMINATOR,
+        "Missing required \"--\" in argument list."
+    );
+}
+
+#[test]
+fn b23_alias_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help alias`.
+    let text = usage_text(false);
+    assert!(text.starts_with("ALIAS WORKFLOW\n"), "{text}");
+    assert!(
+        text.contains("Create and modify command aliases."),
+        "{text}"
+    );
+    assert!(text.contains("--json"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }

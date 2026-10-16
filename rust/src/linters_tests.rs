@@ -706,10 +706,10 @@ fn linters_l23_single_engine_reports_unknown_linter() {
 
 #[test]
 fn linters_l25_help_uses_php_wording() {
-    // T1153 LINTERS-L25: help uses PHP wording (T1153 R10: generated
-    // workflow help now, not the custom usage line).
-    let help = super::usage();
-    assert!(help.contains("LINTERS WORKFLOW"));
+    // T1153 LINTERS-L25: help uses PHP wording.
+    // T1153 B21/B23: `--help` renders the generated workflow help.
+    let help = super::usage_text(false);
+    assert!(help.contains("LINTERS WORKFLOW"), "{help}");
     assert!(help.contains("List the available and configured linters"));
     assert!(help.contains("Show detailed information, including options."));
 }
@@ -803,4 +803,34 @@ fn r10_linters_help_matches_generated_format() {
     assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
     // `run()` prints `usage()` (same text, ambient ANSI mode).
     assert!(usage().contains("LINTERS WORKFLOW"), "{}", usage());
+}
+
+#[test]
+fn b21_linters_needs_no_terminator() {
+    // T1153 B21/B23 VERIFIED for `linters`: it is a classic workflow,
+    // so PHP runs it via the `scripts/arcanist.php` re-exec, which
+    // never requires `--`. Parsing takes no TTY input, so
+    // piped-style argv parses directly, and `--help` without `--`
+    // still succeeds.
+    assert!(matches!(
+        parse_args(&["--verbose".to_string()]),
+        ParseOutcome::Args(_)
+    ));
+    assert!(matches!(
+        parse_args(&["--help".to_string()]),
+        ParseOutcome::Help
+    ));
+    let text = usage_text(false);
+    assert!(text.contains("LINTERS WORKFLOW"), "{text}");
+}
+
+#[test]
+fn b23_linters_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help linters`.
+    let text = usage_text(false);
+    assert!(text.starts_with("LINTERS WORKFLOW\n"), "{text}");
+    assert!(text.contains("--search"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }

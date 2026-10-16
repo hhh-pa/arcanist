@@ -161,10 +161,24 @@ pub enum ParseOutcome {
     Args(Options),
     Help,
     Error(String),
+    /// T1153 B21/B23: stdin is piped and argv carries no `--`.
+    MissingTerminator,
 }
 
 /// Parse `argv` (excluding the subcommand name).
 pub fn parse_args(argv: &[String]) -> ParseOutcome {
+    parse_args_with_tty(argv, crate::prompt::stdin_is_terminal())
+}
+
+/// [`parse_args`] with an injected TTY flag (deterministic tests).
+/// T1153 B21/B23: piped runs without `--` fail with
+/// `MissingTerminator` (checked after unknown-flag scanning, like
+/// PHP's `parseFull()`, but before success). `--help` without `--`
+/// when piped reports the terminator. Vs ceb
+/// `ArcanistRuntime.php:80-86,172-188` and
+/// `PhutilArgumentParser.php:331-336`.
+fn parse_args_with_tty(argv: &[String], stdin_tty: bool) -> ParseOutcome {
+    let missing = crate::help::terminator_missing(argv, stdin_tty);
     let mut explore = false;
     let mut objects = Vec::new();
     let mut end_of_flags = false;
@@ -176,12 +190,18 @@ pub fn parse_args(argv: &[String]) -> ParseOutcome {
         } else if arg == "--explore" {
             explore = true;
         } else if arg == "-h" || arg == "--help" {
+            if missing {
+                return ParseOutcome::MissingTerminator;
+            }
             return ParseOutcome::Help;
         } else if arg.starts_with('-') {
             return ParseOutcome::Error(format!("unknown flag '{arg}'"));
         } else {
             objects.push(arg.clone());
         }
+    }
+    if missing {
+        return ParseOutcome::MissingTerminator;
     }
     ParseOutcome::Args(Options { explore, objects })
 }
@@ -756,6 +776,15 @@ fn parse_inspect_options(argv: &[String]) -> Result<Options, ExitCode> {
         ParseOutcome::Help => {
             print!("{}", usage());
             Err(ExitCode::SUCCESS)
+        }
+        // T1153 B21/B23: the terminator failure prints the three cyan
+        // hints first (like `ArcanistRuntime.php:172-188`).
+        ParseOutcome::MissingTerminator => {
+            crate::help::print_terminator_hints(terminal::ansi_enabled());
+            Err(conduit::report(
+                EnvelopeKind::ToolsetUsage,
+                crate::help::MISSING_TERMINATOR,
+            ))
         }
         ParseOutcome::Error(message) => {
             // T1153 RB-D4 (R4): `inspect` is a toolset workflow:
