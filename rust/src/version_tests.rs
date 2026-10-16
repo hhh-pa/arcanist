@@ -95,33 +95,54 @@ fn commit_at(dir: &Path, name: &str, date: &str) {
 
 #[test]
 fn parses_empty_and_help() {
-    assert_eq!(parse_args(&args(&[])), Ok(Some(())));
-    assert_eq!(parse_args(&args(&["--help"])), Ok(None));
-    assert_eq!(parse_args(&args(&["-h"])), Ok(None));
+    // T1153 BROWSE-B21: TTY runs need no `--`; piped runs do.
+    assert_eq!(parse_args_with_tty(&args(&[]), true), Ok(Some(())));
+    assert_eq!(
+        parse_args_with_tty(&args(&[]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    assert_eq!(parse_args_with_tty(&args(&["--"]), false), Ok(Some(())));
+    assert_eq!(
+        parse_args_with_tty(&args(&["--help", "--"]), false),
+        Ok(None)
+    );
+    assert_eq!(parse_args_with_tty(&args(&["-h", "--"]), false), Ok(None));
 }
 
 #[test]
 fn rejects_arguments_and_flags() {
+    // Unknown flags report before the terminator check; `--help`
+    // without `--` when piped reports the terminator.
     assert_eq!(
-        parse_args(&args(&["--"])),
-        Err("unexpected argument '--': version takes no arguments".to_string())
-    );
-    assert_eq!(
-        parse_args(&args(&["--bogus"])),
+        parse_args_with_tty(&args(&["--bogus"]), false),
         Err("unknown flag '--bogus'".to_string())
     );
     assert_eq!(
-        parse_args(&args(&["extra"])),
+        parse_args_with_tty(&args(&["extra", "--"]), false),
         Err("unexpected argument 'extra'".to_string())
+    );
+    assert_eq!(
+        parse_args_with_tty(&args(&["--help"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
     );
 }
 
 #[test]
 fn usage_names_command_and_synopsis() {
-    let text = usage();
-    assert!(text.starts_with("usage: arc version\n"), "{text}");
-    assert!(text.contains("Show toolset version information."), "{text}");
-    assert!(text.contains("Shows the current version."), "{text}");
+    // T1153 BROWSE-B23: `--help` renders the generated workflow help.
+    let text = usage_text(false);
+    assert_eq!(
+        text,
+        "VERSION WORKFLOW\n\
+         \n\
+         version\n\
+         Show toolset version information.\n\
+         \n\
+         Shows the current version.\n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
 
 #[test]
@@ -243,14 +264,15 @@ fn fails_without_commits() {
 
 #[test]
 fn run_in_reports_help_and_usage_errors() {
+    // T1153 BROWSE-B21: piped runs carry `--`.
     let repo = fresh_repo("runin");
     commit_at(&repo.path, "a.txt", "2026-10-05 12:00:00 +0000");
     assert_eq!(
-        run_in(&repo.path, &args(&[])),
+        run_in(&repo.path, &args(&["--"])),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(
-        run_in(&repo.path, &args(&["--help"])),
+        run_in(&repo.path, &args(&["--help", "--"])),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(
@@ -261,7 +283,11 @@ fn run_in_reports_help_and_usage_errors() {
 
 #[test]
 fn run_reports_help_and_usage_errors() {
-    assert_eq!(run(&args(&["--help"])), std::process::ExitCode::SUCCESS);
+    // T1153 BROWSE-B21: piped runs carry `--`.
+    assert_eq!(
+        run(&args(&["--help", "--"])),
+        std::process::ExitCode::SUCCESS
+    );
     assert_eq!(run(&args(&["--bogus"])), std::process::ExitCode::FAILURE);
 }
 

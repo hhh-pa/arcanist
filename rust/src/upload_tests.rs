@@ -530,7 +530,7 @@ fn upx_b21_upload_requires_terminator_when_piped() {
         ParseOutcome::Error(_)
     ));
     assert_eq!(
-        MISSING_TERMINATOR,
+        crate::help::MISSING_TERMINATOR,
         "Missing required \"--\" in argument list."
     );
 }
