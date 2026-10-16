@@ -13,7 +13,8 @@ fn args_of(words: &[&str]) -> Options {
 
 #[test]
 fn parses_create_options() {
-    let opts = args_of(&["--title", "t", "--lang", "rust", "--input", "f.txt"]);
+    // T1153 BROWSE-B21: piped runs carry `--`.
+    let opts = args_of(&["--title", "t", "--lang", "rust", "--input", "f.txt", "--"]);
     assert_eq!(opts.title, Some("t".to_string()));
     assert_eq!(opts.lang, Some("rust".to_string()));
     assert_eq!(opts.input, Some("f.txt".to_string()));
@@ -22,17 +23,20 @@ fn parses_create_options() {
 
 #[test]
 fn parses_read_symbol() {
-    let opts = args_of(&["P123"]);
+    // T1153 BROWSE-B21: piped runs carry `--`.
+    let opts = args_of(&["P123", "--"]);
     assert_eq!(opts.symbol, Some("P123".to_string()));
 }
 
 #[test]
 fn rejects_read_mode_creation_flags() {
+    // T1153 BROWSE-B21: `--` present, so validation (not the
+    // terminator) reports.
     for words in [
-        &["P1", "--lang", "x"][..],
-        &["P1", "--title", "x"][..],
-        &["P1", "--input", "f"][..],
-        &["P1", "--browse"][..],
+        &["P1", "--lang", "x", "--"][..],
+        &["P1", "--title", "x", "--"][..],
+        &["P1", "--input", "f", "--"][..],
+        &["P1", "--browse", "--"][..],
     ] {
         let ParseOutcome::Error(message) = parse_args(&argv(words)) else {
             panic!("expected error for {words:?}");
@@ -40,16 +44,17 @@ fn rejects_read_mode_creation_flags() {
         assert!(message.contains("not supported when reading"), "{message}");
     }
     assert!(matches!(
-        parse_args(&argv(&["P1", "P2"])),
+        parse_args(&argv(&["P1", "P2", "--"])),
         ParseOutcome::Error(_)
     ));
 }
 
 #[test]
 fn parses_browse_on_create() {
-    let opts = args_of(&["--browse"]);
+    // T1153 BROWSE-B21: piped runs carry `--`.
+    let opts = args_of(&["--browse", "--"]);
     assert!(opts.browse);
-    assert!(!args_of(&[]).browse);
+    assert!(!args_of(&["--"]).browse);
 }
 
 #[test]
@@ -179,7 +184,8 @@ fn browse_opens_the_created_paste() {
     let edit = paste_p_envelope(r#"{"object": {"id": 5, "phid": "PHID-PSTE-5"}}"#);
     let (base, _rx) = serve_seq(vec![edit, paste_p_search_hit(5, "t")]);
     let client = crate::conduit::Client::new(&base, "t").unwrap();
-    let opts = args_of(&["--browse"]);
+    // T1153 BROWSE-B21: piped runs carry `--`.
+    let opts = args_of(&["--browse", "--"]);
     // T1153 PASTE-P3: parts carry the text plus the browse URI (the CLI
     // prints first, then browses).
     let parts = create_paste_parts(&dir, &client, &opts, Some("hello")).unwrap();
@@ -404,7 +410,8 @@ fn paste_p14_non_utf8_input_sends_empty_params() {
             .to_string(),
     ]);
     let client = crate::conduit::Client::new(&base, "t").unwrap();
-    let opts = args_of(&["--input", "latin1.txt"]);
+    // T1153 BROWSE-B21: piped runs carry `--`.
+    let opts = args_of(&["--input", "latin1.txt", "--"]);
     let err = create_paste_parts(&dir, &client, &opts, None).unwrap_err();
     assert!(err.message.contains("validation failed"), "{}", err.message);
     let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
@@ -466,4 +473,91 @@ fn paste_p18_usage_errors_classify_toolset() {
     let err = read_paste_classified(&client, "P999").unwrap_err();
     assert_eq!(err.kind, EnvelopeKind::ToolsetUsage);
     assert!(err.message.contains("does not exist"), "{}", err.message);
+}
+
+#[test]
+fn upx_b21_paste_requires_terminator_when_piped() {
+    // Piped without `--`: the terminator reports, even for `--help`
+    // and empty argv (PHP's `parseFull` runs before
+    // `didParseArguments`).
+    assert!(matches!(
+        parse_args_with_tty(&argv(&["P123"]), false),
+        ParseOutcome::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&argv(&["--help"]), false),
+        ParseOutcome::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&argv(&[]), false),
+        ParseOutcome::MissingTerminator
+    ));
+    // Unknown flags still report first.
+    assert!(matches!(
+        parse_args_with_tty(&argv(&["--bogus"]), false),
+        ParseOutcome::Error(_)
+    ));
+    // `--` (or a TTY) proceeds to normal validation.
+    assert!(matches!(
+        parse_args_with_tty(&argv(&["--", "P123"]), false),
+        ParseOutcome::Args(_)
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&argv(&["P123"]), true),
+        ParseOutcome::Args(_)
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&argv(&["P1", "P2", "--"]), false),
+        ParseOutcome::Error(_)
+    ));
+    assert_eq!(
+        MISSING_TERMINATOR,
+        "Missing required \"--\" in argument list."
+    );
+}
+
+#[test]
+fn upx_b23_paste_help_matches_generated_format() {
+    // PHP sets no synopsis for `paste`, so the synopsis line renders
+    // empty (the blank line after the examples).
+    assert_eq!(
+        usage_text(false),
+        "PASTE WORKFLOW\n\
+         \n\
+         paste [options] --\n\
+         paste [options] -- object\n\
+         \n\
+         \n\
+         Share and grab text using the Paste application. To create a paste, use the\n\
+         \"--input\" flag or provide the text on stdin:\n\
+         \n\
+         \x20 $ cat list_of_ducks.txt | arc paste\n\
+         \x20 $ arc paste --input list_of_ducks.txt\n\
+         \n\
+         To retrieve a paste, specify the paste ID:\n\
+         \n\
+         \x20 $ arc paste P123\n\
+         \n\
+         \x20     --browse\n\
+         \x20         After creating a paste, open it in a web browser.\n\
+         \n\
+         \x20     --input path\n\
+         \x20         Create a paste using the content in a file.\n\
+         \n\
+         \x20     --lang language\n\
+         \x20         Language for the paste.\n\
+         \n\
+         \x20     --title title\n\
+         \x20         Title for the paste.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `--help` still exits zero once `--` satisfies the terminator.
+    match execute(&std::env::temp_dir(), &argv(&["--help", "--"])) {
+        Ok(text) => assert!(text.contains("PASTE WORKFLOW"), "{text}"),
+        Err(message) => panic!("expected help, got {message}"),
+    }
 }

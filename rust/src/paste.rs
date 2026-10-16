@@ -21,23 +21,79 @@ pub const NAME: &str = "paste";
 
 const DEFAULT_TITLE: &str = "Command-Line Input";
 
-fn usage() -> String {
-    format!(
-        "usage: arc {NAME} [--title TITLE] [--lang LANG] [--input PATH] [--browse]\n\
-         \x20      arc {NAME} P123\n\
-         \n\
-         Share and grab text using the Paste application. To create a paste,\n\
-         use --input or provide the text on stdin; to retrieve one, give\n\
-         its paste ID.\n\
-         \n\
-         Options:\n\
-         \x20 --title TITLE  title for the paste\n\
-         \x20 --lang LANG    language for the paste\n\
-         \x20 --input PATH   create a paste from a file ('-' reads stdin)\n\
-         \x20 --browse       after creating a paste, open it in a web browser\n\
-         \x20 --conduit-uri URI  conduit server (or ARC_CONDUIT_URI / .arcconfig)\n\
-         \x20 -h, --help     show this help\n"
+/// T1153 BROWSE-B23: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string.
+const HELP_EXAMPLES: &str = "**paste** [__options__] --\n**paste** [__options__] -- __object__";
+/// PHP sets no synopsis for `paste`, so `getSynopsis()` is null and the
+/// synopsis line renders empty.
+const HELP_SYNOPSIS: &str = "";
+/// `getWorkflowInformation()` help after `newPhutilWorkflow()` unwraps
+/// newlines between non-space characters.
+const HELP_TEXT: &str = "Share and grab text using the Paste application. To create a paste, use the \"--input\" flag or provide the text on stdin:\n\n  $ cat list_of_ducks.txt | arc paste\n  $ arc paste --input list_of_ducks.txt\n\nTo retrieve a paste, specify the paste ID:\n\n  $ arc paste P123";
+/// Non-wildcard argument specs in `msort` order: (name, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, &str)] = &[
+    (
+        "browse",
+        None,
+        "After creating a paste, open it in a web browser.",
+    ),
+    (
+        "input",
+        Some("path"),
+        "Create a paste using the content in a file.",
+    ),
+    ("lang", Some("language"), "Language for the paste."),
+    ("title", Some("title"), "Title for the paste."),
+];
+
+/// `PhutilArgumentParser::indent()`: interpret markup, then wrap.
+fn help_indent(level: usize, text: &str, ansi: bool) -> String {
+    crate::terminal::console_wrap(
+        &crate::terminal::console_format(text, &[], ansi),
+        level,
+        true,
     )
+}
+
+/// `renderArgumentSpecs()` for the workflow arguments.
+fn help_specs(ansi: bool) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for (name, param, help) in HELP_SPECS {
+        let mut first = help_indent(6, &format!("__--{name}__"), ansi);
+        if let Some(param) = param {
+            first.push_str(&crate::terminal::console_format(
+                &format!(" __{param}__"),
+                &[],
+                ansi,
+            ));
+        }
+        out.push(first);
+        out.push(help_indent(10, help, ansi));
+        out.push(String::new());
+    }
+    out.join("\n")
+}
+
+/// The full `--help` text: `**PASTE WORKFLOW**` header plus the
+/// detailed workflow help and a trailing blank line.
+fn usage_text(ansi: bool) -> String {
+    let header = crate::terminal::console_format("**%s**\n\n", &["PASTE WORKFLOW"], ansi);
+    let body = [
+        help_indent(0, HELP_EXAMPLES, ansi),
+        help_indent(0, HELP_SYNOPSIS, ansi),
+        String::new(),
+        help_indent(0, HELP_TEXT, ansi),
+        String::new(),
+        help_specs(ansi),
+        String::new(),
+    ]
+    .join("\n");
+    format!("{header}{body}\n")
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
 }
 
 /// A paste symbol: numeric ID(s) or PHID(s).
@@ -61,6 +117,8 @@ enum ParseOutcome {
     Args(Options),
     Help,
     Error(String),
+    /// T1153 BROWSE-B21: stdin is piped and argv carries no `--`.
+    MissingTerminator,
 }
 
 fn take_value(iter: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<String, String> {
@@ -207,7 +265,14 @@ impl Parser {
         self.tail(arg)
     }
 
-    fn finish(self) -> ParseOutcome {
+    fn finish(self, missing_terminator: bool) -> ParseOutcome {
+        // T1153 BROWSE-B21: the terminator check runs after flag
+        // scanning (unknown flags report first, like PHP's
+        // `parseFull()`), but before workflow validation (PHP's
+        // `didParseArguments` runs after it).
+        if missing_terminator {
+            return ParseOutcome::MissingTerminator;
+        }
         if self.symbol.is_some() {
             if self.lang.is_some() {
                 return ParseOutcome::Error(
@@ -242,16 +307,78 @@ impl Parser {
     }
 }
 
+/// T1153 BROWSE-B21: noninteractive runs must carry `--`
+/// (`ArcanistRuntime.php:80-86`, enforced by
+/// `PhutilArgumentParser::parseFull()`). Any standalone `--` token
+/// satisfies PHP: the standard-arguments scan that records it never
+/// consumes workflow flag values.
+fn terminator_missing(argv: &[String], stdin_tty: bool) -> bool {
+    !stdin_tty && !argv.iter().any(|arg| arg == "--")
+}
+
+const MISSING_TERMINATOR: &str = "Missing required \"--\" in argument list.";
+
+/// The three cyan `USAGE` hints PHP prints before the terminator
+/// error (`ArcanistRuntime.php:172-188`), on stderr like PHP.
+fn print_terminator_hints(ansi: bool) {
+    use crate::terminal::{PhtArg, TVal};
+    let usage = crate::terminal::pht("USAGE", &[]);
+    for hint in [
+        crate::terminal::pht(
+            "\"%s\" is being run noninteractively, but the argument list is missing \"--\" to indicate end of flags.",
+            &[PhtArg::Text("arc")],
+        ),
+        crate::terminal::pht(
+            "When running noninteractively, you MUST provide \"--\" to all commands (even if they take no arguments).",
+            &[],
+        ),
+    ] {
+        eprint!(
+            "{}",
+            crate::terminal::format_log("cyan", &usage, &hint, ansi)
+        );
+    }
+    // `tsprintf('%s <__%s__>', ...)` nested like PHP: the inner line
+    // passes through the outer `%s` unescaped (`TVal::Terminal`).
+    let inner = crate::terminal::tsprintf_ansi(
+        "%s <__%s__>",
+        &[
+            TVal::Text(&crate::terminal::pht("Learn More:", &[])),
+            TVal::Text("https://phurl.io/u/noninteractive"),
+        ],
+        ansi,
+    )
+    .expect("fixed tsprintf pattern");
+    let line = crate::terminal::tsprintf_ansi(
+        "**<bg:cyan> %s </bg>** %s\n",
+        &[TVal::Text(&usage), TVal::Terminal(&inner)],
+        ansi,
+    )
+    .expect("fixed tsprintf pattern");
+    eprint!("{}", line.as_str());
+}
+
 fn parse_args(argv: &[String]) -> ParseOutcome {
+    parse_args_with_tty(argv, crate::prompt::stdin_is_terminal())
+}
+
+/// [`parse_args`] with an injected TTY flag (deterministic tests).
+fn parse_args_with_tty(argv: &[String], stdin_tty: bool) -> ParseOutcome {
+    let missing = terminator_missing(argv, stdin_tty);
     let mut parser = Parser::new();
     let mut iter = argv.iter();
     while let Some(arg) = iter.next() {
         match parser.consume(arg, &mut iter) {
             Step::Handled => {}
+            // `--help` reroutes through the help workflow in PHP,
+            // which still requires the terminator.
+            Step::Done(ParseOutcome::Help) if missing => {
+                return ParseOutcome::MissingTerminator;
+            }
             Step::Done(outcome) => return outcome,
         }
     }
-    parser.finish()
+    parser.finish(missing)
 }
 
 /// The `ArcanistSimpleSymbolRef::resolveSymbol()` rejection
@@ -721,6 +848,11 @@ fn execute_parts(
                 browse_uri: None,
             });
         }
+        ParseOutcome::MissingTerminator => {
+            return Err(ClassifiedError::toolset_usage(
+                MISSING_TERMINATOR.to_string(),
+            ));
+        }
         ParseOutcome::Error(message) => return Err(ClassifiedError::toolset_usage(message)),
     };
     let client =
@@ -787,7 +919,12 @@ pub fn run_in_with_sink(dir: &Path, argv: &[String], sink: &mut dyn FnMut(&str))
             }
             ExitCode::SUCCESS
         }
-        Err(err) => err.report(),
+        Err(err) => {
+            if err.message == MISSING_TERMINATOR {
+                print_terminator_hints(crate::terminal::ansi_enabled());
+            }
+            err.report()
+        }
     }
 }
 
