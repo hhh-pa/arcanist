@@ -675,3 +675,450 @@ fn r4_browseb20_workflow_error_is_fatal() {
         std::process::ExitCode::from(255)
     );
 }
+
+// -( T1153 Wave 2: browse retrocompat )---------------------------------------
+
+#[test]
+fn browse_b1_force_yields_to_explicit_types() {
+    // `--types commit --force` resolves the commit kind (PHP
+    // `ArcanistBrowseWorkflow.php:88-97`), so the missing
+    // `diffusion.querycommits` route fails loudly (fatal); bare
+    // `--force` still resolves the path kind (exit 0).
+    let tmp = repo_fixture("forcewins");
+    std::fs::write(
+        tmp.path.join(".arcconfig"),
+        serde_json::json!({
+            "repository.callsign": "X",
+            "browser": null_browser(),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let call = mock(repo_routes());
+    let mut input: &[u8] = &[];
+    assert_eq!(
+        run_in_with(
+            &tmp.path,
+            &argv(&["--types", "commit", "--force", "--", "HEAD"]),
+            Some(&call),
+            &mut input
+        ),
+        std::process::ExitCode::from(255)
+    );
+    let mut input: &[u8] = &[];
+    assert_eq!(
+        run_in_with(
+            &tmp.path,
+            &argv(&["--force", "--", "HEAD"]),
+            Some(&call),
+            &mut input
+        ),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
+#[test]
+fn browse_b2_default_token_decided_per_ref() {
+    // PHP reuses the last warning-loop `$token` for every row (a
+    // leftover loop variable, kept like LAND-41); Rust decides per
+    // ref. Reversed order pins it: stale state would show `T7` on
+    // all four rows.
+    let refs = vec![pick_ref(None), pick_ref(Some("T7"))];
+    let resolved = vec![
+        pick_hits(&[("u1", "commit"), ("u2", "object")]),
+        pick_hits(&[("u3", "commit"), ("u4", "object")]),
+    ];
+    assert_eq!(
+        render_pick_table(&refs, &resolved, false, false),
+        "Argument  Type   URI\n\
+         <default> commit u1\n\
+         <default> object u2\n\
+         T7        commit u3\n\
+         T7        object u4\n"
+    );
+}
+
+#[test]
+fn browse_b4_eof_during_pick_aborts() {
+    // PHP loops forever on EOF; Rust aborts (kept: PHP never
+    // terminates, like the CORE-46/54 keep).
+    let mut input = std::io::Cursor::new(b"");
+    assert_eq!(
+        console_select_with_tty(&mut input, "Pick?", 1, 3, true).unwrap_err(),
+        ABORT
+    );
+}
+
+#[test]
+fn browse_b5_absolute_uri_drops_query_and_fragment() {
+    assert_eq!(
+        absolute_uri("https://phab.example/api/", "/D123?x=1#frag"),
+        "https://phab.example/D123"
+    );
+    // Protocol-relative URIs already have a domain: kept whole.
+    assert_eq!(
+        absolute_uri("https://phab.example/api/", "//other.test/x?y=1"),
+        "//other.test/x?y=1"
+    );
+    // Absolute URIs (query included) still pass through.
+    assert_eq!(
+        absolute_uri("https://phab.example/api/", "https://x.test/y?z"),
+        "https://x.test/y?z"
+    );
+}
+
+#[test]
+fn browse_b6_legacy_hit_without_uri_falls_back_to_monogram() {
+    let mut routes = HashMap::new();
+    routes.insert(
+        "differential.query".to_string(),
+        serde_json::json!([
+            {"id": 12, "statusName": "Needs Review", "hashes": [["gtcm", "abc"]]},
+            {"id": "13", "statusName": "Accepted", "hashes": [["gtcm", "def"]]},
+        ]),
+    );
+    let call = mock(routes);
+    let pairs = vec![
+        vec!["gtcm".to_string(), "abc".to_string()],
+        vec!["gtcm".to_string(), "def".to_string()],
+    ];
+    let hits = hash_revision_hits(&call, &pairs).unwrap();
+    assert_eq!(hits.get("abc").unwrap(), &vec![("/D12".to_string(), false)]);
+    // String ids coerce like PHP's `(int)` cast.
+    assert_eq!(hits.get("def").unwrap(), &vec![("/D13".to_string(), false)]);
+}
+
+#[test]
+fn browse_b8_top_level_default_branch_ignored() {
+    // PHP reads only `fields.defaultBranch`.
+    assert_eq!(
+        default_branch_of(&serde_json::json!({"defaultBranch": "top"})),
+        "master"
+    );
+    assert_eq!(
+        default_branch_of(&serde_json::json!({"fields": {"defaultBranch": "dev"}})),
+        "dev"
+    );
+    assert_eq!(default_branch_of(&serde_json::json!({})), "master");
+}
+
+#[test]
+fn browse_b9_lines_zero_dropped() {
+    let repo = RepoInfo {
+        phid: "PHID-REPO-1".to_string(),
+        browse_uri: "https://phab.example/diffusion/X/".to_string(),
+        default_branch: "master".to_string(),
+    };
+    // PHP's `if ($params['lines'])` drops `'0'` (falsy); any other
+    // string, including `'00'`, stays.
+    assert_eq!(
+        new_browse_uri(&repo, "f", Some("0"), None),
+        "https://phab.example/diffusion/X/browse/master/f"
+    );
+    assert_eq!(
+        new_browse_uri(&repo, "f", Some("00"), None),
+        "https://phab.example/diffusion/X/browse/master/f$00"
+    );
+    assert_eq!(
+        new_browse_uri(&repo, "f", Some("12"), None),
+        "https://phab.example/diffusion/X/browse/master/f$12"
+    );
+}
+
+#[test]
+fn browse_b10_null_token_head_failure_throws() {
+    let tmp = TempDir::new("nohead");
+    git(&tmp.path, &["init", "-q", "-b", "master"]);
+    // A missing token resolves `HEAD` outside the per-token
+    // try/catch, so an unresolvable `HEAD` throws.
+    let rf = pick_ref(None);
+    assert_eq!(
+        commits_for_one_ref(&tmp.path, &rf).unwrap_err(),
+        "Unable to find any git commit named 'HEAD' in this repository."
+    );
+    // Explicit bad tokens still resolve to nothing, and path-only
+    // refs never touch `HEAD` (the path query wants no commitrefs).
+    let rf = pick_ref(Some("no-such-rev"));
+    assert!(commits_for_one_ref(&tmp.path, &rf).unwrap().is_empty());
+    let rf = BrowseRef {
+        token: None,
+        types: vec![BROWSE_PATH.to_string()],
+        branch: None,
+    };
+    assert!(commits_for_one_ref(&tmp.path, &rf).unwrap().is_empty());
+}
+
+#[test]
+fn browse_b11_remote_uri_applies_insteadof() {
+    let tmp = fixture_repo("instead");
+    git(&tmp.path, &["remote", "add", "origin", "orig:X.git"]);
+    git(
+        &tmp.path,
+        &["config", "url.git@example.test:.insteadOf", "orig:"],
+    );
+    // `git remote get-url` rewrites; `git config` would echo `orig:`.
+    assert_eq!(
+        remote_uri(&tmp.path).as_deref(),
+        Some("git@example.test:X.git")
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn browse_b12_leaf_symlink_stays_unresolved() {
+    let tmp = TempDir::new("leaf");
+    std::fs::write(tmp.path.join("target.txt"), "x").unwrap();
+    std::os::unix::fs::symlink("target.txt", tmp.path.join("link.txt")).unwrap();
+    let link = tmp.path.join("link.txt");
+    let resolved = canonicalize_lax(&link);
+    // The parent resolves but the leaf name survives, like PHP's
+    // `resolvePath()`; resolving through would end at `target.txt`.
+    assert_eq!(resolved.file_name().unwrap(), "link.txt");
+    assert_eq!(
+        resolved.parent().unwrap(),
+        tmp.path.canonicalize().unwrap().as_path()
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn browse_b13_broken_symlink_counts_as_existing() {
+    let tmp = TempDir::new("broken");
+    std::fs::write(tmp.path.join("real.txt"), "x").unwrap();
+    std::os::unix::fs::symlink("missing.txt", tmp.path.join("link.txt")).unwrap();
+    assert!(path_exists(&tmp.path.join("real.txt")));
+    assert!(path_exists(&tmp.path.join("link.txt")));
+    assert!(!path_exists(&tmp.path.join("missing.txt")));
+}
+
+#[test]
+fn browse_b14_status_lines_use_writewarn_format() {
+    // `push_status` routes through `format_status_message`
+    // (`writeWarn`/`writeInfo`), not the log engine: bold nests
+    // inside the background color, and values pass through raw.
+    let status = terminal::format_status_message("yellow", "AMBIGUOUS", "m", true);
+    assert!(status.contains("\x1b[43m\x1b[1m"), "{status:?}");
+    let log = terminal::format_log("yellow", "AMBIGUOUS", "m", true);
+    assert!(log.contains("\x1b[1m\x1b[43m"), "{log:?}");
+    let raw = terminal::format_status_message("blue", "L", "a\x01b", false);
+    assert!(raw.contains("a\x01b"), "{raw:?}");
+}
+
+#[test]
+fn browse_b15_wide_chars_pad_by_columns() {
+    // `日本` spans 4 console columns (2 chars); `x` pads to 4, not 2.
+    let out = render_table(
+        &["K", "V"],
+        &[
+            vec!["日本".to_string(), "1".to_string()],
+            vec!["x".to_string(), "2".to_string()],
+        ],
+    );
+    assert_eq!(out, "K    V\n日本 1\nx    2\n");
+}
+
+#[test]
+fn browse_b16_kind_order_is_fixed() {
+    // PHP follows future-resolution order (nondeterministic); Rust
+    // resolves commit/object/path/revision (kept: one valid order,
+    // deterministic). A token that is a branch, a file, and an
+    // object exercises all four kinds at once.
+    let tmp = repo_fixture("kindorder");
+    std::fs::write(tmp.path.join("myfile"), "x\n").unwrap();
+    git(&tmp.path, &["add", "myfile"]);
+    git(&tmp.path, &["commit", "-qm", "add myfile"]);
+    git(&tmp.path, &["branch", "myfile"]);
+    let head = git(&tmp.path, &["rev-parse", "HEAD"]);
+    let mut routes = repo_routes();
+    routes.insert(
+        "diffusion.querycommits".to_string(),
+        serde_json::json!({
+            "identifierMap": {head.clone(): "PHID-CMT-1"},
+            "data": {"PHID-CMT-1": {"uri": "/rXabc"}},
+        }),
+    );
+    routes.insert(
+        "phid.lookup".to_string(),
+        serde_json::json!({"myfile": {"uri": "https://phab.example/object/myfile"}}),
+    );
+    routes.insert(
+        "differential.query".to_string(),
+        serde_json::json!([{
+            "id": 7,
+            "statusName": "Accepted",
+            "uri": "https://phab.example/D7",
+            "hashes": [["gtcm", head]],
+        }]),
+    );
+    let call = mock(routes);
+    let mut ctx = BrowseCtx::new(&tmp.path, &call, "https://phab.example/api/");
+    let refs = vec![pick_ref(Some("myfile"))];
+    let resolved = resolve_refs(&mut ctx, &refs).unwrap();
+    let kinds: Vec<&str> = resolved[0].uris.iter().map(|u| u.kind.as_str()).collect();
+    assert_eq!(kinds, vec!["commit", "object", "path", "revision"]);
+}
+
+#[test]
+fn browse_b17_querycommits_names_deduped() {
+    // Two tokens resolving to one hash send one name, like PHP's
+    // `array_keys($commit_map)`.
+    let tmp = repo_fixture("dedupe");
+    let head = git(&tmp.path, &["rev-parse", "HEAD"]);
+    let seen: std::cell::RefCell<Vec<serde_json::Value>> = std::cell::RefCell::new(Vec::new());
+    let routes = repo_routes();
+    let call = |method: &str, params: &serde_json::Value| {
+        if method == "diffusion.querycommits" {
+            seen.borrow_mut().push(params.clone());
+            return Ok(serde_json::json!({
+                "identifierMap": {head.clone(): "PHID-CMT-1"},
+                "data": {"PHID-CMT-1": {"uri": "/rXabc"}},
+            }));
+        }
+        routes
+            .get(method)
+            .cloned()
+            .ok_or_else(|| format!("unexpected call {method}"))
+    };
+    let mut ctx = BrowseCtx::new(&tmp.path, &call, "https://phab.example/api/");
+    let refs = vec![
+        BrowseRef {
+            token: Some("HEAD".to_string()),
+            types: vec![BROWSE_COMMIT.to_string()],
+            branch: None,
+        },
+        BrowseRef {
+            token: Some("master".to_string()),
+            types: vec![BROWSE_COMMIT.to_string()],
+            branch: None,
+        },
+    ];
+    resolve_refs(&mut ctx, &refs).unwrap();
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0]["names"], serde_json::json!([head]));
+}
+
+#[test]
+fn browse_b18_hash_match_compares_type_and_value() {
+    // PHP keys hashes as `type:value`; a tree hash never matches a
+    // commit-hash pair.
+    let mut routes = HashMap::new();
+    routes.insert(
+        "differential.query".to_string(),
+        serde_json::json!([
+            {"id": 1, "statusName": "Accepted", "uri": "u-tree",
+             "hashes": [["gttr", "abc"]]},
+            {"id": 2, "statusName": "Accepted", "uri": "u-commit",
+             "hashes": [["gtcm", "abc"]]},
+        ]),
+    );
+    let call = mock(routes);
+    let pairs = vec![vec!["gtcm".to_string(), "abc".to_string()]];
+    let hits = hash_revision_hits(&call, &pairs).unwrap();
+    assert_eq!(
+        hits.get("abc").unwrap(),
+        &vec![("u-commit".to_string(), false)]
+    );
+}
+
+#[test]
+fn browse_b21_terminator_required_when_piped() {
+    assert!(terminator_missing(&argv(&["HEAD"]), false));
+    assert!(!terminator_missing(&argv(&["--", "HEAD"]), false));
+    assert!(!terminator_missing(&argv(&["HEAD"]), true));
+    assert_eq!(
+        MISSING_TERMINATOR,
+        "Missing required \"--\" in argument list."
+    );
+    // The failure renders toolset usage (exit 1); `--` proceeds.
+    assert_eq!(
+        terminator_exit(&argv(&["HEAD"]), false),
+        Some(std::process::ExitCode::FAILURE)
+    );
+    assert_eq!(terminator_exit(&argv(&["--", "HEAD"]), false), None);
+    assert_eq!(terminator_exit(&argv(&["HEAD"]), true), None);
+}
+
+#[test]
+fn browse_b23_help_matches_generated_format() {
+    assert_eq!(
+        help_text(false),
+        "BROWSE WORKFLOW\n\
+         \n\
+         browse [options] -- target ...\n\
+         browse -- file-name\n\
+         browse -- object-name\n\
+         Open a file or object in a local web browser.\n\
+         \n\
+         Open a file or object (like a task or revision) in a local web browser.\n\
+         \n\
+         \x20 $ arc browse README   # Open a file in Diffusion.\n\
+         \x20 $ arc browse T123     # View a task.\n\
+         \x20 $ arc browse HEAD     # View a symbolic commit.\n\
+         \n\
+         To choose a browser binary to invoke, use:\n\
+         \n\
+         \x20 $ arc set-config browser browser-binary\n\
+         \n\
+         If no browser is set, the command will try to guess which browser to use.\n\
+         \n\
+         \x20     --branch branch-name\n\
+         \x20         Default branch name to view on server. Defaults to \"master\".\n\
+         \n\
+         \x20     --force\n\
+         \x20         (DEPRECATED) Obsolete, use \"--types path\" instead.\n\
+         \n\
+         \x20     --types type-list\n\
+         \x20         Force targets to be interpreted as naming particular types of\n\
+         \x20         resources.\n\
+         \n\
+         \n"
+    );
+    // ANSI mode carries bold/underline codes.
+    let ansi = help_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `--help` still exits zero once `--` satisfies the terminator.
+    let dir = std::env::temp_dir();
+    let mut input: &[u8] = &[];
+    assert_eq!(
+        run_in_with(&dir, &argv(&["--help", "--"]), None, &mut input),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
+#[test]
+fn browse_b26_phid_lookup_keeps_ref_order() {
+    // PHP sends `$token_set` in ref order; the old `BTreeMap` sorted
+    // the keys (here `T9` must precede `T7` on the wire).
+    let tmp = fixture_repo("phidorder");
+    let seen: std::cell::RefCell<Vec<serde_json::Value>> = std::cell::RefCell::new(Vec::new());
+    let call = |method: &str, params: &serde_json::Value| {
+        assert_eq!(method, "phid.lookup");
+        seen.borrow_mut().push(params.clone());
+        Ok(serde_json::json!({
+            "T9": {"uri": "https://phab.example/T9"},
+            "T7": {"uri": "https://phab.example/T7"},
+        }))
+    };
+    let mut ctx = BrowseCtx::new(&tmp.path, &call, "https://phab.example/api/");
+    let refs = vec![
+        BrowseRef {
+            token: Some("T9".to_string()),
+            types: vec![BROWSE_OBJECT.to_string()],
+            branch: None,
+        },
+        BrowseRef {
+            token: Some("T7".to_string()),
+            types: vec![BROWSE_OBJECT.to_string()],
+            branch: None,
+        },
+    ];
+    resolve_refs(&mut ctx, &refs).unwrap();
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        serde_json::to_string(&seen[0]["names"]).unwrap(),
+        r#"{"T9":"T9","T7":"T7"}"#
+    );
+}

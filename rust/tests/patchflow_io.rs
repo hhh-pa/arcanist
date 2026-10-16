@@ -131,8 +131,9 @@ fn commands_reject_bad_args_without_io() {
 #[test]
 fn help_succeeds_for_all_commands() {
     let fx = Fixture::named("help");
+    // T1153 BROWSE-B21: piped `--help` carries `--`.
     assert_eq!(
-        download::run_in(fx.path(), &argv(&["--help"])),
+        download::run_in(fx.path(), &argv(&["--help", "--"])),
         ExitCode::SUCCESS
     );
     assert_eq!(
@@ -147,10 +148,11 @@ fn help_succeeds_for_all_commands() {
         liberate::run_in(fx.path(), &argv(&["--help"])),
         ExitCode::SUCCESS
     );
+    // T1153 BROWSE-B21 (terminator) + BROWSE-B23 (generated help).
     assert!(
-        download::execute(fx.path(), &argv(&["--help"]))
+        download::execute(fx.path(), &argv(&["--help", "--"]))
             .unwrap()
-            .contains("usage: arc download")
+            .contains("DOWNLOAD WORKFLOW")
     );
     assert!(
         liberate::execute(fx.path(), &argv(&["--help"]))
@@ -219,8 +221,8 @@ fn download_saves_bytes_under_own_name() {
     )]);
 
     let out = download::download_file(&client_for(&api_base), fx.path(), 9, None).unwrap();
-    assert!(out.contains("Downloading \"report.txt\""), "{out}");
-    assert!(out.contains("Saved \"report.txt\""), "{out}");
+    // T1153 DL-D1: statuses go to stderr; the returned text is empty.
+    assert_eq!(out, "");
     assert_eq!(
         std::fs::read(fx.dir.join("report.txt")).unwrap(),
         b"hello-bytes"
@@ -241,7 +243,8 @@ fn download_honors_as_and_rejects_existing() {
 
     let out =
         download::download_file(&client_for(&api_base), fx.path(), 9, Some("custom.bin")).unwrap();
-    assert!(out.contains("custom.bin"), "{out}");
+    // T1153 DL-D1: statuses go to stderr; the returned text is empty.
+    assert_eq!(out, "");
     assert_eq!(std::fs::read(fx.dir.join("custom.bin")).unwrap(), b"zz");
 
     let err = download::download_file(&client_for(&api_base), fx.path(), 9, Some("custom.bin"))
@@ -257,7 +260,8 @@ fn download_uniquifies_default_name() {
     let (api_base, _api_rx) = serve_seq(vec![file_search_hit(&format!("{data_base}F9/data"), 3)]);
 
     let out = download::download_file(&client_for(&api_base), fx.path(), 9, None).unwrap();
-    assert!(out.contains("report.txt.1"), "{out}");
+    // T1153 DL-D1: statuses go to stderr; the returned text is empty.
+    assert_eq!(out, "");
     assert_eq!(std::fs::read(fx.dir.join("report.txt.1")).unwrap(), b"new");
     assert_eq!(std::fs::read(fx.dir.join("report.txt")).unwrap(), b"taken");
 }
@@ -270,7 +274,9 @@ fn download_rejects_size_mismatch() {
 
     let err = download::download_file(&client_for(&api_base), fx.path(), 9, None).unwrap_err();
     assert!(err.contains("does not match expected"), "{err}");
-    assert!(!fx.dir.join("report.txt").exists());
+    // T1153 DL-D7: the size check runs after the bytes land, leaving
+    // the corrupt file behind like PHP.
+    assert_eq!(std::fs::read(fx.dir.join("report.txt")).unwrap(), b"short");
 }
 
 #[test]

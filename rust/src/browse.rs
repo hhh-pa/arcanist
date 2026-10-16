@@ -6,17 +6,19 @@
 //! URIs of four kinds (commit, object, path, revision); the URIs are
 //! listed or opened in a browser (see [`crate::browser`]).
 //!
-//! Statuses render through the log engine (`writeWarn` yellow,
-//! `writeInfo` blue); the pick table has bold titles and escaped values;
-//! the pick prompt is wrapped like `phutil_console_prompt`.
+//! Statuses render like `writeWarn`/`writeInfo` (yellow/blue, values
+//! unescaped); the pick table has bold titles and escaped values; the
+//! pick prompt is wrapped like `phutil_console_prompt`.
 //!
 //! Deviations: prompts read plain lines (no readline); end of input during
-//! the pick prompt aborts instead of looping forever like PHP; drive
-//! letters in absolute paths split into `:lines` exactly like PHP; the
-//! `<default>` token display is decided per ref while PHP reuses the last
-//! warning-loop token; statuses use the log-engine pattern while PHP's
-//! `writeWarn`/`writeInfo` nest bold and background in the other order
-//! (identical once markup is stripped).
+//! the pick prompt aborts instead of looping forever like PHP (T1153
+//! BROWSE-B4, kept: PHP never terminates); drive letters in absolute
+//! paths split into `:lines` exactly like PHP; the `<default>` token
+//! display is decided per ref while PHP reuses the last warning-loop
+//! token (BROWSE-B2, kept: PHP reads a leftover loop variable, like the
+//! LAND-41 keep); URI kinds resolve in fixed commit/object/path/revision
+//! order while PHP follows future-resolution order (BROWSE-B16, kept:
+//! PHP's order is nondeterministic).
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
@@ -26,7 +28,7 @@ use std::process::ExitCode;
 use crate::{
     browser,
     conduit::{self, EnvelopeKind},
-    config, diff_submit, get_config, git,
+    config, diff_submit, get_config, git, grid,
     terminal::{self, PhtArg, TVal},
     which,
 };
@@ -42,17 +44,143 @@ pub const BROWSE_REVISION: &str = "revision";
 /// Abort text for end of input during the pick prompt.
 pub const ABORT: &str = "User aborted the workflow.";
 
-const USAGE: &str = "usage: arc browse [--branch BRANCH] [--types TYPES] [--force] [--] [TARGET ...]\n\
-\n\
-Open a file, commit, object, or revision in a web browser. With no\n\
-target, opens the current working copy. TYPES is a comma- or\n\
-space-separated list of commit, object, path, and revision.\n\
-\n\
-Options:\n\
-  --branch BRANCH  browse paths on BRANCH instead of the default branch\n\
-  --types TYPES    only resolve these browse kinds\n\
-  --force          deprecated alias for --types path\n\
-  -h, --help       Show this help.\n";
+/// T1153 BROWSE-B23: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string.
+const HELP_EXAMPLES: &str = "**browse** [options] -- __target__ ...\n\
+     **browse** -- __file-name__\n\
+     **browse** -- __object-name__";
+const HELP_SYNOPSIS: &str = "Open a file or object in a local web browser.";
+const HELP_TEXT: &str = "Open a file or object (like a task or revision) in a local web browser.\n\
+     \n\
+     \x20 $ arc browse README   # Open a file in Diffusion.\n\
+     \x20 $ arc browse T123     # View a task.\n\
+     \x20 $ arc browse HEAD     # View a symbolic commit.\n\
+     \n\
+     To choose a browser binary to invoke, use:\n\
+     \n\
+     \x20 $ arc set-config browser __browser-binary__\n\
+     \n\
+     If no browser is set, the command will try to guess which browser to use.";
+/// Non-wildcard argument specs in `msort` order: (name, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, &str)] = &[
+    (
+        "branch",
+        Some("branch-name"),
+        "Default branch name to view on server. Defaults to \"master\".",
+    ),
+    (
+        "force",
+        None,
+        "(DEPRECATED) Obsolete, use \"--types path\" instead.",
+    ),
+    (
+        "types",
+        Some("type-list"),
+        "Force targets to be interpreted as naming particular types of resources.",
+    ),
+];
+
+/// `PhutilArgumentParser::indent()`: interpret markup, then wrap.
+fn help_indent(level: usize, text: &str, ansi: bool) -> String {
+    terminal::console_wrap(&terminal::console_format(text, &[], ansi), level, true)
+}
+
+/// `renderArgumentSpecs()` for the workflow arguments.
+fn help_specs(ansi: bool) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for (name, param, help) in HELP_SPECS {
+        let mut first = help_indent(6, &format!("__--{name}__"), ansi);
+        if let Some(param) = param {
+            first.push_str(&terminal::console_format(
+                &format!(" __{param}__"),
+                &[],
+                ansi,
+            ));
+        }
+        out.push(first);
+        out.push(help_indent(10, help, ansi));
+        out.push(String::new());
+    }
+    out.join("\n")
+}
+
+/// The full `--help` text: `**BROWSE WORKFLOW**` header plus the
+/// detailed workflow help and a trailing blank line.
+fn help_text(ansi: bool) -> String {
+    let header = terminal::console_format("**%s**\n\n", &["BROWSE WORKFLOW"], ansi);
+    let body = [
+        help_indent(0, HELP_EXAMPLES, ansi),
+        help_indent(0, HELP_SYNOPSIS, ansi),
+        String::new(),
+        help_indent(0, HELP_TEXT, ansi),
+        String::new(),
+        help_specs(ansi),
+        String::new(),
+    ]
+    .join("\n");
+    format!("{header}{body}\n")
+}
+
+/// T1153 BROWSE-B21: noninteractive runs must carry `--`
+/// (`ArcanistRuntime.php:80-86`, enforced by
+/// `PhutilArgumentParser::parseFull()`). Any standalone `--` token
+/// satisfies PHP: the standard-arguments scan that records it never
+/// consumes workflow flag values.
+fn terminator_missing(argv: &[String], stdin_tty: bool) -> bool {
+    !stdin_tty && !argv.iter().any(|arg| arg == "--")
+}
+
+const MISSING_TERMINATOR: &str = "Missing required \"--\" in argument list.";
+
+/// The terminator failure (hints plus the toolset usage error), or
+/// `None` when the invocation may proceed.
+fn terminator_exit(argv: &[String], stdin_tty: bool) -> Option<ExitCode> {
+    if !terminator_missing(argv, stdin_tty) {
+        return None;
+    }
+    print_terminator_hints(terminal::ansi_enabled());
+    Some(conduit::report(
+        EnvelopeKind::ToolsetUsage,
+        MISSING_TERMINATOR,
+    ))
+}
+
+/// The three cyan `USAGE` hints PHP prints before the terminator
+/// error (`ArcanistRuntime.php:172-188`), on stderr like PHP.
+fn print_terminator_hints(ansi: bool) {
+    let usage = terminal::pht("USAGE", &[]);
+    for hint in [
+        terminal::pht(
+            "\"%s\" is being run noninteractively, but the argument list is missing \"--\" to indicate end of flags.",
+            &[PhtArg::Text("arc")],
+        ),
+        terminal::pht(
+            "When running noninteractively, you MUST provide \"--\" to all commands (even if they take no arguments).",
+            &[],
+        ),
+    ] {
+        eprint!("{}", terminal::format_log("cyan", &usage, &hint, ansi));
+    }
+    // `tsprintf('%s <__%s__>', ...)` nested like PHP: the inner line
+    // passes through the outer `%s` unescaped (`TVal::Terminal`).
+    let inner = terminal::tsprintf_ansi(
+        "%s <__%s__>",
+        &[
+            TVal::Text(&terminal::pht("Learn More:", &[])),
+            TVal::Text("https://phurl.io/u/noninteractive"),
+        ],
+        ansi,
+    )
+    .expect("fixed tsprintf pattern");
+    let line = terminal::tsprintf_ansi(
+        "**<bg:cyan> %s </bg>** %s\n",
+        &[TVal::Text(&usage), TVal::Terminal(&inner)],
+        ansi,
+    )
+    .expect("fixed tsprintf pattern");
+    eprint!("{}", line.as_str());
+}
 
 /// Parsed command line.
 pub struct BrowseOptions {
@@ -354,9 +482,27 @@ fn upstream_remote(dir: &Path) -> Option<String> {
 }
 
 /// Fetch URI of the upstream remote (else `origin`), like `getRemoteURI()`.
+///
+/// T1153 BROWSE-B11: PHP resolves through `git remote get-url`
+/// (`ArcanistGitAPI.php:1571-1660`), which applies `insteadOf` rewrites
+/// and multi-value selection; `ls-remote --get-url` and `git config`
+/// are the older fallbacks. The version gates are skipped: on any git,
+/// a missing command fails and the chain moves on with the same result.
 fn remote_uri(dir: &Path) -> Option<String> {
     let remote = upstream_remote(dir).unwrap_or_else(|| "origin".to_string());
-    git::stdout_text(dir, &["config", &format!("remote.{remote}.url")])
+    if let Ok(uri) = git::stdout_text(dir, &["remote", "get-url", "--", &remote])
+        && !uri.is_empty()
+    {
+        return Some(uri);
+    }
+    // `ls-remote --get-url` echoes the remote name when nothing resolves.
+    if let Ok(uri) = git::stdout_text(dir, &["ls-remote", "--get-url", &remote])
+        && !uri.is_empty()
+        && uri != remote
+    {
+        return Some(uri);
+    }
+    git::stdout_text(dir, &["config", "--", &format!("remote.{remote}.url")])
         .ok()
         .filter(|uri| !uri.is_empty())
 }
@@ -400,15 +546,16 @@ fn call_repo_query(
     }
 }
 
-/// The default branch of a `repository.query` row (`fields` first, then
-/// top level, else `master`).
+/// The default branch of a `repository.query` row (`fields` only,
+/// else `master`).
+///
+/// T1153 BROWSE-B8: PHP reads only `fields.defaultBranch`
+/// (`ArcanistRepositoryRef.php:101-109`); orsay rows carry neither
+/// key, so both sides yield `master`.
 fn default_branch_of(row: &serde_json::Value) -> String {
     if let Some(fields) = row.get("fields")
         && let Some(serde_json::Value::String(branch)) = fields.get("defaultBranch")
     {
-        return branch.clone();
-    }
-    if let Some(serde_json::Value::String(branch)) = row.get("defaultBranch") {
         return branch.clone();
     }
     "master".to_string()
@@ -451,9 +598,20 @@ pub fn resolve_repo(
 }
 
 /// Commit URIs via `diffusion.querycommits` (batched over hashes).
+///
+/// T1153 BROWSE-B17: `names` carries each hash once, first-seen order,
+/// like PHP's `array_keys($commit_map)`
+/// (`ArcanistCommitUpstreamHardpointQuery.php:23-27`).
 fn commit_uris(ctx: &mut BrowseCtx, hashes: &[String]) -> Result<BTreeMap<String, String>, String> {
     let mut uris = BTreeMap::new();
-    if hashes.is_empty() {
+    let mut seen = std::collections::HashSet::new();
+    let mut unique: Vec<&String> = Vec::with_capacity(hashes.len());
+    for hash in hashes {
+        if seen.insert(hash.as_str()) {
+            unique.push(hash);
+        }
+    }
+    if unique.is_empty() {
         return Ok(uris);
     }
     let Some(repo) = ctx.repo()? else {
@@ -462,12 +620,12 @@ fn commit_uris(ctx: &mut BrowseCtx, hashes: &[String]) -> Result<BTreeMap<String
     let repo_phid = repo.phid.clone();
     let result = (ctx.call)(
         "diffusion.querycommits",
-        &serde_json::json!({"repositoryPHID": repo_phid, "names": hashes}),
+        &serde_json::json!({"repositoryPHID": repo_phid, "names": unique}),
     )?;
     let empty = serde_json::json!({});
     let identifiers = result.get("identifierMap").unwrap_or(&empty);
     let data = result.get("data").unwrap_or(&empty);
-    for hash in hashes {
+    for hash in unique {
         let uri = identifiers
             .get(hash)
             .and_then(|phid| phid.as_str())
@@ -475,20 +633,26 @@ fn commit_uris(ctx: &mut BrowseCtx, hashes: &[String]) -> Result<BTreeMap<String
             .and_then(|commit| commit.get("uri"))
             .and_then(|uri| uri.as_str());
         if let Some(uri) = uri.filter(|uri| !uri.is_empty()) {
-            uris.insert(hash.clone(), uri.to_string());
+            uris.insert((*hash).clone(), uri.to_string());
         }
     }
     Ok(uris)
 }
 
 /// Object URIs via `phid.lookup` (batched over tokens).
+///
+/// T1153 BROWSE-B26: `names` keeps ref order (deduped), like PHP's
+/// `$token_set[$token] = $token`; `serde_json::Map` preserves
+/// insertion order (`preserve_order`), where the old `BTreeMap`
+/// sorted the keys.
 fn object_uris(ctx: &mut BrowseCtx, tokens: &[String]) -> Result<BTreeMap<String, String>, String> {
     let mut uris = BTreeMap::new();
-    let names: BTreeMap<&str, &str> = tokens
-        .iter()
-        .filter(|token| !token.is_empty())
-        .map(|token| (token.as_str(), token.as_str()))
-        .collect();
+    let mut names = serde_json::Map::new();
+    for token in tokens {
+        if !token.is_empty() && !names.contains_key(token) {
+            names.insert(token.clone(), serde_json::Value::String(token.clone()));
+        }
+    }
     if names.is_empty() {
         return Ok(uris);
     }
@@ -499,7 +663,7 @@ fn object_uris(ctx: &mut BrowseCtx, tokens: &[String]) -> Result<BTreeMap<String
             .and_then(|object| object.get("uri"))
             .and_then(|uri| uri.as_str());
         if let Some(uri) = uri.filter(|uri| !uri.is_empty()) {
-            uris.insert((*token).to_string(), uri.to_string());
+            uris.insert(token.clone(), uri.to_string());
         }
     }
     Ok(uris)
@@ -525,9 +689,25 @@ fn resolve_path(dir: &Path, path: &str) -> PathBuf {
     clean
 }
 
+/// `Filesystem::pathExists()`: true for symlinks, even broken ones
+/// (`file_exists() || is_link()`).
+fn path_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
 /// Canonicalize, resolving missing files through the nearest existing
 /// ancestor (else the lexical path).
+///
+/// T1153 BROWSE-B12: like `Filesystem::resolvePath()`, a trailing
+/// symlink itself is left unresolved (only its parent resolves).
 fn canonicalize_lax(path: &Path) -> PathBuf {
+    if path.is_symlink()
+        && let Some(parent) = path.parent()
+        && let Some(name) = path.file_name()
+        && let Ok(canonical) = parent.canonicalize()
+    {
+        return canonical.join(name);
+    }
     if let Ok(canonical) = path.canonicalize() {
         return canonical;
     }
@@ -592,8 +772,10 @@ pub fn new_browse_uri(
         .filter(|name| !name.is_empty())
         .unwrap_or(repo.default_branch.as_str());
     let uri_path = escape_uri(path.trim_start_matches('/'));
+    // T1153 BROWSE-B9: PHP's `if ($params['lines'])` drops `'0'`
+    // (falsy) along with the empty string.
     let uri_lines = lines
-        .filter(|text| !text.is_empty())
+        .filter(|text| !text.is_empty() && *text != "0")
         .map(|text| format!("${}", escape_uri(text)))
         .unwrap_or_default();
     format!(
@@ -620,7 +802,9 @@ fn path_uri(ctx: &mut BrowseCtx, rf: &BrowseRef, repo: &RepoInfo) -> Option<Brow
     };
     let (path, lines) = split_lines(&token);
     let full = resolve_path(ctx.dir, &path);
-    if !full.exists() && !is_path {
+    // T1153 BROWSE-B13: `Filesystem::pathExists()` counts broken
+    // symlinks as existing; `Path::exists()` does not.
+    if !path_exists(&full) && !is_path {
         return None;
     }
     let root = git::stdout_text(ctx.dir, &["rev-parse", "--show-toplevel"]).ok()?;
@@ -657,20 +841,30 @@ fn hash_revision_hits(
     for row in query_rows(&result) {
         let status = row.get("statusName").and_then(|v| v.as_str()).unwrap_or("");
         let closed = matches!(status, "Abandoned" | "Closed");
-        let uri = row_string(row, "uri");
-        if uri.is_empty() {
-            continue;
-        }
+        // T1153 BROWSE-B6: rows without a `uri` fall back to `/D{id}`
+        // (`ArcanistRevisionRef::getURI()` via `newFromConduitQuery`),
+        // never dropped.
+        let row_uri = row_string(row, "uri");
+        let uri = if row_uri.is_empty() {
+            let id = row.get("id").and_then(diff_submit::loose_u64).unwrap_or(0);
+            format!("/D{id}")
+        } else {
+            row_uri
+        };
         let empty = Vec::new();
         let row_hashes = row
             .get("hashes")
             .and_then(|hashes| hashes.as_array())
             .unwrap_or(&empty);
         for pair in hashes {
+            let wanted_type = pair.first().cloned().unwrap_or_default();
             let wanted = pair.get(1).cloned().unwrap_or_default();
+            // T1153 BROWSE-B18: PHP matches `type:value`
+            // (`getHashKey()`), not the value alone.
             let found = row_hashes.iter().any(|entry| {
                 entry.as_array().is_some_and(|items| {
-                    items.get(1).and_then(|v| v.as_str()) == Some(wanted.as_str())
+                    items.first().and_then(|v| v.as_str()) == Some(wanted_type.as_str())
+                        && items.get(1).and_then(|v| v.as_str()) == Some(wanted.as_str())
                 })
             });
             if found {
@@ -816,21 +1010,34 @@ pub struct ResolvedRef {
 }
 
 /// Canonical commits for one ref (only commit/revision-typed refs resolve).
-fn commits_for_one_ref(dir: &Path, rf: &BrowseRef) -> Vec<String> {
-    if rf.is_untyped() || rf.has_type(BROWSE_COMMIT) || rf.has_type(BROWSE_REVISION) {
-        commit_hashes(dir, &rf.token)
-    } else {
-        Vec::new()
+///
+/// T1153 BROWSE-B10: a missing token resolves `HEAD` outside the
+/// per-token try/catch (`ArcanistBrowseCommitHardpointQuery.php`),
+/// so an unresolvable `HEAD` throws instead of resolving to
+/// nothing: `ArcanistGitAPI::resolveCommit()`.
+fn commits_for_one_ref(dir: &Path, rf: &BrowseRef) -> Result<Vec<String>, String> {
+    if !(rf.is_untyped() || rf.has_type(BROWSE_COMMIT) || rf.has_type(BROWSE_REVISION)) {
+        return Ok(Vec::new());
+    }
+    match &rf.token {
+        Some(text) if text == "." => Ok(Vec::new()),
+        Some(text) => Ok(canonical_commit(dir, text).into_iter().collect()),
+        None => match canonical_commit(dir, "HEAD") {
+            Some(hash) => Ok(vec![hash]),
+            None => {
+                Err("Unable to find any git commit named 'HEAD' in this repository.".to_string())
+            }
+        },
     }
 }
 
 /// Canonical commits for every ref, in order.
-fn commits_for_refs(dir: &Path, refs: &[BrowseRef]) -> Vec<Vec<String>> {
+fn commits_for_refs(dir: &Path, refs: &[BrowseRef]) -> Result<Vec<Vec<String>>, String> {
     let mut commits = Vec::new();
     for rf in refs {
-        commits.push(commits_for_one_ref(dir, rf));
+        commits.push(commits_for_one_ref(dir, rf)?);
     }
-    commits
+    Ok(commits)
 }
 
 /// Hashes wanted for one commit-backed kind, in ref order.
@@ -987,7 +1194,7 @@ fn assemble_one_ref(
 
 /// Resolve every ref, batching Conduit calls per query kind like PHP.
 pub fn resolve_refs(ctx: &mut BrowseCtx, refs: &[BrowseRef]) -> Result<Vec<ResolvedRef>, String> {
-    let commits = commits_for_refs(ctx.dir, refs);
+    let commits = commits_for_refs(ctx.dir, refs)?;
     let hits = batch_hits(ctx, refs, &commits)?;
     let repo = if any_wants_path(refs) {
         ctx.repo()?.cloned()
@@ -1013,12 +1220,15 @@ fn table_row(cells: &[String]) -> String {
 
 /// Raw display widths spanning titles and cells, like `addRow` plus
 /// `getWidth` without the padding.
+///
+/// T1153 BROWSE-B15: widths are console columns
+/// (`phutil_utf8_console_strlen()`), not char counts.
 fn table_widths(columns: &[&str], rows: &[Vec<String>]) -> Vec<usize> {
-    let mut widths: Vec<usize> = columns.iter().map(|c| c.chars().count()).collect();
+    let mut widths: Vec<usize> = columns.iter().map(|c| grid::console_width(c)).collect();
     for row in rows {
         for (index, cell) in row.iter().enumerate() {
             if let Some(width) = widths.get_mut(index) {
-                *width = (*width).max(cell.chars().count());
+                *width = (*width).max(grid::console_width(cell));
             }
         }
     }
@@ -1047,7 +1257,7 @@ fn pad_cell(cell: &str, width: usize, last: bool) -> String {
     if last {
         return cell.to_string();
     }
-    let pad = width.saturating_sub(cell.chars().count());
+    let pad = width.saturating_sub(grid::console_width(cell));
     format!("{cell}{}", " ".repeat(pad))
 }
 
@@ -1126,7 +1336,7 @@ pub fn render_pick_table(
             let width = widths.get(index).copied().unwrap_or_default();
             pad_title(
                 bold.as_str(),
-                text.chars().count(),
+                grid::console_width(&text),
                 width,
                 index + 1 == columns.len(),
             )
@@ -1210,23 +1420,32 @@ pub fn console_select(
     console_select_with_tty(input, prompt, min, max, crate::prompt::stdin_is_terminal())
 }
 
-/// One warning/info line on stderr, through the log engine
-/// (`writeWarn` yellow, `writeInfo` blue).
+/// One warning/info line on stderr, like `writeWarn` (yellow) and
+/// `writeInfo` (blue).
+///
+/// T1153 BROWSE-B14: PHP formats these with `phutil_console_format`
+/// (`<bg:color>** %s **</bg> %s`, values raw), not the log engine
+/// (`**<bg:color> %s </bg>**`, values tsprintf-escaped).
 fn push_status(color: &str, label: &str, message: &str) {
     eprint!(
         "{}",
-        terminal::format_log(color, label, message, terminal::ansi_enabled())
+        terminal::format_status_message(color, label, message, terminal::ansi_enabled())
     );
 }
 
 /// Make `raw` absolute against the Conduit base when it has no domain.
+///
+/// T1153 BROWSE-B5: like `ArcanistWorkflow::getAbsoluteURI()`, only the
+/// path survives absolutizing (query and fragment are dropped), and
+/// protocol-relative `//host/...` URIs already have a domain.
 #[must_use]
 pub fn absolute_uri(conduit_uri: &str, raw: &str) -> String {
-    if raw.contains("://") {
+    if raw.contains("://") || raw.starts_with("//") {
         return raw.to_string();
     }
     let base = conduit_uri.trim_end_matches('/');
-    let path = raw.strip_prefix('/').unwrap_or(raw);
+    let path = raw.split(['?', '#']).next().unwrap_or(raw);
+    let path = path.strip_prefix('/').unwrap_or(path);
     if let Some(scheme_end) = base.find("://") {
         let after = &base[scheme_end + 3..];
         let host = after.split('/').next().unwrap_or(after);
@@ -1376,9 +1595,17 @@ pub fn run_in_with(
     call: Option<&diff_submit::ConduitCall>,
     input: &mut dyn BufRead,
 ) -> ExitCode {
+    // T1153 BROWSE-B21: the terminator check runs after a
+    // successful parse (unknown flags report first, like PHP's
+    // `parseFull()`), and also gates `--help` (which reroutes
+    // through the help workflow in PHP).
+    let stdin_tty = crate::prompt::stdin_is_terminal();
     let mut options = match parse_args(argv) {
         Parsed::Help => {
-            print!("{USAGE}");
+            if let Some(code) = terminator_exit(argv, stdin_tty) {
+                return code;
+            }
+            print!("{}", help_text(terminal::ansi_enabled()));
             return ExitCode::SUCCESS;
         }
         Parsed::Error(message) => {
@@ -1386,7 +1613,12 @@ pub fn run_in_with(
             // red `USAGE EXCEPTION` label with no usage dump.
             return conduit::report(EnvelopeKind::ToolsetUsage, &message);
         }
-        Parsed::Options(options) => options,
+        Parsed::Options(options) => {
+            if let Some(code) = terminator_exit(argv, stdin_tty) {
+                return code;
+            }
+            options
+        }
     };
     if options.force {
         push_status(
@@ -1397,7 +1629,13 @@ pub fn run_in_with(
                 &[PhtArg::Text(BROWSE_PATH)],
             ),
         );
-        options.types = vec![BROWSE_PATH.to_string()];
+        // T1153 BROWSE-B1: explicit `--types` wins over `--force`
+        // (`ArcanistBrowseWorkflow.php:88-97`); `--force` only fills
+        // in when `--types` was never given (any `--types` value,
+        // even empty, splits to a non-empty list).
+        if options.types.is_empty() {
+            options.types = vec![BROWSE_PATH.to_string()];
+        }
     }
     // Injected callers resolve against "" (see `run_prepared` for an
     // explicit base URI); otherwise build a real client.
