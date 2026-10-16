@@ -130,3 +130,26 @@ flag (single pinned server, frozen PHP reference, test-matrix cost).
 Acceptance (Phase 1): each item's wire shape matches ceb PHP live on
 orsay (probed), `cargo test`/clippy/fmt green, no unlisted behavior
 changes; RB-D27 recorded clean with a locking regression test.
+
+## Phase 2 Wave 1 (shared roots R3/R4/R5/R6/R9) — 2026-10-16
+
+Five parallel agents (isolated worktrees, branches `t1153/w1-r3` …
+`t1153/w1-r9`) implemented the shared-root fixes on this branch; the
+parent merged them (R9→R3→R5→R6→R4) with three semantic merge fixes:
+`stdin_tty` threaded through lint `run_workflow_classified`, unit
+merged-config reads routed through `ClassifiedError::usage`, and the
+missing `--arcrc-file` mapped to toolset usage in land
+`execute_with_io_classified`.
+
+Scope: R3 auto-pagination (`conduit::search_pages`, last-wins match);
+R4 error/exit envelope (`conduit::{EnvelopeKind, ClassifiedError,
+report}`, subprocess vs toolset dispatch); R5 TTY gating + prompt
+core; R6 config-source merge (`get_config::load_merged`); R9 ceb
+no-browser string. Decisions per finding are in
+[decisions.md](decisions.md) (Wave 1 rows, incl. Rule-4 CLEAN:
+CORE-39/40, and carried gaps for Wave 2 owners).
+
+Acceptance: `cargo fmt --check`, `cargo clippy --all-targets -- -D
+warnings`, and `cargo test --offline` 35/35 suites green under clean
+HOME at the merge commit; each finding verified against PHP @
+ceb082ef before fixing, with a finding-prefixed regression test.

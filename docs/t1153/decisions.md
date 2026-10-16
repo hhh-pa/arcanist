@@ -81,6 +81,21 @@ LAND-0a/b/c, AMEND-0, LAND-1 nest under `constraints` via the shared
 | RB-D26 (tasks order) | FIXED via R8 (Rule 0) | `preserve_order` serde so PHID-keyed objects keep server order; follow-ups: signature encoder now sorts keys explicitly (it claimed to but relied on BTreeMap order), `.arclint` linter order is file order like PHP's `foreach` (test updated) |
 | RB-D27 (exit codes) | CLEAN (Rule 4) | not reproduced: 4 live failure modes (transport/API/missing-token/outside-repo) all yield stderr + exit 1 on HEAD, matching the cited code; regression test added |
 
+### Phase 2 Wave 1 (shared roots R3/R4/R5/R6/R9)
+
+| Finding | Decision | Trigger / note |
+|---|---|---|
+| R3 LAND-16/BROWSE-B7/RB-D11/DL-D12/D13/UPLOAD-U16 (pagination) | FIXED (Rule 0) | new `conduit::search_pages` (`after`-cursor loop) + reuse of `revision::conduit_search`; repo/file match is last-wins like PHP `uri_map`/`ipull` overwrite |
+| R4 error/exit envelope (LAND-37, CORE-6/21/49/53, LINT-1/2/3, UNIT-U3/4/5, LINTERS-L24, BROWSE-B20/22, DL-D2/D10, UPLOAD-U15, EXPORT-E7/E28, RB-D4) | FIXED (Rule 0) | one shared `conduit::{EnvelopeKind, ClassifiedError, report}` port of `scripts/arcanist.php:428-468` (subprocess) + `ArcanistRuntime.php:18-50` (toolset); dispatch per `ArcanistArcWorkflow` subclassing, proved at ceb |
+| R4 DL-D2 / E7 / E28 / RB-D4-outside-repo exits | PRESENTATION ONLY (Rule 4 locks) | `didParseArguments` throw path is dead in toolset (exit unchanged); E7/E28 are subprocess exit 1 not 255; outside-repo `branches` exits 1 via the support gate; only banner/usage-dump bytes changed — locked by tests |
+| R4 CORE-6 conduit Display | FIXED (Rule 0) | bare messages, no invented `transport/protocol` prefixes |
+| R5 LAND-10/LAND-20/LINT-8/DIFF-D16/BROWSE-B3/RB-D22 (TTY + prompts) | FIXED (Rule 0) | `require_tty` echo-then-throw gates; `[y/N]` defaults; exact ceb banner/essay bytes |
+| R5 CORE-39/CORE-40 | CLEAN (Rule 4) | not reproduced: PHP token prompt requires TTY and chmod prompt defaults NO — Rust already matches; locking tests added |
+| R6 LAND-13/UNIT-U13/CORE-12/33/34/38 (config merge) | FIXED (Rule 0) | one `get_config::load_merged` precedence (runtime `--config` > local > project > user > system > default) shared by toolset (`SourceList`) and classic (`getConfigFromAnySource`) callers |
+| R9 BROWSE-B24/UPLOAD-U13/CORE-62/RB-D29c (no-browser text) | FIXED (Rule 0) | one shared constant set to the exact ceb bytes |
+| R4 gaps: land cascade-retry rewrap; arclint JSON-decode proxy arm; bare-`arc` Missing arm | CARRIED | documented mis-routes (retry-exhausted→fatal vs usage; proxy errors under Usage arm; Missing arm keeps usage dump) — exit codes unaffected except none cited; land owner picks up the first in Wave 2 |
+| R6 carry-overs: `which` source labels; unit engine-param reads; land `load_saved_prompts` path | CARRIED | unowned call sites adopt `merged_value` labels / full merge in Wave 2 (read-B, unit, LAND-14 owners) |
+
 ### Keep-list (Rule 2, recorded early per task §10 step 4)
 
 | Finding | Criterion | Rationale |
