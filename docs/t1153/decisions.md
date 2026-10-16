@@ -156,7 +156,7 @@ LAND-0a/b/c, AMEND-0, LAND-1 nest under `constraints` via the shared
 |---|---|---|
 | TASKS-2 (tasks positional wording) | FIXED (Rule 0) | positionals with no `$more_key` hit classic `ArcanistWorkflow.php:887-895`: `Unrecognized argument '%s'. Try '%s'.` — first extra wins (`51d440b3`) |
 | DL-4 (download unknown-flag wording) | FIXED (Rule 0) | toolset `PhutilArgumentParser.php:819-825` full-value text: `Argument "%s" is unrecognized. Use "%s"...`; post-`--` leftovers ride the wildcard into symbol validation (`51d440b3`) |
-| RB-D16/17/18 (which prose) | IN PROGRESS | temp PHP 7.4 + ceb-`ceb082ef` oracle in `/tmp` (verified `arc help which` renders); isolated port agent running 8 oracle scenarios |
+| RB-D16/17/18 (which prose) | FIXED (Rule 0) | full ceb `arc which` port (`cc29ecbf`, merged `f44f450c`): 3 wrapped prose sections (`ArcanistWhichWorkflow.php:57-261`), `repository.query` association + reason trail (`ArcanistWorkflow.php:1940-2044`, `:264-285`; `ArcanistGitAPI.php:545-557`), raw 16-char base + `getCommitSummary` + will-be-sent prose; staged printing; usage-error classification (RB-D4); winning-value base truthiness (RB-D38); arc-rs-only sections dropped. 26 live-oracle scenarios byte-identical (stdout+stderr+exit, ANSI + stripped). Oracle note: temp PHP lacks ext-posix so it emits ANSI on pipes (real PHP strips, like Rust); prompt paths in `which` never consult posix, so all 26 comparisons stand |
 
 ### Keep-list (Rule 2, recorded early per task §10 step 4)
 
