@@ -595,7 +595,11 @@ fn resolve_export_base_with_prompt(
     // PHP resolves the head before the merge-base (`getHeadCommit()`
     // inside `buildBaseCommit()`), so empty repositories blame `HEAD`.
     resolve_export_head(dir)?;
-    let loaded = crate::which::load_config_sources(dir, user_file)?;
+    // T1153 RB-D38: `resolve_base` takes the merged config so the
+    // `base` gate sees `--config` runtime values like
+    // `getConfigFromAnySource()` does.
+    let loaded =
+        crate::get_config::load_merged(dir, user_file, &crate::get_config::LoadOptions::default())?;
     let inputs = crate::which::BaseInputs {
         runtime_rules: "",
         prompt,
