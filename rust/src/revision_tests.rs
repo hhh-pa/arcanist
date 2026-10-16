@@ -286,15 +286,57 @@ fn search_params_builder_nests_constraints() {
     );
 }
 
+/// True when `line` names a new-style `.search` call that must nest its
+/// constraints: a method literal (`"user.search"`) or a `METHOD_*_SEARCH`
+/// constant at a call — excluding comments, constant definitions, and
+/// flat-by-design `edge.search` (PHP sends it flat via `yieldConduit`).
+fn is_nested_search_call_site(line: &str) -> bool {
+    let is_literal = line.contains(".search\"");
+    let is_constant = line.contains("METHOD_") && line.contains("SEARCH");
+    if !is_literal && !is_constant {
+        return false;
+    }
+    if line.trim_start().starts_with('/') || line.contains("pub const") {
+        return false;
+    }
+    !(line.contains("edge.search") || line.contains("EDGE_SEARCH"))
+}
+
+/// True when the ±6-line window around `index` shows nested constraints.
+fn search_window_is_nested(lines: &[&str], index: usize) -> bool {
+    let low = index.saturating_sub(6);
+    let high = (index + 7).min(lines.len());
+    let window = lines[low..high].join("\n");
+    window.contains("\"constraints\"")
+        || window.contains("conduit_search")
+        || window.contains("search_params(")
+        || window.contains("search_constraints(")
+}
+
+/// Scan one source file for flat `.search` params, pushing
+/// `name:line: text` failures; returns the call sites checked.
+fn scan_file_for_flat_search(name: &str, body: &str, failures: &mut Vec<String>) -> usize {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut checked = 0;
+    for (index, line) in lines.iter().enumerate() {
+        if !is_nested_search_call_site(line) {
+            continue;
+        }
+        checked += 1;
+        if !search_window_is_nested(&lines, index) {
+            failures.push(format!("{}:{}: {}", name, index + 1, line.trim()));
+        }
+    }
+    checked
+}
+
 /// Every new-style `.search` call site must send its constraints nested
 /// under a top-level `constraints` key (T1153): the server rejects flat
 /// constraint params with `ERR-CONDUIT-CALL`, exactly like PHP
 /// `ConduitSearchFuture` wraps them.
 ///
-/// This test enumerates the call sites textually (a method literal like
-/// `"user.search"` or a `METHOD_*_SEARCH` constant at a call) so a
-/// future flat addition fails loudly. `edge.search` is the one
-/// flat-by-design exception (PHP sends it flat via `yieldConduit`).
+/// This test enumerates the call sites textually so a future flat
+/// addition fails loudly (see [`is_nested_search_call_site`]).
 #[test]
 fn every_search_call_site_nests_constraints() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -315,31 +357,7 @@ fn every_search_call_site_nests_constraints() {
             continue;
         }
         let body = std::fs::read_to_string(&path).unwrap();
-        let lines: Vec<&str> = body.lines().collect();
-        for (index, line) in lines.iter().enumerate() {
-            let is_literal = line.contains(".search\"");
-            let is_constant = line.contains("METHOD_") && line.contains("SEARCH");
-            if !is_literal && !is_constant {
-                continue;
-            }
-            if line.trim_start().starts_with('/') || line.contains("pub const") {
-                continue;
-            }
-            if line.contains("edge.search") || line.contains("EDGE_SEARCH") {
-                continue;
-            }
-            checked += 1;
-            let low = index.saturating_sub(6);
-            let high = (index + 7).min(lines.len());
-            let window = lines[low..high].join("\n");
-            let nested = window.contains("\"constraints\"")
-                || window.contains("conduit_search")
-                || window.contains("search_params(")
-                || window.contains("search_constraints(");
-            if !nested {
-                failures.push(format!("{}:{}: {}", name, index + 1, line.trim()));
-            }
-        }
+        checked += scan_file_for_flat_search(name, &body, &mut failures);
     }
     assert!(checked > 0, "search call-site scan found nothing");
     assert!(

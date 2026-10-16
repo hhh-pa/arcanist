@@ -1697,6 +1697,78 @@ fn render_hunks(hunks: &[ParsedHunk]) -> String {
     out
 }
 
+/// First byte of `line` (0 when empty): the change-type discriminant.
+fn first_byte_of(line: &str) -> u8 {
+    line.as_bytes().first().copied().unwrap_or(0)
+}
+
+/// Index of the first added/removed line at or after `from`, or `None`
+/// when only context remains (PHP `:533-542`).
+fn find_next_change(lines: &[&str], from: usize) -> Option<usize> {
+    let mut jj = from;
+    while jj < lines.len() {
+        let byte = first_byte_of(lines[jj]);
+        if byte == b'-' || byte == b'+' {
+            return Some(jj);
+        }
+        jj += 1;
+    }
+    None
+}
+
+/// Outcome of scanning one small hunk body (PHP `:556-600`).
+struct SmallHunkScan {
+    /// One-past-the-end line index (after split-point rewind).
+    end: usize,
+    old_lines: u64,
+    new_lines: u64,
+    adjust: u64,
+}
+
+/// Scan a small hunk body from the change at `start`: a context gap over
+/// `2 * CONTEXT` lines ends the hunk, rewinding to the split point
+/// recorded `CONTEXT` lines past the last change (PHP `:556-600`).
+fn scan_small_hunk(lines: &[&str], start: usize) -> SmallHunkScan {
+    const CONTEXT: usize = 3;
+    let n = lines.len();
+    let mut jj = start;
+    let mut old_lines: u64 = 0;
+    let mut new_lines: u64 = 0;
+    let mut hunk_adjust: u64 = 0;
+    let mut last_change = start;
+    let mut break_here: Option<usize> = None;
+    while jj < n {
+        if first_byte_of(lines[jj]) == b' ' {
+            if jj - last_change > CONTEXT && break_here.is_none() {
+                break_here = Some(jj);
+            }
+            // PHP: `>= ($context * 2 + 1)`.
+            if jj - last_change > CONTEXT * 2 {
+                break;
+            }
+        } else {
+            break_here = None;
+            last_change = jj;
+            match first_byte_of(lines[jj]) {
+                b'\\' => hunk_adjust += 1,
+                b'-' => old_lines += 1,
+                b'+' => new_lines += 1,
+                _ => {}
+            }
+        }
+        jj += 1;
+    }
+    if let Some(at) = break_here {
+        jj = at;
+    }
+    SmallHunkScan {
+        end: jj,
+        old_lines,
+        new_lines,
+        adjust: hunk_adjust,
+    }
+}
+
 /// Break one hunk into small hunks with 3 lines of context
 /// (`breakHunkIntoSmallHunks()`, `:524-622`): disjoint output (git apply
 /// rejects overlaps), no overlong trailing context (patch rejects it),
@@ -1705,68 +1777,32 @@ fn render_hunks(hunks: &[ParsedHunk]) -> String {
 fn break_hunk_into_small_hunks(base: &ParsedHunk) -> Vec<ParsedHunk> {
     const CONTEXT: usize = 3;
     let lines: Vec<&str> = base.corpus.split_inclusive('\n').collect();
-    let first_byte = |line: &str| line.as_bytes().first().copied().unwrap_or(0);
     let n = lines.len();
     let mut old_offset = base.old_start;
     let mut new_offset = base.new_start;
     let mut results = Vec::new();
     let mut ii = 0;
     while ii < n {
-        let mut jj = ii;
-        while jj < n {
-            let byte = first_byte(lines[jj]);
-            if byte == b'-' || byte == b'+' {
-                break;
-            }
-            jj += 1;
-        }
-        if jj >= n {
+        let Some(change) = find_next_change(&lines, ii) else {
             break;
-        }
-        let hunk_start = jj.saturating_sub(CONTEXT);
-        let mut old_lines: u64 = 0;
-        let mut new_lines: u64 = 0;
-        let mut hunk_adjust: u64 = 0;
-        let mut last_change = jj;
-        let mut break_here: Option<usize> = None;
-        while jj < n {
-            if first_byte(lines[jj]) == b' ' {
-                if jj - last_change > CONTEXT && break_here.is_none() {
-                    break_here = Some(jj);
-                }
-                // PHP: `>= ($context * 2 + 1)`.
-                if jj - last_change > CONTEXT * 2 {
-                    break;
-                }
-            } else {
-                break_here = None;
-                last_change = jj;
-                match first_byte(lines[jj]) {
-                    b'\\' => hunk_adjust += 1,
-                    b'-' => old_lines += 1,
-                    b'+' => new_lines += 1,
-                    _ => {}
-                }
-            }
-            jj += 1;
-        }
-        if let Some(at) = break_here {
-            jj = at;
-        }
+        };
+        let hunk_start = change.saturating_sub(CONTEXT);
+        let scan = scan_small_hunk(&lines, change);
+        let jj = scan.end;
         let hunk_length = jj.min(n) - hunk_start;
-        let count_length = hunk_length as u64 - hunk_adjust;
+        let count_length = hunk_length as u64 - scan.adjust;
         let corpus: String = lines[hunk_start..hunk_start + hunk_length].concat();
         // Adjacent hunks share context, so `hunk_start` may precede `ii`.
         let back = ii as i64 - hunk_start as i64;
         results.push(ParsedHunk {
             old_start: (old_offset as i64 - back).max(0) as u64,
-            old_len: count_length - new_lines,
+            old_len: count_length - scan.new_lines,
             new_start: (new_offset as i64 - back).max(0) as u64,
-            new_len: count_length - old_lines,
+            new_len: count_length - scan.old_lines,
             corpus,
         });
-        old_offset += (jj - ii) as u64 - new_lines;
-        new_offset += (jj - ii) as u64 - old_lines;
+        old_offset += (jj - ii) as u64 - scan.new_lines;
+        new_offset += (jj - ii) as u64 - scan.old_lines;
         ii = jj;
     }
     results

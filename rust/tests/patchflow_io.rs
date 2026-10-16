@@ -452,6 +452,8 @@ fn null_browser_config() -> &'static str {
 fn upload_browse_opens_uploaded_files() {
     let fx = Fixture::named("up-browse");
     fx.write("a.txt", b"aaa");
+    // CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(fx.path().join(".git")).unwrap();
     fx.write(".arcconfig", null_browser_config().as_bytes());
     let search = serde_json::json!({
         "result": {

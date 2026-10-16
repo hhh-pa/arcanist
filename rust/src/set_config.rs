@@ -360,8 +360,10 @@ fn parse_args(argv: &[String]) -> Result<Option<Options>, String> {
     };
     let mut positional = Vec::new();
     let mut end_of_flags = false;
-    let mut rest = argv.iter();
-    while let Some(arg) = rest.next() {
+    let mut index = 0;
+    while index < argv.len() {
+        let arg = &argv[index];
+        index += 1;
         if end_of_flags {
             positional.push(arg.clone());
             continue;
@@ -381,19 +383,15 @@ fn parse_args(argv: &[String]) -> Result<Option<Options>, String> {
             Some((name, value)) => (name, Some(value)),
             None => (arg.as_str(), None),
         };
-        if matches!(name, "--config" | "--config-file" | "--arcrc-file") {
-            let value = match inline {
-                Some(value) => value.to_string(),
-                None => rest
-                    .next()
-                    .cloned()
-                    .ok_or_else(|| format!("{name} requires a value"))?,
-            };
-            match name {
-                "--config" => options.config.push(value),
-                "--config-file" => options.config_files.push(value),
-                _ => options.arcrc_file = Some(value),
-            }
+        if crate::get_config::take_runtime_flag(
+            &mut options.config,
+            &mut options.config_files,
+            &mut options.arcrc_file,
+            name,
+            inline,
+            argv,
+            &mut index,
+        )? {
             continue;
         }
         if arg.starts_with('-') {

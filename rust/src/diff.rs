@@ -1456,6 +1456,45 @@ pub fn prepare_submit(
     prepare_submit_with_report(cwd, options, mode, &diff_local::LintUnitReport::empty())
 }
 
+/// Mode-dependent submit payload: local fields (create), the update
+/// message (update), and the create corpus for server-side field
+/// resolution (create).
+struct ModePayload {
+    fields: serde_json::Value,
+    message: Option<String>,
+    message_corpus: Option<String>,
+}
+
+/// Collect the mode-dependent submit payload.
+fn collect_mode_payload(
+    cwd: &Path,
+    options: &Options,
+    mode: &SubmitMode,
+    base: &str,
+    head: Option<&str>,
+) -> Result<ModePayload, String> {
+    let fields = match mode {
+        SubmitMode::Create => fields_json(&collect_fields(cwd, options, base, head)?),
+        // Without `--verbatim` PHP sends no local fields on update (`:648-652`).
+        SubmitMode::Update(_) => serde_json::json!({}),
+        // Diff-only mode builds no commit message (`:1292-1295`).
+        SubmitMode::Only => serde_json::Value::Null,
+    };
+    let message = match mode {
+        SubmitMode::Update(_) => Some(update_message(options.message.as_deref())?),
+        _ => None,
+    };
+    let message_corpus = match mode {
+        SubmitMode::Create => collect_create_corpus(cwd, options, base, head)?,
+        _ => None,
+    };
+    Ok(ModePayload {
+        fields,
+        message,
+        message_corpus,
+    })
+}
+
 /// Collect a submit, stamping the diff spec with `report`'s lint/unit
 /// status words (`run()`, `:375-379`).
 pub fn prepare_submit_with_report(
@@ -1492,27 +1531,13 @@ pub fn prepare_submit_with_report(
         diff_local::unit_status(report.unit_result),
         &spec_input,
     );
-    let fields = match mode {
-        SubmitMode::Create => fields_json(&collect_fields(cwd, options, &range.base, head)?),
-        // Without `--verbatim` PHP sends no local fields on update (`:648-652`).
-        SubmitMode::Update(_) => serde_json::json!({}),
-        // Diff-only mode builds no commit message (`:1292-1295`).
-        SubmitMode::Only => serde_json::Value::Null,
-    };
-    let message = match mode {
-        SubmitMode::Update(_) => Some(update_message(options.message.as_deref())?),
-        _ => None,
-    };
-    let message_corpus = match mode {
-        SubmitMode::Create => collect_create_corpus(cwd, options, &range.base, head)?,
-        _ => None,
-    };
+    let payload = collect_mode_payload(cwd, options, mode, &range.base, head)?;
     Ok(SubmitInput {
         mode: mode.clone(),
-        message,
+        message: payload.message,
         draft: options.draft,
-        message_corpus,
-        fields,
+        message_corpus: payload.message_corpus,
+        fields: payload.fields,
         spec,
         properties: diff_properties(cwd, &range.base, head)?,
         included_changes: diff_local::render_included_changes(&entries),
