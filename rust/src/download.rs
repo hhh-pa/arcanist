@@ -68,7 +68,7 @@ fn usage() -> String {
 
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
-    file_id: u64,
+    file: FileSymbol,
     symbol: String,
     save_as: Option<String>,
     conduit_uri: Option<String>,
@@ -82,24 +82,60 @@ enum ParseOutcome {
     MissingTerminator,
 }
 
-/// `F123` or `123` to a numeric file ID, mirroring `/^F?\d+$/` (uppercase
-/// `F` only, no trimming) plus the symbol engine's `[1-9]\d*` rule.
-pub fn parse_file_symbol(text: &str) -> Result<u64, String> {
-    let digits = text.strip_prefix('F').unwrap_or(text);
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err("Specify file by ID, e.g. F123.".to_string());
-    }
-    // T1153 DL-D3: `didParseArguments` accepts `F0`/`0`/leading zeros,
-    // but the symbol engine rejects them (`ArcanistSimpleSymbolRef.php`
-    // `([1-9]\d*)`, with the file `[Ff]?` prefix after the uppercase-`F`
-    // gate above).
-    if digits.starts_with('0') {
-        return Err(format!(
-            "The format of symbol \"{text}\" is unrecognized. Expected a monogram like \"X123\", or an ID like \"123\", or a PHID."
+/// A parsed `download` file symbol: a numeric ID (`F123`, `f123`,
+/// `123`) or a file PHID (`PHID-FILE-...`).
+///
+/// T1153 DL-1: mirrors the live symbol-engine rules, not the dead
+/// `didParseArguments()` `/^F?\d+$/` gate (`ArcanistDownloadWorkflow.php:32-51`;
+/// its only caller is classic `parseArguments()`,
+/// `ArcanistWorkflow.php:923`, which the toolset path never runs —
+/// the live `runWorkflow()` goes straight to the symbol engine,
+/// `ArcanistDownloadWorkflow.php:71-72`). The ID rule is the file
+/// `[Ff]?` prefix (`ArcanistFileSymbolRef.php:10-12`) plus
+/// `([1-9]\d*)` (`ArcanistSimpleSymbolRef.php:29-35`); the PHID rule
+/// is `^PHID-FILE-\S+\z` (`ArcanistSimpleSymbolRef.php:37-44` with
+/// the `FILE` type from `ArcanistFileSymbolRef.php:14-16`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileSymbol {
+    Id(u64),
+    Phid(String),
+}
+
+/// Parse a file symbol into an ID or PHID, mirroring
+/// `ArcanistSimpleSymbolRef::resolveSymbol()`
+/// (`ArcanistSimpleSymbolRef.php:21-51`).
+///
+/// T1153 DL-2: anything the engine rejects reports the engine text
+/// (`ArcanistSimpleSymbolRef.php:46-50`), never the dead
+/// `didParseArguments()` `Specify file by ID...` line. T1153 DL-D3
+/// (reconciled): zero and leading zeros fail the engine's
+/// `([1-9]\d*)` rule, so they land in the same unrecognized arm.
+pub fn parse_file_symbol(text: &str) -> Result<FileSymbol, String> {
+    let digits = text
+        .strip_prefix('F')
+        .or_else(|| text.strip_prefix('f'))
+        .unwrap_or(text);
+    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) && !digits.starts_with('0')
+    {
+        // PHP `(int)` casts saturate at `PHP_INT_MAX`.
+        return Ok(FileSymbol::Id(
+            digits.parse::<u64>().unwrap_or(i64::MAX as u64),
         ));
     }
-    // PHP `(int)` casts saturate at `PHP_INT_MAX`.
-    Ok(digits.parse::<u64>().unwrap_or(i64::MAX as u64))
+    if is_file_phid(text) {
+        return Ok(FileSymbol::Phid(text.to_string()));
+    }
+    Err(format!(
+        "The format of symbol \"{text}\" is unrecognized. Expected a monogram like \"X123\", or an ID like \"123\", or a PHID."
+    ))
+}
+
+/// T1153 DL-1: `^PHID-FILE-\S+\z` (`ArcanistSimpleSymbolRef.php:37-44`;
+/// the `FILE` type is a `preg_quote`d literal-uppercase match, and
+/// `\S` without `/u` is ASCII non-whitespace).
+fn is_file_phid(text: &str) -> bool {
+    text.strip_prefix("PHID-FILE-")
+        .is_some_and(|rest| !rest.is_empty() && !rest.bytes().any(|b| b.is_ascii_whitespace()))
 }
 
 // T1153 RB-D5: terminator gate lives in the shared `crate::help`
@@ -228,17 +264,20 @@ impl Parser {
             return ParseOutcome::MissingTerminator;
         }
         if self.positionals.is_empty() {
-            return ParseOutcome::Error("Specify a file to download.".to_string());
+            // T1153 DL-3: the live `runWorkflow()` text
+            // (`ArcanistDownloadWorkflow.php:57-60`), not the dead
+            // `didParseArguments()` line (`:32-36`).
+            return ParseOutcome::Error("Specify a file to download, like \"F123\".".to_string());
         }
         if self.positionals.len() > 1 {
             return ParseOutcome::Error("Specify exactly one file to download.".to_string());
         }
-        let file_id = match parse_file_symbol(&self.positionals[0]) {
-            Ok(id) => id,
+        let file = match parse_file_symbol(&self.positionals[0]) {
+            Ok(file) => file,
             Err(message) => return ParseOutcome::Error(message),
         };
         ParseOutcome::Args(Options {
-            file_id,
+            file,
             symbol: self.positionals[0].clone(),
             save_as: self.save_as,
             conduit_uri: self.conduit_uri,
@@ -306,31 +345,69 @@ fn select_file_hit(hits: &[serde_json::Value], file_id: u64) -> Option<&serde_js
     })
 }
 
-/// Resolve a file by ID via `file.search`.
-pub fn fetch_file_ref(client: &crate::conduit::Client, file_id: u64) -> Result<FileRef, String> {
-    fetch_file_ref_for_symbol(client, file_id, &format!("F{file_id}"))
+/// Pick the `file.search` hit whose `phid` equals `phid`, like PHP's
+/// `ipull($results, null, 'phid')` lookup
+/// (`ArcanistSimpleSymbolHardpointQuery.php:81`): the last duplicate
+/// wins. (T1153 DL-1.)
+fn select_file_hit_by_phid<'a>(
+    hits: &'a [serde_json::Value],
+    phid: &str,
+) -> Option<&'a serde_json::Value> {
+    hits.iter().rfind(|hit| {
+        hit.get("phid")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|candidate| candidate == phid)
+    })
 }
 
-/// Resolve a file, echoing the user's original symbol in the not-found
-/// error like PHP (`loadFileForSymbol($file_symbol)`).
+/// Resolve a file by ID via `file.search`.
+pub fn fetch_file_ref(client: &crate::conduit::Client, file_id: u64) -> Result<FileRef, String> {
+    fetch_file_ref_for_symbol(client, &FileSymbol::Id(file_id), &format!("F{file_id}"))
+}
+
+/// Resolve a file for a parsed symbol, echoing the user's original
+/// symbol in the not-found error like PHP
+/// (`loadFileForSymbol($file_symbol)`).
+///
+/// T1153 DL-1: ID symbols query `file.search` by `ids` and match on
+/// `id` (`ArcanistSimpleSymbolHardpointQuery.php:42-46,72`); PHID
+/// symbols query by `phids` and match on `phid` (`:53-59,81`).
 pub fn fetch_file_ref_for_symbol(
     client: &crate::conduit::Client,
-    file_id: u64,
+    file: &FileSymbol,
     symbol: &str,
 ) -> Result<FileRef, String> {
-    let hits = crate::revision::conduit_search(
-        client,
-        "file.search",
-        &serde_json::json!({"ids": [file_id]}),
-        None,
-    )?;
-    let hit = select_file_hit(&hits, file_id).ok_or_else(|| {
+    let constraints = match file {
+        FileSymbol::Id(file_id) => serde_json::json!({"ids": [file_id]}),
+        FileSymbol::Phid(phid) => serde_json::json!({"phids": [phid]}),
+    };
+    let hits = crate::revision::conduit_search(client, "file.search", &constraints, None)?;
+    let hit = match file {
+        FileSymbol::Id(file_id) => select_file_hit(&hits, *file_id),
+        FileSymbol::Phid(phid) => select_file_hit_by_phid(&hits, phid),
+    }
+    .ok_or_else(|| {
         format!("File \"{symbol}\" does not exist, or you do not have permission to view it.")
     })?;
+    file_ref_from_hit(hit, file, symbol)
+}
+
+/// Build a [`FileRef`] from one `file.search` hit. A hit without a
+/// numeric `id` falls back to the requested ID (PHID hits always
+/// carry one; `0` there is unreachable in practice). (T1153 DL-1.)
+fn file_ref_from_hit(
+    hit: &serde_json::Value,
+    file: &FileSymbol,
+    symbol: &str,
+) -> Result<FileRef, String> {
+    let fallback_id = match file {
+        FileSymbol::Id(file_id) => *file_id,
+        FileSymbol::Phid(_) => 0,
+    };
     let id = hit
         .get("id")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(file_id);
+        .unwrap_or(fallback_id);
     let fields = hit.get("fields");
     let name = fields
         .and_then(|f| f.get("name"))
@@ -344,7 +421,9 @@ pub fn fetch_file_ref_for_symbol(
     let data_uri = fields
         .and_then(|f| f.get("dataURI"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| format!("File \"F{file_id}\" has no download URI."))?
+        // T1153 DL-1: echo the user's symbol as given (PHP echoes
+        // `$file_symbol` verbatim in file errors).
+        .ok_or_else(|| format!("File \"{symbol}\" has no download URI."))?
         .to_string();
     Ok(FileRef {
         id,
@@ -514,7 +593,13 @@ pub fn download_file(
     file_id: u64,
     save_as: Option<&str>,
 ) -> Result<String, String> {
-    download_file_for_symbol(client, dir, file_id, &format!("F{file_id}"), save_as)
+    download_file_for_symbol(
+        client,
+        dir,
+        &FileSymbol::Id(file_id),
+        &format!("F{file_id}"),
+        save_as,
+    )
 }
 
 /// `PhutilConsoleProgressSink` for large downloads: `[ 12.3%]
@@ -717,14 +802,15 @@ fn download_to_path(
 }
 
 /// Download one file, echoing the user's original symbol in errors.
+/// Takes the parsed symbol so PHIDs resolve (T1153 DL-1).
 pub fn download_file_for_symbol(
     client: &crate::conduit::Client,
     dir: &Path,
-    file_id: u64,
+    file: &FileSymbol,
     symbol: &str,
     save_as: Option<&str>,
 ) -> Result<String, String> {
-    let file = fetch_file_ref_for_symbol(client, file_id, symbol)?;
+    let file = fetch_file_ref_for_symbol(client, file, symbol)?;
     let display_name = file.display_name();
 
     if save_as == Some("-") {
@@ -820,7 +906,7 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
     download_file_for_symbol(
         &client,
         dir,
-        opts.file_id,
+        &opts.file,
         &opts.symbol,
         opts.save_as.as_deref(),
     )

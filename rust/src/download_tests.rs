@@ -15,16 +15,16 @@ fn args_of(words: &[&str]) -> Options {
 fn parses_id_and_as() {
     // T1153 BROWSE-B21: piped runs carry `--`.
     let opts = args_of(&["--", "F123"]);
-    assert_eq!(opts.file_id, 123);
+    assert_eq!(opts.file, FileSymbol::Id(123));
     assert_eq!(opts.save_as, None);
 
     let opts = args_of(&["--as", "-", "--", "F7"]);
-    assert_eq!(opts.file_id, 7);
+    assert_eq!(opts.file, FileSymbol::Id(7));
     assert_eq!(opts.symbol, "F7");
     assert_eq!(opts.save_as, Some("-".to_string()));
 
     let opts = args_of(&["--", "99"]);
-    assert_eq!(opts.file_id, 99);
+    assert_eq!(opts.file, FileSymbol::Id(99));
     assert_eq!(opts.symbol, "99");
 }
 
@@ -35,7 +35,8 @@ fn rejects_missing_extra_and_bad_symbols() {
     let ParseOutcome::Error(message) = parse_args(&argv(&["--"])) else {
         panic!("expected error for no file");
     };
-    assert!(message.contains("Specify a file"), "{message}");
+    // T1153 DL-3: the live `runWorkflow()` no-argv text.
+    assert_eq!(message, "Specify a file to download, like \"F123\".");
 
     assert!(matches!(
         parse_args(&argv(&["--", "F1", "F2"])),
@@ -53,28 +54,44 @@ fn rejects_missing_extra_and_bad_symbols() {
 
 #[test]
 fn parses_file_symbols() {
-    assert_eq!(parse_file_symbol("F123").unwrap(), 123);
-    assert_eq!(parse_file_symbol("99").unwrap(), 99);
+    assert_eq!(parse_file_symbol("F123").unwrap(), FileSymbol::Id(123));
+    assert_eq!(parse_file_symbol("99").unwrap(), FileSymbol::Id(99));
+    // T1153 DL-1: the engine prefix is `[Ff]?`, and file PHIDs
+    // resolve through the `phids` search.
+    assert_eq!(parse_file_symbol("f4").unwrap(), FileSymbol::Id(4));
+    assert_eq!(
+        parse_file_symbol("PHID-FILE-abcdef").unwrap(),
+        FileSymbol::Phid("PHID-FILE-abcdef".to_string())
+    );
     // T1153 DL-D3: the symbol engine rejects zero and leading zeros.
     assert!(parse_file_symbol("F007").is_err());
+    assert!(parse_file_symbol("f007").is_err());
     assert!(parse_file_symbol("F0").is_err());
     assert!(parse_file_symbol("0").is_err());
     assert!(parse_file_symbol("007").is_err());
-    // PHP `/^F?\d+$/`: uppercase `F` only, nothing else.
-    assert!(parse_file_symbol("f4").is_err());
+    // No trimming, no bare prefix, no doubled prefix.
     assert!(parse_file_symbol(" 99").is_err());
     assert!(parse_file_symbol("99 ").is_err());
     assert!(parse_file_symbol("F").is_err());
+    assert!(parse_file_symbol("f").is_err());
     assert!(parse_file_symbol("Fx").is_err());
+    assert!(parse_file_symbol("FF1").is_err());
     assert!(parse_file_symbol("").is_err());
+    // T1153 DL-1: the PHID type is literal-uppercase `FILE` with a
+    // non-empty `\S+` tail.
+    assert!(parse_file_symbol("PHID-FILE-").is_err());
+    assert!(parse_file_symbol("phid-file-abc").is_err());
+    assert!(parse_file_symbol("PHID-DIFF-abc").is_err());
+    assert!(parse_file_symbol("PHID-FILE-a b").is_err());
+    // T1153 DL-2: garbage reports the symbol-engine text.
     assert_eq!(
         parse_file_symbol("xyz").unwrap_err(),
-        "Specify file by ID, e.g. F123."
+        "The format of symbol \"xyz\" is unrecognized. Expected a monogram like \"X123\", or an ID like \"123\", or a PHID."
     );
     // PHP `(int)` casts saturate instead of failing.
     assert_eq!(
         parse_file_symbol("99999999999999999999999").unwrap(),
-        i64::MAX as u64
+        FileSymbol::Id(i64::MAX as u64)
     );
 }
 
@@ -394,7 +411,7 @@ fn dl_d1_dl_d15_file_download_returns_empty_text() {
     let (base, rx) = serve_seq(vec![page]);
     let client = crate::conduit::Client::new(&base, "t").unwrap();
     let dir = dl_tempdir("ok");
-    let out = download_file_for_symbol(&client, &dir, 9, "F9", None).unwrap();
+    let out = download_file_for_symbol(&client, &dir, &FileSymbol::Id(9), "F9", None).unwrap();
     assert_eq!(out, "");
     assert_eq!(std::fs::read(dir.join("f9.bin")).unwrap(), body);
     assert_eq!(
@@ -417,8 +434,78 @@ fn dl_d3_zero_and_leading_zeros_are_unrecognized() {
             "{symbol}"
         );
     }
-    assert_eq!(parse_file_symbol("F123").unwrap(), 123);
-    assert_eq!(parse_file_symbol("123").unwrap(), 123);
+    assert_eq!(parse_file_symbol("F123").unwrap(), FileSymbol::Id(123));
+    assert_eq!(parse_file_symbol("123").unwrap(), FileSymbol::Id(123));
+}
+
+#[test]
+fn dl1_lowercase_and_phid_symbols_parse() {
+    // T1153 DL-1: `[Ff]?` IDs keep the original spelling for error
+    // echo; PHIDs ride through to the `phids` search.
+    let opts = args_of(&["--", "f123"]);
+    assert_eq!(opts.file, FileSymbol::Id(123));
+    assert_eq!(opts.symbol, "f123");
+    let opts = args_of(&["--", "PHID-FILE-x1y2"]);
+    assert_eq!(opts.file, FileSymbol::Phid("PHID-FILE-x1y2".to_string()));
+    assert_eq!(opts.symbol, "PHID-FILE-x1y2");
+}
+
+#[test]
+fn dl1_phid_fetch_searches_by_phid() {
+    // T1153 DL-1: PHID symbols query `file.search` with `phids` and
+    // match on `phid` (last duplicate wins, like `ipull`).
+    let page = serde_json::json!({
+        "result": {"data": [
+            {"id": 7, "phid": "PHID-FILE-x1y2",
+             "fields": {"name": "old.bin", "size": 1,
+                        "dataURI": "http://127.0.0.1:9/old"}},
+            {"id": 9, "phid": "PHID-FILE-x1y2",
+             "fields": {"name": "new.bin", "size": 2,
+                        "dataURI": "http://127.0.0.1:9/new"}},
+        ]},
+        "error_code": null,
+    })
+    .to_string();
+    let (base, rx) = serve_seq(vec![page]);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    let file = fetch_file_ref_for_symbol(
+        &client,
+        &FileSymbol::Phid("PHID-FILE-x1y2".to_string()),
+        "PHID-FILE-x1y2",
+    )
+    .unwrap();
+    assert_eq!(file.id, 9);
+    assert_eq!(file.name, "new.bin");
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].contains("phids"), "{}", seen[0]);
+    assert!(seen[0].contains("PHID-FILE-x1y2"), "{}", seen[0]);
+
+    // A PHID with no hit echoes the symbol as given.
+    let empty = serde_json::json!({
+        "result": {"data": []},
+        "error_code": null,
+    })
+    .to_string();
+    let (base, rx) = serve_seq(vec![empty]);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    let err = fetch_file_ref_for_symbol(
+        &client,
+        &FileSymbol::Phid("PHID-FILE-nope".to_string()),
+        "PHID-FILE-nope",
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        "File \"PHID-FILE-nope\" does not exist, or you do not have permission to view it."
+    );
+    assert!(is_toolset_usage_message(&err));
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -469,7 +556,7 @@ fn dl_d7_size_mismatch_leaves_corrupt_file() {
     let (base, rx) = serve_seq(vec![page]);
     let client = crate::conduit::Client::new(&base, "t").unwrap();
     let dir = dl_tempdir("mismatch");
-    let err = download_file_for_symbol(&client, &dir, 9, "F9", None).unwrap_err();
+    let err = download_file_for_symbol(&client, &dir, &FileSymbol::Id(9), "F9", None).unwrap_err();
     assert!(err.contains("does not match expected file size"), "{err}");
     assert_eq!(std::fs::read(dir.join("short.bin")).unwrap(), body);
     assert_eq!(
@@ -528,7 +615,7 @@ fn dl_d11_missing_data_uri_is_fatal_class() {
     .to_string();
     let (base, rx) = serve_seq(vec![page]);
     let client = crate::conduit::Client::new(&base, "t").unwrap();
-    let err = fetch_file_ref_for_symbol(&client, 9, "F9").unwrap_err();
+    let err = fetch_file_ref_for_symbol(&client, &FileSymbol::Id(9), "F9").unwrap_err();
     assert!(err.contains("has no download URI"), "{err}");
     assert!(!is_toolset_usage_message(&err));
     assert_eq!(

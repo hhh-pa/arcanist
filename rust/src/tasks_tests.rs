@@ -273,6 +273,24 @@ fn r4_rbd4_parse_error_has_no_dump() {
 }
 
 #[test]
+fn tasks1_unknown_flags_use_classic_text() {
+    // T1153 TASKS-1: classic `ArcanistWorkflow` wording over the
+    // stripped key, including `=`-split longs and shorts.
+    assert_eq!(
+        parse_args(&args(&["--bogus"])).unwrap_err(),
+        "Unknown argument 'bogus'. Try 'arc help'."
+    );
+    assert_eq!(
+        parse_args(&args(&["--bogus=x"])).unwrap_err(),
+        "Unknown argument 'bogus'. Try 'arc help'."
+    );
+    assert_eq!(
+        parse_args(&args(&["-x"])).unwrap_err(),
+        "Unknown argument 'x'. Try 'arc help'."
+    );
+}
+
+#[test]
 fn rbd8_user_phid_prefers_cached_identity() {
     // The startup-auth identity answers without I/O: an unroutable
     // client still resolves when cached.
