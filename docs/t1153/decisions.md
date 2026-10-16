@@ -90,7 +90,7 @@ LAND-0a/b/c, AMEND-0, LAND-1 nest under `constraints` via the shared
 | R4 DL-D2 / E7 / E28 / RB-D4-outside-repo exits | PRESENTATION ONLY (Rule 4 locks) | `didParseArguments` throw path is dead in toolset (exit unchanged); E7/E28 are subprocess exit 1 not 255; outside-repo `branches` exits 1 via the support gate; only banner/usage-dump bytes changed — locked by tests |
 | R4 CORE-6 conduit Display | FIXED (Rule 0) | bare messages, no invented `transport/protocol` prefixes |
 | R5 LAND-10/LAND-20/LINT-8/DIFF-D16/BROWSE-B3/RB-D22 (TTY + prompts) | FIXED (Rule 0) | `require_tty` echo-then-throw gates; `[y/N]` defaults; exact ceb banner/essay bytes |
-| R5 CORE-39/CORE-40 | CLEAN (Rule 4) | not reproduced: PHP token prompt requires TTY and chmod prompt defaults NO — Rust already matches; locking tests added |
+| R5 CORE-39/CORE-40 | CLEAN (Rule 4, corrected Wave 3) | token prompt requires TTY (matches); the R5 note said the chmod prompt "defaults NO" — wrong: ceb `ArcanistConfigurationManager.php:198` passes `$default_no = false` = `[Y/n]` default YES (`src/console/format.php:11-12`); Rust `install_certificate.rs` prompts `[Y/n]` and chmods on accept — locking tests added |
 | R6 LAND-13/UNIT-U13/CORE-12/33/34/38 (config merge) | FIXED (Rule 0) | one `get_config::load_merged` precedence (runtime `--config` > local > project > user > system > default) shared by toolset (`SourceList`) and classic (`getConfigFromAnySource`) callers |
 | R9 BROWSE-B24/UPLOAD-U13/CORE-62/RB-D29c (no-browser text) | FIXED (Rule 0) | one shared constant set to the exact ceb bytes |
 | R4 gaps: land cascade-retry rewrap; arclint JSON-decode proxy arm; bare-`arc` Missing arm | CARRIED | documented mis-routes (retry-exhausted→fatal vs usage; proxy errors under Usage arm; Missing arm keeps usage dump) — exit codes unaffected except none cited; land owner picks up the first in Wave 2 |
@@ -120,6 +120,16 @@ LAND-0a/b/c, AMEND-0, LAND-1 nest under `constraints` via the shared
 | LINT-10 separator preservation | FIXED (Rule 0) | `normalize_lexical` returns dot-free paths byte-identical (a `PathBuf` rebuild converts `/`→`\` on Windows and broke `^externals/` routing + displays); `..` resolution unchanged |
 | Complexity ratchet (28) + platform tests | FIXED | three agents split Wave-2's over-threshold functions (verified 0 violations via local rca replication); d7 identity, root-chmod, and 4 Windows failures fixed (hg CRLF tolerance, unix-gated stubs, drive-absolute bin, separator preservation) |
 
+### Phase 2 Wave 3 (sections, 5 agents)
+
+| Finding(s) | Decision | Trigger / note |
+|---|---|---|
+| coreA: LINT-23, UNIT-U16/U17/U21-escape/U22, CORE-32/41/42/43/44/65, LAND-22 | FIXED (Rule 0) | hg amend via bundled extension; PCRE include/exclude; lowercase `\uXXXX` escaping end-to-end (`conduit.rs`); global-flag consumption; VCS-root `--local`; `[Y/n]` chmod default YES (CORE-41 — corrects the R5 "defaults NO" note above); literal `~/.arcrc` text; ceb example host; status nesting; live stderr streaming; cached handshake identity. CORE-18 stays UNPORTED (Rule 3). Carry: UNIT-U21 order half (`unit.rs`), CORE-65 stdout residual |
+| coreB: LAND-23..28/42, RB-D9..39 (cited), BROWSE-B25 | FIXED (Rule 0) | conduit-required grids (tokenless); hg `hgcm` pairs; nonzero-exit future throw; unchecked `name`/`node`; support-gate order; toolset parse texts; strict remote parsing; verbatim `--limit`; no owner/unassigned conflict; fetch-then-push per remote; PHP-truthy `isClosed`; first PHID-less ref kept. Follow-up `6d2784f8`: support gate runs ahead of conduit setup (PHP `getRepositoryAPI` order — Wave-3 order preempted it). Carry: RB-D33/35/36/37, RB-D15 remainder |
+| lintunit: COVER-C1/C10/C11, UNIT-U19/U20, LINT-34/35 | FIXED/KEPT | full base-commit chain (`arc:` rules, upstream, scratch file, prompt); first-seen insertion order end-to-end; strict version regexes. C10 keep (Rule 2a: PHP fatals on the empty-tree base). Convention drift: citations lack the `T1153` prefix — Wave-4 instruction. Carry: C13 (svn/hg, T1128) |
+| diff: EXPORT-E11..E24, E37 | FIXED (Rule 0) | `diff_local.rs` parser halves: block-header keys, hunk-count validation, CRLF/unterminated tails, filemode lines, git filename extraction, synthetic data, changeset loop, path-merge. Carry: E14/E11/E13/E20 wiring into submit paths + DIFF-D22 |
+| brup: BROWSE-B21/B23 | FIXED (Rule 0) | `--` terminator gate + generated workflow help across export/paste/upload (classic vs toolset dispatch). Carry: B21/B23 remainder (other commands), RB-D5 shared help renderer |
+
 ### Keep-list (Rule 2, recorded early per task §10 step 4)
 
 | Finding | Criterion | Rationale |
@@ -139,12 +149,10 @@ LAND-0a/b/c, AMEND-0, LAND-1 nest under `constraints` via the shared
 
 ### Pending Phase 3 decisions
 
-- **LAND-43** (squash-merge flow: post-T13576 reduce-rebase-merge vs ceb
-  simple rebase-then-merge). Recommendation: keep the newer flow iff it
-  produces identical trees on orsay-shaped histories and only differs in
-  status text (then it is COSMETIC + Rule 2b); else restore the ceb flow.
-  Needs a merge-commit-range experiment to decide.
-- **COVER-C2**: decide on the same criteria when Phase 3 reaches cover.
+- ~~**LAND-43**~~ decided Wave 2 (see row above): experiment DIVERGED →
+  ceb rebase-then-merge restored; re-verified Wave 3 (no change).
+- ~~**COVER-C2**~~ decided Wave 2 (see row above): keep Rust N (Rule 2a —
+  PHP misattributes N+1); re-verified Wave 3 (no change).
 - Every finding tagged "Rust better" not yet enumerated above is
   provisionally KEEP under criterion (a)/(b); each gets a log row when
   its phase lands.
