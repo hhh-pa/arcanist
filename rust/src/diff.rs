@@ -1633,27 +1633,49 @@ pub fn submit_over_with_uri_ansi(
     ansi: bool,
 ) -> Result<SubmitReport, String> {
     let created = diff_submit::create_diff(call, &input.spec)?;
-    // DIFF-D11: autotargets upload first (`:399-406`); a hit gates the
-    // legacy `arc:lint`/`arc:unit` properties off (`:2286-2311`). The
-    // upload runs only when `creatediff` returned a diff PHID.
-    let hit_autotargets = created.phid.as_deref().is_some_and(|phid| {
+    let hit_autotargets =
+        upload_submit_autotargets(call, created.phid.as_deref(), &input.lint_unit);
+    let properties = submit_diff_properties(&input.properties, hit_autotargets);
+    diff_submit::set_diff_properties(call, created.diff_id, &properties)?;
+    match &input.mode {
+        SubmitMode::Only => report_only_submit(&created, input, ansi),
+        SubmitMode::Update(id) => report_update_submit(call, *id, created.diff_id, input, ansi),
+        SubmitMode::Create => report_create_submit(call, &created, input, ansi),
+    }
+}
+
+/// DIFF-D11: autotargets upload first (`:399-406`); a hit gates the
+/// legacy `arc:lint`/`arc:unit` properties off (`:2286-2311`). The
+/// upload runs only when `creatediff` returned a diff PHID.
+fn upload_submit_autotargets(
+    call: &diff_submit::ConduitCall<'_>,
+    diff_phid: Option<&str>,
+    lint_unit: &diff_local::LintUnitReport,
+) -> bool {
+    diff_phid.is_some_and(|phid| {
         // No unit result fails the unit target, like PHP's `default` arm.
         let unit_result = i64::from(
-            input
-                .lint_unit
+            lint_unit
                 .unit_result
                 .unwrap_or(diff_local::UNIT_RESULT_FAIL),
         );
         diff_submit::update_autotargets(
             call,
             phid,
-            &input.lint_unit.unresolved_lint,
-            &input.lint_unit.test_results,
+            &lint_unit.unresolved_lint,
+            &lint_unit.test_results,
             unit_result,
         )
-    });
-    let properties: Vec<diff_submit::DiffProperty> = input
-        .properties
+    })
+}
+
+/// Diff properties to set: an autotarget hit drops the legacy
+/// `arc:lint`/`arc:unit` properties.
+fn submit_diff_properties(
+    properties: &[diff_submit::DiffProperty],
+    hit_autotargets: bool,
+) -> Vec<diff_submit::DiffProperty> {
+    properties
         .iter()
         .filter(|property| {
             !hit_autotargets
@@ -1661,101 +1683,120 @@ pub fn submit_over_with_uri_ansi(
                     && property.name != diff_submit::PROP_UNIT)
         })
         .cloned()
-        .collect();
-    diff_submit::set_diff_properties(call, created.diff_id, &properties)?;
+        .collect()
+}
+
+/// `--only` report: the JSON document under `--json`, else the
+/// human-readable diff report.
+fn report_only_submit(
+    created: &diff_submit::CreatedDiff,
+    input: &SubmitInput,
+    ansi: bool,
+) -> Result<SubmitReport, String> {
     let created_diff_id = created.diff_id;
-    match &input.mode {
-        SubmitMode::Only => {
-            if input.json {
-                let uri = created.uri.clone();
-                let doc = serde_json::json!({
-                    "diffURI": created.uri,
-                    "diffID": created.diff_id,
-                    "human": "",
-                });
-                let mut text = diff_submit::php_json_encode(&doc)
-                    .map_err(|e| format!("failed to encode JSON: {e}"))?;
-                text.push('\n');
-                return Ok(SubmitReport {
-                    text,
-                    uri: Some(uri),
-                    revision_id: None,
-                    diff_id: created_diff_id,
-                });
-            }
-            Ok(SubmitReport {
-                text: format_submit_report_ansi(
-                    "Created a new Differential diff:",
-                    "Diff URI:",
-                    &created.uri,
-                    &input.included_changes,
-                    ansi,
-                ),
-                uri: Some(created.uri),
-                revision_id: None,
-                diff_id: created_diff_id,
-            })
-        }
-        SubmitMode::Update(id) => {
-            let revision_id =
-                i64::try_from(*id).map_err(|_| format!("Revision ID {id} is out of range."))?;
-            let params = diff_submit::update_revision_params(
-                revision_id,
-                input.fields.clone(),
-                created.diff_id,
-                input.message.as_deref().unwrap_or(""),
-            );
-            let updated = diff_submit::update_revision(call, &params)?;
-            // DIFF-D17: under `--json` PHP discards the whole report for
-            // create/update (`ob_get_clean()`, `:570-572`); the URI is
-            // still returned for `--browse`.
-            let text = if input.json {
-                String::new()
-            } else {
-                format_submit_report_ansi(
-                    "Updated an existing Differential revision:",
-                    "Revision URI:",
-                    &updated.uri,
-                    &input.included_changes,
-                    ansi,
-                )
-            };
-            Ok(SubmitReport {
-                text,
-                uri: Some(updated.uri),
-                revision_id: Some(revision_id),
-                diff_id: created_diff_id,
-            })
-        }
-        SubmitMode::Create => {
-            let revision = submit_create_revision(
-                call,
-                input,
-                created.diff_id,
-                created.phid.as_deref(),
-                &created.uri,
-            )?;
-            // DIFF-D17: see the update branch above (`:570-572`).
-            let text = if input.json {
-                String::new()
-            } else {
-                format_submit_report_ansi(
-                    "Created a new Differential revision:",
-                    "Revision URI:",
-                    &revision.uri,
-                    &input.included_changes,
-                    ansi,
-                )
-            };
-            let created_id = revision.revision_id;
-            Ok(SubmitReport {
-                text,
-                uri: Some(revision.uri),
-                revision_id: Some(created_id),
-                diff_id: created_diff_id,
-            })
-        }
+    if input.json {
+        let uri = created.uri.clone();
+        let doc = serde_json::json!({
+            "diffURI": created.uri,
+            "diffID": created.diff_id,
+            "human": "",
+        });
+        let mut text = diff_submit::php_json_encode(&doc)
+            .map_err(|e| format!("failed to encode JSON: {e}"))?;
+        text.push('\n');
+        return Ok(SubmitReport {
+            text,
+            uri: Some(uri),
+            revision_id: None,
+            diff_id: created_diff_id,
+        });
     }
+    Ok(SubmitReport {
+        text: format_submit_report_ansi(
+            "Created a new Differential diff:",
+            "Diff URI:",
+            &created.uri,
+            &input.included_changes,
+            ansi,
+        ),
+        uri: Some(created.uri.clone()),
+        revision_id: None,
+        diff_id: created_diff_id,
+    })
+}
+
+/// `--update` report: update the revision, then format the report.
+fn report_update_submit(
+    call: &diff_submit::ConduitCall<'_>,
+    update_id: u64,
+    created_diff_id: i64,
+    input: &SubmitInput,
+    ansi: bool,
+) -> Result<SubmitReport, String> {
+    let revision_id = i64::try_from(update_id)
+        .map_err(|_| format!("Revision ID {update_id} is out of range."))?;
+    let params = diff_submit::update_revision_params(
+        revision_id,
+        input.fields.clone(),
+        created_diff_id,
+        input.message.as_deref().unwrap_or(""),
+    );
+    let updated = diff_submit::update_revision(call, &params)?;
+    // DIFF-D17: under `--json` PHP discards the whole report for
+    // create/update (`ob_get_clean()`, `:570-572`); the URI is
+    // still returned for `--browse`.
+    let text = if input.json {
+        String::new()
+    } else {
+        format_submit_report_ansi(
+            "Updated an existing Differential revision:",
+            "Revision URI:",
+            &updated.uri,
+            &input.included_changes,
+            ansi,
+        )
+    };
+    Ok(SubmitReport {
+        text,
+        uri: Some(updated.uri),
+        revision_id: Some(revision_id),
+        diff_id: created_diff_id,
+    })
+}
+
+/// `--create` report: create the revision, then format the report.
+fn report_create_submit(
+    call: &diff_submit::ConduitCall<'_>,
+    created: &diff_submit::CreatedDiff,
+    input: &SubmitInput,
+    ansi: bool,
+) -> Result<SubmitReport, String> {
+    let revision = submit_create_revision(
+        call,
+        input,
+        created.diff_id,
+        created.phid.as_deref(),
+        &created.uri,
+    )?;
+    // DIFF-D17: see the update branch above (`:570-572`).
+    let text = if input.json {
+        String::new()
+    } else {
+        format_submit_report_ansi(
+            "Created a new Differential revision:",
+            "Revision URI:",
+            &revision.uri,
+            &input.included_changes,
+            ansi,
+        )
+    };
+    let created_id = revision.revision_id;
+    Ok(SubmitReport {
+        text,
+        uri: Some(revision.uri),
+        revision_id: Some(created_id),
+        diff_id: created.diff_id,
+    })
 }
 
 /// Run a submit over `call`, returning the report text (see
@@ -1814,56 +1855,19 @@ fn submit_via_client_ansi(
     // DIFF-D8: explicit creates resolve their message before lint (PHP's
     // `getCommitMessageFromUser()` precedes the linters); a footer
     // revision redirects the mode to that update instead.
-    let mut mode = mode.clone();
-    let mut create_corpus = None;
-    let mut footer_redirect = None;
-    if matches!(mode, SubmitMode::Create) {
-        let metadata_dir = update_metadata_dir(cwd, Some(VcsKind::Git))?;
-        let branch = git::branch_name(cwd)?;
-        // A detached HEAD renders an empty branch name (PHP formats a
-        // null branch through `%s`); raw sources never reach this arm.
-        let branch = branch.as_deref().or(Some(""));
-        let resolved = resolve_create_message_online(
-            cwd,
-            &hg::HgCommand::default(),
-            options,
-            &call,
-            Some(VcsKind::Git),
-            &metadata_dir,
-            &range.base,
-            head,
-            branch,
-        )?;
-        if let Some(footer_id) = resolved.footer_revision_id {
-            mode = SubmitMode::Update(footer_id);
-            footer_redirect = Some((footer_id, resolved.fields));
-        } else {
-            create_corpus = Some(resolved.corpus);
-        }
-    }
+    let CreateRedirect {
+        mode,
+        corpus: create_corpus,
+        footer: footer_redirect,
+    } = resolve_submit_create_redirect(cwd, options, &call, mode, &range.base, head)?;
     let report =
         run_lint_unit_stdio_ansi(cwd, options, Some(range.base.as_str()), head, is_raw, ansi)?;
     let mut input = prepare_submit_with_report(cwd, options, &mode, &report)?;
-    let mut skip_update_resolution = false;
     if let Some(corpus) = create_corpus {
         input.message_corpus = Some(corpus);
     }
-    if let Some((footer_id, pulled_fields)) = &footer_redirect {
-        let metadata_dir = update_metadata_dir(cwd, Some(VcsKind::Git))?;
-        let resolved = resolve_footer_update_online(
-            cwd,
-            &hg::HgCommand::default(),
-            options,
-            &call,
-            *footer_id,
-            pulled_fields,
-            Some(VcsKind::Git),
-            &metadata_dir,
-        )?;
-        input.fields = resolved.fields;
-        input.message = Some(resolved.message);
-        skip_update_resolution = true;
-    }
+    let skip_update_resolution =
+        apply_footer_redirect(cwd, options, &call, &mut input, &footer_redirect)?;
     submit_prepared_via_client_ansi(
         cwd,
         &hg::HgCommand::default(),
@@ -1875,6 +1879,103 @@ fn submit_via_client_ansi(
         skip_update_resolution,
         ansi,
     )
+}
+
+/// DIFF-D8 create redirect: the effective mode plus the create
+/// corpus or footer revision to apply after lint.
+struct CreateRedirect {
+    /// Effective submit mode (a footer revision redirects to update).
+    mode: SubmitMode,
+    /// Raw corpus for the create submit, absent on redirect.
+    corpus: Option<String>,
+    /// Footer revision to update instead of creating.
+    footer: Option<FooterRedirect>,
+}
+
+/// A footer revision redirect: the id plus the pulled message fields.
+struct FooterRedirect {
+    /// Footer revision id.
+    revision_id: u64,
+    /// Server-pulled message fields.
+    fields: diff_local::CommitFields,
+}
+
+/// Resolve the DIFF-D8 create redirect.
+fn resolve_submit_create_redirect(
+    cwd: &Path,
+    options: &Options,
+    call: &diff_submit::ConduitCall<'_>,
+    mode: &SubmitMode,
+    base: &str,
+    head: Option<&str>,
+) -> Result<CreateRedirect, String> {
+    if !matches!(mode, SubmitMode::Create) {
+        return Ok(CreateRedirect {
+            mode: mode.clone(),
+            corpus: None,
+            footer: None,
+        });
+    }
+    let metadata_dir = update_metadata_dir(cwd, Some(VcsKind::Git))?;
+    let branch = git::branch_name(cwd)?;
+    // A detached HEAD renders an empty branch name (PHP formats a
+    // null branch through `%s`); raw sources never reach this arm.
+    let branch = branch.as_deref().or(Some(""));
+    let resolved = resolve_create_message_online(
+        cwd,
+        &hg::HgCommand::default(),
+        options,
+        call,
+        Some(VcsKind::Git),
+        &metadata_dir,
+        base,
+        head,
+        branch,
+    )?;
+    if let Some(footer_id) = resolved.footer_revision_id {
+        Ok(CreateRedirect {
+            mode: SubmitMode::Update(footer_id),
+            corpus: None,
+            footer: Some(FooterRedirect {
+                revision_id: footer_id,
+                fields: resolved.fields,
+            }),
+        })
+    } else {
+        Ok(CreateRedirect {
+            mode: mode.clone(),
+            corpus: Some(resolved.corpus),
+            footer: None,
+        })
+    }
+}
+
+/// Apply a footer redirect to a prepared input, returning whether the
+/// update was pre-resolved (skipping the standard resolution).
+fn apply_footer_redirect(
+    cwd: &Path,
+    options: &Options,
+    call: &diff_submit::ConduitCall<'_>,
+    input: &mut SubmitInput,
+    footer_redirect: &Option<FooterRedirect>,
+) -> Result<bool, String> {
+    let Some(redirect) = footer_redirect else {
+        return Ok(false);
+    };
+    let metadata_dir = update_metadata_dir(cwd, Some(VcsKind::Git))?;
+    let resolved = resolve_footer_update_online(
+        cwd,
+        &hg::HgCommand::default(),
+        options,
+        call,
+        redirect.revision_id,
+        &redirect.fields,
+        Some(VcsKind::Git),
+        &metadata_dir,
+    )?;
+    input.fields = resolved.fields;
+    input.message = Some(resolved.message);
+    Ok(true)
 }
 
 /// Submit a prepared input: stamp the repository PHID, resolve a
@@ -1907,15 +2008,52 @@ fn submit_prepared_via_client_ansi(
     if let Some(update_id) = update_id
         && !skip_update_resolution
     {
-        let metadata_dir = update_metadata_dir(cwd, kind)?;
-        let mut display_arg = String::new();
-        let target = standard_update_target(options, &input.fields, update_id, &mut display_arg);
-        let resolved =
-            resolve_update_online(cwd, hg_cmd, options, &call, &target, kind, &metadata_dir)?;
-        input.fields = resolved.fields;
-        input.message = Some(resolved.message);
+        apply_client_update_resolution(cwd, hg_cmd, options, &call, kind, &mut *input, update_id)?;
     }
-    let report = submit_over_with_browse_ansi(cwd, options, &call, input, ansi)?;
+    let report = submit_over_and_stage(cwd, options, &call, kind, input, ansi)?;
+    finalize_client_submit(
+        cwd,
+        hg_cmd,
+        options,
+        &call,
+        kind,
+        &input.mode,
+        report.revision_id,
+        update_id,
+    )?;
+    Ok(report.text)
+}
+
+/// Resolve an `--update` target's fields and message against Conduit
+/// (plus the editor) before the diff exists.
+fn apply_client_update_resolution(
+    cwd: &Path,
+    hg_cmd: &hg::HgCommand,
+    options: &Options,
+    call: &diff_submit::ConduitCall<'_>,
+    kind: Option<VcsKind>,
+    input: &mut SubmitInput,
+    update_id: u64,
+) -> Result<(), String> {
+    let metadata_dir = update_metadata_dir(cwd, kind)?;
+    let mut display_arg = String::new();
+    let target = standard_update_target(options, &input.fields, update_id, &mut display_arg);
+    let resolved = resolve_update_online(cwd, hg_cmd, options, call, &target, kind, &metadata_dir)?;
+    input.fields = resolved.fields;
+    input.message = Some(resolved.message);
+    Ok(())
+}
+
+/// Submit over `call`, then push the diff to the staging area.
+fn submit_over_and_stage(
+    cwd: &Path,
+    options: &Options,
+    call: &diff_submit::ConduitCall<'_>,
+    kind: Option<VcsKind>,
+    input: &SubmitInput,
+    ansi: bool,
+) -> Result<SubmitReport, String> {
+    let report = submit_over_with_browse_ansi(cwd, options, call, input, ansi)?;
     // DIFF-D13: the staging push records before the post-create amend
     // (both run after the submit here; PHP stages pre-submit).
     let spec_base = input
@@ -1923,19 +2061,35 @@ fn submit_prepared_via_client_ansi(
         .get("sourceControlBaseRevision")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    submit_changes_to_staging_area(cwd, options, &call, kind, report.diff_id, spec_base, ansi)?;
+    submit_changes_to_staging_area(cwd, options, call, kind, report.diff_id, spec_base, ansi)?;
+    Ok(report)
+}
+
+/// DIFF-D7/D6: amend the worktree after a create, then forget the
+/// update scratch files.
+#[allow(clippy::too_many_arguments)]
+fn finalize_client_submit(
+    cwd: &Path,
+    hg_cmd: &hg::HgCommand,
+    options: &Options,
+    call: &diff_submit::ConduitCall<'_>,
+    kind: Option<VcsKind>,
+    mode: &SubmitMode,
+    created_id: Option<i64>,
+    update_id: Option<u64>,
+) -> Result<(), String> {
     // DIFF-D7: a fresh revision's footer amends into the worktree commit.
-    if matches!(input.mode, SubmitMode::Create)
-        && let Some(created_id) = report.revision_id
+    if matches!(mode, SubmitMode::Create)
+        && let Some(created_id) = created_id
     {
-        amend_after_create(cwd, hg_cmd, options, &call, created_id, kind)?;
+        amend_after_create(cwd, hg_cmd, options, call, created_id, kind)?;
     }
     if let Some(update_id) = update_id
         && let Ok(metadata_dir) = update_metadata_dir(cwd, kind)
     {
         clear_update_scratch(&metadata_dir, update_id);
     }
-    Ok(report.text)
+    Ok(())
 }
 
 /// Inspect `cwd` per `options`, returning the bytes for stdout.
@@ -2856,97 +3010,207 @@ pub fn resolve_update_revision<R: std::io::BufRead, W: std::io::Write>(
     let id_arg = i64::try_from(revision_id)
         .map_err(|_| format!("Revision ID {revision_id} is out of range."))?;
     if target.check_ownership {
-        let row = diff_submit::query_revision_row(resolver.call, id_arg)?
-            .ok_or_else(|| diff_submit::unknown_revision_message(target.revision_arg))?;
-        let viewer = fetch_viewer_phid(resolver.call)?;
-        diff_local::check_revision_ownership(resolver.reader, resolver.writer, &row, &viewer)?;
+        check_update_revision_ownership(&mut *resolver, id_arg, target.revision_arg)?;
     }
-    let params = match target.edit_fields {
-        Some(fields) => diff_submit::commit_message_update_params(id_arg, fields.clone()),
-        None => diff_submit::commit_message_from_revision_params(id_arg),
-    };
-    let base_corpus = diff_submit::fetch_commit_message(resolver.call, &params)?;
-    let mut base_message = diff_local::CommitMessage::new_from_raw_corpus(&base_corpus)?;
-    base_message
-        .pull_data_from_conduit(resolver.call, false)
-        .map_err(diff_local::PullDataError::into_message)?;
+    let (base_corpus, base_message) =
+        fetch_base_update_message(resolver.call, id_arg, target.edit_fields)?;
     let id_key = revision_id.to_string();
-    let mut edit_messages = read_update_scratch(resolver.metadata_dir, SCRATCH_EDIT_MESSAGES);
-    let cached = edit_messages
-        .get(&id_key)
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let use_fields = target
-        .verbatim_fields
-        .as_object()
-        .is_some_and(|fields| !fields.is_empty());
-    let mut remote_corpus = if !options.edit || cached.is_none() || use_fields {
-        base_corpus.clone()
-    } else {
-        cached.unwrap_or_default()
-    };
-    if options.edit {
-        let edited = (resolver.edit)(&remote_corpus, EDITOR_DIFF_EDIT)?;
-        if edited != remote_corpus {
-            remote_corpus = edited.clone();
-            edit_messages[&id_key] = serde_json::Value::String(edited);
-            write_scratch_json(resolver.metadata_dir, SCRATCH_EDIT_MESSAGES, &edit_messages);
-        }
-    }
-    let new_message = if base_corpus == remote_corpus {
-        base_message
-    } else {
-        let stripped = diff_local::remove_comments(&remote_corpus);
-        let mut fresh = diff_local::CommitMessage::new_from_raw_corpus(&stripped)?;
-        fresh
-            .pull_data_from_conduit(resolver.call, false)
-            .map_err(diff_local::PullDataError::into_message)?;
-        fresh
-    };
+    let remote_corpus = resolve_remote_corpus(
+        resolver,
+        &base_corpus,
+        &id_key,
+        options.edit,
+        target.verbatim_fields,
+    )?;
+    let new_message =
+        rebuild_update_message(resolver.call, base_message, &base_corpus, &remote_corpus)?;
     let fields = fields_json(new_message.get_fields());
     let message = match options.message.as_deref() {
         Some(text) if !text.is_empty() => text.to_string(),
-        _ => {
-            let is_raw =
-                diff_local::is_raw_diff_source(options.raw, options.raw_command.as_deref());
-            diff_local::require_non_raw_update_message(is_raw)?;
-            let mut update_messages =
-                read_update_scratch(resolver.metadata_dir, SCRATCH_UPDATE_MESSAGES);
-            let cached_message = update_messages
-                .get(&id_key)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let template = if cached_message.is_empty() {
-                let comments = (resolver.prefill)()?.unwrap_or_default();
-                let title = new_message
-                    .get_fields()
-                    .get("title")
-                    .and_then(|value| match value {
-                        diff_local::FieldValue::Text(title) => Some(title.clone()),
-                        diff_local::FieldValue::List(_) => None,
-                    })
-                    .unwrap_or_default();
-                let template_id = new_message.revision_id.unwrap_or(revision_id);
-                diff_local::default_update_message_template(&comments, template_id, &title)
-            } else {
-                cached_message
-            };
-            let comments = (resolver.edit)(&template, EDITOR_DIFF_UPDATE)?;
-            update_messages[&id_key] = serde_json::Value::String(comments.clone());
-            write_scratch_json(
-                resolver.metadata_dir,
-                SCRATCH_UPDATE_MESSAGES,
-                &update_messages,
-            );
-            let stripped = diff_local::remove_comments(&comments);
-            if stripped.trim().is_empty() {
-                return Err(diff_local::USER_ABORT.to_string());
-            }
-            stripped
-        }
+        _ => prompt_update_message(&mut *resolver, options, &id_key, &new_message, revision_id)?,
     };
     Ok(ResolvedUpdate { fields, message })
+}
+
+/// Check the viewer owns the updated revision, erroring on unknown
+/// revisions first.
+fn check_update_revision_ownership<R: std::io::BufRead, W: std::io::Write>(
+    resolver: &mut UpdateResolver<'_, R, W>,
+    id_arg: i64,
+    revision_arg: &str,
+) -> Result<(), String> {
+    let row = diff_submit::query_revision_row(resolver.call, id_arg)?
+        .ok_or_else(|| diff_submit::unknown_revision_message(revision_arg))?;
+    let viewer = fetch_viewer_phid(resolver.call)?;
+    diff_local::check_revision_ownership(resolver.reader, resolver.writer, &row, &viewer)
+}
+
+/// Fetch the update's base corpus and its conduit-pulled message: the
+/// `edit` template under footer fields, else the plain revision corpus.
+fn fetch_base_update_message(
+    call: &diff_submit::ConduitCall<'_>,
+    id_arg: i64,
+    edit_fields: Option<&serde_json::Value>,
+) -> Result<(String, diff_local::CommitMessage), String> {
+    let params = match edit_fields {
+        Some(fields) => diff_submit::commit_message_update_params(id_arg, fields.clone()),
+        None => diff_submit::commit_message_from_revision_params(id_arg),
+    };
+    let base_corpus = diff_submit::fetch_commit_message(call, &params)?;
+    let mut base_message = diff_local::CommitMessage::new_from_raw_corpus(&base_corpus)?;
+    base_message
+        .pull_data_from_conduit(call, false)
+        .map_err(diff_local::PullDataError::into_message)?;
+    Ok((base_corpus, base_message))
+}
+
+/// Resolve the remote corpus: the cached edit or base corpus, run
+/// through the revision-info editor.
+fn resolve_remote_corpus<R: std::io::BufRead, W: std::io::Write>(
+    resolver: &UpdateResolver<'_, R, W>,
+    base_corpus: &str,
+    id_key: &str,
+    edit: bool,
+    verbatim_fields: &serde_json::Value,
+) -> Result<String, String> {
+    let mut edit_messages = read_update_scratch(resolver.metadata_dir, SCRATCH_EDIT_MESSAGES);
+    let cached = edit_messages
+        .get(id_key)
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let use_fields = verbatim_fields
+        .as_object()
+        .is_some_and(|fields| !fields.is_empty());
+    let remote_corpus = select_remote_corpus(base_corpus, cached, edit, use_fields);
+    maybe_edit_remote_corpus(
+        edit,
+        resolver.edit,
+        resolver.metadata_dir,
+        id_key,
+        &mut edit_messages,
+        remote_corpus,
+    )
+}
+
+/// Pick the remote corpus: the cached edit, unless editing is off,
+/// nothing is cached, or verbatim fields defeat the cache.
+fn select_remote_corpus(
+    base_corpus: &str,
+    cached: Option<String>,
+    edit: bool,
+    use_fields: bool,
+) -> String {
+    if !edit || cached.is_none() || use_fields {
+        base_corpus.to_string()
+    } else {
+        cached.unwrap_or_default()
+    }
+}
+
+/// Run the revision-info editor over the remote corpus, caching edits
+/// under the revision id.
+fn maybe_edit_remote_corpus(
+    edit: bool,
+    editor: &dyn Fn(&str, &str) -> Result<String, String>,
+    metadata_dir: &Path,
+    id_key: &str,
+    edit_messages: &mut serde_json::Value,
+    remote_corpus: String,
+) -> Result<String, String> {
+    if !edit {
+        return Ok(remote_corpus);
+    }
+    let edited = editor(&remote_corpus, EDITOR_DIFF_EDIT)?;
+    if edited == remote_corpus {
+        return Ok(remote_corpus);
+    }
+    edit_messages[id_key] = serde_json::Value::String(edited.clone());
+    write_scratch_json(metadata_dir, SCRATCH_EDIT_MESSAGES, edit_messages);
+    Ok(edited)
+}
+
+/// Rebuild the update message from an edited corpus, reusing the base
+/// message when nothing changed.
+fn rebuild_update_message(
+    call: &diff_submit::ConduitCall<'_>,
+    base_message: diff_local::CommitMessage,
+    base_corpus: &str,
+    remote_corpus: &str,
+) -> Result<diff_local::CommitMessage, String> {
+    if base_corpus == remote_corpus {
+        return Ok(base_message);
+    }
+    let stripped = diff_local::remove_comments(remote_corpus);
+    let mut fresh = diff_local::CommitMessage::new_from_raw_corpus(&stripped)?;
+    fresh
+        .pull_data_from_conduit(call, false)
+        .map_err(diff_local::PullDataError::into_message)?;
+    Ok(fresh)
+}
+
+/// Prompt the update message through the editor, caching comments under
+/// the revision id. An empty message aborts the update.
+fn prompt_update_message<R: std::io::BufRead, W: std::io::Write>(
+    resolver: &mut UpdateResolver<'_, R, W>,
+    options: &Options,
+    id_key: &str,
+    new_message: &diff_local::CommitMessage,
+    revision_id: u64,
+) -> Result<String, String> {
+    let is_raw = diff_local::is_raw_diff_source(options.raw, options.raw_command.as_deref());
+    diff_local::require_non_raw_update_message(is_raw)?;
+    let mut update_messages = read_update_scratch(resolver.metadata_dir, SCRATCH_UPDATE_MESSAGES);
+    let cached_message = update_messages
+        .get(id_key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let template = if cached_message.is_empty() {
+        update_message_template(resolver.prefill, new_message, revision_id)?
+    } else {
+        cached_message
+    };
+    let comments = (resolver.edit)(&template, EDITOR_DIFF_UPDATE)?;
+    update_messages[id_key] = serde_json::Value::String(comments.clone());
+    write_scratch_json(
+        resolver.metadata_dir,
+        SCRATCH_UPDATE_MESSAGES,
+        &update_messages,
+    );
+    let stripped = diff_local::remove_comments(&comments);
+    if stripped.trim().is_empty() {
+        return Err(diff_local::USER_ABORT.to_string());
+    }
+    Ok(stripped)
+}
+
+/// Build the update template from the prefill comments and the
+/// message's title.
+fn update_message_template(
+    prefill: &dyn Fn() -> Result<Option<String>, String>,
+    new_message: &diff_local::CommitMessage,
+    revision_id: u64,
+) -> Result<String, String> {
+    let comments = prefill()?.unwrap_or_default();
+    let title = update_message_title(new_message);
+    let template_id = new_message.revision_id.unwrap_or(revision_id);
+    Ok(diff_local::default_update_message_template(
+        &comments,
+        template_id,
+        &title,
+    ))
+}
+
+/// The update template's title: the message's text title, if any.
+fn update_message_title(new_message: &diff_local::CommitMessage) -> String {
+    new_message
+        .get_fields()
+        .get("title")
+        .and_then(|value| match value {
+            diff_local::FieldValue::Text(title) => Some(title.clone()),
+            diff_local::FieldValue::List(_) => None,
+        })
+        .unwrap_or_default()
 }
 
 /// Forget one revision's cached edit/update messages after a successful
@@ -3113,29 +3377,56 @@ fn query_unique_repository_row(
 ) -> Result<Option<serde_json::Value>, String> {
     let user_file = config::arcrc_path();
     let sources = get_config::load_sources(cwd, user_file.as_deref())?;
-    let mut query = None;
-    if let Some((_, value)) = get_config::current_value("repository.callsign", &sources)
-        && let Some(callsign) = value.as_str().map(str::trim)
-        && !callsign.is_empty()
-    {
-        query = Some(serde_json::json!({"callsigns": [callsign]}));
-    }
+    let mut query = callsign_repository_query(&sources);
     if query.is_none() {
-        let (uuid, remote) = match kind {
-            Some(VcsKind::Hg) | None => (None, hg::get_remote_uri(cwd)?),
-            Some(VcsKind::Svn) => (svn::get_repository_uuid(cwd)?, svn::get_remote_uri(cwd)?),
-            Some(VcsKind::Git) => (None, git::remote_uri(cwd)?),
-        };
-        if let Some(uuid) = uuid {
-            query = Some(serde_json::json!({"uuids": [uuid]}));
-        } else if let Some(remote) = remote {
-            query = Some(serde_json::json!({"remoteURIs": [remote]}));
-        }
+        query = vcs_repository_query(cwd, kind)?;
     }
     let Some(query) = query else {
         return Ok(None);
     };
-    let results = match call("repository.query", &query) {
+    run_unique_repository_query(call, &query)
+}
+
+/// The `repository.query` constraint from the configured callsign, if any.
+fn callsign_repository_query(sources: &get_config::Sources) -> Option<serde_json::Value> {
+    if let Some((_, value)) = get_config::current_value("repository.callsign", sources)
+        && let Some(callsign) = value.as_str().map(str::trim)
+        && !callsign.is_empty()
+    {
+        Some(serde_json::json!({"callsigns": [callsign]}))
+    } else {
+        None
+    }
+}
+
+/// The `repository.query` constraint from the working copy: the VCS
+/// UUID (svn), then the remote URI.
+fn vcs_repository_query(
+    cwd: &Path,
+    kind: Option<VcsKind>,
+) -> Result<Option<serde_json::Value>, String> {
+    let (uuid, remote) = match kind {
+        Some(VcsKind::Hg) | None => (None, hg::get_remote_uri(cwd)?),
+        Some(VcsKind::Svn) => (svn::get_repository_uuid(cwd)?, svn::get_remote_uri(cwd)?),
+        Some(VcsKind::Git) => (None, git::remote_uri(cwd)?),
+    };
+    if let Some(uuid) = uuid {
+        Ok(Some(serde_json::json!({"uuids": [uuid]})))
+    } else if let Some(remote) = remote {
+        Ok(Some(serde_json::json!({"remoteURIs": [remote]})))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Run a `repository.query` constraint, yielding the row on a unique
+/// match. `ERR-CONDUIT-CALL` (old server) and non-unique matches yield
+/// `None`; other conduit failures propagate.
+fn run_unique_repository_query(
+    call: &diff_submit::ConduitCall<'_>,
+    query: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, String> {
+    let results = match call("repository.query", query) {
         Ok(results) => results,
         Err(error) if is_old_server_error(&error) => return Ok(None),
         Err(error) => return Err(error),
@@ -3197,76 +3488,113 @@ fn submit_changes_to_staging_area(
         );
         call(diff_submit::METHOD_SET_DIFF_PROPERTY, &params).map(|_| ())
     };
+    match plan_staging_push(options, call, cwd, kind)? {
+        StagingPlan::Skip { message, status } => {
+            staging_notice("blue", "SKIP STAGING", message, ansi);
+            record(status, &[])
+        }
+        StagingPlan::Push { uri, prefix } => {
+            push_staging_refs(cwd, &uri, &prefix, diff_id, spec_base, ansi, &record)
+        }
+    }
+}
+
+/// A staging decision: skip with a notice and status, or push to a URI.
+enum StagingPlan {
+    /// Skip the push, recording `status`.
+    Skip {
+        /// Stderr notice message.
+        message: &'static str,
+        /// Recorded staging status.
+        status: &'static str,
+    },
+    /// Push the base and diff tags.
+    Push {
+        /// Staging area URI.
+        uri: String,
+        /// Tag prefix.
+        prefix: String,
+    },
+}
+
+/// Resolve the staging plan through the skip ladder (flag, raw,
+/// unknown/unavailable/unsupported/unconfigured repository, non-git
+/// client).
+fn plan_staging_push(
+    options: &Options,
+    call: &diff_submit::ConduitCall<'_>,
+    cwd: &Path,
+    kind: Option<VcsKind>,
+) -> Result<StagingPlan, String> {
     if options.skip_staging {
-        staging_notice(
-            "blue",
-            "SKIP STAGING",
-            "Flag --skip-staging was specified.",
-            ansi,
-        );
-        return record(diff_submit::STAGING_USER_SKIP, &[]);
+        return Ok(StagingPlan::Skip {
+            message: "Flag --skip-staging was specified.",
+            status: diff_submit::STAGING_USER_SKIP,
+        });
     }
     if diff_local::is_raw_diff_source(options.raw, options.raw_command.as_deref()) {
-        staging_notice(
-            "blue",
-            "SKIP STAGING",
-            "Raw changes can not be pushed to a staging area.",
-            ansi,
-        );
-        return record(diff_submit::STAGING_DIFF_RAW, &[]);
+        return Ok(StagingPlan::Skip {
+            message: "Raw changes can not be pushed to a staging area.",
+            status: diff_submit::STAGING_DIFF_RAW,
+        });
     }
     let row = query_unique_repository_row(call, cwd, kind)?;
     let Some(row) = row else {
-        staging_notice(
-            "blue",
-            "SKIP STAGING",
-            "Unable to determine repository for this change.",
-            ansi,
-        );
-        return record(diff_submit::STAGING_REPOSITORY_UNKNOWN, &[]);
+        return Ok(StagingPlan::Skip {
+            message: "Unable to determine repository for this change.",
+            status: diff_submit::STAGING_REPOSITORY_UNKNOWN,
+        });
     };
     let Some(staging) = row.get("staging") else {
-        staging_notice(
-            "blue",
-            "SKIP STAGING",
-            "The server does not support staging areas.",
-            ansi,
-        );
-        return record(diff_submit::STAGING_REPOSITORY_UNAVAILABLE, &[]);
+        return Ok(StagingPlan::Skip {
+            message: "The server does not support staging areas.",
+            status: diff_submit::STAGING_REPOSITORY_UNAVAILABLE,
+        });
     };
     if staging.get("supported").and_then(|v| v.as_bool()) != Some(true) {
-        staging_notice(
-            "blue",
-            "SKIP STAGING",
-            "Phabricator does not support staging areas for this repository.",
-            ansi,
-        );
-        return record(diff_submit::STAGING_REPOSITORY_UNSUPPORTED, &[]);
+        return Ok(StagingPlan::Skip {
+            message: "Phabricator does not support staging areas for this repository.",
+            status: diff_submit::STAGING_REPOSITORY_UNSUPPORTED,
+        });
     }
     let staging_uri = staging.get("uri").and_then(|v| v.as_str()).unwrap_or("");
     if staging_uri.is_empty() {
-        staging_notice(
-            "blue",
-            "SKIP STAGING",
-            "No staging area is configured for this repository.",
-            ansi,
-        );
-        return record(diff_submit::STAGING_REPOSITORY_UNCONFIGURED, &[]);
+        return Ok(StagingPlan::Skip {
+            message: "No staging area is configured for this repository.",
+            status: diff_submit::STAGING_REPOSITORY_UNCONFIGURED,
+        });
     }
     if !matches!(kind, Some(VcsKind::Git)) {
-        staging_notice(
-            "blue",
-            "SKIP STAGING",
-            "This client version does not support staging this repository.",
-            ansi,
-        );
-        return record(diff_submit::STAGING_CLIENT_UNSUPPORTED, &[]);
+        return Ok(StagingPlan::Skip {
+            message: "This client version does not support staging this repository.",
+            status: diff_submit::STAGING_CLIENT_UNSUPPORTED,
+        });
     }
+    Ok(StagingPlan::Push {
+        uri: staging_uri.to_string(),
+        prefix: staging
+            .get("prefix")
+            .and_then(|v| v.as_str())
+            .unwrap_or("phabricator")
+            .to_string(),
+    })
+}
+
+/// Records a staging status plus refs (`setdiffproperty`).
+type StagingRecorder<'a> = dyn Fn(&str, &[serde_json::Value]) -> Result<(), String> + 'a;
+
+/// Push the base and diff tags to the staging area, recording the refs.
+#[allow(clippy::too_many_arguments)]
+fn push_staging_refs(
+    cwd: &Path,
+    staging_uri: &str,
+    prefix: &str,
+    diff_id: i64,
+    spec_base: &str,
+    ansi: bool,
+    record: &StagingRecorder<'_>,
+) -> Result<(), String> {
     let head = git::head_commit(cwd)?;
-    let prefix = staging
-        .get("prefix")
-        .and_then(|v| v.as_str())
-        .unwrap_or("phabricator");
     let is_lfs = git::is_git_lfs_working_copy(cwd);
     let refs =
         diff_submit::staging_push_refs(staging_uri, prefix, diff_id, spec_base, &head, is_lfs);
@@ -4101,70 +4429,72 @@ fn submit_full_via_client_ansi(
 ) -> Result<String, String> {
     let is_raw = diff_local::is_raw_diff_source(options.raw, options.raw_command.as_deref());
     let kind = if is_raw { None } else { detect_vcs_kind(cwd) };
-    // Outside a working copy the prepare step reports the canonical
-    // error; lint/unit stay unrunnable (PHP's repository setup throws
-    // before `:363` just the same).
-    let report = if !is_raw && kind.is_none() {
-        diff_local::LintUnitReport::empty()
-    } else {
-        let (base, head) = lint_unit_base(cwd, options, kind, is_raw)?;
-        let head_ref = head.as_deref();
-        run_lint_unit_stdio_ansi(cwd, options, base.as_deref(), head_ref, is_raw, ansi)?
-    };
-    let mut input = prepare_submit_full_with_report(cwd, options, mode, &report)?;
+    let lint_report = full_lint_unit_report(cwd, options, kind, is_raw, ansi)?;
+    let mut input = prepare_submit_full_with_report(cwd, options, mode, &lint_report)?;
     let client = config::client_for(options.conduit_uri.as_deref())?;
     stamp_repository_phid(&client, cwd, is_raw, &mut input.spec)?;
     let call = |method: &str, params: &serde_json::Value| {
         client.call(method, params).map_err(|e| e.to_string())
     };
     // DIFF-D6/D9/D10: see the baseline path above.
+    let update_id = maybe_apply_full_update(cwd, options, &call, kind, &mut input)?;
+    let report = submit_over_and_stage(cwd, options, &call, kind, &input, ansi)?;
+    // DIFF-D13/DIFF-D7: see the baseline path above.
+    finalize_client_submit(
+        cwd,
+        &hg::HgCommand::default(),
+        options,
+        &call,
+        kind,
+        &input.mode,
+        report.revision_id,
+        update_id,
+    )?;
+    Ok(report.text)
+}
+
+/// Resolve an `--update` target for a full submit, returning the id.
+fn maybe_apply_full_update(
+    cwd: &Path,
+    options: &Options,
+    call: &diff_submit::ConduitCall<'_>,
+    kind: Option<VcsKind>,
+    input: &mut SubmitInput,
+) -> Result<Option<u64>, String> {
     let update_id = match &input.mode {
         SubmitMode::Update(id) => Some(*id),
         _ => None,
     };
     if let Some(update_id) = update_id {
-        let metadata_dir = update_metadata_dir(cwd, kind)?;
-        let mut display_arg = String::new();
-        let target = standard_update_target(options, &input.fields, update_id, &mut display_arg);
-        let resolved = resolve_update_online(
+        apply_client_update_resolution(
             cwd,
             &hg::HgCommand::default(),
             options,
-            &call,
-            &target,
+            call,
             kind,
-            &metadata_dir,
-        )?;
-        input.fields = resolved.fields;
-        input.message = Some(resolved.message);
-    }
-    let report = submit_over_with_browse_ansi(cwd, options, &call, &input, ansi)?;
-    // DIFF-D13: see the baseline path above.
-    let spec_base = input
-        .spec
-        .get("sourceControlBaseRevision")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    submit_changes_to_staging_area(cwd, options, &call, kind, report.diff_id, spec_base, ansi)?;
-    // DIFF-D7: a fresh revision's footer amends into the worktree commit.
-    if matches!(input.mode, SubmitMode::Create)
-        && let Some(created_id) = report.revision_id
-    {
-        amend_after_create(
-            cwd,
-            &hg::HgCommand::default(),
-            options,
-            &call,
-            created_id,
-            kind,
+            input,
+            update_id,
         )?;
     }
-    if let Some(update_id) = update_id
-        && let Ok(metadata_dir) = update_metadata_dir(cwd, kind)
-    {
-        clear_update_scratch(&metadata_dir, update_id);
+    Ok(update_id)
+}
+
+/// Lint/unit report for a full submit. Outside a working copy the
+/// prepare step reports the canonical error; lint/unit stay unrunnable
+/// (PHP's repository setup throws before `:363` just the same).
+fn full_lint_unit_report(
+    cwd: &Path,
+    options: &Options,
+    kind: Option<VcsKind>,
+    is_raw: bool,
+    ansi: bool,
+) -> Result<diff_local::LintUnitReport, String> {
+    if !is_raw && kind.is_none() {
+        return Ok(diff_local::LintUnitReport::empty());
     }
-    Ok(report.text)
+    let (base, head) = lint_unit_base(cwd, options, kind, is_raw)?;
+    let head_ref = head.as_deref();
+    run_lint_unit_stdio_ansi(cwd, options, base.as_deref(), head_ref, is_raw, ansi)
 }
 
 /// Base commit plus head for lint/unit `--rev`, by repository kind.
