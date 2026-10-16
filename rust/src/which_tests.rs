@@ -770,3 +770,66 @@ fn multi_revision_guidance_stays_plain() {
     let styled = render_ansi(&ctx, true);
     assert!(styled.contains(sentence), "{styled}");
 }
+
+// -( R5 TTY gating: RB-D22 )---------------------------------------------------
+
+#[test]
+fn r5_rb_d22_banner_essay_bytes() {
+    // `ArcanistGitAPI.php:323-352`: the green-badge banner plus the
+    // 78-column essay, markup-stripped without a TTY.
+    assert_eq!(
+        default_range_banner(false),
+        " Select a Default Commit Range \n\n"
+    );
+    let styled = default_range_banner(true);
+    assert!(
+        styled.contains("Select a Default Commit Range"),
+        "{styled:?}"
+    );
+    assert!(styled.contains('\x1b'), "{styled:?}");
+    let essay = default_range_essay();
+    assert!(essay.starts_with("You're running a command"), "{essay:?}");
+    assert!(essay.contains("origin/master"), "{essay:?}");
+    assert!(essay.ends_with("start of the commit range.)"), "{essay:?}");
+    for line in essay.split('\n') {
+        assert!(line.chars().count() <= 78, "{line:?}");
+    }
+}
+
+#[test]
+fn r5_rb_d22_default_answer_mapping() {
+    // `ArcanistGitAPI.php:356-358`: blank takes `origin/master`,
+    // anything else passes through raw.
+    assert_eq!(default_range_answer(""), "origin/master");
+    assert_eq!(default_range_answer("   "), "origin/master");
+    assert_eq!(default_range_answer("HEAD^"), "HEAD^");
+    assert_eq!(default_range_answer("  HEAD^  "), "  HEAD^  ");
+}
+
+#[test]
+fn r5_rb_d22_prompt_line_gate() {
+    // Piped stdin records the TTY failure out-of-band for the prompt
+    // call sites; the take resets it.
+    assert_eq!(prompt_line_with_tty("Q?", false), None);
+    assert!(take_prompt_tty_failed());
+    assert!(!take_prompt_tty_failed());
+}
+
+#[test]
+fn r5_rb_d22_non_tty_throws_after_echo() {
+    // `ArcanistGitAPI.php:354-360` via `phutil_console_prompt()`:
+    // piped stdin throws instead of silently defaulting.
+    let repo = fresh_repo("r5d22");
+    commit(&repo.path, "a.txt");
+    commit(&repo.path, "b.txt");
+    let fail = |_: &str| {
+        PROMPT_TTY_FAILED.with(|failed| failed.set(true));
+        None
+    };
+    let inputs = base_inputs("", &fail);
+    assert_eq!(
+        resolve_base(&repo.path, None, "HEAD", false, &empty_loaded(), &inputs).unwrap_err(),
+        crate::prompt::NOT_INTERACTIVE
+    );
+    assert!(!take_prompt_tty_failed());
+}

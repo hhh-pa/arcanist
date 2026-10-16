@@ -4459,28 +4459,28 @@ fn rename_over(from: &Path, to: &Path) -> Result<(), String> {
     }
 }
 
-/// Ask a yes/no question (`phutil_console_confirm()`): `{prompt} [Y/n] `
-/// for a yes default, `{prompt} [y/N] ` for a no default. Blank answers
-/// and EOF take the default; invalid answers re-prompt.
+/// Ask a yes/no question (`phutil_console_confirm()`): two blank lines
+/// plus the query and `[Y/n]` (or `[y/N]`) wrapped with a 4-space
+/// indent, looping until `y`/`n`/empty, then a blank line. Blank
+/// answers and EOF take the default (`default_yes`).
+///
+/// The TTY is injected: scripted sessions pass `true`, production
+/// passes the real stdin state, and piped input echoes the prompt
+/// once, then fails with the `phutil_console_require_tty()` error.
+pub fn confirm_with_tty(
+    prompt: &str,
+    default_yes: bool,
+    input: &mut dyn BufRead,
+    stdin_tty: bool,
+) -> Result<bool, String> {
+    let default_no = !default_yes;
+    let options = if default_no { "[y/N]" } else { "[Y/n]" };
+    crate::prompt::console_confirm_with_tty(input, prompt, options, default_no, stdin_tty)
+}
+
+/// [`confirm_with_tty`] for scripted sessions (stdin reads as a TTY).
 pub fn confirm(prompt: &str, default_yes: bool, input: &mut dyn BufRead) -> bool {
-    use std::io::Write;
-    let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
-    loop {
-        print!("{prompt} {suffix} ");
-        std::io::stdout().flush().ok();
-        let mut line = String::new();
-        match input.read_line(&mut line) {
-            Ok(0) => return default_yes,
-            Err(_) => return default_yes,
-            Ok(_) => {}
-        }
-        match line.trim().to_ascii_lowercase().as_str() {
-            "" => return default_yes,
-            "y" | "yes" => return true,
-            "n" | "no" => return false,
-            _ => {}
-        }
-    }
+    confirm_with_tty(prompt, default_yes, input, true).unwrap_or(default_yes)
 }
 
 /// Show the `diff -u` of a patch
@@ -4569,11 +4569,25 @@ pub fn run(argv: &[String]) -> ExitCode {
 pub fn run_in(cwd: &Path, argv: &[String]) -> ExitCode {
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
-    run_in_with_input(cwd, argv, &mut input)
+    run_in_with_input_and_tty(cwd, argv, &mut input, crate::prompt::stdin_is_terminal())
 }
 
-/// Entry point with an explicit prompt-input reader.
+/// Entry point with an explicit prompt-input reader. Injected input
+/// models a TTY session; use [`run_in_with_input_and_tty`] to gate
+/// prompts on the real stdin state.
 pub fn run_in_with_input(cwd: &Path, argv: &[String], input: &mut dyn BufRead) -> ExitCode {
+    run_in_with_input_and_tty(cwd, argv, input, true)
+}
+
+/// [`run_in_with_input`] with an injected TTY flag: piped input
+/// echoes each prompt once, then fails with the
+/// `phutil_console_require_tty()` error.
+pub fn run_in_with_input_and_tty(
+    cwd: &Path,
+    argv: &[String],
+    input: &mut dyn BufRead,
+    stdin_tty: bool,
+) -> ExitCode {
     let options = match parse_args(argv) {
         ParseOutcome::Help => {
             print!("{}", usage());
@@ -4586,7 +4600,7 @@ pub fn run_in_with_input(cwd: &Path, argv: &[String], input: &mut dyn BufRead) -
         ParseOutcome::Args(options) => options,
     };
     let ansi = terminal::ansi_enabled();
-    match run_workflow(cwd, &options, input, ansi) {
+    match run_workflow(cwd, &options, input, ansi, stdin_tty) {
         Ok(code) => ExitCode::from(code as u8),
         Err(message) => {
             eprintln!("arc {NAME}: {message}");
@@ -4600,6 +4614,7 @@ fn run_workflow(
     options: &Options,
     input: &mut dyn BufRead,
     ansi: bool,
+    stdin_tty: bool,
 ) -> Result<i32, String> {
     let work = discover_working_copy(cwd)?;
     check_supports(options, work.vcs)?;
@@ -4609,7 +4624,7 @@ fn run_workflow(
         return Err("No linters to run.".to_string());
     }
     let mut results = workflow_gather(&work, cwd, options, &engine, input, ansi)?;
-    workflow_emit(&work, options, input, &mut results, ansi)
+    workflow_emit(&work, options, input, &mut results, ansi, stdin_tty)
 }
 
 /// Reject `--everything` combined with explicit paths.
@@ -4775,6 +4790,7 @@ fn workflow_emit(
     input: &mut dyn BufRead,
     results: &mut [LintResult],
     ansi: bool,
+    stdin_tty: bool,
 ) -> Result<i32, String> {
     let renderer_key = workflow_renderer(options)?;
     let mut sink = if options.outfile.is_some() {
@@ -4782,14 +4798,29 @@ fn workflow_emit(
     } else {
         Sink::Stdout
     };
-    let (wrote_to_disk, all_autofix) =
-        workflow_render(results, renderer_key, options, input, &mut sink, ansi)?;
+    let (wrote_to_disk, all_autofix) = workflow_render(
+        results,
+        renderer_key,
+        options,
+        input,
+        &mut sink,
+        ansi,
+        stdin_tty,
+    )?;
     // `--outfile` lands via temp file plus rename (PHP `TempFile`
     // plus `Filesystem::rename()`), before the amend prompt.
     if let Sink::Buffer(buffer) = &sink {
         flush_outfile(options.outfile.as_deref().unwrap_or_default(), buffer)?;
     }
-    maybe_amend(work, options, wrote_to_disk, all_autofix, input, ansi)?;
+    maybe_amend(
+        work,
+        options,
+        wrote_to_disk,
+        all_autofix,
+        input,
+        ansi,
+        stdin_tty,
+    )?;
     let code = result_code(results);
     workflow_render_okay(renderer_key, options.outfile.as_deref(), code, ansi)?;
     Ok(code)
@@ -4804,6 +4835,7 @@ fn workflow_render(
     input: &mut dyn BufRead,
     sink: &mut Sink,
     ansi: bool,
+    stdin_tty: bool,
 ) -> Result<(bool, bool), String> {
     if renderer_key == RENDERER_XML {
         sink.write(&render_xml_header());
@@ -4822,7 +4854,8 @@ fn workflow_render(
         }
         render_workflow_result(result, renderer_key, sink, ansi)?;
         if should_patch && result.is_patchable() {
-            wrote_to_disk |= apply_result_patch(result, prompt_patches, sink, input, ansi)?;
+            wrote_to_disk |=
+                apply_result_patch(result, prompt_patches, sink, input, ansi, stdin_tty)?;
         }
     }
     if renderer_key == RENDERER_XML {
@@ -4871,13 +4904,19 @@ fn apply_result_patch(
     sink: &mut Sink,
     input: &mut dyn BufRead,
     ansi: bool,
+    stdin_tty: bool,
 ) -> Result<bool, String> {
     let (patched, _) = build_patched_data(&result.data, &result.messages)?;
     let result_all_autofix = result.is_all_autofix();
     let mut apply = true;
     if prompt_patches && !result_all_autofix {
         prompt_for_patch(result, &patched, sink);
-        apply = confirm(&patch_prompt_with_ansi(&result.path, ansi), true, input);
+        apply = confirm_with_tty(
+            &patch_prompt_with_ansi(&result.path, ansi),
+            true,
+            input,
+            stdin_tty,
+        )?;
     }
     if !apply {
         return Ok(false);
@@ -4963,6 +5002,7 @@ fn maybe_amend(
     all_autofix: bool,
     input: &mut dyn BufRead,
     ansi: bool,
+    stdin_tty: bool,
 ) -> Result<(), String> {
     if !wrote_to_disk || !amend_enabled(work, options)? {
         return Ok(());
@@ -4972,7 +5012,7 @@ fn maybe_amend(
         print!("{}", lint_notice_line(ansi));
         true
     } else {
-        confirm("Amend HEAD with lint patches?", true, input)
+        confirm_with_tty("Amend HEAD with lint patches?", true, input, stdin_tty)?
     };
     if !amend {
         return Err(

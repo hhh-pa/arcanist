@@ -1638,9 +1638,12 @@ fn confirm_honors_answers_and_defaults() {
         confirm("Do it?", default_yes, &mut cursor)
     };
     assert!(ask("y\n", false));
-    assert!(ask("YES\n", false));
+    // LINT-8: only `y`/`n`/empty answer; `yes`/`no` re-prompt like PHP.
+    assert!(!ask("YES\n", false));
     assert!(!ask("n\n", true));
-    assert!(!ask("No\n", true));
+    assert!(ask("No\n", true));
+    assert!(ask("yes\ny\n", false));
+    assert!(!ask("no\nn\n", true));
     assert!(ask("\n", true));
     assert!(!ask("\n", false));
     assert!(ask("", true));
@@ -1805,4 +1808,22 @@ fn context_with_ansi_skips_multiline_highlight() {
     };
     let tty = render_context_with_ansi(&message, b"one\ntwo\n", true);
     assert!(!tty.contains('\x1b'));
+}
+
+// -( R5 TTY gating: LINT-8 )--------------------------------------------------
+
+#[test]
+fn r5_lint8_confirm_with_tty_gates_pipes() {
+    // `phutil_console_prompt()` echoes, then `require_tty()` throws
+    // (`src/console/format.php:42-52`); scripted TTY sessions answer.
+    let mut piped = std::io::BufReader::new("y\n".as_bytes());
+    assert_eq!(
+        confirm_with_tty("Apply this patch to f?", true, &mut piped, false).unwrap_err(),
+        crate::prompt::NOT_INTERACTIVE
+    );
+    let mut tty = std::io::BufReader::new("y\n".as_bytes());
+    assert!(confirm_with_tty("Apply this patch to f?", true, &mut tty, true).unwrap());
+    // Amend-prompt default stays yes; Enter amends.
+    let mut enter = std::io::BufReader::new("\n".as_bytes());
+    assert!(confirm_with_tty("Amend HEAD with lint patches?", true, &mut enter, true).unwrap());
 }

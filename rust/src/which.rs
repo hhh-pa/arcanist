@@ -133,7 +133,9 @@ pub enum MatchConfig<'a> {
 }
 
 /// Interactive inputs for [`load_context`]: `--base` rules, a prompt hook
-/// (`None` on EOF), and revision matching.
+/// (`None` on EOF), and revision matching. The production hook reports
+/// a non-TTY stdin out-of-band (see [`take_prompt_tty_failed`]); a
+/// scripted `None` still takes the caller's default.
 pub struct Resolution<'a> {
     pub runtime_rules: &'a str,
     pub prompt: &'a dyn Fn(&str) -> Option<String>,
@@ -431,6 +433,9 @@ impl<'a> Engine<'a> {
     fn resolve_arc_prompt(&mut self) -> Result<RuleOutcome, String> {
         self.explain("it is what you typed when prompted.".to_string());
         let answer = (self.prompt)("Against which commit?").unwrap_or_default();
+        if take_prompt_tty_failed() {
+            return Err(crate::prompt::NOT_INTERACTIVE.to_string());
+        }
         if answer.is_empty() {
             Ok(RuleOutcome::NoMatch)
         } else {
@@ -913,13 +918,16 @@ fn resolve_default_base(
             false,
         );
     }
-    print!("{DEFAULT_RANGE_ESSAY}");
+    print!(
+        "{}{}",
+        default_range_banner(terminal::ansi_enabled()),
+        default_range_essay()
+    );
     let answer = prompt("What default do you want to use? [origin/master]").unwrap_or_default();
-    let default = if answer.trim().is_empty() {
-        "origin/master".to_string()
-    } else {
-        answer
-    };
+    if take_prompt_tty_failed() {
+        return Err(crate::prompt::NOT_INTERACTIVE.to_string());
+    }
+    let default = default_range_answer(&answer);
     finish_default_base(
         dir,
         &default,
@@ -928,19 +936,52 @@ fn resolve_default_base(
     )
 }
 
-const DEFAULT_RANGE_ESSAY: &str = "Select a Default Commit Range\n\n\
-You're running a command which operates on a range of revisions (usually, from some revision to \
-HEAD) but have not specified the revision that should determine the start of the range.\n\n\
+/// Raw default-range essay paragraphs (`ArcanistGitAPI.php:328-352`),
+/// wrapped at render time by [`default_range_essay`] like PHP's
+/// `phutil_console_wrap()` call.
+const DEFAULT_RANGE_ESSAY: &str = "You're running a command which operates on a range of revisions \
+(usually, from some revision to HEAD) but have not specified the revision that should determine \
+the start of the range.\n\n\
 Previously, arc assumed you meant 'HEAD^' when you did not specify a start revision, but this \
 behavior does not make much sense in most workflows outside of Facebook's historic git-svn \
 workflow.\n\n\
 arc no longer assumes 'HEAD^'. You must specify a relative commit explicitly when you invoke a \
 command (e.g., `arc diff HEAD^`, not just `arc diff`) or select a default for this working \
-copy.\n\nIn most cases, the best default is 'origin/master'. You can also select 'HEAD^' to \
-preserve the old behavior, or some other remote or branch. But you almost certainly want to \
+copy.\n\n\
+In most cases, the best default is 'origin/master'. You can also select 'HEAD^' to preserve the \
+old behavior, or some other remote or branch. But you almost certainly want to \
 select 'origin/master'.\n\n\
 (Technically: the merge-base of the selected revision and HEAD is used to determine the start \
 of the commit range.)";
+
+/// The `Select a Default Commit Range` banner
+/// (`ArcanistGitAPI.php:323-326`): `phutil_console_format()` of
+/// `<bg:green>** %s **</bg>`, ANSI on TTYs, markup-stripped otherwise.
+fn default_range_banner(ansi: bool) -> String {
+    terminal::tsprintf_ansi(
+        "<bg:green>** %s **</bg>\n\n",
+        &[terminal::TVal::Text("Select a Default Commit Range")],
+        ansi,
+    )
+    .map(|line| line.as_str().to_string())
+    .unwrap_or_default()
+}
+
+/// The default-range essay wrapped at column 78, like PHP's
+/// `phutil_console_wrap()` with no indent.
+fn default_range_essay() -> String {
+    terminal::console_wrap(DEFAULT_RANGE_ESSAY, 0, true)
+}
+
+/// Map one default-range answer: blank (whitespace-only) takes
+/// `origin/master`, anything else passes through raw (`:356-358`).
+fn default_range_answer(answer: &str) -> String {
+    if answer.trim().is_empty() {
+        "origin/master".to_string()
+    } else {
+        answer.to_string()
+    }
+}
 
 /// Verify a default relative commit, persist it when freshly prompted,
 /// and return its merge-base with HEAD.
@@ -1973,16 +2014,37 @@ fn parse_args(argv: &[String]) -> Parsed {
     Parsed::Options(parser.finish())
 }
 
+thread_local! {
+    /// Set by [`prompt_line_with_tty`] when stdin is not a TTY. The
+    /// prompt hook type (`Fn(&str) -> Option<String>`) has no error
+    /// channel, so the `phutil_console_require_tty()` failure rides
+    /// out-of-band: each prompt call site takes it right after the
+    /// hook returns (see [`take_prompt_tty_failed`]). Scripted hooks
+    /// never set it, so their `None` keeps meaning EOF/default.
+    static PROMPT_TTY_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Take the recorded prompt TTY failure, if any (resetting it).
+fn take_prompt_tty_failed() -> bool {
+    PROMPT_TTY_FAILED.take()
+}
+
+/// `phutil_console_prompt()`: two blank lines plus the query wrapped
+/// at indent 4, then one raw answer line. Piped stdin echoes the
+/// prompt, records the TTY failure (see [`take_prompt_tty_failed`]),
+/// and yields `None`; EOF yields `None` (the caller takes its default).
 fn prompt_line(prompt: &str) -> Option<String> {
-    use std::io::{BufRead, Write};
-    print!("{prompt} ");
-    std::io::stdout().flush().ok()?;
-    let mut line = String::new();
-    match std::io::stdin().lock().read_line(&mut line) {
-        Ok(0) => None,
-        Ok(_) => Some(line.trim_end_matches(['\r', '\n']).to_string()),
-        Err(_) => None,
+    prompt_line_with_tty(prompt, crate::prompt::stdin_is_terminal())
+}
+
+/// [`prompt_line`] with an injected TTY flag (deterministic tests).
+fn prompt_line_with_tty(prompt: &str, stdin_tty: bool) -> Option<String> {
+    print!("{}", crate::prompt::prompt_text(prompt));
+    if !stdin_tty {
+        PROMPT_TTY_FAILED.set(true);
+        return None;
     }
+    crate::prompt::read_answer(&mut std::io::stdin().lock())
 }
 
 /// Entry point: `argv` excludes the subcommand name.

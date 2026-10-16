@@ -466,3 +466,38 @@ fn args_accept_one_uri_and_flags() {
         .unwrap();
     assert_eq!(dashed.uri, Some("https://h.example/".to_string()));
 }
+
+// -( R5 TTY gating: CORE-39/40, both CLEAN )-----------------------------------
+
+#[test]
+fn r5_core39_token_prompt_gates_pipes() {
+    // CLEAN: `phutil_console_prompt()` requires a TTY
+    // (`ArcanistInstallCertificateWorkflow.php:103-109` via
+    // `src/console/format.php:46-52`); blanks re-prompt, EOF fails fast
+    // (CORE-46 keep).
+    let mut piped = std::io::BufReader::new("cli-tok\n".as_bytes());
+    assert_eq!(
+        prompt_token_from(&mut piped, false).unwrap_err(),
+        crate::prompt::NOT_INTERACTIVE
+    );
+    let mut blanks = std::io::BufReader::new("\n  \ncli-tok\n".as_bytes());
+    assert_eq!(
+        prompt_token_from(&mut blanks, true).unwrap(),
+        "cli-tok".to_string()
+    );
+    let mut eof = std::io::BufReader::new("".as_bytes());
+    assert_eq!(
+        prompt_token_from(&mut eof, true).unwrap_err(),
+        "no token provided (EOF on stdin)".to_string()
+    );
+}
+
+#[test]
+fn r5_core40_install_anyway_enter_declines() {
+    // CLEAN: `ArcanistInstallCertificateWorkflow.php:126` defaults to
+    // no (`[y/N]`), so Enter declines and the token is not installed.
+    let mut enter = std::io::BufReader::new("\n".as_bytes());
+    assert!(!prompt_confirm_from(&mut enter, "Install this token anyway?", true, true).unwrap());
+    let mut yes = std::io::BufReader::new("y\n".as_bytes());
+    assert!(prompt_confirm_from(&mut yes, "Install this token anyway?", true, true).unwrap());
+}

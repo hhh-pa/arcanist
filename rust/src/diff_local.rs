@@ -2177,8 +2177,9 @@ pub fn run_lint_ansi<W: Write>(
 /// Run unit tests (`runUnit()`, `:1213-1278`).
 ///
 /// Shape mirrors [`run_lint`]; the `RESULT_UNSOUND` prompt reads from
-/// `input` (default yes, like `phutil_console_confirm()`), and declining
-/// aborts with [`USER_ABORT`]. Test-result dictionaries are always
+/// `input` (default no, like `phutil_console_confirm()` with its
+/// default `$default_no`), and declining aborts with [`USER_ABORT`].
+/// Test-result dictionaries are always
 /// empty (same in-process caveat as [`run_lint`]).
 /// Render a lint/unit output failure.
 fn write_output_error(error: std::io::Error) -> String {
@@ -2198,7 +2199,7 @@ fn handle_unit_code_ansi<R: BufRead, W: Write>(
     ansi: bool,
 ) -> Result<Option<i32>, String> {
     if result == UNIT_RESULT_UNSOUND
-        && !diff::prompt_confirm_from(input, out, UNSOUND_PROMPT, false)?
+        && !diff::prompt_confirm_from(input, out, UNSOUND_PROMPT, true)?
     {
         return Err(USER_ABORT.to_string());
     }

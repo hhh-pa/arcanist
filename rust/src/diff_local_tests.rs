@@ -1159,10 +1159,10 @@ fn gap2_run_unit_confirms_unsound_and_maps_codes() {
         );
         assert_eq!(out, format!("Running unit tests...\n{banner}").into_bytes());
     }
-    // Unsound prompts (default yes); declining aborts.
-    for answer in ["y\n", "\n"] {
+    // Unsound prompts (DIFF-D16: default no, like PHP); only `y` continues.
+    {
         let mut out = Vec::new();
-        let mut input = Cursor::new(answer.as_bytes().to_vec());
+        let mut input = Cursor::new(b"y\n".to_vec());
         assert_eq!(
             run_unit(
                 &dir,
@@ -1185,26 +1185,29 @@ fn gap2_run_unit_confirms_unsound_and_maps_codes() {
         assert!(text.contains("Ignore unsound test failures?"), "{text}");
         assert!(text.contains("** UNIT UNSOUND **"), "{text}");
     }
-    let mut out = Vec::new();
-    let mut input = Cursor::new(b"n\n".to_vec());
-    assert_eq!(
-        run_unit(
-            &dir,
-            None,
-            &[],
-            false,
-            &run(ChildOutcome::Code(UNIT_RESULT_UNSOUND)),
-            &mut input,
-            &mut out,
-        )
-        .unwrap_err(),
-        USER_ABORT
-    );
-    assert!(
-        !String::from_utf8(out)
-            .unwrap()
-            .contains("** UNIT UNSOUND **")
-    );
+    // DIFF-D16: `n` and empty (Enter/EOF take the no default) abort.
+    for answer in [b"n\n".to_vec(), b"\n".to_vec(), b"".to_vec()] {
+        let mut out = Vec::new();
+        let mut input = Cursor::new(answer);
+        assert_eq!(
+            run_unit(
+                &dir,
+                None,
+                &[],
+                false,
+                &run(ChildOutcome::Code(UNIT_RESULT_UNSOUND)),
+                &mut input,
+                &mut out,
+            )
+            .unwrap_err(),
+            USER_ABORT
+        );
+        assert!(
+            !String::from_utf8(out)
+                .unwrap()
+                .contains("** UNIT UNSOUND **")
+        );
+    }
     // No engine yields None.
     let mut out = Vec::new();
     let mut input = Cursor::new(b"".to_vec());
@@ -4175,4 +4178,25 @@ fn from_revision_corpus_fetch_sends_edit_false() {
         *seen.borrow(),
         vec![serde_json::json!({"revision_id": 7, "edit": false})]
     );
+}
+
+// -( R5 TTY gating: DIFF-D16 )------------------------------------------------
+
+#[test]
+fn r5_diff_d16_unsound_shows_y_n_default() {
+    // `ArcanistDiffWorkflow.php:1241-1244` calls
+    // `phutil_console_confirm()` with the default `$default_no`, so the
+    // unsound prompt renders `[y/N]` and Enter declines.
+    use std::io::Cursor;
+    let dir = std::env::temp_dir();
+    let run = |_: &Path, _: &[String]| ChildOutcome::Code(UNIT_RESULT_UNSOUND);
+    let mut out = Vec::new();
+    let mut input = Cursor::new(b"y\n".to_vec());
+    assert_eq!(
+        run_unit(&dir, None, &[], false, &run, &mut input, &mut out).unwrap(),
+        Some(UNIT_RESULT_UNSOUND)
+    );
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("[y/N]"), "{text}");
+    assert!(!text.contains("[Y/n]"), "{text}");
 }

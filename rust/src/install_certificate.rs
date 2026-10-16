@@ -19,7 +19,7 @@
 
 extern crate self as arc_rs;
 
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -465,18 +465,20 @@ pub fn render_success(is_token_auth: bool, ansi: bool) -> String {
     )
 }
 
-/// Prompt for a token on stdin, reprompting on blank lines. Echo and
-/// TTY gating mirror `phutil_console_prompt`; EOF fails fast instead of
-/// re-prompting forever like the PHP `do/while` loop.
-pub fn prompt_token() -> Result<String, String> {
+/// Prompt for a token on `input`, reprompting on blank lines. Echo
+/// and TTY gating mirror `phutil_console_prompt`
+/// (`ArcanistInstallCertificateWorkflow.php:103-109`); EOF fails fast
+/// instead of re-prompting forever like the PHP `do/while` loop.
+///
+/// The TTY is injected: scripted sessions pass `true`, production
+/// passes the real stdin state.
+pub fn prompt_token_from(input: &mut dyn BufRead, stdin_tty: bool) -> Result<String, String> {
     print!("{}", prompt::prompt_text(TOKEN_PROMPT));
-    if !prompt::stdin_is_terminal() {
+    if !stdin_tty {
         return Err(prompt::NOT_INTERACTIVE.to_string());
     }
-    let stdin = std::io::stdin();
-    let mut input = stdin.lock();
     loop {
-        match prompt::read_answer(&mut input) {
+        match prompt::read_answer(input) {
             Some(line) => {
                 if let Some(token) = accept_token_line(&line) {
                     return Ok(token);
@@ -488,11 +490,31 @@ pub fn prompt_token() -> Result<String, String> {
     }
 }
 
-/// Confirm `question` via the shared `phutil_console_confirm` port.
+/// [`prompt_token_from`] on real stdin.
+pub fn prompt_token() -> Result<String, String> {
+    prompt_token_from(&mut std::io::stdin().lock(), prompt::stdin_is_terminal())
+}
+
+/// Confirm `question` via the shared `phutil_console_confirm` port,
+/// with an injected TTY flag.
+pub fn prompt_confirm_from(
+    input: &mut dyn BufRead,
+    question: &str,
+    default_no: bool,
+    stdin_tty: bool,
+) -> Result<bool, String> {
+    let options = if default_no { "[y/N]" } else { "[Y/n]" };
+    prompt::console_confirm_with_tty(input, question, options, default_no, stdin_tty)
+}
+
+/// [`prompt_confirm_from`] on real stdin.
 pub fn prompt_confirm(question: &str, default_no: bool) -> Result<bool, String> {
-    let stdin = std::io::stdin();
-    let mut input = stdin.lock();
-    prompt::console_confirm(&mut input, question, default_no)
+    prompt_confirm_from(
+        &mut std::io::stdin().lock(),
+        question,
+        default_no,
+        prompt::stdin_is_terminal(),
+    )
 }
 
 #[derive(Debug, PartialEq, Eq)]
