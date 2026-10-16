@@ -140,3 +140,14 @@ fn ref_lines_carry_no_markup() {
     assert!(!out.contains('\x1b'), "{out}");
     assert!(!out.contains("**"), "{out}");
 }
+
+#[test]
+fn r9_upload_u13_no_browser_text_matches_ceb() {
+    // `browse_uploaded_refs` returns the shared scan error when no browser
+    // command resolves; it must be the ceb rendering (PHP
+    // `ArcanistWorkflow.php:2204-2206` @ ceb082ef).
+    assert_eq!(
+        crate::diff::NO_BROWSER_MESSAGE,
+        "Unable to find a browser command to run. Set 'browser' in your Arcanist config to specify a command to use."
+    );
+}

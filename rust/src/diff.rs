@@ -3328,8 +3328,8 @@ pub fn git_metadata_dir(cwd: &Path) -> Result<PathBuf, String> {
 /* -(  Full-State Browser, Amend, Worktree Checks (G1)  )----------------------- */
 
 /// Error when no browser command can be found (`:2204-2207`).
-pub const NO_BROWSER_MESSAGE: &str = "Unable to find a browser command to run. Set \"browser\" in \
-    your configuration to specify a command to use.";
+pub const NO_BROWSER_MESSAGE: &str = "Unable to find a browser command to run. Set 'browser' in your \
+    Arcanist config to specify a command to use.";
 
 /// Browser argv for `uri`: explicit config, `cmd /c start` on Windows, else
 /// the `sensible-browser`/`xdg-open`/`open --` scan (`:2171-2208`).

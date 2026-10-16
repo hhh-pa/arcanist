@@ -573,3 +573,15 @@ fn wraps_select_prompts_at_indent_four() {
     );
     assert_eq!(select_prompt("Pick?", 1, 3), "    Pick? [1 - 3] ");
 }
+
+#[test]
+fn r9_browse_b24_no_browser_text_matches_ceb() {
+    // `run_prepared` prints the shared scan error when no browser command
+    // resolves; it must be the ceb rendering (PHP
+    // `ArcanistWorkflow.php:2204-2206` @ ceb082ef), not the newer-baseline
+    // `"browser"` / `your configuration` wording.
+    assert_eq!(
+        crate::diff::NO_BROWSER_MESSAGE,
+        "Unable to find a browser command to run. Set 'browser' in your Arcanist config to specify a command to use."
+    );
+}
