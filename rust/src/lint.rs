@@ -3038,6 +3038,16 @@ pub fn collect_explicit(
 /// joined CLI paths reduce to the canonical absolute form PHP displays.
 fn normalize_lexical(path: &Path) -> PathBuf {
     use std::path::Component;
+    // Fast path with zero separator churn: without `.`/`..` segments
+    // there is nothing to resolve, so return the path byte-identical.
+    // (A `PathBuf` rebuild would convert `/` to `\` on Windows and
+    // break the `/`-anchored `^externals/` routing and displays.)
+    if !path
+        .components()
+        .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+    {
+        return path.to_path_buf();
+    }
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {

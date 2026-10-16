@@ -1630,11 +1630,11 @@ fn explicit_paths_must_exist_and_stay_unwalked() {
     )
     .unwrap();
     // T1153 LINT-9: CLI order is kept (never sorted); directories pass
-    // through unlisted. Display paths use the platform separator.
-    let sep = std::path::MAIN_SEPARATOR;
+    // through unlisted. `/`-typed CLI paths keep `/` displays on every
+    // platform (the join is byte-preserving without `.`/`..`).
     assert_eq!(files.len(), 2);
-    assert_eq!(files[0].1, format!("sub{sep}file.txt"));
-    assert_eq!(files[1].1, format!("sub{sep}empty"));
+    assert_eq!(files[0].1, "sub/file.txt");
+    assert_eq!(files[1].1, "sub/empty");
     assert_eq!(files[0].0, file);
     assert_eq!(
         collect_explicit(&["nope.txt".to_string()], tmp.path(), tmp.path()).unwrap_err(),
