@@ -140,6 +140,16 @@ LAND-0a/b/c, AMEND-0, LAND-1 nest under `constraints` via the shared
 | w4-diffland: E11/13/14/15/20/36, D22, LAND-22, COMMIT-C3 | FIXED (Rule 0) | hunk explicitness bits; filemodes→properties; shared CompanionFold (`old_path` Option); synthetic-hunk attach + pinned submit invocation; shared hunk_stats; lint/unit child dicts into `arc:lint`/`arc:unit`; cached handshake at amend/commit; best-effort post-commit nudge. §9 diff gaps VERIFIED. Carry: §9 `work` under hg, `oldPath` shapes (wide blast radius) |
 | w4-live: 21 orsay probes (read-only) | 17 VERIFIED, 4 DIVERGED→Wave 5 | ping/nested search/attachments/tasks/list/browse/download-vs-PHP all match; D494 untouched. DL-1 (lowercase `f123`/PHID-FILE), DL-2/DL-3 (symbol-engine/no-argv texts): port lifted dead `didParseArguments` validation, live path is the symbol engine — owner `download.rs`. TASKS-1 unknown-flag wording (minor; scope vs locked convention TBD) |
 
+### Phase 2 Wave 5 (last planned wave, 4 agents)
+
+| Finding(s) | Decision | Trigger / note |
+|---|---|---|
+| w5-download: DL-1/2/3, TASKS-1 | FIXED (Rule 0) | `FileSymbol::{Id,Phid}` engine rules (`[Ff]?`, PHID→`file.search`); symbol-engine garbage text; live no-argv text; DL-D3 reconciled (dead `didParseArguments` vs live `runWorkflow`); tasks unknown-flag classic text per-command (toolset lock kept). New: tasks positional + download unknown-flag wordings (no IDs) |
+| w5-r10: other 28 `--help`s | FIXED/VERIFIED (Rule 0) | all 28 through the shared renderer, byte-identical to `arc help <cmd>`; HELP_ENTRIES verified vs ceb, no entry changes |
+| w5-b2123: 10 gates + 15 classic helps | FIXED/VERIFIED/KEPT | `--` gate + generated help for 10 toolset (alias/amend/bookmarks/branches/inspect/land/liberate/look/upgrade/work); 15 classic helps, B21-exempt VERIFIED; markers help KEPT (2b). Merge: help bytes identical to R10 (renderer `**name**` default), R10 kept, gates kept |
+| w5-diffland2: WORK-HG, OLD-PATH | FIXED (Rule 0) | hg work engine (bookmark/branch flows, save/restore/shelve); ADD `oldPath` shapes routed per pipeline. CI: hermeticized hg tests (bare-`.hg`-is-operable; sh `{desc}` match fails on Win → fixture dispatch) |
+| RB-D16/17/18 (which prose) | CARRIED (blocked) | needs a PHP-execution oracle; no PHP in this environment — single remaining carry |
+
 ### Keep-list (Rule 2, recorded early per task §10 step 4)
 
 | Finding | Criterion | Rationale |
