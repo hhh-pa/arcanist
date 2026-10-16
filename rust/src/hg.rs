@@ -1866,10 +1866,12 @@ pub fn do_commit(dir: &Path, message: &str) -> Result<(), String> {
     do_commit_with(dir, &HgCommand::system(), message)
 }
 
-/// `amendNonHeadCommit` (`ArcanistMercurialAPI.php:738-777`): amend via the
-/// bundled `arc-hg` extension, rebase every child onto the new commit
-/// (aborting the rebase on failure, where a failed abort masks the
-/// original error, exactly like PHP), then strip the old commit.
+/// `amendNonHeadCommit` (`ArcanistMercurialAPI.php:738-777`, 2023-only:
+/// absent at ceb, where `amendCommit` always runs plain `commit --amend`
+/// — T1153 LINT-23): amend via the bundled `arc-hg` extension, rebase
+/// every child onto the new commit (aborting the rebase on failure,
+/// where a failed abort masks the original error, exactly like PHP),
+/// then strip the old commit.
 pub fn amend_non_head_commit_with(
     dir: &Path,
     hg: &HgCommand,
@@ -1922,71 +1924,56 @@ pub fn amend_non_head_commit_with(
     Ok(())
 }
 
-/// `amendCommit` (`ArcanistMercurialAPI.php:672-721`). With no message
-/// change and no working-copy changes there is nothing to amend. The
-/// `evolve` path amends then evolves (aborting the evolve on failure, like
-/// PHP); otherwise head commits use `commit --amend` and non-head commits
-/// go through [`amend_non_head_commit_with`].
+/// `amendCommit` (`ArcanistMercurialAPI.php:662-687` at ceb, T1153
+/// LINT-23): always run `commit --amend`, swallowing only a
+/// `/nothing changed/` failure (Mercurial treats a no-op amend as an
+/// error; workflows assume no-op amends are fine). Every other failure
+/// propagates. There is no early return, no `evolve` path, and no
+/// children probe: those are the 2023 flow, not ceb. There is no
+/// in-memory working-copy state to reload. `arc_hg_script` is unused
+/// (ceb amends through plain `execxLocal`, no extension); it stays in
+/// the signature for the established callers.
 pub fn amend_commit_with(
     dir: &Path,
     hg: &HgCommand,
     message: Option<&str>,
     arc_hg_script: Option<&Path>,
 ) -> Result<(), String> {
-    let statuses = get_uncommitted_status_with(dir, hg)?;
-    let existing = get_commit_message_with(dir, hg, ".")?;
+    let _ = arc_hg_script;
     let message = match message {
-        None => {
-            if statuses.is_empty() {
-                return Ok(());
-            }
-            get_commit_message_with(dir, hg, ".")?
-        }
-        Some(text) if text == existing => {
-            if statuses.is_empty() {
-                return Ok(());
-            }
-            get_commit_message_with(dir, hg, ".")?
-        }
         Some(text) => text.to_string(),
+        None => get_commit_message_with(dir, hg, ".")?,
     };
     let tmp = write_temp_file("hgamend", message.as_bytes())?;
     let path = tmp.to_string_lossy().to_string();
-    let result = amend_commit_inner(dir, hg, &path, arc_hg_script);
+    let out = output_with(dir, hg, &["commit", "--amend", "--logfile", &path])?;
     std::fs::remove_file(&tmp).ok();
-    result
-}
-
-fn amend_commit_inner(
-    dir: &Path,
-    hg: &HgCommand,
-    message_file: &str,
-    arc_hg_script: Option<&Path>,
-) -> Result<(), String> {
-    if mercurial_feature_supported_with(dir, hg, "evolve")? {
-        stdout_text_with(dir, hg, &["amend", "--logfile", message_file, "--"])?;
-        if let Err(first) = stdout_text_with(dir, hg, &["evolve", "--all", "--"]) {
-            stdout_text_with(dir, hg, &["evolve", "--abort", "--"])?;
-            return Err(first);
-        }
+    if out.status.success() {
         return Ok(());
     }
-    let children_out = stdout_text_with(
-        dir,
-        hg,
-        &["log", "--template", "{node} ", "--rev", "children(.)", "--"],
-    )?;
-    let children = parse_children_list(&children_out);
-    if children.is_empty() {
-        stdout_text_with(
-            dir,
-            hg,
-            &["commit", "--amend", "--logfile", message_file, "--"],
-        )?;
-    } else {
-        amend_non_head_commit_with(dir, hg, &children, message_file, arc_hg_script)?;
+    // PHP matches `/nothing changed/` against stdout only
+    // (`$ex->getStdout()`), not the combined streams.
+    if String::from_utf8_lossy(&out.stdout).contains("nothing changed") {
+        return Ok(());
     }
-    Ok(())
+    Err(amend_failure_message(hg, &out))
+}
+
+/// Failure text for [`amend_commit_with`], shaped like
+/// [`stdout_text_with`]: the trimmed combined output, else the bare
+/// failing argv (without the temp message path).
+fn amend_failure_message(hg: &HgCommand, out: &std::process::Output) -> String {
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let trimmed = combined.trim();
+    if trimmed.is_empty() {
+        format!("{} commit --amend failed", hg.program)
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// `amendCommit` with the system binary.

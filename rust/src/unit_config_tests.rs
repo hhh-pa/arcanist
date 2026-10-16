@@ -42,12 +42,13 @@ fn invalid_type_names_available_engines() {
 
 #[test]
 fn missing_type_and_bad_shapes_error() {
+    // T1153 UNIT-U16: generic proxy wrappers plus the cause on the next
+    // line, like PHP's `PhutilProxyException` rendering.
     let err =
         parse_engine_specs(r#"{"engines": {"a": {}}}"#, "/r/.arcunit", &["phutil"]).unwrap_err();
-    assert!(
-        err.message().contains("for test engine 'a'"),
-        "{}",
-        err.message()
+    assert_eq!(
+        err.message(),
+        "Error in parsing '.arcunit' file, for test engine 'a'.\nexpected a 'type' string"
     );
     let err = parse_engine_specs(
         r#"{"engines": {"a": {"type": "phutil", "include": 7}}}"#,
@@ -55,16 +56,39 @@ fn missing_type_and_bad_shapes_error() {
         &["phutil"],
     )
     .unwrap_err();
-    assert!(err.message().contains("'include'"), "{}", err.message());
+    assert_eq!(
+        err.message(),
+        "Error in parsing '.arcunit' file, for test engine 'a'.\n'include' must be a regex or a list of regexes"
+    );
+    let err = parse_engine_specs(
+        r#"{"engines": {"a": {"type": "phutil", "bogus": 1}}}"#,
+        "/r/.arcunit",
+        &["phutil"],
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.message(),
+        "Error in parsing '.arcunit' file, for test engine 'a'.\nunknown key 'bogus'"
+    );
     let err = parse_engine_specs("not json", "/r/.arcunit", &["phutil"]).unwrap_err();
     assert!(
-        err.message().contains("valid JSON file"),
+        err.message().starts_with(
+            "Expected '.arcunit' file to be a valid JSON file, but failed to decode '/r/.arcunit'.\n"
+        ),
         "{}",
         err.message()
     );
-    assert!(err.message().contains("/r/.arcunit"), "{}", err.message());
     let err = parse_engine_specs(r#"{"nope": 1}"#, "/r/.arcunit", &["phutil"]).unwrap_err();
-    assert!(err.message().contains("'engines'"), "{}", err.message());
+    assert_eq!(
+        err.message(),
+        "Error in parsing '/r/.arcunit' file.\nexpected an 'engines' map"
+    );
+    let err =
+        parse_engine_specs(r#"{"engines": {"a": 7}}"#, "/r/.arcunit", &["phutil"]).unwrap_err();
+    assert_eq!(
+        err.message(),
+        "Error in parsing '/r/.arcunit' file.\nengine 'a' must be a map"
+    );
 }
 
 #[test]
@@ -76,21 +100,33 @@ fn match_paths_applies_include_then_exclude() {
     ];
     let all = match_paths(&paths, &[], &[]);
     assert_eq!(all, paths);
-    let inc = match_paths(&paths, &["src/".to_string()], &[]);
+    let inc = match_paths(&paths, &["/src/".to_string()], &[]);
     assert_eq!(inc, vec!["src/a.py".to_string(), "src/c.txt".to_string()]);
-    let exc = match_paths(&paths, &[], &[".txt".to_string()]);
+    let exc = match_paths(&paths, &[], &["/\\.txt$/".to_string()]);
     assert_eq!(exc, vec!["src/a.py".to_string(), "gen/b.py".to_string()]);
-    let both = match_paths(&paths, &["src/".to_string()], &[".txt".to_string()]);
+    let both = match_paths(&paths, &["/src/".to_string()], &["/\\.txt$/".to_string()]);
     assert_eq!(both, vec!["src/a.py".to_string()]);
 }
 
 #[test]
-fn rule_matcher_strips_delimiters_and_orders_captures() {
+fn rule_matcher_uses_preg_semantics() {
+    // T1153 UNIT-U17: full PCRE via the shared engine (classes,
+    // alternation, modifiers), unanchored like `preg_match`; invalid
+    // patterns never match (PHP warns and returns false).
     assert!(rule_matches("@src/@", "src/a.py"));
     assert!(!rule_matches("@src/@", "lib/a.py"));
     assert!(rule_matches("/^src\\//", "src/a.py"));
-    assert!(rule_matches("(.*)Tests/(.*)", "a/Tests/b"));
-    assert!(!rule_matches("(.*)Tests/(.*)", "a/b"));
+    assert!(!rule_matches("/^src\\//", "lib/src/a.py"));
+    assert!(rule_matches("/\\.(py|txt)$/", "src/a.py"));
+    assert!(rule_matches("/[a-z]+\\.py$/", "src/a.py"));
+    assert!(rule_matches("/SRC/i", "src/a.py"));
+    assert!(!rule_matches("/SRC/", "src/a.py"));
+    assert!(rule_matches("/(.*)Tests\\/(.*)/", "a/Tests/b"));
+    assert!(!rule_matches("/(.*)Tests\\/(.*)/", "a/b"));
+    assert!(!rule_matches("src/", "src/a.py"));
+    assert!(!rule_matches("(.*)Tests/(.*)", "a/Tests/b"));
+    assert!(!rule_matches("/[/", "src/a.py"));
+    assert!(!rule_matches("", "src/a.py"));
 }
 
 #[test]
@@ -128,7 +164,7 @@ fn child_context_assigns_paths_and_run_all() {
         run_all_tests: true,
     };
     let engine = PlannedEngine {
-        include: vec!["src/".to_string()],
+        include: vec!["/src/".to_string()],
         ..planned("a")
     };
     let child = child_context(&ctx, &engine, true);

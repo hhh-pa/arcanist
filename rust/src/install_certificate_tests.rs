@@ -28,18 +28,19 @@ impl Drop for TempDir {
 
 #[test]
 fn uri_normalization_requires_http_and_domain() {
+    // T1153 CORE-43: the ceb example host is `phabricator.example.com`.
     assert_eq!(CLI_TOKEN.len(), 32);
     assert_eq!(API_TOKEN.len(), 32);
     for raw in [
-        "https://devtools.example.com/",
-        "https://devtools.example.com",
-        "https://devtools.example.com/api/",
-        "https://devtools.example.com/api",
-        "https://devtools.example.com/some/path",
+        "https://phabricator.example.com/",
+        "https://phabricator.example.com",
+        "https://phabricator.example.com/api/",
+        "https://phabricator.example.com/api",
+        "https://phabricator.example.com/some/path",
     ] {
         assert_eq!(
             normalize_uri(raw).unwrap(),
-            "https://devtools.example.com/api/",
+            "https://phabricator.example.com/api/",
             "for {raw}"
         );
     }
@@ -52,12 +53,12 @@ fn uri_normalization_requires_http_and_domain() {
         "https://h.example:8443/api/"
     );
     assert_eq!(
-        normalize_uri("devtools.example.com").unwrap_err(),
-        "Server URI \"devtools.example.com\" must include a protocol and domain. It should be in the form \"https://devtools.example.com/\"."
+        normalize_uri("phabricator.example.com").unwrap_err(),
+        "Server URI \"phabricator.example.com\" must include a protocol and domain. It should be in the form \"https://phabricator.example.com/\"."
     );
     assert_eq!(
         normalize_uri("ftp://h.example/").unwrap_err(),
-        "Server URI \"ftp://h.example/\" must include the \"http\" or \"https\" protocol. It should be in the form \"https://devtools.example.com/\"."
+        "Server URI \"ftp://h.example/\" must include the \"http\" or \"https\" protocol. It should be in the form \"https://phabricator.example.com/\"."
     );
     assert!(
         normalize_uri("https://")
@@ -154,10 +155,10 @@ fn messages_match_php_call_sites() {
         connect_message("https://h.example/api/"),
         "Connecting to \"https://h.example/api/\"..."
     );
-    assert_eq!(login_header_markup(), "**LOG IN**\n");
+    assert_eq!(login_header_markup(), "**LOGIN TO PHABRICATOR**\n");
     assert_eq!(
         login_page_block("https://h.example/conduit/login/"),
-        "Open this page in your browser and log in if necessary:\n\nhttps://h.example/conduit/login/\n\nThen paste the API Token on that page below."
+        "Open this page in your browser and login to Phabricator if necessary:\n\nhttps://h.example/conduit/login/\n\nThen paste the API Token on that page below."
     );
     assert_eq!(
         standard_token_notice(),
@@ -206,7 +207,11 @@ fn token_storage_roundtrips_and_preserves_config() {
         Some(CLI_TOKEN.to_string())
     );
     std::fs::write(&path, "nope").unwrap();
-    assert!(read_token_doc(&path).is_err());
+    // T1153 CORE-42: the `readUserConfigurationFile()` text, literal `~/.arcrc`.
+    assert_eq!(
+        read_token_doc(&path).unwrap_err(),
+        "Your '~/.arcrc' file is not a valid JSON file."
+    );
     assert!(install_token(&path, "https://h.example/api/", CLI_TOKEN).is_err());
     std::fs::write(&path, "[1]").unwrap();
     assert!(read_token_doc(&path).is_err());
@@ -432,7 +437,10 @@ fn styled_renders_match_console_output() {
         render_connect("https://h.example/api/", false),
         " CONNECT  Connecting to \"https://h.example/api/\"...\n"
     );
-    assert_eq!(render_login_header(false).unwrap(), "LOG IN\n");
+    assert_eq!(
+        render_login_header(false).unwrap(),
+        "LOGIN TO PHABRICATOR\n"
+    );
     assert_eq!(
         render_success(true, false),
         " SUCCESS!  API Token installed.\n"
@@ -440,6 +448,16 @@ fn styled_renders_match_console_output() {
     assert_eq!(
         render_success(false, false),
         " SUCCESS!  Certificate installed.\n"
+    );
+    // T1153 CORE-44: status nesting (`<bg:color>** %s **</bg>`), not the
+    // log-engine order — plain text stays identical.
+    assert_eq!(
+        render_connect("https://h.example/api/", true),
+        "\x1b[44m\x1b[1m CONNECT \x1b[m\x1b[49m Connecting to \"https://h.example/api/\"...\n"
+    );
+    assert_eq!(
+        render_success(true, true),
+        "\x1b[42m\x1b[1m SUCCESS! \x1b[m\x1b[49m API Token installed.\n"
     );
 }
 
@@ -590,4 +608,83 @@ fn r6_core34_install_config_flags_parse() {
     assert_eq!(opts.config_files, ["f"]);
     assert_eq!(opts.arcrc_file.as_deref(), Some("g"));
     assert!(parse_args(&["--config".to_string()]).is_err());
+}
+
+// T1153 CORE-41: the `readUserConfigurationFile()` permission gate.
+// Unix-only (PHP skips it on Windows); chmod works as root, so no
+// readability tricks are needed.
+#[cfg(unix)]
+fn open_arcrc(tmp: &TempDir, mode: u32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = tmp.path.join(".arcrc");
+    std::fs::write(&path, "{}").unwrap();
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(mode);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+#[cfg(unix)]
+fn arcrc_mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[test]
+#[cfg(unix)]
+fn core41_open_arcrc_prompts_to_chmod() {
+    // Accept narrows to 0600; decline keeps the mode and errors.
+    let tmp = TempDir::new("chmod-yes");
+    let path = open_arcrc(&tmp, 0o644);
+    let mut input = std::io::BufReader::new(std::io::Cursor::new(b"y\n".to_vec()));
+    ensure_arcrc_permissions_from(&mut input, &path, true).unwrap();
+    assert_eq!(arcrc_mode(&path), 0o600);
+
+    let tmp = TempDir::new("chmod-no");
+    let path = open_arcrc(&tmp, 0o644);
+    let mut input = std::io::BufReader::new(std::io::Cursor::new(b"n\n".to_vec()));
+    assert_eq!(
+        ensure_arcrc_permissions_from(&mut input, &path, true).unwrap_err(),
+        "Set ~/.arcrc to file mode 600."
+    );
+    assert_eq!(arcrc_mode(&path), 0o644);
+}
+
+#[test]
+#[cfg(unix)]
+fn core41_chmod_prompt_defaults_yes() {
+    // PHP passes `$default_no = false` ([Y/n]): empty input chmods.
+    let tmp = TempDir::new("chmod-default");
+    let path = open_arcrc(&tmp, 0o640);
+    let mut input = std::io::BufReader::new(std::io::Cursor::new(b"\n".to_vec()));
+    ensure_arcrc_permissions_from(&mut input, &path, true).unwrap();
+    assert_eq!(arcrc_mode(&path), 0o600);
+}
+
+#[test]
+#[cfg(unix)]
+fn core41_closed_or_missing_arcrc_skips_prompt() {
+    // A 0600 or missing file never prompts: with a non-TTY even an
+    // accidental prompt would fail, so Ok proves the skip.
+    let tmp = TempDir::new("chmod-skip");
+    let path = open_arcrc(&tmp, 0o600);
+    let mut input = std::io::BufReader::new(std::io::Cursor::new(Vec::new()));
+    ensure_arcrc_permissions_from(&mut input, &path, false).unwrap();
+    assert_eq!(arcrc_mode(&path), 0o600);
+    let missing = tmp.path.join("no-arcrc");
+    let mut input = std::io::BufReader::new(std::io::Cursor::new(Vec::new()));
+    ensure_arcrc_permissions_from(&mut input, &missing, false).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn core41_open_arcrc_fails_when_piped() {
+    // Non-TTY stdin echoes the prompt once, then fails like PHP's
+    // `phutil_console_require_tty` throw.
+    let tmp = TempDir::new("chmod-pipe");
+    let path = open_arcrc(&tmp, 0o644);
+    let mut input = std::io::BufReader::new(std::io::Cursor::new(Vec::new()));
+    let err = ensure_arcrc_permissions_from(&mut input, &path, false).unwrap_err();
+    assert!(err.contains("not a TTY"), "{err}");
+    assert_eq!(arcrc_mode(&path), 0o644);
 }

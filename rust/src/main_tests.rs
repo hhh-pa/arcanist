@@ -581,6 +581,19 @@ fn rbd3_strips_standard_globals_anywhere() {
 }
 
 #[test]
+fn unitu22_global_flags_strip_after_command() {
+    // T1153 UNIT-U22: PHP consumes globals anywhere (`unit --trace`
+    // works); `--config` alone is initial-only (PHP throws past the
+    // first non-flag word).
+    let (rest, globals) = strip_globals(&args(&["unit", "--trace"])).unwrap();
+    assert_eq!(rest, args(&["unit"]));
+    assert!(globals.trace);
+    let (rest, globals) = strip_globals(&args(&["unit", "--conduit-uri", "https://x/"])).unwrap();
+    assert_eq!(rest, args(&["unit"]));
+    assert_eq!(globals.conduit_uri.as_deref(), Some("https://x/"));
+}
+
+#[test]
 fn rbd3_strips_valued_and_repeat_globals() {
     // `--config` precedes any non-flag word (initial-only), like PHP.
     let (rest, globals) = strip_globals(&args(&[
