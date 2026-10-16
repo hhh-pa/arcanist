@@ -433,7 +433,8 @@ fn upload_paths_rejects_missing_file_without_io() {
         None,
     )
     .unwrap_err();
-    assert!(err.contains("cannot read"), "{err}");
+    // T1153 UPLOAD-U4: `willUpload()` texts replace the generic read error.
+    assert!(err.contains("does not exist"), "{err}");
 }
 
 /// A fake browser command which exits zero without doing anything.
@@ -452,6 +453,8 @@ fn null_browser_config() -> &'static str {
 fn upload_browse_opens_uploaded_files() {
     let fx = Fixture::named("up-browse");
     fx.write("a.txt", b"aaa");
+    // CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(fx.path().join(".git")).unwrap();
     fx.write(".arcconfig", null_browser_config().as_bytes());
     let search = serde_json::json!({
         "result": {
@@ -521,8 +524,23 @@ fn paste_read_missing_errors() {
 
 #[test]
 fn paste_creates_through_paste_create() {
+    // T1153 PASTE-P1: PHP creates via `paste.edit` transactions ONLY
+    // (`paste.create` is frozen server-side); the re-search follows.
+    // (Name kept for traceability; the flow is edit-only now.)
+    let search = serde_json::json!({
+        "result": {
+            "data": [{
+                "id": 5,
+                "phid": "PHID-PSTE-5",
+                "fields": {"title": "title", "uri": "/P5"},
+            }],
+        },
+        "error_code": null,
+    })
+    .to_string();
     let (base, rx) = serve_seq(vec![
-        r#"{"result": {"id": 5, "uri": "/P5"}, "error_code": null}"#.to_string(),
+        r#"{"result": {"object": {"phid": "PHID-PSTE-5"}}, "error_code": null}"#.to_string(),
+        search,
     ]);
     let created = paste::create_paste(
         &client_for(&base),
@@ -539,53 +557,45 @@ fn paste_creates_through_paste_create() {
         "Created paste P5: https://phab.example/P5\n"
     );
     let seen = seen_requests(&rx);
-    assert_eq!(seen.len(), 1);
+    assert_eq!(seen.len(), 2);
     assert!(
-        seen[0].0.starts_with("POST /api/paste.create "),
+        seen[0].0.starts_with("POST /api/paste.edit "),
         "{}",
         seen[0].0
     );
     assert!(seen[0].1.contains("main"), "{}", seen[0].1);
     assert!(seen[0].1.contains("language"), "{}", seen[0].1);
     assert!(seen[0].1.contains("rust"), "{}", seen[0].1);
+    assert!(
+        seen[1].0.starts_with("POST /api/paste.search "),
+        "{}",
+        seen[1].0
+    );
 }
 
 #[test]
 fn paste_create_falls_back_to_paste_edit() {
-    let search = serde_json::json!({
-        "result": {
-            "data": [{
-                "id": 6,
-                "phid": "PHID-PSTE-6",
-                "fields": {"title": "t", "uri": "/P6"},
-            }],
-        },
-        "error_code": null,
-    })
-    .to_string();
+    // T1153 PASTE-P1/PASTE-P12: no `paste.create` attempt and no retry on
+    // ANY error (which masked real errors); a `paste.edit` failure
+    // surfaces after exactly one call.
+    // (Name kept for traceability; nothing falls back anymore.)
     let (base, rx) = serve_seq(vec![
-        r#"{"result": null, "error_code": "ERR-CONDUIT-CORE", "error_info": "no such method"}"#
+        r#"{"result": null, "error_code": "ERR-CONDUIT-CORE", "error_info": "bad edit"}"#
             .to_string(),
-        r#"{"result": {"object": {"id": 6, "phid": "PHID-PSTE-6"}}, "error_code": null}"#
-            .to_string(),
-        search,
     ]);
-    let created = paste::create_paste(
+    let err = paste::create_paste(
         &client_for(&base),
         "t",
         None,
         "body",
         Some("https://phab.example/"),
     )
-    .unwrap();
-    assert_eq!(created.id, 6);
-    assert_eq!(created.uri, "https://phab.example/P6");
+    .unwrap_err();
+    assert!(err.contains("bad edit"), "{err}");
     let seen = seen_requests(&rx);
-    assert_eq!(seen.len(), 3);
-    assert!(seen[0].0.contains("paste.create"), "{}", seen[0].0);
-    assert!(seen[1].0.contains("paste.edit"), "{}", seen[1].0);
-    assert!(seen[1].1.contains("transactions"), "{}", seen[1].1);
-    assert!(seen[2].0.contains("paste.search"), "{}", seen[2].0);
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].0.contains("paste.edit"), "{}", seen[0].0);
+    assert!(seen[0].1.contains("transactions"), "{}", seen[0].1);
 }
 
 // --- liberate ------------------------------------------------------------

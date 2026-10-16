@@ -59,9 +59,16 @@ pub enum Format {
 /// Where the exported change comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
-    Local { base: Option<String> },
+    Local {
+        base: Option<String>,
+    },
     Revision(u64),
     Diff(u64),
+    /// Non-numeric `--revision` (one `D`/`d` stripped): sent raw, the
+    /// server errors (T1153 EXPORT-E25).
+    RevisionRaw(String),
+    /// Non-numeric `--diff`: sent raw, the server errors (T1153 EXPORT-E25).
+    DiffRaw(String),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -127,7 +134,7 @@ struct Parser {
     revision: Option<String>,
     diff: Option<String>,
     encoding: Option<String>,
-    positional: Option<String>,
+    positionals: Vec<String>,
     conduit_uri: Option<String>,
     end_of_flags: bool,
 }
@@ -141,7 +148,7 @@ impl Parser {
             revision: None,
             diff: None,
             encoding: None,
-            positional: None,
+            positionals: Vec::new(),
             conduit_uri: None,
             end_of_flags: false,
         }
@@ -235,21 +242,12 @@ impl Parser {
     }
 
     fn positional(&mut self, arg: &str) -> Step {
-        if self.positional.is_some() {
-            // T1153 R4 (EXPORT-E28): PHP's `parseBaseCommitArgument()`
-            // (`ArcanistWorkflow.php:1834-1840`) throws
-            // `ArcanistUsageException`, rendered `Usage Exception:`
-            // with exit 1 (the "exit" half of E28 already matches; the
-            // "255" reading does not reproduce — `export` is a
-            // subprocess workflow).
-            Step::Done(ParseOutcome::Error(
-                "Specify exactly one base commit. The end of the commit range is always the working copy state."
-                    .to_string(),
-            ))
-        } else {
-            self.positional = Some(arg.to_string());
-            Step::Handled
-        }
+        // T1153 EXPORT-E27: positionals are collected, not validated here:
+        // conduit sources ignore them entirely (PHP only calls
+        // `parseBaseCommitArgument()` for local sources), and the
+        // multi-positional error applies to local sources only.
+        self.positionals.push(arg.to_string());
+        Step::Handled
     }
 
     fn tail(&mut self, arg: &str) -> Step {
@@ -324,48 +322,67 @@ fn resolve_format(
     Ok(Format::Unified)
 }
 
+/// Strip one leading `D`/`d`, like `normalizeRevisionID()`
+/// (`preg_replace('/^D/i', '', $id)`).
+fn strip_revision_prefix(value: &str) -> &str {
+    value
+        .strip_prefix('D')
+        .or_else(|| value.strip_prefix('d'))
+        .unwrap_or(value)
+}
+
 fn resolve_source(
     revision: Option<String>,
     diff: Option<String>,
-    positional: Option<String>,
+    positionals: Vec<String>,
 ) -> Result<Source, ParseOutcome> {
+    // T1153 EXPORT-E27: positionals with `--revision`/`--diff` are
+    // silently ignored (PHP never reads `paths` for conduit sources).
     if let Some(value) = revision {
-        if positional.is_some() {
-            return Err(ParseOutcome::Error(
-                "unexpected argument: --revision takes no base commit".to_string(),
-            ));
+        // T1153 EXPORT-E25: one `D` stripped, then sent raw (numeric or
+        // not); the server errors on garbage.
+        let stripped = strip_revision_prefix(&value);
+        if let Ok(id) = normalize_revision_id(&value) {
+            return Ok(Source::Revision(id));
         }
-        return match normalize_revision_id(&value) {
-            Ok(id) => Ok(Source::Revision(id)),
-            Err(message) => Err(ParseOutcome::Error(message)),
-        };
+        return Ok(Source::RevisionRaw(stripped.to_string()));
     }
     if let Some(value) = diff {
-        if positional.is_some() {
-            return Err(ParseOutcome::Error(
-                "unexpected argument: --diff takes no base commit".to_string(),
-            ));
+        if let Ok(id) = parse_diff_id(&value) {
+            return Ok(Source::Diff(id));
         }
-        return match parse_diff_id(&value) {
-            Ok(id) => Ok(Source::Diff(id)),
-            Err(message) => Err(ParseOutcome::Error(message)),
-        };
+        return Ok(Source::DiffRaw(value));
     }
-    Ok(Source::Local { base: positional })
+    // T1153 R4 (EXPORT-E28): PHP's `parseBaseCommitArgument()`
+    // (`ArcanistWorkflow.php:1834-1840`) throws `ArcanistUsageException`,
+    // rendered `Usage Exception:` with exit 1 (the "exit" half of E28
+    // already matches; the "255" reading does not reproduce — `export`
+    // is a subprocess workflow). Local sources only (E27).
+    if positionals.len() > 1 {
+        return Err(ParseOutcome::Error(
+            "Specify exactly one base commit. The end of the commit range is always the working copy state."
+                .to_string(),
+        ));
+    }
+    Ok(Source::Local {
+        base: positionals.into_iter().next(),
+    })
 }
 
 fn finish(parser: Parser) -> ParseOutcome {
-    let format = match resolve_format(parser.git, parser.unified, parser.arcbundle) {
-        Ok(format) => format,
-        Err(outcome) => return outcome,
-    };
+    // T1153 EXPORT-E29: PHP's `didParseArguments()` checks the
+    // source conflict before the format selection.
     if parser.revision.is_some() && parser.diff.is_some() {
         return ParseOutcome::Error(
             "Options '--revision' and '--diff' are not compatible. Choose exactly one change source."
                 .to_string(),
         );
     }
-    let source = match resolve_source(parser.revision, parser.diff, parser.positional) {
+    let format = match resolve_format(parser.git, parser.unified, parser.arcbundle) {
+        Ok(format) => format,
+        Err(outcome) => return outcome,
+    };
+    let source = match resolve_source(parser.revision, parser.diff, parser.positionals) {
         Ok(source) => source,
         Err(outcome) => return outcome,
     };
@@ -389,14 +406,21 @@ fn parse_args(argv: &[String]) -> ParseOutcome {
     finish(parser)
 }
 
+/// The `loadBundleFromConduit()` not-found text, wrapped like PHP's
+/// `phutil_console_wrap()` with no indent (T1153 EXPORT-E31; the "255"
+/// half does not reproduce — `export` is a subprocess workflow, exit 1).
+fn not_found_message() -> String {
+    crate::terminal::console_wrap(
+        "The diff or revision you specified is either invalid or you don't have permission to view it.",
+        0,
+        true,
+    )
+}
+
 /// First diff ID in a `differential.querydiffs` result (a dict keyed by diff
 /// ID, or a list).
 fn first_diff_id(result: &serde_json::Value) -> Result<String, String> {
-    let missing = || {
-        "The diff or revision you specified is either invalid or you don't \
-         have permission to view it."
-            .to_string()
-    };
+    let missing = not_found_message;
     let diff = match result {
         serde_json::Value::Object(map) => map.values().next().ok_or_else(missing)?,
         serde_json::Value::Array(items) => items.first().ok_or_else(missing)?,
@@ -443,32 +467,122 @@ pub fn fetch_raw_diff_for_revision(
     let result = client
         .call(
             "differential.querydiffs",
-            &serde_json::json!({"revisionIDs": [revision]}),
+            // T1153 EXPORT-E26: PHP sends string IDs on the wire.
+            &serde_json::json!({"revisionIDs": [revision.to_string()]}),
         )
         .map_err(|e| e.to_string())?;
     let diff_id = first_diff_id(&result)?;
     fetch_raw_diff_for_diff(client, &diff_id)
 }
 
+/// The `differential.querydiffs` params for a conduit [`Source`]: PHP sends
+/// the raw (string) IDs (T1153 EXPORT-E25/E26).
+fn querydiffs_params(source: &Source) -> serde_json::Value {
+    match source {
+        Source::Revision(id) => serde_json::json!({"revisionIDs": [id.to_string()]}),
+        Source::RevisionRaw(raw) => serde_json::json!({"revisionIDs": [raw]}),
+        Source::Diff(id) => serde_json::json!({"ids": [id.to_string()]}),
+        Source::DiffRaw(raw) => serde_json::json!({"ids": [raw]}),
+        Source::Local { .. } => serde_json::json!({}),
+    }
+}
+
 /// Local `git diff` of the working tree against `base` in `format`, as bytes.
+/// Resolve `HEAD`, blaming it with `resolveCommit()`'s text when missing
+/// (empty repositories).
+fn resolve_export_head(dir: &Path) -> Result<String, String> {
+    crate::git::stdout_text(dir, &["rev-parse", "HEAD"])
+        .map_err(|_| "Unable to find any git commit named 'HEAD' in this repository.".to_string())
+}
+
+std::thread_local! {
+    /// Set when the base-commit prompt is reached without an interactive
+    /// stdin: PHP throws `PhutilConsoleStdinNotInteractiveException` there,
+    /// before any fallback.
+    static EXPORT_PROMPT_TTY_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The interactive base-commit prompt for [`crate::which::resolve_base`]:
+/// echo the prompt, then read one answer line on a TTY.
+fn export_prompt_line(prompt: &str) -> Option<String> {
+    print!("{}", crate::prompt::prompt_text(prompt));
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    if !crate::prompt::stdin_is_terminal() {
+        EXPORT_PROMPT_TTY_FAILED.set(true);
+        return None;
+    }
+    crate::prompt::read_answer(&mut std::io::stdin().lock())
+}
+
+/// Resolve the local base commit: an explicit base goes through
+/// `merge-base(base, HEAD)` (T1153 EXPORT-E3), otherwise the full default
+/// chain (rules, `base` config, `default-relative-commit`, upstream,
+/// scratch, interactive prompt; T1153 EXPORT-E1), via
+/// [`crate::which::resolve_base`].
+fn resolve_export_base(dir: &Path, explicit: Option<&str>) -> Result<String, String> {
+    let user_file = crate::config::arcrc_path();
+    resolve_export_base_with_prompt(dir, explicit, user_file.as_deref(), &export_prompt_line)
+}
+
+fn resolve_export_base_with_prompt(
+    dir: &Path,
+    explicit: Option<&str>,
+    user_file: Option<&Path>,
+    prompt: &dyn Fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    // PHP finds the repository API before parsing the base
+    // (`getRepositoryAPI()` precedes `parseBaseCommitArgument()`).
+    if !crate::git::is_inside_work_tree(dir) {
+        return Err("not inside a git working copy".to_string());
+    }
+    // PHP resolves the head before the merge-base (`getHeadCommit()`
+    // inside `buildBaseCommit()`), so empty repositories blame `HEAD`.
+    resolve_export_head(dir)?;
+    let loaded = crate::which::load_config_sources(dir, user_file)?;
+    let inputs = crate::which::BaseInputs {
+        runtime_rules: "",
+        prompt,
+    };
+    let outcome = crate::which::resolve_base(dir, explicit, "HEAD", false, &loaded, &inputs);
+    // A prompt reached without a TTY throws before any fallback.
+    if EXPORT_PROMPT_TTY_FAILED.take() {
+        return Err(crate::prompt::NOT_INTERACTIVE.to_string());
+    }
+    outcome.map(|(base, _explanation)| base)
+}
+
 pub fn local_diff_bytes(dir: &Path, format: Format, base: &str) -> Result<Vec<u8>, String> {
     if !crate::git::is_inside_work_tree(dir) {
         return Err("not inside a git working copy".to_string());
     }
-    let args: &[&str] = match format {
-        Format::Git => &["diff", "--no-color", base, "--"],
-        Format::Unified => &[
+    // Both text formats diff in git format now: the committed `base HEAD`
+    // range (`getFullGitDiff($base, $head)`, T1153 EXPORT-E2) with the
+    // pinned config and diff options (T1153 EXPORT-E36). `--unified`
+    // renders from the bundle (T1153 EXPORT-E5).
+    let _ = format;
+    let head = resolve_export_head(dir)?;
+    let out = crate::git::output(
+        dir,
+        &[
+            "-c",
+            "diff.suppressBlankEmpty=false",
             "diff",
-            "--no-color",
             "--no-ext-diff",
-            "--no-prefix",
+            "--no-textconv",
+            "--submodule=short",
+            "--no-color",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "-U32767",
+            "-M",
+            "-C",
             base,
+            &head,
             "--",
         ],
-        // Bundles always diff in git format; `execute` never passes this.
-        Format::Bundle { .. } => unreachable!("bundle output diffs in git format"),
-    };
-    let out = crate::git::output(dir, args)?;
+    )?;
+
     if out.status.success() {
         Ok(out.stdout)
     } else {
@@ -486,7 +600,7 @@ pub fn local_diff_bytes(dir: &Path, format: Format, base: &str) -> Result<Vec<u8
     }
 }
 
-/// Local `git diff` of the working tree against `base` in `format`.
+/// Local `git diff` of the committed `base HEAD` range.
 pub fn local_diff(dir: &Path, format: Format, base: &str) -> Result<String, String> {
     crate::patch::decode_bytes(&local_diff_bytes(dir, format, base)?, None)
 }
@@ -659,6 +773,79 @@ pub fn changes_json(changes: &[crate::diff_local::ParsedChange]) -> Vec<serde_js
     out
 }
 
+/// PHP `nonempty($value, array())` for change-dict lists: missing and
+/// empty-ish values (`null`, `""`, `"0"`, `false`, `0`, `[]`, `{}`) become
+/// `[]`, like `ArcanistDiffChange::newFromDictionary()`.
+fn nonempty_or_empty_array(value: Option<&serde_json::Value>) -> serde_json::Value {
+    let empty = match value {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Bool(flag)) => !flag,
+        Some(serde_json::Value::Number(number)) => {
+            number.as_i64() == Some(0) || number.as_u64() == Some(0) || number.as_f64() == Some(0.0)
+        }
+        Some(serde_json::Value::String(text)) => text.is_empty() || text == "0",
+        Some(serde_json::Value::Array(items)) => items.is_empty(),
+        Some(serde_json::Value::Object(map)) => map.is_empty(),
+    };
+    if empty {
+        serde_json::json!([])
+    } else {
+        value.cloned().unwrap_or(serde_json::Value::Null)
+    }
+}
+
+/// One conduit hunk dict in `toDictionary()` shape: the 9 keys, corpus
+/// stringified (`(string)$corpus`).
+fn normalize_conduit_hunk(hunk: &serde_json::Value) -> serde_json::Value {
+    let corpus = match hunk.get("corpus") {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::Number(_)) | Some(serde_json::Value::Bool(_)) => hunk
+            .get("corpus")
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        Some(_) => String::new(),
+    };
+    let field = |key: &str| hunk.get(key).cloned().unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "oldOffset": field("oldOffset"),
+        "newOffset": field("newOffset"),
+        "oldLength": field("oldLength"),
+        "newLength": field("newLength"),
+        "addLines": field("addLines"),
+        "delLines": field("delLines"),
+        "isMissingOldNewline": field("isMissingOldNewline"),
+        "isMissingNewNewline": field("isMissingNewNewline"),
+        "corpus": corpus,
+    })
+}
+
+/// Normalize one conduit `changes[]` dict through
+/// `newFromDictionary()` + `toDictionary()` (T1153 EXPORT-E17): exactly
+/// the 10 keys (extras like `id` dropped), values passing through.
+/// (Key byte order stays `BTreeMap`-sorted like the local path; PHP's
+/// insertion order needs the R7 `preserve_order` change, out of scope.)
+fn normalize_conduit_change(change: &serde_json::Value) -> serde_json::Value {
+    let field = |key: &str| change.get(key).cloned().unwrap_or(serde_json::Value::Null);
+    let hunks: Vec<serde_json::Value> = change
+        .get("hunks")
+        .and_then(|h| h.as_array())
+        .map(|items| items.iter().map(normalize_conduit_hunk).collect())
+        .unwrap_or_default();
+    serde_json::json!({
+        "metadata": field("metadata"),
+        "oldPath": field("oldPath"),
+        "currentPath": field("currentPath"),
+        "awayPaths": nonempty_or_empty_array(change.get("awayPaths")),
+        "oldProperties": nonempty_or_empty_array(change.get("oldProperties")),
+        "newProperties": nonempty_or_empty_array(change.get("newProperties")),
+        "type": field("type"),
+        "fileType": field("fileType"),
+        "commitHash": field("commitHash"),
+        "hunks": hunks,
+    })
+}
+
 /// Replace inline hunk corpora with their numeric file IDs, collecting
 /// the corpora in order, mirroring `writeToDisk()`.
 pub fn strip_corpora(changes: &mut [serde_json::Value]) -> Vec<String> {
@@ -700,6 +887,31 @@ pub fn blob_phids(changes: &[serde_json::Value]) -> Vec<String> {
     phids
 }
 
+/// Lax base64 decode, like PHP `base64_decode()` without `$strict`
+/// (T1153 EXPORT-E35): non-alphabet bytes are skipped and padding repaired;
+/// undecodable input yields empty bytes (PHP returns false there, which
+/// `writeFile()` stores as `""`).
+fn lax_base64_decode(input: &str) -> Vec<u8> {
+    use base64::Engine;
+    let clean: String = input
+        .bytes()
+        .filter(|byte| {
+            matches!(
+                byte,
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/'
+            )
+        })
+        .map(|byte| byte as char)
+        .collect();
+    let mut padded = clean;
+    while !padded.len().is_multiple_of(4) {
+        padded.push('=');
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(&padded)
+        .unwrap_or_default()
+}
+
 /// Download one blob via `file.download` (base64), mirroring `getBlob()`.
 fn download_blob(client: &crate::conduit::Client, phid: &str) -> Result<Vec<u8>, String> {
     eprintln!("Downloading binary data...");
@@ -709,10 +921,7 @@ fn download_blob(client: &crate::conduit::Client, phid: &str) -> Result<Vec<u8>,
     let encoded = result
         .as_str()
         .ok_or_else(|| "file.download returned an unexpected response".to_string())?;
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .map_err(|e| format!("file.download returned invalid data: {e}"))
+    Ok(lax_base64_decode(encoded))
 }
 
 /// First row of a legacy Conduit response (list or id-keyed map).
@@ -743,11 +952,44 @@ fn viewer_real_name(client: &crate::conduit::Client) -> Result<String, String> {
         .to_string())
 }
 
+/// Split `Name <addr>` into display name + address, mirroring
+/// `PhutilEmailAddress` (T1153 EXPORT-E32): a trailing `<...>` (greedy
+/// display, quote/space-trimmed; address split at the first `@`) wins,
+/// else a bare `local@domain` split at the last `@` (no display name),
+/// else the whole string as the local part.
+fn split_email_author(author: &str) -> (Option<String>, String) {
+    let trimmed = author.trim();
+    if let Some(inner) = trimmed.strip_suffix('>')
+        && let Some(at) = inner.rfind('<')
+    {
+        let display = inner[..at].trim_matches(['\'', '"', ' ']).to_string();
+        let addr = &inner[at + 1..];
+        if let Some((local, domain)) = addr.split_once('@') {
+            let mut address = local.to_string();
+            if !domain.is_empty() {
+                address.push('@');
+                address.push_str(domain);
+            }
+            return (Some(display), address);
+        }
+        return (Some(display), addr.to_string());
+    }
+    if let Some((local, domain)) = trimmed.rsplit_once('@') {
+        let mut address = local.to_string();
+        if !domain.is_empty() {
+            address.push('@');
+            address.push_str(domain);
+        }
+        return (None, address);
+    }
+    (None, trimmed.to_string())
+}
+
 /// `meta.json` for a local export.
 fn local_meta(
     base_revision: &str,
     encoding: Option<&str>,
-    author_name: &str,
+    author_name: Option<&str>,
     author_email: &str,
 ) -> serde_json::Value {
     serde_json::json!({
@@ -781,10 +1023,7 @@ fn first_diff_dict(
     let result = client
         .call("differential.querydiffs", params)
         .map_err(|e| e.to_string())?;
-    first_row(&result).cloned().ok_or_else(|| {
-        "The diff or revision you specified is either invalid or you don't have permission to view it."
-            .to_string()
-    })
+    first_row(&result).cloned().ok_or_else(not_found_message)
 }
 
 /// Fresh staging directory with `hunks/` and `blobs/` subdirectories.
@@ -836,6 +1075,8 @@ fn create_tar(stage: &Path, out: &Path) -> Result<(), String> {
 }
 
 /// Stage `changes.json`, `meta.json`, hunks, and blobs, then tar them.
+/// The JSON files use PHP `json_encode()` escaping (`\/` + `\uXXXX`,
+/// T1153 EXPORT-E18).
 fn write_bundle(
     out: &Path,
     changes: &[serde_json::Value],
@@ -845,19 +1086,19 @@ fn write_bundle(
 ) -> Result<(), String> {
     let stage = stage_dir()?;
     let result = (|| {
+        let changes_text =
+            serde_json::to_string(changes).map_err(|e| format!("failed to encode bundle: {e}"))?;
         write_stage_file(
             &stage,
             "changes.json",
-            serde_json::to_string(changes)
-                .map_err(|e| format!("failed to encode bundle: {e}"))?
-                .as_bytes(),
+            crate::upload::php_escape_json_text(&changes_text, true).as_bytes(),
         )?;
+        let meta_text =
+            serde_json::to_string(meta).map_err(|e| format!("failed to encode bundle: {e}"))?;
         write_stage_file(
             &stage,
             "meta.json",
-            serde_json::to_string(meta)
-                .map_err(|e| format!("failed to encode bundle: {e}"))?
-                .as_bytes(),
+            crate::upload::php_escape_json_text(&meta_text, true).as_bytes(),
         )?;
         for (index, corpus) in hunks.iter().enumerate() {
             write_stage_file(&stage, &format!("hunks/{index}"), corpus.as_bytes())?;
@@ -881,7 +1122,8 @@ fn bundle_out_path(dir: &Path, path: &str) -> std::path::PathBuf {
     }
 }
 
-/// Local working-copy changes as bundle parts.
+/// Local working-copy changes as bundle parts. `base` is the resolved
+/// base commit.
 fn local_bundle_parts(
     dir: &Path,
     base: &str,
@@ -893,9 +1135,12 @@ fn local_bundle_parts(
     let parsed = crate::diff_local::parse_unified_diff(&String::from_utf8_lossy(&bytes))?;
     let changes = changes_json(&parsed);
     let base_revision = crate::git::stdout_text(dir, &["rev-parse", base])?;
+    // PHP builds `sprintf('%s <%s>', $realName, $email)` and parses it back
+    // with `PhutilEmailAddress` (T1153 EXPORT-E32).
     let author_name = viewer_real_name(client)?;
     let author_email = crate::git::stdout_text(dir, &["config", "user.email"])?;
-    let meta = local_meta(&base_revision, encoding, &author_name, &author_email);
+    let (display, address) = split_email_author(&format!("{author_name} <{author_email}>"));
+    let meta = local_meta(&base_revision, encoding, display.as_deref(), &address);
     Ok((changes, meta))
 }
 
@@ -909,10 +1154,590 @@ fn conduit_bundle_parts(
     let changes: Vec<serde_json::Value> = diff
         .get("changes")
         .and_then(|changes| changes.as_array())
-        .cloned()
+        .map(|items| items.iter().map(normalize_conduit_change).collect())
         .unwrap_or_default();
     let meta = conduit_meta(&diff, encoding);
     Ok((changes, meta))
+}
+
+/// File bytes of `path` at `revision` (`getFileDataAtRevision()`),
+/// `None` when missing (empty path or no blob).
+fn file_data_at_revision(dir: &Path, revision: &str, path: &str) -> Option<Vec<u8>> {
+    if path.is_empty() {
+        return None;
+    }
+    let spec = format!("{revision}:{path}");
+    let out = crate::git::output(dir, &["show", &spec]).ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
+/// Batch `git ls-tree` mode lookup (`-z`, unquoted names): path to
+/// `unix:filemode`. Missing paths (added/deleted sides) are absent.
+/// Failures yield no modes (the render falls back to `100644`).
+fn local_file_modes(
+    dir: &Path,
+    revision: &str,
+    paths: &[String],
+) -> std::collections::BTreeMap<String, String> {
+    let mut modes = std::collections::BTreeMap::new();
+    // Chunked: huge diffs would overflow the command line otherwise.
+    for chunk in paths.chunks(500) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let mut args: Vec<&str> = vec!["ls-tree", "-z", revision, "--"];
+        args.extend(chunk.iter().map(String::as_str));
+        let Ok(out) = crate::git::output(dir, &args) else {
+            continue;
+        };
+        if !out.status.success() {
+            continue;
+        }
+        for entry in out.stdout.split(|byte| *byte == 0) {
+            // `100644 blob <sha>\t<name>`.
+            let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
+                continue;
+            };
+            let (meta, name) = entry.split_at(tab);
+            let mut meta = meta.split(|byte| *byte == b' ');
+            let (Some(mode), Some(_kind)) = (meta.next(), meta.next()) else {
+                continue;
+            };
+            if let (Ok(mode), Ok(name)) =
+                (std::str::from_utf8(mode), std::str::from_utf8(&name[1..]))
+            {
+                modes.insert(name.to_string(), mode.to_string());
+            }
+        }
+    }
+    modes
+}
+
+/// Convert parsed local changes for rendering. Modes come from `ls-tree`
+/// at the base/head (what PHP's parser reads off git's own mode lines):
+/// without them, deletes render without `deleted file mode` and no
+/// longer apply. Binary changes additionally attach base/head file data
+/// like `loadSyntheticData()` (T1153 EXPORT-E19).
+fn local_render_changes(
+    dir: &Path,
+    base: &str,
+    head: &str,
+    parsed: &[crate::diff_local::ParsedChange],
+) -> Vec<crate::patch::BundleChange> {
+    let old_paths: Vec<String> = parsed
+        .iter()
+        .map(|change| change.old_path.clone())
+        .filter(|path| !path.is_empty())
+        .collect();
+    let new_paths: Vec<String> = parsed
+        .iter()
+        .map(|change| change.current_path.clone())
+        .filter(|path| !path.is_empty())
+        .collect();
+    let old_modes = local_file_modes(dir, base, &old_paths);
+    let new_modes = local_file_modes(dir, head, &new_paths);
+    parsed
+        .iter()
+        .map(|parsed| {
+            let mut change = crate::patch::BundleChange {
+                change_type: parsed.change_type,
+                file_type: parsed.file_type,
+                old_path: if parsed.old_path.is_empty() {
+                    None
+                } else {
+                    Some(parsed.old_path.clone())
+                },
+                current_path: if parsed.current_path.is_empty() {
+                    None
+                } else {
+                    Some(parsed.current_path.clone())
+                },
+                old_mode: old_modes.get(&parsed.old_path).cloned(),
+                new_mode: new_modes.get(&parsed.current_path).cloned(),
+                hunks: parsed.hunks.clone(),
+                old_binary_phid: None,
+                new_binary_phid: None,
+                away_paths: parsed.away_paths.clone(),
+                original_file_data: None,
+                current_file_data: None,
+            };
+            if parsed.file_type == crate::diff_local::FILE_BINARY {
+                change.original_file_data = file_data_at_revision(dir, base, &parsed.old_path);
+                change.current_file_data = file_data_at_revision(dir, head, &parsed.current_path);
+            }
+            change
+        })
+        .collect()
+}
+
+/// Convert a conduit `changes[]` dict for rendering (mirrors
+/// `ArcanistDiffChange::newFromDictionary()` for the rendered fields).
+fn conduit_render_change(change: &serde_json::Value) -> crate::patch::BundleChange {
+    let mode = |key: &str| {
+        change
+            .get(key)
+            .and_then(|props| props.get("unix:filemode"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    crate::patch::BundleChange {
+        change_type: change
+            .get("type")
+            .and_then(crate::diff_submit::loose_u64)
+            .unwrap_or(u64::from(crate::diff_local::TYPE_CHANGE)) as u32,
+        file_type: change
+            .get("fileType")
+            .and_then(crate::diff_submit::loose_u64)
+            .unwrap_or(u64::from(crate::diff_local::FILE_TEXT)) as u32,
+        old_path: change
+            .get("oldPath")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        current_path: change
+            .get("currentPath")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        old_mode: mode("oldProperties"),
+        new_mode: mode("newProperties"),
+        hunks: crate::patch::conduit_hunks_from_dict(change),
+        old_binary_phid: change
+            .get("metadata")
+            .and_then(|m| m.get("old:binary-phid"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        new_binary_phid: change
+            .get("metadata")
+            .and_then(|m| m.get("new:binary-phid"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        away_paths: change
+            .get("awayPaths")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        original_file_data: None,
+        current_file_data: None,
+    }
+}
+
+/// `isGitBinaryChange()`: `FILE_BINARY` or `FILE_IMAGE` (2).
+fn is_export_binary(change: &crate::patch::BundleChange) -> bool {
+    change.file_type == crate::diff_local::FILE_BINARY || change.file_type == 2
+}
+
+/// `getOldPath()`: null when empty or an addition.
+fn export_old_path(change: &crate::patch::BundleChange) -> Option<&str> {
+    if change.change_type == crate::diff_local::TYPE_ADD {
+        return None;
+    }
+    change.old_path.as_deref().filter(|path| !path.is_empty())
+}
+
+/// `getCurrentPath()`: null when empty, a deletion, or a multicopy.
+fn export_current_path(change: &crate::patch::BundleChange) -> Option<&str> {
+    if change.change_type == crate::diff_local::TYPE_DELETE
+        || change.change_type == crate::diff_local::TYPE_MULTICOPY
+    {
+        return None;
+    }
+    change
+        .current_path
+        .as_deref()
+        .filter(|path| !path.is_empty())
+}
+
+/// `encodeGitTargetPath()`: targets containing spaces get a trailing tab.
+fn export_git_target(target: &str) -> String {
+    if target.contains(' ') {
+        format!("{target}\t")
+    } else {
+        target.to_string()
+    }
+}
+
+/// Basename for the blob-download message (`basename()`).
+fn export_basename(path: &str) -> &str {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+}
+
+/// Decompose `MULTICOPY` changes into one `MOVE_HERE` plus the surviving
+/// `COPY_HERE`s (`toGitPatch()`, T419), or fail like PHP.
+fn decompose_export_multicopies(
+    changes: &mut Vec<crate::patch::BundleChange>,
+) -> Result<(), String> {
+    let keys: Vec<usize> = (0..changes.len()).collect();
+    let mut removed: Vec<usize> = Vec::new();
+    for key in keys {
+        if changes[key].change_type != crate::diff_local::TYPE_MULTICOPY {
+            continue;
+        }
+        let current = changes[key].current_path.clone();
+        let mut found = None;
+        for (index, change) in changes.iter().enumerate() {
+            if removed.contains(&index) {
+                continue;
+            }
+            if change.change_type == crate::diff_local::TYPE_COPY_HERE && change.old_path == current
+            {
+                found = Some(index);
+                break;
+            }
+        }
+        let Some(index) = found else {
+            return Err(
+                "Failed to decompose multicopy changeset in order to generate diff.".to_string(),
+            );
+        };
+        changes[index].change_type = crate::diff_local::TYPE_MOVE_HERE;
+        removed.push(key);
+    }
+    removed.sort_unstable();
+    for key in removed.into_iter().rev() {
+        changes.remove(key);
+    }
+    Ok(())
+}
+
+/// One `GIT binary patch` literal body: zlib-compress (PHP `gzcompress()`,
+/// default level) then base85-encode. (Compression bytes may differ from
+/// libzlib's; both inflate identically.)
+fn export_binary_body(data: &[u8]) -> Result<String, String> {
+    use std::io::Write;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(data)
+        .map_err(|e| format!("failed to compress binary data: {e}"))?;
+    let compressed = encoder
+        .finish()
+        .map_err(|e| format!("failed to compress binary data: {e}"))?;
+    Ok(crate::patch::base85_encode(&compressed))
+}
+
+/// `buildBinaryChange()` without the loader: index line, `GIT binary
+/// patch`, and both literal bodies. PHP never emits a `Binary files ...
+/// differ` line here. Missing data renders 40 zeros (present-but-empty
+/// data hashes as the empty blob).
+fn render_export_binary_body(
+    old_data: Option<&[u8]>,
+    new_data: Option<&[u8]>,
+) -> Result<String, String> {
+    let id_of = |data: Option<&[u8]>| match data {
+        Some(bytes) => crate::patch::git_blob_sha1(bytes),
+        None => "0".repeat(40),
+    };
+    let mut body = format!(
+        "index {}..{}\nGIT binary patch\n",
+        id_of(old_data),
+        id_of(new_data)
+    );
+    let new_bytes = new_data.unwrap_or(b"");
+    body.push_str(&format!("literal {}\n", new_bytes.len()));
+    body.push_str(&export_binary_body(new_bytes)?);
+    body.push('\n');
+    let old_bytes = old_data.unwrap_or(b"");
+    body.push_str(&format!("literal {}\n", old_bytes.len()));
+    body.push_str(&export_binary_body(old_bytes)?);
+    body.push('\n');
+    Ok(body)
+}
+
+/// Lazy blob loader: `file.download` by PHID, with the basename for the
+/// stderr message when known.
+type BlobLoader<'a> = dyn Fn(&str, Option<&str>) -> Result<Vec<u8>, String> + 'a;
+
+/// `buildBinaryChange()`: resolve old/new bytes (inline data, else the
+/// blob loader) and render. `old_binary` is the away change when the
+/// current path was claimed by one.
+fn build_export_binary_body(
+    change: &crate::patch::BundleChange,
+    old_binary: Option<&crate::patch::BundleChange>,
+    load_blob: &BlobLoader<'_>,
+) -> Result<String, String> {
+    let (old_data, old_phid) = match old_binary {
+        Some(away) => match away.original_file_data.clone() {
+            Some(data) => (Some(data), None),
+            None => (None, away.old_binary_phid.as_deref()),
+        },
+        None => (
+            change.original_file_data.clone(),
+            change.old_binary_phid.as_deref(),
+        ),
+    };
+    let old_data = match (old_data, old_phid) {
+        (Some(data), _) => Some(data),
+        (None, Some(phid)) => Some(load_blob(
+            phid,
+            export_old_path(change).map(export_basename),
+        )?),
+        (None, None) => None,
+    };
+    let mut new_data = change.current_file_data.clone();
+    if new_data.is_none()
+        && let Some(phid) = change.new_binary_phid.as_deref()
+    {
+        new_data = Some(load_blob(
+            phid,
+            export_current_path(change).map(export_basename),
+        )?);
+    }
+    render_export_binary_body(old_data.as_deref(), new_data.as_deref())
+}
+
+/// Break one hunk into small hunks with 3 lines of context
+/// (`breakHunkIntoSmallHunks()`; same algorithm as the verified
+/// `arc patch` port, which lives in a read-only module for this task).
+fn break_export_hunk(base: &crate::diff_local::ParsedHunk) -> Vec<crate::diff_local::ParsedHunk> {
+    const CONTEXT: usize = 3;
+    let lines: Vec<&str> = base.corpus.split_inclusive('\n').collect();
+    let first_byte = |line: &str| line.as_bytes().first().copied().unwrap_or(0);
+    let n = lines.len();
+    let mut old_offset = base.old_start;
+    let mut new_offset = base.new_start;
+    let mut results = Vec::new();
+    let mut ii = 0;
+    while ii < n {
+        let mut jj = ii;
+        while jj < n {
+            let byte = first_byte(lines[jj]);
+            if byte == b'-' || byte == b'+' {
+                break;
+            }
+            jj += 1;
+        }
+        if jj >= n {
+            break;
+        }
+        let hunk_start = jj.saturating_sub(CONTEXT);
+        let mut old_lines: u64 = 0;
+        let mut new_lines: u64 = 0;
+        let mut hunk_adjust: u64 = 0;
+        let mut last_change = jj;
+        let mut break_here: Option<usize> = None;
+        while jj < n {
+            if first_byte(lines[jj]) == b' ' {
+                if jj - last_change > CONTEXT && break_here.is_none() {
+                    break_here = Some(jj);
+                }
+                // PHP: `>= ($context * 2 + 1)`.
+                if jj - last_change > CONTEXT * 2 {
+                    break;
+                }
+            } else {
+                break_here = None;
+                last_change = jj;
+                match first_byte(lines[jj]) {
+                    b'\\' => hunk_adjust += 1,
+                    b'-' => old_lines += 1,
+                    b'+' => new_lines += 1,
+                    _ => {}
+                }
+            }
+            jj += 1;
+        }
+        if let Some(at) = break_here {
+            jj = at;
+        }
+        let hunk_length = jj.min(n) - hunk_start;
+        let count_length = hunk_length as u64 - hunk_adjust;
+        let corpus: String = lines[hunk_start..hunk_start + hunk_length].concat();
+        // Adjacent hunks share context, so `hunk_start` may precede `ii`.
+        let back = ii as i64 - hunk_start as i64;
+        results.push(crate::diff_local::ParsedHunk {
+            old_start: (old_offset as i64 - back).max(0) as u64,
+            old_len: count_length - new_lines,
+            new_start: (new_offset as i64 - back).max(0) as u64,
+            new_len: count_length - old_lines,
+            corpus,
+        });
+        old_offset += (jj - ii) as u64 - new_lines;
+        new_offset += (jj - ii) as u64 - old_lines;
+        ii = jj;
+    }
+    results
+}
+
+/// `buildHunkChanges()`: rebuilt `@@` headers (length 1 omitted, like git)
+/// plus corpora, with a newline forced after unterminated bodies.
+fn render_export_hunks(hunks: &[crate::diff_local::ParsedHunk]) -> String {
+    fn head(offset: u64, len: u64) -> String {
+        if len == 1 {
+            format!("{offset}")
+        } else {
+            format!("{offset},{len}")
+        }
+    }
+    let mut out = String::new();
+    for hunk in hunks {
+        for small in break_export_hunk(hunk) {
+            out.push_str(&format!(
+                "@@ -{} +{} @@\n",
+                head(small.old_start, small.old_len),
+                head(small.new_start, small.new_len)
+            ));
+            out.push_str(&small.corpus);
+            if !small.corpus.is_empty()
+                && !small.corpus.ends_with('\n')
+                && !small.corpus.ends_with('\r')
+            {
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// Render bundle changes as a git patch (`ArcanistBundle::toGitPatch()`):
+/// rebuilt headers from offsets, 3-line context, tab-suffixed targets, no
+/// `index`/`similarity`/`Binary files` lines (T1153 EXPORT-E6/E8). The
+/// blob loader downloads conduit blobs lazily (`file.download`).
+fn render_export_git_patch(
+    changes: &mut Vec<crate::patch::BundleChange>,
+    load_blob: &BlobLoader<'_>,
+) -> Result<String, String> {
+    use crate::diff_local as types;
+    decompose_export_multicopies(changes)?;
+    let mut binary_sources: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for (index, change) in changes.iter().enumerate() {
+        if !is_export_binary(change) {
+            continue;
+        }
+        let change_type = change.change_type;
+        if change_type == types::TYPE_MOVE_AWAY
+            || change_type == types::TYPE_COPY_AWAY
+            || change_type == types::TYPE_MULTICOPY
+        {
+            for path in &change.away_paths {
+                binary_sources.insert(path.clone(), index);
+            }
+        }
+    }
+    let mut result = String::new();
+    for index in 0..changes.len() {
+        let change = &changes[index];
+        if change.file_type == types::FILE_DIRECTORY {
+            continue;
+        }
+        if change.change_type == types::TYPE_MOVE_AWAY {
+            continue;
+        }
+        let old_mode = change.old_mode.as_deref().unwrap_or("100644");
+        let new_mode = change.new_mode.as_deref().unwrap_or("100644");
+        let is_binary = is_export_binary(change);
+        let old_path = export_old_path(change);
+        let cur_path = export_current_path(change);
+        let old_source = cur_path.and_then(|cur| binary_sources.get(cur).copied());
+        // Blob downloads happen before the `COPY_AWAY` skip check, like PHP.
+        let change_body = if is_binary {
+            let old_binary = old_source.map(|away| &changes[away]);
+            build_export_binary_body(change, old_binary, load_blob)?
+        } else {
+            render_export_hunks(&change.hunks)
+        };
+        if change.change_type == types::TYPE_COPY_AWAY
+            && change_body.is_empty()
+            && old_mode == new_mode
+        {
+            continue;
+        }
+        let (old_index, old_target) = match old_path {
+            // `getOldPath()` null (additions): index tracks the new path.
+            None => (
+                format!("a/{}", cur_path.unwrap_or_default()),
+                "/dev/null".to_string(),
+            ),
+            Some(path) => (format!("a/{path}"), format!("a/{path}")),
+        };
+        let (cur_index, cur_target) = match cur_path {
+            None => (
+                format!("b/{}", old_path.unwrap_or_default()),
+                "/dev/null".to_string(),
+            ),
+            Some(path) => (format!("b/{path}"), format!("b/{path}")),
+        };
+        let old_target = export_git_target(&old_target);
+        let cur_target = export_git_target(&cur_target);
+        result.push_str(&format!("diff --git {old_index} {cur_index}\n"));
+        if change.change_type == types::TYPE_ADD {
+            result.push_str(&format!("new file mode {new_mode}\n"));
+        }
+        let change_type = change.change_type;
+        if (change_type == types::TYPE_COPY_HERE
+            || change_type == types::TYPE_MOVE_HERE
+            || change_type == types::TYPE_COPY_AWAY
+            || change_type == types::TYPE_CHANGE)
+            && old_mode != new_mode
+        {
+            result.push_str(&format!("old mode {old_mode}\n"));
+            result.push_str(&format!("new mode {new_mode}\n"));
+        }
+        if change.change_type == types::TYPE_COPY_HERE {
+            result.push_str(&format!(
+                "copy from {}\ncopy to {}\n",
+                old_path.unwrap_or_default(),
+                cur_path.unwrap_or_default()
+            ));
+        } else if change.change_type == types::TYPE_MOVE_HERE {
+            result.push_str(&format!(
+                "rename from {}\nrename to {}\n",
+                old_path.unwrap_or_default(),
+                cur_path.unwrap_or_default()
+            ));
+        } else if change.change_type == types::TYPE_DELETE
+            || change.change_type == types::TYPE_MULTICOPY
+        {
+            // No `100644` default here: the line only prints when the old
+            // properties actually carry a mode.
+            if let Some(mode) = change.old_mode.as_deref().filter(|mode| !mode.is_empty()) {
+                result.push_str(&format!("deleted file mode {mode}\n"));
+            }
+        }
+        if !change_body.is_empty() {
+            if !is_binary {
+                result.push_str(&format!("--- {old_target}\n"));
+                result.push_str(&format!("+++ {cur_target}\n"));
+            }
+            result.push_str(&change_body);
+        }
+    }
+    result.push('\n');
+    Ok(result)
+}
+
+/// Render bundle changes as a unified diff
+/// (`ArcanistBundle::toUnifiedDiff()`, T1153 EXPORT-E4/E5): `Index:` +
+/// `===` + `---`/`+++` (new path wins for moves) + rebuilt hunks. Empty
+/// bundles render `""`.
+fn render_export_unified(changes: &[crate::patch::BundleChange]) -> String {
+    let mut result = String::new();
+    for change in changes {
+        let hunk_changes = render_export_hunks(&change.hunks);
+        if hunk_changes.is_empty() {
+            continue;
+        }
+        let old_path = export_old_path(change);
+        let cur_path = export_current_path(change);
+        let index_path = cur_path.or(old_path).unwrap_or_default();
+        result.push_str(&format!("Index: {index_path}\n"));
+        result.push_str(&format!("{}\n", "=".repeat(67)));
+        let mut old_target = old_path.unwrap_or("/dev/null").to_string();
+        let cur_target = cur_path.unwrap_or("/dev/null").to_string();
+        if cur_target != "/dev/null" && old_target != "/dev/null" {
+            old_target = cur_target.clone();
+        }
+        result.push_str(&format!("--- {old_target}\n"));
+        result.push_str(&format!("+++ {cur_target}\n"));
+        result.push_str(&hunk_changes);
+    }
+    result
 }
 
 /// Write an `--arcbundle` file with an existing client.
@@ -925,24 +1750,24 @@ fn export_bundle_with_client(
     let encoding = opts.encoding.as_deref().filter(|e| !e.is_empty());
     let (mut changes, meta) = match &opts.source {
         Source::Local { base } => {
-            let base = base.as_deref().unwrap_or("HEAD");
-            local_bundle_parts(dir, base, encoding, client)?
+            let base = resolve_export_base(dir, base.as_deref())?;
+            local_bundle_parts(dir, &base, encoding, client)?
         }
-        Source::Revision(id) => {
-            conduit_bundle_parts(&serde_json::json!({"revisionIDs": [id]}), encoding, client)?
-        }
-        Source::Diff(id) => {
-            conduit_bundle_parts(&serde_json::json!({"ids": [id]}), encoding, client)?
-        }
+        other => conduit_bundle_parts(&querydiffs_params(other), encoding, client)?,
     };
     let hunks = strip_corpora(&mut changes);
+    // T1153 EXPORT-E33: PHP echoes the progress line before `writeToDisk()`
+    // (blob downloads included), so failures leave partial output behind.
+    println!("Writing bundle to '{path}'...");
+    use std::io::Write;
+    std::io::stdout().flush().ok();
     let mut blobs = Vec::new();
     for phid in blob_phids(&changes) {
         blobs.push((phid.clone(), download_blob(client, &phid)?));
     }
     let out = bundle_out_path(dir, path);
     write_bundle(&out, &changes, &meta, &hunks, &blobs)?;
-    Ok(format!("Writing bundle to '{path}'...\nDone.\n"))
+    Ok("Done.\n".to_string())
 }
 
 /// Write an `--arcbundle` file, returning the stdout text.
@@ -962,25 +1787,71 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
     execute_with_opts(dir, &opts)
 }
 
+/// Render text output from bundle changes: a git patch or a unified
+/// diff (T1153 EXPORT-E4/E5/E6/E8).
+fn render_export_text(
+    changes: &mut Vec<crate::patch::BundleChange>,
+    git: bool,
+    load_blob: &BlobLoader<'_>,
+) -> Result<String, String> {
+    if git {
+        render_export_git_patch(changes, load_blob)
+    } else {
+        Ok(render_export_unified(changes))
+    }
+}
+
 /// [`execute`] over parsed options.
 fn execute_with_opts(dir: &Path, opts: &Options) -> Result<String, String> {
     if let Format::Bundle { path } = &opts.format {
         return export_bundle(dir, opts, path);
     }
+    let git = matches!(opts.format, Format::Git);
     match &opts.source {
         Source::Local { base } => {
-            let base = base.as_deref().unwrap_or("HEAD");
-            let bytes = local_diff_bytes(dir, opts.format.clone(), base)?;
+            // T1153 EXPORT-E30: PHP requires conduit (and queries the
+            // author) for ALL local exports, even `--git`/`--unified`.
+            let client = crate::config::client_for(opts.conduit_uri.as_deref())?;
+            let base = resolve_export_base(dir, base.as_deref())?;
+            let bytes = local_diff_bytes(dir, Format::Git, &base)?;
             reject_empty_diff(&bytes)?;
-            decode_patch(&bytes, opts.encoding.as_deref())
+            let text = decode_patch(&bytes, opts.encoding.as_deref())?;
+            let parsed = crate::diff_local::parse_unified_diff(&text)?;
+            let head = resolve_export_head(dir)?;
+            // The author is discarded for text formats, but PHP issues
+            // the query before rendering.
+            viewer_real_name(&client)?;
+            let mut changes = local_render_changes(dir, &base, &head, &parsed);
+            render_export_text(&mut changes, git, &|phid, _| {
+                Err(format!("Nowhere to load blob '{phid}' from!"))
+            })
         }
-        Source::Revision(id) => {
+        other => {
             let client = crate::config::client_for(opts.conduit_uri.as_deref())?;
-            fetch_raw_diff_for_revision(&client, *id).map(|text| decode_conduit_text(&text))
-        }
-        Source::Diff(id) => {
-            let client = crate::config::client_for(opts.conduit_uri.as_deref())?;
-            fetch_raw_diff_for_diff(&client, &id.to_string()).map(|text| decode_conduit_text(&text))
+            let diff = first_diff_dict(&client, &querydiffs_params(other))?;
+            let items = diff
+                .get("changes")
+                .and_then(|changes| changes.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let mut changes: Vec<crate::patch::BundleChange> =
+                items.iter().map(conduit_render_change).collect();
+            // `getBlob($phid, $name)`: the render path passes the file
+            // basename, so the stderr message names the file.
+            let load_blob = |phid: &str, name: Option<&str>| -> Result<Vec<u8>, String> {
+                match name {
+                    Some(text) => eprintln!("Downloading binary data for '{text}'..."),
+                    None => eprintln!("Downloading binary data..."),
+                }
+                let result = client
+                    .call("file.download", &serde_json::json!({"phid": phid}))
+                    .map_err(|e| e.to_string())?;
+                let encoded = result
+                    .as_str()
+                    .ok_or_else(|| "file.download returned an unexpected response".to_string())?;
+                Ok(lax_base64_decode(encoded))
+            };
+            render_export_text(&mut changes, git, &load_blob)
         }
     }
 }

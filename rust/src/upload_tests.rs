@@ -90,6 +90,20 @@ fn absolutizes_uris() {
     assert_eq!(absolute_uri(None, "/F1"), "/F1");
     assert_eq!(conduit_root("https://h/api/"), "https://h");
     assert_eq!(conduit_root("https://h/"), "https://h");
+    // T1153 UPLOAD-U14: relative joins drop query/fragment; absolute
+    // and protocol-relative URIs pass through untouched.
+    assert_eq!(
+        absolute_uri(Some("https://h/api/"), "/F1?x=1#y"),
+        "https://h/F1"
+    );
+    assert_eq!(
+        absolute_uri(Some("https://h/"), "https://cdn.example/f?a=b"),
+        "https://cdn.example/f?a=b"
+    );
+    assert_eq!(
+        absolute_uri(Some("https://h/"), "//cdn.example/f"),
+        "//cdn.example/f"
+    );
 }
 
 #[test]
@@ -128,6 +142,8 @@ fn formats_uploaded_ref_json() {
 
 #[test]
 fn ref_lines_carry_no_markup() {
+    // T1153 UPLOAD-U1: non-JSON output is a RefView per file
+    // (`ArcanistRefView.php:117-128`), markup-stripped off-TTY.
     let refs = vec![UploadedRef {
         argument: "a.bin".to_string(),
         id: 7,
@@ -135,8 +151,8 @@ fn ref_lines_carry_no_markup() {
         name: "a.bin".to_string(),
         uri: "https://h/F7".to_string(),
     }];
-    let out = render_uploaded_refs(&refs, false).unwrap();
-    assert_eq!(out, "F7 a.bin\nhttps://h/F7\n");
+    let out = render_uploaded_refs_ansi(&refs, false, 80, false).unwrap();
+    assert_eq!(out, "  *   F7 a.bin\n ://    https://h/F7\n");
     assert!(!out.contains('\x1b'), "{out}");
     assert!(!out.contains("**"), "{out}");
 }
@@ -252,4 +268,216 @@ fn r4_uploadu15_aggregate_errors_are_fatal() {
         ),
         std::process::ExitCode::from(255)
     );
+}
+
+fn upload_u_fixture(name: &str) -> UploadedRef {
+    UploadedRef {
+        argument: "a.bin".to_string(),
+        id: 7,
+        phid: "PHID-FILE-x".to_string(),
+        name: name.to_string(),
+        uri: "https://h/F7".to_string(),
+    }
+}
+
+#[test]
+fn upload_u1_refview_carries_ansi_on_tty() {
+    let refs = vec![upload_u_fixture("a.bin")];
+    let out = render_uploaded_refs_ansi(&refs, false, 80, true).unwrap();
+    assert!(out.contains('\x1b'), "{out}");
+    assert!(out.contains("F7"), "{out}");
+    assert!(out.contains("a.bin"), "{out}");
+    assert!(out.contains("https://h/F7"), "{out}");
+}
+
+#[test]
+fn upload_u2_title_truncates_to_terminal_width() {
+    // Usable width is 80 - 6 (marker) - 3 (`F7` + space) = 71 glyphs;
+    // `PhutilUTF8StringTruncator` keeps 70 + `…` with no word boundary.
+    let refs = vec![upload_u_fixture(&"a".repeat(100))];
+    let out = render_uploaded_refs_ansi(&refs, false, 80, false).unwrap();
+    let first = out.lines().next().unwrap();
+    assert_eq!(first, format!("  *   F7 {}…", "a".repeat(70)));
+}
+
+#[test]
+fn upload_u4_local_file_error_texts() {
+    let dir = std::env::temp_dir().join(format!(
+        "arc-rs-upload-u4-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    assert_eq!(
+        read_upload_bytes(&dir, "missing.bin").unwrap_err(),
+        "Unable to upload file: path \"missing.bin\" does not exist."
+    );
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    assert_eq!(
+        read_upload_bytes(&dir, "sub").unwrap_err(),
+        "Unable to upload file: path \"sub\" is not a file."
+    );
+    // Not-readable: best effort (root and Windows ignore permission bits).
+    let locked = dir.join("locked.bin");
+    std::fs::write(&locked, b"x").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&locked).is_err() {
+            assert_eq!(
+                read_upload_bytes(&dir, "locked.bin").unwrap_err(),
+                "Unable to upload file: path \"locked.bin\" is not readable."
+            );
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    std::fs::write(dir.join("ok.bin"), b"data").unwrap();
+    assert_eq!(read_upload_bytes(&dir, "ok.bin").unwrap(), b"data");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn upload_u_envelope(result: &str) -> String {
+    format!(r#"{{"result": {result}, "error_code": null}}"#)
+}
+
+#[test]
+fn upload_u5_empty_phid_falls_back_to_legacy_upload() {
+    // `upload:true` + empty PHID stays in `$files` and runs the legacy
+    // `file.upload` loop (`ArcanistFileUploader.php:159-166,183-194`).
+    let (base, rx) = serve_seq(vec![
+        upload_u_envelope(r#"{"upload": true, "filePHID": ""}"#),
+        upload_u_envelope(r#""PHID-FILE-9""#),
+    ]);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    assert_eq!(
+        upload_data(&client, "a.bin", b"data", false).unwrap(),
+        "PHID-FILE-9"
+    );
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[0].contains("contentLength"), "{}", seen[0]);
+    assert!(seen[1].contains("data_base64"), "{}", seen[1]);
+    assert!(seen[1].contains("ZGF0YQ"), "{}", seen[1]);
+}
+
+#[test]
+fn upload_u6_non_array_querychunks_errors() {
+    // Rule 2(a) KEEP: PHP `foreach` over a non-array silently completes
+    // the upload with zero chunks (data loss); the clean error stays.
+    let (base, _rx) = serve_seq(vec![
+        upload_u_envelope(r#"{"upload": true, "filePHID": "PHID-FILE-1"}"#),
+        upload_u_envelope(r#"{"chunks": []}"#),
+    ]);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    let err = upload_data(&client, "a.bin", b"data", false).unwrap_err();
+    assert!(err.contains("unexpected response"), "{err}");
+}
+
+#[test]
+fn upload_u7_out_of_range_chunk_errors() {
+    // Rule 2(a) KEEP: PHP `fseek`s past EOF and uploads an empty chunk
+    // (silent corruption); the range error stays.
+    let (base, _rx) = serve_seq(vec![
+        upload_u_envelope(r#"{"upload": true, "filePHID": "PHID-FILE-1"}"#),
+        upload_u_envelope(r#"[{"complete": false, "byteStart": 5, "byteEnd": 99}]"#),
+    ]);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    let err = upload_data(&client, "a.bin", b"0123456789", false).unwrap_err();
+    assert!(err.contains("out-of-range"), "{err}");
+}
+
+#[test]
+fn upload_u8_missing_chunk_bounds_error() {
+    // Rule 2(a) KEEP: PHP reads null bounds (notices, then wrong/odd
+    // data); same failure outcome, stable text.
+    for chunks in [
+        r#"[{"complete": false, "byteEnd": 4}]"#,
+        r#"[{"complete": false, "byteStart": 0}]"#,
+    ] {
+        let (base, _rx) = serve_seq(vec![
+            upload_u_envelope(r#"{"upload": true, "filePHID": "PHID-FILE-1"}"#),
+            upload_u_envelope(chunks),
+        ]);
+        let client = crate::conduit::Client::new(&base, "t").unwrap();
+        let err = upload_data(&client, "a.bin", b"data", false).unwrap_err();
+        assert!(err.contains("without byte"), "{err}");
+    }
+}
+
+#[test]
+fn upload_u9_json_escapes_non_ascii_like_php() {
+    // `PhutilJSON::encodeFormattedValue()`: pretty layout (matches serde)
+    // with `\uXXXX` escapes (lowercase, surrogate pairs past the BMP).
+    let refs = vec![upload_u_fixture("café \u{1F600}")];
+    let out = render_uploaded_refs_ansi(&refs, true, 80, false).unwrap();
+    assert!(out.contains(r#""name": "caf\u00e9 \ud83d\ude00""#), "{out}");
+    assert!(!out.contains('é'), "{out}");
+    // Structural characters and ASCII are untouched.
+    assert!(out.starts_with("[\n  {"), "{out}");
+    assert!(out.ends_with("\n]\n"), "{out}");
+}
+
+#[test]
+fn upload_u10_progress_bar_renders_like_php() {
+    // `[%-{max}.{max}s] %5.1f%%`, 12 columns of chrome, `-`/`~` tip.
+    assert_eq!(
+        render_chunk_bar(0, 4, 78),
+        format!("[{}]   0.0%", " ".repeat(66))
+    );
+    let full = render_chunk_bar(4, 4, 78);
+    assert_eq!(full, format!("[{}] 100.0%", "=".repeat(66)));
+    // Fractional tip: 1/4 of 66 = 16.5 -> 16 `=` + `-` (index 1).
+    let quarter = render_chunk_bar(1, 4, 78);
+    assert_eq!(
+        quarter,
+        format!("[{}-{}]  25.0%", "=".repeat(16), " ".repeat(49))
+    );
+    assert_eq!(quarter.len(), 66 + 9);
+}
+
+#[test]
+fn upload_u11_past_eof_range_errors_not_short() {
+    // Rule 2(a) KEEP (with UPLOAD-U7): PHP's short `fread` past EOF sends
+    // truncated data silently; the whole-file read errors instead.
+    let (base, _rx) = serve_seq(vec![
+        upload_u_envelope(r#"{"upload": true, "filePHID": "PHID-FILE-1"}"#),
+        upload_u_envelope(r#"[{"complete": false, "byteStart": 0, "byteEnd": 5}]"#),
+    ]);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    let err = upload_data(&client, "a.bin", b"ab", false).unwrap_err();
+    assert!(err.contains("out-of-range"), "{err}");
+}
+
+#[test]
+fn upload_u12_allocates_sequentially_in_order() {
+    // Rule 2(c) KEEP: PHP allocates with `FutureIterator->limit(4)` but
+    // yields results in key order; same calls, same order, no byte effect.
+    let dir = std::env::temp_dir().join(format!(
+        "arc-rs-upload-u12-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("first.bin"), b"1").unwrap();
+    std::fs::write(dir.join("second.bin"), b"2").unwrap();
+    let (base, rx) = serve_seq(vec![
+        upload_u_envelope(r#"{"upload": false, "filePHID": "PHID-FILE-1"}"#),
+        upload_u_envelope(r#"{"upload": false, "filePHID": "PHID-FILE-2"}"#),
+    ]);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    let paths = ["first.bin".to_string(), "second.bin".to_string()];
+    let uploads = collect_uploads(&client, &dir, &paths, false).unwrap();
+    assert_eq!(uploads.len(), 2);
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[0].contains("first.bin"), "{}", seen[0]);
+    assert!(seen[1].contains("second.bin"), "{}", seen[1]);
+    std::fs::remove_dir_all(&dir).ok();
 }
