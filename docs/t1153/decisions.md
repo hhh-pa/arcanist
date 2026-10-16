@@ -150,6 +150,14 @@ LAND-0a/b/c, AMEND-0, LAND-1 nest under `constraints` via the shared
 | w5-diffland2: WORK-HG, OLD-PATH | FIXED (Rule 0) | hg work engine (bookmark/branch flows, save/restore/shelve); ADD `oldPath` shapes routed per pipeline. CI: hermeticized hg tests (bare-`.hg`-is-operable; sh `{desc}` match fails on Win → fixture dispatch) |
 | RB-D16/17/18 (which prose) | CARRIED (blocked) | needs a PHP-execution oracle; no PHP in this environment — single remaining carry |
 
+### Phase 2 Wave 6 (oracle carry + unnamed divergences, 1 agent)
+
+| Finding(s) | Decision | Trigger / note |
+|---|---|---|
+| TASKS-2 (tasks positional wording) | FIXED (Rule 0) | positionals with no `$more_key` hit classic `ArcanistWorkflow.php:887-895`: `Unrecognized argument '%s'. Try '%s'.` — first extra wins (`51d440b3`) |
+| DL-4 (download unknown-flag wording) | FIXED (Rule 0) | toolset `PhutilArgumentParser.php:819-825` full-value text: `Argument "%s" is unrecognized. Use "%s"...`; post-`--` leftovers ride the wildcard into symbol validation (`51d440b3`) |
+| RB-D16/17/18 (which prose) | IN PROGRESS | temp PHP 7.4 + ceb-`ceb082ef` oracle in `/tmp` (verified `arc help which` renders); isolated port agent running 8 oracle scenarios |
+
 ### Keep-list (Rule 2, recorded early per task §10 step 4)
 
 | Finding | Criterion | Rationale |
