@@ -183,6 +183,62 @@ pub fn suggest_strings(mut strings: Vec<String>) -> String {
     strings.join("\n")
 }
 
+/// Resolve the `--current` cursor into a word index plus an
+/// optional partial override. An unparseable `--current` behaves like
+/// position 0 with an empty partial (PHP indexes by a missing key,
+/// matching all); a missing one completes the last word.
+fn completion_cursor(current: Option<&str>, argc: usize) -> (i64, Option<String>) {
+    let pos: Option<i64> = match current {
+        None | Some("") => None,
+        Some(text) => text.parse::<i64>().ok(),
+    };
+    match (current, pos) {
+        (Some(text), None) if !text.is_empty() => (0, Some(String::new())),
+        (_, Some(pos)) => (pos, None),
+        _ => (argc as i64 - 1, None),
+    }
+}
+
+/// Complete the workflow word (cursor at 0 or 1) against the toolset
+/// workflows plus `aliases`.
+fn complete_workflow_name(
+    words: &[String],
+    pos: i64,
+    partial_override: Option<&str>,
+    aliases: &[String],
+) -> String {
+    let mut complete: Vec<String> = crate::alias::toolset_names()
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+    complete.extend(aliases.iter().cloned());
+    let partial = partial_override
+        .or_else(|| words.get(pos.max(0) as usize).map(String::as_str))
+        .unwrap_or("");
+    let matches = get_matches(&complete, partial);
+    if matches.is_empty() {
+        return String::new();
+    }
+    suggest_strings(matches)
+}
+
+/// Complete after a valued `--flag`: path parameters complete files,
+/// other parameters complete nothing. `None` when the previous word
+/// is not a valued flag (fall through to flag-name completion).
+fn valued_param_completion(words: &[String], pos: usize, flags: &[FlagInfo]) -> Option<String> {
+    let prev = words.get(pos.wrapping_sub(1))?;
+    let stripped = prev.strip_prefix("--")?;
+    let (_, param, is_path) = flags.iter().find(|(name, _, _)| *name == stripped)?;
+    if param.is_none() {
+        return None;
+    }
+    Some(if *is_path {
+        "<compgen:file>".to_string()
+    } else {
+        String::new()
+    })
+}
+
 /// Complete `words` (the words after `--`, `words[1]` is the workflow)
 /// at cursor `current`, with `aliases` as extra workflow candidates.
 pub fn autocomplete(
@@ -191,17 +247,7 @@ pub fn autocomplete(
     aliases: &[String],
 ) -> Result<String, String> {
     let argc = words.len();
-    let pos: Option<i64> = match current {
-        None | Some("") => None,
-        Some(text) => text.parse::<i64>().ok(),
-    };
-    // An unparseable `--current` behaves like position 0 with an
-    // empty partial (PHP indexes by a missing key, matching all).
-    let (pos, partial_override) = match (current, pos) {
-        (Some(text), None) if !text.is_empty() => (0, Some(String::new())),
-        (_, Some(pos)) => (pos, None),
-        _ => (argc as i64 - 1, None),
-    };
+    let (pos, partial_override) = completion_cursor(current, argc);
     if pos >= argc as i64 {
         let count = argc.to_string();
         let at = current.unwrap_or_default().to_string();
@@ -211,20 +257,12 @@ pub fn autocomplete(
         ));
     }
     if pos <= 1 {
-        let mut complete: Vec<String> = crate::alias::toolset_names()
-            .iter()
-            .map(|name| name.to_string())
-            .collect();
-        complete.extend(aliases.iter().cloned());
-        let partial = partial_override
-            .as_deref()
-            .or_else(|| words.get(pos.max(0) as usize).map(String::as_str))
-            .unwrap_or("");
-        let matches = get_matches(&complete, partial);
-        if matches.is_empty() {
-            return Ok(String::new());
-        }
-        return Ok(suggest_strings(matches));
+        return Ok(complete_workflow_name(
+            words,
+            pos,
+            partial_override.as_deref(),
+            aliases,
+        ));
     }
     let pos = pos as usize;
     let Some(workflow) = words.get(1).and_then(|name| {
@@ -235,17 +273,10 @@ pub fn autocomplete(
         return Ok(String::new());
     };
     let (flags, wildcard_path) = workflow_args(workflow);
-    let current_word = words.get(pos).map(String::as_str).unwrap_or("");
-    if let Some(prev) = words.get(pos.wrapping_sub(1))
-        && let Some(stripped) = prev.strip_prefix("--")
-        && let Some((_, param, is_path)) = flags.iter().find(|(name, _, _)| *name == stripped)
-        && param.is_some()
-    {
-        if *is_path {
-            return Ok("<compgen:file>".to_string());
-        }
-        return Ok(String::new());
+    if let Some(text) = valued_param_completion(words, pos, flags) {
+        return Ok(text);
     }
+    let current_word = words.get(pos).map(String::as_str).unwrap_or("");
     let flag_words: Vec<String> = flags
         .iter()
         .map(|(name, _, _)| format!("--{name}"))
@@ -353,6 +384,119 @@ pub fn source_line(hook_path: &str) -> String {
     }
 }
 
+/// Select the install shell: an explicit `--shell` wins, else
+/// detect from `$SHELL`. Returns the detection status output plus the
+/// shell key.
+fn resolve_install_shell(
+    shell_arg: Option<&str>,
+    shell_env: Option<&str>,
+    ansi: bool,
+) -> Result<(String, String), conduit::ClassifiedError> {
+    use conduit::ClassifiedError;
+    let mut out = String::new();
+    let shell = match shell_arg {
+        Some(arg) if !arg.is_empty() => {
+            select_shell(arg).map_err(ClassifiedError::toolset_usage)?
+        }
+        _ => {
+            let (status, detected) = detect_shell(shell_env, ansi);
+            out.push_str(&status);
+            detected.map_err(ClassifiedError::toolset_usage)?
+        }
+    };
+    Ok((out, shell))
+}
+
+/// The install confirmation prompt and its echo: rewrite (an old line
+/// was replaced), create (no profile yet), or append.
+fn install_prompt_text(
+    shell: &str,
+    removed: Option<&str>,
+    line: &str,
+    is_new: bool,
+) -> (&'static str, String) {
+    match (removed, is_new) {
+        (Some(removed), _) => (
+            "Rewrite this file?",
+            terminal::pht(
+                "%s\n\n    %s\n\n%s\n\n    %s\n",
+                &[
+                    terminal::PhtArg::Text(&terminal::pht(
+                        "To update shell completion support for \"%s\", your existing \"%s\" file will be modified. This line will be removed:",
+                        &[
+                            terminal::PhtArg::Text(shell),
+                            terminal::PhtArg::Text("~/.profile"),
+                        ],
+                    )),
+                    terminal::PhtArg::Text(removed),
+                    terminal::PhtArg::Text("This line will be added:"),
+                    terminal::PhtArg::Text(line),
+                ],
+            ),
+        ),
+        (None, true) => (
+            "Create this file?",
+            terminal::pht(
+                "%s\n\n    %s\n",
+                &[
+                    terminal::PhtArg::Text(&terminal::pht(
+                        "To install shell completion support for \"%s\", a new \"%s\" file will be created with this content:",
+                        &[
+                            terminal::PhtArg::Text(shell),
+                            terminal::PhtArg::Text("~/.profile"),
+                        ],
+                    )),
+                    terminal::PhtArg::Text(line),
+                ],
+            ),
+        ),
+        (None, false) => (
+            "Append to this file?",
+            terminal::pht(
+                "%s\n\n     %s\n",
+                &[
+                    terminal::PhtArg::Text(&terminal::pht(
+                        "To install shell completion support for \"%s\", this line will be added to your existing \"%s\" file:",
+                        &[
+                            terminal::PhtArg::Text(shell),
+                            terminal::PhtArg::Text("~/.profile"),
+                        ],
+                    )),
+                    terminal::PhtArg::Text(line),
+                ],
+            ),
+        ),
+    }
+}
+
+/// The profile content to write: the rewritten data, a fresh file, or
+/// the old data plus the new line.
+fn install_final_data(
+    new_data: String,
+    data: &str,
+    line: &str,
+    had_replacement: bool,
+    is_new: bool,
+) -> String {
+    if had_replacement {
+        new_data
+    } else if is_new {
+        format!("{line}\n")
+    } else {
+        format!("{}\n\n{line}\n", data.trim_end())
+    }
+}
+
+/// Map an install-prompt failure into its install error: declines
+/// abort, everything else is fatal.
+fn install_prompt_error(message: String) -> conduit::ClassifiedError {
+    if message == crate::prompt::ABORT {
+        conduit::ClassifiedError::user_abort(message)
+    } else {
+        conduit::ClassifiedError::fatal(message)
+    }
+}
+
 /// Install completion into `$HOME/.profile`, prompting as needed.
 /// `home`/`root` override `$HOME` and the shell root (tests); `input`
 /// answers the prompt; `save` persists `*`/`!` prompt suffixes.
@@ -370,16 +514,8 @@ pub fn install_in(
     use conduit::ClassifiedError;
     let ansi = terminal::ansi_enabled();
     let mut out = String::new();
-    let shell = match shell_arg {
-        Some(arg) if !arg.is_empty() => {
-            select_shell(arg).map_err(ClassifiedError::toolset_usage)?
-        }
-        _ => {
-            let (status, detected) = detect_shell(shell_env, ansi);
-            out.push_str(&status);
-            detected.map_err(ClassifiedError::toolset_usage)?
-        }
-    };
+    let (status, shell) = resolve_install_shell(shell_arg, shell_env, ansi)?;
+    out.push_str(&status);
     let Some(home) = home.filter(|h| !h.is_empty()) else {
         return Err(ClassifiedError::toolset_usage(
             "The \"HOME\" environment variable is not defined, so this workflow can not identify where to install shell completion.".to_string(),
@@ -418,66 +554,9 @@ pub fn install_in(
         return Ok(out);
     }
     let had_replacement = replaced.is_some();
-    let (prompt, echo) = match (replaced, is_new) {
-        (Some(removed), _) => (
-            "Rewrite this file?",
-            terminal::pht(
-                "%s\n\n    %s\n\n%s\n\n    %s\n",
-                &[
-                    terminal::PhtArg::Text(&terminal::pht(
-                        "To update shell completion support for \"%s\", your existing \"%s\" file will be modified. This line will be removed:",
-                        &[
-                            terminal::PhtArg::Text(&shell),
-                            terminal::PhtArg::Text("~/.profile"),
-                        ],
-                    )),
-                    terminal::PhtArg::Text(&removed),
-                    terminal::PhtArg::Text("This line will be added:"),
-                    terminal::PhtArg::Text(&line),
-                ],
-            ),
-        ),
-        (None, true) => (
-            "Create this file?",
-            terminal::pht(
-                "%s\n\n    %s\n",
-                &[
-                    terminal::PhtArg::Text(&terminal::pht(
-                        "To install shell completion support for \"%s\", a new \"%s\" file will be created with this content:",
-                        &[
-                            terminal::PhtArg::Text(&shell),
-                            terminal::PhtArg::Text("~/.profile"),
-                        ],
-                    )),
-                    terminal::PhtArg::Text(&line),
-                ],
-            ),
-        ),
-        (None, false) => (
-            "Append to this file?",
-            terminal::pht(
-                "%s\n\n     %s\n",
-                &[
-                    terminal::PhtArg::Text(&terminal::pht(
-                        "To install shell completion support for \"%s\", this line will be added to your existing \"%s\" file:",
-                        &[
-                            terminal::PhtArg::Text(&shell),
-                            terminal::PhtArg::Text("~/.profile"),
-                        ],
-                    )),
-                    terminal::PhtArg::Text(&line),
-                ],
-            ),
-        ),
-    };
+    let (prompt, echo) = install_prompt_text(&shell, replaced.as_deref(), &line, is_new);
     out.push_str(&echo);
-    let final_data = if had_replacement {
-        new_data
-    } else if is_new {
-        format!("{line}\n")
-    } else {
-        format!("{}\n\n{line}\n", data.trim_end())
-    };
+    let final_data = install_final_data(new_data, &data, &line, had_replacement, is_new);
     crate::prompts::execute_prompt_saving(
         input,
         crate::prompts::INSTALL_PROMPT_KEY,
@@ -487,13 +566,7 @@ pub fn install_in(
         saved,
         save,
     )
-    .map_err(|message| {
-        if message == crate::prompt::ABORT {
-            ClassifiedError::user_abort(message)
-        } else {
-            ClassifiedError::fatal(message)
-        }
-    })?;
+    .map_err(install_prompt_error)?;
     std::fs::write(&file_path, final_data).map_err(|e| {
         ClassifiedError::fatal(format!("cannot write '{}': {e}", file_path.display()))
     })?;
@@ -564,16 +637,9 @@ pub fn generate_in(root: &Path) -> String {
     out
 }
 
-/// Entry point: `argv` excludes the subcommand name.
-pub fn run(argv: &[String]) -> ExitCode {
-    use conduit::ClassifiedError;
-    use std::io::IsTerminal;
-    let stdin_tty = std::io::stdin().is_terminal();
-    let parsed = match parse_args(argv, stdin_tty) {
-        Ok(parsed) => parsed,
-        Err(message) => return ClassifiedError::toolset_parse_error(message).report(),
-    };
-    for notice in &parsed.notices {
+/// Print the argument spelling-correction notices to stderr.
+fn report_parse_notices(notices: &[String]) {
+    for notice in notices {
         eprint!(
             "{}",
             terminal::tsprintf_ansi(
@@ -585,6 +651,124 @@ pub fn run(argv: &[String]) -> ExitCode {
             .unwrap_or_default()
         );
     }
+}
+
+/// Triggers of the `arc`-toolset aliases (extra workflow candidates
+/// for completion).
+fn arc_alias_triggers() -> Vec<String> {
+    crate::alias::load_aliases()
+        .map(|(aliases, _)| {
+            aliases
+                .into_iter()
+                .filter(|alias| alias.toolset == "arc")
+                .map(|alias| alias.trigger)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+/// Run the complete-arguments flow: reject the install/generate flags,
+/// then complete `words` at `current`.
+fn run_complete(
+    words: Vec<String>,
+    current: Option<String>,
+    is_generate: bool,
+    is_shell: bool,
+) -> ExitCode {
+    use conduit::ClassifiedError;
+    if is_generate {
+        return ClassifiedError::toolset_usage(
+            "You can not use \"--generate\" when completing arguments.".to_string(),
+        )
+        .report();
+    }
+    if is_shell {
+        return ClassifiedError::toolset_usage(
+            "You can not use \"--shell\" when completing arguments.".to_string(),
+        )
+        .report();
+    }
+    let aliases = arc_alias_triggers();
+    match autocomplete(&words, current.as_deref(), &aliases) {
+        Ok(text) => {
+            print!("{text}");
+            ExitCode::SUCCESS
+        }
+        Err(message) => ClassifiedError::fatal(message).report(),
+    }
+}
+
+/// Run `--generate` (rules only) or the install flow. `Ok` means the
+/// run continues to the NOTE footer; `Err` carries the exit code.
+fn run_generate_or_install(
+    is_generate: bool,
+    current: Option<String>,
+    shell_arg: String,
+    stdin_tty: bool,
+) -> Result<(), ExitCode> {
+    use conduit::ClassifiedError;
+    if is_generate {
+        if current.is_some() {
+            return Err(ClassifiedError::toolset_usage(
+                "You can not use \"--current\" when generating rules.".to_string(),
+            )
+            .report());
+        }
+        if !shell_arg.is_empty() {
+            return Err(ClassifiedError::toolset_usage(
+                "The flags \"--generate\" and \"--shell\" are mutually exclusive. The \"--shell\" flag selects which shell to install support for, but the \"--generate\" suppresses installation.".to_string(),
+            )
+            .report());
+        }
+        print!("{}", generate_in(&default_shell_root()));
+        return Ok(());
+    }
+    if current.is_some() {
+        return Err(ClassifiedError::toolset_usage(
+            "You can not use \"--current\" when installing support.".to_string(),
+        )
+        .report());
+    }
+    let home = std::env::var("HOME").ok();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let user_file = crate::config::arcrc_path();
+    let local_file = crate::prompts::working_copy_config_file(&cwd);
+    let saved = crate::prompts::load_saved_response(
+        &cwd,
+        user_file.as_deref(),
+        crate::prompts::INSTALL_PROMPT_KEY,
+    );
+    let stdin = std::io::stdin();
+    let mut locked = stdin.lock();
+    let mut saver =
+        crate::prompts::response_saver(crate::prompts::INSTALL_PROMPT_KEY, user_file, local_file);
+    match install_in(
+        (!shell_arg.is_empty()).then_some(shell_arg.as_str()),
+        std::env::var("SHELL").ok().as_deref(),
+        home.as_deref(),
+        &default_shell_root(),
+        &mut locked,
+        stdin_tty,
+        saved.as_deref(),
+        &mut saver,
+    ) {
+        Ok(text) => print!("{text}"),
+        Err(error) => return Err(error.report()),
+    }
+    print!("{}", generate_in(&default_shell_root()));
+    Ok(())
+}
+
+/// Entry point: `argv` excludes the subcommand name.
+pub fn run(argv: &[String]) -> ExitCode {
+    use conduit::ClassifiedError;
+    use std::io::IsTerminal;
+    let stdin_tty = std::io::stdin().is_terminal();
+    let parsed = match parse_args(argv, stdin_tty) {
+        Ok(parsed) => parsed,
+        Err(message) => return ClassifiedError::toolset_parse_error(message).report(),
+    };
+    report_parse_notices(&parsed.notices);
     let is_generate = parsed.flag("generate");
     let shell_arg = parsed.value("shell").unwrap_or("").to_string();
     let is_shell = !shell_arg.is_empty();
@@ -592,87 +776,10 @@ pub fn run(argv: &[String]) -> ExitCode {
     let words = parsed.positionals;
 
     if !words.is_empty() {
-        if is_generate {
-            return ClassifiedError::toolset_usage(
-                "You can not use \"--generate\" when completing arguments.".to_string(),
-            )
-            .report();
-        }
-        if is_shell {
-            return ClassifiedError::toolset_usage(
-                "You can not use \"--shell\" when completing arguments.".to_string(),
-            )
-            .report();
-        }
-        let aliases = crate::alias::load_aliases()
-            .map(|(aliases, _)| {
-                aliases
-                    .into_iter()
-                    .filter(|alias| alias.toolset == "arc")
-                    .map(|alias| alias.trigger)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        return match autocomplete(&words, current.as_deref(), &aliases) {
-            Ok(text) => {
-                print!("{text}");
-                ExitCode::SUCCESS
-            }
-            Err(message) => ClassifiedError::fatal(message).report(),
-        };
+        return run_complete(words, current, is_generate, is_shell);
     }
-
-    if is_generate {
-        if current.is_some() {
-            return ClassifiedError::toolset_usage(
-                "You can not use \"--current\" when generating rules.".to_string(),
-            )
-            .report();
-        }
-        if is_shell {
-            return ClassifiedError::toolset_usage(
-                "The flags \"--generate\" and \"--shell\" are mutually exclusive. The \"--shell\" flag selects which shell to install support for, but the \"--generate\" suppresses installation.".to_string(),
-            )
-            .report();
-        }
-        print!("{}", generate_in(&default_shell_root()));
-    } else {
-        if current.is_some() {
-            return ClassifiedError::toolset_usage(
-                "You can not use \"--current\" when installing support.".to_string(),
-            )
-            .report();
-        }
-        let home = std::env::var("HOME").ok();
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let user_file = crate::config::arcrc_path();
-        let local_file = crate::prompts::working_copy_config_file(&cwd);
-        let saved = crate::prompts::load_saved_response(
-            &cwd,
-            user_file.as_deref(),
-            crate::prompts::INSTALL_PROMPT_KEY,
-        );
-        let stdin = std::io::stdin();
-        let mut locked = stdin.lock();
-        let mut saver = crate::prompts::response_saver(
-            crate::prompts::INSTALL_PROMPT_KEY,
-            user_file,
-            local_file,
-        );
-        match install_in(
-            (!shell_arg.is_empty()).then_some(shell_arg.as_str()),
-            std::env::var("SHELL").ok().as_deref(),
-            home.as_deref(),
-            &default_shell_root(),
-            &mut locked,
-            stdin_tty,
-            saved.as_deref(),
-            &mut saver,
-        ) {
-            Ok(text) => print!("{text}"),
-            Err(error) => return error.report(),
-        }
-        print!("{}", generate_in(&default_shell_root()));
+    if let Err(code) = run_generate_or_install(is_generate, current, shell_arg, stdin_tty) {
+        return code;
     }
 
     eprint!(

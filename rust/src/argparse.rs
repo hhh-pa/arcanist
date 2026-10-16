@@ -91,33 +91,60 @@ fn strip_affixes(x: &[char], y: &[char]) -> (Vec<char>, Vec<char>) {
     )
 }
 
-/// Damerau-Levenshtein distance with the command-corrector costs
-/// (insert 4, delete 4, replace 3, transpose 2), following
-/// `PhutilEditDistanceMatrix::computeMatrix` exactly: replacement wins
-/// ties over insertion and deletion, insertion wins ties over deletion,
-/// and a transpose wins only when strictly cheaper.
-fn command_distance(a: &str, b: &str) -> i64 {
+/// Pick the cheapest plain edit step for one command-matrix cell:
+/// replacement wins ties over insertion and deletion, insertion wins
+/// ties over deletion. Returns the cost and whether replacement won
+/// (for the Damerau `last_dy` bookkeeping).
+fn command_step_cost(rep_cost: i64, del_cost: i64, ins_cost: i64) -> (i64, bool) {
+    if rep_cost <= del_cost && rep_cost <= ins_cost {
+        (rep_cost, true)
+    } else if ins_cost <= del_cost {
+        (ins_cost, false)
+    } else {
+        (del_cost, false)
+    }
+}
+
+/// One Damerau cell update for [`command_distance`]: the cheapest edit
+/// step, then a strictly-cheaper transpose. Returns the cell cost and
+/// whether a matching pair was consumed (replacement won on equal
+/// characters).
+fn command_cell_cost(
+    m: &[Vec<i64>],
+    xx: usize,
+    yy: usize,
+    matched: bool,
+    dx: i64,
+    dy: i64,
+) -> (i64, bool) {
     const INSERT: i64 = 4;
     const DELETE: i64 = 4;
     const REPLACE: i64 = 3;
     const TRANSPOSE: i64 = 2;
 
-    let (x, y) = strip_affixes(
-        &a.chars().collect::<Vec<_>>(),
-        &b.chars().collect::<Vec<_>>(),
-    );
-    if x.is_empty() {
-        return INSERT * y.len() as i64;
+    let rep_cost = if matched {
+        m[xx][yy]
+    } else {
+        m[xx][yy] + REPLACE
+    };
+    let del_cost = m[xx][yy + 1] + DELETE;
+    let ins_cost = m[xx + 1][yy] + INSERT;
+    let (mut cost, took_rep) = command_step_cost(rep_cost, del_cost, ins_cost);
+    let trn_count = (xx as i64 - dx - 2) + (yy as i64 - dy - 2) + 1;
+    let trn_cost = m[(dx + 1) as usize][(dy + 1) as usize] + trn_count * TRANSPOSE;
+    if trn_cost < cost {
+        cost = trn_cost;
     }
-    if y.is_empty() {
-        return DELETE * x.len() as i64;
-    }
-    if x == y {
-        return 0;
-    }
+    (cost, took_rep && matched)
+}
 
-    let xl = x.len();
-    let yl = y.len();
+/// The `[-1]`-offset matrix and last-seen map for [`command_distance`],
+/// with infinity borders and the insert/delete edges filled.
+fn command_init_matrix(x: &[char], y: &[char]) -> (Vec<Vec<i64>>, HashMap<char, i64>) {
+    const INSERT: i64 = 4;
+    const DELETE: i64 = 4;
+
+    let (xl, yl) = (x.len(), y.len());
     // `m[xx][yy]` with the Damerau `[-1]` row/column at index 0 (offset
     // by one); the `-1` cells hold infinity.
     let inf: i64 = i64::MAX / 4;
@@ -138,39 +165,53 @@ fn command_distance(a: &str, b: &str) -> i64 {
     for yy in 0..=yl {
         m[1][yy + 1] = yy as i64 * INSERT;
     }
+    (m, d)
+}
 
+/// Fill the command matrix cell by cell, tracking each row's last
+/// consumed column for the Damerau transpositions.
+fn command_fill_matrix(x: &[char], y: &[char], m: &mut [Vec<i64>], d: &mut HashMap<char, i64>) {
+    let (xl, yl) = (x.len(), y.len());
     for xx in 1..=xl {
         let mut last_dy: i64 = -1;
         for yy in 1..=yl {
-            let dx = d[&y[yy - 1]];
-            let dy = last_dy;
-            let rep_cost = if x[xx - 1] == y[yy - 1] {
-                m[xx][yy]
-            } else {
-                m[xx][yy] + REPLACE
-            };
-            let del_cost = m[xx][yy + 1] + DELETE;
-            let ins_cost = m[xx + 1][yy] + INSERT;
-            let mut cost;
-            if rep_cost <= del_cost && rep_cost <= ins_cost {
-                cost = rep_cost;
-                if x[xx - 1] == y[yy - 1] {
-                    last_dy = yy as i64 - 1;
-                }
-            } else if ins_cost <= del_cost {
-                cost = ins_cost;
-            } else {
-                cost = del_cost;
-            }
-            let trn_count = (xx as i64 - dx - 2) + (yy as i64 - dy - 2) + 1;
-            let trn_cost = m[(dx + 1) as usize][(dy + 1) as usize] + trn_count * TRANSPOSE;
-            if trn_cost < cost {
-                cost = trn_cost;
+            let matched = x[xx - 1] == y[yy - 1];
+            let (cost, consumed) = command_cell_cost(m, xx, yy, matched, d[&y[yy - 1]], last_dy);
+            if consumed {
+                last_dy = yy as i64 - 1;
             }
             m[xx + 1][yy + 1] = cost;
         }
         d.insert(x[xx - 1], xx as i64 - 1);
     }
+}
+
+/// Damerau-Levenshtein distance with the command-corrector costs
+/// (insert 4, delete 4, replace 3, transpose 2), following
+/// `PhutilEditDistanceMatrix::computeMatrix` exactly: replacement wins
+/// ties over insertion and deletion, insertion wins ties over deletion,
+/// and a transpose wins only when strictly cheaper.
+fn command_distance(a: &str, b: &str) -> i64 {
+    const INSERT: i64 = 4;
+    const DELETE: i64 = 4;
+
+    let (x, y) = strip_affixes(
+        &a.chars().collect::<Vec<_>>(),
+        &b.chars().collect::<Vec<_>>(),
+    );
+    if x.is_empty() {
+        return INSERT * y.len() as i64;
+    }
+    if y.is_empty() {
+        return DELETE * x.len() as i64;
+    }
+    if x == y {
+        return 0;
+    }
+
+    let (mut m, mut d) = command_init_matrix(&x, &y);
+    let (xl, yl) = (x.len(), y.len());
+    command_fill_matrix(&x, &y, &mut m, &mut d);
     m[xl + 1][yl + 1]
 }
 
@@ -302,6 +343,128 @@ fn filter_wildcard(argv: Vec<String>) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// One argv token's role in the toolset flag scan.
+enum ToolsetToken {
+    /// `--`: copy the tail into the leftovers.
+    Terminator,
+    /// Positional, lone `-`, short flag, or `--name` (known or not):
+    /// copied verbatim unless a known flag consumes it.
+    Leftover,
+    /// A `--name[=value]` token to look up in the spec.
+    Flag,
+}
+
+/// Classify one argv token for the toolset flag scan.
+fn toolset_token_kind(arg: &str) -> ToolsetToken {
+    if arg == "--" {
+        ToolsetToken::Terminator
+    } else if arg == "-" || !arg.starts_with('-') || arg.len() < 2 {
+        // A lone `-` is a normal argument (e.g. stdin); anything else
+        // here is positional.
+        ToolsetToken::Leftover
+    } else if !arg.starts_with("--") {
+        // No short flags exist at ceb: `-x` falls through to the
+        // unrecognized-argument error below.
+        ToolsetToken::Leftover
+    } else {
+        ToolsetToken::Flag
+    }
+}
+
+/// Split one `--name[=value]` token and apply flag spelling correction,
+/// recording the notice. Returns the (possibly corrected) name and the
+/// inline value.
+fn toolset_flag_name(
+    arg: &str,
+    specs: &[FlagSpec],
+    by_name: &HashMap<&str, &FlagSpec>,
+    autocorrect: bool,
+    notices: &mut Vec<String>,
+) -> (String, Option<String>) {
+    let (mut name, inline): (String, Option<String>) = match arg[2..].split_once('=') {
+        Some((head, tail)) => (head.to_owned(), Some(tail.to_owned())),
+        None => (arg[2..].to_owned(), None),
+    };
+    if !by_name.contains_key(name.as_str()) && autocorrect {
+        let names: Vec<&str> = specs.iter().map(|spec| spec.name).collect();
+        let fixes = correct_flags(&name, &names);
+        if fixes.len() == 1 {
+            // `(Assuming "--x" is the British spelling of "--y".)`.
+            let head = format!("(Assuming \"--{name}\" is the British spelling of ");
+            notices.push(format!("{head}\"--{}\".)", fixes[0]));
+            name = fixes[0].clone();
+        }
+    }
+    (name, inline)
+}
+
+/// Record one flag occurrence, rejecting repeats unless repeatable.
+fn toolset_record_value(
+    parsed: &mut Parsed,
+    spec: &FlagSpec,
+    name: &str,
+    value: String,
+) -> Result<(), String> {
+    if !spec.repeat && parsed.values.contains_key(name) {
+        return Err(format!("Argument \"--{name}\" was provided twice."));
+    }
+    parsed
+        .values
+        .entry(name.to_owned())
+        .or_default()
+        .push(value);
+    Ok(())
+}
+
+/// Consume one known flag at `argv[index]` (`next` is the following
+/// token for separate parameters), recording it into `parsed`.
+/// Returns the argv slots consumed (2 when the parameter comes from
+/// the next token).
+fn toolset_consume_flag(
+    parsed: &mut Parsed,
+    spec: &FlagSpec,
+    name: &str,
+    inline: Option<String>,
+    next: Option<&String>,
+) -> Result<usize, String> {
+    if spec.param.is_none() {
+        if inline.is_some() {
+            return Err(format!("Argument \"--{name}\" does not take a parameter."));
+        }
+        toolset_record_value(parsed, spec, name, String::new())?;
+        return Ok(1);
+    }
+    let (value, consumed) = match inline {
+        Some(value) => (value, 1),
+        None => {
+            let Some(next) = next else {
+                return Err(format!("Argument \"--{name}\" requires a parameter."));
+            };
+            (next.clone(), 2)
+        }
+    };
+    toolset_record_value(parsed, spec, name, value)?;
+    Ok(consumed)
+}
+
+/// Finish the flag scan: with a wildcard the leftovers are the
+/// positionals, otherwise any leftover is unrecognized.
+fn toolset_finish(
+    parsed: &mut Parsed,
+    remaining: Vec<String>,
+    wildcard: bool,
+) -> Result<(), String> {
+    if wildcard {
+        parsed.positionals = filter_wildcard(remaining)?;
+        return Ok(());
+    }
+    let leftovers = filter_wildcard(remaining)?;
+    if let Some(first) = leftovers.first() {
+        return Err(format!("Unrecognized argument \"{first}\"."));
+    }
+    Ok(())
+}
+
 /// Parse toolset (full-parse) arguments against `specs`.
 ///
 /// `wildcard` mirrors a wildcard argument: leftovers are collected as
@@ -321,83 +484,30 @@ pub fn parse_toolset(
     let mut index = 0;
     while index < argv.len() {
         let arg = &argv[index];
-        if arg == "--" {
-            parsed.saw_terminator = true;
-            remaining.extend(argv[index..].iter().cloned());
-            break;
-        }
-        if arg == "-" || !arg.starts_with('-') || arg.len() < 2 {
-            // A lone `-` is a normal argument (e.g. stdin); anything
-            // else here is positional.
-            remaining.push(arg.clone());
-            index += 1;
-            continue;
-        }
-        if !arg.starts_with("--") {
-            // No short flags exist at ceb: `-x` falls through to the
-            // unrecognized-argument error below.
-            remaining.push(arg.clone());
-            index += 1;
-            continue;
-        }
-        let (mut name, inline): (String, Option<String>) = match arg[2..].split_once('=') {
-            Some((head, tail)) => (head.to_string(), Some(tail.to_string())),
-            None => (arg[2..].to_string(), None),
-        };
-        if !by_name.contains_key(name.as_str()) && autocorrect {
-            let names: Vec<&str> = specs.iter().map(|spec| spec.name).collect();
-            let fixes = correct_flags(&name, &names);
-            if fixes.len() == 1 {
-                // `(Assuming "--x" is the British spelling of "--y".)`.
-                let head = format!("(Assuming \"--{name}\" is the British spelling of ");
-                parsed.notices.push(format!("{head}\"--{}\".)", fixes[0]));
-                name = fixes[0].clone();
+        match toolset_token_kind(arg) {
+            ToolsetToken::Terminator => {
+                parsed.saw_terminator = true;
+                remaining.extend(argv[index..].iter().cloned());
+                break;
             }
-        }
-        let Some(spec) = by_name.get(name.as_str()) else {
-            remaining.push(arg.clone());
-            index += 1;
-            continue;
-        };
-        if spec.param.is_none() {
-            if inline.is_some() {
-                return Err(format!("Argument \"--{name}\" does not take a parameter."));
-            }
-            if !spec.repeat && parsed.values.contains_key(name.as_str()) {
-                return Err(format!("Argument \"--{name}\" was provided twice."));
-            }
-            parsed
-                .values
-                .entry(name.clone())
-                .or_default()
-                .push(String::new());
-            index += 1;
-            continue;
-        }
-        let value = match inline {
-            Some(value) => value,
-            None => {
-                let Some(next) = argv.get(index + 1) else {
-                    return Err(format!("Argument \"--{name}\" requires a parameter."));
-                };
+            ToolsetToken::Leftover => {
+                remaining.push(arg.clone());
                 index += 1;
-                next.clone()
             }
-        };
-        if !spec.repeat && parsed.values.contains_key(name.as_str()) {
-            return Err(format!("Argument \"--{name}\" was provided twice."));
-        }
-        parsed.values.entry(name).or_default().push(value);
-        index += 1;
-    }
-    if wildcard {
-        parsed.positionals = filter_wildcard(remaining)?;
-    } else {
-        let leftovers = filter_wildcard(remaining)?;
-        if let Some(first) = leftovers.first() {
-            return Err(format!("Unrecognized argument \"{first}\"."));
+            ToolsetToken::Flag => {
+                let (name, inline) =
+                    toolset_flag_name(arg, specs, &by_name, autocorrect, &mut parsed.notices);
+                let Some(spec) = by_name.get(name.as_str()) else {
+                    remaining.push(arg.clone());
+                    index += 1;
+                    continue;
+                };
+                let next = argv.get(index + 1);
+                index += toolset_consume_flag(&mut parsed, spec, &name, inline, next)?;
+            }
         }
     }
+    toolset_finish(&mut parsed, remaining, wildcard)?;
     Ok(parsed)
 }
 

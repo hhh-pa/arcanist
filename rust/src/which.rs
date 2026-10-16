@@ -1465,31 +1465,42 @@ pub fn match_working_copy_revisions(
     attach_authors(client, rows)
 }
 
-/// Resolve other authors' names via `user.query`, like the PHP workflow.
-fn attach_authors(
-    client: &conduit::Client,
-    rows: Vec<(String, String, String, String)>,
-) -> Result<Vec<MatchedRevision>, String> {
-    // T1153 RB-D8: PHP resolves whoami once at startup auth, then
-    // reuses the cached viewer PHID (`getUserPHID()`); only call when
-    // uncached (e.g. direct library use without `config::authenticate`).
-    let cached = client.authenticated_user();
-    let who;
-    let own = match &cached {
-        Some((_, phid)) => phid.as_str(),
-        None => {
-            who = client
-                .call("user.whoami", &serde_json::json!({}))
-                .map_err(|e| e.to_string())?;
-            who.get("phid").and_then(|v| v.as_str()).unwrap_or("")
-        }
-    };
+/// The viewer's PHID: the cached auth PHID, else one `user.whoami`
+/// call.
+///
+/// T1153 RB-D8: PHP resolves whoami once at startup auth, then reuses
+/// the cached viewer PHID (`getUserPHID()`); only call when uncached
+/// (e.g. direct library use without `config::authenticate`).
+fn viewer_phid(client: &conduit::Client) -> Result<String, String> {
+    if let Some((_, phid)) = client.authenticated_user() {
+        return Ok(phid);
+    }
+    let who = client
+        .call("user.whoami", &serde_json::json!({}))
+        .map_err(|e| e.to_string())?;
+    Ok(who
+        .get("phid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string())
+}
+
+/// Distinct author PHIDs in `rows` excluding the viewer.
+fn other_author_phids(rows: &[(String, String, String, String)], own: &str) -> Vec<String> {
     let mut others: Vec<String> = Vec::new();
-    for (_, _, author, _) in &rows {
+    for (_, _, author, _) in rows {
         if author != own && !others.iter().any(|p| p == author) {
             others.push(author.clone());
         }
     }
+    others
+}
+
+/// Map other-author PHIDs to user names via one `user.query` call.
+fn query_author_names(
+    client: &conduit::Client,
+    others: &[String],
+) -> Result<std::collections::BTreeMap<String, String>, String> {
     let mut names: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     if !others.is_empty() {
         let users = client
@@ -1499,21 +1510,43 @@ fn attach_authors(
             names.insert(row_string(user, "phid"), row_string(user, "userName"));
         }
     }
+    Ok(names)
+}
+
+/// Build one matched revision, resolving other authors' names.
+fn build_matched_revision(
+    id: String,
+    title: String,
+    author: String,
+    why: String,
+    own: &str,
+    names: &std::collections::BTreeMap<String, String>,
+) -> MatchedRevision {
+    let name = if author == own {
+        None
+    } else {
+        Some(names.get(&author).cloned().unwrap_or_default())
+    };
+    MatchedRevision {
+        monogram: format!("D{id}"),
+        title,
+        author: name,
+        why,
+    }
+}
+
+/// Resolve other authors' names via `user.query`, like the PHP workflow.
+fn attach_authors(
+    client: &conduit::Client,
+    rows: Vec<(String, String, String, String)>,
+) -> Result<Vec<MatchedRevision>, String> {
+    let own_phid = viewer_phid(client)?;
+    let own = own_phid.as_str();
+    let others = other_author_phids(&rows, own);
+    let names = query_author_names(client, &others)?;
     Ok(rows
         .into_iter()
-        .map(|(id, title, author, why)| {
-            let name = if author == own {
-                None
-            } else {
-                Some(names.get(&author).cloned().unwrap_or_default())
-            };
-            MatchedRevision {
-                monogram: format!("D{id}"),
-                title,
-                author: name,
-                why,
-            }
-        })
+        .map(|(id, title, author, why)| build_matched_revision(id, title, author, why, own, &names))
         .collect())
 }
 
