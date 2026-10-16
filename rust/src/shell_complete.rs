@@ -19,6 +19,107 @@ use crate::terminal;
 
 pub const NAME: &str = "shell-complete";
 
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`).
+/// The renderer is the shared `crate::help` module; this file keeps
+/// only the data (ceb
+/// `src/toolset/workflow/ArcanistShellCompleteWorkflow.php:14-64,67-87`).
+const HELP_SYNOPSIS: &str = "Install shell completion.";
+const HELP_TEXT: &str = "Install shell completion so you can use the \"tab\" key to autocomplete\n\
+commands and flags in your shell for Arcanist toolsets and workflows.\n\
+\n\
+The **bash** shell is supported.\n\
+\n\
+**Installing Completion**\n\
+\n\
+To install shell completion, run the command:\n\
+\n\
+\x20 $ arc shell-complete\n\
+\n\
+This will install shell completion into your current shell. After installing,\n\
+you may need to start a new shell (or open a new terminal window) to pick up\n\
+the updated configuration.\n\
+\n\
+Once installed, completion should work across all Arcanist toolsets.\n\
+\n\
+**Using Completion**\n\
+\n\
+After completion is installed, use the \"tab\" key to automatically complete\n\
+workflows and flags. For example, if you type:\n\
+\n\
+\x20 $ arc diff --draf<tab>\n\
+\n\
+...your shell should automatically expand the flag to:\n\
+\n\
+\x20 $ arc diff --draft\n\
+\n\
+**Updating Completion**\n\
+\n\
+To update shell completion, run the same command:\n\
+\n\
+\x20 $ arc shell-complete\n\
+\n\
+You can update shell completion without reinstalling it by running:\n\
+\n\
+\x20 $ arc shell-complete --generate\n\
+\n\
+You may need to update shell completion if:\n\
+\n\
+\x20 - you install new Arcanist toolsets; or\n\
+\x20 - you move the Arcanist directory; or\n\
+\x20 - you upgrade Arcanist and the new version fixes shell completion bugs.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[
+    (
+        "current",
+        None,
+        Some("cursor-position"),
+        "Internal. Current term in the argument list being completed.",
+    ),
+    (
+        "generate",
+        None,
+        None,
+        "Regenerate shell completion rules, without installing any configuration.",
+    ),
+    (
+        "shell",
+        None,
+        Some("shell-name"),
+        "Install completion support for a particular shell.",
+    ),
+];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        None,
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &specs,
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(terminal::ansi_enabled())
+}
+
+/// True when `-h`/`--help` appears before any `--` terminator (the
+/// global parser consumes help flags first in PHP; direct calls
+/// reroute to usage the same way).
+fn wants_help(argv: &[String]) -> bool {
+    argv.iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg == "-h" || arg == "--help")
+}
+
 /// `support/shell/templates/bash-template.sh` at ceb, with a `{{{BIN}}}`
 /// placeholder per toolset key.
 const BASH_TEMPLATE: &str = "_arcanist_complete_{{{BIN}}} ()\n\
@@ -763,6 +864,12 @@ fn run_generate_or_install(
 pub fn run(argv: &[String]) -> ExitCode {
     use conduit::ClassifiedError;
     use std::io::IsTerminal;
+    // T1153 R10: `--help` reroutes to the generated workflow help
+    // (ceb `PhutilArgumentParser.php:461-475`).
+    if wants_help(argv) {
+        print!("{}", usage());
+        return ExitCode::SUCCESS;
+    }
     let stdin_tty = std::io::stdin().is_terminal();
     let parsed = match parse_args(argv, stdin_tty) {
         Ok(parsed) => parsed,

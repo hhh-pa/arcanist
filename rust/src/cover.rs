@@ -51,21 +51,40 @@ use arc_rs::{config, diff_local, get_config, git, prompt, terminal};
 /// Subcommand name, matching `arc cover`.
 pub const NAME: &str = "cover";
 
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `arc_rs::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistCoverWorkflow.php:12-46`).
+const HELP_SYNOPSIS: &str = "      **cover** [--rev __revision__] [__path__ ...]";
+const HELP_TEXT: &str = "          Supports: svn, git, hg\n          Cover your... professional reputation. Show blame for the lines you\n          changed in your working copy (svn) or since some commit (hg, git).\n          This will take a minute because blame takes a minute, especially under\n          SVN.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[(
+    "rev",
+    None,
+    Some("revision"),
+    "Cover changes since a specific revision.",
+)];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<arc_rs::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    arc_rs::help::usage_text(
+        NAME,
+        None,
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &specs,
+        ansi,
+    )
+}
+
 fn usage() -> String {
-    "usage: arc cover [--rev revision] [path ...]\n\
-     \n\
-     Supports: git\n\
-     Cover your... professional reputation. Show blame for the lines you\n\
-     changed in your working copy (svn) or since some commit (hg, git).\n\
-     This will take a minute because blame takes a minute, especially under\n\
-     SVN.\n\
-     \n\
-     Options:\n\
-     \x20 --rev REV      Cover changes since a specific revision.\n\
-     \x20 -h, --help     Show this help.\n\
-     \n\
-     Not yet ported (see T1128): Subversion and Mercurial working copies.\n"
-        .to_string()
+    usage_text(arc_rs::terminal::ansi_enabled())
 }
 
 /// The empty-tree object PHP accepts as an explicit base

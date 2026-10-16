@@ -2448,8 +2448,10 @@ fn execute_help_preview_and_errors() {
     let dir = temp_dir("exec_help");
     let backends = Backends::default();
     let mut io = Io::buffered();
-    let out = execute_with_io(&dir, &argv(&["--help"]), &mut io, &backends).unwrap();
-    assert_eq!(out.stdout, USAGE);
+    // T1153 R10: `--help` renders the generated workflow help (exact
+    // bytes locked by `r10_patch_help_matches_generated_format`).
+    let out = execute_with_io_ansi(&dir, &argv(&["--help"]), &mut io, &backends, false).unwrap();
+    assert_eq!(out.stdout, usage_text(false));
     let mut io = Io::buffered();
     let error = execute_with_io(&dir, &argv(&["--bogus"]), &mut io, &backends).unwrap_err();
     assert!(error.ends_with(USAGE), "{error}");
@@ -2576,7 +2578,12 @@ fn execute_pops_stash_on_failure() {
 fn run_entry_points() {
     let dir = temp_dir("run_points");
     assert_eq!(run_in(&dir, &argv(&["--help"])), ExitCode::SUCCESS);
-    assert_eq!(execute(&dir, &argv(&["--help"])).unwrap().stdout, USAGE);
+    assert_eq!(
+        execute_ansi(&dir, &argv(&["--help"]), false)
+            .unwrap()
+            .stdout,
+        usage_text(false)
+    );
     assert_eq!(run(&argv(&["--help"])), ExitCode::SUCCESS);
 }
 
@@ -3656,4 +3663,73 @@ fn p13_raw_fetches_send_verbatim_string_ids() {
         seen[0].1
     );
     assert!(seen[1].1.contains("\"ids\":[\"D12\"]"), "{}", seen[1].1);
+}
+#[test]
+fn r10_patch_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "PATCH WORKFLOW\n\
+         \n\
+         patch\n\
+         \x20     patch D12345\n\
+         \x20     patch --revision revision_id\n\
+         \x20     patch --diff diff_id\n\
+         \x20     patch --patch file\n\
+         \x20     patch --arcbundle bundlefile\n\
+         \n\
+         \x20         Supports: git, svn, hg\n\
+         \x20         Apply the changes in a Differential revision, patchfile, or arc\n\
+         \x20         bundle to the working copy.\n\
+         \n\
+         \x20     --arcbundle bundlefile\n\
+         \x20         Apply changes from an arc bundle generated with 'arc export'.\n\
+         \n\
+         \x20     --diff diff_id\n\
+         \x20         Apply changes from a Differential diff. Normally you want to use\n\
+         \x20         --revision to get the most recent changes, but you can specifically\n\
+         \x20         apply an out-of-date diff or a diff which was never attached to a\n\
+         \x20         revision by using this flag.\n\
+         \n\
+         \x20     --encoding encoding\n\
+         \x20         Attempt to convert non UTF-8 patch into specified encoding.\n\
+         \n\
+         \x20     --force\n\
+         \x20         Do not run any sanity checks.\n\
+         \n\
+         \x20     --nobranch\n\
+         \x20         Normally, a new branch (git) or bookmark (hg) is created and then\n\
+         \x20         the patch is applied and committed in the new branch/bookmark. This\n\
+         \x20         flag cherry-picks the resultant commit onto the original branch and\n\
+         \x20         deletes the temporary branch.\n\
+         \n\
+         \x20     --nocommit\n\
+         \x20         Normally under git/hg, if the patch is successful, the changes are\n\
+         \x20         committed to the working copy. This flag prevents the commit.\n\
+         \n\
+         \x20     --patch patchfile\n\
+         \x20         Apply changes from a git patchfile or unified patchfile.\n\
+         \n\
+         \x20     --revision revision_id\n\
+         \x20         Apply changes from a Differential revision, using the most recent\n\
+         \x20         diff that has been attached to it. You can run 'arc patch D12345'\n\
+         \x20         as a shorthand.\n\
+         \n\
+         \x20     --skip-dependencies\n\
+         \x20         Normally, if a patch has dependencies that are not present in the\n\
+         \x20         working copy, arc tries to apply them as well. This flag prevents\n\
+         \x20         such work.\n\
+         \n\
+         \x20     --update\n\
+         \x20         Update the local working copy before applying the patch.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `execute_with_io_ansi` pushes the same text with explicit ANSI.
+    assert!(usage_text(true).contains("PATCH WORKFLOW"));
 }

@@ -198,3 +198,34 @@ fn rbd8_user_phid_prefers_cached_identity() {
     client.set_authenticated_user("alice", "PHID-USER-1");
     assert_eq!(user_phid(&client).unwrap(), "PHID-USER-1");
 }
+#[test]
+fn r10_todo_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "TODO WORKFLOW\n\
+         \n\
+         todo\n\
+         \x20     todo summary [options]\n\
+         \n\
+         \x20       Quickly create a task for yourself.\n\
+         \n\
+         \x20     --browse\n\
+         \x20         After creating the task, open it in a web browser.\n\
+         \n\
+         \x20     --cc cc, -C cc\n\
+         \x20         Other users to CC on the new task.\n\
+         \n\
+         \x20     --project project\n\
+         \x20         Projects to assign to the task.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("TODO WORKFLOW"), "{}", usage());
+}

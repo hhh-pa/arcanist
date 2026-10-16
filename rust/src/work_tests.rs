@@ -673,3 +673,47 @@ fn save_and_restore_roundtrips_branches() {
         git(tmp.path(), &["rev-parse", &detached.commit])
     );
 }
+#[test]
+fn r10_work_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "WORK WORKFLOW\n\
+         \n\
+         work [--start start] symbol\n\
+         Begin or resume work.\n\
+         \n\
+         Begin or resume work on a branch, bookmark, task, or revision.\n\
+         \n\
+         The symbol may be a branch or bookmark name, a revision name (like \"D123\"), a\n\
+         task name (like \"T123\"), or a new symbol.\n\
+         \n\
+         If you provide a symbol which currently does not identify any ongoing work,\n\
+         Arcanist will create a new branch or bookmark with the name you provide.\n\
+         \n\
+         If you provide the name of an existing branch or bookmark, Arcanist will\n\
+         switch to that branch or bookmark.\n\
+         \n\
+         If you provide the name of a revision or task, Arcanist will look for a\n\
+         related branch or bookmark that exists in the working copy. If it finds one,\n\
+         it will switch to it. If it does not find one, it will attempt to create a\n\
+         new branch or bookmark.\n\
+         \n\
+         When \"arc work\" creates a branch or bookmark, it will use --start as the\n\
+         branchpoint if it is provided. Otherwise, the current working copy state will\n\
+         serve as the starting point.\n\
+         \n\
+         \x20     --start symbol\n\
+         \x20         When creating a new branch or bookmark, use this as the branch\n\
+         \x20         point.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("WORK WORKFLOW"), "{}", usage());
+}

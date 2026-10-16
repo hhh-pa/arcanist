@@ -30,19 +30,41 @@ use arc_rs::{
 /// Subcommand name, matching `arc set-config`.
 pub const NAME: &str = "set-config";
 
-const USAGE: &str = "usage: arc set-config [--local] [--config K=V] [--config-file FILE] [--arcrc-file FILE] [--] <name> <value>\n\
-\n\
-Write an arc configuration option. Writes user configuration (~/.arcrc)\n\
-by default, or the working copy's local configuration (an arc directory\n\
-under .git, .hg, or .svn, as appropriate) with --local. An empty value\n\
-deletes the key.\n\
-\n\
-Options:\n\
-  --local         Write local (working-copy) config instead of user config.\n\
-  --config K=V    Accepted like other commands; writes ignore it.\n\
-  --config-file F Accepted like other commands; writes ignore it.\n\
-  --arcrc-file F  Write user config to F instead of ~/.arcrc.\n\
-  -h, --help      Show this help.\n";
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `arc_rs::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistSetConfigWorkflow.php:12-40`).
+const HELP_SYNOPSIS: &str = "      **set-config** [__options__] -- __name__ __value__";
+const HELP_TEXT: &str = "          Supports: cli\n          Sets an arc configuration option.\n\n          Options are either user (apply to all arc commands you invoke\n          from the current user) or local (apply only to the current working\n          copy). By default, user configuration is written. Use __--local__\n          to write local configuration.\n\n          User values are written to '~/.arcrc' on Linux and Mac OS X, and an\n          undisclosed location on Windows. Local values are written to an arc\n          directory under either .git, .hg, or .svn as appropriate.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[(
+    "local",
+    None,
+    None,
+    "Set a local config value instead of a user one.",
+)];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<arc_rs::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    arc_rs::help::usage_text(
+        NAME,
+        None,
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &specs,
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(arc_rs::terminal::ansi_enabled())
+}
 
 /// Setting type for coercion, mirroring the `ArcanistSettings` table
 /// (`string`, `bool`, `list`, `wild`, `aliases`). Unknown keys are `wild`.
@@ -442,7 +464,7 @@ pub fn run(argv: &[String]) -> ExitCode {
     let options = match parse_args(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", usage());
             return ExitCode::SUCCESS;
         }
         // T1153 CORE-49 (R4): `set-config` is a subprocess

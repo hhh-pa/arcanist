@@ -22,7 +22,55 @@ use crate::{
 /// Subcommand name, matching `arc todo`.
 pub const NAME: &str = "todo";
 
-const USAGE: &str = "usage: arc todo SUMMARY [--cc USER] [--project SLUG] [--json] [--browse] [--conduit-uri URI]\n";
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `crate::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistTodoWorkflow.php:12-50`).
+const HELP_SYNOPSIS: &str = "      **todo** __summary__ [__options__]";
+const HELP_TEXT: &str = "        Quickly create a task for yourself.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[
+    (
+        "cc",
+        Some("C"),
+        Some("cc"),
+        "Other users to CC on the new task.",
+    ),
+    (
+        "project",
+        None,
+        Some("project"),
+        "Projects to assign to the task.",
+    ),
+    (
+        "browse",
+        None,
+        None,
+        "After creating the task, open it in a web browser.",
+    ),
+];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        None,
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &specs,
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(terminal::ansi_enabled())
+}
 
 /// Parsed `todo` options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -470,7 +518,7 @@ pub fn run(argv: &[String]) -> ExitCode {
     let options = match parse_args(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", usage());
             return ExitCode::SUCCESS;
         }
         // T1153 RB-D4 (R4): `todo` is a subprocess workflow:

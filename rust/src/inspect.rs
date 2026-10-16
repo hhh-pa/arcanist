@@ -116,22 +116,37 @@ pub fn symbol_type(name: &str) -> Option<&'static SymbolType> {
     SYMBOL_TYPES.iter().find(|kind| kind.name == name)
 }
 
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `arc_rs::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistInspectWorkflow.php:10-31`).
+const HELP_EXAMPLES: &str = "**inspect** [__options__] -- __object__";
+const HELP_SYNOPSIS: &str = "Show internal object information.";
+const HELP_TEXT: &str = "Inspect internal object properties.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] =
+    &[("explore", None, None, "Load all object hardpoints.")];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<arc_rs::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    arc_rs::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &specs,
+        ansi,
+    )
+}
+
 fn usage() -> String {
-    "usage: arc inspect [--explore] [-- OBJECT...]\n\
-     \n\
-     Show internal object information.\n\
-     \n\
-     With no OBJECTs, list the inspectable object types. Otherwise each\n\
-     OBJECT has the form NAME or NAME(ARG), for example \"working-copy(HEAD)\".\n\
-     \n\
-     Options:\n\
-     \x20 --explore     Load all object hardpoints.\n\
-     \x20 -h, --help    Show this help.\n\
-     \n\
-     Not yet ported (see T1128): conduit-backed hardpoint loads\n\
-     (upstream and revision refs, symbol/user objects, remote\n\
-     repository refs).\n"
-        .to_string()
+    usage_text(arc_rs::terminal::ansi_enabled())
 }
 
 /// Parsed `inspect` options.

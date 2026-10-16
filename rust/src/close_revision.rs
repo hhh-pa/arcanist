@@ -27,6 +27,45 @@ pub const STATUS_CLOSED: i64 = 3;
 
 const USAGE: &str = "usage: arc close-revision [--finalize] [--quiet] [--json] [--force] [--conduit-uri URI] REVISION\n";
 
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not the short error-dump usage. The renderer is the shared
+/// `crate::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistCloseRevisionWorkflow.php:12-51`).
+const HELP_SYNOPSIS: &str = "      **close-revision** [__options__] __revision__";
+const HELP_TEXT: &str = "          Supports: git, hg, svn\n          Close a revision which has been committed (svn) or pushed (git, hg).\n          You should not normally need to do this: arc commit (svn), arc amend\n          (git, hg), arc land (git, hg), or repository tracking on the master\n          remote repository should do it for you. However, if these mechanisms\n          have failed for some reason you can use this command to manually\n          change a revision status from \"Accepted\" to \"Closed\".";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[
+    (
+        "finalize",
+        None,
+        None,
+        "Close only if the repository is untracked and the revision is accepted. Continue even if the close can't happen. This is a soft version of '' used by other workflows.",
+    ),
+    ("quiet", None, None, "Do not print a success message."),
+];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        None,
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &specs,
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
+}
+
 /// Parsed `close-revision` options.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
@@ -662,7 +701,7 @@ pub fn run(argv: &[String]) -> ExitCode {
     let mut options = match parse_args(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", usage());
             return ExitCode::SUCCESS;
         }
         Err(msg) => {

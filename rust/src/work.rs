@@ -34,20 +34,59 @@ pub const ABORT: &str = "User aborted the workflow.";
 /// Subcommand name, matching `arc work`.
 pub const NAME: &str = "work";
 
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `arc_rs::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistWorkWorkflow.php:11-50`).
+const HELP_EXAMPLES: &str = "**work** [--start __start__] __symbol__";
+const HELP_SYNOPSIS: &str = "Begin or resume work.";
+const HELP_TEXT: &str = "Begin or resume work on a branch, bookmark, task, or revision.\n\
+\n\
+The __symbol__ may be a branch or bookmark name, a revision name (like \"D123\"),\n\
+a task name (like \"T123\"), or a new symbol.\n\
+\n\
+If you provide a symbol which currently does not identify any ongoing work,\n\
+Arcanist will create a new branch or bookmark with the name you provide.\n\
+\n\
+If you provide the name of an existing branch or bookmark, Arcanist will switch\n\
+to that branch or bookmark.\n\
+\n\
+If you provide the name of a revision or task, Arcanist will look for a related\n\
+branch or bookmark that exists in the working copy. If it finds one, it will\n\
+switch to it. If it does not find one, it will attempt to create a new branch\n\
+or bookmark.\n\
+\n\
+When \"arc work\" creates a branch or bookmark, it will use **--start** as the\n\
+branchpoint if it is provided. Otherwise, the current working copy state will\n\
+serve as the starting point.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[(
+    "start",
+    None,
+    Some("symbol"),
+    "When creating a new branch or bookmark, use this as the branch point.",
+)];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<arc_rs::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    arc_rs::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &specs,
+        ansi,
+    )
+}
+
 fn usage() -> String {
-    "usage: arc work [--start START] SYMBOL\n\
-     \n\
-     Begin or resume work on a branch.\n\
-     \n\
-     If SYMBOL names an existing local branch, check it out. Otherwise create\n\
-     a new branch named SYMBOL from --start (or the current branch or HEAD).\n\
-     \n\
-     Options:\n\
-     \x20 --start START  Branch point for a new branch.\n\
-     \x20 -h, --help     Show this help.\n\
-     \n\
-     Not yet ported (see T1128): Mercurial bookmarks.\n"
-        .to_string()
+    usage_text(terminal::ansi_enabled())
 }
 
 /// Parsed `work` options.

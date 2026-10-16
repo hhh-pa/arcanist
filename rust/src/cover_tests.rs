@@ -893,9 +893,10 @@ fn cover_c14_arg_errors_use_php_bytes() {
 
 #[test]
 fn cover_c15_help_uses_php_wording() {
-    // T1153 COVER-C15: help uses PHP wording.
+    // T1153 COVER-C15: help uses PHP wording (T1153 R10: generated
+    // workflow help now, not the custom usage line).
     let help = super::usage();
-    assert!(help.contains("usage: arc cover [--rev revision] [path ...]"));
+    assert!(help.contains("COVER WORKFLOW"));
     assert!(help.contains("Cover your... professional reputation."));
     assert!(help.contains("Cover changes since a specific revision."));
 }
@@ -1269,4 +1270,34 @@ fn cover_c13_svn_and_hg_stay_unported() {
         execute_cover_text_ansi(svn.path(), &options(&[]), false),
         Err("Subversion working copies are not yet ported (see T1128)".to_string())
     );
+}
+#[test]
+fn r10_cover_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "COVER WORKFLOW\n\
+         \n\
+         cover\n\
+         \x20     cover [--rev revision] [path ...]\n\
+         \n\
+         \x20         Supports: svn, git, hg\n\
+         \x20         Cover your... professional reputation. Show blame for the lines you\n\
+         \x20         changed in your working copy (svn) or since some commit (hg, git).\n\
+         \x20         This will take a minute because blame takes a minute, especially\n\
+         under\n\
+         \x20         SVN.\n\
+         \n\
+         \x20     --rev revision\n\
+         \x20         Cover changes since a specific revision.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("COVER WORKFLOW"), "{}", usage());
 }

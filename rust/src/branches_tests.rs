@@ -166,10 +166,11 @@ fn formats_json_objects() {
 
 #[test]
 fn usage_covers_options() {
+    // T1153 R10: `--help` is the generated workflow help (ceb takes no
+    // arguments; `--all`/`--json`/`--conduit-uri` stay parser-accepted).
     let text = usage();
-    assert!(text.contains("usage: arc branches"));
-    assert!(text.contains("--all") && text.contains("--json"));
-    assert!(text.contains("--conduit-uri"));
+    assert!(text.contains("BRANCHES WORKFLOW"));
+    assert!(text.contains("Show an enhanced view of branches in the working copy."));
 }
 
 #[test]
@@ -202,4 +203,25 @@ fn r4_rbd4_outside_repo_is_toolset_usage_not_fatal() {
     std::fs::create_dir_all(&dir).unwrap();
     assert_eq!(run_in(&dir, &args(&[])), std::process::ExitCode::FAILURE);
     std::fs::remove_dir_all(&dir).ok();
+}
+#[test]
+fn r10_branches_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "BRANCHES WORKFLOW\n\
+         \n\
+         branches\n\
+         Show an enhanced view of branches in the working copy.\n\
+         \n\
+         Lists branches in the working copy, annotated with additional information\n\
+         about review status.\n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("BRANCHES WORKFLOW"), "{}", usage());
 }

@@ -52,19 +52,41 @@ const INIT_FILE: &str = "__phutil_library_init__.php";
 const MAP_FILE: &str = "__phutil_library_map__.php";
 const VERSION_MARKER: &str = "@phutil-library-version";
 
-/// Short `--help` text. The synopsis transcribes PHP verbatim
-/// (`ArcanistLiberateWorkflow.php:14-20` at ceb, T1153 CORE-55).
-fn usage() -> String {
-    format!(
-        "usage: arc {NAME} [--clean] [PATH]\n\
-         \n\
-         Create or update an Arcanist library. Without PATH, libraries one\n\
-         level below the current directory are updated.\n\
-         \n\
-         Options:\n\
-         \x20 --clean     perform a clean rebuild, ignoring caches (slow)\n\
-         \x20 -h, --help  show this help\n"
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `crate::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistLiberateWorkflow.php:11-34`).
+const HELP_EXAMPLES: &str = "**liberate**\n**liberate** [__path__]";
+const HELP_SYNOPSIS: &str = "Create or update an Arcanist library.";
+const HELP_TEXT: &str = "Create or update an Arcanist library.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[(
+    "clean",
+    None,
+    None,
+    "Perform a clean rebuild, ignoring caches. Thorough, but slow.",
+)];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &specs,
+        ansi,
     )
+}
+
+fn usage() -> String {
+    usage_text(terminal::ansi_enabled())
 }
 
 #[derive(Debug, PartialEq, Eq)]

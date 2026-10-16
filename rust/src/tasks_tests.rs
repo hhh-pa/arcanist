@@ -280,3 +280,42 @@ fn rbd8_user_phid_prefers_cached_identity() {
     client.set_authenticated_user("alice", "PHID-USER-1");
     assert_eq!(user_phid(&client).unwrap(), "PHID-USER-1");
 }
+#[test]
+fn r10_tasks_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "TASKS WORKFLOW\n\
+         \n\
+         tasks\n\
+         \x20     tasks [options]\n\
+         \n\
+         \x20       View all assigned tasks.\n\
+         \n\
+         \x20     --limit n\n\
+         \x20         Limit the amount of tasks outputted, default is all.\n\
+         \n\
+         \x20     --order task_order\n\
+         \x20         Arrange tasks based on priority, created, or modified, default is\n\
+         \x20         priority.\n\
+         \n\
+         \x20     --owner username\n\
+         \x20         Only show tasks assigned to the given username, also accepts @all\n\
+         \x20         to show all, default is you.\n\
+         \n\
+         \x20     --status task_status\n\
+         \x20         Show tasks that are open or closed, default is open.\n\
+         \n\
+         \x20     --unassigned\n\
+         \x20         Only show tasks that are not assigned (upforgrabs).\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("TASKS WORKFLOW"), "{}", usage());
+}

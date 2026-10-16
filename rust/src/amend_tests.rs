@@ -104,10 +104,12 @@ fn normalizes_messages() {
 
 #[test]
 fn usage_covers_options_and_limits() {
+    // T1153 R10: `--help` is the generated workflow help, not the old
+    // custom usage (options stay parser-accepted, limits come from ceb).
     let text = usage();
-    assert!(text.contains("usage: arc amend"));
+    assert!(text.contains("AMEND WORKFLOW"));
     assert!(text.contains("--revision") && text.contains("--show"));
-    assert!(text.contains("history.immutable"));
+    assert!(text.contains("Mercurial 2.2 and newer"));
 }
 
 fn revision(id: &str, title: &str) -> close_revision::Revision {
@@ -346,4 +348,36 @@ fn announce_text_modes() {
         announce_text(&rev, true),
         "Amending commit message to reflect revision:\n\n\x1b[46m\x1b[1m  *  \x1b[m\x1b[49m \x1b[1mD123\x1b[m Fix it\n\n"
     );
+}
+#[test]
+fn r10_amend_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "AMEND WORKFLOW\n\
+         \n\
+         amend [options] -- \n\
+         Amend the working copy, synchronizing the local commit message.\n\
+         \n\
+         Amend the working copy, synchronizing the local commit message from\n\
+         Differential.\n\
+         \n\
+         Supported in Mercurial 2.2 and newer.\n\
+         \n\
+         \x20     --revision id\n\
+         \x20         Use the message from a specific revision. If you do not specify a\n\
+         \x20         revision, arc will guess which revision is in the working copy.\n\
+         \n\
+         \x20     --show\n\
+         \x20         Show the amended commit message, without modifying the working copy.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("AMEND WORKFLOW"), "{}", usage());
 }

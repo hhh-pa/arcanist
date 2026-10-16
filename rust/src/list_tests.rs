@@ -269,3 +269,24 @@ fn rbd8_user_phid_prefers_cached_identity() {
     client.set_authenticated_user("alice", "PHID-USER-1");
     assert_eq!(user_phid(&client).unwrap(), "PHID-USER-1");
 }
+#[test]
+fn r10_list_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "LIST WORKFLOW\n\
+         \n\
+         list\n\
+         \x20     list\n\
+         \n\
+         \x20         Supports: git, svn, hg\n\
+         \x20         List your open Differential revisions.\n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("LIST WORKFLOW"), "{}", usage());
+}

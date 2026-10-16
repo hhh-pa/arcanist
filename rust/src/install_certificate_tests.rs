@@ -692,3 +692,36 @@ fn core41_open_arcrc_fails_when_piped() {
     assert!(err.contains("not a TTY"), "{err}");
     assert_eq!(arcrc_mode(&path), 0o644);
 }
+#[test]
+fn r10_install_certificate_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "INSTALL-CERTIFICATE WORKFLOW\n\
+         \n\
+         install-certificate\n\
+         \x20     install-certificate [uri]\n\
+         \n\
+         \x20         Supports: http, https\n\
+         \x20         Installs Conduit credentials into your ~/.arcrc for the given\n\
+         install\n\
+         \x20         of Phabricator. You need to do this before you can use 'arc', as it\n\
+         \x20         enables 'arc' to link your command-line activity with your account\n\
+         on\n\
+         \x20         the web. Run this command from within a project directory to\n\
+         install\n\
+         \x20         that project's certificate, or specify an explicit URI (like\n\
+         \x20         \"https://phabricator.example.com/\").\n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(
+        usage().contains("INSTALL-CERTIFICATE WORKFLOW"),
+        "{}",
+        usage()
+    );
+}

@@ -36,20 +36,93 @@ pub const TOOLSET: &str = "arc";
 /// Maximum alias-chain depth, mirroring `ArcanistAliasEngine`.
 const STACK_LIMIT: usize = 16;
 
-const USAGE: &str = "usage: arc alias [--json]\n\
-       arc alias <name>\n\
-       arc alias <name> <target> -- [arguments]\n\
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `crate::help` module; this file keeps only the data (ceb
+/// `src/toolset/workflow/ArcanistAliasWorkflow.php:17-71`).
+const HELP_EXAMPLES: &str = "**alias**\n**alias** __command__ __target__ -- [__arguments__]";
+const HELP_SYNOPSIS: &str = "Create and modify command aliases.";
+const HELP_TEXT: &str = "Create an alias from __command__ to __target__ (optionally, with __options__).\n\
 \n\
-Create and modify command aliases.\n\
+Aliases allow you to create shorthands for commands and sets of flags you\n\
+commonly use, like defining \"arc draft\" as a shorthand for \"arc diff --draft\".\n\
 \n\
-With no arguments, list aliases. With one argument, delete that alias\n\
-(after confirmation). With two or more, define <name> as a shorthand\n\
-for <target> with [arguments]; use \"--\" before any flags meant for\n\
-the target. A target starting with \"!\" runs as a shell command.\n\
+**Creating Aliases**\n\
 \n\
-Options:\n\
-  --json            Output aliases in JSON format (listing only).\n\
-  -h, --help        Show this help.\n";
+You can define \"arc draft\" as a shorthand for \"arc diff --draft\" like this:\n\
+\n\
+\x20 $ arc alias draft diff -- --draft\n\
+\n\
+Now, when you run \"arc draft\", the command will function like\n\
+\"arc diff --draft\".\n\
+\n\
+<bg:yellow> NOTE: </bg> Make sure you use \"--\" before specifying any flags you\n\
+want to pass to the command! Otherwise, the flags will be interpreted as flags\n\
+to \"arc alias\".\n\
+\n\
+**Listing Aliases**\n\
+\n\
+Without any arguments, \"arc alias\" will list aliases.\n\
+\n\
+**Removing Aliases**\n\
+\n\
+To remove an alias, run:\n\
+\n\
+\x20 $ arc alias <alias-name>\n\
+\n\
+You will be prompted to remove the alias.\n\
+\n\
+**Shell Commands**\n\
+\n\
+If you begin an alias with \"!\", the remainder of the alias will be invoked as\n\
+a shell command. For example, if you want to implement \"arc ls\", you can do so\n\
+like this:\n\
+\n\
+\x20 $ arc alias ls '!ls'\n\
+\n\
+When run, \"arc ls\" will now behave like \"ls\".\n\
+\n\
+**Multiple Toolsets**\n\
+\n\
+This workflow supports any toolset, even though the examples in this help text\n\
+use \"arc\". If you are working with another toolset, use the binary for that\n\
+toolset define aliases for it:\n\
+\n\
+\x20 $ phage alias ...\n\
+\n\
+Aliases are bound to the toolset which was used to define them. If you define\n\
+an \"arc draft\" alias, that does not also define a \"phage draft\" alias.\n\
+\n\
+**Builtins**\n\
+\n\
+You can not overwrite the behavior of builtin workflows, including \"alias\"\n\
+itself, and if you install a new workflow it will take precedence over any\n\
+existing aliases with the same name.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] =
+    &[("json", None, None, "Output aliases in JSON format.")];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &specs,
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
+}
 
 /// Every command `main` dispatches without aliases: the `COMMANDS` table
 /// plus `call-conduit` (parsed by `classify`) and `help` (also handled by
@@ -1017,7 +1090,7 @@ pub fn run(argv: &[String]) -> ExitCode {
     let options = match parse_args(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", usage());
             return ExitCode::SUCCESS;
         }
         Err(message) => {

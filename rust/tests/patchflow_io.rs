@@ -158,10 +158,11 @@ fn help_succeeds_for_all_commands() {
             .unwrap()
             .contains("DOWNLOAD WORKFLOW")
     );
+    // T1153 R10: `--help` renders the generated workflow help.
     assert!(
         liberate::execute(fx.path(), &argv(&["--help"]))
             .unwrap()
-            .contains("usage: arc liberate")
+            .contains("LIBERATE WORKFLOW")
     );
 }
 

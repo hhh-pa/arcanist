@@ -501,3 +501,28 @@ fn r4_rbd4_spec_errors_are_toolset_usage() {
         std::process::ExitCode::FAILURE
     );
 }
+#[test]
+fn r10_inspect_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "INSPECT WORKFLOW\n\
+         \n\
+         inspect [options] -- object\n\
+         Show internal object information.\n\
+         \n\
+         Inspect internal object properties.\n\
+         \n\
+         \x20     --explore\n\
+         \x20         Load all object hardpoints.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("INSPECT WORKFLOW"), "{}", usage());
+}

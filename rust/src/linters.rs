@@ -36,22 +36,48 @@ pub const NAME: &str = "linters";
 /// Status-line indent (`$pad`, `:61`).
 const PAD: &str = "    ";
 
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `crate::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistLintersWorkflow.php:12-44`).
+const HELP_SYNOPSIS: &str = "      **linters** [__options__] [__name__]";
+const HELP_TEXT: &str = "          Supports: cli\n          List the available and configured linters, with information about\n          what they do and which versions are installed.\n\n          if __name__ is provided, the linter with that name will be displayed.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[
+    (
+        "verbose",
+        None,
+        None,
+        "Show detailed information, including options.",
+    ),
+    (
+        "search",
+        None,
+        Some("search"),
+        "Search for linters. Search is case-insensitive, and is performed against name and description of each linter.",
+    ),
+];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        None,
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &specs,
+        ansi,
+    )
+}
+
 fn usage() -> String {
-    "usage: arc linters [options] [name]\n\
-     \n\
-     Supports: cli\n\
-     List the available and configured linters, with information about\n\
-     what they do and which versions are installed.\n\
-     \n\
-     if name is provided, the linter with that name will be displayed.\n\
-     \n\
-     Options:\n\
-     \x20 --verbose           Show detailed information, including options.\n\
-     \x20 --search TERM       Search for linters. Search is case-insensitive,\n\
-     \x20                     and is performed against name and description of\n\
-     \x20                     each linter. May be repeated.\n\
-     \x20 -h, --help          Show this help.\n"
-        .to_string()
+    usage_text(crate::terminal::ansi_enabled())
 }
 
 /// One registered linter: display name plus a one-line summary. Kept

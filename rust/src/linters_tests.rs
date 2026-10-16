@@ -706,9 +706,10 @@ fn linters_l23_single_engine_reports_unknown_linter() {
 
 #[test]
 fn linters_l25_help_uses_php_wording() {
-    // T1153 LINTERS-L25: help uses PHP wording.
+    // T1153 LINTERS-L25: help uses PHP wording (T1153 R10: generated
+    // workflow help now, not the custom usage line).
     let help = super::usage();
-    assert!(help.contains("usage: arc linters [options] [name]"));
+    assert!(help.contains("LINTERS WORKFLOW"));
     assert!(help.contains("List the available and configured linters"));
     assert!(help.contains("Show detailed information, including options."));
 }
@@ -769,4 +770,37 @@ fn linters_l28_brief_mode_shows_probe_errors() {
     });
     let rendered = render_entries(&[&error], false);
     assert!(rendered.contains("\n    ArcanistMissingLinterException\n    boom\n"));
+}
+#[test]
+fn r10_linters_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "LINTERS WORKFLOW\n\
+         \n\
+         linters\n\
+         \x20     linters [options] [name]\n\
+         \n\
+         \x20         Supports: cli\n\
+         \x20         List the available and configured linters, with information about\n\
+         \x20         what they do and which versions are installed.\n\
+         \n\
+         \x20         if name is provided, the linter with that name will be displayed.\n\
+         \n\
+         \x20     --search search\n\
+         \x20         Search for linters. Search is case-insensitive, and is performed\n\
+         \x20         against name and description of each linter.\n\
+         \n\
+         \x20     --verbose\n\
+         \x20         Show detailed information, including options.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("LINTERS WORKFLOW"), "{}", usage());
 }

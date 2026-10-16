@@ -17,19 +17,30 @@ use crate::{config, git, grid, hg, markers};
 
 pub const NAME: &str = "bookmarks";
 
-fn usage() -> String {
-    format!(
-        "usage: arc {NAME} [--json] [--conduit-uri URI]\n\
-         \n\
-         Show an enhanced view of bookmarks in the working copy.\n\
-         Bookmarks are a Mercurial concept; under git this command fails,\n\
-         matching `arc bookmarks`.\n\
-         \n\
-         Options:\n\
-         \x20 --json             emit a JSON array of bookmark objects\n\
-         \x20 --conduit-uri URI  conduit server (or ARC_CONDUIT_URI)\n\
-         \x20 -h, --help         show this help\n"
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `crate::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistBookmarksWorkflow.php:16-30`).
+const HELP_EXAMPLES: &str = "**bookmarks**";
+const HELP_SYNOPSIS: &str = "Show an enhanced view of bookmarks in the working copy.";
+const HELP_TEXT: &str = "Lists bookmarks in the working copy, annotated with additional information\nabout review status.";
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &[],
+        ansi,
     )
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
 }
 
 /// One Mercurial bookmark (the `--json` shape).

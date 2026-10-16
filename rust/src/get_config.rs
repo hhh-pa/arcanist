@@ -61,6 +61,42 @@ Options:\n\
   --arcrc-file F  Read user config from F instead of ~/.arcrc.\n\
   -h, --help      Show this help.\n";
 
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not the short error-dump usage. The renderer is the shared
+/// `arc_rs::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistGetConfigWorkflow.php:12-36`).
+const HELP_SYNOPSIS: &str = "      **get-config** [__options__] -- [__name__ ...]";
+const HELP_TEXT: &str = "          Supports: cli\n          Reads an arc configuration option. With no argument, reads all\n          options.\n\n          With __--verbose__, shows detailed information about one or more\n          options.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[(
+    "verbose",
+    None,
+    None,
+    "Show detailed information about options.",
+)];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<arc_rs::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    arc_rs::help::usage_text(
+        NAME,
+        None,
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &specs,
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(arc_rs::terminal::ansi_enabled())
+}
+
 /// Source name for `--config` runtime values in merged reads.
 pub const SOURCE_RUNTIME: &str = "runtime";
 
@@ -954,7 +990,7 @@ pub fn run(argv: &[String]) -> ExitCode {
     let options = match parse_args(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", usage());
             return ExitCode::SUCCESS;
         }
         Err(message) => {

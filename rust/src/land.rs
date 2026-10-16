@@ -114,7 +114,218 @@ use crate::terminal::{self, TVal};
 /// Subcommand name, matching `arc land`.
 pub const NAME: &str = "land";
 
-const USAGE: &str = "usage: arc land [--hold] [--keep-branches] [--onto-remote REMOTE] [--onto BRANCH] [--strategy NAME] [--revision REV] [--preview] [--into REF] [--into-remote REMOTE] [--into-local] [--into-empty] [--incremental] [--pick] [--conduit-uri URI] [--config K=V] [--config-file FILE] [--arcrc-file FILE] [-- ref ...]\n";
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `crate::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistLandWorkflow.php:13-129,131-229`).
+const HELP_EXAMPLES: &str = "**land** [__options__] -- [__ref__ ...]";
+const HELP_SYNOPSIS: &str = "Publish reviewed changes.";
+const HELP_TEXT: &str = "Supports: git, git/p4, git/svn, hg\n\
+\n\
+Publish accepted revisions after review. This command is the last step in the\n\
+standard Differential code review workflow.\n\
+\n\
+To publish changes in local branch or bookmark \"feature1\", you will usually\n\
+run this command:\n\
+\n\
+\x20 **$ arc land feature1**\n\
+\n\
+This workflow merges and pushes changes associated with revisions that are\n\
+ancestors of __ref__. Without __ref__, the current working copy state will be\n\
+used. You can specify multiple __ref__ arguments to publish multiple changes at\n\
+once.\n\
+\n\
+A __ref__ can be any symbol which identifies a commit: a branch name, a tag\n\
+name, a bookmark name, a topic name, a raw commit hash, a symbolic reference,\n\
+etc.\n\
+\n\
+When you provide a __ref__, all unpublished changes which are present in\n\
+ancestors of that __ref__ will be selected for publishing. (With the\n\
+**--pick** flag, only the unpublished changes you directly reference will be\n\
+selected.)\n\
+\n\
+For example, if you provide local branch \"feature3\" as a __ref__ argument, that\n\
+may also select the changes in \"feature1\" and \"feature2\" (if they are ancestors\n\
+of \"feature3\"). If you stack changes in a single local branch, all commits in\n\
+the stack may be selected.\n\
+\n\
+The workflow merges unpublished changes reachable from __ref__ \"into\" some\n\
+intermediate branch, then pushes the combined state \"onto\" some destination\n\
+branch (or list of branches).\n\
+\n\
+(In Mercurial, the \"into\" and \"onto\" branches may be bookmarks instead.)\n\
+\n\
+In the most common case, there is only one \"onto\" branch (often \"master\" or\n\
+\"default\" or some similar branch) and the \"into\" branch is the same branch. For\n\
+example, it is common to merge local feature branch \"feature1\" into\n\
+\"origin/master\", then push it onto \"origin/master\".\n\
+\n\
+The list of \"onto\" branches is selected by examining these sources in order:\n\
+\n\
+\x20 - the **--onto** flags;\n\
+\x20 - the __arc.land.onto__ configuration setting;\n\
+\x20 - (in Git) the upstream of the branch targeted by the land operation,\n\
+\x20 \x20 recursively;\n\
+\x20 - or by falling back to a standard default:\n\
+\x20 \x20 - (in Git) \"master\";\n\
+\x20 \x20 - (in Mercurial) \"default\".\n\
+\n\
+The remote to push \"onto\" is selected by examining these sources in order:\n\
+\n\
+\x20 - the **--onto-remote** flag;\n\
+\x20 - the __arc.land.onto-remote__ configuration setting;\n\
+\x20 - (in Git) the upstream of the current branch, recursively;\n\
+\x20 - (in Git) the special \"p4\" remote which indicates a repository has\n\
+\x20 \x20 been synchronized with Perforce;\n\
+\x20 - or by falling back to a standard default:\n\
+\x20 \x20 - (in Git) \"origin\";\n\
+\x20 \x20 - (in Mercurial) \"default\".\n\
+\n\
+The branch to merge \"into\" is selected by examining these sources in order:\n\
+\n\
+\x20 - the **--into** flag;\n\
+\x20 - the **--into-empty** flag;\n\
+\x20 - or by falling back to the first \"onto\" branch.\n\
+\n\
+The remote to merge \"into\" is selected by examining these sources in order:\n\
+\n\
+\x20 - the **--into-remote** flag;\n\
+\x20 - the **--into-local** flag (which disables fetching before merging);\n\
+\x20 - or by falling back to the \"onto\" remote.\n\
+\n\
+After selecting remotes and branches, the commits which will land are printed.\n\
+\n\
+With **--preview**, execution stops here, before the change is merged.\n\
+\n\
+The \"into\" branch is fetched from the \"into\" remote (unless **--into-local** or\n\
+**--into-empty** are specified) and the changes are merged into the state in\n\
+the \"into\" branch according to the selected merge strategy.\n\
+\n\
+The default merge strategy is \"squash\", which produces a single commit from\n\
+all local commits for each change. A different strategy can be selected with\n\
+the **--strategy** flag.\n\
+\n\
+The resulting merged change will be given an up-to-date commit message\n\
+describing the final state of the revision in Differential.\n\
+\n\
+With **--hold**, execution stops here, before the change is pushed.\n\
+\n\
+The change is pushed onto all of the \"onto\" branches in the \"onto\" remote.\n\
+\n\
+If you are landing multiple changes, they are normally all merged locally and\n\
+then all pushed in a single operation. Instead, you can merge and push them one\n\
+at a time with **--incremental**.\n\
+\n\
+Under merge strategies which mutate history (including the default \"squash\"\n\
+strategy), local refs which descend from commits that were published are\n\
+now updated. For example, if you land \"feature4\", local branches \"feature5\" and\n\
+\"feature6\" may now be rebased on the published version of the change.\n\
+\n\
+Once everything has been pushed, cleanup occurs. Consulting mystical sources of\n\
+power, the workflow makes a guess about what state you wanted to end up in\n\
+after the process finishes. The working copy is put into that state.\n\
+\n\
+Any obsolete refs that point at commits which were published are deleted,\n\
+unless the **--keep-branches** flag is passed.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[
+    (
+        "hold",
+        None,
+        None,
+        "Prepare the changes to be pushed, but do not actually push them.",
+    ),
+    (
+        "keep-branches",
+        None,
+        None,
+        "Keep local branches around after changes are pushed. By default, local branches are deleted after the changes they contain are published.",
+    ),
+    (
+        "onto-remote",
+        None,
+        Some("remote-name"),
+        "Push to a remote other than the default.\n\nRelated configuration: **arc.land.onto-remote**",
+    ),
+    (
+        "onto",
+        None,
+        Some("branch-name"),
+        "After merging, push changes onto a specified branch.\n\nSpecifying this flag multiple times will push to multiple branches.\n\nRelated configuration: **arc.land.onto**",
+    ),
+    (
+        "strategy",
+        None,
+        Some("strategy-name"),
+        "Merge using a particular strategy. Supported strategies are \"squash\" and \"merge\".\n\nThe \"squash\" strategy collapses multiple local commits into a single commit when publishing. It produces a linear published history (but discards local checkpoint commits). This is the default strategy.\n\nThe \"merge\" strategy generates a merge commit when publishing that retains local checkpoint commits (but produces a nonlinear published history). Select this strategy if you do not want \"arc land\" to discard checkpoint commits.\n\nRelated configuration: **arc.land.strategy**",
+    ),
+    (
+        "revision",
+        None,
+        Some("revision-identifier"),
+        "Land a specific revision, rather than determining revisions automatically from the commits that are landing.",
+    ),
+    (
+        "preview",
+        None,
+        None,
+        "Show the changes that will land. Does not modify the working copy or the remote.",
+    ),
+    (
+        "into",
+        None,
+        Some("commit-ref"),
+        "Specify the state to merge into. By default, this is the same as the \"onto\" ref.",
+    ),
+    (
+        "into-remote",
+        None,
+        Some("remote-name"),
+        "Specifies the remote to fetch the \"into\" ref from. By default, this is the same as the \"onto\" remote.",
+    ),
+    (
+        "into-local",
+        None,
+        None,
+        "Use the local \"into\" ref state instead of fetching it from a remote.",
+    ),
+    (
+        "into-empty",
+        None,
+        None,
+        "Merge into the empty state instead of an existing state. This mode is primarily useful when creating a new repository, and selected automatically if the \"onto\" ref does not exist and the \"into\" state is not specified.",
+    ),
+    (
+        "incremental",
+        None,
+        None,
+        "When landing multiple revisions at once, push and rebase after each merge completes instead of waiting until all merges are completed to push.\n\nThis is slower than the default behavior and not atomic, but may make it easier to resolve conflicts and land complicated changes by allowing you to make progress one step at a time.",
+    ),
+    (
+        "pick",
+        None,
+        None,
+        "Land only the changes directly named by arguments, instead of all reachable ancestors.",
+    ),
+];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &specs,
+        ansi,
+    )
+}
 
 /// `user.whoami` Conduit method; the result's `phid` is the viewer PHID
 /// (`src/workflow/ArcanistWorkflow.php:489-494`).
@@ -8350,7 +8561,7 @@ pub fn execute_with_io_classified(
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
-            io.push_out(USAGE);
+            io.push_out(&usage_text(io.ansi));
             return Ok(std::mem::take(&mut io.out));
         }
         Err(message) => return Err(ClassifiedError::toolset_usage(message)),

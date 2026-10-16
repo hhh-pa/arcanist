@@ -49,27 +49,52 @@ pub const PROMPT_AUTHOR: &str = "arc.amend.author";
 /// Prompt confirming history mutation (`:55-59`).
 pub const PROMPT_IMMUTABLE: &str = "arc.amend.immutable";
 
-fn usage() -> String {
-    format!(
-        "usage: arc {NAME} [(-m MESSAGE | --revision ID)] [--show]\n\
-         \n\
-         Amend the HEAD commit message. The message comes from -m/--message\n\
-         (repeatable, joined with a blank line), or from Differential via\n\
-         --revision. With neither, the revision is guessed from the working\n\
-         copy. Staged changes are refused; unstaged and untracked changes\n\
-         are left alone.\n\
-         \n\
-         Options:\n\
-         \x20 -m, --message MSG   new commit message (repeatable)\n\
-         \x20 --revision ID       fetch the message from Differential (D123 or 123)\n\
-         \x20 --conduit-uri URI   Conduit URI (else ARC_CONDUIT_URI or .arcconfig)\n\
-         \x20 --show              print the message without amending\n\
-         \x20 -h, --help          show this help\n\
-         \n\
-         Revisions you do not own, revisions unrelated to the working copy,\n\
-         and immutable histories (history.immutable) prompt before anything\n\
-         is mutated.\n"
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `crate::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistAmendWorkflow.php:10-43`).
+const HELP_EXAMPLES: &str = "**amend** [options] -- ";
+const HELP_SYNOPSIS: &str = "Amend the working copy, synchronizing the local commit message.";
+const HELP_TEXT: &str = "Amend the working copy, synchronizing the local commit message from\n\
+Differential.\n\
+\n\
+Supported in Mercurial 2.2 and newer.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[
+    (
+        "show",
+        None,
+        None,
+        "Show the amended commit message, without modifying the working copy.",
+    ),
+    (
+        "revision",
+        None,
+        Some("id"),
+        "Use the message from a specific revision. If you do not specify a revision, arc will guess which revision is in the working copy.",
+    ),
+];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &specs,
+        ansi,
     )
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
 }
 
 /// Parsed `amend` options.

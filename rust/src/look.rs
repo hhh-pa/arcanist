@@ -23,7 +23,31 @@ use crate::{
 /// Subcommand name, matching `arc look`.
 pub const NAME: &str = "look";
 
-const USAGE: &str = "usage: arc look [-- THING...]\n";
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `crate::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistLookWorkflow.php:11-30`).
+const HELP_EXAMPLES: &str = "**look**\n**look** [options] -- __thing__";
+const HELP_SYNOPSIS: &str = "You stand in the middle of a small clearing.";
+const HELP_TEXT: &str = "Look around, or look at a specific __thing__.";
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &[],
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(terminal::ansi_enabled())
+}
 
 /// `pht('Arcventure')`, the `%!` banner title.
 pub const TITLE: &str = "Arcventure";
@@ -1491,7 +1515,7 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
     let thing = match parse_args(argv) {
         Ok(Some(thing)) => thing,
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", usage());
             return ExitCode::SUCCESS;
         }
         Err(msg) => {

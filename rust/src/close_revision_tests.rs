@@ -322,3 +322,42 @@ fn land22_user_phid_reuses_handshake_identity() {
     client.set_authenticated_user("alice", "PHID-USER-1");
     assert_eq!(user_phid(&client).unwrap(), "PHID-USER-1");
 }
+#[test]
+fn r10_close_revision_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "CLOSE-REVISION WORKFLOW\n\
+         \n\
+         close-revision\n\
+         \x20     close-revision [options] revision\n\
+         \n\
+         \x20         Supports: git, hg, svn\n\
+         \x20         Close a revision which has been committed (svn) or pushed (git,\n\
+         hg).\n\
+         \x20         You should not normally need to do this: arc commit (svn), arc\n\
+         amend\n\
+         \x20         (git, hg), arc land (git, hg), or repository tracking on the master\n\
+         \x20         remote repository should do it for you. However, if these\n\
+         mechanisms\n\
+         \x20         have failed for some reason you can use this command to manually\n\
+         \x20         change a revision status from \"Accepted\" to \"Closed\".\n\
+         \n\
+         \x20     --finalize\n\
+         \x20         Close only if the repository is untracked and the revision is\n\
+         \x20         accepted. Continue even if the close can't happen. This is a soft\n\
+         \x20         version of '' used by other workflows.\n\
+         \n\
+         \x20     --quiet\n\
+         \x20         Do not print a success message.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("CLOSE-REVISION WORKFLOW"), "{}", usage());
+}

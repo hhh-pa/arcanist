@@ -174,7 +174,8 @@ fn run_uses_current_dir() {
 fn help_succeeds_and_prints_usage() {
     let repo = Fixture::init_repo("help");
     let out = branches::execute(repo.path(), &args(&["--help"])).unwrap();
-    assert!(out.contains("usage: arc branches"), "unexpected: {out}");
+    // T1153 R10: `--help` renders the generated workflow help.
+    assert!(out.contains("BRANCHES WORKFLOW"), "unexpected: {out}");
     assert_eq!(
         branches::run_in(repo.path(), &args(&["--help"])),
         ExitCode::SUCCESS

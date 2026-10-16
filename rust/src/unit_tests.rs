@@ -2919,3 +2919,62 @@ fn d22_cargo_aggregate_results_convert_to_engine_dicts() {
     assert_eq!(json[0]["name"], serde_json::json!("cargo"));
     assert_eq!(json[0]["result"], serde_json::json!("pass"));
 }
+#[test]
+fn r10_unit_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "UNIT WORKFLOW\n\
+         \n\
+         unit\n\
+         \x20     unit [options] [paths]\n\
+         \x20     unit [options] --rev [rev]\n\
+         \n\
+         \x20         Supports: git, svn, hg\n\
+         \x20         Run unit tests that cover specified paths. If no paths are\n\
+         specified,\n\
+         \x20         unit tests covering all modified files will be run.\n\
+         \n\
+         \x20     --coverage\n\
+         \x20         Always enable coverage information.\n\
+         \n\
+         \x20     --detailed-coverage\n\
+         \x20         Show a detailed coverage report on the CLI. Implies --coverage.\n\
+         \n\
+         \x20     --engine classname\n\
+         \x20         Override configured unit engine for this project.\n\
+         \n\
+         \x20     --everything\n\
+         \x20         Run every test associated with a tracked file in the working copy.\n\
+         \n\
+         \x20     --json\n\
+         \x20         Report results in JSON format.\n\
+         \n\
+         \x20     --no-coverage\n\
+         \x20         Always disable coverage information.\n\
+         \n\
+         \x20     --output format\n\
+         \x20         With 'full', show full pretty report (Default). With 'json', report\n\
+         \x20         results in JSON format. With 'ugly', use uglier (but more\n\
+         \x20         efficient) JSON formatting. With 'none', don't print results.\n\
+         \n\
+         \x20     --rev revision\n\
+         \x20         Run unit tests covering changes since a specific revision.\n\
+         \n\
+         \x20     --target phid\n\
+         \x20         (PROTOTYPE) Record a copy of the test results on the specified\n\
+         \x20         Harbormaster build target.\n\
+         \n\
+         \x20     --ugly\n\
+         \x20         With --json, use uglier (but more efficient) formatting.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("UNIT WORKFLOW"), "{}", usage());
+}

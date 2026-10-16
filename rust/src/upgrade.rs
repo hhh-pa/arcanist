@@ -49,6 +49,32 @@ Options:\n\
   --yes           Skip the upgrade prompt (scripting).\n\
   -h, --help      Show this help.\n";
 
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not the short usage line (which stays for error dumps). The
+/// renderer is the shared `arc_rs::help` module; this file keeps only
+/// the data (ceb `src/workflow/ArcanistUpgradeWorkflow.php:11-27`).
+const HELP_EXAMPLES: &str = "**upgrade**";
+const HELP_SYNOPSIS: &str = "Upgrade Arcanist to the latest version.";
+const HELP_TEXT: &str = "Upgrade Arcanist to the latest version.";
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    arc_rs::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &[],
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(terminal::ansi_enabled())
+}
+
 /// The running version, from `Cargo.toml`.
 #[must_use]
 pub fn version() -> &'static str {
@@ -1500,7 +1526,7 @@ fn run_apply_command(cwd: &Path, options: &Options) -> ExitCode {
 pub fn run(argv: &[String]) -> ExitCode {
     let options = match parse_args(argv) {
         Parsed::Help => {
-            print!("{USAGE}");
+            print!("{}", usage());
             return ExitCode::SUCCESS;
         }
         Parsed::Error(message) => {

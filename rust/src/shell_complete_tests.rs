@@ -198,3 +198,81 @@ fn core66_install_needs_home_and_shell() {
         .is_err()
     );
 }
+#[test]
+fn r10_shell_complete_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "SHELL-COMPLETE WORKFLOW\n\
+         \n\
+         shell-complete\n\
+         Install shell completion.\n\
+         \n\
+         Install shell completion so you can use the \"tab\" key to autocomplete\n\
+         commands and flags in your shell for Arcanist toolsets and workflows.\n\
+         \n\
+         The bash shell is supported.\n\
+         \n\
+         Installing Completion\n\
+         \n\
+         To install shell completion, run the command:\n\
+         \n\
+         \x20 $ arc shell-complete\n\
+         \n\
+         This will install shell completion into your current shell. After installing,\n\
+         you may need to start a new shell (or open a new terminal window) to pick up\n\
+         the updated configuration.\n\
+         \n\
+         Once installed, completion should work across all Arcanist toolsets.\n\
+         \n\
+         Using Completion\n\
+         \n\
+         After completion is installed, use the \"tab\" key to automatically complete\n\
+         workflows and flags. For example, if you type:\n\
+         \n\
+         \x20 $ arc diff --draf<tab>\n\
+         \n\
+         ...your shell should automatically expand the flag to:\n\
+         \n\
+         \x20 $ arc diff --draft\n\
+         \n\
+         Updating Completion\n\
+         \n\
+         To update shell completion, run the same command:\n\
+         \n\
+         \x20 $ arc shell-complete\n\
+         \n\
+         You can update shell completion without reinstalling it by running:\n\
+         \n\
+         \x20 $ arc shell-complete --generate\n\
+         \n\
+         You may need to update shell completion if:\n\
+         \n\
+         \x20 - you install new Arcanist toolsets; or\n\
+         \x20 - you move the Arcanist directory; or\n\
+         \x20 - you upgrade Arcanist and the new version fixes shell completion bugs.\n\
+         \n\
+         \x20     --current cursor-position\n\
+         \x20         Internal. Current term in the argument list being completed.\n\
+         \n\
+         \x20     --generate\n\
+         \x20         Regenerate shell completion rules, without installing any\n\
+         \x20         configuration.\n\
+         \n\
+         \x20     --shell shell-name\n\
+         \x20         Install completion support for a particular shell.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    assert!(wants_help(&["--help".to_string()]));
+    assert!(!wants_help(&["--".to_string(), "--help".to_string()]));
+    assert_eq!(
+        run(&["--help".to_string()]),
+        std::process::ExitCode::SUCCESS
+    );
+}

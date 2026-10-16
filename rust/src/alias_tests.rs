@@ -952,3 +952,85 @@ fn core28_user_aliases_prefer_config_section_on_collision() {
         vec!["diff".to_string(), "--section".to_string()]
     );
 }
+#[test]
+fn r10_alias_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "ALIAS WORKFLOW\n\
+         \n\
+         alias\n\
+         alias command target -- [arguments]\n\
+         Create and modify command aliases.\n\
+         \n\
+         Create an alias from command to target (optionally, with options).\n\
+         \n\
+         Aliases allow you to create shorthands for commands and sets of flags you\n\
+         commonly use, like defining \"arc draft\" as a shorthand for \"arc diff\n\
+         --draft\".\n\
+         \n\
+         Creating Aliases\n\
+         \n\
+         You can define \"arc draft\" as a shorthand for \"arc diff --draft\" like this:\n\
+         \n\
+         \x20 $ arc alias draft diff -- --draft\n\
+         \n\
+         Now, when you run \"arc draft\", the command will function like \"arc diff\n\
+         --draft\".\n\
+         \n\
+         \x20NOTE:  Make sure you use \"--\" before specifying any flags you want to pass\n\
+         to the command! Otherwise, the flags will be interpreted as flags to \"arc\n\
+         alias\".\n\
+         \n\
+         Listing Aliases\n\
+         \n\
+         Without any arguments, \"arc alias\" will list aliases.\n\
+         \n\
+         Removing Aliases\n\
+         \n\
+         To remove an alias, run:\n\
+         \n\
+         \x20 $ arc alias <alias-name>\n\
+         \n\
+         You will be prompted to remove the alias.\n\
+         \n\
+         Shell Commands\n\
+         \n\
+         If you begin an alias with \"!\", the remainder of the alias will be invoked as\n\
+         a shell command. For example, if you want to implement \"arc ls\", you can do\n\
+         so like this:\n\
+         \n\
+         \x20 $ arc alias ls '!ls'\n\
+         \n\
+         When run, \"arc ls\" will now behave like \"ls\".\n\
+         \n\
+         Multiple Toolsets\n\
+         \n\
+         This workflow supports any toolset, even though the examples in this help\n\
+         text use \"arc\". If you are working with another toolset, use the binary for\n\
+         that toolset define aliases for it:\n\
+         \n\
+         \x20 $ phage alias ...\n\
+         \n\
+         Aliases are bound to the toolset which was used to define them. If you define\n\
+         an \"arc draft\" alias, that does not also define a \"phage draft\" alias.\n\
+         \n\
+         Builtins\n\
+         \n\
+         You can not overwrite the behavior of builtin workflows, including \"alias\"\n\
+         itself, and if you install a new workflow it will take precedence over any\n\
+         existing aliases with the same name.\n\
+         \n\
+         \x20     --json\n\
+         \x20         Output aliases in JSON format.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("ALIAS WORKFLOW"), "{}", usage());
+}
