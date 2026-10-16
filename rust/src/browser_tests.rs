@@ -116,6 +116,34 @@ fn missing_binaries_fall_back_to_the_scan_error() {
 }
 
 #[test]
+#[cfg(unix)]
+fn browse_b19_unmarked_files_are_not_binaries() {
+    // PHP resolves via `which %s`, which only finds executables;
+    // `is_file()` alone also matches unmarked files.
+    let dir = std::env::temp_dir().join(format!(
+        "arc-rs-browser-exec-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let prog = dir.join("prog");
+    std::fs::write(&prog, "#!/bin/sh\ntrue\n").unwrap();
+    let name = prog.to_str().unwrap().to_string();
+    assert!(!binary_exists(&name));
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&prog).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&prog, perms).unwrap();
+    }
+    assert!(binary_exists(&name));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 #[cfg(not(windows))]
 fn r9_browse_b24_no_browser_scan_error_matches_ceb() {
     // `open_uris_in_browser` propagates the `browser_open_argv` scan error

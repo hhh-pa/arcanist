@@ -40,21 +40,41 @@ pub fn configured_browser(dir: &Path) -> Option<Vec<String>> {
     configured_argv(&value)
 }
 
+/// True for a plain file that the OS would execute.
+///
+/// T1153 BROWSE-B19: PHP resolves via `which %s`
+/// (`Filesystem::resolveBinary()`), which only finds executables;
+/// `is_file()` alone also matches unmarked files.
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 /// True when `name` resolves to a file on `PATH`, mirroring
 /// `Filesystem::binaryExists()`.
 fn binary_exists(name: &str) -> bool {
     if name.contains('/') || name.contains('\\') {
-        return Path::new(name).is_file();
+        return is_executable_file(Path::new(name));
     }
     std::env::var_os("PATH").is_some_and(|paths| {
         std::env::split_paths(&paths).any(|dir| {
-            if dir.join(name).is_file() {
+            if is_executable_file(&dir.join(name)) {
                 return true;
             }
             cfg!(windows)
                 && ["exe", "cmd", "bat", "com"]
                     .iter()
-                    .any(|ext| dir.join(format!("{name}.{ext}")).is_file())
+                    .any(|ext| is_executable_file(&dir.join(format!("{name}.{ext}"))))
         })
     })
 }
