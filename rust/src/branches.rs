@@ -14,8 +14,9 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use crate::{
+    argparse,
     conduit::{self, EnvelopeKind},
-    config, git, grid, markers,
+    config, get_config, git, grid, markers,
 };
 
 pub const NAME: &str = "branches";
@@ -54,40 +55,46 @@ pub struct Options {
     pub conduit_uri: Option<String>,
 }
 
+/// True when `-h`/`--help` appears before any `--` terminator (direct
+/// calls still reroute to usage; the binary strips standard help flags
+/// globally first).
+fn wants_help(argv: &[String]) -> bool {
+    let mut terminated = false;
+    for arg in argv {
+        if arg == "--" {
+            terminated = true;
+        } else if !terminated && (arg == "-h" || arg == "--help") {
+            return true;
+        }
+    }
+    false
+}
+
 /// Parse `argv` (excluding the subcommand name).
 ///
 /// Returns `Ok(None)` when `--help` was requested.
+///
+/// T1153 LAND-42: toolset workflows parse through
+/// `PhutilArgumentParser` (`parseWorkflowsFull`), so this shares the
+/// ported texts with `markers` (see there for the full list).
 pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
-    let mut all = false;
-    let mut json = false;
-    let mut conduit_uri = None;
-    let mut iter = argv.iter();
-    while let Some(arg) = iter.next() {
-        if arg == "--all" {
-            all = true;
-        } else if arg == "--json" {
-            json = true;
-        } else if arg == "--conduit-uri" {
-            let Some(value) = iter.next() else {
-                return Err("--conduit-uri requires a value".to_string());
-            };
-            conduit_uri = Some(value.clone());
-        } else if let Some(value) = arg.strip_prefix("--conduit-uri=") {
-            conduit_uri = Some(value.to_string());
-        } else if arg == "-h" || arg == "--help" {
-            return Ok(None);
-        } else if arg == "--" {
-            return Err("unexpected argument '--': branches takes no paths".to_string());
-        } else if arg.starts_with('-') {
-            return Err(format!("unknown flag '{arg}'"));
-        } else {
-            return Err(format!("unexpected argument '{arg}'"));
-        }
+    if wants_help(argv) {
+        return Ok(None);
     }
+    let parsed = argparse::parse_toolset(
+        argv,
+        &[
+            argparse::FlagSpec::boolean("all"),
+            argparse::FlagSpec::boolean("json"),
+            argparse::FlagSpec::valued("conduit-uri", "uri"),
+        ],
+        false,
+        false,
+    )?;
     Ok(Some(Options {
-        all,
-        json,
-        conduit_uri,
+        all: parsed.flag("all"),
+        json: parsed.flag("json"),
+        conduit_uri: parsed.value("conduit-uri").map(str::to_string),
     }))
 }
 
@@ -211,8 +218,23 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
         // T1153 R4 (RB-D4): PHP renders usage errors with no dump.
         Err(message) => return Err(message),
     };
-    let owned_client = config::client_for(options.conduit_uri.as_deref()).ok();
-    execute_core(dir, &options, grid::terminal_width(), owned_client.as_ref())
+    if options.json {
+        // The `--json` extension never calls conduit; it stays offline.
+        return execute_core(dir, &options, grid::terminal_width(), None);
+    }
+    // T1153 LAND-23: the engine needs conduit (tokenless when only
+    // credentials are missing — calls then fail mapped); without a
+    // URI the setup block replaces the grid.
+    let owned_client = match config::client_for_tokenless_with(
+        options.conduit_uri.as_deref(),
+        dir,
+        config::arcrc_path().as_deref(),
+        &get_config::LoadOptions::default(),
+    ) {
+        Ok(client) => client,
+        Err(message) => return Err(conduit::toolset_setup_message(&message)),
+    };
+    execute_core(dir, &options, grid::terminal_width(), Some(&owned_client))
 }
 
 /// Run the workflow with an explicit terminal width and conduit client.
@@ -239,6 +261,14 @@ fn execute_core(
     terminal: Option<usize>,
     client: Option<&crate::conduit::Client>,
 ) -> Result<String, String> {
+    // T1153 LAND-28: outside a repository PHP resolves a
+    // `filesystem` API, whose empty marker-type list fails the
+    // support check (usage error, like the `svn` gate this matches).
+    // The gate runs ahead of both renderers.
+    let vcs = detect_vcs(dir).unwrap_or("filesystem");
+    if !markers::supports_marker_type(vcs, markers::MARKER_TYPE_BRANCH) {
+        return Err(markers::support_error(vcs, markers::MARKER_TYPE_BRANCH));
+    }
     if options.json {
         return match detect_vcs(dir) {
             Some("hg") => {
@@ -268,10 +298,6 @@ fn execute_core(
                 Ok(text)
             }
         };
-    }
-    let vcs = detect_vcs(dir).ok_or_else(|| "not inside a git repository".to_string())?;
-    if !markers::supports_marker_type(vcs, markers::MARKER_TYPE_BRANCH) {
-        return Err(markers::support_error(vcs, markers::MARKER_TYPE_BRANCH));
     }
     markers::run_workflow(
         dir,

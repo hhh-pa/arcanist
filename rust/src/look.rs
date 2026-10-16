@@ -877,18 +877,19 @@ impl RemoteInfo {
 }
 
 /// List git remotes under `cwd` (repository names unresolved).
+///
+/// T1153 RB-D9: PHP parses one `git remote --verbose` strictly (raw
+/// config URIs, no `insteadOf` rewriting) and throws on lines which
+/// miss the pattern — including the empty line, so a remote-less
+/// checkout fails instead of rendering empty.
 pub fn query_remotes(cwd: &Path) -> Result<Vec<RemoteInfo>, String> {
     if !git::is_inside_work_tree(cwd) {
         return Err("not inside a git repository".to_string());
     }
-    let names = git::stdout_text(cwd, &["remote"])?;
-    let mut remotes = Vec::new();
-    for name in names.lines().filter(|l| !l.trim().is_empty()) {
-        let push_uri = git::stdout_text(cwd, &["remote", "get-url", "--push", name]).ok();
-        let fetch_uri = git::stdout_text(cwd, &["remote", "get-url", name]).ok();
-        remotes.push(RemoteInfo::new(name.to_string(), push_uri, fetch_uri));
-    }
-    Ok(remotes)
+    Ok(crate::markers::query_git_remotes(cwd)?
+        .into_iter()
+        .map(|remote| RemoteInfo::new(remote.name, remote.push_uri, remote.fetch_uri))
+        .collect())
 }
 
 /// The four ref-view lines for one remote (`pht('Push URI: %s')`, ...).
@@ -1019,61 +1020,16 @@ pub fn resolve_repositories(
     Ok(repos)
 }
 
-/// Split a git URI into `(domain, path)`, covering `scheme://` and
-/// scp-like (`[user@]host:path`) spellings; plain paths have no domain.
-fn split_git_uri(uri: &str) -> (Option<String>, String) {
-    if let Some(rest) = uri.split_once("://").map(|(_, rest)| rest) {
-        let after_host = rest.find('/').map_or("", |i| &rest[i..]);
-        let authority = rest.split('/').next().unwrap_or("");
-        let host = authority.rsplit('@').next().unwrap_or("");
-        let host = host.split(':').next().unwrap_or("");
-        if host.is_empty() {
-            return (None, after_host.to_string());
-        }
-        return (Some(host.to_string()), after_host.to_string());
-    }
-    // Windows drive paths (`C:\...`, `C:/...`) are local, not scp-like.
-    if uri.len() >= 2
-        && uri.as_bytes()[0].is_ascii_alphabetic()
-        && uri.as_bytes()[1] == b':'
-        && uri[2..].starts_with(['/', '\\'])
-    {
-        return (None, uri.to_string());
-    }
-    if let Some((host_part, path)) = uri.split_once(':')
-        && !host_part.contains('/')
-        && !host_part.contains('\\')
-    {
-        let host = host_part.rsplit('@').next().unwrap_or("");
-        if !host.is_empty() {
-            return (Some(host.to_string()), path.to_string());
-        }
-    }
-    (None, uri.to_string())
-}
-
-/// Normalize a git URI for comparison, porting
-/// `ArcanistRepositoryURINormalizer` (`TYPE_GIT`): lowercased domain plus
-/// the trimmed path without `.git`, with Phabricator `/diffusion/X/`
-/// prefixes collapsed to the callsign.
+/// Normalize a git URI for comparison (`ArcanistRepositoryURINormalizer`
+/// with `TYPE_GIT`).
+///
+/// T1153 RB-D10: this delegates to the shared `revision` port of
+/// `PhutilURI` (dotless scp hosts, digit paths, multi-colon inputs,
+/// query strings, garbage ports, and Windows paths all follow it)
+/// instead of the naive local split.
 #[must_use]
 pub fn normalize_git_uri(uri: &str) -> String {
-    let (domain, path) = split_git_uri(uri);
-    let domain = domain.map_or("<void>".to_string(), |d| d.to_lowercase());
-    let mut path = path.trim_matches('/').to_string();
-    if let Some(stripped) = path.strip_suffix(".git") {
-        path = stripped.to_string();
-    }
-    if let Some(rest) = path.strip_prefix("diffusion/") {
-        let head = rest.split('/').next().unwrap_or("");
-        if !head.is_empty()
-            && (head.chars().all(|c| c.is_ascii_uppercase())
-                || head.chars().all(|c| c.is_ascii_digit()))
-        {
-            path = format!("diffusion/{head}");
-        }
-    }
-    format!("{domain}/{path}")
+    crate::revision::normalize_git_uri(uri)
 }
 
 /// Find the repository whose URIs contain `uri` after normalization.

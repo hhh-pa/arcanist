@@ -1,9 +1,47 @@
 //! `.arclint` config plus `markers` behavior through the wired library.
 
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use arc_rs::conduit::Client;
 use arc_rs::{arclint, markers};
+
+/// One-shot mock conduit server answering `body` to a single call.
+fn serve_once(body: &'static str) -> (String, std::sync::mpsc::Receiver<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8(head).unwrap();
+        let len: usize = head
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length: ")
+                    .or_else(|| line.strip_prefix("content-length: "))
+                    .map(|v| v.trim().parse().unwrap())
+            })
+            .unwrap_or(0);
+        let mut rest = vec![0u8; len];
+        stream.read_exact(&mut rest).unwrap();
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(reply.as_bytes()).unwrap();
+        tx.send(()).unwrap();
+    });
+    (base, rx)
+}
 
 struct TempDir {
     path: PathBuf,
@@ -273,6 +311,13 @@ fn markers_lists_git_branches_as_grid() {
     std::fs::write(tmp.path().join("b.txt"), "second\n").unwrap();
     git(tmp.path(), &["add", "b.txt"]);
     git(tmp.path(), &["commit", "-qm", "add thing"]);
+    // T1153 RB-D9: the grid workflow parses `git remote --verbose`
+    // strictly, so this rendering fixture needs a remote (a
+    // remote-less checkout fails; see `rbd9_remoteless_checkout_fails`).
+    git(
+        tmp.path(),
+        &["remote", "add", "origin", "https://example.test/repo.git"],
+    );
 
     let found = markers::list_git_branches(tmp.path()).unwrap();
     assert_eq!(found.len(), 2);
@@ -280,7 +325,11 @@ fn markers_lists_git_branches_as_grid() {
     assert_eq!(found[0].name, "feature");
 
     // Fixed width: message truncation depends on the terminal.
-    let text = markers::execute_with_client(tmp.path(), &[], Some(150), None).unwrap();
+    // T1153 LAND-23: the grid needs a client (`differential.query`
+    // answers empty here; no tracking refs, so nothing else fires).
+    let (base, _served) = serve_once(r#"{"result": [], "error_code": null}"#);
+    let client = Client::new(&base, "test-token").unwrap();
+    let text = markers::execute_with_client(tmp.path(), &[], Some(150), Some(&client)).unwrap();
     let feature = git(tmp.path(), &["rev-parse", "--short", "feature"]);
     // The tree grid follows graph order: master (first commit) renders
     // first, the active feature marker second.
@@ -327,4 +376,39 @@ fn markers_fails_outside_a_working_copy() {
         err.contains("not inside a working copy"),
         "unexpected: {err}"
     );
+}
+
+#[test]
+fn land23_grid_fails_without_conduit() {
+    // Without a client the workflow fails like PHP instead of
+    // rendering an unannotated grid.
+    let tmp = git_repo("land23-noclient");
+    git(
+        tmp.path(),
+        &["commit", "-q", "--allow-empty", "-m", "first"],
+    );
+    git(
+        tmp.path(),
+        &["remote", "add", "origin", "https://example.test/repo.git"],
+    );
+    let err = markers::execute_with_client(tmp.path(), &[], Some(150), None).unwrap_err();
+    assert!(
+        err.contains("This command needs to communicate with Phabricator"),
+        "unexpected: {err}"
+    );
+}
+
+#[test]
+fn rbd9_remoteless_checkout_fails_like_php() {
+    // Empty `git remote --verbose` output throws (the empty line
+    // misses the remote pattern), like PHP.
+    let tmp = git_repo("rbd9-noremote");
+    git(
+        tmp.path(),
+        &["commit", "-q", "--allow-empty", "-m", "first"],
+    );
+    let err = markers::query_git_remotes(tmp.path()).unwrap_err();
+    assert_eq!(err, "Failed to match remote pattern against line \"\".");
+    let err = markers::execute_with_client(tmp.path(), &[], Some(150), None).unwrap_err();
+    assert_eq!(err, "Failed to match remote pattern against line \"\".");
 }

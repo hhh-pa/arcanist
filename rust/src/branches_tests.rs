@@ -53,14 +53,34 @@ fn help_returns_none() {
 
 #[test]
 fn rejects_bad_arguments() {
-    let err = parse_options(&args(&["--bogus"])).unwrap_err();
-    assert!(err.contains("unknown flag"), "unexpected: {err}");
-    let err = parse_options(&args(&["feature"])).unwrap_err();
-    assert!(err.contains("unexpected argument"), "unexpected: {err}");
-    let err = parse_options(&args(&["--"])).unwrap_err();
-    assert!(err.contains("unexpected argument"), "unexpected: {err}");
-    let err = parse_options(&args(&["--conduit-uri"])).unwrap_err();
-    assert!(err.contains("requires a value"), "unexpected: {err}");
+    // T1153 LAND-42: toolset parse texts (`PhutilArgumentParser`).
+    assert_eq!(
+        parse_options(&args(&["--bogus"])).unwrap_err(),
+        "Argument \"--bogus\" is unrecognized. Use \"--\" to indicate the end of flags."
+    );
+    assert_eq!(
+        parse_options(&args(&["feature"])).unwrap_err(),
+        "Unrecognized argument \"feature\"."
+    );
+    assert_eq!(
+        parse_options(&args(&["--conduit-uri"])).unwrap_err(),
+        "Argument \"--conduit-uri\" requires a parameter."
+    );
+    assert_eq!(
+        parse_options(&args(&["--all=x"])).unwrap_err(),
+        "Argument \"--all\" does not take a parameter."
+    );
+    assert_eq!(
+        parse_options(&args(&["--all", "--all"])).unwrap_err(),
+        "Argument \"--all\" was provided twice."
+    );
+    // A lone `--` terminates flags and parses clean.
+    assert!(parse_options(&args(&["--"])).unwrap().is_some());
+    // Past `--`, flags are positionals.
+    assert_eq!(
+        parse_options(&args(&["--", "--help"])).unwrap_err(),
+        "Unrecognized argument \"--help\"."
+    );
 }
 
 #[test]

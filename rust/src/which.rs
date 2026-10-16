@@ -281,16 +281,24 @@ fn rev_to_commit(dir: &Path, rev: &str) -> Option<String> {
     if sha.is_empty() { None } else { Some(sha) }
 }
 
-/// Resolve the range head like `getHeadCommit()`, with git's own error.
+/// Missing-commit usage text (`ArcanistGitAPI.php:223,418`).
+fn unknown_commit_message(symbolic: &str) -> String {
+    format!("Unable to find any git commit named '{symbolic}' in this repository.")
+}
+
+/// True for the missing-commit usage errors, which render
+/// `Usage Exception:` even though most resolution failures are generic
+/// exceptions (T1153 RB-D21).
+fn is_usage_message(message: &str) -> bool {
+    message.starts_with("Unable to find any git commit named '")
+}
+
+/// Resolve the range head like `getHeadCommit()` (`rev-parse` plus the
+/// missing-commit usage error, T1153 RB-D21).
 fn resolve_head(dir: &Path, head_ref: &str) -> Result<String, String> {
-    let out = git::output(dir, &["show", "-s", "--format=%H", head_ref, "--"])
-        .map_err(|e| format!("cannot resolve '{head_ref}': {e}"))?;
+    let out = git::output(dir, &["rev-parse", head_ref])?;
     if !out.status.success() {
-        let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        if detail.is_empty() {
-            return Err(format!("cannot resolve '{head_ref}' (empty repository?)"));
-        }
-        return Err(detail);
+        return Err(unknown_commit_message(head_ref));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -644,13 +652,12 @@ impl<'a> Engine<'a> {
                 let Ok(upstream) = upstream else {
                     return Ok(None);
                 };
-                let out = git::output(self.dir, &["merge-base", "--", &upstream, "HEAD"])
-                    .map_err(|e| format!("git merge-base failed: {e}"))?;
+                // `merge-base %s HEAD`, like PHP (no `--`): failures
+                // raise `CommandException`, not a wrapped message.
+                let command = format!("git merge-base {} HEAD", shell_arg(&upstream));
+                let out = git::output(self.dir, &["merge-base", &upstream, "HEAD"])?;
                 if !out.status.success() {
-                    return Err(format!(
-                        "git merge-base failed: {}",
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    ));
+                    return Err(execx_failed(&command, out.status, &out));
                 }
                 let base = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 self.explain(format!(
@@ -675,7 +682,7 @@ impl<'a> Engine<'a> {
         name: &str,
         source: &str,
     ) -> Result<Option<String>, String> {
-        if let Some(inner) = strip_wrapped(name, "merge-base(", ")") {
+        if let Some(inner) = strip_wrapped_nonempty(name, "merge-base(", ")") {
             let out = git::output(self.dir, &["merge-base", "--", inner, "HEAD"])
                 .map_err(|e| format!("git merge-base failed: {e}"))?;
             if !out.status.success() {
@@ -688,7 +695,7 @@ impl<'a> Engine<'a> {
             ));
             return Ok(Some(base));
         }
-        if let Some(inner) = strip_wrapped(name, "branch-unique(", ")") {
+        if let Some(inner) = strip_wrapped_nonempty(name, "branch-unique(", ")") {
             return self.resolve_branch_unique(rule, inner, source);
         }
         if git::ok(self.dir, &["cat-file", "-t", name]) {
@@ -751,9 +758,59 @@ impl<'a> Engine<'a> {
 }
 
 /// Strip one `prefix...suffix` wrapper (greedy inner, like `(.*)`).
+/// Unwrap `prefix...suffix`, mirroring PHP's `/^...\(.*\)$/`
+/// wrappings: `.` never spans `\n`, so multi-line inners never match
+/// (T1153 RB-D38e). (A trailing `\n` would still match PHP's `$`, but
+/// rule tokenizing trims every rule, so that shape is unreachable.)
 fn strip_wrapped<'b>(name: &'b str, prefix: &str, suffix: &str) -> Option<&'b str> {
-    name.strip_prefix(prefix)
-        .and_then(|rest| rest.strip_suffix(suffix))
+    let inner = name
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(suffix))?;
+    if inner.contains('\n') {
+        return None;
+    }
+    Some(inner)
+}
+
+/// Unwrap a git-side `prefix...+...suffix` wrapping (`merge-base(`,
+/// `branch-unique(`): like [`strip_wrapped`], but the inner `.+`
+/// also rejects empties.
+fn strip_wrapped_nonempty<'b>(name: &'b str, prefix: &str, suffix: &str) -> Option<&'b str> {
+    let inner = strip_wrapped(name, prefix, suffix)?;
+    if inner.is_empty() {
+        return None;
+    }
+    Some(inner)
+}
+
+/// `csprintf` `%s` escaping (`PhutilCommandString::escapeLinux()`):
+/// safe shell words pass through, anything else is single-quoted.
+fn shell_arg(value: &str) -> String {
+    let safe = !value.is_empty()
+        && value.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b':' | b'/' | b'@' | b'.' | b'_' | b'+' | b'-')
+        });
+    if safe {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+/// Render a failed `git` call like PHP's `CommandException`
+/// (`src/future/exec/CommandException.php`), which is what
+/// `execxLocal` raises (T1153 RB-D23).
+fn execx_failed(
+    command: &str,
+    status: std::process::ExitStatus,
+    out: &std::process::Output,
+) -> String {
+    crate::markers::command_exception_text(
+        status.code().unwrap_or(1),
+        command,
+        &String::from_utf8_lossy(&out.stdout),
+        &String::from_utf8_lossy(&out.stderr),
+    )
 }
 
 /// Local branch short names (`refs/heads/*`).
@@ -885,9 +942,7 @@ fn resolve_explicit_base(
     let out = git::output(dir, &["merge-base", "--", commit, &head])
         .map_err(|e| format!("git merge-base failed: {e}"))?;
     if !out.status.success() {
-        return Err(format!(
-            "Unable to find any git commit named '{commit}' in this repository."
-        ));
+        return Err(unknown_commit_message(commit));
     }
     let base = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let why = if head_explicit {
@@ -1220,40 +1275,31 @@ pub fn git_commit_messages(
 /// `ArcanistDifferentialCommitMessage::parseRevisionIDFromRawCorpus()`.
 /// Returns `Ok(None)` when the corpus has no footer; errors on a
 /// malformed one.
-/// How `/^Differential Revision:\s*(.+)/im` matches at one line start:
-/// no match (try the next), a whitespace-only value (throw), or a raw
-/// value (monogram, URI, or throw).
-enum FooterValue<'a> {
-    None,
-    Empty,
-    Value(&'a str),
-}
-
 /// PCRE `\s`: space, tab, newline, CR, form feed, vertical tab.
 const FOOTER_SPACE: [char; 6] = [' ', '\t', '\n', '\r', '\u{c}', '\u{b}'];
 
 /// PHP `trim()` charlist (no form feed).
 const TRIM_CHARS: [char; 6] = [' ', '\t', '\n', '\r', '\0', '\u{b}'];
 
-fn footer_value(after: &str) -> FooterValue<'_> {
+/// How `/^Differential Revision:\s*(.+)/im` matches at one line start:
+/// the raw value, or no match (try the next start). T1153 RB-D20: a
+/// whitespace-only tail never matches — even with spaces in it — so
+/// an empty footer is skipped instead of throwing.
+fn footer_value(after: &str) -> Option<&str> {
     let stripped = after.trim_start_matches(FOOTER_SPACE);
-    if !stripped.is_empty() {
-        let raw = stripped.split('\n').next().unwrap_or("");
-        return FooterValue::Value(raw);
+    if stripped.is_empty() {
+        return None;
     }
-    let run = &after[..after.len() - stripped.len()];
-    if run.bytes().any(|b| b != b'\n') {
-        FooterValue::Empty
-    } else {
-        FooterValue::None
-    }
+    Some(stripped.split('\n').next().unwrap_or(""))
 }
 
 fn invalid_footer(value: &str) -> String {
+    // T1153 BROWSE-B25: the ceb-era Phabricator example, not the 2023
+    // devtools text.
     format!(
         "Invalid \"Differential Revision\" field in commit message. This field should have a \
-         revision identifier like \"D123\" or a server URI like \
-         \"https://devtools.example.com/D123\", but has \"{value}\"."
+         revision identifier like \"D123\" or a Phabricator URI like \
+         \"https://phabricator.example.com/D123\", but has \"{value}\"."
     )
 }
 
@@ -1276,20 +1322,17 @@ pub fn revision_id_from_corpus(corpus: &str) -> Result<Option<String>, String> {
         if !head.eq_ignore_ascii_case(PREFIX) {
             continue;
         }
-        match footer_value(after) {
-            FooterValue::None => continue,
-            FooterValue::Empty => return Err(invalid_footer("")),
-            FooterValue::Value(raw) => {
-                let value = raw.trim_matches(TRIM_CHARS);
-                if let Some(id) = bare_revision_id(value) {
-                    return Ok(Some(id));
-                }
-                if let Some(id) = uri_revision_id(value) {
-                    return Ok(Some(id));
-                }
-                return Err(invalid_footer(value));
-            }
+        let Some(raw) = footer_value(after) else {
+            continue;
+        };
+        let value = raw.trim_matches(TRIM_CHARS);
+        if let Some(id) = bare_revision_id(value) {
+            return Ok(Some(id));
         }
+        if let Some(id) = uri_revision_id(value) {
+            return Ok(Some(id));
+        }
+        return Err(invalid_footer(value));
     }
     Ok(None)
 }
@@ -1307,14 +1350,28 @@ fn bare_revision_id(value: &str) -> Option<String> {
     }
 }
 
+/// True for `PhutilURI` scheme heads (alpha start, scheme chars).
+fn is_uri_scheme(head: &str) -> bool {
+    let mut chars = head.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
 /// A server-URI footer value: the whole URI path must be a monogram.
+/// T1153 RB-D38b: without `://`, PHP's `PhutilURI` still splits a
+/// scheme, so `host:D123` carries path `D123` and resolves.
 fn uri_revision_id(value: &str) -> Option<String> {
     let without_query = value.split(['?', '#']).next().unwrap_or("");
-    let path = match without_query.split_once("://") {
-        Some((_, rest)) => rest.split_once('/').map_or("", |(_, path)| path),
-        None => without_query,
-    };
-    bare_revision_id(path.trim_matches('/'))
+    if let Some((_, rest)) = without_query.split_once("://") {
+        let path = rest.split_once('/').map_or("", |(_, path)| path);
+        return bare_revision_id(path.trim_matches('/'));
+    }
+    if let Some((head, rest)) = without_query.split_once(':')
+        && is_uri_scheme(head)
+    {
+        return bare_revision_id(rest.trim_matches('/'));
+    }
+    bare_revision_id(without_query.trim_matches('/'))
 }
 
 fn id_number(id: &str) -> serde_json::Value {
@@ -1601,6 +1658,12 @@ struct RangeResolution {
     matching: Matching,
 }
 
+/// `ArcanistGitAPI::getLocalCommitInformation()` on a repository with
+/// no commits (`ArcanistGitAPI.php:99-113`): PHP prints the repository
+/// section first, then fails with this text.
+const NO_LOCAL_COMMITS: &str =
+    "You can't get local commit information for a repository with no commits.";
+
 fn resolve_report_range(
     dir: &Path,
     user_file: Option<&Path>,
@@ -1623,9 +1686,7 @@ fn resolve_report_range(
         &inputs,
     )?;
     if !has_any_commit(dir) {
-        return Err(
-            "You can't get local commit information for a repository with no commits.".to_string(),
-        );
+        return Err(NO_LOCAL_COMMITS.to_string());
     }
     let resolved_head = resolve_head(dir, head_ref)?;
     if head_explicit && base != GIT_MAGIC_ROOT_COMMIT {
@@ -1647,17 +1708,16 @@ fn resolve_report_range(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn load_context(
+/// The range-independent half of [`Context`]: everything PHP prints
+/// before range resolution can fail (T1153 RB-D24). Local probes only —
+/// no config-default prompts, no conduit.
+fn local_prefix_context(
     dir: &Path,
     user_file: Option<&Path>,
     flag_uri: Option<&str>,
     env: Option<&str>,
-    explicit_base: Option<&str>,
     head_ref: &str,
-    head_explicit: bool,
-    resolution: &Resolution<'_>,
-) -> Result<Context, String> {
+) -> Context {
     let in_repo = git::is_inside_work_tree(dir);
     let identity = load_repo_identity(dir, head_ref, in_repo);
     let (project_root, project_file) = find_project(dir);
@@ -1666,29 +1726,11 @@ pub fn load_context(
     let token = conduit_uri
         .as_ref()
         .map(|uri| token_installed(user_file, uri));
-    let (base, explanation, commits, matching) = if in_repo {
-        let range = resolve_report_range(
-            dir,
-            user_file,
-            explicit_base,
-            head_ref,
-            head_explicit,
-            resolution,
-        )?;
-        (
-            Some(range.base),
-            Some(range.explanation),
-            range.commits,
-            range.matching,
-        )
-    } else {
-        (None, None, Vec::new(), Matching::OutsideRepo)
-    };
     let (callsign_name, callsign_source) = match callsign {
         Some((name, source)) => (Some(name), Some(source)),
         None => (None, None),
     };
-    Ok(Context {
+    Context {
         dir: dir.to_string_lossy().to_string(),
         vcs: if in_repo { "git" } else { "none" },
         vcs_root: identity.vcs_root,
@@ -1703,16 +1745,47 @@ pub fn load_context(
         conduit_uri,
         conduit_source,
         token_installed: token,
-        base,
-        base_explanation: explanation,
+        base: None,
+        base_explanation: None,
         head_ref: head_ref.to_string(),
-        commits,
-        diff_arg: match explicit_base {
-            Some(base) => format!(" {base}"),
-            None => String::new(),
-        },
-        matching,
-    })
+        commits: Vec::new(),
+        diff_arg: String::new(),
+        matching: Matching::OutsideRepo,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn load_context(
+    dir: &Path,
+    user_file: Option<&Path>,
+    flag_uri: Option<&str>,
+    env: Option<&str>,
+    explicit_base: Option<&str>,
+    head_ref: &str,
+    head_explicit: bool,
+    resolution: &Resolution<'_>,
+) -> Result<Context, String> {
+    let mut ctx = local_prefix_context(dir, user_file, flag_uri, env, head_ref);
+    let in_repo = git::is_inside_work_tree(dir);
+    if in_repo {
+        let range = resolve_report_range(
+            dir,
+            user_file,
+            explicit_base,
+            head_ref,
+            head_explicit,
+            resolution,
+        )?;
+        ctx.base = Some(range.base);
+        ctx.base_explanation = Some(range.explanation);
+        ctx.commits = range.commits;
+        ctx.matching = range.matching;
+    }
+    ctx.diff_arg = match explicit_base {
+        Some(base) => format!(" {base}"),
+        None => String::new(),
+    };
+    Ok(ctx)
 }
 
 /// Bold a section header or verdict word on TTYs (`**%s**`), plain
@@ -1835,10 +1908,18 @@ fn render_matching(ctx: &Context, out: &mut String, ansi: bool) {
             out.push_str(&format!("    (Revision matching unavailable: {reason})\n"));
         }
         Matching::Found(revisions) if revisions.is_empty() => {
+            // T1153 RB-D19: PHP prints this subheader before the empty
+            // check, so matched runs always carry it.
+            out.push_str(
+                "These Differential revisions match the changes in this working copy:\n\n",
+            );
             out.push_str("    (No revisions match.)\n\n");
             out.push_str(&created_guidance(&ctx.diff_arg, ansi));
         }
         Matching::Found(revisions) => {
+            out.push_str(
+                "These Differential revisions match the changes in this working copy:\n\n",
+            );
             for revision in revisions {
                 match &revision.author {
                     Some(author) => out.push_str(&format!(
@@ -1862,6 +1943,18 @@ fn render_matching(ctx: &Context, out: &mut String, ansi: bool) {
             }
         }
     }
+}
+
+/// Render the range-independent prefix (working copy, repository,
+/// conduit): what `arc which` still prints when range resolution fails
+/// on a repository with no commits (T1153 RB-D24).
+#[must_use]
+fn render_report_prefix(ctx: &Context, ansi: bool) -> String {
+    let mut out = String::new();
+    render_working_copy(ctx, &mut out, ansi);
+    render_repository(ctx, &mut out, ansi);
+    render_conduit(ctx, &mut out, ansi);
+    out
 }
 
 /// Render the human-readable report with the process ANSI setting.
@@ -2223,8 +2316,19 @@ pub fn run(argv: &[String]) -> ExitCode {
     ) {
         Ok(ctx) => ctx,
         // T1153 R4 (RB-D4): context/resolution failures are generic
-        // exceptions under the red banner (`:449-468`).
-        Err(message) => return conduit::report(EnvelopeKind::Exception, &message),
+        // exceptions under the red banner (`:449-468`), except the
+        // missing-commit usage errors (T1153 RB-D21).
+        Err(message) => {
+            return report_context_failure(
+                &cwd,
+                user_file.as_deref(),
+                options.conduit_uri.as_deref(),
+                env_uri.as_deref(),
+                &options.head,
+                options.json,
+                &message,
+            );
+        }
     };
     if options.json {
         println!(
@@ -2235,6 +2339,37 @@ pub fn run(argv: &[String]) -> ExitCode {
         print!("{}", render(&ctx));
     }
     ExitCode::SUCCESS
+}
+
+/// Report a `load_context` failure: T1153 R4 (RB-D4) renders
+/// context/resolution failures as generic exceptions under the red
+/// banner (`:449-468`), except the missing-commit usage errors (T1153
+/// RB-D21). On an empty repository PHP has already printed the
+/// repository section when commit resolution fails, so the local
+/// prefix prints first (T1153 RB-D24).
+#[allow(clippy::too_many_arguments)]
+fn report_context_failure(
+    dir: &Path,
+    user_file: Option<&Path>,
+    flag_uri: Option<&str>,
+    env: Option<&str>,
+    head_ref: &str,
+    json: bool,
+    message: &str,
+) -> ExitCode {
+    if message == NO_LOCAL_COMMITS && !json {
+        let prefix = local_prefix_context(dir, user_file, flag_uri, env, head_ref);
+        print!(
+            "{}",
+            render_report_prefix(&prefix, terminal::ansi_enabled())
+        );
+    }
+    let kind = if is_usage_message(message) {
+        EnvelopeKind::Usage
+    } else {
+        EnvelopeKind::Exception
+    };
+    conduit::report(kind, message)
 }
 
 /// `--show-base` prints the base commit only, without conduit.
@@ -2266,7 +2401,15 @@ fn run_show_base(
             println!("{base}");
             ExitCode::SUCCESS
         }
-        Err(message) => conduit::report(EnvelopeKind::Exception, &message),
+        Err(message) => {
+            // Missing commits are usage errors, like the main report.
+            let kind = if is_usage_message(&message) {
+                EnvelopeKind::Usage
+            } else {
+                EnvelopeKind::Exception
+            };
+            conduit::report(kind, &message)
+        }
     }
 }
 

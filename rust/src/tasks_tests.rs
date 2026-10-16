@@ -45,7 +45,7 @@ fn parses_all_options() {
     assert_eq!(options.status, Some("closed".to_string()));
     assert_eq!(options.owner, Some("alice".to_string()));
     assert_eq!(options.order, Some("created".to_string()));
-    assert_eq!(options.limit, Some(10));
+    assert_eq!(options.limit, Some("10".to_string()));
     assert!(options.json);
     assert_eq!(
         options.conduit_uri,
@@ -65,15 +65,24 @@ fn rejects_bad_args() {
     assert!(parse_args(&args(&["--status"])).is_err());
     assert!(parse_args(&args(&["--status="])).is_err());
     assert!(parse_args(&args(&["--limit"])).is_err());
-    assert!(parse_args(&args(&["--limit", "many"])).is_err());
-    assert!(parse_args(&args(&["--limit", "-1"])).is_err());
     assert!(parse_args(&args(&["positional"])).is_err());
     assert!(parse_args(&args(&["--", "positional"])).is_err());
 }
 
 #[test]
-fn rejects_owner_and_unassigned_conflict() {
-    assert!(parse_args(&args(&["--owner", "alice", "--unassigned"])).is_err());
+fn rbd28_owner_and_unassigned_accepted_limit_sent_raw() {
+    // PHP strips the `conflict` and `int` specs, so `--owner` plus
+    // `--unassigned` parses (owner wins in `execute`) and any
+    // `--limit` value rides through verbatim.
+    let options = parse_args(&args(&["--owner", "alice", "--unassigned"]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(options.owner, Some("alice".to_string()));
+    assert!(options.unassigned);
+    let options = parse_args(&args(&["--limit", "many"])).unwrap().unwrap();
+    assert_eq!(options.limit, Some("many".to_string()));
+    let options = parse_args(&args(&["--limit", "-1"])).unwrap().unwrap();
+    assert_eq!(options.limit, Some("-1".to_string()));
 }
 
 #[test]
@@ -91,9 +100,9 @@ fn builds_default_query_params() {
 #[test]
 fn builds_custom_query_params() {
     assert_eq!(
-        query_params(None, Some("all"), Some("created"), Some(5)),
+        query_params(None, Some("all"), Some("created"), Some("5")),
         serde_json::json!({
-            "limit": 5,
+            "limit": "5",
             "order": "order-created",
             "status": "status-any",
         })
@@ -103,6 +112,41 @@ fn builds_custom_query_params() {
         serde_json::json!({
             "order": "order-priority",
             "status": "status-closed",
+        })
+    );
+}
+
+#[test]
+fn rbd28_blank_order_status_fall_back_and_limit_is_verbatim() {
+    // Empty (and `"0"`, the only other falsy string) `--order` /
+    // `--status` fall back to the PHP defaults; `--limit` keeps its
+    // argv spelling, numeric or not.
+    for order in [Some(""), Some("0"), None] {
+        for status in [Some(""), Some("0"), None] {
+            assert_eq!(
+                query_params(None, status, order, None),
+                serde_json::json!({
+                    "order": "order-priority",
+                    "status": "status-open",
+                }),
+                "order={order:?} status={status:?}"
+            );
+        }
+    }
+    assert_eq!(
+        query_params(None, None, None, Some("many")),
+        serde_json::json!({
+            "limit": "many",
+            "order": "order-priority",
+            "status": "status-open",
+        })
+    );
+    assert_eq!(
+        query_params(None, Some("all"), Some(""), Some("0")),
+        serde_json::json!({
+            "limit": "0",
+            "order": "order-priority",
+            "status": "status-any",
         })
     );
 }
@@ -126,6 +170,11 @@ fn parses_task_rows() {
     assert_eq!(task.is_closed, Some(false));
     let numeric = parse_task(&serde_json::json!({"id": 1, "isClosed": 1})).unwrap();
     assert_eq!(numeric.is_closed, Some(true));
+    // T1153 RB-D39: string `isClosed` follows PHP truthiness.
+    let text = parse_task(&serde_json::json!({"id": 1, "isClosed": "1"})).unwrap();
+    assert_eq!(text.is_closed, Some(true));
+    let zero = parse_task(&serde_json::json!({"id": 1, "isClosed": "0"})).unwrap();
+    assert_eq!(zero.is_closed, Some(false));
     let missing =
         parse_task(&serde_json::json!({"id": 1, "isClosed": serde_json::Value::Null})).unwrap();
     assert_eq!(missing.is_closed, None);

@@ -208,6 +208,37 @@ fn git_uri_normalization_matches_normalizer() {
 }
 
 #[test]
+fn rbd10_normalization_follows_phutil_uri_edges() {
+    // The shared `revision` port decides the `PhutilURI` edges: dotless
+    // `host:path` is a scheme (not scp), digit tails are ports (not
+    // paths), query strings never reach the path, garbage ports void
+    // the URI, and drive letters split as schemes.
+    for uri in [
+        "localhost:repo",
+        "host:22",
+        "a:b:c",
+        "ssh://host/repo?x=1",
+        "ssh://host:abc/repo",
+        "ssh://host:22/repo",
+        "C:\\repo",
+        "C:/repo",
+        "user@host:/repo",
+        "git@domain.com:bananas.git",
+    ] {
+        assert_eq!(
+            normalize_git_uri(uri),
+            crate::revision::normalize_git_uri(uri),
+            "for {uri}"
+        );
+    }
+    assert_eq!(normalize_git_uri("localhost:repo"), "<void>/repo");
+    assert_eq!(normalize_git_uri("host:22"), "<void>/22");
+    assert_eq!(normalize_git_uri("ssh://host/repo?x=1"), "host/repo");
+    assert_eq!(normalize_git_uri("ssh://host:abc/repo"), "<void>/");
+    assert_eq!(normalize_git_uri("C:\\repo"), "<void>/\\repo");
+}
+
+#[test]
 fn repository_search_parses_names_uris_and_rules() {
     let value = serde_json::json!({
         "data": [

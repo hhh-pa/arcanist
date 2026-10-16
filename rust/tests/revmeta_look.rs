@@ -145,13 +145,15 @@ fn remotes_lists_git_remotes() {
 }
 
 #[test]
-fn remotes_without_remotes_still_shows_grove() {
+fn rbd9_remotes_without_remotes_fails_like_php() {
+    // T1153 RB-D9: empty `git remote --verbose` output throws (the
+    // empty line misses the remote pattern), like PHP — no empty
+    // grove renders.
     let repo = Fixture::init_repo("no-remotes");
-    let (out, code) = look::render(&repo.dir, &args(&["remotes"]), NOON).unwrap();
-    assert_eq!(code, ExitCode::SUCCESS);
-    assert!(out.contains("grove of fruit trees"), "{out}");
-    assert!(!out.contains("Remote \""), "{out}");
-    assert!(out.contains("toward published commits"), "{out}");
+    let err = look::render(&repo.dir, &args(&["remotes"]), NOON).unwrap_err();
+    assert_eq!(err, "Failed to match remote pattern against line \"\".");
+    let err = look::query_remotes(&repo.dir).unwrap_err();
+    assert_eq!(err, "Failed to match remote pattern against line \"\".");
 }
 
 #[test]

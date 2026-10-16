@@ -354,19 +354,20 @@ fn task_create_params(
     Ok(params)
 }
 
-fn finish_created_task(
-    dir: &std::path::Path,
+/// A created task plus its stdout text: the text prints first and the
+/// task feeds `--browse` after it (T1153 RB-D29b: PHP echoes the
+/// `Created task ...` line, then opens the browser).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedOutcome {
+    pub text: String,
+    pub task: Option<CreatedTask>,
+}
+
+fn render_created_task(
     task: &CreatedTask,
     options: &Options,
     ansi: bool,
 ) -> Result<String, String> {
-    if options.browse {
-        let configured = crate::browser::configured_browser(dir);
-        crate::browser::open_uris_in_browser(
-            std::slice::from_ref(&task.uri),
-            configured.as_deref(),
-        )?;
-    }
     if options.json {
         let mut doc =
             serde_json::to_string_pretty(&created_json(task)).map_err(json_encode_error)?;
@@ -374,6 +375,42 @@ fn finish_created_task(
         return Ok(doc);
     }
     Ok(render_created(task, ansi))
+}
+
+/// Open the created task in a browser, like PHP's
+/// `openURIsInBrowser` after the creation line. Failures are usage
+/// errors (PHP throws `ArcanistUsageException`).
+pub fn open_created_in_browser(dir: &std::path::Path, task: &CreatedTask) -> Result<(), String> {
+    let configured = crate::browser::configured_browser(dir);
+    crate::browser::open_uris_in_browser(std::slice::from_ref(&task.uri), configured.as_deref())
+}
+
+/// Create the task per `options` in `dir`, returning the stdout text
+/// and the created task (none when the summary is blank). Browsing is
+/// the caller's job, after printing the text.
+pub fn create_in_ansi(
+    _dir: &std::path::Path,
+    client: &conduit::Client,
+    options: &Options,
+    ansi: bool,
+) -> Result<CreatedOutcome, String> {
+    let summary = options.summary.join(" ");
+    if is_blank_summary(&summary) {
+        return Ok(CreatedOutcome {
+            text: "Please provide a summary.\n".to_string(),
+            task: None,
+        });
+    }
+    let params = task_create_params(client, options, summary)?;
+    let result = client
+        .call("maniphest.createtask", &serde_json::Value::Object(params))
+        .map_err(conduit_error_text)?;
+    let task = parse_created(&result).ok_or_else(missing_task_id)?;
+    let text = render_created_task(&task, options, ansi)?;
+    Ok(CreatedOutcome {
+        text,
+        task: Some(task),
+    })
 }
 
 /// Create the task per `options`, returning the stdout text.
@@ -400,6 +437,9 @@ pub fn execute_ansi(
 }
 
 /// Create the task per `options` with `dir` pinning config discovery.
+///
+/// Only the stdout text is returned: `--browse` is the caller's job,
+/// after printing (see [`create_in_ansi`] + [`open_created_in_browser`]).
 pub fn execute_in(
     dir: &std::path::Path,
     client: &conduit::Client,
@@ -409,23 +449,15 @@ pub fn execute_in(
 }
 
 /// Create the task per `options` in `dir` with an explicit ANSI setting
-/// (deterministic under test).
+/// (deterministic under test). `--browse` is the caller's job, after
+/// printing the returned text (T1153 RB-D29b).
 pub fn execute_in_ansi(
     dir: &std::path::Path,
     client: &conduit::Client,
     options: &Options,
     ansi: bool,
 ) -> Result<String, String> {
-    let summary = options.summary.join(" ");
-    if is_blank_summary(&summary) {
-        return Ok("Please provide a summary.\n".to_string());
-    }
-    let params = task_create_params(client, options, summary)?;
-    let result = client
-        .call("maniphest.createtask", &serde_json::Value::Object(params))
-        .map_err(conduit_error_text)?;
-    let task = parse_created(&result).ok_or_else(missing_task_id)?;
-    finish_created_task(dir, &task, options, ansi)
+    create_in_ansi(dir, client, options, ansi).map(|outcome| outcome.text)
 }
 
 /// Entry point: `argv` excludes the subcommand name.
@@ -456,9 +488,18 @@ pub fn run(argv: &[String]) -> ExitCode {
         Ok(client) => client,
         Err(error) => return error.report(),
     };
-    match execute_ansi(&client, &options, terminal::ansi_enabled()) {
-        Ok(out) => {
-            print!("{out}");
+    match create_in_ansi(&cwd, &client, &options, terminal::ansi_enabled()) {
+        Ok(outcome) => {
+            print!("{}", outcome.text);
+            // T1153 RB-D29b: the creation line prints first; `--browse`
+            // opens the task after it (usage errors, like PHP's
+            // `openURIsInBrowser` throw).
+            if options.browse
+                && let Some(task) = outcome.task
+                && let Err(msg) = open_created_in_browser(&cwd, &task)
+            {
+                return conduit::report(EnvelopeKind::Usage, &msg);
+            }
             ExitCode::SUCCESS
         }
         Err(msg) => conduit::report(EnvelopeKind::Exception, &msg),

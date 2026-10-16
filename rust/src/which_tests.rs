@@ -186,6 +186,117 @@ fn base_inputs<'a>(
     }
 }
 
+#[test]
+fn rbd39_query_rows_accept_lists_and_objects() {
+    // Servers send lists, but `differential.query` rows also read
+    // from the object shape (sorted by key), like PHP's `foreach`.
+    let list = serde_json::json!([{"id": 1}, {"id": 2}]);
+    assert_eq!(query_rows(&list).len(), 2);
+    let map = serde_json::json!({"1": {"id": 2}, "0": {"id": 1}});
+    let rows = query_rows(&map);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(row_string(rows[0], "id"), "1");
+    assert_eq!(query_rows(&serde_json::json!(null)).len(), 0);
+}
+
+#[test]
+fn rbd38a_commit_line_in_body_does_not_split() {
+    // PHP scans `--format=medium` with the diff parser, so a body line
+    // `commit <40hex>` splits one commit into two; the `%x01/%x02`
+    // framing keeps it inside the message (kept: PHP bug not
+    // replicated, Rust stays correct).
+    let repo = fresh_repo("rbd38a-body");
+    commit(&repo.path, "a.txt");
+    git(
+        &repo.path,
+        &["commit", "--allow-empty", "-q", "-m", "second"],
+    );
+    git(
+        &repo.path,
+        &[
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "third",
+            "-m",
+            "commit 0123456789abcdef0123456789abcdef01234567",
+            "-m",
+            "Differential Revision: D77",
+        ],
+    );
+    let messages = git_commit_messages(&repo.path, GIT_MAGIC_ROOT_COMMIT, "HEAD").unwrap();
+    assert_eq!(messages.len(), 3);
+    let (ids, _) = collect_explicit_revision_ids(&messages).unwrap();
+    assert_eq!(ids, vec![serde_json::json!(77)]);
+}
+
+#[test]
+fn rbd38e_multiline_and_empty_wrappings_rejected() {
+    // PHP's `(.*)`/`.+` never span `\n`, so multi-line `exec(...)`
+    // is an unrecognized rule (never a shell command), and empty
+    // git-side wrappings fall through to plain ref matching.
+    let repo = fresh_repo("rbd38e-wrap");
+    commit(&repo.path, "a.txt");
+    commit(&repo.path, "b.txt");
+    let loaded = empty_loaded();
+    let inputs = base_inputs("arc:exec(echo hi\nbye)", &never_prompt);
+    let err = resolve_base(&repo.path, None, "HEAD", false, &loaded, &inputs).unwrap_err();
+    assert!(err.contains("not a recognized rule"), "{err}");
+    let inputs = base_inputs("git:merge-base()", &never_prompt);
+    let err = resolve_base(&repo.path, None, "HEAD", false, &loaded, &inputs).unwrap_err();
+    assert!(err.contains("None of the rules"), "{err}");
+    assert_eq!(strip_wrapped("exec(a\nb)", "exec(", ")"), None);
+    assert_eq!(strip_wrapped("exec(a)", "exec(", ")"), Some("a"));
+    assert_eq!(
+        strip_wrapped_nonempty("merge-base()", "merge-base(", ")"),
+        None
+    );
+}
+
+#[test]
+fn rbd21_invalid_head_reports_missing_commit() {
+    let repo = fresh_repo("rbd21-head");
+    commit(&repo.path, "a.txt");
+    let err = resolve_head(&repo.path, "no-such-rev").unwrap_err();
+    assert_eq!(
+        err,
+        "Unable to find any git commit named 'no-such-rev' in this repository."
+    );
+    assert!(is_usage_message(&err));
+    assert!(!is_usage_message("You can't get local commit information."));
+    let head = resolve_head(&repo.path, "HEAD").unwrap();
+    assert_eq!(head.len(), 40);
+}
+
+#[test]
+fn rbd23_upstream_merge_base_failure_renders_command_exception() {
+    // The upstream resolves but the histories are unrelated, so
+    // `merge-base` exits 1 and `execxLocal` raises `CommandException`.
+    let repo = fresh_repo("rbd23-upstream");
+    commit(&repo.path, "a.txt");
+    commit(&repo.path, "b.txt");
+    git(&repo.path, &["checkout", "-q", "--orphan", "other"]);
+    commit(&repo.path, "b.txt");
+    git(&repo.path, &["checkout", "-q", "master"]);
+    git(&repo.path, &["config", "branch.master.remote", "."]);
+    git(
+        &repo.path,
+        &["config", "branch.master.merge", "refs/heads/other"],
+    );
+    let loaded = empty_loaded();
+    let inputs = base_inputs("arc:upstream", &never_prompt);
+    let err = resolve_base(&repo.path, None, "HEAD", false, &loaded, &inputs).unwrap_err();
+    assert!(
+        err.starts_with("Command failed with error #1!\nCOMMAND\ngit merge-base other HEAD\n"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        err.contains("\nSTDOUT\n(empty)\n\nSTDERR\n(empty)"),
+        "{err}"
+    );
+}
+
 fn no_matching() -> MatchConfig<'static> {
     MatchConfig::Unavailable("no conduit in test".to_string())
 }
@@ -600,12 +711,16 @@ fn extracts_revision_ids_from_corpora() {
         revision_id_from_corpus("Differential Revision:").unwrap(),
         None
     );
-    // Whitespace-only values throw with an empty reported value.
+    // T1153 RB-D20: a whitespace-only tail never matches — even
+    // with spaces in it — so empty footers fall through to hash
+    // matching instead of throwing.
     assert_eq!(
-        revision_id_from_corpus("Differential Revision:   ").unwrap_err(),
-        "Invalid \"Differential Revision\" field in commit message. This field should have a \
-         revision identifier like \"D123\" or a server URI like \
-         \"https://devtools.example.com/D123\", but has \"\"."
+        revision_id_from_corpus("Differential Revision:   ").unwrap(),
+        None
+    );
+    assert_eq!(
+        revision_id_from_corpus("Differential Revision:  \n  \n").unwrap(),
+        None
     );
     // The prefix must sit at a line start; matching is ASCII-only.
     assert_eq!(
@@ -641,6 +756,39 @@ fn extracts_revision_ids_from_corpora() {
             .unwrap_err()
             .contains("Invalid \"Differential Revision\" field")
     );
+}
+
+#[test]
+fn rbd25_invalid_footer_uses_ceb_phabricator_text() {
+    assert_eq!(
+        revision_id_from_corpus("Differential Revision: nope").unwrap_err(),
+        "Invalid \"Differential Revision\" field in commit message. This field should have a \
+         revision identifier like \"D123\" or a Phabricator URI like \
+         \"https://phabricator.example.com/D123\", but has \"nope\"."
+    );
+}
+
+#[test]
+fn rbd38b_scheme_split_uris_resolve() {
+    // Without `://`, `PhutilURI` still splits a scheme: `host:D123`
+    // carries path `D123`.
+    assert_eq!(
+        revision_id_from_corpus("Differential Revision: host:D123").unwrap(),
+        Some("123".to_string())
+    );
+    assert_eq!(
+        revision_id_from_corpus("Differential Revision: x:D45?view=all").unwrap(),
+        Some("45".to_string())
+    );
+    // Non-scheme colons still throw.
+    for bad in [
+        "Differential Revision: 1abc:D123",
+        "Differential Revision: :D123",
+        "Differential Revision: host:D12x",
+        "Differential Revision: a:b:c",
+    ] {
+        assert!(revision_id_from_corpus(bad).is_err(), "{bad}");
+    }
 }
 
 #[test]
@@ -768,6 +916,67 @@ fn verdict_words_bold_only_on_tty() {
         styled.contains("it will be \x1b[1mupdated\x1b[m if you run 'arc diff'.\n\n"),
         "{styled}"
     );
+}
+
+#[test]
+fn rbd19_matching_subheader_and_double_space_quirk() {
+    // `ArcanistWhichWorkflow.php:189-193`: the subheader prints on
+    // every matched run (empty or not); with an explicit commit the
+    // multi-revision sentence keeps PHP's double space (`'arc diff '`
+    // plus the leading-space arg).
+    let subheader = "These Differential revisions match the changes in this working copy:\n\n";
+    let empty = ansi_context(Matching::Found(Vec::new()));
+    let plain = render_ansi(&empty, false);
+    assert!(plain.contains(subheader), "{plain}");
+    assert!(
+        plain.contains(&format!("MATCHING REVISIONS\n{subheader}")),
+        "{plain}"
+    );
+
+    let mut ctx = ansi_context(Matching::Found(vec![matched("D1"), matched("D2")]));
+    ctx.diff_arg = " abc123".to_string();
+    let plain = render_ansi(&ctx, false);
+    assert!(plain.contains(subheader), "{plain}");
+    assert!(
+        plain.contains("if you run 'arc diff  abc123'.\n\n"),
+        "{plain}"
+    );
+    let one = ansi_context(Matching::Found(vec![matched("D1")]));
+    assert!(
+        render_ansi(&one, false).contains(subheader),
+        "single-revision runs keep the subheader"
+    );
+}
+
+#[test]
+fn rbd24_empty_repo_fails_after_prefix() {
+    // `ArcanistGitAPI.php:99-113`: PHP prints the repository section
+    // first, then fails with this exact text. `execute` prints the
+    // range-independent prefix before reporting the same failure.
+    let repo = fresh_repo("empty");
+    let resolution = test_resolution("", &never_prompt);
+    let err = match load_context(
+        &repo.path,
+        None,
+        None,
+        None,
+        None,
+        "HEAD",
+        false,
+        &resolution,
+    ) {
+        Err(err) => err,
+        Ok(_) => panic!("empty repo must fail context load"),
+    };
+    assert_eq!(err, NO_LOCAL_COMMITS);
+
+    let prefix = local_prefix_context(&repo.path, None, None, None, "HEAD");
+    let text = render_report_prefix(&prefix, false);
+    for section in ["WORKING COPY", "REPOSITORY", "CONDUIT"] {
+        assert!(text.contains(section), "{text}");
+    }
+    assert!(!text.contains("COMMIT RANGE"), "{text}");
+    assert!(!text.contains("MATCHING REVISIONS"), "{text}");
 }
 
 #[test]

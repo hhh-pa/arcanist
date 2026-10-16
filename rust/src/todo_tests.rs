@@ -132,14 +132,24 @@ fn execute_threads_ansi_through_finish() {
         uri: "https://example.test/T55".to_string(),
     };
     let options = plain_options(&["Do", "thing"]);
-    let dir = std::env::temp_dir();
     assert_eq!(
-        finish_created_task(&dir, &task, &options, false).unwrap(),
+        render_created_task(&task, &options, false).unwrap(),
         render_created(&task, false)
     );
-    let styled = finish_created_task(&dir, &task, &options, true).unwrap();
+    let styled = render_created_task(&task, &options, true).unwrap();
     assert_eq!(styled, render_created(&task, true));
     assert!(styled.contains('\u{1b}'), "got: {styled}");
+}
+
+#[test]
+fn rbd29b_create_returns_task_for_browse_after_print() {
+    // `--browse` no longer runs inside `execute`: the outcome carries
+    // the task so the caller prints first, then browses (like PHP).
+    let client = conduit::Client::new("http://127.0.0.1:9/", "t").unwrap();
+    let options = plain_options(&[]);
+    let outcome = create_in_ansi(std::env::temp_dir().as_path(), &client, &options, false).unwrap();
+    assert_eq!(outcome.text, "Please provide a summary.\n");
+    assert_eq!(outcome.task, None);
 }
 
 #[test]
