@@ -1283,10 +1283,14 @@ pub struct SubmitInput {
 /// Hunks, modes, and companions attach in [`submit_changes_with_hunks`]
 /// from the parsed range text (T1153 EXPORT-E11/E13/E14).
 fn submit_change(entry: &diff_local::ChangeEntry) -> diff_submit::DiffChange {
+    // T1153 OLD-PATH: ADD reports `/dev/null` like the parser
+    // (`ArcanistDiffParser.php:801-808`); moves/copies keep the old
+    // path, deletes/changes keep the current path.
     let old_path = match entry.change_type {
         diff_local::TYPE_MOVE_HERE | diff_local::TYPE_COPY_HERE => {
             entry.old_path.clone().unwrap_or_default()
         }
+        diff_local::TYPE_ADD => "/dev/null".to_string(),
         _ => entry.current.path.clone(),
     };
     let mut change = diff_submit::DiffChange::new_text(&old_path, &entry.current.path);
@@ -2502,8 +2506,7 @@ fn filemode_properties(mode: Option<&str>) -> serde_json::Value {
 
 /// Convert a parsed change to a submit payload change, hunks included.
 ///
-/// Divergence: added files report an empty `oldPath` (normalized from
-/// `/dev/null` by the parser).
+/// Added files report `/dev/null` like the parser (T1153 OLD-PATH).
 pub fn submit_change_from_parsed(change: &diff_local::ParsedChange) -> diff_submit::DiffChange {
     let mut out = diff_submit::DiffChange::new_text(&change.old_path, &change.current_path);
     // T1153 EXPORT-E14: companions report a null old path (PHP never

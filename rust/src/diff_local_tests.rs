@@ -1576,6 +1576,30 @@ fn unified_diff_handles_add_delete_rename_binary() {
 }
 
 #[test]
+fn old_path_add_reports_dev_null_like_php() {
+    // T1153 OLD-PATH: `ArcanistDiffParser.php:801-808` unconditionally
+    // `setOldPath($old_file)` from the `---` line, so git/hg ADD
+    // carries `/dev/null` (not empty or the current path).
+    let add = "diff --git a/new.txt b/new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hi\n";
+    let changes = parse_unified_diff(add).unwrap();
+    assert_eq!(changes[0].change_type, TYPE_ADD);
+    assert_eq!(changes[0].old_path, "/dev/null");
+    assert_eq!(changes[0].current_path, "new.txt");
+    // Hg `--git` ADD uses the same `/dev/null` shape.
+    let hg_add = "diff -r abc123 new.txt\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hi\n";
+    let changes = parse_unified_diff(hg_add).unwrap();
+    assert_eq!(changes[0].change_type, TYPE_ADD);
+    assert_eq!(changes[0].old_path, "/dev/null");
+    // DELETE keeps the path on both sides (PHP discards the `+++`
+    // `/dev/null`, `:804-808` only sets the old path from `---`).
+    let delete = "diff --git a/old.txt b/old.txt\ndeleted file mode 100644\n--- a/old.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-bye\n";
+    let changes = parse_unified_diff(delete).unwrap();
+    assert_eq!(changes[0].change_type, TYPE_DELETE);
+    assert_eq!(changes[0].old_path, "old.txt");
+    assert_eq!(changes[0].current_path, "old.txt");
+}
+
+#[test]
 fn unified_diff_handles_hg_and_svn_headers() {
     let hg = "diff -r abc123 f.txt\n--- f.txt\tThu Jan 01 00:00:00 2026\n+++ f.txt\tThu Jan 01 00:00:00 2026\n@@ -1 +1 @@\n-a\n+b\n";
     let changes = parse_unified_diff(hg).unwrap();

@@ -937,6 +937,64 @@ fn g1_hunk_and_change_conversion() {
 }
 
 #[test]
+fn old_path_submit_pipelines_report_dev_null_for_add() {
+    // T1153 OLD-PATH: both submit pipelines report `/dev/null` for
+    // ADD (`ArcanistDiffParser.php:801-808`), not empty or the
+    // current path.
+    let parsed = diff_local::ParsedChange {
+        old_path: "/dev/null".to_string(),
+        current_path: "n.txt".to_string(),
+        change_type: diff_local::TYPE_ADD,
+        file_type: diff_local::FILE_TEXT,
+        hunks: Vec::new(),
+        hunk_len_explicit: Vec::new(),
+        old_mode: None,
+        new_mode: None,
+        away_paths: Vec::new(),
+        commit_hash: None,
+        message: None,
+    };
+    let submit = submit_change_from_parsed(&parsed);
+    assert_eq!(submit.old_path.as_deref(), Some("/dev/null"));
+    assert_eq!(submit.current_path, "n.txt");
+    // Raw-diff pipeline parses the `--- /dev/null` line.
+    let text = "diff --git a/n.txt b/n.txt\nnew file mode 100644\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1 @@\n+hi\n";
+    let changes = parse_raw_diff_changes(text).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].old_path.as_deref(), Some("/dev/null"));
+    assert_eq!(changes[0].current_path, "n.txt");
+    // Entry pipeline (git range skeletons) maps ADD to `/dev/null`.
+    let entry = diff_local::ChangeEntry {
+        change_type: diff_local::TYPE_ADD,
+        file_type: diff_local::FILE_TEXT,
+        old_path: None,
+        away_paths: Vec::new(),
+        current: FileDiff {
+            path: "e.txt".to_string(),
+            added: 1,
+            deleted: 0,
+        },
+    };
+    let submit = submit_change(&entry);
+    assert_eq!(submit.old_path.as_deref(), Some("/dev/null"));
+    assert_eq!(submit.current_path, "e.txt");
+    // DELETE keeps the path (PHP discards the `+++` side).
+    let entry = diff_local::ChangeEntry {
+        change_type: diff_local::TYPE_DELETE,
+        file_type: diff_local::FILE_TEXT,
+        old_path: None,
+        away_paths: Vec::new(),
+        current: FileDiff {
+            path: "d.txt".to_string(),
+            added: 0,
+            deleted: 1,
+        },
+    };
+    let submit = submit_change(&entry);
+    assert_eq!(submit.old_path.as_deref(), Some("d.txt"));
+}
+
+#[test]
 fn g1_vcs_kind_detection() {
     assert_eq!(VcsKind::Git.name(), "git");
     assert_eq!(VcsKind::Hg.name(), "hg");

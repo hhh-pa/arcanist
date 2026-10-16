@@ -375,6 +375,8 @@ fn renders_ref_views_and_ambiguous_block() {
         epoch: 9,
         summary: "work".to_string(),
         message: "work".to_string(),
+        // T1153 WORK-HG: git tips render as branches.
+        marker_type: "branch".to_string(),
     };
     assert_eq!(
         marker_ref_view(&tip, 80, false),
@@ -672,4 +674,269 @@ fn save_and_restore_roundtrips_branches() {
         git(tmp.path(), &["rev-parse", "HEAD"]),
         git(tmp.path(), &["rev-parse", &detached.commit])
     );
+}
+
+// T1153 WORK-HG: hg tests use an inline `sh` fake (no `hg` binary in
+// CI), like `land35_hg_without_shelve_matches_php_error`.
+fn hg_fake_script() -> &'static str {
+    "#!/bin/sh\necho \"$*\" >> .fakehg.log\nargs=\"$*\"\ncase \"$args\" in\n  *--encoding*) shift 2 2>/dev/null || true;;\nesac\nsub=\"\"\nfor a in \"$@\"; do case \"$a\" in --encoding|--config|extensions.*) continue;; -*) continue;; *) sub=\"$a\"; break;; esac; done\nif [ -e \".fakehg-fail-$sub\" ]; then exit 1; fi\nNODE=\"0123456789abcdef0123456789abcdef01234567\"\ncase \"$sub\" in\n  branch) if [ \"$args\" != \"${args%--force*}\" ]; then exit 0; fi\n    if [ -e .fakehg-branch ]; then cat .fakehg-branch; else echo \"default\"; fi;;\n  bookmarks) if [ -e .fakehg-bookmarks ]; then cat .fakehg-bookmarks; fi;;\n  branches) if [ -e .fakehg-branches ]; then cat .fakehg-branches; fi;;\n  status) if [ -e .fakehg-status ]; then cat .fakehg-status; fi;;\n  log) case \"$args\" in *\"{desc}\"*) if [ -e .fakehg-msg ]; then cat .fakehg-msg; else echo \"old message\"; fi;; *) printf '%s' \"$NODE\";; esac;;\n  update|checkout|bookmark) exit 0;;\n  shelve|unshelve) if [ -e .fakehg-no-shelve ]; then exit 1; fi; exit 0;;\n  *) exit 0;;\nesac\nexit 0\n"
+}
+
+fn hg_test_repo(tag: &str) -> (TempDir, crate::hg::HgCommand) {
+    let tmp = TempDir::new(tag);
+    std::fs::create_dir_all(tmp.path().join(".hg")).unwrap();
+    let script = tmp.path().join("fakehg.sh");
+    std::fs::write(&script, hg_fake_script()).unwrap();
+    let hg_cmd = crate::hg::HgCommand::custom("sh", &[&script.to_string_lossy()]);
+    (tmp, hg_cmd)
+}
+
+fn hg_read_log(dir: &Path) -> String {
+    std::fs::read_to_string(dir.join(".fakehg.log")).unwrap_or_default()
+}
+
+#[test]
+fn hg_default_start_is_dot() {
+    // T1153 WORK-HG: `ArcanistMercurialAPI.php:451-453` returns `.`.
+    assert_eq!(hg_default_start(), ".");
+    assert_eq!(crate::hg::get_working_copy_revision(), ".");
+}
+
+#[test]
+fn hg_parses_bookmarks_and_active_mark() {
+    // T1153 WORK-HG: `*` marks the active bookmark.
+    assert_eq!(
+        parse_hg_bookmarks_active("  feat  3:abc\n* active  5:def\n"),
+        Some("active".to_string())
+    );
+    assert_eq!(parse_hg_bookmarks_active("  feat  3:abc\n"), None);
+    assert_eq!(parse_hg_bookmarks_active(""), None);
+    let names = parse_hg_bookmark_names("  feat  3:abc\n* active  5:def\n");
+    assert_eq!(names, vec!["feat".to_string(), "active".to_string()]);
+    let nodes = parse_hg_bookmark_nodes("  feat  3:abc123\n* active  5:def456\n");
+    assert_eq!(
+        nodes,
+        vec![
+            ("feat".to_string(), "abc123".to_string()),
+            ("active".to_string(), "def456".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn hg_renders_bookmark_ref_views() {
+    // T1153 WORK-HG: `ArcanistMarkerRef.php:27-36` renders
+    // `Bookmark "x"` for bookmarks, `Branch "x"` otherwise.
+    let bookmark = BranchTip {
+        name: "feat".to_string(),
+        commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+        tree: String::new(),
+        epoch: 0,
+        summary: "work".to_string(),
+        message: "work".to_string(),
+        marker_type: "bookmark".to_string(),
+    };
+    assert_eq!(
+        marker_ref_view(&bookmark, 80, false),
+        "  *   Bookmark \"feat\" 0123456789ab work\n"
+    );
+    let branch = BranchTip {
+        marker_type: "branch".to_string(),
+        ..bookmark
+    };
+    assert!(marker_ref_view(&branch, 80, false).contains("Branch \"feat\""));
+}
+
+#[test]
+fn hg_shelve_names_match_php_shape() {
+    // T1153 WORK-HG: `arc-` plus 12 `[a-z2-7]`
+    // (`Filesystem.php:538-558`).
+    for _ in 0..10 {
+        let name = new_hg_shelve_name();
+        assert!(name.starts_with("arc-"), "{name}");
+        assert_eq!(name.len(), 16, "{name}");
+        assert!(
+            name[4..]
+                .bytes()
+                .all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7')),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn hg_dirty_lists_group_status_flags() {
+    // T1153 WORK-HG: tracked files are uncommitted
+    // (`ArcanistMercurialAPI.php:307-323`).
+    let (tmp, hg_cmd) = hg_test_repo("hg-dirty");
+    std::fs::write(tmp.path().join(".fakehg-status"), "M a.txt\n? new.txt\n").unwrap();
+    let lists = hg_dirty_lists_with(tmp.path(), &hg_cmd).unwrap();
+    assert_eq!(lists.untracked, vec!["new.txt".to_string()]);
+    assert_eq!(lists.uncommitted, vec!["a.txt".to_string()]);
+    assert!(lists.unstaged.is_empty());
+    assert!(lists.externals.is_empty());
+}
+
+#[test]
+fn hg_save_and_restore_roundtrips_state() {
+    // T1153 WORK-HG: save reads commit/branch/bookmark; restore runs
+    // `update`, `branch --force`, `bookmark --force`
+    // (`ArcanistMercurialLocalState.php:82-107`).
+    let (tmp, hg_cmd) = hg_test_repo("hg-state");
+    std::fs::write(
+        tmp.path().join(".fakehg-bookmarks"),
+        "  feat  3:abc\n* active  5:def\n",
+    )
+    .unwrap();
+    let state = save_hg_state_with(tmp.path(), &hg_cmd).unwrap();
+    assert_eq!(state.commit, "0123456789abcdef0123456789abcdef01234567");
+    assert_eq!(state.branch, "default");
+    assert_eq!(state.bookmark.as_deref(), Some("active"));
+    restore_hg_state_with(tmp.path(), &hg_cmd, &state).unwrap();
+    let log = hg_read_log(tmp.path());
+    assert!(log.contains("update -- 0123456789abcdef"), "{log}");
+    assert!(log.contains("branch --force -- default"), "{log}");
+    assert!(log.contains("bookmark --force -- active"), "{log}");
+}
+
+#[test]
+fn hg_markers_match_bookmarks_and_branches() {
+    // T1153 WORK-HG: symbols match bookmarks plus branches
+    // (`ArcanistWorkEngine.php:37-57`).
+    let (tmp, hg_cmd) = hg_test_repo("hg-markers");
+    std::fs::write(tmp.path().join(".fakehg-bookmarks"), "  feat  3:abc\n").unwrap();
+    std::fs::write(
+        tmp.path().join(".fakehg-branches"),
+        "default                    1:abc123\n",
+    )
+    .unwrap();
+    let markers = hg_markers_for_symbol_with(tmp.path(), &hg_cmd, "feat");
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].1, "bookmark");
+    let markers = hg_markers_for_symbol_with(tmp.path(), &hg_cmd, "default");
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].1, "branch");
+    assert!(hg_markers_for_symbol_with(tmp.path(), &hg_cmd, "missing").is_empty());
+    // Same name in both lists is ambiguous.
+    std::fs::write(tmp.path().join(".fakehg-bookmarks"), "  default  3:abc\n").unwrap();
+    let markers = hg_markers_for_symbol_with(tmp.path(), &hg_cmd, "default");
+    assert_eq!(markers.len(), 2);
+}
+
+#[test]
+fn hg_dispatch_checks_out_and_creates_bookmarks() {
+    // T1153 WORK-HG: existing markers check out
+    // (`:31-54`); new symbols become bookmarks (`:11-29`).
+    let (tmp, hg_cmd) = hg_test_repo("hg-dispatch");
+    std::fs::write(tmp.path().join(".fakehg-bookmarks"), "  feat  3:abc\n").unwrap();
+    std::fs::write(tmp.path().join(".fakehg-branches"), "").unwrap();
+    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({"data": []}))
+    };
+    hg_dispatch_symbol_with(tmp.path(), &hg_cmd, "feat", None, &call).unwrap();
+    let log = hg_read_log(tmp.path());
+    assert!(log.contains("checkout feat --"), "{log}");
+    // New symbol creates a bookmark from `.` (no `update` when the
+    // start is the default).
+    std::fs::remove_file(tmp.path().join(".fakehg.log")).ok();
+    hg_dispatch_symbol_with(tmp.path(), &hg_cmd, "novel", None, &call).unwrap();
+    let log = hg_read_log(tmp.path());
+    assert!(log.contains("bookmark novel --"), "{log}");
+    assert!(!log.contains("update --"), "{log}");
+    // Explicit startpoints update first.
+    std::fs::remove_file(tmp.path().join(".fakehg.log")).ok();
+    hg_dispatch_symbol_with(
+        tmp.path(),
+        &hg_cmd,
+        "branched",
+        Some("abc123".to_string()),
+        &call,
+    )
+    .unwrap();
+    let log = hg_read_log(tmp.path());
+    assert!(log.contains("update -- abc123"), "{log}");
+    assert!(log.contains("bookmark branched --"), "{log}");
+}
+
+#[test]
+fn hg_ambiguous_symbols_fail_like_php() {
+    // T1153 WORK-HG: `ArcanistWorkEngine.php:42-51` throws
+    // `Symbol "x" is ambiguous.`
+    let (tmp, hg_cmd) = hg_test_repo("hg-ambiguous");
+    std::fs::write(tmp.path().join(".fakehg-bookmarks"), "  dup  3:abc\n").unwrap();
+    std::fs::write(tmp.path().join(".fakehg-branches"), "dup  1:abc123\n").unwrap();
+    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({"data": []}))
+    };
+    let err = hg_dispatch_symbol_with(tmp.path(), &hg_cmd, "dup", None, &call).unwrap_err();
+    assert_eq!(err, "Symbol \"dup\" is ambiguous.");
+}
+
+#[test]
+fn hg_without_shelve_fails_like_php() {
+    // T1153 WORK-HG: without shelve, hg fails with the verbatim PHP
+    // usage error (`ArcanistRepositoryLocalState.php:143-148`).
+    let (tmp, hg_cmd) = hg_test_repo("hg-noshelve");
+    std::fs::write(tmp.path().join(".fakehg-status"), "M a.txt\n").unwrap();
+    std::fs::write(tmp.path().join(".fakehg-no-shelve"), "").unwrap();
+    let lists = hg_dirty_lists_with(tmp.path(), &hg_cmd).unwrap();
+    let mut input: &[u8] = b"y\n";
+    let err = hg_maybe_shelve_with(tmp.path(), &hg_cmd, &mut input, &lists).unwrap_err();
+    assert_eq!(
+        err,
+        "You can not continue with uncommitted changes. Commit or discard them before proceeding."
+    );
+}
+
+#[test]
+fn hg_revision_symbols_find_hash_and_footer_markers() {
+    // T1153 WORK-HG: hg markers associate via `hgcm` hashes
+    // (`ArcanistMercurialAPI.php:578-592`) plus `Differential
+    // Revision:` footers, like git.
+    let (tmp, hg_cmd) = hg_test_repo("hg-rev");
+    std::fs::write(
+        tmp.path().join(".fakehg-bookmarks"),
+        "  feat  3:0123456789abcdef0123456789abcdef01234567\n",
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join(".fakehg-branches"), "").unwrap();
+    std::fs::write(
+        tmp.path().join(".fakehg-msg"),
+        "subject\n\nDifferential Revision: https://phab.example/D123\n",
+    )
+    .unwrap();
+    let call = |method: &str, params: &serde_json::Value| -> Result<serde_json::Value, String> {
+        if method == "differential.query" {
+            // Hash path misses (wrong node); footer path hits.
+            return Ok(serde_json::json!([{
+                "phid": "PHID-DREV-1",
+                "hashes": [["hgcm", "ffffffffffffffffffffffffffffffffffffffff"]],
+            }]));
+        }
+        if method == "differential.revision.search" {
+            let ids = params
+                .get("constraints")
+                .and_then(|c| c.get("ids"))
+                .cloned()
+                .unwrap_or_default();
+            if ids == serde_json::json!(["123"]) || ids == serde_json::json!([123]) {
+                return Ok(serde_json::json!({"data": [{
+                    "id": 123,
+                    "phid": "PHID-DREV-1",
+                }]}));
+            }
+            return Ok(serde_json::json!({"data": []}));
+        }
+        Ok(serde_json::json!({"data": []}))
+    };
+    let revision = Revision {
+        id: "123".to_string(),
+        phid: "PHID-DREV-1".to_string(),
+        monogram: "D123".to_string(),
+        title: "Fix it".to_string(),
+    };
+    let tips = hg_branches_for_revision_with(&call, tmp.path(), &hg_cmd, &revision).unwrap();
+    assert_eq!(tips.len(), 1);
+    assert_eq!(tips[0].name, "feat");
+    assert_eq!(tips[0].marker_type, "bookmark");
 }
