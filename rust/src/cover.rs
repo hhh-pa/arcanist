@@ -31,7 +31,6 @@
 //! sites use `pht` (including the real `en_US` plural table), and
 //! markup-free `sprintf` sites use plain `format!`.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -46,10 +45,13 @@ use arc_rs::{git, terminal};
 pub const NAME: &str = "cover";
 
 fn usage() -> String {
-    "usage: arc cover [--rev REV] [PATH...]\n\
+    "usage: arc cover [--rev revision] [path ...]\n\
      \n\
+     Supports: git\n\
      Cover your... professional reputation. Show blame for the lines you\n\
-     changed in your working copy (or since some commit), grouped by author.\n\
+     changed in your working copy (svn) or since some commit (hg, git).\n\
+     This will take a minute because blame takes a minute, especially under\n\
+     SVN.\n\
      \n\
      Options:\n\
      \x20 --rev REV      Cover changes since a specific revision.\n\
@@ -58,6 +60,10 @@ fn usage() -> String {
      Not yet ported (see T1128): Subversion and Mercurial working copies.\n"
         .to_string()
 }
+
+/// The empty-tree object PHP accepts as an explicit base
+/// (`ArcanistGitAPI::GIT_MAGIC_ROOT_COMMIT`).
+const GIT_MAGIC_ROOT_COMMIT: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /// Parsed `cover` options.
 #[derive(Debug, PartialEq, Eq)]
@@ -73,7 +79,8 @@ pub enum ParseOutcome {
     Error(String),
 }
 
-/// Parse `argv` (excluding the subcommand name).
+/// Parse `argv` (excluding the subcommand name). Error bytes match
+/// PHP's argument parser (`ArcanistWorkflow.php:815-880`).
 pub fn parse_args(argv: &[String]) -> ParseOutcome {
     let mut rev = None;
     let mut paths = Vec::new();
@@ -86,15 +93,18 @@ pub fn parse_args(argv: &[String]) -> ParseOutcome {
             end_of_flags = true;
         } else if arg == "--rev" {
             let Some(value) = iter.next() else {
-                return ParseOutcome::Error("--rev requires a value".to_string());
+                return ParseOutcome::Error("Option '--rev' requires a parameter.".to_string());
             };
             rev = Some(value.clone());
         } else if let Some(value) = arg.strip_prefix("--rev=") {
             rev = Some(value.to_string());
         } else if arg == "-h" || arg == "--help" {
             return ParseOutcome::Help;
-        } else if arg.starts_with('-') {
-            return ParseOutcome::Error(format!("unknown flag '{arg}'"));
+        } else if let Some(long) = arg.strip_prefix("--") {
+            let key = long.split('=').next().unwrap_or("");
+            return ParseOutcome::Error(format!("Unknown argument '{key}'. Try 'arc help'."));
+        } else if let Some(key) = arg.strip_prefix('-') {
+            return ParseOutcome::Error(format!("Unknown argument '{key}'. Try 'arc help'."));
         } else {
             paths.push(arg.clone());
         }
@@ -135,14 +145,18 @@ fn resolve_commit(dir: &Path, rev: &str) -> Option<String> {
 /// Resolve `--rev` to the merge-base with `HEAD`, like
 /// `ArcanistGitAPI::buildBaseCommit()`. On ties git prints several bases;
 /// the first wins (PHP would feed the whole blob to later commands).
+/// The empty-tree magic commit is accepted directly, like PHP.
 fn resolve_rev_base(dir: &Path, rev: &str) -> Result<String, String> {
+    if rev == GIT_MAGIC_ROOT_COMMIT {
+        return Ok(rev.to_string());
+    }
     let failure = || {
         terminal::pht(
             "Unable to find any git commit named '%s' in this repository.",
             &[PhtArg::Text(rev)],
         )
     };
-    let out = git::stdout_text(dir, &["merge-base", "--", rev, "HEAD"]).map_err(|_| failure())?;
+    let out = git::stdout_text(dir, &["merge-base", rev, "HEAD"]).map_err(|_| failure())?;
     out.lines()
         .next()
         .filter(|line| !line.is_empty())
@@ -171,18 +185,92 @@ fn check_working_copy(dir: &Path) -> Result<(), String> {
     ))
 }
 
+/// Resolve `.` and `..` lexically (no filesystem access), so
+/// `..` segments cannot defeat prefix stripping.
+fn lexical_clean(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            _ => out.push(component.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
+}
+
+/// Express absolute `target` relative to `dir` (both cleaned
+/// lexically), for git pathspecs. Returns `None` when the two share
+/// no common prefix.
+fn relative_to_dir(dir: &Path, target: &Path) -> Option<String> {
+    let dir = lexical_clean(dir);
+    let target = lexical_clean(target);
+    if let Ok(relative) = target.strip_prefix(&dir) {
+        if relative.as_os_str().is_empty() {
+            return Some(".".to_string());
+        }
+        return Some(relative.to_string_lossy().into_owned());
+    }
+    let mut dir_parts: Vec<_> = dir.components().collect();
+    let mut target_parts: Vec<_> = target.components().collect();
+    let mut common = 0;
+    while common < dir_parts.len()
+        && common < target_parts.len()
+        && dir_parts[common] == target_parts[common]
+    {
+        common += 1;
+    }
+    if common == 0 {
+        return None;
+    }
+    dir_parts.drain(..common);
+    target_parts.drain(..common);
+    let mut out = PathBuf::new();
+    for _ in &dir_parts {
+        out.push("..");
+    }
+    for part in target_parts {
+        out.push(part.as_os_str());
+    }
+    Some(out.to_string_lossy().into_owned())
+}
+
 /// Explicit paths must exist in the worktree, like
 /// `selectPathsForWorkflow()`: `pht("Path '%s' does not exist!", $path)`.
-fn check_cover_paths(dir: &Path, paths: &[String]) -> Result<(), String> {
+/// Returns usable git pathspecs: absolute paths resolve to
+/// dir-relative form like PHP's `readablePath` normalization, so they
+/// select files instead of matching nothing.
+fn check_cover_paths(dir: &Path, paths: &[String]) -> Result<Vec<String>, String> {
+    let mut out = Vec::with_capacity(paths.len());
     for path in paths {
-        if !dir.join(path).exists() {
+        let candidate = Path::new(path);
+        let absolute = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            dir.join(candidate)
+        };
+        if !absolute.exists() {
             return Err(terminal::pht(
                 "Path '%s' does not exist!",
                 &[PhtArg::Text(path)],
             ));
         }
+        if candidate.is_absolute() {
+            match relative_to_dir(dir, candidate) {
+                Some(relative) => out.push(relative),
+                None => out.push(path.clone()),
+            }
+        } else {
+            out.push(path.clone());
+        }
     }
-    Ok(())
+    Ok(out)
 }
 
 /// Repository root for resolving diff output paths (which git reports
@@ -351,7 +439,8 @@ fn apply_diff_line(state: &mut DiffParse, line: &str) {
 /// Parse `git diff --unified=0` output into per-file OLD-side cover lines.
 /// Files without cover lines (deletions of nothing, binary files, mode
 /// changes) are kept with empty line lists so callers can tell "changed
-/// but unattributable" from "unchanged".
+/// but unattributable" from "unchanged". Lines are deduplicated in
+/// first-seen order, like PHP's `cover_map` keys.
 pub fn parse_diff_unified0(text: &str) -> Vec<FileChanges> {
     let mut state = DiffParse {
         files: Vec::new(),
@@ -361,7 +450,17 @@ pub fn parse_diff_unified0(text: &str) -> Vec<FileChanges> {
         apply_diff_line(&mut state, line);
     }
     state.files.retain(|file| !file.path.is_empty());
+    for file in &mut state.files {
+        dedupe_cover_lines(&mut file.lines);
+    }
     state.files
+}
+
+/// Drop duplicate cover lines, keeping first-seen order (PHP's
+/// `cover_map` is keyed, so `array_keys()` never repeats).
+fn dedupe_cover_lines(lines: &mut Vec<u64>) {
+    let mut seen = std::collections::HashSet::new();
+    lines.retain(|line| seen.insert(*line));
 }
 
 /// One blamed line: the author git reports, plus whether the line sits on
@@ -491,15 +590,13 @@ fn exists_at_base(dir: &Path, base: &str, path: &str) -> bool {
 }
 
 /// Changed lines grouped by author in first-seen order (PHP's `$covers`
-/// is insertion-ordered), then by file.
-pub type Covers = Vec<(String, BTreeMap<String, Vec<u64>>)>;
+/// is insertion-ordered), then by file in first-seen order (PHP keeps
+/// CLI order, not alphabetical).
+pub type Covers = Vec<(String, Vec<(String, Vec<u64>)>)>;
 
-fn covers_files_for<'a>(
-    covers: &'a mut Covers,
-    author: &str,
-) -> &'a mut BTreeMap<String, Vec<u64>> {
+fn covers_files_for<'a>(covers: &'a mut Covers, author: &str) -> &'a mut Vec<(String, Vec<u64>)> {
     if !covers.iter().any(|(name, _)| name == author) {
-        covers.push((author.to_string(), BTreeMap::new()));
+        covers.push((author.to_string(), Vec::new()));
     }
     let entry = covers
         .iter_mut()
@@ -523,10 +620,12 @@ fn attribute_lines(blame: &[BlameLine], changes: &FileChanges, covers: &mut Cove
         if blamed.boundary || blamed.author.is_empty() {
             continue;
         }
-        covers_files_for(covers, &blamed.author)
-            .entry(changes.path.clone())
-            .or_default()
-            .push(*line);
+        let files = covers_files_for(covers, &blamed.author);
+        if let Some(entry) = files.iter_mut().find(|(path, _)| *path == changes.path) {
+            entry.1.push(*line);
+        } else {
+            files.push((changes.path.clone(), vec![*line]));
+        }
     }
 }
 
@@ -583,8 +682,10 @@ pub fn render_covers_ansi(covers: &Covers, ansi: bool) -> String {
 
 fn resolve_cover_base(dir: &Path, rev: Option<&str>) -> Result<Option<String>, String> {
     match rev {
-        Some(rev) => resolve_rev_base(dir, rev).map(Some),
-        None => Ok(resolve_commit(dir, "HEAD")),
+        // An empty `--rev=` is falsy in PHP, so it falls back to the
+        // default base like no `--rev` at all.
+        Some(rev) if !rev.is_empty() => resolve_rev_base(dir, rev).map(Some),
+        _ => Ok(resolve_commit(dir, "HEAD")),
     }
 }
 
@@ -642,10 +743,17 @@ pub fn execute_cover_text_ansi(
     ansi: bool,
 ) -> Result<String, String> {
     check_working_copy(dir)?;
+    // Explicit paths are validated before the revision resolves: PHP's
+    // `parseBaseCommitArgument()` only stores the rev, while
+    // `selectPathsForWorkflow()` throws the path error first.
+    let paths = check_cover_paths(dir, &options.paths)?;
     let base = resolve_cover_base(dir, options.rev.as_deref())?;
-    check_cover_paths(dir, &options.paths)?;
     let top = repo_top(dir);
-    let files = collect_cover_changes(dir, base.as_deref(), options)?;
+    let normalized = Options {
+        rev: options.rev.clone(),
+        paths,
+    };
+    let files = collect_cover_changes(dir, base.as_deref(), &normalized)?;
     if options.paths.is_empty() && files.is_empty() {
         return Ok(no_changes_message());
     }

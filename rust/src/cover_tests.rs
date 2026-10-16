@@ -108,13 +108,14 @@ fn parses_rev_paths_and_help() {
         })
     );
     assert_eq!(parse_args(&args(&["--help"])), ParseOutcome::Help);
+    // COVER-C14: PHP argument-parser bytes.
     assert_eq!(
         parse_args(&args(&["--rev"])),
-        ParseOutcome::Error("--rev requires a value".to_string())
+        ParseOutcome::Error("Option '--rev' requires a parameter.".to_string())
     );
     assert_eq!(
         parse_args(&args(&["--bogus"])),
-        ParseOutcome::Error("unknown flag '--bogus'".to_string())
+        ParseOutcome::Error("Unknown argument 'bogus'. Try 'arc help'.".to_string())
     );
 }
 
@@ -155,6 +156,7 @@ fn hunk_headers_yield_old_and_new_offsets() {
 #[test]
 fn cover_map_tracks_old_side_lines() {
     // Modify middle line: `-` covers old 2; `+` covers old 2 and 3.
+    // COVER-C5: PHP keys dedupe, so the repeated 2 appears once.
     let diff = "diff --git a/f.txt b/f.txt\n\
          index 1111111..2222222 100644\n\
          --- a/f.txt\n\
@@ -168,7 +170,7 @@ fn cover_map_tracks_old_side_lines() {
         parse_diff_unified0(diff),
         vec![FileChanges {
             path: "f.txt".to_string(),
-            lines: vec![2, 2, 3],
+            lines: vec![2, 3],
         }]
     );
 }
@@ -176,6 +178,7 @@ fn cover_map_tracks_old_side_lines() {
 #[test]
 fn cover_map_marks_insertion_neighbors() {
     // Pure insertion after old line 5 covers old 4 and 5 per added line.
+    // COVER-C5: deduped to one pair.
     let diff = "diff --git a/f.txt b/f.txt\n\
          --- a/f.txt\n\
          +++ b/f.txt\n\
@@ -186,7 +189,7 @@ fn cover_map_marks_insertion_neighbors() {
         parse_diff_unified0(diff),
         vec![FileChanges {
             path: "f.txt".to_string(),
-            lines: vec![4, 5, 4, 5],
+            lines: vec![4, 5],
         }]
     );
 }
@@ -215,10 +218,10 @@ fn cover_map_tracks_deletions_and_new_files() {
                 lines: vec![2, 3],
             },
             // New files cover old line 0 (the PHP quirk); callers prune
-            // added files and never attribute line 0.
+            // added files and never attribute line 0. COVER-C5: deduped.
             FileChanges {
                 path: "new.txt".to_string(),
-                lines: vec![0, 0],
+                lines: vec![0],
             },
         ]
     );
@@ -229,6 +232,7 @@ fn corpus_lines_beat_section_headers_by_count() {
     // An added line reading `+++ foo` must stay corpus: the hunk expects
     // exactly one new line, so the `+++` prefix never misroutes. The `+`
     // covers old 1 (predecessor, since old_line is 2) and old 2.
+    // COVER-C5: deduped.
     let diff = "diff --git a/f.txt b/f.txt\n\
          --- a/f.txt\n\
          +++ b/f.txt\n\
@@ -239,7 +243,7 @@ fn corpus_lines_beat_section_headers_by_count() {
         parse_diff_unified0(diff),
         vec![FileChanges {
             path: "f.txt".to_string(),
-            lines: vec![1, 1, 2],
+            lines: vec![1, 2],
         }]
     );
 }
@@ -439,13 +443,14 @@ fn worktree_edits_attribute_base_authors() {
     commit_as(tmp.path(), "f.txt", "one\ntwo\nthree\nfour\nfive\n", "bob");
     std::fs::write(tmp.path().join("f.txt"), "one\ntwo\nthree\nFOUR\nfive\n").unwrap();
     // `-` covers old 4 (ann); `+` covers old 4 and 5 (ann, bob).
+    // COVER-C5: deduped, so each author owns one line (singular noun).
     assert_eq!(
         execute_cover_text_ansi(tmp.path(), &options(&[]), false),
-        Ok("ann\n  f.txt: lines 4\nbob\n  f.txt: line 5\n".to_string())
+        Ok("ann\n  f.txt: line 4\nbob\n  f.txt: line 5\n".to_string())
     );
     assert_eq!(
         execute_cover_text_ansi(tmp.path(), &options(&["f.txt"]), false),
-        Ok("ann\n  f.txt: lines 4\nbob\n  f.txt: line 5\n".to_string())
+        Ok("ann\n  f.txt: line 4\nbob\n  f.txt: line 5\n".to_string())
     );
 }
 
@@ -470,9 +475,10 @@ fn ranges_cover_committed_lines_since_rev() {
     commit_as(tmp.path(), "f.txt", "one\nTWO!\nthree\n", "bob");
     // Base is the merge-base of HEAD~1 and HEAD; blame runs there, so old
     // 2 attributes to yara while root-commit old 3 stays boundary.
+    // COVER-C5: deduped to one line (singular noun).
     assert_eq!(
         execute_cover_text_ansi(tmp.path(), &options(&["--rev", "HEAD~1"]), false),
-        Ok("yara\n  f.txt: lines 2\n".to_string())
+        Ok("yara\n  f.txt: line 2\n".to_string())
     );
     assert_eq!(
         execute_cover_text_ansi(tmp.path(), &options(&["--rev", "no-such-rev"]), false),
@@ -577,4 +583,249 @@ fn rejects_bad_contexts_and_flags() {
 fn run_reports_help_and_usage_errors() {
     assert_eq!(run(&args(&["--help"])), std::process::ExitCode::SUCCESS);
     assert_eq!(run(&args(&["--bogus"])), std::process::ExitCode::FAILURE);
+}
+
+#[test]
+fn cover_c2_blame_attributes_correct_line() {
+    // Keep (Rule 2a): PHP looks the 1-based line up in a 0-indexed
+    // list, attributing the next line's author; Rust attributes line
+    // N to blame entry N-1. Experiment: three single-author lines,
+    // change the middle one — the middle author must own it, not the
+    // third line's author.
+    let mut covers: Covers = Vec::new();
+    let blame = vec![
+        BlameLine {
+            author: "first".to_string(),
+            boundary: false,
+        },
+        BlameLine {
+            author: "second".to_string(),
+            boundary: false,
+        },
+        BlameLine {
+            author: "third".to_string(),
+            boundary: false,
+        },
+    ];
+    attribute_lines(
+        &blame,
+        &FileChanges {
+            path: "f.txt".to_string(),
+            lines: vec![2],
+        },
+        &mut covers,
+    );
+    assert_eq!(
+        render_covers_ansi(&covers, false),
+        "second\n  f.txt: line 2\n"
+    );
+}
+
+#[test]
+fn cover_c3_boundary_lines_keep_indexes_stable() {
+    // Keep (Rule 2a): PHP drops boundary lines, shifting later
+    // indexes; Rust preserves them flagged, so line N still maps to
+    // entry N-1 and boundary lines stay unattributed.
+    let mut covers: Covers = Vec::new();
+    let blame = vec![
+        BlameLine {
+            author: "ancient".to_string(),
+            boundary: true,
+        },
+        BlameLine {
+            author: "recent".to_string(),
+            boundary: false,
+        },
+    ];
+    attribute_lines(
+        &blame,
+        &FileChanges {
+            path: "f.txt".to_string(),
+            lines: vec![1, 2],
+        },
+        &mut covers,
+    );
+    assert_eq!(
+        render_covers_ansi(&covers, false),
+        "recent\n  f.txt: line 2\n"
+    );
+}
+
+#[test]
+fn cover_c4_blame_failure_stays_unattributed() {
+    // Keep (Rule 2a): PHP fatals when a passed file cannot be blamed
+    // at the base; Rust leaves it unattributed with exit 0.
+    let tmp = init_repo("c4");
+    commit_file(tmp.path(), "f.txt", "one\n");
+    std::fs::write(tmp.path().join("new.txt"), "hello\n").unwrap();
+    git(tmp.path(), &["add", "new.txt"]);
+    assert_eq!(
+        execute_cover_text_ansi(tmp.path(), &options(&["new.txt"]), false),
+        Ok("You're covered, your changes didn't touch anyone else's code.\n".to_string())
+    );
+}
+
+#[test]
+fn cover_c5_first_line_change_uses_singular_noun() {
+    // Deleting the only second line covers just old 2: a single
+    // deduped line renders with the singular noun.
+    let diff = "diff --git a/f.txt b/f.txt\n\
+         --- a/f.txt\n\
+         +++ b/f.txt\n\
+         @@ -1,2 +1 @@\n\
+         \x20one\n\
+         -two\n";
+    assert_eq!(
+        parse_diff_unified0(diff),
+        vec![FileChanges {
+            path: "f.txt".to_string(),
+            lines: vec![2],
+        }]
+    );
+}
+
+#[test]
+fn cover_c6_files_keep_cli_order() {
+    // Files under one author render in first-seen (CLI/diff) order,
+    // not alphabetical.
+    let mut covers: Covers = Vec::new();
+    let blame = vec![BlameLine {
+        author: "ann".to_string(),
+        boundary: false,
+    }];
+    for path in ["zebra.txt", "apple.txt"] {
+        attribute_lines(
+            &blame,
+            &FileChanges {
+                path: path.to_string(),
+                lines: vec![1],
+            },
+            &mut covers,
+        );
+    }
+    assert_eq!(
+        render_covers_ansi(&covers, false),
+        "ann\n  zebra.txt: line 1\n  apple.txt: line 1\n"
+    );
+}
+
+#[test]
+fn cover_c7_bad_path_beats_bad_rev() {
+    let tmp = init_repo("c7");
+    commit_file(tmp.path(), "f.txt", "one\n");
+    assert_eq!(
+        execute_cover_text_ansi(
+            tmp.path(),
+            &options(&["--rev", "no-such-rev", "no-such-file.txt"]),
+            false
+        ),
+        Err("Path 'no-such-file.txt' does not exist!".to_string())
+    );
+}
+
+#[test]
+fn cover_c8_empty_rev_means_default_base() {
+    let tmp = init_repo("c8");
+    commit_file(tmp.path(), "f.txt", "one\n");
+    // Empty `--rev=` behaves like no `--rev`: a clean tree reports no
+    // changes instead of a revision error.
+    assert_eq!(
+        execute_cover_text_ansi(tmp.path(), &options(&["--rev="]), false),
+        Ok("You're covered, you didn't change anything.\n".to_string())
+    );
+}
+
+#[test]
+fn cover_c9_empty_tree_rev_is_accepted() {
+    let tmp = init_repo("c9");
+    commit_file(tmp.path(), "f.txt", "one\n");
+    // The magic empty-tree commit resolves as a base instead of
+    // erroring like an unknown rev; a clean tree then reports no
+    // changes (nothing exists at the empty base to blame).
+    assert_eq!(
+        execute_cover_text_ansi(
+            tmp.path(),
+            &options(&["--rev", "4b825dc642cb6eb9a060e54bf8d69288fbee4904"]),
+            false
+        ),
+        Ok("You're covered, you didn't change anything.\n".to_string())
+    );
+}
+
+#[test]
+fn cover_c10_single_commit_repo_reports_untouched() {
+    // Keep (Rule 2a): PHP fatals on one-commit repos; Rust attributes
+    // against HEAD where every line is boundary, hence untouched.
+    let tmp = init_repo("c10");
+    commit_as(tmp.path(), "f.txt", "one\ntwo\n", "ann");
+    std::fs::write(tmp.path().join("f.txt"), "one\nTWO\n").unwrap();
+    assert_eq!(
+        execute_cover_text_ansi(tmp.path(), &options(&[]), false),
+        Ok("You're covered, your changes didn't touch anyone else's code.\n".to_string())
+    );
+}
+
+#[test]
+fn cover_c11_absolute_paths_select_files() {
+    let tmp = init_repo("c11");
+    commit_as(tmp.path(), "f.txt", "one\ntwo\nthree\n", "zelda");
+    commit_as(tmp.path(), "f.txt", "one\ntwo\nthree\nfour\n", "ann");
+    std::fs::write(tmp.path().join("f.txt"), "one\ntwo\nthree\nFOUR\n").unwrap();
+    let absolute = tmp.path().join("f.txt").to_string_lossy().into_owned();
+    let by_relative = execute_cover_text_ansi(tmp.path(), &options(&["f.txt"]), false);
+    let by_absolute = execute_cover_text_ansi(tmp.path(), &options(&[&absolute]), false);
+    assert_eq!(by_absolute, by_relative);
+    assert!(by_absolute.unwrap().contains("ann"));
+}
+
+#[test]
+fn cover_c12_author_zero_is_attributed() {
+    // Keep (Rule 2a): PHP's falsy check drops author "0"; Rust
+    // attributes every non-empty author.
+    let mut covers: Covers = Vec::new();
+    let blame = vec![BlameLine {
+        author: "0".to_string(),
+        boundary: false,
+    }];
+    attribute_lines(
+        &blame,
+        &FileChanges {
+            path: "f.txt".to_string(),
+            lines: vec![1],
+        },
+        &mut covers,
+    );
+    assert_eq!(render_covers_ansi(&covers, false), "0\n  f.txt: line 1\n");
+}
+
+#[test]
+fn cover_c14_arg_errors_use_php_bytes() {
+    assert_eq!(
+        parse_args(&args(&["-x"])),
+        ParseOutcome::Error("Unknown argument 'x'. Try 'arc help'.".to_string())
+    );
+    assert_eq!(
+        parse_args(&args(&["--bogus=value"])),
+        ParseOutcome::Error("Unknown argument 'bogus'. Try 'arc help'.".to_string())
+    );
+}
+
+#[test]
+fn cover_c15_help_uses_php_wording() {
+    let help = super::usage();
+    assert!(help.contains("usage: arc cover [--rev revision] [path ...]"));
+    assert!(help.contains("Cover your... professional reputation."));
+    assert!(help.contains("Cover changes since a specific revision."));
+}
+
+#[test]
+fn cover_c16_merge_base_has_no_dashdash() {
+    // The argv shape is fixed by `resolve_rev_base`; a bad rev still
+    // reports the PHP bytes through the bare `merge-base` call.
+    let tmp = init_repo("c16");
+    commit_file(tmp.path(), "f.txt", "one\n");
+    assert_eq!(
+        execute_cover_text_ansi(tmp.path(), &options(&["--rev", "nope"]), false),
+        Err("Unable to find any git commit named 'nope' in this repository.".to_string())
+    );
 }
