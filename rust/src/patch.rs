@@ -47,14 +47,15 @@
 //!   source encodings still decode as Windows-1252 (PHP supports any
 //!   `mbstring` encoding). UTF-8 input passes through. The
 //!   repository-encoding lookup (`getRepositoryEncoding()`, UTF-8 by
-//!   default) is not ported: conduit sources always decode as UTF-8
-//!   unless `--encoding` says otherwise.
-//! - Interactive editors are not ported: commit-message editing (patch
-//!   commits, and the clean-check "create a commit" yes-path) fails with
-//!   a guidance error naming `--nocommit` instead of opening `$EDITOR`.
-//! - The clean-check amend detection (`calculateShouldAmend()`) is not
-//!   ported: the prompt always offers "create a new commit", never
-//!   "amend".
+//!   default) feeds conduit bundles (PATCH-P11): `--encoding` wins,
+//!   else the unique repository match, else UTF-8.
+//! - Patch commits and the clean-check yes-path open `$EDITOR` like
+//!   PHP (PATCH-P8/P9); without an editor hook the guidance error naming
+//!   `--nocommit` survives only in the offline resolver.
+//! - The clean-check amend detection (`calculateShouldAmend()`) is
+//!   ported except the final working-copy revision lookup (D8): messages
+//!   carrying a revision ID conservatively decline, and the
+//!   published-check is skipped without a conduit channel.
 //! - `arc patch` outside a working copy fails with the established
 //!   port message (`not inside a git, hg, or svn working copy`); the PHP
 //!   runner error was not found in the vendored sources.
@@ -90,7 +91,11 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use arc_rs::land::{self, Io, Out};
-use arc_rs::{diff_local::ParsedHunk, diff_submit, git, hg, svn, terminal};
+use arc_rs::{
+    config, diff,
+    diff_local::{self, ParsedHunk},
+    diff_submit, get_config, git, hg, svn, terminal,
+};
 
 /// Subcommand name, matching `arc patch`.
 pub const NAME: &str = "patch";
@@ -459,10 +464,16 @@ pub fn select_source(options: &Options) -> Result<Source, String> {
     if let Some(path) = options.patch.as_deref() {
         sources.push(Source::Patch(path.to_string()));
     }
-    if let Some(diff) = options.diff.as_deref() {
+    // PATCH-P13: PHP skips falsy values (`if (!$value) continue`,
+    // `:127-130`), so empty ids mean "no source", not a local error.
+    if let Some(diff) = options.diff.as_deref().filter(|diff| !diff.is_empty()) {
         sources.push(Source::Diff(normalize_numeric_id("diff", diff)?));
     }
-    if let Some(revision) = options.revision.as_deref() {
+    if let Some(revision) = options
+        .revision
+        .as_deref()
+        .filter(|revision| !revision.is_empty())
+    {
         sources.push(Source::Revision(normalize_numeric_id(
             "revision", revision,
         )?));
@@ -485,28 +496,34 @@ pub fn select_source(options: &Options) -> Result<Source, String> {
 }
 
 /// Normalize a revision monogram: strip one leading `D` (either case),
-/// like `ArcanistWorkflow::normalizeRevisionID()` (`:1586-1588`), then
-/// require digits (a fail-fast port extension; PHP would fail later at
-/// Conduit with a passthrough error).
+/// like `ArcanistWorkflow::normalizeRevisionID()`, and pass the rest to
+/// Conduit unvalidated (`ArcanistPatchWorkflow.php:132-143`).
+///
+/// PATCH-P13: the old digit check was a fail-fast port extension; PHP
+/// fails server-side with a passthrough error instead.
 pub fn normalize_revision_id(value: &str) -> Result<String, String> {
     normalize_numeric_id("revision", value)
 }
 
-/// Normalize a `--diff` ID the same way (`:256-258` normalizes both).
+/// Pass a `--diff` ID through untouched: PHP never normalizes `diff`
+/// (`:132-143` only touches `revision`/`name`).
+///
+/// PATCH-P13: `--diff D12` reaches Conduit verbatim and fails there.
 pub fn normalize_diff_id(value: &str) -> Result<String, String> {
     normalize_numeric_id("diff", value)
 }
 
-/// Strip one leading `D`/`d` and require an all-digit remainder.
+/// Strip one leading `D`/`d` for revisions; pass diffs through raw.
+/// Never fails: non-numeric ids fail server-side, like PHP.
 fn normalize_numeric_id(kind: &str, value: &str) -> Result<String, String> {
-    let stripped = value
+    if kind == "diff" {
+        return Ok(value.to_string());
+    }
+    Ok(value
         .strip_prefix('D')
         .or_else(|| value.strip_prefix('d'))
-        .unwrap_or(value);
-    if stripped.is_empty() || !stripped.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(format!("invalid {kind} '{value}': expected D12345"));
-    }
-    Ok(stripped.to_string())
+        .unwrap_or(value)
+        .to_string())
 }
 
 /// A loaded patch bundle: the patch text plus metadata.
@@ -2131,7 +2148,9 @@ pub fn parse_diff_rows(result: &serde_json::Value) -> Vec<DiffRow> {
                 .to_string(),
         });
     }
-    rows.sort_by_key(|row| row.id);
+    // PATCH-P3: PHP takes `head()` of the server-ordered rows
+    // (`ArcanistWorkflow.php:1384`); no id sort — row order is the
+    // server's `querydiffs` order.
     rows
 }
 
@@ -2163,7 +2182,8 @@ pub fn fetch_conduit_bundle(
 ) -> Result<Bundle, String> {
     let result = call(diff_submit::METHOD_QUERY_DIFFS, params)?;
     let rows = parse_diff_rows(&result);
-    let Some(diff) = rows.into_iter().next_back() else {
+    // PATCH-P3: `head()` — the first row in server order, not max id.
+    let Some(diff) = rows.into_iter().next() else {
         return Err(NO_DIFF_OR_REVISION.to_string());
     };
     let row = result
@@ -2208,6 +2228,30 @@ pub fn fetch_revision_bundle(
 pub fn fetch_diff_bundle(
     call: &diff_submit::ConduitCall<'_>,
     diff_id: u64,
+) -> Result<Bundle, String> {
+    fetch_conduit_bundle(call, &serde_json::json!({"ids": [diff_id]}), None)
+}
+
+/// Load the bundle for a raw `--revision` / positional id: the id goes
+/// to `querydiffs` verbatim as a string (PHP passes argv strings
+/// unvalidated; PATCH-P13). Non-numeric ids fail server-side; the bundle
+/// revision id falls back to the row's.
+pub fn fetch_revision_bundle_raw(
+    call: &diff_submit::ConduitCall<'_>,
+    revision_id: &str,
+) -> Result<Bundle, String> {
+    fetch_conduit_bundle(
+        call,
+        &serde_json::json!({"revisionIDs": [revision_id]}),
+        revision_id.parse::<u64>().ok(),
+    )
+}
+
+/// Load the bundle for a raw `--diff` id, verbatim like PHP
+/// (PATCH-P13).
+pub fn fetch_diff_bundle_raw(
+    call: &diff_submit::ConduitCall<'_>,
+    diff_id: &str,
 ) -> Result<Bundle, String> {
     fetch_conduit_bundle(call, &serde_json::json!({"ids": [diff_id]}), None)
 }
@@ -2611,10 +2655,10 @@ pub enum StashState {
 /// `--force` skips the whole check (`ArcanistPatchWorkflow.php:312-314`).
 /// Incomplete directories, conflicts, and missing files fail with the
 /// verbatim errors; dirty externals and untracked files prompt (declining
-/// aborts); uncommitted/unstaged changes prompt to create a commit —
-/// answering yes fails with port guidance (no interactive editor), and
-/// answering no autostashes under git with `arc.autostash`, else fails
-/// with the verbatim error. Returns whether a stash must be popped.
+/// aborts); uncommitted/unstaged changes prompt to commit — answering
+/// yes commits via the editor (PATCH-P9), and answering no autostashes
+/// under git with `arc.autostash`, else fails with the verbatim error.
+/// Returns whether a stash must be popped.
 pub fn require_clean_tree(
     dir: &Path,
     vcs: Vcs,
@@ -2633,6 +2677,22 @@ pub fn require_clean_tree_ansi(
     io: &mut Io,
     force: bool,
     ansi: bool,
+) -> Result<StashState, String> {
+    require_clean_tree_with_call(dir, vcs, backends, io, force, ansi, None)
+}
+
+/// [`require_clean_tree_ansi`] with a conduit channel for amend
+/// detection: the published-check runs when `call` is present
+/// (PATCH-P9).
+#[allow(clippy::too_many_arguments)]
+pub fn require_clean_tree_with_call(
+    dir: &Path,
+    vcs: Vcs,
+    backends: &Backends,
+    io: &mut Io,
+    force: bool,
+    ansi: bool,
+    call: Option<&diff_submit::ConduitCall<'_>>,
 ) -> Result<StashState, String> {
     if force {
         return Ok(StashState::Clean);
@@ -2654,7 +2714,9 @@ pub fn require_clean_tree_ansi(
     if status.unstaged.is_empty() && status.uncommitted.is_empty() {
         return Ok(StashState::Clean);
     }
-    resolve_uncommitted_tree(dir, vcs, io, &status, &desc)
+    resolve_uncommitted_tree(dir, vcs, backends, io, &status, &desc, call, &|template| {
+        diff::edit_interactively(template, EDITOR_COMMIT_MESSAGE, None, None, 0)
+    })
 }
 
 /// Fail on incomplete directories, conflicts, and missing files with the
@@ -2751,15 +2813,361 @@ fn prune_tree_overlaps(status: &mut TreeStatus) {
 }
 
 /// Print the uncommitted/unstaged lists and resolve them: offering a new
-/// commit (yes fails without an interactive editor), autostashing under
-/// git with `arc.autostash`, else failing with the verbatim error.
+/// Editor name for clean-check commit messages (`:1239`).
+pub const EDITOR_COMMIT_MESSAGE: &str = "commit-message";
+/// Error when the commit template leaves the editor unchanged (`:1243`).
+pub const MUST_PROVIDE_MESSAGE: &str = "You must provide a commit message.";
+/// Error when the stripped commit message is empty (`:1251`).
+pub const MUST_PROVIDE_NONEMPTY_MESSAGE: &str = "You must provide a nonempty commit message.";
+
+/// Ask-for-add prompt: amend vs create wording (`getAskForAddPrompt()`,
+/// `ArcanistWorkflow.php:1348-1359`).
+#[must_use]
+pub fn ask_for_add_prompt(amend: bool, count: usize) -> String {
+    if amend {
+        format!("Do you want to amend these {count} change(s) to the current commit?")
+    } else {
+        format!("Do you want to create a new commit with these {count} change(s)?")
+    }
+}
+
+/// Editor template for a clean-check commit: the comment header plus the
+/// unique sorted paths (`:1222-1237`).
+#[must_use]
+pub fn commit_offer_template(unstaged: &[String], uncommitted: &[String]) -> String {
+    let mut paths: Vec<&str> = unstaged
+        .iter()
+        .chain(uncommitted.iter())
+        .map(String::as_str)
+        .collect();
+    paths.sort_unstable();
+    paths.dedup();
+    let mut template = "\n\n# Enter a commit message.\n#\n# Changes:\n#\n".to_string();
+    for path in paths {
+        template.push_str("#     ");
+        template.push_str(path);
+        template.push('\n');
+    }
+    template
+}
+
+/// HEAD/tip identity for amend detection.
+struct HeadInfo {
+    /// Commit hash.
+    hash: String,
+    /// Commit author name (parsed like `getAuthor()`).
+    author: String,
+    /// Full commit message.
+    message: String,
+}
+
+/// `HEAD` identity, or `None` with no commits.
+fn git_head_info(dir: &Path) -> Result<Option<HeadInfo>, String> {
+    if !git::ok(dir, &["rev-parse", "--verify", "HEAD"]) {
+        return Ok(None);
+    }
+    let out = git::stdout_text(dir, &["log", "-1", "--format=%H\x01%an\x01%B", "--"])?;
+    let mut parts = out.splitn(3, '\x01');
+    let (Some(hash), Some(author), Some(message)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return Err("malformed git log output".to_string());
+    };
+    Ok(Some(HeadInfo {
+        hash: hash.to_string(),
+        author: author.to_string(),
+        message: message.to_string(),
+    }))
+}
+
+/// Working-parent identity, or `None` with no commits.
+fn hg_tip_info(dir: &Path, hg_cmd: &hg::HgCommand) -> Result<Option<HeadInfo>, String> {
+    let out = hg::output_with(
+        dir,
+        hg_cmd,
+        &[
+            "log",
+            "-r",
+            ".",
+            "--template",
+            "{node}\x01{author}\x01{desc}",
+        ],
+    )?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut parts = text.splitn(3, '\x01');
+    let (Some(node), Some(full_author), Some(desc)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return Ok(None);
+    };
+    if node.is_empty() {
+        return Ok(None);
+    }
+    let (author, _) = hg::parse_full_author(full_author);
+    Ok(Some(HeadInfo {
+        hash: node.to_string(),
+        author: author.unwrap_or_default(),
+        message: desc.to_string(),
+    }))
+}
+
+/// `isHistoryImmutable()` for the clean check (`ArcanistWorkflow.php:1592-1600`).
+fn patch_history_immutable(dir: &Path, vcs: Vcs) -> bool {
+    let default = !matches!(vcs, Vcs::Git);
+    let user_file = config::arcrc_path();
+    let merged = get_config::load_merged(
+        dir,
+        user_file.as_deref(),
+        &get_config::LoadOptions::default(),
+    );
+    let Ok(merged) = merged else {
+        return default;
+    };
+    get_config::merged_value("history.immutable", &merged)
+        .and_then(|(_, value)| value.as_bool())
+        .unwrap_or(default)
+}
+
+/// The `repository.query` constraint for the amend published-check,
+/// mirroring `getRepositoryQuery()`: configured callsign, then the VCS
+/// UUID (svn), then the remote URI.
+fn amend_repository_query(
+    dir: &Path,
+    vcs: Vcs,
+    backends: &Backends,
+) -> Result<Option<serde_json::Value>, String> {
+    let user_file = config::arcrc_path();
+    let sources = get_config::load_sources(dir, user_file.as_deref())?;
+    if let Some((_, value)) = get_config::current_value("repository.callsign", &sources)
+        && let Some(callsign) = value.as_str().map(str::trim)
+        && !callsign.is_empty()
+    {
+        return Ok(Some(serde_json::json!({"callsigns": [callsign]})));
+    }
+    let (uuid, remote) = match vcs {
+        Vcs::Git => (None, git::remote_uri(dir)?),
+        Vcs::Hg => (None, hg::get_remote_uri_with(dir, &backends.hg)?),
+        Vcs::Svn => (
+            svn::get_repository_uuid_with(dir, &backends.svn)?,
+            svn::get_remote_uri_with(dir, &backends.svn)?,
+        ),
+    };
+    if let Some(uuid) = uuid {
+        return Ok(Some(serde_json::json!({"uuids": [uuid]})));
+    }
+    Ok(remote.map(|remote| serde_json::json!({"remoteURIs": [remote]})))
+}
+
+/// Project repository encoding for bundle conversion
+/// (`getRepositoryEncoding()`, `ArcanistWorkflow.php:1780-1784`, via
+/// `loadRepositoryInformation()`): the unique `repository.query` match's
+/// `encoding`, defaulting to UTF-8. Unidentified repositories and
+/// `ERR-CONDUIT-CALL` (unknown method) also yield UTF-8; other conduit
+/// failures yield None (PHP catches them at `:408-410`).
+///
+/// PATCH-P11: applied to conduit bundles (render is a no-op for UTF-8;
+/// `decode_bytes` also passes valid UTF-8 through for legacy names,
+/// where PHP's converter would mangle already-UTF-8 conduit content).
+fn patch_repository_encoding(
+    dir: &Path,
+    vcs: Vcs,
+    backends: &Backends,
+    call: &diff_submit::ConduitCall<'_>,
+) -> Result<Option<String>, String> {
+    let query = match amend_repository_query(dir, vcs, backends)? {
+        Some(query) => query,
+        None => return Ok(Some("UTF-8".to_string())),
+    };
+    let results = match call("repository.query", &query) {
+        Ok(results) => results,
+        Err(error) if is_conduit_call_error(&error) => {
+            return Ok(Some("UTF-8".to_string()));
+        }
+        Err(_) => return Ok(None),
+    };
+    let matches = results.as_array().cloned().unwrap_or_default();
+    if matches.len() != 1 {
+        return Ok(Some("UTF-8".to_string()));
+    }
+    Ok(Some(
+        matches[0]
+            .get("encoding")
+            .and_then(|v| v.as_str())
+            .filter(|encoding| !encoding.is_empty())
+            .unwrap_or("UTF-8")
+            .to_string(),
+    ))
+}
+
+/// True for `ERR-CONDUIT-CALL` failures (unknown conduit method).
+#[must_use]
+pub fn is_conduit_call_error(error: &str) -> bool {
+    error == "ERR-CONDUIT-CALL" || error.starts_with("ERR-CONDUIT-CALL:")
+}
+
+/// True when `hash` is already known upstream (`calculateShouldAmend()`'s
+/// `diffusion.querycommits` probe, `:1294-1311`): an unidentified
+/// repository skips the check, like PHP's `if ($repository)` guard.
+fn patch_commit_published(
+    call: &diff_submit::ConduitCall<'_>,
+    query: &serde_json::Value,
+    hash: &str,
+) -> Result<bool, String> {
+    let results = call("repository.query", query)?;
+    let matches = results.as_array().cloned().unwrap_or_default();
+    if matches.len() != 1 {
+        return Ok(false);
+    }
+    let row = &matches[0];
+    let name = match row.get("callsign").and_then(|v| v.as_str()) {
+        Some(callsign) if !callsign.is_empty() => format!("r{callsign}{hash}"),
+        _ => {
+            let id = row.get("id").and_then(diff_submit::loose_u64).unwrap_or(0);
+            format!("R{id}:{hash}")
+        }
+    };
+    let result = call(
+        "diffusion.querycommits",
+        &serde_json::json!({"names": [name.clone()]}),
+    )?;
+    Ok(result
+        .get("identifierMap")
+        .and_then(|map| map.get(&name))
+        .is_some_and(|hit| !hit.is_null()))
+}
+
+/// Amend decision plus the HEAD message for the amend itself.
+///
+/// PATCH-P9: ports `calculateShouldAmend()` (`:1261-1327`) except the
+/// final working-copy revision lookup (D8's unported
+/// `loadWorkingCopyDifferentialRevisions()`): a message carrying a
+/// revision ID conservatively declines. Without a conduit channel the
+/// published-check is skipped (an unidentified repository skips it in
+/// PHP too); PHP without conduit fatals outright, so no reference
+/// behavior exists there.
+fn calculate_patch_should_amend(
+    dir: &Path,
+    vcs: Vcs,
+    backends: &Backends,
+    call: Option<&diff_submit::ConduitCall<'_>>,
+) -> Result<(bool, Option<String>), String> {
+    let supports_amend = match vcs {
+        Vcs::Git => true,
+        Vcs::Hg => diff::hg_supports_amend_with(dir, &backends.hg),
+        Vcs::Svn => false,
+    };
+    if patch_history_immutable(dir, vcs) || !supports_amend {
+        return Ok((false, None));
+    }
+    let head = match vcs {
+        Vcs::Git => git_head_info(dir)?,
+        Vcs::Hg => hg_tip_info(dir, &backends.hg)?,
+        Vcs::Svn => None,
+    };
+    let Some(head) = head else {
+        return Ok((false, None));
+    };
+    let parsed = diff_local::CommitMessage::new_from_raw_corpus(&head.message)?;
+    if parsed.git_svn_base_revision.is_some() {
+        return Ok((false, None));
+    }
+    let author_matches = match vcs {
+        Vcs::Git => git::author(dir).map(|author| author == head.author)?,
+        Vcs::Hg => {
+            hg::get_author_with(dir, &backends.hg)?.is_some_and(|author| author == head.author)
+        }
+        Vcs::Svn => false,
+    };
+    if !author_matches {
+        return Ok((false, None));
+    }
+    if let Some(call) = call
+        && let Some(query) = amend_repository_query(dir, vcs, backends)?
+        && patch_commit_published(call, &query, &head.hash)?
+    {
+        return Ok((false, None));
+    }
+    if parsed.revision_id.is_some() {
+        // Residual: PHP consults the working-copy open revisions (D8);
+        // without that loader, decline.
+        return Ok((false, None));
+    }
+    Ok((true, Some(head.message)))
+}
+
+/// Stage `unstaged` for commit on any VCS (`addToCommit()`).
+fn patch_add_to_commit(
+    dir: &Path,
+    vcs: Vcs,
+    backends: &Backends,
+    unstaged: &[String],
+) -> Result<(), String> {
+    if unstaged.is_empty() {
+        return Ok(());
+    }
+    let refs: Vec<&str> = unstaged.iter().map(String::as_str).collect();
+    match vcs {
+        Vcs::Git => git::add_to_commit(dir, &refs),
+        Vcs::Hg => hg::add_to_commit_with(dir, &backends.hg, &refs),
+        Vcs::Svn => svn::add_to_commit_with(dir, &backends.svn, &refs),
+    }
+}
+
+/// Commit the staged yes-path changes: amend the HEAD message, or edit a
+/// new message and commit it (`:1218-1254`).
+fn commit_yes_path_changes(
+    dir: &Path,
+    vcs: Vcs,
+    backends: &Backends,
+    amend: bool,
+    head_message: Option<&str>,
+    template: &str,
+    edit: EditHook<'_>,
+) -> Result<(), String> {
+    if amend {
+        let message = head_message.unwrap_or("");
+        return match vcs {
+            Vcs::Git => git::amend_commit(dir, Some(message)),
+            Vcs::Hg => hg::amend_commit_with(dir, &backends.hg, Some(message), None),
+            Vcs::Svn => Ok(()),
+        };
+    }
+    let edited = edit(template)?;
+    if edited == template {
+        return Err(MUST_PROVIDE_MESSAGE.to_string());
+    }
+    let stripped = diff_local::remove_comments(&edited);
+    if stripped.is_empty() {
+        return Err(MUST_PROVIDE_NONEMPTY_MESSAGE.to_string());
+    }
+    match vcs {
+        Vcs::Git => git::do_commit(dir, &stripped),
+        Vcs::Hg => hg::do_commit_with(dir, &backends.hg, &stripped),
+        // Subversion supports no local commits: staged, but uncommitted.
+        Vcs::Svn => Ok(()),
+    }
+}
+
+/// Offer to commit uncommitted/unstaged changes, then autostash or fail
+/// (`askForAdd()` + the commit block, `:1159-1258`).
+///
+/// PATCH-P9: "yes" commits via the editor (amending when
+/// [`calculate_patch_should_amend`] says so) instead of failing; the
+/// prompt varies between amend and create wording.
+#[allow(clippy::too_many_arguments)]
 fn resolve_uncommitted_tree(
     dir: &Path,
     vcs: Vcs,
+    backends: &Backends,
     io: &mut Io,
     status: &TreeStatus,
     desc: &str,
+    call: Option<&diff_submit::ConduitCall<'_>>,
+    edit: EditHook<'_>,
 ) -> Result<StashState, String> {
+    // Warmed before the echo, like PHP (`:1163-1165`).
+    let (amend, head_message) = calculate_patch_should_amend(dir, vcs, backends, call)?;
     io.push_out(&format!(
         "You have uncommitted changes in this working copy.\n\n{desc}"
     ));
@@ -2778,26 +3186,32 @@ fn resolve_uncommitted_tree(
     }
     io.push_out(&format!("{}\n", lists.join("\n\n")));
     let count = status.unstaged.len() + status.uncommitted.len();
-    // Amend detection is not ported (see the module docs): always offer a
-    // new commit (`getAskForAddPrompt()`, `:1348-1359`).
-    let query = format!("Do you want to create a new commit with these {count} change(s)?");
-    if land::console_confirm(io, &query, true)? {
+    if !land::console_confirm(io, &ask_for_add_prompt(amend, count), true)? {
+        if autostash_permitted(dir) && vcs == Vcs::Git {
+            io.push_out(
+                "Stashing uncommitted changes. (You can restore them with `git stash pop`).\n",
+            );
+            git::stdout_text(dir, &["stash"])?;
+            return Ok(StashState::Stashed);
+        }
         return Err(
-            "Can not commit changes without an interactive editor. Commit, stash, or discard \
-             them manually, then run \"arc patch\" again."
+            "You can not continue with uncommitted changes. Commit or discard them before \
+             proceeding."
                 .to_string(),
         );
     }
-    if autostash_permitted(dir) && vcs == Vcs::Git {
-        io.push_out("Stashing uncommitted changes. (You can restore them with `git stash pop`).\n");
-        git::stdout_text(dir, &["stash"])?;
-        return Ok(StashState::Stashed);
-    }
-    Err(
-        "You can not continue with uncommitted changes. Commit or discard them before \
-         proceeding."
-            .to_string(),
-    )
+    patch_add_to_commit(dir, vcs, backends, &status.unstaged)?;
+    let template = commit_offer_template(&status.unstaged, &status.uncommitted);
+    commit_yes_path_changes(
+        dir,
+        vcs,
+        backends,
+        amend,
+        head_message.as_deref(),
+        &template,
+        edit,
+    )?;
+    Ok(StashState::Clean)
 }
 
 /// Pop an autostash taken by [`require_clean_tree`]
@@ -2905,9 +3319,11 @@ pub fn parse_dependency_node(row: &serde_json::Value) -> Option<DependencyNode> 
 /// (`buildDependencyGraph()`, `:1115-1144`, plus
 /// `ArcanistDifferentialDependencyGraph::loadEdges()`, `:33-56`).
 ///
-/// Expands `phabricator:depends-on` edges breadth-first via
-/// `differential.query`, pruning revisions whose commit hash is already
-/// local (`has_local_commit`). Returns nodes in discovery order.
+/// Expands `phabricator:depends-on` edges breadth-first, one batched
+/// `differential.query` per frontier level like `loadEdges()` (PATCH-P4).
+/// Revisions whose commit hash is already local are kept with empty
+/// edges — still applied, just not expanded — like PHP (PATCH-P5).
+/// Returns nodes in discovery order.
 pub fn load_dependency_nodes(
     call: &diff_submit::ConduitCall<'_>,
     start_id: u64,
@@ -2927,33 +3343,40 @@ pub fn load_dependency_nodes(
     let mut nodes: Vec<DependencyNode> = vec![start];
     let mut seen = vec![start_phid.clone()];
     let mut queue: VecDeque<String> = nodes[0].depends_on.iter().cloned().collect();
-    while let Some(phid) = queue.pop_front() {
-        if seen.contains(&phid) {
+    while !queue.is_empty() {
+        // One batched query per frontier level (PATCH-P4).
+        let mut level: Vec<String> = queue.drain(..).collect();
+        level.retain(|phid| !seen.contains(phid));
+        if level.is_empty() {
             continue;
         }
-        seen.push(phid.clone());
+        seen.extend(level.iter().cloned());
         let result = call(
             diff_submit::METHOD_QUERY,
-            &serde_json::json!({"phids": [phid]}),
+            &serde_json::json!({"phids": level}),
         )?;
         let rows = result.as_array().cloned().unwrap_or_default();
-        let Some(node) = rows.first().and_then(parse_dependency_node) else {
-            continue;
-        };
-        let hash = rows
-            .first()
-            .and_then(|row| row.get("hashes"))
-            .and_then(|hashes| hashes.get(hash_key))
-            .and_then(|hash| hash.as_str());
-        if has_local_commit(hash) {
-            continue;
-        }
-        for dep in &node.depends_on {
-            if !seen.contains(dep) {
-                queue.push_back(dep.clone());
+        for row in &rows {
+            let Some(mut node) = parse_dependency_node(row) else {
+                continue;
+            };
+            let hash = row
+                .get("hashes")
+                .and_then(|hashes| hashes.get(hash_key))
+                .and_then(|hash| hash.as_str());
+            if has_local_commit(hash) {
+                // PATCH-P5: kept with empty edges (still applied).
+                node.depends_on.clear();
+                nodes.push(node);
+                continue;
             }
+            for dep in &node.depends_on {
+                if !seen.contains(dep) {
+                    queue.push_back(dep.clone());
+                }
+            }
+            nodes.push(node);
         }
-        nodes.push(node);
     }
     Ok((nodes, start_phid))
 }
@@ -3114,9 +3537,25 @@ fn suffixed_revision(
     text
 }
 
-/// Exact `$EDITOR` template for patch commit messages
-/// (`ArcanistPatchWorkflow.php:954-965`).
-pub const COMMIT_TEMPLATE: &str = "\n\n# Enter a commit message.\n#\n# This message will be associated with a Differential revision.\n#\n# Differential Revision: <URL or ID of the Differential Revision>\n#\n";
+/// Exact `$EDITOR` template for patch commit messages, without a
+/// failed-fetch note (`ArcanistPatchWorkflow.php:900-909`).
+///
+/// PATCH-P12: the old text and citation (`:954-965`) were invented; PHP
+/// renders `sprintf("\n\n# %s%s\n", $help, $prompt_message)`.
+pub const COMMIT_TEMPLATE: &str = "\n\n# Enter a commit message for this patch. If you just want to apply the patch to the working copy without committing, re-run arc patch with the --nocommit flag.\n";
+
+/// Render the patch commit-message template, appending the failed-fetch
+/// note for `revision_id` when Differential had no message
+/// (`ArcanistPatchWorkflow.php:888-909`).
+#[must_use]
+pub fn patch_commit_template(failed_revision_id: Option<&str>) -> String {
+    match failed_revision_id {
+        None => COMMIT_TEMPLATE.to_string(),
+        Some(id) => format!(
+            "\n\n# Enter a commit message for this patch. If you just want to apply the patch to the working copy without committing, re-run arc patch with the --nocommit flag.  Note arcanist failed to load the commit message from differential for revision D{id}.\n"
+        ),
+    }
+}
 
 /// Load a patch commit message via `differential.getcommitmessage`
 /// with `{revision_id}` (`getCommitMessage()`, `:924-940`).
@@ -3399,20 +3838,68 @@ pub fn git_cherry_pick_temp_ansi(
     Ok(())
 }
 
+/// Editor name for patch commit messages (`:909-911`).
+pub const EDITOR_PATCH_COMMIT: &str = "arcanist-patch-commit-message";
+
+/// Interactive editor hook: template text to edited text.
+pub type EditHook<'a> = &'a dyn Fn(&str) -> Result<String, String>;
+
+/// Guidance error when no commit message exists and no editor is wired.
+pub const NO_COMMIT_MESSAGE: &str = "Unable to determine a commit message for this patch. Re-run with --nocommit to apply \
+     without committing.";
+
 /// Resolve the commit message: Differential messages for bundles with a
 /// revision ID, else the port guidance error (no interactive editor; see
-/// the module docs).
+/// [`resolve_commit_message_with_editor`]).
 pub fn resolve_commit_message(
     bundle: &Bundle,
     call: Option<&diff_submit::ConduitCall<'_>>,
 ) -> Result<String, String> {
+    resolve_commit_message_with_editor(bundle, call, None)
+}
+
+/// Resolve the commit message with an editor fallback
+/// (`getCommitMessage()`, `ArcanistPatchWorkflow.php:876-925`).
+///
+/// PATCH-P8: bundles without a Differential message (no revision ID, or
+/// an empty fetch) open the editor on [`patch_commit_template`] instead
+/// of failing; a blank result aborts. `edit` maps the template to the
+/// edited text; `None` keeps the [`NO_COMMIT_MESSAGE`] guidance error.
+pub fn resolve_commit_message_with_editor(
+    bundle: &Bundle,
+    call: Option<&diff_submit::ConduitCall<'_>>,
+    edit: Option<EditHook<'_>>,
+) -> Result<String, String> {
+    let mut prompt_revision: Option<String> = None;
     if let (Some(id), Some(call)) = (bundle.revision_id, call) {
-        return fetch_patch_commit_message(call, id);
+        let fetched = fetch_patch_commit_message(call, id)?;
+        if !fetched.is_empty() {
+            return Ok(fetched);
+        }
+        prompt_revision = Some(id.to_string());
     }
-    Err(
-        "Unable to determine a commit message for this patch. Re-run with --nocommit to apply \
-         without committing."
-            .to_string(),
+    let Some(edit) = edit else {
+        return Err(NO_COMMIT_MESSAGE.to_string());
+    };
+    let template = patch_commit_template(prompt_revision.as_deref());
+    let edited = edit(&template)?;
+    let stripped = diff_local::remove_comments(&edited);
+    if stripped.trim().is_empty() {
+        return Err(diff_local::USER_ABORT.to_string());
+    }
+    Ok(stripped)
+}
+
+/// [`resolve_commit_message_with_editor`] over the real interactive
+/// editor, for the apply flows.
+fn resolve_commit_message_interactive(
+    bundle: &Bundle,
+    call: Option<&diff_submit::ConduitCall<'_>>,
+) -> Result<String, String> {
+    resolve_commit_message_with_editor(
+        bundle,
+        call,
+        Some(&|template| diff::edit_interactively(template, EDITOR_PATCH_COMMIT, None, None, 0)),
     )
 }
 
@@ -3458,7 +3945,7 @@ pub fn apply_git_ansi(
     git_apply_patch_ansi(dir, bundle, io, ansi)?;
     git_submodule_update(dir, io)?;
     if should_commit(options) {
-        let message = resolve_commit_message(bundle, call)?;
+        let message = resolve_commit_message_interactive(bundle, call)?;
         git_commit_patch(dir, bundle, &message)?;
         git_write_okay_ansi(io, "COMMITTED", "Successfully committed patch.", ansi);
     } else {
@@ -3762,7 +4249,7 @@ pub fn apply_hg_ansi(
 ) -> Result<(), String> {
     hg_import_patch_ansi(dir, hg, bundle, io, ansi)?;
     if should_commit(options) {
-        let message = resolve_commit_message(bundle, call)?;
+        let message = resolve_commit_message_interactive(bundle, call)?;
         hg_commit_patch(dir, hg, bundle, &message)?;
         if !should_branch(options)
             && has_base_local
@@ -4683,31 +5170,28 @@ pub fn load_bundle(
 }
 
 /// Load the bundle for a `--revision` / positional `D123` source.
+///
+/// PATCH-P13: the id goes to Conduit verbatim (strings, like PHP's argv
+/// passthrough); local parsing was a fail-fast extension.
 fn load_revision_source_bundle(
     id: &str,
     call: Option<&diff_submit::ConduitCall<'_>>,
 ) -> Result<LoadedBundle, String> {
     let call = require_call(call)?;
-    let revision_id = id
-        .parse::<u64>()
-        .map_err(|_| format!("invalid revision '{id}': expected D12345"))?;
     Ok(LoadedBundle {
-        bundle: fetch_revision_bundle(call, revision_id)?,
+        bundle: fetch_revision_bundle_raw(call, id)?,
         arcbundle_dicts: None,
     })
 }
 
-/// Load the bundle for a `--diff` source.
+/// Load the bundle for a `--diff` source (verbatim ids, PATCH-P13).
 fn load_diff_source_bundle(
     id: &str,
     call: Option<&diff_submit::ConduitCall<'_>>,
 ) -> Result<LoadedBundle, String> {
     let call = require_call(call)?;
-    let diff_id = id
-        .parse::<u64>()
-        .map_err(|_| format!("invalid diff '{id}': expected D12345"))?;
     Ok(LoadedBundle {
-        bundle: fetch_diff_bundle(call, diff_id)?,
+        bundle: fetch_diff_bundle_raw(call, id)?,
         arcbundle_dicts: None,
     })
 }
@@ -5006,9 +5490,11 @@ fn fetch_dependency_monograms(
     let rows = result.as_array().cloned().unwrap_or_default();
     let mut monograms: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for row in &rows {
+        // PATCH-P6 remainder: orsay types `id` as a string; strict
+        // `as_u64` dropped every monogram (deps never applied).
         if let (Some(phid), Some(id)) = (
             row.get("phid").and_then(|v| v.as_str()),
-            row.get("id").and_then(|v| v.as_u64()),
+            row.get("id").and_then(diff_submit::loose_u64),
         ) {
             monograms.insert(phid.to_string(), format!("D{id}"));
         }
@@ -5112,29 +5598,9 @@ fn run_patch_flow(
         return Err(NOT_A_WORKING_COPY.to_string());
     };
     check_supports(options, vcs.name())?;
-    if options.update {
-        update_working_copy(dir, vcs, backends, io)?;
-    }
-    let stash = require_clean_tree_ansi(dir, vcs, backends, io, options.force, ansi)?;
-    let outcome = run_patch_flow_inner(dir, options, io, backends, &source, vcs, ansi);
-    let pop = unstash_changes(dir, stash);
-    match (outcome, pop) {
-        (Ok(outcome), Ok(())) => Ok(outcome),
-        (Ok(_), Err(error)) => Err(error),
-        (Err(error), _) => Err(error),
-    }
-}
-
-/// The patch flow between the clean check and the stash pop.
-fn run_patch_flow_inner(
-    dir: &Path,
-    options: &Options,
-    io: &mut Io,
-    backends: &Backends,
-    source: &Source,
-    vcs: Vcs,
-    ansi: bool,
-) -> Result<FlowOutcome, String> {
+    // Built before the clean check, like PHP's workflow setup: conduit
+    // errors precede worktree errors, and amend detection (PATCH-P9) can
+    // run the published-check. `--patch` sources stay conduit-less.
     let client = match source {
         Source::Patch(_) => None,
         _ => Some(land::client_for_dir(options.conduit_uri.as_deref(), dir)?),
@@ -5149,7 +5615,90 @@ fn run_patch_flow_inner(
     let call_option: Option<&diff_submit::ConduitCall<'_>> = client
         .as_ref()
         .map(|_| &call as &dyn Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>);
-    let loaded = load_bundle(source, options, io, call_option)?;
+    if options.update {
+        update_working_copy(dir, vcs, backends, io)?;
+    }
+    let stash =
+        require_clean_tree_with_call(dir, vcs, backends, io, options.force, ansi, call_option)?;
+    let mut loaded = load_bundle_with_reauth(&source, options, io, call_option)?;
+    // PATCH-P11: conduit bundles render through the `--encoding` flag,
+    // else the repository encoding (`:404-414`).
+    if matches!(
+        source,
+        Source::Revision(_) | Source::Diff(_) | Source::Named(_)
+    ) {
+        let encoding = match options.encoding.as_deref() {
+            Some(flag) => Some(flag.to_string()),
+            None => match call_option {
+                Some(call) => patch_repository_encoding(dir, vcs, backends, call)?,
+                None => None,
+            },
+        };
+        if let Some(encoding) = encoding {
+            loaded.bundle.text = decode_bytes(loaded.bundle.text.as_bytes(), Some(&encoding))?;
+        }
+    }
+    let outcome = run_patch_flow_inner(dir, options, io, backends, vcs, ansi, call_option, loaded);
+    let pop = unstash_changes(dir, stash);
+    match (outcome, pop) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), _) => Err(error),
+    }
+}
+
+/// Load the bundle, re-authenticating and retrying once on
+/// `ERR-INVALID-SESSION` (PATCH-P10, `:392-400`).
+///
+/// PHP retries the whole `run()` via unbounded recursion (re-pulling and
+/// re-prompting, and looping forever on a persistently failing server);
+/// this retries just the failed load, once: the try in PHP wraps only
+/// the bundle load, and the whole-run recursion is incidental.
+fn load_bundle_with_reauth(
+    source: &Source,
+    options: &Options,
+    io: &mut Io,
+    call_option: Option<&diff_submit::ConduitCall<'_>>,
+) -> Result<LoadedBundle, String> {
+    match load_bundle(source, options, io, call_option) {
+        Err(error) if is_invalid_session_error(&error) => {
+            let Some(call) = call_option else {
+                return Err(error);
+            };
+            reauthenticate_patch_conduit(call)?;
+            load_bundle(source, options, io, call_option)
+        }
+        outcome => outcome,
+    }
+}
+
+/// True for `ERR-INVALID-SESSION` conduit failures, matched on the
+/// stringified `{code}: {info}` shape (`conduit::Error` Display).
+#[must_use]
+pub fn is_invalid_session_error(error: &str) -> bool {
+    error == "ERR-INVALID-SESSION" || error.starts_with("ERR-INVALID-SESSION:")
+}
+
+/// Re-verify the conduit session after `ERR-INVALID-SESSION`: the token
+/// arm of `authenticateConduit()` (`ArcanistWorkflow.php:479-498`) is a
+/// `user.whoami` round-trip; failures propagate like PHP.
+fn reauthenticate_patch_conduit(call: &diff_submit::ConduitCall<'_>) -> Result<(), String> {
+    call("user.whoami", &serde_json::json!({}))?;
+    Ok(())
+}
+
+/// The patch flow between the bundle load and the stash pop.
+#[allow(clippy::too_many_arguments)]
+fn run_patch_flow_inner(
+    dir: &Path,
+    options: &Options,
+    io: &mut Io,
+    backends: &Backends,
+    vcs: Vcs,
+    ansi: bool,
+    call_option: Option<&diff_submit::ConduitCall<'_>>,
+    loaded: LoadedBundle,
+) -> Result<FlowOutcome, String> {
     let has_base_local =
         ensure_base_present_with_ansi(dir, vcs, &loaded.bundle, io, backends, ansi)?;
     let branch = maybe_create_branch(

@@ -812,6 +812,32 @@ pub fn select_usable_messages(
     Ok(usable)
 }
 
+/// Select hg commit messages usable to prefill a revision update.
+///
+/// PHP: `getMercurialUpdateMessage()`
+/// (`src/workflow/ArcanistDiffWorkflow.php:2043-2077`): like
+/// [`select_usable_messages`] but with no revision-ID stop — hg only
+/// stops at commits already attached to the active diff. Input runs
+/// newest-first (`getCommitMessageLog()` reverses the log,
+/// `ArcanistMercurialAPI.php:522-539`).
+#[must_use]
+pub fn select_usable_hg_messages(
+    pairs_newest_first: &[(String, String)],
+    active_hashes: &HashSet<String>,
+) -> Vec<String> {
+    if pairs_newest_first.len() == 1 {
+        return Vec::new();
+    }
+    let mut usable = Vec::new();
+    for (node, desc) in pairs_newest_first {
+        if active_hashes.contains(node) {
+            break;
+        }
+        usable.push(desc.clone());
+    }
+    usable
+}
+
 /// Format usable log messages as a `  - first line` prefill template.
 ///
 /// PHP: `formatUsableLogs()`
@@ -928,20 +954,61 @@ pub fn normalize_revision_id(revision_id: &str) -> &str {
 ///
 /// PHP: `buildCommitMessage()`
 /// (`src/workflow/ArcanistDiffWorkflow.php:1340-1346`): normalize, then
-/// require a Differential revision number.
+/// require `is_numeric()`.
 ///
-/// Divergence: PHP uses `is_numeric()`, which also accepts inputs like
-/// `1e3`, `12.3`, or `+123`; only ASCII digits (around optional padding)
-/// are accepted here, and overlong digit strings fail `u64` parsing.
+/// DIFF-D21: `is_numeric()` forms (`1e3`, `12.3`, `+123`, padded) are
+/// accepted like PHP and truncated toward zero to fit the `u64` pipeline
+/// (PHP itself passes the raw string to Conduit; orsay accepts both
+/// scalar shapes, so the value agrees where it fits). Negative,
+/// non-finite, overflowing, and non-numeric inputs keep the ceb error.
 pub fn parse_update_revision_id(target: &str) -> Result<u64, String> {
     let digits = normalize_revision_id(target).trim();
-    if !digits.is_empty()
-        && digits.bytes().all(|b| b.is_ascii_digit())
-        && let Ok(id) = digits.parse::<u64>()
+    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(id) = digits.parse::<u64>() {
+            return Ok(id);
+        }
+    } else if is_php_numeric(digits)
+        && let Ok(value) = digits.parse::<f64>()
+        && value.is_finite()
+        && (0.0..18_446_744_073_709_551_616.0).contains(&value)
     {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let id = value.trunc() as u64;
         return Ok(id);
     }
     Err("Parameter to --update must be a Differential Revision number.".to_string())
+}
+
+/// PHP 7 `is_numeric()` grammar: optional sign, digits with an optional
+/// fraction, and an optional decimal exponent (`DIFF-D21`). Hex strings
+/// are not numeric under PHP 7; the caller trims padding first.
+#[must_use]
+pub fn is_php_numeric(text: &str) -> bool {
+    let body = text.strip_prefix(['+', '-']).unwrap_or(text);
+    let mantissa = match body.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => {
+            let exponent = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+            if exponent.is_empty() || !exponent.bytes().all(|b| b.is_ascii_digit()) {
+                return false;
+            }
+            mantissa
+        }
+        None => body,
+    };
+    let (head, tail) = match mantissa.split_once('.') {
+        Some((head, tail)) => (head, Some(tail)),
+        None => (mantissa, None),
+    };
+    let head_ok = !head.is_empty() && head.bytes().all(|b| b.is_ascii_digit());
+    match tail {
+        None => head_ok,
+        Some(tail) => {
+            !tail.is_empty()
+                && tail.bytes().all(|b| b.is_ascii_digit())
+                && (head_ok || head.is_empty())
+                || head_ok && tail.is_empty()
+        }
+    }
 }
 
 /// Resolve an explicit symbolic base to the merge-base with the head.
@@ -1876,6 +1943,163 @@ pub fn harbormaster_type_from_result(unit_result: i32) -> &'static str {
         UNIT_RESULT_OKAY | UNIT_RESULT_SKIP => "pass",
         _ => "fail",
     }
+}
+
+/* -(  Working-Copy Revision Detection (D8)  )------------------------------ */
+
+/// One open revision matching the working copy (D8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkingCopyRevision {
+    /// Revision id.
+    pub id: u64,
+    /// Revision title (for the several-revisions list).
+    pub title: String,
+}
+
+/// Parse `differential.query` detection rows, skipping unparseable ones.
+#[must_use]
+pub fn parse_working_copy_revisions(result: &serde_json::Value) -> Vec<WorkingCopyRevision> {
+    result
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|row| {
+            Some(WorkingCopyRevision {
+                id: row.get("id").and_then(diff_submit::loose_u64)?,
+                title: row
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Explicit revision IDs from commit messages, in scan order
+/// (`ArcanistGitAPI.php:1193-1200`, `ArcanistMercurialAPI.php:551-558`).
+/// Duplicates are kept, like PHP (no dedup before the query).
+#[must_use]
+pub fn footer_revision_ids(messages: &[(String, String)]) -> Vec<u64> {
+    messages
+        .iter()
+        .filter_map(|(_, message)| {
+            CommitMessage::new_from_raw_corpus(message)
+                .ok()
+                .and_then(|parsed| parsed.revision_id)
+        })
+        .collect()
+}
+
+/// Base `differential.query` params for detection: author plus
+/// status-open (`buildCommitMessage()`, `:1303-1310`).
+#[must_use]
+pub fn working_copy_query_params(user_phid: &str) -> serde_json::Value {
+    serde_json::json!({
+        "authors": [user_phid],
+        "status": "status-open",
+    })
+}
+
+/// Git working-copy revisions: footer scan over the commit log, else a
+/// commit/tree hash lookup over local commits
+/// (`ArcanistGitAPI.php:1178-1237`).
+pub fn load_working_copy_revisions_git(
+    call: &diff_submit::ConduitCall<'_>,
+    dir: &Path,
+    base: &str,
+    head: &str,
+    user_phid: &str,
+) -> Result<Vec<WorkingCopyRevision>, String> {
+    let log = get_git_update_messages(dir, base, head)?;
+    if log.is_empty() {
+        return Ok(Vec::new());
+    }
+    let pairs: Vec<(String, String)> = log
+        .into_iter()
+        .map(|entry| (entry.commit_hash, entry.message))
+        .collect();
+    let ids = footer_revision_ids(&pairs);
+    if !ids.is_empty() {
+        let mut params = working_copy_query_params(user_phid);
+        params["ids"] = serde_json::json!(ids);
+        let result = call("differential.query", &params)?;
+        return Ok(parse_working_copy_revisions(&result));
+    }
+    let mut hashes: Vec<serde_json::Value> = Vec::new();
+    for commit in get_local_commit_information(dir, base, head)? {
+        hashes.push(serde_json::json!(["gtcm", commit.commit]));
+        hashes.push(serde_json::json!(["gttr", commit.tree]));
+    }
+    let mut params = working_copy_query_params(user_phid);
+    params["commitHashes"] = serde_json::Value::Array(hashes);
+    let result = call("differential.query", &params)?;
+    Ok(parse_working_copy_revisions(&result))
+}
+
+/// Hg working-copy revisions: footer scan over the message log, else a
+/// commit-hash lookup (`ArcanistMercurialAPI.php:541-605`).
+pub fn load_working_copy_revisions_hg(
+    call: &diff_submit::ConduitCall<'_>,
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    base: &str,
+    branch: &str,
+    user_phid: &str,
+) -> Result<Vec<WorkingCopyRevision>, String> {
+    let argv = hg_commit_log_argv(base, branch);
+    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let text = hg::stdout_text_with(dir, hg_cmd, &refs)?;
+    // `getCommitMessageLog()` scans newest-first (`:538`).
+    let mut pairs = parse_hg_commit_log(&text);
+    pairs.reverse();
+    let ids = footer_revision_ids(&pairs);
+    if !ids.is_empty() {
+        let mut params = working_copy_query_params(user_phid);
+        params["ids"] = serde_json::json!(ids);
+        let result = call("differential.query", &params)?;
+        return Ok(parse_working_copy_revisions(&result));
+    }
+    let mut hashes: Vec<serde_json::Value> = Vec::new();
+    for commit in get_hg_local_commits_with(dir, hg_cmd, base, branch)? {
+        hashes.push(serde_json::json!(["hgcm", commit.node]));
+    }
+    if hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut params = working_copy_query_params(user_phid);
+    params["commitHashes"] = serde_json::Value::Array(hashes);
+    let result = call("differential.query", &params)?;
+    Ok(parse_working_copy_revisions(&result))
+}
+
+/// Svn working-copy revisions: open author revisions at this checkout
+/// path (`ArcanistSubversionAPI.php:643-660`).
+pub fn load_working_copy_revisions_svn(
+    call: &diff_submit::ConduitCall<'_>,
+    dir: &Path,
+    user_phid: &str,
+) -> Result<Vec<WorkingCopyRevision>, String> {
+    let result = call("differential.query", &working_copy_query_params(user_phid))?;
+    let here = dir.to_string_lossy();
+    Ok(result
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter(|row| row.get("sourcePath").and_then(|v| v.as_str()) == Some(here.as_ref()))
+        .filter_map(|row| {
+            Some(WorkingCopyRevision {
+                id: row.get("id").and_then(diff_submit::loose_u64)?,
+                title: row
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            })
+        })
+        .collect())
 }
 
 /// True when lint must be skipped (reporting `RESULT_SKIP`).
@@ -3492,6 +3716,33 @@ pub fn get_hg_branch_name_with(dir: &Path, hg_cmd: &hg::HgCommand) -> Result<Str
     Ok(out.trim().to_string())
 }
 
+/// Active hg bookmark (`bookmark`), if any.
+///
+/// DIFF-D19: PHP reads this through the bundled `arc-hg` extension
+/// (`getActiveBookmark()`, `ArcanistMercurialAPI.php:891-905`); the
+/// native `hg bookmarks` table marks the same bookmark with `*`, which
+/// this parses instead (the extension is not bundled; see LAND-25).
+pub fn get_hg_active_bookmark_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+) -> Result<Option<String>, String> {
+    let out = hg::stdout_text_with(dir, hg_cmd, &["bookmarks"])?;
+    Ok(parse_hg_active_bookmark(&out))
+}
+
+/// The `*`-marked row of `hg bookmarks` output, if any.
+#[must_use]
+pub fn parse_hg_active_bookmark(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let name = line.strip_prefix('*')?.trim_start();
+        let name = name.split_whitespace().next()?;
+        if name.is_empty() {
+            return None;
+        }
+        Some(name.to_string())
+    })
+}
+
 /// `hg status --rev <since>` argv (`ArcanistMercurialAPI.php:275-278`).
 #[must_use]
 pub fn hg_status_argv(since_commit: &str) -> Vec<String> {
@@ -3997,7 +4248,8 @@ pub fn truncate_preview_64(saved: &str) -> String {
 /// the `Message begins:` block (`:1376-1380`).
 #[must_use]
 pub fn saved_message_notice(where_path: &str, preview: &str) -> String {
-    let block = if preview.is_empty() {
+    // PHP tests `if ($preview)`: `""` and `"0"` both omit the block.
+    let block = if preview.is_empty() || preview == "0" {
         String::new()
     } else {
         format!("{MESSAGE_BEGINS}\n\n       {preview}\n\n")
@@ -5136,7 +5388,8 @@ pub fn resolve_saved_template<R: BufRead, W: Write>(
     let Some(saved) = diff::read_scratch_file(metadata_dir, SCRATCH_CREATE_MESSAGE) else {
         return Ok(None);
     };
-    if saved.is_empty() {
+    // PHP tests `if ($saved)`: `""` and `"0"` are both falsy.
+    if saved.is_empty() || saved == "0" {
         return Ok(None);
     }
     let preview = truncate_preview_64(&saved);
@@ -5424,7 +5677,9 @@ fn echo_saved_copy_note<W: Write>(writer: &mut W, where_path: &str) -> Result<()
 /// (skips the editor on the first pass for non-default templates).
 /// Returns the parsed, pulled, validated message.
 /// Produce the next create-message draft: the verbatim template on the
-/// first pass, else one editor round-trip with comment stripping.
+/// first pass, else one editor round-trip. Both paths strip `#`
+/// comments (`:1486`), and the default check compares the raw editor
+/// output against the commented template (`:1483-1485`).
 fn next_create_template<R: BufRead, W: Write>(
     editor: &CreateMessageEditor<'_, R, W>,
     template: &str,
@@ -5434,15 +5689,14 @@ fn next_create_template<R: BufRead, W: Write>(
     template_is_default: bool,
 ) -> Result<String, String> {
     if first && verbatim && !template_is_default {
-        return Ok(template.to_string());
+        return Ok(remove_comments(template));
     }
     let edit_text = build_editor_template(template, issues);
     let edited = (editor.edit)(&edit_text)?;
-    let stripped = remove_comments(&edited);
-    if template_is_default && stripped == template {
+    if template_is_default && edited == edit_text {
         return Err(TEMPLATE_NOT_EDITED.to_string());
     }
-    Ok(stripped)
+    Ok(remove_comments(&edited))
 }
 
 pub fn edit_create_message<R: BufRead, W: Write>(
@@ -5492,34 +5746,28 @@ fn short_commit_hash(hash: &str) -> String {
     hash.chars().take(12).collect()
 }
 
-/// One default-field message outcome.
-enum CreateFieldOutcome {
-    /// Pulled fields.
-    Fields(CommitFields),
-    /// Parse-failure note lines.
-    Notes(Vec<String>),
-}
-
 /// Parse one message for default fields (`:1874-1886`).
 ///
+/// Returns the pulled fields plus any parse-failure note lines.
 /// Usage errors from the corpus parser and transport failures propagate;
-/// conduit parser errors become note lines (verbatim rethrows the first).
+/// conduit parser errors become note lines (verbatim rethrows the first)
+/// while the partial fields still merge (`:1876`).
 fn parse_create_message_fields(
     call: &diff_submit::ConduitCall<'_>,
     hash: &str,
     message: &str,
     verbatim: bool,
-) -> Result<CreateFieldOutcome, String> {
+) -> Result<(CommitFields, Vec<String>), String> {
     let mut parsed = CommitMessage::new_from_raw_corpus(message)?;
     match parsed.pull_data_from_conduit(call, true) {
-        Ok(()) => Ok(CreateFieldOutcome::Fields(parsed.fields)),
+        Ok(()) => Ok((parsed.fields, Vec::new())),
         Err(PullDataError::Parser(errors)) => {
             if verbatim {
                 return Err(errors.into_iter().next().unwrap_or_default());
             }
             let mut notes = vec![commit_parse_note(&short_commit_hash(hash))];
             notes.extend(errors.iter().map(|error| format!("  - {error}")));
-            Ok(CreateFieldOutcome::Notes(notes))
+            Ok((parsed.fields, notes))
         }
         Err(PullDataError::Other(error)) => Err(error),
     }
@@ -5566,10 +5814,9 @@ pub fn get_default_create_fields_with(
     let mut dicts = Vec::new();
     let mut notes = Vec::new();
     for (hash, message, _) in &messages {
-        match parse_create_message_fields(call, hash, message, verbatim)? {
-            CreateFieldOutcome::Fields(dict) => dicts.push(dict),
-            CreateFieldOutcome::Notes(mut lines) => notes.append(&mut lines),
-        }
+        let (dict, mut lines) = parse_create_message_fields(call, hash, message, verbatim)?;
+        dicts.push(dict);
+        notes.append(&mut lines);
     }
     let mut fields = merge_fields_oldest_first(&dicts);
     if create {

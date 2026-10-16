@@ -76,14 +76,16 @@ fn g1_full_submit_draft_create_defers_to_submit() {
 
 #[test]
 fn g1_full_submit_update_requires_message() {
+    // DIFF-D9: prepare no longer requires `--message`; the raw flag rides
+    // through and the editor fallback resolves online.
     let (fx, _, _) = g1_repo("g1-full-updmsg");
-    let err = diff::prepare_submit_full(
+    let input = diff::prepare_submit_full(
         fx.path(),
         &options(None, false),
         &diff::SubmitMode::Update(5),
     )
-    .unwrap_err();
-    assert!(err.contains("requires --message"), "{err}");
+    .unwrap();
+    assert_eq!(input.message, None);
 }
 
 #[test]
@@ -121,12 +123,10 @@ fn g1_full_submit_message_file_wins() {
 
 #[test]
 fn g1_inspect_full_matches_inspect_for_git() {
+    // DIFF-D8: bare human output no longer matches: git submits via
+    // working-copy detection while the full pipeline stays read-only.
+    // Only the `--json` read-only document keeps parity.
     let (fx, first, _) = g1_repo("g1-full-inspect");
-    let opts = options(Some(&first), false);
-    let classic = diff::inspect(fx.path(), &opts).unwrap();
-    let full = diff::inspect_full(fx.path(), &opts).unwrap();
-    assert_eq!(full, classic);
-
     let json_opts = options(Some(&first), true);
     let classic: serde_json::Value =
         serde_json::from_slice(&diff::inspect(fx.path(), &json_opts).unwrap()).unwrap();
@@ -398,13 +398,18 @@ fn json_diff_against_explicit_base() {
 
 #[test]
 fn default_output_has_stat_and_patch() {
+    // DIFF-D8: a bare human invocation now submits instead of printing
+    // this; the stat-and-patch renderer still serves the pipeline
+    // directly.
     let fx = Fixture::named("default-out");
     fx.init_repo();
     fx.write("f.txt", "a\nb\nc\n");
     fx.commit_all("one");
     fx.write("f.txt", "a\nB2\nB3\nc\n");
 
-    let out = diff::inspect(fx.path(), &options(None, false)).unwrap();
+    let range = diff::resolve_range(fx.path(), &options(None, false)).unwrap();
+    let out =
+        diff::default_diff_output_range(fx.path(), &range.base, range.head.as_deref()).unwrap();
     let text = String::from_utf8_lossy(&out);
     assert!(text.contains("f.txt"), "{text}");
     assert!(text.contains("diff --git"), "{text}");
@@ -412,6 +417,23 @@ fn default_output_has_stat_and_patch() {
         text.contains("files changed") || text.contains("file changed"),
         "{text}"
     );
+}
+
+#[test]
+fn d8_bare_human_git_submits_via_detection() {
+    // DIFF-D8: a bare human invocation submits like PHP instead of
+    // printing the read-only diff: it reaches Conduit (here a bogus URI
+    // fails token lookup before any network).
+    let fx = Fixture::named("d8-bare-submit");
+    fx.init_repo();
+    fx.write("f.txt", "a\n");
+    fx.commit_all("one");
+    fx.write("f.txt", "a\nb\n");
+
+    let mut opts = options(None, false);
+    opts.conduit_uri = Some("d8-invalid-conduit-uri".to_string());
+    let err = diff::inspect(fx.path(), &opts).unwrap_err();
+    assert!(err.contains("no token for d8-invalid-conduit-uri"), "{err}");
 }
 
 #[test]
@@ -615,8 +637,11 @@ fn only_submit_creates_diff_over_seam() {
 
     let methods = canned.methods();
     assert_eq!(methods[0], "differential.creatediff");
+    // DIFF-D11: the diff PHID triggers the autotarget query; the canned
+    // miss falls back to legacy properties after it.
+    assert_eq!(methods[1], "harbormaster.queryautotargets");
     assert!(
-        methods[1..]
+        methods[2..]
             .iter()
             .all(|m| m == "differential.setdiffproperty")
     );
@@ -662,9 +687,11 @@ fn update_submit_requires_message_then_updates_over_seam() {
     fx.commit_all("one");
     fx.write("f.txt", "a\nb\n");
 
+    // DIFF-D9: prepare passes the raw `--message` through (None here);
+    // the editor fallback resolves online before the submit.
     let opts = options(None, false);
-    let err = diff::prepare_submit(fx.path(), &opts, &diff::SubmitMode::Update(123)).unwrap_err();
-    assert!(err.contains("requires --message"), "{err}");
+    let pending = diff::prepare_submit(fx.path(), &opts, &diff::SubmitMode::Update(123)).unwrap();
+    assert_eq!(pending.message, None);
 
     let mut opts = options(None, false);
     opts.message = Some("take two".to_string());

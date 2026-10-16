@@ -547,14 +547,18 @@ fn update_revision_id_requires_digits() {
     assert_eq!(parse_update_revision_id("D5 ").unwrap(), 5);
     assert_eq!(parse_update_revision_id(" 5").unwrap(), 5);
     assert_eq!(parse_update_revision_id("0").unwrap(), 0);
+    // DIFF-D21: `is_numeric()` forms are accepted and truncated.
+    assert_eq!(parse_update_revision_id("1e3").unwrap(), 1000);
+    assert_eq!(parse_update_revision_id("12.3").unwrap(), 12);
+    assert_eq!(parse_update_revision_id("+123").unwrap(), 123);
+    assert_eq!(parse_update_revision_id(" 1e2 ").unwrap(), 100);
     for bad in [
         "",
         "D",
         " D5",
-        "1e3",
-        "12.3",
-        "+123",
         "D12x",
+        "-5",
+        "0x10",
         "99999999999999999999999",
     ] {
         assert_eq!(
@@ -4199,4 +4203,129 @@ fn r5_diff_d16_unsound_shows_y_n_default() {
     let text = String::from_utf8(out).unwrap();
     assert!(text.contains("[y/N]"), "{text}");
     assert!(!text.contains("[Y/n]"), "{text}");
+}
+
+/* T1153 DIFF-D findings: numeric grammar, hg bookmarks, hg prefills. */
+
+#[test]
+fn d21_is_php_numeric_matches_ceb() {
+    for numeric in [
+        "123", "+123", "-123", "12.3", ".5", "5.", "1e3", "1E3", "2e-2", "+.5e+2",
+    ] {
+        assert!(is_php_numeric(numeric), "{numeric}");
+    }
+    for other in [
+        "", ".", "e3", "1e", "0x10", "12x", "1.2.3", " 12", "D12", "NaN", "inf",
+    ] {
+        assert!(!is_php_numeric(other), "{other}");
+    }
+}
+
+#[test]
+fn d19_parses_hg_active_bookmark() {
+    let output = "  old                       1:aaa\n* active                    3:bbb\n  other                     2:ccc\n";
+    assert_eq!(parse_hg_active_bookmark(output).as_deref(), Some("active"));
+    assert_eq!(parse_hg_active_bookmark("  none  1:aaa\n"), None);
+    assert_eq!(parse_hg_active_bookmark(""), None);
+    assert_eq!(parse_hg_active_bookmark("*\n"), None);
+}
+
+#[test]
+fn d9_selects_usable_hg_messages() {
+    let pairs = vec![
+        ("n3".to_string(), "third\n".to_string()),
+        ("n2".to_string(), "second\n".to_string()),
+        ("n1".to_string(), "first\n".to_string()),
+    ];
+    let empty: HashSet<String> = HashSet::new();
+    assert_eq!(
+        select_usable_hg_messages(&pairs, &empty),
+        vec![
+            "third\n".to_string(),
+            "second\n".to_string(),
+            "first\n".to_string()
+        ]
+    );
+    // One message means an amend workflow: nothing usable.
+    assert!(select_usable_hg_messages(&pairs[..1], &empty).is_empty());
+    // Attached commits stop the scan.
+    let attached: HashSet<String> = ["n2".to_string()].into_iter().collect();
+    assert_eq!(
+        select_usable_hg_messages(&pairs, &attached),
+        vec!["third\n".to_string()]
+    );
+}
+
+#[test]
+fn d8_partial_fields_merge_on_parser_errors() {
+    // DIFF-D8 (`:1876`): conduit parser errors add note lines but the
+    // partial fields still merge into the defaults.
+    let call = |method: &str, _: &serde_json::Value| {
+        assert_eq!(method, diff_submit::METHOD_PARSE_COMMIT_MESSAGE);
+        Ok(serde_json::json!({
+            "fields": {"title": "Part", "summary": "kept"},
+            "errors": ["unknown reviewer robert"],
+        }))
+    };
+    let local = vec![LocalCommitInfo {
+        commit: "abcdef1234567890".to_string(),
+        tree: String::new(),
+        parents: Vec::new(),
+        time: String::new(),
+        author: "t".to_string(),
+        summary: "Part".to_string(),
+        message: "Part\n".to_string(),
+        author_email: String::new(),
+    }];
+    let (fields, included, notes) =
+        get_default_create_fields_with(&call, &local, true, None, None, false).unwrap();
+    assert_eq!(
+        fields.get("title"),
+        Some(&FieldValue::Text("Part".to_string()))
+    );
+    assert_eq!(
+        fields.get("summary"),
+        Some(&FieldValue::Text("kept".to_string()))
+    );
+    assert_eq!(included, vec!["abcdef123456 Part".to_string()]);
+    assert_eq!(
+        notes,
+        vec![
+            "NOTE: commit abcdef123456 could not be completely parsed:".to_string(),
+            "  - unknown reviewer robert".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn d8_saved_template_zero_scratch_is_falsy() {
+    // DIFF-D8: PHP tests `if ($saved)`, so a `"0"` scratch file counts
+    // as no saved message (no notice, no prompt).
+    use std::io::Cursor;
+    let root = gap2_d1_scratch("d8-zero");
+    let meta = root.join(".git");
+    diff::write_scratch_file(&meta, SCRATCH_CREATE_MESSAGE, "0");
+    let mut out = Vec::new();
+    let reused = resolve_saved_template(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &meta,
+        &root,
+        false,
+    )
+    .unwrap();
+    assert_eq!(reused, None);
+    assert!(out.is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn d8_saved_notice_zero_preview_omits_block() {
+    // DIFF-D8: PHP tests `if ($preview)`, so a `"0"` first line omits
+    // the `Message begins:` block like an empty preview.
+    let with_zero = saved_message_notice("/tmp/x", "0");
+    assert!(!with_zero.contains("Message begins:"), "{with_zero}");
+    assert!(with_zero.contains("You can use this message"));
+    let with_text = saved_message_notice("/tmp/x", "Hello");
+    assert!(with_text.contains("Message begins:"), "{with_text}");
 }
