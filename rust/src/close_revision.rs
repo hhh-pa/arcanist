@@ -7,8 +7,10 @@
 //!
 //! Known limits (see T1128): `--force` is a port affordance for
 //! non-interactive closes of revisions owned by someone else (PHP has no
-//! `--force` flag; it skips only the not-the-author prompt). Outside a
-//! repository the git finalized message prints; PHP fatals there instead.
+//! `--force` flag; it skips only the not-the-author prompt). `--help` is a
+//! port affordance too: PHP has no workflow `--help` flag (help goes
+//! through `arc help`), so `--help`/`-h` print the usage text instead of
+//! failing as unknown arguments.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -125,7 +127,16 @@ impl Parser {
         } else if arg == "--help" || arg == "-h" {
             Step::Help
         } else if arg.starts_with('-') {
-            Step::Error(format!("unknown flag '{arg}'"))
+            // `Unknown argument '%s'. Try 'arc help'.` over the key
+            // without dashes (`ArcanistWorkflow.php:838-860`).
+            let key = arg
+                .strip_prefix("--")
+                .or_else(|| arg.strip_prefix('-'))
+                .unwrap_or(arg)
+                .split('=')
+                .next()
+                .unwrap_or(arg);
+            Step::Error(format!("Unknown argument '{key}'. Try 'arc help'."))
         } else {
             self.positional(arg)
         }
@@ -266,11 +277,11 @@ fn first_row(result: &serde_json::Value) -> Option<&serde_json::Value> {
     }
 }
 
+/// Revision ID parameter: always the normalized string, as PHP sends
+/// `normalizeRevisionID()` verbatim (`'ids' => array($revision_id)`,
+/// `'revisionID' => $revision_id`).
 fn id_param(id: &str) -> serde_json::Value {
-    id.parse::<u64>().map_or_else(
-        |_| serde_json::Value::String(id.to_string()),
-        serde_json::Value::from,
-    )
+    serde_json::Value::String(id.to_string())
 }
 
 /// Look one revision up with `differential.query`.
@@ -426,7 +437,11 @@ fn close_if_accepted(
 
 /// The per-VCS finalized message, wrapped like
 /// `echo phutil_console_wrap($message)."\n"`.
-fn finalized_message(vcs: Option<&WorkingCopy>) -> String {
+///
+/// Outside a repository PHP throws
+/// `ArcanistCapabilityNotSupportedException` from
+/// `ArcanistFilesystemAPI::getFinalizedRevisionMessage()`.
+fn finalized_message(vcs: Option<&WorkingCopy>) -> Result<String, String> {
     let message = match vcs {
         Some(WorkingCopy::Hg) => {
             "You may now push this commit upstream, as appropriate (e.g. with \
@@ -434,18 +449,24 @@ fn finalized_message(vcs: Option<&WorkingCopy>) -> String {
                 .to_string()
         }
         Some(WorkingCopy::Svn) => "Done.".to_string(),
-        Some(WorkingCopy::Git) | None => "You may now push this commit upstream, as appropriate \
+        Some(WorkingCopy::Git) => "You may now push this commit upstream, as appropriate \
              (e.g. with 'git push', or 'git svn dcommit', or by printing and faxing it)."
             .to_string(),
+        None => {
+            return Err(
+                "This repository API ('filesystem') does not support the requested capability."
+                    .to_string(),
+            );
+        }
     };
-    format!("{}\n", terminal::console_wrap(&message, 0, true))
+    Ok(format!("{}\n", terminal::console_wrap(&message, 0, true)))
 }
 
 /// The final message: empty with `--quiet`, else the push hint for a
 /// finalized revision or a plain `Done.`.
-fn closing_message(revision: &Option<Revision>, quiet: bool, dir: &Path) -> String {
+fn closing_message(revision: &Option<Revision>, quiet: bool, dir: &Path) -> Result<String, String> {
     if quiet {
-        return String::new();
+        return Ok(String::new());
     }
     let finalized = matches!(&revision, Some(rev)
         if (rev.status == STATUS_ACCEPTED || rev.status == STATUS_CLOSED)
@@ -453,7 +474,7 @@ fn closing_message(revision: &Option<Revision>, quiet: bool, dir: &Path) -> Stri
     if finalized {
         finalized_message(detect_working_copy(dir).as_ref())
     } else {
-        "Done.\n".to_string()
+        Ok("Done.\n".to_string())
     }
 }
 
@@ -518,7 +539,7 @@ pub fn execute_in(
         closed = step.closed;
     }
 
-    let closing = closing_message(&revision, options.quiet, dir);
+    let closing = closing_message(&revision, options.quiet, dir)?;
     render_report(
         options,
         &object_name,

@@ -285,7 +285,8 @@ fn open_parents_and_builds_gates() {
     let groups = open_parent_groups(&[open], &[]);
     let finding = open_parents_gate(&groups).unwrap();
     assert_eq!(finding.prompt, "arc.land.open-parents");
-    assert_eq!(finding.title, "1 OPEN PARENT REVISION(S)");
+    // LAND-38: PHP's title carries a trailing space.
+    assert_eq!(finding.title, "1 OPEN PARENT REVISION(S) ");
     assert_eq!(
         finding.query,
         "Land changes that depend on 1 open revision(s)?"
@@ -445,4 +446,16 @@ fn create_gates_use_vcs_wording() {
     assert_eq!(hg.prompt, PROMPT_CREATE);
     assert_eq!(hg.title, "CREATE 1 BOOKMARK(S)");
     assert_eq!(hg.query, "Create 1 new remote bookmark(s)?");
+}
+
+// -( T1153 Wave 2: LAND findings )--------------------------------------------
+
+#[test]
+fn land38_open_parents_title_keeps_trailing_space() {
+    // PHP's `'%s OPEN PARENT REVISION(S) '` ends with a space.
+    let open = parent_link(0, &modern("needs-review", "Needs Review", false, "a")).unwrap();
+    let groups = open_parent_groups(&[open], &[]);
+    let gate = open_parents_gate(&groups).unwrap();
+    assert!(gate.title.ends_with(' '));
+    assert_eq!(gate.title, "1 OPEN PARENT REVISION(S) ");
 }
