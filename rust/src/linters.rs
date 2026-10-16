@@ -9,11 +9,11 @@
 //! - Markup (colors, bold) renders on TTYs via the shared terminal
 //!   styling helpers (see [`render_entries_with_ansi`]) and is stripped
 //!   otherwise: non-TTY output matches piped `arc`.
-//! - `phutil_console_wrap()` is approximated as word-wrap at 80 columns
-//!   (see [`arc_rs::lint::word_wrap`]).
 //! - Version-probe failure text cannot match phutil's `CommandException`
-//!   rendering; failures surface as `CommandException` with a plain
-//!   message describing the failed command.
+//!   rendering; spawn failures and nonzero exits surface as
+//!   `CommandException` with a plain message, while a missing binary
+//!   surfaces as `ArcanistMissingLinterException` with install
+//!   instructions.
 //! - The XHP rules table lists the ported rules only (1 of ~100), and
 //!   its borders are reconstructed (phutil is not vendored).
 //! - Linter order is class-name order; PHP uses class-map order.
@@ -37,19 +37,19 @@ pub const NAME: &str = "linters";
 const PAD: &str = "    ";
 
 fn usage() -> String {
-    "usage: arc linters [--verbose] [--search TERM] [NAME...]\n\
+    "usage: arc linters [options] [name]\n\
      \n\
-     Lists the available linters.\n\
+     Supports: cli\n\
+     List the available and configured linters, with information about\n\
+     what they do and which versions are installed.\n\
      \n\
-     With no arguments, shows every known linter. Positional NAME\n\
-     arguments select linters by exact configuration name and imply\n\
-     --verbose. --search selects linters whose name or description\n\
-     contains TERM (case-insensitive) and may repeat.\n\
+     if name is provided, the linter with that name will be displayed.\n\
      \n\
      Options:\n\
-     \x20 --verbose           Show more detailed information about linters.\n\
-     \x20 --search TERM       Search case-insensitively for a linter by\n\
-     \x20                     name. May be repeated.\n\
+     \x20 --verbose           Show detailed information, including options.\n\
+     \x20 --search TERM       Search for linters. Search is case-insensitive,\n\
+     \x20                     and is performed against name and description of\n\
+     \x20                     each linter. May be repeated.\n\
      \x20 -h, --help          Show this help.\n"
         .to_string()
 }
@@ -201,6 +201,8 @@ pub enum VersionPattern {
 pub struct ExternalMeta {
     pub binary: &'static str,
     pub version: Option<VersionPattern>,
+    /// `getInstallInstructions()` text for the missing-binary error.
+    pub install: &'static str,
 }
 
 /// One linter class: every `getInfo*()`/options/version fact the
@@ -226,43 +228,42 @@ pub struct LinterMeta {
     pub external: Option<ExternalMeta>,
 }
 
-/// Base configuration options (`ArcanistLinter.php:392-421`).
+/// Base configuration options (`ArcanistLinter.php:490-515`).
 const BASE_OPTIONS: &[LinterOption] = &[
     LinterOption {
         name: "severity",
-        option_type: "optional map<string, string>",
-        help: "Map a severity ('advice', 'autofix', 'warning', 'error', or 'disabled') to a lint code, e.g. \"variable.unused\" or \"322\".",
+        option_type: "optional map<string|int, string>",
+        help: "Provide a map from lint codes to adjusted severity levels: error, warning, advice, autofix or disabled.",
     },
     LinterOption {
         name: "severity.rules",
-        option_type: "optional list<wild>",
-        help: "Add regular expression rules to override severity based on message text.",
+        option_type: "optional map<string, string>",
+        help: "Provide a map of regular expressions to severity levels. All matching codes have their severity adjusted.",
     },
     LinterOption {
         name: "standard",
-        option_type: "optional string",
-        help: "Select a builtin standard to use.",
+        option_type: "optional string | list<string>",
+        help: "The coding standard(s) to apply.",
     },
 ];
 
 /// Tool options for an external linter
-/// (`ArcanistExternalLinter.php:464-504`). `{binary}` and `{display}`
-/// tokens are substituted at render time.
+/// (`ArcanistExternalLinter.php:464-490`).
 const TOOL_OPTIONS: &[LinterOption] = &[
     LinterOption {
         name: "bin",
-        option_type: "optional string",
-        help: "The binary to run (default: '{binary}').",
+        option_type: "optional string | list<string>",
+        help: "Specify a string (or list of strings) identifying the binary which should be invoked to execute this linter. This overrides the default binary. If you provide a list of possible binaries, the first one which exists will be used.",
     },
     LinterOption {
         name: "flags",
         option_type: "optional list<string>",
-        help: "Additional flags to pass to '{binary}' when running {display}.",
+        help: "Provide a list of additional flags to pass to the linter on the command line.",
     },
     LinterOption {
         name: "version",
         option_type: "optional string",
-        help: "Minimum required version of '{binary}'.",
+        help: "Specify a version requirement for the binary. The version number may be prefixed with <, <=, >, >=, or = to specify the version comparison operator (default: =).",
     },
 ];
 
@@ -298,7 +299,7 @@ impl LinterMeta {
     }
 }
 
-/// All 33 linter classes, in class-name order.
+/// All 34 linter classes, in class-name order.
 pub const LINTERS: &[LinterMeta] = &[
     LinterMeta {
         class: "ArcanistChmodLinter",
@@ -324,6 +325,7 @@ pub const LINTERS: &[LinterMeta] = &[
         customizes_severities: true,
         external: Some(ExternalMeta {
             binary: "gjslint",
+            install: "Install gjslint using `pip install closure-linter`.",
             version: None,
         }),
     },
@@ -339,6 +341,7 @@ pub const LINTERS: &[LinterMeta] = &[
         customizes_severities: true,
         external: Some(ExternalMeta {
             binary: "coffeelint",
+            install: "Install CoffeeLint using `npm install -g coffeelint`.",
             version: Some(VersionPattern::ExactTriple),
         }),
     },
@@ -366,6 +369,7 @@ pub const LINTERS: &[LinterMeta] = &[
         customizes_severities: true,
         external: Some(ExternalMeta {
             binary: "cppcheck",
+            install: "Install Cppcheck using `apt-get install cppcheck` or similar.",
             version: Some(VersionPattern::Cppcheck),
         }),
     },
@@ -380,7 +384,8 @@ pub const LINTERS: &[LinterMeta] = &[
         append_custom_options: false,
         customizes_severities: true,
         external: Some(ExternalMeta {
-            binary: "cpplint",
+            binary: "cpplint.py",
+            install: "Install cpplint.py using `wget https://raw.github.com/google/styleguide/gh-pages/cpplint/cpplint.py`, and place it in your path with the appropriate permissions set.",
             version: None,
         }),
     },
@@ -413,8 +418,23 @@ pub const LINTERS: &[LinterMeta] = &[
         customizes_severities: true,
         external: Some(ExternalMeta {
             binary: "csslint",
+            install: "Install CSSLint using `npm install -g csslint`.",
             version: Some(VersionPattern::CssV),
         }),
+    },
+    LinterMeta {
+        class: "ArcanistFilenameLinter",
+        config_name: "filename",
+        display: "NAME",
+        info_name: "Filename",
+        uri: None,
+        description: Some(
+            "Stifles developer creativity by requiring files have uninspired names containing only letters, numbers, period, hyphen and underscore.",
+        ),
+        custom_options: &[],
+        append_custom_options: false,
+        customizes_severities: true,
+        external: None,
     },
     LinterMeta {
         class: "ArcanistFlake8Linter",
@@ -430,6 +450,7 @@ pub const LINTERS: &[LinterMeta] = &[
         customizes_severities: true,
         external: Some(ExternalMeta {
             binary: "flake8",
+            install: "Install flake8 using `pip install flake8`.",
             version: Some(VersionPattern::PrefixMinor),
         }),
     },
@@ -459,6 +480,7 @@ pub const LINTERS: &[LinterMeta] = &[
         customizes_severities: true,
         external: Some(ExternalMeta {
             binary: "golint",
+            install: "Install Golint using `go get github.com/golang/lint/golint`.",
             version: None,
         }),
     },
@@ -474,6 +496,7 @@ pub const LINTERS: &[LinterMeta] = &[
         customizes_severities: true,
         external: Some(ExternalMeta {
             binary: "hlint",
+            install: "Install hlint with `cabal install hlint`.",
             version: Some(VersionPattern::Hlint),
         }),
     },
@@ -500,6 +523,7 @@ pub const LINTERS: &[LinterMeta] = &[
         customizes_severities: true,
         external: Some(ExternalMeta {
             binary: "jscs",
+            install: "Install JSCS using `npm install -g jscs`.",
             version: Some(VersionPattern::ExactTriple),
         }),
     },
@@ -519,6 +543,7 @@ pub const LINTERS: &[LinterMeta] = &[
         customizes_severities: true,
         external: Some(ExternalMeta {
             binary: "jshint",
+            install: "Install JSHint using `npm install -g jshint`.",
             version: Some(VersionPattern::JshintStderr),
         }),
     },
@@ -546,6 +571,7 @@ pub const LINTERS: &[LinterMeta] = &[
         customizes_severities: true,
         external: Some(ExternalMeta {
             binary: "jsonlint",
+            install: "Install jsonlint using `npm install -g jsonlint`.",
             version: Some(VersionPattern::LenientTriple),
         }),
     },
@@ -574,6 +600,7 @@ pub const LINTERS: &[LinterMeta] = &[
         customizes_severities: true,
         external: Some(ExternalMeta {
             binary: "lessc",
+            install: "Install lessc using `npm install -g less`.",
             version: Some(VersionPattern::RunOnly),
         }),
     },
@@ -619,6 +646,7 @@ pub const LINTERS: &[LinterMeta] = &[
         customizes_severities: true,
         external: Some(ExternalMeta {
             binary: "pep8",
+            install: "Install PEP8 using `pip install pep8`.",
             version: Some(VersionPattern::PrefixMinor),
         }),
     },
@@ -626,18 +654,21 @@ pub const LINTERS: &[LinterMeta] = &[
         class: "ArcanistPhpcsLinter",
         config_name: "phpcs",
         display: "PHPCS",
-        info_name: "PHP Code Sniffer",
-        uri: Some("https://github.com/squizlabs/PHP_CodeSniffer"),
-        description: Some("Use `phpcs` to detect issues with PHP source files."),
+        info_name: "PHP_CodeSniffer",
+        uri: Some("http://pear.php.net/package/PHP_CodeSniffer/"),
+        description: Some(
+            "PHP_CodeSniffer tokenizes PHP, JavaScript and CSS files and detects violations of a defined set of coding standards.",
+        ),
         custom_options: &[LinterOption {
             name: "phpcs.standard",
             option_type: "optional string",
-            help: "The standard to use.",
+            help: "The name or path of the coding standard to use.",
         }],
         append_custom_options: false,
         customizes_severities: true,
         external: Some(ExternalMeta {
             binary: "phpcs",
+            install: "Install PHPCS with `pear install PHP_CodeSniffer`.",
             version: Some(VersionPattern::Phpcs),
         }),
     },
@@ -653,6 +684,7 @@ pub const LINTERS: &[LinterMeta] = &[
         customizes_severities: false,
         external: Some(ExternalMeta {
             binary: "php",
+            install: "Install PHP.",
             version: Some(VersionPattern::PhpVersion),
         }),
     },
@@ -686,6 +718,7 @@ pub const LINTERS: &[LinterMeta] = &[
         customizes_severities: true,
         external: Some(ExternalMeta {
             binary: "puppet-lint",
+            install: "Install puppet-lint using `gem install puppet-lint`.",
             version: Some(VersionPattern::PuppetLint),
         }),
     },
@@ -703,6 +736,7 @@ pub const LINTERS: &[LinterMeta] = &[
         customizes_severities: false,
         external: Some(ExternalMeta {
             binary: "pyflakes",
+            install: "Install pyflakes with `pip install pyflakes`.",
             version: Some(VersionPattern::Pyflakes),
         }),
     },
@@ -724,6 +758,7 @@ pub const LINTERS: &[LinterMeta] = &[
         customizes_severities: true,
         external: Some(ExternalMeta {
             binary: "pylint",
+            install: "Install PyLint using `pip install pylint`.",
             version: Some(VersionPattern::Pylint),
         }),
     },
@@ -745,6 +780,7 @@ pub const LINTERS: &[LinterMeta] = &[
         customizes_severities: true,
         external: Some(ExternalMeta {
             binary: "rubocop",
+            install: "Install RuboCop using `gem install rubocop`.",
             version: Some(VersionPattern::ExactTriple),
         }),
     },
@@ -760,6 +796,7 @@ pub const LINTERS: &[LinterMeta] = &[
         customizes_severities: true,
         external: Some(ExternalMeta {
             binary: "ruby",
+            install: "Install `ruby` from <http://www.ruby-lang.org/>.",
             version: Some(VersionPattern::Ruby),
         }),
     },
@@ -810,8 +847,14 @@ pub const LINTERS: &[LinterMeta] = &[
         display: "TXT",
         info_name: "Basic Text Linter",
         uri: None,
-        description: Some("Basic linting for text files."),
-        custom_options: &[],
+        description: Some(
+            "Enforces basic text rules like line length, character encoding, and trailing whitespace.",
+        ),
+        custom_options: &[LinterOption {
+            name: "text.max-line-length",
+            option_type: "optional int",
+            help: "Adjust the maximum line length before a warning is raised. By default, a warning is raised on lines exceeding 80 characters.",
+        }],
         append_custom_options: false,
         customizes_severities: true,
         external: None,
@@ -822,11 +865,57 @@ pub const LINTERS: &[LinterMeta] = &[
         display: "XHP",
         info_name: "XHPAST Lint",
         uri: None,
-        description: Some(
-            "Use XHPAST to check for errors, some of which can be automatically fixed.",
-        ),
-        custom_options: &[],
-        append_custom_options: false,
+        description: Some("Use XHPAST to enforce coding conventions on PHP source files."),
+        custom_options: &[
+            LinterOption {
+                name: "xhpast.php-version",
+                option_type: "optional string",
+                help: "PHP version to target.",
+            },
+            LinterOption {
+                name: "xhpast.php-version.windows",
+                option_type: "optional string",
+                help: "PHP version to target on Windows.",
+            },
+            LinterOption {
+                name: "xhpast.blacklisted.function",
+                option_type: "optional map<string, string>",
+                help: "Blacklisted functions which should not be used.",
+            },
+            LinterOption {
+                name: "xhpast.deprecated.functions",
+                option_type: "optional map<string, string>",
+                help: "Functions which should be considered deprecated.",
+            },
+            LinterOption {
+                name: "xhpast.printf-functions",
+                option_type: "optional map<string, int>",
+                help: "`printf()`-style functions which take a format string and list of values as arguments. The value for the mapping is the start index of the function parameters (the index of the format string parameter).",
+            },
+            LinterOption {
+                name: "xhpast.switchhook",
+                option_type: "optional string",
+                help: "Name of a concrete subclass of `ArcanistXHPASTLintSwitchHook` which tunes the analysis of `switch` statements for this linter.",
+            },
+            LinterOption {
+                name: "xhpast.naminghook",
+                option_type: "optional string",
+                help: "Name of a concrete subclass of `ArcanistXHPASTLintNamingHook` which enforces more granular naming convention rules for symbols.",
+            },
+            LinterOption {
+                name: "xhpast.dynamic-string.classes",
+                option_type: "optional map<string, string>",
+                help: "Classes which should not be used because they represent the unsafe usage of dynamic strings.",
+            },
+            LinterOption {
+                name: "xhpast.dynamic-string.functions",
+                option_type: "optional map<string, string>",
+                help: "Functions which should not be used because they represent the unsafe usage of dynamic strings.",
+            },
+        ],
+        // PHP merges rule options after the base table
+        // (`parent::... + array_mergev(...)`).
+        append_custom_options: true,
         customizes_severities: true,
         external: None,
     },
@@ -1075,8 +1164,22 @@ pub fn version_pattern_for(config_name: &str) -> Option<VersionPattern> {
 
 /// Probe a configured linter's version (`getVersion()`): `Ok(None)`
 /// keeps the configured status without a version; `Err` flips the
-/// status to error.
+/// status to error. Probes the default binary; use
+/// [`probe_version_with_bin`] for a `.arclint`-configured `bin`.
 pub fn probe_version(meta: &LinterMeta) -> Result<Option<String>, LinterError> {
+    probe_version_with_bin(meta, None)
+}
+
+/// Probe a configured linter's version through an explicit binary
+/// (`getVersion()` runs `getExecutableCommand()`, which honors the
+/// configured `bin`). A missing binary surfaces as
+/// `ArcanistMissingLinterException` with install instructions, like
+/// `checkBinaryConfiguration()`; other spawn failures and nonzero
+/// exits surface as `CommandException`.
+pub fn probe_version_with_bin(
+    meta: &LinterMeta,
+    binary_override: Option<&str>,
+) -> Result<Option<String>, LinterError> {
     if meta.class == "ArcanistXHPASTLinter" {
         // `count($this->rules)`: the ported rules only.
         return Ok(Some(ported_xhpast_rules().len().to_string()));
@@ -1087,7 +1190,7 @@ pub fn probe_version(meta: &LinterMeta) -> Result<Option<String>, LinterError> {
     let Some(pattern) = external.version else {
         return Ok(None);
     };
-    let binary = external.binary;
+    let binary = binary_override.unwrap_or(external.binary);
     let mut command = Command::new(binary);
     if pattern == VersionPattern::PhpVersion {
         command.arg("--run").arg("echo phpversion();");
@@ -1099,10 +1202,24 @@ pub fn probe_version(meta: &LinterMeta) -> Result<Option<String>, LinterError> {
     } else {
         format!("{binary} --version")
     };
-    let output = arc_rs::lint::spawn_with_retry(&mut command).map_err(|error| LinterError {
-        class: "CommandException",
-        message: format!("Failed to run '{label}': {error}."),
-    })?;
+    let output = match arc_rs::lint::spawn_with_retry(&mut command) {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(LinterError {
+                class: "ArcanistMissingLinterException",
+                message: format!(
+                    "Unable to locate binary \"{binary}\" to run linter {}. You may need to install the binary, or adjust your linter configuration.\nTO INSTALL: {}",
+                    meta.class, external.install,
+                ),
+            });
+        }
+        Err(error) => {
+            return Err(LinterError {
+                class: "CommandException",
+                message: format!("Failed to run '{label}': {error}."),
+            });
+        }
+    };
     if !output.status.success() && pattern != VersionPattern::LenientTriple {
         let code = output
             .status
@@ -1213,12 +1330,30 @@ pub struct LinterEntry {
     pub error: Option<LinterError>,
 }
 
+/// A configured linter class plus its `.arclint` `bin` override, if
+/// any (version probes honor the configured binary like PHP's
+/// `getExecutableCommand()`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredLinter {
+    pub class: &'static str,
+    pub bin: Option<String>,
+}
+
 /// Resolve the configured linter classes (`newLintEngine()` plus
 /// `buildLinters()`, class-grouped): `--engine` is not a `linters`
 /// flag, so only `.arcconfig` `lint.engine` and `.arclint` apply. A
 /// missing engine (or no working copy) yields an empty set; an
 /// invalid config or unknown engine class is fatal.
 pub fn configured_classes(cwd: &Path) -> Result<Vec<&'static str>, String> {
+    Ok(configured_linters(cwd)?
+        .into_iter()
+        .map(|configured| configured.class)
+        .collect())
+}
+
+/// Resolve the configured linters with their `.arclint` `bin`
+/// overrides, for version probing.
+pub fn configured_linters(cwd: &Path) -> Result<Vec<ConfiguredLinter>, String> {
     let work = match arc_rs::lint::discover_working_copy(cwd) {
         Ok(work) => work,
         Err(_) => return Ok(Vec::new()),
@@ -1250,16 +1385,31 @@ fn configured_engine_class(work: &arc_rs::lint::WorkCopy) -> Option<String> {
     None
 }
 
-/// Configured linter classes for an engine class name.
+/// Configured linters for an engine class name.
 fn classes_for_engine(
     work: &arc_rs::lint::WorkCopy,
     class: &str,
-) -> Result<Vec<&'static str>, String> {
+) -> Result<Vec<ConfiguredLinter>, String> {
     match class {
         arc_rs::lint::ENGINE_CONFIGURATION_DRIVEN => configuration_driven_classes(work),
         arc_rs::lint::ENGINE_COMPREHENSIVE => {
-            // With no paths, only the filename linter is built.
-            Ok(vec!["ArcanistFilenameLinter"])
+            // `buildLinters()` builds all nine unconditionally (paths only
+            // filter which files each linter sees, not which linters
+            // exist); the `linters` flow calls it with no paths set.
+            Ok([
+                "ArcanistGeneratedLinter",
+                "ArcanistNoLintLinter",
+                "ArcanistTextLinter",
+                "ArcanistFilenameLinter",
+                "ArcanistXHPASTLinter",
+                "ArcanistPyFlakesLinter",
+                "ArcanistPEP8Linter",
+                "ArcanistRubyLinter",
+                "ArcanistJSHintLinter",
+            ]
+            .into_iter()
+            .map(|class| ConfiguredLinter { class, bin: None })
+            .collect())
         }
         arc_rs::lint::ENGINE_SINGLE => single_engine_class(work),
         _ => Err(format!(
@@ -1269,24 +1419,64 @@ fn classes_for_engine(
     }
 }
 
-/// Classes named by `.arclint`, class-grouped in config order.
+/// The `bin` override from a `.arclint` spec's extra keys: a string
+/// or the first entry of a list, like PHP's `setBinary()` loop.
+/// Relative paths containing a separator resolve against the project
+/// root (PHP's `resolvePath` fallback).
+fn spec_bin(
+    project_root: &Path,
+    extra: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<String> {
+    let value = extra.get("bin")?;
+    let raw = match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(items) => items.iter().find_map(|item| match item {
+            serde_json::Value::String(text) => Some(text.clone()),
+            _ => None,
+        })?,
+        _ => return None,
+    };
+    if raw.contains('/') && Path::new(&raw).is_relative() {
+        return Some(project_root.join(&raw).to_string_lossy().into_owned());
+    }
+    Some(raw)
+}
+
+/// Linters named by `.arclint`, class-grouped in config order.
+/// PHP keys by configuration name (`loadAvailableLinters()` maps
+/// `getLinterConfigurationName()`), so `jsonlint` marks the external
+/// JSON linter even though both JSON linters share a display name.
+/// Display-name aliases (a Rust extension) still resolve to the first
+/// configuration with that display.
 fn configuration_driven_classes(
     work: &arc_rs::lint::WorkCopy,
-) -> Result<Vec<&'static str>, String> {
+) -> Result<Vec<ConfiguredLinter>, String> {
     let config = arc_rs::arclint::load_arclint(&work.project_root)?;
-    let mut classes = Vec::new();
+    let mut classes: Vec<ConfiguredLinter> = Vec::new();
     for spec in &config.linters {
-        if let Some(meta) = LINTERS.iter().find(|meta| meta.display == spec.display)
-            && !classes.contains(&meta.class)
+        let meta = LINTERS
+            .iter()
+            .find(|meta| meta.config_name == spec.linter_type)
+            .or_else(|| LINTERS.iter().find(|meta| meta.display == spec.display));
+        if let Some(meta) = meta
+            && !classes
+                .iter()
+                .any(|configured| configured.class == meta.class)
         {
-            classes.push(meta.class);
+            classes.push(ConfiguredLinter {
+                class: meta.class,
+                bin: spec_bin(&work.project_root, &spec.extra),
+            });
         }
     }
     Ok(classes)
 }
 
 /// The single linter class named by `lint.engine.single.linter`.
-fn single_engine_class(work: &arc_rs::lint::WorkCopy) -> Result<Vec<&'static str>, String> {
+/// PHP also accepts custom subclasses with a second "MUST be a
+/// subclass" error; custom PHP classes are unportable (Rule 3), so any
+/// name outside the registry reports "does not exist".
+fn single_engine_class(work: &arc_rs::lint::WorkCopy) -> Result<Vec<ConfiguredLinter>, String> {
     const KEY: &str = "lint.engine.single.linter";
     let name = arc_rs::lint::arcconfig_value(&work.project_root, KEY)
         .ok()
@@ -1300,7 +1490,10 @@ fn single_engine_class(work: &arc_rs::lint::WorkCopy) -> Result<Vec<&'static str
         ));
     };
     match LINTERS.iter().find(|meta| meta.class == name) {
-        Some(meta) => Ok(vec![meta.class]),
+        Some(meta) => Ok(vec![ConfiguredLinter {
+            class: meta.class,
+            bin: None,
+        }]),
         None => Err(format!(
             "Linter '{name}' configured in '{KEY}' does not exist!"
         )),
@@ -1310,17 +1503,36 @@ fn single_engine_class(work: &arc_rs::lint::WorkCopy) -> Result<Vec<&'static str
 /// Build status entries for every linter class, probing versions of
 /// the configured ones (`getLintersInfo()`).
 pub fn collect_entries(configured: &[&str]) -> Vec<LinterEntry> {
+    let with_bins: Vec<ConfiguredLinter> = configured
+        .iter()
+        .filter_map(|class| {
+            LINTERS
+                .iter()
+                .find(|meta| meta.class == *class)
+                .map(|meta| ConfiguredLinter {
+                    class: meta.class,
+                    bin: None,
+                })
+        })
+        .collect();
+    collect_entries_with_bins(&with_bins)
+}
+
+/// Build status entries, probing each configured linter through its
+/// `.arclint` `bin` override when present.
+pub fn collect_entries_with_bins(configured: &[ConfiguredLinter]) -> Vec<LinterEntry> {
     LINTERS
         .iter()
         .map(|meta| {
-            let is_configured = configured.contains(&meta.class);
-            let (status, version, error) = if !is_configured {
-                (LinterStatus::Available, None, None)
-            } else {
-                match probe_version(meta) {
+            let entry = configured
+                .iter()
+                .find(|configured| configured.class == meta.class);
+            let (status, version, error) = match entry {
+                None => (LinterStatus::Available, None, None),
+                Some(configured) => match probe_version_with_bin(meta, configured.bin.as_deref()) {
                     Ok(version) => (LinterStatus::Configured, version, None),
                     Err(error) => (LinterStatus::Error, None, Some(error)),
-                }
+                },
             };
             LinterEntry {
                 meta,
@@ -1333,11 +1545,15 @@ pub fn collect_entries(configured: &[&str]) -> Vec<LinterEntry> {
 }
 
 /// Keep entries whose configuration name is in `exact`
-/// (`findExactNames()`).
+/// (`findExactNames()`: `strcasecmp`, so ASCII case-insensitive).
 pub fn filter_exact<'a>(entries: &'a [LinterEntry], exact: &[String]) -> Vec<&'a LinterEntry> {
     entries
         .iter()
-        .filter(|entry| exact.iter().any(|name| name == entry.meta.config_name))
+        .filter(|entry| {
+            exact
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(entry.meta.config_name))
+        })
         .collect()
 }
 
@@ -1429,18 +1645,21 @@ pub fn render_entries_with_ansi(entries: &[&LinterEntry], verbose: bool, ansi: b
     out
 }
 
-/// One non-verbose entry line.
+/// One non-verbose entry: header plus any probe failure (PHP prints
+/// the exception block in brief mode too, `:111-120`).
 fn render_brief_entry(entry: &LinterEntry, out: &mut String, ansi: bool) {
     let meta = entry.meta;
     render_entry_header(out, entry.status, meta.config_name, meta.info_name, ansi);
+    render_entry_error(entry, out, ansi);
 }
 
 /// One verbose entry: header plus error, version, description, options,
-/// and XHP rules sections.
+/// and XHP rules sections. The header shows the configuration name and
+/// info name like brief mode (`:99-104`); there is no leading blank
+/// line before the header.
 fn render_verbose_entry(entry: &LinterEntry, out: &mut String, ansi: bool) {
     let meta = entry.meta;
-    out.push('\n');
-    render_entry_header(out, entry.status, meta.info_name, meta.class, ansi);
+    render_entry_header(out, entry.status, meta.config_name, meta.info_name, ansi);
     let mut tail = false;
     tail |= render_entry_error(entry, out, ansi);
     tail |= render_entry_version(entry, out, ansi);
@@ -1471,7 +1690,7 @@ fn render_entry_error(entry: &LinterEntry, out: &mut String, ansi: bool) -> bool
     } else {
         out.push('\n');
         out.push_str(&format!("    {}\n", error.class));
-        out.push_str(&arc_rs::lint::word_wrap(&error.message, 4));
+        out.push_str(&terminal::console_wrap(&error.message, 4, true));
         out.push('\n');
     }
     true
@@ -1511,7 +1730,7 @@ fn render_entry_description(entry: &LinterEntry, out: &mut String, ansi: bool) -
         ));
     } else {
         out.push('\n');
-        out.push_str(&arc_rs::lint::word_wrap(description, 4));
+        out.push_str(&terminal::console_wrap(description, 4, true));
         out.push('\n');
     }
     true
@@ -1552,7 +1771,7 @@ fn render_entry_options(entry: &LinterEntry, out: &mut String, ansi: bool) -> bo
                     "    {} ({})\n{}\n",
                     option.name,
                     option.option_type,
-                    arc_rs::lint::word_wrap(&meta.option_help(option), 6)
+                    terminal::console_wrap(&meta.option_help(option), 6, true)
                 )
             })
             .collect();
@@ -1572,10 +1791,10 @@ pub fn no_match_message(exact: &[String]) -> String {
 /// text through the console formatter.
 #[must_use]
 pub fn no_match_message_with_ansi(exact: &[String], ansi: bool) -> String {
-    let inner = format!(
-        "No match found. Try `arc linters --search {}` to search for a linter.",
-        exact.join(",")
-    );
+    // PHP reports only the first exact term (`$exact[0]`).
+    let first = exact.first().map(String::as_str).unwrap_or("");
+    let inner =
+        format!("No match found. Try `arc linters --search {first}` to search for a linter.");
     terminal::console_format("%s\n", &[&inner], ansi)
 }
 
@@ -1653,7 +1872,7 @@ pub fn run_in(cwd: &Path, argv: &[String]) -> ExitCode {
         ParseOutcome::Error(message) => return conduit::report(EnvelopeKind::Usage, &message),
         ParseOutcome::Args(options) => options,
     };
-    let configured = match configured_classes(cwd) {
+    let configured = match configured_linters(cwd) {
         Ok(configured) => configured,
         // Bad engine/linter configuration names are usage errors in
         // PHP (`newLintEngine()` throws `ArcanistUsageException` /
@@ -1662,7 +1881,15 @@ pub fn run_in(cwd: &Path, argv: &[String]) -> ExitCode {
         // flattened; the exit stays 1 either way.
         Err(message) => return conduit::report(EnvelopeKind::Usage, &message),
     };
-    let entries = collect_entries(&configured);
+    // PHP throws when both exact names and search terms are given
+    // (`:74-77`).
+    if !options.exact.is_empty() && !options.search.is_empty() {
+        return conduit::report(
+            EnvelopeKind::Usage,
+            "Specify either search expression or exact name",
+        );
+    }
+    let entries = collect_entries_with_bins(&configured);
     let verbose = options.verbose || !options.exact.is_empty();
     let ansi = terminal::ansi_enabled();
     if !options.exact.is_empty() {
@@ -1740,13 +1967,14 @@ mod linters_ansi_tests {
         let mut text = ansi_entry("ArcanistTextLinter", LinterStatus::Configured);
         text.version = Some("9.9".to_string());
         let tty = render_entries_with_ansi(&[&text], true, true);
+        // LINTERS-L5/L6: config + info header, no leading blank.
         assert!(tty.starts_with(
-            "\n\x1b[42m\x1b[1m CONFIGURED \x1b[m\x1b[49m \x1b[1mBasic Text \
-             Linter\x1b[m (ArcanistTextLinter)\n\n    Version \x1b[1m9.9\x1b[m\n"
+            "\x1b[42m\x1b[1m CONFIGURED \x1b[m\x1b[49m \x1b[1mtext\x1b[m (Basic Text \
+             Linter)\n\n    Version \x1b[1m9.9\x1b[m\n"
         ));
-        assert!(tty.contains("\n    Basic linting for text files.\n"));
+        assert!(tty.contains("Enforces basic text rules like line length"));
         assert!(tty.contains("\n    \x1b[1mConfiguration Options\x1b[m\n\n"));
-        assert!(tty.contains("    \x1b[4mseverity\x1b[m (optional map<string, string>)\n"));
+        assert!(tty.contains("    \x1b[4mseverity\x1b[m (optional map<string|int, string>)\n"));
         assert_eq!(
             render_entries_with_ansi(&[&text], true, false),
             render_entries(&[&text], true)
