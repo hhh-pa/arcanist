@@ -32,7 +32,9 @@ fn parses_json_and_engine_flags() {
 
     let opts = parse_args(&args(&["--engine=cargo", "--", "--nocapture"])).unwrap();
     assert_eq!(opts.engine, "cargo");
-    assert_eq!(opts.cargo_args, args(&["--nocapture"]));
+    // UNIT-U6: post-`--` tokens collect into `paths` like PHP.
+    assert_eq!(opts.paths, args(&["--nocapture"]));
+    assert!(opts.cargo_args.is_empty());
 }
 
 #[test]
@@ -40,7 +42,9 @@ fn forwards_everything_after_dashdash() {
     let opts = parse_args(&args(&["--", "--json", "--engine", "bogus"])).unwrap();
     assert!(!opts.json);
     assert_eq!(opts.engine, "cargo");
-    assert_eq!(opts.cargo_args, args(&["--json", "--engine", "bogus"]));
+    // UNIT-U6: post-`--` tokens collect into `paths` like PHP.
+    assert_eq!(opts.paths, args(&["--json", "--engine", "bogus"]));
+    assert!(opts.cargo_args.is_empty());
 }
 
 #[test]
@@ -64,7 +68,8 @@ fn rejects_bad_invocations() {
         let err = parse_args(&args(&[flag])).unwrap_err();
         assert_eq!(err, format!("Option '{flag}' requires a parameter."));
     }
-    // Empty `--engine=` parses (D1 stores empty); discovery rejects it.
+    // Empty `--engine=` parses (D1 stores empty); discovery treats it
+    // as unset and falls through to config (UNIT-U14).
     let opts = parse_args(&args(&["--engine="])).unwrap();
     assert_eq!(opts.engine, "");
     assert!(opts.engine_explicit);
@@ -155,8 +160,9 @@ fn rejects_unknown_engine_without_running_cargo() {
         ..Options::default()
     };
     let err = execute(&opts, Path::new("."), None).unwrap_err();
-    assert!(err.contains("unknown engine 'phpunit'"), "{err}");
-    assert!(err.contains("available engines: cargo"), "{err}");
+    // UNIT-U8: PHP's subclass message, not an allowlist dump.
+    assert!(err.contains("is not a subclass of"), "{err}");
+    assert!(err.contains("\"phpunit\""), "{err}");
 }
 
 #[test]
@@ -187,7 +193,9 @@ fn parses_everything_and_tracks_explicit_engine() {
 
     let opts = parse_args(&args(&["--", "--everything"])).unwrap();
     assert!(!opts.everything);
-    assert_eq!(opts.cargo_args, args(&["--everything"]));
+    // UNIT-U6: post-`--` tokens collect into `paths` like PHP.
+    assert_eq!(opts.paths, args(&["--everything"]));
+    assert!(opts.cargo_args.is_empty());
 }
 
 #[test]
@@ -263,20 +271,31 @@ fn discover_selection_prefers_explicit_then_config_then_cargo() {
     std::fs::create_dir_all(&dir).unwrap();
     // CORE-33: the project file only counts at a working-copy root.
     std::fs::create_dir_all(dir.join(".git")).unwrap();
-    assert_eq!(
-        discover_selection(&Options::default(), &dir).unwrap(),
-        Selection::Cargo
-    );
+    // UNIT-U7: nothing configured is `ArcanistNoEngineException`, not a
+    // cargo default.
+    let err = discover_selection(&Options::default(), &dir).unwrap_err();
+    assert!(err.contains("No unit test engine is configured"), "{err}");
 
+    // UNIT-U15: only the `phutil` class-map name validates in `.arcunit`.
     std::fs::write(
         dir.join(".arcunit"),
         r#"{"engines": {"n": {"type": "NoseTestEngine"}}}"#,
     )
     .unwrap();
+    let err = discover_selection(&Options::default(), &dir).unwrap_err();
+    assert!(
+        err.contains("specifies invalid type 'NoseTestEngine'"),
+        "{err}"
+    );
+    std::fs::write(
+        dir.join(".arcunit"),
+        r#"{"engines": {"p": {"type": "phutil"}}}"#,
+    )
+    .unwrap();
     match discover_selection(&Options::default(), &dir).unwrap() {
         Selection::Config { engines, root } => {
             assert_eq!(engines.len(), 1);
-            assert_eq!(engines[0].engine_type, "NoseTestEngine");
+            assert_eq!(engines[0].engine_type, "phutil");
             assert_eq!(root, dir);
         }
         other => panic!("expected Config, got {other:?}"),
@@ -323,7 +342,9 @@ fn discover_selection_rejects_bad_config() {
 
     let bogus = parse_args(&args(&["--engine", "BogusEngine"])).unwrap();
     let err = discover_selection(&bogus, &dir).unwrap_err();
-    assert!(err.contains("unknown engine 'BogusEngine'"), "{err}");
+    // UNIT-U8: PHP's subclass message.
+    assert!(err.contains("is not a subclass of"), "{err}");
+    assert!(err.contains("\"BogusEngine\""), "{err}");
 
     let config_class = parse_args(&args(&[
         "--engine",
@@ -335,7 +356,8 @@ fn discover_selection_rejects_bad_config() {
 
     std::fs::write(dir.join(".arcconfig"), r#"{"unit.engine": "BogusEngine"}"#).unwrap();
     let err = discover_selection(&Options::default(), &dir).unwrap_err();
-    assert!(err.contains("unknown engine 'BogusEngine'"), "{err}");
+    // UNIT-U8: PHP's subclass message.
+    assert!(err.contains("is not a subclass of"), "{err}");
 
     std::fs::write(dir.join(".arcconfig"), "{}").unwrap();
     std::fs::write(
@@ -519,8 +541,9 @@ fn run_single_unrunnable_engines_error_clearly() {
         );
     }
     let err = run_single_with_runner("Bogus", &ctx, &runner).unwrap_err();
+    // UNIT-U8: PHP's subclass message.
     assert!(
-        err.message().contains("unknown engine"),
+        err.message().contains("is not a subclass of"),
         "{}",
         err.message()
     );
@@ -537,10 +560,13 @@ fn run_config_merges_canned_results_and_counts() {
         "def test_ok(): pass\n",
     )
     .unwrap();
+    // UNIT-U15: class names no longer validate via `.arcunit`
+    // (`CONFIG_AVAILABLE` is the `phutil`-only class map), so the merge
+    // test plans against an explicit available list.
     let planned = crate::unit_config::parse_engine_specs(
         r#"{"engines": {"n": {"type": "NoseTestEngine"}}}"#,
         "/r/.arcunit",
-        CONFIG_AVAILABLE,
+        &["NoseTestEngine"],
     )
     .unwrap();
     let runner = |argv: &[String], _cwd: &str| {
@@ -573,10 +599,11 @@ fn run_config_merges_canned_results_and_counts() {
 
 #[test]
 fn run_config_validates_everything_and_no_effect() {
+    // UNIT-U15: explicit available list (see above).
     let planned = crate::unit_config::parse_engine_specs(
         r#"{"engines": {"p": {"type": "PytestTestEngine"}}}"#,
         "/r/.arcunit",
-        CONFIG_AVAILABLE,
+        &["PytestTestEngine"],
     )
     .unwrap();
     let runner = |_: &[String], _: &str| CapturedOutput::new(0, "", "");
@@ -584,10 +611,11 @@ fn run_config_validates_everything_and_no_effect() {
         run_config_with_runner(&planned, "/tmp", &[], true, Some(false), &runner).unwrap_err();
     assert!(err.contains("does not support --everything"), "{err}");
 
+    // UNIT-U15: explicit available list (see above).
     let planned = crate::unit_config::parse_engine_specs(
         r#"{"engines": {"p": {"type": "PhpunitTestEngine"}}}"#,
         "/r/.arcunit",
-        CONFIG_AVAILABLE,
+        &["PhpunitTestEngine"],
     )
     .unwrap();
     let root = unique_dir("config-noeffect");
@@ -614,38 +642,43 @@ fn engine_result(name: &str, code: &str) -> EngineUnitResult {
 
 #[test]
 fn render_unit_result_cases() {
+    // UNIT-U10: the plain rendering strips the badge/duration markup like
+    // PHP, keeping the star, spaces, and padding.
     let mut pass = engine_result("t", "pass");
     pass.set_namespace("ns");
     pass.set_duration(0.125);
-    assert_eq!(render_unit_result(&pass), "  PASS 125ms ns::t\n");
+    assert_eq!(render_unit_result(&pass), "   PASS  125ms   ns::t\n");
 
     let bare_pass = engine_result("t", "pass");
-    assert_eq!(render_unit_result(&bare_pass), "  PASS  <1ms t\n");
+    assert_eq!(
+        render_unit_result(&bare_pass),
+        format!("   PASS   <1ms{}  t\n", expected_star())
+    );
 
     let mut fail = engine_result("t", "fail");
     fail.set_user_data("oops");
-    assert_eq!(render_unit_result(&fail), "  FAIL t\noops\n");
+    assert_eq!(render_unit_result(&fail), "   FAIL  t\noops\n");
 
     let fail_bare = engine_result("t", "fail");
-    assert_eq!(render_unit_result(&fail_bare), "  FAIL t\n");
+    assert_eq!(render_unit_result(&fail_bare), "   FAIL  t\n");
 
     assert_eq!(
         render_unit_result(&engine_result("t", "skip")),
-        "  SKIP t\n"
+        "   SKIP  t\n"
     );
     assert_eq!(
         render_unit_result(&engine_result("t", "broken")),
-        "  BROKEN t\n"
+        "   BROKEN  t\n"
     );
     assert_eq!(
         render_unit_result(&engine_result("t", "unsound")),
-        "  UNSOUND t\n"
+        "   UNSOUND  t\n"
     );
     assert_eq!(render_unit_result(&engine_result("t", "bogus")), "   t\n");
 
     let mut trailing = engine_result("t", "fail");
     trailing.set_user_data("x\n");
-    assert_eq!(render_unit_result(&trailing), "  FAIL t\nx\n\n");
+    assert_eq!(render_unit_result(&trailing), "   FAIL  t\nx\n\n");
 }
 
 #[test]
@@ -752,10 +785,10 @@ fn parses_all_spec_flags() {
 fn parses_help_and_dashdash() {
     assert_eq!(parse_options(&args(&["--help"])).unwrap(), None);
     assert_eq!(parse_options(&args(&["-h"])).unwrap(), None);
-    // Past `--`, help forwards to cargo.
+    // UNIT-U6: past `--`, help collects into `paths` like PHP.
     let opts = parse_options(&args(&["--", "--help"])).unwrap().unwrap();
-    assert_eq!(opts.cargo_args, args(&["--help"]));
-    assert!(opts.paths.is_empty());
+    assert_eq!(opts.paths, args(&["--help"]));
+    assert!(opts.cargo_args.is_empty());
     // Unknown `--help=x` errors like D1.
     let err = parse_options(&args(&["--help=x"])).unwrap_err();
     assert_eq!(err, "Unknown argument 'help'. Try 'arc help'.");
@@ -763,11 +796,11 @@ fn parses_help_and_dashdash() {
     let opts = parse_options(&args(&["--json=x"])).unwrap().unwrap();
     assert!(opts.json);
     assert_eq!(opts.paths, vec!["x".to_string()]);
-    // Second `--` forwards verbatim to cargo.
+    // UNIT-U6: a second `--` collects verbatim into `paths` like PHP.
     let opts = parse_options(&args(&["--", "a", "--", "b"]))
         .unwrap()
         .unwrap();
-    assert_eq!(opts.cargo_args, args(&["a", "--", "b"]));
+    assert_eq!(opts.paths, args(&["a", "--", "b"]));
 }
 
 #[test]
@@ -1047,18 +1080,23 @@ fn coverage_collect_merge_and_render() {
     assert!(text.contains("    100%     f.php\n"), "{text}");
     assert!(text.contains("      0%     asked.php\n"), "{text}");
     let detailed = render_coverage_report(&sorted, &reports, true, &root);
-    assert!(detailed.contains("[C]"), "{detailed}");
+    // UNIT-U11: plain detailed lines carry no mark letter.
+    assert!(!detailed.contains("[C]"), "{detailed}");
+    assert!(detailed.contains("    1   one"), "{detailed}");
     std::fs::remove_dir_all(&root).ok();
 }
 
 #[test]
 fn detailed_coverage_marks_lines() {
+    // UNIT-U11: plain detailed lines carry no mark letter, just the
+    // padded source line.
     let out = render_detailed_coverage_report("a\nbb\nccc", "CUXN-extra");
-    assert!(out.contains("    1  [C] a"), "{out}");
-    assert!(out.contains("    2  [U] bb"), "{out}");
-    assert!(out.contains("    3  [X] ccc"), "{out}");
+    assert!(out.contains("    1   a "), "{out}");
+    assert!(out.contains("    2   bb "), "{out}");
+    assert!(out.contains("    3   ccc "), "{out}");
+    assert!(!out.contains('['), "{out}");
     let out = render_detailed_coverage_report("only", "");
-    assert!(out.contains("[N]"), "{out}");
+    assert!(out.contains("    1   only "), "{out}");
 }
 
 #[test]
@@ -1166,8 +1204,15 @@ fn binaries_arcconfig_discovery_and_files() {
     assert!(files.contains(&".arcconfig".to_string()), "{files:?}");
     assert!(files.contains(&"sub/f.txt".to_string()), "{files:?}");
 
-    // Phpunit engine honors `.arcconfig` binary/config keys.
-    let engine = phpunit_engine_from_config(&root_s);
+    // Phpunit engine honors merged binary/config keys (UNIT-U13
+    // follow-through): the project file counts at a working-copy root,
+    // and shadow options keep ambient config out.
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let shadow = shadow_opts(&root);
+    let merged_for =
+        |root: &std::path::Path| arc_rs::get_config::load_merged(root, None, &shadow).unwrap();
+    let merged = merged_for(&root);
+    let engine = phpunit_engine_from_merged(&root_s, Some(&merged));
     assert_eq!(engine.binary, "phpunit");
     assert!(engine.config_file.is_none());
     std::fs::write(root.join("phpunit.xml"), "<x/>").unwrap();
@@ -1176,7 +1221,8 @@ fn binaries_arcconfig_discovery_and_files() {
         r#"{"phpunit_config": "phpunit.xml", "unit.phpunit.binary": "my-phpunit"}"#,
     )
     .unwrap();
-    let engine = phpunit_engine_from_config(&root_s);
+    let merged = merged_for(&root);
+    let engine = phpunit_engine_from_merged(&root_s, Some(&merged));
     assert!(engine.config_file.is_some());
     assert!(engine.binary.ends_with("my-phpunit"), "{}", engine.binary);
     std::fs::remove_dir_all(&root).ok();
@@ -1227,7 +1273,10 @@ fn xunit_and_csharp_runs_cover_stages() {
     // Random stems are 10 chars.
     assert_eq!(super::random_xml_stem().len(), 10);
 
-    // Configured-but-missing phpunit config surfaces verbatim.
+    // Configured-but-missing phpunit config surfaces verbatim. The
+    // project file counts at a working-copy root (UNIT-U13
+    // follow-through reads through the merge).
+    std::fs::create_dir_all(root.join(".git")).unwrap();
     std::fs::write(
         root.join(".arcconfig"),
         r#"{"phpunit_config": "missing.xml"}"#,
@@ -1315,10 +1364,21 @@ fn cargo_argv_appends_paths_as_filters() {
         ..Options::default()
     };
     assert_eq!(cargo_test_argv(&opts), args(&["test", "adds_", "other"]));
+    // UNIT-U6: post-`--` tokens are paths, so argv keeps CLI order.
     let opts = parse_args(&args(&["flt", "--", "--", "--nocapture"])).unwrap();
     assert_eq!(
         cargo_test_argv(&opts),
-        args(&["test", "--", "--nocapture", "flt"])
+        args(&["test", "flt", "--", "--nocapture"])
+    );
+    // Hand-built `cargo_args` still lead (Rust extension).
+    let opts = Options {
+        cargo_args: args(&["--nocapture"]),
+        paths: args(&["flt"]),
+        ..Options::default()
+    };
+    assert_eq!(
+        cargo_test_argv(&opts),
+        args(&["test", "--nocapture", "flt"])
     );
 }
 
@@ -1352,16 +1412,25 @@ fn unknown_engine_message_lists_every_engine() {
         engine: "Nope".to_string(),
         ..Options::default()
     };
+    // UNIT-U8: PHP's subclass message.
     assert_eq!(
         execute(&opts, Path::new("."), None).unwrap_err(),
-        "unknown engine 'Nope' (available engines: cargo, \
-         ArcanistConfigurationDrivenUnitTestEngine, CSharpToolsTestEngine, NoseTestEngine, \
-         PhpunitTestEngine, PhutilUnitTestEngine, PytestTestEngine, XUnitTestEngine)"
+        "Configured unit test engine \"Nope\" is not a subclass of \
+         \"ArcanistUnitTestEngine\", but must be."
     );
-    // Cargo stays the default selection (documented extension, not PHP's
-    // ArcanistNoEngineException).
+    // UNIT-U7: nothing configured is `ArcanistNoEngineException`, not a
+    // cargo default; cargo still selects when named.
     let dir = unique_dir("cargo-default");
     std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    let err = discover_selection(&Options::default(), &dir).unwrap_err();
+    assert!(err.contains("No unit test engine is configured"), "{err}");
+    let explicit = parse_args(&args(&["--engine", "cargo"])).unwrap();
+    assert_eq!(
+        discover_selection(&explicit, &dir).unwrap(),
+        Selection::Cargo
+    );
+    std::fs::write(dir.join(".arcconfig"), r#"{"unit.engine": "cargo"}"#).unwrap();
     assert_eq!(
         discover_selection(&Options::default(), &dir).unwrap(),
         Selection::Cargo
@@ -1679,7 +1748,7 @@ fn csharp_cover_config_loads_and_errors() {
             "unit.csharp.coverage.excluded": {"Skip.dll": "1"}}"#,
     )
     .unwrap();
-    let cover = super::load_csharp_cover(&ctx).unwrap().unwrap();
+    let cover = super::load_csharp_cover(&ctx, None).unwrap().unwrap();
     assert!(
         cover.cover_engine.ends_with("tools/cscover.exe"),
         "{}",
@@ -1692,10 +1761,10 @@ fn csharp_cover_config_loads_and_errors() {
         enable_coverage: Some(false),
         ..ctx.clone()
     };
-    assert!(super::load_csharp_cover(&off).unwrap().is_none());
+    assert!(super::load_csharp_cover(&off, None).unwrap().is_none());
 
     std::fs::write(root.join(".arcconfig"), "{}").unwrap();
-    let err = super::load_csharp_cover(&ctx).unwrap_err();
+    let err = super::load_csharp_cover(&ctx, None).unwrap_err();
     assert!(
         err.message().contains("unit.csharp.coverage.binary"),
         "{}",
@@ -1707,7 +1776,7 @@ fn csharp_cover_config_loads_and_errors() {
         r#"{"unit.csharp.cscover.binary": "nope.exe"}"#,
     )
     .unwrap();
-    let err = super::load_csharp_cover(&ctx).unwrap_err();
+    let err = super::load_csharp_cover(&ctx, None).unwrap_err();
     assert!(
         err.message().contains("have you built yet"),
         "{}",
@@ -1863,8 +1932,9 @@ fn single_php_seam_rejects_unknown_engines() {
     let ctx = EngineContext::new(&forward_slashes(&std::env::temp_dir()));
     let runner = |_: &[String], _: &str| CapturedOutput::new(0, "", "");
     let err = run_single_with_php("Bogus", &ctx, &runner, &|| None).unwrap_err();
+    // UNIT-U8: PHP's subclass message.
     assert!(
-        err.message().contains("unknown engine 'Bogus'"),
+        err.message().contains("is not a subclass of"),
         "{}",
         err.message()
     );
@@ -1925,8 +1995,8 @@ fn result_label_badges_match_php() {
         "\x1b[43m\x1b[1m UNSOUND \x1b[m\x1b[49m"
     );
     assert_eq!(format_result_label("bogus", true), "");
-    // Like PHP, the stripped badge keeps its padding; the plain
-    // workflow rendering uses bare labels instead.
+    // Like PHP, the stripped badge keeps its padding, and the plain
+    // workflow rendering uses it (UNIT-U10).
     assert_eq!(format_result_label("pass", false), " PASS ");
 }
 
@@ -1952,9 +2022,10 @@ fn render_unit_result_with_ansi_styles_pass_line() {
         render_unit_result_with_ansi(&pass, true),
         "  \x1b[42m\x1b[1m PASS \x1b[m\x1b[49m \x1b[32m125ms\x1b[39m   ns::t\n"
     );
+    // UNIT-U10: stripped markup keeps star/spaces/padding.
     assert_eq!(
         render_unit_result_with_ansi(&pass, false),
-        "  PASS 125ms ns::t\n"
+        "   PASS  125ms   ns::t\n"
     );
 }
 
@@ -1969,9 +2040,10 @@ fn render_unit_result_with_ansi_stars_fast_pass() {
             "  \x1b[42m\x1b[1m PASS \x1b[m\x1b[49m \x1b[32m  5ms\x1b[39m\x1b[33m{star}\x1b[39m  t\n"
         )
     );
+    // UNIT-U10: the fast-run star survives stripping.
     assert_eq!(
         render_unit_result_with_ansi(&pass, false),
-        "  PASS   5ms t\n"
+        format!("   PASS    5ms{star}  t\n")
     );
 }
 
@@ -1983,9 +2055,10 @@ fn render_unit_result_with_ansi_appends_user_data_raw() {
         render_unit_result_with_ansi(&fail, true),
         "  \x1b[41m\x1b[1m FAIL \x1b[m\x1b[49m t\noops\n"
     );
+    // UNIT-U10: stripped badge keeps its padding.
     assert_eq!(
         render_unit_result_with_ansi(&fail, false),
-        "  FAIL t\noops\n"
+        "   FAIL  t\noops\n"
     );
     assert_eq!(
         render_unit_result_with_ansi(&engine_result("t", "bogus"), true),
@@ -2045,11 +2118,12 @@ fn render_detailed_with_ansi_paints_marks() {
         let out = render_detailed_coverage_report_with_ansi("only", report, true);
         assert_eq!(out, format!("    1   {:<80} \n", "only"));
     }
-    // Plain keeps the bracketed marks.
+    // UNIT-U11: plain strips the backgrounds with no mark letter.
     let plain = render_detailed_coverage_report_with_ansi("a\nbb", "CU", false);
-    assert!(plain.contains("[C]"), "{plain}");
-    assert!(plain.contains("[U]"), "{plain}");
+    assert!(!plain.contains("[C]"), "{plain}");
+    assert!(!plain.contains("[U]"), "{plain}");
     assert!(!plain.contains('\x1b'), "{plain}");
+    assert!(plain.starts_with("    1   a"), "{plain}");
 }
 
 #[test]
@@ -2064,7 +2138,8 @@ fn workflow_output_with_ansi_threads_flag() {
         "{full}"
     );
     let plain = render_workflow_output_with_ansi(&[pass.clone()], &[], "full", false, &root, false);
-    assert_eq!(plain, "  PASS 125ms t\n");
+    // UNIT-U10: stripped markup keeps star/spaces/padding.
+    assert_eq!(plain, "   PASS  125ms   t\n");
     // Machine formats carry no markup in either mode.
     let json = render_workflow_output_with_ansi(&[pass.clone()], &[], "json", false, &root, true);
     assert!(!json.contains('\x1b'), "{json}");
@@ -2227,10 +2302,9 @@ fn r6_unitu13_selection_honors_config_flags() {
         config_file: vec![empty.to_string_lossy().to_string()],
         ..Options::default()
     };
-    assert_eq!(
-        discover_selection(&shadowed, &dir).unwrap(),
-        Selection::Cargo
-    );
+    // UNIT-U7: shadowed-out engine is `ArcanistNoEngineException`.
+    let err = discover_selection(&shadowed, &dir).unwrap_err();
+    assert!(err.contains("No unit test engine is configured"), "{err}");
     // A mistyped `unit.engine` errors instead of falling through.
     std::fs::write(dir.join(".arcconfig"), r#"{"unit.engine": 42}"#).unwrap();
     let err = discover_selection(&Options::default(), &dir).unwrap_err();
@@ -2260,4 +2334,471 @@ fn r4_unitu5_failed_is_generic() {
     let error = classify_engine_error(arc_rs::unit_engine::EngineError::Failed("boom".to_string()));
     assert_eq!(error.kind, EnvelopeKind::Exception);
     assert_eq!(error.kind.exit_code(), std::process::ExitCode::FAILURE);
+}
+
+// --- T1153 Wave 2: UNIT findings ---
+
+#[test]
+fn unit_u1_config_runs_echo_nothing_when_children_echo() {
+    // Only the configuration-driven engine suppresses the workflow echo.
+    assert!(!should_echo_test_results(
+        "ArcanistConfigurationDrivenUnitTestEngine"
+    ));
+    for engine in [
+        "NoseTestEngine",
+        "PytestTestEngine",
+        "PhpunitTestEngine",
+        "PhutilUnitTestEngine",
+        "phutil",
+        "XUnitTestEngine",
+        "CSharpToolsTestEngine",
+        "cargo",
+        "Bogus",
+    ] {
+        assert!(should_echo_test_results(engine), "{engine}");
+    }
+
+    // Canned config run: every ported child echoes, so the mask is all
+    // false and the `full` rendering prints zero per-result lines.
+    let root = unique_dir("u1-echo");
+    std::fs::create_dir_all(root.join("pkg")).unwrap();
+    std::fs::create_dir_all(root.join("tests").join("pkg")).unwrap();
+    std::fs::write(root.join("pkg").join("mod.py"), "x = 1\n").unwrap();
+    std::fs::write(
+        root.join("tests").join("pkg").join("test_mod.py"),
+        "def test_ok(): pass\n",
+    )
+    .unwrap();
+    let planned = crate::unit_config::parse_engine_specs(
+        r#"{"engines": {"n": {"type": "NoseTestEngine"}}}"#,
+        "/r/.arcunit",
+        &["NoseTestEngine"],
+    )
+    .unwrap();
+    let runner = |argv: &[String], _cwd: &str| {
+        let xunit = argv
+            .iter()
+            .find(|a| a.starts_with("--xunit-file="))
+            .unwrap();
+        std::fs::write(xunit.trim_start_matches("--xunit-file="), CANNED_XUNIT).unwrap();
+        CapturedOutput::new(1, "", "")
+    };
+    let (report, echo) = run_config_with_echo_classified(
+        &planned,
+        &forward_slashes(&root),
+        &["pkg/mod.py".to_string()],
+        false,
+        Some(false),
+        &runner,
+        &|| None,
+    )
+    .unwrap();
+    assert!(!report.results.is_empty());
+    assert_eq!(echo, vec![false; report.results.len()]);
+    let full = render_workflow_output_with_echo(
+        &report.results,
+        &[],
+        "full",
+        false,
+        &root,
+        false,
+        Some(&echo),
+    );
+    assert_eq!(full, "");
+
+    // Coverage still renders and machine formats still carry results.
+    use std::collections::HashMap;
+    let mut covered = engine_result("c", "pass");
+    covered.set_coverage(HashMap::from([("f.php".to_string(), "C".to_string())]));
+    let full = render_workflow_output_with_echo(
+        std::slice::from_ref(&covered),
+        &[],
+        "full",
+        false,
+        &root,
+        false,
+        Some(&[false]),
+    );
+    assert!(full.contains("COVERAGE REPORT"), "{full}");
+    assert!(!full.contains("PASS"), "{full}");
+    let ugly = render_workflow_output_with_echo(
+        std::slice::from_ref(&covered),
+        &[],
+        "ugly",
+        false,
+        &root,
+        false,
+        Some(&[false]),
+    );
+    assert!(ugly.contains("\"name\":\"c\""), "{ugly}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn unit_u2_phutil_echoes_at_workflow_level() {
+    // Workflow-level echo matches PHP: `shouldEchoTestResults` is true
+    // for every ported engine including phutil, so single runs print
+    // per-result lines. (PHP's in-process during-run progress has no
+    // out-of-process equivalent; carried over — libphutil ships no
+    // source in scope to pin its bytes.)
+    assert!(should_echo_test_results("PhutilUnitTestEngine"));
+    assert!(should_echo_test_results("phutil"));
+    let root = unique_dir("u2-echo");
+    std::fs::create_dir_all(&root).unwrap();
+    let out = render_workflow_output(
+        std::slice::from_ref(&engine_result("t", "pass")),
+        &[],
+        "full",
+        false,
+        &root,
+    );
+    assert!(out.contains("PASS"), "{out}");
+    assert!(out.contains(" t\n"), "{out}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn unit_u6_dashdash_collects_into_paths() {
+    let opts = parse_args(&args(&["--engine", "cargo", "--", "--json", "p.php"])).unwrap();
+    assert!(!opts.json);
+    assert_eq!(opts.paths, args(&["--json", "p.php"]));
+    assert!(opts.cargo_args.is_empty());
+    // Cargo still forwards them as `cargo test` filters.
+    assert_eq!(cargo_test_argv(&opts), args(&["test", "--json", "p.php"]));
+}
+
+#[test]
+fn unit_u7_no_engine_is_usage_error() {
+    use arc_rs::conduit::EnvelopeKind;
+    let dir = unique_dir("u7-kind");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    let err = discover_selection_classified(&Options::default(), &dir).unwrap_err();
+    assert_eq!(err.kind, EnvelopeKind::Usage);
+    assert!(
+        err.message.contains("No unit test engine is configured"),
+        "{}",
+        err.message
+    );
+    assert!(err.message.contains("'.arcunit'"), "{}", err.message);
+    assert!(err.message.contains("'unit.engine'"), "{}", err.message);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn unit_u8_bad_engine_subclass_message() {
+    let dir = unique_dir("u8-msg");
+    std::fs::create_dir_all(&dir).unwrap();
+    let opts = parse_args(&args(&["--engine", "BogusEngine"])).unwrap();
+    assert_eq!(
+        discover_selection(&opts, &dir).unwrap_err(),
+        "Configured unit test engine \"BogusEngine\" is not a subclass of \
+         \"ArcanistUnitTestEngine\", but must be."
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn unit_u9_everything_checked_before_discovery() {
+    // `.hg` marks a working copy without needing a git binary.
+    let dir = unique_dir("u9-order");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join(".hg")).unwrap();
+    // `--everything` plus paths wins even when discovery would fail.
+    let opts = parse_args(&args(&["--everything", "p", "--engine", "Bogus"])).unwrap();
+    let err = plan_run(&opts, &dir).unwrap_err();
+    assert!(
+        err.message
+            .starts_with("You can not specify paths with --everything."),
+        "{}",
+        err.message
+    );
+    // Control: without paths, discovery runs and rejects the engine.
+    let opts = parse_args(&args(&["--everything", "--engine", "Bogus"])).unwrap();
+    let err = plan_run(&opts, &dir).unwrap_err();
+    assert!(
+        err.message.contains("is not a subclass of"),
+        "{}",
+        err.message
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn unit_u10_plain_keeps_star_and_padding() {
+    let star = expected_star();
+    let mut pass = engine_result("t", "pass");
+    pass.set_duration(0.005);
+    let plain = render_unit_result_with_ansi(&pass, false);
+    assert!(plain.contains(star), "{plain}");
+    assert!(plain.starts_with("   PASS "), "{plain}");
+    assert!(plain.ends_with(&format!("{star}  t\n")), "{plain}");
+}
+
+#[test]
+fn unit_u11_plain_detailed_has_no_mark_letters() {
+    let out = render_detailed_coverage_report_with_ansi("a\nb", "CU", false);
+    assert!(!out.contains('[') && !out.contains(']'), "{out}");
+    assert_eq!(out.lines().count(), 2);
+    // ...while TTY keeps painted backgrounds.
+    let tty = render_detailed_coverage_report_with_ansi("a\nb", "CU", true);
+    assert!(tty.contains("\x1b[42m"), "{tty}");
+    assert!(tty.contains("\x1b[41m"), "{tty}");
+}
+
+#[test]
+fn unit_u12_coverage_ties_keep_insertion_order() {
+    use std::collections::HashMap;
+    let mut first = engine_result("a", "pass");
+    first.set_coverage(HashMap::from([("b.php".to_string(), "CU".to_string())]));
+    let mut second = engine_result("b", "pass");
+    second.set_coverage(HashMap::from([("a.php".to_string(), "CU".to_string())]));
+    let collected = collect_coverage_ordered(&[first, second]);
+    assert_eq!(collected.len(), 2);
+    assert_eq!(collected[0].0, "b.php");
+    assert_eq!(collected[1].0, "a.php");
+    // Tied fractions keep insertion order (no filename tiebreak).
+    let (sorted, _) = merge_file_coverage_ordered(&["z.php".to_string()], &collected);
+    let names: Vec<&str> = sorted.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, vec!["z.php", "b.php", "a.php"]);
+}
+
+#[test]
+fn unit_u13follow_engine_params_read_merged() {
+    let dir = unique_dir("u13f");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    let root_s = forward_slashes(&dir);
+    let user = dir.join("arcrc.json");
+    std::fs::write(
+        &user,
+        r#"{"config": {"unit.phpunit.binary": "user-phpunit",
+            "unit.phutil.init-script": "user-init.php"}}"#,
+    )
+    .unwrap();
+    let default = arc_rs::get_config::LoadOptions::default();
+    let merged = arc_rs::get_config::load_merged(&dir, Some(&user), &default).unwrap();
+    // User source wins over defaults.
+    let engine = phpunit_engine_from_merged(&root_s, Some(&merged));
+    assert!(engine.binary.ends_with("user-phpunit"), "{}", engine.binary);
+    assert_eq!(
+        engine_param_string_from(Some(&merged), &root_s, arc_rs::unit_phutil::INIT_SCRIPT_KEY)
+            .as_deref(),
+        Some("user-init.php")
+    );
+    // Project beats user.
+    std::fs::write(
+        dir.join(".arcconfig"),
+        r#"{"unit.phpunit.binary": "proj-phpunit"}"#,
+    )
+    .unwrap();
+    let merged = arc_rs::get_config::load_merged(&dir, Some(&user), &default).unwrap();
+    let engine = phpunit_engine_from_merged(&root_s, Some(&merged));
+    assert!(engine.binary.ends_with("proj-phpunit"), "{}", engine.binary);
+    // Runtime `--config` beats project.
+    let mut runtime = serde_json::Map::new();
+    runtime.insert(
+        "unit.phpunit.binary".to_string(),
+        serde_json::json!("rt-phpunit"),
+    );
+    let opts = arc_rs::get_config::LoadOptions {
+        runtime,
+        ..Default::default()
+    };
+    let merged = arc_rs::get_config::load_merged(&dir, Some(&user), &opts).unwrap();
+    let engine = phpunit_engine_from_merged(&root_s, Some(&merged));
+    assert!(engine.binary.ends_with("rt-phpunit"), "{}", engine.binary);
+    // `None` falls back to the project-root read.
+    let engine = phpunit_engine_from_merged(&root_s, None);
+    assert!(engine.binary.ends_with("proj-phpunit"), "{}", engine.binary);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn unit_u14_empty_engine_falls_through_to_config() {
+    let dir = unique_dir("u14-empty");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    let empty = parse_args(&args(&["--engine="])).unwrap();
+    // Bare: falls through to the NoEngine error.
+    let err = discover_selection(&empty, &dir).unwrap_err();
+    assert!(err.contains("No unit test engine is configured"), "{err}");
+    // Config wins when set...
+    std::fs::write(
+        dir.join(".arcconfig"),
+        r#"{"unit.engine": "PytestTestEngine"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        discover_selection(&empty, &dir).unwrap(),
+        Selection::Single("PytestTestEngine".to_string())
+    );
+    // ...and `.arcunit` when config is unset.
+    std::fs::write(dir.join(".arcconfig"), "{}").unwrap();
+    std::fs::write(
+        dir.join(".arcunit"),
+        r#"{"engines": {"p": {"type": "phutil"}}}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        discover_selection(&empty, &dir).unwrap(),
+        Selection::Config { .. }
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn unit_u15_arcunit_types_are_class_map_only() {
+    assert_eq!(CONFIG_AVAILABLE, &["phutil"]);
+    let err = crate::unit_config::parse_engine_specs(
+        r#"{"engines": {"n": {"type": "NoseTestEngine"}}}"#,
+        "/r/.arcunit",
+        CONFIG_AVAILABLE,
+    )
+    .unwrap_err();
+    assert!(
+        err.message()
+            .contains("Available test engines are: phutil."),
+        "{}",
+        err.message()
+    );
+    // ...while single runs still take class names plus `phutil`.
+    assert!(SINGLE_AVAILABLE.contains(&"NoseTestEngine"));
+    assert!(SINGLE_AVAILABLE.contains(&"phutil"));
+}
+
+#[test]
+fn unit_u18_int_durations_render_bare() {
+    let mut r = engine_result("t", "pass");
+    r.set_duration_int(3);
+    assert!(r.duration_is_int());
+    let ugly = results_to_json_text(std::slice::from_ref(&r), false);
+    assert!(ugly.contains("\"duration\":3,"), "{ugly}");
+    assert!(!ugly.contains("\"duration\":3.0"), "{ugly}");
+    let pretty = results_to_json_text(std::slice::from_ref(&r), true);
+    assert!(pretty.contains("\"duration\": 3,"), "{pretty}");
+    let value = results_to_json(std::slice::from_ref(&r));
+    assert_eq!(value[0]["duration"], serde_json::json!(3));
+    assert!(value[0]["duration"].is_i64());
+    assert!(
+        r.to_dictionary()
+            .to_json_string()
+            .contains("\"duration\":3,"),
+        "{}",
+        r.to_dictionary().to_json_string()
+    );
+    // Floats keep the `.0` (PHP `json_encode(3.0)`).
+    r.set_duration(3.0);
+    assert!(!r.duration_is_int());
+    let ugly = results_to_json_text(std::slice::from_ref(&r), false);
+    assert!(ugly.contains("\"duration\":3.0,"), "{ugly}");
+}
+
+#[test]
+fn unit_u19_unset_name_result_are_null() {
+    let bare = EngineUnitResult::new();
+    assert_eq!(bare.get_name(), "");
+    assert_eq!(bare.get_result(), "");
+    let ugly = results_to_json_text(std::slice::from_ref(&bare), false);
+    assert!(ugly.contains("\"name\":null"), "{ugly}");
+    assert!(ugly.contains("\"result\":null"), "{ugly}");
+    let pretty = results_to_json_text(std::slice::from_ref(&bare), true);
+    assert!(pretty.contains("\"name\": null"), "{pretty}");
+    assert!(pretty.contains("\"result\": null"), "{pretty}");
+    let value = results_to_json(std::slice::from_ref(&bare));
+    assert!(value[0]["name"].is_null());
+    assert!(value[0]["result"].is_null());
+    let dict = bare.to_dictionary().to_json_string();
+    assert!(dict.contains("\"name\":null"), "{dict}");
+    assert!(dict.contains("\"result\":null"), "{dict}");
+    // Explicitly set values (even empty) stay strings.
+    let mut empty = EngineUnitResult::new();
+    empty.set_name("").unwrap();
+    empty.set_result("");
+    let ugly = results_to_json_text(std::slice::from_ref(&empty), false);
+    assert!(ugly.contains("\"name\":\"\""), "{ugly}");
+    assert!(ugly.contains("\"result\":\"\""), "{ugly}");
+}
+
+#[test]
+fn unit_u23_working_copy_required() {
+    use arc_rs::conduit::EnvelopeKind;
+    let bare = unique_dir("u23-bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    let err = plan_run(&Options::default(), &bare).unwrap_err();
+    assert_eq!(
+        err.message,
+        "This command must be run in a Git, Mercurial or Subversion working copy."
+    );
+    assert_eq!(err.kind, EnvelopeKind::Usage);
+    // With a VCS marker the gate passes (discovery runs next).
+    let repo = unique_dir("u23-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(repo.join(".hg")).unwrap();
+    let err = plan_run(&Options::default(), &repo).unwrap_err();
+    assert!(
+        err.message.contains("No unit test engine is configured"),
+        "{}",
+        err.message
+    );
+    std::fs::remove_dir_all(&bare).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn unit_u24_detailed_pad_counts_bytes() {
+    // `str_pad` pads to 80 BYTES: `é` (2 bytes) takes 78 spaces.
+    let padded = pad_detailed_line("é");
+    assert_eq!(padded.len(), 80);
+    assert_eq!(padded.chars().count(), 79);
+    assert_eq!(pad_detailed_line("a").len(), 80);
+    // Never truncates.
+    assert_eq!(pad_detailed_line(&"x".repeat(90)).len(), 90);
+}
+
+#[test]
+fn unit_u26_empty_rev_takes_plain_status_path() {
+    let dir = unique_dir("u26-rev");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join(".hg")).unwrap();
+    // Fake `hg`: serves `status`, fails `log` (range resolution).
+    // `HgCommand` prepends global `--encoding` args, so the scripts scan
+    // every argument for the subcommand.
+    #[cfg(windows)]
+    let script_name = "fakehg.bat";
+    #[cfg(not(windows))]
+    let script_name = "fakehg.sh";
+    #[cfg(windows)]
+    let script_text = "@echo off\r\nfor %%a in (%*) do if \"%%a\"==\"log\" exit /b 1\r\necho M mod.py\r\necho ? new.py\r\n";
+    #[cfg(not(windows))]
+    let script_text = "#!/bin/sh\nfor a in \"$@\"; do if [ \"$a\" = \"log\" ]; then exit 1; fi; done\nprintf 'M mod.py\\n? new.py\\n'\n";
+    let script = dir.join(script_name);
+    std::fs::write(&script, script_text).unwrap();
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let script_s = forward_slashes(&script);
+    #[cfg(windows)]
+    let hg = arc_rs::hg::HgCommand::custom("cmd", &["/C", script_s.as_str()]);
+    #[cfg(not(windows))]
+    let hg = arc_rs::hg::HgCommand::custom(script_s.as_str(), &[]);
+    let svn = arc_rs::svn::SvnCommand::system();
+    // Empty `--rev` matches no rev (plain status, no `log` call).
+    let via_none = select_paths_with(&Options::default(), &dir, &dir, &hg, &svn).unwrap();
+    let empty = Options {
+        rev: Some(String::new()),
+        ..Options::default()
+    };
+    let via_empty = select_paths_with(&empty, &dir, &dir, &hg, &svn).unwrap();
+    assert_eq!(via_empty, via_none);
+    assert_eq!(via_empty, args(&["mod.py"]));
+    // A real rev still attempts range resolution (and fails here).
+    let bogus = Options {
+        rev: Some("bogus".to_string()),
+        ..Options::default()
+    };
+    assert!(select_paths_with(&bogus, &dir, &dir, &hg, &svn).is_err());
+    std::fs::remove_dir_all(&dir).ok();
 }

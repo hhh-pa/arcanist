@@ -263,3 +263,42 @@ fn dict_json_escapes_like_php_json_encode() {
     let json = result.to_dictionary().to_json_string();
     assert!(json.contains("\"extra\":[]"), "{json}");
 }
+
+// --- T1153 Wave 2: UNIT findings ---
+
+#[test]
+fn unit_u18_int_flag_transitions() {
+    let mut result = UnitResult::new();
+    assert!(!result.duration_is_int());
+    result.set_duration_int(3);
+    assert!(result.duration_is_int());
+    assert_eq!(result.get_duration(), Some(3.0));
+    // A float set clears the flag (PHP `json_encode(3.0)` keeps `.0`).
+    result.set_duration(3.0);
+    assert!(!result.duration_is_int());
+}
+
+#[test]
+fn unit_u19_dictionary_nulls_for_unset() {
+    let dict = UnitResult::new().to_dictionary();
+    assert_eq!(dict.name, None);
+    assert_eq!(dict.result, None);
+    assert!(!dict.duration_is_int);
+    let mut result = UnitResult::new();
+    result.set_name("t").unwrap();
+    result.set_result(RESULT_PASS);
+    let dict = result.to_dictionary();
+    assert_eq!(dict.name.as_deref(), Some("t"));
+    assert_eq!(dict.result.as_deref(), Some(RESULT_PASS));
+}
+
+#[test]
+fn unit_u25_counts_use_thousands_separators() {
+    assert_eq!(format_count(255), "255");
+    assert_eq!(format_count(1234), "1,234");
+    assert_eq!(format_count(1234567), "1,234,567");
+    let mut result = UnitResult::new();
+    let err = result.set_name(&"n".repeat(1234)).unwrap_err();
+    assert!(err.contains("1,234 bytes"), "{err}");
+    assert!(err.contains("255 bytes"), "{err}");
+}

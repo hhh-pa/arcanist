@@ -17,9 +17,10 @@
 //! - JSON is parsed with a dependency-free mini parser instead of
 //!   `phutil_json_decode`. Namespaces, DOCTYPEs, entities beyond the five
 //!   predefined XML entities, and duplicate attributes are not supported.
-//! - `setDuration` takes `f64` only; PHP (`ArcanistUnitTestResult.php:86-94`)
-//!   accepts int|float and throws otherwise. The Rust type makes the throw
-//!   unreachable.
+//! - `setDuration` takes `f64`, plus `set_duration_int` for whole seconds:
+//!   PHP (`ArcanistUnitTestResult.php:86-94`) accepts int|float and JSON keeps
+//!   the distinction (`3` vs `3.0`), so the flag survives into every JSON
+//!   renderer. A non-numeric throw is unreachable in the Rust types.
 //! - `extraData` values are strings; PHP (`ArcanistUnitTestResult.php:114-121`)
 //!   allows wild values.
 
@@ -57,10 +58,15 @@ pub const MAX_NAME_BYTES: usize = 255;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct UnitResult {
     namespace: Option<String>,
-    name: String,
+    // T1153 UNIT-U19: unset `name`/`result` stay `None` (PHP JSON null);
+    // the `get_*` accessors still return `""` for compat.
+    name: Option<String>,
     link: Option<String>,
-    result: String,
+    result: Option<String>,
     duration: Option<f64>,
+    // T1153 UNIT-U18: true when set via `set_duration_int`, so JSON keeps
+    // PHP's int-vs-float distinction (`3` vs `3.0`).
+    duration_is_int: bool,
     user_data: Option<String>,
     extra_data: Option<HashMap<String, String>>,
     coverage: Option<HashMap<String, String>>,
@@ -86,24 +92,28 @@ impl UnitResult {
     }
 
     /// `setName` (`src/unit/ArcanistUnitTestResult.php:32-49`): names longer
-    /// than 255 bytes are an error, mirroring the PHP exception.
+    /// than 255 bytes are an error, mirroring the PHP exception. Counts
+    /// render with thousands separators like PHP `PhutilNumber` (UNIT-U25).
     pub fn set_name(&mut self, name: &str) -> Result<&mut Self, String> {
         let actual = name.len();
         if actual > MAX_NAME_BYTES {
             return Err(format!(
                 "Parameter (\"{name}\") passed to \"setName()\" when constructing a unit test \
-                 message must be a string with a maximum length of {MAX_NAME_BYTES} bytes, but \
-                 is {actual} bytes in length."
+                 message must be a string with a maximum length of {} bytes, but \
+                 is {} bytes in length.",
+                format_count(MAX_NAME_BYTES),
+                format_count(actual),
             ));
         }
-        self.name = name.to_string();
+        self.name = Some(name.to_string());
         Ok(self)
     }
 
-    /// `getName` (`src/unit/ArcanistUnitTestResult.php:51-53`).
+    /// `getName` (`src/unit/ArcanistUnitTestResult.php:51-53`): `""` when
+    /// unset (PHP `toDictionary` reports null instead; see UNIT-U19).
     #[must_use]
     pub fn get_name(&self) -> &str {
-        &self.name
+        self.name.as_deref().unwrap_or("")
     }
 
     /// `setLink` (`src/unit/ArcanistUnitTestResult.php:55-58`).
@@ -120,21 +130,37 @@ impl UnitResult {
 
     /// `setResult` (`src/unit/ArcanistUnitTestResult.php:64-67`).
     pub fn set_result(&mut self, result: &str) -> &mut Self {
-        self.result = result.to_string();
+        self.result = Some(result.to_string());
         self
     }
 
-    /// `getResult` (`src/unit/ArcanistUnitTestResult.php:69-71`).
+    /// `getResult` (`src/unit/ArcanistUnitTestResult.php:69-71`): `""` when
+    /// unset (PHP `toDictionary` reports null instead; see UNIT-U19).
     #[must_use]
     pub fn get_result(&self) -> &str {
-        &self.result
+        self.result.as_deref().unwrap_or("")
     }
 
     /// `setDuration` (`src/unit/ArcanistUnitTestResult.php:86-94`): seconds as
-    /// a float. See the module docs for the int|float Divergence.
+    /// a float. See `set_duration_int` for the integer spelling (UNIT-U18).
     pub fn set_duration(&mut self, duration: f64) -> &mut Self {
         self.duration = Some(duration);
+        self.duration_is_int = false;
         self
+    }
+
+    /// `setDuration` with an integer value: PHP keeps int|float apart and
+    /// JSON-encodes them as `3` vs `3.0` (UNIT-U18).
+    pub fn set_duration_int(&mut self, duration: i64) -> &mut Self {
+        self.duration = Some(duration as f64);
+        self.duration_is_int = true;
+        self
+    }
+
+    /// Whether the duration was set as an integer (UNIT-U18).
+    #[must_use]
+    pub fn duration_is_int(&self) -> bool {
+        self.duration_is_int && self.duration.is_some()
     }
 
     /// `getDuration` (`src/unit/ArcanistUnitTestResult.php:97-99`).
@@ -203,7 +229,9 @@ impl UnitResult {
         Some(String::from_utf8(bytes).expect("coverage maps must be ASCII"))
     }
 
-    /// `toDictionary` (`src/unit/ArcanistUnitTestResult.php:164-175`).
+    /// `toDictionary` (`src/unit/ArcanistUnitTestResult.php:164-175`):
+    /// unset scalars stay `None` (PHP null), including `name`/`result`
+    /// (UNIT-U19).
     #[must_use]
     pub fn to_dictionary(&self) -> UnitDictionary {
         UnitDictionary {
@@ -212,6 +240,7 @@ impl UnitResult {
             link: self.link.clone(),
             result: self.result.clone(),
             duration: self.duration,
+            duration_is_int: self.duration_is_int(),
             extra: self.extra_data.as_ref().map(sorted_pairs),
             user_data: self.user_data.clone(),
             coverage: self.coverage.as_ref().map(sorted_pairs),
@@ -277,20 +306,37 @@ fn sorted_pairs(map: &HashMap<String, String>) -> Vec<(String, String)> {
 pub struct UnitDictionary {
     /// `namespace` key.
     pub namespace: Option<String>,
-    /// `name` key.
-    pub name: String,
+    /// `name` key (`None` when unset, like PHP null — UNIT-U19).
+    pub name: Option<String>,
     /// `link` key.
     pub link: Option<String>,
-    /// `result` key.
-    pub result: String,
+    /// `result` key (`None` when unset, like PHP null — UNIT-U19).
+    pub result: Option<String>,
     /// `duration` key.
     pub duration: Option<f64>,
+    /// True when the duration was set as an integer, rendering bare
+    /// (`3`, not `3.0`) like PHP `json_encode` (UNIT-U18).
+    pub duration_is_int: bool,
     /// `extra` key.
     pub extra: Option<Vec<(String, String)>>,
     /// `userData` key.
     pub user_data: Option<String>,
     /// `coverage` key.
     pub coverage: Option<Vec<(String, String)>>,
+}
+
+/// Render a count like PHP `new PhutilNumber($n)`: thousands separators
+/// (`1234` → `"1,234"`), used by the overlong-name error (UNIT-U25).
+fn format_count(value: usize) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 impl UnitDictionary {
@@ -302,17 +348,19 @@ impl UnitDictionary {
             "\"namespace\":{},",
             json_string_or_null(self.namespace.as_deref())
         ));
-        out.push_str(&format!("\"name\":{},", json_escape(&self.name)));
+        out.push_str(&format!(
+            "\"name\":{},",
+            json_string_or_null(self.name.as_deref())
+        ));
         out.push_str(&format!(
             "\"link\":{},",
             json_string_or_null(self.link.as_deref())
         ));
-        out.push_str(&format!("\"result\":{},", json_escape(&self.result)));
         out.push_str(&format!(
-            "\"duration\":{},",
-            self.duration
-                .map_or_else(|| "null".to_string(), |d| format!("{d:?}"))
+            "\"result\":{},",
+            json_string_or_null(self.result.as_deref())
         ));
+        out.push_str(&format!("\"duration\":{},", self.duration_json()));
         out.push_str(&format!(
             "\"extra\":{},",
             json_map_or_null(self.extra.as_deref())
@@ -327,6 +375,16 @@ impl UnitDictionary {
         ));
         out.push('}');
         out
+    }
+
+    /// The `duration` value: `null` when unset, bare when set as an
+    /// integer, shortest round-trip otherwise (UNIT-U18).
+    fn duration_json(&self) -> String {
+        match self.duration {
+            None => "null".to_string(),
+            Some(value) if self.duration_is_int => format!("{}", value as i64),
+            Some(value) => format!("{value:?}"),
+        }
     }
 }
 
