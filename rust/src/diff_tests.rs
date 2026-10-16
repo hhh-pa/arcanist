@@ -1832,6 +1832,7 @@ fn ansi_submit_reports_bold_label_and_underline_uri() {
         fields: serde_json::Value::Null,
         spec: serde_json::json!({}),
         properties: Vec::new(),
+        lint_unit: diff_local::LintUnitReport::empty(),
         included_changes: "Included changes:\n".to_string(),
         json: false,
     };
@@ -1856,6 +1857,7 @@ fn create_test_input(draft: bool, corpus: Option<&str>) -> SubmitInput {
         fields: serde_json::json!({"title": "Local"}),
         spec: serde_json::json!({}),
         properties: Vec::new(),
+        lint_unit: diff_local::LintUnitReport::empty(),
         included_changes: String::new(),
         json: false,
     }
@@ -2058,4 +2060,1055 @@ fn r9_core62_no_browser_message_matches_ceb() {
             expected
         );
     }
+}
+
+/* T1153 DIFF-D findings: update resolution, json, phid stamping. */
+
+fn update_stub_call() -> impl Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String> {
+    |method: &str, params: &serde_json::Value| {
+        if method == diff_submit::METHOD_QUERY {
+            assert_eq!(params["ids"], serde_json::json!([5]));
+            return Ok(serde_json::json!([{
+                "id": 5, "title": "Thing",
+                "authorPHID": "PHID-USER-1", "statusName": "Accepted",
+            }]));
+        }
+        if method == "user.whoami" {
+            return Ok(serde_json::json!({"phid": "PHID-USER-1"}));
+        }
+        if method == diff_submit::METHOD_GET_COMMIT_MESSAGE {
+            assert_eq!(params["edit"], serde_json::json!(false));
+            return Ok(serde_json::json!("Thing\n\nSummary: yes\n"));
+        }
+        if method == diff_submit::METHOD_PARSE_COMMIT_MESSAGE {
+            return Ok(serde_json::json!({
+                "fields": {"title": "Thing", "summary": "yes"},
+            }));
+        }
+        Err(format!("DIFF-D test: unexpected {method}"))
+    }
+}
+
+fn update_test_options(message: Option<&str>, edit: bool) -> Options {
+    Options {
+        update: Some("5".to_string()),
+        message: message.map(str::to_string),
+        edit,
+        ..Options::default()
+    }
+}
+
+fn update_test_target(fields: &serde_json::Value) -> UpdateTarget<'_> {
+    UpdateTarget {
+        revision_id: 5,
+        revision_arg: "5",
+        verbatim_fields: fields,
+        check_ownership: true,
+        edit_fields: None,
+    }
+}
+
+#[test]
+fn d6_update_resolves_remote_fields_not_empty() {
+    let meta = scratch_dir("d6-fields");
+    let call = update_stub_call();
+    let edit = |_: &str, _: &str| -> Result<String, String> {
+        panic!("DIFF-D6: no editor without --edit or missing --message")
+    };
+    let prefill = || -> Result<Option<String>, String> { Ok(None) };
+    let mut reader = std::io::BufReader::new(std::io::empty());
+    let mut writer = Vec::new();
+    let mut resolver = UpdateResolver {
+        reader: &mut reader,
+        writer: &mut writer,
+        call: &call,
+        metadata_dir: &meta,
+        edit: &edit,
+        prefill: &prefill,
+    };
+    let options = update_test_options(Some("take two"), false);
+    let resolved = resolve_update_revision(
+        &mut resolver,
+        &options,
+        &update_test_target(&serde_json::json!({})),
+    )
+    .unwrap();
+    assert_eq!(
+        resolved.fields,
+        serde_json::json!({"title": "Thing", "summary": "yes"})
+    );
+    assert_eq!(resolved.message, "take two");
+}
+
+#[test]
+fn d6_update_missing_revision_names_arg() {
+    let meta = scratch_dir("d6-missing");
+    let call = |method: &str, _: &serde_json::Value| {
+        if method == diff_submit::METHOD_QUERY {
+            return Ok(serde_json::json!([]));
+        }
+        Err(format!("DIFF-D6: unexpected {method}"))
+    };
+    let edit = |_: &str, _: &str| -> Result<String, String> { Ok(String::new()) };
+    let prefill = || -> Result<Option<String>, String> { Ok(None) };
+    let mut reader = std::io::BufReader::new(std::io::empty());
+    let mut writer = Vec::new();
+    let mut resolver = UpdateResolver {
+        reader: &mut reader,
+        writer: &mut writer,
+        call: &call,
+        metadata_dir: &meta,
+        edit: &edit,
+        prefill: &prefill,
+    };
+    let mut options = update_test_options(Some("m"), false);
+    options.update = Some("D5".to_string());
+    let err = resolve_update_revision(
+        &mut resolver,
+        &options,
+        &update_test_target(&serde_json::json!({})),
+    )
+    .unwrap_err();
+    assert_eq!(err, "Revision '5' does not exist!");
+}
+
+#[test]
+fn d6_update_foreign_revision_confirms() {
+    let meta = scratch_dir("d6-ownership");
+    let call = |method: &str, _: &serde_json::Value| {
+        if method == diff_submit::METHOD_QUERY {
+            return Ok(serde_json::json!([{
+                "id": 5, "title": "Theirs", "authorPHID": "PHID-USER-9",
+            }]));
+        }
+        if method == "user.whoami" {
+            return Ok(serde_json::json!({"phid": "PHID-USER-1"}));
+        }
+        Err(format!("DIFF-D6: unexpected {method}"))
+    };
+    let edit = |_: &str, _: &str| -> Result<String, String> { Ok(String::new()) };
+    let prefill = || -> Result<Option<String>, String> { Ok(None) };
+    let mut reader = std::io::BufReader::new("n\n".as_bytes());
+    let mut writer = Vec::new();
+    let mut resolver = UpdateResolver {
+        reader: &mut reader,
+        writer: &mut writer,
+        call: &call,
+        metadata_dir: &meta,
+        edit: &edit,
+        prefill: &prefill,
+    };
+    let options = update_test_options(Some("m"), false);
+    let err = resolve_update_revision(
+        &mut resolver,
+        &options,
+        &update_test_target(&serde_json::json!({})),
+    )
+    .unwrap_err();
+    assert_eq!(err, diff_submit::OWNERSHIP_ABORT);
+    let prompt = String::from_utf8(writer).unwrap();
+    assert!(prompt.contains("You don't own revision D5"), "{prompt}");
+}
+
+#[test]
+fn d9_empty_message_opens_editor_and_caches() {
+    let meta = scratch_dir("d9-editor");
+    let call = update_stub_call();
+    let seen = std::cell::RefCell::new(Vec::new());
+    let edit = |template: &str, name: &str| -> Result<String, String> {
+        seen.borrow_mut()
+            .push((template.to_string(), name.to_string()));
+        Ok("second try\n# a comment\n".to_string())
+    };
+    let prefill = || -> Result<Option<String>, String> { Ok(Some("  - foo\n".to_string())) };
+    let mut reader = std::io::BufReader::new(std::io::empty());
+    let mut writer = Vec::new();
+    let mut resolver = UpdateResolver {
+        reader: &mut reader,
+        writer: &mut writer,
+        call: &call,
+        metadata_dir: &meta,
+        edit: &edit,
+        prefill: &prefill,
+    };
+    // Empty `--message` still opens the editor, like ceb (`:701-702`).
+    let options = update_test_options(Some(""), false);
+    let resolved = resolve_update_revision(
+        &mut resolver,
+        &options,
+        &update_test_target(&serde_json::json!({})),
+    )
+    .unwrap();
+    assert_eq!(resolved.message, "second try\n");
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].1, EDITOR_DIFF_UPDATE);
+    assert!(seen[0].0.contains("# Updating D5: Thing"), "{}", seen[0].0);
+    assert!(seen[0].0.contains("  - foo"), "{}", seen[0].0);
+    // The raw editor output (comments included) is cached.
+    let saved = read_scratch_json(&meta, SCRATCH_UPDATE_MESSAGES);
+    assert_eq!(saved["5"], serde_json::json!("second try\n# a comment\n"));
+}
+
+#[test]
+fn d9_blank_editor_output_aborts() {
+    let meta = scratch_dir("d9-abort");
+    let call = update_stub_call();
+    let edit = |_: &str, _: &str| -> Result<String, String> { Ok("# nothing\n".to_string()) };
+    let prefill = || -> Result<Option<String>, String> { Ok(None) };
+    let mut reader = std::io::BufReader::new(std::io::empty());
+    let mut writer = Vec::new();
+    let mut resolver = UpdateResolver {
+        reader: &mut reader,
+        writer: &mut writer,
+        call: &call,
+        metadata_dir: &meta,
+        edit: &edit,
+        prefill: &prefill,
+    };
+    let options = update_test_options(None, false);
+    let err = resolve_update_revision(
+        &mut resolver,
+        &options,
+        &update_test_target(&serde_json::json!({})),
+    )
+    .unwrap_err();
+    assert_eq!(err, diff_local::USER_ABORT);
+}
+
+#[test]
+fn d9_raw_update_without_message_errors() {
+    let meta = scratch_dir("d9-raw");
+    let call = update_stub_call();
+    let edit = |_: &str, _: &str| -> Result<String, String> {
+        panic!("DIFF-D9: raw sources never open the editor")
+    };
+    let prefill = || -> Result<Option<String>, String> { Ok(None) };
+    let mut reader = std::io::BufReader::new(std::io::empty());
+    let mut writer = Vec::new();
+    let mut resolver = UpdateResolver {
+        reader: &mut reader,
+        writer: &mut writer,
+        call: &call,
+        metadata_dir: &meta,
+        edit: &edit,
+        prefill: &prefill,
+    };
+    let mut options = update_test_options(None, false);
+    options.raw = true;
+    let err = resolve_update_revision(
+        &mut resolver,
+        &options,
+        &update_test_target(&serde_json::json!({})),
+    )
+    .unwrap_err();
+    assert_eq!(err, diff_local::RAW_UPDATE_MESSAGE_ERROR);
+}
+
+#[test]
+fn d10_edit_caches_corpus_for_next_run() {
+    let meta = scratch_dir("d10-edit");
+    let call = update_stub_call();
+    let seen = std::cell::RefCell::new(Vec::new());
+    let edit = |template: &str, name: &str| -> Result<String, String> {
+        seen.borrow_mut()
+            .push((template.to_string(), name.to_string()));
+        Ok("Thing\n\nSummary: edited\n".to_string())
+    };
+    let prefill = || -> Result<Option<String>, String> { Ok(None) };
+    let mut reader = std::io::BufReader::new(std::io::empty());
+    let mut writer = Vec::new();
+    let mut resolver = UpdateResolver {
+        reader: &mut reader,
+        writer: &mut writer,
+        call: &call,
+        metadata_dir: &meta,
+        edit: &edit,
+        prefill: &prefill,
+    };
+    let options = update_test_options(Some("m"), true);
+    resolve_update_revision(
+        &mut resolver,
+        &options,
+        &update_test_target(&serde_json::json!({})),
+    )
+    .unwrap();
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].1, EDITOR_DIFF_EDIT);
+    // Without `--edit` the cache is ignored; with it, the cached corpus
+    // is the editor input.
+    assert_eq!(seen[0].0, "Thing\n\nSummary: yes\n");
+    let saved = read_scratch_json(&meta, SCRATCH_EDIT_MESSAGES);
+    assert_eq!(saved["5"], serde_json::json!("Thing\n\nSummary: edited\n"));
+}
+
+#[test]
+fn d10_verbatim_fields_defeat_edit_cache() {
+    let meta = scratch_dir("d10-verbatim");
+    write_scratch_json(
+        &meta,
+        SCRATCH_EDIT_MESSAGES,
+        &serde_json::json!({"5": "stale cache\n"}),
+    );
+    let call = update_stub_call();
+    let seen = std::cell::RefCell::new(String::new());
+    let edit = |template: &str, _: &str| -> Result<String, String> {
+        *seen.borrow_mut() = template.to_string();
+        Ok(template.to_string())
+    };
+    let prefill = || -> Result<Option<String>, String> { Ok(None) };
+    let mut reader = std::io::BufReader::new(std::io::empty());
+    let mut writer = Vec::new();
+    let mut resolver = UpdateResolver {
+        reader: &mut reader,
+        writer: &mut writer,
+        call: &call,
+        metadata_dir: &meta,
+        edit: &edit,
+        prefill: &prefill,
+    };
+    let options = update_test_options(Some("m"), true);
+    resolve_update_revision(
+        &mut resolver,
+        &options,
+        &update_test_target(&serde_json::json!({"title": "Local"})),
+    )
+    .unwrap();
+    // Non-empty local fields refetch the base corpus (`:659-670`).
+    assert_eq!(*seen.borrow(), "Thing\n\nSummary: yes\n");
+}
+
+#[test]
+fn d17_json_updates_and_creates_print_nothing() {
+    let call = |method: &str, _: &serde_json::Value| {
+        if method == diff_submit::METHOD_CREATE_DIFF {
+            return Ok(serde_json::json!({"diffid": 3, "uri": "http://x/D1"}));
+        }
+        if method == diff_submit::METHOD_UPDATE_REVISION {
+            return Ok(serde_json::json!({"revisionid": 5, "uri": "http://x/D5"}));
+        }
+        Err(format!("DIFF-D17: unexpected {method}"))
+    };
+    let input = SubmitInput {
+        mode: SubmitMode::Update(5),
+        message: Some("m".to_string()),
+        draft: false,
+        message_corpus: None,
+        fields: serde_json::json!({}),
+        spec: serde_json::json!({}),
+        properties: Vec::new(),
+        lint_unit: diff_local::LintUnitReport::empty(),
+        included_changes: String::new(),
+        json: true,
+    };
+    let report = submit_over_with_uri_ansi(&call, &input, false).unwrap();
+    assert_eq!(report.text, "");
+    assert_eq!(report.uri.as_deref(), Some("http://x/D5"));
+}
+
+#[test]
+fn d7_amend_after_create_rewrites_git_message() {
+    let git = git_dir("d7-amend");
+    // Pin amendability regardless of ambient user config.
+    std::fs::write(git.join(".arcconfig"), "{\"history.immutable\": false}").unwrap();
+    std::fs::write(git.join("f.txt"), "a\n").unwrap();
+    let add = std::process::Command::new("git")
+        .current_dir(&git)
+        .args(["add", "-A"])
+        .status()
+        .unwrap();
+    assert!(add.success());
+    let commit = std::process::Command::new("git")
+        .current_dir(&git)
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qam",
+            "old",
+        ])
+        .status()
+        .unwrap();
+    assert!(commit.success());
+    let call = |method: &str, params: &serde_json::Value| {
+        assert_eq!(method, diff_submit::METHOD_GET_COMMIT_MESSAGE);
+        assert_eq!(params["revision_id"], serde_json::json!(7));
+        Ok(serde_json::json!("new\n\nDifferential Revision: D7\n"))
+    };
+    let options = Options::default();
+    amend_after_create(
+        &git,
+        &hg::HgCommand::default(),
+        &options,
+        &call,
+        7,
+        Some(VcsKind::Git),
+    )
+    .unwrap();
+    let out = std::process::Command::new("git")
+        .current_dir(&git)
+        .args(["log", "-1", "--format=%B"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim_end(),
+        "new\n\nDifferential Revision: D7"
+    );
+}
+
+#[test]
+fn d7_no_amend_flag_skips_rewrite() {
+    let git = git_dir("d7-noamend");
+    let call = |method: &str, _: &serde_json::Value| {
+        assert_eq!(method, diff_submit::METHOD_GET_COMMIT_MESSAGE);
+        Ok(serde_json::json!("revised\n"))
+    };
+    let options = Options {
+        no_amend: true,
+        ..Options::default()
+    };
+    // Fetches (like PHP) but rewrites nothing.
+    amend_after_create(
+        &git,
+        &hg::HgCommand::default(),
+        &options,
+        &call,
+        7,
+        Some(VcsKind::Git),
+    )
+    .unwrap();
+}
+
+#[test]
+fn d11_autotarget_hit_gates_lint_unit_props() {
+    let props = std::cell::RefCell::new(Vec::new());
+    let call = |method: &str, params: &serde_json::Value| {
+        if method == diff_submit::METHOD_CREATE_DIFF {
+            return Ok(serde_json::json!({
+                "diffid": 3, "uri": "http://x/D1", "phid": "PHID-DIFF-9",
+            }));
+        }
+        if method == diff_submit::METHOD_QUERY_AUTOTARGETS {
+            return Ok(serde_json::json!({"targetMap": {"arcanist.lint": "PHID-L"}}));
+        }
+        if method == diff_submit::METHOD_SENDMESSAGE {
+            return Ok(serde_json::json!(null));
+        }
+        if method == diff_submit::METHOD_SET_DIFF_PROPERTY {
+            props
+                .borrow_mut()
+                .push(params["name"].as_str().unwrap_or("").to_string());
+            return Ok(serde_json::json!(null));
+        }
+        Err(format!("DIFF-D11: unexpected {method}"))
+    };
+    let input = SubmitInput {
+        mode: SubmitMode::Only,
+        message: None,
+        draft: false,
+        message_corpus: None,
+        fields: serde_json::Value::Null,
+        spec: serde_json::json!({}),
+        properties: vec![
+            diff_submit::DiffProperty {
+                name: diff_submit::PROP_LINT.to_string(),
+                data: "[]".to_string(),
+            },
+            diff_submit::DiffProperty {
+                name: diff_submit::PROP_LOCAL_COMMITS.to_string(),
+                data: "[]".to_string(),
+            },
+        ],
+        lint_unit: diff_local::LintUnitReport::empty(),
+        included_changes: String::new(),
+        json: false,
+    };
+    submit_over_with_uri_ansi(&call, &input, false).unwrap();
+    // The hit gates `arc:lint` off; `local:commits` still sends.
+    assert_eq!(*props.borrow(), vec!["local:commits".to_string()]);
+}
+
+#[test]
+fn d11_autotarget_miss_keeps_legacy_props() {
+    let props = std::cell::RefCell::new(Vec::new());
+    let call = |method: &str, params: &serde_json::Value| {
+        if method == diff_submit::METHOD_CREATE_DIFF {
+            return Ok(serde_json::json!({"diffid": 3, "uri": "http://x/D1"}));
+        }
+        if method == diff_submit::METHOD_SET_DIFF_PROPERTY {
+            props
+                .borrow_mut()
+                .push(params["name"].as_str().unwrap_or("").to_string());
+            return Ok(serde_json::json!(null));
+        }
+        Err(format!("DIFF-D11: unexpected {method}"))
+    };
+    let input = SubmitInput {
+        mode: SubmitMode::Only,
+        message: None,
+        draft: false,
+        message_corpus: None,
+        fields: serde_json::Value::Null,
+        spec: serde_json::json!({}),
+        properties: vec![diff_submit::DiffProperty {
+            name: diff_submit::PROP_UNIT.to_string(),
+            data: "[]".to_string(),
+        }],
+        lint_unit: diff_local::LintUnitReport::empty(),
+        included_changes: String::new(),
+        json: false,
+    };
+    submit_over_with_uri_ansi(&call, &input, false).unwrap();
+    // No diff PHID means no upload attempt; the legacy prop sends.
+    assert_eq!(*props.borrow(), vec!["arc:unit".to_string()]);
+}
+
+#[test]
+fn d13_staging_skip_ladder_records_statuses() {
+    let recorded = std::cell::RefCell::new(Vec::new());
+    let repo_rows = std::cell::RefCell::new(serde_json::json!([{}]));
+    let call = |method: &str, params: &serde_json::Value| {
+        if method == "repository.query" {
+            return Ok(repo_rows.borrow().clone());
+        }
+        assert_eq!(method, diff_submit::METHOD_SET_DIFF_PROPERTY);
+        assert_eq!(params["name"], serde_json::json!("arc.staging"));
+        assert_eq!(params["diff_id"], serde_json::json!(9));
+        recorded
+            .borrow_mut()
+            .push(params["data"].as_str().unwrap().to_string());
+        Ok(serde_json::json!(null))
+    };
+    let dir = git_dir("d13-ladder");
+    // Flag skip short-circuits before any query.
+    let options = Options {
+        skip_staging: true,
+        ..Options::default()
+    };
+    submit_changes_to_staging_area(&dir, &options, &call, Some(VcsKind::Git), 9, "b", false)
+        .unwrap();
+    // Raw sources skip next.
+    let options = Options {
+        raw: true,
+        ..Options::default()
+    };
+    submit_changes_to_staging_area(&dir, &options, &call, Some(VcsKind::Git), 9, "b", false)
+        .unwrap();
+    // No callsign or remote: repository unknown (no query succeeds).
+    let options = Options::default();
+    submit_changes_to_staging_area(&dir, &options, &call, Some(VcsKind::Git), 9, "b", false)
+        .unwrap();
+    let recorded = recorded.borrow();
+    assert_eq!(recorded.len(), 3);
+    assert!(recorded[0].contains("\"user.skip\""), "{}", recorded[0]);
+    assert!(recorded[1].contains("\"diff.raw\""), "{}", recorded[1]);
+    assert!(
+        recorded[2].contains("\"repository.unknown\""),
+        "{}",
+        recorded[2]
+    );
+}
+
+#[test]
+fn d13_staging_server_ladder_records_statuses() {
+    let repo_rows = std::cell::RefCell::new(serde_json::json!([]));
+    let dir = git_dir("d13-server");
+    std::fs::write(dir.join(".arcconfig"), "{\"repository.callsign\": \"X\"}").unwrap();
+    let options = Options::default();
+    // Each server-side answer maps to its skip status.
+    for (rows, status) in [
+        (serde_json::json!([]), "repository.unknown"),
+        (serde_json::json!([{}]), "repository.unavailable"),
+        (
+            serde_json::json!([{"staging": {"supported": false}}]),
+            "repository.unsupported",
+        ),
+        (
+            serde_json::json!([{"staging": {"supported": true}}]),
+            "repository.unconfigured",
+        ),
+    ] {
+        *repo_rows.borrow_mut() = rows;
+        let payload = std::cell::RefCell::new(String::new());
+        let call = |method: &str, params: &serde_json::Value| {
+            if method == "repository.query" {
+                return Ok(repo_rows.borrow().clone());
+            }
+            *payload.borrow_mut() = params["data"].as_str().unwrap_or("").to_string();
+            Ok(serde_json::json!(null))
+        };
+        submit_changes_to_staging_area(&dir, &options, &call, Some(VcsKind::Git), 9, "b", false)
+            .unwrap();
+        assert!(payload.borrow().contains(status), "{}", payload.borrow());
+    }
+    // A non-git client with a configured area records client.unsupported.
+    *repo_rows.borrow_mut() = serde_json::json!([{
+        "staging": {"supported": true, "uri": "s"},
+    }]);
+    let payload = std::cell::RefCell::new(String::new());
+    let call = |method: &str, params: &serde_json::Value| {
+        if method == "repository.query" {
+            return Ok(repo_rows.borrow().clone());
+        }
+        *payload.borrow_mut() = params["data"].as_str().unwrap_or("").to_string();
+        Ok(serde_json::json!(null))
+    };
+    submit_changes_to_staging_area(&dir, &options, &call, Some(VcsKind::Svn), 9, "b", false)
+        .unwrap();
+    assert!(
+        payload.borrow().contains("client.unsupported"),
+        "{}",
+        payload.borrow()
+    );
+    assert!(is_old_server_error("ERR-CONDUIT-CALL: x"));
+    assert!(!is_old_server_error("ERR-OTHER: x"));
+}
+
+#[test]
+fn d13_staging_push_records_refs() {
+    // Push to a local bare repo standing in for the staging area.
+    let bare = scratch_dir("d13-bare");
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&bare)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let dir = git_dir("d13-push");
+    std::fs::write(dir.join(".arcconfig"), "{\"repository.callsign\": \"X\"}").unwrap();
+    std::fs::write(dir.join("f.txt"), "a\n").unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .current_dir(&dir)
+            .args(["add", "-A"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        std::process::Command::new("git")
+            .current_dir(&dir)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qam",
+                "one"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(dir.join("f.txt"), "a\nb\n").unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .current_dir(&dir)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qam",
+                "two"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let base = std::process::Command::new("git")
+        .current_dir(&dir)
+        .args(["rev-parse", "HEAD~1"])
+        .output()
+        .unwrap();
+    let base = String::from_utf8_lossy(&base.stdout).trim().to_string();
+    let uri = bare.to_string_lossy().to_string();
+    let payload = std::cell::RefCell::new(String::new());
+    let call = |method: &str, params: &serde_json::Value| {
+        if method == "repository.query" {
+            return Ok(serde_json::json!([{
+                "staging": {"supported": true, "uri": uri},
+            }]));
+        }
+        assert_eq!(method, diff_submit::METHOD_SET_DIFF_PROPERTY);
+        *payload.borrow_mut() = params["data"].as_str().unwrap_or("").to_string();
+        Ok(serde_json::json!(null))
+    };
+    let options = Options::default();
+    submit_changes_to_staging_area(&dir, &options, &call, Some(VcsKind::Git), 7, &base, false)
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payload.borrow()).unwrap();
+    assert_eq!(payload["status"], serde_json::json!("pushed"));
+    assert_eq!(payload["refs"].as_array().unwrap().len(), 2);
+    let tags = std::process::Command::new("git")
+        .current_dir(&bare)
+        .args(["tag", "-l", "phabricator/diff/7"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&tags.stdout).trim(),
+        "phabricator/diff/7"
+    );
+}
+
+#[test]
+fn d14_stamp_skips_raw_and_unknown_repos() {
+    // Offline-safe: raw skips before any call, and a non-repo dir
+    // resolves to no query without touching the network.
+    let client = conduit::Client::new("http://127.0.0.1:9/", "x").unwrap();
+    let plain = scratch_dir("d14-raw");
+    let mut spec = serde_json::json!({"changes": []});
+    stamp_repository_phid(&client, &plain, true, &mut spec).unwrap();
+    assert_eq!(spec, serde_json::json!({"changes": []}));
+    let outside = scratch_dir("d14-outside");
+    stamp_repository_phid(&client, &outside, false, &mut spec).unwrap();
+    assert_eq!(spec, serde_json::json!({"changes": []}));
+}
+
+fn d8_local_commit(hash: &str, summary: &str, message: &str) -> diff_local::LocalCommitInfo {
+    diff_local::LocalCommitInfo {
+        commit: hash.to_string(),
+        tree: String::new(),
+        parents: Vec::new(),
+        time: String::new(),
+        author: "t".to_string(),
+        summary: summary.to_string(),
+        message: message.to_string(),
+        author_email: String::new(),
+    }
+}
+
+#[test]
+fn d8_create_message_defaults_run_before_saved_resume() {
+    // DIFF-D8 (`:1398-1403`): default-field conduit pulls run even when
+    // a saved template resumes, and the resume skips the server
+    // template fetch.
+    let root = scratch_dir("d8-saved");
+    let meta = root.join(".git");
+    write_scratch_file(
+        &meta,
+        diff_local::SCRATCH_CREATE_MESSAGE,
+        "Saved title\nBody\n",
+    );
+    let seen = std::cell::RefCell::new(Vec::new());
+    let call = |method: &str, _: &serde_json::Value| {
+        seen.borrow_mut().push(method.to_string());
+        if method == diff_submit::METHOD_GET_COMMIT_MESSAGE {
+            panic!("DIFF-D8: saved resume must not fetch the server template");
+        }
+        assert_eq!(method, diff_submit::METHOD_PARSE_COMMIT_MESSAGE);
+        Ok(serde_json::json!({"fields": {"title": "X"}}))
+    };
+    let edit = |template: &str| -> Result<String, String> {
+        assert!(template.contains("Saved title"), "{template}");
+        Ok("Edited title\n".to_string())
+    };
+    let mut reader = std::io::BufReader::new(std::io::Cursor::new(b"y\n".to_vec()));
+    let mut writer = Vec::new();
+    let mut context = CreateMessageContext {
+        reader: &mut reader,
+        writer: &mut writer,
+        call: &call,
+        metadata_dir: &meta,
+        work_root: &root,
+        edit: &edit,
+        amend_commit: None,
+        user_phid: "PHID-USER-1",
+    };
+    let local = vec![d8_local_commit("abcdef1234567890", "Subj", "Subj\n")];
+    let message =
+        create_message_from_user(&mut context, &defaults(), &local, Some("main")).unwrap();
+    assert_eq!(message.raw_corpus, "Edited title\n");
+    // One pull for the local commit plus one for the edited draft.
+    assert_eq!(
+        *seen.borrow(),
+        vec![
+            diff_submit::METHOD_PARSE_COMMIT_MESSAGE.to_string(),
+            diff_submit::METHOD_PARSE_COMMIT_MESSAGE.to_string(),
+        ]
+    );
+}
+
+#[test]
+fn d8_create_message_notes_use_head_commit_message() {
+    // DIFF-D8 (`:1411-1412`): parse notes switch the template to the
+    // head commit message instead of the server template.
+    let root = scratch_dir("d8-notes");
+    let meta = root.join(".git");
+    let call = |method: &str, _: &serde_json::Value| {
+        assert_eq!(method, diff_submit::METHOD_PARSE_COMMIT_MESSAGE);
+        Ok(serde_json::json!({
+            "fields": {"title": "Head subject"},
+            "errors": ["unknown reviewer robert"],
+        }))
+    };
+    let captured = std::cell::RefCell::new(String::new());
+    let edit = |template: &str| -> Result<String, String> {
+        *captured.borrow_mut() = template.to_string();
+        Ok("Fixed title\n".to_string())
+    };
+    // The re-edit pull succeeds so the fixed draft validates.
+    let fixed = std::cell::RefCell::new(false);
+    let call = |method: &str, params: &serde_json::Value| {
+        if *fixed.borrow() {
+            assert_eq!(method, diff_submit::METHOD_PARSE_COMMIT_MESSAGE);
+            return Ok(serde_json::json!({"fields": {"title": "Fixed title"}}));
+        }
+        *fixed.borrow_mut() = true;
+        call(method, params)
+    };
+    let mut reader = std::io::BufReader::new(std::io::empty());
+    let mut writer = Vec::new();
+    let mut context = CreateMessageContext {
+        reader: &mut reader,
+        writer: &mut writer,
+        call: &call,
+        metadata_dir: &meta,
+        work_root: &root,
+        edit: &edit,
+        amend_commit: None,
+        user_phid: "PHID-USER-1",
+    };
+    let local = vec![d8_local_commit(
+        "abcdef1234567890",
+        "Head subject",
+        "Head subject\n\nBody text\n",
+    )];
+    let message =
+        create_message_from_user(&mut context, &defaults(), &local, Some("main")).unwrap();
+    assert_eq!(message.raw_corpus, "Fixed title\n");
+    let template = captured.borrow().clone();
+    assert!(
+        template.starts_with("Head subject\n\nBody text\n\n# NEW DIFFERENTIAL REVISION"),
+        "{template}"
+    );
+}
+
+#[test]
+fn d8_create_message_included_block_names_branch() {
+    // DIFF-D8 (`:1428-1448`): the editor template wraps included
+    // commits with the branch header.
+    let root = scratch_dir("d8-included");
+    let meta = root.join(".git");
+    let call = |method: &str, _: &serde_json::Value| {
+        if method == diff_submit::METHOD_GET_COMMIT_MESSAGE {
+            return Ok(serde_json::json!("Server template\n"));
+        }
+        assert_eq!(method, diff_submit::METHOD_PARSE_COMMIT_MESSAGE);
+        Ok(serde_json::json!({"fields": {"title": "T"}}))
+    };
+    let captured = std::cell::RefCell::new(String::new());
+    let edit = |template: &str| -> Result<String, String> {
+        *captured.borrow_mut() = template.to_string();
+        Ok("Final title\n".to_string())
+    };
+    let mut reader = std::io::BufReader::new(std::io::empty());
+    let mut writer = Vec::new();
+    let mut context = CreateMessageContext {
+        reader: &mut reader,
+        writer: &mut writer,
+        call: &call,
+        metadata_dir: &meta,
+        work_root: &root,
+        edit: &edit,
+        amend_commit: None,
+        user_phid: "PHID-USER-1",
+    };
+    let local = vec![d8_local_commit("abcdef1234567890", "Subj", "Subj\n")];
+    let message =
+        create_message_from_user(&mut context, &defaults(), &local, Some("main")).unwrap();
+    assert_eq!(message.raw_corpus, "Final title\n");
+    let template = captured.borrow().clone();
+    assert!(
+        template.contains("# Included commits in branch main:"),
+        "{template}"
+    );
+    assert!(template.contains("abcdef123456 Subj"), "{template}");
+}
+
+#[test]
+fn d8_bare_detection_creates_updates_or_chooses() {
+    // DIFF-D8 (`:1303-1334`): no open revision creates, exactly one
+    // updates, several raise the chooser error.
+    let dir = git_dir("d8-detect");
+    let run = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .current_dir(&dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    };
+    run(&["commit", "--allow-empty", "-qm", "first"]);
+    let base = git::stdout_text(&dir, &["rev-parse", "HEAD"]).unwrap();
+    // No footers and no open revisions: create.
+    run(&["commit", "--allow-empty", "-qm", "second"]);
+    let queried = std::cell::RefCell::new(false);
+    let call = |method: &str, params: &serde_json::Value| {
+        assert_eq!(method, diff_submit::METHOD_QUERY);
+        assert!(params.get("commitHashes").is_some());
+        *queried.borrow_mut() = true;
+        Ok(serde_json::json!([]))
+    };
+    let mode = resolve_bare_submit_mode(
+        &call,
+        &dir,
+        &hg::HgCommand::default(),
+        Some(VcsKind::Git),
+        base.trim(),
+        Some("HEAD"),
+        "PHID-USER-1",
+    )
+    .unwrap();
+    assert_eq!(mode, SubmitMode::Create);
+    assert!(*queried.borrow());
+
+    // A footer id plus one open revision: update. Two rows: chooser.
+    run(&[
+        "commit",
+        "--allow-empty",
+        "-qm",
+        "third",
+        "-m",
+        "Differential Revision: D7",
+    ]);
+    let call = |method: &str, params: &serde_json::Value| {
+        assert_eq!(method, diff_submit::METHOD_QUERY);
+        assert_eq!(params["ids"], serde_json::json!([7]));
+        Ok(serde_json::json!([{"id": 7, "title": "Seven"}]))
+    };
+    let mode = resolve_bare_submit_mode(
+        &call,
+        &dir,
+        &hg::HgCommand::default(),
+        Some(VcsKind::Git),
+        base.trim(),
+        Some("HEAD"),
+        "PHID-USER-1",
+    )
+    .unwrap();
+    assert_eq!(mode, SubmitMode::Update(7));
+    let call = |_: &str, _: &serde_json::Value| {
+        Ok(serde_json::json!([
+            {"id": 7, "title": "Seven"},
+            {"id": 8, "title": "Eight"},
+        ]))
+    };
+    let err = resolve_bare_submit_mode(
+        &call,
+        &dir,
+        &hg::HgCommand::default(),
+        Some(VcsKind::Git),
+        base.trim(),
+        Some("HEAD"),
+        "PHID-USER-1",
+    )
+    .unwrap_err();
+    assert!(err.contains("several revisions"), "{err}");
+    assert!(err.contains("D7: Seven"), "{err}");
+    assert!(err.contains("'--update'"), "{err}");
+    assert!(err.contains("'--create'"), "{err}");
+}
+
+#[test]
+fn d8_footer_target_skips_ownership_uses_edit_template() {
+    // DIFF-D8 (`:667-670`): footer redirects skip the ownership query
+    // and seed the `edit` template with the pulled fields.
+    let meta = scratch_dir("d8-footer");
+    let use_fields = serde_json::json!({"title": "Pulled"});
+    let call = |method: &str, params: &serde_json::Value| {
+        assert_ne!(method, diff_submit::METHOD_QUERY);
+        if method == diff_submit::METHOD_GET_COMMIT_MESSAGE {
+            assert_eq!(params["edit"], serde_json::json!("edit"));
+            assert_eq!(params["revision_id"], serde_json::json!(7));
+            assert_eq!(params["fields"], serde_json::json!({"title": "Pulled"}));
+            return Ok(serde_json::json!("Seven\n\nSummary: s\n"));
+        }
+        assert_eq!(method, diff_submit::METHOD_PARSE_COMMIT_MESSAGE);
+        Ok(serde_json::json!({"fields": {"title": "Seven"}}))
+    };
+    let edit = |_: &str, _: &str| -> Result<String, String> {
+        panic!("DIFF-D8: --message skips the editor")
+    };
+    let prefill = || -> Result<Option<String>, String> { Ok(None) };
+    let mut reader = std::io::BufReader::new(std::io::empty());
+    let mut writer = Vec::new();
+    let mut resolver = UpdateResolver {
+        reader: &mut reader,
+        writer: &mut writer,
+        call: &call,
+        metadata_dir: &meta,
+        edit: &edit,
+        prefill: &prefill,
+    };
+    let mut options = update_test_options(Some("m"), false);
+    options.update = None;
+    let target = UpdateTarget {
+        revision_id: 7,
+        revision_arg: "7",
+        verbatim_fields: &use_fields,
+        check_ownership: false,
+        edit_fields: Some(&use_fields),
+    };
+    let resolved = resolve_update_revision(&mut resolver, &options, &target).unwrap();
+    assert_eq!(resolved.fields, serde_json::json!({"title": "Seven"}));
+    assert_eq!(resolved.message, "m");
+}
+
+#[test]
+fn d8_bare_verbatim_skips_detection() {
+    // DIFF-D8 (`:1298-1300`): bare `--verbatim` always creates.
+    assert!(!bare_submit_skips_detection(&defaults()));
+    let verbatim = Options {
+        verbatim: true,
+        ..defaults()
+    };
+    assert!(bare_submit_skips_detection(&verbatim));
+}
+
+#[test]
+fn d8_resolve_create_message_file_returns_footer_redirect() {
+    // DIFF-D8 (`:1357-1373`): `--message-file` validates without
+    // editing; a footer revision id redirects to that update.
+    let root = scratch_dir("d8-msgfile");
+    let path = root.join("msg.txt");
+    std::fs::write(&path, "File title\n\nDifferential Revision: D9\n").unwrap();
+    let call = |method: &str, _: &serde_json::Value| {
+        if method == diff_submit::METHOD_QUERY {
+            return Ok(serde_json::json!([{
+                "id": 9, "title": "Nine", "authorPHID": "PHID-USER-1",
+            }]));
+        }
+        assert_eq!(method, diff_submit::METHOD_PARSE_COMMIT_MESSAGE);
+        Ok(serde_json::json!({"fields": {"title": "File title"}}))
+    };
+    let edit =
+        |_: &str| -> Result<String, String> { panic!("DIFF-D8: --message-file never edits") };
+    let mut reader = std::io::BufReader::new(std::io::empty());
+    let mut writer = Vec::new();
+    let mut context = CreateMessageContext {
+        reader: &mut reader,
+        writer: &mut writer,
+        call: &call,
+        metadata_dir: &root,
+        work_root: &root,
+        edit: &edit,
+        amend_commit: None,
+        user_phid: "PHID-USER-1",
+    };
+    let options = Options {
+        message_file: Some(path.to_string_lossy().into_owned()),
+        ..defaults()
+    };
+    let resolved = resolve_create_message(&mut context, &options, &[], Some("main")).unwrap();
+    assert_eq!(resolved.corpus, "File title\n\nDifferential Revision: D9\n");
+    assert_eq!(resolved.footer_revision_id, Some(9));
 }

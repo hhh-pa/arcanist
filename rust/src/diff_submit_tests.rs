@@ -900,3 +900,102 @@ fn loose_int_coercion_accepts_numbers_and_strings() {
     assert_eq!(loose_u64(&json!("-1")), None);
     assert_eq!(loose_u64(&json!("bogus")), None);
 }
+
+#[test]
+fn d20_draft_create_uses_ceb_server_wording() {
+    let err = check_draft_create(true, false).unwrap_err();
+    assert!(
+        err.contains("the version of Phabricator on the server"),
+        "{err}"
+    );
+    assert!(check_draft_create(false, false).is_ok());
+    assert!(check_draft_create(true, true).is_ok());
+}
+
+#[test]
+fn d18_empty_metadata_encodes_as_list() {
+    let change = DiffChange::default();
+    assert_eq!(change_json(&change)["metadata"], json!([]));
+}
+
+#[test]
+fn d12_modern_dictionaries_drop_nulls_and_move_details() {
+    assert_eq!(
+        modern_lint_dictionary(&json!({"severity": "error", "line": null})),
+        json!({"severity": "error"})
+    );
+    assert_eq!(
+        modern_unit_dictionary(&json!({"name": "t", "userData": "out", "x": null})),
+        json!({"name": "t", "details": "out"})
+    );
+    // Empty `userData` vanishes without a `details` key.
+    assert_eq!(
+        modern_unit_dictionary(&json!({"name": "t", "userData": ""})),
+        json!({"name": "t"})
+    );
+    // Non-objects pass through untouched.
+    assert_eq!(modern_lint_dictionary(&json!(7)), json!(7));
+}
+
+#[test]
+fn d13_staging_push_refs() {
+    let refs = staging_push_refs("s", "phab", 7, "base1", "head1", false);
+    assert_eq!(refs.len(), 2);
+    assert_eq!(refs[0]["ref"], json!("refs/tags/phab/base/7"));
+    assert_eq!(refs[0]["type"], json!("base"));
+    assert_eq!(refs[0]["commit"], json!("base1"));
+    assert_eq!(refs[0]["remote"], json!({"uri": "s"}));
+    assert_eq!(refs[1]["ref"], json!("refs/tags/phab/diff/7"));
+    assert_eq!(refs[1]["commit"], json!("head1"));
+    // The magic root commit skips the base tag.
+    let refs = staging_push_refs(
+        "s",
+        "phab",
+        7,
+        crate::git::GIT_MAGIC_ROOT_COMMIT,
+        "head1",
+        false,
+    );
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0]["type"], json!("diff"));
+    // LFS pushes the base commit to the diff tag.
+    let refs = staging_push_refs("s", "phab", 7, "base1", "head1", true);
+    assert_eq!(refs[1]["commit"], json!("base1"));
+    // The payload round-trips (slashes come back escaped, like PHP).
+    let payload: serde_json::Value =
+        serde_json::from_str(&staging_property_data(STAGING_PUSHED, &refs)).unwrap();
+    assert_eq!(payload["status"], json!("pushed"));
+    assert_eq!(payload["refs"], serde_json::Value::Array(refs));
+}
+
+#[test]
+fn d11_autotargets_send_modernized_messages() {
+    use std::cell::RefCell;
+    let sent = RefCell::new(Vec::new());
+    let call = |method: &str, params: &serde_json::Value| {
+        if method == METHOD_QUERY_AUTOTARGETS {
+            assert_eq!(
+                params["targetKeys"],
+                json!([AUTOTARGET_LINT_KEY, AUTOTARGET_UNIT_KEY])
+            );
+            return Ok(
+                json!({"targetMap": {"arcanist.lint": "PHID-L", "arcanist.unit": "PHID-U"}}),
+            );
+        }
+        assert_eq!(method, METHOD_SENDMESSAGE);
+        sent.borrow_mut().push(params.clone());
+        Ok(json!(null))
+    };
+    assert!(update_autotargets(
+        &call,
+        "PHID-DIFF-1",
+        &[json!({"severity": "warning", "dropped": null})],
+        &[json!({"name": "t", "userData": "log"})],
+        0,
+    ));
+    let sent = sent.borrow();
+    assert_eq!(sent[0]["lint"], json!([{"severity": "warning"}]));
+    assert_eq!(sent[0]["type"], json!("fail"));
+    assert_eq!(sent[1]["unit"], json!([{"name": "t", "details": "log"}]));
+    assert_eq!(sent[1]["type"], json!("pass"));
+}

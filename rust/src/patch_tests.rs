@@ -194,9 +194,12 @@ fn missing_value_fails() {
 fn empty_equals_value_stores_empty() {
     let options = options_of(&["--diff="]);
     assert_eq!(options.diff.as_deref(), Some(""));
+    // PATCH-P13: PHP skips falsy values, so an empty `--diff` means no
+    // source was given.
     assert_eq!(
         select_source(&options).unwrap_err(),
-        "invalid diff '': expected D12345"
+        "You must specify changes to apply to the working copy with \"D12345\", \"--revision\", \
+         \"--diff\", \"--arcbundle\", or \"--patch\"."
     );
 }
 
@@ -232,22 +235,14 @@ fn check_supports_restricts_vcs() {
 
 #[test]
 fn normalizes_ids() {
+    // PATCH-P13: revisions strip one D and pass through; diffs pass raw.
     assert_eq!(normalize_revision_id("D123").unwrap(), "123");
     assert_eq!(normalize_revision_id("d123").unwrap(), "123");
     assert_eq!(normalize_revision_id("123").unwrap(), "123");
-    assert_eq!(normalize_diff_id("D9").unwrap(), "9");
-    assert_eq!(
-        normalize_revision_id("Dx").unwrap_err(),
-        "invalid revision 'Dx': expected D12345"
-    );
-    assert_eq!(
-        normalize_revision_id("").unwrap_err(),
-        "invalid revision '': expected D12345"
-    );
-    assert_eq!(
-        normalize_diff_id("abc").unwrap_err(),
-        "invalid diff 'abc': expected D12345"
-    );
+    assert_eq!(normalize_diff_id("D9").unwrap(), "D9");
+    assert_eq!(normalize_revision_id("Dx").unwrap(), "x");
+    assert_eq!(normalize_revision_id("").unwrap(), "");
+    assert_eq!(normalize_diff_id("abc").unwrap(), "abc");
 }
 
 #[test]
@@ -290,10 +285,11 @@ fn source_selection_enforces_exclusivity() {
         "Options \"D12345\", \"--revision\", \"--diff\", \"--arcbundle\" and \"--patch\" are \
          mutually exclusive. Choose exactly one patch source."
     );
-    assert!(
-        select_source(&options_of(&["nope"]))
-            .unwrap_err()
-            .contains("invalid revision")
+    // PATCH-P13: non-numeric names pass through to Conduit, which fails
+    // server-side; there is no local validation left.
+    assert_eq!(
+        select_source(&options_of(&["nope"])).unwrap(),
+        Source::Named("nope".to_string())
     );
 }
 
@@ -758,12 +754,14 @@ fn parses_diff_rows_as_map_or_list() {
     });
     let rows = parse_diff_rows(&map);
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].id, 3);
-    assert_eq!(rows[1].id, 5);
-    assert_eq!(rows[1].revision_id, Some(9));
-    assert_eq!(rows[1].base_revision, "base");
-    assert_eq!(rows[1].author_name, "Ada");
-    assert_eq!(rows[1].author_email, "ada@test");
+    // PATCH-P3: server order is kept (no id sort); the map above lists 5
+    // before 3, so 5 stays head.
+    assert_eq!(rows[0].id, 5);
+    assert_eq!(rows[1].id, 3);
+    assert_eq!(rows[0].revision_id, Some(9));
+    assert_eq!(rows[0].base_revision, "base");
+    assert_eq!(rows[0].author_name, "Ada");
+    assert_eq!(rows[0].author_email, "ada@test");
     let list = serde_json::json!([{"id": 1}]);
     assert_eq!(parse_diff_rows(&list).len(), 1);
     assert!(parse_diff_rows(&serde_json::json!("x")).is_empty());
@@ -797,12 +795,14 @@ fn diff_responses() -> std::collections::HashMap<String, serde_json::Value> {
     });
     std::collections::HashMap::from([(
         diff_submit::METHOD_QUERY_DIFFS.to_string(),
+        // PATCH-P3: server order is id DESC (newest first), so the head row
+        // carries the latest changes.
         serde_json::json!({
-            "1": {"id": "1", "revisionID": "7", "sourceControlBaseRevision": "base1",
-                  "authorName": "Ada", "authorEmail": "ada@test", "changes": []},
             "2": {"id": "2", "revisionID": "7", "sourceControlBaseRevision": "base2",
                   "authorName": "Ada", "authorEmail": "ada@test",
                   "changes": [change]},
+            "1": {"id": "1", "revisionID": "7", "sourceControlBaseRevision": "base1",
+                  "authorName": "Ada", "authorEmail": "ada@test", "changes": []},
         }),
     )])
 }
@@ -979,30 +979,40 @@ fn loads_each_bundle_kind() {
 }
 
 #[test]
-fn load_bundle_rejects_bad_ids_and_missing_conduit() {
+fn load_bundle_passes_raw_ids_and_requires_conduit() {
     let options = Options::default();
     let mut io = Io::buffered();
-    let call = stub_call(diff_responses());
-    assert_eq!(
-        load_bundle(
-            &Source::Revision("Dx".to_string()),
-            &options,
-            &mut io,
-            Some(&call)
-        )
-        .unwrap_err(),
-        "invalid revision 'Dx': expected D12345"
-    );
-    assert_eq!(
-        load_bundle(
-            &Source::Diff("Dx".to_string()),
-            &options,
-            &mut io,
-            Some(&call)
-        )
-        .unwrap_err(),
-        "invalid diff 'Dx': expected D12345"
-    );
+    // PATCH-P13: raw ids reach Conduit verbatim (no local validation);
+    // the stub answers regardless, so the loads succeed here and the
+    // server would fail on the real wire.
+    let seen = std::cell::RefCell::new(Vec::new());
+    let call = |method: &str, params: &serde_json::Value| {
+        seen.borrow_mut()
+            .push((method.to_string(), params.to_string()));
+        Ok(serde_json::json!({
+            "2": {"id": "2", "revisionID": "7",
+                  "sourceControlBaseRevision": "base2",
+                  "authorName": "Ada", "authorEmail": "ada@test",
+                  "changes": []},
+        }))
+    };
+    load_bundle(
+        &Source::Revision("x".to_string()),
+        &options,
+        &mut io,
+        Some(&call),
+    )
+    .unwrap();
+    load_bundle(
+        &Source::Diff("D12".to_string()),
+        &options,
+        &mut io,
+        Some(&call),
+    )
+    .unwrap();
+    let seen = seen.borrow();
+    assert!(seen[0].1.contains("\"x\""), "{}", seen[0].1);
+    assert!(seen[1].1.contains("\"D12\""), "{}", seen[1].1);
     for source in [
         Source::Named("7".to_string()),
         Source::Revision("7".to_string()),
@@ -1171,17 +1181,12 @@ fn clean_check_prompts_for_untracked() {
 
 #[test]
 fn clean_check_commit_prompt_paths() {
+    // PATCH-P9: the yes-path now commits via the editor (covered below
+    // through `resolve_uncommitted_tree` with a stub editor; the public
+    // entry would launch the real `$EDITOR` here).
     let repo = make_repo("clean_commit");
     std::fs::write(repo.join("file.txt"), "dirty\n").unwrap();
     let backends = Backends::default();
-    let mut io = Io::canned(&["y"]);
-    let error = require_clean_tree(&repo, Vcs::Git, &backends, &mut io, false).unwrap_err();
-    assert!(error.contains("interactive editor"), "{error}");
-    assert!(
-        io.out.stdout.contains("Unstaged changes in working copy"),
-        "{}",
-        io.out.stdout
-    );
     let mut io = Io::canned(&["n"]);
     assert_eq!(
         require_clean_tree(&repo, Vcs::Git, &backends, &mut io, false).unwrap_err(),
@@ -1353,18 +1358,25 @@ fn loads_dependency_nodes_breadth_first() {
         assert_eq!(method, diff_submit::METHOD_QUERY);
         if params.to_string().contains("\"ids\"") {
             Ok(start.clone())
-        } else if params.to_string().contains("PHID-DREV-2") {
-            Ok(dep2.clone())
         } else {
-            Ok(dep3.clone())
+            let mut rows = dep2.as_array().cloned().unwrap_or_default();
+            rows.extend(dep3.as_array().cloned().unwrap_or_default());
+            Ok(serde_json::Value::Array(rows))
         }
     };
     let has_local = |hash: Option<&str>| hash == Some("local");
     let (nodes, start_phid) = load_dependency_nodes(&call, 1, &has_local, "gtcm").unwrap();
     assert_eq!(start_phid, "PHID-DREV-1");
-    // PHID-DREV-2 is pruned (commit local); PHID-DREV-3 is kept.
-    assert_eq!(nodes.len(), 2);
-    assert_eq!(nodes[1].phid, "PHID-DREV-3");
+    // PATCH-P4: one batched query per level (start + one frontier call).
+    assert_eq!(calls.borrow().len(), 2);
+    assert!(calls.borrow()[1].contains("PHID-DREV-2"));
+    assert!(calls.borrow()[1].contains("PHID-DREV-3"));
+    // PATCH-P5: PHID-DREV-2 is kept with empty edges (commit local);
+    // PHID-DREV-3 is kept with its edges.
+    assert_eq!(nodes.len(), 3);
+    assert_eq!(nodes[1].phid, "PHID-DREV-2");
+    assert!(nodes[1].depends_on.is_empty());
+    assert_eq!(nodes[2].phid, "PHID-DREV-3");
     let empty = stub_call(std::collections::HashMap::from([(
         diff_submit::METHOD_QUERY.to_string(),
         serde_json::json!([]),
@@ -2398,11 +2410,14 @@ fn sanity_check_paths() {
 
 #[test]
 fn commit_template_is_verbatim() {
+    // PATCH-P12: the ceb template text (`:900-909`), not the invented one.
     assert_eq!(
         COMMIT_TEMPLATE,
-        "\n\n# Enter a commit message.\n#\n# This message will be associated with a Differential \
-         revision.\n#\n# Differential Revision: <URL or ID of the Differential Revision>\n#\n"
+        "\n\n# Enter a commit message for this patch. If you just want to apply the patch to the \
+         working copy without committing, re-run arc patch with the --nocommit flag.\n"
     );
+    assert_eq!(patch_commit_template(None), COMMIT_TEMPLATE);
+    assert!(patch_commit_template(Some("494")).contains("for revision D494."));
 }
 
 #[test]
@@ -2506,21 +2521,23 @@ fn execute_git_patch_flow() {
 }
 
 #[test]
-fn execute_commit_without_message_fails() {
+fn execute_patch_nocommit_applies_without_editor() {
+    // PATCH-P8: committing without a message now opens the editor (covered
+    // at the resolver level); `--nocommit` still applies cleanly.
     let repo = make_repo("exec_commit");
     let patch = repo.join("fix.patch");
     std::fs::write(&patch, &change_bundle().text).unwrap();
     let patch = patch.to_string_lossy().to_string();
     let backends = Backends::default();
     let mut io = Io::canned(&["y"]);
-    let error = execute_with_io(
+    let out = execute_with_io(
         &repo,
-        &argv(&["--patch", &patch, "--nobranch", "--force"]),
+        &argv(&["--patch", &patch, "--nobranch", "--force", "--nocommit"]),
         &mut io,
         &backends,
     )
-    .unwrap_err();
-    assert!(error.contains("--nocommit"), "{error}");
+    .unwrap();
+    assert!(out.stderr.contains("APPLIED"), "{}", out.stderr);
 }
 
 #[test]
@@ -3239,4 +3256,403 @@ fn break_hunk_matches_server_split_live_vector() {
         rendered.contains("@@ -58,15 +65,31 @@\n"),
         "{rendered:.200}"
     );
+}
+
+/* T1153 PATCH-P findings: string-id monograms, raw id fetches. */
+
+#[test]
+fn p6_dependency_monograms_accept_string_ids() {
+    // Orsay types `differential.query` ids as strings; the whole plan
+    // must still yield children.
+    let repo = make_repo("p6_string_monograms");
+    let bundle = Bundle {
+        revision_id: Some(1),
+        ..Bundle::default()
+    };
+    let options = Options::default();
+    let mut io = Io::buffered();
+    let start = serde_json::json!([{
+        "phid": "PHID-DREV-1", "id": "1",
+        "auxiliary": {"phabricator:depends-on": ["PHID-DREV-2"]}
+    }]);
+    let dep = serde_json::json!([{
+        "phid": "PHID-DREV-2", "id": "2", "auxiliary": {}
+    }]);
+    let both = serde_json::json!([
+        {"phid": "PHID-DREV-1", "id": "1"},
+        {"phid": "PHID-DREV-2", "id": "2"}
+    ]);
+    let graph = |_: &str, params: &serde_json::Value| {
+        let text = params.to_string();
+        if text.contains("\"ids\"") {
+            Ok(start.clone())
+        } else if text.contains("PHID-DREV-1") {
+            Ok(both.clone())
+        } else {
+            Ok(dep.clone())
+        }
+    };
+    let children =
+        plan_dependency_children(&repo, Vcs::Git, &bundle, &options, &mut io, &graph).unwrap();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].revision.as_deref(), Some("D2"));
+}
+
+#[test]
+fn p8_editor_fallback_commits_without_revision() {
+    let bundle = Bundle::default();
+    let edit = |template: &str| -> Result<String, String> {
+        assert_eq!(template, COMMIT_TEMPLATE);
+        Ok("my patch\n# comment\n".to_string())
+    };
+    assert_eq!(
+        resolve_commit_message_with_editor(&bundle, None, Some(&edit)).unwrap(),
+        "my patch\n"
+    );
+    // A blank edit aborts.
+    let blank = |_: &str| -> Result<String, String> { Ok("# only\n".to_string()) };
+    assert_eq!(
+        resolve_commit_message_with_editor(&bundle, None, Some(&blank)).unwrap_err(),
+        diff_local::USER_ABORT
+    );
+    // Without an editor the guidance error survives.
+    assert_eq!(
+        resolve_commit_message_with_editor(&bundle, None, None).unwrap_err(),
+        NO_COMMIT_MESSAGE
+    );
+}
+
+#[test]
+fn p8_empty_fetch_opens_noted_template() {
+    let call = stub_call(std::collections::HashMap::from([(
+        diff_submit::METHOD_GET_COMMIT_MESSAGE.to_string(),
+        serde_json::json!(""),
+    )]));
+    let bundle = Bundle {
+        revision_id: Some(494),
+        ..Bundle::default()
+    };
+    let edit = |template: &str| -> Result<String, String> {
+        assert!(template.contains("for revision D494."), "{template}");
+        Ok("typed\n".to_string())
+    };
+    assert_eq!(
+        resolve_commit_message_with_editor(&bundle, Some(&call), Some(&edit)).unwrap(),
+        "typed\n"
+    );
+}
+
+#[test]
+fn p9_yes_path_commits_via_editor() {
+    // HEAD carries a revision footer, so the prompt offers a new commit
+    // (the D8 working-copy lookup is unported; revision IDs decline).
+    let repo = make_repo("p9_create");
+    git(
+        &repo,
+        &[
+            "commit",
+            "--allow-empty",
+            "-m",
+            "x\n\nDifferential Revision: D1",
+        ],
+    );
+    std::fs::write(repo.join("file.txt"), "dirty\n").unwrap();
+    let backends = Backends::default();
+    let mut io = Io::canned(&["y"]);
+    let status = TreeStatus {
+        unstaged: vec!["file.txt".to_string()],
+        ..TreeStatus::default()
+    };
+    let seen = std::cell::RefCell::new(String::new());
+    let edit = |template: &str| -> Result<String, String> {
+        *seen.borrow_mut() = template.to_string();
+        Ok("wip save\n".to_string())
+    };
+    let outcome = resolve_uncommitted_tree(
+        &repo,
+        Vcs::Git,
+        &backends,
+        &mut io,
+        &status,
+        "desc",
+        None,
+        &edit,
+    )
+    .unwrap();
+    assert_eq!(outcome, StashState::Clean);
+    assert!(
+        io.out.stdout.contains("create a new commit"),
+        "{}",
+        io.out.stdout
+    );
+    let template = seen.borrow().clone();
+    assert!(template.contains("# Enter a commit message."), "{template}");
+    assert!(template.contains("#     file.txt"), "{template}");
+    assert_eq!(git(&repo, &["log", "-1", "--format=%s"]), "wip save");
+    assert_eq!(git(&repo, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn p9_yes_path_amends_when_detected() {
+    // Plain HEAD by the repo author: amend wording, no editor, same count.
+    let repo = make_repo("p9_amend");
+    std::fs::write(repo.join(".arcconfig"), "{\"history.immutable\": false}").unwrap();
+    std::fs::write(repo.join("file.txt"), "dirty\n").unwrap();
+    let backends = Backends::default();
+    let mut io = Io::canned(&["y"]);
+    let status = TreeStatus {
+        unstaged: vec!["file.txt".to_string()],
+        ..TreeStatus::default()
+    };
+    let edit = |_: &str| -> Result<String, String> {
+        panic!("PATCH-P9: amend path never opens the editor")
+    };
+    resolve_uncommitted_tree(
+        &repo,
+        Vcs::Git,
+        &backends,
+        &mut io,
+        &status,
+        "desc",
+        None,
+        &edit,
+    )
+    .unwrap();
+    assert!(
+        io.out.stdout.contains("amend these 1 change(s)"),
+        "{}",
+        io.out.stdout
+    );
+    assert_eq!(git(&repo, &["rev-list", "--count", "HEAD"]), "1");
+    assert_eq!(git(&repo, &["status", "--porcelain", "--", "file.txt"]), "");
+}
+
+#[test]
+fn p9_unchanged_and_empty_templates_error() {
+    let repo = make_repo("p9_template");
+    git(
+        &repo,
+        &[
+            "commit",
+            "--allow-empty",
+            "-m",
+            "x\n\nDifferential Revision: D1",
+        ],
+    );
+    std::fs::write(repo.join("file.txt"), "dirty\n").unwrap();
+    let backends = Backends::default();
+    let status = TreeStatus {
+        unstaged: vec!["file.txt".to_string()],
+        ..TreeStatus::default()
+    };
+    let mut io = Io::canned(&["y"]);
+    let echo = |template: &str| -> Result<String, String> { Ok(template.to_string()) };
+    assert_eq!(
+        resolve_uncommitted_tree(
+            &repo,
+            Vcs::Git,
+            &backends,
+            &mut io,
+            &status,
+            "desc",
+            None,
+            &echo,
+        )
+        .unwrap_err(),
+        MUST_PROVIDE_MESSAGE
+    );
+    // An all-comments edit strips to `"\n"` (never `""`, like PHP), so
+    // the nonempty check cannot trip — `git commit` itself refuses.
+    let mut io = Io::canned(&["y"]);
+    let empty = |_: &str| -> Result<String, String> { Ok("# only\n".to_string()) };
+    let error = resolve_uncommitted_tree(
+        &repo,
+        Vcs::Git,
+        &backends,
+        &mut io,
+        &status,
+        "desc",
+        None,
+        &empty,
+    )
+    .unwrap_err();
+    assert!(error.contains("empty commit message"), "{error}");
+    assert_eq!(
+        MUST_PROVIDE_NONEMPTY_MESSAGE,
+        "You must provide a nonempty commit message."
+    );
+}
+
+#[test]
+fn p9_published_head_declines_amend() {
+    // A `diffusion.querycommits` hit means published: create wording.
+    let repo = make_repo("p9_published");
+    std::fs::write(
+        repo.join(".arcconfig"),
+        "{\"history.immutable\": false, \"repository.callsign\": \"X\"}",
+    )
+    .unwrap();
+    let backends = Backends::default();
+    let hash = git(&repo, &["rev-parse", "HEAD"]);
+    let call = |method: &str, params: &serde_json::Value| {
+        if method == "repository.query" {
+            return Ok(serde_json::json!([{"id": "7", "callsign": "X"}]));
+        }
+        if method == "diffusion.querycommits" {
+            assert_eq!(params["names"], serde_json::json!([format!("rX{hash}")]));
+            return Ok(serde_json::json!({
+                "identifierMap": {format!("rX{hash}"): {"id": 1}}
+            }));
+        }
+        Err(format!("PATCH-P9: unexpected {method}"))
+    };
+    let (amend, _) = calculate_patch_should_amend(&repo, Vcs::Git, &backends, Some(&call)).unwrap();
+    assert!(!amend);
+    let (amend, head) = calculate_patch_should_amend(&repo, Vcs::Git, &backends, None).unwrap();
+    assert!(amend);
+    assert!(head.unwrap().contains("base"));
+}
+
+#[test]
+fn p10_invalid_session_reauthenticates_and_retries_once() {
+    let options = Options::default();
+    let mut io = Io::buffered();
+    let seen = std::cell::RefCell::new(Vec::new());
+    let calls = std::cell::Cell::new(0u32);
+    let call = |method: &str, params: &serde_json::Value| {
+        seen.borrow_mut()
+            .push((method.to_string(), params.to_string()));
+        if method == "user.whoami" {
+            return Ok(serde_json::json!({"phid": "PHID-USER-1"}));
+        }
+        calls.set(calls.get() + 1);
+        if calls.get() == 1 {
+            return Err("ERR-INVALID-SESSION: session expired".to_string());
+        }
+        Ok(serde_json::json!({
+            "12": {"id": "12", "revisionID": "7",
+                   "sourceControlBaseRevision": "base",
+                   "authorName": "Ada", "authorEmail": "ada@test",
+                   "changes": []},
+        }))
+    };
+    let loaded = load_bundle_with_reauth(
+        &Source::Revision("7".to_string()),
+        &options,
+        &mut io,
+        Some(&call),
+    )
+    .unwrap();
+    assert_eq!(loaded.bundle.revision_id, Some(7));
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 3);
+    assert_eq!(seen[0].0, diff_submit::METHOD_QUERY_DIFFS);
+    assert_eq!(seen[1].0, "user.whoami");
+    assert_eq!(seen[2].0, diff_submit::METHOD_QUERY_DIFFS);
+    assert!(is_invalid_session_error("ERR-INVALID-SESSION: x"));
+    assert!(is_invalid_session_error("ERR-INVALID-SESSION"));
+    assert!(!is_invalid_session_error("ERR-OTHER: x"));
+}
+
+#[test]
+fn p10_reauth_failure_propagates() {
+    let options = Options::default();
+    let mut io = Io::buffered();
+    let call = |method: &str, _: &serde_json::Value| {
+        if method == "user.whoami" {
+            return Err("ERR-INVALID-AUTH: bad token".to_string());
+        }
+        Err("ERR-INVALID-SESSION: expired".to_string())
+    };
+    // Like PHP, the re-auth error (not the load error) surfaces.
+    assert_eq!(
+        load_bundle_with_reauth(
+            &Source::Revision("7".to_string()),
+            &options,
+            &mut io,
+            Some(&call),
+        )
+        .unwrap_err(),
+        "ERR-INVALID-AUTH: bad token"
+    );
+}
+
+#[test]
+fn p11_repository_encoding_lookup() {
+    let repo = make_repo("p11_encoding");
+    std::fs::write(repo.join(".arcconfig"), "{\"repository.callsign\": \"X\"}").unwrap();
+    let backends = Backends::default();
+    let answer = std::cell::RefCell::new(serde_json::json!([{"encoding": "cp1252"}]));
+    let call = |method: &str, params: &serde_json::Value| {
+        assert_eq!(method, "repository.query");
+        assert!(params.to_string().contains("\"X\""), "{}", params);
+        Ok(answer.borrow().clone())
+    };
+    assert_eq!(
+        patch_repository_encoding(&repo, Vcs::Git, &backends, &call).unwrap(),
+        Some("cp1252".to_string())
+    );
+    // Missing/empty encodings and ambiguous matches default to UTF-8.
+    for rows in [
+        serde_json::json!([{}]),
+        serde_json::json!([{"encoding": ""}]),
+        serde_json::json!([]),
+        serde_json::json!([{"encoding": "a"}, {"encoding": "b"}]),
+    ] {
+        *answer.borrow_mut() = rows;
+        assert_eq!(
+            patch_repository_encoding(&repo, Vcs::Git, &backends, &call).unwrap(),
+            Some("UTF-8".to_string())
+        );
+    }
+}
+
+#[test]
+fn p11_repository_encoding_failures() {
+    let repo = make_repo("p11_failures");
+    std::fs::write(repo.join(".arcconfig"), "{\"repository.callsign\": \"X\"}").unwrap();
+    let backends = Backends::default();
+    // `ERR-CONDUIT-CALL` (unknown method) still yields UTF-8; other
+    // conduit failures yield no override.
+    let call = |_: &str, _: &serde_json::Value| {
+        Err::<serde_json::Value, String>("ERR-CONDUIT-CALL: nope".to_string())
+    };
+    assert_eq!(
+        patch_repository_encoding(&repo, Vcs::Git, &backends, &call).unwrap(),
+        Some("UTF-8".to_string())
+    );
+    let call = |_: &str, _: &serde_json::Value| {
+        Err::<serde_json::Value, String>("ERR-OTHER: boom".to_string())
+    };
+    assert_eq!(
+        patch_repository_encoding(&repo, Vcs::Git, &backends, &call).unwrap(),
+        None
+    );
+    assert!(is_conduit_call_error("ERR-CONDUIT-CALL: x"));
+    assert!(!is_conduit_call_error("ERR-OTHER: x"));
+}
+
+#[test]
+fn p13_raw_fetches_send_verbatim_string_ids() {
+    let seen = std::cell::RefCell::new(Vec::new());
+    let call = |method: &str, params: &serde_json::Value| {
+        seen.borrow_mut()
+            .push((method.to_string(), params.to_string()));
+        Ok(serde_json::json!({
+            "12": {"id": "12", "revisionID": "7",
+                   "sourceControlBaseRevision": "base",
+                   "authorName": "Ada", "authorEmail": "ada@test",
+                   "changes": []},
+        }))
+    };
+    let bundle = fetch_revision_bundle_raw(&call, "x").unwrap();
+    assert_eq!(bundle.revision_id, Some(7));
+    fetch_diff_bundle_raw(&call, "D12").unwrap();
+    let seen = seen.borrow();
+    assert!(
+        seen[0].1.contains("\"revisionIDs\":[\"x\"]"),
+        "{}",
+        seen[0].1
+    );
+    assert!(seen[1].1.contains("\"ids\":[\"D12\"]"), "{}", seen[1].1);
 }
