@@ -21,18 +21,39 @@ use crate::{
 
 pub const NAME: &str = "branches";
 
-fn usage() -> String {
-    format!(
-        "usage: arc {NAME} [--all] [--json] [--conduit-uri URI]\n\
-         \n\
-         Show an enhanced view of branches in the working copy.\n\
-         \n\
-         Options:\n\
-         \x20 --all              include remote-tracking branches\n\
-         \x20 --json             emit a JSON array of branch objects\n\
-         \x20 --conduit-uri URI  conduit server (or ARC_CONDUIT_URI)\n\
-         \x20 -h, --help         show this help\n"
+/// T1153 B21/B23: `--help` renders the generated workflow help
+/// (`src/workflow/ArcanistBranchesWorkflow.php` via
+/// `ArcanistMarkersWorkflow`, toolset `getWorkflowInformation()`), not
+/// a short custom usage string. T1153 RB-D5: the renderer is the
+/// shared `crate::help` module; this file keeps only the data. The
+/// `--all`/`--json`/`--conduit-uri` extensions stay functional but
+/// undocumented in `--help`, like PHP (which takes no arguments).
+const HELP_EXAMPLES: &str = "**branches**";
+const HELP_SYNOPSIS: &str = "Show an enhanced view of branches in the working copy.";
+const HELP_TEXT: &str = "Lists branches in the working copy, annotated with additional information\nabout review status.";
+/// Non-wildcard argument specs: (name, short, param, help). Empty:
+/// ceb takes no arguments.
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &specs,
+        ansi,
     )
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
 }
 
 /// One listed branch (the `--json` shape).
@@ -78,7 +99,22 @@ fn wants_help(argv: &[String]) -> bool {
 /// `PhutilArgumentParser` (`parseWorkflowsFull`), so this shares the
 /// ported texts with `markers` (see there for the full list).
 pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
+    parse_options_with_tty(argv, crate::prompt::stdin_is_terminal())
+}
+
+/// [`parse_options`] with an injected TTY flag (deterministic tests).
+/// T1153 B21/B23: piped runs without `--` fail with
+/// `MISSING_TERMINATOR` (checked after unknown-flag scanning, like
+/// PHP's `parseFull()`, but before success). `--help` without `--`
+/// when piped reports the terminator. Vs ceb
+/// `ArcanistRuntime.php:80-86,172-188` and
+/// `PhutilArgumentParser.php:331-336`.
+fn parse_options_with_tty(argv: &[String], stdin_tty: bool) -> Result<Option<Options>, String> {
+    let missing = crate::help::terminator_missing(argv, stdin_tty);
     if wants_help(argv) {
+        if missing {
+            return Err(crate::help::MISSING_TERMINATOR.to_string());
+        }
         return Ok(None);
     }
     let parsed = argparse::parse_toolset(
@@ -91,6 +127,9 @@ pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
         false,
         false,
     )?;
+    if missing {
+        return Err(crate::help::MISSING_TERMINATOR.to_string());
+    }
     Ok(Some(Options {
         all: parsed.flag("all"),
         json: parsed.flag("json"),
@@ -329,6 +368,11 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
+            // T1153 B21/B23: the terminator failure prints the three
+            // cyan hints first (like `ArcanistRuntime.php:172-188`).
+            if message == crate::help::MISSING_TERMINATOR {
+                crate::help::print_terminator_hints(crate::terminal::ansi_enabled());
+            }
             // T1153 CORE-5: auth-coded query failures render login
             // guidance (the toolset runtime's auth arm). The calls
             // went out on a strict client, re-resolved here for the

@@ -87,7 +87,98 @@ pub const SINGLE_AVAILABLE: &[&str] = &[
     "phutil",
 ];
 
-pub const USAGE: &str = "usage: arc unit [--rev REV] [--engine ENGINE] [--coverage] [--no-coverage] [--detailed-coverage] [--json] [--output FORMAT] [--target PHID] [--everything] [--ugly] [--conduit-uri URI] [--config K=V] [--config-file FILE] [--arcrc-file FILE] [paths...]\n";
+/// T1153 B21/B23: `--help` renders the generated workflow help
+/// (`src/workflow/ArcanistUnitWorkflow.php`,
+/// `getCommandSynopses()`/`getCommandHelp()`), not a short custom
+/// usage string. T1153 RB-D5: the renderer is the shared
+/// `crate::help` module; this file keeps only the data. The
+/// `--conduit-uri`/`--config`/`--config-file`/`--arcrc-file`
+/// extensions stay functional but undocumented in `--help`, like
+/// PHP. Classic workflows never require `--` (B21 exempt: PHP
+/// runs them via the `scripts/arcanist.php` re-exec).
+const HELP_EXAMPLES: &str = "**unit**";
+const HELP_SYNOPSIS: &str =
+    "      **unit** [__options__] [__paths__]\n      **unit** [__options__] --rev [__rev__]";
+const HELP_TEXT: &str = "          Supports: git, svn, hg\n          Run unit tests that cover specified paths. If no paths are specified,\n          unit tests covering all modified files will be run.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[
+    (
+        "rev",
+        None,
+        Some("revision"),
+        "Run unit tests covering changes since a specific revision.",
+    ),
+    (
+        "engine",
+        None,
+        Some("classname"),
+        "Override configured unit engine for this project.",
+    ),
+    (
+        "coverage",
+        None,
+        None,
+        "Always enable coverage information.",
+    ),
+    (
+        "no-coverage",
+        None,
+        None,
+        "Always disable coverage information.",
+    ),
+    (
+        "detailed-coverage",
+        None,
+        None,
+        "Show a detailed coverage report on the CLI. Implies --coverage.",
+    ),
+    ("json", None, None, "Report results in JSON format."),
+    (
+        "output",
+        None,
+        Some("format"),
+        "With 'full', show full pretty report (Default). With 'json', report results in JSON format. With 'ugly', use uglier (but more efficient) JSON formatting. With 'none', don't print results.",
+    ),
+    (
+        "target",
+        None,
+        Some("phid"),
+        "(PROTOTYPE) Record a copy of the test results on the specified Harbormaster build target.",
+    ),
+    (
+        "everything",
+        None,
+        None,
+        "Run every test associated with a tracked file in the working copy.",
+    ),
+    (
+        "ugly",
+        None,
+        None,
+        "With --json, use uglier (but more efficient) formatting.",
+    ),
+];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &specs,
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
+}
 
 /// Number of trailing output lines echoed after the one-line summary.
 pub const TAIL_LINES: usize = 20;
@@ -3872,7 +3963,7 @@ fn parse_unit_options(argv: &[String]) -> Result<Options, ExitCode> {
     match parse_options(argv) {
         Ok(Some(opts)) => Ok(opts),
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", usage());
             Err(ExitCode::SUCCESS)
         }
         // T1153 R4 (UNIT-U4): `unit` is a subprocess workflow:
@@ -3986,7 +4077,7 @@ pub fn run_in_collecting(cwd: &Path, argv: &[String]) -> Result<ChildUnitReport,
     let opts = match parse_options(argv) {
         Ok(Some(opts)) => opts,
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", usage());
             return Err(ClassifiedError::usage(
                 "unexpected --help in child unit argv".to_string(),
             ));

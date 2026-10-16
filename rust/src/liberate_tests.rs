@@ -6,7 +6,8 @@ fn argv(words: &[&str]) -> Vec<String> {
 }
 
 fn args_of(words: &[&str]) -> Options {
-    let ParseOutcome::Args(opts) = parse_args(&argv(words)) else {
+    // T1153 B21/B23: TTY runs need no `--`.
+    let ParseOutcome::Args(opts) = parse_args_with_tty(&argv(words), true) else {
         panic!("expected args for {words:?}");
     };
     opts
@@ -28,6 +29,7 @@ fn scratch(name: &str) -> PathBuf {
 
 #[test]
 fn parses_path_and_clean() {
+    // T1153 B21/B23: TTY runs need no `--`.
     let opts = args_of(&[]);
     assert!(!opts.clean);
     assert_eq!(opts.path, None);
@@ -37,18 +39,19 @@ fn parses_path_and_clean() {
     assert_eq!(opts.path, Some("lib/".to_string()));
 
     assert!(matches!(
-        parse_args(&argv(&["a", "b"])),
+        parse_args_with_tty(&argv(&["a", "b"]), true),
         ParseOutcome::Error(_)
     ));
     assert!(matches!(
-        parse_args(&argv(&["--bogus"])),
+        parse_args_with_tty(&argv(&["--bogus"]), true),
         ParseOutcome::Error(_)
     ));
 }
 
 #[test]
 fn rejects_second_path_with_full_text() {
-    let ParseOutcome::Error(message) = parse_args(&argv(&["a", "b"])) else {
+    // T1153 B21/B23: TTY runs need no `--`.
+    let ParseOutcome::Error(message) = parse_args_with_tty(&argv(&["a", "b"]), true) else {
         panic!("expected an error");
     };
     assert_eq!(message, one_path_error());
@@ -147,6 +150,7 @@ fn declines_missing_directory() {
 
 #[test]
 fn core52_create_prompt_requires_a_tty() {
+    // T1153 B21/B23: piped runs carry `--` to reach the prompt gate.
     // T1153 CORE-52: off-TTY the create-directory prompt echoes its
     // query and throws (`ArcanistPrompt.php:77-86` at ceb), even with
     // a piped answer waiting.
@@ -159,7 +163,7 @@ fn core52_create_prompt_requires_a_tty() {
     assert!(!lib.exists());
     // Same through the workflow seam.
     let mut input = BufReader::new(std::io::Cursor::new("y\nmy-lib\n"));
-    let err = execute_with_input(&dir, &argv(&["nope"]), &mut input, false).unwrap_err();
+    let err = execute_with_input(&dir, &argv(&["--", "nope"]), &mut input, false).unwrap_err();
     assert!(err.contains("attempting to read user input"), "{err}");
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -374,20 +378,23 @@ fn rebuild_failure_stays_per_library_failure() {
 
 #[test]
 fn run_in_fails_on_usage_errors() {
+    // T1153 B21/B23: piped runs carry `--` to reach each error arm;
+    // `--bogus` stays bare to lock scan-first ordering.
     // T1153 CORE-21 / T1153 CORE-53 (R4): parser errors exit 1 under the
     // `USAGE EXCEPTION` label, but no-libraries-found throws
     // `ArcanistUsageException`, which escapes the toolset runtime
     // into a PHP fatal (255). Help still succeeds.
     let dir = scratch("exit-usage");
-    assert_eq!(run_in(&dir, &argv(&[])), ExitCode::from(255));
-    assert_eq!(run_in(&dir, &argv(&["a", "b"])), ExitCode::FAILURE);
+    assert_eq!(run_in(&dir, &argv(&["--"])), ExitCode::from(255));
+    assert_eq!(run_in(&dir, &argv(&["a", "b", "--"])), ExitCode::FAILURE);
     assert_eq!(run_in(&dir, &argv(&["--bogus"])), ExitCode::FAILURE);
-    assert_eq!(run_in(&dir, &argv(&["--help"])), ExitCode::SUCCESS);
+    assert_eq!(run_in(&dir, &argv(&["--help", "--"])), ExitCode::SUCCESS);
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn run_in_exits_zero_on_rebuild_failures() {
+    // T1153 B21/B23: piped runs carry `--`.
     // Per-library rebuild failures (missing script, missing `php`, a
     // failing rebuild) still exit 0, per PHP's `$any_errors` policy. The
     // rebuild runs for real here when `php` is present, and fails
@@ -397,22 +404,23 @@ fn run_in_exits_zero_on_rebuild_failures() {
     std::fs::create_dir_all(&lib).unwrap();
     std::fs::write(lib.join(INIT_FILE), "<?php\n").unwrap();
     std::fs::write(lib.join(MAP_FILE), "@phutil-library-version 2\n").unwrap();
-    assert_eq!(run_in(&dir, &argv(&["v2lib"])), ExitCode::SUCCESS);
+    assert_eq!(run_in(&dir, &argv(&["--", "v2lib"])), ExitCode::SUCCESS);
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn r4_core53_error_kinds() {
     use crate::conduit::EnvelopeKind;
+    // T1153 B21/B23: non-parse messages carry `--` to model a successful parse.
     // Parser errors are toolset usage; declines are `---`; the rest
     // (no libraries, versions, IO) escape into a fatal.
     assert_eq!(
-        classify_error(&argv(&["a", "b"]), "x".to_string()).kind,
+        classify_error(&argv(&["a", "b", "--"]), "x".to_string()).kind,
         EnvelopeKind::ToolsetUsage
     );
     assert_eq!(
         classify_error(
-            &argv(&["lib"]),
+            &argv(&["--", "lib"]),
             "cancelled: directory \"d\" does not exist".to_string()
         )
         .kind,
@@ -420,20 +428,25 @@ fn r4_core53_error_kinds() {
     );
     assert_eq!(
         classify_error(
-            &argv(&[]),
+            &argv(&["--"]),
             "Unable to find any libraries under the current working directory. To create a library, provide a path.".to_string()
         )
         .kind,
         EnvelopeKind::Fatal
     );
     assert_eq!(
-        classify_error(&argv(&["lib"]), "Unknown library version '9'!".to_string()).kind,
+        classify_error(
+            &argv(&["--", "lib"]),
+            "Unknown library version '9'!".to_string()
+        )
+        .kind,
         EnvelopeKind::Fatal
     );
 }
 
 #[test]
 fn r4_core21_decline_reports_user_abort() {
+    // T1153 B21/B23: `classify_error` argv carries `--` to model a successful parse.
     // T1153 CORE-51: declining the create-directory prompt fails
     // with `cancelled:`, routed to the `---` arm (exit 1).
     let dir = scratch("r4-decline");
@@ -442,7 +455,7 @@ fn r4_core21_decline_reports_user_abort() {
     let err = execute_with_input(&dir, &argv(&["newlib"]), &mut reader, true).unwrap_err();
     assert!(err.starts_with("cancelled: "), "{err}");
     assert_eq!(
-        classify_error(&argv(&["newlib"]), err).kind,
+        classify_error(&argv(&["--", "newlib"]), err).kind,
         crate::conduit::EnvelopeKind::UserAbort
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -465,8 +478,9 @@ fn core50_rebuild_failure_still_succeeds_silently() {
 
 #[test]
 fn core51_decline_renders_php_abort_text() {
+    // T1153 B21/B23: `classify_error` argv carries `--` to model a successful parse.
     let error = classify_error(
-        &argv(&["newlib"]),
+        &argv(&["--", "newlib"]),
         format!("cancelled: {}", crate::prompt::ABORT),
     );
     assert_eq!(error.kind, crate::conduit::EnvelopeKind::UserAbort);
@@ -499,11 +513,12 @@ fn core52_prompt_engine_drives_liberate_confirms() {
 
 #[test]
 fn core53_parse_errors_keep_red_arm_with_parser_texts() {
+    // T1153 B21/B23: TTY runs need no `--`.
     // The arm stays `ToolsetUsage` (R4-locked exit mapping); only the
     // texts follow the toolset parser.
     let error = classify_error(&argv(&["--bogus"]), "x".to_string());
     assert_eq!(error.kind, crate::conduit::EnvelopeKind::ToolsetUsage);
-    let ParseOutcome::Error(message) = parse_args(&argv(&["--bogus"])) else {
+    let ParseOutcome::Error(message) = parse_args_with_tty(&argv(&["--bogus"]), true) else {
         panic!("expected an error");
     };
     assert_eq!(
@@ -511,11 +526,11 @@ fn core53_parse_errors_keep_red_arm_with_parser_texts() {
         "Argument \"--bogus\" is unrecognized. Use \"--\" to indicate the end of flags."
     );
     assert!(matches!(
-        parse_args(&argv(&["--clean", "--clean"])),
+        parse_args_with_tty(&argv(&["--clean", "--clean"]), true),
         ParseOutcome::Error(_)
     ));
     assert!(matches!(
-        parse_args(&argv(&["--clean=x"])),
+        parse_args_with_tty(&argv(&["--clean=x"]), true),
         ParseOutcome::Error(_)
     ));
     // `--help` after `--` is a positional path, not help.
@@ -523,4 +538,58 @@ fn core53_parse_errors_keep_red_arm_with_parser_texts() {
         parse_args(&argv(&["--", "--help"])),
         ParseOutcome::Args(_)
     ));
+}
+
+#[test]
+fn b21_liberate_requires_terminator_when_piped() {
+    // T1153 B21/B23: piped without `--` reports the terminator, even
+    // for `--help` and empty argv. Unknown flags still report first;
+    // path-count validation runs after the terminator check.
+    assert!(matches!(
+        parse_args_with_tty(&argv(&["lib"]), false),
+        ParseOutcome::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&argv(&["--help"]), false),
+        ParseOutcome::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&argv(&[]), false),
+        ParseOutcome::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&argv(&["a", "b"]), false),
+        ParseOutcome::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&argv(&["--bogus"]), false),
+        ParseOutcome::Error(_)
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&argv(&["--", "lib"]), false),
+        ParseOutcome::Args(_)
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&argv(&["lib"]), true),
+        ParseOutcome::Args(_)
+    ));
+    assert_eq!(
+        crate::help::MISSING_TERMINATOR,
+        "Missing required \"--\" in argument list."
+    );
+}
+
+#[test]
+fn b23_liberate_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help liberate`.
+    let text = usage_text(false);
+    assert!(text.starts_with("LIBERATE WORKFLOW\n"), "{text}");
+    assert!(
+        text.contains("Create or update an Arcanist library."),
+        "{text}"
+    );
+    assert!(text.contains("--clean"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }

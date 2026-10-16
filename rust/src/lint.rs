@@ -167,40 +167,101 @@ pub const JSON_LINES_OF_CONTEXT: usize = 3;
 /// so the value does not affect the result.
 pub const DIFF_CONTEXT_LINES: u32 = 3;
 
+/// T1153 B21/B23: `--help` renders the generated workflow help
+/// (`src/workflow/ArcanistLintWorkflow.php`,
+/// `getCommandSynopses()`/`getCommandHelp()`), not a short custom
+/// usage string. T1153 RB-D5: the renderer is the shared
+/// `crate::help` module; this file keeps only the data. Classic
+/// workflows never require `--` (B21 exempt: PHP runs them via
+/// the `scripts/arcanist.php` re-exec).
+const HELP_EXAMPLES: &str = "**lint**";
+const HELP_SYNOPSIS: &str =
+    "      **lint** [__options__] [__paths__]\n      **lint** [__options__] --rev [__rev__]";
+const HELP_TEXT: &str = "          Supports: git, svn, hg\n          Run static analysis on changes to check for mistakes. If no files\n          are specified, lint will be run on all files which have been modified.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[
+    (
+        "lintall",
+        None,
+        None,
+        "Show all lint warnings, not just those on changed lines. When paths are specified, this is the default behavior.",
+    ),
+    (
+        "rev",
+        None,
+        Some("revision"),
+        "Lint changes since a specific revision.",
+    ),
+    ("output", None, Some("format"), "Select an output format."),
+    (
+        "outfile",
+        None,
+        Some("path"),
+        "Output the linter results to a file. Defaults to stdout.",
+    ),
+    (
+        "engine",
+        None,
+        Some("classname"),
+        "Override configured lint engine for this project.",
+    ),
+    (
+        "apply-patches",
+        None,
+        None,
+        "Apply patches suggested by lint to the working copy without prompting.",
+    ),
+    (
+        "never-apply-patches",
+        None,
+        None,
+        "Never apply patches suggested by lint.",
+    ),
+    (
+        "amend-all",
+        None,
+        None,
+        "When linting git repositories, amend HEAD with all patches suggested by lint without prompting.",
+    ),
+    (
+        "amend-autofixes",
+        None,
+        None,
+        "When linting git repositories, amend HEAD with autofix patches suggested by lint without prompting.",
+    ),
+    (
+        "everything",
+        None,
+        None,
+        "Lint all tracked files in the working copy. Ignored files and untracked files will not be linted.",
+    ),
+    (
+        "severity",
+        None,
+        Some("string"),
+        "Set minimum message severity. One of: 'advice', 'autofix', 'warning', 'error', 'disabled'. Defaults to 'advice'.",
+    ),
+];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &specs,
+        ansi,
+    )
+}
+
 fn usage() -> String {
-    "usage: arc lint [--lintall] [--rev REV] [--output FORMAT] [--outfile FILE] [--engine CLASS] [--apply-patches | --never-apply-patches] [--amend-all] [--amend-autofixes] [--everything] [--severity LEVEL] [PATHS...]\n\
-     \n\
-     Run static analysis on changes to check for mistakes. If no files\n\
-     are specified, lint will be run on all files which have been modified.\n\
-     \n\
-     Options:\n\
-     \x20 --lintall             Show all lint warnings, not just those on\n\
-     \x20                       changed lines. When paths are specified, this\n\
-     \x20                       is the default behavior.\n\
-     \x20 --rev REV             Lint changes since a specific revision.\n\
-     \x20 --output FORMAT       Select an output format: console, json,\n\
-     \x20                       summary, compiler, xml, none.\n\
-     \x20 --outfile FILE        Output the linter results to a file.\n\
-     \x20                       Defaults to stdout.\n\
-     \x20 --engine CLASS        Override configured lint engine for this\n\
-     \x20                       project.\n\
-     \x20 --apply-patches       Apply patches suggested by lint to the\n\
-     \x20                       working copy without prompting.\n\
-     \x20 --never-apply-patches Never apply patches suggested by lint.\n\
-     \x20 --amend-all           When linting git repositories, amend HEAD\n\
-     \x20                       with all patches suggested by lint without\n\
-     \x20                       prompting.\n\
-     \x20 --amend-autofixes     When linting git repositories, amend HEAD\n\
-     \x20                       with autofix patches suggested by lint\n\
-     \x20                       without prompting.\n\
-     \x20 --everything          Lint all tracked files in the working copy.\n\
-     \x20                       Ignored files and untracked files will not\n\
-     \x20                       be linted.\n\
-     \x20 --severity LEVEL      Set minimum message severity. One of:\n\
-     \x20                       'advice', 'autofix', 'warning', 'error',\n\
-     \x20                       'disabled'. Defaults to 'advice'.\n\
-     \x20 -h, --help            Show this help.\n"
-        .to_string()
+    usage_text(crate::terminal::ansi_enabled())
 }
 
 /// Rank of a severity level, mirroring

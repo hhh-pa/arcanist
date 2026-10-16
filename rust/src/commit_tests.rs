@@ -121,10 +121,17 @@ fn normalizes_messages() {
 
 #[test]
 fn usage_covers_options_and_limits() {
-    let text = usage();
-    assert!(text.contains("usage: arc commit"));
-    assert!(text.contains("--revision") && text.contains("--show"));
-    assert!(text.contains("--conduit-uri"));
+    // T1153 B21/B23: `--help` renders the generated workflow help
+    // (extensions stay undocumented).
+    let text = usage_text(false);
+    assert!(text.contains("COMMIT WORKFLOW"), "{text}");
+    assert!(
+        text.contains("--revision") && text.contains("--show"),
+        "{text}"
+    );
+    assert!(!text.contains("--conduit-uri"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
 
 fn scratch(name: &str) -> std::path::PathBuf {
@@ -417,4 +424,31 @@ fn commit_c3_looksoon_skips_untracked_working_copies() {
     // No identifiable repository (and no network): silently skipped.
     ask_for_repository_update(&client, &dir);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn b21_commit_needs_no_terminator() {
+    // T1153 B21/B23 VERIFIED for `commit`: it is a classic workflow,
+    // so PHP runs it via the `scripts/arcanist.php` re-exec, which
+    // never requires `--`. Parsing takes no TTY input, so
+    // piped-style argv parses directly, and `--help` without `--`
+    // still succeeds.
+    assert!(parse_options(&args(&["--show"])).unwrap().is_some());
+    assert_eq!(parse_options(&args(&["--help"])).unwrap(), None);
+    let text = usage_text(false);
+    assert!(text.contains("COMMIT WORKFLOW"), "{text}");
+}
+
+#[test]
+fn b23_commit_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help commit`.
+    let text = usage_text(false);
+    assert!(text.starts_with("COMMIT WORKFLOW\n"), "{text}");
+    assert!(
+        text.contains("Commit a revision which has been accepted"),
+        "{text}"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }

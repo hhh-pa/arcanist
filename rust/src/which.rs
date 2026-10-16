@@ -41,20 +41,61 @@ pub const NAME: &str = "which";
 /// (`ArcanistGitAPI::GIT_MAGIC_ROOT_COMMIT`).
 pub const GIT_MAGIC_ROOT_COMMIT: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
-const USAGE: &str = "usage: arc which [--conduit-uri URI] [--head COMMIT] [--show-base] [--json] [--base RULES] [--any-status] [COMMIT]\n\
-|\n\
-|Explain how arc resolves the working copy, project, conduit, and\n\
-|commit-range context for the current directory. Optional COMMIT pins the\n\
-|base of the reported range; --head pins its end (default HEAD).\n\
-|\n\
-|Options:\n\
-|  --conduit-uri URI   Override Conduit URI discovery for this report.\n\
-|  --head COMMIT       End of the commit range (default HEAD).\n\
-|  --show-base         Print the base commit only and exit.\n\
-|  --base RULES        Additional rules for determining the base commit.\n\
-|  --any-status        Show committed and abandoned revisions.\n\
-|  --json              Emit the report as JSON.\n\
-|  -h, --help          Show this help.\n";
+/// T1153 B21/B23: `--help` renders the generated workflow help
+/// (`src/workflow/ArcanistWhichWorkflow.php`,
+/// `getCommandSynopses()`/`getCommandHelp()`), not a short custom
+/// usage string. T1153 RB-D5: the renderer is the shared `crate::help`
+/// module; this file keeps only the data. The `--conduit-uri`/`--json`
+/// extensions stay functional but undocumented in `--help`, like PHP.
+/// Classic workflows never require `--` (B21 exempt: PHP runs them via
+/// the `scripts/arcanist.php` re-exec).
+const HELP_EXAMPLES: &str = "**which**";
+const HELP_SYNOPSIS: &str =
+    "      **which** [options] (svn)\n      **which** [options] [__commit__] (hg, git)";
+const HELP_TEXT: &str = "          Supports: svn, git, hg\n          Shows which repository the current working copy corresponds to,\n          which commits 'arc diff' will select, and which revision is in\n          the working copy (or which revisions, if more than one matches).";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[
+    (
+        "any-status",
+        None,
+        None,
+        "Show committed and abandoned revisions.",
+    ),
+    (
+        "base",
+        None,
+        Some("rules"),
+        "Additional rules for determining base revision.",
+    ),
+    ("show-base", None, None, "Print base commit only and exit."),
+    (
+        "head",
+        None,
+        Some("commit"),
+        "Specify the end of the commit range to select.",
+    ),
+];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &specs,
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
+}
 
 /// One commit in the reported range.
 pub struct Commit {
@@ -2274,7 +2315,7 @@ fn prompt_line_with_tty(prompt: &str, stdin_tty: bool) -> Option<String> {
 pub fn run(argv: &[String]) -> ExitCode {
     let options = match parse_args(argv) {
         Parsed::Help => {
-            print!("{USAGE}");
+            print!("{}", usage());
             return ExitCode::SUCCESS;
         }
         Parsed::Error(message) => {

@@ -29,28 +29,54 @@ use crate::{amend, close_revision, config, git, land, svn};
 
 pub const NAME: &str = "commit";
 
-fn usage() -> String {
-    format!(
-        "usage: arc {NAME} [(-m MESSAGE | --revision ID)] [--all] [--allow-empty] [--show]\n\
-         \n\
-         Under git, create a local commit. The message comes from\n\
-         -m/--message (repeatable, joined with a blank line), or from\n\
-         Differential via --revision. Nothing is pushed.\n\
-         \n\
-         Under Subversion, commit an accepted Differential revision: the\n\
-         revision is guessed from the working copy unless --revision is\n\
-         given, sanity checks prompt, then 'svn commit' runs and the\n\
-         revision is finalized. -m/--all/--allow-empty are git-only.\n\
-         \n\
-         Options:\n\
-         \x20 -m, --message MSG   commit message (repeatable, git only)\n\
-         \x20 --revision ID       fetch the message from Differential (D123 or 123)\n\
-         \x20 --conduit-uri URI   Conduit URI (else ARC_CONDUIT_URI or .arcconfig)\n\
-         \x20 -a, --all           stage tracked modifications before committing\n\
-         \x20 --allow-empty       allow a commit with no changes\n\
-         \x20 --show              print the message without committing\n\
-         \x20 -h, --help          show this help\n"
+/// T1153 B21/B23: `--help` renders the generated workflow help
+/// (`src/workflow/ArcanistCommitWorkflow.php`,
+/// `getCommandSynopses()`/`getCommandHelp()`), not a short custom
+/// usage string. T1153 RB-D5: the renderer is the shared `crate::help`
+/// module; this file keeps only the data. The `-m`/`--message`/
+/// `--conduit-uri`/`-a`/`--all`/`--allow-empty` extensions stay
+/// functional but undocumented in `--help`, like PHP. Classic
+/// workflows never require `--` (B21 exempt: PHP runs them via the
+/// `scripts/arcanist.php` re-exec).
+const HELP_EXAMPLES: &str = "**commit**";
+const HELP_SYNOPSIS: &str = "      **commit** [--revision __revision_id__] [--show]";
+const HELP_TEXT: &str =
+    "          Supports: svn\n          Commit a revision which has been accepted by a reviewer.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[
+    (
+        "show",
+        None,
+        None,
+        "Show the command which would be issued, but do not actually commit anything.",
+    ),
+    (
+        "revision",
+        None,
+        Some("revision_id"),
+        "Commit a specific revision. If you do not specify a revision, arc will look for committable revisions.",
+    ),
+];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &specs,
+        ansi,
     )
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
 }
 
 /// Parsed `commit` options.

@@ -41,7 +41,207 @@ use arc_rs::{
 /// Subcommand name, matching `arc diff`.
 pub const NAME: &str = "diff";
 
-const USAGE: &str = "usage: arc diff [--message MSG] [--message-file FILE] [--edit] [--raw] [--raw-command CMD] [--create | --update ID] [--draft] [--nounit] [--nolint] [--only] [--allow-untracked] [--apply-patches | --never-apply-patches] [--amend-all] [--amend-autofixes] [-a] [--json] [--no-amend] [--uncommitted] [--verbatim] [--reviewers NAMES] [--cc NAMES] [--skip-binaries] [--skip-staging] [--base REV] [--coverage | --no-coverage] [--browse] [--head REV] [--conduit-uri URI] [commit]\n";
+/// T1153 B21/B23: `--help` renders the generated workflow help
+/// (`src/workflow/ArcanistDiffWorkflow.php`,
+/// `getCommandSynopses()`/`getCommandHelp()`), not a short custom
+/// usage string. T1153 RB-D5: the renderer is the shared
+/// `crate::help` module; this file keeps only the data. The
+/// `-a`/`--conduit-uri` extensions stay functional but undocumented
+/// in `--help`, like PHP. Classic workflows never require `--`
+/// (B21 exempt: PHP runs them via the `scripts/arcanist.php` re-exec).
+const HELP_EXAMPLES: &str = "**diff**";
+const HELP_SYNOPSIS: &str =
+    "      **diff** [__paths__] (svn)\n      **diff** [__commit__] (git, hg)";
+const HELP_TEXT: &str = "          Supports: git, svn, hg\n          Generate a Differential diff or revision from local changes.\n\n          Under git and mercurial, you can specify a commit (like __HEAD^^^__\n          or __master__) and Differential will generate a diff against the\n          merge base of that commit and your current working directory parent.\n\n          Under svn, you can choose to include only some of the modified files\n          in the working copy in the diff by specifying their paths. If you\n          omit paths, all changes are included in the diff.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[
+    (
+        "message",
+        Some("m"),
+        Some("message"),
+        "When updating a revision, use the specified message instead of prompting.",
+    ),
+    (
+        "message-file",
+        Some("F"),
+        Some("file"),
+        "When creating a revision, read revision information from this file.",
+    ),
+    (
+        "edit",
+        None,
+        None,
+        "When updating a revision under git, edit revision information before updating.",
+    ),
+    (
+        "raw",
+        None,
+        None,
+        "Read diff from stdin, not from the working copy. This disables many Arcanist/Phabricator features which depend on having access to the working copy.",
+    ),
+    (
+        "raw-command",
+        None,
+        Some("command"),
+        "Generate diff by executing a specified command, not from the working copy. This disables many Arcanist/Phabricator features which depend on having access to the working copy.",
+    ),
+    ("create", None, None, "Always create a new revision."),
+    (
+        "update",
+        None,
+        Some("revision_id"),
+        "Always update a specific revision.",
+    ),
+    (
+        "draft",
+        None,
+        None,
+        "Create a draft revision so you can look over your changes before involving anyone else. Other users will not be notified about the revision until you later use \"Request Review\" to publish it. You can still share the draft by giving someone the link.",
+    ),
+    ("nounit", None, None, "Do not run unit tests."),
+    ("nolint", None, None, "Do not run lint."),
+    (
+        "only",
+        None,
+        None,
+        "Instead of creating or updating a revision, only create a diff, which you may later attach to a revision.",
+    ),
+    (
+        "allow-untracked",
+        None,
+        None,
+        "Skip checks for untracked files in the working copy.",
+    ),
+    (
+        "apply-patches",
+        None,
+        None,
+        "Apply patches suggested by lint to the working copy without prompting.",
+    ),
+    (
+        "never-apply-patches",
+        None,
+        None,
+        "Never apply patches suggested by lint.",
+    ),
+    (
+        "amend-all",
+        None,
+        None,
+        "When linting git repositories, amend HEAD with all patches suggested by lint without prompting.",
+    ),
+    (
+        "amend-autofixes",
+        None,
+        None,
+        "When linting git repositories, amend HEAD with autofix patches suggested by lint without prompting.",
+    ),
+    (
+        "add-all",
+        Some("a"),
+        None,
+        "Automatically add all unstaged and uncommitted files to the commit.",
+    ),
+    (
+        "json",
+        None,
+        None,
+        "Emit machine-readable JSON. EXPERIMENTAL! Probably does not work!",
+    ),
+    (
+        "no-amend",
+        None,
+        None,
+        "Never amend commits in the working copy with lint patches.",
+    ),
+    (
+        "uncommitted",
+        None,
+        None,
+        "Suppress warning about uncommitted changes.",
+    ),
+    (
+        "verbatim",
+        None,
+        None,
+        "When creating a revision, try to use the working copy commit message verbatim, without prompting to edit it. When updating a revision, update some fields from the local commit message.",
+    ),
+    (
+        "reviewers",
+        None,
+        Some("usernames"),
+        "When creating a revision, add reviewers.",
+    ),
+    (
+        "cc",
+        None,
+        Some("usernames"),
+        "When creating a revision, add CCs.",
+    ),
+    (
+        "skip-binaries",
+        None,
+        None,
+        "Do not upload binaries (like images).",
+    ),
+    (
+        "skip-staging",
+        None,
+        None,
+        "Do not copy changes to the staging area.",
+    ),
+    (
+        "base",
+        None,
+        Some("rules"),
+        "Additional rules for determining base revision.",
+    ),
+    (
+        "coverage",
+        None,
+        None,
+        "Always enable coverage information.",
+    ),
+    (
+        "no-coverage",
+        None,
+        None,
+        "Always disable coverage information.",
+    ),
+    (
+        "browse",
+        None,
+        None,
+        "After creating a diff or revision, open it in a web browser.",
+    ),
+    (
+        "head",
+        None,
+        Some("commit"),
+        "Specify the end of the commit range. This disables many Arcanist/Phabricator features which depend on having access to the working copy.",
+    ),
+];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &specs,
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
+}
 
 /// Parsed `diff` options.
 ///
@@ -2281,7 +2481,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(msg) => {
-            eprintln!("arc diff: {msg}\n\n{USAGE}");
+            eprintln!("arc diff: {msg}\n\n{}", usage());
             return ExitCode::FAILURE;
         }
     };
@@ -2303,10 +2503,12 @@ pub fn run(argv: &[String]) -> ExitCode {
     }
 }
 
-/// Full `--help` text: usage line plus the long help.
+/// Full `--help` text: the generated workflow help.
+/// T1153 B21/B23: merged to the shared renderer (was
+/// `USAGE` + `FULL_HELP`).
 #[must_use]
 pub fn help_text() -> String {
-    format!("{USAGE}\n{FULL_HELP}")
+    usage()
 }
 
 /* -(  Full-State Prompts and Raw Sources (G1)  )--------------------------------- */
@@ -2314,8 +2516,9 @@ pub fn help_text() -> String {
 /// Full `arc diff` help text: supports line plus command help.
 ///
 /// PHP: `getCommandHelp()` (`src/workflow/ArcanistDiffWorkflow.php:46-60`)
-/// with console markup stripped. `run()` still prints [`USAGE`]; this is
-/// the merge target for `--help` parity.
+/// with console markup stripped. T1153 B21/B23: `--help` now renders
+/// the generated workflow help ([`help_text`]); this stays as the
+/// documented merge source.
 pub const FULL_HELP: &str = "Supports: git, svn, hg\nGenerate a Differential diff or revision from local changes.\n\nUnder git and mercurial, you can specify a commit (like HEAD^^^ or master) and Differential will generate a diff against the merge base of that commit and your current working directory parent.\n\nUnder svn, you can choose to include only some of the modified files in the working copy in the diff by specifying their paths. If you omit paths, all changes are included in the diff.\n";
 
 /// Wrap console text to 78 columns with an `indent`-space prefix.

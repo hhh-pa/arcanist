@@ -322,3 +322,37 @@ fn land22_user_phid_reuses_handshake_identity() {
     client.set_authenticated_user("alice", "PHID-USER-1");
     assert_eq!(user_phid(&client).unwrap(), "PHID-USER-1");
 }
+
+#[test]
+fn b21_close_revision_needs_no_terminator() {
+    // T1153 B21/B23 VERIFIED for `close-revision`: it is a classic
+    // workflow (`ArcanistWorkflow`, `supportsToolset()` false), so
+    // PHP runs it via the `scripts/arcanist.php` re-exec, which
+    // never requires `--`. Parsing takes no TTY input, so
+    // piped-style argv parses directly, and `--help` without `--`
+    // still succeeds.
+    assert!(parse_args(&args(&["D123"])).unwrap().is_some());
+    assert_eq!(parse_args(&args(&["--help"])).unwrap(), None);
+    assert!(parse_args(&args(&[])).is_err());
+    let text = usage_text(false);
+    assert!(text.contains("CLOSE-REVISION WORKFLOW"), "{text}");
+}
+
+#[test]
+fn b23_close_revision_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help close-revision`
+    // (classic: source indentation kept verbatim, no unwrap).
+    // Extensions stay undocumented.
+    let text = usage_text(false);
+    assert!(text.starts_with("CLOSE-REVISION WORKFLOW\n"), "{text}");
+    assert!(
+        text.contains("Close a revision which has been committed"),
+        "{text}"
+    );
+    assert!(text.contains("--finalize"), "{text}");
+    assert!(text.contains("--quiet"), "{text}");
+    assert!(!text.contains("--force"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+}

@@ -34,20 +34,41 @@ use arc_rs::terminal::{self, PhtArg, TVal};
 /// Subcommand name, matching `arc upgrade`.
 pub const NAME: &str = "upgrade";
 
-const USAGE: &str = "usage: arc upgrade [--check] [--json] [--apply] [--yes]\n\
-\n\
-Report the running arc version and whether the enclosing git checkout\n\
-is behind its upstream. With --apply, replace the running executable\n\
-with the latest stable release instead of reporting (--check is\n\
-ignored; --json prints the result as JSON).\n\
-\n\
-Options:\n\
-  --check         Exit non-zero when the checkout is behind its upstream.\n\
-  --json          Emit the report (or --apply result) as JSON.\n\
-  --apply         Download the latest stable release and replace the\n\
-                  running executable (prompts first; --yes skips).\n\
-  --yes           Skip the upgrade prompt (scripting).\n\
-  -h, --help      Show this help.\n";
+/// T1153 B21/B23: `--help` renders the generated workflow help
+/// (`src/workflow/ArcanistUpgradeWorkflow.php`, toolset
+/// `getWorkflowInformation()`), not a short custom usage string.
+/// T1153 RB-D5: the renderer is the shared `crate::help` module; this
+/// file keeps only the data. The `--check`/`--json`/`--apply`/`--yes`
+/// extensions (Rule 3: PHP's `git pull` self-update is unportable to a
+/// static binary, T1153 CORE-56) stay functional but undocumented in
+/// `--help`, like PHP (which takes no arguments).
+const HELP_EXAMPLES: &str = "**upgrade**";
+const HELP_SYNOPSIS: &str = "Upgrade Arcanist to the latest version.";
+const HELP_TEXT: &str = "Upgrade Arcanist to the latest version.";
+/// Non-wildcard argument specs: (name, short, param, help). Empty:
+/// ceb takes no arguments.
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<arc_rs::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    arc_rs::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &specs,
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(arc_rs::terminal::ansi_enabled())
+}
 
 /// The running version, from `Cargo.toml`.
 #[must_use]
@@ -1416,15 +1437,34 @@ enum Parsed {
     Help,
     Options(Options),
     Error(String),
+    /// T1153 B21/B23: stdin is piped and argv carries no `--`.
+    MissingTerminator,
 }
 
 fn parse_args(argv: &[String]) -> Parsed {
+    parse_args_with_tty(argv, arc_rs::prompt::stdin_is_terminal())
+}
+
+/// [`parse_args`] with an injected TTY flag (deterministic tests).
+/// T1153 B21/B23: piped runs without `--` fail with
+/// `MissingTerminator` (checked after unknown-flag scanning, like
+/// PHP's `parseFull()`, but before success). A lone `--` is the
+/// terminator (accepted); `--help` after `--` is a positional
+/// (rejected, like PHP). Vs ceb `ArcanistRuntime.php:80-86,172-188`
+/// and `PhutilArgumentParser.php:331-336`.
+fn parse_args_with_tty(argv: &[String], stdin_tty: bool) -> Parsed {
+    let missing = arc_rs::help::terminator_missing(argv, stdin_tty);
     let mut check = false;
     let mut json = false;
     let mut apply = false;
     let mut yes = false;
+    let mut end_of_flags = false;
     for arg in argv {
-        if arg == "--check" {
+        if end_of_flags {
+            return Parsed::Error(format!("unexpected argument '{arg}'"));
+        } else if arg == "--" {
+            end_of_flags = true;
+        } else if arg == "--check" {
             check = true;
         } else if arg == "--json" {
             json = true;
@@ -1433,12 +1473,18 @@ fn parse_args(argv: &[String]) -> Parsed {
         } else if arg == "--yes" {
             yes = true;
         } else if arg == "-h" || arg == "--help" {
+            if missing {
+                return Parsed::MissingTerminator;
+            }
             return Parsed::Help;
         } else if arg.starts_with('-') {
             return Parsed::Error(format!("unknown flag '{arg}'"));
         } else {
             return Parsed::Error(format!("unexpected argument '{arg}'"));
         }
+    }
+    if missing {
+        return Parsed::MissingTerminator;
     }
     Parsed::Options(Options {
         check,
@@ -1500,11 +1546,21 @@ fn run_apply_command(cwd: &Path, options: &Options) -> ExitCode {
 pub fn run(argv: &[String]) -> ExitCode {
     let options = match parse_args(argv) {
         Parsed::Help => {
-            print!("{USAGE}");
+            print!("{}", usage());
             return ExitCode::SUCCESS;
         }
+        // T1153 B21/B23: the terminator failure prints the three cyan
+        // hints first (like `ArcanistRuntime.php:172-188`) and reports
+        // through the toolset usage arm (exit 1).
+        Parsed::MissingTerminator => {
+            arc_rs::help::print_terminator_hints(arc_rs::terminal::ansi_enabled());
+            return arc_rs::conduit::report(
+                arc_rs::conduit::EnvelopeKind::ToolsetUsage,
+                arc_rs::help::MISSING_TERMINATOR,
+            );
+        }
         Parsed::Error(message) => {
-            eprintln!("arc {NAME}: {message}\n\n{USAGE}");
+            eprintln!("arc {NAME}: {message}\n\n{}", usage());
             return ExitCode::FAILURE;
         }
         Parsed::Options(options) => options,

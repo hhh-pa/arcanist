@@ -15,31 +15,40 @@ fn empty_options() -> Options {
 
 #[test]
 fn parses_defaults() {
-    assert_eq!(parse_options(&args(&[])), Ok(Some(empty_options())));
+    // T1153 B21/B23: TTY runs need no `--`.
+    assert_eq!(
+        parse_options_with_tty(&args(&[]), true),
+        Ok(Some(empty_options()))
+    );
 }
 
 #[test]
 fn parses_message_forms() {
+    // T1153 B21/B23: TTY runs need no `--`.
     let mut expected = empty_options();
     expected.messages = vec!["one".to_string()];
     assert_eq!(
-        parse_options(&args(&["-m", "one"])),
+        parse_options_with_tty(&args(&["-m", "one"]), true),
         Ok(Some(expected.clone()))
     );
     assert_eq!(
-        parse_options(&args(&["--message", "one"])),
+        parse_options_with_tty(&args(&["--message", "one"]), true),
         Ok(Some(expected.clone()))
     );
     assert_eq!(
-        parse_options(&args(&["--message=one"])),
+        parse_options_with_tty(&args(&["--message=one"]), true),
         Ok(Some(expected.clone()))
     );
-    assert_eq!(parse_options(&args(&["-mone"])), Ok(Some(expected)));
+    assert_eq!(
+        parse_options_with_tty(&args(&["-mone"]), true),
+        Ok(Some(expected))
+    );
 }
 
 #[test]
 fn messages_are_repeatable() {
-    let options = parse_options(&args(&["-m", "one", "-m", "two"]))
+    // T1153 B21/B23: TTY runs need no `--`.
+    let options = parse_options_with_tty(&args(&["-m", "one", "-m", "two"]), true)
         .unwrap()
         .unwrap();
     assert_eq!(options.messages, vec!["one".to_string(), "two".to_string()]);
@@ -47,13 +56,16 @@ fn messages_are_repeatable() {
 
 #[test]
 fn parses_revision_and_conduit_uri() {
-    let options = parse_options(&args(&["--revision", "D123"]))
+    // T1153 B21/B23: TTY runs need no `--`.
+    let options = parse_options_with_tty(&args(&["--revision", "D123"]), true)
         .unwrap()
         .unwrap();
     assert_eq!(options.revision, Some("D123".to_string()));
-    let options = parse_options(&args(&["--revision=123"])).unwrap().unwrap();
+    let options = parse_options_with_tty(&args(&["--revision=123"]), true)
+        .unwrap()
+        .unwrap();
     assert_eq!(options.revision, Some("123".to_string()));
-    let options = parse_options(&args(&["--conduit-uri", "http://x/"]))
+    let options = parse_options_with_tty(&args(&["--conduit-uri", "http://x/"]), true)
         .unwrap()
         .unwrap();
     assert_eq!(options.conduit_uri, Some("http://x/".to_string()));
@@ -61,24 +73,32 @@ fn parses_revision_and_conduit_uri() {
 
 #[test]
 fn help_returns_none() {
-    assert_eq!(parse_options(&args(&["--help"])), Ok(None));
-    assert_eq!(parse_options(&args(&["-h"])), Ok(None));
+    // T1153 B21/B23: TTY runs need no `--`.
+    assert_eq!(parse_options_with_tty(&args(&["--help"]), true), Ok(None));
+    assert_eq!(parse_options_with_tty(&args(&["-h"]), true), Ok(None));
 }
 
 #[test]
 fn rejects_bad_arguments() {
-    let err = parse_options(&args(&["--bogus"])).unwrap_err();
+    // T1153 B21/B23: TTY runs need no `--`; a lone `--` is the
+    // terminator (accepted), and `--help` after `--` is positional.
+    let err = parse_options_with_tty(&args(&["--bogus"]), true).unwrap_err();
     assert!(err.contains("unknown flag"), "unexpected: {err}");
     // Amend rewrites the message only; staging flags are not accepted.
-    let err = parse_options(&args(&["--all"])).unwrap_err();
+    let err = parse_options_with_tty(&args(&["--all"]), true).unwrap_err();
     assert!(err.contains("unknown flag"), "unexpected: {err}");
-    let err = parse_options(&args(&["file.txt"])).unwrap_err();
+    let err = parse_options_with_tty(&args(&["file.txt"]), true).unwrap_err();
     assert!(err.contains("unexpected argument"), "unexpected: {err}");
-    let err = parse_options(&args(&["--"])).unwrap_err();
+    assert!(
+        parse_options_with_tty(&args(&["--"]), true)
+            .unwrap()
+            .is_some()
+    );
+    let err = parse_options_with_tty(&args(&["--", "--help"]), true).unwrap_err();
     assert!(err.contains("unexpected argument"), "unexpected: {err}");
-    assert!(parse_options(&args(&["-m"])).is_err());
-    assert!(parse_options(&args(&["--revision"])).is_err());
-    assert!(parse_options(&args(&["--conduit-uri"])).is_err());
+    assert!(parse_options_with_tty(&args(&["-m"]), true).is_err());
+    assert!(parse_options_with_tty(&args(&["--revision"]), true).is_err());
+    assert!(parse_options_with_tty(&args(&["--conduit-uri"]), true).is_err());
 }
 
 #[test]
@@ -104,10 +124,66 @@ fn normalizes_messages() {
 
 #[test]
 fn usage_covers_options_and_limits() {
-    let text = usage();
-    assert!(text.contains("usage: arc amend"));
-    assert!(text.contains("--revision") && text.contains("--show"));
-    assert!(text.contains("history.immutable"));
+    // T1153 B21/B23: `--help` renders the generated workflow help
+    // (extensions `-m`/`--message`/`--conduit-uri` stay undocumented).
+    let text = usage_text(false);
+    assert!(text.contains("AMEND WORKFLOW"), "{text}");
+    assert!(
+        text.contains("--revision") && text.contains("--show"),
+        "{text}"
+    );
+    assert!(!text.contains("--message"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+}
+
+#[test]
+fn b21_amend_requires_terminator_when_piped() {
+    // T1153 B21/B23: piped without `--` reports the terminator, even
+    // for `--help` and empty argv. Unknown flags still report first.
+    assert_eq!(
+        parse_options_with_tty(&args(&[]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    assert_eq!(
+        parse_options_with_tty(&args(&["--help"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    assert_eq!(
+        parse_options_with_tty(&args(&["--show"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    let err = parse_options_with_tty(&args(&["--bogus"]), false).unwrap_err();
+    assert!(err.contains("unknown flag"), "unexpected: {err}");
+    assert!(
+        parse_options_with_tty(&args(&["--"]), false)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        parse_options_with_tty(&args(&["--show", "--"]), false)
+            .unwrap()
+            .is_some()
+    );
+    assert!(parse_options_with_tty(&args(&[]), true).unwrap().is_some());
+    assert_eq!(
+        crate::help::MISSING_TERMINATOR,
+        "Missing required \"--\" in argument list."
+    );
+}
+
+#[test]
+fn b23_amend_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help amend`.
+    let text = usage_text(false);
+    assert!(text.starts_with("AMEND WORKFLOW\n"), "{text}");
+    assert!(
+        text.contains("synchronizing the local commit message"),
+        "{text}"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
 
 fn revision(id: &str, title: &str) -> close_revision::Revision {

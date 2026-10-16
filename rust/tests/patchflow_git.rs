@@ -188,6 +188,8 @@ fn patch_rejects_bad_args_without_repo() {
 
 #[test]
 fn patch_help_succeeds() {
+    // T1153 B21/B23: `--help` renders the generated workflow help
+    // (classic: no `--` needed).
     let fx = Fixture::named("help");
     assert_eq!(
         patch::run_in(fx.path(), &argv(&["--help"])),
@@ -198,7 +200,7 @@ fn patch_help_succeeds() {
         ExitCode::SUCCESS
     );
     let out = patch::execute(fx.path(), &argv(&["--help"])).unwrap();
-    assert!(out.stdout.contains("usage: arc patch"), "{}", out.stdout);
+    assert!(out.stdout.contains("PATCH WORKFLOW"), "{}", out.stdout);
 }
 
 #[test]

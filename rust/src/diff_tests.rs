@@ -756,9 +756,11 @@ fn merge_routes_raw_sources_without_working_copy() {
 
 #[test]
 fn merge_help_text_combines_usage_and_full_help() {
+    // T1153 B21/B23: `--help` renders the generated workflow help.
     let text = help_text();
-    assert!(text.starts_with(USAGE), "{text:?}");
+    assert!(text.starts_with("DIFF WORKFLOW\n"), "{text:?}");
     assert!(text.contains("Supports: git, svn, hg"), "{text:?}");
+    assert!(text.contains("--verbatim"), "{text:?}");
 }
 
 #[test]
@@ -3136,4 +3138,29 @@ fn d8_resolve_create_message_file_returns_footer_redirect() {
     let resolved = resolve_create_message(&mut context, &options, &[], Some("main")).unwrap();
     assert_eq!(resolved.corpus, "File title\n\nDifferential Revision: D9\n");
     assert_eq!(resolved.footer_revision_id, Some(9));
+}
+
+#[test]
+fn b21_diff_needs_no_terminator() {
+    // T1153 B21/B23 VERIFIED for `diff`: it is a classic workflow,
+    // so PHP runs it via the `scripts/arcanist.php` re-exec, which
+    // never requires `--`. Parsing takes no TTY input, so
+    // piped-style argv parses directly, and `--help` without `--`
+    // still succeeds.
+    assert!(parse_options(&args(&["--verbatim"])).unwrap().is_some());
+    assert_eq!(parse_options(&args(&["--help"])).unwrap(), None);
+    let text = usage_text(false);
+    assert!(text.contains("DIFF WORKFLOW"), "{text}");
+}
+
+#[test]
+fn b23_diff_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help diff`.
+    let text = usage_text(false);
+    assert!(text.starts_with("DIFF WORKFLOW\n"), "{text}");
+    assert!(text.contains("--reviewers"), "{text}");
+    assert!(text.contains("--base"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }

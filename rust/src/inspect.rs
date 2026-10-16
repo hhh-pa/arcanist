@@ -116,22 +116,37 @@ pub fn symbol_type(name: &str) -> Option<&'static SymbolType> {
     SYMBOL_TYPES.iter().find(|kind| kind.name == name)
 }
 
+/// T1153 B21/B23: `--help` renders the generated workflow help
+/// (`src/workflow/ArcanistInspectWorkflow.php`, toolset
+/// `getWorkflowInformation()`), not a short custom usage string.
+/// T1153 RB-D5: the renderer is the shared `crate::help` module; this
+/// file keeps only the data.
+const HELP_EXAMPLES: &str = "**inspect** [__options__] -- __object__";
+const HELP_SYNOPSIS: &str = "Show internal object information.";
+const HELP_TEXT: &str = "Inspect internal object properties.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] =
+    &[("explore", None, None, "Load all object hardpoints.")];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &specs,
+        ansi,
+    )
+}
+
 fn usage() -> String {
-    "usage: arc inspect [--explore] [-- OBJECT...]\n\
-     \n\
-     Show internal object information.\n\
-     \n\
-     With no OBJECTs, list the inspectable object types. Otherwise each\n\
-     OBJECT has the form NAME or NAME(ARG), for example \"working-copy(HEAD)\".\n\
-     \n\
-     Options:\n\
-     \x20 --explore     Load all object hardpoints.\n\
-     \x20 -h, --help    Show this help.\n\
-     \n\
-     Not yet ported (see T1128): conduit-backed hardpoint loads\n\
-     (upstream and revision refs, symbol/user objects, remote\n\
-     repository refs).\n"
-        .to_string()
+    usage_text(crate::terminal::ansi_enabled())
 }
 
 /// Parsed `inspect` options.
@@ -146,10 +161,24 @@ pub enum ParseOutcome {
     Args(Options),
     Help,
     Error(String),
+    /// T1153 B21/B23: stdin is piped and argv carries no `--`.
+    MissingTerminator,
 }
 
 /// Parse `argv` (excluding the subcommand name).
 pub fn parse_args(argv: &[String]) -> ParseOutcome {
+    parse_args_with_tty(argv, crate::prompt::stdin_is_terminal())
+}
+
+/// [`parse_args`] with an injected TTY flag (deterministic tests).
+/// T1153 B21/B23: piped runs without `--` fail with
+/// `MissingTerminator` (checked after unknown-flag scanning, like
+/// PHP's `parseFull()`, but before success). `--help` without `--`
+/// when piped reports the terminator. Vs ceb
+/// `ArcanistRuntime.php:80-86,172-188` and
+/// `PhutilArgumentParser.php:331-336`.
+fn parse_args_with_tty(argv: &[String], stdin_tty: bool) -> ParseOutcome {
+    let missing = crate::help::terminator_missing(argv, stdin_tty);
     let mut explore = false;
     let mut objects = Vec::new();
     let mut end_of_flags = false;
@@ -161,12 +190,18 @@ pub fn parse_args(argv: &[String]) -> ParseOutcome {
         } else if arg == "--explore" {
             explore = true;
         } else if arg == "-h" || arg == "--help" {
+            if missing {
+                return ParseOutcome::MissingTerminator;
+            }
             return ParseOutcome::Help;
         } else if arg.starts_with('-') {
             return ParseOutcome::Error(format!("unknown flag '{arg}'"));
         } else {
             objects.push(arg.clone());
         }
+    }
+    if missing {
+        return ParseOutcome::MissingTerminator;
     }
     ParseOutcome::Args(Options { explore, objects })
 }
@@ -741,6 +776,15 @@ fn parse_inspect_options(argv: &[String]) -> Result<Options, ExitCode> {
         ParseOutcome::Help => {
             print!("{}", usage());
             Err(ExitCode::SUCCESS)
+        }
+        // T1153 B21/B23: the terminator failure prints the three cyan
+        // hints first (like `ArcanistRuntime.php:172-188`).
+        ParseOutcome::MissingTerminator => {
+            crate::help::print_terminator_hints(terminal::ansi_enabled());
+            Err(conduit::report(
+                EnvelopeKind::ToolsetUsage,
+                crate::help::MISSING_TERMINATOR,
+            ))
         }
         ParseOutcome::Error(message) => {
             // T1153 RB-D4 (R4): `inspect` is a toolset workflow:

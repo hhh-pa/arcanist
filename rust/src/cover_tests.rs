@@ -894,8 +894,9 @@ fn cover_c14_arg_errors_use_php_bytes() {
 #[test]
 fn cover_c15_help_uses_php_wording() {
     // T1153 COVER-C15: help uses PHP wording.
-    let help = super::usage();
-    assert!(help.contains("usage: arc cover [--rev revision] [path ...]"));
+    // T1153 B21/B23: `--help` renders the generated workflow help.
+    let help = super::usage_text(false);
+    assert!(help.contains("COVER WORKFLOW"), "{help}");
     assert!(help.contains("Cover your... professional reputation."));
     assert!(help.contains("Cover changes since a specific revision."));
 }
@@ -1269,4 +1270,31 @@ fn cover_c13_svn_and_hg_stay_unported() {
         execute_cover_text_ansi(svn.path(), &options(&[]), false),
         Err("Subversion working copies are not yet ported (see T1128)".to_string())
     );
+}
+
+#[test]
+fn b21_cover_needs_no_terminator() {
+    // T1153 B21/B23 VERIFIED for `cover`: it is a classic workflow,
+    // so PHP runs it via the `scripts/arcanist.php` re-exec, which
+    // never requires `--`. Parsing takes no TTY input, so
+    // piped-style argv parses directly, and `--help` without `--`
+    // still succeeds.
+    assert!(matches!(
+        parse_args(&args(&["f.txt"])),
+        ParseOutcome::Args(_)
+    ));
+    assert!(matches!(parse_args(&args(&["--help"])), ParseOutcome::Help));
+    let text = usage_text(false);
+    assert!(text.contains("COVER WORKFLOW"), "{text}");
+}
+
+#[test]
+fn b23_cover_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help cover`.
+    let text = usage_text(false);
+    assert!(text.starts_with("COVER WORKFLOW\n"), "{text}");
+    assert!(text.contains("--rev"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }

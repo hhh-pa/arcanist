@@ -139,30 +139,37 @@ fn behind_counts_come_from_local_refs_only() {
 
 #[test]
 fn args_cover_check_json_apply_and_help() {
-    assert!(matches!(parse_args(&[]), Parsed::Options(_)));
+    // T1153 B21/B23: TTY runs need no `--`.
+    assert!(matches!(parse_args_with_tty(&[], true), Parsed::Options(_)));
     assert!(matches!(
-        parse_args(&["--check".to_string()]),
+        parse_args_with_tty(&["--check".to_string()], true),
         Parsed::Options(_)
     ));
     assert!(matches!(
-        parse_args(&["--json".to_string()]),
+        parse_args_with_tty(&["--json".to_string()], true),
         Parsed::Options(_)
     ));
-    assert!(matches!(parse_args(&["--help".to_string()]), Parsed::Help));
     assert!(matches!(
-        parse_args(&["--apply".to_string()]),
+        parse_args_with_tty(&["--help".to_string()], true),
+        Parsed::Help
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&["--apply".to_string()], true),
         Parsed::Options(Options { apply: true, .. })
     ));
     // `--yes` is accepted (it skips the `--apply` prompt).
     assert!(matches!(
-        parse_args(&["--yes".to_string()]),
+        parse_args_with_tty(&["--yes".to_string()], true),
         Parsed::Options(Options { apply: false, .. })
     ));
     assert!(matches!(
-        parse_args(&["--bogus".to_string()]),
+        parse_args_with_tty(&["--bogus".to_string()], true),
         Parsed::Error(_)
     ));
-    assert!(matches!(parse_args(&["pos".to_string()]), Parsed::Error(_)));
+    assert!(matches!(
+        parse_args_with_tty(&["pos".to_string()], true),
+        Parsed::Error(_)
+    ));
 }
 
 #[test]
@@ -471,14 +478,66 @@ fn assert_no_leftovers(dir: &Path) {
 
 #[test]
 fn yes_flag_is_recorded() {
+    // T1153 B21/B23: TTY runs need no `--`.
     assert!(matches!(
-        parse_args(&["--yes".to_string()]),
+        parse_args_with_tty(&["--yes".to_string()], true),
         Parsed::Options(Options { yes: true, .. })
     ));
     assert!(matches!(
-        parse_args(&[]),
+        parse_args_with_tty(&[], true),
         Parsed::Options(Options { yes: false, .. })
     ));
+}
+
+#[test]
+fn b21_upgrade_requires_terminator_when_piped() {
+    // T1153 B21/B23: piped without `--` reports the terminator, even
+    // for `--help` and empty argv. Unknown flags still report first.
+    assert!(matches!(
+        parse_args_with_tty(&[], false),
+        Parsed::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&["--help".to_string()], false),
+        Parsed::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&["--json".to_string()], false),
+        Parsed::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&["--bogus".to_string()], false),
+        Parsed::Error(_)
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&["--".to_string()], false),
+        Parsed::Options(_)
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&["--json".to_string(), "--".to_string()], false),
+        Parsed::Options(_)
+    ));
+    assert!(matches!(parse_args_with_tty(&[], true), Parsed::Options(_)));
+    assert_eq!(
+        arc_rs::help::MISSING_TERMINATOR,
+        "Missing required \"--\" in argument list."
+    );
+}
+
+#[test]
+fn b23_upgrade_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help upgrade`.
+    // Extensions stay undocumented (ceb takes no arguments).
+    let text = usage_text(false);
+    assert!(text.starts_with("UPGRADE WORKFLOW\n"), "{text}");
+    assert!(
+        text.contains("Upgrade Arcanist to the latest version."),
+        "{text}"
+    );
+    assert!(!text.contains("--apply"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
 
 #[test]

@@ -58,23 +58,27 @@ fn init_repo(tag: &str) -> TempDir {
 
 #[test]
 fn parses_explore_objects_and_separators() {
+    // T1153 B21/B23: TTY runs need no `--`.
     assert_eq!(
-        parse_args(&args(&[])),
+        parse_args_with_tty(&args(&[]), true),
         ParseOutcome::Args(Options {
             explore: false,
             objects: Vec::new(),
         })
     );
     assert_eq!(
-        parse_args(&args(&["--explore", "--", "working-copy(HEAD)"])),
+        parse_args_with_tty(&args(&["--explore", "--", "working-copy(HEAD)"]), true),
         ParseOutcome::Args(Options {
             explore: true,
             objects: vec!["working-copy(HEAD)".to_string()],
         })
     );
-    assert_eq!(parse_args(&args(&["--help"])), ParseOutcome::Help);
     assert_eq!(
-        parse_args(&args(&["--bogus"])),
+        parse_args_with_tty(&args(&["--help"]), true),
+        ParseOutcome::Help
+    );
+    assert_eq!(
+        parse_args_with_tty(&args(&["--bogus"]), true),
         ParseOutcome::Error("unknown flag '--bogus'".to_string())
     );
 }
@@ -361,24 +365,31 @@ fn run_in_lists_types_and_joins_blocks() {
     git(tmp.path(), &["add", "f.txt"]);
     git(tmp.path(), &["commit", "-m", "first subject"]);
 
+    // T1153 B21/B23: piped runs carry `--`; `--bogus` stays bare to
+    // lock that scan errors report before the terminator check.
     assert_eq!(
-        run_in(tmp.path(), &args(&[])),
+        run_in(tmp.path(), &args(&["--"])),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(
-        run_in(tmp.path(), &args(&["working-copy(HEAD)"])),
+        run_in(tmp.path(), &args(&["--", "working-copy(HEAD)"])),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(
         run_in(
             tmp.path(),
-            &args(&["--explore", "working-copy(HEAD)", "working-copy(HEAD)"])
+            &args(&[
+                "--explore",
+                "--",
+                "working-copy(HEAD)",
+                "working-copy(HEAD)"
+            ])
         ),
         std::process::ExitCode::SUCCESS
     );
     // T1153 RB-D13: `commit(...)` renders now.
     assert_eq!(
-        run_in(tmp.path(), &args(&["commit(HEAD)"])),
+        run_in(tmp.path(), &args(&["--", "commit(HEAD)"])),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(
@@ -386,14 +397,18 @@ fn run_in_lists_types_and_joins_blocks() {
         std::process::ExitCode::FAILURE
     );
     assert_eq!(
-        run_in(tmp.path(), &args(&["--help"])),
+        run_in(tmp.path(), &args(&["--help", "--"])),
         std::process::ExitCode::SUCCESS
     );
 }
 
 #[test]
 fn run_reports_help_and_usage_errors() {
-    assert_eq!(run(&args(&["--help"])), std::process::ExitCode::SUCCESS);
+    // T1153 B21/B23: piped runs carry `--`.
+    assert_eq!(
+        run(&args(&["--help", "--"])),
+        std::process::ExitCode::SUCCESS
+    );
     assert_eq!(run(&args(&["--bogus"])), std::process::ExitCode::FAILURE);
 }
 
@@ -439,6 +454,7 @@ fn explores_browse_tokens_through_the_engine() {
     );
 
     // End to end through run_in_with with an injected caller.
+    // T1153 B21/B23: piped runs carry `--`.
     let mut routes = HashMap::new();
     routes.insert("repository.query".to_string(), serde_json::json!([]));
     routes.insert("phid.lookup".to_string(), serde_json::json!({}));
@@ -452,14 +468,14 @@ fn explores_browse_tokens_through_the_engine() {
     assert_eq!(
         run_in_with(
             tmp.path(),
-            &args(&["--explore", "browse(HEAD)"]),
+            &args(&["--explore", "--", "browse(HEAD)"]),
             Some(&call)
         ),
         std::process::ExitCode::SUCCESS
     );
     // Without --explore, no Conduit is needed at all.
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["browse(HEAD)"]), None),
+        run_in_with(tmp.path(), &args(&["--", "browse(HEAD)"]), None),
         std::process::ExitCode::SUCCESS
     );
 }
@@ -495,9 +511,59 @@ fn r4_rbd4_spec_errors_are_toolset_usage() {
         "Expected exactly one argument to \"working-copy(...)\" with a commit hash."
     ));
     assert!(!is_toolset_usage_message("unknown commit \"zzz\"."));
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = TempDir::new("r4-spec");
     assert_eq!(
-        run_in(tmp.path(), &args(&["not a spec!!"])),
+        run_in(tmp.path(), &args(&["--", "not a spec!!"])),
         std::process::ExitCode::FAILURE
     );
+}
+
+#[test]
+fn b21_inspect_requires_terminator_when_piped() {
+    // T1153 B21/B23: piped without `--` reports the terminator, even
+    // for `--help` and empty argv. Unknown flags still report first.
+    assert!(matches!(
+        parse_args_with_tty(&args(&["working-copy(HEAD)"]), false),
+        ParseOutcome::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&args(&["--help"]), false),
+        ParseOutcome::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&args(&[]), false),
+        ParseOutcome::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&args(&["--bogus"]), false),
+        ParseOutcome::Error(_)
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&args(&["--", "working-copy(HEAD)"]), false),
+        ParseOutcome::Args(_)
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&args(&["working-copy(HEAD)"]), true),
+        ParseOutcome::Args(_)
+    ));
+    assert_eq!(
+        crate::help::MISSING_TERMINATOR,
+        "Missing required \"--\" in argument list."
+    );
+}
+
+#[test]
+fn b23_inspect_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help inspect`.
+    let text = usage_text(false);
+    assert!(text.starts_with("INSPECT WORKFLOW\n"), "{text}");
+    assert!(
+        text.contains("Inspect internal object properties."),
+        "{text}"
+    );
+    assert!(text.contains("--explore"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }

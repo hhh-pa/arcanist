@@ -2445,14 +2445,15 @@ fn gap2_preview_passes_patch_bytes_through_verbatim() {
 
 #[test]
 fn execute_help_preview_and_errors() {
+    // T1153 B21/B23: `--help` renders the generated workflow help.
     let dir = temp_dir("exec_help");
     let backends = Backends::default();
     let mut io = Io::buffered();
     let out = execute_with_io(&dir, &argv(&["--help"]), &mut io, &backends).unwrap();
-    assert_eq!(out.stdout, USAGE);
+    assert!(out.stdout.contains("PATCH WORKFLOW"), "{}", out.stdout);
     let mut io = Io::buffered();
     let error = execute_with_io(&dir, &argv(&["--bogus"]), &mut io, &backends).unwrap_err();
-    assert!(error.ends_with(USAGE), "{error}");
+    assert!(error.contains("PATCH WORKFLOW"), "{error}");
     // `--preview` needs no repository for file sources.
     std::fs::write(dir.join("fix.patch"), "diff --git a/f b/f\n").unwrap();
     let patch = dir.join("fix.patch").to_string_lossy().to_string();
@@ -2574,9 +2575,15 @@ fn execute_pops_stash_on_failure() {
 
 #[test]
 fn run_entry_points() {
+    // T1153 B21/B23: `--help` renders the generated workflow help.
     let dir = temp_dir("run_points");
     assert_eq!(run_in(&dir, &argv(&["--help"])), ExitCode::SUCCESS);
-    assert_eq!(execute(&dir, &argv(&["--help"])).unwrap().stdout, USAGE);
+    assert!(
+        execute(&dir, &argv(&["--help"]))
+            .unwrap()
+            .stdout
+            .contains("PATCH WORKFLOW")
+    );
     assert_eq!(run(&argv(&["--help"])), ExitCode::SUCCESS);
 }
 
@@ -3656,4 +3663,34 @@ fn p13_raw_fetches_send_verbatim_string_ids() {
         seen[0].1
     );
     assert!(seen[1].1.contains("\"ids\":[\"D12\"]"), "{}", seen[1].1);
+}
+
+#[test]
+fn b21_patch_needs_no_terminator() {
+    // T1153 B21/B23 VERIFIED for `patch`: it is a classic workflow,
+    // so PHP runs it via the `scripts/arcanist.php` re-exec, which
+    // never requires `--`. Parsing takes no TTY input, so
+    // piped-style argv parses directly, and `--help` without `--`
+    // still succeeds.
+    assert!(parse_options(&argv(&["D123"])).unwrap().is_some());
+    assert_eq!(parse_options(&argv(&["--help"])).unwrap(), None);
+    let text = usage_text(false);
+    assert!(text.contains("PATCH WORKFLOW"), "{text}");
+}
+
+#[test]
+fn b23_patch_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help patch`.
+    // Extensions stay undocumented.
+    let text = usage_text(false);
+    assert!(text.starts_with("PATCH WORKFLOW\n"), "{text}");
+    assert!(
+        text.contains("Apply the changes in a Differential revision"),
+        "{text}"
+    );
+    assert!(text.contains("--nocommit"), "{text}");
+    assert!(!text.contains("--preview"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }

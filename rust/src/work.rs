@@ -34,20 +34,59 @@ pub const ABORT: &str = "User aborted the workflow.";
 /// Subcommand name, matching `arc work`.
 pub const NAME: &str = "work";
 
+/// T1153 B21/B23: `--help` renders the generated workflow help
+/// (`src/workflow/ArcanistWorkWorkflow.php`, toolset
+/// `getWorkflowInformation()`), not a short custom usage string.
+/// T1153 RB-D5: the renderer is the shared `crate::help` module; this
+/// file keeps only the data.
+const HELP_EXAMPLES: &str = "**work** [--start __start__] __symbol__";
+const HELP_SYNOPSIS: &str = "Begin or resume work.";
+const HELP_TEXT: &str = "Begin or resume work on a branch, bookmark, task, or revision.\n\
+    \n\
+    The __symbol__ may be a branch or bookmark name, a revision name (like \"D123\"),\n\
+    a task name (like \"T123\"), or a new symbol.\n\
+    \n\
+    If you provide a symbol which currently does not identify any ongoing work,\n\
+    Arcanist will create a new branch or bookmark with the name you provide.\n\
+    \n\
+    If you provide the name of an existing branch or bookmark, Arcanist will switch\n\
+    to that branch or bookmark.\n\
+    \n\
+    If you provide the name of a revision or task, Arcanist will look for a related\n\
+    branch or bookmark that exists in the working copy. If it finds one, it will\n\
+    switch to it. If it does not find one, it will attempt to create a new branch\n\
+    or bookmark.\n\
+    \n\
+    When \"arc work\" creates a branch or bookmark, it will use **--start** as the\n\
+    branchpoint if it is provided. Otherwise, the current working copy state will\n\
+    serve as the starting point.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[(
+    "start",
+    None,
+    Some("symbol"),
+    "When creating a new branch or bookmark, use this as the branch point.",
+)];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<arc_rs::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    arc_rs::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &specs,
+        ansi,
+    )
+}
+
 fn usage() -> String {
-    "usage: arc work [--start START] SYMBOL\n\
-     \n\
-     Begin or resume work on a branch.\n\
-     \n\
-     If SYMBOL names an existing local branch, check it out. Otherwise create\n\
-     a new branch named SYMBOL from --start (or the current branch or HEAD).\n\
-     \n\
-     Options:\n\
-     \x20 --start START  Branch point for a new branch.\n\
-     \x20 -h, --help     Show this help.\n\
-     \n\
-     Not yet ported (see T1128): Mercurial bookmarks.\n"
-        .to_string()
+    usage_text(arc_rs::terminal::ansi_enabled())
 }
 
 /// Parsed `work` options.
@@ -62,10 +101,24 @@ pub enum ParseOutcome {
     Args(Options),
     Help,
     Error(String),
+    /// T1153 B21/B23: stdin is piped and argv carries no `--`.
+    MissingTerminator,
 }
 
 /// Parse `argv` (excluding the subcommand name).
 pub fn parse_args(argv: &[String]) -> ParseOutcome {
+    parse_args_with_tty(argv, arc_rs::prompt::stdin_is_terminal())
+}
+
+/// [`parse_args`] with an injected TTY flag (deterministic tests).
+/// T1153 B21/B23: piped runs without `--` fail with
+/// `MissingTerminator` (checked after unknown-flag scanning, like
+/// PHP's `parseFull()`, but before symbol-count validation). `--help`
+/// without `--` when piped reports the terminator. Vs ceb
+/// `ArcanistRuntime.php:80-86,172-188` and
+/// `PhutilArgumentParser.php:331-336`.
+fn parse_args_with_tty(argv: &[String], stdin_tty: bool) -> ParseOutcome {
+    let missing = arc_rs::help::terminator_missing(argv, stdin_tty);
     let mut start = None;
     let mut symbols = Vec::new();
     let mut end_of_flags = false;
@@ -83,12 +136,18 @@ pub fn parse_args(argv: &[String]) -> ParseOutcome {
         } else if let Some(value) = arg.strip_prefix("--start=") {
             start = Some(value.to_string());
         } else if arg == "-h" || arg == "--help" {
+            if missing {
+                return ParseOutcome::MissingTerminator;
+            }
             return ParseOutcome::Help;
         } else if arg.starts_with('-') {
             return ParseOutcome::Error(format!("unknown flag '{arg}'"));
         } else {
             symbols.push(arg.clone());
         }
+    }
+    if missing {
+        return ParseOutcome::MissingTerminator;
     }
     if symbols.is_empty() {
         return ParseOutcome::Error(
@@ -1137,6 +1196,16 @@ fn parse_or_report(argv: &[String]) -> Result<Options, ExitCode> {
         ParseOutcome::Help => {
             print!("{}", usage());
             Err(ExitCode::SUCCESS)
+        }
+        // T1153 B21/B23: the terminator failure prints the three cyan
+        // hints first (like `ArcanistRuntime.php:172-188`) and reports
+        // through the toolset usage arm (exit 1).
+        ParseOutcome::MissingTerminator => {
+            arc_rs::help::print_terminator_hints(arc_rs::terminal::ansi_enabled());
+            Err(arc_rs::conduit::report(
+                arc_rs::conduit::EnvelopeKind::ToolsetUsage,
+                arc_rs::help::MISSING_TERMINATOR,
+            ))
         }
         ParseOutcome::Error(message) => {
             eprintln!("arc {NAME}: {message}\n\n{}", usage());

@@ -49,27 +49,54 @@ pub const PROMPT_AUTHOR: &str = "arc.amend.author";
 /// Prompt confirming history mutation (`:55-59`).
 pub const PROMPT_IMMUTABLE: &str = "arc.amend.immutable";
 
-fn usage() -> String {
-    format!(
-        "usage: arc {NAME} [(-m MESSAGE | --revision ID)] [--show]\n\
-         \n\
-         Amend the HEAD commit message. The message comes from -m/--message\n\
-         (repeatable, joined with a blank line), or from Differential via\n\
-         --revision. With neither, the revision is guessed from the working\n\
-         copy. Staged changes are refused; unstaged and untracked changes\n\
-         are left alone.\n\
-         \n\
-         Options:\n\
-         \x20 -m, --message MSG   new commit message (repeatable)\n\
-         \x20 --revision ID       fetch the message from Differential (D123 or 123)\n\
-         \x20 --conduit-uri URI   Conduit URI (else ARC_CONDUIT_URI or .arcconfig)\n\
-         \x20 --show              print the message without amending\n\
-         \x20 -h, --help          show this help\n\
-         \n\
-         Revisions you do not own, revisions unrelated to the working copy,\n\
-         and immutable histories (history.immutable) prompt before anything\n\
-         is mutated.\n"
+/// T1153 B21/B23: `--help` renders the generated workflow help
+/// (`src/workflow/ArcanistAmendWorkflow.php`, toolset
+/// `getWorkflowInformation()`), not a short custom usage string.
+/// T1153 RB-D5: the renderer is the shared `crate::help` module; this
+/// file keeps only the data. The `-m`/`--message`/`--conduit-uri`
+/// extensions stay functional but undocumented in `--help`, like PHP
+/// (which syncs the message from Differential).
+const HELP_EXAMPLES: &str = "**amend** [options] -- ";
+const HELP_SYNOPSIS: &str = "Amend the working copy, synchronizing the local commit message.";
+const HELP_TEXT: &str = "Amend the working copy, synchronizing the local commit message from\n\
+    Differential.\n\
+    \n\
+    Supported in Mercurial 2.2 and newer.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[
+    (
+        "show",
+        None,
+        None,
+        "Show the amended commit message, without modifying the working copy.",
+    ),
+    (
+        "revision",
+        None,
+        Some("id"),
+        "Use the message from a specific revision. If you do not specify a revision, arc will guess which revision is in the working copy.",
+    ),
+];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &specs,
+        ansi,
     )
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
 }
 
 /// Parsed `amend` options.
@@ -223,14 +250,42 @@ fn consume_arg(options: &mut Options, arg: &str, iter: &mut std::slice::Iter<'_,
 ///
 /// Returns `Ok(None)` when `--help` was requested.
 pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
+    parse_options_with_tty(argv, crate::prompt::stdin_is_terminal())
+}
+
+/// [`parse_options`] with an injected TTY flag (deterministic tests).
+/// T1153 B21/B23: piped runs without `--` fail with
+/// `MISSING_TERMINATOR` (checked after unknown-flag scanning, like
+/// PHP's `parseFull()`, but before success). A lone `--` is the
+/// terminator (accepted); `--help` after `--` is a positional
+/// (rejected, like PHP). Vs ceb `ArcanistRuntime.php:80-86,172-188`
+/// and `PhutilArgumentParser.php:331-336`.
+fn parse_options_with_tty(argv: &[String], stdin_tty: bool) -> Result<Option<Options>, String> {
+    let missing = crate::help::terminator_missing(argv, stdin_tty);
     let mut options = Options::empty();
+    let mut end_of_flags = false;
     let mut iter = argv.iter();
     while let Some(arg) = iter.next() {
+        if end_of_flags {
+            return Err(format!("unexpected argument '{arg}': amend takes no paths"));
+        }
+        if arg == "--" {
+            end_of_flags = true;
+            continue;
+        }
         match consume_arg(&mut options, arg, &mut iter) {
             Step::Handled => {}
-            Step::Help => return Ok(None),
+            Step::Help => {
+                if missing {
+                    return Err(crate::help::MISSING_TERMINATOR.to_string());
+                }
+                return Ok(None);
+            }
             Step::Error(message) => return Err(message),
         }
+    }
+    if missing {
+        return Err(crate::help::MISSING_TERMINATOR.to_string());
     }
     Ok(Some(options))
 }
@@ -992,6 +1047,9 @@ pub fn execute_with_io_backends_ansi(
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => return Ok(usage()),
+        // T1153 B21/B23: the terminator failure carries no usage dump
+        // (toolset `USAGE EXCEPTION`, like PHP).
+        Err(message) if message == crate::help::MISSING_TERMINATOR => return Err(message),
         Err(message) => return Err(format!("{message}\n\n{}", usage())),
     };
     if !options.messages.is_empty() && options.revision.is_some() {
@@ -1036,6 +1094,16 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
+            // T1153 B21/B23: the terminator failure prints the three
+            // cyan hints first (like `ArcanistRuntime.php:172-188`)
+            // and reports through the toolset usage arm (exit 1).
+            if message == crate::help::MISSING_TERMINATOR {
+                crate::help::print_terminator_hints(crate::terminal::ansi_enabled());
+                return crate::conduit::report(
+                    crate::conduit::EnvelopeKind::ToolsetUsage,
+                    &message,
+                );
+            }
             eprintln!("arc {NAME}: {message}");
             ExitCode::FAILURE
         }

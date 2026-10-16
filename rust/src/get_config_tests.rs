@@ -953,3 +953,35 @@ fn core33_project_discovery_svn_nearest_hg_root() {
     let (none, empty) = read_project_config(&child).unwrap();
     assert!(none.is_none() && empty.is_empty());
 }
+
+#[test]
+fn b21_get_config_needs_no_terminator() {
+    // T1153 B21/B23 VERIFIED for `get-config`: it is a classic
+    // workflow, so PHP runs it via the `scripts/arcanist.php`
+    // re-exec, which never requires `--`. Parsing takes no TTY
+    // input, so piped-style argv parses directly, and `--help`
+    // without `--` still succeeds.
+    assert!(
+        parse_args(&["arc.land.onto".to_string()])
+            .unwrap()
+            .is_some()
+    );
+    assert!(parse_args(&["--help".to_string()]).unwrap().is_none());
+    let text = usage_text(false);
+    assert!(text.contains("GET-CONFIG WORKFLOW"), "{text}");
+}
+
+#[test]
+fn b23_get_config_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help get-config`.
+    let text = usage_text(false);
+    assert!(text.starts_with("GET-CONFIG WORKFLOW\n"), "{text}");
+    assert!(
+        text.contains("Reads an arc configuration option."),
+        "{text}"
+    );
+    assert!(text.contains("--verbose"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+}

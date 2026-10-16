@@ -29,20 +29,42 @@ use arc_rs::{conduit, config, diff_submit, get_config, prompt, terminal};
 /// Subcommand name, matching `arc install-certificate`.
 pub const NAME: &str = "install-certificate";
 
-const USAGE: &str = "usage: arc install-certificate [URI] [--conduit-uri URI] [--token TOKEN] [--force] [--config K=V] [--config-file FILE] [--arcrc-file FILE]\n\
-\n\
-Install Conduit credentials into ~/.arcrc for URI. Without URI, the URI\n\
-comes from --conduit-uri, $ARC_CONDUIT_URI, or the merged configuration.\n\
-Without --token, the token is read from stdin after printing the login page.\n\
-\n\
-Options:\n\
-  --conduit-uri URI   Conduit server URI (under the positional URI).\n\
-  --token TOKEN       API token (else prompt via stdin).\n\
-  --force             Install standard api- tokens without prompting.\n\
-  --config K=V        Runtime value (repeatable).\n\
-  --config-file F     Read F instead of the system/user files (repeatable).\n\
-  --arcrc-file F      Read/write credentials at F instead of ~/.arcrc.\n\
-  -h, --help          Show this help.\n";
+/// T1153 B21/B23: `--help` renders the generated workflow help
+/// (`src/workflow/ArcanistInstallCertificateWorkflow.php`,
+/// `getCommandSynopses()`/`getCommandHelp()`), not a short custom
+/// usage string. T1153 RB-D5: the renderer is the shared `crate::help`
+/// module; this file keeps only the data. The `--conduit-uri`/
+/// `--token`/`--force`/`--config`/`--config-file`/`--arcrc-file`
+/// extensions stay functional but undocumented in `--help`, like PHP
+/// (which takes no options). Classic workflows never require `--`
+/// (B21 exempt: PHP runs them via the `scripts/arcanist.php` re-exec).
+const HELP_EXAMPLES: &str = "**install-certificate**";
+const HELP_SYNOPSIS: &str = "      **install-certificate** [uri]";
+const HELP_TEXT: &str = "          Supports: http, https\n          Installs Conduit credentials into your ~/.arcrc for the given install\n          of Phabricator. You need to do this before you can use 'arc', as it\n          enables 'arc' to link your command-line activity with your account on\n          the web. Run this command from within a project directory to install\n          that project's certificate, or specify an explicit URI (like\n          \"https://phabricator.example.com/\").";
+/// Non-wildcard argument specs: (name, short, param, help). Empty:
+/// ceb takes no options.
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &specs,
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
+}
 
 const EXAMPLE_URI: &str = "https://phabricator.example.com/";
 
@@ -833,11 +855,11 @@ fn install_options(argv: &[String]) -> Result<Options, ExitCode> {
     match parse_args(argv) {
         Ok(Some(options)) => Ok(options),
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", usage());
             Err(ExitCode::SUCCESS)
         }
         Err(message) => {
-            eprintln!("arc {NAME}: {message}\n\n{USAGE}");
+            eprintln!("arc {NAME}: {message}\n\n{}", usage());
             Err(ExitCode::FAILURE)
         }
     }

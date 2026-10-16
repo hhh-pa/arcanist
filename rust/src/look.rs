@@ -23,7 +23,39 @@ use crate::{
 /// Subcommand name, matching `arc look`.
 pub const NAME: &str = "look";
 
-const USAGE: &str = "usage: arc look [-- THING...]\n";
+/// T1153 B21/B23: `--help` renders the generated workflow help
+/// (`src/workflow/ArcanistLookWorkflow.php`, toolset
+/// `getWorkflowInformation()`), not a short custom usage string.
+/// T1153 RB-D5: the renderer is the shared `crate::help` module; this
+/// file keeps only the data.
+const HELP_EXAMPLES: &str = "**look**\n**look** [options] -- __thing__";
+const HELP_SYNOPSIS: &str = "You stand in the middle of a small clearing.";
+const HELP_TEXT: &str = "Look around, or look at a specific __thing__.";
+/// Non-wildcard argument specs: (name, short, param, help). Empty:
+/// the only argument is the `thing` wildcard, which
+/// `renderArgumentSpecs()` skips.
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &specs,
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
+}
 
 /// `pht('Arcventure')`, the `%!` banner title.
 pub const TITLE: &str = "Arcventure";
@@ -32,6 +64,18 @@ pub const TITLE: &str = "Arcventure";
 ///
 /// Returns `Ok(None)` when `--help` was requested.
 pub fn parse_args(argv: &[String]) -> Result<Option<Vec<String>>, String> {
+    parse_args_with_tty(argv, crate::prompt::stdin_is_terminal())
+}
+
+/// [`parse_args`] with an injected TTY flag (deterministic tests).
+/// T1153 B21/B23: piped runs without `--` fail with
+/// `MISSING_TERMINATOR` (checked after unknown-flag scanning, like
+/// PHP's `parseFull()`, but before success). `--help` without `--`
+/// when piped reports the terminator. Vs ceb
+/// `ArcanistRuntime.php:80-86,172-188` and
+/// `PhutilArgumentParser.php:331-336`.
+fn parse_args_with_tty(argv: &[String], stdin_tty: bool) -> Result<Option<Vec<String>>, String> {
+    let missing = crate::help::terminator_missing(argv, stdin_tty);
     let mut thing = Vec::new();
     let mut end_of_flags = false;
     for arg in argv {
@@ -40,12 +84,18 @@ pub fn parse_args(argv: &[String]) -> Result<Option<Vec<String>>, String> {
         } else if arg == "--" {
             end_of_flags = true;
         } else if arg == "--help" || arg == "-h" {
+            if missing {
+                return Err(crate::help::MISSING_TERMINATOR.to_string());
+            }
             return Ok(None);
         } else if arg.starts_with('-') {
             return Err(format!("unknown flag '{arg}'"));
         } else {
             thing.push(arg.clone());
         }
+    }
+    if missing {
+        return Err(crate::help::MISSING_TERMINATOR.to_string());
     }
     Ok(Some(thing))
 }
@@ -1491,10 +1541,15 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
     let thing = match parse_args(argv) {
         Ok(Some(thing)) => thing,
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", usage());
             return ExitCode::SUCCESS;
         }
         Err(msg) => {
+            // T1153 B21/B23: the terminator failure prints the three
+            // cyan hints first (like `ArcanistRuntime.php:172-188`).
+            if msg == crate::help::MISSING_TERMINATOR {
+                crate::help::print_terminator_hints(terminal::ansi_enabled());
+            }
             // T1153 RB-D4 (R4): toolset parser errors render the red
             // `USAGE EXCEPTION` label with no usage dump.
             return conduit::report(EnvelopeKind::ToolsetUsage, &msg);

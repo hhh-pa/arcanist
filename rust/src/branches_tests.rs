@@ -6,8 +6,9 @@ fn args(list: &[&str]) -> Vec<String> {
 
 #[test]
 fn parses_defaults() {
+    // T1153 B21/B23: TTY runs need no `--`.
     assert_eq!(
-        parse_options(&args(&[])),
+        parse_options_with_tty(&args(&[]), true),
         Ok(Some(Options {
             all: false,
             json: false,
@@ -18,8 +19,9 @@ fn parses_defaults() {
 
 #[test]
 fn parses_all_json_and_conduit_uri() {
+    // T1153 B21/B23: TTY runs need no `--`.
     assert_eq!(
-        parse_options(&args(&["--all", "--json"])),
+        parse_options_with_tty(&args(&["--all", "--json"]), true),
         Ok(Some(Options {
             all: true,
             json: true,
@@ -27,7 +29,7 @@ fn parses_all_json_and_conduit_uri() {
         }))
     );
     assert_eq!(
-        parse_options(&args(&["--conduit-uri", "https://host/api/"])),
+        parse_options_with_tty(&args(&["--conduit-uri", "https://host/api/"]), true),
         Ok(Some(Options {
             all: false,
             json: false,
@@ -35,7 +37,7 @@ fn parses_all_json_and_conduit_uri() {
         }))
     );
     assert_eq!(
-        parse_options(&args(&["--conduit-uri=https://host/api/"])),
+        parse_options_with_tty(&args(&["--conduit-uri=https://host/api/"]), true),
         Ok(Some(Options {
             all: false,
             json: false,
@@ -46,39 +48,48 @@ fn parses_all_json_and_conduit_uri() {
 
 #[test]
 fn help_returns_none() {
-    assert_eq!(parse_options(&args(&["--help"])), Ok(None));
-    assert_eq!(parse_options(&args(&["-h"])), Ok(None));
-    assert_eq!(parse_options(&args(&["--all", "--help"])), Ok(None));
+    // T1153 B21/B23: TTY runs need no `--`.
+    assert_eq!(parse_options_with_tty(&args(&["--help"]), true), Ok(None));
+    assert_eq!(parse_options_with_tty(&args(&["-h"]), true), Ok(None));
+    assert_eq!(
+        parse_options_with_tty(&args(&["--all", "--help"]), true),
+        Ok(None)
+    );
 }
 
 #[test]
 fn rejects_bad_arguments() {
     // T1153 LAND-42: toolset parse texts (`PhutilArgumentParser`).
+    // T1153 B21/B23: TTY runs need no `--`.
     assert_eq!(
-        parse_options(&args(&["--bogus"])).unwrap_err(),
+        parse_options_with_tty(&args(&["--bogus"]), true).unwrap_err(),
         "Argument \"--bogus\" is unrecognized. Use \"--\" to indicate the end of flags."
     );
     assert_eq!(
-        parse_options(&args(&["feature"])).unwrap_err(),
+        parse_options_with_tty(&args(&["feature"]), true).unwrap_err(),
         "Unrecognized argument \"feature\"."
     );
     assert_eq!(
-        parse_options(&args(&["--conduit-uri"])).unwrap_err(),
+        parse_options_with_tty(&args(&["--conduit-uri"]), true).unwrap_err(),
         "Argument \"--conduit-uri\" requires a parameter."
     );
     assert_eq!(
-        parse_options(&args(&["--all=x"])).unwrap_err(),
+        parse_options_with_tty(&args(&["--all=x"]), true).unwrap_err(),
         "Argument \"--all\" does not take a parameter."
     );
     assert_eq!(
-        parse_options(&args(&["--all", "--all"])).unwrap_err(),
+        parse_options_with_tty(&args(&["--all", "--all"]), true).unwrap_err(),
         "Argument \"--all\" was provided twice."
     );
     // A lone `--` terminates flags and parses clean.
-    assert!(parse_options(&args(&["--"])).unwrap().is_some());
+    assert!(
+        parse_options_with_tty(&args(&["--"]), true)
+            .unwrap()
+            .is_some()
+    );
     // Past `--`, flags are positionals.
     assert_eq!(
-        parse_options(&args(&["--", "--help"])).unwrap_err(),
+        parse_options_with_tty(&args(&["--", "--help"]), true).unwrap_err(),
         "Unrecognized argument \"--help\"."
     );
 }
@@ -166,10 +177,64 @@ fn formats_json_objects() {
 
 #[test]
 fn usage_covers_options() {
-    let text = usage();
-    assert!(text.contains("usage: arc branches"));
-    assert!(text.contains("--all") && text.contains("--json"));
-    assert!(text.contains("--conduit-uri"));
+    // T1153 B21/B23: `--help` renders the generated workflow help
+    // (ceb takes no arguments, so extensions stay undocumented).
+    let text = usage_text(false);
+    assert!(text.contains("BRANCHES WORKFLOW"), "{text}");
+    assert!(text.contains("Show an enhanced view of branches"), "{text}");
+    assert!(!text.contains("--all"), "{text}");
+    assert!(!text.contains("--json"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+}
+
+#[test]
+fn b21_branches_requires_terminator_when_piped() {
+    // T1153 B21/B23: piped without `--` reports the terminator, even
+    // for `--help` and empty argv. Unknown flags still report first.
+    assert_eq!(
+        parse_options_with_tty(&args(&[]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    assert_eq!(
+        parse_options_with_tty(&args(&["--help"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    assert_eq!(
+        parse_options_with_tty(&args(&["--all"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    let err = parse_options_with_tty(&args(&["--bogus"]), false).unwrap_err();
+    assert!(err.contains("unrecognized"), "unexpected: {err}");
+    assert!(
+        parse_options_with_tty(&args(&["--"]), false)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        parse_options_with_tty(&args(&["--all", "--"]), false)
+            .unwrap()
+            .is_some()
+    );
+    assert!(parse_options_with_tty(&args(&[]), true).unwrap().is_some());
+    assert_eq!(
+        crate::help::MISSING_TERMINATOR,
+        "Missing required \"--\" in argument list."
+    );
+}
+
+#[test]
+fn b23_branches_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help branches`.
+    let text = usage_text(false);
+    assert!(text.starts_with("BRANCHES WORKFLOW\n"), "{text}");
+    assert!(
+        text.contains("Lists branches in the working copy"),
+        "{text}"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
 
 #[test]
@@ -191,6 +256,7 @@ fn r4_rbd4_outside_repo_is_toolset_usage_not_fatal() {
     // Outside a repo the marker-type support gate throws
     // `PhutilArgumentUsageException` (exit 1) — T1153 RB-D4's "255" does
     // not reproduce at ceb.
+    // T1153 B21/B23: piped runs carry `--` to reach the support gate.
     let dir = std::env::temp_dir().join(format!(
         "arc-rs-branches-r4-{}-{}",
         std::process::id(),
@@ -200,6 +266,9 @@ fn r4_rbd4_outside_repo_is_toolset_usage_not_fatal() {
             .unwrap_or(0)
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    assert_eq!(run_in(&dir, &args(&[])), std::process::ExitCode::FAILURE);
+    assert_eq!(
+        run_in(&dir, &args(&["--"])),
+        std::process::ExitCode::FAILURE
+    );
     std::fs::remove_dir_all(&dir).ok();
 }

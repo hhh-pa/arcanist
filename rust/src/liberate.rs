@@ -52,19 +52,41 @@ const INIT_FILE: &str = "__phutil_library_init__.php";
 const MAP_FILE: &str = "__phutil_library_map__.php";
 const VERSION_MARKER: &str = "@phutil-library-version";
 
-/// Short `--help` text. The synopsis transcribes PHP verbatim
-/// (`ArcanistLiberateWorkflow.php:14-20` at ceb, T1153 CORE-55).
-fn usage() -> String {
-    format!(
-        "usage: arc {NAME} [--clean] [PATH]\n\
-         \n\
-         Create or update an Arcanist library. Without PATH, libraries one\n\
-         level below the current directory are updated.\n\
-         \n\
-         Options:\n\
-         \x20 --clean     perform a clean rebuild, ignoring caches (slow)\n\
-         \x20 -h, --help  show this help\n"
+/// T1153 B21/B23: `--help` renders the generated workflow help
+/// (`ArcanistLiberateWorkflow.php:14-20` at ceb, T1153 CORE-55,
+/// toolset `getWorkflowInformation()`), not a short custom usage
+/// string. T1153 RB-D5: the renderer is the shared `crate::help`
+/// module; this file keeps only the data.
+const HELP_EXAMPLES: &str = "**liberate**\n**liberate** [__path__]";
+const HELP_SYNOPSIS: &str = "Create or update an Arcanist library.";
+const HELP_TEXT: &str = "Create or update an Arcanist library.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[(
+    "clean",
+    None,
+    None,
+    "Perform a clean rebuild, ignoring caches. Thorough, but slow.",
+)];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &specs,
+        ansi,
     )
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -77,9 +99,23 @@ enum ParseOutcome {
     Args(Options),
     Help,
     Error(String),
+    /// T1153 B21/B23: stdin is piped and argv carries no `--`.
+    MissingTerminator,
 }
 
 fn parse_args(argv: &[String]) -> ParseOutcome {
+    parse_args_with_tty(argv, crate::prompt::stdin_is_terminal())
+}
+
+/// [`parse_args`] with an injected TTY flag (deterministic tests).
+/// T1153 B21/B23: piped runs without `--` fail with
+/// `MissingTerminator` (checked after unknown-flag scanning, like
+/// PHP's `parseFull()`, but before path-count validation). `--help`
+/// without `--` when piped reports the terminator. Vs ceb
+/// `ArcanistRuntime.php:80-86,172-188` and
+/// `PhutilArgumentParser.php:331-336`.
+fn parse_args_with_tty(argv: &[String], stdin_tty: bool) -> ParseOutcome {
+    let missing = crate::help::terminator_missing(argv, stdin_tty);
     // `--help` never reaches the workflow parser in PHP (the global
     // parser consumes it); the port keeps the shortcut for direct
     // calls, like the other commands.
@@ -88,13 +124,16 @@ fn parse_args(argv: &[String]) -> ParseOutcome {
         .take_while(|arg| arg.as_str() != "--")
         .any(|arg| arg == "-h" || arg == "--help")
     {
+        if missing {
+            return ParseOutcome::MissingTerminator;
+        }
         return ParseOutcome::Help;
     }
     let parsed = match crate::argparse::parse_toolset(
         argv,
         &[crate::argparse::FlagSpec::boolean("clean")],
         true,
-        std::io::IsTerminal::is_terminal(&std::io::stdin()),
+        stdin_tty,
     ) {
         Ok(parsed) => parsed,
         Err(message) => return ParseOutcome::Error(message),
@@ -107,6 +146,9 @@ fn parse_args(argv: &[String]) -> ParseOutcome {
                 .map(|t| t.to_string())
                 .unwrap_or_default()
         );
+    }
+    if missing {
+        return ParseOutcome::MissingTerminator;
     }
     let clean = parsed.flag("clean");
     let mut positionals = parsed.positionals.into_iter();
@@ -501,9 +543,15 @@ pub fn execute_with_input(
     input: &mut dyn BufRead,
     stdin_tty: bool,
 ) -> Result<String, String> {
-    let opts = match parse_args(argv) {
+    // T1153 B21/B23: the parse threads the prompt TTY flag so
+    // contract tests (TTY) need no `--` while piped runs do.
+    let opts = match parse_args_with_tty(argv, stdin_tty) {
         ParseOutcome::Args(opts) => opts,
         ParseOutcome::Help => return Ok(usage()),
+        // T1153 B21/B23: the terminator failure carries no usage dump.
+        ParseOutcome::MissingTerminator => {
+            return Err(crate::help::MISSING_TERMINATOR.to_string());
+        }
         // T1153 CORE-21 (R4): PHP renders usage errors with no dump.
         ParseOutcome::Error(message) => return Err(message),
     };
@@ -591,7 +639,11 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
 /// Per-library rebuild failures never reach here (ignored above,
 /// T1153 CORE-50).
 fn classify_error(argv: &[String], message: String) -> ClassifiedError {
-    if matches!(parse_args(argv), ParseOutcome::Error(_)) {
+    // T1153 B21/B23: the terminator failure is toolset usage (exit 1).
+    if matches!(
+        parse_args(argv),
+        ParseOutcome::Error(_) | ParseOutcome::MissingTerminator
+    ) {
         ClassifiedError::toolset_usage(message)
     } else if let Some(body) = message.strip_prefix("cancelled: ") {
         ClassifiedError::user_abort(body.to_string())
@@ -606,7 +658,14 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             print!("{text}");
             ExitCode::SUCCESS
         }
-        Err(message) => classify_error(argv, message).report(),
+        Err(message) => {
+            // T1153 B21/B23: the terminator failure prints the three
+            // cyan hints first (like `ArcanistRuntime.php:172-188`).
+            if message == crate::help::MISSING_TERMINATOR {
+                crate::help::print_terminator_hints(crate::terminal::ansi_enabled());
+            }
+            classify_error(argv, message).report()
+        }
     }
 }
 

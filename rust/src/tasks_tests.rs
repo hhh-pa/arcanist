@@ -280,3 +280,30 @@ fn rbd8_user_phid_prefers_cached_identity() {
     client.set_authenticated_user("alice", "PHID-USER-1");
     assert_eq!(user_phid(&client).unwrap(), "PHID-USER-1");
 }
+
+#[test]
+fn b21_tasks_needs_no_terminator() {
+    // T1153 B21/B23 VERIFIED for `tasks`: it is a classic workflow,
+    // so PHP runs it via the `scripts/arcanist.php` re-exec, which
+    // never requires `--`. Parsing takes no TTY input, so
+    // piped-style argv parses directly, and `--help` without `--`
+    // still succeeds.
+    assert!(parse_args(&args(&["--limit", "5"])).unwrap().is_some());
+    assert_eq!(parse_args(&args(&["--help"])).unwrap(), None);
+    let text = usage_text(false);
+    assert!(text.contains("TASKS WORKFLOW"), "{text}");
+}
+
+#[test]
+fn b23_tasks_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help tasks`.
+    // Extensions stay undocumented.
+    let text = usage_text(false);
+    assert!(text.starts_with("TASKS WORKFLOW\n"), "{text}");
+    assert!(text.contains("View all assigned tasks."), "{text}");
+    assert!(text.contains("--unassigned"), "{text}");
+    assert!(!text.contains("--json"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+}

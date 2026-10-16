@@ -130,7 +130,10 @@ fn temp_home(tag: &str) -> common::HomeGuard {
 fn run_engine(dir: &Path, list: &[&str], answers: &[&str]) -> Result<land::Out, String> {
     let _guard = temp_home("engine");
     let mut io = land::Io::canned(answers);
-    land::execute_with_io(dir, &args(list), &mut io)
+    // T1153 B21/B23: piped runs carry `--` (appended centrally here).
+    let mut full = args(list);
+    full.push("--".to_string());
+    land::execute_with_io(dir, &full, &mut io)
 }
 
 /* LAND-6: mock Conduit over HTTP for the online engine flows. */
@@ -299,6 +302,8 @@ fn run_online_with(
     let mut full: Vec<String> = list.iter().map(|item| (*item).to_string()).collect();
     full.push("--conduit-uri".to_string());
     full.push(base);
+    // T1153 B21/B23: piped runs carry `--` (appended centrally here).
+    full.push("--".to_string());
     let mut io = land::Io::canned(answers);
     land::execute_with_io(dir, &full, &mut io)
 }
@@ -315,13 +320,14 @@ fn module_name_is_land() {
 
 #[test]
 fn run_uses_current_dir() {
+    // T1153 B21/B23: piped runs carry `--`.
     // LAND-6: `--preview` needs Conduit too, so this contract runs online.
     let (repo, _bare) = repo_with_origin("run-contract");
     let old = std::env::current_dir().unwrap();
     std::env::set_current_dir(repo.path()).unwrap();
     let (base, _seen) = serve_methods(online_responses());
     let _guard = home_with_token("run-contract", &base);
-    let code = land::run(&args(&["--preview", "--conduit-uri", &base]));
+    let code = land::run(&args(&["--preview", "--conduit-uri", &base, "--"]));
     std::env::set_current_dir(&old).unwrap();
     assert_eq!(code, ExitCode::SUCCESS);
     // Unchanged: still on the feature branch.
@@ -330,11 +336,12 @@ fn run_uses_current_dir() {
 
 #[test]
 fn help_succeeds_and_prints_usage() {
+    // T1153 B21/B23: piped runs carry `--`; `--help` asserts the generated `LAND WORKFLOW` help.
     let repo = Fixture::init_repo("help");
-    let out = land::execute(repo.path(), &args(&["--help"])).unwrap();
-    assert!(out.stdout.contains("usage: arc land"), "{}", out.stdout);
+    let out = land::execute(repo.path(), &args(&["--help", "--"])).unwrap();
+    assert!(out.stdout.contains("LAND WORKFLOW"), "{}", out.stdout);
     assert_eq!(
-        land::run_in(repo.path(), &args(&["--help"])),
+        land::run_in(repo.path(), &args(&["--help", "--"])),
         ExitCode::SUCCESS
     );
 }
@@ -499,9 +506,12 @@ fn nothing_to_land_fails() {
 #[test]
 fn outside_repo_fails() {
     let empty = Fixture::named("notrepo");
-    let err = land::execute(empty.path(), &args(&[])).unwrap_err();
+    let err = land::execute(empty.path(), &args(&["--"])).unwrap_err();
     assert_eq!(err, land::NOT_GIT_OR_HG);
-    assert_eq!(land::run_in(empty.path(), &args(&[])), ExitCode::FAILURE);
+    assert_eq!(
+        land::run_in(empty.path(), &args(&["--"])),
+        ExitCode::FAILURE
+    );
 }
 
 #[test]
@@ -700,6 +710,7 @@ fn land6_land_without_conduit_fails() {
 
 #[test]
 fn revision_flag_rejects_bad_values() {
+    // T1153 B21/B23: missing-param scan errors stay bare (they report before the terminator check).
     let (repo, _bare) = repo_with_origin("revbad");
     let err = run_engine(repo.path(), &["--preview", "--revision", "nope"], &[]).unwrap_err();
     assert!(
@@ -715,6 +726,7 @@ fn revision_flag_rejects_bad_values() {
 
 #[test]
 fn bad_flags_fail() {
+    // T1153 B21/B23: scan errors stay bare (they report before the terminator check).
     let repo = Fixture::init_repo("flags");
     let err = land::execute(repo.path(), &args(&["--bogus"])).unwrap_err();
     assert!(
@@ -1202,6 +1214,6 @@ fn svn_working_copy_is_rejected_like_any_non_git_hg_tree() {
     // SvnCommand path exists for land.
     let svn = Fixture::named("svn-tree");
     std::fs::create_dir_all(svn.path().join(".svn")).unwrap();
-    let err = land::execute(svn.path(), &args(&[])).unwrap_err();
+    let err = land::execute(svn.path(), &args(&["--"])).unwrap_err();
     assert_eq!(err, land::NOT_GIT_OR_HG);
 }

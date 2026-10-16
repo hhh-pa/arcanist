@@ -23,7 +23,42 @@ use crate::{
 /// Subcommand name, matching `arc list`.
 pub const NAME: &str = "list";
 
-const USAGE: &str = "usage: arc list [--json] [--conduit-uri URI]\n";
+/// T1153 B21/B23: `--help` renders the generated workflow help
+/// (`src/workflow/ArcanistListWorkflow.php`,
+/// `getCommandSynopses()`/`getCommandHelp()`), not a short custom
+/// usage string. T1153 RB-D5: the renderer is the shared `crate::help`
+/// module; this file keeps only the data. The `--json`/`--conduit-uri`
+/// extensions stay functional but undocumented in `--help`, like PHP
+/// (which takes no options). Classic workflows never require `--`
+/// (B21 exempt: PHP runs them via the `scripts/arcanist.php` re-exec).
+const HELP_EXAMPLES: &str = "**list**";
+const HELP_SYNOPSIS: &str = "      **list**";
+const HELP_TEXT: &str =
+    "          Supports: git, svn, hg\n          List your open Differential revisions.";
+/// Non-wildcard argument specs: (name, short, param, help). Empty:
+/// ceb takes no options.
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &specs,
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
+}
 
 /// Parsed `list` options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,7 +390,7 @@ pub fn run_in(cwd: &Path, argv: &[String]) -> ExitCode {
     let options = match parse_args(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", usage());
             return ExitCode::SUCCESS;
         }
         // T1153 RB-D4 (R4): `list` is a subprocess workflow:

@@ -100,7 +100,97 @@ use arc_rs::{
 /// Subcommand name, matching `arc patch`.
 pub const NAME: &str = "patch";
 
-const USAGE: &str = "usage: arc patch [--revision ID] [--diff ID] [--arcbundle FILE] [--patch FILE] [--encoding NAME] [--update] [--nocommit] [--skip-dependencies] [--nobranch] [--force] [--preview] [--conduit-uri URI] [D12345]\n";
+/// T1153 B21/B23: `--help` renders the generated workflow help
+/// (`src/workflow/ArcanistPatchWorkflow.php`,
+/// `getCommandSynopses()`/`getCommandHelp()`), not a short custom
+/// usage string. T1153 RB-D5: the renderer is the shared
+/// `crate::help` module; this file keeps only the data. The
+/// `--preview`/`--conduit-uri` extensions stay functional but
+/// undocumented in `--help`, like PHP. Classic workflows never
+/// require `--` (B21 exempt: PHP runs them via the
+/// `scripts/arcanist.php` re-exec).
+const HELP_EXAMPLES: &str = "**patch**";
+const HELP_SYNOPSIS: &str = "      **patch** __D12345__\n      **patch** __--revision__ __revision_id__\n      **patch** __--diff__ __diff_id__\n      **patch** __--patch__ __file__\n      **patch** __--arcbundle__ __bundlefile__";
+const HELP_TEXT: &str = "          Supports: git, svn, hg\n          Apply the changes in a Differential revision, patchfile, or arc\n          bundle to the working copy.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[
+    (
+        "revision",
+        None,
+        Some("revision_id"),
+        "Apply changes from a Differential revision, using the most recent diff that has been attached to it. You can run 'arc patch D12345' as a shorthand.",
+    ),
+    (
+        "diff",
+        None,
+        Some("diff_id"),
+        "Apply changes from a Differential diff. Normally you want to use --revision to get the most recent changes, but you can specifically apply an out-of-date diff or a diff which was never attached to a revision by using this flag.",
+    ),
+    (
+        "arcbundle",
+        None,
+        Some("bundlefile"),
+        "Apply changes from an arc bundle generated with 'arc export'.",
+    ),
+    (
+        "patch",
+        None,
+        Some("patchfile"),
+        "Apply changes from a git patchfile or unified patchfile.",
+    ),
+    (
+        "encoding",
+        None,
+        Some("encoding"),
+        "Attempt to convert non UTF-8 patch into specified encoding.",
+    ),
+    (
+        "update",
+        None,
+        None,
+        "Update the local working copy before applying the patch.",
+    ),
+    (
+        "nocommit",
+        None,
+        None,
+        "Normally under git/hg, if the patch is successful, the changes are committed to the working copy. This flag prevents the commit.",
+    ),
+    (
+        "skip-dependencies",
+        None,
+        None,
+        "Normally, if a patch has dependencies that are not present in the working copy, arc tries to apply them as well. This flag prevents such work.",
+    ),
+    (
+        "nobranch",
+        None,
+        None,
+        "Normally, a new branch (git) or bookmark (hg) is created and then the patch is applied and committed in the new branch/bookmark. This flag cherry-picks the resultant commit onto the original branch and deletes the temporary branch.",
+    ),
+    ("force", None, None, "Do not run any sanity checks."),
+];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &specs,
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
+}
 
 /// Error when no working copy is detected (established port message; see
 /// the module docs).
@@ -5969,10 +6059,10 @@ pub fn execute_with_io_ansi(
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
-            io.push_out(USAGE);
+            io.push_out(&usage());
             return Ok(std::mem::take(&mut io.out));
         }
-        Err(message) => return Err(format!("{message}\n\n{USAGE}")),
+        Err(message) => return Err(format!("{message}\n\n{}", usage())),
     };
     if options.preview {
         return execute_preview(dir, &options, io);
