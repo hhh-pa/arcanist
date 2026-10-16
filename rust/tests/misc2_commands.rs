@@ -218,10 +218,13 @@ fn inspect_shows_working_copy_state() {
     let head = git(tmp.path(), &["rev-parse", "HEAD"]);
 
     assert!(inspect::SUPPORTED_TYPES.contains(&"working-copy"));
+    // T1153 RB-D14: without `--explore` the raw argument renders
+    // unresolved; exploration resolves and loads the message.
     let block = inspect::inspect_one(tmp.path(), "working-copy(HEAD)", false).unwrap();
-    assert!(block.contains(&head));
+    assert!(block.contains("Commit \"HEAD\""), "{block}");
     assert!(block.contains("ArcanistWorkingCopyStateRef"));
     let explored = inspect::inspect_one(tmp.path(), "working-copy(HEAD)", true).unwrap();
+    assert!(explored.contains(&head), "{explored}");
     assert!(explored.contains("one"));
     assert_eq!(
         inspect::run_in(tmp.path(), &args(&[])),

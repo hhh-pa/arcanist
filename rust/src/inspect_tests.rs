@@ -188,13 +188,21 @@ fn inspects_single_objects() {
     git(tmp.path(), &["commit", "-m", "first subject"]);
     let head = git(tmp.path(), &["rev-parse", "HEAD"]);
 
+    // T1153 RB-D14: without `--explore` the raw argument renders
+    // unresolved; exploration resolves and loads the message.
     let block = inspect_one(tmp.path(), "working-copy(HEAD)", false).unwrap();
-    assert!(block.contains(&format!("Commit \"{head}\"")));
+    assert!(block.contains("Commit \"HEAD\""), "{block}");
     let explored = inspect_one(tmp.path(), "working-copy(HEAD)", true).unwrap();
+    assert!(
+        explored.contains(&format!("Commit \"{head}\"")),
+        "{explored}"
+    );
     assert!(explored.contains("first subject"));
 
     assert!(inspect_one(tmp.path(), "working-copy", false).is_err());
     assert!(inspect_one(tmp.path(), "browse", false).is_err());
+    assert!(inspect_one(tmp.path(), "working-copy(a,b)", false).is_err());
+    assert!(inspect_one(tmp.path(), "browse(a,b)", false).is_err());
 
     let block = inspect_one(tmp.path(), "browse(HEAD)", false).unwrap();
     assert!(
@@ -210,10 +218,140 @@ fn inspects_single_objects() {
         "{block}"
     );
 
-    let unknown = inspect_one(tmp.path(), "commit(HEAD)", false).unwrap_err();
-    assert!(unknown.contains("Unknown object type \"commit\""));
-    assert!(unknown.contains("browse, working-copy"));
+    // T1153 RB-D13: `commit(...)` is a known type now.
+    let block = inspect_one(tmp.path(), "commit(HEAD)", false).unwrap();
+    assert!(
+        block.contains("+ [ArcanistCommitSymbolRef] Commit Symbol \"HEAD\""),
+        "{block}"
+    );
+    let explored = inspect_one(tmp.path(), "commit(HEAD)", true).unwrap();
+    assert!(
+        explored.contains(&format!("Commit \"{head}\"")),
+        "{explored}"
+    );
+    assert!(explored.contains("first subject"), "{explored}");
+
+    let unknown = inspect_one(tmp.path(), "frobnicate(HEAD)", false).unwrap_err();
+    assert!(unknown.contains("Unknown object type \"frobnicate\""));
+    for name in [
+        "browse",
+        "working-copy",
+        "commit",
+        "user",
+        "remote",
+        "revision",
+        "task",
+    ] {
+        assert!(unknown.contains(name), "{unknown}");
+    }
     assert!(inspect_one(tmp.path(), "not valid!", false).is_err());
+}
+
+#[test]
+fn rbd14_working_copy_needs_no_repo_without_explore() {
+    let dir = std::env::temp_dir().join(format!("arc-rs-rbd14-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let block = inspect_one(&dir, "working-copy(HEAD)", false).unwrap();
+    assert!(block.contains("Working Copy State"), "{block}");
+    assert!(block.contains("Commit \"HEAD\""), "{block}");
+    assert!(inspect_one(&dir, "working-copy(HEAD)", true).is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn rbd13_symbols_users_and_remotes_render() {
+    let tmp = init_repo("symbols");
+    git(
+        tmp.path(),
+        &["remote", "add", "origin", "https://example.test/r.git"],
+    );
+    // Simple symbols resolve eagerly (IDs, monograms with PHP's
+    // `(int)` quirk, and PHIDs); anything else is a usage error.
+    let block = inspect_one(tmp.path(), "revision(D123)", false).unwrap();
+    assert!(
+        block.contains("+ [ArcanistRevisionSymbolRef] Revision Symbol \"0\""),
+        "{block}"
+    );
+    assert!(
+        block.contains(" o [ArcanistScalarHardpoint] ref.symbol.object"),
+        "{block}"
+    );
+    let block = inspect_one(tmp.path(), "revision(123)", false).unwrap();
+    assert!(block.contains("Revision Symbol \"123\""), "{block}");
+    let block = inspect_one(tmp.path(), "task(PHID-TASK-abc)", false).unwrap();
+    assert!(block.contains("Task Symbol \"PHID-TASK-abc\""), "{block}");
+    let err = inspect_one(tmp.path(), "revision(abc)", false).unwrap_err();
+    assert!(
+        err.contains("The format of symbol \"abc\" is unrecognized"),
+        "{err}"
+    );
+    assert!(is_toolset_usage_message(&err));
+    let err = inspect_one(tmp.path(), "revision(1,2)", false).unwrap_err();
+    assert!(err.contains("Expected exactly one argument"), "{err}");
+
+    let block = inspect_one(tmp.path(), "user(@alice)", false).unwrap();
+    assert!(block.contains("User Symbol \"alice\""), "{block}");
+    let block = inspect_one(tmp.path(), "user(viewer())", false).unwrap();
+    assert!(block.contains("User Symbol \"viewer()\""), "{block}");
+    let err = inspect_one(tmp.path(), "user(a b)", false).unwrap_err();
+    assert!(err.contains("The format of user symbol"), "{err}");
+    assert!(is_toolset_usage_message(&err));
+
+    let block = inspect_one(tmp.path(), "remote(origin)", false).unwrap();
+    assert!(
+        block.contains("+ [ArcanistRemoteRef] Remote \"origin\""),
+        "{block}"
+    );
+    assert!(
+        block.contains(" o [ArcanistObjectListHardpoint] arc.remote.repositoryRefs"),
+        "{block}"
+    );
+    let err = inspect_one(tmp.path(), "remote(missing)", false).unwrap_err();
+    assert!(
+        err.contains("This working copy has no remote named \"missing\""),
+        "{err}"
+    );
+    assert!(is_toolset_usage_message(&err));
+}
+
+#[test]
+fn rbd13_remote_outside_repo_is_not_implemented() {
+    let dir = std::env::temp_dir().join(format!("arc-rs-rbd13-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let err = inspect_one(&dir, "remote(origin)", false).unwrap_err();
+    assert_eq!(
+        err,
+        "Method newRemoteRefQueryTemplate in class ArcanistFilesystemAPI is not implemented!"
+    );
+    assert!(!is_toolset_usage_message(&err));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn rbd15_commit_explore_resolves_and_loads() {
+    let tmp = init_repo("commitsym");
+    std::fs::write(tmp.path().join("f.txt"), "one\n").unwrap();
+    git(tmp.path(), &["add", "f.txt"]);
+    git(tmp.path(), &["commit", "-m", "first subject"]);
+    git(tmp.path(), &["tag", "-a", "-m", "annotated", "v1"]);
+
+    // Unknown and non-commit symbols attach null, rendering `*`
+    // with an empty value — quietly, like PHP.
+    for symbol in ["missing", "v1"] {
+        let block = inspect_one(tmp.path(), &format!("commit({symbol})"), true).unwrap();
+        assert!(
+            block.contains(" * [ArcanistScalarHardpoint] ref.symbol.object"),
+            "{block}"
+        );
+        assert!(block.contains("  > \"\""), "{block}");
+    }
+    // Newlines are fatal, with the c-escaped symbol.
+    let err = inspect_one(tmp.path(), "commit(a\nb)", true).unwrap_err();
+    assert!(
+        err.contains("Commit symbol \"a\\nb\" contains a newline"),
+        "{err}"
+    );
+    assert!(!is_toolset_usage_message(&err));
 }
 
 #[test]
@@ -238,9 +376,10 @@ fn run_in_lists_types_and_joins_blocks() {
         ),
         std::process::ExitCode::SUCCESS
     );
+    // T1153 RB-D13: `commit(...)` renders now.
     assert_eq!(
         run_in(tmp.path(), &args(&["commit(HEAD)"])),
-        std::process::ExitCode::FAILURE
+        std::process::ExitCode::SUCCESS
     );
     assert_eq!(
         run_in(tmp.path(), &args(&["--bogus"])),

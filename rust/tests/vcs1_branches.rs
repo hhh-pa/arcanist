@@ -129,6 +129,27 @@ fn args(list: &[&str]) -> Vec<String> {
     list.iter().map(|item| (*item).to_string()).collect()
 }
 
+/// Canned empty conduit for grid tests (T1153 LAND-23: the workflow
+/// needs a client). With `published`, a `diffusion.repository.search`
+/// answer precedes the `differential.query` answer, matching the
+/// workflow's call order for repos with remote-tracking markers.
+fn empty_conduit(published: bool) -> (String, Client, std::sync::mpsc::Receiver<(String, String)>) {
+    let mut script = Vec::new();
+    if published {
+        script.push(r#"{"result": {"data": []}, "error_code": null}"#);
+    }
+    script.push(r#"{"result": [], "error_code": null}"#);
+    let (base, seen) = serve_script(script);
+    let client = Client::new(&base, "test-token").unwrap();
+    (base, client, seen)
+}
+
+/// Give the fixture a remote (T1153 RB-D9: the workflow parses
+/// `git remote --verbose` strictly and throws when remote-less).
+fn add_remote(repo: &Fixture) {
+    repo.git(&["remote", "add", "origin", "https://example.test/repo.git"]);
+}
+
 #[test]
 fn module_name_is_branches() {
     assert_eq!(branches::NAME, "branches");
@@ -137,9 +158,14 @@ fn module_name_is_branches() {
 #[test]
 fn run_uses_current_dir() {
     let repo = Fixture::init_repo("run-contract");
+    // T1153 RB-D9/LAND-23: the grid needs a remote; `--conduit-uri`
+    // points the run at a canned server (deterministic offline, and
+    // the grid proves the working copy resolved from the cwd).
+    add_remote(&repo);
+    let (base, _client, _seen) = empty_conduit(false);
     let old = std::env::current_dir().unwrap();
     std::env::set_current_dir(repo.path()).unwrap();
-    let code = branches::run(&args(&[]));
+    let code = branches::run(&args(&["--conduit-uri", &base]));
     std::env::set_current_dir(&old).unwrap();
     assert_eq!(code, ExitCode::SUCCESS);
 }
@@ -159,6 +185,9 @@ fn help_succeeds_and_prints_usage() {
 fn lists_branches_with_current_marker() {
     let repo = Fixture::init_repo("list");
     repo.git(&["branch", "feature"]);
+    // T1153 RB-D9/LAND-23: the grid needs a remote and a client.
+    add_remote(&repo);
+    let (_base, client, _seen) = empty_conduit(false);
     let branches = branches::list(repo.path(), false).unwrap();
     assert_eq!(branches.len(), 2);
     assert_eq!(branches[0].name, "master");
@@ -167,7 +196,8 @@ fn lists_branches_with_current_marker() {
     assert!(!branches[1].current);
 
     // Fixed width: message truncation depends on the terminal.
-    let out = branches::execute_with_client(repo.path(), &args(&[]), Some(150), None).unwrap();
+    let out =
+        branches::execute_with_client(repo.path(), &args(&[]), Some(150), Some(&client)).unwrap();
     // Both markers point at the same commit, so one tree view holds two
     // marker items: the plain marker first, the active one second.
     let lines: Vec<&str> = out.lines().collect();
@@ -177,17 +207,25 @@ fn lists_branches_with_current_marker() {
     let short = repo.git(&["rev-parse", "--short", "HEAD"]);
     assert!(out.contains(&short), "missing hash: {out}");
     assert!(out.contains("initial commit"), "missing subject: {out}");
-    assert_eq!(branches::run_in(repo.path(), &args(&[])), ExitCode::SUCCESS);
+    let (base, _client, _seen) = empty_conduit(false);
+    assert_eq!(
+        branches::run_in(repo.path(), &args(&["--conduit-uri", &base])),
+        ExitCode::SUCCESS
+    );
 }
 
 #[test]
 fn detached_head_has_no_current_branch() {
     let repo = Fixture::init_repo("detached");
     repo.git(&["checkout", "-q", "--detach", "HEAD"]);
+    // T1153 RB-D9/LAND-23: the grid needs a remote and a client.
+    add_remote(&repo);
+    let (_base, client, _seen) = empty_conduit(false);
     let branches = branches::list(repo.path(), false).unwrap();
     assert_eq!(branches.len(), 1);
     assert!(!branches[0].current);
-    let out = branches::execute_with_client(repo.path(), &args(&[]), Some(150), None).unwrap();
+    let out =
+        branches::execute_with_client(repo.path(), &args(&[]), Some(150), Some(&client)).unwrap();
     assert!(!out.contains(" *  "), "unexpected: {out}");
     assert!(out.contains("• master"), "unexpected: {out}");
 }
@@ -197,8 +235,14 @@ fn empty_repo_matches_php_partition_error() {
     let repo = Fixture::named("empty");
     repo.git(&["init", "-q", "-b", "master", "."]);
     assert_eq!(branches::list(repo.path(), false).unwrap(), Vec::new());
+    // T1153 RB-D9/LAND-23: the remote query precedes the graph
+    // query, so a remote plus an (unused) client lead to PHP's
+    // graph error here.
+    add_remote(&repo);
+    let (_base, client, _seen) = empty_conduit(false);
     // No markers means no heads; PHP throws out of the graph query.
-    let err = branches::execute(repo.path(), &args(&[])).unwrap_err();
+    let err = branches::execute_with_client(repo.path(), &args(&[]), Some(150), Some(&client))
+        .unwrap_err();
     assert!(
         err.contains("Need head hashes or exact hashes!"),
         "unexpected: {err}"
@@ -214,9 +258,11 @@ fn empty_repo_matches_php_partition_error() {
 fn outside_repo_fails() {
     let empty = Fixture::named("notrepo");
     let err = branches::execute(empty.path(), &args(&[])).unwrap_err();
-    assert!(
-        err.contains("not inside a git repository"),
-        "unexpected: {err}"
+    // T1153 LAND-28: outside a repository PHP fails the support
+    // check against a `filesystem` API.
+    assert_eq!(
+        err,
+        "The version control system (\"filesystem\") in the current working copy does not support branches."
     );
     assert_eq!(
         branches::run_in(empty.path(), &args(&[])),
@@ -245,6 +291,9 @@ fn upstream_tracking_is_shown() {
     repo.git(&["branch", "frozen"]);
     repo.commit_file("extra.txt", "extra\n", "second commit");
     repo.git(&["branch", "--set-upstream-to=frozen"]);
+    // T1153 RB-D9/LAND-23: the grid needs a remote and a client.
+    add_remote(&repo);
+    let (_base, client, _seen) = empty_conduit(false);
 
     let branches = branches::list(repo.path(), false).unwrap();
     let master = branches.iter().find(|b| b.name == "master").unwrap();
@@ -253,7 +302,8 @@ fn upstream_tracking_is_shown() {
 
     // The tree grid shows no upstream tracking (matching `arc`); the
     // tracking data stays available through `list()`.
-    let out = branches::execute_with_client(repo.path(), &args(&[]), Some(150), None).unwrap();
+    let out =
+        branches::execute_with_client(repo.path(), &args(&[]), Some(150), Some(&client)).unwrap();
     assert!(out.contains("• frozen"), "unexpected: {out}");
     assert!(out.contains("└  *  master"), "unexpected: {out}");
     assert!(out.contains("second commit"), "unexpected: {out}");
@@ -267,8 +317,11 @@ fn all_includes_remote_tracking_branches() {
     repo.git(&["remote", "add", "origin", &bare.dir.to_string_lossy()]);
     repo.git(&["push", "-q", "origin", "master"]);
 
+    // T1153 LAND-23: the grid needs a client (the published
+    // lookup fires first for these remote-tracking markers).
+    let (_base, client, _seen) = empty_conduit(true);
     let local_only =
-        branches::execute_with_client(repo.path(), &args(&[]), Some(150), None).unwrap();
+        branches::execute_with_client(repo.path(), &args(&[]), Some(150), Some(&client)).unwrap();
     assert_eq!(
         local_only
             .lines()
@@ -280,8 +333,10 @@ fn all_includes_remote_tracking_branches() {
 
     // Remote-tracking markers render under their branch name, so `--all`
     // adds a second `master` item for `origin/master`.
+    let (_base, client, _seen) = empty_conduit(true);
     let all =
-        branches::execute_with_client(repo.path(), &args(&["--all"]), Some(150), None).unwrap();
+        branches::execute_with_client(repo.path(), &args(&["--all"]), Some(150), Some(&client))
+            .unwrap();
     assert_eq!(
         all.lines().filter(|line| line.contains("master")).count(),
         2,
@@ -298,9 +353,13 @@ fn all_includes_remote_tracking_branches() {
 fn bad_flags_fail() {
     let repo = Fixture::init_repo("flags");
     let err = branches::execute(repo.path(), &args(&["--bogus"])).unwrap_err();
-    assert!(err.contains("unknown flag"), "unexpected: {err}");
+    // T1153 LAND-42: toolset parse texts (`PhutilArgumentParser`).
+    assert_eq!(
+        err,
+        "Argument \"--bogus\" is unrecognized. Use \"--\" to indicate the end of flags."
+    );
     let err = branches::execute(repo.path(), &args(&["master"])).unwrap_err();
-    assert!(err.contains("unexpected argument"), "unexpected: {err}");
+    assert_eq!(err, "Unrecognized argument \"master\".");
     assert_eq!(
         branches::run_in(repo.path(), &args(&["--bogus"])),
         ExitCode::FAILURE
@@ -344,6 +403,9 @@ fn conduit_revisions_annotate_the_grid() {
     let repo = Fixture::init_repo("annotated");
     repo.git(&["checkout", "-qb", "feature"]);
     repo.commit_file("extra.txt", "extra\n", "second commit");
+    // T1153 RB-D9: the grid parses remotes strictly (no tracking
+    // refs here, so only `differential.query` fires below).
+    add_remote(&repo);
     let head = repo.git(&["rev-parse", "HEAD"]);
 
     let row = format!(
@@ -376,8 +438,12 @@ fn conduit_revisions_annotate_the_grid() {
     assert!(params.contains("commitHashes"), "{params}");
     assert!(params.contains(&head), "{params}");
 
-    // Without a client the same grid renders with blank annotation.
-    let plain = branches::execute_with_client(repo.path(), &args(&[]), Some(150), None).unwrap();
-    assert!(!plain.contains("D1"), "unexpected: {plain}");
-    assert!(plain.contains("second commit"), "unexpected: {plain}");
+    // T1153 LAND-23: without a client the grid fails like PHP
+    // instead of rendering with blank annotation.
+    let err = branches::execute_with_client(repo.path(), &args(&[]), Some(150), None).unwrap_err();
+    assert!(
+        err.contains("This command needs to communicate with Phabricator"),
+        "unexpected: {err}"
+    );
+    assert!(err.contains("phabricator.uri"), "unexpected: {err}");
 }
