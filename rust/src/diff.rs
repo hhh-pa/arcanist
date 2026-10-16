@@ -2776,6 +2776,27 @@ pub fn collect_submit_changes_with(
 
 /// [`collect_submit_changes_with`] with injected prompt stdio for the svn
 /// externals confirm.
+/// Collect git submit changes, attaching synthetic hunks for pure moves.
+///
+/// T1153 EXPORT-E20: `loadSyntheticData()` runs on git submits in PHP.
+/// Split from [`collect_submit_changes_with_io`] for the complexity
+/// ratchet (cyclomatic ≤ 15).
+fn collect_git_submit_changes(
+    cwd: &Path,
+    base: &str,
+    head: Option<&str>,
+) -> Result<Vec<diff_submit::DiffChange>, String> {
+    let text =
+        diff_local::get_full_git_diff(cwd, base, head, diff_local::DEFAULT_DIFF_CONTEXT_LINES)?;
+    if text.is_empty() {
+        return Err(diff_local::NO_CHANGES_FOUND.to_string());
+    }
+    let mut full = diff_local::with_companions(&diff_local::parse_unified_diff(&text)?);
+    let raw_for = |path: &str| diff_local::get_raw_diff_text(cwd, base, path);
+    diff_local::attach_synthetic_git_hunks(&mut full, &raw_for)?;
+    Ok(submit_changes_from_parsed(&full))
+}
+
 pub fn collect_submit_changes_with_io<R: std::io::BufRead, W: std::io::Write>(
     cwd: &Path,
     hg_cmd: &hg::HgCommand,
@@ -2793,23 +2814,7 @@ pub fn collect_submit_changes_with_io<R: std::io::BufRead, W: std::io::Write>(
         Ok(submit_changes_from_parsed(&parsed))
     };
     match detect_vcs_kind(cwd) {
-        Some(VcsKind::Git) => {
-            let text = diff_local::get_full_git_diff(
-                cwd,
-                base,
-                head,
-                diff_local::DEFAULT_DIFF_CONTEXT_LINES,
-            )?;
-            if text.is_empty() {
-                return Err(diff_local::NO_CHANGES_FOUND.to_string());
-            }
-            // T1153 EXPORT-E20: pure moves gain fabricated hunks
-            // (`loadSyntheticData()` runs on git submits in PHP).
-            let mut full = diff_local::with_companions(&diff_local::parse_unified_diff(&text)?);
-            let raw_for = |path: &str| diff_local::get_raw_diff_text(cwd, base, path);
-            diff_local::attach_synthetic_git_hunks(&mut full, &raw_for)?;
-            Ok(submit_changes_from_parsed(&full))
-        }
+        Some(VcsKind::Git) => collect_git_submit_changes(cwd, base, head),
         Some(VcsKind::Hg) => {
             let text = diff_local::get_full_hg_diff_with(
                 cwd,

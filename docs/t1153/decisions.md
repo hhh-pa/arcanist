@@ -130,6 +130,16 @@ LAND-0a/b/c, AMEND-0, LAND-1 nest under `constraints` via the shared
 | diff: EXPORT-E11..E24, E37 | FIXED (Rule 0) | `diff_local.rs` parser halves: block-header keys, hunk-count validation, CRLF/unterminated tails, filemode lines, git filename extraction, synthetic data, changeset loop, path-merge. Carry: E14/E11/E13/E20 wiring into submit paths + DIFF-D22 |
 | brup: BROWSE-B21/B23 | FIXED (Rule 0) | `--` terminator gate + generated workflow help across export/paste/upload (classic vs toolset dispatch). Carry: B21/B23 remainder (other commands), RB-D5 shared help renderer |
 
+### Phase 2 Wave 4 (sections, 4 agents + live probes)
+
+| Finding(s) | Decision | Trigger / note |
+|---|---|---|
+| w4-grid: RB-D33/35/36/37, RB-D15 | FIXED (Rule 0) | trailing-only empty drop (mid-stream still throws); float `/2` ceiling; rowless grid draws `\n` not `Array`; `phabricator.example.com/D123` footer; PHID-less first-wins + live load audit. Core duplicated RB-D33/35/36 — grid kept at merge (ceb: mid-stream empty throws `ArcanistGitCommitGraphQuery.php:153-160`; core's `Array` comment wrong) |
+| w4-help: R10 (8 cmds), RB-D5, B21/B23 pilots | FIXED/VERIFIED/KEPT | shared `help.rs` renderer (`usage:` lead kept, no PHP spec); browse central FIXED to ceb bytes, 7 VERIFIED; `--` gate + generated help for anoid/version/weld; markers help KEPT (2b, abstract at ceb). Carry: R10 other 28, B21/B23 other 23 (complex parsers; binary still gated globally) |
+| w4-core: U21-order, CORE-47..65, full ID sweep | FIXED/VERIFIED/KEPT | U21 order VERIFIED+locked; CORE-65 live pipes; 37 workflows (`browse` into `ALL_WORKFLOWS`); liberate/anoid/version/browser COREs; all 67 CORE + 40 RB-D + 25 LINTERS + 16 COVER IDs cited; keeps re-verified (C2 `idx($blame,$line)` etc.); RB-D29a Rule 4 (no `--check` at ceb). Carry: RB-D16/17/18 (which prose, needs PHP oracle) |
+| w4-diffland: E11/13/14/15/20/36, D22, LAND-22, COMMIT-C3 | FIXED (Rule 0) | hunk explicitness bits; filemodes→properties; shared CompanionFold (`old_path` Option); synthetic-hunk attach + pinned submit invocation; shared hunk_stats; lint/unit child dicts into `arc:lint`/`arc:unit`; cached handshake at amend/commit; best-effort post-commit nudge. §9 diff gaps VERIFIED. Carry: §9 `work` under hg, `oldPath` shapes (wide blast radius) |
+| w4-live: 21 orsay probes (read-only) | 17 VERIFIED, 4 DIVERGED→Wave 5 | ping/nested search/attachments/tasks/list/browse/download-vs-PHP all match; D494 untouched. DL-1 (lowercase `f123`/PHID-FILE), DL-2/DL-3 (symbol-engine/no-argv texts): port lifted dead `didParseArguments` validation, live path is the symbol engine — owner `download.rs`. TASKS-1 unknown-flag wording (minor; scope vs locked convention TBD) |
+
 ### Keep-list (Rule 2, recorded early per task §10 step 4)
 
 | Finding | Criterion | Rationale |
