@@ -126,10 +126,14 @@ fn readable_path(cwd: &Path, path: &Path) -> String {
     }
     for parent in &parents {
         let base = parent.display().to_string();
-        let trimmed = base.trim_end_matches(std::path::MAIN_SEPARATOR);
-        let prefix = format!("{trimmed}{}", std::path::MAIN_SEPARATOR);
-        if let Some(rest) = text.strip_prefix(&prefix) {
-            return rest.to_string();
+        // Try both separators: paths may use `/` where Windows
+        // reports `\` (T1153 CORE-61).
+        for sep in [std::path::MAIN_SEPARATOR, '/'] {
+            let trimmed = base.trim_end_matches(sep);
+            let prefix = format!("{trimmed}{sep}");
+            if let Some(rest) = text.strip_prefix(&prefix) {
+                return rest.to_string();
+            }
         }
     }
     text
