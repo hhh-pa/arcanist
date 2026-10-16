@@ -594,9 +594,10 @@ fn parse_hg_ls_markers(text: &str) -> Result<Vec<MarkerRef>, String> {
                 ));
             }
         };
-        // T1153 LAND-27: PHP reads `name`/`node` unchecked (a
-        // missing key is a notice, not a failure), so markers without
-        // them proceed with empty strings instead of hard-failing.
+        // T1153 LAND-27 / T1153 RB-D34: PHP reads `name`/`node`
+        // unchecked (a missing key is a notice, not a failure), so
+        // markers without them proceed with empty strings instead of
+        // hard-failing.
         let name = item
             .get("name")
             .and_then(serde_json::Value::as_str)
@@ -2500,7 +2501,7 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => return Ok(usage()),
-        // T1153 R4 (RB-D4): PHP renders usage errors with no dump.
+        // T1153 RB-D4 (R4): PHP renders usage errors with no dump.
         Err(message) => return Err(message),
     };
     if options.json {
@@ -2550,7 +2551,7 @@ pub fn execute_with_client(
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => return Ok(usage()),
-        // T1153 R4 (RB-D4): PHP renders usage errors with no dump.
+        // T1153 RB-D4 (R4): PHP renders usage errors with no dump.
         Err(message) => return Err(message),
     };
     execute_core(dir, &options, terminal, client, terminal::ansi_enabled())
@@ -2595,7 +2596,7 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             {
                 return code;
             }
-            // T1153 R4 (RB-D4): `markers`/`branches` run in the
+            // T1153 RB-D4 (R4): `markers`/`branches` run in the
             // toolset runtime (`ArcanistMarkersWorkflow extends
             // ArcanistArcWorkflow`). Argument, support-gate, and
             // limit errors render the red `USAGE EXCEPTION` label

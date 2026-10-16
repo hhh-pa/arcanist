@@ -227,7 +227,7 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => return Ok(usage()),
-        // T1153 R4 (RB-D4): PHP renders usage errors with no dump.
+        // T1153 RB-D4 (R4): PHP renders usage errors with no dump.
         Err(message) => return Err(message),
     };
     if options.json {
@@ -265,7 +265,7 @@ pub fn execute_with_client(
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => return Ok(usage()),
-        // T1153 R4 (RB-D4): PHP renders usage errors with no dump.
+        // T1153 RB-D4 (R4): PHP renders usage errors with no dump.
         Err(message) => return Err(message),
     };
     execute_core(dir, &options, terminal, client)
@@ -342,11 +342,11 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             {
                 return code;
             }
-            // T1153 R4 (RB-D4): `branches` runs in the toolset
+            // T1153 RB-D4 (R4): `branches` runs in the toolset
             // runtime (via `ArcanistMarkersWorkflow`). Argument,
             // support-gate, and limit errors render the red `USAGE
             // EXCEPTION` label (exit 1); query and render failures
-            // escape into a fatal (255). (RB-D4's "outside-repo
+            // escape into a fatal (255). (T1153 RB-D4's "outside-repo
             // branches exits 255" does not reproduce at ceb: the
             // support gate throws `PhutilArgumentUsageException`,
             // caught at `ArcanistRuntime.php:38-39` — exit 1.)

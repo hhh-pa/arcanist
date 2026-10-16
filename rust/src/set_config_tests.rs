@@ -76,6 +76,8 @@ fn coercion_matches_php_write_rules() {
         coerce_value("custom.key", "v").unwrap(),
         serde_json::json!("v")
     );
+    // T1153 CORE-37: the alias error keeps PHP's text (the
+    // `Exception` arm renders it at the CLI layer).
     assert_eq!(
         coerce_value("aliases", "x").unwrap_err(),
         "Use \"arc alias\" to configure aliases, not \"arc set-config\"."

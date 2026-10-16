@@ -358,7 +358,7 @@ pub fn run_in(cwd: &Path, argv: &[String]) -> ExitCode {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
         }
-        // T1153 R4 (RB-D4): `list` is a subprocess workflow:
+        // T1153 RB-D4 (R4): `list` is a subprocess workflow:
         // usage errors render `Usage Exception:` with no usage dump
         // (`scripts/arcanist.php:432-444`).
         Err(msg) => return conduit::report(EnvelopeKind::Usage, &msg),
@@ -367,7 +367,7 @@ pub fn run_in(cwd: &Path, argv: &[String]) -> ExitCode {
         // The working-copy gate is a usage error (same envelope).
         return conduit::report(EnvelopeKind::Usage, &msg);
     }
-    // T1153 CORE-4/CORE-9: classic `requiresAuthentication` startup
+    // T1153 CORE-4/T1153 CORE-9: classic `requiresAuthentication` startup
     // (tokenless engine, credential gate, `user.whoami` /
     // `conduit.connect` verification).
     let user_file = config::arcrc_path();

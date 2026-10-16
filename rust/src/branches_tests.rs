@@ -189,7 +189,7 @@ fn r4_rbd4_parse_error_has_no_dump() {
 #[test]
 fn r4_rbd4_outside_repo_is_toolset_usage_not_fatal() {
     // Outside a repo the marker-type support gate throws
-    // `PhutilArgumentUsageException` (exit 1) — RB-D4's "255" does
+    // `PhutilArgumentUsageException` (exit 1) — T1153 RB-D4's "255" does
     // not reproduce at ceb.
     let dir = std::env::temp_dir().join(format!(
         "arc-rs-branches-r4-{}-{}",

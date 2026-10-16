@@ -1001,7 +1001,8 @@ pub fn collect_remote_uris(remotes: &[RemoteInfo]) -> Vec<String> {
 }
 
 /// Resolve repositories for `uris` via `diffusion.repository.search`,
-/// following `cursor.after` pagination like `ConduitSearchFuture`.
+/// following `cursor.after` pagination like `ConduitSearchFuture`
+/// (`ConduitSearchFuture.php:56-93` at ceb, T1153 RB-D11).
 pub fn resolve_repositories(
     call: &diff_submit::ConduitCall,
     uris: &[String],
@@ -1034,7 +1035,8 @@ pub fn normalize_git_uri(uri: &str) -> String {
 
 /// Find the repository whose URIs contain `uri` after normalization.
 /// On collisions the last match wins, like PHP's `$uri_map` overwrite
-/// (`ArcanistRemoteRepositoryRefsHardpointQuery.php:60-67`).
+/// (`ArcanistRemoteRepositoryRefsHardpointQuery.php:60-87` at ceb,
+/// T1153 RB-D11).
 #[must_use]
 pub fn match_repository<'a>(repos: &'a [RepositoryRef], uri: &str) -> Option<&'a RepositoryRef> {
     let wanted = normalize_git_uri(uri);
@@ -1315,7 +1317,7 @@ fn now_unix() -> u64 {
 }
 
 /// Tokenless-capable Conduit client for repository mapping: `None`
-/// only when no URI resolves at all (T1153 CORE-4/RB-D12). Missing
+/// only when no URI resolves at all (T1153 CORE-4/T1153 RB-D12). Missing
 /// credentials yield a tokenless client whose calls fail mapped
 /// (T1153 CORE-5), like PHP's engine.
 fn look_conduit_client(cwd: &Path, user_file: Option<&Path>) -> Option<conduit::Client> {
@@ -1325,7 +1327,7 @@ fn look_conduit_client(cwd: &Path, user_file: Option<&Path>) -> Option<conduit::
 }
 
 fn fail(message: String) -> ExitCode {
-    // T1153 R4 (RB-D4): `look` runs in the toolset runtime
+    // T1153 RB-D4 (R4): `look` runs in the toolset runtime
     // (`ArcanistLookWorkflow extends ArcanistArcWorkflow`), so runtime
     // errors escape into a PHP fatal (255). PHP never throws here,
     // but the envelope's fatal arm is the faithful default.
@@ -1493,7 +1495,7 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(msg) => {
-            // T1153 R4 (RB-D4): toolset parser errors render the red
+            // T1153 RB-D4 (R4): toolset parser errors render the red
             // `USAGE EXCEPTION` label with no usage dump.
             return conduit::report(EnvelopeKind::ToolsetUsage, &msg);
         }

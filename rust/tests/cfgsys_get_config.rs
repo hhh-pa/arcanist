@@ -76,7 +76,7 @@ fn run_reads_empty_home() {
 #[test]
 fn fixtures_drive_expected_resolution() {
     let tmp = TempDir::new("fixtures");
-    // CORE-33: the project file only counts at a working-copy root.
+    // T1153 CORE-33: the project file only counts at a working-copy root.
     std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
     std::fs::write(
         tmp.path().join(".arcconfig"),

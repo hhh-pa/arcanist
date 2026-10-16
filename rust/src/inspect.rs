@@ -743,7 +743,7 @@ fn parse_inspect_options(argv: &[String]) -> Result<Options, ExitCode> {
             Err(ExitCode::SUCCESS)
         }
         ParseOutcome::Error(message) => {
-            // T1153 R4 (RB-D4): `inspect` is a toolset workflow:
+            // T1153 RB-D4 (R4): `inspect` is a toolset workflow:
             // parser errors render the red `USAGE EXCEPTION` label
             // with no usage dump.
             Err(conduit::report(EnvelopeKind::ToolsetUsage, &message))
@@ -807,7 +807,7 @@ fn finish_inspect_blocks(
                 {
                     return code;
                 }
-                // T1153 R4 (RB-D4): spec-shape errors are toolset
+                // T1153 RB-D4 (R4): spec-shape errors are toolset
                 // usage (exit 1); the rest escape into a fatal (255).
                 let kind = if is_toolset_usage_message(&message) {
                     EnvelopeKind::ToolsetUsage

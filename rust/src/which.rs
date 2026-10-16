@@ -10,6 +10,13 @@
 //! matching is opportunistic — when no conduit client is available the
 //! matching section says why instead of failing like PHP.
 //!
+//! Carried (T1153 RB-D16/T1153 RB-D17/T1153 RB-D18 — Wave-4 core-agent note): the
+//! full `arc which` prose layout (`ArcanistWhichWorkflow.php:57-261`),
+//! the `repository.query` association flow (`:62-105`), and the
+//! `COMMIT RANGE` details (16-char base, summary, prose) still need a
+//! dedicated port; the pieces around them (D19 subheader, D20–D24)
+//! already match. No keep criterion applies, so this stays open.
+//!
 //! Console colors follow the PHP markup sites on TTYs: every section
 //! header renders bold (PHP wraps its `REPOSITORY`, `COMMIT RANGE`, and
 //! `MATCHING REVISIONS` titles in `**`), as do the `created`/`updated`
@@ -356,10 +363,16 @@ pub fn base_sources_from(loaded: &get_config::Sources) -> BaseSources {
 }
 
 /// Split a `base` specification into rules, mirroring
-/// `tokenizeBaseCommitSpecification()`.
+/// `tokenizeBaseCommitSpecification()`
+/// (`ArcanistBaseCommitParser.php:13-30` at ceb, T1153 RB-D38e:
+/// `array_filter` drops falsy rules, so `0` vanishes silently).
 pub fn tokenize_base_rules(raw: &str) -> Result<Vec<String>, String> {
     let mut rules = Vec::new();
-    for rule in raw.split(',').map(str::trim).filter(|r| !r.is_empty()) {
+    for rule in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty() && *rule != "0")
+    {
         if !rule.contains(':') {
             return Err(format!(
                 "Rule '{rule}' is invalid, it must have a type and name like 'arc:upstream'."
@@ -1178,6 +1191,9 @@ pub fn local_commit_information(
     Ok(parse_commit_records(&String::from_utf8_lossy(&out.stdout)))
 }
 
+/// Parse `%H/%T/%s/%B` records (T1153 RB-D38a, kept: the `\x01`/`\x02`
+/// separators make a `commit <40hex>` line inside a message harmless,
+/// where PHP's medium-format `DiffParser` split misparses).
 fn parse_commit_records(text: &str) -> Vec<LocalCommit> {
     let mut commits = Vec::new();
     for record in text.split('\u{2}') {
@@ -2072,6 +2088,12 @@ impl Parser {
     }
 
     fn flag_conduit(&mut self, arg: &str, iter: &mut ArgIter<'_>) -> Option<Step> {
+        // T1153 RB-D25: `--flag=value` is accepted like PHP
+        // (`PhutilArgumentParser.php:143-150` at ceb).
+        if let Some(value) = arg.strip_prefix("--conduit-uri=") {
+            self.conduit_uri = Some(value.to_string());
+            return Some(Step::Handled);
+        }
         if arg != "--conduit-uri" {
             return None;
         }
@@ -2085,6 +2107,12 @@ impl Parser {
     }
 
     fn flag_head(&mut self, arg: &str, iter: &mut ArgIter<'_>) -> Option<Step> {
+        // T1153 RB-D25: `--head=X` is accepted like `--base=X`.
+        if let Some(value) = arg.strip_prefix("--head=") {
+            self.head = value.to_string();
+            self.head_explicit = true;
+            return Some(Step::Handled);
+        }
         if arg != "--head" {
             return None;
         }
@@ -2250,7 +2278,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Parsed::Error(message) => {
-            // T1153 R4 (RB-D4): `which` is a subprocess workflow, so
+            // T1153 RB-D4 (R4): `which` is a subprocess workflow, so
             // usage errors render `Usage Exception:` with no usage dump
             // (`scripts/arcanist.php:432-444`).
             return conduit::report(EnvelopeKind::Usage, &message);
@@ -2270,7 +2298,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             options.base_rules.as_deref().unwrap_or(""),
         );
     }
-    // T1153 CORE-4/CORE-9: tokenless engine, then the classic
+    // T1153 CORE-4/T1153 CORE-9: tokenless engine, then the classic
     // credential check. Without credentials the report stays lenient
     // (matching unavailable, exit 0) as before; with credentials the
     // client verifies like `authenticateConduit()` (`user.whoami` /
@@ -2315,7 +2343,7 @@ pub fn run(argv: &[String]) -> ExitCode {
         &resolution,
     ) {
         Ok(ctx) => ctx,
-        // T1153 R4 (RB-D4): context/resolution failures are generic
+        // T1153 RB-D4 (R4): context/resolution failures are generic
         // exceptions under the red banner (`:449-468`), except the
         // missing-commit usage errors (T1153 RB-D21).
         Err(message) => {
@@ -2341,10 +2369,9 @@ pub fn run(argv: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Report a `load_context` failure: T1153 R4 (RB-D4) renders
+/// Report a `load_context` failure: T1153 RB-D4 (R4) renders
 /// context/resolution failures as generic exceptions under the red
-/// banner (`:449-468`), except the missing-commit usage errors (T1153
-/// RB-D21). On an empty repository PHP has already printed the
+/// banner (`:449-468`), except the missing-commit usage errors (T1153 RB-D21). On an empty repository PHP has already printed the
 /// repository section when commit resolution fails, so the local
 /// prefix prints first (T1153 RB-D24).
 #[allow(clippy::too_many_arguments)]
@@ -2382,7 +2409,7 @@ fn run_show_base(
     runtime_rules: &str,
 ) -> ExitCode {
     if !git::is_inside_work_tree(cwd) {
-        // T1153 R4 (RB-D4): the working-copy gate is a usage error.
+        // T1153 RB-D4 (R4): the working-copy gate is a usage error.
         return conduit::report(
             EnvelopeKind::Usage,
             "no commit range outside a working copy",

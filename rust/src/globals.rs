@@ -53,7 +53,7 @@ pub fn set_load_options(value: String) {
 }
 
 /// Record the resolved classic command name (the `ARCANIST` export,
-/// `scripts/arcanist.php:229`). `main`-only.
+/// `scripts/arcanist.php:229`, T1153 CORE-19). `main`-only.
 ///
 /// Known gap: hook children do not inherit it yet — propagating it
 /// would need an explicit `.env()` at every spawn site, since the

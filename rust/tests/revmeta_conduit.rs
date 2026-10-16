@@ -371,7 +371,7 @@ fn resolve_repository_phid_queries_by_callsign() {
     let client = client_for(&base);
 
     let fx = Fixture::named("close-repo-phid");
-    // CORE-33: the project file only counts at a working-copy root.
+    // T1153 CORE-33: the project file only counts at a working-copy root.
     std::fs::create_dir_all(fx.dir.join(".git")).unwrap();
     std::fs::write(fx.dir.join(".arcconfig"), r#"{"repository.callsign": "X"}"#).unwrap();
     assert_eq!(
@@ -394,7 +394,7 @@ fn resolve_repository_phid_treats_old_servers_as_untracked() {
     let client = client_for(&base);
 
     let fx = Fixture::named("close-repo-old");
-    // CORE-33: the project file only counts at a working-copy root.
+    // T1153 CORE-33: the project file only counts at a working-copy root.
     std::fs::create_dir_all(fx.dir.join(".git")).unwrap();
     std::fs::write(fx.dir.join(".arcconfig"), r#"{"repository.callsign": "X"}"#).unwrap();
     assert_eq!(
@@ -835,7 +835,7 @@ fn null_browser_config() -> &'static str {
 #[test]
 fn browse_opens_the_created_task() {
     let fx = Fixture::named("todo-browse");
-    // CORE-33: the project file only counts at a working-copy root.
+    // T1153 CORE-33: the project file only counts at a working-copy root.
     std::fs::create_dir_all(fx.dir.join(".git")).unwrap();
     std::fs::write(fx.dir.join(".arcconfig"), null_browser_config()).unwrap();
     let mut routes = HashMap::new();
@@ -1069,7 +1069,7 @@ fn upload_continues_past_a_missing_file_then_reports_it() {
 fn conduit_modules_are_reachable_through_shared_helpers() {
     // `config` and `git` are exercised via the commands above; keep direct
     // references so the shared-helper wiring stays covered.
-    // CORE-12: discovery honors ambient user config, so shadow it for a
+    // T1153 CORE-12: discovery honors ambient user config, so shadow it for a
     // hermetic empty assertion.
     let shadow_dir = Fixture::named("discover-shadow");
     let empty = shadow_dir.dir.join("empty.json");

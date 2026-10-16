@@ -79,7 +79,8 @@ enum Action {
     Error(String),
 }
 
-/// `call-conduit` help at ceb (`ArcanistCallConduitWorkflow.php:14-41`).
+/// `call-conduit` help at ceb (`ArcanistCallConduitWorkflow.php:14-41`,
+/// T1153 CORE-67: `...scripts which integrate with Phabricator...`).
 /// Test-locked contract text; detailed help renders from the workflow
 /// reference table (`HELP_ENTRIES`).
 #[allow(dead_code)]
@@ -376,8 +377,11 @@ const CLASSIC_COMMANDS: &[&str] = &[
 
 /// Rust-only commands (abstract in PHP at ceb): they resolve and run
 /// in-process like toolset commands, but are excluded from spelling
-/// options so typo behavior stays PHP-faithful.
-const TOOLSET_EXTRA_COMMANDS: &[&str] = &["browse", "markers"];
+/// options so typo behavior stays PHP-faithful. Only `markers`
+/// qualifies (`ArcanistMarkersWorkflow` is abstract); `browse` is a
+/// concrete PHP workflow (T1153 CORE-66) and lives in
+/// [`ALL_WORKFLOWS`].
+const TOOLSET_EXTRA_COMMANDS: &[&str] = &["markers"];
 
 /// Parsed global (pre-command) arguments.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -568,7 +572,9 @@ fn strip_standard(argv: &[String], globals: &mut Globals) -> Result<Vec<String>,
 
 /// Phase 2: toolset config arguments (`parsePartial($config_args,
 /// initial_only: true)`), red errors. Valued and repeatable; flags
-/// must precede the first non-flag argument.
+/// must precede the first non-flag argument (T1153 CORE-34:
+/// `--config`/`--config-file`/`--arcrc-file` reach every command
+/// through [`get_config::LoadOptions`]).
 fn strip_config(argv: &[String], globals: &mut Globals) -> Result<Vec<String>, GlobalError> {
     let mut rest = Vec::new();
     let mut is_initial = true;
@@ -2390,15 +2396,17 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     },
 ];
 
-/// All 36 concrete workflows at ceb (toolset 20 + legacy 16): the
-/// classic resolution set and the `help` listing without the two
-/// Rust-only extras.
+/// All 37 concrete workflows at ceb (toolset 21 + legacy 16,
+/// counted from `getWorkflowName` definitions, T1153 CORE-66): the
+/// classic resolution set and the `help` listing without the one
+/// Rust-only extra (`markers`, abstract in PHP).
 const ALL_WORKFLOWS: &[&str] = &[
     "alias",
     "amend",
     "anoid",
     "bookmarks",
     "branches",
+    "browse",
     "call-conduit",
     "close-revision",
     "commit",
@@ -2785,7 +2793,9 @@ fn find_static_name(name: &str) -> Option<&'static str> {
 
 /// True when the invocation needs the non-interactive `--` error: a
 /// toolset command (exact match, since autocorrect is off when piped)
-/// whose flow arguments contain no `--` terminator.
+/// whose flow arguments contain no `--` terminator
+/// (`ArcanistRuntime.php:84-86,170-195` at ceb, T1153 CORE-17 —
+/// including `call-conduit`).
 fn needs_terminator_error(argv: &[String]) -> bool {
     let Some(first) = argv.first() else {
         return false;
@@ -2815,7 +2825,7 @@ fn dispatch(argv: &[String]) -> ExitCode {
 /// flags must flow through instead of being re-stripped, since
 /// re-stripping would lose `--help`/`--show-standard-options`.
 /// `arc --help` leads with the one-line usage (the release smoke
-/// test greps it) ahead of the full workflow reference (RB-D5).
+/// test greps it) ahead of the full workflow reference (T1153 RB-D5).
 const BARE_HELP_LEAD: &str = "usage: arc [--version] [--help] <command>\n\n";
 
 /// Dispatch a bare `arc` (no command word).

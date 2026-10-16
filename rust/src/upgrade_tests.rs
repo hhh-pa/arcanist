@@ -64,6 +64,7 @@ fn version_matches_package() {
 
 #[test]
 fn outside_repos_everything_is_unknown() {
+    // T1153 CORE-56 (kept): bare `upgrade` reports instead of pulling.
     let tmp = TempDir::new("plain");
     let status = inspect(&tmp.path).unwrap();
     assert!(!status.in_repo);

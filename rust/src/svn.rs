@@ -1770,23 +1770,11 @@ pub fn svn_lang_env_var() -> &'static str {
     }
 }
 
-/// Failure message for `svn commit`, starting from the PHP sentence
-/// (`ArcanistCommitWorkflow.php:163`) with the captured stdout appended:
-/// stderr already streamed live, while stdout is captured and never
-/// shown on failure (the caller gets `Err`), so it rides along here.
-fn commit_failed_message(out: &std::process::Output) -> String {
-    const BASE: &str = "Executing 'svn commit' failed!";
-    let detail = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let detail = detail.trim();
-    if detail.is_empty() {
-        BASE.to_string()
-    } else {
-        format!("{BASE}: {detail}")
-    }
+/// Failure message for `svn commit`: the bare PHP sentence
+/// (`ArcanistCommitWorkflow.php:163` at ceb). The child streams live,
+/// so its output is already on the console; nothing rides along here.
+fn commit_failed_message() -> String {
+    "Executing 'svn commit' failed!".to_string()
 }
 
 /// Commit `files` with `message`: `svn commit <files> --encoding utf-8
@@ -1794,16 +1782,17 @@ fn commit_failed_message(out: &std::process::Output) -> String {
 ///
 /// PHP: the `svn commit` call in `ArcanistCommitWorkflow::run`
 /// (`src/workflow/ArcanistCommitWorkflow.php:148-164`), which runs
-/// `phutil_passthru` (live stdio). Stderr streams live like PHP's
-/// (T1153 CORE-65); stdout is captured and returned (the `Sending ...
-/// Committed revision N` progress) so the caller can show it.
+/// `phutil_passthru` (live stdio). Both pipes stream live like PHP's
+/// (T1153 CORE-65): the `Sending ... Committed revision N` progress
+/// lands on the console during the commit, and the caller gets only
+/// the status.
 pub fn commit_with_locale(
     dir: &Path,
     svn: &SvnCommand,
     files: &[&str],
     message: &str,
     locale: Option<&str>,
-) -> Result<String, String> {
+) -> Result<(), String> {
     let tmp = write_temp_file("svncommit", message.as_bytes())?;
     let tmp_name = tmp.to_string_lossy().into_owned();
     let mut argv: Vec<&str> = Vec::with_capacity(files.len() + 5);
@@ -1814,16 +1803,16 @@ pub fn commit_with_locale(
     if let Some(locale) = locale {
         cmd.env("LANG", locale);
     }
-    // T1153 CORE-65: PHP's `phutil_passthru` streams both pipes live;
-    // stderr inherits the terminal here while stdout stays captured for
-    // the caller to show.
+    // T1153 CORE-65: PHP's `phutil_passthru` streams both pipes live,
+    // so both inherit the terminal here; nothing is captured.
+    cmd.stdout(std::process::Stdio::inherit());
     cmd.stderr(std::process::Stdio::inherit());
     let out = spawn_output(&mut cmd).map_err(|e| format!("failed to run {}: {e}", svn.program))?;
     std::fs::remove_file(&tmp).ok();
     if !out.status.success() {
-        return Err(commit_failed_message(&out));
+        return Err(commit_failed_message());
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(())
 }
 
 /// Commit `files` with `message`, probing `LANG` on non-Windows.
@@ -1834,7 +1823,7 @@ pub fn commit_with(
     svn: &SvnCommand,
     files: &[&str],
     message: &str,
-) -> Result<String, String> {
+) -> Result<(), String> {
     #[cfg(windows)]
     let locale = None;
     #[cfg(not(windows))]
@@ -1843,7 +1832,7 @@ pub fn commit_with(
 }
 
 /// Commit `files` with `message` using the system binary.
-pub fn commit(dir: &Path, files: &[&str], message: &str) -> Result<String, String> {
+pub fn commit(dir: &Path, files: &[&str], message: &str) -> Result<(), String> {
     commit_with(dir, &SvnCommand::system(), files, message)
 }
 

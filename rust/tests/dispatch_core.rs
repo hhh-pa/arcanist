@@ -75,7 +75,7 @@ fn core20_bare_help_renders_reference() {
 
 #[test]
 fn dash_help_leads_with_usage() {
-    // RB-D5 + release smoke gate: `arc --help` leads with the one-line
+    // T1153 RB-D5 + release smoke gate: `arc --help` leads with the one-line
     // usage ahead of the full workflow reference.
     let (home, repo) = fixture("dash-help");
     let out = arc(&home, &repo, &["--help"]);

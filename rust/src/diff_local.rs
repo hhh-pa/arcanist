@@ -234,14 +234,16 @@ pub fn parse_revision_id_from_raw_corpus(corpus: &str) -> Result<Option<u64>, St
     if let Some(id) = parse_revision_monogram(value) {
         return Ok(Some(id));
     }
-    // Otherwise, try to find a full URI (PHP :131-137).
+    // Otherwise, try to find a full URI (PHP :131-137 at ceb,
+    // T1153 RB-D37: `a Phabricator URI like
+    // "https://phabricator.example.com/D123"`).
     if let Some(id) = parse_revision_monogram(strip_uri_path(value)) {
         return Ok(Some(id));
     }
     Err(format!(
         "Invalid \"Differential Revision\" field in commit message. This field \
-         should have a revision identifier like \"D123\" or a server URI \
-         like \"https://devtools.example.com/D123\", but has \"{value}\"."
+         should have a revision identifier like \"D123\" or a Phabricator URI \
+         like \"https://phabricator.example.com/D123\", but has \"{value}\"."
     ))
 }
 

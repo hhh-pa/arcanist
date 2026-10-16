@@ -165,7 +165,7 @@ const CANNED_XUNIT: &str = "<testsuite name=\"t\" tests=\"3\">\
 #[test]
 fn selection_prefers_explicit_unit_engine_arcunit_cargo() {
     let dir = temp_project("sel");
-    // CORE-33: the project file only counts at a working-copy root.
+    // T1153 CORE-33: the project file only counts at a working-copy root.
     std::fs::create_dir_all(dir.join(".git")).unwrap();
     // UNIT-U7: nothing configured is `ArcanistNoEngineException`.
     let err = unit::discover_selection(&Options::default(), &dir).unwrap_err();

@@ -217,7 +217,7 @@ fn r5_core40_install_anyway_defaults_no() {
     // `phutil_console_confirm()` with the default `$default_no`, so
     // Enter declines (`[y/N]`) and the token is not installed. (The
     // default-YES confirm at `ArcanistConfigurationManager.php:198` is
-    // the chmod prompt, which Rust does not implement — CORE-41.)
+    // the chmod prompt, which Rust does not implement — T1153 CORE-41.)
     let mut input = cursor("\n");
     assert_eq!(
         prompt::console_confirm_with_tty(

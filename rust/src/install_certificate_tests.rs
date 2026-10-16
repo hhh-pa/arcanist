@@ -85,7 +85,7 @@ fn token_shapes_validate() {
 
 #[test]
 fn uri_resolution_follows_precedence() {
-    // CORE-33: the project file only counts at a working-copy root.
+    // T1153 CORE-33: the project file only counts at a working-copy root.
     let tmp = TempDir::new("resolve");
     std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
     std::fs::write(
@@ -121,7 +121,7 @@ fn uri_resolution_follows_precedence() {
         resolve_uri(None, None, None, &tmp.path).unwrap(),
         "https://cfg.example/api/"
     );
-    // CORE-12: with user/system shadowed, bare discovery still errors.
+    // T1153 CORE-12: with user/system shadowed, bare discovery still errors.
     let bare = TempDir::new("bare");
     let empty = bare.path.join("empty.json");
     std::fs::write(&empty, "{}").unwrap();
@@ -213,6 +213,8 @@ fn token_storage_roundtrips_and_preserves_config() {
         "Your '~/.arcrc' file is not a valid JSON file."
     );
     assert!(install_token(&path, "https://h.example/api/", CLI_TOKEN).is_err());
+    // T1153 CORE-35 (kept): non-object docs are rejected upfront
+    // (PHP returns them raw and fatals downstream).
     std::fs::write(&path, "[1]").unwrap();
     assert!(read_token_doc(&path).is_err());
     std::fs::write(&path, r#"{"hosts": 7}"#).unwrap();
@@ -350,6 +352,7 @@ fn certificate_exchange_parses_user_and_cert() {
             certificate: "CERT".to_string(),
         }
     );
+    // T1153 CORE-45 (kept): a missing certificate is rejected.
     let bad = stub_call(
         [(
             "conduit.getcertificate".to_string(),
@@ -497,14 +500,14 @@ fn args_accept_one_uri_and_flags() {
     assert_eq!(dashed.uri, Some("https://h.example/".to_string()));
 }
 
-// -( R5 TTY gating: CORE-39/40, both CLEAN )-----------------------------------
+// -( R5 TTY gating: T1153 CORE-39/T1153 CORE-40, both CLEAN )-----------------------------------
 
 #[test]
 fn r5_core39_token_prompt_gates_pipes() {
     // CLEAN: `phutil_console_prompt()` requires a TTY
     // (`ArcanistInstallCertificateWorkflow.php:103-109` via
     // `src/console/format.php:46-52`); blanks re-prompt, EOF fails fast
-    // (CORE-46 keep).
+    // (T1153 CORE-46 keep).
     let mut piped = std::io::BufReader::new("cli-tok\n".as_bytes());
     assert_eq!(
         prompt_token_from(&mut piped, false).unwrap_err(),
@@ -524,7 +527,7 @@ fn r5_core39_token_prompt_gates_pipes() {
 
 #[test]
 fn r6_core38_uri_uses_full_precedence_and_default() {
-    // CORE-38: discovery reads `phabricator.uri` from any source, then
+    // T1153 CORE-38: discovery reads `phabricator.uri` from any source, then
     // `default` — including the project legacy `conduit_uri`.
     let tmp = TempDir::new("core38");
     std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
@@ -653,7 +656,8 @@ fn core41_open_arcrc_prompts_to_chmod() {
 #[test]
 #[cfg(unix)]
 fn core41_chmod_prompt_defaults_yes() {
-    // PHP passes `$default_no = false` ([Y/n]): empty input chmods.
+    // T1153 CORE-40/T1153 CORE-41: PHP passes `$default_no = false`
+    // ([Y/n]): empty input chmods.
     let tmp = TempDir::new("chmod-default");
     let path = open_arcrc(&tmp, 0o640);
     let mut input = std::io::BufReader::new(std::io::Cursor::new(b"\n".to_vec()));

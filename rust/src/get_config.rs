@@ -528,7 +528,7 @@ pub struct LoadOptions {
 
 impl LoadOptions {
     /// Overlay the dispatcher's global `--config`/`--config-file`/
-    /// `--arcrc-file` (T1153 CORE-10/11 family): explicit per-command
+    /// `--arcrc-file` (T1153 CORE-10/T1153 CORE-11 family): explicit per-command
     /// values win (runtime per key, `arcrc_file` when set),
     /// config-file lists concatenate (global first, later files win).
     /// [`load_merged`] applies this, so globals reach every command.

@@ -56,7 +56,7 @@ fn commit(dir: &Path, name: &str) {
 #[test]
 fn conduit_resolution_reports_its_source() {
     let tmp = TempDir::new("conduit");
-    // CORE-33: the project file only counts at a working-copy root.
+    // T1153 CORE-33: the project file only counts at a working-copy root.
     std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
     std::fs::write(
         tmp.path.join(".arcconfig"),
@@ -88,7 +88,7 @@ fn conduit_resolution_reports_its_source() {
             "project (.arcconfig)"
         )
     );
-    // CORE-12: bare-dir discovery now honors ambient user/system config,
+    // T1153 CORE-12: bare-dir discovery now honors ambient user/system config,
     // so `(None, "none")` is only observable on unconfigured machines;
     // that case moved to `tests/cfgsys_which.rs` under a temp HOME.
     let bare = TempDir::new("noconduit");
@@ -201,10 +201,10 @@ fn rbd39_query_rows_accept_lists_and_objects() {
 
 #[test]
 fn rbd38a_commit_line_in_body_does_not_split() {
-    // PHP scans `--format=medium` with the diff parser, so a body line
-    // `commit <40hex>` splits one commit into two; the `%x01/%x02`
-    // framing keeps it inside the message (kept: PHP bug not
-    // replicated, Rust stays correct).
+    // T1153 RB-D38a (kept): PHP scans `--format=medium` with the diff
+    // parser, so a body line `commit <40hex>` splits one commit into
+    // two; the `%x01/%x02` framing keeps it inside the message (PHP
+    // bug not replicated, Rust stays correct).
     let repo = fresh_repo("rbd38a-body");
     commit(&repo.path, "a.txt");
     git(
@@ -651,11 +651,29 @@ fn args_cover_flags_ranges_and_unported() {
         }
         _ => panic!("expected options"),
     }
+    // T1153 RB-D25: `--flag=value` works for `--head` and
+    // `--conduit-uri` too.
+    match parse_args(&["--head=abc123".to_string()]) {
+        Parsed::Options(opts) => assert_eq!(opts.head, "abc123"),
+        _ => panic!("expected --head= options"),
+    }
+    match parse_args(&["--conduit-uri=https://h.test/api/".to_string()]) {
+        Parsed::Options(opts) => {
+            assert_eq!(opts.conduit_uri.as_deref(), Some("https://h.test/api/"))
+        }
+        _ => panic!("expected --conduit-uri= options"),
+    }
 }
 
 #[test]
 fn tokenizes_base_specifications() {
+    // T1153 RB-D38e: falsy rules (`""`, `"0"`) vanish silently.
     assert!(tokenize_base_rules("").unwrap().is_empty());
+    assert!(tokenize_base_rules("0").unwrap().is_empty());
+    assert_eq!(
+        tokenize_base_rules("arc:upstream,0,git:master").unwrap(),
+        vec!["arc:upstream".to_string(), "git:master".to_string()]
+    );
     assert_eq!(
         tokenize_base_rules("arc:upstream, git:master").unwrap(),
         vec!["arc:upstream".to_string(), "git:master".to_string()]
@@ -992,7 +1010,7 @@ fn multi_revision_guidance_stays_plain() {
     assert!(styled.contains(sentence), "{styled}");
 }
 
-// -( R5 TTY gating: RB-D22 )---------------------------------------------------
+// -( R5 TTY gating: T1153 RB-D22 )---------------------------------------------------
 
 #[test]
 fn r5_rb_d22_banner_essay_bytes() {

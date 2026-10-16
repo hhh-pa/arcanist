@@ -260,8 +260,8 @@ pub fn accept_token_line(line: &str) -> Option<String> {
 /// Read a whole `~/.arcrc` document; a missing file yields `{}`.
 /// The JSON error mirrors `readUserConfigurationFile()` (T1153 CORE-42),
 /// including its literal `~/.arcrc` (PHP hardcodes it even for custom
-/// paths); the non-object rejection is arc-rs strictness (T1153
-/// CORE-35, kept).
+/// paths); the non-object rejection is arc-rs strictness
+/// (T1153 CORE-35, kept).
 pub fn read_token_doc(path: &Path) -> Result<serde_json::Value, String> {
     if !path.is_file() {
         return Ok(serde_json::json!({}));
@@ -328,7 +328,8 @@ fn chmod_arcrc(path: &Path) -> Result<(), String> {
 /// `readUserConfigurationFile()` permission gate (T1153 CORE-41): on
 /// non-Windows, an existing arcrc with group/other bits set prompts to
 /// `chmod 600` (`[Y/n]`, default YES — PHP passes `$default_no =
-/// false`); a decline is the usage error, an accept chmods. Windows
+/// false`, `ArcanistConfigurationManager.php:198` at ceb, T1153
+/// T1153 CORE-40); a decline is the usage error, an accept chmods. Windows
 /// skips the check like PHP (`phutil_is_windows`).
 pub fn ensure_arcrc_permissions(path: &Path) -> Result<(), String> {
     ensure_arcrc_permissions_from(
@@ -499,6 +500,8 @@ pub fn exchange_certificate(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_string();
+    // T1153 CORE-45 (kept): PHP stores whatever the server returns;
+    // empty credentials are rejected here instead.
     if username.is_empty() || certificate.is_empty() {
         return Err(format!(
             "Server \"{uri}\" returned an invalid certificate response."

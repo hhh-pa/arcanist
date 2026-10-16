@@ -230,7 +230,8 @@ fn builds_tasks_json() {
 
 #[test]
 fn parse_tasks_keeps_server_row_order() {
-    // PHID-keyed maps keep wire order (preserve_order), not PHID sort.
+    // T1153 RB-D26: PHID-keyed maps keep wire order (preserve_order),
+    // not PHID sort.
     let result: serde_json::Value = serde_json::from_str(
         r#"{"PHID-TASK-zzz": {"id": 2, "title": "Second"},
             "PHID-TASK-aaa": {"id": 1, "title": "First"}}"#,
@@ -248,8 +249,8 @@ fn parse_tasks_keeps_server_row_order() {
 
 #[test]
 fn execute_propagates_conduit_errors() {
-    // RB-D27 lock: execute errors (incl. conduit failures) surface as Err
-    // so run() prints them to stderr with exit 1, like PHP.
+    // T1153 RB-D27 lock: execute errors (incl. conduit failures) surface
+    // as Err so run() prints them to stderr with exit 1, like PHP.
     let client = crate::conduit::Client::new("http://127.0.0.1:9/", "t").unwrap();
     let options = Options {
         status: None,

@@ -250,7 +250,8 @@ fn is_stop_char(glyph: &[char]) -> bool {
 
 /// Truncate `text` to at most `maximum` glyphs.
 ///
-/// Mirrors `PhutilUTF8StringTruncator` with only `setMaximumGlyphs()`:
+/// Mirrors `PhutilUTF8StringTruncator` with only `setMaximumGlyphs()`
+/// (`src/utils/PhutilUTF8StringTruncator.php` at ceb, T1153 RB-D35):
 /// strings within the limit return unmodified, longer strings are cut with
 /// room for the `…` terminator, preferring word and sentence boundaries.
 #[must_use]
@@ -268,7 +269,9 @@ pub fn truncate_glyphs(text: &str, maximum: usize) -> String {
     if cutoff == 0 {
         return TRUNCATOR_TERMINATOR.to_string();
     }
-    let search = (cutoff.saturating_sub(256)).max(cutoff / 2);
+    // T1153 RB-D35: PHP divides in float (`$cutoff / 2`), so an odd
+    // cutoff searches from the ceiling, not the floor.
+    let search = (cutoff.saturating_sub(256)).max(cutoff.div_ceil(2));
     let mut word_boundary: Option<usize> = None;
     let mut stop_boundary: Option<usize> = None;
     let mut any_nonboundary = false;
@@ -550,6 +553,8 @@ impl GridView {
         if self.columns.is_empty() {
             panic!("Can not draw a grid with no columns!");
         }
+        // T1153 RB-D36: PHP string-casts the empty row list, printing
+        // `Array`.
         if self.rows.is_empty() {
             return "Array\n".to_string();
         }

@@ -2118,7 +2118,7 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            // T1153 R4 (EXPORT-E7, EXPORT-E28, RB-D4): `export` is a
+            // T1153 R4 (EXPORT-E7, EXPORT-E28, T1153 RB-D4): `export` is a
             // subprocess workflow. Argument errors render `Usage
             // Exception:` (exit 1); empty diffs, conduit failures,
             // and not-found errors are generic exceptions under the

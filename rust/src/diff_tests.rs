@@ -267,7 +267,7 @@ fn gap2_open_submit_result_in_browser_matrix() {
 #[test]
 fn gap2_configured_browser_command_shapes() {
     let dir = scratch_dir("gap2-browser-cfg");
-    // CORE-33: the project file only counts at a working-copy root.
+    // T1153 CORE-33: the project file only counts at a working-copy root.
     std::fs::create_dir_all(dir.join(".git")).unwrap();
     std::fs::write(dir.join(".arcconfig"), r#"{"browser": "plain-browser"}"#).unwrap();
     assert_eq!(

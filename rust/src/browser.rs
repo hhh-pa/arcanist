@@ -1,33 +1,69 @@
 //! Shared `--browse` support, mirroring `openURIsInBrowser()` and
-//! `getBrowserCommand()` (`src/workflow/ArcanistWorkflow.php:2150-2208`).
+//! `getBrowserCommand()` (`src/workflow/ArcanistWorkflow.php:2148-2207`
+//! at ceb).
 //!
-//! The browser command comes from the `browser` config value (a string is
-//! one argument, a list is the full argv); without one, Windows uses
-//! `cmd /c start` and other systems scan `sensible-browser`, `xdg-open`,
-//! then `open --`. Each URI is opened in turn; the first failure aborts
-//! with PHP's error.
+//! The browser command comes from the `browser` config value (a truthy
+//! scalar is one argument, a non-empty list is the full argv, each item
+//! string-cast like PHP); without one, Windows uses `cmd /c start` and
+//! other systems scan `sensible-browser`, `xdg-open`, then `open --`.
+//! Each URI is opened in turn; the first failure aborts with PHP's error.
 
 use std::path::Path;
 
 use crate::{config, diff, get_config};
 
-/// A `browser` config value as argv: a truthy string is one argument, a
-/// list is the full command; anything else (including empty values, which
-/// are falsy upstream) means "unconfigured".
+/// PHP truthiness for a `browser` config value
+/// (`getBrowserCommand()`, `:2169-2173` at ceb, T1153 CORE-63):
+/// `null`, `false`, `0`, `""`, `"0"`, and empty arrays/objects are
+/// falsy (unconfigured); everything else runs.
+fn is_truthy(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(flag) => *flag,
+        serde_json::Value::Number(number) => {
+            number.as_i64().is_none_or(|n| n != 0)
+                && number.as_u64().is_none_or(|n| n != 0)
+                && number.as_f64().is_none_or(|n| n != 0.0)
+        }
+        serde_json::Value::String(text) => !text.is_empty() && text != "0",
+        serde_json::Value::Array(items) => !items.is_empty(),
+        serde_json::Value::Object(map) => !map.is_empty(),
+    }
+}
+
+/// PHP string cast for one argv element: strings pass through, numbers
+/// render (`42`, `4.5`), `true` is `"1"`, `null` is `""`; nested
+/// arrays/objects have no sane spelling and are dropped.
+fn cast_element(item: &serde_json::Value) -> Option<String> {
+    match item {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Bool(true) => Some("1".to_string()),
+        serde_json::Value::Bool(false) => Some(String::new()),
+        serde_json::Value::Null => Some(String::new()),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => None,
+    }
+}
+
+/// A `browser` config value as argv (`openURIsInBrowser()`, `:2148-2154`
+/// at ceb, T1153 CORE-63): a truthy scalar is one argument, a
+/// non-empty list is the full command; falsy values (including empty
+/// ones, which are falsy upstream) mean "unconfigured".
 #[must_use]
 pub fn configured_argv(value: &serde_json::Value) -> Option<Vec<String>> {
+    if !is_truthy(value) {
+        return None;
+    }
     match value {
-        serde_json::Value::String(command) if !command.is_empty() && command != "0" => {
-            Some(vec![command.clone()])
-        }
         serde_json::Value::Array(items) => {
-            let argv: Vec<String> = items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_string))
-                .collect();
+            let argv: Vec<String> = items.iter().filter_map(cast_element).collect();
             if argv.is_empty() { None } else { Some(argv) }
         }
-        _ => None,
+        serde_json::Value::Object(map) => {
+            let argv: Vec<String> = map.values().filter_map(cast_element).collect();
+            if argv.is_empty() { None } else { Some(argv) }
+        }
+        scalar => cast_element(scalar).map(|single| vec![single]),
     }
 }
 

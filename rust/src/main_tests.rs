@@ -6,6 +6,8 @@ fn args(v: &[&str]) -> Vec<String> {
 
 #[test]
 fn classifies_help_and_version() {
+    // T1153 CORE-22: `--version`/`-V` are additive (PHP has no such
+    // flag; bare `arc` asks to choose a workflow).
     assert_eq!(classify(&args(&["--help"])), Action::Help);
     assert_eq!(classify(&args(&["-h"])), Action::Help);
     assert_eq!(classify(&args(&["help"])), Action::Help);
@@ -93,7 +95,7 @@ fn renders_call_conduit_envelope() {
 
 #[test]
 fn call_conduit_execute_rejects_bad_stdin_without_io() {
-    // T1153 R4 (CORE-6): the stdin error is an `ArcanistUsageException`
+    // T1153 CORE-6 (R4): the stdin error is an `ArcanistUsageException`
     // in the toolset runtime, which escapes into a PHP fatal (255),
     // not a caught exit 1.
     let args = CallArgs {
@@ -110,7 +112,7 @@ fn call_conduit_execute_rejects_bad_stdin_without_io() {
 
 #[test]
 fn call_conduit_execute_reports_missing_token_without_io() {
-    // T1153 R4 (CORE-6): conduit setup failures escape the toolset
+    // T1153 CORE-6 (R4): conduit setup failures escape the toolset
     // runtime into a PHP fatal (255), like transport failures.
     let args = CallArgs {
         method: "m".to_string(),
@@ -373,6 +375,8 @@ fn call_conduit_accepts_help_flags() {
     assert!(CALL_CONDUIT_USAGE.contains("Call Conduit API methods."));
     assert!(CALL_CONDUIT_USAGE.contains("call-conduit -- method"));
     assert!(CALL_CONDUIT_USAGE.contains("conduit.ping"));
+    // T1153 CORE-67: the ceb help names Phabricator, not "writing scripts".
+    assert!(CALL_CONDUIT_USAGE.contains("integrate\nwith Phabricator"));
 }
 
 #[test]
@@ -485,6 +489,15 @@ fn core16_classic_unique_prefix_runs() {
             notice: None
         }
     ));
+    // T1153 CORE-66: `browse` is a concrete PHP workflow, so its
+    // unique prefix resolves (unlike the abstract `markers`).
+    assert!(matches!(
+        resolve_command("bro", false),
+        Resolution::Run {
+            name: "browse",
+            notice: None
+        }
+    ));
 }
 
 #[test]
@@ -514,6 +527,7 @@ fn core16_dash_led_names_never_correct() {
 
 #[test]
 fn core20_bare_help_lists_synopses_sorted_with_help() {
+    // T1153 CORE-20: the full WORKFLOWS reference with synopses.
     let text = render_help_bare(false, false);
     assert!(text.starts_with("WORKFLOWS\n\n"));
     assert!(text.contains("Amend the working copy, synchronizing the local commit message."));
@@ -552,6 +566,7 @@ fn core20_legacy_synopsis_keeps_source_indent() {
 
 #[test]
 fn core66_prompts_and_shell_complete_listed() {
+    // T1153 CORE-66: `prompts` and `shell-complete` are listed.
     let text = render_help_bare(false, false);
     assert!(text.contains("prompts workflow"));
     assert!(text.contains("Install shell completion."));
@@ -595,7 +610,9 @@ fn unitu22_global_flags_strip_after_command() {
 
 #[test]
 fn rbd3_strips_valued_and_repeat_globals() {
-    // `--config` precedes any non-flag word (initial-only), like PHP.
+    // T1153 CORE-34: `--config`/`--config-file`/`--arcrc-file`
+    // (plus conduit overrides) strip like PHP; `--config` precedes
+    // any non-flag word (initial-only).
     let (rest, globals) = strip_globals(&args(&[
         "--config",
         "base=a",
@@ -691,6 +708,8 @@ fn rbd3_classic_only_errors_use_subprocess_arm() {
 
 #[test]
 fn core17_terminator_needed_only_for_toolset_without_dashes() {
+    // T1153 CORE-17: piped toolset runs (including `call-conduit`)
+    // require `--`; classic commands do not gate here.
     assert!(needs_terminator_error(&args(&["land"])));
     assert!(needs_terminator_error(&args(&["help"])));
     assert!(needs_terminator_error(&args(&["call-conduit", "m"])));
@@ -704,6 +723,8 @@ fn core17_terminator_needed_only_for_toolset_without_dashes() {
 
 #[test]
 fn core19_classic_set_matches_ceb() {
+    // T1153 CORE-19: the classic subprocess sets `ARCANIST` for
+    // exactly the 16 legacy workflows (`scripts/arcanist.php:229`).
     for name in ["diff", "which", "list", "tasks", "todo", "get-config"] {
         assert!(is_classic_command(name), "{name}");
     }
@@ -718,7 +739,9 @@ fn core19_classic_set_matches_ceb() {
         assert!(!is_classic_command(name), "{name}");
     }
     assert_eq!(CLASSIC_COMMANDS.len(), 16);
-    assert_eq!(ALL_WORKFLOWS.len(), 36);
+    // T1153 CORE-66: 37 concrete workflows at ceb (`browse` is real;
+    // only `markers` is abstract).
+    assert_eq!(ALL_WORKFLOWS.len(), 37);
 }
 
 #[test]

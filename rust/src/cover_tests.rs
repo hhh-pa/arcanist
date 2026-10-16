@@ -91,7 +91,7 @@ fn commit_msg(dir: &Path, name: &str, contents: &str, message: &str) {
 }
 
 /// Canonical cover call with empty stdin, non-TTY, and no user file
-/// (COVER-C1: config-isolated and prompt-free).
+/// (T1153 COVER-C1: config-isolated and prompt-free).
 fn cover_opts(dir: &Path, options: &Options, input: &str, tty: bool) -> Result<String, String> {
     let mut cursor = std::io::Cursor::new(input.as_bytes().to_vec());
     execute_cover_text_ansi_with_input_and_config(
@@ -109,7 +109,7 @@ fn cover(dir: &Path, v: &[&str]) -> Result<String, String> {
     cover_opts(dir, &options(v), "", false)
 }
 
-/// COVER-C1: pin the default base via the scratch file (prompt-free).
+/// T1153 COVER-C1: pin the default base via the scratch file (prompt-free).
 fn write_scratch(dir: &Path, relative: &str) {
     let git_dir = git(dir, &["rev-parse", "--git-dir"]);
     let arc_dir = dir.join(git_dir).join("arc");
@@ -117,7 +117,7 @@ fn write_scratch(dir: &Path, relative: &str) {
     std::fs::write(arc_dir.join("default-relative-commit"), relative).unwrap();
 }
 
-/// COVER-C1: point the current branch's upstream at `target`.
+/// T1153 COVER-C1: point the current branch's upstream at `target`.
 fn set_upstream(dir: &Path, target: &str) {
     let branch = git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]);
     git(dir, &["update-ref", "refs/remotes/origin/master", target]);
@@ -171,7 +171,7 @@ fn parses_rev_paths_and_help() {
         })
     );
     assert_eq!(parse_args(&args(&["--help"])), ParseOutcome::Help);
-    // COVER-C14: PHP argument-parser bytes.
+    // T1153 COVER-C14: PHP argument-parser bytes.
     assert_eq!(
         parse_args(&args(&["--rev"])),
         ParseOutcome::Error("Option '--rev' requires a parameter.".to_string())
@@ -219,7 +219,7 @@ fn hunk_headers_yield_old_and_new_offsets() {
 #[test]
 fn cover_map_tracks_old_side_lines() {
     // Modify middle line: `-` covers old 2; `+` covers old 2 and 3.
-    // COVER-C5: PHP keys dedupe, so the repeated 2 appears once.
+    // T1153 COVER-C5: PHP keys dedupe, so the repeated 2 appears once.
     let diff = "diff --git a/f.txt b/f.txt\n\
          index 1111111..2222222 100644\n\
          --- a/f.txt\n\
@@ -241,7 +241,7 @@ fn cover_map_tracks_old_side_lines() {
 #[test]
 fn cover_map_marks_insertion_neighbors() {
     // Pure insertion after old line 5 covers old 4 and 5 per added line.
-    // COVER-C5: deduped to one pair.
+    // T1153 COVER-C5: deduped to one pair.
     let diff = "diff --git a/f.txt b/f.txt\n\
          --- a/f.txt\n\
          +++ b/f.txt\n\
@@ -281,7 +281,7 @@ fn cover_map_tracks_deletions_and_new_files() {
                 lines: vec![2, 3],
             },
             // New files cover old line 0 (the PHP quirk); callers prune
-            // added files and never attribute line 0. COVER-C5: deduped.
+            // added files and never attribute line 0. T1153 COVER-C5: deduped.
             FileChanges {
                 path: "new.txt".to_string(),
                 lines: vec![0],
@@ -295,7 +295,7 @@ fn corpus_lines_beat_section_headers_by_count() {
     // An added line reading `+++ foo` must stay corpus: the hunk expects
     // exactly one new line, so the `+++` prefix never misroutes. The `+`
     // covers old 1 (predecessor, since old_line is 2) and old 2.
-    // COVER-C5: deduped.
+    // T1153 COVER-C5: deduped.
     let diff = "diff --git a/f.txt b/f.txt\n\
          --- a/f.txt\n\
          +++ b/f.txt\n\
@@ -505,11 +505,11 @@ fn worktree_edits_attribute_base_authors() {
     commit_as(tmp.path(), "f.txt", "one\ntwo\nthree\nfour\n", "ann");
     commit_as(tmp.path(), "f.txt", "one\ntwo\nthree\nfour\nfive\n", "bob");
     std::fs::write(tmp.path().join("f.txt"), "one\ntwo\nthree\nFOUR\nfive\n").unwrap();
-    // COVER-C1: the default chain prompts without a configured base, so
+    // T1153 COVER-C1: the default chain prompts without a configured base, so
     // pin HEAD via the scratch file to keep the historical base.
     write_scratch(tmp.path(), "HEAD");
     // `-` covers old 4 (ann); `+` covers old 4 and 5 (ann, bob).
-    // COVER-C5: deduped, so each author owns one line (singular noun).
+    // T1153 COVER-C5: deduped, so each author owns one line (singular noun).
     assert_eq!(
         cover(tmp.path(), &[]),
         Ok("ann\n  f.txt: line 4\nbob\n  f.txt: line 5\n".to_string())
@@ -541,7 +541,7 @@ fn ranges_cover_committed_lines_since_rev() {
     commit_as(tmp.path(), "f.txt", "one\nTWO!\nthree\n", "bob");
     // Base is the merge-base of HEAD~1 and HEAD; blame runs there, so old
     // 2 attributes to yara while root-commit old 3 stays boundary.
-    // COVER-C5: deduped to one line (singular noun).
+    // T1153 COVER-C5: deduped to one line (singular noun).
     assert_eq!(
         execute_cover_text_ansi(tmp.path(), &options(&["--rev", "HEAD~1"]), false),
         Ok("yara\n  f.txt: line 2\n".to_string())
@@ -653,6 +653,7 @@ fn run_reports_help_and_usage_errors() {
 
 #[test]
 fn cover_c2_blame_attributes_correct_line() {
+    // T1153 COVER-C2 (Rule 2a keep): blame attributes the correct line.
     // Keep (Rule 2a): PHP looks the 1-based line up in a 0-indexed
     // list, attributing the next line's author; Rust attributes line
     // N to blame entry N-1. Experiment: three single-author lines,
@@ -689,6 +690,7 @@ fn cover_c2_blame_attributes_correct_line() {
 
 #[test]
 fn cover_c3_boundary_lines_keep_indexes_stable() {
+    // T1153 COVER-C3 (Rule 2a keep): boundary lines keep indexes stable.
     // Keep (Rule 2a): PHP drops boundary lines, shifting later
     // indexes; Rust preserves them flagged, so line N still maps to
     // entry N-1 and boundary lines stay unattributed.
@@ -719,6 +721,7 @@ fn cover_c3_boundary_lines_keep_indexes_stable() {
 
 #[test]
 fn cover_c4_blame_failure_stays_unattributed() {
+    // T1153 COVER-C4 (Rule 2a keep): blame failure stays unattributed.
     // Keep (Rule 2a): PHP fatals when a passed file cannot be blamed
     // at the base; Rust leaves it unattributed with exit 0.
     let tmp = init_repo("c4");
@@ -733,6 +736,7 @@ fn cover_c4_blame_failure_stays_unattributed() {
 
 #[test]
 fn cover_c5_first_line_change_uses_singular_noun() {
+    // T1153 COVER-C5: cover lines dedupe like PHP.
     // Deleting the only second line covers just old 2: a single
     // deduped line renders with the singular noun.
     let diff = "diff --git a/f.txt b/f.txt\n\
@@ -752,6 +756,7 @@ fn cover_c5_first_line_change_uses_singular_noun() {
 
 #[test]
 fn cover_c6_files_keep_cli_order() {
+    // T1153 COVER-C6: files keep CLI order under one author.
     // Files under one author render in first-seen (CLI/diff) order,
     // not alphabetical.
     let mut covers: Covers = Vec::new();
@@ -777,6 +782,7 @@ fn cover_c6_files_keep_cli_order() {
 
 #[test]
 fn cover_c7_bad_path_beats_bad_rev() {
+    // T1153 COVER-C7: a bad path beats a bad rev.
     let tmp = init_repo("c7");
     commit_file(tmp.path(), "f.txt", "one\n");
     assert_eq!(
@@ -791,6 +797,7 @@ fn cover_c7_bad_path_beats_bad_rev() {
 
 #[test]
 fn cover_c8_empty_rev_means_default_base() {
+    // T1153 COVER-C8: empty `--rev` means the default base.
     let tmp = init_repo("c8");
     commit_file(tmp.path(), "f.txt", "one\n");
     // Empty `--rev=` behaves like no `--rev`: a clean tree reports no
@@ -803,6 +810,7 @@ fn cover_c8_empty_rev_means_default_base() {
 
 #[test]
 fn cover_c9_empty_tree_rev_is_accepted() {
+    // T1153 COVER-C9: the empty-tree rev is accepted.
     let tmp = init_repo("c9");
     commit_file(tmp.path(), "f.txt", "one\n");
     // The magic empty-tree commit resolves as a base instead of
@@ -820,6 +828,7 @@ fn cover_c9_empty_tree_rev_is_accepted() {
 
 #[test]
 fn cover_c10_single_commit_repo_reports_untouched() {
+    // T1153 COVER-C10 (Rule 2a keep): one-commit repos report untouched.
     // Keep (Rule 2a): PHP fatals on one-commit repos; Rust attributes
     // against HEAD where every line is boundary, hence untouched.
     let tmp = init_repo("c10");
@@ -833,11 +842,12 @@ fn cover_c10_single_commit_repo_reports_untouched() {
 
 #[test]
 fn cover_c11_absolute_paths_select_files() {
+    // T1153 COVER-C11: absolute paths select files.
     let tmp = init_repo("c11");
     commit_as(tmp.path(), "f.txt", "one\ntwo\nthree\n", "zelda");
     commit_as(tmp.path(), "f.txt", "one\ntwo\nthree\nfour\n", "ann");
     std::fs::write(tmp.path().join("f.txt"), "one\ntwo\nthree\nFOUR\n").unwrap();
-    // COVER-C1: pin HEAD via the scratch file so the default chain stays
+    // T1153 COVER-C1: pin HEAD via the scratch file so the default chain stays
     // prompt-free on this two-commit repo.
     write_scratch(tmp.path(), "HEAD");
     let absolute = tmp.path().join("f.txt").to_string_lossy().into_owned();
@@ -849,6 +859,7 @@ fn cover_c11_absolute_paths_select_files() {
 
 #[test]
 fn cover_c12_author_zero_is_attributed() {
+    // T1153 COVER-C12 (Rule 2a keep): author "0" is attributed.
     // Keep (Rule 2a): PHP's falsy check drops author "0"; Rust
     // attributes every non-empty author.
     let mut covers: Covers = Vec::new();
@@ -869,6 +880,7 @@ fn cover_c12_author_zero_is_attributed() {
 
 #[test]
 fn cover_c14_arg_errors_use_php_bytes() {
+    // T1153 COVER-C14: argument errors use PHP bytes.
     assert_eq!(
         parse_args(&args(&["-x"])),
         ParseOutcome::Error("Unknown argument 'x'. Try 'arc help'.".to_string())
@@ -881,6 +893,7 @@ fn cover_c14_arg_errors_use_php_bytes() {
 
 #[test]
 fn cover_c15_help_uses_php_wording() {
+    // T1153 COVER-C15: help uses PHP wording.
     let help = super::usage();
     assert!(help.contains("usage: arc cover [--rev revision] [path ...]"));
     assert!(help.contains("Cover your... professional reputation."));
@@ -889,6 +902,7 @@ fn cover_c15_help_uses_php_wording() {
 
 #[test]
 fn cover_c16_merge_base_has_no_dashdash() {
+    // T1153 COVER-C16: merge-base argv carries no `--`.
     // The argv shape is fixed by `resolve_rev_base`; a bad rev still
     // reports the PHP bytes through the bare `merge-base` call.
     let tmp = init_repo("c16");
@@ -899,7 +913,7 @@ fn cover_c16_merge_base_has_no_dashdash() {
     );
 }
 
-/// Three-commit repo for COVER-C1 base-selection tests: with the base at
+/// Three-commit repo for T1153 COVER-C1 base-selection tests: with the base at
 /// the middle commit, the worktree edit attributes line 2 to yara.
 fn c1_repo(tag: &str) -> TempDir {
     let tmp = init_repo(tag);
@@ -1225,6 +1239,7 @@ fn cover_c1_tokenizer_drops_falsy_rules() {
 
 #[test]
 fn cover_c11_outside_paths_contribute_nothing() {
+    // T1153 COVER-C11: absolute paths select files.
     // Paths outside the repo can never match diff output: like PHP's
     // hunk-map miss they stay unattributed, never a git failure.
     let tmp = init_repo("c11-out");
@@ -1240,6 +1255,7 @@ fn cover_c11_outside_paths_contribute_nothing() {
 
 #[test]
 fn cover_c13_svn_and_hg_stay_unported() {
+    // T1153 COVER-C13 (Rule 3): svn/hg cover stays unported (T1128).
     // Rule 3 (T1128): svn/hg cover is unported; the refusals stay put.
     let hg = TempDir::new("c13-hg");
     std::fs::create_dir(hg.path().join(".hg")).unwrap();

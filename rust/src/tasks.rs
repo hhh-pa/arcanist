@@ -294,7 +294,9 @@ pub fn parse_task(value: &serde_json::Value) -> Option<Task> {
     })
 }
 
-/// Rows of a `maniphest.query` result, whether it is a list or a map.
+/// Rows of a `maniphest.query` result, whether it is a list or a map
+/// (T1153 RB-D26: server order, not sorted — `preserve_order` keeps
+/// the map's insertion order, matching PHP's `foreach`).
 #[must_use]
 pub fn parse_tasks(result: &serde_json::Value) -> Vec<Task> {
     let items: Vec<&serde_json::Value> = match result {
@@ -514,12 +516,12 @@ pub fn run(argv: &[String]) -> ExitCode {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
         }
-        // T1153 R4 (RB-D4): `tasks` is a subprocess workflow:
+        // T1153 RB-D4 (R4): `tasks` is a subprocess workflow:
         // usage errors render `Usage Exception:` with no usage dump
         // (`scripts/arcanist.php:432-444`).
         Err(msg) => return conduit::report(EnvelopeKind::Usage, &msg),
     };
-    // T1153 CORE-4/CORE-9: classic `requiresAuthentication` startup
+    // T1153 CORE-4/T1153 CORE-9: classic `requiresAuthentication` startup
     // (tokenless engine, credential gate, `user.whoami` /
     // `conduit.connect` verification).
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));

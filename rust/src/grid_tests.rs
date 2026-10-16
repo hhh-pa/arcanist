@@ -82,6 +82,14 @@ fn truncates_at_word_boundaries() {
 }
 
 #[test]
+fn rbd35_odd_cutoff_searches_from_the_ceiling() {
+    // T1153 RB-D35: PHP's `$cutoff / 2` is float division, so with
+    // maximum 8 (cutoff 7) the break search starts at glyph 4, not 3:
+    // the space at 3 is out of reach and the cut lands at 7.
+    assert_eq!(truncate_glyphs("abc defghijklmnop", 8), "abc def…");
+}
+
+#[test]
 fn truncates_at_stop_characters_without_terminator() {
     assert_eq!(truncate_glyphs("hello. bye friend", 8), "hello.");
 }
@@ -167,6 +175,7 @@ fn pads_and_truncates_center_and_right_columns() {
 
 #[test]
 fn empty_grid_renders_like_php() {
+    // T1153 RB-D36: the empty row list string-casts to `Array`.
     let grid = markers_grid();
     assert_eq!(grid.draw(Some(80)), "Array\n");
 }

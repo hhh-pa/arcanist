@@ -292,7 +292,7 @@ fn core2_no_user_agent_header_sent() {
     assert_eq!(header_value(&seen.1, "user-agent"), None);
 }
 
-// T1153 CORE-13/RB-D7: with `preserve_order`, request params keep
+// T1153 CORE-13/T1153 RB-D7: with `preserve_order`, request params keep
 // insertion order like PHP's arrays (the sorted-`BTreeMap` era ended
 // with Wave-1 R8); servers ignore order either way.
 #[test]

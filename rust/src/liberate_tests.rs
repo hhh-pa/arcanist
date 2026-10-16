@@ -134,18 +134,48 @@ fn creates_init_file_in_existing_directory() {
 
 #[test]
 fn declines_missing_directory() {
+    // T1153 CORE-51: a decline aborts with the `cancelled:` abort
+    // text (the `---` arm strips the prefix at the CLI layer).
     let dir = scratch("decline");
     let lib = dir.join("nope");
     let mut input = BufReader::new(std::io::Cursor::new("n\n"));
-    assert!(ensure_library(&lib, &mut input).is_err());
+    let err = ensure_library(&lib, &mut input).unwrap_err();
+    assert!(err.contains("User aborted the workflow."), "{err}");
     assert!(!lib.exists());
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
+fn core52_create_prompt_requires_a_tty() {
+    // T1153 CORE-52: off-TTY the create-directory prompt echoes its
+    // query and throws (`ArcanistPrompt.php:77-86` at ceb), even with
+    // a piped answer waiting.
+    let dir = scratch("tty-gate");
+    let lib = dir.join("nope");
+    let mut input = BufReader::new(std::io::Cursor::new("y\n"));
+    let mut noop = |_: crate::prompts::PromptScope, _: &str| Ok(());
+    let err = ensure_library_with(&lib, &mut input, false, None, &mut noop).unwrap_err();
+    assert!(err.contains("attempting to read user input"), "{err}");
+    assert!(!lib.exists());
+    // Same through the workflow seam.
+    let mut input = BufReader::new(std::io::Cursor::new("y\nmy-lib\n"));
+    let err = execute_with_input(&dir, &argv(&["nope"]), &mut input, false).unwrap_err();
+    assert!(err.contains("attempting to read user input"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn core55_synopsis_matches_php() {
+    // T1153 CORE-55: the synopsis transcribes PHP verbatim
+    // (`ArcanistLiberateWorkflow.php:14-20` at ceb).
+    assert!(usage().contains("Create or update an Arcanist library."));
+}
+
+#[test]
 fn eof_while_naming_library_cancels() {
-    // A 0-byte `read_line` (EOF) must surface the `cancelled` error, not
-    // map to `Some("")` and re-prompt forever.
+    // T1153 CORE-54 (kept): a 0-byte `read_line` (EOF) must surface
+    // the `cancelled` error, not map to `Some("")` and re-prompt
+    // forever like PHP.
     let mut input = BufReader::new(std::io::Cursor::new(""));
     let err = ask_library_name(&mut input).expect_err("EOF must cancel, not loop");
     assert!(err.contains("cancelled"), "{err}");
@@ -158,8 +188,9 @@ fn eof_while_naming_library_cancels() {
 
 #[test]
 fn ancient_and_unknown_versions_are_usage_errors() {
-    // Ancient (v1, including a missing map) and unknown versions abort
-    // with `Err`, which the `run_in` layer maps to exit 1.
+    // T1153 CORE-53: ancient (v1, including a missing map) and unknown
+    // versions abort with `Err`, which the `run_in` layer maps to a
+    // fatal (255).
     let dir = scratch("versions");
     let old = dir.join("oldlib");
     std::fs::create_dir_all(&old).unwrap();
@@ -170,10 +201,10 @@ fn ancient_and_unknown_versions_are_usage_errors() {
     std::fs::write(weird.join(MAP_FILE), "@phutil-library-version 7\n").unwrap();
 
     let mut input = BufReader::new(std::io::Cursor::new(""));
-    let err = execute_with_input(&dir, &argv(&["oldlib"]), &mut input).unwrap_err();
+    let err = execute_with_input(&dir, &argv(&["oldlib"]), &mut input, true).unwrap_err();
     assert!(err.contains("no longer supported"), "{err}");
     let mut input = BufReader::new(std::io::Cursor::new(""));
-    let err = execute_with_input(&dir, &argv(&["weirdlib"]), &mut input).unwrap_err();
+    let err = execute_with_input(&dir, &argv(&["weirdlib"]), &mut input, true).unwrap_err();
     assert!(err.contains("Unknown library version '7'"), "{err}");
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -343,7 +374,7 @@ fn rebuild_failure_stays_per_library_failure() {
 
 #[test]
 fn run_in_fails_on_usage_errors() {
-    // T1153 R4 (CORE-21, CORE-53): parser errors exit 1 under the
+    // T1153 CORE-21 / T1153 CORE-53 (R4): parser errors exit 1 under the
     // `USAGE EXCEPTION` label, but no-libraries-found throws
     // `ArcanistUsageException`, which escapes the toolset runtime
     // into a PHP fatal (255). Help still succeeds.
@@ -403,12 +434,12 @@ fn r4_core53_error_kinds() {
 
 #[test]
 fn r4_core21_decline_reports_user_abort() {
-    // Declining the create-directory prompt fails with `cancelled:`,
-    // routed to the `---` arm (exit 1).
+    // T1153 CORE-51: declining the create-directory prompt fails
+    // with `cancelled:`, routed to the `---` arm (exit 1).
     let dir = scratch("r4-decline");
     let input = "n\n";
     let mut reader = BufReader::new(input.as_bytes());
-    let err = execute_with_input(&dir, &argv(&["newlib"]), &mut reader).unwrap_err();
+    let err = execute_with_input(&dir, &argv(&["newlib"]), &mut reader, true).unwrap_err();
     assert!(err.starts_with("cancelled: "), "{err}");
     assert_eq!(
         classify_error(&argv(&["newlib"]), err).kind,
@@ -419,7 +450,7 @@ fn r4_core21_decline_reports_user_abort() {
 
 #[test]
 fn core50_rebuild_failure_still_succeeds_silently() {
-    // No `support/` tree above scratch: the rebuild fails, but the
+    // T1153 CORE-50: no `support/` tree above scratch, so the rebuild fails, but the
     // run still succeeds with no failure text (DONE prints always).
     let dir = scratch("core50");
     let lib = dir.join("lib");
@@ -427,7 +458,7 @@ fn core50_rebuild_failure_still_succeeds_silently() {
     std::fs::write(lib.join(INIT_FILE), "<?php\n").unwrap();
     std::fs::write(lib.join(MAP_FILE), "@phutil-library-version 2\n").unwrap();
     let mut input = BufReader::new(std::io::Cursor::new(""));
-    let out = execute_with_input(&dir, &argv(&["lib"]), &mut input).unwrap();
+    let out = execute_with_input(&dir, &argv(&["lib"]), &mut input, true).unwrap();
     assert!(out.is_empty(), "{out:?}");
     std::fs::remove_dir_all(&dir).ok();
 }

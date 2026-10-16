@@ -14,6 +14,11 @@
 //! [`uncommitted_paths`], and [`render_uncommitted_block`] remain as the
 //! checkout-based (`git pull`) port for library checkouts; the live
 //! `--apply` path replaces the binary and does not use them.
+//!
+//! Redesign note (T1153 CORE-56, kept): PHP pulls the install
+//! checkout (`git pull --rebase`), which is unportable — a static
+//! binary has no checkout to pull. Bare `arc upgrade` reports,
+//! `--apply` replaces the binary from release assets instead.
 
 extern crate self as arc_rs;
 
