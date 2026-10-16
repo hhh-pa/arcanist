@@ -437,6 +437,92 @@ fn split_flag_value(text: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// Split one argv token into its dash prefix and flag body (`None`
+/// for positionals, which the caller copies to `rest`). Any single
+/// dash prefixes `-h` (PHP's global parser accepts help flags on any
+/// workflow).
+fn standard_token_kind(arg: &str) -> Option<(&str, &str)> {
+    if let Some(body) = arg.strip_prefix("--") {
+        Some(("--", body))
+    } else if arg.len() > 1 && arg.starts_with('-') && !arg.starts_with("--") {
+        Some(("-", &arg[1..]))
+    } else {
+        None
+    }
+}
+
+/// True for the standard-argument names (boolean or valued).
+fn is_standard_flag(canonical: &str) -> bool {
+    matches!(
+        canonical,
+        "trace" | "no-ansi" | "ansi" | "help" | "show-standard-options" | "recon" | "xprofile"
+    )
+}
+
+/// Take a valued standard parameter (inline or the next token),
+/// returning the value and the argv slots consumed.
+fn standard_valued_param(
+    typed: &str,
+    inline: Option<&str>,
+    next: Option<&str>,
+) -> Result<(String, usize), String> {
+    match inline {
+        Some(value) => Ok((value.to_owned(), 1)),
+        None => {
+            let Some(next) = next else {
+                return Err(format!("Argument \"{typed}\" requires a parameter."));
+            };
+            Ok((next.to_owned(), 2))
+        }
+    }
+}
+
+/// Record one known standard argument into `globals` (`typed` is the
+/// `--name`/`-x` spelling for error texts). Returns the argv slots
+/// consumed (2 when a valued parameter comes from the next token).
+fn standard_consume_flag<'a>(
+    globals: &mut Globals,
+    seen: &mut std::collections::HashSet<&'a str>,
+    canonical: &'a str,
+    typed: &str,
+    inline: Option<&str>,
+    known_valued: bool,
+    next: Option<&str>,
+) -> Result<usize, String> {
+    if inline.is_some() && !known_valued {
+        return Err(format!("Argument \"{typed}\" does not take a parameter."));
+    }
+    if !seen.insert(canonical) {
+        return Err(format!("Argument \"{typed}\" was provided twice."));
+    }
+    if known_valued {
+        let (value, consumed) = standard_valued_param(typed, inline, next)?;
+        // `--xprofile` needs XHProf (PHP-only): parsed, ignored.
+        let _ = value;
+        return Ok(consumed);
+    }
+    if canonical == "no-ansi" && seen.contains("ansi") {
+        return Err(format!(
+            "Argument \"{typed}\" conflicts with argument \"--ansi\"."
+        ));
+    }
+    standard_apply_flag(globals, canonical);
+    Ok(1)
+}
+
+/// Apply one boolean standard argument to `globals`.
+fn standard_apply_flag(globals: &mut Globals, canonical: &str) {
+    match canonical {
+        "trace" => globals.trace = true,
+        "no-ansi" => globals.ansi = Some(false),
+        "ansi" => globals.ansi = Some(true),
+        "help" => globals.show_help = true,
+        "show-standard-options" => globals.show_standard_options = true,
+        // `--recon` needs the PHP remote console: parsed, ignored.
+        _ => {}
+    }
+}
+
 /// Phase 1: standard arguments (`parseStandardArguments()`), bold
 /// errors. Consumed anywhere; `--` stops the scan.
 fn strip_standard(argv: &[String], globals: &mut Globals) -> Result<Vec<String>, GlobalError> {
@@ -449,71 +535,33 @@ fn strip_standard(argv: &[String], globals: &mut Globals) -> Result<Vec<String>,
             rest.extend(argv[index..].iter().cloned());
             break;
         }
-        let (pre, body) = if let Some(body) = arg.strip_prefix("--") {
-            ("--", body)
-        } else if arg.len() > 1 && arg.starts_with('-') && !arg.starts_with("--") {
-            ("-", &arg[1..])
-        } else {
+        let Some((pre, body)) = standard_token_kind(arg) else {
             rest.push(arg.clone());
             index += 1;
             continue;
         };
         let (name, inline) = split_flag_value(body);
         let canonical = if pre == "-" { "help" } else { name };
-        let known_bool = matches!(
-            canonical,
-            "trace" | "no-ansi" | "ansi" | "help" | "show-standard-options" | "recon"
-        );
-        let known_valued = canonical == "xprofile";
-        if !known_bool && !known_valued {
+        if !is_standard_flag(canonical) {
             rest.push(arg.clone());
             index += 1;
             continue;
         }
+        let known_valued = canonical == "xprofile";
         let typed = format!("{pre}{name}");
-        if inline.is_some() && !known_valued {
-            return Err(GlobalError::bold(format!(
-                "Argument \"{typed}\" does not take a parameter."
-            )));
+        let next = argv.get(index + 1).map(String::as_str);
+        match standard_consume_flag(
+            globals,
+            &mut seen,
+            canonical,
+            &typed,
+            inline,
+            known_valued,
+            next,
+        ) {
+            Ok(consumed) => index += consumed,
+            Err(message) => return Err(GlobalError::bold(message)),
         }
-        if !seen.insert(canonical) {
-            return Err(GlobalError::bold(format!(
-                "Argument \"{typed}\" was provided twice."
-            )));
-        }
-        if known_valued {
-            let value = match inline {
-                Some(value) => value.to_string(),
-                None => {
-                    let Some(next) = argv.get(index + 1) else {
-                        return Err(GlobalError::bold(format!(
-                            "Argument \"{typed}\" requires a parameter."
-                        )));
-                    };
-                    index += 1;
-                    next.clone()
-                }
-            };
-            // `--xprofile` needs XHProf (PHP-only): parsed, ignored.
-            let _ = value;
-            index += 1;
-            continue;
-        }
-        if canonical == "no-ansi" && seen.contains("ansi") {
-            return Err(GlobalError::bold(format!(
-                "Argument \"{typed}\" conflicts with argument \"--ansi\"."
-            )));
-        }
-        match canonical {
-            "trace" => globals.trace = true,
-            "no-ansi" => globals.ansi = Some(false),
-            "ansi" => globals.ansi = Some(true),
-            "help" => globals.show_help = true,
-            "show-standard-options" => globals.show_standard_options = true,
-            // `--recon` needs the PHP remote console: parsed, ignored.
-            _ => {}
-        }
-        index += 1;
     }
     Ok(rest)
 }
@@ -624,6 +672,63 @@ fn strip_toolset(argv: &[String], globals: &mut Globals) -> Result<Vec<String>, 
     Ok(rest)
 }
 
+/// Consume `--arcrc-file[=value]` (`next` is the following token
+/// for separate parameters). Returns the argv slots consumed (2 when
+/// the parameter comes from the next token).
+fn classic_arcrc_file(
+    globals: &mut Globals,
+    seen: &mut std::collections::HashSet<&str>,
+    inline: Option<&str>,
+    next: Option<&str>,
+) -> Result<usize, String> {
+    let (value, consumed) = match inline {
+        Some(value) => (value.to_owned(), 1),
+        None => {
+            let Some(next) = next else {
+                return Err("Argument \"--arcrc-file\" requires a parameter.".to_string());
+            };
+            (next.to_owned(), 2)
+        }
+    };
+    if !seen.insert("arcrc-file") {
+        return Err("Argument \"--arcrc-file\" was provided twice.".to_string());
+    }
+    globals.arcrc_file = Some(value);
+    Ok(consumed)
+}
+
+/// Consume the boolean `--anonymous` flag.
+fn classic_anonymous(
+    globals: &mut Globals,
+    seen: &mut std::collections::HashSet<&str>,
+    inline: Option<&str>,
+) -> Result<(), String> {
+    if inline.is_some() {
+        return Err("Argument \"--anonymous\" does not take a parameter.".to_string());
+    }
+    if !seen.insert("anonymous") {
+        return Err("Argument \"--anonymous\" was provided twice.".to_string());
+    }
+    globals.anonymous = true;
+    Ok(())
+}
+
+/// Consume `--load-phutil-library` (parsed, ignored: it names PHP
+/// libraries and there is nothing to load in a static binary).
+/// `has_next` is whether a following token exists for a separate
+/// parameter. Returns the argv slots consumed.
+fn classic_phutil_library(inline: Option<&str>, has_next: bool) -> Result<usize, String> {
+    match inline {
+        Some(_) => Ok(1),
+        None => {
+            if !has_next {
+                return Err("Argument \"--load-phutil-library\" requires a parameter.".to_string());
+            }
+            Ok(2)
+        }
+    }
+}
+
 /// Phase 4: classic-only arguments (`scripts/arcanist.php` base args).
 /// PHP consumes these in the classic subprocess (after the toolset
 /// runtime declines the command); the port consumes them in-process
@@ -645,63 +750,23 @@ fn strip_classic(argv: &[String], globals: &mut Globals) -> Result<Vec<String>, 
             continue;
         };
         let (name, inline) = split_flag_value(body);
-        match name {
-            "arcrc-file" => {
-                let value = match inline {
-                    Some(value) => value.to_string(),
-                    None => {
-                        let Some(next) = argv.get(index + 1) else {
-                            return Err(GlobalError::classic(format!(
-                                "Argument \"--{name}\" requires a parameter."
-                            )));
-                        };
-                        index += 1;
-                        next.clone()
-                    }
-                };
-                if !seen.insert("arcrc-file") {
-                    return Err(GlobalError::classic(
-                        "Argument \"--arcrc-file\" was provided twice.".to_string(),
-                    ));
-                }
-                globals.arcrc_file = Some(value);
-                index += 1;
-            }
+        let next = argv.get(index + 1).map(String::as_str);
+        let consumed = match name {
+            "arcrc-file" => classic_arcrc_file(globals, &mut seen, inline, next)
+                .map_err(GlobalError::classic)?,
             "anonymous" => {
-                if inline.is_some() {
-                    return Err(GlobalError::classic(
-                        "Argument \"--anonymous\" does not take a parameter.".to_string(),
-                    ));
-                }
-                if !seen.insert("anonymous") {
-                    return Err(GlobalError::classic(
-                        "Argument \"--anonymous\" was provided twice.".to_string(),
-                    ));
-                }
-                globals.anonymous = true;
-                index += 1;
+                classic_anonymous(globals, &mut seen, inline).map_err(GlobalError::classic)?;
+                1
             }
-            // `--load-phutil-library` names PHP libraries (nothing to
-            // load in a static binary): parsed, ignored.
             "load-phutil-library" => {
-                match inline {
-                    Some(_) => {}
-                    None => {
-                        if index + 1 >= argv.len() {
-                            return Err(GlobalError::classic(format!(
-                                "Argument \"--{name}\" requires a parameter."
-                            )));
-                        }
-                        index += 1;
-                    }
-                }
-                index += 1;
+                classic_phutil_library(inline, next.is_some()).map_err(GlobalError::classic)?
             }
             _ => {
                 rest.push(arg.clone());
-                index += 1;
+                1
             }
-        }
+        };
+        index += consumed;
     }
     Ok(rest)
 }
@@ -2753,44 +2818,107 @@ fn dispatch(argv: &[String]) -> ExitCode {
 /// test greps it) ahead of the full workflow reference (RB-D5).
 const BARE_HELP_LEAD: &str = "usage: arc [--version] [--help] <command>\n\n";
 
-fn dispatch_inner(argv: &[String], globals: &Globals) -> ExitCode {
-    if argv.is_empty() {
-        if globals.show_help {
-            print!(
-                "{BARE_HELP_LEAD}{}",
-                render_help_bare(globals.show_standard_options, terminal::ansi_enabled())
-            );
-            return ExitCode::SUCCESS;
-        }
-        return conduit::report(conduit::EnvelopeKind::ToolsetUsage, "Choose a workflow!");
-    }
-    if argv.first().is_some_and(|first| first == "help") {
-        let mut names = argv[1..].to_vec();
-        if names.first().is_some_and(|name| name == "--") {
-            names.remove(0);
-        }
-        return run_help(&names, globals.show_standard_options);
-    }
-    // `--help` anywhere routes to detailed help (`cmd FLOW --help`
-    // runs `cmd help FLOW`): resolve first so typos still report the
-    // unknown-command error.
+/// Dispatch a bare `arc` (no command word).
+fn dispatch_empty(globals: &Globals) -> ExitCode {
     if globals.show_help {
-        use std::io::IsTerminal;
-        let interactive = std::io::stdin().is_terminal();
-        let first = argv[0].clone();
-        if first == "call-conduit" {
-            return run_help(&["call-conduit".to_string()], globals.show_standard_options);
-        }
-        return match resolve_command(&first, interactive) {
-            Resolution::Run { name, .. } => {
-                run_help(&[name.to_string()], globals.show_standard_options)
-            }
-            Resolution::Unknown { message } => {
-                conduit::report(conduit::EnvelopeKind::Usage, &message)
-            }
-        };
+        print!(
+            "{BARE_HELP_LEAD}{}",
+            render_help_bare(globals.show_standard_options, terminal::ansi_enabled())
+        );
+        return ExitCode::SUCCESS;
     }
-    match classify(argv) {
+    conduit::report(conduit::EnvelopeKind::ToolsetUsage, "Choose a workflow!")
+}
+
+/// Dispatch with `--help` anywhere (`cmd FLOW --help` runs `cmd help
+/// FLOW`): resolve first so typos still report the unknown-command
+/// error. `argv` is non-empty (checked by the caller).
+fn dispatch_help_flag(argv: &[String], globals: &Globals) -> ExitCode {
+    use std::io::IsTerminal;
+    let interactive = std::io::stdin().is_terminal();
+    let first = argv[0].clone();
+    if first == "call-conduit" {
+        return run_help(&["call-conduit".to_string()], globals.show_standard_options);
+    }
+    match resolve_command(&first, interactive) {
+        Resolution::Run { name, .. } => {
+            run_help(&[name.to_string()], globals.show_standard_options)
+        }
+        Resolution::Unknown { message } => conduit::report(conduit::EnvelopeKind::Usage, &message),
+    }
+}
+
+/// Report a `call-conduit` argument error: the method-count error is a
+/// `runWorkflow()` usage error (red label); flag errors are parser
+/// errors (bold label). Exits match at 1 either way.
+fn report_call_conduit_error(msg: &str) -> ExitCode {
+    let kind = if msg == "Provide exactly one Conduit method name to call." {
+        conduit::EnvelopeKind::ToolsetUsage
+    } else {
+        conduit::EnvelopeKind::ToolsetParseError
+    };
+    conduit::report(kind, msg)
+}
+
+/// Map a resolved command name to its runner (`None` for `help`, which
+/// renders the bare help instead of running a workflow).
+fn resolve_runner(name: &str) -> Option<CommandFn> {
+    match name {
+        "help" => None,
+        "prompts" => Some(prompts::run),
+        "shell-complete" => Some(shell_complete::run),
+        _ => find_command(name),
+    }
+}
+
+/// Run a resolved command: print its spelling notice, export the
+/// classic name for hooks, then run.
+fn dispatch_run(
+    name: &'static str,
+    notice: Option<&str>,
+    first: &str,
+    argv: &[String],
+    globals: &Globals,
+) -> ExitCode {
+    if let Some(notice) = notice {
+        let ansi = terminal::ansi_enabled();
+        eprint!(
+            "{}",
+            terminal::tsprintf_ansi("%s\n", &[terminal::TVal::Text(notice)], ansi)
+                .map(|t| t.to_string())
+                .unwrap_or_default()
+        );
+    }
+    if is_classic_command(name) {
+        // The classic subprocess exports the resolved command for
+        // hooks (`scripts/arcanist.php:229`).
+        arc_rs::globals::set_command_name(name.to_string());
+    }
+    match resolve_runner(name) {
+        Some(run) => run(&argv[1..]),
+        None if name == "help" => run_help(&[], globals.show_standard_options),
+        None => conduit::report(
+            conduit::EnvelopeKind::Usage,
+            &format_unknown_command(&first.to_lowercase(), &[]),
+        ),
+    }
+}
+
+/// Dispatch an unclassified command word through resolution.
+fn dispatch_unknown(first: &str, argv: &[String], globals: &Globals) -> ExitCode {
+    use std::io::IsTerminal;
+    let interactive = std::io::stdin().is_terminal();
+    match resolve_command(first, interactive) {
+        Resolution::Run { name, notice } => {
+            dispatch_run(name, notice.as_deref(), first, argv, globals)
+        }
+        Resolution::Unknown { message } => conduit::report(conduit::EnvelopeKind::Usage, &message),
+    }
+}
+
+/// Dispatch one classified top-level action.
+fn dispatch_action(action: Action, argv: &[String], globals: &Globals) -> ExitCode {
+    match action {
         Action::Help => {
             print!(
                 "{BARE_HELP_LEAD}{}",
@@ -2809,57 +2937,26 @@ fn dispatch_inner(argv: &[String], globals: &Globals) -> ExitCode {
         Action::Missing => {
             conduit::report(conduit::EnvelopeKind::ToolsetUsage, "Choose a workflow!")
         }
-        Action::Unknown(first) => {
-            use std::io::IsTerminal;
-            let interactive = std::io::stdin().is_terminal();
-            match resolve_command(&first, interactive) {
-                Resolution::Run { name, notice } => {
-                    if let Some(notice) = notice {
-                        let ansi = terminal::ansi_enabled();
-                        eprint!(
-                            "{}",
-                            terminal::tsprintf_ansi("%s\n", &[terminal::TVal::Text(&notice)], ansi)
-                                .map(|t| t.to_string())
-                                .unwrap_or_default()
-                        );
-                    }
-                    if is_classic_command(name) {
-                        // The classic subprocess exports the resolved
-                        // command for hooks (`scripts/arcanist.php:229`).
-                        arc_rs::globals::set_command_name(name.to_string());
-                    }
-                    let runner: Option<CommandFn> = match name {
-                        "help" => None,
-                        "prompts" => Some(prompts::run),
-                        "shell-complete" => Some(shell_complete::run),
-                        _ => find_command(name),
-                    };
-                    match runner {
-                        Some(run) => run(&argv[1..]),
-                        None if name == "help" => run_help(&[], globals.show_standard_options),
-                        None => conduit::report(
-                            conduit::EnvelopeKind::Usage,
-                            &format_unknown_command(&first.to_lowercase(), &[]),
-                        ),
-                    }
-                }
-                Resolution::Unknown { message } => {
-                    conduit::report(conduit::EnvelopeKind::Usage, &message)
-                }
-            }
-        }
-        // `call-conduit` argument errors: the method-count error is a
-        // `runWorkflow()` usage error (red label); flag errors are
-        // parser errors (bold label). Exits match at 1 either way.
-        Action::Error(msg) => {
-            let kind = if msg == "Provide exactly one Conduit method name to call." {
-                conduit::EnvelopeKind::ToolsetUsage
-            } else {
-                conduit::EnvelopeKind::ToolsetParseError
-            };
-            conduit::report(kind, &msg)
-        }
+        Action::Unknown(first) => dispatch_unknown(&first, argv, globals),
+        Action::Error(msg) => report_call_conduit_error(&msg),
     }
+}
+
+fn dispatch_inner(argv: &[String], globals: &Globals) -> ExitCode {
+    if argv.is_empty() {
+        return dispatch_empty(globals);
+    }
+    if argv.first().is_some_and(|first| first == "help") {
+        let mut names = argv[1..].to_vec();
+        if names.first().is_some_and(|name| name == "--") {
+            names.remove(0);
+        }
+        return run_help(&names, globals.show_standard_options);
+    }
+    if globals.show_help {
+        return dispatch_help_flag(argv, globals);
+    }
+    dispatch_action(classify(argv), argv, globals)
 }
 
 fn main() -> ExitCode {

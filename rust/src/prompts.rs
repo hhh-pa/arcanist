@@ -373,6 +373,72 @@ fn save_echo(key: &str, response: &str, ansi: bool) -> String {
     .unwrap_or_default()
 }
 
+/// Read one interactive prompt answer: echo the query line, trim
+/// PHP's whitespace set, and default an empty answer to `n`.
+fn read_prompt_response(input: &mut dyn std::io::BufRead, query: &str) -> String {
+    use std::io::Write as _;
+    print!("{}", crate::prompt::prompt_line(query));
+    let _ = std::io::stdout().flush();
+    let raw = crate::prompt::read_answer(input).unwrap_or_default();
+    let trimmed = raw
+        .trim_matches([' ', '\t', '\n', '\r', '\0', '\x0B'])
+        .to_string();
+    if trimmed.is_empty() {
+        "n".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// The next prompt response: the saved response once (flagged, so no
+/// save suffix applies), else an interactive answer.
+fn next_prompt_response(
+    input: &mut dyn std::io::BufRead,
+    query: &str,
+    saved: &mut Option<&str>,
+) -> (String, bool) {
+    match saved.take() {
+        Some(response) => (response.to_string(), true),
+        None => (read_prompt_response(input, query), false),
+    }
+}
+
+/// Split a `*`/`!` save suffix off an interactive response (saved
+/// responses never carry one).
+fn split_save_suffix(response: &str, is_saved: bool) -> (String, Option<PromptScope>) {
+    if is_saved {
+        (response.to_string(), None)
+    } else if let Some(stripped) = response.strip_suffix('*') {
+        (stripped.to_string(), Some(PromptScope::User))
+    } else if let Some(stripped) = response.strip_suffix('!') {
+        (stripped.to_string(), Some(PromptScope::WorkingCopy))
+    } else {
+        (response.to_string(), None)
+    }
+}
+
+/// One prompt answer's meaning.
+enum PromptAnswer {
+    /// `y`: persist any save suffix, then accept.
+    Accept,
+    /// `n`: persist any save suffix, then abort.
+    Decline,
+    /// `?`: print the prompt help and ask again.
+    Help,
+    /// Anything else: ask again silently.
+    Retry,
+}
+
+/// Classify one prompt answer (case-insensitive).
+fn classify_prompt_answer(response: &str) -> PromptAnswer {
+    match response.to_lowercase().as_str() {
+        "y" => PromptAnswer::Accept,
+        "n" => PromptAnswer::Decline,
+        "?" => PromptAnswer::Help,
+        _ => PromptAnswer::Retry,
+    }
+}
+
 /// Run a `y`/`n` prompt like `ArcanistPrompt::execute()`, capturing
 /// `*`/`!` save suffixes: `save` persists the stripped response under
 /// its scope (after echoing the `SAVE PROMPT` line), on accept and on
@@ -396,43 +462,18 @@ pub fn execute_prompt_saving(
         return Err(crate::prompt::NOT_INTERACTIVE.to_string());
     }
     println!();
-    use std::io::Write as _;
     let ansi = terminal::ansi_enabled();
     loop {
-        let (response, is_saved) = match saved_response.take() {
-            Some(response) => (response.to_string(), true),
-            None => {
-                print!("{}", crate::prompt::prompt_line(query));
-                let _ = std::io::stdout().flush();
-                let raw = crate::prompt::read_answer(input).unwrap_or_default();
-                let trimmed = raw
-                    .trim_matches([' ', '\t', '\n', '\r', '\0', '\x0B'])
-                    .to_string();
-                let response = if trimmed.is_empty() {
-                    "n".to_string()
-                } else {
-                    trimmed
-                };
-                (response, false)
-            }
-        };
-        let (response, scope) = if is_saved {
-            (response, None)
-        } else if let Some(stripped) = response.strip_suffix('*') {
-            (stripped.to_string(), Some(PromptScope::User))
-        } else if let Some(stripped) = response.strip_suffix('!') {
-            (stripped.to_string(), Some(PromptScope::WorkingCopy))
-        } else {
-            (response, None)
-        };
-        let accepted = match response.to_lowercase().as_str() {
-            "y" => true,
-            "n" => false,
-            "?" => {
+        let (response, is_saved) = next_prompt_response(input, query, &mut saved_response);
+        let (response, scope) = split_save_suffix(&response, is_saved);
+        let accepted = match classify_prompt_answer(&response) {
+            PromptAnswer::Accept => true,
+            PromptAnswer::Decline => false,
+            PromptAnswer::Help => {
                 print!("{}", crate::prompt::prompt_help(key, description));
                 continue;
             }
-            _ => continue,
+            PromptAnswer::Retry => continue,
         };
         if is_saved {
             print!(
