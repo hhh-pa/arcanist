@@ -21,18 +21,30 @@ use crate::{
 
 pub const NAME: &str = "branches";
 
-fn usage() -> String {
-    format!(
-        "usage: arc {NAME} [--all] [--json] [--conduit-uri URI]\n\
-         \n\
-         Show an enhanced view of branches in the working copy.\n\
-         \n\
-         Options:\n\
-         \x20 --all              include remote-tracking branches\n\
-         \x20 --json             emit a JSON array of branch objects\n\
-         \x20 --conduit-uri URI  conduit server (or ARC_CONDUIT_URI)\n\
-         \x20 -h, --help         show this help\n"
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `crate::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistBranchesWorkflow.php:16-30`).
+const HELP_EXAMPLES: &str = "**branches**";
+const HELP_SYNOPSIS: &str = "Show an enhanced view of branches in the working copy.";
+const HELP_TEXT: &str = "Lists branches in the working copy, annotated with additional information\nabout review status.";
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &[],
+        ansi,
     )
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
 }
 
 /// One listed branch (the `--json` shape).

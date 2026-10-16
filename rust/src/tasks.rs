@@ -18,7 +18,67 @@ use crate::{
 /// Subcommand name, matching `arc tasks`.
 pub const NAME: &str = "tasks";
 
-const USAGE: &str = "usage: arc tasks [--status STATUS] [--owner USER] [--order ORDER] [--limit N] [--unassigned] [--json] [--conduit-uri URI]\n";
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `crate::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistTasksWorkflow.php:14-64`).
+const HELP_SYNOPSIS: &str = "      **tasks** [__options__]";
+const HELP_TEXT: &str = "        View all assigned tasks.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[
+    (
+        "status",
+        None,
+        Some("task_status"),
+        "Show tasks that are open or closed, default is open.",
+    ),
+    (
+        "owner",
+        None,
+        Some("username"),
+        "Only show tasks assigned to the given username, also accepts @all to show all, default is you.",
+    ),
+    (
+        "order",
+        None,
+        Some("task_order"),
+        "Arrange tasks based on priority, created, or modified, default is priority.",
+    ),
+    (
+        "limit",
+        None,
+        Some("n"),
+        "Limit the amount of tasks outputted, default is all.",
+    ),
+    (
+        "unassigned",
+        None,
+        None,
+        "Only show tasks that are not assigned (upforgrabs).",
+    ),
+];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        None,
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &specs,
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(terminal::ansi_enabled())
+}
 
 /// Parsed `tasks` options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -524,7 +584,7 @@ pub fn run(argv: &[String]) -> ExitCode {
     let options = match parse_args(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", usage());
             return ExitCode::SUCCESS;
         }
         // T1153 RB-D4 (R4): `tasks` is a subprocess workflow:

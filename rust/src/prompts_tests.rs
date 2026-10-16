@@ -181,3 +181,54 @@ fn core28_prompts_read_top_level_through_toolset_transform() {
         "{text}"
     );
 }
+#[test]
+fn r10_prompts_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "PROMPTS WORKFLOW\n\
+         \n\
+         prompts workflow\n\
+         \n\
+         \n\
+         Show information about prompts a workflow may execute, and review saved\n\
+         responses.\n\
+         \n\
+         Show Prompts\n\
+         \n\
+         To show possible prompts a workflow may execute, run:\n\
+         \n\
+         \x20 $ arc prompts workflow\n\
+         \n\
+         Saving Responses\n\
+         \n\
+         If you always want to answer a particular prompt in a certain way, you can\n\
+         save your response to the prompt. When you encounter the prompt again, your\n\
+         saved response will be used automatically.\n\
+         \n\
+         To save a response, add \"*\" or \"!\" to the end of the response you want to\n\
+         save when you answer the prompt:\n\
+         \n\
+         \x20 - Using \"*\" will save the response in user configuration. In the future,\n\
+         \x20   the saved answer will be used any time you encounter the prompt (in any\n\
+         \x20   project).\n\
+         \x20 - Using \"!\" will save the response in working copy configuration. In the\n\
+         \x20   future, the saved answer will be used when you encounter the prompt in\n\
+         \x20   the current working copy.\n\
+         \n\
+         For example, if you would like to always answer \"y\" to a particular prompt,\n\
+         respond with \"y*\" or \"y!\" to save your response.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    assert!(wants_help(&["--help".to_string()]));
+    assert!(!wants_help(&["--".to_string(), "--help".to_string()]));
+    // `execute_in` reroutes `--help` to the usage text.
+    let out = execute_in(std::path::Path::new("."), None, &["--help".to_string()]).unwrap();
+    assert!(out.contains("PROMPTS WORKFLOW"), "{out}");
+}

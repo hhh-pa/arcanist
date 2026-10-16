@@ -184,6 +184,65 @@ pub fn parse_args(argv: &[String], autocorrect: bool) -> Result<Vec<String>, Str
     Ok(argparse::parse_toolset(argv, &[], true, autocorrect)?.positionals)
 }
 
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`).
+/// The renderer is the shared `crate::help` module; this file keeps
+/// only the data (ceb `src/toolset/workflow/ArcanistPromptsWorkflow.php:14-51`).
+const HELP_EXAMPLES: &str = "**prompts** __workflow__";
+const HELP_TEXT: &str = "Show information about prompts a workflow may execute, and review saved\n\
+responses.\n\
+\n\
+**Show Prompts**\n\
+\n\
+To show possible prompts a workflow may execute, run:\n\
+\n\
+\x20 $ arc prompts __workflow__\n\
+\n\
+**Saving Responses**\n\
+\n\
+If you always want to answer a particular prompt in a certain way, you can\n\
+save your response to the prompt. When you encounter the prompt again, your\n\
+saved response will be used automatically.\n\
+\n\
+To save a response, add \"*\" or \"!\" to the end of the response you want to save\n\
+when you answer the prompt:\n\
+\n\
+\x20 - Using \"*\" will save the response in user configuration. In the future,\n\
+\x20 \x20 the saved answer will be used any time you encounter the prompt (in any\n\
+\x20 \x20 project).\n\
+\x20 - Using \"!\" will save the response in working copy configuration. In the\n\
+\x20 \x20 future, the saved answer will be used when you encounter the prompt in\n\
+\x20 \x20 the current working copy.\n\
+\n\
+For example, if you would like to always answer \"y\" to a particular prompt,\n\
+respond with \"y*\" or \"y!\" to save your response.\n";
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        None,
+        Some(HELP_TEXT),
+        true,
+        &[],
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(terminal::ansi_enabled())
+}
+
+/// True when `-h`/`--help` appears before any `--` terminator (the
+/// global parser consumes help flags first in PHP; direct calls
+/// reroute to usage the same way).
+fn wants_help(argv: &[String]) -> bool {
+    argv.iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg == "-h" || arg == "--help")
+}
+
 /// Unknown-workflow error listing the supported toolset workflows.
 #[must_use]
 pub fn unknown_workflow_error(workflow: &str) -> String {
@@ -202,6 +261,11 @@ fn execute_in(
     argv: &[String],
 ) -> Result<String, conduit::ClassifiedError> {
     use std::io::IsTerminal;
+    // T1153 R10: `--help` reroutes to the generated workflow help
+    // (ceb `PhutilArgumentParser.php:461-475`).
+    if wants_help(argv) {
+        return Ok(usage());
+    }
     let parsed = argparse::parse_toolset(argv, &[], true, std::io::stdin().is_terminal())
         .map_err(conduit::ClassifiedError::toolset_parse_error)?;
     if parsed.positionals.is_empty() {

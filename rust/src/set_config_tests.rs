@@ -341,3 +341,38 @@ fn r4_core49_set_config_usage_has_no_dump() {
     );
     assert_eq!(run(&[]), std::process::ExitCode::FAILURE);
 }
+#[test]
+fn r10_set_config_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "SET-CONFIG WORKFLOW\n\
+         \n\
+         set-config\n\
+         \x20     set-config [options] -- name value\n\
+         \n\
+         \x20         Supports: cli\n\
+         \x20         Sets an arc configuration option.\n\
+         \n\
+         \x20         Options are either user (apply to all arc commands you invoke\n\
+         \x20         from the current user) or local (apply only to the current working\n\
+         \x20         copy). By default, user configuration is written. Use --local\n\
+         \x20         to write local configuration.\n\
+         \n\
+         \x20         User values are written to '~/.arcrc' on Linux and Mac OS X, and an\n\
+         \x20         undisclosed location on Windows. Local values are written to an arc\n\
+         \x20         directory under either .git, .hg, or .svn as appropriate.\n\
+         \n\
+         \x20     --local\n\
+         \x20         Set a local config value instead of a user one.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("SET-CONFIG WORKFLOW"), "{}", usage());
+}

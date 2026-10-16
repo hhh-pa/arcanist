@@ -121,10 +121,12 @@ fn normalizes_messages() {
 
 #[test]
 fn usage_covers_options_and_limits() {
+    // T1153 R10: `--help` is the generated workflow help, not the old
+    // custom usage (options stay parser-accepted, limits come from ceb).
     let text = usage();
-    assert!(text.contains("usage: arc commit"));
+    assert!(text.contains("COMMIT WORKFLOW"));
     assert!(text.contains("--revision") && text.contains("--show"));
-    assert!(text.contains("--conduit-uri"));
+    assert!(text.contains("Supports: svn"));
 }
 
 fn scratch(name: &str) -> std::path::PathBuf {
@@ -417,4 +419,35 @@ fn commit_c3_looksoon_skips_untracked_working_copies() {
     // No identifiable repository (and no network): silently skipped.
     ask_for_repository_update(&client, &dir);
     std::fs::remove_dir_all(&dir).ok();
+}
+#[test]
+fn r10_commit_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "COMMIT WORKFLOW\n\
+         \n\
+         commit\n\
+         \x20     commit [--revision revision_id] [--show]\n\
+         \n\
+         \x20         Supports: svn\n\
+         \x20         Commit a revision which has been accepted by a reviewer.\n\
+         \n\
+         \x20     --revision revision_id\n\
+         \x20         Commit a specific revision. If you do not specify a revision, arc\n\
+         \x20         will look for committable revisions.\n\
+         \n\
+         \x20     --show\n\
+         \x20         Show the command which would be issued, but do not actually commit\n\
+         \x20         anything.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("COMMIT WORKFLOW"), "{}", usage());
 }

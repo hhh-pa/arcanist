@@ -694,12 +694,13 @@ fn g1_inspect_full_branches() {
 
 #[test]
 fn g1_full_help_and_wrap() {
-    assert!(
-        FULL_HELP.starts_with("Supports: git, svn, hg\n"),
-        "{FULL_HELP}"
-    );
-    assert!(FULL_HELP.contains("merge base"), "{FULL_HELP}");
-    assert!(FULL_HELP.contains("Under svn"), "{FULL_HELP}");
+    // T1153 R10: generated workflow help now (the stripped `FULL_HELP`
+    // is gone); exact bytes are locked by
+    // `r10_diff_help_matches_generated_format`.
+    let full = help_text(false);
+    assert!(full.contains("Supports: git, svn, hg"), "{full}");
+    assert!(full.contains("merge base"), "{full}");
+    assert!(full.contains("Under svn"), "{full}");
 
     assert_eq!(console_wrap("hi", 4, true), "    hi");
     assert_eq!(console_wrap("hi", 0, true), "hi");
@@ -756,8 +757,10 @@ fn merge_routes_raw_sources_without_working_copy() {
 
 #[test]
 fn merge_help_text_combines_usage_and_full_help() {
-    let text = help_text();
-    assert!(text.starts_with(USAGE), "{text:?}");
+    // T1153 R10: `--help` renders the generated `DIFF WORKFLOW` reference;
+    // the short `USAGE` stays for error dumps only.
+    let text = help_text(false);
+    assert!(text.starts_with("DIFF WORKFLOW\n"), "{text:?}");
     assert!(text.contains("Supports: git, svn, hg"), "{text:?}");
 }
 
@@ -3194,4 +3197,145 @@ fn d8_resolve_create_message_file_returns_footer_redirect() {
     let resolved = resolve_create_message(&mut context, &options, &[], Some("main")).unwrap();
     assert_eq!(resolved.corpus, "File title\n\nDifferential Revision: D9\n");
     assert_eq!(resolved.footer_revision_id, Some(9));
+}
+#[test]
+fn r10_diff_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        help_text(false),
+        "DIFF WORKFLOW\n\
+         \n\
+         diff\n\
+         \x20     diff [paths] (svn)\n\
+         \x20     diff [commit] (git, hg)\n\
+         \n\
+         \x20         Supports: git, svn, hg\n\
+         \x20         Generate a Differential diff or revision from local changes.\n\
+         \n\
+         \x20         Under git and mercurial, you can specify a commit (like HEAD^^^\n\
+         \x20         or master) and Differential will generate a diff against the\n\
+         \x20         merge base of that commit and your current working directory\n\
+         parent.\n\
+         \n\
+         \x20         Under svn, you can choose to include only some of the modified\n\
+         files\n\
+         \x20         in the working copy in the diff by specifying their paths. If you\n\
+         \x20         omit paths, all changes are included in the diff.\n\
+         \n\
+         \x20     --add-all, -a\n\
+         \x20         Automatically add all unstaged and uncommitted files to the commit.\n\
+         \n\
+         \x20     --allow-untracked\n\
+         \x20         Skip checks for untracked files in the working copy.\n\
+         \n\
+         \x20     --amend-all\n\
+         \x20         When linting git repositories, amend HEAD with all patches\n\
+         \x20         suggested by lint without prompting.\n\
+         \n\
+         \x20     --amend-autofixes\n\
+         \x20         When linting git repositories, amend HEAD with autofix patches\n\
+         \x20         suggested by lint without prompting.\n\
+         \n\
+         \x20     --apply-patches\n\
+         \x20         Apply patches suggested by lint to the working copy without\n\
+         \x20         prompting.\n\
+         \n\
+         \x20     --base rules\n\
+         \x20         Additional rules for determining base revision.\n\
+         \n\
+         \x20     --browse\n\
+         \x20         After creating a diff or revision, open it in a web browser.\n\
+         \n\
+         \x20     --cc usernames\n\
+         \x20         When creating a revision, add CCs.\n\
+         \n\
+         \x20     --coverage\n\
+         \x20         Always enable coverage information.\n\
+         \n\
+         \x20     --create\n\
+         \x20         Always create a new revision.\n\
+         \n\
+         \x20     --draft\n\
+         \x20         Create a draft revision so you can look over your changes before\n\
+         \x20         involving anyone else. Other users will not be notified about the\n\
+         \x20         revision until you later use \"Request Review\" to publish it. You\n\
+         \x20         can still share the draft by giving someone the link.\n\
+         \n\
+         \x20     --edit\n\
+         \x20         When updating a revision under git, edit revision information\n\
+         \x20         before updating.\n\
+         \n\
+         \x20     --head commit\n\
+         \x20         Specify the end of the commit range. This disables many\n\
+         \x20         Arcanist/Phabricator features which depend on having access to the\n\
+         \x20         working copy.\n\
+         \n\
+         \x20     --json\n\
+         \x20         Emit machine-readable JSON. EXPERIMENTAL! Probably does not work!\n\
+         \n\
+         \x20     --message message, -m message\n\
+         \x20         When updating a revision, use the specified message instead of\n\
+         \x20         prompting.\n\
+         \n\
+         \x20     --message-file file, -F file\n\
+         \x20         When creating a revision, read revision information from this file.\n\
+         \n\
+         \x20     --never-apply-patches\n\
+         \x20         Never apply patches suggested by lint.\n\
+         \n\
+         \x20     --no-amend\n\
+         \x20         Never amend commits in the working copy with lint patches.\n\
+         \n\
+         \x20     --no-coverage\n\
+         \x20         Always disable coverage information.\n\
+         \n\
+         \x20     --nolint\n\
+         \x20         Do not run lint.\n\
+         \n\
+         \x20     --nounit\n\
+         \x20         Do not run unit tests.\n\
+         \n\
+         \x20     --only\n\
+         \x20         Instead of creating or updating a revision, only create a diff,\n\
+         \x20         which you may later attach to a revision.\n\
+         \n\
+         \x20     --raw\n\
+         \x20         Read diff from stdin, not from the working copy. This disables many\n\
+         \x20         Arcanist/Phabricator features which depend on having access to the\n\
+         \x20         working copy.\n\
+         \n\
+         \x20     --raw-command command\n\
+         \x20         Generate diff by executing a specified command, not from the\n\
+         \x20         working copy. This disables many Arcanist/Phabricator features\n\
+         \x20         which depend on having access to the working copy.\n\
+         \n\
+         \x20     --reviewers usernames\n\
+         \x20         When creating a revision, add reviewers.\n\
+         \n\
+         \x20     --skip-binaries\n\
+         \x20         Do not upload binaries (like images).\n\
+         \n\
+         \x20     --skip-staging\n\
+         \x20         Do not copy changes to the staging area.\n\
+         \n\
+         \x20     --uncommitted\n\
+         \x20         Suppress warning about uncommitted changes.\n\
+         \n\
+         \x20     --update revision_id\n\
+         \x20         Always update a specific revision.\n\
+         \n\
+         \x20     --verbatim\n\
+         \x20         When creating a revision, try to use the working copy commit\n\
+         \x20         message verbatim, without prompting to edit it. When updating a\n\
+         \x20         revision, update some fields from the local commit message.\n\
+         \n\
+         \n"
+    );
+    let ansi = help_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints the same text with ambient ANSI mode.
+    assert!(help_text(crate::terminal::ansi_enabled()).contains("DIFF WORKFLOW"));
 }

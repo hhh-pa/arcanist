@@ -79,26 +79,9 @@ enum Action {
     Error(String),
 }
 
-/// `call-conduit` help at ceb (`ArcanistCallConduitWorkflow.php:14-41`,
-/// T1153 CORE-67: `...scripts which integrate with Phabricator...`).
-/// Test-locked contract text; detailed help renders from the workflow
-/// reference table (`HELP_ENTRIES`).
-#[allow(dead_code)]
-const CALL_CONDUIT_USAGE: &str = "call-conduit -- method
-Call Conduit API methods.
-
-Allows you to make a raw Conduit method call:
-
-  - Run this command from a working directory.
-  - Call parameters are required, and read as a JSON blob from stdin.
-  - Results are written to stdout as a JSON blob.
-
-This workflow is primarily useful for writing scripts which integrate
-with Phabricator. Examples:
-
-  $ echo '{}' | arc call-conduit -- conduit.ping
-  $ echo '{\"phid\":\"PHID-FILE-xxxx\"}' | arc call-conduit -- file.download
-";
+// T1153 R10: the old `CALL_CONDUIT_USAGE` duplicate is gone;
+// `arc call-conduit --help` renders from the workflow reference
+// table (`HELP_ENTRIES`), like every other command.
 
 /// Parse `call-conduit` arguments (PHP
 /// `ArcanistCallConduitWorkflow.php:31-44`): `--conduit-uri` plus a

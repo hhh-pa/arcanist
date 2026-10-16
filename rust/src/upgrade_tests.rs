@@ -1222,3 +1222,23 @@ fn execute_apply_readonly_fails_before_download() {
     assert!(!saw(&seen, "/dl/"));
     assert_no_leftovers(&tmp.path);
 }
+#[test]
+fn r10_upgrade_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "UPGRADE WORKFLOW\n\
+         \n\
+         upgrade\n\
+         Upgrade Arcanist to the latest version.\n\
+         \n\
+         Upgrade Arcanist to the latest version.\n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("UPGRADE WORKFLOW"), "{}", usage());
+}

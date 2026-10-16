@@ -953,3 +953,33 @@ fn core33_project_discovery_svn_nearest_hg_root() {
     let (none, empty) = read_project_config(&child).unwrap();
     assert!(none.is_none() && empty.is_empty());
 }
+#[test]
+fn r10_get_config_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "GET-CONFIG WORKFLOW\n\
+         \n\
+         get-config\n\
+         \x20     get-config [options] -- [name ...]\n\
+         \n\
+         \x20         Supports: cli\n\
+         \x20         Reads an arc configuration option. With no argument, reads all\n\
+         \x20         options.\n\
+         \n\
+         \x20         With --verbose, shows detailed information about one or more\n\
+         \x20         options.\n\
+         \n\
+         \x20     --verbose\n\
+         \x20         Show detailed information about options.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("GET-CONFIG WORKFLOW"), "{}", usage());
+}

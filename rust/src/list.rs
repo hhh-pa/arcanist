@@ -23,7 +23,31 @@ use crate::{
 /// Subcommand name, matching `arc list`.
 pub const NAME: &str = "list";
 
-const USAGE: &str = "usage: arc list [--json] [--conduit-uri URI]\n";
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `crate::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistListWorkflow.php:12-24`).
+const HELP_SYNOPSIS: &str = "      **list**";
+const HELP_TEXT: &str =
+    "          Supports: git, svn, hg\n          List your open Differential revisions.";
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    crate::help::usage_text(
+        NAME,
+        None,
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &[],
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(terminal::ansi_enabled())
+}
 
 /// Parsed `list` options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,7 +379,7 @@ pub fn run_in(cwd: &Path, argv: &[String]) -> ExitCode {
     let options = match parse_args(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", usage());
             return ExitCode::SUCCESS;
         }
         // T1153 RB-D4 (R4): `list` is a subprocess workflow:

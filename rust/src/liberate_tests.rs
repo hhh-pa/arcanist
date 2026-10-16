@@ -524,3 +524,29 @@ fn core53_parse_errors_keep_red_arm_with_parser_texts() {
         ParseOutcome::Args(_)
     ));
 }
+#[test]
+fn r10_liberate_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "LIBERATE WORKFLOW\n\
+         \n\
+         liberate\n\
+         liberate [path]\n\
+         Create or update an Arcanist library.\n\
+         \n\
+         Create or update an Arcanist library.\n\
+         \n\
+         \x20     --clean\n\
+         \x20         Perform a clean rebuild, ignoring caches. Thorough, but slow.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("LIBERATE WORKFLOW"), "{}", usage());
+}

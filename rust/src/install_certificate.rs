@@ -44,6 +44,31 @@ Options:\n\
   --arcrc-file F      Read/write credentials at F instead of ~/.arcrc.\n\
   -h, --help          Show this help.\n";
 
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not the short usage line. The renderer is the shared
+/// `arc_rs::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistInstallCertificateWorkflow.php:12-35`).
+const HELP_SYNOPSIS: &str = "      **install-certificate** [uri]";
+const HELP_TEXT: &str = "          Supports: http, https\n          Installs Conduit credentials into your ~/.arcrc for the given install\n          of Phabricator. You need to do this before you can use 'arc', as it\n          enables 'arc' to link your command-line activity with your account on\n          the web. Run this command from within a project directory to install\n          that project's certificate, or specify an explicit URI (like\n          \"https://phabricator.example.com/\").";
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    arc_rs::help::usage_text(
+        NAME,
+        None,
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &[],
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(arc_rs::terminal::ansi_enabled())
+}
+
 const EXAMPLE_URI: &str = "https://phabricator.example.com/";
 
 /// `pht('Paste API Token from that page:')`.
@@ -833,7 +858,7 @@ fn install_options(argv: &[String]) -> Result<Options, ExitCode> {
     match parse_args(argv) {
         Ok(Some(options)) => Ok(options),
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", usage());
             Err(ExitCode::SUCCESS)
         }
         Err(message) => {

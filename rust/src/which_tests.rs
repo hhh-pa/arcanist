@@ -1214,3 +1214,41 @@ fn carryover_conduit_labels_name_the_merged_source() {
         );
     }
 }
+#[test]
+fn r10_which_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "WHICH WORKFLOW\n\
+         \n\
+         which\n\
+         \x20     which [options] (svn)\n\
+         \x20     which [options] [commit] (hg, git)\n\
+         \n\
+         \x20         Supports: svn, git, hg\n\
+         \x20         Shows which repository the current working copy corresponds to,\n\
+         \x20         which commits 'arc diff' will select, and which revision is in\n\
+         \x20         the working copy (or which revisions, if more than one matches).\n\
+         \n\
+         \x20     --any-status\n\
+         \x20         Show committed and abandoned revisions.\n\
+         \n\
+         \x20     --base rules\n\
+         \x20         Additional rules for determining base revision.\n\
+         \n\
+         \x20     --head commit\n\
+         \x20         Specify the end of the commit range to select.\n\
+         \n\
+         \x20     --show-base\n\
+         \x20         Print base commit only and exit.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("WHICH WORKFLOW"), "{}", usage());
+}

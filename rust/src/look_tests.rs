@@ -1089,3 +1089,25 @@ fn r4_rbd4_parse_error_has_no_dump() {
     // `USAGE EXCEPTION` (exit 1) with no usage dump.
     assert_eq!(run(&args(&["--bogus"])), std::process::ExitCode::FAILURE);
 }
+#[test]
+fn r10_look_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "LOOK WORKFLOW\n\
+         \n\
+         look\n\
+         look [options] -- thing\n\
+         You stand in the middle of a small clearing.\n\
+         \n\
+         Look around, or look at a specific thing.\n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("LOOK WORKFLOW"), "{}", usage());
+}

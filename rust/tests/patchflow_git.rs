@@ -198,7 +198,8 @@ fn patch_help_succeeds() {
         ExitCode::SUCCESS
     );
     let out = patch::execute(fx.path(), &argv(&["--help"])).unwrap();
-    assert!(out.stdout.contains("usage: arc patch"), "{}", out.stdout);
+    // T1153 R10: `--help` renders the generated workflow help.
+    assert!(out.stdout.contains("PATCH WORKFLOW"), "{}", out.stdout);
 }
 
 #[test]

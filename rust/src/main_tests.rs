@@ -373,11 +373,15 @@ fn call_conduit_accepts_help_flags() {
         dispatch(&args(&["help", "call-conduit"])),
         ExitCode::SUCCESS
     );
-    assert!(CALL_CONDUIT_USAGE.contains("Call Conduit API methods."));
-    assert!(CALL_CONDUIT_USAGE.contains("call-conduit -- method"));
-    assert!(CALL_CONDUIT_USAGE.contains("conduit.ping"));
+    // T1153 R10: help renders from the reference entry (the old
+    // `CALL_CONDUIT_USAGE` duplicate is gone); exact bytes are locked
+    // by `r10_call_conduit_help_matches_generated_format`.
+    let text = render_workflow_help("call-conduit", true, false);
+    assert!(text.contains("Call Conduit API methods."));
+    assert!(text.contains("call-conduit -- method"));
+    assert!(text.contains("conduit.ping"));
     // T1153 CORE-67: the ceb help names Phabricator, not "writing scripts".
-    assert!(CALL_CONDUIT_USAGE.contains("integrate\nwith Phabricator"));
+    assert!(text.contains("integrate with\nPhabricator"));
 }
 
 #[test]
@@ -862,4 +866,31 @@ fn core36_get_config_help_is_ceb_verbatim() {
     assert!(text.contains("Supports: cli"));
     assert!(text.contains("Reads an arc configuration option. With no argument, reads all"));
     assert!(text.contains("With --verbose, shows detailed information about one or more"));
+}
+
+#[test]
+fn r10_call_conduit_help_matches_generated_format() {
+    // T1153 R10: `arc call-conduit --help` reroutes to `arc help
+    // call-conduit` (ceb `PhutilArgumentParser.php:461-475`); both render
+    // this reference entry (ceb `ArcanistCallConduitWorkflow.php:12-38`).
+    assert_eq!(
+        render_workflow_help("call-conduit", true, false),
+        "call-conduit -- method\n\
+         Call Conduit API methods.\n\
+         \n\
+         Allows you to make a raw Conduit method call:\n\
+         \n\
+         \x20 - Run this command from a working directory.\n\
+         \x20 - Call parameters are required, and read as a JSON blob from stdin.\n\
+         \x20 - Results are written to stdout as a JSON blob.\n\
+         \n\
+         This workflow is primarily useful for writing scripts which integrate with\n\
+         Phabricator. Examples:\n\
+         \n\
+         \x20 $ echo '{}' | arc call-conduit -- conduit.ping\n\
+         \x20 $ echo '{\"phid\":\"PHID-FILE-xxxx\"}' | arc call-conduit -- file.download\n"
+    );
+    let ansi = render_workflow_help("call-conduit", true, true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
 }

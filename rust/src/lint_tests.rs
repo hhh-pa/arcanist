@@ -2494,3 +2494,68 @@ fn d22_bare_child_amend_gates_like_argv_flags() {
     std::fs::write(root.join(".arcconfig"), r#"{"history.immutable": true}"#).unwrap();
     assert!(!amend_enabled(&work, &bare).unwrap());
 }
+#[test]
+fn r10_lint_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "LINT WORKFLOW\n\
+         \n\
+         lint\n\
+         \x20     lint [options] [paths]\n\
+         \x20     lint [options] --rev [rev]\n\
+         \n\
+         \x20         Supports: git, svn, hg\n\
+         \x20         Run static analysis on changes to check for mistakes. If no files\n\
+         \x20         are specified, lint will be run on all files which have been\n\
+         modified.\n\
+         \n\
+         \x20     --amend-all\n\
+         \x20         When linting git repositories, amend HEAD with all patches\n\
+         \x20         suggested by lint without prompting.\n\
+         \n\
+         \x20     --amend-autofixes\n\
+         \x20         When linting git repositories, amend HEAD with autofix patches\n\
+         \x20         suggested by lint without prompting.\n\
+         \n\
+         \x20     --apply-patches\n\
+         \x20         Apply patches suggested by lint to the working copy without\n\
+         \x20         prompting.\n\
+         \n\
+         \x20     --engine classname\n\
+         \x20         Override configured lint engine for this project.\n\
+         \n\
+         \x20     --everything\n\
+         \x20         Lint all tracked files in the working copy. Ignored files and\n\
+         \x20         untracked files will not be linted.\n\
+         \n\
+         \x20     --lintall\n\
+         \x20         Show all lint warnings, not just those on changed lines. When paths\n\
+         \x20         are specified, this is the default behavior.\n\
+         \n\
+         \x20     --never-apply-patches\n\
+         \x20         Never apply patches suggested by lint.\n\
+         \n\
+         \x20     --outfile path\n\
+         \x20         Output the linter results to a file. Defaults to stdout.\n\
+         \n\
+         \x20     --output format\n\
+         \x20         Select an output format.\n\
+         \n\
+         \x20     --rev revision\n\
+         \x20         Lint changes since a specific revision.\n\
+         \n\
+         \x20     --severity string\n\
+         \x20         Set minimum message severity. One of: 'advice', 'autofix',\n\
+         \x20         'warning', 'error', 'disabled'. Defaults to 'advice'.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("LINT WORKFLOW"), "{}", usage());
+}

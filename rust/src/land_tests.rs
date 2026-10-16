@@ -2790,10 +2790,12 @@ fn offline_message_lists_commits() {
 
 #[test]
 fn execute_help_parse_error_and_non_repo() {
+    // T1153 R10: `--help` renders the generated workflow help (exact
+    // bytes locked by `r10_land_help_matches_generated_format`).
     let dir = temp_dir("exec-misc");
     let mut io = Io::canned(&[]);
     let out = execute_with_io(&dir, &args(&["--help"]), &mut io).unwrap();
-    assert_eq!(out.stdout, USAGE);
+    assert_eq!(out.stdout, usage_text(false));
     // T1153 R4 (LAND-37): PHP renders usage errors with no usage
     // dump; the envelope (`USAGE EXCEPTION` label) applies at `run_in`.
     let err = execute_with_io(&dir, &args(&["--nope"]), &mut Io::canned(&[])).unwrap_err();
@@ -2801,7 +2803,7 @@ fn execute_help_parse_error_and_non_repo() {
     let err = execute_with_io(&dir, &args(&["--preview"]), &mut Io::canned(&[])).unwrap_err();
     assert_eq!(err, NOT_GIT_OR_HG);
     let out = execute(&dir, &args(&["--help"])).unwrap();
-    assert_eq!(out.stdout, USAGE);
+    assert!(out.stdout.contains("LAND WORKFLOW"));
 }
 
 #[test]
@@ -4515,4 +4517,204 @@ fn land15_invalid_symbol_fails_before_onto_output() {
     assert!(err.contains("nope"), "{err}");
     assert!(!io.out.stderr.contains("ONTO"), "{}", io.out.stderr);
     assert!(!io.out.stderr.contains("INTO"), "{}", io.out.stderr);
+}
+#[test]
+fn r10_land_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "LAND WORKFLOW\n\
+         \n\
+         land [options] -- [ref ...]\n\
+         Publish reviewed changes.\n\
+         \n\
+         Supports: git, git/p4, git/svn, hg\n\
+         \n\
+         Publish accepted revisions after review. This command is the last step in the\n\
+         standard Differential code review workflow.\n\
+         \n\
+         To publish changes in local branch or bookmark \"feature1\", you will usually\n\
+         run this command:\n\
+         \n\
+         \x20 $ arc land feature1\n\
+         \n\
+         This workflow merges and pushes changes associated with revisions that are\n\
+         ancestors of ref. Without ref, the current working copy state will be used.\n\
+         You can specify multiple ref arguments to publish multiple changes at once.\n\
+         \n\
+         A ref can be any symbol which identifies a commit: a branch name, a tag name,\n\
+         a bookmark name, a topic name, a raw commit hash, a symbolic reference, etc.\n\
+         \n\
+         When you provide a ref, all unpublished changes which are present in\n\
+         ancestors of that ref will be selected for publishing. (With the --pick flag,\n\
+         only the unpublished changes you directly reference will be selected.)\n\
+         \n\
+         For example, if you provide local branch \"feature3\" as a ref argument, that\n\
+         may also select the changes in \"feature1\" and \"feature2\" (if they are\n\
+         ancestors of \"feature3\"). If you stack changes in a single local branch, all\n\
+         commits in the stack may be selected.\n\
+         \n\
+         The workflow merges unpublished changes reachable from ref \"into\" some\n\
+         intermediate branch, then pushes the combined state \"onto\" some destination\n\
+         branch (or list of branches).\n\
+         \n\
+         (In Mercurial, the \"into\" and \"onto\" branches may be bookmarks instead.)\n\
+         \n\
+         In the most common case, there is only one \"onto\" branch (often \"master\" or\n\
+         \"default\" or some similar branch) and the \"into\" branch is the same branch.\n\
+         For example, it is common to merge local feature branch \"feature1\" into\n\
+         \"origin/master\", then push it onto \"origin/master\".\n\
+         \n\
+         The list of \"onto\" branches is selected by examining these sources in order:\n\
+         \n\
+         \x20 - the --onto flags;\n\
+         \x20 - the arc.land.onto configuration setting;\n\
+         \x20 - (in Git) the upstream of the branch targeted by the land operation,\n\
+         \x20   recursively;\n\
+         \x20 - or by falling back to a standard default:\n\
+         \x20   - (in Git) \"master\";\n\
+         \x20   - (in Mercurial) \"default\".\n\
+         \n\
+         The remote to push \"onto\" is selected by examining these sources in order:\n\
+         \n\
+         \x20 - the --onto-remote flag;\n\
+         \x20 - the arc.land.onto-remote configuration setting;\n\
+         \x20 - (in Git) the upstream of the current branch, recursively;\n\
+         \x20 - (in Git) the special \"p4\" remote which indicates a repository has\n\
+         \x20   been synchronized with Perforce;\n\
+         \x20 - or by falling back to a standard default:\n\
+         \x20   - (in Git) \"origin\";\n\
+         \x20   - (in Mercurial) \"default\".\n\
+         \n\
+         The branch to merge \"into\" is selected by examining these sources in order:\n\
+         \n\
+         \x20 - the --into flag;\n\
+         \x20 - the --into-empty flag;\n\
+         \x20 - or by falling back to the first \"onto\" branch.\n\
+         \n\
+         The remote to merge \"into\" is selected by examining these sources in order:\n\
+         \n\
+         \x20 - the --into-remote flag;\n\
+         \x20 - the --into-local flag (which disables fetching before merging);\n\
+         \x20 - or by falling back to the \"onto\" remote.\n\
+         \n\
+         After selecting remotes and branches, the commits which will land are\n\
+         printed.\n\
+         \n\
+         With --preview, execution stops here, before the change is merged.\n\
+         \n\
+         The \"into\" branch is fetched from the \"into\" remote (unless --into-local or\n\
+         --into-empty are specified) and the changes are merged into the state in the\n\
+         \"into\" branch according to the selected merge strategy.\n\
+         \n\
+         The default merge strategy is \"squash\", which produces a single commit from\n\
+         all local commits for each change. A different strategy can be selected with\n\
+         the --strategy flag.\n\
+         \n\
+         The resulting merged change will be given an up-to-date commit message\n\
+         describing the final state of the revision in Differential.\n\
+         \n\
+         With --hold, execution stops here, before the change is pushed.\n\
+         \n\
+         The change is pushed onto all of the \"onto\" branches in the \"onto\" remote.\n\
+         \n\
+         If you are landing multiple changes, they are normally all merged locally and\n\
+         then all pushed in a single operation. Instead, you can merge and push them\n\
+         one at a time with --incremental.\n\
+         \n\
+         Under merge strategies which mutate history (including the default \"squash\"\n\
+         strategy), local refs which descend from commits that were published are now\n\
+         updated. For example, if you land \"feature4\", local branches \"feature5\" and\n\
+         \"feature6\" may now be rebased on the published version of the change.\n\
+         \n\
+         Once everything has been pushed, cleanup occurs. Consulting mystical sources\n\
+         of power, the workflow makes a guess about what state you wanted to end up in\n\
+         after the process finishes. The working copy is put into that state.\n\
+         \n\
+         Any obsolete refs that point at commits which were published are deleted,\n\
+         unless the --keep-branches flag is passed.\n\
+         \n\
+         \x20     --hold\n\
+         \x20         Prepare the changes to be pushed, but do not actually push them.\n\
+         \n\
+         \x20     --incremental\n\
+         \x20         When landing multiple revisions at once, push and rebase after each\n\
+         \x20         merge completes instead of waiting until all merges are completed\n\
+         \x20         to push.\n\
+         \x20         \n\
+         \x20         This is slower than the default behavior and not atomic, but may\n\
+         \x20         make it easier to resolve conflicts and land complicated changes by\n\
+         \x20         allowing you to make progress one step at a time.\n\
+         \n\
+         \x20     --into commit-ref\n\
+         \x20         Specify the state to merge into. By default, this is the same as\n\
+         \x20         the \"onto\" ref.\n\
+         \n\
+         \x20     --into-empty\n\
+         \x20         Merge into the empty state instead of an existing state. This mode\n\
+         \x20         is primarily useful when creating a new repository, and selected\n\
+         \x20         automatically if the \"onto\" ref does not exist and the \"into\" state\n\
+         \x20         is not specified.\n\
+         \n\
+         \x20     --into-local\n\
+         \x20         Use the local \"into\" ref state instead of fetching it from a remote.\n\
+         \n\
+         \x20     --into-remote remote-name\n\
+         \x20         Specifies the remote to fetch the \"into\" ref from. By default, this\n\
+         \x20         is the same as the \"onto\" remote.\n\
+         \n\
+         \x20     --keep-branches\n\
+         \x20         Keep local branches around after changes are pushed. By default,\n\
+         \x20         local branches are deleted after the changes they contain are\n\
+         \x20         published.\n\
+         \n\
+         \x20     --onto branch-name\n\
+         \x20         After merging, push changes onto a specified branch.\n\
+         \x20         \n\
+         \x20         Specifying this flag multiple times will push to multiple branches.\n\
+         \x20         \n\
+         \x20         Related configuration: arc.land.onto\n\
+         \n\
+         \x20     --onto-remote remote-name\n\
+         \x20         Push to a remote other than the default.\n\
+         \x20         \n\
+         \x20         Related configuration: arc.land.onto-remote\n\
+         \n\
+         \x20     --pick\n\
+         \x20         Land only the changes directly named by arguments, instead of all\n\
+         \x20         reachable ancestors.\n\
+         \n\
+         \x20     --preview\n\
+         \x20         Show the changes that will land. Does not modify the working copy\n\
+         \x20         or the remote.\n\
+         \n\
+         \x20     --revision revision-identifier\n\
+         \x20         Land a specific revision, rather than determining revisions\n\
+         \x20         automatically from the commits that are landing.\n\
+         \n\
+         \x20     --strategy strategy-name\n\
+         \x20         Merge using a particular strategy. Supported strategies are\n\
+         \x20         \"squash\" and \"merge\".\n\
+         \x20         \n\
+         \x20         The \"squash\" strategy collapses multiple local commits into a\n\
+         \x20         single commit when publishing. It produces a linear published\n\
+         \x20         history (but discards local checkpoint commits). This is the\n\
+         \x20         default strategy.\n\
+         \x20         \n\
+         \x20         The \"merge\" strategy generates a merge commit when publishing that\n\
+         \x20         retains local checkpoint commits (but produces a nonlinear\n\
+         \x20         published history). Select this strategy if you do not want \"arc\n\
+         \x20         land\" to discard checkpoint commits.\n\
+         \x20         \n\
+         \x20         Related configuration: arc.land.strategy\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `execute_with_io` pushes the same text with the IO ANSI mode.
+    assert!(usage_text(true).contains("LAND WORKFLOW"));
 }

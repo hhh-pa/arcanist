@@ -108,9 +108,30 @@ fn formats_json_objects() {
 
 #[test]
 fn usage_covers_options() {
+    // T1153 R10: `--help` is the generated workflow help (ceb takes no
+    // arguments; `--json`/`--conduit-uri` stay parser-accepted).
     let text = usage();
-    assert!(text.contains("usage: arc bookmarks"));
-    assert!(text.contains("--json"));
-    assert!(text.contains("--conduit-uri"));
-    assert!(text.contains("Mercurial"));
+    assert!(text.contains("BOOKMARKS WORKFLOW"));
+    assert!(text.contains("Show an enhanced view of bookmarks in the working copy."));
+}
+#[test]
+fn r10_bookmarks_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "BOOKMARKS WORKFLOW\n\
+         \n\
+         bookmarks\n\
+         Show an enhanced view of bookmarks in the working copy.\n\
+         \n\
+         Lists bookmarks in the working copy, annotated with additional information\n\
+         about review status.\n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("BOOKMARKS WORKFLOW"), "{}", usage());
 }

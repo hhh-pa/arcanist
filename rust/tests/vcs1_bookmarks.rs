@@ -87,7 +87,8 @@ fn run_uses_current_dir() {
 fn help_succeeds_and_prints_usage() {
     let empty = Fixture::named("help");
     let out = bookmarks::execute(empty.path(), &args(&["--help"])).unwrap();
-    assert!(out.contains("usage: arc bookmarks"), "unexpected: {out}");
+    // T1153 R10: `--help` renders the generated workflow help.
+    assert!(out.contains("BOOKMARKS WORKFLOW"), "unexpected: {out}");
     assert_eq!(
         bookmarks::run_in(empty.path(), &args(&["--help"])),
         ExitCode::SUCCESS
