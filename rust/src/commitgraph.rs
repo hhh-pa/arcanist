@@ -291,6 +291,13 @@ fn ingest_record(
 }
 
 /// Ingest `\x01`-separated log output, skipping bare `"\n"` records.
+///
+/// T1153 RB-D33: `LinesOfALarge` never yields a trailing empty piece —
+/// at EOF an empty buffer ends the iterator instead
+/// (`src/filesystem/linesofalarge/LinesOfALarge.php:200-224`) — so the
+/// split artifact after a final delimiter (and the lone piece of empty
+/// output) is dropped before parsing. A mid-stream empty piece still
+/// fails like PHP.
 fn ingest_log_output(
     graph: &mut CommitGraph,
     seen: &mut OrderedMap<()>,
@@ -298,7 +305,11 @@ fn ingest_log_output(
     limit: Option<usize>,
     mut record: impl FnMut(&str) -> Result<LogRecord, String>,
 ) -> Result<(), String> {
-    for chunk in stdout.split('\x01') {
+    let mut chunks: Vec<&str> = stdout.split('\x01').collect();
+    if chunks.last() == Some(&"") {
+        chunks.pop();
+    }
+    for chunk in chunks {
         if chunk == "\n" {
             continue;
         }

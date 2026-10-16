@@ -165,6 +165,35 @@ fn set_counter_is_shared_across_partitions() {
 }
 
 #[test]
+fn ingest_skips_eof_empty_chunk() {
+    // T1153 RB-D33: empty output yields nothing (like `LinesOfALarge`),
+    // and a trailing delimiter leaves no empty chunk behind.
+    let mut graph = CommitGraph::new();
+    let mut seen = OrderedMap::new();
+    ingest_log_output(
+        &mut graph,
+        &mut seen,
+        "",
+        None,
+        |chunk: &str| -> Result<LogRecord, String> { panic!("unexpected chunk {chunk:?}") },
+    )
+    .unwrap();
+    assert!(seen.is_empty());
+    let mut graph = CommitGraph::new();
+    let mut seen = OrderedMap::new();
+    ingest_log_output(
+        &mut graph,
+        &mut seen,
+        "e\x02h\x02\x020\x02m\x01",
+        None,
+        git_log_record,
+    )
+    .unwrap();
+    assert_eq!(seen.keys(), &["h".to_string()]);
+    assert_eq!(graph.node("h").unwrap().message(), Some("m"));
+}
+
+#[test]
 fn parses_log_records() {
     let (hash, parents, epoch, message) =
         parse_log_record("e\x02abc\x02p1 p2\x021729000000\x02hello\n", "git").unwrap();

@@ -82,6 +82,13 @@ fn truncates_at_word_boundaries() {
 }
 
 #[test]
+fn truncates_with_float_half_search_floor() {
+    // T1153 RB-D35: cutoff 7 scans 7..=4 (`7 / 2` is 3.5 in PHP), so
+    // the space at index 3 is out of reach and the cut lands at 7.
+    assert_eq!(truncate_glyphs("abc defghij", 8), "abc def…");
+}
+
+#[test]
 fn truncates_at_stop_characters_without_terminator() {
     assert_eq!(truncate_glyphs("hello. bye friend", 8), "hello.");
 }
@@ -167,8 +174,10 @@ fn pads_and_truncates_center_and_right_columns() {
 
 #[test]
 fn empty_grid_renders_like_php() {
+    // T1153 RB-D36: `phutil_glue` of no rows is `[]`, and `%s` of it
+    // is `""`, so PHP draws a lone newline — never `Array`.
     let grid = markers_grid();
-    assert_eq!(grid.draw(Some(80)), "Array\n");
+    assert_eq!(grid.draw(Some(80)), "\n");
 }
 
 #[test]
