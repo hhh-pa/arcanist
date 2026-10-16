@@ -234,10 +234,20 @@ fn requires_a_supported_working_copy() {
         run_in(tmp.path(), &args(&["feature"])),
         std::process::ExitCode::FAILURE
     );
+    // Hermetic: real `hg` treats a bare `.hg` as operable (`log`
+    // prints the null node, `bookmark` exits 0), so the system binary
+    // would succeed where hg is installed (Ubuntu CI). Drive the hg
+    // engine through an always-failing command instead (T1153 WORK-HG).
     let hg = TempDir::new("hg");
     std::fs::create_dir(hg.path().join(".hg")).unwrap();
+    let options = match parse_args(&args(&["feature"])) {
+        ParseOutcome::Args(options) => options,
+        _ => panic!("feature parses"),
+    };
+    let hg_cmd = crate::hg::HgCommand::custom("false", &[]);
+    let mut input = std::io::Cursor::new(b"");
     assert_eq!(
-        run_in(hg.path(), &args(&["feature"])),
+        run_hg_in_with_cmd(hg.path(), &hg_cmd, &options, None, &mut input),
         std::process::ExitCode::FAILURE
     );
 }
@@ -679,7 +689,14 @@ fn save_and_restore_roundtrips_branches() {
 // T1153 WORK-HG: hg tests use an inline `sh` fake (no `hg` binary in
 // CI), like `land35_hg_without_shelve_matches_php_error`.
 fn hg_fake_script() -> &'static str {
-    "#!/bin/sh\necho \"$*\" >> .fakehg.log\nargs=\"$*\"\ncase \"$args\" in\n  *--encoding*) shift 2 2>/dev/null || true;;\nesac\nsub=\"\"\nfor a in \"$@\"; do case \"$a\" in --encoding|--config|extensions.*) continue;; -*) continue;; *) sub=\"$a\"; break;; esac; done\nif [ -e \".fakehg-fail-$sub\" ]; then exit 1; fi\nNODE=\"0123456789abcdef0123456789abcdef01234567\"\ncase \"$sub\" in\n  branch) if [ \"$args\" != \"${args%--force*}\" ]; then exit 0; fi\n    if [ -e .fakehg-branch ]; then cat .fakehg-branch; else echo \"default\"; fi;;\n  bookmarks) if [ -e .fakehg-bookmarks ]; then cat .fakehg-bookmarks; fi;;\n  branches) if [ -e .fakehg-branches ]; then cat .fakehg-branches; fi;;\n  status) if [ -e .fakehg-status ]; then cat .fakehg-status; fi;;\n  log) case \"$args\" in *\"{desc}\"*) if [ -e .fakehg-msg ]; then cat .fakehg-msg; else echo \"old message\"; fi;; *) printf '%s' \"$NODE\";; esac;;\n  update|checkout|bookmark) exit 0;;\n  shelve|unshelve) if [ -e .fakehg-no-shelve ]; then exit 1; fi; exit 0;;\n  *) exit 0;;\nesac\nexit 0\n"
+    // NOTE: the `log` arm dispatches on fixture presence, not on the
+    // `--template` value: matching `{desc}` in sh fails under Git
+    // Bash on Windows (observed: footer association came back
+    // empty), while plain `cat`/`printf` works everywhere. The
+    // single `.fakehg-msg` test then also sees message bytes as the
+    // canonical node; its hash-miss still holds and `commit` is
+    // unasserted there (T1153 WORK-HG).
+    "#!/bin/sh\necho \"$*\" >> .fakehg.log\nargs=\"$*\"\ncase \"$args\" in\n  *--encoding*) shift 2 2>/dev/null || true;;\nesac\nsub=\"\"\nfor a in \"$@\"; do case \"$a\" in --encoding|--config|extensions.*) continue;; -*) continue;; *) sub=\"$a\"; break;; esac; done\nif [ -e \".fakehg-fail-$sub\" ]; then exit 1; fi\nNODE=\"0123456789abcdef0123456789abcdef01234567\"\ncase \"$sub\" in\n  branch) if [ \"$args\" != \"${args%--force*}\" ]; then exit 0; fi\n    if [ -e .fakehg-branch ]; then cat .fakehg-branch; else echo \"default\"; fi;;\n  bookmarks) if [ -e .fakehg-bookmarks ]; then cat .fakehg-bookmarks; fi;;\n  branches) if [ -e .fakehg-branches ]; then cat .fakehg-branches; fi;;\n  status) if [ -e .fakehg-status ]; then cat .fakehg-status; fi;;\n  log) if [ -e .fakehg-msg ]; then cat .fakehg-msg; else printf '%s' \"$NODE\"; fi;;\n  update|checkout|bookmark) exit 0;;\n  shelve|unshelve) if [ -e .fakehg-no-shelve ]; then exit 1; fi; exit 0;;\n  *) exit 0;;\nesac\nexit 0\n"
 }
 
 fn hg_test_repo(tag: &str) -> (TempDir, crate::hg::HgCommand) {
