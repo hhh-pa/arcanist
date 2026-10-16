@@ -163,8 +163,19 @@ impl Parser {
         if arg == "--help" || arg == "-h" {
             return Step::Help;
         }
-        if arg.starts_with('-') {
-            return Step::Error(format!("unknown flag '{arg}'"));
+        // T1153 TASKS-1: `tasks` is a classic `ArcanistWorkflow`
+        // subclass (`ArcanistTasksWorkflow.php:6`), so unknown flags
+        // report the classic text over the `--`/`-`-stripped,
+        // `=`-split key (`ArcanistWorkflow.php:825-851` long,
+        // `:853-862` short). Per-command override, not a global
+        // change: the toolset `unknown flag` wording locked at
+        // `alias.rs:785` stays for the commands that keep it.
+        if let Some(long) = arg.strip_prefix("--") {
+            let key = long.split('=').next().unwrap_or("");
+            return Step::Error(format!("Unknown argument '{key}'. Try 'arc help'."));
+        }
+        if let Some(key) = arg.strip_prefix('-') {
+            return Step::Error(format!("Unknown argument '{key}'. Try 'arc help'."));
         }
         Step::Error(format!("unexpected argument '{arg}'"))
     }
