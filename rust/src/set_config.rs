@@ -5,11 +5,11 @@
 //! and storage paths from `src/configuration/ArcanistConfigurationManager.php`
 //! (`~/.arcrc`) plus
 //! `src/workingcopyidentity/ArcanistWorkingCopyIdentity.php`
-//! (`.git/arc/config`).
+//! (`arc/config` under `.git`, `.hg`, or `.svn`).
 //!
 //! User writes preserve the rest of `~/.arcrc` (hosts, aliases). An empty
-//! value deletes the key. Local writes only support git working copies
-//! (see T1128).
+//! value deletes the key. Local writes resolve the enclosing git, hg, or
+//! svn working copy (T1153 CORE-32).
 //!
 //! Console output goes through the shared [`arc_rs::terminal`] API: the
 //! unknown-key warning is a true `tsprintf()` site (escaped `%s`
@@ -24,7 +24,7 @@ use std::process::ExitCode;
 use arc_rs::terminal::{PhtArg, TVal};
 use arc_rs::{
     conduit::{self, EnvelopeKind},
-    config, get_config, git, terminal,
+    config, get_config, terminal,
 };
 
 /// Subcommand name, matching `arc set-config`.
@@ -33,8 +33,9 @@ pub const NAME: &str = "set-config";
 const USAGE: &str = "usage: arc set-config [--local] [--config K=V] [--config-file FILE] [--arcrc-file FILE] [--] <name> <value>\n\
 \n\
 Write an arc configuration option. Writes user configuration (~/.arcrc)\n\
-by default, or the working copy's local configuration (.git/arc/config)\n\
-with --local. An empty value deletes the key.\n\
+by default, or the working copy's local configuration (an arc directory\n\
+under .git, .hg, or .svn, as appropriate) with --local. An empty value\n\
+deletes the key.\n\
 \n\
 Options:\n\
   --local         Write local (working-copy) config instead of user config.\n\
@@ -243,10 +244,23 @@ pub fn apply_user(user_file: &Path, key: &str, raw: &str) -> Result<String, Stri
     Ok(message)
 }
 
-/// Local config file for a repository root: `<root>/.git/arc/config`.
+/// Local config file for a repository root of flavor `kind`:
+/// `<root>/.(git|hg|svn)/arc/config`, mirroring
+/// `ArcanistWorkingCopyIdentity::$localMetaDir` (T1153 CORE-32).
+#[must_use]
+pub fn local_config_path_for(kind: get_config::VcsKind, repo_root: &Path) -> PathBuf {
+    let meta = match kind {
+        get_config::VcsKind::Git => ".git",
+        get_config::VcsKind::Hg => ".hg",
+        get_config::VcsKind::Svn => ".svn",
+    };
+    repo_root.join(meta).join("arc").join("config")
+}
+
+/// Local config file for a git repository root: `<root>/.git/arc/config`.
 #[must_use]
 pub fn local_config_path(repo_root: &Path) -> PathBuf {
-    repo_root.join(".git").join("arc").join("config")
+    local_config_path_for(get_config::VcsKind::Git, repo_root)
 }
 
 /// Read a local config file; a missing file yields an empty config. The
@@ -266,7 +280,7 @@ pub fn read_local_file(path: &Path) -> Result<serde_json::Map<String, serde_json
         .ok_or_else(|| format!("'{}' is not a JSON object", path.display()))
 }
 
-/// Write a local config file, creating `.git/arc/` as needed.
+/// Write a local config file, creating the `arc/` dir as needed.
 pub fn write_local_file(
     path: &Path,
     map: &serde_json::Map<String, serde_json::Value>,
@@ -278,28 +292,41 @@ pub fn write_local_file(
     write_json_file(path, &serde_json::Value::Object(map.clone()), false)
 }
 
-/// Set or delete `key` in the local config of the repository rooted at
-/// `repo_root`. Returns the message to print.
-pub fn apply_local_at(repo_root: &Path, key: &str, raw: &str) -> Result<String, String> {
-    let path = local_config_path(repo_root);
+/// Set or delete `key` in the local config of the `kind` repository
+/// rooted at `repo_root`. Returns the message to print.
+pub fn apply_local_at_kind(
+    kind: get_config::VcsKind,
+    repo_root: &Path,
+    key: &str,
+    raw: &str,
+) -> Result<String, String> {
+    let path = local_config_path_for(kind, repo_root);
     let mut map = read_local_file(&path)?;
     let message = apply_to_map(&mut map, key, raw, "local")?;
     write_local_file(&path, &map)?;
     Ok(message)
 }
 
-/// Set or delete `key` in the local config of the repository containing
-/// `dir`. Fails outside a git working copy with the stock
-/// `scripts/arcanist.php` usage error (`--local` requires a repository).
+/// Set or delete `key` in the local config of the git repository rooted
+/// at `repo_root`. Returns the message to print.
+pub fn apply_local_at(repo_root: &Path, key: &str, raw: &str) -> Result<String, String> {
+    apply_local_at_kind(get_config::VcsKind::Git, repo_root, key, raw)
+}
+
+/// Set or delete `key` in the local config of the working copy
+/// containing `dir`, for git, hg, or svn alike (T1153 CORE-32: the VCS
+/// root comes from [`get_config::find_vcs_root`], pure filesystem like
+/// PHP's `$try` walk — no binaries needed). Fails outside any working
+/// copy with the stock `scripts/arcanist.php` usage error (`--local`
+/// requires a repository).
 pub fn apply_local(dir: &Path, key: &str, raw: &str) -> Result<String, String> {
-    if !git::is_inside_work_tree(dir) {
+    let Some((kind, root)) = get_config::find_vcs_root(dir) else {
         return Err(terminal::pht(
             "This command must be run in a Git, Mercurial or Subversion working copy.",
             &[],
         ));
-    }
-    let top = git::stdout_text(dir, &["rev-parse", "--show-toplevel"])?;
-    apply_local_at(Path::new(&top), key, raw)
+    };
+    apply_local_at_kind(kind, &root, key, raw)
 }
 
 fn apply_to_map(

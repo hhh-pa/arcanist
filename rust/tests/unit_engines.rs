@@ -79,7 +79,10 @@ fn config_plans_engines_and_routes_paths() {
         "docs/d.md".to_string(),
     ];
     let routed = unit_config::match_paths(&paths, &specs[1].include, &specs[1].exclude);
-    assert_eq!(routed, vec!["src/a.cs".to_string(), "lib/b.cs".to_string()]);
+    // T1153 UNIT-U17: the sample rules ("src/", "lib/", "gen/") are not
+    // valid PCRE (delimiter must not be alphanumeric), so `preg_match`
+    // warns and returns false for each: nothing is included, like PHP.
+    assert!(routed.is_empty(), "{routed:?}");
 
     let err = unit_config::parse_engine_specs(
         include_str!("fixtures/uniteng/arcunit_badtype.json"),
@@ -809,4 +812,44 @@ fn phutil_fake_php_failure_surfaces() {
     let err =
         unit::run_single_with_php("phutil", &ctx, &SpawnRunner, &|| Some(php.clone())).unwrap_err();
     assert_eq!(err.message(), "phutil driver failed: fake php exploded");
+}
+
+#[test]
+fn unitu17_preg_include_exclude_routing() {
+    // T1153 UNIT-U17: include/exclude are `preg_match` rules (classes,
+    // alternation, modifiers, anchors), matched unanchored.
+    let paths = vec![
+        "src/a.cs".to_string(),
+        "lib/b.cs".to_string(),
+        "gen/c.cs".to_string(),
+        "docs/d.md".to_string(),
+    ];
+    let routed = unit_config::match_paths(&paths, &["/(src|lib)\\//".to_string()], &[]);
+    assert_eq!(routed, vec!["src/a.cs".to_string(), "lib/b.cs".to_string()]);
+    let routed = unit_config::match_paths(&paths, &[], &["/\\.cs$/".to_string()]);
+    assert_eq!(routed, vec!["docs/d.md".to_string()]);
+    let routed = unit_config::match_paths(
+        &paths,
+        &["/[A-Z]+\\.cs$/i".to_string()],
+        &["/gen/".to_string()],
+    );
+    assert_eq!(routed, vec!["src/a.cs".to_string(), "lib/b.cs".to_string()]);
+    assert!(unit_config::rule_matches("/^gen\\//", "gen/c.cs"));
+    assert!(!unit_config::rule_matches("/^gen\\//", "x/gen/c.cs"));
+}
+
+#[test]
+fn unitu16_arcunit_errors_use_proxy_shape() {
+    // T1153 UNIT-U16: generic wrapper plus the cause on the next line.
+    let err = unit_config::parse_engine_specs(
+        r#"{"engines": {"a": {"type": "phutil", "include": 7}}}"#,
+        "/r/.arcunit",
+        &["phutil"],
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.message(),
+        "Error in parsing '.arcunit' file, for test engine 'a'.\n'include' must be a regex or a list of regexes"
+    );
+    assert!(matches!(err, EngineError::Failed(_)));
 }

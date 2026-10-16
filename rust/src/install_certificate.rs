@@ -23,6 +23,7 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use arc_rs::terminal::PhtArg;
 use arc_rs::{conduit, config, diff_submit, get_config, prompt, terminal};
 
 /// Subcommand name, matching `arc install-certificate`.
@@ -43,7 +44,7 @@ Options:\n\
   --arcrc-file F      Read/write credentials at F instead of ~/.arcrc.\n\
   -h, --help          Show this help.\n";
 
-const EXAMPLE_URI: &str = "https://devtools.example.com/";
+const EXAMPLE_URI: &str = "https://phabricator.example.com/";
 
 /// `pht('Paste API Token from that page:')`.
 const TOKEN_PROMPT: &str = "Paste API Token from that page:";
@@ -190,17 +191,18 @@ pub fn connect_message(uri: &str) -> String {
     format!("Connecting to \"{uri}\"...")
 }
 
-/// The `**LOG IN**` header pattern (`phutil_console_format("**%s**\n")`).
+/// The `**LOGIN TO PHABRICATOR**` header pattern
+/// (`phutil_console_format("**%s**\n")`).
 #[must_use]
 pub fn login_header_markup() -> String {
-    "**LOG IN**\n".to_string()
+    "**LOGIN TO PHABRICATOR**\n".to_string()
 }
 
 /// The login-page block (`"%s\n\n%s\n\n%s"`, no trailing newline).
 #[must_use]
 pub fn login_page_block(token_url: &str) -> String {
     format!(
-        "Open this page in your browser and log in if necessary:\n\n{token_url}\n\nThen paste the API Token on that page below."
+        "Open this page in your browser and login to Phabricator if necessary:\n\n{token_url}\n\nThen paste the API Token on that page below."
     )
 }
 
@@ -256,18 +258,113 @@ pub fn accept_token_line(line: &str) -> Option<String> {
 }
 
 /// Read a whole `~/.arcrc` document; a missing file yields `{}`.
+/// The JSON error mirrors `readUserConfigurationFile()` (T1153 CORE-42),
+/// including its literal `~/.arcrc` (PHP hardcodes it even for custom
+/// paths); the non-object rejection is arc-rs strictness (T1153
+/// CORE-35, kept).
 pub fn read_token_doc(path: &Path) -> Result<serde_json::Value, String> {
     if !path.is_file() {
         return Ok(serde_json::json!({}));
     }
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read '{}': {e}", path.display()))?;
-    let doc: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| format!("'{}' is not a valid JSON file: {e}", path.display()))?;
+    let doc: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
+        terminal::pht(
+            "Your '%s' file is not a valid JSON file.",
+            &[PhtArg::Text("~/.arcrc")],
+        )
+    })?;
     if doc.is_object() {
         Ok(doc)
     } else {
         Err(format!("'{}' is not a JSON object", path.display()))
+    }
+}
+
+/// `readUserConfigurationFile()` permission prompt (T1153 CORE-41):
+/// `pht("File permissions on your %s are too open. Fix them by
+/// chmod'ing to 600?", '~/.arcrc')`.
+const CHMOD_PROMPT: &str =
+    "File permissions on your ~/.arcrc are too open. Fix them by chmod'ing to 600?";
+
+/// Decline text: `pht('Set %s to file mode 600.', '~/.arcrc')`.
+const CHMOD_DECLINED: &str = "Set ~/.arcrc to file mode 600.";
+
+/// True when an existing `path` has group/other permission bits set
+/// (`$mode & 0177`), like PHP's open-mode check. Missing files report
+/// false (PHP only checks when the file exists); an unreadable mode is
+/// PHP's `Unable to read file permissions for "%s"!` error.
+#[cfg(unix)]
+fn arcrc_mode_is_open(path: &Path) -> Result<bool, String> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let mode = std::fs::metadata(path)
+        .map(|metadata| {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode()
+        })
+        .map_err(|_| {
+            format!(
+                "Unable to read file permissions for \"{}\"!",
+                path.display()
+            )
+        })?;
+    Ok(mode & 0o177 != 0)
+}
+
+/// `chmod 600` on `path` (PHP: `execx('chmod 600 %s', ...)`).
+#[cfg(unix)]
+fn chmod_arcrc(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = std::fs::metadata(path)
+        .map_err(|e| format!("cannot chmod '{}': {e}", path.display()))?
+        .permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions)
+        .map_err(|e| format!("cannot chmod '{}': {e}", path.display()))
+}
+
+/// `readUserConfigurationFile()` permission gate (T1153 CORE-41): on
+/// non-Windows, an existing arcrc with group/other bits set prompts to
+/// `chmod 600` (`[Y/n]`, default YES — PHP passes `$default_no =
+/// false`); a decline is the usage error, an accept chmods. Windows
+/// skips the check like PHP (`phutil_is_windows`).
+pub fn ensure_arcrc_permissions(path: &Path) -> Result<(), String> {
+    ensure_arcrc_permissions_from(
+        &mut std::io::stdin().lock(),
+        path,
+        prompt::stdin_is_terminal(),
+    )
+}
+
+/// [`ensure_arcrc_permissions`] with injected input/TTY (deterministic tests).
+pub fn ensure_arcrc_permissions_from(
+    input: &mut dyn BufRead,
+    path: &Path,
+    stdin_tty: bool,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    let _ = (input, path, stdin_tty);
+    #[cfg(windows)]
+    return Ok(());
+    #[cfg(not(windows))]
+    ensure_arcrc_permissions_unix(input, path, stdin_tty)
+}
+
+/// Non-Windows half of [`ensure_arcrc_permissions_from`].
+#[cfg(not(windows))]
+fn ensure_arcrc_permissions_unix(
+    input: &mut dyn BufRead,
+    path: &Path,
+    stdin_tty: bool,
+) -> Result<(), String> {
+    if !arcrc_mode_is_open(path)? {
+        return Ok(());
+    }
+    match prompt_confirm_from(input, CHMOD_PROMPT, false, stdin_tty)? {
+        true => chmod_arcrc(path),
+        false => Err(CHMOD_DECLINED.to_string()),
     }
 }
 
@@ -476,22 +573,30 @@ pub fn install_certificate_flow(
     Ok(info)
 }
 
-/// The `writeInfo` CONNECT line (stderr; status blue).
+/// The `writeInfo` CONNECT line (stderr; status blue). PHP's
+/// `writeInfo`/`writeOkay` nest the ANSI codes in status order
+/// (`<bg:color>** %s **</bg>`), unlike log-engine lines (T1153 CORE-44).
 #[must_use]
 pub fn render_connect(uri: &str, ansi: bool) -> String {
-    terminal::format_log("blue", connect_title(), &connect_message(uri), ansi)
+    terminal::format_status_message("blue", connect_title(), &connect_message(uri), ansi)
 }
 
-/// The `**LOG IN**` header line (stdout).
+/// The `**LOGIN TO PHABRICATOR**` header line (stdout).
 pub fn render_login_header(ansi: bool) -> Result<String, String> {
-    terminal::tsprintf_ansi("**%s**\n", &[terminal::TVal::Text("LOG IN")], ansi)
-        .map(|line| line.as_str().to_string())
+    terminal::tsprintf_ansi(
+        "**%s**\n",
+        &[terminal::TVal::Text("LOGIN TO PHABRICATOR")],
+        ansi,
+    )
+    .map(|line| line.as_str().to_string())
 }
 
-/// The green `** SUCCESS! **` banner (stdout; success green).
+/// The green `** SUCCESS! **` banner (stdout; success green, status
+/// nesting like the `phutil_console_format("<bg:green>** %s **</bg>
+/// %s\n", ...)` call site — T1153 CORE-44).
 #[must_use]
 pub fn render_success(is_token_auth: bool, ansi: bool) -> String {
-    terminal::format_log(
+    terminal::format_status_message(
         "green",
         success_title(),
         success_message(is_token_auth),
@@ -868,6 +973,11 @@ fn prepare_install(argv: &[String]) -> Result<InstallPlan, ExitCode> {
     };
     let uri = resolve_install_uri(&options, &cwd)?;
     let arcrc = install_arcrc_for(options.arcrc_file.as_deref())?;
+    // T1153 CORE-41: PHP's `readUserConfigurationFile()` gates on
+    // permissions before parsing the JSON.
+    if let Err(message) = ensure_arcrc_permissions(&arcrc) {
+        return Err(fail(message));
+    }
     let doc = match read_token_doc(&arcrc) {
         Ok(doc) => doc,
         Err(message) => return Err(fail(message)),

@@ -861,24 +861,30 @@ fn mutates_working_copy() {
 }
 
 #[test]
-fn amends_nothing_when_unchanged() {
-    let fake = FakeHg::named("amendnoop");
+fn lint23_amend_always_runs_commit_amend() {
+    // T1153 LINT-23: ceb runs `commit --amend` unconditionally — no
+    // early return when unchanged, no status/children/evolve probes.
+    let fake = FakeHg::named("amendalways");
     fake.write(".fakehg-msg", b"same message");
     amend_commit_with(&fake.dir, &fake.hg, None, None).unwrap();
     amend_commit_with(&fake.dir, &fake.hg, Some("same message"), None).unwrap();
     let log = fake.log();
-    assert!(!log.contains("amend"), "{log}");
+    assert_eq!(log.matches("commit --amend --logfile").count(), 2, "{log}");
+    assert!(!log.contains("status"), "{log}");
+    assert!(!log.contains("children"), "{log}");
+    assert!(!log.contains("evolve"), "{log}");
 }
 
 #[test]
 fn amends_head_and_non_head() {
+    // T1153 LINT-23: the amend path is a single `commit --amend` with
+    // no children probe; the non-head helper below is exercised
+    // directly (2023-only, retained unwired).
     let head = FakeHg::named("amendhead");
-    head.write(".fakehg-status", b"M a.txt\n");
-    head.write(".fakehg-msg", b"old message");
-    head.write(".fakehg-fail-prune", b"");
     amend_commit_with(&head.dir, &head.hg, Some("new message"), None).unwrap();
     let log = head.log();
     assert!(log.contains("commit --amend --logfile"), "{log}");
+    assert!(!log.contains("children"), "{log}");
 
     let non_head = FakeHg::named("amendnonhead");
     non_head.write(".fakehg-status", b"M a.txt\n");
@@ -903,15 +909,72 @@ fn amends_head_and_non_head() {
     assert!(log.contains("extensions.arc-hg="), "{log}");
 }
 
+/// Backend whose `commit` fails with canned stdout/stderr: `sh` on
+/// unix, `cmd /C` on Windows. Removed on drop.
+struct FailBackend {
+    dir: PathBuf,
+    hg: HgCommand,
+}
+
+impl FailBackend {
+    fn failing(tag: &str, stdout_line: &str, stderr_line: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("arc-rs-hg-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(windows)]
+        let hg = {
+            let bat = dir.join("failhg.bat");
+            let body = format!(
+                "@echo off\r\necho {stdout_line}\r\necho {stderr_line}>&2\r\nexit /b 1\r\n"
+            );
+            std::fs::write(&bat, body).unwrap();
+            HgCommand::custom("cmd", &["/C", &bat.to_string_lossy()])
+        };
+        #[cfg(not(windows))]
+        let hg = {
+            let sh = dir.join("failhg.sh");
+            let body =
+                format!("#!/bin/sh\necho \"{stdout_line}\"\necho \"{stderr_line}\" >&2\nexit 1\n");
+            std::fs::write(&sh, &body).unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&sh).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&sh, perms).unwrap();
+            }
+            HgCommand::custom(&sh.to_string_lossy(), &[])
+        };
+        Self { dir, hg }
+    }
+}
+
+impl Drop for FailBackend {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
 #[test]
-fn amends_with_evolve() {
-    let fake = FakeHg::named("amendevolve");
-    fake.write(".fakehg-status", b"M a.txt\n");
-    fake.write(".fakehg-msg", b"old message");
-    amend_commit_with(&fake.dir, &fake.hg, Some("new message"), None).unwrap();
-    let log = fake.log();
-    assert!(log.contains("amend --logfile"), "{log}");
-    assert!(log.contains("evolve --all --"), "{log}");
+fn lint23_amend_swallows_nothing_changed_on_stdout() {
+    // T1153 LINT-23: a `/nothing changed/` failure on stdout is a
+    // no-op success, like PHP's `$ex->getStdout()` match.
+    let fake = FailBackend::failing("amendnoop", "abort: nothing changed", "err");
+    amend_commit_with(&fake.dir, &fake.hg, Some("msg"), None).unwrap();
+}
+
+#[test]
+fn lint23_amend_rethrows_other_failures() {
+    // T1153 LINT-23: any other failure propagates with the combined
+    // output; a stderr-only `nothing changed` does NOT match (PHP
+    // matches stdout only).
+    let fake = FailBackend::failing("amendfail", "abort: locked", "detail");
+    let err = amend_commit_with(&fake.dir, &fake.hg, Some("msg"), None).unwrap_err();
+    assert!(err.contains("abort: locked"), "{err}");
+    assert!(err.contains("detail"), "{err}");
+    let fake = FailBackend::failing("amenderr", "abort: locked", "nothing changed");
+    let err = amend_commit_with(&fake.dir, &fake.hg, Some("msg"), None).unwrap_err();
+    assert!(err.contains("abort: locked"), "{err}");
 }
 
 #[test]

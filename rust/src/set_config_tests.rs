@@ -214,6 +214,36 @@ fn local_apply_requires_a_repo() {
 }
 
 #[test]
+fn core32_local_writes_cover_hg_and_svn_roots() {
+    // T1153 CORE-32 (write half): `--local` resolves the VCS root for
+    // git, hg, and svn alike (filesystem markers, no binaries needed),
+    // writing `arc/config` under the right metadata dir from subdirs.
+    for (meta, kind) in [
+        (".hg", get_config::VcsKind::Hg),
+        (".svn", get_config::VcsKind::Svn),
+        (".git", get_config::VcsKind::Git),
+    ] {
+        let tmp = TempDir::new("localvcs");
+        let root = tmp.path.join("proj");
+        std::fs::create_dir_all(root.join(meta)).unwrap();
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let message = apply_local(&sub, "editor", "nano").unwrap();
+        assert!(message.contains("local config"), "{message}");
+        let stored = read_local_file(&local_config_path_for(kind, &root)).unwrap();
+        assert_eq!(stored["editor"], serde_json::json!("nano"));
+        // Delete round-trips through the same path.
+        apply_local(&sub, "editor", "").unwrap();
+        let stored = read_local_file(&local_config_path_for(kind, &root)).unwrap();
+        assert!(!stored.contains_key("editor"));
+    }
+    assert_eq!(
+        local_config_path(Path::new("/r")),
+        PathBuf::from("/r/.git/arc/config")
+    );
+}
+
+#[test]
 fn args_require_key_and_value() {
     assert!(parse_args(&[]).is_err());
     assert!(parse_args(&["only".to_string()]).is_err());

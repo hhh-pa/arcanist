@@ -2959,6 +2959,11 @@ fn dispatch_inner(argv: &[String], globals: &Globals) -> ExitCode {
     dispatch_action(classify(argv), argv, globals)
 }
 
+/// Binary entry: strip globals, trace, expand aliases, gate the
+/// non-interactive `--` rule, dispatch. T1153 CORE-18 stays unported
+/// (Rule 3): PHP's SIGINT double-press routing needs `pcntl_signal`,
+/// which has no `std` equivalent (`libc` is transitive-only and
+/// `Cargo.toml` is frozen), so interrupts keep the default behavior.
 fn main() -> ExitCode {
     let full: Vec<String> = std::env::args().collect();
     let argv: Vec<String> = full.iter().skip(1).cloned().collect();

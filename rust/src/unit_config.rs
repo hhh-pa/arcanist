@@ -6,19 +6,19 @@
 //! `shouldEchoTestResults` (lines 172-174), and `matchPaths` (lines 186-218).
 //!
 //! Divergences from PHP (each cites the PHP line it relaxes):
-//! - `include`/`exclude` rules are matched with an ordered-substring matcher
-//!   instead of `preg_match($rule, $path)` (line 195): this port has no regex
-//!   engine (dependency-free crate). Rules with `(.*)` match their literal
-//!   parts in order; other rules match as literal substrings after stripping
-//!   delimiters and `^`/`$` anchors. Regex character classes, quantifiers, and
-//!   alternations are not supported.
 //! - `loadAvailableTestEngines` (lines 176-181) uses a class-map query; here
 //!   the caller supplies the available engine names explicitly.
 //! - `run` renders proxied results through `ArcanistUnitRenderer`
 //!   (lines 151-157); rendering is out of scope, so this port only merges.
+//!
+//! `include`/`exclude` rules match with the shared PCRE engine
+//! (`arclint::pcre_matches`, T1153 UNIT-U17), mirroring
+//! `preg_match($rule, $path)` (line 195): invalid patterns never match,
+//! like PHP's warn-and-`false`.
 
 extern crate self as arc_rs;
 
+use arc_rs::arclint;
 use arc_rs::unit_engine::{EngineContext, EngineError, JsonValue, UnitResult, parse_json};
 use std::collections::HashMap;
 
@@ -41,6 +41,16 @@ pub struct PlannedEngine {
     pub include: Vec<String>,
     /// `exclude` rules (line 102; empty when absent).
     pub exclude: Vec<String>,
+}
+
+/// A `PhutilProxyException` rendering (T1153 UNIT-U16): PHP prints the
+/// wrapper plus each chain message on its own line
+/// (`scripts/arcanist.php:449-468`), so the wrapper ends with a period
+/// and the cause follows on the next line (same shape as the LINT-40
+/// port; inner `PhutilTypeSpec` wordings live in unpinned libphutil, so
+/// only the wrapper shape is exact).
+fn proxy_failed(wrapper: String, detail: String) -> EngineError {
+    EngineError::Failed(format!("{wrapper}.\n{detail}"))
 }
 
 /// Parse one spec's `include`/`exclude` value: a single regex string or a list
@@ -71,15 +81,19 @@ pub fn parse_engine_specs(
     available: &[&str],
 ) -> Result<Vec<PlannedEngine>, EngineError> {
     let config = parse_json(data).map_err(|e| {
-        EngineError::Failed(format!(
-            "Expected '.arcunit' file to be a valid JSON file, but failed to decode \
-             '{config_path}': {e}"
-        ))
+        proxy_failed(
+            format!(
+                "Expected '.arcunit' file to be a valid JSON file, but failed to decode \
+                 '{config_path}'"
+            ),
+            e.to_string(),
+        )
     })?;
     let Some(entries) = config.get("engines").and_then(JsonValue::as_obj) else {
-        return Err(EngineError::Failed(format!(
-            "Error in parsing '{config_path}' file: expected an 'engines' map."
-        )));
+        return Err(proxy_failed(
+            format!("Error in parsing '{config_path}' file"),
+            "expected an 'engines' map".to_string(),
+        ));
     };
     check_spec_shapes(entries, config_path)?;
 
@@ -97,12 +111,12 @@ fn check_spec_shapes(
     config_path: &str,
 ) -> Result<(), EngineError> {
     for (name, spec) in entries {
-        let Some(spec_obj) = spec.as_obj() else {
-            return Err(EngineError::Failed(format!(
-                "Error in parsing '{config_path}' file: engine '{name}' must be a map."
-            )));
-        };
-        let _ = spec_obj;
+        if spec.as_obj().is_none() {
+            return Err(proxy_failed(
+                format!("Error in parsing '{config_path}' file"),
+                format!("engine '{name}' must be a map"),
+            ));
+        }
     }
     Ok(())
 }
@@ -130,11 +144,12 @@ fn parse_single_spec(
         )));
     }
 
+    let context = format!("Error in parsing '.arcunit' file, for test engine '{name}'");
     let Some(engine_type) = engine_type else {
-        return Err(EngineError::Failed(format!(
-            "Error in parsing '.arcunit' file, for test engine '{name}': expected a \
-             'type' string."
-        )));
+        return Err(proxy_failed(
+            context,
+            "expected a 'type' string".to_string(),
+        ));
     };
     let mut include = Vec::new();
     let mut exclude = Vec::new();
@@ -143,25 +158,25 @@ fn parse_single_spec(
             "type" => {}
             "include" => {
                 include = parse_rule_list(value).ok_or_else(|| {
-                    EngineError::Failed(format!(
-                        "Error in parsing '.arcunit' file, for test engine '{name}': \
-                         'include' must be a regex or a list of regexes."
-                    ))
+                    proxy_failed(
+                        context.clone(),
+                        "'include' must be a regex or a list of regexes".to_string(),
+                    )
                 })?;
             }
             "exclude" => {
                 exclude = parse_rule_list(value).ok_or_else(|| {
-                    EngineError::Failed(format!(
-                        "Error in parsing '.arcunit' file, for test engine '{name}': \
-                         'exclude' must be a regex or a list of regexes."
-                    ))
+                    proxy_failed(
+                        context.clone(),
+                        "'exclude' must be a regex or a list of regexes".to_string(),
+                    )
                 })?;
             }
             _ => {
-                return Err(EngineError::Failed(format!(
-                    "Error in parsing '.arcunit' file, for test engine '{name}': unknown \
-                     key '{key}'."
-                )));
+                return Err(proxy_failed(
+                    context.clone(),
+                    format!("unknown key '{key}'"),
+                ));
             }
         }
     }
@@ -190,76 +205,13 @@ pub fn load_engine_specs(
     parse_engine_specs(&data, &config_path, available)
 }
 
-/// Ordered-substring rule matcher standing in for `preg_match($rule, $path)`
-/// (line 195). See the module docs for the Divergence.
+/// `preg_match($rule, $path)` (line 195) via the shared PCRE engine:
+/// unanchored match; invalid patterns never match (PHP warns and returns
+/// `false`). Patterns are validated at match time only, like PHP (the
+/// LINT twin `arclint::route_paths` ports the same `matchPaths` copy).
 #[must_use]
 pub fn rule_matches(rule: &str, path: &str) -> bool {
-    let body = strip_rule_delimiters(rule);
-    if body.contains("(.*)") {
-        return match_capture_rule(body, path);
-    }
-    match_literal_rule(body, path)
-}
-
-/// Strip `preg_match` delimiters with trailing flags, e.g. `@...@i`.
-/// Bracket openers are never treated as delimiters: a rule starting with a
-/// group (e.g. `(.*)Tests/`) is matched as a body instead.
-fn strip_rule_delimiters(rule: &str) -> &str {
-    let body = rule;
-    if body.len() >= 2 {
-        let first = body.chars().next().unwrap_or('\0');
-        let is_bracket = matches!(first, '(' | '[' | '{' | '<');
-        if !first.is_alphanumeric()
-            && first != '\\'
-            && first != '\0'
-            && !is_bracket
-            && let Some(last) = body.rfind(first)
-            && last > 0
-        {
-            return &body[1..last];
-        }
-    }
-    body
-}
-
-/// Ordered literal match around `(.*)` captures: the first part anchors at
-/// the path start, later parts match in order.
-fn match_capture_rule(body: &str, path: &str) -> bool {
-    let mut rest = path;
-    for (i, part) in body.split("(.*)").enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-        let part = part.replace("\\/", "/");
-        if i == 0 {
-            if let Some(stripped) = rest.strip_prefix(part.as_str()) {
-                rest = stripped;
-            } else {
-                return false;
-            }
-        } else if let Some(at) = rest.find(part.as_str()) {
-            rest = &rest[at + part.len()..];
-        } else {
-            return false;
-        }
-    }
-    true
-}
-
-/// Literal substring match after stripping `^`/`$` anchors.
-fn match_literal_rule(body: &str, path: &str) -> bool {
-    let mut literal = body.to_string();
-    if literal.starts_with('^') {
-        literal.remove(0);
-    }
-    if literal.ends_with('$') {
-        literal.pop();
-    }
-    literal = literal.replace("\\/", "/");
-    if literal.is_empty() {
-        return true;
-    }
-    path.contains(&literal)
+    arclint::pcre_matches(rule, path)
 }
 
 /// `matchPaths` (lines 186-218): keep paths matching any include rule (or all

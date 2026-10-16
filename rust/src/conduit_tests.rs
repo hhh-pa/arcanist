@@ -701,6 +701,51 @@ fn rbd8_auth_identity_cache_roundtrips() {
 }
 
 #[test]
+fn land22_cached_user_phid_reuses_handshake() {
+    // T1153 LAND-22: a cached handshake identity answers without any
+    // `user.whoami` call (no network here: the test client points at
+    // an unroutable host, so a call would fail loudly).
+    let client = test_client();
+    assert_eq!(client.authenticated_user(), None);
+    client.set_authenticated_user("alice", "PHID-USER-1");
+    assert_eq!(client.cached_user_phid().unwrap(), "PHID-USER-1");
+}
+
+#[test]
+fn unitu21_wire_escapes_non_ascii_like_php() {
+    // T1153 UNIT-U21: PHP `json_encode()` emits lowercase `\uXXXX`
+    // (surrogate pairs past U+FFFF); ASCII — including serde's own
+    // escapes and the caller's `\/` — passes through untouched.
+    assert_eq!(escape_non_ascii_json(r#"{"a":1}"#), r#"{"a":1}"#);
+    assert_eq!(escape_non_ascii_json("a\\/b\"c\\\\d"), "a\\/b\"c\\\\d");
+    assert_eq!(escape_non_ascii_json("é"), "\\u00e9");
+    assert_eq!(escape_non_ascii_json("ü/中"), "\\u00fc/\\u4e2d");
+    assert_eq!(escape_non_ascii_json("😀"), "\\ud83d\\ude00");
+    assert_eq!(escape_non_ascii_json("a\u{2028}b"), "a\\u2028b");
+}
+
+#[test]
+fn unitu21_call_body_carries_escaped_params() {
+    // T1153 UNIT-U21: end to end through `encode_call_body` (offline:
+    // no gzip capability, no post): the form body carries the
+    // `\uXXXX` escapes rawurlencoded, never raw UTF-8.
+    let client = test_client();
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "name".to_string(),
+        serde_json::Value::String("héllo.wörld/a".to_string()),
+    );
+    let (body, gzipped) = client.encode_call_body("conduit.ping", &mut map).unwrap();
+    assert!(!gzipped);
+    let body = String::from_utf8(body).unwrap();
+    assert!(body.contains("%5Cu00e9"), "{body}");
+    assert!(body.contains("%5Cu00f6"), "{body}");
+    assert!(body.contains("%5C%2F"), "{body}");
+    assert!(!body.contains("é"), "{body}");
+    assert!(!body.contains("ö"), "{body}");
+}
+
+#[test]
 fn core16_toolset_parse_error_is_bold() {
     // Bold `**Usage Exception:**` rendering like `Usage` (the toolset
     // `parse()` catch), exit 1; `report()` rethrows only

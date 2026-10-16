@@ -243,6 +243,32 @@ impl Client {
             .clone()
     }
 
+    /// Authenticated user's PHID, reusing the handshake identity when one
+    /// is cached (T1153 LAND-22: PHP's `authenticateConduit()` resolves
+    /// `user.whoami` once, then reuses `userPHID`, instead of calling
+    /// `user.whoami` per workflow). On a cache miss the identity is
+    /// resolved and cached for later callers.
+    pub fn cached_user_phid(&self) -> Result<String, String> {
+        if let Some((_, phid)) = self.authenticated_user() {
+            return Ok(phid);
+        }
+        let who = self
+            .call("user.whoami", &serde_json::json!({}))
+            .map_err(|e| e.to_string())?;
+        let user = who
+            .get("userName")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string();
+        let phid = who
+            .get("phid")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| "conduit user.whoami response has no phid".to_string())?;
+        self.set_authenticated_user(&user, &phid);
+        Ok(phid)
+    }
+
     /// Translate a toolset API failure into login guidance, if any
     /// (T1153 CORE-5): the `ArcanistConduitCallFuture` mapping turns
     /// `ERR-INVALID-SESSION` (tokenless engine) and `ERR-INVALID-AUTH`
@@ -330,6 +356,9 @@ impl Client {
         let json = serde_json::to_string(&map).map_err(json_protocol_error)?;
         // PHP `json_encode()` escapes `/` as `\/`; serde does not.
         let json = json.replace('/', "\\/");
+        // PHP `json_encode()` escapes non-ASCII as `\uXXXX`; serde emits
+        // raw UTF-8 (T1153 UNIT-U21).
+        let json = escape_non_ascii_json(&json);
         let query = build_query(&json);
         let gzipped = self.uses_gzip();
         let body = if gzipped {
@@ -454,6 +483,39 @@ impl Client {
 
 fn json_string(text: &str) -> serde_json::Value {
     serde_json::Value::String(text.to_string())
+}
+
+/// Escape non-ASCII characters in an encoded JSON blob as lowercase
+/// `\uXXXX` (surrogate pairs past U+FFFF), mirroring PHP's
+/// `json_encode()` default. ASCII passes through untouched, so serde's
+/// own `"`, `\`, and control escapes plus the caller's `\/` survive.
+fn escape_non_ascii_json(json: &str) -> String {
+    if json.is_ascii() {
+        return json.to_string();
+    }
+    let mut out = String::with_capacity(json.len());
+    for chr in json.chars() {
+        if chr.is_ascii() {
+            out.push(chr);
+        } else {
+            push_escaped_char(&mut out, chr);
+        }
+    }
+    out
+}
+
+/// Append `chr` (non-ASCII) as `\uXXXX`, splitting astral characters
+/// into UTF-16 surrogate pairs like PHP's `json_encode()`.
+fn push_escaped_char(out: &mut String, chr: char) {
+    let mut code = chr as u32;
+    if code < 0x1_0000 {
+        out.push_str(&format!("\\u{code:04x}"));
+        return;
+    }
+    code -= 0x1_0000;
+    let high = 0xd800 + (code >> 10);
+    let low = 0xdc00 + (code & 0x3ff);
+    out.push_str(&format!("\\u{high:04x}\\u{low:04x}"));
 }
 
 fn implicit_port(scheme: &str) -> u16 {

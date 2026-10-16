@@ -1771,8 +1771,9 @@ pub fn svn_lang_env_var() -> &'static str {
 }
 
 /// Failure message for `svn commit`, starting from the PHP sentence
-/// (`ArcanistCommitWorkflow.php:163`) with the captured output appended:
-/// PHP streams it live, while this port captures it.
+/// (`ArcanistCommitWorkflow.php:163`) with the captured stdout appended:
+/// stderr already streamed live, while stdout is captured and never
+/// shown on failure (the caller gets `Err`), so it rides along here.
 fn commit_failed_message(out: &std::process::Output) -> String {
     const BASE: &str = "Executing 'svn commit' failed!";
     let detail = format!(
@@ -1792,9 +1793,10 @@ fn commit_failed_message(out: &std::process::Output) -> String {
 /// -F <tmp>`, with `LANG` set to `locale` when given.
 ///
 /// PHP: the `svn commit` call in `ArcanistCommitWorkflow::run`
-/// (`src/workflow/ArcanistCommitWorkflow.php:148-164`). Returns raw
-/// stdout (the `Sending ... Committed revision N` progress) so callers
-/// can show it, like PHP's passthru.
+/// (`src/workflow/ArcanistCommitWorkflow.php:148-164`), which runs
+/// `phutil_passthru` (live stdio). Stderr streams live like PHP's
+/// (T1153 CORE-65); stdout is captured and returned (the `Sending ...
+/// Committed revision N` progress) so the caller can show it.
 pub fn commit_with_locale(
     dir: &Path,
     svn: &SvnCommand,
@@ -1812,6 +1814,10 @@ pub fn commit_with_locale(
     if let Some(locale) = locale {
         cmd.env("LANG", locale);
     }
+    // T1153 CORE-65: PHP's `phutil_passthru` streams both pipes live;
+    // stderr inherits the terminal here while stdout stays captured for
+    // the caller to show.
+    cmd.stderr(std::process::Stdio::inherit());
     let out = spawn_output(&mut cmd).map_err(|e| format!("failed to run {}: {e}", svn.program))?;
     std::fs::remove_file(&tmp).ok();
     if !out.status.success() {

@@ -1100,3 +1100,34 @@ fn commit_sets_lang_for_the_child() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn core65_commit_streams_stderr_and_returns_stdout() {
+    // T1153 CORE-65: stderr inherits the terminal (a line lands on the
+    // test's stderr here) while stdout stays captured for the caller.
+    let dir = std::env::temp_dir().join(format!("arc-rs-svn-pipes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    #[cfg(windows)]
+    let svn = {
+        let bat = dir.join("pipes.bat");
+        std::fs::write(&bat, "@echo off\r\necho Sending .\r\necho noise>&2\r\n").unwrap();
+        SvnCommand::custom("cmd", &["/C", &bat.to_string_lossy()])
+    };
+    #[cfg(not(windows))]
+    let svn = {
+        let sh = dir.join("pipes.sh");
+        std::fs::write(&sh, "#!/bin/sh\necho \"Sending .\"\necho noise >&2\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&sh).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&sh, perms).unwrap();
+        }
+        SvnCommand::custom(&sh.to_string_lossy(), &[])
+    };
+    let out = commit_with_locale(&dir, &svn, &[], "msg\n", None).unwrap();
+    assert!(out.contains("Sending ."), "unexpected: {out}");
+    assert!(!out.contains("noise"), "unexpected: {out}");
+    std::fs::remove_dir_all(&dir).ok();
+}
