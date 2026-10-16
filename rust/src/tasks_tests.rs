@@ -214,3 +214,10 @@ fn execute_propagates_conduit_errors() {
     let err = execute(&client, &options).unwrap_err();
     assert!(!err.is_empty());
 }
+
+#[test]
+fn r4_rbd4_parse_error_has_no_dump() {
+    // `tasks` is a subprocess workflow: argument errors render `Usage
+    // Exception:` (exit 1) with no usage dump.
+    assert_eq!(run(&args(&["--bogus"])), std::process::ExitCode::FAILURE);
+}

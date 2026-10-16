@@ -93,6 +93,9 @@ fn renders_call_conduit_envelope() {
 
 #[test]
 fn call_conduit_execute_rejects_bad_stdin_without_io() {
+    // T1153 R4 (CORE-6): the stdin error is an `ArcanistUsageException`
+    // in the toolset runtime, which escapes into a PHP fatal (255),
+    // not a caught exit 1.
     let args = CallArgs {
         method: "m".to_string(),
         conduit_uri: None,
@@ -100,13 +103,15 @@ fn call_conduit_execute_rejects_bad_stdin_without_io() {
     let mut out = Vec::new();
     assert_eq!(
         run_call_conduit_with(&args, &b"nope"[..], &mut out),
-        ExitCode::FAILURE
+        ExitCode::from(255)
     );
     assert!(out.is_empty());
 }
 
 #[test]
 fn call_conduit_execute_reports_missing_token_without_io() {
+    // T1153 R4 (CORE-6): conduit setup failures escape the toolset
+    // runtime into a PHP fatal (255), like transport failures.
     let args = CallArgs {
         method: "m".to_string(),
         conduit_uri: Some("https://call-conduit-test.invalid/".to_string()),
@@ -114,7 +119,7 @@ fn call_conduit_execute_reports_missing_token_without_io() {
     let mut out = Vec::new();
     assert_eq!(
         run_call_conduit_with(&args, &b"{}"[..], &mut out),
-        ExitCode::FAILURE
+        ExitCode::from(255)
     );
     assert!(out.is_empty());
 }
@@ -379,4 +384,22 @@ fn call_conduit_help_flag_as_uri_value_is_not_help() {
         classify(&args(&["call-conduit", "--conduit-uri", "--help"])),
         Action::Error("Provide exactly one Conduit method name to call.".to_string())
     );
+}
+
+#[test]
+fn r4_core49_unknown_command_exits_1() {
+    // Unknown commands render `Usage Exception:` (subprocess arm)
+    // with exit 1 and no usage dump.
+    assert_eq!(dispatch(&args(&["bogus-command"])), ExitCode::FAILURE);
+}
+
+#[test]
+fn r4_core49_call_conduit_parse_error_exits_1() {
+    // `call-conduit` parser errors render the toolset `USAGE
+    // EXCEPTION` label with exit 1 and no usage dump.
+    assert_eq!(
+        dispatch(&args(&["call-conduit", "--bogus"])),
+        ExitCode::FAILURE
+    );
+    assert_eq!(dispatch(&args(&["call-conduit"])), ExitCode::FAILURE);
 }

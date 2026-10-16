@@ -972,3 +972,10 @@ fn fixed_tz_subprocesses_match_oracles() {
         );
     }
 }
+
+#[test]
+fn r4_rbd4_parse_error_has_no_dump() {
+    // `look` runs in the toolset runtime: argument errors render
+    // `USAGE EXCEPTION` (exit 1) with no usage dump.
+    assert_eq!(run(&args(&["--bogus"])), std::process::ExitCode::FAILURE);
+}

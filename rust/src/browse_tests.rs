@@ -573,3 +573,35 @@ fn wraps_select_prompts_at_indent_four() {
     );
     assert_eq!(select_prompt("Pick?", 1, 3), "    Pick? [1 - 3] ");
 }
+
+#[test]
+fn r4_browseb22_parse_error_exits_1() {
+    // Toolset parser errors render `USAGE EXCEPTION` with exit 1
+    // and no usage dump.
+    let dir = std::env::temp_dir();
+    let mut input: &[u8] = &[];
+    assert_eq!(
+        run_in_with(&dir, &argv(&["--bogus"]), None, &mut input),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn r4_browseb20_workflow_error_is_fatal() {
+    // `browse` runs in the toolset runtime: workflow errors escape
+    // into a fatal (255). An unresolvable target with an injected
+    // failing caller exercises the fatal arm without network.
+    let dir = std::env::temp_dir();
+    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        Err("boom".to_string())
+    };
+    let mut input: &[u8] = &[];
+    let options = match parse_args(&argv(&["T999"])) {
+        Parsed::Options(options) => options,
+        _ => panic!("expected options"),
+    };
+    assert_eq!(
+        run_prepared(&dir, &options, &call, "", &mut input),
+        std::process::ExitCode::from(255)
+    );
+}

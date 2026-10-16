@@ -24,7 +24,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::{
-    browser, config, diff_submit, get_config, git,
+    browser,
+    conduit::{self, EnvelopeKind},
+    config, diff_submit, get_config, git,
     terminal::{self, PhtArg, TVal},
     which,
 };
@@ -1346,8 +1348,9 @@ pub fn run_in_with(
             return ExitCode::SUCCESS;
         }
         Parsed::Error(message) => {
-            eprintln!("arc {NAME}: {message}\n\n{USAGE}");
-            return ExitCode::FAILURE;
+            // T1153 R4 (BROWSE-B22): toolset parser errors render the
+            // red `USAGE EXCEPTION` label with no usage dump.
+            return conduit::report(EnvelopeKind::ToolsetUsage, &message);
         }
         Parsed::Options(options) => options,
     };
@@ -1369,10 +1372,9 @@ pub fn run_in_with(
     }
     let client = match config::client_for(None) {
         Ok(client) => client,
-        Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            return ExitCode::FAILURE;
-        }
+        // T1153 R4 (BROWSE-B20): `browse` runs in the toolset runtime,
+        // so workflow errors escape into a PHP fatal (255).
+        Err(message) => return conduit::report(EnvelopeKind::Fatal, &message),
     };
     let live = |method: &str, params: &serde_json::Value| {
         client.call(method, params).map_err(|e| e.to_string())
@@ -1392,15 +1394,13 @@ pub fn run_prepared(
     let refs = build_refs(options);
     let uris = match execute_refs(&mut ctx, &refs, input, terminal::ansi_enabled()) {
         Ok(uris) => uris,
-        Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            return ExitCode::FAILURE;
-        }
+        // T1153 R4 (BROWSE-B20): fatal (see above).
+        Err(message) => return conduit::report(EnvelopeKind::Fatal, &message),
     };
     let configured = browser::configured_browser(dir);
     if let Err(message) = browser::open_uris_in_browser(&uris, configured.as_deref()) {
-        eprintln!("arc {NAME}: {message}");
-        return ExitCode::FAILURE;
+        // T1153 R4 (BROWSE-B20): fatal (see above).
+        return conduit::report(EnvelopeKind::Fatal, &message);
     }
     ExitCode::SUCCESS
 }

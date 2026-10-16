@@ -25,10 +25,17 @@ pub enum Error {
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // T1153 CORE-6: PHP prints conduit failures with no `transport
+        // error:` / `protocol error:` / `conduit error` infix — the raw
+        // exception message goes under the envelope banner (subprocess)
+        // or into the fatal trace (toolset runtime). API failures render
+        // exactly like `ConduitClientException` (`"{code}: {info}"`,
+        // `src/conduit/ConduitClientException.php:7-9`). The `<method>`
+        // infix baked into `info` above is CORE-1's, left untouched.
         match self {
-            Error::Transport(msg) => write!(f, "transport error: {msg}"),
-            Error::Protocol(msg) => write!(f, "protocol error: {msg}"),
-            Error::Api { code, info } => write!(f, "conduit error {code}: {info}"),
+            Error::Transport(msg) => write!(f, "{msg}"),
+            Error::Protocol(msg) => write!(f, "{msg}"),
+            Error::Api { code, info } => write!(f, "{code}: {info}"),
         }
     }
 }
@@ -606,6 +613,183 @@ fn parse_response(text: &str, method: &str) -> Result<serde_json::Value, Error> 
 /// PHP `if ($data['error_code'])`: only truthy codes are failures.
 fn has_error_code(code: Option<&serde_json::Value>) -> bool {
     code.is_some_and(php_truthy)
+}
+
+/// Exit code for an uncaught toolset error. `ArcanistRuntime::execute()`
+/// catches four exception types; anything else (including
+/// `ArcanistUsageException`) escapes into a PHP fatal, which exits 255
+/// (`src/runtime/ArcanistRuntime.php:18-50`,
+/// `support/init/init-arcanist.php`).
+pub const EXIT_FATAL: u8 = 255;
+
+/// Error class for the T1153 R4 exit envelope, the one shared port of
+/// the two ceb dispatch envelopes. Toolset workflows (those extending
+/// `ArcanistArcWorkflow`: land, liberate, browse, download, upload,
+/// weld, look, inspect, branches, markers, ...) run in-process under
+/// `ArcanistRuntime::execute()`; classic workflows (lint, unit,
+/// linters, export, set-config, which, list, tasks, todo, ...) run in a
+/// `scripts/arcanist.php` subprocess via `phutil_passthru`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvelopeKind {
+    /// `ArcanistNoEffectException`: message on stdout, exit 0
+    /// (`scripts/arcanist.php:428-430`).
+    NoEffect,
+    /// Subprocess `ArcanistUsageException`: `Usage Exception: {msg}`
+    /// on stderr, exit 1, no usage dump (`:432-444`).
+    Usage,
+    /// Subprocess generic `Exception`: red banner, message chain,
+    /// `--trace` hint on stderr, exit 1 (`:449-468`).
+    Exception,
+    /// Toolset `PhutilArgumentUsageException`: red `USAGE EXCEPTION`
+    /// label on stderr, exit 1 (`ArcanistRuntime.php:38-39`).
+    ToolsetUsage,
+    /// Toolset `ArcanistConduitException`: red `CONDUIT` label on
+    /// stderr, exit 1 (`ArcanistRuntime.php:36-37`). No ceb throw
+    /// sites exist (only the never-thrown
+    /// `ArcanistNoURIConduitException` subclass); the arm exists for
+    /// completeness and nothing routes to it.
+    ToolsetConduit,
+    /// Toolset `ArcanistUserAbortException`: red `---` label on
+    /// stderr, exit 1 (`ArcanistRuntime.php:40-41`).
+    UserAbort,
+    /// Anything uncaught in the toolset runtime: the raw message on
+    /// stderr, exit 255. PHP prints a fatal trace with file paths and
+    /// line numbers, which is unportable; the message plus the 255
+    /// exit are the stable observables.
+    Fatal,
+}
+
+impl EnvelopeKind {
+    /// Process exit code for this error class.
+    #[must_use]
+    pub fn exit_code(self) -> std::process::ExitCode {
+        match self {
+            Self::NoEffect => std::process::ExitCode::SUCCESS,
+            Self::Fatal => std::process::ExitCode::from(EXIT_FATAL),
+            Self::Usage
+            | Self::Exception
+            | Self::ToolsetUsage
+            | Self::ToolsetConduit
+            | Self::UserAbort => std::process::ExitCode::FAILURE,
+        }
+    }
+
+    /// True when the rendering goes to stdout (only [`Self::NoEffect`]).
+    #[must_use]
+    pub fn uses_stdout(self) -> bool {
+        matches!(self, Self::NoEffect)
+    }
+
+    /// Render the envelope body (with trailing newline) for `message`.
+    #[must_use]
+    pub fn render(self, message: &str, ansi: bool) -> String {
+        match self {
+            Self::NoEffect => format!("{message}\n"),
+            Self::Usage => crate::terminal::console_format(
+                "**%s** %s\n",
+                &["Usage Exception:", rtrim_php(message)],
+                ansi,
+            ),
+            Self::Exception => format!(
+                "{}{message}\n{}",
+                crate::terminal::console_format("<bg:red>** %s **</bg>\n", &["Exception"], ansi),
+                crate::terminal::console_format(
+                    "(%s)\n",
+                    &["Run with `--trace` for a full exception trace."],
+                    ansi,
+                ),
+            ),
+            Self::ToolsetUsage => {
+                crate::terminal::format_log("red", "USAGE EXCEPTION", message, ansi)
+            }
+            Self::ToolsetConduit => crate::terminal::format_log("red", "CONDUIT", message, ansi),
+            Self::UserAbort => crate::terminal::format_log("red", "---", message, ansi),
+            Self::Fatal => format!("{message}\n"),
+        }
+    }
+}
+
+/// PHP `rtrim()` with the default charlist (`" \t\n\r\0\x0B"`), as
+/// applied to usage messages (`scripts/arcanist.php:436`).
+fn rtrim_php(message: &str) -> &str {
+    message.trim_end_matches([' ', '\t', '\n', '\r', '\0', '\x0B'])
+}
+
+/// A workflow error classified for the R4 envelope: the kind selects
+/// the banner, stream, and exit code; the message renders verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifiedError {
+    /// Envelope arm to report through.
+    pub kind: EnvelopeKind,
+    /// Raw message (no `arc <cmd>:` prefix, no usage suffix).
+    pub message: String,
+}
+
+impl ClassifiedError {
+    /// Classify `message` under `kind`.
+    #[must_use]
+    pub fn new(kind: EnvelopeKind, message: String) -> Self {
+        Self { kind, message }
+    }
+
+    /// [`EnvelopeKind::NoEffect`] constructor (for `map_err`).
+    #[must_use]
+    pub fn no_effect(message: String) -> Self {
+        Self::new(EnvelopeKind::NoEffect, message)
+    }
+
+    /// [`EnvelopeKind::Usage`] constructor (for `map_err`).
+    #[must_use]
+    pub fn usage(message: String) -> Self {
+        Self::new(EnvelopeKind::Usage, message)
+    }
+
+    /// [`EnvelopeKind::Exception`] constructor (for `map_err`).
+    #[must_use]
+    pub fn exception(message: String) -> Self {
+        Self::new(EnvelopeKind::Exception, message)
+    }
+
+    /// [`EnvelopeKind::ToolsetUsage`] constructor (for `map_err`).
+    #[must_use]
+    pub fn toolset_usage(message: String) -> Self {
+        Self::new(EnvelopeKind::ToolsetUsage, message)
+    }
+
+    /// [`EnvelopeKind::ToolsetConduit`] constructor (for `map_err`).
+    #[must_use]
+    pub fn toolset_conduit(message: String) -> Self {
+        Self::new(EnvelopeKind::ToolsetConduit, message)
+    }
+
+    /// [`EnvelopeKind::UserAbort`] constructor (for `map_err`).
+    #[must_use]
+    pub fn user_abort(message: String) -> Self {
+        Self::new(EnvelopeKind::UserAbort, message)
+    }
+
+    /// [`EnvelopeKind::Fatal`] constructor (for `map_err`).
+    #[must_use]
+    pub fn fatal(message: String) -> Self {
+        Self::new(EnvelopeKind::Fatal, message)
+    }
+
+    /// Report through the envelope: print and return the exit code.
+    pub fn report(&self) -> std::process::ExitCode {
+        report(self.kind, &self.message)
+    }
+}
+
+/// Report `message` through the envelope arm `kind`: print to the
+/// arm's stream and return its exit code.
+pub fn report(kind: EnvelopeKind, message: &str) -> std::process::ExitCode {
+    let text = kind.render(message, crate::terminal::ansi_enabled());
+    if kind.uses_stdout() {
+        print!("{text}");
+    } else {
+        eprint!("{text}");
+    }
+    kind.exit_code()
 }
 
 #[cfg(test)]

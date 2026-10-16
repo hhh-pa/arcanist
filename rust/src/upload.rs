@@ -18,6 +18,8 @@
 use std::path::Path;
 use std::process::ExitCode;
 
+use crate::conduit::{self, EnvelopeKind};
+
 pub const NAME: &str = "upload";
 
 /// Temporary files expire after 24 hours, like the PHP workflow.
@@ -640,7 +642,8 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
     let opts = match parse_args(argv) {
         ParseOutcome::Args(opts) => opts,
         ParseOutcome::Help => return Ok(usage()),
-        ParseOutcome::Error(message) => return Err(format!("{message}\n\n{}", usage())),
+        // T1153 R4 (UPLOAD-U15): PHP renders usage errors with no dump.
+        ParseOutcome::Error(message) => return Err(message),
     };
     let client = crate::config::client_for(opts.conduit_uri.as_deref())?;
     let base = resolve_conduit_uri(opts.conduit_uri.as_deref());
@@ -662,8 +665,17 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            ExitCode::FAILURE
+            // T1153 R4 (UPLOAD-U15): `upload` is a toolset workflow.
+            // Argument errors render the red `USAGE
+            // EXCEPTION` label (exit 1); aggregate and resolve errors
+            // are uncaught `Exception`s: fatal (255)
+            // (`ArcanistUploadWorkflow.php:43,77-93`).
+            let kind = if matches!(parse_args(argv), ParseOutcome::Error(_)) {
+                EnvelopeKind::ToolsetUsage
+            } else {
+                EnvelopeKind::Fatal
+            };
+            conduit::report(kind, &message)
         }
     }
 }

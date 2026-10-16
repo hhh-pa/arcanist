@@ -13,7 +13,10 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::{config, git, grid, markers};
+use crate::{
+    conduit::{self, EnvelopeKind},
+    config, git, grid, markers,
+};
 
 pub const NAME: &str = "branches";
 
@@ -205,7 +208,8 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => return Ok(usage()),
-        Err(message) => return Err(format!("{message}\n\n{}", usage())),
+        // T1153 R4 (RB-D4): PHP renders usage errors with no dump.
+        Err(message) => return Err(message),
     };
     let owned_client = config::client_for(options.conduit_uri.as_deref()).ok();
     execute_core(dir, &options, grid::terminal_width(), owned_client.as_ref())
@@ -223,7 +227,8 @@ pub fn execute_with_client(
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => return Ok(usage()),
-        Err(message) => return Err(format!("{message}\n\n{}", usage())),
+        // T1153 R4 (RB-D4): PHP renders usage errors with no dump.
+        Err(message) => return Err(message),
     };
     execute_core(dir, &options, terminal, client)
 }
@@ -285,8 +290,21 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            ExitCode::FAILURE
+            // T1153 R4 (RB-D4): `branches` runs in the toolset
+            // runtime (via `ArcanistMarkersWorkflow`). Argument,
+            // support-gate, and limit errors render the red `USAGE
+            // EXCEPTION` label (exit 1); query and render failures
+            // escape into a fatal (255). (RB-D4's "outside-repo
+            // branches exits 255" does not reproduce at ceb: the
+            // support gate throws `PhutilArgumentUsageException`,
+            // caught at `ArcanistRuntime.php:38-39` — exit 1.)
+            let kind =
+                if parse_options(argv).is_err() || markers::is_toolset_usage_message(&message) {
+                    EnvelopeKind::ToolsetUsage
+                } else {
+                    EnvelopeKind::Fatal
+                };
+            conduit::report(kind, &message)
         }
     }
 }

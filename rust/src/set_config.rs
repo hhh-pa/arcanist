@@ -22,7 +22,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use arc_rs::terminal::{PhtArg, TVal};
-use arc_rs::{config, get_config, git, terminal};
+use arc_rs::{
+    conduit::{self, EnvelopeKind},
+    config, get_config, git, terminal,
+};
 
 /// Subcommand name, matching `arc set-config`.
 pub const NAME: &str = "set-config";
@@ -353,10 +356,10 @@ pub fn run(argv: &[String]) -> ExitCode {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
         }
-        Err(message) => {
-            eprintln!("arc {NAME}: {message}\n\n{USAGE}");
-            return ExitCode::FAILURE;
-        }
+        // T1153 R4 (CORE-49): `set-config` is a subprocess
+        // workflow: usage errors render `Usage Exception:` with no
+        // usage dump (`scripts/arcanist.php:432-444`).
+        Err(message) => return conduit::report(EnvelopeKind::Usage, &message),
     };
     if let Some(warning) = warn_if_unknown(&options.key) {
         eprintln!("{warning}");
@@ -375,10 +378,9 @@ pub fn run(argv: &[String]) -> ExitCode {
             println!("{message}");
             ExitCode::SUCCESS
         }
-        Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            ExitCode::FAILURE
-        }
+        // T1153 R4 (CORE-49): write failures are generic exceptions
+        // under the red banner (`:449-468`).
+        Err(message) => conduit::report(EnvelopeKind::Exception, &message),
     }
 }
 

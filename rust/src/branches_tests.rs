@@ -151,3 +151,35 @@ fn usage_covers_options() {
     assert!(text.contains("--all") && text.contains("--json"));
     assert!(text.contains("--conduit-uri"));
 }
+
+#[test]
+fn r4_rbd4_parse_error_has_no_dump() {
+    // `branches` runs in the toolset runtime: argument errors render
+    // `USAGE EXCEPTION` (exit 1) with no usage dump.
+    match execute(&std::env::temp_dir(), &args(&["--bogus"])) {
+        Err(message) => assert!(!message.contains("usage:"), "{message}"),
+        _ => panic!("expected parse error"),
+    }
+    assert_eq!(
+        run_in(&std::env::temp_dir(), &args(&["--bogus"])),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn r4_rbd4_outside_repo_is_toolset_usage_not_fatal() {
+    // Outside a repo the marker-type support gate throws
+    // `PhutilArgumentUsageException` (exit 1) — RB-D4's "255" does
+    // not reproduce at ceb.
+    let dir = std::env::temp_dir().join(format!(
+        "arc-rs-branches-r4-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    assert_eq!(run_in(&dir, &args(&[])), std::process::ExitCode::FAILURE);
+    std::fs::remove_dir_all(&dir).ok();
+}

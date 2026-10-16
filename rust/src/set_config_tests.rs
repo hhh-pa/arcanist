@@ -240,3 +240,14 @@ fn args_require_key_and_value() {
         .unwrap();
     assert_eq!(dashed.key, "--x");
 }
+
+#[test]
+fn r4_core49_set_config_usage_has_no_dump() {
+    // Argument errors render `Usage Exception:` with exit 1 and no
+    // usage dump (parse fails before any disk access).
+    assert_eq!(
+        run(&["--bogus".to_string()]),
+        std::process::ExitCode::FAILURE
+    );
+    assert_eq!(run(&[]), std::process::ExitCode::FAILURE);
+}

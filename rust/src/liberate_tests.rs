@@ -343,12 +343,12 @@ fn rebuild_failure_stays_per_library_failure() {
 
 #[test]
 fn run_in_fails_on_usage_errors() {
-    // Usage-class failures (argument errors, no libraries found,
-    // ancient/unknown versions, declined prompts) exit 1 with a clean
-    // message: PHP throws `ArcanistUsageException`, which escapes the
-    // runtime and fails the CLI. Help still succeeds.
+    // T1153 R4 (CORE-21, CORE-53): parser errors exit 1 under the
+    // `USAGE EXCEPTION` label, but no-libraries-found throws
+    // `ArcanistUsageException`, which escapes the toolset runtime
+    // into a PHP fatal (255). Help still succeeds.
     let dir = scratch("exit-usage");
-    assert_eq!(run_in(&dir, &argv(&[])), ExitCode::FAILURE);
+    assert_eq!(run_in(&dir, &argv(&[])), ExitCode::from(255));
     assert_eq!(run_in(&dir, &argv(&["a", "b"])), ExitCode::FAILURE);
     assert_eq!(run_in(&dir, &argv(&["--bogus"])), ExitCode::FAILURE);
     assert_eq!(run_in(&dir, &argv(&["--help"])), ExitCode::SUCCESS);
@@ -367,5 +367,52 @@ fn run_in_exits_zero_on_rebuild_failures() {
     std::fs::write(lib.join(INIT_FILE), "<?php\n").unwrap();
     std::fs::write(lib.join(MAP_FILE), "@phutil-library-version 2\n").unwrap();
     assert_eq!(run_in(&dir, &argv(&["v2lib"])), ExitCode::SUCCESS);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn r4_core53_error_kinds() {
+    use crate::conduit::EnvelopeKind;
+    // Parser errors are toolset usage; declines are `---`; the rest
+    // (no libraries, versions, IO) escape into a fatal.
+    assert_eq!(
+        classify_error(&argv(&["a", "b"]), "x".to_string()).kind,
+        EnvelopeKind::ToolsetUsage
+    );
+    assert_eq!(
+        classify_error(
+            &argv(&["lib"]),
+            "cancelled: directory \"d\" does not exist".to_string()
+        )
+        .kind,
+        EnvelopeKind::UserAbort
+    );
+    assert_eq!(
+        classify_error(
+            &argv(&[]),
+            "Unable to find any libraries under the current working directory. To create a library, provide a path.".to_string()
+        )
+        .kind,
+        EnvelopeKind::Fatal
+    );
+    assert_eq!(
+        classify_error(&argv(&["lib"]), "Unknown library version '9'!".to_string()).kind,
+        EnvelopeKind::Fatal
+    );
+}
+
+#[test]
+fn r4_core21_decline_reports_user_abort() {
+    // Declining the create-directory prompt fails with `cancelled:`,
+    // routed to the `---` arm (exit 1).
+    let dir = scratch("r4-decline");
+    let input = "n\n";
+    let mut reader = BufReader::new(input.as_bytes());
+    let err = execute_with_input(&dir, &argv(&["newlib"]), &mut reader).unwrap_err();
+    assert!(err.starts_with("cancelled: "), "{err}");
+    assert_eq!(
+        classify_error(&argv(&["newlib"]), err).kind,
+        crate::conduit::EnvelopeKind::UserAbort
+    );
     std::fs::remove_dir_all(&dir).ok();
 }

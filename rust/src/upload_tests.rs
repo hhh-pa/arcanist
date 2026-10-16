@@ -140,3 +140,27 @@ fn ref_lines_carry_no_markup() {
     assert!(!out.contains('\x1b'), "{out}");
     assert!(!out.contains("**"), "{out}");
 }
+
+#[test]
+fn r4_uploadu15_aggregate_errors_are_fatal() {
+    // `upload` is a toolset workflow: aggregate and resolve errors
+    // are uncaught `Exception`s (fatal, 255), while argument errors
+    // stay toolset usage (exit 1) with no usage dump.
+    match execute(&std::env::temp_dir(), &argv(&[])) {
+        Err(message) => assert!(!message.contains("usage:"), "{message}"),
+        _ => panic!("expected parse error"),
+    }
+    assert_eq!(
+        run_in(&std::env::temp_dir(), &argv(&["--bogus"])),
+        std::process::ExitCode::FAILURE
+    );
+    // Conduit setup failures (deterministic: no token can exist for
+    // `.invalid`) escape into a fatal, like aggregate errors.
+    assert_eq!(
+        run_in(
+            &std::env::temp_dir(),
+            &argv(&["--conduit-uri", "https://upload-test.invalid/", "f.bin"])
+        ),
+        std::process::ExitCode::from(255)
+    );
+}

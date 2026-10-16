@@ -770,3 +770,13 @@ fn multi_revision_guidance_stays_plain() {
     let styled = render_ansi(&ctx, true);
     assert!(styled.contains(sentence), "{styled}");
 }
+
+#[test]
+fn r4_rbd4_parse_error_has_no_dump() {
+    // `which` is a subprocess workflow: argument errors render `Usage
+    // Exception:` (exit 1) with no usage dump.
+    assert_eq!(
+        run(&["--bogus".to_string()]),
+        std::process::ExitCode::FAILURE
+    );
+}

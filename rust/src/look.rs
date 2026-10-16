@@ -15,7 +15,10 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::{conduit, config, diff_submit, git, terminal};
+use crate::{
+    conduit::{self, EnvelopeKind},
+    config, diff_submit, git, terminal,
+};
 
 /// Subcommand name, matching `arc look`.
 pub const NAME: &str = "look";
@@ -1356,8 +1359,11 @@ fn look_conduit_client() -> Option<conduit::Client> {
 }
 
 fn fail(message: String) -> ExitCode {
-    eprintln!("arc {NAME}: {message}");
-    ExitCode::FAILURE
+    // T1153 R4 (RB-D4): `look` runs in the toolset runtime
+    // (`ArcanistLookWorkflow extends ArcanistArcWorkflow`), so runtime
+    // errors escape into a PHP fatal (255). PHP never throws here,
+    // but the envelope's fatal arm is the faithful default.
+    conduit::report(EnvelopeKind::Fatal, &message)
 }
 
 fn conduit_error_text(error: conduit::Error) -> String {
@@ -1500,8 +1506,9 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(msg) => {
-            eprintln!("arc {NAME}: {msg}\n\n{USAGE}");
-            return ExitCode::FAILURE;
+            // T1153 R4 (RB-D4): toolset parser errors render the red
+            // `USAGE EXCEPTION` label with no usage dump.
+            return conduit::report(EnvelopeKind::ToolsetUsage, &msg);
         }
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());

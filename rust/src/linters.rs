@@ -26,7 +26,10 @@ extern crate self as arc_rs;
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
-use crate::terminal;
+use crate::{
+    conduit::{self, EnvelopeKind},
+    terminal,
+};
 
 pub const NAME: &str = "linters";
 
@@ -1644,18 +1647,20 @@ pub fn run_in(cwd: &Path, argv: &[String]) -> ExitCode {
             print!("{}", usage());
             return ExitCode::SUCCESS;
         }
-        ParseOutcome::Error(message) => {
-            eprintln!("arc {NAME}: {message}\n\n{}", usage());
-            return ExitCode::FAILURE;
-        }
+        // T1153 R4 (LINTERS-L24): `linters` is a subprocess
+        // workflow: usage errors render `Usage Exception:` with no
+        // usage dump (`scripts/arcanist.php:432-444`).
+        ParseOutcome::Error(message) => return conduit::report(EnvelopeKind::Usage, &message),
         ParseOutcome::Args(options) => options,
     };
     let configured = match configured_classes(cwd) {
         Ok(configured) => configured,
-        Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            return ExitCode::FAILURE;
-        }
+        // Bad engine/linter configuration names are usage errors in
+        // PHP (`newLintEngine()` throws `ArcanistUsageException` /
+        // `ArcanistNoEngineException`, caught by the linters flow for
+        // the no-engine case only). JSON-decode proxy nuances stay
+        // flattened; the exit stays 1 either way.
+        Err(message) => return conduit::report(EnvelopeKind::Usage, &message),
     };
     let entries = collect_entries(&configured);
     let verbose = options.verbose || !options.exact.is_empty();

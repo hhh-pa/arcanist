@@ -112,6 +112,7 @@ use std::process::ExitCode;
 
 use arc_rs::{config, diff_submit, git, hg, land_checks, revision};
 
+use crate::conduit::ClassifiedError;
 use crate::terminal::{self, TVal};
 
 /// Subcommand name, matching `arc land`.
@@ -7554,21 +7555,98 @@ fn land_hg_inner_with(
     Ok(())
 }
 
+/// True for the engine errors PHP raises as
+/// `PhutilArgumentUsageException` (exit 1 under the `USAGE EXCEPTION`
+/// label): discovery failures (`ArcanistLandEngine.php:823-1153`),
+/// onto/into selection errors, merge conflicts, and empty merges
+/// (`ArcanistGitLandEngine.php:286-1348`), and hg resolution errors
+/// (`ArcanistMercurialLandEngine.php:116-334`). Anything else —
+/// fetch/push/merge operation failures, conduit errors — escapes
+/// into a fatal. (The `:1283` cascade-retry rewrap of operation
+/// errors into usage is not distinguished: those texts also arise
+/// outside the retry path.)
+fn is_toolset_usage_message(message: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "There are no commits to land.",
+        "Encountered a merge conflict.",
+        "Landing onto multiple branches at once is not supported in Mercurial.",
+    ];
+    if EXACT.contains(&message) {
+        return true;
+    }
+    const PREFIXES: &[&str] = &[
+        "TODO: You are forcing a revision,",
+        "Revision for commit \"",
+        "Unable to determine revision for commit \"",
+        "Merging local \"",
+        "No pushable remote \"",
+        "Perforce mode does not support",
+        "The \"onto\" refs you have selected are connected to multiple different",
+        "The branches you are landing are connected to multiple different",
+        "Selected \"onto\" ref \"",
+        "No remote \"",
+    ];
+    if PREFIXES.iter().any(|prefix| message.starts_with(prefix)) {
+        return true;
+    }
+    const SHAPES: &[(&str, &str)] = &[
+        ("Symbol \"", "\" does not identify a valid revision."),
+        (
+            "Symbol \"",
+            "\" does not identify a bookmark, branch, or commit.",
+        ),
+        ("Symbol \"", "\" is ambiguous."),
+        ("Branch \"", "\" does not exist in the local working copy."),
+        ("Remote \"", "is not a valid fetchable remote."),
+        ("Local ref \"", "\" does not exist."),
+        ("Ref \"", "\" does not exist in remote \""),
+    ];
+    SHAPES
+        .iter()
+        .any(|(prefix, infix)| message.starts_with(prefix) && message.contains(infix))
+}
+
+/// Classify an engine-stage error: declines ([`ABORT`]) are
+/// `ArcanistUserAbortException` (the `---` arm), toolset-usage texts
+/// render `USAGE EXCEPTION`, and everything else escapes into a
+/// fatal.
+fn classify_engine_error(message: String) -> ClassifiedError {
+    if message == ABORT {
+        ClassifiedError::user_abort(message)
+    } else if is_toolset_usage_message(&message) {
+        ClassifiedError::toolset_usage(message)
+    } else {
+        ClassifiedError::fatal(message)
+    }
+}
+
 /// Run the workflow with scripted or live IO, returning collected output.
 ///
-/// Parse errors append the usage text (like the old port); `--help`
-/// returns the usage text.
+/// Parse errors carry no usage text (PHP renders usage errors with no
+/// dump); `--help` returns the usage text.
 pub fn execute_with_io(dir: &Path, argv: &[String], io: &mut Io) -> Result<Out, String> {
+    execute_with_io_classified(dir, argv, io).map_err(|error| error.message)
+}
+
+/// [`execute_with_io`] with errors classified for the R4 envelope:
+/// argument, working-copy, and validation errors are toolset usage;
+/// engine errors split into declines (`---`), toolset usage, and
+/// fatal (see [`is_toolset_usage_message`]).
+pub fn execute_with_io_classified(
+    dir: &Path,
+    argv: &[String],
+    io: &mut Io,
+) -> Result<Out, ClassifiedError> {
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
             io.push_out(USAGE);
             return Ok(std::mem::take(&mut io.out));
         }
-        Err(message) => return Err(format!("{message}\n\n{USAGE}")),
+        Err(message) => return Err(ClassifiedError::toolset_usage(message)),
     };
     let Some(vcs) = detect_vcs(dir) else {
-        return Err(NOT_GIT_OR_HG.to_string());
+        return Err(ClassifiedError::toolset_usage(NOT_GIT_OR_HG.to_string()));
     };
     for (key, answer) in load_saved_prompts(dir) {
         io.saved.entry(key).or_insert(answer);
@@ -7583,8 +7661,8 @@ pub fn execute_with_io(dir: &Path, argv: &[String], io: &mut Io) -> Result<Out, 
             local_path: Some(dir.join(metadata).join("arc").join("config")),
         });
     }
-    let validated = validate_options(&options, dir, io)?;
-    execute_engine(dir, &options, vcs, &validated, io)?;
+    let validated = validate_options(&options, dir, io).map_err(ClassifiedError::toolset_usage)?;
+    execute_engine(dir, &options, vcs, &validated, io).map_err(classify_engine_error)?;
     Ok(std::mem::take(&mut io.out))
 }
 
@@ -7597,14 +7675,16 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<Out, String> {
 
 /// Run the workflow rooted at `dir` with live console IO.
 pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
+    // T1153 R4 (LAND-37): `land` is a toolset workflow
+    // (`ArcanistLandWorkflow extends ArcanistArcWorkflow`). Argument
+    // and validation errors render the red `USAGE EXCEPTION` label
+    // (exit 1), declined prompts the red `---` label (exit 1), and
+    // operation failures escape into a PHP fatal (255).
     let mut io = Io::live();
     io.ansi = terminal::ansi_enabled();
-    match execute_with_io(dir, argv, &mut io) {
+    match execute_with_io_classified(dir, argv, &mut io) {
         Ok(_) => ExitCode::SUCCESS,
-        Err(message) => {
-            eprintln!("arc land: {message}");
-            ExitCode::FAILURE
-        }
+        Err(error) => error.report(),
     }
 }
 

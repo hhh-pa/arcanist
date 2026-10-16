@@ -9,6 +9,8 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use crate::conduit::{self, EnvelopeKind};
+
 pub const NAME: &str = "weld";
 
 fn usage() -> String {
@@ -316,13 +318,13 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<Vec<u8>, String> {
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => return Ok(usage().into_bytes()),
-        Err(message) => return Err(format!("{message}\n\n{}", usage())),
+        // T1153 R4 (CORE-49): PHP renders usage errors with no dump.
+        Err(message) => return Err(message),
     };
     if options.files.len() < 2 {
-        return Err(format!(
-            "Specify two or more files to weld together.\n\n{}",
-            usage()
-        ));
+        // T1153 R4 (CORE-49): `PhutilArgumentUsageException`
+        // (`ArcanistWeldWorkflow.php:33-36`), no usage dump.
+        return Err("Specify two or more files to weld together.".to_string());
     }
     let mut inputs = Vec::with_capacity(options.files.len());
     for file in &options.files {
@@ -348,8 +350,18 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            ExitCode::FAILURE
+            // T1153 R4 (CORE-49): `weld` is a toolset workflow.
+            // Argument errors render the red `USAGE EXCEPTION` label
+            // (exit 1, matching the old exit); read failures escape
+            // into a fatal (255).
+            let kind = if parse_options(argv).is_err()
+                || message == "Specify two or more files to weld together."
+            {
+                EnvelopeKind::ToolsetUsage
+            } else {
+                EnvelopeKind::Fatal
+            };
+            conduit::report(kind, &message)
         }
     }
 }

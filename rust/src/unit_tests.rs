@@ -2046,3 +2046,68 @@ fn workflow_output_with_ansi_threads_flag() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn r4_unitu3_no_effect_preserved() {
+    use arc_rs::conduit::EnvelopeKind;
+    // `NoEffect` ("No tests to run.") routes to stdout + exit 0.
+    let error = classify_engine_error(arc_rs::unit_engine::EngineError::no_effect());
+    assert_eq!(error.kind, EnvelopeKind::NoEffect);
+    assert_eq!(error.message, "No tests to run.");
+    assert_eq!(error.kind.exit_code(), std::process::ExitCode::SUCCESS);
+    // End to end through the classified config runner: no engines
+    // planned means no tests to run.
+    let dir = unique_dir("r4-unitu3");
+    std::fs::create_dir_all(&dir).unwrap();
+    let root = dir.to_string_lossy().to_string();
+    let err =
+        run_config_with_runner_classified(&[], &root, &[], false, None, &RealRunner).unwrap_err();
+    assert_eq!(err.kind, EnvelopeKind::NoEffect);
+    assert_eq!(err.message, "No tests to run.");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn r4_unitu4_usage_kinds() {
+    use arc_rs::conduit::EnvelopeKind;
+    // Engine usage errors render `Usage Exception:`.
+    let error = classify_engine_error(arc_rs::unit_engine::EngineError::Usage("bad".to_string()));
+    assert_eq!(error.kind, EnvelopeKind::Usage);
+    // Unknown `--engine` names are usage errors.
+    let opts = Options {
+        engine: "NopeEngine".to_string(),
+        engine_explicit: true,
+        ..Options::default()
+    };
+    let dir = unique_dir("r4-unitu4");
+    std::fs::create_dir_all(&dir).unwrap();
+    let err = discover_selection_classified(&opts, &dir).unwrap_err();
+    assert_eq!(err.kind, EnvelopeKind::Usage);
+    // `--everything` with paths and missing paths are usage errors;
+    // VCS failures are generic.
+    assert_eq!(
+        classify_select_paths_error(
+            "You can not specify paths with --everything. The --everything flag runs every test associated with a tracked file in the working copy."
+                .to_string()
+        )
+        .kind,
+        EnvelopeKind::Usage
+    );
+    assert_eq!(
+        classify_select_paths_error("Path 'x' does not exist!".to_string()).kind,
+        EnvelopeKind::Usage
+    );
+    assert_eq!(
+        classify_select_paths_error("failed to run git: boom".to_string()).kind,
+        EnvelopeKind::Exception
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn r4_unitu5_failed_is_generic() {
+    use arc_rs::conduit::EnvelopeKind;
+    let error = classify_engine_error(arc_rs::unit_engine::EngineError::Failed("boom".to_string()));
+    assert_eq!(error.kind, EnvelopeKind::Exception);
+    assert_eq!(error.kind.exit_code(), std::process::ExitCode::FAILURE);
+}

@@ -204,3 +204,19 @@ fn weld_buffers_skips_empty_and_is_deterministic() {
         b"a\nb\n".to_vec()
     );
 }
+
+#[test]
+fn r4_core49_weld_usage_has_no_dump() {
+    // Fewer than two files is toolset usage (exit 1, matching the
+    // old exit) with no usage dump; read failures are fatal.
+    match execute(&std::env::temp_dir(), &args(&["only"])) {
+        Err(message) => {
+            assert_eq!(message, "Specify two or more files to weld together.");
+        }
+        _ => panic!("expected usage error"),
+    }
+    assert_eq!(
+        run_in(&std::env::temp_dir(), &args(&["only"])),
+        std::process::ExitCode::FAILURE
+    );
+}
