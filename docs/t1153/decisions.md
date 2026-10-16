@@ -96,6 +96,21 @@ LAND-0a/b/c, AMEND-0, LAND-1 nest under `constraints` via the shared
 | R4 gaps: land cascade-retry rewrap; arclint JSON-decode proxy arm; bare-`arc` Missing arm | CARRIED | documented mis-routes (retry-exhausted→fatal vs usage; proxy errors under Usage arm; Missing arm keeps usage dump) — exit codes unaffected except none cited; land owner picks up the first in Wave 2 |
 | R6 carry-overs: `which` source labels; unit engine-param reads; land `load_saved_prompts` path | CARRIED | unowned call sites adopt `merged_value` labels / full merge in Wave 2 (read-B, unit, LAND-14 owners) |
 
+### Phase 2 Wave 2 (sections, 8 agents)
+
+| Finding(s) | Decision | Trigger / note |
+|---|---|---|
+| LAND-2..43 (sans done/keep) + cascade-retry + LAND-43 experiment | FIXED (Rule 0/1) | batched search/query discovery; anchored `Differential Revision`; push/submit failures rewrap to usage/1 after cascade retry (Wave-1 gap closed). LAND-43 experiment DIVERGED → restored the ceb rebase-then-merge flow (reduce path force-lands trees ceb rejects); MERGE Attempting/DONE lines removed |
+| LAND-22/23..28/42-markers | CARRIED | need conduit handshake caching (LAND-22) and markers/branches.rs work — Wave 3 |
+| LINT-4..45 (sans done) | FIXED (Rule 0) | renderers, JSON/XML, patcher, per-linter ports; CLEAN+locked: LINT-21 (unportable `canRun`, Rule 3), LINT-37, LINT-45. Carry: LINT-23 (hg.rs), LINT-34/35 (linters.rs) |
+| UNIT-U1..26 (sans done) | FIXED (Rule 0) | discovery/selection/render/JSON paths; engine params via full merge (Wave-1 follow-through). Carry: U16/U17 (unit_config.rs), U22 (main.rs global flags), U20 producer order, U21 non-ASCII escaping (conduit.rs), U2 phutil-progress half (unverifiable, Rule 3-ish) |
+| LINTERS-L1..28, COVER-C2..16 | FIXED/KEPT | per finding vs ceb; keeps: L15/L16 (XHP ported-only, Rule 3), L23 (subclass N/A, Rule 3), C2 (experiment: PHP misattributes N+1, keep Rust N — Rule 2a), C3/C4/C10/C12. Carry: C1 (base-chain design), C13 (svn/hg, T1128) |
+| BROWSE-B1..26, DL-D1..17 (sans done) | FIXED (Rule 0) | resolve/open/download paths; keeps: B2/B4/B16 + D11-locked (LAND-41/loop/race rationale, Rule 2a). Carry: B25 (which.rs), B21/B23 remainder (other commands' `--` + help) |
+| UPLOAD-U1..16, PASTE-P1..18, EXPORT-E (render halves) | FIXED (Rule 0) | RefView/DONE/grammar/willUpload/browse flows; own toGitPatch/toUnifiedDiff port (git-apply oracle green). Keeps: U6/U7/U8/U11 (PHP ships corrupt uploads, Rule 2a), U12 (Rule 2c). Carry: E11..E24/E37 parser halves (diff_local.rs) |
+| CORE-1..67 + RB-D1..39 (cited subset) | FIXED (Rule 0) | new argparse/prompts/shell_complete engines; liberate CORE-50 (rebuild status ignored, DONE always — stale tests updated at merge, verified vs ceb); which source labels (Wave-1 follow-through). Uncited IDs need Wave-3 verification (fix or lock) |
+| CORE-18 (SIGINT routing) | UNPORTED (Rule 3) | no signal API in std; libc transitive-only, Cargo.toml frozen |
+| DIFF-D6..21, PATCH-P3..13 (sans done) | FIXED (Rule 0) | D8 bare-git submits via detection; D9 raw message ride-through (ported into `collect_mode_payload` at merge); D11/D12 re-verified faithful. D2 verified CLEAN (no edit). Carry: DIFF-D22, DL-D11 |
+
 ### Keep-list (Rule 2, recorded early per task §10 step 4)
 
 | Finding | Criterion | Rationale |

@@ -153,3 +153,25 @@ Acceptance: `cargo fmt --check`, `cargo clippy --all-targets -- -D
 warnings`, and `cargo test --offline` 35/35 suites green under clean
 HOME at the merge commit; each finding verified against PHP @
 ceb082ef before fixing, with a finding-prefixed regression test.
+
+## Phase 2 Wave 2 (sections, 8 agents) — 2026-10-16
+
+Eight parallel agents (isolated worktrees, branches `t1153/w2-land`
+… `t1153/w2-dipa`) implemented the section findings on this branch;
+the parent merged them (lcov→unit→brdl→land→lint→upx→dipa→core) with
+two semantic merge fixes: DIFF-D9's raw-message ride-through ported
+into `collect_mode_payload`, and 3 stale liberate integration tests
+updated to the faithful CORE-50 behavior (verified against
+`ArcanistLiberateWorkflow.php` + `ArcanistPrompt.php` at ceb082ef:
+rebuild status ignored, DONE always; decline aborts; prompts take
+exactly `y`/`n`).
+
+Scope: LAND (incl. cascade-retry rewrap + LAND-43 experiment →
+DIVERGED, ceb flow restored), LINT, UNIT, LINTERS/COVER (incl. C2
+experiment → keep Rust N, Rule 2a), BROWSE/DOWNLOAD, UPLOAD/PASTE/
+EXPORT-render, CORE/read-B (new argparse/prompts/shell_complete
+engines), DIFF/PATCH. Decisions per finding are in
+[decisions.md](decisions.md) (Wave 2 rows). Wave 3 carries: LAND-22/
+23..28/42-markers, LINT-23/34/35, U16/U17/U20/U21-esc/U22, C1, B25,
+B21/B23-remainder, EXPORT parser halves, DIFF-D22, DL-D11, uncited
+CORE/RB-D/LINTERS/COVER verification, R10 help sweep, §9 gaps.
