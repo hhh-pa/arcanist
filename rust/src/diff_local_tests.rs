@@ -191,6 +191,7 @@ fn revision_id_first_match_wins() {
 
 #[test]
 fn revision_id_rejects_invalid_values() {
+    // T1153 RB-D37: PHP's exact error text (`phabricator.example.com`).
     for bad in [
         "D0",
         "D",
@@ -212,8 +213,8 @@ fn revision_id_rejects_invalid_values() {
     assert_eq!(
         parse_revision_id_from_raw_corpus("T\nDifferential Revision: D0\n").unwrap_err(),
         "Invalid \"Differential Revision\" field in commit message. This field \
-         should have a revision identifier like \"D123\" or a server URI \
-         like \"https://devtools.example.com/D123\", but has \"D0\"."
+         should have a revision identifier like \"D123\" or a Phabricator URI \
+         like \"https://phabricator.example.com/D123\", but has \"D0\"."
     );
 }
 

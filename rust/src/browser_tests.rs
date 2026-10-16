@@ -2,6 +2,8 @@ use super::*;
 
 #[test]
 fn parses_browser_config_values() {
+    // T1153 CORE-63: PHP wraps any truthy non-array `browser` value
+    // and runs it (`:2148-2154` at ceb), string-casting scalars.
     assert_eq!(
         configured_argv(&serde_json::json!("my-browser")),
         Some(vec!["my-browser".to_string()])
@@ -10,23 +12,47 @@ fn parses_browser_config_values() {
         configured_argv(&serde_json::json!(["my-browser", "--new"])),
         Some(vec!["my-browser".to_string(), "--new".to_string()])
     );
-    // Empty and non-string values are falsy upstream: unconfigured.
-    // ("0" is falsy in PHP too.)
+    // Truthy scalars wrap and cast.
+    assert_eq!(
+        configured_argv(&serde_json::json!(42)),
+        Some(vec!["42".to_string()])
+    );
+    assert_eq!(
+        configured_argv(&serde_json::json!(4.5)),
+        Some(vec!["4.5".to_string()])
+    );
+    assert_eq!(
+        configured_argv(&serde_json::json!(true)),
+        Some(vec!["1".to_string()])
+    );
+    // List members cast too.
+    assert_eq!(
+        configured_argv(&serde_json::json!(["ok", 42])),
+        Some(vec!["ok".to_string(), "42".to_string()])
+    );
+    assert_eq!(
+        configured_argv(&serde_json::json!([42])),
+        Some(vec!["42".to_string()])
+    );
+    // Falsy values are unconfigured ("0" is falsy in PHP too).
     for value in [
         serde_json::json!(""),
         serde_json::json!("0"),
+        serde_json::json!(0),
+        serde_json::json!(0.0),
+        serde_json::json!(false),
         serde_json::json!([]),
-        serde_json::json!([42]),
+        serde_json::json!({}),
         serde_json::json!(null),
-        serde_json::json!(42),
     ] {
         assert_eq!(configured_argv(&value), None, "{value}");
     }
-    // Non-string list members are dropped.
+    // Nested structures have no sane spelling and are dropped.
     assert_eq!(
-        configured_argv(&serde_json::json!(["ok", 42])),
+        configured_argv(&serde_json::json!(["ok", ["nested"]])),
         Some(vec!["ok".to_string()])
     );
+    assert_eq!(configured_argv(&serde_json::json!([[1]])), None);
 }
 
 #[test]
@@ -40,7 +66,7 @@ fn reads_browser_from_project_config() {
             .as_nanos()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    // CORE-33: the project file only counts at a working-copy root.
+    // T1153 CORE-33: the project file only counts at a working-copy root.
     std::fs::create_dir_all(dir.join(".git")).unwrap();
     std::fs::write(
         dir.join(".arcconfig"),
@@ -147,9 +173,9 @@ fn browse_b19_unmarked_files_are_not_binaries() {
 #[cfg(not(windows))]
 fn r9_browse_b24_no_browser_scan_error_matches_ceb() {
     // `open_uris_in_browser` propagates the `browser_open_argv` scan error
-    // unchanged, so this locks the exact bytes the browse (BROWSE-B24),
-    // upload --browse (UPLOAD-U13), and todo --browse (RB-D29c) paths
-    // surface when no browser resolves.
+    // unchanged, so this locks the exact bytes the browse (T1153 BROWSE-B24),
+    // upload --browse (T1153 UPLOAD-U13), and todo --browse (T1153 RB-D29)
+    // paths surface when no browser resolves.
     let err = diff::browser_open_argv("http://example.test/", None, &|_| false).unwrap_err();
     assert_eq!(
         err,

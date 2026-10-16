@@ -232,7 +232,7 @@ fn verbose_help_goes_through_console_wrap() {
 
 #[test]
 fn project_config_reads_vcs_root_and_validates() {
-    // CORE-33: git reads `.arcconfig` only at the working-copy root; a
+    // T1153 CORE-33: git reads `.arcconfig` only at the working-copy root; a
     // subdir file is invisible, and so is any file outside a repository.
     let tmp = TempDir::new("project");
     let child = tmp.path.join("a").join("b");
@@ -374,7 +374,7 @@ fn system_file_missing_is_empty_and_invalid_fails() {
 #[test]
 fn resolution_follows_source_precedence() {
     let tmp = TempDir::new("resolve");
-    // CORE-33: the project file only counts at a working-copy root.
+    // T1153 CORE-33: the project file only counts at a working-copy root.
     std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
     std::fs::write(
         tmp.path.join(".arcconfig"),
@@ -412,7 +412,7 @@ fn resolution_follows_source_precedence() {
 #[test]
 fn project_legacy_names_apply() {
     let tmp = TempDir::new("legacy");
-    // CORE-33: the project file only counts at a working-copy root.
+    // T1153 CORE-33: the project file only counts at a working-copy root.
     std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
     std::fs::write(
         tmp.path.join(".arcconfig"),
@@ -430,7 +430,7 @@ fn project_legacy_names_apply() {
 #[test]
 fn brief_render_matches_php_bytes() {
     let tmp = TempDir::new("brief");
-    // CORE-33: the project file only counts at a working-copy root.
+    // T1153 CORE-33: the project file only counts at a working-copy root.
     std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
     std::fs::write(tmp.path.join(".arcconfig"), r#"{"editor": "nano"}"#).unwrap();
     let sources = load_sources(&tmp.path, None).unwrap();
@@ -452,7 +452,7 @@ fn brief_render_matches_php_bytes() {
 #[test]
 fn verbose_render_matches_php_bytes() {
     let tmp = TempDir::new("verbose");
-    // CORE-33: the project file only counts at a working-copy root.
+    // T1153 CORE-33: the project file only counts at a working-copy root.
     std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
     std::fs::write(tmp.path.join(".arcconfig"), r#"{"editor": "nano"}"#).unwrap();
     let sources = load_sources(&tmp.path, None).unwrap();

@@ -18,9 +18,9 @@
 //! - Banners and prompts render as plain text through `land::console_confirm`
 //!   (the `phutil_console_confirm` port); prompt queries and error
 //!   sentences keep the PHP wording.
-//! - `svn commit` output is captured and returned, where PHP streams it
-//!   live with `phutil_passthru`; failures append the captured output to
-//!   the PHP sentence.
+//! - Git support plus `-m`/`--all`/`--allow-empty` are pure arc-rs
+//!   extensions (T1153 CORE-64): PHP commits svn only
+//!   (`ArcanistCommitWorkflow.php:282-284` at ceb).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -741,12 +741,10 @@ fn flow_svn(
     ));
     let files = svn_commit_file_list(io, &target.client, svn, &target.root, target.id)?;
     let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
-    let mut out = svn::commit_with(&target.root, svn, &file_refs, &target.message)?;
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str(&finalize_revision(&target.client, options, dir, target.id)?);
-    Ok(out)
+    // T1153 CORE-65: the commit streams live like `phutil_passthru`,
+    // so only the finalize text is returned here.
+    svn::commit_with(&target.root, svn, &file_refs, &target.message)?;
+    finalize_revision(&target.client, options, dir, target.id)
 }
 
 /// Resolve the revision to commit, run sanity checks (unless `--show`),

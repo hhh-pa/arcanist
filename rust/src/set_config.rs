@@ -96,6 +96,9 @@ pub fn coerce_value(key: &str, raw: &str) -> Result<serde_json::Value, String> {
                 Err(err())
             }
         }
+        // T1153 CORE-37: PHP throws a plain `Exception`
+        // (`ArcanistSettings.php:236-240` at ceb), so this renders
+        // through the `Exception` arm (exit 1), not the usage arm.
         "aliases" => Err(terminal::pht(
             "Use \"arc alias\" to configure aliases, not \"arc set-config\".",
             &[],
@@ -442,7 +445,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
         }
-        // T1153 R4 (CORE-49): `set-config` is a subprocess
+        // T1153 CORE-49 (R4): `set-config` is a subprocess
         // workflow: usage errors render `Usage Exception:` with no
         // usage dump (`scripts/arcanist.php:432-444`).
         Err(message) => return conduit::report(EnvelopeKind::Usage, &message),
@@ -475,7 +478,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             println!("{message}");
             ExitCode::SUCCESS
         }
-        // T1153 R4 (CORE-49): write failures are generic exceptions
+        // T1153 CORE-49 (R4): write failures are generic exceptions
         // under the red banner (`:449-468`).
         Err(message) => conduit::report(EnvelopeKind::Exception, &message),
     }

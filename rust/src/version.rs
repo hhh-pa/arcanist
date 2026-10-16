@@ -1,17 +1,19 @@
 //! `arc-rs version` — display the current version of Arcanist.
 //!
-//! Port of `src/toolset/workflow/ArcanistVersionWorkflow.php` (master):
+//! Port of `src/toolset/workflow/ArcanistVersionWorkflow.php` (ceb):
 //! no workflow arguments (`getWorkflowArguments()` returns empty), the
-//! `git` binary precondition (`:34-41`), the single `arcanist` library
-//! root resolved to its git working copy (`:43-57`), and the
-//! `"%s %s (%s)\n"` render of the HEAD commit hash and date (`:59-70`).
+//! `git` binary precondition (`:39-44`), the single `arcanist` library
+//! root resolved to its git working copy (`:46-63`), and the
+//! `"%s %s (%s)\n"` render of the HEAD commit hash and date (`:65-76`).
 //!
 //! Divergence: PHP resolves the library root from the running source
-//! tree (`phutil_get_library_root('arcanist')`); the compiled binary has
-//! no source tree, so the checkout is resolved from the running
-//! executable's directory instead (`run_in` takes it explicitly, so
-//! tests use fixture checkouts). The git-missing and
-//! not-a-git-working-copy errors keep the PHP text.
+//! tree (`phutil_get_library_root('arcanist')`, `:47`); the compiled
+//! binary has no source tree, so the checkout is resolved from the
+//! running executable's directory instead (`run_in` takes it
+//! explicitly, so tests use fixture checkouts), and installed
+//! binaries outside any checkout report the not-a-git-copy error
+//! (T1153 CORE-60, kept: no library root exists to resolve). The
+//! git-missing and not-a-git-working-copy errors keep the PHP text.
 //!
 //! The date renders in the process timezone like PHP's `date()`, via
 //! `look`'s std-only zone lookup (explicit `TZ`, `/etc/localtime`,
@@ -102,7 +104,7 @@ pub fn git_binary_available() -> bool {
     std::env::var_os("PATH").is_some_and(|path| anoid::find_on_path(&path, "git").is_some())
 }
 
-/// PHP `:36-40`: `Cannot display current version without "git" installed.`
+/// PHP `:39-44` at ceb: `Cannot display current version without "git" installed.`
 #[must_use]
 pub fn missing_git_message() -> String {
     terminal::pht(
@@ -111,10 +113,34 @@ pub fn missing_git_message() -> String {
     )
 }
 
-/// PHP `:52-56`: the not-a-git-working-copy error for `tool_dir`.
+/// `Filesystem::readablePath()` (`src/filesystem/Filesystem.php:1019-1034`
+/// at ceb): strip the CWD prefix (then the resolved-CWD prefix) when
+/// `path` sits under it, else return `path` unchanged (T1153 CORE-61).
+fn readable_path(cwd: &Path, path: &Path) -> String {
+    let text = path.display().to_string();
+    let mut parents = vec![cwd.to_path_buf()];
+    if let Ok(resolved) = cwd.canonicalize()
+        && resolved != cwd
+    {
+        parents.push(resolved);
+    }
+    for parent in &parents {
+        let base = parent.display().to_string();
+        let trimmed = base.trim_end_matches(std::path::MAIN_SEPARATOR);
+        let prefix = format!("{trimmed}{}", std::path::MAIN_SEPARATOR);
+        if let Some(rest) = text.strip_prefix(&prefix) {
+            return rest.to_string();
+        }
+    }
+    text
+}
+
+/// PHP `:56-62` at ceb: the not-a-git-working-copy error for `tool_dir`,
+/// with the path relativized like `Filesystem::readablePath()`
+/// (T1153 CORE-61).
 #[must_use]
-pub fn not_git_message(tool_dir: &Path) -> String {
-    let dir = tool_dir.display().to_string();
+pub fn not_git_message(cwd: &Path, tool_dir: &Path) -> String {
+    let dir = readable_path(cwd, tool_dir);
     terminal::pht(
         "Library \"%s\" (at \"%s\") is not a Git working copy, so no version information can be provided.",
         &[PhtArg::Text(LIBRARY), PhtArg::Text(&dir)],
@@ -122,18 +148,18 @@ pub fn not_git_message(tool_dir: &Path) -> String {
 }
 
 /// Resolve the `arcanist` library checkout containing `tool_dir` (PHP's
-/// `$roots` entry, `:43-49`): the enclosing git working copy, or the PHP
+/// `$roots` entry, `:46-48` at ceb): the enclosing git working copy, or the PHP
 /// not-a-git-working-copy error.
-pub fn library_root(tool_dir: &Path) -> Result<PathBuf, String> {
+pub fn library_root(cwd: &Path, tool_dir: &Path) -> Result<PathBuf, String> {
     if !git::is_inside_work_tree(tool_dir) {
-        return Err(not_git_message(tool_dir));
+        return Err(not_git_message(cwd, tool_dir));
     }
     let root = git::stdout_text(tool_dir, &["rev-parse", "--show-toplevel"])?;
     Ok(PathBuf::from(root))
 }
 
 /// Split PHP's `log -1 --format=%ct%x01%H` output into
-/// (timestamp, commit) (PHP `:59-63`: trim, then `explode("\1")`).
+/// (timestamp, commit) (PHP `:65-70` at ceb: trim, then `explode("\1")`).
 pub fn split_log_line(line: &str) -> Result<(i64, String), String> {
     let trimmed = line.trim();
     let Some((timestamp, commit)) = trimmed.split_once('\x01') else {
@@ -142,7 +168,7 @@ pub fn split_log_line(line: &str) -> Result<(i64, String), String> {
     Ok((timestamp.parse::<i64>().unwrap_or(0), commit.to_string()))
 }
 
-/// HEAD commit of the checkout at `root` (PHP `:59-60`).
+/// HEAD commit of the checkout at `root` (PHP `:65-68` at ceb).
 pub fn head_commit(root: &Path) -> Result<(i64, String), String> {
     let line = git::stdout_text(root, &["log", "-1", "--format=%ct%x01%H"])?;
     split_log_line(&line)
@@ -193,7 +219,7 @@ pub fn format_version_date(timestamp: i64) -> String {
     format_version_date_in(timestamp, live_offset(timestamp))
 }
 
-/// Render the version line (PHP `:65-70`): `arcanist <hash> (<date>)`,
+/// Render the version line (PHP `:72-76` at ceb): `arcanist <hash> (<date>)`,
 /// at a fixed offset; pure for tests.
 #[must_use]
 pub fn render_version_line_in(commit: &str, timestamp: i64, offset: i64) -> String {
@@ -210,25 +236,27 @@ pub fn render_version_line(commit: &str, timestamp: i64) -> String {
 }
 
 /// `(timestamp, commit)` for the checkout containing `tool_dir`.
-fn head_of(tool_dir: &Path) -> Result<(i64, String), String> {
+/// `cwd` relativizes the not-a-git-copy error like
+/// `Filesystem::readablePath()` (T1153 CORE-61).
+fn head_of(cwd: &Path, tool_dir: &Path) -> Result<(i64, String), String> {
     if !git_binary_available() {
         return Err(missing_git_message());
     }
-    let root = library_root(tool_dir)?;
+    let root = library_root(cwd, tool_dir)?;
     head_commit(&root)
 }
 
 /// Full `version` output for the checkout containing `tool_dir`, at a
 /// fixed offset; pure for tests.
-pub fn version_text_in(tool_dir: &Path, offset: i64) -> Result<String, String> {
-    let (timestamp, commit) = head_of(tool_dir)?;
+pub fn version_text_in(cwd: &Path, tool_dir: &Path, offset: i64) -> Result<String, String> {
+    let (timestamp, commit) = head_of(cwd, tool_dir)?;
     Ok(render_version_line_in(&commit, timestamp, offset))
 }
 
 /// Full `version` output for the checkout containing `tool_dir`, in the
 /// process timezone.
-pub fn version_text(tool_dir: &Path) -> Result<String, String> {
-    let (timestamp, commit) = head_of(tool_dir)?;
+pub fn version_text(cwd: &Path, tool_dir: &Path) -> Result<String, String> {
+    let (timestamp, commit) = head_of(cwd, tool_dir)?;
     Ok(render_version_line_in(
         &commit,
         timestamp,
@@ -248,6 +276,7 @@ fn tool_dir() -> PathBuf {
 
 /// Display the version per `argv`, resolving the checkout from `tool_dir`.
 pub fn run_in(tool_dir: &Path, argv: &[String]) -> ExitCode {
+    use crate::conduit::{EnvelopeKind, report};
     match parse_args(argv) {
         Ok(None) => {
             print!("{}", usage());
@@ -255,28 +284,32 @@ pub fn run_in(tool_dir: &Path, argv: &[String]) -> ExitCode {
         }
         Err(message) => {
             // T1153 BROWSE-B21: the terminator failure prints the three
-            // cyan hints, then reports through the toolset usage arm.
+            // cyan hints first (like `ArcanistRuntime.php:172-188`).
             if message == crate::help::MISSING_TERMINATOR {
                 crate::help::print_terminator_hints(crate::terminal::ansi_enabled());
-                return crate::conduit::report(
-                    crate::conduit::EnvelopeKind::ToolsetUsage,
-                    &message,
-                );
             }
-            eprintln!("arc {NAME}: {message}\n\n{}", usage());
-            return ExitCode::FAILURE;
+            // T1153 CORE-49: toolset argument errors render the red
+            // `USAGE EXCEPTION` label with no usage dump (exit 1).
+            return crate::conduit::report(crate::conduit::EnvelopeKind::ToolsetUsage, &message);
         }
         Ok(Some(())) => {}
     }
-    match version_text(tool_dir) {
+    if !git_binary_available() {
+        // T1153 CORE-49: the missing-`git` throw is an
+        // `ArcanistUsageException` (`:39-44` at ceb), which escapes
+        // the toolset runtime into a PHP fatal (255).
+        return report(EnvelopeKind::Fatal, &missing_git_message());
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    match version_text(&cwd, tool_dir) {
         Ok(text) => {
             print!("{text}");
             ExitCode::SUCCESS
         }
-        Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            ExitCode::FAILURE
-        }
+        // T1153 CORE-49: the not-a-git-copy throw is a
+        // `PhutilArgumentUsageException` (`:56-62` at ceb), caught as
+        // `USAGE EXCEPTION` (exit 1).
+        Err(message) => report(EnvelopeKind::ToolsetUsage, &message),
     }
 }
 

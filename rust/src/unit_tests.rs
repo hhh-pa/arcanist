@@ -200,7 +200,7 @@ fn parses_everything_and_tracks_explicit_engine() {
 
 #[test]
 fn finds_arcunit_and_unit_engine_keys() {
-    // CORE-33/UNIT-U13: `unit.engine` reads through the source merge, so
+    // T1153 CORE-33/UNIT-U13: `unit.engine` reads through the source merge, so
     // the project file only counts at a working-copy root. Shadow options
     // keep the ambient `~/.arcrc` out of the assertions.
     let root = unique_dir("arcunit-find");
@@ -269,7 +269,7 @@ fn shadow_opts(dir: &std::path::Path) -> arc_rs::get_config::LoadOptions {
 fn discover_selection_prefers_explicit_then_config_then_cargo() {
     let dir = unique_dir("sel-order");
     std::fs::create_dir_all(&dir).unwrap();
-    // CORE-33: the project file only counts at a working-copy root.
+    // T1153 CORE-33: the project file only counts at a working-copy root.
     std::fs::create_dir_all(dir.join(".git")).unwrap();
     // UNIT-U7: nothing configured is `ArcanistNoEngineException`, not a
     // cargo default.
@@ -337,7 +337,7 @@ fn discover_selection_prefers_explicit_then_config_then_cargo() {
 fn discover_selection_rejects_bad_config() {
     let dir = unique_dir("sel-bad");
     std::fs::create_dir_all(&dir).unwrap();
-    // CORE-33: the project file only counts at a working-copy root.
+    // T1153 CORE-33: the project file only counts at a working-copy root.
     std::fs::create_dir_all(dir.join(".git")).unwrap();
 
     let bogus = parse_args(&args(&["--engine", "BogusEngine"])).unwrap();
@@ -1144,6 +1144,61 @@ fn json_and_modern_dicts() {
     assert_eq!(render_workflow_output(&[], &[], "none", false, &root), "");
     assert_eq!(render_workflow_output(&[], &[], "bogus", false, &root), "");
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn u21_sendmessage_params_keep_php_key_order() {
+    // T1153 UNIT-U21: PHP sends `harbormaster.sendmessage` params in
+    // insertion order (`ArcanistUnitWorkflow.php:424-426` at ceb), with
+    // `toDictionary` order inside each unit dict
+    // (`ArcanistUnitTestResult.php:164-175`) and `details` trailing
+    // after the modern rename (`ArcanistWorkflow.php:2243-2253`).
+    let mut r = engine_result("t", "pass");
+    r.set_namespace("ns");
+    r.set_link("l");
+    r.set_duration_int(3);
+    r.set_extra_data_ordered(vec![
+        ("zeta".to_string(), "1".to_string()),
+        ("alpha".to_string(), "2".to_string()),
+    ]);
+    r.set_user_data("trace");
+    r.set_coverage_ordered(vec![("b.rs".to_string(), "C".to_string())]);
+    let params = sendmessage_params("PHID-TARGET", 0, std::slice::from_ref(&r));
+    let top: Vec<&str> = params
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(top, vec!["buildTargetPHID", "unit", "type"]);
+    let unit = &params["unit"][0];
+    let keys: Vec<&str> = unit
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            "namespace",
+            "name",
+            "link",
+            "result",
+            "duration",
+            "extra",
+            "coverage",
+            "details",
+        ]
+    );
+    // Nested dicts keep producer order too (not sorted).
+    let extra: Vec<&str> = unit["extra"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(extra, vec!["zeta", "alpha"]);
 }
 
 #[test]

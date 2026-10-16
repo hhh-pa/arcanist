@@ -126,6 +126,7 @@ fn stores_session_from_connect_result() {
 
 #[test]
 fn rejects_non_object_params() {
+    // T1153 CORE-14 (kept): scalar stdin is a clean error, not a fatal.
     let client = test_client();
     let err = client.call("m", &serde_json::json!([1])).unwrap_err();
     assert_eq!(

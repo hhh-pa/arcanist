@@ -34,7 +34,7 @@ fn misses_cleanly() {
 
 #[test]
 fn discovers_arcconfig_upwards() {
-    // CORE-33: git reads `.arcconfig` only at the working-copy root; a
+    // T1153 CORE-33: git reads `.arcconfig` only at the working-copy root; a
     // subdir file PHP would ignore no longer counts, wherever it sits.
     let root = std::env::temp_dir().join(format!("arc-rs-disc-{}", std::process::id()));
     let child = root.join("a").join("b");

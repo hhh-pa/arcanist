@@ -4876,12 +4876,13 @@ pub fn git_metadata_dir(cwd: &Path) -> Result<PathBuf, String> {
 
 /* -(  Full-State Browser, Amend, Worktree Checks (G1)  )----------------------- */
 
-/// Error when no browser command can be found (`:2204-2207`).
+/// Error when no browser command can be found
+/// (`ArcanistWorkflow.php:2202-2206` at ceb, T1153 CORE-62).
 pub const NO_BROWSER_MESSAGE: &str = "Unable to find a browser command to run. Set 'browser' in your \
     Arcanist config to specify a command to use.";
 
 /// Browser argv for `uri`: explicit config, `cmd /c start` on Windows, else
-/// the `sensible-browser`/`xdg-open`/`open --` scan (`:2171-2208`).
+/// the `sensible-browser`/`xdg-open`/`open --` scan (`:2169-2207` at ceb).
 pub fn browser_open_argv(
     uri: &str,
     configured: Option<&[String]>,
@@ -4914,7 +4915,7 @@ pub fn browser_open_argv(
     Err(NO_BROWSER_MESSAGE.to_string())
 }
 
-/// Error when the browser command fails (`:2161-2166`).
+/// Error when the browser command fails (`:2159-2166` at ceb).
 #[must_use]
 pub fn browser_open_error(uri: &str, browser_argv: &[String]) -> String {
     format!(

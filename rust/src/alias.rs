@@ -6,8 +6,9 @@
 //! (expansion, [`expand`]), and the `src/runtime/ArcanistRuntime.php`
 //! dispatch (shell execution, hint application). The list and delete bodies
 //! follow the pre-toolset `src/workflow/ArcanistAliasWorkflow.php`
-//! (`70c6045c~1`), since the toolset versions on master are `TOOLSETS`
-//! stubs returning 1.
+//! (`70c6045c~1`), since the toolset versions at ceb are `TOOLSETS`
+//! stubs returning 1 silently (T1153 CORE-26, kept: PHP's silent
+//! stubs; Rust implements both).
 //!
 //! Aliases live under the top-level `aliases` key of `~/.arcrc`, read from
 //! every file source (system, user, project, local, least to most specific,
@@ -101,11 +102,12 @@ pub fn builtin_names() -> &'static [&'static str] {
     BUILTINS
 }
 
-/// The 20 workflows the toolset runtime serves in-process at ceb
+/// The 21 workflows the toolset runtime serves in-process at ceb
 /// (`newWorkflows()`: `ArcanistArcWorkflow` subclasses plus the five
 /// `src/toolset/workflow/` commands), alphabetical. The classic
-/// subprocess serves the other 16; `browse`/`markers` are abstract in
-/// PHP and `arc` itself is not a command.
+/// subprocess serves the other 16; `markers` is abstract in PHP
+/// (`browse` is concrete, T1153 CORE-66) and `arc` itself is not a
+/// command.
 #[must_use]
 pub fn toolset_names() -> &'static [&'static str] {
     &[
@@ -114,6 +116,7 @@ pub fn toolset_names() -> &'static [&'static str] {
         "anoid",
         "bookmarks",
         "branches",
+        "browse",
         "call-conduit",
         "download",
         "help",
@@ -231,7 +234,9 @@ fn parse_entry(key: &str, value: &serde_json::Value) -> Result<Alias, String> {
 }
 
 /// Warning for an invalid alias entry, mirroring the engine's
-/// `EFFECT_CONFIGURATION` message.
+/// `EFFECT_CONFIGURATION` message (T1153 CORE-24, kept: PHP
+/// references the undefined constant and fatals; Rust warns and
+/// ignores).
 fn invalid_warning(source: &str, detail: &str) -> String {
     terminal::pht(
         "Configuration source (\"%s\") defines an invalid alias, which will be ignored: %s",
@@ -781,7 +786,7 @@ pub struct Options {
 ///
 /// Returns `Ok(None)` when `--help` was requested. A lone `-` is
 /// positional (T1153 RB-D6); `--json` rejects repeats and `=value`
-/// with the toolset texts (T1153 RB-D2/RB-D25). The unknown-flag text
+/// with the toolset texts (T1153 RB-D2/T1153 RB-D25). The unknown-flag text
 /// stays the legacy `unknown flag` wording (locked by contract tests;
 /// PHP reports `Argument "--x" is unrecognized. ...`).
 pub fn parse_args(argv: &[String]) -> Result<Option<Options>, String> {

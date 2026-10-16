@@ -33,9 +33,9 @@
 //! Divergences:
 //! - End-of-input while naming a library fails instead of re-prompting
 //!   forever (T1153 CORE-54, kept).
-//! - The create-directory prompt reads answers from its input with no
-//!   TTY gate (contract tests feed it piped answers); `?`, `*`/`!`
-//!   saves, and saved responses work through the shared prompt engine.
+//! - `?`, `*`/`!` saves, and saved responses work through the shared
+//!   prompt engine (T1153 CORE-52); the contract-test seam models a
+//!   TTY, production gates on the real stdin state.
 //! - Prompts print plain text (no `phutil_console_prompt` wrapping or
 //!   readline history).
 
@@ -52,11 +52,13 @@ const INIT_FILE: &str = "__phutil_library_init__.php";
 const MAP_FILE: &str = "__phutil_library_map__.php";
 const VERSION_MARKER: &str = "@phutil-library-version";
 
+/// Short `--help` text. The synopsis transcribes PHP verbatim
+/// (`ArcanistLiberateWorkflow.php:14-20` at ceb, T1153 CORE-55).
 fn usage() -> String {
     format!(
         "usage: arc {NAME} [--clean] [PATH]\n\
          \n\
-         Create or update a libphutil library. Without PATH, libraries one\n\
+         Create or update an Arcanist library. Without PATH, libraries one\n\
          level below the current directory are updated.\n\
          \n\
          Options:\n\
@@ -242,10 +244,11 @@ fn prompt_line(prompt: &str, input: &mut dyn BufRead) -> Option<String> {
 }
 
 /// Ask to create a missing directory through the shared prompt
-/// engine (`arc.liberate.create`): `?` help, `*`/`!` saves, and saved
-/// responses all work. Answers come from `input`; `stdin_tty` gates
-/// like PHP (liberate's direct-input path passes `true`, see
-/// `ensure_library_with`).
+/// engine (`arc.liberate.create`, T1153 CORE-52): `?` help, `*`/`!`
+/// saves, and saved responses all work, and a non-TTY stdin throws
+/// after echoing the query, like `ArcanistPrompt.php:77-86` at ceb.
+/// Answers come from `input`; `stdin_tty` carries the real TTY
+/// state (the contract-test seam passes `true`).
 fn confirm_create_directory(
     path: &Path,
     input: &mut dyn BufRead,
@@ -272,12 +275,15 @@ fn confirm_create_directory(
     }
 }
 
+/// Name prompt (`liberateCreateLibrary`, T1153 CORE-52): PHP prints
+/// the `Choose a name...` line on every retry, and loops forever
+/// (T1153 CORE-54, kept: EOF fails fast instead of re-prompting).
 fn ask_library_name(input: &mut dyn BufRead) -> Result<String, String> {
-    println!(
-        "{}",
-        terminal::pht("Choose a name for the new library.", &[])
-    );
     loop {
+        println!(
+            "{}",
+            terminal::pht("Choose a name for the new library.", &[])
+        );
         let name = prompt_line("What do you want to name this library? ", input)
             .ok_or_else(|| "cancelled: no library name given".to_string())?;
         if is_valid_library_name(&name) {
@@ -306,11 +312,11 @@ pub fn ensure_library(path: &Path, input: &mut dyn BufRead) -> Result<bool, Stri
     ensure_library_with(path, input, true, None, &mut noop)
 }
 
-/// [`ensure_library`] with an explicit prompt channel: `stdin_tty`
-/// gates like PHP, `saved` is the saved `arc.liberate.create`
-/// response, and `save` persists `*`/`!` suffixes. Liberate's own
-/// path answers from `input` without gating (contract tests feed
-/// piped answers); pass the real TTY state from new callers.
+/// [`ensure_library`] with an explicit prompt channel (T1153
+/// CORE-52): `stdin_tty` gates like PHP, `saved` is the saved
+/// `arc.liberate.create` response, and `save` persists `*`/`!`
+/// suffixes. The contract-test seam passes `true`; production
+/// passes the real TTY state.
 pub fn ensure_library_with(
     path: &Path,
     input: &mut dyn BufRead,
@@ -437,9 +443,10 @@ pub fn rebuild_map(path: &Path, clean: bool, script: Option<&Path>) -> Option<St
 ///
 /// Returns `Ok(None)` on success and `Ok(Some(message))` when the rebuild
 /// step fails (a per-library failure: reported, but the workflow still
-/// exits 0). Usage errors (ancient or unknown versions, declined
-/// prompts, unreadable maps) return `Err`, abort the workflow, and exit 1
-/// at the `run_in` layer.
+/// exits 0). Usage errors (ancient or unknown versions, unreadable
+/// maps) return `Err`, abort the workflow, and exit 255 at the
+/// `run_in` layer (T1153 CORE-53); declined prompts exit 1 through
+/// the `---` arm (T1153 CORE-51).
 pub fn liberate_path(
     path: &Path,
     clean: bool,
@@ -483,15 +490,21 @@ pub fn readable_path(dir: &Path, path: &Path) -> String {
 }
 
 /// Run the workflow; reads interactive answers from `input`.
+///
+/// `stdin_tty` gates the create-directory prompt like PHP
+/// (`ArcanistPrompt.php:77-86` at ceb, T1153 CORE-52): contract
+/// tests pass `true` with piped answers; [`execute`] passes the
+/// real TTY state.
 pub fn execute_with_input(
     dir: &Path,
     argv: &[String],
     input: &mut dyn BufRead,
+    stdin_tty: bool,
 ) -> Result<String, String> {
     let opts = match parse_args(argv) {
         ParseOutcome::Args(opts) => opts,
         ParseOutcome::Help => return Ok(usage()),
-        // T1153 R4 (CORE-21): PHP renders usage errors with no dump.
+        // T1153 CORE-21 (R4): PHP renders usage errors with no dump.
         ParseOutcome::Error(message) => return Err(message),
     };
     let paths = match opts.path {
@@ -516,9 +529,8 @@ pub fn execute_with_input(
         }
     };
     // The `arc.liberate.create` prompt channel: answers come from
-    // `input` without a TTY gate (contract tests feed piped answers),
-    // with saved responses and `*`/`!` saves wired to the real config
-    // scopes.
+    // `input` through the TTY gate, with saved responses and `*`/`!`
+    // saves wired to the real config scopes.
     let user_file = crate::config::arcrc_path();
     let local_file = crate::prompts::working_copy_config_file(dir);
     let saved_list =
@@ -540,7 +552,14 @@ pub fn execute_with_input(
         );
         // T1153 CORE-50: the rebuild status is ignored entirely (the
         // script already streamed to the console); only `Err` aborts.
-        match liberate_path_with(path, opts.clean, input, true, saved.as_deref(), &mut saver) {
+        match liberate_path_with(
+            path,
+            opts.clean,
+            input,
+            stdin_tty,
+            saved.as_deref(),
+            &mut saver,
+        ) {
             Ok(_) => {}
             Err(message) => return Err(message),
         }
@@ -557,19 +576,20 @@ pub fn execute_with_input(
 pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
     let stdin = std::io::stdin();
     let mut locked = stdin.lock();
-    execute_with_input(dir, argv, &mut locked)
+    execute_with_input(dir, argv, &mut locked, crate::prompt::stdin_is_terminal())
 }
 
 /// Classify a workflow error for the R4 envelope: parser errors
 /// are toolset usage errors (red label, exit 1 -- the R4 mapping,
 /// kept; PHP's `parse()` catch renders these bold, like
 /// `ToolsetParseError` elsewhere); declined prompts (`cancelled:
-/// ...`) are `ArcanistUserAbortException` (the `---` arm, exit 1),
-/// rendered without the `cancelled: ` prefix so declines show PHP's
-/// abort text; no-libraries and ancient/unknown versions throw
-/// `ArcanistUsageException`, which escapes the toolset runtime into a
-/// PHP fatal (255). Per-library rebuild failures never reach here
-/// (ignored above, T1153 CORE-50).
+/// ...`) are `ArcanistUserAbortException` (the `---` arm, exit 1,
+/// T1153 CORE-51), rendered without the `cancelled: ` prefix so
+/// declines show PHP's abort text; no-libraries and ancient/unknown
+/// versions throw `ArcanistUsageException`, which escapes the
+/// toolset runtime into a PHP fatal (255, T1153 CORE-53).
+/// Per-library rebuild failures never reach here (ignored above,
+/// T1153 CORE-50).
 fn classify_error(argv: &[String], message: String) -> ClassifiedError {
     if matches!(parse_args(argv), ParseOutcome::Error(_)) {
         ClassifiedError::toolset_usage(message)

@@ -420,6 +420,7 @@ fn effective_aliases_dedupe_and_sort() {
 
 #[test]
 fn renders_list_table_and_empty_state() {
+    // T1153 CORE-26 (kept): PHP's list stub is silent; Rust lists.
     assert_eq!(render_list(&[]), "You have not defined any aliases yet.\n");
     let aliases = vec![
         alias("arc", "ls", &["!ls"], "user"),
@@ -839,6 +840,7 @@ fn expansion_driver_passes_through_flags_and_unreadable_config() {
 
 #[test]
 fn expansion_driver_emits_configuration_warnings_first() {
+    // T1153 CORE-24 (kept): invalid aliases warn and are ignored.
     let aliases = vec![alias("arc", "draft", &["diff"], "user")];
     let warning = "Configuration source (\"user\") defines an invalid alias".to_string();
     let (result, notices) = apply_expansion_with(
@@ -877,14 +879,17 @@ fn rbd6_lone_dash_is_positional() {
 
 #[test]
 fn core16_toolset_names_match_ceb() {
+    // T1153 CORE-66: `browse` is a concrete toolset workflow at ceb
+    // (`ArcanistBrowseWorkflow extends ArcanistArcWorkflow`).
     let names = toolset_names();
-    assert_eq!(names.len(), 20);
+    assert_eq!(names.len(), 21);
     for name in [
         "alias",
         "amend",
         "anoid",
         "bookmarks",
         "branches",
+        "browse",
         "call-conduit",
         "download",
         "help",
@@ -903,7 +908,7 @@ fn core16_toolset_names_match_ceb() {
     ] {
         assert!(names.contains(&name), "{name}");
     }
-    for name in ["diff", "list", "which", "markers", "browse", "arc"] {
+    for name in ["diff", "list", "which", "markers", "arc"] {
         assert!(!names.contains(&name), "{name}");
     }
 }

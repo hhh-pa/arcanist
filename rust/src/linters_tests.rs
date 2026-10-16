@@ -18,7 +18,7 @@ fn entry(class: &str) -> LinterEntry {
 
 #[test]
 fn registry_lists_all_thirty_three_classes() {
-    // LINTERS-L1: `filename` is listed, so the registry holds 34 classes.
+    // T1153 LINTERS-L1: `filename` is listed, so the registry holds 34 classes.
     assert_eq!(LINTERS.len(), 34);
     let mut classes: Vec<&str> = LINTERS.iter().map(|meta| meta.class).collect();
     classes.sort_unstable();
@@ -47,7 +47,7 @@ fn compat_registry_keeps_thirty_four_display_names() {
 #[test]
 fn options_tables_match_php() {
     // Native with one custom option before the base table.
-    // LINTERS-L11: `text.max-line-length` is listed.
+    // T1153 LINTERS-L11: `text.max-line-length` is listed.
     let names: Vec<&str> = meta("ArcanistTextLinter")
         .options()
         .iter()
@@ -117,7 +117,7 @@ fn options_tables_match_php() {
         .map(|option| option.name)
         .collect();
     assert_eq!(names, vec!["bin", "flags", "version"]);
-    // LINTERS-L9/L10: base and tool option types and helps match PHP.
+    // T1153 LINTERS-L9/L10: base and tool option types and helps match PHP.
     let text_opts = meta("ArcanistTextLinter").options();
     let severity = text_opts.iter().find(|o| o.name == "severity").unwrap();
     assert_eq!(severity.option_type, "optional map<string|int, string>");
@@ -138,7 +138,7 @@ fn options_tables_match_php() {
             .option_help(version)
             .contains("version comparison operator")
     );
-    // LINTERS-L17: XHP merges rule options after the base table.
+    // T1153 LINTERS-L17: XHP merges rule options after the base table.
     let names: Vec<&str> = meta("ArcanistXHPASTLinter")
         .options()
         .iter()
@@ -228,7 +228,7 @@ fn selection_matches_php() {
     assert_eq!(exact.len(), 2);
     assert!(filter_exact(&entries, &["TXT".to_string()]).is_empty());
     assert!(filter_exact(&entries, &["Basic Text Linter".to_string()]).is_empty());
-    // LINTERS-L3: exact match is case-insensitive (`strcasecmp`).
+    // T1153 LINTERS-L3: exact match is case-insensitive (`strcasecmp`).
     assert_eq!(filter_exact(&entries, &["TEXT".to_string()]).len(), 1);
     assert_eq!(filter_exact(&entries, &["Text".to_string()]).len(), 1);
     // Search matches config, info, and description text.
@@ -238,7 +238,7 @@ fn selection_matches_php() {
     let found = filter_search(&entries, &["lint".to_string()]);
     assert!(found.len() > 10);
     let found = filter_search(&entries, &["".to_string()]);
-    // LINTERS-L1: 34 with `filename`.
+    // T1153 LINTERS-L1: 34 with `filename`.
     assert_eq!(found.len(), 34);
     // Multi-term search dedups by class.
     let found = filter_search(&entries, &["php".to_string(), "PHPCS".to_string()]);
@@ -253,7 +253,7 @@ fn sorting_is_case_insensitive_by_info_name() {
     let entries = collect_entries(&[]);
     let refs: Vec<&LinterEntry> = entries.iter().collect();
     let sorted = sort_entries(refs);
-    // LINTERS-L1: 34 with `filename`.
+    // T1153 LINTERS-L1: 34 with `filename`.
     assert_eq!(sorted.len(), 34);
     let names: Vec<&str> = sorted.iter().map(|entry| entry.meta.info_name).collect();
     let mut expected = names.clone();
@@ -295,12 +295,12 @@ fn verbose_rendering_matches_php() {
     text.status = LinterStatus::Configured;
     text.version = Some("9.9".to_string());
     let rendered = render_entries(&[&text], true);
-    // LINTERS-L5/L6: header shows config + info names with no leading blank.
+    // T1153 LINTERS-L5/L6: header shows config + info names with no leading blank.
     assert!(rendered.starts_with(" CONFIGURED  text (Basic Text Linter)\n\n    Version 9.9\n"));
-    // LINTERS-L12: PHP description text.
+    // T1153 LINTERS-L12: PHP description text.
     assert!(rendered.contains("Enforces basic text rules like line length"));
     assert!(rendered.contains("\n    Configuration Options\n\n"));
-    // LINTERS-L9: PHP option types.
+    // T1153 LINTERS-L9: PHP option types.
     assert!(rendered.contains("    severity (optional map<string|int, string>)\n"));
     assert!(rendered.ends_with("\n\n"));
 
@@ -328,7 +328,7 @@ fn no_match_message_matches_php() {
         no_match_message(&["frobnicate".to_string()]),
         "No match found. Try `arc linters --search frobnicate` to search for a linter.\n"
     );
-    // LINTERS-L4: PHP reports only `$exact[0]`.
+    // T1153 LINTERS-L4: PHP reports only `$exact[0]`.
     assert_eq!(
         no_match_message(&["a".to_string(), "b".to_string()]),
         "No match found. Try `arc linters --search a` to search for a linter.\n"
@@ -416,6 +416,7 @@ fn r4_lintersl24_usage_error_has_no_dump() {
 
 #[test]
 fn linters_l1_filename_linter_is_listed() {
+    // T1153 LINTERS-L1: `filename` (NAME) is listed.
     let filename = meta("ArcanistFilenameLinter");
     assert_eq!(filename.config_name, "filename");
     assert_eq!(filename.display, "NAME");
@@ -426,6 +427,7 @@ fn linters_l1_filename_linter_is_listed() {
 
 #[test]
 fn linters_l2_exact_and_search_is_usage_error() {
+    // T1153 LINTERS-L2: exact + `--search` is a usage error.
     assert_eq!(
         run_in(
             Path::new("."),
@@ -441,6 +443,7 @@ fn linters_l2_exact_and_search_is_usage_error() {
 
 #[test]
 fn linters_l3_exact_match_ignores_case() {
+    // T1153 LINTERS-L3: exact match is case-insensitive.
     let entries = collect_entries(&[]);
     assert_eq!(filter_exact(&entries, &["TEXT".to_string()]).len(), 1);
     assert_eq!(
@@ -451,6 +454,7 @@ fn linters_l3_exact_match_ignores_case() {
 
 #[test]
 fn linters_l4_no_match_reports_first_term_only() {
+    // T1153 LINTERS-L4: no-match names only the first term.
     assert_eq!(
         no_match_message(&["a".to_string(), "b".to_string()]),
         "No match found. Try `arc linters --search a` to search for a linter.\n"
@@ -459,6 +463,7 @@ fn linters_l4_no_match_reports_first_term_only() {
 
 #[test]
 fn linters_l5_verbose_header_matches_brief() {
+    // T1153 LINTERS-L5: verbose header shows config + info names.
     let text = entry("ArcanistTextLinter");
     let verbose = render_entries(&[&text], true);
     let brief = render_entries(&[&text], false);
@@ -470,6 +475,7 @@ fn linters_l5_verbose_header_matches_brief() {
 
 #[test]
 fn linters_l6_verbose_has_no_leading_blank_line() {
+    // T1153 LINTERS-L6: no leading blank line in verbose mode.
     let text = entry("ArcanistTextLinter");
     let rendered = render_entries(&[&text], true);
     assert!(!rendered.starts_with('\n'));
@@ -477,6 +483,7 @@ fn linters_l6_verbose_has_no_leading_blank_line() {
 
 #[test]
 fn linters_l7_wrapped_blocks_end_with_single_newline() {
+    // T1153 LINTERS-L7: wrapped blocks end with one newline.
     let mut text = entry("ArcanistTextLinter");
     text.status = LinterStatus::Configured;
     let rendered = render_entries(&[&text], true);
@@ -494,6 +501,7 @@ fn linters_l7_wrapped_blocks_end_with_single_newline() {
 
 #[test]
 fn linters_l8_wrap_stays_within_78_columns() {
+    // T1153 LINTERS-L8: wrap stays within 78 columns.
     let entries = collect_entries(&[]);
     let refs: Vec<&LinterEntry> = entries.iter().collect();
     let rendered = render_entries(&refs, true);
@@ -508,6 +516,7 @@ fn linters_l8_wrap_stays_within_78_columns() {
 
 #[test]
 fn linters_l9_base_option_types_match_php() {
+    // T1153 LINTERS-L9: base severity option types match PHP.
     let options = meta("ArcanistTextLinter").options();
     let find = |name| options.iter().find(|o| o.name == name).unwrap();
     assert_eq!(
@@ -526,6 +535,7 @@ fn linters_l9_base_option_types_match_php() {
 
 #[test]
 fn linters_l10_tool_option_types_match_php() {
+    // T1153 LINTERS-L10: tool option types match PHP, no placeholders.
     let options = meta("ArcanistFlake8Linter").options();
     let find = |name| options.iter().find(|o| o.name == name).unwrap();
     assert_eq!(find("bin").option_type, "optional string | list<string>");
@@ -535,6 +545,7 @@ fn linters_l10_tool_option_types_match_php() {
 
 #[test]
 fn linters_l11_text_max_line_length_option_exists() {
+    // T1153 LINTERS-L11: `text.max-line-length` is listed.
     let options = meta("ArcanistTextLinter").options();
     let option = options
         .iter()
@@ -545,6 +556,7 @@ fn linters_l11_text_max_line_length_option_exists() {
 
 #[test]
 fn linters_l12_text_description_matches_php() {
+    // T1153 LINTERS-L12: text description matches PHP.
     assert_eq!(
         meta("ArcanistTextLinter").description,
         Some(
@@ -555,6 +567,7 @@ fn linters_l12_text_description_matches_php() {
 
 #[test]
 fn linters_l13_phpcs_facts_match_php() {
+    // T1153 LINTERS-L13: phpcs facts match PHP.
     let phpcs = meta("ArcanistPhpcsLinter");
     assert_eq!(phpcs.info_name, "PHP_CodeSniffer");
     assert_eq!(
@@ -575,6 +588,7 @@ fn linters_l13_phpcs_facts_match_php() {
 
 #[test]
 fn linters_l14_xhpast_description_matches_php() {
+    // T1153 LINTERS-L14: xhpast description matches PHP.
     assert_eq!(
         meta("ArcanistXHPASTLinter").description,
         Some("Use XHPAST to enforce coding conventions on PHP source files.")
@@ -583,6 +597,7 @@ fn linters_l14_xhpast_description_matches_php() {
 
 #[test]
 fn linters_l15_xhpast_version_is_ported_rule_count() {
+    // T1153 LINTERS-L15 (Rule 3 keep): version counts ported rules.
     // Rule 3 keep: only one rule is ported, so the version counts it.
     assert_eq!(
         probe_version(meta("ArcanistXHPASTLinter")),
@@ -592,6 +607,7 @@ fn linters_l15_xhpast_version_is_ported_rule_count() {
 
 #[test]
 fn linters_l16_xhpast_table_lists_ported_rules_only() {
+    // T1153 LINTERS-L16 (Rule 3 keep): table lists ported rules only.
     // Rule 3 keep: 103 PHP-only rules are unportable; the table keeps
     // the reconstructed borders over the ported set.
     let table = xhpast_rules_table();
@@ -601,6 +617,7 @@ fn linters_l16_xhpast_table_lists_ported_rules_only() {
 
 #[test]
 fn linters_l17_xhpast_merges_rule_options() {
+    // T1153 LINTERS-L17: XHP merges rule options.
     let names: Vec<&str> = meta("ArcanistXHPASTLinter")
         .options()
         .iter()
@@ -614,6 +631,7 @@ fn linters_l17_xhpast_merges_rule_options() {
 
 #[test]
 fn linters_l20_jsonlint_marks_external_linter() {
+    // T1153 LINTERS-L20: `jsonlint` configures the external wrapper.
     // `jsonlint` is the external wrapper's config name; the native
     // `json` linter shares its display but must not match first.
     let jsonlint = LINTERS
@@ -641,6 +659,7 @@ fn linters_l20_jsonlint_marks_external_linter() {
 
 #[test]
 fn linters_l22_comprehensive_builds_nine_linters() {
+    // T1153 LINTERS-L22: comprehensive engine builds nine linters.
     let dir = std::env::temp_dir().join(format!("linters-comp-{}", std::process::id()));
     std::fs::create_dir_all(dir.join(".git")).unwrap();
     std::fs::write(
@@ -668,6 +687,7 @@ fn linters_l22_comprehensive_builds_nine_linters() {
 
 #[test]
 fn linters_l23_single_engine_reports_unknown_linter() {
+    // T1153 LINTERS-L23 (Rule 3 keep): unknown linter reports PHP bytes.
     // Rule 3: custom PHP subclasses are unportable; unknown names
     // report the PHP "does not exist" bytes.
     let dir = std::env::temp_dir().join(format!("linters-single-{}", std::process::id()));
@@ -686,6 +706,7 @@ fn linters_l23_single_engine_reports_unknown_linter() {
 
 #[test]
 fn linters_l25_help_uses_php_wording() {
+    // T1153 LINTERS-L25: help uses PHP wording.
     let help = super::usage();
     assert!(help.contains("usage: arc linters [options] [name]"));
     assert!(help.contains("List the available and configured linters"));
@@ -694,6 +715,7 @@ fn linters_l25_help_uses_php_wording() {
 
 #[test]
 fn linters_l26_probe_honors_configured_bin() {
+    // T1153 LINTERS-L26: version probe honors the configured `bin`.
     // A configured `bin` replaces the default binary for the probe: a
     // bogus path yields the missing-binary error naming that path.
     let meta = meta("ArcanistFlake8Linter");
@@ -724,6 +746,7 @@ fn linters_l26_probe_honors_configured_bin() {
 
 #[test]
 fn linters_l27_missing_binary_reports_install_instructions() {
+    // T1153 LINTERS-L27: missing binary reports install instructions.
     let meta = meta("ArcanistFlake8Linter");
     let error = probe_version_with_bin(meta, Some("arc-rs-no-such-binary-xyz")).unwrap_err();
     assert_eq!(error.class, "ArcanistMissingLinterException");
@@ -737,6 +760,7 @@ fn linters_l27_missing_binary_reports_install_instructions() {
 
 #[test]
 fn linters_l28_brief_mode_shows_probe_errors() {
+    // T1153 LINTERS-L28: brief mode shows probe errors too.
     let mut error = entry("ArcanistPhpLinter");
     error.status = LinterStatus::Error;
     error.error = Some(LinterError {

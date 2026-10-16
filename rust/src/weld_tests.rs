@@ -150,6 +150,8 @@ fn empty_inputs_are_skipped() {
 
 #[test]
 fn welded_output_is_deterministic_for_a_seed() {
+    // T1153 CORE-47: the stream is splitmix64, not `mt_rand` (kept:
+    // unportable), but `--seed` still pins the joint byte-identical.
     let inputs = ["alpha\nbeta\ngamma\n", "one\ntwo\nthree\n"];
     let mut first = Rng::new(1234);
     let mut second = Rng::new(1234);
@@ -202,6 +204,59 @@ fn usage_covers_files_and_seed() {
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
     assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
 }
+#[test]
+fn core48_combining_marks_fuse_as_one_glyph() {
+    // T1153 CORE-48: `phutil_utf8v_combined` keeps `e` + U+0301
+    // together, so the joint never splits them across sides.
+    assert_eq!(split_glyphs(""), Vec::<String>::new());
+    assert_eq!(split_glyphs("abc"), vec!["a", "b", "c"]);
+    assert_eq!(split_glyphs("é"), vec!["é"]);
+    assert_eq!(split_glyphs("áb"), vec!["á", "b"]);
+    // A leading combining mark attaches to a synthetic space.
+    assert_eq!(split_glyphs("́x"), vec![" ́", "x"]);
+    // Single-byte chars are never combining, even beside marks.
+    assert_eq!(split_glyphs("0́"), vec!["0́"]);
+    for seed in 0..25 {
+        let mut rng = Rng::new(seed);
+        let out = weld_lines("é\n", "xy\n", 0.5, &mut rng);
+        let body = out.strip_suffix('\n').unwrap();
+        // One glyph against two: position 0 draws, position 1 always
+        // takes the later side (earlier pads with a space), and the
+        // mark never leaves its base.
+        assert!(body == "éy" || body == "xy", "seed={seed} {out:?}");
+    }
+}
+
+#[test]
+fn core48_mixed_validity_pairs_split_per_side() {
+    // T1153 CORE-48: `weldLines` tests each side for UTF-8
+    // independently — the valid side fuses glyphs, the invalid side
+    // bytes (`ArcanistWeldWorkflow.php:90-103` at ceb). A two-byte
+    // glyph against one bad byte fuses whole-or-byte, never split.
+    for seed in 0..25 {
+        let mut rng = Rng::new(seed);
+        let out = weld_line_bytes(b"\xff\n", "é\n".as_bytes(), 0.5, &mut rng);
+        let body = out.strip_suffix(b"\n").unwrap();
+        assert!(
+            body == b"\xff" || body == "é".as_bytes(),
+            "seed={seed} {out:?}"
+        );
+        let mut rng = Rng::new(seed);
+        let out = weld_line_bytes("é\n".as_bytes(), b"\xff\n", 0.5, &mut rng);
+        let body = out.strip_suffix(b"\n").unwrap();
+        assert!(
+            body == b"\xff" || body == "é".as_bytes(),
+            "seed={seed} {out:?}"
+        );
+    }
+    // Both-invalid still fuses byte by byte.
+    for seed in 0..10 {
+        let mut rng = Rng::new(seed);
+        let out = weld_line_bytes(b"\xff\n", b"\xfe\n", 0.5, &mut rng);
+        assert!(out == b"\xff\n" || out == b"\xfe\n", "seed={seed} {out:?}");
+    }
+}
+
 #[test]
 fn weld_line_bytes_fuses_invalid_utf8_bytewise() {
     let earlier = b"\xff\xfe data\n";

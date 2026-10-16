@@ -1331,7 +1331,10 @@ impl SortVector {
         self.parts.push(format!("{prefix}{magnitude:020}"));
     }
 
-    /// Add a string part; NUL bytes fail like the PHP vector.
+    /// Add a string part; NUL bytes fail (T1153 RB-D38d, kept:
+    /// PHP's `strpos("\0", $v)` check is a swapped-argument no-op,
+    /// `PhutilSortVector.php:32-38` at ceb — and marker names can
+    /// never contain NUL, so both are unreachable).
     pub fn add_string(&mut self, value: &str) -> Result<(), String> {
         if !value.is_empty() && value.contains('\0') {
             return Err(

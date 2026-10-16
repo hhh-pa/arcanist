@@ -229,7 +229,7 @@ fn run_in_fails_outside_repo_before_conduit() {
 
 #[test]
 fn execute_propagates_conduit_errors() {
-    // RB-D27 lock: execute errors (incl. conduit failures) surface as Err
+    // T1153 RB-D27 lock: execute errors (incl. conduit failures) surface as Err
     // so run() prints them to stderr with exit 1, like PHP.
     let client = crate::conduit::Client::new("http://127.0.0.1:9/", "t").unwrap();
     let options = Options {

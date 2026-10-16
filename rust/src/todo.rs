@@ -6,6 +6,11 @@
 //!
 //! The creation line keeps the PHP console colors (green title, blue URI)
 //! on TTYs, gated on the process ANSI setting like `tsprintf()`.
+//!
+//! No `--check` flag exists at ceb (`ArcanistTodoWorkflow.php` is 121
+//! lines; the audit's `--check` subsystem and browse success text
+//! describe a newer baseline, T1153 RB-D29 Rule 4); `--browse` stays
+//! silent on success like `:115-117`.
 
 use std::process::ExitCode;
 
@@ -468,12 +473,12 @@ pub fn run(argv: &[String]) -> ExitCode {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
         }
-        // T1153 R4 (RB-D4): `todo` is a subprocess workflow:
+        // T1153 RB-D4 (R4): `todo` is a subprocess workflow:
         // usage errors render `Usage Exception:` with no usage dump
         // (`scripts/arcanist.php:432-444`).
         Err(msg) => return conduit::report(EnvelopeKind::Usage, &msg),
     };
-    // T1153 CORE-4/CORE-9: classic `requiresAuthentication` startup
+    // T1153 CORE-4/T1153 CORE-9: classic `requiresAuthentication` startup
     // (tokenless engine, credential gate, `user.whoami` /
     // `conduit.connect` verification).
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));

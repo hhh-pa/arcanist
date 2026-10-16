@@ -9,6 +9,11 @@
 //! the wrapped `parse()`, so errors here render bold `**Usage
 //! Exception:**` and exit 1). New-style workflows at ceb use no short
 //! flags and no conflicts, so those are not modeled.
+//!
+//! Parse-error texts transcribe PHP verbatim (T1153 RB-D1):
+//! `Argument "--x" requires a parameter.`, `Unrecognized argument "x".`,
+//! `Argument "--x" is unrecognized. Use "--" to indicate the end of
+//! flags.`
 
 use std::collections::HashMap;
 

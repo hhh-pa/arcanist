@@ -3322,7 +3322,8 @@ fn results_to_json_pretty(results: &[EngineUnitResult]) -> String {
 /// Encode results as a JSON array of `toDictionary` objects
 /// (`ArcanistUnitWorkflow.php:258`, `ArcanistUnitTestResult.php:164-175`),
 /// in `toDictionary` key order with `null` for missing values (including
-/// unset `name`/`result`, UNIT-U19; integer durations stay bare, UNIT-U18).
+/// unset `name`/`result`, T1153 UNIT-U19; integer durations stay bare,
+/// T1153 UNIT-U18; insertion order on the wire, T1153 UNIT-U21).
 #[must_use]
 pub fn results_to_json(results: &[EngineUnitResult]) -> serde_json::Value {
     let items: Vec<serde_json::Value> = results
@@ -3390,8 +3391,10 @@ pub fn results_to_json(results: &[EngineUnitResult]) -> serde_json::Value {
     serde_json::Value::Array(items)
 }
 
-/// Modern unit dictionary (`ArcanistWorkflow.php:2244-2254`): drop `null`
-/// values, rename non-empty `userData` to `details`.
+/// Modern unit dictionary (`ArcanistWorkflow.php:2243-2253` at ceb):
+/// drop `null` values (order kept), rename non-empty `userData` to a
+/// trailing `details` (T1153 UNIT-U21: insertion order end to end, like
+/// PHP's `json_encode`).
 #[must_use]
 pub fn modern_unit_value(value: &serde_json::Value) -> serde_json::Value {
     let Some(obj) = value.as_object() else {
@@ -3453,6 +3456,24 @@ pub fn upload_results_with(
     opts: &get_config::LoadOptions,
 ) -> Result<(), String> {
     let client = config::client_for_with(conduit_uri, dir, user_file, opts)?;
+    let params = sendmessage_params(target_phid, overall, results);
+    client
+        .call("harbormaster.sendmessage", &params)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// `harbormaster.sendmessage` params for `results`
+/// (`ArcanistUnitWorkflow.php:421-427` at ceb): `buildTargetPHID`,
+/// modern `unit` dicts, `type`, in that order (T1153 UNIT-U21: PHP
+/// sends insertion order via `json_encode`; `preserve_order` keeps
+/// this builder's order on the wire too).
+#[must_use]
+pub fn sendmessage_params(
+    target_phid: &str,
+    overall: i32,
+    results: &[EngineUnitResult],
+) -> serde_json::Value {
     let raw = results_to_json(results);
     let modern: Vec<serde_json::Value> = raw
         .as_array()
@@ -3461,15 +3482,11 @@ pub fn upload_results_with(
         .iter()
         .map(modern_unit_value)
         .collect();
-    let params = serde_json::json!({
+    serde_json::json!({
         "buildTargetPHID": target_phid,
         "unit": modern,
         "type": harbormaster_type(overall),
-    });
-    client
-        .call("harbormaster.sendmessage", &params)
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    })
 }
 
 /// Render a full workflow report to stdout text (pure helper for tests).

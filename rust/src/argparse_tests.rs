@@ -67,6 +67,7 @@ fn rbd1_bool_with_value_rejected() {
 
 #[test]
 fn rbd1_unknown_flags_use_toolset_text() {
+    // T1153 RB-D1: PHP's verbatim parse-error texts.
     let specs = &[FlagSpec::boolean("json")];
     let error = parse_toolset(&args(&["--bogus"]), specs, false, false).unwrap_err();
     assert_eq!(

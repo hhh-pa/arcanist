@@ -295,6 +295,8 @@ fn repository_search_uses_constraints_shape() {
 
 #[test]
 fn repository_matching_uses_normalized_uris() {
+    // T1153 RB-D11: normalized comparison, last match wins on
+    // collisions (like PHP's `$uri_map` overwrite).
     let repos = vec![RepositoryRef {
         name: "repo".to_string(),
         uris: vec!["ssh://git@h.test/repo.git".to_string()],
@@ -306,6 +308,22 @@ fn repository_matching_uses_normalized_uris() {
     );
     assert_eq!(match_repository(&repos, "git@h.test:other"), None);
     assert_eq!(match_repository(&[], "git@h.test:repo"), None);
+    let colliding = vec![
+        RepositoryRef {
+            name: "first".to_string(),
+            uris: vec!["ssh://git@h.test/repo.git".to_string()],
+            permanent_rules: None,
+        },
+        RepositoryRef {
+            name: "second".to_string(),
+            uris: vec!["ssh://git@h.test/repo.git".to_string()],
+            permanent_rules: None,
+        },
+    ];
+    assert_eq!(
+        match_repository(&colliding, "git@h.test:repo").map(|r| r.name.as_str()),
+        Some("second")
+    );
 }
 
 #[test]

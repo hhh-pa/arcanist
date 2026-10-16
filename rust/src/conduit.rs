@@ -660,6 +660,9 @@ fn rawurlencode(input: &str) -> String {
     out
 }
 
+/// `call-conduit` stdin params must be a JSON object (T1153 CORE-14,
+/// kept: PHP fatals with a `TypeError`; Rust reports a clean error in
+/// the same exit class).
 fn call_params_map(
     params: &serde_json::Value,
 ) -> Result<serde_json::Map<String, serde_json::Value>, Error> {
@@ -1096,7 +1099,7 @@ pub enum EnvelopeKind {
     /// Unlike [`Self::Usage`] this arm never rethrows under `--trace`:
     /// the toolset parser catches with or without trace mode, while only
     /// the classic subprocess rethrows (`scripts/arcanist.php:443-446`).
-    /// (T1153 CORE-16/RB-D1.)
+    /// (T1153 CORE-16/T1153 RB-D1.)
     ToolsetParseError,
     /// Anything uncaught in the toolset runtime: the raw message on
     /// stderr, exit 255. PHP prints a fatal trace with file paths and

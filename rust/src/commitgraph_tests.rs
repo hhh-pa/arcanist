@@ -14,6 +14,19 @@ fn partition_count(heads: &[&str], corpus: &str) -> usize {
 }
 
 #[test]
+fn rbd33_empty_log_output_ingests_zero_records() {
+    // T1153 RB-D33: empty `git log` output yields nothing, like PHP's
+    // line iterator — only malformed non-empty chunks fail.
+    let mut graph = CommitGraph::new();
+    let mut seen = OrderedMap::new();
+    ingest_log_output(&mut graph, &mut seen, "", None, git_log_record).unwrap();
+    assert!(seen.is_empty());
+    let mut graph = CommitGraph::new();
+    let mut seen = OrderedMap::new();
+    assert!(ingest_log_output(&mut graph, &mut seen, "garbage", None, git_log_record).is_err());
+}
+
+#[test]
 fn rejects_duplicate_nodes() {
     let mut graph = CommitGraph::new();
     graph.new_node("a").unwrap();
@@ -278,6 +291,7 @@ fn encodes_sort_vector_integers() {
     assert_eq!(parts[1], "B09223372036854775806");
     assert_eq!(parts[2], "A09223372036854775808");
     assert_eq!(parts[3], "C00000000000000000007");
+    // T1153 RB-D38d (kept): NUL fails here (unreachable in practice).
     assert!(SortVector::new().add_string("a\0b").is_err());
 }
 

@@ -17,7 +17,7 @@
 //! Divergences from PHP, all deliberate:
 //!
 //! - Zero/one-commit repos keep `HEAD` (or nothing) instead of PHP's
-//!   empty-tree base, which PHP then fatals on (COVER-C10 keep).
+//!   empty-tree base, which PHP then fatals on (T1153 COVER-C10 keep).
 //! - Blame failures are skipped silently (unattributed) instead of fatal:
 //!   PHP crashes on explicitly passed added files because they cannot be
 //!   blamed at the base commit.
@@ -174,6 +174,23 @@ fn resolve_rev_base(dir: &Path, rev: &str) -> Result<String, String> {
 /// Reject non-git working copies: Mercurial and Subversion report
 /// not-yet-ported, anything else is the stock outside-a-working-copy
 /// usage error from `scripts/arcanist.php`.
+///
+/// Design notes for the svn/hg port (T1153 COVER-C13, Rule 3 —
+/// blocked on the T1128 git-only limit, refusals locked by test):
+/// PHP covers all three systems (`ArcanistCoverWorkflow.php:35-40`
+/// at ceb) through per-VCS `getBlame()`. Subversion shells `svn
+/// blame <path>` against the worktree (no base) and parses
+/// `/^\s*(\d+)\s+(\S+)/` into `(author, revision)` pairs, with an
+/// empty blame for empty files and a `Bad blame? ...` throw on
+/// unparseable lines (`ArcanistSubversionAPI.php:561-585`); `--rev`
+/// is rejected (`cover does not currently support --rev in svn`).
+/// Mercurial shells `hg annotate -u -v -c --rev <base> -- <path>`
+/// at the resolved base and parses
+/// `/^\s*([^:]+?) ([a-f0-9]{12}):/`, throwing `Unable to parse
+/// Mercurial blame line: ...` on mismatch
+/// (`ArcanistMercurialAPI.php:275-304`). Both pair lists feed the
+/// same attribute/render pipeline (no boundary flag exists outside
+/// git, so every blamed line attributes).
 fn check_working_copy(dir: &Path) -> Result<(), String> {
     if git::is_inside_work_tree(dir) {
         return Ok(());
@@ -704,10 +721,10 @@ fn resolve_cover_base(
     }
 }
 
-/// Default base without `--rev` (`buildBaseCommit(null)`, COVER-C1):
+/// Default base without `--rev` (`buildBaseCommit(null)`, T1153 COVER-C1):
 /// `base` rules, then the merge-base of the default relative commit
 /// (project setting, upstream, scratch file, prompt) and HEAD.
-/// Zero/one-commit repos keep HEAD (COVER-C10), never the empty tree.
+/// Zero/one-commit repos keep HEAD (T1153 COVER-C10), never the empty tree.
 fn default_base_commit(
     dir: &Path,
     top: &Path,
@@ -732,7 +749,7 @@ fn default_base_commit(
 }
 
 /// `base` configuration rules (`buildBaseCommit` + `resolveBaseCommit`,
-/// COVER-C1): when the winning `base` value is set, the rule engine
+/// T1153 COVER-C1): when the winning `base` value is set, the rule engine
 /// resolves it; no match is a usage error. `None` continues the chain.
 fn base_config_commit(
     dir: &Path,
@@ -760,7 +777,7 @@ fn base_config_commit(
     }
 }
 
-/// Per-source `base` specs in precedence order (COVER-C1): every present
+/// Per-source `base` specs in precedence order (T1153 COVER-C1): every present
 /// value is type-checked like `getConfigFromAllSources()`, and explicit
 /// nulls read unset like PHP `idx()`.
 fn base_rule_specs(
@@ -792,7 +809,7 @@ fn base_spec_value(value: Option<&serde_json::Value>) -> Result<Option<String>, 
 }
 
 /// First default relative commit: project `git.default-relative-commit`,
-/// `@{upstream}`, the scratch file, else the interactive prompt (COVER-C1).
+/// `@{upstream}`, the scratch file, else the interactive prompt (T1153 COVER-C1).
 /// The flag reports prompt answers (which persist the scratch file).
 fn default_relative_commit(
     dir: &Path,
@@ -812,7 +829,7 @@ fn default_relative_commit(
     prompt_default_relative(input, stdin_tty).map(|name| (name, true))
 }
 
-/// Project `.arcconfig` `git.default-relative-commit` (COVER-C1): raw
+/// Project `.arcconfig` `git.default-relative-commit` (T1153 COVER-C1): raw
 /// project source only (unvalidated scalars render like PHP string use).
 fn project_default_relative(merged: &get_config::MergedConfig) -> Option<String> {
     let value = get_config::value_at(
@@ -829,7 +846,7 @@ fn project_default_relative(merged: &get_config::MergedConfig) -> Option<String>
     if name.is_empty() { None } else { Some(name) }
 }
 
-/// Current branch's upstream short name, if one is configured (COVER-C1).
+/// Current branch's upstream short name, if one is configured (T1153 COVER-C1).
 fn git_upstream(dir: &Path) -> Option<String> {
     let upstream = git::stdout_text(
         dir,
@@ -852,7 +869,7 @@ fn git_metadata_dir(dir: &Path) -> Option<PathBuf> {
     Some(dir.join(git_dir.trim()))
 }
 
-/// Read the `default-relative-commit` scratch file (COVER-C1): missing or
+/// Read the `default-relative-commit` scratch file (T1153 COVER-C1): missing or
 /// unreadable files read empty like `readScratchFile()`.
 fn read_scratch_default(dir: &Path) -> Option<String> {
     let path = git_metadata_dir(dir)?.join("arc/default-relative-commit");
@@ -861,7 +878,7 @@ fn read_scratch_default(dir: &Path) -> Option<String> {
     if name.is_empty() { None } else { Some(name) }
 }
 
-/// Best-effort scratch write (COVER-C1): PHP ignores
+/// Best-effort scratch write (T1153 COVER-C1): PHP ignores
 /// `writeScratchFile` failures, and the legacy `.arc` migration is not
 /// reproduced.
 fn write_scratch_default(dir: &Path, relative: &str) {
@@ -888,7 +905,7 @@ const DEFAULT_RANGE_ESSAY: &str = "You're running a command which operates on a 
      used to determine the start of the commit range.)";
 
 /// Banner plus wrapped essay printed before the default-commit prompt
-/// (COVER-C1; pure form for tests).
+/// (T1153 COVER-C1; pure form for tests).
 fn default_range_banner(ansi: bool) -> String {
     let mut out = terminal::console_format(
         "<bg:green>** %s **</bg>\n\n",
@@ -904,7 +921,7 @@ fn trim_answer(text: &str) -> &str {
     text.trim_matches([' ', '\t', '\n', '\r', '\0', '\u{b}'])
 }
 
-/// The interactive default-commit prompt (COVER-C1): an empty answer
+/// The interactive default-commit prompt (T1153 COVER-C1): an empty answer
 /// keeps `origin/master`.
 fn prompt_default_relative(input: &mut dyn BufRead, stdin_tty: bool) -> Result<String, String> {
     print!("{}", default_range_banner(terminal::ansi_enabled()));
@@ -919,7 +936,7 @@ fn prompt_default_relative(input: &mut dyn BufRead, stdin_tty: bool) -> Result<S
     Ok(trim_answer(&answer).to_string())
 }
 
-/// `cat-file -t` must report `commit` (COVER-C1): unknown names fail the
+/// `cat-file -t` must report `commit` (T1153 COVER-C1): unknown names fail the
 /// git call itself (plain message; `CommandException` bytes are
 /// unportable), while non-commits get the PHP text.
 fn verify_relative_commit(dir: &Path, relative: &str) -> Result<(), String> {
@@ -933,7 +950,7 @@ fn verify_relative_commit(dir: &Path, relative: &str) -> Result<(), String> {
     }
 }
 
-/// Merge-base of a relative commit and HEAD, first base wins (COVER-C1).
+/// Merge-base of a relative commit and HEAD, first base wins (T1153 COVER-C1).
 fn merge_base_head(dir: &Path, relative: &str) -> Result<Option<String>, String> {
     let out = git::stdout_text(dir, &["merge-base", relative, "HEAD"])
         .map_err(|detail| format!("git merge-base failed: {detail}"))?;
@@ -948,7 +965,7 @@ fn first_output_line(out: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Outcome of one base-commit rule (COVER-C1): a resolved commit, no
+/// Outcome of one base-commit rule (T1153 COVER-C1): a resolved commit, no
 /// match (try the next rule), or a ruleset stop (try the next source).
 enum RuleOutcome {
     Matched(String),
@@ -956,7 +973,7 @@ enum RuleOutcome {
     StopRuleset,
 }
 
-/// `base` rule engine state (`ArcanistBaseCommitParser`, COVER-C1).
+/// `base` rule engine state (`ArcanistBaseCommitParser`, T1153 COVER-C1).
 struct BaseRuleEngine<'a> {
     dir: &'a Path,
     top: &'a Path,
@@ -986,7 +1003,7 @@ impl BaseRuleEngine<'_> {
 }
 
 /// Split one source's `base` spec on commas
-/// (`tokenizeBaseCommitSpecification`, COVER-C1): falsy rules (`""`,
+/// (`tokenizeBaseCommitSpecification`, T1153 COVER-C1): falsy rules (`""`,
 /// `"0"`) drop like PHP `array_filter`, colon-less rules error.
 fn tokenize_base_spec(spec: &str) -> Result<Vec<String>, String> {
     if spec.is_empty() || spec == "0" {
@@ -1010,7 +1027,7 @@ fn tokenize_base_spec(spec: &str) -> Result<Vec<String>, String> {
 }
 
 /// Resolve `base` rules from every source in precedence order
-/// (`ArcanistBaseCommitParser::resolveBaseCommit`, COVER-C1).
+/// (`ArcanistBaseCommitParser::resolveBaseCommit`, T1153 COVER-C1).
 fn resolve_base_rules(
     dir: &Path,
     top: &Path,
@@ -1082,7 +1099,7 @@ fn drain_source_queue(
     }
 }
 
-/// Resolve one rule (`resolveRule`, COVER-C1): `literal:` answers
+/// Resolve one rule (`resolveRule`, T1153 COVER-C1): `literal:` answers
 /// verbatim, `git:` runs the git API, `hg:` never matches git, `arc:`
 /// runs the arc rules, anything else errors.
 fn resolve_base_rule(
@@ -1123,7 +1140,7 @@ fn unrecognized_base_rule(rule: &str, source: &str) -> String {
     )
 }
 
-/// `arc:` rules (`resolveArcRule`, COVER-C1).
+/// `arc:` rules (`resolveArcRule`, T1153 COVER-C1).
 fn arc_rule(
     engine: &mut BaseRuleEngine,
     name: &str,
@@ -1196,7 +1213,7 @@ fn update_legacy_rule_name<'a>(engine: &BaseRuleEngine, name: &'a str) -> &'a st
 }
 
 /// `arc:exec(...)` / `arc:nodiff(...)` forms, else the unrecognized-rule
-/// error (COVER-C1): a failing command moves to the next rule.
+/// error (T1153 COVER-C1): a failing command moves to the next rule.
 fn arc_call_rule(
     engine: &BaseRuleEngine,
     name: &str,
@@ -1225,7 +1242,7 @@ fn nonempty_paren_form<'a>(name: &'a str, func: &str) -> Option<&'a str> {
     paren_form(name, func).filter(|inner| !inner.is_empty())
 }
 
-/// `arc:exec(command)` in the project root (COVER-C1).
+/// `arc:exec(command)` in the project root (T1153 COVER-C1).
 fn exec_rule_command(top: &Path, command: &str) -> Option<String> {
     let output = shell_command(top, command).output().ok()?;
     if !output.status.success() {
@@ -1255,7 +1272,7 @@ fn shell_command(top: &Path, command: &str) -> std::process::Command {
     }
 }
 
-/// The git API's rules (`resolveBaseCommitRule`, COVER-C1): `git:`
+/// The git API's rules (`resolveBaseCommitRule`, T1153 COVER-C1): `git:`
 /// `merge-base()` / `branch-unique()` / plain names, and the `arc:` API
 /// names (`empty`, `amended`, `upstream`, `this`; the rest never match).
 fn git_api_rule(engine: &BaseRuleEngine, kind: &str, name: &str) -> Result<Option<String>, String> {
@@ -1319,7 +1336,7 @@ fn upstream_rule_base(dir: &Path) -> Result<Option<String>, String> {
 }
 
 /// `git:branch-unique(ref)`: the first commit after the merge-base that
-/// sits on more branches than HEAD does (COVER-C1).
+/// sits on more branches than HEAD does (T1153 COVER-C1).
 fn branch_unique_base(dir: &Path, upstream_ref: &str) -> Result<Option<String>, String> {
     let out = git::stdout_text(dir, &["merge-base", upstream_ref, "HEAD"]).ok();
     let Some(merge_base) = out.and_then(|text| first_output_line(&text)) else {
@@ -1346,7 +1363,7 @@ fn branch_unique_base(dir: &Path, upstream_ref: &str) -> Result<Option<String>, 
     Ok(None)
 }
 
-/// Local branch short names (`getAllBranches()` names, COVER-C1).
+/// Local branch short names (`getAllBranches()` names, T1153 COVER-C1).
 fn local_branch_names(dir: &Path) -> Result<Vec<String>, String> {
     let out = git::stdout_text(
         dir,
@@ -1386,7 +1403,7 @@ fn prune_added(dir: &Path, base: &str, files: Vec<FileChanges>) -> Vec<FileChang
 
 /// True when `path` (as given) resolves inside the repository: paths
 /// outside the root can never match diff output, so they contribute
-/// nothing like PHP's hunk-map lookup miss (COVER-C11).
+/// nothing like PHP's hunk-map lookup miss (T1153 COVER-C11).
 fn path_within_top(dir: &Path, top: &Path, path: &str) -> bool {
     let (Ok(full), Ok(root)) = (dir.join(path).canonicalize(), top.canonicalize()) else {
         return false;
@@ -1452,7 +1469,7 @@ pub fn execute_cover_text_ansi(
     )
 }
 
-/// [`execute_cover_text_ansi`] with injectable prompt input (COVER-C1).
+/// [`execute_cover_text_ansi`] with injectable prompt input (T1153 COVER-C1).
 pub fn execute_cover_text_ansi_with_input(
     dir: &Path,
     options: &Options,
@@ -1473,7 +1490,7 @@ pub fn execute_cover_text_ansi_with_input(
 }
 
 /// [`execute_cover_text_ansi`] with injectable prompt input and config
-/// sources (COVER-C1; tests pass `user_file: None` for isolation).
+/// sources (T1153 COVER-C1; tests pass `user_file: None` for isolation).
 pub fn execute_cover_text_ansi_with_input_and_config(
     dir: &Path,
     options: &Options,
@@ -1523,7 +1540,7 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
     )
 }
 
-/// [`run_in`] with injectable prompt input (COVER-C1).
+/// [`run_in`] with injectable prompt input (T1153 COVER-C1).
 pub fn run_in_with_input_and_tty(
     dir: &Path,
     argv: &[String],

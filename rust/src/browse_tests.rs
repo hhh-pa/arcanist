@@ -741,7 +741,7 @@ fn browse_b2_default_token_decided_per_ref() {
 #[test]
 fn browse_b4_eof_during_pick_aborts() {
     // PHP loops forever on EOF; Rust aborts (kept: PHP never
-    // terminates, like the CORE-46/54 keep).
+    // terminates, like the T1153 CORE-46/T1153 CORE-54 keep).
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
         console_select_with_tty(&mut input, "Pick?", 1, 3, true).unwrap_err(),

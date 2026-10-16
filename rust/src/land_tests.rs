@@ -743,7 +743,7 @@ fn gate_preview_lists_findings() {
 
 #[test]
 fn client_for_dir_discovers_from_target() {
-    // CORE-12/33: discovery reads the merged config from the target working
+    // T1153 CORE-12/T1153 CORE-33: discovery reads the merged config from the target working
     // copy. Shadow options keep the ambient `~/.arcrc` out; the project
     // file only counts at a working-copy root.
     let dir = temp_dir("client-dir");
@@ -2811,7 +2811,7 @@ fn execute_preview_without_conduit_fails() {
     let (repo, _bare) = repo_with_origin("preview");
     git(&repo, &["checkout", "-b", "feature"]);
     commit_file(&repo, "f.txt", "f\n", "feature work");
-    // CORE-12: discovery now honors ambient user config, so pin a project
+    // T1153 CORE-12: discovery now honors ambient user config, so pin a project
     // URI no host entry can match to force the failure hermetically.
     std::fs::write(
         repo.join(".arcconfig"),
@@ -3534,7 +3534,7 @@ fn r6_land13_strategy_and_remote_merge() {
     let mut io = Io::canned(&[]);
     let validated = validate_options(&user_opts, &dir, &mut io).unwrap();
     assert_eq!(validated.strategy, Strategy::Squash);
-    // A stray subdir `.arcconfig` never counts (CORE-33).
+    // A stray subdir `.arcconfig` never counts (T1153 CORE-33).
     let sub = dir.join("sub");
     std::fs::create_dir_all(&sub).unwrap();
     std::fs::write(sub.join(".arcconfig"), r#"{"arc.land.strategy": "merge"}"#).unwrap();

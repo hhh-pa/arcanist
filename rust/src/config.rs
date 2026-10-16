@@ -37,7 +37,7 @@ pub fn host_field_for_str(text: &str, conduit_uri: &str, field: &str) -> Option<
 
 /// Credentials for one conduit URI: the new-style `token` plus the
 /// legacy `user` + `cert` pair, mirroring the `scripts/arcanist.php`
-/// startup reads (T1153 CORE-4/CORE-9).
+/// startup reads (T1153 CORE-4/T1153 CORE-9).
 #[derive(Debug, Clone, Default)]
 pub struct Credentials {
     /// `hosts[uri].token` (or the `--conduit-token` override).
@@ -125,7 +125,7 @@ pub fn credentials_for(
 }
 
 /// [`get_config::LoadOptions`] from the global `--config`,
-/// `--config-file`, and `--arcrc-file` flags (T1153 CORE-10/11
+/// `--config-file`, and `--arcrc-file` flags (T1153 CORE-10/T1153 CORE-11
 /// family), delivered by the dispatcher as JSON in
 /// `ARC_GLOBAL_LOAD_OPTIONS`. Unparseable or absent input reads
 /// default (no overrides); only the dispatcher writes this channel.
@@ -214,7 +214,7 @@ pub fn client_for(conduit_uri: Option<&str>) -> Result<crate::conduit::Client, S
 /// [`client_for`] with an explicit working copy, user file, and
 /// [`get_config::LoadOptions`]. Tokens come from the resolved user file
 /// (overridden by `--conduit-token`/`ARC_CONDUIT_TOKEN`, T1153
-/// CORE-10), so `--arcrc-file` redirects credential lookup like stock
+/// T1153 CORE-10), so `--arcrc-file` redirects credential lookup like stock
 /// PHP. Missing credentials stay an error here; commands PHP runs
 /// tokenless use [`client_for_tokenless_with`].
 pub fn client_for_with(
@@ -346,7 +346,7 @@ pub fn uri_domain(uri: &str) -> String {
 }
 
 /// Classic `$need_auth` gate text (`scripts/arcanist.php`, T1153
-/// CORE-4), thrown as `ArcanistUsageException` when no credential
+/// T1153 CORE-4), thrown as `ArcanistUsageException` when no credential
 /// exists at all. `forced_uri` is `Some` when `--conduit-uri` selected
 /// the URI, in which case the hint reproduces the flag so the
 /// install command targets the same server.
@@ -379,7 +379,7 @@ pub fn command_description() -> String {
     std::env::args().collect::<Vec<_>>().join(" ")
 }
 
-/// Classic `requiresAuthentication` startup (T1153 CORE-4/CORE-9):
+/// Classic `requiresAuthentication` startup (T1153 CORE-4/T1153 CORE-9):
 /// tokenless engine, credential gate, then `authenticateConduit()`.
 /// Returns the authenticated client, or a classified error ready to
 /// report. A missing URI is a usage error (PHP's no-URI

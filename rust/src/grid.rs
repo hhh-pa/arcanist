@@ -250,7 +250,8 @@ fn is_stop_char(glyph: &[char]) -> bool {
 
 /// Truncate `text` to at most `maximum` glyphs.
 ///
-/// Mirrors `PhutilUTF8StringTruncator` with only `setMaximumGlyphs()`:
+/// Mirrors `PhutilUTF8StringTruncator` with only `setMaximumGlyphs()`
+/// (`src/utils/PhutilUTF8StringTruncator.php` at ceb, T1153 RB-D35):
 /// strings within the limit return unmodified, longer strings are cut with
 /// room for the `…` terminator, preferring word and sentence boundaries.
 #[must_use]
@@ -553,6 +554,8 @@ impl GridView {
         if self.columns.is_empty() {
             panic!("Can not draw a grid with no columns!");
         }
+        // T1153 RB-D36: PHP string-casts the empty row list, printing
+        // `Array`.
         if self.rows.is_empty() {
             return "\n".to_string();
         }

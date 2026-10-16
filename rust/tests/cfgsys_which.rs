@@ -251,7 +251,7 @@ fn base_exec_rule_runs_command() {
 
 #[test]
 fn r6_core12_bare_discovery_under_temp_home() {
-    // CORE-12: discovery reads `phabricator.uri`, else `default`, from any
+    // T1153 CORE-12: discovery reads `phabricator.uri`, else `default`, from any
     // source. Under an empty temp HOME a bare dir resolves to nothing; a
     // `default` in the temp user file resolves like stock PHP.
     let home = TempDir::new("home");

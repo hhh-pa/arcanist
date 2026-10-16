@@ -49,6 +49,8 @@ fn messages_are_repeatable() {
 
 #[test]
 fn parses_flags() {
+    // T1153 CORE-64: git support plus `-m`/`--all`/`--allow-empty`
+    // are pure extensions (PHP commits svn only).
     let options = parse_options(&args(&["--all", "--allow-empty", "--show"]))
         .unwrap()
         .unwrap();

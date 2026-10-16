@@ -78,6 +78,7 @@ fn reads_ids_like_php_int_cast() {
 
 #[test]
 fn parses_revision_ids_from_messages() {
+    // T1153 RB-D37: `D123` or URI-path parsing like PHP.
     assert_eq!(
         revision_id_from_message("subject\n\nDifferential Revision: D123\n"),
         Ok(Some(123))
@@ -224,6 +225,26 @@ fn uri_pair_same(left: &str, right: &str) {
 }
 
 #[test]
+fn rbd38c_scp_garbage_matches_phutil_uri() {
+    // T1153 RB-D38c: PCRE greediness (the digit rule sees the LAST
+    // colon's tail), first-`@` user split, T12961 scp host checks.
+    assert!(!is_scp_uri("a.b:1:2"));
+    assert!(!is_scp_uri("u@h:12:34"));
+    assert!(is_scp_uri("u@h:p1:p2"));
+    assert_eq!(normalize_git_uri("u@h:p1:p2"), "h/p1:p2");
+    // Double-`@` yields host `b@c`, rejected like PHP.
+    assert_eq!(normalize_git_domain("a@b@c:d", &HashMap::new()), "<void>");
+    // Garbage scp hosts fail like `parse_url` hosts (T12961).
+    assert_eq!(
+        normalize_git_domain("user@-evil:path", &HashMap::new()),
+        "<void>"
+    );
+    assert_eq!(normalize_git_path("\0ssh://h/p"), "");
+    // Ambiguous URIs degrade to no-match (PHP throws; kept).
+    assert_eq!(normalize_git_path("ssh://h?x:1/y"), "");
+}
+
+#[test]
 fn evaluates_permanent_ref_rules() {
     let missing = RepositoryRef::from_search_hit(&serde_json::json!({"fields": {}}));
     assert!(!missing.is_permanent_ref("master"));
@@ -261,6 +282,8 @@ fn reads_repository_uris() {
 
 #[test]
 fn matches_permanent_rule_patterns() {
+    // T1153 RB-D31 (kept): the common subset matches; PCRE-only
+    // constructs never match.
     assert!(regexp_match("master", "master"));
     assert!(regexp_match("master", "xmasterx"));
     assert!(!regexp_match("^master$", "xmaster"));

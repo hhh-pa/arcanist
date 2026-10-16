@@ -463,7 +463,7 @@ fn null_browser_config() -> &'static str {
 fn upload_browse_opens_uploaded_files() {
     let fx = Fixture::named("up-browse");
     fx.write("a.txt", b"aaa");
-    // CORE-33: the project file only counts at a working-copy root.
+    // T1153 CORE-33: the project file only counts at a working-copy root.
     std::fs::create_dir_all(fx.path().join(".git")).unwrap();
     fx.write(".arcconfig", null_browser_config().as_bytes());
     let search = serde_json::json!({
@@ -621,7 +621,8 @@ fn filled_input(text: &str) -> std::io::BufReader<std::io::Cursor<Vec<u8>>> {
 #[test]
 fn liberate_scan_finds_nothing_without_libraries() {
     let fx = Fixture::named("lib-none");
-    let err = liberate::execute_with_input(fx.path(), &argv(&[]), &mut empty_input()).unwrap_err();
+    let err =
+        liberate::execute_with_input(fx.path(), &argv(&[]), &mut empty_input(), true).unwrap_err();
     assert!(err.contains("Unable to find any libraries"), "{err}");
 }
 
@@ -634,7 +635,7 @@ fn liberate_rejects_ancient_and_unknown_versions() {
         "<?php\n",
     )
     .unwrap();
-    let err = liberate::execute_with_input(fx.path(), &argv(&["oldlib"]), &mut empty_input())
+    let err = liberate::execute_with_input(fx.path(), &argv(&["oldlib"]), &mut empty_input(), true)
         .unwrap_err();
     assert!(err.contains("no longer supported"), "{err}");
 
@@ -643,23 +644,27 @@ fn liberate_rejects_ancient_and_unknown_versions() {
         "<?php // @phutil-library-version 9\n",
     )
     .unwrap();
-    let err = liberate::execute_with_input(fx.path(), &argv(&["oldlib"]), &mut empty_input())
+    let err = liberate::execute_with_input(fx.path(), &argv(&["oldlib"]), &mut empty_input(), true)
         .unwrap_err();
     assert!(err.contains("Unknown library version '9'"), "{err}");
 }
 
 #[test]
 fn liberate_create_ignores_rebuild_status() {
-    // CORE-50: PHP at ceb ignores the rebuild status entirely
+    // T1153 CORE-50: PHP at ceb ignores the rebuild status entirely
     // (`ArcanistLiberateWorkflow.php:82-93` discards `liberatePath`'s
     // return): the run succeeds with no rebuild text, even with no
     // rebuild script above the library (DONE goes to the console,
     // like PHP's echo, not the return value).
     let fx = Fixture::named("lib-create");
     std::fs::create_dir_all(fx.dir.join("newlib")).unwrap();
-    let out =
-        liberate::execute_with_input(fx.path(), &argv(&["newlib"]), &mut filled_input("my-lib\n"))
-            .unwrap();
+    let out = liberate::execute_with_input(
+        fx.path(),
+        &argv(&["newlib"]),
+        &mut filled_input("my-lib\n"),
+        true,
+    )
+    .unwrap();
     assert!(!out.contains("rebuild-map.php"), "{out}");
     let init =
         std::fs::read_to_string(fx.dir.join("newlib").join("__phutil_library_init__.php")).unwrap();
@@ -672,8 +677,9 @@ fn liberate_missing_directory_decline_and_accept() {
     // Declining the mkdir prompt aborts like PHP's `ArcanistPrompt`
     // (`ArcanistUserAbortException`); the "does not exist" text stays in
     // the banner, not the error.
-    let err = liberate::execute_with_input(fx.path(), &argv(&["ghost"]), &mut filled_input("n\n"))
-        .unwrap_err();
+    let err =
+        liberate::execute_with_input(fx.path(), &argv(&["ghost"]), &mut filled_input("n\n"), true)
+            .unwrap_err();
     assert!(err.contains("User aborted the workflow."), "{err}");
     assert!(!fx.dir.join("ghost").exists());
 
@@ -683,6 +689,7 @@ fn liberate_missing_directory_decline_and_accept() {
         fx.path(),
         &argv(&["fresh"]),
         &mut filled_input("y\nfresh-lib\n"),
+        true,
     )
     .unwrap();
     assert!(!out.contains("rebuild-map.php"), "{out}");
@@ -696,7 +703,7 @@ fn liberate_missing_directory_decline_and_accept() {
 
 #[test]
 fn liberate_v2_ignores_rebuild_status() {
-    // CORE-50: the rebuild status is ignored entirely (see
+    // T1153 CORE-50: the rebuild status is ignored entirely (see
     // `liberate_create_ignores_rebuild_status`); the run exits 0.
     let fx = Fixture::named("lib-v2");
     std::fs::create_dir_all(fx.dir.join("v2lib")).unwrap();
@@ -710,8 +717,8 @@ fn liberate_v2_ignores_rebuild_status() {
         "<?php // @phutil-library-version 2\n",
     )
     .unwrap();
-    let out =
-        liberate::execute_with_input(fx.path(), &argv(&["v2lib"]), &mut empty_input()).unwrap();
+    let out = liberate::execute_with_input(fx.path(), &argv(&["v2lib"]), &mut empty_input(), true)
+        .unwrap();
     assert!(!out.contains("rebuild-map.php"), "{out}");
     assert_eq!(
         liberate::run_in(fx.path(), &argv(&["v2lib"])),
@@ -730,7 +737,8 @@ fn liberate_scan_updates_found_library() {
     .unwrap();
     // v1 (no map): a fatal usage error aborting the workflow, like
     // `arc liberate` (the library was named on the WORK line instead).
-    let err = liberate::execute_with_input(fx.path(), &argv(&[]), &mut empty_input()).unwrap_err();
+    let err =
+        liberate::execute_with_input(fx.path(), &argv(&[]), &mut empty_input(), true).unwrap_err();
     assert!(err.contains("no longer supported"), "{err}");
 }
 

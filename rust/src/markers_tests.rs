@@ -278,9 +278,10 @@ fn rejects_unknown_hg_ls_marker_types() {
 
 #[test]
 fn land27_nameless_hg_markers_proceed() {
-    // PHP reads `name`/`node` unchecked, so markers without them
-    // proceed with empty strings; without `description` (RB-D39) no
-    // message attaches and the summary stays empty.
+    // T1153 LAND-27 / T1153 RB-D34: PHP reads `name`/`node` unchecked,
+    // so markers without them proceed with empty strings; without
+    // `description` (T1153 RB-D39) no message attaches and the summary
+    // stays empty.
     let markers = parse_hg_ls_markers(r#"[{"type": "branch"}]"#).unwrap();
     assert_eq!(markers.len(), 1);
     assert_eq!(markers[0].name, "");

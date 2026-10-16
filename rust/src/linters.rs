@@ -1857,7 +1857,7 @@ pub fn run_in(cwd: &Path, argv: &[String]) -> ExitCode {
             print!("{}", usage());
             return ExitCode::SUCCESS;
         }
-        // T1153 R4 (LINTERS-L24): `linters` is a subprocess
+        // T1153 LINTERS-L24 (R4): `linters` is a subprocess
         // workflow: usage errors render `Usage Exception:` with no
         // usage dump (`scripts/arcanist.php:432-444`).
         ParseOutcome::Error(message) => return conduit::report(EnvelopeKind::Usage, &message),
@@ -1958,7 +1958,7 @@ mod linters_ansi_tests {
         let mut text = ansi_entry("ArcanistTextLinter", LinterStatus::Configured);
         text.version = Some("9.9".to_string());
         let tty = render_entries_with_ansi(&[&text], true, true);
-        // LINTERS-L5/L6: config + info header, no leading blank.
+        // T1153 LINTERS-L5/L6: config + info header, no leading blank.
         assert!(tty.starts_with(
             "\x1b[42m\x1b[1m CONFIGURED \x1b[m\x1b[49m \x1b[1mtext\x1b[m (Basic Text \
              Linter)\n\n    Version \x1b[1m9.9\x1b[m\n"

@@ -94,6 +94,8 @@ fn windows_probes_exe_extension() {
 
 #[test]
 fn finds_script_by_walking_up() {
+    // T1153 CORE-58 (kept): no install tree exists in a compiled
+    // binary, so the script resolves by walking up.
     let tmp = TempDir::new("script");
     let nested = tmp.path().join("a").join("b");
     std::fs::create_dir_all(&nested).unwrap();
@@ -111,6 +113,8 @@ fn finds_script_by_walking_up() {
 
 #[test]
 fn passthru_maps_status_and_reports_spawn_failures() {
+    // T1153 CORE-57: the child status comes back verbatim, like
+    // `PhutilExecPassthru::execute()`.
     let tmp = TempDir::new("passthru");
     let git = std::env::var_os("PATH")
         .and_then(|path| find_on_path(&path, "git"))
@@ -123,6 +127,12 @@ fn passthru_maps_status_and_reports_spawn_failures() {
         passthru(&git, &["no-such-subcommand"], tmp.path()).unwrap(),
         std::process::ExitCode::FAILURE
     );
+    // A distinctive non-1 code survives verbatim.
+    #[cfg(windows)]
+    let third = passthru(Path::new("cmd"), &["/C", "exit 3"], tmp.path()).unwrap();
+    #[cfg(not(windows))]
+    let third = passthru(Path::new("sh"), &["-c", "exit 3"], tmp.path()).unwrap();
+    assert_eq!(third, std::process::ExitCode::from(3));
     assert!(passthru(&tmp.path().join("no-such-program"), &[], tmp.path()).is_err());
 }
 
@@ -173,6 +183,7 @@ fn b23_help_matches_generated_format() {
 
 #[test]
 fn interpreter_candidates_cover_platform() {
+    // T1153 CORE-59: the Windows `python` fallback stays additive.
     let found = interpreter_candidates();
     assert!(found.contains(&"python3"));
     assert_eq!(found.contains(&"python"), cfg!(windows));
