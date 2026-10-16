@@ -210,6 +210,18 @@ fn detect_vcs(dir: &Path) -> Option<&'static str> {
     }
 }
 
+/// Reject working copies whose VCS cannot list branches.
+///
+/// Shared by [`execute`] (ahead of conduit setup, per PHP's
+/// `getRepositoryAPI` order) and `execute_core` (the test seam).
+fn check_branches_support(dir: &Path) -> Result<&'static str, String> {
+    let vcs = detect_vcs(dir).unwrap_or("filesystem");
+    if !markers::supports_marker_type(vcs, markers::MARKER_TYPE_BRANCH) {
+        return Err(markers::support_error(vcs, markers::MARKER_TYPE_BRANCH));
+    }
+    Ok(vcs)
+}
+
 /// Run the workflow rooted at `dir`, returning stdout text or an error message.
 pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
     let options = match parse_options(argv) {
@@ -222,6 +234,10 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
         // The `--json` extension never calls conduit; it stays offline.
         return execute_core(dir, &options, grid::terminal_width(), None);
     }
+    // T1153 LAND-28: the working-copy/support gate runs before
+    // conduit setup — PHP's getRepositoryAPI (and its usage error)
+    // precedes the marker query.
+    check_branches_support(dir)?;
     // T1153 LAND-23: the engine needs conduit (tokenless when only
     // credentials are missing — calls then fail mapped); without a
     // URI the setup block replaces the grid.
@@ -265,10 +281,7 @@ fn execute_core(
     // `filesystem` API, whose empty marker-type list fails the
     // support check (usage error, like the `svn` gate this matches).
     // The gate runs ahead of both renderers.
-    let vcs = detect_vcs(dir).unwrap_or("filesystem");
-    if !markers::supports_marker_type(vcs, markers::MARKER_TYPE_BRANCH) {
-        return Err(markers::support_error(vcs, markers::MARKER_TYPE_BRANCH));
-    }
+    let vcs = check_branches_support(dir)?;
     if options.json {
         return match detect_vcs(dir) {
             Some("hg") => {

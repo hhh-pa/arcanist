@@ -346,8 +346,10 @@ fn markers_lists_git_branches_as_grid() {
     let value: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(value.as_array().unwrap().len(), 2);
     assert_eq!(value[0]["active"], serde_json::json!(true));
-
-    assert_eq!(markers::run_in(tmp.path(), &[]), ExitCode::SUCCESS);
+    // No `run_in` without a client here: the exit code would depend
+    // on ambient ~/.arcrc (T1153 LAND-23 fails conduit-less grids;
+    // see land23_grid_fails_without_conduit). The bookmarks test
+    // below covers run_in's failure arm.
 }
 
 #[test]

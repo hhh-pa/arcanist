@@ -2474,6 +2474,28 @@ pub fn is_toolset_usage_message(message: &str) -> bool {
 }
 
 /// Run the workflow rooted at `dir`, returning stdout text or an error message.
+/// Reject working copies that cannot list `marker_type`, returning the VCS.
+///
+/// Shared by the non-JSON tails of [`execute`] (ahead of conduit
+/// setup, per PHP's `getRepositoryAPI` order) and `execute_core`.
+fn check_vcs_support(dir: &Path, marker_type: &str) -> Result<&'static str, String> {
+    let vcs = detect_vcs(dir).ok_or_else(|| {
+        "not inside a working copy (no git repository or Mercurial '.hg' directory found)"
+            .to_string()
+    })?;
+    if !supports_marker_type(vcs, marker_type) {
+        return Err(support_error(vcs, marker_type));
+    }
+    Ok(vcs)
+}
+
+/// Resolve the marker type and run the working-copy/support gate.
+fn check_markers_support(dir: &Path, requested: Option<&str>) -> Result<String, String> {
+    let marker_type = resolve_type(dir, requested)?;
+    check_vcs_support(dir, &marker_type)?;
+    Ok(marker_type)
+}
+
 pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
@@ -2491,6 +2513,10 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
             terminal::ansi_enabled(),
         );
     }
+    // T1153 LAND-28: the working-copy/support gate runs before
+    // conduit setup — PHP's getRepositoryAPI (and its usage error)
+    // precedes the marker query.
+    check_markers_support(dir, options.marker_type.as_deref())?;
     // T1153 LAND-23: the engine needs conduit (tokenless when only
     // credentials are missing — calls then fail mapped); without a
     // URI the setup block replaces the grid.
@@ -2545,13 +2571,7 @@ fn execute_core(
         text.push('\n');
         return Ok(text);
     }
-    let vcs = detect_vcs(dir).ok_or_else(|| {
-        "not inside a working copy (no git repository or Mercurial '.hg' directory found)"
-            .to_string()
-    })?;
-    if !supports_marker_type(vcs, &marker_type) {
-        return Err(support_error(vcs, &marker_type));
-    }
+    let vcs = check_vcs_support(dir, &marker_type)?;
     run_workflow_ansi(dir, vcs, &marker_type, false, client, terminal, ansi)
 }
 
