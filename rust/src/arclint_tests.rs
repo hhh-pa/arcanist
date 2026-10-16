@@ -71,8 +71,11 @@ fn resolves_all_configuration_names_verbatim() {
             "for {config_name}"
         );
         assert_eq!(resolve_type(config_name), Some(display));
-        // Exact display names are accepted as aliases.
-        assert_eq!(resolve_type(display), Some(display));
+        // T1153 LINT-38: display names never resolve, like PHP (except
+        // `flake8`/`cppcheck`, whose display equals the config name).
+        if display != config_name {
+            assert_eq!(resolve_type(display), None, "for {display}");
+        }
     }
     assert_eq!(configuration_name_to_display("TXT"), None);
     assert_eq!(configuration_name_to_display("nope"), None);
@@ -122,9 +125,11 @@ fn rejects_unknown_types_with_available_list() {
 fn validates_severity_values() {
     let err = parse_arclint(r#"{"linters": {"a": {"type": "text", "severity": {"1": "bogus"}}}}"#)
         .unwrap_err();
+    // T1153 LINT-40: setter failures use the `in key` context, one chain
+    // message per line.
     assert_eq!(
         err,
-        "Error in parsing '.arclint' file, for linter 'a': Unknown lint severity \"bogus\". Valid severities are: error, warning, autofix, advice, disabled."
+        "Error in parsing '.arclint' file, in key 'severity' for linter 'a'.\nUnknown lint severity \"bogus\". Valid severities are: error, warning, autofix, advice, disabled."
     );
     let err = parse_arclint(
         r#"{"linters": {"a": {"type": "text", "severity.rules": {"/x/": "bogus"}}}}"#,
@@ -137,9 +142,10 @@ fn validates_severity_values() {
         r#"{"linters": {"a": {"type": "text", "severity.rules": {"(": "warning"}}}}"#,
     )
     .unwrap_err();
+    // T1153 LINT-40: `in key 'severity.rules'` context, one message per line.
     assert_eq!(
         err,
-        "Error in parsing '.arclint' file, for linter 'a': Severity rule \"(\" is not a valid regular expression."
+        "Error in parsing '.arclint' file, in key 'severity.rules' for linter 'a'.\nSeverity rule \"(\" is not a valid regular expression."
     );
 
     for level in SEVERITIES {
@@ -314,4 +320,15 @@ fn retain_selected_matches_display_names_exactly() {
     retain_selected(&mut linters, |linter| linter.name, &config);
     let names: Vec<&str> = linters.iter().map(|linter| linter.name).collect();
     assert_eq!(names, vec!["TXT", "JSON"]);
+}
+
+// -( T1153 Wave 2: lint retrocompat )--------------------------------------
+
+#[test]
+fn lint42_unknown_top_level_keys_are_config_errors() {
+    let err = parse_arclint(r#"{"linters": {}, "bogus": 1}"#).unwrap_err();
+    assert_eq!(
+        err,
+        "Error in parsing '.arclint' file.\nunknown option 'bogus'."
+    );
 }

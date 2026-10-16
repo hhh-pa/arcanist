@@ -162,3 +162,27 @@ fn lint_bytes_reads_the_executable_bit_on_unix() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// -( T1153 Wave 2: lint retrocompat )--------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn lint26_executable_bit_stats_the_engine_disk_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("arc-rs-chmod-{}-{}", std::process::id(), line!()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("run.sh");
+    std::fs::write(&script, b"echo hi\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // The display path resolves to nothing from the process working
+    // directory; only the engine's project-root disk path finds the
+    // executable bit (PHP `getFilePathOnDisk()`).
+    let linter = ChmodLinter::new();
+    linter.set_active_disk_path(&script);
+    let found = linter.lint_bytes("definitely-not-here-xyz/run.sh", b"echo hi\n");
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].code, "CHMOD1");
+
+    std::fs::remove_dir_all(&dir).ok();
+}

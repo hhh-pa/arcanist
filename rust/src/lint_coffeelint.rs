@@ -200,6 +200,11 @@ pub fn parse_raw_output(path: &str, stdout: &str) -> Result<Vec<LintMessage>, St
                 .and_then(|value| value.as_str())
                 .map(str::to_string),
             replacement: None,
+            granularity: None,
+            locations: Vec::new(),
+            bypass_changed_line_filtering: None,
+            original_bytes: None,
+            replacement_bytes: None,
         });
     }
     Ok(messages)
@@ -331,6 +336,11 @@ fn failure_message(path: &str, description: &str) -> LintMessage {
         description: description.to_string(),
         original: None,
         replacement: None,
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     }
 }
 

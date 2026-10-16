@@ -208,6 +208,11 @@ fn parse_at(path: &str, line: &str, colon: usize) -> Option<LintMessage> {
         description,
         original: None,
         replacement: None,
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     })
 }
 

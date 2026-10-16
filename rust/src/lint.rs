@@ -27,21 +27,22 @@
 //! - Include/exclude/`severity.rules` routing needs a regex engine the
 //!   dependency set lacks, so per-linter path routing is not applied and
 //!   `severity.rules` never match; exact `severity` maps are applied.
-//! - Per-linter tool options (`bin`, `flags`, `version`, `interpreter`,
-//!   per-tool config keys) parse but are not applied, except
-//!   `text.max-line-length`. External tools run with default binaries.
-//! - `severity.rules` patterns are not validated as regular expressions.
+//! - Per-linter tool options (`bin`, `flags`, `version`, per-tool
+//!   config keys) parse and apply (T1153 LINT-45); no in-tree linter
+//!   declares `interpreter` (`shouldUseInterpreter()` is never
+//!   overridden at ceb).
 //! - Console markup (colors, `##inverse##` highlights) renders on TTYs
 //!   via the shared terminal styling helpers (see the `*_with_ansi`
 //!   seams) and is stripped otherwise: output
 //!   matches piped (non-TTY) `arc` exactly, verified against the golden
 //!   files in `src/lint/renderer/__tests__/data/`.
-//! - `phutil_console_wrap()` is approximated as word-wrap at 80 columns;
-//!   only long descriptions are affected.
-//! - The `OKAY` line, `LINT NOTICE` line, confirm-prompt decorations, and
+//! - `phutil_console_wrap()` is ported exactly (T1153 LINT-24): content
+//!   wraps at `78 - indent` characters with ANSI escapes ignored.
+//! - The `OKAY` line and `LINT NOTICE` line render through the shared
+//!   formatter (T1153 LINT-5/LINT-6): ` OKAY  No lint messages.` and
+//!   ` LINT NOTICE  ...` on non-TTYs. Confirm-prompt decorations and
 //!   the XHP rules table are reconstructed (phutil is not vendored):
-//!   `   OKAY  No lint messages.`, `** LINT NOTICE ** ...`, `{prompt}
-//!   [Y/n] `, and a bordered ID/Class/Name table.
+//!   `{prompt} [Y/n] ` and a bordered ID/Class/Name table.
 //! - Descriptions containing `/` are emitted as `\/` in `--output json`
 //!   to match PHP `json_encode()` escaping.
 //! - `--engine ArcanistUnitTestableLintEngine` and unknown engine classes
@@ -103,18 +104,18 @@ pub const RENDERER_COMPILER: &str = "compiler";
 pub const RENDERER_XML: &str = "xml";
 pub const RENDERER_NONE: &str = "none";
 
-/// Supported renderer keys, sorted. PHP lists them in class-map order
-/// (`ArcanistLintRenderer::getAllRenderers()`), which is not reproducible
-/// here; the sorted order is deterministic.
+/// Supported renderer keys in PHP class-map order
+/// (`ArcanistLintRenderer::getAllRenderers()`, T1153 LINT-16):
+/// alphabetical by class name, so `xml` (Checkstyle) first.
 #[must_use]
 pub fn all_renderers() -> Vec<&'static str> {
     vec![
+        RENDERER_XML,
         RENDERER_COMPILER,
         RENDERER_CONSOLE,
         RENDERER_JSON,
         RENDERER_NONE,
         RENDERER_SUMMARY,
-        RENDERER_XML,
     ]
 }
 
@@ -312,6 +313,38 @@ pub struct LintMessage {
     pub description: String,
     pub original: Option<String>,
     pub replacement: Option<String>,
+    /// Cache granularity stamped by the engine
+    /// (`$message->setGranularity($linter->getCacheGranularity())`,
+    /// `ArcanistLintEngine.php:218`); `None` before stamping (PHP
+    /// `null`), rendered as JSON `null` (T1153 LINT-11).
+    pub granularity: Option<u8>,
+    /// Secondary locations (`getOtherLocations()`), rendered as the
+    /// console "Other locations" suffix and honored by relevance
+    /// filtering (T1153 LINT-13/LINT-14).
+    pub locations: Vec<OtherLocation>,
+    /// Bypass for changed-line filtering
+    /// (`shouldBypassChangedLineFiltering()`); `None` is PHP `null`
+    /// (T1153 LINT-14).
+    pub bypass_changed_line_filtering: Option<bool>,
+    /// Raw-byte patch spans (T1153 LINT-43): when present, the patcher
+    /// splices these instead of `original`/`replacement`, so non-UTF-8
+    /// files patch byte-exact like PHP's `str_replace()`. Only the
+    /// text linter's newline rule sets them; display rendering keeps
+    /// the lossy `String` fields.
+    pub original_bytes: Option<Vec<u8>>,
+    pub replacement_bytes: Option<Vec<u8>>,
+}
+
+/// One secondary message location (`getOtherLocation()` dicts:
+/// `path`/`line`/`char`, plus `original` for relevance checks).
+/// `line`/`char` are PHP's values with 0 meaning unset (message lines
+/// are 1-based; location chars are 0-based byte offsets).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OtherLocation {
+    pub path: Option<String>,
+    pub line: usize,
+    pub char: usize,
+    pub original: Option<String>,
 }
 
 impl LintMessage {
@@ -461,6 +494,24 @@ pub trait Linter {
     fn take_halt(&self) -> bool {
         false
     }
+    /// Take a pending linter failure (T1153 LINT-4/LINT-28/LINT-32):
+    /// `Some` once when the last `lint_bytes()` call failed the way
+    /// PHP's `lintPath()` throws (script failures, `throw` groups,
+    /// missing tools). The engine polls this after every section and
+    /// folds failures into the `Some linters failed:` aggregate instead
+    /// of aborting or staying silent. The text only surfaces through
+    /// direct callers; the workflow aggregate swallows it like PHP.
+    fn take_error(&self) -> Option<String> {
+        None
+    }
+    /// Receive the on-disk path of the file being linted (T1153
+    /// LINT-26): linters needing filesystem access beyond `data`
+    /// (chmod's stat) resolve it against this path, mirroring
+    /// `getFilePathOnDisk()` (project root, not the process working
+    /// directory). The engine calls this from `lint_file()` before
+    /// running the sections; direct `lint_bytes()` callers leave it
+    /// unset and linters fall back to the given path as-is.
+    fn set_active_disk_path(&self, _disk: &Path) {}
     /// Receive the section's validated custom severity map, for
     /// linters whose own phase gates consult `isMessageEnabled()`
     /// (the text linter's `didStopAllLinters()` gates). The default
@@ -485,7 +536,9 @@ pub struct OptionContext<'a> {
 /// (`src/lint/linter/ArcanistTextLinter.php:93-125`).
 #[derive(Debug)]
 pub struct TextLinter {
-    max_line_length: usize,
+    /// Signed like PHP's `$maxLineLength`: a negative width flags every
+    /// line (`strlen($line) > $width`), T1153 LINT-41.
+    max_line_length: i64,
     /// Custom severity overrides: DOS-newline and bad-charset stops
     /// only fire for enabled codes (`isMessageEnabled()`, exact map
     /// plus `severity.rules`).
@@ -496,7 +549,7 @@ impl TextLinter {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            max_line_length: DEFAULT_MAX_LINE_LENGTH,
+            max_line_length: DEFAULT_MAX_LINE_LENGTH as i64,
             severity: arclint::SeverityOverrides::default(),
         }
     }
@@ -505,7 +558,7 @@ impl TextLinter {
     #[must_use]
     pub fn with_max_line_length(max_line_length: usize) -> Self {
         Self {
-            max_line_length,
+            max_line_length: i64::try_from(max_line_length).unwrap_or(i64::MAX),
             severity: arclint::SeverityOverrides::default(),
         }
     }
@@ -514,7 +567,7 @@ impl TextLinter {
     #[must_use]
     pub fn with_severity_map(severity_map: HashMap<String, String>) -> Self {
         Self {
-            max_line_length: DEFAULT_MAX_LINE_LENGTH,
+            max_line_length: DEFAULT_MAX_LINE_LENGTH as i64,
             severity: arclint::SeverityOverrides {
                 map: severity_map,
                 rules: Vec::new(),
@@ -524,7 +577,7 @@ impl TextLinter {
 
     #[must_use]
     pub fn max_line_length(&self) -> usize {
-        self.max_line_length
+        usize::try_from(self.max_line_length.max(0)).unwrap_or(usize::MAX)
     }
 
     /// True when a stop code is not custom-disabled
@@ -585,6 +638,11 @@ fn text_message(spec: TextMessageSpec<'_>) -> LintMessage {
         description: spec.description,
         original: spec.original,
         replacement: spec.replacement,
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     }
 }
 
@@ -609,8 +667,7 @@ impl Linter for TextLinter {
     ) -> Result<(), String> {
         match key {
             "text.max-line-length" => {
-                let length = value.as_u64().unwrap_or(DEFAULT_MAX_LINE_LENGTH as u64);
-                self.max_line_length = usize::try_from(length).unwrap_or(usize::MAX);
+                self.max_line_length = value.as_i64().unwrap_or(DEFAULT_MAX_LINE_LENGTH as i64);
                 Ok(())
             }
             _ => Err(format!("unknown option '{key}'.")),
@@ -667,7 +724,9 @@ impl Linter for TextLinter {
 /// files (except dotfiles and `__init__.py`) raise `TXT10` and stop all
 /// linters. Returns true when it stopped.
 fn lint_empty_file(path: &str, data: &[u8], out: &mut Vec<LintMessage>) -> bool {
-    let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    // PHP `basename()` splits `/` only (T1153 LINT-44): `foo\.hidden`
+    // is not a dotfile there.
+    let base = path.rsplit('/').next().unwrap_or(path);
     if base == "__init__.py" || base.starts_with('.') {
         return false;
     }
@@ -693,14 +752,17 @@ fn lint_empty_file(path: &str, data: &[u8], out: &mut Vec<LintMessage>) -> bool 
 /// `lintNewlines()` (`ArcanistTextLinter.php:150-166`): any CR byte raises
 /// `TXT1` at offset 0 with a whole-file patch, and stops all linters
 /// (subject to the caller's severity map; the engine re-checks). Returns
-/// true when the message fired.
+/// true when the message fired. The patch spans are raw bytes
+/// (`str_replace("\r\n", "\n", $data)`, T1153 LINT-43); the display
+/// strings stay lossy.
 fn lint_dos_newlines(path: &str, data: &[u8], out: &mut Vec<LintMessage>) -> bool {
     if !data.contains(&b'\r') {
         return false;
     }
+    let replacement_bytes = strip_crlf(data);
     let original = String::from_utf8_lossy(data).into_owned();
-    let replacement = original.replace("\r\n", "\n");
-    out.push(text_message(TextMessageSpec {
+    let replacement = String::from_utf8_lossy(&replacement_bytes).into_owned();
+    let mut message = text_message(TextMessageSpec {
         path,
         line: 1,
         col: 1,
@@ -710,8 +772,26 @@ fn lint_dos_newlines(path: &str, data: &[u8], out: &mut Vec<LintMessage>) -> boo
         description: DESC_DOS_NEWLINE.to_string(),
         original: Some(original),
         replacement: Some(replacement),
-    }));
+    });
+    message.original_bytes = Some(data.to_vec());
+    message.replacement_bytes = Some(replacement_bytes);
+    out.push(message);
     true
+}
+
+/// Byte-level `str_replace("\r\n", "\n", $data)`: collapse CR-LF pairs,
+/// leaving lone CR bytes in place.
+fn strip_crlf(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut index = 0;
+    while index < data.len() {
+        if data[index] == b'\r' && data.get(index + 1) == Some(&b'\n') {
+            index += 1;
+        }
+        out.push(data[index]);
+        index += 1;
+    }
+    out
 }
 
 /// `lintTabs()` (`ArcanistTextLinter.php:168-177`): only the FIRST tab is
@@ -735,10 +815,13 @@ fn lint_tabs(path: &str, data: &[u8], out: &mut Vec<LintMessage>) {
 }
 
 /// `lintLineLength()` (`ArcanistTextLinter.php:179-197`): lines longer
-/// than `width` bytes raise `TXT3` warnings.
-fn lint_line_length(path: &str, data: &[u8], width: usize, out: &mut Vec<LintMessage>) {
+/// than `width` bytes raise `TXT3` warnings (signed: a negative width
+/// flags every line, T1153 LINT-41). Only the line length is
+/// comma-formatted (`PhutilNumber`); the width prints raw (T1153
+/// LINT-36).
+fn lint_line_length(path: &str, data: &[u8], width: i64, out: &mut Vec<LintMessage>) {
     for (index, line) in split_lines(data).iter().enumerate() {
-        if line.len() > width {
+        if line.len() as i64 > width {
             out.push(text_message(TextMessageSpec {
                 path,
                 line: index + 1,
@@ -747,9 +830,8 @@ fn lint_line_length(path: &str, data: &[u8], width: usize, out: &mut Vec<LintMes
                 severity: SEVERITY_WARNING,
                 name: NAME_LINE_WRAP,
                 description: format!(
-                    "This line is {} characters long, but the convention is {} characters.",
+                    "This line is {} characters long, but the convention is {width} characters.",
                     format_number(line.len()),
-                    format_number(width),
                 ),
                 original: Some(String::from_utf8_lossy(line).into_owned()),
                 replacement: None,
@@ -977,6 +1059,10 @@ pub struct Engine {
     sections: Vec<Section>,
     /// Route linters per path like [`ENGINE_COMPREHENSIVE`].
     comprehensive: bool,
+    /// Single-linter glue engine ([`ENGINE_SINGLE`]): directories never
+    /// reach linters, like `ArcanistSingleLintEngine::buildLinters()`
+    /// stripping them from the paths (T1153 LINT-22).
+    single: bool,
     /// Injected prior results by path and cache version
     /// (`setCachedResults()`).
     cached: CachedResults,
@@ -1036,11 +1122,16 @@ pub struct CachedMessage {
 impl CachedMessage {
     /// Rebuild a cached message from a `toDictionary()` map
     /// (`newFromDictionary()`); returns `None` when required keys
-    /// are missing or mistyped. `locations`/`bypassChangedLineFiltering`
-    /// have no port fields and are dropped.
+    /// are missing or mistyped. `granularity`, `locations`, and
+    /// `bypassChangedLineFiltering` restore onto the message (T1153
+    /// LINT-11/LINT-13/LINT-14) as well as the cache entry.
     #[must_use]
     pub fn from_dict(dict: &HashMap<String, serde_json::Value>) -> Option<Self> {
         let text = |key: &str| dict.get(key).and_then(|value| value.as_str());
+        let granularity = dict
+            .get("granularity")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|granularity| u8::try_from(granularity).ok());
         let message = LintMessage {
             path: text("path")?.to_string(),
             line: dict
@@ -1059,16 +1150,54 @@ impl CachedMessage {
             description: text("description")?.to_string(),
             original: text("original").map(str::to_string),
             replacement: text("replacement").map(str::to_string),
+            granularity,
+            locations: dict
+                .get("locations")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| items.iter().filter_map(location_from_dict).collect())
+                .unwrap_or_default(),
+            bypass_changed_line_filtering: dict.get("bypassChangedLineFiltering").and_then(
+                |value| {
+                    if value.is_null() {
+                        None
+                    } else {
+                        Some(value.as_bool().unwrap_or(false))
+                    }
+                },
+            ),
+            original_bytes: None,
+            replacement_bytes: None,
         };
-        let granularity = dict
-            .get("granularity")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|granularity| u8::try_from(granularity).ok());
         Some(Self {
             message,
             granularity,
         })
     }
+}
+
+/// Rebuild one `locations` entry (`path`/`line`/`char`/`original` keys;
+/// unknown keys only arise from custom linters and are dropped).
+fn location_from_dict(value: &serde_json::Value) -> Option<OtherLocation> {
+    let entry = value.as_object()?;
+    let number = |key: &str| {
+        entry
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(0)
+    };
+    Some(OtherLocation {
+        path: entry
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        line: number("line"),
+        char: number("char"),
+        original: entry
+            .get("original")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    })
 }
 
 /// Every ported linter, in registration order. `lint_external` stays out:
@@ -1216,9 +1345,9 @@ fn should_use_cache(
     }
 }
 
-/// Build the linter for a `.arclint` `type`: exact configuration names
-/// first, then display-name aliases (first configuration with that
-/// display), mirroring [`arclint::canonical_config_name`].
+/// Build the linter for a `.arclint` `type`: exact configuration
+/// names only (display names never resolve, T1153 LINT-38), mirroring
+/// [`arclint::canonical_config_name`].
 fn linter_for_type(linter_type: &str) -> Option<Box<dyn Linter>> {
     let canonical = arclint::canonical_config_name(linter_type)?;
     linter_for_text_to_flake8(canonical)
@@ -1511,12 +1640,14 @@ fn check_option_type(
     ))
 }
 
-/// True when `value` has the JSON shape of `expected`.
+/// True when `value` has the JSON shape of `expected`. `Int` is a
+/// signed 64-bit integer like PHP's `int` (negatives pass, T1153
+/// LINT-41).
 fn option_value_matches(expected: OptionType, value: &serde_json::Value) -> bool {
     match expected {
         OptionType::Str => value.is_string(),
         OptionType::Bool => value.is_boolean(),
-        OptionType::Int => value.as_u64().is_some(),
+        OptionType::Int => value.as_i64().is_some(),
         OptionType::StrList => is_str_list_value(value),
         OptionType::StrOrStrList => is_str_or_str_list_value(value),
         OptionType::Regex => is_valid_regex_value(value),
@@ -1588,24 +1719,54 @@ const PHUTIL_XHPAST_STANDARD_SEVERITY: &[(&str, &str)] =
     &[("16", "advice"), ("34", "error"), ("87", "warning")];
 
 /// The `phutil.xhpast` standard's rule configuration, applied through
-/// the XHP linter like PHP's `setLinterConfigurationValue()` loop.
+/// the XHP linter like PHP's `setLinterConfigurationValue()` loop
+/// (verbatim from `ArcanistPhutilXHPASTLinterStandard.php:25-56`,
+/// T1153 LINT-30).
 fn phutil_xhpast_standard_config() -> serde_json::Value {
     serde_json::json!({
-        "xhpast.blacklisted.function": {},
-        "xhpast.php-version": "5.3.0",
-        "xhpast.php-version.windows": "5.4.0",
-        "xhpast.dynamic-string.classes": {},
-        "xhpast.dynamic-string.functions": {},
+        "xhpast.blacklisted.function": {
+            "eval": "The `eval` function should be avoided. It is potentially unsafe and makes debugging more difficult.",
+        },
+        "xhpast.php-version": "5.2.3",
+        "xhpast.php-version.windows": "5.3.0",
+        "xhpast.dynamic-string.classes": {
+            "ExecFuture": 0,
+        },
+        "xhpast.dynamic-string.functions": {
+            "pht": 0,
+            "hsprintf": 0,
+            "jsprintf": 0,
+            "hgsprintf": 0,
+            "csprintf": 0,
+            "vcsprintf": 0,
+            "execx": 0,
+            "exec_manual": 0,
+            "phutil_passthru": 0,
+            "qsprintf": 1,
+            "vqsprintf": 1,
+            "queryfx": 1,
+            "queryfx_all": 1,
+            "queryfx_one": 1,
+        },
     })
 }
 
-/// Prefix `.arclint` option errors with the linter name.
+/// Prefix `.arclint` option errors with the linter name, as a proxy
+/// chain link (T1153 LINT-40): `checkMap()` failures use the `for
+/// linter` context, `setLinterConfigurationValue()` failures the `in
+/// key` context, each followed by the cause on the next line.
 fn arclint_error(name: &str, detail: String) -> String {
-    format!("Error in parsing '.arclint' file, for linter '{name}': {detail}")
+    format!("Error in parsing '.arclint' file, for linter '{name}'.\n{detail}")
+}
+
+/// Prefix `.arclint` option-setter errors with the linter name and key
+/// (`Error in parsing ... in key ...`, T1153 LINT-40).
+fn arclint_key_error(name: &str, key: &str, detail: String) -> String {
+    format!("Error in parsing '.arclint' file, in key '{key}' for linter '{name}'.\n{detail}")
 }
 
 /// Apply base/custom/lessc options in PHP table order, then validate the
-/// severity map; option errors are prefixed with the linter name.
+/// severity map; each stage wraps its own errors with the linter name.
 fn apply_section_options(
     linter: &mut Box<dyn Linter>,
     spec: &arclint::LinterSpec,
@@ -1616,20 +1777,15 @@ fn apply_section_options(
 ) -> Result<arclint::SeverityOverrides, String> {
     let mut severity;
     if custom_after_base {
-        severity = apply_base_options(linter, spec, canonical, ctx)
-            .map_err(|detail| arclint_error(&spec.name, detail))?;
-        apply_custom_options(linter, spec, canonical, table, ctx)
-            .map_err(|detail| arclint_error(&spec.name, detail))?;
-        apply_lessc_options(linter, spec, canonical, ctx)
-            .map_err(|detail| arclint_error(&spec.name, detail))?;
+        severity = apply_base_options(linter, spec, canonical, ctx)?;
+        apply_custom_options(linter, spec, canonical, table, ctx)?;
+        apply_lessc_options(linter, spec, canonical, ctx)?;
     } else {
-        apply_custom_options(linter, spec, canonical, table, ctx)
-            .map_err(|detail| arclint_error(&spec.name, detail))?;
-        severity = apply_base_options(linter, spec, canonical, ctx)
-            .map_err(|detail| arclint_error(&spec.name, detail))?;
+        apply_custom_options(linter, spec, canonical, table, ctx)?;
+        severity = apply_base_options(linter, spec, canonical, ctx)?;
     }
     severity.map = validate_severity_map(linter.as_ref(), &severity.map)
-        .map_err(|detail| arclint_error(&spec.name, detail))?;
+        .map_err(|detail| arclint_key_error(&spec.name, "severity", detail))?;
     Ok(severity)
 }
 
@@ -1700,7 +1856,9 @@ fn reject_unknown_options(
 
 /// Apply linter-specific options in PHP table order (type-check, then
 /// `set_option`, like `checkMap()` feeding
-/// `setLinterConfigurationValue()`).
+/// `setLinterConfigurationValue()`): type failures use the `for
+/// linter` context, setter failures the `in key` context (T1153
+/// LINT-40).
 fn apply_custom_options(
     linter: &mut Box<dyn Linter>,
     spec: &arclint::LinterSpec,
@@ -1713,11 +1871,14 @@ fn apply_custom_options(
             continue;
         };
         if canonical == "text" && *key == "text.max-line-length" {
-            apply_max_line_length(linter, value, ctx)?;
+            apply_max_line_length(linter, spec, value, ctx)?;
             continue;
         }
-        check_option_type(key, *expected, value)?;
-        linter.set_option(key, value, ctx)?;
+        check_option_type(key, *expected, value)
+            .map_err(|detail| arclint_error(&spec.name, detail))?;
+        linter
+            .set_option(key, value, ctx)
+            .map_err(|detail| arclint_key_error(&spec.name, key, detail))?;
     }
     Ok(())
 }
@@ -1736,30 +1897,39 @@ fn apply_lessc_options(
         let Some(value) = spec.extra.get(*key) else {
             continue;
         };
-        check_option_type(key, *expected, value)?;
-        linter.set_option(key, value, ctx)?;
+        check_option_type(key, *expected, value)
+            .map_err(|detail| arclint_error(&spec.name, detail))?;
+        linter
+            .set_option(key, value, ctx)
+            .map_err(|detail| arclint_key_error(&spec.name, key, detail))?;
     }
     Ok(())
 }
 
 /// Apply `text.max-line-length`, preserving the long-standing error
-/// texts for non-integer and overflowing values.
+/// text for non-integer values. Negatives pass through like PHP's
+/// `'optional int'` (T1153 LINT-41).
 fn apply_max_line_length(
     linter: &mut Box<dyn Linter>,
+    spec: &arclint::LinterSpec,
     value: &serde_json::Value,
     ctx: &OptionContext,
 ) -> Result<(), String> {
-    check_option_type("text.max-line-length", OptionType::Int, value)
-        .map_err(|_| "'text.max-line-length' must be an integer".to_string())?;
-    let length = value.as_u64().unwrap_or(DEFAULT_MAX_LINE_LENGTH as u64);
-    if usize::try_from(length).is_err() {
-        return Err("'text.max-line-length' is too large".to_string());
-    }
-    linter.set_option("text.max-line-length", value, ctx)
+    check_option_type("text.max-line-length", OptionType::Int, value).map_err(|_| {
+        arclint_error(
+            &spec.name,
+            "'text.max-line-length' must be an integer".to_string(),
+        )
+    })?;
+    linter
+        .set_option("text.max-line-length", value, ctx)
+        .map_err(|detail| arclint_key_error(&spec.name, "text.max-line-length", detail))
 }
 
 /// Apply the base options: reject `severity` keys for linters that
-/// cannot customize severities, and resolve `standard` names.
+/// cannot customize severities, and resolve `standard` names. Shape
+/// rejections use the `for linter` context (`checkMap()`); `standard`
+/// resolution failures the `in key 'standard'` context (T1153 LINT-40).
 fn apply_base_options(
     linter: &mut Box<dyn Linter>,
     spec: &arclint::LinterSpec,
@@ -1769,20 +1939,30 @@ fn apply_base_options(
     let mut severity = spec.severity.clone();
     if !linter.can_customize_severities() {
         if !severity.map.is_empty() {
-            return Err("unknown option 'severity'.".to_string());
+            return Err(arclint_error(
+                &spec.name,
+                "unknown option 'severity'.".to_string(),
+            ));
         }
         if !severity.rules.is_empty() {
-            return Err("unknown option 'severity.rules'.".to_string());
+            return Err(arclint_error(
+                &spec.name,
+                "unknown option 'severity.rules'.".to_string(),
+            ));
         }
         if spec.extra.contains_key("standard") {
-            return Err("unknown option 'standard'.".to_string());
+            return Err(arclint_error(
+                &spec.name,
+                "unknown option 'standard'.".to_string(),
+            ));
         }
         return Ok(severity);
     }
     let Some(standard) = spec.extra.get("standard") else {
         return Ok(severity);
     };
-    check_option_type("standard", OptionType::StrOrStrList, standard)?;
+    check_option_type("standard", OptionType::StrOrStrList, standard)
+        .map_err(|detail| arclint_error(&spec.name, detail))?;
     let mut names = Vec::new();
     if let Some(name) = standard.as_str() {
         names.push(name.to_string());
@@ -1792,7 +1972,8 @@ fn apply_base_options(
         }
     }
     for name in names {
-        apply_standard(&mut severity, linter, canonical, &name, ctx)?;
+        apply_standard(&mut severity, linter, canonical, &name, ctx)
+            .map_err(|detail| arclint_key_error(&spec.name, "standard", detail))?;
     }
     Ok(severity)
 }
@@ -1861,6 +2042,7 @@ impl Engine {
         Self {
             sections: sections_from_pairs(all_linter_pairs()),
             comprehensive: false,
+            single: false,
             cached: CachedResults::new(),
             repository_version: None,
         }
@@ -1883,6 +2065,7 @@ impl Engine {
         Ok(Self {
             sections,
             comprehensive: false,
+            single: false,
             cached: CachedResults::new(),
             repository_version: None,
         })
@@ -1909,6 +2092,7 @@ impl Engine {
         Self {
             sections: sections_from_pairs(pairs),
             comprehensive: true,
+            single: false,
             cached: CachedResults::new(),
             repository_version: None,
         }
@@ -1925,6 +2109,7 @@ impl Engine {
         Self {
             sections: Vec::new(),
             comprehensive: false,
+            single: false,
             cached: CachedResults::new(),
             repository_version: None,
         }
@@ -1975,6 +2160,12 @@ impl Engine {
     #[must_use]
     pub fn is_comprehensive(&self) -> bool {
         self.comprehensive
+    }
+
+    /// True for the single-linter glue engine (T1153 LINT-22).
+    #[must_use]
+    pub fn is_single(&self) -> bool {
+        self.single
     }
 
     /// Resolve the effective severity for a message through the first
@@ -2156,14 +2347,32 @@ impl Engine {
 
     #[must_use]
     pub fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {
+        self.lint_bytes_with_errors(path, data).0
+    }
+
+    /// [`lint_bytes`](Self::lint_bytes) plus per-section failures
+    /// (T1153 LINT-4): messages come back in section-execution order
+    /// (PHP keeps linter emission order until `sortAndFilterMessages()`;
+    /// result grouping sorts by position), each stamped with its
+    /// section's cache granularity (`ArcanistLintEngine.php:218`).
+    /// Section failures are collected, never aborting the remaining
+    /// sections, like `executeLintersOnChunk()`; callers fold them
+    /// into the `Some linters failed:` aggregate.
+    #[must_use]
+    pub fn lint_bytes_with_errors(
+        &self,
+        path: &str,
+        data: &[u8],
+    ) -> (Vec<LintMessage>, Vec<String>) {
         let Some(allowed) = self.bytes_allowed(path) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         if self.bytes_globally_skipped(path, data, &allowed) {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
 
         let mut out = Vec::new();
+        let mut errors = Vec::new();
         let mut stopped = false;
         let entry = self.cache_entry_for(path);
         for (index, section) in self.ordered_sections() {
@@ -2175,7 +2384,14 @@ impl Engine {
             }
             let mut messages = section.linter.lint_bytes(path, data);
             Self::apply_section_severity(section, &mut messages);
+            let granularity = section.linter.cache_granularity();
+            for message in &mut messages {
+                message.granularity = Some(granularity);
+            }
             stopped |= section.linter.take_halt();
+            if let Some(error) = section.linter.take_error() {
+                errors.push(error);
+            }
             // Text stops (`lintEmptyFile`, `lintNewlines`, `lintCharset`):
             // an empty file always stops; DOS newlines and bad charsets
             // stop unless custom-disabled.
@@ -2185,51 +2401,79 @@ impl Engine {
             out.extend(messages);
         }
         self.merge_cached_messages(path, &mut out);
-        out.sort_by(|a, b| {
-            (&a.path, a.line, a.col, &a.code).cmp(&(&b.path, b.line, b.col, &b.code))
-        });
-        out
+        (out, errors)
     }
 
     /// Lint one file from disk, applying each linter's `shouldLint*()`
     /// path filters like the PHP engine (`ArcanistLinter.php:294-319`):
     /// missing files lint nowhere; directories and symlinks only reach
     /// linters opting in (the filename linter); binary files (NUL byte)
-    /// only reach linters opting in (filename, chmod).
+    /// only reach linters opting in (filename, chmod). Under the single
+    /// engine, directories lint nowhere at all (T1153 LINT-22).
     pub fn lint_file(&self, disk: &Path, display: &str) -> Result<Vec<LintMessage>, String> {
+        let (messages, errors) = self.lint_file_with_errors(disk, display);
+        if errors.is_empty() {
+            Ok(messages)
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    /// [`lint_file`](Self::lint_file) with section failures collected
+    /// instead of aborting (T1153 LINT-4/LINT-20): an unreadable file
+    /// yields no messages plus one error, like PHP folding the
+    /// `loadData()` failure into the aggregate while other paths still
+    /// lint. Callers render the `Some linters failed:` aggregate when
+    /// errors are non-empty. Every section sees the on-disk path first
+    /// (`set_active_disk_path()`, T1153 LINT-26).
+    #[must_use]
+    pub fn lint_file_with_errors(
+        &self,
+        disk: &Path,
+        display: &str,
+    ) -> (Vec<LintMessage>, Vec<String>) {
         if self.comprehensive && comprehensive_linters_for(display).is_none() {
-            return Ok(Vec::new());
+            return (Vec::new(), Vec::new());
         }
         let meta = match std::fs::symlink_metadata(disk) {
-            Err(_) => return Ok(Vec::new()),
+            Err(_) => return (Vec::new(), Vec::new()),
             Ok(meta) => meta,
         };
+        for section in &self.sections {
+            section.linter.set_active_disk_path(disk);
+        }
         let file_type = meta.file_type();
         if file_type.is_symlink() {
-            return Ok(self
-                .lint_bytes_filtered(display, b"", |linter| linter.should_lint_symbolic_links()));
+            return self
+                .lint_bytes_filtered(display, b"", |linter| linter.should_lint_symbolic_links());
         }
         if file_type.is_dir() {
-            return Ok(
-                self.lint_bytes_filtered(display, b"", |linter| linter.should_lint_directories())
-            );
+            if self.single {
+                return (Vec::new(), Vec::new());
+            }
+            return self
+                .lint_bytes_filtered(display, b"", |linter| linter.should_lint_directories());
         }
-        let data = std::fs::read(disk).map_err(|e| format!("cannot read: {e}"))?;
+        let data = match std::fs::read(disk) {
+            Ok(data) => data,
+            Err(error) => return (Vec::new(), vec![format!("cannot read: {error}")]),
+        };
         if data.contains(&0) {
-            return Ok(self
-                .lint_bytes_filtered(display, &data, |linter| linter.should_lint_binary_files()));
+            return self
+                .lint_bytes_filtered(display, &data, |linter| linter.should_lint_binary_files());
         }
-        Ok(self.lint_bytes(display, &data))
+        self.lint_bytes_with_errors(display, &data)
     }
 
     /// Run the linters accepting `filter` over one file's bytes. Stops
     /// cannot trigger here: no stopping linter opts into filtered paths.
+    /// Section failures are collected like [`lint_bytes`](Self::lint_bytes).
     fn lint_bytes_filtered(
         &self,
         path: &str,
         data: &[u8],
         filter: impl Fn(&dyn Linter) -> bool,
-    ) -> Vec<LintMessage> {
+    ) -> (Vec<LintMessage>, Vec<String>) {
         let mut sections = self.ordered_sections();
         sections.retain(|(_, section)| filter(section.linter.as_ref()));
         let allowed = self
@@ -2237,6 +2481,7 @@ impl Engine {
             .then(|| comprehensive_linters_for(path))
             .flatten();
         let mut out = Vec::new();
+        let mut errors = Vec::new();
         let entry = self.cache_entry_for(path);
         for (_, section) in sections {
             if let Some(names) = &allowed
@@ -2259,13 +2504,17 @@ impl Engine {
             }
             let mut messages = section.linter.lint_bytes(path, data);
             Self::apply_section_severity(section, &mut messages);
+            let granularity = section.linter.cache_granularity();
+            for message in &mut messages {
+                message.granularity = Some(granularity);
+            }
+            if let Some(error) = section.linter.take_error() {
+                errors.push(error);
+            }
             out.extend(messages);
         }
         self.merge_cached_messages(path, &mut out);
-        out.sort_by(|a, b| {
-            (&a.path, a.line, a.col, &a.code).cmp(&(&b.path, b.line, b.col, &b.code))
-        });
-        out
+        (out, errors)
     }
 }
 
@@ -2751,7 +3000,10 @@ fn display_for(disk: &Path, project_root: &Path) -> String {
 /// (`ArcanistWorkflow.php:1622-1663`): every path must exist (files,
 /// directories, and symlinks alike; directories are NOT walked), and
 /// display paths are project-relative. Relative paths resolve from
-/// `cwd`.
+/// `cwd`. CLI order is kept verbatim, duplicates included (T1153
+/// LINT-9: PHP never sorts or dedups), and `.`/`..` segments are
+/// normalized lexically like `Filesystem::resolvePath()` (T1153
+/// LINT-10), so `sub/../file.php` displays as `file.php`.
 pub fn collect_explicit(
     paths: &[String],
     cwd: &Path,
@@ -2773,12 +3025,33 @@ pub fn collect_explicit(
         } else {
             cwd.join(&disk)
         };
+        let absolute = normalize_lexical(&absolute);
         let display = display_for(&absolute, project_root);
         out.push((absolute, display));
     }
-    out.sort_by(|a, b| a.1.cmp(&b.1));
-    out.dedup_by(|a, b| a.0 == b.0);
     Ok(out)
+}
+
+/// Normalize `.`/`..` segments lexically, like PHP
+/// `Filesystem::resolvePath()` (no symlink resolution, no filesystem
+/// access): `..` pops the previous segment and clamps at the root, so
+/// joined CLI paths reduce to the canonical absolute form PHP displays.
+fn normalize_lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(Component::RootDir.as_os_str()),
+            Component::CurDir => {}
+            // `PathBuf::pop()` clamps at the root, like PHP.
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    out
 }
 
 /// Tracked working-copy status paths (range plus uncommitted, minus
@@ -2945,10 +3218,35 @@ pub fn changed_lines_for(
             }
         }
     };
-    if diff.contains("Binary files ") && diff.contains("differ") {
+    if diff.lines().any(is_binary_diff_marker) {
         return Ok(None);
     }
     Ok(Some(parse_changed_lines(&diff)))
+}
+
+/// True when a diff line marks the file binary, mirroring the
+/// `ArcanistDiffParser` markers (`ArcanistDiffParser.php:733-787`,
+/// T1153 LINT-17): the svn `Cannot display` notice, the
+/// git/svn `Binary files ... differ` / `Files ... differ` line, the hg
+/// `Binary file ... has changed` line, and `GIT binary patch` headers.
+/// Lines are `rtrim()`ed and matched anchored, like PHP.
+fn is_binary_diff_marker(line: &str) -> bool {
+    let line = line.trim_end_matches([' ', '\t', '\n', '\r', '\0', '\x0B']);
+    if line == "Cannot display: file marked as a binary type." || line == "GIT binary patch" {
+        return true;
+    }
+    if line.starts_with("Binary file ") && line.ends_with(" has changed") {
+        return true;
+    }
+    for prefix in ["Binary files ", "Files "] {
+        if let Some(rest) = line.strip_prefix(prefix)
+            && let Some(middle) = rest.strip_suffix(" differ")
+            && middle.contains(" and ")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /* -(  Arguments  )------------------------------------------------------------ */
@@ -3304,6 +3602,7 @@ fn single_engine(work: &WorkCopy) -> Result<Engine, String> {
     };
     let mut engine = Engine::new();
     engine.retain_display(display);
+    engine.single = true;
     Ok(engine)
 }
 
@@ -3462,14 +3761,16 @@ impl LintResult {
         self.applied.push(false);
     }
 
-    /// Sort messages by position (`sortAndFilterMessages()`:
-    /// `line * 8192 + char`, with a code tiebreak for determinism).
-    /// Messages without a line sort first, like PHP's null key 0.
+    /// Sort messages by position (`sortAndFilterMessages()`,
+    /// `ArcanistLintResult.php:93-98`: `line * 8192 + char`, stable so
+    /// ties keep linter emission order like PHP's `asort()` key order,
+    /// T1153 LINT-15). Messages without a line sort first, like PHP's
+    /// null key 0.
     pub fn sort_messages(&mut self) {
         let mut order: Vec<usize> = (0..self.messages.len()).collect();
         order.sort_by_key(|&i| {
             let message = &self.messages[i];
-            (message.line * 8192 + message.col, message.code.clone())
+            message.line * 8192 + message.col
         });
         let mut messages = Vec::with_capacity(self.messages.len());
         let mut applied = Vec::with_capacity(self.applied.len());
@@ -3492,15 +3793,20 @@ impl LintResult {
     }
 }
 
-/// Group messages by path (sorted), loading file data for context
-/// rendering. Missing/unreadable files get empty data.
+/// Group messages by path in first-seen order (T1153 LINT-9: PHP
+/// renders result sections in engine path order, never sorted),
+/// loading file data for context rendering. Missing/unreadable files
+/// get empty data.
 pub fn group_results(
     messages: Vec<LintMessage>,
     disk_for: &dyn Fn(&str) -> PathBuf,
 ) -> Vec<LintResult> {
-    let mut paths: Vec<String> = messages.iter().map(|m| m.path.clone()).collect();
-    paths.sort();
-    paths.dedup();
+    let mut paths: Vec<String> = Vec::new();
+    for message in &messages {
+        if !paths.contains(&message.path) {
+            paths.push(message.path.clone());
+        }
+    }
     let mut results = Vec::new();
     for path in paths {
         let disk_path = disk_for(&path);
@@ -3516,32 +3822,67 @@ pub fn group_results(
 }
 
 /// Drop non-error messages outside the changed lines, mirroring
-/// `isRelevantMessage()` (`ArcanistLintEngine.php:316-369`): errors and
-/// line-less messages are always relevant; a `None` line set (binary,
-/// directory, missing) keeps everything.
+/// `isRelevantMessage()` (`ArcanistLintEngine.php:316-369`, T1153
+/// LINT-14).
 pub fn filter_changed_lines(
     messages: Vec<LintMessage>,
     changed: &HashMap<String, Option<BTreeSet<usize>>>,
 ) -> Vec<LintMessage> {
     messages
         .into_iter()
-        .filter(|message| {
-            if message.is_error() || !message.has_file_context() {
-                return true;
-            }
-            match changed.get(&message.path) {
-                None => false,
-                Some(None) => true,
-                Some(Some(lines)) => {
-                    let mut last = message.line;
-                    if let Some(original) = &message.original {
-                        last += original.bytes().filter(|b| *b == b'\n').count();
-                    }
-                    (message.line..=last).any(|line| lines.contains(&line))
-                }
-            }
-        })
+        .filter(|message| is_relevant_message(message, changed))
         .collect()
+}
+
+/// True when `message` survives changed-line filtering
+/// (`isRelevantMessage()`): errors, bypass-flagged messages, and an
+/// empty change map are always relevant; otherwise the message's own
+/// location plus every `otherLocations` entry is tried (PHP's Windows
+/// path juggling omitted), where a `None` line set (binary,
+/// directory, missing) or a line-less location keeps the message, and
+/// a location with `original` text spans its newline count.
+fn is_relevant_message(
+    message: &LintMessage,
+    changed: &HashMap<String, Option<BTreeSet<usize>>>,
+) -> bool {
+    if changed.is_empty()
+        || message.is_error()
+        || message.bypass_changed_line_filtering == Some(true)
+    {
+        return true;
+    }
+    let own_path = message.path.clone();
+    let mut locations: Vec<(String, usize, Option<&str>)> = message
+        .locations
+        .iter()
+        .map(|location| {
+            (
+                location.path.clone().unwrap_or_else(|| own_path.clone()),
+                location.line,
+                location.original.as_deref(),
+            )
+        })
+        .collect();
+    locations.push((own_path, message.line, message.original.as_deref()));
+    for (path, line, original) in &locations {
+        let Some(entry) = changed.get(path) else {
+            continue;
+        };
+        let Some(lines) = entry else {
+            return true;
+        };
+        if *line == 0 {
+            return true;
+        }
+        let mut last = *line;
+        if let Some(original) = original {
+            last += original.bytes().filter(|b| *b == b'\n').count();
+        }
+        if (*line..=last).any(|line| lines.contains(&line)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Compute the workflow result code from unresolved (non-applied)
@@ -3567,59 +3908,74 @@ pub fn result_code(results: &[LintResult]) -> i32 {
 
 /* -(  Renderers  )--------------------------------------------------------------- */
 
-/// Word-wrap `text` like `phutil_console_wrap()`: each paragraph is
-/// wrapped to 80 columns and every line is prefixed with `indent`
-/// spaces. Approximation; see the module docs.
+/// Word-wrap `text` like `phutil_console_wrap()` (T1153 LINT-24):
+/// content wraps at `78 - indent` characters (not 80 total), counted
+/// in characters with ANSI escapes ignored; lines break after the
+/// last space (the break space is dropped, interior spacing kept),
+/// embedded newlines flush the line as-is, and every emitted line is
+/// prefixed with `indent` spaces. No trailing newline is synthesized.
 pub fn word_wrap(text: &str, indent: usize) -> String {
-    const WIDTH: usize = 80;
+    let width = 78usize.saturating_sub(indent);
+    let chars: Vec<char> = text.chars().collect();
+    let mut lines: Vec<Vec<char>> = Vec::new();
+    let mut line: Vec<char> = Vec::new();
+    let mut line_len: usize = 0;
+    let mut break_pos: Option<usize> = None;
+    let mut len_after_break: usize = 0;
+    let mut index = 0;
+    while index < chars.len() {
+        // ANSI escapes ride along without counting toward the width.
+        if chars[index] == '\x1b' {
+            while index < chars.len() {
+                line.push(chars[index]);
+                let done = chars[index] == 'm';
+                index += 1;
+                if done {
+                    break;
+                }
+            }
+            continue;
+        }
+        let chr = chars[index];
+        index += 1;
+        line.push(chr);
+        line_len += 1;
+        len_after_break += 1;
+        if line_len > width
+            && let Some(at) = break_pos
+        {
+            let mut slice: Vec<char> = line[..at].to_vec();
+            while slice.last() == Some(&' ') {
+                slice.pop();
+            }
+            slice.push('\n');
+            lines.push(slice);
+            line = line[at..].to_vec();
+            line_len = len_after_break;
+            len_after_break = 0;
+            break_pos = None;
+        }
+        if chr == ' ' {
+            break_pos = Some(line.len());
+            len_after_break = 0;
+        }
+        if chr == '\n' {
+            lines.push(std::mem::take(&mut line));
+            len_after_break = 0;
+            line_len = 0;
+            break_pos = None;
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
     let prefix = " ".repeat(indent);
     let mut out = String::new();
-    for paragraph in text.split('\n') {
-        if paragraph.is_empty() {
-            out.push_str(&prefix);
-            out.push('\n');
-            continue;
-        }
-        wrap_paragraph(paragraph, &prefix, indent, WIDTH, &mut out);
-        out.push('\n');
+    for line in &lines {
+        out.push_str(&prefix);
+        out.extend(line.iter());
     }
     out
-}
-
-/// Wrap one non-empty paragraph into `out` (without the trailing newline).
-fn wrap_paragraph(paragraph: &str, prefix: &str, indent: usize, width: usize, out: &mut String) {
-    let mut line_len = 0;
-    for word in paragraph.split(' ') {
-        if word.is_empty() {
-            continue;
-        }
-        line_len = wrap_push_word(out, prefix, indent, width, line_len, word);
-    }
-}
-
-/// Append one word at `line_len`, breaking the line past `width`.
-/// Returns the new current-line length.
-fn wrap_push_word(
-    out: &mut String,
-    prefix: &str,
-    indent: usize,
-    width: usize,
-    line_len: usize,
-    word: &str,
-) -> usize {
-    if line_len > 0 && indent + line_len + 1 + word.len() > width {
-        out.push('\n');
-        out.push_str(prefix);
-        out.push_str(word);
-        return word.len();
-    }
-    if line_len == 0 {
-        out.push_str(prefix);
-    } else {
-        out.push(' ');
-    }
-    out.push_str(word);
-    line_len + usize::from(line_len > 0) + word.len()
 }
 
 /// Render one result in console format
@@ -3639,12 +3995,13 @@ pub fn render_console_result_with_ansi(result: &LintResult, ansi: bool) -> Resul
     let mut entries = Vec::new();
     for message in &result.messages {
         let severity = severity_display_name(&message.severity)?;
+        let description = description_with_other_locations(message, &result.path);
         entries.push(format!(
-            "   {}  ({}) {}\n{}",
+            "   {}  ({}) {}\n{}\n",
             severity,
             message.code,
             message.name,
-            word_wrap(&message.description, 4),
+            word_wrap(&description, 4),
         ));
         if message.has_file_context() {
             entries.push(render_context(message, &result.data));
@@ -3660,6 +4017,30 @@ pub fn render_console_result_with_ansi(result: &LintResult, ansi: bool) -> Resul
     ))
 }
 
+/// A message's description plus the `Other locations: ...` suffix
+/// (`ArcanistConsoleLintRenderer.php:71-81`, T1153 LINT-13): each
+/// secondary location renders as `path` plus `:line` when the line is
+/// set, appended after a newline and wrapped with the description.
+fn description_with_other_locations(message: &LintMessage, default_path: &str) -> String {
+    if message.locations.is_empty() {
+        return message.description.clone();
+    }
+    let mut locations = Vec::new();
+    for location in &message.locations {
+        let path = location.path.as_deref().unwrap_or(default_path);
+        if location.line == 0 {
+            locations.push(path.to_string());
+        } else {
+            locations.push(format!("{path}:{}", location.line));
+        }
+    }
+    format!(
+        "{}\nOther locations: {}",
+        message.description,
+        locations.join(", ")
+    )
+}
+
 /// TTY rendering for [`render_console_result_with_ansi`]:
 /// `phutil_console_format("  **<bg:COLOR> %s </bg>** (%s) __%s__\n%s\n",
 /// ...)` per message (`:83-88`, red for errors, yellow otherwise) plus
@@ -3670,7 +4051,8 @@ fn render_console_result_tty(result: &LintResult) -> Result<String, String> {
         let severity = severity_display_name(&message.severity)?;
         let color = if message.is_error() { "red" } else { "yellow" };
         let pattern = format!("  **<bg:{color}> %s </bg>** (%s) __%s__\n%s\n");
-        let description = terminal::console_wrap(&message.description, 4, true);
+        let description = description_with_other_locations(message, &result.path);
+        let description = terminal::console_wrap(&description, 4, true);
         entries.push(terminal::console_format(
             &pattern,
             &[
@@ -3698,8 +4080,12 @@ fn render_console_result_tty(result: &LintResult) -> Result<String, String> {
 /// (`ArcanistConsoleLintRenderer::renderContext()`, `:105-336`).
 /// Highlights are stripped (non-TTY `##..##`); see the module docs.
 /// Split like `phutil_split_lines()`: lines keep their endings; a
-/// trailing newline leaves no empty piece.
+/// trailing newline leaves no empty piece; empty text is one empty
+/// line (T1153 LINT-25).
 fn split_keep_ends(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
     let mut lines = Vec::new();
     let mut start = 0;
     for (index, byte) in text.bytes().enumerate() {
@@ -4161,25 +4547,22 @@ fn render_line(number: Option<usize>, data: &str, chevron: bool, diff: Option<ch
 }
 
 /// `renderResultCode()` for console and summary: the `OKAY` line on
-/// success, else nothing. TTYs render the green log line
-/// (`PhutilConsoleLogLine::drawView()`, `tsprintf("<bg:green>** %s
-/// **</bg> %s\n", ...)`); non-TTYs keep the stripped rendering.
+/// success, else nothing (`PhutilConsoleLogLine::drawView()`,
+/// `tsprintf("<bg:green>** %s **</bg> %s\n", ...)` through the shared
+/// formatter, so non-TTYs render the stripped ` OKAY  No lint
+/// messages.` with one leading space, T1153 LINT-5).
 fn render_result_code_okay(result_code: i32, ansi: bool) -> String {
     if result_code != RESULT_OKAY {
         return String::new();
     }
-    if ansi {
-        terminal::tsprintf_ansi(
-            "<bg:green>** %s **</bg> %s\n",
-            &[TVal::Text("OKAY"), TVal::Text("No lint messages.")],
-            true,
-        )
-        .expect("fixed tsprintf pattern")
-        .as_str()
-        .to_string()
-    } else {
-        "   OKAY  No lint messages.\n".to_string()
-    }
+    terminal::tsprintf_ansi(
+        "<bg:green>** %s **</bg> %s\n",
+        &[TVal::Text("OKAY"), TVal::Text("No lint messages.")],
+        ansi,
+    )
+    .expect("fixed tsprintf pattern")
+    .as_str()
+    .to_string()
 }
 
 /// Render one result in summary format
@@ -4239,7 +4622,8 @@ pub fn render_compiler_result_with_ansi(result: &LintResult, ansi: bool) -> Resu
 }
 
 /// One message as a JSON-renderer dictionary: `toDictionary()` plus
-/// `context`, minus `path`.
+/// `context`, minus `path`. Key order matches PHP's insertion order
+/// (`line` through `bypassChangedLineFiltering`, then `context`).
 fn message_json_dict(message: &LintMessage, data: &[u8]) -> serde_json::Value {
     let text = String::from_utf8_lossy(data);
     let mut lines: Vec<&str> = text.split('\n').collect();
@@ -4251,6 +4635,8 @@ fn message_json_dict(message: &LintMessage, data: &[u8]) -> serde_json::Value {
         .take(JSON_LINES_OF_CONTEXT * 2 + 1)
         .copied()
         .collect();
+    let locations: Vec<serde_json::Value> =
+        message.locations.iter().map(location_json_dict).collect();
     serde_json::json!({
         "line": if message.line == 0 { serde_json::Value::Null } else { serde_json::json!(message.line) },
         "char": if message.col == 0 { serde_json::Value::Null } else { serde_json::json!(message.col) },
@@ -4260,11 +4646,34 @@ fn message_json_dict(message: &LintMessage, data: &[u8]) -> serde_json::Value {
         "description": message.description,
         "original": message.original,
         "replacement": message.replacement,
-        "granularity": serde_json::Value::Null,
-        "locations": Vec::<serde_json::Value>::new(),
-        "bypassChangedLineFiltering": serde_json::Value::Null,
+        "granularity": message.granularity,
+        "locations": locations,
+        "bypassChangedLineFiltering": message.bypass_changed_line_filtering,
         "context": context.join("\n"),
     })
+}
+
+/// One `locations` entry as JSON: the `getOtherLocation()` dict shape
+/// (`path`/`line`/`char`), plus `original` when set.
+fn location_json_dict(location: &OtherLocation) -> serde_json::Value {
+    let mut dict = serde_json::Map::new();
+    dict.insert(
+        "path".to_string(),
+        location
+            .path
+            .clone()
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    dict.insert("line".to_string(), serde_json::json!(location.line));
+    dict.insert("char".to_string(), serde_json::json!(location.char));
+    if let Some(original) = &location.original {
+        dict.insert(
+            "original".to_string(),
+            serde_json::Value::String(original.clone()),
+        );
+    }
+    serde_json::Value::Object(dict)
 }
 
 /// Render one result in JSON format
@@ -4286,16 +4695,17 @@ pub fn render_json_result(result: &LintResult) -> String {
 }
 
 /// Escape non-ASCII text like PHP `json_encode()`: every char at or
-/// above DEL becomes `\uXXXX` (surrogate pairs above the BMP).
+/// above U+0080 becomes `\uXXXX` (surrogate pairs above the BMP).
+/// DEL (0x7F) passes through raw like PHP (T1153 LINT-11).
 /// Serialized JSON syntax is ASCII-only, so only string contents (and
 /// raw UTF-8 in them) change; existing escapes pass through.
 fn json_escape_nonascii(rendered: &str) -> String {
-    if rendered.chars().all(|ch| (ch as u32) < 0x7f) {
+    if rendered.chars().all(|ch| (ch as u32) < 0x80) {
         return rendered.to_string();
     }
     let mut out = String::with_capacity(rendered.len());
     for ch in rendered.chars() {
-        if (ch as u32) < 0x7f {
+        if (ch as u32) < 0x80 {
             out.push(ch);
         } else {
             let mut encoded = [0u16; 2];
@@ -4307,12 +4717,17 @@ fn json_escape_nonascii(rendered: &str) -> String {
     out
 }
 
-/// Escape XML attribute text like `XMLWriter`.
+/// Escape XML attribute text like `XMLWriter::writeAttribute()`
+/// (T1153 LINT-12): `& < > "` plus tab/newline/CR as character
+/// references (inserted after `&` so the reference `&` survives).
 fn xml_escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\t', "&#9;")
+        .replace('\n', "&#10;")
+        .replace('\r', "&#13;")
 }
 
 /// Open the checkstyle document (`willRenderResults()`).
@@ -4371,8 +4786,12 @@ fn patch_line_offsets(data: &[u8]) -> Vec<usize> {
 /// (`ArcanistLintPatcher::buildModifiedFile()`, `:66-106`). Messages
 /// apply in position order; overlapping messages are skipped via the
 /// dirty cursor. Returns the patched data plus per-message applied
-/// flags. A message past the end of the file is an error (PHP's
-/// message names an undefined variable, rendering as 0).
+/// flags. Targets up to one past the last line are allowed
+/// (`getCharacterOffset()` holds `nlines + 1` entries, T1153 LINT-18);
+/// anything further is an error (PHP's message names an undefined
+/// variable, rendering as 0). An unset char offsets one byte before
+/// the line start (PHP's null-char `- 1`, T1153 LINT-18). Byte-exact
+/// spans splice raw when the message carries them (T1153 LINT-43).
 pub fn build_patched_data(
     data: &[u8],
     messages: &[LintMessage],
@@ -4386,29 +4805,50 @@ pub fn build_patched_data(
         if !message.is_patchable() {
             continue;
         }
-        if message.line == 0 || message.line > offsets.len() {
+        if message.line == 0 || message.line > offsets.len() + 1 {
             return Err("Data has fewer than 0 lines.".to_string());
         }
-        let orig_offset = offsets[message.line - 1] + message.col.saturating_sub(1);
-        if dirty_until > orig_offset {
+        // The virtual line past the end starts one byte past the data
+        // (`lineOffsets[nlines]`, the trailing `strlen + 1` entry).
+        let line_start = offsets
+            .get(message.line - 1)
+            .copied()
+            .unwrap_or(data.len() + 1) as i64;
+        let orig_offset = line_start + message.col as i64 - 1;
+        if dirty_until as i64 > orig_offset {
             continue;
         }
-        let working_offset = (orig_offset as i64 + delta).max(0) as usize;
-        let old = message.original.clone().unwrap_or_default();
-        let new = message.replacement.clone().unwrap_or_default();
+        let working_offset = (orig_offset + delta).max(0) as usize;
+        let old = patch_span(
+            message.original_bytes.as_deref(),
+            message.original.as_deref(),
+        );
+        let new = patch_span(
+            message.replacement_bytes.as_deref(),
+            message.replacement.as_deref(),
+        );
         if working_offset == patched.len() {
             // Temporary hack to work around a destructive hphpi issue.
-            patched.extend_from_slice(new.as_bytes());
+            patched.extend_from_slice(new);
         } else {
             let start = working_offset.min(patched.len());
             let end = (working_offset + old.len()).min(patched.len());
-            patched.splice(start..end, new.bytes());
+            patched.splice(start..end, new.iter().copied());
         }
         delta += new.len() as i64 - old.len() as i64;
-        dirty_until = orig_offset + old.len();
+        dirty_until = orig_offset.max(0) as usize + old.len();
         applied[index] = true;
     }
     Ok((patched, applied))
+}
+
+/// One patch span as bytes: the raw-byte span when the message carries
+/// it, else the lossy text span, else empty.
+fn patch_span<'a>(bytes: Option<&'a [u8]>, text: Option<&'a str>) -> &'a [u8] {
+    if let Some(bytes) = bytes {
+        return bytes;
+    }
+    text.map(str::as_bytes).unwrap_or_default()
 }
 
 /// Write a patch to disk via a `<path>.linted[N]` temp file plus rename
@@ -4436,9 +4876,11 @@ pub fn write_patch_to_disk(result: &LintResult) -> Result<Vec<bool>, String> {
     }
     std::fs::write(&temp, &patched)
         .map_err(|e| format!("Unable to write '{}': {e}", temp.display()))?;
-    if let Err(rename_error) = rename_over(&temp, path) {
+    if rename_over(&temp, path).is_err() {
+        // PHP names no reason (`ArcanistLintPatcher.php:52-57`, T1153
+        // LINT-19).
         return Err(format!(
-            "Unable to overwrite path '{}', patched version was left at '{}'. ({rename_error})",
+            "Unable to overwrite path '{}', patched version was left at '{}'.",
             path.display(),
             temp.display(),
         ));
@@ -4771,19 +5213,29 @@ fn workflow_selection(
     Ok(selection)
 }
 
-/// Lint every selected path, collecting messages.
+/// Lint every selected path, collecting messages. Per-path and
+/// per-section failures never abort the run: every path still lints
+/// (T1153 LINT-4/LINT-20), and any failure becomes the
+/// `PhutilAggregateException('Some linters failed:')` aggregate
+/// (`ArcanistLintEngine.php:263-267`), which the renderer rethrows
+/// (`ArcanistLintRenderer.php:45-47`) so nothing renders.
 fn workflow_lint_selection(
     engine: &Engine,
     work: &WorkCopy,
     selection: &[String],
 ) -> Result<Vec<LintMessage>, String> {
     let mut messages = Vec::new();
+    let mut failed = false;
     for path in selection {
         let disk = work.vcs_root.join(path);
-        match engine.lint_file(&disk, path) {
-            Ok(mut found) => messages.append(&mut found),
-            Err(error) => return Err(format!("{path}: {error}")),
+        let (mut found, errors) = engine.lint_file_with_errors(&disk, path);
+        messages.append(&mut found);
+        if !errors.is_empty() {
+            failed = true;
         }
+    }
+    if failed {
+        return Err("Some linters failed:".to_string());
     }
     Ok(messages)
 }
@@ -4971,6 +5423,10 @@ fn apply_result_patch(
 }
 
 /// Render the trailing `OKAY` line for console/summary renderers.
+/// With `--outfile`, PHP renders the code after renaming the temp file
+/// away, so the line lands in a deleted temp file and is lost
+/// (`ArcanistLintWorkflow.php:323-326,384`: T1153 LINT-7); without an
+/// outfile it prints to stdout.
 fn workflow_render_okay(
     renderer_key: &str,
     outfile: Option<&str>,
@@ -4980,13 +5436,10 @@ fn workflow_render_okay(
     if !matches!(renderer_key, RENDERER_CONSOLE | RENDERER_SUMMARY) {
         return Ok(());
     }
-    let okay = render_result_code_okay(code, ansi);
-    if let Some(out_path) = outfile {
-        // `renderResultCode()` appends through the same sink.
-        append_outfile(out_path, &okay)?;
-    } else {
-        print!("{okay}");
+    if outfile.is_some() {
+        return Ok(());
     }
+    print!("{}", render_result_code_okay(code, ansi));
     Ok(())
 }
 
@@ -5004,35 +5457,20 @@ fn flush_outfile(out_path: &str, buffer: &str) -> Result<(), String> {
     rename_over(&temp, Path::new(out_path)).map_err(|e| format!("cannot write '{out_path}': {e}"))
 }
 
-/// Append to `--outfile` (PHP `Filesystem::appendFile()`).
-fn append_outfile(out_path: &str, text: &str) -> Result<(), String> {
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(out_path)
-        .map_err(|e| format!("cannot write '{out_path}': {e}"))?;
-    file.write_all(text.as_bytes())
-        .map_err(|e| format!("cannot write '{out_path}': {e}"))
-}
-
 /// Amend HEAD with applied patches
 /// (`ArcanistLintWorkflow.php:238-354`).
 /// The `LINT NOTICE` amend line (`ArcanistLintWorkflow.php`, the
-/// `writeOut("<bg:yellow>** %s **</bg> %s\n", ...)` call): TTYs render
-/// the yellow status line, non-TTYs keep the plain `** LINT NOTICE **`
-/// rendering byte-identical. Includes the trailing newline.
+/// `writeOut("<bg:yellow>** %s **</bg> %s\n", ...)` call) through the
+/// shared formatter, so non-TTYs render the stripped ` LINT NOTICE  ...`
+/// line with the markup removed (T1153 LINT-6). Includes the trailing
+/// newline.
 fn lint_notice_line(ansi: bool) -> String {
-    if ansi {
-        terminal::format_status_message(
-            "yellow",
-            "LINT NOTICE",
-            "Automatically amending HEAD with lint patches.",
-            true,
-        )
-    } else {
-        "** LINT NOTICE ** Automatically amending HEAD with lint patches.\n".to_string()
-    }
+    terminal::format_status_message(
+        "yellow",
+        "LINT NOTICE",
+        "Automatically amending HEAD with lint patches.",
+        ansi,
+    )
 }
 
 fn maybe_amend(

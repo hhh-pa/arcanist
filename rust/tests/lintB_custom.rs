@@ -133,6 +133,11 @@ fn echo_parser(
         description: stdout.trim().to_string(),
         original: None,
         replacement: None,
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     }])
 }
 
@@ -234,7 +239,8 @@ fn script_and_regex_default_is_silent_but_parser_ports_rules() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].code, "S&RX");
     assert_eq!(messages[0].severity, "error");
-    assert_eq!((messages[0].line, messages[0].col), (3, 1));
+    // T1153 LINT-27: no `char` group means PHP null (0).
+    assert_eq!((messages[0].line, messages[0].col), (3, 0));
 }
 
 #[test]
@@ -291,6 +297,11 @@ fn external_parsers_resolve_on_canned_output() {
             description: stdout.to_string(),
             original: None,
             replacement: None,
+            granularity: None,
+            locations: Vec::new(),
+            bypass_changed_line_filtering: None,
+            original_bytes: None,
+            replacement_bytes: None,
         }])
     }
     let messages = lint_external::resolve_output(parser, "f.txt", 0, "boom\n", "", true).unwrap();

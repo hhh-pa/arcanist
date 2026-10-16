@@ -134,9 +134,47 @@ fn arclint_loads_from_disk() {
 fn arclint_type_table_is_complete() {
     let available = arclint::available_types();
     assert_eq!(available.len(), 34);
-    let mut sorted = available.clone();
-    sorted.sort_unstable();
-    assert_eq!(available, sorted);
+    // T1153 LINT-39: PHP class-map order (alphabetical by class name),
+    // not sorted.
+    assert_eq!(
+        available,
+        vec![
+            "csslint",
+            "csharp",
+            "chmod",
+            "gjslint",
+            "coffeelint",
+            "composer",
+            "cppcheck",
+            "cpplint",
+            "filename",
+            "flake8",
+            "generated",
+            "golint",
+            "hlint",
+            "jshint",
+            "jsonlint",
+            "json",
+            "jscs",
+            "lessc",
+            "merge-conflict",
+            "nolint",
+            "pep8",
+            "php",
+            "phpcs",
+            "phutil-library",
+            "puppet-lint",
+            "pyflakes",
+            "pylint",
+            "rubocop",
+            "ruby",
+            "script-and-regex",
+            "spelling",
+            "text",
+            "xhpast",
+            "xml",
+        ]
+    );
 
     let displays = arclint::display_names();
     assert_eq!(displays.len(), 33);
@@ -192,9 +230,11 @@ fn arclint_retain_selects_exact_names() {
     struct Fake {
         name: &'static str,
     }
-    let config =
-        arclint::parse_arclint(r#"{"linters": {"a": {"type": "cpplint"}, "b": {"type": "C#"}}}"#)
-            .unwrap();
+    // T1153 LINT-38: `type` takes configuration names only (`C#` is invalid).
+    let config = arclint::parse_arclint(
+        r#"{"linters": {"a": {"type": "cpplint"}, "b": {"type": "csharp"}}}"#,
+    )
+    .unwrap();
     assert_eq!(
         arclint::selected_display_names(&config),
         vec!["C++ Google's Styleguide", "C#"]

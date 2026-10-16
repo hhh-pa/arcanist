@@ -13,21 +13,24 @@
 //! ([`parse_pcre_output`]). A custom [`OutputParser`] matcher remains
 //! available to direct callers.
 //!
+//! Script failures and `throw` matches record a pending error for
+//! [`Linter::take_error`] (T1153 LINT-28): the engine folds it into the
+//! `Some linters failed:` aggregate like PHP. Missing `line`/`char`
+//! groups map to 0 (PHP `null`, T1153 LINT-27); negative captures clamp
+//! for the same reason. An `offset` group resolves against the matched
+//! file's bytes, read from the project root (T1153 LINT-27); the pure
+//! [`parse_output_with`] / [`parse_pcre_output`] parse against the
+//! linted bytes and error when a match names another file (use the
+//! `*_with_file_bytes` variants to supply bytes).
+//!
 //! Out of scope / divergences:
 //!
-//! - Script failures and `throw` matches make `lint_bytes` return no
-//!   messages (PHP raises); the fallible [`parse_output_with`] surfaces
-//!   `throw`, and [`run_script_for_path`] is available to direct callers.
-//! - Whole-file messages use line/column 1 (the Rust message has no null
-//!   line); negative captures clamp to 1 for the same reason.
-//! - `offset` always resolves against the linted bytes, even when a `file`
-//!   group names another file (PHP reads that file's data).
 //! - Custom `severity` maps are accepted but ignored, like PHP (the PHP
 //!   linter never consults them, despite what its `code` docs suggest).
 
 extern crate self as arc_rs;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -117,6 +120,7 @@ pub struct ScriptAndRegexLinter {
     pattern: Option<regex::Regex>,
     root: Option<PathBuf>,
     halted: Cell<bool>,
+    error: RefCell<Option<String>>,
 }
 
 impl ScriptAndRegexLinter {
@@ -137,6 +141,7 @@ impl ScriptAndRegexLinter {
             pattern: None,
             root: None,
             halted: Cell::new(false),
+            error: RefCell::new(None),
         }
     }
 }
@@ -148,30 +153,54 @@ impl Linter for ScriptAndRegexLinter {
 
     fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {
         self.halted.set(false);
+        *self.error.borrow_mut() = None;
+        let fail = |error: String| {
+            *self.error.borrow_mut() = Some(error);
+            Vec::new()
+        };
         let Some(script) = self.script.as_deref() else {
             return Vec::new();
         };
         if data.contains(&0) || script.trim().is_empty() {
             return Vec::new();
         }
-        let Ok(output) = run_script_for_path_in(script, path, self.root.as_deref()) else {
-            return Vec::new();
+        // A nonzero script exit fails loudly like `resolvex()` (T1153
+        // LINT-28): the message waits on `take_error()` for the
+        // engine's aggregate.
+        let output = match run_script_for_path_in(script, path, self.root.as_deref()) {
+            Ok(output) => output,
+            Err(error) => return fail(error),
+        };
+        // `offset` groups resolve against the matched file's bytes
+        // (`getLineAndCharFromOffset(idx($match, 'file', $path), ...)`),
+        // read from the project root when it names another file (T1153
+        // LINT-27).
+        let file_bytes = |file: &str| -> Option<Vec<u8>> {
+            if file == path {
+                return Some(data.to_vec());
+            }
+            self.root
+                .as_deref()
+                .and_then(|root| std::fs::read(root.join(file)).ok())
         };
         if let Some(parser) = self.parser {
-            let (messages, halted) =
-                messages_from_matches(parser(&output), &output, path, data).unwrap_or_default();
-            self.halted.set(halted);
-            return messages;
+            return match messages_from_matches(parser(&output), &output, path, data, &file_bytes) {
+                Ok((messages, halted)) => {
+                    self.halted.set(halted);
+                    messages
+                }
+                Err(error) => fail(error),
+            };
         }
         let Some(pattern) = &self.pattern else {
             return Vec::new();
         };
-        match parse_pcre_output(pattern, &output, path, data) {
+        match parse_pcre_output_with_file_bytes(pattern, &output, path, data, &file_bytes) {
             Ok((messages, halted)) => {
                 self.halted.set(halted);
                 messages
             }
-            Err(_) => Vec::new(),
+            Err(error) => fail(error),
         }
     }
 
@@ -209,6 +238,10 @@ impl Linter for ScriptAndRegexLinter {
     fn take_halt(&self) -> bool {
         self.halted.replace(false)
     }
+
+    fn take_error(&self) -> Option<String> {
+        self.error.borrow_mut().take()
+    }
 }
 
 /// Parse script `output` into messages, applying the PHP named-group rules.
@@ -222,10 +255,25 @@ pub fn parse_output_with(
     path: &str,
     data: &[u8],
 ) -> Result<Vec<LintMessage>, String> {
+    parse_output_with_file_bytes(parser, output, path, data, &|_| None)
+}
+
+/// [`parse_output_with`] with a matched-file byte supplier: `offset`
+/// groups naming another file resolve against `file_bytes(file)`
+/// (T1153 LINT-27), erroring when the file cannot be supplied, like
+/// PHP's `loadData()` failure.
+pub fn parse_output_with_file_bytes(
+    parser: OutputParser,
+    output: &str,
+    path: &str,
+    data: &[u8],
+    file_bytes: &dyn Fn(&str) -> Option<Vec<u8>>,
+) -> Result<Vec<LintMessage>, String> {
     if output.is_empty() {
         return Ok(Vec::new());
     }
-    messages_from_matches(parser(output), output, path, data).map(|(messages, _)| messages)
+    messages_from_matches(parser(output), output, path, data, file_bytes)
+        .map(|(messages, _)| messages)
 }
 
 /// Parse one compiled PCRE pattern's matches (`PREG_SET_ORDER`) into
@@ -237,6 +285,18 @@ pub fn parse_pcre_output(
     path: &str,
     data: &[u8],
 ) -> Result<(Vec<LintMessage>, bool), String> {
+    parse_pcre_output_with_file_bytes(pattern, output, path, data, &|_| None)
+}
+
+/// [`parse_pcre_output`] with a matched-file byte supplier for `offset`
+/// groups naming another file (T1153 LINT-27).
+pub fn parse_pcre_output_with_file_bytes(
+    pattern: &regex::Regex,
+    output: &str,
+    path: &str,
+    data: &[u8],
+    file_bytes: &dyn Fn(&str) -> Option<Vec<u8>>,
+) -> Result<(Vec<LintMessage>, bool), String> {
     if output.is_empty() {
         return Ok((Vec::new(), false));
     }
@@ -245,7 +305,7 @@ pub fn parse_pcre_output(
         .captures_iter(output)
         .map(|captured| match_from_captures(&captured, &known))
         .collect();
-    messages_from_matches(matches, output, path, data)
+    messages_from_matches(matches, output, path, data, file_bytes)
 }
 
 /// Read the documented named groups from one regex match.
@@ -282,12 +342,16 @@ fn match_from_captures(captured: &regex::Captures<'_>, known: &HashSet<&str>) ->
 
 /// Turn matches into `(messages, halted)`, applying the PHP per-match
 /// rules: `throw` aborts, `halt` stops everything, `stop` stops this
-/// file, `ignore` skips the match.
+/// file, `ignore` skips the match. An `offset` group resolves against
+/// the matched file's bytes (`file_bytes`, the linted bytes when the
+/// `file` group is absent or names the linted file); an unsuppliable
+/// file errors like PHP's `loadData()` failure (T1153 LINT-27).
 fn messages_from_matches(
     matches: Vec<ScriptRegexMatch>,
     output: &str,
     path: &str,
     data: &[u8],
+    file_bytes: &dyn Fn(&str) -> Option<Vec<u8>>,
 ) -> Result<(Vec<LintMessage>, bool), String> {
     let mut out = Vec::new();
     for captured in matches {
@@ -306,9 +370,22 @@ fn messages_from_matches(
         if nonempty(&captured.ignore).is_some() {
             continue;
         }
-        let (line, col) = match_line_and_char(&captured, data);
+        let file = captured.file.as_deref().unwrap_or(path);
+        let owned: Option<Vec<u8>>;
+        let match_data: &[u8] = if file == path || nonempty(&captured.offset).is_none() {
+            data
+        } else {
+            match file_bytes(file) {
+                Some(bytes) => {
+                    owned = Some(bytes);
+                    owned.as_deref().unwrap_or(data)
+                }
+                None => return Err(format!("Failed to read file '{file}'.")),
+            }
+        };
+        let (line, col) = match_line_and_char(&captured, match_data);
         out.push(LintMessage {
-            path: captured.file.as_deref().unwrap_or(path).to_string(),
+            path: file.to_string(),
             line,
             col,
             code: captured.code.as_deref().unwrap_or(CODE_DEFAULT).to_string(),
@@ -321,24 +398,25 @@ fn messages_from_matches(
                 .to_string(),
             original: captured.original.clone(),
             replacement: captured.replacement.clone(),
+            granularity: None,
+            locations: Vec::new(),
+            bypass_changed_line_filtering: None,
+            original_bytes: None,
+            replacement_bytes: None,
         });
     }
     Ok((out, false))
 }
 
-/// Severity for one match, ported exactly from `getMatchSeverity`.
-///
-/// Note the PHP quirks this preserves: when no `severity` group matched,
-/// the result is `error` without consulting the `error`/`warning`/...
-/// groups (despite the PHP docblock suggesting otherwise), and named
-/// groups beat the `severity` value only when they come earlier in map
-/// order (`error`, `warning`, `autofix`, `advice`, `disabled`).
+/// Severity for one match, ported exactly from `getMatchSeverity`
+/// (T1153 LINT-29): each map entry checks its named group first, then
+/// the `severity` value, in `error`, `warning`, `autofix`, `advice`,
+/// `disabled` order — with no `severity` group, a named group still
+/// wins; otherwise the result is `error`.
 pub fn match_severity(captured: &ScriptRegexMatch) -> &'static str {
-    let severity_name = nonempty(&captured.severity).unwrap_or("");
-    if severity_name.is_empty() {
-        return SEVERITY_ERROR;
-    }
-    let severity_name = severity_name.to_ascii_lowercase();
+    let severity_name = nonempty(&captured.severity)
+        .unwrap_or("")
+        .to_ascii_lowercase();
     let groups = [
         (&captured.error, "error", SEVERITY_ERROR),
         (&captured.warning, "warning", SEVERITY_WARNING),
@@ -357,13 +435,16 @@ pub fn match_severity(captured: &ScriptRegexMatch) -> &'static str {
     SEVERITY_ERROR
 }
 
-/// 1-based (line, col) for one match, ported from `getMatchLineAndChar`.
+/// (line, col) for one match, ported from `getMatchLineAndChar`
+/// (T1153 LINT-27).
 ///
 /// A nonempty `offset` group wins (parsed like a PHP `(int)` cast, so
-/// garbage means byte 0); otherwise `line` parses as an integer with
-/// non-positive values clamped to 1 (PHP maps 0 to 1) and missing values
-/// defaulting to 1; `char` follows PHP truthiness (`"0"` counts as absent)
-/// with the same 1-based clamping.
+/// garbage means byte 0; `data` must be the matched file's bytes, see
+/// [`parse_pcre_output_with_resolver`]); otherwise `line` parses as an
+/// integer with 0/garbage mapping to 1 (PHP's `!$line`) and missing
+/// values mapping to 0 (PHP `null`, line-less and always relevant);
+/// `char` follows PHP truthiness (`"0"` counts as absent) with missing
+/// values mapping to 0 (PHP `null`).
 pub fn match_line_and_char(captured: &ScriptRegexMatch, data: &[u8]) -> (usize, usize) {
     if let Some(offset) = nonempty(&captured.offset) {
         let byte = php_int(offset).max(0) as usize;
@@ -371,11 +452,11 @@ pub fn match_line_and_char(captured: &ScriptRegexMatch, data: &[u8]) -> (usize, 
     }
     let line = match nonempty(&captured.line) {
         Some(text) => php_int(text).max(1) as usize,
-        None => 1,
+        None => 0,
     };
     let col = match captured.char.as_deref() {
-        Some(text) if !text.is_empty() && text != "0" => php_int(text).max(1) as usize,
-        _ => 1,
+        Some(text) if !text.is_empty() && text != "0" => php_int(text).max(0) as usize,
+        _ => 0,
     };
     (line, col)
 }

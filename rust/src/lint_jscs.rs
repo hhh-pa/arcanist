@@ -185,6 +185,11 @@ pub fn parse_checkstyle_output(path: &str, stdout: &str) -> Result<Vec<LintMessa
             description: attr(&attrs, "message").to_string(),
             original: None,
             replacement: None,
+            granularity: None,
+            locations: Vec::new(),
+            bypass_changed_line_filtering: None,
+            original_bytes: None,
+            replacement_bytes: None,
         });
     }
     Ok(messages)
@@ -486,6 +491,11 @@ fn failure_message(path: &str, description: &str) -> LintMessage {
         description: description.to_string(),
         original: None,
         replacement: None,
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     }
 }
 

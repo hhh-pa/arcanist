@@ -165,6 +165,11 @@ pub fn parse_lint_xml_output(path: &str, stdout: &str) -> Result<Vec<LintMessage
             description: attr(&attrs, "reason").to_string(),
             original: Some(original_text(&attrs)),
             replacement: None,
+            granularity: None,
+            locations: Vec::new(),
+            bypass_changed_line_filtering: None,
+            original_bytes: None,
+            replacement_bytes: None,
         });
     }
     Ok(messages)
@@ -507,6 +512,11 @@ fn failure_message(path: &str, description: &str) -> LintMessage {
         description: description.to_string(),
         original: None,
         replacement: None,
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     }
 }
 

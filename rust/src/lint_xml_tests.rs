@@ -135,3 +135,14 @@ fn deep_nesting_is_rejected_not_stack_overflowing() {
     let error = check_well_formed(&data).unwrap_err();
     assert!(error.message.contains("too deep"), "{}", error.message);
 }
+
+// -( T1153 Wave 2: lint retrocompat )--------------------------------------
+
+#[test]
+fn lint21_xml_linter_always_runs_without_extension_checks() {
+    // PHP's `canRun()` gates on the libxml/simplexml extensions; the
+    // port is a dependency-free parser, so it always runs (and orsay's
+    // PHP ships both extensions, so PHP always runs there too).
+    let linter = XmlLinter::new();
+    assert!(!linter.lint_bytes("f.xml", b"<a>").is_empty());
+}

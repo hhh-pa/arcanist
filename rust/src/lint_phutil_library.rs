@@ -232,6 +232,11 @@ impl LibraryFinding {
             description: self.description.clone(),
             original: None,
             replacement: None,
+            granularity: None,
+            locations: Vec::new(),
+            bypass_changed_line_filtering: None,
+            original_bytes: None,
+            replacement_bytes: None,
         }
     }
 }
@@ -460,6 +465,11 @@ pub fn check_one_class_per_file(path: &str, data: &[u8]) -> Vec<LintMessage> {
             ),
             original: None,
             replacement: None,
+            granularity: None,
+            locations: Vec::new(),
+            bypass_changed_line_filtering: None,
+            original_bytes: None,
+            replacement_bytes: None,
         }];
     }
     if classes.len() > 1 {
@@ -479,6 +489,11 @@ pub fn check_one_class_per_file(path: &str, data: &[u8]) -> Vec<LintMessage> {
             ),
             original: None,
             replacement: None,
+            granularity: None,
+            locations: Vec::new(),
+            bypass_changed_line_filtering: None,
+            original_bytes: None,
+            replacement_bytes: None,
         }];
     }
     Vec::new()

@@ -141,6 +141,11 @@ pub fn parse_gjslint_output(path: &str, stdout: &str) -> Vec<LintMessage> {
                 description,
                 original: None,
                 replacement: None,
+                granularity: None,
+                locations: Vec::new(),
+                bypass_changed_line_filtering: None,
+                original_bytes: None,
+                replacement_bytes: None,
             });
         }
     }
@@ -270,6 +275,11 @@ fn failure_message(path: &str, description: &str) -> LintMessage {
         description: description.to_string(),
         original: None,
         replacement: None,
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     }
 }
 
