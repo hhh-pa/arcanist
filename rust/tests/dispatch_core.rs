@@ -74,6 +74,21 @@ fn core20_bare_help_renders_reference() {
 }
 
 #[test]
+fn dash_help_leads_with_usage() {
+    // RB-D5 + release smoke gate: `arc --help` leads with the one-line
+    // usage ahead of the full workflow reference.
+    let (home, repo) = fixture("dash-help");
+    let out = arc(&home, &repo, &["--help"]);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.starts_with("usage: arc [--version] [--help] <command>\n\nWORKFLOWS\n\n"),
+        "{stdout:?}"
+    );
+    assert!(text(&out.stderr).is_empty());
+}
+
+#[test]
 fn rbd5_detailed_help_for_toolset_and_classic() {
     let (home, repo) = fixture("detailed");
     let out = arc(&home, &repo, &["help", "diff", "--"]);

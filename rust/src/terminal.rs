@@ -695,7 +695,7 @@ fn php_truthy(value: Option<&str>) -> bool {
 /// dispatcher from the global `--trace` flag.
 #[must_use]
 pub fn trace_enabled() -> bool {
-    matches!(std::env::var("ARC_TRACE").as_deref(), Ok("1"))
+    crate::globals::trace_enabled()
 }
 
 /// True when console output should carry ANSI codes.
@@ -706,10 +706,8 @@ pub fn trace_enabled() -> bool {
 /// stdout-TTY probe decides.
 #[must_use]
 pub fn ansi_enabled() -> bool {
-    match std::env::var("ARC_ANSI").as_deref() {
-        Ok("0") => return false,
-        Ok("1") => return true,
-        _ => {}
+    if let Some(forced) = crate::globals::ansi_override() {
+        return forced;
     }
     let term = std::env::var("TERM").unwrap_or_default().to_lowercase();
     let term = if !php_truthy(Some(&term)) && php_truthy(std::env::var("ANSICON").ok().as_deref()) {

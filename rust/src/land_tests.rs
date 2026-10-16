@@ -4312,8 +4312,11 @@ fn land36_prune_sorts_branches_globally_natural() {
 }
 
 #[test]
+#[cfg(unix)]
 fn land9_push_reports_failure_without_capturing() {
     // The push inherits stdio and maps failure to `Push failed! ...`.
+    // Unix-only: the stub programs (`true`/`false`/`sh`) have no
+    // Windows counterparts.
     let dir = temp_dir("land9-push");
     let mut io = Io::canned(&[]);
     assert!(

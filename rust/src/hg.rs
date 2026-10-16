@@ -395,6 +395,9 @@ pub fn parse_mercurial_status_details(
     }
     let mut last_path: Option<String> = None;
     for line in trimmed.split('\n') {
+        // Real `hg` emits LF; tolerate CRLF producers (the Windows
+        // test fake shells through `cmd`, whose `echo` appends CRLF).
+        let line = line.strip_suffix('\r').unwrap_or(line);
         let bytes = line.as_bytes();
         if bytes.len() < 2 || bytes[1] != b' ' {
             return Err(format!("Unparsable Mercurial status line '{line}'."));

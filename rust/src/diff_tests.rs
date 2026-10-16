@@ -2413,6 +2413,17 @@ fn d7_amend_after_create_rewrites_git_message() {
     // Pin amendability regardless of ambient user config.
     std::fs::write(git.join(".arcconfig"), "{\"history.immutable\": false}").unwrap();
     std::fs::write(git.join("f.txt"), "a\n").unwrap();
+    // Repo-local identity for both the seed commit and the later amend
+    // (one-shot `-c` would not cover the amend on machines without a
+    // global identity, like CI runners).
+    for (key, value) in [("user.name", "t"), ("user.email", "t@t")] {
+        let set = std::process::Command::new("git")
+            .current_dir(&git)
+            .args(["config", key, value])
+            .status()
+            .unwrap();
+        assert!(set.success());
+    }
     let add = std::process::Command::new("git")
         .current_dir(&git)
         .args(["add", "-A"])
@@ -2421,15 +2432,7 @@ fn d7_amend_after_create_rewrites_git_message() {
     assert!(add.success());
     let commit = std::process::Command::new("git")
         .current_dir(&git)
-        .args([
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qam",
-            "old",
-        ])
+        .args(["commit", "-qam", "old"])
         .status()
         .unwrap();
     assert!(commit.success());

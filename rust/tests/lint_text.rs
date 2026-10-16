@@ -597,6 +597,12 @@ fn lint4_unreadable_file_aggregates_to_exit_1() {
     let locked = tmp.write("locked.txt", "x\n");
     tmp.write("ok.txt", "ok\n");
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&locked).is_ok() {
+        // Privileged runner (e.g. root in CI containers): permission
+        // bits do not block reads, so the failure under test cannot
+        // trigger.
+        return;
+    }
     // T1153 LINT-4/LINT-20: any linter failure aggregates to exit 1 with
     // nothing rendered (the `Some linters failed:` envelope shows above).
     assert_eq!(code(run_in(tmp.path(), &["locked.txt", "ok.txt"])), Some(1));

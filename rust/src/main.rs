@@ -766,32 +766,24 @@ fn validate_runtime_config(
     set_config::parse_runtime_config(pairs).map_err(GlobalError::red)
 }
 
-/// Apply globals to the process environment channels the commands
-/// read (`ARC_TRACE`, `ARC_ANSI`, `ARC_GLOBAL_CONDUIT_*`,
-/// `ARC_ANONYMOUS`, `ARC_GLOBAL_LOAD_OPTIONS`). Only `main` calls
-/// this; `dispatch` stays free of process-global writes so unit tests
-/// stay hermetic.
+/// Apply globals to the [`globals`] cells the commands read. Only
+/// `main` calls this; `dispatch` stays free of process-global writes
+/// so unit tests stay hermetic.
 fn apply_globals(globals: &Globals) -> Result<(), GlobalError> {
-    // SAFETY: `main` is single-threaded here; no other thread can
-    // observe the environment while globals are applied.
-    unsafe {
-        if globals.trace {
-            std::env::set_var("ARC_TRACE", "1");
-        }
-        match globals.ansi {
-            Some(true) => std::env::set_var("ARC_ANSI", "1"),
-            Some(false) => std::env::set_var("ARC_ANSI", "0"),
-            None => {}
-        }
-        if let Some(uri) = &globals.conduit_uri {
-            std::env::set_var("ARC_GLOBAL_CONDUIT_URI", uri);
-        }
-        if let Some(token) = &globals.conduit_token {
-            std::env::set_var("ARC_GLOBAL_CONDUIT_TOKEN", token);
-        }
-        if globals.anonymous {
-            std::env::set_var("ARC_ANONYMOUS", "1");
-        }
+    if globals.trace {
+        arc_rs::globals::set_trace(true);
+    }
+    if let Some(ansi) = globals.ansi {
+        arc_rs::globals::set_ansi(ansi);
+    }
+    if let Some(uri) = &globals.conduit_uri {
+        arc_rs::globals::set_conduit_uri(uri.clone());
+    }
+    if let Some(token) = &globals.conduit_token {
+        arc_rs::globals::set_conduit_token(token.clone());
+    }
+    if globals.anonymous {
+        arc_rs::globals::set_anonymous(true);
     }
     if !globals.config.is_empty()
         || !globals.config_files.is_empty()
@@ -803,10 +795,7 @@ fn apply_globals(globals: &Globals) -> Result<(), GlobalError> {
             "config_files": globals.config_files,
             "arcrc_file": globals.arcrc_file,
         });
-        // SAFETY: `main` is single-threaded here (see above).
-        unsafe {
-            std::env::set_var("ARC_GLOBAL_LOAD_OPTIONS", doc.to_string());
-        }
+        arc_rs::globals::set_load_options(doc.to_string());
     }
     Ok(())
 }
@@ -2760,11 +2749,15 @@ fn dispatch(argv: &[String]) -> ExitCode {
 /// this after alias expansion (which needs the stripped argv); the
 /// flags must flow through instead of being re-stripped, since
 /// re-stripping would lose `--help`/`--show-standard-options`.
+/// `arc --help` leads with the one-line usage (the release smoke
+/// test greps it) ahead of the full workflow reference (RB-D5).
+const BARE_HELP_LEAD: &str = "usage: arc [--version] [--help] <command>\n\n";
+
 fn dispatch_inner(argv: &[String], globals: &Globals) -> ExitCode {
     if argv.is_empty() {
         if globals.show_help {
             print!(
-                "{}",
+                "{BARE_HELP_LEAD}{}",
                 render_help_bare(globals.show_standard_options, terminal::ansi_enabled())
             );
             return ExitCode::SUCCESS;
@@ -2800,7 +2793,7 @@ fn dispatch_inner(argv: &[String], globals: &Globals) -> ExitCode {
     match classify(argv) {
         Action::Help => {
             print!(
-                "{}",
+                "{BARE_HELP_LEAD}{}",
                 render_help_bare(globals.show_standard_options, terminal::ansi_enabled())
             );
             ExitCode::SUCCESS
@@ -2832,12 +2825,8 @@ fn dispatch_inner(argv: &[String], globals: &Globals) -> ExitCode {
                     }
                     if is_classic_command(name) {
                         // The classic subprocess exports the resolved
-                        // command for hooks (`scripts/arcanist.php`).
-                        // SAFETY: dispatch is single-threaded; the classic
-                        // subprocess exports this same variable.
-                        unsafe {
-                            std::env::set_var("ARCANIST", name);
-                        }
+                        // command for hooks (`scripts/arcanist.php:229`).
+                        arc_rs::globals::set_command_name(name.to_string());
                     }
                     let runner: Option<CommandFn> = match name {
                         "help" => None,

@@ -704,17 +704,24 @@ fn linters_l26_probe_honors_configured_bin() {
     assert_eq!(error.class, "ArcanistMissingLinterException");
     assert!(error.message.contains("/definitely/not/a/flake8-binary"));
     // The `.arclint` `bin` reaches the configured set without probing.
+    // The bin must be absolute on every platform (a bare `/...` is
+    // drive-relative on Windows and resolves against the project root).
+    let bin = if cfg!(windows) {
+        "C:/custom/flake8"
+    } else {
+        "/custom/flake8"
+    };
     let dir = std::env::temp_dir().join(format!("linters-bin-{}", std::process::id()));
     std::fs::create_dir_all(dir.join(".git")).unwrap();
     std::fs::write(
         dir.join(".arclint"),
-        r#"{"linters": {"py": {"type": "flake8", "bin": "/custom/flake8"}}}"#,
+        format!(r#"{{"linters": {{"py": {{"type": "flake8", "bin": "{bin}"}}}}}}"#),
     )
     .unwrap();
     let configured = configured_linters(&dir).unwrap();
     assert_eq!(configured.len(), 1);
     assert_eq!(configured[0].class, "ArcanistFlake8Linter");
-    assert_eq!(configured[0].bin, Some("/custom/flake8".to_string()));
+    assert_eq!(configured[0].bin, Some(bin.to_string()));
     std::fs::remove_dir_all(&dir).ok();
 }
 

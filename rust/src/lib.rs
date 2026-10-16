@@ -20,6 +20,7 @@ pub mod download;
 pub mod export;
 pub mod get_config;
 pub mod git;
+pub mod globals;
 pub mod grid;
 pub mod hg;
 pub mod inspect;

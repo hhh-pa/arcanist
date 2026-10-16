@@ -1630,10 +1630,11 @@ fn explicit_paths_must_exist_and_stay_unwalked() {
     )
     .unwrap();
     // T1153 LINT-9: CLI order is kept (never sorted); directories pass
-    // through unlisted.
+    // through unlisted. Display paths use the platform separator.
+    let sep = std::path::MAIN_SEPARATOR;
     assert_eq!(files.len(), 2);
-    assert_eq!(files[0].1, "sub/file.txt");
-    assert_eq!(files[1].1, "sub/empty");
+    assert_eq!(files[0].1, format!("sub{sep}file.txt"));
+    assert_eq!(files[1].1, format!("sub{sep}empty"));
     assert_eq!(files[0].0, file);
     assert_eq!(
         collect_explicit(&["nope.txt".to_string()], tmp.path(), tmp.path()).unwrap_err(),
@@ -1964,6 +1965,12 @@ fn lint20_unreadable_files_fold_into_the_aggregate() {
     let locked = tmp.write("locked.txt", "x\n");
     tmp.write("ok.txt", "ok\n");
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&locked).is_ok() {
+        // Privileged runner (e.g. root in CI containers): permission
+        // bits do not block reads, so the failure under test cannot
+        // trigger.
+        return;
+    }
     let work = WorkCopy {
         vcs: Vcs::Git,
         vcs_root: tmp.path().to_path_buf(),

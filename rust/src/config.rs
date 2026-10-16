@@ -99,12 +99,12 @@ pub fn credentials_for(
     conduit_uri: &str,
     force_token: Option<&str>,
 ) -> Credentials {
-    let global_token = std::env::var("ARC_GLOBAL_CONDUIT_TOKEN").ok();
+    let global_token = crate::globals::conduit_token();
     let env_token = std::env::var("ARC_CONDUIT_TOKEN").ok();
     let force_token = force_token
         .or(global_token.as_deref())
         .or(env_token.as_deref());
-    let anonymous = matches!(std::env::var("ARC_ANONYMOUS").as_deref(), Ok("1"));
+    let anonymous = crate::globals::anonymous();
     let text = user_file.and_then(|path| std::fs::read_to_string(path).ok());
     let file_token = text
         .as_deref()
@@ -131,7 +131,7 @@ pub fn credentials_for(
 /// default (no overrides); only the dispatcher writes this channel.
 #[must_use]
 pub fn global_load_options() -> get_config::LoadOptions {
-    let Ok(raw) = std::env::var("ARC_GLOBAL_LOAD_OPTIONS") else {
+    let Some(raw) = crate::globals::load_options() else {
         return get_config::LoadOptions::default();
     };
     let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw) else {
@@ -256,7 +256,7 @@ fn build_client(
     // Precedence: explicit flag, global `--conduit-uri` (T1153 CORE-11,
     // delivered via `ARC_GLOBAL_CONDUIT_URI`), `ARC_CONDUIT_URI`, merged
     // config. Empty values fall through like PHP's falsy checks.
-    let global_uri = std::env::var("ARC_GLOBAL_CONDUIT_URI").ok();
+    let global_uri = crate::globals::conduit_uri();
     let uri = conduit_uri
         .map(str::to_string)
         .filter(|uri| !uri.trim().is_empty())
@@ -413,7 +413,7 @@ pub fn authed_client_for(
             .map_err(ClassifiedError::exception)?;
     let creds = credentials_for(user.as_deref(), client.base_uri(), None);
     if !creds.has_any() {
-        let global_uri = std::env::var("ARC_GLOBAL_CONDUIT_URI").ok();
+        let global_uri = crate::globals::conduit_uri();
         let forced = conduit_uri
             .filter(|uri| !uri.trim().is_empty())
             .or(global_uri.as_deref());
