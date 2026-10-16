@@ -231,12 +231,20 @@ fn verbose_help_goes_through_console_wrap() {
 }
 
 #[test]
-fn project_config_walks_up_and_validates() {
+fn project_config_reads_vcs_root_and_validates() {
+    // CORE-33: git reads `.arcconfig` only at the working-copy root; a
+    // subdir file is invisible, and so is any file outside a repository.
     let tmp = TempDir::new("project");
     let child = tmp.path.join("a").join("b");
     std::fs::create_dir_all(&child).unwrap();
+    std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
     std::fs::write(
         tmp.path.join("a").join(".arcconfig"),
+        r#"{"phabricator.uri": "https://sub.example/"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path.join(".arcconfig"),
         r#"{"phabricator.uri": "https://x.example/"}"#,
     )
     .unwrap();
@@ -246,7 +254,13 @@ fn project_config_walks_up_and_validates() {
         map["phabricator.uri"],
         serde_json::json!("https://x.example/")
     );
-    let (none, empty) = read_project_config(&tmp.path).unwrap();
+    let plain = TempDir::new("plain");
+    std::fs::write(
+        plain.path.join(".arcconfig"),
+        r#"{"phabricator.uri": "https://plain.example/"}"#,
+    )
+    .unwrap();
+    let (none, empty) = read_project_config(&plain.path).unwrap();
     assert!(none.is_none() && empty.is_empty());
 
     std::fs::write(tmp.path.join(".arcconfig"), "not json").unwrap();
@@ -358,6 +372,8 @@ fn system_file_missing_is_empty_and_invalid_fails() {
 #[test]
 fn resolution_follows_source_precedence() {
     let tmp = TempDir::new("resolve");
+    // CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
     std::fs::write(
         tmp.path.join(".arcconfig"),
         r#"{"editor": "proj", "browser": "proj"}"#,
@@ -394,6 +410,8 @@ fn resolution_follows_source_precedence() {
 #[test]
 fn project_legacy_names_apply() {
     let tmp = TempDir::new("legacy");
+    // CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
     std::fs::write(
         tmp.path.join(".arcconfig"),
         r#"{"conduit_uri": "https://old.example/"}"#,
@@ -410,6 +428,8 @@ fn project_legacy_names_apply() {
 #[test]
 fn brief_render_matches_php_bytes() {
     let tmp = TempDir::new("brief");
+    // CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
     std::fs::write(tmp.path.join(".arcconfig"), r#"{"editor": "nano"}"#).unwrap();
     let sources = load_sources(&tmp.path, None).unwrap();
     assert_eq!(
@@ -430,6 +450,8 @@ fn brief_render_matches_php_bytes() {
 #[test]
 fn verbose_render_matches_php_bytes() {
     let tmp = TempDir::new("verbose");
+    // CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
     std::fs::write(tmp.path.join(".arcconfig"), r#"{"editor": "nano"}"#).unwrap();
     let sources = load_sources(&tmp.path, None).unwrap();
     // Source labels keep PHP's lowercase names; the example row prints
@@ -503,7 +525,10 @@ fn args_accept_flags_separator_and_help() {
         parse_args(&[]).unwrap().unwrap(),
         Options {
             show_source: false,
-            keys: vec![]
+            keys: vec![],
+            config: vec![],
+            config_files: vec![],
+            arcrc_file: None,
         }
     );
     assert!(
@@ -525,4 +550,242 @@ fn args_accept_flags_separator_and_help() {
         .unwrap();
     assert_eq!(opts.keys, ["--weird"]);
     assert!(parse_args(&["--bogus".to_string()]).is_err());
+}
+
+#[test]
+fn r6_core33_find_vcs_root_prefers_innermost_git_first() {
+    let tmp = TempDir::new("vcsroot");
+    assert_eq!(find_vcs_root(&tmp.path), None);
+    // Innermost level wins.
+    let outer = tmp.path.join("outer");
+    let inner = outer.join("inner");
+    std::fs::create_dir_all(inner.join(".hg")).unwrap();
+    std::fs::create_dir_all(outer.join(".git")).unwrap();
+    assert_eq!(find_vcs_root(&inner), Some((VcsKind::Hg, inner.clone())));
+    assert_eq!(find_vcs_root(&outer), Some((VcsKind::Git, outer.clone())));
+    // `.git` wins over `.hg`/`.svn` in one directory, like PHP's `$try`.
+    std::fs::create_dir_all(inner.join(".git")).unwrap();
+    std::fs::create_dir_all(inner.join(".svn")).unwrap();
+    assert_eq!(find_vcs_root(&inner), Some((VcsKind::Git, inner.clone())));
+    // A `.git` file (worktree/submodule pointer) counts like PHP's
+    // `pathExists()`.
+    let work = tmp.path.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join(".git"), "gitdir: /elsewhere\n").unwrap();
+    assert_eq!(find_vcs_root(&work), Some((VcsKind::Git, work)));
+}
+
+#[test]
+fn r6_core34_merged_value_precedence() {
+    let mut sources = empty_sources();
+    sources
+        .system
+        .insert("k".to_string(), serde_json::json!("system"));
+    sources
+        .user
+        .insert("k".to_string(), serde_json::json!("user"));
+    sources
+        .project
+        .insert("k".to_string(), serde_json::json!("project"));
+    sources
+        .local
+        .insert("k".to_string(), serde_json::json!("local"));
+    let plain = MergedConfig {
+        sources,
+        runtime: serde_json::Map::new(),
+    };
+    assert_eq!(
+        merged_value("k", &plain).unwrap(),
+        ("local", serde_json::json!("local"))
+    );
+    let mut runtime = serde_json::Map::new();
+    runtime.insert("k".to_string(), serde_json::json!("runtime"));
+    let with_runtime = MergedConfig {
+        sources: plain.sources,
+        runtime,
+    };
+    assert_eq!(
+        merged_value("k", &with_runtime).unwrap(),
+        (SOURCE_RUNTIME, serde_json::json!("runtime"))
+    );
+    assert!(merged_value("never-set", &with_runtime).is_none());
+    // Project legacy names still resolve through the merge.
+    let mut legacy = empty_sources();
+    legacy.project.insert(
+        "conduit_uri".to_string(),
+        serde_json::json!("https://old.example/"),
+    );
+    let merged = MergedConfig {
+        sources: legacy,
+        runtime: serde_json::Map::new(),
+    };
+    assert_eq!(
+        merged_value("phabricator.uri", &merged).unwrap().0,
+        "project"
+    );
+}
+
+#[test]
+fn r6_core34_checked_value_type_errors() {
+    let mut sources = empty_sources();
+    sources
+        .project
+        .insert("editor".to_string(), serde_json::json!(42));
+    let merged = MergedConfig {
+        sources,
+        runtime: serde_json::Map::new(),
+    };
+    assert_eq!(
+        checked_value("editor", &merged).unwrap_err(),
+        "Type of setting 'editor' must be string."
+    );
+    let mut sources = empty_sources();
+    sources
+        .user
+        .insert("history.immutable".to_string(), serde_json::json!("yes"));
+    let merged = MergedConfig {
+        sources,
+        runtime: serde_json::Map::new(),
+    };
+    assert_eq!(
+        checked_value("history.immutable", &merged).unwrap_err(),
+        "Type of setting 'history.immutable' must be boolean."
+    );
+    // A bad lower value errors even below a valid winner, like PHP's
+    // `getConfigFromAllSources()`.
+    let mut sources = empty_sources();
+    sources
+        .local
+        .insert("load".to_string(), serde_json::json!(["ok"]));
+    sources
+        .user
+        .insert("load".to_string(), serde_json::json!("nope"));
+    let merged = MergedConfig {
+        sources,
+        runtime: serde_json::Map::new(),
+    };
+    assert_eq!(
+        checked_value("load", &merged).unwrap_err(),
+        "Type of setting 'load' must be list."
+    );
+    // JSON objects pass `list`: PHP decodes to associative arrays.
+    let mut sources = empty_sources();
+    sources
+        .project
+        .insert("load".to_string(), serde_json::json!({"a": "b"}));
+    let merged = MergedConfig {
+        sources,
+        runtime: serde_json::Map::new(),
+    };
+    assert_eq!(
+        checked_value("load", &merged).unwrap().unwrap().0,
+        "project"
+    );
+    // Builtin defaults read unchecked.
+    let merged = MergedConfig {
+        sources: empty_sources(),
+        runtime: serde_json::Map::new(),
+    };
+    assert_eq!(
+        checked_value("arc.autostash", &merged).unwrap().unwrap(),
+        ("default", serde_json::json!(false))
+    );
+}
+
+#[test]
+fn r6_core34_config_file_shadows_system_user() {
+    let tmp = TempDir::new("conffile");
+    let user_file = tmp.path.join("arcrc.json");
+    std::fs::write(&user_file, r#"{"config": {"editor": "user"}}"#).unwrap();
+    let first = tmp.path.join("first.json");
+    let second = tmp.path.join("second.json");
+    std::fs::write(&first, r#"{"editor": "first"}"#).unwrap();
+    std::fs::write(&second, r#"{"editor": "second"}"#).unwrap();
+    // Without `--config-file`, the user value shows.
+    let merged = load_merged(&tmp.path, Some(&user_file), &LoadOptions::default()).unwrap();
+    assert_eq!(merged.sources.user["editor"], serde_json::json!("user"));
+    // With `--config-file`s, user+system go empty and later files win.
+    let opts = LoadOptions {
+        config_files: vec![first, second, tmp.path.join("missing.json")],
+        ..Default::default()
+    };
+    let merged = load_merged(&tmp.path, Some(&user_file), &opts).unwrap();
+    assert!(merged.sources.user.is_empty());
+    assert_eq!(
+        merged_value("editor", &merged).unwrap(),
+        ("system", serde_json::json!("second"))
+    );
+}
+
+#[test]
+fn r6_core34_arcrc_file_redirects_user_source() {
+    let tmp = TempDir::new("arcrcfile");
+    let custom = tmp.path.join("custom.json");
+    std::fs::write(&custom, r#"{"config": {"editor": "custom"}}"#).unwrap();
+    let opts = LoadOptions {
+        arcrc_file: Some(custom),
+        ..Default::default()
+    };
+    let merged = load_merged(&tmp.path, None, &opts).unwrap();
+    assert_eq!(
+        merged_value("editor", &merged).unwrap(),
+        ("user", serde_json::json!("custom"))
+    );
+    // A missing custom file errors, like PHP's
+    // `setUserConfigurationFileLocation()`.
+    let missing = LoadOptions {
+        arcrc_file: Some(tmp.path.join("nope.json")),
+        ..Default::default()
+    };
+    assert_eq!(
+        load_merged(&tmp.path, None, &missing).unwrap_err(),
+        "Custom arcrc file was specified, but it was not found!"
+    );
+    assert_eq!(
+        resolve_user_file(None, Some(Path::new("nope.json"))).unwrap_err(),
+        "Custom arcrc file was specified, but it was not found!"
+    );
+}
+
+#[test]
+fn r6_core34_runtime_excluded_from_display() {
+    // Stock `get-config` never shows `--config` values: display reads the
+    // static sources only.
+    let mut runtime = serde_json::Map::new();
+    runtime.insert("editor".to_string(), serde_json::json!("rt"));
+    runtime.insert("zzz-unknown".to_string(), serde_json::json!("rt"));
+    let merged = MergedConfig {
+        sources: empty_sources(),
+        runtime,
+    };
+    assert_eq!(merged_value("editor", &merged).unwrap().0, SOURCE_RUNTIME);
+    assert!(current_value("editor", &merged.sources).is_none());
+    assert!(!all_keys(&merged.sources).contains(&"zzz-unknown".to_string()));
+    let text = render_ansi("editor", &merged.sources, true, false);
+    assert!(text.contains("Current Value: -"), "{text}");
+    assert!(!text.contains("\"rt\""), "{text}");
+}
+
+#[test]
+fn r6_core34_cli_flags_parse_both_forms() {
+    let opts = parse_args(&[
+        "--config".to_string(),
+        "a=1".to_string(),
+        "--config=b=2".to_string(),
+        "--config-file".to_string(),
+        "f".to_string(),
+        "--arcrc-file=g".to_string(),
+    ])
+    .unwrap()
+    .unwrap();
+    assert_eq!(opts.config, ["a=1", "b=2"]);
+    assert_eq!(opts.config_files, ["f"]);
+    assert_eq!(opts.arcrc_file.as_deref(), Some("g"));
+    assert!(parse_args(&["--config".to_string()]).is_err());
+    let cli = load_options_from_cli(&opts.config, &opts.config_files, opts.arcrc_file.as_deref())
+        .unwrap();
+    assert_eq!(cli.runtime["a"], serde_json::json!("1"));
+    assert_eq!(cli.config_files, [PathBuf::from("f")]);
+    assert_eq!(cli.arcrc_file, Some(PathBuf::from("g")));
+    assert!(load_options_from_cli(&["lone".to_string()], &[], None).is_err());
 }

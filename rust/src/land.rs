@@ -110,14 +110,14 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use arc_rs::{config, diff_submit, git, hg, land_checks, revision};
+use arc_rs::{config, diff_submit, get_config, git, hg, land_checks, revision};
 
 use crate::terminal::{self, TVal};
 
 /// Subcommand name, matching `arc land`.
 pub const NAME: &str = "land";
 
-const USAGE: &str = "usage: arc land [--hold] [--keep-branches] [--onto-remote REMOTE] [--onto BRANCH] [--strategy NAME] [--revision REV] [--preview] [--into REF] [--into-remote REMOTE] [--into-local] [--into-empty] [--incremental] [--pick] [--conduit-uri URI] [-- ref ...]\n";
+const USAGE: &str = "usage: arc land [--hold] [--keep-branches] [--onto-remote REMOTE] [--onto BRANCH] [--strategy NAME] [--revision REV] [--preview] [--into REF] [--into-remote REMOTE] [--into-local] [--into-empty] [--incremental] [--pick] [--conduit-uri URI] [--config K=V] [--config-file FILE] [--arcrc-file FILE] [-- ref ...]\n";
 
 /// `user.whoami` Conduit method; the result's `phid` is the viewer PHID
 /// (`src/workflow/ArcanistWorkflow.php:489-494`).
@@ -184,6 +184,12 @@ pub struct Options {
     /// Conduit URI override (global `--conduit-uri`,
     /// `src/workflow/ArcanistWorkflow.php:304-310`).
     pub conduit_uri: Option<String>,
+    /// Runtime `--config key=value` pairs (highest-precedence source).
+    pub config: Vec<String>,
+    /// `--config-file` paths (replace the system/user sources).
+    pub config_file: Vec<String>,
+    /// `--arcrc-file` path (replaces `~/.arcrc`).
+    pub arcrc_file: Option<String>,
     /// Canonical long flag names in first-provision order (PHP `$dict`
     /// insertion order, `ArcanistWorkflow.php:791-884`). Empty for
     /// hand-built options, which skip the order-dependent checks.
@@ -200,6 +206,9 @@ enum ValueFlag {
     Into,
     IntoRemote,
     ConduitUri,
+    Config,
+    ConfigFile,
+    ArcrcFile,
 }
 
 /// A boolean `land` flag.
@@ -296,6 +305,18 @@ const FLAG_SPECS: &[FlagSpec] = &[
         long: "conduit-uri",
         flag: Flag::Value(ValueFlag::ConduitUri),
     },
+    FlagSpec {
+        long: "config",
+        flag: Flag::Value(ValueFlag::Config),
+    },
+    FlagSpec {
+        long: "config-file",
+        flag: Flag::Value(ValueFlag::ConfigFile),
+    },
+    FlagSpec {
+        long: "arcrc-file",
+        flag: Flag::Value(ValueFlag::ArcrcFile),
+    },
 ];
 
 /// Find a spec by long name (`--onto`).
@@ -314,6 +335,9 @@ fn store_value_flag(options: &mut Options, flag: ValueFlag, value: String) {
         ValueFlag::Into => options.into = Some(value),
         ValueFlag::IntoRemote => options.into_remote = Some(value),
         ValueFlag::ConduitUri => options.conduit_uri = Some(value),
+        ValueFlag::Config => options.config.push(value),
+        ValueFlag::ConfigFile => options.config_file.push(value),
+        ValueFlag::ArcrcFile => options.arcrc_file = Some(value),
     }
 }
 
@@ -1460,17 +1484,22 @@ fn detect_vcs(dir: &Path) -> Option<Vcs> {
     None
 }
 
-/// Read one `.arcconfig` value, walking toward the filesystem root.
-///
-/// Later (nearer) files win; the first file defining `key` provides it.
-/// Mirrors the project half of `config::discover_from()`, generalized to
-/// any key.
-fn arcconfig_value(dir: &Path, key: &str) -> Option<serde_json::Value> {
-    dir.ancestors().find_map(|ancestor| {
-        let text = std::fs::read_to_string(ancestor.join(".arcconfig")).ok()?;
-        let doc: serde_json::Value = serde_json::from_str(&text).ok()?;
-        doc.get(key).cloned()
-    })
+/// Read one `arc.land.*` value through the full source merge (runtime
+/// `--config` > local > project > user > system > default), mirroring
+/// `ArcanistLandEngine::get*FromConfiguration()` → `getConfig()`.
+fn land_config_value(
+    options: &Options,
+    dir: &Path,
+    key: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let cli = get_config::load_options_from_cli(
+        &options.config,
+        &options.config_file,
+        options.arcrc_file.as_deref(),
+    )?;
+    let user_file = config::arcrc_path();
+    let merged = get_config::load_merged(dir, user_file.as_deref(), &cli)?;
+    Ok(get_config::merged_value(key, &merged).map(|(_, value)| value))
 }
 
 /// Parse an `arc.land.onto` configuration value: one string or a list of
@@ -1769,7 +1798,7 @@ fn validate_options(options: &Options, dir: &Path, io: &mut Io) -> Result<Valida
             "Arguments \"--into\" and \"--into-empty\" are mutually exclusive.".to_string(),
         );
     }
-    let strategy_config = arcconfig_value(dir, "arc.land.strategy")
+    let strategy_config = land_config_value(options, dir, "arc.land.strategy")?
         .as_ref()
         .and_then(parse_string_config);
     let (strategy, line) = select_strategy_with_ansi(
@@ -1797,7 +1826,7 @@ struct Validated {
 }
 
 /// Resolve the conduit URI: the flag, `ARC_CONDUIT_URI`, or the
-/// `.arcconfig` walk-up from `dir` (like the diff port's
+/// merged-config discovery from `dir` (like the diff port's
 /// `discover_from(&dir)`, not the process working directory).
 pub fn resolve_conduit_uri(conduit_uri: Option<&str>, dir: &Path) -> Option<String> {
     conduit_uri
@@ -1806,8 +1835,22 @@ pub fn resolve_conduit_uri(conduit_uri: Option<&str>, dir: &Path) -> Option<Stri
         .or_else(|| config::discover_from(dir))
 }
 
-/// Resolve the conduit URI (flag, `ARC_CONDUIT_URI`, or `.arcconfig`
-/// walk-up from `dir`) and build an authenticated client from `~/.arcrc`.
+/// [`resolve_conduit_uri`] with an explicit user file and
+/// [`get_config::LoadOptions`].
+pub fn resolve_conduit_uri_with(
+    conduit_uri: Option<&str>,
+    dir: &Path,
+    user_file: Option<&Path>,
+    opts: &get_config::LoadOptions,
+) -> Option<String> {
+    conduit_uri
+        .map(str::to_string)
+        .or_else(|| std::env::var("ARC_CONDUIT_URI").ok())
+        .or_else(|| config::discover_uri_with(dir, user_file, opts))
+}
+
+/// Resolve the conduit URI (flag, `ARC_CONDUIT_URI`, or merged-config
+/// discovery from `dir`) and build an authenticated client from `~/.arcrc`.
 ///
 /// Mirrors [`config::client_for`], but discovers from the target working
 /// copy — like the diff port (`discover_from(&dir)`) — instead of the
@@ -1825,6 +1868,31 @@ pub fn client_for_dir(
         .and_then(|path| config::token_for_file(&path, &uri))
         .ok_or_else(|| format!("no token for {uri} in ~/.arcrc"))?;
     arc_rs::conduit::Client::new(&uri, &token).map_err(|e| e.to_string())
+}
+
+/// [`client_for_dir`] with an explicit user file and
+/// [`get_config::LoadOptions`], so `--config`/`--config-file`/
+/// `--arcrc-file` reach conduit setup like stock PHP.
+pub fn client_for_dir_with(
+    conduit_uri: Option<&str>,
+    dir: &Path,
+    user_file: Option<&Path>,
+    opts: &get_config::LoadOptions,
+) -> Result<arc_rs::conduit::Client, String> {
+    config::client_for_with(conduit_uri, dir, user_file, opts)
+}
+
+/// Config overrides for a land run: parsed `--config`/`--config-file`/
+/// `--arcrc-file` plus the default user file.
+fn load_options_for_run(
+    options: &Options,
+) -> Result<(get_config::LoadOptions, Option<PathBuf>), String> {
+    let cli = get_config::load_options_from_cli(
+        &options.config,
+        &options.config_file,
+        options.arcrc_file.as_deref(),
+    )?;
+    Ok((cli, config::arcrc_path()))
 }
 
 /// Note printed when Conduit is unavailable and revision discovery is
@@ -3293,7 +3361,7 @@ fn git_new_onto_remote(
         );
         return Ok(remote.to_string());
     }
-    if let Some(remote) = arcconfig_value(dir, "arc.land.onto-remote")
+    if let Some(remote) = land_config_value(options, dir, "arc.land.onto-remote")?
         .as_ref()
         .and_then(parse_string_config)
     {
@@ -3367,7 +3435,7 @@ pub fn git_select_onto_refs(
         );
         return Ok(options.onto.clone());
     }
-    if let Some(value) = arcconfig_value(dir, "arc.land.onto") {
+    if let Some(value) = land_config_value(options, dir, "arc.land.onto")? {
         let onto = parse_onto_config(&value);
         if !onto.is_empty() {
             io.push_status(
@@ -4929,7 +4997,7 @@ pub fn hg_select_onto_remote_with(
             &format!("Remote \"{remote}\" was selected with the \"--onto-remote\" flag."),
         );
         remote.to_string()
-    } else if let Some(remote) = arcconfig_value(dir, "arc.land.onto-remote")
+    } else if let Some(remote) = land_config_value(options, dir, "arc.land.onto-remote")?
         .as_ref()
         .and_then(parse_string_config)
     {
@@ -4972,7 +5040,7 @@ pub fn hg_select_onto_refs(
         );
         return Ok(options.onto.clone());
     }
-    if let Some(value) = arcconfig_value(dir, "arc.land.onto") {
+    if let Some(value) = land_config_value(options, dir, "arc.land.onto")? {
         let onto = parse_onto_config(&value);
         if !onto.is_empty() {
             io.push_status(
@@ -6167,7 +6235,13 @@ fn execute_engine(
     let squash = validated.strategy == Strategy::Squash;
     let mut prep = prepare_engine_commits(dir, options, vcs, io)?;
     // Conduit: online discovery, or the offline single set with a note.
-    let client = client_for_dir(options.conduit_uri.as_deref(), dir);
+    let (cli, user_file) = load_options_for_run(options)?;
+    let client = client_for_dir_with(
+        options.conduit_uri.as_deref(),
+        dir,
+        user_file.as_deref(),
+        &cli,
+    );
     let online = client.as_ref().ok();
     announce_offline_fallback(io, &client);
     let mut sets = build_sets(
@@ -6314,7 +6388,13 @@ fn confirm_gates_if_online(
     let call = |method: &str, params: &serde_json::Value| {
         client.call(method, params).map_err(|e| e.to_string())
     };
-    let uri = resolve_conduit_uri(options.conduit_uri.as_deref(), dir);
+    let (cli, user_file) = load_options_for_run(options)?;
+    let uri = resolve_conduit_uri_with(
+        options.conduit_uri.as_deref(),
+        dir,
+        user_file.as_deref(),
+        &cli,
+    );
     confirm_online_gates(io, &call, sets, commits, uri.as_deref())
 }
 
@@ -7578,8 +7658,12 @@ pub fn execute_with_io(dir: &Path, argv: &[String], io: &mut Io) -> Result<Out, 
             Vcs::Git => ".git",
             Vcs::Hg => ".hg",
         };
+        let user_path = get_config::resolve_user_file(
+            config::arcrc_path(),
+            options.arcrc_file.as_deref().map(Path::new),
+        )?;
         io.config_writer = Some(ConfigWriter {
-            user_path: config::arcrc_path(),
+            user_path,
             local_path: Some(dir.join(metadata).join("arc").join("config")),
         });
     }

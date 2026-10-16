@@ -1,8 +1,11 @@
 //! Conduit endpoint and credential discovery, mirroring `ArcanistRuntime`:
-//! the URI comes from `--conduit-uri`, `ARC_CONDUIT_URI`, or a `.arcconfig`
-//! walk-up; tokens come from `~/.arcrc` host entries.
+//! the URI comes from `--conduit-uri`, `ARC_CONDUIT_URI`, or the merged
+//! config (`phabricator.uri`, falling back to `default`); tokens come
+//! from the user file's host entries.
 
 use std::path::{Path, PathBuf};
+
+use crate::get_config;
 
 pub fn arcrc_path() -> Option<PathBuf> {
     let home = if cfg!(windows) {
@@ -37,30 +40,72 @@ pub fn discover_conduit_uri() -> Option<String> {
     discover_from(&std::env::current_dir().ok()?)
 }
 
+/// Discover the conduit URI from `dir`: merged `phabricator.uri` (any
+/// source, including the project legacy `conduit_uri`), else merged
+/// `default`, mirroring the ceb resolution (`scripts/arcanist.php` for
+/// classic workflows, `ArcanistRuntime::newConduitEngine()` for toolset
+/// ones). Lenient: unreadable sources and type mismatches read empty;
+/// commands that can surface errors read through
+/// [`get_config::checked_value`] instead.
 pub fn discover_from(dir: &Path) -> Option<String> {
-    dir.ancestors().find_map(|dir| {
-        let text = std::fs::read_to_string(dir.join(".arcconfig")).ok()?;
-        serde_json::from_str::<serde_json::Value>(&text)
-            .ok()?
-            .get("phabricator.uri")?
-            .as_str()
-            .map(str::to_string)
-    })
+    let user_file = arcrc_path();
+    discover_uri_with(
+        dir,
+        user_file.as_deref(),
+        &get_config::LoadOptions::default(),
+    )
+}
+
+/// [`discover_from`] with an explicit user file and [`get_config::LoadOptions`].
+pub fn discover_uri_with(
+    dir: &Path,
+    user_file: Option<&Path>,
+    opts: &get_config::LoadOptions,
+) -> Option<String> {
+    let merged = get_config::load_merged(dir, user_file, opts).ok()?;
+    get_config::merged_value("phabricator.uri", &merged)
+        .or_else(|| get_config::merged_value("default", &merged))
+        .and_then(|(_, value)| value.as_str().map(str::to_string))
 }
 
 /// Resolve the conduit URI (explicit override, `ARC_CONDUIT_URI`, or
-/// `.arcconfig` walk-up) and build an authenticated client from `~/.arcrc`.
+/// merged-config discovery) and build an authenticated client from
+/// `~/.arcrc`.
 pub fn client_for(conduit_uri: Option<&str>) -> Result<crate::conduit::Client, String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let user_file = arcrc_path();
+    client_for_with(
+        conduit_uri,
+        &cwd,
+        user_file.as_deref(),
+        &get_config::LoadOptions::default(),
+    )
+}
+
+/// [`client_for`] with an explicit working copy, user file, and
+/// [`get_config::LoadOptions`]. Tokens come from the resolved user file,
+/// so `--arcrc-file` redirects credential lookup like stock PHP.
+pub fn client_for_with(
+    conduit_uri: Option<&str>,
+    dir: &Path,
+    user_file: Option<&Path>,
+    opts: &get_config::LoadOptions,
+) -> Result<crate::conduit::Client, String> {
+    let user = get_config::resolve_user_file(
+        user_file.map(Path::to_path_buf),
+        opts.arcrc_file.as_deref(),
+    )?;
     let uri = conduit_uri
         .map(str::to_string)
         .or_else(|| std::env::var("ARC_CONDUIT_URI").ok())
-        .or_else(discover_conduit_uri)
+        .or_else(|| discover_uri_with(dir, user.as_deref(), opts))
         .ok_or_else(|| {
             "no conduit URI: pass --conduit-uri, set ARC_CONDUIT_URI, or run inside a project with .arcconfig"
                 .to_string()
         })?;
-    let token = arcrc_path()
-        .and_then(|path| token_for_file(&path, &uri))
+    let token = user
+        .as_deref()
+        .and_then(|path| token_for_file(path, &uri))
         .ok_or_else(|| format!("no token for {uri} in ~/.arcrc"))?;
     crate::conduit::Client::new(&uri, &token).map_err(|e| e.to_string())
 }

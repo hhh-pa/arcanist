@@ -5,7 +5,7 @@
 //! `src/console/format.php`; TTY gating: `phutil_console_require_tty`).
 //!
 //! Flow: resolve the server URI (positional URI, `--conduit-uri`,
-//! `ARC_CONDUIT_URI`, or the enclosing `.arcconfig`), print the login page,
+//! `ARC_CONDUIT_URI`, or merged-config discovery), print the login page,
 //! read one API token, then branch on server capabilities. Modern servers
 //! verify the token with `user.whoami` and store `{"token": ...}`; legacy
 //! servers exchange it via `conduit.getcertificate` and store
@@ -23,21 +23,24 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use arc_rs::{conduit, config, diff_submit, prompt, terminal};
+use arc_rs::{conduit, config, diff_submit, get_config, prompt, terminal};
 
 /// Subcommand name, matching `arc install-certificate`.
 pub const NAME: &str = "install-certificate";
 
-const USAGE: &str = "usage: arc install-certificate [URI] [--conduit-uri URI] [--token TOKEN] [--force]\n\
+const USAGE: &str = "usage: arc install-certificate [URI] [--conduit-uri URI] [--token TOKEN] [--force] [--config K=V] [--config-file FILE] [--arcrc-file FILE]\n\
 \n\
 Install Conduit credentials into ~/.arcrc for URI. Without URI, the URI\n\
-comes from --conduit-uri, $ARC_CONDUIT_URI, or the enclosing .arcconfig.\n\
+comes from --conduit-uri, $ARC_CONDUIT_URI, or the merged configuration.\n\
 Without --token, the token is read from stdin after printing the login page.\n\
 \n\
 Options:\n\
   --conduit-uri URI   Conduit server URI (under the positional URI).\n\
   --token TOKEN       API token (else prompt via stdin).\n\
   --force             Install standard api- tokens without prompting.\n\
+  --config K=V        Runtime value (repeatable).\n\
+  --config-file F     Read F instead of the system/user files (repeatable).\n\
+  --arcrc-file F      Read/write credentials at F instead of ~/.arcrc.\n\
   -h, --help          Show this help.\n";
 
 const EXAMPLE_URI: &str = "https://devtools.example.com/";
@@ -107,20 +110,51 @@ pub fn validate_token(token: &str) -> Result<TokenKind, String> {
 }
 
 /// Resolve the server URI: positional, `--conduit-uri`, environment, then
-/// the `.arcconfig` enclosing `dir`.
+/// merged-config discovery (`phabricator.uri`, else `default`) from `dir`.
 pub fn resolve_uri(
     positional: Option<&str>,
     flag: Option<&str>,
     env: Option<&str>,
     dir: &Path,
 ) -> Result<String, String> {
+    let user_file = config::arcrc_path();
+    resolve_uri_with(
+        positional,
+        flag,
+        env,
+        dir,
+        user_file.as_deref(),
+        &get_config::LoadOptions::default(),
+    )
+}
+
+/// [`resolve_uri`] with an explicit user file and
+/// [`get_config::LoadOptions`]. Discovery reads through
+/// [`get_config::checked_value`], so a mistyped `phabricator.uri` or
+/// `default` errors like stock PHP instead of falling through.
+pub fn resolve_uri_with(
+    positional: Option<&str>,
+    flag: Option<&str>,
+    env: Option<&str>,
+    dir: &Path,
+    user_file: Option<&Path>,
+    opts: &get_config::LoadOptions,
+) -> Result<String, String> {
     let picked = [positional, flag, env]
         .into_iter()
         .flatten()
         .find(|v| !v.trim().is_empty())
-        .map(str::to_string)
-        .or_else(|| config::discover_from(dir));
-    match picked {
+        .map(str::to_string);
+    if let Some(uri) = picked {
+        return normalize_uri(&uri);
+    }
+    let merged = get_config::load_merged(dir, user_file, opts)?;
+    let found = match get_config::checked_value("phabricator.uri", &merged)? {
+        some @ Some(_) => some,
+        None => get_config::checked_value("default", &merged)?,
+    };
+    let discovered = found.and_then(|(_, value)| value.as_str().map(str::to_string));
+    match discovered {
         Some(uri) => normalize_uri(&uri),
         None => Err(
             "Specify an explicit URI or run this command from within a project which is configured with a .arcconfig."
@@ -501,6 +535,9 @@ struct Options {
     conduit_uri: Option<String>,
     token: Option<String>,
     force: bool,
+    config: Vec<String>,
+    config_files: Vec<String>,
+    arcrc_file: Option<String>,
 }
 
 type ArgIter<'a> = std::iter::Peekable<std::slice::Iter<'a, String>>;
@@ -517,6 +554,9 @@ struct Parser {
     conduit_uri: Option<String>,
     token: Option<String>,
     force: bool,
+    config: Vec<String>,
+    config_files: Vec<String>,
+    arcrc_file: Option<String>,
     positional: u32,
 }
 
@@ -527,6 +567,9 @@ impl Parser {
             conduit_uri: None,
             token: None,
             force: false,
+            config: Vec::new(),
+            config_files: Vec::new(),
+            arcrc_file: None,
             positional: 0,
         }
     }
@@ -594,11 +637,37 @@ impl Parser {
         self.push_positional(arg)
     }
 
+    fn flag_config(&mut self, arg: &str, iter: &mut ArgIter<'_>) -> Option<Step> {
+        let (name, inline) = match arg.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (arg, None),
+        };
+        if !matches!(name, "--config" | "--config-file" | "--arcrc-file") {
+            return None;
+        }
+        let value = match inline {
+            Some(value) => value.to_string(),
+            None => match iter.next() {
+                Some(value) => value.clone(),
+                None => return Some(Step::Error(format!("{name} requires a value"))),
+            },
+        };
+        match name {
+            "--config" => self.config.push(value),
+            "--config-file" => self.config_files.push(value),
+            _ => self.arcrc_file = Some(value),
+        }
+        Some(Step::Handled)
+    }
+
     fn consume(&mut self, arg: &str, iter: &mut ArgIter<'_>) -> Step {
         if let Some(step) = self.flag_conduit(arg, iter) {
             return step;
         }
         if let Some(step) = self.flag_token(arg, iter) {
+            return step;
+        }
+        if let Some(step) = self.flag_config(arg, iter) {
             return step;
         }
         self.tail(arg, iter)
@@ -610,6 +679,9 @@ impl Parser {
             conduit_uri: self.conduit_uri,
             token: self.token,
             force: self.force,
+            config: self.config,
+            config_files: self.config_files,
+            arcrc_file: self.arcrc_file,
         }
     }
 }
@@ -643,11 +715,22 @@ fn install_options(argv: &[String]) -> Result<Options, ExitCode> {
 
 fn resolve_install_uri(options: &Options, cwd: &Path) -> Result<String, ExitCode> {
     let env_uri = std::env::var("ARC_CONDUIT_URI").ok();
-    match resolve_uri(
+    let cli = match get_config::load_options_from_cli(
+        &options.config,
+        &options.config_files,
+        options.arcrc_file.as_deref(),
+    ) {
+        Ok(cli) => cli,
+        Err(message) => return Err(fail(message)),
+    };
+    let user_file = config::arcrc_path();
+    match resolve_uri_with(
         options.uri.as_deref(),
         options.conduit_uri.as_deref(),
         env_uri.as_deref(),
         cwd,
+        user_file.as_deref(),
+        &cli,
     ) {
         Ok(uri) => Ok(uri),
         Err(message) => {
@@ -662,12 +745,15 @@ fn fail(message: String) -> ExitCode {
     ExitCode::FAILURE
 }
 
-fn install_arcrc() -> Result<PathBuf, ExitCode> {
-    match config::arcrc_path() {
-        Some(path) => Ok(path),
-        None => Err(fail(
+/// Credentials target: `--arcrc-file` wins over `~/.arcrc`, like stock
+/// PHP's `writeUserConfigurationFile()` at the custom location.
+fn install_arcrc_for(arcrc_file: Option<&str>) -> Result<PathBuf, ExitCode> {
+    match get_config::resolve_user_file(config::arcrc_path(), arcrc_file.map(Path::new)) {
+        Ok(Some(path)) => Ok(path),
+        Ok(None) => Err(fail(
             "cannot locate ~/.arcrc (HOME/USERPROFILE is not set)".to_string(),
         )),
+        Err(message) => Err(fail(message)),
     }
 }
 
@@ -759,7 +845,7 @@ fn prepare_install(argv: &[String]) -> Result<InstallPlan, ExitCode> {
         Err(_) => PathBuf::from("."),
     };
     let uri = resolve_install_uri(&options, &cwd)?;
-    let arcrc = install_arcrc()?;
+    let arcrc = install_arcrc_for(options.arcrc_file.as_deref())?;
     let doc = match read_token_doc(&arcrc) {
         Ok(doc) => doc,
         Err(message) => return Err(fail(message)),

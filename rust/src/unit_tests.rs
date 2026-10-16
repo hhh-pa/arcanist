@@ -192,6 +192,9 @@ fn parses_everything_and_tracks_explicit_engine() {
 
 #[test]
 fn finds_arcunit_and_unit_engine_keys() {
+    // CORE-33/UNIT-U13: `unit.engine` reads through the source merge, so
+    // the project file only counts at a working-copy root. Shadow options
+    // keep the ambient `~/.arcrc` out of the assertions.
     let root = unique_dir("arcunit-find");
     let child = root.join("sub");
     std::fs::create_dir_all(&child).unwrap();
@@ -199,38 +202,67 @@ fn finds_arcunit_and_unit_engine_keys() {
     assert_eq!(find_arcunit_from(&child), Some(root.clone()));
     assert_eq!(find_arcunit_from(&root), Some(root.clone()));
 
+    std::fs::create_dir_all(root.join(".git")).unwrap();
     std::fs::write(
         root.join(".arcconfig"),
         r#"{"unit.engine": "NoseTestEngine"}"#,
     )
     .unwrap();
+    let shadow = shadow_opts(&root);
     assert_eq!(
-        find_unit_engine_from(&child).as_deref(),
+        find_unit_engine_with(&child, None, &shadow).as_deref(),
         Some("NoseTestEngine")
     );
     assert_eq!(
-        find_unit_engine_from(&root).as_deref(),
+        find_unit_engine_with(&root, None, &shadow).as_deref(),
+        Some("NoseTestEngine")
+    );
+    // A subdir project file stays invisible under git.
+    std::fs::write(
+        child.join(".arcconfig"),
+        r#"{"unit.engine": "PytestTestEngine"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        find_unit_engine_with(&child, None, &shadow).as_deref(),
         Some("NoseTestEngine")
     );
     std::fs::remove_dir_all(&root).ok();
 
     let bare = unique_dir("arcunit-bare");
     std::fs::create_dir_all(&bare).unwrap();
+    std::fs::create_dir_all(bare.join(".git")).unwrap();
+    let shadow = shadow_opts(&bare);
     assert_eq!(find_arcunit_from(&bare), None);
-    assert_eq!(find_unit_engine_from(&bare), None);
+    assert_eq!(find_unit_engine_with(&bare, None, &shadow), None);
     std::fs::write(bare.join(".arcconfig"), "not json").unwrap();
-    assert_eq!(find_unit_engine_from(&bare), None);
+    assert_eq!(find_unit_engine_with(&bare, None, &shadow), None);
     std::fs::write(bare.join(".arcconfig"), r#"{"unit.engine": ""}"#).unwrap();
-    assert_eq!(find_unit_engine_from(&bare), None);
+    assert_eq!(find_unit_engine_with(&bare, None, &shadow), None);
     std::fs::write(bare.join(".arcconfig"), "{}").unwrap();
-    assert_eq!(find_unit_engine_from(&bare), None);
+    assert_eq!(find_unit_engine_with(&bare, None, &shadow), None);
+    std::fs::write(bare.join(".arcconfig"), r#"{"unit.engine": 42}"#).unwrap();
+    assert_eq!(find_unit_engine_with(&bare, None, &shadow), None);
     std::fs::remove_dir_all(&bare).ok();
+}
+
+/// Hermetic [`get_config::LoadOptions`]: `--config-file` shadows the
+/// ambient user/system sources.
+fn shadow_opts(dir: &std::path::Path) -> arc_rs::get_config::LoadOptions {
+    let empty = dir.join("empty.json");
+    std::fs::write(&empty, "{}").unwrap();
+    arc_rs::get_config::LoadOptions {
+        config_files: vec![empty],
+        ..Default::default()
+    }
 }
 
 #[test]
 fn discover_selection_prefers_explicit_then_config_then_cargo() {
     let dir = unique_dir("sel-order");
     std::fs::create_dir_all(&dir).unwrap();
+    // CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
     assert_eq!(
         discover_selection(&Options::default(), &dir).unwrap(),
         Selection::Cargo
@@ -286,6 +318,8 @@ fn discover_selection_prefers_explicit_then_config_then_cargo() {
 fn discover_selection_rejects_bad_config() {
     let dir = unique_dir("sel-bad");
     std::fs::create_dir_all(&dir).unwrap();
+    // CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
 
     let bogus = parse_args(&args(&["--engine", "BogusEngine"])).unwrap();
     let err = discover_selection(&bogus, &dir).unwrap_err();
@@ -2045,4 +2079,120 @@ fn workflow_output_with_ansi_threads_flag() {
         ""
     );
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn r6_unitu13_engine_reads_any_source() {
+    // UNIT-U13: `unit.engine` resolves from local/user/`--config`, not
+    // just `.arcconfig`. Shadow files keep ambient config out.
+    let dir = unique_dir("u13-any");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    let user = dir.join("arcrc.json");
+    std::fs::write(&user, r#"{"config": {"unit.engine": "PytestTestEngine"}}"#).unwrap();
+    assert_eq!(
+        find_unit_engine_with(
+            &dir,
+            Some(&user),
+            &arc_rs::get_config::LoadOptions::default()
+        )
+        .as_deref(),
+        Some("PytestTestEngine")
+    );
+    // Project beats user; `--config` beats project.
+    std::fs::write(
+        dir.join(".arcconfig"),
+        r#"{"unit.engine": "NoseTestEngine"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        find_unit_engine_with(
+            &dir,
+            Some(&user),
+            &arc_rs::get_config::LoadOptions::default()
+        )
+        .as_deref(),
+        Some("NoseTestEngine")
+    );
+    let mut runtime = serde_json::Map::new();
+    runtime.insert(
+        "unit.engine".to_string(),
+        serde_json::json!("XUnitTestEngine"),
+    );
+    let opts = arc_rs::get_config::LoadOptions {
+        runtime,
+        ..Default::default()
+    };
+    assert_eq!(
+        find_unit_engine_with(&dir, Some(&user), &opts).as_deref(),
+        Some("XUnitTestEngine")
+    );
+    // The project legacy `unit_engine` name resolves too.
+    std::fs::write(
+        dir.join(".arcconfig"),
+        r#"{"unit_engine": "PhpunitTestEngine"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        find_unit_engine_with(&dir, None, &shadow_opts(&dir)).as_deref(),
+        Some("PhpunitTestEngine")
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn r6_unitu13_selection_honors_config_flags() {
+    let dir = unique_dir("u13-sel");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    // `--config unit.engine=...` selects without any project file.
+    let opts = parse_args(&args(&["--config", "unit.engine=PytestTestEngine"])).unwrap();
+    assert_eq!(opts.config, ["unit.engine=PytestTestEngine"]);
+    assert_eq!(
+        discover_selection(&opts, &dir).unwrap(),
+        Selection::Single("PytestTestEngine".to_string())
+    );
+    // `--config-file` shadows a user engine.
+    let user = dir.join("arcrc.json");
+    std::fs::write(&user, r#"{"config": {"unit.engine": "NoseTestEngine"}}"#).unwrap();
+    let arcrc_opts = Options {
+        arcrc_file: Some(user.to_string_lossy().to_string()),
+        ..Options::default()
+    };
+    assert_eq!(
+        discover_selection(&arcrc_opts, &dir).unwrap(),
+        Selection::Single("NoseTestEngine".to_string())
+    );
+    let empty = dir.join("empty.json");
+    std::fs::write(&empty, "{}").unwrap();
+    let shadowed = Options {
+        arcrc_file: Some(user.to_string_lossy().to_string()),
+        config_file: vec![empty.to_string_lossy().to_string()],
+        ..Options::default()
+    };
+    assert_eq!(
+        discover_selection(&shadowed, &dir).unwrap(),
+        Selection::Cargo
+    );
+    // A mistyped `unit.engine` errors instead of falling through.
+    std::fs::write(dir.join(".arcconfig"), r#"{"unit.engine": 42}"#).unwrap();
+    let err = discover_selection(&Options::default(), &dir).unwrap_err();
+    assert_eq!(err, "Type of setting 'unit.engine' must be string.");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn r6_core34_unit_config_flags_parse() {
+    let opts = parse_args(&args(&[
+        "--config",
+        "a=1",
+        "--config=b=2",
+        "--config-file",
+        "f",
+        "--arcrc-file=g",
+    ]))
+    .unwrap();
+    assert_eq!(opts.config, ["a=1", "b=2"]);
+    assert_eq!(opts.config_file, ["f"]);
+    assert_eq!(opts.arcrc_file.as_deref(), Some("g"));
 }

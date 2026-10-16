@@ -228,7 +228,10 @@ fn args_require_key_and_value() {
         Options {
             local: true,
             key: "k".to_string(),
-            value: "v".to_string()
+            value: "v".to_string(),
+            config: vec![],
+            config_files: vec![],
+            arcrc_file: None,
         }
     );
     let empty = parse_args(&["k".to_string(), String::new()])
@@ -239,4 +242,59 @@ fn args_require_key_and_value() {
         .unwrap()
         .unwrap();
     assert_eq!(dashed.key, "--x");
+}
+
+#[test]
+fn r6_core34_runtime_config_parses_and_coerces() {
+    let map = parse_runtime_config(&[
+        "editor=nano".to_string(),
+        "history.immutable=yes".to_string(),
+        "load=[\"a\"]".to_string(),
+        "mystery=raw".to_string(),
+    ])
+    .unwrap();
+    assert_eq!(map["editor"], serde_json::json!("nano"));
+    assert_eq!(map["history.immutable"], serde_json::json!(true));
+    assert_eq!(map["load"], serde_json::json!(["a"]));
+    assert_eq!(map["mystery"], serde_json::json!("raw"));
+    // Split on the first `=` only.
+    let map = parse_runtime_config(&["editor=a=b".to_string()]).unwrap();
+    assert_eq!(map["editor"], serde_json::json!("a=b"));
+    // Later pairs win, like `setRuntimeConfig()` overwrites.
+    let map = parse_runtime_config(&["editor=a".to_string(), "editor=b".to_string()]).unwrap();
+    assert_eq!(map["editor"], serde_json::json!("b"));
+    // Missing `=` and bad types error with the stock texts.
+    assert_eq!(
+        parse_runtime_config(&["lone".to_string()]).unwrap_err(),
+        "Argument was 'lone', but must be 'name=value'. For example, history.immutable=true"
+    );
+    assert_eq!(
+        parse_runtime_config(&["history.immutable=maybe".to_string()]).unwrap_err(),
+        "Type of setting 'history.immutable' must be boolean, like 'true' or 'false'."
+    );
+    assert!(
+        parse_runtime_config(&["aliases=x".to_string()])
+            .unwrap_err()
+            .contains("Use \"arc alias\"")
+    );
+}
+
+#[test]
+fn r6_core34_cli_flags_parse() {
+    let opts = parse_args(&[
+        "--config".to_string(),
+        "a=1".to_string(),
+        "--config-file=f".to_string(),
+        "--arcrc-file".to_string(),
+        "g".to_string(),
+        "k".to_string(),
+        "v".to_string(),
+    ])
+    .unwrap()
+    .unwrap();
+    assert_eq!(opts.config, ["a=1"]);
+    assert_eq!(opts.config_files, ["f"]);
+    assert_eq!(opts.arcrc_file.as_deref(), Some("g"));
+    assert_eq!(opts.key, "k");
+    assert!(parse_args(&["--arcrc-file".to_string()]).is_err());
 }

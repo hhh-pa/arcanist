@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 
-use arc_rs::{close_revision, conduit, config, git, list, tasks, todo, upload};
+use arc_rs::{close_revision, conduit, config, get_config, git, list, tasks, todo, upload};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc;
@@ -371,6 +371,8 @@ fn resolve_repository_phid_queries_by_callsign() {
     let client = client_for(&base);
 
     let fx = Fixture::named("close-repo-phid");
+    // CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(fx.dir.join(".git")).unwrap();
     std::fs::write(fx.dir.join(".arcconfig"), r#"{"repository.callsign": "X"}"#).unwrap();
     assert_eq!(
         close_revision::resolve_repository_phid(&client, &fx.dir).unwrap(),
@@ -392,6 +394,8 @@ fn resolve_repository_phid_treats_old_servers_as_untracked() {
     let client = client_for(&base);
 
     let fx = Fixture::named("close-repo-old");
+    // CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(fx.dir.join(".git")).unwrap();
     std::fs::write(fx.dir.join(".arcconfig"), r#"{"repository.callsign": "X"}"#).unwrap();
     assert_eq!(
         close_revision::resolve_repository_phid(&client, &fx.dir).unwrap(),
@@ -826,6 +830,8 @@ fn null_browser_config() -> &'static str {
 #[test]
 fn browse_opens_the_created_task() {
     let fx = Fixture::named("todo-browse");
+    // CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(fx.dir.join(".git")).unwrap();
     std::fs::write(fx.dir.join(".arcconfig"), null_browser_config()).unwrap();
     let mut routes = HashMap::new();
     routes.insert(
@@ -1050,7 +1056,18 @@ fn upload_continues_past_a_missing_file_then_reports_it() {
 fn conduit_modules_are_reachable_through_shared_helpers() {
     // `config` and `git` are exercised via the commands above; keep direct
     // references so the shared-helper wiring stays covered.
-    assert!(config::discover_from(Path::new("/nonexistent-revmeta-dir")).is_none());
+    // CORE-12: discovery honors ambient user config, so shadow it for a
+    // hermetic empty assertion.
+    let shadow_dir = Fixture::named("discover-shadow");
+    let empty = shadow_dir.dir.join("empty.json");
+    std::fs::write(&empty, "{}").unwrap();
+    let shadow = get_config::LoadOptions {
+        config_files: vec![empty],
+        ..Default::default()
+    };
+    assert!(
+        config::discover_uri_with(Path::new("/nonexistent-revmeta-dir"), None, &shadow).is_none()
+    );
     let scratch = Fixture::named("list-git-helper");
     assert!(!git::is_inside_work_tree(&scratch.dir));
 }

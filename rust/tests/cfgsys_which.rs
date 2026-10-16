@@ -248,3 +248,26 @@ fn base_exec_rule_runs_command() {
     let (base, _) = resolve_with_rules(tmp.path(), "arc:exec(echo hi)").unwrap();
     assert_eq!(base, "hi");
 }
+
+#[test]
+fn r6_core12_bare_discovery_under_temp_home() {
+    // CORE-12: discovery reads `phabricator.uri`, else `default`, from any
+    // source. Under an empty temp HOME a bare dir resolves to nothing; a
+    // `default` in the temp user file resolves like stock PHP.
+    let home = TempDir::new("home");
+    let _home = with_temp_home(home.path());
+    let bare = TempDir::new("bare");
+    assert_eq!(
+        which::resolve_conduit_in(bare.path(), None, None),
+        (None, "none")
+    );
+    std::fs::write(
+        home.path().join(".arcrc"),
+        r#"{"config": {"default": "https://d.example/"}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        which::resolve_conduit_in(bare.path(), None, None).0,
+        Some("https://d.example/".to_string())
+    );
+}
