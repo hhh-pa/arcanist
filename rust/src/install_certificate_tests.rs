@@ -84,7 +84,9 @@ fn token_shapes_validate() {
 
 #[test]
 fn uri_resolution_follows_precedence() {
+    // CORE-33: the project file only counts at a working-copy root.
     let tmp = TempDir::new("resolve");
+    std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
     std::fs::write(
         tmp.path.join(".arcconfig"),
         r#"{"phabricator.uri": "https://cfg.example/"}"#,
@@ -118,9 +120,16 @@ fn uri_resolution_follows_precedence() {
         resolve_uri(None, None, None, &tmp.path).unwrap(),
         "https://cfg.example/api/"
     );
+    // CORE-12: with user/system shadowed, bare discovery still errors.
     let bare = TempDir::new("bare");
+    let empty = bare.path.join("empty.json");
+    std::fs::write(&empty, "{}").unwrap();
+    let shadow = arc_rs::get_config::LoadOptions {
+        config_files: vec![empty],
+        ..Default::default()
+    };
     assert_eq!(
-        resolve_uri(None, None, None, &bare.path).unwrap_err(),
+        resolve_uri_with(None, None, None, &bare.path, None, &shadow).unwrap_err(),
         "Specify an explicit URI or run this command from within a project which is configured with a .arcconfig."
     );
     assert!(resolve_uri(Some("notauri"), None, None, &tmp.path).is_err());
@@ -459,6 +468,9 @@ fn args_accept_one_uri_and_flags() {
             conduit_uri: None,
             token: Some("t".to_string()),
             force: true,
+            config: vec![],
+            config_files: vec![],
+            arcrc_file: None,
         }
     );
     let dashed = parse_args(&["--".to_string(), "https://h.example/".to_string()])
@@ -493,6 +505,54 @@ fn r5_core39_token_prompt_gates_pipes() {
 }
 
 #[test]
+fn r6_core38_uri_uses_full_precedence_and_default() {
+    // CORE-38: discovery reads `phabricator.uri` from any source, then
+    // `default` — including the project legacy `conduit_uri`.
+    let tmp = TempDir::new("core38");
+    std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
+    let user = tmp.path.join("arcrc.json");
+    std::fs::write(&user, r#"{"config": {"default": "https://d.example/"}}"#).unwrap();
+    let opts = arc_rs::get_config::LoadOptions::default();
+    assert_eq!(
+        resolve_uri_with(None, None, None, &tmp.path, Some(&user), &opts).unwrap(),
+        "https://d.example/api/"
+    );
+    std::fs::write(
+        tmp.path.join(".arcconfig"),
+        r#"{"conduit_uri": "https://old.example/"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        resolve_uri_with(None, None, None, &tmp.path, Some(&user), &opts).unwrap(),
+        "https://old.example/api/"
+    );
+    // `--config` beats the project file.
+    let rt = arc_rs::get_config::load_options_from_cli(
+        &["phabricator.uri=https://rt.example/".to_string()],
+        &[],
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        resolve_uri_with(None, None, None, &tmp.path, Some(&user), &rt).unwrap(),
+        "https://rt.example/api/"
+    );
+    // Explicit inputs still beat discovery.
+    assert_eq!(
+        resolve_uri_with(
+            None,
+            Some("https://flag.example/"),
+            None,
+            &tmp.path,
+            Some(&user),
+            &rt
+        )
+        .unwrap(),
+        "https://flag.example/api/"
+    );
+}
+
+#[test]
 fn r5_core40_install_anyway_enter_declines() {
     // CLEAN: `ArcanistInstallCertificateWorkflow.php:126` defaults to
     // no (`[y/N]`), so Enter declines and the token is not installed.
@@ -500,4 +560,34 @@ fn r5_core40_install_anyway_enter_declines() {
     assert!(!prompt_confirm_from(&mut enter, "Install this token anyway?", true, true).unwrap());
     let mut yes = std::io::BufReader::new("y\n".as_bytes());
     assert!(prompt_confirm_from(&mut yes, "Install this token anyway?", true, true).unwrap());
+}
+
+#[test]
+fn r6_core38_mistyped_uri_errors() {
+    let tmp = TempDir::new("core38type");
+    std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
+    std::fs::write(tmp.path.join(".arcconfig"), r#"{"phabricator.uri": 42}"#).unwrap();
+    let opts = arc_rs::get_config::LoadOptions::default();
+    assert_eq!(
+        resolve_uri_with(None, None, None, &tmp.path, None, &opts).unwrap_err(),
+        "Type of setting 'phabricator.uri' must be string."
+    );
+}
+
+#[test]
+fn r6_core34_install_config_flags_parse() {
+    let opts = parse_args(&[
+        "https://h.example/".to_string(),
+        "--config".to_string(),
+        "a=1".to_string(),
+        "--config-file=f".to_string(),
+        "--arcrc-file".to_string(),
+        "g".to_string(),
+    ])
+    .unwrap()
+    .unwrap();
+    assert_eq!(opts.config, ["a=1"]);
+    assert_eq!(opts.config_files, ["f"]);
+    assert_eq!(opts.arcrc_file.as_deref(), Some("g"));
+    assert!(parse_args(&["--config".to_string()]).is_err());
 }

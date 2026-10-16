@@ -27,7 +27,7 @@ use arc_rs::{config, get_config, git, terminal};
 /// Subcommand name, matching `arc set-config`.
 pub const NAME: &str = "set-config";
 
-const USAGE: &str = "usage: arc set-config [--local] [--] <name> <value>\n\
+const USAGE: &str = "usage: arc set-config [--local] [--config K=V] [--config-file FILE] [--arcrc-file FILE] [--] <name> <value>\n\
 \n\
 Write an arc configuration option. Writes user configuration (~/.arcrc)\n\
 by default, or the working copy's local configuration (.git/arc/config)\n\
@@ -35,6 +35,9 @@ with --local. An empty value deletes the key.\n\
 \n\
 Options:\n\
   --local         Write local (working-copy) config instead of user config.\n\
+  --config K=V    Accepted like other commands; writes ignore it.\n\
+  --config-file F Accepted like other commands; writes ignore it.\n\
+  --arcrc-file F  Write user config to F instead of ~/.arcrc.\n\
   -h, --help      Show this help.\n";
 
 /// Setting type for coercion, mirroring the `ArcanistSettings` table
@@ -102,6 +105,30 @@ pub fn coerce_value(key: &str, raw: &str) -> Result<serde_json::Value, String> {
 #[must_use]
 pub fn format_value(value: &serde_json::Value) -> String {
     get_config::format_value("", value)
+}
+
+/// Parse `--config key=value` pairs into a runtime map, mirroring
+/// `ArcanistConfigurationManager::applyRuntimeArcConfig()`: split on the
+/// first `=`, coerce with `willWriteValue()`, and let later pairs win.
+/// Unknown keys stay `wild`, like stock PHP.
+pub fn parse_runtime_config(
+    pairs: &[String],
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let mut map = serde_json::Map::new();
+    for pair in pairs {
+        let Some((key, value)) = pair.split_once('=') else {
+            return Err(terminal::pht(
+                "Argument was '%s', but must be '%s'. For example, %s",
+                &[
+                    PhtArg::Text(pair),
+                    PhtArg::Text("name=value"),
+                    PhtArg::Text("history.immutable=true"),
+                ],
+            ));
+        };
+        map.insert(key.to_string(), coerce_value(key, value)?);
+    }
+    Ok(map)
 }
 
 /// The `(was ...)` operand: PHP formats the old value (possibly null)
@@ -314,35 +341,69 @@ struct Options {
     local: bool,
     key: String,
     value: String,
+    config: Vec<String>,
+    config_files: Vec<String>,
+    arcrc_file: Option<String>,
 }
 
 fn parse_args(argv: &[String]) -> Result<Option<Options>, String> {
-    let mut local = false;
+    let mut options = Options {
+        local: false,
+        key: String::new(),
+        value: String::new(),
+        config: Vec::new(),
+        config_files: Vec::new(),
+        arcrc_file: None,
+    };
     let mut positional = Vec::new();
     let mut end_of_flags = false;
-    for arg in argv {
+    let mut rest = argv.iter();
+    while let Some(arg) = rest.next() {
         if end_of_flags {
             positional.push(arg.clone());
-        } else if arg == "--" {
-            end_of_flags = true;
-        } else if arg == "--local" {
-            local = true;
-        } else if arg == "-h" || arg == "--help" {
-            return Ok(None);
-        } else if arg.starts_with('-') {
-            return Err(format!("unknown flag '{arg}'"));
-        } else {
-            positional.push(arg.clone());
+            continue;
         }
+        if arg == "--" {
+            end_of_flags = true;
+            continue;
+        }
+        if arg == "--local" {
+            options.local = true;
+            continue;
+        }
+        if arg == "-h" || arg == "--help" {
+            return Ok(None);
+        }
+        let (name, inline) = match arg.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (arg.as_str(), None),
+        };
+        if matches!(name, "--config" | "--config-file" | "--arcrc-file") {
+            let value = match inline {
+                Some(value) => value.to_string(),
+                None => rest
+                    .next()
+                    .cloned()
+                    .ok_or_else(|| format!("{name} requires a value"))?,
+            };
+            match name {
+                "--config" => options.config.push(value),
+                "--config-file" => options.config_files.push(value),
+                _ => options.arcrc_file = Some(value),
+            }
+            continue;
+        }
+        if arg.starts_with('-') {
+            return Err(format!("unknown flag '{arg}'"));
+        }
+        positional.push(arg.clone());
     }
     if positional.len() != 2 {
         return Err(terminal::pht("Specify a key and a value.", &[]));
     }
-    Ok(Some(Options {
-        local,
-        key: positional[0].clone(),
-        value: positional[1].clone(),
-    }))
+    options.key = positional[0].clone();
+    options.value = positional[1].clone();
+    Ok(Some(options))
 }
 
 /// Entry point: `argv` excludes the subcommand name.
@@ -358,6 +419,13 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // `--config` validates like everywhere else, then stays inert: stock
+    // PHP consumes it before dispatch and the write ignores runtime
+    // sources. `--config-file` is likewise accepted and ignored.
+    if let Err(message) = parse_runtime_config(&options.config) {
+        eprintln!("arc {NAME}: {message}");
+        return ExitCode::FAILURE;
+    }
     if let Some(warning) = warn_if_unknown(&options.key) {
         eprintln!("{warning}");
     }
@@ -365,9 +433,13 @@ pub fn run(argv: &[String]) -> ExitCode {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         apply_local(&cwd, &options.key, &options.value)
     } else {
-        match config::arcrc_path() {
-            Some(path) => apply_user(&path, &options.key, &options.value),
-            None => Err("cannot locate ~/.arcrc (HOME/USERPROFILE is not set)".to_string()),
+        match get_config::resolve_user_file(
+            config::arcrc_path(),
+            options.arcrc_file.as_deref().map(Path::new),
+        ) {
+            Ok(Some(path)) => apply_user(&path, &options.key, &options.value),
+            Ok(None) => Err("cannot locate ~/.arcrc (HOME/USERPROFILE is not set)".to_string()),
+            Err(message) => Err(message),
         }
     };
     match result {

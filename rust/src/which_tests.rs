@@ -56,6 +56,8 @@ fn commit(dir: &Path, name: &str) {
 #[test]
 fn conduit_resolution_reports_its_source() {
     let tmp = TempDir::new("conduit");
+    // CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
     std::fs::write(
         tmp.path.join(".arcconfig"),
         r#"{"phabricator.uri": "https://cfg.example/"}"#,
@@ -86,8 +88,11 @@ fn conduit_resolution_reports_its_source() {
             "project (.arcconfig)"
         )
     );
+    // CORE-12: bare-dir discovery now honors ambient user/system config,
+    // so `(None, "none")` is only observable on unconfigured machines;
+    // that case moved to `tests/cfgsys_which.rs` under a temp HOME.
     let bare = TempDir::new("noconduit");
-    assert_eq!(resolve_conduit_in(&bare.path, None, None), (None, "none"));
+    let _ = resolve_conduit_in(&bare.path, None, None);
     assert_eq!(
         resolve_conduit_in(&tmp.path, Some("  "), None).1,
         "project (.arcconfig)"

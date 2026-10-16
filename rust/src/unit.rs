@@ -42,7 +42,9 @@ use arc_rs::unit_config::{self, PlannedEngine};
 use arc_rs::unit_engine::{
     CommandRunner, EngineContext, EngineError, UnitResult as EngineUnitResult,
 };
-use arc_rs::{config, unit_csharp, unit_nose, unit_phpunit, unit_phutil, unit_pytest, unit_xunit};
+use arc_rs::{
+    config, get_config, unit_csharp, unit_nose, unit_phpunit, unit_phutil, unit_pytest, unit_xunit,
+};
 
 use crate::terminal;
 
@@ -76,7 +78,7 @@ pub const CONFIG_AVAILABLE: &[&str] = &[
     "phutil",
 ];
 
-pub const USAGE: &str = "usage: arc unit [--rev REV] [--engine ENGINE] [--coverage] [--no-coverage] [--detailed-coverage] [--json] [--output FORMAT] [--target PHID] [--everything] [--ugly] [--conduit-uri URI] [paths...] [-- <cargo-test-args>]\n";
+pub const USAGE: &str = "usage: arc unit [--rev REV] [--engine ENGINE] [--coverage] [--no-coverage] [--detailed-coverage] [--json] [--output FORMAT] [--target PHID] [--everything] [--ugly] [--conduit-uri URI] [--config K=V] [--config-file FILE] [--arcrc-file FILE] [paths...] [-- <cargo-test-args>]\n";
 
 /// Number of trailing output lines echoed after the one-line summary.
 pub const TAIL_LINES: usize = 20;
@@ -156,6 +158,12 @@ pub struct Options {
     pub ugly: bool,
     /// Conduit URI override (global `--conduit-uri`, threaded like `diff`).
     pub conduit_uri: Option<String>,
+    /// Runtime `--config key=value` pairs (highest-precedence source).
+    pub config: Vec<String>,
+    /// `--config-file` paths (replace the system/user sources).
+    pub config_file: Vec<String>,
+    /// `--arcrc-file` path (replaces `~/.arcrc`).
+    pub arcrc_file: Option<String>,
     /// Positional paths (`*` maps to `paths`, line 106).
     pub paths: Vec<String>,
     /// Canonical long flag names in first-provision order (PHP `$dict`
@@ -186,6 +194,9 @@ impl Default for Options {
             everything: false,
             ugly: false,
             conduit_uri: None,
+            config: Vec::new(),
+            config_file: Vec::new(),
+            arcrc_file: None,
             paths: Vec::new(),
             provided: Vec::new(),
             help: false,
@@ -203,6 +214,9 @@ enum ValueFlag {
     Output,
     Target,
     ConduitUri,
+    Config,
+    ConfigFile,
+    ArcrcFile,
 }
 
 /// A boolean `unit` flag.
@@ -297,6 +311,21 @@ const FLAG_SPECS: &[FlagSpec] = &[
         short: None,
         flag: Flag::Value(ValueFlag::ConduitUri),
     },
+    FlagSpec {
+        long: "config",
+        short: None,
+        flag: Flag::Value(ValueFlag::Config),
+    },
+    FlagSpec {
+        long: "config-file",
+        short: None,
+        flag: Flag::Value(ValueFlag::ConfigFile),
+    },
+    FlagSpec {
+        long: "arcrc-file",
+        short: None,
+        flag: Flag::Value(ValueFlag::ArcrcFile),
+    },
 ];
 
 /// Find a spec by long name (`--engine`).
@@ -329,6 +358,9 @@ fn store_value_flag(options: &mut Options, flag: ValueFlag, value: String) {
         ValueFlag::Output => options.output = Some(value),
         ValueFlag::Target => options.target = Some(value),
         ValueFlag::ConduitUri => options.conduit_uri = Some(value),
+        ValueFlag::Config => options.config.push(value),
+        ValueFlag::ConfigFile => options.config_file.push(value),
+        ValueFlag::ArcrcFile => options.arcrc_file = Some(value),
     }
 }
 
@@ -1087,24 +1119,51 @@ pub fn find_arcunit_from(dir: &Path) -> Option<PathBuf> {
 }
 
 /// Read the `unit.engine` key (`ArcanistWorkflow.php:2112`
-/// `getConfigFromAnySource('unit.engine')`) from the nearest `.arcconfig`
-/// walking up from `dir`.
+/// `getConfigFromAnySource('unit.engine')`) from any config source for
+/// `dir` (local > project > user > system > default). Lenient:
+/// unreadable sources and non-string values read empty, like the old
+/// walk-up; [`unit_engine_from_merged`] surfaces type errors instead.
 #[must_use]
 pub fn find_unit_engine_from(dir: &Path) -> Option<String> {
-    for ancestor in dir.ancestors() {
-        let Ok(text) = std::fs::read_to_string(ancestor.join(".arcconfig")) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-            continue;
-        };
-        if let Some(name) = value.get("unit.engine").and_then(|v| v.as_str())
-            && !name.is_empty()
-        {
-            return Some(name.to_string());
-        }
+    let user_file = config::arcrc_path();
+    find_unit_engine_with(
+        dir,
+        user_file.as_deref(),
+        &get_config::LoadOptions::default(),
+    )
+}
+
+/// [`find_unit_engine_from`] with an explicit user file and
+/// [`get_config::LoadOptions`].
+#[must_use]
+pub fn find_unit_engine_with(
+    dir: &Path,
+    user_file: Option<&Path>,
+    opts: &get_config::LoadOptions,
+) -> Option<String> {
+    let merged = get_config::load_merged(dir, user_file, opts).ok()?;
+    get_config::merged_value("unit.engine", &merged).and_then(|(_, value)| {
+        value
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+    })
+}
+
+/// Read `unit.engine` from a merged load with `willReadValue()`
+/// validation: a mistyped value errors (like stock PHP) instead of
+/// reading empty. An empty string reads as unset (PHP's falsy
+/// fallthrough to `.arcunit`).
+pub fn unit_engine_from_merged(
+    merged: &get_config::MergedConfig,
+) -> Result<Option<String>, String> {
+    match get_config::checked_value("unit.engine", merged)? {
+        Some((_, value)) => Ok(value
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)),
+        None => Ok(None),
     }
-    None
 }
 
 /// Aggregate report for one engine run.
@@ -1343,7 +1402,14 @@ pub fn discover_selection(opts: &Options, cwd: &Path) -> Result<Selection, Strin
         }
         return Ok(Selection::Single(opts.engine.clone()));
     }
-    if let Some(class) = find_unit_engine_from(cwd) {
+    let cli = get_config::load_options_from_cli(
+        &opts.config,
+        &opts.config_file,
+        opts.arcrc_file.as_deref(),
+    )?;
+    let user_file = config::arcrc_path();
+    let merged = get_config::load_merged(cwd, user_file.as_deref(), &cli)?;
+    if let Some(class) = unit_engine_from_merged(&merged)? {
         validate_engine(&class)?;
         if class == "cargo" {
             return Ok(Selection::Cargo);
@@ -3087,7 +3153,32 @@ pub fn upload_results(
     results: &[EngineUnitResult],
     conduit_uri: Option<&str>,
 ) -> Result<(), String> {
-    let client = config::client_for(conduit_uri)?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let user_file = config::arcrc_path();
+    upload_results_with(
+        target_phid,
+        overall,
+        results,
+        conduit_uri,
+        &cwd,
+        user_file.as_deref(),
+        &get_config::LoadOptions::default(),
+    )
+}
+
+/// [`upload_results`] with an explicit working copy, user file, and
+/// [`get_config::LoadOptions`], so `--config`/`--config-file`/
+/// `--arcrc-file` reach Harbormaster uploads like stock PHP.
+pub fn upload_results_with(
+    target_phid: &str,
+    overall: i32,
+    results: &[EngineUnitResult],
+    conduit_uri: Option<&str>,
+    dir: &Path,
+    user_file: Option<&Path>,
+    opts: &get_config::LoadOptions,
+) -> Result<(), String> {
+    let client = config::client_for_with(conduit_uri, dir, user_file, opts)?;
     let raw = results_to_json(results);
     let modern: Vec<serde_json::Value> = raw
         .as_array()
@@ -3363,17 +3454,38 @@ fn finish_php_report(
     print!("{text}");
     let overall = arc_rs::unit_engine::overall_result(&report.results);
     if let Some(target) = opts.target.as_deref()
-        && let Err(msg) = upload_results(
-            target,
-            overall,
-            &report.results,
-            opts.conduit_uri.as_deref(),
-        )
+        && let Err(msg) =
+            upload_results_for_options(opts, project_root, target, overall, &report.results)
     {
         eprintln!("arc unit: {msg}");
         return ExitCode::FAILURE;
     }
     exit_code_for_overall(overall)
+}
+
+/// Upload through [`upload_results_with`] with the run's config overrides.
+fn upload_results_for_options(
+    opts: &Options,
+    dir: &Path,
+    target: &str,
+    overall: i32,
+    results: &[EngineUnitResult],
+) -> Result<(), String> {
+    let cli = get_config::load_options_from_cli(
+        &opts.config,
+        &opts.config_file,
+        opts.arcrc_file.as_deref(),
+    )?;
+    let user_file = config::arcrc_path();
+    upload_results_with(
+        target,
+        overall,
+        results,
+        opts.conduit_uri.as_deref(),
+        dir,
+        user_file.as_deref(),
+        &cli,
+    )
 }
 
 fn parse_unit_options(argv: &[String]) -> Result<Options, ExitCode> {

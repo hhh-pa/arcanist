@@ -232,6 +232,8 @@ fn repository_query_prefers_configured_callsign() {
     std::fs::create_dir_all(&dir).unwrap();
     // The project source beats user/system sources, so this holds no
     // matter what the ambient machine configures.
+    // CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
     std::fs::write(dir.join(".arcconfig"), r#"{"repository.callsign": "X"}"#).unwrap();
     assert_eq!(
         repository_query(&dir).unwrap(),

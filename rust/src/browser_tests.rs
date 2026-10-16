@@ -40,6 +40,8 @@ fn reads_browser_from_project_config() {
             .as_nanos()
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    // CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
     std::fs::write(
         dir.join(".arcconfig"),
         r#"{"browser": ["my-browser", "--new"]}"#,

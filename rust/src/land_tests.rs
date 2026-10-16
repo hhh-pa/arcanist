@@ -742,8 +742,17 @@ fn gate_preview_lists_findings() {
 
 #[test]
 fn client_for_dir_discovers_from_target() {
+    // CORE-12/33: discovery reads the merged config from the target working
+    // copy. Shadow options keep the ambient `~/.arcrc` out; the project
+    // file only counts at a working-copy root.
     let dir = temp_dir("client-dir");
-    let err = match client_for_dir(None, &dir) {
+    let empty = dir.join("empty.json");
+    std::fs::write(&empty, "{}").unwrap();
+    let shadow = arc_rs::get_config::LoadOptions {
+        config_files: vec![empty],
+        ..Default::default()
+    };
+    let err = match client_for_dir_with(None, &dir, None, &shadow) {
         Ok(_) => panic!("expected no conduit URI"),
         Err(err) => err,
     };
@@ -752,12 +761,13 @@ fn client_for_dir_discovers_from_target() {
         "no conduit URI: pass --conduit-uri, set ARC_CONDUIT_URI, or run inside a project with \
          .arcconfig"
     );
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
     std::fs::write(
         dir.join(".arcconfig"),
         r#"{"phabricator.uri": "https://phab.example/"}"#,
     )
     .unwrap();
-    let err = match client_for_dir(None, &dir) {
+    let err = match client_for_dir_with(None, &dir, None, &shadow) {
         Ok(_) => panic!("expected no token"),
         Err(err) => err,
     };
@@ -2731,6 +2741,13 @@ fn execute_previews_offline_land() {
     let (repo, _bare) = repo_with_origin("preview");
     git(&repo, &["checkout", "-b", "feature"]);
     commit_file(&repo, "f.txt", "f\n", "feature work");
+    // CORE-12: discovery now honors ambient user config, so pin a project
+    // URI no host entry can match to force the offline path hermetically.
+    std::fs::write(
+        repo.join(".arcconfig"),
+        r#"{"phabricator.uri": "https://127.0.0.1:9/"}"#,
+    )
+    .unwrap();
     let mut io = Io::canned(&[]);
     let out = execute_with_io(&repo, &args(&["--preview", "feature"]), &mut io).unwrap();
     assert!(out.stderr.contains("** STRATEGY **"));
@@ -3286,4 +3303,134 @@ fn r5_land10_console_confirm_requires_tty() {
         crate::prompt::NOT_INTERACTIVE
     );
     assert_eq!(io.out.stdout, "\n\n    Delete? [y/N] ");
+}
+
+#[test]
+fn r6_land13_onto_reads_full_merge() {
+    // LAND-13: `arc.land.onto` resolves runtime > local > project > user,
+    // not `.arcconfig` alone.
+    let repo = make_repo("r6-onto");
+    std::fs::write(
+        repo.join(".arcconfig"),
+        r#"{"arc.land.onto": ["from-project"]}"#,
+    )
+    .unwrap();
+    let mut io = Io::canned(&[]);
+    assert_eq!(
+        git_select_onto_refs(&repo, &mut io, &Options::default(), &[]).unwrap(),
+        vec!["from-project".to_string()]
+    );
+    assert!(
+        io.out
+            .stderr
+            .contains("reading \"arc.land.onto\" configuration")
+    );
+    // User source via `--arcrc-file`, below project.
+    let user = repo.join("arcrc.json");
+    std::fs::write(&user, r#"{"config": {"arc.land.onto": ["from-user"]}}"#).unwrap();
+    let user_opts = Options {
+        arcrc_file: Some(user.to_string_lossy().to_string()),
+        ..Options::default()
+    };
+    let mut io = Io::canned(&[]);
+    assert_eq!(
+        git_select_onto_refs(&repo, &mut io, &user_opts, &[]).unwrap(),
+        vec!["from-project".to_string()]
+    );
+    std::fs::remove_file(repo.join(".arcconfig")).unwrap();
+    let mut io = Io::canned(&[]);
+    assert_eq!(
+        git_select_onto_refs(&repo, &mut io, &user_opts, &[]).unwrap(),
+        vec!["from-user".to_string()]
+    );
+    // Local beats user; `--config` beats local.
+    let local_dir = repo.join(".git").join("arc");
+    std::fs::create_dir_all(&local_dir).unwrap();
+    std::fs::write(
+        local_dir.join("config"),
+        r#"{"arc.land.onto": ["from-local"]}"#,
+    )
+    .unwrap();
+    let mut io = Io::canned(&[]);
+    assert_eq!(
+        git_select_onto_refs(&repo, &mut io, &user_opts, &[]).unwrap(),
+        vec!["from-local".to_string()]
+    );
+    let rt_opts = Options {
+        arcrc_file: user_opts.arcrc_file.clone(),
+        config: vec!["arc.land.onto=from-rt".to_string()],
+        ..Options::default()
+    };
+    let mut io = Io::canned(&[]);
+    assert_eq!(
+        git_select_onto_refs(&repo, &mut io, &rt_opts, &[]).unwrap(),
+        vec!["from-rt".to_string()]
+    );
+}
+
+#[test]
+fn r6_land13_strategy_and_remote_merge() {
+    // LAND-13: `arc.land.strategy` and `arc.land.onto-remote` resolve
+    // through the same merge (strategy via `validate_options`).
+    let dir = temp_dir("r6-strategy");
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::write(
+        dir.join(".arcconfig"),
+        r#"{"arc.land.strategy": "merge", "arc.land.onto-remote": "proj-remote"}"#,
+    )
+    .unwrap();
+    let mut io = Io::canned(&[]);
+    let validated = validate_options(&Options::default(), &dir, &mut io).unwrap();
+    assert_eq!(validated.strategy, Strategy::Merge);
+    assert!(
+        io.out
+            .stderr
+            .contains("configured with \"arc.land.strategy\"")
+    );
+    let user = dir.join("arcrc.json");
+    std::fs::write(
+        &user,
+        r#"{"config": {"arc.land.strategy": "squash", "arc.land.onto-remote": "user-remote"}}"#,
+    )
+    .unwrap();
+    let user_opts = Options {
+        arcrc_file: Some(user.to_string_lossy().to_string()),
+        ..Options::default()
+    };
+    // Project beats user for both keys.
+    let mut io = Io::canned(&[]);
+    let validated = validate_options(&user_opts, &dir, &mut io).unwrap();
+    assert_eq!(validated.strategy, Strategy::Merge);
+    assert_eq!(
+        land_config_value(&user_opts, &dir, "arc.land.onto-remote").unwrap(),
+        Some(serde_json::json!("proj-remote"))
+    );
+    std::fs::remove_file(dir.join(".arcconfig")).unwrap();
+    let mut io = Io::canned(&[]);
+    let validated = validate_options(&user_opts, &dir, &mut io).unwrap();
+    assert_eq!(validated.strategy, Strategy::Squash);
+    // A stray subdir `.arcconfig` never counts (CORE-33).
+    let sub = dir.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join(".arcconfig"), r#"{"arc.land.strategy": "merge"}"#).unwrap();
+    let mut io = Io::canned(&[]);
+    let validated = validate_options(&user_opts, &sub, &mut io).unwrap();
+    assert_eq!(validated.strategy, Strategy::Squash);
+}
+
+#[test]
+fn r6_core34_land_config_flags_parse() {
+    let opts = parse_options(&args(&[
+        "--config",
+        "a=1",
+        "--config=b=2",
+        "--config-file",
+        "f",
+        "--arcrc-file=g",
+    ]))
+    .unwrap()
+    .unwrap();
+    assert_eq!(opts.config, ["a=1", "b=2"]);
+    assert_eq!(opts.config_file, ["f"]);
+    assert_eq!(opts.arcrc_file.as_deref(), Some("g"));
 }
