@@ -226,3 +226,16 @@ fn run_in_fails_outside_repo_before_conduit() {
 
     std::fs::remove_dir_all(&plain).ok();
 }
+
+#[test]
+fn execute_propagates_conduit_errors() {
+    // RB-D27 lock: execute errors (incl. conduit failures) surface as Err
+    // so run() prints them to stderr with exit 1, like PHP.
+    let client = crate::conduit::Client::new("http://127.0.0.1:9/", "t").unwrap();
+    let options = Options {
+        json: false,
+        conduit_uri: None,
+    };
+    let err = execute(&client, &options).unwrap_err();
+    assert!(!err.is_empty());
+}

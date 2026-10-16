@@ -6,10 +6,10 @@ fn parses_sample_config() {
     let config = parse_arclint(text).unwrap();
     assert_eq!(config.global_exclude, vec!["externals/".to_string()]);
     assert_eq!(config.linters.len(), 3);
-    // Sorted-key order: json-files, spelling-strict, text.
-    assert_eq!(config.linters[0].name, "json-files");
-    assert_eq!(config.linters[0].linter_type, "json");
-    assert_eq!(config.linters[0].display, "JSON");
+    // File order, like PHP's `foreach` over the decoded config.
+    assert_eq!(config.linters[0].name, "text");
+    assert_eq!(config.linters[2].linter_type, "json");
+    assert_eq!(config.linters[2].display, "JSON");
     assert_eq!(
         config.linters[1]
             .severity
@@ -18,10 +18,10 @@ fn parses_sample_config() {
             .map(String::as_str),
         Some("error")
     );
-    assert_eq!(config.linters[2].display, "TXT");
+    assert_eq!(config.linters[0].display, "TXT");
     assert_eq!(
         selected_display_names(&config),
-        vec!["JSON", "SPELL", "TXT"]
+        vec!["TXT", "SPELL", "JSON"]
     );
 }
 

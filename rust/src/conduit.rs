@@ -498,9 +498,11 @@ pub fn encode_raw_data_for_signature(value: &serde_json::Value) -> Result<String
         }
         serde_json::Value::Object(map) => {
             let mut out = format!("O{}:", map.len());
-            for (key, item) in map {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            for key in keys {
                 out.push_str(&encode_signature_string(key));
-                out.push_str(&encode_raw_data_for_signature(item)?);
+                out.push_str(&encode_raw_data_for_signature(&map[key])?);
             }
             Ok(out)
         }

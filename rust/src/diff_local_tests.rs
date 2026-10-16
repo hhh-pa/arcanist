@@ -1499,11 +1499,7 @@ fn unified_diff_parses_git_change() {
         (hunk.old_start, hunk.old_len, hunk.new_start, hunk.new_len),
         (1, 2, 1, 3)
     );
-    assert!(
-        hunk.corpus.starts_with("@@ -1,2 +1,3 @@\n"),
-        "{}",
-        hunk.corpus
-    );
+    assert_eq!(hunk.corpus, " a\n+b\n c\n");
     assert!(hunk.corpus.contains("+b\n"), "{}", hunk.corpus);
     assert_eq!(change.corpus_size(), hunk.corpus.len());
     assert_eq!(change.commit_hash, None);
@@ -4115,5 +4111,68 @@ fn ansi_working_copy_desc_underlines_path() {
     assert_eq!(
         working_copy_desc_ansi("/repo", true),
         "  Working copy: \x1b[4m/repo\x1b[m\n\n"
+    );
+}
+
+#[test]
+fn away_check_reads_user_query_lists() {
+    use std::io::Cursor;
+    let call = |method: &str, _: &serde_json::Value| {
+        assert_eq!(method, "user.query");
+        Ok(serde_json::json!([
+            {"userName": "bob", "realName": "Bob",
+             "currentStatus": "away", "currentStatusUntil": 1_700_000_000},
+        ]))
+    };
+    let mut message = CommitMessage::new_from_raw_corpus("Title\n").unwrap();
+    message.set_field_value(
+        "reviewerPHIDs",
+        FieldValue::List(vec!["PHID-USER-9".to_string()]),
+    );
+    let mut out = Vec::new();
+    validate_commit_message(
+        &mut Cursor::new(b"y\n".to_vec()),
+        &mut out,
+        &call,
+        &message,
+        "PHID-USER-me",
+        0,
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("bob"), "unexpected: {text}");
+}
+
+#[test]
+fn from_revision_corpus_fetch_sends_edit_false() {
+    use std::io::Cursor;
+    let seen: std::rc::Rc<std::cell::RefCell<Vec<serde_json::Value>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let probe = seen.clone();
+    let call = move |method: &str, params: &serde_json::Value| {
+        if method == "differential.getcommitmessage" {
+            probe.borrow_mut().push(params.clone());
+            return Ok(serde_json::json!("Template title\n"));
+        }
+        if method == "differential.query" {
+            return Ok(serde_json::json!([
+                {"id": 7, "title": "Mine",
+                 "authorPHID": "PHID-USER-me", "statusName": "Draft"},
+            ]));
+        }
+        Ok(serde_json::json!({"fields": {}}))
+    };
+    let mut out = Vec::new();
+    get_commit_message_from_revision_with(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &call,
+        "7",
+        "PHID-USER-me",
+    )
+    .unwrap();
+    assert_eq!(
+        *seen.borrow(),
+        vec![serde_json::json!({"revision_id": 7, "edit": false})]
     );
 }

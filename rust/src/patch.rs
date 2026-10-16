@@ -90,7 +90,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use arc_rs::land::{self, Io, Out};
-use arc_rs::{diff_submit, git, hg, svn, terminal};
+use arc_rs::{diff_local::ParsedHunk, diff_submit, git, hg, svn, terminal};
 
 /// Subcommand name, matching `arc patch`.
 pub const NAME: &str = "patch";
@@ -554,22 +554,67 @@ fn is_utf8_name(encoding: &str) -> bool {
     matches!(encoding.to_lowercase().as_str(), "utf-8" | "utf8")
 }
 
-/// Decode `bytes` with `encoding` (`ArcanistBundle::setEncoding()` /
-/// `convertNonUTF8Diff()`, `src/parser/ArcanistBundle.php:72-88,493-498`).
+/// True for Windows-1252 encoding names (case-insensitive,
+/// dash-optional).
+fn is_cp1252_name(encoding: &str) -> bool {
+    matches!(
+        encoding.to_lowercase().as_str(),
+        "cp1252" | "windows-1252" | "windows1252"
+    )
+}
+
+/// True for ISO-8859-1 encoding names (case-insensitive, dash-optional).
+fn is_latin1_name(encoding: &str) -> bool {
+    matches!(
+        encoding.to_lowercase().as_str(),
+        "latin1" | "latin-1" | "iso-8859-1" | "iso8859-1" | "iso88591"
+    )
+}
+
+/// Decode input `bytes` with `--encoding` (the `tryEncoding` direction:
+/// foreign bytes into UTF-8, `ArcanistDiffParser.php:1006-1019`).
 ///
-/// UTF-8 (or no encoding) decodes lossily; anything else decodes through
-/// a Windows-1252 table (see the module docs). The table is complete
-/// and verified byte-for-byte against the Windows-1252 standard:
-/// bytes outside `0x80..0xA0` map to the identical Latin-1 scalar, the
-/// 27 defined `0x80..0xA0` bytes map per the standard, and the 5
-/// undefined bytes (`0x81,0x8D,0x8F,0x90,0x9D`) become U+FFFD (PHP
-/// delegates to `mb_convert_encoding()` with no vendored table;
-/// U+FFFD matches Rust lossy conversion and `phutil_utf8ize()`).
-pub fn decode_bytes(bytes: &[u8], encoding: Option<&str>) -> String {
+/// Valid UTF-8 passes through untouched however `--encoding` reads (PHP
+/// converts only non-UTF-8 corpora). Otherwise cp1252-family names decode
+/// through the Windows-1252 table and latin1-family names map 1:1; UTF-8
+/// names and no encoding fall back lossily (residual: PHP passes raw
+/// bytes, which a Rust `String` cannot hold); anything else throws like
+/// PHP's converter.
+pub fn decode_bytes(bytes: &[u8], encoding: Option<&str>) -> Result<String, String> {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return Ok(text.to_string());
+    }
     match encoding {
-        None => String::from_utf8_lossy(bytes).into_owned(),
-        Some(name) if is_utf8_name(name) => String::from_utf8_lossy(bytes).into_owned(),
-        Some(_) => bytes.iter().map(|byte| decode_cp1252(*byte)).collect(),
+        None => Ok(String::from_utf8_lossy(bytes).into_owned()),
+        Some(name) if is_utf8_name(name) => Ok(String::from_utf8_lossy(bytes).into_owned()),
+        Some(name) if is_cp1252_name(name) => {
+            Ok(bytes.iter().map(|byte| decode_cp1252(*byte)).collect())
+        }
+        Some(name) if is_latin1_name(name) => Ok(bytes.iter().map(|byte| *byte as char).collect()),
+        Some(name) => Err(format!("Unknown encoding \"{name}\".")),
+    }
+}
+
+/// Encode rendered UTF-8 `text` into `--encoding` bytes
+/// (`ArcanistBundle::convertNonUTF8Diff()`, `:493-498`: UTF-8 to target).
+/// Unmappable scalars become `?` like `mb_convert_encoding()`; unknown
+/// encodings throw.
+pub fn encode_bytes(text: &str, encoding: Option<&str>) -> Result<Vec<u8>, String> {
+    match encoding {
+        None => Ok(text.as_bytes().to_vec()),
+        Some(name) if is_utf8_name(name) => Ok(text.as_bytes().to_vec()),
+        Some(name) if is_cp1252_name(name) => Ok(text
+            .chars()
+            .map(|ch| encode_cp1252(ch).unwrap_or(b'?'))
+            .collect()),
+        Some(name) if is_latin1_name(name) => Ok(text
+            .chars()
+            .map(|ch| {
+                let n = ch as u32;
+                u8::try_from(n).unwrap_or(b'?')
+            })
+            .collect()),
+        Some(name) => Err(format!("Unknown encoding \"{name}\".")),
     }
 }
 
@@ -616,6 +661,21 @@ fn decode_cp1252(byte: u8) -> char {
         return CP1252_80_9F[(byte - 0x80) as usize].unwrap_or('\u{FFFD}');
     }
     byte as char
+}
+
+/// Reverse of [`decode_cp1252`]: `None` for unmappable scalars.
+fn encode_cp1252(ch: char) -> Option<u8> {
+    let n = ch as u32;
+    if n < 0x80 {
+        return u8::try_from(n).ok();
+    }
+    if (0xA0..=0xFF).contains(&n) {
+        return u8::try_from(n).ok();
+    }
+    CP1252_80_9F
+        .iter()
+        .position(|slot| *slot == Some(ch))
+        .and_then(|index| u8::try_from(0x80 + index).ok())
 }
 
 /// Read patch bytes from `path` or `-` (stdin).
@@ -967,7 +1027,7 @@ pub fn load_file_bundle(path: &str, encoding: Option<&str>, io: &mut Io) -> Resu
     if path == "-" && bytes.is_empty() {
         return Err(NO_STDIN_PATCH.to_string());
     }
-    let text = decode_bytes(&bytes, encoding);
+    let text = decode_bytes(&bytes, encoding)?;
     validate_patch_text(&text)?;
     Ok(Bundle {
         text,
@@ -1092,8 +1152,9 @@ pub struct BundleChange {
     pub old_mode: Option<String>,
     /// `unix:filemode` after, when properties carry it.
     pub new_mode: Option<String>,
-    /// Decoded hunk corpora.
-    pub hunks: Vec<String>,
+    /// Decoded hunks: offsets plus body-only corpora (headers are
+    /// rebuilt at render, like `ArcanistBundle::buildHunkChanges()`).
+    pub hunks: Vec<ParsedHunk>,
     /// `old:binary-phid` metadata for binary/image changes.
     pub old_binary_phid: Option<String>,
     /// `new:binary-phid` metadata for binary/image changes.
@@ -1118,7 +1179,7 @@ impl BundleChange {
 }
 
 /// Parse one `changes.json` change dictionary with decoded hunk corpora.
-fn parse_bundle_change(value: &serde_json::Value, hunks: Vec<String>) -> BundleChange {
+fn parse_bundle_change(value: &serde_json::Value, hunks: Vec<ParsedHunk>) -> BundleChange {
     let mode = |key: &str| {
         value
             .get(key)
@@ -1129,11 +1190,11 @@ fn parse_bundle_change(value: &serde_json::Value, hunks: Vec<String>) -> BundleC
     BundleChange {
         change_type: value
             .get("type")
-            .and_then(|v| v.as_u64())
+            .and_then(diff_submit::loose_u64)
             .unwrap_or(u64::from(TYPE_CHANGE)) as u32,
         file_type: value
             .get("fileType")
-            .and_then(|v| v.as_u64())
+            .and_then(diff_submit::loose_u64)
             .unwrap_or(u64::from(FILE_TEXT)) as u32,
         old_path: value
             .get("oldPath")
@@ -1604,6 +1665,113 @@ fn push_change_headers(change: &BundleChange, result: &mut String) {
     }
 }
 
+/// Render hunks with rebuilt `@@` headers (`buildHunkChanges()`,
+/// `:487-522`): each hunk is first broken into small hunks (3-line
+/// context), lengths of 1 omit `,len` like git, and a corpus without a
+/// trailing newline gains one.
+fn render_hunks(hunks: &[ParsedHunk]) -> String {
+    fn head(offset: u64, len: u64) -> String {
+        if len == 1 {
+            format!("{offset}")
+        } else {
+            format!("{offset},{len}")
+        }
+    }
+    let mut out = String::new();
+    for hunk in hunks {
+        for small in break_hunk_into_small_hunks(hunk) {
+            out.push_str(&format!(
+                "@@ -{} +{} @@\n",
+                head(small.old_start, small.old_len),
+                head(small.new_start, small.new_len)
+            ));
+            out.push_str(&small.corpus);
+            if !small.corpus.is_empty()
+                && !small.corpus.ends_with('\n')
+                && !small.corpus.ends_with('\r')
+            {
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// Break one hunk into small hunks with 3 lines of context
+/// (`breakHunkIntoSmallHunks()`, `:524-622`): disjoint output (git apply
+/// rejects overlaps), no overlong trailing context (patch rejects it),
+/// and 7-line gaps split like `diff -u` (PHI838). Line indexes advance
+/// both files (`\` lines adjust lengths but still advance offsets).
+fn break_hunk_into_small_hunks(base: &ParsedHunk) -> Vec<ParsedHunk> {
+    const CONTEXT: usize = 3;
+    let lines: Vec<&str> = base.corpus.split_inclusive('\n').collect();
+    let first_byte = |line: &str| line.as_bytes().first().copied().unwrap_or(0);
+    let n = lines.len();
+    let mut old_offset = base.old_start;
+    let mut new_offset = base.new_start;
+    let mut results = Vec::new();
+    let mut ii = 0;
+    while ii < n {
+        let mut jj = ii;
+        while jj < n {
+            let byte = first_byte(lines[jj]);
+            if byte == b'-' || byte == b'+' {
+                break;
+            }
+            jj += 1;
+        }
+        if jj >= n {
+            break;
+        }
+        let hunk_start = jj.saturating_sub(CONTEXT);
+        let mut old_lines: u64 = 0;
+        let mut new_lines: u64 = 0;
+        let mut hunk_adjust: u64 = 0;
+        let mut last_change = jj;
+        let mut break_here: Option<usize> = None;
+        while jj < n {
+            if first_byte(lines[jj]) == b' ' {
+                if jj - last_change > CONTEXT && break_here.is_none() {
+                    break_here = Some(jj);
+                }
+                // PHP: `>= ($context * 2 + 1)`.
+                if jj - last_change > CONTEXT * 2 {
+                    break;
+                }
+            } else {
+                break_here = None;
+                last_change = jj;
+                match first_byte(lines[jj]) {
+                    b'\\' => hunk_adjust += 1,
+                    b'-' => old_lines += 1,
+                    b'+' => new_lines += 1,
+                    _ => {}
+                }
+            }
+            jj += 1;
+        }
+        if let Some(at) = break_here {
+            jj = at;
+        }
+        let hunk_length = jj.min(n) - hunk_start;
+        let count_length = hunk_length as u64 - hunk_adjust;
+        let corpus: String = lines[hunk_start..hunk_start + hunk_length].concat();
+        // Adjacent hunks share context, so `hunk_start` may precede `ii`.
+        let back = ii as i64 - hunk_start as i64;
+        results.push(ParsedHunk {
+            old_start: (old_offset as i64 - back).max(0) as u64,
+            old_len: count_length - new_lines,
+            new_start: (new_offset as i64 - back).max(0) as u64,
+            new_len: count_length - old_lines,
+            corpus,
+        });
+        old_offset += (jj - ii) as u64 - new_lines;
+        new_offset += (jj - ii) as u64 - old_lines;
+        ii = jj;
+    }
+    results
+}
+
 /// Render bundle changes as a git patch with binary blobs
 /// (`ArcanistBundle::toGitPatch()` full form, `:313-485`).
 ///
@@ -1632,7 +1800,7 @@ pub fn render_git_patch_with_blobs(
                 .and_then(|cur| sources.get(cur));
             build_binary_change(change, old_source, loader)?
         } else {
-            change.hunks.concat()
+            render_hunks(&change.hunks)
         };
         if change.change_type == TYPE_COPY_AWAY
             && body.is_empty()
@@ -1689,7 +1857,7 @@ fn render_text_change(change: &BundleChange, result: &mut String) -> Result<(), 
     if change.file_type == FILE_IMAGE || change.file_type == FILE_BINARY {
         return Err("binary patches are not yet ported by arc patch".to_string());
     }
-    let body: String = change.hunks.concat();
+    let body: String = render_hunks(&change.hunks);
     if change.change_type == TYPE_COPY_AWAY
         && body.is_empty()
         && change.defaulted_old_mode() == change.defaulted_new_mode()
@@ -1757,7 +1925,7 @@ pub fn load_arcbundle(path: &str, encoding: Option<&str>) -> Result<Bundle, Stri
     let text = render_git_patch_with_blobs(&mut changes, &|phid: &str| {
         tar_extract(path, &format!("blobs/{phid}"))
     })?;
-    let text = decode_bytes(text.as_bytes(), decode_as);
+    let text = decode_bytes(text.as_bytes(), decode_as)?;
     Ok(Bundle {
         text,
         base_revision: meta.base_revision,
@@ -1804,12 +1972,13 @@ fn arcbundle_changes(
     Ok(changes)
 }
 
-/// Decode one change dict's hunk corpora from the `hunks/N` members.
+/// Decode one change dict's hunks: offsets from the dict plus the
+/// body-only corpus from the `hunks/N` members.
 fn arcbundle_corpora(
     path: &str,
     dict: &serde_json::Value,
     decode_as: Option<&str>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<ParsedHunk>, String> {
     let mut hunks = Vec::new();
     if let Some(items) = dict.get("hunks").and_then(|v| v.as_array()) {
         for hunk in items {
@@ -1817,10 +1986,64 @@ fn arcbundle_corpora(
                 format!("failed to read arcbundle '{path}': hunk corpus is not an index")
             })?;
             let bytes = tar_extract(path, &format!("hunks/{index}"))?;
-            hunks.push(decode_bytes(&bytes, decode_as));
+            let (old_start, old_len, new_start, new_len) = hunk_offsets(hunk);
+            hunks.push(ParsedHunk {
+                old_start,
+                old_len,
+                new_start,
+                new_len,
+                corpus: decode_bytes(&bytes, decode_as)?,
+            });
         }
     }
     Ok(hunks)
+}
+
+/// Parse inline `hunks[]` from one `differential.querydiffs` change dict
+/// (`ArcanistDiffHunk::newFromDictionary()`): offsets coerce loosely and
+/// corpora arrive body-only.
+pub fn conduit_hunks_from_dict(dict: &serde_json::Value) -> Vec<ParsedHunk> {
+    dict.get("hunks")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .map(|hunk| {
+                    let (old_start, old_len, new_start, new_len) = hunk_offsets(hunk);
+                    ParsedHunk {
+                        old_start,
+                        old_len,
+                        new_start,
+                        new_len,
+                        corpus: hunk
+                            .get("corpus")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Loose hunk offsets from a change dict (`oldOffset`, `oldLength`,
+/// `newOffset`, `newLength`), defaulting to 0.
+fn hunk_offsets(dict: &serde_json::Value) -> (u64, u64, u64, u64) {
+    (
+        dict.get("oldOffset")
+            .and_then(diff_submit::loose_u64)
+            .unwrap_or(0),
+        dict.get("oldLength")
+            .and_then(diff_submit::loose_u64)
+            .unwrap_or(0),
+        dict.get("newOffset")
+            .and_then(diff_submit::loose_u64)
+            .unwrap_or(0),
+        dict.get("newLength")
+            .and_then(diff_submit::loose_u64)
+            .unwrap_or(0),
+    )
 }
 
 /// One `differential.querydiffs` row.
@@ -1848,10 +2071,13 @@ pub fn parse_diff_rows(result: &serde_json::Value) -> Vec<DiffRow> {
         _ => Vec::new(),
     };
     for value in values {
-        let id = value.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+        let id = value
+            .get("id")
+            .and_then(diff_submit::loose_u64)
+            .unwrap_or(0);
         rows.push(DiffRow {
             id,
-            revision_id: value.get("revisionID").and_then(|v| v.as_u64()),
+            revision_id: value.get("revisionID").and_then(diff_submit::loose_u64),
             base_revision: value
                 .get("sourceControlBaseRevision")
                 .and_then(|v| v.as_str())
@@ -1872,9 +2098,6 @@ pub fn parse_diff_rows(result: &serde_json::Value) -> Vec<DiffRow> {
     rows.sort_by_key(|row| row.id);
     rows
 }
-
-/// Conduit method returning the raw diff text.
-const METHOD_GET_RAW_DIFF: &str = "differential.getrawdiff";
 
 /// Extract raw-diff text: a bare string, or `.rawDiff`/`.diff` (the
 /// established lenient shapes).
@@ -1907,15 +2130,21 @@ pub fn fetch_conduit_bundle(
     let Some(diff) = rows.into_iter().next_back() else {
         return Err(NO_DIFF_OR_REVISION.to_string());
     };
-    let text = call(
-        METHOD_GET_RAW_DIFF,
-        &serde_json::json!({"diffID": diff.id.to_string()}),
-    )
-    .map_err(|e| e.to_string())
-    .and_then(|result| {
-        raw_diff_text(&result)
-            .ok_or_else(|| "differential.getrawdiff returned an unexpected response".to_string())
-    })?;
+    let row = result
+        .get(diff.id.to_string())
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let mut changes: Vec<BundleChange> = row
+        .get("changes")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .map(|dict| parse_bundle_change(dict, conduit_hunks_from_dict(dict)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let text = render_git_patch_with_blobs(&mut changes, &|phid| fetch_file_blob(call, phid))?;
     Ok(Bundle {
         text,
         base_revision: Some(diff.base_revision).filter(|base| !base.is_empty()),
@@ -2618,7 +2847,7 @@ pub struct DependencyNode {
 /// Parse a legacy `differential.query` row into a dependency node.
 pub fn parse_dependency_node(row: &serde_json::Value) -> Option<DependencyNode> {
     let phid = row.get("phid")?.as_str()?.to_string();
-    let id = row.get("id")?.as_u64()?;
+    let id = row.get("id").and_then(diff_submit::loose_u64)?;
     let depends_on = row
         .get("auxiliary")
         .and_then(|aux| aux.get("phabricator:depends-on"))
@@ -2756,13 +2985,13 @@ pub fn revision_suffix_for_hash(
     let mut rows = result.as_array().cloned().unwrap_or_default();
     rows.sort_by_key(|row| {
         row.get("dateModified")
-            .and_then(|v| v.as_i64())
+            .and_then(diff_submit::loose_i64)
             .unwrap_or(0)
     });
     let mut found = None;
     for row in &rows {
-        if row.get("status").and_then(|v| v.as_i64()) == Some(STATUS_CLOSED)
-            && let Some(id) = row.get("id").and_then(|v| v.as_u64())
+        if row.get("status").and_then(diff_submit::loose_i64) == Some(STATUS_CLOSED)
+            && let Some(id) = row.get("id").and_then(diff_submit::loose_u64)
         {
             found = Some(format!(" \\ D{id}"));
         }
@@ -3551,7 +3780,7 @@ pub struct SvnChange {
 /// hunk corpora).
 pub fn svn_changes_from_dicts(
     dicts: &[serde_json::Value],
-    corpora: &[Vec<String>],
+    corpora: &[Vec<ParsedHunk>],
 ) -> Vec<SvnChange> {
     dicts
         .iter()
@@ -3585,10 +3814,10 @@ pub fn svn_changes_from_dicts(
                     .get("currentPath")
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
-                hunks: hunks.concat(),
+                hunks: render_hunks(hunks),
                 old_props: props("oldProperties"),
                 new_props: props("newProperties"),
-                symlink_target: symlink_target_from_hunks(file_type, &hunks.concat()),
+                symlink_target: symlink_target_from_hunks(file_type, &render_hunks(hunks)),
             }
         })
         .collect()
@@ -4389,9 +4618,9 @@ pub fn run_symlink(dir: &Path, target: &str, path: &str) -> Result<(), String> {
 pub struct LoadedBundle {
     /// The bundle.
     pub bundle: Bundle,
-    /// Arcbundle change dicts with decoded hunk corpora, when the source
+    /// Arcbundle change dicts with decoded hunks, when the source
     /// is an arcbundle.
-    pub arcbundle_dicts: Option<(Vec<serde_json::Value>, Vec<Vec<String>>)>,
+    pub arcbundle_dicts: Option<(Vec<serde_json::Value>, Vec<Vec<ParsedHunk>>)>,
 }
 
 /// Load the bundle for `source`.
@@ -4473,8 +4702,8 @@ fn require_call<'a>(
     })
 }
 
-/// An arcbundle plus raw change dicts and decoded hunk corpora.
-type ArcbundleWithDicts = (Bundle, Vec<serde_json::Value>, Vec<Vec<String>>);
+/// An arcbundle plus raw change dicts and decoded hunks.
+type ArcbundleWithDicts = (Bundle, Vec<serde_json::Value>, Vec<Vec<ParsedHunk>>);
 
 /// Load an arcbundle plus its raw change dicts and decoded corpora.
 fn load_arcbundle_with_dicts(
@@ -4969,7 +5198,7 @@ fn apply_patch_bundle(
     io: &mut Io,
     backends: &Backends,
     bundle: &Bundle,
-    arcbundle_dicts: Option<&(Vec<serde_json::Value>, Vec<Vec<String>>)>,
+    arcbundle_dicts: Option<&(Vec<serde_json::Value>, Vec<Vec<ParsedHunk>>)>,
     vcs: Vcs,
     branch: &BranchState,
     has_base_local: bool,
@@ -5016,7 +5245,7 @@ fn apply_patch_svn(
     dir: &Path,
     backends: &Backends,
     bundle: &Bundle,
-    arcbundle_dicts: Option<&(Vec<serde_json::Value>, Vec<Vec<String>>)>,
+    arcbundle_dicts: Option<&(Vec<serde_json::Value>, Vec<Vec<ParsedHunk>>)>,
     io: &mut Io,
     ansi: bool,
 ) -> Result<FlowOutcome, String> {

@@ -138,11 +138,26 @@ fn normalizes_revision_ids() {
 #[test]
 fn decodes_patches_with_encoding() {
     // 0xE9 is `é` in Windows-1252 but invalid UTF-8.
-    assert_eq!(decode_patch(b"+caf\xe9\n", None), "+caf�\n");
-    assert_eq!(decode_patch(b"+caf\xe9\n", Some("windows-1252")), "+café\n");
-    assert_eq!(decode_patch(b"+caf\xe9\n", Some("UTF-8")), "+caf�\n");
-    assert_eq!(decode_conduit_text("raw", None), "raw\n");
-    assert_eq!(decode_conduit_text("raw\n", None), "raw\n");
+    assert_eq!(decode_patch(b"+caf\xe9\n", None).unwrap(), "+caf�\n");
+    assert_eq!(
+        decode_patch(b"+caf\xe9\n", Some("windows-1252")).unwrap(),
+        "+café\n"
+    );
+    assert_eq!(
+        decode_patch(b"+caf\xe9\n", Some("UTF-8")).unwrap(),
+        "+caf�\n"
+    );
+    // Valid UTF-8 is never re-decoded, whatever the encoding reads.
+    assert_eq!(
+        decode_patch("+café\n".as_bytes(), Some("windows-1252")).unwrap(),
+        "+café\n"
+    );
+    assert_eq!(
+        decode_patch(b"\xff", Some("shift-jis")).unwrap_err(),
+        "Unknown encoding \"shift-jis\"."
+    );
+    assert_eq!(decode_conduit_text("raw"), "raw\n");
+    assert_eq!(decode_conduit_text("raw\n"), "raw\n");
 }
 
 #[test]
@@ -205,17 +220,11 @@ fn serializes_changes_with_stats_and_companions() {
 
 #[test]
 fn counts_missing_newlines_like_php() {
-    let (add, del, missing_old, missing_new) = hunk_stats(
-        "@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n",
-        1,
-        1,
-    );
+    let (add, del, missing_old, missing_new) =
+        hunk_stats("-old\n\\ No newline at end of file\n+new\n", 1, 1);
     assert_eq!((add, del, missing_old, missing_new), (1, 1, true, false));
-    let (add, del, missing_old, missing_new) = hunk_stats(
-        "@@ -1 +1 @@\n-old\n+new\n\\ No newline at end of file\n",
-        1,
-        1,
-    );
+    let (add, del, missing_old, missing_new) =
+        hunk_stats("-old\n+new\n\\ No newline at end of file\n", 1, 1);
     assert_eq!((add, del, missing_old, missing_new), (1, 1, false, true));
 }
 
@@ -377,7 +386,8 @@ fn local_bundle_roundtrips_through_tar() {
     assert_eq!(changes[0]["currentPath"], serde_json::json!("f.txt"));
     assert_eq!(changes[0]["hunks"][0]["corpus"], serde_json::json!(0));
     let corpus = std::fs::read_to_string(unpacked.join("hunks/0")).unwrap();
-    assert!(corpus.starts_with("@@ -1 +1,2 @@"), "{corpus:?}");
+    assert_eq!(corpus, " one\n+two\n");
+    assert_eq!(changes[0]["hunks"][0]["oldOffset"], serde_json::json!(1));
 
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(&unpacked).ok();
@@ -422,4 +432,18 @@ fn conduit_bundle_passes_dicts_through_and_downloads_blobs() {
 
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(&unpacked).ok();
+}
+
+#[test]
+fn execute_bytes_encodes_to_target_at_sink() {
+    let dir = fixture_repo("enc");
+    std::fs::write(dir.join("f.txt"), "plain\n").unwrap();
+    git(&dir, &["add", "f.txt"]);
+    git(&dir, &["commit", "-qm", "add"]);
+    std::fs::write(dir.join("f.txt"), "caf\u{E9}\n").unwrap();
+    let bytes = execute_bytes(&dir, &argv(&["--git", "--encoding", "windows-1252"])).unwrap();
+    assert!(bytes.windows(6).any(|w| w == b"+caf\xE9\n"), "{bytes:?}");
+    let err = execute_bytes(&dir, &argv(&["--git", "--encoding", "shift-jis"])).unwrap_err();
+    assert_eq!(err, "Unknown encoding \"shift-jis\".");
+    std::fs::remove_dir_all(&dir).ok();
 }

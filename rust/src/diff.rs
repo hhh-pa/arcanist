@@ -1118,6 +1118,60 @@ pub fn merge_message_fields(
     diff_local::merge_fields_oldest_first(&parsed)
 }
 
+/// Local commit messages oldest-first for field/corpus collection.
+fn local_commit_messages_oldest_first(
+    cwd: &Path,
+    base: &str,
+    head: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let infos = diff_local::get_local_commit_information(cwd, base, head.unwrap_or("HEAD"))?;
+    Ok(infos
+        .iter()
+        .rev()
+        .map(|info| info.message.clone())
+        .collect())
+}
+
+/// Join oldest-first commit messages plus the `--reviewers`/`--cc` faux
+/// message into the create corpus resolved server-side
+/// (`parseCommitMessagesIntoFields()` faux handling, `:1786-1811`). The
+/// faux message rides last; its `<placeholder>` first line is stripped
+/// when real messages precede it (the server takes the first line as the
+/// title, and PHP's merge skips placeholder titles). `None` when there is
+/// nothing to resolve (no messages, no flags).
+#[must_use]
+pub fn join_create_corpus(
+    oldest_first: &[String],
+    reviewers: Option<&str>,
+    cc: Option<&str>,
+) -> Option<String> {
+    let faux = diff_local::faux_flag_message(reviewers, cc);
+    if oldest_first.is_empty() {
+        return faux;
+    }
+    let mut parts: Vec<String> = oldest_first.to_vec();
+    if let Some(faux) = faux {
+        parts.push(strip_placeholder_line(&faux));
+    }
+    let corpus = parts.join("\n\n");
+    if corpus.trim().is_empty() {
+        return None;
+    }
+    Some(corpus)
+}
+
+/// Drop a leading `<placeholder>` title line (T12069 filler), keeping the
+/// tag lines the server must parse.
+fn strip_placeholder_line(faux: &str) -> String {
+    let mut lines = faux.splitn(2, '\n');
+    let first = lines.next().unwrap_or("");
+    let rest = lines.next().unwrap_or("");
+    if first.trim() == diff_local::PLACEHOLDER_TITLE {
+        return rest.trim_start_matches('\n').to_string();
+    }
+    faux.to_string()
+}
+
 /// Collect the merged revision fields for `options`.
 ///
 /// `--message-file` wins alone (`buildCommitMessage()`,
@@ -1133,13 +1187,28 @@ pub fn collect_fields(
         let message = diff_local::commit_message_from_file(Path::new(path))?;
         return Ok(diff_local::parse_field_tags(&message.raw_corpus));
     }
-    let infos = diff_local::get_local_commit_information(cwd, base, head.unwrap_or("HEAD"))?;
-    let oldest_first: Vec<String> = infos
-        .iter()
-        .rev()
-        .map(|info| info.message.clone())
-        .collect();
+    let oldest_first = local_commit_messages_oldest_first(cwd, base, head)?;
     Ok(merge_message_fields(
+        &oldest_first,
+        options.reviewers.as_deref(),
+        options.cc.as_deref(),
+    ))
+}
+
+/// Collect the create-mode message corpus for `options`: `--message-file`
+/// content wins alone, else the range's commit messages plus flags.
+fn collect_create_corpus(
+    cwd: &Path,
+    options: &Options,
+    base: &str,
+    head: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(path) = options.message_file.as_deref() {
+        let message = diff_local::commit_message_from_file(Path::new(path))?;
+        return Ok(Some(message.raw_corpus));
+    }
+    let oldest_first = local_commit_messages_oldest_first(cwd, base, head)?;
+    Ok(join_create_corpus(
         &oldest_first,
         options.reviewers.as_deref(),
         options.cc.as_deref(),
@@ -1184,6 +1253,13 @@ pub struct SubmitInput {
     pub mode: SubmitMode,
     /// Update message (`--message`), update mode only.
     pub message: Option<String>,
+    /// Whether `--draft` was passed (create mode decides against server
+    /// transactions support).
+    pub draft: bool,
+    /// Create-mode message corpus for server-side field resolution
+    /// (`parsecommitmessage`); `None` for update/only modes and for
+    /// sourceless (raw/svn) creates, which keep local fields.
+    pub message_corpus: Option<String>,
     /// Revision fields (create mode) or `{}` (update mode).
     pub fields: serde_json::Value,
     /// Full `differential.creatediff` params.
@@ -1212,6 +1288,44 @@ fn submit_change(entry: &diff_local::ChangeEntry) -> diff_submit::DiffChange {
     change.change_type = i64::from(entry.change_type);
     change.file_type = i64::from(entry.file_type);
     change
+}
+
+/// Build submit changes for the git range: entry skeletons plus hunks
+/// parsed from the range diff text (`generateChanges()`, `:802-827`).
+/// Entries keep their type/path mapping; hunks attach by current path.
+/// A range whose text does not parse fails like PHP's `didFailParse()`.
+fn submit_changes_with_hunks(
+    cwd: &Path,
+    base: &str,
+    head: Option<&str>,
+    entries: &[diff_local::ChangeEntry],
+) -> Result<Vec<diff_submit::DiffChange>, String> {
+    let mut args = vec!["--no-pager", "diff", "--no-color", base];
+    if let Some(rev) = head {
+        args.push(rev);
+    }
+    args.push("--");
+    let out = git_output(cwd, &args)?;
+    if !out.status.success() {
+        return Err(format!(
+            "git diff failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let text = crate::patch::decode_bytes(&out.stdout, None)?;
+    let parsed = diff_local::parse_unified_diff(&text)?;
+    let mut changes = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let mut change = submit_change(entry);
+        if let Some(found) = parsed
+            .iter()
+            .find(|parsed| parsed.current_path == entry.current.path)
+        {
+            change.hunks = found.hunks.iter().map(submit_hunk_from_parsed).collect();
+        }
+        changes.push(change);
+    }
+    Ok(changes)
 }
 
 /// Require a `--message` update message.
@@ -1354,7 +1468,7 @@ pub fn prepare_submit_with_report(
     let head = range.head.as_deref();
     let entries = diff_local::collect_change_entries(cwd, &range.base, head)?;
     diff_submit::require_changes(entries.len())?;
-    let changes: Vec<diff_submit::DiffChange> = entries.iter().map(submit_change).collect();
+    let changes = submit_changes_with_hunks(cwd, &range.base, head, &entries)?;
     let local = diff_local::load_diff_specification(
         cwd,
         &range.base,
@@ -1389,9 +1503,15 @@ pub fn prepare_submit_with_report(
         SubmitMode::Update(_) => Some(update_message(options.message.as_deref())?),
         _ => None,
     };
+    let message_corpus = match mode {
+        SubmitMode::Create => collect_create_corpus(cwd, options, &range.base, head)?,
+        _ => None,
+    };
     Ok(SubmitInput {
         mode: mode.clone(),
         message,
+        draft: options.draft,
+        message_corpus,
         fields,
         spec,
         properties: diff_properties(cwd, &range.base, head)?,
@@ -1510,10 +1630,13 @@ pub fn submit_over_with_uri_ansi(
             })
         }
         SubmitMode::Create => {
-            // No server transactions are available locally, so the legacy
-            // `differential.createrevision` path applies (`:478-531`).
-            let params = diff_submit::create_revision_params(input.fields.clone(), created.diff_id);
-            let revision = diff_submit::create_revision_legacy(call, &params)?;
+            let revision = submit_create_revision(
+                call,
+                input,
+                created.diff_id,
+                created.phid.as_deref(),
+                &created.uri,
+            )?;
             Ok(SubmitReport {
                 text: format_submit_report_ansi(
                     "Created a new Differential revision:",
@@ -1819,10 +1942,7 @@ pub fn read_raw_diff_text(options: &Options) -> Result<String, String> {
 fn count_hunk_lines(corpus: &str) -> (i64, i64) {
     let mut adds = 0;
     let mut dels = 0;
-    for (number, line) in corpus.lines().enumerate() {
-        if number == 0 {
-            continue;
-        }
+    for line in corpus.lines() {
         match line.as_bytes().first() {
             Some(b'+') => adds += 1,
             Some(b'-') => dels += 1,
@@ -1838,10 +1958,7 @@ fn missing_newlines(corpus: &str) -> (bool, bool) {
     let mut missing_old = false;
     let mut missing_new = false;
     let mut previous: u8 = 0;
-    for (number, line) in corpus.lines().enumerate() {
-        if number == 0 {
-            continue;
-        }
+    for line in corpus.lines() {
         if line.starts_with("\\ No newline") {
             if previous == b'-' {
                 missing_old = true;
@@ -2321,12 +2438,91 @@ fn submit_full_changes<R: std::io::BufRead, W: std::io::Write>(
     collect_submit_changes_with_io(cwd, hg_cmd, svn_cmd, options, base, head, io)
 }
 
-/// Reject `--draft --create` without server transactions (`:515-521`).
-fn check_submit_draft(mode: &SubmitMode, draft: bool) -> Result<(), String> {
-    if matches!(mode, SubmitMode::Create) {
-        diff_submit::check_draft_create(draft, false)?;
+/// Create a revision from `input` (`run()`, `:478-531`): resolve the
+/// create corpus server-side (`parsecommitmessage` fields plus
+/// transactions), then take `differential.revision.edit` when the server
+/// sent transactions, else legacy `differential.createrevision` (where
+/// `--draft` errors). Without a corpus (raw/svn sourceless creates) the
+/// local fields go legacy, as before.
+fn submit_create_revision(
+    call: &diff_submit::ConduitCall<'_>,
+    input: &SubmitInput,
+    diff_id: i64,
+    diff_phid: Option<&str>,
+    diff_uri: &str,
+) -> Result<diff_submit::RevisionResult, String> {
+    let Some(corpus) = input.message_corpus.as_deref() else {
+        diff_submit::check_draft_create(input.draft, false)?;
+        let params = diff_submit::create_revision_params(input.fields.clone(), diff_id);
+        return diff_submit::create_revision_legacy(call, &params);
+    };
+    let mut message = diff_local::CommitMessage::new_from_raw_corpus(corpus)?;
+    message
+        .pull_data_from_conduit(call, false)
+        .map_err(diff_local::PullDataError::into_message)?;
+    let fields = fields_json(&scrub_placeholder_fields(message.get_fields()));
+    let xactions = message
+        .xactions
+        .as_ref()
+        .and_then(|value| value.as_array())
+        .map(|items| scrub_placeholder_xactions(items))
+        .unwrap_or_default();
+    if xactions.is_empty() {
+        diff_submit::check_draft_create(input.draft, false)?;
+        let params = diff_submit::create_revision_params(fields, diff_id);
+        return diff_submit::create_revision_legacy(call, &params);
     }
-    Ok(())
+    let params = diff_submit::revision_edit_params(&xactions, diff_phid, input.draft);
+    let revision_id = diff_submit::create_revision_via_edit(call, &params)?;
+    Ok(diff_submit::RevisionResult {
+        revision_id,
+        uri: revision_uri_from_diff_uri(diff_uri, revision_id),
+    })
+}
+
+/// Drop a `<placeholder>` faux title from server-parsed fields, mirroring
+/// PHP's field merge skip (`parseCommitMessagesIntoFields()`, `:1846-1852`).
+fn scrub_placeholder_fields(fields: &diff_local::CommitFields) -> diff_local::CommitFields {
+    let mut scrubbed = fields.clone();
+    if matches!(
+        scrubbed.get("title"),
+        Some(diff_local::FieldValue::Text(title)) if title == diff_local::PLACEHOLDER_TITLE
+    ) {
+        scrubbed.remove("title");
+    }
+    scrubbed
+}
+
+/// Drop `<placeholder>` title transactions, the xactions half of
+/// [`scrub_placeholder_fields`].
+fn scrub_placeholder_xactions(xactions: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    xactions
+        .iter()
+        .filter(|xaction| {
+            let is_title = xaction.get("type").and_then(|v| v.as_str()) == Some("title");
+            let is_placeholder = xaction.get("value").and_then(|v| v.as_str())
+                == Some(diff_local::PLACEHOLDER_TITLE);
+            !(is_title && is_placeholder)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Revision web URI from the created diff's URI origin plus `/D{id}`,
+/// mirroring PHP's conduit-URI hack (`:508-511`): both URIs are
+/// server-absolute on the same host.
+fn revision_uri_from_diff_uri(diff_uri: &str, revision_id: i64) -> String {
+    let origin = diff_uri.split_once("://").and_then(|(scheme, rest)| {
+        let host = rest.split('/').next().unwrap_or("");
+        if scheme.is_empty() || host.is_empty() {
+            return None;
+        }
+        Some(format!("{scheme}://{host}"))
+    });
+    match origin {
+        Some(origin) => format!("{origin}/D{revision_id}"),
+        None => format!("/D{revision_id}"),
+    }
 }
 
 /// Update message for a full-state submit, if the mode needs one.
@@ -2429,7 +2625,10 @@ pub fn prepare_submit_full_with_commands_io<R: std::io::BufRead, W: std::io::Wri
         &spec_input,
     );
     let fields = full_submit_fields_with(cwd, hg_cmd, options, kind, mode, &base, head_ref)?;
-    check_submit_draft(mode, options.draft)?;
+    let message_corpus = match mode {
+        SubmitMode::Create => full_create_corpus_with(cwd, hg_cmd, options, kind, &base, head_ref)?,
+        _ => None,
+    };
     let message = submit_full_message(options, mode)?;
     let entries = submit_full_entries(
         cwd,
@@ -2444,12 +2643,55 @@ pub fn prepare_submit_full_with_commands_io<R: std::io::BufRead, W: std::io::Wri
     Ok(SubmitInput {
         mode: mode.clone(),
         message,
+        draft: options.draft,
+        message_corpus,
         fields,
         spec,
         properties: full_submit_properties_with(cwd, hg_cmd, kind, &base, head_ref)?,
         included_changes: diff_local::render_included_changes(&entries),
         json: options.json,
     })
+}
+
+/// Create-mode message corpus for the full-state pipeline: `--message-file`
+/// wins alone, hg joins its log descriptions, git reuses the locked
+/// collector, svn/raw fall back to flags-only (or nothing).
+fn full_create_corpus_with(
+    cwd: &Path,
+    hg_cmd: &hg::HgCommand,
+    options: &Options,
+    kind: Option<VcsKind>,
+    base: &str,
+    head: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(path) = options.message_file.as_deref() {
+        let message = diff_local::commit_message_from_file(Path::new(path))?;
+        return Ok(Some(message.raw_corpus));
+    }
+    match kind {
+        Some(VcsKind::Git) => collect_create_corpus(cwd, options, base, head),
+        Some(VcsKind::Hg) => {
+            let branch = diff_local::get_hg_branch_name_with(cwd, hg_cmd)?;
+            let argv = diff_local::hg_commit_log_argv(base, &branch);
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let text = hg::stdout_text_with(cwd, hg_cmd, &refs)?;
+            let mut oldest_first: Vec<String> = diff_local::parse_hg_commit_log(&text)
+                .into_iter()
+                .map(|(_, desc)| desc)
+                .collect();
+            oldest_first.reverse();
+            Ok(join_create_corpus(
+                &oldest_first,
+                options.reviewers.as_deref(),
+                options.cc.as_deref(),
+            ))
+        }
+        None | Some(VcsKind::Svn) => Ok(join_create_corpus(
+            &[],
+            options.reviewers.as_deref(),
+            options.cc.as_deref(),
+        )),
+    }
 }
 
 /// Read the unified diff text for hg/svn entry rendering.

@@ -478,26 +478,21 @@ pub fn local_diff_bytes(dir: &Path, format: Format, base: &str) -> Result<Vec<u8
 
 /// Local `git diff` of the working tree against `base` in `format`.
 pub fn local_diff(dir: &Path, format: Format, base: &str) -> Result<String, String> {
-    Ok(crate::patch::decode_bytes(
-        &local_diff_bytes(dir, format, base)?,
-        None,
-    ))
+    crate::patch::decode_bytes(&local_diff_bytes(dir, format, base)?, None)
 }
 
-/// Decode patch bytes with `--encoding`, mirroring
-/// `ArcanistBundle::convertNonUTF8Diff()`.
-#[must_use]
-pub fn decode_patch(bytes: &[u8], encoding: Option<&str>) -> String {
+/// Decode patch bytes with `--encoding` (input direction: foreign bytes
+/// into UTF-8).
+pub fn decode_patch(bytes: &[u8], encoding: Option<&str>) -> Result<String, String> {
     crate::patch::decode_bytes(bytes, encoding)
 }
 
-/// Decode a Conduit raw diff with `--encoding` (a no-op without one).
+/// Normalize a Conduit raw diff (trailing newline). Conduit text arrives
+/// UTF-8; `--encoding` output conversion happens at the stdout sink
+/// ([`execute_bytes`]), like `convertNonUTF8Diff()` at render.
 #[must_use]
-pub fn decode_conduit_text(text: &str, encoding: Option<&str>) -> String {
-    match encoding {
-        None => ensure_trailing_newline(text.to_string()),
-        Some(name) => ensure_trailing_newline(decode_patch(text.as_bytes(), Some(name))),
-    }
+pub fn decode_conduit_text(text: &str) -> String {
+    ensure_trailing_newline(text.to_string())
 }
 
 fn ensure_trailing_newline(mut text: String) -> String {
@@ -520,8 +515,7 @@ fn hunk_stats(corpus: &str, old_len: u64, new_len: u64) -> (u64, u64, bool, bool
     let mut missing_new = false;
     let mut old_left = old_len;
     let mut new_left = new_len;
-    let mut lines = corpus.lines();
-    lines.next(); // @@ header
+    let lines = corpus.lines();
     for line in lines {
         if line.starts_with("\\ No newline at end of file") {
             if new_left > 0 {
@@ -934,32 +928,56 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
         ParseOutcome::Help => return Ok(usage()),
         ParseOutcome::Error(message) => return Err(format!("{message}\n\n{}", usage())),
     };
+    execute_with_opts(dir, &opts)
+}
+
+/// [`execute`] over parsed options.
+fn execute_with_opts(dir: &Path, opts: &Options) -> Result<String, String> {
     if let Format::Bundle { path } = &opts.format {
-        return export_bundle(dir, &opts, path);
+        return export_bundle(dir, opts, path);
     }
-    match opts.source {
+    match &opts.source {
         Source::Local { base } => {
             let base = base.as_deref().unwrap_or("HEAD");
-            let bytes = local_diff_bytes(dir, opts.format, base)?;
-            Ok(decode_patch(&bytes, opts.encoding.as_deref()))
+            let bytes = local_diff_bytes(dir, opts.format.clone(), base)?;
+            decode_patch(&bytes, opts.encoding.as_deref())
         }
         Source::Revision(id) => {
             let client = crate::config::client_for(opts.conduit_uri.as_deref())?;
-            fetch_raw_diff_for_revision(&client, id)
-                .map(|text| decode_conduit_text(&text, opts.encoding.as_deref()))
+            fetch_raw_diff_for_revision(&client, *id).map(|text| decode_conduit_text(&text))
         }
         Source::Diff(id) => {
             let client = crate::config::client_for(opts.conduit_uri.as_deref())?;
-            fetch_raw_diff_for_diff(&client, &id.to_string())
-                .map(|text| decode_conduit_text(&text, opts.encoding.as_deref()))
+            fetch_raw_diff_for_diff(&client, &id.to_string()).map(|text| decode_conduit_text(&text))
         }
     }
 }
 
+/// Run the workflow rooted at `dir`, returning stdout bytes or an error
+/// message: like [`execute`], then UTF-8 to `--encoding` conversion at
+/// the sink (`convertNonUTF8Diff()`). Bundle writes keep UTF-8 stdout
+/// (the file carries its own encoding record).
+pub fn execute_bytes(dir: &Path, argv: &[String]) -> Result<Vec<u8>, String> {
+    let opts = match parse_args(argv) {
+        ParseOutcome::Args(opts) => opts,
+        ParseOutcome::Help => return Ok(usage().into_bytes()),
+        ParseOutcome::Error(message) => return Err(format!("{message}\n\n{}", usage())),
+    };
+    let text = execute_with_opts(dir, &opts)?;
+    if matches!(opts.format, Format::Bundle { .. }) {
+        return Ok(text.into_bytes());
+    }
+    crate::patch::encode_bytes(&text, opts.encoding.as_deref())
+}
+
 pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
-    match execute(dir, argv) {
-        Ok(text) => {
-            print!("{text}");
+    use std::io::Write;
+    match execute_bytes(dir, argv) {
+        Ok(bytes) => {
+            if std::io::stdout().write_all(&bytes).is_err() {
+                eprintln!("arc {NAME}: failed to write output");
+                return ExitCode::FAILURE;
+            }
             ExitCode::SUCCESS
         }
         Err(message) => {

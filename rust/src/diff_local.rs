@@ -2661,8 +2661,9 @@ pub fn should_amend(
 /// One parsed hunk: header offsets plus the verbatim corpus.
 ///
 /// PHP: `ArcanistDiffHunk` (`src/parser/diff/ArcanistDiffHunk.php`); the
-/// corpus is the `@@` header line plus every body line through the next
-/// header, exactly as `ArcanistDiffParser` accumulates it.
+/// corpus is the body lines only — the `@@` header is consumed for the
+/// offsets and never stored, exactly as `ArcanistDiffParser`
+/// accumulates `$real` (`:938-1002`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedHunk {
     /// Old-file start line (`-old_start`).
@@ -2673,8 +2674,8 @@ pub struct ParsedHunk {
     pub new_start: u64,
     /// New-file line count.
     pub new_len: u64,
-    /// Verbatim hunk text: header line plus body lines, `\n`-joined with a
-    /// trailing newline when non-empty.
+    /// Verbatim hunk body: body lines `\n`-joined with a trailing newline
+    /// when non-empty (no `@@` header).
     pub corpus: String,
 }
 
@@ -3313,8 +3314,6 @@ fn collect_hunk(
     new_len: u64,
 ) -> (ParsedHunk, usize) {
     let mut corpus = String::new();
-    corpus.push_str(lines[start]);
-    corpus.push('\n');
     let mut index = start + 1;
     while index < lines.len() {
         let line = lines[index];
@@ -5196,6 +5195,11 @@ fn select_reviewer_users<'a>(
     users: &'a serde_json::Value,
     reviewers: &[&str],
 ) -> Vec<&'a serde_json::Value> {
+    // PHP iterates the `user.query` result rows directly (`:1649-1652`);
+    // orsay returns a list, older servers a PHID-keyed map.
+    if let serde_json::Value::Array(items) = users {
+        return items.iter().collect();
+    }
     let mut out = Vec::new();
     if let serde_json::Value::Object(map) = users {
         for phid in reviewers {
@@ -5618,7 +5622,7 @@ pub fn get_commit_message_from_revision_with<R: BufRead, W: Write>(
     }
     check_revision_ownership(reader, writer, &row, user_phid)?;
     let is_draft = row.get("statusName").and_then(serde_json::Value::as_str) == Some("Draft");
-    let params = diff_submit::get_commit_message_edit_params(id_arg);
+    let params = diff_submit::commit_message_from_revision_params(id_arg);
     let template = call(diff_submit::METHOD_GET_COMMIT_MESSAGE, &params)?;
     let Some(corpus) = template.as_str() else {
         return Err(FAILED_TO_RETRIEVE_TEMPLATE.to_string());

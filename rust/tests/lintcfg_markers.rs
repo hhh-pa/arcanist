@@ -122,7 +122,7 @@ fn arclint_loads_from_disk() {
     let config = arclint::load_arclint(tmp.path()).unwrap();
     assert_eq!(
         arclint::selected_display_names(&config),
-        vec!["JSON", "SPELL", "TXT"]
+        vec!["TXT", "SPELL", "JSON"]
     );
 
     std::fs::write(tmp.path().join(".arclint"), "{oops").unwrap();

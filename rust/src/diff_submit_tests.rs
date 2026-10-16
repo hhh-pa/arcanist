@@ -886,3 +886,17 @@ fn submit_via_edit_sends_null_phid_when_server_omits_it() {
     let (_, id) = submit_create_revision_via_edit(&call, &json!({}), &[], false).unwrap();
     assert_eq!(id, 3);
 }
+
+#[test]
+fn loose_int_coercion_accepts_numbers_and_strings() {
+    assert_eq!(loose_i64(&json!(3)), Some(3));
+    assert_eq!(loose_i64(&json!("3")), Some(3));
+    assert_eq!(loose_i64(&json!(-1)), Some(-1));
+    assert_eq!(loose_i64(&json!("-1")), Some(-1));
+    assert_eq!(loose_i64(&json!("bogus")), None);
+    assert_eq!(loose_i64(&json!(null)), None);
+    assert_eq!(loose_u64(&json!(1633)), Some(1633));
+    assert_eq!(loose_u64(&json!("1633")), Some(1633));
+    assert_eq!(loose_u64(&json!("-1")), None);
+    assert_eq!(loose_u64(&json!("bogus")), None);
+}

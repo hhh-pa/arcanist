@@ -48,11 +48,13 @@ fn g1_full_submit_carries_hunks_over_seam() {
     assert_eq!(changes[0]["currentPath"], serde_json::json!("f.txt"));
     let hunks = changes[0]["hunks"].as_array().unwrap();
     assert!(!hunks.is_empty(), "{}", sent[0]);
+    // Submit corpora are body-only; offsets ride alongside.
     assert!(
-        hunks[0]["corpus"].as_str().unwrap().contains("@@"),
+        !hunks[0]["corpus"].as_str().unwrap().contains("@@"),
         "{}",
         sent[0]
     );
+    assert!(hunks[0].get("oldOffset").is_some(), "{}", sent[0]);
     assert_eq!(
         sent[0]["sourceControlBaseRevision"],
         serde_json::json!(second)
@@ -60,12 +62,16 @@ fn g1_full_submit_carries_hunks_over_seam() {
 }
 
 #[test]
-fn g1_full_submit_draft_create_fails_legacy() {
-    let (fx, _, _) = g1_repo("g1-full-draft");
-    let mut opts = options(None, false);
+fn g1_full_submit_draft_create_defers_to_submit() {
+    // `--draft` no longer fails in prepare: the create branch decides
+    // against real server transactions (`revision.edit` iff present, else
+    // the legacy too-old error), like PHP.
+    let (fx, first, _) = g1_repo("g1-full-draft");
+    let mut opts = options(Some(&first), false);
     opts.draft = true;
-    let err = diff::prepare_submit_full(fx.path(), &opts, &diff::SubmitMode::Create).unwrap_err();
-    assert!(err.contains("too old"), "{err}");
+    let input = diff::prepare_submit_full(fx.path(), &opts, &diff::SubmitMode::Create).unwrap();
+    assert!(input.draft);
+    assert!(input.message_corpus.is_some());
 }
 
 #[test]
@@ -714,6 +720,10 @@ fn create_submit_sends_fields_over_seam() {
             wire_fixture("setdiffproperty"),
         )
         .with(
+            "differential.parsecommitmessage",
+            r#"{"fields": {"title": "Add feature", "reviewerPHIDs": ["PHID-USER-1"]}}"#,
+        )
+        .with(
             "differential.createrevision",
             wire_fixture("createrevision"),
         );
@@ -728,12 +738,18 @@ fn create_submit_sends_fields_over_seam() {
         "{text}"
     );
 
+    // Legacy creates carry the server-resolved fields (usernames already
+    // PHIDs), never the local raw names.
     let creates = canned.params_for("differential.createrevision");
     assert_eq!(creates.len(), 1);
     assert_eq!(creates[0]["diffid"], serde_json::json!(42));
     assert_eq!(
         creates[0]["fields"]["title"],
         serde_json::json!("Add feature")
+    );
+    assert_eq!(
+        creates[0]["fields"]["reviewerPHIDs"],
+        serde_json::json!(["PHID-USER-1"])
     );
 }
 
@@ -844,6 +860,10 @@ fn gap2_submit_report_uris_per_mode() {
             wire_fixture("setdiffproperty"),
         )
         .with(
+            "differential.parsecommitmessage",
+            r#"{"fields": {"title": "Add feature"}}"#,
+        )
+        .with(
             "differential.createrevision",
             wire_fixture("createrevision"),
         );
@@ -878,4 +898,33 @@ fn submit_with_no_changes_fails() {
     let opts = options(None, false);
     let err = diff::prepare_submit(fx.path(), &opts, &diff::SubmitMode::Only).unwrap_err();
     assert_eq!(err, "There are no changes to generate a diff from!");
+}
+
+#[test]
+fn git_submit_carries_parsed_hunks() {
+    // D4: the locked git path submits hunks parsed from the range diff,
+    // body-only corpora with offsets.
+    let (fx, first, _) = g1_repo("git-hunks");
+    let opts = options(Some(&first), false);
+    let input = diff::prepare_submit(fx.path(), &opts, &diff::SubmitMode::Only).unwrap();
+    let canned = Canned::default()
+        .with("differential.creatediff", wire_fixture("creatediff"))
+        .with(
+            "differential.setdiffproperty",
+            wire_fixture("setdiffproperty"),
+        );
+    let call = |method: &str, params: &serde_json::Value| canned.call(method, params);
+    diff::submit_over(&call, &input).unwrap();
+    let sent = canned.params_for("differential.creatediff");
+    assert_eq!(sent.len(), 1);
+    let changes = sent[0]["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1);
+    let hunks = changes[0]["hunks"].as_array().unwrap();
+    assert!(!hunks.is_empty(), "{}", sent[0]);
+    assert!(
+        !hunks[0]["corpus"].as_str().unwrap().contains("@@"),
+        "{}",
+        sent[0]
+    );
+    assert!(hunks[0].get("oldOffset").is_some(), "{}", sent[0]);
 }

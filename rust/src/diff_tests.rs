@@ -1825,6 +1825,8 @@ fn ansi_submit_reports_bold_label_and_underline_uri() {
     let input = SubmitInput {
         mode: SubmitMode::Only,
         message: None,
+        draft: false,
+        message_corpus: None,
         fields: serde_json::Value::Null,
         spec: serde_json::json!({}),
         properties: Vec::new(),
@@ -1841,4 +1843,201 @@ fn ansi_submit_reports_bold_label_and_underline_uri() {
         colored,
         "Created a new Differential diff:\n        \x1b[1mDiff URI:\x1b[m \x1b[4mhttp://x/D1\x1b[m\n\nIncluded changes:\n"
     );
+}
+
+fn create_test_input(draft: bool, corpus: Option<&str>) -> SubmitInput {
+    SubmitInput {
+        mode: SubmitMode::Create,
+        message: None,
+        draft,
+        message_corpus: corpus.map(str::to_string),
+        fields: serde_json::json!({"title": "Local"}),
+        spec: serde_json::json!({}),
+        properties: Vec::new(),
+        included_changes: String::new(),
+        json: false,
+    }
+}
+
+#[test]
+fn create_uses_revision_edit_when_server_sends_transactions() {
+    let call = |method: &str, params: &serde_json::Value| {
+        if method == diff_submit::METHOD_PARSE_COMMIT_MESSAGE {
+            assert_eq!(
+                params["corpus"],
+                serde_json::json!("Add thing\n\nReviewers: alice\n")
+            );
+            return Ok(serde_json::json!({
+                "fields": {"title": "Add thing",
+                           "reviewerPHIDs": ["PHID-USER-1"]},
+                "transactions": [
+                    {"type": "title", "value": "Add thing"},
+                    {"type": "reviewers.set", "value": ["PHID-USER-1"]},
+                ],
+            }));
+        }
+        if method == diff_submit::METHOD_REVISION_EDIT {
+            let types: Vec<&str> = params["transactions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["type"].as_str().unwrap())
+                .collect();
+            assert_eq!(types, vec!["title", "reviewers.set", "update", "draft"]);
+            assert_eq!(
+                params["transactions"][2]["value"],
+                serde_json::json!("PHID-DIFF-9")
+            );
+            return Ok(serde_json::json!({"object": {"id": 7}}));
+        }
+        Err(format!("unexpected {method}"))
+    };
+    let input = create_test_input(true, Some("Add thing\n\nReviewers: alice\n"));
+    let revision = submit_create_revision(
+        &call,
+        &input,
+        3,
+        Some("PHID-DIFF-9"),
+        "https://phab.test/differential/diff/3/",
+    )
+    .unwrap();
+    assert_eq!(revision.revision_id, 7);
+    assert_eq!(revision.uri, "https://phab.test/D7");
+}
+
+#[test]
+fn create_edits_without_draft_transaction_when_not_draft() {
+    let call = |method: &str, _: &serde_json::Value| {
+        if method == diff_submit::METHOD_PARSE_COMMIT_MESSAGE {
+            return Ok(serde_json::json!({
+                "fields": {"title": "T"},
+                "transactions": [{"type": "title", "value": "T"}],
+            }));
+        }
+        if method == diff_submit::METHOD_REVISION_EDIT {
+            return Ok(serde_json::json!({"object": {"id": 8}}));
+        }
+        Err(format!("unexpected {method}"))
+    };
+    let input = create_test_input(false, Some("T\n"));
+    let revision = submit_create_revision(&call, &input, 3, None, "u").unwrap();
+    assert_eq!(revision.revision_id, 8);
+}
+
+#[test]
+fn create_falls_back_to_legacy_without_transactions() {
+    let call = |method: &str, params: &serde_json::Value| {
+        if method == diff_submit::METHOD_PARSE_COMMIT_MESSAGE {
+            return Ok(serde_json::json!({
+                "fields": {"title": "T", "reviewerPHIDs": ["PHID-USER-1"]},
+            }));
+        }
+        if method == diff_submit::METHOD_CREATE_REVISION {
+            assert_eq!(
+                params["fields"]["reviewerPHIDs"],
+                serde_json::json!(["PHID-USER-1"])
+            );
+            assert_eq!(params["diffid"], serde_json::json!(3));
+            return Ok(serde_json::json!({"revisionid": 9, "uri": "https://phab.test/D9"}));
+        }
+        Err(format!("unexpected {method}"))
+    };
+    let input = create_test_input(false, Some("T\n\nReviewers: alice\n"));
+    let revision = submit_create_revision(&call, &input, 3, None, "u").unwrap();
+    assert_eq!(revision.revision_id, 9);
+    assert_eq!(revision.uri, "https://phab.test/D9");
+}
+
+#[test]
+fn create_draft_without_transactions_errors_like_php() {
+    let call = |method: &str, _: &serde_json::Value| {
+        if method == diff_submit::METHOD_PARSE_COMMIT_MESSAGE {
+            return Ok(serde_json::json!({"fields": {"title": "T"}}));
+        }
+        Err(format!("unexpected {method}"))
+    };
+    let input = create_test_input(true, Some("T\n"));
+    let err = submit_create_revision(&call, &input, 3, None, "u").unwrap_err();
+    assert!(err.contains("--draft"), "unexpected: {err}");
+}
+
+#[test]
+fn create_without_corpus_keeps_local_fields_legacy() {
+    let call = |method: &str, params: &serde_json::Value| {
+        if method == diff_submit::METHOD_CREATE_REVISION {
+            assert_eq!(params["fields"]["title"], serde_json::json!("Local"));
+            return Ok(serde_json::json!({"revisionid": 1, "uri": "u"}));
+        }
+        Err(format!("unexpected {method}"))
+    };
+    let input = create_test_input(false, None);
+    submit_create_revision(&call, &input, 3, None, "u").unwrap();
+}
+
+#[test]
+fn create_scrubs_placeholder_titles() {
+    let call = |method: &str, _: &serde_json::Value| {
+        if method == diff_submit::METHOD_PARSE_COMMIT_MESSAGE {
+            return Ok(serde_json::json!({
+                "fields": {"title": "<placeholder>",
+                           "reviewerPHIDs": ["PHID-USER-1"]},
+                "transactions": [
+                    {"type": "title", "value": "<placeholder>"},
+                    {"type": "reviewers.set", "value": ["PHID-USER-1"]},
+                ],
+            }));
+        }
+        if method == diff_submit::METHOD_REVISION_EDIT {
+            return Ok(serde_json::json!({"object": {"id": 2}}));
+        }
+        Err(format!("unexpected {method}"))
+    };
+    // Flags-only corpus: placeholder title dropped, reviewers kept, edit
+    // path still taken on the remaining transaction.
+    let input = create_test_input(false, Some("<placeholder>\n\nReviewers: alice\n"));
+    let revision = submit_create_revision(&call, &input, 3, None, "u").unwrap();
+    assert_eq!(revision.revision_id, 2);
+    assert_eq!(
+        scrub_placeholder_xactions(&[
+            serde_json::json!({"type": "title", "value": "<placeholder>"}),
+            serde_json::json!({"type": "title", "value": "Real"}),
+        ])
+        .len(),
+        1
+    );
+}
+
+#[test]
+fn join_create_corpus_orders_messages_and_strips_placeholder() {
+    assert_eq!(join_create_corpus(&[], None, None), None);
+    assert_eq!(
+        join_create_corpus(&["one".to_string()], None, None),
+        Some("one".to_string())
+    );
+    let corpus = join_create_corpus(
+        &["First".to_string(), "Second".to_string()],
+        Some("a"),
+        None,
+    )
+    .unwrap();
+    assert!(
+        corpus.starts_with("First\n\nSecond\n\n"),
+        "unexpected: {corpus}"
+    );
+    assert!(corpus.contains("Reviewers: a"), "unexpected: {corpus}");
+    assert!(!corpus.contains("<placeholder>"), "unexpected: {corpus}");
+    let faux_only = join_create_corpus(&[], Some("a"), None).unwrap();
+    assert!(
+        faux_only.contains("<placeholder>"),
+        "unexpected: {faux_only}"
+    );
+}
+
+#[test]
+fn revision_uri_derives_from_diff_origin() {
+    assert_eq!(
+        revision_uri_from_diff_uri("https://phab.test/differential/diff/3/", 7),
+        "https://phab.test/D7"
+    );
+    assert_eq!(revision_uri_from_diff_uri("garbage", 7), "/D7");
 }

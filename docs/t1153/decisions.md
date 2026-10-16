@@ -72,13 +72,13 @@ LAND-0a/b/c, AMEND-0, LAND-1 nest under `constraints` via the shared
 | DIFF-D15 (`user.query` list) | FIXED (Rule 0) | iterate list rows like PHP `validateCommitMessage` |
 | PATCH-P1 diffID type | KEEP BOTH (Rule 2c) | orsay accepts string AND number with identical bytes (probed); PHP never calls `getrawdiff`, so no reference shape exists |
 | PATCH-P1 `parse_diff_rows` ids | FIXED via R2 (Rule 0) | string ids → `id: 0` → `ERR_NOT_FOUND` live today |
-| PATCH-P2 (bundle from dicts) | FIXED (Rule 0) | render from `querydiffs` `changes[]` like `loadBundleFromConduit`, not `getrawdiff` text |
+| PATCH-P2 (bundle from dicts) | FIXED (Rule 0) | render from `querydiffs` `changes[]` like `loadBundleFromConduit`, not `getrawdiff` text; verified byte-parity on D494 (480 files, 474 hunk headers identical to server raw) |
 | DIFF-D1 (`edit:false`) | FIXED (Rule 0) | one-key wire fix + doc-cite correction |
 | DIFF-D3/D5 + D2-create | FIXED (Rule 1) | create path pulls server fields+xactions via `parsecommitmessage`; `revision.edit` iff xactions non-empty (the signal PHP reads); legacy branch keeps the ceb `--draft` error |
 | DIFF-D4 (git hunks) | FIXED (Rule 0) | git submits parse range diff text through `parse_unified_diff` like PHP `generateChanges` |
-| EXPORT-E9 (encoding) | FIXED (Rule 0) | render converts UTF-8→target (was reversed); no-encoding passes valid UTF-8 through untouched; unknown encoding throws. Residual (Rule 3): Rust `String` cannot hold invalid-UTF-8 bytes PHP passes raw — lossy only on that path, documented at the call site |
-| EXPORT-E10 (hunk corpus) | FIXED (Rule 0) | corpus is body-only (strip `@@` header) for bundle AND submit — one parser feeds both in PHP |
-| RB-D26 (tasks order) | FIXED via R8 (Rule 0) | `preserve_order` serde so PHID-keyed objects keep server order |
+| EXPORT-E9 (encoding) | FIXED (Rule 0) | render converts UTF-8→target at the stdout sink (was reversed into mojibake); valid UTF-8 passes through untouched; cp1252-family via table, latin1-family 1:1, unknown throws. Residual (Rule 3): Rust `String` cannot hold invalid-UTF-8 bytes PHP passes raw — lossy only on that path, documented at the call site |
+| EXPORT-E10 (hunk corpus) | FIXED (Rule 0) | corpus is body-only (strip `@@` header) for bundle AND submit — one parser feeds both in PHP; render rebuilds headers from offsets incl. the small-hunk splitter port (`breakHunkIntoSmallHunks`), pinned by the live D494 `.arclint` vector |
+| RB-D26 (tasks order) | FIXED via R8 (Rule 0) | `preserve_order` serde so PHID-keyed objects keep server order; follow-ups: signature encoder now sorts keys explicitly (it claimed to but relied on BTreeMap order), `.arclint` linter order is file order like PHP's `foreach` (test updated) |
 | RB-D27 (exit codes) | CLEAN (Rule 4) | not reproduced: 4 live failure modes (transport/API/missing-token/outside-repo) all yield stderr + exit 1 on HEAD, matching the cited code; regression test added |
 
 ### Keep-list (Rule 2, recorded early per task §10 step 4)

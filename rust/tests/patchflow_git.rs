@@ -314,19 +314,25 @@ fn patch_apply_requires_repo() {
 }
 
 #[test]
-fn patch_fetches_revision_through_querydiffs_then_getrawdiff() {
-    let query = r#"{"result": {"77": {"id": 77}}, "error_code": null}"#;
-    let raw = r#"{"result": "diff --git a/x\n", "error_code": null}"#;
-    let (base, rx) = serve_seq(vec![query, raw]);
+fn patch_renders_revision_from_querydiffs_dicts() {
+    let query = r#"{"result": {"77": {"id": "77", "changes": [
+        {"type": "2", "fileType": "1", "oldPath": "a.txt", "currentPath": "a.txt",
+         "hunks": [{"oldOffset": "1", "oldLength": "1", "newOffset": "1",
+                    "newLength": "1", "corpus": "-a\n+b\n"}]}
+      ]}}, "error_code": null}"#;
+    let (base, rx) = serve_seq(vec![query]);
     let client = client_for(&base);
     let call = patch_call(&client);
 
     let bundle = patch::fetch_revision_bundle(&call, 123).unwrap();
-    assert_eq!(bundle.text, "diff --git a/x\n");
+    assert_eq!(
+        bundle.text,
+        "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+b\n\n"
+    );
     assert_eq!(bundle.revision_id, Some(123));
 
     let seen = seen_requests(&rx);
-    assert_eq!(seen.len(), 2);
+    assert_eq!(seen.len(), 1);
     assert!(
         seen[0].0.starts_with("POST /api/differential.querydiffs "),
         "{}",
@@ -334,36 +340,32 @@ fn patch_fetches_revision_through_querydiffs_then_getrawdiff() {
     );
     assert!(seen[0].1.contains("revisionIDs"), "{}", seen[0].1);
     assert!(seen[0].1.contains("123"), "{}", seen[0].1);
-    assert!(
-        seen[1].0.starts_with("POST /api/differential.getrawdiff "),
-        "{}",
-        seen[1].0
-    );
-    assert!(seen[1].1.contains("77"), "{}", seen[1].1);
 }
 
 #[test]
 fn patch_fetches_single_diff() {
-    let raw = r#"{"result": "patch-bytes\n", "error_code": null}"#;
-    let query = r#"{"result": {"9": {"id": 9}}, "error_code": null}"#;
-    let (base, rx) = serve_seq(vec![query, raw]);
+    let query = r#"{"result": {"9": {"id": "9", "changes": [
+        {"type": "2", "fileType": "1", "oldPath": "a.txt", "currentPath": "a.txt",
+         "hunks": [{"oldOffset": "1", "oldLength": "1", "newOffset": "1",
+                    "newLength": "1", "corpus": "-a\n+b\n"}]}
+      ]}}, "error_code": null}"#;
+    let (base, rx) = serve_seq(vec![query]);
     let client = client_for(&base);
     let call = patch_call(&client);
 
     let bundle = patch::fetch_diff_bundle(&call, 9).unwrap();
-    assert_eq!(bundle.text, "patch-bytes\n");
+    assert!(
+        bundle.text.contains("@@ -1 +1 @@\n-a\n+b\n"),
+        "{}",
+        bundle.text
+    );
 
     let seen = seen_requests(&rx);
-    assert_eq!(seen.len(), 2);
+    assert_eq!(seen.len(), 1);
     assert!(
         seen[0].0.starts_with("POST /api/differential.querydiffs "),
         "{}",
         seen[0].0
-    );
-    assert!(
-        seen[1].0.starts_with("POST /api/differential.getrawdiff "),
-        "{}",
-        seen[1].0
     );
 }
 

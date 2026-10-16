@@ -72,6 +72,25 @@ pub const PROP_ONTO: &str = "arc:onto";
 /// (`ArcanistDiffWorkflow.php:2272`).
 pub const CREATION_METHOD_ARC: &str = "arc";
 
+/// Loose `i64` coercion for legacy-query scalars (T1153 R2): orsay types
+/// `differential.query` / `user.query` / `differential.querydiffs`
+/// scalars as strings while other servers send numbers; PHP compares
+/// loosely. Accepts both, `None` otherwise.
+#[must_use]
+pub fn loose_i64(value: &serde_json::Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|s| s.parse::<i64>().ok()))
+}
+
+/// Loose `u64` coercion, same wire rule as [`loose_i64`] for IDs.
+#[must_use]
+pub fn loose_u64(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|s| s.parse::<u64>().ok()))
+}
+
 /// `ArcanistLintWorkflow::RESULT_OKAY` (`ArcanistLintWorkflow.php:8`).
 pub const LINT_RESULT_OKAY: i64 = 0;
 /// `ArcanistLintWorkflow::RESULT_WARNINGS` (`ArcanistLintWorkflow.php:9`).
@@ -420,16 +439,6 @@ pub fn commit_message_update_params(
         "revision_id": revision_id,
         "edit": "edit",
         "fields": fields,
-    })
-}
-
-/// Build the `--update` message `differential.getcommitmessage` params:
-/// `revision_id`, `edit` = `edit` (`ArcanistDiffWorkflow.php:1600-1603`).
-#[must_use]
-pub fn get_commit_message_edit_params(revision_id: i64) -> serde_json::Value {
-    serde_json::json!({
-        "revision_id": revision_id,
-        "edit": "edit",
     })
 }
 

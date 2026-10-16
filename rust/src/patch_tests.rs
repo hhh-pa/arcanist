@@ -319,13 +319,45 @@ fn bundle_helpers() {
 
 #[test]
 fn decodes_bytes() {
-    assert_eq!(decode_bytes(b"plain", None), "plain");
-    assert_eq!(decode_bytes(b"plain", Some("UTF-8")), "plain");
-    assert_eq!(decode_bytes(b"plain", Some("utf8")), "plain");
-    assert_eq!(decode_bytes(b"\xff", None), "\u{FFFD}");
-    assert_eq!(decode_bytes(&[0xE9], Some("latin1")), "é");
-    assert_eq!(decode_bytes(&[0x80], Some("windows-1252")), "€");
-    assert_eq!(decode_bytes(&[0x81], Some("latin1")), "\u{FFFD}");
+    assert_eq!(decode_bytes(b"plain", None).unwrap(), "plain");
+    assert_eq!(decode_bytes(b"plain", Some("UTF-8")).unwrap(), "plain");
+    assert_eq!(decode_bytes(b"plain", Some("utf8")).unwrap(), "plain");
+    assert_eq!(decode_bytes(b"\xff", None).unwrap(), "\u{FFFD}");
+    assert_eq!(decode_bytes(&[0xE9], Some("latin1")).unwrap(), "é");
+    assert_eq!(decode_bytes(&[0x80], Some("windows-1252")).unwrap(), "€");
+    // Latin-1 maps 1:1 (a control scalar here, not U+FFFD).
+    assert_eq!(decode_bytes(&[0x81], Some("latin1")).unwrap(), "");
+    // Valid UTF-8 passes through untouched whatever the encoding reads.
+    assert_eq!(
+        decode_bytes("café\n".as_bytes(), Some("windows-1252")).unwrap(),
+        "café\n"
+    );
+    // Unknown encodings throw.
+    assert_eq!(
+        decode_bytes(b"\xff", Some("shift-jis")).unwrap_err(),
+        "Unknown encoding \"shift-jis\"."
+    );
+}
+
+#[test]
+fn encodes_bytes_to_target() {
+    assert_eq!(encode_bytes("café\n", None).unwrap(), "café\n".as_bytes());
+    assert_eq!(
+        encode_bytes("café\n", Some("UTF-8")).unwrap(),
+        "café\n".as_bytes()
+    );
+    assert_eq!(
+        encode_bytes("café €\n", Some("windows-1252")).unwrap(),
+        b"caf\xe9 \x80\n".to_vec()
+    );
+    assert_eq!(
+        encode_bytes("café\n", Some("latin1")).unwrap(),
+        b"caf\xe9\n".to_vec()
+    );
+    assert_eq!(
+        encode_bytes("x", Some("shift-jis")).unwrap_err(),
+        "Unknown encoding \"shift-jis\"."
+    );
 }
 
 #[test]
@@ -365,14 +397,14 @@ fn gap2_cp1252_table_covers_all_bytes() {
     assert_eq!(specials.len(), 27);
     for (byte, expected) in specials {
         assert_eq!(
-            decode_bytes(&[*byte], Some("windows-1252")),
+            decode_bytes(&[*byte], Some("windows-1252")).unwrap(),
             expected.to_string(),
             "byte 0x{byte:02X}"
         );
     }
     for byte in [0x81u8, 0x8D, 0x8F, 0x90, 0x9D] {
         assert_eq!(
-            decode_bytes(&[byte], Some("windows-1252")),
+            decode_bytes(&[byte], Some("windows-1252")).unwrap(),
             "\u{FFFD}",
             "byte 0x{byte:02X}"
         );
@@ -383,12 +415,12 @@ fn gap2_cp1252_table_covers_all_bytes() {
         }
         let expected = char::from_u32(u32::from(byte)).unwrap().to_string();
         assert_eq!(
-            decode_bytes(&[byte], Some("cp1252")),
+            decode_bytes(&[byte], Some("cp1252")).unwrap(),
             expected,
             "byte 0x{byte:02X}"
         );
     }
-    assert_eq!(decode_bytes(&[0x80], None), "\u{FFFD}");
+    assert_eq!(decode_bytes(&[0x80], None).unwrap(), "\u{FFFD}");
 }
 
 #[test]
@@ -437,14 +469,14 @@ fn file_bundle_decodes_with_encoding() {
     let dir = temp_dir("file_bundle_enc");
     let path = dir.join("fix.patch");
     let mut bytes = b"diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+".to_vec();
-    bytes.push(0x80);
+    bytes.push(0xE9);
     bytes.push(b'\n');
     std::fs::write(&path, &bytes).unwrap();
     let mut io = Io::buffered();
     let bundle = load_file_bundle(&path.to_string_lossy(), Some("latin1"), &mut io).unwrap();
     assert_eq!(
         bundle.text,
-        "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+€\n"
+        "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+é\n"
     );
 }
 
@@ -456,6 +488,22 @@ fn quotes_git_targets() {
     assert_eq!(quote_git_target("a\nb"), "\"a\\nb\"");
     assert_eq!(quote_git_target("a\tb"), "\"a\\tb\"");
     assert_eq!(quote_git_target("a\x01b"), "\"a\\001b\"");
+}
+
+fn parsed_hunk(
+    old_start: u64,
+    old_len: u64,
+    new_start: u64,
+    new_len: u64,
+    corpus: &str,
+) -> crate::diff_local::ParsedHunk {
+    crate::diff_local::ParsedHunk {
+        old_start,
+        old_len,
+        new_start,
+        new_len,
+        corpus: corpus.to_string(),
+    }
 }
 
 fn bundle_change(change_type: u32, old: Option<&str>, current: Option<&str>) -> BundleChange {
@@ -479,11 +527,11 @@ fn bundle_change(change_type: u32, old: Option<&str>, current: Option<&str>) -> 
 fn renders_add_change_delete() {
     let mut changes = vec![
         BundleChange {
-            hunks: vec!["@@ -0,0 +1 @@\n+hi\n".to_string()],
+            hunks: vec![parsed_hunk(0, 0, 1, 1, "+hi\n")],
             ..bundle_change(TYPE_ADD, None, Some("new.txt"))
         },
         BundleChange {
-            hunks: vec!["@@ -1 +1 @@\n-a\n+b\n".to_string()],
+            hunks: vec![parsed_hunk(1, 1, 1, 1, "-a\n+b\n")],
             ..bundle_change(TYPE_CHANGE, Some("old.txt"), Some("old.txt"))
         },
         BundleChange {
@@ -601,7 +649,7 @@ fn multicopy_without_sibling_fails() {
 #[test]
 fn render_appends_missing_trailing_newline() {
     let mut changes = vec![BundleChange {
-        hunks: vec!["@@ -1 +1 @@\n-a\n+b".to_string()],
+        hunks: vec![parsed_hunk(1, 1, 1, 1, "-a\n+b")],
         ..bundle_change(TYPE_CHANGE, Some("a.txt"), Some("a.txt"))
     }];
     let text = render_git_patch(&mut changes).unwrap();
@@ -739,26 +787,34 @@ fn extracts_raw_diff_text() {
     assert_eq!(raw_diff_text(&serde_json::json!({})), None);
 }
 
-fn diff_responses(raw: serde_json::Value) -> std::collections::HashMap<String, serde_json::Value> {
-    std::collections::HashMap::from([
-        (
-            diff_submit::METHOD_QUERY_DIFFS.to_string(),
-            serde_json::json!({
-                "1": {"id": 1, "revisionID": 7, "sourceControlBaseRevision": "base1",
-                      "authorName": "Ada", "authorEmail": "ada@test"},
-                "2": {"id": 2, "revisionID": 7, "sourceControlBaseRevision": "base2",
-                      "authorName": "Ada", "authorEmail": "ada@test"}
-            }),
-        ),
-        (METHOD_GET_RAW_DIFF.to_string(), raw),
-    ])
+fn diff_responses() -> std::collections::HashMap<String, serde_json::Value> {
+    let change = serde_json::json!({
+        "type": "2", "fileType": "1",
+        "oldPath": "a.txt", "currentPath": "a.txt",
+        "hunks": [{"oldOffset": "1", "oldLength": "1",
+                   "newOffset": "1", "newLength": "1",
+                   "corpus": "-a\n+b\n"}],
+    });
+    std::collections::HashMap::from([(
+        diff_submit::METHOD_QUERY_DIFFS.to_string(),
+        serde_json::json!({
+            "1": {"id": "1", "revisionID": "7", "sourceControlBaseRevision": "base1",
+                  "authorName": "Ada", "authorEmail": "ada@test", "changes": []},
+            "2": {"id": "2", "revisionID": "7", "sourceControlBaseRevision": "base2",
+                  "authorName": "Ada", "authorEmail": "ada@test",
+                  "changes": [change]},
+        }),
+    )])
 }
 
 #[test]
 fn fetches_latest_diff_bundle() {
-    let call = stub_call(diff_responses(serde_json::json!("patch text")));
+    let call = stub_call(diff_responses());
     let bundle = fetch_revision_bundle(&call, 7).unwrap();
-    assert_eq!(bundle.text, "patch text");
+    assert_eq!(
+        bundle.text,
+        "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+b\n\n"
+    );
     assert_eq!(bundle.base_revision.as_deref(), Some("base2"));
     assert_eq!(bundle.revision_id, Some(7));
     assert_eq!(bundle.author_name.as_deref(), Some("Ada"));
@@ -767,9 +823,13 @@ fn fetches_latest_diff_bundle() {
 
 #[test]
 fn fetch_prefers_row_revision_when_unset() {
-    let call = stub_call(diff_responses(serde_json::json!({"rawDiff": "rd"})));
+    let call = stub_call(diff_responses());
     let bundle = fetch_conduit_bundle(&call, &serde_json::json!({"ids": [2]}), None).unwrap();
-    assert_eq!(bundle.text, "rd");
+    assert!(
+        bundle.text.contains("@@ -1 +1 @@\n-a\n+b\n"),
+        "{}",
+        bundle.text
+    );
     assert_eq!(bundle.revision_id, Some(7));
 }
 
@@ -786,12 +846,16 @@ fn fetch_fails_without_diffs() {
 }
 
 #[test]
-fn fetch_fails_on_bad_raw_diff() {
-    let call = stub_call(diff_responses(serde_json::json!({"nonsense": true})));
-    assert_eq!(
-        fetch_diff_bundle(&call, 2).unwrap_err(),
-        "differential.getrawdiff returned an unexpected response"
-    );
+fn fetch_renders_empty_text_without_changes() {
+    let call = stub_call(std::collections::HashMap::from([(
+        diff_submit::METHOD_QUERY_DIFFS.to_string(),
+        serde_json::json!({
+            "2": {"id": "2", "revisionID": "7", "sourceControlBaseRevision": "base2",
+                  "authorName": "Ada", "authorEmail": "ada@test"},
+        }),
+    )]));
+    let bundle = fetch_diff_bundle(&call, 2).unwrap();
+    assert_eq!(bundle.text, "\n");
 }
 
 #[test]
@@ -861,7 +925,7 @@ fn loads_each_bundle_kind() {
     assert_eq!(loaded.bundle.text, "diff --git a/f b/f\n");
     assert!(loaded.arcbundle_dicts.is_none());
 
-    let call = stub_call(diff_responses(serde_json::json!("raw")));
+    let call = stub_call(diff_responses());
     let loaded = load_bundle(
         &Source::Revision("7".to_string()),
         &options,
@@ -869,7 +933,7 @@ fn loads_each_bundle_kind() {
         Some(&call),
     )
     .unwrap();
-    assert_eq!(loaded.bundle.text, "raw");
+    assert!(loaded.bundle.text.contains("@@ -1 +1 @@\n-a\n+b\n"));
     assert_eq!(loaded.bundle.revision_id, Some(7));
     let loaded = load_bundle(
         &Source::Named("7".to_string()),
@@ -886,7 +950,7 @@ fn loads_each_bundle_kind() {
         Some(&call),
     )
     .unwrap();
-    assert_eq!(loaded.bundle.text, "raw");
+    assert!(loaded.bundle.text.contains("@@ -1 +1 @@\n-a\n+b\n"));
 
     let bundle_path = write_arcbundle(
         &dir,
@@ -895,9 +959,9 @@ fn loads_each_bundle_kind() {
             ("meta.json", br#"{"revisionID":3}"#),
             (
                 "changes.json",
-                br#"[{"type":2,"fileType":1,"oldPath":"a.txt","currentPath":"a.txt","hunks":[{"corpus":0}]}]"#,
+                br#"[{"type":2,"fileType":1,"oldPath":"a.txt","currentPath":"a.txt","hunks":[{"oldOffset":1,"oldLength":1,"newOffset":1,"newLength":1,"corpus":0}]}]"#,
             ),
-            ("hunks/0", b"@@ -1 +1 @@\n-a\n+b\n"),
+            ("hunks/0", b"-a\n+b\n"),
         ],
     );
     let loaded = load_bundle(
@@ -910,14 +974,15 @@ fn loads_each_bundle_kind() {
     assert_eq!(loaded.bundle.revision_id, Some(3));
     let (dicts, corpora) = loaded.arcbundle_dicts.unwrap();
     assert_eq!(dicts.len(), 1);
-    assert_eq!(corpora, vec![vec!["@@ -1 +1 @@\n-a\n+b\n".to_string()]]);
+    assert_eq!(corpora, vec![vec![parsed_hunk(1, 1, 1, 1, "-a\n+b\n")]]);
+    assert!(loaded.bundle.text.contains("@@ -1 +1 @@\n-a\n+b\n"));
 }
 
 #[test]
 fn load_bundle_rejects_bad_ids_and_missing_conduit() {
     let options = Options::default();
     let mut io = Io::buffered();
-    let call = stub_call(diff_responses(serde_json::json!("raw")));
+    let call = stub_call(diff_responses());
     assert_eq!(
         load_bundle(
             &Source::Revision("Dx".to_string()),
@@ -1913,8 +1978,8 @@ fn svn_changes_from_dicts_map() {
         serde_json::json!({"type": 5, "fileType": 5, "oldPath": "l", "currentPath": "l2"}),
     ];
     let corpora = vec![
-        vec!["@@ -0,0 +1 @@\n".to_string(), "+x\n".to_string()],
-        vec!["@@ -1 +1 @@\n-t\n+u\n".to_string()],
+        vec![parsed_hunk(0, 0, 1, 1, "+x\n")],
+        vec![parsed_hunk(1, 1, 1, 1, "-t\n+u\n")],
     ];
     let changes = svn_changes_from_dicts(&dicts, &corpora);
     assert_eq!(changes.len(), 2);
@@ -2575,7 +2640,7 @@ fn gap2_build_binary_add() {
 #[test]
 fn gap2_render_with_blobs_matches_text() {
     let mut text_changes = vec![BundleChange {
-        hunks: vec!["@@ -1 +1 @@\n-a\n+b\n".to_string()],
+        hunks: vec![parsed_hunk(1, 1, 1, 1, "-a\n+b\n")],
         ..bundle_change(TYPE_CHANGE, Some("a.txt"), Some("a.txt"))
     }];
     let expected = render_git_patch(&mut text_changes.clone()).unwrap();
@@ -3015,4 +3080,163 @@ fn ansi_clean_tree_desc_underlines_path() {
             assert!(!io.out.stdout.contains('\x1b'), "{}", io.out.stdout);
         }
     }
+}
+
+#[test]
+fn dependency_nodes_accept_string_ids() {
+    let node = parse_dependency_node(&serde_json::json!({
+        "phid": "PHID-DREV-1",
+        "id": "494",
+        "auxiliary": {"phabricator:depends-on": ["PHID-DREV-2"]},
+    }))
+    .unwrap();
+    assert_eq!(node.id, 494);
+    assert_eq!(node.depends_on, vec!["PHID-DREV-2".to_string()]);
+    let node = parse_dependency_node(&serde_json::json!({
+        "phid": "PHID-DREV-1",
+        "id": 494,
+    }))
+    .unwrap();
+    assert_eq!(node.id, 494);
+}
+
+#[test]
+fn diff_rows_accept_string_ids() {
+    let rows = parse_diff_rows(&serde_json::json!({
+        "1633": {"id": "1633", "revisionID": "494", "authorName": "a", "authorEmail": "e"},
+    }));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, 1633);
+    assert_eq!(rows[0].revision_id, Some(494));
+}
+
+#[test]
+fn revision_suffix_matches_closed_string_rows() {
+    let call = |_: &str, _: &serde_json::Value| {
+        Ok(serde_json::json!([
+            {"id": "491", "status": "3", "dateModified": "100"},
+            {"id": "492", "status": "1", "dateModified": "200"},
+        ]))
+    };
+    assert_eq!(
+        revision_suffix_for_hash(&call, "gtcm", "abc"),
+        Some(" \\ D491".to_string())
+    );
+}
+
+#[test]
+fn render_hunks_rebuilds_headers_from_offsets() {
+    // Length 1 omits `,len` like git; missing trailing newline is added.
+    assert_eq!(
+        render_hunks(&[parsed_hunk(1, 1, 1, 1, "-a\n+b")]),
+        "@@ -1 +1 @@\n-a\n+b\n"
+    );
+    assert_eq!(
+        render_hunks(&[parsed_hunk(0, 0, 1, 3, "+a\n+b\n+c\n")]),
+        "@@ -0,0 +1,3 @@\n+a\n+b\n+c\n"
+    );
+    assert_eq!(render_hunks(&[]), "");
+}
+
+#[test]
+fn conduit_hunks_coerce_string_offsets() {
+    let hunks = conduit_hunks_from_dict(&serde_json::json!({
+        "hunks": [
+            {"oldOffset": "1", "oldLength": "1", "newOffset": "1",
+             "newLength": "1", "corpus": "-a\n+b\n"},
+            {"corpus": "+x\n"},
+        ],
+    }));
+    assert_eq!(
+        hunks,
+        vec![
+            parsed_hunk(1, 1, 1, 1, "-a\n+b\n"),
+            parsed_hunk(0, 0, 0, 0, "+x\n"),
+        ]
+    );
+    assert!(conduit_hunks_from_dict(&serde_json::json!({})).is_empty());
+}
+
+#[test]
+fn break_hunk_splits_seven_line_gaps_like_diff_u() {
+    // PHI838: 7 unchanged lines between changes split into two hunks.
+    let mut body = vec!["-old".to_string(), "+new".to_string()];
+    for i in 0..7 {
+        body.push(format!(" ctx{i}"));
+    }
+    body.push("-gone".to_string());
+    body.push("+here".to_string());
+    let corpus = body.join("\n") + "\n";
+    let small = break_hunk_into_small_hunks(&parsed_hunk(10, 9, 10, 9, &corpus));
+    assert_eq!(small.len(), 2);
+    assert_eq!(
+        (
+            small[0].old_start,
+            small[0].old_len,
+            small[0].new_start,
+            small[0].new_len
+        ),
+        (10, 4, 10, 4)
+    );
+    assert_eq!(
+        (
+            small[1].old_start,
+            small[1].old_len,
+            small[1].new_start,
+            small[1].new_len
+        ),
+        (15, 4, 15, 4)
+    );
+    assert!(small[0].corpus.ends_with(" ctx2\n"));
+    assert!(small[1].corpus.starts_with(" ctx4\n"));
+}
+
+#[test]
+fn break_hunk_keeps_small_changes_whole() {
+    // Lengths recompute from the corpus; input lengths are ignored.
+    let small = break_hunk_into_small_hunks(&parsed_hunk(1, 99, 1, 99, " a\n-b\n+b\n c\n"));
+    assert_eq!(small.len(), 1);
+    assert_eq!(
+        (
+            small[0].old_start,
+            small[0].old_len,
+            small[0].new_start,
+            small[0].new_len
+        ),
+        (1, 3, 1, 3)
+    );
+    assert_eq!(small[0].corpus, " a\n-b\n+b\n c\n");
+}
+
+#[test]
+fn break_hunk_matches_server_split_live_vector() {
+    // D494 `.arclint`: one stored hunk (1,86,1,109) renders as the same
+    // two headers orsay serves.
+    let corpus = include_str!("../tests/fixtures/patch/arclint-live-corpus.txt");
+    let small = break_hunk_into_small_hunks(&parsed_hunk(1, 86, 1, 109, corpus));
+    assert_eq!(small.len(), 2);
+    assert_eq!(
+        (
+            small[0].old_start,
+            small[0].old_len,
+            small[0].new_start,
+            small[0].new_len
+        ),
+        (8, 6, 8, 13)
+    );
+    assert_eq!(
+        (
+            small[1].old_start,
+            small[1].old_len,
+            small[1].new_start,
+            small[1].new_len
+        ),
+        (58, 15, 65, 31)
+    );
+    let rendered = render_hunks(&[parsed_hunk(1, 86, 1, 109, corpus)]);
+    assert!(rendered.contains("@@ -8,6 +8,13 @@\n"), "{rendered:.200}");
+    assert!(
+        rendered.contains("@@ -58,15 +65,31 @@\n"),
+        "{rendered:.200}"
+    );
 }
