@@ -490,7 +490,7 @@ fn fetch_revision_views_queries_ids_and_phids() {
     );
     assert_eq!(
         seen.borrow()[1],
-        serde_json::json!({"phids": ["PHID-DREV-89"]})
+        serde_json::json!({"constraints": {"phids": ["PHID-DREV-89"]}})
     );
 }
 
@@ -602,6 +602,56 @@ fn build_views_join_buildable_build_plan() {
     assert_eq!(builds[0].build_name, "Lint");
     assert_eq!(builds[0].buildable_monogram, "B7");
     assert_eq!(builds[0].buildable_uri, "https://phab.example.com/B7");
+}
+
+#[test]
+fn build_gate_queries_nest_constraints() {
+    let seen: std::rc::Rc<std::cell::RefCell<Vec<(String, serde_json::Value)>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let probe = seen.clone();
+    let call = move |method: &str, params: &serde_json::Value| {
+        probe
+            .borrow_mut()
+            .push((method.to_string(), params.clone()));
+        Ok(match method {
+            METHOD_BUILDABLE_SEARCH => serde_json::json!({"data": [
+                {"id": 7, "phid": "PHID-HMBB-7", "fields": {"objectPHID": "PHID-DIFF-89"}},
+            ]}),
+            METHOD_BUILD_SEARCH => serde_json::json!({"data": [
+                {"id": 42, "fields": {
+                    "name": "Lint",
+                    "buildStatus": {"value": "passed"},
+                    "buildablePHID": "PHID-HMBB-7",
+                    "buildPlanPHID": "PHID-HMPA-1",
+                }},
+            ]}),
+            _ => serde_json::json!({"data": [
+                {"phid": "PHID-HMPA-1", "fields": {"behaviors": {"arc-land": {"value": "always"}}}},
+            ]}),
+        })
+    };
+    let revisions = vec![view(89, "accepted", "Accepted", false, "PHID-USER-a")];
+    fetch_build_views(&call, &revisions, None).unwrap();
+    assert_eq!(
+        *seen.borrow(),
+        vec![
+            (
+                METHOD_BUILDABLE_SEARCH.to_string(),
+                serde_json::json!({"constraints": {
+                    "objectPHIDs": ["PHID-DIFF-89"],
+                    "manual": false,
+                }}),
+            ),
+            (
+                METHOD_BUILD_SEARCH.to_string(),
+                serde_json::json!({"constraints": {"buildables": ["PHID-HMBB-7"]}}),
+            ),
+            (
+                METHOD_BUILDPLAN_SEARCH.to_string(),
+                serde_json::json!({"constraints": {"phids": ["PHID-HMPA-1"]}}),
+            ),
+        ]
+    );
 }
 
 #[test]

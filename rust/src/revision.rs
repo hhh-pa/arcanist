@@ -298,6 +298,26 @@ fn uri_revision_id(raw: &str) -> Option<u32> {
     bare_revision_id(trimmed)
 }
 
+/// Build one new-style `.search` request body: `{"constraints": ...}`
+/// plus `attachments` only when given — the exact
+/// `ConduitSearchFuture` wire shape
+/// (`src/conduit/ConduitSearchFuture.php:96`). Every new-style search
+/// call site must build its params through this (or [`conduit_search`]);
+/// flat constraint params are rejected by the server with
+/// `ERR-CONDUIT-CALL`. (`edge.search` is the one exception: PHP sends it
+/// flat via `yieldConduit`, so it stays flat.)
+#[must_use]
+pub fn conduit_search_params(
+    constraints: &serde_json::Value,
+    attachments: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut params = serde_json::json!({ "constraints": constraints });
+    if let Some(extra) = attachments {
+        params["attachments"] = extra.clone();
+    }
+    params
+}
+
 /// Run a paginated conduit search (`ConduitSearchFuture`): POST
 /// `{constraints, attachments?, after?}`, accumulate `data`, follow
 /// `cursor.after` until null.
@@ -310,10 +330,7 @@ pub fn conduit_search(
     let mut objects = Vec::new();
     let mut after: Option<String> = None;
     loop {
-        let mut params = serde_json::json!({ "constraints": constraints });
-        if let Some(extra) = attachments {
-            params["attachments"] = extra.clone();
-        }
+        let mut params = conduit_search_params(constraints, attachments);
         if let Some(cursor) = &after {
             params["after"] = serde_json::Value::String(cursor.clone());
         }

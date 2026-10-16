@@ -110,7 +110,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use arc_rs::{config, diff_submit, git, hg, land_checks};
+use arc_rs::{config, diff_submit, git, hg, land_checks, revision};
 
 use crate::terminal::{self, TVal};
 
@@ -1852,14 +1852,15 @@ pub fn fetch_revision_views(
     call: &diff_submit::ConduitCall<'_>,
     symbol: &RevisionSymbol,
 ) -> Result<Vec<land_checks::RevisionView>, String> {
-    let params = match symbol {
+    let constraints = match symbol {
         RevisionSymbol::Id(id) => {
             let numeric =
                 i64::try_from(*id).map_err(|_| format!("Revision ID {id} is out of range."))?;
-            diff_submit::revision_search_params(&[numeric])
+            serde_json::json!({"ids": [numeric]})
         }
         RevisionSymbol::Phid(phid) => serde_json::json!({"phids": [phid]}),
     };
+    let params = revision::conduit_search_params(&constraints, None);
     let result = call(diff_submit::METHOD_REVISION_SEARCH, &params)?;
     let rows = result
         .get("data")
@@ -2173,7 +2174,10 @@ pub fn fetch_build_views(
     }
     let buildables = call(
         METHOD_BUILDABLE_SEARCH,
-        &serde_json::json!({"objectPHIDs": diff_phids, "manual": false}),
+        &revision::conduit_search_params(
+            &serde_json::json!({"objectPHIDs": diff_phids, "manual": false}),
+            None,
+        ),
     )?;
     let rows = parse_buildable_rows(&buildables)?;
     // Join buildable objectPHID -> revision diffPHID, like
@@ -2185,7 +2189,7 @@ pub fn fetch_build_views(
     let phids: Vec<String> = rows.iter().map(|row| row.phid.clone()).collect();
     let builds = call(
         METHOD_BUILD_SEARCH,
-        &serde_json::json!({"buildables": phids}),
+        &revision::conduit_search_params(&serde_json::json!({"buildables": phids}), None),
     )?;
     let build_rows = parse_build_rows(&builds)?;
     let behaviors = fetch_plan_behaviors(call, &build_rows)?;
@@ -2250,7 +2254,7 @@ fn fetch_plan_behaviors(
     }
     let plans = call(
         METHOD_BUILDPLAN_SEARCH,
-        &serde_json::json!({"phids": plan_phids}),
+        &revision::conduit_search_params(&serde_json::json!({"phids": plan_phids}), None),
     )?;
     parse_plan_behaviors(&plans)
 }

@@ -7,6 +7,7 @@ use std::process::{Command, ExitCode};
 use std::sync::{Arc, Mutex};
 
 use arc_rs::amend;
+use arc_rs::conduit::Client;
 use arc_rs::land;
 
 /// Unique scratch dir for one test; removed on drop (best effort).
@@ -1029,4 +1030,55 @@ fn hg_amend_refuses_dirty_files() {
         amend::execute_with_io_backends(&repo.dir, &args(&["-m", "x"]), &mut io, &hg).unwrap_err();
     assert!(err.contains("uncommitted changes"), "unexpected: {err}");
     assert!(repo.log().contains("status"), "{}", repo.log());
+}
+
+/// Decode one `application/x-www-form-urlencoded` value (`%XX` escapes;
+/// `+` stays literal, matching `rawurlencode`).
+fn url_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = &value[index + 1..index + 3];
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(out).unwrap()
+}
+
+/// The `params` JSON object of one observed Conduit request body.
+fn request_params(body: &str) -> serde_json::Value {
+    let encoded = body
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("params="))
+        .unwrap();
+    serde_json::from_str(&url_decode(encoded)).unwrap()
+}
+
+#[test]
+fn user_lookup_nests_search_constraints() {
+    let canned = r#"{"error_code":null,"error_info":null,"result":{"data":[{"phid":"PHID-USER-9","fields":{"username":"bob","realName":"Bob"}}]}}"#.to_string();
+    let (base, seen) = serve_once(canned);
+    let client = Client::new(&base, "t").unwrap();
+    let found = amend::query_user(&client, "PHID-USER-9").unwrap();
+    assert_eq!(found, Some(("bob".to_string(), "Bob".to_string())));
+    let (line, body) = seen.recv().unwrap();
+    assert!(line.contains("user.search"), "unexpected: {line}");
+    let params = request_params(&body);
+    assert_eq!(
+        params.get("constraints"),
+        Some(&serde_json::json!({"phids": ["PHID-USER-9"]})),
+        "unexpected params: {params}"
+    );
+    assert!(
+        params.get("phids").is_none(),
+        "flat constraints rejected by the server: {params}"
+    );
 }

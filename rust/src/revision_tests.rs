@@ -267,3 +267,84 @@ fn matches_permanent_rule_patterns() {
     assert!(!regexp_match("(a)\\1", "aa"));
     assert!(!regexp_match("(unclosed", "unclosed"));
 }
+
+#[test]
+fn search_params_builder_nests_constraints() {
+    assert_eq!(
+        conduit_search_params(&serde_json::json!({"phids": ["PHID-USER-9"]}), None),
+        serde_json::json!({"constraints": {"phids": ["PHID-USER-9"]}})
+    );
+    assert_eq!(
+        conduit_search_params(
+            &serde_json::json!({"ids": [123]}),
+            Some(&serde_json::json!({"uris": true})),
+        ),
+        serde_json::json!({
+            "constraints": {"ids": [123]},
+            "attachments": {"uris": true},
+        })
+    );
+}
+
+/// Every new-style `.search` call site must send its constraints nested
+/// under a top-level `constraints` key (T1153): the server rejects flat
+/// constraint params with `ERR-CONDUIT-CALL`, exactly like PHP
+/// `ConduitSearchFuture` wraps them.
+///
+/// This test enumerates the call sites textually (a method literal like
+/// `"user.search"` or a `METHOD_*_SEARCH` constant at a call) so a
+/// future flat addition fails loudly. `edge.search` is the one
+/// flat-by-design exception (PHP sends it flat via `yieldConduit`).
+#[test]
+fn every_search_call_site_nests_constraints() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut entries: Vec<_> = std::fs::read_dir(&src)
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    entries.sort_by_key(|entry| entry.file_name());
+    let mut checked = 0;
+    let mut failures = Vec::new();
+    for entry in entries {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.ends_with("_tests.rs") {
+            continue;
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            let is_literal = line.contains(".search\"");
+            let is_constant = line.contains("METHOD_") && line.contains("SEARCH");
+            if !is_literal && !is_constant {
+                continue;
+            }
+            if line.trim_start().starts_with('/') || line.contains("pub const") {
+                continue;
+            }
+            if line.contains("edge.search") || line.contains("EDGE_SEARCH") {
+                continue;
+            }
+            checked += 1;
+            let low = index.saturating_sub(6);
+            let high = (index + 7).min(lines.len());
+            let window = lines[low..high].join("\n");
+            let nested = window.contains("\"constraints\"")
+                || window.contains("conduit_search")
+                || window.contains("search_params(")
+                || window.contains("search_constraints(");
+            if !nested {
+                failures.push(format!("{}:{}: {}", name, index + 1, line.trim()));
+            }
+        }
+    }
+    assert!(checked > 0, "search call-site scan found nothing");
+    assert!(
+        failures.is_empty(),
+        "flat .search params (missing top-level constraints):\n{}",
+        failures.join("\n")
+    );
+}

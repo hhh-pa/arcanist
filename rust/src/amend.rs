@@ -36,7 +36,9 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use crate::conduit::Client;
-use crate::{close_revision, config, diff_local, get_config, git, hg, land, svn, terminal};
+use crate::{
+    close_revision, config, diff_local, get_config, git, hg, land, revision, svn, terminal,
+};
 
 pub const NAME: &str = "amend";
 
@@ -511,7 +513,10 @@ fn ref_view_plain(object: &str, title: &str) -> String {
 /// `None` when the server knows no such user.
 pub fn query_user(client: &Client, phid: &str) -> Result<Option<(String, String)>, String> {
     let result = client
-        .call("user.search", &serde_json::json!({"phids": [phid]}))
+        .call(
+            "user.search",
+            &revision::conduit_search_params(&serde_json::json!({"phids": [phid]}), None),
+        )
         .map_err(|e| e.to_string())?;
     Ok(rows_of(&result).iter().filter_map(user_name_of).next())
 }
