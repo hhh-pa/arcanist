@@ -1644,6 +1644,486 @@ fn gap2_leading_diff_cc_recovers_to_later_git_block() {
     assert_eq!(changes[0].hunks.len(), 1);
 }
 
+/* T1153 wave 3 parser halves: EXPORT-E11..E24/E37 + E20. */
+
+fn e_headers(body: &str) -> String {
+    format!("diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n{body}")
+}
+
+#[test]
+fn e11_hunk_length_explicitness_bits() {
+    // Explicit `,length` on both sides.
+    let changes = parse_unified_diff(&e_headers("@@ -1,2 +1,3 @@\n a\n+b\n c\n")).unwrap();
+    assert_eq!(changes[0].hunks.len(), 1);
+    assert_eq!(
+        changes[0].hunk_len_explicit,
+        vec![HunkLenExplicit {
+            old_explicit: true,
+            new_explicit: true,
+        }]
+    );
+    // Bare offsets imply length 1 and encode as numbers.
+    let changes = parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\n+b\n")).unwrap();
+    assert_eq!(
+        changes[0].hunk_len_explicit,
+        vec![HunkLenExplicit {
+            old_explicit: false,
+            new_explicit: false,
+        }]
+    );
+    // Spelled `,1` differs from omitted (string "1" vs number 1).
+    let changes = parse_unified_diff(&e_headers("@@ -1,1 +1,1 @@\n-a\n+b\n")).unwrap();
+    assert_eq!(
+        (changes[0].hunks[0].old_len, changes[0].hunks[0].new_len),
+        (1, 1)
+    );
+    assert_eq!(
+        changes[0].hunk_len_explicit,
+        vec![HunkLenExplicit {
+            old_explicit: true,
+            new_explicit: true,
+        }]
+    );
+    // Mixed: explicit old, bare new.
+    let changes = parse_unified_diff(&e_headers("@@ -0,0 +1 @@\n+hi\n")).unwrap();
+    assert_eq!(
+        changes[0].hunk_len_explicit,
+        vec![HunkLenExplicit {
+            old_explicit: true,
+            new_explicit: false,
+        }]
+    );
+}
+
+#[test]
+fn e12_corpus_retains_original_line_endings() {
+    // CRLF bodies keep `\r\n`.
+    let changes = parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\r\n+b\r\n")).unwrap();
+    assert_eq!(changes[0].hunks[0].corpus, "-a\r\n+b\r\n");
+    // An unterminated final line stays unterminated.
+    let changes = parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\n+b")).unwrap();
+    assert_eq!(changes[0].hunks[0].corpus, "-a\n+b");
+    // LF bodies are byte-identical to before.
+    let changes = parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\n+b\n")).unwrap();
+    assert_eq!(changes[0].hunks[0].corpus, "-a\n+b\n");
+}
+
+#[test]
+fn e13_filemodes_retained_through_parser() {
+    let text = "diff --git a/f.txt b/f.txt\nold mode 100644\nnew mode 100755\n";
+    let changes = parse_unified_diff(text).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].change_type, TYPE_CHANGE);
+    assert_eq!(changes[0].old_mode.as_deref(), Some("100644"));
+    assert_eq!(changes[0].new_mode.as_deref(), Some("100755"));
+
+    let add = "diff --git a/n.txt b/n.txt\nnew file mode 100644\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1 @@\n+hi\n";
+    let changes = parse_unified_diff(add).unwrap();
+    assert_eq!(changes[0].change_type, TYPE_ADD);
+    assert_eq!(changes[0].old_mode, None);
+    assert_eq!(changes[0].new_mode.as_deref(), Some("100644"));
+
+    let delete = "diff --git a/o.txt b/o.txt\ndeleted file mode 100644\n--- a/o.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-bye\n";
+    let changes = parse_unified_diff(delete).unwrap();
+    assert_eq!(changes[0].change_type, TYPE_DELETE);
+    assert_eq!(changes[0].old_mode.as_deref(), Some("100644"));
+    assert_eq!(changes[0].new_mode, None);
+
+    // Plain changes carry no modes.
+    let changes = parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\n+b\n")).unwrap();
+    assert_eq!(changes[0].old_mode, None);
+    assert_eq!(changes[0].new_mode, None);
+}
+
+#[test]
+fn e15_hunk_body_validates_line_counts() {
+    // Too few lines.
+    let err = parse_unified_diff(&e_headers("@@ -1,2 +1,2 @@\n a\n+b\n")).unwrap_err();
+    assert!(err.contains(WRONG_HUNK_LINE_COUNT), "{err:?}");
+    // Too many added lines (counter goes negative).
+    let err = parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\n+b\n+c\n")).unwrap_err();
+    assert!(err.contains(WRONG_HUNK_LINE_COUNT), "{err:?}");
+    // Too many removed lines.
+    let err = parse_unified_diff(&e_headers("@@ -1,2 +1,1 @@\n-a\n-b\n-c\n+d\n")).unwrap_err();
+    assert!(err.contains(WRONG_HUNK_LINE_COUNT), "{err:?}");
+    // A new header with unexhausted counts fails at that line.
+    let err =
+        parse_unified_diff(&e_headers("@@ -1,2 +1,2 @@\n a\n@@ -9 +9 @@\n-b\n+c\n")).unwrap_err();
+    assert!(err.contains(WRONG_HUNK_LINE_COUNT), "{err:?}");
+    assert!(err.contains("@@ -9 +9 @@"), "{err:?}");
+    // The next block with unexhausted counts fails too.
+    let err = parse_unified_diff(&format!(
+        "{}diff --git a/g.txt b/g.txt\n--- a/g.txt\n+++ b/g.txt\n@@ -1 +1 @@\n-x\n+y\n",
+        e_headers("@@ -1,2 +1,2 @@\n a\n")
+    ))
+    .unwrap_err();
+    assert!(err.contains(WRONG_HUNK_LINE_COUNT), "{err:?}");
+}
+
+#[test]
+fn e15_hunk_boundaries_mirror_php() {
+    // A context line past exhausted counts ends the hunk (consumed).
+    let changes =
+        parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\n+b\n c\n@@ -2 +2 @@\n-d\n+e\n")).unwrap();
+    assert_eq!(changes[0].hunks.len(), 2);
+    assert_eq!(changes[0].hunks[0].corpus, "-a\n+b\n");
+    assert_eq!(changes[0].hunks[1].corpus, "-d\n+e\n");
+    // A `-` line with the old side exhausted holds for a following
+    // file (here skipped as between-block noise).
+    let changes = parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\n+b\n--- stray\n")).unwrap();
+    assert_eq!(changes[0].hunks.len(), 1);
+    assert_eq!(changes[0].hunks[0].corpus, "-a\n+b\n");
+    // ...but with the new side unexhausted it is a miscount.
+    let err = parse_unified_diff(&e_headers("@@ -1,1 +1,2 @@\n-a\n+b\n-c\n+d\n")).unwrap_err();
+    assert!(err.contains(WRONG_HUNK_LINE_COUNT), "{err:?}");
+    // Empty lines count as context (`diff.suppressBlankEmpty`).
+    let changes = parse_unified_diff(&e_headers("@@ -1,2 +1,2 @@\n a\n\n b\n")).unwrap();
+    assert_eq!(changes[0].hunks[0].corpus, " a\n\n");
+    // A zero-length hunk holds no body.
+    let changes = parse_unified_diff(&e_headers("@@ -0,0 +0,0 @@\n")).unwrap();
+    assert_eq!(changes[0].hunks.len(), 1);
+    assert!(changes[0].hunks[0].corpus.is_empty());
+}
+
+#[test]
+fn e15_no_newline_markers_validate_and_persist() {
+    // Malformed `\` lines fail.
+    let err = parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\n\\ bogus\n+b\n")).unwrap_err();
+    assert!(err.contains(EXPECTED_NO_NEWLINE_MARKER), "{err:?}");
+    // Well-formed markers persist in the corpus; a middle marker
+    // (new side unexhausted) continues the hunk.
+    let changes = parse_unified_diff(&e_headers(
+        "@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+b\n\\ No newline at end of file\n",
+    ))
+    .unwrap();
+    assert_eq!(
+        changes[0].hunks[0].corpus,
+        "-a\n\\ No newline at end of file\n+b\n\\ No newline at end of file\n"
+    );
+}
+
+#[test]
+fn e15_malformed_hunk_headers_fail() {
+    // Missing closing `@@`.
+    let err = parse_unified_diff(&e_headers("@@ -1 +1\n-a\n+b\n")).unwrap_err();
+    assert!(err.contains(EXPECTED_HUNK_HEADER), "{err:?}");
+    // Combined-style third range.
+    let err = parse_unified_diff(&e_headers("@@ -1,2 +1,2 +1,2 @@\n-a\n+b\n")).unwrap_err();
+    assert!(err.contains(EXPECTED_HUNK_HEADER), "{err:?}");
+    // Non-numeric range.
+    let err = parse_unified_diff(&e_headers("@@ -a +1 @@\n-a\n+b\n")).unwrap_err();
+    assert!(err.contains(EXPECTED_HUNK_HEADER), "{err:?}");
+    // Without `---`/`+++` the failure names the hunk target instead.
+    let err = parse_unified_diff("diff --git a/f.txt b/f.txt\n@@ -1 +1\n").unwrap_err();
+    assert!(err.contains(EXPECTED_HUNK_TARGET), "{err:?}");
+}
+
+#[test]
+fn e16_c_quoted_paths_decode_like_php() {
+    // `---`/`+++` paths stay literal, quotes included.
+    let changes = parse_unified_diff(
+        "diff --git a/f.txt b/f.txt\n--- \"a/old name\"\n+++ \"b/new name\"\n@@ -1 +1 @@\n-a\n+b\n",
+    )
+    .unwrap();
+    assert_eq!(changes[0].old_path, "\"a/old name\"");
+    assert_eq!(changes[0].current_path, "\"b/new name\"");
+    // The `diff --git` pair decodes (quoted, with spaces).
+    let changes = parse_unified_diff(
+        "diff --git \"a/old name\" \"b/old name\"\n--- \"a/old name\"\n+++ \"b/old name\"\n@@ -1 +1 @@\n-a\n+b\n",
+    )
+    .unwrap();
+    // Non-rename `+++` still overwrites from the literal line (the
+    // `+++`-discard applies to resolved renames/copies only).
+    assert_eq!(changes[0].old_path, "\"a/old name\"");
+    assert_eq!(changes[0].current_path, "\"b/old name\"");
+    // Quoted renames decode the `rename to` side and keep the
+    // literal `---` old path (PHP overwrites the decoded source).
+    let changes = parse_unified_diff(
+        "diff --git \"a/o n\" \"b/n n\"\nrename from \"o n\"\nrename to \"n n\"\n--- \"a/o n\"\n+++ \"b/n n\"\n@@ -1 +1 @@\n-x\n+y\n",
+    )
+    .unwrap();
+    assert_eq!(changes[0].change_type, TYPE_MOVE_HERE);
+    assert_eq!(changes[0].old_path, "\"a/o n\"");
+    assert_eq!(changes[0].current_path, "n n");
+    // Octal escapes decode to bytes.
+    let changes = parse_unified_diff(
+        "diff --git \"a/f\\303\\244\" \"b/f\\303\\244\"\n--- \"a/f\\303\\244\"\n+++ \"b/f\\303\\244\"\n@@ -1 +1 @@\n-a\n+b\n",
+    )
+    .unwrap();
+    assert_eq!(changes[0].old_path, "\"a/f\\303\\244\"");
+    // Unquoted paths are untouched.
+    let changes = parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\n+b\n")).unwrap();
+    assert_eq!(changes[0].old_path, "f.txt");
+    assert_eq!(changes[0].current_path, "f.txt");
+}
+
+#[test]
+fn e16_git_common_filename_and_unescape_units() {
+    assert_eq!(
+        extract_git_common_filename("a/f.txt b/f.txt").as_deref(),
+        Some("f.txt")
+    );
+    assert_eq!(
+        extract_git_common_filename("\"a/old name\" \"b/old name\"").as_deref(),
+        Some("old name")
+    );
+    assert_eq!(extract_git_common_filename("a/o b/n"), None);
+    assert_eq!(extract_git_common_filename("a/f.txt b/f.txt junk"), None);
+    assert_eq!(
+        extract_git_common_filename("src/f dst/f").as_deref(),
+        Some("f")
+    );
+    assert_eq!(extract_git_common_filename("f f").as_deref(), Some("f"));
+    assert_eq!(extract_git_common_filename("a/ a/").as_deref(), Some("a/"));
+    assert_eq!(extract_git_common_filename("/f /f").as_deref(), Some("/f"));
+    assert_eq!(unescape_git_filename("\"a\\tb\""), "a\tb");
+    assert_eq!(unescape_git_filename("\"a\\303\\244\""), "aä");
+    assert_eq!(unescape_git_filename("plain"), "plain");
+    assert_eq!(unescape_git_filename("\"\""), "\"\"");
+    assert_eq!(stripcslashes("a\\nb\\ x"), "a\nb x");
+    assert_eq!(stripcslashes("\\101"), "A");
+    // Degenerate `a/`-only targets strip like PHP.
+    assert_eq!(diff_path_value("--- a/", false), "");
+    assert_eq!(strip_ab_prefix("a/"), "");
+}
+
+#[test]
+fn e21_typechange_blocks_merge_to_change() {
+    // Real git form (probed): a delete block plus an add block.
+    let text = "diff --git a/link b/link\n\
+        deleted file mode 120000\n\
+        index ac558a3..0000000\n\
+        --- a/link\n\
+        +++ /dev/null\n\
+        @@ -1 +0,0 @@\n\
+        -real\n\
+        \\ No newline at end of file\n\
+        diff --git a/link b/link\n\
+        new file mode 100644\n\
+        index 0000000..d95f3ad\n\
+        --- /dev/null\n\
+        +++ b/link\n\
+        @@ -0,0 +1 @@\n\
+        +content\n";
+    let changes = parse_unified_diff(text).unwrap();
+    assert_eq!(changes.len(), 1);
+    let change = &changes[0];
+    assert_eq!(change.change_type, TYPE_CHANGE);
+    assert_eq!(change.old_path, "/dev/null");
+    assert_eq!(change.current_path, "link");
+    assert_eq!(change.old_mode.as_deref(), Some("120000"));
+    assert_eq!(change.new_mode.as_deref(), Some("100644"));
+    assert_eq!(change.hunks.len(), 1);
+    assert_eq!(change.hunks[0].corpus, "+content\n");
+    // Reversed order (add then delete) deletes unconditionally.
+    let text = "diff --git a/f b/f\n\
+        new file mode 100644\n\
+        --- /dev/null\n\
+        +++ b/f\n\
+        @@ -0,0 +1 @@\n\
+        +hi\n\
+        diff --git a/f b/f\n\
+        deleted file mode 100644\n\
+        --- a/f\n\
+        +++ /dev/null\n\
+        @@ -1 +0,0 @@\n\
+        -hi\n";
+    let changes = parse_unified_diff(text).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].change_type, TYPE_DELETE);
+    // Both flags in one block read as delete-then-new.
+    let text = "diff --git a/f b/f\n\
+        deleted file mode 120000\n\
+        new file mode 100644\n\
+        --- a/f\n\
+        +++ b/f\n\
+        @@ -1 +1 @@\n\
+        -a\n\
+        +b\n";
+    let changes = parse_unified_diff(text).unwrap();
+    assert_eq!(changes[0].change_type, TYPE_CHANGE);
+}
+
+#[test]
+fn e22_files_differ_wording_is_binary() {
+    let text = "diff --git a/f b/f\nFiles a/f and b/f differ\n";
+    let changes = parse_unified_diff(text).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].file_type, FILE_BINARY);
+    assert!(changes[0].hunks.is_empty());
+    assert_eq!(changes[0].hunk_len_explicit.len(), 0);
+}
+
+#[test]
+fn e23_malformed_binary_lines_fail() {
+    // Before `---`/`+++`: the hunk-target text.
+    let err = parse_unified_diff("diff --git a/f b/f\nBinary files x\n").unwrap_err();
+    assert!(err.contains(EXPECTED_HUNK_TARGET), "{err:?}");
+    // Past the paths: the hunk-header text.
+    let err = parse_unified_diff(&e_headers("Binary files x\n")).unwrap_err();
+    assert!(err.contains(EXPECTED_HUNK_HEADER), "{err:?}");
+    // The `Files` wording without a tail fails the same way.
+    let err = parse_unified_diff("diff --git a/f b/f\nFiles x\n").unwrap_err();
+    assert!(err.contains(EXPECTED_HUNK_TARGET), "{err:?}");
+}
+
+#[test]
+fn e24_duplicate_blocks_merge_later_wins() {
+    // Later hunks win; the position stays stable.
+    let text = "Index: b.txt\n\
+        --- b.txt\t(revision 1)\n\
+        +++ b.txt\t(working copy)\n\
+        @@ -1 +1 @@\n\
+        -b\n\
+        +B\n\
+        Index: a.txt\n\
+        --- a.txt\t(revision 1)\n\
+        +++ a.txt\t(working copy)\n\
+        @@ -1 +1 @@\n\
+        -a\n\
+        +A\n\
+        Index: b.txt\n\
+        --- b.txt\t(revision 2)\n\
+        +++ b.txt\t(working copy)\n\
+        @@ -1 +1 @@\n\
+        -b\n\
+        +B2\n";
+    let changes = parse_unified_diff(text).unwrap();
+    assert_eq!(changes.len(), 2);
+    assert_eq!(changes[0].current_path, "b.txt");
+    assert_eq!(changes[0].hunks[0].corpus, "-b\n+B2\n");
+    assert_eq!(changes[1].current_path, "a.txt");
+    // An armless incoming block keeps the existing type (PHP
+    // mutates the reused change through arms only).
+    let text = "diff --git a/f b/f\n\
+        deleted file mode 100644\n\
+        --- a/f\n\
+        +++ /dev/null\n\
+        @@ -1 +0,0 @@\n\
+        -x\n\
+        diff --git a/f b/f\n\
+        --- a/f\n\
+        +++ b/f\n\
+        @@ -1 +1 @@\n\
+        -x\n\
+        +y\n";
+    let changes = parse_unified_diff(text).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].change_type, TYPE_DELETE);
+    assert_eq!(changes[0].hunks[0].corpus, "-x\n+y\n");
+    // Binary is sticky across the merge.
+    let text = "diff --git a/f b/f\n\
+        Binary files a/f and b/f differ\n\
+        diff --git a/f b/f\n\
+        --- a/f\n\
+        +++ b/f\n\
+        @@ -1 +1 @@\n\
+        -a\n\
+        +b\n";
+    let changes = parse_unified_diff(text).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].file_type, FILE_BINARY);
+    assert_eq!(changes[0].hunks[0].corpus, "-a\n+b\n");
+    // Filemodes union across the merge.
+    let text = "diff --git a/f b/f\n\
+        old mode 100644\n\
+        diff --git a/f b/f\n\
+        new mode 100755\n";
+    let changes = parse_unified_diff(text).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].old_mode.as_deref(), Some("100644"));
+    assert_eq!(changes[0].new_mode.as_deref(), Some("100755"));
+}
+
+#[test]
+fn e24_rename_blocks_never_merge() {
+    // Unkeyed rename/copy blocks stay separate (like PHP's
+    // `buildChange(null)`). Companion folding is EXPORT-E14
+    // carry-over: the export side fabricates one companion per
+    // here-change today.
+    let text = "diff --git a/src b/one\n\
+        copy from src\n\
+        copy to one\n\
+        --- a/src\n\
+        +++ b/one\n\
+        @@ -1 +1 @@\n\
+        -a\n\
+        +b\n\
+        diff --git a/src b/two\n\
+        copy from src\n\
+        copy to two\n\
+        --- a/src\n\
+        +++ b/two\n\
+        @@ -1 +1 @@\n\
+        -a\n\
+        +b\n";
+    let changes = parse_unified_diff(text).unwrap();
+    assert_eq!(changes.len(), 2);
+    assert_eq!(changes[0].change_type, TYPE_COPY_HERE);
+    assert_eq!(changes[1].change_type, TYPE_COPY_HERE);
+}
+
+#[test]
+fn e37_hg_binary_changed_marker_is_binary() {
+    let text = "diff -r abc123 f.bin\nBinary file f.bin has changed\n";
+    let changes = parse_unified_diff(text).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].current_path, "f.bin");
+    assert_eq!(changes[0].file_type, FILE_BINARY);
+    assert!(changes[0].hunks.is_empty());
+}
+
+#[test]
+fn e20_synthetic_predicate_flags_pure_moves() {
+    let pure =
+        "diff --git a/o.txt b/n.txt\nsimilarity index 100%\nrename from o.txt\nrename to n.txt\n";
+    let changes = parse_unified_diff(pure).unwrap();
+    assert_eq!(changes[0].change_type, TYPE_MOVE_HERE);
+    assert!(changes[0].hunks.is_empty());
+    assert!(needs_synthetic_git_hunks(&changes[0]));
+
+    let moved = "diff --git a/o.txt b/n.txt\nrename from o.txt\nrename to n.txt\n--- a/o.txt\n+++ b/n.txt\n@@ -1 +1 @@\n-x\n+y\n";
+    let changes = parse_unified_diff(moved).unwrap();
+    assert!(!needs_synthetic_git_hunks(&changes[0]));
+
+    let plain = parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\n+b\n")).unwrap();
+    assert!(!needs_synthetic_git_hunks(&plain[0]));
+}
+
+#[test]
+fn e20_synthetic_hunks_rewrite_adds_to_context() {
+    // A pure-move reparse reads as an add; `+` rewrites to ` `.
+    let raw = "diff --git a/n.txt b/n.txt\nnew file mode 100644\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1,2 @@\n+one\n+two\n";
+    let made = synthetic_hunks_for_path(raw, "n.txt").unwrap().unwrap();
+    assert_eq!(made.file_type, FILE_TEXT);
+    assert_eq!(made.hunks.len(), 1);
+    assert_eq!(
+        (
+            made.hunks[0].old_start,
+            made.hunks[0].old_len,
+            made.hunks[0].new_start,
+            made.hunks[0].new_len,
+        ),
+        (0, 0, 1, 2)
+    );
+    assert_eq!(made.hunks[0].corpus, " one\n two\n");
+    // The move-source reparse reads as a delete; `-` lines persist.
+    let raw = "diff --git a/o.txt b/o.txt\ndeleted file mode 100644\n--- a/o.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-one\n-two\n";
+    let made = synthetic_hunks_for_path(raw, "o.txt").unwrap().unwrap();
+    assert_eq!(made.hunks[0].corpus, "-one\n-two\n");
+    // No change targets the path: nothing attaches.
+    assert!(
+        synthetic_hunks_for_path(raw, "elsewhere")
+            .unwrap()
+            .is_none()
+    );
+    // Binary reparses propagate the file type with no hunks.
+    let raw = "diff --git a/i.png b/i.png\nBinary files a/i.png and b/i.png differ\n";
+    let made = synthetic_hunks_for_path(raw, "i.png").unwrap().unwrap();
+    assert_eq!(made.file_type, FILE_BINARY);
+    assert!(made.hunks.is_empty());
+}
+
 struct FailingReader;
 
 impl std::io::Read for FailingReader {
@@ -2547,6 +3027,9 @@ fn gap2_apply_svn_copy_info_flows() {
         change_type: TYPE_COPY_HERE,
         file_type: FILE_TEXT,
         hunks: Vec::new(),
+        hunk_len_explicit: Vec::new(),
+        old_mode: None,
+        new_mode: None,
         away_paths: Vec::new(),
         commit_hash: None,
         message: None,
@@ -2563,6 +3046,9 @@ fn gap2_apply_svn_copy_info_flows() {
             change_type: TYPE_MESSAGE,
             file_type: FILE_TEXT,
             hunks: Vec::new(),
+            hunk_len_explicit: Vec::new(),
+            old_mode: None,
+            new_mode: None,
             away_paths: Vec::new(),
             commit_hash: None,
             message: None,

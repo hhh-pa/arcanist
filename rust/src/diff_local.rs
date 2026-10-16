@@ -2923,9 +2923,26 @@ pub struct ParsedHunk {
     pub new_start: u64,
     /// New-file line count.
     pub new_len: u64,
-    /// Verbatim hunk body: body lines `\n`-joined with a trailing newline
-    /// when non-empty (no `@@` header).
+    /// Verbatim hunk body: body lines with their original line endings
+    /// (no `@@` header). Endings are retained, never normalized
+    /// (EXPORT-E12): CRLF diffs keep `\r\n`, and an unterminated final
+    /// line stays unterminated, exactly as PHP's `$real` accumulation.
     pub corpus: String,
+}
+
+/// Whether the `,length` parts of one hunk header were explicit
+/// (EXPORT-E11).
+///
+/// PHP keeps the regex captures as strings: offsets are always explicit
+/// (always strings in `toDictionary()`), while lengths are strings when
+/// the header spells `,length` and integer `1` when omitted. Bundle and
+/// submit renders need the bit to reproduce the types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HunkLenExplicit {
+    /// True when the old range spells `,length`.
+    pub old_explicit: bool,
+    /// True when the new range spells `,length`.
+    pub new_explicit: bool,
 }
 
 /// One parsed file change (or commit message) from unified diff text.
@@ -2947,6 +2964,17 @@ pub struct ParsedChange {
     pub file_type: u32,
     /// Parsed hunks (empty for binary and message changes).
     pub hunks: Vec<ParsedHunk>,
+    /// `,length` explicitness per hunk, parallel to `hunks`
+    /// (EXPORT-E11). Always the same length as `hunks`.
+    pub hunk_len_explicit: Vec<HunkLenExplicit>,
+    /// `unix:filemode` before the change, from `old mode` /
+    /// `deleted file mode` lines (EXPORT-E13). `None` when the diff
+    /// carries no old mode.
+    pub old_mode: Option<String>,
+    /// `unix:filemode` after the change, from `new mode` /
+    /// `new file mode` lines (EXPORT-E13). `None` when the diff
+    /// carries no new mode.
+    pub new_mode: Option<String>,
     /// Destination paths for old-location changes (`getAwayPaths()`),
     /// filled by the Subversion copy/move pass, else empty.
     pub away_paths: Vec<String>,
@@ -2978,7 +3006,9 @@ impl ParsedChange {
 /// add/delete), rename/copy headers, `Binary files ... differ` and
 /// `GIT binary patch` markers, and `commit <hash>` message blocks from
 /// `git show`/`git log`. Unknown text between blocks is skipped, mirroring
-/// the PHP parser's tolerance for extended headers.
+/// the PHP parser's tolerance for extended headers. Repeated blocks
+/// for one path merge like `buildChange()` (later wins, EXPORT-E24);
+/// hunk bodies validate counts like `parseChangeset()` (EXPORT-E15).
 ///
 /// Combined diffs fail with PHP's `didFailParse()` errors: `diff --cc` /
 /// `diff --combined` headers match no PHP header pattern (`:276-283`),
@@ -2987,6 +3017,7 @@ impl ParsedChange {
 /// `diff --git` line starts a real block (`:260-272`), like PHP.
 pub fn parse_unified_diff(text: &str) -> Result<Vec<ParsedChange>, String> {
     let mut changes: Vec<ParsedChange> = Vec::new();
+    let mut key_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut pending_message: Option<(String, Vec<String>)> = None;
     let lines: Vec<&str> = text.lines().collect();
     let raw: Vec<&str> = split_keep_endings(text);
@@ -2994,23 +3025,16 @@ pub fn parse_unified_diff(text: &str) -> Result<Vec<ParsedChange>, String> {
     while index < lines.len() {
         let line = lines[index];
         if let Some(hash) = line.strip_prefix("commit ") {
-            if let Some((done_hash, body)) = pending_message.take() {
-                changes.push(message_change(&done_hash, &body));
-            }
+            flush_pending_message(&mut changes, &mut pending_message, true);
             let hash = hash.split_whitespace().next().unwrap_or("").to_string();
             pending_message = Some((hash, Vec::new()));
             index += 1;
             continue;
         }
         if is_diff_header(line) {
-            if let Some((done_hash, body)) = pending_message.take()
-                && (!body_is_empty(&body) || changes.is_empty())
-            {
-                changes.push(message_change(&done_hash, &body));
-            }
-            let (change, next) = parse_file_block(&lines, &raw, index)?;
-            changes.push(change);
-            index = next;
+            let force = changes.is_empty();
+            flush_pending_message(&mut changes, &mut pending_message, force);
+            index = push_file_block_or_merge(&mut changes, &mut key_index, &lines, &raw, index)?;
             continue;
         }
         if is_combined_diff_header(line) {
@@ -3038,6 +3062,44 @@ pub fn parse_unified_diff(text: &str) -> Result<Vec<ParsedChange>, String> {
     Ok(changes)
 }
 
+/// Flush a pending `commit` message block, unless it is empty and a
+/// file change already exists.
+fn flush_pending_message(
+    changes: &mut Vec<ParsedChange>,
+    pending_message: &mut Option<(String, Vec<String>)>,
+    force: bool,
+) {
+    if let Some((done_hash, body)) = pending_message.take()
+        && (force || !body_is_empty(&body))
+    {
+        changes.push(message_change(&done_hash, &body));
+    }
+}
+
+/// Parse the file block at `lines[index]`, merging duplicate paths
+/// like `buildChange()` (later wins, stable position, EXPORT-E24).
+/// Returns the next unconsumed index.
+fn push_file_block_or_merge(
+    changes: &mut Vec<ParsedChange>,
+    key_index: &mut std::collections::HashMap<String, usize>,
+    lines: &[&str],
+    raw: &[&str],
+    index: usize,
+) -> Result<usize, String> {
+    let (change, meta, next) = parse_file_block(lines, raw, index)?;
+    match &meta.key {
+        Some(key) => match key_index.get(key) {
+            Some(&at) => merge_duplicate_block(&mut changes[at], change, &meta),
+            None => {
+                key_index.insert(key.clone(), changes.len());
+                changes.push(change);
+            }
+        },
+        None => changes.push(change),
+    }
+    Ok(next)
+}
+
 /// Split text into lines retaining endings, like `phutil_split_lines()`.
 ///
 /// Indices correspond 1:1 with `str::lines()`; used for parse-error
@@ -3059,6 +3121,21 @@ pub const EXPECTED_HUNK_HEADER: &str = "Expected hunk header '@@ -NN,NN +NN,NN @
 /// unrecognized text between blocks stays skipped (see the
 /// [`parse_unified_diff`] docs).
 pub const EXPECTED_DIFF_START: &str = "Expected a hunk header, like 'Index: /path/to/file.ext' (svn), 'Property changes on: /path/to/file.ext' (svn properties), 'commit 59bcc3ad6775562f845953cf01624225' (git show), 'diff --git' (git diff), '--- filename' (unified diff), or 'diff -r' (hg diff or patch).";
+
+/// `didFailParse()` message when a hunk body has the wrong number of
+/// lines (`:999`, EXPORT-E15).
+pub const WRONG_HUNK_LINE_COUNT: &str = "Found the wrong number of hunk lines.";
+
+/// `didFailParse()` message for a malformed `\` marker line
+/// (`:951-954`, EXPORT-E15).
+pub const EXPECTED_NO_NEWLINE_MARKER: &str = "Expected '\\ No newline at end of file'.";
+
+/// `didFailParse()` message when a `---`/`+++` target is expected
+/// (`parseHunkTarget()`, `:839-870`, EXPORT-E23). PHP reports this when a
+/// malformed `Binary files` line (or anything else) shows up where the
+/// `---`/`+++` paths belong; the text names `+++` even for the `---`
+/// slot.
+pub const EXPECTED_HUNK_TARGET: &str = "Expected hunk target '+++ path/to/file.ext (revision N)'.";
 
 /// Combined-diff header (`git diff --cc` / `git diff --combined`).
 fn is_combined_diff_header(line: &str) -> bool {
@@ -3143,6 +3220,75 @@ pub fn without_message_changes(changes: &[ParsedChange]) -> Vec<ParsedChange> {
         .collect()
 }
 
+/// Synthetic hunks fabricated for one pure move/copy, à la
+/// `loadSyntheticData()` (EXPORT-E20).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntheticHunks {
+    /// File type of the reparsed change (binary stays binary).
+    pub file_type: u32,
+    /// Fabricated hunks (`+` rewritten to context).
+    pub hunks: Vec<ParsedHunk>,
+}
+
+/// True when `change` needs `loadSyntheticData()` fabrication: a
+/// hunkless move/copy target (the `:599-616` early return, EXPORT-E20).
+///
+/// PHP also flags hunkless adds/deletes, but fabricating those is a
+/// no-op (an empty file reparse yields no hunks), so the predicate
+/// covers only renames and copies. Moves and copies can only come
+/// from git header lines, so svn/hg blocks never match.
+#[must_use]
+pub fn needs_synthetic_git_hunks(change: &ParsedChange) -> bool {
+    matches!(change.change_type, TYPE_MOVE_HERE | TYPE_COPY_HERE) && change.hunks.is_empty()
+}
+
+/// Rewrite one hunk's added lines to context (`preg_replace('/^\+/m',
+/// ' ', ...)`).
+fn rewrite_synthetic_hunk(hunk: &ParsedHunk) -> ParsedHunk {
+    let corpus: String = hunk
+        .corpus
+        .split_inclusive('\n')
+        .map(|line| {
+            if let Some(rest) = line.strip_prefix('+') {
+                format!(" {rest}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    ParsedHunk {
+        old_start: hunk.old_start,
+        old_len: hunk.old_len,
+        new_start: hunk.new_start,
+        new_len: hunk.new_len,
+        corpus,
+    }
+}
+
+/// Fabricate synthetic hunks for `path` from `raw_diff`
+/// (`loadSyntheticData()`, `:1237-1289`, EXPORT-E20).
+///
+/// `raw_diff` is `git diff -U32767 <base> -- <path>` without move
+/// detection (against the worktree, like PHP): for a pure move it
+/// reads as an add, whose `+` lines rewrite to context. Returns
+/// `None` when no parsed change targets `path` (PHP then attaches
+/// nothing). Malformed reparse text fails, like PHP's sub-parse.
+pub fn synthetic_hunks_for_path(
+    raw_diff: &str,
+    path: &str,
+) -> Result<Option<SyntheticHunks>, String> {
+    for change in parse_unified_diff(raw_diff)? {
+        if change.current_path == path {
+            let hunks = change.hunks.iter().map(rewrite_synthetic_hunk).collect();
+            return Ok(Some(SyntheticHunks {
+                file_type: change.file_type,
+                hunks,
+            }));
+        }
+    }
+    Ok(None)
+}
+
 fn body_is_empty(body: &[String]) -> bool {
     body.iter().all(|line| line.trim().is_empty())
 }
@@ -3154,6 +3300,9 @@ fn message_change(hash: &str, body: &[String]) -> ParsedChange {
         change_type: TYPE_MESSAGE,
         file_type: FILE_TEXT,
         hunks: Vec::new(),
+        hunk_len_explicit: Vec::new(),
+        old_mode: None,
+        new_mode: None,
         away_paths: Vec::new(),
         commit_hash: Some(hash.to_string()),
         message: Some(body.join("\n")),
@@ -3170,6 +3319,43 @@ pub const SVN_BINARY_MARKER: &str = "Cannot display: file marked as a binary typ
 #[must_use]
 pub fn is_svn_binary_marker(line: &str) -> bool {
     line.trim_end() == SVN_BINARY_MARKER
+}
+
+/// True for `Binary files x and y differ` and the `Files x and y
+/// differ` wording (EXPORT-E22).
+///
+/// PHP: `/^(Binary files|Files) .* and .* differ$/` on the rtrimmed
+/// line (`:744-751`).
+#[must_use]
+pub fn is_binary_differ_line(line: &str) -> bool {
+    let trimmed = line.trim_end();
+    let rest = trimmed
+        .strip_prefix("Binary files ")
+        .or_else(|| trimmed.strip_prefix("Files "));
+    match rest {
+        Some(rest) => rest.contains(" and ") && rest.ends_with(" differ"),
+        None => false,
+    }
+}
+
+/// True for a malformed `Binary files`/`Files` line without the
+/// ` differ` tail (EXPORT-E23). PHP fails the parse there
+/// (`parseHunkTarget()` / `parseChangeset()`); the message depends on
+/// whether `---`/`+++` were already consumed.
+#[must_use]
+pub fn is_malformed_binary_line(line: &str) -> bool {
+    (line.starts_with("Binary files ") || line.starts_with("Files "))
+        && !is_binary_differ_line(line)
+}
+
+/// True for hg's `Binary file f has changed` marker (EXPORT-E37).
+///
+/// PHP: `/^Binary file .* has changed$/` on the rtrimmed line
+/// (`:757-764`). Note the singular `file`.
+#[must_use]
+pub fn is_hg_binary_changed_line(line: &str) -> bool {
+    let trimmed = line.trim_end();
+    trimmed.starts_with("Binary file ") && trimmed.ends_with(" has changed")
 }
 
 fn is_diff_header(line: &str) -> bool {
@@ -3189,18 +3375,27 @@ struct FileBlockState {
     is_rename: bool,
     new_file: bool,
     deleted_file: bool,
+    /// `unix:filemode` before the change (EXPORT-E13).
+    old_mode: Option<String>,
+    /// `unix:filemode` after the change (EXPORT-E13).
+    new_mode: Option<String>,
+    /// Literal `---` path when seen, `/dev/null` included (EXPORT-E24:
+    /// PHP's `setOldPath()` overwrite for duplicate blocks).
+    minus_literal: Option<String>,
+    /// Whether a `+++` line was consumed (EXPORT-E23 message choice).
+    saw_plus: bool,
 }
 
 /// Seed `(old, new)` paths from a block header line (`diff --git a/o b/n`,
 /// `diff -r <rev> <file>`, `Index: <file>`).
+///
+/// Git headers go through `extractGitCommonFilename()` (EXPORT-E16):
+/// quoted pairs decode, and renames/differs seed empty (recovered
+/// later from `rename from`/`rename to` or `---`/`+++` lines).
 fn seed_file_block_paths(header: &str) -> (String, String) {
     if let Some(rest) = header.strip_prefix("diff --git ") {
-        let mut parts = rest.split_whitespace();
-        if let (Some(old), Some(new)) = (parts.next(), parts.next()) {
-            return (
-                strip_ab_prefix(old).to_string(),
-                strip_ab_prefix(new).to_string(),
-            );
+        if let Some(common) = extract_git_common_filename(rest) {
+            return (common.clone(), common);
         }
         return (String::new(), String::new());
     }
@@ -3218,10 +3413,13 @@ fn seed_file_block_paths(header: &str) -> (String, String) {
 }
 
 /// True at the end of the extended-header run (`---`, binary markers,
-/// hunks, or the next block).
+/// hunks, or the next block). Malformed binary lines also end the run
+/// so the body pass can fail on them (EXPORT-E23).
 fn is_extended_header_end(line: &str) -> bool {
     line.starts_with("--- ")
-        || line.starts_with("Binary files ")
+        || is_binary_differ_line(line)
+        || is_hg_binary_changed_line(line)
+        || is_malformed_binary_line(line)
         || line.starts_with("GIT binary patch")
         || is_svn_binary_marker(line)
         || line.starts_with("@@ ")
@@ -3229,25 +3427,49 @@ fn is_extended_header_end(line: &str) -> bool {
         || line.starts_with("commit ")
 }
 
+/// Read a `unix:filemode` value after `prefix` (`old mode ` and
+/// friends, EXPORT-E13). PHP's `\d+` is prefix-matched, so trailing
+/// junk is ignored; a missing digit run matches nothing.
+fn mode_value_after(line: &str, prefix: &str) -> Option<String> {
+    let rest = line.strip_prefix(prefix)?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    Some(digits)
+}
+
 /// Fold one extended-header line into `state` (renames, copies, modes).
+///
+/// Rename/copy paths decode C-quoting (`unescapeFilename()`,
+/// EXPORT-E16); mode lines retain their `unix:filemode` values
+/// (EXPORT-E13).
 fn apply_extended_header_line(line: &str, state: &mut FileBlockState) {
     if let Some(path) = line.strip_prefix("rename from ") {
-        state.rename_from = Some(path.trim().to_string());
+        state.rename_from = Some(unescape_git_filename(path.trim()));
         state.is_rename = true;
     } else if let Some(path) = line.strip_prefix("rename to ") {
-        state.rename_to = Some(path.trim().to_string());
+        state.rename_to = Some(unescape_git_filename(path.trim()));
         state.is_rename = true;
     } else if let Some(path) = line.strip_prefix("copy from ") {
-        state.rename_from = Some(path.trim().to_string());
+        state.rename_from = Some(unescape_git_filename(path.trim()));
         state.is_copy = true;
     } else if let Some(path) = line.strip_prefix("copy to ") {
-        state.rename_to = Some(path.trim().to_string());
+        state.rename_to = Some(unescape_git_filename(path.trim()));
         state.is_copy = true;
-    } else if line.starts_with("new file mode") {
+    } else if let Some(mode) = mode_value_after(line, "new file mode ") {
         state.new_file = true;
-    } else if line.starts_with("deleted file mode") {
+        state.new_mode = Some(mode);
+    } else if let Some(mode) = mode_value_after(line, "deleted file mode ") {
         state.deleted_file = true;
+        state.old_mode = Some(mode);
+    } else if let Some(mode) = mode_value_after(line, "old mode ") {
+        state.old_mode = Some(mode);
+    } else if let Some(mode) = mode_value_after(line, "new mode ") {
+        state.new_mode = Some(mode);
     }
+    // Digitless `new/deleted file mode` lines match nothing, like PHP's
+    // `\d+` patterns.
 }
 
 /// Scan extended headers from `index`, returning the first body line.
@@ -3264,6 +3486,10 @@ fn scan_extended_headers(lines: &[&str], state: &mut FileBlockState, mut index: 
 }
 
 /// Consume the `---` path line at `index`, returning the next index.
+///
+/// The literal path is recorded for duplicate-block merges (PHP's
+/// `setOldPath()` overwrite, EXPORT-E24); a `/dev/null` target marks
+/// a new file without touching the seeded path.
 fn consume_minus_path_line(
     lines: &[&str],
     index: usize,
@@ -3274,6 +3500,7 @@ fn consume_minus_path_line(
         return index;
     }
     let old = diff_path_value(lines[index], index_block);
+    state.minus_literal = Some(old.clone());
     if old == "/dev/null" {
         state.new_file = true;
     } else if !old.is_empty() {
@@ -3283,6 +3510,10 @@ fn consume_minus_path_line(
 }
 
 /// Consume the `+++` path line at `index`, returning the next index.
+///
+/// For resolved renames/copies the `+++` value is discarded
+/// (EXPORT-E16): PHP keeps the decoded `rename to`/`copy to` path and
+/// only `setCurrentPath()`s the `+++` target for RCS diffs.
 fn consume_plus_path_line(
     lines: &[&str],
     index: usize,
@@ -3292,7 +3523,11 @@ fn consume_plus_path_line(
     if index >= lines.len() || !lines[index].starts_with("+++ ") {
         return index;
     }
+    state.saw_plus = true;
     let new = diff_path_value(lines[index], index_block);
+    if state.rename_to.is_some() && (state.is_rename || state.is_copy) {
+        return index + 1;
+    }
     if new == "/dev/null" {
         state.deleted_file = true;
         state.new_path.clone_from(&state.old_path);
@@ -3333,13 +3568,13 @@ fn skip_svn_binary_block(lines: &[&str], mut index: usize) -> usize {
     index
 }
 
-/// True at the end of a git binary payload (hunk or next block).
+/// True at the end of a git binary payload (next block only).
+///
+/// Base85 payload lines can start with `@@`, `---`, or `+++`, so only
+/// block boundaries end the payload (PHP delimits on `literal` /
+/// blank lines instead; the outcome is the same for valid payloads).
 fn is_binary_payload_end(line: &str) -> bool {
-    line.starts_with("@@ ")
-        || line.starts_with("@@@")
-        || is_diff_header(line)
-        || is_combined_diff_header(line)
-        || line.starts_with("commit ")
+    is_diff_header(line) || is_combined_diff_header(line) || line.starts_with("commit ")
 }
 
 /// Skip `Binary files`/`GIT binary patch` payload lines (`literal ...`,
@@ -3352,47 +3587,131 @@ fn skip_git_binary_block(lines: &[&str], mut index: usize) -> usize {
     index
 }
 
-/// Collect body hunks from `index`, returning `(hunks, binary, next)`.
+/// Collected block body: hunks plus their explicitness bits.
+struct BlockBody {
+    hunks: Vec<ParsedHunk>,
+    bits: Vec<HunkLenExplicit>,
+    binary: bool,
+    next: usize,
+}
+
+/// True for git/hg binary markers with payloads (`differ` lines, the
+/// hg `has changed` marker, `GIT binary patch`).
+fn is_git_binary_marker(line: &str) -> bool {
+    is_binary_differ_line(line)
+        || is_hg_binary_changed_line(line)
+        || line.starts_with("GIT binary patch")
+}
+
+/// Parse the hunk at `lines[index]`, failing like PHP on malformed
+/// lines in hunk position (EXPORT-E15/E23). Returns `None` for
+/// non-hunk lines (skipped as noise).
+///
+/// `saw_paths` picks the `didFailParse()` text: past `---`/`+++` PHP
+/// fails in `parseChangeset()`, before them in `parseHunkTarget()`.
+fn collect_body_hunk_or_fail(
+    lines: &[&str],
+    raw: &[&str],
+    index: usize,
+    saw_paths: bool,
+) -> Result<Option<(ParsedHunk, HunkLenExplicit, usize)>, String> {
+    let line = lines[index];
+    if is_malformed_binary_line(line) {
+        return Err(diff_parse_error(raw, index, hunk_position_error(saw_paths)));
+    }
+    if let Some(header) = parse_hunk_header(line) {
+        let (hunk, next) = collect_hunk(lines, raw, index, &header)?;
+        return Ok(Some((hunk, header.explicit, next)));
+    }
+    if line.starts_with("@@@") || line.starts_with("@@ ") {
+        return Err(diff_parse_error(raw, index, hunk_position_error(saw_paths)));
+    }
+    Ok(None)
+}
+
+/// `didFailParse()` text for a malformed line in hunk position.
+fn hunk_position_error(saw_paths: bool) -> &'static str {
+    if saw_paths {
+        EXPECTED_HUNK_HEADER
+    } else {
+        EXPECTED_HUNK_TARGET
+    }
+}
+
+/// Collect body hunks from `index`.
+///
+/// `saw_paths` reports whether `---`/`+++` were both consumed, which
+/// picks the `didFailParse()` text for malformed binary lines
+/// (EXPORT-E23): past the paths PHP fails in `parseChangeset()`,
+/// before them in `parseHunkTarget()`.
 fn collect_block_body(
     lines: &[&str],
     raw: &[&str],
     mut index: usize,
-) -> Result<(Vec<ParsedHunk>, bool, usize), String> {
-    let mut hunks = Vec::new();
-    let mut binary = false;
+    saw_paths: bool,
+) -> Result<BlockBody, String> {
+    let mut body = BlockBody {
+        hunks: Vec::new(),
+        bits: Vec::new(),
+        binary: false,
+        next: index,
+    };
     while index < lines.len() {
         let line = lines[index];
         if is_block_end_line(line) {
             break;
         }
         if is_svn_binary_marker(line) {
-            binary = true;
+            body.binary = true;
             index = skip_svn_binary_block(lines, index);
             continue;
         }
-        if line.starts_with("Binary files ") || line.starts_with("GIT binary patch") {
-            binary = true;
+        if is_git_binary_marker(line) {
+            body.binary = true;
             index = skip_git_binary_block(lines, index);
             continue;
         }
-        if let Some((old_start, old_len, new_start, new_len)) = parse_hunk_header(line) {
-            let (hunk, next) = collect_hunk(lines, index, old_start, old_len, new_start, new_len);
-            hunks.push(hunk);
-            index = next;
-            continue;
+        match collect_body_hunk_or_fail(lines, raw, index, saw_paths)? {
+            Some((hunk, bits, next)) => {
+                body.hunks.push(hunk);
+                body.bits.push(bits);
+                index = next;
+            }
+            None => index += 1,
         }
-        if line.starts_with("@@@") {
-            return Err(diff_parse_error(raw, index, EXPECTED_HUNK_HEADER));
-        }
-        index += 1;
     }
-    Ok((hunks, binary, index))
+    body.next = index;
+    Ok(body)
+}
+
+/// Resolve the change type from header flags (EXPORT-E21).
+///
+/// A block carrying both `deleted file mode` and `new file mode`
+/// (symlink↔file typechange) is a change, like PHP's `new` arm
+/// escalating past `TYPE_DELETE` (`:629-642`). PHP applies same-block
+/// arms in file order; the flags here are orderless, so both-flags
+/// always means the delete-then-new order git emits across blocks.
+fn finish_block_type(is_rename: bool, is_copy: bool, new_file: bool, deleted_file: bool) -> u32 {
+    if is_rename {
+        TYPE_MOVE_HERE
+    } else if is_copy {
+        TYPE_COPY_HERE
+    } else if new_file && deleted_file {
+        TYPE_CHANGE
+    } else if new_file {
+        TYPE_ADD
+    } else if deleted_file {
+        TYPE_DELETE
+    } else {
+        TYPE_CHANGE
+    }
 }
 
 /// Resolve change/file types and build the parsed change.
 fn finish_file_block(
     state: FileBlockState,
     hunks: Vec<ParsedHunk>,
+    bits: Vec<HunkLenExplicit>,
     binary: bool,
     index: usize,
 ) -> (ParsedChange, usize) {
@@ -3405,30 +3724,28 @@ fn finish_file_block(
         is_rename,
         new_file,
         deleted_file,
+        old_mode,
+        new_mode,
+        minus_literal,
+        saw_plus: _,
     } = state;
     let mut hunks = hunks;
-    let mut change_type = TYPE_CHANGE;
+    let mut bits = bits;
     let mut file_type = FILE_TEXT;
     if binary {
         file_type = FILE_BINARY;
         hunks.clear();
+        bits.clear();
     }
-    if is_rename {
-        change_type = TYPE_MOVE_HERE;
-        if let (Some(from), Some(to)) = (rename_from, rename_to) {
-            old_path = from;
-            new_path = to;
-        }
-    } else if is_copy {
-        change_type = TYPE_COPY_HERE;
-        if let (Some(from), Some(to)) = (rename_from, rename_to) {
-            old_path = from;
-            new_path = to;
-        }
-    } else if new_file {
-        change_type = TYPE_ADD;
-    } else if deleted_file {
-        change_type = TYPE_DELETE;
+    let change_type = finish_block_type(is_rename, is_copy, new_file, deleted_file);
+    // PHP overwrites the decoded rename source with the literal `---`
+    // path afterwards (`parseHunkTarget()`), while the `+++` target
+    // is discarded (EXPORT-E16).
+    if (is_rename || is_copy)
+        && let (Some(from), Some(to)) = (rename_from, rename_to)
+    {
+        old_path = minus_literal.unwrap_or(from);
+        new_path = to;
     }
     if old_path == "/dev/null" {
         old_path.clear();
@@ -3440,12 +3757,104 @@ fn finish_file_block(
             change_type,
             file_type,
             hunks,
+            hunk_len_explicit: bits,
+            old_mode,
+            new_mode,
             away_paths: Vec::new(),
             commit_hash: None,
             message: None,
         },
         index,
     )
+}
+
+/// Per-block metadata for duplicate-block merges (EXPORT-E24).
+struct FileBlockMeta {
+    /// `buildChange()` key: the seeded current path, or `None` for
+    /// renames/differs/commits (PHP keys on `idx($match, 'cur')`,
+    /// unset there, so those blocks never merge).
+    key: Option<String>,
+    /// Literal `---` path when seen (PHP's `setOldPath()` overwrite).
+    minus_literal: Option<String>,
+    /// Whether the block carries a `new file mode` arm.
+    new_file: bool,
+    /// Whether the block carries a `deleted file mode` arm.
+    deleted_file: bool,
+}
+
+/// `buildChange()` key for a block header line (EXPORT-E24): the git
+/// common filename, the `Index:` path, or the `diff -r`/`diff -u`
+/// path. `None` (unkeyed, never merged) for renames and differs.
+fn block_key(header: &str) -> Option<String> {
+    if let Some(rest) = header.strip_prefix("diff --git ") {
+        return extract_git_common_filename(rest);
+    }
+    if let Some(rest) = header.strip_prefix("Index: ") {
+        return Some(rest.trim().to_string());
+    }
+    if (header.starts_with("diff -r ") || header.starts_with("diff -u "))
+        && let Some(last) = header.split_whitespace().last()
+    {
+        return Some(strip_ab_prefix(last).to_string());
+    }
+    None
+}
+
+/// Merged change type for a duplicate block (EXPORT-E21/E24).
+///
+/// PHP mutates the reused change through the incoming block's `new`
+/// / `deleted` arms (`:629-642`): `deleted` forces delete, `new`
+/// escalates a delete to a change (the symlink↔file two-block form)
+/// and otherwise adds, while an armless block keeps the existing
+/// type. A both-flags block reads as delete-then-new.
+fn merge_block_type(existing: u32, meta: &FileBlockMeta) -> u32 {
+    if meta.deleted_file && meta.new_file {
+        TYPE_CHANGE
+    } else if meta.deleted_file {
+        TYPE_DELETE
+    } else if meta.new_file {
+        if existing == TYPE_DELETE {
+            TYPE_CHANGE
+        } else {
+            TYPE_ADD
+        }
+    } else {
+        existing
+    }
+}
+
+/// Merge a duplicate-path block into the existing change, like PHP's
+/// `buildChange()` reuse (EXPORT-E24).
+///
+/// Later blocks win: hunks (and their explicitness bits) are
+/// replaced (`dropHunks()`), the `---` path overwrites the old path
+/// (`/dev/null` literally), and the type runs through the incoming
+/// arms. The current path, binary flag (sticky), filemodes (union),
+/// and away paths are preserved unless the incoming block sets them.
+fn merge_duplicate_block(
+    existing: &mut ParsedChange,
+    incoming: ParsedChange,
+    meta: &FileBlockMeta,
+) {
+    existing.change_type = merge_block_type(existing.change_type, meta);
+    if incoming.change_type == TYPE_MOVE_HERE || incoming.change_type == TYPE_COPY_HERE {
+        existing.change_type = incoming.change_type;
+        existing.current_path = incoming.current_path.clone();
+    }
+    if let Some(literal) = &meta.minus_literal {
+        existing.old_path = literal.clone();
+    }
+    existing.hunks = incoming.hunks;
+    existing.hunk_len_explicit = incoming.hunk_len_explicit;
+    if incoming.file_type == FILE_BINARY {
+        existing.file_type = FILE_BINARY;
+    }
+    if incoming.old_mode.is_some() {
+        existing.old_mode = incoming.old_mode;
+    }
+    if incoming.new_mode.is_some() {
+        existing.new_mode = incoming.new_mode;
+    }
 }
 
 /// Parse one `diff`/`Index:` block starting at `lines[start]`.
@@ -3455,8 +3864,9 @@ fn parse_file_block(
     lines: &[&str],
     raw: &[&str],
     start: usize,
-) -> Result<(ParsedChange, usize), String> {
+) -> Result<(ParsedChange, FileBlockMeta, usize), String> {
     let header = lines[start];
+    let key = block_key(header);
     let (old_path, new_path) = seed_file_block_paths(header);
     let mut state = FileBlockState {
         old_path,
@@ -3467,6 +3877,10 @@ fn parse_file_block(
         is_rename: false,
         new_file: false,
         deleted_file: false,
+        old_mode: None,
+        new_mode: None,
+        minus_literal: None,
+        saw_plus: false,
     };
     // Extended headers up to `---`.
     let mut index = scan_extended_headers(lines, &mut state, start + 1);
@@ -3481,15 +3895,170 @@ fn parse_file_block(
     finalize_block_paths(header, index_block, &mut state);
 
     // Body: binary markers and hunks until the next block.
-    let (hunks, binary, next) = collect_block_body(lines, raw, index)?;
-    Ok(finish_file_block(state, hunks, binary, next))
+    let saw_paths = state.minus_literal.is_some() && state.saw_plus;
+    let body = collect_block_body(lines, raw, index, saw_paths)?;
+    let meta = FileBlockMeta {
+        key,
+        minus_literal: state.minus_literal.clone(),
+        new_file: state.new_file,
+        deleted_file: state.deleted_file,
+    };
+    let (change, next) = finish_file_block(state, body.hunks, body.bits, body.binary, body.next);
+    Ok((change, meta, next))
 }
 
 fn strip_ab_prefix(path: &str) -> &str {
-    if path.len() > 2 && (path.starts_with("a/") || path.starts_with("b/")) {
+    if path.len() >= 2 && (path.starts_with("a/") || path.starts_with("b/")) {
         &path[2..]
     } else {
         path
+    }
+}
+
+/// Unescape a possibly C-quoted git filename (`unescapeFilename()`,
+/// `src/parser/ArcanistDiffParser.php:1229`, EXPORT-E16).
+///
+/// Only fully double-quoted names decode; anything else stays literal
+/// (backslashes kept).
+fn unescape_git_filename(name: &str) -> String {
+    if name.len() > 2 && name.starts_with('"') && name.ends_with('"') {
+        stripcslashes(&name[1..name.len() - 1])
+    } else {
+        name.to_string()
+    }
+}
+
+/// Decode an octal `stripcslashes()` escape at `bytes[pos]`,
+/// returning the bytes consumed.
+fn stripcslashes_octal(bytes: &[u8], pos: usize, out: &mut Vec<u8>) -> usize {
+    let mut end = pos;
+    while end < bytes.len() && end - pos < 3 && matches!(bytes[end], b'0'..=b'7') {
+        end += 1;
+    }
+    let mut value: u32 = 0;
+    for digit in &bytes[pos..end] {
+        value = value * 8 + u32::from(digit - b'0');
+    }
+    out.push(value as u8);
+    end - pos
+}
+
+/// Decode a `\x` hex `stripcslashes()` escape at `bytes[pos]`,
+/// returning the bytes consumed.
+fn stripcslashes_hex(bytes: &[u8], pos: usize, out: &mut Vec<u8>) -> usize {
+    let mut end = pos + 1;
+    while end < bytes.len() && end - pos < 3 && bytes[end].is_ascii_hexdigit() {
+        end += 1;
+    }
+    if end == pos + 1 {
+        out.push(b'x');
+    } else {
+        let text = std::str::from_utf8(&bytes[pos + 1..end]).unwrap_or("");
+        out.push(u8::from_str_radix(text, 16).unwrap_or(0));
+    }
+    end - pos
+}
+
+/// Decode one `stripcslashes()` escape at `bytes[pos]` (past the
+/// backslash), appending to `out` and returning the bytes consumed.
+fn stripcslashes_escape(bytes: &[u8], pos: usize, out: &mut Vec<u8>) -> usize {
+    match bytes[pos] {
+        b'n' => out.push(b'\n'),
+        b'r' => out.push(b'\r'),
+        b't' => out.push(b'\t'),
+        b'v' => out.push(0x0B),
+        b'f' => out.push(0x0C),
+        b'a' => out.push(0x07),
+        b'b' => out.push(0x08),
+        b'\\' | b'\'' | b'"' | b'?' => out.push(bytes[pos]),
+        b'0'..=b'7' => return stripcslashes_octal(bytes, pos, out),
+        b'x' => return stripcslashes_hex(bytes, pos, out),
+        other => out.push(other),
+    }
+    1
+}
+
+/// PHP `stripcslashes()` over the quoted inner text (EXPORT-E16).
+///
+/// Handles the C single-letter escapes git emits plus up to 3 octal
+/// digits and `\x` hex; anything else keeps the escaped char.
+/// Decoded bytes are lossy UTF-8, matching how hunk corpora already
+/// decode non-UTF-8 bytes elsewhere in this port.
+fn stripcslashes(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut pos = 0;
+    while pos < bytes.len() {
+        if bytes[pos] == b'\\' && pos + 1 < bytes.len() {
+            let consumed = stripcslashes_escape(bytes, pos + 1, &mut out);
+            pos += 1 + consumed;
+        } else {
+            out.push(bytes[pos]);
+            pos += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parse one `diff --git` path: a C-quoted name or a bare token up to
+/// the next space. Returns the inner text, whether it was quoted, and
+/// the remainder after it.
+fn parse_git_diff_path(text: &str) -> Option<(String, bool, &str)> {
+    if let Some(inner) = text.strip_prefix('"') {
+        let bytes = inner.as_bytes();
+        let mut pos = 0;
+        while pos < bytes.len() {
+            if bytes[pos] == b'\\' {
+                pos += 2;
+                continue;
+            }
+            if bytes[pos] == b'"' {
+                return Some((inner[..pos].to_string(), true, &inner[pos + 1..]));
+            }
+            pos += 1;
+        }
+        return None;
+    }
+    let end = text.find(' ').unwrap_or(text.len());
+    Some((text[..end].to_string(), false, &text[end..]))
+}
+
+/// Drop one optional leading `[^/]+/` prefix segment, like the
+/// `(?:[^/]+/)?` prefix in `extractGitCommonFilename()`. A leading
+/// or trailing slash matches no prefix (the regex needs a non-empty
+/// segment on both sides), so those stay whole.
+fn strip_one_prefix_segment(path: &str) -> &str {
+    match path.find('/') {
+        Some(slash) if slash > 0 && slash + 1 < path.len() => &path[slash + 1..],
+        _ => path,
+    }
+}
+
+/// Common filename of a `diff --git` old/new pair
+/// (`extractGitCommonFilename()`, `:1325`, EXPORT-E16).
+///
+/// `rest` is the header text after `diff --git `. The two paths may be
+/// C-quoted (then they may contain spaces) and carry any single
+/// `a/`-style prefix, which is removed before comparing. Returns the
+/// unescaped common path, or `None` for renames/differs (recovered
+/// later from `rename from`/`rename to` lines).
+fn extract_git_common_filename(rest: &str) -> Option<String> {
+    let rest = rest.trim_end_matches(['\r', '\n']);
+    let (old, _, after_old) = parse_git_diff_path(rest)?;
+    let after_old = after_old.strip_prefix(' ')?;
+    let (new, new_quoted, after_new) = parse_git_diff_path(after_old)?;
+    if !after_new.is_empty() {
+        return None;
+    }
+    let old_common = strip_one_prefix_segment(&old);
+    let new_common = strip_one_prefix_segment(&new);
+    if old_common.is_empty() || old_common != new_common {
+        return None;
+    }
+    if new_quoted {
+        Some(stripcslashes(new_common))
+    } else {
+        Some(new_common.to_string())
     }
 }
 
@@ -3510,10 +4079,13 @@ fn strip_svn_paren_suffix(path: &str) -> &str {
 
 /// Extract the path from a `---`/`+++` line, dropping hg/svn suffixes.
 ///
-/// Handles `a/f`, `b/f`, bare `f`, quoted `"f"`, svn `f (revision N)` /
+/// Handles `a/f`, `b/f`, bare `f`, svn `f (revision N)` /
 /// `f (working copy)` / `f (synthetic)` suffixes, and hg tab-separated
 /// date suffixes. `Index:` blocks strip every trailing ` (...)`
 /// (`parseHunkTarget()`); other blocks keep the legacy suffix checks.
+/// Quoted names stay literal (EXPORT-E16): PHP's `parseHunkTarget()`
+/// never unescapes `---`/`+++` paths (only rename/copy headers
+/// decode).
 fn diff_path_value(line: &str, strip_paren_suffix: bool) -> String {
     let value = line[4..].trim_end();
     // Tab separates svn/hg metadata suffixes.
@@ -3526,68 +4098,206 @@ fn diff_path_value(line: &str, strip_paren_suffix: bool) -> String {
     } else {
         path
     };
-    let path = path.trim();
-    let unquoted = if path.len() >= 2 && path.starts_with('"') && path.ends_with('"') {
-        &path[1..path.len() - 1]
-    } else {
-        path
-    };
-    strip_ab_prefix(unquoted).to_string()
+    strip_ab_prefix(path.trim()).to_string()
 }
 
-/// Parse an `@@ -a[,b] +c[,d] @@` header into its four offsets.
-fn parse_hunk_header(line: &str) -> Option<(u64, u64, u64, u64)> {
-    let inner = line.strip_prefix("@@ ")?.split_once("@@")?.0;
-    let mut parts = inner.split_whitespace();
-    let old = parts.next()?.strip_prefix('-')?;
-    let new = parts.next()?.strip_prefix('+')?;
-    let (old_start, old_len) = parse_hunk_range(old)?;
-    let (new_start, new_len) = parse_hunk_range(new)?;
-    Some((old_start, old_len, new_start, new_len))
-}
-
-fn parse_hunk_range(text: &str) -> Option<(u64, u64)> {
-    if let Some((start, len)) = text.split_once(',') {
-        Some((start.parse().ok()?, len.parse().ok()?))
-    } else {
-        Some((text.parse().ok()?, 1))
-    }
-}
-
-fn collect_hunk(
-    lines: &[&str],
-    start: usize,
+/// One parsed `@@ -a[,b] +c[,d] @@` header, with length
+/// explicitness (EXPORT-E11).
+struct HunkHeader {
     old_start: u64,
     old_len: u64,
     new_start: u64,
     new_len: u64,
-) -> (ParsedHunk, usize) {
+    explicit: HunkLenExplicit,
+}
+
+/// Parse an `@@ -a[,b] +c[,d] @@` header into offsets plus the
+/// `,length` explicitness bits (EXPORT-E11).
+///
+/// A third range (combined-diff style) or a missing closing `@@`
+/// rejects the header, like PHP's full-anchored hunk regex
+/// (EXPORT-E15).
+fn parse_hunk_header(line: &str) -> Option<HunkHeader> {
+    let inner = line.strip_prefix("@@ ")?.split_once("@@")?.0;
+    let mut parts = inner.split_whitespace();
+    let old = parts.next()?.strip_prefix('-')?;
+    let new = parts.next()?.strip_prefix('+')?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let (old_start, old_len, old_explicit) = parse_hunk_range(old)?;
+    let (new_start, new_len, new_explicit) = parse_hunk_range(new)?;
+    Some(HunkHeader {
+        old_start,
+        old_len,
+        new_start,
+        new_len,
+        explicit: HunkLenExplicit {
+            old_explicit,
+            new_explicit,
+        },
+    })
+}
+
+fn parse_hunk_range(text: &str) -> Option<(u64, u64, bool)> {
+    if let Some((start, len)) = text.split_once(',') {
+        if len.contains(',') {
+            return None;
+        }
+        Some((start.parse().ok()?, len.parse().ok()?, true))
+    } else {
+        Some((text.parse().ok()?, 1, false))
+    }
+}
+
+/// True for a line that ends a hunk body without being consumed:
+/// any `@`-led line (next header or combined hunk) or a block
+/// boundary. PHP's body `switch` ends the hunk (`hit_next_hunk`) on
+/// these and on any other unexpected first byte (`:950-994`); the
+/// leftovers end it via `hunk_line_action`.
+fn is_hunk_end_line(line: &str) -> bool {
+    line.starts_with('@') || is_block_end_line(line)
+}
+
+/// First byte driving the hunk body loop. Empty lines count as
+/// context (`diff.suppressBlankEmpty`, `:940-947`).
+fn hunk_first_byte(line: &str) -> u8 {
+    if line.is_empty() {
+        b' '
+    } else {
+        line.as_bytes()[0]
+    }
+}
+
+/// True for a well-formed `\ No newline at end of file` marker
+/// (EXPORT-E15). PHP searches unanchored (`:951`), so any line whose
+/// first byte is `\` and which contains the marker text qualifies.
+fn is_no_newline_marker(line: &str) -> bool {
+    line.as_bytes().first() == Some(&b'\\') && line.contains("No newline at end of file")
+}
+
+/// One hunk body line's effect on the length countdown.
+enum HunkLineAction {
+    /// `+` line: consumes one new line.
+    Add,
+    /// `-` line: consumes one old line.
+    Del,
+    /// ` ` (or empty) line: consumes one line on each side.
+    Context,
+    /// `\` marker: validated and stored by the caller.
+    Backslash,
+    /// End the hunk, holding the line (`-` past zero, anything else).
+    EndHold,
+    /// End the hunk, consuming the line (` ` past zero counts).
+    EndConsumed,
+}
+
+/// Validate and store one `\` marker line, returning whether the
+/// hunk ends (new side exhausted, EXPORT-E15).
+fn collect_hunk_backslash(
+    line: &str,
+    raw: &[&str],
+    index: usize,
+    new_rem: i64,
+    corpus: &mut String,
+) -> Result<bool, String> {
+    if !is_no_newline_marker(line) {
+        return Err(diff_parse_error(raw, index, EXPECTED_NO_NEWLINE_MARKER));
+    }
+    corpus.push_str(raw[index]);
+    Ok(new_rem == 0)
+}
+
+/// Classify one hunk body line against the remaining counts
+/// (EXPORT-E15).
+fn hunk_line_action(line: &str, old_rem: i64, new_rem: i64) -> HunkLineAction {
+    match hunk_first_byte(line) {
+        b'\\' => HunkLineAction::Backslash,
+        b'+' => HunkLineAction::Add,
+        b'-' => {
+            if old_rem == 0 {
+                HunkLineAction::EndHold
+            } else {
+                HunkLineAction::Del
+            }
+        }
+        b' ' => {
+            if old_rem == 0 && new_rem == 0 {
+                HunkLineAction::EndConsumed
+            } else {
+                HunkLineAction::Context
+            }
+        }
+        _ => HunkLineAction::EndHold,
+    }
+}
+
+/// Collect one hunk body from `start + 1`, length-driven like PHP's
+/// `parseChangeset()` loop (`:939-997`, EXPORT-E15).
+///
+/// `lines` drives matching while `raw` (same indices, endings kept)
+/// supplies the corpus bytes, so original line endings are retained
+/// (EXPORT-E12). Count mismatches fail with PHP's
+/// `didFailParse()` texts; a hunk ends early on `@` lines and block
+/// boundaries (held, not consumed) or on a ` ` line past exhausted
+/// counts (consumed, like PHP).
+fn collect_hunk(
+    lines: &[&str],
+    raw: &[&str],
+    start: usize,
+    header: &HunkHeader,
+) -> Result<(ParsedHunk, usize), String> {
+    let mut old_rem = i64::try_from(header.old_len).unwrap_or(i64::MAX);
+    let mut new_rem = i64::try_from(header.new_len).unwrap_or(i64::MAX);
     let mut corpus = String::new();
     let mut index = start + 1;
     while index < lines.len() {
         let line = lines[index];
-        if line.starts_with("@@ ")
-            || line.starts_with("@@@")
-            || is_diff_header(line)
-            || is_combined_diff_header(line)
-            || line.starts_with("commit ")
-        {
+        if is_hunk_end_line(line) {
             break;
         }
-        corpus.push_str(line);
-        corpus.push('\n');
-        index += 1;
+        match hunk_line_action(line, old_rem, new_rem) {
+            HunkLineAction::Backslash => {
+                let end = collect_hunk_backslash(line, raw, index, new_rem, &mut corpus)?;
+                index += 1;
+                if end {
+                    break;
+                }
+            }
+            HunkLineAction::Add => {
+                new_rem -= 1;
+                corpus.push_str(raw[index]);
+                index += 1;
+            }
+            HunkLineAction::Del => {
+                old_rem -= 1;
+                corpus.push_str(raw[index]);
+                index += 1;
+            }
+            HunkLineAction::Context => {
+                old_rem -= 1;
+                new_rem -= 1;
+                corpus.push_str(raw[index]);
+                index += 1;
+            }
+            HunkLineAction::EndConsumed => {
+                index += 1;
+                break;
+            }
+            HunkLineAction::EndHold => break,
+        }
     }
-    (
-        ParsedHunk {
-            old_start,
-            old_len,
-            new_start,
-            new_len,
-            corpus,
-        },
-        index,
-    )
+    if old_rem != 0 || new_rem != 0 {
+        return Err(diff_parse_error(raw, index, WRONG_HUNK_LINE_COUNT));
+    }
+    let hunk = ParsedHunk {
+        old_start: header.old_start,
+        old_len: header.old_len,
+        new_start: header.new_start,
+        new_len: header.new_len,
+        corpus,
+    };
+    Ok((hunk, index))
 }
 
 /* -(  Raw Sources, Hg, Svn (G1 full-state)  )----------------------------------- */
@@ -4749,6 +5459,9 @@ pub fn svn_skeleton_change(root: &Path, path: &str, flags: u32) -> ParsedChange 
         change_type,
         file_type,
         hunks: Vec::new(),
+        hunk_len_explicit: Vec::new(),
+        old_mode: None,
+        new_mode: None,
         away_paths: Vec::new(),
         commit_hash: None,
         message: None,
@@ -4914,6 +5627,9 @@ fn fresh_origin_change(origin: &str) -> ParsedChange {
         change_type: TYPE_CHANGE,
         file_type: FILE_TEXT,
         hunks: Vec::new(),
+        hunk_len_explicit: Vec::new(),
+        old_mode: None,
+        new_mode: None,
         away_paths: Vec::new(),
         commit_hash: None,
         message: None,

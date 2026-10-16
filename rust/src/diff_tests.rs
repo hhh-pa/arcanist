@@ -890,6 +890,12 @@ fn g1_hunk_and_change_conversion() {
         change_type: diff_local::TYPE_MOVE_HERE,
         file_type: diff_local::FILE_TEXT,
         hunks: vec![hunk],
+        hunk_len_explicit: vec![diff_local::HunkLenExplicit {
+            old_explicit: true,
+            new_explicit: true,
+        }],
+        old_mode: None,
+        new_mode: None,
         away_paths: vec!["away.txt".to_string()],
         commit_hash: None,
         message: None,
