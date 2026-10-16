@@ -204,3 +204,18 @@ fn binaries_and_flags() {
     let out = CapturedOutput::new(1, "", "oops");
     assert_eq!(describe_output(&out), "exit 1: oops");
 }
+
+#[test]
+fn unit_u20_coverage_keeps_document_order() {
+    let cover = r#"<coverage><packages><package><classes>
+      <class filename="zeta.py"><lines><line number="1" hits="1"/></lines></class>
+      <class filename="alpha.py"><lines><line number="1" hits="0"/></lines></class>
+    </classes></package></packages></coverage>"#;
+    let is_dir = |_: &str| false;
+    let is_file = |p: &str| p == "/r/zeta.py" || p == "/r/alpha.py";
+    let counts = |_: &str| Some(1);
+    let paths = ["zeta.py".to_string(), "alpha.py".to_string()];
+    let reports = read_coverage_ordered(cover, "/r", &paths, &counts, &is_dir, &is_file);
+    let names: Vec<&str> = reports.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, vec!["zeta.py", "alpha.py"]);
+}

@@ -162,3 +162,28 @@ fn run_with_uses_canned_outputs() {
     assert!(engine.supports_run_all_tests());
     assert_eq!(engine.engine_configuration_name(), None);
 }
+
+#[test]
+fn unit_u20_coverage_keeps_document_order() {
+    let cover = r#"<coverage><package><classes>
+      <class filename="/r/z.py"><lines><line number="1" hits="1"/></lines></class>
+      <class filename="/r/a.py"><lines><line number="1" hits="0"/></lines></class>
+    </classes></package></coverage>"#;
+    let counts = |_: &str| Some(1);
+    let reports = read_coverage_ordered(cover, "/r", &counts);
+    let names: Vec<&str> = reports.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, vec!["/r/z.py", "/r/a.py"]);
+    // Through the parse path into the dictionary.
+    let xunit = r#"<testsuite><testcase classname="a" name="t" time="1"/></testsuite>"#;
+    let ctx = EngineContext::new("/r");
+    let results = parse_test_results("./", xunit, Some(cover), None, &ctx, &counts).unwrap();
+    let dict = results[0].to_dictionary();
+    let names: Vec<&str> = dict
+        .coverage
+        .as_deref()
+        .unwrap()
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(names, vec!["/r/z.py", "/r/a.py"]);
+}

@@ -302,3 +302,82 @@ fn unit_u25_counts_use_thousands_separators() {
     assert!(err.contains("1,234 bytes"), "{err}");
     assert!(err.contains("255 bytes"), "{err}");
 }
+
+#[test]
+fn unit_u20_ordered_sets_keep_document_order() {
+    let mut result = UnitResult::new();
+    result.set_extra_data_ordered(vec![
+        ("zebra".to_string(), "1".to_string()),
+        ("apple".to_string(), "2".to_string()),
+    ]);
+    result.set_coverage_ordered(vec![
+        ("z.php".to_string(), "C".to_string()),
+        ("a.php".to_string(), "U".to_string()),
+    ]);
+    // Lookups still work.
+    assert_eq!(result.get_extra_data().unwrap().get("apple").unwrap(), "2");
+    assert_eq!(result.get_coverage().unwrap().get("a.php").unwrap(), "U");
+    // Dictionaries keep document order, not sorted order.
+    let dict = result.to_dictionary();
+    let keys: Vec<&str> = dict
+        .extra
+        .as_deref()
+        .unwrap()
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .collect();
+    assert_eq!(keys, vec!["zebra", "apple"]);
+    let keys: Vec<&str> = dict
+        .coverage
+        .as_deref()
+        .unwrap()
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .collect();
+    assert_eq!(keys, vec!["z.php", "a.php"]);
+    // Repeats keep first position with the last value (PHP arrays).
+    result.set_coverage_ordered(vec![
+        ("b.php".to_string(), "C".to_string()),
+        ("a.php".to_string(), "U".to_string()),
+        ("b.php".to_string(), "CC".to_string()),
+    ]);
+    assert_eq!(
+        result.coverage_ordered().unwrap(),
+        vec![
+            ("b.php".to_string(), "CC".to_string()),
+            ("a.php".to_string(), "U".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn unit_u20_legacy_sets_render_sorted() {
+    // The legacy `HashMap` setters lost the order already, so readers
+    // keep the historical sorted rendering.
+    let mut result = UnitResult::new();
+    result.set_extra_data(HashMap::from([
+        ("zebra".to_string(), "1".to_string()),
+        ("apple".to_string(), "2".to_string()),
+    ]));
+    result.set_coverage(HashMap::from([
+        ("z.php".to_string(), "C".to_string()),
+        ("a.php".to_string(), "U".to_string()),
+    ]));
+    let dict = result.to_dictionary();
+    let keys: Vec<&str> = dict
+        .extra
+        .as_deref()
+        .unwrap()
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .collect();
+    assert_eq!(keys, vec!["apple", "zebra"]);
+    let keys: Vec<&str> = dict
+        .coverage
+        .as_deref()
+        .unwrap()
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .collect();
+    assert_eq!(keys, vec!["a.php", "z.php"]);
+}

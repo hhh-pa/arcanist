@@ -275,3 +275,18 @@ fn run_with_uses_canned_reports() {
     assert!(!engine.supports_run_all_tests());
     assert_eq!(engine.engine_configuration_name(), None);
 }
+
+#[test]
+fn unit_u20_clover_keeps_document_order() {
+    let clover = r#"<coverage><project>
+      <file name="/r/src/Z.php"><line num="1" type="stmt" count="1"/></file>
+      <file name="/r/src/A.php"><line num="1" type="stmt" count="1"/></file>
+    </project></coverage>"#;
+    let mut affected = HashMap::new();
+    affected.insert("/r/src/Z.php".to_string(), "t".to_string());
+    affected.insert("/r/src/A.php".to_string(), "t".to_string());
+    let counts = |_: &str| Some(1);
+    let reports = read_clover_coverage_ordered(clover, "/r", &affected, &counts);
+    let names: Vec<&str> = reports.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, vec!["src/Z.php", "src/A.php"]);
+}

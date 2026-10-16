@@ -2116,20 +2116,20 @@ fn plan_csharp_assembly(
 }
 
 /// Read one run's cscover report through the cache (`readCoverage`,
-/// lines 216-285). Line counts come from the real filesystem, matching
-/// PHP `count(file(...))`.
+/// lines 216-285) in first-seen file order (UNIT-U20). Line counts come
+/// from the real filesystem, matching PHP `count(file(...))`.
 fn read_run_coverage(
     cover_output: Option<&str>,
     project_root: &str,
     cache: &mut unit_csharp::CoverageCache,
-) -> Result<Option<HashMap<String, String>>, EngineError> {
+) -> Result<Option<Vec<(String, String)>>, EngineError> {
     let Some(cover_file) = cover_output else {
         return Ok(None);
     };
     let xml = std::fs::read_to_string(cover_file)
         .map_err(|e| EngineError::Failed(format!("cannot read '{cover_file}': {e}")))?;
     cache
-        .read_cached(cover_file, &xml, project_root, &|p| {
+        .read_cached_ordered(cover_file, &xml, project_root, &|p| {
             std::fs::read_to_string(p)
                 .ok()
                 .map(|text| text.lines().count())
@@ -2156,7 +2156,7 @@ fn execute_csharp_run(
     let xml = std::fs::read_to_string(&run.xunit_output)
         .map_err(|e| EngineError::Failed(format!("cannot read '{}': {e}", run.xunit_output)))?;
     let coverage = read_run_coverage(run.cover_output.as_deref(), project_root, cache)?;
-    let results = unit_csharp::parse_assembly_results(&xml, coverage.as_ref())?;
+    let results = unit_csharp::parse_assembly_results_ordered(&xml, coverage.as_deref())?;
     remove_report_file(&run.xunit_output);
     if let Some(cover) = run.cover_output.as_deref() {
         remove_report_file(cover);
@@ -2821,15 +2821,12 @@ pub fn collect_coverage(results: &[EngineUnitResult]) -> HashMap<String, Vec<Str
 pub fn collect_coverage_ordered(results: &[EngineUnitResult]) -> Vec<(String, Vec<String>)> {
     let mut coverage: Vec<(String, Vec<String>)> = Vec::new();
     for result in results {
-        let Some(map) = result.get_coverage() else {
+        // Per-result files keep document order (UNIT-U20; legacy maps
+        // fall back to sorted pairs).
+        let Some(files) = result.coverage_ordered() else {
             continue;
         };
-        // NOTE: per-result maps are unordered (`HashMap`), so files from
-        // one result keep no order; files first seen in earlier results
-        // still precede later ones (UNIT-U20 owns the deeper fix).
-        let mut files: Vec<(&String, &String)> = map.iter().collect();
-        files.sort();
-        for (file, report) in files {
+        for (file, report) in &files {
             match coverage.iter_mut().find(|(name, _)| name == file) {
                 Some((_, reports)) => reports.push(report.clone()),
                 None => coverage.push((file.clone(), vec![report.clone()])),
@@ -3282,9 +3279,9 @@ fn php_json_string_or_null(value: Option<&str>, escape_slashes: bool) -> String 
 /// `toDictionary` insertion order), never escapes `/`, and emits raw
 /// UTF-8 (PHP `\uXXXX`-escapes non-ASCII) and `{}` for empty maps (PHP
 /// emits `[]` for empty arrays), so both formats render here by hand.
-/// Remaining known divergences: nested `extra`/`coverage` key order
-/// (sorted here, first-seen in PHP) and Harbormaster upload encoding
-/// (the shared conduit client serializes with serde).
+/// Nested `extra`/`coverage` pairs keep insertion order (UNIT-U20).
+/// Remaining known divergence: Harbormaster upload encoding (the shared
+/// conduit client serializes with serde).
 #[must_use]
 pub fn results_to_json_text(results: &[EngineUnitResult], pretty: bool) -> String {
     if pretty {

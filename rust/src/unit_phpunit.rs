@@ -395,9 +395,9 @@ pub fn parse_phpunit_results(
     }
     let report = get_json_report(test_results)?;
     let coverage = if enable_coverage == Some(false) {
-        HashMap::new()
+        Vec::new()
     } else {
-        read_clover_coverage(
+        read_clover_coverage_ordered(
             clover_xml.unwrap_or(""),
             project_root,
             affected_tests,
@@ -443,7 +443,7 @@ pub fn parse_phpunit_results(
 /// clover coverage map.
 fn build_phpunit_event_result(
     event: &JsonValue,
-    coverage: &HashMap<String, String>,
+    coverage: &[(String, String)],
 ) -> Result<UnitResult, EngineError> {
     let (status, user_data) = phpunit_event_outcome(event);
     let raw_name = event.get("test").and_then(JsonValue::as_str).unwrap_or("");
@@ -452,7 +452,7 @@ fn build_phpunit_event_result(
     result.set_name(&name).map_err(EngineError::Failed)?;
     result.set_result(status);
     result.set_duration(event.get("time").and_then(JsonValue::as_num).unwrap_or(0.0));
-    result.set_coverage(coverage.clone());
+    result.set_coverage_ordered(coverage.to_vec());
     result.set_user_data(&user_data);
     Ok(result)
 }
@@ -579,6 +579,8 @@ fn repair_concatenated_json(json: &str) -> String {
 /// covered line are dropped as false positives (parser lines 154-158) and
 /// names are relativized against the project root (parser lines 155-157).
 /// Empty input yields no reports (parser lines 112-114).
+/// Legacy unordered form; the parse path uses
+/// [`read_clover_coverage_ordered`].
 #[must_use]
 pub fn read_clover_coverage(
     clover_xml: &str,
@@ -586,7 +588,21 @@ pub fn read_clover_coverage(
     affected_tests: &HashMap<String, String>,
     line_count_of: &dyn Fn(&str) -> Option<usize>,
 ) -> HashMap<String, String> {
-    let mut reports = HashMap::new();
+    read_clover_coverage_ordered(clover_xml, project_root, affected_tests, line_count_of)
+        .into_iter()
+        .collect()
+}
+
+/// [`read_clover_coverage`] in document order (UNIT-U20): reports follow
+/// the `<file>` elements like PHP's insertion-ordered array.
+#[must_use]
+pub fn read_clover_coverage_ordered(
+    clover_xml: &str,
+    project_root: &str,
+    affected_tests: &HashMap<String, String>,
+    line_count_of: &dyn Fn(&str) -> Option<usize>,
+) -> Vec<(String, String)> {
+    let mut reports = Vec::new();
     if clover_xml.is_empty() {
         return reports;
     }
@@ -606,7 +622,7 @@ pub fn read_clover_coverage(
                 .strip_prefix(&prefix)
                 .unwrap_or(class_path)
                 .to_string();
-            reports.insert(relative, String::from_utf8_lossy(&marks).to_string());
+            reports.push((relative, String::from_utf8_lossy(&marks).to_string()));
         }
     }
     reports

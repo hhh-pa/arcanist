@@ -333,3 +333,15 @@ fn driver_source_covers_selection_execution_and_gates() {
     assert!(driver.contains("didRunTestCases"), "{driver}");
     assert!(driver.contains("toDictionary"), "{driver}");
 }
+
+#[test]
+fn unit_u20_driver_coverage_keeps_document_order() {
+    let text = r#"{"results": [
+        {"name": "t", "result": "pass",
+         "coverage": {"z.php": "C", "a.php": "U"}}
+    ]}"#;
+    let results = parse_phutil_output(text, "o.json").unwrap();
+    let ordered = results[0].coverage_ordered().unwrap();
+    let names: Vec<&str> = ordered.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, vec!["z.php", "a.php"]);
+}

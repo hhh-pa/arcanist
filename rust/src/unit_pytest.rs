@@ -204,7 +204,7 @@ pub fn parse_test_results(
     let mut results = parse_xunit_testcases(junit_xml).map_err(EngineError::Failed)?;
     if enable_coverage != Some(false) {
         let empty = String::new();
-        let coverage = read_coverage(
+        let coverage = read_coverage_ordered(
             cover_xml.unwrap_or(&empty),
             project_root,
             paths,
@@ -213,7 +213,7 @@ pub fn parse_test_results(
             is_file,
         );
         for result in &mut results {
-            result.set_coverage(coverage.clone());
+            result.set_coverage_ordered(coverage.clone());
         }
     }
     Ok(results)
@@ -255,6 +255,7 @@ pub fn resolve_module_path(
 /// `in_array($relative_path, $paths)` (line 106). Empty input yields no
 /// reports (lines 68-70). Probes see root-joined absolute paths, mirroring
 /// `Filesystem::resolvePath` against the project root.
+/// Legacy unordered form; the parse path uses [`read_coverage_ordered`].
 #[must_use]
 pub fn read_coverage(
     coverage_xml: &str,
@@ -264,7 +265,30 @@ pub fn read_coverage(
     is_dir: &dyn Fn(&str) -> bool,
     is_file: &dyn Fn(&str) -> bool,
 ) -> HashMap<String, String> {
-    let mut reports = HashMap::new();
+    read_coverage_ordered(
+        coverage_xml,
+        project_root,
+        paths,
+        line_count_of,
+        is_dir,
+        is_file,
+    )
+    .into_iter()
+    .collect()
+}
+
+/// [`read_coverage`] in document order (UNIT-U20): reports follow the
+/// `<class>` elements like PHP's insertion-ordered array.
+#[must_use]
+pub fn read_coverage_ordered(
+    coverage_xml: &str,
+    project_root: &str,
+    paths: &[String],
+    line_count_of: &dyn Fn(&str) -> Option<usize>,
+    is_dir: &dyn Fn(&str) -> bool,
+    is_file: &dyn Fn(&str) -> bool,
+) -> Vec<(String, String)> {
+    let mut reports = Vec::new();
     if coverage_xml.is_empty() {
         return reports;
     }
@@ -291,7 +315,7 @@ pub fn read_coverage(
                 lines.push((number, hits));
             }
         }
-        reports.insert(relative, coverage_string_from_lines(line_count, &lines));
+        reports.push((relative, coverage_string_from_lines(line_count, &lines)));
     }
     reports
 }

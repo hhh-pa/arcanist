@@ -245,11 +245,24 @@ pub fn process_tags(xml: &str, tag: &str) -> Vec<CoverageSpan> {
 /// all-`N` report sized by the file's line count (lines 248-254); files are
 /// keyed relative to the project root (line 238). Note the fetched-but-unused
 /// `$modified` paths (line 225). Spans outside the file are clipped.
+/// Legacy unordered form; ordered readers use
+/// [`read_cscover_coverage_ordered`].
 pub fn read_cscover_coverage(
     cover_xml: &str,
     project_root: &str,
     line_count_of: &dyn Fn(&str) -> Option<usize>,
 ) -> Result<HashMap<String, String>, EngineError> {
+    read_cscover_coverage_ordered(cover_xml, project_root, line_count_of)
+        .map(|reports| reports.into_iter().collect())
+}
+
+/// [`read_cscover_coverage`] in first-seen file order (UNIT-U20), like
+/// PHP's insertion-ordered array.
+pub fn read_cscover_coverage_ordered(
+    cover_xml: &str,
+    project_root: &str,
+    line_count_of: &dyn Fn(&str) -> Option<usize>,
+) -> Result<Vec<(String, String)>, EngineError> {
     let instrumented = process_tags(cover_xml, "instrumented");
     let executed = process_tags(cover_xml, "executed");
 
@@ -261,7 +274,7 @@ pub fn read_cscover_coverage(
         }
     }
 
-    let mut reports = HashMap::new();
+    let mut reports = Vec::new();
     for file in &files {
         let absolute = format!("{project_root}/{file}");
         let Some(line_count) = line_count_of(&absolute) else {
@@ -280,7 +293,7 @@ pub fn read_cscover_coverage(
             }
             paint_span(&mut coverage, span.start, span.end, b'C');
         }
-        reports.insert(file.clone(), String::from_utf8_lossy(&coverage).to_string());
+        reports.push((file.clone(), String::from_utf8_lossy(&coverage).to_string()));
     }
     Ok(reports)
 }
@@ -312,18 +325,58 @@ pub fn relative_to_root(absolute: &str, project_root: &str) -> String {
 
 /// `parseCoverageResult` (lines 152-157): with coverage disabled there is no
 /// report (parent returns null); otherwise read the cscover file.
+/// Legacy unordered form; ordered readers use
+/// [`parse_coverage_result_ordered`].
 pub fn parse_coverage_result(
     cover_xml: Option<&str>,
     enable_coverage: Option<bool>,
     project_root: &str,
     line_count_of: &dyn Fn(&str) -> Option<usize>,
 ) -> Result<Option<HashMap<String, String>>, EngineError> {
+    parse_coverage_result_ordered(cover_xml, enable_coverage, project_root, line_count_of)
+        .map(|reports| reports.map(|pairs| pairs.into_iter().collect()))
+}
+
+/// [`parse_coverage_result`] in first-seen file order (UNIT-U20).
+pub fn parse_coverage_result_ordered(
+    cover_xml: Option<&str>,
+    enable_coverage: Option<bool>,
+    project_root: &str,
+    line_count_of: &dyn Fn(&str) -> Option<usize>,
+) -> Result<Option<Vec<(String, String)>>, EngineError> {
     if enable_coverage == Some(false) {
         return Ok(None);
     }
     match cover_xml {
-        Some(xml) => read_cscover_coverage(xml, project_root, line_count_of).map(Some),
+        Some(xml) => read_cscover_coverage_ordered(xml, project_root, line_count_of).map(Some),
         None => Ok(None),
+    }
+}
+
+/// One cached coverage file: lookup map plus first-seen file order
+/// (UNIT-U20). Legacy `add_cached` stores leave the order empty.
+#[derive(Debug, Default)]
+struct CacheEntry {
+    map: HashMap<String, String>,
+    order: Vec<String>,
+}
+
+impl CacheEntry {
+    /// Pairs in insertion order, else sorted (the legacy fallback).
+    fn ordered_pairs(&self) -> Vec<(String, String)> {
+        if self.order.is_empty() {
+            let mut pairs: Vec<(String, String)> = self
+                .map
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            pairs.sort();
+            return pairs;
+        }
+        self.order
+            .iter()
+            .filter_map(|key| self.map.get(key).map(|value| (key.clone(), value.clone())))
+            .collect()
     }
 }
 
@@ -331,7 +384,7 @@ pub fn parse_coverage_result(
 /// `addCachedResults` (lines 183-188): reports keyed by coverage-file name.
 #[derive(Debug, Default)]
 pub struct CoverageCache {
-    entries: HashMap<String, HashMap<String, String>>,
+    entries: HashMap<String, CacheEntry>,
 }
 
 impl CoverageCache {
@@ -344,12 +397,38 @@ impl CoverageCache {
     /// `getCachedResultsIfPossible`: cached reports for a coverage file.
     #[must_use]
     pub fn get_cached(&self, cover_file: &str) -> Option<&HashMap<String, String>> {
-        self.entries.get(cover_file)
+        self.entries.get(cover_file).map(|entry| &entry.map)
     }
 
     /// `addCachedResults`: store reports for a coverage file.
     pub fn add_cached(&mut self, cover_file: &str, reports: HashMap<String, String>) {
-        self.entries.insert(cover_file.to_string(), reports);
+        self.entries.insert(
+            cover_file.to_string(),
+            CacheEntry {
+                map: reports,
+                order: Vec::new(),
+            },
+        );
+    }
+
+    /// [`CoverageCache::get_cached`] in first-seen file order (UNIT-U20).
+    #[must_use]
+    pub fn get_cached_ordered(&self, cover_file: &str) -> Option<Vec<(String, String)>> {
+        self.entries.get(cover_file).map(CacheEntry::ordered_pairs)
+    }
+
+    /// [`CoverageCache::add_cached`] with first-seen file order (UNIT-U20).
+    pub fn add_cached_ordered(&mut self, cover_file: &str, reports: Vec<(String, String)>) {
+        let mut map = HashMap::with_capacity(reports.len());
+        let mut order = Vec::with_capacity(reports.len());
+        for (key, value) in reports {
+            if !map.contains_key(&key) {
+                order.push(key.clone());
+            }
+            map.insert(key, value);
+        }
+        self.entries
+            .insert(cover_file.to_string(), CacheEntry { map, order });
     }
 
     /// Cached read: serve from the cache when possible, else parse, store,
@@ -361,11 +440,23 @@ impl CoverageCache {
         project_root: &str,
         line_count_of: &dyn Fn(&str) -> Option<usize>,
     ) -> Result<HashMap<String, String>, EngineError> {
-        if let Some(cached) = self.get_cached(cover_file) {
-            return Ok(cached.clone());
+        self.read_cached_ordered(cover_file, cover_xml, project_root, line_count_of)
+            .map(|reports| reports.into_iter().collect())
+    }
+
+    /// [`CoverageCache::read_cached`] in first-seen file order (UNIT-U20).
+    pub fn read_cached_ordered(
+        &mut self,
+        cover_file: &str,
+        cover_xml: &str,
+        project_root: &str,
+        line_count_of: &dyn Fn(&str) -> Option<usize>,
+    ) -> Result<Vec<(String, String)>, EngineError> {
+        if let Some(cached) = self.get_cached_ordered(cover_file) {
+            return Ok(cached);
         }
-        let reports = read_cscover_coverage(cover_xml, project_root, line_count_of)?;
-        self.add_cached(cover_file, reports.clone());
+        let reports = read_cscover_coverage_ordered(cover_xml, project_root, line_count_of)?;
+        self.add_cached_ordered(cover_file, reports.clone());
         Ok(reports)
     }
 }
@@ -373,9 +464,37 @@ impl CoverageCache {
 /// Parent xUnit assembly-result parsing, duplicated in miniature from the
 /// xUnit engine (the PHP class inherits it): `<test name time result>` with
 /// `Pass`/`Fail`/`Skip` mapping, defaulting to unsound.
+/// Legacy unordered coverage; ordered callers use
+/// [`parse_assembly_results_ordered`].
 pub fn parse_assembly_results(
     xunit_xml: &str,
     coverage: Option<&HashMap<String, String>>,
+) -> Result<Vec<UnitResult>, EngineError> {
+    let ordered = coverage.map(|map| {
+        let mut pairs: Vec<(String, String)> = map
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        pairs.sort();
+        pairs
+    });
+    let mut results = parse_assembly_results_ordered(xunit_xml, ordered.as_deref())?;
+    // The legacy map's order is already lost, so results keep the
+    // sorted fallback (not recorded document order).
+    if coverage.is_some() {
+        for result in &mut results {
+            let map = result.get_coverage().cloned().unwrap_or_default();
+            result.set_coverage(map);
+        }
+    }
+    Ok(results)
+}
+
+/// [`parse_assembly_results`] with coverage pairs in document order
+/// (UNIT-U20).
+pub fn parse_assembly_results_ordered(
+    xunit_xml: &str,
+    coverage: Option<&[(String, String)]>,
 ) -> Result<Vec<UnitResult>, EngineError> {
     let mut results = Vec::new();
     for test in find_elements(xunit_xml, "test") {
@@ -396,7 +515,7 @@ pub fn parse_assembly_results(
                 .unwrap_or(0.0),
         );
         if let Some(coverage) = coverage {
-            result.set_coverage(coverage.clone());
+            result.set_coverage_ordered(coverage.to_vec());
         }
         results.push(result);
     }
