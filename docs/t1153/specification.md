@@ -111,3 +111,22 @@ Old-style flat APIs untouched: `differential.query`,
 orsay server upgrade; restoring PHP arc; changing old-style flat
 APIs (`edge.search`, `*.query*`); touching the phabricator repo;
 shipping the binary (normal release flow follows after review).
+
+## Phase 1 (wire-critical) — task update 2026-10-16
+
+The task grew into a full retrocompat program (Phases 0–3). Phase 0
+(§1, this spec's original scope) is done. Phase 1 implements, on the
+same branch: R2 loose-int coercion (PATCH-P6/P7, DIFF-D15, P1 ids),
+DIFF-D1/D3/D4/D5 (+D2 create-path wiring, inseparable from D3/D5),
+PATCH-P1/P2, EXPORT-E9/E10, RB-D26/D27.
+
+When the retrocompatible implementation runs vs not is defined in
+[decisions.md](decisions.md): default always-ceb; capability-driven
+branches port PHP's own server-signal decisions (notably
+`parsecommitmessage` `transactions` presence gates `revision.edit` vs
+legacy create); static keep-list for PHP bugs/fatals; no global compat
+flag (single pinned server, frozen PHP reference, test-matrix cost).
+
+Acceptance (Phase 1): each item's wire shape matches ceb PHP live on
+orsay (probed), `cargo test`/clippy/fmt green, no unlisted behavior
+changes; RB-D27 recorded clean with a locking regression test.
