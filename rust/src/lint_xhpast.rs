@@ -409,6 +409,11 @@ fn emit(path: &str, tree: &xhp_ast::Tree, finding: &xhp_ast::RawFinding) -> Lint
         description: finding.message.clone(),
         original: None,
         replacement: None,
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     }
 }
 
@@ -439,6 +444,11 @@ fn unable_to_parse(path: &str, exit_code: i32, stderr: &str) -> LintMessage {
         description,
         original: None,
         replacement: None,
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     }
 }
 
@@ -490,6 +500,11 @@ fn syntax_error(path: &str, stderr: &str, line: usize) -> LintMessage {
         description,
         original: None,
         replacement: None,
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     }
 }
 

@@ -230,6 +230,11 @@ pub fn parse_output(path: &str, _exit_code: i32, _stdout: &str, stderr: &str) ->
             description: message,
             original: None,
             replacement: None,
+            granularity: None,
+            locations: Vec::new(),
+            bypass_changed_line_filtering: None,
+            original_bytes: None,
+            replacement_bytes: None,
         });
     }
     out

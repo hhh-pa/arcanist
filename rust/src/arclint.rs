@@ -33,15 +33,15 @@
 //! - PHP `buildLinters()` emits linters in config order
 //!   (`ArcanistConfigurationDrivenLintEngine.php:51-136`);
 //!   [`retain_selected`] preserves the caller vector's order.
-//! - Linter sections and `severity.rules` entries iterate in sorted-key
-//!   order: the pinned serde_json map does not preserve document order,
-//!   while PHP iterates file order.
-//! - PHP lists available types in class-map order in the invalid-type error
-//!   (`ArcanistConfigurationDrivenLintEngine.php:55-61`); the list here is
-//!   sorted for determinism.
-//! - A `type` naming an exact display name (e.g. `"TXT"`) is accepted as an
-//!   alias; PHP accepts only configuration names
-//!   (`ArcanistConfigurationDrivenLintEngine.php:52-62,139-144`).
+//! - Linter sections and `severity.rules` entries iterate in file order
+//!   like PHP's `foreach` (the serde map preserves document order;
+//!   T1153 LINT-37).
+//! - The invalid-type error lists available types in PHP class-map order
+//!   (`ArcanistConfigurationDrivenLintEngine.php:55-61`; T1153 LINT-39).
+//! - A `type` naming a display name (e.g. `"TXT"`) is an invalid type;
+//!   PHP accepts only configuration names
+//!   (`ArcanistConfigurationDrivenLintEngine.php:52-62,139-144`;
+//!   T1153 LINT-38).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -61,42 +61,44 @@ pub fn is_valid_severity(severity: &str) -> bool {
 
 /// (configuration name, display name) pairs, verbatim from PHP
 /// `getLinterConfigurationName()` / `getLinterName()` in
-/// `src/lint/linter/Arcanist*.php`.
+/// `src/lint/linter/Arcanist*.php`, in class-map order (alphabetical
+/// by class name, abstract linters skipped) so the invalid-type error
+/// lists them like PHP (T1153 LINT-39).
 const LINTER_TYPES: &[(&str, &str)] = &[
-    ("text", "TXT"),
-    ("filename", "NAME"),
-    ("json", "JSON"),
-    ("jsonlint", "JSON"),
-    ("xml", "XML"),
-    ("merge-conflict", "MERGECONFLICT"),
-    ("generated", "GEN"),
-    ("nolint", "NOLINT"),
-    ("chmod", "CHMOD"),
-    ("spelling", "SPELL"),
-    ("script-and-regex", "S&RX"),
-    ("composer", "COMPOSER"),
-    ("phutil-library", "PHL"),
-    ("jshint", "JSHint"),
-    ("jscs", "JSCS"),
     ("csslint", "CSSLint"),
-    ("lessc", "LESSC"),
+    ("csharp", "C#"),
+    ("chmod", "CHMOD"),
     ("gjslint", "GJSLINT"),
     ("coffeelint", "COFFEE"),
-    ("flake8", "flake8"),
-    ("pyflakes", "PYFLAKES"),
-    ("pylint", "PyLint"),
-    ("pep8", "PEP8"),
-    ("rubocop", "RuboCop"),
-    ("ruby", "RUBY"),
+    ("composer", "COMPOSER"),
     ("cppcheck", "cppcheck"),
     ("cpplint", "C++ Google's Styleguide"),
+    ("filename", "NAME"),
+    ("flake8", "flake8"),
+    ("generated", "GEN"),
     ("golint", "GOLINT"),
     ("hlint", "HLINT"),
-    ("csharp", "C#"),
-    ("phpcs", "PHPCS"),
+    ("jshint", "JSHint"),
+    ("jsonlint", "JSON"),
+    ("json", "JSON"),
+    ("jscs", "JSCS"),
+    ("lessc", "LESSC"),
+    ("merge-conflict", "MERGECONFLICT"),
+    ("nolint", "NOLINT"),
+    ("pep8", "PEP8"),
     ("php", "PHP"),
+    ("phpcs", "PHPCS"),
+    ("phutil-library", "PHL"),
     ("puppet-lint", "PUPPETLINT"),
+    ("pyflakes", "PYFLAKES"),
+    ("pylint", "PyLint"),
+    ("rubocop", "RuboCop"),
+    ("ruby", "RUBY"),
+    ("script-and-regex", "S&RX"),
+    ("spelling", "SPELL"),
+    ("text", "TXT"),
     ("xhpast", "XHP"),
+    ("xml", "XML"),
 ];
 
 /// Map a configuration name (`.arclint` `type`) to its display name.
@@ -109,29 +111,21 @@ pub fn configuration_name_to_display(config_name: &str) -> Option<&'static str> 
 }
 
 /// Canonical configuration name for a `.arclint` `type`: exact
-/// configuration names map to themselves, display-name aliases map to
-/// the first configuration name with that display (so `"JSON"` means
-/// `"json"`, the first of the `json`/`jsonlint` pair).
+/// configuration names map to themselves (PHP accepts only
+/// configuration names, never display names, T1153 LINT-38).
 #[must_use]
 pub fn canonical_config_name(linter_type: &str) -> Option<&'static str> {
-    if configuration_name_to_display(linter_type).is_some() {
-        return LINTER_TYPES
-            .iter()
-            .find(|(name, _)| *name == linter_type)
-            .map(|(name, _)| *name);
-    }
     LINTER_TYPES
         .iter()
-        .find(|(_, display)| *display == linter_type)
+        .find(|(name, _)| *name == linter_type)
         .map(|(name, _)| *name)
 }
 
-/// Every selectable configuration name, sorted.
+/// Every selectable configuration name, in PHP class-map order
+/// (T1153 LINT-39).
 #[must_use]
 pub fn available_types() -> Vec<&'static str> {
-    let mut out: Vec<&'static str> = LINTER_TYPES.iter().map(|(name, _)| *name).collect();
-    out.sort_unstable();
-    out
+    LINTER_TYPES.iter().map(|(name, _)| *name).collect()
 }
 
 /// Every display name, deduplicated and sorted.
@@ -143,16 +137,11 @@ pub fn display_names() -> Vec<&'static str> {
     out
 }
 
-/// Resolve a `.arclint` `type` to its display name: exact configuration names
-/// first (the PHP behavior), then exact display names as an alias.
+/// Resolve a `.arclint` `type` to its display name: exact
+/// configuration names only, like PHP (a `type` naming a display name
+/// is an invalid type, T1153 LINT-38).
 fn resolve_type(linter_type: &str) -> Option<&'static str> {
-    if let Some(display) = configuration_name_to_display(linter_type) {
-        return Some(display);
-    }
-    LINTER_TYPES
-        .iter()
-        .find(|(_, display)| *display == linter_type)
-        .map(|(_, display)| *display)
+    configuration_name_to_display(linter_type)
 }
 
 /* -(  PCRE patterns  )-------------------------------------------------------- */
@@ -574,12 +563,17 @@ pub struct LinterSpec {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ArclintConfig {
     pub global_exclude: Vec<String>,
-    /// In sorted-key order (see the divergences note).
+    /// In file order, like PHP's `foreach` (T1153 LINT-37).
     pub linters: Vec<LinterSpec>,
 }
 
+/// A `PhutilProxyException` chain link (T1153 LINT-40): PHP renders
+/// each chain message on its own line (`scripts/arcanist.php:449-468`),
+/// so the wrapper ends with a period and the cause follows on the next
+/// line. (Inner `PhutilTypeSpec` wordings live in unpinned libphutil;
+/// only the wrapper shape and the in-tree texts are ported.)
 fn shape_error(context: &str, detail: &str) -> String {
-    format!("Error in parsing {context}: {detail}")
+    format!("Error in parsing {context}.\n{detail}")
 }
 
 fn unknown_severity_error(severity: &str) -> String {
@@ -610,26 +604,45 @@ fn parse_pattern_list(value: &serde_json::Value, what: &str) -> Result<Vec<Strin
 /// Parse a `severity` / `severity.rules` map, validating severity values.
 /// `severity.rules` patterns must also be valid PCRE
 /// (`ArcanistLinter.php:552-558`), checked before the severity like PHP.
+/// Shape failures report under the `for linter` context (`checkMap()`);
+/// value failures under the `in key` context
+/// (`setLinterConfigurationValue()`, T1153 LINT-40).
 fn parse_severity_map(
+    linter_name: &str,
+    key: &str,
     value: &serde_json::Value,
     into_map: &mut HashMap<String, String>,
     into_rules: &mut Vec<(String, String)>,
     is_rules: bool,
 ) -> Result<(), String> {
+    let shape_fail = |detail: String| {
+        shape_error(
+            &format!("'.arclint' file, for linter '{linter_name}'"),
+            &detail,
+        )
+    };
+    let key_fail = |detail: String| {
+        shape_error(
+            &format!("'.arclint' file, in key '{key}' for linter '{linter_name}'"),
+            &detail,
+        )
+    };
     let serde_json::Value::Object(entries) = value else {
-        return Err("severity maps must be objects".to_string());
+        return Err(shape_fail("severity maps must be objects".to_string()));
     };
     for (code, severity) in entries {
         if is_rules && compile_pcre(code).is_err() {
-            return Err(format!(
+            return Err(key_fail(format!(
                 "Severity rule \"{code}\" is not a valid regular expression."
-            ));
+            )));
         }
         let serde_json::Value::String(severity) = severity else {
-            return Err(format!("severity for code \"{code}\" must be a string"));
+            return Err(shape_fail(format!(
+                "severity for code \"{code}\" must be a string"
+            )));
         };
         if !is_valid_severity(severity) {
-            return Err(unknown_severity_error(severity));
+            return Err(key_fail(unknown_severity_error(severity)));
         }
         if is_rules {
             into_rules.push((code.clone(), severity.clone()));
@@ -670,12 +683,24 @@ fn parse_linter_spec(name: &str, value: &serde_json::Value) -> Result<LinterSpec
                 exclude = parse_pattern_list(val, "'exclude'").map_err(fail)?;
             }
             "severity" => {
-                parse_severity_map(val, &mut severity.map, &mut severity.rules, false)
-                    .map_err(fail)?;
+                parse_severity_map(
+                    name,
+                    "severity",
+                    val,
+                    &mut severity.map,
+                    &mut severity.rules,
+                    false,
+                )?;
             }
             "severity.rules" => {
-                parse_severity_map(val, &mut severity.map, &mut severity.rules, true)
-                    .map_err(fail)?;
+                parse_severity_map(
+                    name,
+                    "severity.rules",
+                    val,
+                    &mut severity.map,
+                    &mut severity.rules,
+                    true,
+                )?;
             }
             _ => {
                 extra.insert(key.clone(), val.clone());
@@ -703,6 +728,16 @@ pub fn parse_arclint(text: &str) -> Result<ArclintConfig, String> {
             "top level must be an object",
         ));
     };
+    // Unknown top-level keys error like PHP's `checkMap($config, ...)`
+    // (T1153 LINT-42).
+    for key in root.keys() {
+        if key != "exclude" && key != "linters" {
+            return Err(shape_error(
+                "'.arclint' file",
+                &format!("unknown option '{key}'."),
+            ));
+        }
+    }
     let mut global_exclude = Vec::new();
     if let Some(value) = root.get("exclude") {
         global_exclude = parse_pattern_list(value, "'exclude'")
@@ -843,7 +878,7 @@ pub struct LinterPlan {
     pub severity: SeverityOverrides,
 }
 
-/// Build per-linter path plans for `paths`, in sorted-key order.
+/// Build per-linter path plans for `paths`, in file order.
 pub fn plan_for_paths(config: &ArclintConfig, paths: &[String]) -> Vec<LinterPlan> {
     config
         .linters
@@ -857,7 +892,7 @@ pub fn plan_for_paths(config: &ArclintConfig, paths: &[String]) -> Vec<LinterPla
         .collect()
 }
 
-/// Display names selected by `config`, deduplicated, in sorted-key order.
+/// Display names selected by `config`, deduplicated, in file order.
 #[must_use]
 pub fn selected_display_names(config: &ArclintConfig) -> Vec<String> {
     let mut out = Vec::new();

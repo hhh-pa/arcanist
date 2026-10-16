@@ -268,6 +268,11 @@ fn parse_idea(path: &str, idea: &serde_json::Value) -> Option<LintMessage> {
             .get("to")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     })
 }
 

@@ -188,6 +188,11 @@ pub fn parse_lint_output(path: &str, stderr: &str) -> Vec<LintMessage> {
             description: ucfirst(&description),
             original: None,
             replacement: None,
+            granularity: None,
+            locations: Vec::new(),
+            bypass_changed_line_filtering: None,
+            original_bytes: None,
+            replacement_bytes: None,
         });
     }
     messages
@@ -355,6 +360,11 @@ fn failure_message(path: &str, description: &str, line: usize, col: usize) -> Li
         description: description.to_string(),
         original: None,
         replacement: None,
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     }
 }
 

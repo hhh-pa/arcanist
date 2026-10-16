@@ -225,6 +225,11 @@ pub fn parse_output(path: &str, exit_code: i32, stdout: &str, _stderr: &str) -> 
             description: ucfirst(message.trim()),
             original: None,
             replacement: None,
+            granularity: None,
+            locations: Vec::new(),
+            bypass_changed_line_filtering: None,
+            original_bytes: None,
+            replacement_bytes: None,
         });
     }
     out

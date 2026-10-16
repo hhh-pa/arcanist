@@ -185,13 +185,15 @@ fn version_gate_accepts_only_cslint_1() {
 #[test]
 fn stylecop_rules_may_not_be_disabled() {
     let linter = CsharpLinter::new();
+    // T1153 LINT-31: ceb wording (`Arcanist results`, `for Arcanist`).
     assert_eq!(
         linter.validate_severity_entry("SA1600", "disabled"),
         Err(
-            "In order to keep StyleCop integration with IDEs and other tools consistent with lint \
-             results, you aren't permitted to disable StyleCop rules within '.arclint'. Instead \
-             configure the severity using the StyleCop settings dialog (usually accessible from \
-             within your IDE). StyleCop settings for your project will be used when linting."
+            "In order to keep StyleCop integration with IDEs and other tools consistent with \
+             Arcanist results, you aren't permitted to disable StyleCop rules within '.arclint'. \
+             Instead configure the severity using the StyleCop settings dialog (usually accessible \
+             from within your IDE). StyleCop settings for your project will be used when linting \
+             for Arcanist."
                 .to_string()
         )
     );
@@ -314,4 +316,53 @@ fn unrenderable_formats_fall_back_to_the_raw_message() {
     let messages = parse_output("F.cs", 0, stdout, "");
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].description, "needs %s and %s");
+}
+
+// -( T1153 Wave 2: lint retrocompat )--------------------------------------
+
+#[test]
+fn lint32_missing_runtime_and_tool_report_php_texts() {
+    let linter = CsharpLinter::new();
+    let empty = std::ffi::OsStr::new("");
+    #[cfg(not(windows))]
+    assert_eq!(
+        linter.resolve_in(empty).unwrap_err(),
+        "Unable to find Mono and you are not on Windows!"
+    );
+    #[cfg(windows)]
+    assert_eq!(
+        linter.resolve_in(empty).unwrap_err(),
+        "Unable to locate cslint."
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn lint32_version_probe_reports_old_and_new_texts() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn script(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    let tmp = TempDir::new("lint32");
+    // A pass-through runtime plus a version-reporting tool.
+    script(tmp.path(), "mono", "#!/bin/sh\nexec \"$@\"\n");
+    script(tmp.path(), "cslint.exe", "#!/bin/sh\necho 2\n");
+    let linter = CsharpLinter::new();
+    assert_eq!(
+        linter.resolve_in(tmp.path().as_os_str()).unwrap_err(),
+        "Arcanist does not support this version of cslint (it is newer). \
+         You can try upgrading Arcanist with `arc upgrade`."
+    );
+    script(tmp.path(), "cslint.exe", "#!/bin/sh\nexit 1\n");
+    assert_eq!(
+        linter.resolve_in(tmp.path().as_os_str()).unwrap_err(),
+        "You are running an old version of cslint. Please upgrade to version 1."
+    );
+    script(tmp.path(), "cslint.exe", "#!/bin/sh\necho 1\n");
+    assert!(linter.resolve_in(tmp.path().as_os_str()).is_ok());
 }
