@@ -171,10 +171,9 @@ fn version_parsers_match_php_regexes() {
     assert_eq!(parse(ExactTriple, "1.9\n"), None);
     assert_eq!(parse(ExactTriple, "v1.9.1\n"), None);
     assert_eq!(parse(Cppcheck, "Cppcheck 2.10\n"), Some("2.10".to_string()));
-    assert_eq!(
-        parse(Cppcheck, "Cppcheck 2.10.3\n"),
-        Some("2.10.3".to_string())
-    );
+    // LINT-35: ceb `^\d+\.\d+$` rejects patch versions.
+    assert_eq!(parse(Cppcheck, "Cppcheck 2.10.3\n"), None);
+    assert_eq!(parse(Cppcheck, "Cppcheck 2.10rc1\n"), None);
     assert_eq!(parse(Cppcheck, "cppcheck 2.10\n"), None);
     assert_eq!(parse(CssV, "v2.2.4\n"), Some("2.2.4".to_string()));
     assert_eq!(parse(CssV, "2.2.4\n"), None);
@@ -199,10 +198,8 @@ fn version_parsers_match_php_regexes() {
         parse(PuppetLint, "puppet-lint 2.3.6\n"),
         Some("2.3.6".to_string())
     );
-    assert_eq!(
-        parse(Pyflakes, "2.1.1 Python 3.9.0 on linux\n"),
-        Some("2.1.1".to_string())
-    );
+    // LINT-34: ceb `^\d+\.\d+\.\d+$` rejects the ` Python…` suffix.
+    assert_eq!(parse(Pyflakes, "2.1.1 Python 3.9.0 on linux\n"), None);
     assert_eq!(parse(Pyflakes, "2.1.1\n"), Some("2.1.1".to_string()));
     assert_eq!(parse(Pyflakes, "2.1.1x\n"), None);
     assert_eq!(

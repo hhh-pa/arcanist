@@ -23,6 +23,10 @@
 //!   renderer. A non-numeric throw is unreachable in the Rust types.
 //! - `extraData` values are strings; PHP (`ArcanistUnitTestResult.php:114-121`)
 //!   allows wild values.
+//! - `extraData`/`coverage` keep insertion order end to end (UNIT-U20):
+//!   producers record pairs in document order and every renderer emits
+//!   them in that order, like PHP arrays. Maps set through the legacy
+//!   `HashMap` setters (whose order is already lost) still render sorted.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -70,6 +74,11 @@ pub struct UnitResult {
     user_data: Option<String>,
     extra_data: Option<HashMap<String, String>>,
     coverage: Option<HashMap<String, String>>,
+    // UNIT-U20: insertion order for the maps above, first-seen keys.
+    // Empty when set through the legacy `HashMap` setters (order
+    // already lost): readers fall back to sorted pairs then.
+    extra_order: Vec<String>,
+    coverage_order: Vec<String>,
 }
 
 impl UnitResult {
@@ -182,8 +191,11 @@ impl UnitResult {
     }
 
     /// `setExtraData` (`src/unit/ArcanistUnitTestResult.php:114-117`).
+    /// Legacy form: the map's order is already lost, so readers render
+    /// sorted pairs (see [`UnitResult::set_extra_data_ordered`]).
     pub fn set_extra_data(&mut self, extra_data: HashMap<String, String>) -> &mut Self {
         self.extra_data = Some(extra_data);
+        self.extra_order.clear();
         self
     }
 
@@ -193,9 +205,29 @@ impl UnitResult {
         self.extra_data.as_ref()
     }
 
+    /// `setExtraData` with insertion order (UNIT-U20): `pairs` in
+    /// document order, like a PHP array (repeats keep first position,
+    /// last value wins).
+    pub fn set_extra_data_ordered(&mut self, pairs: Vec<(String, String)>) -> &mut Self {
+        let (map, order) = order_pairs(pairs);
+        self.extra_data = Some(map);
+        self.extra_order = order;
+        self
+    }
+
+    /// `getExtraData` pairs in insertion order (UNIT-U20): recorded
+    /// order, else sorted (the legacy-setter fallback).
+    #[must_use]
+    pub fn extra_data_ordered(&self) -> Option<Vec<(String, String)>> {
+        ordered_pairs(self.extra_data.as_ref(), &self.extra_order)
+    }
+
     /// `setCoverage` (`src/unit/ArcanistUnitTestResult.php:123-126`).
+    /// Legacy form: the map's order is already lost, so readers render
+    /// sorted pairs (see [`UnitResult::set_coverage_ordered`]).
     pub fn set_coverage(&mut self, coverage: HashMap<String, String>) -> &mut Self {
         self.coverage = Some(coverage);
+        self.coverage_order.clear();
         self
     }
 
@@ -203,6 +235,23 @@ impl UnitResult {
     #[must_use]
     pub fn get_coverage(&self) -> Option<&HashMap<String, String>> {
         self.coverage.as_ref()
+    }
+
+    /// `setCoverage` with insertion order (UNIT-U20): `pairs` in
+    /// document order, like a PHP array (repeats keep first position,
+    /// last value wins).
+    pub fn set_coverage_ordered(&mut self, pairs: Vec<(String, String)>) -> &mut Self {
+        let (map, order) = order_pairs(pairs);
+        self.coverage = Some(map);
+        self.coverage_order = order;
+        self
+    }
+
+    /// `getCoverage` pairs in insertion order (UNIT-U20): recorded
+    /// order, else sorted (the legacy-setter fallback).
+    #[must_use]
+    pub fn coverage_ordered(&self) -> Option<Vec<(String, String)>> {
+        ordered_pairs(self.coverage.as_ref(), &self.coverage_order)
     }
 
     /// `mergeCoverage` (`src/unit/ArcanistUnitTestResult.php:138-162`): merge
@@ -231,7 +280,7 @@ impl UnitResult {
 
     /// `toDictionary` (`src/unit/ArcanistUnitTestResult.php:164-175`):
     /// unset scalars stay `None` (PHP null), including `name`/`result`
-    /// (UNIT-U19).
+    /// (UNIT-U19); nested maps keep insertion order (UNIT-U20).
     #[must_use]
     pub fn to_dictionary(&self) -> UnitDictionary {
         UnitDictionary {
@@ -241,9 +290,9 @@ impl UnitResult {
             result: self.result.clone(),
             duration: self.duration,
             duration_is_int: self.duration_is_int(),
-            extra: self.extra_data.as_ref().map(sorted_pairs),
+            extra: self.extra_data_ordered(),
             user_data: self.user_data.clone(),
-            coverage: self.coverage.as_ref().map(sorted_pairs),
+            coverage: self.coverage_ordered(),
         }
     }
 
@@ -297,6 +346,39 @@ fn sorted_pairs(map: &HashMap<String, String>) -> Vec<(String, String)> {
         map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     pairs.sort();
     pairs
+}
+
+/// Split `pairs` into a lookup map plus first-seen key order (UNIT-U20):
+/// repeats keep their first position while the last value wins, like
+/// PHP array assignment.
+fn order_pairs(pairs: Vec<(String, String)>) -> (HashMap<String, String>, Vec<String>) {
+    let mut map = HashMap::with_capacity(pairs.len());
+    let mut order = Vec::with_capacity(pairs.len());
+    for (key, value) in pairs {
+        if !map.contains_key(&key) {
+            order.push(key.clone());
+        }
+        map.insert(key, value);
+    }
+    (map, order)
+}
+
+/// Pairs for a stored map: recorded insertion order when present, else
+/// sorted (the legacy-`HashMap`-setter fallback, UNIT-U20).
+fn ordered_pairs(
+    map: Option<&HashMap<String, String>>,
+    order: &[String],
+) -> Option<Vec<(String, String)>> {
+    let map = map?;
+    if order.is_empty() {
+        return Some(sorted_pairs(map));
+    }
+    Some(
+        order
+            .iter()
+            .filter_map(|key| map.get(key).map(|value| (key.clone(), value.clone())))
+            .collect(),
+    )
 }
 
 /// Dictionary form of a result, mirroring `toDictionary` keys

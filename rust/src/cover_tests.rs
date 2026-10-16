@@ -84,6 +84,69 @@ fn commit_as(dir: &Path, name: &str, contents: &str, author: &str) {
     );
 }
 
+fn commit_msg(dir: &Path, name: &str, contents: &str, message: &str) {
+    std::fs::write(dir.join(name), contents).unwrap();
+    git(dir, &["add", name]);
+    git(dir, &["commit", "-m", message]);
+}
+
+/// Canonical cover call with empty stdin, non-TTY, and no user file
+/// (COVER-C1: config-isolated and prompt-free).
+fn cover_opts(dir: &Path, options: &Options, input: &str, tty: bool) -> Result<String, String> {
+    let mut cursor = std::io::Cursor::new(input.as_bytes().to_vec());
+    execute_cover_text_ansi_with_input_and_config(
+        dir,
+        options,
+        false,
+        &mut cursor,
+        tty,
+        None,
+        &arc_rs::get_config::LoadOptions::default(),
+    )
+}
+
+fn cover(dir: &Path, v: &[&str]) -> Result<String, String> {
+    cover_opts(dir, &options(v), "", false)
+}
+
+/// COVER-C1: pin the default base via the scratch file (prompt-free).
+fn write_scratch(dir: &Path, relative: &str) {
+    let git_dir = git(dir, &["rev-parse", "--git-dir"]);
+    let arc_dir = dir.join(git_dir).join("arc");
+    std::fs::create_dir_all(&arc_dir).unwrap();
+    std::fs::write(arc_dir.join("default-relative-commit"), relative).unwrap();
+}
+
+/// COVER-C1: point the current branch's upstream at `target`.
+fn set_upstream(dir: &Path, target: &str) {
+    let branch = git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    git(dir, &["update-ref", "refs/remotes/origin/master", target]);
+    git(
+        dir,
+        &["config", "remote.origin.url", "https://example.test/x.git"],
+    );
+    git(
+        dir,
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
+    git(
+        dir,
+        &["config", &format!("branch.{branch}.remote"), "origin"],
+    );
+    git(
+        dir,
+        &[
+            "config",
+            &format!("branch.{branch}.merge"),
+            "refs/heads/master",
+        ],
+    );
+}
+
 #[test]
 fn parses_rev_paths_and_help() {
     assert_eq!(
@@ -442,14 +505,17 @@ fn worktree_edits_attribute_base_authors() {
     commit_as(tmp.path(), "f.txt", "one\ntwo\nthree\nfour\n", "ann");
     commit_as(tmp.path(), "f.txt", "one\ntwo\nthree\nfour\nfive\n", "bob");
     std::fs::write(tmp.path().join("f.txt"), "one\ntwo\nthree\nFOUR\nfive\n").unwrap();
+    // COVER-C1: the default chain prompts without a configured base, so
+    // pin HEAD via the scratch file to keep the historical base.
+    write_scratch(tmp.path(), "HEAD");
     // `-` covers old 4 (ann); `+` covers old 4 and 5 (ann, bob).
     // COVER-C5: deduped, so each author owns one line (singular noun).
     assert_eq!(
-        execute_cover_text_ansi(tmp.path(), &options(&[]), false),
+        cover(tmp.path(), &[]),
         Ok("ann\n  f.txt: line 4\nbob\n  f.txt: line 5\n".to_string())
     );
     assert_eq!(
-        execute_cover_text_ansi(tmp.path(), &options(&["f.txt"]), false),
+        cover(tmp.path(), &["f.txt"]),
         Ok("ann\n  f.txt: line 4\nbob\n  f.txt: line 5\n".to_string())
     );
 }
@@ -771,9 +837,12 @@ fn cover_c11_absolute_paths_select_files() {
     commit_as(tmp.path(), "f.txt", "one\ntwo\nthree\n", "zelda");
     commit_as(tmp.path(), "f.txt", "one\ntwo\nthree\nfour\n", "ann");
     std::fs::write(tmp.path().join("f.txt"), "one\ntwo\nthree\nFOUR\n").unwrap();
+    // COVER-C1: pin HEAD via the scratch file so the default chain stays
+    // prompt-free on this two-commit repo.
+    write_scratch(tmp.path(), "HEAD");
     let absolute = tmp.path().join("f.txt").to_string_lossy().into_owned();
-    let by_relative = execute_cover_text_ansi(tmp.path(), &options(&["f.txt"]), false);
-    let by_absolute = execute_cover_text_ansi(tmp.path(), &options(&[&absolute]), false);
+    let by_relative = cover(tmp.path(), &["f.txt"]);
+    let by_absolute = cover(tmp.path(), &[&absolute]);
     assert_eq!(by_absolute, by_relative);
     assert!(by_absolute.unwrap().contains("ann"));
 }
@@ -827,5 +896,361 @@ fn cover_c16_merge_base_has_no_dashdash() {
     assert_eq!(
         execute_cover_text_ansi(tmp.path(), &options(&["--rev", "nope"]), false),
         Err("Unable to find any git commit named 'nope' in this repository.".to_string())
+    );
+}
+
+/// Three-commit repo for COVER-C1 base-selection tests: with the base at
+/// the middle commit, the worktree edit attributes line 2 to yara.
+fn c1_repo(tag: &str) -> TempDir {
+    let tmp = init_repo(tag);
+    commit_as(tmp.path(), "f.txt", "one\n", "zelda");
+    commit_as(tmp.path(), "f.txt", "one\ntwo\n", "yara");
+    commit_as(tmp.path(), "f.txt", "one\ntwo\nthree\n", "ann");
+    std::fs::write(tmp.path().join("f.txt"), "one\ntwo\nTHREE\n").unwrap();
+    tmp
+}
+
+#[test]
+fn cover_c1_upstream_selects_merge_base() {
+    let tmp = c1_repo("c1-up");
+    let middle = git(tmp.path(), &["rev-parse", "HEAD~1"]);
+    set_upstream(tmp.path(), &middle);
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+}
+
+#[test]
+fn cover_c1_scratch_file_selects_base() {
+    let tmp = c1_repo("c1-scratch");
+    write_scratch(tmp.path(), "HEAD~1");
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+}
+
+#[test]
+fn cover_c1_project_default_relative_wins() {
+    let tmp = c1_repo("c1-proj");
+    // The project setting beats upstream and scratch.
+    let head = git(tmp.path(), &["rev-parse", "HEAD"]);
+    set_upstream(tmp.path(), &head);
+    write_scratch(tmp.path(), "HEAD");
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"git.default-relative-commit": "HEAD~1"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+}
+
+#[test]
+fn cover_c1_prompt_answers_and_defaults() {
+    let tmp = c1_repo("c1-prompt");
+    // A typed answer resolves the base and persists the scratch file.
+    assert_eq!(
+        cover_opts(tmp.path(), &options(&[]), "HEAD~1\n", true),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+    let git_dir = git(tmp.path(), &["rev-parse", "--git-dir"]);
+    let scratch = tmp.path().join(git_dir).join("arc/default-relative-commit");
+    assert_eq!(std::fs::read_to_string(&scratch).unwrap(), "HEAD~1");
+    // Drop the scratch file so the next answers reach the prompt again.
+    std::fs::remove_file(&scratch).unwrap();
+    // An empty answer keeps origin/master, which does not exist here.
+    let err = cover_opts(tmp.path(), &options(&[]), "\n", true).unwrap_err();
+    assert!(err.starts_with("git cat-file failed: "), "{err}");
+    // A non-TTY stdin echoes the prompt once, then fails.
+    assert_eq!(
+        cover_opts(tmp.path(), &options(&[]), "", false).unwrap_err(),
+        arc_rs::prompt::NOT_INTERACTIVE.to_string()
+    );
+}
+
+#[test]
+fn cover_c1_prompt_banner_matches_php() {
+    let banner = super::default_range_banner(false);
+    assert!(banner.contains("Select a Default Commit Range"));
+    assert!(banner.contains("arc no longer assumes 'HEAD^'"));
+    assert!(!banner.contains("What default do you want"));
+    assert!(banner.contains("origin/master"));
+}
+
+#[test]
+fn cover_c1_zero_commit_repo_reports_no_changes() {
+    let tmp = init_repo("c1-zero");
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("You're covered, you didn't change anything.\n".to_string())
+    );
+}
+
+#[test]
+fn cover_c1_base_rules_resolve_and_fall_through() {
+    let tmp = c1_repo("c1-base");
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"base": "git:no-such-ref, literal:HEAD~1"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+    // `arc:this` is HEAD^; `git:` plain names verify with cat-file.
+    std::fs::write(tmp.path().join(".arcconfig"), r#"{"base": "arc:this"}"#).unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"base": "git:merge-base(HEAD~1)"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+}
+
+#[test]
+fn cover_c1_base_rule_errors_use_php_bytes() {
+    let tmp = c1_repo("c1-err");
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"base": "git:nope, git:also-nope"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Err(
+            "None of the rules in your 'base' configuration matched a valid commit. Adjust \
+             rules or specify which commit you want to use explicitly."
+                .to_string()
+        )
+    );
+    std::fs::write(tmp.path().join(".arcconfig"), r#"{"base": "bogus"}"#).unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Err(
+            "Rule 'bogus' is invalid, it must have a type and name like 'arc:upstream'."
+                .to_string()
+        )
+    );
+    std::fs::write(tmp.path().join(".arcconfig"), r#"{"base": "frobnicate:x"}"#).unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Err(
+            "Base commit rule 'frobnicate:x' (from source 'project') is not a recognized rule."
+                .to_string()
+        )
+    );
+    // A mistyped `base` errors like `willReadValue()`.
+    std::fs::write(tmp.path().join(".arcconfig"), r#"{"base": 42}"#).unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Err("Type of setting 'base' must be string.".to_string())
+    );
+}
+
+#[test]
+fn cover_c1_relative_commit_must_be_a_commit() {
+    let tmp = c1_repo("c1-cat");
+    // An annotated tag passes the scratch read but fails the commit check.
+    git(tmp.path(), &["tag", "-a", "-m", "v1", "v1", "HEAD~1"]);
+    write_scratch(tmp.path(), "v1");
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Err("Relative commit 'v1' is not the name of a commit!".to_string())
+    );
+    // An unknown name fails the git call itself, like PHP's throw.
+    write_scratch(tmp.path(), "no-such-ref");
+    let err = cover(tmp.path(), &[]).unwrap_err();
+    assert!(err.starts_with("git cat-file failed: "), "{err}");
+}
+
+#[test]
+fn cover_c1_amended_and_empty_and_exec_rules() {
+    let tmp = init_repo("c1-amend");
+    commit_as(tmp.path(), "f.txt", "one\n", "zelda");
+    commit_as(tmp.path(), "f.txt", "one\ntwo\n", "yara");
+    commit_msg(
+        tmp.path(),
+        "f.txt",
+        "one\ntwo\nthree\n",
+        "do the thing\n\nDifferential Revision: D123\n",
+    );
+    std::fs::write(tmp.path().join("f.txt"), "one\ntwo\nTHREE\n").unwrap();
+    // HEAD carries a revision ID, so `arc:amended` resolves HEAD^.
+    std::fs::write(tmp.path().join(".arcconfig"), r#"{"base": "arc:amended"}"#).unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+    // `arc:empty` blames nothing: no file exists at the empty tree.
+    std::fs::write(tmp.path().join(".arcconfig"), r#"{"base": "arc:empty"}"#).unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("You're covered, you didn't change anything.\n".to_string())
+    );
+    // `arc:exec` runs in the project root; success resolves stdout.
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"base": "arc:exec(git rev-parse HEAD~1)"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+}
+
+#[test]
+fn cover_c1_branch_unique_rule() {
+    let tmp = init_repo("c1-bu");
+    commit_as(tmp.path(), "f.txt", "zero\n", "zelda");
+    commit_as(tmp.path(), "f.txt", "zero\none\n", "ann");
+    git(tmp.path(), &["branch", "-m", "main"]);
+    git(tmp.path(), &["checkout", "-b", "feat"]);
+    commit_as(tmp.path(), "f.txt", "zero\none\ntwo\n", "bob");
+    std::fs::write(tmp.path().join("f.txt"), "zero\none\nTWO\n").unwrap();
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"base": "git:branch-unique(main)"}"#,
+    )
+    .unwrap();
+    // The merge-base sits on two branches while HEAD sits on one, so it wins.
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("ann\n  f.txt: line 2\n".to_string())
+    );
+}
+
+#[test]
+fn cover_c1_arc_prompt_skip_and_halt_rules() {
+    let tmp = c1_repo("c1-arc");
+    // `arc:prompt` answers resolve; empty answers fall to the next rule.
+    std::fs::write(tmp.path().join(".arcconfig"), r#"{"base": "arc:prompt"}"#).unwrap();
+    assert_eq!(
+        cover_opts(tmp.path(), &options(&[]), "HEAD~1\n", true),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"base": "arc:prompt, literal:HEAD~1"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cover_opts(tmp.path(), &options(&[]), "\n", true),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+    // `arc:skip` moves on; `arc:halt` stops everything.
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"base": "arc:skip, literal:HEAD~1"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"base": "arc:halt, literal:HEAD~1"}"#,
+    )
+    .unwrap();
+    assert!(
+        cover(tmp.path(), &[])
+            .unwrap_err()
+            .starts_with("None of the rules in your 'base' configuration")
+    );
+}
+
+#[test]
+fn cover_c1_runtime_source_switches_to_project() {
+    let tmp = c1_repo("c1-switch");
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"base": "literal:HEAD~1"}"#,
+    )
+    .unwrap();
+    // The runtime rule jumps to the project source, which resolves.
+    let mut runtime = serde_json::Map::new();
+    runtime.insert(
+        "base".to_string(),
+        serde_json::Value::String("arc:project".to_string()),
+    );
+    let opts = arc_rs::get_config::LoadOptions {
+        runtime,
+        ..arc_rs::get_config::LoadOptions::default()
+    };
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    assert_eq!(
+        execute_cover_text_ansi_with_input_and_config(
+            tmp.path(),
+            &options(&[]),
+            false,
+            &mut cursor,
+            false,
+            None,
+            &opts,
+        ),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+}
+
+#[test]
+fn cover_c1_tokenizer_drops_falsy_rules() {
+    assert_eq!(super::tokenize_base_spec("").unwrap(), Vec::<String>::new());
+    assert_eq!(
+        super::tokenize_base_spec("0").unwrap(),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        super::tokenize_base_spec("arc:skip,, 0 , literal:x").unwrap(),
+        vec!["arc:skip".to_string(), "literal:x".to_string()]
+    );
+    assert!(
+        super::tokenize_base_spec("bogus")
+            .unwrap_err()
+            .contains("Rule 'bogus' is invalid")
+    );
+}
+
+#[test]
+fn cover_c11_outside_paths_contribute_nothing() {
+    // Paths outside the repo can never match diff output: like PHP's
+    // hunk-map miss they stay unattributed, never a git failure.
+    let tmp = init_repo("c11-out");
+    commit_file(tmp.path(), "f.txt", "one\n");
+    let outside = TempDir::new("c11-elsewhere");
+    std::fs::write(outside.path().join("o.txt"), "x\n").unwrap();
+    let absolute = outside.path().join("o.txt").to_string_lossy().into_owned();
+    assert_eq!(
+        execute_cover_text_ansi(tmp.path(), &options(&[&absolute]), false),
+        Ok("You're covered, your changes didn't touch anyone else's code.\n".to_string())
+    );
+}
+
+#[test]
+fn cover_c13_svn_and_hg_stay_unported() {
+    // Rule 3 (T1128): svn/hg cover is unported; the refusals stay put.
+    let hg = TempDir::new("c13-hg");
+    std::fs::create_dir(hg.path().join(".hg")).unwrap();
+    assert_eq!(
+        execute_cover_text_ansi(hg.path(), &options(&[]), false),
+        Err("Mercurial working copies are not yet ported (see T1128)".to_string())
+    );
+    let svn = TempDir::new("c13-svn");
+    std::fs::create_dir(svn.path().join(".svn")).unwrap();
+    assert_eq!(
+        execute_cover_text_ansi(svn.path(), &options(&[]), false),
+        Err("Subversion working copies are not yet ported (see T1128)".to_string())
     );
 }

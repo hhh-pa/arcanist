@@ -28,7 +28,7 @@ extern crate self as arc_rs;
 
 use arc_rs::unit_engine::{
     CommandRunner, EngineContext, EngineError, RESULT_FAIL, RESULT_PASS, RESULT_SKIP,
-    RESULT_UNSOUND, UnitResult, find_elements, text_content,
+    RESULT_UNSOUND, UnitResult, XmlElement, find_elements, text_content,
 };
 use std::collections::HashMap;
 
@@ -493,48 +493,91 @@ pub fn parse_coverage_result() -> Option<HashMap<String, String>> {
 /// 424); details come from the first `<reason>` or `<failure>` child's
 /// `<message>` plus `<stack-trace>` (lines 437-449); coverage attaches only
 /// when present (lines 456-458).
+/// Legacy unordered coverage; ordered callers use
+/// [`parse_assembly_results_ordered`].
 pub fn parse_assembly_results(
     xunit_xml: &str,
     coverage: Option<&HashMap<String, String>>,
 ) -> Result<Vec<UnitResult>, String> {
-    let mut results = Vec::new();
-    for test in find_elements(xunit_xml, "test") {
-        let name = test.attr("name").unwrap_or("");
-        let time = test.attr("time").unwrap_or("");
-        let status = match test.attr("result") {
-            Some("Pass") => RESULT_PASS,
-            Some("Fail") => RESULT_FAIL,
-            Some("Skip") => RESULT_SKIP,
-            _ => RESULT_UNSOUND,
-        };
-        let mut userdata = String::new();
-        let reasons = find_elements(&test.inner, "reason");
-        let failures = find_elements(&test.inner, "failure");
-        let node = if !reasons.is_empty() {
-            reasons.first()
-        } else {
-            failures.first()
-        };
-        if let Some(node) = node {
-            if let Some(message) = find_elements(&node.inner, "message").first() {
-                userdata.push_str(&text_content(&message.inner));
-            }
-            if let Some(trace) = find_elements(&node.inner, "stack-trace").first() {
-                userdata.push('\n');
-                userdata.push_str(&text_content(&trace.inner));
-            }
+    let ordered = coverage.map(|map| {
+        let mut pairs: Vec<(String, String)> = map
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        pairs.sort();
+        pairs
+    });
+    let mut results = parse_assembly_results_ordered(xunit_xml, ordered.as_deref())?;
+    // The legacy map's order is already lost, so results keep the
+    // sorted fallback (not recorded document order).
+    if coverage.is_some() {
+        for result in &mut results {
+            let map = result.get_coverage().cloned().unwrap_or_default();
+            result.set_coverage(map);
         }
-        let mut result = UnitResult::new();
-        result.set_name(name)?;
-        result.set_result(status);
-        result.set_duration(time.parse::<f64>().unwrap_or(0.0));
-        result.set_user_data(&userdata);
-        if let Some(coverage) = coverage {
-            result.set_coverage(coverage.clone());
-        }
-        results.push(result);
     }
     Ok(results)
+}
+
+/// [`parse_assembly_results`] with coverage pairs in document order
+/// (UNIT-U20).
+pub fn parse_assembly_results_ordered(
+    xunit_xml: &str,
+    coverage: Option<&[(String, String)]>,
+) -> Result<Vec<UnitResult>, String> {
+    let mut results = Vec::new();
+    for test in find_elements(xunit_xml, "test") {
+        results.push(assembly_test_result(&test, coverage)?);
+    }
+    Ok(results)
+}
+
+/// One `<test>` entry: status mapping plus the first `<reason>` or
+/// `<failure>` child's message and stack trace as user data.
+fn assembly_test_result(
+    test: &XmlElement,
+    coverage: Option<&[(String, String)]>,
+) -> Result<UnitResult, String> {
+    let name = test.attr("name").unwrap_or("");
+    let time = test.attr("time").unwrap_or("");
+    let status = match test.attr("result") {
+        Some("Pass") => RESULT_PASS,
+        Some("Fail") => RESULT_FAIL,
+        Some("Skip") => RESULT_SKIP,
+        _ => RESULT_UNSOUND,
+    };
+    let mut result = UnitResult::new();
+    result.set_name(name)?;
+    result.set_result(status);
+    result.set_duration(time.parse::<f64>().unwrap_or(0.0));
+    result.set_user_data(&assembly_test_detail(test));
+    if let Some(coverage) = coverage {
+        result.set_coverage_ordered(coverage.to_vec());
+    }
+    Ok(result)
+}
+
+/// User data for one `<test>` entry: the first `<reason>` or `<failure>`
+/// child's `<message>` plus `<stack-trace>`.
+fn assembly_test_detail(test: &XmlElement) -> String {
+    let reasons = find_elements(&test.inner, "reason");
+    let failures = find_elements(&test.inner, "failure");
+    let node = if !reasons.is_empty() {
+        reasons.first()
+    } else {
+        failures.first()
+    };
+    let mut userdata = String::new();
+    if let Some(node) = node {
+        if let Some(message) = find_elements(&node.inner, "message").first() {
+            userdata.push_str(&text_content(&message.inner));
+        }
+        if let Some(trace) = find_elements(&node.inner, "stack-trace").first() {
+            userdata.push('\n');
+            userdata.push_str(&text_content(&trace.inner));
+        }
+    }
+    userdata
 }
 
 /// `run` path selection (lines 106-110): run-all lists every file under the

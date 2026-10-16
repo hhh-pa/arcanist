@@ -1013,10 +1013,10 @@ fn parse_exact_triple_version(stdout: &str) -> Option<String> {
     take_full_triple(stdout.trim())
 }
 
-/// `^Cppcheck \d+\.\d+(\.\d+)?$` on stdout.
+/// `^Cppcheck \d+\.\d+$` on stdout (LINT-35: ceb rejects patch versions).
 fn parse_cppcheck_version(stdout: &str) -> Option<String> {
     let text = stdout.trim().strip_prefix("Cppcheck ")?;
-    let (version, rest) = take_triple(text)?;
+    let (version, rest) = take_minor(text)?;
     if !rest.is_empty() {
         return None;
     }
@@ -1063,18 +1063,9 @@ fn parse_puppet_lint_version(stdout: &str) -> Option<String> {
     take_full_triple(text)
 }
 
-/// `^(\d+\.\d+\.\d+)( Python.*)?$` on stdout.
+/// `^\d+\.\d+\.\d+$` on stdout (LINT-34: ceb rejects the ` Python…` suffix).
 fn parse_pyflakes_version(stdout: &str) -> Option<String> {
-    let text = stdout.trim();
-    let (version, rest) = take_triple(text)?;
-    if version.bytes().filter(|b| *b == b'.').count() != 2 {
-        return None;
-    }
-    if rest.is_empty() || rest.starts_with(" Python") {
-        Some(version)
-    } else {
-        None
-    }
+    take_full_triple(stdout.trim())
 }
 
 /// `^pylint \d+\.\d+\.\d+` prefix on stdout.

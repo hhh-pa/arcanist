@@ -11,12 +11,13 @@
 //! lines at the base commit and group them by author. Files added since
 //! the base and untracked files are omitted (they carry
 //! `FLAG_ADDED`/`FLAG_UNTRACKED`, which cover's omit mask drops); without
-//! `--rev` the base is `HEAD`.
+//! `--rev` the base follows PHP's default chain (`base` rules, project
+//! default, upstream, scratch file, prompt).
 //!
 //! Divergences from PHP, all deliberate:
 //!
-//! - No interactive default-commit-range selection: without `--rev` the
-//!   base is always `HEAD`, matching historic arc behavior.
+//! - Zero/one-commit repos keep `HEAD` (or nothing) instead of PHP's
+//!   empty-tree base, which PHP then fatals on (COVER-C10 keep).
 //! - Blame failures are skipped silently (unattributed) instead of fatal:
 //!   PHP crashes on explicitly passed added files because they cannot be
 //!   blamed at the base commit.
@@ -24,6 +25,10 @@
 //!   the 1-based line up in a 0-indexed blame list, so it attributes the
 //!   next line's author; that off-by-one is not reproduced.
 //! - Subversion and Mercurial working copies are not yet ported (T1128).
+//! - `CommandException` bytes (failed `cat-file`/`merge-base`/`log` calls
+//!   on the base chain) render as plain `git <verb> failed:` messages.
+//! - Multi-merge-base output resolves to the first base (PHP feeds the
+//!   whole blob to later commands, which always fails).
 //!
 //! Console output goes through the shared [`arc_rs::terminal`] API:
 //! `phutil_console_format()` sites (interpret pattern, substitute raw)
@@ -31,6 +36,8 @@
 //! sites use `pht` (including the real `en_US` plural table), and
 //! markup-free `sprintf` sites use plain `format!`.
 
+use std::collections::VecDeque;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -39,7 +46,7 @@ use std::process::ExitCode;
 extern crate self as arc_rs;
 
 use arc_rs::terminal::{PhtArg, TVal};
-use arc_rs::{git, terminal};
+use arc_rs::{config, diff_local, get_config, git, prompt, terminal};
 
 /// Subcommand name, matching `arc cover`.
 pub const NAME: &str = "cover";
@@ -680,13 +687,692 @@ pub fn render_covers_ansi(covers: &Covers, ansi: bool) -> String {
     out
 }
 
-fn resolve_cover_base(dir: &Path, rev: Option<&str>) -> Result<Option<String>, String> {
+fn resolve_cover_base(
+    dir: &Path,
+    top: &Path,
+    rev: Option<&str>,
+    input: &mut dyn BufRead,
+    stdin_tty: bool,
+    user_file: Option<&Path>,
+    opts: &get_config::LoadOptions,
+) -> Result<Option<String>, String> {
     match rev {
         // An empty `--rev=` is falsy in PHP, so it falls back to the
         // default base like no `--rev` at all.
         Some(rev) if !rev.is_empty() => resolve_rev_base(dir, rev).map(Some),
-        _ => Ok(resolve_commit(dir, "HEAD")),
+        _ => default_base_commit(dir, top, input, stdin_tty, user_file, opts),
     }
+}
+
+/// Default base without `--rev` (`buildBaseCommit(null)`, COVER-C1):
+/// `base` rules, then the merge-base of the default relative commit
+/// (project setting, upstream, scratch file, prompt) and HEAD.
+/// Zero/one-commit repos keep HEAD (COVER-C10), never the empty tree.
+fn default_base_commit(
+    dir: &Path,
+    top: &Path,
+    input: &mut dyn BufRead,
+    stdin_tty: bool,
+    user_file: Option<&Path>,
+    opts: &get_config::LoadOptions,
+) -> Result<Option<String>, String> {
+    if !git::ok(dir, &["rev-parse", "--verify", "HEAD^"]) {
+        return Ok(resolve_commit(dir, "HEAD"));
+    }
+    let merged = get_config::load_merged(dir, user_file, opts)?;
+    if let Some(base) = base_config_commit(dir, top, &merged, input, stdin_tty)? {
+        return Ok(Some(base));
+    }
+    let (relative, from_prompt) = default_relative_commit(dir, &merged, input, stdin_tty)?;
+    verify_relative_commit(dir, &relative)?;
+    if from_prompt {
+        write_scratch_default(dir, &relative);
+    }
+    merge_base_head(dir, &relative)
+}
+
+/// `base` configuration rules (`buildBaseCommit` + `resolveBaseCommit`,
+/// COVER-C1): when the winning `base` value is set, the rule engine
+/// resolves it; no match is a usage error. `None` continues the chain.
+fn base_config_commit(
+    dir: &Path,
+    top: &Path,
+    merged: &get_config::MergedConfig,
+    input: &mut dyn BufRead,
+    stdin_tty: bool,
+) -> Result<Option<String>, String> {
+    let specs = base_rule_specs(merged)?;
+    let winner = specs.iter().find_map(|(_, spec)| spec.as_deref());
+    if winner.is_none_or(str::is_empty) {
+        return Ok(None);
+    }
+    let have: Vec<(&str, &str)> = specs
+        .iter()
+        .map(|(source, spec)| (*source, spec.as_deref().unwrap_or("")))
+        .collect();
+    match resolve_base_rules(dir, top, &have, input, stdin_tty)? {
+        Some(commit) => Ok(Some(commit)),
+        None => Err(terminal::pht(
+            "None of the rules in your 'base' configuration matched a valid commit. Adjust \
+             rules or specify which commit you want to use explicitly.",
+            &[],
+        )),
+    }
+}
+
+/// Per-source `base` specs in precedence order (COVER-C1): every present
+/// value is type-checked like `getConfigFromAllSources()`, and explicit
+/// nulls read unset like PHP `idx()`.
+fn base_rule_specs(
+    merged: &get_config::MergedConfig,
+) -> Result<Vec<(&'static str, Option<String>)>, String> {
+    let mut specs = Vec::new();
+    let runtime = merged.runtime.get("base").filter(|v| !v.is_null());
+    specs.push((get_config::SOURCE_RUNTIME, base_spec_value(runtime)?));
+    for source in [
+        get_config::SOURCE_LOCAL,
+        get_config::SOURCE_PROJECT,
+        get_config::SOURCE_USER,
+        get_config::SOURCE_SYSTEM,
+    ] {
+        let value = get_config::value_at("base", source, &merged.sources).filter(|v| !v.is_null());
+        specs.push((source, base_spec_value(value.as_ref())?));
+    }
+    Ok(specs)
+}
+
+/// One validated `base` source value: `None` when unset, else the string
+/// (mistyped values error like `willReadValue()`).
+fn base_spec_value(value: Option<&serde_json::Value>) -> Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let checked = get_config::check_value("base", value)?;
+    Ok(checked.as_str().map(str::to_string))
+}
+
+/// First default relative commit: project `git.default-relative-commit`,
+/// `@{upstream}`, the scratch file, else the interactive prompt (COVER-C1).
+/// The flag reports prompt answers (which persist the scratch file).
+fn default_relative_commit(
+    dir: &Path,
+    merged: &get_config::MergedConfig,
+    input: &mut dyn BufRead,
+    stdin_tty: bool,
+) -> Result<(String, bool), String> {
+    if let Some(name) = project_default_relative(merged) {
+        return Ok((name, false));
+    }
+    if let Some(name) = git_upstream(dir) {
+        return Ok((name, false));
+    }
+    if let Some(name) = read_scratch_default(dir) {
+        return Ok((name, false));
+    }
+    prompt_default_relative(input, stdin_tty).map(|name| (name, true))
+}
+
+/// Project `.arcconfig` `git.default-relative-commit` (COVER-C1): raw
+/// project source only (unvalidated scalars render like PHP string use).
+fn project_default_relative(merged: &get_config::MergedConfig) -> Option<String> {
+    let value = get_config::value_at(
+        "git.default-relative-commit",
+        get_config::SOURCE_PROJECT,
+        &merged.sources,
+    )?;
+    let name = match &value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::Bool(true) => "1".to_string(),
+        _ => return None,
+    };
+    if name.is_empty() { None } else { Some(name) }
+}
+
+/// Current branch's upstream short name, if one is configured (COVER-C1).
+fn git_upstream(dir: &Path) -> Option<String> {
+    let upstream = git::stdout_text(
+        dir,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    )
+    .ok()?;
+    let name = upstream.trim().to_string();
+    if name.is_empty() { None } else { Some(name) }
+}
+
+/// Git metadata directory for scratch files (`rev-parse --git-dir`,
+/// resolved against `dir` since git may print it relative).
+fn git_metadata_dir(dir: &Path) -> Option<PathBuf> {
+    let git_dir = git::stdout_text(dir, &["rev-parse", "--git-dir"]).ok()?;
+    Some(dir.join(git_dir.trim()))
+}
+
+/// Read the `default-relative-commit` scratch file (COVER-C1): missing or
+/// unreadable files read empty like `readScratchFile()`.
+fn read_scratch_default(dir: &Path) -> Option<String> {
+    let path = git_metadata_dir(dir)?.join("arc/default-relative-commit");
+    let name = std::fs::read_to_string(path).ok()?;
+    let name = name.trim().to_string();
+    if name.is_empty() { None } else { Some(name) }
+}
+
+/// Best-effort scratch write (COVER-C1): PHP ignores
+/// `writeScratchFile` failures, and the legacy `.arc` migration is not
+/// reproduced.
+fn write_scratch_default(dir: &Path, relative: &str) {
+    let Some(arc_dir) = git_metadata_dir(dir).map(|meta| meta.join("arc")) else {
+        return;
+    };
+    if std::fs::create_dir_all(&arc_dir).is_err() {
+        return;
+    }
+    std::fs::write(arc_dir.join("default-relative-commit"), relative).ok();
+}
+
+/// The default range essay, with PHP's substitutions applied.
+const DEFAULT_RANGE_ESSAY: &str = "You're running a command which operates on a range of \
+     revisions (usually, from some revision to HEAD) but have not specified the revision that \
+     should determine the start of the range.\n\nPreviously, arc assumed you meant 'HEAD^' \
+     when you did not specify a start revision, but this behavior does not make much sense in \
+     most workflows outside of Facebook's historic git-svn workflow.\n\narc no longer assumes \
+     'HEAD^'. You must specify a relative commit explicitly when you invoke a command (e.g., \
+     `arc diff HEAD^`, not just `arc diff`) or select a default for this working copy.\n\nIn \
+     most cases, the best default is 'origin/master'. You can also select 'HEAD^' to preserve \
+     the old behavior, or some other remote or branch. But you almost certainly want to select \
+     'origin/master'.\n\n(Technically: the merge-base of the selected revision and HEAD is \
+     used to determine the start of the commit range.)";
+
+/// Banner plus wrapped essay printed before the default-commit prompt
+/// (COVER-C1; pure form for tests).
+fn default_range_banner(ansi: bool) -> String {
+    let mut out = terminal::console_format(
+        "<bg:green>** %s **</bg>\n\n",
+        &["Select a Default Commit Range"],
+        ansi,
+    );
+    out.push_str(&terminal::console_wrap(DEFAULT_RANGE_ESSAY, 0, true));
+    out
+}
+
+/// PHP `trim()` charlist (`" \t\n\r\0\x0B"`, no form feed).
+fn trim_answer(text: &str) -> &str {
+    text.trim_matches([' ', '\t', '\n', '\r', '\0', '\u{b}'])
+}
+
+/// The interactive default-commit prompt (COVER-C1): an empty answer
+/// keeps `origin/master`.
+fn prompt_default_relative(input: &mut dyn BufRead, stdin_tty: bool) -> Result<String, String> {
+    print!("{}", default_range_banner(terminal::ansi_enabled()));
+    let answer = prompt::console_prompt_with_tty(
+        input,
+        "What default do you want to use? [origin/master]",
+        stdin_tty,
+    )?;
+    if trim_answer(&answer).is_empty() {
+        return Ok("origin/master".to_string());
+    }
+    Ok(trim_answer(&answer).to_string())
+}
+
+/// `cat-file -t` must report `commit` (COVER-C1): unknown names fail the
+/// git call itself (plain message; `CommandException` bytes are
+/// unportable), while non-commits get the PHP text.
+fn verify_relative_commit(dir: &Path, relative: &str) -> Result<(), String> {
+    match git::stdout_text(dir, &["cat-file", "-t", relative]) {
+        Ok(kind) if kind.trim() == "commit" => Ok(()),
+        Ok(_) => Err(terminal::pht(
+            "Relative commit '%s' is not the name of a commit!",
+            &[PhtArg::Text(relative)],
+        )),
+        Err(detail) => Err(format!("git cat-file failed: {detail}")),
+    }
+}
+
+/// Merge-base of a relative commit and HEAD, first base wins (COVER-C1).
+fn merge_base_head(dir: &Path, relative: &str) -> Result<Option<String>, String> {
+    let out = git::stdout_text(dir, &["merge-base", relative, "HEAD"])
+        .map_err(|detail| format!("git merge-base failed: {detail}"))?;
+    Ok(first_output_line(&out))
+}
+
+/// First non-empty output line, if any.
+fn first_output_line(out: &str) -> Option<String> {
+    out.lines()
+        .next()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
+/// Outcome of one base-commit rule (COVER-C1): a resolved commit, no
+/// match (try the next rule), or a ruleset stop (try the next source).
+enum RuleOutcome {
+    Matched(String),
+    NoMatch,
+    StopRuleset,
+}
+
+/// `base` rule engine state (`ArcanistBaseCommitParser`, COVER-C1).
+struct BaseRuleEngine<'a> {
+    dir: &'a Path,
+    top: &'a Path,
+    input: &'a mut dyn BufRead,
+    stdin_tty: bool,
+    verbose: bool,
+}
+
+impl BaseRuleEngine<'_> {
+    /// Verbose log line on stderr, like `ArcanistBaseCommitParser::log()`.
+    fn log(&self, message: &str) {
+        if self.verbose {
+            eprintln!("{message}");
+        }
+    }
+
+    /// Prompt for `arc:prompt`: an empty answer moves to the next rule.
+    /// (The base-commit explanation is skipped: cover never prints it.)
+    fn prompt_base_commit(&mut self) -> Result<Option<String>, String> {
+        let answer =
+            prompt::console_prompt_with_tty(self.input, "Against which commit?", self.stdin_tty)?;
+        if trim_answer(&answer).is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(answer))
+    }
+}
+
+/// Split one source's `base` spec on commas
+/// (`tokenizeBaseCommitSpecification`, COVER-C1): falsy rules (`""`,
+/// `"0"`) drop like PHP `array_filter`, colon-less rules error.
+fn tokenize_base_spec(spec: &str) -> Result<Vec<String>, String> {
+    if spec.is_empty() || spec == "0" {
+        return Ok(Vec::new());
+    }
+    let mut rules = Vec::new();
+    for part in spec.split(',') {
+        let rule = part.trim_matches([' ', '\t', '\n', '\x0B', '\x0C', '\r']);
+        if rule.is_empty() || rule == "0" {
+            continue;
+        }
+        if !rule.contains(':') {
+            return Err(terminal::pht(
+                "Rule '%s' is invalid, it must have a type and name like 'arc:upstream'.",
+                &[PhtArg::Text(rule)],
+            ));
+        }
+        rules.push(rule.to_string());
+    }
+    Ok(rules)
+}
+
+/// Resolve `base` rules from every source in precedence order
+/// (`ArcanistBaseCommitParser::resolveBaseCommit`, COVER-C1).
+fn resolve_base_rules(
+    dir: &Path,
+    top: &Path,
+    specs: &[(&str, &str)],
+    input: &mut dyn BufRead,
+    stdin_tty: bool,
+) -> Result<Option<String>, String> {
+    // PHP tokenizes every source upfront, so a malformed rule errors
+    // even below a resolving source.
+    let mut queues: Vec<(&str, VecDeque<String>)> = Vec::new();
+    for (source, spec) in specs {
+        queues.push((source, tokenize_base_spec(spec)?.into()));
+    }
+    let mut engine = BaseRuleEngine {
+        dir,
+        top,
+        input,
+        stdin_tty,
+        verbose: false,
+    };
+    let mut trying: VecDeque<&str> = queues.iter().map(|(source, _)| *source).collect();
+    while let Some(source) = trying.front().copied() {
+        if source_queue_empty(&queues, source) {
+            engine.log(&format!("No rules left from source '{source}'."));
+            trying.pop_front();
+            continue;
+        }
+        engine.log(&format!("Trying rules from source '{source}'."));
+        if let Some(commit) = drain_source_queue(&mut engine, &mut queues, source, &mut trying)? {
+            return Ok(Some(commit));
+        }
+    }
+    Ok(None)
+}
+
+/// True when `source` has no rules left to try.
+fn source_queue_empty(queues: &[(&str, VecDeque<String>)], source: &str) -> bool {
+    queues
+        .iter()
+        .find(|(name, _)| *name == source)
+        .is_none_or(|(_, queue)| queue.is_empty())
+}
+
+/// Try one source's rules in order: the first match resolves the base,
+/// a ruleset stop (or exhaustion) returns to the source loop.
+fn drain_source_queue(
+    engine: &mut BaseRuleEngine,
+    queues: &mut [(&str, VecDeque<String>)],
+    source: &str,
+    trying: &mut VecDeque<&str>,
+) -> Result<Option<String>, String> {
+    loop {
+        let rule = queues
+            .iter_mut()
+            .find(|(name, _)| *name == source)
+            .and_then(|(_, queue)| queue.pop_front());
+        let Some(rule) = rule else {
+            return Ok(None);
+        };
+        engine.log(&format!("Trying rule '{rule}'."));
+        match resolve_base_rule(engine, &rule, source, trying)? {
+            RuleOutcome::Matched(commit) => {
+                engine.log(&format!("Resolved commit '{commit}' from rule '{rule}'."));
+                return Ok(Some(commit));
+            }
+            RuleOutcome::NoMatch => {}
+            RuleOutcome::StopRuleset => return Ok(None),
+        }
+    }
+}
+
+/// Resolve one rule (`resolveRule`, COVER-C1): `literal:` answers
+/// verbatim, `git:` runs the git API, `hg:` never matches git, `arc:`
+/// runs the arc rules, anything else errors.
+fn resolve_base_rule(
+    engine: &mut BaseRuleEngine,
+    rule: &str,
+    source: &str,
+    trying: &mut VecDeque<&str>,
+) -> Result<RuleOutcome, String> {
+    let Some((kind, name)) = rule.split_once(':') else {
+        return Err(invalid_base_rule(rule));
+    };
+    match kind {
+        "literal" => Ok(RuleOutcome::Matched(name.to_string())),
+        "git" => {
+            Ok(git_api_rule(engine, "git", name)?
+                .map_or(RuleOutcome::NoMatch, RuleOutcome::Matched))
+        }
+        "hg" => Ok(RuleOutcome::NoMatch),
+        "arc" => arc_rule(engine, name, rule, source, trying),
+        _ => Err(unrecognized_base_rule(rule, source)),
+    }
+}
+
+/// `Rule '%s' is invalid` usage text (unreachable: the tokenizer rejects
+/// colon-less rules first).
+fn invalid_base_rule(rule: &str) -> String {
+    terminal::pht(
+        "Rule '%s' is invalid, it must have a type and name like 'arc:upstream'.",
+        &[PhtArg::Text(rule)],
+    )
+}
+
+/// `Base commit rule ... is not a recognized rule` usage text.
+fn unrecognized_base_rule(rule: &str, source: &str) -> String {
+    terminal::pht(
+        "Base commit rule '%s' (from source '%s') is not a recognized rule.",
+        &[PhtArg::Text(rule), PhtArg::Text(source)],
+    )
+}
+
+/// `arc:` rules (`resolveArcRule`, COVER-C1).
+fn arc_rule(
+    engine: &mut BaseRuleEngine,
+    name: &str,
+    rule: &str,
+    source: &str,
+    trying: &mut VecDeque<&str>,
+) -> Result<RuleOutcome, String> {
+    let name = update_legacy_rule_name(engine, name);
+    match name {
+        "verbose" => {
+            engine.verbose = true;
+            engine.log("Enabled verbose mode.");
+            Ok(RuleOutcome::NoMatch)
+        }
+        "prompt" => Ok(engine
+            .prompt_base_commit()?
+            .map_or(RuleOutcome::NoMatch, RuleOutcome::Matched)),
+        "local" | "user" | "project" | "runtime" | "system" => {
+            let target: &'static str = static_source_name(name).expect("matched source name");
+            trying.push_front(target);
+            engine.log(&format!("Switching to source '{target}'."));
+            Ok(RuleOutcome::StopRuleset)
+        }
+        "yield" => {
+            if let Some(head) = trying.pop_front() {
+                trying.push_back(head);
+            }
+            engine.log(&format!("Yielding processing of rules from '{source}'."));
+            Ok(RuleOutcome::StopRuleset)
+        }
+        "halt" => {
+            trying.clear();
+            engine.log("Halting all rule processing.");
+            Ok(RuleOutcome::StopRuleset)
+        }
+        "skip" => Ok(RuleOutcome::NoMatch),
+        "empty" | "upstream" | "outgoing" | "bookmark" | "amended" | "this" => {
+            Ok(git_api_rule(engine, "arc", name)?
+                .map_or(RuleOutcome::NoMatch, RuleOutcome::Matched))
+        }
+        _ => arc_call_rule(engine, name, rule, source),
+    }
+}
+
+/// Static source name for `arc:` source-switch rules.
+fn static_source_name(name: &str) -> Option<&'static str> {
+    match name {
+        "local" => Some("local"),
+        "user" => Some("user"),
+        "project" => Some("project"),
+        "runtime" => Some("runtime"),
+        "system" => Some("system"),
+        _ => None,
+    }
+}
+
+/// Translate legacy `arc:` source names (`updateLegacyRuleName`).
+fn update_legacy_rule_name<'a>(engine: &BaseRuleEngine, name: &'a str) -> &'a str {
+    let translated = match name {
+        "global" => Some("user"),
+        "args" => Some("runtime"),
+        _ => None,
+    };
+    if let Some(new) = translated {
+        engine.log(&format!("Translating legacy name '{name}' to '{new}'"));
+        new
+    } else {
+        name
+    }
+}
+
+/// `arc:exec(...)` / `arc:nodiff(...)` forms, else the unrecognized-rule
+/// error (COVER-C1): a failing command moves to the next rule.
+fn arc_call_rule(
+    engine: &BaseRuleEngine,
+    name: &str,
+    rule: &str,
+    source: &str,
+) -> Result<RuleOutcome, String> {
+    if let Some(command) = paren_form(name, "exec") {
+        return Ok(exec_rule_command(engine.top, command)
+            .map_or(RuleOutcome::NoMatch, RuleOutcome::Matched));
+    }
+    if paren_form(name, "nodiff").is_some() {
+        return Ok(RuleOutcome::NoMatch);
+    }
+    Err(unrecognized_base_rule(rule, source))
+}
+
+/// Inner text of a `func(...)` form, greedy like PHP `(.*)`.
+fn paren_form<'a>(name: &'a str, func: &str) -> Option<&'a str> {
+    let prefix = format!("{func}(");
+    name.strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_suffix(')'))
+}
+
+/// `func(...)` with a non-empty body (PHP `(.+)`).
+fn nonempty_paren_form<'a>(name: &'a str, func: &str) -> Option<&'a str> {
+    paren_form(name, func).filter(|inner| !inner.is_empty())
+}
+
+/// `arc:exec(command)` in the project root (COVER-C1).
+fn exec_rule_command(top: &Path, command: &str) -> Option<String> {
+    let output = shell_command(top, command).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Platform shell command with `top` as the working directory.
+fn shell_command(top: &Path, command: &str) -> std::process::Command {
+    #[cfg(windows)]
+    {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C"]);
+        <std::process::Command as std::os::windows::process::CommandExt>::raw_arg(
+            &mut cmd, command,
+        );
+        cmd.current_dir(top);
+        cmd
+    }
+    #[cfg(not(windows))]
+    {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", command]);
+        cmd.current_dir(top);
+        cmd
+    }
+}
+
+/// The git API's rules (`resolveBaseCommitRule`, COVER-C1): `git:`
+/// `merge-base()` / `branch-unique()` / plain names, and the `arc:` API
+/// names (`empty`, `amended`, `upstream`, `this`; the rest never match).
+fn git_api_rule(engine: &BaseRuleEngine, kind: &str, name: &str) -> Result<Option<String>, String> {
+    if kind == "git" {
+        return git_name_rule(engine, name);
+    }
+    match name {
+        "empty" => Ok(Some(GIT_MAGIC_ROOT_COMMIT.to_string())),
+        "amended" => head_amended(engine.dir),
+        "upstream" => upstream_rule_base(engine.dir),
+        "this" => Ok(Some("HEAD^".to_string())),
+        _ => Ok(None),
+    }
+}
+
+/// `git:` names: `merge-base()` / `branch-unique()` forms, else a plain
+/// name verified with `cat-file` (returned symbolically, like PHP).
+fn git_name_rule(engine: &BaseRuleEngine, name: &str) -> Result<Option<String>, String> {
+    if let Some(inner) = nonempty_paren_form(name, "merge-base") {
+        let out = git::stdout_text(engine.dir, &["merge-base", inner, "HEAD"]).ok();
+        return Ok(out.and_then(|text| first_output_line(&text)));
+    }
+    if let Some(inner) = nonempty_paren_form(name, "branch-unique") {
+        return branch_unique_base(engine.dir, inner);
+    }
+    if git::ok(engine.dir, &["cat-file", "-t", name]) {
+        return Ok(Some(name.to_string()));
+    }
+    Ok(None)
+}
+
+/// `arc:amended`: `HEAD^` when HEAD carries a revision ID, else no match
+/// (an invalid field errors like PHP's throw).
+fn head_amended(dir: &Path) -> Result<Option<String>, String> {
+    let message = git::stdout_text(dir, &["log", "-n1", "--format=%B", "HEAD"])
+        .map_err(|detail| format!("git log failed: {detail}"))?;
+    let revision = diff_local::parse_revision_id_from_raw_corpus(&message)?;
+    Ok(revision.map(|_| "HEAD^".to_string()))
+}
+
+/// `arc:upstream`: the merge-base of the branch upstream and HEAD, or no
+/// match without an upstream (a failing merge-base aborts like PHP's
+/// `execxLocal` throw).
+fn upstream_rule_base(dir: &Path) -> Result<Option<String>, String> {
+    let upstream = git::stdout_text(
+        dir,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    );
+    let Ok(upstream) = upstream else {
+        return Ok(None);
+    };
+    let upstream = upstream.trim().to_string();
+    let out = git::stdout_text(dir, &["merge-base", &upstream, "HEAD"])
+        .map_err(|detail| format!("git merge-base failed: {detail}"))?;
+    Ok(first_output_line(&out))
+}
+
+/// `git:branch-unique(ref)`: the first commit after the merge-base that
+/// sits on more branches than HEAD does (COVER-C1).
+fn branch_unique_base(dir: &Path, upstream_ref: &str) -> Result<Option<String>, String> {
+    let out = git::stdout_text(dir, &["merge-base", upstream_ref, "HEAD"]).ok();
+    let Some(merge_base) = out.and_then(|text| first_output_line(&text)) else {
+        return Ok(None);
+    };
+    let range = format!("{merge_base}..HEAD");
+    let log = git::stdout_text(dir, &["log", "--format=%H", &range, "--"])
+        .map_err(|detail| format!("git log failed: {detail}"))?;
+    let mut commits: Vec<String> = log.lines().map(str::to_string).collect();
+    if commits.is_empty() {
+        return Ok(None);
+    }
+    commits.push(merge_base);
+    let branches = local_branch_names(dir)?;
+    let mut head_count: Option<usize> = None;
+    for commit in commits {
+        let count = branches_containing(dir, &commit, &branches)?.len();
+        match head_count {
+            None => head_count = Some(count),
+            Some(first) if count > first => return Ok(Some(commit)),
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+/// Local branch short names (`getAllBranches()` names, COVER-C1).
+fn local_branch_names(dir: &Path) -> Result<Vec<String>, String> {
+    let out = git::stdout_text(
+        dir,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+    )
+    .map_err(|detail| format!("git for-each-ref failed: {detail}"))?;
+    Ok(out.lines().map(str::to_string).collect())
+}
+
+/// Branches containing `commit`, filtered to known branch names like PHP
+/// (`branch --contains`, trimmed of spaces and `*` markers).
+fn branches_containing(
+    dir: &Path,
+    commit: &str,
+    branches: &[String],
+) -> Result<Vec<String>, String> {
+    let out = git::stdout_text(
+        dir,
+        &["branch", "--no-color", "--no-column", "--contains", commit],
+    )
+    .map_err(|detail| format!("git branch failed: {detail}"))?;
+    Ok(out
+        .lines()
+        .map(|line| line.trim_matches([' ', '*']).to_string())
+        .filter(|name| branches.contains(name))
+        .collect())
 }
 
 /// Diff files minus the added-at-base set, i.e. the paths cover acts on
@@ -698,18 +1384,30 @@ fn prune_added(dir: &Path, base: &str, files: Vec<FileChanges>) -> Vec<FileChang
         .collect()
 }
 
-/// Explicit file pathspecs for the diff. Explicit directories are dropped:
-/// PHP's `is_dir` skip means they contribute nothing.
-fn explicit_file_spec(dir: &Path, paths: &[String]) -> Vec<String> {
+/// True when `path` (as given) resolves inside the repository: paths
+/// outside the root can never match diff output, so they contribute
+/// nothing like PHP's hunk-map lookup miss (COVER-C11).
+fn path_within_top(dir: &Path, top: &Path, path: &str) -> bool {
+    let (Ok(full), Ok(root)) = (dir.join(path).canonicalize(), top.canonicalize()) else {
+        return false;
+    };
+    full.starts_with(&root)
+}
+
+/// Explicit file pathspecs for the diff. Explicit directories are dropped
+/// (PHP's `is_dir` skip means they contribute nothing), as are paths
+/// outside the repository.
+fn explicit_file_spec(dir: &Path, top: &Path, paths: &[String]) -> Vec<String> {
     paths
         .iter()
-        .filter(|path| !dir.join(path).is_dir())
+        .filter(|path| !dir.join(path).is_dir() && path_within_top(dir, top, path))
         .cloned()
         .collect()
 }
 
 fn collect_cover_changes(
     dir: &Path,
+    top: &Path,
     base: Option<&str>,
     options: &Options,
 ) -> Result<Vec<FileChanges>, String> {
@@ -719,7 +1417,7 @@ fn collect_cover_changes(
     if !options.paths.is_empty() {
         // Explicit directories contribute nothing (PHP's `is_dir` skip):
         // when no file paths remain there is nothing to diff for.
-        let spec = explicit_file_spec(dir, &options.paths);
+        let spec = explicit_file_spec(dir, top, &options.paths);
         if spec.is_empty() {
             return Ok(Vec::new());
         }
@@ -742,18 +1440,69 @@ pub fn execute_cover_text_ansi(
     options: &Options,
     ansi: bool,
 ) -> Result<String, String> {
+    let user_file = config::arcrc_path();
+    execute_cover_text_ansi_with_input_and_config(
+        dir,
+        options,
+        ansi,
+        &mut std::io::stdin().lock(),
+        prompt::stdin_is_terminal(),
+        user_file.as_deref(),
+        &get_config::LoadOptions::default(),
+    )
+}
+
+/// [`execute_cover_text_ansi`] with injectable prompt input (COVER-C1).
+pub fn execute_cover_text_ansi_with_input(
+    dir: &Path,
+    options: &Options,
+    ansi: bool,
+    input: &mut dyn BufRead,
+    stdin_tty: bool,
+) -> Result<String, String> {
+    let user_file = config::arcrc_path();
+    execute_cover_text_ansi_with_input_and_config(
+        dir,
+        options,
+        ansi,
+        input,
+        stdin_tty,
+        user_file.as_deref(),
+        &get_config::LoadOptions::default(),
+    )
+}
+
+/// [`execute_cover_text_ansi`] with injectable prompt input and config
+/// sources (COVER-C1; tests pass `user_file: None` for isolation).
+pub fn execute_cover_text_ansi_with_input_and_config(
+    dir: &Path,
+    options: &Options,
+    ansi: bool,
+    input: &mut dyn BufRead,
+    stdin_tty: bool,
+    user_file: Option<&Path>,
+    opts: &get_config::LoadOptions,
+) -> Result<String, String> {
     check_working_copy(dir)?;
     // Explicit paths are validated before the revision resolves: PHP's
     // `parseBaseCommitArgument()` only stores the rev, while
     // `selectPathsForWorkflow()` throws the path error first.
     let paths = check_cover_paths(dir, &options.paths)?;
-    let base = resolve_cover_base(dir, options.rev.as_deref())?;
     let top = repo_top(dir);
+    let base = resolve_cover_base(
+        dir,
+        &top,
+        options.rev.as_deref(),
+        input,
+        stdin_tty,
+        user_file,
+        opts,
+    )?;
     let normalized = Options {
         rev: options.rev.clone(),
         paths,
     };
-    let files = collect_cover_changes(dir, base.as_deref(), &normalized)?;
+    let files = collect_cover_changes(dir, &top, base.as_deref(), &normalized)?;
     if options.paths.is_empty() && files.is_empty() {
         return Ok(no_changes_message());
     }
@@ -766,6 +1515,21 @@ pub fn execute_cover_text_ansi(
 
 /// Cover changed lines in `dir` per `argv`.
 pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
+    run_in_with_input_and_tty(
+        dir,
+        argv,
+        &mut std::io::stdin().lock(),
+        prompt::stdin_is_terminal(),
+    )
+}
+
+/// [`run_in`] with injectable prompt input (COVER-C1).
+pub fn run_in_with_input_and_tty(
+    dir: &Path,
+    argv: &[String],
+    input: &mut dyn BufRead,
+    stdin_tty: bool,
+) -> ExitCode {
     let options = match parse_args(argv) {
         ParseOutcome::Help => {
             print!("{}", usage());
@@ -777,7 +1541,13 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
         }
         ParseOutcome::Args(options) => options,
     };
-    match execute_cover_text(dir, &options) {
+    match execute_cover_text_ansi_with_input(
+        dir,
+        &options,
+        terminal::ansi_enabled(),
+        input,
+        stdin_tty,
+    ) {
         Ok(text) => {
             print!("{text}");
             ExitCode::SUCCESS

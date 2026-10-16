@@ -2438,9 +2438,10 @@ fn unit_u1_config_runs_echo_nothing_when_children_echo() {
 fn unit_u2_phutil_echoes_at_workflow_level() {
     // Workflow-level echo matches PHP: `shouldEchoTestResults` is true
     // for every ported engine including phutil, so single runs print
-    // per-result lines. (PHP's in-process during-run progress has no
-    // out-of-process equivalent; carried over — libphutil ships no
-    // source in scope to pin its bytes.)
+    // per-result lines. (Rule 3: PHP's in-process during-run progress
+    // is libphutil-runtime-bound and unverifiable — no libphutil source
+    // is in scope to pin its bytes — so the capturing runner plus the
+    // single workflow-level echo is the kept equivalent.)
     assert!(should_echo_test_results("PhutilUnitTestEngine"));
     assert!(should_echo_test_results("phutil"));
     let root = unique_dir("u2-echo");
@@ -2561,6 +2562,45 @@ fn unit_u12_coverage_ties_keep_insertion_order() {
     let (sorted, _) = merge_file_coverage_ordered(&["z.php".to_string()], &collected);
     let names: Vec<&str> = sorted.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(names, vec!["z.php", "b.php", "a.php"]);
+}
+
+#[test]
+fn unit_u20_collect_keeps_per_result_document_order() {
+    // Files from one result keep document order (not sorted, not hashed).
+    let mut one = engine_result("a", "pass");
+    one.set_coverage_ordered(vec![
+        ("z.php".to_string(), "CU".to_string()),
+        ("a.php".to_string(), "CU".to_string()),
+    ]);
+    let collected = collect_coverage_ordered(&[one]);
+    let names: Vec<&str> = collected.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, vec!["z.php", "a.php"]);
+}
+
+#[test]
+fn unit_u20_json_keeps_nested_document_order() {
+    let mut result = engine_result("a", "pass");
+    result.set_extra_data_ordered(vec![
+        ("zebra".to_string(), "1".to_string()),
+        ("apple".to_string(), "2".to_string()),
+    ]);
+    result.set_coverage_ordered(vec![
+        ("z.php".to_string(), "CU".to_string()),
+        ("a.php".to_string(), "CU".to_string()),
+    ]);
+    let ugly = results_to_json_text(std::slice::from_ref(&result), false);
+    assert!(
+        ugly.contains("\"extra\":{\"zebra\":\"1\",\"apple\":\"2\"}"),
+        "{ugly}"
+    );
+    assert!(
+        ugly.contains("\"coverage\":{\"z.php\":\"CU\",\"a.php\":\"CU\"}"),
+        "{ugly}"
+    );
+    let pretty = results_to_json_text(std::slice::from_ref(&result), true);
+    let zebra = pretty.find("\"zebra\"").unwrap();
+    let apple = pretty.find("\"apple\"").unwrap();
+    assert!(zebra < apple, "{pretty}");
 }
 
 #[test]

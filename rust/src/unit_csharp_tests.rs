@@ -158,3 +158,39 @@ fn assembly_results_mirror_parent_mapping() {
     assert_eq!(results[3].get_result(), RESULT_UNSOUND);
     assert!(results[0].get_coverage().is_some());
 }
+
+#[test]
+fn unit_u20_cscover_cache_and_parse_keep_file_order() {
+    let xml = r#"<coverage>
+      <instrumented file="/r/Z.cs" start="1" end="1"/>
+      <instrumented file="/r/A.cs" start="1" end="1"/>
+      <executed file="/r/Z.cs" start="1" end="1"/>
+    </coverage>"#;
+    let counts = |p: &str| {
+        if p == "/r/Z.cs" || p == "/r/A.cs" {
+            Some(1)
+        } else {
+            None
+        }
+    };
+    let reports = read_cscover_coverage_ordered(xml, "/r", &counts).unwrap();
+    let names: Vec<&str> = reports.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, vec!["Z.cs", "A.cs"]);
+    // Through the cache and the assembly parse into the dictionary.
+    let mut cache = CoverageCache::new();
+    let cached = cache
+        .read_cached_ordered("c.xml", xml, "/r", &counts)
+        .unwrap();
+    assert_eq!(cached, reports);
+    let assembly = r#"<assembly><test name="t" time="1" result="Pass"/></assembly>"#;
+    let results = parse_assembly_results_ordered(assembly, Some(&cached)).unwrap();
+    let dict = results[0].to_dictionary();
+    let names: Vec<&str> = dict
+        .coverage
+        .as_deref()
+        .unwrap()
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(names, vec!["Z.cs", "A.cs"]);
+}
