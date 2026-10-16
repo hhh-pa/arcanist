@@ -984,31 +984,55 @@ pub fn parse_update_revision_id(target: &str) -> Result<u64, String> {
 /// are not numeric under PHP 7; the caller trims padding first.
 #[must_use]
 pub fn is_php_numeric(text: &str) -> bool {
-    let body = text.strip_prefix(['+', '-']).unwrap_or(text);
-    let mantissa = match body.split_once(['e', 'E']) {
-        Some((mantissa, exponent)) => {
-            let exponent = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
-            if exponent.is_empty() || !exponent.bytes().all(|b| b.is_ascii_digit()) {
-                return false;
-            }
-            mantissa
-        }
-        None => body,
-    };
-    let (head, tail) = match mantissa.split_once('.') {
-        Some((head, tail)) => (head, Some(tail)),
-        None => (mantissa, None),
-    };
-    let head_ok = !head.is_empty() && head.bytes().all(|b| b.is_ascii_digit());
-    match tail {
-        None => head_ok,
-        Some(tail) => {
-            !tail.is_empty()
-                && tail.bytes().all(|b| b.is_ascii_digit())
-                && (head_ok || head.is_empty())
-                || head_ok && tail.is_empty()
-        }
+    let body = strip_php_numeric_sign(text);
+    match mantissa_with_valid_exponent(body) {
+        None => false,
+        Some(mantissa) => decimal_mantissa_is_valid(mantissa),
     }
+}
+
+/// Strip one leading `+`/`-` sign, if present.
+fn strip_php_numeric_sign(text: &str) -> &str {
+    text.strip_prefix(['+', '-']).unwrap_or(text)
+}
+
+/// True for a nonempty run of ASCII digits.
+fn is_digit_run(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Split off the exponent: `Some(mantissa)` when there is none or it is
+/// a signed digit run, `None` for a malformed exponent.
+fn mantissa_with_valid_exponent(body: &str) -> Option<&str> {
+    match body.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => {
+            if is_digit_run(strip_php_numeric_sign(exponent)) {
+                Some(mantissa)
+            } else {
+                None
+            }
+        }
+        None => Some(body),
+    }
+}
+
+/// True when the mantissa is a valid decimal: digits, optionally with
+/// one dot that leaves at least one digit run beside it.
+fn decimal_mantissa_is_valid(mantissa: &str) -> bool {
+    match mantissa.split_once('.') {
+        Some((head, tail)) => dotted_decimal_is_valid(head, tail),
+        None => is_digit_run(mantissa),
+    }
+}
+
+/// True for `head.tail`: an empty tail keeps a digit head, otherwise the
+/// tail must be digits beside a digit (or empty) head.
+fn dotted_decimal_is_valid(head: &str, tail: &str) -> bool {
+    let head_ok = is_digit_run(head);
+    if tail.is_empty() {
+        return head_ok;
+    }
+    is_digit_run(tail) && (head_ok || head.is_empty())
 }
 
 /// Resolve an explicit symbolic base to the merge-base with the head.

@@ -3052,40 +3052,21 @@ fn calculate_patch_should_amend(
     backends: &Backends,
     call: Option<&diff_submit::ConduitCall<'_>>,
 ) -> Result<(bool, Option<String>), String> {
-    let supports_amend = match vcs {
-        Vcs::Git => true,
-        Vcs::Hg => diff::hg_supports_amend_with(dir, &backends.hg),
-        Vcs::Svn => false,
-    };
+    let supports_amend = patch_vcs_supports_amend(dir, vcs, backends);
     if patch_history_immutable(dir, vcs) || !supports_amend {
         return Ok((false, None));
     }
-    let head = match vcs {
-        Vcs::Git => git_head_info(dir)?,
-        Vcs::Hg => hg_tip_info(dir, &backends.hg)?,
-        Vcs::Svn => None,
-    };
-    let Some(head) = head else {
+    let Some(head) = patch_head_info_for(dir, vcs, backends)? else {
         return Ok((false, None));
     };
     let parsed = diff_local::CommitMessage::new_from_raw_corpus(&head.message)?;
     if parsed.git_svn_base_revision.is_some() {
         return Ok((false, None));
     }
-    let author_matches = match vcs {
-        Vcs::Git => git::author(dir).map(|author| author == head.author)?,
-        Vcs::Hg => {
-            hg::get_author_with(dir, &backends.hg)?.is_some_and(|author| author == head.author)
-        }
-        Vcs::Svn => false,
-    };
-    if !author_matches {
+    if !patch_head_author_matches(dir, vcs, backends, &head)? {
         return Ok((false, None));
     }
-    if let Some(call) = call
-        && let Some(query) = amend_repository_query(dir, vcs, backends)?
-        && patch_commit_published(call, &query, &head.hash)?
-    {
+    if patch_head_published(call, dir, vcs, backends, &head.hash)? {
         return Ok((false, None));
     }
     if parsed.revision_id.is_some() {
@@ -3094,6 +3075,63 @@ fn calculate_patch_should_amend(
         return Ok((false, None));
     }
     Ok((true, Some(head.message)))
+}
+
+/// Whether `vcs` can amend: git always, hg when its commit help offers
+/// `--amend`, never svn.
+fn patch_vcs_supports_amend(dir: &Path, vcs: Vcs, backends: &Backends) -> bool {
+    match vcs {
+        Vcs::Git => true,
+        Vcs::Hg => diff::hg_supports_amend_with(dir, &backends.hg),
+        Vcs::Svn => false,
+    }
+}
+
+/// HEAD identity for the amend decision: git `HEAD`, the hg working
+/// parent, none on svn.
+fn patch_head_info_for(
+    dir: &Path,
+    vcs: Vcs,
+    backends: &Backends,
+) -> Result<Option<HeadInfo>, String> {
+    match vcs {
+        Vcs::Git => git_head_info(dir),
+        Vcs::Hg => hg_tip_info(dir, &backends.hg),
+        Vcs::Svn => Ok(None),
+    }
+}
+
+/// Whether the working-copy author matches the HEAD commit author.
+fn patch_head_author_matches(
+    dir: &Path,
+    vcs: Vcs,
+    backends: &Backends,
+    head: &HeadInfo,
+) -> Result<bool, String> {
+    match vcs {
+        Vcs::Git => git::author(dir).map(|author| author == head.author),
+        Vcs::Hg => hg::get_author_with(dir, &backends.hg)
+            .map(|author| author.as_deref() == Some(head.author.as_str())),
+        Vcs::Svn => Ok(false),
+    }
+}
+
+/// Whether the HEAD commit is already known upstream. Without a conduit
+/// channel or an identified repository the check is skipped.
+fn patch_head_published(
+    call: Option<&diff_submit::ConduitCall<'_>>,
+    dir: &Path,
+    vcs: Vcs,
+    backends: &Backends,
+    hash: &str,
+) -> Result<bool, String> {
+    let Some(call) = call else {
+        return Ok(false);
+    };
+    let Some(query) = amend_repository_query(dir, vcs, backends)? else {
+        return Ok(false);
+    };
+    patch_commit_published(call, &query, hash)
 }
 
 /// Stage `unstaged` for commit on any VCS (`addToCommit()`).
@@ -5601,10 +5639,7 @@ fn run_patch_flow(
     // Built before the clean check, like PHP's workflow setup: conduit
     // errors precede worktree errors, and amend detection (PATCH-P9) can
     // run the published-check. `--patch` sources stay conduit-less.
-    let client = match source {
-        Source::Patch(_) => None,
-        _ => Some(land::client_for_dir(options.conduit_uri.as_deref(), dir)?),
-    };
+    let client = setup_patch_client(&source, options, dir)?;
     let call = |method: &str, params: &serde_json::Value| {
         client
             .as_ref()
@@ -5621,25 +5656,72 @@ fn run_patch_flow(
     let stash =
         require_clean_tree_with_call(dir, vcs, backends, io, options.force, ansi, call_option)?;
     let mut loaded = load_bundle_with_reauth(&source, options, io, call_option)?;
-    // PATCH-P11: conduit bundles render through the `--encoding` flag,
-    // else the repository encoding (`:404-414`).
-    if matches!(
+    apply_patch_bundle_encoding(
+        dir,
+        vcs,
+        backends,
+        &source,
+        options,
+        call_option,
+        &mut loaded,
+    )?;
+    let outcome = run_patch_flow_inner(dir, options, io, backends, vcs, ansi, call_option, loaded);
+    let pop = unstash_changes(dir, stash);
+    combine_patch_flow_outcome(outcome, pop)
+}
+
+/// Conduit client for the flow, built before the clean check so conduit
+/// errors precede worktree errors. `--patch` sources stay conduit-less.
+fn setup_patch_client(
+    source: &Source,
+    options: &Options,
+    dir: &Path,
+) -> Result<Option<arc_rs::conduit::Client>, String> {
+    match source {
+        Source::Patch(_) => Ok(None),
+        _ => Ok(Some(land::client_for_dir(
+            options.conduit_uri.as_deref(),
+            dir,
+        )?)),
+    }
+}
+
+/// PATCH-P11: render a conduit bundle through the `--encoding` flag,
+/// else the repository encoding (`:404-414`).
+fn apply_patch_bundle_encoding(
+    dir: &Path,
+    vcs: Vcs,
+    backends: &Backends,
+    source: &Source,
+    options: &Options,
+    call_option: Option<&diff_submit::ConduitCall<'_>>,
+    loaded: &mut LoadedBundle,
+) -> Result<(), String> {
+    if !matches!(
         source,
         Source::Revision(_) | Source::Diff(_) | Source::Named(_)
     ) {
-        let encoding = match options.encoding.as_deref() {
-            Some(flag) => Some(flag.to_string()),
-            None => match call_option {
-                Some(call) => patch_repository_encoding(dir, vcs, backends, call)?,
-                None => None,
-            },
-        };
-        if let Some(encoding) = encoding {
-            loaded.bundle.text = decode_bytes(loaded.bundle.text.as_bytes(), Some(&encoding))?;
-        }
+        return Ok(());
     }
-    let outcome = run_patch_flow_inner(dir, options, io, backends, vcs, ansi, call_option, loaded);
-    let pop = unstash_changes(dir, stash);
+    let encoding = match options.encoding.as_deref() {
+        Some(flag) => Some(flag.to_string()),
+        None => match call_option {
+            Some(call) => patch_repository_encoding(dir, vcs, backends, call)?,
+            None => None,
+        },
+    };
+    if let Some(encoding) = encoding {
+        loaded.bundle.text = decode_bytes(loaded.bundle.text.as_bytes(), Some(&encoding))?;
+    }
+    Ok(())
+}
+
+/// Merge the flow outcome with the stash-pop outcome: a failed pop
+/// fails an otherwise clean run, and a flow error wins over the pop.
+fn combine_patch_flow_outcome(
+    outcome: Result<FlowOutcome, String>,
+    pop: Result<(), String>,
+) -> Result<FlowOutcome, String> {
     match (outcome, pop) {
         (Ok(outcome), Ok(())) => Ok(outcome),
         (Ok(_), Err(error)) => Err(error),
