@@ -415,3 +415,39 @@ fn signs_requests_with_known_vector() {
          EkNIkhFwvCIsCTgj+/AokXD+Ozpue+wARFT2/pR1lsKb4LXyv8uG0f/fbg=="
     );
 }
+
+#[test]
+fn r3_search_pages_follows_after_until_null() {
+    let seen: std::cell::RefCell<Vec<serde_json::Value>> = std::cell::RefCell::new(Vec::new());
+    let call = |method: &str, params: &serde_json::Value| {
+        assert_eq!(method, "differential.revision.search");
+        seen.borrow_mut().push(params.clone());
+        if seen.borrow().len() == 1 {
+            Ok(serde_json::json!({"data": [{"id": 1}], "cursor": {"after": "c1"}}))
+        } else {
+            Ok(serde_json::json!({"data": [{"id": 2}]}))
+        }
+    };
+    let base = serde_json::json!({"constraints": {"ids": [1, 2]}});
+    let pages = search_pages(&call, "differential.revision.search", &base).unwrap();
+    assert_eq!(pages.len(), 2);
+    assert_eq!(pages[0]["data"][0]["id"], serde_json::json!(1));
+    assert_eq!(pages[1]["data"][0]["id"], serde_json::json!(2));
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[0].get("after").is_none());
+    assert_eq!(seen[1]["after"], serde_json::json!("c1"));
+    assert_eq!(seen[1]["constraints"], serde_json::json!({"ids": [1, 2]}));
+}
+
+#[test]
+fn r3_search_pages_single_page_without_cursor_calls_once() {
+    let calls = std::cell::Cell::new(0);
+    let call = |_method: &str, _params: &serde_json::Value| {
+        calls.set(calls.get() + 1);
+        Ok(serde_json::json!({"data": [], "cursor": {"after": null}}))
+    };
+    let pages = search_pages(&call, "file.search", &serde_json::json!({})).unwrap();
+    assert_eq!(pages.len(), 1);
+    assert_eq!(calls.get(), 1);
+}

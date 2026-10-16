@@ -481,29 +481,26 @@ pub fn absolute_uri(conduit_uri: Option<&str>, uri: &str) -> String {
     }
 }
 
-/// Resolve uploaded PHIDs to display refs via `file.search`.
+/// Resolve uploaded PHIDs to display refs via `file.search`,
+/// following `cursor.after` pagination like `ConduitSearchFuture`.
 pub fn resolve_refs(
     client: &crate::conduit::Client,
     uploads: &[(String, String)],
     conduit_uri: Option<&str>,
 ) -> Result<Vec<UploadedRef>, String> {
     let phids: Vec<&str> = uploads.iter().map(|(_, phid)| phid.as_str()).collect();
-    let result = client
-        .call(
-            "file.search",
-            &serde_json::json!({"constraints": {"phids": phids}}),
-        )
-        .map_err(|e| e.to_string())?;
-    let empty = Vec::new();
-    let data = result
-        .get("data")
-        .and_then(|v| v.as_array())
-        .unwrap_or(&empty);
+    let data = crate::revision::conduit_search(
+        client,
+        "file.search",
+        &serde_json::json!({"phids": phids}),
+        None,
+    )?;
     let mut refs = Vec::with_capacity(uploads.len());
     for (argument, phid) in uploads {
+        // Last duplicate wins, like PHP's `ipull($results, null, 'phid')`.
         let hit = data
             .iter()
-            .find(|h| h.get("phid").and_then(|v| v.as_str()) == Some(phid.as_str()))
+            .rfind(|h| h.get("phid").and_then(|v| v.as_str()) == Some(phid.as_str()))
             .ok_or_else(|| format!("Failed to resolve symbol ref \"{phid}\"."))?;
         let id = hit
             .get("id")

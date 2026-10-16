@@ -110,7 +110,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use arc_rs::{config, diff_submit, git, hg, land_checks, revision};
+use arc_rs::{conduit, config, diff_submit, git, hg, land_checks, revision};
 
 use crate::terminal::{self, TVal};
 
@@ -1844,7 +1844,8 @@ pub fn format_skip_note_with_ansi(reason: &str, ansi: bool) -> String {
     )
 }
 
-/// Load revision rows for `symbol` via `differential.revision.search`.
+/// Load revision rows for `symbol` via `differential.revision.search`,
+/// following `cursor.after` pagination like `ConduitSearchFuture`.
 ///
 /// Numeric symbols constrain `ids`; PHID symbols constrain `phids`
 /// (`ArcanistRevisionSymbolRef`, `src/ref/revision/ArcanistRevisionSymbolRef.php:18-24`).
@@ -1861,12 +1862,19 @@ pub fn fetch_revision_views(
         RevisionSymbol::Phid(phid) => serde_json::json!({"phids": [phid]}),
     };
     let params = revision::conduit_search_params(&constraints, None);
-    let result = call(diff_submit::METHOD_REVISION_SEARCH, &params)?;
-    let rows = result
-        .get("data")
-        .and_then(|data| data.as_array())
-        .ok_or_else(|| "differential.revision.search response has no data list".to_string())?;
-    rows.iter().map(land_checks::parse_revision).collect()
+    let mut views = Vec::new();
+    for page in conduit::search_pages(call, diff_submit::METHOD_REVISION_SEARCH, &params)? {
+        let rows = page
+            .get("data")
+            .and_then(|data| data.as_array())
+            .ok_or_else(|| "differential.revision.search response has no data list".to_string())?;
+        views.extend(
+            rows.iter()
+                .map(land_checks::parse_revision)
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+    }
+    Ok(views)
 }
 
 /// Resolve a `--revision` symbol to its revision, or fail with the
@@ -2160,9 +2168,11 @@ fn parse_plan_behaviors(result: &serde_json::Value) -> Result<HashMap<String, St
 /// `harbormaster.build.search` with `buildables`
 /// (`ArcanistBuildableBuildsHardpointQuery.php:19-23`), and
 /// `harbormaster.buildplan.search` with `phids`
-/// (`ArcanistBuildBuildplanHardpointQuery.php:21-25`). Revisions without a
-/// diff PHID (legacy rows) contribute no builds. `conduit_uri`
-/// absolutizes buildable URIs (see [`absolute_buildable_uri`]).
+/// (`ArcanistBuildBuildplanHardpointQuery.php:21-25`). Each search
+/// follows `cursor.after` pagination like `ConduitSearchFuture`.
+/// Revisions without a diff PHID (legacy rows) contribute no builds.
+/// `conduit_uri` absolutizes buildable URIs (see
+/// [`absolute_buildable_uri`]).
 pub fn fetch_build_views(
     call: &diff_submit::ConduitCall<'_>,
     revisions: &[land_checks::RevisionView],
@@ -2172,14 +2182,17 @@ pub fn fetch_build_views(
     if diff_phids.is_empty() {
         return Ok(Vec::new());
     }
-    let buildables = call(
+    let mut rows = Vec::new();
+    for page in conduit::search_pages(
+        call,
         METHOD_BUILDABLE_SEARCH,
         &revision::conduit_search_params(
             &serde_json::json!({"objectPHIDs": diff_phids, "manual": false}),
             None,
         ),
-    )?;
-    let rows = parse_buildable_rows(&buildables)?;
+    )? {
+        rows.extend(parse_buildable_rows(&page)?);
+    }
     // Join buildable objectPHID -> revision diffPHID, like
     // `confirmBuilds` (`ArcanistLandEngine.php:623-644`).
     let buildable_to_revision = join_buildable_revisions(&rows, revisions);
@@ -2187,11 +2200,14 @@ pub fn fetch_build_views(
         return Ok(Vec::new());
     }
     let phids: Vec<String> = rows.iter().map(|row| row.phid.clone()).collect();
-    let builds = call(
+    let mut build_rows = Vec::new();
+    for page in conduit::search_pages(
+        call,
         METHOD_BUILD_SEARCH,
         &revision::conduit_search_params(&serde_json::json!({"buildables": phids}), None),
-    )?;
-    let build_rows = parse_build_rows(&builds)?;
+    )? {
+        build_rows.extend(parse_build_rows(&page)?);
+    }
     let behaviors = fetch_plan_behaviors(call, &build_rows)?;
     let mut views = Vec::new();
     for row in &build_rows {
@@ -2252,11 +2268,15 @@ fn fetch_plan_behaviors(
     if plan_phids.is_empty() {
         return Ok(HashMap::new());
     }
-    let plans = call(
+    let mut behaviors = HashMap::new();
+    for page in conduit::search_pages(
+        call,
         METHOD_BUILDPLAN_SEARCH,
         &revision::conduit_search_params(&serde_json::json!({"phids": plan_phids}), None),
-    )?;
-    parse_plan_behaviors(&plans)
+    )? {
+        behaviors.extend(parse_plan_behaviors(&page)?);
+    }
+    Ok(behaviors)
 }
 
 /// One build view for `row`, or `None` when its buildable belongs to no

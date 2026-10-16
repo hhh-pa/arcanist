@@ -972,3 +972,64 @@ fn fixed_tz_subprocesses_match_oracles() {
         );
     }
 }
+
+#[test]
+fn r3_rbd11_resolve_repositories_follows_after_cursor() {
+    fn repo_row(name: &str, uri: &str) -> serde_json::Value {
+        serde_json::json!({
+            "fields": {"name": name},
+            "attachments": {"uris": {"uris": [
+                {"fields": {"uri": {"effective": uri}}},
+            ]}},
+        })
+    }
+    let seen: std::cell::RefCell<Vec<serde_json::Value>> = std::cell::RefCell::new(Vec::new());
+    let call = |method: &str, params: &serde_json::Value| {
+        assert_eq!(method, "diffusion.repository.search");
+        seen.borrow_mut().push(params.clone());
+        if seen.borrow().len() == 1 {
+            Ok(serde_json::json!({
+                "data": [repo_row("one", "git@h.test:one.git")],
+                "cursor": {"after": "p2"},
+            }))
+        } else {
+            Ok(serde_json::json!({
+                "data": [repo_row("two", "git@h.test:two.git")],
+            }))
+        }
+    };
+    let uris = vec!["git@h.test:one.git".to_string()];
+    let repos = resolve_repositories(&call, &uris).unwrap();
+    assert_eq!(repos.len(), 2);
+    assert_eq!(repos[0].name, "one");
+    assert_eq!(repos[1].name, "two");
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[0].get("after").is_none());
+    assert_eq!(seen[1]["after"], serde_json::json!("p2"));
+    assert_eq!(
+        seen[1]["attachments"],
+        serde_json::json!({"uris": true}),
+        "attachments survive onto page two"
+    );
+}
+
+#[test]
+fn r3_rbd11_match_repository_prefers_last_on_collision() {
+    let repos = vec![
+        RepositoryRef {
+            name: "first".to_string(),
+            uris: vec!["git@h.test:repo.git".to_string()],
+            permanent_rules: None,
+        },
+        RepositoryRef {
+            name: "second".to_string(),
+            uris: vec!["ssh://git@h.test/repo".to_string()],
+            permanent_rules: None,
+        },
+    ];
+    assert_eq!(
+        match_repository(&repos, "git@h.test:repo").map(|r| r.name.as_str()),
+        Some("second")
+    );
+}

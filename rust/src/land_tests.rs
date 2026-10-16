@@ -3154,3 +3154,93 @@ fn console_wrap_at_hint_indent_matches_phutil_wrap() {
     );
     assert_eq!(console_wrap("  ?   Use X.", 6, false), "  ?   Use X.");
 }
+
+#[test]
+fn r3_land16_revision_search_follows_after_cursor() {
+    let seen: std::rc::Rc<std::cell::RefCell<Vec<serde_json::Value>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let probe = seen.clone();
+    let call = move |method: &str, params: &serde_json::Value| {
+        assert_eq!(method, diff_submit::METHOD_REVISION_SEARCH);
+        probe.borrow_mut().push(params.clone());
+        if probe.borrow().len() == 1 {
+            Ok(serde_json::json!({
+                "data": [modern_row(89, "accepted", "Accepted", false, "PHID-USER-a")],
+                "cursor": {"after": "page2"},
+            }))
+        } else {
+            Ok(serde_json::json!({
+                "data": [modern_row(90, "accepted", "Accepted", false, "PHID-USER-a")],
+            }))
+        }
+    };
+    let views = fetch_revision_views(&call, &RevisionSymbol::Id(89)).unwrap();
+    assert_eq!(views.len(), 2);
+    assert_eq!(views[0].monogram, "D89");
+    assert_eq!(views[1].monogram, "D90");
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[0].get("after").is_none());
+    assert_eq!(seen[1]["after"], serde_json::json!("page2"));
+    assert_eq!(seen[1]["constraints"], serde_json::json!({"ids": [89]}));
+}
+
+#[test]
+fn r3_land16_build_searches_paginate() {
+    let calls: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let probe = calls.clone();
+    let call = move |method: &str, params: &serde_json::Value| {
+        let page = if params.get("after").is_some() { 2 } else { 1 };
+        probe.borrow_mut().push(format!("{method} p{page}"));
+        match (method, page) {
+            (METHOD_BUILDABLE_SEARCH, 1) => Ok(serde_json::json!({"data": [
+                {"id": 7, "phid": "PHID-HMBB-7", "fields": {"objectPHID": "PHID-DIFF-89"}},
+            ], "cursor": {"after": "b2"}})),
+            (METHOD_BUILDABLE_SEARCH, _) => Ok(serde_json::json!({"data": [
+                {"id": 8, "phid": "PHID-HMBB-8", "fields": {"objectPHID": "PHID-DIFF-89"}},
+            ]})),
+            (METHOD_BUILD_SEARCH, 1) => Ok(serde_json::json!({"data": [
+                {"id": 42, "fields": {
+                    "name": "Lint",
+                    "buildStatus": {"value": "failed"},
+                    "buildablePHID": "PHID-HMBB-7",
+                    "buildPlanPHID": "PHID-HMPA-1",
+                }},
+            ], "cursor": {"after": "u2"}})),
+            (METHOD_BUILD_SEARCH, _) => Ok(serde_json::json!({"data": [
+                {"id": 43, "fields": {
+                    "name": "Unit",
+                    "buildStatus": {"value": "passed"},
+                    "buildablePHID": "PHID-HMBB-8",
+                    "buildPlanPHID": "PHID-HMPA-2",
+                }},
+            ]})),
+            (METHOD_BUILDPLAN_SEARCH, 1) => Ok(serde_json::json!({"data": [
+                {"phid": "PHID-HMPA-1", "fields": {"behaviors": {"arc-land": {"value": "always"}}}},
+            ], "cursor": {"after": "p2"}})),
+            (METHOD_BUILDPLAN_SEARCH, _) => Ok(serde_json::json!({"data": [
+                {"phid": "PHID-HMPA-2", "fields": {"behaviors": {"arc-land": {"value": "never"}}}},
+            ]})),
+            _ => Err(format!("unexpected conduit call {method}")),
+        }
+    };
+    let revisions = vec![view(89, "accepted", "Accepted", false, "PHID-USER-a")];
+    let builds = fetch_build_views(&call, &revisions, None).unwrap();
+    assert_eq!(builds.len(), 2);
+    assert_eq!(builds[0].buildable_monogram, "B7");
+    assert_eq!(builds[0].plan_behavior.as_deref(), Some("always"));
+    assert_eq!(builds[1].buildable_monogram, "B8");
+    assert_eq!(builds[1].plan_behavior.as_deref(), Some("never"));
+    assert_eq!(
+        calls.borrow().clone(),
+        vec![
+            "harbormaster.buildable.search p1",
+            "harbormaster.buildable.search p2",
+            "harbormaster.build.search p1",
+            "harbormaster.build.search p2",
+            "harbormaster.buildplan.search p1",
+            "harbormaster.buildplan.search p2",
+        ]
+    );
+}

@@ -703,3 +703,73 @@ fn liberate_scan_updates_found_library() {
     let err = liberate::execute_with_input(fx.path(), &argv(&[]), &mut empty_input()).unwrap_err();
     assert!(err.contains("no longer supported"), "{err}");
 }
+
+// --- T1153 R3 auto-pagination ---------------------------------------------
+
+#[test]
+fn r3_dld12_download_follows_file_search_pages() {
+    fn hit(id: u32) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "phid": format!("PHID-FILE-{id}"),
+            "fields": {
+                "name": format!("f{id}.txt"),
+                "size": 1,
+                "dataURI": "http://127.0.0.1:9/x",
+            },
+        })
+    }
+    let page1 = serde_json::json!({
+        "result": {"data": [hit(7)], "cursor": {"after": "p2"}},
+        "error_code": null,
+    })
+    .to_string();
+    let page2 = serde_json::json!({
+        "result": {"data": [hit(9)]},
+        "error_code": null,
+    })
+    .to_string();
+    let (base, rx) = serve_seq(vec![page1, page2]);
+    let file = download::fetch_file_ref(&client_for(&base), 9).unwrap();
+    assert_eq!(file.id, 9);
+    assert_eq!(file.name, "f9.txt");
+    let seen = seen_requests(&rx);
+    assert_eq!(seen.len(), 2);
+    assert!(seen[0].0.contains("file.search"), "{}", seen[0].0);
+    assert!(!seen[0].1.contains("after"), "{}", seen[0].1);
+    assert!(seen[1].0.contains("file.search"), "{}", seen[1].0);
+    assert!(seen[1].1.contains("after"), "{}", seen[1].1);
+}
+
+#[test]
+fn r3_uploadu16_resolve_refs_follows_file_search_pages() {
+    fn hit(id: u32) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "phid": format!("PHID-FILE-{id}"),
+            "fields": {"name": format!("f{id}.txt"), "uri": format!("/F{id}")},
+        })
+    }
+    let page1 = serde_json::json!({
+        "result": {"data": [hit(1)], "cursor": {"after": "p2"}},
+        "error_code": null,
+    })
+    .to_string();
+    let page2 = serde_json::json!({
+        "result": {"data": [hit(2)]},
+        "error_code": null,
+    })
+    .to_string();
+    let (base, rx) = serve_seq(vec![page1, page2]);
+    let refs = upload::resolve_refs(
+        &client_for(&base),
+        &[("f2.txt".to_string(), "PHID-FILE-2".to_string())],
+        None,
+    )
+    .unwrap();
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].id, 2);
+    let seen = seen_requests(&rx);
+    assert_eq!(seen.len(), 2);
+    assert!(seen[1].1.contains("after"), "{}", seen[1].1);
+}

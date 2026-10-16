@@ -151,3 +151,81 @@ fn r9_upload_u13_no_browser_text_matches_ceb() {
         "Unable to find a browser command to run. Set 'browser' in your Arcanist config to specify a command to use."
     );
 }
+
+/// Serve canned Conduit envelopes in order; returns the base URI and the
+/// observed request bodies once all are served.
+fn serve_seq(canned: Vec<String>) -> (String, std::sync::mpsc::Receiver<Vec<String>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for body in canned {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8(head).unwrap();
+            let len: usize = head
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                })
+                .unwrap_or(0);
+            let mut raw = vec![0u8; len];
+            stream.read_exact(&mut raw).unwrap();
+            seen.push(String::from_utf8(raw).unwrap());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+        tx.send(seen).unwrap();
+    });
+    (base, rx)
+}
+
+#[test]
+fn r3_uploadu16_file_search_follows_after_cursor() {
+    fn hit(id: u64, name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "phid": format!("PHID-FILE-{id}"),
+            "fields": {"name": name, "uri": format!("/F{id}")},
+        })
+    }
+    let page1 = serde_json::json!({
+        "result": {"data": [hit(1, "other.bin")], "cursor": {"after": "p2"}},
+        "error_code": null,
+    })
+    .to_string();
+    let page2 = serde_json::json!({
+        "result": {"data": [hit(2, "a.bin")]},
+        "error_code": null,
+    })
+    .to_string();
+    let (base, rx) = serve_seq(vec![page1, page2]);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    let refs = resolve_refs(
+        &client,
+        &[("a.bin".to_string(), "PHID-FILE-2".to_string())],
+        None,
+    )
+    .unwrap();
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].id, 2);
+    assert_eq!(refs[0].name, "a.bin");
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(!seen[0].contains("after"), "{}", seen[0]);
+    assert!(seen[1].contains("after"), "{}", seen[1]);
+}
