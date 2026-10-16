@@ -53,6 +53,24 @@ fn rejects_missing_extra_and_bad_symbols() {
 }
 
 #[test]
+fn dl4_unknown_flag_uses_toolset_text() {
+    // T1153 DL-4: unknown flags throw the full value
+    // (`PhutilArgumentParser.php:819-825`); post-`--` leftovers
+    // ride the wildcard into symbol validation instead.
+    let ParseOutcome::Error(message) = parse_args_with_tty(&argv(&["--bogus"]), true) else {
+        panic!("expected unknown-flag error");
+    };
+    assert_eq!(
+        message,
+        "Argument \"--bogus\" is unrecognized. Use \"--\" to indicate the end of flags."
+    );
+    assert!(matches!(
+        parse_args(&argv(&["--", "--bogus"])),
+        ParseOutcome::Error(_)
+    ));
+}
+
+#[test]
 fn parses_file_symbols() {
     assert_eq!(parse_file_symbol("F123").unwrap(), FileSymbol::Id(123));
     assert_eq!(parse_file_symbol("99").unwrap(), FileSymbol::Id(99));

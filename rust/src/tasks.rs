@@ -237,12 +237,14 @@ impl Parser {
         if let Some(key) = arg.strip_prefix('-') {
             return Step::Error(format!("Unknown argument '{key}'. Try 'arc help'."));
         }
-        Step::Error(format!("unexpected argument '{arg}'"))
+        // T1153 TASKS-2: positionals with no `$more_key` throw the
+        // first extra (`ArcanistWorkflow.php:887-895`).
+        Step::Error(format!("Unrecognized argument '{arg}'. Try 'arc help'."))
     }
 
     fn consume(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Step {
         if self.end_of_flags {
-            return Step::Error(format!("unexpected argument '{arg}'"));
+            return Step::Error(format!("Unrecognized argument '{arg}'. Try 'arc help'."));
         }
         if let Some(step) = self.flag_status(arg, iter) {
             return step;

@@ -291,6 +291,24 @@ fn tasks1_unknown_flags_use_classic_text() {
 }
 
 #[test]
+fn tasks2_positional_uses_classic_text() {
+    // T1153 TASKS-2: positionals with no `$more_key` name the first
+    // extra (`ArcanistWorkflow.php:887-895`), bare or after `--`.
+    assert_eq!(
+        parse_args(&args(&["positional"])).unwrap_err(),
+        "Unrecognized argument 'positional'. Try 'arc help'."
+    );
+    assert_eq!(
+        parse_args(&args(&["--", "positional"])).unwrap_err(),
+        "Unrecognized argument 'positional'. Try 'arc help'."
+    );
+    assert_eq!(
+        parse_args(&args(&["first", "second"])).unwrap_err(),
+        "Unrecognized argument 'first'. Try 'arc help'."
+    );
+}
+
+#[test]
 fn rbd8_user_phid_prefers_cached_identity() {
     // The startup-auth identity answers without I/O: an unroutable
     // client still resolves when cached.

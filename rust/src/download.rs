@@ -234,7 +234,11 @@ impl Parser {
         } else if arg == "-h" || arg == "--help" {
             Step::Done(ParseOutcome::Help)
         } else if arg.starts_with('-') {
-            Step::Done(ParseOutcome::Error(format!("unknown flag '{arg}'")))
+            // T1153 DL-4: the toolset parser throws the full value
+            // (`PhutilArgumentParser.php:819-825`).
+            Step::Done(ParseOutcome::Error(format!(
+                "Argument \"{arg}\" is unrecognized. Use \"--\" to indicate the end of flags."
+            )))
         } else {
             self.positionals.push(arg.to_string());
             Step::Handled
