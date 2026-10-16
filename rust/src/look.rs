@@ -996,7 +996,8 @@ pub fn collect_remote_uris(remotes: &[RemoteInfo]) -> Vec<String> {
     uris
 }
 
-/// Resolve repositories for `uris` via `diffusion.repository.search`.
+/// Resolve repositories for `uris` via `diffusion.repository.search`,
+/// following `cursor.after` pagination like `ConduitSearchFuture`.
 pub fn resolve_repositories(
     call: &diff_submit::ConduitCall,
     uris: &[String],
@@ -1004,11 +1005,15 @@ pub fn resolve_repositories(
     if uris.is_empty() {
         return Ok(Vec::new());
     }
-    let result = call(
+    let mut repos = Vec::new();
+    for page in conduit::search_pages(
+        call,
         "diffusion.repository.search",
         &repository_search_params(uris),
-    )?;
-    Ok(parse_repository_search(&result))
+    )? {
+        repos.extend(parse_repository_search(&page));
+    }
+    Ok(repos)
 }
 
 /// Split a git URI into `(domain, path)`, covering `scheme://` and
@@ -1069,12 +1074,14 @@ pub fn normalize_git_uri(uri: &str) -> String {
 }
 
 /// Find the repository whose URIs contain `uri` after normalization.
+/// On collisions the last match wins, like PHP's `$uri_map` overwrite
+/// (`ArcanistRemoteRepositoryRefsHardpointQuery.php:60-67`).
 #[must_use]
 pub fn match_repository<'a>(repos: &'a [RepositoryRef], uri: &str) -> Option<&'a RepositoryRef> {
     let wanted = normalize_git_uri(uri);
     repos
         .iter()
-        .find(|repo| repo.uris.iter().any(|u| normalize_git_uri(u) == wanted))
+        .rfind(|repo| repo.uris.iter().any(|u| normalize_git_uri(u) == wanted))
 }
 
 /// Fill push/fetch repository display names from resolved repositories.

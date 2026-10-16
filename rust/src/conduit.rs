@@ -608,6 +608,39 @@ fn has_error_code(code: Option<&serde_json::Value>) -> bool {
     code.is_some_and(php_truthy)
 }
 
+/// Fetch every page of a new-style `.search` call through the
+/// caller-supplied `call` seam, following `cursor.after` like
+/// `ConduitSearchFuture` (`src/conduit/ConduitSearchFuture.php:50-87`):
+/// POST the base `params` (`{constraints, attachments?}`), then re-POST
+/// with a top-level `after` cursor until `cursor.after` is null. Returns
+/// the raw page results so each caller keeps its own `data` handling.
+/// This is the [`ConduitCall`](crate::diff_submit::ConduitCall) counterpart
+/// of [`conduit_search`](crate::revision::conduit_search).
+pub fn search_pages(
+    call: &crate::diff_submit::ConduitCall<'_>,
+    method: &str,
+    params: &serde_json::Value,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut pages = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let mut page_params = params.clone();
+        if let Some(cursor) = &after {
+            page_params["after"] = serde_json::Value::String(cursor.clone());
+        }
+        let result = call(method, &page_params)?;
+        let cursor = result
+            .get("cursor")
+            .and_then(|value| value.get("after"))
+            .and_then(|value| value.as_str().map(str::to_string));
+        pages.push(result);
+        match cursor {
+            Some(next) => after = Some(next),
+            None => return Ok(pages),
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "conduit_tests.rs"]
 mod conduit_tests;

@@ -172,3 +172,97 @@ fn status_lines_carry_no_markup() {
         assert!(!line.contains("**"), "{line}");
     }
 }
+
+#[test]
+fn r3_dld12_select_file_hit_matches_by_id() {
+    let hits = serde_json::json!([
+        {"id": 7, "fields": {}},
+        {"id": "9", "fields": {}},
+        {"id": 9, "fields": {}},
+    ]);
+    let hits = hits.as_array().unwrap();
+    // Numeric-string ids match (PHP loose keys); last duplicate wins
+    // (PHP `ipull` overwrite).
+    assert_eq!(
+        select_file_hit(hits, 9).unwrap().get("id").unwrap(),
+        &serde_json::json!(9)
+    );
+    assert!(select_file_hit(hits, 404).is_none());
+    assert!(select_file_hit(&[], 9).is_none());
+}
+
+/// Serve canned Conduit envelopes in order; returns the base URI and the
+/// observed request bodies once all are served.
+fn serve_seq(canned: Vec<String>) -> (String, std::sync::mpsc::Receiver<Vec<String>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for body in canned {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8(head).unwrap();
+            let len: usize = head
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                })
+                .unwrap_or(0);
+            let mut raw = vec![0u8; len];
+            stream.read_exact(&mut raw).unwrap();
+            seen.push(String::from_utf8(raw).unwrap());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+        tx.send(seen).unwrap();
+    });
+    (base, rx)
+}
+
+#[test]
+fn r3_dld12_file_search_follows_after_cursor() {
+    fn hit(id: u64) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "phid": format!("PHID-FILE-{id}"),
+            "fields": {
+                "name": format!("f{id}.txt"),
+                "size": 1,
+                "dataURI": "http://127.0.0.1:9/x",
+            },
+        })
+    }
+    let page1 = serde_json::json!({
+        "result": {"data": [hit(7)], "cursor": {"after": "p2"}},
+        "error_code": null,
+    })
+    .to_string();
+    let page2 = serde_json::json!({
+        "result": {"data": [hit(9)]},
+        "error_code": null,
+    })
+    .to_string();
+    let (base, rx) = serve_seq(vec![page1, page2]);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    let file = fetch_file_ref(&client, 9).unwrap();
+    assert_eq!(file.id, 9);
+    assert_eq!(file.name, "f9.txt");
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(!seen[0].contains("after"), "{}", seen[0]);
+    assert!(seen[1].contains("after"), "{}", seen[1]);
+}

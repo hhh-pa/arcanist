@@ -573,3 +573,38 @@ fn wraps_select_prompts_at_indent_four() {
     );
     assert_eq!(select_prompt("Pick?", 1, 3), "    Pick? [1 - 3] ");
 }
+
+#[test]
+fn r3_browseb7_revision_search_follows_after_cursor() {
+    fn row(id: u32) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "fields": {
+                "uri": format!("/D{id}"),
+                "status": {"closed": false},
+            },
+        })
+    }
+    let seen: std::cell::RefCell<Vec<serde_json::Value>> = std::cell::RefCell::new(Vec::new());
+    let call = |method: &str, params: &serde_json::Value| {
+        assert_eq!(method, "differential.revision.search");
+        seen.borrow_mut().push(params.clone());
+        if seen.borrow().len() == 1 {
+            Ok(serde_json::json!({"data": [row(1)], "cursor": {"after": "p2"}}))
+        } else {
+            Ok(serde_json::json!({"data": [row(2)]}))
+        }
+    };
+    let hits = search_revision_hits(&call, &["1".to_string(), "2".to_string()]).unwrap();
+    assert_eq!(
+        hits,
+        vec![
+            ("1".to_string(), "/D1".to_string(), false),
+            ("2".to_string(), "/D2".to_string(), false),
+        ]
+    );
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[0].get("after").is_none());
+    assert_eq!(seen[1]["after"], serde_json::json!("p2"));
+}

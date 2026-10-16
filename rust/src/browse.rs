@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::{
-    browser, config, diff_submit, get_config, git,
+    browser, conduit, config, diff_submit, get_config, git,
     terminal::{self, PhtArg, TVal},
     which,
 };
@@ -740,7 +740,8 @@ fn row_closed(row: &serde_json::Value) -> bool {
     closed.as_bool().unwrap_or(false)
 }
 
-/// Modern `differential.revision.search` rows: (id, uri, closed).
+/// Modern `differential.revision.search` rows: (id, uri, closed),
+/// following `cursor.after` pagination like `ConduitSearchFuture`.
 fn search_revision_hits(
     call: &diff_submit::ConduitCall,
     ids: &[String],
@@ -752,19 +753,18 @@ fn search_revision_hits(
     for id in ids {
         query_ids.push(id_param(id));
     }
-    let result = call(
-        "differential.revision.search",
-        &serde_json::json!({"constraints": {"ids": query_ids}}),
-    )?;
+    let params = serde_json::json!({"constraints": {"ids": query_ids}});
     let mut hits = Vec::new();
-    let empty = Vec::new();
-    let rows = match result.get("data") {
-        Some(serde_json::Value::Array(items)) => items,
-        _ => &empty,
-    };
-    for row in rows {
-        let id = row_id_string(row);
-        hits.push((id.clone(), row_uri(row, &id), row_closed(row)));
+    for page in conduit::search_pages(call, "differential.revision.search", &params)? {
+        let empty = Vec::new();
+        let rows = match page.get("data") {
+            Some(serde_json::Value::Array(items)) => items,
+            _ => &empty,
+        };
+        for row in rows {
+            let id = row_id_string(row);
+            hits.push((id.clone(), row_uri(row, &id), row_closed(row)));
+        }
     }
     Ok(hits)
 }

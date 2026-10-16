@@ -217,8 +217,16 @@ impl FileRef {
     }
 }
 
-fn first_search_hit(result: &serde_json::Value) -> Option<&serde_json::Value> {
-    result.get("data")?.as_array()?.first()
+/// Pick the `file.search` hit whose `id` equals `file_id`, like PHP's
+/// `ipull($results, null, 'id')` lookup (`ArcanistSimpleSymbolHardpointQuery.php:96-102`):
+/// the last duplicate wins, and numeric-string ids match like PHP's
+/// loose array keys.
+fn select_file_hit(hits: &[serde_json::Value], file_id: u64) -> Option<&serde_json::Value> {
+    hits.iter().rfind(|hit| {
+        hit.get("id")
+            .and_then(crate::diff_submit::loose_u64)
+            .is_some_and(|id| id == file_id)
+    })
 }
 
 /// Resolve a file by ID via `file.search`.
@@ -233,13 +241,13 @@ pub fn fetch_file_ref_for_symbol(
     file_id: u64,
     symbol: &str,
 ) -> Result<FileRef, String> {
-    let result = client
-        .call(
-            "file.search",
-            &serde_json::json!({"constraints": {"ids": [file_id]}}),
-        )
-        .map_err(|e| e.to_string())?;
-    let hit = first_search_hit(&result).ok_or_else(|| {
+    let hits = crate::revision::conduit_search(
+        client,
+        "file.search",
+        &serde_json::json!({"ids": [file_id]}),
+        None,
+    )?;
+    let hit = select_file_hit(&hits, file_id).ok_or_else(|| {
         format!("File \"{symbol}\" does not exist, or you do not have permission to view it.")
     })?;
     let id = hit
