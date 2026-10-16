@@ -645,16 +645,18 @@ fn liberate_rejects_ancient_and_unknown_versions() {
 }
 
 #[test]
-fn liberate_creates_init_then_reports_missing_rebuild_script() {
+fn liberate_create_ignores_rebuild_status() {
+    // CORE-50: PHP at ceb ignores the rebuild status entirely
+    // (`ArcanistLiberateWorkflow.php:82-93` discards `liberatePath`'s
+    // return): the run succeeds with no rebuild text, even with no
+    // rebuild script above the library (DONE goes to the console,
+    // like PHP's echo, not the return value).
     let fx = Fixture::named("lib-create");
     std::fs::create_dir_all(fx.dir.join("newlib")).unwrap();
-    // Creation succeeded (init file written) but no rebuild script exists
-    // above a temp dir, so the rebuild step fails deterministically. Like
-    // `arc liberate`, per-library rebuild failures still exit 0.
     let out =
         liberate::execute_with_input(fx.path(), &argv(&["newlib"]), &mut filled_input("my-lib\n"))
             .unwrap();
-    assert!(out.contains("rebuild-map.php"), "{out}");
+    assert!(!out.contains("rebuild-map.php"), "{out}");
     let init =
         std::fs::read_to_string(fx.dir.join("newlib").join("__phutil_library_init__.php")).unwrap();
     assert!(init.contains("phutil_register_library('my-lib'"), "{init}");
@@ -663,18 +665,23 @@ fn liberate_creates_init_then_reports_missing_rebuild_script() {
 #[test]
 fn liberate_missing_directory_decline_and_accept() {
     let fx = Fixture::named("lib-mkdir");
+    // Declining the mkdir prompt aborts like PHP's `ArcanistPrompt`
+    // (`ArcanistUserAbortException`); the "does not exist" text stays in
+    // the banner, not the error.
     let err = liberate::execute_with_input(fx.path(), &argv(&["ghost"]), &mut filled_input("n\n"))
         .unwrap_err();
-    assert!(err.contains("does not exist"), "{err}");
+    assert!(err.contains("User aborted the workflow."), "{err}");
     assert!(!fx.dir.join("ghost").exists());
 
+    // PHP only accepts exactly `y`/`n` (lowercased) at toolset prompts
+    // (`ArcanistPrompt.php`); anything else re-prompts.
     let out = liberate::execute_with_input(
         fx.path(),
         &argv(&["fresh"]),
-        &mut filled_input("yes\nfresh-lib\n"),
+        &mut filled_input("y\nfresh-lib\n"),
     )
     .unwrap();
-    assert!(out.contains("rebuild-map.php"), "{out}");
+    assert!(!out.contains("rebuild-map.php"), "{out}");
     assert!(
         fx.dir
             .join("fresh")
@@ -684,7 +691,9 @@ fn liberate_missing_directory_decline_and_accept() {
 }
 
 #[test]
-fn liberate_v2_reports_missing_rebuild_script() {
+fn liberate_v2_ignores_rebuild_status() {
+    // CORE-50: the rebuild status is ignored entirely (see
+    // `liberate_create_ignores_rebuild_status`); the run exits 0.
     let fx = Fixture::named("lib-v2");
     std::fs::create_dir_all(fx.dir.join("v2lib")).unwrap();
     std::fs::write(
@@ -699,8 +708,7 @@ fn liberate_v2_reports_missing_rebuild_script() {
     .unwrap();
     let out =
         liberate::execute_with_input(fx.path(), &argv(&["v2lib"]), &mut empty_input()).unwrap();
-    assert!(out.contains("rebuild-map.php"), "{out}");
-    // Per-library rebuild failures still exit 0, like `arc liberate`.
+    assert!(!out.contains("rebuild-map.php"), "{out}");
     assert_eq!(
         liberate::run_in(fx.path(), &argv(&["v2lib"])),
         ExitCode::SUCCESS
