@@ -14,8 +14,6 @@
 //! strings are verbatim from PHP; each item cites its PHP lines.
 //!
 //! Divergences (behavior limits with PHP refs):
-//! - The open-parents title drops a stray trailing space in PHP's
-//!   `'%s OPEN PARENT REVISION(S) '` (`ArcanistLandEngine.php:486`).
 //! - `classify_builds` preserves input order in `problems`; PHP sorts the
 //!   printed list passed-builds-first (`ArcanistLandEngine.php:576`), which
 //!   is display order only and does not change the verdict.
@@ -609,7 +607,8 @@ pub fn open_parents_gate(groups: &[OpenParentGroup]) -> Option<GateFinding> {
     }
     Some(GateFinding {
         prompt: PROMPT_OPEN_PARENTS,
-        title: format!("{count} OPEN PARENT REVISION(S)"),
+        // The title carries a trailing space in PHP (`:486`).
+        title: format!("{count} OPEN PARENT REVISION(S) "),
         query: format!("Land changes that depend on {count} open revision(s)?"),
         count,
     })

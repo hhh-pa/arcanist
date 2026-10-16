@@ -70,9 +70,21 @@ fn parses_help() {
 fn rejects_bad_args() {
     assert!(parse_args(&args(&[])).is_err());
     assert!(parse_args(&args(&["D1", "D2"])).is_err());
-    assert!(parse_args(&args(&["--bogus", "D1"])).is_err());
     assert!(parse_args(&args(&["--conduit-uri"])).is_err());
     assert!(parse_args(&args(&["--conduit-uri="])).is_err());
+    // LAND-42: `Unknown argument 'bogus'. Try 'arc help'.`
+    assert_eq!(
+        parse_args(&args(&["--bogus", "D1"])).unwrap_err(),
+        "Unknown argument 'bogus'. Try 'arc help'."
+    );
+    assert_eq!(
+        parse_args(&args(&["-x", "D1"])).unwrap_err(),
+        "Unknown argument 'x'. Try 'arc help'."
+    );
+    assert_eq!(
+        parse_args(&args(&["--bogus=1", "D1"])).unwrap_err(),
+        "Unknown argument 'bogus'. Try 'arc help'."
+    );
 }
 
 #[test]
@@ -149,7 +161,8 @@ fn builds_result_json() {
 
 #[test]
 fn close_targets_revision_id_number() {
-    assert_eq!(id_param("123"), serde_json::json!(123));
+    // LAND-32: the normalized ID travels as a string, as PHP sends it.
+    assert_eq!(id_param("123"), serde_json::json!("123"));
 }
 
 #[test]
@@ -259,4 +272,41 @@ fn detects_working_copy_flavors() {
     std::fs::create_dir_all(&plain).unwrap();
     assert!(detect_working_copy(&plain).is_none());
     std::fs::remove_dir_all(&base).ok();
+}
+
+// -( T1153 Wave 2: LAND findings )--------------------------------------------
+
+#[test]
+fn land21_finalized_message_fails_outside_repo() {
+    // Outside a repository the finalized message throws like PHP's
+    // `ArcanistCapabilityNotSupportedException`; `--quiet` still skips it.
+    let rev = parse_revision(&revision(STATUS_ACCEPTED, "PHID-USER-1")).unwrap();
+    let plain = std::env::temp_dir().join(format!("arc-rs-close-plain-{}", std::process::id()));
+    std::fs::create_dir_all(&plain).unwrap();
+    let err = closing_message(&Some(rev.clone()), false, &plain).unwrap_err();
+    assert_eq!(
+        err,
+        "This repository API ('filesystem') does not support the requested capability."
+    );
+    assert_eq!(closing_message(&Some(rev), true, &plain).unwrap(), "");
+    let repo = plain.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let status = std::process::Command::new("git")
+        .current_dir(&repo)
+        .args(["init", "-q", "-b", "master"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let rev = parse_revision(&revision(STATUS_ACCEPTED, "PHID-USER-1")).unwrap();
+    let message = closing_message(&Some(rev), false, &repo).unwrap();
+    assert!(message.contains("git push"), "{message}");
+    std::fs::remove_dir_all(&plain).ok();
+}
+
+#[test]
+fn land32_close_sends_string_revision_ids() {
+    // Both `differential.query` ids and `differential.close` revisionID
+    // travel as strings, as PHP sends them.
+    assert_eq!(id_param("123"), serde_json::json!("123"));
+    assert_eq!(id_param("D123"), serde_json::json!("D123"));
 }
