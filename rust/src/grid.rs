@@ -268,7 +268,10 @@ pub fn truncate_glyphs(text: &str, maximum: usize) -> String {
     if cutoff == 0 {
         return TRUNCATOR_TERMINATOR.to_string();
     }
-    let search = (cutoff.saturating_sub(256)).max(cutoff / 2);
+    // T1153 RB-D35: PHP divides by two as a float (`$cutoff / 2`,
+    // `src/utils/PhutilUTF8StringTruncator.php:204-209`), so odd cutoffs
+    // round the search floor up (like `terminal`'s truncator).
+    let search = cutoff.div_ceil(2).max(cutoff.saturating_sub(256));
     let mut word_boundary: Option<usize> = None;
     let mut stop_boundary: Option<usize> = None;
     let mut any_nonboundary = false;
@@ -541,17 +544,17 @@ impl GridView {
 
     /// Draw the grid: rows joined with newlines plus one trailing newline.
     ///
-    /// A grid with no rows renders `Array`, matching PHP's array-to-string
-    /// coercion in `drawGrid()`; the markers workflows always produce rows
-    /// (or fail earlier in the partition query), so this is unreachable
-    /// in practice.
+    /// T1153 RB-D36: a grid with no rows renders `"\n"` — `phutil_glue`
+    /// returns `[]` for no rows and `%s` of it is `""`
+    /// (`src/utils/utils.php:1955-1958`, `src/xsprintf/tsprintf.php` via
+    /// `PhutilTerminalString::escapeStringValue`).
     #[must_use]
     pub fn draw(&self, terminal: Option<usize>) -> String {
         if self.columns.is_empty() {
             panic!("Can not draw a grid with no columns!");
         }
         if self.rows.is_empty() {
-            return "Array\n".to_string();
+            return "\n".to_string();
         }
         let widths = self.column_widths(terminal);
         let mut out = String::new();

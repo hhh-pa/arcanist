@@ -111,11 +111,11 @@ fn parses_revision_ids_from_messages() {
 #[test]
 fn rejects_invalid_revision_fields() {
     let err = revision_id_from_message("Differential Revision: D0\n").unwrap_err();
-    assert!(
-        err.contains("Invalid \"Differential Revision\" field"),
-        "{err}"
+    // T1153 RB-D37: the ceb bytes name a Phabricator URI.
+    assert_eq!(
+        err,
+        "Invalid \"Differential Revision\" field in commit message. This field should have a revision identifier like \"D123\" or a Phabricator URI like \"https://phabricator.example.com/D123\", but has \"D0\"."
     );
-    assert!(err.contains("but has \"D0\""), "{err}");
     assert!(revision_id_from_message("Differential Revision: 123\n").is_err());
     assert!(revision_id_from_message("Differential Revision: D12x\n").is_err());
     assert!(revision_id_from_message("Differential Revision: https://host/other\n").is_err());
@@ -138,6 +138,19 @@ fn merges_refs_by_phid_with_hash_refs_first() {
     assert_eq!(merged.len(), 2);
     assert_eq!(merged[0].name(), Some("via hash"));
     assert_eq!(merged[1].name(), Some("other"));
+}
+
+#[test]
+fn merges_phid_less_refs_first_wins() {
+    // T1153 RB-D15: a missing PHID keys as `""` like PHP's
+    // `mergeHardpointValues`, so only the first PHID-less ref is kept.
+    let first =
+        RevisionRef::from_search_hit(&serde_json::json!({"id": 3, "fields": {"title": "first"}}));
+    let second =
+        RevisionRef::from_search_hit(&serde_json::json!({"id": 4, "fields": {"title": "second"}}));
+    let merged = merge_revision_refs(vec![first], vec![second]);
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].name(), Some("first"));
 }
 
 #[test]

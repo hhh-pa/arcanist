@@ -257,8 +257,10 @@ pub fn revision_id_from_message(corpus: &str) -> Result<Option<u32>, String> {
             if let Some(id) = uri_revision_id(raw) {
                 return Ok(Some(id));
             }
+            // T1153 RB-D37: the ceb wording names a Phabricator URI
+            // (`src/differential/ArcanistDifferentialCommitMessage.php:139-147`).
             return Err(format!(
-                "Invalid \"Differential Revision\" field in commit message. This field should have a revision identifier like \"D123\" or a server URI like \"https://devtools.example.com/D123\", but has \"{raw}\"."
+                "Invalid \"Differential Revision\" field in commit message. This field should have a revision identifier like \"D123\" or a Phabricator URI like \"https://phabricator.example.com/D123\", but has \"{raw}\"."
             ));
         }
         if line_end == corpus.len() {
@@ -418,7 +420,8 @@ pub fn load_by_ids(
 ///
 /// Mirrors the hardpoint engine merge (`ArcanistObjectListHardpoint`,
 /// queries in class-map order: the git query sorts before the message
-/// query). Refs without a PHID are kept as-is.
+/// query). A missing PHID keys as `""`, so only the first PHID-less
+/// ref is kept (T1153 RB-D15, same rule as RB-D32).
 pub fn merge_revision_refs(
     by_hash: Vec<RevisionRef>,
     by_message: Vec<RevisionRef>,
@@ -426,16 +429,16 @@ pub fn merge_revision_refs(
     let mut merged: Vec<RevisionRef> = Vec::new();
     let mut seen: HashMap<String, ()> = HashMap::new();
     for reference in by_hash.into_iter().chain(by_message) {
-        match reference.phid() {
-            Some(phid) => {
-                if seen.contains_key(phid) {
-                    continue;
-                }
-                seen.insert(phid.to_string(), ());
-                merged.push(reference);
-            }
-            None => merged.push(reference),
+        // T1153 RB-D15: `mergeHardpointValues` keys `$old[$phid]` with a
+        // null PHID as `""`
+        // (`src/hardpoint/ArcanistObjectListHardpoint.php:10-21`), so a
+        // second PHID-less ref loses like any other duplicate.
+        let key = reference.phid().unwrap_or("").to_string();
+        if seen.contains_key(&key) {
+            continue;
         }
+        seen.insert(key, ());
+        merged.push(reference);
     }
     merged
 }
