@@ -1491,74 +1491,106 @@ fn build_export_binary_body(
     render_export_binary_body(old_data.as_deref(), new_data.as_deref())
 }
 
+/// First byte of a hunk corpus line, or NUL for empty lines.
+fn export_hunk_first_byte(line: &str) -> u8 {
+    line.as_bytes().first().copied().unwrap_or(0)
+}
+
+/// Scan forward from `from` for the first added/removed corpus line.
+fn next_export_change_line(lines: &[&str], from: usize) -> Option<usize> {
+    let mut jj = from;
+    while jj < lines.len() {
+        let byte = export_hunk_first_byte(lines[jj]);
+        if byte == b'-' || byte == b'+' {
+            return Some(jj);
+        }
+        jj += 1;
+    }
+    None
+}
+
+/// One scanned hunk span: end offset plus the line counts the header
+/// rebuild needs.
+struct ExportHunkScan {
+    end: usize,
+    old_lines: u64,
+    new_lines: u64,
+    adjust: u64,
+    break_at: Option<usize>,
+}
+
+/// Scan one hunk span from its first change line, counting added /
+/// removed lines and stopping after `context * 2 + 1` trailing
+/// context lines (PHP: `>= ($context * 2 + 1)`).
+fn scan_export_hunk_end(lines: &[&str], from: usize, context: usize) -> ExportHunkScan {
+    let n = lines.len();
+    let mut jj = from;
+    let mut old_lines: u64 = 0;
+    let mut new_lines: u64 = 0;
+    let mut adjust: u64 = 0;
+    let mut last_change = jj;
+    let mut break_here: Option<usize> = None;
+    while jj < n {
+        if export_hunk_first_byte(lines[jj]) == b' ' {
+            if jj - last_change > context && break_here.is_none() {
+                break_here = Some(jj);
+            }
+            if jj - last_change > context * 2 {
+                break;
+            }
+        } else {
+            break_here = None;
+            last_change = jj;
+            match export_hunk_first_byte(lines[jj]) {
+                b'\\' => adjust += 1,
+                b'-' => old_lines += 1,
+                b'+' => new_lines += 1,
+                _ => {}
+            }
+        }
+        jj += 1;
+    }
+    ExportHunkScan {
+        end: jj,
+        old_lines,
+        new_lines,
+        adjust,
+        break_at: break_here,
+    }
+}
+
 /// Break one hunk into small hunks with 3 lines of context
 /// (`breakHunkIntoSmallHunks()`; same algorithm as the verified
 /// `arc patch` port, which lives in a read-only module for this task).
 fn break_export_hunk(base: &crate::diff_local::ParsedHunk) -> Vec<crate::diff_local::ParsedHunk> {
     const CONTEXT: usize = 3;
     let lines: Vec<&str> = base.corpus.split_inclusive('\n').collect();
-    let first_byte = |line: &str| line.as_bytes().first().copied().unwrap_or(0);
     let n = lines.len();
     let mut old_offset = base.old_start;
     let mut new_offset = base.new_start;
     let mut results = Vec::new();
     let mut ii = 0;
     while ii < n {
-        let mut jj = ii;
-        while jj < n {
-            let byte = first_byte(lines[jj]);
-            if byte == b'-' || byte == b'+' {
-                break;
-            }
-            jj += 1;
-        }
-        if jj >= n {
+        let Some(found) = next_export_change_line(&lines, ii) else {
             break;
-        }
-        let hunk_start = jj.saturating_sub(CONTEXT);
-        let mut old_lines: u64 = 0;
-        let mut new_lines: u64 = 0;
-        let mut hunk_adjust: u64 = 0;
-        let mut last_change = jj;
-        let mut break_here: Option<usize> = None;
-        while jj < n {
-            if first_byte(lines[jj]) == b' ' {
-                if jj - last_change > CONTEXT && break_here.is_none() {
-                    break_here = Some(jj);
-                }
-                // PHP: `>= ($context * 2 + 1)`.
-                if jj - last_change > CONTEXT * 2 {
-                    break;
-                }
-            } else {
-                break_here = None;
-                last_change = jj;
-                match first_byte(lines[jj]) {
-                    b'\\' => hunk_adjust += 1,
-                    b'-' => old_lines += 1,
-                    b'+' => new_lines += 1,
-                    _ => {}
-                }
-            }
-            jj += 1;
-        }
-        if let Some(at) = break_here {
-            jj = at;
-        }
+        };
+        let hunk_start = found.saturating_sub(CONTEXT);
+        let scan = scan_export_hunk_end(&lines, found, CONTEXT);
+        let jj = scan.break_at.unwrap_or(scan.end);
         let hunk_length = jj.min(n) - hunk_start;
-        let count_length = hunk_length as u64 - hunk_adjust;
+        let count_length = hunk_length as u64 - scan.adjust;
         let corpus: String = lines[hunk_start..hunk_start + hunk_length].concat();
         // Adjacent hunks share context, so `hunk_start` may precede `ii`.
         let back = ii as i64 - hunk_start as i64;
         results.push(crate::diff_local::ParsedHunk {
             old_start: (old_offset as i64 - back).max(0) as u64,
-            old_len: count_length - new_lines,
+            old_len: count_length - scan.new_lines,
             new_start: (new_offset as i64 - back).max(0) as u64,
-            new_len: count_length - old_lines,
+            new_len: count_length - scan.old_lines,
             corpus,
         });
-        old_offset += (jj - ii) as u64 - new_lines;
-        new_offset += (jj - ii) as u64 - old_lines;
+        old_offset += (jj - ii) as u64 - scan.new_lines;
+        new_offset += (jj - ii) as u64 - scan.old_lines;
         ii = jj;
     }
     results
@@ -1594,16 +1626,11 @@ fn render_export_hunks(hunks: &[crate::diff_local::ParsedHunk]) -> String {
     out
 }
 
-/// Render bundle changes as a git patch (`ArcanistBundle::toGitPatch()`):
-/// rebuilt headers from offsets, 3-line context, tab-suffixed targets, no
-/// `index`/`similarity`/`Binary files` lines (T1153 EXPORT-E6/E8). The
-/// blob loader downloads conduit blobs lazily (`file.download`).
-fn render_export_git_patch(
-    changes: &mut Vec<crate::patch::BundleChange>,
-    load_blob: &BlobLoader<'_>,
-) -> Result<String, String> {
+/// Away-path to change index for binary move/copy sources.
+fn collect_export_binary_sources(
+    changes: &[crate::patch::BundleChange],
+) -> std::collections::BTreeMap<String, usize> {
     use crate::diff_local as types;
-    decompose_export_multicopies(changes)?;
     let mut binary_sources: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
     for (index, change) in changes.iter().enumerate() {
@@ -1620,92 +1647,187 @@ fn render_export_git_patch(
             }
         }
     }
+    binary_sources
+}
+
+/// Away change feeding a binary body, if the current path was claimed
+/// by a move/copy source.
+fn lookup_export_old_binary<'a>(
+    changes: &'a [crate::patch::BundleChange],
+    binary_sources: &std::collections::BTreeMap<String, usize>,
+    change: &crate::patch::BundleChange,
+) -> Option<&'a crate::patch::BundleChange> {
+    let cur = export_current_path(change)?;
+    let away = binary_sources.get(cur).copied()?;
+    Some(&changes[away])
+}
+
+/// True for changes with no patch output at all: directories and
+/// move-away halves.
+fn export_git_has_no_output(change: &crate::patch::BundleChange) -> bool {
+    use crate::diff_local as types;
+    change.file_type == types::FILE_DIRECTORY || change.change_type == types::TYPE_MOVE_AWAY
+}
+
+/// Render one change body: binary literal blocks or rebuilt hunks.
+fn render_export_change_body(
+    change: &crate::patch::BundleChange,
+    old_binary: Option<&crate::patch::BundleChange>,
+    load_blob: &BlobLoader<'_>,
+) -> Result<String, String> {
+    if is_export_binary(change) {
+        build_export_binary_body(change, old_binary, load_blob)
+    } else {
+        Ok(render_export_hunks(&change.hunks))
+    }
+}
+
+/// True for `COPY_AWAY` halves with no body and no mode change, which
+/// carry no output.
+fn is_empty_copy_away(
+    change: &crate::patch::BundleChange,
+    body: &str,
+    old_mode: &str,
+    new_mode: &str,
+) -> bool {
+    use crate::diff_local as types;
+    change.change_type == types::TYPE_COPY_AWAY && body.is_empty() && old_mode == new_mode
+}
+
+/// `diff --git` index lines plus tab-suffixed `---`/`+++` targets
+/// (additions track the new path, deletions the old path).
+fn export_git_index_targets(
+    old_path: Option<&str>,
+    cur_path: Option<&str>,
+) -> (String, String, String, String) {
+    let (old_index, old_target) = match old_path {
+        // `getOldPath()` null (additions): index tracks the new path.
+        None => (
+            format!("a/{}", cur_path.unwrap_or_default()),
+            "/dev/null".to_string(),
+        ),
+        Some(path) => (format!("a/{path}"), format!("a/{path}")),
+    };
+    let (cur_index, cur_target) = match cur_path {
+        None => (
+            format!("b/{}", old_path.unwrap_or_default()),
+            "/dev/null".to_string(),
+        ),
+        Some(path) => (format!("b/{path}"), format!("b/{path}")),
+    };
+    (
+        old_index,
+        cur_index,
+        export_git_target(&old_target),
+        export_git_target(&cur_target),
+    )
+}
+
+/// `new file mode` / `old mode` / `new mode` header lines.
+fn export_git_mode_lines(
+    change: &crate::patch::BundleChange,
+    old_mode: &str,
+    new_mode: &str,
+    out: &mut String,
+) {
+    use crate::diff_local as types;
+    if change.change_type == types::TYPE_ADD {
+        out.push_str(&format!("new file mode {new_mode}\n"));
+    }
+    let change_type = change.change_type;
+    if (change_type == types::TYPE_COPY_HERE
+        || change_type == types::TYPE_MOVE_HERE
+        || change_type == types::TYPE_COPY_AWAY
+        || change_type == types::TYPE_CHANGE)
+        && old_mode != new_mode
+    {
+        out.push_str(&format!("old mode {old_mode}\n"));
+        out.push_str(&format!("new mode {new_mode}\n"));
+    }
+}
+
+/// `copy from/to`, `rename from/to`, and `deleted file mode` lines.
+fn export_git_copy_lines(
+    change: &crate::patch::BundleChange,
+    old_path: Option<&str>,
+    cur_path: Option<&str>,
+    out: &mut String,
+) {
+    use crate::diff_local as types;
+    if change.change_type == types::TYPE_COPY_HERE {
+        out.push_str(&format!(
+            "copy from {}\ncopy to {}\n",
+            old_path.unwrap_or_default(),
+            cur_path.unwrap_or_default()
+        ));
+    } else if change.change_type == types::TYPE_MOVE_HERE {
+        out.push_str(&format!(
+            "rename from {}\nrename to {}\n",
+            old_path.unwrap_or_default(),
+            cur_path.unwrap_or_default()
+        ));
+    } else if change.change_type == types::TYPE_DELETE
+        || change.change_type == types::TYPE_MULTICOPY
+    {
+        // No `100644` default here: the line only prints when the old
+        // properties actually carry a mode.
+        if let Some(mode) = change.old_mode.as_deref().filter(|mode| !mode.is_empty()) {
+            out.push_str(&format!("deleted file mode {mode}\n"));
+        }
+    }
+}
+
+/// Render one change of a git patch, or `None` when it carries no
+/// output. Blob downloads happen before the `COPY_AWAY` skip check,
+/// like PHP.
+fn render_export_git_change(
+    change: &crate::patch::BundleChange,
+    old_binary: Option<&crate::patch::BundleChange>,
+    load_blob: &BlobLoader<'_>,
+) -> Result<Option<String>, String> {
+    if export_git_has_no_output(change) {
+        return Ok(None);
+    }
+    let old_mode = change.old_mode.as_deref().unwrap_or("100644");
+    let new_mode = change.new_mode.as_deref().unwrap_or("100644");
+    let is_binary = is_export_binary(change);
+    let old_path = export_old_path(change);
+    let cur_path = export_current_path(change);
+    let change_body = render_export_change_body(change, old_binary, load_blob)?;
+    if is_empty_copy_away(change, &change_body, old_mode, new_mode) {
+        return Ok(None);
+    }
+    let (old_index, cur_index, old_target, cur_target) =
+        export_git_index_targets(old_path, cur_path);
+    let mut out = format!("diff --git {old_index} {cur_index}\n");
+    export_git_mode_lines(change, old_mode, new_mode, &mut out);
+    export_git_copy_lines(change, old_path, cur_path, &mut out);
+    if !change_body.is_empty() {
+        if !is_binary {
+            out.push_str(&format!("--- {old_target}\n"));
+            out.push_str(&format!("+++ {cur_target}\n"));
+        }
+        out.push_str(&change_body);
+    }
+    Ok(Some(out))
+}
+
+/// Render bundle changes as a git patch (`ArcanistBundle::toGitPatch()`):
+/// rebuilt headers from offsets, 3-line context, tab-suffixed targets, no
+/// `index`/`similarity`/`Binary files` lines (T1153 EXPORT-E6/E8). The
+/// blob loader downloads conduit blobs lazily (`file.download`).
+fn render_export_git_patch(
+    changes: &mut Vec<crate::patch::BundleChange>,
+    load_blob: &BlobLoader<'_>,
+) -> Result<String, String> {
+    decompose_export_multicopies(changes)?;
+    let binary_sources = collect_export_binary_sources(changes);
     let mut result = String::new();
     for index in 0..changes.len() {
         let change = &changes[index];
-        if change.file_type == types::FILE_DIRECTORY {
-            continue;
-        }
-        if change.change_type == types::TYPE_MOVE_AWAY {
-            continue;
-        }
-        let old_mode = change.old_mode.as_deref().unwrap_or("100644");
-        let new_mode = change.new_mode.as_deref().unwrap_or("100644");
-        let is_binary = is_export_binary(change);
-        let old_path = export_old_path(change);
-        let cur_path = export_current_path(change);
-        let old_source = cur_path.and_then(|cur| binary_sources.get(cur).copied());
-        // Blob downloads happen before the `COPY_AWAY` skip check, like PHP.
-        let change_body = if is_binary {
-            let old_binary = old_source.map(|away| &changes[away]);
-            build_export_binary_body(change, old_binary, load_blob)?
-        } else {
-            render_export_hunks(&change.hunks)
-        };
-        if change.change_type == types::TYPE_COPY_AWAY
-            && change_body.is_empty()
-            && old_mode == new_mode
-        {
-            continue;
-        }
-        let (old_index, old_target) = match old_path {
-            // `getOldPath()` null (additions): index tracks the new path.
-            None => (
-                format!("a/{}", cur_path.unwrap_or_default()),
-                "/dev/null".to_string(),
-            ),
-            Some(path) => (format!("a/{path}"), format!("a/{path}")),
-        };
-        let (cur_index, cur_target) = match cur_path {
-            None => (
-                format!("b/{}", old_path.unwrap_or_default()),
-                "/dev/null".to_string(),
-            ),
-            Some(path) => (format!("b/{path}"), format!("b/{path}")),
-        };
-        let old_target = export_git_target(&old_target);
-        let cur_target = export_git_target(&cur_target);
-        result.push_str(&format!("diff --git {old_index} {cur_index}\n"));
-        if change.change_type == types::TYPE_ADD {
-            result.push_str(&format!("new file mode {new_mode}\n"));
-        }
-        let change_type = change.change_type;
-        if (change_type == types::TYPE_COPY_HERE
-            || change_type == types::TYPE_MOVE_HERE
-            || change_type == types::TYPE_COPY_AWAY
-            || change_type == types::TYPE_CHANGE)
-            && old_mode != new_mode
-        {
-            result.push_str(&format!("old mode {old_mode}\n"));
-            result.push_str(&format!("new mode {new_mode}\n"));
-        }
-        if change.change_type == types::TYPE_COPY_HERE {
-            result.push_str(&format!(
-                "copy from {}\ncopy to {}\n",
-                old_path.unwrap_or_default(),
-                cur_path.unwrap_or_default()
-            ));
-        } else if change.change_type == types::TYPE_MOVE_HERE {
-            result.push_str(&format!(
-                "rename from {}\nrename to {}\n",
-                old_path.unwrap_or_default(),
-                cur_path.unwrap_or_default()
-            ));
-        } else if change.change_type == types::TYPE_DELETE
-            || change.change_type == types::TYPE_MULTICOPY
-        {
-            // No `100644` default here: the line only prints when the old
-            // properties actually carry a mode.
-            if let Some(mode) = change.old_mode.as_deref().filter(|mode| !mode.is_empty()) {
-                result.push_str(&format!("deleted file mode {mode}\n"));
-            }
-        }
-        if !change_body.is_empty() {
-            if !is_binary {
-                result.push_str(&format!("--- {old_target}\n"));
-                result.push_str(&format!("+++ {cur_target}\n"));
-            }
-            result.push_str(&change_body);
+        let old_binary = lookup_export_old_binary(changes, &binary_sources, change);
+        if let Some(text) = render_export_git_change(change, old_binary, load_blob)? {
+            result.push_str(&text);
         }
     }
     result.push('\n');
@@ -1801,6 +1923,82 @@ fn render_export_text(
     }
 }
 
+/// Local workcopy diff as decoded patch text.
+fn decode_local_export_diff(
+    dir: &Path,
+    base: &str,
+    encoding: Option<&str>,
+) -> Result<String, String> {
+    let bytes = local_diff_bytes(dir, Format::Git, base)?;
+    reject_empty_diff(&bytes)?;
+    decode_patch(&bytes, encoding)
+}
+
+/// Text export over a local workcopy (T1153 EXPORT-E30: PHP requires
+/// conduit (and queries the author) for ALL local exports, even
+/// `--git`/`--unified`).
+fn execute_local_export_text(
+    dir: &Path,
+    opts: &Options,
+    base: &Option<String>,
+    git: bool,
+) -> Result<String, String> {
+    let client = crate::config::client_for(opts.conduit_uri.as_deref())?;
+    let base = resolve_export_base(dir, base.as_deref())?;
+    let text = decode_local_export_diff(dir, &base, opts.encoding.as_deref())?;
+    let parsed = crate::diff_local::parse_unified_diff(&text)?;
+    let head = resolve_export_head(dir)?;
+    // The author is discarded for text formats, but PHP issues
+    // the query before rendering.
+    viewer_real_name(&client)?;
+    let mut changes = local_render_changes(dir, &base, &head, &parsed);
+    render_export_text(&mut changes, git, &|phid, _| {
+        Err(format!("Nowhere to load blob '{phid}' from!"))
+    })
+}
+
+/// `getBlob($phid, $name)`: download one conduit blob, naming the
+/// file on stderr when known.
+fn download_export_blob(
+    client: &crate::conduit::Client,
+    phid: &str,
+    name: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    match name {
+        Some(text) => eprintln!("Downloading binary data for '{text}'..."),
+        None => eprintln!("Downloading binary data..."),
+    }
+    let result = client
+        .call("file.download", &serde_json::json!({"phid": phid}))
+        .map_err(|e| e.to_string())?;
+    let encoded = result
+        .as_str()
+        .ok_or_else(|| "file.download returned an unexpected response".to_string())?;
+    Ok(lax_base64_decode(encoded))
+}
+
+/// Text export over a conduit diff.
+fn execute_conduit_export_text(
+    opts: &Options,
+    source: &Source,
+    git: bool,
+) -> Result<String, String> {
+    let client = crate::config::client_for(opts.conduit_uri.as_deref())?;
+    let diff = first_diff_dict(&client, &querydiffs_params(source))?;
+    let items = diff
+        .get("changes")
+        .and_then(|changes| changes.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut changes: Vec<crate::patch::BundleChange> =
+        items.iter().map(conduit_render_change).collect();
+    // `getBlob($phid, $name)`: the render path passes the file
+    // basename, so the stderr message names the file.
+    render_export_text(&mut changes, git, &|phid, name| {
+        download_export_blob(&client, phid, name)
+    })
+}
+
 /// [`execute`] over parsed options.
 fn execute_with_opts(dir: &Path, opts: &Options) -> Result<String, String> {
     if let Format::Bundle { path } = &opts.format {
@@ -1808,51 +2006,8 @@ fn execute_with_opts(dir: &Path, opts: &Options) -> Result<String, String> {
     }
     let git = matches!(opts.format, Format::Git);
     match &opts.source {
-        Source::Local { base } => {
-            // T1153 EXPORT-E30: PHP requires conduit (and queries the
-            // author) for ALL local exports, even `--git`/`--unified`.
-            let client = crate::config::client_for(opts.conduit_uri.as_deref())?;
-            let base = resolve_export_base(dir, base.as_deref())?;
-            let bytes = local_diff_bytes(dir, Format::Git, &base)?;
-            reject_empty_diff(&bytes)?;
-            let text = decode_patch(&bytes, opts.encoding.as_deref())?;
-            let parsed = crate::diff_local::parse_unified_diff(&text)?;
-            let head = resolve_export_head(dir)?;
-            // The author is discarded for text formats, but PHP issues
-            // the query before rendering.
-            viewer_real_name(&client)?;
-            let mut changes = local_render_changes(dir, &base, &head, &parsed);
-            render_export_text(&mut changes, git, &|phid, _| {
-                Err(format!("Nowhere to load blob '{phid}' from!"))
-            })
-        }
-        other => {
-            let client = crate::config::client_for(opts.conduit_uri.as_deref())?;
-            let diff = first_diff_dict(&client, &querydiffs_params(other))?;
-            let items = diff
-                .get("changes")
-                .and_then(|changes| changes.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let mut changes: Vec<crate::patch::BundleChange> =
-                items.iter().map(conduit_render_change).collect();
-            // `getBlob($phid, $name)`: the render path passes the file
-            // basename, so the stderr message names the file.
-            let load_blob = |phid: &str, name: Option<&str>| -> Result<Vec<u8>, String> {
-                match name {
-                    Some(text) => eprintln!("Downloading binary data for '{text}'..."),
-                    None => eprintln!("Downloading binary data..."),
-                }
-                let result = client
-                    .call("file.download", &serde_json::json!({"phid": phid}))
-                    .map_err(|e| e.to_string())?;
-                let encoded = result
-                    .as_str()
-                    .ok_or_else(|| "file.download returned an unexpected response".to_string())?;
-                Ok(lax_base64_decode(encoded))
-            };
-            render_export_text(&mut changes, git, &load_blob)
-        }
+        Source::Local { base } => execute_local_export_text(dir, opts, base, git),
+        other => execute_conduit_export_text(opts, other, git),
     }
 }
 

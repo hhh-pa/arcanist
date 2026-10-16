@@ -668,6 +668,83 @@ fn create_target(target: &Path, unique: bool) -> Result<std::fs::File, String> {
     })
 }
 
+/// Fail a streaming download: silence the progress sink and remove
+/// the partial target, returning the error message.
+fn fail_download(sink: &mut Option<ProgressSink>, target: &Path, message: String) -> String {
+    if let Some(sink) = sink.take() {
+        sink.fail();
+    }
+    std::fs::remove_file(target).ok();
+    message
+}
+
+/// Build the HTTP client and fetch one download response, failing on
+/// transport errors and non-2xx statuses.
+fn open_download_response(
+    url: &str,
+    timeout: Duration,
+    sink: &mut Option<ProgressSink>,
+    target: &Path,
+) -> Result<reqwest::blocking::Response, String> {
+    let http = match reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .no_proxy()
+        .build()
+    {
+        Ok(http) => http,
+        Err(e) => return Err(format!("failed to build HTTP client: {e}")),
+    };
+    let response = match http.get(url).send() {
+        Ok(response) => response,
+        Err(e) => {
+            return Err(fail_download(sink, target, format!("download failed: {e}")));
+        }
+    };
+    if !response.status().is_success() {
+        let status = response.status();
+        return Err(fail_download(
+            sink,
+            target,
+            format!("download failed: HTTP {status}"),
+        ));
+    }
+    Ok(response)
+}
+
+/// Pump one response body to `out` in 32 KiB chunks, returning the
+/// bytes written.
+fn pump_download_response(
+    response: &mut reqwest::blocking::Response,
+    out: &mut std::fs::File,
+    sink: &mut Option<ProgressSink>,
+    target: &Path,
+) -> Result<u64, String> {
+    let mut written: u64 = 0;
+    let mut chunk = [0u8; 32 * 1024];
+    loop {
+        match response.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(got) => {
+                if let Err(e) = out.write_all(&chunk[..got]) {
+                    return Err(fail_download(
+                        sink,
+                        target,
+                        format!("failed to write \"{}\": {e}", target.display()),
+                    ));
+                }
+                written += got as u64;
+                if let Some(sink) = sink.as_mut() {
+                    sink.made_progress(got as u64);
+                }
+            }
+            Err(e) => {
+                return Err(fail_download(sink, target, format!("download failed: {e}")));
+            }
+        }
+    }
+    Ok(written)
+}
+
 /// Stream one data URI straight to `target` (`setDownloadPath`),
 /// returning the bytes written.
 ///
@@ -684,30 +761,7 @@ fn download_to_path(
     // T1153 DL-D9: files over 4 MiB draw a progress sink.
     let mut sink = (expected_bytes > PROGRESS_MIN_BYTES)
         .then(|| ProgressSink::new(expected_bytes, stderr_tty));
-    let fail = |sink: Option<ProgressSink>, target: &Path, message: String| {
-        if let Some(sink) = sink {
-            sink.fail();
-        }
-        std::fs::remove_file(target).ok();
-        message
-    };
-    let http = reqwest::blocking::Client::builder()
-        .timeout(timeout)
-        .no_proxy()
-        .build()
-        .map_err(|e| format!("failed to build HTTP client: {e}"))?;
-    let mut response = http
-        .get(url)
-        .send()
-        .map_err(|e| fail(sink.take(), target, format!("download failed: {e}")))?;
-    if !response.status().is_success() {
-        let status = response.status();
-        return Err(fail(
-            sink.take(),
-            target,
-            format!("download failed: HTTP {status}"),
-        ));
-    }
+    let mut response = open_download_response(url, timeout, &mut sink, target)?;
     let mut out = match create_target(target, unique) {
         Ok(file) => file,
         // `setDownloadPath()` throws outside the `removePath` catch,
@@ -719,29 +773,7 @@ fn download_to_path(
             return Err(message);
         }
     };
-    let mut written: u64 = 0;
-    let mut chunk = [0u8; 32 * 1024];
-    loop {
-        match response.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(got) => {
-                if let Err(e) = out.write_all(&chunk[..got]) {
-                    return Err(fail(
-                        sink.take(),
-                        target,
-                        format!("failed to write \"{}\": {e}", target.display()),
-                    ));
-                }
-                written += got as u64;
-                if let Some(sink) = sink.as_mut() {
-                    sink.made_progress(got as u64);
-                }
-            }
-            Err(e) => {
-                return Err(fail(sink.take(), target, format!("download failed: {e}")));
-            }
-        }
-    }
+    let written = pump_download_response(&mut response, &mut out, &mut sink, target)?;
     if let Some(sink) = sink.take() {
         sink.complete();
     }

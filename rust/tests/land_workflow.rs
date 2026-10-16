@@ -135,6 +135,62 @@ fn run_engine(dir: &Path, list: &[&str], answers: &[&str]) -> Result<land::Out, 
 
 /* LAND-6: mock Conduit over HTTP for the online engine flows. */
 
+/// Read one request head (through the blank line) from a mock
+/// connection.
+fn read_mock_head(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        if stream.read_exact(&mut byte).is_err() {
+            break;
+        }
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    head
+}
+
+/// `Content-Length` of a mock request head (either case), else 0.
+fn mock_content_length(head: &str) -> usize {
+    head.lines()
+        .find_map(|line| {
+            line.strip_prefix("Content-Length: ")
+                .or_else(|| line.strip_prefix("content-length: "))
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// Conduit method from a mock request line (`/api/<method>`).
+fn mock_method(head: &str) -> String {
+    head.lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|path| path.strip_prefix("/api/"))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Success envelope for a canned method, or the loud
+/// `ERR-UNKNOWN-METHOD` envelope.
+fn mock_payload(responses: &HashMap<String, serde_json::Value>, method: &str) -> serde_json::Value {
+    match responses.get(method) {
+        Some(result) => serde_json::json!({
+            "error_code": null,
+            "error_info": null,
+            "result": result,
+        }),
+        None => serde_json::json!({
+            "error_code": "ERR-UNKNOWN-METHOD",
+            "error_info": format!("<{method}> no canned response"),
+            "result": null,
+        }),
+    }
+}
+
 /// Serve `responses` (Conduit method -> `result` payload) on a loopback
 /// mock server. Returns the `--conduit-uri` base plus a receiver collecting
 /// one `(method, raw body)` per request. Unknown methods fail loudly with
@@ -153,50 +209,15 @@ fn serve_methods(
                 Ok(stream) => stream,
                 Err(_) => break,
             };
-            let mut head = Vec::new();
-            let mut byte = [0u8; 1];
-            loop {
-                if stream.read_exact(&mut byte).is_err() {
-                    break;
-                }
-                head.push(byte[0]);
-                if head.ends_with(b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let head = String::from_utf8_lossy(&head).to_string();
-            let len: usize = head
-                .lines()
-                .find_map(|line| {
-                    line.strip_prefix("Content-Length: ")
-                        .or_else(|| line.strip_prefix("content-length: "))
-                        .and_then(|v| v.trim().parse().ok())
-                })
-                .unwrap_or(0);
+            let head = String::from_utf8_lossy(&read_mock_head(&mut stream)).to_string();
+            let len = mock_content_length(&head);
             let mut body = vec![0u8; len];
             if stream.read_exact(&mut body).is_err() {
                 continue;
             }
-            let method = head
-                .lines()
-                .next()
-                .and_then(|line| line.split_whitespace().nth(1))
-                .and_then(|path| path.strip_prefix("/api/"))
-                .unwrap_or("")
-                .to_string();
+            let method = mock_method(&head);
             tx.send((method.clone(), body)).ok();
-            let payload = match responses.get(&method) {
-                Some(result) => serde_json::json!({
-                    "error_code": null,
-                    "error_info": null,
-                    "result": result,
-                }),
-                None => serde_json::json!({
-                    "error_code": "ERR-UNKNOWN-METHOD",
-                    "error_info": format!("<{method}> no canned response"),
-                    "result": null,
-                }),
-            };
+            let payload = mock_payload(&responses, &method);
             let text = serde_json::to_string(&payload).unwrap();
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
