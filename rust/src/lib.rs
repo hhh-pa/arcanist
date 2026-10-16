@@ -22,6 +22,7 @@ pub mod get_config;
 pub mod git;
 pub mod globals;
 pub mod grid;
+pub mod help;
 pub mod hg;
 pub mod inspect;
 pub mod install_certificate;

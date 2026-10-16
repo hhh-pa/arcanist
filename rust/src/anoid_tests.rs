@@ -33,16 +33,34 @@ impl Drop for TempDir {
 
 #[test]
 fn parses_empty_and_help() {
-    assert_eq!(parse_args(&args(&[])), Ok(Some(())));
-    assert_eq!(parse_args(&args(&["--help"])), Ok(None));
-    assert_eq!(parse_args(&args(&["-h"])), Ok(None));
+    // T1153 BROWSE-B21: TTY runs need no `--`; piped runs do.
+    assert_eq!(parse_args_with_tty(&args(&[]), true), Ok(Some(())));
+    assert_eq!(
+        parse_args_with_tty(&args(&[]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    assert_eq!(parse_args_with_tty(&args(&["--"]), false), Ok(Some(())));
+    assert_eq!(parse_args_with_tty(&args(&["--help"]), true), Ok(None));
+    assert_eq!(
+        parse_args_with_tty(&args(&["--help", "--"]), false),
+        Ok(None)
+    );
+    assert_eq!(parse_args_with_tty(&args(&["-h", "--"]), false), Ok(None));
 }
 
 #[test]
 fn rejects_arguments_and_flags() {
-    assert!(parse_args(&args(&["extra"])).is_err());
-    assert!(parse_args(&args(&["--bogus"])).is_err());
-    assert!(parse_args(&args(&["--"])).is_err());
+    // Unknown flags and positionals report before the terminator
+    // check (like PHP's `parseFull`); `--help` without `--` when
+    // piped reports the terminator; `--help` after `--` is a
+    // positional.
+    assert!(parse_args_with_tty(&args(&["extra", "--"]), false).is_err());
+    assert!(parse_args_with_tty(&args(&["--bogus"]), false).is_err());
+    assert_eq!(
+        parse_args_with_tty(&args(&["--help"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    assert!(parse_args_with_tty(&args(&["--", "--help"]), false).is_err());
 }
 
 #[test]
@@ -110,7 +128,11 @@ fn passthru_maps_status_and_reports_spawn_failures() {
 
 #[test]
 fn run_reports_help_and_usage_errors() {
-    assert_eq!(run(&args(&["--help"])), std::process::ExitCode::SUCCESS);
+    // T1153 BROWSE-B21: piped runs carry `--`.
+    assert_eq!(
+        run(&args(&["--help", "--"])),
+        std::process::ExitCode::SUCCESS
+    );
     assert_eq!(run(&args(&["--bogus"])), std::process::ExitCode::FAILURE);
 }
 
@@ -118,15 +140,35 @@ fn run_reports_help_and_usage_errors() {
 fn run_in_fails_without_python_or_script() {
     // Either precondition may fail depending on the machine, but a bare temp
     // dir (no support/ tree) can never launch the probe.
+    // T1153 BROWSE-B21: piped runs carry `--`.
     let tmp = TempDir::new("missing");
     assert_eq!(
-        run_in(tmp.path(), &args(&[])),
+        run_in(tmp.path(), &args(&["--"])),
         std::process::ExitCode::FAILURE
     );
     assert_eq!(
-        run_in(tmp.path(), &args(&["--help"])),
+        run_in(tmp.path(), &args(&["--help", "--"])),
         std::process::ExitCode::SUCCESS
     );
+}
+
+#[test]
+fn b23_help_matches_generated_format() {
+    // T1153 BROWSE-B23: `--help` renders the generated workflow help
+    // (`ArcanistAnoidWorkflow.php:11-23`), byte-identical to
+    // `arc help anoid`.
+    assert_eq!(
+        usage_text(false),
+        "ANOID WORKFLOW\n\
+         \n\
+         anoid\n\
+         Pilot a probe from the vessel \"Arcanoid\".\n\
+         \n\
+         Take control of a probe launched from the science vessel \"Arcanoid\".\n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
 
 #[test]

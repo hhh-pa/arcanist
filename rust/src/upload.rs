@@ -28,68 +28,48 @@ const TEMPORARY_TTL_SECS: u64 = 24 * 60 * 60;
 
 /// T1153 BROWSE-B23: `--help` renders the generated workflow help
 /// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
-/// not a short custom usage string.
+/// not a short custom usage string. T1153 RB-D5: the renderer is the
+/// shared `crate::help` module; this file keeps only the data.
 const HELP_EXAMPLES: &str = "**upload** [__options__] -- __file__ [__file__ ...]";
 const HELP_SYNOPSIS: &str = "Upload files.";
 const HELP_TEXT: &str = "Upload one or more files from local disk to Phabricator.";
-/// Non-wildcard argument specs in `msort` order: (name, param, help).
-const HELP_SPECS: &[(&str, Option<&str>, &str)] = &[
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[
     (
         "browse",
         None,
+        None,
         "After the upload completes, open the files in a web browser.",
     ),
-    ("json", None, "Output upload information in JSON format."),
+    (
+        "json",
+        None,
+        None,
+        "Output upload information in JSON format.",
+    ),
     (
         "temporary",
+        None,
         None,
         "Mark the file as temporary. Temporary files will be deleted after 24 hours.",
     ),
 ];
 
-/// `PhutilArgumentParser::indent()`: interpret markup, then wrap.
-fn help_indent(level: usize, text: &str, ansi: bool) -> String {
-    crate::terminal::console_wrap(
-        &crate::terminal::console_format(text, &[], ansi),
-        level,
-        true,
-    )
-}
-
-/// `renderArgumentSpecs()` for the workflow arguments.
-fn help_specs(ansi: bool) -> String {
-    let mut out: Vec<String> = Vec::new();
-    for (name, param, help) in HELP_SPECS {
-        let mut first = help_indent(6, &format!("__--{name}__"), ansi);
-        if let Some(param) = param {
-            first.push_str(&crate::terminal::console_format(
-                &format!(" __{param}__"),
-                &[],
-                ansi,
-            ));
-        }
-        out.push(first);
-        out.push(help_indent(10, help, ansi));
-        out.push(String::new());
-    }
-    out.join("\n")
-}
-
-/// The full `--help` text: `**UPLOAD WORKFLOW**` header plus the
-/// detailed workflow help and a trailing blank line.
+/// The full `--help` text via the shared renderer.
 fn usage_text(ansi: bool) -> String {
-    let header = crate::terminal::console_format("**%s**\n\n", &["UPLOAD WORKFLOW"], ansi);
-    let body = [
-        help_indent(0, HELP_EXAMPLES, ansi),
-        help_indent(0, HELP_SYNOPSIS, ansi),
-        String::new(),
-        help_indent(0, HELP_TEXT, ansi),
-        String::new(),
-        help_specs(ansi),
-        String::new(),
-    ]
-    .join("\n");
-    format!("{header}{body}\n")
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &specs,
+        ansi,
+    )
 }
 
 fn usage() -> String {
@@ -219,56 +199,8 @@ impl Parser {
     }
 }
 
-/// T1153 BROWSE-B21: noninteractive runs must carry `--`
-/// (`ArcanistRuntime.php:80-86`, enforced by
-/// `PhutilArgumentParser::parseFull()`). Any standalone `--` token
-/// satisfies PHP: the standard-arguments scan that records it never
-/// consumes workflow flag values.
-fn terminator_missing(argv: &[String], stdin_tty: bool) -> bool {
-    !stdin_tty && !argv.iter().any(|arg| arg == "--")
-}
-
-const MISSING_TERMINATOR: &str = "Missing required \"--\" in argument list.";
-
-/// The three cyan `USAGE` hints PHP prints before the terminator
-/// error (`ArcanistRuntime.php:172-188`), on stderr like PHP.
-fn print_terminator_hints(ansi: bool) {
-    use crate::terminal::{PhtArg, TVal};
-    let usage = crate::terminal::pht("USAGE", &[]);
-    for hint in [
-        crate::terminal::pht(
-            "\"%s\" is being run noninteractively, but the argument list is missing \"--\" to indicate end of flags.",
-            &[PhtArg::Text("arc")],
-        ),
-        crate::terminal::pht(
-            "When running noninteractively, you MUST provide \"--\" to all commands (even if they take no arguments).",
-            &[],
-        ),
-    ] {
-        eprint!(
-            "{}",
-            crate::terminal::format_log("cyan", &usage, &hint, ansi)
-        );
-    }
-    // `tsprintf('%s <__%s__>', ...)` nested like PHP: the inner line
-    // passes through the outer `%s` unescaped (`TVal::Terminal`).
-    let inner = crate::terminal::tsprintf_ansi(
-        "%s <__%s__>",
-        &[
-            TVal::Text(&crate::terminal::pht("Learn More:", &[])),
-            TVal::Text("https://phurl.io/u/noninteractive"),
-        ],
-        ansi,
-    )
-    .expect("fixed tsprintf pattern");
-    let line = crate::terminal::tsprintf_ansi(
-        "**<bg:cyan> %s </bg>** %s\n",
-        &[TVal::Text(&usage), TVal::Terminal(&inner)],
-        ansi,
-    )
-    .expect("fixed tsprintf pattern");
-    eprint!("{}", line.as_str());
-}
+// T1153 RB-D5: terminator gate lives in the shared `crate::help`
+// renderer; this module calls it directly.
 
 fn parse_args(argv: &[String]) -> ParseOutcome {
     parse_args_with_tty(argv, crate::prompt::stdin_is_terminal())
@@ -276,7 +208,7 @@ fn parse_args(argv: &[String]) -> ParseOutcome {
 
 /// [`parse_args`] with an injected TTY flag (deterministic tests).
 fn parse_args_with_tty(argv: &[String], stdin_tty: bool) -> ParseOutcome {
-    let missing = terminator_missing(argv, stdin_tty);
+    let missing = crate::help::terminator_missing(argv, stdin_tty);
     let mut parser = Parser::new();
     let mut iter = argv.iter();
     while let Some(arg) = iter.next() {
@@ -1077,7 +1009,9 @@ fn execute_parts(dir: &Path, argv: &[String]) -> Result<UploadParts, String> {
                 browse: false,
             });
         }
-        ParseOutcome::MissingTerminator => return Err(MISSING_TERMINATOR.to_string()),
+        ParseOutcome::MissingTerminator => {
+            return Err(crate::help::MISSING_TERMINATOR.to_string());
+        }
         // T1153 R4 (UPLOAD-U15): PHP renders usage errors with no dump.
         ParseOutcome::Error(message) => return Err(message),
     };
@@ -1131,8 +1065,8 @@ pub fn run_in_with_sink(dir: &Path, argv: &[String], sink: &mut dyn FnMut(&str))
             // EXCEPTION` label (exit 1); aggregate and resolve errors
             // are uncaught `Exception`s: fatal (255)
             // (`ArcanistUploadWorkflow.php:43,77-93`).
-            if message == MISSING_TERMINATOR {
-                print_terminator_hints(crate::terminal::ansi_enabled());
+            if message == crate::help::MISSING_TERMINATOR {
+                crate::help::print_terminator_hints(crate::terminal::ansi_enabled());
             }
             let kind = if matches!(
                 parse_args(argv),

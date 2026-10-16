@@ -29,33 +29,70 @@ pub const NAME: &str = "version";
 /// Library label in the version line (PHP's `$roots` key, `:44`).
 pub const LIBRARY: &str = "arcanist";
 
+/// T1153 BROWSE-B23: `--help` renders the generated workflow help
+/// (`ArcanistVersionWorkflow.php:16-29`), not a short custom usage
+/// string. T1153 RB-D5: the renderer is the shared `crate::help`
+/// module; this file keeps only the data.
+const HELP_EXAMPLES: &str = "**version**";
+const HELP_SYNOPSIS: &str = "Show toolset version information.";
+const HELP_TEXT: &str = "Shows the current version.";
+/// Non-wildcard argument specs: (name, short, param, help). Empty:
+/// `getWorkflowArguments()` returns no arguments (`:30-32`).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &specs,
+        ansi,
+    )
+}
+
 fn usage() -> String {
-    "usage: arc version\n\
-     \n\
-     Show toolset version information.\n\
-     \n\
-     Shows the current version.\n\
-     \n\
-     Options:\n\
-     \x20 -h, --help    Show this help.\n"
-        .to_string()
+    usage_text(crate::terminal::ansi_enabled())
 }
 
 /// Parse `argv` (excluding the subcommand name); `Ok(None)` requests help.
 pub fn parse_args(argv: &[String]) -> Result<Option<()>, String> {
-    let Some(first) = argv.first() else {
-        return Ok(Some(()));
-    };
-    if first == "-h" || first == "--help" {
-        return Ok(None);
+    parse_args_with_tty(argv, crate::prompt::stdin_is_terminal())
+}
+
+/// [`parse_args`] with an injected TTY flag (deterministic tests).
+/// T1153 BROWSE-B21: piped runs without `--` fail with
+/// `MISSING_TERMINATOR` (checked after unknown-flag scanning, like
+/// PHP's `parseFull()`). A lone `--` is the terminator (accepted).
+fn parse_args_with_tty(argv: &[String], stdin_tty: bool) -> Result<Option<()>, String> {
+    let missing = crate::help::terminator_missing(argv, stdin_tty);
+    let mut terminated = false;
+    for arg in argv {
+        if !terminated && arg == "--" {
+            terminated = true;
+            continue;
+        }
+        if !terminated && (arg == "-h" || arg == "--help") {
+            if missing {
+                return Err(crate::help::MISSING_TERMINATOR.to_string());
+            }
+            return Ok(None);
+        }
+        if !terminated && arg.starts_with('-') && arg.len() > 1 {
+            return Err(format!("unknown flag '{arg}'"));
+        }
+        return Err(format!("unexpected argument '{arg}'"));
     }
-    if first == "--" {
-        return Err("unexpected argument '--': version takes no arguments".to_string());
+    if missing {
+        return Err(crate::help::MISSING_TERMINATOR.to_string());
     }
-    if first.starts_with('-') {
-        return Err(format!("unknown flag '{first}'"));
-    }
-    Err(format!("unexpected argument '{first}'"))
+    Ok(Some(()))
 }
 
 /// True when a `git` binary is on the real `$PATH`
@@ -217,6 +254,15 @@ pub fn run_in(tool_dir: &Path, argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(message) => {
+            // T1153 BROWSE-B21: the terminator failure prints the three
+            // cyan hints, then reports through the toolset usage arm.
+            if message == crate::help::MISSING_TERMINATOR {
+                crate::help::print_terminator_hints(crate::terminal::ansi_enabled());
+                return crate::conduit::report(
+                    crate::conduit::EnvelopeKind::ToolsetUsage,
+                    &message,
+                );
+            }
             eprintln!("arc {NAME}: {message}\n\n{}", usage());
             return ExitCode::FAILURE;
         }

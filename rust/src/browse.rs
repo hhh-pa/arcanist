@@ -46,7 +46,8 @@ pub const ABORT: &str = "User aborted the workflow.";
 
 /// T1153 BROWSE-B23: `--help` renders the generated workflow help
 /// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
-/// not a short custom usage string.
+/// not a short custom usage string. T1153 RB-D5: the renderer is the
+/// shared `crate::help` module; this file keeps only the data.
 const HELP_EXAMPLES: &str = "**browse** [options] -- __target__ ...\n\
      **browse** -- __file-name__\n\
      **browse** -- __object-name__";
@@ -62,124 +63,59 @@ const HELP_TEXT: &str = "Open a file or object (like a task or revision) in a lo
      \x20 $ arc set-config browser __browser-binary__\n\
      \n\
      If no browser is set, the command will try to guess which browser to use.";
-/// Non-wildcard argument specs in `msort` order: (name, param, help).
-const HELP_SPECS: &[(&str, Option<&str>, &str)] = &[
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[
     (
         "branch",
+        None,
         Some("branch-name"),
         "Default branch name to view on server. Defaults to \"master\".",
     ),
     (
         "force",
         None,
+        None,
         "(DEPRECATED) Obsolete, use \"--types path\" instead.",
     ),
     (
         "types",
+        None,
         Some("type-list"),
         "Force targets to be interpreted as naming particular types of resources.",
     ),
 ];
 
-/// `PhutilArgumentParser::indent()`: interpret markup, then wrap.
-fn help_indent(level: usize, text: &str, ansi: bool) -> String {
-    terminal::console_wrap(&terminal::console_format(text, &[], ansi), level, true)
-}
-
-/// `renderArgumentSpecs()` for the workflow arguments.
-fn help_specs(ansi: bool) -> String {
-    let mut out: Vec<String> = Vec::new();
-    for (name, param, help) in HELP_SPECS {
-        let mut first = help_indent(6, &format!("__--{name}__"), ansi);
-        if let Some(param) = param {
-            first.push_str(&terminal::console_format(
-                &format!(" __{param}__"),
-                &[],
-                ansi,
-            ));
-        }
-        out.push(first);
-        out.push(help_indent(10, help, ansi));
-        out.push(String::new());
-    }
-    out.join("\n")
-}
-
-/// The full `--help` text: `**BROWSE WORKFLOW**` header plus the
-/// detailed workflow help and a trailing blank line.
+/// The full `--help` text via the shared renderer.
 fn help_text(ansi: bool) -> String {
-    let header = terminal::console_format("**%s**\n\n", &["BROWSE WORKFLOW"], ansi);
-    let body = [
-        help_indent(0, HELP_EXAMPLES, ansi),
-        help_indent(0, HELP_SYNOPSIS, ansi),
-        String::new(),
-        help_indent(0, HELP_TEXT, ansi),
-        String::new(),
-        help_specs(ansi),
-        String::new(),
-    ]
-    .join("\n");
-    format!("{header}{body}\n")
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &specs,
+        ansi,
+    )
 }
 
-/// T1153 BROWSE-B21: noninteractive runs must carry `--`
-/// (`ArcanistRuntime.php:80-86`, enforced by
-/// `PhutilArgumentParser::parseFull()`). Any standalone `--` token
-/// satisfies PHP: the standard-arguments scan that records it never
-/// consumes workflow flag values.
-fn terminator_missing(argv: &[String], stdin_tty: bool) -> bool {
-    !stdin_tty && !argv.iter().any(|arg| arg == "--")
-}
-
-const MISSING_TERMINATOR: &str = "Missing required \"--\" in argument list.";
+// T1153 RB-D5: terminator gate lives in the shared `crate::help`
+// renderer; this module calls it directly.
 
 /// The terminator failure (hints plus the toolset usage error), or
 /// `None` when the invocation may proceed.
 fn terminator_exit(argv: &[String], stdin_tty: bool) -> Option<ExitCode> {
-    if !terminator_missing(argv, stdin_tty) {
+    if !crate::help::terminator_missing(argv, stdin_tty) {
         return None;
     }
-    print_terminator_hints(terminal::ansi_enabled());
+    crate::help::print_terminator_hints(terminal::ansi_enabled());
     Some(conduit::report(
         EnvelopeKind::ToolsetUsage,
-        MISSING_TERMINATOR,
+        crate::help::MISSING_TERMINATOR,
     ))
-}
-
-/// The three cyan `USAGE` hints PHP prints before the terminator
-/// error (`ArcanistRuntime.php:172-188`), on stderr like PHP.
-fn print_terminator_hints(ansi: bool) {
-    let usage = terminal::pht("USAGE", &[]);
-    for hint in [
-        terminal::pht(
-            "\"%s\" is being run noninteractively, but the argument list is missing \"--\" to indicate end of flags.",
-            &[PhtArg::Text("arc")],
-        ),
-        terminal::pht(
-            "When running noninteractively, you MUST provide \"--\" to all commands (even if they take no arguments).",
-            &[],
-        ),
-    ] {
-        eprint!("{}", terminal::format_log("cyan", &usage, &hint, ansi));
-    }
-    // `tsprintf('%s <__%s__>', ...)` nested like PHP: the inner line
-    // passes through the outer `%s` unescaped (`TVal::Terminal`).
-    let inner = terminal::tsprintf_ansi(
-        "%s <__%s__>",
-        &[
-            TVal::Text(&terminal::pht("Learn More:", &[])),
-            TVal::Text("https://phurl.io/u/noninteractive"),
-        ],
-        ansi,
-    )
-    .expect("fixed tsprintf pattern");
-    let line = terminal::tsprintf_ansi(
-        "**<bg:cyan> %s </bg>** %s\n",
-        &[TVal::Text(&usage), TVal::Terminal(&inner)],
-        ansi,
-    )
-    .expect("fixed tsprintf pattern");
-    eprint!("{}", line.as_str());
 }
 
 /// Parsed command line.

@@ -1023,11 +1023,14 @@ fn browse_b18_hash_match_compares_type_and_value() {
 
 #[test]
 fn browse_b21_terminator_required_when_piped() {
-    assert!(terminator_missing(&argv(&["HEAD"]), false));
-    assert!(!terminator_missing(&argv(&["--", "HEAD"]), false));
-    assert!(!terminator_missing(&argv(&["HEAD"]), true));
+    assert!(crate::help::terminator_missing(&argv(&["HEAD"]), false));
+    assert!(!crate::help::terminator_missing(
+        &argv(&["--", "HEAD"]),
+        false
+    ));
+    assert!(!crate::help::terminator_missing(&argv(&["HEAD"]), true));
     assert_eq!(
-        MISSING_TERMINATOR,
+        crate::help::MISSING_TERMINATOR,
         "Missing required \"--\" in argument list."
     );
     // The failure renders toolset usage (exit 1); `--` proceeds.

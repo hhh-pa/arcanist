@@ -6,19 +6,20 @@ fn args(list: &[&str]) -> Vec<String> {
 
 #[test]
 fn parses_files_and_seed() {
+    // T1153 BROWSE-B21: TTY runs need no `--`.
     assert_eq!(
-        parse_options(&args(&["a.txt", "b.txt"])),
+        parse_options_with_tty(&args(&["a.txt", "b.txt"]), true),
         Ok(Some(Options {
             files: vec!["a.txt".to_string(), "b.txt".to_string()],
             seed: None,
         }))
     );
-    let options = parse_options(&args(&["--seed", "42", "--", "a.txt", "b.txt"]))
+    let options = parse_options_with_tty(&args(&["--seed", "42", "--", "a.txt", "b.txt"]), true)
         .unwrap()
         .unwrap();
     assert_eq!(options.seed, Some(42));
     assert_eq!(options.files.len(), 2);
-    let options = parse_options(&args(&["--seed=7", "a.txt", "b.txt"]))
+    let options = parse_options_with_tty(&args(&["--seed=7", "a.txt", "b.txt"]), true)
         .unwrap()
         .unwrap();
     assert_eq!(options.seed, Some(7));
@@ -26,7 +27,7 @@ fn parses_files_and_seed() {
 
 #[test]
 fn separator_keeps_dashed_files() {
-    let options = parse_options(&args(&["--", "--weird", "-x"]))
+    let options = parse_options_with_tty(&args(&["--", "--weird", "-x"]), false)
         .unwrap()
         .unwrap();
     assert_eq!(options.files, vec!["--weird".to_string(), "-x".to_string()]);
@@ -34,17 +35,34 @@ fn separator_keeps_dashed_files() {
 
 #[test]
 fn help_returns_none() {
-    assert_eq!(parse_options(&args(&["--help"])), Ok(None));
-    assert_eq!(parse_options(&args(&["-h"])), Ok(None));
+    // T1153 BROWSE-B21: `--help` needs `--` when piped.
+    assert_eq!(
+        parse_options_with_tty(&args(&["--help", "--"]), false),
+        Ok(None)
+    );
+    assert_eq!(
+        parse_options_with_tty(&args(&["-h", "--"]), false),
+        Ok(None)
+    );
+    assert_eq!(
+        parse_options_with_tty(&args(&["--help"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
 }
 
 #[test]
 fn rejects_bad_arguments() {
-    let err = parse_options(&args(&["--bogus", "a", "b"])).unwrap_err();
+    // Unknown flags report before the terminator check.
+    let err = parse_options_with_tty(&args(&["--bogus", "a", "b"]), false).unwrap_err();
     assert!(err.contains("unknown flag"), "unexpected: {err}");
-    assert!(parse_options(&args(&["--seed"])).is_err());
-    let err = parse_options(&args(&["--seed=abc", "a", "b"])).unwrap_err();
+    assert!(parse_options_with_tty(&args(&["--seed", "--"]), false).is_err());
+    let err = parse_options_with_tty(&args(&["--seed=abc", "a", "b", "--"]), false).unwrap_err();
     assert!(err.contains("invalid --seed"), "unexpected: {err}");
+    // Piped without `--` reports the terminator.
+    assert_eq!(
+        parse_options_with_tty(&args(&["a.txt", "b.txt"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
 }
 
 #[test]
@@ -166,10 +184,23 @@ fn terminator_prefers_the_later_line() {
 
 #[test]
 fn usage_covers_files_and_seed() {
-    let text = usage();
-    assert!(text.contains("usage: arc weld"));
-    assert!(text.contains("<file>"));
-    assert!(text.contains("--seed"));
+    // T1153 BROWSE-B23: `--help` renders the generated workflow help
+    // (no `--seed`: the Rule 3 extension stays undocumented, like PHP).
+    let text = usage_text(false);
+    assert_eq!(
+        text,
+        "WELD WORKFLOW\n\
+         \n\
+         weld [options] -- file file ...\n\
+         Robustly fuse files together.\n\
+         \n\
+         Robustly fuse two or more files together. The resulting joint is much\n\
+         stronger than the one created by tools like cat.\n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
 }
 #[test]
 fn weld_line_bytes_fuses_invalid_utf8_bytewise() {
@@ -209,14 +240,15 @@ fn weld_buffers_skips_empty_and_is_deterministic() {
 fn r4_core49_weld_usage_has_no_dump() {
     // Fewer than two files is toolset usage (exit 1, matching the
     // old exit) with no usage dump; read failures are fatal.
-    match execute(&std::env::temp_dir(), &args(&["only"])) {
+    // T1153 BROWSE-B21: piped runs carry `--`.
+    match execute(&std::env::temp_dir(), &args(&["only", "--"])) {
         Err(message) => {
             assert_eq!(message, "Specify two or more files to weld together.");
         }
         _ => panic!("expected usage error"),
     }
     assert_eq!(
-        run_in(&std::env::temp_dir(), &args(&["only"])),
+        run_in(&std::env::temp_dir(), &args(&["only", "--"])),
         std::process::ExitCode::FAILURE
     );
 }

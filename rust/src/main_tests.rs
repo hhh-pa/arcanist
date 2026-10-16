@@ -341,15 +341,16 @@ fn help_unknown_name_succeeds_with_no_workflow_message() {
 
 #[test]
 fn workflow_header_and_no_workflow_line_match_php() {
-    assert_eq!(workflow_header("bogus", false), "BOGUS WORKFLOW");
+    // T1153 RB-D5: header helpers live in the shared `help` renderer.
+    assert_eq!(help::workflow_header("bogus", false), "BOGUS WORKFLOW");
     assert_eq!(
-        no_workflow_line("bogus", false),
+        help::no_workflow_line("bogus", false),
         "There is no bogus workflow."
     );
     // Bold markers are interpreted on TTYs (exact ANSI bytes are
     // covered by the terminal console-format tests).
-    assert!(workflow_header("bogus", true).contains('\x1b'));
-    assert!(no_workflow_line("bogus", true).contains('\x1b'));
+    assert!(help::workflow_header("bogus", true).contains('\x1b'));
+    assert!(help::no_workflow_line("bogus", true).contains('\x1b'));
 }
 
 #[test]
@@ -542,6 +543,32 @@ fn core20_detailed_help_matches_php_layout() {
     assert!(text.contains("--add-all, -a"));
     assert!(text.contains("Automatically add all unstaged"));
     assert!(text.ends_with('\n'));
+}
+
+#[test]
+fn r10_browse_help_matches_ceb_bytes() {
+    // T1153 R10: `arc help browse` renders the ceb workflow help
+    // (`src/browse/workflow/ArcanistBrowseWorkflow.php:13-60`), not
+    // the Rust-extended resolver text. Byte-identical to the
+    // per-command `--help` (`browse::help_text`).
+    let text = render_workflow_help("browse", true, false);
+    assert!(
+        text.contains("browse [options] -- target ...\n"),
+        "{text:?}"
+    );
+    assert!(text.contains("browse -- file-name\n"), "{text:?}");
+    assert!(
+        text.contains("Open a file or object in a local web browser."),
+        "{text:?}"
+    );
+    assert!(text.contains("$ arc browse README"), "{text:?}");
+    assert!(text.contains("--branch branch-name\n"), "{text:?}");
+    assert!(
+        text.contains("Default branch name to view on server."),
+        "{text:?}"
+    );
+    assert!(text.contains("--types type-list\n"), "{text:?}");
+    assert!(text.contains("(DEPRECATED) Obsolete"), "{text:?}");
 }
 
 #[test]

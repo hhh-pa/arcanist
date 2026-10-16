@@ -13,18 +13,39 @@ use crate::conduit::{self, EnvelopeKind};
 
 pub const NAME: &str = "weld";
 
-fn usage() -> String {
-    format!(
-        "usage: arc {NAME} [options] -- <file> <file> [...]\n\
-         \n\
-         Robustly fuse two or more files together. Files are concatenated\n\
-         with a randomly blended overlap region; empty files are skipped.\n\
-         \n\
-         Options:\n\
-         \x20 --seed N       deterministic output from seed N (arc extension;\n\
-         \x20                PHP welds randomly and has no equivalent)\n\
-         \x20 -h, --help     show this help\n"
+/// T1153 BROWSE-B23: `--help` renders the generated workflow help
+/// (`ArcanistWeldWorkflow.php:11-23`), not a short custom usage
+/// string. T1153 RB-D5: the renderer is the shared `crate::help`
+/// module; this file keeps only the data. The `--seed` extension
+/// (Rule 3: `mt_rand` streams are unportable) stays functional but
+/// undocumented in `--help`, like PHP.
+const HELP_EXAMPLES: &str = "**weld** [options] -- __file__ __file__ ...";
+const HELP_SYNOPSIS: &str = "Robustly fuse files together.";
+const HELP_TEXT: &str = "Robustly fuse two or more files together. The resulting joint is much stronger\nthan the one created by tools like __cat__.";
+/// Non-wildcard argument specs: (name, short, param, help). Empty:
+/// the only argument is the `files` wildcard (`:25-28`), which
+/// `renderArgumentSpecs()` skips.
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &specs,
+        ansi,
     )
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
 }
 
 /// Parsed `weld` options.
@@ -43,6 +64,17 @@ fn parse_seed(text: &str) -> Result<u64, String> {
 ///
 /// Returns `Ok(None)` when `--help` was requested.
 pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
+    parse_options_with_tty(argv, crate::prompt::stdin_is_terminal())
+}
+
+/// [`parse_options`] with an injected TTY flag (deterministic tests).
+/// T1153 BROWSE-B21: piped runs without `--` fail with
+/// `MISSING_TERMINATOR` (checked after unknown-flag scanning, like
+/// PHP's `parseFull()`, but before the file-count validation in
+/// `execute`). `--help` without `--` when piped reports the
+/// terminator.
+fn parse_options_with_tty(argv: &[String], stdin_tty: bool) -> Result<Option<Options>, String> {
+    let missing = crate::help::terminator_missing(argv, stdin_tty);
     let mut files = Vec::new();
     let mut seed = None;
     let mut end_of_flags = false;
@@ -60,12 +92,18 @@ pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
         } else if let Some(value) = arg.strip_prefix("--seed=") {
             seed = Some(parse_seed(value)?);
         } else if arg == "-h" || arg == "--help" {
+            if missing {
+                return Err(crate::help::MISSING_TERMINATOR.to_string());
+            }
             return Ok(None);
         } else if arg.starts_with('-') {
             return Err(format!("unknown flag '{arg}'"));
         } else {
             files.push(arg.clone());
         }
+    }
+    if missing {
+        return Err(crate::help::MISSING_TERMINATOR.to_string());
     }
     Ok(Some(Options { files, seed }))
 }
@@ -350,6 +388,11 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
+            // T1153 BROWSE-B21: the terminator failure prints the three
+            // cyan hints first (like `ArcanistRuntime.php:172-188`).
+            if message == crate::help::MISSING_TERMINATOR {
+                crate::help::print_terminator_hints(crate::terminal::ansi_enabled());
+            }
             // T1153 R4 (CORE-49): `weld` is a toolset workflow.
             // Argument errors render the red `USAGE EXCEPTION` label
             // (exit 1, matching the old exit); read failures escape

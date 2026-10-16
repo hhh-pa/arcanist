@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 use arc_rs::{
     alias, amend, anoid, argparse, bookmarks, branches, browse, close_revision, commit, conduit,
-    config, cover, diff, download, export, get_config, inspect, install_certificate, land,
+    config, cover, diff, download, export, get_config, help, inspect, install_certificate, land,
     liberate, lint, linters, list, look, markers, paste, patch, prompts, set_config,
     shell_complete, tasks, terminal, todo, unit, upgrade, upload, version, weld, which, work,
 };
@@ -333,23 +333,9 @@ fn find_command_ci(name: &str) -> Option<CommandFn> {
         .map(|(_, run)| *run)
 }
 
-/// `**NAME WORKFLOW**` header from `PhutilHelpArgumentWorkflow`
-/// (`'%s WORKFLOW'`, uppercased name), console-formatted.
-fn workflow_header(name: &str, ansi: bool) -> String {
-    terminal::console_format(
-        "**%s**",
-        &[&format!("{} WORKFLOW", name.to_uppercase())],
-        ansi,
-    )
-}
-
-/// `There is no ... workflow.` body from `renderWorkflowHelp`
-/// (shown when `help <name>` names nothing known), console-formatted.
-fn no_workflow_line(name: &str, ansi: bool) -> String {
-    terminal::console_format("There is no **%s** workflow.", &[name], ansi)
-}
-
 /* -(  Global arguments  )---------------------------------------------- */
+// T1153 RB-D5: `workflow_header`/`no_workflow_line` live in the shared
+// `help` renderer (`arc_rs::help`); call sites below use it directly.
 
 /// Classic (old-style) workflow names at ceb: everything concrete
 /// which is not in the toolset set. In-process these run the same
@@ -1032,31 +1018,49 @@ const HELP_ENTRIES: &[HelpEntry] = &[
         args: &[],
     },
     HelpEntry {
+        // T1153 R10: fixed to the ceb bytes
+        // (`src/browse/workflow/ArcanistBrowseWorkflow.php:13-60`); the
+        // previous text described the Rust-extended resolver (commit /
+        // object / path / revision types), not the ceb workflow.
         name: "browse",
-        examples: Some("**browse**"),
-        synopsis: Some("Open a file, commit, object, or revision in a web browser."),
-        help: Some(
-            "Open a file, commit, object, or revision in a web browser. With no\ntarget, opens the current working copy. TYPES is a comma- or\nspace-separated list of commit, object, path, and revision.",
+        examples: Some(
+            "**browse** [options] -- __target__ ...\n**browse** -- __file-name__\n**browse** -- __object-name__",
         ),
-        unwrap_help: false,
+        synopsis: Some("Open a file or object in a local web browser."),
+        help: Some(
+            "Open a file or object (like a task or revision) in a local web browser.\n\
+            \n\
+            \x20 $ arc browse README   # Open a file in Diffusion.\n\
+            \x20 $ arc browse T123     # View a task.\n\
+            \x20 $ arc browse HEAD     # View a symbolic commit.\n\
+            \n\
+            To choose a browser binary to invoke, use:\n\
+            \n\
+            \x20 $ arc set-config browser __browser-binary__\n\
+            \n\
+            If no browser is set, the command will try to guess which browser to use.",
+        ),
+        unwrap_help: true,
         args: &[
             HelpArg {
                 name: "branch",
                 short: None,
-                param: Some("BRANCH"),
-                help: Some("browse paths on BRANCH instead of the default branch"),
+                param: Some("branch-name"),
+                help: Some("Default branch name to view on server. Defaults to \"master\"."),
             },
             HelpArg {
                 name: "types",
                 short: None,
-                param: Some("TYPES"),
-                help: Some("only resolve these browse kinds"),
+                param: Some("type-list"),
+                help: Some(
+                    "Force targets to be interpreted as naming particular types of resources.",
+                ),
             },
             HelpArg {
                 name: "force",
                 short: None,
                 param: None,
-                help: Some("deprecated alias for --types path"),
+                help: Some("(DEPRECATED) Obsolete, use \"--types path\" instead."),
             },
         ],
     },
@@ -2432,68 +2436,9 @@ const ALL_WORKFLOWS: &[&str] = &[
     "work",
 ];
 
-/// `indent()`: interpret console markers, then wrap at 78 columns
-/// with a `level`-space prefix.
-fn indent_text(level: usize, text: &str, ansi: bool) -> String {
-    terminal::console_wrap(&terminal::interpret(text, ansi), level, true)
-}
-
-/// Unwrap single newlines in toolset help bodies
-/// (`preg_replace("/(?<=\S)\n(?=\S)/", ' ', $help)`).
-fn unwrap_help(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
-    for (index, chr) in chars.iter().enumerate() {
-        if *chr == '\n' {
-            let before = index
-                .checked_sub(1)
-                .and_then(|prev| chars.get(prev))
-                .is_some_and(|prev| !prev.is_whitespace());
-            let after = chars
-                .get(index + 1)
-                .is_some_and(|next| !next.is_whitespace());
-            if before && after {
-                out.push(' ');
-                continue;
-            }
-        }
-        out.push(*chr);
-    }
-    out
-}
-
-/// One displayed argument spec: name, short flag, parameter, help.
-type SpecView<'a> = (&'a str, Option<&'a str>, Option<&'a str>, Option<&'a str>);
-
-/// One argument spec line plus its help (`renderArgumentSpecs()`,
-/// sorted by name): `      __--name__ __param__[, __-s__ __param__]`
-/// then the 10-space help, then a blank line.
-fn render_argument_specs(specs: &[SpecView<'_>], ansi: bool) -> String {
-    let mut sorted: Vec<_> = specs.to_vec();
-    sorted.sort_by(|a, b| a.0.cmp(b.0));
-    let mut out = Vec::new();
-    for (name, short, param, help) in sorted {
-        let mut line = indent_text(6, &format!("__--{name}__"), ansi);
-        let mut short_part =
-            short.map(|alias| terminal::interpret(&format!(", __-{alias}__"), ansi));
-        if let Some(param) = param {
-            let rendered = terminal::interpret(&format!(" __{param}__"), ansi);
-            line.push_str(&rendered);
-            if let Some(short) = short_part.as_mut() {
-                short.push_str(&rendered);
-            }
-        }
-        if let Some(short) = short_part {
-            line.push_str(&short);
-        }
-        out.push(line);
-        out.push(indent_text(10, help.unwrap_or(""), ansi));
-        out.push(String::new());
-    }
-    out.join("\n")
-}
-
 /// Parser specs known when bare help renders: standard, config, and
+// T1153 RB-D5: `indent_text`/`unwrap_help`/`render_argument_specs` live
+// in the shared `help` renderer; the functions below call `help::`.
 /// toolset arguments (`renderHelp()` shows the non-standard ones, plus
 /// the standard ones under `--show-standard-options`).
 /// A global spec: name, short flag, parameter, help, standard.
@@ -2585,7 +2530,7 @@ fn render_workflow_help(name: &str, details: bool, ansi: bool) -> String {
     else {
         return format!(
             "{}\n",
-            terminal::console_wrap(&no_workflow_line(name, ansi), indent, true)
+            terminal::console_wrap(&help::no_workflow_line(name, ansi), indent, true)
         );
     };
     let examples = entry
@@ -2593,27 +2538,27 @@ fn render_workflow_help(name: &str, details: bool, ansi: bool) -> String {
         .map(str::to_string)
         .unwrap_or_else(|| format!("**{}**", entry.name));
     let mut parts = vec![
-        indent_text(indent, &examples, ansi),
-        indent_text(indent, entry.synopsis.unwrap_or(""), ansi),
+        help::indent_text(indent, &examples, ansi),
+        help::indent_text(indent, entry.synopsis.unwrap_or(""), ansi),
     ];
     if details {
         if let Some(help) = entry.help {
             let body = if entry.unwrap_help {
-                unwrap_help(help)
+                help::unwrap_help(help)
             } else {
                 help.to_string()
             };
             parts.push(String::new());
-            parts.push(indent_text(indent, &body, ansi));
+            parts.push(help::indent_text(indent, &body, ansi));
         }
         if !entry.args.is_empty() {
-            let specs: Vec<SpecView<'_>> = entry
+            let specs: Vec<help::SpecView<'_>> = entry
                 .args
                 .iter()
                 .map(|arg| (arg.name, arg.short, arg.param, arg.help))
                 .collect();
             parts.push(String::new());
-            parts.push(render_argument_specs(&specs, ansi));
+            parts.push(help::render_argument_specs(&specs, ansi));
         }
     }
     parts.push(String::new());
@@ -2632,20 +2577,20 @@ fn render_help_bare(show_standard_options: bool, ansi: bool) -> String {
     }
     parts.push(terminal::interpret("**OPTION REFERENCE**", ansi));
     parts.push(String::new());
-    let specs: Vec<SpecView<'_>> = GLOBAL_SPECS
+    let specs: Vec<help::SpecView<'_>> = GLOBAL_SPECS
         .iter()
         .filter(|spec| show_standard_options || !spec.4)
         .map(|spec| (spec.0, spec.1, spec.2, Some(spec.3)))
         .collect();
-    parts.push(render_argument_specs(&specs, ansi));
+    parts.push(help::render_argument_specs(&specs, ansi));
     parts.push(String::new());
-    parts.push(indent_text(
+    parts.push(help::indent_text(
         0,
         "Use **help** __command__ for a detailed command reference.",
         ansi,
     ));
     if !show_standard_options {
-        parts.push(indent_text(
+        parts.push(help::indent_text(
             0,
             "Use __--show-standard-options__ to show additional options.",
             ansi,
@@ -2670,7 +2615,7 @@ fn run_help(names: &[String], show_standard_options: bool) -> ExitCode {
     }
     let ansi = terminal::ansi_enabled();
     for name in names {
-        println!("{}\n", workflow_header(name, ansi));
+        println!("{}\n", help::workflow_header(name, ansi));
         print!("{}", render_workflow_help(name, true, ansi));
         println!();
     }
@@ -2810,19 +2755,15 @@ fn dispatch(argv: &[String]) -> ExitCode {
     dispatch_inner(&argv, &globals)
 }
 
-/// Dispatch already-stripped `argv` with its globals. `main` calls
-/// this after alias expansion (which needs the stripped argv); the
-/// flags must flow through instead of being re-stripped, since
-/// re-stripping would lose `--help`/`--show-standard-options`.
-/// `arc --help` leads with the one-line usage (the release smoke
-/// test greps it) ahead of the full workflow reference (RB-D5).
-const BARE_HELP_LEAD: &str = "usage: arc [--version] [--help] <command>\n\n";
+// T1153 RB-D5: the `usage:` lead lives in the shared `help` renderer
+// (the release smoke test greps it); both bare dispatches use it.
 
 /// Dispatch a bare `arc` (no command word).
 fn dispatch_empty(globals: &Globals) -> ExitCode {
     if globals.show_help {
         print!(
-            "{BARE_HELP_LEAD}{}",
+            "{}{}",
+            help::BARE_HELP_LEAD,
             render_help_bare(globals.show_standard_options, terminal::ansi_enabled())
         );
         return ExitCode::SUCCESS;
@@ -2921,7 +2862,8 @@ fn dispatch_action(action: Action, argv: &[String], globals: &Globals) -> ExitCo
     match action {
         Action::Help => {
             print!(
-                "{BARE_HELP_LEAD}{}",
+                "{}{}",
+                help::BARE_HELP_LEAD,
                 render_help_bare(globals.show_standard_options, terminal::ansi_enabled())
             );
             ExitCode::SUCCESS
@@ -2942,6 +2884,10 @@ fn dispatch_action(action: Action, argv: &[String], globals: &Globals) -> ExitCo
     }
 }
 
+/// Dispatch already-stripped `argv` with its globals. `main` calls
+/// this after alias expansion (which needs the stripped argv); the
+/// flags must flow through instead of being re-stripped, since
+/// re-stripping would lose `--help`/`--show-standard-options`.
 fn dispatch_inner(argv: &[String], globals: &Globals) -> ExitCode {
     if argv.is_empty() {
         return dispatch_empty(globals);

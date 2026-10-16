@@ -80,8 +80,9 @@ fn every_command_reports_help() {
         linters::run(&args(&["--help"])),
         std::process::ExitCode::SUCCESS
     );
+    // T1153 BROWSE-B21: `anoid` is toolset; piped runs carry `--`.
     assert_eq!(
-        anoid::run(&args(&["--help"])),
+        anoid::run(&args(&["--help", "--"])),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(

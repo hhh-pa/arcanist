@@ -632,7 +632,7 @@ fn dl_b21_terminator_ordering() {
         ParseOutcome::Error(_)
     ));
     assert_eq!(
-        MISSING_TERMINATOR,
+        crate::help::MISSING_TERMINATOR,
         "Missing required \"--\" in argument list."
     );
 }
