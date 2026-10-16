@@ -15,7 +15,10 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::{conduit, config, git, svn, terminal};
+use crate::{
+    conduit::{self, EnvelopeKind},
+    config, git, svn, terminal,
+};
 
 /// Subcommand name, matching `arc list`.
 pub const NAME: &str = "list";
@@ -350,31 +353,27 @@ pub fn run_in(cwd: &Path, argv: &[String]) -> ExitCode {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
         }
-        Err(msg) => {
-            eprintln!("arc {NAME}: {msg}\n\n{USAGE}");
-            return ExitCode::FAILURE;
-        }
+        // T1153 R4 (RB-D4): `list` is a subprocess workflow:
+        // usage errors render `Usage Exception:` with no usage dump
+        // (`scripts/arcanist.php:432-444`).
+        Err(msg) => return conduit::report(EnvelopeKind::Usage, &msg),
     };
     if let Err(msg) = require_working_copy(cwd) {
-        eprintln!("arc {NAME}: {msg}");
-        return ExitCode::FAILURE;
+        // The working-copy gate is a usage error (same envelope).
+        return conduit::report(EnvelopeKind::Usage, &msg);
     }
     let client = match config::client_for(options.conduit_uri.as_deref()) {
         Ok(client) => client,
-        Err(msg) => {
-            eprintln!("arc {NAME}: {msg}");
-            return ExitCode::FAILURE;
-        }
+        // Conduit setup and query failures are generic exceptions
+        // under the red banner (`:449-468`).
+        Err(msg) => return conduit::report(EnvelopeKind::Exception, &msg),
     };
     match execute_in(&client, &options, cwd) {
         Ok(out) => {
             print!("{out}");
             ExitCode::SUCCESS
         }
-        Err(msg) => {
-            eprintln!("arc {NAME}: {msg}");
-            ExitCode::FAILURE
-        }
+        Err(msg) => conduit::report(EnvelopeKind::Exception, &msg),
     }
 }
 

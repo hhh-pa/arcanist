@@ -44,7 +44,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::terminal::TVal;
-use crate::{commitgraph, config, grid, hg, revision, terminal};
+use crate::{
+    commitgraph,
+    conduit::{self, EnvelopeKind},
+    config, grid, hg, revision, terminal,
+};
 
 pub const NAME: &str = "markers";
 
@@ -2332,12 +2336,32 @@ fn detect_vcs(dir: &Path) -> Option<&'static str> {
     }
 }
 
+/// True for the marker errors PHP raises as
+/// `PhutilArgumentUsageException` (exit 1 under the `USAGE EXCEPTION`
+/// label): outside a working copy (which fails the marker-type
+/// support gate), unsupported VCS/type pairs
+/// (`ArcanistBranchesWorkflow.php:31-38`), and the 1000-unpublished
+/// guard (`ArcanistMarkersWorkflow.php:37-43`). Query and render
+/// failures escape into a fatal. Shared with `branches`, which runs
+/// the same workflow.
+#[must_use]
+pub fn is_toolset_usage_message(message: &str) -> bool {
+    message.starts_with("not inside a working copy")
+        || message == "not inside a git repository"
+        || (message.starts_with("The version control system (\"")
+            && message.contains("does not support "))
+        || (message.starts_with("Found more than ")
+            && message.ends_with(" unpublished commits which are ancestors of heads."))
+        || message.starts_with("unknown marker type '")
+}
+
 /// Run the workflow rooted at `dir`, returning stdout text or an error message.
 pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => return Ok(usage()),
-        Err(message) => return Err(format!("{message}\n\n{}", usage())),
+        // T1153 R4 (RB-D4): PHP renders usage errors with no dump.
+        Err(message) => return Err(message),
     };
     let owned_client = config::client_for(options.conduit_uri.as_deref()).ok();
     execute_core(
@@ -2361,7 +2385,8 @@ pub fn execute_with_client(
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => return Ok(usage()),
-        Err(message) => return Err(format!("{message}\n\n{}", usage())),
+        // T1153 R4 (RB-D4): PHP renders usage errors with no dump.
+        Err(message) => return Err(message),
     };
     execute_core(dir, &options, terminal, client, terminal::ansi_enabled())
 }
@@ -2398,8 +2423,18 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            ExitCode::FAILURE
+            // T1153 R4 (RB-D4): `markers`/`branches` run in the
+            // toolset runtime (`ArcanistMarkersWorkflow extends
+            // ArcanistArcWorkflow`). Argument, support-gate, and
+            // limit errors render the red `USAGE EXCEPTION` label
+            // (exit 1); query and render failures escape into a
+            // fatal (255).
+            let kind = if parse_options(argv).is_err() || is_toolset_usage_message(&message) {
+                EnvelopeKind::ToolsetUsage
+            } else {
+                EnvelopeKind::Fatal
+            };
+            conduit::report(kind, &message)
         }
     }
 }

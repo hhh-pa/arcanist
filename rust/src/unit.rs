@@ -46,6 +46,7 @@ use arc_rs::{
     config, get_config, unit_csharp, unit_nose, unit_phpunit, unit_phutil, unit_pytest, unit_xunit,
 };
 
+use crate::conduit::{self, ClassifiedError, EnvelopeKind};
 use crate::terminal;
 
 pub const NAME: &str = "unit";
@@ -1372,33 +1373,66 @@ fn validate_engine(engine: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Map an engine error onto the R4 envelope: `NoEffect` prints on
+/// stdout with exit 0, `Usage` renders `Usage Exception:`, `Failed`
+/// renders the generic banner.
+fn classify_engine_error(error: EngineError) -> ClassifiedError {
+    match error {
+        EngineError::NoEffect(message) => ClassifiedError::no_effect(message),
+        EngineError::Usage(message) => ClassifiedError::usage(message),
+        EngineError::Failed(message) => ClassifiedError::exception(message),
+    }
+}
+
+/// String-error entry kept for API stability; production uses
+/// [`load_config_selection_classified`].
+#[allow(dead_code)]
 fn load_config_selection(cwd: &Path) -> Result<Selection, String> {
+    load_config_selection_classified(cwd).map_err(|error| error.message)
+}
+
+/// [`load_config_selection`] with errors classified for the R4
+/// envelope: a missing `.arcunit` is a usage error (PHP throws
+/// `ArcanistNoEngineException`, an `ArcanistUsageException`
+/// subclass); spec errors keep their engine class.
+fn load_config_selection_classified(cwd: &Path) -> Result<Selection, ClassifiedError> {
     let Some(dir) = find_arcunit_from(cwd) else {
-        return Err(
+        return Err(ClassifiedError::usage(
             "Unable to find '.arcunit' file to configure test engines. Create an \
             '.arcunit' file in the root directory of the working copy."
                 .to_string(),
-        );
+        ));
     };
     let path = dir.join(".arcunit");
-    let data = std::fs::read_to_string(&path)
-        .map_err(|e| format!("cannot read '{}': {e}", path.display()))?;
+    let data = std::fs::read_to_string(&path).map_err(|e| {
+        ClassifiedError::exception(format!("cannot read '{}': {e}", path.display()))
+    })?;
     let display = path.to_string_lossy().to_string();
     let engines = unit_config::parse_engine_specs(&data, &display, CONFIG_AVAILABLE)
-        .map_err(|e| e.message().to_string())?;
+        .map_err(classify_engine_error)?;
     Ok(Selection::Config { engines, root: dir })
 }
 
 /// Select engines: explicit `--engine`, then `unit.engine` from `.arcconfig`,
 /// then `.arcunit`, else the `cargo` default.
 pub fn discover_selection(opts: &Options, cwd: &Path) -> Result<Selection, String> {
+    discover_selection_classified(opts, cwd).map_err(|error| error.message)
+}
+
+/// [`discover_selection`] with errors classified for the R4 envelope:
+/// unknown engine names are usage errors (PHP throws
+/// `ArcanistUsageException` for a bad `--engine`).
+pub fn discover_selection_classified(
+    opts: &Options,
+    cwd: &Path,
+) -> Result<Selection, ClassifiedError> {
     if opts.engine_explicit {
-        validate_engine(&opts.engine)?;
+        validate_engine(&opts.engine).map_err(ClassifiedError::usage)?;
         if opts.engine == "cargo" {
             return Ok(Selection::Cargo);
         }
         if opts.engine == "ArcanistConfigurationDrivenUnitTestEngine" {
-            return load_config_selection(cwd);
+            return load_config_selection_classified(cwd);
         }
         return Ok(Selection::Single(opts.engine.clone()));
     }
@@ -1406,21 +1440,23 @@ pub fn discover_selection(opts: &Options, cwd: &Path) -> Result<Selection, Strin
         &opts.config,
         &opts.config_file,
         opts.arcrc_file.as_deref(),
-    )?;
+    )
+    .map_err(ClassifiedError::usage)?;
     let user_file = config::arcrc_path();
-    let merged = get_config::load_merged(cwd, user_file.as_deref(), &cli)?;
-    if let Some(class) = unit_engine_from_merged(&merged)? {
-        validate_engine(&class)?;
+    let merged =
+        get_config::load_merged(cwd, user_file.as_deref(), &cli).map_err(ClassifiedError::usage)?;
+    if let Some(class) = unit_engine_from_merged(&merged).map_err(ClassifiedError::usage)? {
+        validate_engine(&class).map_err(ClassifiedError::usage)?;
         if class == "cargo" {
             return Ok(Selection::Cargo);
         }
         if class == "ArcanistConfigurationDrivenUnitTestEngine" {
-            return load_config_selection(cwd);
+            return load_config_selection_classified(cwd);
         }
         return Ok(Selection::Single(class));
     }
     if find_arcunit_from(cwd).is_some() {
-        return load_config_selection(cwd);
+        return load_config_selection_classified(cwd);
     }
     Ok(Selection::Cargo)
 }
@@ -2327,6 +2363,27 @@ pub fn run_single_report(
     enable_coverage: Option<bool>,
     runner: &dyn CommandRunner,
 ) -> Result<ConfigReport, String> {
+    run_single_report_classified(
+        engine_type,
+        project_root,
+        paths,
+        run_all_tests,
+        enable_coverage,
+        runner,
+    )
+    .map_err(|error| error.message)
+}
+
+/// [`run_single_report`] with errors classified for the R4 envelope,
+/// preserving `NoEffect` (stdout, exit 0).
+pub fn run_single_report_classified(
+    engine_type: &str,
+    project_root: &str,
+    paths: &[String],
+    run_all_tests: bool,
+    enable_coverage: Option<bool>,
+    runner: &dyn CommandRunner,
+) -> Result<ConfigReport, ClassifiedError> {
     let ctx = EngineContext {
         project_root: project_root.to_string(),
         paths: paths.to_vec(),
@@ -2335,7 +2392,7 @@ pub fn run_single_report(
     };
     let started = std::time::Instant::now();
     let results =
-        run_single_with_runner(engine_type, &ctx, runner).map_err(|e| e.message().to_string())?;
+        run_single_with_runner(engine_type, &ctx, runner).map_err(classify_engine_error)?;
     let duration_ms: u64 = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
     let (passed, failed) = count_results(&results);
     let success =
@@ -2362,7 +2419,28 @@ pub fn run_config_with_runner(
     enable_coverage: Option<bool>,
     runner: &dyn CommandRunner,
 ) -> Result<ConfigReport, String> {
-    run_config_with_php(
+    run_config_with_runner_classified(
+        planned,
+        project_root,
+        paths,
+        run_all_tests,
+        enable_coverage,
+        runner,
+    )
+    .map_err(|error| error.message)
+}
+
+/// [`run_config_with_runner`] with errors classified for the R4
+/// envelope, preserving `NoEffect` (stdout, exit 0).
+pub fn run_config_with_runner_classified(
+    planned: &[PlannedEngine],
+    project_root: &str,
+    paths: &[String],
+    run_all_tests: bool,
+    enable_coverage: Option<bool>,
+    runner: &dyn CommandRunner,
+) -> Result<ConfigReport, ClassifiedError> {
+    run_config_with_php_classified(
         planned,
         project_root,
         paths,
@@ -2384,15 +2462,38 @@ pub fn run_config_with_php(
     runner: &dyn CommandRunner,
     php: &dyn Fn() -> Option<Vec<String>>,
 ) -> Result<ConfigReport, String> {
+    run_config_with_php_classified(
+        planned,
+        project_root,
+        paths,
+        run_all_tests,
+        enable_coverage,
+        runner,
+        php,
+    )
+    .map_err(|error| error.message)
+}
+
+/// [`run_config_with_php`] with errors classified for the R4 envelope,
+/// preserving `NoEffect` (stdout, exit 0).
+pub fn run_config_with_php_classified(
+    planned: &[PlannedEngine],
+    project_root: &str,
+    paths: &[String],
+    run_all_tests: bool,
+    enable_coverage: Option<bool>,
+    runner: &dyn CommandRunner,
+    php: &dyn Fn() -> Option<Vec<String>>,
+) -> Result<ConfigReport, ClassifiedError> {
     let child_supports: Vec<bool> = planned
         .iter()
         .map(|engine| supports_run_all_tests(&engine.engine_type))
         .collect();
     if run_all_tests && !unit_config::supports_run_all_tests(&child_supports) {
-        return Err(
+        return Err(ClassifiedError::usage(
             "Engine 'ArcanistConfigurationDrivenUnitTestEngine' does not support --everything."
                 .to_string(),
-        );
+        ));
     }
     let top = EngineContext {
         project_root: project_root.to_string(),
@@ -2412,7 +2513,7 @@ pub fn run_config_with_php(
             php,
         ));
     }
-    let results = unit_config::merge_engine_runs(runs).map_err(|e| e.message().to_string())?;
+    let results = unit_config::merge_engine_runs(runs).map_err(classify_engine_error)?;
     let duration_ms: u64 = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
     let (passed, failed) = count_results(&results);
     let success =
@@ -3341,9 +3442,10 @@ fn empty_json_object(_: serde_json::Error) -> String {
 /// `json` pretty-prints the aggregate; `ugly` compacts it; `none` prints
 /// nothing. Failures exit `2` (`RESULT_FAIL`); successes exit `0`.
 fn run_cargo_selection(opts: &Options, cwd: &Path) -> ExitCode {
+    // T1153 R4 (UNIT-U4): `--everything` with paths is a usage error
+    // (`ArcanistUnitWorkflow.php:136-143`).
     if let Err(msg) = check_everything_paths(opts.everything, &opts.paths) {
-        eprintln!("arc unit: {msg}");
-        return ExitCode::FAILURE;
+        return conduit::report(EnvelopeKind::Usage, &msg);
     }
     if let Some(warning) = cargo_coverage_warning(opts) {
         eprintln!("{warning}");
@@ -3353,8 +3455,8 @@ fn run_cargo_selection(opts: &Options, cwd: &Path) -> ExitCode {
             let format = output_format(opts);
             print_cargo_output(&report, &format);
             if let Err(msg) = upload_cargo_target(opts, &report) {
-                eprintln!("arc unit: {msg}");
-                return ExitCode::FAILURE;
+                // T1153 R4 (UNIT-U5): upload failures are generic.
+                return conduit::report(EnvelopeKind::Exception, &msg);
             }
             if report.success {
                 ExitCode::SUCCESS
@@ -3362,10 +3464,8 @@ fn run_cargo_selection(opts: &Options, cwd: &Path) -> ExitCode {
                 exit_code_for_overall(arc_rs::unit_engine::WORKFLOW_RESULT_FAIL)
             }
         }
-        Err(msg) => {
-            eprintln!("arc unit: {msg}");
-            ExitCode::FAILURE
-        }
+        // T1153 R4 (UNIT-U5): cargo failures are generic exceptions.
+        Err(msg) => conduit::report(EnvelopeKind::Exception, &msg),
     }
 }
 
@@ -3378,14 +3478,20 @@ fn run_single_selection(
     ansi: bool,
 ) -> ExitCode {
     if !opts.cargo_args.is_empty() {
-        eprintln!("arc unit: cargo test args after '--' require the cargo engine");
-        return ExitCode::FAILURE;
+        // T1153 R4 (UNIT-U4): an invocation mistake (Rust-only; PHP
+        // has no cargo engine), reported as usage.
+        return conduit::report(
+            EnvelopeKind::Usage,
+            "cargo test args after '--' require the cargo engine",
+        );
     }
     let root = project_root_path(cwd);
     let root_string = root.to_string_lossy().replace('\\', "/");
     let runner = RealRunner;
     let coverage = enable_coverage(opts);
-    match run_single_report(
+    // T1153 R4 (UNIT-U3, UNIT-U4, UNIT-U5): the classified report
+    // preserves `NoEffect` (stdout, exit 0), usage, and generic.
+    match run_single_report_classified(
         class,
         &root_string,
         paths,
@@ -3394,10 +3500,7 @@ fn run_single_selection(
         &runner,
     ) {
         Ok(report) => finish_php_report(opts, &root, paths, &report, ansi),
-        Err(msg) => {
-            eprintln!("arc unit: {msg}");
-            ExitCode::FAILURE
-        }
+        Err(error) => error.report(),
     }
 }
 
@@ -3410,13 +3513,17 @@ fn run_config_selection(
     ansi: bool,
 ) -> ExitCode {
     if !opts.cargo_args.is_empty() {
-        eprintln!("arc unit: cargo test args after '--' require the cargo engine");
-        return ExitCode::FAILURE;
+        // T1153 R4 (UNIT-U4): an invocation mistake (see above).
+        return conduit::report(
+            EnvelopeKind::Usage,
+            "cargo test args after '--' require the cargo engine",
+        );
     }
     let root_string = root.to_string_lossy().replace('\\', "/");
     let runner = RealRunner;
     let coverage = enable_coverage(opts);
-    match run_config_with_runner(
+    // T1153 R4 (UNIT-U3, UNIT-U4, UNIT-U5): classified (see above).
+    match run_config_with_runner_classified(
         engines,
         &root_string,
         paths,
@@ -3425,10 +3532,7 @@ fn run_config_selection(
         &runner,
     ) {
         Ok(report) => finish_php_report(opts, root, paths, &report, ansi),
-        Err(msg) => {
-            eprintln!("arc unit: {msg}");
-            ExitCode::FAILURE
-        }
+        Err(error) => error.report(),
     }
 }
 
@@ -3457,8 +3561,8 @@ fn finish_php_report(
         && let Err(msg) =
             upload_results_for_options(opts, project_root, target, overall, &report.results)
     {
-        eprintln!("arc unit: {msg}");
-        return ExitCode::FAILURE;
+        // T1153 R4 (UNIT-U5): upload failures are generic.
+        return conduit::report(EnvelopeKind::Exception, &msg);
     }
     exit_code_for_overall(overall)
 }
@@ -3495,20 +3599,20 @@ fn parse_unit_options(argv: &[String]) -> Result<Options, ExitCode> {
             print!("{USAGE}");
             Err(ExitCode::SUCCESS)
         }
-        Err(msg) => {
-            eprintln!("arc unit: {msg}\n\n{USAGE}");
-            Err(ExitCode::FAILURE)
-        }
+        // T1153 R4 (UNIT-U4): `unit` is a subprocess workflow:
+        // usage errors render `Usage Exception:` with no usage dump
+        // (`scripts/arcanist.php:432-444`).
+        Err(msg) => Err(conduit::report(EnvelopeKind::Usage, &msg)),
     }
 }
 
 fn unit_working_dir() -> Result<PathBuf, ExitCode> {
     match std::env::current_dir() {
         Ok(dir) => Ok(dir),
-        Err(e) => {
-            eprintln!("arc unit: cannot read current directory: {e}");
-            Err(ExitCode::FAILURE)
-        }
+        Err(e) => Err(conduit::report(
+            EnvelopeKind::Exception,
+            &format!("cannot read current directory: {e}"),
+        )),
     }
 }
 
@@ -3516,8 +3620,8 @@ fn check_unit_supports(cwd: &Path, opts: &Options) -> Result<(), ExitCode> {
     if let Some(vcs) = detect_vcs(cwd)
         && let Err(msg) = check_supports(vcs, &opts.provided)
     {
-        eprintln!("arc unit: {msg}");
-        return Err(ExitCode::FAILURE);
+        // T1153 R4 (UNIT-U4): VCS support refusals are usage errors.
+        return Err(conduit::report(EnvelopeKind::Usage, &msg));
     }
     Ok(())
 }
@@ -3525,12 +3629,24 @@ fn check_unit_supports(cwd: &Path, opts: &Options) -> Result<(), ExitCode> {
 fn discover_unit_selection(opts: &Options, cwd: &Path) -> Result<Selection, ExitCode> {
     // Cargo ignores paths/rev (it runs `cargo test` in the crate root), but
     // the `--everything` plus paths check still applies workflow-wide.
-    match discover_selection(opts, cwd) {
+    match discover_selection_classified(opts, cwd) {
         Ok(selection) => Ok(selection),
-        Err(msg) => {
-            eprintln!("arc unit: {msg}");
-            Err(ExitCode::FAILURE)
-        }
+        Err(error) => Err(error.report()),
+    }
+}
+
+/// Classify a path-selection error: `--everything` with paths and
+/// missing explicit paths are usage errors
+/// (`ArcanistUnitWorkflow.php:136-143`,
+/// `ArcanistWorkflow.php:1631-1637`); VCS command failures are
+/// generic.
+fn classify_select_paths_error(message: String) -> ClassifiedError {
+    if message.starts_with("You can not specify paths with --everything.")
+        || (message.starts_with("Path '") && message.ends_with("' does not exist!"))
+    {
+        ClassifiedError::usage(message)
+    } else {
+        ClassifiedError::exception(message)
     }
 }
 
@@ -3538,10 +3654,7 @@ fn run_single_paths(opts: &Options, cwd: &Path, class: &str, ansi: bool) -> Exit
     let root = project_root_path(cwd);
     let paths = match select_paths(opts, cwd, &root) {
         Ok(paths) => paths,
-        Err(msg) => {
-            eprintln!("arc unit: {msg}");
-            return ExitCode::FAILURE;
-        }
+        Err(msg) => return classify_select_paths_error(msg).report(),
     };
     run_single_selection(opts, cwd, class, &paths, ansi)
 }
@@ -3555,10 +3668,7 @@ fn run_config_paths(
 ) -> ExitCode {
     let paths = match select_paths(opts, cwd, root) {
         Ok(paths) => paths,
-        Err(msg) => {
-            eprintln!("arc unit: {msg}");
-            return ExitCode::FAILURE;
-        }
+        Err(msg) => return classify_select_paths_error(msg).report(),
     };
     run_config_selection(opts, engines, root, &paths, ansi)
 }

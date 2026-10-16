@@ -451,3 +451,93 @@ fn r3_search_pages_single_page_without_cursor_calls_once() {
     assert_eq!(pages.len(), 1);
     assert_eq!(calls.get(), 1);
 }
+
+#[test]
+fn r4_core6_conduit_errors_render_bare() {
+    // No `transport error:` / `protocol error:` / `conduit error`
+    // infix: PHP prints the raw message under the envelope.
+    assert_eq!(Error::Transport("boom".to_string()).to_string(), "boom");
+    assert_eq!(
+        Error::Protocol("bad frame".to_string()).to_string(),
+        "bad frame"
+    );
+    // Exactly `ConduitClientException` (`"{code}: {info}"`).
+    assert_eq!(
+        Error::Api {
+            code: "ERR-CONDUIT-CORE".to_string(),
+            info: "nope".to_string(),
+        }
+        .to_string(),
+        "ERR-CONDUIT-CORE: nope"
+    );
+}
+
+#[test]
+fn r4_core6_envelope_exit_codes() {
+    use std::process::ExitCode;
+    assert_eq!(EnvelopeKind::NoEffect.exit_code(), ExitCode::SUCCESS);
+    assert_eq!(EnvelopeKind::Fatal.exit_code(), ExitCode::from(EXIT_FATAL));
+    assert_eq!(EXIT_FATAL, 255);
+    for kind in [
+        EnvelopeKind::Usage,
+        EnvelopeKind::Exception,
+        EnvelopeKind::ToolsetUsage,
+        EnvelopeKind::ToolsetConduit,
+        EnvelopeKind::UserAbort,
+    ] {
+        assert_eq!(kind.exit_code(), ExitCode::FAILURE, "{kind:?}");
+    }
+    assert!(EnvelopeKind::NoEffect.uses_stdout());
+    assert!(!EnvelopeKind::Usage.uses_stdout());
+    assert!(!EnvelopeKind::Fatal.uses_stdout());
+}
+
+#[test]
+fn r4_core6_subprocess_arms_render_plain() {
+    assert_eq!(
+        EnvelopeKind::NoEffect.render("No linters to run.", false),
+        "No linters to run.\n"
+    );
+    assert_eq!(
+        EnvelopeKind::Usage.render("oops", false),
+        "Usage Exception: oops\n"
+    );
+    // Usage messages are rstripped like PHP (`:436`).
+    assert_eq!(
+        EnvelopeKind::Usage.render("oops  \n", false),
+        "Usage Exception: oops\n"
+    );
+    assert_eq!(
+        EnvelopeKind::Exception.render("boom", false),
+        " Exception \nboom\n(Run with `--trace` for a full exception trace.)\n"
+    );
+}
+
+#[test]
+fn r4_core6_toolset_arms_render_plain() {
+    assert_eq!(
+        EnvelopeKind::ToolsetUsage.render("oops", false),
+        " USAGE EXCEPTION  oops\n"
+    );
+    assert_eq!(
+        EnvelopeKind::ToolsetConduit.render("oops", false),
+        " CONDUIT  oops\n"
+    );
+    assert_eq!(
+        EnvelopeKind::UserAbort.render("User aborted the workflow.", false),
+        " ---  User aborted the workflow.\n"
+    );
+    // Fatal: the raw message only (the PHP trace is unportable).
+    assert_eq!(EnvelopeKind::Fatal.render("boom", false), "boom\n");
+}
+
+#[test]
+fn r4_core6_usage_bold_on_tty() {
+    assert_eq!(
+        EnvelopeKind::Usage.render("oops", true),
+        "\x1b[1mUsage Exception:\x1b[m oops\n"
+    );
+    let banner = EnvelopeKind::Exception.render("boom", true);
+    assert!(banner.contains("\x1b[41m"), "{banner:?}");
+    assert!(banner.contains("Exception"), "{banner:?}");
+}

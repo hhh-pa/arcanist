@@ -172,3 +172,10 @@ fn builds_created_json() {
         })
     );
 }
+
+#[test]
+fn r4_rbd4_parse_error_has_no_dump() {
+    // `todo` is a subprocess workflow: argument errors render `Usage
+    // Exception:` (exit 1) with no usage dump.
+    assert_eq!(run(&args(&["--bogus"])), std::process::ExitCode::FAILURE);
+}

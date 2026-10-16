@@ -62,6 +62,7 @@ use std::process::{Command, ExitCode};
 
 use arc_rs::{arclint, git, hg, svn};
 
+use crate::conduit::{self, ClassifiedError, EnvelopeKind};
 use crate::terminal::{self, TVal};
 
 pub const NAME: &str = "lint";
@@ -4557,8 +4558,10 @@ pub fn run(argv: &[String]) -> ExitCode {
     let cwd = match std::env::current_dir() {
         Ok(dir) => dir,
         Err(error) => {
-            eprintln!("arc {NAME}: cannot determine current directory: {error}");
-            return ExitCode::FAILURE;
+            return conduit::report(
+                EnvelopeKind::Exception,
+                &format!("cannot determine current directory: {error}"),
+            );
         }
     };
     run_in(&cwd, argv)
@@ -4593,22 +4596,67 @@ pub fn run_in_with_input_and_tty(
             print!("{}", usage());
             return ExitCode::SUCCESS;
         }
-        ParseOutcome::Error(message) => {
-            eprintln!("arc {NAME}: {message}\n\n{}", usage());
-            return ExitCode::FAILURE;
-        }
+        // T1153 R4 (LINT-2): `lint` is a subprocess workflow:
+        // usage errors render `Usage Exception:` with no usage dump
+        // (`scripts/arcanist.php:432-444`).
+        ParseOutcome::Error(message) => return conduit::report(EnvelopeKind::Usage, &message),
         ParseOutcome::Args(options) => options,
     };
     let ansi = terminal::ansi_enabled();
-    match run_workflow(cwd, &options, input, ansi, stdin_tty) {
+    match run_workflow_classified(cwd, &options, input, ansi, stdin_tty) {
         Ok(code) => ExitCode::from(code as u8),
-        Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            ExitCode::FAILURE
-        }
+        Err(error) => error.report(),
     }
 }
 
+/// Classify a gather-stage error: "no paths" is `NoEffect`
+/// (`ArcanistLintEngine.php:179`), everything else (base resolution,
+/// git failures) is a generic exception.
+fn classify_gather_error(message: String) -> ClassifiedError {
+    if message == "No paths are lintable." {
+        ClassifiedError::no_effect(message)
+    } else {
+        ClassifiedError::exception(message)
+    }
+}
+
+/// Classify an emit-stage error: declining the amend is a usage error
+/// (`ArcanistLintWorkflow.php:349`), everything else (bad renderer,
+/// patch and IO failures) is a generic exception.
+fn classify_emit_error(message: String) -> ClassifiedError {
+    if message == "Sort out the lint changes that were applied to the working copy and relint." {
+        ClassifiedError::usage(message)
+    } else {
+        ClassifiedError::exception(message)
+    }
+}
+
+/// [`run_workflow`] with errors classified for the R4 envelope.
+fn run_workflow_classified(
+    cwd: &Path,
+    options: &Options,
+    input: &mut dyn BufRead,
+    ansi: bool,
+    stdin_tty: bool,
+) -> Result<i32, ClassifiedError> {
+    let work = discover_working_copy(cwd).map_err(ClassifiedError::usage)?;
+    check_supports(options, work.vcs).map_err(ClassifiedError::usage)?;
+    reject_everything_with_paths(options).map_err(ClassifiedError::usage)?;
+    let engine =
+        engine_for_workcopy(&work, options.engine.as_deref()).map_err(ClassifiedError::usage)?;
+    if engine.is_empty() {
+        // T1153 R4 (LINT-1): `ArcanistNoEffectException` prints on
+        // stdout with exit 0 (`scripts/arcanist.php:428-430`).
+        return Err(ClassifiedError::no_effect("No linters to run.".to_string()));
+    }
+    let mut results = workflow_gather(&work, cwd, options, &engine, input, ansi)
+        .map_err(classify_gather_error)?;
+    workflow_emit(&work, options, input, &mut results, ansi, stdin_tty).map_err(classify_emit_error)
+}
+
+/// String-error entry kept for API stability; production uses
+/// [`run_workflow_classified`].
+#[allow(dead_code)]
 fn run_workflow(
     cwd: &Path,
     options: &Options,
@@ -4616,15 +4664,7 @@ fn run_workflow(
     ansi: bool,
     stdin_tty: bool,
 ) -> Result<i32, String> {
-    let work = discover_working_copy(cwd)?;
-    check_supports(options, work.vcs)?;
-    reject_everything_with_paths(options)?;
-    let engine = engine_for_workcopy(&work, options.engine.as_deref())?;
-    if engine.is_empty() {
-        return Err("No linters to run.".to_string());
-    }
-    let mut results = workflow_gather(&work, cwd, options, &engine, input, ansi)?;
-    workflow_emit(&work, options, input, &mut results, ansi, stdin_tty)
+    run_workflow_classified(cwd, options, input, ansi, stdin_tty).map_err(|error| error.message)
 }
 
 /// Reject `--everything` combined with explicit paths.

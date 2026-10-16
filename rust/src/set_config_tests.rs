@@ -298,3 +298,14 @@ fn r6_core34_cli_flags_parse() {
     assert_eq!(opts.key, "k");
     assert!(parse_args(&["--arcrc-file".to_string()]).is_err());
 }
+
+#[test]
+fn r4_core49_set_config_usage_has_no_dump() {
+    // Argument errors render `Usage Exception:` with exit 1 and no
+    // usage dump (parse fails before any disk access).
+    assert_eq!(
+        run(&["--bogus".to_string()]),
+        std::process::ExitCode::FAILURE
+    );
+    assert_eq!(run(&[]), std::process::ExitCode::FAILURE);
+}

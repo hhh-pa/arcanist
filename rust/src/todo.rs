@@ -9,7 +9,10 @@
 
 use std::process::ExitCode;
 
-use crate::{conduit, config, terminal};
+use crate::{
+    conduit::{self, EnvelopeKind},
+    config, terminal,
+};
 
 /// Subcommand name, matching `arc todo`.
 pub const NAME: &str = "todo";
@@ -428,27 +431,23 @@ pub fn run(argv: &[String]) -> ExitCode {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
         }
-        Err(msg) => {
-            eprintln!("arc {NAME}: {msg}\n\n{USAGE}");
-            return ExitCode::FAILURE;
-        }
+        // T1153 R4 (RB-D4): `todo` is a subprocess workflow:
+        // usage errors render `Usage Exception:` with no usage dump
+        // (`scripts/arcanist.php:432-444`).
+        Err(msg) => return conduit::report(EnvelopeKind::Usage, &msg),
     };
     let client = match config::client_for(options.conduit_uri.as_deref()) {
         Ok(client) => client,
-        Err(msg) => {
-            eprintln!("arc {NAME}: {msg}");
-            return ExitCode::FAILURE;
-        }
+        // Conduit setup and creation failures are generic exceptions
+        // under the red banner (`:449-468`).
+        Err(msg) => return conduit::report(EnvelopeKind::Exception, &msg),
     };
     match execute_ansi(&client, &options, terminal::ansi_enabled()) {
         Ok(out) => {
             print!("{out}");
             ExitCode::SUCCESS
         }
-        Err(msg) => {
-            eprintln!("arc {NAME}: {msg}");
-            ExitCode::FAILURE
-        }
+        Err(msg) => conduit::report(EnvelopeKind::Exception, &msg),
     }
 }
 

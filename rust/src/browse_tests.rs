@@ -596,6 +596,18 @@ fn r9_browse_b24_no_browser_text_matches_ceb() {
 }
 
 #[test]
+fn r4_browseb22_parse_error_exits_1() {
+    // Toolset parser errors render `USAGE EXCEPTION` with exit 1
+    // and no usage dump.
+    let dir = std::env::temp_dir();
+    let mut input: &[u8] = &[];
+    assert_eq!(
+        run_in_with(&dir, &argv(&["--bogus"]), None, &mut input),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
 fn r3_browseb7_revision_search_follows_after_cursor() {
     fn row(id: u32) -> serde_json::Value {
         serde_json::json!({
@@ -641,5 +653,25 @@ fn r5_browse_b3_non_tty_throws_after_echo() {
     assert_eq!(
         console_select_with_tty(&mut piped, "Pick?", 1, 3, false).unwrap_err(),
         crate::prompt::NOT_INTERACTIVE
+    );
+}
+
+#[test]
+fn r4_browseb20_workflow_error_is_fatal() {
+    // `browse` runs in the toolset runtime: workflow errors escape
+    // into a fatal (255). An unresolvable target with an injected
+    // failing caller exercises the fatal arm without network.
+    let dir = std::env::temp_dir();
+    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        Err("boom".to_string())
+    };
+    let mut input: &[u8] = &[];
+    let options = match parse_args(&argv(&["T999"])) {
+        Parsed::Options(options) => options,
+        _ => panic!("expected options"),
+    };
+    assert_eq!(
+        run_prepared(&dir, &options, &call, "", &mut input),
+        std::process::ExitCode::from(255)
     );
 }

@@ -462,13 +462,15 @@ fn lint_everything_covers_tracked_only() {
         Some(2)
     );
     // ...and to the status selection (which is empty here).
+    // T1153 R4 (LINT-1): "No paths are lintable." is
+    // `ArcanistNoEffectException`: stdout + exit 0, not exit 1.
     assert_eq!(
         code(run_in_with(
             tmp.path(),
             &["--rev", "HEAD", "--output", "none"],
             ""
         )),
-        Some(1)
+        Some(0)
     );
 }
 
@@ -549,6 +551,8 @@ fn lint_comprehensive_and_single_engines() {
         Some(2)
     );
     // `externals/` is excluded: nothing lintable.
+    // T1153 R4 (LINT-1): "No paths are lintable." is
+    // `ArcanistNoEffectException`: stdout + exit 0, not exit 1.
     tmp.write("externals/a.php", "ok\nx\ty\n");
     assert_eq!(
         code(run_in(
@@ -561,7 +565,7 @@ fn lint_comprehensive_and_single_engines() {
                 "none"
             ]
         )),
-        Some(1)
+        Some(0)
     );
 
     // Single runs one linter class.

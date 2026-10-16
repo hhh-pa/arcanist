@@ -239,3 +239,24 @@ fn execute_propagates_conduit_errors() {
     let err = execute(&client, &options).unwrap_err();
     assert!(!err.is_empty());
 }
+
+#[test]
+fn r4_rbd4_parse_and_working_copy_are_usage() {
+    // `list` is a subprocess workflow: argument and working-copy
+    // errors render `Usage Exception:` (exit 1) with no usage dump.
+    assert_eq!(
+        run_in(&std::env::temp_dir(), &args(&["--bogus"])),
+        std::process::ExitCode::FAILURE
+    );
+    let dir = std::env::temp_dir().join(format!(
+        "arc-rs-list-r4-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    assert_eq!(run_in(&dir, &args(&[])), std::process::ExitCode::FAILURE);
+    std::fs::remove_dir_all(&dir).ok();
+}

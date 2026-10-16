@@ -1827,3 +1827,44 @@ fn r5_lint8_confirm_with_tty_gates_pipes() {
     let mut enter = std::io::BufReader::new("\n".as_bytes());
     assert!(confirm_with_tty("Amend HEAD with lint patches?", true, &mut enter, true).unwrap());
 }
+
+#[test]
+fn r4_lint1_no_effect_kinds() {
+    use arc_rs::conduit::EnvelopeKind;
+    // Both `ArcanistNoEffectException` sites route to stdout + exit 0.
+    assert_eq!(
+        classify_gather_error("No paths are lintable.".to_string()).kind,
+        EnvelopeKind::NoEffect
+    );
+    let error = arc_rs::conduit::ClassifiedError::no_effect("No linters to run.".to_string());
+    assert_eq!(error.kind, EnvelopeKind::NoEffect);
+    assert_eq!(error.kind.exit_code(), std::process::ExitCode::SUCCESS);
+}
+
+#[test]
+fn r4_lint2_lint3_gather_emit_kinds() {
+    use arc_rs::conduit::EnvelopeKind;
+    // Amend declines are usage; renderer and git failures are generic.
+    assert_eq!(
+        classify_emit_error(
+            "Sort out the lint changes that were applied to the working copy and relint."
+                .to_string()
+        )
+        .kind,
+        EnvelopeKind::Usage
+    );
+    assert_eq!(
+        classify_emit_error("Lint renderer \"x\" is unknown.".to_string()).kind,
+        EnvelopeKind::Exception
+    );
+    assert_eq!(
+        classify_gather_error("failed to run git: boom".to_string()).kind,
+        EnvelopeKind::Exception
+    );
+    // Usage renders with no dump: the classified parse path keeps the
+    // bare message (the `Usage Exception:` label applies at `run_in`).
+    assert!(matches!(
+        parse_args(&["--bogus".to_string()]),
+        ParseOutcome::Error(_)
+    ));
+}

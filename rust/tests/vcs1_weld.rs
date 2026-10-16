@@ -112,9 +112,11 @@ fn missing_file_fails() {
     dir.write("a.txt", b"a\n");
     let err = weld::execute(dir.path(), &args(&["a.txt", "nope.txt"])).unwrap_err();
     assert!(err.contains("cannot read 'nope.txt'"), "unexpected: {err}");
+    // T1153 R4 (CORE-49): `weld` is a toolset workflow; read
+    // failures escape into a PHP fatal (255), not exit 1.
     assert_eq!(
         weld::run_in(dir.path(), &args(&["a.txt", "nope.txt"])),
-        ExitCode::FAILURE
+        ExitCode::from(255)
     );
 }
 

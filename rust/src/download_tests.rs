@@ -266,3 +266,45 @@ fn r3_dld12_file_search_follows_after_cursor() {
     assert!(!seen[0].contains("after"), "{}", seen[0]);
     assert!(seen[1].contains("after"), "{}", seen[1]);
 }
+
+#[test]
+fn r4_dld2_arg_errors_are_toolset_usage() {
+    // `didParseArguments()` raising `ArcanistUsageException` is dead
+    // in the toolset path: the live errors are toolset usage (exit
+    // 1), so only the presentation changes, never the exit.
+    assert!(is_toolset_usage_message(
+        "File \"F9\" does not exist, or you do not have permission to view it."
+    ));
+    assert!(is_toolset_usage_message("File \"/tmp/x\" already exists."));
+    // Parse errors carry no usage dump.
+    match parse_args(&argv(&[])) {
+        ParseOutcome::Error(message) => assert!(!message.contains("usage:"), "{message}"),
+        _ => panic!("expected parse error"),
+    }
+    match execute(&std::env::temp_dir(), &argv(&[])) {
+        Err(message) => assert!(!message.contains("usage:"), "{message}"),
+        _ => panic!("expected error"),
+    }
+}
+
+#[test]
+fn r4_dld10_conduit_setup_is_fatal() {
+    // Conduit setup failures (deterministic: no token can exist for
+    // `.invalid`) escape into a fatal, like HTTP failures.
+    assert_eq!(
+        run_in(
+            &std::env::temp_dir(),
+            &argv(&["--conduit-uri", "https://download-test.invalid/", "F1"])
+        ),
+        std::process::ExitCode::from(255)
+    );
+}
+
+#[test]
+fn r4_dld10_http_errors_are_fatal() {
+    // HTTP, size-mismatch, and write failures are uncaught
+    // `Exception`s: fatal (255), never toolset usage.
+    assert!(!is_toolset_usage_message("download failed: HTTP 500"));
+    assert!(!is_toolset_usage_message(&size_mismatch_error(1, 2)));
+    assert!(!is_toolset_usage_message("failed to write \"x\": boom"));
+}

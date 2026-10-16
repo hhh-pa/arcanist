@@ -229,3 +229,27 @@ fn r3_uploadu16_file_search_follows_after_cursor() {
     assert!(!seen[0].contains("after"), "{}", seen[0]);
     assert!(seen[1].contains("after"), "{}", seen[1]);
 }
+
+#[test]
+fn r4_uploadu15_aggregate_errors_are_fatal() {
+    // `upload` is a toolset workflow: aggregate and resolve errors
+    // are uncaught `Exception`s (fatal, 255), while argument errors
+    // stay toolset usage (exit 1) with no usage dump.
+    match execute(&std::env::temp_dir(), &argv(&[])) {
+        Err(message) => assert!(!message.contains("usage:"), "{message}"),
+        _ => panic!("expected parse error"),
+    }
+    assert_eq!(
+        run_in(&std::env::temp_dir(), &argv(&["--bogus"])),
+        std::process::ExitCode::FAILURE
+    );
+    // Conduit setup failures (deterministic: no token can exist for
+    // `.invalid`) escape into a fatal, like aggregate errors.
+    assert_eq!(
+        run_in(
+            &std::env::temp_dir(),
+            &argv(&["--conduit-uri", "https://upload-test.invalid/", "f.bin"])
+        ),
+        std::process::ExitCode::from(255)
+    );
+}

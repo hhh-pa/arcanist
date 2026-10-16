@@ -447,3 +447,41 @@ fn execute_bytes_encodes_to_target_at_sink() {
     assert_eq!(err, "Unknown encoding \"shift-jis\".");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn r4_exporte7_empty_local_export_errors() {
+    // `parseDiff()` throws on blank input; only local sources check
+    // (conduit sources never pass through the parser).
+    assert_eq!(
+        reject_empty_diff(b"").unwrap_err(),
+        "Can't parse an empty diff!"
+    );
+    assert!(reject_empty_diff(b"  \n\t ").is_err());
+    assert!(reject_empty_diff(b"diff --git a/f b/f\n").is_ok());
+    let dir = fixture_repo("r4-e7");
+    std::fs::write(dir.join("f.txt"), "f\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "x"]);
+    let err = execute(&dir, &argv(&["--git"])).unwrap_err();
+    assert_eq!(err, "Can't parse an empty diff!");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn r4_exporte28_multi_positional_message_and_exit() {
+    // PHP's `parseBaseCommitArgument()` text; the exit was and stays
+    // 1 (`export` is a subprocess workflow — never 255).
+    match parse_args(&argv(&["--git", "a", "b"])) {
+        ParseOutcome::Error(message) => assert_eq!(
+            message,
+            "Specify exactly one base commit. The end of the commit range is always the working copy state."
+        ),
+        _ => panic!("expected parse error"),
+    }
+    let dir = fixture_repo("r4-e28");
+    assert_eq!(
+        run_in(&dir, &argv(&["--git", "a", "b"])),
+        std::process::ExitCode::FAILURE
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

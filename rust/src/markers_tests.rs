@@ -561,3 +561,34 @@ fn styled_rows_carry_escapes_only_on_tty() {
         "got: {status}"
     );
 }
+
+#[test]
+fn r4_rbd4_toolset_usage_matcher() {
+    // Support-gate, outside-repo, limit, and bad-type errors are
+    // toolset usage (exit 1); query failures escape into a fatal.
+    assert!(is_toolset_usage_message(
+        "not inside a working copy (no git repository or Mercurial '.hg' directory found)"
+    ));
+    assert!(is_toolset_usage_message("not inside a git repository"));
+    assert!(is_toolset_usage_message(
+        "The version control system (\"svn\") in the current working copy does not support branches."
+    ));
+    assert!(is_toolset_usage_message(
+        "Found more than 1,000 unpublished commits which are ancestors of heads."
+    ));
+    assert!(is_toolset_usage_message("unknown marker type 'zzz'"));
+    assert!(!is_toolset_usage_message("failed to run git: boom"));
+    assert!(!is_toolset_usage_message("boom"));
+}
+
+#[test]
+fn r4_rbd4_parse_error_has_no_dump() {
+    match execute(&std::env::temp_dir(), &args(&["--bogus"])) {
+        Err(message) => assert!(!message.contains("usage:"), "{message}"),
+        _ => panic!("expected parse error"),
+    }
+    assert_eq!(
+        run_in(&std::env::temp_dir(), &args(&["--bogus"])),
+        std::process::ExitCode::FAILURE
+    );
+}

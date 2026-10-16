@@ -20,6 +20,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
+use crate::conduit::{self, EnvelopeKind};
 use crate::diff_local::{
     FILE_TEXT, TYPE_ADD, TYPE_COPY_AWAY, TYPE_COPY_HERE, TYPE_MOVE_AWAY, TYPE_MOVE_HERE,
 };
@@ -235,7 +236,16 @@ impl Parser {
 
     fn positional(&mut self, arg: &str) -> Step {
         if self.positional.is_some() {
-            Step::Done(ParseOutcome::Error("unexpected extra argument".to_string()))
+            // T1153 R4 (EXPORT-E28): PHP's `parseBaseCommitArgument()`
+            // (`ArcanistWorkflow.php:1834-1840`) throws
+            // `ArcanistUsageException`, rendered `Usage Exception:`
+            // with exit 1 (the "exit" half of E28 already matches; the
+            // "255" reading does not reproduce — `export` is a
+            // subprocess workflow).
+            Step::Done(ParseOutcome::Error(
+                "Specify exactly one base commit. The end of the commit range is always the working copy state."
+                    .to_string(),
+            ))
         } else {
             self.positional = Some(arg.to_string());
             Step::Handled
@@ -479,6 +489,25 @@ pub fn local_diff_bytes(dir: &Path, format: Format, base: &str) -> Result<Vec<u8
 /// Local `git diff` of the working tree against `base` in `format`.
 pub fn local_diff(dir: &Path, format: Format, base: &str) -> Result<String, String> {
     crate::patch::decode_bytes(&local_diff_bytes(dir, format, base)?, None)
+}
+
+/// Reject an empty local diff like `ArcanistDiffParser::parseDiff()`,
+/// which throws on `!strlen(trim($diff))`
+/// (`src/parser/ArcanistDiffParser.php:189-192`). Conduit sources never
+/// pass through `parseDiff`, so only local call sites check.
+fn reject_empty_diff(bytes: &[u8]) -> Result<(), String> {
+    let blank = bytes
+        .iter()
+        .all(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'\0' | 0x0B));
+    if blank {
+        // T1153 R4 (EXPORT-E7): PHP throws a generic `Exception`,
+        // rendered under the red banner with exit 1 — the "255"
+        // reading does not reproduce (`export` is a subprocess
+        // workflow), but erroring (vs printing `''`/an empty bundle)
+        // does.
+        return Err("Can't parse an empty diff!".to_string());
+    }
+    Ok(())
 }
 
 /// Decode patch bytes with `--encoding` (input direction: foreign bytes
@@ -860,6 +889,7 @@ fn local_bundle_parts(
     client: &crate::conduit::Client,
 ) -> Result<(Vec<serde_json::Value>, serde_json::Value), String> {
     let bytes = local_diff_bytes(dir, Format::Git, base)?;
+    reject_empty_diff(&bytes)?;
     let parsed = crate::diff_local::parse_unified_diff(&String::from_utf8_lossy(&bytes))?;
     let changes = changes_json(&parsed);
     let base_revision = crate::git::stdout_text(dir, &["rev-parse", base])?;
@@ -926,7 +956,8 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
     let opts = match parse_args(argv) {
         ParseOutcome::Args(opts) => opts,
         ParseOutcome::Help => return Ok(usage()),
-        ParseOutcome::Error(message) => return Err(format!("{message}\n\n{}", usage())),
+        // T1153 R4 (EXPORT-E28): PHP renders usage errors with no dump.
+        ParseOutcome::Error(message) => return Err(message),
     };
     execute_with_opts(dir, &opts)
 }
@@ -940,6 +971,7 @@ fn execute_with_opts(dir: &Path, opts: &Options) -> Result<String, String> {
         Source::Local { base } => {
             let base = base.as_deref().unwrap_or("HEAD");
             let bytes = local_diff_bytes(dir, opts.format.clone(), base)?;
+            reject_empty_diff(&bytes)?;
             decode_patch(&bytes, opts.encoding.as_deref())
         }
         Source::Revision(id) => {
@@ -961,7 +993,8 @@ pub fn execute_bytes(dir: &Path, argv: &[String]) -> Result<Vec<u8>, String> {
     let opts = match parse_args(argv) {
         ParseOutcome::Args(opts) => opts,
         ParseOutcome::Help => return Ok(usage().into_bytes()),
-        ParseOutcome::Error(message) => return Err(format!("{message}\n\n{}", usage())),
+        // T1153 R4 (EXPORT-E28): PHP renders usage errors with no dump.
+        ParseOutcome::Error(message) => return Err(message),
     };
     let text = execute_with_opts(dir, &opts)?;
     if matches!(opts.format, Format::Bundle { .. }) {
@@ -981,8 +1014,17 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            ExitCode::FAILURE
+            // T1153 R4 (EXPORT-E7, EXPORT-E28, RB-D4): `export` is a
+            // subprocess workflow. Argument errors render `Usage
+            // Exception:` (exit 1); empty diffs, conduit failures,
+            // and not-found errors are generic exceptions under the
+            // red banner (exit 1, never 255).
+            let kind = if matches!(parse_args(argv), ParseOutcome::Error(_)) {
+                EnvelopeKind::Usage
+            } else {
+                EnvelopeKind::Exception
+            };
+            conduit::report(kind, &message)
         }
     }
 }

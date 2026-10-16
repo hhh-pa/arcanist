@@ -42,6 +42,7 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use crate::conduit::ClassifiedError;
 use crate::terminal::{self, PhtArg, TVal};
 
 pub const NAME: &str = "liberate";
@@ -431,7 +432,8 @@ pub fn execute_with_input(
     let opts = match parse_args(argv) {
         ParseOutcome::Args(opts) => opts,
         ParseOutcome::Help => return Ok(usage()),
-        ParseOutcome::Error(message) => return Err(format!("{message}\n\n{}", usage())),
+        // T1153 R4 (CORE-21): PHP renders usage errors with no dump.
+        ParseOutcome::Error(message) => return Err(message),
     };
     let paths = match opts.path {
         Some(path) => vec![dir.join(&path)],
@@ -495,22 +497,30 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
     execute_with_input(dir, argv, &mut locked)
 }
 
+/// Classify a workflow error for the R4 envelope: parser errors
+/// are toolset usage (exit 1); declined prompts (`cancelled: ...`)
+/// are `ArcanistUserAbortException` (the `---` arm, exit 1);
+/// no-libraries and ancient/unknown versions throw
+/// `ArcanistUsageException`, which escapes the toolset runtime into a
+/// PHP fatal (255). Per-library rebuild failures never reach here
+/// (`Ok` above).
+fn classify_error(argv: &[String], message: String) -> ClassifiedError {
+    if matches!(parse_args(argv), ParseOutcome::Error(_)) {
+        ClassifiedError::toolset_usage(message)
+    } else if message.starts_with("cancelled: ") {
+        ClassifiedError::user_abort(message)
+    } else {
+        ClassifiedError::fatal(message)
+    }
+}
+
 pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
     match execute(dir, argv) {
         Ok(text) => {
             print!("{text}");
             ExitCode::SUCCESS
         }
-        Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            // Usage-class failures (argument errors, no libraries found,
-            // ancient/unknown versions, declined prompts) throw
-            // `ArcanistUsageException` in PHP, which escapes the runtime
-            // and fails the CLI; the port reports the same clean message
-            // with the caught-usage exit code instead of a fatal trace.
-            // Per-library rebuild failures never reach here (`Ok` above).
-            ExitCode::FAILURE
-        }
+        Err(message) => classify_error(argv, message).report(),
     }
 }
 

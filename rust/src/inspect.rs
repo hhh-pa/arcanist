@@ -23,7 +23,11 @@ use std::process::ExitCode;
 // into lib.rs and when included standalone by an integration test.
 extern crate self as arc_rs;
 
-use arc_rs::{browse, config, diff_submit, git};
+use arc_rs::{
+    browse,
+    conduit::{self, EnvelopeKind},
+    config, diff_submit, git,
+};
 
 /// Subcommand name, matching `arc inspect`.
 pub const NAME: &str = "inspect";
@@ -300,8 +304,10 @@ fn parse_inspect_options(argv: &[String]) -> Result<Options, ExitCode> {
             Err(ExitCode::SUCCESS)
         }
         ParseOutcome::Error(message) => {
-            eprintln!("arc {NAME}: {message}\n\n{}", usage());
-            Err(ExitCode::FAILURE)
+            // T1153 R4 (RB-D4): `inspect` is a toolset workflow:
+            // parser errors render the red `USAGE EXCEPTION` label
+            // with no usage dump.
+            Err(conduit::report(EnvelopeKind::ToolsetUsage, &message))
         }
         ParseOutcome::Args(options) => Ok(options),
     }
@@ -326,6 +332,21 @@ fn wants_browse_client(options: &Options) -> bool {
     options.explore && options.objects.iter().any(|spec| is_browse_spec(spec))
 }
 
+/// True for the spec-shape errors PHP raises as
+/// `PhutilArgumentUsageException` (exit 1 under the `USAGE EXCEPTION`
+/// label): malformed specs and unknown object types
+/// (`ArcanistInspectWorkflow.php:62-78`), the working-copy gate (a
+/// "must be run in ..." refusal like land's), and the arity guards.
+/// Anything else (bad commits, render failures) escapes into a fatal.
+fn is_toolset_usage_message(message: &str) -> bool {
+    (message.starts_with("Object specification \"")
+        && message.contains("\" is unknown, expected a specification like \"commit(HEAD)\"."))
+        || message.starts_with("Unknown object type \"")
+        || message.starts_with("Expected exactly one argument to \"")
+        || message
+            == "\"arc inspect\" must be run in a Git working copy to inspect \"working-copy(...)\"."
+}
+
 fn finish_inspect_blocks(
     dir: &Path,
     options: &Options,
@@ -336,8 +357,14 @@ fn finish_inspect_blocks(
         match inspect_one_with(dir, spec, options.explore, ctx.as_deref_mut()) {
             Ok(block) => blocks.push(block),
             Err(message) => {
-                eprintln!("arc {NAME}: {message}");
-                return ExitCode::FAILURE;
+                // T1153 R4 (RB-D4): spec-shape errors are toolset
+                // usage (exit 1); the rest escape into a fatal (255).
+                let kind = if is_toolset_usage_message(&message) {
+                    EnvelopeKind::ToolsetUsage
+                } else {
+                    EnvelopeKind::Fatal
+                };
+                return conduit::report(kind, &message);
             }
         }
     }
@@ -366,10 +393,7 @@ fn run_inspect_objects(
                 let mut ctx = browse::BrowseCtx::new(dir, &live, "");
                 finish_inspect_blocks(dir, options, Some(&mut ctx))
             }
-            Err(message) => {
-                eprintln!("arc {NAME}: {message}");
-                ExitCode::FAILURE
-            }
+            Err(message) => conduit::report(EnvelopeKind::Fatal, &message),
         },
     }
 }

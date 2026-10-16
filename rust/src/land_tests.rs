@@ -2727,9 +2727,10 @@ fn execute_help_parse_error_and_non_repo() {
     let mut io = Io::canned(&[]);
     let out = execute_with_io(&dir, &args(&["--help"]), &mut io).unwrap();
     assert_eq!(out.stdout, USAGE);
+    // T1153 R4 (LAND-37): PHP renders usage errors with no usage
+    // dump; the envelope (`USAGE EXCEPTION` label) applies at `run_in`.
     let err = execute_with_io(&dir, &args(&["--nope"]), &mut Io::canned(&[])).unwrap_err();
-    assert!(err.starts_with("Unknown argument 'nope'."));
-    assert!(err.contains("usage: arc land"));
+    assert_eq!(err, "Unknown argument 'nope'. Try 'arc help'.");
     let err = execute_with_io(&dir, &args(&["--preview"]), &mut Io::canned(&[])).unwrap_err();
     assert_eq!(err, NOT_GIT_OR_HG);
     let out = execute(&dir, &args(&["--help"])).unwrap();
@@ -3369,6 +3370,50 @@ fn r6_land13_onto_reads_full_merge() {
 }
 
 #[test]
+fn r4_land37_toolset_usage_matcher() {
+    use arc_rs::conduit::EnvelopeKind;
+    // Engine errors PHP raises as `PhutilArgumentUsageException`.
+    for message in [
+        "There are no commits to land.",
+        "Encountered a merge conflict.",
+        "Landing onto multiple branches at once is not supported in Mercurial.",
+        "TODO: You are forcing a revision, but ...",
+        "Symbol \"D1\" does not identify a valid revision.",
+        "Symbol \"x\" does not identify a bookmark, branch, or commit.",
+        "Symbol \"x\" is ambiguous.",
+        "Revision for commit \"abc\" is ambiguous. Use \"--revision\" to force selection of a particular revision.",
+        "Unable to determine revision for commit \"abc\".",
+        "Merging local \"abc\" into \"def\" produces an empty diff. This usually means these changes have already landed.",
+        "Branch \"b\" does not exist in the local working copy.",
+        "No pushable remote \"r\" exists. Use the \"--onto-remote\" flag to choose a valid, pushable remote to land changes onto.",
+        "Perforce mode does not support the \"merge\" land strategy. Use the \"squash\" land strategy when landing to a Perforce remote (you can use \"--squash\" to select this strategy).",
+        "The \"onto\" refs you have selected are connected to multiple different remotes via Git branch upstreams. Use \"--onto-remote\" to select a single remote.",
+        "The branches you are landing are connected to multiple different remote branches via Git branch upstreams. Use \"--onto\" to select the refs you want to push to.",
+        "Selected \"onto\" ref \"\" is invalid: the empty string is not a valid ref.",
+        "Remote \"r\", specified with \"--into\", is not a valid fetchable remote.",
+        "Local ref \"l\" does not exist.",
+        "Ref \"r\" does not exist in remote \"o\".",
+        "No remote \"r\" exists in this repository.",
+    ] {
+        assert!(is_toolset_usage_message(message), "{message}");
+    }
+    // Operation failures escape into a fatal instead.
+    for message in [
+        "Fetch of \"m\" from remote \"o\" failed! Fix the error and run \"arc land\" again.",
+        "Push failed! Fix the error and run \"arc land\" again.",
+        "Perforce sync failed! Fix the error and run \"arc land\" again.",
+        "Branch \"b\" does not rebase cleanly from \"a\" onto \"c\", halting.",
+        "transport exploded",
+    ] {
+        assert!(!is_toolset_usage_message(message), "{message}");
+    }
+    assert_ne!(
+        EnvelopeKind::ToolsetUsage.exit_code(),
+        EnvelopeKind::Fatal.exit_code()
+    );
+}
+
+#[test]
 fn r6_land13_strategy_and_remote_merge() {
     // LAND-13: `arc.land.strategy` and `arc.land.onto-remote` resolve
     // through the same merge (strategy via `validate_options`).
@@ -3433,4 +3478,40 @@ fn r6_core34_land_config_flags_parse() {
     assert_eq!(opts.config, ["a=1", "b=2"]);
     assert_eq!(opts.config_file, ["f"]);
     assert_eq!(opts.arcrc_file.as_deref(), Some("g"));
+}
+
+#[test]
+fn r4_land37_classified_parse_and_non_repo_are_usage() {
+    use arc_rs::conduit::EnvelopeKind;
+    let dir = temp_dir("r4-land37");
+    let err =
+        execute_with_io_classified(&dir, &args(&["--nope"]), &mut Io::canned(&[])).unwrap_err();
+    assert_eq!(err.kind, EnvelopeKind::ToolsetUsage);
+    assert_eq!(err.message, "Unknown argument 'nope'. Try 'arc help'.");
+    let err =
+        execute_with_io_classified(&dir, &args(&["--preview"]), &mut Io::canned(&[])).unwrap_err();
+    assert_eq!(err.kind, EnvelopeKind::ToolsetUsage);
+    assert_eq!(err.message, NOT_GIT_OR_HG);
+}
+
+#[test]
+fn r4_land37_engine_error_kinds() {
+    use arc_rs::conduit::EnvelopeKind;
+    // Declines surface as exactly `ABORT` (e.g. `prompt_for_key`
+    // with "n"), routed to the `---` arm (exit 1).
+    let mut io = Io::canned(&["n"]);
+    assert_eq!(prompt_for_key(&mut io, "k", "Land?").unwrap_err(), ABORT);
+    assert_eq!(
+        classify_engine_error(ABORT.to_string()).kind,
+        EnvelopeKind::UserAbort
+    );
+    assert_eq!(
+        classify_engine_error("There are no commits to land.".to_string()).kind,
+        EnvelopeKind::ToolsetUsage
+    );
+    assert_eq!(
+        classify_engine_error("Push failed! Fix the error and run \"arc land\" again.".to_string())
+            .kind,
+        EnvelopeKind::Fatal
+    );
 }

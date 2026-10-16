@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+use crate::conduit::{self, EnvelopeKind};
+
 pub const NAME: &str = "download";
 
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
@@ -433,12 +435,24 @@ fn format_saved(display_name: &str, display_path: &str) -> String {
     format!("Saved \"{display_name}\" as \"{display_path}\".\n")
 }
 
+/// True for the resolution errors PHP raises as
+/// `PhutilArgumentUsageException` in `runWorkflow()` (exit 1 under the
+/// `USAGE EXCEPTION` label): unknown files and occupied `--as` paths
+/// (`ArcanistDownloadWorkflow.php:70-109`). HTTP, size-mismatch, and
+/// write failures are uncaught `Exception`s: fatal (255).
+fn is_toolset_usage_message(message: &str) -> bool {
+    message.starts_with("File \"")
+        && (message.ends_with("\" does not exist, or you do not have permission to view it.")
+            || message.ends_with("\" already exists."))
+}
+
 /// Run the workflow rooted at `dir`, returning stdout text or an error message.
 pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
     let opts = match parse_args(argv) {
         ParseOutcome::Args(opts) => opts,
         ParseOutcome::Help => return Ok(usage()),
-        ParseOutcome::Error(message) => return Err(format!("{message}\n\n{}", usage())),
+        // T1153 R4 (DL-D2): PHP renders usage errors with no usage dump.
+        ParseOutcome::Error(message) => return Err(message),
     };
     let client = crate::config::client_for(opts.conduit_uri.as_deref())?;
     download_file_for_symbol(
@@ -457,8 +471,24 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            ExitCode::FAILURE
+            // T1153 R4 (DL-D2, DL-D10): `download` is a toolset
+            // workflow. Argument and resolution errors render the red
+            // `USAGE EXCEPTION` label (exit 1); HTTP and size failures
+            // escape into a PHP fatal (255). (`didParseArguments()`
+            // raising `ArcanistUsageException` is dead in the toolset
+            // path: the live `runWorkflow()` raises
+            // `PhutilArgumentUsageException`, caught at
+            // `ArcanistRuntime.php:38-39` — so DL-D2's "fatal 255" for
+            // arg errors does not reproduce; only the presentation
+            // changes there.)
+            let kind = if matches!(parse_args(argv), ParseOutcome::Error(_))
+                || is_toolset_usage_message(&message)
+            {
+                EnvelopeKind::ToolsetUsage
+            } else {
+                EnvelopeKind::Fatal
+            };
+            conduit::report(kind, &message)
         }
     }
 }

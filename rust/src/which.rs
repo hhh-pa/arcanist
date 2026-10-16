@@ -22,7 +22,10 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use arc_rs::{conduit, config, get_config, git, terminal};
+use arc_rs::{
+    conduit::{self, EnvelopeKind},
+    config, get_config, git, terminal,
+};
 
 /// Subcommand name, matching `arc which`.
 pub const NAME: &str = "which";
@@ -2055,8 +2058,10 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Parsed::Error(message) => {
-            eprintln!("arc {NAME}: {message}\n\n{USAGE}");
-            return ExitCode::FAILURE;
+            // T1153 R4 (RB-D4): `which` is a subprocess workflow, so
+            // usage errors render `Usage Exception:` with no usage dump
+            // (`scripts/arcanist.php:432-444`).
+            return conduit::report(EnvelopeKind::Usage, &message);
         }
         Parsed::Options(options) => options,
     };
@@ -2097,10 +2102,9 @@ pub fn run(argv: &[String]) -> ExitCode {
         &resolution,
     ) {
         Ok(ctx) => ctx,
-        Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            return ExitCode::FAILURE;
-        }
+        // T1153 R4 (RB-D4): context/resolution failures are generic
+        // exceptions under the red banner (`:449-468`).
+        Err(message) => return conduit::report(EnvelopeKind::Exception, &message),
     };
     if options.json {
         println!(
@@ -2123,15 +2127,15 @@ fn run_show_base(
     runtime_rules: &str,
 ) -> ExitCode {
     if !git::is_inside_work_tree(cwd) {
-        eprintln!("arc {NAME}: no commit range outside a working copy");
-        return ExitCode::FAILURE;
+        // T1153 R4 (RB-D4): the working-copy gate is a usage error.
+        return conduit::report(
+            EnvelopeKind::Usage,
+            "no commit range outside a working copy",
+        );
     }
     let loaded = match load_config_sources(cwd, user_file) {
         Ok(loaded) => loaded,
-        Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            return ExitCode::FAILURE;
-        }
+        Err(message) => return conduit::report(EnvelopeKind::Exception, &message),
     };
     let inputs = BaseInputs {
         runtime_rules,
@@ -2142,10 +2146,7 @@ fn run_show_base(
             println!("{base}");
             ExitCode::SUCCESS
         }
-        Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            ExitCode::FAILURE
-        }
+        Err(message) => conduit::report(EnvelopeKind::Exception, &message),
     }
 }
 

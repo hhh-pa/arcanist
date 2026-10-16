@@ -352,3 +352,19 @@ fn xhpast_rules_table_has_one_ported_rule() {
     assert!(lines[1].contains("ID"));
     assert!(lines[3].contains("Unable to Parse"));
 }
+
+#[test]
+fn r4_lintersl24_usage_error_has_no_dump() {
+    // Argument errors render `Usage Exception:` with exit 1 and no
+    // usage dump (the label applies at `run_in`).
+    match parse_args(&["--bogus".to_string()]) {
+        ParseOutcome::Error(message) => {
+            assert!(!message.contains("usage:"), "{message}");
+        }
+        _ => panic!("expected parse error"),
+    }
+    assert_eq!(
+        run_in(Path::new("."), &["--bogus".to_string()]),
+        std::process::ExitCode::FAILURE
+    );
+}

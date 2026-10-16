@@ -838,3 +838,13 @@ fn r5_rb_d22_non_tty_throws_after_echo() {
     );
     assert!(!take_prompt_tty_failed());
 }
+
+#[test]
+fn r4_rbd4_parse_error_has_no_dump() {
+    // `which` is a subprocess workflow: argument errors render `Usage
+    // Exception:` (exit 1) with no usage dump.
+    assert_eq!(
+        run(&["--bogus".to_string()]),
+        std::process::ExitCode::FAILURE
+    );
+}

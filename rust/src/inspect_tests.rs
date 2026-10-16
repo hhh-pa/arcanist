@@ -341,3 +341,24 @@ fn ref_trees_carry_no_markup() {
     assert!(!out.contains('\x1b'), "{out}");
     assert!(!out.contains("**"), "{out}");
 }
+
+#[test]
+fn r4_rbd4_spec_errors_are_toolset_usage() {
+    // Malformed specs and unknown types are toolset usage (exit 1);
+    // bad commits escape into a fatal (255).
+    assert!(is_toolset_usage_message(
+        "Object specification \"x(y\" is unknown, expected a specification like \"commit(HEAD)\"."
+    ));
+    assert!(is_toolset_usage_message(
+        "Unknown object type \"zzz\", supported types are: browse, working-copy."
+    ));
+    assert!(is_toolset_usage_message(
+        "Expected exactly one argument to \"working-copy(...)\" with a commit hash."
+    ));
+    assert!(!is_toolset_usage_message("unknown commit \"zzz\"."));
+    let tmp = TempDir::new("r4-spec");
+    assert_eq!(
+        run_in(tmp.path(), &args(&["not a spec!!"])),
+        std::process::ExitCode::FAILURE
+    );
+}

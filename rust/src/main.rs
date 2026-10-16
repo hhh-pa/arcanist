@@ -7,10 +7,10 @@
 use std::process::ExitCode;
 
 use arc_rs::{
-    alias, amend, anoid, bookmarks, branches, browse, close_revision, commit, config, cover, diff,
-    download, export, get_config, inspect, install_certificate, land, liberate, lint, linters,
-    list, look, markers, paste, patch, set_config, tasks, terminal, todo, unit, upgrade, upload,
-    version, weld, which, work,
+    alias, amend, anoid, bookmarks, branches, browse, close_revision, commit, conduit, config,
+    cover, diff, download, export, get_config, inspect, install_certificate, land, liberate, lint,
+    linters, list, look, markers, paste, patch, set_config, tasks, terminal, todo, unit, upgrade,
+    upload, version, weld, which, work,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -180,19 +180,20 @@ fn run_call_conduit_with<R: std::io::Read, W: std::io::Write>(
     stdin: R,
     stdout: &mut W,
 ) -> ExitCode {
+    // T1153 R4: `call-conduit` is a toolset workflow
+    // (`ArcanistCallConduitWorkflow extends ArcanistArcWorkflow`), so
+    // every error below escapes `ArcanistRuntime::execute()` into a PHP
+    // fatal (exit 255): the stdin error is an `ArcanistUsageException`
+    // (`:51-55`), and transport/protocol failures are uncaught
+    // `Exception`s. Only `ConduitClientException` is caught, into the
+    // JSON envelope with exit 0 (`:57-74`).
     let params = match read_params_json(stdin) {
         Ok(value) => value,
-        Err(msg) => {
-            eprintln!("arc: {msg}");
-            return ExitCode::FAILURE;
-        }
+        Err(msg) => return conduit::report(conduit::EnvelopeKind::Fatal, &msg),
     };
     let client = match config::client_for(args.conduit_uri.as_deref()) {
         Ok(client) => client,
-        Err(msg) => {
-            eprintln!("arc: {msg}");
-            return ExitCode::FAILURE;
-        }
+        Err(msg) => return conduit::report(conduit::EnvelopeKind::Fatal, &msg),
     };
     // API errors land in the envelope with exit 0, exactly like PHP
     // (`:57-74`); transport failures stay hard errors.
@@ -201,10 +202,7 @@ fn run_call_conduit_with<R: std::io::Read, W: std::io::Write>(
         Err(arc_rs::conduit::Error::Api { code, info }) => {
             render_envelope(Some((&code, &info)), serde_json::Value::Null)
         }
-        Err(e) => {
-            eprintln!("arc: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(e) => return conduit::report(conduit::EnvelopeKind::Fatal, &e.to_string()),
     };
     // No trailing newline: PHP `echo`s the encoded blob as-is (`:67`).
     if stdout.write_all(text.as_bytes()).is_err() {
@@ -346,14 +344,21 @@ fn dispatch(argv: &[String]) -> ExitCode {
             eprintln!("{}", usage());
             ExitCode::FAILURE
         }
-        Action::Unknown(c) => {
-            eprintln!("arc: unknown command '{c}'\n\n{}", usage());
-            ExitCode::FAILURE
-        }
-        Action::Error(msg) => {
-            eprintln!("arc: {msg}\n\n{}", usage());
-            ExitCode::FAILURE
-        }
+        // T1153 R4 (CORE-49): unknown commands fall through to the
+        // `scripts/arcanist.php` subprocess, where `selectWorkflow()`
+        // throws `ArcanistUsageException` (`src/configuration/
+        // ArcanistConfiguration.php:108-116`): `Usage Exception:`
+        // with no usage dump. (Prefix/spelling resolution is
+        // CORE-16's; the message text stays Rust's.)
+        Action::Unknown(c) => conduit::report(
+            conduit::EnvelopeKind::Usage,
+            &format!("unknown command '{c}'"),
+        ),
+        // T1153 R4 (CORE-49): `call-conduit` argument errors are
+        // libphutil parser errors (`PhutilArgumentUsageException`) in
+        // the toolset runtime: the red `USAGE EXCEPTION` label, no
+        // usage dump.
+        Action::Error(msg) => conduit::report(conduit::EnvelopeKind::ToolsetUsage, &msg),
     }
 }
 
