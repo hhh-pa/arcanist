@@ -754,23 +754,16 @@ fn core17_terminator_needed_only_for_toolset_without_dashes() {
 }
 
 #[test]
-fn core19_classic_set_matches_ceb() {
-    // T1153 CORE-19: the classic subprocess sets `ARCANIST` for
-    // exactly the 16 legacy workflows (`scripts/arcanist.php:229`).
-    for name in ["diff", "which", "list", "tasks", "todo", "get-config"] {
-        assert!(is_classic_command(name), "{name}");
-    }
-    for name in [
-        "land",
-        "help",
-        "call-conduit",
-        "markers",
-        "browse",
-        "prompts",
-    ] {
-        assert!(!is_classic_command(name), "{name}");
-    }
-    assert_eq!(CLASSIC_COMMANDS.len(), 16);
+fn core19_all_commands_export_arcanist() {
+    // T1153 CORE-19 (R2): PHP putenvs `$command` after `selectWorkflow()`
+    // for every command (`scripts/arcanist.php:229`), so hook children of
+    // toolset-style commands inherit it too. `help` exercises a
+    // non-classic name through the real dispatch (no other test sets the
+    // process-once cell, so this read is deterministic).
+    let globals = Globals::default();
+    let code = dispatch_run("help", None, "help", &args(&["arc"]), &globals);
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(arc_rs::globals::command_name().as_deref(), Some("help"));
     // T1153 CORE-66: 37 concrete workflows at ceb (`browse` is real;
     // only `markers` is abstract).
     assert_eq!(ALL_WORKFLOWS.len(), 37);

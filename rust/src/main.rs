@@ -321,29 +321,6 @@ fn find_command_ci(name: &str) -> Option<CommandFn> {
 // T1153 RB-D5: `workflow_header`/`no_workflow_line` live in the shared
 // `help` renderer (`arc_rs::help`); call sites below use it directly.
 
-/// Classic (old-style) workflow names at ceb: everything concrete
-/// which is not in the toolset set. In-process these run the same
-/// `COMMANDS` runners, but with the classic subprocess conventions
-/// (`ARCANIST` set, usage envelopes, no `--` requirement).
-const CLASSIC_COMMANDS: &[&str] = &[
-    "close-revision",
-    "commit",
-    "cover",
-    "diff",
-    "export",
-    "get-config",
-    "install-certificate",
-    "lint",
-    "linters",
-    "list",
-    "patch",
-    "set-config",
-    "tasks",
-    "todo",
-    "unit",
-    "which",
-];
-
 /// Rust-only commands (abstract in PHP at ceb): they resolve and run
 /// in-process like toolset commands, but are excluded from spelling
 /// options so typo behavior stays PHP-faithful. Only `markers`
@@ -2630,10 +2607,6 @@ enum Resolution {
 
 /// True for the 16 legacy workflows (the classic subprocess sets
 /// `ARCANIST` for exactly these; toolset commands never see it).
-fn is_classic_command(name: &str) -> bool {
-    CLASSIC_COMMANDS.contains(&name)
-}
-
 /// `raiseUnknownCommand()`: `Unknown command '%s'. Try 'arc help'.`
 /// plus the sorted, 4-space `Did you mean:` list.
 fn format_unknown_command(command: &str, maybe: &[String]) -> String {
@@ -2823,11 +2796,11 @@ fn dispatch_run(
                 .unwrap_or_default()
         );
     }
-    if is_classic_command(name) {
-        // The classic subprocess exports the resolved command for
-        // hooks (`scripts/arcanist.php:229`).
-        arc_rs::globals::set_command_name(name.to_string());
-    }
+    // Every selected command exports its resolved name for hooks: PHP
+    // putenvs `$command` after `selectWorkflow()` rewrites it (exact,
+    // prefix-expanded, or spelling-corrected) for classic and
+    // toolset-style workflows alike (`scripts/arcanist.php:229`).
+    arc_rs::globals::set_command_name(name.to_string());
     match resolve_runner(name) {
         Some(run) => run(&argv[1..]),
         None if name == "help" => run_help(&[], globals.show_standard_options),

@@ -52,7 +52,7 @@ pub fn set_load_options(value: String) {
     let _ = LOAD_OPTIONS.set(value);
 }
 
-/// Record the resolved classic command name (the `ARCANIST` export,
+/// Record the resolved command name (the `ARCANIST` export,
 /// `scripts/arcanist.php:229`, T1153 CORE-19). `main`-only.
 ///
 /// Hook children inherit it through [`crate::proc_env::command`], which
@@ -124,7 +124,7 @@ pub fn load_options() -> Option<String> {
         .or_else(|| std::env::var("ARC_GLOBAL_LOAD_OPTIONS").ok())
 }
 
-/// The resolved classic command name, propagated to hook children by
+/// The resolved command name, propagated to hook children by
 /// [`crate::proc_env::command`] (see [`set_command_name`]).
 #[must_use]
 pub fn command_name() -> Option<String> {
