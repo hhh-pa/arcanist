@@ -4359,16 +4359,18 @@ fn has_patch_binary() -> bool {
 
 /// Fake `patch` binary routing through `git apply` (hermetic: system
 /// patch is absent on some machines and fails valid input on Windows
-/// CI). The shim applies the `-i` file in its cwd and echoes a fixed
-/// marker, propagating git's exit code. Returns `(program, prefix)`
-/// for `run_patch_file_with_argv` — the `.bat` needs `cmd /C` first.
+/// CI). The shim applies the `-i` file in its cwd with newline
+/// conversion disabled (else Windows git writes CRLF) and echoes a
+/// fixed marker, propagating git's exit code. Returns `(program,
+/// prefix)` for `run_patch_file_with_argv` — the `.bat` needs `cmd
+/// /C` first.
 fn fake_patch_shim(dir: &std::path::Path) -> (String, Vec<String>) {
     #[cfg(windows)]
     {
         let bat = dir.join("fakepatch.bat");
         std::fs::write(
             &bat,
-            "@echo off\r\ngit apply \"%~3\"\r\nset CODE=%errorlevel%\r\necho applied patch\r\nexit /b %CODE%\r\n",
+            "@echo off\r\ngit -c core.autocrlf=false apply \"%~3\"\r\nset CODE=%errorlevel%\r\necho applied patch\r\nexit /b %CODE%\r\n",
         )
         .unwrap();
         (
@@ -4381,7 +4383,7 @@ fn fake_patch_shim(dir: &std::path::Path) -> (String, Vec<String>) {
         let sh = dir.join("fakepatch.sh");
         std::fs::write(
             &sh,
-            "#!/bin/sh\ngit apply \"$3\"\ncode=$?\necho \"applied patch\"\nexit $code\n",
+            "#!/bin/sh\ngit -c core.autocrlf=false apply \"$3\"\ncode=$?\necho \"applied patch\"\nexit $code\n",
         )
         .unwrap();
         {
