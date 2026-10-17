@@ -222,7 +222,7 @@ jobs:
           files: rust/target/llvm-cov/lcov.info
           fail_ci_if_error: false
       - name: upload test results to codecov
-        if: ${{ !cancelled() }} && hashFiles('rust/target/nextest/default/junit.xml') != ''
+        if: ${{ !cancelled() && hashFiles('rust/target/nextest/default/junit.xml') != '' }}
         uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
