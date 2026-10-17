@@ -41,6 +41,7 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@v5
+      - uses: ./.github/actions/profile-runner
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -69,6 +70,7 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@v5
+      - uses: ./.github/actions/profile-runner
       - uses: dtolnay/rust-toolchain@stable
       # Cargo registry + target/ cache (T1170): warm runs skip crate
       # downloads and reuse prior compilation. `save-if` forces a save
@@ -96,6 +98,7 @@ jobs:
       GATE_IMAGE: ${{ vars.GATE_IMAGE || 'hhhpa/arcanist' }}
     steps:
       - uses: actions/checkout@v5
+      - uses: ./.github/actions/profile-runner
       # Cache key: every input the image depends on. A hit pulls the image
       # and runs the gates in it; a miss rebuilds, pushes, then runs.
       - name: compute image key
@@ -171,6 +174,10 @@ jobs:
           test -z "$(gofmt -l .)"
           go vet ./...
           go test ./...
+          # Platform-tagged files (e.g. runner-profile's OS probers)
+          # never compile on Linux CI otherwise; build every CI OS.
+          GOOS=windows go build ./...
+          GOOS=darwin go build ./...
       - name: build ci-tools binaries
         id: build-tools
         if: steps.tools-bin-cache.outputs.cache-hit != 'true'
@@ -238,6 +245,7 @@ jobs:
       actions: read # binary-cache restore (save owned by the gates job)
     steps:
       - uses: actions/checkout@v5
+      - uses: ./.github/actions/profile-runner
       # Same binary cache as the gates preamble: a hit means this
       # exact source hash already passed, so setup and tests skip.
       # Restore-only here; the gates job owns the save.
@@ -274,6 +282,7 @@ jobs:
         working-directory: rust
     steps:
       - uses: actions/checkout@v5
+      - uses: ./.github/actions/profile-runner
       - uses: dtolnay/rust-toolchain@stable
       # Cargo registry + target/ cache (T1170): warm runs skip crate
       # downloads and reuse prior compilation. `save-if` forces a save

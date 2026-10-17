@@ -6,7 +6,9 @@ Fast, silent, fully-covered CI: cargo builds reuse the GitHub Actions
 cache instead of re-downloading ~150 crates and recompiling from scratch
 on every run; no check-run carries warning annotations and no Rust build
 step emits `warning:` lines; project line coverage is 100% and enforced
-by the in-repo gates.
+by the in-repo gates. Every CI job also logs its runner's hardware
+profile (CPU, memory, storage) so per-execution performance can be
+understood.
 
 ## Background
 
@@ -48,6 +50,11 @@ by the in-repo gates.
    (unreachable-defensive arms). Raise the in-repo floor gates
    (`coverage-floor` default + `rust-quality-gates` floor constant,
    which must stay in sync per the `coverage-summary` comment) to 100.
+4. **Profiler** (`PROF`): every CI job logs its runner's hardware
+   profile — CPU count/model/frequency/cache, memory size, storage
+   sizes/types (+ Azure VM size on Linux) — to the step log and the
+   job summary via a local composite action running the in-repo Go
+   tool (`scripts/ci/go/cmd/runner-profile`, stdlib-only, no shell).
 
 ## Fix design
 
@@ -73,6 +80,13 @@ by the in-repo gates.
   adding tests that execute the lines — never `#[cfg(not(tarpaulin))]`
   style wholesale ignores. Update `coverage-floor` invocation(s),
   the floor constant, and golden summaries together.
+- `PROF`: new Go tool with OS probers behind build tags (Linux:
+  /proc + /sys + IMDS; macOS: sysctl; Windows: CIM via PowerShell),
+  pure parsers/renders unit-tested, plus a binary smoke test; a
+  composite action (`setup-go` + `go run`) wires one line into every
+  job. The CI Go gate gains `GOOS=windows/darwin go build ./...` so
+  platform-tagged files always compile in CI. The tool never fails
+  CI (exit 0, `unknown` degradation) and writes nothing to stderr.
 
 ## Tests
 
@@ -98,6 +112,8 @@ by the in-repo gates.
   (`workflow_dispatch`, builds without publishing) green; annotation
   sweep empty; Codecov statuses 100%/100%.
 - Cache proof comes from the *second* run's logs (first run warms).
+- Profiler proof: the hardware block appears in one job log per OS
+  (ubuntu/macos/windows) plus its step summary.
 
 ## Acceptance criteria
 
@@ -109,7 +125,9 @@ by the in-repo gates.
 3. `COV`: `codecov/project` 100% and patch 100% on the branch;
    in-repo floor gates set to 100 and green; no new coverage
    exclusions except individually-justified single lines.
-4. `michael-h-hu` review approves; squash-merge; master CI stays green.
+4. `PROF`: every job's log and step summary carry the hardware
+   profile on all three OSes (verified on the branch run).
+5. `michael-h-hu` review approves; squash-merge; master CI stays green.
 
 ## Non-goals
 

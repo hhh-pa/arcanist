@@ -1,0 +1,19 @@
+name: profile-runner
+description: >
+  Log the runner's hardware profile (CPU, memory, storage) to the step log
+  and the job summary, so per-execution performance can be understood
+  (T1170 PROF). Runs the in-repo Go profiler; no external dependencies
+  beyond setup-go.
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-go@v6
+      with:
+        go-version-file: scripts/ci/go/go.mod
+        # Single shot `go run`: nothing worth caching, and this keeps
+        # the caller jobs' least-privilege permissions untouched.
+        cache: false
+    - name: profile runner hardware
+      shell: bash
+      working-directory: ${{ github.workspace }}/scripts/ci/go
+      run: go run ./cmd/runner-profile
