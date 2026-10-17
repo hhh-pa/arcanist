@@ -544,11 +544,17 @@ fn b23_upgrade_help_matches_generated_format() {
 fn github_remote_parsing() {
     let cases = [
         (
-            "https://github.com/m-hu/arcanist.git",
-            Some("m-hu/arcanist"),
+            "https://github.com/hhh-pa/arcanist.git",
+            Some("hhh-pa/arcanist"),
         ),
-        ("https://github.com/m-hu/arcanist", Some("m-hu/arcanist")),
-        ("https://github.com/m-hu/arcanist/", Some("m-hu/arcanist")),
+        (
+            "https://github.com/hhh-pa/arcanist",
+            Some("hhh-pa/arcanist"),
+        ),
+        (
+            "https://github.com/hhh-pa/arcanist/",
+            Some("hhh-pa/arcanist"),
+        ),
         ("http://github.com/o/r.git", Some("o/r")),
         ("https://www.github.com/o/r", Some("o/r")),
         ("git@github.com:o/r.git", Some("o/r")),

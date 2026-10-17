@@ -16,8 +16,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/m-hu/arcanist/scripts/ci/go/internal/executil"
-	"github.com/m-hu/arcanist/scripts/ci/go/internal/pyjson"
+	"github.com/hhh-pa/arcanist/scripts/ci/go/internal/executil"
+	"github.com/hhh-pa/arcanist/scripts/ci/go/internal/pyjson"
 )
 
 const usage = `cargo-geiger gate (T968): fail when workspace ` + "`unsafe`" + ` grows.

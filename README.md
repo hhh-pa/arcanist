@@ -22,7 +22,7 @@ The shipped binary is named `arc` (the cargo package stays `arc-rs`).
 ## Install to PATH
 
 Prebuilt binaries for Linux, macOS, and Windows are attached to each
-[GitHub release](https://github.com/m-hu/arcanist/releases): download
+[GitHub release](https://github.com/hhh-pa/arcanist/releases): download
 `arc-<target>.tar.gz`, unpack it, and put `arc` on your `PATH`.
 
 Or build from source. From the repository root:

@@ -11,7 +11,7 @@ import (
 	"sort"
 	"strconv"
 
-	"github.com/m-hu/arcanist/scripts/ci/go/internal/lcov"
+	"github.com/hhh-pa/arcanist/scripts/ci/go/internal/lcov"
 )
 
 const usage = "Usage: coverage-floor <lcov.info> [floor=80.0]\n"

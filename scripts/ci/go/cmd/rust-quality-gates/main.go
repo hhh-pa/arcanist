@@ -26,8 +26,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/m-hu/arcanist/scripts/ci/go/internal/executil"
-	"github.com/m-hu/arcanist/scripts/ci/go/internal/lcov"
+	"github.com/hhh-pa/arcanist/scripts/ci/go/internal/executil"
+	"github.com/hhh-pa/arcanist/scripts/ci/go/internal/lcov"
 )
 
 const usage = `Rust quality gates (T968): audit, deny, udeps, geiger, complexity, coverage.
