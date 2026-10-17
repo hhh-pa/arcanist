@@ -82,9 +82,12 @@ understood.
   the floor constant, and golden summaries together.
 - `PROF`: new Go tool with OS probers behind build tags (Linux:
   /proc + /sys + IMDS; macOS: sysctl; Windows: CIM via PowerShell),
-  pure parsers/renders unit-tested, plus a binary smoke test; a
-  composite action (`setup-go` + `go run`) wires one line into every
-  job. The CI Go gate gains `GOOS=windows/darwin go build ./...` so
+  pure parsers/renders unit-tested, plus a binary smoke test. A
+  composite action wires one step into every job; like ci-tools, it
+  runs a prebuilt binary from the Actions cache, rebuilding (setup-go
+  + `go build`) and saving only on a miss. Cache keys are per
+  OS+job+source-hash so concurrent same-OS jobs never contend. The
+  CI Go gate gains `GOOS=windows/darwin go build ./...` so
   platform-tagged files always compile in CI. The tool never fails
   CI (exit 0, `unknown` degradation) and writes nothing to stderr.
 

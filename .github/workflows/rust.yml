@@ -42,6 +42,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/profile-runner
+        with:
+          cache-key: runner-profile-${{ runner.os }}-${{ github.job }}-${{ hashFiles('scripts/ci/go/**') }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -71,6 +73,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/profile-runner
+        with:
+          cache-key: runner-profile-${{ runner.os }}-${{ github.job }}-${{ hashFiles('scripts/ci/go/**') }}
       - uses: dtolnay/rust-toolchain@stable
       # Cargo registry + target/ cache (T1170): warm runs skip crate
       # downloads and reuse prior compilation. `save-if` forces a save
@@ -99,6 +103,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/profile-runner
+        with:
+          cache-key: runner-profile-${{ runner.os }}-${{ github.job }}-${{ hashFiles('scripts/ci/go/**') }}
       # Cache key: every input the image depends on. A hit pulls the image
       # and runs the gates in it; a miss rebuilds, pushes, then runs.
       - name: compute image key
@@ -242,10 +248,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read # checkout
-      actions: read # binary-cache restore (save owned by the gates job)
+      actions: write # profiler cache save; ci-tools restore only (gates owns that save)
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/profile-runner
+        with:
+          cache-key: runner-profile-${{ runner.os }}-${{ github.job }}-${{ hashFiles('scripts/ci/go/**') }}
       # Same binary cache as the gates preamble: a hit means this
       # exact source hash already passed, so setup and tests skip.
       # Restore-only here; the gates job owns the save.
@@ -283,6 +291,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/profile-runner
+        with:
+          cache-key: runner-profile-${{ runner.os }}-${{ github.job }}-${{ hashFiles('scripts/ci/go/**') }}
       - uses: dtolnay/rust-toolchain@stable
       # Cargo registry + target/ cache (T1170): warm runs skip crate
       # downloads and reuse prior compilation. `save-if` forces a save

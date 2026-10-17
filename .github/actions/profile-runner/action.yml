@@ -2,18 +2,36 @@ name: profile-runner
 description: >
   Log the runner's hardware profile (CPU, memory, storage) to the step log
   and the job summary, so per-execution performance can be understood
-  (T1170 PROF). Runs the in-repo Go profiler; no external dependencies
-  beyond setup-go.
+  (T1170 PROF). Runs the in-repo Go profiler from a prebuilt binary kept
+  in the Actions cache (rebuilt on miss, like ci-tools); no external
+  dependencies beyond setup-go.
+inputs:
+  cache-key:
+    description: >
+      Full cache key for the prebuilt profiler binary, including the OS,
+      the calling job (each job owns its entry, so concurrent same-OS
+      jobs never contend on one key), and the Go source hash, e.g.
+      runner-profile-${{ runner.os }}-${{ github.job }}-${{ hashFiles('scripts/ci/go/**') }}.
+    required: true
 runs:
   using: composite
   steps:
-    - uses: actions/setup-go@v6
+    - id: cache
+      uses: actions/cache@v5
+      with:
+        # The whole dir: the file inside is runner-profile(.exe)
+        # depending on the OS, and a dir path sidesteps that.
+        path: profiler-bin
+        key: ${{ inputs.cache-key }}
+    - if: steps.cache.outputs.cache-hit != 'true'
+      uses: actions/setup-go@v6
       with:
         go-version-file: scripts/ci/go/go.mod
-        # Single shot `go run`: nothing worth caching, and this keeps
-        # the caller jobs' least-privilege permissions untouched.
         cache: false
-    - name: profile runner hardware
+    - if: steps.cache.outputs.cache-hit != 'true'
       shell: bash
       working-directory: ${{ github.workspace }}/scripts/ci/go
-      run: go run ./cmd/runner-profile
+      run: CGO_ENABLED=0 go build -o "${{ github.workspace }}/profiler-bin/runner-profile" ./cmd/runner-profile
+    - name: profile runner hardware
+      shell: bash
+      run: "${{ github.workspace }}/profiler-bin/runner-profile"

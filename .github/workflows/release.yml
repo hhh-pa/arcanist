@@ -36,6 +36,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/profile-runner
+        with:
+          cache-key: runner-profile-${{ runner.os }}-${{ github.job }}-${{ hashFiles('scripts/ci/go/**') }}
       - uses: dtolnay/rust-toolchain@stable
       # Cargo registry + target/ cache (T1170): warm runs skip crate
       # downloads and reuse prior compilation. `save-if` forces a save
@@ -82,6 +84,8 @@ jobs:
         with:
           fetch-depth: 0
       - uses: ./.github/actions/profile-runner
+        with:
+          cache-key: runner-profile-${{ runner.os }}-${{ github.job }}-${{ hashFiles('scripts/ci/go/**') }}
       - uses: actions/download-artifact@v7
         with:
           path: dist
