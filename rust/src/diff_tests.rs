@@ -6980,3 +6980,97 @@ fn t1170_maybe_apply_full_update_failure_propagates() {
         .unwrap_err();
     assert_eq!(err, "query down");
 }
+
+#[test]
+fn t1173_stdio_split_phases_report_empty_without_engines() {
+    // T1173: `run_lint_unit_stdio_ansi` runs the lint phase first with
+    // no stdin guard held, then locks stdin fresh for the unit phase,
+    // assembling the same `LintUnitReport` the combined
+    // `run_lint_unit_ansi` would. A marker-only repo has neither
+    // engine, so both real children report `NoEngine` and the report
+    // is empty.
+    let dir = scratch_dir("t1173-noengines");
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    let report = run_lint_unit_stdio_ansi(&dir, &defaults(), None, None, false, false).unwrap();
+    assert_eq!(report, diff_local::LintUnitReport::empty());
+}
+
+#[test]
+fn t1173_stdio_split_phases_report_skip_when_flagged() {
+    // T1173: `--nolint`/`--nounit` skip each split phase exactly like
+    // the combined `run_lint_unit_ansi` (same order, flags, report).
+    let dir = scratch_dir("t1173-skip");
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    let options = Options {
+        nolint: true,
+        nounit: true,
+        ..defaults()
+    };
+    let report = run_lint_unit_stdio_ansi(&dir, &options, None, None, false, false).unwrap();
+    assert_eq!(
+        report,
+        diff_local::LintUnitReport {
+            lint_result: Some(diff_local::LINT_RESULT_SKIP),
+            unresolved_lint: Vec::new(),
+            unit_result: Some(diff_local::UNIT_RESULT_SKIP),
+            test_results: Vec::new(),
+        }
+    );
+}
+
+#[test]
+fn t1173_stdio_lint_child_locks_stdin_without_deadlock() {
+    // T1173 regression: the lint child locks stdin itself, so holding
+    // a `StdinLock` guard across it (the pre-fix shape) deadlocks this
+    // thread. An `.arclint` with zero linters resolves to an empty
+    // engine, driving the real child past its probe to its own
+    // `stdin.lock()` — then the workflow bails with `NoEffect` before
+    // any git or prompt interaction, so this completes promptly (and
+    // would hang forever on the old code).
+    let dir = scratch_dir("t1173-arclint");
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::write(dir.join(".arclint"), "{\"linters\": {}}\n").unwrap();
+    let report = run_lint_unit_stdio_ansi(&dir, &defaults(), None, None, false, false).unwrap();
+    assert_eq!(report, diff_local::LintUnitReport::empty());
+}
+
+#[test]
+fn t1173_stdio_lint_failure_aborts_before_unit() {
+    // T1173: a failing lint child aborts the split-phase run with its
+    // message, before stdin is locked for the unit phase. A bogus
+    // `lint.engine` fails the probe deterministically, without
+    // touching git or prompting.
+    let dir = scratch_dir("t1173-lintfail");
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::write(
+        dir.join(".arcconfig"),
+        "{\"lint.engine\": \"BogusEngine\"}\n",
+    )
+    .unwrap();
+    let err = run_lint_unit_stdio_ansi(&dir, &defaults(), None, None, false, false).unwrap_err();
+    assert_eq!(
+        err,
+        "Configured lint engine \"BogusEngine\" is not a subclass of \"ArcanistLintEngine\", but must be."
+    );
+}
+
+#[test]
+fn t1173_stdio_unit_failure_aborts_after_lint() {
+    // T1173: a failing unit child aborts the split-phase run with its
+    // message after the lint phase completes. A bogus `unit.engine`
+    // fails unit discovery deterministically (no lint engine here, so
+    // the lint phase reports `NoEngine` first), without prompting. A
+    // real `git init` repo is needed: the unit working-copy gate
+    // rejects marker-only dirs before discovery runs.
+    let dir = git_dir("t1173-unitfail");
+    std::fs::write(
+        dir.join(".arcconfig"),
+        "{\"unit.engine\": \"BogusEngine\"}\n",
+    )
+    .unwrap();
+    let err = run_lint_unit_stdio_ansi(&dir, &defaults(), None, None, false, false).unwrap_err();
+    assert_eq!(
+        err,
+        "Configured unit test engine \"BogusEngine\" is not a subclass of \"ArcanistUnitTestEngine\", but must be."
+    );
+}
