@@ -3061,6 +3061,17 @@ impl ParsedChange {
 /// `diff --cc` line recovers past itself only when a later `diff -r` /
 /// `diff --git` line starts a real block (`:260-272`), like PHP.
 pub fn parse_unified_diff(text: &str) -> Result<Vec<ParsedChange>, String> {
+    parse_unified_diff_inner(text, false)
+}
+
+/// [`parse_unified_diff`] over transport text (T1153 EXPORT-E9):
+/// identical structure, but C-quoted filenames decode byte-faithfully
+/// instead of lossily.
+pub fn parse_unified_diff_transport(text: &str) -> Result<Vec<ParsedChange>, String> {
+    parse_unified_diff_inner(text, true)
+}
+
+fn parse_unified_diff_inner(text: &str, transport: bool) -> Result<Vec<ParsedChange>, String> {
     let mut changes: Vec<ParsedChange> = Vec::new();
     let mut key_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut pending_message: Option<(String, Vec<String>)> = None;
@@ -3079,7 +3090,14 @@ pub fn parse_unified_diff(text: &str) -> Result<Vec<ParsedChange>, String> {
         if is_diff_header(line) {
             let force = changes.is_empty();
             flush_pending_message(&mut changes, &mut pending_message, force);
-            index = push_file_block_or_merge(&mut changes, &mut key_index, &lines, &raw, index)?;
+            index = push_file_block_or_merge(
+                &mut changes,
+                &mut key_index,
+                &lines,
+                &raw,
+                index,
+                transport,
+            )?;
             continue;
         }
         if is_combined_diff_header(line) {
@@ -3130,8 +3148,9 @@ fn push_file_block_or_merge(
     lines: &[&str],
     raw: &[&str],
     index: usize,
+    transport: bool,
 ) -> Result<usize, String> {
-    let (change, meta, next) = parse_file_block(lines, raw, index)?;
+    let (change, meta, next) = parse_file_block(lines, raw, index, transport)?;
     match &meta.key {
         Some(key) => match key_index.get(key) {
             Some(&at) => merge_duplicate_block(&mut changes[at], change, &meta),
@@ -3245,11 +3264,13 @@ fn diff_parse_error(raw: &[&str], line: usize, message: &str) -> String {
     let mut context = String::new();
     for (number, raw_line) in raw.iter().enumerate().take(max + 1).skip(min) {
         let marker = if number == line { ">>>  " } else { "" };
+        // Transport never leaks into the display: the lossy view matches
+        // the historical rendering, and is identical for escape-free input.
         context.push_str(&format!(
             "{} {}   {}",
             fit_right(marker, 8),
             fit_right(&(number + 1).to_string(), 6),
-            raw_line
+            crate::patch::untransport_lossy(raw_line)
         ));
     }
     format!("Diff Parse Exception: {message}\n\n{context}")
@@ -3394,7 +3415,28 @@ pub fn synthetic_hunks_for_path(
     raw_diff: &str,
     path: &str,
 ) -> Result<Option<SyntheticHunks>, String> {
-    for change in parse_unified_diff(raw_diff)? {
+    synthetic_hunks_for_path_inner(raw_diff, path, false)
+}
+
+/// [`synthetic_hunks_for_path`] over transport text (T1153 EXPORT-E9).
+pub fn synthetic_hunks_for_path_transport(
+    raw_diff: &str,
+    path: &str,
+) -> Result<Option<SyntheticHunks>, String> {
+    synthetic_hunks_for_path_inner(raw_diff, path, true)
+}
+
+fn synthetic_hunks_for_path_inner(
+    raw_diff: &str,
+    path: &str,
+    transport: bool,
+) -> Result<Option<SyntheticHunks>, String> {
+    let parsed = if transport {
+        parse_unified_diff_transport(raw_diff)?
+    } else {
+        parse_unified_diff(raw_diff)?
+    };
+    for change in parsed {
         if change.current_path == path {
             let hunks = change.hunks.iter().map(rewrite_synthetic_hunk).collect();
             return Ok(Some(SyntheticHunks {
@@ -3597,6 +3639,13 @@ pub fn with_companions(changes: &[ParsedChange]) -> Vec<ParsedChange> {
 /// options minus `-M`/`-C`, base commit only (no head: the worktree is
 /// always the other side), scoped to `path`.
 pub fn get_raw_diff_text(dir: &Path, base: &str, path: &str) -> Result<String, String> {
+    Ok(String::from_utf8_lossy(&get_raw_diff_bytes(dir, base, path)?).into_owned())
+}
+
+/// Raw re-diff bytes for one path (T1153 EXPORT-E9): the same `git
+/// diff` [`get_raw_diff_text`] runs, without the lossy decode, so
+/// byte-faithful pipelines can transport the output.
+pub fn get_raw_diff_bytes(dir: &Path, base: &str, path: &str) -> Result<Vec<u8>, String> {
     let mut options: Vec<String> = DIFF_BASE_OPTIONS
         .iter()
         .map(|option| (*option).to_string())
@@ -3619,7 +3668,7 @@ pub fn get_raw_diff_text(dir: &Path, base: &str, path: &str) -> Result<String, S
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(out.stdout)
 }
 
 /// Attach fabricated hunks to every change needing them (T1153
@@ -3632,12 +3681,34 @@ pub fn attach_synthetic_git_hunks(
     changes: &mut [ParsedChange],
     raw_diff_for: &dyn Fn(&str) -> Result<String, String>,
 ) -> Result<(), String> {
+    attach_synthetic_git_hunks_inner(changes, raw_diff_for, false)
+}
+
+/// [`attach_synthetic_git_hunks`] over transport text (T1153 EXPORT-E9):
+/// the re-diff closure must return transport too.
+pub fn attach_synthetic_git_hunks_transport(
+    changes: &mut [ParsedChange],
+    raw_diff_for: &dyn Fn(&str) -> Result<String, String>,
+) -> Result<(), String> {
+    attach_synthetic_git_hunks_inner(changes, raw_diff_for, true)
+}
+
+fn attach_synthetic_git_hunks_inner(
+    changes: &mut [ParsedChange],
+    raw_diff_for: &dyn Fn(&str) -> Result<String, String>,
+    transport: bool,
+) -> Result<(), String> {
     for change in changes.iter_mut() {
         if !needs_synthetic_git_hunks(change) {
             continue;
         }
         let raw = raw_diff_for(&change.current_path)?;
-        if let Some(made) = synthetic_hunks_for_path(&raw, &change.current_path)? {
+        let made = if transport {
+            synthetic_hunks_for_path_transport(&raw, &change.current_path)?
+        } else {
+            synthetic_hunks_for_path(&raw, &change.current_path)?
+        };
+        if let Some(made) = made {
             change.file_type = made.file_type;
             change.hunks = made.hunks;
             change.hunk_len_explicit = made.hunk_len_explicit;
@@ -3749,9 +3820,9 @@ struct FileBlockState {
 /// Git headers go through `extractGitCommonFilename()` (EXPORT-E16):
 /// quoted pairs decode, and renames/differs seed empty (recovered
 /// later from `rename from`/`rename to` or `---`/`+++` lines).
-fn seed_file_block_paths(header: &str) -> (String, String) {
+fn seed_file_block_paths(header: &str, transport: bool) -> (String, String) {
     if let Some(rest) = header.strip_prefix("diff --git ") {
-        if let Some(common) = extract_git_common_filename(rest) {
+        if let Some(common) = extract_git_common_filename(rest, transport) {
             return (common.clone(), common);
         }
         return (String::new(), String::new());
@@ -3801,18 +3872,18 @@ fn mode_value_after(line: &str, prefix: &str) -> Option<String> {
 /// Rename/copy paths decode C-quoting (`unescapeFilename()`,
 /// EXPORT-E16); mode lines retain their `unix:filemode` values
 /// (EXPORT-E13).
-fn apply_extended_header_line(line: &str, state: &mut FileBlockState) {
+fn apply_extended_header_line(line: &str, state: &mut FileBlockState, transport: bool) {
     if let Some(path) = line.strip_prefix("rename from ") {
-        state.rename_from = Some(unescape_git_filename(path.trim()));
+        state.rename_from = Some(unescape_git_filename(path.trim(), transport));
         state.is_rename = true;
     } else if let Some(path) = line.strip_prefix("rename to ") {
-        state.rename_to = Some(unescape_git_filename(path.trim()));
+        state.rename_to = Some(unescape_git_filename(path.trim(), transport));
         state.is_rename = true;
     } else if let Some(path) = line.strip_prefix("copy from ") {
-        state.rename_from = Some(unescape_git_filename(path.trim()));
+        state.rename_from = Some(unescape_git_filename(path.trim(), transport));
         state.is_copy = true;
     } else if let Some(path) = line.strip_prefix("copy to ") {
-        state.rename_to = Some(unescape_git_filename(path.trim()));
+        state.rename_to = Some(unescape_git_filename(path.trim(), transport));
         state.is_copy = true;
     } else if let Some(mode) = mode_value_after(line, "new file mode ") {
         state.new_file = true;
@@ -3830,13 +3901,18 @@ fn apply_extended_header_line(line: &str, state: &mut FileBlockState) {
 }
 
 /// Scan extended headers from `index`, returning the first body line.
-fn scan_extended_headers(lines: &[&str], state: &mut FileBlockState, mut index: usize) -> usize {
+fn scan_extended_headers(
+    lines: &[&str],
+    state: &mut FileBlockState,
+    mut index: usize,
+    transport: bool,
+) -> usize {
     while index < lines.len() {
         let line = lines[index];
         if is_extended_header_end(line) {
             break;
         }
-        apply_extended_header_line(line, state);
+        apply_extended_header_line(line, state, transport);
         index += 1;
     }
     index
@@ -4148,9 +4224,9 @@ struct FileBlockMeta {
 /// `buildChange()` key for a block header line (EXPORT-E24): the git
 /// common filename, the `Index:` path, or the `diff -r`/`diff -u`
 /// path. `None` (unkeyed, never merged) for renames and differs.
-fn block_key(header: &str) -> Option<String> {
+fn block_key(header: &str, transport: bool) -> Option<String> {
     if let Some(rest) = header.strip_prefix("diff --git ") {
-        return extract_git_common_filename(rest);
+        return extract_git_common_filename(rest, transport);
     }
     if let Some(rest) = header.strip_prefix("Index: ") {
         return Some(rest.trim().to_string());
@@ -4227,10 +4303,11 @@ fn parse_file_block(
     lines: &[&str],
     raw: &[&str],
     start: usize,
+    transport: bool,
 ) -> Result<(ParsedChange, FileBlockMeta, usize), String> {
     let header = lines[start];
-    let key = block_key(header);
-    let (old_path, new_path) = seed_file_block_paths(header);
+    let key = block_key(header, transport);
+    let (old_path, new_path) = seed_file_block_paths(header, transport);
     let mut state = FileBlockState {
         old_path,
         new_path,
@@ -4246,7 +4323,7 @@ fn parse_file_block(
         saw_plus: false,
     };
     // Extended headers up to `---`.
-    let mut index = scan_extended_headers(lines, &mut state, start + 1);
+    let mut index = scan_extended_headers(lines, &mut state, start + 1, transport);
 
     // `Index:` blocks key on the header path; `---`/`+++` only supply
     // the old path with `(...)` suffixes stripped (`parseHunkTarget()`,
@@ -4282,10 +4359,11 @@ fn strip_ab_prefix(path: &str) -> &str {
 /// `src/parser/ArcanistDiffParser.php:1229`, EXPORT-E16).
 ///
 /// Only fully double-quoted names decode; anything else stays literal
-/// (backslashes kept).
-fn unescape_git_filename(name: &str) -> String {
+/// (backslashes kept). `transport` selects the byte-faithful carry
+/// (T1153 EXPORT-E9) over the historical lossy decode.
+fn unescape_git_filename(name: &str, transport: bool) -> String {
     if name.len() > 2 && name.starts_with('"') && name.ends_with('"') {
-        stripcslashes(&name[1..name.len() - 1])
+        stripcslashes(&name[1..name.len() - 1], transport)
     } else {
         name.to_string()
     }
@@ -4345,10 +4423,19 @@ fn stripcslashes_escape(bytes: &[u8], pos: usize, out: &mut Vec<u8>) -> usize {
 ///
 /// Handles the C single-letter escapes git emits plus up to 3 octal
 /// digits and `\x` hex; anything else keeps the escaped char.
-/// Decoded bytes are lossy UTF-8, matching how hunk corpora already
-/// decode non-UTF-8 bytes elsewhere in this port.
-fn stripcslashes(text: &str) -> String {
-    let bytes = text.as_bytes();
+/// Decoded bytes are lossy UTF-8 by default, matching how hunk corpora
+/// already decode non-UTF-8 bytes elsewhere in this port; `transport`
+/// carries them byte-faithfully instead (T1153 EXPORT-E9).
+fn stripcslashes(text: &str, transport: bool) -> String {
+    // Transport mode decodes over the raw bytes (like PHP's byte
+    // strings) so smuggle sequences survive the round trip.
+    let owned;
+    let bytes = if transport {
+        owned = crate::patch::untransport_bytes(text);
+        owned.as_slice()
+    } else {
+        text.as_bytes()
+    };
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut pos = 0;
     while pos < bytes.len() {
@@ -4360,7 +4447,11 @@ fn stripcslashes(text: &str) -> String {
             pos += 1;
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    if transport {
+        crate::patch::transport_bytes(&out)
+    } else {
+        String::from_utf8_lossy(&out).into_owned()
+    }
 }
 
 /// Parse one `diff --git` path: a C-quoted name or a bare token up to
@@ -4405,7 +4496,7 @@ fn strip_one_prefix_segment(path: &str) -> &str {
 /// `a/`-style prefix, which is removed before comparing. Returns the
 /// unescaped common path, or `None` for renames/differs (recovered
 /// later from `rename from`/`rename to` lines).
-fn extract_git_common_filename(rest: &str) -> Option<String> {
+fn extract_git_common_filename(rest: &str, transport: bool) -> Option<String> {
     let rest = rest.trim_end_matches(['\r', '\n']);
     let (old, _, after_old) = parse_git_diff_path(rest)?;
     let after_old = after_old.strip_prefix(' ')?;
@@ -4419,7 +4510,7 @@ fn extract_git_common_filename(rest: &str) -> Option<String> {
         return None;
     }
     if new_quoted {
-        Some(stripcslashes(new_common))
+        Some(stripcslashes(new_common, transport))
     } else {
         Some(new_common.to_string())
     }

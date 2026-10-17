@@ -12,10 +12,9 @@
 //! writes a version-5 bundle tarball (`changes.json`, `meta.json`,
 //! `hunks/`, `blobs/`), mirroring `ArcanistBundle::writeToDisk()`.
 //!
-//! Known gaps: hunk corpora are parsed as UTF-8 (non-UTF-8 bytes become
-//! U+FFFD instead of staying raw); filemode properties and C-escaped
-//! paths are dropped by the diff parser; JSON escapes differ from PHP's
-//! `json_encode` (same parsed value).
+//! Known gaps: filemode properties and C-escaped paths are dropped by
+//! the diff parser; JSON escapes differ from PHP's `json_encode` (same
+//! parsed value).
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -847,6 +846,49 @@ fn normalize_conduit_hunk(hunk: &serde_json::Value) -> serde_json::Value {
     })
 }
 
+/// Escape every string in a conduit value tree (T1153 EXPORT-E9),
+/// so `write_bundle`'s un-escaping restores them byte-exactly.
+/// Marker-free values pass through unchanged.
+fn escape_json_strings(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => {
+            serde_json::Value::String(crate::patch::escape_transport_markers(text))
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(escape_json_strings).collect())
+        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(key, val)| (key.clone(), escape_json_strings(val)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Restore every string in a `changes.json` value tree (T1153
+/// EXPORT-E9): local entries ride as transport and conduit entries
+/// escaped at normalize, so all restore here. Byte-exact for
+/// escape-free trees; undecodable paths render lossily (PHP's
+/// `json_encode` fails on those instead — exotic, Linux-only
+/// filenames).
+fn untransport_json_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => {
+            serde_json::Value::String(crate::patch::untransport_lossy(text))
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(untransport_json_value).collect())
+        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(key, val)| (key.clone(), untransport_json_value(val)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 /// Normalize one conduit `changes[]` dict through
 /// `newFromDictionary()` + `toDictionary()` (T1153 EXPORT-E17): exactly
 /// the 10 keys (extras like `id` dropped), values passing through.
@@ -859,7 +901,7 @@ fn normalize_conduit_change(change: &serde_json::Value) -> serde_json::Value {
         .and_then(|h| h.as_array())
         .map(|items| items.iter().map(normalize_conduit_hunk).collect())
         .unwrap_or_default();
-    serde_json::json!({
+    escape_json_strings(&serde_json::json!({
         "metadata": field("metadata"),
         "oldPath": field("oldPath"),
         "currentPath": field("currentPath"),
@@ -870,7 +912,7 @@ fn normalize_conduit_change(change: &serde_json::Value) -> serde_json::Value {
         "fileType": field("fileType"),
         "commitHash": field("commitHash"),
         "hunks": hunks,
-    })
+    }))
 }
 
 /// Replace inline hunk corpora with their numeric file IDs, collecting
@@ -1113,8 +1155,9 @@ fn write_bundle(
 ) -> Result<(), String> {
     let stage = stage_dir()?;
     let result = (|| {
+        let plain: Vec<serde_json::Value> = changes.iter().map(untransport_json_value).collect();
         let changes_text =
-            serde_json::to_string(changes).map_err(|e| format!("failed to encode bundle: {e}"))?;
+            serde_json::to_string(&plain).map_err(|e| format!("failed to encode bundle: {e}"))?;
         write_stage_file(
             &stage,
             "changes.json",
@@ -1128,7 +1171,9 @@ fn write_bundle(
             crate::upload::php_escape_json_text(&meta_text, true).as_bytes(),
         )?;
         for (index, corpus) in hunks.iter().enumerate() {
-            write_stage_file(&stage, &format!("hunks/{index}"), corpus.as_bytes())?;
+            // Corpora ride as transport; members carry raw bytes, like PHP.
+            let raw = crate::patch::untransport_bytes(corpus);
+            write_stage_file(&stage, &format!("hunks/{index}"), &raw)?;
         }
         for (phid, blob) in blobs {
             write_stage_file(&stage, &format!("blobs/{phid}"), blob)?;
@@ -1159,13 +1204,14 @@ fn local_bundle_parts(
 ) -> Result<(Vec<serde_json::Value>, serde_json::Value), String> {
     let bytes = local_diff_bytes(dir, Format::Git, base)?;
     reject_empty_diff(&bytes)?;
-    let parsed = crate::diff_local::parse_unified_diff(&String::from_utf8_lossy(&bytes))?;
+    let parsed =
+        crate::diff_local::parse_unified_diff_transport(&crate::patch::transport_bytes(&bytes))?;
     // T1153 EXPORT-E20: PHP's local export parses with a repository API
     // (`ArcanistExportWorkflow.php:187`), so `loadSyntheticData()`
     // fabricates pure-move hunks for local bundles too.
     let mut full = crate::diff_local::with_companions(&parsed);
-    let raw_for = |path: &str| crate::diff_local::get_raw_diff_text(dir, base, path);
-    crate::diff_local::attach_synthetic_git_hunks(&mut full, &raw_for)?;
+    let raw_for = |path: &str| raw_diff_transport(dir, base, path);
+    crate::diff_local::attach_synthetic_git_hunks_transport(&mut full, &raw_for)?;
     let changes = changes_json(&full);
     let base_revision = crate::git::stdout_text(dir, &["rev-parse", base])?;
     // PHP builds `sprintf('%s <%s>', $realName, $email)` and parses it back
@@ -1175,6 +1221,15 @@ fn local_bundle_parts(
     let (display, address) = split_email_author(&format!("{author_name} <{author_email}>"));
     let meta = local_meta(&base_revision, encoding, display.as_deref(), &address);
     Ok((changes, meta))
+}
+
+/// Re-diff one path as transport (T1153 EXPORT-E9): the path arrives
+/// as transport (view it lossily for the CLI) and the output rides as
+/// transport.
+fn raw_diff_transport(dir: &Path, base: &str, path: &str) -> Result<String, String> {
+    let plain = crate::patch::untransport_lossy(path);
+    let bytes = crate::diff_local::get_raw_diff_bytes(dir, base, &plain)?;
+    Ok(crate::patch::transport_bytes(&bytes))
 }
 
 /// Conduit revision/diff changes as bundle parts.
@@ -1259,14 +1314,17 @@ fn local_render_changes(
 ) -> Vec<crate::patch::BundleChange> {
     // T1153 OLD-PATH: ADD old paths are `/dev/null` like the parser;
     // they carry no mode and never hit the filesystem.
+    // Parsed paths ride as transport (T1153 EXPORT-E9); the
+    // filesystem, CLI, and mode-map lookups below need the lossy view.
+    // Render fields keep transport (verbatim into the output).
     let old_paths: Vec<String> = parsed
         .iter()
-        .map(|change| change.old_path.clone())
+        .map(|change| crate::patch::untransport_lossy(&change.old_path))
         .filter(|path| !path.is_empty() && path != "/dev/null")
         .collect();
     let new_paths: Vec<String> = parsed
         .iter()
-        .map(|change| change.current_path.clone())
+        .map(|change| crate::patch::untransport_lossy(&change.current_path))
         .filter(|path| !path.is_empty())
         .collect();
     let old_modes = local_file_modes(dir, base, &old_paths);
@@ -1274,6 +1332,8 @@ fn local_render_changes(
     parsed
         .iter()
         .map(|parsed| {
+            let old_plain = crate::patch::untransport_lossy(&parsed.old_path);
+            let current_plain = crate::patch::untransport_lossy(&parsed.current_path);
             let mut change = crate::patch::BundleChange {
                 change_type: parsed.change_type,
                 file_type: parsed.file_type,
@@ -1289,8 +1349,8 @@ fn local_render_changes(
                 } else {
                     Some(parsed.current_path.clone())
                 },
-                old_mode: old_modes.get(&parsed.old_path).cloned(),
-                new_mode: new_modes.get(&parsed.current_path).cloned(),
+                old_mode: old_modes.get(&old_plain).cloned(),
+                new_mode: new_modes.get(&current_plain).cloned(),
                 hunks: parsed.hunks.clone(),
                 old_binary_phid: None,
                 new_binary_phid: None,
@@ -1301,9 +1361,9 @@ fn local_render_changes(
             if parsed.file_type == crate::diff_local::FILE_BINARY {
                 // T1153 OLD-PATH: no old bytes for `/dev/null` (ADD).
                 if parsed.old_path != "/dev/null" {
-                    change.original_file_data = file_data_at_revision(dir, base, &parsed.old_path);
+                    change.original_file_data = file_data_at_revision(dir, base, &old_plain);
                 }
-                change.current_file_data = file_data_at_revision(dir, head, &parsed.current_path);
+                change.current_file_data = file_data_at_revision(dir, head, &current_plain);
             }
             change
         })
@@ -1965,15 +2025,13 @@ fn render_export_text(
     }
 }
 
-/// Local workcopy diff as decoded patch text.
-fn decode_local_export_diff(
-    dir: &Path,
-    base: &str,
-    encoding: Option<&str>,
-) -> Result<String, String> {
+/// Local workcopy diff as transport text (T1153 EXPORT-E9): raw bytes
+/// ride through parse/render, and `--encoding` converts only at the
+/// stdout sink, like `convertNonUTF8Diff()`.
+fn decode_local_export_diff(dir: &Path, base: &str) -> Result<String, String> {
     let bytes = local_diff_bytes(dir, Format::Git, base)?;
     reject_empty_diff(&bytes)?;
-    decode_patch(&bytes, encoding)
+    Ok(crate::patch::transport_bytes(&bytes))
 }
 
 /// Text export over a local workcopy (T1153 EXPORT-E30: PHP requires
@@ -1987,8 +2045,8 @@ fn execute_local_export_text(
 ) -> Result<String, String> {
     let client = crate::config::client_for(opts.conduit_uri.as_deref())?;
     let base = resolve_export_base(dir, base.as_deref())?;
-    let text = decode_local_export_diff(dir, &base, opts.encoding.as_deref())?;
-    let parsed = crate::diff_local::parse_unified_diff(&text)?;
+    let text = decode_local_export_diff(dir, &base)?;
+    let parsed = crate::diff_local::parse_unified_diff_transport(&text)?;
     let head = resolve_export_head(dir)?;
     // The author is discarded for text formats, but PHP issues
     // the query before rendering.
@@ -2068,7 +2126,14 @@ pub fn execute_bytes(dir: &Path, argv: &[String]) -> Result<Vec<u8>, String> {
     if matches!(opts.format, Format::Bundle { .. }) {
         return Ok(text.into_bytes());
     }
-    crate::patch::encode_bytes(&text, opts.encoding.as_deref())
+    // Local text rides as transport (T1153 EXPORT-E9); conduit text is
+    // already UTF-8. Both convert at the sink, like
+    // `convertNonUTF8Diff()`.
+    if matches!(opts.source, Source::Local { .. }) {
+        crate::patch::encode_transport_text(&text, opts.encoding.as_deref())
+    } else {
+        crate::patch::encode_bytes(&text, opts.encoding.as_deref())
+    }
 }
 
 pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {

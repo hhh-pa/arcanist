@@ -455,6 +455,7 @@ fn file_bundle_rejects_empty_stdin() {
         bundle,
         Bundle {
             text: "diff --git a/f.txt b/f.txt\n".to_string(),
+            encoding: Some("utf-8".to_string()),
             ..Bundle::default()
         }
     );
@@ -470,10 +471,15 @@ fn file_bundle_decodes_with_encoding() {
     std::fs::write(&path, &bytes).unwrap();
     let mut io = Io::buffered();
     let bundle = load_file_bundle(&path.to_string_lossy(), Some("latin1"), &mut io).unwrap();
-    assert_eq!(
-        bundle.text,
-        "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+é\n"
-    );
+    // T1153 EXPORT-E9: the raw byte rides as transport and the encoding
+    // converts at the sinks, like `convertNonUTF8Diff()` (invalid bytes
+    // become `?`, like `mb_convert_encoding()`).
+    assert_eq!(bundle.text, transport_bytes(&bytes));
+    assert_eq!(bundle.encoding.as_deref(), Some("latin1"));
+    let mut converted = bytes.clone();
+    let last = converted.len() - 2;
+    converted[last] = b'?';
+    assert_eq!(bundle_patch_bytes(&bundle).unwrap(), converted);
 }
 
 #[test]
@@ -3764,4 +3770,503 @@ fn b23_patch_help_matches_generated_format() {
     assert!(!text.contains("--preview"), "{text}");
     let ansi = usage_text(true);
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+}
+
+// T1153 EXPORT-E9 residual: byte-faithful corpus path. Raw bytes ride
+// the `String` pipeline as transport (valid UTF-8 verbatim, invalid
+// bytes smuggled, real U+E000 markers doubled) and convert only at
+// the sinks, matching PHP's raw passthrough plus
+// `convertNonUTF8Diff()`.
+
+const E9_ESC: char = '\u{E000}';
+
+fn e9_smuggle(byte: u8) -> String {
+    format!(
+        "{E9_ESC}{}",
+        char::from_u32(0xE100 + u32::from(byte)).unwrap()
+    )
+}
+
+fn e9_invalid_vectors() -> Vec<Vec<u8>> {
+    vec![
+        vec![0xE9],
+        vec![0x80],
+        vec![0xFF],
+        vec![0xFE, 0xFF],
+        vec![0xE9, 0x80],
+        vec![0xED, 0xA0, 0x80],
+        vec![0xC0, 0xAF],
+        vec![0xF5, 0x80, 0x80, 0x80],
+        vec![0xC3],
+        vec![0xE2, 0x82],
+        b"caf\xe9 mix \x80\xff end".to_vec(),
+        "caf\u{00e9} valid \u{20ac} ".as_bytes().to_vec(),
+        b"\x00nul\x00".to_vec(),
+        b"a\r\nb\r\n".to_vec(),
+        vec![],
+    ]
+}
+
+#[test]
+fn e9_transport_round_trips_bytes() {
+    for bytes in e9_invalid_vectors() {
+        assert_eq!(untransport_bytes(&transport_bytes(&bytes)), bytes);
+    }
+    // Valid UTF-8 (however exotic) passes through verbatim.
+    for text in [
+        "",
+        "plain ascii",
+        "caf\u{00e9} \u{20ac} \u{1f600} \u{4e2d}",
+        "\x00\x01\x02",
+    ] {
+        assert_eq!(transport_bytes(text.as_bytes()), text);
+    }
+}
+
+#[test]
+fn e9_transport_escapes_real_markers() {
+    let marker = E9_ESC.to_string();
+    assert_eq!(
+        transport_bytes(marker.as_bytes()),
+        format!("{E9_ESC}{E9_ESC}")
+    );
+    assert_eq!(
+        untransport_bytes(&format!("{E9_ESC}{E9_ESC}")),
+        marker.as_bytes()
+    );
+    // A natural marker + smuggle-range pair round-trips exactly.
+    let pair = format!("{E9_ESC}\u{E100}");
+    assert_eq!(
+        untransport_bytes(&transport_bytes(pair.as_bytes())),
+        pair.as_bytes()
+    );
+    // A lone marker reads literally instead of panicking.
+    assert_eq!(
+        untransport_bytes(&E9_ESC.to_string()),
+        E9_ESC.to_string().as_bytes()
+    );
+}
+
+#[test]
+fn e9_transport_preserves_diff_structure() {
+    let bytes = b"diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+\xe9\n";
+    let carried = transport_bytes(bytes);
+    assert!(carried.starts_with("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+"));
+    assert!(carried.ends_with(&format!("{}\n", e9_smuggle(0xE9))));
+}
+
+#[test]
+fn e9_untransport_lossy_views() {
+    assert_eq!(untransport_lossy(&e9_smuggle(0xE9)), "\u{FFFD}");
+    assert_eq!(untransport_lossy("plain caf\u{00e9}"), "plain caf\u{00e9}");
+    assert_eq!(
+        untransport_lossy(&format!("{E9_ESC}{E9_ESC}")),
+        E9_ESC.to_string()
+    );
+    assert_eq!(untransport_lossy(""), "");
+}
+
+#[test]
+fn e9_escape_markers_round_trip() {
+    assert_eq!(escape_transport_markers("plain"), "plain");
+    assert_eq!(
+        escape_transport_markers(&E9_ESC.to_string()),
+        format!("{E9_ESC}{E9_ESC}")
+    );
+    let escaped = escape_transport_markers("a\u{E000}b");
+    assert_eq!(untransport_lossy(&escaped), "a\u{E000}b");
+}
+
+#[test]
+fn e9_convert_passes_empty_and_utf8_through() {
+    let valid = "caf\u{00e9} \u{20ac}\n".as_bytes().to_vec();
+    let invalid = b"caf\xe9 \x80\xff\n".to_vec();
+    for encoding in [None, Some(""), Some("0"), Some("UTF-8"), Some("utf8")] {
+        assert_eq!(convert_bytes(&valid, encoding).unwrap(), valid);
+        assert_eq!(convert_bytes(&invalid, encoding).unwrap(), invalid);
+    }
+}
+
+#[test]
+fn e9_convert_cp1252_table() {
+    assert_eq!(
+        convert_bytes("caf\u{00e9} \u{20ac}\n".as_bytes(), Some("windows-1252")).unwrap(),
+        b"caf\xe9 \x80\n"
+    );
+    // Unmappable scalars and invalid bytes become `?`, like mb.
+    assert_eq!(
+        convert_bytes("\u{4e2d}\n".as_bytes(), Some("cp1252")).unwrap(),
+        b"?\n"
+    );
+    assert_eq!(
+        convert_bytes(b"\xff\n", Some("windows-1252")).unwrap(),
+        b"?\n"
+    );
+    // Undefined cp1252 bytes decode lossily, like PHP's converter.
+    assert_eq!(
+        decode_bytes(&[0x81], Some("windows-1252")).unwrap(),
+        "\u{FFFD}"
+    );
+}
+
+#[test]
+fn e9_convert_latin1_one_to_one() {
+    assert_eq!(
+        convert_bytes("caf\u{00e9}\n".as_bytes(), Some("latin1")).unwrap(),
+        b"caf\xe9\n"
+    );
+    assert_eq!(
+        convert_bytes("\u{20ac}\n".as_bytes(), Some("latin1")).unwrap(),
+        b"?\n"
+    );
+    assert_eq!(convert_bytes(b"\xe9\n", Some("latin1")).unwrap(), b"?\n");
+}
+
+#[test]
+fn e9_convert_invalid_grouping_matches_mb() {
+    // Pinned against `mb_convert_encoding(..., 'Windows-1252', 'UTF-8')`.
+    for (input, expected) in [
+        (b"\xe9\x80".as_slice(), "?"),
+        (b"\xed\xa0\x80".as_slice(), "???"),
+        (b"\xf0\x28\x8c\x28".as_slice(), "?(?("),
+        (b"\xc0\xaf".as_slice(), "??"),
+        (b"\x80".as_slice(), "?"),
+        (b"\xc3".as_slice(), "?"),
+        (b"\xfe\xff".as_slice(), "??"),
+        (b"a\xffb".as_slice(), "a?b"),
+    ] {
+        for encoding in ["windows-1252", "latin1"] {
+            assert_eq!(
+                convert_bytes(input, Some(encoding)).unwrap(),
+                expected.as_bytes(),
+                "{input:?} / {encoding}"
+            );
+        }
+    }
+}
+
+#[test]
+fn e9_convert_unknown_throws() {
+    assert_eq!(
+        convert_bytes(b"x", Some("klingon-9")).unwrap_err(),
+        "Unknown encoding \"klingon-9\"."
+    );
+}
+
+#[test]
+fn e9_encode_transport_text_converts_at_sink() {
+    let carried = transport_bytes(b"caf\xe9\n");
+    assert_eq!(encode_transport_text(&carried, None).unwrap(), b"caf\xe9\n");
+    assert_eq!(
+        encode_transport_text(&carried, Some("UTF-8")).unwrap(),
+        b"caf\xe9\n"
+    );
+    assert_eq!(
+        encode_transport_text(&carried, Some("windows-1252")).unwrap(),
+        b"caf?\n"
+    );
+    let valid = transport_bytes("caf\u{00e9}\n".as_bytes());
+    assert_eq!(
+        encode_transport_text(&valid, Some("windows-1252")).unwrap(),
+        b"caf\xe9\n"
+    );
+}
+
+#[test]
+fn e9_convert_transport_text_round_trip() {
+    for bytes in e9_invalid_vectors() {
+        let carried = transport_bytes(&bytes);
+        for encoding in [None, Some("UTF-8"), Some("windows-1252"), Some("latin1")] {
+            let converted = convert_transport_text(&carried, encoding).unwrap();
+            assert_eq!(
+                untransport_bytes(&converted),
+                convert_bytes(&bytes, encoding).unwrap(),
+                "{bytes:?} / {encoding:?}"
+            );
+        }
+    }
+    assert_eq!(
+        convert_transport_text("x", Some("klingon-9")).unwrap_err(),
+        "Unknown encoding \"klingon-9\"."
+    );
+}
+
+#[test]
+fn e9_bundle_patch_bytes_convert_like_php() {
+    let bundle = Bundle {
+        text: transport_bytes(b"+caf\xe9\n"),
+        ..Bundle::default()
+    };
+    assert_eq!(bundle_patch_bytes(&bundle).unwrap(), b"+caf\xe9\n");
+    let bundle = Bundle {
+        text: transport_bytes(b"+caf\xe9\n"),
+        encoding: Some("latin1".to_string()),
+        ..Bundle::default()
+    };
+    assert_eq!(bundle_patch_bytes(&bundle).unwrap(), b"+caf?\n");
+    let bundle = Bundle {
+        text: "+x\n".to_string(),
+        encoding: Some("klingon-9".to_string()),
+        ..Bundle::default()
+    };
+    assert_eq!(
+        bundle_patch_bytes(&bundle).unwrap_err(),
+        "Unknown encoding \"klingon-9\"."
+    );
+}
+
+#[test]
+fn e9_load_file_bundle_carries_raw_bytes() {
+    let dir = temp_dir("e9_file_bundle");
+    let path = dir.join("raw.patch");
+    let bytes = b"diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\xe9\x80\n".to_vec();
+    std::fs::write(&path, &bytes).unwrap();
+    let name = path.to_string_lossy().to_string();
+    for encoding in [None, Some("UTF-8")] {
+        let mut io = Io::buffered();
+        let bundle = load_file_bundle(&name, encoding, &mut io).unwrap();
+        assert_eq!(bundle.text, transport_bytes(&bytes));
+        assert_eq!(bundle.encoding, encoding.map(str::to_string));
+        assert_eq!(bundle_patch_bytes(&bundle).unwrap(), bytes);
+    }
+    let mut io = Io::buffered();
+    let bundle = load_file_bundle(&name, Some("windows-1252"), &mut io).unwrap();
+    assert_eq!(bundle.encoding.as_deref(), Some("windows-1252"));
+    assert_eq!(
+        bundle_patch_bytes(&bundle).unwrap(),
+        convert_bytes(&bytes, Some("windows-1252")).unwrap()
+    );
+    let mut io = Io::buffered();
+    assert_eq!(
+        load_file_bundle(&name, Some("klingon-9"), &mut io).unwrap(),
+        Bundle {
+            text: transport_bytes(&bytes),
+            encoding: Some("klingon-9".to_string()),
+            ..Bundle::default()
+        }
+    );
+}
+
+#[test]
+fn e9_quote_git_target_preserves_transport() {
+    // ASCII behavior is unchanged (also covered by `quotes_git_targets`).
+    assert_eq!(quote_git_target("plain"), "plain");
+    // Unquoted transport paths pass through verbatim.
+    let carried = transport_bytes(b"f-\xe9.txt");
+    assert_eq!(quote_git_target(&carried), carried);
+    // Quoting runs over raw bytes; high bytes re-ride as transport.
+    let quoted = quote_git_target(&transport_bytes(b"a\"b\xe9"));
+    assert_eq!(quoted, format!("\"a\\\"b{}\"", e9_smuggle(0xE9)));
+    assert_eq!(untransport_bytes(&quoted), b"\"a\\\"b\xe9\"");
+}
+
+#[test]
+fn e9_unquote_git_path_decodes_high_octals() {
+    assert_eq!(unquote_git_path("\"a\\tb\""), "a\tb");
+    assert_eq!(unquote_git_path("plain"), "plain");
+    // Valid octals decode to real chars; invalid ones ride as transport.
+    assert_eq!(unquote_git_path("\"a\\303\\251\""), "a\u{00e9}");
+    let decoded = unquote_git_path("\"a\\351\"");
+    assert_eq!(decoded, format!("a{}", e9_smuggle(0xE9)));
+    assert_eq!(untransport_bytes(&decoded), b"a\xe9");
+}
+
+#[test]
+fn e9_strip_ansi_codes_preserves_bytes() {
+    let mut raw = "caf\u{00e9} ".as_bytes().to_vec();
+    raw.push(0xE9);
+    let carried = transport_bytes(&raw);
+    let colored = format!("\x1b[32m{carried}\x1b[m");
+    assert_eq!(strip_ansi_codes(&colored), carried);
+    assert_eq!(strip_ansi_codes("plain"), "plain");
+}
+
+#[test]
+fn e9_validate_accepts_non_ascii_without_panic() {
+    // Multibyte chars before a unified date used to panic on byte slicing.
+    validate_patch_text("--- caf\u{00e9}g.txt\t2024-01-02 03:04:05\n+++ f\n").unwrap();
+    validate_patch_text(&transport_bytes(
+        b"diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@ func\xe9\n-a\n+b\n",
+    ))
+    .unwrap();
+    assert!(validate_patch_text("not a diff\n").is_err());
+}
+
+#[test]
+fn e9_parse_error_hides_transport() {
+    let lines = vec![transport_bytes(b"+bad \xe9 line\n")];
+    let rendered = format_parse_error("broken", &lines, 0);
+    assert!(rendered.contains('\u{FFFD}'), "{rendered}");
+    assert!(!rendered.contains(E9_ESC), "{rendered}");
+}
+
+#[test]
+fn e9_arcbundle_carries_raw_corpora() {
+    let dir = temp_dir("e9_arcbundle");
+    let changes = br#"[{"type":1,"fileType":1,"oldPath":"f","currentPath":"f","hunks":[{"oldStart":1,"oldLines":1,"newStart":1,"newLines":1,"corpus":0}]}]"#;
+    let corpus = b" line\n-line\n+caf\xe9 raw\n";
+    let bundle = write_arcbundle(
+        &dir,
+        "raw.bundle",
+        &[
+            ("changes.json", changes),
+            ("hunks/0", corpus),
+            ("meta.json", b"{}"),
+        ],
+    );
+    let name = bundle.to_string_lossy().to_string();
+    let loaded = load_arcbundle(&name, None).unwrap();
+    assert_eq!(loaded.encoding, None);
+    assert!(
+        untransport_bytes(&loaded.text)
+            .windows(corpus.len())
+            .any(|w| w == corpus),
+        "raw corpus survives the render"
+    );
+    assert_eq!(
+        bundle_patch_bytes(&loaded).unwrap(),
+        untransport_bytes(&loaded.text)
+    );
+}
+
+#[test]
+fn e9_arcbundle_meta_encoding_converts_at_sink() {
+    let dir = temp_dir("e9_arcbundle_enc");
+    let changes = br#"[{"type":1,"fileType":1,"oldPath":"f","currentPath":"f","hunks":[{"oldStart":1,"oldLines":1,"newStart":1,"newLines":1,"corpus":0}]}]"#;
+    let bundle = write_arcbundle(
+        &dir,
+        "enc.bundle",
+        &[
+            ("changes.json", changes),
+            ("hunks/0", b" line\n-line\n+caf\xe9 raw\n"),
+            ("meta.json", br#"{"encoding":"windows-1252"}"#),
+        ],
+    );
+    let name = bundle.to_string_lossy().to_string();
+    let loaded = load_arcbundle(&name, None).unwrap();
+    // The meta encoding is stored, not decoded: unknown names only throw
+    // when the bundle converts at an apply sink, like PHP.
+    assert_eq!(loaded.encoding.as_deref(), Some("windows-1252"));
+    assert!(
+        bundle_patch_bytes(&loaded)
+            .unwrap()
+            .windows(4)
+            .any(|w| w == b"caf?"),
+        "converts like convertNonUTF8Diff"
+    );
+}
+
+#[test]
+fn e9_svn_changes_stay_lossy() {
+    // The svn apply path keeps its historical lossy behavior (no svn
+    // binary exists here to oracle-verify a byte port): transport in,
+    // replacement chars out, never transport markers.
+    let changes = parse_git_patch_for_svn(&transport_bytes(
+        b"diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\xe9\n",
+    ));
+    assert_eq!(changes.len(), 1);
+    assert!(
+        changes[0].hunks.contains('\u{FFFD}'),
+        "{}",
+        changes[0].hunks
+    );
+    assert!(!changes[0].hunks.contains(E9_ESC), "{}", changes[0].hunks);
+    let dicts: Vec<serde_json::Value> =
+        vec![serde_json::json!({"type": 1, "fileType": 1, "oldPath": "o", "currentPath": "f"})];
+    let hunks = vec![crate::diff_local::ParsedHunk {
+        old_start: 1,
+        old_len: 1,
+        new_start: 1,
+        new_len: 1,
+        corpus: transport_bytes(b"+q\xff\n"),
+        synthetic_counts: None,
+    }];
+    let changes = svn_changes_from_dicts(&dicts, &[hunks]);
+    assert!(changes[0].hunks.contains('\u{FFFD}'));
+    assert!(!changes[0].hunks.contains(E9_ESC));
+}
+
+#[test]
+fn e9_transport_parse_decodes_quoted_bytes() {
+    // `parse_unified_diff_transport` matches the lossy parse on
+    // structure, but C-quoted filenames decode byte-faithfully. (The
+    // `+++` line keeps quotes verbatim, so the rename header carries
+    // the quoted name: PHP keeps the decoded `rename to` path.)
+    let text = "diff --git a/o b/n\nrename from o\nrename to \"n\\351\"\n--- a/o\n+++ \"b/n\\351\"\n@@ -1 +1 @@\n-a\n+b\n";
+    let lossy = crate::diff_local::parse_unified_diff(text).unwrap();
+    assert_eq!(lossy[0].current_path, "n\u{FFFD}");
+    let carried =
+        crate::diff_local::parse_unified_diff_transport(&transport_bytes(text.as_bytes())).unwrap();
+    assert_eq!(untransport_bytes(&carried[0].current_path), b"n\xe9");
+    assert_eq!(carried[0].hunks.len(), lossy[0].hunks.len());
+    assert_eq!(carried[0].old_path, lossy[0].old_path);
+}
+
+#[test]
+fn e9_apply_bundle_encoding_stores_selection() {
+    let backends = Backends::default();
+    let repo = make_repo("e9_apply_encoding");
+    std::fs::write(repo.join(".arcconfig"), "{\"repository.callsign\": \"X\"}").unwrap();
+    let answer = std::cell::RefCell::new(serde_json::json!([{"encoding": "cp1252"}]));
+    let call = |method: &str, _params: &serde_json::Value| {
+        assert_eq!(method, "repository.query");
+        Ok(answer.borrow().clone())
+    };
+    let call_ref: &diff_submit::ConduitCall = &call;
+    // Conduit sources store the flag, else the repository encoding.
+    let mut loaded = LoadedBundle {
+        bundle: Bundle {
+            text: "t".to_string(),
+            ..Bundle::default()
+        },
+        arcbundle_dicts: None,
+    };
+    let options = options_of(&["--encoding", "latin1"]);
+    apply_patch_bundle_encoding(
+        &repo,
+        Vcs::Git,
+        &backends,
+        &Source::Revision("D1".to_string()),
+        &options,
+        Some(call_ref),
+        &mut loaded,
+    )
+    .unwrap();
+    assert_eq!(loaded.bundle.encoding.as_deref(), Some("latin1"));
+    assert_eq!(loaded.bundle.text, "t");
+    let mut loaded = LoadedBundle {
+        bundle: Bundle::default(),
+        arcbundle_dicts: None,
+    };
+    let options = options_of(&[]);
+    apply_patch_bundle_encoding(
+        &repo,
+        Vcs::Git,
+        &backends,
+        &Source::Diff("123".to_string()),
+        &options,
+        Some(call_ref),
+        &mut loaded,
+    )
+    .unwrap();
+    assert_eq!(loaded.bundle.encoding.as_deref(), Some("cp1252"));
+    // File sources keep their flag-stored encoding untouched.
+    let mut loaded = LoadedBundle {
+        bundle: Bundle {
+            encoding: Some("utf-8".to_string()),
+            ..Bundle::default()
+        },
+        arcbundle_dicts: None,
+    };
+    apply_patch_bundle_encoding(
+        &repo,
+        Vcs::Git,
+        &backends,
+        &Source::Patch("f".to_string()),
+        &options_of(&[]),
+        Some(call_ref),
+        &mut loaded,
+    )
+    .unwrap();
+    assert_eq!(loaded.bundle.encoding.as_deref(), Some("utf-8"));
 }

@@ -1913,28 +1913,40 @@ fn e16_c_quoted_paths_decode_like_php() {
 #[test]
 fn e16_git_common_filename_and_unescape_units() {
     assert_eq!(
-        extract_git_common_filename("a/f.txt b/f.txt").as_deref(),
+        extract_git_common_filename("a/f.txt b/f.txt", false).as_deref(),
         Some("f.txt")
     );
     assert_eq!(
-        extract_git_common_filename("\"a/old name\" \"b/old name\"").as_deref(),
+        extract_git_common_filename("\"a/old name\" \"b/old name\"", false).as_deref(),
         Some("old name")
     );
-    assert_eq!(extract_git_common_filename("a/o b/n"), None);
-    assert_eq!(extract_git_common_filename("a/f.txt b/f.txt junk"), None);
+    assert_eq!(extract_git_common_filename("a/o b/n", false), None);
     assert_eq!(
-        extract_git_common_filename("src/f dst/f").as_deref(),
+        extract_git_common_filename("a/f.txt b/f.txt junk", false),
+        None
+    );
+    assert_eq!(
+        extract_git_common_filename("src/f dst/f", false).as_deref(),
         Some("f")
     );
-    assert_eq!(extract_git_common_filename("f f").as_deref(), Some("f"));
-    assert_eq!(extract_git_common_filename("a/ a/").as_deref(), Some("a/"));
-    assert_eq!(extract_git_common_filename("/f /f").as_deref(), Some("/f"));
-    assert_eq!(unescape_git_filename("\"a\\tb\""), "a\tb");
-    assert_eq!(unescape_git_filename("\"a\\303\\244\""), "aä");
-    assert_eq!(unescape_git_filename("plain"), "plain");
-    assert_eq!(unescape_git_filename("\"\""), "\"\"");
-    assert_eq!(stripcslashes("a\\nb\\ x"), "a\nb x");
-    assert_eq!(stripcslashes("\\101"), "A");
+    assert_eq!(
+        extract_git_common_filename("f f", false).as_deref(),
+        Some("f")
+    );
+    assert_eq!(
+        extract_git_common_filename("a/ a/", false).as_deref(),
+        Some("a/")
+    );
+    assert_eq!(
+        extract_git_common_filename("/f /f", false).as_deref(),
+        Some("/f")
+    );
+    assert_eq!(unescape_git_filename("\"a\\tb\"", false), "a\tb");
+    assert_eq!(unescape_git_filename("\"a\\303\\244\"", false), "aä");
+    assert_eq!(unescape_git_filename("plain", false), "plain");
+    assert_eq!(unescape_git_filename("\"\"", false), "\"\"");
+    assert_eq!(stripcslashes("a\\nb\\ x", false), "a\nb x");
+    assert_eq!(stripcslashes("\\101", false), "A");
     // Degenerate `a/`-only targets strip like PHP.
     assert_eq!(diff_path_value("--- a/", false), "");
     assert_eq!(strip_ab_prefix("a/"), "");
