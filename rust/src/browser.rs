@@ -121,7 +121,7 @@ fn open_one(uri: &str, configured: Option<&[String]>) -> Result<(), String> {
     // the browser itself is everything before it.
     let full = diff::browser_open_argv(uri, configured, &binary_exists)?;
     let browser = &full[..full.len() - 1];
-    let status = std::process::Command::new(&full[0])
+    let status = crate::proc_env::command(&full[0])
         .args(&full[1..])
         .status()
         .map_err(|_| diff::browser_open_error(uri, browser))?;

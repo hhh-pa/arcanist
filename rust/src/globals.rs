@@ -55,9 +55,9 @@ pub fn set_load_options(value: String) {
 /// Record the resolved classic command name (the `ARCANIST` export,
 /// `scripts/arcanist.php:229`, T1153 CORE-19). `main`-only.
 ///
-/// Known gap: hook children do not inherit it yet — propagating it
-/// would need an explicit `.env()` at every spawn site, since the
-/// process environment cannot be written without `unsafe`.
+/// Hook children inherit it through [`crate::proc_env::command`], which
+/// re-attaches the cell as an explicit `.env()` at every spawn site
+/// (the process environment cannot be written without `unsafe`).
 pub fn set_command_name(value: String) {
     let _ = COMMAND_NAME.set(value);
 }
@@ -124,9 +124,8 @@ pub fn load_options() -> Option<String> {
         .or_else(|| std::env::var("ARC_GLOBAL_LOAD_OPTIONS").ok())
 }
 
-/// The resolved classic command name, for future hook propagation (see
-/// [`set_command_name`]).
-#[allow(dead_code)]
+/// The resolved classic command name, propagated to hook children by
+/// [`crate::proc_env::command`] (see [`set_command_name`]).
 #[must_use]
 pub fn command_name() -> Option<String> {
     COMMAND_NAME.get().cloned()

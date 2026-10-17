@@ -1274,7 +1274,7 @@ fn exec_rule_command(top: &Path, command: &str) -> Option<String> {
 fn shell_command(top: &Path, command: &str) -> std::process::Command {
     #[cfg(windows)]
     {
-        let mut cmd = std::process::Command::new("cmd");
+        let mut cmd = crate::proc_env::command("cmd");
         cmd.args(["/C"]);
         <std::process::Command as std::os::windows::process::CommandExt>::raw_arg(
             &mut cmd, command,
@@ -1284,7 +1284,7 @@ fn shell_command(top: &Path, command: &str) -> std::process::Command {
     }
     #[cfg(not(windows))]
     {
-        let mut cmd = std::process::Command::new("sh");
+        let mut cmd = crate::proc_env::command("sh");
         cmd.args(["-c", command]);
         cmd.current_dir(top);
         cmd

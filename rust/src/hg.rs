@@ -111,7 +111,7 @@ pub struct CommandResult {
 }
 
 fn command_for(dir: &Path, hg: &HgCommand, args: &[&str]) -> std::process::Command {
-    let mut cmd = std::process::Command::new(&hg.program);
+    let mut cmd = crate::proc_env::command(&hg.program);
     cmd.current_dir(dir);
     cmd.args(&hg.prefix);
     cmd.args(HG_ENCODING_ARGS);

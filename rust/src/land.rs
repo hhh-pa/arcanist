@@ -4471,7 +4471,7 @@ fn git_apply_commit(
         args.push("--allow-empty");
     }
     args.extend(["-F", "-", "--"]);
-    let mut child = std::process::Command::new("git")
+    let mut child = crate::proc_env::command("git")
         .current_dir(dir)
         .args(&args)
         .stdin(Stdio::piped())
@@ -4783,7 +4783,7 @@ fn git_write_raw_commit(dir: &Path, raw: &RawCommit) -> Result<String, String> {
     use std::io::Write;
     use std::process::Stdio;
     let blob = render_raw_commit_blob(raw);
-    let mut child = std::process::Command::new("git")
+    let mut child = crate::proc_env::command("git")
         .current_dir(dir)
         .args([
             "hash-object",
@@ -4908,7 +4908,7 @@ pub fn git_push_change_with(
 /// credentials, and progress belongs on the terminal
 /// (`ArcanistGitLandEngine.php:186-190`).
 fn git_passthru_with(dir: &Path, program: &str, prefix: &[String], args: &[&str]) -> bool {
-    let mut command = std::process::Command::new(program);
+    let mut command = crate::proc_env::command(program);
     command.current_dir(dir).args(prefix).args(args);
     command.status().is_ok_and(|status| status.success())
 }
@@ -4959,7 +4959,7 @@ pub fn git_p4_submit_with(
         &format!("Submitting changes to \"{onto_remote}\"."),
     );
     let argv = git_p4_submit_argv(into_commit);
-    let mut command = std::process::Command::new(program);
+    let mut command = crate::proc_env::command(program);
     command.current_dir(dir).args(prefix).args(&argv);
     let ok = command.status().is_ok_and(|status| status.success());
     if ok {
@@ -4979,7 +4979,7 @@ pub fn git_p4_sync_with(
     remote: &str,
     name: &str,
 ) -> Result<(), String> {
-    let mut command = std::process::Command::new(program);
+    let mut command = crate::proc_env::command(program);
     command.current_dir(dir).args(prefix).args([
         "p4",
         "sync",
@@ -6036,7 +6036,7 @@ pub fn hg_execute_merge_with(
 /// credentials, and progress belongs on the terminal. Honors the
 /// `HgCommand` program/prefix plus the encoding args and `HGPLAIN`.
 fn hg_passthru_with(dir: &Path, hg_cmd: &hg::HgCommand, args: &[&str]) -> bool {
-    let mut command = std::process::Command::new(&hg_cmd.program);
+    let mut command = crate::proc_env::command(&hg_cmd.program);
     command
         .current_dir(dir)
         .args(&hg_cmd.prefix)
@@ -6069,7 +6069,7 @@ fn hg_write_stdin_with(
 ) -> bool {
     use std::io::Write;
     use std::process::Stdio;
-    let mut command = std::process::Command::new(&hg_cmd.program);
+    let mut command = crate::proc_env::command(&hg_cmd.program);
     command
         .current_dir(dir)
         .args(&hg_cmd.prefix)

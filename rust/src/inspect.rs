@@ -522,7 +522,7 @@ pub fn resolve_commit_symbol(dir: &Path, symbol: &str) -> Result<Option<String>,
              Git commit symbol."
         ));
     }
-    let mut child = std::process::Command::new("git")
+    let mut child = crate::proc_env::command("git")
         .arg("-C")
         .arg(dir)
         .args(["cat-file", "--batch-check", "--"])

@@ -1139,7 +1139,7 @@ pub fn load_file_bundle(path: &str, encoding: Option<&str>, io: &mut Io) -> Resu
 
 /// List `tar` members of `bundle` (`tar tfO`, via `tar -tf`).
 fn tar_list(bundle: &str) -> Result<Vec<String>, String> {
-    let output = std::process::Command::new("tar")
+    let output = crate::proc_env::command("tar")
         .args(["-tf", bundle])
         .output()
         .map_err(|e| format!("failed to read arcbundle '{bundle}': {e}"))?;
@@ -1165,7 +1165,7 @@ fn tar_list(bundle: &str) -> Result<Vec<String>, String> {
 /// matches either spelling.
 fn tar_extract(bundle: &str, member: &str) -> Result<Vec<u8>, String> {
     for candidate in [member.to_string(), format!("./{member}")] {
-        let output = std::process::Command::new("tar")
+        let output = crate::proc_env::command("tar")
             .args(["-xOf", bundle])
             .arg(&candidate)
             .output()
@@ -3850,7 +3850,7 @@ pub fn git_apply_patch_ansi(
 pub fn git_commit_patch(dir: &Path, bundle: &Bundle, message: &str) -> Result<(), String> {
     use std::io::Write;
     use std::process::Stdio;
-    let mut command = std::process::Command::new("git");
+    let mut command = crate::proc_env::command("git");
     command.current_dir(dir).arg("commit").arg("-a");
     if let Some(author) = bundle.full_author() {
         command.arg(format!("--author={author}"));
@@ -5225,7 +5225,7 @@ pub fn run_patch_file_with(
 ) -> Result<(bool, String), String> {
     let patchfile = TempPatchFile::write(patch_text)?;
     let file = patchfile.path.to_string_lossy().to_string();
-    let output = std::process::Command::new(patch_bin)
+    let output = crate::proc_env::command(patch_bin)
         .current_dir(dir)
         .args(["-p0", "-i", &file])
         .output()

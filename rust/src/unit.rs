@@ -786,7 +786,7 @@ pub fn check_everything_paths(everything: bool, paths: &[String]) -> Result<(), 
 
 /// Run `git` with `args` in `cwd`, capturing output.
 fn git_output(cwd: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    std::process::Command::new("git")
+    crate::proc_env::command("git")
         .current_dir(cwd)
         .args(args)
         .output()
@@ -1400,7 +1400,7 @@ pub fn execute(
         ));
     };
 
-    let mut cmd = std::process::Command::new("cargo");
+    let mut cmd = crate::proc_env::command("cargo");
     cmd.args(cargo_test_argv(opts))
         .current_dir(&root)
         .env("CARGO_NET_OFFLINE", "true")
@@ -1608,7 +1608,7 @@ impl CommandRunner for RealRunner {
         if argv.is_empty() {
             return arc_rs::unit_engine::CapturedOutput::new(1, "", "empty command");
         }
-        match std::process::Command::new(&argv[0])
+        match crate::proc_env::command(&argv[0])
             .args(&argv[1..])
             .current_dir(cwd)
             .output()

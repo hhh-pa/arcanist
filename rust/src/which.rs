@@ -786,11 +786,11 @@ impl<'a> Engine<'a> {
             .clone()
             .unwrap_or_else(|| self.dir.to_path_buf());
         let mut cmd = if cfg!(windows) {
-            let mut cmd = std::process::Command::new("cmd");
+            let mut cmd = crate::proc_env::command("cmd");
             cmd.arg("/C").arg(command);
             cmd
         } else {
-            let mut cmd = std::process::Command::new("sh");
+            let mut cmd = crate::proc_env::command("sh");
             cmd.arg("-c").arg(command);
             cmd
         };

@@ -462,7 +462,7 @@ pub fn rebuild_map(path: &Path, clean: bool, script: Option<&Path>) -> Option<St
             path.display()
         ));
     };
-    let mut command = std::process::Command::new("php");
+    let mut command = crate::proc_env::command("php");
     command.arg("-f").arg(&script).arg("--");
     if clean {
         command.arg("--drop-cache");

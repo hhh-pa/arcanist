@@ -30,7 +30,7 @@ extern crate self as arc_rs;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use arc_rs::lint::{LintMessage, Linter, OptionContext, SEVERITY_AUTOFIX, SEVERITY_ERROR};
 
@@ -295,7 +295,7 @@ pub fn resolve_command() -> Option<(PathBuf, Vec<String>)> {
 /// gate (T1153 LINT-32): a failing probe or an older version reports
 /// PHP's upgrade text, a newer version the Arcanist-upgrade text.
 fn check_version(program: &Path, prefix: &[String]) -> Result<(), String> {
-    let mut command = Command::new(program);
+    let mut command = crate::proc_env::command(program);
     if !cfg!(windows) {
         let Some(cslint) = prefix.first() else {
             return Err(old_version_error());
@@ -402,7 +402,7 @@ fn staged_name(display_path: &str) -> String {
 }
 
 fn run_tool(program: &Path, prefix: &[String], file: &Path) -> Option<(i32, String, String)> {
-    let mut command = Command::new(program);
+    let mut command = crate::proc_env::command(program);
     command.args(prefix).arg(file).stdin(Stdio::null());
     let output = arc_rs::lint::spawn_with_retry(&mut command).ok()?;
     let code = output.status.code().unwrap_or(1);

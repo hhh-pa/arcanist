@@ -528,9 +528,9 @@ pub fn run_script_for_path_in(
 ) -> Result<String, String> {
     let command = script_command(script, path);
     #[cfg(unix)]
-    let mut spawned_command = std::process::Command::new("sh");
+    let mut spawned_command = crate::proc_env::command("sh");
     #[cfg(windows)]
-    let mut spawned_command = std::process::Command::new("cmd");
+    let mut spawned_command = crate::proc_env::command("cmd");
     #[cfg(unix)]
     spawned_command.arg("-c").arg(&command);
     #[cfg(windows)]

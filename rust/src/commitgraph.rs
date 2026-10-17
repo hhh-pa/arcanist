@@ -474,7 +474,7 @@ fn git_command_with_input(
 ) -> Result<String, String> {
     use std::io::Write;
     use std::process::Stdio;
-    let mut child = std::process::Command::new("git")
+    let mut child = crate::proc_env::command("git")
         .current_dir(dir)
         .args(args)
         .stdin(Stdio::piped())

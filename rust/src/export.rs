@@ -1072,7 +1072,7 @@ fn write_stage_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> 
 
 /// `tar -czf <out>` over the staged files (alphabetical, like `*`).
 fn create_tar(stage: &Path, out: &Path) -> Result<(), String> {
-    let output = std::process::Command::new("tar")
+    let output = crate::proc_env::command("tar")
         .current_dir(stage)
         .args([
             "-czf",

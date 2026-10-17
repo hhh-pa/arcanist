@@ -18,7 +18,6 @@
 extern crate self as arc_rs;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_rs::lint::{LintMessage, Linter, OptionContext};
@@ -292,11 +291,11 @@ fn run_tool(binary: &Path, args: &[String]) -> Option<ToolOutput> {
         Some(ext) if ext.eq_ignore_ascii_case("bat") || ext.eq_ignore_ascii_case("cmd")
     );
     let mut command = if scripted {
-        let mut command = Command::new("cmd");
+        let mut command = crate::proc_env::command("cmd");
         command.arg("/C").arg(binary).args(args);
         command
     } else {
-        let mut command = Command::new(binary);
+        let mut command = crate::proc_env::command(binary);
         command.args(args);
         command
     };
