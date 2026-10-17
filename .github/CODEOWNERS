@@ -1,0 +1,5 @@
+# Default reviewer for all changes (review-loop: michael-h-hu reviews,
+# m-hu updates). With the 1-approval branch rule — and the author unable
+# to approve their own PR — this effectively requires michael-h-hu
+# approval on every PR.
+*  @michael-h-hu
