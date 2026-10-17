@@ -34,8 +34,15 @@ jobs:
         working-directory: rust
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      # Cargo registry + target/ cache (T1170): warm runs skip crate
+      # downloads and reuse prior compilation. `save-if` forces a save
+      # on branch runs too, so the second push already hits.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          save-if: 'true'
       - run: cargo build --release --locked
       - name: package binary
         run: |
@@ -53,7 +60,7 @@ jobs:
           echo "asset=$asset" >> "$GITHUB_OUTPUT"
           echo "target=$target" >> "$GITHUB_OUTPUT"
         id: package
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: arc-${{ steps.package.outputs.target }}
           path: rust/dist/arc-*.tar.gz
@@ -70,10 +77,10 @@ jobs:
     steps:
       # gh release needs the git remote (and full history + tags for
       # --generate-notes); download-artifact alone leaves no checkout.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true

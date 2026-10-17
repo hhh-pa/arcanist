@@ -33,20 +33,33 @@ jobs:
   fmt-clippy:
     name: fmt + clippy
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout
+      actions: write # cargo cache
     defaults:
       run:
         working-directory: rust
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # Cargo registry + target/ cache (T1170): warm runs skip crate
+      # downloads and reuse prior compilation. `save-if` forces a save
+      # on branch runs too, so the second push already hits.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          save-if: 'true'
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
 
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read # checkout
+      actions: write # cargo cache
     strategy:
       fail-fast: false
       matrix:
@@ -55,8 +68,15 @@ jobs:
       run:
         working-directory: rust
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      # Cargo registry + target/ cache (T1170): warm runs skip crate
+      # downloads and reuse prior compilation. `save-if` forces a save
+      # on branch runs too, so the second push already hits.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          save-if: 'true'
       - run: cargo test --locked
 
   quality-gates:
@@ -75,7 +95,7 @@ jobs:
       # local-only and the gates still run (fork PRs stay green, slower).
       GATE_IMAGE: ${{ vars.GATE_IMAGE || 'hhhpa/arcanist' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Cache key: every input the image depends on. A hit pulls the image
       # and runs the gates in it; a miss rebuilds, pushes, then runs.
       - name: compute image key
@@ -89,7 +109,7 @@ jobs:
         run: docker pull "$GATE_IMAGE:$GATE_KEY"
       - name: set up buildx
         if: steps.pull.outcome == 'failure'
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
       # `secrets` is unusable in `if:`, so probe it in `run:` and gate on
       # the output instead.
       - name: check docker hub credentials
@@ -103,7 +123,7 @@ jobs:
           fi
       - name: docker hub login
         if: steps.pull.outcome == 'failure' && steps.creds.outputs.available == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -126,19 +146,19 @@ jobs:
       # gate container where the gates need the provisioned image).
       - name: restore ci-tools binaries
         id: tools-bin-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ci-tools-bin
           key: ci-tools-${{ runner.os }}-${{ hashFiles('scripts/ci/go/**') }}
       - name: set up Go
         if: steps.tools-bin-cache.outputs.cache-hit != 'true'
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: scripts/ci/go/go.mod
           cache: false # stdlib-only module: nothing to cache but the build below
       - name: cache Go build
         if: steps.tools-bin-cache.outputs.cache-hit != 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/go-build
           key: go-build-${{ runner.os }}-${{ hashFiles('scripts/ci/go/**') }}
@@ -163,7 +183,7 @@ jobs:
           ls "$GITHUB_WORKSPACE/ci-tools-bin"
       - name: save ci-tools binaries
         if: steps.tools-bin-cache.outputs.cache-hit != 'true' && steps.build-tools.outcome == 'success'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: ci-tools-bin
           key: ci-tools-${{ runner.os }}-${{ hashFiles('scripts/ci/go/**') }}
@@ -182,31 +202,32 @@ jobs:
         run: ./ci-tools-bin/coverage-summary --out rust/target/llvm-cov/coverage-comment.md rust/target/llvm-cov/lcov.info >> "$GITHUB_STEP_SUMMARY"
       - name: upload coverage report
         if: always() && hashFiles('rust/target/llvm-cov/lcov.info') != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: coverage-report
           path: rust/target/llvm-cov/
           retention-days: 30
       - name: coverage PR comment
         if: always() && github.event_name == 'pull_request' && hashFiles('rust/target/llvm-cov/coverage-comment.md') != ''
-        uses: marocchino/sticky-pull-request-comment@v2
+        uses: marocchino/sticky-pull-request-comment@v3.0.5
         with:
           header: coverage
           path: rust/target/llvm-cov/coverage-comment.md
           skip_unchanged: true
       - name: upload coverage to codecov
         if: always() && hashFiles('rust/target/llvm-cov/lcov.info') != ''
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: rust/target/llvm-cov/lcov.info
           fail_ci_if_error: false
       - name: upload test results to codecov
         if: ${{ !cancelled() }} && hashFiles('rust/target/nextest/default/junit.xml') != ''
-        uses: codecov/test-results-action@v1
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: rust/target/nextest/default/junit.xml
+          report_type: test_results
           fail_ci_if_error: false
 
   go-tools-test:
@@ -216,17 +237,17 @@ jobs:
       contents: read # checkout
       actions: read # binary-cache restore (save owned by the gates job)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Same binary cache as the gates preamble: a hit means this
       # exact source hash already passed, so setup and tests skip.
       # Restore-only here; the gates job owns the save.
       - name: restore ci-tools binaries
         id: tools-bin-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ci-tools-bin
           key: ci-tools-${{ runner.os }}-${{ hashFiles('scripts/ci/go/**') }}
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         if: steps.tools-bin-cache.outputs.cache-hit != 'true'
         with:
           go-version-file: scripts/ci/go/go.mod
@@ -252,8 +273,15 @@ jobs:
       run:
         working-directory: rust
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      # Cargo registry + target/ cache (T1170): warm runs skip crate
+      # downloads and reuse prior compilation. `save-if` forces a save
+      # on branch runs too, so the second push already hits.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          save-if: 'true'
       - run: cargo build --release --locked
       # Same package steps as release.yml: smoke-test the binary, then tar
       # it as dist/arc-<target>.tar.gz.
@@ -273,7 +301,7 @@ jobs:
           asset="dist/arc-$target.tar.gz"
           tar -czf "$asset" -C target/release "$(basename "$bin")"
           echo "target=$target" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: arc-${{ steps.package.outputs.target }}
           path: rust/dist/arc-*.tar.gz
