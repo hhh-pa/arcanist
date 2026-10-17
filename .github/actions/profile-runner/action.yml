@@ -40,31 +40,32 @@ runs:
       with:
         go-version-file: scripts/ci/go/go.mod
         cache: false
-    # NOTE: never expand ${{ github.workspace }} inside run: scripts —
-    # on Windows it is a backslash path that bash mangles. Relative
-    # paths plus the quoted $GITHUB_WORKSPACE env (bash-safe) only;
-    # working-directory (handled natively by the runner, not bash)
-    # stays absolute.
+    # NO working-directory ANYWHERE in this manifest — deliberate.
+    # The ${{ github.workspace }} context and the $GITHUB_WORKSPACE env
+    # demonstrably disagree inside this composite: split steps crossing
+    # the two spellings 127'd on every job (the build wrote below the
+    # context spelling while the run looked below the env spelling, and
+    # the single-step era only worked because it never crossed them).
+    # So every path here uses exactly one spelling — the quoted env
+    # (double quotes keep Windows backslashes literal for bash; Go and
+    # the Windows API accept the mixed slashes). The build cds in-script
+    # because working-directory takes no env. The two echo lines probe
+    # the context/env disagreement side by side; keep them until the
+    # values are on record, then drop them.
     - if: steps.cache.outputs.cache-hit != 'true'
       shell: bash
-      working-directory: ${{ github.workspace }}/scripts/ci/go
-      run: CGO_ENABLED=0 go build -o ../../profiler-bin/runner-profile ./cmd/runner-profile
-    # NO working-directory here — deliberate, and load-bearing for the
-    # cache post step. History, all CI-proven:
-    # - split build/run with a RELATIVE invocation 127'd on misses:
-    #   implicit-cwd steps execute at the caller's job-default
-    #   (rust/ here), where ./profiler-bin/ does not exist;
-    # - merged single step plus an explicit-workspace trailer fixed the
-    #   127 but the post step warned ("do(es) not exist") and never
-    #   saved on any job;
-    # - this saver shape (explicit build, implicit absolute run) saved
-    #   on the only run that ever saved (fmt, run 39050345211).
-    # So: the post step resolves `profiler-bin` against the workspace
-    # only when an implicit-cwd run step exists; the invocation stays
-    # absolute via the quoted $GITHUB_WORKSPACE env (double quotes keep
-    # Windows backslashes literal, so bash cannot mangle them). DO NOT add
-    # working-directory here, and DO NOT make the invocation relative,
-    # without re-proving post-save on all three OSes.
+      run: |
+        echo "CTXWS=${{ github.workspace }}"
+        echo "ENVWS=$GITHUB_WORKSPACE"
+        cd "$GITHUB_WORKSPACE/scripts/ci/go"
+        CGO_ENABLED=0 go build -o "$GITHUB_WORKSPACE/profiler-bin/runner-profile" ./cmd/runner-profile
+    # Implicit cwd here is load-bearing for the cache post step: it
+    # resolves relative profiler-bin against the workspace only when an
+    # implicit-cwd run step exists (all-explicit shapes warned "do(es)
+    # not exist" and never saved; run 39050345211 saved with this
+    # saver shape). DO NOT add working-directory, and DO NOT make the
+    # invocation relative or context-spelled, without re-proving
+    # post-save on all three OSes.
     - name: profile runner hardware
       shell: bash
       run: "$GITHUB_WORKSPACE/profiler-bin/runner-profile"
