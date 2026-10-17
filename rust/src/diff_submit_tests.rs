@@ -676,6 +676,7 @@ fn finds_away_reviewers() {
     }});
     assert_eq!(away_reviewers(&mapped).len(), 1);
     assert!(away_reviewers(&json!([])).is_empty());
+    assert!(away_reviewers(&json!(7)).is_empty());
 }
 
 #[test]
@@ -690,18 +691,16 @@ fn enforces_nonempty_changes() {
 #[test]
 fn checks_draft_flags() {
     assert_eq!(check_draft_update(false, "D7", false), DraftUpdate::Proceed);
-    let DraftUpdate::WarnAlreadyDraft(warn) = check_draft_update(true, "D7", true) else {
-        panic!("expected already-draft warning");
-    };
-    assert!(warn.contains("\"D7\""), "{warn}");
-    assert!(warn.contains("already a draft"), "{warn}");
-    let DraftUpdate::AbortPublished(abort) = check_draft_update(true, "D7", false) else {
-        panic!("expected published abort");
-    };
-    assert!(
-        abort.contains("You can not turn a revision back into a draft"),
-        "{abort}"
-    );
+    let update = check_draft_update(true, "D7", true);
+    assert!(matches!(update, DraftUpdate::WarnAlreadyDraft(_)));
+    let debug = format!("{update:?}");
+    assert!(debug.contains(r#"\"D7\""#), "{debug}");
+    assert!(debug.contains("already a draft"), "{debug}");
+    let update = check_draft_update(true, "D7", false);
+    assert!(matches!(update, DraftUpdate::AbortPublished(_)));
+    let debug = format!("{update:?}");
+    let refused = debug.contains("You can not turn a revision back into a draft");
+    assert!(refused, "{debug}");
     assert!(check_draft_create(false, false).is_ok());
     assert!(check_draft_create(true, true).is_ok());
     let err = check_draft_create(true, false).unwrap_err();
@@ -823,37 +822,43 @@ fn seam_query_revision_row_returns_head() {
 
 #[test]
 fn active_hashes_prefers_search_then_falls_back() {
-    let modern = |method: &str, _: &serde_json::Value| match method {
-        "differential.revision.search" => Ok(json!({"data": [{"phid": "PHID-DREV-1"}]})),
-        "differential.diff.search" => Ok(json!({"data": [{
-            "attachments": {"commits": {"commits": [{"identifier": "aaa"}]}}
-        }]})),
-        _ => panic!("unexpected {method}"),
+    let modern = |method: &str, _: &serde_json::Value| {
+        if method == "differential.revision.search" {
+            Ok(json!({"data": [{"phid": "PHID-DREV-1"}]}))
+        } else {
+            assert_eq!(method, "differential.diff.search");
+            Ok(json!({"data": [{
+                "attachments": {"commits": {"commits": [{"identifier": "aaa"}]}}
+            }]}))
+        }
     };
     assert_eq!(
         active_diff_hashes(&modern, 7).unwrap(),
         vec!["aaa".to_string()]
     );
 
-    let failing_search = |method: &str, _: &serde_json::Value| match method {
-        "differential.revision.search" => Err("old server".to_string()),
-        "differential.querydiffs" => {
+    let failing_search = |method: &str, _: &serde_json::Value| {
+        if method == "differential.revision.search" {
+            Err("old server".to_string())
+        } else {
+            assert_eq!(method, "differential.querydiffs");
             Ok(json!([{"properties": {"local:commits": [{"commit": "bbb"}]}}]))
         }
-        _ => panic!("unexpected {method}"),
     };
     assert_eq!(
         active_diff_hashes(&failing_search, 7).unwrap(),
         vec!["bbb".to_string()]
     );
 
-    let missing_attachment = |method: &str, _: &serde_json::Value| match method {
-        "differential.revision.search" => Ok(json!({"data": [{"phid": "PHID-DREV-1"}]})),
-        "differential.diff.search" => Ok(json!({"data": [{}]})),
-        "differential.querydiffs" => {
+    let missing_attachment = |method: &str, _: &serde_json::Value| {
+        if method == "differential.revision.search" {
+            Ok(json!({"data": [{"phid": "PHID-DREV-1"}]}))
+        } else if method == "differential.diff.search" {
+            Ok(json!({"data": [{}]}))
+        } else {
+            assert_eq!(method, "differential.querydiffs");
             Ok(json!([{"properties": {"local:commits": [{"commit": "ccc"}]}}]))
         }
-        _ => panic!("unexpected {method}"),
     };
     assert_eq!(
         active_diff_hashes(&missing_attachment, 7).unwrap(),
@@ -862,20 +867,42 @@ fn active_hashes_prefers_search_then_falls_back() {
 }
 
 #[test]
+fn active_hashes_search_misses_fall_back_to_querydiffs() {
+    // Every search-miss shape (empty rows, scalar rows, mapped rows,
+    // rows without a PHID) misses the search path and falls back to
+    // `querydiffs`, which answers empty here.
+    for data in [
+        json!([]),
+        json!(7),
+        json!({"k": {"x": 1}}),
+        json!([{"x": 1}]),
+    ] {
+        let call = |method: &str, _: &serde_json::Value| {
+            if method == "differential.revision.search" {
+                Ok(json!({"data": data.clone()}))
+            } else {
+                assert_eq!(method, "differential.querydiffs");
+                Ok(json!([]))
+            }
+        };
+        assert!(active_diff_hashes(&call, 7).unwrap().is_empty());
+    }
+}
+
+#[test]
 fn submit_flows_chain_creatediff_and_revision_calls() {
     use std::cell::RefCell;
     let methods = RefCell::new(Vec::new());
     let call = |method: &str, _: &serde_json::Value| {
         methods.borrow_mut().push(method.to_string());
-        match method {
-            "differential.creatediff" => {
-                Ok(json!({"diffid": 42, "phid": "PHID-DIFF-1", "uri": "u"}))
-            }
-            "differential.updaterevision" | "differential.createrevision" => {
-                Ok(json!({"revisionid": 7, "uri": "r"}))
-            }
-            "differential.revision.edit" => Ok(json!({"object": {"id": 8}})),
-            _ => panic!("unexpected {method}"),
+        if method == "differential.creatediff" {
+            Ok(json!({"diffid": 42, "phid": "PHID-DIFF-1", "uri": "u"}))
+        } else if method == "differential.updaterevision" || method == "differential.createrevision"
+        {
+            Ok(json!({"revisionid": 7, "uri": "r"}))
+        } else {
+            assert_eq!(method, "differential.revision.edit");
+            Ok(json!({"object": {"id": 8}}))
         }
     };
     let spec = diff_spec_json(&[sample_change()], "okay", "okay", &spec_input());
@@ -902,13 +929,14 @@ fn submit_flows_chain_creatediff_and_revision_calls() {
 
 #[test]
 fn submit_via_edit_sends_null_phid_when_server_omits_it() {
-    let call = |method: &str, params: &serde_json::Value| match method {
-        "differential.creatediff" => Ok(json!({"diffid": 1, "uri": "u"})),
-        "differential.revision.edit" => {
+    let call = |method: &str, params: &serde_json::Value| {
+        if method == "differential.creatediff" {
+            Ok(json!({"diffid": 1, "uri": "u"}))
+        } else {
+            assert_eq!(method, "differential.revision.edit");
             assert_eq!(params["transactions"][0]["value"], serde_json::Value::Null);
             Ok(json!({"object": {"id": 3}}))
         }
-        _ => panic!("unexpected {method}"),
     };
     let (_, id) = submit_create_revision_via_edit(&call, &json!({}), &[], false).unwrap();
     assert_eq!(id, 3);
@@ -962,6 +990,7 @@ fn d12_modern_dictionaries_drop_nulls_and_move_details() {
     );
     // Non-objects pass through untouched.
     assert_eq!(modern_lint_dictionary(&json!(7)), json!(7));
+    assert_eq!(modern_unit_dictionary(&json!(7)), json!(7));
 }
 
 #[test]

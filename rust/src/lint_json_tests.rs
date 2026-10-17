@@ -1,5 +1,32 @@
 use super::*;
 
+use std::path::{Path, PathBuf};
+
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path =
+            std::env::temp_dir().join(format!("arc-rs-json-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
 #[test]
 fn linter_name_is_json() {
     assert_eq!(JsonLinter::new().name(), "JSON");
@@ -78,4 +105,13 @@ fn non_json_and_binary_inputs_are_silent() {
     assert!(linter.lint_bytes("f.txt", b"{oops").is_empty());
     assert!(linter.lint_bytes("f.json5", b"{oops").is_empty());
     assert!(linter.lint_bytes("f.json", b"{\x00oops").is_empty());
+}
+
+#[test]
+fn existing_directories_are_skipped() {
+    let tmp = TempDir::new("dir");
+    let dir = tmp.path().join("sub.json");
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.to_string_lossy().into_owned();
+    assert!(JsonLinter::new().lint_bytes(&path, b"{oops").is_empty());
 }

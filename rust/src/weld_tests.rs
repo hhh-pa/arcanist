@@ -66,6 +66,14 @@ fn rejects_bad_arguments() {
 }
 
 #[test]
+fn seed_flag_requires_a_value() {
+    assert_eq!(
+        parse_options_with_tty(&args(&["--seed"]), true),
+        Err("--seed requires a value".to_string())
+    );
+}
+
+#[test]
 fn splits_lines_keeping_terminators() {
     assert_eq!(split_lines_keep(""), Vec::<&str>::new());
     assert_eq!(split_lines_keep("a\nb\n"), vec!["a\n", "b\n"]);
@@ -81,6 +89,20 @@ fn splits_terminators() {
     assert_eq!(split_terminator("abc"), ("abc", None));
     assert_eq!(split_terminator("\n"), ("", Some("\n")));
     assert_eq!(split_terminator(""), ("", None));
+}
+
+#[test]
+fn splits_byte_lines_keeping_terminators() {
+    assert_eq!(split_lines_bytes(b""), Vec::<&[u8]>::new());
+    assert_eq!(
+        split_lines_bytes(b"a\nb\n"),
+        vec![b"a\n".as_slice(), b"b\n".as_slice()]
+    );
+    assert_eq!(
+        split_lines_bytes(b"a\nb"),
+        vec![b"a\n".as_slice(), b"b".as_slice()]
+    );
+    assert_eq!(split_lines_bytes(b"abc"), vec![b"abc".as_slice()]);
 }
 
 #[test]
@@ -275,6 +297,20 @@ fn weld_line_bytes_fuses_invalid_utf8_bytewise() {
 }
 
 #[test]
+fn weld_line_bytes_keeps_terminatorless_pairs_terminatorless() {
+    // Neither side carries a terminator, so the fused line has none:
+    // the output is pure fused content of the padded width.
+    let mut rng = Rng::new(3);
+    let out = weld_line_bytes(b"abc", b"defg", 0.5, &mut rng);
+    assert_eq!(out.len(), 4);
+    for (index, byte) in out.iter().enumerate() {
+        let earlier = b"abc".get(index).copied().unwrap_or(b' ');
+        let later = b"defg".get(index).copied().unwrap_or(b' ');
+        assert!(*byte == earlier || *byte == later, "index={index} {out:?}");
+    }
+}
+
+#[test]
 fn weld_buffers_skips_empty_and_is_deterministic() {
     let files = vec![b"alpha\n".to_vec(), vec![], b"beta\n".to_vec()];
     let no_empty = vec![b"alpha\n".to_vec(), b"beta\n".to_vec()];
@@ -296,14 +332,21 @@ fn r4_core49_weld_usage_has_no_dump() {
     // Fewer than two files is toolset usage (exit 1, matching the
     // old exit) with no usage dump; read failures are fatal.
     // T1153 BROWSE-B21: piped runs carry `--`.
-    match execute(&std::env::temp_dir(), &args(&["only", "--"])) {
-        Err(message) => {
-            assert_eq!(message, "Specify two or more files to weld together.");
-        }
-        _ => panic!("expected usage error"),
-    }
+    let message = execute(&std::env::temp_dir(), &args(&["only", "--"])).unwrap_err();
+    assert_eq!(message, "Specify two or more files to weld together.");
     assert_eq!(
         run_in(&std::env::temp_dir(), &args(&["only", "--"])),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn r4_core49_run_in_without_terminator_prints_hints() {
+    // T1153 BROWSE-B21: piped runs without `--` print the three cyan
+    // hints, then report toolset usage (exit 1). Stdin is never a TTY
+    // under the test runners, so the terminator is always missing here.
+    assert_eq!(
+        run_in(&std::env::temp_dir(), &args(&["a", "b"])),
         std::process::ExitCode::FAILURE
     );
 }

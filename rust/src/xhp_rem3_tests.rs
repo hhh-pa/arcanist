@@ -598,3 +598,104 @@ fn partial_catch_reports_last_duplicate_and_scopes_per_try() {
     assert_eq!(hits.len(), 1);
     assert_eq!((hits[0].0, hits[0].1), (11, 10));
 }
+
+#[test]
+fn node_start_skips_a_balanced_subscript() {
+    // A `]` directly before the class keyword walks back over its
+    // matcher; rule 87 still reports at the class name.
+    let hits = for_rule("<?php $a[0]\nclass C extends Phobject {}\n", 87);
+    assert_eq!(hits.len(), 1);
+    assert_eq!((hits[0].0, hits[0].1), (2, 7));
+}
+
+#[test]
+fn node_start_stops_at_an_unbalanced_bracket() {
+    let hits = for_rule("<?php ]\nclass C extends Phobject {}\n", 87);
+    assert_eq!(hits.len(), 1);
+    assert_eq!((hits[0].0, hits[0].1), (2, 7));
+}
+
+#[test]
+fn truncated_class_declaration_is_skipped_safely() {
+    // `class` at EOF yields a nameless, bodyless block: rules 87/95
+    // skip it, rule 113 has no body to scan, rule 88 still fires.
+    assert!(for_rule("<?php class", 87).is_empty());
+    assert!(for_rule("<?php class", 95).is_empty());
+    assert!(for_rule("<?php class", 113).is_empty());
+    assert_eq!(for_rule("<?php class", 88).len(), 1);
+}
+
+#[test]
+fn docblock_marker_needs_word_boundaries() {
+    // A glued marker neither exempts (rule 87 fires) nor matches.
+    let hits = for_rule(
+        "<?php\n/**x@concrete-extensible*/\nclass C extends Phobject {}\n",
+        87,
+    );
+    assert_eq!(hits.len(), 1);
+    // A rejected first hit falls through to a valid second marker.
+    assert!(
+        for_rule(
+            "<?php\n/** x@concrete-extensible @concrete-extensible */\nclass C extends Phobject {}\n",
+            87
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn bodiless_constructor_has_no_returns_to_flag() {
+    // A `__construct` terminated by `}` (no `;`/body) has no span.
+    assert!(for_rule("<?php interface I { function __construct() }\n", 92).is_empty());
+}
+
+#[test]
+fn closures_outside_the_constructor_do_not_mask_returns() {
+    let hits = for_rule(
+        "<?php class A extends Phobject { function __construct() { return 1; } function m() { $f = function () {}; } }\n",
+        92,
+    );
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn truncated_return_counts_as_bare() {
+    assert!(
+        for_rule(
+            "<?php class A extends Phobject { function __construct() { return",
+            92
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn continue_walk_crosses_function_boundaries() {
+    let hits = for_rule(
+        "<?php function f($x) { switch ($x) { case 1: continue; } }\n",
+        128,
+    );
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn public_property_with_nested_brackets_still_flags() {
+    let hits = for_rule(
+        "<?php class A extends Phobject { public $a = [1, 2]; }\n",
+        130,
+    );
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn paren_less_catch_has_no_names_to_collect() {
+    assert!(for_rule("<?php try {} catch {}\n", 132).is_empty());
+}
+
+#[test]
+fn glued_marker_at_end_of_doc_matches_nothing() {
+    // The needle ending the doc with a glued prefix advances past the
+    // end without matching (the scan's fallthrough arm).
+    assert!(!super::has_concrete_extensible("x@concrete-extensible"));
+    assert!(super::has_concrete_extensible(" @concrete-extensible "));
+}

@@ -1203,3 +1203,22 @@ fn call_conduit_write_failure_is_fatal() {
     assert!(std::io::Write::flush(&mut out).is_ok());
     server.join().unwrap();
 }
+
+// -( T1170 wave 5d )-----------------------------------------------------------
+
+#[test]
+fn core19_dispatch_run_prints_spelling_notice() {
+    // A resolved command with a spelling notice prints the notice
+    // before running. `help` renders without side effects; the name
+    // matches the CORE-19 pin, so the process-once command cell stays
+    // deterministic no matter which test runs first.
+    let globals = Globals::default();
+    let code = dispatch_run(
+        "help",
+        Some("(Assuming \"hep\" is the British spelling of \"help\".)"),
+        "hep",
+        &args(&["arc"]),
+        &globals,
+    );
+    assert_eq!(code, ExitCode::SUCCESS);
+}

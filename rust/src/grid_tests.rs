@@ -185,3 +185,66 @@ fn cell_width_ignores_ansi() {
     let cell = GridCell::new("status", vec!["\x1b[32mAccepted\x1b[m\n".to_string()]);
     assert_eq!(cell.content_width(), 8);
 }
+
+#[test]
+fn empty_input_has_no_glyphs() {
+    assert!(combine_glyphs(&[]).is_empty());
+    assert_eq!(console_width(""), 0);
+}
+
+#[test]
+fn ideographic_space_and_nul_are_narrow() {
+    // U+303F is the carved-out exception in the wide table; NUL
+    // contributes no columns.
+    assert!(!is_wide_codepoint(0x303F));
+    assert_eq!(glyph_width(0), 0);
+    assert_eq!(glyph_width(u32::from('日')), 2);
+    assert_eq!(glyph_width(u32::from('a')), 1);
+}
+
+#[test]
+fn ansi_stripping_preserves_four_byte_sequences() {
+    assert_eq!(strip_ansi("\x1b[1m😀\x1b[m"), "😀");
+    assert_eq!(strip_ansi("a😀b"), "a😀b");
+}
+
+#[test]
+fn display_width_pins_the_column() {
+    let mut grid = GridView::new();
+    grid.new_column("fixed").set_display_width(4);
+    grid.new_column("auto");
+    grid.new_row(vec![
+        GridCell::new("fixed", vec!["toolongvalue\n".to_string()]),
+        GridCell::new("auto", vec!["xy\n".to_string()]),
+    ]);
+    // A pinned width skips content measuring (the `is_none` else arm).
+    assert_eq!(grid.draw(Some(80)), "too…  xy\n");
+}
+
+#[test]
+fn minimum_width_round_trips() {
+    let mut grid = GridView::new();
+    let column = grid.new_column("messages");
+    assert_eq!(column.minimum_width(), None);
+    column.set_minimum_width(12);
+    assert_eq!(column.minimum_width(), Some(12));
+}
+
+#[test]
+fn rows_report_cells_and_missing_cells_draw_empty() {
+    let row = GridRow::new(vec![GridCell::new("a", vec!["x\n".to_string()])]);
+    assert!(row.has_cell("a"));
+    assert!(!row.has_cell("b"));
+    let mut grid = GridView::new();
+    grid.new_column("a");
+    grid.new_column("b");
+    grid.new_row(vec![GridCell::new("a", vec!["x\n".to_string()])]);
+    assert_eq!(grid.draw(Some(80)), "x   \n");
+}
+
+#[test]
+#[should_panic(expected = "Can not draw a grid with no columns!")]
+fn drawing_without_columns_panics_like_php() {
+    let grid = GridView::new();
+    let _ = grid.draw(Some(80));
+}

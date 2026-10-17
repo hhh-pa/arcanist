@@ -68,3 +68,10 @@ fn only_composer_json_files_are_checked() {
     );
     assert!(linter.lint_bytes("composer.json", b"{\0}").is_empty());
 }
+
+#[test]
+fn severity_lookup_strips_composer_prefix() {
+    let linter = ComposerLinter::new();
+    assert_eq!(linter.severity_lookup_code("COMPOSER1"), "1");
+    assert_eq!(linter.severity_lookup_code("OTHER"), "OTHER");
+}

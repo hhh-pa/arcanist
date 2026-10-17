@@ -1639,3 +1639,108 @@ fn t1170_execute_with_client_routes_help_and_parse_errors() {
     let err = execute_with_client(dir.path(), &args(&["--bogus"]), Some(80), None).unwrap_err();
     assert!(err.contains("--bogus"), "{err}");
 }
+
+// -( T1170 wave 5d )-----------------------------------------------------------
+
+#[test]
+fn t1170_query_markers_system_needs_checkout() {
+    // Outside a checkout the system-hg entry fails before spawning,
+    // so no assertion touches the ambient `hg` backend.
+    let empty = TempDir::new("syshg-empty");
+    assert_eq!(
+        query_hg_markers(empty.path(), MARKER_TYPE_BRANCH).unwrap_err(),
+        "not inside a Mercurial working copy"
+    );
+}
+
+#[test]
+fn t1170_merge_id_query_refs_skips_unknown_ids() {
+    // The id query may return rows for revisions no state mentions
+    // (stale server data); they are skipped, not merged.
+    let states = vec![StateCommit {
+        hash: "abc".to_string(),
+        message: "change\n\nDifferential Revision: D7".to_string(),
+    }];
+    let query_rows = r#"[{"id": 7, "phid": "PHID-DREV-7", "hashes": [["gtcm", "abc"]]}]"#;
+    let hit = serde_json::json!({
+        "id": 7,
+        "phid": "PHID-DREV-7",
+        "fields": {
+            "title": "change",
+            "status": {"value": "needs-review", "name": "Needs Review"},
+        },
+    });
+    let stranger = serde_json::json!({
+        "id": 999,
+        "phid": "PHID-DREV-999",
+        "fields": {
+            "title": "stranger",
+            "status": {"value": "needs-review", "name": "Needs Review"},
+        },
+    });
+    let (base, rx) = serve_seq(vec![
+        format!(r#"{{"result": {query_rows}, "error_code": null}}"#),
+        format!(r#"{{"result": {{"data": [{hit}, {stranger}]}}, "error_code": null}}"#),
+    ]);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    let merged = load_revision_refs_for_vcs(Some(&client), &states, "git").unwrap();
+    let refs = merged.get("abc").unwrap();
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].id(), 7);
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(seen.len(), 2);
+}
+
+#[test]
+fn t1170_run_head_query_propagates_hg_failures() {
+    // Spawn failures resolve to empty output; unparseable log output
+    // is what fails the query.
+    let dir = TempDir::new("headquery-fail");
+    let mut graph = commitgraph::CommitGraph::new();
+    let hg = fake_hg_stdout("bogus\n");
+    let heads = vec!["abc".to_string()];
+    let err = run_head_query(&mut graph, dir.path(), &hg, "hg", &heads, &[]).unwrap_err();
+    assert!(!err.is_empty(), "{err}");
+}
+
+#[test]
+fn t1170_load_disjoint_heads_propagates_hg_failures() {
+    let dir = TempDir::new("disjoint-fail");
+    let mut graph = commitgraph::CommitGraph::new();
+    let hg = fake_hg_stdout("bogus\n");
+    let mut nodes = vec!["keep".to_string()];
+    let err = load_disjoint_heads(
+        &mut graph,
+        dir.path(),
+        &hg,
+        "hg",
+        &["missing".to_string()],
+        &mut nodes,
+    )
+    .unwrap_err();
+    assert!(!err.is_empty(), "{err}");
+    assert_eq!(nodes, vec!["keep".to_string()]);
+}
+
+#[test]
+fn t1170_execute_builds_tokenless_client_then_queries() {
+    // With an explicit URI the tokenless setup succeeds offline and
+    // the workflow proceeds to its conduit queries, which fail
+    // against the dead port (no proxy: localhost is exempt).
+    let repo = init_repo("exec-query");
+    let sha = git(repo.path(), &["rev-parse", "HEAD"]);
+    git(
+        repo.path(),
+        &["remote", "add", "origin", "https://h.test/repo.git"],
+    );
+    git(
+        repo.path(),
+        &["update-ref", "refs/remotes/origin/main", &sha],
+    );
+    let err = execute(
+        repo.path(),
+        &args(&["--conduit-uri", "http://127.0.0.1:9/"]),
+    )
+    .unwrap_err();
+    assert!(!err.is_empty(), "{err}");
+}

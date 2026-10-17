@@ -345,3 +345,21 @@ fn unit_u20_driver_coverage_keeps_document_order() {
     let names: Vec<&str> = ordered.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(names, vec!["z.php", "a.php"]);
 }
+
+#[test]
+fn walk_stops_outside_the_stop_root() {
+    assert!(walk_to_root("/other/x", "/stop").is_empty());
+    assert_eq!(walk_to_root("/r/a/b", "/r"), vec!["/r/a/b", "/r/a", "/r"]);
+}
+
+#[test]
+fn walk_ends_at_a_bare_slash() {
+    assert_eq!(walk_to_root("/x", "/"), vec!["/x"]);
+}
+
+#[test]
+fn join_root_prefixes_relative_paths() {
+    assert_eq!(join_root("/r", "rel/path"), "/r/rel/path");
+    assert_eq!(join_root("/r/", "rel"), "/r/rel");
+    assert_eq!(join_root("/r", "/abs/path"), "/abs/path");
+}

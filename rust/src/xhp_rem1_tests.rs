@@ -1433,6 +1433,64 @@ fn brace_bare_block_gap_checked() {
 }
 
 #[test]
+fn brace_helpers_tolerate_missing_predecessors() {
+    // Defensive edges parsed sources never produce (the open tag is
+    // always the first semantic token): a bare `{`, a block `{`, an
+    // `else`, and a type name with no semantic predecessor.
+    let bare = ast::Tree {
+        source: "{ }".to_string(),
+        tokens: vec![ast::Token {
+            kind: "{".to_string(),
+            value: "{".to_string(),
+            offset: 0,
+        }],
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    super::brace_bare_blocks(&bare, &[], &mut out);
+    assert!(out.is_empty());
+
+    let donor = ast::tree_from_source("<?php function f() {}\n");
+    let blocks = donor.blocks();
+    assert_eq!(blocks.len(), 1);
+    let mut block = blocks[0].clone();
+    block.body = ast::BodySpan::Brace {
+        open: 0,
+        close: None,
+    };
+    let mut out = Vec::new();
+    super::brace_open_gap(&donor, &block, &mut out);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].rule, 24);
+
+    let donor =
+        ast::tree_from_source("<?php function f() { if ($a) { $b = 1; }else{ $c = 2; } }\n");
+    let blocks = donor.blocks();
+    let found = blocks
+        .into_iter()
+        .find(|b| matches!(b.kind, ast::BlockKind::Else));
+    let mut block = found.unwrap();
+    let mut out = Vec::new();
+    super::brace_else_gap(&donor, &block, &mut out);
+    assert_eq!(out.len(), 1);
+    block.kw_idx = 0;
+    let mut out = Vec::new();
+    super::brace_else_gap(&donor, &block, &mut out);
+    assert!(out.is_empty());
+
+    let solo = ast::Tree {
+        source: "C".to_string(),
+        tokens: vec![ast::Token {
+            kind: ast::kinds::T_STRING.to_string(),
+            value: "C".to_string(),
+            offset: 0,
+        }],
+        ..Default::default()
+    };
+    assert!(super::is_type_name_start(&solo, 0, 0));
+}
+
+#[test]
 fn brace_else_without_braces() {
     // A truncated `else` has no end to hug.
     assert!(for_rule("<?php if ($x) {} else", 24).is_empty());

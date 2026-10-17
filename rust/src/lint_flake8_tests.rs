@@ -154,3 +154,166 @@ fn severity_codes_need_one_letter_like_php() {
         );
     }
 }
+
+// -( T1170 wave 5d: options, tool runs )--------------------------------------
+
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-lint-flake8-tests-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+#[cfg(unix)]
+fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) {}
+
+fn option_ctx(root: &Path) -> OptionContext<'_> {
+    OptionContext { project_root: root }
+}
+
+#[test]
+fn set_option_delegates_bin_flags_and_version() {
+    let tmp = TempDir::new("tool-opts");
+    let tool = tmp.path().join("fake-flake8");
+    std::fs::write(&tool, b"#!/bin/sh\nexit 0\n").unwrap();
+    make_executable(&tool);
+    let ctx = option_ctx(tmp.path());
+    let mut linter = Flake8Linter::new();
+    linter
+        .set_option(
+            "bin",
+            &serde_json::json!(tool.to_string_lossy().into_owned()),
+            &ctx,
+        )
+        .unwrap();
+    assert_eq!(linter.options.bin, Some(tool));
+    linter
+        .set_option("flags", &serde_json::json!(["--extra"]), &ctx)
+        .unwrap();
+    assert_eq!(linter.options.flags, Some(vec!["--extra".to_string()]));
+    assert!(
+        linter
+            .set_option("flags", &serde_json::json!("--extra"), &ctx)
+            .is_err()
+    );
+    linter
+        .set_option("version", &serde_json::json!(">= 1.0"), &ctx)
+        .unwrap();
+    assert_eq!(linter.options.version.as_deref(), Some(">= 1.0"));
+    assert!(
+        linter
+            .set_option("bogus", &serde_json::json!(true), &ctx)
+            .is_err()
+    );
+}
+
+#[test]
+fn binary_on_path_bare_name_reads_path() {
+    // A bare tool name searches `$PATH`, exactly like `binary_in`
+    // over the ambient value; no assertion on what it finds.
+    let expected = std::env::var_os("PATH").and_then(|path| binary_in(&path));
+    assert_eq!(binary_on_path(BINARY), expected);
+}
+
+#[test]
+#[cfg(unix)]
+fn lint_bytes_runs_configured_tool() {
+    let tmp = TempDir::new("run");
+    let ctx = option_ctx(tmp.path());
+    let tool = write_script(
+        tmp.path(),
+        "fake-flake8",
+        "#!/bin/sh\necho 'target.py:3:1: E302 expected 2 blank lines, found 1'\n",
+    );
+    let mut linter = Flake8Linter::new();
+    linter
+        .set_option(
+            "bin",
+            &serde_json::json!(tool.to_string_lossy().into_owned()),
+            &ctx,
+        )
+        .unwrap();
+    let messages = linter.lint_bytes("a.py", b"x = 1\n");
+    assert_eq!(messages.len(), 1);
+    assert_eq!((messages[0].line, messages[0].col), (3, 1));
+    assert_eq!(messages[0].code, "E302");
+    assert_eq!(messages[0].severity, "error");
+}
+
+#[test]
+#[cfg(unix)]
+fn version_requirement_gates_linting() {
+    let tmp = TempDir::new("version");
+    let ctx = option_ctx(tmp.path());
+    // A tool reporting no parseable version stays inactive.
+    let tool = write_script(tmp.path(), "fake-flake8", "#!/bin/sh\necho junk\n");
+    let mut linter = Flake8Linter::new();
+    linter
+        .set_option(
+            "bin",
+            &serde_json::json!(tool.to_string_lossy().into_owned()),
+            &ctx,
+        )
+        .unwrap();
+    linter
+        .set_option("version", &serde_json::json!(">= 1.0"), &ctx)
+        .unwrap();
+    assert!(linter.lint_bytes("a.py", b"x = 1\n").is_empty());
+    // A tool answering `--version` with a minor-prefixed version
+    // proceeds to lint.
+    let tool = write_script(
+        tmp.path(),
+        "fake-flake8-new",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 3.9.2; else echo 'target.py:9: C901 f is too complex'; fi\n",
+    );
+    let mut linter = Flake8Linter::new();
+    linter
+        .set_option(
+            "bin",
+            &serde_json::json!(tool.to_string_lossy().into_owned()),
+            &ctx,
+        )
+        .unwrap();
+    linter
+        .set_option("version", &serde_json::json!(">= 1.0"), &ctx)
+        .unwrap();
+    let messages = linter.lint_bytes("a.py", b"x = 1\n");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].code, "C901");
+    assert_eq!(messages[0].severity, "advice");
+}

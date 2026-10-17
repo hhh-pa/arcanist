@@ -8108,3 +8108,14 @@ fn t1170_execute_classified_uses_hg_metadata() {
         "{writer:?}"
     );
 }
+
+#[test]
+fn t1170_describe_json_type_names_all_shapes() {
+    assert_eq!(describe_json_type(&serde_json::json!(null)), "NULL");
+    assert_eq!(describe_json_type(&serde_json::json!(true)), "boolean");
+    assert_eq!(describe_json_type(&serde_json::json!(7)), "integer");
+    assert_eq!(describe_json_type(&serde_json::json!(7.5)), "double");
+    assert_eq!(describe_json_type(&serde_json::json!("x")), "string");
+    assert_eq!(describe_json_type(&serde_json::json!([1])), "array");
+    assert_eq!(describe_json_type(&serde_json::json!({"a": 1})), "array");
+}

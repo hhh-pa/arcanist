@@ -526,3 +526,12 @@ fn binary_option_rejects_non_strings_and_discovery_skips_malformed_entries() {
     assert_eq!(map.len(), 1);
     assert_eq!(map["b"], vec!["x".to_string()]);
 }
+
+#[test]
+fn unknown_printf_spec_declines() {
+    assert_eq!(vsprintf("%q", &["x".to_string()]), None);
+    assert_eq!(
+        vsprintf("%s!", &["hi".to_string()]),
+        Some("hi!".to_string())
+    );
+}

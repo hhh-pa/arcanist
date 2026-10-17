@@ -44,12 +44,12 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .args(args)
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
+    let detail = format!(
         "git {} failed: {}",
         args.join(" "),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(output.status.success(), "{detail}");
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
@@ -1359,6 +1359,27 @@ fn check_cover_paths_keeps_unrelatable_absolute_paths() {
 }
 
 #[test]
+fn check_cover_paths_cleans_dot_segments() {
+    let tmp = TempDir::new("coverdot");
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "x").unwrap();
+    let dotted = format!("{}/./f.txt", tmp.path().display());
+    let specs = check_cover_paths(tmp.path(), std::slice::from_ref(&dotted)).unwrap();
+    assert_eq!(specs, vec!["f.txt".to_string()]);
+}
+
+#[test]
+fn relative_to_dir_cleans_leading_cur_dirs() {
+    // Only a leading `./` survives `components()` as `CurDir`
+    // (interior dots normalize away), so the lexical cleaner meets
+    // it only on `./`-led relative paths.
+    assert_eq!(
+        relative_to_dir(Path::new("./sub"), Path::new("./sub/f.txt")),
+        Some("f.txt".to_string())
+    );
+}
+
+#[test]
 fn minusminus_lines_name_unnamed_diffs() {
     let files = parse_diff_unified0("diff --git abc\n--- a/foo.txt\n");
     assert_eq!(
@@ -1436,13 +1457,19 @@ fn colon_less_rules_are_invalid() {
         verbose: false,
     };
     let mut trying: VecDeque<&str> = VecDeque::new();
-    match resolve_base_rule(&mut engine, "nocolon", "user", &mut trying) {
-        Err(err) => assert_eq!(
-            err,
-            "Rule 'nocolon' is invalid, it must have a type and name like 'arc:upstream'."
-        ),
-        _ => panic!("a colon-less rule must be invalid"),
-    }
+    let err = resolve_base_rule(&mut engine, "nocolon", "user", &mut trying)
+        .err()
+        .unwrap();
+    assert_eq!(
+        err,
+        "Rule 'nocolon' is invalid, it must have a type and name like 'arc:upstream'."
+    );
+}
+
+#[test]
+#[should_panic(expected = "expected args")]
+fn options_panics_on_non_args() {
+    options(&["--help"]);
 }
 
 #[test]

@@ -184,6 +184,79 @@ fn builds_created_json() {
 }
 
 #[test]
+fn parses_created_ids_beyond_i64_and_strings() {
+    let task = parse_created(&serde_json::json!({
+        "id": 18446744073709551615u64,
+        "title": "Big",
+        "uri": "https://example.test/T1",
+    }))
+    .unwrap();
+    assert_eq!(task.id, "18446744073709551615");
+    let task = parse_created(&serde_json::json!({
+        "id": "77",
+        "title": "Str",
+        "uri": "https://example.test/T77",
+    }))
+    .unwrap();
+    assert_eq!(task.id, "77");
+}
+
+#[test]
+fn error_text_helpers_render_verbatim() {
+    assert_eq!(
+        conduit_error_text(conduit::Error::Transport("down".to_string())),
+        "down"
+    );
+    assert_eq!(
+        missing_task_id(),
+        "conduit maniphest.createtask response has no id"
+    );
+    let parse = serde_json::from_str::<serde_json::Value>("{bad").unwrap_err();
+    assert!(json_encode_error(parse).starts_with("failed to encode JSON: "),);
+}
+
+/// Serve one canned Conduit response on loopback, returning the base URI.
+/// The handler reads the request headers, then answers `response`.
+fn serve_one(response: &str) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let uri = format!("http://{}/", listener.local_addr().unwrap());
+    let body = response.to_string();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let mut seen = Vec::new();
+        loop {
+            let n = stream.read(&mut buf).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            seen.extend_from_slice(&buf[..n]);
+            if seen.windows(4).any(|w| w == b"\r\n\r\n") || seen.len() > 65536 {
+                break;
+            }
+        }
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(reply.as_bytes()).unwrap();
+        stream.flush().unwrap();
+    });
+    (uri, handle)
+}
+
+#[test]
+fn cc_resolution_ignores_scalar_results() {
+    let (uri, handle) = serve_one(r#"{"error_code":null,"error_info":null,"result":"scalar"}"#);
+    let client = conduit::Client::new(&uri, "t").unwrap();
+    let phids = resolve_cc_phids(&client, &["alice".to_string()]).unwrap();
+    assert!(phids.is_empty());
+    handle.join().unwrap();
+}
+
+#[test]
 fn r4_rbd4_parse_error_has_no_dump() {
     // `todo` is a subprocess workflow: argument errors render `Usage
     // Exception:` (exit 1) with no usage dump.

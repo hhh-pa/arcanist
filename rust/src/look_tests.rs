@@ -414,13 +414,8 @@ fn fill_repositories_maps_push_and_fetch() {
 
 #[test]
 fn resolve_repositories_skips_empty_search() {
-    let calls: std::cell::Cell<u32> = std::cell::Cell::new(0);
-    let call = |_method: &str, _params: &serde_json::Value| {
-        calls.set(calls.get() + 1);
-        Ok(serde_json::json!({}))
-    };
+    let call = |_: &str, _: &serde_json::Value| unreachable!("empty search must short-circuit");
     assert_eq!(resolve_repositories(&call, &[]).unwrap(), Vec::new());
-    assert_eq!(calls.get(), 0);
 }
 
 #[test]
@@ -970,19 +965,19 @@ fn rejects_corrupt_zoneinfo() {
 fn reads_system_new_york_when_present() {
     // Unix zoneinfo layout; skipped silently where it does not exist
     // (Windows). Expectations pin the file's zone, never the machine's.
-    let Ok(bytes) = std::fs::read("/usr/share/zoneinfo/America/New_York") else {
-        return;
-    };
-    for (now, want) in [
-        (WINTER, -18_000),
-        (SUMMER, -14_400),
-        (SPRING_BEFORE, -18_000),
-        (SPRING_AFTER, -14_400),
-        (FALL_BEFORE, -14_400),
-        (FALL_AFTER, -18_000),
-    ] {
-        assert_eq!(tzif_offset(&bytes, now as i64), Some(want), "for {now}");
-    }
+    let bytes = std::fs::read("/usr/share/zoneinfo/America/New_York").ok();
+    let _ = bytes.map(|bytes| {
+        for (now, want) in [
+            (WINTER, -18_000),
+            (SUMMER, -14_400),
+            (SPRING_BEFORE, -18_000),
+            (SPRING_AFTER, -14_400),
+            (FALL_BEFORE, -14_400),
+            (FALL_AFTER, -18_000),
+        ] {
+            assert_eq!(tzif_offset(&bytes, now as i64), Some(want), "for {now}");
+        }
+    });
 }
 
 /// Zone-independent sanity for the machine zone: current IANA offsets
@@ -1202,12 +1197,12 @@ fn look_git(dir: &std::path::Path, argv: &[&str]) -> String {
         .args(argv)
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
+    let detail = format!(
         "git {} failed: {}",
         argv.join(" "),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(output.status.success(), "{detail}");
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
@@ -1660,6 +1655,20 @@ fn run_published_fails_outside_repo() {
     write_arcconfig(plain.path(), "http://127.0.0.1:9/");
     assert_eq!(
         run_published(plain.path(), false),
+        std::process::ExitCode::from(255)
+    );
+}
+
+#[test]
+fn run_published_reports_marker_errors_fatal() {
+    // The `.git` marker makes the project URI count, so the client
+    // resolves; marker lookup then fails (not a real repo) and the
+    // data error escapes through the fatal arm without any traffic.
+    let tmp = LookTmp::new("run-published-dataerr");
+    std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+    write_arcconfig(tmp.path(), "http://127.0.0.1:9/");
+    assert_eq!(
+        run_published(tmp.path(), false),
         std::process::ExitCode::from(255)
     );
 }

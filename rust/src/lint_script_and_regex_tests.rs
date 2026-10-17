@@ -488,3 +488,118 @@ fn lint29_named_severity_wins_without_severity_group() {
     };
     assert_eq!(match_severity(&late), "warning");
 }
+
+#[test]
+fn script_without_parser_or_pattern_stays_silent() {
+    let dir = std::env::temp_dir();
+    let ctx = OptionContext { project_root: &dir };
+    let mut linter = ScriptAndRegexLinter::new();
+    linter
+        .set_option(
+            "script-and-regex.script",
+            &serde_json::json!("echo hi"),
+            &ctx,
+        )
+        .unwrap();
+    assert!(linter.lint_bytes("file.txt", b"data\n").is_empty());
+    assert_eq!(linter.take_error(), None);
+}
+
+#[test]
+fn pcre_throw_group_fails_through_lint_bytes() {
+    let dir = std::env::temp_dir();
+    let ctx = OptionContext { project_root: &dir };
+    let mut linter = ScriptAndRegexLinter::new();
+    linter
+        .set_option(
+            "script-and-regex.script",
+            &serde_json::json!("echo boom"),
+            &ctx,
+        )
+        .unwrap();
+    linter
+        .set_option(
+            "script-and-regex.regex",
+            &serde_json::json!("/^(?P<throw>.+)$/m"),
+            &ctx,
+        )
+        .unwrap();
+    assert!(linter.lint_bytes("file.txt", b"data\n").is_empty());
+    let error = linter.take_error().unwrap();
+    assert!(error.contains("'throw'"), "{error}");
+}
+
+#[test]
+fn script_and_regex_options_reject_non_strings() {
+    let dir = std::env::temp_dir();
+    let ctx = OptionContext { project_root: &dir };
+    let mut linter = ScriptAndRegexLinter::new();
+    assert_eq!(
+        linter
+            .set_option("script-and-regex.script", &serde_json::json!(42), &ctx)
+            .unwrap_err(),
+        "'script-and-regex.script' must be a string"
+    );
+    assert_eq!(
+        linter
+            .set_option("script-and-regex.regex", &serde_json::json!(42), &ctx)
+            .unwrap_err(),
+        "'script-and-regex.regex' must be a string"
+    );
+}
+
+#[test]
+fn pcre_parse_of_empty_output_is_empty() {
+    let pattern = compile_pcre("/(?P<message>.+)/").unwrap();
+    let (messages, halted) =
+        parse_pcre_output_with_file_bytes(&pattern, "", "f.txt", b"x\n", &|_| None).unwrap();
+    assert!(messages.is_empty());
+    assert!(!halted);
+}
+
+fn offset_other_file_parser(_output: &str) -> Vec<ScriptRegexMatch> {
+    vec![ScriptRegexMatch {
+        message: Some("m".to_string()),
+        file: Some("other.txt".to_string()),
+        offset: Some("0".to_string()),
+        ..ScriptRegexMatch::default()
+    }]
+}
+
+#[test]
+fn offset_in_another_file_reads_from_the_project_root() {
+    // Without a configured root the other file cannot be supplied,
+    // like PHP's `loadData()` failure.
+    let linter = ScriptAndRegexLinter::with_script_and_parser("echo hi", offset_other_file_parser);
+    assert!(linter.lint_bytes("file.txt", b"data\n").is_empty());
+    let error = linter.take_error().unwrap();
+    assert!(error.contains("Failed to read file 'other.txt'"), "{error}");
+}
+
+#[test]
+fn binary_lookup_rejects_empty_names() {
+    assert!(!binary_exists(""));
+}
+
+#[test]
+#[cfg(unix)]
+fn binary_lookup_covers_paths_and_path_search() {
+    assert!(binary_exists("/bin/sh"));
+    assert!(!binary_exists("/definitely/missing/tool-xyz"));
+    assert!(binary_exists("sh"));
+    assert!(!binary_exists("definitely-missing-lint-binary-xyz"));
+}
+
+#[test]
+fn run_script_defaults_to_the_working_directory() {
+    let output = run_script_for_path("echo", "hello").unwrap();
+    assert!(output.contains("hello"), "{output:?}");
+}
+
+#[test]
+fn php_int_casts_signs_and_garbage() {
+    assert_eq!(php_int("-12"), -12);
+    assert_eq!(php_int("+5"), 5);
+    assert_eq!(php_int("  42x"), 42);
+    assert_eq!(php_int("abc"), 0);
+}

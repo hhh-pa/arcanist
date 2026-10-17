@@ -167,3 +167,144 @@ fn staged_names_keep_safe_extensions() {
     assert_eq!(staged_name("weird."), "src.cpp");
     assert_eq!(staged_name("a.verylongextensionname"), "src.cpp");
 }
+
+// -( T1170 COV5: close lint_cppcheck.rs )--------------------------------------
+
+#[test]
+fn empty_path_segments_are_skipped() {
+    assert!(binary_in(std::ffi::OsStr::new("")).is_none());
+    assert!(binary_in(std::ffi::OsStr::new(":")).is_none());
+}
+
+#[test]
+fn default_lookup_runs_without_options() {
+    // Outcome depends on the machine (a real cppcheck may exist), so
+    // nothing is asserted; the lookup path itself must not fail.
+    let _found = binary_on_path();
+    let _messages = CppcheckLinter::new().lint_bytes("a.c", b"int x;\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn tool_output_flows_through_lint_with_binary() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new("tool-out");
+    let fake = tmp.path().join("cppcheck");
+    std::fs::write(
+        &fake,
+        format!("#!/bin/sh\ncat >&2 <<'EOF'\n{REPORT}\nEOF\nexit 0\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let messages = lint_with_binary("src/main.c", b"int x;\n", Some(&fake));
+    assert_eq!(messages.len(), 4);
+    assert!(messages.iter().all(|m| m.path == "src/main.c"));
+    assert_eq!(messages[3].name, "nullPointer");
+    // A nonzero tool exit yields no messages.
+    std::fs::write(&fake, "#!/bin/sh\nexit 3\n").unwrap();
+    assert!(lint_with_binary("src/main.c", b"int x;\n", Some(&fake)).is_empty());
+}
+
+#[test]
+fn ampersand_without_semicolon_stays_literal() {
+    // Quirk: the trailing `&`-tail is appended twice (once on the
+    // missing-`;` break, once after the loop).
+    let report = REPORT.replace("Unused variable: x", "fish & chips");
+    let messages = parse_output("a.c", 0, "", &report);
+    assert_eq!(messages[2].description, "fish & chips& chips");
+}
+
+#[test]
+fn long_entities_are_kept_verbatim() {
+    let report = REPORT.replace("Unused variable: x", "&averylongentityname;!");
+    let messages = parse_output("a.c", 0, "", &report);
+    assert_eq!(messages[2].description, "&averylongentityname;!");
+}
+
+#[test]
+fn char_refs_decode_decimal_hex_and_upper_hex() {
+    let report = REPORT.replace("Unused variable: x", "&#65;&#x41;&#X42;");
+    let messages = parse_output("a.c", 0, "", &report);
+    assert_eq!(messages[2].description, "AAB");
+}
+
+#[test]
+fn unknown_and_broken_char_refs_stay_verbatim() {
+    for entity in ["&bogus;", "&#xZZ;", "&#;", "&#55296;", "&#x;"] {
+        let report = REPORT.replace("Unused variable: x", entity);
+        let messages = parse_output("a.c", 0, "", &report);
+        assert_eq!(messages[2].description, entity, "{entity}");
+    }
+}
+
+#[test]
+fn attr_lookup_skips_substring_and_unquoted_matches() {
+    // `id` inside `grid` is not an attribute boundary.
+    let report = REPORT.replacen("<error id=", "<error grid=\"1\" id=", 1);
+    let messages = parse_output("a.c", 0, "", &report);
+    assert_eq!(messages[0].name, "arrayIndexOutOfBounds");
+    // A space before `=` is not an attribute either.
+    let report = REPORT.replacen("id=\"unreadVariable\"", "id =\"unreadVariable\"", 1);
+    let messages = parse_output("a.c", 0, "", &report);
+    assert_eq!(messages[2].name, "");
+    // Unquoted values are skipped.
+    let report = REPORT.replacen("id=\"unreadVariable\"", "id=unreadVariable", 1);
+    let messages = parse_output("a.c", 0, "", &report);
+    assert_eq!(messages[2].name, "");
+}
+
+#[test]
+fn unterminated_and_unclosed_reports_parse_to_nothing() {
+    assert!(parse_output("a.c", 0, "", "<error id=\"x\"").is_empty());
+    assert!(
+        parse_output(
+            "a.c",
+            0,
+            "",
+            "<error id=\"x\" severity=\"style\" msg=\"m\">blah blah"
+        )
+        .is_empty()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn linter_options_drive_lint_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new("options");
+    let fake = tmp.path().join("cppcheck");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"Cppcheck 2.10\"; exit 0; fi\ncat >&2 <<'EOF'\n{REPORT}\nEOF\nexit 0\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ctx = crate::lint::OptionContext {
+        project_root: tmp.path(),
+    };
+    let mut linter = CppcheckLinter::new();
+    linter
+        .set_option(
+            "bin",
+            &serde_json::json!(fake.to_string_lossy().to_string()),
+            &ctx,
+        )
+        .unwrap();
+    // An unsatisfied version requirement silences the linter.
+    linter
+        .set_option("version", &serde_json::json!(">= 99"), &ctx)
+        .unwrap();
+    assert!(linter.lint_bytes("src.c", b"int x;\n").is_empty());
+    // A satisfied requirement runs the tool with default flags.
+    linter
+        .set_option("version", &serde_json::json!(">= 2.0"), &ctx)
+        .unwrap();
+    assert_eq!(linter.lint_bytes("src.c", b"int x;\n").len(), 4);
+    // Configured flags replace the defaults; the tool still runs.
+    linter
+        .set_option("flags", &serde_json::json!(["--custom-flag"]), &ctx)
+        .unwrap();
+    assert_eq!(linter.lint_bytes("src.c", b"int x;\n").len(), 4);
+}

@@ -188,3 +188,35 @@ fn interpreter_candidates_cover_platform() {
     assert!(found.contains(&"python3"));
     assert_eq!(found.contains(&"python"), cfg!(windows));
 }
+
+#[test]
+fn path_lookup_skips_empty_segments() {
+    assert!(find_on_path(std::ffi::OsStr::new(":"), "no-such-tool-xyz").is_none());
+}
+
+#[test]
+fn piped_run_without_terminator_fails() {
+    // Without `--` on a pipe, `run_in` prints the terminator hints
+    // and reports usage; on a TTY it proceeds (and the empty dir has
+    // no script, so it still fails cleanly without spawning).
+    let tmp = TempDir::new("piped");
+    assert_eq!(
+        run_in(tmp.path(), &args(&[])),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn passthru_returns_the_script_status() {
+    let tmp = TempDir::new("passthru");
+    let script_dir = tmp.path().join("support").join("arcanoid");
+    std::fs::create_dir_all(&script_dir).unwrap();
+    std::fs::write(script_dir.join("arcanoid.py"), "import sys\nsys.exit(0)\n").unwrap();
+    if python3_on_path().is_none() {
+        return;
+    }
+    assert_eq!(
+        run_in(tmp.path(), &args(&["--"])),
+        std::process::ExitCode::SUCCESS
+    );
+}

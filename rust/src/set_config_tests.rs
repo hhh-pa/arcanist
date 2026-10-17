@@ -341,6 +341,59 @@ fn r4_core49_set_config_usage_has_no_dump() {
     );
     assert_eq!(run(&[]), std::process::ExitCode::FAILURE);
 }
+
+#[test]
+fn run_rejects_malformed_runtime_config() {
+    // `--config` validates before anything else: a pair without `=`
+    // fails the run with exit 1 and no disk access.
+    assert_eq!(
+        run(&[
+            "--config".to_string(),
+            "bogus".to_string(),
+            "key".to_string(),
+            "value".to_string()
+        ]),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn run_local_rejects_alias_keys_before_writing() {
+    // `aliases` keys always fail coercion, so the `--local` run errors
+    // before touching working-copy config: the local arm runs without
+    // writing to the real checkout.
+    assert_eq!(
+        run(&[
+            "--local".to_string(),
+            "aliases".to_string(),
+            "x".to_string()
+        ]),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn run_rejects_missing_arcrc_file_override() {
+    // A `--arcrc-file` that names no file fails user-file resolution
+    // before any read or write.
+    assert_eq!(
+        run(&[
+            "--arcrc-file".to_string(),
+            "definitely/missing/arcrc".to_string(),
+            "k".to_string(),
+            "v".to_string()
+        ]),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn local_writes_reject_parentless_paths() {
+    // A path with no parent skips directory creation; the write itself
+    // then fails because the empty path names no file.
+    let map = serde_json::Map::new();
+    assert!(write_local_file(Path::new(""), &map).is_err());
+}
 #[test]
 fn r10_set_config_help_matches_generated_format() {
     // T1153 R10: `--help` renders the generated workflow help

@@ -305,6 +305,15 @@ fn matches_permanent_rule_patterns() {
 }
 
 #[test]
+fn empty_pattern_parts_match_empty() {
+    // The parser yields `Empty` at end of input, and `Empty` matches
+    // the empty string at any position.
+    let mut parser = PatternParser::new("");
+    assert_eq!(parser.parse_atom(), Pattern::Empty);
+    assert_eq!(match_here(&Pattern::Empty, &[], 0), vec![0]);
+}
+
+#[test]
 fn legacy_status_codes_cover_numbers_and_unknown_shapes() {
     // A numeric `status` mangles like its string spelling.
     let reference = RevisionRef::from_query_row(&serde_json::json!({
@@ -524,15 +533,20 @@ fn search_window_is_nested(lines: &[&str], index: usize) -> bool {
     let low = index.saturating_sub(6);
     let high = (index + 7).min(lines.len());
     let window = lines[low..high].join("\n");
-    window.contains("\"constraints\"")
-        || window.contains("conduit_search")
-        || window.contains("search_params(")
-        || window.contains("search_constraints(")
+    [
+        "\"constraints\"",
+        "conduit_search",
+        "search_params(",
+        "search_constraints(",
+    ]
+    .iter()
+    .any(|needle| window.contains(needle))
 }
 
-/// Scan one source file for flat `.search` params, pushing
-/// `name:line: text` failures; returns the call sites checked.
-fn scan_file_for_flat_search(name: &str, body: &str, failures: &mut Vec<String>) -> usize {
+/// Scan one source file for flat `.search` params, recording one
+/// `(nested, name:line: text)` verdict per call site; returns the call
+/// sites checked.
+fn scan_file_for_flat_search(name: &str, body: &str, verdicts: &mut Vec<(bool, String)>) -> usize {
     let lines: Vec<&str> = body.lines().collect();
     let mut checked = 0;
     for (index, line) in lines.iter().enumerate() {
@@ -540,9 +554,8 @@ fn scan_file_for_flat_search(name: &str, body: &str, failures: &mut Vec<String>)
             continue;
         }
         checked += 1;
-        if !search_window_is_nested(&lines, index) {
-            failures.push(format!("{}:{}: {}", name, index + 1, line.trim()));
-        }
+        let nested = search_window_is_nested(&lines, index);
+        verdicts.push((nested, format!("{}:{}: {}", name, index + 1, line.trim())));
     }
     checked
 }
@@ -563,23 +576,24 @@ fn every_search_call_site_nests_constraints() {
         .unwrap();
     entries.sort_by_key(|entry| entry.file_name());
     let mut checked = 0;
-    let mut failures = Vec::new();
+    let mut verdicts: Vec<(bool, String)> = Vec::new();
     for entry in entries {
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
-            continue;
-        }
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if name.ends_with("_tests.rs") {
+        let is_source = path.extension().and_then(|ext| ext.to_str()) == Some("rs");
+        let is_unit_tests = name.ends_with("_tests.rs");
+        if !is_source || is_unit_tests {
             continue;
         }
         let body = std::fs::read_to_string(&path).unwrap();
-        checked += scan_file_for_flat_search(name, &body, &mut failures);
+        checked += scan_file_for_flat_search(name, &body, &mut verdicts);
     }
-    assert!(checked > 0, "search call-site scan found nothing");
-    assert!(
-        failures.is_empty(),
+    verdicts.retain(|(nested, _)| !nested);
+    let failures: Vec<&str> = verdicts.iter().map(|(_, text)| text.as_str()).collect();
+    let report = format!(
         "flat .search params (missing top-level constraints):\n{}",
         failures.join("\n")
     );
+    assert!(checked > 0, "search call-site scan found nothing");
+    assert!(failures.is_empty(), "{report}");
 }

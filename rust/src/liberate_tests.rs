@@ -619,3 +619,110 @@ fn b23_liberate_help_matches_generated_format() {
     let ansi = usage_text(true);
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
+
+// -( T1170 wave 5d )-----------------------------------------------------------
+
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-liberate-tests-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+#[test]
+fn parse_corrects_near_miss_flag_with_notice() {
+    // T1153 B21/B23: TTY runs need no `--`; autocorrect is on, so the
+    // near-miss `--clea` corrects to `--clean` with a stderr notice.
+    let ParseOutcome::Args(opts) = parse_args_with_tty(&argv(&["--clea"]), true) else {
+        panic!("expected autocorrected args");
+    };
+    assert!(opts.clean);
+    assert_eq!(opts.path, None);
+}
+
+#[test]
+fn ensure_library_rejects_files() {
+    let dir = TempDir::new("notdir");
+    let file = dir.path().join("plain-file");
+    std::fs::write(&file, "x\n").unwrap();
+    let mut input = std::io::Cursor::new(Vec::new());
+    let mut save = |_: crate::prompts::PromptScope, _: &str| Ok(());
+    let err = ensure_library_with(&file, &mut input, true, None, &mut save).unwrap_err();
+    assert_eq!(
+        err,
+        "Provide a directory to create or update a libphutil library in."
+    );
+}
+
+#[test]
+fn rebuild_map_passes_drop_cache_when_clean() {
+    // The `--drop-cache` flag composes before spawning; the spawn
+    // itself fails either way (php or the script is missing), so the
+    // outcome only pins the failure shape.
+    let dir = TempDir::new("rebuild-clean");
+    let missing = dir.path().join("no-such-rebuild-map.php");
+    let message = rebuild_map(dir.path(), true, Some(&missing)).unwrap();
+    assert!(message.contains("php"), "{message}");
+}
+
+#[test]
+fn rebuild_map_reports_php_outcomes() {
+    // `php` is present in CI but not on every dev machine: skip the
+    // success/failure arms when it is absent.
+    let php_present = std::process::Command::new("php")
+        .arg("-v")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if php_present {
+        let dir = TempDir::new("rebuild-php");
+        let clean = dir.path().join("ok.php");
+        std::fs::write(&clean, "<?php exit(0);\n").unwrap();
+        assert_eq!(rebuild_map(dir.path(), false, Some(&clean)), None);
+        let failing = dir.path().join("fail.php");
+        std::fs::write(&failing, "<?php exit(3);\n").unwrap();
+        let message = rebuild_map(dir.path(), false, Some(&failing)).unwrap();
+        assert!(message.contains("rebuild-map.php failed"), "{message}");
+    }
+}
+
+#[test]
+fn liberate_path_delegates_to_prompt_channel() {
+    let dir = TempDir::new("delegate");
+    let file = dir.path().join("plain-file");
+    std::fs::write(&file, "x\n").unwrap();
+    let mut input = std::io::Cursor::new(Vec::new());
+    let err = liberate_path(&file, false, &mut input).unwrap_err();
+    assert_eq!(
+        err,
+        "Provide a directory to create or update a libphutil library in."
+    );
+}
+
+#[test]
+fn execute_with_input_reports_missing_terminator() {
+    // Piped runs without `--` fail before any prompt or scan.
+    let dir = TempDir::new("terminator");
+    let mut input = std::io::Cursor::new(Vec::new());
+    let err = execute_with_input(dir.path(), &argv(&[]), &mut input, false).unwrap_err();
+    assert_eq!(err, crate::help::MISSING_TERMINATOR);
+}

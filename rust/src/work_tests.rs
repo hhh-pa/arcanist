@@ -999,19 +999,17 @@ fn hg_revision_symbols_find_hash_and_footer_markers() {
                 "hashes": [["hgcm", "ffffffffffffffffffffffffffffffffffffffff"]],
             }]));
         }
-        if method == "differential.revision.search" {
-            let ids = params
-                .get("constraints")
-                .and_then(|c| c.get("ids"))
-                .cloned()
-                .unwrap_or_default();
-            if ids == serde_json::json!(["123"]) || ids == serde_json::json!([123]) {
-                return Ok(serde_json::json!({"data": [{
-                    "id": 123,
-                    "phid": "PHID-DREV-1",
-                }]}));
-            }
-            return Ok(serde_json::json!({"data": []}));
+        assert_eq!(method, "differential.revision.search");
+        let ids = params
+            .get("constraints")
+            .and_then(|c| c.get("ids"))
+            .cloned()
+            .unwrap_or_default();
+        if ids == serde_json::json!(["123"]) || ids == serde_json::json!([123]) {
+            return Ok(serde_json::json!({"data": [{
+                "id": 123,
+                "phid": "PHID-DREV-1",
+            }]}));
         }
         Ok(serde_json::json!({"data": []}))
     };
@@ -1025,6 +1023,15 @@ fn hg_revision_symbols_find_hash_and_footer_markers() {
     assert_eq!(tips.len(), 1);
     assert_eq!(tips[0].name, "feat");
     assert_eq!(tips[0].marker_type, "bookmark");
+    // A footer naming an unknown revision searches other ids (empty
+    // result) and associates nothing.
+    std::fs::write(
+        tmp.path().join(".fakehg-msg"),
+        "subject\n\nDifferential Revision: https://phab.example/D999\n",
+    )
+    .unwrap();
+    let tips = hg_branches_for_revision_with(&call, tmp.path(), &hg_cmd, &revision).unwrap();
+    assert!(tips.is_empty());
 }
 
 #[test]
@@ -1251,19 +1258,17 @@ fn branches_for_revision_matches_hash_hits_and_skips_decoys() {
         title: "Fix it".to_string(),
     };
     let call = |method: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        if method == "differential.query" {
-            return Ok(serde_json::json!([
-                {"phid": "PHID-DREV-OTHER", "hashes": [["gtcm", feature_commit]]},
-                {"phid": "PHID-DREV-1", "hashes": [
-                    ["gttr", "no-such-tree"],
-                    ["gtcm", feature_commit],
-                    ["bogus"],
-                    "not-a-pair",
-                    7,
-                ]},
-            ]));
-        }
-        Ok(serde_json::json!({"data": []}))
+        assert_eq!(method, "differential.query");
+        Ok(serde_json::json!([
+            {"phid": "PHID-DREV-OTHER", "hashes": [["gtcm", feature_commit]]},
+            {"phid": "PHID-DREV-1", "hashes": [
+                ["gttr", "no-such-tree"],
+                ["gtcm", feature_commit],
+                ["bogus"],
+                "not-a-pair",
+                7,
+            ]},
+        ]))
     };
     let tips = branches_for_revision(&call, tmp.path(), &revision).unwrap();
     assert_eq!(tips.len(), 1);
@@ -1686,17 +1691,15 @@ fn hg_hash_association_skips_decoys() {
     .unwrap();
     std::fs::write(tmp.path().join(".fakehg-branches"), "").unwrap();
     let call = |method: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        if method == "differential.query" {
-            return Ok(serde_json::json!([
-                {"phid": "PHID-DREV-OTHER", "hashes": [["hgcm", FAKE_NODE]]},
-                {"phid": "PHID-DREV-1", "hashes": [
-                    ["hgcm", "ffffffffffffffffffffffffffffffffffffffff"],
-                    ["gtcm", FAKE_NODE],
-                    ["hgcm", FAKE_NODE],
-                ]},
-            ]));
-        }
-        Ok(serde_json::json!({"data": []}))
+        assert_eq!(method, "differential.query");
+        Ok(serde_json::json!([
+            {"phid": "PHID-DREV-OTHER", "hashes": [["hgcm", FAKE_NODE]]},
+            {"phid": "PHID-DREV-1", "hashes": [
+                ["hgcm", "ffffffffffffffffffffffffffffffffffffffff"],
+                ["gtcm", FAKE_NODE],
+                ["hgcm", FAKE_NODE],
+            ]},
+        ]))
     };
     let tips = hg_branches_for_revision_with(&call, tmp.path(), &hg_cmd, &revision_123()).unwrap();
     assert_eq!(tips.len(), 1);
@@ -2145,4 +2148,17 @@ fn run_hg_in_with_cmd_restores_after_ambiguous_dispatch() {
     let log = hg_read_log(tmp.path());
     assert!(log.contains("update -- 0123456789abcdef"), "{log}");
     assert!(log.contains("branch --force -- default"), "{log}");
+}
+
+#[test]
+fn apply_hg_shelve_reports_failed_delete() {
+    // T1170: a restored shelf that cannot be deleted fails the step
+    // (work.rs:1412-1418).
+    let (tmp, hg_cmd) = hg_test_repo("hg-apply-fail");
+    std::fs::write(tmp.path().join(".fakehg-fail-shelve"), "").unwrap();
+    let err = apply_hg_shelve_with(tmp.path(), &hg_cmd, "arc-test").unwrap_err();
+    assert!(!err.is_empty());
+    let log = hg_read_log(tmp.path());
+    assert!(log.contains("unshelve --keep --name arc-test"), "{log}");
+    assert!(log.contains("shelve --delete arc-test"), "{log}");
 }

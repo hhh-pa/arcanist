@@ -84,6 +84,32 @@ fn comment_style_flags_hash_comments() {
 }
 
 #[test]
+fn comment_helpers_tolerate_unlexable_shapes() {
+    // Defensive edges the tokenizer never produces: a `#[\...]`
+    // comment (always lexed as an attribute) and a `/` that opens no
+    // comment marker.
+    let tree = ast::Tree {
+        source: "#[\\x]".to_string(),
+        tokens: vec![ast::Token {
+            kind: ast::kinds::T_COMMENT.to_string(),
+            value: "#[\\x]".to_string(),
+            offset: 0,
+        }],
+        ..Default::default()
+    };
+    let ctx = ast::RuleCtx {
+        tree: &tree,
+        path: "test.php",
+        options: &ast::XhpOptions::default(),
+    };
+    let mut out = Vec::new();
+    super::rule_comment_style(&ctx, &mut out);
+    assert!(out.is_empty());
+    assert!(!super::needs_comment_space("/ab"));
+    assert!(!super::needs_comment_space("/"));
+}
+
+#[test]
 fn elseif_usage_message_is_exact() {
     let hits = for_rule("<?php if ($a) {} elseif ($b) {}\n", 42);
     assert_eq!(hits.len(), 1);
@@ -353,6 +379,29 @@ fn decl_parens_distinguishes_anonymous() {
         2
     );
     assert!(for_rule("<?php $f = function ($x) use ($y) {};\n", 38).is_empty());
+}
+
+#[test]
+fn decl_paren_helpers_tolerate_missing_anchors() {
+    // Defensive edges the parser never produces (a declaration paren
+    // with no predecessor; a closure `use` span with no `use`
+    // keyword before its paren).
+    let tree = ast::tree_from_source("<?php function foo($x) {}\n");
+    let blocks = tree.blocks();
+    assert_eq!(blocks.len(), 1);
+    let mut out = Vec::new();
+    super::decl_paren_leading(&tree, &blocks[0], 0, &mut out);
+    assert!(out.is_empty());
+
+    let tree = ast::tree_from_source("<?php $f = function ($x) use ($y) {};\n");
+    let blocks = tree.blocks();
+    let found = blocks.into_iter().find(|b| b.closure_use.is_some());
+    let mut block = found.unwrap();
+    let rparen = block.rparen.unwrap();
+    block.closure_use = Some((rparen + 1, rparen + 1));
+    let mut out = Vec::new();
+    super::decl_use_spacing(&tree, &block, &mut out);
+    assert!(out.is_empty());
 }
 
 #[test]

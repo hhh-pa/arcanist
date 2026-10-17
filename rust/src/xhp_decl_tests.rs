@@ -1,10 +1,10 @@
 use super::super::xhp_ast as ast;
 
-fn check(source: &str) -> Vec<(u32, usize, usize, String)> {
-    check_path("test.php", source)
+fn check(source: &str) {
+    check_path("test.php", source);
 }
 
-fn check_path(path: &str, source: &str) -> Vec<(u32, usize, usize, String)> {
+fn check_path(path: &str, source: &str) {
     let canned = ast::tokens_to_canned(source, &ast::tokenize(source));
     let tree = ast::tree_from_canned(&canned).expect("canned output must parse");
     let ctx = ast::RuleCtx {
@@ -14,15 +14,11 @@ fn check_path(path: &str, source: &str) -> Vec<(u32, usize, usize, String)> {
     };
     let mut out = Vec::new();
     super::apply(&ctx, &mut out);
-    out.iter()
-        .map(|f| {
-            let (line, col) = tree.line_col(f.offset);
-            (f.rule, line, col, f.message.clone())
-        })
-        .collect()
+    // Assigned rules were ported to xhp_rem1/2/3: nothing runs here.
+    assert!(out.is_empty());
 }
 
 #[test]
 fn placeholder_decl_rules_run() {
-    assert!(check("<?php echo 1;\n").is_empty());
+    check("<?php echo 1;\n");
 }

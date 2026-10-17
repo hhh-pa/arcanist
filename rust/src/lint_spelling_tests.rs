@@ -1,5 +1,32 @@
 use super::*;
 
+use std::path::{Path, PathBuf};
+
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path =
+            std::env::temp_dir().join(format!("arc-rs-spelling-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
 fn lint(linter: &SpellingLinter, data: &str) -> Vec<LintMessage> {
     linter.lint_bytes("file.txt", data.as_bytes())
 }
@@ -105,6 +132,30 @@ fn bad_dictionaries_error_clearly() {
 }
 
 #[test]
+fn non_object_sections_error_and_empty_words_skip() {
+    let err = SpellingLinter::from_dictionary_json(r#"{"rules": {"exact": []}}"#).unwrap_err();
+    assert_eq!(
+        err,
+        "invalid spelling dictionary: 'exact' must be an object"
+    );
+    let linter =
+        SpellingLinter::from_dictionary_json(r#"{"rules": {"exact": {"": "x"}}}"#).unwrap();
+    assert_eq!(linter.rule_counts(), (0, 0));
+}
+
+#[test]
+fn empty_rules_skip_and_default_matches_new() {
+    let mut linter = SpellingLinter::empty();
+    linter.add_exact_rule("", "x");
+    linter.add_partial_rule("", "x");
+    assert_eq!(linter.rule_counts(), (0, 0));
+    assert_eq!(
+        SpellingLinter::default().rule_counts(),
+        SpellingLinter::new().rule_counts()
+    );
+}
+
+#[test]
 fn skips_empty_binary_and_ruleless_inputs() {
     let linter = SpellingLinter::new();
     assert!(lint(&linter, "").is_empty());
@@ -177,6 +228,19 @@ fn dictionaries_option_loads_files_from_project_root() {
             .is_err()
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn dictionaries_option_rejects_non_string_entries() {
+    let tmp = TempDir::new("badopt");
+    let ctx = OptionContext {
+        project_root: tmp.path(),
+    };
+    let mut linter = SpellingLinter::empty();
+    let err = linter
+        .set_option("spelling.dictionaries", &serde_json::json!([42]), &ctx)
+        .unwrap_err();
+    assert_eq!(err, "'spelling.dictionaries' must be a list of strings");
 }
 
 #[test]

@@ -15,6 +15,41 @@ fn task(id: u64, title: &str) -> Task {
     }
 }
 
+/// Serve one canned conduit response, whatever the method.
+fn serve_one(canned: String) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8_lossy(&head).to_string();
+        let len: usize = head
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(key, value)| {
+                    key.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+            })
+            .unwrap_or(0);
+        let mut body = vec![0u8; len];
+        stream.read_exact(&mut body).unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            canned.len(),
+            canned
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    base
+}
+
 #[test]
 fn parses_defaults() {
     let options = parse_args(&args(&[])).unwrap().unwrap();
@@ -381,4 +416,52 @@ fn b23_tasks_help_matches_generated_format() {
     assert!(!text.contains("--json"), "{text}");
     let ansi = usage_text(true);
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+}
+
+#[test]
+fn missing_flag_values_error() {
+    assert_eq!(
+        parse_args(&args(&["--owner"])).unwrap_err(),
+        "--owner requires a value"
+    );
+    assert_eq!(
+        parse_args(&args(&["--order"])).unwrap_err(),
+        "--order requires a value"
+    );
+    assert_eq!(
+        parse_args(&args(&["--conduit-uri"])).unwrap_err(),
+        "--conduit-uri requires a value"
+    );
+    assert_eq!(
+        parse_args(&args(&["--owner="])).unwrap_err(),
+        "--owner requires a value"
+    );
+}
+
+#[test]
+fn task_ids_accept_big_and_prefixed_forms() {
+    assert_eq!(task_id(&serde_json::json!(7)), Some("7".to_string()));
+    assert_eq!(
+        task_id(&serde_json::json!(18_446_744_073_709_551_615u64)),
+        Some("18446744073709551615".to_string())
+    );
+    assert_eq!(task_id(&serde_json::json!("T42")), Some("42".to_string()));
+    assert_eq!(task_id(&serde_json::json!("t7")), Some("7".to_string()));
+    assert_eq!(task_id(&serde_json::json!("42")), Some("42".to_string()));
+    assert_eq!(task_id(&serde_json::json!(null)), None);
+}
+
+#[test]
+fn owner_phid_accepts_object_and_empty_shapes() {
+    let base = serve_one(
+        r#"{"result": {"alice": {"phid": "PHID-USER-1"}}, "error_code": null}"#.to_string(),
+    );
+    let client = conduit::Client::new(&base, "t").unwrap();
+    assert_eq!(
+        find_owner_phid(&client, "alice").unwrap(),
+        Some("PHID-USER-1".to_string())
+    );
+    let base = serve_one(r#"{"result": null, "error_code": null}"#.to_string());
+    let client = conduit::Client::new(&base, "t").unwrap();
+    assert_eq!(find_owner_phid(&client, "alice").unwrap(), None);
 }

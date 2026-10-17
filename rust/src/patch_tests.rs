@@ -45,11 +45,8 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .args(args)
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "git {args:?} failed: {stderr}");
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
@@ -76,6 +73,79 @@ fn stub_call(
             .cloned()
             .ok_or_else(|| format!("unexpected conduit call to {method}"))
     }
+}
+
+/// Shared svn-flow hook stubs. One body each (covered by
+/// [`hook_stubs_behave`]), so call sites that legitimately never fire a
+/// hook carry no dead closure lines.
+fn ok_patch(_: &str, _: &str) -> Result<(bool, String), String> {
+    Ok((true, String::new()))
+}
+fn ok_touch(_: &str) -> Result<(), String> {
+    Ok(())
+}
+fn ok_link(_: &str, _: &str) -> Result<(), String> {
+    Ok(())
+}
+fn no_patch(_: &str, _: &str) -> Result<(bool, String), String> {
+    panic!("no patch expected")
+}
+fn no_link(_: &str, _: &str) -> Result<(), String> {
+    panic!("no link expected")
+}
+
+/// The amend path never opens the editor.
+fn never_edit(_: &str) -> Result<String, String> {
+    panic!("PATCH-P9: amend path never opens the editor")
+}
+
+/// No repository query is expected on this path.
+fn no_repository_query(_: &str, _: &serde_json::Value) -> Result<serde_json::Value, String> {
+    panic!("no repository query expected")
+}
+
+#[test]
+fn hook_stubs_behave() {
+    assert_eq!(ok_patch("a", "b"), Ok((true, String::new())));
+    assert_eq!(ok_touch("a"), Ok(()));
+    assert_eq!(ok_link("a", "b"), Ok(()));
+}
+
+#[test]
+#[should_panic(expected = "no patch expected")]
+fn no_patch_stub_panics() {
+    let _result: Result<(bool, String), String> = no_patch("a", "b");
+}
+
+#[test]
+#[should_panic(expected = "no link expected")]
+fn no_link_stub_panics() {
+    let _result: Result<(), String> = no_link("a", "b");
+}
+
+#[test]
+#[should_panic(expected = "never opens the editor")]
+fn never_edit_stub_panics() {
+    let _result: Result<String, String> = never_edit("template");
+}
+
+#[test]
+#[should_panic(expected = "no repository query expected")]
+fn no_repository_query_stub_panics() {
+    let _result: Result<serde_json::Value, String> =
+        no_repository_query("m", &serde_json::Value::Null);
+}
+
+#[test]
+#[should_panic(expected = "expected options")]
+fn options_of_panics_on_parse_error() {
+    options_of(&["--bogus-flag-xyz"]);
+}
+
+#[test]
+#[should_panic(expected = "expected error")]
+fn parse_err_panics_on_success() {
+    parse_err(&["D1"]);
 }
 
 #[test]
@@ -690,11 +760,8 @@ fn write_arcbundle(dir: &Path, name: &str, files: &[(&str, &[u8])]) -> PathBuf {
         .arg(".")
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "tar failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "tar failed: {stderr}");
     bundle
 }
 
@@ -2183,8 +2250,8 @@ fn apply_svn_reports_hunk_failures() {
         &[svn_modification("mod.txt")],
         &mut io,
         &mut |_, _| Ok((false, String::new())),
-        &mut |_| Ok(()),
-        &mut |_, _| Ok(()),
+        &mut ok_touch,
+        &mut ok_link,
     )
     .unwrap();
     assert_eq!(outcome, SvnOutcome::HunksFailed);
@@ -2202,8 +2269,8 @@ fn apply_svn_reports_hunk_failures() {
         &[svn_modification("mod.txt")],
         &mut io,
         &mut |_, _| Err("boom".to_string()),
-        &mut |_| Ok(()),
-        &mut |_, _| Ok(()),
+        &mut ok_touch,
+        &mut ok_link,
     )
     .unwrap_err();
     assert_eq!(error, "boom");
@@ -2223,9 +2290,9 @@ fn apply_svn_prompts_for_missing_sources() {
         &svn::SvnCommand::system(),
         std::slice::from_ref(&delete),
         &mut io,
-        &mut |_, _| Ok((true, String::new())),
-        &mut |_| Ok(()),
-        &mut |_, _| Ok(()),
+        &mut ok_patch,
+        &mut ok_touch,
+        &mut ok_link,
     )
     .unwrap_err();
     assert_eq!(error, land::ABORT);
@@ -2235,9 +2302,9 @@ fn apply_svn_prompts_for_missing_sources() {
         &svn::SvnCommand::system(),
         &[delete],
         &mut io,
-        &mut |_, _| Ok((true, String::new())),
-        &mut |_| Ok(()),
-        &mut |_, _| Ok(()),
+        &mut ok_patch,
+        &mut ok_touch,
+        &mut ok_link,
     )
     .unwrap();
     assert_eq!(outcome, SvnOutcome::Applied);
@@ -2253,9 +2320,9 @@ fn apply_svn_prompts_for_missing_sources() {
         &svn::SvnCommand::system(),
         &[copy],
         &mut io,
-        &mut |_, _| Ok((true, String::new())),
+        &mut ok_patch,
         &mut |_| Ok(()),
-        &mut |_, _| Ok(()),
+        &mut ok_link,
     )
     .unwrap();
     assert!(
@@ -2277,18 +2344,15 @@ fn run_touch_and_symlink() {
         "keep\n"
     );
     // Symlinks need privileges on Windows; accept either outcome there.
-    match run_symlink(&dir, "new.txt", "link.txt") {
-        Ok(()) => {
-            assert!(dir.join("link.txt").is_symlink());
-            run_symlink(&dir, "other", "link.txt").unwrap();
-        }
-        #[cfg(windows)]
-        Err(error) => {
-            assert!(error.contains("Failed to link"), "{error}");
-        }
-        #[cfg(not(windows))]
-        Err(error) => panic!("unexpected symlink failure: {error}"),
-    }
+    let result = run_symlink(&dir, "new.txt", "link.txt");
+    let linked = result.is_ok();
+    let message_ok = linked || result.unwrap_err().contains("Failed to link");
+    let relinked = !linked || run_symlink(&dir, "other", "link.txt").is_ok();
+    let is_link = !linked || dir.join("link.txt").is_symlink();
+    assert!(linked || cfg!(windows));
+    assert!(message_ok);
+    assert!(relinked);
+    assert!(is_link);
 }
 
 #[test]
@@ -3042,9 +3106,9 @@ fn ansi_apply_svn_okay_uses_green_background() {
             &svn::SvnCommand::system(),
             &[],
             &mut io,
-            &mut |_, _| Ok((true, String::new())),
-            &mut |_| Ok(()),
-            &mut |_, _| Ok(()),
+            &mut ok_patch,
+            &mut ok_touch,
+            &mut ok_link,
             ansi,
         )
         .unwrap();
@@ -3445,9 +3509,7 @@ fn p9_yes_path_amends_when_detected() {
         unstaged: vec!["file.txt".to_string()],
         ..TreeStatus::default()
     };
-    let edit = |_: &str| -> Result<String, String> {
-        panic!("PATCH-P9: amend path never opens the editor")
-    };
+    let edit = never_edit;
     resolve_uncommitted_tree(
         &repo,
         Vcs::Git,
@@ -3539,13 +3601,11 @@ fn p9_published_head_declines_amend() {
         if method == "repository.query" {
             return Ok(serde_json::json!([{"id": "7", "callsign": "X"}]));
         }
-        if method == "diffusion.querycommits" {
-            assert_eq!(params["names"], serde_json::json!([format!("rX{hash}")]));
-            return Ok(serde_json::json!({
-                "identifierMap": {format!("rX{hash}"): {"id": 1}}
-            }));
-        }
-        Err(format!("PATCH-P9: unexpected {method}"))
+        assert_eq!(method, "diffusion.querycommits", "unexpected {method}");
+        assert_eq!(params["names"], serde_json::json!([format!("rX{hash}")]));
+        Ok(serde_json::json!({
+            "identifierMap": {format!("rX{hash}"): {"id": 1}}
+        }))
     };
     let (amend, _) = calculate_patch_should_amend(&repo, Vcs::Git, &backends, Some(&call)).unwrap();
     assert!(!amend);
@@ -3690,11 +3750,8 @@ fn p13_raw_fetches_send_verbatim_string_ids() {
     assert_eq!(bundle.revision_id, Some(7));
     fetch_diff_bundle_raw(&call, "D12").unwrap();
     let seen = seen.borrow();
-    assert!(
-        seen[0].1.contains("\"revisionIDs\":[\"x\"]"),
-        "{}",
-        seen[0].1
-    );
+    let first = &seen[0].1;
+    assert!(first.contains("\"revisionIDs\":[\"x\"]"), "{first}");
     assert!(seen[1].1.contains("\"ids\":[\"D12\"]"), "{}", seen[1].1);
 }
 #[test]
@@ -4193,11 +4250,8 @@ fn e9_svn_changes_stay_lossy() {
         b"diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\xe9\n",
     ));
     assert_eq!(changes.len(), 1);
-    assert!(
-        changes[0].hunks.contains('\u{FFFD}'),
-        "{}",
-        changes[0].hunks
-    );
+    let hunks = &changes[0].hunks;
+    assert!(hunks.contains('\u{FFFD}'), "{hunks}");
     assert!(!changes[0].hunks.contains(E9_ESC), "{}", changes[0].hunks);
     let dicts: Vec<serde_json::Value> =
         vec![serde_json::json!({"type": 1, "fileType": 1, "oldPath": "o", "currentPath": "f"})];
@@ -5095,9 +5149,7 @@ fn t1170_amend_accepts_unpublished_matching_head() {
         "{\"history.immutable\": false, \"repository.callsign\": \"\"}",
     )
     .unwrap();
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        panic!("no repository query expected")
-    };
+    let call = no_repository_query;
     let (amend, message) =
         calculate_patch_should_amend(&repo, Vcs::Git, &Backends::default(), Some(&call)).unwrap();
     assert!(amend);
@@ -5183,9 +5235,7 @@ fn t1170_repository_encoding_without_query_is_utf8() {
     // Conduit (patch.rs:3301; the stub panics if called).
     let repo = make_repo("t1170_enc_none");
     std::fs::write(repo.join(".arcconfig"), "{\"repository.callsign\": \"\"}").unwrap();
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        panic!("no repository query expected")
-    };
+    let call = no_repository_query;
     assert_eq!(
         patch_repository_encoding(&repo, Vcs::Git, &Backends::default(), &call).unwrap(),
         Some("UTF-8".to_string())
@@ -5212,12 +5262,10 @@ fn t1170_repository_query_uses_hg_remote() {
         patch_repository_encoding(&repo, Vcs::Hg, &backends, &call).unwrap(),
         Some("UTF-8".to_string())
     );
+    let seen_text = seen.borrow().to_string();
     assert!(
-        seen.borrow()
-            .to_string()
-            .contains("https://hg.example.test/repo"),
-        "{}",
-        seen.borrow()
+        seen_text.contains("https://hg.example.test/repo"),
+        "{seen_text}"
     );
 }
 
@@ -5247,16 +5295,9 @@ fn t1170_repository_query_prefers_svn_uuid() {
         patch_repository_encoding(&repo, Vcs::Svn, &backends, &call).unwrap(),
         Some("UTF-8".to_string())
     );
-    assert!(
-        seen.borrow().to_string().contains("\"uuids\""),
-        "{}",
-        seen.borrow()
-    );
-    assert!(
-        seen.borrow().to_string().contains("uuid-9"),
-        "{}",
-        seen.borrow()
-    );
+    let seen_text = seen.borrow().to_string();
+    assert!(seen_text.contains("\"uuids\""), "{seen_text}");
+    assert!(seen_text.contains("uuid-9"), "{seen_text}");
     std::fs::write(
         repo.join(".fakesvn-info"),
         "Path: /\nRepository Root: https://svn.example.test/repo\n",
@@ -5266,11 +5307,8 @@ fn t1170_repository_query_prefers_svn_uuid() {
         patch_repository_encoding(&repo, Vcs::Svn, &backends, &call).unwrap(),
         Some("UTF-8".to_string())
     );
-    assert!(
-        seen.borrow().to_string().contains("remoteURIs"),
-        "{}",
-        seen.borrow()
-    );
+    let seen_text = seen.borrow().to_string();
+    assert!(seen_text.contains("remoteURIs"), "{seen_text}");
 }
 
 #[test]
@@ -6021,12 +6059,9 @@ fn t1170_run_svn_patches_touch_failure() {
         ..SvnPlan::default()
     };
     let mut io = Io::buffered();
-    let failed = run_svn_patches(
-        &plan,
-        &mut io,
-        &mut |_, _| -> Result<(bool, String), String> { panic!("no patch expected") },
-        &mut |_| Err("no touch".to_string()),
-    )
+    let failed = run_svn_patches(&plan, &mut io, &mut no_patch, &mut |_| {
+        Err("no touch".to_string())
+    })
     .unwrap();
     assert!(failed);
 }
@@ -6369,4 +6404,302 @@ fn t1170_preview_conduit_requires_token() {
         execute_preview(&dir, &options, &mut io).unwrap_err(),
         "no token for https://patch-test.invalid/api/ in ~/.arcrc"
     );
+}
+
+// -( T1170 COV5: close patch.rs )-------------------------------------------------
+
+#[test]
+fn source_selection_requires_a_source() {
+    let err = select_source(&Options::default()).unwrap_err();
+    assert!(err.contains("You must specify changes"), "{err}");
+}
+
+#[test]
+fn unterminated_ansi_falls_through() {
+    let text = "\x1b[31Xoops\n\x1b[31mok\ndiff --git a/f b/f\n";
+    assert_eq!(validate_patch_text(text), Ok(()));
+}
+
+#[test]
+fn base64_padding_decodes() {
+    assert_eq!(base64_decode("Zg==").unwrap(), b"f");
+    assert_eq!(base64_decode("Zm8=").unwrap(), b"fo");
+}
+
+#[test]
+fn hg_tip_propagates_spawn_failures() {
+    let dir = temp_dir("hg-tip-spawn");
+    let hg = hg::HgCommand::custom("definitely-not-an-hg-binary-xyz", &[]);
+    assert!(hg_tip_info(&dir, &hg).is_err());
+}
+
+#[test]
+fn svn_head_helpers_are_trivial() {
+    let dir = temp_dir("svn-head");
+    let backends = Backends::default();
+    assert!(
+        patch_head_info_for(&dir, Vcs::Svn, &backends)
+            .unwrap()
+            .is_none()
+    );
+    let head = HeadInfo {
+        hash: "abc".to_string(),
+        author: "a".to_string(),
+        message: "m".to_string(),
+    };
+    assert!(!patch_head_author_matches(&dir, Vcs::Svn, &backends, &head).unwrap());
+    assert_eq!(
+        working_source_revision(&dir, Vcs::Svn, &backends).unwrap(),
+        ""
+    );
+}
+
+#[test]
+fn git_apply_reports_spawn_failures() {
+    let missing = temp_dir("apply-missing").join("no-such-dir");
+    let bundle = Bundle {
+        text: "diff --git a/f b/f\n".to_string(),
+        encoding: None,
+        base_revision: None,
+        revision_id: None,
+        author_name: None,
+        author_email: None,
+    };
+    let mut io = Io::canned(&[]);
+    assert!(git_apply_patch_ansi(&missing, &bundle, &mut io, false).is_err());
+}
+
+#[test]
+fn svn_copy_and_propset_failures_propagate() {
+    let dir = temp_dir("svn-fail");
+    let svn = svn::SvnCommand::custom("definitely-not-an-svn-binary-xyz", &[]);
+    let copies = SvnPlan {
+        copies: vec![("a".to_string(), "b".to_string())],
+        deletes: Vec::new(),
+        patches: Vec::new(),
+        propset: Vec::new(),
+        adds: Vec::new(),
+        symlinks: Vec::new(),
+    };
+    assert!(run_svn_copies_deletes(&dir, &svn, &copies).is_err());
+    let props = SvnPlan {
+        copies: Vec::new(),
+        deletes: Vec::new(),
+        patches: Vec::new(),
+        propset: vec![(
+            "f".to_string(),
+            "svn:eol-style".to_string(),
+            Some("LF".to_string()),
+        )],
+        adds: Vec::new(),
+        symlinks: Vec::new(),
+    };
+    assert!(run_svn_adds_props(&dir, &svn, &props).is_err());
+}
+
+#[test]
+fn apply_hg_commits_applies_and_rebases() {
+    let dir = temp_dir("apply-hg");
+    let hg = fake_hg_backend(&dir);
+    let bundle = Bundle {
+        text: "diff --git a/f b/f\n".to_string(),
+        revision_id: Some(1),
+        ..Bundle::default()
+    };
+    let mut responses = std::collections::HashMap::new();
+    responses.insert(
+        diff_submit::METHOD_GET_COMMIT_MESSAGE.to_string(),
+        serde_json::json!("hello"),
+    );
+    let call = stub_call(responses);
+    let call_ref: &diff_submit::ConduitCall = &call;
+    // Commit on a fresh bookmark: no rebase.
+    let mut io = Io::canned(&[]);
+    apply_hg_ansi(
+        &dir,
+        &hg,
+        &bundle,
+        &Options::default(),
+        &mut io,
+        Some(call_ref),
+        false,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    assert!(
+        io.out.stderr.contains("Successfully committed patch."),
+        "{}",
+        io.out.stderr
+    );
+    // Nobranch with a local base and live branches: rebase the temp.
+    let mut options = Options {
+        nobranch: true,
+        ..Options::default()
+    };
+    let mut io = Io::canned(&[]);
+    apply_hg_ansi(
+        &dir,
+        &hg,
+        &bundle,
+        &options,
+        &mut io,
+        Some(call_ref),
+        true,
+        Some("master"),
+        Some("arcpatch"),
+        false,
+    )
+    .unwrap();
+    assert!(
+        io.out.stderr.contains("Successfully committed patch."),
+        "{}",
+        io.out.stderr
+    );
+    // Nocommit: apply only.
+    options.nocommit = true;
+    let mut io = Io::canned(&[]);
+    apply_hg_ansi(
+        &dir,
+        &hg,
+        &bundle,
+        &options,
+        &mut io,
+        Some(call_ref),
+        false,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    assert!(
+        io.out.stderr.contains("Successfully applied patch."),
+        "{}",
+        io.out.stderr
+    );
+}
+
+#[test]
+fn flow_inner_decline_aborts_at_sanity() {
+    let dir = make_repo("flow-inner-decline");
+    let bundle = Bundle {
+        text: "diff --git a/f b/f\n".to_string(),
+        base_revision: Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string()),
+        ..Bundle::default()
+    };
+    let loaded = LoadedBundle {
+        bundle,
+        arcbundle_dicts: None,
+    };
+    let options = Options {
+        skip_dependencies: true,
+        nobranch: true,
+        nocommit: true,
+        ..Options::default()
+    };
+    let mut io = Io::canned(&["n"]);
+    let backends = Backends::default();
+    let err = run_patch_flow_inner(
+        &dir,
+        &options,
+        &mut io,
+        &backends,
+        Vcs::Git,
+        false,
+        None,
+        loaded,
+    )
+    .unwrap_err();
+    assert_eq!(err, land::ABORT);
+}
+
+#[test]
+fn flow_inner_dependency_child_failure_propagates() {
+    let dir = make_repo("flow-inner-deps");
+    let bundle = Bundle {
+        text: "diff --git a/f b/f\n".to_string(),
+        base_revision: Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string()),
+        revision_id: Some(1),
+        ..Bundle::default()
+    };
+    let loaded = LoadedBundle {
+        bundle,
+        arcbundle_dicts: None,
+    };
+    let options = Options {
+        nobranch: true,
+        nocommit: true,
+        ..Options::default()
+    };
+    let rows = serde_json::json!([
+        {"phid": "PHID-DREV-1", "id": 1,
+         "auxiliary": {"phabricator:depends-on": ["PHID-DREV-2"]},
+         "hashes": {"gtcm": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}},
+        {"phid": "PHID-DREV-2", "id": 2, "auxiliary": {}},
+    ]);
+    let mut responses = std::collections::HashMap::new();
+    responses.insert(diff_submit::METHOD_QUERY.to_string(), rows);
+    let call = stub_call(responses);
+    let call_ref: &diff_submit::ConduitCall = &call;
+    let mut io = Io::canned(&[]);
+    let backends = Backends::default();
+    // The child revision flow fails (no conduit client in hermetic
+    // runs; an unknown revision elsewhere) and the error propagates.
+    let result = run_patch_flow_inner(
+        &dir,
+        &options,
+        &mut io,
+        &backends,
+        Vcs::Git,
+        false,
+        Some(call_ref),
+        loaded,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn svn_apply_failure_propagates() {
+    let dir = temp_dir("svn-apply-fail");
+    let backends = Backends {
+        svn: svn::SvnCommand::custom("definitely-not-an-svn-binary-xyz", &[]),
+        ..Backends::default()
+    };
+    let bundle = Bundle {
+        text: "diff --git a/new.txt b/new.txt\nnew file mode 100644\nindex 0000000..3b18e51\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hello\n"
+            .to_string(),
+        ..Bundle::default()
+    };
+    let mut io = Io::canned(&[]);
+    let mut run_patch = |_: &str, _: &str| Ok((true, String::new()));
+    assert!(
+        apply_patch_svn_with(
+            &dir,
+            &backends,
+            &bundle,
+            None,
+            &mut io,
+            false,
+            &mut run_patch
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn targetless_symlinks_are_skipped() {
+    let change = SvnChange {
+        change_type: TYPE_ADD,
+        file_type: 0,
+        old_path: None,
+        current_path: Some("link".to_string()),
+        hunks: String::new(),
+        old_props: std::collections::HashMap::new(),
+        new_props: std::collections::HashMap::new(),
+        symlink_target: None,
+    };
+    // A firing hook would panic: success proves the targetless change
+    // was skipped.
+    run_svn_symlinks(&[change], &mut no_link).unwrap();
 }

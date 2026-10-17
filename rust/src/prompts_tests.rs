@@ -182,6 +182,146 @@ fn core28_prompts_read_top_level_through_toolset_transform() {
     );
 }
 #[test]
+fn parse_args_returns_positionals() {
+    assert_eq!(
+        parse_args(&args(&["amend"]), false).unwrap(),
+        args(&["amend"])
+    );
+    assert!(parse_args(&args(&[]), false).unwrap().is_empty());
+}
+
+#[test]
+fn execute_rejects_empty_and_unknown_workflows() {
+    let dir = scratch("validate");
+    let error = execute_in(&dir, None, &[]).unwrap_err();
+    assert!(
+        error.message.contains("Provide a workflow"),
+        "{}",
+        error.message
+    );
+    let error = execute_in(&dir, None, &args(&["bogus"])).unwrap_err();
+    assert!(error.message.contains("unknown"), "{}", error.message);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn execute_reports_promptless_workflows_without_config() {
+    // `look` is a toolset workflow with no prompts: no config reads.
+    let dir = scratch("noprompts");
+    let text = execute_in(&dir, None, &args(&["look"])).unwrap();
+    assert!(text.contains("does not have any prompts"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn execute_reads_no_saved_responses_without_a_user_file() {
+    let dir = scratch("nouser");
+    let text = execute_in(&dir, None, &args(&["amend"])).unwrap();
+    assert!(text.contains("arc.amend.author"), "{text}");
+    assert!(!text.contains("You have saved the response"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn working_copy_config_files_resolve_per_vcs() {
+    for (marker, joined) in [(".git", ".git"), (".hg", ".hg"), (".svn", ".svn")] {
+        let dir = scratch(&format!("vcs-{marker}"));
+        let nested = dir.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(dir.join(marker)).unwrap();
+        let expected = dir.join(joined).join("arc").join("config");
+        assert_eq!(working_copy_config_file(&nested), Some(expected));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    let bare = scratch("novcs");
+    assert_eq!(working_copy_config_file(&bare), None);
+    let _ = std::fs::remove_dir_all(&bare);
+}
+
+#[test]
+fn saved_response_loading_skips_unreadable_files() {
+    let dir = scratch("loadskip");
+    let bad = dir.join("bad.json");
+    std::fs::write(&bad, "not json").unwrap();
+    assert!(load_saved_responses(Some(&bad), None).is_empty());
+    assert!(load_saved_responses(Some(&dir.join("missing")), None).is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn saved_response_lookup_prefers_the_last_match() {
+    let dir = scratch("lookup");
+    let user = dir.join("arcrc");
+    std::fs::write(
+        &user,
+        r#"{"prompts": [{"prompt": "k", "response": "n"}, {"prompt": "k", "response": "y"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        load_saved_response(&dir, Some(&user), "k"),
+        Some("y".to_string())
+    );
+    assert_eq!(load_saved_response(&dir, Some(&user), "other"), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn save_fails_when_the_parent_is_not_a_directory() {
+    let dir = scratch("savefail");
+    let blocker = dir.join("blocker");
+    std::fs::write(&blocker, "x").unwrap();
+    let error = save_prompt_response(&blocker.join("child"), "k", "y").unwrap_err();
+    assert!(error.contains("cannot write"), "{error}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn save_without_a_parent_dir_skips_mkdir() {
+    // A parentless path (`/` has no parent) skips directory creation;
+    // the write itself still fails, without touching the filesystem.
+    let error = save_prompt_response(std::path::Path::new("/"), "k", "y").unwrap_err();
+    assert!(error.contains("cannot write"), "{error}");
+}
+
+#[test]
+fn response_saver_routes_scopes_to_files() {
+    let dir = scratch("saver");
+    let user = dir.join("user.json");
+    let local = dir.join("local.json");
+    let mut saver = response_saver("k", Some(user.clone()), Some(local.clone()));
+    saver(PromptScope::User, "y").unwrap();
+    saver(PromptScope::WorkingCopy, "n").unwrap();
+    assert_eq!(
+        load_saved_responses(Some(&user), None),
+        vec![("k".to_string(), "y".to_string())]
+    );
+    assert_eq!(
+        load_saved_responses(Some(&local), None),
+        vec![("k".to_string(), "n".to_string())]
+    );
+    let mut homeless = response_saver("k", None, None);
+    assert!(homeless(PromptScope::User, "y").is_err());
+    assert!(homeless(PromptScope::WorkingCopy, "n").is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prompt_retries_unknown_answers_silently() {
+    let mut save = |_: PromptScope, _: &str| Ok(());
+    let mut input = BufReader::new(std::io::Cursor::new(b"maybe\ny\n"));
+    assert!(execute_prompt_saving(&mut input, "k", "d", "Q?", true, None, &mut save).is_ok());
+}
+
+#[test]
+fn run_reports_unknown_workflows() {
+    // Unknown workflows fail before any config is read.
+    assert_eq!(
+        run(&args(&["bogus-workflow"])),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
 fn r10_prompts_help_matches_generated_format() {
     // T1153 R10: `--help` renders the generated workflow help
     // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),

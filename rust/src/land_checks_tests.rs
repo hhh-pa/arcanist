@@ -119,6 +119,15 @@ fn parses_legacy_rows_with_status_map() {
 }
 
 #[test]
+fn numeric_ids_accept_strings_and_reject_overflows() {
+    // String ids parse; a u64 that overflows i64 is no id at all.
+    let revision = parse_revision(&json!({"id": "123"})).unwrap();
+    assert_eq!(revision.id, 123);
+    assert_eq!(revision.monogram, "D123");
+    assert!(parse_revision(&json!({"id": 18_446_744_073_709_551_615u64})).is_err());
+}
+
+#[test]
 fn status_predicates_match_php() {
     assert!(view("changes-planned", "a").is_status_changes_planned());
     assert!(!view("accepted", "a").is_status_changes_planned());

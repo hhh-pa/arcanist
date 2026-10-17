@@ -5590,6 +5590,196 @@ fn t1170_hunk_stats_end_conditions() {
 }
 
 /// Bare parsed change for predicate tests.
+#[test]
+fn t1170_merge_occupied_field_empty_text_replaces() {
+    let mut slot = FieldValue::Text(String::new());
+    merge_occupied_field(&mut slot, &FieldValue::Text("x".to_string()));
+    assert_eq!(slot, FieldValue::Text("x".to_string()));
+    merge_occupied_field(&mut slot, &FieldValue::Text("y".to_string()));
+    assert_eq!(slot, FieldValue::Text("x\n\ny".to_string()));
+}
+
+#[test]
+fn t1170_status_change_type_rejects_unknown_letters() {
+    let record = NameStatusEntry {
+        status: 'X',
+        old_path: None,
+        path: "f".to_string(),
+    };
+    assert_eq!(
+        status_change_type(&record),
+        Err("unsupported change status 'X' for 'f'".to_string())
+    );
+    let record = NameStatusEntry {
+        status: 'M',
+        old_path: None,
+        path: "f".to_string(),
+    };
+    assert_eq!(status_change_type(&record), Ok((TYPE_CHANGE, None)));
+}
+
+#[test]
+fn t1170_exit_code_value_maps_child_codes() {
+    use std::process::ExitCode;
+    assert_eq!(exit_code_value(ExitCode::SUCCESS), 0);
+    assert_eq!(exit_code_value(ExitCode::from(2)), 2);
+    assert_eq!(exit_code_value(ExitCode::from(3)), 3);
+    assert_eq!(exit_code_value(ExitCode::FAILURE), 1);
+    assert_eq!(exit_code_value(ExitCode::from(7)), 1);
+}
+
+#[test]
+fn t1170_run_unit_in_process_collects_cargo_results() {
+    // A scratch checkout (marker only) with an `.arcunit` sentinel
+    // and a passing crate: `--engine cargo` runs `cargo test` and the
+    // collecting run maps to `Code(0, [dict])`. Mercurial detection is
+    // marker-based (git shells out), so `.hg` keeps this hermetic.
+    let dir = gap2_d1_scratch("unit-cargo");
+    std::fs::create_dir_all(dir.join(".hg")).unwrap();
+    std::fs::write(dir.join(".arcunit"), "{}\n").unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"t1170fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("src").join("lib.rs"),
+        "#[test]\nfn passes() {\n    assert_eq!(1 + 1, 2);\n}\n",
+    )
+    .unwrap();
+    let argv = ["--engine".to_string(), "cargo".to_string()];
+    match run_unit_in_process(&dir, &argv) {
+        ChildOutcome::Code(code, dicts) => {
+            assert_eq!(code, 0);
+            assert_eq!(dicts.len(), 1);
+        }
+        _ => panic!("expected unit results"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn t1170_first_content_line_needs_content() {
+    assert!(!is_first_content_line(&["", "  ", "# c"], 2));
+    assert!(is_first_content_line(&["", "x"], 1));
+    assert!(!is_first_content_line(&["", "x"], 0));
+}
+
+#[test]
+fn t1170_diff_start_needs_a_dash_word() {
+    assert!(!looks_like_diff_start("diff xyz"));
+    assert!(!looks_like_diff_start("hello"));
+    assert!(looks_like_diff_start("diff --git a b"));
+    assert!(looks_like_diff_start("  diff -r abc def"));
+}
+
+#[test]
+fn t1170_seed_block_paths_default_empty() {
+    assert_eq!(
+        seed_file_block_paths("--- a/f", false),
+        (String::new(), String::new())
+    );
+    assert_eq!(
+        seed_file_block_paths("Index: a/f", false),
+        ("a/f".to_string(), "a/f".to_string())
+    );
+}
+
+#[test]
+fn t1170_block_key_ignores_non_headers() {
+    assert_eq!(block_key("--- a/f", false), None);
+    assert_eq!(block_key("Index: a/f", false), Some("a/f".to_string()));
+}
+
+#[test]
+fn t1170_hg_status_attaches_copy_sources() {
+    let entries = parse_hg_status_details("A dst\n  src").unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0.path, "dst");
+    assert_eq!(entries[0].0.from.as_deref(), Some("src"));
+}
+
+#[test]
+fn t1170_resolve_list_path_skips_dot_components() {
+    assert_eq!(
+        resolve_list_path(std::path::Path::new("."), "t1170-no-such-dir-xyz/sub"),
+        "t1170-no-such-dir-xyz/sub"
+    );
+}
+
+#[test]
+fn t1170_here_type_rejects_bad_origins() {
+    assert_eq!(here_type(999), Err("Bad origin state 999.".to_string()));
+    assert_eq!(here_type(TYPE_MOVE_AWAY), Ok(TYPE_MOVE_HERE));
+}
+
+#[test]
+fn t1170_apply_svn_copy_info_skips_uncopied_paths() {
+    let mut changes = vec![t1170_parsed_change(TYPE_CHANGE, Vec::new())];
+    changes[0].current_path = "f".to_string();
+    let data = vec![gap2_path_data(
+        "f",
+        svn::FLAG_ADDED,
+        &[("Revision", "1")],
+        None,
+    )];
+    apply_svn_copy_info(&mut changes, &data, Some("https://r")).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].change_type, TYPE_CHANGE);
+    assert!(changes[0].old_path.is_empty());
+}
+
+#[test]
+fn t1170_select_reviewer_users_ignores_scalars() {
+    assert!(select_reviewer_users(&serde_json::json!(null), &["PHID-1"]).is_empty());
+    let users = serde_json::json!({"PHID-1": {"name": "a"}});
+    assert_eq!(select_reviewer_users(&users, &["PHID-1"]).len(), 1);
+}
+
+#[test]
+fn t1170_edit_create_message_other_error_without_draft() {
+    use std::io::Cursor;
+    // An unchanged amend skips the draft hook, then an invalid revision
+    // id fails the attempt outside the parser-error path.
+    let root = gap2_d1_scratch("loop-other");
+    let meta = root.join(".git");
+    let amended = std::cell::RefCell::new(0usize);
+    let amend = |_: &str| -> Result<(), String> {
+        *amended.borrow_mut() += 1;
+        Ok(())
+    };
+    let passthrough = |template: &str| -> Result<String, String> { Ok(template.to_string()) };
+    let mut input = Cursor::new(b"".to_vec());
+    let mut out = Vec::new();
+    let mut editor = CreateMessageEditor {
+        reader: &mut input,
+        writer: &mut out,
+        call: &gap2_d1_ok_call,
+        metadata_dir: &meta,
+        work_root: &root,
+        edit: &passthrough,
+        amend_commit: Some(&amend),
+        user_phid: "PHID-USER-me",
+        away_offset: 0,
+    };
+    let template = "T\nDifferential Revision: D0\n";
+    let err = edit_create_message(&mut editor, template, template, false, false, &[]).unwrap_err();
+    assert!(err.contains("Invalid \"Differential Revision\""), "{err}");
+    assert_eq!(*amended.borrow(), 0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn t1170_fail_io_helpers_report_errors() {
+    use std::io::{BufRead, Read, Write};
+    assert!(T1170FailWriter.write(b"x").is_err());
+    assert!(T1170FailWriter.flush().is_err());
+    assert!(T1170ErrReader.read(&mut [0u8; 4]).is_err());
+    assert!(T1170ErrReader.fill_buf().is_err());
+    T1170ErrReader.consume(1);
+}
+
 fn t1170_parsed_change(change_type: u32, hunks: Vec<ParsedHunk>) -> ParsedChange {
     ParsedChange {
         old_path: String::new(),

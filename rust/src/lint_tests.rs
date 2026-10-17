@@ -324,6 +324,9 @@ fn empty_file_message_stops_later_linters() {
     engine.add_linter(Box::new(TextLinter::new()));
     engine.add_linter(Box::new(Noisy));
     assert_eq!(codes(&engine.lint_bytes("e.txt", b"")), vec!["TXT10"]);
+    // Direct call pins the helper shape; the engine above must not
+    // reach it (the empty-file message stops later linters).
+    assert_eq!(Noisy.lint_bytes("e.txt", b"")[0].code, "N1");
 }
 
 #[test]
@@ -2713,6 +2716,8 @@ fn cov_linter_trait_defaults_reject_options_and_symlinks() {
             .unwrap_err(),
         "unknown option 'bogus'."
     );
+    assert_eq!(linter.name(), "DEFAULT");
+    assert!(linter.lint_bytes("f.txt", b"ok\n").is_empty());
 }
 
 #[test]
@@ -3164,6 +3169,11 @@ fn cov_dos_stop_skips_later_linters() {
     engine.add_linter(Box::new(TextLinter::new()));
     engine.add_linter(Box::new(NoisyLinter));
     assert_eq!(codes(&engine.lint_bytes("d.txt", b"a\r\n")), vec!["TXT1"]);
+    // Direct call pins the helper shape; the engine above must not
+    // reach it (the DOS stop skips later linters).
+    let direct = NoisyLinter.lint_bytes("d.txt", b"x");
+    assert_eq!(direct.len(), 1);
+    assert_eq!(direct[0].code, "WARN123");
 }
 
 #[test]
@@ -4183,4 +4193,59 @@ fn cov_amend_git_head_reports_add_failures() {
     assert!(error.starts_with("git add -u failed"), "{error}");
     assert!(error.contains("not a git repository"), "{error}");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn cov_spawn_with_retry_retries_text_file_busy() {
+    // Linux-only: executing a binary held open for writing fails with
+    // ETXTBSY there (macOS permits the spawn), exercising the retry
+    // arm; the runner retries, then surfaces the last error unchanged.
+    let tmp = TempDir::new("cov-etxtbsy");
+    let copy = tmp.path().join("busy-copy");
+    std::fs::copy(std::env::current_exe().unwrap(), &copy).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let _held = std::fs::File::options().write(true).open(&copy).unwrap();
+    let mut command = std::process::Command::new(&copy);
+    // `--help` only guards the impossible: were the spawn to succeed,
+    // the harness would print help and exit instead of running tests.
+    command.arg("--help");
+    let err = spawn_with_retry(&mut command).unwrap_err();
+    assert!(is_text_file_busy(&err), "{err:?}");
+}
+
+#[test]
+fn cov_normalize_lexical_drops_dot_segments() {
+    assert_eq!(normalize_lexical(Path::new("a/./b")), PathBuf::from("a/b"));
+}
+
+#[test]
+fn cov_shrink_ranges_head_continues_past_shared_lines() {
+    let old = vec!["a".to_string(), "x".to_string()];
+    let new = vec!["a".to_string(), "x".to_string()];
+    let mut start = 1;
+    assert_eq!(shrink_ranges(&old, &new, &mut start, 2, 2), (0, 0));
+    assert_eq!(start, 3);
+}
+
+#[test]
+fn cov_shrink_ranges_tail_continues_past_shared_lines() {
+    let old = vec!["p".to_string(), "a".to_string()];
+    let new = vec!["q".to_string(), "a".to_string()];
+    let mut start = 1;
+    assert_eq!(shrink_ranges(&old, &new, &mut start, 2, 2), (1, 1));
+}
+
+#[test]
+fn cov_rename_over_replaces_a_file_with_a_directory() {
+    let tmp = TempDir::new("cov-renamedir");
+    let from = tmp.path().join("from-dir");
+    std::fs::create_dir(&from).unwrap();
+    let dest = tmp.write("dest.txt", "old");
+    rename_over(&from, &dest).unwrap();
+    assert!(dest.is_dir());
+    assert!(!from.exists());
 }

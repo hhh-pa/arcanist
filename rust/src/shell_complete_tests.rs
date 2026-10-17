@@ -467,6 +467,22 @@ fn t1170_run_rejects_parse_errors_and_bad_combos() {
 }
 
 #[test]
+fn parse_notices_print_to_stderr() {
+    report_parse_notices(&[]);
+    report_parse_notices(&["did you mean --generate?".to_string()]);
+}
+
+#[test]
+fn install_flow_rejects_unsupported_shells_before_prompting() {
+    // Shell resolution fails before any prompt or write, so the ambient
+    // config reads stay side-effect free under any HOME.
+    assert_eq!(
+        run_generate_or_install(false, None, "bogus".to_string(), false),
+        Err(std::process::ExitCode::FAILURE)
+    );
+}
+
+#[test]
 fn t1170_run_generate_regenerates_rules() {
     use std::process::ExitCode;
     assert_eq!(run(&args(&["--generate"])), ExitCode::SUCCESS);

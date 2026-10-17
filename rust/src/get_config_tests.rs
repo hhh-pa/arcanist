@@ -1015,3 +1015,30 @@ fn b23_get_config_help_matches_generated_format() {
     let ansi = usage_text(true);
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
+
+#[test]
+fn toolset_user_file_rejects_non_object_config() {
+    let tmp = TempDir::new("toolset-config");
+    let file = tmp.path.join("arcrc");
+    std::fs::write(&file, r#"{"config": 42}"#).unwrap();
+    let err = read_user_file_toolset(&file).unwrap_err();
+    assert!(err.contains("has a non-object \"config\" section"), "{err}");
+}
+
+#[test]
+fn run_rejects_malformed_runtime_config() {
+    let argv = ["--config".to_string(), "no-equals".to_string()];
+    assert_eq!(run(&argv), std::process::ExitCode::FAILURE);
+}
+
+#[test]
+fn run_rejects_invalid_config_files() {
+    let tmp = TempDir::new("bad-config-file");
+    let file = tmp.path.join("bad.json");
+    std::fs::write(&file, "not json{").unwrap();
+    let argv = [
+        "--config-file".to_string(),
+        file.to_string_lossy().to_string(),
+    ];
+    assert_eq!(run(&argv), std::process::ExitCode::FAILURE);
+}

@@ -1,5 +1,30 @@
 use super::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path =
+            std::env::temp_dir().join(format!("arc-rs-hg-tests-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
 
 const NODE_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const NODE_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -1854,4 +1879,24 @@ fn t1170_arc_outgoing_falls_back_to_amended() {
         .unwrap(),
         None
     );
+}
+
+#[test]
+fn email_parse_passes_through_names_without_at() {
+    assert_eq!(
+        parse_email_address("Just A Name"),
+        (None, Some("Just A Name".to_string()))
+    );
+    assert_eq!(
+        parse_email_address("  spaced@example.test  "),
+        (None, Some("spaced@example.test".to_string()))
+    );
+}
+
+#[test]
+fn amend_non_head_propagates_the_first_log_failure() {
+    let tmp = TempDir::new("amend-log-fail");
+    let hg = HgCommand::custom("definitely-missing-hg-xyz", &[]);
+    let err = amend_non_head_commit_with(tmp.path(), &hg, &[], "msg.txt", None).unwrap_err();
+    assert!(!err.is_empty(), "expected a spawn failure");
 }

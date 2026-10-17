@@ -46,12 +46,12 @@ fn git(dir: &std::path::Path, argv: &[&str]) -> String {
         .args(argv)
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
+    let detail = format!(
         "git {} failed: {}",
         argv.join(" "),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(output.status.success(), "{detail}");
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
@@ -550,14 +550,25 @@ fn rejects_empty_inline_flag_values() {
     assert_eq!(options.conduit_uri, Some("http://x/".to_string()));
 }
 
+fn tail_error(arg: &str) -> String {
+    let Step::Error(message) = flag_tail(arg) else {
+        panic!("expected flag_tail to reject '{arg}'");
+    };
+    message
+}
+
 #[test]
 fn flag_tail_rejects_bare_terminator() {
     // Unreachable through the parser (it strips `--` first), but the
     // tail keeps its own positional rejection.
-    let Step::Error(message) = flag_tail("--") else {
-        panic!("expected flag_tail to reject '--'");
-    };
+    let message = tail_error("--");
     assert!(message.contains("takes no paths"), "unexpected: {message}");
+}
+
+#[test]
+#[should_panic(expected = "expected flag_tail to reject")]
+fn tail_error_panics_on_handled_steps() {
+    tail_error("-h");
 }
 
 #[test]
@@ -744,11 +755,8 @@ fn flows_short_circuit_show_with_messages() {
 
 #[test]
 fn run_in_reports_missing_terminator() {
-    // Piped stdin is never a TTY under `cargo test`; bail out (rather
-    // than parse differently) if that ever changes.
-    if crate::prompt::stdin_is_terminal() {
-        return;
-    }
+    // Piped runs miss the terminator; a TTY run would parse and then
+    // fail outside a working copy. Either way the exit is a failure.
     let tmp = TempDir::new("terminator");
     assert_eq!(
         run_in(tmp.path(), &args(&["-m", "x"])),

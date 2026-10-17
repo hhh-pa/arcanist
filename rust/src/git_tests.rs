@@ -594,3 +594,224 @@ fn round_trips_raw_commits() {
     let headers_only = RawCommit::new_from_raw_blob("tree t\n").unwrap();
     assert_eq!(headers_only.get_message(), Some(""));
 }
+
+fn plain_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("arc-rs-git-{name}-{}", std::process::id()));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).ok();
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn commit_one(dir: &std::path::Path, name: &str, contents: &str) {
+    std::fs::write(dir.join(name), contents).unwrap();
+    for args in [
+        vec!["config", "commit.gpgsign", "false"],
+        vec!["config", "core.autocrlf", "false"],
+        vec!["add", name],
+        vec!["commit", "-q", "-m", contents],
+    ] {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}");
+    }
+}
+
+#[test]
+fn missing_directories_are_not_work_trees() {
+    let missing = std::env::temp_dir().join(format!(
+        "arc-rs-git-no-such-dir-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    assert!(!missing.exists());
+    assert!(!is_inside_work_tree(&missing));
+    assert!(!is_git_lfs_working_copy(&missing));
+    assert!(remote_fetch_uri(&missing, "origin").is_none());
+    assert!(commit_range_status(&missing, "HEAD").is_err());
+}
+
+#[test]
+fn upstream_hops_replace_existing_keys() {
+    let mut path = UpstreamPath::new();
+    path.add_upstream("a".to_string(), UpstreamHop::local("b".to_string(), false));
+    path.add_upstream("a".to_string(), UpstreamHop::local("c".to_string(), false));
+    assert_eq!(path.get_length(), 1);
+    assert_eq!(path.get_upstream("a").map(|h| h.name.as_str()), Some("c"));
+}
+
+#[test]
+fn blob_without_trailing_newline_ends_headers() {
+    let raw = RawCommit::new_from_raw_blob("tree abcdef").unwrap();
+    assert_eq!(raw.get_tree_hash(), Some("abcdef"));
+    assert_eq!(raw.get_message(), Some(""));
+}
+
+#[test]
+fn raw_diff_skips_renames_and_copies_without_tabs() {
+    let old = "a".repeat(40);
+    let new = "b".repeat(40);
+    let status = format!(
+        ":100644 100644 {old} {new} R100 oldonly\n\
+         :100644 100644 {old} {new} C100 copyonly\n\
+         :100644 100644 {old} {new} M\tfile.txt\n"
+    );
+    let parsed = parse_git_raw_diff(&status);
+    assert_eq!(parsed.len(), 1);
+    assert!(parsed.contains_key("file.txt"));
+}
+
+#[test]
+fn porcelain_v2_skips_headless_entries() {
+    assert!(parse_porcelain_v2_status(b"?\0").is_empty());
+}
+
+#[test]
+fn tree_lines_reject_extra_fields() {
+    assert!(parse_git_tree_line("100644 blob abcdef extra\tname").is_none());
+    let hash = "a".repeat(40);
+    let parsed = parse_git_tree_line(&format!("100644 blob {hash}\tname")).unwrap();
+    assert_eq!(parsed.0, "name");
+}
+
+#[test]
+fn blame_caches_authors_per_revision() {
+    let sha = "C".repeat(40);
+    let stdout = format!(
+        "{sha} 1 1 1\nauthor Same\nfilename f.txt\n\tfirst\n\
+         {sha} 2 2 1\nauthor Same\nfilename f.txt\n\tsecond\n"
+    );
+    let blame = parse_blame(&stdout).unwrap();
+    assert_eq!(
+        blame,
+        vec![
+            BlameLine {
+                author: "Same".to_string(),
+                revision: sha.clone()
+            },
+            BlameLine {
+                author: "Same".to_string(),
+                revision: sha
+            },
+        ]
+    );
+}
+
+#[test]
+fn remote_uri_follows_the_tracking_remote() {
+    let repo = fresh_repo("remote");
+    commit_one(&repo, "a.txt", "one\n");
+    let bare = plain_dir("cov-remote-bare");
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&bare)
+        .args(["init", "-q", "--bare"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let bare_s = bare.to_string_lossy().into_owned();
+    for args in [
+        vec!["remote", "add", "origin", bare_s.as_str()],
+        vec!["push", "-q", "-u", "origin", "master"],
+    ] {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}");
+    }
+    let uri = remote_uri(&repo).unwrap();
+    assert!(uri.is_some_and(|uri| uri.contains("cov-remote-bare")));
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&bare).ok();
+}
+
+#[test]
+fn author_fails_on_broken_repo_config() {
+    let repo = fresh_repo("author");
+    std::fs::write(repo.join(".git/config"), "[[[\n").unwrap();
+    assert_eq!(
+        author(&repo).unwrap_err(),
+        "git var GIT_AUTHOR_IDENT failed"
+    );
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn status_failures_outside_repos_report() {
+    let plain = plain_dir("cov-plain");
+    assert_eq!(
+        uncommitted_status(&plain).unwrap_err(),
+        "git status --porcelain=2 failed"
+    );
+    assert_eq!(
+        changed_files(&plain, "HEAD").unwrap_err(),
+        "git diff --raw failed"
+    );
+    assert_eq!(all_files(&plain).unwrap_err(), "git ls-files failed");
+    std::fs::remove_dir_all(&plain).ok();
+}
+
+#[test]
+fn missing_blob_objects_fail_file_reads() {
+    let repo = fresh_repo("blob");
+    commit_one(&repo, "a.txt", "one\n");
+    let sha = stdout_text(&repo, &["rev-parse", "HEAD:a.txt"]).unwrap();
+    let object = repo.join(".git/objects").join(&sha[..2]).join(&sha[2..]);
+    std::fs::remove_file(&object).unwrap();
+    assert_eq!(
+        file_data_at_revision(&repo, "a.txt", "HEAD").unwrap_err(),
+        "git cat-file blob failed"
+    );
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn corrupt_objects_fail_branch_listing() {
+    // `symbolic-ref` only reads `.git/HEAD`, so the branch resolves
+    // while `for-each-ref` fails dereferencing the corrupt commit.
+    let repo = fresh_repo("branches");
+    commit_one(&repo, "a.txt", "one\n");
+    assert_eq!(branch_name(&repo).unwrap().as_deref(), Some("master"));
+    let sha = stdout_text(&repo, &["rev-parse", "HEAD"]).unwrap();
+    let object = repo.join(".git/objects").join(&sha[..2]).join(&sha[2..]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    #[cfg(not(unix))]
+    {
+        let mut perms = std::fs::metadata(&object).unwrap().permissions();
+        perms.set_readonly(false);
+        std::fs::set_permissions(&object, perms).unwrap();
+    }
+    std::fs::write(&object, b"garbage-garbage-garbage").unwrap();
+    assert_eq!(all_branches(&repo).unwrap_err(), "git for-each-ref failed");
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn raw_commit_writes_tolerate_early_git_exit() {
+    // Outside a repository git fatals before reading stdin; the
+    // megabyte blob cannot fit the pipe buffer, so the write
+    // deterministically hits EPIPE and the status check reports.
+    let plain = plain_dir("cov-raw");
+    let mut commit = RawCommit::default();
+    commit.set_message(Some("x".repeat(1 << 20)));
+    assert_eq!(
+        write_raw_commit(&plain, &commit).unwrap_err(),
+        "git hash-object failed"
+    );
+    std::fs::remove_dir_all(&plain).ok();
+}

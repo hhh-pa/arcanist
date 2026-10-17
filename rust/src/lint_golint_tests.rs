@@ -101,6 +101,121 @@ fn tool_failure_and_empty_output_yield_no_messages() {
     assert!(parse_output("main.go", 0, "short:line\n", "").is_empty());
 }
 
+#[cfg(unix)]
+fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) {}
+
+fn option_ctx(root: &Path) -> OptionContext<'_> {
+    OptionContext { project_root: root }
+}
+
+fn set_bin(linter: &mut GolintLinter, ctx: &OptionContext, tool: &Path) {
+    linter
+        .set_option(
+            "bin",
+            &serde_json::json!(tool.to_string_lossy().into_owned()),
+            ctx,
+        )
+        .unwrap();
+}
+
+#[test]
+fn trailing_dot_has_no_extension() {
+    assert_eq!(extension_of("foo."), None);
+    assert!(!is_supported("foo."));
+}
+
+#[test]
+fn staged_name_falls_back_to_go() {
+    assert_eq!(staged_name("Makefile"), "src.go");
+    assert_eq!(staged_name("archive.verylongextension"), "src.go");
+    assert_eq!(staged_name("odd.b-c"), "src.go");
+    assert_eq!(staged_name("a.go"), "src.go");
+    assert_eq!(staged_name("A.GO"), "src.GO");
+}
+
+#[test]
+fn binary_lookup_skips_empty_path_entries() {
+    let tmp = TempDir::new("lookup-empty");
+    let marker = tmp.path().join(binary_name());
+    std::fs::write(&marker, b"x").unwrap();
+    let both = std::env::join_paths([std::path::Path::new(""), tmp.path()]).unwrap();
+    assert_eq!(binary_in(&both), Some(marker));
+}
+
+#[test]
+fn set_option_delegates_bin_flags_and_version() {
+    let tmp = TempDir::new("tool-opts");
+    let tool = tmp.path().join("fake-golint");
+    std::fs::write(&tool, b"#!/bin/sh\nexit 0\n").unwrap();
+    make_executable(&tool);
+    let ctx = option_ctx(tmp.path());
+    let mut linter = GolintLinter::new();
+    set_bin(&mut linter, &ctx, &tool);
+    linter
+        .set_option("flags", &serde_json::json!(["--extra"]), &ctx)
+        .unwrap();
+    linter
+        .set_option("version", &serde_json::json!(">= 1.0"), &ctx)
+        .unwrap();
+    assert!(
+        linter
+            .set_option("bogus", &serde_json::json!(1), &ctx)
+            .is_err()
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn lint_bytes_runs_configured_tool_and_parses_stdout() {
+    let tmp = TempDir::new("run");
+    let tool = write_script(
+        tmp.path(),
+        "fake-golint",
+        "#!/bin/sh\necho '/tmp/src.go:7:6: exported type Exported should have comment'\n",
+    );
+    let ctx = option_ctx(tmp.path());
+    let mut linter = GolintLinter::new();
+    set_bin(&mut linter, &ctx, &tool);
+    let messages = linter.lint_bytes("main.go", b"package main\n");
+    assert_eq!(messages.len(), 1);
+    assert_eq!((messages[0].line, messages[0].col), (7, 6));
+    assert_eq!(messages[0].severity, "advice");
+}
+
+#[test]
+#[cfg(unix)]
+fn version_requirement_keeps_the_linter_inactive() {
+    // GoLint defines no `getVersion()`: any requirement gates the run.
+    let tmp = TempDir::new("version");
+    let tool = write_script(
+        tmp.path(),
+        "fake-golint",
+        "#!/bin/sh\necho '/tmp/src.go:7:6: something'\n",
+    );
+    let ctx = option_ctx(tmp.path());
+    let mut linter = GolintLinter::new();
+    set_bin(&mut linter, &ctx, &tool);
+    linter
+        .set_option("version", &serde_json::json!(">= 1.0"), &ctx)
+        .unwrap();
+    assert!(linter.lint_bytes("main.go", b"package main\n").is_empty());
+}
+
 #[test]
 fn ucfirst_uppercases_only_the_first_character() {
     assert_eq!(ucfirst(""), "");

@@ -292,14 +292,18 @@ fn discover_selection_prefers_explicit_then_config_then_cargo() {
         r#"{"engines": {"p": {"type": "phutil"}}}"#,
     )
     .unwrap();
-    match discover_selection(&Options::default(), &dir).unwrap() {
-        Selection::Config { engines, root } => {
-            assert_eq!(engines.len(), 1);
-            assert_eq!(engines[0].engine_type, "phutil");
-            assert_eq!(root, dir);
+    assert_eq!(
+        discover_selection(&Options::default(), &dir).unwrap(),
+        Selection::Config {
+            engines: vec![arc_rs::unit_config::PlannedEngine {
+                name: "p".to_string(),
+                engine_type: "phutil".to_string(),
+                include: Vec::new(),
+                exclude: Vec::new(),
+            }],
+            root: dir.clone(),
         }
-        other => panic!("expected Config, got {other:?}"),
-    }
+    );
 
     let explicit_cargo = parse_args(&args(&["--engine", "cargo"])).unwrap();
     assert_eq!(
@@ -494,10 +498,10 @@ fn run_single_rejects_everything_when_unsupported() {
     };
     let runner = |_: &[String], _: &str| CapturedOutput::new(0, "", "");
     let err = run_single_with_runner("PytestTestEngine", &ctx, &runner).unwrap_err();
+    let message = err.message();
     assert!(
-        err.message().contains("does not support --everything"),
-        "{}",
-        err.message()
+        message.contains("does not support --everything"),
+        "{message}"
     );
 
     let root = unique_dir("nose-everything");
@@ -532,21 +536,21 @@ fn run_single_unrunnable_engines_error_clearly() {
     for engine in ["XUnitTestEngine", "CSharpToolsTestEngine"] {
         let err = run_single_with_runner(engine, &ctx, &runner).unwrap_err();
         let msg = err.message();
+        let markers = [
+            "Unable to find",
+            "discovery rules",
+            "Unable to locate",
+            "cscover",
+        ];
         assert!(
-            msg.contains("Unable to find")
-                || msg.contains("discovery rules")
-                || msg.contains("Unable to locate")
-                || msg.contains("cscover"),
+            markers.iter().any(|marker| msg.contains(marker)),
             "{engine}: {msg}"
         );
     }
     let err = run_single_with_runner("Bogus", &ctx, &runner).unwrap_err();
     // UNIT-U8: PHP's subclass message.
-    assert!(
-        err.message().contains("is not a subclass of"),
-        "{}",
-        err.message()
-    );
+    let message = err.message();
+    assert!(message.contains("is not a subclass of"), "{message}");
 }
 
 #[test]
@@ -963,11 +967,8 @@ fn git_helpers_list_status_range_and_tracked() {
             .args(args)
             .output()
             .unwrap();
-        assert!(
-            out.status.success(),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{args:?}: {stderr}");
     };
     run(&["init", "-q"]);
     run(&["config", "user.email", "t@t.test"]);
@@ -1035,9 +1036,8 @@ fn validate_and_select_paths() {
     opts.paths.clear();
     // Temp dir has no VCS marker and is not under the worktree repo? It is
     // under /tmp, so no repo: empty selection.
-    if super::detect_vcs(&root).is_none() {
-        assert!(select_paths(&opts, &root, &root).unwrap().is_empty());
-    }
+    assert!(super::detect_vcs(&root).is_none());
+    assert!(select_paths(&opts, &root, &root).unwrap().is_empty());
     opts.everything = false;
     opts.paths = vec!["sub/f.php".to_string()];
     assert_eq!(
@@ -1045,9 +1045,8 @@ fn validate_and_select_paths() {
         vec!["sub/f.php".to_string()]
     );
     opts.paths.clear();
-    if super::detect_vcs(&root).is_none() {
-        assert!(select_paths(&opts, &root, &root).unwrap().is_empty());
-    }
+    assert!(super::detect_vcs(&root).is_none());
+    assert!(select_paths(&opts, &root, &root).unwrap().is_empty());
     // Private project-root helper prefers the `.arcconfig` ancestor.
     assert_eq!(super::project_root_path(&root.join("sub")), root);
     std::fs::remove_dir_all(&root).ok();
@@ -1344,11 +1343,10 @@ fn xunit_and_csharp_runs_cover_stages() {
         run_all_tests: false,
     };
     let err = run_single_with_runner("PhpunitTestEngine", &ctx, &runner).unwrap_err();
+    let message = err.message();
     assert!(
-        err.message()
-            .contains("PHPUnit configuration file was not found"),
-        "{}",
-        err.message()
+        message.contains("PHPUnit configuration file was not found"),
+        "{message}"
     );
     std::fs::remove_dir_all(&root).ok();
 }
@@ -1703,10 +1701,10 @@ fn csharp_cover_run_wraps_xunit_and_reads_coverage() {
     assert_eq!(argv.len(), 13);
     assert_eq!(argv[0], "fake-cscover");
     assert_eq!(argv[1], "-o");
+    let out_path = &argv[2];
     assert!(
-        argv[2].starts_with(&root_s) && argv[2].ends_with(".xml"),
-        "{}",
-        argv[2]
+        out_path.starts_with(&root_s) && out_path.ends_with(".xml"),
+        "{out_path}"
     );
     assert_eq!(argv[3], "-c");
     assert_eq!(argv[4], "fake-xunit");
@@ -1820,11 +1818,8 @@ fn csharp_cover_config_loads_and_errors() {
 
     std::fs::write(root.join(".arcconfig"), "{}").unwrap();
     let err = super::load_csharp_cover(&ctx, None).unwrap_err();
-    assert!(
-        err.message().contains("unit.csharp.coverage.binary"),
-        "{}",
-        err.message()
-    );
+    let message = err.message();
+    assert!(message.contains("unit.csharp.coverage.binary"), "{message}");
 
     std::fs::write(
         root.join(".arcconfig"),
@@ -1832,11 +1827,8 @@ fn csharp_cover_config_loads_and_errors() {
     )
     .unwrap();
     let err = super::load_csharp_cover(&ctx, None).unwrap_err();
-    assert!(
-        err.message().contains("have you built yet"),
-        "{}",
-        err.message()
-    );
+    let message = err.message();
+    assert!(message.contains("have you built yet"), "{message}");
 
     assert!(super::parse_excluded_files(&serde_json::json!(["a"])).is_none());
     std::fs::remove_dir_all(&root).ok();
@@ -1919,11 +1911,8 @@ fn phutil_run_parses_canned_output_and_cleans_up() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].0.len(), 4);
     assert_eq!(calls[0].1, root_s);
-    assert!(
-        calls[0].0[2].contains(".arc-unit-phutil-input-"),
-        "{:?}",
-        calls[0].0
-    );
+    let argv = &calls[0].0;
+    assert!(argv[2].contains(".arc-unit-phutil-input-"), "{argv:?}");
     assert_eq!(staged_leftovers(&root).len(), 0);
     std::fs::remove_dir_all(&root).ok();
 }
@@ -1988,11 +1977,8 @@ fn single_php_seam_rejects_unknown_engines() {
     let runner = |_: &[String], _: &str| CapturedOutput::new(0, "", "");
     let err = run_single_with_php("Bogus", &ctx, &runner, &|| None).unwrap_err();
     // UNIT-U8: PHP's subclass message.
-    assert!(
-        err.message().contains("is not a subclass of"),
-        "{}",
-        err.message()
-    );
+    let message = err.message();
+    assert!(message.contains("is not a subclass of"), "{message}");
 }
 
 #[test]
@@ -2751,11 +2737,10 @@ fn unit_u15_arcunit_types_are_class_map_only() {
         CONFIG_AVAILABLE,
     )
     .unwrap_err();
+    let message = err.message();
     assert!(
-        err.message()
-            .contains("Available test engines are: phutil."),
-        "{}",
-        err.message()
+        message.contains("Available test engines are: phutil."),
+        "{message}"
     );
     // ...while single runs still take class names plus `phutil`.
     assert!(SINGLE_AVAILABLE.contains(&"NoseTestEngine"));
@@ -2775,13 +2760,8 @@ fn unit_u18_int_durations_render_bare() {
     let value = results_to_json(std::slice::from_ref(&r));
     assert_eq!(value[0]["duration"], serde_json::json!(3));
     assert!(value[0]["duration"].is_i64());
-    assert!(
-        r.to_dictionary()
-            .to_json_string()
-            .contains("\"duration\":3,"),
-        "{}",
-        r.to_dictionary().to_json_string()
-    );
+    let json = r.to_dictionary().to_json_string();
+    assert!(json.contains("\"duration\":3,"), "{json}");
     // Floats keep the `.0` (PHP `json_encode(3.0)`).
     r.set_duration(3.0);
     assert!(!r.duration_is_int());
@@ -3037,11 +3017,8 @@ fn uncommitted_paths_strips_legacy_arrow_and_quotes() {
             .args(args)
             .output()
             .unwrap();
-        assert!(
-            out.status.success(),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{args:?}: {stderr}");
     };
     run(&["init", "-q"]);
     run(&["config", "user.email", "t@t.test"]);
@@ -3208,13 +3185,18 @@ fn load_config_selection_shim_roundtrips() {
         r#"{"engines": {"p": {"type": "phutil"}}}"#,
     )
     .unwrap();
-    match super::load_config_selection(&dir).unwrap() {
-        Selection::Config { engines, root } => {
-            assert_eq!(engines.len(), 1);
-            assert_eq!(root, dir);
+    assert_eq!(
+        super::load_config_selection(&dir).unwrap(),
+        Selection::Config {
+            engines: vec![arc_rs::unit_config::PlannedEngine {
+                name: "p".to_string(),
+                engine_type: "phutil".to_string(),
+                include: Vec::new(),
+                exclude: Vec::new(),
+            }],
+            root: dir.clone(),
         }
-        other => panic!("expected Config, got {other:?}"),
-    }
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -3248,13 +3230,18 @@ fn discover_selection_config_class_routes_to_arcunit() {
         r#"{"engines": {"p": {"type": "phutil"}}}"#,
     )
     .unwrap();
-    match discover_selection_classified(&Options::default(), &dir).unwrap() {
-        Selection::Config { engines, root } => {
-            assert_eq!(engines.len(), 1);
-            assert_eq!(root, dir);
+    assert_eq!(
+        discover_selection_classified(&Options::default(), &dir).unwrap(),
+        Selection::Config {
+            engines: vec![arc_rs::unit_config::PlannedEngine {
+                name: "p".to_string(),
+                engine_type: "phutil".to_string(),
+                include: Vec::new(),
+                exclude: Vec::new(),
+            }],
+            root: dir.clone(),
         }
-        other => panic!("expected Config, got {other:?}"),
-    }
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -3367,11 +3354,8 @@ fn xunit_generate_maps_pass_fail_and_hard_errors() {
     let pass = super::run_xunit_generate(&env, &regen).unwrap();
     assert_eq!(pass.len(), 1);
     assert_eq!(pass[0].get_result(), "pass");
-    assert!(
-        pass[0].get_name().starts_with("(regenerate projects for "),
-        "{}",
-        pass[0].get_name()
-    );
+    let name = pass[0].get_name();
+    assert!(name.starts_with("(regenerate projects for "), "{name}");
 
     let failing = |_: &[String], _: &str| CapturedOutput::new(1, "regen log", "");
     let fail = super::run_xunit_generate(&env, &failing).unwrap();
@@ -3380,11 +3364,8 @@ fn xunit_generate_maps_pass_fail_and_hard_errors() {
 
     let hard = |_: &[String], _: &str| CapturedOutput::new(3, "", "boom");
     let err = super::run_xunit_generate(&env, &hard).unwrap_err();
-    assert!(
-        err.message().contains("failed with exit code 3"),
-        "{}",
-        err.message()
-    );
+    let message = err.message();
+    assert!(message.contains("failed with exit code 3"), "{message}");
     assert!(err.message().contains("boom"), "{}", err.message());
     std::fs::remove_dir_all(&root).ok();
 }
@@ -3426,11 +3407,8 @@ fn xunit_plan_stops_after_failing_build() {
     let results = super::run_xunit_plan(&plan, &runner).unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].get_result(), "fail");
-    assert!(
-        results[0].get_name().starts_with("(build) "),
-        "{}",
-        results[0].get_name()
-    );
+    let name = results[0].get_name();
+    assert!(name.starts_with("(build) "), "{name}");
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -3455,11 +3433,8 @@ fn csharp_test_propagates_cover_stage_failures() {
     };
     let runner = |_: &[String], _: &str| panic!("no command may run");
     let err = super::run_csharp_test(&plan, Some(&cover), None, &runner).unwrap_err();
-    assert!(
-        err.message().contains("cannot stage cover file"),
-        "{}",
-        err.message()
-    );
+    let message = err.message();
+    assert!(message.contains("cannot stage cover file"), "{message}");
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -3809,12 +3784,11 @@ fn finish_php_report_collecting_upload_failure_is_generic() {
     let err =
         super::finish_php_report_collecting(&opts, &dir, &[], &report, false, None).unwrap_err();
     assert_eq!(err.kind, EnvelopeKind::Exception);
+    let message = &err.message;
+    let markers = ["no token", "transport", "conduit"];
     assert!(
-        err.message.contains("no token")
-            || err.message.contains("transport")
-            || err.message.contains("conduit"),
-        "{}",
-        err.message
+        markers.iter().any(|marker| message.contains(marker)),
+        "{message}"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -3845,11 +3819,11 @@ fn plan_run_single_selects_paths() {
     std::fs::create_dir_all(dir.join(".hg")).unwrap();
     std::fs::write(dir.join("f.php"), "<?php\n").unwrap();
     let opts = parse_args(&args(&["--engine", "NoseTestEngine", "f.php"])).unwrap();
-    let super::PlannedRun::Single { class, paths } = plan_run(&opts, &dir).unwrap() else {
-        panic!("expected Single");
-    };
-    assert_eq!(class, "NoseTestEngine");
-    assert_eq!(paths, args(&["f.php"]));
+    let run = plan_run(&opts, &dir).unwrap();
+    assert_eq!(
+        format!("{run:?}"),
+        "Single { class: \"NoseTestEngine\", paths: [\"f.php\"] }"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -3872,17 +3846,14 @@ fn plan_run_config_selects_paths() {
         "f.php",
     ]))
     .unwrap();
-    let super::PlannedRun::Config {
-        engines,
-        root,
-        paths,
-    } = plan_run(&opts, &dir).unwrap()
-    else {
-        panic!("expected Config");
-    };
-    assert_eq!(engines.len(), 1);
-    assert_eq!(root, dir);
-    assert_eq!(paths, args(&["f.php"]));
+    let run = plan_run(&opts, &dir).unwrap();
+    assert_eq!(
+        format!("{run:?}"),
+        format!(
+            "Config {{ engines: [PlannedEngine {{ name: \"p\", engine_type: \"phutil\", \
+             include: [], exclude: [] }}], root: {dir:?}, paths: [\"f.php\"] }}"
+        )
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

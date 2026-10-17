@@ -5407,6 +5407,27 @@ fn t1170_run_lint_unit_stdio_skips_both_children() {
 }
 
 #[test]
+fn t1170_run_lint_unit_stdio_reports_lint_failures() {
+    // Outside a working copy the lint child fails, aborting before
+    // the unit phase runs.
+    let dir = scratch_dir("t1170-lintfail");
+    let options = defaults();
+    assert!(run_lint_unit_stdio_ansi(&dir, &options, None, None, false, false).is_err());
+}
+
+#[test]
+fn t1170_run_lint_unit_stdio_reports_unit_failures() {
+    // With lint skipped, a broken unit setup fails the unit phase.
+    let dir = scratch_dir("t1170-unitfail");
+    std::fs::write(dir.join(".arcunit"), "{nope").unwrap();
+    let options = Options {
+        nolint: true,
+        ..defaults()
+    };
+    assert!(run_lint_unit_stdio_ansi(&dir, &options, None, None, false, false).is_err());
+}
+
+#[test]
 fn t1170_prepare_submit_spec_failure_on_bare_symref() {
     // HEAD retargeted at a tag resolves for the range but breaks
     // branch-name parsing when the spec loads.

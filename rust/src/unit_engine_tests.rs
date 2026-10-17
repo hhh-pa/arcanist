@@ -582,10 +582,7 @@ fn json_parser_reads_signed_exponents() {
 
 #[test]
 fn temp_file_create_reports_uncreatable_paths() {
-    let err = match TempFile::create("a/b", ".tmp") {
-        Ok(_) => panic!("expected TempFile::create to fail"),
-        Err(err) => err,
-    };
+    let err = TempFile::create("a/b", ".tmp").err().unwrap();
     assert!(err.contains("cannot create temp file:"), "{err}");
 }
 
@@ -638,10 +635,7 @@ fn temp_file_create_reports_too_many_collisions() {
         std::fs::write(&path, b"squat").unwrap();
         squatted.push(path);
     }
-    let err = match TempFile::create(prefix, suffix) {
-        Ok(_) => panic!("expected TempFile::create to fail"),
-        Err(err) => err,
-    };
+    let err = TempFile::create(prefix, suffix).err().unwrap();
     assert_eq!(err, "cannot create temp file: too many collisions");
     drop(probe);
     for path in squatted {

@@ -839,6 +839,46 @@ fn t1170_functions_cover_by_ref_and_union_returns() {
 }
 
 #[test]
+fn t1170_params_skip_leading_trivia_in_type_range() {
+    // Whitespace and comments between the opener (or comma) and the
+    // type name are not part of the type range.
+    let tree = tree_from_source("<?php function f( int $x, /*c*/ string $y) {}\n");
+    let blocks = tree.blocks();
+    assert_eq!(blocks[0].params.len(), 2);
+    assert!(blocks[0].params[0].ty.is_some());
+    assert!(blocks[0].params[1].ty.is_some());
+}
+
+#[test]
+fn t1170_param_type_range_validates_trivia_led_ranges() {
+    // Split ranges can start on trivia (the parser trims them, so
+    // only a direct call exercises the skip): the range starts at
+    // the first semantic token.
+    let tree = Tree {
+        source: " int $x".to_string(),
+        tokens: vec![
+            Token {
+                kind: kinds::T_WHITESPACE.to_string(),
+                value: " ".to_string(),
+                offset: 0,
+            },
+            Token {
+                kind: kinds::T_STRING.to_string(),
+                value: "int".to_string(),
+                offset: 1,
+            },
+            Token {
+                kind: kinds::T_VARIABLE.to_string(),
+                value: "$x".to_string(),
+                offset: 5,
+            },
+        ],
+        ..Default::default()
+    };
+    assert_eq!(param_ty_range(&tree, 0, 2), Some((1, 1)));
+}
+
+#[test]
 fn t1170_arrow_functions_parse_bodies() {
     let tree = tree_from_source("<?php $f = fn($x) => foo($x) + 1;\n");
     let blocks = tree.blocks();

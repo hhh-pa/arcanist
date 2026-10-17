@@ -183,14 +183,8 @@ fn ingest_skips_eof_empty_chunk() {
     // and a trailing delimiter leaves no empty chunk behind.
     let mut graph = CommitGraph::new();
     let mut seen = OrderedMap::new();
-    ingest_log_output(
-        &mut graph,
-        &mut seen,
-        "",
-        None,
-        |chunk: &str| -> Result<LogRecord, String> { panic!("unexpected chunk {chunk:?}") },
-    )
-    .unwrap();
+    let no_chunks = |chunk: &str| -> Result<LogRecord, String> { panic!("chunk {chunk:?}") };
+    ingest_log_output(&mut graph, &mut seen, "", None, no_chunks).unwrap();
     assert!(seen.is_empty());
     let mut graph = CommitGraph::new();
     let mut seen = OrderedMap::new();

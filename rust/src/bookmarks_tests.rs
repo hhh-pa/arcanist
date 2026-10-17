@@ -203,3 +203,118 @@ fn b23_bookmarks_help_matches_generated_format() {
     let ansi = usage_text(true);
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
+
+// -( T1170 wave 5d )-----------------------------------------------------------
+
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-bookmarks-tests-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+/// A fake `hg` whose stdout is `body` (mirrors `HgCommand::custom`;
+/// the appended hg argv are ignored by `sh -c`).
+fn fake_hg_stdout(body: &str) -> crate::hg::HgCommand {
+    crate::hg::HgCommand {
+        program: "sh".to_string(),
+        prefix: vec!["-c".to_string(), format!("printf '%s' '{body}'")],
+    }
+}
+
+#[test]
+fn parses_space_separated_conduit_uri() {
+    // T1153 B21/B23: TTY runs need no `--`.
+    assert_eq!(
+        parse_options_with_tty(&args(&["--conduit-uri", "https://host/api/"]), true),
+        Ok(Some(Options {
+            json: false,
+            conduit_uri: Some("https://host/api/".to_string()),
+        }))
+    );
+}
+
+#[test]
+fn list_with_binary_reports_missing_working_copy() {
+    // The binary seam forces the Mercurial-missing path without
+    // depending on what is installed on PATH.
+    let dir = TempDir::new("nowhere");
+    let err = list_with_binary(dir.path(), "arc-rs-definitely-missing-hg").unwrap_err();
+    assert!(err.contains("not inside a working copy"), "{err}");
+}
+
+#[test]
+fn list_maps_and_sorts_bookmarks() {
+    let dir = TempDir::new("marks");
+    std::fs::create_dir(dir.path().join(".hg")).unwrap();
+    let body = r#"[
+        {"type": "bookmark", "name": "b10", "node": "aaa", "isActive": false},
+        {"type": "bookmark", "name": "b2", "node": "bbb", "isActive": false},
+        {"type": "bookmark", "name": "zeta", "node": "ccc", "isActive": true},
+        {"type": "branch", "name": "main", "node": "ddd", "isActive": false}
+    ]"#;
+    let marks = list_with(dir.path(), &fake_hg_stdout(body)).unwrap();
+    // Active first, then natural name order (`b2` before `b10`);
+    // branches are filtered out, nodes map, revs stay empty.
+    let names: Vec<&str> = marks.iter().map(|mark| mark.name.as_str()).collect();
+    assert_eq!(names, vec!["zeta", "b2", "b10"]);
+    assert_eq!(marks[0].node, "ccc");
+    assert!(marks[0].active);
+    assert!(marks.iter().all(|mark| mark.rev.is_empty()));
+}
+
+#[test]
+fn execute_with_binary_covers_help_and_usage_errors() {
+    let dir = TempDir::new("exec");
+    // `--help` before `--` parses without TTY input.
+    let text = execute_with_binary(dir.path(), &args(&["--help", "--"]), "hg").unwrap();
+    assert!(text.contains("BOOKMARKS WORKFLOW"), "{text}");
+    // Unknown flags fail before the terminator check, with a dump.
+    let err = execute_with_binary(dir.path(), &args(&["--bogus"]), "hg").unwrap_err();
+    assert!(err.contains("unknown flag"), "{err}");
+    assert!(err.contains("BOOKMARKS WORKFLOW"), "{err}");
+}
+
+#[test]
+fn execute_core_json_lists_bookmarks() {
+    let dir = TempDir::new("json");
+    std::fs::create_dir(dir.path().join(".hg")).unwrap();
+    let body = r#"[
+        {"type": "bookmark", "name": "wip", "node": "abc123", "isActive": true}
+    ]"#;
+    let options = Options {
+        json: true,
+        conduit_uri: None,
+    };
+    let text = execute_core(dir.path(), &options, &fake_hg_stdout(body), None, None).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!([{
+            "name": "wip",
+            "active": true,
+            "rev": "",
+            "node": "abc123",
+        }])
+    );
+}

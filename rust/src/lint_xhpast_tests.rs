@@ -281,3 +281,102 @@ fn rule_options_are_accepted_and_short_codes_look_up() {
     assert_eq!(linter.severity_lookup_code("XHP"), "");
     assert_eq!(linter.severity_lookup_code("OTHER"), "OTHER");
 }
+
+#[test]
+fn extension_probe_rejects_trailing_dots() {
+    assert_eq!(extension_of("foo."), None);
+    assert_eq!(extension_of("a.php"), Some("php"));
+    assert_eq!(extension_of("no-extension"), None);
+}
+
+#[test]
+fn path_lookup_skips_empty_segments() {
+    assert!(find_on_path(std::ffi::OsStr::new(":"), "no-such-tool-xyz").is_none());
+}
+
+#[test]
+fn staged_names_fall_back_to_php() {
+    assert_eq!(staged_name("src/a.php"), "src.php");
+    assert_eq!(staged_name("Makefile"), "src.php");
+    assert_eq!(staged_name("a.toolongextension"), "src.php");
+    assert_eq!(staged_name("a.weird-ext!"), "src.php");
+}
+
+#[test]
+fn path_level_findings_pin_to_origin() {
+    let tree = xhp_ast::tree_from_source("<?php echo 1;\n");
+    let finding = xhp_ast::RawFinding::at(0, xhp_ast::PATH_LEVEL, String::new());
+    let message = emit("a.php", &tree, &finding);
+    assert_eq!((message.line, message.col), (0, 0));
+    assert_eq!(message.name, "XHP Lint");
+    let finding = xhp_ast::RawFinding::at(42, xhp_ast::PATH_LEVEL, "m".to_string());
+    let message = emit("a.php", &tree, &finding);
+    assert_eq!((message.line, message.col), (0, 0));
+    assert_eq!(message.code, "XHP42");
+    assert_eq!(message.name, "`elseif` Usage");
+}
+
+#[test]
+fn syntax_errors_without_detail_use_plain_text() {
+    let message = syntax_error("a.php", "", 3);
+    assert_eq!(message.code, "XHP1");
+    assert_eq!((message.line, message.col), (3, 1));
+    assert_eq!(message.description, "This file contains a syntax error.");
+}
+
+#[cfg(unix)]
+fn write_tool_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let script = dir.join(name);
+    std::fs::write(&script, format!("#!/bin/sh\n{body}")).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+    script
+}
+
+#[test]
+#[cfg(unix)]
+fn tool_failure_yields_unable_to_parse() {
+    let tmp = TempDir::new("tool-fail");
+    let tool = write_tool_script(tmp.path(), "xhpast", "exit 3\n");
+    let options = xhp_ast::XhpOptions::default();
+    let messages =
+        lint_with_binary_and_options("src/a.php", b"<?php echo 1;\n", Some(&tool), &options);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].code, "XHP2");
+    assert_eq!((messages[0].line, messages[0].col), (0, 0));
+}
+
+#[test]
+#[cfg(unix)]
+fn tool_success_runs_rules_over_canned_output() {
+    let source = "<?php if ($a) {\n} elseif ($b) {\n}\n";
+    let tmp = TempDir::new("tool-ok");
+    let out = tmp.path().join("out.json");
+    std::fs::write(&out, canned(source)).unwrap();
+    let tool = write_tool_script(
+        tmp.path(),
+        "xhpast",
+        &format!("cat \"{}\"\n", out.display()),
+    );
+    let options = xhp_ast::XhpOptions::default();
+    let messages =
+        lint_with_binary_and_options("src/a.php", source.as_bytes(), Some(&tool), &options);
+    let tree = xhp_ast::tree_from_canned_with_source(source, &canned(source)).unwrap();
+    assert_eq!(messages, lint_tree("src/a.php", &tree, &options));
+    assert!(messages.iter().any(|m| m.code == "XHP42"));
+}
+
+#[test]
+#[cfg(unix)]
+fn tool_garbage_falls_back_to_source_rules() {
+    let source = "<?php if ($a) {\n} elseif ($b) {\n}\n";
+    let tmp = TempDir::new("tool-garbage");
+    let tool = write_tool_script(tmp.path(), "xhpast", "printf 'not json'\n");
+    let options = xhp_ast::XhpOptions::default();
+    let messages =
+        lint_with_binary_and_options("src/a.php", source.as_bytes(), Some(&tool), &options);
+    let tree = xhp_ast::tree_from_source(source);
+    assert_eq!(messages, lint_tree("src/a.php", &tree, &options));
+}

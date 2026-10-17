@@ -39,12 +39,12 @@ fn git(dir: &Path, args: &[&str]) {
         .args(args)
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
+    let detail = format!(
         "git {} failed: {}",
         args.join(" "),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(output.status.success(), "{detail}");
 }
 
 fn git_output(dir: &Path, args: &[&str]) -> String {
@@ -54,12 +54,12 @@ fn git_output(dir: &Path, args: &[&str]) -> String {
         .args(args)
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
+    let detail = format!(
         "git {} failed: {}",
         args.join(" "),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(output.status.success(), "{detail}");
     String::from_utf8_lossy(&output.stdout)
         .trim_end()
         .to_string()
@@ -86,11 +86,11 @@ fn commit_at(dir: &Path, name: &str, date: &str) {
         .env("GIT_COMMITTER_DATE", date)
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
+    let detail = format!(
         "git commit failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(output.status.success(), "{detail}");
 }
 
 #[test]
@@ -214,6 +214,18 @@ fn renders_php_version_line() {
 }
 
 #[test]
+fn live_version_line_matches_fixed_offset_rendering() {
+    // Zone-independent: the live render equals the fixed-offset render
+    // at the live offset, whatever the machine zone is.
+    for timestamp in [0, 1_791_243_000] {
+        let live = render_version_line("abc123", timestamp);
+        let now = u64::try_from(timestamp).unwrap_or(0);
+        let offset = look::local_utc_offset(now);
+        assert_eq!(live, render_version_line_in("abc123", timestamp, offset));
+    }
+}
+
+#[test]
 fn reports_fixture_checkout_version() {
     let repo = fresh_repo("happy");
     commit_at(&repo.path, "a.txt", "2026-10-05 12:00:00 +0000");
@@ -264,6 +276,18 @@ fn rejects_directories_outside_any_checkout() {
     );
     assert_eq!(
         run_in(tmp.path(), &args(&[])),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn run_in_reports_not_a_checkout_as_usage_error() {
+    // T1153 CORE-49: with `--` present the parse succeeds and the
+    // not-a-git-copy error escapes as a toolset `USAGE EXCEPTION`
+    // (exit 1), like the parse errors above.
+    let tmp = TempDir::new("notacheckout");
+    assert_eq!(
+        run_in(tmp.path(), &args(&["--"])),
         std::process::ExitCode::FAILURE
     );
 }

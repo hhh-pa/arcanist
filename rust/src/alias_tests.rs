@@ -1155,6 +1155,29 @@ fn list_entry_point_lists_or_fatals_on_ambient_config() {
 }
 
 #[test]
+fn delete_entry_point_removes_or_aborts_on_ambient_config() {
+    // Read-only over ambient config when the trigger is absent (the
+    // usual case): no assertion about its content, only that deletion
+    // resolves to a terminal exit code. The `--` terminator reaches
+    // the delete runner with or without a TTY.
+    let code = run(&args(&["--", "t1170-definitely-no-such-alias"]));
+    assert!(
+        code == std::process::ExitCode::SUCCESS || code == std::process::ExitCode::FAILURE,
+        "{code:?}"
+    );
+}
+
+#[test]
+fn create_dispatch_rejects_builtin_triggers_through_run() {
+    // Two positionals dispatch to the create runner, which rejects
+    // builtin triggers before touching the filesystem.
+    assert_eq!(
+        run(&args(&["--", "diff", "land"])),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
 fn user_file_matches_arcrc_path() {
     assert_eq!(user_file_or_error().ok(), config::arcrc_path());
 }

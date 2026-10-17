@@ -746,6 +746,174 @@ fn unitu21_call_body_carries_escaped_params() {
     assert!(!body.contains("ö"), "{body}");
 }
 
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-conduit-tests-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+#[test]
+fn client_debug_hides_secrets() {
+    let rendered = format!("{:?}", test_client());
+    assert!(rendered.contains("Client"), "{rendered}");
+    assert!(rendered.contains("conduit.test"), "{rendered}");
+    assert!(!rendered.contains("api-test"), "{rendered}");
+}
+
+#[test]
+fn tls_rejects_malformed_bundles() {
+    let tmp = TempDir::new("cabundle-bad");
+    let bundle = tmp.path().join("ca.pem");
+    std::fs::write(
+        &bundle,
+        "-----BEGIN CERTIFICATE-----\n!!! not base64 !!!\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
+    let tls = TlsConfig {
+        cabundle: Some(bundle),
+        blind_trust: Vec::new(),
+    };
+    let err = Client::new_with_tls("https://phab.example/", "t", &tls).unwrap_err();
+    assert!(err.to_string().contains("invalid CA bundle"), "{err}");
+}
+
+#[test]
+fn tls_loads_valid_ca_bundles() {
+    // Self-signed fixture minted by `openssl`; skipped when it is missing.
+    let tmp = TempDir::new("cabundle-ok");
+    let cert = tmp.path().join("ca.pem");
+    let minted = std::process::Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:1024",
+            "-keyout",
+            tmp.path().join("key.pem").to_string_lossy().as_ref(),
+            "-out",
+            cert.to_string_lossy().as_ref(),
+            "-days",
+            "1",
+            "-nodes",
+            "-subj",
+            "/CN=t1170",
+        ])
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !minted {
+        return;
+    }
+    let tls = TlsConfig {
+        cabundle: Some(cert),
+        blind_trust: Vec::new(),
+    };
+    let client = Client::new_with_tls("https://phab.example/", "t", &tls).unwrap();
+    assert_eq!(client.base_uri(), "https://phab.example/api/");
+}
+
+#[test]
+fn client_timeout_and_basic_auth_setters_chain() {
+    let mut client = test_client();
+    client
+        .set_timeout(std::time::Duration::from_secs(5))
+        .set_basic_auth_credentials("user", "pass");
+    let rendered = format!("{:?}", client);
+    assert!(!rendered.contains("pass"), "{rendered}");
+}
+
+#[test]
+fn basic_auth_credentials_flow_into_requests() {
+    // The post fails at a dead port, after the credentials arm runs.
+    let mut client = Client::new("http://127.0.0.1:9/", "t").unwrap();
+    client.set_basic_auth_credentials("user", "pass");
+    assert!(client.call("m", &serde_json::json!({})).is_err());
+}
+
+#[test]
+fn session_store_ignores_non_objects() {
+    let client = test_client();
+    client.store_session(&serde_json::json!("scalar"));
+    client.store_session(&serde_json::json!({"sessionKey": 42}));
+    assert_eq!(client.authenticated_user(), None);
+}
+
+#[test]
+fn split_uri_rejects_bare_ports() {
+    assert_eq!(
+        split_uri("https://:8080").unwrap_err(),
+        Error::Transport("Conduit URI 'https://:8080' must include a valid host.".to_string())
+    );
+}
+
+#[test]
+fn authority_and_port_edges() {
+    assert_eq!(split_authority("[::1"), ("[::1".to_string(), None));
+    assert_eq!(split_authority("host:abc"), ("host:abc".to_string(), None));
+    assert_eq!(parse_port(""), None);
+    assert_eq!(parse_port("8080"), Some(8080));
+}
+
+#[test]
+fn php_value_edges() {
+    assert!(php_truthy(&serde_json::json!({"a": 1})));
+    assert!(!php_truthy(&serde_json::json!({})));
+    assert_eq!(php_stringify(&serde_json::json!(false)), "");
+    assert_eq!(php_stringify(&serde_json::json!([1])), "Array");
+    assert_eq!(php_stringify(&serde_json::json!({"a": 1})), "Array");
+}
+
+#[test]
+fn json_protocol_error_wraps_serde_failures() {
+    let parse = serde_json::from_str::<serde_json::Value>("{bad").unwrap_err();
+    let error = json_protocol_error(parse);
+    assert!(matches!(error, Error::Protocol(_)), "{error}");
+}
+
+#[test]
+fn signature_encoding_covers_large_u64() {
+    assert_eq!(
+        encode_raw_data_for_signature(&serde_json::json!(18446744073709551615u64)).unwrap(),
+        "I20:18446744073709551615"
+    );
+}
+
+#[test]
+fn shell_arg_quotes_unsafe_words() {
+    assert_eq!(shell_arg("echo"), "echo");
+    assert_eq!(shell_arg("two words"), "'two words'");
+    assert_eq!(shell_arg("o'clock"), "'o'\\''clock'");
+    assert_eq!(shell_arg(""), "''");
+}
+
+#[test]
+fn toolset_conduit_constructor_reports() {
+    let error = ClassifiedError::toolset_conduit("boom".to_string());
+    assert_eq!(error.kind, EnvelopeKind::ToolsetConduit);
+    assert_eq!(error.message, "boom");
+    assert_eq!(error.report(), std::process::ExitCode::FAILURE);
+}
+
 #[test]
 fn core16_toolset_parse_error_is_bold() {
     // Bold `**Usage Exception:**` rendering like `Usage` (the toolset
