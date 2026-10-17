@@ -3365,3 +3365,1471 @@ fn b23_diff_help_matches_generated_format() {
     let ansi = help_text(true);
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
+
+/* T1170 coverage: git ranges, pure helpers, scratch metadata. */
+
+fn t1170_commit(dir: &Path, message: &str) {
+    let add = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["add", "-A"])
+        .status()
+        .unwrap();
+    assert!(add.success());
+    let commit = std::process::Command::new("git")
+        .current_dir(dir)
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qam",
+            message,
+        ])
+        .status()
+        .unwrap();
+    assert!(commit.success());
+}
+
+fn t1170_rev(dir: &Path, rev: &str) -> String {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["rev-parse", rev])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn t1170_three_commit_repo(tag: &str) -> PathBuf {
+    let dir = git_dir(tag);
+    for (file, body, message) in [
+        ("a.txt", "a\n", "one"),
+        ("b.txt", "b\n", "two"),
+        ("c.txt", "c\n", "three"),
+    ] {
+        std::fs::write(dir.join(file), body).unwrap();
+        t1170_commit(&dir, message);
+    }
+    dir
+}
+
+#[cfg(unix)]
+fn t1170_make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn t1170_resolve_base_explicit_and_default() {
+    let dir = git_dir("t1170-base");
+    std::fs::write(dir.join("f.txt"), "a\n").unwrap();
+    t1170_commit(&dir, "one");
+    let head = t1170_rev(&dir, "HEAD");
+    assert_eq!(resolve_base(&dir, None).unwrap(), head);
+    assert_eq!(resolve_base(&dir, Some("HEAD")).unwrap(), head);
+    let err = resolve_base(&dir, Some("no-such-rev-t1170")).unwrap_err();
+    assert_eq!(err, "invalid base revision 'no-such-rev-t1170'");
+}
+
+#[test]
+fn t1170_numstat_range_reports_git_failure() {
+    let dir = git_dir("t1170-numstat");
+    std::fs::write(dir.join("f.txt"), "a\n").unwrap();
+    t1170_commit(&dir, "one");
+    let err = numstat_range(&dir, "no-such-rev-t1170", None).unwrap_err();
+    assert!(err.starts_with("git diff --numstat failed:"), "{err}");
+    let head = t1170_rev(&dir, "HEAD");
+    assert_eq!(numstat_range(&dir, &head, None).unwrap(), vec![]);
+}
+
+#[test]
+fn t1170_default_diff_output_range_head_and_bad_base() {
+    let dir = t1170_three_commit_repo("t1170-output");
+    let base = t1170_rev(&dir, "HEAD~1");
+    let out = default_diff_output_range(&dir, &base, Some("HEAD")).unwrap();
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("c.txt"), "{text}");
+    assert!(text.contains("diff --git"), "{text}");
+    let err = default_diff_output_range(&dir, "no-such-rev-t1170", None).unwrap_err();
+    assert!(err.starts_with("git diff failed:"), "{err}");
+}
+
+#[test]
+fn t1170_submit_changes_with_hunks_head_and_bad_base() {
+    let dir = t1170_three_commit_repo("t1170-hunks");
+    let base = t1170_rev(&dir, "HEAD~1");
+    let entries = diff_local::collect_change_entries(&dir, &base, Some("HEAD")).unwrap();
+    assert!(!entries.is_empty());
+    let changes = submit_changes_with_hunks(&dir, &base, Some("HEAD"), &entries).unwrap();
+    assert_eq!(changes.len(), entries.len());
+    assert!(changes.iter().any(|c| c.current_path == "c.txt"));
+    let err = submit_changes_with_hunks(&dir, "no-such-rev-t1170", None, &entries).unwrap_err();
+    assert!(err.starts_with("git diff failed:"), "{err}");
+}
+
+#[test]
+fn t1170_set_child_flags_splits_lint_unit() {
+    let options = Options {
+        apply_patches: true,
+        amend_autofixes: true,
+        coverage: true,
+        ..Options::default()
+    };
+    let (lint, unit) = set_child_flags(&options);
+    assert_eq!(
+        lint,
+        vec!["apply-patches".to_string(), "amend-autofixes".to_string()]
+    );
+    assert_eq!(unit, vec!["coverage".to_string()]);
+    let (lint, unit) = set_child_flags(&Options::default());
+    assert!(lint.is_empty() && unit.is_empty());
+}
+
+#[test]
+fn t1170_standard_update_target_display_arg() {
+    let fields = serde_json::json!({"title": "T"});
+    let mut display = String::new();
+    let options = Options {
+        update: Some("D5".to_string()),
+        ..Options::default()
+    };
+    {
+        let target = standard_update_target(&options, &fields, 5, &mut display);
+        assert_eq!(target.revision_id, 5);
+        assert_eq!(target.revision_arg, "5");
+        assert!(target.check_ownership);
+        assert_eq!(target.edit_fields, None);
+        assert_eq!(target.verbatim_fields, &fields);
+    }
+    let options = Options::default();
+    let target = standard_update_target(&options, &fields, 7, &mut display);
+    assert_eq!(target.revision_arg, "7");
+}
+
+#[test]
+fn t1170_select_remote_corpus_matrix() {
+    assert_eq!(
+        select_remote_corpus("base", Some("cached".to_string()), true, false),
+        "cached"
+    );
+    assert_eq!(
+        select_remote_corpus("base", Some("cached".to_string()), false, false),
+        "base"
+    );
+    assert_eq!(select_remote_corpus("base", None, true, false), "base");
+    assert_eq!(
+        select_remote_corpus("base", Some("cached".to_string()), true, true),
+        "base"
+    );
+}
+
+#[test]
+fn t1170_update_message_title_kinds() {
+    let mut message = diff_local::CommitMessage::new_from_raw_corpus("Title here\n").unwrap();
+    assert_eq!(update_message_title(&message), "");
+    message.fields.insert(
+        "title".to_string(),
+        diff_local::FieldValue::Text("Pulled".to_string()),
+    );
+    assert_eq!(update_message_title(&message), "Pulled");
+    message.fields.insert(
+        "title".to_string(),
+        diff_local::FieldValue::List(vec!["a".to_string()]),
+    );
+    assert_eq!(update_message_title(&message), "");
+}
+
+#[test]
+fn t1170_join_create_corpus_blank_is_none() {
+    assert_eq!(join_create_corpus(&["  \n ".to_string()], None, None), None);
+    assert_eq!(join_create_corpus(&[], None, None), None);
+}
+
+#[test]
+fn t1170_revision_uri_from_diff_uri_fallback() {
+    assert_eq!(revision_uri_from_diff_uri("not-a-uri", 5), "/D5");
+    assert_eq!(revision_uri_from_diff_uri("https://", 5), "/D5");
+    assert_eq!(
+        revision_uri_from_diff_uri("https://phab.test/D3", 9),
+        "https://phab.test/D9"
+    );
+}
+
+#[test]
+fn t1170_update_scratch_non_object_and_clear() {
+    let meta = scratch_dir("t1170-uscratch");
+    write_scratch_json(&meta, SCRATCH_EDIT_MESSAGES, &serde_json::json!([1, 2]));
+    assert_eq!(
+        read_update_scratch(&meta, SCRATCH_EDIT_MESSAGES),
+        serde_json::json!({})
+    );
+    for name in [SCRATCH_EDIT_MESSAGES, SCRATCH_UPDATE_MESSAGES] {
+        write_scratch_json(&meta, name, &serde_json::json!({"5": "old", "6": "keep"}));
+    }
+    clear_update_scratch(&meta, 5);
+    for name in [SCRATCH_EDIT_MESSAGES, SCRATCH_UPDATE_MESSAGES] {
+        assert_eq!(
+            read_update_scratch(&meta, name),
+            serde_json::json!({"6": "keep"})
+        );
+    }
+    clear_update_scratch(&meta, 99);
+}
+
+#[test]
+fn t1170_update_metadata_dir_per_vcs() {
+    let git = git_dir("t1170-meta");
+    assert_eq!(update_metadata_dir(&git, None).unwrap(), git.join(".git"));
+    assert_eq!(
+        update_metadata_dir(&git, Some(VcsKind::Git)).unwrap(),
+        git.join(".git")
+    );
+    let hg = scratch_dir("t1170-meta-hg");
+    std::fs::create_dir_all(hg.join(".hg")).unwrap();
+    assert_eq!(update_metadata_dir(&hg, None).unwrap(), hg.join(".hg"));
+    let svn = scratch_dir("t1170-meta-svn");
+    std::fs::create_dir_all(svn.join(".svn")).unwrap();
+    assert_eq!(update_metadata_dir(&svn, None).unwrap(), svn.join(".svn"));
+    let plain = scratch_dir("t1170-meta-plain");
+    assert_eq!(
+        update_metadata_dir(&plain, None).unwrap_err(),
+        "not inside a git repository"
+    );
+}
+
+#[test]
+fn t1170_git_metadata_dir_relative_and_worktree() {
+    let dir = git_dir("t1170-gitdir");
+    std::fs::write(dir.join("f.txt"), "a\n").unwrap();
+    t1170_commit(&dir, "one");
+    assert_eq!(git_metadata_dir(&dir).unwrap(), dir.join(".git"));
+    assert_eq!(
+        git_metadata_dir(&scratch_dir("t1170-gitdir-plain")).unwrap_err(),
+        "not inside a git repository"
+    );
+    // Linked worktrees resolve to an absolute git dir.
+    let wt = std::env::temp_dir().join(format!("arc-rs-diff-wt-{}", std::process::id()));
+    let added = std::process::Command::new("git")
+        .current_dir(&dir)
+        .args(["worktree", "add", &wt.to_string_lossy()])
+        .status()
+        .unwrap();
+    assert!(added.success());
+    let resolved = git_metadata_dir(&wt).unwrap();
+    assert!(resolved.is_absolute(), "{}", resolved.display());
+}
+
+#[test]
+fn t1170_history_default_immutable_per_vcs() {
+    assert!(!history_default_immutable(&git_dir("t1170-imm-git")));
+    let hg = scratch_dir("t1170-imm-hg");
+    std::fs::create_dir_all(hg.join(".hg")).unwrap();
+    assert!(history_default_immutable(&hg));
+    let svn = scratch_dir("t1170-imm-svn");
+    std::fs::create_dir_all(svn.join(".svn")).unwrap();
+    assert!(history_default_immutable(&svn));
+    assert!(!history_default_immutable(&scratch_dir("t1170-imm-plain")));
+}
+
+#[test]
+fn t1170_scratch_write_failures_return_false() {
+    let dir = scratch_dir("t1170-scratchfail");
+    let file = dir.join("not-a-dir");
+    std::fs::write(&file, "x").unwrap();
+    assert!(!write_scratch_file(&file, "create-message", "hello"));
+    assert!(!write_scratch_json(
+        &file,
+        "data",
+        &serde_json::json!({"a": 1})
+    ));
+}
+
+#[test]
+fn t1170_readable_scratch_with_curdir_root() {
+    let root = scratch_dir("t1170-curdir");
+    let meta = root.join(".git");
+    let expected = Path::new(".git")
+        .join("arc")
+        .join("create-message")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        readable_scratch_file_path(&meta, &root.join("."), "create-message"),
+        expected
+    );
+}
+
+/* T1170 coverage: update resolution, properties, raw sources, submit-over. */
+
+#[test]
+fn t1170_update_uses_cached_template_on_second_run() {
+    let meta = scratch_dir("t1170-d9cache");
+    write_scratch_json(
+        &meta,
+        SCRATCH_UPDATE_MESSAGES,
+        &serde_json::json!({"5": "cached template"}),
+    );
+    let call = update_stub_call();
+    let seen = std::cell::RefCell::new(Vec::new());
+    let edit = |template: &str, name: &str| -> Result<String, String> {
+        seen.borrow_mut()
+            .push((template.to_string(), name.to_string()));
+        Ok("final words\n".to_string())
+    };
+    let prefill = || -> Result<Option<String>, String> {
+        panic!("T1170: no prefill when a cached template exists")
+    };
+    let mut reader = std::io::BufReader::new(std::io::empty());
+    let mut writer = Vec::new();
+    let mut resolver = UpdateResolver {
+        reader: &mut reader,
+        writer: &mut writer,
+        call: &call,
+        metadata_dir: &meta,
+        edit: &edit,
+        prefill: &prefill,
+    };
+    let options = update_test_options(None, false);
+    let resolved = resolve_update_revision(
+        &mut resolver,
+        &options,
+        &update_test_target(&serde_json::json!({})),
+    )
+    .unwrap();
+    assert_eq!(resolved.message, "final words\n");
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, "cached template");
+    assert_eq!(seen[0].1, EDITOR_DIFF_UPDATE);
+}
+
+#[test]
+fn t1170_maybe_apply_full_update_non_update_skips() {
+    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        panic!("T1170: no conduit for non-update modes")
+    };
+    let dir = scratch_dir("t1170-noupdate");
+    let options = Options::default();
+    let mut input = create_test_input(false, None);
+    assert_eq!(
+        maybe_apply_full_update(&dir, &options, &call, Some(VcsKind::Git), &mut input).unwrap(),
+        None
+    );
+    input.mode = SubmitMode::Only;
+    assert_eq!(
+        maybe_apply_full_update(&dir, &options, &call, Some(VcsKind::Git), &mut input).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn t1170_lint_unit_properties_emit_only_nonempty() {
+    assert!(
+        lint_unit_properties(&diff_local::LintUnitReport::empty())
+            .unwrap()
+            .is_empty()
+    );
+    let lint_only = diff_local::LintUnitReport {
+        lint_result: Some(1),
+        unresolved_lint: vec![serde_json::json!({"path": "f"})],
+        unit_result: None,
+        test_results: Vec::new(),
+    };
+    let props = lint_unit_properties(&lint_only).unwrap();
+    assert_eq!(props.len(), 1);
+    assert_eq!(props[0].name, diff_submit::PROP_LINT);
+    assert!(props[0].data.contains("\"path\""), "{}", props[0].data);
+    let unit_only = diff_local::LintUnitReport {
+        lint_result: None,
+        unresolved_lint: Vec::new(),
+        unit_result: Some(0),
+        test_results: vec![serde_json::json!({"name": "t"})],
+    };
+    let props = lint_unit_properties(&unit_only).unwrap();
+    assert_eq!(props.len(), 1);
+    assert_eq!(props[0].name, diff_submit::PROP_UNIT);
+}
+
+#[test]
+fn t1170_diff_properties_onto_needs_upstream() {
+    // A plain repo reports local commits but no onto targets.
+    let dir = t1170_three_commit_repo("t1170-props");
+    let base = t1170_rev(&dir, "HEAD~1");
+    let props = diff_properties(&dir, &base, Some("HEAD")).unwrap();
+    let names: Vec<&str> = props.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, vec![diff_submit::PROP_LOCAL_COMMITS]);
+    // A clone tracks its origin, so onto targets appear.
+    let origin = t1170_three_commit_repo("t1170-origin");
+    let clone = std::env::temp_dir().join(format!("arc-rs-diff-clone-{}", std::process::id()));
+    let cloned = std::process::Command::new("git")
+        .args(["clone", "-q"])
+        .arg(&origin)
+        .arg(&clone)
+        .status()
+        .unwrap();
+    assert!(cloned.success());
+    let base = t1170_rev(&clone, "HEAD~1");
+    let props = diff_properties(&clone, &base, Some("HEAD")).unwrap();
+    let names: Vec<&str> = props.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![diff_submit::PROP_LOCAL_COMMITS, diff_submit::PROP_ONTO]
+    );
+}
+
+#[test]
+fn t1170_raw_command_feeds_submit_entries() {
+    let dir = scratch_dir("t1170-raw");
+    let text = "diff --git a/f.txt b/f.txt\nnew file mode 100644\nindex 0000000..257cc56\n--- /dev/null\n+++ b/f.txt\n@@ -0,0 +1 @@\n+hi\n";
+    let file = dir.join("raw.diff");
+    std::fs::write(&file, text).unwrap();
+    let cat = if cfg!(windows) { "type" } else { "cat" };
+    let options = Options {
+        raw_command: Some(format!("{cat} \"{}\"", file.to_string_lossy())),
+        ..Options::default()
+    };
+    let entries = submit_raw_entries(&options).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].current.path, "f.txt");
+    // The same source flows through the full collector and prepare path.
+    let mut reader = std::io::BufReader::new(std::io::empty());
+    let mut writer = Vec::new();
+    let mut io = diff_local::SvnPromptIo {
+        reader: &mut reader,
+        writer: &mut writer,
+        warned_externals: false,
+    };
+    let changes = collect_submit_changes_with_io(
+        &dir,
+        &hg::HgCommand::default(),
+        &svn::SvnCommand::default(),
+        &options,
+        "",
+        None,
+        &mut io,
+    )
+    .unwrap();
+    assert_eq!(changes.len(), 1);
+    let mut reader = std::io::BufReader::new(std::io::empty());
+    let mut writer = Vec::new();
+    let mut io = diff_local::SvnPromptIo {
+        reader: &mut reader,
+        writer: &mut writer,
+        warned_externals: false,
+    };
+    let input = prepare_submit_full_with_commands_io(
+        &dir,
+        &hg::HgCommand::default(),
+        &svn::SvnCommand::default(),
+        &options,
+        &SubmitMode::Only,
+        &diff_local::LintUnitReport::empty(),
+        &mut io,
+    )
+    .unwrap();
+    assert!(
+        input.included_changes.contains("f.txt"),
+        "{}",
+        input.included_changes
+    );
+}
+
+#[test]
+fn t1170_lint_unit_base_matrix() {
+    let dir = scratch_dir("t1170-lub");
+    let raw = Options {
+        raw: true,
+        ..Options::default()
+    };
+    assert_eq!(
+        lint_unit_base(&dir, &raw, Some(VcsKind::Git), true).unwrap(),
+        (None, None)
+    );
+    let plain = Options::default();
+    assert_eq!(
+        lint_unit_base(&dir, &plain, Some(VcsKind::Svn), false).unwrap(),
+        (None, None)
+    );
+    assert_eq!(
+        lint_unit_base(&dir, &plain, None, false).unwrap(),
+        (None, None)
+    );
+    let git = t1170_three_commit_repo("t1170-lub-git");
+    let head = t1170_rev(&git, "HEAD");
+    assert_eq!(
+        lint_unit_base(&git, &plain, Some(VcsKind::Git), false).unwrap(),
+        (Some(head), None)
+    );
+    // Outside a working copy the report stays empty without children.
+    let report = full_lint_unit_report(&dir, &plain, None, false, false).unwrap();
+    assert_eq!(report.lint_result, None);
+    assert_eq!(report.unit_result, None);
+    assert!(report.unresolved_lint.is_empty() && report.test_results.is_empty());
+}
+
+#[test]
+fn t1170_open_uri_in_browser_success_and_failure() {
+    #[cfg(not(windows))]
+    {
+        assert!(open_uri_in_browser("https://example.test/D1", &["true".to_string()]).is_ok());
+        let err =
+            open_uri_in_browser("https://example.test/D1", &["false".to_string()]).unwrap_err();
+        assert!(err.contains("https://example.test/D1"), "{err}");
+    }
+    let err = open_uri_in_browser(
+        "https://example.test/D1",
+        &["definitely-not-a-browser-t1170".to_string()],
+    )
+    .unwrap_err();
+    assert!(err.contains("browser"), "{err}");
+}
+
+#[test]
+fn t1170_binary_exists_on_path_probes_path() {
+    assert!(binary_exists_on_path("git"));
+    assert!(!binary_exists_on_path("definitely-not-a-binary-t1170"));
+}
+
+#[test]
+fn t1170_submit_over_with_browse_reports_then_errors() {
+    let call = |method: &str, _: &serde_json::Value| {
+        assert_eq!(method, diff_submit::METHOD_CREATE_DIFF);
+        Ok(serde_json::json!({"diffid": 3, "uri": "https://phab.test/diff/3/"}))
+    };
+    let mut input = create_test_input(false, None);
+    input.mode = SubmitMode::Only;
+    input.fields = serde_json::Value::Null;
+    // A git root: the project file only counts at a working-copy root, and
+    // it pins a missing browser so the user config cannot leak in.
+    let dir = git_dir("t1170-browse");
+    std::fs::write(
+        dir.join(".arcconfig"),
+        "{\"browser\": \"definitely-not-a-browser-t1170\"}",
+    )
+    .unwrap();
+    let report =
+        submit_over_with_browse_ansi(&dir, &Options::default(), &call, &input, false).unwrap();
+    assert!(report.text.contains("Differential diff"), "{}", report.text);
+    assert_eq!(report.diff_id, 3);
+    let options = Options {
+        browse: true,
+        ..Options::default()
+    };
+    let err = match submit_over_with_browse_ansi(&dir, &options, &call, &input, false) {
+        Ok(_) => panic!("T1170: missing browser must fail the submit"),
+        Err(err) => err,
+    };
+    assert!(err.contains("https://phab.test/diff/3/"), "{err}");
+    assert!(err.contains("definitely-not-a-browser-t1170"), "{err}");
+}
+
+#[test]
+fn t1170_submit_over_and_stage_records_skip() {
+    let recorded = std::cell::RefCell::new(Vec::new());
+    let call = |method: &str, params: &serde_json::Value| {
+        if method == diff_submit::METHOD_CREATE_DIFF {
+            return Ok(serde_json::json!({"diffid": 3, "uri": "https://phab.test/diff/3/"}));
+        }
+        assert_eq!(method, diff_submit::METHOD_SET_DIFF_PROPERTY);
+        recorded
+            .borrow_mut()
+            .push(params["name"].as_str().unwrap_or("").to_string());
+        Ok(serde_json::json!(null))
+    };
+    let mut input = create_test_input(false, None);
+    input.mode = SubmitMode::Only;
+    input.fields = serde_json::Value::Null;
+    input.spec = serde_json::json!({"sourceControlBaseRevision": "abc"});
+    let options = Options {
+        skip_staging: true,
+        ..Options::default()
+    };
+    let report = submit_over_and_stage(
+        &scratch_dir("t1170-stage"),
+        &options,
+        &call,
+        Some(VcsKind::Git),
+        &input,
+        false,
+    )
+    .unwrap();
+    assert_eq!(report.diff_id, 3);
+    assert_eq!(
+        *recorded.borrow(),
+        vec![diff_submit::PROP_STAGING.to_string()]
+    );
+}
+
+#[test]
+fn t1170_finalize_client_submit_create_and_update() {
+    let dir = git_dir("t1170-final");
+    let fetched = std::cell::Cell::new(false);
+    let call = |method: &str, _: &serde_json::Value| {
+        assert_eq!(method, diff_submit::METHOD_GET_COMMIT_MESSAGE);
+        fetched.set(true);
+        Ok(serde_json::json!("revised\n"))
+    };
+    // Create with --no-amend fetches but rewrites nothing.
+    let options = Options {
+        no_amend: true,
+        ..Options::default()
+    };
+    finalize_client_submit(
+        &dir,
+        &hg::HgCommand::default(),
+        &options,
+        &call,
+        Some(VcsKind::Git),
+        &SubmitMode::Create,
+        Some(7),
+        None,
+    )
+    .unwrap();
+    assert!(fetched.get());
+    // Update clears that revision's cached messages.
+    let meta = update_metadata_dir(&dir, Some(VcsKind::Git)).unwrap();
+    write_scratch_json(
+        &meta,
+        SCRATCH_UPDATE_MESSAGES,
+        &serde_json::json!({"5": "stale"}),
+    );
+    finalize_client_submit(
+        &dir,
+        &hg::HgCommand::default(),
+        &Options::default(),
+        &call,
+        Some(VcsKind::Git),
+        &SubmitMode::Update(5),
+        None,
+        Some(5),
+    )
+    .unwrap();
+    assert_eq!(
+        read_update_scratch(&meta, SCRATCH_UPDATE_MESSAGES),
+        serde_json::json!({})
+    );
+}
+
+#[test]
+fn t1170_submit_redirect_passthrough() {
+    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        panic!("T1170: no conduit for non-create modes")
+    };
+    let options = Options::default();
+    let dir = scratch_dir("t1170-redir");
+    let redirect =
+        resolve_submit_create_redirect(&dir, &options, &call, &SubmitMode::Update(5), "abc", None)
+            .unwrap();
+    assert_eq!(redirect.mode, SubmitMode::Update(5));
+    assert!(redirect.corpus.is_none() && redirect.footer.is_none());
+    let mut input = create_test_input(false, None);
+    assert!(!apply_footer_redirect(&dir, &options, &call, &mut input, &None).unwrap());
+}
+
+/* T1170 coverage: amend, staging, repository queries, hg/svn seams. */
+
+#[test]
+fn t1170_amend_after_create_unsupported_kind_noops() {
+    let dir = scratch_dir("t1170-amendnone");
+    // Pin mutability regardless of ambient user config.
+    std::fs::write(dir.join(".arcconfig"), "{\"history.immutable\": false}").unwrap();
+    let fetched = std::cell::Cell::new(0);
+    let call = |method: &str, _: &serde_json::Value| {
+        assert_eq!(method, diff_submit::METHOD_GET_COMMIT_MESSAGE);
+        fetched.set(fetched.get() + 1);
+        Ok(serde_json::json!("revised\n"))
+    };
+    for kind in [None, Some(VcsKind::Svn)] {
+        amend_after_create(
+            &dir,
+            &hg::HgCommand::default(),
+            &Options::default(),
+            &call,
+            7,
+            kind,
+        )
+        .unwrap();
+    }
+    // Hg with an unusable binary fails closed to unsupported.
+    let bogus_hg = hg::HgCommand::custom("definitely-not-hg-t1170", &[]);
+    amend_after_create(
+        &dir,
+        &bogus_hg,
+        &Options::default(),
+        &call,
+        7,
+        Some(VcsKind::Hg),
+    )
+    .unwrap();
+    // Every run fetches like PHP, then no-ops on the unsupported kind.
+    assert_eq!(fetched.get(), 3);
+}
+
+#[test]
+fn t1170_amend_worktree_message_git_empty_repo_errors() {
+    let dir = git_dir("t1170-amendempty");
+    let err = amend_worktree_message_git(&dir, "msg").unwrap_err();
+    assert!(err.starts_with("git amend failed:"), "{err}");
+}
+
+#[test]
+fn t1170_push_staging_refs_failed_push_errors() {
+    let dir = git_dir("t1170-pushfail");
+    std::fs::write(dir.join("f.txt"), "a\n").unwrap();
+    t1170_commit(&dir, "one");
+    let base = t1170_rev(&dir, "HEAD");
+    let recorded = std::cell::RefCell::new(Vec::new());
+    let record = |status: &str, refs: &[serde_json::Value]| {
+        recorded.borrow_mut().push(status.to_string());
+        assert!(refs.is_empty());
+        Ok(())
+    };
+    let bogus = dir.join("no-such-remote-t1170");
+    let err = push_staging_refs(
+        &dir,
+        &bogus.to_string_lossy(),
+        "phabricator",
+        7,
+        &base,
+        false,
+        &record,
+    )
+    .unwrap_err();
+    assert!(err.contains("--skip-staging"), "{err}");
+    assert!(recorded.borrow().is_empty());
+    // The ANSI notice path reports the same failure.
+    let err = push_staging_refs(
+        &dir,
+        &bogus.to_string_lossy(),
+        "phabricator",
+        7,
+        &base,
+        true,
+        &record,
+    )
+    .unwrap_err();
+    assert!(err.contains("--skip-staging"), "{err}");
+}
+
+#[test]
+fn t1170_push_staging_refs_lfs_pushes_forced_diff_tag() {
+    // A bare repo stands in for the staging area; `.gitattributes` marks
+    // the worktree LFS without needing the git-lfs binary.
+    let bare = scratch_dir("t1170-lfs-bare");
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&bare)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let dir = git_dir("t1170-lfs-push");
+    std::fs::write(dir.join(".gitattributes"), "*.bin filter=lfs\n").unwrap();
+    std::fs::write(dir.join("a.bin"), "lfs?\n").unwrap();
+    t1170_commit(&dir, "one");
+    assert!(git::is_git_lfs_working_copy(&dir));
+    let base = t1170_rev(&dir, "HEAD");
+    let recorded = std::cell::RefCell::new(Vec::new());
+    let record = |status: &str, refs: &[serde_json::Value]| {
+        recorded.borrow_mut().push(status.to_string());
+        assert_eq!(refs.len(), 2);
+        Ok(())
+    };
+    push_staging_refs(
+        &dir,
+        &bare.to_string_lossy(),
+        "phabricator",
+        7,
+        &base,
+        false,
+        &record,
+    )
+    .unwrap();
+    assert_eq!(
+        *recorded.borrow(),
+        vec![diff_submit::STAGING_PUSHED.to_string()]
+    );
+    let tags = std::process::Command::new("git")
+        .current_dir(&bare)
+        .args(["tag", "-l", "phabricator/diff/7"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&tags.stdout).trim(),
+        "phabricator/diff/7"
+    );
+}
+
+#[test]
+fn t1170_run_unique_repository_query_matrix() {
+    let query = serde_json::json!({"callsigns": ["X"]});
+    let old = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        Err("ERR-CONDUIT-CALL: gone".to_string())
+    };
+    assert_eq!(run_unique_repository_query(&old, &query).unwrap(), None);
+    let other = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        Err("boom".to_string())
+    };
+    assert_eq!(
+        run_unique_repository_query(&other, &query).unwrap_err(),
+        "boom"
+    );
+    for rows in [
+        serde_json::json!([]),
+        serde_json::json!([{"a": 1}, {"a": 2}]),
+    ] {
+        let call = |_: &str, _: &serde_json::Value| Ok(rows.clone());
+        assert_eq!(run_unique_repository_query(&call, &query).unwrap(), None);
+    }
+    let one = |_: &str, _: &serde_json::Value| Ok(serde_json::json!([{"id": 1}]));
+    assert_eq!(
+        run_unique_repository_query(&one, &query).unwrap(),
+        Some(serde_json::json!({"id": 1}))
+    );
+}
+
+#[test]
+fn t1170_vcs_repository_query_git_remote_and_missing_binaries() {
+    let dir = git_dir("t1170-vcsq");
+    assert_eq!(
+        vcs_repository_query(&dir, Some(VcsKind::Git)).unwrap(),
+        None
+    );
+    let added = std::process::Command::new("git")
+        .current_dir(&dir)
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://phab.test/diffusion/X.git",
+        ])
+        .status()
+        .unwrap();
+    assert!(added.success());
+    assert_eq!(
+        vcs_repository_query(&dir, Some(VcsKind::Git)).unwrap(),
+        Some(serde_json::json!({"remoteURIs": ["https://phab.test/diffusion/X.git"]}))
+    );
+    // Without a working copy the hg/svn lookups fail honestly.
+    let plain = scratch_dir("t1170-vcsq-plain");
+    assert!(vcs_repository_query(&plain, None).is_err());
+    assert!(vcs_repository_query(&plain, Some(VcsKind::Svn)).is_err());
+}
+
+#[cfg(not(windows))]
+fn t1170_fake_hg(dir: &Path) -> hg::HgCommand {
+    // Every invocation carries a `--encoding utf-8` prefix, so match the
+    // full argv (`$*`), never `$1`.
+    let sh = dir.join("fakehg.sh");
+    std::fs::write(
+        &sh,
+        "#!/bin/sh\n\
+         case \"$*\" in\n\
+         \"--encoding utf-8 branch\") echo default; exit 0;;\n\
+         *--style*) exit 0;;\n\
+         *-r\\ bogus*) exit 1;;\n\
+         *-r\\ *) echo deadbeefnode; exit 0;;\n\
+         *failme*) exit 1;;\n\
+         *emptyme*) exit 0;;\n\
+         *) echo cafenode; exit 0;;\n\
+         esac\n",
+    )
+    .unwrap();
+    t1170_make_executable(&sh);
+    hg::HgCommand::custom(&sh.to_string_lossy(), &[])
+}
+
+#[test]
+#[cfg(not(windows))]
+fn t1170_hg_rev_ancestor_resolve_via_fake() {
+    let dir = scratch_dir("t1170-fakehg");
+    let hg = t1170_fake_hg(&dir);
+    assert_eq!(
+        hg_rev_to_commit_with(&dir, &hg, "tip").as_deref(),
+        Some("deadbeefnode")
+    );
+    assert_eq!(hg_rev_to_commit_with(&dir, &hg, "bogus"), None);
+    assert_eq!(hg_ancestor_with(&dir, &hg, "tip", ".").unwrap(), "cafenode");
+    assert_eq!(
+        hg_ancestor_with(&dir, &hg, "failme", ".").unwrap_err(),
+        "Unable to find any hg commit named 'failme'."
+    );
+    assert_eq!(
+        hg_ancestor_with(&dir, &hg, "emptyme", ".").unwrap_err(),
+        "Unable to find any hg commit named 'emptyme'."
+    );
+}
+
+#[test]
+#[cfg(not(windows))]
+fn t1170_resolve_hg_base_auto_via_fake() {
+    let dir = scratch_dir("t1170-hgauto");
+    let hg = t1170_fake_hg(&dir);
+    // No base or commit: branch plus an empty outgoing log yields ".".
+    assert_eq!(
+        resolve_hg_base_with(&dir, &hg, &Options::default()).unwrap(),
+        "."
+    );
+    let options = Options {
+        base: Some("tip".to_string()),
+        ..Options::default()
+    };
+    assert_eq!(
+        resolve_hg_base_with(&dir, &hg, &options).unwrap(),
+        "deadbeefnode"
+    );
+    let options = Options {
+        base: Some("bogus".to_string()),
+        ..Options::default()
+    };
+    assert_eq!(
+        resolve_hg_base_with(&dir, &hg, &options).unwrap_err(),
+        "Unable to find any hg commit named 'bogus'."
+    );
+}
+
+#[test]
+fn t1170_submit_full_hg_base_rejects_head() {
+    let options = Options {
+        head: Some("tip".to_string()),
+        ..Options::default()
+    };
+    let err = submit_full_hg_base(
+        &scratch_dir("t1170-hghead"),
+        &hg::HgCommand::default(),
+        &options,
+    )
+    .unwrap_err();
+    assert!(err.contains("'--head' is not supported under hg"), "{err}");
+    // Positional paths become the base commit before hg resolution.
+    #[cfg(not(windows))]
+    {
+        let dir = scratch_dir("t1170-hgpaths");
+        let hg = t1170_fake_hg(&dir);
+        let options = Options {
+            paths: vec!["tip".to_string()],
+            ..Options::default()
+        };
+        assert_eq!(
+            submit_full_hg_base(&dir, &hg, &options).unwrap(),
+            "cafenode"
+        );
+    }
+}
+
+#[test]
+fn t1170_svn_or_hg_diff_text_outside_repo_errors() {
+    let err =
+        svn_or_hg_diff_text(&scratch_dir("t1170-nohvcs"), &Options::default(), "").unwrap_err();
+    assert_eq!(err, "not inside an hg or svn working copy");
+}
+
+#[test]
+#[cfg(not(windows))]
+fn t1170_svn_diff_failure_reports_stderr() {
+    let dir = scratch_dir("t1170-fakesvn");
+    std::fs::create_dir_all(dir.join(".svn")).unwrap();
+    let sh = dir.join("fakesvn.sh");
+    std::fs::write(
+        &sh,
+        "#!/bin/sh\necho \"$@\" > args.txt\necho 'cannot talk' >&2\nexit 1\n",
+    )
+    .unwrap();
+    t1170_make_executable(&sh);
+    let svn = svn::SvnCommand::custom(&sh.to_string_lossy(), &[]);
+    let options = Options {
+        paths: vec!["a.txt".to_string()],
+        ..Options::default()
+    };
+    let err =
+        svn_or_hg_diff_text_with(&dir, &hg::HgCommand::default(), &svn, &options, "").unwrap_err();
+    assert_eq!(err, "svn diff failed: cannot talk");
+    let argv = std::fs::read_to_string(dir.join("args.txt")).unwrap();
+    assert!(argv.contains("-- a.txt"), "{argv}");
+}
+
+#[test]
+#[cfg(not(windows))]
+fn t1170_full_submit_properties_hg_lists_local_commits() {
+    let dir = scratch_dir("t1170-hgprops");
+    let hg = t1170_hg_log_fake(&dir);
+    let props = full_submit_properties_with(&dir, &hg, Some(VcsKind::Hg), "base", None).unwrap();
+    assert_eq!(props.len(), 1);
+    assert_eq!(props[0].name, diff_submit::PROP_LOCAL_COMMITS);
+    assert!(props[0].data.contains("n1"), "{}", props[0].data);
+}
+
+/* T1170 coverage: inspect-full, prefill, editors, companions, message file. */
+
+#[test]
+fn t1170_inspect_full_json_base_and_fields() {
+    assert_eq!(
+        inspect_full_json_base(
+            &scratch_dir("t1170-ijson"),
+            &Options::default(),
+            VcsKind::Svn
+        )
+        .unwrap(),
+        (String::new(), None)
+    );
+    // Non-git kinds get empty fields even with field flags.
+    let options = Options {
+        reviewers: Some("alice".to_string()),
+        ..Options::default()
+    };
+    let mut doc = serde_json::json!({"base": "x"});
+    attach_inspect_full_fields(
+        &scratch_dir("t1170-ijson"),
+        &options,
+        VcsKind::Svn,
+        "",
+        None,
+        &mut doc,
+    )
+    .unwrap();
+    assert_eq!(doc["fields"], serde_json::json!({}));
+    // Git collects fields from the message file.
+    let dir = scratch_dir("t1170-ijson-git");
+    let file = dir.join("msg.txt");
+    std::fs::write(&file, "Hello title\n\nSummary: yes\n").unwrap();
+    let options = Options {
+        message_file: Some(file.to_string_lossy().into_owned()),
+        ..Options::default()
+    };
+    let mut doc = serde_json::json!({"base": "x"});
+    attach_inspect_full_fields(&dir, &options, VcsKind::Git, "", None, &mut doc).unwrap();
+    assert_eq!(doc["fields"]["title"], serde_json::json!("Hello title"));
+}
+
+#[test]
+fn t1170_inspect_full_text_git_and_entries_errors() {
+    let dir = t1170_three_commit_repo("t1170-itext");
+    std::fs::write(dir.join("a.txt"), "a\nchanged\n").unwrap();
+    let out = inspect_full_text_git(&dir, &Options::default()).unwrap();
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("a.txt") && text.contains("diff --git"),
+        "{text}"
+    );
+    // Non-git entry rendering without a working copy errors honestly.
+    let err = inspect_full_json_entries(
+        &scratch_dir("t1170-ientries"),
+        &Options::default(),
+        VcsKind::Svn,
+        "",
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(err, "not inside an hg or svn working copy");
+}
+
+#[test]
+fn t1170_collect_submit_changes_no_working_copy_errors() {
+    let mut reader = std::io::BufReader::new(std::io::empty());
+    let mut writer = Vec::new();
+    let mut io = diff_local::SvnPromptIo {
+        reader: &mut reader,
+        writer: &mut writer,
+        warned_externals: false,
+    };
+    let err = collect_submit_changes_with_io(
+        &scratch_dir("t1170-norepo"),
+        &hg::HgCommand::default(),
+        &svn::SvnCommand::default(),
+        &Options::default(),
+        "",
+        None,
+        &mut io,
+    )
+    .unwrap_err();
+    assert_eq!(err, "not inside a git, hg, or svn working copy");
+}
+
+#[test]
+fn t1170_git_update_prefill_usable_and_covered() {
+    let dir = t1170_three_commit_repo("t1170-prefill");
+    let base = t1170_rev(&dir, "HEAD~2");
+    // No active hashes: both range messages are usable.
+    let call = |method: &str, _: &serde_json::Value| {
+        if method == diff_submit::METHOD_REVISION_SEARCH {
+            return Err("ERR-CONDUIT-CALL".to_string());
+        }
+        assert_eq!(method, diff_submit::METHOD_QUERY_DIFFS);
+        Ok(serde_json::json!([{"properties": {"local:commits": []}}]))
+    };
+    let prefill = git_update_prefill(&dir, &call, 5, &base, None)
+        .unwrap()
+        .unwrap();
+    assert!(
+        prefill.contains("two") && prefill.contains("three"),
+        "{prefill}"
+    );
+    // Every hash attached: nothing usable.
+    let head = t1170_rev(&dir, "HEAD");
+    let prev = t1170_rev(&dir, "HEAD~1");
+    let call = |method: &str, _: &serde_json::Value| {
+        if method == diff_submit::METHOD_REVISION_SEARCH {
+            return Err("ERR-CONDUIT-CALL".to_string());
+        }
+        Ok(serde_json::json!([{"properties": {"local:commits": [
+            {"commit": head.as_str()},
+            {"commit": prev.as_str()},
+        ]}}]))
+    };
+    assert_eq!(
+        git_update_prefill(&dir, &call, 5, &base, None).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn t1170_default_update_prefill_git_and_none() {
+    let dir = t1170_three_commit_repo("t1170-dprefill");
+    // Svn and unknown kinds never prefill.
+    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        panic!("T1170: no conduit for svn/unknown kinds")
+    };
+    let options = Options::default();
+    assert_eq!(
+        default_update_prefill(
+            &dir,
+            &hg::HgCommand::default(),
+            &options,
+            Some(VcsKind::Svn),
+            &call,
+            5
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(
+        default_update_prefill(&dir, &hg::HgCommand::default(), &options, None, &call, 5).unwrap(),
+        None
+    );
+    // Git resolves the range and formats usable messages.
+    let base = t1170_rev(&dir, "HEAD~2");
+    let options = Options {
+        base: Some(base),
+        ..Options::default()
+    };
+    let qcall = |method: &str, _: &serde_json::Value| {
+        if method == diff_submit::METHOD_REVISION_SEARCH {
+            return Err("ERR-CONDUIT-CALL".to_string());
+        }
+        Ok(serde_json::json!([{"properties": {"local:commits": []}}]))
+    };
+    let prefill = default_update_prefill(
+        &dir,
+        &hg::HgCommand::default(),
+        &options,
+        Some(VcsKind::Git),
+        &qcall,
+        5,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(prefill.contains("three"), "{prefill}");
+}
+
+#[test]
+#[cfg(not(windows))]
+fn t1170_hg_update_prefill_via_fake() {
+    let dir = scratch_dir("t1170-hgprefill");
+    let sh = dir.join("fakehg.sh");
+    std::fs::write(
+        &sh,
+        "#!/bin/sh\n\
+         if [ \"$3\" = \"branch\" ]; then echo default; exit 0; fi\n\
+         printf 'aaa\\001first\\002bbb\\001second\\002'\nexit 0\n",
+    )
+    .unwrap();
+    t1170_make_executable(&sh);
+    let hg = hg::HgCommand::custom(&sh.to_string_lossy(), &[]);
+    let call = |method: &str, _: &serde_json::Value| {
+        if method == diff_submit::METHOD_REVISION_SEARCH {
+            return Err("ERR-CONDUIT-CALL".to_string());
+        }
+        Ok(serde_json::json!([{"properties": {"local:commits": []}}]))
+    };
+    let prefill = hg_update_prefill(&dir, &hg, &call, 5, "base")
+        .unwrap()
+        .unwrap();
+    assert!(
+        prefill.contains("first") && prefill.contains("second"),
+        "{prefill}"
+    );
+}
+
+#[test]
+fn t1170_create_local_commits_matrix() {
+    let hg = hg::HgCommand::default();
+    let dir = scratch_dir("t1170-clc");
+    assert!(
+        create_local_commits(&dir, &hg, Some(VcsKind::Svn), "x", None, None)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        create_local_commits(&dir, &hg, None, "x", None, None)
+            .unwrap()
+            .is_empty()
+    );
+    let git = t1170_three_commit_repo("t1170-clc-git");
+    let base = t1170_rev(&git, "HEAD~1");
+    let infos =
+        create_local_commits(&git, &hg, Some(VcsKind::Git), &base, Some("HEAD"), None).unwrap();
+    assert_eq!(infos.len(), 1);
+    assert!(infos[0].message.contains("three"), "{}", infos[0].message);
+    #[cfg(not(windows))]
+    {
+        let dir = scratch_dir("t1170-clc-hg");
+        let fake = t1170_hg_log_fake(&dir);
+        let infos =
+            create_local_commits(&dir, &fake, Some(VcsKind::Hg), "base", None, None).unwrap();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].commit, "n1");
+        assert!(
+            infos[0].message.contains("First line"),
+            "{}",
+            infos[0].message
+        );
+    }
+}
+
+#[test]
+fn t1170_bare_submit_mode_without_working_copy_creates() {
+    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        panic!("T1170: no conduit without a working copy")
+    };
+    let dir = scratch_dir("t1170-bare");
+    let hg = hg::HgCommand::default();
+    assert!(
+        load_working_copy_revisions(&call, &dir, &hg, None, "", None, "PHID-USER-1")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        resolve_bare_submit_mode(&call, &dir, &hg, None, "", None, "PHID-USER-1").unwrap(),
+        SubmitMode::Create
+    );
+}
+
+#[test]
+#[cfg(not(windows))]
+fn t1170_edit_interactively_failing_editor_errors() {
+    let err = edit_interactively("x\n", "msg", None, Some("false"), 3).unwrap_err();
+    assert_eq!(err, "Editor exited with an error code (#1).");
+}
+
+#[test]
+#[cfg(not(windows))]
+fn t1170_edit_interactively_deleted_file_errors() {
+    let err = edit_interactively("x\n", "msg", None, Some("rm"), 0).unwrap_err();
+    assert_eq!(err, "failed to read editor temporary file");
+}
+
+#[test]
+fn t1170_maybe_forgive_editor_exit_passthrough() {
+    assert_eq!(maybe_forgive_editor_exit("nano", 1), 1);
+    assert_eq!(maybe_forgive_editor_exit("nano", 0), 0);
+}
+
+#[test]
+fn t1170_fold_entry_companion_new_update_guards() {
+    let rename = "diff --git a/old.txt b/new.txt\nsimilarity index 90%\nrename from old.txt\nrename to new.txt\nindex 1111111..2222222 100644\n--- a/old.txt\n+++ b/new.txt\n@@ -1 +1 @@\n-a\n+b\n";
+    let parsed = diff_local::parse_unified_diff(rename).unwrap();
+    let full = diff_local::with_companions(&parsed);
+    assert!(!full.is_empty());
+    let entry = |change_type: u32, old: Option<&str>, current: &str| diff_local::ChangeEntry {
+        change_type,
+        file_type: diff_local::FILE_TEXT,
+        old_path: old.map(str::to_string),
+        away_paths: Vec::new(),
+        current: FileDiff {
+            path: current.to_string(),
+            added: 1,
+            deleted: 1,
+        },
+    };
+    let mut fold = diff_local::CompanionFold::new();
+    let mut slots: Vec<usize> = Vec::new();
+    let mut changes: Vec<diff_submit::DiffChange> = Vec::new();
+    // Guards leave everything untouched.
+    for guarded in [
+        entry(diff_local::TYPE_CHANGE, Some("old.txt"), "new.txt"),
+        entry(diff_local::TYPE_MOVE_HERE, None, "new.txt"),
+        entry(diff_local::TYPE_MOVE_HERE, Some(""), "new.txt"),
+        entry(diff_local::TYPE_MOVE_HERE, Some("same.txt"), "same.txt"),
+    ] {
+        fold_entry_companion(&mut fold, &mut slots, &mut changes, &guarded, &full);
+    }
+    assert!(changes.is_empty() && slots.is_empty());
+    // The first reference emits the companion for the old path.
+    fold_entry_companion(
+        &mut fold,
+        &mut slots,
+        &mut changes,
+        &entry(diff_local::TYPE_MOVE_HERE, Some("old.txt"), "new.txt"),
+        &full,
+    );
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].current_path, "old.txt");
+    assert_eq!(changes[0].away_paths, vec!["new.txt".to_string()]);
+    assert_eq!(changes[0].old_path, None);
+    // A second reference to the same old path updates it in place.
+    fold_entry_companion(
+        &mut fold,
+        &mut slots,
+        &mut changes,
+        &entry(diff_local::TYPE_COPY_HERE, Some("old.txt"), "new2.txt"),
+        &full,
+    );
+    assert_eq!(changes.len(), 1);
+    assert_eq!(
+        changes[0].away_paths,
+        vec!["new.txt".to_string(), "new2.txt".to_string()]
+    );
+}
+
+#[test]
+fn t1170_prepare_submit_create_with_message_file() {
+    let dir = t1170_three_commit_repo("t1170-prepmsg");
+    std::fs::write(dir.join("a.txt"), "a\nchanged\n").unwrap();
+    let file = dir.join("msg.txt");
+    std::fs::write(&file, "Filed title\n\nSummary: from file\n").unwrap();
+    let options = Options {
+        message_file: Some(file.to_string_lossy().into_owned()),
+        ..Options::default()
+    };
+    let input = prepare_submit(&dir, &options, &SubmitMode::Create).unwrap();
+    assert!(
+        input
+            .message_corpus
+            .as_deref()
+            .unwrap()
+            .contains("Filed title"),
+        "{:?}",
+        input.message_corpus
+    );
+    assert_eq!(input.fields["title"], serde_json::json!("Filed title"));
+}
+
+#[test]
+fn t1170_run_help_returns_success() {
+    assert_eq!(run(&args(&["--help"])), ExitCode::SUCCESS);
+    assert_eq!(run(&args(&["--bogus-flag-t1170"])), ExitCode::FAILURE);
+    // Read-only `--json` inspects and writes successfully in a checkout.
+    if is_inside_git_repo(Path::new(".")) {
+        assert_eq!(run(&args(&["--json"])), ExitCode::SUCCESS);
+    }
+}
+
+#[test]
+#[cfg(not(windows))]
+fn t1170_collect_hg_empty_diff_errors() {
+    let dir = scratch_dir("t1170-hgempty");
+    std::fs::create_dir_all(dir.join(".hg")).unwrap();
+    let sh = dir.join("fakehg.sh");
+    std::fs::write(&sh, "#!/bin/sh\nexit 0\n").unwrap();
+    t1170_make_executable(&sh);
+    let hg = hg::HgCommand::custom(&sh.to_string_lossy(), &[]);
+    let mut reader = std::io::BufReader::new(std::io::empty());
+    let mut writer = Vec::new();
+    let mut io = diff_local::SvnPromptIo {
+        reader: &mut reader,
+        writer: &mut writer,
+        warned_externals: false,
+    };
+    let err = collect_submit_changes_with_io(
+        &dir,
+        &hg,
+        &svn::SvnCommand::default(),
+        &Options::default(),
+        "base",
+        None,
+        &mut io,
+    )
+    .unwrap_err();
+    assert_eq!(err, diff_local::NO_CHANGES_FOUND);
+}
+
+#[cfg(not(windows))]
+fn t1170_hg_log_fake(dir: &Path) -> hg::HgCommand {
+    let sh = dir.join("fakehg.sh");
+    let record =
+        "n1\\0015\\001Jane <j@x>\\0011700000000 0\\001default\\001\\001\\001First line\\002";
+    std::fs::write(
+        &sh,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$3\" = \"branch\" ]; then echo default; exit 0; fi\n\
+             if [ \"$3\" = \"parents\" ]; then echo ppnode; exit 0; fi\n\
+             printf '{record}'\nexit 0\n"
+        ),
+    )
+    .unwrap();
+    t1170_make_executable(&sh);
+    hg::HgCommand::custom(&sh.to_string_lossy(), &[])
+}
+
+#[test]
+fn t1170_create_message_without_commits_uses_server_template() {
+    // DIFF-D8 with no local commits and no flags: no included block, so
+    // the server template feeds the edit cycle directly.
+    let root = scratch_dir("t1170-nocommits");
+    let meta = root.join(".git");
+    let call = |method: &str, _: &serde_json::Value| {
+        if method == diff_submit::METHOD_GET_COMMIT_MESSAGE {
+            return Ok(serde_json::json!("Server template\n"));
+        }
+        assert_eq!(method, diff_submit::METHOD_PARSE_COMMIT_MESSAGE);
+        Ok(serde_json::json!({"fields": {"title": "Fresh title"}}))
+    };
+    let captured = std::cell::RefCell::new(String::new());
+    let edit = |template: &str| -> Result<String, String> {
+        *captured.borrow_mut() = template.to_string();
+        Ok("Fresh title\n".to_string())
+    };
+    let mut reader = std::io::BufReader::new(std::io::empty());
+    let mut writer = Vec::new();
+    let mut context = CreateMessageContext {
+        reader: &mut reader,
+        writer: &mut writer,
+        call: &call,
+        metadata_dir: &meta,
+        work_root: &root,
+        edit: &edit,
+        amend_commit: None,
+        user_phid: "PHID-USER-1",
+    };
+    let message = create_message_from_user(&mut context, &defaults(), &[], Some("main")).unwrap();
+    assert_eq!(message.raw_corpus, "Fresh title\n");
+    let template = captured.borrow().clone();
+    assert!(template.contains("Server template"), "{template}");
+    assert!(!template.contains("Included changes"), "{template}");
+}
+
+#[test]
+fn t1170_create_submit_json_discards_report() {
+    let call = |method: &str, params: &serde_json::Value| {
+        if method == diff_submit::METHOD_CREATE_DIFF {
+            return Ok(serde_json::json!({"diffid": 3, "uri": "https://phab.test/diff/3/"}));
+        }
+        if method == diff_submit::METHOD_PARSE_COMMIT_MESSAGE {
+            return Ok(serde_json::json!({"fields": {"title": "T"}}));
+        }
+        if method == diff_submit::METHOD_CREATE_REVISION {
+            assert_eq!(params["diffid"], serde_json::json!(3));
+            return Ok(serde_json::json!({"revisionid": 9, "uri": "https://phab.test/D9"}));
+        }
+        Err(format!("unexpected {method}"))
+    };
+    let mut input = create_test_input(false, Some("T\n"));
+    input.json = true;
+    let report = submit_over_with_uri_ansi(&call, &input, false).unwrap();
+    assert_eq!(report.text, "");
+    assert_eq!(report.uri.as_deref(), Some("https://phab.test/D9"));
+    assert_eq!(report.revision_id, Some(9));
+}

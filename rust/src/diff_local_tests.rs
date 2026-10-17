@@ -4976,3 +4976,1460 @@ fn d8_saved_notice_zero_preview_omits_block() {
     let with_text = saved_message_notice("/tmp/x", "Hello");
     assert!(with_text.contains("Message begins:"), "{with_text}");
 }
+
+/* T1170 coverage: close the diff_local/hg miss manifests with behavior tests. */
+
+#[test]
+fn t1170_git_svn_id_requires_space_after_revision() {
+    // `(\d+)\s+(.*)`: digits glued to the UUID never match.
+    let message =
+        CommitMessage::new_from_raw_corpus("Title\ngit-svn-id: https://x@42UUID\n").unwrap();
+    assert_eq!(message.git_svn_base_revision, None);
+    assert_eq!(message.git_svn_uuid, None);
+    let message =
+        CommitMessage::new_from_raw_corpus("Title\ngit-svn-id: https://x@42 uuid\n").unwrap();
+    assert_eq!(
+        message.git_svn_base_revision.as_deref(),
+        Some("https://x@42")
+    );
+}
+
+#[test]
+fn t1170_tag_lines_with_padded_or_punctuated_names_stay_body() {
+    // Padded names and names with punctuation are not tags.
+    let fields = parse_field_tags("Title\n Summary : x\n");
+    assert_eq!(
+        fields.get(FIELD_SUMMARY),
+        Some(&FieldValue::Text("Summary : x".to_string()))
+    );
+    let fields = parse_field_tags("Title\nSum-mary: x\n");
+    assert_eq!(
+        fields.get(FIELD_SUMMARY),
+        Some(&FieldValue::Text("Sum-mary: x".to_string()))
+    );
+}
+
+/// True when the `git` binary runs (real-repo tests probe this first).
+fn t1170_git_available() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+/// Scratch git repo with one empty commit; removed on drop. `None` when
+/// `git` is unavailable (the caller skips).
+struct T1170GitRepo {
+    dir: std::path::PathBuf,
+}
+
+impl T1170GitRepo {
+    fn named(tag: &str) -> Option<Self> {
+        if !t1170_git_available() {
+            return None;
+        }
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "arc-rs-diff-t1170-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        run(&["init"]);
+        run(&[
+            "-c",
+            "user.email=t1170@example.test",
+            "-c",
+            "user.name=t1170",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+        Some(Self { dir })
+    }
+
+    fn run(&self, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&self.dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+    }
+
+    fn commit_file(&self, name: &str, body: &str, message: &str) {
+        std::fs::write(self.dir.join(name), body).unwrap();
+        self.run(&["add", "--", name]);
+        self.run(&[
+            "-c",
+            "user.email=t1170@example.test",
+            "-c",
+            "user.name=t1170",
+            "commit",
+            "-m",
+            message,
+        ]);
+    }
+}
+
+impl Drop for T1170GitRepo {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
+#[test]
+fn t1170_git_log_failures_report_stderr() {
+    let Some(repo) = T1170GitRepo::named("logfail") else {
+        return;
+    };
+    let err = get_local_commit_information(&repo.dir, "missing-base", "HEAD").unwrap_err();
+    assert!(err.contains("git log failed"), "{err}");
+    let err = get_git_update_messages(&repo.dir, "missing-base", "HEAD").unwrap_err();
+    assert!(err.contains("git log failed"), "{err}");
+    let err = get_git_parent_history(&repo.dir, "missing-base").unwrap_err();
+    assert!(err.contains("git log failed"), "{err}");
+    // The magic-root arm lists HEAD instead of a range.
+    let messages = get_git_update_messages(&repo.dir, GIT_MAGIC_ROOT_COMMIT, "HEAD").unwrap();
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].message.contains("init"));
+}
+
+#[test]
+fn t1170_symbolic_ref_unexpected_exit_fails() {
+    let Some(repo) = T1170GitRepo::named("symref") else {
+        return;
+    };
+    // Outside any repo `git symbolic-ref` exits 128: neither 0 nor 1.
+    let plain =
+        std::env::temp_dir().join(format!("arc-rs-diff-t1170-plain-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&plain);
+    std::fs::create_dir_all(&plain).unwrap();
+    let err = get_branch_name(&plain).unwrap_err();
+    assert!(err.contains("Command git symbolic-ref failed"), "{err}");
+    let _ = std::fs::remove_dir_all(&plain);
+    // Sanity: the scratch repo itself resolves its branch.
+    assert!(get_branch_name(&repo.dir).unwrap().is_some());
+}
+
+#[test]
+fn t1170_collect_change_entries_classifies_worktree_shapes() {
+    let Some(repo) = T1170GitRepo::named("classify") else {
+        return;
+    };
+    repo.commit_file("a.txt", "one\n", "add a");
+    let base = git::stdout_text(&repo.dir, &["rev-parse", "HEAD~1"]).unwrap();
+    // A path the range adds but the worktree lost reads as plain text.
+    std::fs::remove_file(repo.dir.join("a.txt")).unwrap();
+    let entries = collect_change_entries(&repo.dir, &base, Some("HEAD")).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].change_type, TYPE_ADD);
+    assert_eq!(entries[0].file_type, FILE_TEXT);
+    // A worktree directory in place of the file is not a symlink either.
+    std::fs::create_dir_all(repo.dir.join("a.txt")).unwrap();
+    let entries = collect_change_entries(&repo.dir, &base, Some("HEAD")).unwrap();
+    assert_eq!(entries[0].file_type, FILE_TEXT);
+    // Bad ranges report the diff stderr.
+    let err = collect_change_entries(&repo.dir, "missing-base", None).unwrap_err();
+    assert!(err.contains("git diff failed"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn t1170_collect_change_entries_spots_symlinks() {
+    let Some(repo) = T1170GitRepo::named("symlink") else {
+        return;
+    };
+    repo.commit_file("a.txt", "one\n", "add a");
+    std::fs::remove_file(repo.dir.join("a.txt")).unwrap();
+    std::os::unix::fs::symlink("target", repo.dir.join("a.txt")).unwrap();
+    let entries = collect_change_entries(&repo.dir, "HEAD", None).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].change_type, TYPE_CHANGE);
+    assert_eq!(entries[0].file_type, FILE_SYMLINK);
+}
+
+#[test]
+fn t1170_copy_status_maps_to_copy_here() {
+    let Some(repo) = T1170GitRepo::named("copydetect") else {
+        return;
+    };
+    let body: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+    repo.commit_file("a.txt", &body, "add a");
+    // `-C` reports a copy only from a modified source to a
+    // similar-but-different new file.
+    let mut changed = body.clone();
+    changed.push_str("extra\n");
+    std::fs::write(repo.dir.join("a.txt"), &changed).unwrap();
+    let copied = changed.replacen("line 1\n", "CHANGED\n", 1);
+    std::fs::write(repo.dir.join("b.txt"), &copied).unwrap();
+    repo.run(&["add", "--", "a.txt", "b.txt"]);
+    repo.run(&[
+        "-c",
+        "user.email=t1170@example.test",
+        "-c",
+        "user.name=t1170",
+        "commit",
+        "-m",
+        "modify a, copy to b",
+    ]);
+    let entries = collect_change_entries(&repo.dir, "HEAD~1", Some("HEAD")).unwrap();
+    let copied = entries
+        .iter()
+        .find(|entry| entry.current.path == "b.txt")
+        .unwrap();
+    assert_eq!(copied.change_type, TYPE_COPY_HERE);
+    assert_eq!(copied.old_path.as_deref(), Some("a.txt"));
+}
+
+#[test]
+fn t1170_working_copy_revisions_with_empty_log_returns_none() {
+    let Some(repo) = T1170GitRepo::named("emptylog") else {
+        return;
+    };
+    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        panic!("conduit must not run for an empty log");
+    };
+    let revisions =
+        load_working_copy_revisions_git(&call, &repo.dir, "HEAD", "HEAD", "PHID-U").unwrap();
+    assert!(revisions.is_empty());
+}
+
+#[test]
+fn t1170_raw_diff_bytes_failure_reports_stderr() {
+    let Some(repo) = T1170GitRepo::named("rawfail") else {
+        return;
+    };
+    let err = get_raw_diff_bytes(&repo.dir, "missing-base", "f.txt").unwrap_err();
+    assert!(err.contains("git diff failed"), "{err}");
+}
+
+/// Minimal canned `hg` backend (unix): `log` with `{rev}` serves the
+/// local-commit response, `parents` the parents response, anything else
+/// the message-log response. Removed on drop.
+#[cfg(unix)]
+struct T1170FakeHg {
+    dir: std::path::PathBuf,
+    hg: hg::HgCommand,
+}
+
+#[cfg(unix)]
+impl T1170FakeHg {
+    fn named(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "arc-rs-diff-t1170-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sh = dir.join("fakehg.sh");
+        std::fs::write(
+            &sh,
+            "#!/bin/sh\ncase \"$*\" in\n*\"{rev}\"*) cat .resp-local 2>/dev/null;;\n*parents*) cat .resp-parents 2>/dev/null;;\n*) cat .resp-log 2>/dev/null;;\nesac\nexit 0\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&sh).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&sh, perms).unwrap();
+        }
+        let hg = hg::HgCommand::custom(&sh.to_string_lossy(), &[]);
+        Self { dir, hg }
+    }
+
+    fn write(&self, name: &str, body: &[u8]) {
+        std::fs::write(self.dir.join(name), body).unwrap();
+    }
+}
+
+#[cfg(unix)]
+impl Drop for T1170FakeHg {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn t1170_hg_working_copy_revisions_by_footer_id() {
+    // Footer IDs query `differential.query` by id and skip the hash path.
+    let fake = T1170FakeHg::named("hgids");
+    fake.write(
+        ".resp-log",
+        "n1\x01fix it\n\nDifferential Revision: D7\n\x02".as_bytes(),
+    );
+    let call = |method: &str, params: &serde_json::Value| -> Result<serde_json::Value, String> {
+        assert_eq!(method, "differential.query");
+        assert_eq!(params["ids"], serde_json::json!([7]));
+        Ok(serde_json::json!([{"id": 7, "title": "Seven"}]))
+    };
+    let revisions =
+        load_working_copy_revisions_hg(&call, &fake.dir, &fake.hg, "base", "default", "PHID-U")
+            .unwrap();
+    assert_eq!(
+        revisions,
+        vec![WorkingCopyRevision {
+            id: 7,
+            title: "Seven".to_string(),
+        }]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn t1170_hg_working_copy_revisions_by_commit_hash() {
+    // Without footer IDs the local commits feed a commit-hash lookup;
+    // chained parents skip the lookup, unchained ones run it.
+    let fake = T1170FakeHg::named("hghash");
+    fake.write(".resp-log", "n1\x01no trailer here\x02".as_bytes());
+    fake.write(
+        ".resp-local",
+        "n1\x01r1\x01a\x010 0\x01b\x01\x01\x01first\x02n2\x01r2\x01a\x010 0\x01b\x01\x01\x01second\x02n3\x01r3\x01a\x010 0\x01b\x01\x01p9\x01third\x02"
+            .as_bytes(),
+    );
+    fake.write(".resp-parents", b"p9\n");
+    let call = |method: &str, params: &serde_json::Value| -> Result<serde_json::Value, String> {
+        assert_eq!(method, "differential.query");
+        assert_eq!(
+            params["commitHashes"],
+            serde_json::json!([["hgcm", "n3"], ["hgcm", "n2"], ["hgcm", "n1"]])
+        );
+        Ok(serde_json::json!([{"id": 9, "title": "Nine"}]))
+    };
+    let revisions =
+        load_working_copy_revisions_hg(&call, &fake.dir, &fake.hg, "base", "default", "PHID-U")
+            .unwrap();
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(revisions[0].id, 9);
+}
+
+#[cfg(unix)]
+#[test]
+fn t1170_hg_working_copy_revisions_empty_without_commits() {
+    // No footer IDs and no local commits: empty without querying.
+    let fake = T1170FakeHg::named("hgempty");
+    fake.write(".resp-log", "n1\x01no trailer here\x02".as_bytes());
+    fake.write(".resp-local", b"");
+    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        panic!("conduit must not run without commits");
+    };
+    let revisions =
+        load_working_copy_revisions_hg(&call, &fake.dir, &fake.hg, "base", "default", "PHID-U")
+            .unwrap();
+    assert!(revisions.is_empty());
+}
+
+#[test]
+fn t1170_svn_working_copy_revisions_match_checkout_path() {
+    // Only rows at this checkout path with usable ids survive.
+    let dir = std::env::temp_dir().join("arc-rs-diff-t1170-svnrev");
+    let here = dir.to_string_lossy().to_string();
+    let call = |method: &str, params: &serde_json::Value| -> Result<serde_json::Value, String> {
+        assert_eq!(method, "differential.query");
+        assert_eq!(params["status"], serde_json::json!("status-open"));
+        Ok(serde_json::json!([
+            {"id": 3, "title": "Here", "sourcePath": here},
+            {"id": "bogus", "title": "Bad", "sourcePath": here},
+            {"id": 4, "title": "Elsewhere", "sourcePath": "/other/checkout"},
+        ]))
+    };
+    let revisions = load_working_copy_revisions_svn(&call, &dir, "PHID-U").unwrap();
+    assert_eq!(
+        revisions,
+        vec![WorkingCopyRevision {
+            id: 3,
+            title: "Here".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn t1170_lint_in_process_rejects_unknown_engine_class() {
+    // A configured-but-unknown engine class aborts (not NoEngine).
+    let dir =
+        std::env::temp_dir().join(format!("arc-rs-diff-t1170-lintbad-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::write(dir.join(".arcconfig"), "{\"lint.engine\": \"BogusEngine\"}").unwrap();
+    let outcome = run_lint_in_process(&dir, &[]);
+    assert!(
+        matches!(&outcome, ChildOutcome::Failed(message) if message.contains("not a subclass")),
+        "{outcome:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn t1170_lint_in_process_usage_error_fails() {
+    // `--help` in child argv is a usage failure after engine discovery.
+    let dir =
+        std::env::temp_dir().join(format!("arc-rs-diff-t1170-linthelp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::write(
+        dir.join(".arcconfig"),
+        "{\"lint.engine\": \"ArcanistComprehensiveLintEngine\"}",
+    )
+    .unwrap();
+    let outcome = run_lint_in_process(&dir, &["--help".to_string()]);
+    assert!(
+        matches!(&outcome, ChildOutcome::Failed(message) if message.contains("--help")),
+        "{outcome:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn t1170_lint_in_process_empty_engine_has_no_effect() {
+    // An `.arclint` with no linters runs nothing: NoEffect.
+    let dir = std::env::temp_dir().join(format!(
+        "arc-rs-diff-t1170-lintempty-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::write(dir.join(".arclint"), "{\"linters\": {}}").unwrap();
+    assert_eq!(
+        run_lint_in_process(&dir, &[]),
+        ChildOutcome::NoEffect("No linters to run.".to_string())
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn t1170_lint_in_process_comprehensive_run_collects() {
+    let Some(repo) = T1170GitRepo::named("lintrun") else {
+        return;
+    };
+    std::fs::write(
+        repo.dir.join(".arcconfig"),
+        "{\"lint.engine\": \"ArcanistComprehensiveLintEngine\"}",
+    )
+    .unwrap();
+    std::fs::write(repo.dir.join("note.txt"), "hello\n").unwrap();
+    // Explicit paths skip worktree status; the single commit keeps base
+    // resolution prompt-free.
+    let outcome = run_lint_in_process(&repo.dir, &["note.txt".to_string()]);
+    assert!(
+        matches!(outcome, ChildOutcome::Code(_, _)),
+        "comprehensive run collects a report: {outcome:?}"
+    );
+}
+
+#[test]
+fn t1170_unit_in_process_usage_error_fails() {
+    // `.arcunit` passes the engine gate; `--help` then fails usage.
+    let dir =
+        std::env::temp_dir().join(format!("arc-rs-diff-t1170-unithelp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::write(dir.join(".arcunit"), "{\"engines\": []}").unwrap();
+    let outcome = run_unit_in_process(&dir, &["--help".to_string()]);
+    assert!(
+        matches!(&outcome, ChildOutcome::Failed(message) if message.contains("--help")),
+        "{outcome:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Writer that always fails, for prompt/output error paths.
+struct T1170FailWriter;
+
+impl std::io::Write for T1170FailWriter {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("t1170 no writes"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::other("t1170 no writes"))
+    }
+}
+
+#[test]
+fn t1170_run_unit_maps_no_effect_failed_and_skip_codes() {
+    use std::io::Cursor;
+    let dir = std::env::temp_dir();
+    let run = |outcome: ChildOutcome| move |_: &Path, _: &[String]| outcome.clone();
+    // NoEffect prints the message and yields no result.
+    let mut out = Vec::new();
+    assert_eq!(
+        run_unit(
+            &dir,
+            None,
+            &[],
+            false,
+            &run(ChildOutcome::NoEffect("nothing to run".to_string())),
+            &mut Cursor::new(b"".to_vec()),
+            &mut out,
+        )
+        .unwrap(),
+        (None, Vec::new())
+    );
+    assert_eq!(out, b"Running unit tests...\nnothing to run\n");
+    // Child failures abort after the start notice.
+    let mut out = Vec::new();
+    assert_eq!(
+        run_unit(
+            &dir,
+            None,
+            &[],
+            false,
+            &run(ChildOutcome::Failed("boom".to_string())),
+            &mut Cursor::new(b"".to_vec()),
+            &mut out,
+        )
+        .unwrap_err(),
+        "boom"
+    );
+    assert_eq!(out, b"Running unit tests...\n");
+    // A SKIP code from the child prints no banner.
+    let mut out = Vec::new();
+    assert_eq!(
+        run_unit(
+            &dir,
+            None,
+            &[],
+            false,
+            &run(ChildOutcome::Code(3, Vec::new())),
+            &mut Cursor::new(b"".to_vec()),
+            &mut out,
+        )
+        .unwrap(),
+        (Some(3), Vec::new())
+    );
+    assert_eq!(out, b"Running unit tests...\n");
+    // Output failures name the failing write.
+    let err = run_unit(
+        &dir,
+        None,
+        &[],
+        false,
+        &run(ChildOutcome::Code(0, Vec::new())),
+        &mut Cursor::new(b"".to_vec()),
+        &mut T1170FailWriter,
+    )
+    .unwrap_err();
+    assert!(err.contains("failed to write output"), "{err}");
+}
+
+#[test]
+fn t1170_run_lint_unit_reports_unit_failure() {
+    use std::io::Cursor;
+    let dir = std::env::temp_dir();
+    let ok = |_: &Path, _: &[String]| ChildOutcome::Code(0, Vec::new());
+    let fail = |_: &Path, _: &[String]| ChildOutcome::Failed("unit boom".to_string());
+    let mut out = Vec::new();
+    assert_eq!(
+        run_lint_unit(
+            &dir,
+            None,
+            &[],
+            &[],
+            false,
+            false,
+            &ok,
+            &fail,
+            &mut Cursor::new(b"".to_vec()),
+            &mut out,
+        )
+        .unwrap_err(),
+        "unit boom"
+    );
+}
+
+#[test]
+fn t1170_trailing_commit_message_survives_at_end() {
+    // A `commit` block with no following diff still emits its message.
+    let changes = parse_unified_diff("commit abc123\nsubject here\n").unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].change_type, TYPE_MESSAGE);
+    assert_eq!(changes[0].commit_hash.as_deref(), Some("abc123"));
+    assert!(
+        changes[0]
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("subject here")
+    );
+}
+
+#[test]
+fn t1170_combined_diff_recovery_skips_blank_and_noise_lines() {
+    // Leading blanks/comments do not count as content, and near-miss
+    // `diff` lines do not count as starts: recovery still finds the
+    // real block.
+    let text = "\n# note\ndiff --cc f\ndiffx -r f\ndiff -x f\ndiff --git a/g b/g\n--- a/g\n+++ b/g\n@@ -1 +1 @@\n-a\n+b\n";
+    let changes = parse_unified_diff(text).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].current_path, "g");
+}
+
+#[test]
+fn t1170_hunk_stats_end_conditions() {
+    // A `-` past exhausted old lines ends the hunk.
+    assert_eq!(hunk_stats("-gone\n", 0, 1), (0, 0, false, false));
+    // A context line past exhausted counts ends the hunk.
+    assert_eq!(hunk_stats(" ctx\n", 0, 0), (0, 0, false, false));
+    // Anything else ends the hunk too.
+    assert_eq!(hunk_stats("!x\n", 1, 1), (0, 0, false, false));
+    // Sanity: ordinary lines still count.
+    assert_eq!(hunk_stats("+a\n-b\n c\n", 2, 2), (1, 1, false, false));
+}
+
+/// Bare parsed change for predicate tests.
+fn t1170_parsed_change(change_type: u32, hunks: Vec<ParsedHunk>) -> ParsedChange {
+    ParsedChange {
+        old_path: String::new(),
+        current_path: "f".to_string(),
+        change_type,
+        file_type: FILE_TEXT,
+        hunks,
+        hunk_len_explicit: Vec::new(),
+        old_mode: None,
+        new_mode: None,
+        away_paths: Vec::new(),
+        commit_hash: None,
+        message: None,
+    }
+}
+
+#[test]
+fn t1170_needs_synthetic_matches_hunkless_moves_and_copies() {
+    for change_type in [
+        TYPE_MOVE_HERE,
+        TYPE_COPY_HERE,
+        TYPE_MOVE_AWAY,
+        TYPE_MULTICOPY,
+    ] {
+        assert!(
+            needs_synthetic_git_hunks(&t1170_parsed_change(change_type, Vec::new())),
+            "{change_type}"
+        );
+    }
+    assert!(!needs_synthetic_git_hunks(&t1170_parsed_change(
+        TYPE_CHANGE,
+        Vec::new()
+    )));
+    // Hunks of any kind disqualify, even on a move.
+    let hunk = ParsedHunk {
+        old_start: 1,
+        old_len: 1,
+        new_start: 1,
+        new_len: 1,
+        corpus: " x\n".to_string(),
+        synthetic_counts: None,
+    };
+    assert!(!needs_synthetic_git_hunks(&t1170_parsed_change(
+        TYPE_MOVE_HERE,
+        vec![hunk]
+    )));
+}
+
+#[test]
+fn t1170_synthetic_transport_matches_plain_for_ascii() {
+    // Marker-free ASCII is transport-identical, so both entry points agree.
+    let raw = "diff --git a/n.txt b/n.txt\nnew file mode 100644\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1,2 @@\n+one\n+two\n";
+    let plain = synthetic_hunks_for_path(raw, "n.txt").unwrap().unwrap();
+    let transported = synthetic_hunks_for_path_transport(raw, "n.txt")
+        .unwrap()
+        .unwrap();
+    assert_eq!(transported, plain);
+    assert_eq!(transported.hunks[0].corpus, " one\n two\n");
+    assert!(
+        synthetic_hunks_for_path_transport(raw, "elsewhere")
+            .unwrap()
+            .is_none()
+    );
+
+    let text =
+        "diff --git a/o.txt b/n.txt\nsimilarity index 100%\nrename from o.txt\nrename to n.txt\n";
+    let mut full = with_companions(&parse_unified_diff(text).unwrap());
+    let raw_for = |path: &str| -> Result<String, String> {
+        if path == "n.txt" {
+            Ok(raw.to_string())
+        } else {
+            Ok("diff --git a/o.txt b/o.txt\ndeleted file mode 100644\n--- a/o.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-one\n-two\n".to_string())
+        }
+    };
+    attach_synthetic_git_hunks_transport(&mut full, &raw_for).unwrap();
+    assert_eq!(full[0].hunks[0].corpus, " one\n two\n");
+    assert_eq!(full[1].hunks[0].corpus, "-one\n-two\n");
+}
+
+#[test]
+fn t1170_copy_onto_move_folds_multicopy() {
+    // A copy folding onto a move-away companion escalates to multicopy.
+    let mut fold = CompanionFold::new();
+    let (slot, is_new) = fold.fold(TYPE_MOVE_HERE, "o.txt", "a.txt");
+    assert!(is_new);
+    assert_eq!(fold.companion(slot).change_type, TYPE_MOVE_AWAY);
+    let (slot, is_new) = fold.fold(TYPE_COPY_HERE, "o.txt", "b.txt");
+    assert!(!is_new);
+    let companion = fold.companion(slot);
+    assert_eq!(companion.change_type, TYPE_MULTICOPY);
+    assert_eq!(
+        companion.away_paths,
+        vec!["a.txt".to_string(), "b.txt".to_string()]
+    );
+}
+
+#[test]
+fn t1170_blank_commit_message_dropped_before_next_block() {
+    // A blank `commit` body between file blocks flushes to nothing.
+    let first = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n";
+    let second = "diff --git a/g b/g\n--- a/g\n+++ b/g\n@@ -1 +1 @@\n-a\n+b\n";
+    let text = format!("{first}commit abc\n\n{second}");
+    let changes = parse_unified_diff(&text).unwrap();
+    assert_eq!(changes.len(), 2);
+    assert!(changes.iter().all(|change| !change.is_message()));
+}
+
+#[test]
+fn t1170_digitless_mode_lines_match_nothing() {
+    // `new file mode` without digits is ignored like PHP's `\d+`.
+    let changes = parse_unified_diff(
+        "diff --git a/f b/f\nnew file mode abc\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n",
+    )
+    .unwrap();
+    assert_eq!(changes[0].change_type, TYPE_CHANGE);
+    assert_eq!(changes[0].new_mode, None);
+}
+
+#[test]
+fn t1170_svn_binary_block_skips_blank_lines() {
+    // Blank lines between the marker and the mime line are consumed.
+    let changes = parse_unified_diff(
+        "Index: f.bin\n--- f.bin (revision 1)\n+++ f.bin (working copy)\nCannot display: file marked as a binary type.\n\n\nsvn:mime-type: application/octet-stream\n",
+    )
+    .unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].file_type, FILE_BINARY);
+    assert!(changes[0].hunks.is_empty());
+}
+
+#[test]
+fn t1170_duplicate_blocks_run_both_mode_arms() {
+    // An incoming block with both modes reads as delete-then-new.
+    let delete =
+        "diff --git a/f b/f\ndeleted file mode 100644\n--- a/f\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\n";
+    let both = "diff --git a/f b/f\ndeleted file mode 100644\nnew file mode 100755\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n";
+    let changes = parse_unified_diff(&format!("{delete}{both}")).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].change_type, TYPE_CHANGE);
+    // An incoming `new file mode` over a plain change lands an add.
+    let change = "diff --git a/g b/g\n--- a/g\n+++ b/g\n@@ -1 +1 @@\n-a\n+b\n";
+    let added =
+        "diff --git a/g b/g\nnew file mode 100644\n--- /dev/null\n+++ b/g\n@@ -0,0 +1 @@\n+b\n";
+    let changes = parse_unified_diff(&format!("{change}{added}")).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].change_type, TYPE_ADD);
+}
+
+#[test]
+fn t1170_duplicate_keyed_rename_retypes_and_repaths() {
+    // A keyed block carrying rename lines retypes the merged change.
+    let first = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n";
+    let renamed =
+        "diff --git a/f b/f\nrename from x\nrename to y\n--- a/x\n+++ b/y\n@@ -1 +1 @@\n-a\n+b\n";
+    let changes = parse_unified_diff(&format!("{first}{renamed}")).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].change_type, TYPE_MOVE_HERE);
+    assert_eq!(changes[0].current_path, "y");
+}
+
+#[test]
+fn t1170_duplicate_binary_block_sticks() {
+    // A later binary block flips the merged change binary (sticky).
+    let first = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n";
+    let binary = "diff --git a/f b/f\nBinary files a/f and b/f differ\n";
+    let changes = parse_unified_diff(&format!("{first}{binary}")).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].file_type, FILE_BINARY);
+    assert!(changes[0].hunks.is_empty());
+}
+
+#[test]
+fn t1170_c_quoted_hex_and_control_escapes_decode() {
+    // `\x41` decodes hex (one or two digits); a bare `\x` keeps the `x`.
+    assert_eq!(stripcslashes("f\\x41", false), "fA");
+    assert_eq!(stripcslashes("f\\x4", false), "f\x04");
+    assert_eq!(stripcslashes("f\\xg", false), "fxg");
+    assert_eq!(stripcslashes("f\\x41", true), "fA");
+    // Single-letter controls decode to their bytes.
+    assert_eq!(stripcslashes("x\\ry", false), "x\ry");
+    assert_eq!(stripcslashes("x\\vy", false), "x\x0By");
+    assert_eq!(stripcslashes("x\\fy", false), "x\x0Cy");
+    assert_eq!(stripcslashes("x\\ay", false), "x\x07y");
+    assert_eq!(stripcslashes("x\\by", false), "x\x08y");
+    // Quoting escapes keep the escaped char.
+    assert_eq!(stripcslashes("x\\\\y", false), "x\\y");
+    assert_eq!(stripcslashes("x\\\"y", false), "x\"y");
+    assert_eq!(stripcslashes("x\\'y", false), "x'y");
+    assert_eq!(stripcslashes("x\\?y", false), "x?y");
+    // End to end: the common filename decodes through the header.
+    assert_eq!(
+        extract_git_common_filename("\"a/f\\x41\" \"b/f\\x41\"", false).as_deref(),
+        Some("fA")
+    );
+}
+
+#[test]
+fn t1170_unterminated_quote_falls_back_to_hunk_paths() {
+    // An unterminated quoted header recovers paths from `---`/`+++`.
+    let changes =
+        parse_unified_diff("diff --git \"a/f b/g\n--- a/f\n+++ b/g\n@@ -1 +1 @@\n-a\n+b\n")
+            .unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].old_path, "f");
+    assert_eq!(changes[0].current_path, "g");
+}
+
+#[test]
+fn t1170_paren_suffix_without_open_paren_is_kept() {
+    // An `Index:` path ending in `)` without `(` stays literal.
+    let changes = parse_unified_diff("Index: f\n--- f)\n+++ f\n@@ -1 +1 @@\n-a\n+b\n").unwrap();
+    assert_eq!(changes[0].old_path, "f)");
+}
+
+#[test]
+fn t1170_hg_revision_suffix_strips_in_plain_block() {
+    // Non-`Index:` blocks strip ` (revision N)` and ` (working copy)`.
+    let changes =
+        parse_unified_diff("diff -r abc f\n--- f (revision 3)\n+++ f\n@@ -1 +1 @@\n-a\n+b\n")
+            .unwrap();
+    assert_eq!(changes[0].old_path, "f");
+    let changes =
+        parse_unified_diff("diff -r abc f\n--- f\n+++ f (working copy)\n@@ -1 +1 @@\n-a\n+b\n")
+            .unwrap();
+    assert_eq!(changes[0].current_path, "f");
+}
+
+#[test]
+fn t1170_extra_hunk_range_comma_fails() {
+    // A third range element rejects the header like PHP's anchored regex.
+    let err = parse_unified_diff("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,2,3 +1 @@\n-a\n+b\n")
+        .unwrap_err();
+    assert!(err.contains("Expected hunk header"), "{err}");
+}
+
+#[test]
+fn t1170_foreign_hunk_line_ends_with_short_counts() {
+    // A line with an unexpected first byte ends the hunk, failing counts.
+    let err =
+        parse_unified_diff("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n!x\n").unwrap_err();
+    assert!(err.contains("wrong number of hunk lines"), "{err}");
+}
+
+/// Backend whose every invocation fails with canned stderr (hg and svn
+/// share the `SvnCommand`/`HgCommand` program+prefix shape, so one
+/// script serves both). Removed on drop.
+struct T1170FailBackend {
+    dir: std::path::PathBuf,
+}
+
+impl T1170FailBackend {
+    fn failing(tag: &str, stderr_line: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "arc-rs-diff-t1170-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(windows)]
+        {
+            let bat = dir.join("fail.bat");
+            std::fs::write(
+                &bat,
+                format!("@echo off\r\necho {stderr_line}>&2\r\nexit /b 1\r\n"),
+            )
+            .unwrap();
+        }
+        #[cfg(not(windows))]
+        {
+            let sh = dir.join("fail.sh");
+            std::fs::write(
+                &sh,
+                format!("#!/bin/sh\necho \"{stderr_line}\" >&2\nexit 1\n"),
+            )
+            .unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&sh).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&sh, perms).unwrap();
+            }
+        }
+        Self { dir }
+    }
+
+    fn hg(&self) -> hg::HgCommand {
+        #[cfg(windows)]
+        {
+            let bat = self.dir.join("fail.bat");
+            hg::HgCommand::custom("cmd", &["/C", &bat.to_string_lossy()])
+        }
+        #[cfg(not(windows))]
+        {
+            let sh = self.dir.join("fail.sh");
+            hg::HgCommand::custom(&sh.to_string_lossy(), &[])
+        }
+    }
+
+    fn svn(&self) -> svn::SvnCommand {
+        #[cfg(windows)]
+        {
+            let bat = self.dir.join("fail.bat");
+            svn::SvnCommand::custom("cmd", &["/C", &bat.to_string_lossy()])
+        }
+        #[cfg(not(windows))]
+        {
+            let sh = self.dir.join("fail.sh");
+            svn::SvnCommand::custom(&sh.to_string_lossy(), &[])
+        }
+    }
+}
+
+impl Drop for T1170FailBackend {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
+#[test]
+fn t1170_hg_diff_failure_reports_stderr() {
+    let fake = T1170FailBackend::failing("hgdiff", "abort: no repo");
+    let err = get_full_hg_diff_with(&fake.dir, &fake.hg(), "base", 3).unwrap_err();
+    assert!(err.contains("hg diff failed: abort: no repo"), "{err}");
+}
+
+#[test]
+fn t1170_svn_info_failure_names_exit_code() {
+    let fake = T1170FailBackend::failing("svninfo", "oops");
+    let err = get_svn_info_with(&fake.dir, &fake.svn(), "f.txt").unwrap_err();
+    assert_eq!(err, "Error #1 executing svn info against 'f.txt'.");
+}
+
+#[test]
+fn t1170_svn_file_list_resolves_absolute_and_dot_paths() {
+    // Absolute CLI paths match absolutely.
+    let list = SvnFileList::new(
+        std::path::Path::new("/repo"),
+        &["/repo/sub/f.txt".to_string()],
+    );
+    assert!(list.contains(std::path::Path::new("/repo"), "sub/f.txt"));
+    assert!(!list.contains(std::path::Path::new("/repo"), "other.txt"));
+    // `.` segments collapse lexically (against a real dir so the
+    // trailing-slash directory rule applies).
+    let root =
+        std::env::temp_dir().join(format!("arc-rs-diff-t1170-filelist-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    let list = SvnFileList::new(&root, &["./sub".to_string()]);
+    assert!(list.contains(&root, "sub/f.txt"));
+    assert!(!list.contains(&root, "other/f.txt"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn t1170_collect_svn_path_data_skips_unusable_paths() {
+    // Untracked, conflicted, and missing paths never reach the backend,
+    // so even a bogus backend succeeds.
+    let mut status = svn::StatusMap::new();
+    status.insert("u.txt".to_string(), svn::FLAG_UNTRACKED);
+    status.insert("c.txt".to_string(), svn::FLAG_CONFLICT);
+    status.insert("m.txt".to_string(), svn::FLAG_MISSING);
+    let config = svn::SvnDiffConfig::windows(3);
+    let data = collect_svn_path_data_with(
+        std::path::Path::new("definitely-not-an-svn-dir-t1170"),
+        &svn::SvnCommand::custom("definitely-not-a-real-svn-binary-t1170", &[]),
+        &status,
+        &config,
+    )
+    .unwrap();
+    assert!(data.is_empty());
+}
+
+#[test]
+fn t1170_merge_svn_path_diffs_appends_unknown_paths() {
+    // A parsed block for a path with no skeleton appends as-is.
+    let data = vec![gap2_path_data(
+        "a.txt",
+        svn::FLAG_MODIFIED,
+        &[("Node Kind", "file")],
+        Some(
+            "Index: other.txt\n--- other.txt (revision 1)\n+++ other.txt (working copy)\n@@ -1 +1 @@\n-a\n+b\n",
+        ),
+    )];
+    let changes = merge_svn_path_diffs(std::path::Path::new("/repo"), &data, None).unwrap();
+    assert_eq!(changes.len(), 2);
+    assert_eq!(changes[0].current_path, "a.txt");
+    assert_eq!(changes[1].current_path, "other.txt");
+    assert_eq!(changes[1].hunks.len(), 1);
+}
+
+#[test]
+fn t1170_merge_svn_path_diffs_skips_empty_diff_bytes() {
+    // Present-but-empty diff bytes keep the bare skeleton.
+    let data = vec![gap2_path_data(
+        "a.txt",
+        svn::FLAG_MODIFIED,
+        &[("Node Kind", "file")],
+        Some(""),
+    )];
+    let changes = merge_svn_path_diffs(std::path::Path::new("/repo"), &data, None).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].current_path, "a.txt");
+    assert!(changes[0].hunks.is_empty());
+}
+
+#[test]
+fn t1170_svn_copy_old_path_compares_numeric_revs() {
+    // Numeric revisions compare numerically (`09` equals `9`).
+    assert_eq!(
+        svn_copy_old_path("https://r/trunk/f", "9", "10", "https://r"),
+        Some("trunk/f@9".to_string())
+    );
+    assert_eq!(
+        svn_copy_old_path("https://r/f", "09", "9", "https://r"),
+        Some("f".to_string())
+    );
+    assert_eq!(
+        svn_copy_old_path("https://r/f", "9", "9", "https://r"),
+        Some("f".to_string())
+    );
+    // Non-numeric revisions compare as strings.
+    assert_eq!(
+        svn_copy_old_path("https://r/f", "HEAD", "10", "https://r"),
+        Some("f@HEAD".to_string())
+    );
+}
+
+#[test]
+fn t1170_apply_svn_copy_info_transitions_origins() {
+    // An ADD origin stays an add; the copy lands copy-here.
+    let mut changes = vec![
+        t1170_parsed_change(TYPE_ADD, Vec::new()),
+        t1170_parsed_change(TYPE_CHANGE, Vec::new()),
+    ];
+    changes[0].current_path = "src".to_string();
+    changes[1].current_path = "dst".to_string();
+    let data = vec![
+        gap2_path_data(
+            "dst",
+            svn::FLAG_ADDED,
+            &[
+                ("Copied From URL", "https://r/src"),
+                ("Copied From Rev", ""),
+                ("Revision", "1"),
+            ],
+            None,
+        ),
+        // A copied path with no change entry is skipped, not created.
+        gap2_path_data(
+            "ghost",
+            svn::FLAG_ADDED,
+            &[
+                ("Copied From URL", "https://r/src"),
+                ("Copied From Rev", ""),
+                ("Revision", "1"),
+            ],
+            None,
+        ),
+    ];
+    apply_svn_copy_info(&mut changes, &data, Some("https://r")).unwrap();
+    assert_eq!(changes[0].change_type, TYPE_ADD);
+    assert_eq!(changes[0].away_paths, vec!["dst".to_string()]);
+    assert_eq!(changes[1].change_type, TYPE_COPY_HERE);
+    assert_eq!(changes[1].old_path, "src");
+    assert_eq!(changes.len(), 2);
+
+    // A MOVE_AWAY origin escalates to multicopy; the move lands move-here.
+    let mut changes = vec![
+        t1170_parsed_change(TYPE_MOVE_AWAY, Vec::new()),
+        t1170_parsed_change(TYPE_CHANGE, Vec::new()),
+    ];
+    changes[0].current_path = "src".to_string();
+    changes[1].current_path = "dst".to_string();
+    apply_svn_copy_info(&mut changes, &data[..1], Some("https://r")).unwrap();
+    assert_eq!(changes[0].change_type, TYPE_MULTICOPY);
+    assert_eq!(changes[1].change_type, TYPE_MOVE_HERE);
+}
+
+/// Canned `svn` backend (unix) for the gigantic-diff throw: `status`
+/// serves XML, `info` serves fields, `diff` serves the big text.
+#[cfg(unix)]
+struct T1170FakeSvn {
+    dir: std::path::PathBuf,
+    svn: svn::SvnCommand,
+}
+
+#[cfg(unix)]
+impl T1170FakeSvn {
+    fn named(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "arc-rs-diff-t1170-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".svn")).unwrap();
+        let sh = dir.join("fakesvn.sh");
+        std::fs::write(
+            &sh,
+            "#!/bin/sh\ncase \"$*\" in\n*status*) cat .resp-status;;\n*info*) cat .resp-info;;\n*) cat .resp-diff;;\nesac\nexit 0\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&sh).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&sh, perms).unwrap();
+        }
+        let svn = svn::SvnCommand::custom(&sh.to_string_lossy(), &[]);
+        Self { dir, svn }
+    }
+
+    fn write(&self, name: &str, body: &[u8]) {
+        std::fs::write(self.dir.join(name), body).unwrap();
+    }
+}
+
+#[cfg(unix)]
+impl Drop for T1170FakeSvn {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn t1170_collect_svn_changes_throws_on_gigantic_corpus() {
+    use std::io::Cursor;
+    // One modified file whose parsed corpus exceeds 4 MiB aborts the fan-out.
+    let fake = T1170FakeSvn::named("svngigantic");
+    fake.write(
+        ".resp-status",
+        b"<?xml version=\"1.0\"?>\n<status>\n<target path=\".\">\n<entry path=\"big.txt\">\n<wc-status props=\"none\" item=\"modified\" revision=\"42\">\n</wc-status>\n</entry>\n</target>\n</status>\n",
+    );
+    fake.write(
+        ".resp-info",
+        b"Path: big.txt\nURL: https://x.example/r/big.txt\nRevision: 42\nNode Kind: file\n",
+    );
+    let lines = 100_000usize;
+    let mut diff = format!(
+        "Index: big.txt\n--- big.txt (revision 42)\n+++ big.txt (working copy)\n@@ -1,{lines} +1,{lines} @@\n"
+    );
+    for _ in 0..lines {
+        diff.push_str(" xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n");
+    }
+    assert!(diff.len() > GIGANTIC_DIFF_LIMIT_BYTES);
+    fake.write(".resp-diff", diff.as_bytes());
+    let config = svn::SvnDiffConfig::windows(3);
+    let mut io = SvnPromptIo {
+        reader: &mut Cursor::new(b"".to_vec()),
+        writer: &mut Vec::new(),
+        warned_externals: false,
+    };
+    let err = collect_svn_parsed_changes_with_io(&fake.dir, &fake.svn, &[], &config, &mut io)
+        .unwrap_err();
+    assert!(err.contains("Diff for 'big.txt' with context is"), "{err}");
+}
+
+#[test]
+fn t1170_reviewer_availability_skips_unknown_and_present_reviewers() {
+    // `user.query` maps select in reviewer order; missing entries are
+    // skipped, and reviewers who are not away validate silently.
+    use std::io::Cursor;
+    let mut message = CommitMessage::new_from_raw_corpus("Title\n").unwrap();
+    message.set_field_value(
+        "reviewerPHIDs",
+        FieldValue::List(vec!["PHID-A".to_string(), "PHID-B".to_string()]),
+    );
+    let call = |method: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        assert_eq!(method, "user.query");
+        Ok(serde_json::json!({"PHID-A": {
+            "userName": "a",
+            "realName": "A",
+            "currentStatus": "active",
+        }}))
+    };
+    let mut out = Vec::new();
+    validate_commit_message(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &call,
+        &message,
+        "PHID-USER-me",
+        0,
+    )
+    .unwrap();
+    assert!(out.is_empty(), "no away block, no prompt");
+}
+
+#[test]
+fn t1170_edit_create_transport_error_echoes_saved_copy() {
+    // A Conduit transport failure aborts after echoing the saved-copy note.
+    use std::io::Cursor;
+    let root = gap2_d1_scratch("t1170-transport");
+    let meta = root.join(".git");
+    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        Err("conduit down".to_string())
+    };
+    let edit = |template: &str| -> Result<String, String> { Ok(format!("{template}edited\n")) };
+    let mut input = Cursor::new(b"".to_vec());
+    let mut out = Vec::new();
+    let mut editor = CreateMessageEditor {
+        reader: &mut input,
+        writer: &mut out,
+        call: &call,
+        metadata_dir: &meta,
+        work_root: &root,
+        edit: &edit,
+        amend_commit: None,
+        user_phid: "PHID-USER-me",
+        away_offset: 0,
+    };
+    let err = edit_create_message(&mut editor, "Title\n", "", false, false, &[]).unwrap_err();
+    assert_eq!(err, "conduit down");
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("(Message saved to "), "{text}");
+    assert!(text.contains("create-message"), "{text}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn t1170_default_create_fields_transport_error_propagates() {
+    // A Conduit transport failure aborts the defaults merge (no notes).
+    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        Err("conduit down".to_string())
+    };
+    let local = vec![gap2_d1_local_commit("abc", "s", "Title\n")];
+    assert_eq!(
+        get_default_create_fields_with(&call, &local, false, None, None, false).unwrap_err(),
+        "conduit down"
+    );
+}
+
+#[test]
+fn t1170_hg_working_copy_changes_maps_every_mask() {
+    use std::collections::BTreeMap;
+    let mut status = BTreeMap::new();
+    status.insert("e".to_string(), hg::FLAG_EXTERNALS);
+    status.insert("u".to_string(), hg::FLAG_UNTRACKED);
+    let changes = hg_working_copy_changes(&status);
+    assert_eq!(changes.externals, vec!["e".to_string()]);
+    assert_eq!(changes.untracked, vec!["u".to_string()]);
+    assert!(changes.conflicts.is_empty());
+    let changes = git_working_copy_changes(&status);
+    assert_eq!(changes.externals, vec!["e".to_string()]);
+}
+
+/// Reader that always fails, for confirm error paths.
+struct T1170ErrReader;
+
+impl std::io::Read for T1170ErrReader {
+    fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("t1170 no reads"))
+    }
+}
+
+impl std::io::BufRead for T1170ErrReader {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        Err(std::io::Error::other("t1170 no reads"))
+    }
+
+    fn consume(&mut self, _: usize) {}
+}
+
+#[test]
+fn t1170_clean_check_confirm_read_failures_abort() {
+    let edit = |_: &str| -> Result<String, String> { Ok(String::new()) };
+    let vcs = gap2_d3_vcs(&edit);
+    // The externals confirm cannot read its answer.
+    let changes = WorkingCopyChanges {
+        externals: vec!["ext".to_string()],
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    let err = require_clean_working_copy(
+        &mut T1170ErrReader,
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Allow,
+    )
+    .unwrap_err();
+    assert!(!err.is_empty());
+    // The untracked confirm cannot read its answer either.
+    let changes = WorkingCopyChanges {
+        untracked: vec!["u.txt".to_string()],
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    let err = require_clean_working_copy(
+        &mut T1170ErrReader,
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Allow,
+    )
+    .unwrap_err();
+    assert!(!err.is_empty());
+}
+
+#[test]
+fn t1170_clean_check_write_failure_names_prompt() {
+    let edit = |_: &str| -> Result<String, String> { Ok(String::new()) };
+    let vcs = gap2_d3_vcs(&edit);
+    let changes = WorkingCopyChanges {
+        uncommitted: vec!["a.txt".to_string()],
+        ..Default::default()
+    };
+    let err = require_clean_working_copy(
+        &mut T1170ErrReader,
+        &mut T1170FailWriter,
+        &vcs,
+        &changes,
+        CommitMode::Disable,
+    )
+    .unwrap_err();
+    assert!(err.contains("failed to write prompt"), "{err}");
+}
+
+#[test]
+fn t1170_clean_check_stash_without_hook_marks_stashed() {
+    // Autostash with no stash hook still counts as stashed.
+    let edit = |_: &str| -> Result<String, String> { Ok(String::new()) };
+    let mut vcs = gap2_d3_vcs(&edit);
+    vcs.autostash = true;
+    let changes = WorkingCopyChanges {
+        uncommitted: vec!["a.txt".to_string()],
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    let outcome = require_clean_working_copy(
+        &mut T1170ErrReader,
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Disable,
+    )
+    .unwrap();
+    assert!(outcome.stashed);
+}
+
+#[test]
+fn t1170_clean_check_commit_branches() {
+    use std::io::Cursor;
+    let edit = |_: &str| -> Result<String, String> { Ok("New message\n".to_string()) };
+    // Amending without a head commit fails.
+    let mut vcs = gap2_d3_vcs(&edit);
+    vcs.should_amend = true;
+    let changes = WorkingCopyChanges {
+        uncommitted: vec!["a.txt".to_string()],
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    assert_eq!(
+        require_clean_working_copy(
+            &mut Cursor::new(b"".to_vec()),
+            &mut out,
+            &vcs,
+            &changes,
+            CommitMode::Enable,
+        )
+        .unwrap_err(),
+        "cannot amend without a local commit"
+    );
+    // Amending with a head but no hook succeeds silently.
+    vcs.head_commit_message = Some("Head\n".to_string());
+    let mut out = Vec::new();
+    let outcome = require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Enable,
+    )
+    .unwrap();
+    assert!(!outcome.stashed);
+    // VCSs without local commits skip the editor entirely.
+    let fail_edit = |_: &str| -> Result<String, String> { panic!("editor must not run") };
+    let mut vcs = gap2_d3_vcs(&fail_edit);
+    vcs.supports_local_commits = false;
+    let mut out = Vec::new();
+    require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Enable,
+    )
+    .unwrap();
+    // The editor path commits without a hook.
+    let vcs = gap2_d3_vcs(&edit);
+    let mut out = Vec::new();
+    require_clean_working_copy(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &vcs,
+        &changes,
+        CommitMode::Enable,
+    )
+    .unwrap();
+}
+
+#[test]
+fn t1170_conduit_truthy_shapes_drive_amend_decision() {
+    // The published-commit check treats PHP-falsy conduit values as
+    // unpublished (amend) and truthy ones as published (no amend).
+    let head = gap2_d1_local_commit("abc", "s", "Plain title\n");
+    let no_revisions = || -> Result<Vec<(i64, String)>, String> { Ok(Vec::new()) };
+    for (value, expected) in [
+        (serde_json::json!(true), false),
+        (serde_json::json!(false), true),
+        (serde_json::json!(1), false),
+        (serde_json::json!(0), true),
+        (serde_json::json!(1.5), false),
+        (serde_json::json!(0.0), true),
+        (serde_json::json!("x"), false),
+        (serde_json::json!("0"), true),
+        (serde_json::json!(""), true),
+        (serde_json::json!([1]), false),
+        (serde_json::json!([]), true),
+    ] {
+        let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+            Ok(serde_json::json!({"identifierMap": {"R7:abc": value}}))
+        };
+        let check = AmendCheck {
+            history_immutable: false,
+            supports_amend: true,
+            head: Some(head.clone()),
+            api_author: "a",
+            create: false,
+            repository: Some(AmendRepository {
+                id: 7,
+                callsign: None,
+            }),
+            load_open_revisions: &no_revisions,
+            call: &call,
+        };
+        assert_eq!(calculate_should_amend(&check).unwrap(), expected, "{value}");
+    }
+}
