@@ -140,26 +140,9 @@ fn normalizes_revision_ids() {
 }
 
 #[test]
-fn decodes_patches_with_encoding() {
-    // 0xE9 is `é` in Windows-1252 but invalid UTF-8.
-    assert_eq!(decode_patch(b"+caf\xe9\n", None).unwrap(), "+caf�\n");
-    assert_eq!(
-        decode_patch(b"+caf\xe9\n", Some("windows-1252")).unwrap(),
-        "+café\n"
-    );
-    assert_eq!(
-        decode_patch(b"+caf\xe9\n", Some("UTF-8")).unwrap(),
-        "+caf�\n"
-    );
-    // Valid UTF-8 is never re-decoded, whatever the encoding reads.
-    assert_eq!(
-        decode_patch("+café\n".as_bytes(), Some("windows-1252")).unwrap(),
-        "+café\n"
-    );
-    assert_eq!(
-        decode_patch(b"\xff", Some("shift-jis")).unwrap_err(),
-        "Unknown encoding \"shift-jis\"."
-    );
+fn decodes_conduit_text_with_trailing_newline() {
+    // (T1153 E9: the removed `decode_patch` wrapper's decoding is still
+    // covered at its source, `patch::decode_bytes`.)
     assert_eq!(decode_conduit_text("raw"), "raw\n");
     assert_eq!(decode_conduit_text("raw\n"), "raw\n");
 }
@@ -820,7 +803,7 @@ fn export_e29_source_conflict_beats_missing_format() {
 fn export_e_render_changes(dir: &std::path::Path, base: &str) -> Vec<crate::patch::BundleChange> {
     let bytes = local_diff_bytes(dir, Format::Git, base).unwrap();
     reject_empty_diff(&bytes).unwrap();
-    let text = decode_patch(&bytes, None).unwrap();
+    let text = crate::patch::decode_bytes(&bytes, None).unwrap();
     let parsed = crate::diff_local::parse_unified_diff(&text).unwrap();
     let head = resolve_export_head(dir).unwrap();
     local_render_changes(dir, base, &head, &parsed)

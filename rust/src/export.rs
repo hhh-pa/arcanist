@@ -659,11 +659,6 @@ pub fn local_diff_bytes(dir: &Path, format: Format, base: &str) -> Result<Vec<u8
     }
 }
 
-/// Local `git diff` of the committed `base HEAD` range.
-pub fn local_diff(dir: &Path, format: Format, base: &str) -> Result<String, String> {
-    crate::patch::decode_bytes(&local_diff_bytes(dir, format, base)?, None)
-}
-
 /// Reject an empty local diff like `ArcanistDiffParser::parseDiff()`,
 /// which throws on `!strlen(trim($diff))`
 /// (`src/parser/ArcanistDiffParser.php:189-192`). Conduit sources never
@@ -681,12 +676,6 @@ fn reject_empty_diff(bytes: &[u8]) -> Result<(), String> {
         return Err("Can't parse an empty diff!".to_string());
     }
     Ok(())
-}
-
-/// Decode patch bytes with `--encoding` (input direction: foreign bytes
-/// into UTF-8).
-pub fn decode_patch(bytes: &[u8], encoding: Option<&str>) -> Result<String, String> {
-    crate::patch::decode_bytes(bytes, encoding)
 }
 
 /// Normalize a Conduit raw diff (trailing newline). Conduit text arrives
