@@ -24,7 +24,7 @@
 extern crate self as arc_rs;
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use arc_rs::lint::{LintMessage, Linter, OptionContext, SEVERITY_ERROR};
 use arc_rs::lint_external::{ToolOptions, apply_tool_option, version_requirement_satisfied};
@@ -185,7 +185,7 @@ fn staged_name(display_path: &str) -> String {
 }
 
 fn run_tool(binary: &Path, file: &Path, flags: &[String]) -> Option<(i32, String, String)> {
-    let mut command = Command::new(binary);
+    let mut command = crate::proc_env::command(binary);
     command.args(flags).arg(file).stdin(Stdio::null());
     let output = arc_rs::lint::spawn_with_retry(&mut command).ok()?;
     let code = output.status.code().unwrap_or(1);

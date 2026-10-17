@@ -25,7 +25,6 @@ use arc_rs::lint::{LintMessage, Linter, OptionContext};
 use arc_rs::lint_external::{ToolOptions, apply_tool_option, version_requirement_satisfied};
 use arc_rs::linters::version_pattern_for;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Default binary name, mirroring PHP `getDefaultBinary()`.
 pub const BINARY: &str = "pylint";
@@ -165,7 +164,7 @@ fn lint_with_binary_and_flags(
     let Some(scratch) = write_scratch("pylint", ".py", path, data) else {
         return Vec::new();
     };
-    let mut command = Command::new(tool);
+    let mut command = crate::proc_env::command(tool);
     command
         .args(flags)
         .arg(&scratch.file)

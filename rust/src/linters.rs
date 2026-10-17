@@ -24,7 +24,7 @@
 extern crate self as arc_rs;
 
 use std::path::Path;
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 use crate::{
     conduit::{self, EnvelopeKind},
@@ -1208,7 +1208,7 @@ pub fn probe_version_with_bin(
         return Ok(None);
     };
     let binary = binary_override.unwrap_or(external.binary);
-    let mut command = Command::new(binary);
+    let mut command = crate::proc_env::command(binary);
     if pattern == VersionPattern::PhpVersion {
         command.arg("--run").arg("echo phpversion();");
     } else {
@@ -1258,7 +1258,7 @@ pub fn probe_version_with_bin(
 /// treat the linter as inactive then, like a missing binary).
 #[must_use]
 pub fn probe_binary_version(pattern: VersionPattern, binary: &Path) -> Option<String> {
-    let mut command = Command::new(binary);
+    let mut command = crate::proc_env::command(binary);
     if pattern == VersionPattern::PhpVersion {
         command.arg("--run").arg("echo phpversion();");
     } else {

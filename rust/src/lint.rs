@@ -5055,7 +5055,7 @@ fn prompt_for_patch(result: &LintResult, patched: &[u8], sink: &mut Sink) {
     let new_path = write_temp_bytes("arc-rs-lint-patch", patched);
     let mut diff_text = String::new();
     if let Some(new_path) = &new_path {
-        let output = Command::new("diff")
+        let output = crate::proc_env::command("diff")
             .arg("-u")
             .arg(&old_path)
             .arg(new_path)

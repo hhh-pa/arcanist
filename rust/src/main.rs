@@ -278,7 +278,7 @@ fn apply_alias_expansion(argv: Vec<String>) -> Result<Vec<String>, ExitCode> {
                 .split_first()
                 .map(|(program, args)| (program.as_str(), args.to_vec()))
                 .unwrap_or(("sh", vec!["-c".to_string(), String::new()]));
-            std::process::Command::new(program)
+            arc_rs::proc_env::command(program)
                 .args(&args)
                 .status()
                 .map(|status| alias::shell_status_from_exit_status(&status))

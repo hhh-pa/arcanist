@@ -313,7 +313,7 @@ pub fn rebuild_note() -> &'static str {
 /// Run `git pull --rebase origin -- <branch>` in `root`, returning stdout
 /// on success and `(stdout, stderr)` on failure.
 fn pull_rebase(root: &Path, branch: &str) -> Result<String, (String, String)> {
-    let out = std::process::Command::new("git")
+    let out = crate::proc_env::command("git")
         .current_dir(root)
         .args(["pull", "--rebase", "origin", "--", branch])
         .output()
@@ -329,7 +329,7 @@ fn pull_rebase(root: &Path, branch: &str) -> Result<String, (String, String)> {
 
 /// Best-effort `git rebase --abort` after a failed pull, mirroring PHP.
 fn abort_rebase(root: &Path) {
-    std::process::Command::new("git")
+    crate::proc_env::command("git")
         .current_dir(root)
         .args(["rebase", "--abort"])
         .output()

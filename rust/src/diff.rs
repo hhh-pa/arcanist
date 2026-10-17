@@ -31,7 +31,7 @@ extern crate self as arc_rs;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 use arc_rs::{
     amend, close_revision, conduit, config, diff_local, diff_submit, get_config, git, hg, list,
@@ -864,7 +864,7 @@ fn prepare(cwd: &Path, options: &Options) -> Result<Options, String> {
 
 /// Run `git` with `args` in `cwd`, capturing output.
 fn git_output(cwd: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    Command::new("git")
+    crate::proc_env::command("git")
         .current_dir(cwd)
         .args(args)
         .output()
@@ -5254,7 +5254,7 @@ pub fn browser_open_error(uri: &str, browser_argv: &[String]) -> String {
 pub fn open_uri_in_browser(uri: &str, browser_argv: &[String]) -> Result<(), String> {
     let mut argv = browser_argv.to_vec();
     argv.push(uri.to_string());
-    let status = Command::new(&argv[0])
+    let status = crate::proc_env::command(&argv[0])
         .args(&argv[1..])
         .status()
         .map_err(|_| browser_open_error(uri, browser_argv))?;

@@ -149,7 +149,7 @@ pub fn find_script(start: &Path) -> Option<PathBuf> {
 /// `src/future/exec/PhutilExecPassthru.php:34-36,103` at ceb, T1153
 /// T1153 CORE-57). A signaled child (no code, Unix-only) maps to 1.
 pub fn passthru(program: &Path, args: &[&str], dir: &Path) -> Result<ExitCode, String> {
-    let status = std::process::Command::new(program)
+    let status = crate::proc_env::command(program)
         .current_dir(dir)
         .args(args)
         .status()

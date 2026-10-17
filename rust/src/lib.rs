@@ -72,6 +72,7 @@ pub mod look;
 pub mod markers;
 pub mod paste;
 pub mod patch;
+pub mod proc_env;
 pub mod prompt;
 pub mod prompts;
 pub mod revision;

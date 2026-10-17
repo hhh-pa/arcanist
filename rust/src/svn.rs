@@ -103,7 +103,7 @@ pub struct CommandResult {
 }
 
 fn command_for(dir: &Path, svn: &SvnCommand, args: &[&str]) -> std::process::Command {
-    let mut cmd = std::process::Command::new(&svn.program);
+    let mut cmd = crate::proc_env::command(&svn.program);
     cmd.current_dir(dir);
     cmd.args(&svn.prefix);
     cmd.args(args);
@@ -1373,7 +1373,7 @@ fn run_program(
     prefix: &[&str],
     args: &[&str],
 ) -> Result<RawOutput, String> {
-    let out = std::process::Command::new(program)
+    let out = crate::proc_env::command(program)
         .current_dir(dir)
         .args(prefix)
         .args(args)
@@ -1763,7 +1763,7 @@ pub fn select_svn_locale(locales_output: &str) -> &'static str {
 /// `en_US.utf8` when the probe fails. PHP swallows probe errors the same
 /// way; Windows callers pass no locale at all (PHP skips `LANG` there).
 pub fn svn_lang_env_var() -> &'static str {
-    let output = std::process::Command::new("locale").arg("-a").output();
+    let output = crate::proc_env::command("locale").arg("-a").output();
     match output {
         Ok(out) if out.status.success() => select_svn_locale(&String::from_utf8_lossy(&out.stdout)),
         _ => "en_US.utf8",

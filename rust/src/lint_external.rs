@@ -275,11 +275,11 @@ impl Linter for ExternalLinter {
             }
         }
         let mut command = if let Some(interpreter) = resolved.interpreter.as_deref() {
-            let mut command = std::process::Command::new(interpreter);
+            let mut command = crate::proc_env::command(interpreter);
             command.arg(&resolved.binary);
             command
         } else {
-            std::process::Command::new(&resolved.binary)
+            crate::proc_env::command(&resolved.binary)
         };
         command.args(&self.config.flags);
         command.arg(path);

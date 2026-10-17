@@ -4697,7 +4697,7 @@ pub fn read_raw_stdin_from<R: std::io::Read>(mut reader: R) -> Result<String, St
 pub fn shell_command_output(command: &str) -> Result<std::process::Output, String> {
     #[cfg(windows)]
     {
-        let mut cmd = std::process::Command::new("cmd");
+        let mut cmd = crate::proc_env::command("cmd");
         cmd.args(["/C"]);
         <std::process::Command as std::os::windows::process::CommandExt>::raw_arg(
             &mut cmd, command,
@@ -4707,7 +4707,7 @@ pub fn shell_command_output(command: &str) -> Result<std::process::Output, Strin
     }
     #[cfg(not(windows))]
     {
-        std::process::Command::new("sh")
+        crate::proc_env::command("sh")
             .args(["-c", command])
             .output()
             .map_err(|e| format!("failed to run shell command: {e}"))
@@ -4720,7 +4720,7 @@ pub fn shell_command_output(command: &str) -> Result<std::process::Output, Strin
 pub fn shell_command_status(command: &str) -> Result<std::process::ExitStatus, String> {
     #[cfg(windows)]
     {
-        let mut cmd = std::process::Command::new("cmd");
+        let mut cmd = crate::proc_env::command("cmd");
         cmd.args(["/C"]);
         <std::process::Command as std::os::windows::process::CommandExt>::raw_arg(
             &mut cmd, command,
@@ -4730,7 +4730,7 @@ pub fn shell_command_status(command: &str) -> Result<std::process::ExitStatus, S
     }
     #[cfg(not(windows))]
     {
-        std::process::Command::new("sh")
+        crate::proc_env::command("sh")
             .args(["-c", command])
             .status()
             .map_err(|e| format!("failed to run shell command: {e}"))

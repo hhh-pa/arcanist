@@ -649,7 +649,7 @@ fn tput_columns() -> usize {
     if cfg!(windows) {
         return 0;
     }
-    let Ok(output) = std::process::Command::new("tput").arg("cols").output() else {
+    let Ok(output) = crate::proc_env::command("tput").arg("cols").output() else {
         return 0;
     };
     if !output.status.success() {

@@ -218,7 +218,7 @@ pub fn terminal_width() -> Option<usize> {
 
 #[cfg(not(windows))]
 fn terminal_width_from_tput() -> Option<usize> {
-    let output = std::process::Command::new("tput")
+    let output = crate::proc_env::command("tput")
         .arg("cols")
         .stdin(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::null())
