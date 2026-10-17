@@ -30,10 +30,15 @@ runs:
       with:
         go-version-file: scripts/ci/go/go.mod
         cache: false
+    # NOTE: never expand the workspace path inside run: scripts — on
+    # Windows it is a backslash path that bash mangles into nonsense.
+    # Relative paths only here; working-directory (handled natively by
+    # the runner, not bash) stays absolute.
     - if: steps.cache.outputs.cache-hit != 'true'
       shell: bash
       working-directory: ${{ github.workspace }}/scripts/ci/go
-      run: CGO_ENABLED=0 go build -o "${{ github.workspace }}/profiler-bin/runner-profile" ./cmd/runner-profile
+      run: CGO_ENABLED=0 go build -o ../../profiler-bin/runner-profile ./cmd/runner-profile
     - name: profile runner hardware
       shell: bash
-      run: "${{ github.workspace }}/profiler-bin/runner-profile"
+      working-directory: ${{ github.workspace }}
+      run: ./profiler-bin/runner-profile
