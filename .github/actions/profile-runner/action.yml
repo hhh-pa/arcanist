@@ -60,3 +60,14 @@ runs:
           CGO_ENABLED=0 go build -o ../../profiler-bin/runner-profile ./cmd/runner-profile
         fi
         ../../profiler-bin/runner-profile
+    # Trailer: no-op run step declaring the workspace, so the cache
+    # post step resolves `profiler-bin` against it (empirically the
+    # post inherits the last run step's DECLARED working-directory;
+    # without this it looked under scripts/ci/go and never saved).
+    # The `pwd` probes the nested cwd rule; keep it until the save is
+    # proven, then reduce to `true`. DO NOT REMOVE this step without
+    # re-proving post-save.
+    - name: anchor cache post cwd (probe)
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: pwd
