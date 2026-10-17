@@ -620,6 +620,9 @@ fn normalize_numeric_id(kind: &str, value: &str) -> Result<String, String> {
 pub struct Bundle {
     /// Patch text to apply.
     pub text: String,
+    /// Selected `--encoding` (or bundle/repo encoding), converted at
+    /// the apply sinks like `convertNonUTF8Diff()` (T1153 EXPORT-E9).
+    pub encoding: Option<String>,
     /// Base commit the change applies against, if known.
     pub base_revision: Option<String>,
     /// Differential revision ID, if known.
@@ -679,9 +682,14 @@ fn is_latin1_name(encoding: &str) -> bool {
 /// Valid UTF-8 passes through untouched however `--encoding` reads (PHP
 /// converts only non-UTF-8 corpora). Otherwise cp1252-family names decode
 /// through the Windows-1252 table and latin1-family names map 1:1; UTF-8
-/// names and no encoding fall back lossily (residual: PHP passes raw
-/// bytes, which a Rust `String` cannot hold); anything else throws like
+/// names and no encoding fall back lossily; anything else throws like
 /// PHP's converter.
+///
+/// Byte-faithful pipelines (export text/bundle, patch bundles) no longer
+/// decode here: they carry [`transport_bytes`] through parse/render and
+/// convert only at the sink ([`encode_transport_text`],
+/// [`convert_transport_text`]), matching PHP's raw passthrough plus
+/// `convertNonUTF8Diff()`.
 pub fn decode_bytes(bytes: &[u8], encoding: Option<&str>) -> Result<String, String> {
     if let Ok(text) = std::str::from_utf8(bytes) {
         return Ok(text.to_string());
@@ -717,6 +725,74 @@ pub fn encode_bytes(text: &str, encoding: Option<&str>) -> Result<Vec<u8>, Strin
             })
             .collect()),
         Some(name) => Err(format!("Unknown encoding \"{name}\".")),
+    }
+}
+
+/// True for `--encoding` values PHP's `nonempty()` drops (empty string
+/// and `"0"` are falsy there): no conversion, like no encoding.
+fn is_empty_encoding(name: &str) -> bool {
+    name.is_empty() || name == "0"
+}
+
+/// Map one scalar to latin1, or `None` when unmappable.
+fn encode_latin1_byte(ch: char) -> Option<u8> {
+    u8::try_from(ch as u32).ok()
+}
+
+/// Convert one `utf8_chunks()` walk with `encode`: valid scalars map
+/// (unmappable become `?`) and each invalid sequence becomes one `?`,
+/// matching `mb_convert_encoding()` grouping (probed: `E9 80` yields
+/// one `?`, `ED A0 80` three, `F0 28 8C 28` `?(?(`).
+fn convert_mapped_bytes(bytes: &[u8], encode: fn(char) -> Option<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    for chunk in bytes.utf8_chunks() {
+        for ch in chunk.valid().chars() {
+            out.push(encode(ch).unwrap_or(b'?'));
+        }
+        if !chunk.invalid().is_empty() {
+            out.push(b'?');
+        }
+    }
+    out
+}
+
+/// Convert raw `bytes` from UTF-8 into `--encoding` bytes: the
+/// `convertNonUTF8Diff()` direction (`ArcanistBundle.php:493-498`) over
+/// byte input. `None`, empty/`"0"`, and UTF-8 names pass bytes through
+/// untouched (PHP no-ops identical conversions, even for invalid
+/// input); cp1252-family converts via the table and latin1-family 1:1,
+/// with `?` for invalid sequences and unmappable scalars like
+/// `mb_convert_encoding()`; unknown encodings throw.
+pub fn convert_bytes(bytes: &[u8], encoding: Option<&str>) -> Result<Vec<u8>, String> {
+    match encoding {
+        None => Ok(bytes.to_vec()),
+        Some(name) if is_empty_encoding(name) => Ok(bytes.to_vec()),
+        Some(name) if is_utf8_name(name) => Ok(bytes.to_vec()),
+        Some(name) if is_cp1252_name(name) => Ok(convert_mapped_bytes(bytes, encode_cp1252)),
+        Some(name) if is_latin1_name(name) => Ok(convert_mapped_bytes(bytes, encode_latin1_byte)),
+        Some(name) => Err(format!("Unknown encoding \"{name}\".")),
+    }
+}
+
+/// Sink conversion for transport text: restore the raw bytes, then
+/// [`convert_bytes`] into `--encoding` (T1153 EXPORT-E9).
+pub fn encode_transport_text(text: &str, encoding: Option<&str>) -> Result<Vec<u8>, String> {
+    convert_bytes(&untransport_bytes(text), encoding)
+}
+
+/// Convert transport `text` into `--encoding` and re-transport the
+/// result, for verbatim bundle producers (`arc patch` has no render
+/// step, so the selected encoding converts at load instead of at a
+/// render sink). `None`/empty/`"0"`/UTF-8 names keep the text as is.
+pub fn convert_transport_text(text: &str, encoding: Option<&str>) -> Result<String, String> {
+    match encoding {
+        None => Ok(text.to_string()),
+        Some(name) if is_empty_encoding(name) => Ok(text.to_string()),
+        Some(name) if is_utf8_name(name) => Ok(text.to_string()),
+        Some(_) => Ok(transport_bytes(&convert_bytes(
+            &untransport_bytes(text),
+            encoding,
+        )?)),
     }
 }
 
@@ -763,6 +839,111 @@ fn decode_cp1252(byte: u8) -> char {
         return CP1252_80_9F[(byte - 0x80) as usize].unwrap_or('\u{FFFD}');
     }
     byte as char
+}
+
+/// Transport escape marker (private-use U+E000): starts every
+/// multi-char transport sequence (T1153 EXPORT-E9 byte-faithfulness).
+const TRANSPORT_ESC: char = '\u{E000}';
+
+/// Base of the smuggled-byte range: invalid byte `b` rides the pipeline
+/// as `TRANSPORT_ESC` + `char(U+E100 + b)` (T1153 EXPORT-E9).
+const TRANSPORT_BYTE_BASE: u32 = 0xE100;
+
+/// Carry raw `bytes` through the `String`-based pipeline without loss
+/// (T1153 EXPORT-E9): valid UTF-8 passes through verbatim, each invalid
+/// byte rides as a smuggle sequence, and real U+E000 markers double so
+/// the encoding stays unambiguous. ASCII bytes (all diff structure)
+/// are never altered, so the parser observes no difference.
+///
+/// Inverse: [`untransport_bytes`]; display form: [`untransport_lossy`].
+#[must_use]
+pub fn transport_bytes(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for chunk in bytes.utf8_chunks() {
+        escape_valid_chunk(&mut out, chunk.valid());
+        for byte in chunk.invalid() {
+            push_transport_byte(&mut out, *byte);
+        }
+    }
+    out
+}
+
+/// Append one valid UTF-8 chunk, doubling real transport markers.
+fn escape_valid_chunk(out: &mut String, valid: &str) {
+    for ch in valid.chars() {
+        if ch == TRANSPORT_ESC {
+            out.push(TRANSPORT_ESC);
+        }
+        out.push(ch);
+    }
+}
+
+/// True for a smuggled-byte scalar (U+E100..U+E1FF).
+fn is_smuggled_byte(ch: char) -> bool {
+    matches!(ch as u32, 0xE100..=0xE1FF)
+}
+
+/// Push one raw byte as transport: ASCII verbatim, high bytes smuggled.
+fn push_transport_byte(out: &mut String, byte: u8) {
+    if byte < 0x80 {
+        out.push(byte as char);
+    } else {
+        out.push(TRANSPORT_ESC);
+        let scalar = TRANSPORT_BYTE_BASE + u32::from(byte);
+        out.push(char::from_u32(scalar).unwrap_or('\u{FFFD}'));
+    }
+}
+
+/// Restore the raw bytes behind transport text (inverse of
+/// [`transport_bytes`]): smuggle sequences yield their byte, doubled
+/// markers yield U+E000, and every other char yields its UTF-8 bytes.
+/// A lone marker (unreachable from pipeline output) reads literally.
+/// Escape-free input round-trips to its own UTF-8 bytes.
+#[must_use]
+pub fn untransport_bytes(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut buf = [0u8; 4];
+    while let Some(ch) = chars.next() {
+        if ch != TRANSPORT_ESC {
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            continue;
+        }
+        match chars.peek() {
+            Some(next) if *next == TRANSPORT_ESC => {
+                chars.next();
+                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+            Some(next) if is_smuggled_byte(*next) => {
+                let scalar = chars.next().unwrap_or('\u{FFFD}') as u32;
+                out.push((scalar - TRANSPORT_BYTE_BASE) as u8);
+            }
+            _ => out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes()),
+        }
+    }
+    out
+}
+
+/// Display form of transport text: raw bytes decoded lossily, like the
+/// historical `String::from_utf8_lossy` rendering. Escape-free input
+/// (including every pre-transport pipeline string) round-trips
+/// unchanged, so lossy-only consumers keep their exact behavior.
+#[must_use]
+pub fn untransport_lossy(text: &str) -> String {
+    String::from_utf8_lossy(&untransport_bytes(text)).into_owned()
+}
+
+/// Normalize a valid-UTF-8 pipeline string (conduit/JSON text, which is
+/// never smuggled): double real transport markers so downstream
+/// un-transporting stays a bijection. Marker-free input is unchanged.
+#[must_use]
+pub fn escape_transport_markers(text: &str) -> String {
+    if !text.contains(TRANSPORT_ESC) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    escape_valid_chunk(&mut out, text);
+    out
 }
 
 /// Reverse of [`decode_cp1252`]: `None` for unmappable scalars.
@@ -839,7 +1020,9 @@ fn has_leading_ansi(text: &str) -> bool {
     false
 }
 
-/// Strip all `\x1B\[[\d;]*m` sequences.
+/// Strip all `\x1B\[[\d;]*m` sequences. Detection stays byte-oriented
+/// (ANSI codes are ASCII) but surviving text copies per char, so
+/// non-ASCII bytes and transport sequences pass through intact.
 fn strip_ansi_codes(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
@@ -855,8 +1038,9 @@ fn strip_ansi_codes(text: &str) -> String {
                 continue;
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        let ch = text[i..].chars().next().unwrap_or('\u{FFFD}');
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -883,7 +1067,9 @@ fn has_unified_date(rest: &str) -> bool {
     let bytes = rest.as_bytes();
     let mut i = 0;
     while i + 10 <= bytes.len() {
-        if is_date_prefix(&rest[i..]) {
+        // `get` skips non-boundary offsets (multibyte chars) instead of
+        // panicking; dates are ASCII, so decisions never change.
+        if rest.get(i..).is_some_and(is_date_prefix) {
             let mut ws_start = i;
             while ws_start > 0 && is_pcre_space(bytes[ws_start - 1]) {
                 ws_start -= 1;
@@ -1024,7 +1210,14 @@ pub fn format_parse_error(message: &str, lines: &[String], idx: usize) -> String
             continue;
         }
         let marker = if i == idx { ">>>  " } else { "" };
-        context.push_str(&format!("{:>8} {:>6}   {}", marker, i + 1, line));
+        // Transport never leaks into the display: the lossy view matches
+        // the historical rendering, and is identical for escape-free input.
+        context.push_str(&format!(
+            "{:>8} {:>6}   {}",
+            marker,
+            i + 1,
+            untransport_lossy(line)
+        ));
     }
     format!("Diff Parse Exception: {message}\n\n{context}")
 }
@@ -1120,21 +1313,34 @@ fn probe_hg_export_header(lines: &[String], idx: usize) -> bool {
 /// Load a `--patch` bundle from a file or `-`
 /// (`ArcanistPatchWorkflow.php:361-377` via `ArcanistBundle::newFromDiff()`).
 ///
-/// Empty stdin fails with [`NO_STDIN_PATCH`]; decoded text is
-/// pre-parsed like `ArcanistDiffParser::parseDiff()` (empty and
-/// malformed headers fail with byte-for-byte parse errors) and
-/// carries no metadata. Valid patches pass through verbatim.
+/// Empty stdin fails with [`NO_STDIN_PATCH`]; the raw bytes ride as
+/// transport (T1153 EXPORT-E9) and pre-parse like
+/// `ArcanistDiffParser::parseDiff()` (empty and malformed headers fail
+/// with byte-for-byte parse errors). The bundle carries no metadata.
+/// The encoding converts at the apply sinks, like
+/// `convertNonUTF8Diff()` at render; without one the patch passes
+/// through byte-verbatim.
 pub fn load_file_bundle(path: &str, encoding: Option<&str>, io: &mut Io) -> Result<Bundle, String> {
     let bytes = read_patch_bytes(path, io)?;
     if path == "-" && bytes.is_empty() {
         return Err(NO_STDIN_PATCH.to_string());
     }
-    let text = decode_bytes(&bytes, encoding)?;
-    validate_patch_text(&text)?;
+    let transported = transport_bytes(&bytes);
+    validate_patch_text(&transported)?;
     Ok(Bundle {
-        text,
+        text: transported,
+        encoding: encoding.map(str::to_string),
         ..Bundle::default()
     })
+}
+
+/// Patchfile bytes for a bundle (T1153 EXPORT-E9): convert the selected
+/// encoding over the transport text (like `convertNonUTF8Diff()`),
+/// then restore raw bytes. Unknown encodings throw here (at apply,
+/// after branching, like PHP).
+pub fn bundle_patch_bytes(bundle: &Bundle) -> Result<Vec<u8>, String> {
+    let converted = convert_transport_text(&bundle.text, bundle.encoding.as_deref())?;
+    Ok(untransport_bytes(&converted))
 }
 
 /// List `tar` members of `bundle` (`tar tfO`, via `tar -tf`).
@@ -1289,6 +1495,15 @@ fn parse_bundle_change(value: &serde_json::Value, hunks: Vec<ParsedHunk>) -> Bun
             .and_then(|v| v.as_str())
             .map(str::to_string)
     };
+    // Path-ish fields ride the transport pipeline downstream, so real
+    // markers escape here (T1153 EXPORT-E9); marker-free values pass
+    // through unchanged.
+    let path_field = |key: &str| {
+        value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(escape_transport_markers)
+    };
     BundleChange {
         change_type: value
             .get("type")
@@ -1298,14 +1513,8 @@ fn parse_bundle_change(value: &serde_json::Value, hunks: Vec<ParsedHunk>) -> Bun
             .get("fileType")
             .and_then(diff_submit::loose_u64)
             .unwrap_or(u64::from(FILE_TEXT)) as u32,
-        old_path: value
-            .get("oldPath")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        current_path: value
-            .get("currentPath")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
+        old_path: path_field("oldPath"),
+        current_path: path_field("currentPath"),
         old_mode: mode("oldProperties"),
         new_mode: mode("newProperties"),
         hunks,
@@ -1325,7 +1534,7 @@ fn parse_bundle_change(value: &serde_json::Value, hunks: Vec<ParsedHunk>) -> Bun
             .map(|items| {
                 items
                     .iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .filter_map(|v| v.as_str().map(escape_transport_markers))
                     .collect()
             })
             .unwrap_or_default(),
@@ -1336,29 +1545,58 @@ fn parse_bundle_change(value: &serde_json::Value, hunks: Vec<ParsedHunk>) -> Bun
 
 /// Quote a git target path (`encodeGitTargetPath()`): plain paths pass
 /// through; paths with quotes, backslashes, or control bytes render
-/// C-quoted.
+/// C-quoted. Quoting runs over the un-transported raw bytes (like PHP's
+/// byte strings) and re-transports high bytes, so transport paths
+/// survive quoting; ASCII behavior is unchanged.
 pub fn quote_git_target(path: &str) -> String {
-    let needs_quotes = path
-        .bytes()
-        .any(|byte| byte == b'"' || byte == b'\\' || byte < 0x20 || byte == 0x7f);
+    let raw = untransport_bytes(path);
+    let needs_quotes = raw
+        .iter()
+        .any(|byte| *byte == b'"' || *byte == b'\\' || *byte < 0x20 || *byte == 0x7f);
     if !needs_quotes {
         return path.to_string();
     }
     let mut quoted = String::from("\"");
-    for byte in path.bytes() {
-        match byte {
-            b'"' => quoted.push_str("\\\""),
-            b'\\' => quoted.push_str("\\\\"),
-            b'\n' => quoted.push_str("\\n"),
-            b'\t' => quoted.push_str("\\t"),
-            other if other < 0x20 || other == 0x7f => {
-                quoted.push_str(&format!("\\{other:03o}"));
-            }
-            other => quoted.push(other as char),
-        }
+    let mut pending: Vec<u8> = Vec::new();
+    for byte in raw {
+        push_quoted_byte(&mut quoted, &mut pending, byte);
     }
+    flush_transport_pending(&mut quoted, &mut pending);
     quoted.push('"');
     quoted
+}
+
+/// Quote one raw target byte: escapes and ASCII flush first, while
+/// consecutive high bytes buffer up so valid sequences re-decode
+/// together.
+fn push_quoted_byte(quoted: &mut String, pending: &mut Vec<u8>, byte: u8) {
+    match byte {
+        b'"' => {
+            flush_transport_pending(quoted, pending);
+            quoted.push_str("\\\"");
+        }
+        b'\\' => {
+            flush_transport_pending(quoted, pending);
+            quoted.push_str("\\\\");
+        }
+        b'\n' => {
+            flush_transport_pending(quoted, pending);
+            quoted.push_str("\\n");
+        }
+        b'\t' => {
+            flush_transport_pending(quoted, pending);
+            quoted.push_str("\\t");
+        }
+        other if other < 0x20 || other == 0x7f => {
+            flush_transport_pending(quoted, pending);
+            quoted.push_str(&format!("\\{other:03o}"));
+        }
+        other if other < 0x80 => {
+            flush_transport_pending(quoted, pending);
+            quoted.push(other as char);
+        }
+        other => pending.push(other),
+    }
 }
 
 /// Rotate `v` left by `n` bits (SHA-1 helper).
@@ -2061,13 +2299,13 @@ pub fn load_arcbundle(path: &str, encoding: Option<&str>) -> Result<Bundle, Stri
     let dicts: Vec<serde_json::Value> = serde_json::from_slice(&raw)
         .map_err(|e| format!("failed to read arcbundle '{path}': {e}"))?;
     let decode_as = encoding.or(meta.encoding.as_deref());
-    let mut changes = arcbundle_changes(path, &dicts, decode_as)?;
+    let mut changes = arcbundle_changes(path, &dicts)?;
     let text = render_git_patch_with_blobs(&mut changes, &|phid: &str| {
         tar_extract(path, &format!("blobs/{phid}"))
     })?;
-    let text = decode_bytes(text.as_bytes(), decode_as)?;
     Ok(Bundle {
         text,
+        encoding: decode_as.map(str::to_string),
         base_revision: meta.base_revision,
         revision_id: meta.revision_id,
         author_name: meta.author_name,
@@ -2096,29 +2334,20 @@ fn require_arcbundle_member(path: &str, members: &[String], member: &str) -> Res
     }
 }
 
-/// Parse one [`BundleChange`] per dict, decoding each hunk corpus.
-fn arcbundle_changes(
-    path: &str,
-    dicts: &[serde_json::Value],
-    decode_as: Option<&str>,
-) -> Result<Vec<BundleChange>, String> {
+/// Parse one [`BundleChange`] per dict, carrying each hunk corpus as
+/// transport (conversion happens after render, like
+/// `convertNonUTF8Diff()`).
+fn arcbundle_changes(path: &str, dicts: &[serde_json::Value]) -> Result<Vec<BundleChange>, String> {
     let mut changes = Vec::new();
     for dict in dicts {
-        changes.push(parse_bundle_change(
-            dict,
-            arcbundle_corpora(path, dict, decode_as)?,
-        ));
+        changes.push(parse_bundle_change(dict, arcbundle_corpora(path, dict)?));
     }
     Ok(changes)
 }
 
-/// Decode one change dict's hunks: offsets from the dict plus the
-/// body-only corpus from the `hunks/N` members.
-fn arcbundle_corpora(
-    path: &str,
-    dict: &serde_json::Value,
-    decode_as: Option<&str>,
-) -> Result<Vec<ParsedHunk>, String> {
+/// Carry one change dict's hunks: offsets from the dict plus the
+/// body-only corpus from the `hunks/N` members, as transport.
+fn arcbundle_corpora(path: &str, dict: &serde_json::Value) -> Result<Vec<ParsedHunk>, String> {
     let mut hunks = Vec::new();
     if let Some(items) = dict.get("hunks").and_then(|v| v.as_array()) {
         for hunk in items {
@@ -2132,7 +2361,7 @@ fn arcbundle_corpora(
                 old_len,
                 new_start,
                 new_len,
-                corpus: decode_bytes(&bytes, decode_as)?,
+                corpus: transport_bytes(&bytes),
                 // Bundle hunks count from the corpus (T1153 EXPORT-E20).
                 synthetic_counts: None,
             });
@@ -2160,8 +2389,8 @@ pub fn conduit_hunks_from_dict(dict: &serde_json::Value) -> Vec<ParsedHunk> {
                         corpus: hunk
                             .get("corpus")
                             .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
+                            .map(escape_transport_markers)
+                            .unwrap_or_default(),
                         // Conduit hunks count from the corpus (T1153 EXPORT-E20).
                         synthetic_counts: None,
                     }
@@ -2294,6 +2523,7 @@ pub fn fetch_conduit_bundle(
     let text = render_git_patch_with_blobs(&mut changes, &|phid| fetch_file_blob(call, phid))?;
     Ok(Bundle {
         text,
+        encoding: None,
         base_revision: Some(diff.base_revision).filter(|base| !base.is_empty()),
         revision_id: revision_id.or(diff.revision_id),
         author_name: Some(diff.author_name).filter(|name| !name.is_empty()),
@@ -3711,11 +3941,17 @@ pub struct TempPatchFile {
 impl TempPatchFile {
     /// Write `text` to a unique temp file.
     pub fn write(text: &str) -> Result<Self, String> {
+        Self::write_bytes(text.as_bytes())
+    }
+
+    /// Write raw `bytes` to a unique temp file (T1153 EXPORT-E9: the
+    /// byte sink behind transport bundle text).
+    pub fn write_bytes(bytes: &[u8]) -> Result<Self, String> {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let path =
             std::env::temp_dir().join(format!("arc-rs-patch-{}-{id}.patch", std::process::id()));
-        std::fs::write(&path, text)
+        std::fs::write(&path, bytes)
             .map_err(|e| format!("Failed to write temporary patch file: {e}"))?;
         Ok(Self { path })
     }
@@ -3822,7 +4058,9 @@ pub fn git_apply_patch_ansi(
     io: &mut Io,
     ansi: bool,
 ) -> Result<(), String> {
-    let patchfile = TempPatchFile::write(&bundle.text)?;
+    // Bundle text rides as transport; the patchfile carries converted
+    // raw bytes, like `toGitPatch()` plus `convertNonUTF8Diff()`.
+    let patchfile = TempPatchFile::write_bytes(&bundle_patch_bytes(bundle)?)?;
     let path = patchfile.path.to_string_lossy().to_string();
     let output = git::output(
         dir,
@@ -4237,7 +4475,9 @@ pub fn hg_import_patch_ansi(
 ) -> Result<(), String> {
     // The patch travels via temp file instead of `-` stdin so custom
     // backends work; `hg import` accepts a file the same way.
-    let patchfile = TempPatchFile::write(&bundle.text)?;
+    // Bundle text rides as transport; the patchfile carries converted
+    // raw bytes, like `toGitPatch()` plus `convertNonUTF8Diff()`.
+    let patchfile = TempPatchFile::write_bytes(&bundle_patch_bytes(bundle)?)?;
     let path = patchfile.path.to_string_lossy().to_string();
     let output = hg::output_with(dir, hg, &["import", "--no-commit", &path])?;
     if output.status.success() {
@@ -4437,42 +4677,46 @@ pub fn svn_changes_from_dicts(
     dicts
         .iter()
         .zip(corpora.iter())
-        .map(|(dict, hunks)| {
-            let props = |key: &str| {
-                dict.get(key)
-                    .and_then(|v| v.as_object())
-                    .map(|map| {
-                        map.iter()
-                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            };
-            let file_type = dict
-                .get("fileType")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(u64::from(FILE_TEXT)) as u32;
-            SvnChange {
-                change_type: dict
-                    .get("type")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(u64::from(TYPE_CHANGE)) as u32,
-                file_type,
-                old_path: dict
-                    .get("oldPath")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                current_path: dict
-                    .get("currentPath")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                hunks: render_hunks(hunks),
-                old_props: props("oldProperties"),
-                new_props: props("newProperties"),
-                symlink_target: symlink_target_from_hunks(file_type, &render_hunks(hunks)),
-            }
-        })
+        .map(|(dict, hunks)| svn_change_lossy(svn_change_from_dict(dict, hunks)))
         .collect()
+}
+
+/// One svn change from an arcbundle change dictionary plus its hunk
+/// corpora (transport-safe: callers lossy-view the result).
+fn svn_change_from_dict(dict: &serde_json::Value, hunks: &[ParsedHunk]) -> SvnChange {
+    let props = |key: &str| {
+        dict.get(key)
+            .and_then(|v| v.as_object())
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let file_type = dict
+        .get("fileType")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(u64::from(FILE_TEXT)) as u32;
+    SvnChange {
+        change_type: dict
+            .get("type")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(u64::from(TYPE_CHANGE)) as u32,
+        file_type,
+        old_path: dict
+            .get("oldPath")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        current_path: dict
+            .get("currentPath")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        hunks: render_hunks(hunks),
+        old_props: props("oldProperties"),
+        new_props: props("newProperties"),
+        symlink_target: symlink_target_from_hunks(file_type, &render_hunks(hunks)),
+    }
 }
 
 /// Symlink target from hunk bodies: the single added line, when the
@@ -4489,39 +4733,71 @@ fn symlink_target_from_hunks(file_type: u32, body: &str) -> Option<String> {
 }
 
 /// Unquote a git C-quoted path (`"a\"b"` -> `a"b`); plain paths pass
-/// through.
+/// through. Decoded bytes ride as transport (T1153 EXPORT-E9): valid
+/// sequences decode to real chars, the rest smuggled, so non-UTF-8
+/// paths survive; ASCII behavior is unchanged.
 pub fn unquote_git_path(path: &str) -> String {
     if !(path.starts_with('"') && path.ends_with('"') && path.len() >= 2) {
         return path.to_string();
     }
     let inner = &path[1..path.len() - 1];
     let mut out = String::new();
+    // Consecutive decoded high bytes buffer up so valid sequences
+    // decode together; anything else flushes first.
+    let mut pending: Vec<u8> = Vec::new();
     let mut chars = inner.chars();
     while let Some(ch) = chars.next() {
         if ch != '\\' {
+            flush_transport_pending(&mut out, &mut pending);
             out.push(ch);
             continue;
         }
         match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
+            Some('n') => {
+                flush_transport_pending(&mut out, &mut pending);
+                out.push('\n');
+            }
+            Some('t') => {
+                flush_transport_pending(&mut out, &mut pending);
+                out.push('\t');
+            }
+            Some('r') => {
+                flush_transport_pending(&mut out, &mut pending);
+                out.push('\r');
+            }
             Some(other) => {
                 if other.is_ascii_digit() {
                     let mut octal = String::from(other);
                     octal.push(chars.next().unwrap_or('0'));
                     octal.push(chars.next().unwrap_or('0'));
                     if let Ok(byte) = u8::from_str_radix(&octal, 8) {
-                        out.push(byte as char);
+                        if byte < 0x80 {
+                            flush_transport_pending(&mut out, &mut pending);
+                            out.push(byte as char);
+                        } else {
+                            pending.push(byte);
+                        }
                     }
                 } else {
+                    flush_transport_pending(&mut out, &mut pending);
                     out.push(other);
                 }
             }
-            None => out.push('\\'),
+            None => {
+                flush_transport_pending(&mut out, &mut pending);
+                out.push('\\');
+            }
         }
     }
+    flush_transport_pending(&mut out, &mut pending);
     out
+}
+
+/// Flush buffered high bytes as transport (valid sequences decode
+/// together; the rest smuggle).
+fn flush_transport_pending(out: &mut String, pending: &mut Vec<u8>) {
+    out.push_str(&transport_bytes(pending));
+    pending.clear();
 }
 
 /// Strip one `a/` or `b/` prefix from a `---`/`+++` path.
@@ -4604,6 +4880,23 @@ fn parse_svn_section(section: &str) -> Vec<SvnChange> {
     svn_section_modes(&mut change, &headers);
     svn_section_symlink(&mut change);
     svn_section_classify(change, &headers)
+        .into_iter()
+        .map(svn_change_lossy)
+        .collect()
+}
+
+/// View one svn change lossily (T1153 EXPORT-E9 residual carry): the svn
+/// apply path keeps its historical lossy behavior (its filesystem, CLI,
+/// and prompt sinks are `String`-only, and no svn binary exists here to
+/// oracle-verify a byte port), while transport inputs stay contained.
+fn svn_change_lossy(mut change: SvnChange) -> SvnChange {
+    change.old_path = change.old_path.map(|path| untransport_lossy(&path));
+    change.current_path = change.current_path.map(|path| untransport_lossy(&path));
+    change.hunks = untransport_lossy(&change.hunks);
+    change.symlink_target = change
+        .symlink_target
+        .map(|target| untransport_lossy(&target));
+    change
 }
 
 /// Parsed `diff --git` section headers (before the first `@@`).
@@ -5223,7 +5516,9 @@ pub fn run_patch_file_with(
     patch_text: &str,
     patch_bin: &str,
 ) -> Result<(bool, String), String> {
-    let patchfile = TempPatchFile::write(patch_text)?;
+    // Patch text may ride as transport; the patchfile carries raw bytes
+    // (identical bytes for escape-free input).
+    let patchfile = TempPatchFile::write_bytes(&untransport_bytes(patch_text))?;
     let file = patchfile.path.to_string_lossy().to_string();
     let output = crate::proc_env::command(patch_bin)
         .current_dir(dir)
@@ -5234,6 +5529,16 @@ pub fn run_patch_file_with(
         output.status.success(),
         String::from_utf8_lossy(&output.stdout).to_string(),
     ))
+}
+
+/// Apply one per-file patch, converting the bundle encoding first
+/// (the `convertNonUTF8Diff()` render step; T1153 EXPORT-E9).
+fn run_patch_file_converted(
+    dir: &Path,
+    patch_text: &str,
+    encoding: Option<&str>,
+) -> Result<(bool, String), String> {
+    run_patch_file(dir, &convert_transport_text(patch_text, encoding)?)
 }
 
 /// Touch one svn file (`(cd %s; touch %s)`): create it when missing,
@@ -5270,7 +5575,7 @@ pub fn run_symlink(dir: &Path, target: &str, path: &str) -> Result<(), String> {
 pub struct LoadedBundle {
     /// The bundle.
     pub bundle: Bundle,
-    /// Arcbundle change dicts with decoded hunks, when the source
+    /// Arcbundle change dicts with transport hunks, when the source
     /// is an arcbundle.
     pub arcbundle_dicts: Option<(Vec<serde_json::Value>, Vec<Vec<ParsedHunk>>)>,
 }
@@ -5351,24 +5656,21 @@ fn require_call<'a>(
     })
 }
 
-/// An arcbundle plus raw change dicts and decoded hunks.
+/// An arcbundle plus raw change dicts and transport hunks.
 type ArcbundleWithDicts = (Bundle, Vec<serde_json::Value>, Vec<Vec<ParsedHunk>>);
 
-/// Load an arcbundle plus its raw change dicts and decoded corpora.
+/// Load an arcbundle plus its raw change dicts and transport corpora.
 fn load_arcbundle_with_dicts(
     path: &str,
     encoding: Option<&str>,
 ) -> Result<ArcbundleWithDicts, String> {
     let bundle = load_arcbundle(path, encoding)?;
-    let members = tar_list(path)?;
-    let meta = arcbundle_meta(path, &members)?;
     let raw = tar_extract(path, "changes.json")?;
     let dicts: Vec<serde_json::Value> = serde_json::from_slice(&raw)
         .map_err(|e| format!("failed to read arcbundle '{path}': {e}"))?;
-    let decode_as = encoding.or(meta.encoding.as_deref());
     let mut corpora = Vec::new();
     for dict in &dicts {
-        corpora.push(arcbundle_corpora(path, dict, decode_as)?);
+        corpora.push(arcbundle_corpora(path, dict)?);
     }
     Ok((bundle, dicts, corpora))
 }
@@ -5777,8 +6079,9 @@ fn setup_patch_client(
     }
 }
 
-/// PATCH-P11: render a conduit bundle through the `--encoding` flag,
-/// else the repository encoding (`:404-414`).
+/// PATCH-P11: select the `--encoding` flag, else the repository
+/// encoding (`:404-414`), for a conduit bundle. The selection rides on
+/// the bundle and converts at the apply sinks (T1153 EXPORT-E9).
 fn apply_patch_bundle_encoding(
     dir: &Path,
     vcs: Vcs,
@@ -5802,7 +6105,9 @@ fn apply_patch_bundle_encoding(
         },
     };
     if let Some(encoding) = encoding {
-        loaded.bundle.text = decode_bytes(loaded.bundle.text.as_bytes(), Some(&encoding))?;
+        // Selected encoding rides on the bundle and converts at the
+        // apply sinks, like `convertNonUTF8Diff()` at render.
+        loaded.bundle.encoding = Some(encoding);
     }
     Ok(())
 }
@@ -5997,8 +6302,8 @@ fn apply_patch_bundle(
     }
 }
 
-/// Apply the loaded bundle under svn, from arcbundle dicts (with decoded
-/// corpora) or parsed git-patch text.
+/// Apply the loaded bundle under svn, from arcbundle dicts (with
+/// transport corpora) or parsed git-patch text.
 fn apply_patch_svn(
     dir: &Path,
     backends: &Backends,
@@ -6011,12 +6316,13 @@ fn apply_patch_svn(
         Some((dicts, corpora)) => svn_changes_from_dicts(dicts, corpora),
         None => parse_git_patch_for_svn(&bundle.text),
     };
+    let encoding = bundle.encoding.clone();
     let outcome = apply_svn_ansi(
         dir,
         &backends.svn,
         &changes,
         io,
-        &mut |_, patch| run_patch_file(dir, patch),
+        &mut |_, patch| run_patch_file_converted(dir, patch, encoding.as_deref()),
         &mut |path| run_touch_file(dir, path),
         &mut |target, path| run_symlink(dir, target, path),
         ansi,
@@ -6086,7 +6392,11 @@ fn execute_preview(dir: &Path, options: &Options, io: &mut Io) -> Result<Out, St
         .as_ref()
         .map(|_| &call as &dyn Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>);
     let loaded = load_bundle(&source, options, io, call_option)?;
-    io.push_out(&loaded.bundle.text);
+    // `--preview` shows what would apply: converted, then lossily to
+    // the text sink (identical to the historical rendering for
+    // escape-free bundles without an encoding).
+    let converted = convert_transport_text(&loaded.bundle.text, loaded.bundle.encoding.as_deref())?;
+    io.push_out(&untransport_lossy(&converted));
     Ok(std::mem::take(&mut io.out))
 }
 
