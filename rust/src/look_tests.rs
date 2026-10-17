@@ -1387,7 +1387,11 @@ fn slash_tz_name_reads_literal_path_first() {
     let tmp = LookTmp::new("tzslash");
     let path = tmp.path().join("v1.tz");
     std::fs::write(&path, TESTBURG_V1).unwrap();
-    let name = path.to_str().expect("utf8 tmp path").to_string();
+    // Forward slashes on every OS (Windows tmp paths use `\`).
+    let name = path
+        .to_str()
+        .expect("utf8 tmp path")
+        .replace(std::path::MAIN_SEPARATOR, "/");
     assert!(name.contains('/'));
     assert_eq!(env_tz_offset(&name, WINTER as i64), -18_000);
     assert_eq!(env_tz_offset(&name, SUMMER as i64), -14_400);
@@ -1714,7 +1718,11 @@ fn system_zone_falls_back_past_unparseable_localtime() {
     let tmp = LookTmp::new("syszone");
     let path = tmp.path().join("v1.tz");
     std::fs::write(&path, TESTBURG_V1).unwrap();
-    let name = path.to_str().expect("utf8 tmp path").to_string();
+    // Forward slashes on every OS (Windows tmp paths use `\`).
+    let name = path
+        .to_str()
+        .expect("utf8 tmp path")
+        .replace(std::path::MAIN_SEPARATOR, "/");
     assert!(name.contains('/'));
     assert_eq!(
         system_tz_offset_from(Some(b"not a tzfile"), Some(&name), WINTER as i64),

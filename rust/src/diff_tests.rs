@@ -6170,23 +6170,10 @@ impl MockConduit {
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .ok();
-        let mut raw = Vec::new();
         let mut buf = [0u8; 4096];
-        loop {
-            let Ok(count) = stream.read(&mut buf) else {
-                return;
-            };
-            if count == 0 {
-                return;
-            }
-            raw.extend_from_slice(&buf[..count]);
-            if raw.windows(4).any(|window| window == b"\r\n\r\n") {
-                break;
-            }
-            if raw.len() > 1_000_000 {
-                return;
-            }
-        }
+        let Some(raw) = Self::read_head(&mut stream, &mut buf) else {
+            return;
+        };
         let head_end = raw
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
@@ -6242,6 +6229,28 @@ impl MockConduit {
             text.len(),
         );
         stream.write_all(response.as_bytes()).ok();
+    }
+
+    /// Read through the end of the HTTP headers (`\r\n\r\n`), or None
+    /// when the stream ends or exceeds the cap first.
+    fn read_head(stream: &mut std::net::TcpStream, buf: &mut [u8; 4096]) -> Option<Vec<u8>> {
+        use std::io::Read;
+        let mut raw = Vec::new();
+        loop {
+            let Ok(count) = stream.read(buf) else {
+                return None;
+            };
+            if count == 0 {
+                return None;
+            }
+            raw.extend_from_slice(&buf[..count]);
+            if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                return Some(raw);
+            }
+            if raw.len() > 1_000_000 {
+                return None;
+            }
+        }
     }
 
     /// The `params` form field, percent-decoded into JSON.

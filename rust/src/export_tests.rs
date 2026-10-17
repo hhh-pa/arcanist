@@ -1359,10 +1359,13 @@ fn local_diff_bytes_rejects_non_repo_and_bad_base() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[cfg(unix)]
 #[test]
 fn create_tar_reports_member_failures() {
     // Missing members fail `tar -czf` with stderr naming them (our own
-    // member names, not tar prose, are asserted).
+    // member names, not tar prose, are asserted). Unix-only: Windows
+    // bsdtar words member errors differently, and coverage flows from
+    // the Linux gates run anyway.
     let stage = plain_dir("tar");
     let out = stage.join("o.tar.gz");
     let err = create_tar(&stage, &out).unwrap_err();
@@ -1373,9 +1376,13 @@ fn create_tar_reports_member_failures() {
 #[test]
 fn bundle_out_path_prefers_absolute_paths() {
     let dir = plain_dir("outpath");
+    // Absolute on every platform (a bare `/abs/...` is drive-relative
+    // on Windows, so build one from the temp dir instead; nothing is
+    // created on disk).
+    let abs = std::env::temp_dir().join("t1170-abs-out.tar.gz");
     assert_eq!(
-        bundle_out_path(&dir, "/abs/out.tar.gz"),
-        std::path::PathBuf::from("/abs/out.tar.gz")
+        bundle_out_path(&dir, abs.to_str().expect("utf8 tmp path")),
+        abs
     );
     assert_eq!(bundle_out_path(&dir, "o.tar.gz"), dir.join("o.tar.gz"));
     std::fs::remove_dir_all(&dir).ok();
