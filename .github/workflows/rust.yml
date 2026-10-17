@@ -14,12 +14,16 @@ on:
       - "scripts/ci/**"
       - ".dockerignore"
       - ".github/workflows/rust.yml"
+      # Local composite actions (profile-runner) run in every job;
+      # without this, edits to them never trigger CI (T1170).
+      - ".github/actions/**"
   pull_request:
     paths:
       - "rust/**"
       - "scripts/ci/**"
       - ".dockerignore"
       - ".github/workflows/rust.yml"
+      - ".github/actions/**"
 
 env:
   CARGO_TERM_COLOR: always
