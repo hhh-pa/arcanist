@@ -28,10 +28,11 @@ runs:
       with:
         # The whole dir: the file inside is runner-profile(.exe)
         # depending on the OS, and a dir path sidesteps that.
-        # Relative on purpose: `uses:` steps resolve against the
-        # workspace (not the caller's job-default cwd — proven by real
-        # saves), while an absolute workspace path fails post-save
-        # validation ("Path(s) ... do(es) not exist", CI-proven).
+        # Relative on purpose: an absolute workspace path fails
+        # post-save validation ("Path(s) ... do(es) not exist",
+        # CI-proven). Relative resolves against the workspace for the
+        # main step (hits extract to WS/profiler-bin, CI-proven) and
+        # for the post step only in the saver manifest shape below.
         path: profiler-bin
         key: ${{ inputs.cache-key }}
     - if: steps.cache.outputs.cache-hit != 'true'
@@ -39,35 +40,31 @@ runs:
       with:
         go-version-file: scripts/ci/go/go.mod
         cache: false
-    # NOTE: never expand the workspace path inside run: scripts — on
-    # Windows it is a backslash path that bash mangles into nonsense.
-    # Relative paths only here; working-directory (handled natively by
-    # the runner, not bash) stays absolute.
-    #
-    # Build and run share ONE step (same cwd, guaranteed): split steps
-    # resolved profiler-bin/ against different directories depending on
-    # the caller's job-default cwd, so cache misses always failed with
-    # 127 while hits worked. The cache-hit output crosses the step
-    # boundary via env (steps context is unavailable to run: scripts'
-    # shell, but expressions are allowed in env:).
-    - name: profile runner hardware
+    # NOTE: never expand ${{ github.workspace }} inside run: scripts —
+    # on Windows it is a backslash path that bash mangles. Relative
+    # paths plus the quoted $GITHUB_WORKSPACE env (bash-safe) only;
+    # working-directory (handled natively by the runner, not bash)
+    # stays absolute.
+    - if: steps.cache.outputs.cache-hit != 'true'
       shell: bash
       working-directory: ${{ github.workspace }}/scripts/ci/go
-      env:
-        CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
-      run: |
-        if [ "$CACHE_HIT" != 'true' ]; then
-          CGO_ENABLED=0 go build -o ../../profiler-bin/runner-profile ./cmd/runner-profile
-        fi
-        ../../profiler-bin/runner-profile
-    # Trailer: no-op run step declaring the workspace, so the cache
-    # post step resolves `profiler-bin` against it (empirically the
-    # post inherits the last run step's DECLARED working-directory;
-    # without this it looked under scripts/ci/go and never saved).
-    # The `pwd` probes the nested cwd rule; keep it until the save is
-    # proven, then reduce to `true`. DO NOT REMOVE this step without
-    # re-proving post-save.
-    - name: anchor cache post cwd (probe)
+      run: CGO_ENABLED=0 go build -o ../../profiler-bin/runner-profile ./cmd/runner-profile
+    # NO working-directory here — deliberate, and load-bearing for the
+    # cache post step. History, all CI-proven:
+    # - split build/run with a RELATIVE invocation 127'd on misses:
+    #   implicit-cwd steps execute at the caller's job-default
+    #   (rust/ here), where ./profiler-bin/ does not exist;
+    # - merged single step plus an explicit-workspace trailer fixed the
+    #   127 but the post step warned ("do(es) not exist") and never
+    #   saved on any job;
+    # - this saver shape (explicit build, implicit absolute run) saved
+    #   on the only run that ever saved (fmt, run 39050345211).
+    # So: the post step resolves `profiler-bin` against the workspace
+    # only when an implicit-cwd run step exists; the invocation stays
+    # absolute via the quoted $GITHUB_WORKSPACE env (double quotes keep
+    # Windows backslashes literal, so bash cannot mangle them). DO NOT add
+    # working-directory here, and DO NOT make the invocation relative,
+    # without re-proving post-save on all three OSes.
+    - name: profile runner hardware
       shell: bash
-      working-directory: ${{ github.workspace }}
-      run: pwd
+      run: "$GITHUB_WORKSPACE/profiler-bin/runner-profile"
