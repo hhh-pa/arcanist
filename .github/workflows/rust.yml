@@ -47,7 +47,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/profile-runner
         with:
-          cache-key: runner-profile-${{ runner.os }}-${{ hashFiles('.github/actions/profile-runner/**', 'scripts/ci/go/**') }}
+          cache-key: runner-profile-${{ runner.os }}-${{ hashFiles('.github/actions/profile-runner/**', 'scripts/ci/go/go.mod', 'scripts/ci/go/cmd/runner-profile/**', 'scripts/ci/go/internal/executil/**') }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -78,7 +78,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/profile-runner
         with:
-          cache-key: runner-profile-${{ runner.os }}-${{ hashFiles('.github/actions/profile-runner/**', 'scripts/ci/go/**') }}
+          cache-key: runner-profile-${{ runner.os }}-${{ hashFiles('.github/actions/profile-runner/**', 'scripts/ci/go/go.mod', 'scripts/ci/go/cmd/runner-profile/**', 'scripts/ci/go/internal/executil/**') }}
       - uses: dtolnay/rust-toolchain@stable
       # Cargo registry + target/ cache (T1170): warm runs skip crate
       # downloads and reuse prior compilation. `save-if` forces a save
@@ -108,7 +108,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/profile-runner
         with:
-          cache-key: runner-profile-${{ runner.os }}-${{ hashFiles('.github/actions/profile-runner/**', 'scripts/ci/go/**') }}
+          cache-key: runner-profile-${{ runner.os }}-${{ hashFiles('.github/actions/profile-runner/**', 'scripts/ci/go/go.mod', 'scripts/ci/go/cmd/runner-profile/**', 'scripts/ci/go/internal/executil/**') }}
       # Cache key: every input the image depends on. A hit pulls the image
       # and runs the gates in it; a miss rebuilds, pushes, then runs.
       - name: compute image key
@@ -257,7 +257,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/profile-runner
         with:
-          cache-key: runner-profile-${{ runner.os }}-${{ hashFiles('.github/actions/profile-runner/**', 'scripts/ci/go/**') }}
+          cache-key: runner-profile-${{ runner.os }}-${{ hashFiles('.github/actions/profile-runner/**', 'scripts/ci/go/go.mod', 'scripts/ci/go/cmd/runner-profile/**', 'scripts/ci/go/internal/executil/**') }}
       # Same binary cache as the gates preamble: a hit means this
       # exact source hash already passed, so setup and tests skip.
       # Restore-only here; the gates job owns the save.
@@ -296,7 +296,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/profile-runner
         with:
-          cache-key: runner-profile-${{ runner.os }}-${{ hashFiles('.github/actions/profile-runner/**', 'scripts/ci/go/**') }}
+          cache-key: runner-profile-${{ runner.os }}-${{ hashFiles('.github/actions/profile-runner/**', 'scripts/ci/go/go.mod', 'scripts/ci/go/cmd/runner-profile/**', 'scripts/ci/go/internal/executil/**') }}
       - uses: dtolnay/rust-toolchain@stable
       # Cargo registry + target/ cache (T1170): warm runs skip crate
       # downloads and reuse prior compilation. `save-if` forces a save

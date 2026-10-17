@@ -10,13 +10,15 @@ inputs:
     description: >
       Full cache key for the prebuilt profiler binary, shared by every
       job on the OS: runner-profile-<os>-<hash>, where the hash covers
-      this action's sources plus the Go module, e.g.
+      this action's sources plus exactly the Go inputs the build reads
+      (go.mod, cmd/runner-profile, internal/executil), e.g.
       runner-profile-ubuntu-a1b2c3. One entry per OS serves all jobs
-      (like ci-tools); the action hash re-keys automatically whenever
-      this manifest changes, so stale entries from older designs can
-      never shadow a fresh build. (Callers build the key from the
-      runner and hashFiles contexts, which exist in workflows but not
-      in this manifest.)
+      (like ci-tools); unrelated Go tool changes no longer invalidate
+      it, while the action hash re-keys automatically whenever this
+      manifest changes, so stale entries from older designs can never
+      shadow a fresh build. (Callers build the key from the runner and
+      hashFiles contexts, which exist in workflows but not in this
+      manifest.)
     required: true
 runs:
   using: composite
