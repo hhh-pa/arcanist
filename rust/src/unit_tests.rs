@@ -3008,3 +3008,978 @@ fn b23_unit_help_matches_generated_format() {
     let ansi = usage_text(true);
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
+
+// --- T1170 coverage gap: `unit.rs` missed lines ---
+//
+// Each test below names the manifest lines it covers. Skipped clusters
+// (unreachable arms, platform gates, toolchain/ambient requirements) are
+// listed in the task report, not here.
+
+#[test]
+fn git_repo_probe_reports_false_for_missing_dir() {
+    // unit.rs:800 — `git rev-parse` cannot spawn when the cwd is gone.
+    let missing = unique_dir("git-gone").join("no-such-dir");
+    assert!(!is_inside_git_repo(&missing));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn uncommitted_paths_strips_legacy_arrow_and_quotes() {
+    // unit.rs:853,857 — `git status -z` never emits `->` renames (order
+    // is reversed, arrow omitted) or quoting, so these strips only fire
+    // on literal `->`/`"` bytes inside file names. Both bytes are illegal
+    // in Windows names, hence the gate.
+    let repo = unique_dir("git-odd-names");
+    std::fs::create_dir_all(&repo).unwrap();
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(&["init", "-q"]);
+    run(&["config", "user.email", "t@t.test"]);
+    run(&["config", "user.name", "t"]);
+    run(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join("a -> b.txt"), "one\n").unwrap();
+    std::fs::write(repo.join("\"q\""), "one\n").unwrap();
+    run(&["add", "-A"]);
+    run(&["commit", "-qm", "one"]);
+    std::fs::write(repo.join("a -> b.txt"), "two\n").unwrap();
+    std::fs::write(repo.join("\"q\""), "two\n").unwrap();
+    assert_eq!(uncommitted_paths(&repo).unwrap(), args(&["b.txt", "q"]));
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn commit_range_reports_diff_failures() {
+    // unit.rs:886-889 — fresh repo, no commits: the empty-tree base
+    // resolves but `git diff` against the unborn HEAD fails.
+    let repo = unique_dir("git-nodiff");
+    std::fs::create_dir_all(&repo).unwrap();
+    let out = std::process::Command::new("git")
+        .current_dir(&repo)
+        .args(["init", "-q"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let err = commit_range_paths(&repo, crate::git::GIT_MAGIC_ROOT_COMMIT).unwrap_err();
+    assert!(err.starts_with("git diff failed: "), "{err}");
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn select_paths_everything_lists_git_tracked_files() {
+    // unit.rs:1158 — `--everything` inside a git repo lists tracked files.
+    let repo = unique_dir("sel-everything");
+    std::fs::create_dir_all(repo.join("sub")).unwrap();
+    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+    std::fs::write(repo.join("sub").join("b.txt"), "b\n").unwrap();
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}");
+    };
+    run(&["init", "-q"]);
+    run(&["config", "user.email", "t@t.test"]);
+    run(&["config", "user.name", "t"]);
+    run(&["config", "commit.gpgsign", "false"]);
+    run(&["add", "-A"]);
+    run(&["commit", "-qm", "one"]);
+    let opts = Options {
+        everything: true,
+        ..Options::default()
+    };
+    assert_eq!(
+        select_paths(&opts, &repo, &repo).unwrap(),
+        args(&["a.txt", "sub/b.txt"])
+    );
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn select_paths_status_lists_git_uncommitted_files() {
+    // unit.rs:1173 — default selection unions the range with uncommitted
+    // paths; untracked files stay excluded.
+    let repo = unique_dir("sel-status");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}");
+    };
+    run(&["init", "-q"]);
+    run(&["config", "user.email", "t@t.test"]);
+    run(&["config", "user.name", "t"]);
+    run(&["config", "commit.gpgsign", "false"]);
+    run(&["add", "-A"]);
+    run(&["commit", "-qm", "one"]);
+    std::fs::write(repo.join("a.txt"), "two\n").unwrap();
+    std::fs::write(repo.join("new.txt"), "new\n").unwrap();
+    assert_eq!(
+        select_paths(&Options::default(), &repo, &repo).unwrap(),
+        args(&["a.txt"])
+    );
+    let ranged = Options {
+        rev: Some("HEAD".to_string()),
+        ..Options::default()
+    };
+    assert_eq!(
+        select_paths(&ranged, &repo, &repo).unwrap(),
+        args(&["a.txt"])
+    );
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+fn stage_passing_crate(tag: &str) -> PathBuf {
+    let dir = unique_dir(tag);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"t1170fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("src").join("lib.rs"),
+        "#[test]\nfn passes() {\n    assert_eq!(1 + 1, 2);\n}\n",
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn cargo_selection_reports_passing_run() {
+    // unit.rs:1427,3698-3702,3751-3753,3766,3774 — a real `cargo test`
+    // success through the collecting selection: coverage warning,
+    // full-format summary plus tail, exit 0.
+    let dir = stage_passing_crate("cargo-pass");
+    let opts = Options {
+        coverage: true,
+        ..Options::default()
+    };
+    assert_eq!(
+        super::run_cargo_selection(&opts, &dir),
+        std::process::ExitCode::SUCCESS
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn cargo_collecting_renders_json_and_ugly() {
+    // unit.rs:3690-3696 — the machine-format print arms plus the
+    // converted aggregate results.
+    let dir = stage_passing_crate("cargo-fmt");
+    for output in ["json", "ugly"] {
+        let opts = Options {
+            output: Some(output.to_string()),
+            ..Options::default()
+        };
+        let (code, results) = super::run_cargo_collecting(&opts, &dir).unwrap();
+        assert_eq!(code, std::process::ExitCode::SUCCESS, "{output}");
+        assert_eq!(results.len(), 1, "{output}");
+        assert_eq!(results[0].get_name(), "cargo", "{output}");
+        assert_eq!(results[0].get_result(), "pass", "{output}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn load_config_selection_shim_roundtrips() {
+    // unit.rs:1498-1500 — the string-error shim over the classified load.
+    let dir = unique_dir("cfg-shim");
+    std::fs::create_dir_all(&dir).unwrap();
+    let err = super::load_config_selection(&dir).unwrap_err();
+    assert!(err.contains("Unable to find '.arcunit'"), "{err}");
+    std::fs::write(
+        dir.join(".arcunit"),
+        r#"{"engines": {"p": {"type": "phutil"}}}"#,
+    )
+    .unwrap();
+    match super::load_config_selection(&dir).unwrap() {
+        Selection::Config { engines, root } => {
+            assert_eq!(engines.len(), 1);
+            assert_eq!(root, dir);
+        }
+        other => panic!("expected Config, got {other:?}"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn config_selection_reports_unreadable_arcunit() {
+    // unit.rs:1516 — invalid UTF-8 fails `read_to_string` portably.
+    use arc_rs::conduit::EnvelopeKind;
+    let dir = unique_dir("cfg-unread");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(".arcunit"), b"\xff\xfe{\xff").unwrap();
+    let err = super::load_config_selection_classified(&dir).unwrap_err();
+    assert_eq!(err.kind, EnvelopeKind::Exception);
+    assert!(err.message.contains("cannot read"), "{}", err.message);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn discover_selection_config_class_routes_to_arcunit() {
+    // unit.rs:1564 — `unit.engine` naming the configuration-driven
+    // class loads `.arcunit` like the explicit `--engine` path.
+    let dir = unique_dir("cfg-class");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::write(
+        dir.join(".arcconfig"),
+        r#"{"unit.engine": "ArcanistConfigurationDrivenUnitTestEngine"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(".arcunit"),
+        r#"{"engines": {"p": {"type": "phutil"}}}"#,
+    )
+    .unwrap();
+    match discover_selection_classified(&Options::default(), &dir).unwrap() {
+        Selection::Config { engines, root } => {
+            assert_eq!(engines.len(), 1);
+            assert_eq!(root, dir);
+        }
+        other => panic!("expected Config, got {other:?}"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn real_runner_maps_empty_missing_and_ok_commands() {
+    // unit.rs:1607-1627 — the production command runner: empty argv,
+    // spawn failure, and a real exit-0 command.
+    let dir = unique_dir("real-run");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cwd = forward_slashes(&dir);
+
+    let out = RealRunner.run(&[], &cwd);
+    assert_eq!(out.exit_code, 1);
+    assert_eq!(out.stdout, "");
+    assert_eq!(out.stderr, "empty command");
+
+    let out = RealRunner.run(&args(&["definitely-not-a-binary-xyz-123"]), &cwd);
+    assert_eq!(out.exit_code, 1);
+    assert_eq!(out.stdout, "");
+    assert!(
+        out.stderr
+            .starts_with("failed to run 'definitely-not-a-binary-xyz-123': "),
+        "{}",
+        out.stderr
+    );
+
+    let out = RealRunner.run(&args(&["git", "--version"]), &cwd);
+    assert_eq!(out.exit_code, 0);
+    assert!(out.stdout.contains("git version"), "{}", out.stdout);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn real_pytest_fs_probes() {
+    // unit.rs:1642-1653 — the pytest filesystem probes.
+    use crate::unit_pytest::PytestFs;
+    let dir = unique_dir("pytest-fs");
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    let file = dir.join("three.txt");
+    std::fs::write(&file, "a\nb\nc").unwrap();
+    let empty = dir.join("empty.txt");
+    std::fs::write(&empty, "").unwrap();
+    let missing = forward_slashes(&dir.join("missing"));
+    let fs = super::RealPytestFs;
+    let (d, f, e) = (
+        forward_slashes(&dir),
+        forward_slashes(&file),
+        forward_slashes(&empty),
+    );
+    assert!(fs.path_exists(&f));
+    assert!(!fs.path_exists(&missing));
+    assert_eq!(fs.read_file(&f).as_deref(), Some("a\nb\nc"));
+    assert!(fs.read_file(&missing).is_none());
+    assert!(fs.is_dir(&d));
+    assert!(!fs.is_dir(&f));
+    assert!(fs.is_file(&f));
+    assert!(!fs.is_file(&d));
+    assert_eq!(fs.line_count(&f), Some(3));
+    assert_eq!(fs.line_count(&e), Some(1));
+    assert_eq!(fs.line_count(&missing), None);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn real_phpunit_fs_counts_lines() {
+    // unit.rs:1673-1676 — the phpunit line-count probe.
+    use crate::unit_phpunit::PhpunitFs;
+    let dir = unique_dir("phpunit-fs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("two.txt");
+    std::fs::write(&file, "a\nb\n").unwrap();
+    let fs = super::RealPhpunitFs;
+    assert_eq!(fs.line_count(&forward_slashes(&file)), Some(2));
+    assert_eq!(fs.line_count(&forward_slashes(&dir.join("missing"))), None);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn discovery_rules_reject_short_pairs() {
+    // unit.rs:1778 — a discovery target with fewer than two entries.
+    assert!(parse_discovery_rules(&serde_json::json!({"src/(.*)/": [["only-one"]]})).is_none());
+    assert!(parse_discovery_rules(&serde_json::json!({"src/(.*)/": [[42, "b"]]})).is_none());
+}
+
+#[test]
+fn all_files_under_missing_root_is_empty() {
+    // unit.rs:1805 — an unreadable root yields no files.
+    let missing = unique_dir("files-gone").join("no-such-dir");
+    assert!(all_files_under(&forward_slashes(&missing)).is_empty());
+}
+
+#[test]
+fn xunit_generate_maps_pass_fail_and_hard_errors() {
+    // unit.rs:1932-1960 — the regenerate stage with `Build/` plus
+    // `Protobuild.exe` present: pass, fail, and hard-error exits.
+    let root = unique_dir("xunit-gen");
+    std::fs::create_dir_all(root.join("Build")).unwrap();
+    std::fs::write(root.join("Protobuild.exe"), "x").unwrap();
+    let env = crate::unit_xunit::XunitEnvironment {
+        build_engine: "fake-msbuild".to_string(),
+        runtime_engine: String::new(),
+        test_engine: "fake-xunit".to_string(),
+        project_root: forward_slashes(&root),
+        discovery_rules: Vec::new(),
+    };
+    let regen = |argv: &[String], _cwd: &str| {
+        assert!(argv.contains(&"Protobuild.exe".to_string()), "{argv:?}");
+        CapturedOutput::new(0, "regen ok", "")
+    };
+    let pass = super::run_xunit_generate(&env, &regen).unwrap();
+    assert_eq!(pass.len(), 1);
+    assert_eq!(pass[0].get_result(), "pass");
+    assert!(
+        pass[0].get_name().starts_with("(regenerate projects for "),
+        "{}",
+        pass[0].get_name()
+    );
+
+    let failing = |_: &[String], _: &str| CapturedOutput::new(1, "regen log", "");
+    let fail = super::run_xunit_generate(&env, &failing).unwrap();
+    assert_eq!(fail.len(), 1);
+    assert_eq!(fail[0].get_result(), "fail");
+
+    let hard = |_: &[String], _: &str| CapturedOutput::new(3, "", "boom");
+    let err = super::run_xunit_generate(&env, &hard).unwrap_err();
+    assert!(
+        err.message().contains("failed with exit code 3"),
+        "{}",
+        err.message()
+    );
+    assert!(err.message().contains("boom"), "{}", err.message());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn xunit_plan_stops_after_failing_generate() {
+    // unit.rs:1898 — a failing regenerate stage ends the plan before
+    // the build stage runs.
+    let root = unique_dir("xunit-stopgen");
+    std::fs::create_dir_all(root.join("Build")).unwrap();
+    std::fs::write(root.join("Protobuild.exe"), "x").unwrap();
+    let root_s = forward_slashes(&root);
+    let plan = fake_xunit_plan(&root_s, &format!("{root_s}/A.Tests.dll"));
+    let runner = |argv: &[String], _cwd: &str| {
+        assert!(
+            argv.contains(&"Protobuild.exe".to_string()),
+            "must stop before build: {argv:?}"
+        );
+        CapturedOutput::new(1, "gen log", "")
+    };
+    let results = super::run_xunit_plan(&plan, &runner).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get_result(), "fail");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn xunit_plan_stops_after_failing_build() {
+    // unit.rs:1903 — a failing build stage ends the plan before the
+    // test stage runs (no `/xml` invocation).
+    let root = unique_dir("xunit-stopbuild");
+    std::fs::create_dir_all(&root).unwrap();
+    let root_s = forward_slashes(&root);
+    let plan = fake_xunit_plan(&root_s, &format!("{root_s}/A.Tests.dll"));
+    let runner = |argv: &[String], _cwd: &str| {
+        assert_eq!(argv[0], "fake-msbuild", "must stop before test: {argv:?}");
+        CapturedOutput::new(1, "build log", "")
+    };
+    let results = super::run_xunit_plan(&plan, &runner).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get_result(), "fail");
+    assert!(
+        results[0].get_name().starts_with("(build) "),
+        "{}",
+        results[0].get_name()
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn csharp_test_propagates_cover_stage_failures() {
+    // unit.rs:2270 — an unwritable cover stage errors the plan before
+    // any command runs (the project root here is a file).
+    use std::collections::HashMap;
+    let root = unique_dir("csharp-nocover");
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("App.Tests.dll"), "dll").unwrap();
+    let not_a_dir = root.join("not-a-dir");
+    std::fs::write(&not_a_dir, "x").unwrap();
+    let root_s = forward_slashes(&not_a_dir);
+    let assembly = format!("{}/App.Tests.dll", forward_slashes(&bin));
+    let plan = fake_xunit_plan(&root_s, &assembly);
+    let cover = super::CsharpCover {
+        cover_engine: "fake-cscover".to_string(),
+        match_regex: None,
+        excluded: Some(HashMap::new()),
+    };
+    let runner = |_: &[String], _: &str| panic!("no command may run");
+    let err = super::run_csharp_test(&plan, Some(&cover), None, &runner).unwrap_err();
+    assert!(
+        err.message().contains("cannot stage cover file"),
+        "{}",
+        err.message()
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn run_phutil_with_runner_reads_merged_params() {
+    // unit.rs:2408-2416 — the merged-config entry point stages, runs,
+    // parses, and cleans up like the explicit-merge twin.
+    let root = unique_dir("phutil-merge");
+    std::fs::create_dir_all(&root).unwrap();
+    let root_s = forward_slashes(&root);
+    let ctx = EngineContext {
+        project_root: root_s.clone(),
+        paths: vec!["a.php".to_string()],
+        enable_coverage: None,
+        run_all_tests: false,
+    };
+    let runner = |argv: &[String], cwd: &str| {
+        assert_eq!(argv[0], "fake-php");
+        assert_eq!(cwd, root_s);
+        std::fs::write(
+            &argv[3],
+            r#"{"results": [{"name": "t", "result": "pass"}]}"#,
+        )
+        .unwrap();
+        CapturedOutput::new(0, "", "")
+    };
+    let results = run_phutil_with_runner(&ctx, &runner, "phutil", &|| {
+        Some(vec!["fake-php".to_string()])
+    })
+    .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get_result(), "pass");
+    assert_eq!(staged_leftovers(&root).len(), 0);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn phpunit_run_with_existing_config_file_proceeds() {
+    // unit.rs:2510 — a configured `phpunit_config` that EXISTS skips
+    // the missing-file error and runs the engine.
+    let root = unique_dir("phpunit-cfg");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join("src").join("Calc.php"), "<?php\n").unwrap();
+    std::fs::write(root.join("src").join("CalcTest.php"), "<?php\n").unwrap();
+    std::fs::write(root.join("phpunit.xml"), "<x/>").unwrap();
+    std::fs::write(
+        root.join(".arcconfig"),
+        r#"{"phpunit_config": "phpunit.xml"}"#,
+    )
+    .unwrap();
+    let ctx = EngineContext {
+        project_root: forward_slashes(&root),
+        paths: vec!["src/Calc.php".to_string()],
+        enable_coverage: Some(false),
+        run_all_tests: false,
+    };
+    let events = "{\"event\":\"testStart\",\"test\":\"CalcTest::testAdd\"}\n\
+        {\"event\":\"test\",\"test\":\"CalcTest::testAdd\",\"status\":\"pass\",\"time\":0.02}\n";
+    let runner = |argv: &[String], _cwd: &str| {
+        let at = argv.iter().position(|a| a == "--log-json").unwrap();
+        std::fs::write(&argv[at + 1], events).unwrap();
+        CapturedOutput::new(0, "", "")
+    };
+    let results = run_single_with_runner("PhpunitTestEngine", &ctx, &runner).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get_result(), "pass");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn single_report_aggregates_counts_and_success() {
+    // unit.rs:2539-2589 — the single-engine report aggregates counts,
+    // success, and per-test results; unknown engines stay usage errors.
+    let root = unique_dir("single-report");
+    std::fs::create_dir_all(root.join("pkg")).unwrap();
+    std::fs::create_dir_all(root.join("tests").join("pkg")).unwrap();
+    std::fs::write(root.join("pkg").join("mod.py"), "x = 1\n").unwrap();
+    std::fs::write(
+        root.join("tests").join("pkg").join("test_mod.py"),
+        "def test_ok(): pass\n",
+    )
+    .unwrap();
+    let root_s = forward_slashes(&root);
+    let runner = |argv: &[String], _cwd: &str| {
+        let xunit = argv
+            .iter()
+            .find(|a| a.starts_with("--xunit-file="))
+            .unwrap();
+        std::fs::write(xunit.trim_start_matches("--xunit-file="), CANNED_XUNIT).unwrap();
+        CapturedOutput::new(1, "", "")
+    };
+    let report = run_single_report(
+        "NoseTestEngine",
+        &root_s,
+        &["pkg/mod.py".to_string()],
+        false,
+        Some(false),
+        &runner,
+    )
+    .unwrap();
+    assert_eq!(report.engine, "NoseTestEngine");
+    assert_eq!((report.passed, report.failed), (1, 1));
+    assert!(!report.success);
+    assert_eq!(report.results.len(), 2);
+
+    let err = run_single_report("Bogus", &root_s, &[], false, Some(false), &runner).unwrap_err();
+    assert!(err.contains("is not a subclass of"), "{err}");
+    let err = run_single_report_classified("Bogus", &root_s, &[], false, Some(false), &runner)
+        .unwrap_err();
+    assert_eq!(err.kind, arc_rs::conduit::EnvelopeKind::Usage);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn merge_ordered_updates_seeded_paths_in_place() {
+    // unit.rs:2976 — a requested path that also has coverage keeps its
+    // seed slot and takes the merged fraction.
+    let (sorted, reports) = merge_file_coverage_ordered(
+        &["f.php".to_string()],
+        &[("f.php".to_string(), vec!["CC".to_string()])],
+    );
+    assert_eq!(sorted, vec![("f.php".to_string(), 1.0)]);
+    assert_eq!(reports["f.php"], "CC");
+}
+
+#[test]
+fn cargo_outcome_codes_convert_all_outcomes() {
+    // unit.rs:3707-3727 — every cargo outcome converts to its engine
+    // result code with name and duration intact.
+    assert_eq!(super::cargo_outcome_code(Outcome::Pass), "pass");
+    assert_eq!(super::cargo_outcome_code(Outcome::Fail), "fail");
+    assert_eq!(super::cargo_outcome_code(Outcome::Skip), "skip");
+    assert_eq!(super::cargo_outcome_code(Outcome::Broken), "broken");
+    assert_eq!(super::cargo_outcome_code(Outcome::Unsound), "unsound");
+
+    let converted = super::convert_cargo_result(&UnitResult::new("n", Outcome::Skip, 0.5));
+    assert_eq!(converted.get_name(), "n");
+    assert_eq!(converted.get_result(), "skip");
+    assert_eq!(converted.get_duration(), Some(0.5));
+
+    let report = EngineReport {
+        engine: "cargo".to_string(),
+        passed: 1,
+        failed: 1,
+        duration_ms: 9,
+        success: false,
+        tail: String::new(),
+        results: vec![
+            UnitResult::new("a", Outcome::Pass, 0.1),
+            UnitResult::new("b", Outcome::Broken, 0.2),
+        ],
+    };
+    let converted = super::converted_cargo_results(&report);
+    assert_eq!(converted.len(), 2);
+    assert_eq!(converted[0].get_result(), "pass");
+    assert_eq!(converted[1].get_result(), "broken");
+}
+
+#[test]
+fn upload_cargo_target_maps_success_to_overall() {
+    // unit.rs:3733-3739 — both overall arms reach the conduit upload,
+    // which fails deterministically against an invalid URI with no token.
+    let opts = Options {
+        target: Some("PHID-1".to_string()),
+        conduit_uri: Some("https://invalid.invalid/".to_string()),
+        ..Options::default()
+    };
+    for success in [true, false] {
+        let report = EngineReport {
+            engine: "cargo".to_string(),
+            passed: u32::from(success),
+            failed: u32::from(!success),
+            duration_ms: 1,
+            success,
+            tail: String::new(),
+            results: Vec::new(),
+        };
+        let err = super::upload_cargo_target(&opts, &report).unwrap_err();
+        assert!(
+            err.contains("no token") || err.contains("transport") || err.contains("conduit"),
+            "{success}: {err}"
+        );
+    }
+}
+
+#[test]
+fn empty_json_object_renders_braces() {
+    // unit.rs:3742-3744 — the pretty-print fallback.
+    let err = serde_json::from_str::<serde_json::Value>("{bad").unwrap_err();
+    assert_eq!(super::empty_json_object(err), "{}");
+}
+
+#[test]
+fn cargo_selection_reports_missing_crate() {
+    // unit.rs:3754 — a cargo run outside any crate reports a generic
+    // failure.
+    let dir = unique_dir("cargo-nocrate");
+    std::fs::create_dir_all(&dir).unwrap();
+    assert_eq!(
+        super::run_cargo_selection(&Options::default(), &dir),
+        std::process::ExitCode::FAILURE
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn single_collecting_rejects_cargo_args() {
+    // unit.rs:3820-3826 — `cargo test` args need the cargo engine.
+    use arc_rs::conduit::EnvelopeKind;
+    let dir = unique_dir("single-cargoargs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let opts = Options {
+        cargo_args: args(&["--nocapture"]),
+        ..Options::default()
+    };
+    let err = super::run_single_collecting(&opts, &dir, "NoseTestEngine", &[], false).unwrap_err();
+    assert_eq!(err.kind, EnvelopeKind::Usage);
+    assert_eq!(
+        err.message,
+        "cargo test args after '--' require the cargo engine"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn single_collecting_reports_unknown_engine() {
+    // unit.rs:3827-3840,3842 — an unknown engine class fails before any
+    // command runs.
+    use arc_rs::conduit::EnvelopeKind;
+    let dir = unique_dir("single-bogus");
+    std::fs::create_dir_all(&dir).unwrap();
+    let err =
+        super::run_single_collecting(&Options::default(), &dir, "Bogus", &[], false).unwrap_err();
+    assert_eq!(err.kind, EnvelopeKind::Usage);
+    assert!(
+        err.message.contains("is not a subclass of"),
+        "{}",
+        err.message
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn config_collecting_rejects_cargo_args() {
+    // unit.rs:3869-3874 — `cargo test` args need the cargo engine.
+    use arc_rs::conduit::EnvelopeKind;
+    let dir = unique_dir("config-cargoargs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let opts = Options {
+        cargo_args: args(&["--nocapture"]),
+        ..Options::default()
+    };
+    let err = super::run_config_collecting(&opts, &[], &dir, &[], false).unwrap_err();
+    assert_eq!(err.kind, EnvelopeKind::Usage);
+    assert_eq!(
+        err.message,
+        "cargo test args after '--' require the cargo engine"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn config_collecting_reports_bad_child() {
+    // unit.rs:3875-3888,3892 — an unknown child engine class fails the
+    // config run as a usage error.
+    use arc_rs::conduit::EnvelopeKind;
+    let dir = unique_dir("config-badchild");
+    std::fs::create_dir_all(&dir).unwrap();
+    let planned = vec![crate::unit_config::PlannedEngine {
+        name: "bad".to_string(),
+        engine_type: "Bogus".to_string(),
+        include: Vec::new(),
+        exclude: Vec::new(),
+    }];
+    let err =
+        super::run_config_collecting(&Options::default(), &planned, &dir, &[], false).unwrap_err();
+    assert_eq!(err.kind, EnvelopeKind::Usage);
+    assert!(
+        err.message.contains("is not a subclass of"),
+        "{}",
+        err.message
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn finish_php_report_collecting_maps_exit_codes() {
+    // unit.rs:3902-3921,3929 — print per the output format, skip the
+    // upload without a target, map the overall result to the exit code,
+    // and pass the results through.
+    let dir = unique_dir("finish-map");
+    std::fs::create_dir_all(&dir).unwrap();
+    let report = ConfigReport {
+        engine: "NoseTestEngine".to_string(),
+        passed: 1,
+        failed: 1,
+        duration_ms: 3,
+        success: false,
+        results: vec![engine_result("a", "pass"), engine_result("b", "fail")],
+    };
+    let opts = Options {
+        output: Some("none".to_string()),
+        ..Options::default()
+    };
+    let (code, results) =
+        super::finish_php_report_collecting(&opts, &dir, &[], &report, false, None).unwrap();
+    assert_eq!(code, std::process::ExitCode::from(2));
+    assert_eq!(results.len(), 2);
+
+    let passing = ConfigReport {
+        passed: 1,
+        failed: 0,
+        success: true,
+        results: vec![engine_result("a", "pass")],
+        ..report
+    };
+    let (code, results) =
+        super::finish_php_report_collecting(&Options::default(), &dir, &[], &passing, false, None)
+            .unwrap();
+    assert_eq!(code, std::process::ExitCode::SUCCESS);
+    assert_eq!(results.len(), 1);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn finish_php_report_collecting_upload_failure_is_generic() {
+    // unit.rs:3922-3928,3933-3955 — an upload failure becomes a generic
+    // error through the options-threaded upload.
+    use arc_rs::conduit::EnvelopeKind;
+    let dir = unique_dir("finish-upload");
+    std::fs::create_dir_all(&dir).unwrap();
+    let report = ConfigReport {
+        engine: "NoseTestEngine".to_string(),
+        passed: 1,
+        failed: 0,
+        duration_ms: 1,
+        success: true,
+        results: vec![engine_result("a", "pass")],
+    };
+    let opts = Options {
+        output: Some("none".to_string()),
+        target: Some("PHID-1".to_string()),
+        conduit_uri: Some("https://invalid.invalid/".to_string()),
+        ..Options::default()
+    };
+    let err =
+        super::finish_php_report_collecting(&opts, &dir, &[], &report, false, None).unwrap_err();
+    assert_eq!(err.kind, EnvelopeKind::Exception);
+    assert!(
+        err.message.contains("no token")
+            || err.message.contains("transport")
+            || err.message.contains("conduit"),
+        "{}",
+        err.message
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn parse_unit_options_ok_path() {
+    // unit.rs:3959 — valid argv parses through.
+    let opts = super::parse_unit_options(&args(&[])).unwrap();
+    assert_eq!(opts.engine, "cargo");
+    assert!(!opts.help);
+}
+
+#[test]
+fn unit_working_dir_returns_cwd() {
+    // unit.rs:3971-3973 — the happy path returns the process cwd.
+    assert_eq!(
+        super::unit_working_dir().unwrap(),
+        std::env::current_dir().unwrap()
+    );
+}
+
+#[test]
+fn plan_run_single_selects_paths() {
+    // unit.rs:4040-4043 — an explicit engine plus explicit paths plans a
+    // single run (`.hg` marks the working copy without needing git).
+    let dir = unique_dir("plan-single");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join(".hg")).unwrap();
+    std::fs::write(dir.join("f.php"), "<?php\n").unwrap();
+    let opts = parse_args(&args(&["--engine", "NoseTestEngine", "f.php"])).unwrap();
+    let super::PlannedRun::Single { class, paths } = plan_run(&opts, &dir).unwrap() else {
+        panic!("expected Single");
+    };
+    assert_eq!(class, "NoseTestEngine");
+    assert_eq!(paths, args(&["f.php"]));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn plan_run_config_selects_paths() {
+    // unit.rs:4045-4051 — the configuration-driven class plus explicit
+    // paths plans a config run over `.arcunit`.
+    let dir = unique_dir("plan-config");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join(".hg")).unwrap();
+    std::fs::write(dir.join("f.php"), "<?php\n").unwrap();
+    std::fs::write(
+        dir.join(".arcunit"),
+        r#"{"engines": {"p": {"type": "phutil"}}}"#,
+    )
+    .unwrap();
+    let opts = parse_args(&args(&[
+        "--engine",
+        "ArcanistConfigurationDrivenUnitTestEngine",
+        "f.php",
+    ]))
+    .unwrap();
+    let super::PlannedRun::Config {
+        engines,
+        root,
+        paths,
+    } = plan_run(&opts, &dir).unwrap()
+    else {
+        panic!("expected Config");
+    };
+    assert_eq!(engines.len(), 1);
+    assert_eq!(root, dir);
+    assert_eq!(paths, args(&["f.php"]));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn single_selection_reports_errors() {
+    // unit.rs:3798-3805,3807-3809 — the single-run wrapper maps a
+    // collecting failure to its reported exit code.
+    let dir = unique_dir("single-sel");
+    std::fs::create_dir_all(&dir).unwrap();
+    assert_eq!(
+        super::run_single_selection(&Options::default(), &dir, "Bogus", &[], false),
+        std::process::ExitCode::FAILURE
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn config_selection_reports_errors() {
+    // unit.rs:3847-3854,3856-3858 — the config-run wrapper maps a
+    // collecting failure to its reported exit code.
+    let dir = unique_dir("config-sel");
+    std::fs::create_dir_all(&dir).unwrap();
+    let planned = vec![crate::unit_config::PlannedEngine {
+        name: "bad".to_string(),
+        engine_type: "Bogus".to_string(),
+        include: Vec::new(),
+        exclude: Vec::new(),
+    }];
+    assert_eq!(
+        super::run_config_selection(&Options::default(), &planned, &dir, &[], false),
+        std::process::ExitCode::FAILURE
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn child_collecting_help_and_usage_errors() {
+    // unit.rs:4075-4082 — `diff`'s child entry rejects `--help` and bad
+    // flags as unreported usage errors.
+    use arc_rs::conduit::EnvelopeKind;
+    let dir = unique_dir("child-parse");
+    std::fs::create_dir_all(&dir).unwrap();
+    let err = run_in_collecting(&dir, &args(&["--help"])).unwrap_err();
+    assert_eq!(err.kind, EnvelopeKind::Usage);
+    assert_eq!(err.message, "unexpected --help in child unit argv");
+    let err = run_in_collecting(&dir, &args(&["--bogus"])).unwrap_err();
+    assert_eq!(err.kind, EnvelopeKind::Usage);
+    assert_eq!(err.message, "Unknown argument 'bogus'. Try 'arc help'.");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn child_collecting_runs_each_selection() {
+    // unit.rs:4086-4094 — the child entry dispatches cargo, single, and
+    // config selections; each sub-case fails deterministically without
+    // external tools (missing crate, missing phpunit config, empty
+    // engine map).
+    let dir = unique_dir("child-cargo");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join(".hg")).unwrap();
+    let err = run_in_collecting(&dir, &args(&["--engine", "cargo"])).unwrap_err();
+    assert!(err.message.contains("no Cargo.toml"), "{}", err.message);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let dir = unique_dir("child-single");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join(".hg")).unwrap();
+    std::fs::write(dir.join("f.php"), "<?php\n").unwrap();
+    std::fs::write(
+        dir.join(".arcconfig"),
+        r#"{"phpunit_config": "missing.xml"}"#,
+    )
+    .unwrap();
+    let err =
+        run_in_collecting(&dir, &args(&["--engine", "PhpunitTestEngine", "f.php"])).unwrap_err();
+    assert!(
+        err.message
+            .contains("PHPUnit configuration file was not found"),
+        "{}",
+        err.message
+    );
+    std::fs::remove_dir_all(&dir).ok();
+
+    let dir = unique_dir("child-config");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join(".hg")).unwrap();
+    std::fs::write(dir.join("f.php"), "<?php\n").unwrap();
+    std::fs::write(dir.join(".arcunit"), r#"{"engines": {}}"#).unwrap();
+    let err = run_in_collecting(
+        &dir,
+        &args(&[
+            "--engine",
+            "ArcanistConfigurationDrivenUnitTestEngine",
+            "f.php",
+        ]),
+    )
+    .unwrap_err();
+    assert_eq!(err.message, "No tests to run.");
+    std::fs::remove_dir_all(&dir).ok();
+}

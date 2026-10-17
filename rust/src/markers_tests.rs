@@ -816,3 +816,836 @@ fn b23_markers_help_stays_custom() {
     assert!(text.starts_with("usage: arc markers"), "{text}");
     assert!(!text.contains("WORKFLOW"), "{text}");
 }
+
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path =
+            std::env::temp_dir().join(format!("arc-rs-markers-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn init_repo(tag: &str) -> TempDir {
+    let tmp = TempDir::new(tag);
+    git(tmp.path(), &["init", "-q", "-b", "master"]);
+    git(tmp.path(), &["config", "user.email", "t@t"]);
+    git(tmp.path(), &["config", "user.name", "t"]);
+    git(tmp.path(), &["config", "commit.gpgsign", "false"]);
+    std::fs::write(tmp.path().join("f.txt"), "one\n").unwrap();
+    git(tmp.path(), &["add", "f.txt"]);
+    git(tmp.path(), &["commit", "-qm", "add f"]);
+    tmp
+}
+
+/// A fake `hg` whose stdout is `body` (mirrors `HgCommand::custom`;
+/// the appended hg argv are ignored by `sh -c`).
+fn fake_hg_stdout(body: &str) -> crate::hg::HgCommand {
+    crate::hg::HgCommand {
+        program: "sh".to_string(),
+        prefix: vec!["-c".to_string(), format!("printf '%s' '{body}'")],
+    }
+}
+
+/// Serve canned Conduit envelopes in order; returns the base URI and
+/// the observed (request line, body) pairs once all are served.
+fn serve_seq(canned: Vec<String>) -> (String, std::sync::mpsc::Receiver<Vec<(String, String)>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for body in canned {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8(head).unwrap();
+            let len: usize = head
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                })
+                .unwrap_or(0);
+            let mut raw = vec![0u8; len];
+            stream.read_exact(&mut raw).unwrap();
+            let line = head.lines().next().unwrap_or("").to_string();
+            seen.push((line, String::from_utf8(raw).unwrap()));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+        tx.send(seen).unwrap();
+    });
+    (base, rx)
+}
+
+fn set_view(id: u64, parent: Option<u64>, children: Vec<u64>, group: u64) -> SetView {
+    SetView {
+        set_id: id,
+        parent,
+        children,
+        group,
+        members: Vec::new(),
+        depth: 0,
+    }
+}
+
+#[test]
+fn t1170_resolve_type_covers_bookmark_branch_and_unknown() {
+    let empty = TempDir::new("resolve-empty");
+    let err = resolve_type(empty.path(), Some(MARKER_TYPE_BOOKMARK)).unwrap_err();
+    assert!(err.contains("no Mercurial '.hg' directory found"), "{err}");
+    let err = resolve_type(empty.path(), Some(MARKER_TYPE_BRANCH)).unwrap_err();
+    assert!(err.contains("no git repository or Mercurial"), "{err}");
+    let err = resolve_type(empty.path(), Some("tag")).unwrap_err();
+    assert_eq!(err, "unknown marker type 'tag'");
+    let hg = TempDir::new("resolve-hg");
+    std::fs::create_dir(hg.path().join(".hg")).unwrap();
+    assert_eq!(
+        resolve_type(hg.path(), Some(MARKER_TYPE_BOOKMARK)).unwrap(),
+        MARKER_TYPE_BOOKMARK
+    );
+}
+
+#[test]
+fn t1170_php_int_prefix_parses_signs_like_php_cast() {
+    assert_eq!(php_int_prefix("-12abc"), -12);
+    assert_eq!(php_int_prefix("+7"), 7);
+    assert_eq!(php_int_prefix("1729000000 +0200"), 1_729_000_000);
+    assert_eq!(php_int_prefix("abc"), 0);
+    assert_eq!(php_int_prefix(""), 0);
+}
+
+#[test]
+fn t1170_query_git_markers_fails_outside_repos() {
+    let empty = TempDir::new("gitmarkers-empty");
+    let err = query_git_markers(empty.path(), MARKER_TYPE_BRANCH, false).unwrap_err();
+    assert!(!err.is_empty());
+}
+
+#[test]
+fn t1170_query_git_markers_filters_type_and_marks_current() {
+    let repo = init_repo("gitmarkers");
+    let branches = query_git_markers(repo.path(), MARKER_TYPE_BRANCH, false).unwrap();
+    assert_eq!(branches.len(), 1);
+    assert_eq!(branches[0].name, "master");
+    assert!(branches[0].active);
+    assert!(!branches[0].summary.is_empty());
+    // No bookmark flavor under git: every record filters out.
+    let bookmarks = query_git_markers(repo.path(), MARKER_TYPE_BOOKMARK, false).unwrap();
+    assert!(bookmarks.is_empty());
+}
+
+#[test]
+fn t1170_bundled_extension_reinstalls_when_missing() {
+    let target = std::env::temp_dir().join(format!("arc-hg-{:016x}.py", arc_hg_content_tag()));
+    std::fs::remove_file(&target).ok();
+    let script = materialize_bundled_arc_hg().unwrap();
+    assert_eq!(script, target);
+    assert_eq!(std::fs::read_to_string(&script).unwrap(), ARC_HG_BUNDLED);
+}
+
+#[test]
+fn t1170_arc_hg_script_prefers_checkout_copy() {
+    let root = TempDir::new("archg");
+    let nested = root.path().join("a").join("b");
+    let script = root.path().join("support").join("hg").join("arc-hg.py");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+    std::fs::write(&script, "# fake arc-hg").unwrap();
+    assert_eq!(arc_hg_script(&nested), Some(script));
+}
+
+#[test]
+fn t1170_hg_flags_treat_arrays_and_objects_like_php_empty() {
+    let markers = parse_hg_ls_markers(
+        r#"[
+            {"type": "bookmark", "name": "a", "node": "aaa", "isActive": []},
+            {"type": "bookmark", "name": "b", "node": "bbb", "isActive": [1]},
+            {"type": "bookmark", "name": "c", "node": "ccc", "isActive": {}},
+            {"type": "bookmark", "name": "d", "node": "ddd", "isActive": {"x": 1}}
+        ]"#,
+    )
+    .unwrap();
+    assert!(!markers[0].active);
+    assert!(markers[1].active);
+    assert!(!markers[2].active);
+    assert!(markers[3].active);
+}
+
+#[test]
+fn t1170_query_hg_markers_needs_mercurial_checkout() {
+    let empty = TempDir::new("hgmarkers-empty");
+    let hg = crate::hg::HgCommand::custom("true", &[]);
+    assert_eq!(
+        query_hg_markers_with(empty.path(), &hg, MARKER_TYPE_BRANCH).unwrap_err(),
+        "not inside a Mercurial working copy"
+    );
+    // The system-hg entry point surfaces hg failures as errors.
+    let hgdir = TempDir::new("hgmarkers-sys");
+    std::fs::create_dir(hgdir.path().join(".hg")).unwrap();
+    assert!(query_hg_markers(hgdir.path(), MARKER_TYPE_BRANCH).is_err());
+}
+
+#[test]
+fn t1170_query_hg_markers_filters_by_type() {
+    let dir = TempDir::new("hgmarkers-fake");
+    std::fs::create_dir(dir.path().join(".hg")).unwrap();
+    let body = r#"[
+        {"type": "branch", "name": "main", "node": "aaa", "isActive": true, "description": "first"},
+        {"type": "bookmark", "name": "mark", "node": "bbb", "isActive": false, "description": "second"}
+    ]"#;
+    let markers =
+        query_hg_markers_with(dir.path(), &fake_hg_stdout(body), MARKER_TYPE_BOOKMARK).unwrap();
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].name, "mark");
+    assert_eq!(markers[0].marker_type, MARKER_TYPE_BOOKMARK);
+    assert_eq!(markers[0].summary, "second");
+}
+
+#[test]
+fn t1170_published_git_hashes_need_conduit() {
+    let repo = init_repo("pubhashes");
+    let sha = git(repo.path(), &["rev-parse", "HEAD"]);
+    git(
+        repo.path(),
+        &["remote", "add", "origin", "git@h.test:repo.git"],
+    );
+    git(
+        repo.path(),
+        &["update-ref", "refs/remotes/origin/main", &sha],
+    );
+    assert_eq!(
+        published_git_hashes(repo.path(), None).unwrap_err(),
+        crate::conduit::no_uri_block()
+    );
+}
+
+#[test]
+fn t1170_published_git_hashes_keep_permanent_refs() {
+    let repo = init_repo("pubhashes-mock");
+    let sha = git(repo.path(), &["rev-parse", "HEAD"]);
+    git(
+        repo.path(),
+        &["remote", "add", "origin", "git@h.test:repo.git"],
+    );
+    git(
+        repo.path(),
+        &["update-ref", "refs/remotes/origin/main", &sha],
+    );
+    git(
+        repo.path(),
+        &["update-ref", "refs/remotes/origin/feature", &sha],
+    );
+    git(
+        repo.path(),
+        &["update-ref", "refs/remotes/stale/other", &sha],
+    );
+    let hit = repository_hit("repo", "git@h.test:repo.git", &["main"]);
+    let (base, rx) = serve_seq(vec![format!(
+        r#"{{"result": {{"data": [{hit}]}}, "error_code": null}}"#
+    )]);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    // `main` is permanent; `feature` is not; `stale` names no remote.
+    let hashes = published_git_hashes(repo.path(), Some(&client)).unwrap();
+    assert_eq!(hashes, vec![sha]);
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(seen.len(), 1);
+}
+
+#[test]
+fn t1170_permanent_refs_need_push_uri_and_rule_match() {
+    // No push URI: never permanent.
+    let remote = RemoteRef {
+        name: "origin".to_string(),
+        fetch_uri: None,
+        push_uri: None,
+    };
+    assert!(!is_permanent_git_ref(&[], &remote, "main"));
+    // A repository whose URIs never match leaves no winner.
+    let other = revision::RepositoryRef::from_search_hit(&repository_hit(
+        "r",
+        "git@h.test:other.git",
+        &["main"],
+    ));
+    let remote = remote_with_push("origin", "git@h.test:repo.git");
+    assert!(!is_permanent_git_ref(
+        std::slice::from_ref(&other),
+        &remote,
+        "main"
+    ));
+}
+
+#[test]
+fn t1170_published_hg_hashes_list_nodes() {
+    let dir = TempDir::new("pubhg");
+    let hg = fake_hg_stdout("aaa111\n\nbbb222\n");
+    assert_eq!(
+        published_hg_hashes_with(dir.path(), &hg).unwrap(),
+        vec!["aaa111".to_string(), "bbb222".to_string()]
+    );
+    assert!(published_hg_hashes(dir.path()).is_err());
+}
+
+#[test]
+fn t1170_revision_id_index_skips_bad_fields_and_groups_dupes() {
+    let states = vec![
+        StateCommit {
+            hash: "bad".to_string(),
+            message: "x\n\nDifferential Revision: xyz".to_string(),
+        },
+        StateCommit {
+            hash: "h1".to_string(),
+            message: "one\n\nDifferential Revision: D5".to_string(),
+        },
+        StateCommit {
+            hash: "h2".to_string(),
+            message: "two\n\nDifferential Revision: D5".to_string(),
+        },
+        StateCommit {
+            hash: "plain".to_string(),
+            message: "no field".to_string(),
+        },
+    ];
+    let (map, order) = revision_id_index(&states);
+    assert_eq!(order, vec![5]);
+    assert_eq!(
+        map.get(&5).unwrap(),
+        &vec!["h1".to_string(), "h2".to_string()]
+    );
+}
+
+#[test]
+fn t1170_load_revision_refs_merges_message_query_hits() {
+    let states = vec![StateCommit {
+        hash: "abc".to_string(),
+        message: "change\n\nDifferential Revision: D7".to_string(),
+    }];
+    let query_rows = r#"[{"id": 7, "phid": "PHID-DREV-7", "hashes": [["gtcm", "abc"]]}]"#;
+    let hit = serde_json::json!({
+        "id": 7,
+        "phid": "PHID-DREV-7",
+        "fields": {
+            "title": "change",
+            "status": {"value": "needs-review", "name": "Needs Review"},
+        },
+    });
+    let (base, rx) = serve_seq(vec![
+        format!(r#"{{"result": {query_rows}, "error_code": null}}"#),
+        format!(r#"{{"result": {{"data": [{hit}]}}, "error_code": null}}"#),
+    ]);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    let merged = load_revision_refs_for_vcs(Some(&client), &states, "git").unwrap();
+    // The hash query and the id query agree on PHID-DREV-7: one ref.
+    let refs = merged.get("abc").unwrap();
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].id(), 7);
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(seen.len(), 2);
+}
+
+#[test]
+fn t1170_hash_active_and_parent_lookups_miss_cleanly() {
+    let groups: HashMap<String, Vec<MarkerRef>> = HashMap::new();
+    assert!(!hash_has_active_marker(&groups, "zzz"));
+    let sets: Vec<commitgraph::CommitSet> = Vec::new();
+    assert!(parent_set_ids(&sets, 99).is_empty());
+}
+
+#[test]
+fn t1170_marker_part_vectors_handle_empty_names() {
+    let mut names = Vec::new();
+    assert_eq!(set_marker_parts(&[], &mut names), (0, String::new()));
+    assert!(names.is_empty());
+    let empty = partition_sort_vector(false, 0, &[]);
+    let marked = partition_sort_vector(false, 0, &["main".to_string()]);
+    assert_ne!(empty.sort_string(), marked.sort_string());
+    let active = partition_sort_vector(true, 0, &[]);
+    assert_ne!(empty.sort_string(), active.sort_string());
+}
+
+#[test]
+fn t1170_partition_order_compares_bytes_then_position() {
+    use std::cmp::Ordering;
+    assert_eq!(
+        partition_order_cmp(&("a".to_string(), 0), &("b".to_string(), 0)),
+        Ordering::Less
+    );
+    assert_eq!(
+        partition_order_cmp(&("b".to_string(), 0), &("a".to_string(), 0)),
+        Ordering::Greater
+    );
+    assert_eq!(
+        partition_order_cmp(&("a".to_string(), 0), &("a".to_string(), 1)),
+        Ordering::Less
+    );
+    assert_eq!(
+        partition_order_cmp(&("a".to_string(), 1), &("a".to_string(), 1)),
+        Ordering::Equal
+    );
+}
+
+#[test]
+#[should_panic(expected = "vector keys cover every set")]
+fn t1170_find_set_position_panics_off_map() {
+    let sets: Vec<commitgraph::CommitSet> = Vec::new();
+    find_set_position(&sets, 7);
+}
+
+#[test]
+#[should_panic(expected = "view ids resolve")]
+fn t1170_view_index_panics_off_map() {
+    view_index(&[], 7);
+}
+
+#[test]
+fn t1170_build_set_views_tolerates_unknown_sets() {
+    let sets: HashMap<u64, &commitgraph::CommitSet> = HashMap::new();
+    let views = build_set_views(&sets, 99);
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0].set_id, 99);
+    assert!(views[0].parent.is_none());
+    assert!(views[0].children.is_empty());
+}
+
+#[test]
+fn t1170_group_for_view_covers_shapes() {
+    // Childless views group alone.
+    let views = vec![set_view(1, None, vec![], 1)];
+    assert_eq!(
+        group_for_view(&views, 0, &HashMap::new(), &HashMap::new()),
+        1
+    );
+    // Revised views group alone even with children.
+    let views = vec![set_view(1, None, vec![2], 1)];
+    let revisions = HashMap::from([(1u64, true)]);
+    assert_eq!(group_for_view(&views, 0, &revisions, &HashMap::new()), 1);
+    // A root with children groups alone.
+    let views = vec![set_view(1, None, vec![2], 1)];
+    assert_eq!(
+        group_for_view(&views, 0, &HashMap::new(), &HashMap::new()),
+        1
+    );
+    // An only child joins its parent's group.
+    let views = vec![
+        set_view(1, None, vec![2], 7),
+        set_view(2, Some(1), vec![3], 2),
+    ];
+    assert_eq!(
+        group_for_view(&views, 1, &HashMap::new(), &HashMap::new()),
+        7
+    );
+    // A non-only child groups alone.
+    let views = vec![
+        set_view(1, None, vec![2, 3], 7),
+        set_view(2, Some(1), vec![4], 2),
+    ];
+    assert_eq!(
+        group_for_view(&views, 1, &HashMap::new(), &HashMap::new()),
+        2
+    );
+}
+
+#[test]
+fn t1170_small_groups_split_into_singletons() {
+    let mut holder = set_view(1, None, vec![2], 1);
+    holder.members = vec![1, 2];
+    let mut views = vec![holder, set_view(2, Some(1), vec![], 1)];
+    split_small_groups(&mut views);
+    assert_eq!(views[0].group, 1);
+    assert_eq!(views[0].members, vec![1]);
+    assert_eq!(views[1].group, 2);
+    assert_eq!(views[1].members, vec![2]);
+}
+
+#[test]
+fn t1170_view_depth_steps_two_past_groups() {
+    let mut holder = set_view(1, None, vec![2], 1);
+    holder.members = vec![1, 2];
+    holder.depth = 5;
+    let views = vec![holder, set_view(2, Some(1), vec![], 2)];
+    assert_eq!(view_depth(&views, 1), 7);
+    assert_eq!(view_depth(&views, 0), 0);
+}
+
+#[test]
+fn t1170_commit_merge_map_skips_phid_less_revisions() {
+    let commits = vec![("h".to_string(), "msg\n".to_string())];
+    let bare = revision::RevisionRef::from_query_row(&serde_json::json!({"id": 5}));
+    let merge_strings = revision_merge_strings(std::slice::from_ref(&bare));
+    let map = commit_merge_map(&commits, std::slice::from_ref(&bare), &merge_strings);
+    assert!(map.is_empty());
+}
+
+#[test]
+fn t1170_find_revision_by_phid_reports_both_ways() {
+    let refs = vec![revision(1, "PHID-DREV-1", "one", false)];
+    assert_eq!(find_revision_by_phid(&refs, "PHID-DREV-1"), Some(0));
+    assert_eq!(find_revision_by_phid(&refs, "PHID-DREV-9"), None);
+}
+
+#[test]
+fn t1170_paired_indexes_skip_unknown_phids() {
+    let commits = vec![("h".to_string(), "m\n".to_string())];
+    let merge_map = HashMap::from([("PHID-DREV-9".to_string(), vec![0usize])]);
+    let (result, merged) = paired_revision_indexes(&commits, &[], &merge_map);
+    assert!(result.is_empty());
+    assert!(merged.is_empty());
+}
+
+#[test]
+fn t1170_commit_marker_list_ignores_empty_groups() {
+    let commits = vec![("h".to_string(), "m\n".to_string())];
+    let item = Item {
+        commit: Some(0),
+        ..Item::default()
+    };
+    let markers = HashMap::from([("h".to_string(), Vec::new())]);
+    assert!(commit_marker_list(&item, &commits, &markers).is_none());
+}
+
+#[test]
+fn t1170_commit_range_label_handles_empty_views() {
+    assert_eq!(commit_range_label(&[]), "");
+    assert_eq!(
+        commit_range_label(&[("abc123456789".to_string(), "m".to_string())]),
+        "abc1234"
+    );
+}
+
+#[test]
+fn t1170_marker_cell_geometry_caps_depth_by_width() {
+    assert_eq!(marker_cell_geometry(99, Some(80)), (8, 16));
+    assert_eq!(marker_cell_geometry(1, Some(80)), (2, 22));
+}
+
+#[test]
+fn t1170_first_row_path_marks_open_parents() {
+    assert_eq!(first_row_path(2, false, false), "┗━┯ ");
+    assert_eq!(first_row_path(0, false, true), "• ");
+}
+
+#[test]
+fn t1170_marker_item_path_indents_nested_rows() {
+    let item = Item::default();
+    assert_eq!(marker_item_path(&item, false, true, 2, false), "  └ ");
+    assert_eq!(marker_item_path(&item, false, true, 0, false), "└ ");
+}
+
+#[test]
+fn t1170_draw_view_row_indents_deep_views() {
+    let commits = vec![("aaa1111".to_string(), "first\n".to_string())];
+    let items = vec![Item {
+        commit: Some(0),
+        ..Item::default()
+    }];
+    let cells = draw_view_row(&commits, &[], items, 1, 2, false, Some(80), false);
+    let marker = cells[0].display_lines().join("\n");
+    assert!(marker.starts_with("  "), "got: {marker:?}");
+}
+
+#[test]
+fn t1170_collapse_placeholders_render_in_commits_and_messages() {
+    let commits = vec![("aaa1111".to_string(), "first\n".to_string())];
+    let items = vec![Item {
+        commit: Some(0),
+        collapse: Some(12),
+        ..Item::default()
+    }];
+    let cells = draw_view_row(&commits, &[], items, 1, 0, false, Some(80), false);
+    let commits_cell = cells[1].display_lines().join("\n");
+    assert!(commits_cell.contains(':'), "got: {commits_cell:?}");
+    let messages = cells[4].display_lines().join("\n");
+    assert!(
+        messages.contains("<... 12 more commits ...>"),
+        "got: {messages}"
+    );
+}
+
+#[test]
+fn t1170_render_partition_requires_state_for_every_hash() {
+    let mut graph = commitgraph::CommitGraph::new();
+    commitgraph::graph_from_corpus(&mut graph, "A>B B>C").unwrap();
+    let heads = vec!["C".to_string()];
+    let partitions = commitgraph::partition_query(&graph, &heads, None).unwrap();
+    let mut counter = 1;
+    let sets =
+        commitgraph::set_query(&graph, &partitions[0], &HashMap::new(), &mut counter).unwrap();
+    let err = render_partition(
+        &sets,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        Some(80),
+        false,
+    )
+    .unwrap_err();
+    assert!(err.contains("Found no state ref"), "{err}");
+}
+
+#[test]
+fn t1170_render_partition_skips_grouped_non_holders() {
+    let mut graph = commitgraph::CommitGraph::new();
+    commitgraph::graph_from_corpus(&mut graph, "A>B B>C C>D D>E E>F").unwrap();
+    let heads = vec!["F".to_string()];
+    let partitions = commitgraph::partition_query(&graph, &heads, None).unwrap();
+    let waypoints = HashMap::from([
+        ("B".to_string(), vec![2u32]),
+        ("C".to_string(), vec![3]),
+        ("D".to_string(), vec![4]),
+        ("E".to_string(), vec![5]),
+        ("F".to_string(), vec![6]),
+    ]);
+    let mut counter = 1;
+    let sets = commitgraph::set_query(&graph, &partitions[0], &waypoints, &mut counter).unwrap();
+    assert!(sets.len() >= 4, "got {} sets", sets.len());
+    let states = HashMap::from([
+        ("A".to_string(), "a\n".to_string()),
+        ("B".to_string(), "b\n".to_string()),
+        ("C".to_string(), "c\n".to_string()),
+        ("D".to_string(), "d\n".to_string()),
+        ("E".to_string(), "e\n".to_string()),
+        ("F".to_string(), "f\n".to_string()),
+    ]);
+    let rows = render_partition(
+        &sets,
+        &states,
+        &HashMap::new(),
+        &HashMap::new(),
+        Some(80),
+        false,
+    )
+    .unwrap();
+    assert!(!rows.is_empty());
+}
+
+#[test]
+fn t1170_mark_set_ancestors_skips_visited_parents() {
+    let mut graph = commitgraph::CommitGraph::new();
+    commitgraph::graph_from_corpus(&mut graph, "A>B B>C").unwrap();
+    let heads = vec!["C".to_string()];
+    let partitions = commitgraph::partition_query(&graph, &heads, None).unwrap();
+    let waypoints = HashMap::from([("C".to_string(), vec![7u32])]);
+    let mut counter = 1;
+    let sets = commitgraph::set_query(&graph, &partitions[0], &waypoints, &mut counter).unwrap();
+    assert_eq!(sets.len(), 2);
+    let mut active = HashMap::from([(sets[0].set_id(), ()), (sets[1].set_id(), ())]);
+    mark_set_ancestors(&sets, &mut active);
+    assert_eq!(active.len(), 2);
+}
+
+#[test]
+fn t1170_sort_sets_treats_empty_marker_groups_as_absent() {
+    let mut graph = commitgraph::CommitGraph::new();
+    commitgraph::graph_from_corpus(&mut graph, "A>B B>C").unwrap();
+    let heads = vec!["C".to_string()];
+    let partitions = commitgraph::partition_query(&graph, &heads, None).unwrap();
+    let mut counter = 1;
+    let base =
+        commitgraph::set_query(&graph, &partitions[0], &HashMap::new(), &mut counter).unwrap();
+    let groups = HashMap::from([("A".to_string(), Vec::new())]);
+    let mut sets = base.clone();
+    let with_empty = sort_sets(&graph, &mut sets, &groups);
+    let mut sets = base.clone();
+    let without = sort_sets(&graph, &mut sets, &HashMap::new());
+    assert_eq!(with_empty.sort_string(), without.sort_string());
+}
+
+#[test]
+fn t1170_workflow_queries_reject_unknown_vcs_and_cover_hg_tails() {
+    let dir = TempDir::new("workflow-q");
+    let hg = crate::hg::HgCommand::custom("true", &[]);
+    let err =
+        query_workflow_markers(dir.path(), &hg, "svn", MARKER_TYPE_BRANCH, false).unwrap_err();
+    assert!(err.contains("does not support branches"), "{err}");
+    let hg = fake_hg_stdout("node1\nnode2\n");
+    assert_eq!(
+        query_workflow_tails(dir.path(), &hg, "hg", None).unwrap(),
+        vec!["node1".to_string(), "node2".to_string()]
+    );
+}
+
+#[test]
+fn t1170_run_head_query_reads_hg_graphs() {
+    let dir = TempDir::new("headquery");
+    let mut graph = commitgraph::CommitGraph::new();
+    let hg = crate::hg::HgCommand::custom("true", &[]);
+    let heads = vec!["abc".to_string()];
+    let seen = run_head_query(&mut graph, dir.path(), &hg, "hg", &heads, &[]).unwrap();
+    assert!(seen.is_empty());
+}
+
+#[test]
+fn t1170_load_disjoint_heads_skips_known_and_loads_missing() {
+    let dir = TempDir::new("disjoint-empty");
+    let mut graph = commitgraph::CommitGraph::new();
+    let hg = crate::hg::HgCommand::custom("true", &[]);
+    let mut nodes = vec!["a".to_string()];
+    load_disjoint_heads(
+        &mut graph,
+        dir.path(),
+        &hg,
+        "git",
+        &["a".to_string()],
+        &mut nodes,
+    )
+    .unwrap();
+    assert_eq!(nodes, vec!["a".to_string()]);
+    // Unknown heads load exactly, without duplicating known nodes.
+    let repo = init_repo("disjoint-git");
+    let sha = git(repo.path(), &["rev-parse", "HEAD"]);
+    let mut graph = commitgraph::CommitGraph::new();
+    let mut nodes = Vec::new();
+    load_disjoint_heads(
+        &mut graph,
+        repo.path(),
+        &hg,
+        "git",
+        std::slice::from_ref(&sha),
+        &mut nodes,
+    )
+    .unwrap();
+    assert_eq!(nodes, vec![sha]);
+    // The hg arm resolves errors to empty, keeping known nodes.
+    let mut graph = commitgraph::CommitGraph::new();
+    let mut nodes = vec!["keep".to_string()];
+    load_disjoint_heads(
+        &mut graph,
+        dir.path(),
+        &hg,
+        "hg",
+        &["missing".to_string()],
+        &mut nodes,
+    )
+    .unwrap();
+    assert_eq!(nodes, vec!["keep".to_string()]);
+}
+
+#[test]
+fn t1170_list_git_branches_needs_a_repo() {
+    let empty = TempDir::new("listbranches-empty");
+    assert_eq!(
+        list_git_branches(empty.path()).unwrap_err(),
+        "not inside a git repository"
+    );
+    let repo = init_repo("listbranches");
+    let markers = list_git_branches(repo.path()).unwrap();
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].name, "master");
+}
+
+#[test]
+fn t1170_list_with_reads_hg_bookmarks_and_branches() {
+    let dir = TempDir::new("listhg");
+    std::fs::create_dir(dir.path().join(".hg")).unwrap();
+    let body = r#"[
+        {"type": "bookmark", "name": "wip", "node": "bbb", "isActive": true, "description": "work"},
+        {"type": "branch", "name": "main", "node": "aaa", "isActive": false, "description": "line"}
+    ]"#;
+    let markers = list_with(dir.path(), MARKER_TYPE_BOOKMARK, &fake_hg_stdout(body)).unwrap();
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].name, "wip");
+    assert!(markers[0].active);
+    let markers = list_with(dir.path(), MARKER_TYPE_BRANCH, &fake_hg_stdout(body)).unwrap();
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].name, "main");
+}
+
+#[test]
+fn t1170_detect_vcs_covers_hg_svn_and_bare_dirs() {
+    let hg = TempDir::new("vcs-hg");
+    std::fs::create_dir(hg.path().join(".hg")).unwrap();
+    assert_eq!(detect_vcs(hg.path()), Some("hg"));
+    let svn = TempDir::new("vcs-svn");
+    std::fs::create_dir(svn.path().join(".svn")).unwrap();
+    assert_eq!(detect_vcs(svn.path()), Some("svn"));
+    let bare = TempDir::new("vcs-bare");
+    assert_eq!(detect_vcs(bare.path()), None);
+    let repo = init_repo("vcs-git");
+    assert_eq!(detect_vcs(repo.path()), Some("git"));
+}
+
+#[test]
+fn t1170_check_vcs_support_rejects_bare_and_svn() {
+    let bare = TempDir::new("support-bare");
+    let err = check_vcs_support(bare.path(), MARKER_TYPE_BRANCH).unwrap_err();
+    assert!(err.contains("not inside a working copy"), "{err}");
+    let svn = TempDir::new("support-svn");
+    std::fs::create_dir(svn.path().join(".svn")).unwrap();
+    let err = check_vcs_support(svn.path(), MARKER_TYPE_BRANCH).unwrap_err();
+    assert!(err.contains("does not support branches"), "{err}");
+    let hg = TempDir::new("support-hg");
+    std::fs::create_dir(hg.path().join(".hg")).unwrap();
+    assert_eq!(
+        check_vcs_support(hg.path(), MARKER_TYPE_BOOKMARK).unwrap(),
+        "hg"
+    );
+    assert_eq!(
+        check_markers_support(hg.path(), None).unwrap(),
+        MARKER_TYPE_BOOKMARK
+    );
+    assert!(check_markers_support(bare.path(), None).is_err());
+}
+
+#[test]
+fn t1170_execute_with_client_routes_help_and_parse_errors() {
+    let dir = TempDir::new("execwc");
+    let help = execute_with_client(dir.path(), &args(&["--help"]), Some(80), None).unwrap();
+    assert!(help.contains("usage: arc markers"), "{help}");
+    let err = execute_with_client(dir.path(), &args(&["--bogus"]), Some(80), None).unwrap_err();
+    assert!(err.contains("--bogus"), "{err}");
+}
+
+#[test]
+fn t1170_run_in_reports_query_failures_as_fatal() {
+    let dir = TempDir::new("runin-fatal");
+    std::fs::create_dir(dir.path().join(".hg")).unwrap();
+    // `--json` stays offline: hg itself fails (no real repo), which is a
+    // fatal, not a usage error.
+    assert_eq!(
+        run_in(dir.path(), &args(&["--json", "--type", "branch"])),
+        std::process::ExitCode::from(255)
+    );
+}

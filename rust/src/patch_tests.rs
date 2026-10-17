@@ -4273,3 +4273,2009 @@ fn e9_apply_bundle_encoding_stores_selection() {
     .unwrap();
     assert_eq!(loaded.bundle.encoding.as_deref(), Some("utf-8"));
 }
+
+// T1170 coverage tests below. Each `t1170_` test pins observable behavior
+// for a miss-manifest cluster in `patch.rs`.
+
+/// Fake `svn` backend logging argv to `.fakesvn.log` (portable .bat/.sh).
+fn fake_svn_backend(dir: &std::path::Path) -> svn::SvnCommand {
+    #[cfg(windows)]
+    let (name, content) = (
+        "fakesvn-t1170.bat",
+        include_str!("../tests/fixtures/vcs/fakesvn.bat"),
+    );
+    #[cfg(not(windows))]
+    let (name, content) = (
+        "fakesvn-t1170.sh",
+        include_str!("../tests/fixtures/vcs/fakesvn.sh"),
+    );
+    let script = dir.join(name);
+    std::fs::write(&script, content).unwrap();
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        svn::SvnCommand::custom("cmd", &["/C", &script.to_string_lossy()])
+    }
+    #[cfg(not(windows))]
+    {
+        svn::SvnCommand::custom(&script.to_string_lossy(), &[])
+    }
+}
+
+/// Write a purpose-built `hg` stub script (unix-only dispatch the shared
+/// fixture cannot express: `\x01` tip templates, stderr failures, distinct
+/// revisions per `-r` argument).
+#[cfg(unix)]
+fn stub_hg(dir: &std::path::Path, name: &str, body: &str) -> hg::HgCommand {
+    let script = dir.join(name);
+    std::fs::write(&script, body).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+    hg::HgCommand::custom(&script.to_string_lossy(), &[])
+}
+
+/// True when the system `patch` binary runs (absent on some machines, so
+/// `run_patch_file` tests probe and return early instead of failing).
+fn has_patch_binary() -> bool {
+    std::process::Command::new("patch")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+#[test]
+fn t1170_unknown_provided_entries_are_ignored() {
+    // `provided` entries with no flag spec skip both gates (patch.rs:488,
+    // :508); only known flags can conflict or restrict a VCS.
+    let options = Options {
+        provided: vec!["bogus"],
+        ..Options::default()
+    };
+    assert_eq!(check_conflicts(&options), Ok(()));
+    assert_eq!(check_supports(&options, "git"), Ok(()));
+    assert_eq!(check_supports(&options, "svn"), Ok(()));
+}
+
+#[test]
+fn t1170_validate_ansi_colored_diff() {
+    // A leading `\x1B[<digits>m` colors the strip path (patch.rs:1011-1016,
+    // :1039, :1258) and the cleaned header validates (patch.rs:1248).
+    let text = "\u{1b}[32mdiff --git a/f b/f\u{1b}[0m\n";
+    assert!(has_leading_ansi(text));
+    assert!(!has_leading_ansi("diff --git a/f b/f\n"));
+    assert_eq!(strip_ansi_codes(text), "diff --git a/f b/f\n");
+    assert_eq!(validate_patch_text(text), Ok(()));
+}
+
+#[test]
+fn t1170_validate_nul_only_text_errors() {
+    // `"\0"` survives `trim()` but `ltrim_php()` eats it, so the split of
+    // `""` yields one empty line (patch.rs:995) that fails the header
+    // check with a byte-for-byte parse error.
+    let err = validate_patch_text("\0").unwrap_err();
+    assert!(
+        err.starts_with("Diff Parse Exception: Expected a hunk header"),
+        "{err}"
+    );
+}
+
+#[test]
+fn t1170_validate_comment_only_text_errors_at_eof() {
+    // Only `#` comments: the content index runs past the last line
+    // (patch.rs:1241) and the error carries no `>>>` marker, like PHP.
+    let err = validate_patch_text("# one\n# two\n").unwrap_err();
+    assert!(
+        err.starts_with("Diff Parse Exception: Expected a hunk header"),
+        "{err}"
+    );
+    assert!(!err.contains(">>>"), "{err}");
+}
+
+#[test]
+fn t1170_parse_error_skips_distant_lines() {
+    // Context spans five lines each way; farther lines are skipped
+    // (patch.rs:1210), so distant content never leaks into the error.
+    let mut text = String::from("# comment\nNEAR-garbage\n");
+    for filler in 0..10 {
+        text.push_str(&format!("filler{filler}\n"));
+    }
+    text.push_str("DISTANT\n");
+    let err = validate_patch_text(&text).unwrap_err();
+    assert!(err.contains(">>>"), "{err}");
+    assert!(err.contains("NEAR-garbage"), "{err}");
+    assert!(!err.contains("DISTANT"), "{err}");
+}
+
+#[test]
+fn t1170_validate_hg_export_preamble() {
+    // A later `diff -r` opener excuses a non-header first line
+    // (patch.rs:1299-1301, :1308), covering `hg export` preambles.
+    assert_eq!(
+        validate_patch_text("changeset: 1:abc\nsome preamble\ndiff -r ab12cd file.txt\n"),
+        Ok(())
+    );
+}
+
+#[test]
+fn t1170_validate_indented_later_diff_header() {
+    // The loose `^\s*diff` probe (patch.rs:1304-1307) also accepts an
+    // indented later `diff --git` opener.
+    assert_eq!(
+        validate_patch_text("preamble\n  diff --git a/f b/f\n"),
+        Ok(())
+    );
+}
+
+#[test]
+fn t1170_validate_blank_then_garbage_fails() {
+    // The first content line is blank but a later line is not: the probe
+    // only excuses the failing line itself (patch.rs:1290, :1295).
+    let err = validate_patch_text("# c\n\nGARBAGE\n").unwrap_err();
+    assert!(
+        err.starts_with("Diff Parse Exception: Expected a hunk header"),
+        "{err}"
+    );
+}
+
+#[test]
+fn t1170_validate_rejects_malformed_hg_and_binary_headers() {
+    // Each malformed opener fails its header predicate (patch.rs:1079,
+    // :1122, :1135, :1148, :1153, :1157) and then the later-opener probe.
+    for text in [
+        "diff -r abcdef\n",
+        "diff -r ab -r x\n",
+        "Files foo\n",
+        "Binary files a and b same\n",
+        "--- 2024-01-02\n",
+    ] {
+        let err = validate_patch_text(text).unwrap_err();
+        assert!(
+            err.starts_with("Diff Parse Exception: Expected a hunk header"),
+            "{text}: {err}"
+        );
+    }
+}
+
+#[test]
+fn t1170_arcbundle_missing_hunk_member_errors() {
+    // Both `member` and `./member` extraction attempts fail
+    // (patch.rs:1381-1385), naming the missing hunk member.
+    let dir = temp_dir("t1170_arcbundle_hunk");
+    let changes = br#"[{"type":2,"fileType":1,"oldPath":"f.txt","currentPath":"f.txt","hunks":[{"corpus":0,"oldOffset":1,"oldLength":1,"newOffset":1,"newLength":1}]}]"#;
+    let bundle = write_arcbundle(&dir, "h.bundle", &[("changes.json", changes)]);
+    let err = load_arcbundle(&bundle.to_string_lossy(), None).unwrap_err();
+    assert!(err.contains("member 'hunks/0' is missing"), "{err}");
+}
+
+#[test]
+fn t1170_arcbundle_without_meta_uses_defaults() {
+    // Old bundles predate `meta.json` (patch.rs:2322): metadata stays
+    // `None` instead of failing.
+    let dir = temp_dir("t1170_arcbundle_nometa");
+    let bundle = write_arcbundle(&dir, "m.bundle", &[("changes.json", b"[]")]);
+    let loaded = load_arcbundle(&bundle.to_string_lossy(), None).unwrap();
+    assert_eq!(loaded.text, "\n");
+    assert!(loaded.base_revision.is_none());
+    assert!(loaded.revision_id.is_none());
+    assert!(loaded.encoding.is_none());
+    assert!(loaded.author_name.is_none());
+    assert!(loaded.author_email.is_none());
+    // A change dict without `hunks` skips corpus loading
+    // (patch.rs:2369) and still renders its headers.
+    let bundle = write_arcbundle(
+        &dir,
+        "h.bundle",
+        &[(
+            "changes.json",
+            br#"[{"type":2,"fileType":1,"oldPath":"f.txt","currentPath":"f.txt"}]"#.as_slice(),
+        )],
+    );
+    let loaded = load_arcbundle(&bundle.to_string_lossy(), None).unwrap();
+    assert!(loaded.base_revision.is_none());
+    assert!(
+        loaded.text.contains("diff --git a/f.txt b/f.txt"),
+        "{}",
+        loaded.text
+    );
+}
+
+#[test]
+fn t1170_parse_bundle_change_carries_away_paths() {
+    // `awayPaths` entries ride through (patch.rs:1535-1539) while
+    // non-string entries are dropped.
+    let dict = serde_json::json!({"type": 4, "fileType": 2, "awayPaths": ["d1", 7, "d2"]});
+    let change = parse_bundle_change(&dict, Vec::new());
+    assert_eq!(change.away_paths, vec!["d1".to_string(), "d2".to_string()]);
+}
+
+#[test]
+fn t1170_base64_decodes_digits_and_symbols() {
+    // Digit, `+`, and `/` values decode (patch.rs:1794-1796); other
+    // bytes fail (patch.rs:1798).
+    assert_eq!(base64_decode("f+/9").unwrap(), vec![0x7F, 0xEF, 0xFD]);
+    assert_eq!(base64_decode("AB!D").unwrap_err(), "invalid base64 byte");
+}
+
+#[test]
+fn t1170_build_binary_change_prefers_old_source() {
+    // The away change supplies the old blob: inline data wins
+    // (patch.rs:1888) without touching the loader, else the old phid
+    // loads through it (patch.rs:1889).
+    let change = BundleChange {
+        file_type: FILE_BINARY,
+        current_file_data: Some(vec![4]),
+        ..bundle_change(TYPE_CHANGE, Some("a.bin"), Some("a.bin"))
+    };
+    let inline_old = BundleChange {
+        original_file_data: Some(vec![1, 2, 3]),
+        ..bundle_change(TYPE_MOVE_AWAY, Some("a.bin"), None)
+    };
+    let fail = |_: &str| -> Result<Vec<u8>, String> { panic!("no blobs needed") };
+    let body = build_binary_change(&change, Some(&inline_old), &fail).unwrap();
+    assert!(body.contains("literal 1\n"), "{body}");
+    assert!(body.contains("literal 3\n"), "{body}");
+    assert!(body.contains(&git_blob_sha1(&[1, 2, 3])), "{body}");
+    let phid_old = BundleChange {
+        old_binary_phid: Some("PHID-OLD".to_string()),
+        ..bundle_change(TYPE_MOVE_AWAY, Some("a.bin"), None)
+    };
+    let seen = std::cell::RefCell::new(Vec::new());
+    let loader = |phid: &str| -> Result<Vec<u8>, String> {
+        seen.borrow_mut().push(phid.to_string());
+        Ok(vec![9, 9])
+    };
+    let body = build_binary_change(&change, Some(&phid_old), &loader).unwrap();
+    assert_eq!(*seen.borrow(), vec!["PHID-OLD".to_string()]);
+    assert!(body.contains("literal 2\n"), "{body}");
+}
+
+#[test]
+fn t1170_collect_binary_sources_maps_away_destinations() {
+    // Only binary away changes map (patch.rs:1949-1950); text aways and
+    // binary heres contribute nothing.
+    let away = BundleChange {
+        file_type: FILE_BINARY,
+        away_paths: vec!["d1".to_string(), "d2".to_string()],
+        ..bundle_change(TYPE_MOVE_AWAY, Some("a.bin"), None)
+    };
+    let map = collect_binary_sources(&[
+        away,
+        bundle_change(TYPE_MOVE_AWAY, Some("t.txt"), None),
+        BundleChange {
+            file_type: FILE_BINARY,
+            ..bundle_change(TYPE_CHANGE, Some("b.bin"), Some("b.bin"))
+        },
+    ]);
+    assert_eq!(map.len(), 2);
+    assert!(map.contains_key("d1"));
+    assert!(map.contains_key("d2"));
+}
+
+#[test]
+fn t1170_render_counts_backslash_and_odd_lines() {
+    // `\` lines adjust the split counts (patch.rs:2093) and unprefixed
+    // lines pass through the catch-all (patch.rs:2096); all survive.
+    let mut changes = vec![BundleChange {
+        hunks: vec![parsed_hunk(
+            1,
+            1,
+            1,
+            1,
+            "-a\n+b\n\\ No newline at end of file\n? odd\n",
+        )],
+        ..bundle_change(TYPE_CHANGE, Some("f.txt"), Some("f.txt"))
+    }];
+    let out = render_git_patch(&mut changes).unwrap();
+    for line in ["-a\n", "+b\n", "\\ No newline at end of file\n", "? odd\n"] {
+        assert!(out.contains(line), "{out}");
+    }
+}
+
+#[test]
+fn t1170_render_with_blobs_skips_and_terminates() {
+    // The blobs renderer skips directories, move-aways, and pure
+    // copy-aways (patch.rs:2168, :2171, :2184-2187), emits headers
+    // alone for bodyless changes (patch.rs:2193), and terminates a
+    // `\r`-ended body (patch.rs:2200).
+    let loader = |_: &str| -> Result<Vec<u8>, String> { panic!("no blobs needed") };
+    let mut changes = vec![
+        BundleChange {
+            file_type: FILE_DIRECTORY,
+            ..bundle_change(TYPE_ADD, None, Some("dir"))
+        },
+        bundle_change(TYPE_MOVE_AWAY, Some("gone.txt"), None),
+        bundle_change(TYPE_COPY_AWAY, Some("same.txt"), Some("same.txt")),
+        bundle_change(TYPE_CHANGE, Some("plain.txt"), Some("plain.txt")),
+        BundleChange {
+            hunks: vec![parsed_hunk(1, 1, 1, 1, "-a\n+b\r")],
+            ..bundle_change(TYPE_CHANGE, Some("cr.txt"), Some("cr.txt"))
+        },
+    ];
+    let out = render_git_patch_with_blobs(&mut changes, &loader).unwrap();
+    assert!(!out.contains("gone.txt"), "{out}");
+    assert!(!out.contains("same.txt"), "{out}");
+    assert!(!out.contains("a/dir "), "{out}");
+    assert!(
+        out.contains("diff --git a/plain.txt b/plain.txt\n"),
+        "{out}"
+    );
+    assert!(out.contains("+b\r\n"), "{out}");
+}
+
+#[test]
+fn t1170_render_text_terminates_cr_ended_body() {
+    // Same `\r`-ended body through the text renderer (patch.rs:2261).
+    let mut changes = vec![BundleChange {
+        hunks: vec![parsed_hunk(1, 1, 1, 1, "-a\n+b\r")],
+        ..bundle_change(TYPE_CHANGE, Some("cr.txt"), Some("cr.txt"))
+    }];
+    let out = render_git_patch(&mut changes).unwrap();
+    assert!(out.contains("+b\r\n"), "{out}");
+}
+
+#[test]
+fn t1170_porcelain_skips_empty_entries() {
+    // Empty `-z` records are skipped (patch.rs:2667) without disturbing
+    // the real entries around them.
+    let status = parse_porcelain_v2(b"? a.txt\0\0").unwrap();
+    assert_eq!(status.untracked, vec!["a.txt".to_string()]);
+}
+
+#[test]
+fn t1170_hg_tree_status_buckets_via_fixture() {
+    // `U` lines become conflicts before parsing (patch.rs:2764); every
+    // tracked path also counts as uncommitted (patch.rs:2770-2772);
+    // missing, uncommitted, and untracked sort into buckets
+    // (patch.rs:2777-2794).
+    let dir = temp_dir("t1170_hg_status");
+    let hg = fake_hg_backend(&dir);
+    std::fs::write(
+        dir.join(".fakehg-status"),
+        "U conflict.txt\n! gone.txt\nM mod.txt\n? new.txt\nA add.txt\n",
+    )
+    .unwrap();
+    let status = hg_tree_status(&dir, &hg, &["status"]).unwrap();
+    assert_eq!(status.conflicts, vec!["conflict.txt".to_string()]);
+    assert_eq!(status.missing, vec!["gone.txt".to_string()]);
+    assert_eq!(
+        status.uncommitted,
+        vec![
+            "add.txt".to_string(),
+            "gone.txt".to_string(),
+            "mod.txt".to_string()
+        ]
+    );
+    assert_eq!(status.untracked, vec!["new.txt".to_string()]);
+    assert!(status.unstaged.is_empty());
+    assert!(status.externals.is_empty());
+}
+
+#[test]
+fn t1170_svn_entry_without_status_is_ignored() {
+    // Entries without a `wc-status` tag parse to `None` and are
+    // skipped (patch.rs:2872).
+    let status = parse_svn_status_xml("<status><entry path=\"x\"></entry></status>").unwrap();
+    assert_eq!(status, TreeStatus::default());
+}
+
+#[test]
+fn t1170_push_svn_bucket_ignores_unknown() {
+    // Unknown bucket names hit the catch-all (patch.rs:2899) and change
+    // nothing.
+    let mut status = TreeStatus::default();
+    push_svn_bucket(&mut status, "bogus", "p.txt");
+    assert_eq!(status, TreeStatus::default());
+}
+
+#[test]
+fn t1170_svn_tree_status_via_fixture() {
+    // The `svn --xml status` runner parses through the fixture
+    // (patch.rs:2925) into untracked and missing buckets.
+    let dir = temp_dir("t1170_svn_status");
+    let svn = fake_svn_backend(&dir);
+    std::fs::write(
+        dir.join(".fakesvn-status"),
+        "<status><entry path=\"n.txt\"><wc-status props=\"none\" item=\"unversioned\"></wc-status></entry>\
+         <entry path=\"g.txt\"><wc-status props=\"none\" item=\"missing\"></wc-status></entry></status>",
+    )
+    .unwrap();
+    let status = svn_tree_status(&dir, &svn, &["--xml", "status"]).unwrap();
+    assert_eq!(status.untracked, vec!["n.txt".to_string()]);
+    assert_eq!(status.missing, vec!["g.txt".to_string()]);
+}
+
+#[test]
+fn t1170_clean_check_hg_conflicts_and_missing_fail() {
+    // The hg clean check (patch.rs:3023) fails verbatim on conflicts
+    // and missing files (patch.rs:3057-3070).
+    let dir = temp_dir("t1170_hg_fatal");
+    let backends = Backends {
+        hg: fake_hg_backend(&dir),
+        svn: svn::SvnCommand::system(),
+    };
+    std::fs::write(dir.join(".fakehg-status"), "U c.txt\n").unwrap();
+    let mut io = Io::canned(&[]);
+    let err = require_clean_tree_ansi(&dir, Vcs::Hg, &backends, &mut io, false, false).unwrap_err();
+    assert!(err.contains("merge conflicts"), "{err}");
+    assert!(err.contains("c.txt"), "{err}");
+    std::fs::write(dir.join(".fakehg-status"), "! m.txt\n").unwrap();
+    let mut io = Io::canned(&[]);
+    let err = require_clean_tree_ansi(&dir, Vcs::Hg, &backends, &mut io, false, false).unwrap_err();
+    assert!(err.contains("Missing files"), "{err}");
+    assert!(err.contains("m.txt"), "{err}");
+}
+
+#[test]
+fn t1170_clean_check_svn_incomplete_and_externals() {
+    // The svn clean check (patch.rs:3024) fails verbatim on incomplete
+    // directories (patch.rs:3048-3054); externals clear silently under
+    // svn instead of prompting.
+    let dir = temp_dir("t1170_svn_fatal");
+    let backends = Backends {
+        hg: hg::HgCommand::system(),
+        svn: fake_svn_backend(&dir),
+    };
+    std::fs::write(
+        dir.join(".fakesvn-status"),
+        "<status><entry path=\"half\"><wc-status props=\"none\" item=\"incomplete\"></wc-status></entry></status>",
+    )
+    .unwrap();
+    let mut io = Io::canned(&[]);
+    let err =
+        require_clean_tree_ansi(&dir, Vcs::Svn, &backends, &mut io, false, false).unwrap_err();
+    assert!(err.contains("incompletely checked out"), "{err}");
+    assert!(err.contains("half"), "{err}");
+    std::fs::write(
+        dir.join(".fakesvn-status"),
+        "<status><entry path=\"ext\"><wc-status props=\"none\" item=\"external\"></wc-status></entry></status>",
+    )
+    .unwrap();
+    let mut io = Io::canned(&[]);
+    assert_eq!(
+        require_clean_tree_ansi(&dir, Vcs::Svn, &backends, &mut io, false, false).unwrap(),
+        StashState::Clean
+    );
+    assert!(!io.out.stdout.contains("submodule(s)"), "{}", io.out.stdout);
+}
+
+#[test]
+fn t1170_confirm_tree_externals_prompts() {
+    // Dirty externals list and prompt (patch.rs:3080-3090): declining
+    // aborts, accepting continues.
+    let status = TreeStatus {
+        externals: vec!["sub".to_string()],
+        ..TreeStatus::default()
+    };
+    let mut io = Io::canned(&["n"]);
+    assert_eq!(
+        confirm_tree_externals(&mut io, &status).unwrap_err(),
+        land::ABORT
+    );
+    assert!(
+        io.out.stdout.contains("1 submodule(s) have uncommitted"),
+        "{}",
+        io.out.stdout
+    );
+    let mut io = Io::canned(&["y"]);
+    assert_eq!(confirm_tree_externals(&mut io, &status), Ok(()));
+}
+
+#[test]
+fn t1170_clean_check_untracked_place_names() {
+    // The untracked prompt names the ignore file per VCS
+    // (patch.rs:3107-3108).
+    let dir = temp_dir("t1170_place_hg");
+    let backends = Backends {
+        hg: fake_hg_backend(&dir),
+        svn: svn::SvnCommand::system(),
+    };
+    std::fs::write(dir.join(".fakehg-status"), "? n.txt\n").unwrap();
+    let mut io = Io::canned(&["y"]);
+    assert_eq!(
+        require_clean_tree_ansi(&dir, Vcs::Hg, &backends, &mut io, false, false).unwrap(),
+        StashState::Clean
+    );
+    assert!(io.out.stdout.contains(".hgignore"), "{}", io.out.stdout);
+    let dir = temp_dir("t1170_place_svn");
+    let backends = Backends {
+        hg: hg::HgCommand::system(),
+        svn: fake_svn_backend(&dir),
+    };
+    std::fs::write(
+        dir.join(".fakesvn-status"),
+        "<status><entry path=\"n.txt\"><wc-status props=\"none\" item=\"unversioned\"></wc-status></entry></status>",
+    )
+    .unwrap();
+    let mut io = Io::canned(&["y"]);
+    assert_eq!(
+        require_clean_tree_ansi(&dir, Vcs::Svn, &backends, &mut io, false, false).unwrap(),
+        StashState::Clean
+    );
+    assert!(io.out.stdout.contains("svn:ignore"), "{}", io.out.stdout);
+}
+
+#[test]
+fn t1170_clean_check_lists_uncommitted_only() {
+    // A staged-only change prints the uncommitted list without the
+    // unstaged header (patch.rs:3541-3544), then the decline errors.
+    let repo = make_repo("t1170_uncommitted_only");
+    std::fs::write(repo.join("file.txt"), "dirty\n").unwrap();
+    git(&repo, &["add", "file.txt"]);
+    let mut io = Io::canned(&["n"]);
+    let err =
+        require_clean_tree(&repo, Vcs::Git, &Backends::default(), &mut io, false).unwrap_err();
+    assert_eq!(
+        err,
+        "You can not continue with uncommitted changes. Commit or discard them before proceeding."
+    );
+    assert!(
+        io.out
+            .stdout
+            .contains("Uncommitted changes in working copy:\n    file.txt"),
+        "{}",
+        io.out.stdout
+    );
+    assert!(
+        !io.out.stdout.contains("Unstaged changes"),
+        "{}",
+        io.out.stdout
+    );
+}
+
+#[test]
+fn t1170_resolve_uncommitted_hg_and_svn_paths() {
+    // The yes-path stages through the hg backend (patch.rs:3471) and
+    // commits it (patch.rs:3505); under svn it stages (patch.rs:3472)
+    // and reports staged-but-uncommitted (patch.rs:3507).
+    let dir = temp_dir("t1170_resolve_hg");
+    let backends = Backends {
+        hg: fake_hg_backend(&dir),
+        svn: svn::SvnCommand::system(),
+    };
+    let mut io = Io::canned(&["y"]);
+    let status = TreeStatus {
+        unstaged: vec!["f.txt".to_string()],
+        ..TreeStatus::default()
+    };
+    let edit = |_: &str| Ok("hello\n".to_string());
+    assert_eq!(
+        resolve_uncommitted_tree(
+            &dir,
+            Vcs::Hg,
+            &backends,
+            &mut io,
+            &status,
+            "DESC",
+            None,
+            &edit
+        )
+        .unwrap(),
+        StashState::Clean
+    );
+    let log = std::fs::read_to_string(dir.join(".fakehg.log")).unwrap();
+    assert!(log.contains("addremove"), "{log}");
+    assert!(log.contains("commit"), "{log}");
+    let dir = temp_dir("t1170_resolve_svn");
+    std::fs::write(dir.join("f.txt"), "x\n").unwrap();
+    let backends = Backends {
+        hg: hg::HgCommand::system(),
+        svn: fake_svn_backend(&dir),
+    };
+    let mut io = Io::canned(&["y"]);
+    assert_eq!(
+        resolve_uncommitted_tree(
+            &dir,
+            Vcs::Svn,
+            &backends,
+            &mut io,
+            &status,
+            "DESC",
+            None,
+            &edit
+        )
+        .unwrap(),
+        StashState::Clean
+    );
+    let log = std::fs::read_to_string(dir.join(".fakesvn.log")).unwrap();
+    assert!(log.contains("add -- f.txt"), "{log}");
+}
+
+#[test]
+fn t1170_commit_yes_path_svn_amend_is_noop() {
+    // Amend under svn is a structural no-op (patch.rs:3492): no editor,
+    // no commit, success.
+    let dir = temp_dir("t1170_svn_amend");
+    let edit = |_: &str| -> Result<String, String> { panic!("must not edit") };
+    assert_eq!(
+        commit_yes_path_changes(
+            &dir,
+            Vcs::Svn,
+            &Backends::default(),
+            true,
+            Some("m"),
+            "t",
+            &edit
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn t1170_commit_yes_path_strips_trailing_comments() {
+    // The yes-path strips trailing `#` comment lines before
+    // committing, so a message with a comment tail commits the
+    // stripped text.
+    let repo = make_repo("t1170_empty_msg");
+    git(&repo, &["config", "user.name", "Patch Test"]);
+    std::fs::write(repo.join("file.txt"), "dirty\n").unwrap();
+    git(&repo, &["add", "file.txt"]);
+    let edit = |_: &str| Ok("wip save\n# Enter a commit message.\n".to_string());
+    commit_yes_path_changes(
+        &repo,
+        Vcs::Git,
+        &Backends::default(),
+        false,
+        None,
+        "template",
+        &edit,
+    )
+    .unwrap();
+    assert_eq!(git(&repo, &["log", "-1", "--format=%s"]), "wip save");
+}
+
+#[test]
+fn t1170_patch_add_to_commit_empty_is_noop() {
+    // Nothing unstaged means nothing to stage (patch.rs:3466).
+    let dir = temp_dir("t1170_add_empty");
+    assert_eq!(
+        patch_add_to_commit(&dir, Vcs::Git, &Backends::default(), &[]),
+        Ok(())
+    );
+}
+
+#[test]
+fn t1170_update_working_copy_hg_and_svn() {
+    // The hg and svn update arms (patch.rs:3602, :3605) print the same
+    // wrapper lines around the backend `up`.
+    let dir = temp_dir("t1170_update_hg");
+    let backends = Backends {
+        hg: fake_hg_backend(&dir),
+        svn: svn::SvnCommand::system(),
+    };
+    let mut io = Io::buffered();
+    update_working_copy(&dir, Vcs::Hg, &backends, &mut io).unwrap();
+    assert_eq!(io.out.stdout, "Updating working copy...\nDone.\n");
+    let dir = temp_dir("t1170_update_svn");
+    let backends = Backends {
+        hg: hg::HgCommand::system(),
+        svn: fake_svn_backend(&dir),
+    };
+    let mut io = Io::buffered();
+    update_working_copy(&dir, Vcs::Svn, &backends, &mut io).unwrap();
+    assert_eq!(io.out.stdout, "Updating working copy...\nDone.\n");
+}
+
+#[test]
+fn t1170_amend_declines_when_history_immutable() {
+    // Immutable history declines before any HEAD lookup
+    // (patch.rs:3378). The project pin beats user config.
+    let repo = make_repo("t1170_immutable");
+    std::fs::write(repo.join(".arcconfig"), "{\"history.immutable\": true}").unwrap();
+    assert_eq!(
+        calculate_patch_should_amend(&repo, Vcs::Git, &Backends::default(), None).unwrap(),
+        (false, None)
+    );
+}
+
+#[test]
+fn t1170_amend_declines_without_head() {
+    // No commits means no HEAD identity (patch.rs:3188), so amend
+    // declines (patch.rs:3381).
+    let dir = temp_dir("t1170_nohead");
+    git(&dir, &["init", "-b", "master"]);
+    assert_eq!(
+        calculate_patch_should_amend(&dir, Vcs::Git, &Backends::default(), None).unwrap(),
+        (false, None)
+    );
+}
+
+#[test]
+fn t1170_amend_declines_git_svn_message() {
+    // A HEAD carrying a `git-svn-id` footer declines (patch.rs:3385).
+    let repo = make_repo("t1170_gitsvn");
+    std::fs::write(repo.join(".arcconfig"), "{\"history.immutable\": false}").unwrap();
+    git(
+        &repo,
+        &[
+            "commit",
+            "--allow-empty",
+            "-m",
+            "x\n\ngit-svn-id: https://svn.example.test/r@42 uuid-1234",
+        ],
+    );
+    assert_eq!(
+        calculate_patch_should_amend(&repo, Vcs::Git, &Backends::default(), None).unwrap(),
+        (false, None)
+    );
+}
+
+#[test]
+fn t1170_amend_declines_author_mismatch() {
+    // A HEAD committed by someone else declines (patch.rs:3388).
+    let repo = make_repo("t1170_author_mismatch");
+    std::fs::write(repo.join(".arcconfig"), "{\"history.immutable\": false}").unwrap();
+    git(&repo, &["config", "user.name", "Someone Else"]);
+    assert_eq!(
+        calculate_patch_should_amend(&repo, Vcs::Git, &Backends::default(), None).unwrap(),
+        (false, None)
+    );
+}
+
+#[test]
+fn t1170_amend_accepts_unpublished_matching_head() {
+    // A matching unpublished HEAD with no repository query amends: the
+    // published check skips without a query (patch.rs:3453) instead of
+    // calling Conduit (the stub panics if called).
+    let repo = make_repo("t1170_amend_true");
+    std::fs::write(
+        repo.join(".arcconfig"),
+        "{\"history.immutable\": false, \"repository.callsign\": \"\"}",
+    )
+    .unwrap();
+    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        panic!("no repository query expected")
+    };
+    let (amend, message) =
+        calculate_patch_should_amend(&repo, Vcs::Git, &Backends::default(), Some(&call)).unwrap();
+    assert!(amend);
+    assert!(
+        message.as_ref().is_some_and(|text| text.contains("base")),
+        "{message:?}"
+    );
+}
+
+#[test]
+fn t1170_amend_support_and_head_lookup_by_vcs() {
+    // Amend support is per-VCS (patch.rs:3406-3407) and HEAD lookup
+    // dispatches per-VCS (patch.rs:3420).
+    let repo = make_repo("t1170_supports");
+    assert!(patch_vcs_supports_amend(
+        &repo,
+        Vcs::Git,
+        &Backends::default()
+    ));
+    assert!(!patch_vcs_supports_amend(
+        &repo,
+        Vcs::Svn,
+        &Backends::default()
+    ));
+    let dir = temp_dir("t1170_supports_hg");
+    let backends = Backends {
+        hg: fake_hg_backend(&dir),
+        svn: svn::SvnCommand::system(),
+    };
+    assert!(patch_vcs_supports_amend(&dir, Vcs::Hg, &backends));
+    std::fs::write(dir.join(".fakehg-noamend"), "").unwrap();
+    assert!(!patch_vcs_supports_amend(&dir, Vcs::Hg, &backends));
+    let empty = temp_dir("t1170_head_empty");
+    git(&empty, &["init", "-b", "master"]);
+    assert!(
+        patch_head_info_for(&empty, Vcs::Git, &Backends::default())
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        patch_head_info_for(&dir, Vcs::Hg, &backends)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn t1170_head_author_matches_hg_backend() {
+    // The hg working-copy author comes from the backend showconfig
+    // (patch.rs:3434): a matching HEAD author passes, others fail.
+    let dir = temp_dir("t1170_hg_author");
+    let backends = Backends {
+        hg: fake_hg_backend(&dir),
+        svn: svn::SvnCommand::system(),
+    };
+    let matching = HeadInfo {
+        hash: "n".to_string(),
+        author: "Test User".to_string(),
+        message: "m".to_string(),
+    };
+    assert!(patch_head_author_matches(&dir, Vcs::Hg, &backends, &matching).unwrap());
+    let other = HeadInfo {
+        author: "Other".to_string(),
+        ..matching
+    };
+    assert!(!patch_head_author_matches(&dir, Vcs::Hg, &backends, &other).unwrap());
+}
+
+#[test]
+fn t1170_history_immutable_defaults_on_config_failure() {
+    // An unreadable project config falls back to the VCS default
+    // (patch.rs:3246): mutable for git, immutable otherwise.
+    let repo = make_repo("t1170_immutable_broken");
+    std::fs::write(repo.join(".arcconfig"), "{not json").unwrap();
+    assert!(!patch_history_immutable(&repo, Vcs::Git));
+    assert!(patch_history_immutable(&repo, Vcs::Hg));
+}
+
+#[test]
+fn t1170_repository_encoding_without_query_is_utf8() {
+    // With no callsign and no remote the query is `None` (patch.rs:3270,
+    // :3280), so the encoding defaults to UTF-8 without calling
+    // Conduit (patch.rs:3301; the stub panics if called).
+    let repo = make_repo("t1170_enc_none");
+    std::fs::write(repo.join(".arcconfig"), "{\"repository.callsign\": \"\"}").unwrap();
+    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        panic!("no repository query expected")
+    };
+    assert_eq!(
+        patch_repository_encoding(&repo, Vcs::Git, &Backends::default(), &call).unwrap(),
+        Some("UTF-8".to_string())
+    );
+}
+
+#[test]
+fn t1170_repository_query_uses_hg_remote() {
+    // Without a callsign the hg remote URI becomes the query
+    // (patch.rs:3271, :3280).
+    let repo = make_repo("t1170_enc_hg");
+    std::fs::write(repo.join(".arcconfig"), "{\"repository.callsign\": \"\"}").unwrap();
+    let backends = Backends {
+        hg: fake_hg_backend(&repo),
+        svn: svn::SvnCommand::system(),
+    };
+    let seen = std::cell::RefCell::new(serde_json::Value::Null);
+    let call = |method: &str, params: &serde_json::Value| {
+        assert_eq!(method, "repository.query");
+        *seen.borrow_mut() = params.clone();
+        Ok(serde_json::json!([]))
+    };
+    assert_eq!(
+        patch_repository_encoding(&repo, Vcs::Hg, &backends, &call).unwrap(),
+        Some("UTF-8".to_string())
+    );
+    assert!(
+        seen.borrow()
+            .to_string()
+            .contains("https://hg.example.test/repo"),
+        "{}",
+        seen.borrow()
+    );
+}
+
+#[test]
+fn t1170_repository_query_prefers_svn_uuid() {
+    // The svn UUID becomes a `uuids` query when known
+    // (patch.rs:3273-3274, :3277-3278), else the root becomes a
+    // `remoteURIs` query (patch.rs:3280).
+    let repo = make_repo("t1170_enc_svn");
+    std::fs::write(repo.join(".arcconfig"), "{\"repository.callsign\": \"\"}").unwrap();
+    let backends = Backends {
+        hg: hg::HgCommand::system(),
+        svn: fake_svn_backend(&repo),
+    };
+    std::fs::write(
+        repo.join(".fakesvn-info"),
+        "Path: /\nRepository Root: https://svn.example.test/repo\nRepository UUID: uuid-9\n",
+    )
+    .unwrap();
+    let seen = std::cell::RefCell::new(serde_json::Value::Null);
+    let call = |method: &str, params: &serde_json::Value| {
+        assert_eq!(method, "repository.query");
+        *seen.borrow_mut() = params.clone();
+        Ok(serde_json::json!([]))
+    };
+    assert_eq!(
+        patch_repository_encoding(&repo, Vcs::Svn, &backends, &call).unwrap(),
+        Some("UTF-8".to_string())
+    );
+    assert!(
+        seen.borrow().to_string().contains("\"uuids\""),
+        "{}",
+        seen.borrow()
+    );
+    assert!(
+        seen.borrow().to_string().contains("uuid-9"),
+        "{}",
+        seen.borrow()
+    );
+    std::fs::write(
+        repo.join(".fakesvn-info"),
+        "Path: /\nRepository Root: https://svn.example.test/repo\n",
+    )
+    .unwrap();
+    assert_eq!(
+        patch_repository_encoding(&repo, Vcs::Svn, &backends, &call).unwrap(),
+        Some("UTF-8".to_string())
+    );
+    assert!(
+        seen.borrow().to_string().contains("remoteURIs"),
+        "{}",
+        seen.borrow()
+    );
+}
+
+#[test]
+fn t1170_commit_published_probes() {
+    // Zero or ambiguous repository matches mean unpublished
+    // (patch.rs:3341); without a callsign the commit name uses the
+    // `R{id}:{hash}` shape (patch.rs:3347-3348).
+    let call = |method: &str, _: &serde_json::Value| {
+        assert_eq!(method, "repository.query");
+        Ok(serde_json::json!([]))
+    };
+    assert!(
+        !patch_commit_published(&call, &serde_json::json!({"callsigns": ["X"]}), "abc").unwrap()
+    );
+    let seen = std::cell::RefCell::new(String::new());
+    let call = |method: &str, params: &serde_json::Value| {
+        if method == "repository.query" {
+            return Ok(serde_json::json!([{"id": 7}]));
+        }
+        assert_eq!(method, "diffusion.querycommits");
+        *seen.borrow_mut() = params.to_string();
+        Ok(serde_json::json!({"identifierMap": {"R7:abc": {"x": 1}}}))
+    };
+    assert!(patch_commit_published(&call, &serde_json::json!({}), "abc").unwrap());
+    assert!(seen.borrow().contains("R7:abc"), "{}", seen.borrow());
+}
+
+#[test]
+fn t1170_load_dependency_nodes_skips_bad_rows() {
+    // Rows without a PHID are skipped (patch.rs:3720); unseen
+    // transitive dependencies queue for the next level (patch.rs:3734);
+    // locally-present commits keep empty edges.
+    let start = serde_json::json!([{
+        "phid": "P1", "id": 1,
+        "auxiliary": {"phabricator:depends-on": ["PA", "PB"]}
+    }]);
+    let level = serde_json::json!([
+        {"noid": true},
+        {"phid": "PA", "id": 2, "auxiliary": {"phabricator:depends-on": ["PC"]}},
+        {"phid": "PB", "id": 3, "hashes": {"gtcm": "LOCAL"},
+         "auxiliary": {"phabricator:depends-on": ["PD"]}},
+    ]);
+    let graph = |_: &str, params: &serde_json::Value| {
+        let text = params.to_string();
+        if text.contains("\"ids\"") {
+            Ok(start.clone())
+        } else if text.contains("PC") {
+            Ok(serde_json::json!([]))
+        } else {
+            Ok(level.clone())
+        }
+    };
+    let (nodes, start_phid) =
+        load_dependency_nodes(&graph, 1, &|hash| hash == Some("LOCAL"), "gtcm").unwrap();
+    assert_eq!(start_phid, "P1");
+    assert_eq!(nodes.len(), 3);
+    let local = nodes.iter().find(|node| node.phid == "PB").unwrap();
+    assert!(local.depends_on.is_empty());
+    let parent = nodes.iter().find(|node| node.phid == "PA").unwrap();
+    assert_eq!(parent.depends_on, vec!["PC".to_string()]);
+}
+
+#[test]
+fn t1170_plan_children_empty_and_error() {
+    // An unknown start revision plans no children (patch.rs:5872);
+    // Conduit failures propagate (patch.rs:5870).
+    let dir = temp_dir("t1170_plan_empty");
+    let bundle = Bundle {
+        revision_id: Some(1),
+        ..Bundle::default()
+    };
+    let mut io = Io::buffered();
+    let empty = |_: &str, _: &serde_json::Value| Ok(serde_json::json!([]));
+    assert!(
+        plan_dependency_children(
+            &dir,
+            Vcs::Git,
+            &bundle,
+            &Options::default(),
+            &mut io,
+            &empty
+        )
+        .unwrap()
+        .is_empty()
+    );
+    let failing = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        Err("boom".to_string())
+    };
+    assert_eq!(
+        plan_dependency_children(
+            &dir,
+            Vcs::Git,
+            &bundle,
+            &Options::default(),
+            &mut io,
+            &failing
+        )
+        .unwrap_err(),
+        "boom"
+    );
+}
+
+#[test]
+fn t1170_build_children_skips_unresolved() {
+    // Dependencies without a resolved monogram are skipped
+    // (patch.rs:5970), so only resolvable children plan.
+    let dir = temp_dir("t1170_plan_skip");
+    let bundle = Bundle {
+        revision_id: Some(1),
+        ..Bundle::default()
+    };
+    let start = serde_json::json!([{
+        "phid": "P1", "id": 1,
+        "auxiliary": {"phabricator:depends-on": ["PA"]}
+    }]);
+    let level = serde_json::json!([{"phid": "PA", "id": 2, "auxiliary": {}}]);
+    let monograms = serde_json::json!([{"phid": "P1", "id": 1}]);
+    let graph = |_: &str, params: &serde_json::Value| {
+        let text = params.to_string();
+        if text.contains("\"ids\"") {
+            Ok(start.clone())
+        } else if text.contains("P1") {
+            Ok(monograms.clone())
+        } else {
+            Ok(level.clone())
+        }
+    };
+    let mut io = Io::buffered();
+    let children = plan_dependency_children(
+        &dir,
+        Vcs::Git,
+        &bundle,
+        &Options::default(),
+        &mut io,
+        &graph,
+    )
+    .unwrap();
+    assert!(children.is_empty());
+}
+
+#[test]
+fn t1170_git_create_branch_fails_when_names_taken() {
+    // Exhausting the `arcpatch{,_1,_2,_3}` names propagates the
+    // verbatim error (patch.rs:4018) after logging each collision.
+    let repo = make_repo("t1170_branch_taken");
+    for name in ["arcpatch", "arcpatch_1", "arcpatch_2", "arcpatch_3"] {
+        git(&repo, &["branch", name]);
+    }
+    let mut io = Io::buffered();
+    assert_eq!(
+        git_create_branch(&repo, &Bundle::default(), false, &mut io).unwrap_err(),
+        "Arc was unable to automagically make a name for this patch. Please clean up your \
+         working copy and try again."
+    );
+    assert!(
+        io.out.stdout.contains("already exists; trying a new name"),
+        "{}",
+        io.out.stdout
+    );
+}
+
+#[test]
+fn t1170_git_submodule_update_fails_outside_repo() {
+    // A non-zero `git submodule update` fails with the stderr tail
+    // (patch.rs:4035-4038).
+    let dir = temp_dir("t1170_submodule_outside");
+    let mut io = Io::buffered();
+    let err = git_submodule_update(&dir, &mut io).unwrap_err();
+    assert!(err.starts_with("git submodule update failed:"), "{err}");
+}
+
+#[test]
+fn t1170_git_commit_patch_fails_when_clean() {
+    // Nothing to commit fails the commit (patch.rs:4114-4117).
+    let repo = make_repo("t1170_commit_clean");
+    let err = git_commit_patch(&repo, &Bundle::default(), "msg").unwrap_err();
+    assert!(err.starts_with("git commit failed:"), "{err}");
+}
+
+#[test]
+fn t1170_cherry_pick_reports_submodule_failure() {
+    // A cherry-pick that lands but breaks submodule update reports the
+    // update error (patch.rs:4186) with the failure banner, and still
+    // deletes the temp branch. The work branch carries a real gitlink
+    // plus a bogus URL, so only the post-pick update fails.
+    let repo = make_repo("t1170_cherry_sub");
+    let origin = temp_dir("t1170_cherry_origin");
+    git(&origin, &["init", "-b", "master"]);
+    git(&origin, &["config", "user.email", "patch@test"]);
+    git(&origin, &["config", "user.name", "Patch Test"]);
+    std::fs::write(origin.join("x.txt"), "x\n").unwrap();
+    git(&origin, &["add", "."]);
+    git(&origin, &["commit", "-m", "sub"]);
+    git(&repo, &["checkout", "-b", "work"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &origin.to_string_lossy(),
+            "x",
+        ],
+    );
+    let modules = std::fs::read_to_string(repo.join(".gitmodules")).unwrap();
+    std::fs::write(
+        repo.join(".gitmodules"),
+        modules.replace(
+            &origin.to_string_lossy().into_owned(),
+            "file:///nonexistent-submodule-xyz",
+        ),
+    )
+    .unwrap();
+    git(&repo, &["add", ".gitmodules"]);
+    git(&repo, &["commit", "-m", "add submodule"]);
+    git(&repo, &["checkout", "master"]);
+    // Scrub the branch-independent registration so the post-pick
+    // update clones from the bogus URL instead of the stale config.
+    git(&repo, &["config", "--remove-section", "submodule.x"]);
+    let _ = std::fs::remove_dir_all(repo.join("x"));
+    let _ = std::fs::remove_dir_all(repo.join(".git/modules/x"));
+    let mut io = Io::buffered();
+    let err = git_cherry_pick_temp_ansi(&repo, &mut io, "master", "work", false).unwrap_err();
+    assert!(err.starts_with("git submodule update failed:"), "{err}");
+    assert!(
+        io.out.stdout.contains("Cherry Pick Failed!"),
+        "{}",
+        io.out.stdout
+    );
+    assert!(git(&repo, &["branch", "--list", "work"]).is_empty());
+}
+
+#[test]
+#[cfg(unix)]
+fn t1170_hg_tip_info_paths() {
+    // The working-parent lookup parses the `\x01`-separated template
+    // (patch.rs:3204-3233); failures, missing separators, and empty
+    // nodes all read as no commits.
+    let dir = temp_dir("t1170_tip");
+    let hg = stub_hg(
+        &dir,
+        "stubhg-tip.sh",
+        "#!/bin/sh\necho \"$*\" >> .stubhg.log\n\
+         if [ \"$1\" = \"--encoding\" ]; then shift; shift; fi\n\
+         if [ \"$1\" = \"log\" ] && [ -e .stubhg-fail-log ]; then exit 1; fi\n\
+         if [ \"$1\" = \"log\" ] && [ -e .stubhg-log ]; then cat .stubhg-log; exit 0; fi\n\
+         exit 0\n",
+    );
+    std::fs::write(
+        dir.join(".stubhg-log"),
+        b"abc123\x01Author Name <a@t>\x01hello desc",
+    )
+    .unwrap();
+    let tip = hg_tip_info(&dir, &hg).unwrap().unwrap();
+    assert_eq!(tip.hash, "abc123");
+    assert_eq!(tip.author, "Author Name");
+    assert_eq!(tip.message, "hello desc");
+    std::fs::write(dir.join(".stubhg-fail-log"), "").unwrap();
+    assert!(hg_tip_info(&dir, &hg).unwrap().is_none());
+    std::fs::remove_file(dir.join(".stubhg-fail-log")).unwrap();
+    std::fs::write(dir.join(".stubhg-log"), "plain-node").unwrap();
+    assert!(hg_tip_info(&dir, &hg).unwrap().is_none());
+    std::fs::write(dir.join(".stubhg-log"), b"\x01a@t\x01d").unwrap();
+    assert!(hg_tip_info(&dir, &hg).unwrap().is_none());
+}
+
+#[test]
+#[cfg(unix)]
+fn t1170_hg_amend_commit_path() {
+    // A matching unpublished hg tip amends through the backend
+    // (patch.rs:3491) without opening the editor. The project pin
+    // keeps history mutable regardless of user config.
+    let dir = make_repo("t1170_hg_amend");
+    std::fs::write(dir.join(".arcconfig"), "{\"history.immutable\": false}").unwrap();
+    let hg = stub_hg(
+        &dir,
+        "stubhg-amend.sh",
+        "#!/bin/sh\necho \"$*\" >> .stubhg.log\n\
+         if [ \"$1\" = \"--encoding\" ]; then shift; shift; fi\n\
+         case \"$1\" in\n\
+         log) printf 'abc123\\001Amender <a@t>\\001plain message' ;;\n\
+         showconfig) printf 'Amender <a@t>' ;;\n\
+         help) printf 'hg commit [OPTION]...\\n  --amend flag\\n' ;;\n\
+         *) exit 0 ;;\nesac\nexit 0\n",
+    );
+    let backends = Backends {
+        hg,
+        svn: svn::SvnCommand::system(),
+    };
+    let mut io = Io::canned(&["y"]);
+    let status = TreeStatus {
+        unstaged: vec!["f.txt".to_string()],
+        ..TreeStatus::default()
+    };
+    let edit = |_: &str| -> Result<String, String> { panic!("amend never edits") };
+    assert_eq!(
+        resolve_uncommitted_tree(
+            &dir,
+            Vcs::Hg,
+            &backends,
+            &mut io,
+            &status,
+            "DESC",
+            None,
+            &edit
+        )
+        .unwrap(),
+        StashState::Clean
+    );
+    assert!(
+        io.out.stdout.contains("amend these 1 change(s)"),
+        "{}",
+        io.out.stdout
+    );
+    let log = std::fs::read_to_string(dir.join(".stubhg.log")).unwrap();
+    assert!(log.contains("--amend"), "{log}");
+}
+
+#[test]
+#[cfg(unix)]
+fn t1170_hg_create_bookmark_paths() {
+    // Bookmark creation updates to the base first when asked
+    // (patch.rs:4398-4407) and reports the new bookmark
+    // (patch.rs:4410-4411); update failures propagate.
+    let dir = temp_dir("t1170_bookmark");
+    let hg = stub_hg(
+        &dir,
+        "stubhg-bookmark.sh",
+        "#!/bin/sh\necho \"$*\" >> .stubhg.log\n\
+         if [ \"$1\" = \"--encoding\" ]; then shift; shift; fi\n\
+         case \"$1\" in\n\
+         log) case \"$*\" in *arcpatch*) exit 1 ;; *) printf 'NODE999' ;; esac ;;\n\
+         bookmark) exit 0 ;;\n\
+         update) if [ -e .stubhg-fail-update ]; then echo update exploded 1>&2; exit 1; fi\n\
+         echo moved ;; \n*) exit 0 ;;\nesac\n",
+    );
+    let mut io = Io::buffered();
+    assert_eq!(
+        hg_create_bookmark(&dir, &hg, &Bundle::default(), false, &mut io).unwrap(),
+        "arcpatch"
+    );
+    assert!(
+        io.out
+            .stdout
+            .contains("Created and checked out bookmark arcpatch."),
+        "{}",
+        io.out.stdout
+    );
+    let bundle = Bundle {
+        base_revision: Some(".".to_string()),
+        ..Bundle::default()
+    };
+    let mut io = Io::buffered();
+    assert_eq!(
+        hg_create_bookmark(&dir, &hg, &bundle, true, &mut io).unwrap(),
+        "arcpatch"
+    );
+    assert!(
+        io.out
+            .stdout
+            .contains("Updating to the revision's base commit"),
+        "{}",
+        io.out.stdout
+    );
+    assert!(io.out.stdout.contains("moved"), "{}", io.out.stdout);
+    std::fs::write(dir.join(".stubhg-fail-update"), "").unwrap();
+    let mut io = Io::buffered();
+    let err = hg_create_bookmark(&dir, &hg, &bundle, true, &mut io).unwrap_err();
+    assert!(err.contains("hg update failed: update exploded"), "{err}");
+}
+
+#[test]
+#[cfg(unix)]
+fn t1170_hg_create_bookmark_names_taken() {
+    // Exhausting the bookmark names propagates the verbatim error
+    // (patch.rs:4396) after logging each collision.
+    let dir = temp_dir("t1170_bookmark_taken");
+    let hg = stub_hg(
+        &dir,
+        "stubhg-taken.sh",
+        "#!/bin/sh\necho \"$*\" >> .stubhg.log\n\
+         if [ \"$1\" = \"--encoding\" ]; then shift; shift; fi\n\
+         if [ \"$1\" = \"log\" ]; then printf 'TAKEN'; exit 0; fi\n\
+         exit 0\n",
+    );
+    let mut io = Io::buffered();
+    assert_eq!(
+        hg_create_bookmark(&dir, &hg, &Bundle::default(), false, &mut io).unwrap_err(),
+        "Arc was unable to automagically make a name for this patch. Please clean up your \
+         working copy and try again."
+    );
+    assert!(
+        io.out
+            .stdout
+            .contains("Bookmark name arcpatch-3 already exists"),
+        "{}",
+        io.out.stdout
+    );
+}
+
+#[test]
+fn t1170_unquote_rejects_bad_octal() {
+    // An octal escape that overflows a byte is dropped
+    // (patch.rs:4805).
+    assert_eq!(unquote_git_path("\"a\\8\""), "a");
+}
+
+#[test]
+fn t1170_hg_import_failure_reports_banner() {
+    // A failed import prints the patch-failed banner (patch.rs:4487)
+    // and propagates the trimmed hg output (patch.rs:4492-4496).
+    let dir = temp_dir("t1170_import_fail");
+    let hg = fake_hg_backend(&dir);
+    std::fs::write(dir.join(".fakehg-fail-import"), "").unwrap();
+    let bundle = Bundle {
+        text: "diff --git a/f b/f\n".to_string(),
+        ..Bundle::default()
+    };
+    let mut io = Io::buffered();
+    assert_eq!(
+        hg_import_patch_ansi(&dir, &hg, &bundle, &mut io, false).unwrap_err(),
+        ""
+    );
+    assert!(io.out.stdout.contains("Patch Failed!"), "{}", io.out.stdout);
+}
+
+#[test]
+#[cfg(unix)]
+fn t1170_hg_import_case_warning() {
+    // A `case-folding collision` stderr adds the WARNING block
+    // (patch.rs:4489-4491) after the banner.
+    let dir = temp_dir("t1170_import_case");
+    let hg = stub_hg(
+        &dir,
+        "stubhg-import.sh",
+        "#!/bin/sh\nif [ \"$1\" = \"--encoding\" ]; then shift; shift; fi\n\
+         echo 'oops case-folding collision xyz' 1>&2\nexit 1\n",
+    );
+    let bundle = Bundle {
+        text: "diff --git a/f b/f\n".to_string(),
+        ..Bundle::default()
+    };
+    let mut io = Io::buffered();
+    let err = hg_import_patch_ansi(&dir, &hg, &bundle, &mut io, false).unwrap_err();
+    assert!(err.contains("case-folding collision"), "{err}");
+    assert!(io.out.stdout.contains("Patch Failed!"), "{}", io.out.stdout);
+    assert!(io.out.stdout.contains("** WARNING **"), "{}", io.out.stdout);
+    assert!(
+        io.out.stdout.contains("case of a filename"),
+        "{}",
+        io.out.stdout
+    );
+}
+
+#[test]
+fn t1170_hg_commit_uses_author_and_reports_failure() {
+    // The full author rides as `-u` (patch.rs:4514-4515); failures
+    // report the stderr tail (patch.rs:4520-4525).
+    let dir = temp_dir("t1170_hg_commit");
+    let hg = fake_hg_backend(&dir);
+    let bundle = Bundle {
+        author_name: Some("Ada".to_string()),
+        author_email: Some("ada@t".to_string()),
+        ..Bundle::default()
+    };
+    hg_commit_patch(&dir, &hg, &bundle, "msg").unwrap();
+    let log = std::fs::read_to_string(dir.join(".fakehg.log")).unwrap();
+    assert!(log.contains("-u"), "{log}");
+    assert!(log.contains("Ada <ada@t>"), "{log}");
+    std::fs::write(dir.join(".fakehg-fail-commit"), "").unwrap();
+    let err = hg_commit_patch(&dir, &hg, &bundle, "msg").unwrap_err();
+    assert!(err.starts_with("hg commit failed:"), "{err}");
+}
+
+#[test]
+#[cfg(unix)]
+fn t1170_hg_rebase_temp_aborts_on_failure() {
+    // A rebase onto a diverged parent that fails aborts and reports
+    // the verbatim banner (patch.rs:4563-4572).
+    let dir = temp_dir("t1170_rebase");
+    let hg = stub_hg(
+        &dir,
+        "stubhg-rebase.sh",
+        "#!/bin/sh\necho \"$*\" >> .stubhg.log\n\
+         if [ \"$1\" = \"--encoding\" ]; then shift; shift; fi\n\
+         case \"$1\" in\n\
+         log) case \"$*\" in *orig*) printf 'AAA' ;; *) printf 'BBB' ;; esac ;;\n\
+         rebase) case \"$*\" in *--abort*) exit 0 ;; *) echo boom 1>&2; exit 1 ;; esac ;;\n\
+         bookmark) exit 0 ;;\n*) exit 0 ;;\nesac\n",
+    );
+    let err = hg_rebase_temp_ansi(&dir, &hg, "orig", "new", false).unwrap_err();
+    assert!(err.contains("Rebase onto orig failed!"), "{err}");
+    let log = std::fs::read_to_string(dir.join(".stubhg.log")).unwrap();
+    assert!(log.contains("rebase --abort"), "{log}");
+    assert!(log.contains("bookmark --delete new"), "{log}");
+}
+
+#[test]
+fn t1170_sanity_check_hg_revision() {
+    // The hg sanity check resolves the working revision through the
+    // backend (patch.rs:3864, :3873-3878) and prompts; declining
+    // aborts.
+    let dir = temp_dir("t1170_sanity_hg");
+    let backends = Backends {
+        hg: fake_hg_backend(&dir),
+        svn: svn::SvnCommand::system(),
+    };
+    let bundle = Bundle {
+        base_revision: Some("abc".to_string()),
+        ..Bundle::default()
+    };
+    let mut io = Io::canned(&["y"]);
+    assert_eq!(
+        sanity_check(&dir, Vcs::Hg, &backends, &mut io, None, &bundle, false),
+        Ok(())
+    );
+    let mut io = Io::canned(&["n"]);
+    assert_eq!(
+        sanity_check(&dir, Vcs::Hg, &backends, &mut io, None, &bundle, false).unwrap_err(),
+        land::ABORT
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn t1170_maybe_create_branch_hg() {
+    // The hg branch captures the active bookmark and creates a new
+    // one (patch.rs:5810-5821).
+    let dir = temp_dir("t1170_branch_hg");
+    let hg = stub_hg(
+        &dir,
+        "stubhg-branch.sh",
+        "#!/bin/sh\necho \"$*\" >> .stubhg.log\n\
+         if [ \"$1\" = \"--encoding\" ]; then shift; shift; fi\n\
+         case \"$1\" in\n\
+         bookmarks) printf ' * active  3:aaa\\n   other  2:bbb\\n' ;;\n\
+         log) case \"$*\" in *arcpatch*) exit 1 ;; *) printf 'NODE1' ;; esac ;;\n\
+         bookmark) exit 0 ;;\n*) exit 0 ;;\nesac\n",
+    );
+    let backends = Backends {
+        hg,
+        svn: svn::SvnCommand::system(),
+    };
+    let mut io = Io::buffered();
+    let state = maybe_create_branch(
+        &dir,
+        Vcs::Hg,
+        &backends,
+        &Bundle::default(),
+        &Options::default(),
+        &mut io,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        state,
+        BranchState {
+            original: Some("active".to_string()),
+            new: Some("arcpatch".to_string()),
+        }
+    );
+}
+
+#[test]
+fn t1170_split_git_header_quoted_and_malformed() {
+    // The `diff --git` fallback honors C-quoting (patch.rs:4863-4868);
+    // a header without two paths yields nothing (patch.rs:4884).
+    let changes = parse_git_patch_for_svn(
+        "diff --git \"a/a b\" \"b/a b\"\nold mode 100644\nnew mode 100755\n",
+    );
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].old_path.as_deref(), Some("a b"));
+    assert_eq!(changes[0].current_path.as_deref(), Some("a b"));
+    let changes = parse_git_patch_for_svn("diff --git loner\nold mode 1\nnew mode 2\n");
+    assert_eq!(changes.len(), 1);
+    assert!(changes[0].old_path.is_none());
+    assert!(changes[0].current_path.is_none());
+}
+
+#[test]
+fn t1170_parse_svn_copy_section() {
+    // `copy from`/`copy to` headers parse (patch.rs:4989-4992) and
+    // classify the change as a copy-here with header paths
+    // (patch.rs:5082-5090).
+    let changes = parse_git_patch_for_svn(
+        "diff --git a/o.txt b/c.txt\ncopy from o.txt\ncopy to c.txt\n--- a/o.txt\n+++ b/c.txt\n@@ -1 +1 @@\n same\n",
+    );
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].change_type, TYPE_COPY_HERE);
+    assert_eq!(changes[0].old_path.as_deref(), Some("o.txt"));
+    assert_eq!(changes[0].current_path.as_deref(), Some("c.txt"));
+}
+
+#[test]
+fn t1170_svn_create_parents_top_level_is_noop() {
+    // A path with no parent needs no directories (patch.rs:5166).
+    let dir = temp_dir("t1170_parents_noop");
+    assert_eq!(
+        svn_create_parents(&dir, &svn::SvnCommand::system(), ""),
+        Ok(())
+    );
+}
+
+#[test]
+fn t1170_plan_svn_changes_collects_ops() {
+    // Planning collects deletes for existing files (patch.rs:5346),
+    // adds (patch.rs:5318-5320), copies for existing sources
+    // (patch.rs:5374-5376), and propset entries for new-only
+    // properties (patch.rs:5387).
+    let dir = temp_dir("t1170_plan");
+    std::fs::write(dir.join("del.txt"), "x").unwrap();
+    std::fs::write(dir.join("src.txt"), "x").unwrap();
+    let changes = vec![
+        SvnChange {
+            change_type: TYPE_DELETE,
+            current_path: Some("del.txt".to_string()),
+            ..SvnChange::default()
+        },
+        SvnChange {
+            change_type: TYPE_ADD,
+            current_path: Some("new.txt".to_string()),
+            ..SvnChange::default()
+        },
+        SvnChange {
+            change_type: TYPE_MOVE_HERE,
+            old_path: Some("src.txt".to_string()),
+            current_path: Some("dst.txt".to_string()),
+            ..SvnChange::default()
+        },
+        SvnChange {
+            change_type: TYPE_CHANGE,
+            old_path: Some("m.txt".to_string()),
+            current_path: Some("m.txt".to_string()),
+            new_props: [("k".to_string(), "v".to_string())].into_iter().collect(),
+            ..SvnChange::default()
+        },
+    ];
+    let mut io = Io::canned(&[]);
+    let plan = plan_svn_changes(&dir, &changes, &mut io).unwrap();
+    assert_eq!(plan.deletes, vec!["del.txt".to_string()]);
+    assert_eq!(plan.adds, vec!["new.txt".to_string()]);
+    assert_eq!(
+        plan.copies,
+        vec![("src.txt".to_string(), "dst.txt".to_string())]
+    );
+    assert!(
+        plan.propset.iter().any(|(path, key, value)| {
+            path == "m.txt" && key == "k" && value.as_deref() == Some("v")
+        }),
+        "{:?}",
+        plan.propset
+    );
+}
+
+#[test]
+fn t1170_plan_svn_copy_missing_declines() {
+    // A move from a missing source prompts with the move verb
+    // (patch.rs:5364); declining aborts (patch.rs:5371).
+    let dir = temp_dir("t1170_plan_decline");
+    let changes = vec![SvnChange {
+        change_type: TYPE_MOVE_HERE,
+        old_path: Some("missing.txt".to_string()),
+        current_path: Some("dst.txt".to_string()),
+        ..SvnChange::default()
+    }];
+    let mut io = Io::canned(&["n"]);
+    assert_eq!(
+        plan_svn_changes(&dir, &changes, &mut io).unwrap_err(),
+        land::ABORT
+    );
+    assert!(
+        io.out.stdout.contains("moves 'missing.txt'"),
+        "{}",
+        io.out.stdout
+    );
+}
+
+#[test]
+fn t1170_create_svn_parents_for_plan() {
+    // Copy destinations and added paths gain parents through the
+    // backend (patch.rs:5405, :5411).
+    let dir = temp_dir("t1170_svn_parents");
+    let svn = fake_svn_backend(&dir);
+    let plan = SvnPlan {
+        copies: vec![("s.txt".to_string(), "sub/d.txt".to_string())],
+        adds: vec!["sub2/e.txt".to_string()],
+        ..SvnPlan::default()
+    };
+    create_svn_parents(&dir, &svn, &plan).unwrap();
+    assert!(dir.join("sub").is_dir());
+    assert!(dir.join("sub2").is_dir());
+    let log = std::fs::read_to_string(dir.join(".fakesvn.log")).unwrap();
+    assert!(log.contains("add sub"), "{log}");
+    assert!(log.contains("add sub2"), "{log}");
+}
+
+#[test]
+fn t1170_run_svn_copies_deletes() {
+    // Planned copies and deletes run as `svn cp`/`svn rm`
+    // (patch.rs:5419-5426).
+    let dir = temp_dir("t1170_svn_cprm");
+    let svn = fake_svn_backend(&dir);
+    let plan = SvnPlan {
+        copies: vec![("s.txt".to_string(), "d.txt".to_string())],
+        deletes: vec!["g.txt".to_string()],
+        ..SvnPlan::default()
+    };
+    run_svn_copies_deletes(&dir, &svn, &plan).unwrap();
+    let log = std::fs::read_to_string(dir.join(".fakesvn.log")).unwrap();
+    assert!(log.contains("cp s.txt d.txt"), "{log}");
+    assert!(log.contains("rm g.txt"), "{log}");
+}
+
+#[test]
+fn t1170_run_svn_symlinks_by_type() {
+    // Added, changed, and moved symlinks link (patch.rs:5440,
+    // :5445); other types skip (patch.rs:5447).
+    let symlinks = vec![
+        SvnChange {
+            change_type: TYPE_MOVE_HERE,
+            current_path: Some("l".to_string()),
+            symlink_target: Some("t".to_string()),
+            ..SvnChange::default()
+        },
+        SvnChange {
+            change_type: TYPE_DELETE,
+            current_path: Some("d".to_string()),
+            symlink_target: Some("t".to_string()),
+            ..SvnChange::default()
+        },
+    ];
+    let mut linked = Vec::new();
+    run_svn_symlinks(&symlinks, &mut |target, path| {
+        linked.push((target.to_string(), path.to_string()));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(linked, vec![("t".to_string(), "l".to_string())]);
+}
+
+#[test]
+fn t1170_run_svn_patches_touch_failure() {
+    // An empty patch whose touch fails counts as a hunk failure
+    // (patch.rs:5465).
+    let plan = SvnPlan {
+        patches: vec![("e.txt".to_string(), String::new())],
+        ..SvnPlan::default()
+    };
+    let mut io = Io::buffered();
+    let failed = run_svn_patches(
+        &plan,
+        &mut io,
+        &mut |_, _| -> Result<(bool, String), String> { panic!("no patch expected") },
+        &mut |_| Err("no touch".to_string()),
+    )
+    .unwrap();
+    assert!(failed);
+}
+
+#[test]
+fn t1170_run_svn_adds_and_props() {
+    // Adds run `svn add` (patch.rs:5486); removals run `propdel`
+    // (patch.rs:5492) and values run `propset` (patch.rs:5499), with
+    // `unix:filemode` mapped to `svn:executable`.
+    let dir = temp_dir("t1170_svn_addprop");
+    let svn = fake_svn_backend(&dir);
+    let plan = SvnPlan {
+        adds: vec!["n.txt".to_string()],
+        propset: vec![
+            (
+                "f.txt".to_string(),
+                "unix:filemode".to_string(),
+                Some("100755".to_string()),
+            ),
+            ("g.txt".to_string(), "svn:ignore".to_string(), None),
+        ],
+        ..SvnPlan::default()
+    };
+    run_svn_adds_props(&dir, &svn, &plan).unwrap();
+    let log = std::fs::read_to_string(dir.join(".fakesvn.log")).unwrap();
+    assert!(log.contains("add n.txt"), "{log}");
+    assert!(log.contains("propset svn:executable on f.txt"), "{log}");
+    assert!(log.contains("propdel svn:ignore g.txt"), "{log}");
+}
+
+#[test]
+fn t1170_run_patch_file_applies_and_reports() {
+    // The `patch -p0` runner (patch.rs:5527-5529) reports success and
+    // stdout (patch.rs:5547-5550) for both outcomes.
+    if !has_patch_binary() {
+        return;
+    }
+    let dir = temp_dir("t1170_patch_run");
+    std::fs::write(dir.join("v.txt"), "a\n").unwrap();
+    let (ok, out) = run_patch_file(&dir, "--- v.txt\n+++ v.txt\n@@ -1 +1 @@\n-a\n+b\n").unwrap();
+    assert!(ok, "{out}");
+    assert!(out.contains("patching"), "{out}");
+    assert_eq!(std::fs::read_to_string(dir.join("v.txt")).unwrap(), "b\n");
+    std::fs::write(dir.join("w.txt"), "zzz\n").unwrap();
+    let (ok, _) = run_patch_file(&dir, "--- w.txt\n+++ w.txt\n@@ -1 +1 @@\n-a\n+b\n").unwrap();
+    assert!(!ok);
+}
+
+#[test]
+fn t1170_run_patch_file_converted_applies() {
+    // The encoding-converting runner (patch.rs:5555-5560) converts
+    // first, then applies like the plain runner.
+    if !has_patch_binary() {
+        return;
+    }
+    let dir = temp_dir("t1170_patch_converted");
+    std::fs::write(dir.join("v.txt"), "a\n").unwrap();
+    let (ok, _) = run_patch_file_converted(
+        &dir,
+        "--- v.txt\n+++ v.txt\n@@ -1 +1 @@\n-a\n+b\n",
+        Some("UTF-8"),
+    )
+    .unwrap();
+    assert!(ok);
+    assert_eq!(std::fs::read_to_string(dir.join("v.txt")).unwrap(), "b\n");
+}
+
+#[test]
+fn t1170_flow_update_failure_aborts() {
+    // The flow runs the working-copy update first (patch.rs:6066); a
+    // failing `git pull` aborts before any patching.
+    let repo = make_repo("t1170_flow_update");
+    let patch = repo.join("fix.patch");
+    std::fs::write(
+        &patch,
+        "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-base\n+new\n",
+    )
+    .unwrap();
+    let path = patch.to_string_lossy().to_string();
+    let err = execute_with_stdin_ansi(
+        &repo,
+        &argv(&["--patch", &path, "--force", "--update"]),
+        None,
+        false,
+    )
+    .unwrap_err();
+    assert!(!err.is_empty(), "expected the pull failure");
+}
+
+#[test]
+fn t1170_setup_patch_client_requires_token() {
+    // Non-patch sources build a Conduit client (patch.rs:6094-6097),
+    // which fails without a token for the URI.
+    let dir = temp_dir("t1170_setup_client");
+    let options = options_of(&["--conduit-uri", "https://patch-test.invalid/api/"]);
+    assert_eq!(
+        setup_patch_client(&Source::Named("1".to_string()), &options, &dir).unwrap_err(),
+        "no token for https://patch-test.invalid/api/ in ~/.arcrc"
+    );
+}
+
+#[test]
+fn t1170_apply_bundle_encoding_without_call() {
+    // Without a Conduit channel there is no repository encoding to
+    // look up (patch.rs:6123), so the bundle keeps no encoding.
+    let dir = temp_dir("t1170_enc_nocall");
+    let mut loaded = LoadedBundle {
+        bundle: Bundle::default(),
+        arcbundle_dicts: None,
+    };
+    apply_patch_bundle_encoding(
+        &dir,
+        Vcs::Git,
+        &Backends::default(),
+        &Source::Revision("1".to_string()),
+        &options_of(&[]),
+        None,
+        &mut loaded,
+    )
+    .unwrap();
+    assert!(loaded.bundle.encoding.is_none());
+}
+
+#[test]
+fn t1170_combine_flow_outcome_prefers_errors() {
+    // A failed stash pop fails an otherwise clean run
+    // (patch.rs:6142).
+    assert_eq!(
+        combine_patch_flow_outcome(Ok(FlowOutcome::Done), Err("pop".to_string())),
+        Err("pop".to_string())
+    );
+}
+
+#[test]
+fn t1170_flow_branch_collision_aborts() {
+    // Branch creation failure inside the flow propagates
+    // (patch.rs:6209) before anything applies.
+    let repo = make_repo("t1170_flow_branch");
+    for name in ["arcpatch", "arcpatch_1", "arcpatch_2", "arcpatch_3"] {
+        git(&repo, &["branch", name]);
+    }
+    let patch = repo.join("fix.patch");
+    std::fs::write(&patch, "diff --git a/f.txt b/f.txt\n").unwrap();
+    let path = patch.to_string_lossy().to_string();
+    let err = execute_with_stdin_ansi(
+        &repo,
+        &argv(&["--patch", &path, "--force", "--nocommit"]),
+        None,
+        false,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        "Arc was unable to automagically make a name for this patch. Please clean up your \
+         working copy and try again."
+    );
+}
+
+#[test]
+fn t1170_flow_hg_apply_failure_propagates() {
+    // An hg apply failure inside the flow propagates (patch.rs:6317)
+    // after printing the failure banner.
+    let dir = temp_dir("t1170_flow_hg");
+    std::fs::create_dir(dir.join(".hg")).unwrap();
+    let backends = Backends {
+        hg: fake_hg_backend(&dir),
+        svn: svn::SvnCommand::system(),
+    };
+    std::fs::write(dir.join(".fakehg-fail-import"), "").unwrap();
+    let patch = dir.join("fix.patch");
+    std::fs::write(&patch, "diff --git a/f b/f\n").unwrap();
+    let path = patch.to_string_lossy().to_string();
+    let mut io = Io::buffered();
+    let err = execute_with_io_ansi(
+        &dir,
+        &argv(&["--patch", &path, "--force", "--nobranch", "--nocommit"]),
+        &mut io,
+        &backends,
+        false,
+    )
+    .unwrap_err();
+    assert_eq!(err, String::new());
+    assert!(io.out.stdout.contains("Patch Failed!"), "{}", io.out.stdout);
+}
+
+#[test]
+fn t1170_apply_patch_svn_from_dicts() {
+    // The svn applier takes arcbundle dicts when present
+    // (patch.rs:6335), patching (patch.rs:6344), touching
+    // (patch.rs:6346), and linking (patch.rs:6348) per change; clean
+    // runs report `Done` (patch.rs:6350) and failed hunks report
+    // `SvnHunksFailed` (patch.rs:6351).
+    if !has_patch_binary() {
+        return;
+    }
+    let dir = temp_dir("t1170_svn_dicts");
+    std::fs::write(dir.join("v.txt"), "a\n").unwrap();
+    let backends = Backends {
+        hg: hg::HgCommand::system(),
+        svn: fake_svn_backend(&dir),
+    };
+    let mut dicts = vec![
+        serde_json::json!({"type": 2, "fileType": 1, "oldPath": "v.txt", "currentPath": "v.txt",
+            "oldProperties": {}, "newProperties": {}}),
+        serde_json::json!({"type": 1, "fileType": 1, "currentPath": "touched.txt",
+            "oldProperties": {}, "newProperties": {}}),
+    ];
+    let mut corpora = vec![vec![parsed_hunk(1, 1, 1, 1, "-a\n+b\n")], Vec::new()];
+    #[cfg(unix)]
+    {
+        dicts.push(
+            serde_json::json!({"type": 1, "fileType": 5, "currentPath": "link",
+                "oldProperties": {}, "newProperties": {}}),
+        );
+        corpora.push(vec![parsed_hunk(1, 0, 1, 1, "+tgt\n")]);
+    }
+    let bundle = Bundle::default();
+    let mut io = Io::buffered();
+    assert_eq!(
+        apply_patch_svn(
+            &dir,
+            &backends,
+            &bundle,
+            Some(&(dicts, corpora)),
+            &mut io,
+            false
+        )
+        .unwrap(),
+        FlowOutcome::Done
+    );
+    assert_eq!(std::fs::read_to_string(dir.join("v.txt")).unwrap(), "b\n");
+    assert!(dir.join("touched.txt").is_file());
+    #[cfg(unix)]
+    assert!(
+        std::fs::symlink_metadata(dir.join("link"))
+            .unwrap()
+            .is_symlink(),
+        "expected a symlink"
+    );
+    let dir = temp_dir("t1170_svn_dicts_fail");
+    std::fs::write(dir.join("v.txt"), "zzz\n").unwrap();
+    let backends = Backends {
+        hg: hg::HgCommand::system(),
+        svn: fake_svn_backend(&dir),
+    };
+    let dicts = vec![
+        serde_json::json!({"type": 2, "fileType": 1, "oldPath": "v.txt", "currentPath": "v.txt",
+            "oldProperties": {}, "newProperties": {}}),
+    ];
+    let corpora = vec![vec![parsed_hunk(1, 1, 1, 1, "-a\n+b\n")]];
+    let mut io = Io::buffered();
+    assert_eq!(
+        apply_patch_svn(
+            &dir,
+            &backends,
+            &bundle,
+            Some(&(dicts, corpora)),
+            &mut io,
+            false
+        )
+        .unwrap(),
+        FlowOutcome::SvnHunksFailed
+    );
+    assert!(io.out.stdout.contains("WARNING"), "{}", io.out.stdout);
+}
+
+#[test]
+fn t1170_flow_svn_hunks_failure_exits_empty() {
+    // Failed svn hunks print the warning and exit empty
+    // (patch.rs:6392): the caller exits 1 without printing more.
+    if !has_patch_binary() {
+        return;
+    }
+    let dir = temp_dir("t1170_flow_svn");
+    std::fs::create_dir(dir.join(".svn")).unwrap();
+    std::fs::write(dir.join("v.txt"), "zzz\n").unwrap();
+    let backends = Backends {
+        hg: hg::HgCommand::system(),
+        svn: fake_svn_backend(&dir),
+    };
+    let patch = dir.join("fix.patch");
+    std::fs::write(
+        &patch,
+        "diff --git a/v.txt b/v.txt\n--- a/v.txt\n+++ b/v.txt\n@@ -1 +1 @@\n-a\n+b\n",
+    )
+    .unwrap();
+    let path = patch.to_string_lossy().to_string();
+    let mut io = Io::buffered();
+    let err = execute_with_io_ansi(
+        &dir,
+        &argv(&["--patch", &path, "--force"]),
+        &mut io,
+        &backends,
+        false,
+    )
+    .unwrap_err();
+    assert_eq!(err, String::new());
+    assert!(io.out.stdout.contains("WARNING"), "{}", io.out.stdout);
+}
+
+#[test]
+fn t1170_preview_conduit_requires_token() {
+    // Previewing a Conduit source builds a client (patch.rs:6401),
+    // which fails without a token for the URI.
+    let dir = temp_dir("t1170_preview_token");
+    let options = options_of(&[
+        "--revision",
+        "D1",
+        "--conduit-uri",
+        "https://patch-test.invalid/api/",
+    ]);
+    let mut io = Io::buffered();
+    assert_eq!(
+        execute_preview(&dir, &options, &mut io).unwrap_err(),
+        "no token for https://patch-test.invalid/api/ in ~/.arcrc"
+    );
+}

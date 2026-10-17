@@ -276,3 +276,202 @@ fn r10_shell_complete_help_matches_generated_format() {
         std::process::ExitCode::SUCCESS
     );
 }
+
+#[test]
+fn t1170_workflow_args_cover_every_shape() {
+    let (flags, wildcard) = workflow_args("amend");
+    assert!(!wildcard);
+    assert!(flags.contains(&("show", None, false)));
+    assert!(flags.contains(&("revision", Some("id"), false)));
+    let (flags, wildcard) = workflow_args("upload");
+    assert!(wildcard);
+    assert!(flags.contains(&("temporary", None, false)));
+    let (flags, wildcard) = workflow_args("work");
+    assert!(!wildcard);
+    assert!(flags.contains(&("start", Some("symbol"), false)));
+    let (flags, wildcard) = workflow_args("prompts");
+    assert!(!wildcard);
+    assert!(flags.is_empty());
+    let (flags, wildcard) = workflow_args("shell-complete");
+    assert!(!wildcard);
+    assert!(flags.contains(&("generate", None, false)));
+    assert!(flags.contains(&("shell", Some("shell-name"), false)));
+    let (flags, wildcard) = workflow_args("no-such-workflow");
+    assert!(!wildcard);
+    assert!(flags.is_empty());
+}
+
+#[test]
+fn t1170_shell_roots_resolve_beside_executable() {
+    assert_eq!(
+        shell_root_for(Path::new("/opt/arc/bin")),
+        PathBuf::from("/opt/arc/bin/support/shell")
+    );
+    let root = default_shell_root();
+    assert!(root.ends_with(Path::new("support/shell")), "{root:?}");
+}
+
+#[test]
+fn t1170_completion_cursor_handles_garbage_and_missing() {
+    assert_eq!(completion_cursor(Some("abc"), 3), (0, Some(String::new())));
+    assert_eq!(completion_cursor(None, 3), (2, None));
+    assert_eq!(completion_cursor(Some("2"), 3), (2, None));
+}
+
+#[test]
+fn t1170_valued_param_completion_skips_boolean_flags() {
+    let (flags, _) = workflow_args("land");
+    // After a boolean flag there is no parameter slot: fall through.
+    let words = args(&["arc", "land", "--hold", ""]);
+    assert_eq!(valued_param_completion(&words, 3, flags), None);
+    // After a valued flag the slot completes (empty for text params).
+    let words = args(&["arc", "land", "--onto", ""]);
+    assert_eq!(
+        valued_param_completion(&words, 3, flags),
+        Some(String::new())
+    );
+    let (paste_flags, _) = workflow_args("paste");
+    let words = args(&["arc", "paste", "--input", ""]);
+    assert_eq!(
+        valued_param_completion(&words, 3, paste_flags),
+        Some("<compgen:file>".to_string())
+    );
+}
+
+#[test]
+fn t1170_install_prompt_text_covers_rewrite_and_append() {
+    let (prompt, echo) = install_prompt_text(
+        "bash",
+        Some("source /old # arcanist-shell-complete"),
+        "source /new # arcanist-shell-complete",
+        false,
+    );
+    assert_eq!(prompt, "Rewrite this file?");
+    assert!(echo.contains("will be removed"), "{echo}");
+    assert!(echo.contains("/old"), "{echo}");
+    let (prompt, echo) =
+        install_prompt_text("bash", None, "source /new # arcanist-shell-complete", false);
+    assert_eq!(prompt, "Append to this file?");
+    assert!(echo.contains("will be added to your existing"), "{echo}");
+    let (prompt, _) =
+        install_prompt_text("bash", None, "source /new # arcanist-shell-complete", true);
+    assert_eq!(prompt, "Create this file?");
+}
+
+#[test]
+fn t1170_install_final_data_picks_rewrite_create_or_append() {
+    assert_eq!(
+        install_final_data("new".to_string(), "old", "line", true, false),
+        "new"
+    );
+    assert_eq!(
+        install_final_data("new".to_string(), "", "line", false, true),
+        "line\n"
+    );
+    assert_eq!(
+        install_final_data("new".to_string(), "old\n", "line", false, false),
+        "old\n\nline\n"
+    );
+}
+
+#[test]
+fn t1170_install_prompt_error_maps_abort_and_fatal() {
+    let abort = install_prompt_error(crate::prompt::ABORT.to_string());
+    assert_eq!(abort.kind, crate::conduit::EnvelopeKind::UserAbort);
+    assert_eq!(abort.message, crate::prompt::ABORT);
+    let fatal = install_prompt_error("eof".to_string());
+    assert_eq!(fatal.kind, crate::conduit::EnvelopeKind::Fatal);
+    assert_eq!(fatal.message, "eof");
+}
+
+#[test]
+fn t1170_install_reports_unwritable_profile() {
+    let home = scratch("installnowrite");
+    let root = scratch("installnowrite-root");
+    // A directory at `.profile` makes the final write fail.
+    std::fs::create_dir(home.join(".profile")).unwrap();
+    let mut save = |_: crate::prompts::PromptScope, _: &str| Ok(());
+    let mut input = BufReader::new(std::io::Cursor::new(b"y\n"));
+    let err = install_in(
+        None,
+        Some("/bin/bash"),
+        home.to_str(),
+        &root,
+        &mut input,
+        true,
+        None,
+        &mut save,
+    )
+    .unwrap_err();
+    assert_eq!(err.kind, crate::conduit::EnvelopeKind::Fatal);
+    assert!(err.message.contains("cannot write"), "{}", err.message);
+}
+
+#[test]
+fn t1170_generate_skips_when_rules_unwritable() {
+    let root = scratch("generatenowrite");
+    // A file at `rules/` makes `create_dir_all` fail.
+    std::fs::write(root.join("rules"), b"not a dir").unwrap();
+    let out = generate_in(&root);
+    assert!(out.contains("GENERATE"), "{out}");
+    assert!(out.contains("SKIP"), "{out}");
+    assert!(out.contains("already up to date"), "{out}");
+}
+
+#[test]
+fn t1170_run_complete_rejects_install_flags_and_bad_positions() {
+    use std::process::ExitCode;
+    assert_eq!(
+        run_complete(vec!["arc".to_string()], None, true, false),
+        ExitCode::FAILURE
+    );
+    assert_eq!(
+        run_complete(vec!["arc".to_string()], None, false, true),
+        ExitCode::FAILURE
+    );
+    assert_ne!(
+        run_complete(args(&["arc", "x"]), Some("9".to_string()), false, false),
+        ExitCode::SUCCESS
+    );
+    assert_eq!(
+        run_complete(args(&["arc", "dow"]), Some("1".to_string()), false, false),
+        ExitCode::SUCCESS
+    );
+}
+
+#[test]
+fn t1170_run_generate_or_install_rejects_bad_flag_combos() {
+    use std::process::ExitCode;
+    assert_eq!(
+        run_generate_or_install(true, Some("1".to_string()), String::new(), false),
+        Err(ExitCode::FAILURE)
+    );
+    assert_eq!(
+        run_generate_or_install(true, None, "bash".to_string(), false),
+        Err(ExitCode::FAILURE)
+    );
+    assert_eq!(
+        run_generate_or_install(false, Some("1".to_string()), String::new(), false),
+        Err(ExitCode::FAILURE)
+    );
+}
+
+#[test]
+fn t1170_run_rejects_parse_errors_and_bad_combos() {
+    use std::process::ExitCode;
+    assert_eq!(run(&args(&["--bogus"])), ExitCode::FAILURE);
+    assert_eq!(
+        run(&args(&["--generate", "--current", "1"])),
+        ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn t1170_run_generate_regenerates_rules() {
+    use std::process::ExitCode;
+    assert_eq!(run(&args(&["--generate"])), ExitCode::SUCCESS);
+    let rules = default_shell_root().join("rules").join("bash-rules.sh");
+    assert!(rules.is_file());
+    assert_eq!(std::fs::read_to_string(&rules).unwrap(), completion_rules());
+    std::fs::remove_file(&rules).ok();
+}
