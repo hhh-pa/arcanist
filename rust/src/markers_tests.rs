@@ -328,10 +328,18 @@ fn land26_command_sections_truncate_like_php() {
 #[test]
 fn land25_bundled_extension_materializes() {
     // Outside any checkout the bundled `arc-hg.py` copy resolves,
-    // with the compiled-in bytes on disk.
+    // with the compiled-in bytes on disk — and a deleted copy
+    // reinstalls on the next call. One test (not two): the target
+    // path is fixed, so a parallel remover flaked the reader
+    // (macOS CI read back empty).
     let script = materialize_bundled_arc_hg().unwrap();
     assert_eq!(std::fs::read_to_string(&script).unwrap(), ARC_HG_BUNDLED);
     assert!(arc_hg_script(std::env::temp_dir().as_path()).is_some());
+    let target = std::env::temp_dir().join(format!("arc-hg-{:016x}.py", arc_hg_content_tag()));
+    std::fs::remove_file(&target).ok();
+    let script = materialize_bundled_arc_hg().unwrap();
+    assert_eq!(script, target);
+    assert_eq!(std::fs::read_to_string(&script).unwrap(), ARC_HG_BUNDLED);
 }
 
 #[test]
@@ -976,15 +984,6 @@ fn t1170_query_git_markers_filters_type_and_marks_current() {
     // No bookmark flavor under git: every record filters out.
     let bookmarks = query_git_markers(repo.path(), MARKER_TYPE_BOOKMARK, false).unwrap();
     assert!(bookmarks.is_empty());
-}
-
-#[test]
-fn t1170_bundled_extension_reinstalls_when_missing() {
-    let target = std::env::temp_dir().join(format!("arc-hg-{:016x}.py", arc_hg_content_tag()));
-    std::fs::remove_file(&target).ok();
-    let script = materialize_bundled_arc_hg().unwrap();
-    assert_eq!(script, target);
-    assert_eq!(std::fs::read_to_string(&script).unwrap(), ARC_HG_BUNDLED);
 }
 
 #[test]

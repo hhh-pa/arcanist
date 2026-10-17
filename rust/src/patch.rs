@@ -5535,12 +5535,25 @@ pub fn run_patch_file_with(
     patch_text: &str,
     patch_bin: &str,
 ) -> Result<(bool, String), String> {
+    run_patch_file_with_argv(dir, patch_text, patch_bin, &[])
+}
+
+/// [`run_patch_file_with`] with fixed leading arguments (test seam: a
+/// `.bat` shim needs `cmd /C` first on Windows, which a bare program
+/// string cannot express — `CreateProcess` will not run batch files).
+pub fn run_patch_file_with_argv(
+    dir: &Path,
+    patch_text: &str,
+    program: &str,
+    prefix: &[&str],
+) -> Result<(bool, String), String> {
     // Patch text may ride as transport; the patchfile carries raw bytes
     // (identical bytes for escape-free input).
     let patchfile = TempPatchFile::write_bytes(&untransport_bytes(patch_text))?;
     let file = patchfile.path.to_string_lossy().to_string();
-    let output = crate::proc_env::command(patch_bin)
+    let output = crate::proc_env::command(program)
         .current_dir(dir)
+        .args(prefix)
         .args(["-p0", "-i", &file])
         .output()
         .map_err(|e| format!("failed to run patch: {e}"))?;
@@ -5558,6 +5571,23 @@ fn run_patch_file_converted(
     encoding: Option<&str>,
 ) -> Result<(bool, String), String> {
     run_patch_file(dir, &convert_transport_text(patch_text, encoding)?)
+}
+
+/// [`run_patch_file_converted`] over an explicit program+prefix (test
+/// seam, mirroring [`run_patch_file_with_argv`]).
+pub fn run_patch_file_converted_with_argv(
+    dir: &Path,
+    patch_text: &str,
+    encoding: Option<&str>,
+    program: &str,
+    prefix: &[&str],
+) -> Result<(bool, String), String> {
+    run_patch_file_with_argv(
+        dir,
+        &convert_transport_text(patch_text, encoding)?,
+        program,
+        prefix,
+    )
 }
 
 /// Touch one svn file (`(cd %s; touch %s)`): create it when missing,
@@ -6331,17 +6361,41 @@ fn apply_patch_svn(
     io: &mut Io,
     ansi: bool,
 ) -> Result<FlowOutcome, String> {
+    let encoding = bundle.encoding.clone();
+    apply_patch_svn_with(
+        dir,
+        backends,
+        bundle,
+        arcbundle_dicts,
+        io,
+        ansi,
+        &mut |_, patch| run_patch_file_converted(dir, patch, encoding.as_deref()),
+    )
+}
+
+/// [`apply_patch_svn`] with an explicit patch runner (test seam: the
+/// system `patch` binary is absent on some machines and unreliable on
+/// Windows CI, so hermetic tests record and stub the runner).
+#[allow(clippy::too_many_arguments)]
+fn apply_patch_svn_with(
+    dir: &Path,
+    backends: &Backends,
+    bundle: &Bundle,
+    arcbundle_dicts: Option<&(Vec<serde_json::Value>, Vec<Vec<ParsedHunk>>)>,
+    io: &mut Io,
+    ansi: bool,
+    run_patch: PatchRunner<'_>,
+) -> Result<FlowOutcome, String> {
     let changes = match arcbundle_dicts {
         Some((dicts, corpora)) => svn_changes_from_dicts(dicts, corpora),
         None => parse_git_patch_for_svn(&bundle.text),
     };
-    let encoding = bundle.encoding.clone();
     let outcome = apply_svn_ansi(
         dir,
         &backends.svn,
         &changes,
         io,
-        &mut |_, patch| run_patch_file_converted(dir, patch, encoding.as_deref()),
+        run_patch,
         &mut |path| run_touch_file(dir, path),
         &mut |target, path| run_symlink(dir, target, path),
         ansi,

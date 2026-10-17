@@ -1830,6 +1830,31 @@ fn fake_hg_backend(dir: &std::path::Path) -> hg::HgCommand {
     }
 }
 
+/// Fake `hg` via PowerShell on Windows (cmd.exe mangles `<>` in argv
+/// logging, so author-carrying tests use this); plain shell fake on
+/// unix, where the `.sh` fixture passes every byte through.
+fn fake_hg_ps1_backend(dir: &std::path::Path) -> hg::HgCommand {
+    #[cfg(windows)]
+    {
+        let ps1 = dir.join("fakehg-gap2.ps1");
+        std::fs::write(&ps1, include_str!("../tests/fixtures/vcs/fakehg.ps1")).unwrap();
+        hg::HgCommand::custom(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                &ps1.to_string_lossy(),
+            ],
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        fake_hg_backend(dir)
+    }
+}
+
 #[test]
 fn gap2_hg_dotted_revisions_pass_verbatim() {
     // PHP never interprets revision text in the patch flow: revisions
@@ -4323,12 +4348,50 @@ fn stub_hg(dir: &std::path::Path, name: &str, body: &str) -> hg::HgCommand {
 }
 
 /// True when the system `patch` binary runs (absent on some machines, so
-/// `run_patch_file` tests probe and return early instead of failing).
+/// the failure-expecting flow test probes and returns early instead of
+/// failing; all other patch tests use [`fake_patch_shim`]).
 fn has_patch_binary() -> bool {
     std::process::Command::new("patch")
         .arg("--version")
         .output()
         .is_ok()
+}
+
+/// Fake `patch` binary routing through `git apply` (hermetic: system
+/// patch is absent on some machines and fails valid input on Windows
+/// CI). The shim applies the `-i` file in its cwd and echoes a fixed
+/// marker, propagating git's exit code. Returns `(program, prefix)`
+/// for `run_patch_file_with_argv` — the `.bat` needs `cmd /C` first.
+fn fake_patch_shim(dir: &std::path::Path) -> (String, Vec<String>) {
+    #[cfg(windows)]
+    {
+        let bat = dir.join("fakepatch.bat");
+        std::fs::write(
+            &bat,
+            "@echo off\r\ngit apply \"%~3\"\r\nset CODE=%errorlevel%\r\necho applied patch\r\nexit /b %CODE%\r\n",
+        )
+        .unwrap();
+        (
+            "cmd".to_string(),
+            vec!["/C".to_string(), bat.to_string_lossy().to_string()],
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let sh = dir.join("fakepatch.sh");
+        std::fs::write(
+            &sh,
+            "#!/bin/sh\ngit apply \"$3\"\ncode=$?\necho \"applied patch\"\nexit $code\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&sh).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&sh, perms).unwrap();
+        }
+        (sh.to_string_lossy().to_string(), Vec::new())
+    }
 }
 
 #[test]
@@ -5666,7 +5729,7 @@ fn t1170_hg_commit_uses_author_and_reports_failure() {
     // The full author rides as `-u` (patch.rs:4514-4515); failures
     // report the stderr tail (patch.rs:4520-4525).
     let dir = temp_dir("t1170_hg_commit");
-    let hg = fake_hg_backend(&dir);
+    let hg = fake_hg_ps1_backend(&dir);
     let bundle = Bundle {
         author_name: Some("Ada".to_string()),
         author_email: Some("ada@t".to_string()),
@@ -5995,38 +6058,54 @@ fn t1170_run_svn_adds_and_props() {
 #[test]
 fn t1170_run_patch_file_applies_and_reports() {
     // The `patch -p0` runner (patch.rs:5527-5529) reports success and
-    // stdout (patch.rs:5547-5550) for both outcomes.
-    if !has_patch_binary() {
-        return;
-    }
+    // stdout (patch.rs:5547-5550) for both outcomes. Runs through the
+    // git-apply shim: hermetic on every OS (system patch is absent on
+    // some machines and fails valid input on Windows CI).
     let dir = temp_dir("t1170_patch_run");
-    std::fs::write(dir.join("v.txt"), "a\n").unwrap();
-    let (ok, out) = run_patch_file(&dir, "--- v.txt\n+++ v.txt\n@@ -1 +1 @@\n-a\n+b\n").unwrap();
+    std::fs::write(dir.join("v.txt"), "x\na\nx\n").unwrap();
+    let (program, prefix) = fake_patch_shim(&dir);
+    let prefs: Vec<&str> = prefix.iter().map(String::as_str).collect();
+    let patch = "--- v.txt\n+++ v.txt\n@@ -1,3 +1,3 @@\n x\n-a\n+b\n x\n";
+    let (ok, out) = run_patch_file_with_argv(&dir, patch, &program, &prefs).unwrap();
     assert!(ok, "{out}");
-    assert!(out.contains("patching"), "{out}");
-    assert_eq!(std::fs::read_to_string(dir.join("v.txt")).unwrap(), "b\n");
+    assert!(out.contains("applied patch"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("v.txt")).unwrap(),
+        "x\nb\nx\n"
+    );
     std::fs::write(dir.join("w.txt"), "zzz\n").unwrap();
-    let (ok, _) = run_patch_file(&dir, "--- w.txt\n+++ w.txt\n@@ -1 +1 @@\n-a\n+b\n").unwrap();
+    let (ok, _) = run_patch_file_with_argv(
+        &dir,
+        "--- w.txt\n+++ w.txt\n@@ -1 +1 @@\n-a\n+b\n",
+        &program,
+        &prefs,
+    )
+    .unwrap();
     assert!(!ok);
 }
 
 #[test]
 fn t1170_run_patch_file_converted_applies() {
     // The encoding-converting runner (patch.rs:5555-5560) converts
-    // first, then applies like the plain runner.
-    if !has_patch_binary() {
-        return;
-    }
+    // first, then applies like the plain runner (git-apply shim, as
+    // above — no system patch).
     let dir = temp_dir("t1170_patch_converted");
-    std::fs::write(dir.join("v.txt"), "a\n").unwrap();
-    let (ok, _) = run_patch_file_converted(
+    std::fs::write(dir.join("v.txt"), "x\na\nx\n").unwrap();
+    let (program, prefix) = fake_patch_shim(&dir);
+    let prefs: Vec<&str> = prefix.iter().map(String::as_str).collect();
+    let (ok, _) = run_patch_file_converted_with_argv(
         &dir,
-        "--- v.txt\n+++ v.txt\n@@ -1 +1 @@\n-a\n+b\n",
+        "--- v.txt\n+++ v.txt\n@@ -1,3 +1,3 @@\n x\n-a\n+b\n x\n",
         Some("UTF-8"),
+        &program,
+        &prefs,
     )
     .unwrap();
     assert!(ok);
-    assert_eq!(std::fs::read_to_string(dir.join("v.txt")).unwrap(), "b\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("v.txt")).unwrap(),
+        "x\nb\nx\n"
+    );
 }
 
 #[test]
@@ -6149,14 +6228,10 @@ fn t1170_flow_hg_apply_failure_propagates() {
 
 #[test]
 fn t1170_apply_patch_svn_from_dicts() {
-    // The svn applier takes arcbundle dicts when present
-    // (patch.rs:6335), patching (patch.rs:6344), touching
-    // (patch.rs:6346), and linking (patch.rs:6348) per change; clean
-    // runs report `Done` (patch.rs:6350) and failed hunks report
-    // `SvnHunksFailed` (patch.rs:6351).
-    if !has_patch_binary() {
-        return;
-    }
+    // The svn applier takes arcbundle dicts when present, patching,
+    // touching, and linking per change; clean runs report `Done` and
+    // failed hunks report `SvnHunksFailed`. The patch runner is a
+    // recording stub (no system patch); touch/link run for real.
     let dir = temp_dir("t1170_svn_dicts");
     std::fs::write(dir.join("v.txt"), "a\n").unwrap();
     let backends = Backends {
@@ -6183,19 +6258,29 @@ fn t1170_apply_patch_svn_from_dicts() {
     }
     let bundle = Bundle::default();
     let mut io = Io::buffered();
+    let mut received: Vec<(String, String)> = Vec::new();
     assert_eq!(
-        apply_patch_svn(
+        apply_patch_svn_with(
             &dir,
             &backends,
             &bundle,
             Some(&(dicts, corpora)),
             &mut io,
-            false
+            false,
+            &mut |path, patch| {
+                received.push((path.to_string(), patch.to_string()));
+                Ok((true, "applied".to_string()))
+            },
         )
         .unwrap(),
         FlowOutcome::Done
     );
-    assert_eq!(std::fs::read_to_string(dir.join("v.txt")).unwrap(), "b\n");
+    // The v.txt change rode the patch runner (the stub records instead
+    // of writing, so no content assert here); touch/link ran for real.
+    assert_eq!(received.len(), 1);
+    assert!(received[0].0.contains("v.txt"), "{received:?}");
+    assert!(received[0].1.contains("-a"), "{:?}", received[0].1);
+    assert!(received[0].1.contains("+b"), "{:?}", received[0].1);
     assert!(dir.join("touched.txt").is_file());
     #[cfg(unix)]
     assert!(
@@ -6217,13 +6302,14 @@ fn t1170_apply_patch_svn_from_dicts() {
     let corpora = vec![vec![parsed_hunk(1, 1, 1, 1, "-a\n+b\n")]];
     let mut io = Io::buffered();
     assert_eq!(
-        apply_patch_svn(
+        apply_patch_svn_with(
             &dir,
             &backends,
             &bundle,
             Some(&(dicts, corpora)),
             &mut io,
-            false
+            false,
+            &mut |_, _| Ok((false, "hunk failed".to_string())),
         )
         .unwrap(),
         FlowOutcome::SvnHunksFailed

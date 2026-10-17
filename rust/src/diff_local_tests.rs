@@ -5853,9 +5853,11 @@ impl T1170FailBackend {
         #[cfg(windows)]
         {
             let bat = dir.join("fail.bat");
+            // `echo(` (not `echo `): a bare `echo` prints "ECHO is off"
+            // instead of an empty line (same trap as hg's FailBackend).
             std::fs::write(
                 &bat,
-                format!("@echo off\r\necho {stderr_line}>&2\r\nexit /b 1\r\n"),
+                format!("@echo off\r\necho({stderr_line}>&2\r\nexit /b 1\r\n"),
             )
             .unwrap();
         }

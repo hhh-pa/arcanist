@@ -925,8 +925,11 @@ impl FailBackend {
         #[cfg(windows)]
         let hg = {
             let bat = dir.join("failhg.bat");
+            // `echo(` (not `echo `): a bare `echo` prints "ECHO is off"
+            // instead of an empty line, which breaks silent-output
+            // tests like `t1170_amend_failure_without_output_names_argv`.
             let body = format!(
-                "@echo off\r\necho {stdout_line}\r\necho {stderr_line}>&2\r\nexit /b 1\r\n"
+                "@echo off\r\necho({stdout_line}\r\necho({stderr_line}>&2\r\nexit /b 1\r\n"
             );
             std::fs::write(&bat, body).unwrap();
             HgCommand::custom("cmd", &["/C", &bat.to_string_lossy()])
