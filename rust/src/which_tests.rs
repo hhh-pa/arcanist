@@ -2105,3 +2105,821 @@ fn w6_json_carries_matching_revisions() {
         }])
     );
 }
+
+// -( T1170 coverage: conduit labels, engine paths, matching, runners )--------
+
+#[test]
+fn t1170_broken_arcconfig_has_no_conduit() {
+    // A project file that fails to parse fails the merged load, so
+    // conduit resolution reports none rather than erroring.
+    let repo = fresh_repo("t1170broken");
+    std::fs::write(repo.path.join(".arcconfig"), "{oops").unwrap();
+    assert_eq!(resolve_conduit_in(&repo.path, None, None), (None, "none"));
+}
+
+#[test]
+fn t1170_non_string_conduit_uri_has_no_conduit() {
+    // A present-but-typeless `phabricator.uri` reads as missing.
+    let repo = fresh_repo("t1170typeless");
+    std::fs::write(repo.path.join(".arcconfig"), r#"{"phabricator.uri": 42}"#).unwrap();
+    assert_eq!(resolve_conduit_in(&repo.path, None, None), (None, "none"));
+}
+
+#[test]
+fn t1170_source_labels_cover_local_and_default() {
+    // A local hit outside any working copy, plus unknown sources.
+    let bare = TempDir::new("t1170labels");
+    assert_eq!(
+        merged_source_label(get_config::SOURCE_LOCAL, &bare.path),
+        "local"
+    );
+    assert_eq!(merged_source_label("bogus-source", &bare.path), "default");
+}
+
+#[test]
+#[cfg(not(windows))]
+fn t1170_system_label_names_etc_arcconfig() {
+    let bare = TempDir::new("t1170syslabel");
+    assert_eq!(
+        merged_source_label(get_config::SOURCE_SYSTEM, &bare.path),
+        "system (/etc/arcconfig)"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn t1170_system_label_names_programdata() {
+    let bare = TempDir::new("t1170syslabel");
+    assert_eq!(
+        merged_source_label(get_config::SOURCE_SYSTEM, &bare.path),
+        "system (ProgramData\\Phabricator\\Arcanist\\config)"
+    );
+}
+
+#[test]
+fn t1170_svn_without_arcconfig_has_no_project() {
+    // Subversion walks to the root and gives up when no `.arcconfig`
+    // turns up along the way.
+    let tmp = TempDir::new("t1170svnmiss");
+    let child = tmp.path.join("a").join("b");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::create_dir_all(tmp.path.join(".svn")).unwrap();
+    assert_eq!(find_project(&child), (None, None));
+}
+
+#[test]
+fn t1170_rev_to_commit_misses_unknown_revs() {
+    let repo = fresh_repo("t1170rev");
+    commit(&repo.path, "a.txt");
+    assert_eq!(rev_to_commit(&repo.path, "no-such-rev"), None);
+}
+
+#[test]
+fn t1170_base_sources_empty_reads_blank() {
+    let empty = BaseSources::empty();
+    assert!(empty.local.is_empty());
+    assert!(empty.project.is_empty());
+    assert!(empty.user.is_empty());
+    assert!(empty.system.is_empty());
+}
+
+#[test]
+fn t1170_engine_without_rulesets_matches_nothing() {
+    // A ruleset list that omits a retried source skips it instead of
+    // failing: no rules anywhere means no match.
+    let repo = fresh_repo("t1170norules");
+    commit(&repo.path, "a.txt");
+    let mut engine = Engine::new(&repo.path, None, &never_prompt);
+    assert_eq!(engine.resolve(&[]).unwrap(), None);
+}
+
+#[test]
+fn t1170_engine_rejects_colonless_rules_directly() {
+    // `tokenize_base_rules` normally screens these, but the engine
+    // reports the same shape when handed one directly.
+    let repo = fresh_repo("t1170colonless");
+    commit(&repo.path, "a.txt");
+    let mut engine = Engine::new(&repo.path, None, &never_prompt);
+    let all = [SourceRules {
+        name: "runtime",
+        rules: std::collections::VecDeque::from(["arcupstream".to_string()]),
+    }];
+    assert_eq!(
+        engine.resolve(&all).unwrap_err(),
+        "Rule 'arcupstream' is invalid, it must have a type and name like 'arc:upstream'."
+    );
+}
+
+#[test]
+fn t1170_arc_legacy_names_switch_sources() {
+    // `arc:global`/`arc:args` translate to `user`/`runtime` before
+    // switching rulesets.
+    let repo = fresh_repo("t1170legacy");
+    commit(&repo.path, "a.txt");
+    commit(&repo.path, "b.txt");
+    let merged = merged_with("base", serde_json::json!("literal:from-user"), "user");
+    let inputs = base_inputs("arc:global, literal:unreached", &never_prompt);
+    let (base, _) = resolve_base(&repo.path, None, "HEAD", false, &merged, &inputs).unwrap();
+    assert_eq!(base, "from-user");
+
+    let inputs = base_inputs("arc:args, literal:kept", &never_prompt);
+    let (base, _) =
+        resolve_base(&repo.path, None, "HEAD", false, &empty_loaded(), &inputs).unwrap();
+    assert_eq!(base, "kept");
+}
+
+#[test]
+fn t1170_arc_verbose_resolves_and_logs() {
+    // `arc:verbose` enables engine logging mid-stream; resolution
+    // continues with the next rule.
+    let repo = fresh_repo("t1170verbose");
+    commit(&repo.path, "a.txt");
+    commit(&repo.path, "b.txt");
+    let inputs = base_inputs("arc:verbose, literal:kept", &never_prompt);
+    let (base, _) =
+        resolve_base(&repo.path, None, "HEAD", false, &empty_loaded(), &inputs).unwrap();
+    assert_eq!(base, "kept");
+}
+
+#[test]
+fn t1170_arc_prompt_reports_non_tty() {
+    // A prompt answered without a TTY throws instead of resolving.
+    let repo = fresh_repo("t1170prompttty");
+    commit(&repo.path, "a.txt");
+    commit(&repo.path, "b.txt");
+    assert_eq!(prompt_line("Against which commit?"), None);
+    let inputs = base_inputs("arc:prompt", &|_: &str| Some("typed".to_string()));
+    assert_eq!(
+        resolve_base(&repo.path, None, "HEAD", false, &empty_loaded(), &inputs).unwrap_err(),
+        crate::prompt::NOT_INTERACTIVE
+    );
+    assert!(!take_prompt_tty_failed());
+}
+
+#[test]
+fn t1170_arc_source_and_flow_rules_cover_switches() {
+    let repo = fresh_repo("t1170flows");
+    commit(&repo.path, "a.txt");
+    commit(&repo.path, "b.txt");
+    // `arc:runtime` re-enters the runtime ruleset.
+    let inputs = base_inputs("arc:runtime, literal:kept", &never_prompt);
+    let (base, _) =
+        resolve_base(&repo.path, None, "HEAD", false, &empty_loaded(), &inputs).unwrap();
+    assert_eq!(base, "kept");
+    // `arc:system` switches to the system ruleset.
+    let merged = merged_with("base", serde_json::json!("literal:from-system"), "system");
+    let inputs = base_inputs("arc:system, literal:unreached", &never_prompt);
+    let (base, _) = resolve_base(&repo.path, None, "HEAD", false, &merged, &inputs).unwrap();
+    assert_eq!(base, "from-system");
+    // `arc:yield` moves the current source to the back; the runtime
+    // queue resumes once the others run dry.
+    let inputs = base_inputs("arc:yield, literal:kept", &never_prompt);
+    let (base, _) =
+        resolve_base(&repo.path, None, "HEAD", false, &empty_loaded(), &inputs).unwrap();
+    assert_eq!(base, "kept");
+}
+
+#[test]
+fn t1170_arc_nodiff_and_this_rules() {
+    let repo = fresh_repo("t1170nothis");
+    commit(&repo.path, "a.txt");
+    commit(&repo.path, "b.txt");
+    // `arc:nodiff(X)` resolves through the git rules, which never
+    // match the wrapped name, so it falls through.
+    let inputs = base_inputs("arc:nodiff(empty), literal:kept", &never_prompt);
+    let (base, _) =
+        resolve_base(&repo.path, None, "HEAD", false, &empty_loaded(), &inputs).unwrap();
+    assert_eq!(base, "kept");
+    // `arc:this` pins the parent of HEAD.
+    let inputs = base_inputs("arc:this", &never_prompt);
+    let (base, why) =
+        resolve_base(&repo.path, None, "HEAD", false, &empty_loaded(), &inputs).unwrap();
+    assert_eq!(base, "HEAD^");
+    assert!(why.contains("arc:this"), "{why}");
+}
+
+fn commit_with_message(dir: &Path, name: &str, subject: &str, body: &str) {
+    std::fs::write(dir.join(name), "x\n").unwrap();
+    git(dir, &["add", name]);
+    git(dir, &["commit", "-q", "-m", subject, "-m", body]);
+}
+
+#[test]
+fn t1170_arc_amended_detects_revision_footers() {
+    // HEAD amended with a footer resolves to its parent; without one
+    // the rule falls through; a malformed footer errors.
+    let repo = fresh_repo("t1170amended");
+    commit(&repo.path, "a.txt");
+    commit_with_message(&repo.path, "b.txt", "second", "Differential Revision: D1");
+    let inputs = base_inputs("arc:amended", &never_prompt);
+    let (base, why) =
+        resolve_base(&repo.path, None, "HEAD", false, &empty_loaded(), &inputs).unwrap();
+    assert_eq!(base, "HEAD^");
+    assert!(why.contains("amended"), "{why}");
+
+    let plain = fresh_repo("t1170unamended");
+    commit(&plain.path, "a.txt");
+    commit(&plain.path, "b.txt");
+    let inputs = base_inputs("arc:amended, literal:kept", &never_prompt);
+    let (base, _) =
+        resolve_base(&plain.path, None, "HEAD", false, &empty_loaded(), &inputs).unwrap();
+    assert_eq!(base, "kept");
+
+    let broken = fresh_repo("t1170badamended");
+    commit(&broken.path, "a.txt");
+    commit_with_message(
+        &broken.path,
+        "b.txt",
+        "second",
+        "Differential Revision: nope",
+    );
+    let inputs = base_inputs("arc:amended", &never_prompt);
+    let err =
+        resolve_base(&broken.path, None, "HEAD", false, &empty_loaded(), &inputs).unwrap_err();
+    assert!(
+        err.contains("Invalid \"Differential Revision\" field"),
+        "{err}"
+    );
+}
+
+#[test]
+fn t1170_arc_upstream_falls_through_without_upstream() {
+    let repo = fresh_repo("t1170noupstream");
+    commit(&repo.path, "a.txt");
+    commit(&repo.path, "b.txt");
+    let inputs = base_inputs("arc:upstream, literal:kept", &never_prompt);
+    let (base, _) =
+        resolve_base(&repo.path, None, "HEAD", false, &empty_loaded(), &inputs).unwrap();
+    assert_eq!(base, "kept");
+}
+
+#[test]
+fn t1170_arc_upstream_resolves_merge_base() {
+    let repo = fresh_repo("t1170upstream");
+    commit(&repo.path, "a.txt");
+    commit(&repo.path, "b.txt");
+    let origin = TempDir::new("t1170uporigin");
+    git(&origin.path, &["init", "-q", "--bare"]);
+    git(
+        &repo.path,
+        &["remote", "add", "origin", &origin.path.to_string_lossy()],
+    );
+    git(&repo.path, &["push", "-q", "-u", "origin", "master"]);
+    commit(&repo.path, "c.txt");
+    let inputs = base_inputs("arc:upstream", &never_prompt);
+    let (base, why) =
+        resolve_base(&repo.path, None, "HEAD", false, &empty_loaded(), &inputs).unwrap();
+    assert_eq!(base, rev_to_commit(&repo.path, "HEAD~1").unwrap());
+    assert!(why.contains("merge-base"), "{why}");
+}
+
+#[test]
+fn t1170_git_merge_base_failure_falls_through() {
+    let repo = fresh_repo("t1170mbfail");
+    commit(&repo.path, "a.txt");
+    commit(&repo.path, "b.txt");
+    let inputs = base_inputs("git:merge-base(no-such-ref), literal:kept", &never_prompt);
+    let (base, _) =
+        resolve_base(&repo.path, None, "HEAD", false, &empty_loaded(), &inputs).unwrap();
+    assert_eq!(base, "kept");
+}
+
+#[test]
+fn t1170_branch_unique_needs_resolving_refs() {
+    // An unresolving inner ref fails `merge-base` and falls through.
+    let repo = fresh_repo("t1170bunoref");
+    commit(&repo.path, "a.txt");
+    commit(&repo.path, "b.txt");
+    let inputs = base_inputs(
+        "git:branch-unique(no-such-ref), literal:kept",
+        &never_prompt,
+    );
+    let (base, _) =
+        resolve_base(&repo.path, None, "HEAD", false, &empty_loaded(), &inputs).unwrap();
+    assert_eq!(base, "kept");
+}
+
+#[test]
+fn t1170_branch_unique_empty_range_matches_nothing() {
+    // The merge-base is HEAD itself, so the range — and the match —
+    // is empty.
+    let repo = fresh_repo("t1170buempty");
+    commit(&repo.path, "a.txt");
+    commit(&repo.path, "b.txt");
+    let inputs = base_inputs("git:branch-unique(HEAD)", &never_prompt);
+    let err = resolve_base(&repo.path, None, "HEAD", false, &empty_loaded(), &inputs).unwrap_err();
+    assert!(err.contains("None of the rules"), "{err}");
+}
+
+#[test]
+fn t1170_branch_unique_log_failure_matches_nothing() {
+    // `git log` can fail while `merge-base` succeeds (here via a bogus
+    // repo-local date format); the rule falls through.
+    let repo = fresh_repo("t1170bulogfail");
+    commit(&repo.path, "a.txt");
+    commit(&repo.path, "b.txt");
+    git(&repo.path, &["config", "log.date", "BOGUS"]);
+    let inputs = base_inputs("git:branch-unique(HEAD), literal:kept", &never_prompt);
+    let (base, _) =
+        resolve_base(&repo.path, None, "HEAD", false, &empty_loaded(), &inputs).unwrap();
+    assert_eq!(base, "kept");
+}
+
+#[test]
+fn t1170_branch_unique_finds_fork_point() {
+    // `feature` forks from the first commit; the fork point sits on
+    // more branches than HEAD, so it resolves with its explanation.
+    let repo = fresh_repo("t1170bufork");
+    commit(&repo.path, "a.txt");
+    git(&repo.path, &["branch", "feature"]);
+    commit(&repo.path, "b.txt");
+    git(&repo.path, &["checkout", "-q", "feature"]);
+    commit(&repo.path, "c.txt");
+    git(&repo.path, &["checkout", "-q", "master"]);
+    let fork = rev_to_commit(&repo.path, "HEAD~1").unwrap();
+    let inputs = base_inputs("git:branch-unique(feature)", &never_prompt);
+    let (base, why) =
+        resolve_base(&repo.path, None, "HEAD", false, &empty_loaded(), &inputs).unwrap();
+    assert_eq!(base, fork);
+    assert!(why.contains("merge-base"), "{why}");
+    assert!(why.contains("feature"), "{why}");
+}
+
+#[test]
+fn t1170_branch_unique_single_branch_matches_nothing() {
+    // Every commit sits on the same branches as HEAD, so no commit
+    // outranks it and the walk runs dry.
+    let repo = fresh_repo("t1170busingle");
+    commit(&repo.path, "a.txt");
+    commit(&repo.path, "b.txt");
+    let inputs = base_inputs("git:branch-unique(HEAD~1)", &never_prompt);
+    let err = resolve_base(&repo.path, None, "HEAD", false, &empty_loaded(), &inputs).unwrap_err();
+    assert!(err.contains("None of the rules"), "{err}");
+}
+
+#[test]
+fn t1170_branch_helpers_list_and_fail_leniently() {
+    let repo = fresh_repo("t1170brhelp");
+    commit(&repo.path, "a.txt");
+    git(&repo.path, &["branch", "feature"]);
+    let head = rev_to_commit(&repo.path, "HEAD").unwrap();
+    let mut branches = local_branch_names(&repo.path);
+    branches.sort();
+    assert_eq!(branches, ["feature", "master"]);
+    let mut contained = branches_containing(&repo.path, &head, &branches);
+    contained.sort();
+    assert_eq!(contained, ["feature", "master"]);
+    // Outside a repository the helpers report emptiness, never errors.
+    let plain = TempDir::new("t1170brplain");
+    assert!(local_branch_names(&plain.path).is_empty());
+    assert!(branches_containing(&plain.path, &head, &branches).is_empty());
+    // Unspawnable git (a missing directory) reads the same way.
+    let gone = TempDir::new("t1170brgone");
+    let missing = gone.path.join("nope");
+    assert!(local_branch_names(&missing).is_empty());
+    assert!(branches_containing(&missing, &head, &branches).is_empty());
+}
+
+#[test]
+fn t1170_explicit_base_names_an_explicit_head() {
+    let repo = fresh_repo("t1170exphead");
+    commit(&repo.path, "a.txt");
+    commit(&repo.path, "b.txt");
+    let inputs = base_inputs("", &never_prompt);
+    let (base, why) = resolve_base(
+        &repo.path,
+        Some("HEAD~1"),
+        "HEAD",
+        true,
+        &empty_loaded(),
+        &inputs,
+    )
+    .unwrap();
+    assert_eq!(base, rev_to_commit(&repo.path, "HEAD~1").unwrap());
+    assert!(why.contains("explicitly specified head commit"), "{why}");
+}
+
+#[test]
+fn t1170_default_chain_prompts_persists_and_reuses_scratch() {
+    // No upstream anywhere: the prompt answer persists to the scratch
+    // file, and the next resolution reuses it without prompting.
+    let repo = fresh_repo("t1170scratch");
+    commit(&repo.path, "a.txt");
+    commit(&repo.path, "b.txt");
+    let want = rev_to_commit(&repo.path, "HEAD~1").unwrap();
+    let scratch = repo.path.join(".git/arc/default-relative-commit");
+    let inputs = base_inputs("", &|_: &str| Some("HEAD~1".to_string()));
+    let (base, _) =
+        resolve_base(&repo.path, None, "HEAD", false, &empty_loaded(), &inputs).unwrap();
+    assert_eq!(base, want);
+    assert_eq!(std::fs::read_to_string(&scratch).unwrap(), "HEAD~1");
+    let inputs = base_inputs("", &never_prompt);
+    let (base, why) =
+        resolve_base(&repo.path, None, "HEAD", false, &empty_loaded(), &inputs).unwrap();
+    assert_eq!(base, want);
+    assert!(why.contains("default-relative-commit"), "{why}");
+    // With the scratch file gone the prompt default fails like PHP.
+    std::fs::remove_file(&scratch).unwrap();
+    let inputs = base_inputs("", &never_prompt);
+    let err = resolve_base(&repo.path, None, "HEAD", false, &empty_loaded(), &inputs).unwrap_err();
+    assert_eq!(
+        err,
+        "Relative commit 'origin/master' is not the name of a commit!"
+    );
+}
+
+#[test]
+fn t1170_default_chain_merge_base_failure_errors() {
+    // The upstream resolves but shares no history, so the default
+    // merge-base fails with the command text.
+    let repo = fresh_repo("t1170defmb");
+    commit(&repo.path, "a.txt");
+    commit(&repo.path, "b.txt");
+    git(&repo.path, &["checkout", "-q", "--orphan", "other"]);
+    commit(&repo.path, "b.txt");
+    git(&repo.path, &["checkout", "-q", "master"]);
+    git(&repo.path, &["config", "branch.master.remote", "."]);
+    git(
+        &repo.path,
+        &["config", "branch.master.merge", "refs/heads/other"],
+    );
+    let inputs = base_inputs("", &never_prompt);
+    let err = resolve_base(&repo.path, None, "HEAD", false, &empty_loaded(), &inputs).unwrap_err();
+    assert!(err.starts_with("git merge-base failed:"), "{err}");
+}
+
+#[test]
+fn t1170_scratch_file_resolves_absolute_git_dirs() {
+    // Linked worktrees report an absolute `--git-dir`; scratch reads
+    // and writes follow it.
+    let repo = fresh_repo("t1170worktree");
+    commit(&repo.path, "a.txt");
+    let wt = TempDir::new("t1170wt");
+    let linked = wt.path.join("linked");
+    git(
+        &repo.path,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            &linked.to_string_lossy(),
+            "HEAD",
+        ],
+    );
+    assert_eq!(read_scratch_file(&linked), "");
+    write_scratch_file(&linked, "HEAD~1");
+    assert_eq!(read_scratch_file(&linked), "HEAD~1");
+}
+
+#[test]
+fn t1170_write_scratch_ignores_missing_git_dir() {
+    // Outside a repository there is no scratch location; the write
+    // is a silent no-op.
+    let plain = TempDir::new("t1170writemiss");
+    write_scratch_file(&plain.path, "HEAD~1");
+    assert_eq!(read_scratch_file(&plain.path), "");
+}
+
+#[test]
+fn t1170_prompt_line_reads_tty_answers() {
+    // With a TTY stdin the prompt reads one answer line (EOF under
+    // test capture answers nothing).
+    assert_eq!(prompt_line_with_tty("Q?", true), None);
+}
+
+#[test]
+fn t1170_commit_records_skip_short_rows() {
+    assert!(parse_commit_records("").is_empty());
+    assert!(parse_commit_records("aaa\x01bbb").is_empty());
+    let one = "c1\x01t1\x01p\x01 0\x01a\x01e\x01subj\x01msg\n\nbody";
+    let parsed = parse_commit_records(one);
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].commit, "c1");
+    assert_eq!(parsed[0].tree, "t1");
+    assert_eq!(parsed[0].summary, "subj");
+    assert_eq!(parsed[0].message, "msg\n\nbody");
+}
+
+#[test]
+fn t1170_commit_messages_report_log_failures() {
+    let repo = fresh_repo("t1170msgfail");
+    commit(&repo.path, "a.txt");
+    let head = rev_to_commit(&repo.path, "HEAD").unwrap();
+    let err = git_commit_messages(&repo.path, &head, "no-such-rev").unwrap_err();
+    assert!(err.starts_with("git log failed:"), "{err}");
+}
+
+#[test]
+fn t1170_huge_revision_ids_stay_strings() {
+    // A footer id overflowing u64 keeps its digit text instead of
+    // becoming a number.
+    let repo = fresh_repo("t1170hugeid");
+    commit(&repo.path, "a.txt");
+    let huge = "9".repeat(30);
+    commit_with_message(
+        &repo.path,
+        "b.txt",
+        "second",
+        &format!("Differential Revision: D{huge}"),
+    );
+    let head = rev_to_commit(&repo.path, "HEAD").unwrap();
+    let parent = rev_to_commit(&repo.path, "HEAD~1").unwrap();
+    let messages = git_commit_messages(&repo.path, &parent, &head).unwrap();
+    let (ids, _) = collect_explicit_revision_ids(&messages).unwrap();
+    assert_eq!(ids, vec![serde_json::Value::String(huge)]);
+}
+
+#[test]
+fn t1170_matching_reports_conduit_failures() {
+    // A failing `differential.query` propagates its conduit text.
+    let repo = fresh_repo("t1170matchfail");
+    commit(&repo.path, "a.txt");
+    let (base, _seen) = serve_script(vec![
+        "{\"error_code\": \"ERR-BAD\", \"error_info\": \"nope\"}",
+    ]);
+    let client = mock_client(&base);
+    let head = rev_to_commit(&repo.path, "HEAD").unwrap();
+    let err =
+        match_working_copy_revisions(&client, &repo.path, GIT_MAGIC_ROOT_COMMIT, &head, false)
+            .unwrap_err();
+    assert_eq!(err, "ERR-BAD: nope");
+}
+
+fn t1170_footer_repo(tag: &str) -> TempDir {
+    let repo = fresh_repo(tag);
+    commit(&repo.path, "a.txt");
+    commit_with_message(&repo.path, "b.txt", "second", "Differential Revision: D77");
+    commit_with_message(&repo.path, "c.txt", "third", "Differential Revision: D78");
+    repo
+}
+
+#[test]
+fn t1170_matching_queries_explicit_ids_and_whoami() {
+    // Footer ids query by id; without a cached viewer the flow asks
+    // `user.whoami` once, then resolves only the other authors.
+    let repo = t1170_footer_repo("t1170byids");
+    let head = rev_to_commit(&repo.path, "HEAD").unwrap();
+    let parent = rev_to_commit(&repo.path, "HEAD~2").unwrap();
+    let (base, seen) = serve_script(vec![
+        "{\"error_code\": null, \"result\": [{\"id\": 77, \"title\": \"Mine\", \
+         \"authorPHID\": \"PHID-USER-1\"}, {\"id\": 78, \"title\": \"Theirs\", \
+         \"authorPHID\": \"PHID-USER-9\"}]}",
+        "{\"error_code\": null, \"result\": {\"userName\": \"alice\", \"phid\": \"PHID-USER-1\"}}",
+        "{\"error_code\": null, \"result\": [{\"phid\": \"PHID-USER-9\", \
+         \"userName\": \"bob\"}]}",
+    ]);
+    let client = mock_client(&base);
+    let matched = match_working_copy_revisions(&client, &repo.path, &parent, &head, false).unwrap();
+    assert_eq!(matched.len(), 2);
+    assert_eq!(matched[0].monogram, "D77");
+    assert_eq!(matched[0].author, None);
+    assert!(
+        matched[0].why.contains("explicit 'Differential Revision'"),
+        "{}",
+        matched[0].why
+    );
+    assert_eq!(matched[1].monogram, "D78");
+    assert_eq!(matched[1].author.as_deref(), Some("bob"));
+    let (request, body) = seen.recv().unwrap();
+    assert!(request.contains("differential.query"), "{request}");
+    assert!(body.contains("status-open"), "{body}");
+    let (request, _) = seen.recv().unwrap();
+    assert!(request.contains("user.whoami"), "{request}");
+    let (request, _) = seen.recv().unwrap();
+    assert!(request.contains("user.query"), "{request}");
+}
+
+#[test]
+fn t1170_matching_any_status_queries_all_revisions() {
+    let repo = t1170_footer_repo("t1170anystatus");
+    let head = rev_to_commit(&repo.path, "HEAD").unwrap();
+    let parent = rev_to_commit(&repo.path, "HEAD~2").unwrap();
+    let (base, seen) = serve_script(vec![
+        "{\"error_code\": null, \"result\": []}",
+        "{\"error_code\": null, \"result\": {\"userName\": \"alice\", \"phid\": \"PHID-USER-1\"}}",
+    ]);
+    let client = mock_client(&base);
+    let matched = match_working_copy_revisions(&client, &repo.path, &parent, &head, true).unwrap();
+    assert!(matched.is_empty());
+    let (_, body) = seen.recv().unwrap();
+    assert!(body.contains("status-any"), "{body}");
+}
+
+#[test]
+fn t1170_matching_empty_range_matches_nothing() {
+    let repo = fresh_repo("t1170nomatch");
+    commit(&repo.path, "a.txt");
+    let head = rev_to_commit(&repo.path, "HEAD").unwrap();
+    let (base, seen) = serve_script(vec![]);
+    let client = mock_client(&base);
+    assert!(
+        match_working_copy_revisions(&client, &repo.path, &head, &head, false)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(seen.try_recv().is_err());
+}
+
+#[test]
+fn t1170_repo_identity_covers_missing_and_bad_heads() {
+    // Outside a repository every field reads empty; a bad head ref
+    // drops the head pair while keeping the rest.
+    let plain = TempDir::new("t1170noident");
+    let vacant = load_repo_identity(&plain.path, "HEAD", false);
+    assert_eq!(vacant.vcs_root, None);
+    assert_eq!(vacant.branch, None);
+    assert_eq!(vacant.head, None);
+    assert_eq!(vacant.head_subject, None);
+    assert_eq!(vacant.remote_url, None);
+
+    let repo = fresh_repo("t1170badhead");
+    commit(&repo.path, "a.txt");
+    let bad = load_repo_identity(&repo.path, "no-such-rev", true);
+    assert_eq!(bad.head, None);
+    assert_eq!(bad.head_subject, None);
+    assert!(bad.vcs_root.is_some());
+    let good = load_repo_identity(&repo.path, "HEAD", true);
+    assert!(good.head.is_some());
+    assert_eq!(good.head_subject.as_deref(), Some("a.txt"));
+}
+
+#[test]
+fn t1170_explicit_head_checks_range_direction() {
+    let repo = fresh_repo("t1170headdirs");
+    commit(&repo.path, "a.txt");
+    commit(&repo.path, "b.txt");
+    let range = load_range_data(
+        &repo.path,
+        &empty_loaded(),
+        Some("HEAD~1"),
+        "HEAD",
+        true,
+        "",
+        &never_prompt,
+    )
+    .unwrap();
+    assert_eq!(range.commits.len(), 1);
+    let err = load_range_data(
+        &repo.path,
+        &empty_loaded(),
+        Some("HEAD"),
+        "HEAD~1",
+        true,
+        "",
+        &never_prompt,
+    )
+    .unwrap_err();
+    assert!(err.contains("empty, backward or invalid"), "{err}");
+}
+
+#[test]
+fn t1170_context_range_error_after_association() {
+    // Association succeeds, then the bad explicit base fails the
+    // context load.
+    let repo = fresh_repo("t1170ctxerr");
+    commit(&repo.path, "a.txt");
+    let (base, _seen) = serve_script(vec![UNIQUE_REPO]);
+    let client = authed_client(&base);
+    let inputs = base_inputs("", &never_prompt);
+    let err = load_context(
+        &repo.path,
+        None,
+        None,
+        None,
+        Some("no-such-rev"),
+        "HEAD",
+        false,
+        &callsign_merged("X"),
+        &inputs,
+        &client,
+        false,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        "Unable to find any git commit named 'no-such-rev' in this repository."
+    );
+}
+
+#[test]
+fn t1170_render_uses_ambient_ansi() {
+    // `render` matches `render_ansi` under the process setting.
+    let ctx = ansi_context(vec![matched("D1")]);
+    assert_eq!(render(&ctx), render_ansi(&ctx, terminal::ansi_enabled()));
+    assert!(render(&ctx).contains("MATCHING REVISIONS"));
+}
+
+#[test]
+fn t1170_conduit_uri_takes_a_separate_value() {
+    match parse_args(&[
+        "--conduit-uri".to_string(),
+        "https://h.test/api/".to_string(),
+    ]) {
+        Parsed::Options(opts) => {
+            assert_eq!(opts.conduit_uri.as_deref(), Some("https://h.test/api/"))
+        }
+        _ => panic!("expected --conduit-uri options"),
+    }
+}
+
+fn t1170_arcrc_with_token(path: &Path, mock_base: &str) {
+    // Mirror `config::host_key` for a loopback mock base (always
+    // `http://127.0.0.1:PORT/` with a trailing slash).
+    let key = format!("{mock_base}api/");
+    let mut hosts = serde_json::Map::new();
+    hosts.insert(key, serde_json::json!({"token": "t"}));
+    let doc = serde_json::json!({"hosts": hosts});
+    std::fs::write(path, serde_json::to_string(&doc).unwrap()).unwrap();
+}
+
+fn t1170_authed_repo(tag: &str) -> TempDir {
+    // One commit plus a callsign: `run_in` loads the base without
+    // prompting and associates without a remote.
+    let repo = fresh_repo(tag);
+    commit(&repo.path, "a.txt");
+    std::fs::write(
+        repo.path.join(".arcconfig"),
+        r#"{"repository.callsign": "X"}"#,
+    )
+    .unwrap();
+    repo
+}
+
+const T1170_WHOAMI: &str =
+    "{\"error_code\": null, \"result\": {\"userName\": \"alice\", \"phid\": \"PHID-USER-1\"}}";
+const T1170_NO_MATCH: &str = "{\"error_code\": null, \"result\": []}";
+
+#[test]
+fn t1170_run_in_rejects_plain_directories() {
+    // The working-copy gate fires before any conduit setup.
+    let plain = TempDir::new("t1170nogate");
+    let options = options_of(&[]);
+    let opts = get_config::LoadOptions::default();
+    assert_eq!(
+        run_in(&plain.path, &options, None, &opts),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn t1170_run_in_text_authenticates_and_reports() {
+    let repo = t1170_authed_repo("t1170runtext");
+    let (base, _seen) = serve_script(vec![T1170_WHOAMI, UNIQUE_REPO, T1170_NO_MATCH]);
+    let user_file = repo.path.join("t1170.arcrc");
+    t1170_arcrc_with_token(&user_file, &base);
+    let options = options_of(&["--conduit-uri", base.as_str()]);
+    let opts = get_config::LoadOptions::default();
+    assert_eq!(
+        run_in(&repo.path, &options, Some(user_file.as_path()), &opts),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
+#[test]
+fn t1170_run_in_json_reports_the_whole_context() {
+    let repo = t1170_authed_repo("t1170runjson");
+    let (base, _seen) = serve_script(vec![T1170_WHOAMI, UNIQUE_REPO, T1170_NO_MATCH]);
+    let user_file = repo.path.join("t1170.arcrc");
+    t1170_arcrc_with_token(&user_file, &base);
+    let options = options_of(&["--conduit-uri", base.as_str(), "--json"]);
+    let opts = get_config::LoadOptions::default();
+    assert_eq!(
+        run_in(&repo.path, &options, Some(user_file.as_path()), &opts),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
+#[test]
+fn t1170_run_in_show_base_prints_without_matching() {
+    let repo = t1170_authed_repo("t1170runshow");
+    let (base, seen) = serve_script(vec![T1170_WHOAMI]);
+    let user_file = repo.path.join("t1170.arcrc");
+    t1170_arcrc_with_token(&user_file, &base);
+    let options = options_of(&["--conduit-uri", base.as_str(), "--show-base"]);
+    let opts = get_config::LoadOptions::default();
+    assert_eq!(
+        run_in(&repo.path, &options, Some(user_file.as_path()), &opts),
+        std::process::ExitCode::SUCCESS
+    );
+    // Auth only: `--show-base` never reaches conduit again.
+    let (request, _) = seen.recv().unwrap();
+    assert!(request.contains("user.whoami"), "{request}");
+    assert!(seen.try_recv().is_err());
+}
+
+#[test]
+fn t1170_run_in_reports_unreadable_config() {
+    // Authentication succeeds, then the broken project file fails
+    // the merged load as a generic exception.
+    let repo = t1170_authed_repo("t1170runbroken");
+    std::fs::write(repo.path.join(".arcconfig"), "{oops").unwrap();
+    let (base, _seen) = serve_script(vec![T1170_WHOAMI]);
+    let user_file = repo.path.join("t1170.arcrc");
+    t1170_arcrc_with_token(&user_file, &base);
+    let options = options_of(&["--conduit-uri", base.as_str()]);
+    let opts = get_config::LoadOptions::default();
+    assert_eq!(
+        run_in(&repo.path, &options, Some(user_file.as_path()), &opts),
+        std::process::ExitCode::FAILURE
+    );
+}

@@ -487,12 +487,11 @@ impl Tree {
             if is_open(kind) {
                 depth += 1;
             } else if is_close(kind) {
+                // The opener itself ran first, so depth is positive
+                // here; hitting zero returns, never going negative.
                 depth -= 1;
                 if depth == 0 {
                     return if matches(&open, kind) { Some(i) } else { None };
-                }
-                if depth < 0 {
-                    return None;
                 }
             }
             i += 1;

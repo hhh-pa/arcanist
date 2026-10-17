@@ -1163,3 +1163,591 @@ fn r10_look_help_matches_generated_format() {
     // `run()` prints `usage()` (same text, ambient ANSI mode).
     assert!(usage().contains("LOOK WORKFLOW"), "{}", usage());
 }
+
+/// Unique scratch dir (pid + nanos + counter), removed on drop.
+struct LookTmp {
+    path: std::path::PathBuf,
+}
+
+impl LookTmp {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-look-{tag}-{}-{nanos}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for LookTmp {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+fn look_git(dir: &std::path::Path, argv: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(argv)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        argv.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn look_repo(tag: &str) -> LookTmp {
+    let repo = LookTmp::new(tag);
+    look_git(repo.path(), &["init", "-q", "-b", "master"]);
+    look_git(repo.path(), &["config", "user.email", "t@t"]);
+    look_git(repo.path(), &["config", "user.name", "t"]);
+    look_git(repo.path(), &["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.path().join("f.txt"), "one\n").unwrap();
+    look_git(repo.path(), &["add", "f.txt"]);
+    look_git(repo.path(), &["commit", "-qm", "add f"]);
+    repo
+}
+
+fn write_arcconfig(dir: &std::path::Path, uri: &str) {
+    std::fs::write(
+        dir.join(".arcconfig"),
+        format!("{{\"phabricator.uri\": \"{uri}\"}}"),
+    )
+    .unwrap();
+}
+
+fn look_envelope(result: &str) -> String {
+    format!(r#"{{"result": {result}, "error_code": null}}"#)
+}
+
+/// Serve `expected` requests from `routes` (method -> envelope); returns
+/// the base URI. (Local replicate of the `export_tests` stub.)
+fn look_serve(routes: std::collections::HashMap<String, String>, expected: usize) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for _ in 0..expected {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            let head_text = String::from_utf8_lossy(&head).to_string();
+            let len: usize = head_text
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(key, value)| {
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).unwrap();
+            let method = head_text
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .strip_prefix("/api/")
+                .unwrap_or("")
+                .to_string();
+            let canned = routes
+                .get(&method)
+                .cloned()
+                .unwrap_or_else(|| r#"{"result": null, "error_code": "ERR-NO-ROUTE"}"#.to_string());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                canned.len(),
+                canned
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    base
+}
+
+#[test]
+fn dst_rule_heads_reject_out_of_range_days() {
+    // `J` days run 1-365 and counted days 0-365; anything else fails
+    // closed (the lookup falls back to UTC).
+    for bad in ["J0", "J366", "366"] {
+        assert_eq!(take_dst_rule_head(bad), None, "for {bad:?}");
+    }
+    for good in ["J1", "J365", "0", "365"] {
+        assert!(take_dst_rule_head(good).is_some(), "for {good:?}");
+    }
+    assert_eq!(parse_posix_tz("EST5EDT,J0/2,M11.1.0/2"), None);
+    assert_eq!(parse_posix_tz("EST5EDT,366/2,M11.1.0/2"), None);
+}
+
+#[test]
+fn parses_posix_dst_with_explicit_offset() {
+    // An explicit daylight offset wins over the one-hour-east default.
+    let dst = parse_posix_tz("EST5EDT3,M3.2.0/2,M11.1.0/2")
+        .expect("parse")
+        .dst
+        .expect("dst");
+    assert_eq!(dst.offset, -10_800);
+    // ...including with the default US rules.
+    let bare = parse_posix_tz("EST5EDT3").expect("parse").dst.expect("dst");
+    assert_eq!(bare.offset, -10_800);
+    assert_eq!(
+        posix_offset("EST5EDT3,M3.2.0/2,M11.1.0/2", SUMMER as i64),
+        Some(-10_800)
+    );
+}
+
+#[test]
+fn posix_offset_ignores_coincident_transitions() {
+    // Start and end at the same instant (02:00 standard == 03:00
+    // daylight on the same day) means no daylight saving at all.
+    let tz = "EST5EDT,M3.2.0/2,M3.2.0/3";
+    assert_eq!(posix_offset(tz, WINTER as i64), Some(-18_000));
+    assert_eq!(posix_offset(tz, SUMMER as i64), Some(-18_000));
+}
+
+#[test]
+fn rejects_transition_index_past_type_table() {
+    // Type indices past the table fail the whole file closed.
+    let mut bad = TESTBURG_V1.to_vec();
+    // Two transition times follow the 44-byte header; the two type
+    // indices sit right after them.
+    bad[52] = 0xff;
+    bad[53] = 0xff;
+    assert_eq!(parse_tzif(&bad), None);
+    assert_eq!(tzif_offset(&bad, WINTER as i64), None);
+}
+
+#[test]
+fn rejects_zone_without_time_types() {
+    // A block with no local-time types cannot resolve anything.
+    let mut bad = TESTBURG_V1.to_vec();
+    // Header counts: transitions at 32..36, types at 36..40.
+    bad[32..36].copy_from_slice(&0u32.to_be_bytes());
+    bad[36..40].copy_from_slice(&0u32.to_be_bytes());
+    assert_eq!(parse_tzif(&bad), None);
+}
+
+#[test]
+fn ignores_footer_with_embedded_newline() {
+    // A v2+ footer whose body holds a newline is not well-formed, so
+    // the file parses footerless and holds its last explicit type.
+    let mut bad = TESTBURG_FAT.to_vec();
+    let end = bad.len();
+    // Footer "\nEST5\n": puncture the body with a second newline.
+    bad[end - 4] = b'\n';
+    let parsed = parse_tzif(&bad).expect("parse footerless");
+    assert_eq!(parsed.footer, None);
+    assert_eq!(tzif_offset(&bad, WINTER as i64), Some(-18_000));
+}
+
+#[test]
+fn colon_tz_reads_zone_file_directly() {
+    let tmp = LookTmp::new("tzfile");
+    let path = tmp.path().join("v1.tz");
+    std::fs::write(&path, TESTBURG_V1).unwrap();
+    let spec = format!(":{}", path.display());
+    assert_eq!(env_tz_offset(&spec, WINTER as i64), -18_000);
+    assert_eq!(env_tz_offset(&spec, SUMMER as i64), -14_400);
+    // Missing or corrupt files fall back to UTC.
+    assert_eq!(env_tz_offset(":/nonexistent-look-tz", WINTER as i64), 0);
+    let bad_path = tmp.path().join("bad.tz");
+    std::fs::write(&bad_path, b"not a tzfile").unwrap();
+    assert_eq!(
+        env_tz_offset(&format!(":{}", bad_path.display()), WINTER as i64),
+        0
+    );
+}
+
+#[test]
+fn slash_tz_name_reads_literal_path_first() {
+    // A `TZ` name with a slash is also tried as a literal path, like
+    // glibc, before the zoneinfo directories.
+    let tmp = LookTmp::new("tzslash");
+    let path = tmp.path().join("v1.tz");
+    std::fs::write(&path, TESTBURG_V1).unwrap();
+    let name = path.to_str().expect("utf8 tmp path").to_string();
+    assert!(name.contains('/'));
+    assert_eq!(env_tz_offset(&name, WINTER as i64), -18_000);
+    assert_eq!(env_tz_offset(&name, SUMMER as i64), -14_400);
+    // First parseable file wins; missing ones are skipped.
+    assert_eq!(
+        files_tz_offset(&["/nonexistent-look-tz".to_string(), name], WINTER as i64),
+        Some(-18_000)
+    );
+    assert_eq!(
+        files_tz_offset(&["/nonexistent-look-tz".to_string()], WINTER as i64),
+        None
+    );
+}
+
+#[test]
+fn fill_repositories_skips_missing_uris() {
+    let repos = vec![RepositoryRef {
+        name: "repo".to_string(),
+        uris: vec!["git@h.test:repo.git".to_string()],
+        permanent_rules: None,
+    }];
+    let mut remotes = vec![RemoteInfo::new("bare".to_string(), None, None)];
+    fill_remote_repositories(&mut remotes, &repos);
+    assert_eq!(remotes[0].push_repository, None);
+    assert_eq!(remotes[0].fetch_repository, None);
+}
+
+#[test]
+fn marker_parsing_skips_empty_remote_or_branch() {
+    assert!(parse_marker_refs("refs/remotes//master abc123\n").is_empty());
+    assert!(parse_marker_refs("refs/remotes/origin/ abc123\n").is_empty());
+}
+
+#[test]
+fn query_markers_lists_remote_tracking_tips() {
+    let repo = look_repo("markers");
+    assert!(query_markers(repo.path()).unwrap().is_empty());
+    let head = look_git(repo.path(), &["rev-parse", "HEAD"]);
+    look_git(
+        repo.path(),
+        &["update-ref", "refs/remotes/origin/master", &head],
+    );
+    assert_eq!(
+        query_markers(repo.path()).unwrap(),
+        vec![Marker {
+            remote: "origin".to_string(),
+            name: "master".to_string(),
+            hash: head,
+        }]
+    );
+    let plain = LookTmp::new("markers-plain");
+    assert!(query_markers(plain.path()).is_err());
+}
+
+#[test]
+fn query_markers_reports_git_failures() {
+    // A corrupt packed-refs still parses as a work tree, but listing
+    // refs fails: the git error surfaces instead of silent tips.
+    let repo = look_repo("markers-corrupt");
+    std::fs::write(repo.path().join(".git/packed-refs"), "garbage{{{not-refs\n").unwrap();
+    assert!(query_markers(repo.path()).is_err());
+}
+
+#[test]
+fn published_hashes_skip_remotes_without_push_uri() {
+    let markers = vec![Marker {
+        remote: "origin".to_string(),
+        name: "master".to_string(),
+        hash: "aaa".to_string(),
+    }];
+    let remotes = vec![RemoteInfo::new(
+        "origin".to_string(),
+        None,
+        Some("git@h.test:repo.git".to_string()),
+    )];
+    let repos = vec![RepositoryRef {
+        name: "repo".to_string(),
+        uris: vec!["git@h.test:repo.git".to_string()],
+        permanent_rules: Some(Vec::new()),
+    }];
+    assert!(published_hashes(&markers, &remotes, &repos).is_empty());
+}
+
+#[test]
+fn look_remotes_data_resolves_optionally() {
+    let repo = look_repo("remotes-data");
+    look_git(
+        repo.path(),
+        &["remote", "add", "origin", "https://h.test/repo.git"],
+    );
+    // Local-only: names stay unresolved.
+    let local = look_remotes_data(repo.path(), None).unwrap();
+    assert_eq!(local.len(), 1);
+    assert_eq!(local[0].name, "origin");
+    assert_eq!(local[0].push_repository, None);
+    // With conduit: the search fills display names.
+    let call = |_method: &str, _params: &serde_json::Value| {
+        Ok(serde_json::json!({"data": [{
+            "fields": {"name": "repo"},
+            "attachments": {"uris": {"uris": [
+                {"fields": {"uri": {"effective": "https://h.test/repo.git"}}},
+            ]}},
+        }]}))
+    };
+    let resolved = look_remotes_data(repo.path(), Some(&call)).unwrap();
+    assert_eq!(resolved[0].push_repository, Some("repo".to_string()));
+    assert_eq!(resolved[0].fetch_repository, Some("repo".to_string()));
+}
+
+#[test]
+fn look_published_data_lists_tips_or_filters() {
+    let repo = look_repo("published-data");
+    let head = look_git(repo.path(), &["rev-parse", "HEAD"]);
+    look_git(
+        repo.path(),
+        &["remote", "add", "origin", "https://h.test/repo.git"],
+    );
+    look_git(
+        repo.path(),
+        &["update-ref", "refs/remotes/origin/master", &head],
+    );
+    look_git(
+        repo.path(),
+        &["update-ref", "refs/remotes/origin/wip", &head],
+    );
+    // Offline: every remote-tracking tip.
+    let mut tips = look_published_data(repo.path(), None).unwrap();
+    tips.sort();
+    assert_eq!(tips, vec![head.clone(), head.clone()]);
+    // With conduit: only permanent push refs.
+    let call = |_method: &str, _params: &serde_json::Value| {
+        Ok(serde_json::json!({"data": [{
+            "fields": {
+                "name": "repo",
+                "refRules": {"permanentRefRules": ["master"]},
+            },
+            "attachments": {"uris": {"uris": [
+                {"fields": {"uri": {"effective": "https://h.test/repo.git"}}},
+            ]}},
+        }]}))
+    };
+    assert_eq!(
+        look_published_data(repo.path(), Some(&call)).unwrap(),
+        vec![head]
+    );
+}
+
+#[test]
+fn fail_mapped_reports_auth_or_fatal() {
+    let client = crate::conduit::Client::new("http://127.0.0.1:9/", "").expect("client");
+    assert_eq!(
+        fail_mapped(&client, "ERR-INVALID-AUTH: bad token".to_string()),
+        std::process::ExitCode::FAILURE
+    );
+    assert_eq!(
+        fail_mapped(&client, "not inside a git repository".to_string()),
+        std::process::ExitCode::from(255)
+    );
+}
+
+#[test]
+fn call_or_unavailable_maps_transport_errors() {
+    let client = crate::conduit::Client::new("http://127.0.0.1:9/", "").expect("client");
+    let err = call_or_unavailable(
+        Some(&client),
+        "diffusion.repository.search",
+        &serde_json::json!({}),
+    )
+    .expect_err("refused");
+    assert!(!err.is_empty(), "expected a transport message");
+    assert_eq!(
+        call_or_unavailable(None, "diffusion.repository.search", &serde_json::json!({})),
+        Err("conduit unavailable".to_string())
+    );
+}
+
+#[test]
+fn render_remotes_output_lists_every_remote() {
+    let remote = RemoteInfo {
+        name: "origin".to_string(),
+        push_uri: Some("https://h.test/repo.git".to_string()),
+        fetch_uri: Some("https://h.test/repo.git".to_string()),
+        push_repository: Some("repo".to_string()),
+        fetch_repository: Some("repo".to_string()),
+    };
+    let out = render_remotes_output(std::slice::from_ref(&remote), false).unwrap();
+    assert!(out.contains("Arcventure"), "{out}");
+    assert!(out.contains("origin"), "{out}");
+    assert!(out.contains("Push Repository: repo"), "{out}");
+    assert!(out.contains("published"), "{out}");
+    let empty = render_remotes_output(&[], false).unwrap();
+    assert!(empty.contains("grove"), "{empty}");
+}
+
+#[test]
+fn render_published_output_handles_empty_river() {
+    let empty = render_published_output(&[], false).unwrap();
+    assert!(empty.contains("bubbles quietly"), "{empty}");
+    assert!(!empty.contains("Floating"), "{empty}");
+    let out = render_published_output(&["abc123".to_string()], false).unwrap();
+    assert!(out.contains("Floating on the water"), "{out}");
+    assert!(out.contains("abc123"), "{out}");
+    assert!(out.contains("bubbles peacefully"), "{out}");
+}
+
+#[test]
+fn run_clearing_renders_live_clearing() {
+    assert_eq!(run_clearing(false), std::process::ExitCode::SUCCESS);
+    assert_eq!(run_clearing(true), std::process::ExitCode::SUCCESS);
+}
+
+#[test]
+fn run_unknown_reports_missing_thing() {
+    assert_eq!(
+        run_unknown(&args(&["big", "rock"]), false),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn run_remotes_fails_in_remote_less_repo() {
+    let repo = look_repo("run-remotes-err");
+    write_arcconfig(repo.path(), "http://127.0.0.1:9/");
+    assert_eq!(
+        run_remotes(repo.path(), false),
+        std::process::ExitCode::from(255)
+    );
+}
+
+#[test]
+fn run_remotes_lists_repo_remotes() {
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "diffusion.repository.search".to_string(),
+        look_envelope(
+            r#"{"data": [{
+                "fields": {"name": "repo"},
+                "attachments": {"uris": {"uris": [
+                    {"fields": {"uri": {"effective": "https://h.test/repo.git"}}}
+                ]}}
+            }]}"#,
+        ),
+    );
+    let base = look_serve(routes, 1);
+    let repo = look_repo("run-remotes-ok");
+    look_git(
+        repo.path(),
+        &["remote", "add", "origin", "https://h.test/repo.git"],
+    );
+    write_arcconfig(repo.path(), &base);
+    // Guard: the project URI must win discovery, so the run below can
+    // only talk to the loopback stub.
+    let user_file = crate::config::arcrc_path();
+    let client =
+        look_conduit_client(repo.path(), user_file.as_deref()).expect("stub client resolves");
+    assert_eq!(client.base_uri(), format!("{base}api/"));
+    assert_eq!(
+        run_remotes(repo.path(), false),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
+#[test]
+fn run_published_fails_outside_repo() {
+    let plain = LookTmp::new("run-published-err");
+    write_arcconfig(plain.path(), "http://127.0.0.1:9/");
+    assert_eq!(
+        run_published(plain.path(), false),
+        std::process::ExitCode::from(255)
+    );
+}
+
+#[test]
+fn run_published_lists_remote_tips() {
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "diffusion.repository.search".to_string(),
+        look_envelope(r#"{"data": []}"#),
+    );
+    let base = look_serve(routes, 1);
+    let repo = look_repo("run-published-ok");
+    look_git(
+        repo.path(),
+        &["remote", "add", "origin", "https://h.test/repo.git"],
+    );
+    write_arcconfig(repo.path(), &base);
+    // Guard: the project URI must win discovery, so the run below can
+    // only talk to the loopback stub.
+    let user_file = crate::config::arcrc_path();
+    let client =
+        look_conduit_client(repo.path(), user_file.as_deref()).expect("stub client resolves");
+    assert_eq!(client.base_uri(), format!("{base}api/"));
+    assert_eq!(
+        run_published(repo.path(), false),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
+#[test]
+fn run_in_reports_missing_terminator_when_piped() {
+    // Under `cargo test` stdin is not a TTY, so an argv without `--`
+    // reports the terminator hints plus the usage envelope.
+    let plain = LookTmp::new("run-terminator");
+    assert_eq!(run_in(plain.path(), &[]), std::process::ExitCode::FAILURE);
+}
+
+#[test]
+fn system_zone_prefers_localtime_bytes() {
+    // Valid localtime bytes win, even with a timezone name present.
+    assert_eq!(
+        system_tz_offset_from(Some(TESTBURG_V1), Some("UTC"), WINTER as i64),
+        -18_000
+    );
+    assert_eq!(
+        system_tz_offset_from(Some(TESTBURG_V1), None, SUMMER as i64),
+        -14_400
+    );
+}
+
+#[test]
+fn system_zone_falls_back_past_unparseable_localtime() {
+    // Corrupt localtime bytes fall through to the timezone name, then
+    // to UTC when nothing resolves.
+    let tmp = LookTmp::new("syszone");
+    let path = tmp.path().join("v1.tz");
+    std::fs::write(&path, TESTBURG_V1).unwrap();
+    let name = path.to_str().expect("utf8 tmp path").to_string();
+    assert!(name.contains('/'));
+    assert_eq!(
+        system_tz_offset_from(Some(b"not a tzfile"), Some(&name), WINTER as i64),
+        -18_000
+    );
+    assert_eq!(
+        system_tz_offset_from(Some(b"not a tzfile"), None, WINTER as i64),
+        0
+    );
+    assert_eq!(system_tz_offset_from(None, None, WINTER as i64), 0);
+}
+
+#[test]
+fn system_zone_ignores_blank_and_unknown_names() {
+    // Blank names skip the zoneinfo lookup; unknown names resolve to
+    // nothing; both land on UTC.
+    assert_eq!(system_tz_offset_from(None, Some(""), WINTER as i64), 0);
+    assert_eq!(system_tz_offset_from(None, Some("  \n "), WINTER as i64), 0);
+    assert_eq!(
+        system_tz_offset_from(None, Some("arc-rs-no-such-zone"), WINTER as i64),
+        0
+    );
+}
+
+#[test]
+fn system_zone_matches_live_etc_contents() {
+    // The wrapper reads exactly `/etc/localtime` + `/etc/timezone` and
+    // delegates: same inputs, same offset as the live call.
+    let localtime = std::fs::read("/etc/localtime").ok();
+    let timezone = std::fs::read_to_string("/etc/timezone").ok();
+    let now = WINTER as i64;
+    assert_eq!(
+        system_tz_offset(now),
+        system_tz_offset_from(localtime.as_deref(), timezone.as_deref(), now)
+    );
+}

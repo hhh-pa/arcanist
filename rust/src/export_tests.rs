@@ -1116,3 +1116,792 @@ fn upx_b23_export_help_matches_generated_format() {
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
     assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
 }
+
+/// Plain temp dir (not a git repo); the caller removes it.
+fn plain_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "arc-rs-export-plain-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Binary `BundleChange` with no data and no phids; tests set what they need.
+fn cov_binary_change() -> crate::patch::BundleChange {
+    crate::patch::BundleChange {
+        change_type: crate::diff_local::TYPE_CHANGE,
+        file_type: crate::diff_local::FILE_BINARY,
+        old_path: Some("dir/old.bin".to_string()),
+        current_path: Some("dir/new.bin".to_string()),
+        old_mode: None,
+        new_mode: None,
+        hunks: Vec::new(),
+        old_binary_phid: None,
+        new_binary_phid: None,
+        away_paths: Vec::new(),
+        original_file_data: None,
+        current_file_data: None,
+    }
+}
+
+fn cov_hunk(corpus: &str) -> crate::diff_local::ParsedHunk {
+    crate::diff_local::ParsedHunk {
+        old_start: 1,
+        old_len: 1,
+        new_start: 1,
+        new_len: 1,
+        corpus: corpus.to_string(),
+        synthetic_counts: None,
+    }
+}
+
+#[test]
+fn missing_values_for_value_flags_error() {
+    for (flag, words) in [
+        ("--revision", &["--git", "--revision"][..]),
+        ("--diff", &["--git", "--diff"][..]),
+        ("--conduit-uri", &["--git", "--conduit-uri"][..]),
+    ] {
+        match parse_args(&argv(words)) {
+            ParseOutcome::Error(message) => {
+                assert_eq!(message, format!("{flag} requires a value"));
+            }
+            _ => panic!("expected missing-value error for {flag}"),
+        }
+    }
+    // Empty values are missing too (`take_value` rejects `""`).
+    assert!(matches!(
+        parse_args(&argv(&["--git", "--revision", ""])),
+        ParseOutcome::Error(_)
+    ));
+}
+
+#[test]
+fn parses_equals_forms_for_revision_and_conduit_uri() {
+    assert_eq!(
+        args_of(&["--git", "--revision=D5"]).source,
+        Source::Revision(5)
+    );
+    let opts = args_of(&["--git", "--conduit-uri=https://x/"]);
+    assert_eq!(opts.conduit_uri, Some("https://x/".to_string()));
+    let opts = args_of(&["--git", "--conduit-uri", "https://y/"]);
+    assert_eq!(opts.conduit_uri, Some("https://y/".to_string()));
+}
+
+#[test]
+fn double_dash_ends_flag_parsing() {
+    let opts = args_of(&["--git", "--", "HEAD"]);
+    assert_eq!(
+        opts.source,
+        Source::Local {
+            base: Some("HEAD".to_string())
+        }
+    );
+    // Flag-like positionals survive after `--`.
+    let opts = args_of(&["--git", "--", "--git"]);
+    assert_eq!(
+        opts.source,
+        Source::Local {
+            base: Some("--git".to_string())
+        }
+    );
+}
+
+#[test]
+fn unknown_flag_errors() {
+    match parse_args(&argv(&["--git", "--bogus"])) {
+        ParseOutcome::Error(message) => assert_eq!(message, "unknown flag '--bogus'"),
+        _ => panic!("expected unknown-flag error"),
+    }
+}
+
+#[test]
+fn first_diff_id_rejects_non_tables_and_reads_string_ids() {
+    // Non-table results are not-found (message asserted structurally).
+    assert!(first_diff_id(&serde_json::json!("x")).is_err());
+    assert!(first_diff_id(&serde_json::json!(7)).is_err());
+    // String IDs pass through; missing/other IDs are not-found.
+    let dict = serde_json::json!({"3": {"id": "7"}});
+    assert_eq!(first_diff_id(&dict).unwrap(), "7");
+    assert!(first_diff_id(&serde_json::json!({"3": {}})).is_err());
+    assert!(first_diff_id(&serde_json::json!({"3": {"id": true}})).is_err());
+    let list = serde_json::json!([{"id": "9"}]);
+    assert_eq!(first_diff_id(&list).unwrap(), "9");
+}
+
+#[test]
+fn fetch_raw_diff_reads_all_response_shapes() {
+    let fetch = |result: &str| {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert("differential.getrawdiff".to_string(), envelope(result));
+        let base = serve(routes, 1);
+        let client = crate::conduit::Client::new(&base, "t").unwrap();
+        fetch_raw_diff_for_diff(&client, "3")
+    };
+    assert_eq!(fetch(r#""S""#).unwrap(), "S");
+    assert_eq!(fetch(r#"{"rawDiff": "R1"}"#).unwrap(), "R1");
+    assert_eq!(fetch(r#"{"diff": "R2"}"#).unwrap(), "R2");
+    assert_eq!(
+        fetch(r#"{}"#).unwrap_err(),
+        "differential.getrawdiff returned an unexpected response"
+    );
+}
+
+#[test]
+fn querydiffs_params_covers_local_and_diff_sources() {
+    assert_eq!(
+        querydiffs_params(&Source::Local { base: None }),
+        serde_json::json!({})
+    );
+    assert_eq!(
+        querydiffs_params(&Source::Diff(3)),
+        serde_json::json!({"ids": ["3"]})
+    );
+}
+
+#[test]
+fn first_row_covers_arrays_and_scalars() {
+    let row = serde_json::json!([{"realName": "Ada"}]);
+    assert_eq!(
+        first_row(&row),
+        Some(&serde_json::json!({"realName": "Ada"}))
+    );
+    assert_eq!(first_row(&serde_json::json!("x")), None);
+    assert_eq!(first_row(&serde_json::json!(null)), None);
+}
+
+#[test]
+fn nonempty_or_empty_array_covers_all_json_shapes() {
+    // Through `normalize_conduit_change`, which applies it to
+    // `awayPaths`/`oldProperties`/`newProperties`.
+    let normalized = |value: serde_json::Value| {
+        normalize_conduit_change(&serde_json::json!({"awayPaths": value}))["awayPaths"].clone()
+    };
+    assert_eq!(normalized(serde_json::json!(null)), serde_json::json!([]));
+    assert_eq!(normalized(serde_json::json!(false)), serde_json::json!([]));
+    assert_eq!(normalized(serde_json::json!(true)), serde_json::json!(true));
+    assert_eq!(normalized(serde_json::json!(0)), serde_json::json!([]));
+    assert_eq!(normalized(serde_json::json!(0.0)), serde_json::json!([]));
+    assert_eq!(normalized(serde_json::json!(5)), serde_json::json!(5));
+    assert_eq!(normalized(serde_json::json!("")), serde_json::json!([]));
+    assert_eq!(normalized(serde_json::json!("0")), serde_json::json!([]));
+    assert_eq!(normalized(serde_json::json!("x")), serde_json::json!("x"));
+    assert_eq!(normalized(serde_json::json!({})), serde_json::json!([]));
+    assert_eq!(
+        normalized(serde_json::json!({"a": 1})),
+        serde_json::json!({"a": 1})
+    );
+}
+
+#[test]
+fn conduit_hunk_corpus_stringifies_scalars() {
+    let corpus_of = |value: serde_json::Value| {
+        let change = serde_json::json!({"hunks": [{"corpus": value}]});
+        normalize_conduit_change(&change)["hunks"][0]["corpus"].clone()
+    };
+    assert_eq!(corpus_of(serde_json::json!(5)), serde_json::json!("5"));
+    assert_eq!(
+        corpus_of(serde_json::json!(true)),
+        serde_json::json!("true")
+    );
+    assert_eq!(corpus_of(serde_json::json!(["x"])), serde_json::json!(""));
+    assert_eq!(
+        corpus_of(serde_json::json!({"a": 1})),
+        serde_json::json!("")
+    );
+}
+
+#[test]
+fn strip_corpora_skips_changes_without_hunks() {
+    let mut changes = vec![
+        serde_json::json!({"metadata": {}}),
+        serde_json::json!({"hunks": "x"}),
+    ];
+    assert!(strip_corpora(&mut changes).is_empty());
+}
+
+#[test]
+fn blob_phids_skips_changes_without_metadata() {
+    let changes = vec![serde_json::json!({"hunks": []})];
+    assert!(blob_phids(&changes).is_empty());
+}
+
+#[test]
+fn export_prompt_line_fails_without_tty() {
+    // Piped stdin is never a TTY under `cargo test`; bail out (rather
+    // than block on a real terminal) if that ever changes.
+    if crate::prompt::stdin_is_terminal() {
+        return;
+    }
+    assert_eq!(export_prompt_line("Base?"), None);
+    // The flag was set; `take` asserts that and resets it.
+    assert!(EXPORT_PROMPT_TTY_FAILED.take());
+}
+
+#[test]
+fn local_diff_bytes_rejects_non_repo_and_bad_base() {
+    let plain = plain_dir("diff");
+    assert_eq!(
+        local_diff_bytes(&plain, Format::Git, "HEAD").unwrap_err(),
+        "not inside a git working copy"
+    );
+    std::fs::remove_dir_all(&plain).ok();
+
+    let dir = export_e_repo("diff-repo", &[("f.txt", "one\n")]);
+    // The failure echoes our own ref name (no git prose asserted).
+    let err = local_diff_bytes(&dir, Format::Git, "no-such-base-xyz").unwrap_err();
+    assert!(err.contains("no-such-base-xyz"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn create_tar_reports_member_failures() {
+    // Missing members fail `tar -czf` with stderr naming them (our own
+    // member names, not tar prose, are asserted).
+    let stage = plain_dir("tar");
+    let out = stage.join("o.tar.gz");
+    let err = create_tar(&stage, &out).unwrap_err();
+    assert!(err.contains("blobs"), "{err}");
+    std::fs::remove_dir_all(&stage).ok();
+}
+
+#[test]
+fn bundle_out_path_prefers_absolute_paths() {
+    let dir = plain_dir("outpath");
+    assert_eq!(
+        bundle_out_path(&dir, "/abs/out.tar.gz"),
+        std::path::PathBuf::from("/abs/out.tar.gz")
+    );
+    assert_eq!(bundle_out_path(&dir, "o.tar.gz"), dir.join("o.tar.gz"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn raw_diff_transport_diffs_single_path() {
+    let dir = export_e_repo("rawdt", &[("f.txt", "one\n"), ("f.txt", "one\ntwo\n")]);
+    let out = raw_diff_transport(&dir, "HEAD~1", "f.txt").unwrap();
+    assert!(
+        crate::patch::untransport_lossy(&out).contains("+two"),
+        "{out:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn local_bundle_covers_pure_rename() {
+    // A pure rename needs synthetic hunks, which re-diff through
+    // `raw_diff_transport`.
+    let dir = fixture_repo("rename");
+    std::fs::write(dir.join("f.txt"), "one\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-qm", "one"]);
+    git(&dir, &["mv", "f.txt", "g.txt"]);
+    git(&dir, &["commit", "-qm", "mv"]);
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "user.whoami".to_string(),
+        envelope(r#"{"phid": "PHID-USER-1"}"#),
+    );
+    routes.insert(
+        "user.query".to_string(),
+        envelope(r#"{"1": {"realName": "Ada"}}"#),
+    );
+    let base = serve(routes, 2);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    let opts = args_of(&["--arcbundle", "out.tar.gz", "HEAD~1"]);
+    assert_eq!(
+        export_bundle_with_client(&dir, &opts, "out.tar.gz", &client).unwrap(),
+        "Done.\n"
+    );
+    let unpacked = unpack(&dir.join("out.tar.gz"));
+    let changes: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(unpacked.join("changes.json")).unwrap())
+            .unwrap();
+    let paths: Vec<&str> = changes
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|change| change.get("currentPath").and_then(|path| path.as_str()))
+        .collect();
+    assert!(paths.contains(&"g.txt"), "{paths:?}");
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&unpacked).ok();
+}
+
+#[test]
+fn file_data_at_revision_rejects_empty_paths() {
+    let dir = plain_dir("filedata");
+    assert_eq!(file_data_at_revision(&dir, "HEAD", ""), None);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn local_file_modes_tolerates_git_failures() {
+    // Spawn failure (missing dir) and command failure (not a repo)
+    // both read as no modes.
+    let missing = std::env::temp_dir().join(format!(
+        "arc-rs-export-missing-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    assert!(!missing.exists());
+    assert!(local_file_modes(&missing, "HEAD", &["f.txt".to_string()]).is_empty());
+    let plain = plain_dir("modes");
+    assert!(local_file_modes(&plain, "HEAD", &["f.txt".to_string()]).is_empty());
+    std::fs::remove_dir_all(&plain).ok();
+}
+
+#[test]
+fn local_render_changes_maps_empty_current_path_to_none() {
+    let dir = export_e_repo("emptycur", &[("f.txt", "one\n")]);
+    let head = resolve_export_head(&dir).unwrap();
+    let parsed = crate::diff_local::ParsedChange {
+        old_path: "/dev/null".to_string(),
+        current_path: String::new(),
+        change_type: crate::diff_local::TYPE_CHANGE,
+        file_type: crate::diff_local::FILE_TEXT,
+        hunks: Vec::new(),
+        hunk_len_explicit: Vec::new(),
+        old_mode: None,
+        new_mode: None,
+        away_paths: Vec::new(),
+        commit_hash: None,
+        message: None,
+    };
+    let rendered = local_render_changes(&dir, "HEAD", &head, &[parsed]);
+    assert_eq!(rendered.len(), 1);
+    assert_eq!(rendered[0].old_path, None);
+    assert_eq!(rendered[0].current_path, None);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn render_export_binary_body_zeroes_missing_data() {
+    let zeros = "0".repeat(40);
+    let body = render_export_binary_body(None, None).unwrap();
+    assert!(
+        body.contains(&format!("index {zeros}..{zeros}\n")),
+        "{body}"
+    );
+    assert!(body.contains("literal 0\n"), "{body}");
+    let body = render_export_binary_body(Some(b"ab"), Some(b"c")).unwrap();
+    let old = crate::patch::git_blob_sha1(b"ab");
+    let new = crate::patch::git_blob_sha1(b"c");
+    assert!(body.contains(&format!("index {old}..{new}\n")), "{body}");
+    assert!(body.contains("literal 1\n"), "{body}");
+    assert!(body.contains("literal 2\n"), "{body}");
+}
+
+#[test]
+fn build_export_binary_body_loads_blobs_by_phid() {
+    use std::cell::RefCell;
+    let seen: RefCell<Vec<(String, Option<String>)>> = RefCell::new(Vec::new());
+    let loader = |phid: &str, name: Option<&str>| {
+        seen.borrow_mut()
+            .push((phid.to_string(), name.map(str::to_string)));
+        Ok(format!("bytes-for-{phid}").into_bytes())
+    };
+
+    // Away change with inline data: no download.
+    let change = cov_binary_change();
+    let mut away = cov_binary_change();
+    away.original_file_data = Some(b"OLD".to_vec());
+    let body = build_export_binary_body(&change, Some(&away), &export_e_no_blobs).unwrap();
+    assert!(body.contains("literal 3\n"), "{body}");
+    assert!(body.contains("literal 0\n"), "{body}");
+
+    // Away change with only a phid: downloads, naming the basename
+    // (trailing slashes trimmed).
+    let mut trailing = cov_binary_change();
+    trailing.old_path = Some("a/b/".to_string());
+    let mut away_phid = cov_binary_change();
+    away_phid.old_binary_phid = Some("PHID-O".to_string());
+    let body = build_export_binary_body(&trailing, Some(&away_phid), &loader).unwrap();
+    assert!(body.contains("literal 16\n"), "{body}");
+    assert_eq!(
+        seen.borrow().as_slice(),
+        &[("PHID-O".to_string(), Some("b".to_string()))]
+    );
+    seen.borrow_mut().clear();
+
+    // Own old phid without data: downloads too.
+    let mut old_phid = cov_binary_change();
+    old_phid.old_binary_phid = Some("PHID-O2".to_string());
+    old_phid.old_path = Some("x/y.bin".to_string());
+    build_export_binary_body(&old_phid, None, &loader).unwrap();
+    assert_eq!(
+        seen.borrow().as_slice(),
+        &[("PHID-O2".to_string(), Some("y.bin".to_string()))]
+    );
+    seen.borrow_mut().clear();
+
+    // Neither data nor phids: zeros, no download.
+    let bare = cov_binary_change();
+    let body = build_export_binary_body(&bare, None, &export_e_no_blobs).unwrap();
+    assert!(body.contains(&"0".repeat(40)), "{body}");
+
+    // New phid without data: downloads naming the current basename.
+    let mut new_phid = cov_binary_change();
+    new_phid.new_binary_phid = Some("PHID-N".to_string());
+    new_phid.current_path = Some("dir/n.bin".to_string());
+    let body = build_export_binary_body(&new_phid, None, &loader).unwrap();
+    assert!(body.contains("literal 16\n"), "{body}");
+    assert_eq!(
+        seen.borrow().as_slice(),
+        &[("PHID-N".to_string(), Some("n.bin".to_string()))]
+    );
+}
+
+#[test]
+fn break_export_hunk_handles_context_only_corpora() {
+    let hunk = crate::diff_local::ParsedHunk {
+        old_start: 1,
+        old_len: 2,
+        new_start: 1,
+        new_len: 2,
+        corpus: " a\n b\n".to_string(),
+        synthetic_counts: None,
+    };
+    assert!(break_export_hunk(&hunk).is_empty());
+    assert!(render_export_hunks(&[hunk]).is_empty());
+}
+
+#[test]
+fn scan_export_hunk_end_covers_context_breaks_and_markers() {
+    // Change, short context, change: break point set, then cleared.
+    let scan = scan_export_hunk_end(&["-a", " c1", " c2", " c3", " c4", "+b"], 0, 3);
+    assert_eq!(scan.end, 6);
+    assert_eq!((scan.old_lines, scan.new_lines, scan.adjust), (1, 1, 0));
+    assert_eq!(scan.break_at, None);
+    // Long context runs stop the hunk, keeping the break point.
+    let scan = scan_export_hunk_end(
+        &["-a", " c1", " c2", " c3", " c4", " c5", " c6", " c7", " c8"],
+        0,
+        3,
+    );
+    assert_eq!(scan.end, 7);
+    assert_eq!(scan.break_at, Some(4));
+    // Missing-newline markers adjust the counts.
+    let scan = scan_export_hunk_end(&["-a", "\\ No newline at end of file", "+b"], 0, 3);
+    assert_eq!(scan.adjust, 1);
+    assert_eq!(scan.end, 3);
+    // Foreign leading bytes count as changed lines.
+    let scan = scan_export_hunk_end(&["-a", "X", "+b"], 0, 3);
+    assert_eq!(scan.end, 3);
+    assert_eq!((scan.old_lines, scan.new_lines), (1, 1));
+}
+
+#[test]
+fn render_export_hunks_terminates_unterminated_corpora() {
+    let hunk = crate::diff_local::ParsedHunk {
+        old_start: 1,
+        old_len: 1,
+        new_start: 1,
+        new_len: 0,
+        corpus: "-a".to_string(),
+        synthetic_counts: None,
+    };
+    assert_eq!(render_export_hunks(&[hunk]), "@@ -1 +1,0 @@\n-a\n");
+}
+
+#[test]
+fn collect_and_lookup_cover_binary_move_sources() {
+    let mut away = cov_binary_change();
+    away.change_type = crate::diff_local::TYPE_COPY_AWAY;
+    away.away_paths = vec!["n.bin".to_string()];
+    let mut here = cov_binary_change();
+    here.change_type = crate::diff_local::TYPE_COPY_HERE;
+    here.current_path = Some("n.bin".to_string());
+    let changes = vec![away, here];
+    let sources = collect_export_binary_sources(&changes);
+    assert_eq!(sources.get("n.bin"), Some(&0));
+    let found = lookup_export_old_binary(&changes, &sources, &changes[1]).unwrap();
+    assert_eq!(found.change_type, crate::diff_local::TYPE_COPY_AWAY);
+    assert!(lookup_export_old_binary(&changes, &sources, &changes[0]).is_none());
+}
+
+#[test]
+fn render_export_git_change_covers_copy_and_skip_shapes() {
+    // Copies print `copy from/to` headers.
+    let copy = crate::patch::BundleChange {
+        change_type: crate::diff_local::TYPE_COPY_HERE,
+        file_type: crate::diff_local::FILE_TEXT,
+        old_path: Some("o.txt".to_string()),
+        current_path: Some("c.txt".to_string()),
+        old_mode: None,
+        new_mode: None,
+        hunks: vec![cov_hunk("+x\n")],
+        old_binary_phid: None,
+        new_binary_phid: None,
+        away_paths: Vec::new(),
+        original_file_data: None,
+        current_file_data: None,
+    };
+    let text = render_export_git_change(&copy, None, &export_e_no_blobs)
+        .unwrap()
+        .unwrap();
+    assert!(text.contains("copy from o.txt\ncopy to c.txt\n"), "{text}");
+    assert!(text.starts_with("diff --git a/o.txt b/c.txt\n"), "{text}");
+
+    // Directories and move-away halves carry no output.
+    let mut dir = cov_binary_change();
+    dir.change_type = crate::diff_local::TYPE_CHANGE;
+    dir.file_type = crate::diff_local::FILE_DIRECTORY;
+    assert!(
+        render_export_git_change(&dir, None, &export_e_no_blobs)
+            .unwrap()
+            .is_none()
+    );
+    let mut move_away = cov_binary_change();
+    move_away.change_type = crate::diff_local::TYPE_MOVE_AWAY;
+    move_away.file_type = crate::diff_local::FILE_TEXT;
+    assert!(
+        render_export_git_change(&move_away, None, &export_e_no_blobs)
+            .unwrap()
+            .is_none()
+    );
+    // Bodiless copy-away halves without mode changes are skipped.
+    let mut copy_away = cov_binary_change();
+    copy_away.change_type = crate::diff_local::TYPE_COPY_AWAY;
+    copy_away.file_type = crate::diff_local::FILE_TEXT;
+    assert!(
+        render_export_git_change(&copy_away, None, &export_e_no_blobs)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn render_export_unified_skips_bodyless_changes() {
+    let mut change = cov_binary_change();
+    change.change_type = crate::diff_local::TYPE_CHANGE;
+    change.file_type = crate::diff_local::FILE_TEXT;
+    assert!(render_export_unified(&[change]).is_empty());
+}
+
+#[test]
+fn export_e_multicopy_decomposes_with_two_sources() {
+    let multicopy = |current: &str| crate::patch::BundleChange {
+        change_type: crate::diff_local::TYPE_MULTICOPY,
+        file_type: crate::diff_local::FILE_TEXT,
+        old_path: None,
+        current_path: Some(current.to_string()),
+        old_mode: None,
+        new_mode: None,
+        hunks: Vec::new(),
+        old_binary_phid: None,
+        new_binary_phid: None,
+        away_paths: Vec::new(),
+        original_file_data: None,
+        current_file_data: None,
+    };
+    let copy_here = |old: &str, current: &str| crate::patch::BundleChange {
+        change_type: crate::diff_local::TYPE_COPY_HERE,
+        file_type: crate::diff_local::FILE_TEXT,
+        old_path: Some(old.to_string()),
+        current_path: Some(current.to_string()),
+        old_mode: None,
+        new_mode: None,
+        hunks: Vec::new(),
+        old_binary_phid: None,
+        new_binary_phid: None,
+        away_paths: Vec::new(),
+        original_file_data: None,
+        current_file_data: None,
+    };
+    let mut changes = vec![
+        multicopy("A"),
+        copy_here("A", "A2"),
+        multicopy("B"),
+        copy_here("B", "B2"),
+    ];
+    decompose_export_multicopies(&mut changes).unwrap();
+    assert_eq!(changes.len(), 2);
+    assert!(
+        changes
+            .iter()
+            .all(|change| change.change_type == crate::diff_local::TYPE_MOVE_HERE)
+    );
+    assert_eq!(changes[0].current_path.as_deref(), Some("A2"));
+    assert_eq!(changes[1].current_path.as_deref(), Some("B2"));
+}
+
+#[test]
+fn split_email_author_keeps_bare_names() {
+    assert_eq!(
+        split_email_author("justname"),
+        (None, "justname".to_string())
+    );
+}
+
+#[test]
+fn export_bundle_reports_missing_credentials() {
+    // The `.invalid` URI keeps this hermetic: no token can exist for it,
+    // so `client_for` fails before any conduit traffic.
+    let dir = plain_dir("bundlecreds");
+    let opts = args_of(&[
+        "--arcbundle",
+        "o.tar.gz",
+        "--revision",
+        "1",
+        "--conduit-uri",
+        "https://export-bundle.invalid/",
+    ]);
+    let err = export_bundle(&dir, &opts, "o.tar.gz").unwrap_err();
+    assert!(err.contains("no token for"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn download_export_blob_names_files_like_php() {
+    // "bin-data" in base64.
+    let mut routes = std::collections::HashMap::new();
+    routes.insert("file.download".to_string(), envelope(r#""YmluLWRhdGE=""#));
+    let base = serve(routes, 2);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    assert_eq!(
+        download_export_blob(&client, "PHID-X", Some("a.bin")).unwrap(),
+        b"bin-data"
+    );
+    assert_eq!(
+        download_export_blob(&client, "PHID-Y", None).unwrap(),
+        b"bin-data"
+    );
+}
+
+#[test]
+fn execute_dispatches_bundles_before_credentials() {
+    let dir = plain_dir("execbundle");
+    let err = execute(
+        &dir,
+        &argv(&[
+            "--arcbundle",
+            "o.tar.gz",
+            "--revision",
+            "1",
+            "--conduit-uri",
+            "https://export-2094.invalid/",
+        ]),
+    )
+    .unwrap_err();
+    assert!(err.contains("no token for"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn run_in_reports_runtime_failures_as_exceptions() {
+    // Parses fine but fails at runtime (no conduit credentials), so the
+    // red-banner exception envelope applies (exit 1, never 255).
+    let dir = plain_dir("runexc");
+    assert_eq!(
+        run_in(
+            &dir,
+            &argv(&["--git", "--conduit-uri", "https://export-2147.invalid/"])
+        ),
+        std::process::ExitCode::FAILURE
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn quiet_failures_use_the_silent_wording() {
+    // Real `git`/`tar` failures always print something, so the silent
+    // branches are pinned directly through the shared helper.
+    assert_eq!(failure_detail_or("", "git diff failed"), "git diff failed");
+    assert_eq!(
+        failure_detail_or("  \n\t ", "tar -czf failed"),
+        "tar -czf failed"
+    );
+    assert_eq!(failure_detail_or("boom\n", "silent"), "boom");
+    assert_eq!(failure_detail_or("\n  spaced  \n", "silent"), "spaced");
+}
+
+#[test]
+fn bundle_parts_surface_staging_failures() {
+    // Against a missing stage dir the first member write fails; with a
+    // directory squatting on `meta.json`, the second one does.
+    let parent = plain_dir("parts-missing");
+    let missing = parent.join("no-such-stage");
+    let err = write_bundle_parts(
+        &missing,
+        &missing.join("o.tar.gz"),
+        &[],
+        &serde_json::Value::Null,
+        &[],
+        &[],
+    )
+    .unwrap_err();
+    assert!(err.contains("failed to stage bundle files"), "{err}");
+    std::fs::remove_dir_all(&parent).ok();
+
+    let stage = plain_dir("parts-clash");
+    std::fs::create_dir_all(stage.join("meta.json")).unwrap();
+    let err = write_bundle_parts(
+        &stage,
+        &stage.join("o.tar.gz"),
+        &[],
+        &serde_json::Value::Null,
+        &[],
+        &[],
+    )
+    .unwrap_err();
+    assert!(err.contains("failed to stage bundle files"), "{err}");
+    std::fs::remove_dir_all(&stage).ok();
+}
+
+#[test]
+fn ls_tree_entries_parse_or_fall_back() {
+    // Well-formed `-z` entries yield `(name, mode)`; anything corrupt
+    // (which real `git` never emits) yields `None` for the `100644`
+    // fallback.
+    assert_eq!(
+        ls_tree_entry_mode(b"100644 blob e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\tfile.txt"),
+        Some(("file.txt".to_string(), "100644".to_string()))
+    );
+    assert_eq!(ls_tree_entry_mode(b""), None);
+    assert_eq!(ls_tree_entry_mode(b"no-tab-here"), None);
+    assert_eq!(ls_tree_entry_mode(b"100644\tfile.txt"), None);
+    assert_eq!(ls_tree_entry_mode(b"\tnameless"), None);
+    assert_eq!(ls_tree_entry_mode(b"\xff\xfe blob abc\tfile.txt"), None);
+    assert_eq!(ls_tree_entry_mode(b"100644 blob abc\t\xff\xfe"), None);
+}
+
+/// A sink that always fails, standing in for a closed/broken stdout.
+struct FailSink;
+
+impl std::io::Write for FailSink {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("closed"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn run_sink_failure_is_fatal() {
+    // `--help` renders without conduit, so it exercises the sink arms:
+    // a broken stdout fails, a working sink gets the usage bytes.
+    let dir = plain_dir("runsink");
+    let argv = argv(&["--help"]);
+    assert_eq!(
+        run_in_with(&dir, &argv, &mut FailSink),
+        std::process::ExitCode::FAILURE
+    );
+    let mut buf = Vec::new();
+    assert_eq!(
+        run_in_with(&dir, &argv, &mut buf),
+        std::process::ExitCode::SUCCESS
+    );
+    assert_eq!(buf, usage().into_bytes());
+    std::fs::remove_dir_all(&dir).ok();
+}

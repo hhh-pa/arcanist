@@ -650,12 +650,7 @@ pub fn local_diff_bytes(dir: &Path, format: Format, base: &str) -> Result<Vec<u8
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
-        let trimmed = detail.trim();
-        if trimmed.is_empty() {
-            Err("git diff failed".to_string())
-        } else {
-            Err(trimmed.to_string())
-        }
+        Err(failure_detail_or(&detail, "git diff failed"))
     }
 }
 
@@ -1123,12 +1118,19 @@ fn create_tar(stage: &Path, out: &Path) -> Result<(), String> {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        let trimmed = detail.trim();
-        if trimmed.is_empty() {
-            Err("tar -czf failed".to_string())
-        } else {
-            Err(trimmed.to_string())
-        }
+        Err(failure_detail_or(&detail, "tar -czf failed"))
+    }
+}
+
+/// Trimmed combined child output, or `silent` when the command failed
+/// without a word (the quiet-failure wording stays unit-testable: real
+/// `git`/`tar` failures always print something).
+fn failure_detail_or(detail: &str, silent: &str) -> String {
+    let trimmed = detail.trim();
+    if trimmed.is_empty() {
+        silent.to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -1143,34 +1145,47 @@ fn write_bundle(
     blobs: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
     let stage = stage_dir()?;
-    let result = (|| {
-        let plain: Vec<serde_json::Value> = changes.iter().map(untransport_json_value).collect();
-        let changes_text =
-            serde_json::to_string(&plain).map_err(|e| format!("failed to encode bundle: {e}"))?;
-        write_stage_file(
-            &stage,
-            "changes.json",
-            crate::upload::php_escape_json_text(&changes_text, true).as_bytes(),
-        )?;
-        let meta_text =
-            serde_json::to_string(meta).map_err(|e| format!("failed to encode bundle: {e}"))?;
-        write_stage_file(
-            &stage,
-            "meta.json",
-            crate::upload::php_escape_json_text(&meta_text, true).as_bytes(),
-        )?;
-        for (index, corpus) in hunks.iter().enumerate() {
-            // Corpora ride as transport; members carry raw bytes, like PHP.
-            let raw = crate::patch::untransport_bytes(corpus);
-            write_stage_file(&stage, &format!("hunks/{index}"), &raw)?;
-        }
-        for (phid, blob) in blobs {
-            write_stage_file(&stage, &format!("blobs/{phid}"), blob)?;
-        }
-        create_tar(&stage, out)
-    })();
+    let result = write_bundle_parts(&stage, out, changes, meta, hunks, blobs);
     std::fs::remove_dir_all(&stage).ok();
     result
+}
+
+/// Stage the bundle members under `stage` and tar them into `out`.
+/// Split from [`write_bundle`] so staging failures (unreachable against
+/// the fresh stage dir a successful [`stage_dir`] returns) stay testable
+/// with an explicit stage path.
+fn write_bundle_parts(
+    stage: &Path,
+    out: &Path,
+    changes: &[serde_json::Value],
+    meta: &serde_json::Value,
+    hunks: &[String],
+    blobs: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    let plain: Vec<serde_json::Value> = changes.iter().map(untransport_json_value).collect();
+    let changes_text =
+        serde_json::to_string(&plain).map_err(|e| format!("failed to encode bundle: {e}"))?;
+    write_stage_file(
+        stage,
+        "changes.json",
+        crate::upload::php_escape_json_text(&changes_text, true).as_bytes(),
+    )?;
+    let meta_text =
+        serde_json::to_string(meta).map_err(|e| format!("failed to encode bundle: {e}"))?;
+    write_stage_file(
+        stage,
+        "meta.json",
+        crate::upload::php_escape_json_text(&meta_text, true).as_bytes(),
+    )?;
+    for (index, corpus) in hunks.iter().enumerate() {
+        // Corpora ride as transport; members carry raw bytes, like PHP.
+        let raw = crate::patch::untransport_bytes(corpus);
+        write_stage_file(stage, &format!("hunks/{index}"), &raw)?;
+    }
+    for (phid, blob) in blobs {
+        write_stage_file(stage, &format!("blobs/{phid}"), blob)?;
+    }
+    create_tar(stage, out)
 }
 
 /// Resolve the bundle output path against `dir` when relative.
@@ -1258,10 +1273,8 @@ fn local_file_modes(
 ) -> std::collections::BTreeMap<String, String> {
     let mut modes = std::collections::BTreeMap::new();
     // Chunked: huge diffs would overflow the command line otherwise.
+    // (`chunks()` never yields an empty chunk, so no guard is needed.)
     for chunk in paths.chunks(500) {
-        if chunk.is_empty() {
-            continue;
-        }
         let mut args: Vec<&str> = vec!["ls-tree", "-z", revision, "--"];
         args.extend(chunk.iter().map(String::as_str));
         let Ok(out) = crate::git::output(dir, &args) else {
@@ -1271,23 +1284,29 @@ fn local_file_modes(
             continue;
         }
         for entry in out.stdout.split(|byte| *byte == 0) {
-            // `100644 blob <sha>\t<name>`.
-            let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
-                continue;
-            };
-            let (meta, name) = entry.split_at(tab);
-            let mut meta = meta.split(|byte| *byte == b' ');
-            let (Some(mode), Some(_kind)) = (meta.next(), meta.next()) else {
-                continue;
-            };
-            if let (Ok(mode), Ok(name)) =
-                (std::str::from_utf8(mode), std::str::from_utf8(&name[1..]))
-            {
-                modes.insert(name.to_string(), mode.to_string());
+            if let Some((name, mode)) = ls_tree_entry_mode(entry) {
+                modes.insert(name, mode);
             }
         }
     }
     modes
+}
+
+/// Parse one `-z` `ls-tree` entry (`<mode> SP <type> SP <sha> TAB
+/// <name>`) into `(name, mode)`. Malformed entries yield `None` (the
+/// render falls back to `100644`). Split out so corrupt entries —
+/// which real `git` never emits — stay unit-testable.
+fn ls_tree_entry_mode(entry: &[u8]) -> Option<(String, String)> {
+    let tab = entry.iter().position(|byte| *byte == b'\t')?;
+    let (meta, name) = entry.split_at(tab);
+    let mut meta = meta.split(|byte| *byte == b' ');
+    let (Some(mode), Some(_kind)) = (meta.next(), meta.next()) else {
+        return None;
+    };
+    match (std::str::from_utf8(mode), std::str::from_utf8(&name[1..])) {
+        (Ok(mode), Ok(name)) => Some((name.to_string(), mode.to_string())),
+        _ => None,
+    }
 }
 
 /// Convert parsed local changes for rendering. Modes come from `ls-tree`
@@ -2126,10 +2145,15 @@ pub fn execute_bytes(dir: &Path, argv: &[String]) -> Result<Vec<u8>, String> {
 }
 
 pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
-    use std::io::Write;
+    run_in_with(dir, argv, &mut std::io::stdout())
+}
+
+/// [`run_in`] over an explicit sink, so the stdout-failure arm (only
+/// reachable with a closed/broken stdout) stays unit-testable.
+fn run_in_with(dir: &Path, argv: &[String], out: &mut dyn std::io::Write) -> ExitCode {
     match execute_bytes(dir, argv) {
         Ok(bytes) => {
-            if std::io::stdout().write_all(&bytes).is_err() {
+            if out.write_all(&bytes).is_err() {
                 eprintln!("arc {NAME}: failed to write output");
                 return ExitCode::FAILURE;
             }

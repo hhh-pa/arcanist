@@ -115,10 +115,19 @@ fn command_for(dir: &Path, svn: &SvnCommand, args: &[&str]) -> std::process::Com
 /// (parallel tests, an editor saving a hook); the error is transient by
 /// nature, so retry bounded, then return the last error unchanged.
 fn spawn_output(cmd: &mut std::process::Command) -> Result<std::process::Output, std::io::Error> {
+    spawn_output_retry(cmd, &is_text_file_busy)
+}
+
+/// Retry loop with an injectable busy predicate, so tests can force the
+/// ETXTBSY path where the platform never reports it (macOS, Windows).
+fn spawn_output_retry(
+    cmd: &mut std::process::Command,
+    is_busy: &dyn Fn(&std::io::Error) -> bool,
+) -> Result<std::process::Output, std::io::Error> {
     let mut attempt = 0;
     loop {
         match cmd.output() {
-            Err(error) if is_text_file_busy(&error) && attempt < 50 => {
+            Err(error) if is_busy(&error) && attempt < 50 => {
                 attempt += 1;
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
@@ -1763,7 +1772,12 @@ pub fn select_svn_locale(locales_output: &str) -> &'static str {
 /// `en_US.utf8` when the probe fails. PHP swallows probe errors the same
 /// way; Windows callers pass no locale at all (PHP skips `LANG` there).
 pub fn svn_lang_env_var() -> &'static str {
-    let output = crate::proc_env::command("locale").arg("-a").output();
+    lang_env_var_from_probe(crate::proc_env::command("locale").arg("-a").output())
+}
+
+/// Map a `locale -a` probe result to the commit `LANG`: probe failures
+/// fall back, like PHP.
+fn lang_env_var_from_probe(output: Result<std::process::Output, std::io::Error>) -> &'static str {
     match output {
         Ok(out) if out.status.success() => select_svn_locale(&String::from_utf8_lossy(&out.stdout)),
         _ => "en_US.utf8",

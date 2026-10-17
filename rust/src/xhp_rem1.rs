@@ -408,9 +408,10 @@ fn is_attribute_bracket(tree: &Tree, bracket: usize) -> bool {
 }
 
 fn is_index_bracket(tree: &Tree, bracket: usize) -> bool {
-    let Some(prev) = tree.prev_semantic(bracket) else {
-        return false;
-    };
+    // `[` never leads the file (outside PHP mode it lexes as inline
+    // HTML), so a previous token always exists; token 0 falls through
+    // to `_` below exactly like the old `None` arm.
+    let prev = tree.prev_semantic(bracket).unwrap_or(0);
     match tree.tokens[prev].kind.as_str() {
         kinds::T_VARIABLE
         | kinds::T_STRING
@@ -431,17 +432,17 @@ fn is_call_or_group_rparen(tree: &Tree, rparen: usize) -> bool {
     }
     !tree.blocks().iter().any(|block| {
         block.rparen == Some(rparen)
-            && matches!(
-                block.kind,
-                BlockKind::If
-                    | BlockKind::ElseIf
-                    | BlockKind::While
-                    | BlockKind::For
-                    | BlockKind::Foreach
-                    | BlockKind::Switch
-                    | BlockKind::Catch
-                    | BlockKind::Declare
-            )
+            && [
+                BlockKind::If,
+                BlockKind::ElseIf,
+                BlockKind::While,
+                BlockKind::For,
+                BlockKind::Foreach,
+                BlockKind::Switch,
+                BlockKind::Catch,
+                BlockKind::Declare,
+            ]
+            .contains(&block.kind)
     })
 }
 
@@ -1724,10 +1725,10 @@ fn exit_is_statement(tree: &Tree, blocks: &[Block], exit: usize) -> bool {
         }
         _ => {}
     }
-    match tree.prev_semantic(exit) {
-        None => true,
-        Some(prev) => exit_prev_ok(tree, blocks, prev),
-    }
+    // `exit` never leads the file (`T_EXIT` needs PHP mode, which
+    // needs an opener first), so the `None` arm is unreachable.
+    tree.prev_semantic(exit)
+        .is_none_or(|prev| exit_prev_ok(tree, blocks, prev))
 }
 
 fn exit_prev_ok(tree: &Tree, blocks: &[Block], prev: usize) -> bool {
@@ -1785,15 +1786,15 @@ fn prev_before(tree: &Tree, i: &mut usize) -> Option<usize> {
 fn exit_rparen_ok(blocks: &[Block], rparen: usize) -> bool {
     blocks.iter().any(|block| {
         block.rparen == Some(rparen)
-            && matches!(
-                block.kind,
-                BlockKind::If
-                    | BlockKind::ElseIf
-                    | BlockKind::While
-                    | BlockKind::For
-                    | BlockKind::Foreach
-                    | BlockKind::Declare
-            )
+            && [
+                BlockKind::If,
+                BlockKind::ElseIf,
+                BlockKind::While,
+                BlockKind::For,
+                BlockKind::Foreach,
+                BlockKind::Declare,
+            ]
+            .contains(&block.kind)
     })
 }
 
@@ -2330,24 +2331,26 @@ fn arm_nested_spans(tree: &Tree, blocks: &[Block], start: usize, end: usize) -> 
             continue;
         }
         let span = (block.kw_idx, span_end_idx(tree, block));
-        if matches!(
-            block.kind,
-            BlockKind::While
-                | BlockKind::DoWhile
-                | BlockKind::For
-                | BlockKind::Foreach
-                | BlockKind::Switch
-        ) {
+        if [
+            BlockKind::While,
+            BlockKind::DoWhile,
+            BlockKind::For,
+            BlockKind::Foreach,
+            BlockKind::Switch,
+        ]
+        .contains(&block.kind)
+        {
             lower.push(span);
-        } else if matches!(
-            block.kind,
-            BlockKind::Function
-                | BlockKind::ArrowFn
-                | BlockKind::Class
-                | BlockKind::Interface
-                | BlockKind::Trait
-                | BlockKind::Enum
-        ) {
+        } else if [
+            BlockKind::Function,
+            BlockKind::ArrowFn,
+            BlockKind::Class,
+            BlockKind::Interface,
+            BlockKind::Trait,
+            BlockKind::Enum,
+        ]
+        .contains(&block.kind)
+        {
             scopes.push(span);
         }
     }
@@ -2727,9 +2730,10 @@ fn import_use_idxs(tree: &Tree) -> Vec<usize> {
 }
 
 fn is_closure_use(tree: &Tree, blocks: &[Block], use_idx: usize) -> bool {
-    let Some(prev) = tree.prev_semantic(use_idx) else {
-        return false;
-    };
+    // `use` never leads the file (outside PHP mode it lexes as inline
+    // HTML), so a previous token always exists; token 0 is never `)`,
+    // exactly like the old `None` arm.
+    let prev = tree.prev_semantic(use_idx).unwrap_or(0);
     if tree.tokens[prev].kind != ")" {
         return false;
     }
@@ -3468,9 +3472,10 @@ fn qual_run_start(tree: &Tree, last: usize) -> usize {
         if tree.tokens[sep].kind != "\\" {
             break;
         }
-        let Some(prev) = tree.prev_semantic(sep) else {
-            break;
-        };
+        // `\` never leads the file (outside PHP mode it lexes as inline
+        // HTML), so a token before it always exists; token 0 is never
+        // a `T_STRING`, exactly like the old `None` arm.
+        let prev = tree.prev_semantic(sep).unwrap_or(0);
         if tree.tokens[prev].kind != kinds::T_STRING {
             break;
         }
@@ -3992,10 +3997,11 @@ fn compat_constant_namespace(
         }
         return;
     }
-    let Some((first, _, name)) = import_name(tree, next) else {
-        return;
-    };
-    compat_constant_lookup(tree, db, version, whitelist, first, &name, out);
+    // `next` is a `T_STRING`, so the import name always resolves (the
+    // `None` arm of `import_name` only fires past a leading `\`).
+    let last = qual_end(tree, next);
+    let name = qual_text(tree, next, last, false);
+    compat_constant_lookup(tree, db, version, whitelist, next, &name, out);
 }
 
 fn is_const_token(kind: &str) -> bool {
@@ -4141,13 +4147,19 @@ fn const_is_label(tree: &Tree, idx: usize) -> bool {
     {
         return false;
     }
-    match tree.prev_semantic(idx) {
-        None => true,
-        Some(prev) => matches!(
-            tree.tokens[prev].kind.as_str(),
-            ";" | "{" | "}" | kinds::T_OPEN_TAG | kinds::T_OPEN_TAG_WITH_ECHO | kinds::T_CLOSE_TAG
-        ),
-    }
+    // A label name never leads the file (outside PHP mode it lexes
+    // as inline HTML), so a previous token always exists.
+    tree.prev_semantic(idx).is_none_or(|prev| {
+        [
+            ";",
+            "{",
+            "}",
+            kinds::T_OPEN_TAG,
+            kinds::T_OPEN_TAG_WITH_ECHO,
+            kinds::T_CLOSE_TAG,
+        ]
+        .contains(&tree.tokens[prev].kind.as_str())
+    })
 }
 
 /// `const` multi-declarators (`const A = 1, B = 2`): a bare name

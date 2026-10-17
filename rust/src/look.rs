@@ -727,12 +727,20 @@ fn env_tz_offset(tz: &str, now: i64) -> i64 {
 
 /// Offset with `TZ` unset or empty: the system zone database, else UTC.
 fn system_tz_offset(now: i64) -> i64 {
-    if let Ok(bytes) = std::fs::read("/etc/localtime")
-        && let Some(offset) = tzif_offset(&bytes, now)
+    let localtime = std::fs::read("/etc/localtime").ok();
+    let timezone = std::fs::read_to_string("/etc/timezone").ok();
+    system_tz_offset_from(localtime.as_deref(), timezone.as_deref(), now)
+}
+
+/// [`system_tz_offset`] over already-read file contents, so the
+/// missing/corrupt fallbacks stay testable without touching `/etc`.
+fn system_tz_offset_from(localtime: Option<&[u8]>, timezone: Option<&str>, now: i64) -> i64 {
+    if let Some(bytes) = localtime
+        && let Some(offset) = tzif_offset(bytes, now)
     {
         return offset;
     }
-    if let Ok(name) = std::fs::read_to_string("/etc/timezone") {
+    if let Some(name) = timezone {
         let name = name.trim();
         if !name.is_empty()
             && let Some(offset) = files_tz_offset(&tz_file_candidates(name), now)

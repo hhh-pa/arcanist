@@ -239,15 +239,25 @@ fn merged_source_label(source: &str, dir: &Path) -> &'static str {
         },
         get_config::SOURCE_PROJECT => "project (.arcconfig)",
         get_config::SOURCE_USER => "user (~/.arcrc)",
-        get_config::SOURCE_SYSTEM => {
-            if cfg!(windows) {
-                "system (ProgramData\\Phabricator\\Arcanist\\config)"
-            } else {
-                "system (/etc/arcconfig)"
-            }
-        }
+        get_config::SOURCE_SYSTEM => system_source_label(),
         _ => "default",
     }
+}
+
+/// Display label for system-source values: the platform config path.
+/// Split per platform (rather than `cfg!`) so each build only carries
+/// its own reachable arm.
+#[cfg(windows)]
+fn system_source_label() -> &'static str {
+    "system (ProgramData\\Phabricator\\Arcanist\\config)"
+}
+
+/// Display label for system-source values: the platform config path.
+/// Split per platform (rather than `cfg!`) so each build only carries
+/// its own reachable arm.
+#[cfg(not(windows))]
+fn system_source_label() -> &'static str {
+    "system (/etc/arcconfig)"
 }
 
 /// Whether `user_file` (a `~/.arcrc`) holds a token for `uri`. Missing
@@ -785,15 +795,7 @@ impl<'a> Engine<'a> {
             .project_root
             .clone()
             .unwrap_or_else(|| self.dir.to_path_buf());
-        let mut cmd = if cfg!(windows) {
-            let mut cmd = crate::proc_env::command("cmd");
-            cmd.arg("/C").arg(command);
-            cmd
-        } else {
-            let mut cmd = crate::proc_env::command("sh");
-            cmd.arg("-c").arg(command);
-            cmd
-        };
+        let mut cmd = shell_command(command);
         let out = cmd.current_dir(&cwd).output().ok()?;
         if !out.status.success() {
             return None;
@@ -948,6 +950,26 @@ impl<'a> Engine<'a> {
         }
         Ok(None)
     }
+}
+
+/// Shell for an `exec(...)` rule body: `cmd /C` on Windows, `sh -c`
+/// elsewhere. Split per platform (rather than `cfg!`) so each build
+/// only carries its own reachable arm.
+#[cfg(windows)]
+fn shell_command(command: &str) -> std::process::Command {
+    let mut cmd = crate::proc_env::command("cmd");
+    cmd.arg("/C").arg(command);
+    cmd
+}
+
+/// Shell for an `exec(...)` rule body: `cmd /C` on Windows, `sh -c`
+/// elsewhere. Split per platform (rather than `cfg!`) so each build
+/// only carries its own reachable arm.
+#[cfg(not(windows))]
+fn shell_command(command: &str) -> std::process::Command {
+    let mut cmd = crate::proc_env::command("sh");
+    cmd.arg("-c").arg(command);
+    cmd
 }
 
 /// Strip one `prefix...suffix` wrapper (greedy inner, like `(.*)`).
@@ -1352,12 +1374,13 @@ fn read_scratch_file(dir: &Path) -> String {
 }
 
 fn write_scratch_file(dir: &Path, value: &str) {
-    if let Some(file) = scratch_file(dir) {
-        if let Some(parent) = file.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        std::fs::write(file, value).ok();
-    }
+    let Some(file) = scratch_file(dir) else {
+        return;
+    };
+    // The scratch path always nests under `arc/`, so it always has a
+    // parent; `dir` is an unreachable fallback for totality.
+    std::fs::create_dir_all(file.parent().unwrap_or(dir)).ok();
+    std::fs::write(file, value).ok();
 }
 
 /// The `getLocalCommitInformation()` log format (T1153 RB-D18, Rule 0:
@@ -1556,9 +1579,9 @@ pub fn revision_id_from_corpus(corpus: &str) -> Result<Option<String>, String> {
         }
     }
     for start in starts {
-        let Some(rest) = corpus.get(start..) else {
-            continue;
-        };
+        // Every start is 0 or just past a `\n`, so always a boundary
+        // at or below the length; the fallback never fires.
+        let rest = corpus.get(start..).unwrap_or("");
         if rest.len() < PREFIX.len() {
             continue;
         }
@@ -2414,11 +2437,10 @@ impl Parser {
         Step::Handled
     }
 
-    fn consume_rest(&mut self, iter: &mut ArgIter<'_>) -> Option<Step> {
+    fn consume_rest(&mut self, iter: &mut ArgIter<'_>) {
         for rest in iter.by_ref() {
             self.commits.push(rest.clone());
         }
-        None
     }
 
     fn tail(&mut self, arg: &str, iter: &mut ArgIter<'_>) -> Step {
@@ -2438,9 +2460,7 @@ impl Parser {
             return Step::Done(Parsed::Help);
         }
         if arg == "--" {
-            if let Some(step) = self.consume_rest(iter) {
-                return step;
-            }
+            self.consume_rest(iter);
             return Step::Handled;
         }
         if arg.starts_with('-') {
@@ -2537,37 +2557,49 @@ pub fn run(argv: &[String]) -> ExitCode {
         Parsed::Options(options) => options,
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    // T1153 RB-D16: the working-copy gate runs before conduit setup
-    // (`scripts/arcanist.php:260-266` at ceb).
-    if !git::is_inside_work_tree(&cwd) {
-        return conduit::report(EnvelopeKind::Usage, WORKING_COPY_REQUIRED);
-    }
     let user_file = config::arcrc_path();
     let opts = get_config::LoadOptions::default();
+    run_in(&cwd, &options, user_file.as_deref(), &opts)
+}
+
+/// [`run`] with an injected working directory, user file, and load
+/// options, so tests can drive the gate, authentication, and dispatch
+/// without ambient state.
+fn run_in(
+    cwd: &Path,
+    options: &Options,
+    user_file: Option<&Path>,
+    opts: &get_config::LoadOptions,
+) -> ExitCode {
+    // T1153 RB-D16: the working-copy gate runs before conduit setup
+    // (`scripts/arcanist.php:260-266` at ceb).
+    if !git::is_inside_work_tree(cwd) {
+        return conduit::report(EnvelopeKind::Usage, WORKING_COPY_REQUIRED);
+    }
     // T1153 RB-D17: conduit plus authentication come next
     // (`requiresConduit()`/`requiresAuthentication()`), even for
     // `--show-base`, which never reaches the repository section.
     let client = match config::authed_client_for(
         options.conduit_uri.as_deref(),
-        &cwd,
-        user_file.as_deref(),
-        &opts,
+        cwd,
+        user_file,
+        opts,
         &config::command_description(),
     ) {
         Ok(client) => client,
         Err(error) => return error.report(),
     };
-    let merged = match get_config::load_merged(&cwd, user_file.as_deref(), &opts) {
+    let merged = match get_config::load_merged(cwd, user_file, opts) {
         Ok(merged) => merged,
         Err(message) => return conduit::report(EnvelopeKind::Exception, &message),
     };
     if options.json {
-        return run_json(&cwd, user_file.as_deref(), &options, &merged, &client);
+        return run_json(cwd, user_file, options, &merged, &client);
     }
     if options.show_base {
-        return run_show_base(&cwd, &options, &merged);
+        return run_show_base(cwd, options, &merged);
     }
-    run_text(&cwd, &options, &merged, &client)
+    run_text(cwd, options, &merged, &client)
 }
 
 /// The text report, printed in stages like `run()` at
