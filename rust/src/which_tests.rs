@@ -1835,3 +1835,273 @@ fn rbd16_range_section_bytes() {
         render_range(&empty, "", None, false)
     );
 }
+
+// -( Wave 6 coverage: staged runners, separator, log failure, author arms )----
+
+fn options_of(argv: &[&str]) -> Options {
+    let owned: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+    match parse_args(&owned) {
+        Parsed::Options(opts) => opts,
+        Parsed::Help => panic!("unexpected help for {argv:?}"),
+        Parsed::Error(message) => panic!("unexpected parse error for {argv:?}: {message}"),
+    }
+}
+
+fn callsign_merged(name: &str) -> get_config::MergedConfig {
+    merged_with(
+        "repository.callsign",
+        serde_json::Value::String(name.to_string()),
+        "project",
+    )
+}
+
+fn authed_client(base: &str) -> conduit::Client {
+    let client = mock_client(base);
+    client.set_authenticated_user("alice", "PHID-USER-1");
+    client
+}
+
+const UNIQUE_REPO: &str =
+    "{\"error_code\": null, \"result\": [{\"name\": \"demo\", \"callsign\": \"X\"}]}";
+
+#[test]
+fn w6_run_text_reports_success() {
+    // Single commit: the empty-tree base needs no prompt; the mock
+    // answers `repository.query` plus `differential.query` (no match).
+    let repo = fresh_repo("w6text");
+    commit(&repo.path, "a.txt");
+    let (base, _seen) = serve_script(vec![UNIQUE_REPO, "{\"error_code\": null, \"result\": []}"]);
+    let client = authed_client(&base);
+    let options = options_of(&[]);
+    assert_eq!(
+        run_text(&repo.path, &options, &callsign_merged("X"), &client),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
+#[test]
+fn w6_run_text_usage_error_on_bad_callsign() {
+    // A non-string callsign fails association before any conduit
+    // call, routing through the usage arm of `report_which_error`.
+    let repo = fresh_repo("w6assocuse");
+    commit(&repo.path, "a.txt");
+    let merged = merged_with("repository.callsign", serde_json::json!(123), "project");
+    let (base, seen) = serve_script(vec![]);
+    let client = authed_client(&base);
+    let options = options_of(&[]);
+    assert_eq!(
+        run_text(&repo.path, &options, &merged, &client),
+        std::process::ExitCode::FAILURE
+    );
+    assert!(seen.try_recv().is_err());
+}
+
+#[test]
+fn w6_run_text_exception_on_conduit_error() {
+    // Other conduit failures propagate through the generic arm of
+    // `report_which_error`.
+    let repo = fresh_repo("w6assocgen");
+    commit(&repo.path, "a.txt");
+    let (base, _seen) = serve_script(vec![
+        "{\"error_code\": \"ERR-INVALID-AUTH\", \"error_info\": \"bad token\"}",
+    ]);
+    let client = authed_client(&base);
+    let options = options_of(&[]);
+    assert_eq!(
+        run_text(&repo.path, &options, &callsign_merged("X"), &client),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn w6_run_text_rejects_two_commits() {
+    // The count check runs after the repository section prints.
+    let repo = fresh_repo("w6many");
+    commit(&repo.path, "a.txt");
+    let (base, _seen) = serve_script(vec![UNIQUE_REPO]);
+    let client = authed_client(&base);
+    let options = options_of(&["a", "b"]);
+    assert_eq!(
+        run_text(&repo.path, &options, &callsign_merged("X"), &client),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn w6_run_text_range_error() {
+    // An unknown explicit base fails after the repository section.
+    let repo = fresh_repo("w6range");
+    commit(&repo.path, "a.txt");
+    let (base, _seen) = serve_script(vec![UNIQUE_REPO]);
+    let client = authed_client(&base);
+    let options = options_of(&["no-such-rev"]);
+    assert_eq!(
+        run_text(&repo.path, &options, &callsign_merged("X"), &client),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn w6_run_text_revisions_error() {
+    // A malformed footer fails matching after the range prints; the
+    // failure lands before any `differential.query` call.
+    let repo = fresh_repo("w6rev");
+    commit(&repo.path, "a.txt");
+    std::fs::write(repo.path.join("b.txt"), "x\n").unwrap();
+    git(&repo.path, &["add", "b.txt"]);
+    git(
+        &repo.path,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "second",
+            "-m",
+            "Differential Revision: nope",
+        ],
+    );
+    let (base, _seen) = serve_script(vec![UNIQUE_REPO]);
+    let client = authed_client(&base);
+    let options = options_of(&["HEAD~1"]);
+    assert_eq!(
+        run_text(&repo.path, &options, &callsign_merged("X"), &client),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn w6_run_show_base_prints_base() {
+    // `--show-base` needs no conduit: the explicit base prints.
+    let repo = fresh_repo("w6show");
+    commit(&repo.path, "a.txt");
+    commit(&repo.path, "b.txt");
+    let options = options_of(&["HEAD~1"]);
+    assert_eq!(
+        run_show_base(&repo.path, &options, &empty_loaded()),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
+#[test]
+fn w6_run_show_base_rejects_two_commits() {
+    let repo = fresh_repo("w6showmany");
+    commit(&repo.path, "a.txt");
+    let options = options_of(&["a", "b"]);
+    assert_eq!(
+        run_show_base(&repo.path, &options, &empty_loaded()),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn w6_run_show_base_resolve_error() {
+    let repo = fresh_repo("w6showerr");
+    commit(&repo.path, "a.txt");
+    let options = options_of(&["no-such-rev"]);
+    assert_eq!(
+        run_show_base(&repo.path, &options, &empty_loaded()),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn w6_run_json_reports_success() {
+    // Like the text success path, but through the whole-context load.
+    let repo = fresh_repo("w6json");
+    commit(&repo.path, "a.txt");
+    let (base, _seen) = serve_script(vec![UNIQUE_REPO, "{\"error_code\": null, \"result\": []}"]);
+    let client = authed_client(&base);
+    let options = options_of(&[]);
+    assert_eq!(
+        run_json(&repo.path, None, &options, &callsign_merged("X"), &client),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
+#[test]
+fn w6_run_json_rejects_two_commits() {
+    // The count check runs before the context load: no conduit call.
+    let repo = fresh_repo("w6jsonmany");
+    commit(&repo.path, "a.txt");
+    let (base, seen) = serve_script(vec![]);
+    let client = authed_client(&base);
+    let options = options_of(&["a", "b"]);
+    assert_eq!(
+        run_json(&repo.path, None, &options, &empty_loaded(), &client),
+        std::process::ExitCode::FAILURE
+    );
+    assert!(seen.try_recv().is_err());
+}
+
+#[test]
+fn w6_run_json_context_error_outside_repo() {
+    // Outside a working copy the gate error wins before any call.
+    let plain = TempDir::new("w6jsonplain");
+    let (base, seen) = serve_script(vec![]);
+    let client = authed_client(&base);
+    let options = options_of(&[]);
+    assert_eq!(
+        run_json(&plain.path, None, &options, &empty_loaded(), &client),
+        std::process::ExitCode::FAILURE
+    );
+    assert!(seen.try_recv().is_err());
+}
+
+#[test]
+fn w6_double_dash_collects_positionals() {
+    // Everything after `--` is a positional, even flag shapes.
+    match parse_args(&["--".to_string(), "abc123".to_string(), "--head".to_string()]) {
+        Parsed::Options(opts) => assert_eq!(
+            opts.commits,
+            vec!["abc123".to_string(), "--head".to_string()]
+        ),
+        _ => panic!("expected options"),
+    }
+}
+
+#[test]
+fn w6_local_log_failure_reports_command() {
+    // An unresolvable base fails `git log` like `execxLocal`: the
+    // `CommandException` text names the command and exit code.
+    let repo = fresh_repo("w6logfail");
+    commit(&repo.path, "a.txt");
+    let err = match local_commit_information(&repo.path, "zzz-no-such-rev", "HEAD") {
+        Ok(_) => panic!("expected log failure"),
+        Err(message) => message,
+    };
+    assert!(
+        err.starts_with(
+            "Command failed with error #128!\nCOMMAND\ngit log HEAD --not zzz-no-such-rev"
+        ),
+        "{err}"
+    );
+    assert!(!is_usage_message(&err));
+}
+
+#[test]
+fn w6_matching_renders_other_authors() {
+    // `ArcanistWhichWorkflow.php:228` at ceb: other authors render
+    // `    D9 (name) title`.
+    let mut revision = matched("D1");
+    revision.author = Some("bob".to_string());
+    let text = render_matching(&[revision], "", false);
+    assert!(text.contains("    D1 (bob) title\n"), "{text}");
+}
+
+#[test]
+fn w6_json_carries_matching_revisions() {
+    // `--json` is an arc-rs extension: each match carries its
+    // monogram, title, author, and reason.
+    let mut revision = matched("D7");
+    revision.author = Some("bob".to_string());
+    let ctx = ansi_context(vec![revision]);
+    assert_eq!(
+        report_json(&ctx)["matching"],
+        serde_json::json!([{
+            "revision": "D7",
+            "title": "title",
+            "author": "bob",
+            "why": "reason",
+        }])
+    );
+}
