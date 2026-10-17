@@ -4752,45 +4752,64 @@ pub fn unquote_git_path(path: &str) -> String {
             out.push(ch);
             continue;
         }
-        match chars.next() {
-            Some('n') => {
-                flush_transport_pending(&mut out, &mut pending);
-                out.push('\n');
-            }
-            Some('t') => {
-                flush_transport_pending(&mut out, &mut pending);
-                out.push('\t');
-            }
-            Some('r') => {
-                flush_transport_pending(&mut out, &mut pending);
-                out.push('\r');
-            }
-            Some(other) => {
-                if other.is_ascii_digit() {
-                    let mut octal = String::from(other);
-                    octal.push(chars.next().unwrap_or('0'));
-                    octal.push(chars.next().unwrap_or('0'));
-                    if let Ok(byte) = u8::from_str_radix(&octal, 8) {
-                        if byte < 0x80 {
-                            flush_transport_pending(&mut out, &mut pending);
-                            out.push(byte as char);
-                        } else {
-                            pending.push(byte);
-                        }
-                    }
-                } else {
-                    flush_transport_pending(&mut out, &mut pending);
-                    out.push(other);
-                }
-            }
-            None => {
-                flush_transport_pending(&mut out, &mut pending);
-                out.push('\\');
-            }
-        }
+        push_unquoted_escape(&mut out, &mut pending, &mut chars);
     }
     flush_transport_pending(&mut out, &mut pending);
     out
+}
+
+/// Consume one escape sequence after a backslash: `n`/`t`/`r` map to
+/// control chars, octal triplets buffer raw bytes (ASCII ones flush
+/// through immediately), anything else — or a trailing backslash —
+/// passes through literally.
+fn push_unquoted_escape(out: &mut String, pending: &mut Vec<u8>, chars: &mut std::str::Chars<'_>) {
+    match chars.next() {
+        Some('n') => {
+            flush_transport_pending(out, pending);
+            out.push('\n');
+        }
+        Some('t') => {
+            flush_transport_pending(out, pending);
+            out.push('\t');
+        }
+        Some('r') => {
+            flush_transport_pending(out, pending);
+            out.push('\r');
+        }
+        Some(other) => push_unquoted_char(out, pending, chars, other),
+        None => {
+            flush_transport_pending(out, pending);
+            out.push('\\');
+        }
+    }
+}
+
+/// Emit a non-trivial escape payload: an octal digit starts a triplet
+/// (ASCII bytes flush through, high bytes buffer for joint decoding),
+/// any other char passes through literally.
+fn push_unquoted_char(
+    out: &mut String,
+    pending: &mut Vec<u8>,
+    chars: &mut std::str::Chars<'_>,
+    other: char,
+) {
+    if !other.is_ascii_digit() {
+        flush_transport_pending(out, pending);
+        out.push(other);
+        return;
+    }
+    let mut octal = String::from(other);
+    octal.push(chars.next().unwrap_or('0'));
+    octal.push(chars.next().unwrap_or('0'));
+    let Ok(byte) = u8::from_str_radix(&octal, 8) else {
+        return;
+    };
+    if byte < 0x80 {
+        flush_transport_pending(out, pending);
+        out.push(byte as char);
+    } else {
+        pending.push(byte);
+    }
 }
 
 /// Flush buffered high bytes as transport (valid sequences decode
