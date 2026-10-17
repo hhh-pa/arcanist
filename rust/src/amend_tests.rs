@@ -38,6 +38,8 @@ impl Drop for TempDir {
     }
 }
 
+// Unix-only: the sole caller chain serves the chmod-needing hook test below.
+#[cfg(unix)]
 fn git(dir: &std::path::Path, argv: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .current_dir(dir)
@@ -53,6 +55,7 @@ fn git(dir: &std::path::Path, argv: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+#[cfg(unix)]
 fn amend_repo(tag: &str) -> TempDir {
     let tmp = TempDir::new(tag);
     git(tmp.path(), &["init", "-q", "-b", "master"]);

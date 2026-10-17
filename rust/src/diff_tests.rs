@@ -808,10 +808,8 @@ fn g1_confirm_prompt_helpers() {
 }
 
 #[test]
+#[cfg(unix)] // PHP has no TTY gate without posix_isatty (Windows).
 fn g1_prompt_confirm_requires_tty() {
-    // PHP has no TTY gate without posix_isatty (Windows).
-    #[cfg(not(unix))]
-    return;
     // Interactive session: the TTY gate cannot fail deterministically
     // (it would block on input), so an interactive run checks nothing.
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
