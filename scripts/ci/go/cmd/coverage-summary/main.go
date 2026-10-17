@@ -12,7 +12,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/m-hu/arcanist/scripts/ci/go/internal/lcov"
+	"github.com/hhh-pa/arcanist/scripts/ci/go/internal/lcov"
 )
 
 // Must match the floor enforced by rust-quality-gates (the

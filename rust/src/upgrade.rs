@@ -449,7 +449,7 @@ pub fn report_json(status: &Status) -> serde_json::Value {
 /// Default release repository: the fork whose GitHub releases carry
 /// the `arc` binaries. Checkouts whose `fork` (else `origin`)
 /// remote points at another `github.com` repo use that repo instead.
-pub const DEFAULT_RELEASE_REPO: &str = "m-hu/arcanist";
+pub const DEFAULT_RELEASE_REPO: &str = "hhh-pa/arcanist";
 
 /// GitHub REST API base for release lookups. Every network seam takes
 /// this as a parameter so tests can point it at a local mock server.

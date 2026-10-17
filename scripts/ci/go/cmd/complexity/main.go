@@ -20,8 +20,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/m-hu/arcanist/scripts/ci/go/internal/executil"
-	"github.com/m-hu/arcanist/scripts/ci/go/internal/pyjson"
+	"github.com/hhh-pa/arcanist/scripts/ci/go/internal/executil"
+	"github.com/hhh-pa/arcanist/scripts/ci/go/internal/pyjson"
 )
 
 const usage = `rust-code-analysis gate (T968): fail on new/worsened complexity violations.
