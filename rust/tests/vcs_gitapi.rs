@@ -411,6 +411,19 @@ fn raw_commit_round_trip() {
 }
 
 #[test]
+fn write_raw_commit_outside_repo_fails_deterministically() {
+    // Outside a repository git exits before reading stdin; the write
+    // must surface the canonical status error, never a racy EPIPE
+    // (T1170: Linux CI saw EPIPE, macOS the status).
+    let dir = TempDir::new("norawcommit");
+    let raw = git::RawCommit::new_empty_commit();
+    assert_eq!(
+        git::write_raw_commit(dir.path(), &raw).unwrap_err(),
+        "git hash-object failed"
+    );
+}
+
+#[test]
 fn stage_commit_and_amend_flow() {
     let repo = init_repo("commitflow");
     let dir = repo.path();

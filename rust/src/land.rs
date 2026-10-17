@@ -4798,12 +4798,20 @@ fn git_write_raw_commit(dir: &Path, raw: &RawCommit) -> Result<String, String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to run git: {e}"))?;
-    child
+    match child
         .stdin
         .as_mut()
         .ok_or_else(|| "failed to write raw commit".to_string())?
         .write_all(blob.as_bytes())
-        .map_err(|e| format!("failed to write raw commit: {e}"))?;
+    {
+        Ok(()) => {}
+        // git exited before reading stdin (e.g. its fatal fired
+        // outside a repo): fall through to the exit-status check for
+        // the canonical error instead of this scheduling-dependent
+        // EPIPE (Linux CI hit EPIPE, macOS the status).
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => return Err(format!("failed to write raw commit: {e}")),
+    }
     let output = child
         .wait_with_output()
         .map_err(|e| format!("failed to run git: {e}"))?;

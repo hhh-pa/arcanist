@@ -2266,9 +2266,13 @@ pub fn write_raw_commit(dir: &Path, commit: &RawCommit) -> Result<String, String
         .map_err(|e| format!("failed to run git: {e}"))?;
     if let Some(stdin) = child.stdin.take() {
         let mut stdin = stdin;
-        stdin
-            .write_all(commit.get_raw_blob().as_bytes())
-            .map_err(|e| format!("failed to write raw commit: {e}"))?;
+        match stdin.write_all(commit.get_raw_blob().as_bytes()) {
+            Ok(()) => {}
+            // Same EPIPE tolerance as land.rs: git may exit before
+            // reading stdin; the status check below reports it.
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => return Err(format!("failed to write raw commit: {e}")),
+        }
     }
     let out = child
         .wait_with_output()

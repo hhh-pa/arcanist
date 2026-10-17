@@ -6163,12 +6163,15 @@ fn t1170_apply_patch_svn_from_dicts() {
         hg: hg::HgCommand::system(),
         svn: fake_svn_backend(&dir),
     };
+    // `mut` feeds the unix-only symlink pushes below; unused on Windows.
+    #[allow(unused_mut)]
     let mut dicts = vec![
         serde_json::json!({"type": 2, "fileType": 1, "oldPath": "v.txt", "currentPath": "v.txt",
             "oldProperties": {}, "newProperties": {}}),
         serde_json::json!({"type": 1, "fileType": 1, "currentPath": "touched.txt",
             "oldProperties": {}, "newProperties": {}}),
     ];
+    #[allow(unused_mut)]
     let mut corpora = vec![vec![parsed_hunk(1, 1, 1, 1, "-a\n+b\n")], Vec::new()];
     #[cfg(unix)]
     {
