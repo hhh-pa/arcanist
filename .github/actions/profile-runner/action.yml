@@ -8,10 +8,12 @@ description: >
 inputs:
   cache-key:
     description: >
-      Full cache key for the prebuilt profiler binary, including the OS,
-      the calling job (each job owns its entry, so concurrent same-OS
-      jobs never contend on one key), and the Go source hash, e.g.
-      runner-profile-${{ runner.os }}-${{ github.job }}-${{ hashFiles('scripts/ci/go/**') }}.
+      Full cache key for the prebuilt profiler binary: the OS, the
+      calling job, and the Go source hash joined by dashes, e.g.
+      runner-profile-ubuntu-jobname-gohash. Each job owns its entry,
+      so concurrent same-OS jobs never contend on one key. (Callers
+      build this from the runner, job, and hashFiles contexts, which
+      are available in workflows but not in this manifest.)
     required: true
 runs:
   using: composite
