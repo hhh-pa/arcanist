@@ -8,12 +8,15 @@ description: >
 inputs:
   cache-key:
     description: >
-      Full cache key for the prebuilt profiler binary: the OS, the
-      calling job, and the Go source hash joined by dashes, e.g.
-      runner-profile-ubuntu-jobname-gohash. Each job owns its entry,
-      so concurrent same-OS jobs never contend on one key. (Callers
-      build this from the runner, job, and hashFiles contexts, which
-      are available in workflows but not in this manifest.)
+      Full cache key for the prebuilt profiler binary, shared by every
+      job on the OS: runner-profile-<os>-<hash>, where the hash covers
+      this action's sources plus the Go module, e.g.
+      runner-profile-ubuntu-a1b2c3. One entry per OS serves all jobs
+      (like ci-tools); the action hash re-keys automatically whenever
+      this manifest changes, so stale entries from older designs can
+      never shadow a fresh build. (Callers build the key from the
+      runner and hashFiles contexts, which exist in workflows but not
+      in this manifest.)
     required: true
 runs:
   using: composite
@@ -23,7 +26,10 @@ runs:
       with:
         # The whole dir: the file inside is runner-profile(.exe)
         # depending on the OS, and a dir path sidesteps that.
-        path: profiler-bin
+        # Absolute: actions/cache runs on Node (backslash-safe), and a
+        # relative path would resolve against each caller's job-default
+        # cwd instead of the workspace, scattering entries per job.
+        path: ${{ github.workspace }}/profiler-bin
         key: ${{ inputs.cache-key }}
     - if: steps.cache.outputs.cache-hit != 'true'
       uses: actions/setup-go@v6
@@ -34,11 +40,20 @@ runs:
     # Windows it is a backslash path that bash mangles into nonsense.
     # Relative paths only here; working-directory (handled natively by
     # the runner, not bash) stays absolute.
-    - if: steps.cache.outputs.cache-hit != 'true'
-      shell: bash
-      working-directory: ${{ github.workspace }}/scripts/ci/go
-      run: CGO_ENABLED=0 go build -o ../../profiler-bin/runner-profile ./cmd/runner-profile
+    #
+    # Build and run share ONE step (same cwd, guaranteed): split steps
+    # resolved profiler-bin/ against different directories depending on
+    # the caller's job-default cwd, so cache misses always failed with
+    # 127 while hits worked. The cache-hit output crosses the step
+    # boundary via env (steps context is unavailable to run: scripts'
+    # shell, but expressions are allowed in env:).
     - name: profile runner hardware
       shell: bash
-      working-directory: ${{ github.workspace }}
-      run: ./profiler-bin/runner-profile
+      working-directory: ${{ github.workspace }}/scripts/ci/go
+      env:
+        CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+      run: |
+        if [ "$CACHE_HIT" != 'true' ]; then
+          CGO_ENABLED=0 go build -o ../../profiler-bin/runner-profile ./cmd/runner-profile
+        fi
+        ../../profiler-bin/runner-profile
