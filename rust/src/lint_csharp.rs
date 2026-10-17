@@ -77,6 +77,9 @@ impl CsharpLinter {
             .map(Path::to_path_buf)
             .or_else(|| find_on_path(&path, binary_name()))
             .ok_or_else(|| "Unable to locate cslint.".to_string())?;
+        // The only mutation is the non-Windows `insert` below; without
+        // this the `mut` is unused on Windows (T1170).
+        #[cfg_attr(windows, allow(unused_mut))]
         let mut prefix = command_flags_for(&settings);
         #[cfg(not(windows))]
         prefix.insert(0, cslint.to_string_lossy().into_owned());

@@ -63,6 +63,11 @@ by the in-repo gates.
   API until the warning set is empty; grep the `cargo` step logs for
   `warning:` (case-insensitive, excluding the intentional
   `DOCKERHUB_TOKEN`-missing notice path when the secret exists).
+  Rustc warnings are fixed at the source (Windows-only dead code:
+  conditional `mut` allow, Unix-only const gating) and locked out
+  structurally with `[lints.rust] unused = "deny"` in
+  `rust/Cargo.toml`, which covers every platform/profile/target where
+  clippy only runs on Linux.
 - `COV`: generate the uncovered-line list from a local
   `cargo llvm-cov` run, work file by file (highest-count first),
   adding tests that execute the lines — never `#[cfg(not(tarpaulin))]`

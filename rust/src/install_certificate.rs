@@ -293,11 +293,16 @@ pub fn read_token_doc(path: &Path) -> Result<serde_json::Value, String> {
 
 /// `readUserConfigurationFile()` permission prompt (T1153 CORE-41):
 /// `pht("File permissions on your %s are too open. Fix them by
-/// chmod'ing to 600?", '~/.arcrc')`.
+/// chmod'ing to 600?", '~/.arcrc')`. Unix-only like its sole use site
+/// (`ensure_arcrc_permissions_unix`), so the definition is gated too
+/// (T1170: ungated, this is dead code on Windows).
+#[cfg(not(windows))]
 const CHMOD_PROMPT: &str =
     "File permissions on your ~/.arcrc are too open. Fix them by chmod'ing to 600?";
 
 /// Decline text: `pht('Set %s to file mode 600.', '~/.arcrc')`.
+/// Unix-only like its sole use site (T1170).
+#[cfg(not(windows))]
 const CHMOD_DECLINED: &str = "Set ~/.arcrc to file mode 600.";
 
 /// True when an existing `path` has group/other permission bits set

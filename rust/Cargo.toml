@@ -18,3 +18,12 @@ reqwest = { version = "0.12", features = ["blocking"] }
 rsa = "0.9"
 serde_json = { version = "1", features = ["preserve_order"] }
 sha1 = { version = "0.10", features = ["oid"] }
+
+# Deny the `unused` lint group (unused_mut, dead_code, unused_imports,
+# ...) package-wide, on every platform/profile/target. Clippy's `-D
+# warnings` only runs on Linux, so without this Windows-only dead code
+# (T1170: lint_csharp's conditional `mut`, the Unix-only CHMOD consts)
+# compiles with warnings that no gate catches. Applies to this package
+# only, never to dependencies.
+[lints.rust]
+unused = "deny"
