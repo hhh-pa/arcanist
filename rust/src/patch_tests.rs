@@ -4069,6 +4069,9 @@ fn e9_unquote_git_path_decodes_high_octals() {
     let decoded = unquote_git_path("\"a\\351\"");
     assert_eq!(decoded, format!("a{}", e9_smuggle(0xE9)));
     assert_eq!(untransport_bytes(&decoded), b"a\xe9");
+    // `\r` maps to CR like `stripcslashes()` (covers the carriage arm
+    // of the cognitive-gate split).
+    assert_eq!(unquote_git_path("\"a\\rb\""), "a\rb");
 }
 
 #[test]
