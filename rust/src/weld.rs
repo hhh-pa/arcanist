@@ -9,20 +9,43 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use crate::conduit::{self, EnvelopeKind};
+
 pub const NAME: &str = "weld";
 
-fn usage() -> String {
-    format!(
-        "usage: arc {NAME} [options] -- <file> <file> [...]\n\
-         \n\
-         Robustly fuse two or more files together. Files are concatenated\n\
-         with a randomly blended overlap region; empty files are skipped.\n\
-         \n\
-         Options:\n\
-         \x20 --seed N       deterministic output from seed N (arc extension;\n\
-         \x20                PHP welds randomly and has no equivalent)\n\
-         \x20 -h, --help     show this help\n"
+/// T1153 BROWSE-B23: `--help` renders the generated workflow help
+/// (`ArcanistWeldWorkflow.php:11-23`), not a short custom usage
+/// string. T1153 RB-D5: the renderer is the shared `crate::help`
+/// module; this file keeps only the data. The `--seed` extension
+/// (Rule 3: `mt_rand` streams are unportable) stays functional but
+/// undocumented in `--help`, like PHP.
+const HELP_EXAMPLES: &str = "**weld** [options] -- __file__ __file__ ...";
+const HELP_SYNOPSIS: &str = "Robustly fuse files together.";
+const HELP_TEXT: &str = "Robustly fuse two or more files together. The resulting joint is much stronger\nthan the one created by tools like __cat__.";
+/// Non-wildcard argument specs: (name, short, param, help). Empty:
+/// the only argument is the `files` wildcard (`:25-28`), which
+/// `renderArgumentSpecs()` skips.
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &specs,
+        ansi,
     )
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
 }
 
 /// Parsed `weld` options.
@@ -41,6 +64,17 @@ fn parse_seed(text: &str) -> Result<u64, String> {
 ///
 /// Returns `Ok(None)` when `--help` was requested.
 pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
+    parse_options_with_tty(argv, crate::prompt::stdin_is_terminal())
+}
+
+/// [`parse_options`] with an injected TTY flag (deterministic tests).
+/// T1153 BROWSE-B21: piped runs without `--` fail with
+/// `MISSING_TERMINATOR` (checked after unknown-flag scanning, like
+/// PHP's `parseFull()`, but before the file-count validation in
+/// `execute`). `--help` without `--` when piped reports the
+/// terminator.
+fn parse_options_with_tty(argv: &[String], stdin_tty: bool) -> Result<Option<Options>, String> {
+    let missing = crate::help::terminator_missing(argv, stdin_tty);
     let mut files = Vec::new();
     let mut seed = None;
     let mut end_of_flags = false;
@@ -58,6 +92,9 @@ pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
         } else if let Some(value) = arg.strip_prefix("--seed=") {
             seed = Some(parse_seed(value)?);
         } else if arg == "-h" || arg == "--help" {
+            if missing {
+                return Err(crate::help::MISSING_TERMINATOR.to_string());
+            }
             return Ok(None);
         } else if arg.starts_with('-') {
             return Err(format!("unknown flag '{arg}'"));
@@ -65,15 +102,20 @@ pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
             files.push(arg.clone());
         }
     }
+    if missing {
+        return Err(crate::help::MISSING_TERMINATOR.to_string());
+    }
     Ok(Some(Options { files, seed }))
 }
 
 /// Small splitmix64 generator (std-only; no new dependencies).
 ///
-/// PHP welds with `mt_rand`, whose stream no std-only generator reproduces;
-/// exact stream parity is intentionally not pursued — the joint is random
-/// either way. What matters is determinism under `--seed`, which this
-/// provides and the tests pin.
+/// PHP welds with `mt_rand` (`ArcanistWeldWorkflow.php:46,114-130` at
+/// ceb), whose stream no std-only generator reproduces; exact stream
+/// parity is intentionally not pursued — the joint is random either
+/// way (T1153 CORE-47, kept: PHP-`mt_rand` streams are unportable).
+/// What matters is determinism under `--seed`, which this provides
+/// and the tests pin.
 #[derive(Debug, Clone)]
 pub struct Rng(u64);
 
@@ -199,6 +241,68 @@ pub fn split_lines_bytes(data: &[u8]) -> Vec<&[u8]> {
     out
 }
 
+/// True for the combining codepoint ranges in
+/// `phutil_utf8_is_combining_character()`
+/// (`src/utils/utf8.php:852-870` at ceb).
+fn is_combining_mark(codepoint: u32) -> bool {
+    (0x0300..=0x036F).contains(&codepoint)
+        || (0x1DC0..=0x1DFF).contains(&codepoint)
+        || (0x20D0..=0x20FF).contains(&codepoint)
+        || (0xFE20..=0xFE2F).contains(&codepoint)
+}
+
+/// Split valid UTF-8 text into glyphs, merging combining marks like
+/// `phutil_utf8v_combined()` (`src/utils/utf8.php:880-883` at ceb, via
+/// `phutil_utf8v_combine_characters()`, `:895-930`): single-byte chars
+/// pass through, longer chars merge when combining, and a leading
+/// combining mark attaches to a synthetic space (T1153 CORE-48).
+#[must_use]
+pub fn split_glyphs(text: &str) -> Vec<String> {
+    let mut chars = text.chars().peekable();
+    let mut glyphs: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    let mut buf_open = false;
+    if let Some(&first) = chars.peek()
+        && first.len_utf8() > 1
+        && is_combining_mark(first as u32)
+    {
+        buf.push(' ');
+        buf_open = true;
+    }
+    for ch in chars {
+        let combining = ch.len_utf8() > 1 && is_combining_mark(ch as u32);
+        if combining {
+            buf.push(ch);
+            buf_open = true;
+        } else {
+            if buf_open {
+                glyphs.push(std::mem::take(&mut buf));
+            }
+            buf.push(ch);
+            buf_open = true;
+        }
+    }
+    if buf_open {
+        glyphs.push(buf);
+    }
+    glyphs
+}
+
+/// One side's fuse elements: glyph bytes when the content is valid
+/// UTF-8 (`phutil_utf8v_combined`), single bytes otherwise
+/// (`str_split`), like `weldLines()` tests each side independently
+/// (`ArcanistWeldWorkflow.php:90-103` at ceb, T1153 CORE-48).
+fn split_fuse_elements(content: &[u8]) -> Vec<Vec<u8>> {
+    match std::str::from_utf8(content) {
+        Ok(text) => split_glyphs(text)
+            .iter()
+            .map(String::as_bytes)
+            .map(<[u8]>::to_vec)
+            .collect(),
+        Err(_) => content.iter().map(|byte| vec![*byte]).collect(),
+    }
+}
+
 /// Fuse one line pair glyph by glyph. The shorter side is padded with
 /// spaces; the terminator is the later line's when present, else the
 /// earlier line's.
@@ -206,14 +310,17 @@ pub fn weld_lines(earlier: &str, later: &str, bias: f64, rng: &mut Rng) -> Strin
     let (ucontent, unewline) = split_terminator(earlier);
     let (vcontent, vnewline) = split_terminator(later);
     let newline = vnewline.or(unewline);
-    let mut us: Vec<char> = ucontent.chars().collect();
-    let mut vs: Vec<char> = vcontent.chars().collect();
+    // T1153 CORE-48: `&str` inputs are always valid UTF-8, so both
+    // sides take the glyph path (`ArcanistWeldWorkflow.php:90-103`).
+    let mut us = split_glyphs(ucontent);
+    let mut vs = split_glyphs(vcontent);
     let len = us.len().max(vs.len());
-    us.resize(len, ' ');
-    vs.resize(len, ' ');
+    us.resize(len, " ".to_string());
+    vs.resize(len, " ".to_string());
     let mut out = String::new();
     for (uc, vc) in us.iter().zip(vs.iter()) {
-        out.push(pick(*uc, *vc, bias, rng.unit()));
+        let keep = keep_earlier(uc == " ", vc == " ", bias, rng.unit());
+        out.push_str(if keep { uc } else { vc });
     }
     if let Some(newline) = newline {
         out.push_str(newline);
@@ -221,24 +328,24 @@ pub fn weld_lines(earlier: &str, later: &str, bias: f64, rng: &mut Rng) -> Strin
     out
 }
 
-/// Fuse one raw line pair. Valid UTF-8 pairs fuse glyph by glyph like
-/// [`weld_lines`]; anything else fuses byte by byte so binary input
-/// round-trips without corruption.
+/// Fuse one raw line pair, testing each side for UTF-8 independently
+/// like `weldLines()` (`ArcanistWeldWorkflow.php:90-103` at ceb,
+/// T1153 CORE-48): a valid side fuses glyph by glyph, an invalid
+/// side byte by byte, so binary input round-trips without corruption.
 pub fn weld_line_bytes(earlier: &[u8], later: &[u8], bias: f64, rng: &mut Rng) -> Vec<u8> {
-    if let (Ok(u), Ok(v)) = (std::str::from_utf8(earlier), std::str::from_utf8(later)) {
-        return weld_lines(u, v, bias, rng).into_bytes();
-    }
     let (ucontent, unewline) = split_terminator_bytes(earlier);
     let (vcontent, vnewline) = split_terminator_bytes(later);
-    let mut us = ucontent.to_vec();
-    let mut vs = vcontent.to_vec();
+    let mut us = split_fuse_elements(ucontent);
+    let mut vs = split_fuse_elements(vcontent);
     let len = us.len().max(vs.len());
-    us.resize(len, b' ');
-    vs.resize(len, b' ');
+    us.resize(len, vec![b' ']);
+    vs.resize(len, vec![b' ']);
     let mut out = Vec::with_capacity(len + 2);
-    for (ub, vb) in us.iter().zip(vs.iter()) {
-        let keep = keep_earlier(*ub == b' ', *vb == b' ', bias, rng.unit());
-        out.push(if keep { *ub } else { *vb });
+    for (uc, vc) in us.iter().zip(vs.iter()) {
+        let earlier_space = uc.len() == 1 && uc[0] == b' ';
+        let later_space = vc.len() == 1 && vc[0] == b' ';
+        let keep = keep_earlier(earlier_space, later_space, bias, rng.unit());
+        out.extend_from_slice(if keep { uc } else { vc });
     }
     if let Some(newline) = vnewline.or(unewline) {
         out.extend_from_slice(newline);
@@ -316,13 +423,13 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<Vec<u8>, String> {
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => return Ok(usage().into_bytes()),
-        Err(message) => return Err(format!("{message}\n\n{}", usage())),
+        // T1153 CORE-49 (R4): PHP renders usage errors with no dump.
+        Err(message) => return Err(message),
     };
     if options.files.len() < 2 {
-        return Err(format!(
-            "Specify two or more files to weld together.\n\n{}",
-            usage()
-        ));
+        // T1153 CORE-49 (R4): `PhutilArgumentUsageException`
+        // (`ArcanistWeldWorkflow.php:33-36`), no usage dump.
+        return Err("Specify two or more files to weld together.".to_string());
     }
     let mut inputs = Vec::with_capacity(options.files.len());
     for file in &options.files {
@@ -348,8 +455,23 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            ExitCode::FAILURE
+            // T1153 BROWSE-B21: the terminator failure prints the three
+            // cyan hints first (like `ArcanistRuntime.php:172-188`).
+            if message == crate::help::MISSING_TERMINATOR {
+                crate::help::print_terminator_hints(crate::terminal::ansi_enabled());
+            }
+            // T1153 CORE-49 (R4): `weld` is a toolset workflow.
+            // Argument errors render the red `USAGE EXCEPTION` label
+            // (exit 1, matching the old exit); read failures escape
+            // into a fatal (255).
+            let kind = if parse_options(argv).is_err()
+                || message == "Specify two or more files to weld together."
+            {
+                EnvelopeKind::ToolsetUsage
+            } else {
+                EnvelopeKind::Fatal
+            };
+            conduit::report(kind, &message)
         }
     }
 }

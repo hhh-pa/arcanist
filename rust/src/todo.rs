@@ -6,15 +6,71 @@
 //!
 //! The creation line keeps the PHP console colors (green title, blue URI)
 //! on TTYs, gated on the process ANSI setting like `tsprintf()`.
+//!
+//! No `--check` flag exists at ceb (`ArcanistTodoWorkflow.php` is 121
+//! lines; the audit's `--check` subsystem and browse success text
+//! describe a newer baseline, T1153 RB-D29 Rule 4); `--browse` stays
+//! silent on success like `:115-117`.
 
 use std::process::ExitCode;
 
-use crate::{conduit, config, terminal};
+use crate::{
+    conduit::{self, EnvelopeKind},
+    config, get_config, terminal,
+};
 
 /// Subcommand name, matching `arc todo`.
 pub const NAME: &str = "todo";
 
-const USAGE: &str = "usage: arc todo SUMMARY [--cc USER] [--project SLUG] [--json] [--browse] [--conduit-uri URI]\n";
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `crate::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistTodoWorkflow.php:12-50`).
+const HELP_SYNOPSIS: &str = "      **todo** __summary__ [__options__]";
+const HELP_TEXT: &str = "        Quickly create a task for yourself.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[
+    (
+        "cc",
+        Some("C"),
+        Some("cc"),
+        "Other users to CC on the new task.",
+    ),
+    (
+        "project",
+        None,
+        Some("project"),
+        "Projects to assign to the task.",
+    ),
+    (
+        "browse",
+        None,
+        None,
+        "After creating the task, open it in a web browser.",
+    ),
+];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        None,
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &specs,
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(terminal::ansi_enabled())
+}
 
 /// Parsed `todo` options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,8 +245,13 @@ pub fn parse_args(argv: &[String]) -> Result<Option<Options>, String> {
     Ok(Some(parser.finish()))
 }
 
-/// Authenticated user's PHID via `user.whoami`.
+/// Authenticated user's PHID: the identity cached at startup auth,
+/// else one `user.whoami` call (T1153 RB-D8: PHP resolves whoami once
+/// first, then reuses the cached PHID).
 pub fn user_phid(client: &conduit::Client) -> Result<String, String> {
+    if let Some((_, phid)) = client.authenticated_user() {
+        return Ok(phid);
+    }
     let who = client
         .call("user.whoami", &serde_json::json!({}))
         .map_err(|e| e.to_string())?;
@@ -346,19 +407,20 @@ fn task_create_params(
     Ok(params)
 }
 
-fn finish_created_task(
-    dir: &std::path::Path,
+/// A created task plus its stdout text: the text prints first and the
+/// task feeds `--browse` after it (T1153 RB-D29b: PHP echoes the
+/// `Created task ...` line, then opens the browser).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedOutcome {
+    pub text: String,
+    pub task: Option<CreatedTask>,
+}
+
+fn render_created_task(
     task: &CreatedTask,
     options: &Options,
     ansi: bool,
 ) -> Result<String, String> {
-    if options.browse {
-        let configured = crate::browser::configured_browser(dir);
-        crate::browser::open_uris_in_browser(
-            std::slice::from_ref(&task.uri),
-            configured.as_deref(),
-        )?;
-    }
     if options.json {
         let mut doc =
             serde_json::to_string_pretty(&created_json(task)).map_err(json_encode_error)?;
@@ -366,6 +428,42 @@ fn finish_created_task(
         return Ok(doc);
     }
     Ok(render_created(task, ansi))
+}
+
+/// Open the created task in a browser, like PHP's
+/// `openURIsInBrowser` after the creation line. Failures are usage
+/// errors (PHP throws `ArcanistUsageException`).
+pub fn open_created_in_browser(dir: &std::path::Path, task: &CreatedTask) -> Result<(), String> {
+    let configured = crate::browser::configured_browser(dir);
+    crate::browser::open_uris_in_browser(std::slice::from_ref(&task.uri), configured.as_deref())
+}
+
+/// Create the task per `options` in `dir`, returning the stdout text
+/// and the created task (none when the summary is blank). Browsing is
+/// the caller's job, after printing the text.
+pub fn create_in_ansi(
+    _dir: &std::path::Path,
+    client: &conduit::Client,
+    options: &Options,
+    ansi: bool,
+) -> Result<CreatedOutcome, String> {
+    let summary = options.summary.join(" ");
+    if is_blank_summary(&summary) {
+        return Ok(CreatedOutcome {
+            text: "Please provide a summary.\n".to_string(),
+            task: None,
+        });
+    }
+    let params = task_create_params(client, options, summary)?;
+    let result = client
+        .call("maniphest.createtask", &serde_json::Value::Object(params))
+        .map_err(conduit_error_text)?;
+    let task = parse_created(&result).ok_or_else(missing_task_id)?;
+    let text = render_created_task(&task, options, ansi)?;
+    Ok(CreatedOutcome {
+        text,
+        task: Some(task),
+    })
 }
 
 /// Create the task per `options`, returning the stdout text.
@@ -392,6 +490,9 @@ pub fn execute_ansi(
 }
 
 /// Create the task per `options` with `dir` pinning config discovery.
+///
+/// Only the stdout text is returned: `--browse` is the caller's job,
+/// after printing (see [`create_in_ansi`] + [`open_created_in_browser`]).
 pub fn execute_in(
     dir: &std::path::Path,
     client: &conduit::Client,
@@ -401,23 +502,15 @@ pub fn execute_in(
 }
 
 /// Create the task per `options` in `dir` with an explicit ANSI setting
-/// (deterministic under test).
+/// (deterministic under test). `--browse` is the caller's job, after
+/// printing the returned text (T1153 RB-D29b).
 pub fn execute_in_ansi(
     dir: &std::path::Path,
     client: &conduit::Client,
     options: &Options,
     ansi: bool,
 ) -> Result<String, String> {
-    let summary = options.summary.join(" ");
-    if is_blank_summary(&summary) {
-        return Ok("Please provide a summary.\n".to_string());
-    }
-    let params = task_create_params(client, options, summary)?;
-    let result = client
-        .call("maniphest.createtask", &serde_json::Value::Object(params))
-        .map_err(conduit_error_text)?;
-    let task = parse_created(&result).ok_or_else(missing_task_id)?;
-    finish_created_task(dir, &task, options, ansi)
+    create_in_ansi(dir, client, options, ansi).map(|outcome| outcome.text)
 }
 
 /// Entry point: `argv` excludes the subcommand name.
@@ -425,30 +518,44 @@ pub fn run(argv: &[String]) -> ExitCode {
     let options = match parse_args(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", usage());
             return ExitCode::SUCCESS;
         }
-        Err(msg) => {
-            eprintln!("arc {NAME}: {msg}\n\n{USAGE}");
-            return ExitCode::FAILURE;
-        }
+        // T1153 RB-D4 (R4): `todo` is a subprocess workflow:
+        // usage errors render `Usage Exception:` with no usage dump
+        // (`scripts/arcanist.php:432-444`).
+        Err(msg) => return conduit::report(EnvelopeKind::Usage, &msg),
     };
-    let client = match config::client_for(options.conduit_uri.as_deref()) {
+    // T1153 CORE-4/T1153 CORE-9: classic `requiresAuthentication` startup
+    // (tokenless engine, credential gate, `user.whoami` /
+    // `conduit.connect` verification).
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let user_file = config::arcrc_path();
+    let client = match config::authed_client_for(
+        options.conduit_uri.as_deref(),
+        &cwd,
+        user_file.as_deref(),
+        &get_config::LoadOptions::default(),
+        &config::command_description(),
+    ) {
         Ok(client) => client,
-        Err(msg) => {
-            eprintln!("arc {NAME}: {msg}");
-            return ExitCode::FAILURE;
-        }
+        Err(error) => return error.report(),
     };
-    match execute_ansi(&client, &options, terminal::ansi_enabled()) {
-        Ok(out) => {
-            print!("{out}");
+    match create_in_ansi(&cwd, &client, &options, terminal::ansi_enabled()) {
+        Ok(outcome) => {
+            print!("{}", outcome.text);
+            // T1153 RB-D29b: the creation line prints first; `--browse`
+            // opens the task after it (usage errors, like PHP's
+            // `openURIsInBrowser` throw).
+            if options.browse
+                && let Some(task) = outcome.task
+                && let Err(msg) = open_created_in_browser(&cwd, &task)
+            {
+                return conduit::report(EnvelopeKind::Usage, &msg);
+            }
             ExitCode::SUCCESS
         }
-        Err(msg) => {
-            eprintln!("arc {NAME}: {msg}");
-            ExitCode::FAILURE
-        }
+        Err(msg) => conduit::report(EnvelopeKind::Exception, &msg),
     }
 }
 

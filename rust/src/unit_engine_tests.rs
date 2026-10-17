@@ -263,3 +263,121 @@ fn dict_json_escapes_like_php_json_encode() {
     let json = result.to_dictionary().to_json_string();
     assert!(json.contains("\"extra\":[]"), "{json}");
 }
+
+// --- T1153 Wave 2: UNIT findings ---
+
+#[test]
+fn unit_u18_int_flag_transitions() {
+    let mut result = UnitResult::new();
+    assert!(!result.duration_is_int());
+    result.set_duration_int(3);
+    assert!(result.duration_is_int());
+    assert_eq!(result.get_duration(), Some(3.0));
+    // A float set clears the flag (PHP `json_encode(3.0)` keeps `.0`).
+    result.set_duration(3.0);
+    assert!(!result.duration_is_int());
+}
+
+#[test]
+fn unit_u19_dictionary_nulls_for_unset() {
+    let dict = UnitResult::new().to_dictionary();
+    assert_eq!(dict.name, None);
+    assert_eq!(dict.result, None);
+    assert!(!dict.duration_is_int);
+    let mut result = UnitResult::new();
+    result.set_name("t").unwrap();
+    result.set_result(RESULT_PASS);
+    let dict = result.to_dictionary();
+    assert_eq!(dict.name.as_deref(), Some("t"));
+    assert_eq!(dict.result.as_deref(), Some(RESULT_PASS));
+}
+
+#[test]
+fn unit_u25_counts_use_thousands_separators() {
+    assert_eq!(format_count(255), "255");
+    assert_eq!(format_count(1234), "1,234");
+    assert_eq!(format_count(1234567), "1,234,567");
+    let mut result = UnitResult::new();
+    let err = result.set_name(&"n".repeat(1234)).unwrap_err();
+    assert!(err.contains("1,234 bytes"), "{err}");
+    assert!(err.contains("255 bytes"), "{err}");
+}
+
+#[test]
+fn unit_u20_ordered_sets_keep_document_order() {
+    let mut result = UnitResult::new();
+    result.set_extra_data_ordered(vec![
+        ("zebra".to_string(), "1".to_string()),
+        ("apple".to_string(), "2".to_string()),
+    ]);
+    result.set_coverage_ordered(vec![
+        ("z.php".to_string(), "C".to_string()),
+        ("a.php".to_string(), "U".to_string()),
+    ]);
+    // Lookups still work.
+    assert_eq!(result.get_extra_data().unwrap().get("apple").unwrap(), "2");
+    assert_eq!(result.get_coverage().unwrap().get("a.php").unwrap(), "U");
+    // Dictionaries keep document order, not sorted order.
+    let dict = result.to_dictionary();
+    let keys: Vec<&str> = dict
+        .extra
+        .as_deref()
+        .unwrap()
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .collect();
+    assert_eq!(keys, vec!["zebra", "apple"]);
+    let keys: Vec<&str> = dict
+        .coverage
+        .as_deref()
+        .unwrap()
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .collect();
+    assert_eq!(keys, vec!["z.php", "a.php"]);
+    // Repeats keep first position with the last value (PHP arrays).
+    result.set_coverage_ordered(vec![
+        ("b.php".to_string(), "C".to_string()),
+        ("a.php".to_string(), "U".to_string()),
+        ("b.php".to_string(), "CC".to_string()),
+    ]);
+    assert_eq!(
+        result.coverage_ordered().unwrap(),
+        vec![
+            ("b.php".to_string(), "CC".to_string()),
+            ("a.php".to_string(), "U".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn unit_u20_legacy_sets_render_sorted() {
+    // The legacy `HashMap` setters lost the order already, so readers
+    // keep the historical sorted rendering.
+    let mut result = UnitResult::new();
+    result.set_extra_data(HashMap::from([
+        ("zebra".to_string(), "1".to_string()),
+        ("apple".to_string(), "2".to_string()),
+    ]));
+    result.set_coverage(HashMap::from([
+        ("z.php".to_string(), "C".to_string()),
+        ("a.php".to_string(), "U".to_string()),
+    ]));
+    let dict = result.to_dictionary();
+    let keys: Vec<&str> = dict
+        .extra
+        .as_deref()
+        .unwrap()
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .collect();
+    assert_eq!(keys, vec!["apple", "zebra"]);
+    let keys: Vec<&str> = dict
+        .coverage
+        .as_deref()
+        .unwrap()
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .collect();
+    assert_eq!(keys, vec!["a.php", "z.php"]);
+}

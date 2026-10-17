@@ -8,10 +8,12 @@
 //! switch); when it is executable and text, it must start with a `#!`
 //! shebang line.
 //!
-//! The executable bit is read from disk via [`lint_bytes`]'s `path`
-//! argument, so paths that do not exist on disk are silent. [`check_bytes`]
-//! runs the same rules against an explicit flag and is the portable,
-//! directly testable core.
+//! The executable bit is read from disk via the engine's
+//! `set_active_disk_path()` path (`getFilePathOnDisk()`, project-root
+//! relative, T1153 LINT-26), falling back to [`lint_bytes`]'s `path`
+//! argument for direct callers, so paths that do not exist on disk are
+//! silent. [`check_bytes`] runs the same rules against an explicit flag
+//! and is the portable, directly testable core.
 //!
 //! Known limits: MIME detection is magic-byte sniffing for exactly the PHP
 //! list (OLE containers report `application/msword` as the representative
@@ -19,6 +21,9 @@
 //! non-Unix platforms nothing is executable, so the linter stays silent.
 
 extern crate self as arc_rs;
+
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 
 use arc_rs::lint::{LintMessage, Linter};
 
@@ -30,12 +35,14 @@ const DESC_NEEDS_BINARY_OR_SHEBANG: &str =
 
 /// Linter flagging needlessly executable files (PHP `CHMOD`).
 #[derive(Debug, Default)]
-pub struct ChmodLinter;
+pub struct ChmodLinter {
+    disk: RefCell<Option<PathBuf>>,
+}
 
 impl ChmodLinter {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -264,13 +271,18 @@ fn invalid_executable(path: &str, description: &str) -> LintMessage {
         description: description.to_string(),
         original: None,
         replacement: None,
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     }
 }
 
 /// True when `path` exists on disk as a regular file with any executable
 /// bit set. Directories, symlinks-to-dirs, missing paths, and (on non-Unix
 /// platforms) everything report false.
-fn is_executable_on_disk(path: &str) -> bool {
+fn is_executable_on_disk(path: &Path) -> bool {
     let meta = match std::fs::metadata(path) {
         Ok(meta) => meta,
         Err(_) => return false,
@@ -307,8 +319,21 @@ impl Linter for ChmodLinter {
         true
     }
 
+    fn set_active_disk_path(&self, disk: &Path) {
+        *self.disk.borrow_mut() = Some(disk.to_path_buf());
+    }
+
     fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {
-        check_bytes(path, data, is_executable_on_disk(path))
+        let disk = self.disk.borrow().clone();
+        let probe;
+        let stat_path: &Path = match disk.as_deref() {
+            Some(disk) => disk,
+            None => {
+                probe = PathBuf::from(path);
+                &probe
+            }
+        };
+        check_bytes(path, data, is_executable_on_disk(stat_path))
     }
 }
 

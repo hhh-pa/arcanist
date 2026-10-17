@@ -269,3 +269,36 @@ fn test_assemblies_parse_and_clean_reports() {
     let ctx = EngineContext::new("/r");
     assert!(describe_run(&ctx, &projects).contains("projects 1"));
 }
+
+#[test]
+fn unit_u20_ordered_parse_keeps_coverage_order() {
+    let xml = r#"<assembly><test name="t" time="1" result="Pass"/></assembly>"#;
+    let coverage = vec![
+        ("z.cs".to_string(), "C".to_string()),
+        ("a.cs".to_string(), "U".to_string()),
+    ];
+    let results = parse_assembly_results_ordered(xml, Some(&coverage)).unwrap();
+    let dict = results[0].to_dictionary();
+    let names: Vec<&str> = dict
+        .coverage
+        .as_deref()
+        .unwrap()
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(names, vec!["z.cs", "a.cs"]);
+    // The legacy form keeps the sorted fallback.
+    let mut map = std::collections::HashMap::new();
+    map.insert("z.cs".to_string(), "C".to_string());
+    map.insert("a.cs".to_string(), "U".to_string());
+    let results = parse_assembly_results(xml, Some(&map)).unwrap();
+    let dict = results[0].to_dictionary();
+    let names: Vec<&str> = dict
+        .coverage
+        .as_deref()
+        .unwrap()
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(names, vec!["a.cs", "z.cs"]);
+}

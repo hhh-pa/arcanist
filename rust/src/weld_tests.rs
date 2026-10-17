@@ -6,19 +6,20 @@ fn args(list: &[&str]) -> Vec<String> {
 
 #[test]
 fn parses_files_and_seed() {
+    // T1153 BROWSE-B21: TTY runs need no `--`.
     assert_eq!(
-        parse_options(&args(&["a.txt", "b.txt"])),
+        parse_options_with_tty(&args(&["a.txt", "b.txt"]), true),
         Ok(Some(Options {
             files: vec!["a.txt".to_string(), "b.txt".to_string()],
             seed: None,
         }))
     );
-    let options = parse_options(&args(&["--seed", "42", "--", "a.txt", "b.txt"]))
+    let options = parse_options_with_tty(&args(&["--seed", "42", "--", "a.txt", "b.txt"]), true)
         .unwrap()
         .unwrap();
     assert_eq!(options.seed, Some(42));
     assert_eq!(options.files.len(), 2);
-    let options = parse_options(&args(&["--seed=7", "a.txt", "b.txt"]))
+    let options = parse_options_with_tty(&args(&["--seed=7", "a.txt", "b.txt"]), true)
         .unwrap()
         .unwrap();
     assert_eq!(options.seed, Some(7));
@@ -26,7 +27,7 @@ fn parses_files_and_seed() {
 
 #[test]
 fn separator_keeps_dashed_files() {
-    let options = parse_options(&args(&["--", "--weird", "-x"]))
+    let options = parse_options_with_tty(&args(&["--", "--weird", "-x"]), false)
         .unwrap()
         .unwrap();
     assert_eq!(options.files, vec!["--weird".to_string(), "-x".to_string()]);
@@ -34,17 +35,34 @@ fn separator_keeps_dashed_files() {
 
 #[test]
 fn help_returns_none() {
-    assert_eq!(parse_options(&args(&["--help"])), Ok(None));
-    assert_eq!(parse_options(&args(&["-h"])), Ok(None));
+    // T1153 BROWSE-B21: `--help` needs `--` when piped.
+    assert_eq!(
+        parse_options_with_tty(&args(&["--help", "--"]), false),
+        Ok(None)
+    );
+    assert_eq!(
+        parse_options_with_tty(&args(&["-h", "--"]), false),
+        Ok(None)
+    );
+    assert_eq!(
+        parse_options_with_tty(&args(&["--help"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
 }
 
 #[test]
 fn rejects_bad_arguments() {
-    let err = parse_options(&args(&["--bogus", "a", "b"])).unwrap_err();
+    // Unknown flags report before the terminator check.
+    let err = parse_options_with_tty(&args(&["--bogus", "a", "b"]), false).unwrap_err();
     assert!(err.contains("unknown flag"), "unexpected: {err}");
-    assert!(parse_options(&args(&["--seed"])).is_err());
-    let err = parse_options(&args(&["--seed=abc", "a", "b"])).unwrap_err();
+    assert!(parse_options_with_tty(&args(&["--seed", "--"]), false).is_err());
+    let err = parse_options_with_tty(&args(&["--seed=abc", "a", "b", "--"]), false).unwrap_err();
     assert!(err.contains("invalid --seed"), "unexpected: {err}");
+    // Piped without `--` reports the terminator.
+    assert_eq!(
+        parse_options_with_tty(&args(&["a.txt", "b.txt"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
 }
 
 #[test]
@@ -132,6 +150,8 @@ fn empty_inputs_are_skipped() {
 
 #[test]
 fn welded_output_is_deterministic_for_a_seed() {
+    // T1153 CORE-47: the stream is splitmix64, not `mt_rand` (kept:
+    // unportable), but `--seed` still pins the joint byte-identical.
     let inputs = ["alpha\nbeta\ngamma\n", "one\ntwo\nthree\n"];
     let mut first = Rng::new(1234);
     let mut second = Rng::new(1234);
@@ -166,11 +186,77 @@ fn terminator_prefers_the_later_line() {
 
 #[test]
 fn usage_covers_files_and_seed() {
-    let text = usage();
-    assert!(text.contains("usage: arc weld"));
-    assert!(text.contains("<file>"));
-    assert!(text.contains("--seed"));
+    // T1153 BROWSE-B23: `--help` renders the generated workflow help
+    // (no `--seed`: the Rule 3 extension stays undocumented, like PHP).
+    let text = usage_text(false);
+    assert_eq!(
+        text,
+        "WELD WORKFLOW\n\
+         \n\
+         weld [options] -- file file ...\n\
+         Robustly fuse files together.\n\
+         \n\
+         Robustly fuse two or more files together. The resulting joint is much\n\
+         stronger than the one created by tools like cat.\n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
 }
+#[test]
+fn core48_combining_marks_fuse_as_one_glyph() {
+    // T1153 CORE-48: `phutil_utf8v_combined` keeps `e` + U+0301
+    // together, so the joint never splits them across sides.
+    assert_eq!(split_glyphs(""), Vec::<String>::new());
+    assert_eq!(split_glyphs("abc"), vec!["a", "b", "c"]);
+    assert_eq!(split_glyphs("é"), vec!["é"]);
+    assert_eq!(split_glyphs("áb"), vec!["á", "b"]);
+    // A leading combining mark attaches to a synthetic space.
+    assert_eq!(split_glyphs("́x"), vec![" ́", "x"]);
+    // Single-byte chars are never combining, even beside marks.
+    assert_eq!(split_glyphs("0́"), vec!["0́"]);
+    for seed in 0..25 {
+        let mut rng = Rng::new(seed);
+        let out = weld_lines("é\n", "xy\n", 0.5, &mut rng);
+        let body = out.strip_suffix('\n').unwrap();
+        // One glyph against two: position 0 draws, position 1 always
+        // takes the later side (earlier pads with a space), and the
+        // mark never leaves its base.
+        assert!(body == "éy" || body == "xy", "seed={seed} {out:?}");
+    }
+}
+
+#[test]
+fn core48_mixed_validity_pairs_split_per_side() {
+    // T1153 CORE-48: `weldLines` tests each side for UTF-8
+    // independently — the valid side fuses glyphs, the invalid side
+    // bytes (`ArcanistWeldWorkflow.php:90-103` at ceb). A two-byte
+    // glyph against one bad byte fuses whole-or-byte, never split.
+    for seed in 0..25 {
+        let mut rng = Rng::new(seed);
+        let out = weld_line_bytes(b"\xff\n", "é\n".as_bytes(), 0.5, &mut rng);
+        let body = out.strip_suffix(b"\n").unwrap();
+        assert!(
+            body == b"\xff" || body == "é".as_bytes(),
+            "seed={seed} {out:?}"
+        );
+        let mut rng = Rng::new(seed);
+        let out = weld_line_bytes("é\n".as_bytes(), b"\xff\n", 0.5, &mut rng);
+        let body = out.strip_suffix(b"\n").unwrap();
+        assert!(
+            body == b"\xff" || body == "é".as_bytes(),
+            "seed={seed} {out:?}"
+        );
+    }
+    // Both-invalid still fuses byte by byte.
+    for seed in 0..10 {
+        let mut rng = Rng::new(seed);
+        let out = weld_line_bytes(b"\xff\n", b"\xfe\n", 0.5, &mut rng);
+        assert!(out == b"\xff\n" || out == b"\xfe\n", "seed={seed} {out:?}");
+    }
+}
+
 #[test]
 fn weld_line_bytes_fuses_invalid_utf8_bytewise() {
     let earlier = b"\xff\xfe data\n";
@@ -202,5 +288,22 @@ fn weld_buffers_skips_empty_and_is_deterministic() {
     assert_eq!(
         weld_buffers(&[b"a\nb\n".to_vec()], &mut third),
         b"a\nb\n".to_vec()
+    );
+}
+
+#[test]
+fn r4_core49_weld_usage_has_no_dump() {
+    // Fewer than two files is toolset usage (exit 1, matching the
+    // old exit) with no usage dump; read failures are fatal.
+    // T1153 BROWSE-B21: piped runs carry `--`.
+    match execute(&std::env::temp_dir(), &args(&["only", "--"])) {
+        Err(message) => {
+            assert_eq!(message, "Specify two or more files to weld together.");
+        }
+        _ => panic!("expected usage error"),
+    }
+    assert_eq!(
+        run_in(&std::env::temp_dir(), &args(&["only", "--"])),
+        std::process::ExitCode::FAILURE
     );
 }

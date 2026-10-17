@@ -24,27 +24,23 @@
 //! process TTY setting like `tsprintf()`.
 //!
 //! Divergences:
-//! - Conduit is opportunistic: without credentials the revision and
-//!   published-ref annotation is empty and the grid still renders. PHP
-//!   fails the whole workflow when conduit calls fail.
-//! - Empty `git remote --verbose` output yields no remotes. PHP throws
-//!   `Failed to match remote pattern against line "".` here, but the
-//!   workflow's own `!$remotes` guard shows an empty list was intended.
 //! - `regexp(...)` permanent-ref rules use the matcher's supported subset
 //!   (see `revision`); exact-name rules behave identically.
 //! - A `refs/remotes/` ref without a `/` (which git never emits) is
 //!   skipped instead of producing a null-named marker.
-//! - `hg arc-ls-markers` resolves the `arc-hg` extension script from
-//!   `ARC_HG_EXTENSION` or an upward `support/hg/arc-hg.py` search, else
-//!   runs bare and relies on the user's Mercurial configuration. PHP
-//!   always passes its bundled script path.
+//! - `hg arc-ls-markers` decode failures keep the Rust-side error text:
+//!   PHP's detail bytes come from the external JsonLint library.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::terminal::TVal;
-use crate::{commitgraph, config, grid, hg, revision, terminal};
+use crate::{
+    argparse, commitgraph,
+    conduit::{self, EnvelopeKind},
+    config, get_config, grid, hg, revision, terminal,
+};
 
 pub const NAME: &str = "markers";
 
@@ -96,45 +92,56 @@ pub struct Options {
     pub conduit_uri: Option<String>,
 }
 
+/// True when `-h`/`--help` appears before any `--` terminator (direct
+/// calls still reroute to usage; the binary strips standard help flags
+/// globally first).
+fn wants_help(argv: &[String]) -> bool {
+    let mut terminated = false;
+    for arg in argv {
+        if arg == "--" {
+            terminated = true;
+        } else if !terminated && (arg == "-h" || arg == "--help") {
+            return true;
+        }
+    }
+    false
+}
+
 /// Parse `argv` (excluding the subcommand name).
 ///
 /// Returns `Ok(None)` when `--help` was requested.
+///
+/// T1153 LAND-42: toolset workflows parse through
+/// `PhutilArgumentParser` (`parseWorkflowsFull`), so this shares the
+/// ported texts (`Argument "--x" requires a parameter.`,
+/// `Argument "--x" does not take a parameter.`,
+/// `Argument "--x" was provided twice.`,
+/// `Argument "--x" is unrecognized. ...`, and
+/// `Unrecognized argument "y".` for positionals). Interactive
+/// British-spelling correction stays off (its stderr notices have no
+/// plumbing here).
 pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
-    let mut marker_type = None;
-    let mut json = false;
-    let mut conduit_uri = None;
-    let mut iter = argv.iter();
-    while let Some(arg) = iter.next() {
-        if arg == "--json" {
-            json = true;
-        } else if arg == "--type" {
-            let Some(value) = iter.next() else {
-                return Err("--type requires a value".to_string());
-            };
-            marker_type = Some(check_marker_type(value)?);
-        } else if let Some(value) = arg.strip_prefix("--type=") {
-            marker_type = Some(check_marker_type(value)?);
-        } else if arg == "--conduit-uri" {
-            let Some(value) = iter.next() else {
-                return Err("--conduit-uri requires a value".to_string());
-            };
-            conduit_uri = Some(value.clone());
-        } else if let Some(value) = arg.strip_prefix("--conduit-uri=") {
-            conduit_uri = Some(value.to_string());
-        } else if arg == "-h" || arg == "--help" {
-            return Ok(None);
-        } else if arg == "--" {
-            return Err("unexpected argument '--': markers takes no paths".to_string());
-        } else if arg.starts_with('-') {
-            return Err(format!("unknown flag '{arg}'"));
-        } else {
-            return Err(format!("unexpected argument '{arg}'"));
-        }
+    if wants_help(argv) {
+        return Ok(None);
     }
+    let parsed = argparse::parse_toolset(
+        argv,
+        &[
+            argparse::FlagSpec::valued("type", "type"),
+            argparse::FlagSpec::boolean("json"),
+            argparse::FlagSpec::valued("conduit-uri", "uri"),
+        ],
+        false,
+        false,
+    )?;
+    let marker_type = match parsed.value("type") {
+        None => None,
+        Some(raw) => Some(check_marker_type(raw)?),
+    };
     Ok(Some(Options {
         marker_type,
-        json,
-        conduit_uri,
+        json: parsed.flag("json"),
+        conduit_uri: parsed.value("conduit-uri").map(str::to_string),
     }))
 }
 
@@ -459,12 +466,12 @@ fn parse_remote_line(line: &str) -> Result<(String, String, String), String> {
 }
 
 /// List git remotes (`ArcanistGitRepositoryRemoteQuery`).
+///
+/// T1153 RB-D9: empty output throws like PHP (`phutil_split_lines`
+/// yields one empty line, which misses the remote pattern), so a
+/// remote-less checkout fails instead of listing nothing.
 pub fn query_git_remotes(dir: &Path) -> Result<Vec<RemoteRef>, String> {
     let text = crate::git::stdout_text(dir, &["remote", "--verbose"])?;
-    if text.trim().is_empty() {
-        // PHP throws on the empty line here; an empty list was intended.
-        return Ok(Vec::new());
-    }
     let mut map: Vec<(String, HashMap<String, String>)> = Vec::new();
     for line in grid::split_lines(&text) {
         let (name, uri, mode) = parse_remote_line(line)?;
@@ -489,8 +496,49 @@ pub fn query_git_remotes(dir: &Path) -> Result<Vec<RemoteRef>, String> {
         .collect())
 }
 
+/// The bundled `arc-hg` extension (`support/hg/arc-hg.py`), compiled in
+/// so Mercurial calls always pass a script path like PHP
+/// (`getMercurialExtensionArguments`), even outside a source checkout.
+const ARC_HG_BUNDLED: &str = include_str!("../../support/hg/arc-hg.py");
+
+/// FNV-1a over the bundled script: a stable content tag for the
+/// materialized copy's file name.
+fn arc_hg_content_tag() -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in ARC_HG_BUNDLED.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Materialize the bundled `arc-hg` script under the temp dir,
+/// atomically installing it when the bytes differ. Best-effort:
+/// `None` leaves the caller to run bare.
+fn materialize_bundled_arc_hg() -> Option<PathBuf> {
+    let target = std::env::temp_dir().join(format!("arc-hg-{:016x}.py", arc_hg_content_tag()));
+    if std::fs::read(&target).is_ok_and(|bytes| bytes == ARC_HG_BUNDLED.as_bytes()) {
+        return Some(target);
+    }
+    let tmp = target.with_extension(format!("{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, ARC_HG_BUNDLED).is_err() {
+        return None;
+    }
+    if std::fs::rename(&tmp, &target).is_err() {
+        std::fs::remove_file(&tmp).ok();
+        // A lost install race still converges when the winner matches.
+        if std::fs::read(&target).is_ok_and(|bytes| bytes == ARC_HG_BUNDLED.as_bytes()) {
+            return Some(target);
+        }
+        return None;
+    }
+    Some(target)
+}
+
 /// Locate the `arc-hg` extension script: `ARC_HG_EXTENSION` first, then an
-/// upward `support/hg/arc-hg.py` search from `dir`.
+/// upward `support/hg/arc-hg.py` search from `dir`, then the bundled
+/// copy (T1153 LAND-25: PHP always passes its bundled script path, so
+/// the query never runs bare on user configuration alone).
 #[must_use]
 pub fn arc_hg_script(dir: &Path) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("ARC_HG_EXTENSION") {
@@ -499,9 +547,14 @@ pub fn arc_hg_script(dir: &Path) -> Option<PathBuf> {
             return Some(path);
         }
     }
-    dir.ancestors()
+    if let Some(found) = dir
+        .ancestors()
         .map(|dir| dir.join("support").join("hg").join("arc-hg.py"))
         .find(|path| path.is_file())
+    {
+        return Some(found);
+    }
+    materialize_bundled_arc_hg()
 }
 
 /// PHP `empty()` truthiness for `hg arc-ls-markers` flags.
@@ -541,6 +594,10 @@ fn parse_hg_ls_markers(text: &str) -> Result<Vec<MarkerRef>, String> {
                 ));
             }
         };
+        // T1153 LAND-27 / T1153 RB-D34: PHP reads `name`/`node`
+        // unchecked (a missing key is a notice, not a failure), so
+        // markers without them proceed with empty strings instead of
+        // hard-failing.
         let name = item
             .get("name")
             .and_then(serde_json::Value::as_str)
@@ -549,20 +606,18 @@ fn parse_hg_ls_markers(text: &str) -> Result<Vec<MarkerRef>, String> {
             .get("node")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-        if name.is_empty() || node.is_empty() {
-            return Err(
-                "Call to \"hg arc-ls-markers\" returned a marker without a name or node."
+        // T1153 RB-D39: without `description` PHP attaches no message
+        // and leaves the summary empty.
+        let (summary, message) = match item.get("description").and_then(serde_json::Value::as_str) {
+            Some(description) => (
+                grid::split_lines(description)
+                    .first()
+                    .unwrap_or(&"")
                     .to_string(),
-            );
-        }
-        let description = item
-            .get("description")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let summary = grid::split_lines(description)
-            .first()
-            .unwrap_or(&"")
-            .to_string();
+                Some(description.to_string()),
+            ),
+            None => (String::new(), None),
+        };
         out.push(MarkerRef {
             name: name.to_string(),
             marker_type: marker_type.to_string(),
@@ -570,12 +625,56 @@ fn parse_hg_ls_markers(text: &str) -> Result<Vec<MarkerRef>, String> {
             marker_hash: None,
             commit_hash: node.to_string(),
             summary,
-            message: Some(description.to_string()),
+            message,
             active: php_truthy(item.get("isActive")),
             remote_name: None,
         });
     }
     Ok(out)
+}
+
+/// Summarize one `CommandException` section: `(empty)` when blank,
+/// else the head plus a `... (N more byte(s)) ...` tail past 1000
+/// bytes (skipped when the tail outgrows the cut, like PHP).
+fn summarize_command_section(text: &str) -> String {
+    if text.is_empty() {
+        return "(empty)".to_string();
+    }
+    let bytes = text.as_bytes();
+    if bytes.len() > 1000 {
+        let cut = bytes.len() - 1000;
+        let suffix = format!("... ({} more byte(s)) ...", grid::group_number(cut as u64));
+        if cut > suffix.len() {
+            // PHP's `substr` cuts bytes; a split character renders
+            // lossy here instead of raw partial bytes.
+            return format!("{}{}", String::from_utf8_lossy(&bytes[..1000]), suffix);
+        }
+    }
+    text.to_string()
+}
+
+/// Render an exec failure like PHP's `CommandException`
+/// (`src/future/exec/CommandException.php:17-34`): the
+/// `Command failed with error #N!` head plus `COMMAND`/`STDOUT`/
+/// `STDERR` sections. `command` is the pre-rendered command line.
+///
+/// Residual: PHP censors credentials in the summary
+/// (`phutil_censor_credentials`, libphutil-only); this port renders
+/// sections verbatim.
+#[must_use]
+pub fn command_exception_text(code: i32, command: &str, stdout: &str, stderr: &str) -> String {
+    [
+        format!("Command failed with error #{code}!"),
+        "COMMAND".to_string(),
+        summarize_command_section(command),
+        String::new(),
+        "STDOUT".to_string(),
+        summarize_command_section(stdout),
+        String::new(),
+        "STDERR".to_string(),
+        summarize_command_section(stderr),
+    ]
+    .join("\n")
 }
 
 /// List Mercurial markers via `hg arc-ls-markers`.
@@ -604,17 +703,19 @@ pub fn query_hg_markers_with(
     }
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = hg::output_with(dir, hg_command, &argv)?;
+    // T1153 LAND-26: PHP's future throws on a nonzero exit, so the
+    // failure surfaces as a `CommandException` dump (command plus
+    // stdout/stderr sections), never as hg's bare stderr.
     if !output.status.success() {
-        let detail = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let detail = detail.trim();
-        if detail.is_empty() {
-            return Err("hg arc-ls-markers failed".to_string());
-        }
-        return Err(detail.to_string());
+        let mut display = vec![hg_command.program.clone()];
+        display.extend(hg_command.prefix.iter().cloned());
+        display.extend(args.iter().cloned());
+        return Err(command_exception_text(
+            output.status.code().unwrap_or(1),
+            &terminal::shell_join(&display),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        ));
     }
     let markers = parse_hg_ls_markers(&String::from_utf8_lossy(&output.stdout))?;
     Ok(markers
@@ -626,8 +727,7 @@ pub fn query_hg_markers_with(
 /// Published commit hashes under git: commit hashes of remote-tracking
 /// markers on permanent refs (`newPublishedCommitHashes()`).
 ///
-/// Without a conduit client no repository ref can resolve, so no hash is
-/// permanent and the result is empty.
+/// Without a conduit client the load fails like PHP (T1153 LAND-23).
 pub fn published_git_hashes(
     dir: &Path,
     client: Option<&crate::conduit::Client>,
@@ -640,20 +740,21 @@ pub fn published_git_hashes(
     if markers.is_empty() {
         return Ok(Vec::new());
     }
+    // T1153 LAND-23: without conduit PHP's hardpoint load fails the
+    // whole workflow — the grid never renders unannotated.
     let Some(client) = client else {
-        return Ok(Vec::new());
+        return Err(conduit::no_uri_block());
     };
+    // T1153 RB-D30: fetch-then-push per remote, deduped in
+    // first-appearance order (`array_fuse`), not sorted.
     let mut uris = Vec::new();
     for remote in &remotes {
-        if let Some(uri) = &remote.fetch_uri {
-            uris.push(uri.clone());
-        }
-        if let Some(uri) = &remote.push_uri {
-            uris.push(uri.clone());
+        for uri in [&remote.fetch_uri, &remote.push_uri].into_iter().flatten() {
+            if !uris.contains(uri) {
+                uris.push(uri.clone());
+            }
         }
     }
-    uris.sort();
-    uris.dedup();
     let repositories = revision::load_repositories_by_uris(client, &uris)?;
     let by_name: HashMap<&str, &RemoteRef> = remotes
         .iter()
@@ -677,6 +778,9 @@ pub fn published_git_hashes(
 
 /// True when the remote's push repository marks `ref_name` permanent,
 /// matching push URIs through git normalization on both sides.
+///
+/// T1153 RB-D30: on URI collisions the LAST repository wins, like
+/// PHP's `$uri_map` overwrite.
 fn is_permanent_git_ref(
     repositories: &[revision::RepositoryRef],
     remote: &RemoteRef,
@@ -686,19 +790,16 @@ fn is_permanent_git_ref(
         return false;
     };
     let push_uri = revision::normalize_git_uri(push_uri);
+    let mut winner: Option<&revision::RepositoryRef> = None;
     for repository in repositories {
-        let mut matches = false;
         for uri in repository.uris() {
             if revision::normalize_git_uri(&uri) == push_uri {
-                matches = true;
+                winner = Some(repository);
                 break;
             }
         }
-        if matches {
-            return repository.is_permanent_ref(ref_name);
-        }
     }
-    false
+    winner.is_some_and(|repository| repository.is_permanent_ref(ref_name))
 }
 
 /// Published commit hashes under Mercurial:
@@ -749,27 +850,38 @@ fn empty_revision_refs(states: &[StateCommit]) -> HashMap<String, Vec<revision::
     refs
 }
 
-/// State commit refs carry no tree hash, so only `gtcm` pairs apply.
-fn state_hash_pairs(states: &[StateCommit]) -> Vec<(String, String)> {
+/// Commit-hash pair kind: `gtcm` for git, `hgcm` for Mercurial
+/// (T1153 LAND-24: the hg working-copy query sends `hgcm` pairs).
+fn hash_pair_kind(vcs: &str) -> &'static str {
+    if vcs == "hg" { "hgcm" } else { "gtcm" }
+}
+
+/// State commit refs carry no tree hash, so one pair per state applies.
+fn state_hash_pairs(states: &[StateCommit], kind: &str) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     for state in states {
-        pairs.push(("gtcm".to_string(), state.hash.clone()));
+        pairs.push((kind.to_string(), state.hash.clone()));
     }
     pairs
 }
 
-/// Merge hash-query refs into the per-hash lists.
+/// Strip a `kind:` pair prefix (`gtcm:`/`hgcm:`) from a loader key.
+fn strip_pair_prefix<'a>(key: &'a str, kind: &str) -> Option<&'a str> {
+    key.strip_prefix(kind)?.strip_prefix(':')
+}
+
+/// Merge hash-query refs into the per-hash lists, deduplicated by
+/// PHID like `ArcanistObjectListHardpoint` (T1153 RB-D32).
 fn merge_hash_query_refs(
     client: &crate::conduit::Client,
     states: &[StateCommit],
     merged: &mut HashMap<String, Vec<revision::RevisionRef>>,
+    kind: &str,
 ) -> Result<(), String> {
-    let pairs = state_hash_pairs(states);
+    let pairs = state_hash_pairs(states, kind);
     for (key, reference) in revision::load_by_commit_hashes(client, &pairs)? {
-        if let Some(hash) = key.strip_prefix("gtcm:")
-            && let Some(list) = merged.get_mut(hash)
-        {
-            list.push(reference);
+        if let Some(hash) = strip_pair_prefix(&key, kind) {
+            push_revision_ref_once(merged, hash, &reference);
         }
     }
     Ok(())
@@ -799,7 +911,10 @@ fn revision_id_index(states: &[StateCommit]) -> (HashMap<u32, Vec<String>>, Vec<
     (id_map, id_order)
 }
 
-/// Push `reference` onto `hash`'s list unless its PHID is already there.
+/// Push `reference` onto `hash`'s list unless its PHID is already
+/// there. The list is keyed exactly like PHP's
+/// `mergeHardpointValues` (`$old[$phid]`): a missing PHID keys as
+/// `""`, so only the first PHID-less ref is kept (T1153 RB-D32).
 fn push_revision_ref_once(
     merged: &mut HashMap<String, Vec<revision::RevisionRef>>,
     hash: &str,
@@ -808,18 +923,13 @@ fn push_revision_ref_once(
     let Some(list) = merged.get_mut(hash) else {
         return;
     };
-    let mut duplicate = false;
-    if reference.phid().is_some() {
-        for item in list.iter() {
-            if item.phid() == reference.phid() {
-                duplicate = true;
-                break;
-            }
+    let key = reference.phid().unwrap_or("");
+    for item in list.iter() {
+        if item.phid().unwrap_or("") == key {
+            return;
         }
     }
-    if !duplicate {
-        list.push(reference.clone());
-    }
+    list.push(reference.clone());
 }
 
 /// Merge message-query (id) refs into the per-hash lists.
@@ -845,16 +955,28 @@ fn merge_id_query_refs(
 ///
 /// `states` runs in graph order, which also orders the conduit request
 /// parameters like the PHP hardpoint queries. Without a conduit client
-/// every hash maps to an empty list.
+/// the load fails like PHP (T1153 LAND-23).
 pub fn load_revision_refs(
     client: Option<&crate::conduit::Client>,
     states: &[StateCommit],
 ) -> Result<HashMap<String, Vec<revision::RevisionRef>>, String> {
+    load_revision_refs_for_vcs(client, states, "git")
+}
+
+/// Load revision refs with the pair kind for `vcs` (`gtcm` for git,
+/// `hgcm` for Mercurial).
+pub fn load_revision_refs_for_vcs(
+    client: Option<&crate::conduit::Client>,
+    states: &[StateCommit],
+    vcs: &str,
+) -> Result<HashMap<String, Vec<revision::RevisionRef>>, String> {
     let mut merged = empty_revision_refs(states);
+    // T1153 LAND-23: without conduit PHP's hardpoint load fails the
+    // whole workflow.
     let Some(client) = client else {
-        return Ok(merged);
+        return Err(conduit::no_uri_block());
     };
-    merge_hash_query_refs(client, states, &mut merged)?;
+    merge_hash_query_refs(client, states, &mut merged, hash_pair_kind(vcs))?;
     let (id_map, ids) = revision_id_index(states);
     merge_id_query_refs(client, &ids, &id_map, &mut merged)?;
     Ok(merged)
@@ -1890,7 +2012,8 @@ fn render_partition(
 ///
 /// `vcs` is `git` or `hg`; `marker_type` selects branches or bookmarks;
 /// `include_remote` (the `--all` extension) also heads remote-tracking
-/// markers. Without a conduit client, revision annotation stays empty.
+/// markers. Without a conduit client the workflow fails like PHP
+/// (T1153 LAND-23).
 pub fn run_workflow(
     dir: &Path,
     vcs: &str,
@@ -2212,7 +2335,7 @@ pub fn run_workflow_with_ansi(
     let mut nodes = run_head_query(&mut graph, dir, hg_command, vcs, &heads, &tails)?;
     load_disjoint_heads(&mut graph, dir, hg_command, vcs, &heads, &mut nodes)?;
     let (states, ordered_states) = collect_workflow_states(&graph, &nodes);
-    let revisions = load_revision_refs(client, &ordered_states)?;
+    let revisions = load_revision_refs_for_vcs(client, &ordered_states, vcs)?;
     let partitions = commitgraph::partition_query(&graph, &heads, Some(&nodes))?;
     let groups = group_markers_by_hash(&markers);
     let (partition_sets, partition_vectors) =
@@ -2332,19 +2455,86 @@ fn detect_vcs(dir: &Path) -> Option<&'static str> {
     }
 }
 
+/// True for the marker errors PHP raises as
+/// `PhutilArgumentUsageException` (exit 1 under the `USAGE EXCEPTION`
+/// label): outside a working copy (which fails the marker-type
+/// support gate), unsupported VCS/type pairs
+/// (`ArcanistBranchesWorkflow.php:31-38`), and the 1000-unpublished
+/// guard (`ArcanistMarkersWorkflow.php:37-43`). Query and render
+/// failures escape into a fatal. Shared with `branches`, which runs
+/// the same workflow.
+#[must_use]
+pub fn is_toolset_usage_message(message: &str) -> bool {
+    message.starts_with("not inside a working copy")
+        || message == "not inside a git repository"
+        || (message.starts_with("The version control system (\"")
+            && message.contains("does not support "))
+        || (message.starts_with("Found more than ")
+            && message.ends_with(" unpublished commits which are ancestors of heads."))
+        || message.starts_with("unknown marker type '")
+}
+
 /// Run the workflow rooted at `dir`, returning stdout text or an error message.
+/// Reject working copies that cannot list `marker_type`, returning the VCS.
+///
+/// Shared by the non-JSON tails of [`execute`] (ahead of conduit
+/// setup, per PHP's `getRepositoryAPI` order) and `execute_core`.
+fn check_vcs_support(dir: &Path, marker_type: &str) -> Result<&'static str, String> {
+    let vcs = detect_vcs(dir).ok_or_else(|| {
+        "not inside a working copy (no git repository or Mercurial '.hg' directory found)"
+            .to_string()
+    })?;
+    if !supports_marker_type(vcs, marker_type) {
+        return Err(support_error(vcs, marker_type));
+    }
+    Ok(vcs)
+}
+
+/// Resolve the marker type and run the working-copy/support gate.
+fn check_markers_support(dir: &Path, requested: Option<&str>) -> Result<String, String> {
+    let marker_type = resolve_type(dir, requested)?;
+    check_vcs_support(dir, &marker_type)?;
+    Ok(marker_type)
+}
+
 pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => return Ok(usage()),
-        Err(message) => return Err(format!("{message}\n\n{}", usage())),
+        // T1153 RB-D4 (R4): PHP renders usage errors with no dump.
+        Err(message) => return Err(message),
     };
-    let owned_client = config::client_for(options.conduit_uri.as_deref()).ok();
+    if options.json {
+        // The `--json` extension never calls conduit; it stays offline.
+        return execute_core(
+            dir,
+            &options,
+            grid::terminal_width(),
+            None,
+            terminal::ansi_enabled(),
+        );
+    }
+    // T1153 LAND-28: the working-copy/support gate runs before
+    // conduit setup — PHP's getRepositoryAPI (and its usage error)
+    // precedes the marker query.
+    check_markers_support(dir, options.marker_type.as_deref())?;
+    // T1153 LAND-23: the engine needs conduit (tokenless when only
+    // credentials are missing — calls then fail mapped); without a
+    // URI the setup block replaces the grid.
+    let owned_client = match config::client_for_tokenless_with(
+        options.conduit_uri.as_deref(),
+        dir,
+        config::arcrc_path().as_deref(),
+        &get_config::LoadOptions::default(),
+    ) {
+        Ok(client) => client,
+        Err(message) => return Err(conduit::toolset_setup_message(&message)),
+    };
     execute_core(
         dir,
         &options,
         grid::terminal_width(),
-        owned_client.as_ref(),
+        Some(&owned_client),
         terminal::ansi_enabled(),
     )
 }
@@ -2361,7 +2551,8 @@ pub fn execute_with_client(
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => return Ok(usage()),
-        Err(message) => return Err(format!("{message}\n\n{}", usage())),
+        // T1153 RB-D4 (R4): PHP renders usage errors with no dump.
+        Err(message) => return Err(message),
     };
     execute_core(dir, &options, terminal, client, terminal::ansi_enabled())
 }
@@ -2381,13 +2572,7 @@ fn execute_core(
         text.push('\n');
         return Ok(text);
     }
-    let vcs = detect_vcs(dir).ok_or_else(|| {
-        "not inside a working copy (no git repository or Mercurial '.hg' directory found)"
-            .to_string()
-    })?;
-    if !supports_marker_type(vcs, &marker_type) {
-        return Err(support_error(vcs, &marker_type));
-    }
+    let vcs = check_vcs_support(dir, &marker_type)?;
     run_workflow_ansi(dir, vcs, &marker_type, false, client, terminal, ansi)
 }
 
@@ -2398,8 +2583,31 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            ExitCode::FAILURE
+            // T1153 CORE-5: auth-coded query failures render login
+            // guidance (the toolset runtime's auth arm). The calls
+            // went out on a strict client, re-resolved here for the
+            // mapping context (config reads only, no I/O).
+            let client = parse_options(argv)
+                .ok()
+                .flatten()
+                .and_then(|options| config::client_for(options.conduit_uri.as_deref()).ok());
+            if let Some(client) = client
+                && let Some(code) = conduit::auth_report_for(&client, &message)
+            {
+                return code;
+            }
+            // T1153 RB-D4 (R4): `markers`/`branches` run in the
+            // toolset runtime (`ArcanistMarkersWorkflow extends
+            // ArcanistArcWorkflow`). Argument, support-gate, and
+            // limit errors render the red `USAGE EXCEPTION` label
+            // (exit 1); query and render failures escape into a
+            // fatal (255).
+            let kind = if parse_options(argv).is_err() || is_toolset_usage_message(&message) {
+                EnvelopeKind::ToolsetUsage
+            } else {
+                EnvelopeKind::Fatal
+            };
+            conduit::report(kind, &message)
         }
     }
 }

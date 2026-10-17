@@ -5,7 +5,7 @@
 //! `src/console/format.php`; TTY gating: `phutil_console_require_tty`).
 //!
 //! Flow: resolve the server URI (positional URI, `--conduit-uri`,
-//! `ARC_CONDUIT_URI`, or the enclosing `.arcconfig`), print the login page,
+//! `ARC_CONDUIT_URI`, or merged-config discovery), print the login page,
 //! read one API token, then branch on server capabilities. Modern servers
 //! verify the token with `user.whoami` and store `{"token": ...}`; legacy
 //! servers exchange it via `conduit.getcertificate` and store
@@ -19,28 +19,42 @@
 
 extern crate self as arc_rs;
 
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use arc_rs::{conduit, config, diff_submit, prompt, terminal};
+use arc_rs::terminal::PhtArg;
+use arc_rs::{conduit, config, diff_submit, get_config, prompt, terminal};
 
 /// Subcommand name, matching `arc install-certificate`.
 pub const NAME: &str = "install-certificate";
 
-const USAGE: &str = "usage: arc install-certificate [URI] [--conduit-uri URI] [--token TOKEN] [--force]\n\
-\n\
-Install Conduit credentials into ~/.arcrc for URI. Without URI, the URI\n\
-comes from --conduit-uri, $ARC_CONDUIT_URI, or the enclosing .arcconfig.\n\
-Without --token, the token is read from stdin after printing the login page.\n\
-\n\
-Options:\n\
-  --conduit-uri URI   Conduit server URI (under the positional URI).\n\
-  --token TOKEN       API token (else prompt via stdin).\n\
-  --force             Install standard api- tokens without prompting.\n\
-  -h, --help          Show this help.\n";
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not the short usage line. The renderer is the shared
+/// `arc_rs::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistInstallCertificateWorkflow.php:12-35`).
+const HELP_SYNOPSIS: &str = "      **install-certificate** [uri]";
+const HELP_TEXT: &str = "          Supports: http, https\n          Installs Conduit credentials into your ~/.arcrc for the given install\n          of Phabricator. You need to do this before you can use 'arc', as it\n          enables 'arc' to link your command-line activity with your account on\n          the web. Run this command from within a project directory to install\n          that project's certificate, or specify an explicit URI (like\n          \"https://phabricator.example.com/\").";
 
-const EXAMPLE_URI: &str = "https://devtools.example.com/";
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    arc_rs::help::usage_text(
+        NAME,
+        None,
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &[],
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(arc_rs::terminal::ansi_enabled())
+}
+
+const EXAMPLE_URI: &str = "https://phabricator.example.com/";
 
 /// `pht('Paste API Token from that page:')`.
 const TOKEN_PROMPT: &str = "Paste API Token from that page:";
@@ -107,20 +121,51 @@ pub fn validate_token(token: &str) -> Result<TokenKind, String> {
 }
 
 /// Resolve the server URI: positional, `--conduit-uri`, environment, then
-/// the `.arcconfig` enclosing `dir`.
+/// merged-config discovery (`phabricator.uri`, else `default`) from `dir`.
 pub fn resolve_uri(
     positional: Option<&str>,
     flag: Option<&str>,
     env: Option<&str>,
     dir: &Path,
 ) -> Result<String, String> {
+    let user_file = config::arcrc_path();
+    resolve_uri_with(
+        positional,
+        flag,
+        env,
+        dir,
+        user_file.as_deref(),
+        &get_config::LoadOptions::default(),
+    )
+}
+
+/// [`resolve_uri`] with an explicit user file and
+/// [`get_config::LoadOptions`]. Discovery reads through
+/// [`get_config::checked_value`], so a mistyped `phabricator.uri` or
+/// `default` errors like stock PHP instead of falling through.
+pub fn resolve_uri_with(
+    positional: Option<&str>,
+    flag: Option<&str>,
+    env: Option<&str>,
+    dir: &Path,
+    user_file: Option<&Path>,
+    opts: &get_config::LoadOptions,
+) -> Result<String, String> {
     let picked = [positional, flag, env]
         .into_iter()
         .flatten()
         .find(|v| !v.trim().is_empty())
-        .map(str::to_string)
-        .or_else(|| config::discover_from(dir));
-    match picked {
+        .map(str::to_string);
+    if let Some(uri) = picked {
+        return normalize_uri(&uri);
+    }
+    let merged = get_config::load_merged(dir, user_file, opts)?;
+    let found = match get_config::checked_value("phabricator.uri", &merged)? {
+        some @ Some(_) => some,
+        None => get_config::checked_value("default", &merged)?,
+    };
+    let discovered = found.and_then(|(_, value)| value.as_str().map(str::to_string));
+    match discovered {
         Some(uri) => normalize_uri(&uri),
         None => Err(
             "Specify an explicit URI or run this command from within a project which is configured with a .arcconfig."
@@ -156,17 +201,18 @@ pub fn connect_message(uri: &str) -> String {
     format!("Connecting to \"{uri}\"...")
 }
 
-/// The `**LOG IN**` header pattern (`phutil_console_format("**%s**\n")`).
+/// The `**LOGIN TO PHABRICATOR**` header pattern
+/// (`phutil_console_format("**%s**\n")`).
 #[must_use]
 pub fn login_header_markup() -> String {
-    "**LOG IN**\n".to_string()
+    "**LOGIN TO PHABRICATOR**\n".to_string()
 }
 
 /// The login-page block (`"%s\n\n%s\n\n%s"`, no trailing newline).
 #[must_use]
 pub fn login_page_block(token_url: &str) -> String {
     format!(
-        "Open this page in your browser and log in if necessary:\n\n{token_url}\n\nThen paste the API Token on that page below."
+        "Open this page in your browser and login to Phabricator if necessary:\n\n{token_url}\n\nThen paste the API Token on that page below."
     )
 }
 
@@ -222,18 +268,114 @@ pub fn accept_token_line(line: &str) -> Option<String> {
 }
 
 /// Read a whole `~/.arcrc` document; a missing file yields `{}`.
+/// The JSON error mirrors `readUserConfigurationFile()` (T1153 CORE-42),
+/// including its literal `~/.arcrc` (PHP hardcodes it even for custom
+/// paths); the non-object rejection is arc-rs strictness
+/// (T1153 CORE-35, kept).
 pub fn read_token_doc(path: &Path) -> Result<serde_json::Value, String> {
     if !path.is_file() {
         return Ok(serde_json::json!({}));
     }
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read '{}': {e}", path.display()))?;
-    let doc: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| format!("'{}' is not a valid JSON file: {e}", path.display()))?;
+    let doc: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
+        terminal::pht(
+            "Your '%s' file is not a valid JSON file.",
+            &[PhtArg::Text("~/.arcrc")],
+        )
+    })?;
     if doc.is_object() {
         Ok(doc)
     } else {
         Err(format!("'{}' is not a JSON object", path.display()))
+    }
+}
+
+/// `readUserConfigurationFile()` permission prompt (T1153 CORE-41):
+/// `pht("File permissions on your %s are too open. Fix them by
+/// chmod'ing to 600?", '~/.arcrc')`.
+const CHMOD_PROMPT: &str =
+    "File permissions on your ~/.arcrc are too open. Fix them by chmod'ing to 600?";
+
+/// Decline text: `pht('Set %s to file mode 600.', '~/.arcrc')`.
+const CHMOD_DECLINED: &str = "Set ~/.arcrc to file mode 600.";
+
+/// True when an existing `path` has group/other permission bits set
+/// (`$mode & 0177`), like PHP's open-mode check. Missing files report
+/// false (PHP only checks when the file exists); an unreadable mode is
+/// PHP's `Unable to read file permissions for "%s"!` error.
+#[cfg(unix)]
+fn arcrc_mode_is_open(path: &Path) -> Result<bool, String> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let mode = std::fs::metadata(path)
+        .map(|metadata| {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode()
+        })
+        .map_err(|_| {
+            format!(
+                "Unable to read file permissions for \"{}\"!",
+                path.display()
+            )
+        })?;
+    Ok(mode & 0o177 != 0)
+}
+
+/// `chmod 600` on `path` (PHP: `execx('chmod 600 %s', ...)`).
+#[cfg(unix)]
+fn chmod_arcrc(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = std::fs::metadata(path)
+        .map_err(|e| format!("cannot chmod '{}': {e}", path.display()))?
+        .permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions)
+        .map_err(|e| format!("cannot chmod '{}': {e}", path.display()))
+}
+
+/// `readUserConfigurationFile()` permission gate (T1153 CORE-41): on
+/// non-Windows, an existing arcrc with group/other bits set prompts to
+/// `chmod 600` (`[Y/n]`, default YES — PHP passes `$default_no =
+/// false`, `ArcanistConfigurationManager.php:198` at ceb, T1153
+/// T1153 CORE-40); a decline is the usage error, an accept chmods. Windows
+/// skips the check like PHP (`phutil_is_windows`).
+pub fn ensure_arcrc_permissions(path: &Path) -> Result<(), String> {
+    ensure_arcrc_permissions_from(
+        &mut std::io::stdin().lock(),
+        path,
+        prompt::stdin_is_terminal(),
+    )
+}
+
+/// [`ensure_arcrc_permissions`] with injected input/TTY (deterministic tests).
+pub fn ensure_arcrc_permissions_from(
+    input: &mut dyn BufRead,
+    path: &Path,
+    stdin_tty: bool,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    let _ = (input, path, stdin_tty);
+    #[cfg(windows)]
+    return Ok(());
+    #[cfg(not(windows))]
+    ensure_arcrc_permissions_unix(input, path, stdin_tty)
+}
+
+/// Non-Windows half of [`ensure_arcrc_permissions_from`].
+#[cfg(not(windows))]
+fn ensure_arcrc_permissions_unix(
+    input: &mut dyn BufRead,
+    path: &Path,
+    stdin_tty: bool,
+) -> Result<(), String> {
+    if !arcrc_mode_is_open(path)? {
+        return Ok(());
+    }
+    match prompt_confirm_from(input, CHMOD_PROMPT, false, stdin_tty)? {
+        true => chmod_arcrc(path),
+        false => Err(CHMOD_DECLINED.to_string()),
     }
 }
 
@@ -368,6 +510,8 @@ pub fn exchange_certificate(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_string();
+    // T1153 CORE-45 (kept): PHP stores whatever the server returns;
+    // empty credentials are rejected here instead.
     if username.is_empty() || certificate.is_empty() {
         return Err(format!(
             "Server \"{uri}\" returned an invalid certificate response."
@@ -442,22 +586,30 @@ pub fn install_certificate_flow(
     Ok(info)
 }
 
-/// The `writeInfo` CONNECT line (stderr; status blue).
+/// The `writeInfo` CONNECT line (stderr; status blue). PHP's
+/// `writeInfo`/`writeOkay` nest the ANSI codes in status order
+/// (`<bg:color>** %s **</bg>`), unlike log-engine lines (T1153 CORE-44).
 #[must_use]
 pub fn render_connect(uri: &str, ansi: bool) -> String {
-    terminal::format_log("blue", connect_title(), &connect_message(uri), ansi)
+    terminal::format_status_message("blue", connect_title(), &connect_message(uri), ansi)
 }
 
-/// The `**LOG IN**` header line (stdout).
+/// The `**LOGIN TO PHABRICATOR**` header line (stdout).
 pub fn render_login_header(ansi: bool) -> Result<String, String> {
-    terminal::tsprintf_ansi("**%s**\n", &[terminal::TVal::Text("LOG IN")], ansi)
-        .map(|line| line.as_str().to_string())
+    terminal::tsprintf_ansi(
+        "**%s**\n",
+        &[terminal::TVal::Text("LOGIN TO PHABRICATOR")],
+        ansi,
+    )
+    .map(|line| line.as_str().to_string())
 }
 
-/// The green `** SUCCESS! **` banner (stdout; success green).
+/// The green `** SUCCESS! **` banner (stdout; success green, status
+/// nesting like the `phutil_console_format("<bg:green>** %s **</bg>
+/// %s\n", ...)` call site — T1153 CORE-44).
 #[must_use]
 pub fn render_success(is_token_auth: bool, ansi: bool) -> String {
-    terminal::format_log(
+    terminal::format_status_message(
         "green",
         success_title(),
         success_message(is_token_auth),
@@ -465,18 +617,20 @@ pub fn render_success(is_token_auth: bool, ansi: bool) -> String {
     )
 }
 
-/// Prompt for a token on stdin, reprompting on blank lines. Echo and
-/// TTY gating mirror `phutil_console_prompt`; EOF fails fast instead of
-/// re-prompting forever like the PHP `do/while` loop.
-pub fn prompt_token() -> Result<String, String> {
+/// Prompt for a token on `input`, reprompting on blank lines. Echo
+/// and TTY gating mirror `phutil_console_prompt`
+/// (`ArcanistInstallCertificateWorkflow.php:103-109`); EOF fails fast
+/// instead of re-prompting forever like the PHP `do/while` loop.
+///
+/// The TTY is injected: scripted sessions pass `true`, production
+/// passes the real stdin state.
+pub fn prompt_token_from(input: &mut dyn BufRead, stdin_tty: bool) -> Result<String, String> {
     print!("{}", prompt::prompt_text(TOKEN_PROMPT));
-    if !prompt::stdin_is_terminal() {
+    if !stdin_tty {
         return Err(prompt::NOT_INTERACTIVE.to_string());
     }
-    let stdin = std::io::stdin();
-    let mut input = stdin.lock();
     loop {
-        match prompt::read_answer(&mut input) {
+        match prompt::read_answer(input) {
             Some(line) => {
                 if let Some(token) = accept_token_line(&line) {
                     return Ok(token);
@@ -488,11 +642,31 @@ pub fn prompt_token() -> Result<String, String> {
     }
 }
 
-/// Confirm `question` via the shared `phutil_console_confirm` port.
+/// [`prompt_token_from`] on real stdin.
+pub fn prompt_token() -> Result<String, String> {
+    prompt_token_from(&mut std::io::stdin().lock(), prompt::stdin_is_terminal())
+}
+
+/// Confirm `question` via the shared `phutil_console_confirm` port,
+/// with an injected TTY flag.
+pub fn prompt_confirm_from(
+    input: &mut dyn BufRead,
+    question: &str,
+    default_no: bool,
+    stdin_tty: bool,
+) -> Result<bool, String> {
+    let options = if default_no { "[y/N]" } else { "[Y/n]" };
+    prompt::console_confirm_with_tty(input, question, options, default_no, stdin_tty)
+}
+
+/// [`prompt_confirm_from`] on real stdin.
 pub fn prompt_confirm(question: &str, default_no: bool) -> Result<bool, String> {
-    let stdin = std::io::stdin();
-    let mut input = stdin.lock();
-    prompt::console_confirm(&mut input, question, default_no)
+    prompt_confirm_from(
+        &mut std::io::stdin().lock(),
+        question,
+        default_no,
+        prompt::stdin_is_terminal(),
+    )
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -501,6 +675,9 @@ struct Options {
     conduit_uri: Option<String>,
     token: Option<String>,
     force: bool,
+    config: Vec<String>,
+    config_files: Vec<String>,
+    arcrc_file: Option<String>,
 }
 
 type ArgIter<'a> = std::iter::Peekable<std::slice::Iter<'a, String>>;
@@ -517,6 +694,9 @@ struct Parser {
     conduit_uri: Option<String>,
     token: Option<String>,
     force: bool,
+    config: Vec<String>,
+    config_files: Vec<String>,
+    arcrc_file: Option<String>,
     positional: u32,
 }
 
@@ -527,6 +707,9 @@ impl Parser {
             conduit_uri: None,
             token: None,
             force: false,
+            config: Vec::new(),
+            config_files: Vec::new(),
+            arcrc_file: None,
             positional: 0,
         }
     }
@@ -594,11 +777,37 @@ impl Parser {
         self.push_positional(arg)
     }
 
+    fn flag_config(&mut self, arg: &str, iter: &mut ArgIter<'_>) -> Option<Step> {
+        let (name, inline) = match arg.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (arg, None),
+        };
+        if !matches!(name, "--config" | "--config-file" | "--arcrc-file") {
+            return None;
+        }
+        let value = match inline {
+            Some(value) => value.to_string(),
+            None => match iter.next() {
+                Some(value) => value.clone(),
+                None => return Some(Step::Error(format!("{name} requires a value"))),
+            },
+        };
+        match name {
+            "--config" => self.config.push(value),
+            "--config-file" => self.config_files.push(value),
+            _ => self.arcrc_file = Some(value),
+        }
+        Some(Step::Handled)
+    }
+
     fn consume(&mut self, arg: &str, iter: &mut ArgIter<'_>) -> Step {
         if let Some(step) = self.flag_conduit(arg, iter) {
             return step;
         }
         if let Some(step) = self.flag_token(arg, iter) {
+            return step;
+        }
+        if let Some(step) = self.flag_config(arg, iter) {
             return step;
         }
         self.tail(arg, iter)
@@ -610,6 +819,9 @@ impl Parser {
             conduit_uri: self.conduit_uri,
             token: self.token,
             force: self.force,
+            config: self.config,
+            config_files: self.config_files,
+            arcrc_file: self.arcrc_file,
         }
     }
 }
@@ -631,11 +843,11 @@ fn install_options(argv: &[String]) -> Result<Options, ExitCode> {
     match parse_args(argv) {
         Ok(Some(options)) => Ok(options),
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", usage());
             Err(ExitCode::SUCCESS)
         }
         Err(message) => {
-            eprintln!("arc {NAME}: {message}\n\n{USAGE}");
+            eprintln!("arc {NAME}: {message}\n\n{}", usage());
             Err(ExitCode::FAILURE)
         }
     }
@@ -643,11 +855,22 @@ fn install_options(argv: &[String]) -> Result<Options, ExitCode> {
 
 fn resolve_install_uri(options: &Options, cwd: &Path) -> Result<String, ExitCode> {
     let env_uri = std::env::var("ARC_CONDUIT_URI").ok();
-    match resolve_uri(
+    let cli = match get_config::load_options_from_cli(
+        &options.config,
+        &options.config_files,
+        options.arcrc_file.as_deref(),
+    ) {
+        Ok(cli) => cli,
+        Err(message) => return Err(fail(message)),
+    };
+    let user_file = config::arcrc_path();
+    match resolve_uri_with(
         options.uri.as_deref(),
         options.conduit_uri.as_deref(),
         env_uri.as_deref(),
         cwd,
+        user_file.as_deref(),
+        &cli,
     ) {
         Ok(uri) => Ok(uri),
         Err(message) => {
@@ -662,12 +885,15 @@ fn fail(message: String) -> ExitCode {
     ExitCode::FAILURE
 }
 
-fn install_arcrc() -> Result<PathBuf, ExitCode> {
-    match config::arcrc_path() {
-        Some(path) => Ok(path),
-        None => Err(fail(
+/// Credentials target: `--arcrc-file` wins over `~/.arcrc`, like stock
+/// PHP's `writeUserConfigurationFile()` at the custom location.
+fn install_arcrc_for(arcrc_file: Option<&str>) -> Result<PathBuf, ExitCode> {
+    match get_config::resolve_user_file(config::arcrc_path(), arcrc_file.map(Path::new)) {
+        Ok(Some(path)) => Ok(path),
+        Ok(None) => Err(fail(
             "cannot locate ~/.arcrc (HOME/USERPROFILE is not set)".to_string(),
         )),
+        Err(message) => Err(fail(message)),
     }
 }
 
@@ -759,7 +985,12 @@ fn prepare_install(argv: &[String]) -> Result<InstallPlan, ExitCode> {
         Err(_) => PathBuf::from("."),
     };
     let uri = resolve_install_uri(&options, &cwd)?;
-    let arcrc = install_arcrc()?;
+    let arcrc = install_arcrc_for(options.arcrc_file.as_deref())?;
+    // T1153 CORE-41: PHP's `readUserConfigurationFile()` gates on
+    // permissions before parsing the JSON.
+    if let Err(message) = ensure_arcrc_permissions(&arcrc) {
+        return Err(fail(message));
+    }
     let doc = match read_token_doc(&arcrc) {
         Ok(doc) => doc,
         Err(message) => return Err(fail(message)),

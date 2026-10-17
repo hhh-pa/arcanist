@@ -294,13 +294,13 @@ pub fn parse_test_results(
     let mut results = parse_xunit_testcases(xunit_xml).map_err(EngineError::Failed)?;
     if enable_coverage != Some(false) {
         let empty = String::new();
-        let coverage = read_coverage(
+        let coverage = read_coverage_ordered(
             cover_xml.unwrap_or(&empty),
             &ctx.project_root,
             line_count_of,
         );
         for result in &mut results {
-            result.set_coverage(coverage.clone());
+            result.set_coverage_ordered(coverage.clone());
         }
     }
     Ok(results)
@@ -309,13 +309,27 @@ pub fn parse_test_results(
 /// `readCoverage` (lines 128-180): coverage.py XML with `<class filename>`
 /// plus `<line number hits>` entries. Empty input yields no reports
 /// (lines 130-132); files outside the project root are skipped (lines 143-145).
+/// Legacy unordered form; the parse path uses [`read_coverage_ordered`].
 #[must_use]
 pub fn read_coverage(
     coverage_xml: &str,
     project_root: &str,
     line_count_of: &dyn Fn(&str) -> Option<usize>,
 ) -> HashMap<String, String> {
-    let mut reports = HashMap::new();
+    read_coverage_ordered(coverage_xml, project_root, line_count_of)
+        .into_iter()
+        .collect()
+}
+
+/// [`read_coverage`] in document order (UNIT-U20): reports follow the
+/// `<class>` elements like PHP's insertion-ordered array.
+#[must_use]
+pub fn read_coverage_ordered(
+    coverage_xml: &str,
+    project_root: &str,
+    line_count_of: &dyn Fn(&str) -> Option<usize>,
+) -> Vec<(String, String)> {
+    let mut reports = Vec::new();
     if coverage_xml.is_empty() {
         return reports;
     }
@@ -337,10 +351,10 @@ pub fn read_coverage(
                 lines.push((number, hits));
             }
         }
-        reports.insert(
+        reports.push((
             filename.to_string(),
             coverage_string_from_lines(line_count, &lines),
-        );
+        ));
     }
     reports
 }

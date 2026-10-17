@@ -16,10 +16,11 @@
 //! Divergences:
 //! - `regexp(...)` permanent-ref rules run through a small backtracking
 //!   matcher (literals, `.`, `*`, `+`, `?`, `{n,m}`, `|`, groups,
-//!   character classes, `^`, `$`, `\d\w\s` escapes) instead of PCRE.
+//!   character classes, `^`, `$`, `\d\w\s` escapes) instead of PCRE
+//!   (T1153 RB-D31, kept: PCRE-only constructs like lookaround and
+//!   backrefs have no equivalent in the available engine).
 //!   Patterns using other constructs never match; exact-name rules (the
-//!   common case) behave identically. The crate set has no regex engine,
-//!   like `lint_script_and_regex`.
+//!   common case) behave identically.
 
 use std::collections::HashMap;
 
@@ -224,9 +225,11 @@ fn php_int_prefix(text: &str) -> i64 {
 /// Parse the `Differential Revision:` field of a commit message, returning
 /// the revision id.
 ///
-/// Mirrors `parseRevisionIDFromRawCorpus()`: accepts `D123` or a URI whose
-/// path is `D123`; a present-but-invalid field is a usage error (which the
-/// message hardpoint query catches and skips).
+/// Mirrors `parseRevisionIDFromRawCorpus()`
+/// (`ArcanistDifferentialCommitMessage.php:117-151` at ceb, T1153
+/// T1153 RB-D37): accepts `D123` or a URI whose path is `D123`; a
+/// present-but-invalid field is a usage error (which the message
+/// hardpoint query catches and skips).
 pub fn revision_id_from_message(corpus: &str) -> Result<Option<u32>, String> {
     // `/^Differential Revision:\s*(.+)/im`: the field match is
     // case-insensitive, and `\s*` may span line breaks.
@@ -257,8 +260,10 @@ pub fn revision_id_from_message(corpus: &str) -> Result<Option<u32>, String> {
             if let Some(id) = uri_revision_id(raw) {
                 return Ok(Some(id));
             }
+            // T1153 RB-D37: the ceb wording names a Phabricator URI
+            // (`src/differential/ArcanistDifferentialCommitMessage.php:139-147`).
             return Err(format!(
-                "Invalid \"Differential Revision\" field in commit message. This field should have a revision identifier like \"D123\" or a server URI like \"https://devtools.example.com/D123\", but has \"{raw}\"."
+                "Invalid \"Differential Revision\" field in commit message. This field should have a revision identifier like \"D123\" or a Phabricator URI like \"https://phabricator.example.com/D123\", but has \"{raw}\"."
             ));
         }
         if line_end == corpus.len() {
@@ -298,6 +303,26 @@ fn uri_revision_id(raw: &str) -> Option<u32> {
     bare_revision_id(trimmed)
 }
 
+/// Build one new-style `.search` request body: `{"constraints": ...}`
+/// plus `attachments` only when given — the exact
+/// `ConduitSearchFuture` wire shape
+/// (`src/conduit/ConduitSearchFuture.php:96`). Every new-style search
+/// call site must build its params through this (or [`conduit_search`]);
+/// flat constraint params are rejected by the server with
+/// `ERR-CONDUIT-CALL`. (`edge.search` is the one exception: PHP sends it
+/// flat via `yieldConduit`, so it stays flat.)
+#[must_use]
+pub fn conduit_search_params(
+    constraints: &serde_json::Value,
+    attachments: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut params = serde_json::json!({ "constraints": constraints });
+    if let Some(extra) = attachments {
+        params["attachments"] = extra.clone();
+    }
+    params
+}
+
 /// Run a paginated conduit search (`ConduitSearchFuture`): POST
 /// `{constraints, attachments?, after?}`, accumulate `data`, follow
 /// `cursor.after` until null.
@@ -310,10 +335,7 @@ pub fn conduit_search(
     let mut objects = Vec::new();
     let mut after: Option<String> = None;
     loop {
-        let mut params = serde_json::json!({ "constraints": constraints });
-        if let Some(extra) = attachments {
-            params["attachments"] = extra.clone();
-        }
+        let mut params = conduit_search_params(constraints, attachments);
         if let Some(cursor) = &after {
             params["after"] = serde_json::Value::String(cursor.clone());
         }
@@ -401,7 +423,8 @@ pub fn load_by_ids(
 ///
 /// Mirrors the hardpoint engine merge (`ArcanistObjectListHardpoint`,
 /// queries in class-map order: the git query sorts before the message
-/// query). Refs without a PHID are kept as-is.
+/// query). A missing PHID keys as `""`, so only the first PHID-less
+/// ref is kept (T1153 RB-D15, same rule as RB-D32).
 pub fn merge_revision_refs(
     by_hash: Vec<RevisionRef>,
     by_message: Vec<RevisionRef>,
@@ -409,16 +432,16 @@ pub fn merge_revision_refs(
     let mut merged: Vec<RevisionRef> = Vec::new();
     let mut seen: HashMap<String, ()> = HashMap::new();
     for reference in by_hash.into_iter().chain(by_message) {
-        match reference.phid() {
-            Some(phid) => {
-                if seen.contains_key(phid) {
-                    continue;
-                }
-                seen.insert(phid.to_string(), ());
-                merged.push(reference);
-            }
-            None => merged.push(reference),
+        // T1153 RB-D15: `mergeHardpointValues` keys `$old[$phid]` with a
+        // null PHID as `""`
+        // (`src/hardpoint/ArcanistObjectListHardpoint.php:10-21`), so a
+        // second PHID-less ref loses like any other duplicate.
+        let key = reference.phid().unwrap_or("").to_string();
+        if seen.contains_key(&key) {
+            continue;
         }
+        seen.insert(key, ());
+        merged.push(reference);
     }
     merged
 }
@@ -436,16 +459,36 @@ fn is_scheme_char(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'.' | b'-')
 }
 
-/// Test for `user@host:path` scp syntax (`PhutilURI::isGitURIPattern`).
+/// PCRE `\s` (ASCII only): space, tab, newline, CR, FF, VT.
+fn is_pcre_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0C | 0x0B)
+}
+
+/// Last-most `head:last` split with a non-empty `/`-free head and a last
+/// part not starting with `//`: PCRE greediness plus backtracking in
+/// `isGitURIPattern()` (`src/parser/PhutilURI.php:522-552` at ceb,
+/// T1153 RB-D38c).
+fn scp_split(uri: &str) -> Option<(&str, &str)> {
+    let mut best = None;
+    for (index, byte) in uri.bytes().enumerate() {
+        if byte != b':' {
+            continue;
+        }
+        let (head, last) = (&uri[..index], &uri[index + 1..]);
+        if !head.is_empty() && !head.contains('/') && !last.starts_with("//") {
+            best = Some((head, last));
+        }
+    }
+    best
+}
+
+/// Test for `user@host:path` scp syntax (`PhutilURI::isGitURIPattern`,
+/// T1153 RB-D38c).
 fn is_scp_uri(uri: &str) -> bool {
-    let Some(colon) = uri.find(':') else {
+    let Some((head, last)) = scp_split(uri) else {
         return false;
     };
-    let (head, last) = (&uri[..colon], &uri[colon + 1..]);
-    if head.contains('/') || last.starts_with("//") {
-        return false;
-    }
-    if head.chars().chain(last.chars()).any(char::is_whitespace) {
+    if head.bytes().chain(last.bytes()).any(is_pcre_space) {
         return false;
     }
     if !last.is_empty() && last.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -532,10 +575,15 @@ fn parse_standard_uri(uri: &str) -> ParsedUri {
         domain: String::new(),
         path: String::new(),
     };
-    if uri.starts_with(char::is_whitespace) {
+    // T1153 RB-D38c: leading whitespace fails the parse (T4913);
+    // NUL is rejected too (PHP's `ltrim` strips it).
+    if uri.starts_with(|c: char| c.is_whitespace() || c == '\0') {
         return empty;
     }
-    // Reject ambiguous `scheme://host?query:with-colon` URIs outright.
+    // Reject ambiguous `scheme://host?query:with-colon` URIs outright
+    // (T1153 RB-D38c, kept: PHP throws `Rejecting ambiguous URI`
+    // (T12526); the port degrades to no-match instead of aborting the
+    // whole report over one server-provided URI).
     if is_ambiguous_query_uri(uri) {
         return empty;
     }
@@ -566,8 +614,18 @@ fn parse_uri(uri: &str) -> ParsedUri {
     if is_scp_uri(uri) {
         let colon = uri.find(':').unwrap_or(0);
         let (head, path) = (&uri[..colon], &uri[colon + 1..]);
-        let host = head.rsplit_once('@').map(|(_, host)| host).unwrap_or(head);
+        // T1153 RB-D38c: PHP splits the user at the FIRST `@`
+        // (`[^/@]+@`), so `a@b@c:d` yields host `b@c` — which the
+        // T12961 host check then rejects, like here.
+        let host = head.split_once('@').map(|(_, host)| host).unwrap_or(head);
         let host = host.split('/').next().unwrap_or(host);
+        if !host.is_empty() && !valid_host(host) {
+            return ParsedUri {
+                protocol: String::new(),
+                domain: String::new(),
+                path: String::new(),
+            };
+        }
         return ParsedUri {
             protocol: "ssh".to_string(),
             domain: host.to_string(),

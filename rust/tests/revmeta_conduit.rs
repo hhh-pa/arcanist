@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 
-use arc_rs::{close_revision, conduit, config, git, list, tasks, todo, upload};
+use arc_rs::{close_revision, conduit, config, get_config, git, list, tasks, todo, upload};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc;
@@ -371,6 +371,8 @@ fn resolve_repository_phid_queries_by_callsign() {
     let client = client_for(&base);
 
     let fx = Fixture::named("close-repo-phid");
+    // T1153 CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(fx.dir.join(".git")).unwrap();
     std::fs::write(fx.dir.join(".arcconfig"), r#"{"repository.callsign": "X"}"#).unwrap();
     assert_eq!(
         close_revision::resolve_repository_phid(&client, &fx.dir).unwrap(),
@@ -392,6 +394,8 @@ fn resolve_repository_phid_treats_old_servers_as_untracked() {
     let client = client_for(&base);
 
     let fx = Fixture::named("close-repo-old");
+    // T1153 CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(fx.dir.join(".git")).unwrap();
     std::fs::write(fx.dir.join(".arcconfig"), r#"{"repository.callsign": "X"}"#).unwrap();
     assert_eq!(
         close_revision::resolve_repository_phid(&client, &fx.dir).unwrap(),
@@ -528,9 +532,13 @@ fn tasks_runs_help_and_usage_paths() {
     assert_eq!(tasks::run(&args(&["--help"])), ExitCode::SUCCESS);
     assert_eq!(tasks::run(&args(&["--bogus"])), ExitCode::FAILURE);
     assert_eq!(tasks::run(&args(&["positional"])), ExitCode::FAILURE);
-    assert_eq!(
-        tasks::run(&args(&["--owner", "alice", "--unassigned"])),
-        ExitCode::FAILURE
+    // T1153 RB-D28: `--owner` + `--unassigned` is accepted (PHP strips
+    // the conflict spec), so this asserts at parse level — `run()`
+    // would proceed to a live conduit client here.
+    assert!(
+        tasks::parse_args(&args(&["--owner", "alice", "--unassigned"]))
+            .unwrap()
+            .is_some()
     );
 }
 
@@ -652,7 +660,8 @@ fn tasks_passes_status_order_and_limit() {
     let mut options = options_tasks();
     options.status = Some("closed".to_string());
     options.order = Some("created".to_string());
-    options.limit = Some(5);
+    // T1153 RB-D28: `--limit` rides through verbatim as the argv string.
+    options.limit = Some("5".to_string());
     tasks::execute(&client, &options).unwrap();
     assert_eq!(recv(&seen).0, "user.whoami");
     let query = recv(&seen);
@@ -826,6 +835,8 @@ fn null_browser_config() -> &'static str {
 #[test]
 fn browse_opens_the_created_task() {
     let fx = Fixture::named("todo-browse");
+    // T1153 CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(fx.dir.join(".git")).unwrap();
     std::fs::write(fx.dir.join(".arcconfig"), null_browser_config()).unwrap();
     let mut routes = HashMap::new();
     routes.insert(
@@ -847,7 +858,9 @@ fn browse_opens_the_created_task() {
         "Created task T55: 'Do thing' at https://example.test/T55\n"
     );
 
-    // A failing browser command fails the workflow with PHP's error.
+    // T1153 RB-D29b: browsing runs after printing, so `execute` only
+    // creates — a failing browser fails the separate browse step with
+    // PHP's error while the creation text above already stands.
     std::fs::write(
         fx.dir.join(".arcconfig"),
         r#"{"browser": ["definitely-not-a-browser-xyz"]}"#,
@@ -864,7 +877,13 @@ fn browse_opens_the_created_task() {
     );
     let (base, _seen) = serve(routes, 2);
     let client = client_for(&base);
-    let err = todo::execute_in(&fx.dir, &client, &options).unwrap_err();
+    let outcome = todo::create_in_ansi(&fx.dir, &client, &options, false).unwrap();
+    assert_eq!(
+        outcome.text,
+        "Created task T55: 'Do thing' at https://example.test/T55\n"
+    );
+    let task = outcome.task.unwrap();
+    let err = todo::open_created_in_browser(&fx.dir, &task).unwrap_err();
     assert!(err.contains("Failed to open URI"), "{err}");
 }
 
@@ -1050,7 +1069,105 @@ fn upload_continues_past_a_missing_file_then_reports_it() {
 fn conduit_modules_are_reachable_through_shared_helpers() {
     // `config` and `git` are exercised via the commands above; keep direct
     // references so the shared-helper wiring stays covered.
-    assert!(config::discover_from(Path::new("/nonexistent-revmeta-dir")).is_none());
+    // T1153 CORE-12: discovery honors ambient user config, so shadow it for a
+    // hermetic empty assertion.
+    let shadow_dir = Fixture::named("discover-shadow");
+    let empty = shadow_dir.dir.join("empty.json");
+    std::fs::write(&empty, "{}").unwrap();
+    let shadow = get_config::LoadOptions {
+        config_files: vec![empty],
+        ..Default::default()
+    };
+    assert!(
+        config::discover_uri_with(Path::new("/nonexistent-revmeta-dir"), None, &shadow).is_none()
+    );
     let scratch = Fixture::named("list-git-helper");
     assert!(!git::is_inside_work_tree(&scratch.dir));
+}
+
+#[test]
+fn rbd39_todo_accepts_object_shaped_user_rows() {
+    // `user.query` rows arrive as a list, but the lookup also
+    // accepts the object shape (`{"0": {...}}`).
+    let mut routes = HashMap::new();
+    routes.insert(
+        "user.whoami".to_string(),
+        envelope(r#"{"phid": "PHID-USER-1"}"#),
+    );
+    routes.insert(
+        "user.query".to_string(),
+        envelope(r#"{"0": {"phid": "PHID-USER-2"}}"#),
+    );
+    routes.insert(
+        "maniphest.createtask".to_string(),
+        envelope(r#"{"id": 1, "title": "t", "uri": "https://example.test/T1"}"#),
+    );
+    let (base, seen) = serve(routes, 3);
+    let client = client_for(&base);
+
+    let mut options = options_todo(&["t"]);
+    options.cc = args(&["alice"]);
+    todo::execute(&client, &options).unwrap();
+
+    let mut calls = [recv(&seen), recv(&seen), recv(&seen)];
+    calls.sort();
+    let create = calls
+        .iter()
+        .find(|(m, _)| m == "maniphest.createtask")
+        .unwrap();
+    assert!(create.1.contains("PHID-USER-2"), "{}", create.1);
+}
+
+#[test]
+fn rbd28_owner_wins_over_unassigned() {
+    // PHP accepts `--owner X --unassigned` (conflict spec stripped)
+    // and the owner branch wins (`if ($owner) ...`).
+    let mut routes = HashMap::new();
+    routes.insert(
+        "user.query".to_string(),
+        envelope(r#"[{"phid": "PHID-USER-9", "userName": "bob"}]"#),
+    );
+    routes.insert(
+        "maniphest.query".to_string(),
+        envelope(r#"[{"id": 3, "title": "t"}]"#),
+    );
+    let (base, seen) = serve(routes, 2);
+    let client = client_for(&base);
+
+    let mut options = options_tasks();
+    options.owner = Some("bob".to_string());
+    options.unassigned = true;
+    tasks::execute(&client, &options).unwrap();
+    assert_eq!(recv(&seen).0, "user.query");
+    let query = recv(&seen);
+    assert_eq!(query.0, "maniphest.query");
+    assert!(query.1.contains("PHID-USER-9"), "{}", query.1);
+}
+
+#[test]
+fn rbd28_limit_and_blank_order_status_sent_php_shaped() {
+    // `--limit abc` rides through verbatim; blank `--order` /
+    // `--status` fall back to the PHP defaults.
+    let mut routes = HashMap::new();
+    routes.insert("maniphest.query".to_string(), envelope("[]"));
+    routes.insert(
+        "user.whoami".to_string(),
+        envelope(r#"{"phid": "PHID-USER-1"}"#),
+    );
+    let (base, seen) = serve(routes, 2);
+    let client = client_for(&base);
+
+    let mut options = options_tasks();
+    options.limit = Some("many".to_string());
+    options.order = Some(String::new());
+    options.status = Some(String::new());
+    assert_eq!(
+        tasks::execute(&client, &options).unwrap(),
+        "No tasks found.\n"
+    );
+    assert_eq!(recv(&seen).0, "user.whoami");
+    let query = recv(&seen);
+    assert!(query.1.contains("many"), "{}", query.1);
+    assert!(query.1.contains("order-priority"), "{}", query.1);
+    assert!(query.1.contains("status-open"), "{}", query.1);
 }

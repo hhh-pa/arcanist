@@ -95,33 +95,54 @@ fn commit_at(dir: &Path, name: &str, date: &str) {
 
 #[test]
 fn parses_empty_and_help() {
-    assert_eq!(parse_args(&args(&[])), Ok(Some(())));
-    assert_eq!(parse_args(&args(&["--help"])), Ok(None));
-    assert_eq!(parse_args(&args(&["-h"])), Ok(None));
+    // T1153 BROWSE-B21: TTY runs need no `--`; piped runs do.
+    assert_eq!(parse_args_with_tty(&args(&[]), true), Ok(Some(())));
+    assert_eq!(
+        parse_args_with_tty(&args(&[]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    assert_eq!(parse_args_with_tty(&args(&["--"]), false), Ok(Some(())));
+    assert_eq!(
+        parse_args_with_tty(&args(&["--help", "--"]), false),
+        Ok(None)
+    );
+    assert_eq!(parse_args_with_tty(&args(&["-h", "--"]), false), Ok(None));
 }
 
 #[test]
 fn rejects_arguments_and_flags() {
+    // Unknown flags report before the terminator check; `--help`
+    // without `--` when piped reports the terminator.
     assert_eq!(
-        parse_args(&args(&["--"])),
-        Err("unexpected argument '--': version takes no arguments".to_string())
-    );
-    assert_eq!(
-        parse_args(&args(&["--bogus"])),
+        parse_args_with_tty(&args(&["--bogus"]), false),
         Err("unknown flag '--bogus'".to_string())
     );
     assert_eq!(
-        parse_args(&args(&["extra"])),
+        parse_args_with_tty(&args(&["extra", "--"]), false),
         Err("unexpected argument 'extra'".to_string())
+    );
+    assert_eq!(
+        parse_args_with_tty(&args(&["--help"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
     );
 }
 
 #[test]
 fn usage_names_command_and_synopsis() {
-    let text = usage();
-    assert!(text.starts_with("usage: arc version\n"), "{text}");
-    assert!(text.contains("Show toolset version information."), "{text}");
-    assert!(text.contains("Shows the current version."), "{text}");
+    // T1153 BROWSE-B23: `--help` renders the generated workflow help.
+    let text = usage_text(false);
+    assert_eq!(
+        text,
+        "VERSION WORKFLOW\n\
+         \n\
+         version\n\
+         Show toolset version information.\n\
+         \n\
+         Shows the current version.\n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
 
 #[test]
@@ -130,9 +151,16 @@ fn error_messages_match_php_text() {
         missing_git_message(),
         "Cannot display current version without \"git\" installed."
     );
+    // T1153 CORE-61: outside the CWD the path stays absolute, like
+    // `Filesystem::readablePath()`.
     assert_eq!(
-        not_git_message(Path::new("/tmp/nonexistent-wc")),
+        not_git_message(Path::new("/var"), Path::new("/tmp/nonexistent-wc")),
         "Library \"arcanist\" (at \"/tmp/nonexistent-wc\") is not a Git working copy, so no version information can be provided."
+    );
+    // Under the CWD it relativizes.
+    assert_eq!(
+        not_git_message(Path::new("/tmp"), Path::new("/tmp/nonexistent-wc")),
+        "Library \"arcanist\" (at \"nonexistent-wc\") is not a Git working copy, so no version information can be provided."
     );
 }
 
@@ -192,11 +220,11 @@ fn reports_fixture_checkout_version() {
     let hash = git_output(&repo.path, &["rev-parse", "HEAD"]);
     assert_eq!(hash.len(), 40);
     assert_eq!(
-        version_text_in(&repo.path, 0),
+        version_text_in(&repo.path, &repo.path, 0),
         Ok(format!("arcanist {hash} (5 Oct 2026)\n"))
     );
     // Live render keeps the PHP line shape in any zone.
-    let live = version_text(&repo.path).unwrap();
+    let live = version_text(&repo.path, &repo.path).unwrap();
     assert!(live.starts_with(&format!("arcanist {hash} (")));
     assert!(live.ends_with(")\n"));
 }
@@ -207,25 +235,31 @@ fn resolves_library_root_from_subdirectory() {
     commit_at(&repo.path, "a.txt", "2026-10-05 12:00:00 +0000");
     let nested = repo.path.join("a").join("b");
     std::fs::create_dir_all(&nested).unwrap();
-    let root = library_root(&nested).unwrap();
+    let root = library_root(&repo.path, &nested).unwrap();
     let expected = git_output(&repo.path, &["rev-parse", "--show-toplevel"]);
     assert_eq!(root, PathBuf::from(expected.as_str()));
     let hash = git_output(&repo.path, &["rev-parse", "HEAD"]);
     assert_eq!(
-        version_text_in(&nested, 0),
+        version_text_in(&repo.path, &nested, 0),
         Ok(format!("arcanist {hash} (5 Oct 2026)\n"))
     );
 }
 
 #[test]
 fn rejects_directories_outside_any_checkout() {
+    // T1153 CORE-60 (kept): with no library root to resolve, an
+    // installed binary outside any checkout reports the not-a-git-copy
+    // error (exit 1 via the `USAGE EXCEPTION` arm, T1153 CORE-49).
     let tmp = TempDir::new("plain");
-    assert_eq!(library_root(tmp.path()), Err(not_git_message(tmp.path())));
+    assert_eq!(
+        library_root(tmp.path(), tmp.path()),
+        Err(not_git_message(tmp.path(), tmp.path()))
+    );
     // Either precondition may fail depending on the machine, but a bare
     // temp dir can never report a version.
-    let err = version_text(tmp.path()).unwrap_err();
+    let err = version_text(tmp.path(), tmp.path()).unwrap_err();
     assert!(
-        err == not_git_message(tmp.path()) || err == missing_git_message(),
+        err == not_git_message(tmp.path(), tmp.path()) || err == missing_git_message(),
         "{err}"
     );
     assert_eq!(
@@ -238,19 +272,20 @@ fn rejects_directories_outside_any_checkout() {
 fn fails_without_commits() {
     let repo = fresh_repo("empty");
     assert!(head_commit(&repo.path).is_err());
-    assert!(version_text(&repo.path).is_err());
+    assert!(version_text(&repo.path, &repo.path).is_err());
 }
 
 #[test]
 fn run_in_reports_help_and_usage_errors() {
+    // T1153 BROWSE-B21: piped runs carry `--`.
     let repo = fresh_repo("runin");
     commit_at(&repo.path, "a.txt", "2026-10-05 12:00:00 +0000");
     assert_eq!(
-        run_in(&repo.path, &args(&[])),
+        run_in(&repo.path, &args(&["--"])),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(
-        run_in(&repo.path, &args(&["--help"])),
+        run_in(&repo.path, &args(&["--help", "--"])),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(
@@ -261,7 +296,11 @@ fn run_in_reports_help_and_usage_errors() {
 
 #[test]
 fn run_reports_help_and_usage_errors() {
-    assert_eq!(run(&args(&["--help"])), std::process::ExitCode::SUCCESS);
+    // T1153 BROWSE-B21: piped runs carry `--`.
+    assert_eq!(
+        run(&args(&["--help", "--"])),
+        std::process::ExitCode::SUCCESS
+    );
     assert_eq!(run(&args(&["--bogus"])), std::process::ExitCode::FAILURE);
 }
 

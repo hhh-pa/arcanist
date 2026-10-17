@@ -17,7 +17,6 @@
 extern crate self as arc_rs;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_rs::lint::{LintMessage, Linter, OptionContext};
@@ -146,6 +145,11 @@ pub fn parse_compact_output(path: &str, stderr: &str) -> Vec<LintMessage> {
                 description,
                 original: None,
                 replacement: None,
+                granularity: None,
+                locations: Vec::new(),
+                bypass_changed_line_filtering: None,
+                original_bytes: None,
+                replacement_bytes: None,
             });
         }
     }
@@ -219,6 +223,11 @@ pub fn native_json_check(path: &str, data: &[u8]) -> Vec<LintMessage> {
             description: short_message(&error.to_string()),
             original: None,
             replacement: None,
+            granularity: None,
+            locations: Vec::new(),
+            bypass_changed_line_filtering: None,
+            original_bytes: None,
+            replacement_bytes: None,
         }],
     }
 }
@@ -294,11 +303,11 @@ fn run_tool(binary: &Path, args: &[String]) -> Option<ToolOutput> {
         Some(ext) if ext.eq_ignore_ascii_case("bat") || ext.eq_ignore_ascii_case("cmd")
     );
     let mut command = if scripted {
-        let mut command = Command::new("cmd");
+        let mut command = crate::proc_env::command("cmd");
         command.arg("/C").arg(binary).args(args);
         command
     } else {
-        let mut command = Command::new(binary);
+        let mut command = crate::proc_env::command(binary);
         command.args(args);
         command
     };
@@ -336,6 +345,11 @@ fn failure_message(path: &str, description: &str) -> LintMessage {
         description: description.to_string(),
         original: None,
         replacement: None,
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     }
 }
 

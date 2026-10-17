@@ -49,6 +49,8 @@ fn messages_are_repeatable() {
 
 #[test]
 fn parses_flags() {
+    // T1153 CORE-64: git support plus `-m`/`--all`/`--allow-empty`
+    // are pure extensions (PHP commits svn only).
     let options = parse_options(&args(&["--all", "--allow-empty", "--show"]))
         .unwrap()
         .unwrap();
@@ -119,10 +121,18 @@ fn normalizes_messages() {
 
 #[test]
 fn usage_covers_options_and_limits() {
-    let text = usage();
-    assert!(text.contains("usage: arc commit"));
-    assert!(text.contains("--revision") && text.contains("--show"));
-    assert!(text.contains("--conduit-uri"));
+    // T1153 B21/B23: `--help` renders the generated workflow help
+    // (extensions stay undocumented).
+    let text = usage_text(false);
+    assert!(text.contains("COMMIT WORKFLOW"), "{text}");
+    assert!(
+        text.contains("--revision") && text.contains("--show"),
+        "{text}"
+    );
+    assert!(text.contains("Supports: svn"), "{text}");
+    assert!(!text.contains("--conduit-uri"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
 
 fn scratch(name: &str) -> std::path::PathBuf {
@@ -311,4 +321,166 @@ fn message_files_are_unique_under_concurrency() {
     for path in &paths {
         std::fs::remove_file(path).ok();
     }
+}
+
+/// Serve conduit routes, recording `(method, body)` pairs.
+fn serve_recording(
+    routes: std::collections::HashMap<String, String>,
+    expected: usize,
+) -> (String, std::sync::mpsc::Receiver<(String, String)>) {
+    use std::io::{Read, Write};
+    let (send, recv) = std::sync::mpsc::channel();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for _ in 0..expected {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            let head_text = String::from_utf8_lossy(&head).to_string();
+            let len: usize = head_text
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(key, value)| {
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).unwrap();
+            let method = head_text
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .strip_prefix("/api/")
+                .unwrap_or("")
+                .to_string();
+            send.send((method.clone(), String::from_utf8_lossy(&body).to_string()))
+                .ok();
+            let canned = routes
+                .get(&method)
+                .cloned()
+                .unwrap_or_else(|| r#"{"result": null, "error_code": "ERR-NO-ROUTE"}"#.to_string());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                canned.len(),
+                canned
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    (base, recv)
+}
+
+#[test]
+fn commit_c3_looksoon_nudges_repository_and_swallows_failures() {
+    // T1153 COMMIT-C3: after resolving the repository, `commit` sends
+    // the advisory `diffusion.looksoon`; a failing nudge is swallowed.
+    let dir = std::env::temp_dir().join(format!("arc-rs-commit-c3-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::write(dir.join(".arcconfig"), r#"{"repository.callsign": "X"}"#).unwrap();
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "repository.query".to_string(),
+        r#"{"result": [{"phid": "PHID-REPO-1"}], "error_code": null, "error_info": null}"#
+            .to_string(),
+    );
+    routes.insert(
+        "diffusion.looksoon".to_string(),
+        r#"{"result": null, "error_code": "ERR-CONDUIT-CALL", "error_info": "nope"}"#.to_string(),
+    );
+    let (base, seen) = serve_recording(routes, 2);
+    let client = Client::new(&base, "t").unwrap();
+    ask_for_repository_update(&client, &dir);
+    // Bounded receives: a wiring regression must fail, never hang the suite.
+    let wait = std::time::Duration::from_secs(30);
+    let mut calls = [
+        seen.recv_timeout(wait).unwrap(),
+        seen.recv_timeout(wait).unwrap(),
+    ];
+    calls.sort();
+    assert_eq!(calls[0].0, "diffusion.looksoon");
+    // The nudge names the resolved repository PHID.
+    assert!(calls[0].1.contains("PHID-REPO-1"), "{}", calls[0].1);
+    assert_eq!(calls[1].0, "repository.query");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn commit_c3_looksoon_skips_untracked_working_copies() {
+    // T1153 COMMIT-C3: with no identifiable repository, no call runs.
+    let dir = std::env::temp_dir().join(format!("arc-rs-commit-c3-bare-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let client = Client::new("https://conduit.test/", "t").unwrap();
+    // No identifiable repository (and no network): silently skipped.
+    ask_for_repository_update(&client, &dir);
+    std::fs::remove_dir_all(&dir).ok();
+}
+#[test]
+fn r10_commit_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "COMMIT WORKFLOW\n\
+         \n\
+         commit\n\
+         \x20     commit [--revision revision_id] [--show]\n\
+         \n\
+         \x20         Supports: svn\n\
+         \x20         Commit a revision which has been accepted by a reviewer.\n\
+         \n\
+         \x20     --revision revision_id\n\
+         \x20         Commit a specific revision. If you do not specify a revision, arc\n\
+         \x20         will look for committable revisions.\n\
+         \n\
+         \x20     --show\n\
+         \x20         Show the command which would be issued, but do not actually commit\n\
+         \x20         anything.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("COMMIT WORKFLOW"), "{}", usage());
+}
+
+#[test]
+fn b21_commit_needs_no_terminator() {
+    // T1153 B21/B23 VERIFIED for `commit`: it is a classic workflow,
+    // so PHP runs it via the `scripts/arcanist.php` re-exec, which
+    // never requires `--`. Parsing takes no TTY input, so
+    // piped-style argv parses directly, and `--help` without `--`
+    // still succeeds.
+    assert!(parse_options(&args(&["--show"])).unwrap().is_some());
+    assert_eq!(parse_options(&args(&["--help"])).unwrap(), None);
+    let text = usage_text(false);
+    assert!(text.contains("COMMIT WORKFLOW"), "{text}");
+}
+
+#[test]
+fn b23_commit_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help commit`.
+    let text = usage_text(false);
+    assert!(text.starts_with("COMMIT WORKFLOW\n"), "{text}");
+    assert!(
+        text.contains("Commit a revision which has been accepted"),
+        "{text}"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }

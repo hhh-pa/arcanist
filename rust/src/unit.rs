@@ -11,17 +11,17 @@
 //! Selection mirrors `newUnitTestEngine`: explicit `--engine` (workflow
 //! line 151 passes `getArgument('engine)`), then the `unit.engine`
 //! `.arcconfig` key (workflow lines 2111-2113), then `.arcunit` in the
-//! project root (lines 2115-2119). When nothing is configured this port
-//! runs the `cargo` engine; PHP throws `ArcanistNoEngineException`
-//! (lines 2121-2129) instead.
+//! project root (lines 2115-2119), else `ArcanistNoEngineException`
+//! (lines 2121-2129). The `cargo` engine runs only when named explicitly
+//! or via `unit.engine`.
 //!
 //! `--engine` accepts `cargo` plus the PHP engine class names verbatim.
-//! `.arcunit` `type` values accept the same class names plus `phutil`
-//! (`PhutilUnitTestEngine.php:8-10`); PHP resolves `.arcunit` types through
-//! a class map of `getEngineConfigurationName` values
+//! `.arcunit` `type` values resolve through the class map of
+//! `getEngineConfigurationName` values
 //! (`ArcanistConfigurationDrivenUnitTestEngine.php:176-181`) where only
-//! `phutil` is non-null in-tree, so accepting class names there diverges
-//! from PHP to make every ported engine selectable.
+//! `phutil` is non-null in-tree (`PhutilUnitTestEngine.php:8-10`), so only
+//! `phutil` validates there; single-engine runs accept the class names
+//! plus `phutil`.
 //!
 //! Out-of-process notes: the `cargo` engine treats positional paths as
 //! `cargo test` filters and warns (instead of failing) on coverage flags
@@ -42,8 +42,11 @@ use arc_rs::unit_config::{self, PlannedEngine};
 use arc_rs::unit_engine::{
     CommandRunner, EngineContext, EngineError, UnitResult as EngineUnitResult,
 };
-use arc_rs::{config, unit_csharp, unit_nose, unit_phpunit, unit_phutil, unit_pytest, unit_xunit};
+use arc_rs::{
+    config, get_config, unit_csharp, unit_nose, unit_phpunit, unit_phutil, unit_pytest, unit_xunit,
+};
 
+use crate::conduit::{self, ClassifiedError, EnvelopeKind};
 use crate::terminal;
 
 pub const NAME: &str = "unit";
@@ -64,9 +67,17 @@ pub const AVAILABLE_ENGINES: &[&str] = &[
     "XUnitTestEngine",
 ];
 
-/// `.arcunit` `type` values: the PHP engine class names plus `phutil`
-/// (`PhutilUnitTestEngine.php:9` returns `'phutil'`).
-pub const CONFIG_AVAILABLE: &[&str] = &[
+/// `.arcunit` `type` values (UNIT-U15): the `getEngineConfigurationName`
+/// class map (`ArcanistConfigurationDrivenUnitTestEngine.php:176-181`),
+/// where only `phutil` is non-null in-tree
+/// (`PhutilUnitTestEngine.php:8-10`).
+pub const CONFIG_AVAILABLE: &[&str] = &["phutil"];
+
+/// Engine types the single-engine runners accept: the ported PHP engine
+/// class names plus `phutil` (`.arcunit`'s class-map spelling of
+/// `PhutilUnitTestEngine`, which `--engine` itself rejects like PHP's
+/// `class_exists` check).
+pub const SINGLE_AVAILABLE: &[&str] = &[
     "CSharpToolsTestEngine",
     "NoseTestEngine",
     "PhpunitTestEngine",
@@ -76,7 +87,93 @@ pub const CONFIG_AVAILABLE: &[&str] = &[
     "phutil",
 ];
 
-pub const USAGE: &str = "usage: arc unit [--rev REV] [--engine ENGINE] [--coverage] [--no-coverage] [--detailed-coverage] [--json] [--output FORMAT] [--target PHID] [--everything] [--ugly] [--conduit-uri URI] [paths...] [-- <cargo-test-args>]\n";
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `crate::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistUnitWorkflow.php:21-110`).
+const HELP_SYNOPSIS: &str =
+    "      **unit** [__options__] [__paths__]\n      **unit** [__options__] --rev [__rev__]";
+const HELP_TEXT: &str = "          Supports: git, svn, hg\n          Run unit tests that cover specified paths. If no paths are specified,\n          unit tests covering all modified files will be run.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[
+    (
+        "rev",
+        None,
+        Some("revision"),
+        "Run unit tests covering changes since a specific revision.",
+    ),
+    (
+        "engine",
+        None,
+        Some("classname"),
+        "Override configured unit engine for this project.",
+    ),
+    (
+        "coverage",
+        None,
+        None,
+        "Always enable coverage information.",
+    ),
+    (
+        "no-coverage",
+        None,
+        None,
+        "Always disable coverage information.",
+    ),
+    (
+        "detailed-coverage",
+        None,
+        None,
+        "Show a detailed coverage report on the CLI. Implies --coverage.",
+    ),
+    ("json", None, None, "Report results in JSON format."),
+    (
+        "output",
+        None,
+        Some("format"),
+        "With 'full', show full pretty report (Default). With 'json', report results in JSON format. With 'ugly', use uglier (but more efficient) JSON formatting. With 'none', don't print results.",
+    ),
+    (
+        "target",
+        None,
+        Some("phid"),
+        "(PROTOTYPE) Record a copy of the test results on the specified Harbormaster build target.",
+    ),
+    (
+        "everything",
+        None,
+        None,
+        "Run every test associated with a tracked file in the working copy.",
+    ),
+    (
+        "ugly",
+        None,
+        None,
+        "With --json, use uglier (but more efficient) formatting.",
+    ),
+];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        None,
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &specs,
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(terminal::ansi_enabled())
+}
 
 /// Number of trailing output lines echoed after the one-line summary.
 pub const TAIL_LINES: usize = 20;
@@ -156,6 +253,12 @@ pub struct Options {
     pub ugly: bool,
     /// Conduit URI override (global `--conduit-uri`, threaded like `diff`).
     pub conduit_uri: Option<String>,
+    /// Runtime `--config key=value` pairs (highest-precedence source).
+    pub config: Vec<String>,
+    /// `--config-file` paths (replace the system/user sources).
+    pub config_file: Vec<String>,
+    /// `--arcrc-file` path (replaces `~/.arcrc`).
+    pub arcrc_file: Option<String>,
     /// Positional paths (`*` maps to `paths`, line 106).
     pub paths: Vec<String>,
     /// Canonical long flag names in first-provision order (PHP `$dict`
@@ -164,8 +267,10 @@ pub struct Options {
     pub provided: Vec<&'static str>,
     /// `--help`/`-h` (compat wrapper only; `parse_options` returns `None`).
     pub help: bool,
-    /// Cargo-test args after the first `--` (Rust extension; D1 collects
-    /// these into `paths`).
+    /// Extra `cargo test` args for hand-built options (Rust extension):
+    /// the CLI collects everything after `--` into `paths` like PHP
+    /// (`ArcanistWorkflow.php:818-823`), and the cargo engine forwards
+    /// paths as test-name filters.
     pub cargo_args: Vec<String>,
     /// True when `--engine` was given explicitly (override like PHP
     /// `newUnitTestEngine($engine_class)`).
@@ -186,6 +291,9 @@ impl Default for Options {
             everything: false,
             ugly: false,
             conduit_uri: None,
+            config: Vec::new(),
+            config_file: Vec::new(),
+            arcrc_file: None,
             paths: Vec::new(),
             provided: Vec::new(),
             help: false,
@@ -203,6 +311,9 @@ enum ValueFlag {
     Output,
     Target,
     ConduitUri,
+    Config,
+    ConfigFile,
+    ArcrcFile,
 }
 
 /// A boolean `unit` flag.
@@ -297,6 +408,21 @@ const FLAG_SPECS: &[FlagSpec] = &[
         short: None,
         flag: Flag::Value(ValueFlag::ConduitUri),
     },
+    FlagSpec {
+        long: "config",
+        short: None,
+        flag: Flag::Value(ValueFlag::Config),
+    },
+    FlagSpec {
+        long: "config-file",
+        short: None,
+        flag: Flag::Value(ValueFlag::ConfigFile),
+    },
+    FlagSpec {
+        long: "arcrc-file",
+        short: None,
+        flag: Flag::Value(ValueFlag::ArcrcFile),
+    },
 ];
 
 /// Find a spec by long name (`--engine`).
@@ -329,6 +455,9 @@ fn store_value_flag(options: &mut Options, flag: ValueFlag, value: String) {
         ValueFlag::Output => options.output = Some(value),
         ValueFlag::Target => options.target = Some(value),
         ValueFlag::ConduitUri => options.conduit_uri = Some(value),
+        ValueFlag::Config => options.config.push(value),
+        ValueFlag::ConfigFile => options.config_file.push(value),
+        ValueFlag::ArcrcFile => options.arcrc_file = Some(value),
     }
 }
 
@@ -423,18 +552,17 @@ fn parse_short_flag(
 /// Parse `argv` (excluding the `unit` subcommand name).
 ///
 /// Ports `ArcanistWorkflow::parseArguments()`
-/// (`src/workflow/ArcanistWorkflow.php:788-926`): `--` ends flags (cargo
-/// extension: the rest forwards to `cargo test` instead of collecting into
-/// `paths`), positionals collect into `paths` (the `*` wildcard), and
-/// conflicts are checked after the whole line parses. Returns `Ok(None)`
-/// when `--help` was requested.
+/// (`src/workflow/ArcanistWorkflow.php:788-926`): `--` ends flags and the
+/// rest collects into `paths` like any positional (the `*` wildcard;
+/// UNIT-U6), and conflicts are checked after the whole line parses.
+/// Returns `Ok(None)` when `--help` was requested.
 pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
     let mut options = Options::default();
     let mut queue: VecDeque<String> = argv.iter().cloned().collect();
     let mut end_of_flags = false;
     while let Some(arg) = queue.pop_front() {
         if end_of_flags {
-            options.cargo_args.push(arg);
+            options.paths.push(arg);
             continue;
         }
         if arg == "--" {
@@ -461,8 +589,8 @@ pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
 /// Parse `argv` (excluding the `unit` subcommand name), compat wrapper.
 ///
 /// Maps `parse_options` help (`None`) to `help: true`; all other outcomes
-/// pass through. Everything after the first `--` forwards verbatim to
-/// `cargo test`; only tokens before it are interpreted as `unit` flags.
+/// pass through. Everything after the first `--` collects into `paths`;
+/// only tokens before it are interpreted as `unit` flags.
 pub fn parse_args(argv: &[String]) -> Result<Options, String> {
     match parse_options(argv)? {
         Some(opts) => Ok(opts),
@@ -658,7 +786,7 @@ pub fn check_everything_paths(everything: bool, paths: &[String]) -> Result<(), 
 
 /// Run `git` with `args` in `cwd`, capturing output.
 fn git_output(cwd: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    std::process::Command::new("git")
+    crate::proc_env::command("git")
         .current_dir(cwd)
         .args(args)
         .output()
@@ -1035,13 +1163,16 @@ pub fn select_paths_with(
     if !opts.paths.is_empty() {
         return validate_paths(&opts.paths, cwd, project_root);
     }
+    // UNIT-U26: an empty `--rev` is falsy in PHP (`if ($rev)`), so it
+    // takes the plain status path instead of resolving a range.
+    let rev = opts.rev.as_deref().filter(|rev| !rev.is_empty());
     let Some(vcs) = detect_vcs(cwd) else {
         return Ok(Vec::new());
     };
     match vcs {
-        Vcs::Git => working_copy_paths(cwd, opts.rev.as_deref()),
-        Vcs::Hg => hg_working_copy_paths_with(project_root, hg, opts.rev.as_deref()),
-        Vcs::Svn => svn_working_copy_paths_with(project_root, svn, opts.rev.as_deref()),
+        Vcs::Git => working_copy_paths(cwd, rev),
+        Vcs::Hg => hg_working_copy_paths_with(project_root, hg, rev),
+        Vcs::Svn => svn_working_copy_paths_with(project_root, svn, rev),
     }
 }
 
@@ -1087,24 +1218,51 @@ pub fn find_arcunit_from(dir: &Path) -> Option<PathBuf> {
 }
 
 /// Read the `unit.engine` key (`ArcanistWorkflow.php:2112`
-/// `getConfigFromAnySource('unit.engine')`) from the nearest `.arcconfig`
-/// walking up from `dir`.
+/// `getConfigFromAnySource('unit.engine')`) from any config source for
+/// `dir` (local > project > user > system > default). Lenient:
+/// unreadable sources and non-string values read empty, like the old
+/// walk-up; [`unit_engine_from_merged`] surfaces type errors instead.
 #[must_use]
 pub fn find_unit_engine_from(dir: &Path) -> Option<String> {
-    for ancestor in dir.ancestors() {
-        let Ok(text) = std::fs::read_to_string(ancestor.join(".arcconfig")) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-            continue;
-        };
-        if let Some(name) = value.get("unit.engine").and_then(|v| v.as_str())
-            && !name.is_empty()
-        {
-            return Some(name.to_string());
-        }
+    let user_file = config::arcrc_path();
+    find_unit_engine_with(
+        dir,
+        user_file.as_deref(),
+        &get_config::LoadOptions::default(),
+    )
+}
+
+/// [`find_unit_engine_from`] with an explicit user file and
+/// [`get_config::LoadOptions`].
+#[must_use]
+pub fn find_unit_engine_with(
+    dir: &Path,
+    user_file: Option<&Path>,
+    opts: &get_config::LoadOptions,
+) -> Option<String> {
+    let merged = get_config::load_merged(dir, user_file, opts).ok()?;
+    get_config::merged_value("unit.engine", &merged).and_then(|(_, value)| {
+        value
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+    })
+}
+
+/// Read `unit.engine` from a merged load with `willReadValue()`
+/// validation: a mistyped value errors (like stock PHP) instead of
+/// reading empty. An empty string reads as unset (PHP's falsy
+/// fallthrough to `.arcunit`).
+pub fn unit_engine_from_merged(
+    merged: &get_config::MergedConfig,
+) -> Result<Option<String>, String> {
+    match get_config::checked_value("unit.engine", merged)? {
+        Some((_, value)) => Ok(value
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)),
+        None => Ok(None),
     }
-    None
 }
 
 /// Aggregate report for one engine run.
@@ -1172,10 +1330,9 @@ pub fn tail(text: &str, n: usize) -> String {
 }
 
 /// `cargo test` arguments for an options set (Rust extension; PHP has no
-/// cargo engine): the cargo-test args after the unit `--` separator first,
-/// then the positional unit paths as test-name filters. Filters after a
-/// `--` in the cargo args still filter: the test binary treats its first
-/// positional the same way.
+/// cargo engine): hand-built `cargo_args` first, then the positional unit
+/// paths as test-name filters. The CLI collects post-`--` tokens into
+/// `paths` like PHP (UNIT-U6), so they reach cargo as filters too.
 #[must_use]
 pub fn cargo_test_argv(opts: &Options) -> Vec<String> {
     let mut argv = vec!["test".to_string()];
@@ -1228,11 +1385,7 @@ pub fn execute(
     target_dir: Option<&Path>,
 ) -> Result<EngineReport, String> {
     if !AVAILABLE_ENGINES.contains(&opts.engine.as_str()) {
-        return Err(format!(
-            "unknown engine '{}' (available engines: {})",
-            opts.engine,
-            AVAILABLE_ENGINES.join(", ")
-        ));
+        return Err(not_a_subclass_message(&opts.engine));
     }
     if opts.engine != "cargo" {
         return Err(format!(
@@ -1247,7 +1400,7 @@ pub fn execute(
         ));
     };
 
-    let mut cmd = std::process::Command::new("cargo");
+    let mut cmd = crate::proc_env::command("cargo");
     cmd.args(cargo_test_argv(opts))
         .current_dir(&root)
         .env("CARGO_NET_OFFLINE", "true")
@@ -1292,7 +1445,7 @@ pub fn execute(
 /// (`ArcanistWorkflow.php:2107-2147`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selection {
-    /// Default `cargo` run (PHP throws `ArcanistNoEngineException` here).
+    /// `cargo` run (only when named explicitly or via `unit.engine`).
     Cargo,
     /// One engine named by `--engine` or `unit.engine`.
     Single(String),
@@ -1303,60 +1456,121 @@ pub enum Selection {
     },
 }
 
+/// Bad-engine message (`ArcanistWorkflow.php:2130-2137`, UNIT-U8):
+/// `Configured unit test engine "%s" is not a subclass of "%s", but must
+/// be.` Custom PHP engine classes are unportable (Rule 3), so names outside
+/// the ported set always take this arm.
+fn not_a_subclass_message(engine: &str) -> String {
+    format!(
+        "Configured unit test engine \"{engine}\" is not a subclass of \
+         \"ArcanistUnitTestEngine\", but must be."
+    )
+}
+
+/// No-engine message (`ArcanistWorkflow.php:2121-2129`, UNIT-U7).
+fn no_engine_message() -> String {
+    "No unit test engine is configured for this project. Create an '.arcunit' file, or \
+     configure an advanced engine with 'unit.engine' in '.arcconfig'."
+        .to_string()
+}
+
 fn validate_engine(engine: &str) -> Result<(), String> {
     if !AVAILABLE_ENGINES.contains(&engine) {
-        return Err(format!(
-            "unknown engine '{engine}' (available engines: {})",
-            AVAILABLE_ENGINES.join(", ")
-        ));
+        return Err(not_a_subclass_message(engine));
     }
     Ok(())
 }
 
+/// Map an engine error onto the R4 envelope: `NoEffect` prints on
+/// stdout with exit 0, `Usage` renders `Usage Exception:`, `Failed`
+/// renders the generic banner.
+fn classify_engine_error(error: EngineError) -> ClassifiedError {
+    match error {
+        EngineError::NoEffect(message) => ClassifiedError::no_effect(message),
+        EngineError::Usage(message) => ClassifiedError::usage(message),
+        EngineError::Failed(message) => ClassifiedError::exception(message),
+    }
+}
+
+/// String-error entry kept for API stability; production uses
+/// [`load_config_selection_classified`].
+#[allow(dead_code)]
 fn load_config_selection(cwd: &Path) -> Result<Selection, String> {
+    load_config_selection_classified(cwd).map_err(|error| error.message)
+}
+
+/// [`load_config_selection`] with errors classified for the R4
+/// envelope: a missing `.arcunit` is a usage error (PHP throws
+/// `ArcanistNoEngineException`, an `ArcanistUsageException`
+/// subclass); spec errors keep their engine class.
+fn load_config_selection_classified(cwd: &Path) -> Result<Selection, ClassifiedError> {
     let Some(dir) = find_arcunit_from(cwd) else {
-        return Err(
+        return Err(ClassifiedError::usage(
             "Unable to find '.arcunit' file to configure test engines. Create an \
             '.arcunit' file in the root directory of the working copy."
                 .to_string(),
-        );
+        ));
     };
     let path = dir.join(".arcunit");
-    let data = std::fs::read_to_string(&path)
-        .map_err(|e| format!("cannot read '{}': {e}", path.display()))?;
+    let data = std::fs::read_to_string(&path).map_err(|e| {
+        ClassifiedError::exception(format!("cannot read '{}': {e}", path.display()))
+    })?;
     let display = path.to_string_lossy().to_string();
     let engines = unit_config::parse_engine_specs(&data, &display, CONFIG_AVAILABLE)
-        .map_err(|e| e.message().to_string())?;
+        .map_err(classify_engine_error)?;
     Ok(Selection::Config { engines, root: dir })
 }
 
-/// Select engines: explicit `--engine`, then `unit.engine` from `.arcconfig`,
-/// then `.arcunit`, else the `cargo` default.
+/// Select engines: explicit `--engine`, then `unit.engine` from any config
+/// source, then `.arcunit`, else `ArcanistNoEngineException` (UNIT-U7).
 pub fn discover_selection(opts: &Options, cwd: &Path) -> Result<Selection, String> {
-    if opts.engine_explicit {
-        validate_engine(&opts.engine)?;
+    discover_selection_classified(opts, cwd).map_err(|error| error.message)
+}
+
+/// [`discover_selection`] with errors classified for the R4 envelope:
+/// unknown engine names are usage errors (PHP throws
+/// `ArcanistUsageException` for a bad `--engine`).
+pub fn discover_selection_classified(
+    opts: &Options,
+    cwd: &Path,
+) -> Result<Selection, ClassifiedError> {
+    // UNIT-U14: an empty `--engine` is falsy in PHP (`if (!$engine_class)`)
+    // and falls through to config, like an omitted flag.
+    if opts.engine_explicit && !opts.engine.is_empty() {
+        validate_engine(&opts.engine).map_err(ClassifiedError::usage)?;
         if opts.engine == "cargo" {
             return Ok(Selection::Cargo);
         }
         if opts.engine == "ArcanistConfigurationDrivenUnitTestEngine" {
-            return load_config_selection(cwd);
+            return load_config_selection_classified(cwd);
         }
         return Ok(Selection::Single(opts.engine.clone()));
     }
-    if let Some(class) = find_unit_engine_from(cwd) {
-        validate_engine(&class)?;
+    let cli = get_config::load_options_from_cli(
+        &opts.config,
+        &opts.config_file,
+        opts.arcrc_file.as_deref(),
+    )
+    .map_err(ClassifiedError::usage)?;
+    let user_file = config::arcrc_path();
+    let merged =
+        get_config::load_merged(cwd, user_file.as_deref(), &cli).map_err(ClassifiedError::usage)?;
+    if let Some(class) = unit_engine_from_merged(&merged).map_err(ClassifiedError::usage)? {
+        validate_engine(&class).map_err(ClassifiedError::usage)?;
         if class == "cargo" {
             return Ok(Selection::Cargo);
         }
         if class == "ArcanistConfigurationDrivenUnitTestEngine" {
-            return load_config_selection(cwd);
+            return load_config_selection_classified(cwd);
         }
         return Ok(Selection::Single(class));
     }
     if find_arcunit_from(cwd).is_some() {
-        return load_config_selection(cwd);
+        return load_config_selection_classified(cwd);
     }
-    Ok(Selection::Cargo)
+    // UNIT-U7: nothing configured is `ArcanistNoEngineException` (a usage
+    // error), not a cargo default.
+    Err(ClassifiedError::usage(no_engine_message()))
 }
 
 /// Whether an engine supports `--everything`: nose
@@ -1376,6 +1590,16 @@ pub fn supports_run_all_tests(engine_type: &str) -> bool {
     )
 }
 
+/// Whether the workflow echoes an engine's results after the run
+/// (`ArcanistUnitTestEngine::shouldEchoTestResults`, UNIT-U1): the base
+/// returns true and only the configuration-driven engine overrides it to
+/// false (`ArcanistConfigurationDrivenUnitTestEngine.php:172-174`), echoing
+/// non-echoing children's results itself while they run (`:151-157`).
+#[must_use]
+pub fn should_echo_test_results(engine_type: &str) -> bool {
+    engine_type != "ArcanistConfigurationDrivenUnitTestEngine"
+}
+
 /// Real command runner: spawn `argv` with `cwd`, capturing output.
 struct RealRunner;
 
@@ -1384,7 +1608,7 @@ impl CommandRunner for RealRunner {
         if argv.is_empty() {
             return arc_rs::unit_engine::CapturedOutput::new(1, "", "empty command");
         }
-        match std::process::Command::new(&argv[0])
+        match crate::proc_env::command(&argv[0])
             .args(&argv[1..])
             .current_dir(cwd)
             .output()
@@ -1488,12 +1712,53 @@ pub fn read_arcconfig(project_root: &str) -> Option<serde_json::Value> {
     serde_json::from_str(&text).ok()
 }
 
-/// Fetch one `.arcconfig` string key (`getConfigFromAnySource` subset for
-/// unit engines; walks only the project root, not user/global configs).
+/// Fetch one `.arcconfig` string key (legacy project-root-only read, kept
+/// for compat; engine code reads through [`engine_param_from`] instead).
 #[must_use]
 pub fn arcconfig_string(project_root: &str, key: &str) -> Option<String> {
     read_arcconfig(project_root)?
         .get(key)?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Default-options merged load for `project_root` (local, project, user,
+/// system, default sources), or `None` when any source is unreadable
+/// (UNIT-U13 follow-through: `unit.*` engine params read through the same
+/// merge as `unit.engine`). Runtime `--config` overrides do not reach
+/// engine params: the runners below have no CLI handle (documented gap).
+fn lenient_engine_merged(project_root: &str) -> Option<get_config::MergedConfig> {
+    let user_file = config::arcrc_path();
+    get_config::load_merged(
+        Path::new(project_root),
+        user_file.as_deref(),
+        &get_config::LoadOptions::default(),
+    )
+    .ok()
+}
+
+/// One `unit.*` engine param: the merged winner when a merged load is
+/// available, else the legacy project-root `.arcconfig` read (preserves
+/// the old leniency when sources are unreadable).
+fn engine_param_from(
+    merged: Option<&get_config::MergedConfig>,
+    project_root: &str,
+    key: &str,
+) -> Option<serde_json::Value> {
+    if let Some(merged) = merged {
+        return get_config::merged_value(key, merged).map(|(_, value)| value);
+    }
+    read_arcconfig(project_root)?.get(key).cloned()
+}
+
+/// String form of [`engine_param_from`]: missing and non-string values
+/// read empty, like the old project-root read.
+fn engine_param_string_from(
+    merged: Option<&get_config::MergedConfig>,
+    project_root: &str,
+    key: &str,
+) -> Option<String> {
+    engine_param_from(merged, project_root, key)?
         .as_str()
         .map(str::to_string)
 }
@@ -1584,18 +1849,22 @@ pub struct XunitPlan {
 
 /// Load the xUnit environment and map the run paths to test projects
 /// (`XUnitTestEngine.php:36-95,103-113`) with real filesystem probes.
+/// Engine params read through the config merge (UNIT-U13 follow-through).
 pub fn prepare_xunit_run(ctx: &EngineContext) -> Result<XunitPlan, EngineError> {
+    let merged = lenient_engine_merged(&ctx.project_root);
+    prepare_xunit_run_with_merged(ctx, merged.as_ref())
+}
+
+/// [`prepare_xunit_run`] with an explicit merged config (`None` falls back
+/// to the project-root `.arcconfig`, like the pre-merge read).
+pub fn prepare_xunit_run_with_merged(
+    ctx: &EngineContext,
+    merged: Option<&get_config::MergedConfig>,
+) -> Result<XunitPlan, EngineError> {
     let is_windows = cfg!(windows);
-    let arcconfig = read_arcconfig(&ctx.project_root);
-    let discovery = arcconfig
-        .as_ref()
-        .and_then(|v| v.get(unit_xunit::DISCOVERY_KEY))
-        .and_then(parse_discovery_rules);
-    let hint = arcconfig
-        .as_ref()
-        .and_then(|v| v.get(unit_xunit::XUNIT_BINARY_KEY))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
+    let discovery = engine_param_from(merged, &ctx.project_root, unit_xunit::DISCOVERY_KEY)
+        .and_then(|v| parse_discovery_rules(&v));
+    let hint = engine_param_string_from(merged, &ctx.project_root, unit_xunit::XUNIT_BINARY_KEY);
     let env = unit_xunit::load_environment(
         &ctx.project_root,
         is_windows,
@@ -1771,31 +2040,32 @@ struct CsharpCover {
     excluded: Option<HashMap<String, String>>,
 }
 
-/// Load the C# cover configuration from `.arcconfig`: the cscover hint
-/// plus the match/excluded filters. `None` when coverage is disabled
-/// (then every assembly runs the plain xUnit future).
-fn load_csharp_cover(ctx: &EngineContext) -> Result<Option<CsharpCover>, EngineError> {
-    let arcconfig = read_arcconfig(&ctx.project_root);
-    let hint = arcconfig
-        .as_ref()
-        .and_then(|v| v.get(unit_csharp::CSCOVER_BINARY_KEY))
-        .and_then(|v| v.as_str());
-    let cover_engine =
-        unit_csharp::load_cover_engine(&ctx.project_root, hint, ctx.enable_coverage, &|p| {
-            Path::new(p).exists()
-        })?;
+/// Load the C# cover configuration from the config merge: the cscover hint
+/// plus the match/excluded filters (UNIT-U13 follow-through). `None` when
+/// coverage is disabled (then every assembly runs the plain xUnit future).
+/// A `None` merged load falls back to the project-root `.arcconfig`.
+fn load_csharp_cover(
+    ctx: &EngineContext,
+    merged: Option<&get_config::MergedConfig>,
+) -> Result<Option<CsharpCover>, EngineError> {
+    let hint = engine_param_string_from(merged, &ctx.project_root, unit_csharp::CSCOVER_BINARY_KEY);
+    let cover_engine = unit_csharp::load_cover_engine(
+        &ctx.project_root,
+        hint.as_deref(),
+        ctx.enable_coverage,
+        &|p| Path::new(p).exists(),
+    )?;
     let Some(cover_engine) = cover_engine else {
         return Ok(None);
     };
-    let match_regex = arcconfig
-        .as_ref()
-        .and_then(|v| v.get(unit_csharp::COVERAGE_MATCH_KEY))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let excluded = arcconfig
-        .as_ref()
-        .and_then(|v| v.get(unit_csharp::COVERAGE_EXCLUDED_KEY))
-        .and_then(parse_excluded_files);
+    let match_regex =
+        engine_param_string_from(merged, &ctx.project_root, unit_csharp::COVERAGE_MATCH_KEY);
+    let excluded = engine_param_from(
+        merged,
+        &ctx.project_root,
+        unit_csharp::COVERAGE_EXCLUDED_KEY,
+    )
+    .and_then(|v| parse_excluded_files(&v));
     Ok(Some(CsharpCover {
         cover_engine,
         match_regex,
@@ -1932,20 +2202,20 @@ fn plan_csharp_assembly(
 }
 
 /// Read one run's cscover report through the cache (`readCoverage`,
-/// lines 216-285). Line counts come from the real filesystem, matching
-/// PHP `count(file(...))`.
+/// lines 216-285) in first-seen file order (UNIT-U20). Line counts come
+/// from the real filesystem, matching PHP `count(file(...))`.
 fn read_run_coverage(
     cover_output: Option<&str>,
     project_root: &str,
     cache: &mut unit_csharp::CoverageCache,
-) -> Result<Option<HashMap<String, String>>, EngineError> {
+) -> Result<Option<Vec<(String, String)>>, EngineError> {
     let Some(cover_file) = cover_output else {
         return Ok(None);
     };
     let xml = std::fs::read_to_string(cover_file)
         .map_err(|e| EngineError::Failed(format!("cannot read '{cover_file}': {e}")))?;
     cache
-        .read_cached(cover_file, &xml, project_root, &|p| {
+        .read_cached_ordered(cover_file, &xml, project_root, &|p| {
             std::fs::read_to_string(p)
                 .ok()
                 .map(|text| text.lines().count())
@@ -1972,7 +2242,7 @@ fn execute_csharp_run(
     let xml = std::fs::read_to_string(&run.xunit_output)
         .map_err(|e| EngineError::Failed(format!("cannot read '{}': {e}", run.xunit_output)))?;
     let coverage = read_run_coverage(run.cover_output.as_deref(), project_root, cache)?;
-    let results = unit_csharp::parse_assembly_results(&xml, coverage.as_ref())?;
+    let results = unit_csharp::parse_assembly_results_ordered(&xml, coverage.as_deref())?;
     remove_report_file(&run.xunit_output);
     if let Some(cover) = run.cover_output.as_deref() {
         remove_report_file(cover);
@@ -2015,7 +2285,8 @@ pub fn run_csharp_with_runner(
     // The cover engine resolves before any stage runs (like the parent
     // `loadEnvironment` plus the cover half throwing first), even when no
     // projects mapped.
-    let cover = load_csharp_cover(ctx)?;
+    let merged = lenient_engine_merged(&ctx.project_root);
+    let cover = load_csharp_cover(ctx, merged.as_ref())?;
     if plan.projects.is_empty() {
         return Ok(Vec::new());
     }
@@ -2033,16 +2304,23 @@ pub fn run_csharp_with_runner(
     Ok(results)
 }
 
-/// Build a phpunit engine from `.arcconfig` (`prepareConfigFile`,
+/// Build a phpunit engine from the config merge (`prepareConfigFile`,
 /// `PhpunitTestEngine.php:254-278`): `phpunit_config` plus
-/// `unit.phpunit.binary`.
+/// `unit.phpunit.binary` (UNIT-U13 follow-through).
 #[must_use]
 pub fn phpunit_engine_from_config(project_root: &str) -> unit_phpunit::PhpunitEngine {
-    let arcconfig = read_arcconfig(project_root);
-    let config_value = arcconfig
-        .as_ref()
-        .and_then(|v| v.get(unit_phpunit::CONFIG_KEY))
-        .and_then(|v| v.as_str());
+    let merged = lenient_engine_merged(project_root);
+    phpunit_engine_from_merged(project_root, merged.as_ref())
+}
+
+/// [`phpunit_engine_from_config`] with an explicit merged config (`None`
+/// falls back to the project-root `.arcconfig`, like the pre-merge read).
+#[must_use]
+pub fn phpunit_engine_from_merged(
+    project_root: &str,
+    merged: Option<&get_config::MergedConfig>,
+) -> unit_phpunit::PhpunitEngine {
+    let config_value = engine_param_string_from(merged, project_root, unit_phpunit::CONFIG_KEY);
     let config_file = match config_value {
         None => None,
         Some(value) => {
@@ -2057,13 +2335,10 @@ pub fn phpunit_engine_from_config(project_root: &str) -> unit_phpunit::PhpunitEn
             }
         }
     };
-    let configured = arcconfig
-        .as_ref()
-        .and_then(|v| v.get(unit_phpunit::BINARY_KEY))
-        .and_then(|v| v.as_str());
+    let configured = engine_param_string_from(merged, project_root, unit_phpunit::BINARY_KEY);
     let binary = match configured {
         None => unit_phpunit::PHPUNIT_BINARY.to_string(),
-        Some(bin) if binary_exists(bin) => bin.to_string(),
+        Some(bin) if binary_exists(&bin) => bin,
         Some(bin) => format!("{project_root}/{bin}"),
     };
     unit_phpunit::PhpunitEngine {
@@ -2136,14 +2411,24 @@ pub fn run_phutil_with_runner(
     engine: &str,
     php: &dyn Fn() -> Option<Vec<String>>,
 ) -> Result<Vec<EngineUnitResult>, EngineError> {
+    let merged = lenient_engine_merged(&ctx.project_root);
+    run_phutil_with_runner_merged(ctx, runner, engine, php, merged.as_ref())
+}
+
+/// [`run_phutil_with_runner`] with an explicit merged config for the
+/// init-script param (`None` falls back to the project-root `.arcconfig`).
+pub fn run_phutil_with_runner_merged(
+    ctx: &EngineContext,
+    runner: &dyn CommandRunner,
+    engine: &str,
+    php: &dyn Fn() -> Option<Vec<String>>,
+    merged: Option<&get_config::MergedConfig>,
+) -> Result<Vec<EngineUnitResult>, EngineError> {
     let Some(prefix) = php() else {
         return Err(EngineError::Usage(unit_phutil::missing_php_message(engine)));
     };
-    let init_script = read_arcconfig(&ctx.project_root)
-        .as_ref()
-        .and_then(|v| v.get(unit_phutil::INIT_SCRIPT_KEY))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
+    let init_script =
+        engine_param_string_from(merged, &ctx.project_root, unit_phutil::INIT_SCRIPT_KEY);
     let input = unit_phutil::PhutilRunInput {
         project_root: ctx.project_root.clone(),
         run_all_tests: ctx.run_all_tests,
@@ -2192,11 +2477,8 @@ pub fn run_single_with_php(
     runner: &dyn CommandRunner,
     php: &dyn Fn() -> Option<Vec<String>>,
 ) -> Result<Vec<EngineUnitResult>, EngineError> {
-    if !CONFIG_AVAILABLE.contains(&engine_type) {
-        return Err(EngineError::Usage(format!(
-            "unknown engine '{engine_type}' (available engines: {})",
-            AVAILABLE_ENGINES.join(", ")
-        )));
+    if !SINGLE_AVAILABLE.contains(&engine_type) {
+        return Err(EngineError::Usage(not_a_subclass_message(engine_type)));
     }
     EngineContext::check_set_run_all_tests(
         supports_run_all_tests(engine_type),
@@ -2204,19 +2486,21 @@ pub fn run_single_with_php(
         ctx.run_all_tests,
     )
     .map_err(EngineError::Usage)?;
+    // UNIT-U13 follow-through: one merged load feeds every engine-param
+    // read below (missing/unreadable sources fall back per-param).
+    let merged = lenient_engine_merged(&ctx.project_root);
+    let merged_ref = merged.as_ref();
     match engine_type {
         "NoseTestEngine" => {
             unit_nose::NoseEngine::new().run_with(ctx, runner, &unit_nose::RealNoseFs)
         }
         "PytestTestEngine" => unit_pytest::PytestEngine::new().run_with(ctx, runner, &RealPytestFs),
         "PhpunitTestEngine" => {
-            let engine = phpunit_engine_from_config(&ctx.project_root);
+            let engine = phpunit_engine_from_merged(&ctx.project_root, merged_ref);
             // Surface a configured-but-missing phpunit config verbatim
             // (`PhpunitTestEngine.php:263-266`).
-            if let Some(config_value) = read_arcconfig(&ctx.project_root)
-                .as_ref()
-                .and_then(|v| v.get(unit_phpunit::CONFIG_KEY))
-                .and_then(|v| v.as_str())
+            if let Some(config_value) =
+                engine_param_string_from(merged_ref, &ctx.project_root, unit_phpunit::CONFIG_KEY)
             {
                 let full = format!("{}/{config_value}", ctx.project_root);
                 if !Path::new(&full).exists() {
@@ -2227,13 +2511,12 @@ pub fn run_single_with_php(
             }
             engine.run_with(ctx, runner, &RealPhpunitFs)
         }
-        "PhutilUnitTestEngine" | "phutil" => run_phutil_with_runner(ctx, runner, engine_type, php),
+        "PhutilUnitTestEngine" | "phutil" => {
+            run_phutil_with_runner_merged(ctx, runner, engine_type, php, merged_ref)
+        }
         "XUnitTestEngine" => run_xunit_with_runner(ctx, runner),
         "CSharpToolsTestEngine" => run_csharp_with_runner(ctx, runner),
-        _ => Err(EngineError::Usage(format!(
-            "unknown engine '{engine_type}' (available engines: {})",
-            AVAILABLE_ENGINES.join(", ")
-        ))),
+        _ => Err(EngineError::Usage(not_a_subclass_message(engine_type))),
     }
 }
 
@@ -2261,6 +2544,27 @@ pub fn run_single_report(
     enable_coverage: Option<bool>,
     runner: &dyn CommandRunner,
 ) -> Result<ConfigReport, String> {
+    run_single_report_classified(
+        engine_type,
+        project_root,
+        paths,
+        run_all_tests,
+        enable_coverage,
+        runner,
+    )
+    .map_err(|error| error.message)
+}
+
+/// [`run_single_report`] with errors classified for the R4 envelope,
+/// preserving `NoEffect` (stdout, exit 0).
+pub fn run_single_report_classified(
+    engine_type: &str,
+    project_root: &str,
+    paths: &[String],
+    run_all_tests: bool,
+    enable_coverage: Option<bool>,
+    runner: &dyn CommandRunner,
+) -> Result<ConfigReport, ClassifiedError> {
     let ctx = EngineContext {
         project_root: project_root.to_string(),
         paths: paths.to_vec(),
@@ -2269,7 +2573,7 @@ pub fn run_single_report(
     };
     let started = std::time::Instant::now();
     let results =
-        run_single_with_runner(engine_type, &ctx, runner).map_err(|e| e.message().to_string())?;
+        run_single_with_runner(engine_type, &ctx, runner).map_err(classify_engine_error)?;
     let duration_ms: u64 = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
     let (passed, failed) = count_results(&results);
     let success =
@@ -2296,7 +2600,28 @@ pub fn run_config_with_runner(
     enable_coverage: Option<bool>,
     runner: &dyn CommandRunner,
 ) -> Result<ConfigReport, String> {
-    run_config_with_php(
+    run_config_with_runner_classified(
+        planned,
+        project_root,
+        paths,
+        run_all_tests,
+        enable_coverage,
+        runner,
+    )
+    .map_err(|error| error.message)
+}
+
+/// [`run_config_with_runner`] with errors classified for the R4
+/// envelope, preserving `NoEffect` (stdout, exit 0).
+pub fn run_config_with_runner_classified(
+    planned: &[PlannedEngine],
+    project_root: &str,
+    paths: &[String],
+    run_all_tests: bool,
+    enable_coverage: Option<bool>,
+    runner: &dyn CommandRunner,
+) -> Result<ConfigReport, ClassifiedError> {
+    run_config_with_php_classified(
         planned,
         project_root,
         paths,
@@ -2318,15 +2643,64 @@ pub fn run_config_with_php(
     runner: &dyn CommandRunner,
     php: &dyn Fn() -> Option<Vec<String>>,
 ) -> Result<ConfigReport, String> {
+    run_config_with_php_classified(
+        planned,
+        project_root,
+        paths,
+        run_all_tests,
+        enable_coverage,
+        runner,
+        php,
+    )
+    .map_err(|error| error.message)
+}
+
+/// [`run_config_with_php`] with errors classified for the R4 envelope,
+/// preserving `NoEffect` (stdout, exit 0).
+pub fn run_config_with_php_classified(
+    planned: &[PlannedEngine],
+    project_root: &str,
+    paths: &[String],
+    run_all_tests: bool,
+    enable_coverage: Option<bool>,
+    runner: &dyn CommandRunner,
+    php: &dyn Fn() -> Option<Vec<String>>,
+) -> Result<ConfigReport, ClassifiedError> {
+    run_config_with_echo_classified(
+        planned,
+        project_root,
+        paths,
+        run_all_tests,
+        enable_coverage,
+        runner,
+        php,
+    )
+    .map(|(report, _)| report)
+}
+
+/// [`run_config_with_php_classified`], plus one echo flag per merged result
+/// (UNIT-U1): the proxy echoes only non-echoing children's results
+/// (`ArcanistConfigurationDrivenUnitTestEngine.php:151-157`), and the
+/// workflow echoes nothing itself (`:172-174`), so full runs print zero
+/// per-result lines when every child echoes (all ported engines do).
+pub fn run_config_with_echo_classified(
+    planned: &[PlannedEngine],
+    project_root: &str,
+    paths: &[String],
+    run_all_tests: bool,
+    enable_coverage: Option<bool>,
+    runner: &dyn CommandRunner,
+    php: &dyn Fn() -> Option<Vec<String>>,
+) -> Result<(ConfigReport, Vec<bool>), ClassifiedError> {
     let child_supports: Vec<bool> = planned
         .iter()
         .map(|engine| supports_run_all_tests(&engine.engine_type))
         .collect();
     if run_all_tests && !unit_config::supports_run_all_tests(&child_supports) {
-        return Err(
+        return Err(ClassifiedError::usage(
             "Engine 'ArcanistConfigurationDrivenUnitTestEngine' does not support --everything."
                 .to_string(),
-        );
+        ));
     }
     let top = EngineContext {
         project_root: project_root.to_string(),
@@ -2336,9 +2710,11 @@ pub fn run_config_with_php(
     };
     let started = std::time::Instant::now();
     let mut runs = Vec::new();
+    let mut echo_children = Vec::new();
     for engine in planned {
         let child =
             unit_config::child_context(&top, engine, supports_run_all_tests(&engine.engine_type));
+        echo_children.push(!should_echo_test_results(&engine.engine_type));
         runs.push(run_single_with_php(
             &engine.engine_type,
             &child,
@@ -2346,19 +2722,37 @@ pub fn run_config_with_php(
             php,
         ));
     }
-    let results = unit_config::merge_engine_runs(runs).map_err(|e| e.message().to_string())?;
+    let echo = config_echo_mask(&echo_children, &runs);
+    let results = unit_config::merge_engine_runs(runs).map_err(classify_engine_error)?;
     let duration_ms: u64 = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
     let (passed, failed) = count_results(&results);
     let success =
         arc_rs::unit_engine::overall_result(&results) == arc_rs::unit_engine::WORKFLOW_RESULT_OKAY;
-    Ok(ConfigReport {
+    let report = ConfigReport {
         engine: "ArcanistConfigurationDrivenUnitTestEngine".to_string(),
         passed,
         failed,
         duration_ms,
         success,
         results,
-    })
+    };
+    Ok((report, echo))
+}
+
+/// One echo flag per merged result for a config run (UNIT-U1): each
+/// successful child's results take that child's proxy-echo flag, and
+/// no-effect children contribute nothing (mirroring `merge_engine_runs`).
+fn config_echo_mask(
+    echo_children: &[bool],
+    runs: &[Result<Vec<EngineUnitResult>, EngineError>],
+) -> Vec<bool> {
+    let mut echo = Vec::new();
+    for (child_echo, run) in echo_children.iter().zip(runs.iter()) {
+        if let Ok(results) = run {
+            echo.extend(std::iter::repeat_n(*child_echo, results.len()));
+        }
+    }
+    echo
 }
 
 /// Format a duration in seconds, mirroring `formatTime`
@@ -2382,10 +2776,10 @@ pub fn format_time(seconds: f64) -> String {
 
 /// Render one result, mirroring `renderUnitResult`
 /// (`ArcanistUnitConsoleRenderer.php:5-30`): `  <LABEL>[ time] name`,
-/// plus `userData` for non-passing results. TTYs render the
-/// `getFormattedResult` badge (lines 32-54) and the `formatTestDuration`
-/// bucket color (lines 56-81); non-TTYs keep the historical plain
-/// rendering byte-identical.
+/// plus `userData` for non-passing results. Both modes compose the same
+/// `getFormattedResult` badge (lines 32-54) and `formatTestDuration`
+/// bucket (lines 56-81) through `console_format`; non-TTYs just strip the
+/// markup, keeping the star, spaces, and padding like PHP (UNIT-U10).
 #[must_use]
 pub fn render_unit_result(result: &EngineUnitResult) -> String {
     render_unit_result_with_ansi(result, terminal::ansi_enabled())
@@ -2403,9 +2797,8 @@ pub fn render_unit_result_with_ansi(result: &EngineUnitResult, ansi: bool) -> St
 }
 
 /// One `getFormattedResult` badge (lines 32-54) with an explicit ANSI
-/// flag: `<bg:green/red/yellow>** LABEL **</bg>` like PHP. Like PHP,
-/// the stripped form keeps the badge padding, so only the TTY branch
-/// uses this; the plain rendering uses bare labels instead.
+/// flag: `<bg:green/red/yellow>** LABEL **</bg>` like PHP. The stripped
+/// form keeps the badge padding (` PASS `), like PHP (UNIT-U10).
 fn format_result_label(code: &str, ansi: bool) -> String {
     let (color, label) = match code {
         arc_rs::unit_engine::RESULT_PASS => ("green", "PASS"),
@@ -2457,50 +2850,30 @@ fn result_display_name(result: &EngineUnitResult) -> String {
 /// TTY rendering: the badge, duration, and name composed with
 /// `sprintf("  %s %s\n", ...)` like PHP, plus raw `userData`.
 fn render_unit_result_tty(result: &EngineUnitResult) -> String {
+    render_unit_result_composed(result, true)
+}
+
+/// Plain rendering: the same composition with markup stripped, like PHP
+/// on a non-TTY (UNIT-U10).
+fn render_unit_result_plain(result: &EngineUnitResult) -> String {
+    render_unit_result_composed(result, false)
+}
+
+/// Badge, duration, and name composed with `sprintf("  %s %s\n", ...)`
+/// like PHP (lines 18-23), plus raw `userData` for non-passing results
+/// (lines 25-28). The ANSI flag only switches markup on/off.
+fn render_unit_result_composed(result: &EngineUnitResult, ansi: bool) -> String {
     let code = result.get_result();
-    let label = format_result_label(code, true);
+    let label = format_result_label(code, ansi);
     let duration = if code == arc_rs::unit_engine::RESULT_PASS {
         format!(
             " {}",
-            format_test_duration(result.get_duration().unwrap_or(0.0), true)
+            format_test_duration(result.get_duration().unwrap_or(0.0), ansi)
         )
     } else {
         String::new()
     };
     let mut out = format!("  {label}{duration} {}\n", result_display_name(result));
-    if code != arc_rs::unit_engine::RESULT_PASS
-        && let Some(user_data) = result.get_user_data()
-        && !user_data.is_empty()
-    {
-        out.push_str(user_data);
-        out.push('\n');
-    }
-    out
-}
-
-/// Historical plain rendering, byte-identical.
-fn render_unit_result_plain(result: &EngineUnitResult) -> String {
-    let code = result.get_result();
-    let label = match code {
-        arc_rs::unit_engine::RESULT_PASS => "PASS",
-        arc_rs::unit_engine::RESULT_FAIL => "FAIL",
-        arc_rs::unit_engine::RESULT_SKIP => "SKIP",
-        arc_rs::unit_engine::RESULT_BROKEN => "BROKEN",
-        arc_rs::unit_engine::RESULT_UNSOUND => "UNSOUND",
-        _ => "",
-    };
-    let duration = if code == arc_rs::unit_engine::RESULT_PASS {
-        format!(" {}", format_time(result.get_duration().unwrap_or(0.0)))
-    } else {
-        String::new()
-    };
-    let name = match result.get_namespace() {
-        Some(namespace) if !namespace.is_empty() => {
-            format!("{}::{}", namespace, result.get_name())
-        }
-        _ => result.get_name().to_string(),
-    };
-    let mut out = format!("  {label}{duration} {name}\n");
     if code != arc_rs::unit_engine::RESULT_PASS
         && let Some(user_data) = result.get_user_data()
         && !user_data.is_empty()
@@ -2524,14 +2897,25 @@ fn project_root_path(cwd: &Path) -> PathBuf {
 /// (`ArcanistUnitWorkflow.php:194-199`): `coverage[file][] = report`.
 #[must_use]
 pub fn collect_coverage(results: &[EngineUnitResult]) -> HashMap<String, Vec<String>> {
-    let mut coverage: HashMap<String, Vec<String>> = HashMap::new();
+    collect_coverage_ordered(results).into_iter().collect()
+}
+
+/// [`collect_coverage`] in first-seen file order (UNIT-U12): PHP's
+/// `$coverage` map preserves insertion order, which survives `asort`
+/// ties, so the render path keeps it instead of hashing.
+#[must_use]
+pub fn collect_coverage_ordered(results: &[EngineUnitResult]) -> Vec<(String, Vec<String>)> {
+    let mut coverage: Vec<(String, Vec<String>)> = Vec::new();
     for result in results {
-        if let Some(map) = result.get_coverage() {
-            for (file, report) in map {
-                coverage
-                    .entry(file.clone())
-                    .or_default()
-                    .push(report.clone());
+        // Per-result files keep document order (UNIT-U20; legacy maps
+        // fall back to sorted pairs).
+        let Some(files) = result.coverage_ordered() else {
+            continue;
+        };
+        for (file, report) in &files {
+            match coverage.iter_mut().find(|(name, _)| name == file) {
+                Some((_, reports)) => reports.push(report.clone()),
+                None => coverage.push((file.clone(), vec![report.clone()])),
             }
         }
     }
@@ -2541,7 +2925,9 @@ pub fn collect_coverage(results: &[EngineUnitResult]) -> HashMap<String, Vec<Str
 /// Merge per-file reports and compute fractions
 /// (`ArcanistUnitWorkflow.php:201-217`): `C / (C + U)` else `0`.
 /// Returns `(sorted_file_coverage, file_reports)`; `paths` seeds every
-/// requested file at `0` like PHP `array_fill_keys($paths, 0)`.
+/// requested file at `0` like PHP `array_fill_keys($paths, 0)`. Frozen
+/// unordered form (filename tiebreak); the render path uses
+/// [`merge_file_coverage_ordered`] (UNIT-U12).
 #[must_use]
 pub fn merge_file_coverage(
     paths: &[String],
@@ -2565,6 +2951,35 @@ pub fn merge_file_coverage(
             .then_with(|| a.0.cmp(&b.0))
     });
     (sorted, file_reports)
+}
+
+/// [`merge_file_coverage`] over first-seen coverage order (UNIT-U12): seeds
+/// `paths` in order like PHP `array_fill_keys($paths, 0)`, updates covered
+/// files in place, appends new ones, then sorts by fraction with a STABLE
+/// sort so ties keep insertion order like PHP `asort`.
+#[must_use]
+pub fn merge_file_coverage_ordered(
+    paths: &[String],
+    coverage: &[(String, Vec<String>)],
+) -> (Vec<(String, f64)>, HashMap<String, String>) {
+    let mut ordered: Vec<(String, f64)> = Vec::new();
+    for path in paths {
+        if !ordered.iter().any(|(name, _)| name == path) {
+            ordered.push((path.clone(), 0.0));
+        }
+    }
+    let mut file_reports: HashMap<String, String> = HashMap::new();
+    for (file, reports) in coverage {
+        let merged = EngineUnitResult::merge_coverage(reports).unwrap_or_default();
+        let fraction = arc_rs::unit_engine::coverage_fraction(&merged);
+        match ordered.iter_mut().find(|(name, _)| name == file) {
+            Some(slot) => slot.1 = fraction,
+            None => ordered.push((file.clone(), fraction)),
+        }
+        file_reports.insert(file.clone(), merged);
+    }
+    ordered.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    (ordered, file_reports)
 }
 
 /// Render the coverage report (`ArcanistUnitWorkflow.php:218-239`):
@@ -2632,10 +3047,8 @@ fn coverage_file_line(pct: i32, file: &str, ansi: bool) -> String {
 }
 
 /// Render one file's detailed coverage (`ArcanistUnitWorkflow.php:292-331`).
-/// TTYs paint `<bg:green/red/magenta>` backgrounds for `C`/`U`/`X`
-/// like PHP; non-TTYs keep the historical `%5d  [C] <80-col line>`
-/// rendering (whose bracketed mark keeps the stripped colors
-/// observable) byte-identical.
+/// Both modes compose the same `%5d  ` plus background-wrapped line;
+/// non-TTYs just strip the markup, so no mark letter appears (UNIT-U11).
 #[must_use]
 pub fn render_detailed_coverage_report(data: &str, report: &str) -> String {
     render_detailed_coverage_report_with_ansi(data, report, terminal::ansi_enabled())
@@ -2645,26 +3058,38 @@ pub fn render_detailed_coverage_report(data: &str, report: &str) -> String {
 /// (see [`render_detailed_coverage_report`]).
 #[must_use]
 pub fn render_detailed_coverage_report_with_ansi(data: &str, report: &str, ansi: bool) -> String {
-    if ansi {
-        render_detailed_tty(data, report)
-    } else {
-        render_detailed_plain(data, report)
-    }
+    render_detailed_composed(data, report, ansi)
 }
 
-/// TTY rendering: `%5d  ` plus the 80-column line wrapped in the
-/// mark's background (`C` green, `U` red, `X` magenta, else plain).
-fn render_detailed_tty(data: &str, report: &str) -> String {
+/// `%5d  ` plus the padded line wrapped in the mark's background (`C`
+/// green, `U` red, `X` magenta, else plain). The ANSI flag only switches
+/// markup on/off, like PHP on/off a TTY.
+fn render_detailed_composed(data: &str, report: &str, ansi: bool) -> String {
     let report_bytes = report.as_bytes();
     let mut out = String::new();
     for (n, line) in data.split('\n').enumerate() {
-        out.push_str(&detailed_tty_line(
+        out.push_str(&detailed_line(
             n + 1,
             line,
             detail_mark(report_bytes.get(n).copied()),
+            ansi,
         ));
     }
     out
+}
+
+/// Pad a source line to 80 columns like PHP `str_pad($line, 80, ' ')`,
+/// which counts BYTES and never truncates (UNIT-U24).
+fn pad_detailed_line(line: &str) -> String {
+    if line.len() >= 80 {
+        return line.to_string();
+    }
+    let mut padded = String::with_capacity(80);
+    padded.push_str(line);
+    for _ in line.len()..80 {
+        padded.push(' ');
+    }
+    padded
 }
 
 /// The effective mark for one line: PHP's `empty($report[$n])`
@@ -2676,33 +3101,16 @@ fn detail_mark(byte: Option<u8>) -> char {
     }
 }
 
-/// One TTY detailed-coverage line for `mark`.
-fn detailed_tty_line(number: usize, line: &str, mark: char) -> String {
-    let padded = format!("{line:<80}");
+/// One detailed-coverage line for `mark` with an explicit ANSI flag.
+fn detailed_line(number: usize, line: &str, mark: char, ansi: bool) -> String {
+    let padded = pad_detailed_line(line);
     let painted = match mark {
-        'C' => terminal::console_format("<bg:green> %s </bg>", &[&padded], true),
-        'U' => terminal::console_format("<bg:red> %s </bg>", &[&padded], true),
-        'X' => terminal::console_format("<bg:magenta> %s </bg>", &[&padded], true),
+        'C' => terminal::console_format("<bg:green> %s </bg>", &[&padded], ansi),
+        'U' => terminal::console_format("<bg:red> %s </bg>", &[&padded], ansi),
+        'X' => terminal::console_format("<bg:magenta> %s </bg>", &[&padded], ansi),
         _ => format!(" {padded} "),
     };
     format!("{number:>5}  {painted}\n")
-}
-
-/// Historical plain rendering, byte-identical.
-fn render_detailed_plain(data: &str, report: &str) -> String {
-    let report_bytes = report.as_bytes();
-    let mut out = String::new();
-    for (n, line) in data.split('\n').enumerate() {
-        let mark = report_bytes.get(n).copied().unwrap_or(b'N') as char;
-        let padded = format!("{line:<80}");
-        // Only C/U/X/N appear in real reports; anything else echoes raw.
-        let shown = match mark {
-            'C' | 'U' | 'X' | 'N' => mark,
-            other => other,
-        };
-        out.push_str(&format!("{:>5}  [{shown}] {padded}\n", n + 1));
-    }
-    out
 }
 
 /// Escape one string like PHP `json_encode`.
@@ -2782,6 +3190,16 @@ fn php_json_number(value: f64) -> String {
     serde_json::Number::from_f64(value).map_or_else(|| "null".to_string(), |n| n.to_string())
 }
 
+/// Render an optional duration like `json_encode`: `null` when unset,
+/// bare when set as an integer, float form otherwise (UNIT-U18).
+fn php_json_duration_value(duration: Option<f64>, is_int: bool) -> String {
+    match duration {
+        None => "null".to_string(),
+        Some(value) if is_int => format!("{}", value as i64),
+        Some(value) => php_json_number(value),
+    }
+}
+
 /// Render one `extra`/`coverage` map: `null` when absent, `[]` when empty
 /// (PHP encodes an empty array as a list), else an object. Nested keys are
 /// sorted; PHP keeps insertion order (see the audit note on
@@ -2842,18 +3260,22 @@ fn append_json_indent(out: &mut String, depth: usize) {
 }
 
 /// Render one result dict in `toDictionary` key order (compact).
+/// Unset `name`/`result` render null like PHP (UNIT-U19).
 fn append_result_ugly(out: &mut String, result: &EngineUnitResult) {
     let dict = result.to_dictionary();
     out.push_str("{\"namespace\":");
     append_json_string_or_null(out, dict.namespace.as_deref(), true);
     out.push_str(",\"name\":");
-    out.push_str(&php_json_string(&dict.name, true));
+    append_json_string_or_null(out, dict.name.as_deref(), true);
     out.push_str(",\"link\":");
     append_json_string_or_null(out, dict.link.as_deref(), true);
     out.push_str(",\"result\":");
-    out.push_str(&php_json_string(&dict.result, true));
+    append_json_string_or_null(out, dict.result.as_deref(), true);
     out.push_str(",\"duration\":");
-    append_json_duration(out, dict.duration);
+    out.push_str(&php_json_duration_value(
+        dict.duration,
+        dict.duration_is_int,
+    ));
     out.push_str(",\"extra\":");
     append_json_map(out, dict.extra.as_deref(), true, false, 0);
     out.push_str(",\"userData\":");
@@ -2881,10 +3303,16 @@ fn append_result_pretty(out: &mut String, result: &EngineUnitResult, depth: usiz
             "namespace",
             php_json_string_or_null(dict.namespace.as_deref(), false),
         ),
-        ("name", php_json_string(&dict.name, false)),
+        ("name", php_json_string_or_null(dict.name.as_deref(), false)),
         ("link", php_json_string_or_null(dict.link.as_deref(), false)),
-        ("result", php_json_string(&dict.result, false)),
-        ("duration", php_json_duration(dict.duration)),
+        (
+            "result",
+            php_json_string_or_null(dict.result.as_deref(), false),
+        ),
+        (
+            "duration",
+            php_json_duration_value(dict.duration, dict.duration_is_int),
+        ),
         ("extra", extra),
         (
             "userData",
@@ -2924,19 +3352,6 @@ fn php_json_string_or_null(value: Option<&str>, escape_slashes: bool) -> String 
     )
 }
 
-/// Render an optional duration as a JSON number or `null`.
-fn append_json_duration(out: &mut String, duration: Option<f64>) {
-    match duration {
-        Some(value) => out.push_str(&php_json_number(value)),
-        None => out.push_str("null"),
-    }
-}
-
-/// Render an optional duration as a JSON number or `null` (owned form).
-fn php_json_duration(duration: Option<f64>) -> String {
-    duration.map_or_else(|| "null".to_string(), php_json_number)
-}
-
 /// Encode results exactly like PHP renders them
 /// (`ArcanistUnitWorkflow.php:258-266`).
 ///
@@ -2950,9 +3365,9 @@ fn php_json_duration(duration: Option<f64>) -> String {
 /// `toDictionary` insertion order), never escapes `/`, and emits raw
 /// UTF-8 (PHP `\uXXXX`-escapes non-ASCII) and `{}` for empty maps (PHP
 /// emits `[]` for empty arrays), so both formats render here by hand.
-/// Remaining known divergences: nested `extra`/`coverage` key order
-/// (sorted here, first-seen in PHP) and Harbormaster upload encoding
-/// (the shared conduit client serializes with serde).
+/// Nested `extra`/`coverage` pairs keep insertion order (UNIT-U20).
+/// Remaining known divergence: Harbormaster upload encoding (the shared
+/// conduit client serializes with serde).
 #[must_use]
 pub fn results_to_json_text(results: &[EngineUnitResult], pretty: bool) -> String {
     if pretty {
@@ -2992,7 +3407,9 @@ fn results_to_json_pretty(results: &[EngineUnitResult]) -> String {
 
 /// Encode results as a JSON array of `toDictionary` objects
 /// (`ArcanistUnitWorkflow.php:258`, `ArcanistUnitTestResult.php:164-175`),
-/// in `toDictionary` key order with `null` for missing values.
+/// in `toDictionary` key order with `null` for missing values (including
+/// unset `name`/`result`, T1153 UNIT-U19; integer durations stay bare,
+/// T1153 UNIT-U18; insertion order on the wire, T1153 UNIT-U21).
 #[must_use]
 pub fn results_to_json(results: &[EngineUnitResult]) -> serde_json::Value {
     let items: Vec<serde_json::Value> = results
@@ -3005,19 +3422,29 @@ pub fn results_to_json(results: &[EngineUnitResult]) -> serde_json::Value {
                 d.namespace
                     .map_or(serde_json::Value::Null, serde_json::Value::String),
             );
-            map.insert("name".to_string(), serde_json::Value::String(d.name));
+            map.insert(
+                "name".to_string(),
+                d.name
+                    .map_or(serde_json::Value::Null, serde_json::Value::String),
+            );
             map.insert(
                 "link".to_string(),
                 d.link
                     .map_or(serde_json::Value::Null, serde_json::Value::String),
             );
-            map.insert("result".to_string(), serde_json::Value::String(d.result));
+            map.insert(
+                "result".to_string(),
+                d.result
+                    .map_or(serde_json::Value::Null, serde_json::Value::String),
+            );
             map.insert(
                 "duration".to_string(),
-                d.duration.map_or(serde_json::Value::Null, |v| {
-                    serde_json::Number::from_f64(v)
-                        .map_or(serde_json::Value::Null, serde_json::Value::Number)
-                }),
+                match d.duration {
+                    None => serde_json::Value::Null,
+                    Some(v) if d.duration_is_int => serde_json::Value::from(v as i64),
+                    Some(v) => serde_json::Number::from_f64(v)
+                        .map_or(serde_json::Value::Null, serde_json::Value::Number),
+                },
             );
             map.insert(
                 "extra".to_string(),
@@ -3050,8 +3477,10 @@ pub fn results_to_json(results: &[EngineUnitResult]) -> serde_json::Value {
     serde_json::Value::Array(items)
 }
 
-/// Modern unit dictionary (`ArcanistWorkflow.php:2244-2254`): drop `null`
-/// values, rename non-empty `userData` to `details`.
+/// Modern unit dictionary (`ArcanistWorkflow.php:2243-2253` at ceb):
+/// drop `null` values (order kept), rename non-empty `userData` to a
+/// trailing `details` (T1153 UNIT-U21: insertion order end to end, like
+/// PHP's `json_encode`).
 #[must_use]
 pub fn modern_unit_value(value: &serde_json::Value) -> serde_json::Value {
     let Some(obj) = value.as_object() else {
@@ -3087,7 +3516,50 @@ pub fn upload_results(
     results: &[EngineUnitResult],
     conduit_uri: Option<&str>,
 ) -> Result<(), String> {
-    let client = config::client_for(conduit_uri)?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let user_file = config::arcrc_path();
+    upload_results_with(
+        target_phid,
+        overall,
+        results,
+        conduit_uri,
+        &cwd,
+        user_file.as_deref(),
+        &get_config::LoadOptions::default(),
+    )
+}
+
+/// [`upload_results`] with an explicit working copy, user file, and
+/// [`get_config::LoadOptions`], so `--config`/`--config-file`/
+/// `--arcrc-file` reach Harbormaster uploads like stock PHP.
+pub fn upload_results_with(
+    target_phid: &str,
+    overall: i32,
+    results: &[EngineUnitResult],
+    conduit_uri: Option<&str>,
+    dir: &Path,
+    user_file: Option<&Path>,
+    opts: &get_config::LoadOptions,
+) -> Result<(), String> {
+    let client = config::client_for_with(conduit_uri, dir, user_file, opts)?;
+    let params = sendmessage_params(target_phid, overall, results);
+    client
+        .call("harbormaster.sendmessage", &params)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// `harbormaster.sendmessage` params for `results`
+/// (`ArcanistUnitWorkflow.php:421-427` at ceb): `buildTargetPHID`,
+/// modern `unit` dicts, `type`, in that order (T1153 UNIT-U21: PHP
+/// sends insertion order via `json_encode`; `preserve_order` keeps
+/// this builder's order on the wire too).
+#[must_use]
+pub fn sendmessage_params(
+    target_phid: &str,
+    overall: i32,
+    results: &[EngineUnitResult],
+) -> serde_json::Value {
     let raw = results_to_json(results);
     let modern: Vec<serde_json::Value> = raw
         .as_array()
@@ -3096,15 +3568,11 @@ pub fn upload_results(
         .iter()
         .map(modern_unit_value)
         .collect();
-    let params = serde_json::json!({
+    serde_json::json!({
         "buildTargetPHID": target_phid,
         "unit": modern,
         "type": harbormaster_type(overall),
-    });
-    client
-        .call("harbormaster.sendmessage", &params)
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    })
 }
 
 /// Render a full workflow report to stdout text (pure helper for tests).
@@ -3133,7 +3601,8 @@ pub fn render_workflow_output(
 
 /// Render the workflow output with an explicit ANSI flag: the `full`
 /// rendering threads it into the per-result and coverage renderers;
-/// `json`/`ugly`/`none` carry no markup in any mode.
+/// `json`/`ugly`/`none` carry no markup in any mode. Every result echoes
+/// (the single-engine case, where `shouldEchoTestResults` is true).
 #[must_use]
 pub fn render_workflow_output_with_ansi(
     results: &[EngineUnitResult],
@@ -3143,30 +3612,60 @@ pub fn render_workflow_output_with_ansi(
     project_root: &Path,
     ansi: bool,
 ) -> String {
+    render_workflow_output_with_echo(
+        results,
+        paths,
+        output_format,
+        detailed,
+        project_root,
+        ansi,
+        None,
+    )
+}
+
+/// [`render_workflow_output_with_ansi`] with one echo flag per result
+/// (UNIT-U1): config runs echo only non-echoing children's results, so a
+/// `false` flag skips that result's line. Coverage and machine formats
+/// still see every result.
+#[must_use]
+pub fn render_workflow_output_with_echo(
+    results: &[EngineUnitResult],
+    paths: &[String],
+    output_format: &str,
+    detailed: bool,
+    project_root: &Path,
+    ansi: bool,
+    echo: Option<&[bool]>,
+) -> String {
     match output_format {
         "json" => results_to_json_text(results, true),
         "ugly" => results_to_json_text(results, false),
         "none" => String::new(),
-        _ => render_full_output(results, paths, detailed, project_root, ansi),
+        _ => render_full_output(results, paths, detailed, project_root, ansi, echo),
     }
 }
 
-/// The `full` rendering: per-result lines plus the coverage report
-/// when coverage is present.
+/// The `full` rendering: per-result lines (gated by `echo`) plus the
+/// coverage report when coverage is present.
 fn render_full_output(
     results: &[EngineUnitResult],
     paths: &[String],
     detailed: bool,
     project_root: &Path,
     ansi: bool,
+    echo: Option<&[bool]>,
 ) -> String {
     let mut out = String::new();
-    for result in results {
+    for (index, result) in results.iter().enumerate() {
+        let echoed = echo.as_ref().map(|mask| mask.get(index)).unwrap_or(None);
+        if echoed == Some(&false) {
+            continue;
+        }
         out.push_str(&render_unit_result_with_ansi(result, ansi));
     }
-    let coverage = collect_coverage(results);
+    let coverage = collect_coverage_ordered(results);
     if !coverage.is_empty() {
-        let (sorted, reports) = merge_file_coverage(paths, &coverage);
+        let (sorted, reports) = merge_file_coverage_ordered(paths, &coverage);
         out.push_str(&render_coverage_report_with_ansi(
             &sorted,
             &reports,
@@ -3250,32 +3749,49 @@ fn empty_json_object(_: serde_json::Error) -> String {
 /// `json` pretty-prints the aggregate; `ugly` compacts it; `none` prints
 /// nothing. Failures exit `2` (`RESULT_FAIL`); successes exit `0`.
 fn run_cargo_selection(opts: &Options, cwd: &Path) -> ExitCode {
-    if let Err(msg) = check_everything_paths(opts.everything, &opts.paths) {
-        eprintln!("arc unit: {msg}");
-        return ExitCode::FAILURE;
+    match run_cargo_collecting(opts, cwd) {
+        Ok((code, _)) => code,
+        Err(error) => error.report(),
     }
+}
+
+/// [`run_cargo_selection`] that also returns the aggregate results as
+/// engine dicts, so `diff` can collect them (T1153 DIFF-D22).
+fn run_cargo_collecting(
+    opts: &Options,
+    cwd: &Path,
+) -> Result<(ExitCode, Vec<EngineUnitResult>), ClassifiedError> {
+    // The `--everything` plus paths gate already ran in `plan_run`.
     if let Some(warning) = cargo_coverage_warning(opts) {
         eprintln!("{warning}");
     }
-    match execute(opts, cwd, None) {
-        Ok(report) => {
-            let format = output_format(opts);
-            print_cargo_output(&report, &format);
-            if let Err(msg) = upload_cargo_target(opts, &report) {
-                eprintln!("arc unit: {msg}");
-                return ExitCode::FAILURE;
-            }
-            if report.success {
-                ExitCode::SUCCESS
-            } else {
-                exit_code_for_overall(arc_rs::unit_engine::WORKFLOW_RESULT_FAIL)
-            }
-        }
-        Err(msg) => {
-            eprintln!("arc unit: {msg}");
-            ExitCode::FAILURE
-        }
+    // T1153 R4 (UNIT-U5): cargo and upload failures are generic.
+    let report = execute(opts, cwd, None).map_err(ClassifiedError::exception)?;
+    let format = output_format(opts);
+    print_cargo_output(&report, &format);
+    upload_cargo_target(opts, &report).map_err(ClassifiedError::exception)?;
+    let code = if report.success {
+        ExitCode::SUCCESS
+    } else {
+        exit_code_for_overall(arc_rs::unit_engine::WORKFLOW_RESULT_FAIL)
+    };
+    let results = cargo_aggregate_results(&report).map_err(ClassifiedError::exception)?;
+    Ok((code, results))
+}
+
+/// Cargo aggregate results as engine results (T1153 DIFF-D22): one
+/// pass/fail result named after the engine, like PHP's
+/// `getTestResults()` entries.
+fn cargo_aggregate_results(report: &EngineReport) -> Result<Vec<EngineUnitResult>, String> {
+    let mut out = Vec::with_capacity(report.results.len());
+    for result in &report.results {
+        let mut converted = EngineUnitResult::new();
+        converted.set_name(&result.name)?;
+        converted.set_result(result.outcome.as_str());
+        converted.set_duration(result.duration_secs);
+        out.push(converted);
     }
+    Ok(out)
 }
 
 /// Run one engine named by `--engine` or `unit.engine`.
@@ -3286,15 +3802,35 @@ fn run_single_selection(
     paths: &[String],
     ansi: bool,
 ) -> ExitCode {
+    match run_single_collecting(opts, cwd, class, paths, ansi) {
+        Ok((code, _)) => code,
+        Err(error) => error.report(),
+    }
+}
+
+/// [`run_single_selection`] that also returns the per-test results, so
+/// `diff` can collect them (T1153 DIFF-D22).
+fn run_single_collecting(
+    opts: &Options,
+    cwd: &Path,
+    class: &str,
+    paths: &[String],
+    ansi: bool,
+) -> Result<(ExitCode, Vec<EngineUnitResult>), ClassifiedError> {
     if !opts.cargo_args.is_empty() {
-        eprintln!("arc unit: cargo test args after '--' require the cargo engine");
-        return ExitCode::FAILURE;
+        // T1153 R4 (UNIT-U4): an invocation mistake (Rust-only; PHP
+        // has no cargo engine), reported as usage.
+        return Err(ClassifiedError::usage(
+            "cargo test args after '--' require the cargo engine".to_string(),
+        ));
     }
     let root = project_root_path(cwd);
     let root_string = root.to_string_lossy().replace('\\', "/");
     let runner = RealRunner;
     let coverage = enable_coverage(opts);
-    match run_single_report(
+    // T1153 R4 (UNIT-U3, UNIT-U4, UNIT-U5): the classified report
+    // preserves `NoEffect` (stdout, exit 0), usage, and generic.
+    match run_single_report_classified(
         class,
         &root_string,
         paths,
@@ -3302,11 +3838,8 @@ fn run_single_selection(
         coverage,
         &runner,
     ) {
-        Ok(report) => finish_php_report(opts, &root, paths, &report, ansi),
-        Err(msg) => {
-            eprintln!("arc unit: {msg}");
-            ExitCode::FAILURE
-        }
+        Ok(report) => finish_php_report_collecting(opts, &root, paths, &report, ansi, None),
+        Err(error) => Err(error),
     }
 }
 
@@ -3318,145 +3851,249 @@ fn run_config_selection(
     paths: &[String],
     ansi: bool,
 ) -> ExitCode {
+    match run_config_collecting(opts, engines, root, paths, ansi) {
+        Ok((code, _)) => code,
+        Err(error) => error.report(),
+    }
+}
+
+/// [`run_config_selection`] that also returns the per-test results, so
+/// `diff` can collect them (T1153 DIFF-D22).
+fn run_config_collecting(
+    opts: &Options,
+    engines: &[PlannedEngine],
+    root: &Path,
+    paths: &[String],
+    ansi: bool,
+) -> Result<(ExitCode, Vec<EngineUnitResult>), ClassifiedError> {
     if !opts.cargo_args.is_empty() {
-        eprintln!("arc unit: cargo test args after '--' require the cargo engine");
-        return ExitCode::FAILURE;
+        // T1153 R4 (UNIT-U4): an invocation mistake (see above).
+        return Err(ClassifiedError::usage(
+            "cargo test args after '--' require the cargo engine".to_string(),
+        ));
     }
     let root_string = root.to_string_lossy().replace('\\', "/");
     let runner = RealRunner;
     let coverage = enable_coverage(opts);
-    match run_config_with_runner(
+    // T1153 R4 (UNIT-U3, UNIT-U4, UNIT-U5): classified (see above).
+    // UNIT-U1: the proxy echoes only non-echoing children's results.
+    match run_config_with_echo_classified(
         engines,
         &root_string,
         paths,
         opts.everything,
         coverage,
         &runner,
+        &resolve_php_prefix,
     ) {
-        Ok(report) => finish_php_report(opts, root, paths, &report, ansi),
-        Err(msg) => {
-            eprintln!("arc unit: {msg}");
-            ExitCode::FAILURE
+        Ok((report, echo)) => {
+            finish_php_report_collecting(opts, root, paths, &report, ansi, Some(&echo))
         }
+        Err(error) => Err(error),
     }
 }
 
 /// Print a PHP-engine report per the output format, upload to `target` when
 /// set, and map the overall result to the process exit code
-/// (`ArcanistUnitWorkflow.php:184-282`).
-fn finish_php_report(
+/// (`ArcanistUnitWorkflow.php:184-282`). `echo` gates per-result lines
+/// (UNIT-U1): `None` echoes all (single runs), `Some` masks (config runs).
+/// Also returns the per-test results, so `diff` can collect them (T1153
+/// DIFF-D22).
+fn finish_php_report_collecting(
     opts: &Options,
     project_root: &Path,
     paths: &[String],
     report: &ConfigReport,
     ansi: bool,
-) -> ExitCode {
+    echo: Option<&[bool]>,
+) -> Result<(ExitCode, Vec<EngineUnitResult>), ClassifiedError> {
     let format = output_format(opts);
-    let text = render_workflow_output_with_ansi(
+    let text = render_workflow_output_with_echo(
         &report.results,
         paths,
         &format,
         opts.detailed_coverage,
         project_root,
         ansi,
+        echo,
     );
     print!("{text}");
     let overall = arc_rs::unit_engine::overall_result(&report.results);
     if let Some(target) = opts.target.as_deref()
-        && let Err(msg) = upload_results(
-            target,
-            overall,
-            &report.results,
-            opts.conduit_uri.as_deref(),
-        )
+        && let Err(msg) =
+            upload_results_for_options(opts, project_root, target, overall, &report.results)
     {
-        eprintln!("arc unit: {msg}");
-        return ExitCode::FAILURE;
+        // T1153 R4 (UNIT-U5): upload failures are generic.
+        return Err(ClassifiedError::exception(msg));
     }
-    exit_code_for_overall(overall)
+    Ok((exit_code_for_overall(overall), report.results.clone()))
+}
+
+/// Upload through [`upload_results_with`] with the run's config overrides.
+fn upload_results_for_options(
+    opts: &Options,
+    dir: &Path,
+    target: &str,
+    overall: i32,
+    results: &[EngineUnitResult],
+) -> Result<(), String> {
+    let cli = get_config::load_options_from_cli(
+        &opts.config,
+        &opts.config_file,
+        opts.arcrc_file.as_deref(),
+    )?;
+    let user_file = config::arcrc_path();
+    upload_results_with(
+        target,
+        overall,
+        results,
+        opts.conduit_uri.as_deref(),
+        dir,
+        user_file.as_deref(),
+        &cli,
+    )
 }
 
 fn parse_unit_options(argv: &[String]) -> Result<Options, ExitCode> {
     match parse_options(argv) {
         Ok(Some(opts)) => Ok(opts),
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", usage());
             Err(ExitCode::SUCCESS)
         }
-        Err(msg) => {
-            eprintln!("arc unit: {msg}\n\n{USAGE}");
-            Err(ExitCode::FAILURE)
-        }
+        // T1153 R4 (UNIT-U4): `unit` is a subprocess workflow:
+        // usage errors render `Usage Exception:` with no usage dump
+        // (`scripts/arcanist.php:432-444`).
+        Err(msg) => Err(conduit::report(EnvelopeKind::Usage, &msg)),
     }
 }
 
 fn unit_working_dir() -> Result<PathBuf, ExitCode> {
     match std::env::current_dir() {
         Ok(dir) => Ok(dir),
-        Err(e) => {
-            eprintln!("arc unit: cannot read current directory: {e}");
-            Err(ExitCode::FAILURE)
-        }
+        Err(e) => Err(conduit::report(
+            EnvelopeKind::Exception,
+            &format!("cannot read current directory: {e}"),
+        )),
     }
 }
 
-fn check_unit_supports(cwd: &Path, opts: &Options) -> Result<(), ExitCode> {
-    if let Some(vcs) = detect_vcs(cwd)
-        && let Err(msg) = check_supports(vcs, &opts.provided)
+/// Classify a path-selection error: `--everything` with paths and
+/// missing explicit paths are usage errors
+/// (`ArcanistUnitWorkflow.php:136-143`,
+/// `ArcanistWorkflow.php:1631-1637`); VCS command failures are
+/// generic.
+fn classify_select_paths_error(message: String) -> ClassifiedError {
+    if message.starts_with("You can not specify paths with --everything.")
+        || (message.starts_with("Path '") && message.ends_with("' does not exist!"))
     {
-        eprintln!("arc unit: {msg}");
-        return Err(ExitCode::FAILURE);
+        ClassifiedError::usage(message)
+    } else {
+        ClassifiedError::exception(message)
+    }
+}
+
+/// UNIT-U23: `arc unit` requires a working copy and a repository API
+/// (`ArcanistUnitWorkflow.php:109-115`); outside one, PHP throws a usage
+/// error (`scripts/arcanist.php:260-266`).
+fn check_working_copy_gate(cwd: &Path) -> Result<(), ClassifiedError> {
+    if detect_vcs(cwd).is_none() {
+        return Err(ClassifiedError::usage(
+            "This command must be run in a Git, Mercurial or Subversion working copy.".to_string(),
+        ));
     }
     Ok(())
 }
 
-fn discover_unit_selection(opts: &Options, cwd: &Path) -> Result<Selection, ExitCode> {
-    // Cargo ignores paths/rev (it runs `cargo test` in the crate root), but
-    // the `--everything` plus paths check still applies workflow-wide.
-    match discover_selection(opts, cwd) {
-        Ok(selection) => Ok(selection),
-        Err(msg) => {
-            eprintln!("arc unit: {msg}");
-            Err(ExitCode::FAILURE)
+/// A planned run: engine selection plus (for PHP engines) selected paths.
+#[derive(Debug)]
+enum PlannedRun {
+    Cargo,
+    Single {
+        class: String,
+        paths: Vec<String>,
+    },
+    Config {
+        engines: Vec<PlannedEngine>,
+        root: PathBuf,
+        paths: Vec<String>,
+    },
+}
+
+/// Plan the run in PHP bootstrap order: VCS supports, the working-copy
+/// gate (UNIT-U23), the `--everything` plus paths conflict (UNIT-U9, first
+/// line of PHP `run()`), engine discovery, then path selection. Discovery
+/// stays ahead of selection (unlike PHP's select-then-engine): cargo paths
+/// are test-name filters that must not validate as files.
+fn plan_run(opts: &Options, cwd: &Path) -> Result<PlannedRun, ClassifiedError> {
+    if let Some(vcs) = detect_vcs(cwd) {
+        // T1153 R4 (UNIT-U4): VCS support refusals are usage errors.
+        check_supports(vcs, &opts.provided).map_err(ClassifiedError::usage)?;
+    }
+    check_working_copy_gate(cwd)?;
+    // T1153 R4 (UNIT-U4): `--everything` with paths is a usage error
+    // (`ArcanistUnitWorkflow.php:136-143`), checked pre-discovery.
+    check_everything_paths(opts.everything, &opts.paths).map_err(ClassifiedError::usage)?;
+    // Cargo ignores paths/rev (it runs `cargo test` in the crate root).
+    match discover_selection_classified(opts, cwd)? {
+        Selection::Cargo => Ok(PlannedRun::Cargo),
+        Selection::Single(class) => {
+            let root = project_root_path(cwd);
+            let paths = select_paths(opts, cwd, &root).map_err(classify_select_paths_error)?;
+            Ok(PlannedRun::Single { class, paths })
+        }
+        Selection::Config { engines, root } => {
+            let paths = select_paths(opts, cwd, &root).map_err(classify_select_paths_error)?;
+            Ok(PlannedRun::Config {
+                engines,
+                root,
+                paths,
+            })
         }
     }
 }
 
-fn run_single_paths(opts: &Options, cwd: &Path, class: &str, ansi: bool) -> ExitCode {
-    let root = project_root_path(cwd);
-    let paths = match select_paths(opts, cwd, &root) {
-        Ok(paths) => paths,
-        Err(msg) => {
-            eprintln!("arc unit: {msg}");
-            return ExitCode::FAILURE;
-        }
-    };
-    run_single_selection(opts, cwd, class, &paths, ansi)
+/// Report of a collecting child unit run (T1153 DIFF-D22).
+#[derive(Debug, Clone)]
+pub struct ChildUnitReport {
+    /// Workflow exit code.
+    pub code: ExitCode,
+    /// Per-test results (`testResults`).
+    pub results: Vec<EngineUnitResult>,
 }
 
-fn run_config_paths(
-    opts: &Options,
-    cwd: &Path,
-    engines: &[PlannedEngine],
-    root: &Path,
-    ansi: bool,
-) -> ExitCode {
-    let paths = match select_paths(opts, cwd, root) {
-        Ok(paths) => paths,
-        Err(msg) => {
-            eprintln!("arc unit: {msg}");
-            return ExitCode::FAILURE;
+/// Run unit as `diff`'s child in `cwd`, collecting test-result dicts
+/// (T1153 DIFF-D22: `runUnit()`,
+/// `src/workflow/ArcanistDiffWorkflow.php:1213-1278`). Renders and
+/// uploads like the standalone run; errors return unreported for the
+/// caller to map (`NoEffect` prints with exit 0, everything else
+/// aborts the diff, like PHP's child catches).
+pub fn run_in_collecting(cwd: &Path, argv: &[String]) -> Result<ChildUnitReport, ClassifiedError> {
+    let opts = match parse_options(argv) {
+        Ok(Some(opts)) => opts,
+        Ok(None) => {
+            print!("{}", usage());
+            return Err(ClassifiedError::usage(
+                "unexpected --help in child unit argv".to_string(),
+            ));
         }
+        // T1153 R4 (UNIT-U4): usage errors abort the diff unreported
+        // here (the caller renders them).
+        Err(message) => return Err(ClassifiedError::usage(message)),
     };
-    run_config_selection(opts, engines, root, &paths, ansi)
-}
-
-fn run_unit_selection(opts: &Options, cwd: &Path, selection: Selection, ansi: bool) -> ExitCode {
-    match selection {
-        Selection::Cargo => run_cargo_selection(opts, cwd),
-        Selection::Single(class) => run_single_paths(opts, cwd, &class, ansi),
-        Selection::Config { engines, root } => run_config_paths(opts, cwd, &engines, &root, ansi),
-    }
+    let ansi = terminal::ansi_enabled();
+    let (code, results) = match plan_run(&opts, cwd)? {
+        PlannedRun::Cargo => run_cargo_collecting(&opts, cwd)?,
+        PlannedRun::Single { class, paths } => {
+            run_single_collecting(&opts, cwd, &class, &paths, ansi)?
+        }
+        PlannedRun::Config {
+            engines,
+            root,
+            paths,
+        } => run_config_collecting(&opts, &engines, &root, &paths, ansi)?,
+    };
+    Ok(ChildUnitReport { code, results })
 }
 
 pub fn run(argv: &[String]) -> ExitCode {
@@ -3468,14 +4105,19 @@ pub fn run(argv: &[String]) -> ExitCode {
         Ok(dir) => dir,
         Err(code) => return code,
     };
-    if let Err(code) = check_unit_supports(&cwd, &opts) {
-        return code;
+    let ansi = terminal::ansi_enabled();
+    match plan_run(&opts, &cwd) {
+        Ok(PlannedRun::Cargo) => run_cargo_selection(&opts, &cwd),
+        Ok(PlannedRun::Single { class, paths }) => {
+            run_single_selection(&opts, &cwd, &class, &paths, ansi)
+        }
+        Ok(PlannedRun::Config {
+            engines,
+            root,
+            paths,
+        }) => run_config_selection(&opts, &engines, &root, &paths, ansi),
+        Err(error) => error.report(),
     }
-    let selection = match discover_unit_selection(&opts, &cwd) {
-        Ok(selection) => selection,
-        Err(code) => return code,
-    };
-    run_unit_selection(&opts, &cwd, selection, terminal::ansi_enabled())
 }
 
 #[cfg(test)]

@@ -420,6 +420,7 @@ fn effective_aliases_dedupe_and_sort() {
 
 #[test]
 fn renders_list_table_and_empty_state() {
+    // T1153 CORE-26 (kept): PHP's list stub is silent; Rust lists.
     assert_eq!(render_list(&[]), "You have not defined any aliases yet.\n");
     let aliases = vec![
         alias("arc", "ls", &["!ls"], "user"),
@@ -453,24 +454,31 @@ fn builds_json_document() {
 
 #[test]
 fn parses_args_with_terminator_and_json() {
+    // T1153 B21/B23: TTY runs need no `--`.
     assert_eq!(
-        parse_args(&args(&[])).unwrap().unwrap(),
+        parse_args_with_tty(&args(&[]), true).unwrap().unwrap(),
         Options {
             json: false,
             positional: Vec::new(),
         }
     );
-    let options = parse_args(&args(&["draft", "diff", "--", "--draft"]))
+    let options = parse_args_with_tty(&args(&["draft", "diff", "--", "--draft"]), true)
         .unwrap()
         .unwrap();
     assert_eq!(options.positional, args(&["draft", "diff", "--draft"]));
     assert!(!options.json);
-    let options = parse_args(&args(&["--json"])).unwrap().unwrap();
+    let options = parse_args_with_tty(&args(&["--json"]), true)
+        .unwrap()
+        .unwrap();
     assert!(options.json);
-    assert!(parse_args(&args(&["--help"])).unwrap().is_none());
-    assert!(parse_args(&args(&["-h"])).unwrap().is_none());
     assert!(
-        parse_args(&args(&["--bogus"]))
+        parse_args_with_tty(&args(&["--help"]), true)
+            .unwrap()
+            .is_none()
+    );
+    assert!(parse_args_with_tty(&args(&["-h"]), true).unwrap().is_none());
+    assert!(
+        parse_args_with_tty(&args(&["--bogus"]), true)
             .unwrap_err()
             .contains("unknown flag")
     );
@@ -500,10 +508,8 @@ fn create_stores_new_format_and_preserves_rest_of_file() {
     .unwrap();
 
     let report = execute_create(&arcrc, "draft", &args(&["diff", "--draft"])).unwrap();
-    assert_eq!(
-        report.text,
-        "Aliased \"arc draft\" to \"arc diff --draft\".\n"
-    );
+    // T1153 CORE-25: creation appends silently (no confirmation text).
+    assert_eq!(report.text, "");
     assert!(report.warnings.is_empty());
 
     let doc: serde_json::Value =
@@ -525,16 +531,16 @@ fn create_replaces_previous_definition_and_reports_shell() {
     let arcrc = tmp.arcrc();
     execute_create(&arcrc, "ls", &args(&["!ls"])).unwrap();
     let report = execute_create(&arcrc, "ls", &args(&["!ls", "-la"])).unwrap();
-    assert_eq!(
-        report.text,
-        "Aliased \"arc ls\" to shell command \"ls -la\".\n"
-    );
+    // T1153 CORE-25: creation appends silently (no confirmation text).
+    assert_eq!(report.text, "");
 
     let doc: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&arcrc).unwrap()).unwrap();
+    // T1153 CORE-25: duplicates accumulate (the engine last-wins).
     assert_eq!(
         doc["aliases"],
         serde_json::json!([
+            {"trigger": "ls", "toolset": "arc", "command": ["!ls"]},
             {"trigger": "ls", "toolset": "arc", "command": ["!ls", "-la"]},
         ])
     );
@@ -710,13 +716,23 @@ fn shell_runner_maps_spawn_outcomes() {
         &args(&["echo", "hi"]),
         "arc g -> $ echo hi",
         |program, argv| {
-            assert_eq!(program, "echo");
-            assert_eq!(argv, &["hi".to_string()]);
+            // T1153 CORE-23: Unix mediates the shell (`sh -c`).
+            if cfg!(unix) {
+                assert_eq!(program, "sh");
+                assert_eq!(argv, &["-c".to_string(), "'echo' 'hi'".to_string()]);
+            } else {
+                assert_eq!(program, "echo");
+                assert_eq!(argv, &["hi".to_string()]);
+            }
             Ok(ShellStatus::Exited(0))
         },
     );
     assert_eq!(code, ExitCode::SUCCESS);
-    assert_eq!(notices, vec!["SHELL ALIAS: arc g -> $ echo hi".to_string()]);
+    // T1153 CORE-23: cyan log-engine hint (` SHELL ALIAS  ...` plain).
+    assert_eq!(
+        notices,
+        vec![" SHELL ALIAS  arc g -> $ echo hi".to_string()]
+    );
 
     let (code, notices) =
         run_shell_alias_with(&args(&["echo"]), "h", |_, _| Ok(ShellStatus::Exited(7)));
@@ -740,9 +756,11 @@ fn shell_runner_maps_spawn_outcomes() {
     );
     assert!(notices[1].contains("not found"), "{}", notices[1]);
 
+    // T1153 CORE-23: an empty shell command exits 0 like PHP's
+    // `passthru('')`.
     let (code, notices) = run_shell_alias_with(&[], "h", |_, _| Ok(ShellStatus::Exited(0)));
-    assert_eq!(code, ExitCode::FAILURE);
-    assert!(notices[1].contains("empty shell alias"), "{}", notices[1]);
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(notices.len(), 1);
 }
 
 fn loaded(aliases: Vec<Alias>) -> Option<(Vec<Alias>, Vec<String>)> {
@@ -758,9 +776,10 @@ fn expansion_driver_dispatches_and_reports_shell_and_broken_chains() {
         |_| panic!("must not spawn for dispatch"),
     );
     assert_eq!(result, Ok(args(&["diff", "--draft", "extra"])));
+    // T1153 CORE-23: cyan log-engine hint (` ALIAS  ...` plain).
     assert_eq!(
         notices,
-        vec!["ALIAS: arc draft -> arc diff --draft".to_string()]
+        vec![" ALIAS  arc draft -> arc diff --draft".to_string()]
     );
 
     let aliases = vec![alias("arc", "g", &["!echo", "hi"], "user")];
@@ -768,14 +787,20 @@ fn expansion_driver_dispatches_and_reports_shell_and_broken_chains() {
         args(&["g"]),
         || loaded(aliases),
         |shell| {
-            assert_eq!(shell, &args(&["echo", "hi"]));
+            // T1153 CORE-23: Unix mediates the shell (`sh -c`).
+            if cfg!(unix) {
+                assert_eq!(shell, &args(&["sh", "-c", "'echo' 'hi'"]));
+            } else {
+                assert_eq!(shell, &args(&["echo", "hi"]));
+            }
             Ok(ShellStatus::Exited(0))
         },
     );
     assert_eq!(result, Err(ExitCode::SUCCESS));
+    // T1153 CORE-23: cyan log-engine hint (` SHELL ALIAS  ...` plain).
     assert_eq!(
         notices,
-        vec!["SHELL ALIAS: arc g -> $ 'echo' 'hi'".to_string()]
+        vec![" SHELL ALIAS  arc g -> $ 'echo' 'hi'".to_string()]
     );
 
     let aliases = vec![alias("arc", "g", &["!echo"], "user")];
@@ -795,7 +820,8 @@ fn expansion_driver_dispatches_and_reports_shell_and_broken_chains() {
     );
     assert_eq!(result, Err(ExitCode::FAILURE));
     assert_eq!(notices.len(), 2);
-    assert!(notices[0].starts_with("ALIAS: "), "{}", notices[0]);
+    // T1153 CORE-23: cyan log-engine hint (` ALIAS  ...` plain).
+    assert!(notices[0].starts_with(" ALIAS  "), "{}", notices[0]);
     assert!(
         notices[1].contains("Alias resolved to \"gone\""),
         "{}",
@@ -821,6 +847,7 @@ fn expansion_driver_passes_through_flags_and_unreadable_config() {
 
 #[test]
 fn expansion_driver_emits_configuration_warnings_first() {
+    // T1153 CORE-24 (kept): invalid aliases warn and are ignored.
     let aliases = vec![alias("arc", "draft", &["diff"], "user")];
     let warning = "Configuration source (\"user\") defines an invalid alias".to_string();
     let (result, notices) = apply_expansion_with(
@@ -830,10 +857,240 @@ fn expansion_driver_emits_configuration_warnings_first() {
     );
     assert_eq!(result, Ok(args(&["diff"])));
     assert_eq!(notices.len(), 2);
-    assert_eq!(notices[0], format!("ALIAS: {warning}"));
+    // T1153 CORE-23: cyan log-engine hints (` ALIAS  ...` plain).
+    assert_eq!(notices[0], format!(" ALIAS  {warning}"));
     assert!(
-        notices[1].starts_with("ALIAS: arc draft -> "),
+        notices[1].starts_with(" ALIAS  arc draft -> "),
         "{}",
         notices[1]
     );
+}
+
+#[test]
+fn rbd2_json_rejects_repeats() {
+    // T1153 B21/B23: TTY runs need no `--`.
+    let error = parse_args_with_tty(&args(&["--json", "--json"]), true).unwrap_err();
+    assert_eq!(error, "Argument \"--json\" was provided twice.");
+}
+
+#[test]
+fn rbd25_json_rejects_inline_values() {
+    // T1153 B21/B23: TTY runs need no `--`.
+    let error = parse_args_with_tty(&args(&["--json=x"]), true).unwrap_err();
+    assert_eq!(error, "Argument \"--json\" does not take a parameter.");
+}
+
+#[test]
+fn rbd6_lone_dash_is_positional() {
+    // T1153 B21/B23: TTY runs need no `--`.
+    let options = parse_args_with_tty(&args(&["-"]), true).unwrap().unwrap();
+    assert_eq!(options.positional, vec!["-".to_string()]);
+}
+
+#[test]
+fn core16_toolset_names_match_ceb() {
+    // T1153 CORE-66: `browse` is a concrete toolset workflow at ceb
+    // (`ArcanistBrowseWorkflow extends ArcanistArcWorkflow`).
+    let names = toolset_names();
+    assert_eq!(names.len(), 21);
+    for name in [
+        "alias",
+        "amend",
+        "anoid",
+        "bookmarks",
+        "branches",
+        "browse",
+        "call-conduit",
+        "download",
+        "help",
+        "inspect",
+        "land",
+        "liberate",
+        "look",
+        "paste",
+        "prompts",
+        "shell-complete",
+        "upload",
+        "upgrade",
+        "version",
+        "weld",
+        "work",
+    ] {
+        assert!(names.contains(&name), "{name}");
+    }
+    for name in ["diff", "list", "which", "markers", "arc"] {
+        assert!(!names.contains(&name), "{name}");
+    }
+}
+
+#[test]
+fn core21_alias_errors_use_toolset_arms() {
+    assert_eq!(run(&args(&["--bogus"])), std::process::ExitCode::FAILURE);
+    assert_eq!(
+        run(&args(&["--json", "x"])),
+        std::process::ExitCode::FAILURE
+    );
+    // Builtin triggers fail before touching the filesystem.
+    assert_eq!(
+        run(&args(&["diff", "land"])),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn core28_user_aliases_prefer_config_section_on_collision() {
+    // The toolset `ArcanistUserConfigurationSource` transform keeps the
+    // section's `aliases` value when both layers define the key (`$result
+    // += $config` never overwrites); the union is per-key, so the whole
+    // top-level value drops, not just the colliding trigger.
+    let tmp = TempDir::new("core28");
+    let arcrc = tmp.arcrc();
+    std::fs::write(
+        &arcrc,
+        r#"{
+            "config": {"aliases": {"draft": ["diff", "--section"]}},
+            "aliases": {"draft": ["diff", "--top"]}
+        }"#,
+    )
+    .unwrap();
+    let (aliases, warnings) = load_aliases_in(tmp.path(), Some(&arcrc)).unwrap();
+    assert!(warnings.is_empty());
+    assert_eq!(aliases.len(), 1);
+    assert_eq!(aliases[0].trigger, "draft");
+    assert_eq!(
+        aliases[0].command,
+        vec!["diff".to_string(), "--section".to_string()]
+    );
+}
+#[test]
+fn r10_alias_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "ALIAS WORKFLOW\n\
+         \n\
+         alias\n\
+         alias command target -- [arguments]\n\
+         Create and modify command aliases.\n\
+         \n\
+         Create an alias from command to target (optionally, with options).\n\
+         \n\
+         Aliases allow you to create shorthands for commands and sets of flags you\n\
+         commonly use, like defining \"arc draft\" as a shorthand for \"arc diff\n\
+         --draft\".\n\
+         \n\
+         Creating Aliases\n\
+         \n\
+         You can define \"arc draft\" as a shorthand for \"arc diff --draft\" like this:\n\
+         \n\
+         \x20 $ arc alias draft diff -- --draft\n\
+         \n\
+         Now, when you run \"arc draft\", the command will function like \"arc diff\n\
+         --draft\".\n\
+         \n\
+         \x20NOTE:  Make sure you use \"--\" before specifying any flags you want to pass\n\
+         to the command! Otherwise, the flags will be interpreted as flags to \"arc\n\
+         alias\".\n\
+         \n\
+         Listing Aliases\n\
+         \n\
+         Without any arguments, \"arc alias\" will list aliases.\n\
+         \n\
+         Removing Aliases\n\
+         \n\
+         To remove an alias, run:\n\
+         \n\
+         \x20 $ arc alias <alias-name>\n\
+         \n\
+         You will be prompted to remove the alias.\n\
+         \n\
+         Shell Commands\n\
+         \n\
+         If you begin an alias with \"!\", the remainder of the alias will be invoked as\n\
+         a shell command. For example, if you want to implement \"arc ls\", you can do\n\
+         so like this:\n\
+         \n\
+         \x20 $ arc alias ls '!ls'\n\
+         \n\
+         When run, \"arc ls\" will now behave like \"ls\".\n\
+         \n\
+         Multiple Toolsets\n\
+         \n\
+         This workflow supports any toolset, even though the examples in this help\n\
+         text use \"arc\". If you are working with another toolset, use the binary for\n\
+         that toolset define aliases for it:\n\
+         \n\
+         \x20 $ phage alias ...\n\
+         \n\
+         Aliases are bound to the toolset which was used to define them. If you define\n\
+         an \"arc draft\" alias, that does not also define a \"phage draft\" alias.\n\
+         \n\
+         Builtins\n\
+         \n\
+         You can not overwrite the behavior of builtin workflows, including \"alias\"\n\
+         itself, and if you install a new workflow it will take precedence over any\n\
+         existing aliases with the same name.\n\
+         \n\
+         \x20     --json\n\
+         \x20         Output aliases in JSON format.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("ALIAS WORKFLOW"), "{}", usage());
+}
+
+#[test]
+fn b21_alias_requires_terminator_when_piped() {
+    // T1153 B21/B23: piped without `--` reports the terminator, even
+    // for `--help` and empty argv. Unknown flags still report first.
+    assert_eq!(
+        parse_args_with_tty(&args(&[]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    assert_eq!(
+        parse_args_with_tty(&args(&["--help"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    assert_eq!(
+        parse_args_with_tty(&args(&["--json"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    let err = parse_args_with_tty(&args(&["--bogus"]), false).unwrap_err();
+    assert!(err.contains("unknown flag"), "unexpected: {err}");
+    assert!(
+        parse_args_with_tty(&args(&["--"]), false)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        parse_args_with_tty(&args(&["draft", "diff", "--", "--draft"]), false)
+            .unwrap()
+            .is_some()
+    );
+    assert!(parse_args_with_tty(&args(&[]), true).unwrap().is_some());
+    assert_eq!(
+        crate::help::MISSING_TERMINATOR,
+        "Missing required \"--\" in argument list."
+    );
+}
+
+#[test]
+fn b23_alias_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help alias`.
+    let text = usage_text(false);
+    assert!(text.starts_with("ALIAS WORKFLOW\n"), "{text}");
+    assert!(
+        text.contains("Create and modify command aliases."),
+        "{text}"
+    );
+    assert!(text.contains("--json"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }

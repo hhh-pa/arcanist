@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 /// Run git in `dir`, returning the raw output. Spawn failures become
 /// errors; non-zero exit statuses are left for the caller to interpret.
 pub fn output(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    std::process::Command::new("git")
+    crate::proc_env::command("git")
         .current_dir(dir)
         .args(args)
         .output()
@@ -2256,7 +2256,7 @@ pub fn read_raw_commit(dir: &Path, hash: &str) -> Result<RawCommit, String> {
 pub fn write_raw_commit(dir: &Path, commit: &RawCommit) -> Result<String, String> {
     use std::io::Write;
     use std::process::Stdio;
-    let mut child = std::process::Command::new("git")
+    let mut child = crate::proc_env::command("git")
         .current_dir(dir)
         .args(["hash-object", "-t", "commit", "--stdin", "-w"])
         .stdin(Stdio::piped())

@@ -65,6 +65,11 @@ impl Linter for MergeConflictLinter {
                     description: DESC_MERGECONFLICT.to_string(),
                     original: None,
                     replacement: None,
+                    granularity: None,
+                    locations: Vec::new(),
+                    bypass_changed_line_filtering: None,
+                    original_bytes: None,
+                    replacement_bytes: None,
                 });
             }
         }

@@ -17,11 +17,16 @@
 //! - JSON is parsed with a dependency-free mini parser instead of
 //!   `phutil_json_decode`. Namespaces, DOCTYPEs, entities beyond the five
 //!   predefined XML entities, and duplicate attributes are not supported.
-//! - `setDuration` takes `f64` only; PHP (`ArcanistUnitTestResult.php:86-94`)
-//!   accepts int|float and throws otherwise. The Rust type makes the throw
-//!   unreachable.
+//! - `setDuration` takes `f64`, plus `set_duration_int` for whole seconds:
+//!   PHP (`ArcanistUnitTestResult.php:86-94`) accepts int|float and JSON keeps
+//!   the distinction (`3` vs `3.0`), so the flag survives into every JSON
+//!   renderer. A non-numeric throw is unreachable in the Rust types.
 //! - `extraData` values are strings; PHP (`ArcanistUnitTestResult.php:114-121`)
 //!   allows wild values.
+//! - `extraData`/`coverage` keep insertion order end to end (UNIT-U20):
+//!   producers record pairs in document order and every renderer emits
+//!   them in that order, like PHP arrays. Maps set through the legacy
+//!   `HashMap` setters (whose order is already lost) still render sorted.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -57,13 +62,23 @@ pub const MAX_NAME_BYTES: usize = 255;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct UnitResult {
     namespace: Option<String>,
-    name: String,
+    // T1153 UNIT-U19: unset `name`/`result` stay `None` (PHP JSON null);
+    // the `get_*` accessors still return `""` for compat.
+    name: Option<String>,
     link: Option<String>,
-    result: String,
+    result: Option<String>,
     duration: Option<f64>,
+    // T1153 UNIT-U18: true when set via `set_duration_int`, so JSON keeps
+    // PHP's int-vs-float distinction (`3` vs `3.0`).
+    duration_is_int: bool,
     user_data: Option<String>,
     extra_data: Option<HashMap<String, String>>,
     coverage: Option<HashMap<String, String>>,
+    // UNIT-U20: insertion order for the maps above, first-seen keys.
+    // Empty when set through the legacy `HashMap` setters (order
+    // already lost): readers fall back to sorted pairs then.
+    extra_order: Vec<String>,
+    coverage_order: Vec<String>,
 }
 
 impl UnitResult {
@@ -86,24 +101,28 @@ impl UnitResult {
     }
 
     /// `setName` (`src/unit/ArcanistUnitTestResult.php:32-49`): names longer
-    /// than 255 bytes are an error, mirroring the PHP exception.
+    /// than 255 bytes are an error, mirroring the PHP exception. Counts
+    /// render with thousands separators like PHP `PhutilNumber` (UNIT-U25).
     pub fn set_name(&mut self, name: &str) -> Result<&mut Self, String> {
         let actual = name.len();
         if actual > MAX_NAME_BYTES {
             return Err(format!(
                 "Parameter (\"{name}\") passed to \"setName()\" when constructing a unit test \
-                 message must be a string with a maximum length of {MAX_NAME_BYTES} bytes, but \
-                 is {actual} bytes in length."
+                 message must be a string with a maximum length of {} bytes, but \
+                 is {} bytes in length.",
+                format_count(MAX_NAME_BYTES),
+                format_count(actual),
             ));
         }
-        self.name = name.to_string();
+        self.name = Some(name.to_string());
         Ok(self)
     }
 
-    /// `getName` (`src/unit/ArcanistUnitTestResult.php:51-53`).
+    /// `getName` (`src/unit/ArcanistUnitTestResult.php:51-53`): `""` when
+    /// unset (PHP `toDictionary` reports null instead; see UNIT-U19).
     #[must_use]
     pub fn get_name(&self) -> &str {
-        &self.name
+        self.name.as_deref().unwrap_or("")
     }
 
     /// `setLink` (`src/unit/ArcanistUnitTestResult.php:55-58`).
@@ -120,21 +139,37 @@ impl UnitResult {
 
     /// `setResult` (`src/unit/ArcanistUnitTestResult.php:64-67`).
     pub fn set_result(&mut self, result: &str) -> &mut Self {
-        self.result = result.to_string();
+        self.result = Some(result.to_string());
         self
     }
 
-    /// `getResult` (`src/unit/ArcanistUnitTestResult.php:69-71`).
+    /// `getResult` (`src/unit/ArcanistUnitTestResult.php:69-71`): `""` when
+    /// unset (PHP `toDictionary` reports null instead; see UNIT-U19).
     #[must_use]
     pub fn get_result(&self) -> &str {
-        &self.result
+        self.result.as_deref().unwrap_or("")
     }
 
     /// `setDuration` (`src/unit/ArcanistUnitTestResult.php:86-94`): seconds as
-    /// a float. See the module docs for the int|float Divergence.
+    /// a float. See `set_duration_int` for the integer spelling (UNIT-U18).
     pub fn set_duration(&mut self, duration: f64) -> &mut Self {
         self.duration = Some(duration);
+        self.duration_is_int = false;
         self
+    }
+
+    /// `setDuration` with an integer value: PHP keeps int|float apart and
+    /// JSON-encodes them as `3` vs `3.0` (UNIT-U18).
+    pub fn set_duration_int(&mut self, duration: i64) -> &mut Self {
+        self.duration = Some(duration as f64);
+        self.duration_is_int = true;
+        self
+    }
+
+    /// Whether the duration was set as an integer (UNIT-U18).
+    #[must_use]
+    pub fn duration_is_int(&self) -> bool {
+        self.duration_is_int && self.duration.is_some()
     }
 
     /// `getDuration` (`src/unit/ArcanistUnitTestResult.php:97-99`).
@@ -156,8 +191,11 @@ impl UnitResult {
     }
 
     /// `setExtraData` (`src/unit/ArcanistUnitTestResult.php:114-117`).
+    /// Legacy form: the map's order is already lost, so readers render
+    /// sorted pairs (see [`UnitResult::set_extra_data_ordered`]).
     pub fn set_extra_data(&mut self, extra_data: HashMap<String, String>) -> &mut Self {
         self.extra_data = Some(extra_data);
+        self.extra_order.clear();
         self
     }
 
@@ -167,9 +205,29 @@ impl UnitResult {
         self.extra_data.as_ref()
     }
 
+    /// `setExtraData` with insertion order (UNIT-U20): `pairs` in
+    /// document order, like a PHP array (repeats keep first position,
+    /// last value wins).
+    pub fn set_extra_data_ordered(&mut self, pairs: Vec<(String, String)>) -> &mut Self {
+        let (map, order) = order_pairs(pairs);
+        self.extra_data = Some(map);
+        self.extra_order = order;
+        self
+    }
+
+    /// `getExtraData` pairs in insertion order (UNIT-U20): recorded
+    /// order, else sorted (the legacy-setter fallback).
+    #[must_use]
+    pub fn extra_data_ordered(&self) -> Option<Vec<(String, String)>> {
+        ordered_pairs(self.extra_data.as_ref(), &self.extra_order)
+    }
+
     /// `setCoverage` (`src/unit/ArcanistUnitTestResult.php:123-126`).
+    /// Legacy form: the map's order is already lost, so readers render
+    /// sorted pairs (see [`UnitResult::set_coverage_ordered`]).
     pub fn set_coverage(&mut self, coverage: HashMap<String, String>) -> &mut Self {
         self.coverage = Some(coverage);
+        self.coverage_order.clear();
         self
     }
 
@@ -177,6 +235,23 @@ impl UnitResult {
     #[must_use]
     pub fn get_coverage(&self) -> Option<&HashMap<String, String>> {
         self.coverage.as_ref()
+    }
+
+    /// `setCoverage` with insertion order (UNIT-U20): `pairs` in
+    /// document order, like a PHP array (repeats keep first position,
+    /// last value wins).
+    pub fn set_coverage_ordered(&mut self, pairs: Vec<(String, String)>) -> &mut Self {
+        let (map, order) = order_pairs(pairs);
+        self.coverage = Some(map);
+        self.coverage_order = order;
+        self
+    }
+
+    /// `getCoverage` pairs in insertion order (UNIT-U20): recorded
+    /// order, else sorted (the legacy-setter fallback).
+    #[must_use]
+    pub fn coverage_ordered(&self) -> Option<Vec<(String, String)>> {
+        ordered_pairs(self.coverage.as_ref(), &self.coverage_order)
     }
 
     /// `mergeCoverage` (`src/unit/ArcanistUnitTestResult.php:138-162`): merge
@@ -203,7 +278,9 @@ impl UnitResult {
         Some(String::from_utf8(bytes).expect("coverage maps must be ASCII"))
     }
 
-    /// `toDictionary` (`src/unit/ArcanistUnitTestResult.php:164-175`).
+    /// `toDictionary` (`src/unit/ArcanistUnitTestResult.php:164-175`):
+    /// unset scalars stay `None` (PHP null), including `name`/`result`
+    /// (UNIT-U19); nested maps keep insertion order (UNIT-U20).
     #[must_use]
     pub fn to_dictionary(&self) -> UnitDictionary {
         UnitDictionary {
@@ -212,9 +289,10 @@ impl UnitResult {
             link: self.link.clone(),
             result: self.result.clone(),
             duration: self.duration,
-            extra: self.extra_data.as_ref().map(sorted_pairs),
+            duration_is_int: self.duration_is_int(),
+            extra: self.extra_data_ordered(),
             user_data: self.user_data.clone(),
-            coverage: self.coverage.as_ref().map(sorted_pairs),
+            coverage: self.coverage_ordered(),
         }
     }
 
@@ -270,6 +348,39 @@ fn sorted_pairs(map: &HashMap<String, String>) -> Vec<(String, String)> {
     pairs
 }
 
+/// Split `pairs` into a lookup map plus first-seen key order (UNIT-U20):
+/// repeats keep their first position while the last value wins, like
+/// PHP array assignment.
+fn order_pairs(pairs: Vec<(String, String)>) -> (HashMap<String, String>, Vec<String>) {
+    let mut map = HashMap::with_capacity(pairs.len());
+    let mut order = Vec::with_capacity(pairs.len());
+    for (key, value) in pairs {
+        if !map.contains_key(&key) {
+            order.push(key.clone());
+        }
+        map.insert(key, value);
+    }
+    (map, order)
+}
+
+/// Pairs for a stored map: recorded insertion order when present, else
+/// sorted (the legacy-`HashMap`-setter fallback, UNIT-U20).
+fn ordered_pairs(
+    map: Option<&HashMap<String, String>>,
+    order: &[String],
+) -> Option<Vec<(String, String)>> {
+    let map = map?;
+    if order.is_empty() {
+        return Some(sorted_pairs(map));
+    }
+    Some(
+        order
+            .iter()
+            .filter_map(|key| map.get(key).map(|value| (key.clone(), value.clone())))
+            .collect(),
+    )
+}
+
 /// Dictionary form of a result, mirroring `toDictionary` keys
 /// (`src/unit/ArcanistUnitTestResult.php:164-175`): `namespace`, `name`,
 /// `link`, `result`, `duration`, `extra`, `userData`, `coverage`.
@@ -277,20 +388,37 @@ fn sorted_pairs(map: &HashMap<String, String>) -> Vec<(String, String)> {
 pub struct UnitDictionary {
     /// `namespace` key.
     pub namespace: Option<String>,
-    /// `name` key.
-    pub name: String,
+    /// `name` key (`None` when unset, like PHP null — UNIT-U19).
+    pub name: Option<String>,
     /// `link` key.
     pub link: Option<String>,
-    /// `result` key.
-    pub result: String,
+    /// `result` key (`None` when unset, like PHP null — UNIT-U19).
+    pub result: Option<String>,
     /// `duration` key.
     pub duration: Option<f64>,
+    /// True when the duration was set as an integer, rendering bare
+    /// (`3`, not `3.0`) like PHP `json_encode` (UNIT-U18).
+    pub duration_is_int: bool,
     /// `extra` key.
     pub extra: Option<Vec<(String, String)>>,
     /// `userData` key.
     pub user_data: Option<String>,
     /// `coverage` key.
     pub coverage: Option<Vec<(String, String)>>,
+}
+
+/// Render a count like PHP `new PhutilNumber($n)`: thousands separators
+/// (`1234` → `"1,234"`), used by the overlong-name error (UNIT-U25).
+fn format_count(value: usize) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 impl UnitDictionary {
@@ -302,17 +430,19 @@ impl UnitDictionary {
             "\"namespace\":{},",
             json_string_or_null(self.namespace.as_deref())
         ));
-        out.push_str(&format!("\"name\":{},", json_escape(&self.name)));
+        out.push_str(&format!(
+            "\"name\":{},",
+            json_string_or_null(self.name.as_deref())
+        ));
         out.push_str(&format!(
             "\"link\":{},",
             json_string_or_null(self.link.as_deref())
         ));
-        out.push_str(&format!("\"result\":{},", json_escape(&self.result)));
         out.push_str(&format!(
-            "\"duration\":{},",
-            self.duration
-                .map_or_else(|| "null".to_string(), |d| format!("{d:?}"))
+            "\"result\":{},",
+            json_string_or_null(self.result.as_deref())
         ));
+        out.push_str(&format!("\"duration\":{},", self.duration_json()));
         out.push_str(&format!(
             "\"extra\":{},",
             json_map_or_null(self.extra.as_deref())
@@ -327,6 +457,16 @@ impl UnitDictionary {
         ));
         out.push('}');
         out
+    }
+
+    /// The `duration` value: `null` when unset, bare when set as an
+    /// integer, shortest round-trip otherwise (UNIT-U18).
+    fn duration_json(&self) -> String {
+        match self.duration {
+            None => "null".to_string(),
+            Some(value) if self.duration_is_int => format!("{}", value as i64),
+            Some(value) => format!("{value:?}"),
+        }
     }
 }
 

@@ -7,8 +7,10 @@
 //!
 //! Known limits (see T1128): `--force` is a port affordance for
 //! non-interactive closes of revisions owned by someone else (PHP has no
-//! `--force` flag; it skips only the not-the-author prompt). Outside a
-//! repository the git finalized message prints; PHP fatals there instead.
+//! `--force` flag; it skips only the not-the-author prompt). `--help` is a
+//! port affordance too: PHP has no workflow `--help` flag (help goes
+//! through `arc help`), so `--help`/`-h` print the usage text instead of
+//! failing as unknown arguments.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -23,7 +25,44 @@ pub const STATUS_ACCEPTED: i64 = 2;
 /// Differential "Closed" status.
 pub const STATUS_CLOSED: i64 = 3;
 
-const USAGE: &str = "usage: arc close-revision [--finalize] [--quiet] [--json] [--force] [--conduit-uri URI] REVISION\n";
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not the short error-dump usage. The renderer is the shared
+/// `crate::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistCloseRevisionWorkflow.php:12-51`).
+const HELP_SYNOPSIS: &str = "      **close-revision** [__options__] __revision__";
+const HELP_TEXT: &str = "          Supports: git, hg, svn\n          Close a revision which has been committed (svn) or pushed (git, hg).\n          You should not normally need to do this: arc commit (svn), arc amend\n          (git, hg), arc land (git, hg), or repository tracking on the master\n          remote repository should do it for you. However, if these mechanisms\n          have failed for some reason you can use this command to manually\n          change a revision status from \"Accepted\" to \"Closed\".";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[
+    (
+        "finalize",
+        None,
+        None,
+        "Close only if the repository is untracked and the revision is accepted. Continue even if the close can't happen. This is a soft version of '' used by other workflows.",
+    ),
+    ("quiet", None, None, "Do not print a success message."),
+];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        None,
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &specs,
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
+}
 
 /// Parsed `close-revision` options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,7 +164,16 @@ impl Parser {
         } else if arg == "--help" || arg == "-h" {
             Step::Help
         } else if arg.starts_with('-') {
-            Step::Error(format!("unknown flag '{arg}'"))
+            // `Unknown argument '%s'. Try 'arc help'.` over the key
+            // without dashes (`ArcanistWorkflow.php:838-860`).
+            let key = arg
+                .strip_prefix("--")
+                .or_else(|| arg.strip_prefix('-'))
+                .unwrap_or(arg)
+                .split('=')
+                .next()
+                .unwrap_or(arg);
+            Step::Error(format!("Unknown argument '{key}'. Try 'arc help'."))
         } else {
             self.positional(arg)
         }
@@ -266,11 +314,11 @@ fn first_row(result: &serde_json::Value) -> Option<&serde_json::Value> {
     }
 }
 
+/// Revision ID parameter: always the normalized string, as PHP sends
+/// `normalizeRevisionID()` verbatim (`'ids' => array($revision_id)`,
+/// `'revisionID' => $revision_id`).
 fn id_param(id: &str) -> serde_json::Value {
-    id.parse::<u64>().map_or_else(
-        |_| serde_json::Value::String(id.to_string()),
-        serde_json::Value::from,
-    )
+    serde_json::Value::String(id.to_string())
 }
 
 /// Look one revision up with `differential.query`.
@@ -284,15 +332,14 @@ pub fn query_revision(client: &conduit::Client, id: &str) -> Result<Option<Revis
     Ok(first_row(&result).and_then(parse_revision))
 }
 
-/// Authenticated user's PHID via `user.whoami`.
+/// Authenticated user's PHID, reusing the handshake identity (T1153
+/// LAND-22: PHP's close/amend/commit ownership checks read the cached
+/// `userPHID` from `authenticateConduit()`
+/// (`src/workflow/ArcanistWorkflow.php:494,572`, via `getUserPHID()`),
+/// never a fresh `user.whoami` per close). On a cache miss the identity
+/// is resolved once and cached for later callers.
 pub fn user_phid(client: &conduit::Client) -> Result<String, String> {
-    let who = client
-        .call("user.whoami", &serde_json::json!({}))
-        .map_err(|e| e.to_string())?;
-    who.get("phid")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| "conduit user.whoami response has no phid".to_string())
+    client.cached_user_phid()
 }
 
 /// Output of [`execute`]: warnings and progress go to stderr in `--json`
@@ -426,7 +473,11 @@ fn close_if_accepted(
 
 /// The per-VCS finalized message, wrapped like
 /// `echo phutil_console_wrap($message)."\n"`.
-fn finalized_message(vcs: Option<&WorkingCopy>) -> String {
+///
+/// Outside a repository PHP throws
+/// `ArcanistCapabilityNotSupportedException` from
+/// `ArcanistFilesystemAPI::getFinalizedRevisionMessage()`.
+fn finalized_message(vcs: Option<&WorkingCopy>) -> Result<String, String> {
     let message = match vcs {
         Some(WorkingCopy::Hg) => {
             "You may now push this commit upstream, as appropriate (e.g. with \
@@ -434,18 +485,24 @@ fn finalized_message(vcs: Option<&WorkingCopy>) -> String {
                 .to_string()
         }
         Some(WorkingCopy::Svn) => "Done.".to_string(),
-        Some(WorkingCopy::Git) | None => "You may now push this commit upstream, as appropriate \
+        Some(WorkingCopy::Git) => "You may now push this commit upstream, as appropriate \
              (e.g. with 'git push', or 'git svn dcommit', or by printing and faxing it)."
             .to_string(),
+        None => {
+            return Err(
+                "This repository API ('filesystem') does not support the requested capability."
+                    .to_string(),
+            );
+        }
     };
-    format!("{}\n", terminal::console_wrap(&message, 0, true))
+    Ok(format!("{}\n", terminal::console_wrap(&message, 0, true)))
 }
 
 /// The final message: empty with `--quiet`, else the push hint for a
 /// finalized revision or a plain `Done.`.
-fn closing_message(revision: &Option<Revision>, quiet: bool, dir: &Path) -> String {
+fn closing_message(revision: &Option<Revision>, quiet: bool, dir: &Path) -> Result<String, String> {
     if quiet {
-        return String::new();
+        return Ok(String::new());
     }
     let finalized = matches!(&revision, Some(rev)
         if (rev.status == STATUS_ACCEPTED || rev.status == STATUS_CLOSED)
@@ -453,7 +510,7 @@ fn closing_message(revision: &Option<Revision>, quiet: bool, dir: &Path) -> Stri
     if finalized {
         finalized_message(detect_working_copy(dir).as_ref())
     } else {
-        "Done.\n".to_string()
+        Ok("Done.\n".to_string())
     }
 }
 
@@ -518,7 +575,7 @@ pub fn execute_in(
         closed = step.closed;
     }
 
-    let closing = closing_message(&revision, options.quiet, dir);
+    let closing = closing_message(&revision, options.quiet, dir)?;
     render_report(
         options,
         &object_name,
@@ -630,8 +687,11 @@ fn select_unique_phid(results: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Ownership confirm: PHP `phutil_console_confirm($prompt)` defaults to
+/// no (`[y/N]`), so Enter aborts the close
+/// (`ArcanistCloseRevisionWorkflow.php:121`).
 fn confirm_interactive(query: &str) -> Result<bool, String> {
-    prompt::console_confirm(&mut std::io::stdin().lock(), query, false)
+    prompt::console_confirm(&mut std::io::stdin().lock(), query, true)
 }
 
 /// Entry point: `argv` excludes the subcommand name.
@@ -639,11 +699,11 @@ pub fn run(argv: &[String]) -> ExitCode {
     let mut options = match parse_args(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", usage());
             return ExitCode::SUCCESS;
         }
         Err(msg) => {
-            eprintln!("arc {NAME}: {msg}\n\n{USAGE}");
+            eprintln!("arc {NAME}: {msg}\n\n{}", usage());
             return ExitCode::FAILURE;
         }
     };

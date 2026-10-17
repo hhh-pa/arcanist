@@ -1,4 +1,9 @@
 //! `amend` behavior through the wired library.
+//!
+//! T1153 B21/B23: piped runs carry `--` throughout (the toolset
+//! terminator gate); `--help` asserts the generated `AMEND WORKFLOW`
+//! help; scan errors (`--bogus`, positionals, missing values) stay
+//! bare to lock that they report before the terminator check.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -7,6 +12,7 @@ use std::process::{Command, ExitCode};
 use std::sync::{Arc, Mutex};
 
 use arc_rs::amend;
+use arc_rs::conduit::Client;
 use arc_rs::land;
 
 /// Unique scratch dir for one test; removed on drop (best effort).
@@ -254,7 +260,7 @@ fn run_uses_current_dir() {
     let repo = Fixture::init_repo("run-contract");
     let old = std::env::current_dir().unwrap();
     std::env::set_current_dir(repo.path()).unwrap();
-    let code = amend::run(&args(&["-m", "from run"]));
+    let code = amend::run(&args(&["-m", "from run", "--"]));
     std::env::set_current_dir(&old).unwrap();
     assert_eq!(code, ExitCode::SUCCESS);
     assert_eq!(repo.git(&["log", "-1", "--format=%s"]), "from run");
@@ -263,10 +269,11 @@ fn run_uses_current_dir() {
 #[test]
 fn help_succeeds_and_prints_usage() {
     let repo = Fixture::init_repo("help");
-    let out = amend::execute(repo.path(), &args(&["--help"])).unwrap();
-    assert!(out.contains("usage: arc amend"), "unexpected: {out}");
+    let out = amend::execute(repo.path(), &args(&["--help", "--"])).unwrap();
+    // T1153 R10: `--help` renders the generated workflow help.
+    assert!(out.contains("AMEND WORKFLOW"), "unexpected: {out}");
     assert_eq!(
-        amend::run_in(repo.path(), &args(&["--help"])),
+        amend::run_in(repo.path(), &args(&["--help", "--"])),
         ExitCode::SUCCESS
     );
 }
@@ -274,13 +281,13 @@ fn help_succeeds_and_prints_usage() {
 #[test]
 fn outside_repo_fails() {
     let empty = Fixture::named("notrepo");
-    let err = amend::execute(empty.path(), &args(&["-m", "x"])).unwrap_err();
+    let err = amend::execute(empty.path(), &args(&["-m", "x", "--"])).unwrap_err();
     assert!(
         err.contains("not inside a git or Mercurial working copy"),
         "unexpected: {err}"
     );
     assert_eq!(
-        amend::run_in(empty.path(), &args(&["-m", "x"])),
+        amend::run_in(empty.path(), &args(&["-m", "x", "--"])),
         ExitCode::FAILURE
     );
 }
@@ -295,7 +302,7 @@ fn requires_a_message_source() {
     std::fs::remove_dir_all(&home).ok();
     std::fs::create_dir_all(&home).unwrap();
     let _guard = with_owned_home(home);
-    let err = amend::execute(repo.path(), &args(&[])).unwrap_err();
+    let err = amend::execute(repo.path(), &args(&["--"])).unwrap_err();
     assert!(err.contains("guess"), "unexpected: {err}");
     assert!(err.contains("--message"), "unexpected: {err}");
     assert!(err.contains("--revision"), "unexpected: {err}");
@@ -304,7 +311,8 @@ fn requires_a_message_source() {
 #[test]
 fn rejects_message_and_revision_together() {
     let repo = Fixture::init_repo("both-sources");
-    let err = amend::execute(repo.path(), &args(&["-m", "x", "--revision", "123"])).unwrap_err();
+    let err =
+        amend::execute(repo.path(), &args(&["-m", "x", "--revision", "123", "--"])).unwrap_err();
     assert!(err.contains("only one of"), "unexpected: {err}");
 }
 
@@ -312,7 +320,7 @@ fn rejects_message_and_revision_together() {
 fn rejects_empty_message() {
     let repo = Fixture::init_repo("empty-message");
     let before = repo.git(&["rev-parse", "HEAD"]);
-    let err = amend::execute(repo.path(), &args(&["-m", "   "])).unwrap_err();
+    let err = amend::execute(repo.path(), &args(&["-m", "   ", "--"])).unwrap_err();
     assert!(err.contains("empty"), "unexpected: {err}");
     assert_eq!(repo.git(&["rev-parse", "HEAD"]), before);
 }
@@ -321,7 +329,7 @@ fn rejects_empty_message() {
 fn amends_the_head_message() {
     let repo = Fixture::init_repo("basic");
     let before = repo.git(&["rev-parse", "HEAD"]);
-    let out = amend::execute(repo.path(), &args(&["-m", "amended subject"])).unwrap();
+    let out = amend::execute(repo.path(), &args(&["-m", "amended subject", "--"])).unwrap();
     assert!(!out.trim().is_empty(), "expected a summary, got: {out:?}");
     assert_eq!(
         repo.git(&["log", "-1", "--format=%B"]).trim(),
@@ -338,11 +346,11 @@ fn staged_changes_are_refused() {
     let before = repo.git(&["rev-parse", "HEAD"]);
     repo.write("staged.txt", "staged\n");
     repo.git(&["add", "staged.txt"]);
-    let err = amend::execute(repo.path(), &args(&["-m", "nope"])).unwrap_err();
+    let err = amend::execute(repo.path(), &args(&["-m", "nope", "--"])).unwrap_err();
     assert!(err.contains("staged"), "unexpected: {err}");
     assert_eq!(repo.git(&["rev-parse", "HEAD"]), before);
     assert_eq!(
-        amend::run_in(repo.path(), &args(&["-m", "nope"])),
+        amend::run_in(repo.path(), &args(&["-m", "nope", "--"])),
         ExitCode::FAILURE
     );
 }
@@ -352,7 +360,7 @@ fn unstaged_and_untracked_changes_are_allowed() {
     let repo = Fixture::init_repo("unstaged");
     repo.write("file.txt", "modified\n");
     repo.write("untracked.txt", "untracked\n");
-    amend::execute(repo.path(), &args(&["-m", "amended anyway"])).unwrap();
+    amend::execute(repo.path(), &args(&["-m", "amended anyway", "--"])).unwrap();
     assert_eq!(repo.git(&["log", "-1", "--format=%s"]), "amended anyway");
     assert_eq!(
         std::fs::read_to_string(repo.path().join("file.txt")).unwrap(),
@@ -365,7 +373,7 @@ fn unstaged_and_untracked_changes_are_allowed() {
 fn show_prints_the_message_without_amending() {
     let repo = Fixture::init_repo("show");
     let before = repo.git(&["rev-parse", "HEAD"]);
-    let out = amend::execute(repo.path(), &args(&["--show", "-m", "preview me"])).unwrap();
+    let out = amend::execute(repo.path(), &args(&["--show", "-m", "preview me", "--"])).unwrap();
     assert_eq!(out, "preview me\n");
     assert_eq!(repo.git(&["rev-parse", "HEAD"]), before);
 }
@@ -377,7 +385,7 @@ fn amend_without_any_commit_fails() {
     repo.git(&["config", "user.email", "vcs1-test@example.test"]);
     repo.git(&["config", "user.name", "VCS1 Test"]);
     repo.git(&["config", "commit.gpgsign", "false"]);
-    let err = amend::execute(repo.path(), &args(&["-m", "nothing to amend"])).unwrap_err();
+    let err = amend::execute(repo.path(), &args(&["-m", "nothing to amend", "--"])).unwrap_err();
     assert!(err.contains("amend failed"), "unexpected: {err}");
 }
 
@@ -404,7 +412,7 @@ fn revision_fetches_message_from_conduit() {
     let mut io = land::Io::canned(&["n"]);
     let out = amend::execute_with_io(
         repo.path(),
-        &args(&["--revision", "D123", "--conduit-uri", &base]),
+        &args(&["--revision", "D123", "--conduit-uri", &base, "--"]),
         &mut io,
     )
     .unwrap();
@@ -466,7 +474,7 @@ fn revision_show_prints_fetched_message() {
     let before = repo.git(&["rev-parse", "HEAD"]);
     let out = amend::execute(
         repo.path(),
-        &args(&["--show", "--revision", "123", "--conduit-uri", &base]),
+        &args(&["--show", "--revision", "123", "--conduit-uri", &base, "--"]),
     )
     .unwrap();
     assert_eq!(out, "Fetched title\n");
@@ -486,7 +494,7 @@ fn revision_unknown_to_conduit_fails() {
 
     let err = amend::execute(
         repo.path(),
-        &args(&["--revision", "D123", "--conduit-uri", &base]),
+        &args(&["--revision", "D123", "--conduit-uri", &base, "--"]),
     )
     .unwrap_err();
     assert!(
@@ -510,7 +518,7 @@ fn revision_conduit_error_fails() {
     let before = repo.git(&["rev-parse", "HEAD"]);
     let err = amend::execute(
         repo.path(),
-        &args(&["--revision", "123", "--conduit-uri", &base]),
+        &args(&["--revision", "123", "--conduit-uri", &base, "--"]),
     )
     .unwrap_err();
     assert!(err.contains("ERR-UNKNOWN"), "unexpected: {err}");
@@ -526,7 +534,7 @@ fn bad_flags_fail() {
     assert!(err.contains("unexpected argument"), "unexpected: {err}");
     let err = amend::execute(repo.path(), &args(&["-m"])).unwrap_err();
     assert!(err.contains("requires"), "unexpected: {err}");
-    let err = amend::execute(repo.path(), &args(&["--revision", "abc"])).unwrap_err();
+    let err = amend::execute(repo.path(), &args(&["--revision", "abc", "--"])).unwrap_err();
     assert!(err.contains("invalid revision id"), "unexpected: {err}");
     assert_eq!(
         amend::run_in(repo.path(), &args(&["--bogus"])),
@@ -567,7 +575,7 @@ fn guesses_revision_from_head_trailer() {
     let _home = arcrc_for(&base, "guess-home");
 
     let mut io = land::Io::canned(&["n"]);
-    amend::execute_with_io(repo.path(), &args(&["--conduit-uri", &base]), &mut io).unwrap();
+    amend::execute_with_io(repo.path(), &args(&["--conduit-uri", &base, "--"]), &mut io).unwrap();
     assert_eq!(io.canned.len(), 1);
     assert_eq!(
         methods_of(&seen),
@@ -601,7 +609,7 @@ fn guess_falls_back_to_head_hash() {
     let (base, seen) = serve_routes(vec![route("differential.query", "[]")]);
     let _home = arcrc_for(&base, "guess-hash-home");
 
-    let err = amend::execute(repo.path(), &args(&["--conduit-uri", &base])).unwrap_err();
+    let err = amend::execute(repo.path(), &args(&["--conduit-uri", &base, "--"])).unwrap_err();
     assert!(err.contains("no revisions found"), "unexpected: {err}");
     assert!(err.contains("Use \"--revision <id>\""), "unexpected: {err}");
     let bodies: Vec<String> = seen
@@ -632,7 +640,7 @@ fn guess_with_several_revisions_lists_them() {
     let (base, _seen) = serve_routes(vec![route("differential.query", &format!("[{rows}]"))]);
     let _home = arcrc_for(&base, "guess-many-home");
 
-    let err = amend::execute(repo.path(), &args(&["--conduit-uri", &base])).unwrap_err();
+    let err = amend::execute(repo.path(), &args(&["--conduit-uri", &base, "--"])).unwrap_err();
     assert!(err.contains("MULTIPLE REVISIONS IN WORKING COPY"), "{err}");
     assert!(err.contains("**  *  ** D1 One\n"), "{err}");
     assert!(err.contains("**  *  ** D2 Two\n"), "{err}");
@@ -666,7 +674,7 @@ fn unrelated_revision_prompts() {
     let mut io = land::Io::canned(&["n"]);
     let err = amend::execute_with_io(
         repo.path(),
-        &args(&["--revision", "999", "--conduit-uri", &base]),
+        &args(&["--revision", "999", "--conduit-uri", &base, "--"]),
         &mut io,
     )
     .unwrap_err();
@@ -693,7 +701,7 @@ fn unrelated_revision_prompts() {
     let mut io = land::Io::canned(&["y"]);
     amend::execute_with_io(
         repo.path(),
-        &args(&["--revision", "999", "--conduit-uri", &base]),
+        &args(&["--revision", "999", "--conduit-uri", &base, "--"]),
         &mut io,
     )
     .unwrap();
@@ -733,7 +741,7 @@ fn foreign_author_prompts() {
     let mut io = land::Io::canned(&["n"]);
     let err = amend::execute_with_io(
         repo.path(),
-        &args(&["--revision", "123", "--conduit-uri", &base]),
+        &args(&["--revision", "123", "--conduit-uri", &base, "--"]),
         &mut io,
     )
     .unwrap_err();
@@ -765,7 +773,7 @@ fn foreign_author_prompts() {
     let mut io = land::Io::canned(&["y"]);
     amend::execute_with_io(
         repo.path(),
-        &args(&["--revision", "123", "--conduit-uri", &base]),
+        &args(&["--revision", "123", "--conduit-uri", &base, "--"]),
         &mut io,
     )
     .unwrap();
@@ -798,7 +806,7 @@ fn unknown_author_skips_the_warning() {
     let mut io = land::Io::canned(&["n"]);
     amend::execute_with_io(
         repo.path(),
-        &args(&["--revision", "123", "--conduit-uri", &base]),
+        &args(&["--revision", "123", "--conduit-uri", &base, "--"]),
         &mut io,
     )
     .unwrap();
@@ -816,7 +824,8 @@ fn immutable_history_prompts() {
     // Decline: nothing is amended.
     let before = repo.git(&["rev-parse", "HEAD"]);
     let mut io = land::Io::canned(&["n"]);
-    let err = amend::execute_with_io(repo.path(), &args(&["-m", "nope"]), &mut io).unwrap_err();
+    let err =
+        amend::execute_with_io(repo.path(), &args(&["-m", "nope", "--"]), &mut io).unwrap_err();
     assert_eq!(err, land::ABORT);
     assert!(
         io.out.stdout.contains("IMMUTABLE WORKING COPY"),
@@ -834,7 +843,7 @@ fn immutable_history_prompts() {
 
     // Accept: the amend proceeds.
     let mut io = land::Io::canned(&["y"]);
-    amend::execute_with_io(repo.path(), &args(&["-m", "mutated"]), &mut io).unwrap();
+    amend::execute_with_io(repo.path(), &args(&["-m", "mutated", "--"]), &mut io).unwrap();
     assert_eq!(repo.git(&["log", "-1", "--format=%s"]), "mutated");
 }
 
@@ -843,7 +852,7 @@ fn mutable_config_skips_the_prompt() {
     let repo = Fixture::init_repo("mutable");
     repo.write(".arcconfig", "{\"history.immutable\": false}\n");
     let mut io = land::Io::canned(&["n"]);
-    amend::execute_with_io(repo.path(), &args(&["-m", "free"]), &mut io).unwrap();
+    amend::execute_with_io(repo.path(), &args(&["-m", "free", "--"]), &mut io).unwrap();
     assert_eq!(io.canned.len(), 1);
     assert_eq!(repo.git(&["log", "-1", "--format=%s"]), "free");
 }
@@ -851,7 +860,7 @@ fn mutable_config_skips_the_prompt() {
 #[test]
 fn show_with_message_needs_no_repo() {
     let empty = Fixture::named("show-norepo");
-    let out = amend::execute(empty.path(), &args(&["--show", "-m", "preview"])).unwrap();
+    let out = amend::execute(empty.path(), &args(&["--show", "-m", "preview", "--"])).unwrap();
     assert_eq!(out, "preview\n");
 }
 
@@ -869,7 +878,7 @@ fn show_with_revision_needs_no_repo() {
     let _home = arcrc_for(&base, "show-rev-norepo-home");
     let out = amend::execute(
         empty.path(),
-        &args(&["--show", "--revision", "123", "--conduit-uri", &base]),
+        &args(&["--show", "--revision", "123", "--conduit-uri", &base, "--"]),
     )
     .unwrap();
     assert_eq!(out, "Remote title\n");
@@ -883,7 +892,7 @@ fn show_with_revision_needs_no_repo() {
 fn svn_checkout_reports_amend_unsupported() {
     let empty = Fixture::named("svn-amend");
     std::fs::create_dir_all(empty.path().join(".svn")).unwrap();
-    let err = amend::execute(empty.path(), &args(&["-m", "x"])).unwrap_err();
+    let err = amend::execute(empty.path(), &args(&["-m", "x", "--"])).unwrap_err();
     assert!(
         err.contains("supports amending commits"),
         "unexpected: {err}"
@@ -982,9 +991,13 @@ fn hg_amend_guesses_and_amends() {
 
     // Mercurial histories are immutable by default: answer that prompt.
     let mut io = land::Io::canned(&["y"]);
-    let out =
-        amend::execute_with_io_backends(&repo.dir, &args(&["--conduit-uri", &base]), &mut io, &hg)
-            .unwrap();
+    let out = amend::execute_with_io_backends(
+        &repo.dir,
+        &args(&["--conduit-uri", &base, "--"]),
+        &mut io,
+        &hg,
+    )
+    .unwrap();
     assert_eq!(out, "amended.\n");
     assert!(
         io.out.stdout.contains("IMMUTABLE WORKING COPY"),
@@ -1013,8 +1026,8 @@ fn hg_amend_needs_modern_mercurial() {
     let hg = hg_backend(&repo);
     repo.write(".fakehg-noamend", b"");
     let mut io = land::Io::canned(&["n"]);
-    let err =
-        amend::execute_with_io_backends(&repo.dir, &args(&["-m", "x"]), &mut io, &hg).unwrap_err();
+    let err = amend::execute_with_io_backends(&repo.dir, &args(&["-m", "x", "--"]), &mut io, &hg)
+        .unwrap_err();
     assert!(err.contains("2.2 or newer"), "unexpected: {err}");
     assert_eq!(io.canned.len(), 1);
 }
@@ -1025,8 +1038,59 @@ fn hg_amend_refuses_dirty_files() {
     let hg = hg_backend(&repo);
     repo.write(".fakehg-status", b"M dirty.txt\n");
     let mut io = land::Io::canned(&["y"]);
-    let err =
-        amend::execute_with_io_backends(&repo.dir, &args(&["-m", "x"]), &mut io, &hg).unwrap_err();
+    let err = amend::execute_with_io_backends(&repo.dir, &args(&["-m", "x", "--"]), &mut io, &hg)
+        .unwrap_err();
     assert!(err.contains("uncommitted changes"), "unexpected: {err}");
     assert!(repo.log().contains("status"), "{}", repo.log());
+}
+
+/// Decode one `application/x-www-form-urlencoded` value (`%XX` escapes;
+/// `+` stays literal, matching `rawurlencode`).
+fn url_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = &value[index + 1..index + 3];
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(out).unwrap()
+}
+
+/// The `params` JSON object of one observed Conduit request body.
+fn request_params(body: &str) -> serde_json::Value {
+    let encoded = body
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("params="))
+        .unwrap();
+    serde_json::from_str(&url_decode(encoded)).unwrap()
+}
+
+#[test]
+fn user_lookup_nests_search_constraints() {
+    let canned = r#"{"error_code":null,"error_info":null,"result":{"data":[{"phid":"PHID-USER-9","fields":{"username":"bob","realName":"Bob"}}]}}"#.to_string();
+    let (base, seen) = serve_once(canned);
+    let client = Client::new(&base, "t").unwrap();
+    let found = amend::query_user(&client, "PHID-USER-9").unwrap();
+    assert_eq!(found, Some(("bob".to_string(), "Bob".to_string())));
+    let (line, body) = seen.recv().unwrap();
+    assert!(line.contains("user.search"), "unexpected: {line}");
+    let params = request_params(&body);
+    assert_eq!(
+        params.get("constraints"),
+        Some(&serde_json::json!({"phids": ["PHID-USER-9"]})),
+        "unexpected params: {params}"
+    );
+    assert!(
+        params.get("phids").is_none(),
+        "flat constraints rejected by the server: {params}"
+    );
 }

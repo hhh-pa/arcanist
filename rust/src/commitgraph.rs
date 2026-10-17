@@ -291,6 +291,13 @@ fn ingest_record(
 }
 
 /// Ingest `\x01`-separated log output, skipping bare `"\n"` records.
+///
+/// T1153 RB-D33: `LinesOfALarge` never yields a trailing empty piece —
+/// at EOF an empty buffer ends the iterator instead
+/// (`src/filesystem/linesofalarge/LinesOfALarge.php:200-224`) — so the
+/// split artifact after a final delimiter (and the lone piece of empty
+/// output) is dropped before parsing. A mid-stream empty piece still
+/// fails like PHP.
 fn ingest_log_output(
     graph: &mut CommitGraph,
     seen: &mut OrderedMap<()>,
@@ -298,7 +305,11 @@ fn ingest_log_output(
     limit: Option<usize>,
     mut record: impl FnMut(&str) -> Result<LogRecord, String>,
 ) -> Result<(), String> {
-    for chunk in stdout.split('\x01') {
+    let mut chunks: Vec<&str> = stdout.split('\x01').collect();
+    if chunks.last() == Some(&"") {
+        chunks.pop();
+    }
+    for chunk in chunks {
         if chunk == "\n" {
             continue;
         }
@@ -463,7 +474,7 @@ fn git_command_with_input(
 ) -> Result<String, String> {
     use std::io::Write;
     use std::process::Stdio;
-    let mut child = std::process::Command::new("git")
+    let mut child = crate::proc_env::command("git")
         .current_dir(dir)
         .args(args)
         .stdin(Stdio::piped())
@@ -1320,7 +1331,10 @@ impl SortVector {
         self.parts.push(format!("{prefix}{magnitude:020}"));
     }
 
-    /// Add a string part; NUL bytes fail like the PHP vector.
+    /// Add a string part; NUL bytes fail (T1153 RB-D38d, kept:
+    /// PHP's `strpos("\0", $v)` check is a swapped-argument no-op,
+    /// `PhutilSortVector.php:32-38` at ceb — and marker names can
+    /// never contain NUL, so both are unreachable).
     pub fn add_string(&mut self, value: &str) -> Result<(), String> {
         if !value.is_empty() && value.contains('\0') {
             return Err(

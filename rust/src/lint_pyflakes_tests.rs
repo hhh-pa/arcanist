@@ -20,29 +20,34 @@ fn supported_paths_are_python_files() {
 
 #[test]
 fn parses_canonical_output() {
-    let stdout = "target.py:1:1 undefined name 'foo'\n\
-        target.py:2:5 'os' imported but unused\n";
+    // T1153 LINT-33: ceb PHP has no column group, so the char is always
+    // null and a `path:line:col` line reads the column digits as the
+    // line number.
+    let stdout = "target.py:1:1: undefined name 'foo'\n\
+        target.py:2:5: 'os' imported but unused\n";
     let messages = parse_output("pkg/mod.py", stdout);
     assert_eq!(messages.len(), 2);
 
     assert_eq!(messages[0].path, "pkg/mod.py");
-    assert_eq!((messages[0].line, messages[0].col), (1, 1));
+    assert_eq!((messages[0].line, messages[0].col), (1, 0));
     assert_eq!(messages[0].code, "PYFLAKES");
     assert_eq!(messages[0].name, "PYFLAKES");
     assert_eq!(messages[0].description, "undefined name 'foo'");
     assert_eq!(messages[0].severity, "error");
 
-    assert_eq!((messages[1].line, messages[1].col), (2, 5));
+    assert_eq!((messages[1].line, messages[1].col), (5, 0));
     assert_eq!(messages[1].severity, "warning");
 }
 
 #[test]
 fn error_triggers_mirror_php_regex() {
     // /(^undefined|^duplicate|before assignment$)/
-    let stdout = "t.py:1:1 undefined name 'x'\n\
-        t.py:2:1 duplicate argument 'a' in function definition\n\
-        t.py:3:7 local variable 'x' referenced before assignment\n\
-        t.py:4:1 redefinition of unused 'y'\n";
+    // T1153 LINT-33: canonical `path:line:col: desc` form (colon-less
+    // lines match nothing in ceb PHP and are dropped).
+    let stdout = "t.py:1:1: undefined name 'x'\n\
+        t.py:2:1: duplicate argument 'a' in function definition\n\
+        t.py:3:7: local variable 'x' referenced before assignment\n\
+        t.py:4:1: redefinition of unused 'y'\n";
     let messages = parse_output("a.py", stdout);
     assert_eq!(messages.len(), 4);
     assert_eq!(messages[0].severity, "error");
@@ -52,10 +57,11 @@ fn error_triggers_mirror_php_regex() {
 }
 
 #[test]
-fn missing_column_defaults_to_one() {
+fn missing_column_stays_null_char() {
+    // T1153 LINT-33: no column group in ceb PHP, so the char is null (0).
     let messages = parse_output("a.py", "target.py:3: something odd\n");
     assert_eq!(messages.len(), 1);
-    assert_eq!((messages[0].line, messages[0].col), (3, 1));
+    assert_eq!((messages[0].line, messages[0].col), (3, 0));
     assert_eq!(messages[0].severity, "warning");
 }
 
@@ -118,4 +124,13 @@ fn skips_lines_with_broken_columns() {
     assert!(parse_output("a.py", "f.py:3 \n").is_empty());
     assert!(parse_output("a.py", "f.py:: x\n").is_empty());
     assert!(parse_output("a.py", "\n").is_empty());
+}
+
+// -( T1153 Wave 2: lint retrocompat )--------------------------------------
+
+#[test]
+fn lint33_column_without_colon_matches_nothing() {
+    // `path:line:col desc` (no colon after the column) matches nothing
+    // in ceb PHP's `/^(.*?):(\d+): (.*)$/` and is dropped.
+    assert!(parse_output("a.py", "f.py:3:5 something odd\n").is_empty());
 }

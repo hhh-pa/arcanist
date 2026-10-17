@@ -417,6 +417,17 @@ pub fn console_wrap(text: &str, indent: usize, with_prefix: bool) -> String {
     state.finish(indent, with_prefix)
 }
 
+/// Join an argv like PHP `csprintf('%Ls', ...)`: every word
+/// `escapeshellarg()`-quoted (single quotes, always), space-separated.
+/// Used for the `--trace` ARGV echo and shell-alias displays.
+#[must_use]
+pub fn shell_join(argv: &[String]) -> String {
+    argv.iter()
+        .map(|word| format!("'{}'", word.replace('\'', "'\\''")))
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
 /// PHP `(int)` cast of a string: leading whitespace, an optional sign,
 /// and leading ASCII digits, clamped to 64 bits.
 #[must_use]
@@ -638,7 +649,7 @@ fn tput_columns() -> usize {
     if cfg!(windows) {
         return 0;
     }
-    let Ok(output) = std::process::Command::new("tput").arg("cols").output() else {
+    let Ok(output) = crate::proc_env::command("tput").arg("cols").output() else {
         return 0;
     };
     if !output.status.success() {
@@ -679,9 +690,25 @@ fn php_truthy(value: Option<&str>) -> bool {
     }
 }
 
+/// True when `--trace` mode is on (T1153 CORE-15): magenta trace
+/// labels print, and classic error arms dump backtraces. Set by the
+/// dispatcher from the global `--trace` flag.
+#[must_use]
+pub fn trace_enabled() -> bool {
+    crate::globals::trace_enabled()
+}
+
 /// True when console output should carry ANSI codes.
+///
+/// `ARC_ANSI=0`/`ARC_ANSI=1` (the global `--no-ansi`/`--ansi` channel,
+/// T1153 RB-D3) force the answer, mirroring
+/// `PhutilConsoleFormatter::disableANSI()`; otherwise the TERM +
+/// stdout-TTY probe decides.
 #[must_use]
 pub fn ansi_enabled() -> bool {
+    if let Some(forced) = crate::globals::ansi_override() {
+        return forced;
+    }
     let term = std::env::var("TERM").unwrap_or_default().to_lowercase();
     let term = if !php_truthy(Some(&term)) && php_truthy(std::env::var("ANSICON").ok().as_deref()) {
         "ansi".to_string()

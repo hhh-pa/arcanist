@@ -76,6 +76,8 @@ fn coercion_matches_php_write_rules() {
         coerce_value("custom.key", "v").unwrap(),
         serde_json::json!("v")
     );
+    // T1153 CORE-37: the alias error keeps PHP's text (the
+    // `Exception` arm renders it at the CLI layer).
     assert_eq!(
         coerce_value("aliases", "x").unwrap_err(),
         "Use \"arc alias\" to configure aliases, not \"arc set-config\"."
@@ -214,6 +216,36 @@ fn local_apply_requires_a_repo() {
 }
 
 #[test]
+fn core32_local_writes_cover_hg_and_svn_roots() {
+    // T1153 CORE-32 (write half): `--local` resolves the VCS root for
+    // git, hg, and svn alike (filesystem markers, no binaries needed),
+    // writing `arc/config` under the right metadata dir from subdirs.
+    for (meta, kind) in [
+        (".hg", get_config::VcsKind::Hg),
+        (".svn", get_config::VcsKind::Svn),
+        (".git", get_config::VcsKind::Git),
+    ] {
+        let tmp = TempDir::new("localvcs");
+        let root = tmp.path.join("proj");
+        std::fs::create_dir_all(root.join(meta)).unwrap();
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let message = apply_local(&sub, "editor", "nano").unwrap();
+        assert!(message.contains("local config"), "{message}");
+        let stored = read_local_file(&local_config_path_for(kind, &root)).unwrap();
+        assert_eq!(stored["editor"], serde_json::json!("nano"));
+        // Delete round-trips through the same path.
+        apply_local(&sub, "editor", "").unwrap();
+        let stored = read_local_file(&local_config_path_for(kind, &root)).unwrap();
+        assert!(!stored.contains_key("editor"));
+    }
+    assert_eq!(
+        local_config_path(Path::new("/r")),
+        PathBuf::from("/r/.git/arc/config")
+    );
+}
+
+#[test]
 fn args_require_key_and_value() {
     assert!(parse_args(&[]).is_err());
     assert!(parse_args(&["only".to_string()]).is_err());
@@ -228,7 +260,10 @@ fn args_require_key_and_value() {
         Options {
             local: true,
             key: "k".to_string(),
-            value: "v".to_string()
+            value: "v".to_string(),
+            config: vec![],
+            config_files: vec![],
+            arcrc_file: None,
         }
     );
     let empty = parse_args(&["k".to_string(), String::new()])
@@ -239,4 +274,136 @@ fn args_require_key_and_value() {
         .unwrap()
         .unwrap();
     assert_eq!(dashed.key, "--x");
+}
+
+#[test]
+fn r6_core34_runtime_config_parses_and_coerces() {
+    let map = parse_runtime_config(&[
+        "editor=nano".to_string(),
+        "history.immutable=yes".to_string(),
+        "load=[\"a\"]".to_string(),
+        "mystery=raw".to_string(),
+    ])
+    .unwrap();
+    assert_eq!(map["editor"], serde_json::json!("nano"));
+    assert_eq!(map["history.immutable"], serde_json::json!(true));
+    assert_eq!(map["load"], serde_json::json!(["a"]));
+    assert_eq!(map["mystery"], serde_json::json!("raw"));
+    // Split on the first `=` only.
+    let map = parse_runtime_config(&["editor=a=b".to_string()]).unwrap();
+    assert_eq!(map["editor"], serde_json::json!("a=b"));
+    // Later pairs win, like `setRuntimeConfig()` overwrites.
+    let map = parse_runtime_config(&["editor=a".to_string(), "editor=b".to_string()]).unwrap();
+    assert_eq!(map["editor"], serde_json::json!("b"));
+    // Missing `=` and bad types error with the stock texts.
+    assert_eq!(
+        parse_runtime_config(&["lone".to_string()]).unwrap_err(),
+        "Argument was 'lone', but must be 'name=value'. For example, history.immutable=true"
+    );
+    assert_eq!(
+        parse_runtime_config(&["history.immutable=maybe".to_string()]).unwrap_err(),
+        "Type of setting 'history.immutable' must be boolean, like 'true' or 'false'."
+    );
+    assert!(
+        parse_runtime_config(&["aliases=x".to_string()])
+            .unwrap_err()
+            .contains("Use \"arc alias\"")
+    );
+}
+
+#[test]
+fn r6_core34_cli_flags_parse() {
+    let opts = parse_args(&[
+        "--config".to_string(),
+        "a=1".to_string(),
+        "--config-file=f".to_string(),
+        "--arcrc-file".to_string(),
+        "g".to_string(),
+        "k".to_string(),
+        "v".to_string(),
+    ])
+    .unwrap()
+    .unwrap();
+    assert_eq!(opts.config, ["a=1"]);
+    assert_eq!(opts.config_files, ["f"]);
+    assert_eq!(opts.arcrc_file.as_deref(), Some("g"));
+    assert_eq!(opts.key, "k");
+    assert!(parse_args(&["--arcrc-file".to_string()]).is_err());
+}
+
+#[test]
+fn r4_core49_set_config_usage_has_no_dump() {
+    // Argument errors render `Usage Exception:` with exit 1 and no
+    // usage dump (parse fails before any disk access).
+    assert_eq!(
+        run(&["--bogus".to_string()]),
+        std::process::ExitCode::FAILURE
+    );
+    assert_eq!(run(&[]), std::process::ExitCode::FAILURE);
+}
+#[test]
+fn r10_set_config_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "SET-CONFIG WORKFLOW\n\
+         \n\
+         set-config\n\
+         \x20     set-config [options] -- name value\n\
+         \n\
+         \x20         Supports: cli\n\
+         \x20         Sets an arc configuration option.\n\
+         \n\
+         \x20         Options are either user (apply to all arc commands you invoke\n\
+         \x20         from the current user) or local (apply only to the current working\n\
+         \x20         copy). By default, user configuration is written. Use --local\n\
+         \x20         to write local configuration.\n\
+         \n\
+         \x20         User values are written to '~/.arcrc' on Linux and Mac OS X, and an\n\
+         \x20         undisclosed location on Windows. Local values are written to an arc\n\
+         \x20         directory under either .git, .hg, or .svn as appropriate.\n\
+         \n\
+         \x20     --local\n\
+         \x20         Set a local config value instead of a user one.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("SET-CONFIG WORKFLOW"), "{}", usage());
+}
+
+#[test]
+fn b21_set_config_needs_no_terminator() {
+    // T1153 B21/B23 VERIFIED for `set-config`: it is a classic
+    // workflow, so PHP runs it via the `scripts/arcanist.php`
+    // re-exec, which never requires `--`. Parsing takes no TTY
+    // input, so piped-style argv parses directly, and `--help`
+    // without `--` still succeeds.
+    assert!(
+        parse_args(&["k".to_string(), "v".to_string()])
+            .unwrap()
+            .is_some()
+    );
+    assert!(parse_args(&["--help".to_string()]).unwrap().is_none());
+    let text = usage_text(false);
+    assert!(text.contains("SET-CONFIG WORKFLOW"), "{text}");
+}
+
+#[test]
+fn b23_set_config_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help set-config`.
+    // Extensions stay undocumented.
+    let text = usage_text(false);
+    assert!(text.starts_with("SET-CONFIG WORKFLOW\n"), "{text}");
+    assert!(text.contains("Sets an arc configuration option."), "{text}");
+    assert!(text.contains("--local"), "{text}");
+    assert!(!text.contains("--arcrc-file"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }

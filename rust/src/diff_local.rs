@@ -234,14 +234,16 @@ pub fn parse_revision_id_from_raw_corpus(corpus: &str) -> Result<Option<u64>, St
     if let Some(id) = parse_revision_monogram(value) {
         return Ok(Some(id));
     }
-    // Otherwise, try to find a full URI (PHP :131-137).
+    // Otherwise, try to find a full URI (PHP :131-137 at ceb,
+    // T1153 RB-D37: `a Phabricator URI like
+    // "https://phabricator.example.com/D123"`).
     if let Some(id) = parse_revision_monogram(strip_uri_path(value)) {
         return Ok(Some(id));
     }
     Err(format!(
         "Invalid \"Differential Revision\" field in commit message. This field \
-         should have a revision identifier like \"D123\" or a server URI \
-         like \"https://devtools.example.com/D123\", but has \"{value}\"."
+         should have a revision identifier like \"D123\" or a Phabricator URI \
+         like \"https://phabricator.example.com/D123\", but has \"{value}\"."
     ))
 }
 
@@ -812,6 +814,32 @@ pub fn select_usable_messages(
     Ok(usable)
 }
 
+/// Select hg commit messages usable to prefill a revision update.
+///
+/// PHP: `getMercurialUpdateMessage()`
+/// (`src/workflow/ArcanistDiffWorkflow.php:2043-2077`): like
+/// [`select_usable_messages`] but with no revision-ID stop — hg only
+/// stops at commits already attached to the active diff. Input runs
+/// newest-first (`getCommitMessageLog()` reverses the log,
+/// `ArcanistMercurialAPI.php:522-539`).
+#[must_use]
+pub fn select_usable_hg_messages(
+    pairs_newest_first: &[(String, String)],
+    active_hashes: &HashSet<String>,
+) -> Vec<String> {
+    if pairs_newest_first.len() == 1 {
+        return Vec::new();
+    }
+    let mut usable = Vec::new();
+    for (node, desc) in pairs_newest_first {
+        if active_hashes.contains(node) {
+            break;
+        }
+        usable.push(desc.clone());
+    }
+    usable
+}
+
 /// Format usable log messages as a `  - first line` prefill template.
 ///
 /// PHP: `formatUsableLogs()`
@@ -928,20 +956,85 @@ pub fn normalize_revision_id(revision_id: &str) -> &str {
 ///
 /// PHP: `buildCommitMessage()`
 /// (`src/workflow/ArcanistDiffWorkflow.php:1340-1346`): normalize, then
-/// require a Differential revision number.
+/// require `is_numeric()`.
 ///
-/// Divergence: PHP uses `is_numeric()`, which also accepts inputs like
-/// `1e3`, `12.3`, or `+123`; only ASCII digits (around optional padding)
-/// are accepted here, and overlong digit strings fail `u64` parsing.
+/// DIFF-D21: `is_numeric()` forms (`1e3`, `12.3`, `+123`, padded) are
+/// accepted like PHP and truncated toward zero to fit the `u64` pipeline
+/// (PHP itself passes the raw string to Conduit; orsay accepts both
+/// scalar shapes, so the value agrees where it fits). Negative,
+/// non-finite, overflowing, and non-numeric inputs keep the ceb error.
 pub fn parse_update_revision_id(target: &str) -> Result<u64, String> {
     let digits = normalize_revision_id(target).trim();
-    if !digits.is_empty()
-        && digits.bytes().all(|b| b.is_ascii_digit())
-        && let Ok(id) = digits.parse::<u64>()
+    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(id) = digits.parse::<u64>() {
+            return Ok(id);
+        }
+    } else if is_php_numeric(digits)
+        && let Ok(value) = digits.parse::<f64>()
+        && value.is_finite()
+        && (0.0..18_446_744_073_709_551_616.0).contains(&value)
     {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let id = value.trunc() as u64;
         return Ok(id);
     }
     Err("Parameter to --update must be a Differential Revision number.".to_string())
+}
+
+/// PHP 7 `is_numeric()` grammar: optional sign, digits with an optional
+/// fraction, and an optional decimal exponent (`DIFF-D21`). Hex strings
+/// are not numeric under PHP 7; the caller trims padding first.
+#[must_use]
+pub fn is_php_numeric(text: &str) -> bool {
+    let body = strip_php_numeric_sign(text);
+    match mantissa_with_valid_exponent(body) {
+        None => false,
+        Some(mantissa) => decimal_mantissa_is_valid(mantissa),
+    }
+}
+
+/// Strip one leading `+`/`-` sign, if present.
+fn strip_php_numeric_sign(text: &str) -> &str {
+    text.strip_prefix(['+', '-']).unwrap_or(text)
+}
+
+/// True for a nonempty run of ASCII digits.
+fn is_digit_run(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Split off the exponent: `Some(mantissa)` when there is none or it is
+/// a signed digit run, `None` for a malformed exponent.
+fn mantissa_with_valid_exponent(body: &str) -> Option<&str> {
+    match body.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => {
+            if is_digit_run(strip_php_numeric_sign(exponent)) {
+                Some(mantissa)
+            } else {
+                None
+            }
+        }
+        None => Some(body),
+    }
+}
+
+/// True when the mantissa is a valid decimal: digits, optionally with
+/// one dot that leaves at least one digit run beside it.
+fn decimal_mantissa_is_valid(mantissa: &str) -> bool {
+    match mantissa.split_once('.') {
+        Some((head, tail)) => dotted_decimal_is_valid(head, tail),
+        None => is_digit_run(mantissa),
+    }
+}
+
+/// True for `head.tail`: an empty tail keeps a digit head, otherwise the
+/// tail must be digits beside a digit (or empty) head.
+fn dotted_decimal_is_valid(head: &str, tail: &str) -> bool {
+    let head_ok = is_digit_run(head);
+    if tail.is_empty() {
+        return head_ok;
+    }
+    is_digit_run(tail) && (head_ok || head.is_empty())
 }
 
 /// Resolve an explicit symbolic base to the merge-base with the head.
@@ -1878,6 +1971,163 @@ pub fn harbormaster_type_from_result(unit_result: i32) -> &'static str {
     }
 }
 
+/* -(  Working-Copy Revision Detection (D8)  )------------------------------ */
+
+/// One open revision matching the working copy (D8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkingCopyRevision {
+    /// Revision id.
+    pub id: u64,
+    /// Revision title (for the several-revisions list).
+    pub title: String,
+}
+
+/// Parse `differential.query` detection rows, skipping unparseable ones.
+#[must_use]
+pub fn parse_working_copy_revisions(result: &serde_json::Value) -> Vec<WorkingCopyRevision> {
+    result
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|row| {
+            Some(WorkingCopyRevision {
+                id: row.get("id").and_then(diff_submit::loose_u64)?,
+                title: row
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Explicit revision IDs from commit messages, in scan order
+/// (`ArcanistGitAPI.php:1193-1200`, `ArcanistMercurialAPI.php:551-558`).
+/// Duplicates are kept, like PHP (no dedup before the query).
+#[must_use]
+pub fn footer_revision_ids(messages: &[(String, String)]) -> Vec<u64> {
+    messages
+        .iter()
+        .filter_map(|(_, message)| {
+            CommitMessage::new_from_raw_corpus(message)
+                .ok()
+                .and_then(|parsed| parsed.revision_id)
+        })
+        .collect()
+}
+
+/// Base `differential.query` params for detection: author plus
+/// status-open (`buildCommitMessage()`, `:1303-1310`).
+#[must_use]
+pub fn working_copy_query_params(user_phid: &str) -> serde_json::Value {
+    serde_json::json!({
+        "authors": [user_phid],
+        "status": "status-open",
+    })
+}
+
+/// Git working-copy revisions: footer scan over the commit log, else a
+/// commit/tree hash lookup over local commits
+/// (`ArcanistGitAPI.php:1178-1237`).
+pub fn load_working_copy_revisions_git(
+    call: &diff_submit::ConduitCall<'_>,
+    dir: &Path,
+    base: &str,
+    head: &str,
+    user_phid: &str,
+) -> Result<Vec<WorkingCopyRevision>, String> {
+    let log = get_git_update_messages(dir, base, head)?;
+    if log.is_empty() {
+        return Ok(Vec::new());
+    }
+    let pairs: Vec<(String, String)> = log
+        .into_iter()
+        .map(|entry| (entry.commit_hash, entry.message))
+        .collect();
+    let ids = footer_revision_ids(&pairs);
+    if !ids.is_empty() {
+        let mut params = working_copy_query_params(user_phid);
+        params["ids"] = serde_json::json!(ids);
+        let result = call("differential.query", &params)?;
+        return Ok(parse_working_copy_revisions(&result));
+    }
+    let mut hashes: Vec<serde_json::Value> = Vec::new();
+    for commit in get_local_commit_information(dir, base, head)? {
+        hashes.push(serde_json::json!(["gtcm", commit.commit]));
+        hashes.push(serde_json::json!(["gttr", commit.tree]));
+    }
+    let mut params = working_copy_query_params(user_phid);
+    params["commitHashes"] = serde_json::Value::Array(hashes);
+    let result = call("differential.query", &params)?;
+    Ok(parse_working_copy_revisions(&result))
+}
+
+/// Hg working-copy revisions: footer scan over the message log, else a
+/// commit-hash lookup (`ArcanistMercurialAPI.php:541-605`).
+pub fn load_working_copy_revisions_hg(
+    call: &diff_submit::ConduitCall<'_>,
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    base: &str,
+    branch: &str,
+    user_phid: &str,
+) -> Result<Vec<WorkingCopyRevision>, String> {
+    let argv = hg_commit_log_argv(base, branch);
+    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let text = hg::stdout_text_with(dir, hg_cmd, &refs)?;
+    // `getCommitMessageLog()` scans newest-first (`:538`).
+    let mut pairs = parse_hg_commit_log(&text);
+    pairs.reverse();
+    let ids = footer_revision_ids(&pairs);
+    if !ids.is_empty() {
+        let mut params = working_copy_query_params(user_phid);
+        params["ids"] = serde_json::json!(ids);
+        let result = call("differential.query", &params)?;
+        return Ok(parse_working_copy_revisions(&result));
+    }
+    let mut hashes: Vec<serde_json::Value> = Vec::new();
+    for commit in get_hg_local_commits_with(dir, hg_cmd, base, branch)? {
+        hashes.push(serde_json::json!(["hgcm", commit.node]));
+    }
+    if hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut params = working_copy_query_params(user_phid);
+    params["commitHashes"] = serde_json::Value::Array(hashes);
+    let result = call("differential.query", &params)?;
+    Ok(parse_working_copy_revisions(&result))
+}
+
+/// Svn working-copy revisions: open author revisions at this checkout
+/// path (`ArcanistSubversionAPI.php:643-660`).
+pub fn load_working_copy_revisions_svn(
+    call: &diff_submit::ConduitCall<'_>,
+    dir: &Path,
+    user_phid: &str,
+) -> Result<Vec<WorkingCopyRevision>, String> {
+    let result = call("differential.query", &working_copy_query_params(user_phid))?;
+    let here = dir.to_string_lossy();
+    Ok(result
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter(|row| row.get("sourcePath").and_then(|v| v.as_str()) == Some(here.as_ref()))
+        .filter_map(|row| {
+            Some(WorkingCopyRevision {
+                id: row.get("id").and_then(diff_submit::loose_u64)?,
+                title: row
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            })
+        })
+        .collect())
+}
+
 /// True when lint must be skipped (reporting `RESULT_SKIP`).
 ///
 /// PHP: `runLint()` (`src/workflow/ArcanistDiffWorkflow.php:1146-1151`):
@@ -1999,9 +2249,11 @@ impl LintUnitReport {
 /// Outcome of a lint/unit child run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChildOutcome {
-    /// Workflow result code (`RESULT_OKAY`/`WARNINGS`/`ERRORS`/`SKIP` for
-    /// lint; `RESULT_OKAY`/`UNSOUND`/`FAIL`/`SKIP` for unit).
-    Code(i32),
+    /// Workflow result code plus message dicts (T1153 DIFF-D22):
+    /// `RESULT_OKAY`/`WARNINGS`/`ERRORS`/`SKIP` for lint with the
+    /// unresolved message dicts, `RESULT_OKAY`/`UNSOUND`/`FAIL`/`SKIP`
+    /// for unit with the test-result dicts.
+    Code(i32, Vec<serde_json::Value>),
     /// `ArcanistNoEngineException`: nothing is configured.
     NoEngine,
     /// `ArcanistNoEffectException`, with its message.
@@ -2038,18 +2290,31 @@ fn exit_code_value(code: std::process::ExitCode) -> i32 {
 /// (`lint::engine_for_dir` → "No lint engine is configured ...").
 const LINT_NO_ENGINE_PREFIX: &str = "No lint engine is configured";
 
+/// Map a collecting child's classified error (T1153 DIFF-D22):
+/// `NoEffect` prints with exit 0, everything else aborts the diff,
+/// like PHP's child catches.
+fn map_child_error(error: arc_rs::conduit::ClassifiedError) -> ChildOutcome {
+    if error.kind == arc_rs::conduit::EnvelopeKind::NoEffect {
+        ChildOutcome::NoEffect(error.message)
+    } else {
+        ChildOutcome::Failed(error.message)
+    }
+}
+
 /// Run `lint` in-process, mapping to a [`ChildOutcome`].
 ///
 /// `NoEngine` is probed via [`lint::engine_for_dir`]; anything else that
-/// fails before the workflow runs aborts. Result codes come from the
-/// workflow exit code verbatim.
-///
-/// Divergence: a workflow error inside `lint::run_in` (bad configuration
-/// surfacing late, patch-application failures) exits `FAILURE` and maps
-/// to `Code(1)` (`RESULT_WARNINGS`) instead of aborting: `run_in`
-/// cannot distinguish its own errors from result codes. Surfacing real
-/// errors needs a fallible lint entry point (lint owner).
+/// fails before the workflow runs aborts. The collecting run returns
+/// the result code plus unresolved message dicts (T1153 DIFF-D22);
+/// late workflow errors abort instead of masquerading as result codes.
 pub fn run_lint_in_process(cwd: &Path, argv: &[String]) -> ChildOutcome {
+    run_lint_in_process_with_amend(cwd, argv, false)
+}
+
+/// [`run_lint_in_process`] with diff's `shouldAmend()` (T1153 DIFF-D22:
+/// bare `setShouldAmendChanges()`, no argv form): applied patches
+/// prompt to amend HEAD, like PHP's child workflow.
+pub fn run_lint_in_process_with_amend(cwd: &Path, argv: &[String], amend: bool) -> ChildOutcome {
     match lint::engine_for_dir(cwd) {
         Ok(_) => {}
         Err(message) if message.starts_with(LINT_NO_ENGINE_PREFIX) => {
@@ -2057,22 +2322,38 @@ pub fn run_lint_in_process(cwd: &Path, argv: &[String]) -> ChildOutcome {
         }
         Err(message) => return ChildOutcome::Failed(message),
     }
-    ChildOutcome::Code(exit_code_value(lint::run_in(cwd, argv)))
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    match lint::run_child_collecting(
+        cwd,
+        argv,
+        amend,
+        &mut input,
+        arc_rs::prompt::stdin_is_terminal(),
+    ) {
+        Ok(report) => ChildOutcome::Code(report.code, report.unresolved),
+        Err(error) => map_child_error(error),
+    }
 }
 
-/// Run `unit` in-process, mapping to a [`ChildOutcome`].
+/// Run `unit` in-process in `cwd`, mapping to a [`ChildOutcome`]
+/// (T1153 DIFF-D22).
 ///
 /// `NoEngine` mirrors PHP's engine lookup (`--engine` never passes
 /// through from `diff`, so only `unit.engine` and `.arcunit` count).
-/// Same late-workflow-error caveat as [`run_lint_in_process`].
-///
-/// The caller must pass the process working directory: `unit::run` has
-/// no `cwd` parameter (a `unit::run_in` is unit-owner work).
+/// The collecting run returns the result code plus test-result dicts.
 pub fn run_unit_in_process(cwd: &Path, argv: &[String]) -> ChildOutcome {
     if unit::find_unit_engine_from(cwd).is_none() && unit::find_arcunit_from(cwd).is_none() {
         return ChildOutcome::NoEngine;
     }
-    ChildOutcome::Code(exit_code_value(unit::run(argv)))
+    match unit::run_in_collecting(cwd, argv) {
+        Ok(report) => {
+            let dicts = unit::results_to_json(&report.results);
+            let dicts = dicts.as_array().cloned().unwrap_or_default();
+            ChildOutcome::Code(exit_code_value(report.code), dicts)
+        }
+        Err(error) => map_child_error(error),
+    }
 }
 
 /// Background color for a lint/unit banner title.
@@ -2111,15 +2392,13 @@ fn write_banner_ansi(
 /// (git/hg); `set_flags` holds the user's set passthrough flags;
 /// `skip` is [`should_skip_lint`]; `run_child` executes the child (see
 /// [`run_lint_in_process`]). Notices and banners go to `out`. Returns
-/// the lint result, or `None` when no engine ran.
+/// the lint result (or `None` when no engine ran) plus the unresolved
+/// message dicts (T1153 DIFF-D22), which feed the `arc:lint` property.
 ///
-/// Divergence: `setShouldAmendChanges()` (bare, from `diff`'s
-/// `shouldAmend()`) has no argv form, so plain `arc diff` runs lint
-/// without amending; explicit `--amend-all` / `--amend-autofixes`
-/// pass through exactly. Unresolved message dictionaries are always
-/// empty: in-process runs return only the result code (a
-/// message-returning lint API is lint-owner work, and would also feed
-/// the `arc:lint` diff property).
+/// Amend intent rides the child runner (see
+/// [`run_lint_in_process_with_amend`]): bare, from `diff`'s
+/// `shouldAmend()`; explicit `--amend-all` / `--amend-autofixes` pass
+/// through exactly.
 pub fn run_lint<W: Write>(
     cwd: &Path,
     base: Option<&str>,
@@ -2127,7 +2406,7 @@ pub fn run_lint<W: Write>(
     skip: bool,
     run_child: &dyn Fn(&Path, &[String]) -> ChildOutcome,
     out: &mut W,
-) -> Result<Option<i32>, String> {
+) -> Result<(Option<i32>, Vec<serde_json::Value>), String> {
     run_lint_ansi(
         cwd,
         base,
@@ -2148,9 +2427,9 @@ pub fn run_lint_ansi<W: Write>(
     run_child: &dyn Fn(&Path, &[String]) -> ChildOutcome,
     out: &mut W,
     ansi: bool,
-) -> Result<Option<i32>, String> {
+) -> Result<(Option<i32>, Vec<serde_json::Value>), String> {
     if skip {
-        return Ok(Some(LINT_RESULT_SKIP));
+        return Ok((Some(LINT_RESULT_SKIP), Vec::new()));
     }
     let argv = lint_unit_argv(&passthru_argv("lint", set_flags), base);
     writeln!(out, "{LINTING}").map_err(|e| format!("failed to write output: {e}"))?;
@@ -2158,28 +2437,24 @@ pub fn run_lint_ansi<W: Write>(
         ChildOutcome::NoEngine => {
             writeln!(out, "{NO_LINT_ENGINE}")
                 .map_err(|e| format!("failed to write output: {e}"))?;
-            Ok(None)
+            Ok((None, Vec::new()))
         }
         ChildOutcome::NoEffect(message) => {
             writeln!(out, "{message}").map_err(|e| format!("failed to write output: {e}"))?;
-            Ok(None)
+            Ok((None, Vec::new()))
         }
         ChildOutcome::Failed(message) => Err(message),
-        ChildOutcome::Code(result) => {
+        ChildOutcome::Code(result, dicts) => {
             if let Some((title, detail)) = lint_result_notice(result) {
                 write_banner_ansi(out, title, detail, ansi)?;
             }
-            Ok(Some(result))
+            Ok((Some(result), dicts))
         }
     }
 }
 
 /// Run unit tests (`runUnit()`, `:1213-1278`).
 ///
-/// Shape mirrors [`run_lint`]; the `RESULT_UNSOUND` prompt reads from
-/// `input` (default yes, like `phutil_console_confirm()`), and declining
-/// aborts with [`USER_ABORT`]. Test-result dictionaries are always
-/// empty (same in-process caveat as [`run_lint`]).
 /// Render a lint/unit output failure.
 fn write_output_error(error: std::io::Error) -> String {
     format!("failed to write output: {error}")
@@ -2198,7 +2473,7 @@ fn handle_unit_code_ansi<R: BufRead, W: Write>(
     ansi: bool,
 ) -> Result<Option<i32>, String> {
     if result == UNIT_RESULT_UNSOUND
-        && !diff::prompt_confirm_from(input, out, UNSOUND_PROMPT, false)?
+        && !diff::prompt_confirm_from(input, out, UNSOUND_PROMPT, true)?
     {
         return Err(USER_ABORT.to_string());
     }
@@ -2208,6 +2483,14 @@ fn handle_unit_code_ansi<R: BufRead, W: Write>(
     Ok(Some(result))
 }
 
+/// Run unit tests (`runUnit()`, `:1213-1278`).
+///
+/// Shape mirrors [`run_lint`]; the `RESULT_UNSOUND` prompt reads from
+/// `input` (default no, like `phutil_console_confirm()` with its
+/// default `$default_no`), and declining aborts with [`USER_ABORT`].
+/// Returns the unit result (or `None` when no engine ran) plus the
+/// test-result dicts (T1153 DIFF-D22), which feed the `arc:unit`
+/// property.
 pub fn run_unit<R: BufRead, W: Write>(
     cwd: &Path,
     base: Option<&str>,
@@ -2216,7 +2499,7 @@ pub fn run_unit<R: BufRead, W: Write>(
     run_child: &dyn Fn(&Path, &[String]) -> ChildOutcome,
     input: &mut R,
     out: &mut W,
-) -> Result<Option<i32>, String> {
+) -> Result<(Option<i32>, Vec<serde_json::Value>), String> {
     run_unit_ansi(
         cwd,
         base,
@@ -2240,30 +2523,33 @@ pub fn run_unit_ansi<R: BufRead, W: Write>(
     input: &mut R,
     out: &mut W,
     ansi: bool,
-) -> Result<Option<i32>, String> {
+) -> Result<(Option<i32>, Vec<serde_json::Value>), String> {
     if skip {
-        return Ok(Some(UNIT_RESULT_SKIP));
+        return Ok((Some(UNIT_RESULT_SKIP), Vec::new()));
     }
     let argv = lint_unit_argv(&passthru_argv("unit", set_flags), base);
     write_unit_line(out, RUNNING_UNIT_TESTS)?;
     match run_child(cwd, &argv) {
         ChildOutcome::NoEngine => {
             write_unit_line(out, NO_UNIT_ENGINE)?;
-            Ok(None)
+            Ok((None, Vec::new()))
         }
         ChildOutcome::NoEffect(message) => {
             write_unit_line(out, &message)?;
-            Ok(None)
+            Ok((None, Vec::new()))
         }
         ChildOutcome::Failed(message) => Err(message),
-        ChildOutcome::Code(result) => handle_unit_code_ansi(input, out, result, ansi),
+        ChildOutcome::Code(result, dicts) => {
+            let code = handle_unit_code_ansi(input, out, result, ansi)?;
+            Ok((code, dicts))
+        }
     }
 }
 
 /// Run lint and unit together (`runLintUnit()`, `:1131-1140`).
 ///
-/// Returns the combined [`LintUnitReport`] (dictionaries always empty;
-/// see [`run_lint`]).
+/// Returns the combined [`LintUnitReport`] with collected message
+/// dicts (T1153 DIFF-D22).
 #[allow(clippy::too_many_arguments)]
 pub fn run_lint_unit<R: BufRead, W: Write>(
     cwd: &Path,
@@ -2307,8 +2593,9 @@ pub fn run_lint_unit_ansi<R: BufRead, W: Write>(
     out: &mut W,
     ansi: bool,
 ) -> Result<LintUnitReport, String> {
-    let lint_result = run_lint_ansi(cwd, base, lint_flags, skip_lint, run_lint_child, out, ansi)?;
-    let unit_result = run_unit_ansi(
+    let (lint_result, unresolved_lint) =
+        run_lint_ansi(cwd, base, lint_flags, skip_lint, run_lint_child, out, ansi)?;
+    let (unit_result, test_results) = run_unit_ansi(
         cwd,
         base,
         unit_flags,
@@ -2320,9 +2607,9 @@ pub fn run_lint_unit_ansi<R: BufRead, W: Write>(
     )?;
     Ok(LintUnitReport {
         lint_result,
-        unresolved_lint: Vec::new(),
+        unresolved_lint,
         unit_result,
-        test_results: Vec::new(),
+        test_results,
     })
 }
 
@@ -2661,8 +2948,9 @@ pub fn should_amend(
 /// One parsed hunk: header offsets plus the verbatim corpus.
 ///
 /// PHP: `ArcanistDiffHunk` (`src/parser/diff/ArcanistDiffHunk.php`); the
-/// corpus is the `@@` header line plus every body line through the next
-/// header, exactly as `ArcanistDiffParser` accumulates it.
+/// corpus is the body lines only — the `@@` header is consumed for the
+/// offsets and never stored, exactly as `ArcanistDiffParser`
+/// accumulates `$real` (`:938-1002`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedHunk {
     /// Old-file start line (`-old_start`).
@@ -2673,9 +2961,33 @@ pub struct ParsedHunk {
     pub new_start: u64,
     /// New-file line count.
     pub new_len: u64,
-    /// Verbatim hunk text: header line plus body lines, `\n`-joined with a
-    /// trailing newline when non-empty.
+    /// Verbatim hunk body: body lines with their original line endings
+    /// (no `@@` header). Endings are retained, never normalized
+    /// (EXPORT-E12): CRLF diffs keep `\r\n`, and an unterminated final
+    /// line stays unterminated, exactly as PHP's `$real` accumulation.
     pub corpus: String,
+    /// Pre-rewrite `(add_lines, del_lines)` for synthetic hunks (T1153
+    /// EXPORT-E20): `loadSyntheticData()`
+    /// (`ArcanistDiffParser.php:1269-1280`) rewrites the corpus (`+` to
+    /// context) but attaches the hunk with its parsed counts, so the
+    /// wire keeps the add-side counts beside the context corpus.
+    /// `None` for ordinary hunks (counts come from the corpus).
+    pub synthetic_counts: Option<(u64, u64)>,
+}
+
+/// Whether the `,length` parts of one hunk header were explicit
+/// (EXPORT-E11).
+///
+/// PHP keeps the regex captures as strings: offsets are always explicit
+/// (always strings in `toDictionary()`), while lengths are strings when
+/// the header spells `,length` and integer `1` when omitted. Bundle and
+/// submit renders need the bit to reproduce the types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HunkLenExplicit {
+    /// True when the old range spells `,length`.
+    pub old_explicit: bool,
+    /// True when the new range spells `,length`.
+    pub new_explicit: bool,
 }
 
 /// One parsed file change (or commit message) from unified diff text.
@@ -2687,7 +2999,7 @@ pub struct ParsedHunk {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedChange {
     /// Old path; equals `current_path` except for renames, copies, and
-    /// adds (empty here; `/dev/null` upstream).
+    /// adds (`/dev/null` like upstream, T1153 OLD-PATH).
     pub old_path: String,
     /// Current path (`getCurrentPath()`).
     pub current_path: String,
@@ -2697,6 +3009,17 @@ pub struct ParsedChange {
     pub file_type: u32,
     /// Parsed hunks (empty for binary and message changes).
     pub hunks: Vec<ParsedHunk>,
+    /// `,length` explicitness per hunk, parallel to `hunks`
+    /// (EXPORT-E11). Always the same length as `hunks`.
+    pub hunk_len_explicit: Vec<HunkLenExplicit>,
+    /// `unix:filemode` before the change, from `old mode` /
+    /// `deleted file mode` lines (EXPORT-E13). `None` when the diff
+    /// carries no old mode.
+    pub old_mode: Option<String>,
+    /// `unix:filemode` after the change, from `new mode` /
+    /// `new file mode` lines (EXPORT-E13). `None` when the diff
+    /// carries no new mode.
+    pub new_mode: Option<String>,
     /// Destination paths for old-location changes (`getAwayPaths()`),
     /// filled by the Subversion copy/move pass, else empty.
     pub away_paths: Vec<String>,
@@ -2728,7 +3051,9 @@ impl ParsedChange {
 /// add/delete), rename/copy headers, `Binary files ... differ` and
 /// `GIT binary patch` markers, and `commit <hash>` message blocks from
 /// `git show`/`git log`. Unknown text between blocks is skipped, mirroring
-/// the PHP parser's tolerance for extended headers.
+/// the PHP parser's tolerance for extended headers. Repeated blocks
+/// for one path merge like `buildChange()` (later wins, EXPORT-E24);
+/// hunk bodies validate counts like `parseChangeset()` (EXPORT-E15).
 ///
 /// Combined diffs fail with PHP's `didFailParse()` errors: `diff --cc` /
 /// `diff --combined` headers match no PHP header pattern (`:276-283`),
@@ -2736,7 +3061,19 @@ impl ParsedChange {
 /// `diff --cc` line recovers past itself only when a later `diff -r` /
 /// `diff --git` line starts a real block (`:260-272`), like PHP.
 pub fn parse_unified_diff(text: &str) -> Result<Vec<ParsedChange>, String> {
+    parse_unified_diff_inner(text, false)
+}
+
+/// [`parse_unified_diff`] over transport text (T1153 EXPORT-E9):
+/// identical structure, but C-quoted filenames decode byte-faithfully
+/// instead of lossily.
+pub fn parse_unified_diff_transport(text: &str) -> Result<Vec<ParsedChange>, String> {
+    parse_unified_diff_inner(text, true)
+}
+
+fn parse_unified_diff_inner(text: &str, transport: bool) -> Result<Vec<ParsedChange>, String> {
     let mut changes: Vec<ParsedChange> = Vec::new();
+    let mut key_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut pending_message: Option<(String, Vec<String>)> = None;
     let lines: Vec<&str> = text.lines().collect();
     let raw: Vec<&str> = split_keep_endings(text);
@@ -2744,23 +3081,23 @@ pub fn parse_unified_diff(text: &str) -> Result<Vec<ParsedChange>, String> {
     while index < lines.len() {
         let line = lines[index];
         if let Some(hash) = line.strip_prefix("commit ") {
-            if let Some((done_hash, body)) = pending_message.take() {
-                changes.push(message_change(&done_hash, &body));
-            }
+            flush_pending_message(&mut changes, &mut pending_message, true);
             let hash = hash.split_whitespace().next().unwrap_or("").to_string();
             pending_message = Some((hash, Vec::new()));
             index += 1;
             continue;
         }
         if is_diff_header(line) {
-            if let Some((done_hash, body)) = pending_message.take()
-                && (!body_is_empty(&body) || changes.is_empty())
-            {
-                changes.push(message_change(&done_hash, &body));
-            }
-            let (change, next) = parse_file_block(&lines, &raw, index)?;
-            changes.push(change);
-            index = next;
+            let force = changes.is_empty();
+            flush_pending_message(&mut changes, &mut pending_message, force);
+            index = push_file_block_or_merge(
+                &mut changes,
+                &mut key_index,
+                &lines,
+                &raw,
+                index,
+                transport,
+            )?;
             continue;
         }
         if is_combined_diff_header(line) {
@@ -2788,6 +3125,45 @@ pub fn parse_unified_diff(text: &str) -> Result<Vec<ParsedChange>, String> {
     Ok(changes)
 }
 
+/// Flush a pending `commit` message block, unless it is empty and a
+/// file change already exists.
+fn flush_pending_message(
+    changes: &mut Vec<ParsedChange>,
+    pending_message: &mut Option<(String, Vec<String>)>,
+    force: bool,
+) {
+    if let Some((done_hash, body)) = pending_message.take()
+        && (force || !body_is_empty(&body))
+    {
+        changes.push(message_change(&done_hash, &body));
+    }
+}
+
+/// Parse the file block at `lines[index]`, merging duplicate paths
+/// like `buildChange()` (later wins, stable position, EXPORT-E24).
+/// Returns the next unconsumed index.
+fn push_file_block_or_merge(
+    changes: &mut Vec<ParsedChange>,
+    key_index: &mut std::collections::HashMap<String, usize>,
+    lines: &[&str],
+    raw: &[&str],
+    index: usize,
+    transport: bool,
+) -> Result<usize, String> {
+    let (change, meta, next) = parse_file_block(lines, raw, index, transport)?;
+    match &meta.key {
+        Some(key) => match key_index.get(key) {
+            Some(&at) => merge_duplicate_block(&mut changes[at], change, &meta),
+            None => {
+                key_index.insert(key.clone(), changes.len());
+                changes.push(change);
+            }
+        },
+        None => changes.push(change),
+    }
+    Ok(next)
+}
+
 /// Split text into lines retaining endings, like `phutil_split_lines()`.
 ///
 /// Indices correspond 1:1 with `str::lines()`; used for parse-error
@@ -2809,6 +3185,21 @@ pub const EXPECTED_HUNK_HEADER: &str = "Expected hunk header '@@ -NN,NN +NN,NN @
 /// unrecognized text between blocks stays skipped (see the
 /// [`parse_unified_diff`] docs).
 pub const EXPECTED_DIFF_START: &str = "Expected a hunk header, like 'Index: /path/to/file.ext' (svn), 'Property changes on: /path/to/file.ext' (svn properties), 'commit 59bcc3ad6775562f845953cf01624225' (git show), 'diff --git' (git diff), '--- filename' (unified diff), or 'diff -r' (hg diff or patch).";
+
+/// `didFailParse()` message when a hunk body has the wrong number of
+/// lines (`:999`, EXPORT-E15).
+pub const WRONG_HUNK_LINE_COUNT: &str = "Found the wrong number of hunk lines.";
+
+/// `didFailParse()` message for a malformed `\` marker line
+/// (`:951-954`, EXPORT-E15).
+pub const EXPECTED_NO_NEWLINE_MARKER: &str = "Expected '\\ No newline at end of file'.";
+
+/// `didFailParse()` message when a `---`/`+++` target is expected
+/// (`parseHunkTarget()`, `:839-870`, EXPORT-E23). PHP reports this when a
+/// malformed `Binary files` line (or anything else) shows up where the
+/// `---`/`+++` paths belong; the text names `+++` even for the `---`
+/// slot.
+pub const EXPECTED_HUNK_TARGET: &str = "Expected hunk target '+++ path/to/file.ext (revision N)'.";
 
 /// Combined-diff header (`git diff --cc` / `git diff --combined`).
 fn is_combined_diff_header(line: &str) -> bool {
@@ -2873,11 +3264,13 @@ fn diff_parse_error(raw: &[&str], line: usize, message: &str) -> String {
     let mut context = String::new();
     for (number, raw_line) in raw.iter().enumerate().take(max + 1).skip(min) {
         let marker = if number == line { ">>>  " } else { "" };
+        // Transport never leaks into the display: the lossy view matches
+        // the historical rendering, and is identical for escape-free input.
         context.push_str(&format!(
             "{} {}   {}",
             fit_right(marker, 8),
             fit_right(&(number + 1).to_string(), 6),
-            raw_line
+            crate::patch::untransport_lossy(raw_line)
         ));
     }
     format!("Diff Parse Exception: {message}\n\n{context}")
@@ -2893,6 +3286,437 @@ pub fn without_message_changes(changes: &[ParsedChange]) -> Vec<ParsedChange> {
         .collect()
 }
 
+/// Added/deleted counts plus missing-newline flags for one hunk corpus.
+///
+/// Port of the `parseChangeset()` body loop (`ArcanistDiffParser.php:939-997`,
+/// T1153 EXPORT-E15): `+`/`-` lines decrement the remaining lengths, a `\ No
+/// newline at end of file` marker flags the old side while new lines remain
+/// and the new side once exhausted (ending the hunk), and `-` past exhaustion
+/// or anything else ends the hunk. Both `toDictionary` renderers (submit and
+/// bundle) share this so the flags agree with the parser; corpora are
+/// pre-validated body-only text (EXPORT-E10/E15), so saturating and exact
+/// countdowns coincide.
+#[must_use]
+pub fn hunk_stats(corpus: &str, old_len: u64, new_len: u64) -> (u64, u64, bool, bool) {
+    let mut add = 0;
+    let mut del = 0;
+    let mut missing_old = false;
+    let mut missing_new = false;
+    let mut old_left = old_len;
+    let mut new_left = new_len;
+    for line in corpus.lines() {
+        if line.starts_with("\\ No newline at end of file") {
+            if new_left > 0 {
+                missing_old = true;
+            } else {
+                missing_new = true;
+            }
+            if new_left == 0 {
+                break;
+            }
+            continue;
+        }
+        match line.as_bytes().first().copied().unwrap_or(b' ') {
+            b'+' => {
+                add += 1;
+                new_left = new_left.saturating_sub(1);
+            }
+            b'-' => {
+                if old_left == 0 {
+                    break;
+                }
+                del += 1;
+                old_left -= 1;
+            }
+            b' ' => {
+                if old_left == 0 && new_left == 0 {
+                    break;
+                }
+                old_left = old_left.saturating_sub(1);
+                new_left = new_left.saturating_sub(1);
+            }
+            _ => break,
+        }
+    }
+    (add, del, missing_old, missing_new)
+}
+
+/// Synthetic hunks fabricated for one pure move/copy, à la
+/// `loadSyntheticData()` (EXPORT-E20).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntheticHunks {
+    /// File type of the reparsed change (binary stays binary).
+    pub file_type: u32,
+    /// Fabricated hunks (`+` rewritten to context).
+    pub hunks: Vec<ParsedHunk>,
+    /// `,length` explicitness per hunk, parallel to `hunks` (T1153
+    /// EXPORT-E11/E20: the reparse headers spell the bits).
+    pub hunk_len_explicit: Vec<HunkLenExplicit>,
+}
+
+/// True when `change` needs `loadSyntheticData()` fabrication: a
+/// hunkless move/copy target (the `:599-616` early return, EXPORT-E20),
+/// or the hunkless move-away companion PHP flags alongside it
+/// (`$move_source`, `:612-615`; the flag persists when later folds
+/// retype the companion to `TYPE_MULTICOPY`). Copy-away companions are
+/// never flagged.
+///
+/// PHP also flags hunkless adds/deletes, but fabricating those is a
+/// no-op (an empty file reparse yields no hunks), so the predicate
+/// covers only renames, copies, and their move companions. Moves and
+/// copies can only come from git header lines, so svn/hg blocks never
+/// match (T1153 EXPORT-E20).
+#[must_use]
+pub fn needs_synthetic_git_hunks(change: &ParsedChange) -> bool {
+    if !change.hunks.is_empty() {
+        return false;
+    }
+    matches!(
+        change.change_type,
+        TYPE_MOVE_HERE | TYPE_COPY_HERE | TYPE_MOVE_AWAY | TYPE_MULTICOPY
+    )
+}
+
+/// Rewrite one hunk's added lines to context (`preg_replace('/^\+/m',
+/// ' ', ...)`), keeping the parsed counts (T1153 EXPORT-E20: PHP
+/// attaches the rewritten hunk with its original add/del counts).
+fn rewrite_synthetic_hunk(hunk: &ParsedHunk) -> ParsedHunk {
+    let (adds, dels, _, _) = hunk_stats(&hunk.corpus, hunk.old_len, hunk.new_len);
+    let corpus: String = hunk
+        .corpus
+        .split_inclusive('\n')
+        .map(|line| {
+            if let Some(rest) = line.strip_prefix('+') {
+                format!(" {rest}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    ParsedHunk {
+        old_start: hunk.old_start,
+        old_len: hunk.old_len,
+        new_start: hunk.new_start,
+        new_len: hunk.new_len,
+        corpus,
+        synthetic_counts: Some((adds, dels)),
+    }
+}
+
+/// Fabricate synthetic hunks for `path` from `raw_diff`
+/// (`loadSyntheticData()`, `:1237-1289`, EXPORT-E20).
+///
+/// `raw_diff` is `git diff -U32767 <base> -- <path>` without move
+/// detection (against the worktree, like PHP): for a pure move it
+/// reads as an add, whose `+` lines rewrite to context. Returns
+/// `None` when no parsed change targets `path` (PHP then attaches
+/// nothing). Malformed reparse text fails, like PHP's sub-parse.
+pub fn synthetic_hunks_for_path(
+    raw_diff: &str,
+    path: &str,
+) -> Result<Option<SyntheticHunks>, String> {
+    synthetic_hunks_for_path_inner(raw_diff, path, false)
+}
+
+/// [`synthetic_hunks_for_path`] over transport text (T1153 EXPORT-E9).
+pub fn synthetic_hunks_for_path_transport(
+    raw_diff: &str,
+    path: &str,
+) -> Result<Option<SyntheticHunks>, String> {
+    synthetic_hunks_for_path_inner(raw_diff, path, true)
+}
+
+fn synthetic_hunks_for_path_inner(
+    raw_diff: &str,
+    path: &str,
+    transport: bool,
+) -> Result<Option<SyntheticHunks>, String> {
+    let parsed = if transport {
+        parse_unified_diff_transport(raw_diff)?
+    } else {
+        parse_unified_diff(raw_diff)?
+    };
+    for change in parsed {
+        if change.current_path == path {
+            let hunks = change.hunks.iter().map(rewrite_synthetic_hunk).collect();
+            return Ok(Some(SyntheticHunks {
+                file_type: change.file_type,
+                hunks,
+                hunk_len_explicit: change.hunk_len_explicit.clone(),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// Added/deleted counts for one hunk: the pre-rewrite counts for
+/// synthetic hunks (T1153 EXPORT-E20), else the shared length-driven
+/// loop (T1153 EXPORT-E15).
+#[must_use]
+pub fn hunk_counts(hunk: &ParsedHunk) -> (u64, u64) {
+    if let Some(counts) = hunk.synthetic_counts {
+        return counts;
+    }
+    let (adds, dels, _, _) = hunk_stats(&hunk.corpus, hunk.old_len, hunk.new_len);
+    (adds, dels)
+}
+
+/// Companion type after folding one copy onto `existing` (T1153
+/// EXPORT-E14): a copy onto a move-away folds to multicopy, anything
+/// else (fresh included) lands copy-away
+/// (`ArcanistDiffParser.php:654-666`).
+fn copy_folded_type(existing: u32) -> u32 {
+    if existing == TYPE_MOVE_AWAY {
+        TYPE_MULTICOPY
+    } else {
+        TYPE_COPY_AWAY
+    }
+}
+
+/// Companion type after folding one move onto `existing` (T1153
+/// EXPORT-E14): moves accumulate to multicopy
+/// (`ArcanistDiffParser.php:668-687`).
+fn move_folded_type(existing: u32) -> u32 {
+    // The `:673-681` arms collapse: multicopy stays, away folds up,
+    // fresh lands move-away.
+    if existing == TYPE_MULTICOPY || existing == TYPE_MOVE_AWAY || existing == TYPE_COPY_AWAY {
+        TYPE_MULTICOPY
+    } else {
+        TYPE_MOVE_AWAY
+    }
+}
+
+/// One folded move/copy-away companion: the old path, its folded type,
+/// and the here-paths pointing at it (`addAwayPath()`, `:665-686`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AwayCompanion {
+    /// Folded `TYPE_*` (away or multicopy).
+    pub change_type: u32,
+    /// The old path (the companion's current path).
+    pub current_path: String,
+    /// Here-paths, in fold order.
+    pub away_paths: Vec<String>,
+}
+
+/// Stateful fold of here-changes into away companions (T1153 EXPORT-E14),
+/// mirroring PHP's keyed `buildChange($oldPath)` reuse
+/// (`ArcanistDiffParser.php:654-687`): the first here-change for an old
+/// path creates the companion, later ones retype it and extend its away
+/// paths. Shared by the submit and bundle emitters so both agree.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompanionFold {
+    /// Companions in first-reference order.
+    companions: Vec<AwayCompanion>,
+    /// Old path to companion slot.
+    index: std::collections::HashMap<String, usize>,
+}
+
+impl CompanionFold {
+    /// Empty fold.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold one here-change (`TYPE_MOVE_HERE`/`TYPE_COPY_HERE` with its
+    /// old and current paths). Returns the companion slot plus whether
+    /// the companion is new (emit it) or existing (update the emitted
+    /// copy: retype plus the extended away paths).
+    pub fn fold(&mut self, here_type: u32, old_path: &str, current_path: &str) -> (usize, bool) {
+        if let Some(&at) = self.index.get(old_path) {
+            let companion = &mut self.companions[at];
+            companion.change_type = if here_type == TYPE_COPY_HERE {
+                copy_folded_type(companion.change_type)
+            } else {
+                move_folded_type(companion.change_type)
+            };
+            companion.away_paths.push(current_path.to_string());
+            return (at, false);
+        }
+        // Fresh `ArcanistDiffChange` defaults to `TYPE_CHANGE`
+        // (`ArcanistDiffChange.php:18-19`).
+        let change_type = if here_type == TYPE_COPY_HERE {
+            copy_folded_type(TYPE_CHANGE)
+        } else {
+            move_folded_type(TYPE_CHANGE)
+        };
+        let at = self.companions.len();
+        self.companions.push(AwayCompanion {
+            change_type,
+            current_path: old_path.to_string(),
+            away_paths: vec![current_path.to_string()],
+        });
+        self.index.insert(old_path.to_string(), at);
+        (at, true)
+    }
+
+    /// The companion at `slot` (from [`CompanionFold::fold`]).
+    #[must_use]
+    pub fn companion(&self, slot: usize) -> &AwayCompanion {
+        &self.companions[slot]
+    }
+}
+
+/// True for away/multicopy companion types (T1153 EXPORT-E14).
+#[must_use]
+pub fn is_companion_type(change_type: u32) -> bool {
+    matches!(
+        change_type,
+        TYPE_MOVE_AWAY | TYPE_COPY_AWAY | TYPE_MULTICOPY
+    )
+}
+
+/// True when `change` is a here-change needing a companion: a
+/// move/copy-here with a usable old path distinct from the current one.
+fn needs_companion(change: &ParsedChange) -> bool {
+    matches!(change.change_type, TYPE_MOVE_HERE | TYPE_COPY_HERE)
+        && !change.old_path.is_empty()
+        && change.old_path != change.current_path
+}
+
+/// True when `changes` already carry an away companion for `old_path`
+/// (the Subversion collector emits its own via
+/// [`apply_svn_copy_info`]).
+fn has_companion(changes: &[ParsedChange], old_path: &str) -> bool {
+    changes
+        .iter()
+        .any(|change| change.current_path == old_path && is_companion_type(change.change_type))
+}
+
+/// Fresh away companion as a parsed change (T1153 EXPORT-E14): a bare
+/// `ArcanistDiffChange` (null old path, text file, no hunks/modes) with
+/// the folded type and away paths.
+fn companion_change(companion: &AwayCompanion) -> ParsedChange {
+    ParsedChange {
+        old_path: String::new(),
+        current_path: companion.current_path.clone(),
+        change_type: companion.change_type,
+        file_type: FILE_TEXT,
+        hunks: Vec::new(),
+        hunk_len_explicit: Vec::new(),
+        old_mode: None,
+        new_mode: None,
+        away_paths: companion.away_paths.clone(),
+        commit_hash: None,
+        message: None,
+    }
+}
+
+/// Parsed changes plus their folded away companions (T1153 EXPORT-E14).
+///
+/// Each companion lands right after its first here-change (PHP's
+/// insertion order), already-folded repeats merge into it, and
+/// here-changes the Subversion collector already paired are left alone
+/// (idempotent). Callers that need synthetic content run
+/// [`attach_synthetic_git_hunks`] on the result.
+#[must_use]
+pub fn with_companions(changes: &[ParsedChange]) -> Vec<ParsedChange> {
+    let mut fold = CompanionFold::new();
+    // Companion slot to output position, for merged updates.
+    let mut slots: Vec<usize> = Vec::new();
+    let mut out: Vec<ParsedChange> = Vec::with_capacity(changes.len());
+    for change in changes {
+        out.push(change.clone());
+        if !needs_companion(change) || has_companion(changes, &change.old_path) {
+            continue;
+        }
+        let (slot, is_new) = fold.fold(change.change_type, &change.old_path, &change.current_path);
+        if is_new {
+            slots.push(out.len());
+            out.push(companion_change(fold.companion(slot)));
+        } else if let Some(&at) = slots.get(slot) {
+            out[at].change_type = fold.companion(slot).change_type;
+            out[at].away_paths = fold.companion(slot).away_paths.clone();
+        }
+    }
+    out
+}
+
+/// Raw diff text of `path` without move detection (T1153 EXPORT-E20).
+///
+/// PHP: `ArcanistGitAPI::getRawDiffText()`
+/// (`src/repository/api/ArcanistGitAPI.php:499-507`): the full diff
+/// options minus `-M`/`-C`, base commit only (no head: the worktree is
+/// always the other side), scoped to `path`.
+pub fn get_raw_diff_text(dir: &Path, base: &str, path: &str) -> Result<String, String> {
+    Ok(String::from_utf8_lossy(&get_raw_diff_bytes(dir, base, path)?).into_owned())
+}
+
+/// Raw re-diff bytes for one path (T1153 EXPORT-E9): the same `git
+/// diff` [`get_raw_diff_text`] runs, without the lossy decode, so
+/// byte-faithful pipelines can transport the output.
+pub fn get_raw_diff_bytes(dir: &Path, base: &str, path: &str) -> Result<Vec<u8>, String> {
+    let mut options: Vec<String> = DIFF_BASE_OPTIONS
+        .iter()
+        .map(|option| (*option).to_string())
+        .collect();
+    options.push("--no-color".to_string());
+    options.push("--src-prefix=a/".to_string());
+    options.push("--dst-prefix=b/".to_string());
+    options.push(format!("-U{}", DEFAULT_DIFF_CONTEXT_LINES));
+    let mut args: Vec<&str> = Vec::with_capacity(options.len() + 5);
+    args.extend_from_slice(DIFF_CONFIG_OPTIONS);
+    args.push("diff");
+    args.extend(options.iter().map(String::as_str));
+    args.push(base);
+    args.push("--");
+    args.push(path);
+    let out = crate::git::output(dir, &args)?;
+    if !out.status.success() {
+        return Err(format!(
+            "git diff failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(out.stdout)
+}
+
+/// Attach fabricated hunks to every change needing them (T1153
+/// EXPORT-E20: `loadSyntheticData()`, `:1237-1289`). `raw_diff_for`
+/// re-diffs one path without move detection (see
+/// [`get_raw_diff_text`]); paths with no reparse match keep no hunks,
+/// like PHP. Runs after [`with_companions`] so move-away companions
+/// gain their delete-side hunks too.
+pub fn attach_synthetic_git_hunks(
+    changes: &mut [ParsedChange],
+    raw_diff_for: &dyn Fn(&str) -> Result<String, String>,
+) -> Result<(), String> {
+    attach_synthetic_git_hunks_inner(changes, raw_diff_for, false)
+}
+
+/// [`attach_synthetic_git_hunks`] over transport text (T1153 EXPORT-E9):
+/// the re-diff closure must return transport too.
+pub fn attach_synthetic_git_hunks_transport(
+    changes: &mut [ParsedChange],
+    raw_diff_for: &dyn Fn(&str) -> Result<String, String>,
+) -> Result<(), String> {
+    attach_synthetic_git_hunks_inner(changes, raw_diff_for, true)
+}
+
+fn attach_synthetic_git_hunks_inner(
+    changes: &mut [ParsedChange],
+    raw_diff_for: &dyn Fn(&str) -> Result<String, String>,
+    transport: bool,
+) -> Result<(), String> {
+    for change in changes.iter_mut() {
+        if !needs_synthetic_git_hunks(change) {
+            continue;
+        }
+        let raw = raw_diff_for(&change.current_path)?;
+        let made = if transport {
+            synthetic_hunks_for_path_transport(&raw, &change.current_path)?
+        } else {
+            synthetic_hunks_for_path(&raw, &change.current_path)?
+        };
+        if let Some(made) = made {
+            change.file_type = made.file_type;
+            change.hunks = made.hunks;
+            change.hunk_len_explicit = made.hunk_len_explicit;
+        }
+    }
+    Ok(())
+}
+
 fn body_is_empty(body: &[String]) -> bool {
     body.iter().all(|line| line.trim().is_empty())
 }
@@ -2904,6 +3728,9 @@ fn message_change(hash: &str, body: &[String]) -> ParsedChange {
         change_type: TYPE_MESSAGE,
         file_type: FILE_TEXT,
         hunks: Vec::new(),
+        hunk_len_explicit: Vec::new(),
+        old_mode: None,
+        new_mode: None,
         away_paths: Vec::new(),
         commit_hash: Some(hash.to_string()),
         message: Some(body.join("\n")),
@@ -2920,6 +3747,43 @@ pub const SVN_BINARY_MARKER: &str = "Cannot display: file marked as a binary typ
 #[must_use]
 pub fn is_svn_binary_marker(line: &str) -> bool {
     line.trim_end() == SVN_BINARY_MARKER
+}
+
+/// True for `Binary files x and y differ` and the `Files x and y
+/// differ` wording (EXPORT-E22).
+///
+/// PHP: `/^(Binary files|Files) .* and .* differ$/` on the rtrimmed
+/// line (`:744-751`).
+#[must_use]
+pub fn is_binary_differ_line(line: &str) -> bool {
+    let trimmed = line.trim_end();
+    let rest = trimmed
+        .strip_prefix("Binary files ")
+        .or_else(|| trimmed.strip_prefix("Files "));
+    match rest {
+        Some(rest) => rest.contains(" and ") && rest.ends_with(" differ"),
+        None => false,
+    }
+}
+
+/// True for a malformed `Binary files`/`Files` line without the
+/// ` differ` tail (EXPORT-E23). PHP fails the parse there
+/// (`parseHunkTarget()` / `parseChangeset()`); the message depends on
+/// whether `---`/`+++` were already consumed.
+#[must_use]
+pub fn is_malformed_binary_line(line: &str) -> bool {
+    (line.starts_with("Binary files ") || line.starts_with("Files "))
+        && !is_binary_differ_line(line)
+}
+
+/// True for hg's `Binary file f has changed` marker (EXPORT-E37).
+///
+/// PHP: `/^Binary file .* has changed$/` on the rtrimmed line
+/// (`:757-764`). Note the singular `file`.
+#[must_use]
+pub fn is_hg_binary_changed_line(line: &str) -> bool {
+    let trimmed = line.trim_end();
+    trimmed.starts_with("Binary file ") && trimmed.ends_with(" has changed")
 }
 
 fn is_diff_header(line: &str) -> bool {
@@ -2939,18 +3803,27 @@ struct FileBlockState {
     is_rename: bool,
     new_file: bool,
     deleted_file: bool,
+    /// `unix:filemode` before the change (EXPORT-E13).
+    old_mode: Option<String>,
+    /// `unix:filemode` after the change (EXPORT-E13).
+    new_mode: Option<String>,
+    /// Literal `---` path when seen, `/dev/null` included (EXPORT-E24:
+    /// PHP's `setOldPath()` overwrite for duplicate blocks).
+    minus_literal: Option<String>,
+    /// Whether a `+++` line was consumed (EXPORT-E23 message choice).
+    saw_plus: bool,
 }
 
 /// Seed `(old, new)` paths from a block header line (`diff --git a/o b/n`,
 /// `diff -r <rev> <file>`, `Index: <file>`).
-fn seed_file_block_paths(header: &str) -> (String, String) {
+///
+/// Git headers go through `extractGitCommonFilename()` (EXPORT-E16):
+/// quoted pairs decode, and renames/differs seed empty (recovered
+/// later from `rename from`/`rename to` or `---`/`+++` lines).
+fn seed_file_block_paths(header: &str, transport: bool) -> (String, String) {
     if let Some(rest) = header.strip_prefix("diff --git ") {
-        let mut parts = rest.split_whitespace();
-        if let (Some(old), Some(new)) = (parts.next(), parts.next()) {
-            return (
-                strip_ab_prefix(old).to_string(),
-                strip_ab_prefix(new).to_string(),
-            );
+        if let Some(common) = extract_git_common_filename(rest, transport) {
+            return (common.clone(), common);
         }
         return (String::new(), String::new());
     }
@@ -2968,10 +3841,13 @@ fn seed_file_block_paths(header: &str) -> (String, String) {
 }
 
 /// True at the end of the extended-header run (`---`, binary markers,
-/// hunks, or the next block).
+/// hunks, or the next block). Malformed binary lines also end the run
+/// so the body pass can fail on them (EXPORT-E23).
 fn is_extended_header_end(line: &str) -> bool {
     line.starts_with("--- ")
-        || line.starts_with("Binary files ")
+        || is_binary_differ_line(line)
+        || is_hg_binary_changed_line(line)
+        || is_malformed_binary_line(line)
         || line.starts_with("GIT binary patch")
         || is_svn_binary_marker(line)
         || line.starts_with("@@ ")
@@ -2979,41 +3855,76 @@ fn is_extended_header_end(line: &str) -> bool {
         || line.starts_with("commit ")
 }
 
+/// Read a `unix:filemode` value after `prefix` (`old mode ` and
+/// friends, EXPORT-E13). PHP's `\d+` is prefix-matched, so trailing
+/// junk is ignored; a missing digit run matches nothing.
+fn mode_value_after(line: &str, prefix: &str) -> Option<String> {
+    let rest = line.strip_prefix(prefix)?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    Some(digits)
+}
+
 /// Fold one extended-header line into `state` (renames, copies, modes).
-fn apply_extended_header_line(line: &str, state: &mut FileBlockState) {
+///
+/// Rename/copy paths decode C-quoting (`unescapeFilename()`,
+/// EXPORT-E16); mode lines retain their `unix:filemode` values
+/// (EXPORT-E13).
+fn apply_extended_header_line(line: &str, state: &mut FileBlockState, transport: bool) {
     if let Some(path) = line.strip_prefix("rename from ") {
-        state.rename_from = Some(path.trim().to_string());
+        state.rename_from = Some(unescape_git_filename(path.trim(), transport));
         state.is_rename = true;
     } else if let Some(path) = line.strip_prefix("rename to ") {
-        state.rename_to = Some(path.trim().to_string());
+        state.rename_to = Some(unescape_git_filename(path.trim(), transport));
         state.is_rename = true;
     } else if let Some(path) = line.strip_prefix("copy from ") {
-        state.rename_from = Some(path.trim().to_string());
+        state.rename_from = Some(unescape_git_filename(path.trim(), transport));
         state.is_copy = true;
     } else if let Some(path) = line.strip_prefix("copy to ") {
-        state.rename_to = Some(path.trim().to_string());
+        state.rename_to = Some(unescape_git_filename(path.trim(), transport));
         state.is_copy = true;
-    } else if line.starts_with("new file mode") {
+    } else if let Some(mode) = mode_value_after(line, "new file mode ") {
         state.new_file = true;
-    } else if line.starts_with("deleted file mode") {
+        state.new_mode = Some(mode);
+    } else if let Some(mode) = mode_value_after(line, "deleted file mode ") {
         state.deleted_file = true;
+        state.old_mode = Some(mode);
+    } else if let Some(mode) = mode_value_after(line, "old mode ") {
+        state.old_mode = Some(mode);
+    } else if let Some(mode) = mode_value_after(line, "new mode ") {
+        state.new_mode = Some(mode);
     }
+    // Digitless `new/deleted file mode` lines match nothing, like PHP's
+    // `\d+` patterns.
 }
 
 /// Scan extended headers from `index`, returning the first body line.
-fn scan_extended_headers(lines: &[&str], state: &mut FileBlockState, mut index: usize) -> usize {
+fn scan_extended_headers(
+    lines: &[&str],
+    state: &mut FileBlockState,
+    mut index: usize,
+    transport: bool,
+) -> usize {
     while index < lines.len() {
         let line = lines[index];
         if is_extended_header_end(line) {
             break;
         }
-        apply_extended_header_line(line, state);
+        apply_extended_header_line(line, state, transport);
         index += 1;
     }
     index
 }
 
 /// Consume the `---` path line at `index`, returning the next index.
+///
+/// The literal path is recorded for duplicate-block merges (PHP's
+/// `setOldPath()` overwrite, EXPORT-E24); a `/dev/null` target marks
+/// a new file and overwrites the seeded path like PHP (T1153
+/// OLD-PATH: `ArcanistDiffParser.php:801-808` unconditionally
+/// `setOldPath($old_file)`, so ADD carries `/dev/null`).
 fn consume_minus_path_line(
     lines: &[&str],
     index: usize,
@@ -3024,8 +3935,13 @@ fn consume_minus_path_line(
         return index;
     }
     let old = diff_path_value(lines[index], index_block);
+    state.minus_literal = Some(old.clone());
     if old == "/dev/null" {
         state.new_file = true;
+        // T1153 OLD-PATH: PHP overwrites the seeded path with the
+        // literal `/dev/null` (`:808`), so ADD reports `/dev/null`
+        // instead of the current path.
+        state.old_path = old;
     } else if !old.is_empty() {
         state.old_path = old;
     }
@@ -3033,6 +3949,10 @@ fn consume_minus_path_line(
 }
 
 /// Consume the `+++` path line at `index`, returning the next index.
+///
+/// For resolved renames/copies the `+++` value is discarded
+/// (EXPORT-E16): PHP keeps the decoded `rename to`/`copy to` path and
+/// only `setCurrentPath()`s the `+++` target for RCS diffs.
 fn consume_plus_path_line(
     lines: &[&str],
     index: usize,
@@ -3042,7 +3962,11 @@ fn consume_plus_path_line(
     if index >= lines.len() || !lines[index].starts_with("+++ ") {
         return index;
     }
+    state.saw_plus = true;
     let new = diff_path_value(lines[index], index_block);
+    if state.rename_to.is_some() && (state.is_rename || state.is_copy) {
+        return index + 1;
+    }
     if new == "/dev/null" {
         state.deleted_file = true;
         state.new_path.clone_from(&state.old_path);
@@ -3083,13 +4007,13 @@ fn skip_svn_binary_block(lines: &[&str], mut index: usize) -> usize {
     index
 }
 
-/// True at the end of a git binary payload (hunk or next block).
+/// True at the end of a git binary payload (next block only).
+///
+/// Base85 payload lines can start with `@@`, `---`, or `+++`, so only
+/// block boundaries end the payload (PHP delimits on `literal` /
+/// blank lines instead; the outcome is the same for valid payloads).
 fn is_binary_payload_end(line: &str) -> bool {
-    line.starts_with("@@ ")
-        || line.starts_with("@@@")
-        || is_diff_header(line)
-        || is_combined_diff_header(line)
-        || line.starts_with("commit ")
+    is_diff_header(line) || is_combined_diff_header(line) || line.starts_with("commit ")
 }
 
 /// Skip `Binary files`/`GIT binary patch` payload lines (`literal ...`,
@@ -3102,47 +4026,131 @@ fn skip_git_binary_block(lines: &[&str], mut index: usize) -> usize {
     index
 }
 
-/// Collect body hunks from `index`, returning `(hunks, binary, next)`.
+/// Collected block body: hunks plus their explicitness bits.
+struct BlockBody {
+    hunks: Vec<ParsedHunk>,
+    bits: Vec<HunkLenExplicit>,
+    binary: bool,
+    next: usize,
+}
+
+/// True for git/hg binary markers with payloads (`differ` lines, the
+/// hg `has changed` marker, `GIT binary patch`).
+fn is_git_binary_marker(line: &str) -> bool {
+    is_binary_differ_line(line)
+        || is_hg_binary_changed_line(line)
+        || line.starts_with("GIT binary patch")
+}
+
+/// Parse the hunk at `lines[index]`, failing like PHP on malformed
+/// lines in hunk position (EXPORT-E15/E23). Returns `None` for
+/// non-hunk lines (skipped as noise).
+///
+/// `saw_paths` picks the `didFailParse()` text: past `---`/`+++` PHP
+/// fails in `parseChangeset()`, before them in `parseHunkTarget()`.
+fn collect_body_hunk_or_fail(
+    lines: &[&str],
+    raw: &[&str],
+    index: usize,
+    saw_paths: bool,
+) -> Result<Option<(ParsedHunk, HunkLenExplicit, usize)>, String> {
+    let line = lines[index];
+    if is_malformed_binary_line(line) {
+        return Err(diff_parse_error(raw, index, hunk_position_error(saw_paths)));
+    }
+    if let Some(header) = parse_hunk_header(line) {
+        let (hunk, next) = collect_hunk(lines, raw, index, &header)?;
+        return Ok(Some((hunk, header.explicit, next)));
+    }
+    if line.starts_with("@@@") || line.starts_with("@@ ") {
+        return Err(diff_parse_error(raw, index, hunk_position_error(saw_paths)));
+    }
+    Ok(None)
+}
+
+/// `didFailParse()` text for a malformed line in hunk position.
+fn hunk_position_error(saw_paths: bool) -> &'static str {
+    if saw_paths {
+        EXPECTED_HUNK_HEADER
+    } else {
+        EXPECTED_HUNK_TARGET
+    }
+}
+
+/// Collect body hunks from `index`.
+///
+/// `saw_paths` reports whether `---`/`+++` were both consumed, which
+/// picks the `didFailParse()` text for malformed binary lines
+/// (EXPORT-E23): past the paths PHP fails in `parseChangeset()`,
+/// before them in `parseHunkTarget()`.
 fn collect_block_body(
     lines: &[&str],
     raw: &[&str],
     mut index: usize,
-) -> Result<(Vec<ParsedHunk>, bool, usize), String> {
-    let mut hunks = Vec::new();
-    let mut binary = false;
+    saw_paths: bool,
+) -> Result<BlockBody, String> {
+    let mut body = BlockBody {
+        hunks: Vec::new(),
+        bits: Vec::new(),
+        binary: false,
+        next: index,
+    };
     while index < lines.len() {
         let line = lines[index];
         if is_block_end_line(line) {
             break;
         }
         if is_svn_binary_marker(line) {
-            binary = true;
+            body.binary = true;
             index = skip_svn_binary_block(lines, index);
             continue;
         }
-        if line.starts_with("Binary files ") || line.starts_with("GIT binary patch") {
-            binary = true;
+        if is_git_binary_marker(line) {
+            body.binary = true;
             index = skip_git_binary_block(lines, index);
             continue;
         }
-        if let Some((old_start, old_len, new_start, new_len)) = parse_hunk_header(line) {
-            let (hunk, next) = collect_hunk(lines, index, old_start, old_len, new_start, new_len);
-            hunks.push(hunk);
-            index = next;
-            continue;
+        match collect_body_hunk_or_fail(lines, raw, index, saw_paths)? {
+            Some((hunk, bits, next)) => {
+                body.hunks.push(hunk);
+                body.bits.push(bits);
+                index = next;
+            }
+            None => index += 1,
         }
-        if line.starts_with("@@@") {
-            return Err(diff_parse_error(raw, index, EXPECTED_HUNK_HEADER));
-        }
-        index += 1;
     }
-    Ok((hunks, binary, index))
+    body.next = index;
+    Ok(body)
+}
+
+/// Resolve the change type from header flags (EXPORT-E21).
+///
+/// A block carrying both `deleted file mode` and `new file mode`
+/// (symlink↔file typechange) is a change, like PHP's `new` arm
+/// escalating past `TYPE_DELETE` (`:629-642`). PHP applies same-block
+/// arms in file order; the flags here are orderless, so both-flags
+/// always means the delete-then-new order git emits across blocks.
+fn finish_block_type(is_rename: bool, is_copy: bool, new_file: bool, deleted_file: bool) -> u32 {
+    if is_rename {
+        TYPE_MOVE_HERE
+    } else if is_copy {
+        TYPE_COPY_HERE
+    } else if new_file && deleted_file {
+        TYPE_CHANGE
+    } else if new_file {
+        TYPE_ADD
+    } else if deleted_file {
+        TYPE_DELETE
+    } else {
+        TYPE_CHANGE
+    }
 }
 
 /// Resolve change/file types and build the parsed change.
 fn finish_file_block(
     state: FileBlockState,
     hunks: Vec<ParsedHunk>,
+    bits: Vec<HunkLenExplicit>,
     binary: bool,
     index: usize,
 ) -> (ParsedChange, usize) {
@@ -3155,34 +4163,32 @@ fn finish_file_block(
         is_rename,
         new_file,
         deleted_file,
+        old_mode,
+        new_mode,
+        minus_literal,
+        saw_plus: _,
     } = state;
     let mut hunks = hunks;
-    let mut change_type = TYPE_CHANGE;
+    let mut bits = bits;
     let mut file_type = FILE_TEXT;
     if binary {
         file_type = FILE_BINARY;
         hunks.clear();
+        bits.clear();
     }
-    if is_rename {
-        change_type = TYPE_MOVE_HERE;
-        if let (Some(from), Some(to)) = (rename_from, rename_to) {
-            old_path = from;
-            new_path = to;
-        }
-    } else if is_copy {
-        change_type = TYPE_COPY_HERE;
-        if let (Some(from), Some(to)) = (rename_from, rename_to) {
-            old_path = from;
-            new_path = to;
-        }
-    } else if new_file {
-        change_type = TYPE_ADD;
-    } else if deleted_file {
-        change_type = TYPE_DELETE;
+    let change_type = finish_block_type(is_rename, is_copy, new_file, deleted_file);
+    // PHP overwrites the decoded rename source with the literal `---`
+    // path afterwards (`parseHunkTarget()`), while the `+++` target
+    // is discarded (EXPORT-E16).
+    if (is_rename || is_copy)
+        && let (Some(from), Some(to)) = (rename_from, rename_to)
+    {
+        old_path = minus_literal.unwrap_or(from);
+        new_path = to;
     }
-    if old_path == "/dev/null" {
-        old_path.clear();
-    }
+    // T1153 OLD-PATH: PHP keeps the literal `/dev/null` from the
+    // `---` line as the old path for ADD
+    // (`ArcanistDiffParser.php:801-808`); no clearing to empty.
     (
         ParsedChange {
             old_path,
@@ -3190,12 +4196,104 @@ fn finish_file_block(
             change_type,
             file_type,
             hunks,
+            hunk_len_explicit: bits,
+            old_mode,
+            new_mode,
             away_paths: Vec::new(),
             commit_hash: None,
             message: None,
         },
         index,
     )
+}
+
+/// Per-block metadata for duplicate-block merges (EXPORT-E24).
+struct FileBlockMeta {
+    /// `buildChange()` key: the seeded current path, or `None` for
+    /// renames/differs/commits (PHP keys on `idx($match, 'cur')`,
+    /// unset there, so those blocks never merge).
+    key: Option<String>,
+    /// Literal `---` path when seen (PHP's `setOldPath()` overwrite).
+    minus_literal: Option<String>,
+    /// Whether the block carries a `new file mode` arm.
+    new_file: bool,
+    /// Whether the block carries a `deleted file mode` arm.
+    deleted_file: bool,
+}
+
+/// `buildChange()` key for a block header line (EXPORT-E24): the git
+/// common filename, the `Index:` path, or the `diff -r`/`diff -u`
+/// path. `None` (unkeyed, never merged) for renames and differs.
+fn block_key(header: &str, transport: bool) -> Option<String> {
+    if let Some(rest) = header.strip_prefix("diff --git ") {
+        return extract_git_common_filename(rest, transport);
+    }
+    if let Some(rest) = header.strip_prefix("Index: ") {
+        return Some(rest.trim().to_string());
+    }
+    if (header.starts_with("diff -r ") || header.starts_with("diff -u "))
+        && let Some(last) = header.split_whitespace().last()
+    {
+        return Some(strip_ab_prefix(last).to_string());
+    }
+    None
+}
+
+/// Merged change type for a duplicate block (EXPORT-E21/E24).
+///
+/// PHP mutates the reused change through the incoming block's `new`
+/// / `deleted` arms (`:629-642`): `deleted` forces delete, `new`
+/// escalates a delete to a change (the symlink↔file two-block form)
+/// and otherwise adds, while an armless block keeps the existing
+/// type. A both-flags block reads as delete-then-new.
+fn merge_block_type(existing: u32, meta: &FileBlockMeta) -> u32 {
+    if meta.deleted_file && meta.new_file {
+        TYPE_CHANGE
+    } else if meta.deleted_file {
+        TYPE_DELETE
+    } else if meta.new_file {
+        if existing == TYPE_DELETE {
+            TYPE_CHANGE
+        } else {
+            TYPE_ADD
+        }
+    } else {
+        existing
+    }
+}
+
+/// Merge a duplicate-path block into the existing change, like PHP's
+/// `buildChange()` reuse (EXPORT-E24).
+///
+/// Later blocks win: hunks (and their explicitness bits) are
+/// replaced (`dropHunks()`), the `---` path overwrites the old path
+/// (`/dev/null` literally), and the type runs through the incoming
+/// arms. The current path, binary flag (sticky), filemodes (union),
+/// and away paths are preserved unless the incoming block sets them.
+fn merge_duplicate_block(
+    existing: &mut ParsedChange,
+    incoming: ParsedChange,
+    meta: &FileBlockMeta,
+) {
+    existing.change_type = merge_block_type(existing.change_type, meta);
+    if incoming.change_type == TYPE_MOVE_HERE || incoming.change_type == TYPE_COPY_HERE {
+        existing.change_type = incoming.change_type;
+        existing.current_path = incoming.current_path.clone();
+    }
+    if let Some(literal) = &meta.minus_literal {
+        existing.old_path = literal.clone();
+    }
+    existing.hunks = incoming.hunks;
+    existing.hunk_len_explicit = incoming.hunk_len_explicit;
+    if incoming.file_type == FILE_BINARY {
+        existing.file_type = FILE_BINARY;
+    }
+    if incoming.old_mode.is_some() {
+        existing.old_mode = incoming.old_mode;
+    }
+    if incoming.new_mode.is_some() {
+        existing.new_mode = incoming.new_mode;
+    }
 }
 
 /// Parse one `diff`/`Index:` block starting at `lines[start]`.
@@ -3205,9 +4303,11 @@ fn parse_file_block(
     lines: &[&str],
     raw: &[&str],
     start: usize,
-) -> Result<(ParsedChange, usize), String> {
+    transport: bool,
+) -> Result<(ParsedChange, FileBlockMeta, usize), String> {
     let header = lines[start];
-    let (old_path, new_path) = seed_file_block_paths(header);
+    let key = block_key(header, transport);
+    let (old_path, new_path) = seed_file_block_paths(header, transport);
     let mut state = FileBlockState {
         old_path,
         new_path,
@@ -3217,9 +4317,13 @@ fn parse_file_block(
         is_rename: false,
         new_file: false,
         deleted_file: false,
+        old_mode: None,
+        new_mode: None,
+        minus_literal: None,
+        saw_plus: false,
     };
     // Extended headers up to `---`.
-    let mut index = scan_extended_headers(lines, &mut state, start + 1);
+    let mut index = scan_extended_headers(lines, &mut state, start + 1, transport);
 
     // `Index:` blocks key on the header path; `---`/`+++` only supply
     // the old path with `(...)` suffixes stripped (`parseHunkTarget()`,
@@ -3231,15 +4335,184 @@ fn parse_file_block(
     finalize_block_paths(header, index_block, &mut state);
 
     // Body: binary markers and hunks until the next block.
-    let (hunks, binary, next) = collect_block_body(lines, raw, index)?;
-    Ok(finish_file_block(state, hunks, binary, next))
+    let saw_paths = state.minus_literal.is_some() && state.saw_plus;
+    let body = collect_block_body(lines, raw, index, saw_paths)?;
+    let meta = FileBlockMeta {
+        key,
+        minus_literal: state.minus_literal.clone(),
+        new_file: state.new_file,
+        deleted_file: state.deleted_file,
+    };
+    let (change, next) = finish_file_block(state, body.hunks, body.bits, body.binary, body.next);
+    Ok((change, meta, next))
 }
 
 fn strip_ab_prefix(path: &str) -> &str {
-    if path.len() > 2 && (path.starts_with("a/") || path.starts_with("b/")) {
+    if path.len() >= 2 && (path.starts_with("a/") || path.starts_with("b/")) {
         &path[2..]
     } else {
         path
+    }
+}
+
+/// Unescape a possibly C-quoted git filename (`unescapeFilename()`,
+/// `src/parser/ArcanistDiffParser.php:1229`, EXPORT-E16).
+///
+/// Only fully double-quoted names decode; anything else stays literal
+/// (backslashes kept). `transport` selects the byte-faithful carry
+/// (T1153 EXPORT-E9) over the historical lossy decode.
+fn unescape_git_filename(name: &str, transport: bool) -> String {
+    if name.len() > 2 && name.starts_with('"') && name.ends_with('"') {
+        stripcslashes(&name[1..name.len() - 1], transport)
+    } else {
+        name.to_string()
+    }
+}
+
+/// Decode an octal `stripcslashes()` escape at `bytes[pos]`,
+/// returning the bytes consumed.
+fn stripcslashes_octal(bytes: &[u8], pos: usize, out: &mut Vec<u8>) -> usize {
+    let mut end = pos;
+    while end < bytes.len() && end - pos < 3 && matches!(bytes[end], b'0'..=b'7') {
+        end += 1;
+    }
+    let mut value: u32 = 0;
+    for digit in &bytes[pos..end] {
+        value = value * 8 + u32::from(digit - b'0');
+    }
+    out.push(value as u8);
+    end - pos
+}
+
+/// Decode a `\x` hex `stripcslashes()` escape at `bytes[pos]`,
+/// returning the bytes consumed.
+fn stripcslashes_hex(bytes: &[u8], pos: usize, out: &mut Vec<u8>) -> usize {
+    let mut end = pos + 1;
+    while end < bytes.len() && end - pos < 3 && bytes[end].is_ascii_hexdigit() {
+        end += 1;
+    }
+    if end == pos + 1 {
+        out.push(b'x');
+    } else {
+        let text = std::str::from_utf8(&bytes[pos + 1..end]).unwrap_or("");
+        out.push(u8::from_str_radix(text, 16).unwrap_or(0));
+    }
+    end - pos
+}
+
+/// Decode one `stripcslashes()` escape at `bytes[pos]` (past the
+/// backslash), appending to `out` and returning the bytes consumed.
+fn stripcslashes_escape(bytes: &[u8], pos: usize, out: &mut Vec<u8>) -> usize {
+    match bytes[pos] {
+        b'n' => out.push(b'\n'),
+        b'r' => out.push(b'\r'),
+        b't' => out.push(b'\t'),
+        b'v' => out.push(0x0B),
+        b'f' => out.push(0x0C),
+        b'a' => out.push(0x07),
+        b'b' => out.push(0x08),
+        b'\\' | b'\'' | b'"' | b'?' => out.push(bytes[pos]),
+        b'0'..=b'7' => return stripcslashes_octal(bytes, pos, out),
+        b'x' => return stripcslashes_hex(bytes, pos, out),
+        other => out.push(other),
+    }
+    1
+}
+
+/// PHP `stripcslashes()` over the quoted inner text (EXPORT-E16).
+///
+/// Handles the C single-letter escapes git emits plus up to 3 octal
+/// digits and `\x` hex; anything else keeps the escaped char.
+/// Decoded bytes are lossy UTF-8 by default, matching how hunk corpora
+/// already decode non-UTF-8 bytes elsewhere in this port; `transport`
+/// carries them byte-faithfully instead (T1153 EXPORT-E9).
+fn stripcslashes(text: &str, transport: bool) -> String {
+    // Transport mode decodes over the raw bytes (like PHP's byte
+    // strings) so smuggle sequences survive the round trip.
+    let owned;
+    let bytes = if transport {
+        owned = crate::patch::untransport_bytes(text);
+        owned.as_slice()
+    } else {
+        text.as_bytes()
+    };
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut pos = 0;
+    while pos < bytes.len() {
+        if bytes[pos] == b'\\' && pos + 1 < bytes.len() {
+            let consumed = stripcslashes_escape(bytes, pos + 1, &mut out);
+            pos += 1 + consumed;
+        } else {
+            out.push(bytes[pos]);
+            pos += 1;
+        }
+    }
+    if transport {
+        crate::patch::transport_bytes(&out)
+    } else {
+        String::from_utf8_lossy(&out).into_owned()
+    }
+}
+
+/// Parse one `diff --git` path: a C-quoted name or a bare token up to
+/// the next space. Returns the inner text, whether it was quoted, and
+/// the remainder after it.
+fn parse_git_diff_path(text: &str) -> Option<(String, bool, &str)> {
+    if let Some(inner) = text.strip_prefix('"') {
+        let bytes = inner.as_bytes();
+        let mut pos = 0;
+        while pos < bytes.len() {
+            if bytes[pos] == b'\\' {
+                pos += 2;
+                continue;
+            }
+            if bytes[pos] == b'"' {
+                return Some((inner[..pos].to_string(), true, &inner[pos + 1..]));
+            }
+            pos += 1;
+        }
+        return None;
+    }
+    let end = text.find(' ').unwrap_or(text.len());
+    Some((text[..end].to_string(), false, &text[end..]))
+}
+
+/// Drop one optional leading `[^/]+/` prefix segment, like the
+/// `(?:[^/]+/)?` prefix in `extractGitCommonFilename()`. A leading
+/// or trailing slash matches no prefix (the regex needs a non-empty
+/// segment on both sides), so those stay whole.
+fn strip_one_prefix_segment(path: &str) -> &str {
+    match path.find('/') {
+        Some(slash) if slash > 0 && slash + 1 < path.len() => &path[slash + 1..],
+        _ => path,
+    }
+}
+
+/// Common filename of a `diff --git` old/new pair
+/// (`extractGitCommonFilename()`, `:1325`, EXPORT-E16).
+///
+/// `rest` is the header text after `diff --git `. The two paths may be
+/// C-quoted (then they may contain spaces) and carry any single
+/// `a/`-style prefix, which is removed before comparing. Returns the
+/// unescaped common path, or `None` for renames/differs (recovered
+/// later from `rename from`/`rename to` lines).
+fn extract_git_common_filename(rest: &str, transport: bool) -> Option<String> {
+    let rest = rest.trim_end_matches(['\r', '\n']);
+    let (old, _, after_old) = parse_git_diff_path(rest)?;
+    let after_old = after_old.strip_prefix(' ')?;
+    let (new, new_quoted, after_new) = parse_git_diff_path(after_old)?;
+    if !after_new.is_empty() {
+        return None;
+    }
+    let old_common = strip_one_prefix_segment(&old);
+    let new_common = strip_one_prefix_segment(&new);
+    if old_common.is_empty() || old_common != new_common {
+        return None;
+    }
+    if new_quoted {
+        Some(stripcslashes(new_common, transport))
+    } else {
+        Some(new_common.to_string())
     }
 }
 
@@ -3260,10 +4533,13 @@ fn strip_svn_paren_suffix(path: &str) -> &str {
 
 /// Extract the path from a `---`/`+++` line, dropping hg/svn suffixes.
 ///
-/// Handles `a/f`, `b/f`, bare `f`, quoted `"f"`, svn `f (revision N)` /
+/// Handles `a/f`, `b/f`, bare `f`, svn `f (revision N)` /
 /// `f (working copy)` / `f (synthetic)` suffixes, and hg tab-separated
 /// date suffixes. `Index:` blocks strip every trailing ` (...)`
 /// (`parseHunkTarget()`); other blocks keep the legacy suffix checks.
+/// Quoted names stay literal (EXPORT-E16): PHP's `parseHunkTarget()`
+/// never unescapes `---`/`+++` paths (only rename/copy headers
+/// decode).
 fn diff_path_value(line: &str, strip_paren_suffix: bool) -> String {
     let value = line[4..].trim_end();
     // Tab separates svn/hg metadata suffixes.
@@ -3276,70 +4552,209 @@ fn diff_path_value(line: &str, strip_paren_suffix: bool) -> String {
     } else {
         path
     };
-    let path = path.trim();
-    let unquoted = if path.len() >= 2 && path.starts_with('"') && path.ends_with('"') {
-        &path[1..path.len() - 1]
-    } else {
-        path
-    };
-    strip_ab_prefix(unquoted).to_string()
+    strip_ab_prefix(path.trim()).to_string()
 }
 
-/// Parse an `@@ -a[,b] +c[,d] @@` header into its four offsets.
-fn parse_hunk_header(line: &str) -> Option<(u64, u64, u64, u64)> {
-    let inner = line.strip_prefix("@@ ")?.split_once("@@")?.0;
-    let mut parts = inner.split_whitespace();
-    let old = parts.next()?.strip_prefix('-')?;
-    let new = parts.next()?.strip_prefix('+')?;
-    let (old_start, old_len) = parse_hunk_range(old)?;
-    let (new_start, new_len) = parse_hunk_range(new)?;
-    Some((old_start, old_len, new_start, new_len))
-}
-
-fn parse_hunk_range(text: &str) -> Option<(u64, u64)> {
-    if let Some((start, len)) = text.split_once(',') {
-        Some((start.parse().ok()?, len.parse().ok()?))
-    } else {
-        Some((text.parse().ok()?, 1))
-    }
-}
-
-fn collect_hunk(
-    lines: &[&str],
-    start: usize,
+/// One parsed `@@ -a[,b] +c[,d] @@` header, with length
+/// explicitness (EXPORT-E11).
+struct HunkHeader {
     old_start: u64,
     old_len: u64,
     new_start: u64,
     new_len: u64,
-) -> (ParsedHunk, usize) {
+    explicit: HunkLenExplicit,
+}
+
+/// Parse an `@@ -a[,b] +c[,d] @@` header into offsets plus the
+/// `,length` explicitness bits (EXPORT-E11).
+///
+/// A third range (combined-diff style) or a missing closing `@@`
+/// rejects the header, like PHP's full-anchored hunk regex
+/// (EXPORT-E15).
+fn parse_hunk_header(line: &str) -> Option<HunkHeader> {
+    let inner = line.strip_prefix("@@ ")?.split_once("@@")?.0;
+    let mut parts = inner.split_whitespace();
+    let old = parts.next()?.strip_prefix('-')?;
+    let new = parts.next()?.strip_prefix('+')?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let (old_start, old_len, old_explicit) = parse_hunk_range(old)?;
+    let (new_start, new_len, new_explicit) = parse_hunk_range(new)?;
+    Some(HunkHeader {
+        old_start,
+        old_len,
+        new_start,
+        new_len,
+        explicit: HunkLenExplicit {
+            old_explicit,
+            new_explicit,
+        },
+    })
+}
+
+fn parse_hunk_range(text: &str) -> Option<(u64, u64, bool)> {
+    if let Some((start, len)) = text.split_once(',') {
+        if len.contains(',') {
+            return None;
+        }
+        Some((start.parse().ok()?, len.parse().ok()?, true))
+    } else {
+        Some((text.parse().ok()?, 1, false))
+    }
+}
+
+/// True for a line that ends a hunk body without being consumed:
+/// any `@`-led line (next header or combined hunk) or a block
+/// boundary. PHP's body `switch` ends the hunk (`hit_next_hunk`) on
+/// these and on any other unexpected first byte (`:950-994`); the
+/// leftovers end it via `hunk_line_action`.
+fn is_hunk_end_line(line: &str) -> bool {
+    line.starts_with('@') || is_block_end_line(line)
+}
+
+/// First byte driving the hunk body loop. Empty lines count as
+/// context (`diff.suppressBlankEmpty`, `:940-947`).
+fn hunk_first_byte(line: &str) -> u8 {
+    if line.is_empty() {
+        b' '
+    } else {
+        line.as_bytes()[0]
+    }
+}
+
+/// True for a well-formed `\ No newline at end of file` marker
+/// (EXPORT-E15). PHP searches unanchored (`:951`), so any line whose
+/// first byte is `\` and which contains the marker text qualifies.
+fn is_no_newline_marker(line: &str) -> bool {
+    line.as_bytes().first() == Some(&b'\\') && line.contains("No newline at end of file")
+}
+
+/// One hunk body line's effect on the length countdown.
+enum HunkLineAction {
+    /// `+` line: consumes one new line.
+    Add,
+    /// `-` line: consumes one old line.
+    Del,
+    /// ` ` (or empty) line: consumes one line on each side.
+    Context,
+    /// `\` marker: validated and stored by the caller.
+    Backslash,
+    /// End the hunk, holding the line (`-` past zero, anything else).
+    EndHold,
+    /// End the hunk, consuming the line (` ` past zero counts).
+    EndConsumed,
+}
+
+/// Validate and store one `\` marker line, returning whether the
+/// hunk ends (new side exhausted, EXPORT-E15).
+fn collect_hunk_backslash(
+    line: &str,
+    raw: &[&str],
+    index: usize,
+    new_rem: i64,
+    corpus: &mut String,
+) -> Result<bool, String> {
+    if !is_no_newline_marker(line) {
+        return Err(diff_parse_error(raw, index, EXPECTED_NO_NEWLINE_MARKER));
+    }
+    corpus.push_str(raw[index]);
+    Ok(new_rem == 0)
+}
+
+/// Classify one hunk body line against the remaining counts
+/// (EXPORT-E15).
+fn hunk_line_action(line: &str, old_rem: i64, new_rem: i64) -> HunkLineAction {
+    match hunk_first_byte(line) {
+        b'\\' => HunkLineAction::Backslash,
+        b'+' => HunkLineAction::Add,
+        b'-' => {
+            if old_rem == 0 {
+                HunkLineAction::EndHold
+            } else {
+                HunkLineAction::Del
+            }
+        }
+        b' ' => {
+            if old_rem == 0 && new_rem == 0 {
+                HunkLineAction::EndConsumed
+            } else {
+                HunkLineAction::Context
+            }
+        }
+        _ => HunkLineAction::EndHold,
+    }
+}
+
+/// Collect one hunk body from `start + 1`, length-driven like PHP's
+/// `parseChangeset()` loop (`:939-997`, EXPORT-E15).
+///
+/// `lines` drives matching while `raw` (same indices, endings kept)
+/// supplies the corpus bytes, so original line endings are retained
+/// (EXPORT-E12). Count mismatches fail with PHP's
+/// `didFailParse()` texts; a hunk ends early on `@` lines and block
+/// boundaries (held, not consumed) or on a ` ` line past exhausted
+/// counts (consumed, like PHP).
+fn collect_hunk(
+    lines: &[&str],
+    raw: &[&str],
+    start: usize,
+    header: &HunkHeader,
+) -> Result<(ParsedHunk, usize), String> {
+    let mut old_rem = i64::try_from(header.old_len).unwrap_or(i64::MAX);
+    let mut new_rem = i64::try_from(header.new_len).unwrap_or(i64::MAX);
     let mut corpus = String::new();
-    corpus.push_str(lines[start]);
-    corpus.push('\n');
     let mut index = start + 1;
     while index < lines.len() {
         let line = lines[index];
-        if line.starts_with("@@ ")
-            || line.starts_with("@@@")
-            || is_diff_header(line)
-            || is_combined_diff_header(line)
-            || line.starts_with("commit ")
-        {
+        if is_hunk_end_line(line) {
             break;
         }
-        corpus.push_str(line);
-        corpus.push('\n');
-        index += 1;
+        match hunk_line_action(line, old_rem, new_rem) {
+            HunkLineAction::Backslash => {
+                let end = collect_hunk_backslash(line, raw, index, new_rem, &mut corpus)?;
+                index += 1;
+                if end {
+                    break;
+                }
+            }
+            HunkLineAction::Add => {
+                new_rem -= 1;
+                corpus.push_str(raw[index]);
+                index += 1;
+            }
+            HunkLineAction::Del => {
+                old_rem -= 1;
+                corpus.push_str(raw[index]);
+                index += 1;
+            }
+            HunkLineAction::Context => {
+                old_rem -= 1;
+                new_rem -= 1;
+                corpus.push_str(raw[index]);
+                index += 1;
+            }
+            HunkLineAction::EndConsumed => {
+                index += 1;
+                break;
+            }
+            HunkLineAction::EndHold => break,
+        }
     }
-    (
-        ParsedHunk {
-            old_start,
-            old_len,
-            new_start,
-            new_len,
-            corpus,
-        },
-        index,
-    )
+    if old_rem != 0 || new_rem != 0 {
+        return Err(diff_parse_error(raw, index, WRONG_HUNK_LINE_COUNT));
+    }
+    let hunk = ParsedHunk {
+        old_start: header.old_start,
+        old_len: header.old_len,
+        new_start: header.new_start,
+        new_len: header.new_len,
+        corpus,
+        // Ordinary parsed hunks count from the corpus (T1153 EXPORT-E20:
+        // only synthetic rewrites carry pre-rewrite counts).
+        synthetic_counts: None,
+    };
+    Ok((hunk, index))
 }
 
 /* -(  Raw Sources, Hg, Svn (G1 full-state)  )----------------------------------- */
@@ -3373,7 +4788,7 @@ pub fn read_raw_stdin_from<R: std::io::Read>(mut reader: R) -> Result<String, St
 pub fn shell_command_output(command: &str) -> Result<std::process::Output, String> {
     #[cfg(windows)]
     {
-        let mut cmd = std::process::Command::new("cmd");
+        let mut cmd = crate::proc_env::command("cmd");
         cmd.args(["/C"]);
         <std::process::Command as std::os::windows::process::CommandExt>::raw_arg(
             &mut cmd, command,
@@ -3383,7 +4798,7 @@ pub fn shell_command_output(command: &str) -> Result<std::process::Output, Strin
     }
     #[cfg(not(windows))]
     {
-        std::process::Command::new("sh")
+        crate::proc_env::command("sh")
             .args(["-c", command])
             .output()
             .map_err(|e| format!("failed to run shell command: {e}"))
@@ -3396,7 +4811,7 @@ pub fn shell_command_output(command: &str) -> Result<std::process::Output, Strin
 pub fn shell_command_status(command: &str) -> Result<std::process::ExitStatus, String> {
     #[cfg(windows)]
     {
-        let mut cmd = std::process::Command::new("cmd");
+        let mut cmd = crate::proc_env::command("cmd");
         cmd.args(["/C"]);
         <std::process::Command as std::os::windows::process::CommandExt>::raw_arg(
             &mut cmd, command,
@@ -3406,7 +4821,7 @@ pub fn shell_command_status(command: &str) -> Result<std::process::ExitStatus, S
     }
     #[cfg(not(windows))]
     {
-        std::process::Command::new("sh")
+        crate::proc_env::command("sh")
             .args(["-c", command])
             .status()
             .map_err(|e| format!("failed to run shell command: {e}"))
@@ -3490,6 +4905,33 @@ pub fn get_hg_branch_name(dir: &Path) -> Result<String, String> {
 pub fn get_hg_branch_name_with(dir: &Path, hg_cmd: &hg::HgCommand) -> Result<String, String> {
     let out = hg::stdout_text_with(dir, hg_cmd, &["branch"])?;
     Ok(out.trim().to_string())
+}
+
+/// Active hg bookmark (`bookmark`), if any.
+///
+/// DIFF-D19: PHP reads this through the bundled `arc-hg` extension
+/// (`getActiveBookmark()`, `ArcanistMercurialAPI.php:891-905`); the
+/// native `hg bookmarks` table marks the same bookmark with `*`, which
+/// this parses instead (the extension is not bundled; see LAND-25).
+pub fn get_hg_active_bookmark_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+) -> Result<Option<String>, String> {
+    let out = hg::stdout_text_with(dir, hg_cmd, &["bookmarks"])?;
+    Ok(parse_hg_active_bookmark(&out))
+}
+
+/// The `*`-marked row of `hg bookmarks` output, if any.
+#[must_use]
+pub fn parse_hg_active_bookmark(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let name = line.strip_prefix('*')?.trim_start();
+        let name = name.split_whitespace().next()?;
+        if name.is_empty() {
+            return None;
+        }
+        Some(name.to_string())
+    })
 }
 
 /// `hg status --rev <since>` argv (`ArcanistMercurialAPI.php:275-278`).
@@ -3997,7 +5439,8 @@ pub fn truncate_preview_64(saved: &str) -> String {
 /// the `Message begins:` block (`:1376-1380`).
 #[must_use]
 pub fn saved_message_notice(where_path: &str, preview: &str) -> String {
-    let block = if preview.is_empty() {
+    // PHP tests `if ($preview)`: `""` and `"0"` both omit the block.
+    let block = if preview.is_empty() || preview == "0" {
         String::new()
     } else {
         format!("{MESSAGE_BEGINS}\n\n       {preview}\n\n")
@@ -4473,6 +5916,9 @@ pub fn svn_skeleton_change(root: &Path, path: &str, flags: u32) -> ParsedChange 
         change_type,
         file_type,
         hunks: Vec::new(),
+        hunk_len_explicit: Vec::new(),
+        old_mode: None,
+        new_mode: None,
         away_paths: Vec::new(),
         commit_hash: None,
         message: None,
@@ -4638,6 +6084,9 @@ fn fresh_origin_change(origin: &str) -> ParsedChange {
         change_type: TYPE_CHANGE,
         file_type: FILE_TEXT,
         hunks: Vec::new(),
+        hunk_len_explicit: Vec::new(),
+        old_mode: None,
+        new_mode: None,
         away_paths: Vec::new(),
         commit_hash: None,
         message: None,
@@ -5136,7 +6585,8 @@ pub fn resolve_saved_template<R: BufRead, W: Write>(
     let Some(saved) = diff::read_scratch_file(metadata_dir, SCRATCH_CREATE_MESSAGE) else {
         return Ok(None);
     };
-    if saved.is_empty() {
+    // PHP tests `if ($saved)`: `""` and `"0"` are both falsy.
+    if saved.is_empty() || saved == "0" {
         return Ok(None);
     }
     let preview = truncate_preview_64(&saved);
@@ -5196,6 +6646,11 @@ fn select_reviewer_users<'a>(
     users: &'a serde_json::Value,
     reviewers: &[&str],
 ) -> Vec<&'a serde_json::Value> {
+    // PHP iterates the `user.query` result rows directly (`:1649-1652`);
+    // orsay returns a list, older servers a PHID-keyed map.
+    if let serde_json::Value::Array(items) = users {
+        return items.iter().collect();
+    }
     let mut out = Vec::new();
     if let serde_json::Value::Object(map) = users {
         for phid in reviewers {
@@ -5419,7 +6874,9 @@ fn echo_saved_copy_note<W: Write>(writer: &mut W, where_path: &str) -> Result<()
 /// (skips the editor on the first pass for non-default templates).
 /// Returns the parsed, pulled, validated message.
 /// Produce the next create-message draft: the verbatim template on the
-/// first pass, else one editor round-trip with comment stripping.
+/// first pass, else one editor round-trip. Both paths strip `#`
+/// comments (`:1486`), and the default check compares the raw editor
+/// output against the commented template (`:1483-1485`).
 fn next_create_template<R: BufRead, W: Write>(
     editor: &CreateMessageEditor<'_, R, W>,
     template: &str,
@@ -5429,15 +6886,14 @@ fn next_create_template<R: BufRead, W: Write>(
     template_is_default: bool,
 ) -> Result<String, String> {
     if first && verbatim && !template_is_default {
-        return Ok(template.to_string());
+        return Ok(remove_comments(template));
     }
     let edit_text = build_editor_template(template, issues);
     let edited = (editor.edit)(&edit_text)?;
-    let stripped = remove_comments(&edited);
-    if template_is_default && stripped == template {
+    if template_is_default && edited == edit_text {
         return Err(TEMPLATE_NOT_EDITED.to_string());
     }
-    Ok(stripped)
+    Ok(remove_comments(&edited))
 }
 
 pub fn edit_create_message<R: BufRead, W: Write>(
@@ -5487,34 +6943,28 @@ fn short_commit_hash(hash: &str) -> String {
     hash.chars().take(12).collect()
 }
 
-/// One default-field message outcome.
-enum CreateFieldOutcome {
-    /// Pulled fields.
-    Fields(CommitFields),
-    /// Parse-failure note lines.
-    Notes(Vec<String>),
-}
-
 /// Parse one message for default fields (`:1874-1886`).
 ///
+/// Returns the pulled fields plus any parse-failure note lines.
 /// Usage errors from the corpus parser and transport failures propagate;
-/// conduit parser errors become note lines (verbatim rethrows the first).
+/// conduit parser errors become note lines (verbatim rethrows the first)
+/// while the partial fields still merge (`:1876`).
 fn parse_create_message_fields(
     call: &diff_submit::ConduitCall<'_>,
     hash: &str,
     message: &str,
     verbatim: bool,
-) -> Result<CreateFieldOutcome, String> {
+) -> Result<(CommitFields, Vec<String>), String> {
     let mut parsed = CommitMessage::new_from_raw_corpus(message)?;
     match parsed.pull_data_from_conduit(call, true) {
-        Ok(()) => Ok(CreateFieldOutcome::Fields(parsed.fields)),
+        Ok(()) => Ok((parsed.fields, Vec::new())),
         Err(PullDataError::Parser(errors)) => {
             if verbatim {
                 return Err(errors.into_iter().next().unwrap_or_default());
             }
             let mut notes = vec![commit_parse_note(&short_commit_hash(hash))];
             notes.extend(errors.iter().map(|error| format!("  - {error}")));
-            Ok(CreateFieldOutcome::Notes(notes))
+            Ok((parsed.fields, notes))
         }
         Err(PullDataError::Other(error)) => Err(error),
     }
@@ -5561,10 +7011,9 @@ pub fn get_default_create_fields_with(
     let mut dicts = Vec::new();
     let mut notes = Vec::new();
     for (hash, message, _) in &messages {
-        match parse_create_message_fields(call, hash, message, verbatim)? {
-            CreateFieldOutcome::Fields(dict) => dicts.push(dict),
-            CreateFieldOutcome::Notes(mut lines) => notes.append(&mut lines),
-        }
+        let (dict, mut lines) = parse_create_message_fields(call, hash, message, verbatim)?;
+        dicts.push(dict);
+        notes.append(&mut lines);
     }
     let mut fields = merge_fields_oldest_first(&dicts);
     if create {
@@ -5618,7 +7067,7 @@ pub fn get_commit_message_from_revision_with<R: BufRead, W: Write>(
     }
     check_revision_ownership(reader, writer, &row, user_phid)?;
     let is_draft = row.get("statusName").and_then(serde_json::Value::as_str) == Some("Draft");
-    let params = diff_submit::get_commit_message_edit_params(id_arg);
+    let params = diff_submit::commit_message_from_revision_params(id_arg);
     let template = call(diff_submit::METHOD_GET_COMMIT_MESSAGE, &params)?;
     let Some(corpus) = template.as_str() else {
         return Err(FAILED_TO_RETRIEVE_TEMPLATE.to_string());

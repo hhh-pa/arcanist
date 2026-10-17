@@ -6,8 +6,9 @@
 //! (expansion, [`expand`]), and the `src/runtime/ArcanistRuntime.php`
 //! dispatch (shell execution, hint application). The list and delete bodies
 //! follow the pre-toolset `src/workflow/ArcanistAliasWorkflow.php`
-//! (`70c6045c~1`), since the toolset versions on master are `TOOLSETS`
-//! stubs returning 1.
+//! (`70c6045c~1`), since the toolset versions at ceb are `TOOLSETS`
+//! stubs returning 1 silently (T1153 CORE-26, kept: PHP's silent
+//! stubs; Rust implements both).
 //!
 //! Aliases live under the top-level `aliases` key of `~/.arcrc`, read from
 //! every file source (system, user, project, local, least to most specific,
@@ -20,10 +21,10 @@ use std::process::ExitCode;
 
 use crate::terminal::PhtArg;
 use crate::{
-    amend, anoid, bookmarks, branches, browse, close_revision, commit, config, cover, diff,
-    download, export, get_config, inspect, install_certificate, land, liberate, lint, linters,
-    list, look, markers, paste, patch, prompt, set_config, tasks, terminal, todo, unit, upgrade,
-    upload, version, weld, which, work,
+    amend, anoid, bookmarks, branches, browse, close_revision, commit, conduit, config, cover,
+    diff, download, export, get_config, inspect, install_certificate, land, liberate, lint,
+    linters, list, look, markers, paste, patch, prompt, set_config, tasks, terminal, todo, unit,
+    upgrade, upload, version, weld, which, work,
 };
 
 /// Subcommand name, matching `arc alias`.
@@ -35,20 +36,93 @@ pub const TOOLSET: &str = "arc";
 /// Maximum alias-chain depth, mirroring `ArcanistAliasEngine`.
 const STACK_LIMIT: usize = 16;
 
-const USAGE: &str = "usage: arc alias [--json]\n\
-       arc alias <name>\n\
-       arc alias <name> <target> -- [arguments]\n\
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `crate::help` module; this file keeps only the data (ceb
+/// `src/toolset/workflow/ArcanistAliasWorkflow.php:17-71`).
+const HELP_EXAMPLES: &str = "**alias**\n**alias** __command__ __target__ -- [__arguments__]";
+const HELP_SYNOPSIS: &str = "Create and modify command aliases.";
+const HELP_TEXT: &str = "Create an alias from __command__ to __target__ (optionally, with __options__).\n\
 \n\
-Create and modify command aliases.\n\
+Aliases allow you to create shorthands for commands and sets of flags you\n\
+commonly use, like defining \"arc draft\" as a shorthand for \"arc diff --draft\".\n\
 \n\
-With no arguments, list aliases. With one argument, delete that alias\n\
-(after confirmation). With two or more, define <name> as a shorthand\n\
-for <target> with [arguments]; use \"--\" before any flags meant for\n\
-the target. A target starting with \"!\" runs as a shell command.\n\
+**Creating Aliases**\n\
 \n\
-Options:\n\
-  --json            Output aliases in JSON format (listing only).\n\
-  -h, --help        Show this help.\n";
+You can define \"arc draft\" as a shorthand for \"arc diff --draft\" like this:\n\
+\n\
+\x20 $ arc alias draft diff -- --draft\n\
+\n\
+Now, when you run \"arc draft\", the command will function like\n\
+\"arc diff --draft\".\n\
+\n\
+<bg:yellow> NOTE: </bg> Make sure you use \"--\" before specifying any flags you\n\
+want to pass to the command! Otherwise, the flags will be interpreted as flags\n\
+to \"arc alias\".\n\
+\n\
+**Listing Aliases**\n\
+\n\
+Without any arguments, \"arc alias\" will list aliases.\n\
+\n\
+**Removing Aliases**\n\
+\n\
+To remove an alias, run:\n\
+\n\
+\x20 $ arc alias <alias-name>\n\
+\n\
+You will be prompted to remove the alias.\n\
+\n\
+**Shell Commands**\n\
+\n\
+If you begin an alias with \"!\", the remainder of the alias will be invoked as\n\
+a shell command. For example, if you want to implement \"arc ls\", you can do so\n\
+like this:\n\
+\n\
+\x20 $ arc alias ls '!ls'\n\
+\n\
+When run, \"arc ls\" will now behave like \"ls\".\n\
+\n\
+**Multiple Toolsets**\n\
+\n\
+This workflow supports any toolset, even though the examples in this help text\n\
+use \"arc\". If you are working with another toolset, use the binary for that\n\
+toolset define aliases for it:\n\
+\n\
+\x20 $ phage alias ...\n\
+\n\
+Aliases are bound to the toolset which was used to define them. If you define\n\
+an \"arc draft\" alias, that does not also define a \"phage draft\" alias.\n\
+\n\
+**Builtins**\n\
+\n\
+You can not overwrite the behavior of builtin workflows, including \"alias\"\n\
+itself, and if you install a new workflow it will take precedence over any\n\
+existing aliases with the same name.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] =
+    &[("json", None, None, "Output aliases in JSON format.")];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &specs,
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
+}
 
 /// Every command `main` dispatches without aliases: the `COMMANDS` table
 /// plus `call-conduit` (parsed by `classify`) and `help` (also handled by
@@ -99,6 +173,39 @@ const BUILTINS: &[&str] = &[
 #[must_use]
 pub fn builtin_names() -> &'static [&'static str] {
     BUILTINS
+}
+
+/// The 21 workflows the toolset runtime serves in-process at ceb
+/// (`newWorkflows()`: `ArcanistArcWorkflow` subclasses plus the five
+/// `src/toolset/workflow/` commands), alphabetical. The classic
+/// subprocess serves the other 16; `markers` is abstract in PHP
+/// (`browse` is concrete, T1153 CORE-66) and `arc` itself is not a
+/// command.
+#[must_use]
+pub fn toolset_names() -> &'static [&'static str] {
+    &[
+        "alias",
+        "amend",
+        "anoid",
+        "bookmarks",
+        "branches",
+        "browse",
+        "call-conduit",
+        "download",
+        "help",
+        "inspect",
+        "land",
+        "liberate",
+        "look",
+        "paste",
+        "prompts",
+        "shell-complete",
+        "upload",
+        "upgrade",
+        "version",
+        "weld",
+        "work",
+    ]
 }
 
 /// True when `name` is a builtin command (PHP `isset($workflows[$name])`).
@@ -200,7 +307,9 @@ fn parse_entry(key: &str, value: &serde_json::Value) -> Result<Alias, String> {
 }
 
 /// Warning for an invalid alias entry, mirroring the engine's
-/// `EFFECT_CONFIGURATION` message.
+/// `EFFECT_CONFIGURATION` message (T1153 CORE-24, kept: PHP
+/// references the undefined constant and fatals; Rust warns and
+/// ignores).
 fn invalid_warning(source: &str, detail: &str) -> String {
     terminal::pht(
         "Configuration source (\"%s\") defines an invalid alias, which will be ignored: %s",
@@ -287,7 +396,9 @@ pub fn load_aliases_in(
         &mut warnings,
     )?;
     if let Some(path) = user_file {
-        let user = get_config::read_user_file(path)?;
+        // T1153 CORE-28: toolset workflows read the user file through the
+        // `ArcanistUserConfigurationSource` transform (section wins).
+        let user = get_config::read_user_file_toolset(path)?;
         take_source(
             &user,
             &format!("user ({})", path.display()),
@@ -579,26 +690,50 @@ pub fn shell_status_exit_code(status: ShellStatus) -> ExitCode {
     }
 }
 
+/// One stderr hint line, mirroring `ArcanistLogEngine::writeHint()`
+/// (cyan label, message, no trailing newline — the caller prints lines).
+fn hint_notice(label: &str, message: &str) -> String {
+    terminal::format_log("cyan", label, message, terminal::ansi_enabled())
+        .trim_end()
+        .to_string()
+}
+
+/// Build the spawner argv for a resolved shell alias: on Unix the words
+/// run through `sh -c` (PHP `proc_open()` mediates the shell, so
+/// metacharacters expand and unknown commands exit 127); elsewhere the
+/// words spawn directly (PHP `bypass_shell` on Windows).
+fn shell_spawn_argv(shell_argv: &[String]) -> (String, Vec<String>) {
+    if cfg!(unix) {
+        (
+            "sh".to_string(),
+            vec!["-c".to_string(), terminal::shell_join(shell_argv)],
+        )
+    } else {
+        match shell_argv.split_first() {
+            Some((program, args)) => (program.clone(), args.to_vec()),
+            None => (String::new(), Vec::new()),
+        }
+    }
+}
+
 /// Run a resolved shell alias through an injected spawner, mirroring
 /// `ArcanistRuntime::executeShellAlias()` (hint first, then execute).
 /// Returns the exit code plus stderr lines in order; the caller prints
 /// each line. A spawn failure reports `cannot execute shell alias` and
-/// fails (PHP throws an uncaught `Failed to passthru proc_open()` here,
-/// which Rust softens to a reported failure).
+/// fails (T1153 CORE-29, kept: PHP throws an uncaught `Failed to
+/// passthru proc_open()` here, which Rust softens to a reported
+/// failure).
 pub fn run_shell_alias_with(
     shell_argv: &[String],
     hint: &str,
     spawn: impl FnOnce(&str, &[String]) -> Result<ShellStatus, String>,
 ) -> (ExitCode, Vec<String>) {
-    let mut notices = vec![format!("SHELL ALIAS: {hint}")];
-    let Some((program, args)) = shell_argv.split_first() else {
-        notices.push("arc: empty shell alias".to_string());
-        return (ExitCode::FAILURE, notices);
-    };
-    match spawn(program, args) {
+    let mut notices = vec![hint_notice("SHELL ALIAS", hint)];
+    let (program, args) = shell_spawn_argv(shell_argv);
+    match spawn(&program, &args) {
         Ok(status) => (shell_status_exit_code(status), notices),
         Err(error) => {
-            notices.push(format!("arc: cannot execute shell alias: {error}"));
+            notices.push(format!("cannot execute shell alias: {error}"));
             (ExitCode::FAILURE, notices)
         }
     }
@@ -623,10 +758,12 @@ pub fn apply_expansion_with(
     let Some((aliases, warnings)) = load() else {
         return (Ok(argv), Vec::new());
     };
-    let mut notices: Vec<String> = warnings.iter().map(|w| format!("ALIAS: {w}")).collect();
+    // T1153 CORE-23: every effect message surfaces as a cyan `ALIAS`
+    // hint on stderr (`applyAliasEffects()` + `writeHint()`).
+    let mut notices: Vec<String> = warnings.iter().map(|w| hint_notice("ALIAS", w)).collect();
     match expand(&argv, &aliases, is_builtin_command) {
         Expansion::Dispatch { argv: next, hints } => {
-            notices.extend(hints.iter().map(|h| format!("ALIAS: {h}")));
+            notices.extend(hints.iter().map(|h| hint_notice("ALIAS", h)));
             (Ok(next), notices)
         }
         Expansion::Shell { argv: shell, hint } => {
@@ -638,9 +775,12 @@ pub fn apply_expansion_with(
             notices.append(&mut shell_notices);
             (Err(code), notices)
         }
+        // T1153 CORE-27 (kept): a broken chain (dangling, cyclic,
+        // too deep) fails fast with the cyan hints, instead of PHP's
+        // legacy fallthrough to the unknown-command error.
         Expansion::Failed { message, hints } => {
-            notices.extend(hints.iter().map(|h| format!("ALIAS: {h}")));
-            notices.push(format!("arc: {message}"));
+            notices.extend(hints.iter().map(|h| hint_notice("ALIAS", h)));
+            notices.push(hint_notice("ALIAS", &message));
             (Err(ExitCode::FAILURE), notices)
         }
     }
@@ -717,8 +857,24 @@ pub struct Options {
 
 /// Parse `argv` (excluding the subcommand name).
 ///
-/// Returns `Ok(None)` when `--help` was requested.
+/// Returns `Ok(None)` when `--help` was requested. A lone `-` is
+/// positional (T1153 RB-D6); `--json` rejects repeats and `=value`
+/// with the toolset texts (T1153 RB-D2/T1153 RB-D25). The unknown-flag text
+/// stays the legacy `unknown flag` wording (locked by contract tests;
+/// PHP reports `Argument "--x" is unrecognized. ...`).
 pub fn parse_args(argv: &[String]) -> Result<Option<Options>, String> {
+    parse_args_with_tty(argv, crate::prompt::stdin_is_terminal())
+}
+
+/// [`parse_args`] with an injected TTY flag (deterministic tests).
+/// T1153 B21/B23: piped runs without `--` fail with
+/// `MISSING_TERMINATOR` (checked after unknown-flag scanning, like
+/// PHP's `parseFull()`, but before success). `--help` without `--`
+/// when piped reports the terminator. Vs ceb
+/// `ArcanistRuntime.php:80-86,172-188` and
+/// `PhutilArgumentParser.php:331-336`.
+fn parse_args_with_tty(argv: &[String], stdin_tty: bool) -> Result<Option<Options>, String> {
+    let missing = crate::help::terminator_missing(argv, stdin_tty);
     let mut json = false;
     let mut positional = Vec::new();
     let mut end_of_flags = false;
@@ -728,14 +884,28 @@ pub fn parse_args(argv: &[String]) -> Result<Option<Options>, String> {
         } else if arg == "--" {
             end_of_flags = true;
         } else if arg == "--json" {
+            if json {
+                return Err("Argument \"--json\" was provided twice.".to_string());
+            }
             json = true;
         } else if arg == "-h" || arg == "--help" {
+            if missing {
+                return Err(crate::help::MISSING_TERMINATOR.to_string());
+            }
             return Ok(None);
+        } else if arg == "-" {
+            positional.push(arg.clone());
         } else if arg.starts_with('-') {
+            if arg.starts_with("--json=") {
+                return Err("Argument \"--json\" does not take a parameter.".to_string());
+            }
             return Err(format!("unknown flag '{arg}'"));
         } else {
             positional.push(arg.clone());
         }
+    }
+    if missing {
+        return Err(crate::help::MISSING_TERMINATOR.to_string());
     }
     Ok(Some(Options { json, positional }))
 }
@@ -821,8 +991,10 @@ pub fn execute_list(dir: &Path, user_file: Option<&Path>, json: bool) -> Result<
     Ok(Report { text, warnings })
 }
 
-/// Define `trigger` as `command` in `user_file`, replacing any previous
-/// same-toolset definition (which the engine would shadow anyway).
+/// Define `trigger` as `command` in `user_file`, appending silently
+/// like `runCreateAlias()` (T1153 CORE-25): duplicates accumulate (the
+/// engine last-wins with `IGNORED` hints at expansion), shell aliases
+/// included, and nothing confirms on stdout.
 pub fn execute_create(
     user_file: &Path,
     trigger: &str,
@@ -832,7 +1004,6 @@ pub fn execute_create(
     let mut doc = set_config::read_user_doc(user_file)?;
     let source = format!("user ({})", user_file.display());
     let (mut entries, warnings) = user_entries(&doc, &source)?;
-    entries.retain(|entry| !matches_target(entry, trigger));
     entries.push(
         Alias {
             toolset: TOOLSET.to_string(),
@@ -846,26 +1017,8 @@ pub fn execute_create(
         .expect("read_user_doc object")
         .insert("aliases".to_string(), serde_json::Value::Array(entries));
     set_config::write_user_doc(user_file, &doc)?;
-    let joined = command.join(" ");
-    let message = if is_shell_command(command) {
-        terminal::pht(
-            "Aliased \"%s\" to shell command \"%s\".",
-            &[
-                PhtArg::Text(&format!("arc {trigger}")),
-                PhtArg::Text(&joined[1..]),
-            ],
-        )
-    } else {
-        terminal::pht(
-            "Aliased \"%s\" to \"%s\".",
-            &[
-                PhtArg::Text(&format!("arc {trigger}")),
-                PhtArg::Text(&format!("arc {joined}")),
-            ],
-        )
-    };
     Ok(Report {
-        text: format!("{message}\n"),
+        text: String::new(),
         warnings,
     })
 }
@@ -944,27 +1097,40 @@ fn print_report(report: &Report) {
 }
 
 /// Entry point: `argv` excludes the subcommand name.
+///
+/// `alias` is a toolset workflow, so errors use the toolset arms:
+/// parse errors are bold usage errors (the `parse()` catch), while
+/// `runWorkflow()` usage errors (bad `--json`, builtin triggers)
+/// carry the red label. Config I/O failures escape like uncaught
+/// exceptions (fatal); a declined delete aborts like
+/// `ArcanistUserAbortException`.
 pub fn run(argv: &[String]) -> ExitCode {
     let options = match parse_args(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", usage());
             return ExitCode::SUCCESS;
         }
         Err(message) => {
-            eprintln!("arc {NAME}: {message}\n\n{USAGE}");
-            return ExitCode::FAILURE;
+            // T1153 B21/B23: the terminator failure prints the three
+            // cyan hints first (like `ArcanistRuntime.php:172-188`)
+            // and reports through the toolset usage arm (exit 1);
+            // other parse errors keep the bold parse-error arm.
+            if message == crate::help::MISSING_TERMINATOR {
+                crate::help::print_terminator_hints(crate::terminal::ansi_enabled());
+                return conduit::report(conduit::EnvelopeKind::ToolsetUsage, &message);
+            }
+            return conduit::report(conduit::EnvelopeKind::ToolsetParseError, &message);
         }
     };
     if options.json && !options.positional.is_empty() {
-        eprintln!(
-            "arc {NAME}: {}",
-            terminal::pht(
-                "The \"--json\" argument may only be used when listing aliases.",
-                &[]
-            )
+        return conduit::report(
+            conduit::EnvelopeKind::ToolsetUsage,
+            &terminal::pht(
+                "The \"--json\" argument can only be used to list aliases.",
+                &[],
+            ),
         );
-        return ExitCode::FAILURE;
     }
     if options.positional.is_empty() {
         return run_list(&options);
@@ -982,20 +1148,14 @@ fn run_list(options: &Options) -> ExitCode {
             print_report(&report);
             ExitCode::SUCCESS
         }
-        Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            ExitCode::FAILURE
-        }
+        Err(message) => conduit::report(conduit::EnvelopeKind::Fatal, &message),
     }
 }
 
 fn run_delete(options: &Options) -> ExitCode {
     let user_file = match user_file_or_error() {
         Ok(path) => path,
-        Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            return ExitCode::FAILURE;
-        }
+        Err(message) => return conduit::report(conduit::EnvelopeKind::Fatal, &message),
     };
     let stdin = std::io::stdin();
     let mut locked = stdin.lock();
@@ -1010,29 +1170,29 @@ fn run_delete(options: &Options) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            ExitCode::FAILURE
+            if message == prompt::ABORT {
+                conduit::report(conduit::EnvelopeKind::UserAbort, &message)
+            } else {
+                conduit::report(conduit::EnvelopeKind::Fatal, &message)
+            }
         }
     }
 }
 
 fn run_create(options: &Options) -> ExitCode {
+    if let Err(message) = validate_trigger(&options.positional[0]) {
+        return conduit::report(conduit::EnvelopeKind::ToolsetUsage, &message);
+    }
     let user_file = match user_file_or_error() {
         Ok(path) => path,
-        Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            return ExitCode::FAILURE;
-        }
+        Err(message) => return conduit::report(conduit::EnvelopeKind::Fatal, &message),
     };
     match execute_create(&user_file, &options.positional[0], &options.positional[1..]) {
         Ok(report) => {
             print_report(&report);
             ExitCode::SUCCESS
         }
-        Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            ExitCode::FAILURE
-        }
+        Err(message) => conduit::report(conduit::EnvelopeKind::Fatal, &message),
     }
 }
 

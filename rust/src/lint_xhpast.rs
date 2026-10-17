@@ -43,7 +43,7 @@
 extern crate self as arc_rs;
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use arc_rs::lint::{
     LintMessage, Linter, OptionContext, SEVERITY_ADVICE, SEVERITY_DISABLED, SEVERITY_ERROR,
@@ -354,7 +354,7 @@ fn staged_name(display_path: &str) -> String {
 }
 
 fn run_tool(binary: &Path, file: &Path) -> Option<(i32, String, String)> {
-    let mut command = Command::new(binary);
+    let mut command = crate::proc_env::command(binary);
     command.args(command_flags()).arg(file).stdin(Stdio::null());
     let output = arc_rs::lint::spawn_with_retry(&mut command).ok()?;
     let code = output.status.code().unwrap_or(1);
@@ -409,6 +409,11 @@ fn emit(path: &str, tree: &xhp_ast::Tree, finding: &xhp_ast::RawFinding) -> Lint
         description: finding.message.clone(),
         original: None,
         replacement: None,
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     }
 }
 
@@ -439,6 +444,11 @@ fn unable_to_parse(path: &str, exit_code: i32, stderr: &str) -> LintMessage {
         description,
         original: None,
         replacement: None,
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     }
 }
 
@@ -490,6 +500,11 @@ fn syntax_error(path: &str, stderr: &str, line: usize) -> LintMessage {
         description,
         original: None,
         replacement: None,
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     }
 }
 

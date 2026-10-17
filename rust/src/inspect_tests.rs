@@ -58,23 +58,27 @@ fn init_repo(tag: &str) -> TempDir {
 
 #[test]
 fn parses_explore_objects_and_separators() {
+    // T1153 B21/B23: TTY runs need no `--`.
     assert_eq!(
-        parse_args(&args(&[])),
+        parse_args_with_tty(&args(&[]), true),
         ParseOutcome::Args(Options {
             explore: false,
             objects: Vec::new(),
         })
     );
     assert_eq!(
-        parse_args(&args(&["--explore", "--", "working-copy(HEAD)"])),
+        parse_args_with_tty(&args(&["--explore", "--", "working-copy(HEAD)"]), true),
         ParseOutcome::Args(Options {
             explore: true,
             objects: vec!["working-copy(HEAD)".to_string()],
         })
     );
-    assert_eq!(parse_args(&args(&["--help"])), ParseOutcome::Help);
     assert_eq!(
-        parse_args(&args(&["--bogus"])),
+        parse_args_with_tty(&args(&["--help"]), true),
+        ParseOutcome::Help
+    );
+    assert_eq!(
+        parse_args_with_tty(&args(&["--bogus"]), true),
         ParseOutcome::Error("unknown flag '--bogus'".to_string())
     );
 }
@@ -188,13 +192,21 @@ fn inspects_single_objects() {
     git(tmp.path(), &["commit", "-m", "first subject"]);
     let head = git(tmp.path(), &["rev-parse", "HEAD"]);
 
+    // T1153 RB-D14: without `--explore` the raw argument renders
+    // unresolved; exploration resolves and loads the message.
     let block = inspect_one(tmp.path(), "working-copy(HEAD)", false).unwrap();
-    assert!(block.contains(&format!("Commit \"{head}\"")));
+    assert!(block.contains("Commit \"HEAD\""), "{block}");
     let explored = inspect_one(tmp.path(), "working-copy(HEAD)", true).unwrap();
+    assert!(
+        explored.contains(&format!("Commit \"{head}\"")),
+        "{explored}"
+    );
     assert!(explored.contains("first subject"));
 
     assert!(inspect_one(tmp.path(), "working-copy", false).is_err());
     assert!(inspect_one(tmp.path(), "browse", false).is_err());
+    assert!(inspect_one(tmp.path(), "working-copy(a,b)", false).is_err());
+    assert!(inspect_one(tmp.path(), "browse(a,b)", false).is_err());
 
     let block = inspect_one(tmp.path(), "browse(HEAD)", false).unwrap();
     assert!(
@@ -210,10 +222,140 @@ fn inspects_single_objects() {
         "{block}"
     );
 
-    let unknown = inspect_one(tmp.path(), "commit(HEAD)", false).unwrap_err();
-    assert!(unknown.contains("Unknown object type \"commit\""));
-    assert!(unknown.contains("browse, working-copy"));
+    // T1153 RB-D13: `commit(...)` is a known type now.
+    let block = inspect_one(tmp.path(), "commit(HEAD)", false).unwrap();
+    assert!(
+        block.contains("+ [ArcanistCommitSymbolRef] Commit Symbol \"HEAD\""),
+        "{block}"
+    );
+    let explored = inspect_one(tmp.path(), "commit(HEAD)", true).unwrap();
+    assert!(
+        explored.contains(&format!("Commit \"{head}\"")),
+        "{explored}"
+    );
+    assert!(explored.contains("first subject"), "{explored}");
+
+    let unknown = inspect_one(tmp.path(), "frobnicate(HEAD)", false).unwrap_err();
+    assert!(unknown.contains("Unknown object type \"frobnicate\""));
+    for name in [
+        "browse",
+        "working-copy",
+        "commit",
+        "user",
+        "remote",
+        "revision",
+        "task",
+    ] {
+        assert!(unknown.contains(name), "{unknown}");
+    }
     assert!(inspect_one(tmp.path(), "not valid!", false).is_err());
+}
+
+#[test]
+fn rbd14_working_copy_needs_no_repo_without_explore() {
+    let dir = std::env::temp_dir().join(format!("arc-rs-rbd14-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let block = inspect_one(&dir, "working-copy(HEAD)", false).unwrap();
+    assert!(block.contains("Working Copy State"), "{block}");
+    assert!(block.contains("Commit \"HEAD\""), "{block}");
+    assert!(inspect_one(&dir, "working-copy(HEAD)", true).is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn rbd13_symbols_users_and_remotes_render() {
+    let tmp = init_repo("symbols");
+    git(
+        tmp.path(),
+        &["remote", "add", "origin", "https://example.test/r.git"],
+    );
+    // Simple symbols resolve eagerly (IDs, monograms with PHP's
+    // `(int)` quirk, and PHIDs); anything else is a usage error.
+    let block = inspect_one(tmp.path(), "revision(D123)", false).unwrap();
+    assert!(
+        block.contains("+ [ArcanistRevisionSymbolRef] Revision Symbol \"0\""),
+        "{block}"
+    );
+    assert!(
+        block.contains(" o [ArcanistScalarHardpoint] ref.symbol.object"),
+        "{block}"
+    );
+    let block = inspect_one(tmp.path(), "revision(123)", false).unwrap();
+    assert!(block.contains("Revision Symbol \"123\""), "{block}");
+    let block = inspect_one(tmp.path(), "task(PHID-TASK-abc)", false).unwrap();
+    assert!(block.contains("Task Symbol \"PHID-TASK-abc\""), "{block}");
+    let err = inspect_one(tmp.path(), "revision(abc)", false).unwrap_err();
+    assert!(
+        err.contains("The format of symbol \"abc\" is unrecognized"),
+        "{err}"
+    );
+    assert!(is_toolset_usage_message(&err));
+    let err = inspect_one(tmp.path(), "revision(1,2)", false).unwrap_err();
+    assert!(err.contains("Expected exactly one argument"), "{err}");
+
+    let block = inspect_one(tmp.path(), "user(@alice)", false).unwrap();
+    assert!(block.contains("User Symbol \"alice\""), "{block}");
+    let block = inspect_one(tmp.path(), "user(viewer())", false).unwrap();
+    assert!(block.contains("User Symbol \"viewer()\""), "{block}");
+    let err = inspect_one(tmp.path(), "user(a b)", false).unwrap_err();
+    assert!(err.contains("The format of user symbol"), "{err}");
+    assert!(is_toolset_usage_message(&err));
+
+    let block = inspect_one(tmp.path(), "remote(origin)", false).unwrap();
+    assert!(
+        block.contains("+ [ArcanistRemoteRef] Remote \"origin\""),
+        "{block}"
+    );
+    assert!(
+        block.contains(" o [ArcanistObjectListHardpoint] arc.remote.repositoryRefs"),
+        "{block}"
+    );
+    let err = inspect_one(tmp.path(), "remote(missing)", false).unwrap_err();
+    assert!(
+        err.contains("This working copy has no remote named \"missing\""),
+        "{err}"
+    );
+    assert!(is_toolset_usage_message(&err));
+}
+
+#[test]
+fn rbd13_remote_outside_repo_is_not_implemented() {
+    let dir = std::env::temp_dir().join(format!("arc-rs-rbd13-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let err = inspect_one(&dir, "remote(origin)", false).unwrap_err();
+    assert_eq!(
+        err,
+        "Method newRemoteRefQueryTemplate in class ArcanistFilesystemAPI is not implemented!"
+    );
+    assert!(!is_toolset_usage_message(&err));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn rbd15_commit_explore_resolves_and_loads() {
+    let tmp = init_repo("commitsym");
+    std::fs::write(tmp.path().join("f.txt"), "one\n").unwrap();
+    git(tmp.path(), &["add", "f.txt"]);
+    git(tmp.path(), &["commit", "-m", "first subject"]);
+    git(tmp.path(), &["tag", "-a", "-m", "annotated", "v1"]);
+
+    // Unknown and non-commit symbols attach null, rendering `*`
+    // with an empty value — quietly, like PHP.
+    for symbol in ["missing", "v1"] {
+        let block = inspect_one(tmp.path(), &format!("commit({symbol})"), true).unwrap();
+        assert!(
+            block.contains(" * [ArcanistScalarHardpoint] ref.symbol.object"),
+            "{block}"
+        );
+        assert!(block.contains("  > \"\""), "{block}");
+    }
+    // Newlines are fatal, with the c-escaped symbol.
+    let err = inspect_one(tmp.path(), "commit(a\nb)", true).unwrap_err();
+    assert!(
+        err.contains("Commit symbol \"a\\nb\" contains a newline"),
+        "{err}"
+    );
+    assert!(!is_toolset_usage_message(&err));
 }
 
 #[test]
@@ -223,38 +365,50 @@ fn run_in_lists_types_and_joins_blocks() {
     git(tmp.path(), &["add", "f.txt"]);
     git(tmp.path(), &["commit", "-m", "first subject"]);
 
+    // T1153 B21/B23: piped runs carry `--`; `--bogus` stays bare to
+    // lock that scan errors report before the terminator check.
     assert_eq!(
-        run_in(tmp.path(), &args(&[])),
+        run_in(tmp.path(), &args(&["--"])),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(
-        run_in(tmp.path(), &args(&["working-copy(HEAD)"])),
+        run_in(tmp.path(), &args(&["--", "working-copy(HEAD)"])),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(
         run_in(
             tmp.path(),
-            &args(&["--explore", "working-copy(HEAD)", "working-copy(HEAD)"])
+            &args(&[
+                "--explore",
+                "--",
+                "working-copy(HEAD)",
+                "working-copy(HEAD)"
+            ])
         ),
         std::process::ExitCode::SUCCESS
     );
+    // T1153 RB-D13: `commit(...)` renders now.
     assert_eq!(
-        run_in(tmp.path(), &args(&["commit(HEAD)"])),
-        std::process::ExitCode::FAILURE
+        run_in(tmp.path(), &args(&["--", "commit(HEAD)"])),
+        std::process::ExitCode::SUCCESS
     );
     assert_eq!(
         run_in(tmp.path(), &args(&["--bogus"])),
         std::process::ExitCode::FAILURE
     );
     assert_eq!(
-        run_in(tmp.path(), &args(&["--help"])),
+        run_in(tmp.path(), &args(&["--help", "--"])),
         std::process::ExitCode::SUCCESS
     );
 }
 
 #[test]
 fn run_reports_help_and_usage_errors() {
-    assert_eq!(run(&args(&["--help"])), std::process::ExitCode::SUCCESS);
+    // T1153 B21/B23: piped runs carry `--`.
+    assert_eq!(
+        run(&args(&["--help", "--"])),
+        std::process::ExitCode::SUCCESS
+    );
     assert_eq!(run(&args(&["--bogus"])), std::process::ExitCode::FAILURE);
 }
 
@@ -300,6 +454,7 @@ fn explores_browse_tokens_through_the_engine() {
     );
 
     // End to end through run_in_with with an injected caller.
+    // T1153 B21/B23: piped runs carry `--`.
     let mut routes = HashMap::new();
     routes.insert("repository.query".to_string(), serde_json::json!([]));
     routes.insert("phid.lookup".to_string(), serde_json::json!({}));
@@ -313,14 +468,14 @@ fn explores_browse_tokens_through_the_engine() {
     assert_eq!(
         run_in_with(
             tmp.path(),
-            &args(&["--explore", "browse(HEAD)"]),
+            &args(&["--explore", "--", "browse(HEAD)"]),
             Some(&call)
         ),
         std::process::ExitCode::SUCCESS
     );
     // Without --explore, no Conduit is needed at all.
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["browse(HEAD)"]), None),
+        run_in_with(tmp.path(), &args(&["--", "browse(HEAD)"]), None),
         std::process::ExitCode::SUCCESS
     );
 }
@@ -340,4 +495,100 @@ fn ref_trees_carry_no_markup() {
     let out = render_browse(tmp.path(), "branch", false, None).unwrap();
     assert!(!out.contains('\x1b'), "{out}");
     assert!(!out.contains("**"), "{out}");
+}
+
+#[test]
+fn r4_rbd4_spec_errors_are_toolset_usage() {
+    // Malformed specs and unknown types are toolset usage (exit 1);
+    // bad commits escape into a fatal (255).
+    assert!(is_toolset_usage_message(
+        "Object specification \"x(y\" is unknown, expected a specification like \"commit(HEAD)\"."
+    ));
+    assert!(is_toolset_usage_message(
+        "Unknown object type \"zzz\", supported types are: browse, working-copy."
+    ));
+    assert!(is_toolset_usage_message(
+        "Expected exactly one argument to \"working-copy(...)\" with a commit hash."
+    ));
+    assert!(!is_toolset_usage_message("unknown commit \"zzz\"."));
+    // T1153 B21/B23: piped runs carry `--`.
+    let tmp = TempDir::new("r4-spec");
+    assert_eq!(
+        run_in(tmp.path(), &args(&["--", "not a spec!!"])),
+        std::process::ExitCode::FAILURE
+    );
+}
+#[test]
+fn r10_inspect_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "INSPECT WORKFLOW\n\
+         \n\
+         inspect [options] -- object\n\
+         Show internal object information.\n\
+         \n\
+         Inspect internal object properties.\n\
+         \n\
+         \x20     --explore\n\
+         \x20         Load all object hardpoints.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("INSPECT WORKFLOW"), "{}", usage());
+}
+
+#[test]
+fn b21_inspect_requires_terminator_when_piped() {
+    // T1153 B21/B23: piped without `--` reports the terminator, even
+    // for `--help` and empty argv. Unknown flags still report first.
+    assert!(matches!(
+        parse_args_with_tty(&args(&["working-copy(HEAD)"]), false),
+        ParseOutcome::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&args(&["--help"]), false),
+        ParseOutcome::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&args(&[]), false),
+        ParseOutcome::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&args(&["--bogus"]), false),
+        ParseOutcome::Error(_)
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&args(&["--", "working-copy(HEAD)"]), false),
+        ParseOutcome::Args(_)
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&args(&["working-copy(HEAD)"]), true),
+        ParseOutcome::Args(_)
+    ));
+    assert_eq!(
+        crate::help::MISSING_TERMINATOR,
+        "Missing required \"--\" in argument list."
+    );
+}
+
+#[test]
+fn b23_inspect_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help inspect`.
+    let text = usage_text(false);
+    assert!(text.starts_with("INSPECT WORKFLOW\n"), "{text}");
+    assert!(
+        text.contains("Inspect internal object properties."),
+        "{text}"
+    );
+    assert!(text.contains("--explore"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }

@@ -282,16 +282,18 @@ fn pep8_runs_fake_tool_end_to_end() {
 
 #[test]
 fn pyflakes_runs_fake_tool_end_to_end() {
+    // T1153 LINT-33: canonical `path:line:col: desc` form; ceb PHP has
+    // no column group, so the char is null (0).
     let fake = FakeTool::with_output(
         "pyflakes",
         "pyflakes",
-        "target.py:1:1 undefined name foo\n",
+        "target.py:1:1: undefined name foo\n",
         false,
     );
     let messages = lint_pyflakes::lint_with_binary("pkg/mod.py", b"x = 1\n", Some(&fake.tool));
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].path, "pkg/mod.py");
-    assert_eq!((messages[0].line, messages[0].col), (1, 1));
+    assert_eq!((messages[0].line, messages[0].col), (1, 0));
     assert_eq!(messages[0].code, "PYFLAKES");
     assert_eq!(messages[0].severity, "error");
 }
@@ -342,4 +344,55 @@ fn ruby_runs_fake_tool_end_to_end() {
     assert_eq!((messages[0].line, messages[0].col), (2, 1));
     assert_eq!(messages[0].code, "RUBY");
     assert_eq!(messages[0].severity, "error");
+}
+
+// -( T1153 Wave 2: lint retrocompat )--------------------------------------
+
+#[test]
+#[cfg(unix)]
+fn lint45_pyflakes_bin_flags_version_apply() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // T1153 LINT-45 (locks the CLEAN verdict): per-linter tool options
+    // reach the spawned tool. The fake records its argv, answers
+    // `--version`, and prints one finding otherwise.
+    let dir =
+        std::env::temp_dir().join(format!("arc-rs-lint45-{}-{}", std::process::id(), line!()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let tool = dir.join("pyflakes.sh");
+    std::fs::write(
+        &tool,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> \"{}/argv.txt\"\n\
+             if [ \"$1\" = \"--version\" ]; then echo 3.1.0; exit 0; fi\n\
+             echo 'target.py:1:1: undefined name foo'\nexit 1\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let bin = tool.display().to_string();
+
+    let configured = format!(
+        "{{\"linters\": {{\"p\": {{\"type\": \"pyflakes\", \"bin\": \"{bin}\", \
+         \"flags\": [\"--select=E\"], \"version\": \">= 1.0\"}}}}}}"
+    );
+    let config = arc_rs::arclint::parse_arclint(&configured).unwrap();
+    let engine = lint::Engine::from_config(&config, Path::new(".")).unwrap();
+    let messages = engine.lint_bytes("pkg/mod.py", b"x = 1\n");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].description, "undefined name foo");
+    let argv = std::fs::read_to_string(dir.join("argv.txt")).unwrap();
+    assert!(argv.contains("--select=E"), "{argv}");
+
+    // An unsatisfiable version gates the linter off.
+    let gated = format!(
+        "{{\"linters\": {{\"p\": {{\"type\": \"pyflakes\", \"bin\": \"{bin}\", \
+         \"version\": \">= 99.99\"}}}}}}"
+    );
+    let config = arc_rs::arclint::parse_arclint(&gated).unwrap();
+    let engine = lint::Engine::from_config(&config, Path::new(".")).unwrap();
+    assert!(engine.lint_bytes("pkg/mod.py", b"x = 1\n").is_empty());
+
+    std::fs::remove_dir_all(&dir).ok();
 }

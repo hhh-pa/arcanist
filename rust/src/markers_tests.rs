@@ -82,16 +82,37 @@ fn help_returns_none() {
 
 #[test]
 fn rejects_bad_arguments() {
-    let err = parse_options(&args(&["--bogus"])).unwrap_err();
-    assert!(err.contains("unknown flag"), "unexpected: {err}");
-    let err = parse_options(&args(&["feature"])).unwrap_err();
-    assert!(err.contains("unexpected argument"), "unexpected: {err}");
-    let err = parse_options(&args(&["--"])).unwrap_err();
-    assert!(err.contains("unexpected argument"), "unexpected: {err}");
-    let err = parse_options(&args(&["--type"])).unwrap_err();
-    assert!(err.contains("requires a value"), "unexpected: {err}");
-    let err = parse_options(&args(&["--conduit-uri"])).unwrap_err();
-    assert!(err.contains("requires a value"), "unexpected: {err}");
+    // T1153 LAND-42: toolset parse texts (`PhutilArgumentParser`).
+    assert_eq!(
+        parse_options(&args(&["--bogus"])).unwrap_err(),
+        "Argument \"--bogus\" is unrecognized. Use \"--\" to indicate the end of flags."
+    );
+    assert_eq!(
+        parse_options(&args(&["feature"])).unwrap_err(),
+        "Unrecognized argument \"feature\"."
+    );
+    assert_eq!(
+        parse_options(&args(&["--type"])).unwrap_err(),
+        "Argument \"--type\" requires a parameter."
+    );
+    assert_eq!(
+        parse_options(&args(&["--conduit-uri"])).unwrap_err(),
+        "Argument \"--conduit-uri\" requires a parameter."
+    );
+    assert_eq!(
+        parse_options(&args(&["--json=x"])).unwrap_err(),
+        "Argument \"--json\" does not take a parameter."
+    );
+    assert_eq!(
+        parse_options(&args(&["--json", "--json"])).unwrap_err(),
+        "Argument \"--json\" was provided twice."
+    );
+    // Parse errors precede workflow validation: the unknown flag
+    // wins over the bad `--type`.
+    assert_eq!(
+        parse_options(&args(&["--type", "tag", "--bogus"])).unwrap_err(),
+        "Argument \"--bogus\" is unrecognized. Use \"--\" to indicate the end of flags."
+    );
     let err = parse_options(&args(&["--type", "tag"])).unwrap_err();
     assert!(
         err.contains("unknown marker type 'tag'"),
@@ -99,6 +120,8 @@ fn rejects_bad_arguments() {
     );
     let err = parse_options(&args(&["--type=Tag"])).unwrap_err();
     assert!(err.contains("unknown marker type"), "unexpected: {err}");
+    // A lone `--` terminates flags and parses clean.
+    assert!(parse_options(&args(&["--"])).unwrap().is_some());
 }
 
 #[test]
@@ -251,7 +274,64 @@ fn rejects_unknown_hg_ls_marker_types() {
         "Call to \"hg arc-ls-markers\" returned marker of unknown type \"tag\"."
     );
     assert!(parse_hg_ls_markers("oops").is_err());
-    assert!(parse_hg_ls_markers(r#"[{"type": "branch"}]"#).is_err());
+}
+
+#[test]
+fn land27_nameless_hg_markers_proceed() {
+    // T1153 LAND-27 / T1153 RB-D34: PHP reads `name`/`node` unchecked,
+    // so markers without them proceed with empty strings; without
+    // `description` (T1153 RB-D39) no message attaches and the summary
+    // stays empty.
+    let markers = parse_hg_ls_markers(r#"[{"type": "branch"}]"#).unwrap();
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].name, "");
+    assert_eq!(markers[0].commit_hash, "");
+    assert_eq!(markers[0].summary, "");
+    assert_eq!(markers[0].message, None);
+}
+
+#[test]
+fn land26_failed_hg_call_renders_command_exception() {
+    // A nonzero exit throws like PHP's future: the `CommandException`
+    // dump carries the command plus stdout/stderr sections, never
+    // bare stderr. (`git` stands in as a portable failing `hg`.)
+    let dir = std::env::temp_dir().join(format!("arc-rs-land26-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join(".hg")).unwrap();
+    let hg = crate::hg::HgCommand::custom("git", &["definitely-not-a-git-command"]);
+    let err = query_hg_markers_with(&dir, &hg, "branch").unwrap_err();
+    assert!(
+        err.starts_with("Command failed with error #1!\nCOMMAND\n"),
+        "unexpected error: {err}"
+    );
+    assert!(err.contains("\nSTDOUT\n(empty)\n\nSTDERR\n"), "{err}");
+    assert!(err.contains("not a git command"), "{err}");
+    assert!(err.contains("arc-ls-markers"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn land26_command_sections_truncate_like_php() {
+    assert_eq!(summarize_command_section(""), "(empty)");
+    assert_eq!(summarize_command_section("abc"), "abc");
+    // A 1001-byte section keeps everything: the cut (1) is shorter
+    // than the suffix, so PHP skips truncation.
+    let near = "x".repeat(1001);
+    assert_eq!(summarize_command_section(&near), near);
+    // Past that, the head plus a grouped tail remain.
+    let far = "y".repeat(2500);
+    assert_eq!(
+        summarize_command_section(&far),
+        format!("{}... (1,500 more byte(s)) ...", "y".repeat(1000))
+    );
+}
+
+#[test]
+fn land25_bundled_extension_materializes() {
+    // Outside any checkout the bundled `arc-hg.py` copy resolves,
+    // with the compiled-in bytes on disk.
+    let script = materialize_bundled_arc_hg().unwrap();
+    assert_eq!(std::fs::read_to_string(&script).unwrap(), ARC_HG_BUNDLED);
+    assert!(arc_hg_script(std::env::temp_dir().as_path()).is_some());
 }
 
 #[test]
@@ -312,10 +392,14 @@ fn resolves_types_against_detected_vcs() {
 
 #[test]
 fn usage_covers_options() {
+    // T1153 B21/B23 KEPT (Rule 2b): `markers` is abstract at ceb
+    // (`ArcanistMarkersWorkflow` has no concrete workflow, so there
+    // are no generated help bytes to match); the custom usage stays.
     let text = usage();
     assert!(text.contains("usage: arc markers"));
     assert!(text.contains("--type") && text.contains("--json"));
     assert!(text.contains("--conduit-uri"));
+    assert!(!text.contains("MARKERS WORKFLOW"), "{text}");
 }
 
 fn revision(id: u32, phid: &str, title: &str, published: bool) -> revision::RevisionRef {
@@ -560,4 +644,175 @@ fn styled_rows_carry_escapes_only_on_tty() {
         status.contains("\x1b[32mNeeds Review\x1b[39m"),
         "got: {status}"
     );
+}
+
+#[test]
+fn r4_rbd4_toolset_usage_matcher() {
+    // Support-gate, outside-repo, limit, and bad-type errors are
+    // toolset usage (exit 1); query failures escape into a fatal.
+    assert!(is_toolset_usage_message(
+        "not inside a working copy (no git repository or Mercurial '.hg' directory found)"
+    ));
+    assert!(is_toolset_usage_message("not inside a git repository"));
+    assert!(is_toolset_usage_message(
+        "The version control system (\"svn\") in the current working copy does not support branches."
+    ));
+    assert!(is_toolset_usage_message(
+        "Found more than 1,000 unpublished commits which are ancestors of heads."
+    ));
+    assert!(is_toolset_usage_message("unknown marker type 'zzz'"));
+    assert!(!is_toolset_usage_message("failed to run git: boom"));
+    assert!(!is_toolset_usage_message("boom"));
+}
+
+#[test]
+fn r4_rbd4_parse_error_has_no_dump() {
+    match execute(&std::env::temp_dir(), &args(&["--bogus"])) {
+        Err(message) => assert!(!message.contains("usage:"), "{message}"),
+        _ => panic!("expected parse error"),
+    }
+    assert_eq!(
+        run_in(&std::env::temp_dir(), &args(&["--bogus"])),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+fn repository_hit(name: &str, uri: &str, rules: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "phid": format!("PHID-REPO-{name}"),
+        "fields": {
+            "name": name,
+            "refRules": {"permanentRefRules": rules},
+        },
+        "attachments": {
+            "uris": {
+                "uris": [
+                    {"fields": {"uri": {"effective": uri}}},
+                ],
+            },
+        },
+    })
+}
+
+fn remote_with_push(name: &str, push: &str) -> RemoteRef {
+    RemoteRef {
+        name: name.to_string(),
+        fetch_uri: None,
+        push_uri: Some(push.to_string()),
+    }
+}
+
+#[test]
+fn rbd30_repo_collision_last_wins() {
+    // Both repos claim the push URI; PHP's `$uri_map` overwrite keeps
+    // the LAST one, so `master` is permanent only via the second hit.
+    let repositories = vec![
+        revision::RepositoryRef::from_search_hit(&repository_hit(
+            "first",
+            "git@h.test:repo.git",
+            &[],
+        )),
+        revision::RepositoryRef::from_search_hit(&repository_hit(
+            "second",
+            "git@h.test:repo.git",
+            &["master"],
+        )),
+    ];
+    let remote = remote_with_push("origin", "git@h.test:repo.git");
+    assert!(is_permanent_git_ref(&repositories, &remote, "master"));
+    assert!(!is_permanent_git_ref(&repositories, &remote, "feature"));
+    // Reversed, the empty rule set (match-all) wins instead.
+    let reversed = vec![repositories[1].clone(), repositories[0].clone()];
+    assert!(is_permanent_git_ref(&reversed, &remote, "feature"));
+}
+
+#[test]
+fn land23_loads_fail_without_conduit() {
+    // Without a client the hardpoint loads fail like PHP instead
+    // of yielding empty annotation.
+    let states = vec![StateCommit {
+        hash: "abc".to_string(),
+        message: String::new(),
+    }];
+    let err = load_revision_refs(None, &states).unwrap_err();
+    assert!(
+        err.contains("This command needs to communicate with Phabricator"),
+        "unexpected: {err}"
+    );
+    let err = load_revision_refs_for_vcs(None, &states, "hg").unwrap_err();
+    assert!(
+        err.contains("This command needs to communicate with Phabricator"),
+        "unexpected: {err}"
+    );
+}
+
+#[test]
+fn land24_hash_pairs_use_vcs_kind() {
+    let states = vec![StateCommit {
+        hash: "abc".to_string(),
+        message: String::new(),
+    }];
+    assert_eq!(hash_pair_kind("git"), "gtcm");
+    assert_eq!(hash_pair_kind("hg"), "hgcm");
+    assert_eq!(
+        state_hash_pairs(&states, hash_pair_kind("git")),
+        vec![("gtcm".to_string(), "abc".to_string())]
+    );
+    assert_eq!(
+        state_hash_pairs(&states, hash_pair_kind("hg")),
+        vec![("hgcm".to_string(), "abc".to_string())]
+    );
+    assert_eq!(strip_pair_prefix("hgcm:abc", "hgcm"), Some("abc"));
+    assert_eq!(strip_pair_prefix("gtcm:abc", "hgcm"), None);
+    assert_eq!(strip_pair_prefix("hgcmX:abc", "hgcm"), None);
+}
+
+#[test]
+fn rbd32_revision_ref_lists_key_by_phid() {
+    // `mergeHardpointValues` keys by PHID with first-wins: duplicate
+    // PHIDs collapse, and PHID-less refs collapse onto the `""` key
+    // instead of accumulating.
+    let mut merged = std::collections::HashMap::from([("abc".to_string(), Vec::new())]);
+    let first =
+        revision::RevisionRef::from_query_row(&serde_json::json!({"id": 1, "phid": "PHID-DREV-1"}));
+    let dupe =
+        revision::RevisionRef::from_query_row(&serde_json::json!({"id": 1, "phid": "PHID-DREV-1"}));
+    let other =
+        revision::RevisionRef::from_query_row(&serde_json::json!({"id": 2, "phid": "PHID-DREV-2"}));
+    let bare_a = revision::RevisionRef::from_query_row(&serde_json::json!({"id": 3}));
+    let bare_b = revision::RevisionRef::from_query_row(&serde_json::json!({"id": 4}));
+    for reference in [&first, &dupe, &other, &bare_a, &bare_b] {
+        push_revision_ref_once(&mut merged, "abc", reference);
+    }
+    let ids: Vec<u32> = merged["abc"].iter().map(|r| r.id()).collect();
+    assert_eq!(ids, vec![1, 2, 3]);
+    // Unknown hashes are ignored, like PHP's `$map` miss.
+    push_revision_ref_once(&mut merged, "zzz", &other);
+    assert!(!merged.contains_key("zzz"));
+}
+
+#[test]
+fn b21_markers_terminator_gate_stays_global() {
+    // T1153 B21/B23 KEPT (Rule 2b): `markers` is abstract at ceb
+    // (Rust-only extra, no PHP workflow), so there is no per-command
+    // terminator behavior to match. The library parse takes no TTY
+    // input and succeeds without `--`; the binary gate still covers
+    // `arc markers` when piped (`main.rs needs_terminator_error`,
+    // `TOOLSET_EXTRA_COMMANDS`).
+    assert!(parse_options(&args(&[])).unwrap().is_some());
+    assert_eq!(parse_options(&args(&["--help"])).unwrap(), None);
+    assert!(
+        parse_options(&args(&["--type", "branch"]))
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn b23_markers_help_stays_custom() {
+    // T1153 B21/B23 KEPT (Rule 2b): abstract at ceb, so the custom
+    // usage stays instead of generated workflow help.
+    let text = usage();
+    assert!(text.starts_with("usage: arc markers"), "{text}");
+    assert!(!text.contains("WORKFLOW"), "{text}");
 }

@@ -17,9 +17,19 @@
 //! carries markup, `pht()` sites use `pht`, help wrapping uses
 //! `console_wrap`, and markup-free `sprintf` sites use plain `format!`.
 //!
-//! Deviation: project-config lookup walks up from the working directory
-//! instead of reading only the VCS root, so `get-config` keeps working
-//! outside repositories.
+//! Source precedence (`runtime --config` > local > project > user >
+//! system > default) is shared by every command through [`MergedConfig`]:
+//! `land` reads `arc.land.*`, `unit` reads `unit.engine`, and conduit-URI
+//! discovery reads `phabricator.uri` (falling back to `default`) through
+//! [`load_merged`] plus [`merged_value`] or [`checked_value`]. The merge
+//! ports `ArcanistConfigurationManager::getConfigFromAllSources()` (the
+//! flow every classic workflow runs at ceb) with the
+//! `ArcanistConfigurationEngine` source list folded in: `--config-file`
+//! shadows system+user like the engine, `--arcrc-file` redirects the user
+//! file like the manager, and `--config` pairs apply classic
+//! `applyRuntimeArcConfig()` semantics (last wins, unknown keys allowed).
+//! Display (`render`, `all_keys`) covers the five static sources only:
+//! stock `get-config` never shows runtime values.
 
 // A crate cannot name itself in `use` (E0432), so alias the current crate
 // to keep the shared-helper paths (`arc_rs::git`, `arc_rs::config`)
@@ -31,28 +41,57 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use arc_rs::terminal::{PhtArg, TVal};
-use arc_rs::{config, git, terminal};
+use arc_rs::{config, set_config, terminal};
 
 /// Subcommand name, matching `arc get-config`.
 pub const NAME: &str = "get-config";
 
-const USAGE: &str = "usage: arc get-config [--verbose] [--] [NAME...]\n\
-\n\
-Read arc configuration. With no NAME, show all known and configured keys.\n\
-\n\
-Precedence (highest wins): local (.git/arc/config), project (.arcconfig),\n\
-user (~/.arcrc), system (/etc/arcconfig), default.\n\
-\n\
-Options:\n\
-  --verbose       Show detailed information about each option.\n\
-  --show-source   Alias for --verbose.\n\
-  -h, --help      Show this help.\n";
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not the short error-dump usage. The renderer is the shared
+/// `arc_rs::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistGetConfigWorkflow.php:12-36`).
+const HELP_SYNOPSIS: &str = "      **get-config** [__options__] -- [__name__ ...]";
+const HELP_TEXT: &str = "          Supports: cli\n          Reads an arc configuration option. With no argument, reads all\n          options.\n\n          With __--verbose__, shows detailed information about one or more\n          options.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[(
+    "verbose",
+    None,
+    None,
+    "Show detailed information about options.",
+)];
 
-const SOURCE_LOCAL: &str = "local";
-const SOURCE_PROJECT: &str = "project";
-const SOURCE_USER: &str = "user";
-const SOURCE_SYSTEM: &str = "system";
-const SOURCE_DEFAULT: &str = "default";
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<arc_rs::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    arc_rs::help::usage_text(
+        NAME,
+        None,
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &specs,
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(arc_rs::terminal::ansi_enabled())
+}
+
+/// Source name for `--config` runtime values in merged reads.
+pub const SOURCE_RUNTIME: &str = "runtime";
+
+/// Source names for merged reads (T1153 Wave-2 carry-over: `which`
+/// labels conduit sources from [`merged_value`]).
+pub const SOURCE_LOCAL: &str = "local";
+pub const SOURCE_PROJECT: &str = "project";
+pub const SOURCE_USER: &str = "user";
+pub const SOURCE_SYSTEM: &str = "system";
+pub const SOURCE_DEFAULT: &str = "default";
 
 const SOURCES: [&str; 5] = [
     SOURCE_LOCAL,
@@ -266,37 +305,97 @@ fn read_config_file(
         .ok_or_else(|| format!("'{}' is not a JSON object", path.display()))
 }
 
-/// Read the nearest enclosing `.arcconfig` above `dir`. The parse error
-/// mirrors `ArcanistWorkingCopyIdentity::parseRawConfigFile()`; the
-/// non-object rejection is arc-rs strictness (PHP tolerates it).
+/// Working-copy flavor, mirroring `ArcanistWorkingCopyIdentity`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VcsKind {
+    Git,
+    Hg,
+    Svn,
+}
+
+/// Locate the working-copy root enclosing `dir`, mirroring
+/// `ArcanistWorkingCopyIdentity::newFromPathWithConfig()`: the innermost
+/// directory holding `.git`, `.hg`, or `.svn` wins (`.git` first per
+/// directory, like PHP's `$try` order). Pure filesystem checks, so a bare
+/// marker directory counts exactly like PHP's `pathExists()`.
+#[must_use]
+pub fn find_vcs_root(dir: &Path) -> Option<(VcsKind, PathBuf)> {
+    for ancestor in dir.ancestors() {
+        if ancestor.join(".git").exists() {
+            return Some((VcsKind::Git, ancestor.to_path_buf()));
+        }
+        if ancestor.join(".hg").exists() {
+            return Some((VcsKind::Hg, ancestor.to_path_buf()));
+        }
+        if ancestor.join(".svn").exists() {
+            return Some((VcsKind::Svn, ancestor.to_path_buf()));
+        }
+    }
+    None
+}
+
+/// Read the project `.arcconfig` for `dir`, mirroring
+/// `ArcanistWorkingCopyIdentity::newFromPathWithConfig()`: git and
+/// Mercurial read `.arcconfig` ONLY at the working-copy root;
+/// Subversion takes the nearest `.arcconfig` from `dir` up to the root;
+/// outside any working copy there is no project config at all, so a stray
+/// `.arcconfig` in a plain directory is ignored like PHP ignores it.
+/// The parse error mirrors `parseRawConfigFile()`; the non-object
+/// rejection is arc-rs strictness (PHP tolerates it).
 pub fn read_project_config(
     dir: &Path,
 ) -> Result<(Option<PathBuf>, serde_json::Map<String, serde_json::Value>), String> {
-    for ancestor in dir.ancestors() {
-        let file = ancestor.join(".arcconfig");
-        if !file.is_file() {
-            continue;
+    let Some((kind, root)) = find_vcs_root(dir) else {
+        return Ok((None, serde_json::Map::new()));
+    };
+    if kind == VcsKind::Svn {
+        for ancestor in dir.ancestors() {
+            let file = ancestor.join(".arcconfig");
+            if file.is_file() {
+                return read_project_file(&file);
+            }
+            if ancestor == root.as_path() {
+                break;
+            }
         }
-        let from_where = file.display().to_string();
-        let message = terminal::pht(
-            "Unable to parse '%s' file '%s'.",
-            &[PhtArg::Text(".arcconfig"), PhtArg::Text(&from_where)],
-        );
-        let map = read_config_file(&file, &message)?;
-        return Ok((Some(file), map));
+        return Ok((None, serde_json::Map::new()));
     }
-    Ok((None, serde_json::Map::new()))
+    let file = root.join(".arcconfig");
+    if !file.is_file() {
+        return Ok((None, serde_json::Map::new()));
+    }
+    read_project_file(&file)
 }
 
-/// Read the working copy's local config (`.git/arc/config`); empty outside
-/// a git repository. Only git is supported (see T1128). The parse error
-/// mirrors `readLocalArcConfig()`: `Failed to parse '%s' as JSON.`
+/// Read one project file, with the `parseRawConfigFile()` error text.
+fn read_project_file(
+    file: &Path,
+) -> Result<(Option<PathBuf>, serde_json::Map<String, serde_json::Value>), String> {
+    let from_where = file.display().to_string();
+    let message = terminal::pht(
+        "Unable to parse '%s' file '%s'.",
+        &[PhtArg::Text(".arcconfig"), PhtArg::Text(&from_where)],
+    );
+    let map = read_config_file(file, &message)?;
+    Ok((Some(file.to_path_buf()), map))
+}
+
+/// Read the working copy's local config (`arc/config` under the VCS
+/// metadata directory: `.git`, `.hg`, or `.svn` at the working-copy
+/// root, mirroring `ArcanistWorkingCopyIdentity::$localMetaDir`); empty
+/// outside a working copy. T1153 CORE-32: Mercurial and Subversion read
+/// like git. The parse error mirrors `readLocalArcConfig()`:
+/// `Failed to parse '%s' as JSON.`
 pub fn read_local_config(dir: &Path) -> Result<serde_json::Map<String, serde_json::Value>, String> {
-    if !git::is_inside_work_tree(dir) {
+    let Some((kind, root)) = find_vcs_root(dir) else {
         return Ok(serde_json::Map::new());
-    }
-    let top = git::stdout_text(dir, &["rev-parse", "--show-toplevel"])?;
-    let file = PathBuf::from(top).join(".git").join("arc").join("config");
+    };
+    let meta = match kind {
+        VcsKind::Git => ".git",
+        VcsKind::Hg => ".hg",
+        VcsKind::Svn => ".svn",
+    };
+    let file = root.join(meta).join("arc").join("config");
     if !file.is_file() {
         return Ok(serde_json::Map::new());
     }
@@ -306,12 +405,59 @@ pub fn read_local_config(dir: &Path) -> Result<serde_json::Map<String, serde_jso
 }
 
 /// Read the user config from a `~/.arcrc` file, mirroring PHP's
-/// `readUserArcConfig()`: the `config` object when present (plus the
-/// top-level `aliases` key), else the whole file -- including `hosts`,
-/// exactly like stock PHP, which never redacts credential-adjacent keys
-/// on this path. A missing file yields an empty config. The parse error
-/// mirrors `readUserConfigurationFile()`, including its literal `~/.arcrc`.
+/// `readUserArcConfig()`: ONLY the `config` object when present (T1153
+/// CORE-30: top-level siblings like `aliases` are dropped on this path),
+/// else the whole file -- including `hosts`, exactly like stock PHP,
+/// which never redacts credential-adjacent keys on this path. A missing
+/// file yields an empty config. The parse error mirrors
+/// `readUserConfigurationFile()`, including its literal `~/.arcrc`.
 pub fn read_user_file(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let obj = read_user_doc(path)?;
+    // Stock PHP returns the whole file when `isset($config['config'])` is
+    // false (missing or null); only a present, non-null section narrows
+    // the user config.
+    match obj.get("config") {
+        None | Some(serde_json::Value::Null) => Ok(obj),
+        Some(serde_json::Value::Object(config)) => Ok(config.clone()),
+        Some(_) => Err(format!(
+            "'{}' has a non-object \"config\" section",
+            path.display()
+        )),
+    }
+}
+
+/// Read the user config through the toolset transform, mirroring
+/// `ArcanistUserConfigurationSource::getAllValues()`: the `config`
+/// section plus every top-level key except `hosts` and `config` itself,
+/// with the section winning collisions (T1153 CORE-28: `$result +=
+/// $config` keeps the section's value). Toolset workflows (`alias`,
+/// `prompts`) read user config on this path; classic workflows use
+/// [`read_user_file`]. Load and shape errors match [`read_user_file`].
+pub fn read_user_file_toolset(
+    path: &Path,
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let obj = read_user_doc(path)?;
+    let mut map = match obj.get("config") {
+        None | Some(serde_json::Value::Null) => serde_json::Map::new(),
+        Some(serde_json::Value::Object(config)) => config.clone(),
+        Some(_) => {
+            return Err(format!(
+                "'{}' has a non-object \"config\" section",
+                path.display()
+            ));
+        }
+    };
+    for (key, value) in &obj {
+        if key != "hosts" && key != "config" && !map.contains_key(key) {
+            map.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(map)
+}
+
+/// Load a `~/.arcrc` file as a JSON object: missing files read empty,
+/// with the `readUserConfigurationFile()` parse error.
+fn read_user_doc(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     if !path.is_file() {
         return Ok(serde_json::Map::new());
     }
@@ -323,26 +469,9 @@ pub fn read_user_file(path: &Path) -> Result<serde_json::Map<String, serde_json:
             &[PhtArg::Text("~/.arcrc")],
         )
     })?;
-    let obj = doc
-        .as_object()
-        .ok_or_else(|| format!("'{}' is not a JSON object", path.display()))?;
-    // Stock PHP returns the whole file when `isset($config['config'])` is
-    // false (missing or null); only a present, non-null section narrows
-    // the user config.
-    let mut map = match obj.get("config") {
-        None | Some(serde_json::Value::Null) => obj.clone(),
-        Some(serde_json::Value::Object(config)) => config.clone(),
-        Some(_) => {
-            return Err(format!(
-                "'{}' has a non-object \"config\" section",
-                path.display()
-            ));
-        }
-    };
-    if let Some(aliases) = obj.get("aliases") {
-        map.insert("aliases".to_string(), aliases.clone());
-    }
-    Ok(map)
+    doc.as_object()
+        .cloned()
+        .ok_or_else(|| format!("'{}' is not a JSON object", path.display()))
 }
 
 /// Location of the system config, mirroring
@@ -382,6 +511,7 @@ pub fn read_system_config() -> Result<serde_json::Map<String, serde_json::Value>
 }
 
 /// Configuration from every source for one directory.
+#[derive(Debug, Clone)]
 pub struct Sources {
     pub local: serde_json::Map<String, serde_json::Value>,
     pub project: serde_json::Map<String, serde_json::Value>,
@@ -395,17 +525,142 @@ pub struct Sources {
 /// Load every source for `dir`. `user_file` is the `~/.arcrc` path (from
 /// [`config::arcrc_path`]); `None` skips the user source.
 pub fn load_sources(dir: &Path, user_file: Option<&Path>) -> Result<Sources, String> {
+    load_merged(dir, user_file, &LoadOptions::default()).map(|merged| merged.sources)
+}
+
+/// Overrides for a merged config load, mirroring the global flags PHP
+/// parses before dispatch (`scripts/arcanist.php` base args plus the
+/// `ArcanistRuntime` `--config-file`).
+#[derive(Debug, Clone, Default)]
+pub struct LoadOptions {
+    /// Parsed `--config key=value` pairs (coerced storage values), the
+    /// highest-precedence source.
+    pub runtime: serde_json::Map<String, serde_json::Value>,
+    /// `--config-file` paths: when non-empty they REPLACE the system and
+    /// user sources (`ArcanistConfigurationEngine.php:43-47`), merged in
+    /// order so later files win. A missing file reads empty, like PHP's
+    /// `pathExists()` guard.
+    pub config_files: Vec<PathBuf>,
+    /// `--arcrc-file` path: replaces `~/.arcrc` as the user file
+    /// (`ArcanistConfigurationManager::setUserConfigurationFileLocation()`).
+    /// A missing file is an error, like PHP.
+    pub arcrc_file: Option<PathBuf>,
+}
+
+impl LoadOptions {
+    /// Overlay the dispatcher's global `--config`/`--config-file`/
+    /// `--arcrc-file` (T1153 CORE-10/T1153 CORE-11 family): explicit per-command
+    /// values win (runtime per key, `arcrc_file` when set),
+    /// config-file lists concatenate (global first, later files win).
+    /// [`load_merged`] applies this, so globals reach every command.
+    #[must_use]
+    pub fn with_global(&self) -> LoadOptions {
+        let global = crate::config::global_load_options();
+        let mut runtime = global.runtime;
+        runtime.extend(self.runtime.clone());
+        let mut config_files = global.config_files;
+        config_files.extend(self.config_files.iter().cloned());
+        LoadOptions {
+            runtime,
+            config_files,
+            arcrc_file: self.arcrc_file.clone().or(global.arcrc_file),
+        }
+    }
+}
+
+/// Configuration from every source, plus the `--config` runtime map.
+///
+/// Display (`render`, `all_keys`) covers the five static [`Sources`]
+/// only: stock `get-config` never shows runtime values
+/// (`ArcanistGetConfigWorkflow.php` reads local/project/user/system/
+/// default). Programmatic reads ([`merged_value`], [`checked_value`])
+/// consult the runtime map first.
+#[derive(Debug, Clone)]
+pub struct MergedConfig {
+    pub sources: Sources,
+    pub runtime: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Resolve the user-config file: `--arcrc-file` wins over the default
+/// `~/.arcrc`; a missing custom file errors, like PHP's
+/// `setUserConfigurationFileLocation()`.
+pub fn resolve_user_file(
+    default: Option<PathBuf>,
+    arcrc_file: Option<&Path>,
+) -> Result<Option<PathBuf>, String> {
+    match arcrc_file {
+        Some(path) if !path.is_file() => Err(terminal::pht(
+            "Custom %s file was specified, but it was not found!",
+            &[PhtArg::Text("arcrc")],
+        )),
+        Some(path) => Ok(Some(path.to_path_buf())),
+        None => Ok(default),
+    }
+}
+
+/// Build [`LoadOptions`] from raw CLI values: parse and coerce `--config`
+/// pairs (classic `applyRuntimeArcConfig()` semantics via
+/// [`set_config::parse_runtime_config`]), collect `--config-file`s, and
+/// keep `--arcrc-file` for [`load_merged`] to resolve.
+pub fn load_options_from_cli(
+    config: &[String],
+    config_files: &[String],
+    arcrc_file: Option<&str>,
+) -> Result<LoadOptions, String> {
+    Ok(LoadOptions {
+        runtime: set_config::parse_runtime_config(config)?,
+        config_files: config_files.iter().map(PathBuf::from).collect(),
+        arcrc_file: arcrc_file.map(PathBuf::from),
+    })
+}
+
+/// Load every source plus overrides for `dir`. `user_file` is the default
+/// `~/.arcrc` path; `opts.arcrc_file` overrides it, and non-empty
+/// `opts.config_files` shadow both the user and system sources.
+pub fn load_merged(
+    dir: &Path,
+    user_file: Option<&Path>,
+    opts: &LoadOptions,
+) -> Result<MergedConfig, String> {
+    let opts = opts.with_global();
+    let opts = &opts;
     let (project_file, project) = read_project_config(dir)?;
-    Ok(Sources {
-        local: read_local_config(dir)?,
-        project,
-        user: match user_file {
+    let local = read_local_config(dir)?;
+    let (user, system) = if opts.config_files.is_empty() {
+        let resolved =
+            resolve_user_file(user_file.map(Path::to_path_buf), opts.arcrc_file.as_deref())?;
+        let user = match resolved.as_deref() {
             Some(path) => read_user_file(path)?,
             None => serde_json::Map::new(),
+        };
+        (user, read_system_config()?)
+    } else {
+        let mut merged = serde_json::Map::new();
+        for path in &opts.config_files {
+            if !path.is_file() {
+                continue;
+            }
+            let name = path.display().to_string();
+            let message = terminal::pht(
+                "Your '%s' file is not a valid JSON file.",
+                &[PhtArg::Text(&name)],
+            );
+            for (key, value) in read_config_file(path, &message)? {
+                merged.insert(key, value);
+            }
+        }
+        (serde_json::Map::new(), merged)
+    };
+    Ok(MergedConfig {
+        sources: Sources {
+            local,
+            project,
+            user,
+            system,
+            default: default_config(),
+            project_file,
         },
-        system: read_system_config()?,
-        default: default_config(),
-        project_file,
+        runtime: opts.runtime.clone(),
     })
 }
 
@@ -423,16 +678,22 @@ fn map_for<'a>(
 }
 
 /// The value of `key` at one source. The project source also accepts the
-/// key's legacy name, mirroring the PHP working copy identity.
+/// key's legacy name, mirroring the PHP working copy identity -- including
+/// its `null`-key quirk (T1153 CORE-31): `getLegacyName()` returns `null`
+/// when a key has no legacy name, and `array_key_exists(null, ...)`
+/// coerces to `''`, so a project `{"": v}` entry answers every key
+/// without a legacy name.
 #[must_use]
 pub fn value_at(key: &str, source: &str, sources: &Sources) -> Option<serde_json::Value> {
     if let Some(value) = map_for(source, sources).get(key) {
         return Some(value.clone());
     }
-    if source == SOURCE_PROJECT
-        && let Some(legacy) = legacy_name(key)
-    {
-        return map_for(source, sources).get(legacy).cloned();
+    if source == SOURCE_PROJECT {
+        let map = map_for(source, sources);
+        if let Some(legacy) = legacy_name(key) {
+            return map.get(legacy).cloned();
+        }
+        return map.get("").cloned();
     }
     None
 }
@@ -446,6 +707,61 @@ pub fn current_value(key: &str, sources: &Sources) -> Option<(&'static str, serd
         }
     }
     None
+}
+
+/// The winning value of `key` across runtime plus static sources, or
+/// `None` when unset: runtime > local > project > user > system >
+/// default, mirroring `getConfigFromAnySource()` precedence without type
+/// validation (like `get-config` display, which shows raw values).
+#[must_use]
+pub fn merged_value(key: &str, merged: &MergedConfig) -> Option<(&'static str, serde_json::Value)> {
+    if let Some(value) = merged.runtime.get(key) {
+        return Some((SOURCE_RUNTIME, value.clone()));
+    }
+    current_value(key, &merged.sources)
+}
+
+/// Validate a stored value against its setting type, mirroring
+/// `ArcanistSettings::willReadValue()`. `list` accepts JSON objects too:
+/// PHP decodes to associative arrays, which pass its `is_array()` check.
+pub fn check_value(key: &str, value: &serde_json::Value) -> Result<serde_json::Value, String> {
+    match setting_type(key) {
+        "string" if !value.is_string() => Err(terminal::pht(
+            "Type of setting '%s' must be string.",
+            &[PhtArg::Text(key)],
+        )),
+        "bool" if !value.is_boolean() => Err(terminal::pht(
+            "Type of setting '%s' must be boolean.",
+            &[PhtArg::Text(key)],
+        )),
+        "list" if !(value.is_array() || value.is_object()) => Err(terminal::pht(
+            "Type of setting '%s' must be list.",
+            &[PhtArg::Text(key)],
+        )),
+        _ => Ok(value.clone()),
+    }
+}
+
+/// The winning value with `willReadValue()` validation, mirroring
+/// `ArcanistConfigurationManager::getConfigFromAllSources()`: every
+/// present source value is checked in precedence order (even below a
+/// valid winner, like PHP), and the builtin defaults read unchecked.
+pub fn checked_value(
+    key: &str,
+    merged: &MergedConfig,
+) -> Result<Option<(&'static str, serde_json::Value)>, String> {
+    if let Some(value) = merged.runtime.get(key) {
+        check_value(key, value)?;
+    }
+    for source in SOURCES {
+        if source == SOURCE_DEFAULT {
+            continue;
+        }
+        if let Some(value) = value_at(key, source, &merged.sources) {
+            check_value(key, &value)?;
+        }
+    }
+    Ok(merged_value(key, merged))
 }
 
 /// Every key to show with no arguments: known keys plus any configured
@@ -556,28 +872,102 @@ pub fn render_all_ansi(keys: &[String], sources: &Sources, detailed: bool, ansi:
 struct Options {
     show_source: bool,
     keys: Vec<String>,
+    config: Vec<String>,
+    config_files: Vec<String>,
+    arcrc_file: Option<String>,
+}
+
+/// Split a `--flag` or `--flag=value` token into its name and inline
+/// value.
+fn split_flag(arg: &str) -> (&str, Option<&str>) {
+    match arg.split_once('=') {
+        Some((name, value)) => (name, Some(value)),
+        None => (arg, None),
+    }
+}
+
+/// Consume a `--config`/`--config-file`/`--arcrc-file` flag shared by the
+/// config commands: when `name` is one of those, take its value (inline
+/// `--flag=value`, else the token at `*index`, advancing past it) into
+/// the matching sink and return true; otherwise return false without
+/// consuming anything.
+pub fn take_runtime_flag(
+    config: &mut Vec<String>,
+    config_files: &mut Vec<String>,
+    arcrc_file: &mut Option<String>,
+    name: &str,
+    inline: Option<&str>,
+    argv: &[String],
+    index: &mut usize,
+) -> Result<bool, String> {
+    if !matches!(name, "--config" | "--config-file" | "--arcrc-file") {
+        return Ok(false);
+    }
+    let value = match inline {
+        Some(value) => value.to_string(),
+        None => {
+            if *index >= argv.len() {
+                return Err(format!("{name} requires a value"));
+            }
+            let value = argv[*index].clone();
+            *index += 1;
+            value
+        }
+    };
+    match name {
+        "--config" => config.push(value),
+        "--config-file" => config_files.push(value),
+        _ => *arcrc_file = Some(value),
+    }
+    Ok(true)
 }
 
 fn parse_args(argv: &[String]) -> Result<Option<Options>, String> {
-    let mut show_source = false;
-    let mut keys = Vec::new();
+    let mut options = Options {
+        show_source: false,
+        keys: Vec::new(),
+        config: Vec::new(),
+        config_files: Vec::new(),
+        arcrc_file: None,
+    };
     let mut end_of_flags = false;
-    for arg in argv {
+    let mut index = 0;
+    while index < argv.len() {
+        let arg = &argv[index];
+        index += 1;
         if end_of_flags {
-            keys.push(arg.clone());
-        } else if arg == "--" {
-            end_of_flags = true;
-        } else if arg == "--show-source" || arg == "--verbose" {
-            show_source = true;
-        } else if arg == "-h" || arg == "--help" {
-            return Ok(None);
-        } else if arg.starts_with('-') {
-            return Err(format!("unknown flag '{arg}'"));
-        } else {
-            keys.push(arg.clone());
+            options.keys.push(arg.clone());
+            continue;
         }
+        if arg == "--" {
+            end_of_flags = true;
+            continue;
+        }
+        if arg == "--show-source" || arg == "--verbose" {
+            options.show_source = true;
+            continue;
+        }
+        if arg == "-h" || arg == "--help" {
+            return Ok(None);
+        }
+        let (name, inline) = split_flag(arg);
+        if take_runtime_flag(
+            &mut options.config,
+            &mut options.config_files,
+            &mut options.arcrc_file,
+            name,
+            inline,
+            argv,
+            &mut index,
+        )? {
+            continue;
+        }
+        if arg.starts_with('-') {
+            return Err(format!("unknown flag '{arg}'"));
+        }
+        options.keys.push(arg.clone());
     }
-    Ok(Some(Options { show_source, keys }))
+    Ok(Some(options))
 }
 
 /// Entry point: `argv` excludes the subcommand name.
@@ -585,18 +975,31 @@ pub fn run(argv: &[String]) -> ExitCode {
     let options = match parse_args(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", usage());
             return ExitCode::SUCCESS;
         }
         Err(message) => {
-            eprintln!("arc {NAME}: {message}\n\n{USAGE}");
+            eprintln!("arc {NAME}: {message}\n\n{}", usage());
+            return ExitCode::FAILURE;
+        }
+    };
+    let cli = match load_options_from_cli(
+        &options.config,
+        &options.config_files,
+        options.arcrc_file.as_deref(),
+    ) {
+        Ok(cli) => cli,
+        Err(message) => {
+            eprintln!("arc {NAME}: {message}");
             return ExitCode::FAILURE;
         }
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let user_file = config::arcrc_path();
-    let sources = match load_sources(&cwd, user_file.as_deref()) {
-        Ok(sources) => sources,
+    // Display covers the static sources only: stock `get-config` never
+    // shows `--config` runtime values, though they still validate.
+    let sources = match load_merged(&cwd, user_file.as_deref(), &cli) {
+        Ok(merged) => merged.sources,
         Err(message) => {
             eprintln!("arc {NAME}: {message}");
             return ExitCode::FAILURE;

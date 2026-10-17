@@ -15,12 +15,39 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::{conduit, config, diff_submit, git, terminal};
+use crate::{
+    conduit::{self, EnvelopeKind},
+    config, diff_submit, get_config, git, terminal,
+};
 
 /// Subcommand name, matching `arc look`.
 pub const NAME: &str = "look";
 
-const USAGE: &str = "usage: arc look [-- THING...]\n";
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `crate::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistLookWorkflow.php:11-30`).
+const HELP_EXAMPLES: &str = "**look**\n**look** [options] -- __thing__";
+const HELP_SYNOPSIS: &str = "You stand in the middle of a small clearing.";
+const HELP_TEXT: &str = "Look around, or look at a specific __thing__.";
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &[],
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(terminal::ansi_enabled())
+}
 
 /// `pht('Arcventure')`, the `%!` banner title.
 pub const TITLE: &str = "Arcventure";
@@ -29,6 +56,18 @@ pub const TITLE: &str = "Arcventure";
 ///
 /// Returns `Ok(None)` when `--help` was requested.
 pub fn parse_args(argv: &[String]) -> Result<Option<Vec<String>>, String> {
+    parse_args_with_tty(argv, crate::prompt::stdin_is_terminal())
+}
+
+/// [`parse_args`] with an injected TTY flag (deterministic tests).
+/// T1153 B21/B23: piped runs without `--` fail with
+/// `MISSING_TERMINATOR` (checked after unknown-flag scanning, like
+/// PHP's `parseFull()`, but before success). `--help` without `--`
+/// when piped reports the terminator. Vs ceb
+/// `ArcanistRuntime.php:80-86,172-188` and
+/// `PhutilArgumentParser.php:331-336`.
+fn parse_args_with_tty(argv: &[String], stdin_tty: bool) -> Result<Option<Vec<String>>, String> {
+    let missing = crate::help::terminator_missing(argv, stdin_tty);
     let mut thing = Vec::new();
     let mut end_of_flags = false;
     for arg in argv {
@@ -37,12 +76,18 @@ pub fn parse_args(argv: &[String]) -> Result<Option<Vec<String>>, String> {
         } else if arg == "--" {
             end_of_flags = true;
         } else if arg == "--help" || arg == "-h" {
+            if missing {
+                return Err(crate::help::MISSING_TERMINATOR.to_string());
+            }
             return Ok(None);
         } else if arg.starts_with('-') {
             return Err(format!("unknown flag '{arg}'"));
         } else {
             thing.push(arg.clone());
         }
+    }
+    if missing {
+        return Err(crate::help::MISSING_TERMINATOR.to_string());
     }
     Ok(Some(thing))
 }
@@ -874,18 +919,19 @@ impl RemoteInfo {
 }
 
 /// List git remotes under `cwd` (repository names unresolved).
+///
+/// T1153 RB-D9: PHP parses one `git remote --verbose` strictly (raw
+/// config URIs, no `insteadOf` rewriting) and throws on lines which
+/// miss the pattern — including the empty line, so a remote-less
+/// checkout fails instead of rendering empty.
 pub fn query_remotes(cwd: &Path) -> Result<Vec<RemoteInfo>, String> {
     if !git::is_inside_work_tree(cwd) {
         return Err("not inside a git repository".to_string());
     }
-    let names = git::stdout_text(cwd, &["remote"])?;
-    let mut remotes = Vec::new();
-    for name in names.lines().filter(|l| !l.trim().is_empty()) {
-        let push_uri = git::stdout_text(cwd, &["remote", "get-url", "--push", name]).ok();
-        let fetch_uri = git::stdout_text(cwd, &["remote", "get-url", name]).ok();
-        remotes.push(RemoteInfo::new(name.to_string(), push_uri, fetch_uri));
-    }
-    Ok(remotes)
+    Ok(crate::markers::query_git_remotes(cwd)?
+        .into_iter()
+        .map(|remote| RemoteInfo::new(remote.name, remote.push_uri, remote.fetch_uri))
+        .collect())
 }
 
 /// The four ref-view lines for one remote (`pht('Push URI: %s')`, ...).
@@ -996,7 +1042,9 @@ pub fn collect_remote_uris(remotes: &[RemoteInfo]) -> Vec<String> {
     uris
 }
 
-/// Resolve repositories for `uris` via `diffusion.repository.search`.
+/// Resolve repositories for `uris` via `diffusion.repository.search`,
+/// following `cursor.after` pagination like `ConduitSearchFuture`
+/// (`ConduitSearchFuture.php:56-93` at ceb, T1153 RB-D11).
 pub fn resolve_repositories(
     call: &diff_submit::ConduitCall,
     uris: &[String],
@@ -1004,77 +1052,39 @@ pub fn resolve_repositories(
     if uris.is_empty() {
         return Ok(Vec::new());
     }
-    let result = call(
+    let mut repos = Vec::new();
+    for page in conduit::search_pages(
+        call,
         "diffusion.repository.search",
         &repository_search_params(uris),
-    )?;
-    Ok(parse_repository_search(&result))
+    )? {
+        repos.extend(parse_repository_search(&page));
+    }
+    Ok(repos)
 }
 
-/// Split a git URI into `(domain, path)`, covering `scheme://` and
-/// scp-like (`[user@]host:path`) spellings; plain paths have no domain.
-fn split_git_uri(uri: &str) -> (Option<String>, String) {
-    if let Some(rest) = uri.split_once("://").map(|(_, rest)| rest) {
-        let after_host = rest.find('/').map_or("", |i| &rest[i..]);
-        let authority = rest.split('/').next().unwrap_or("");
-        let host = authority.rsplit('@').next().unwrap_or("");
-        let host = host.split(':').next().unwrap_or("");
-        if host.is_empty() {
-            return (None, after_host.to_string());
-        }
-        return (Some(host.to_string()), after_host.to_string());
-    }
-    // Windows drive paths (`C:\...`, `C:/...`) are local, not scp-like.
-    if uri.len() >= 2
-        && uri.as_bytes()[0].is_ascii_alphabetic()
-        && uri.as_bytes()[1] == b':'
-        && uri[2..].starts_with(['/', '\\'])
-    {
-        return (None, uri.to_string());
-    }
-    if let Some((host_part, path)) = uri.split_once(':')
-        && !host_part.contains('/')
-        && !host_part.contains('\\')
-    {
-        let host = host_part.rsplit('@').next().unwrap_or("");
-        if !host.is_empty() {
-            return (Some(host.to_string()), path.to_string());
-        }
-    }
-    (None, uri.to_string())
-}
-
-/// Normalize a git URI for comparison, porting
-/// `ArcanistRepositoryURINormalizer` (`TYPE_GIT`): lowercased domain plus
-/// the trimmed path without `.git`, with Phabricator `/diffusion/X/`
-/// prefixes collapsed to the callsign.
+/// Normalize a git URI for comparison (`ArcanistRepositoryURINormalizer`
+/// with `TYPE_GIT`).
+///
+/// T1153 RB-D10: this delegates to the shared `revision` port of
+/// `PhutilURI` (dotless scp hosts, digit paths, multi-colon inputs,
+/// query strings, garbage ports, and Windows paths all follow it)
+/// instead of the naive local split.
 #[must_use]
 pub fn normalize_git_uri(uri: &str) -> String {
-    let (domain, path) = split_git_uri(uri);
-    let domain = domain.map_or("<void>".to_string(), |d| d.to_lowercase());
-    let mut path = path.trim_matches('/').to_string();
-    if let Some(stripped) = path.strip_suffix(".git") {
-        path = stripped.to_string();
-    }
-    if let Some(rest) = path.strip_prefix("diffusion/") {
-        let head = rest.split('/').next().unwrap_or("");
-        if !head.is_empty()
-            && (head.chars().all(|c| c.is_ascii_uppercase())
-                || head.chars().all(|c| c.is_ascii_digit()))
-        {
-            path = format!("diffusion/{head}");
-        }
-    }
-    format!("{domain}/{path}")
+    crate::revision::normalize_git_uri(uri)
 }
 
 /// Find the repository whose URIs contain `uri` after normalization.
+/// On collisions the last match wins, like PHP's `$uri_map` overwrite
+/// (`ArcanistRemoteRepositoryRefsHardpointQuery.php:60-87` at ceb,
+/// T1153 RB-D11).
 #[must_use]
 pub fn match_repository<'a>(repos: &'a [RepositoryRef], uri: &str) -> Option<&'a RepositoryRef> {
     let wanted = normalize_git_uri(uri);
     repos
         .iter()
-        .find(|repo| repo.uris.iter().any(|u| normalize_git_uri(u) == wanted))
+        .rfind(|repo| repo.uris.iter().any(|u| normalize_git_uri(u) == wanted))
 }
 
 /// Fill push/fetch repository display names from resolved repositories.
@@ -1348,16 +1358,32 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Best-effort Conduit client for repository mapping (`None` degrades to
-/// local-only data).
-fn look_conduit_client() -> Option<conduit::Client> {
+/// Tokenless-capable Conduit client for repository mapping: `None`
+/// only when no URI resolves at all (T1153 CORE-4/T1153 RB-D12). Missing
+/// credentials yield a tokenless client whose calls fail mapped
+/// (T1153 CORE-5), like PHP's engine.
+fn look_conduit_client(cwd: &Path, user_file: Option<&Path>) -> Option<conduit::Client> {
     // NOTE: `conduit::Client` is not `Debug`; keep the error private.
-    config::client_for(None).ok()
+    config::client_for_tokenless_with(None, cwd, user_file, &get_config::LoadOptions::default())
+        .ok()
 }
 
 fn fail(message: String) -> ExitCode {
-    eprintln!("arc {NAME}: {message}");
-    ExitCode::FAILURE
+    // T1153 RB-D4 (R4): `look` runs in the toolset runtime
+    // (`ArcanistLookWorkflow extends ArcanistArcWorkflow`), so runtime
+    // errors escape into a PHP fatal (255). PHP never throws here,
+    // but the envelope's fatal arm is the faithful default.
+    conduit::report(EnvelopeKind::Fatal, &message)
+}
+
+/// Fail a conduit-backed data load: auth-coded failures render login
+/// guidance (T1153 CORE-5, the toolset runtime's auth arm), anything
+/// else escapes fatal like [`fail`].
+fn fail_mapped(client: &conduit::Client, message: String) -> ExitCode {
+    if let Some(code) = conduit::auth_report_for(client, &message) {
+        return code;
+    }
+    fail(message)
 }
 
 fn conduit_error_text(error: conduit::Error) -> String {
@@ -1373,13 +1399,6 @@ fn call_or_unavailable(
         Some(client) => client.call(method, params).map_err(conduit_error_text),
         None => Err("conduit unavailable".to_string()),
     }
-}
-
-fn optional_call<'a>(
-    client: &'a Option<conduit::Client>,
-    call: &'a dyn Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>,
-) -> Option<&'a diff_submit::ConduitCall<'a>> {
-    if client.is_some() { Some(call) } else { None }
 }
 
 fn render_remotes_output(remotes: &[RemoteInfo], ansi: bool) -> Result<String, String> {
@@ -1441,13 +1460,19 @@ fn run_clearing(ansi: bool) -> ExitCode {
 }
 
 fn run_remotes(cwd: &Path, ansi: bool) -> ExitCode {
-    let client = look_conduit_client();
-    let call = |method: &str, params: &serde_json::Value| {
-        call_or_unavailable(client.as_ref(), method, params)
+    // T1153 RB-D12: PHP resolves repository hardpoints through
+    // Conduit here, so a missing URI fails (fatal, like the
+    // `raiseURIException()` escape) instead of rendering degraded.
+    let user_file = config::arcrc_path();
+    let Some(client) = look_conduit_client(cwd, user_file.as_deref()) else {
+        return fail(conduit::no_uri_block());
     };
-    let remotes = match look_remotes_data(cwd, optional_call(&client, &call)) {
+    let call = |method: &str, params: &serde_json::Value| {
+        call_or_unavailable(Some(&client), method, params)
+    };
+    let remotes = match look_remotes_data(cwd, Some(&call)) {
         Ok(remotes) => remotes,
-        Err(message) => return fail(message),
+        Err(message) => return fail_mapped(&client, message),
     };
     match render_remotes_output(&remotes, ansi) {
         Ok(out) => {
@@ -1459,13 +1484,19 @@ fn run_remotes(cwd: &Path, ansi: bool) -> ExitCode {
 }
 
 fn run_published(cwd: &Path, ansi: bool) -> ExitCode {
-    let client = look_conduit_client();
-    let call = |method: &str, params: &serde_json::Value| {
-        call_or_unavailable(client.as_ref(), method, params)
+    // T1153 RB-D12: `getPublishedCommitHashes()` filters through
+    // repository hardpoints in PHP — no all-tips fallback exists —
+    // so a missing URI fails instead of rendering every tip.
+    let user_file = config::arcrc_path();
+    let Some(client) = look_conduit_client(cwd, user_file.as_deref()) else {
+        return fail(conduit::no_uri_block());
     };
-    let hashes = match look_published_data(cwd, optional_call(&client, &call)) {
+    let call = |method: &str, params: &serde_json::Value| {
+        call_or_unavailable(Some(&client), method, params)
+    };
+    let hashes = match look_published_data(cwd, Some(&call)) {
         Ok(hashes) => hashes,
-        Err(message) => return fail(message),
+        Err(message) => return fail_mapped(&client, message),
     };
     match render_published_output(&hashes, ansi) {
         Ok(out) => {
@@ -1493,27 +1524,38 @@ fn run_unknown(thing: &[String], ansi: bool) -> ExitCode {
 
 /// Entry point: `argv` excludes the subcommand name.
 pub fn run(argv: &[String]) -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    run_in(&cwd, argv)
+}
+
+/// Entry point rooted at `dir`: `argv` excludes the subcommand name.
+pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
     let thing = match parse_args(argv) {
         Ok(Some(thing)) => thing,
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", usage());
             return ExitCode::SUCCESS;
         }
         Err(msg) => {
-            eprintln!("arc {NAME}: {msg}\n\n{USAGE}");
-            return ExitCode::FAILURE;
+            // T1153 B21/B23: the terminator failure prints the three
+            // cyan hints first (like `ArcanistRuntime.php:172-188`).
+            if msg == crate::help::MISSING_TERMINATOR {
+                crate::help::print_terminator_hints(terminal::ansi_enabled());
+            }
+            // T1153 RB-D4 (R4): toolset parser errors render the red
+            // `USAGE EXCEPTION` label with no usage dump.
+            return conduit::report(EnvelopeKind::ToolsetUsage, &msg);
         }
     };
-    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
     let ansi = terminal::ansi_enabled();
     if thing.is_empty() {
         return run_clearing(ansi);
     }
     if thing == ["remotes"] {
-        return run_remotes(&cwd, ansi);
+        return run_remotes(dir, ansi);
     }
     if thing == ["published"] {
-        return run_published(&cwd, ansi);
+        return run_published(dir, ansi);
     }
     run_unknown(&thing, ansi)
 }

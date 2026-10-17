@@ -120,40 +120,50 @@ fn commands_reject_bad_args_without_io() {
     assert_eq!(download::run(&argv(&[])), ExitCode::FAILURE);
     assert_eq!(download::run(&argv(&["F1", "F2"])), ExitCode::FAILURE);
     assert_eq!(upload::run(&argv(&[])), ExitCode::FAILURE);
-    assert_eq!(upload::run(&argv(&["--browse", "f"])), ExitCode::FAILURE);
+    // T1153 R4 (UPLOAD-U15): `--browse f` parses fine; the failure is
+    // conduit setup, which escapes the toolset runtime into a fatal.
+    // T1153 BROWSE-B21: piped runs carry `--`.
+    assert_eq!(
+        upload::run(&argv(&["--browse", "f", "--"])),
+        ExitCode::from(255)
+    );
     assert_eq!(paste::run(&argv(&["P1", "P2"])), ExitCode::FAILURE);
     assert_eq!(paste::run(&argv(&["P1", "--lang", "x"])), ExitCode::FAILURE);
-    assert_eq!(liberate::run(&argv(&["a", "b"])), ExitCode::FAILURE);
+    // T1153 B21/B23: piped runs carry `--` to reach path-count validation.
+    assert_eq!(liberate::run(&argv(&["a", "b", "--"])), ExitCode::FAILURE);
 }
 
 #[test]
 fn help_succeeds_for_all_commands() {
     let fx = Fixture::named("help");
+    // T1153 BROWSE-B21: piped `--help` carries `--`.
     assert_eq!(
-        download::run_in(fx.path(), &argv(&["--help"])),
+        download::run_in(fx.path(), &argv(&["--help", "--"])),
         ExitCode::SUCCESS
     );
     assert_eq!(
-        upload::run_in(fx.path(), &argv(&["--help"])),
+        upload::run_in(fx.path(), &argv(&["--help", "--"])),
         ExitCode::SUCCESS
     );
     assert_eq!(
-        paste::run_in(fx.path(), &argv(&["--help"])),
+        paste::run_in(fx.path(), &argv(&["--help", "--"])),
         ExitCode::SUCCESS
     );
     assert_eq!(
-        liberate::run_in(fx.path(), &argv(&["--help"])),
+        liberate::run_in(fx.path(), &argv(&["--help", "--"])),
         ExitCode::SUCCESS
     );
+    // T1153 BROWSE-B21 (terminator) + BROWSE-B23 (generated help).
     assert!(
-        download::execute(fx.path(), &argv(&["--help"]))
+        download::execute(fx.path(), &argv(&["--help", "--"]))
             .unwrap()
-            .contains("usage: arc download")
+            .contains("DOWNLOAD WORKFLOW")
     );
+    // T1153 R10: `--help` renders the generated workflow help.
     assert!(
-        liberate::execute(fx.path(), &argv(&["--help"]))
+        liberate::execute(fx.path(), &argv(&["--help", "--"]))
             .unwrap()
-            .contains("usage: arc liberate")
+            .contains("LIBERATE WORKFLOW")
     );
 }
 
@@ -217,8 +227,8 @@ fn download_saves_bytes_under_own_name() {
     )]);
 
     let out = download::download_file(&client_for(&api_base), fx.path(), 9, None).unwrap();
-    assert!(out.contains("Downloading \"report.txt\""), "{out}");
-    assert!(out.contains("Saved \"report.txt\""), "{out}");
+    // T1153 DL-D1: statuses go to stderr; the returned text is empty.
+    assert_eq!(out, "");
     assert_eq!(
         std::fs::read(fx.dir.join("report.txt")).unwrap(),
         b"hello-bytes"
@@ -239,7 +249,8 @@ fn download_honors_as_and_rejects_existing() {
 
     let out =
         download::download_file(&client_for(&api_base), fx.path(), 9, Some("custom.bin")).unwrap();
-    assert!(out.contains("custom.bin"), "{out}");
+    // T1153 DL-D1: statuses go to stderr; the returned text is empty.
+    assert_eq!(out, "");
     assert_eq!(std::fs::read(fx.dir.join("custom.bin")).unwrap(), b"zz");
 
     let err = download::download_file(&client_for(&api_base), fx.path(), 9, Some("custom.bin"))
@@ -255,7 +266,8 @@ fn download_uniquifies_default_name() {
     let (api_base, _api_rx) = serve_seq(vec![file_search_hit(&format!("{data_base}F9/data"), 3)]);
 
     let out = download::download_file(&client_for(&api_base), fx.path(), 9, None).unwrap();
-    assert!(out.contains("report.txt.1"), "{out}");
+    // T1153 DL-D1: statuses go to stderr; the returned text is empty.
+    assert_eq!(out, "");
     assert_eq!(std::fs::read(fx.dir.join("report.txt.1")).unwrap(), b"new");
     assert_eq!(std::fs::read(fx.dir.join("report.txt")).unwrap(), b"taken");
 }
@@ -268,7 +280,9 @@ fn download_rejects_size_mismatch() {
 
     let err = download::download_file(&client_for(&api_base), fx.path(), 9, None).unwrap_err();
     assert!(err.contains("does not match expected"), "{err}");
-    assert!(!fx.dir.join("report.txt").exists());
+    // T1153 DL-D7: the size check runs after the bytes land, leaving
+    // the corrupt file behind like PHP.
+    assert_eq!(std::fs::read(fx.dir.join("report.txt")).unwrap(), b"short");
 }
 
 #[test]
@@ -431,7 +445,8 @@ fn upload_paths_rejects_missing_file_without_io() {
         None,
     )
     .unwrap_err();
-    assert!(err.contains("cannot read"), "{err}");
+    // T1153 UPLOAD-U4: `willUpload()` texts replace the generic read error.
+    assert!(err.contains("does not exist"), "{err}");
 }
 
 /// A fake browser command which exits zero without doing anything.
@@ -450,6 +465,8 @@ fn null_browser_config() -> &'static str {
 fn upload_browse_opens_uploaded_files() {
     let fx = Fixture::named("up-browse");
     fx.write("a.txt", b"aaa");
+    // T1153 CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(fx.path().join(".git")).unwrap();
     fx.write(".arcconfig", null_browser_config().as_bytes());
     let search = serde_json::json!({
         "result": {
@@ -519,8 +536,23 @@ fn paste_read_missing_errors() {
 
 #[test]
 fn paste_creates_through_paste_create() {
+    // T1153 PASTE-P1: PHP creates via `paste.edit` transactions ONLY
+    // (`paste.create` is frozen server-side); the re-search follows.
+    // (Name kept for traceability; the flow is edit-only now.)
+    let search = serde_json::json!({
+        "result": {
+            "data": [{
+                "id": 5,
+                "phid": "PHID-PSTE-5",
+                "fields": {"title": "title", "uri": "/P5"},
+            }],
+        },
+        "error_code": null,
+    })
+    .to_string();
     let (base, rx) = serve_seq(vec![
-        r#"{"result": {"id": 5, "uri": "/P5"}, "error_code": null}"#.to_string(),
+        r#"{"result": {"object": {"phid": "PHID-PSTE-5"}}, "error_code": null}"#.to_string(),
+        search,
     ]);
     let created = paste::create_paste(
         &client_for(&base),
@@ -537,53 +569,45 @@ fn paste_creates_through_paste_create() {
         "Created paste P5: https://phab.example/P5\n"
     );
     let seen = seen_requests(&rx);
-    assert_eq!(seen.len(), 1);
+    assert_eq!(seen.len(), 2);
     assert!(
-        seen[0].0.starts_with("POST /api/paste.create "),
+        seen[0].0.starts_with("POST /api/paste.edit "),
         "{}",
         seen[0].0
     );
     assert!(seen[0].1.contains("main"), "{}", seen[0].1);
     assert!(seen[0].1.contains("language"), "{}", seen[0].1);
     assert!(seen[0].1.contains("rust"), "{}", seen[0].1);
+    assert!(
+        seen[1].0.starts_with("POST /api/paste.search "),
+        "{}",
+        seen[1].0
+    );
 }
 
 #[test]
 fn paste_create_falls_back_to_paste_edit() {
-    let search = serde_json::json!({
-        "result": {
-            "data": [{
-                "id": 6,
-                "phid": "PHID-PSTE-6",
-                "fields": {"title": "t", "uri": "/P6"},
-            }],
-        },
-        "error_code": null,
-    })
-    .to_string();
+    // T1153 PASTE-P1/PASTE-P12: no `paste.create` attempt and no retry on
+    // ANY error (which masked real errors); a `paste.edit` failure
+    // surfaces after exactly one call.
+    // (Name kept for traceability; nothing falls back anymore.)
     let (base, rx) = serve_seq(vec![
-        r#"{"result": null, "error_code": "ERR-CONDUIT-CORE", "error_info": "no such method"}"#
+        r#"{"result": null, "error_code": "ERR-CONDUIT-CORE", "error_info": "bad edit"}"#
             .to_string(),
-        r#"{"result": {"object": {"id": 6, "phid": "PHID-PSTE-6"}}, "error_code": null}"#
-            .to_string(),
-        search,
     ]);
-    let created = paste::create_paste(
+    let err = paste::create_paste(
         &client_for(&base),
         "t",
         None,
         "body",
         Some("https://phab.example/"),
     )
-    .unwrap();
-    assert_eq!(created.id, 6);
-    assert_eq!(created.uri, "https://phab.example/P6");
+    .unwrap_err();
+    assert!(err.contains("bad edit"), "{err}");
     let seen = seen_requests(&rx);
-    assert_eq!(seen.len(), 3);
-    assert!(seen[0].0.contains("paste.create"), "{}", seen[0].0);
-    assert!(seen[1].0.contains("paste.edit"), "{}", seen[1].0);
-    assert!(seen[1].1.contains("transactions"), "{}", seen[1].1);
-    assert!(seen[2].0.contains("paste.search"), "{}", seen[2].0);
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].0.contains("paste.edit"), "{}", seen[0].0);
+    assert!(seen[0].1.contains("transactions"), "{}", seen[0].1);
 }
 
 // --- liberate ------------------------------------------------------------
@@ -599,7 +623,8 @@ fn filled_input(text: &str) -> std::io::BufReader<std::io::Cursor<Vec<u8>>> {
 #[test]
 fn liberate_scan_finds_nothing_without_libraries() {
     let fx = Fixture::named("lib-none");
-    let err = liberate::execute_with_input(fx.path(), &argv(&[]), &mut empty_input()).unwrap_err();
+    let err =
+        liberate::execute_with_input(fx.path(), &argv(&[]), &mut empty_input(), true).unwrap_err();
     assert!(err.contains("Unable to find any libraries"), "{err}");
 }
 
@@ -612,7 +637,7 @@ fn liberate_rejects_ancient_and_unknown_versions() {
         "<?php\n",
     )
     .unwrap();
-    let err = liberate::execute_with_input(fx.path(), &argv(&["oldlib"]), &mut empty_input())
+    let err = liberate::execute_with_input(fx.path(), &argv(&["oldlib"]), &mut empty_input(), true)
         .unwrap_err();
     assert!(err.contains("no longer supported"), "{err}");
 
@@ -621,22 +646,28 @@ fn liberate_rejects_ancient_and_unknown_versions() {
         "<?php // @phutil-library-version 9\n",
     )
     .unwrap();
-    let err = liberate::execute_with_input(fx.path(), &argv(&["oldlib"]), &mut empty_input())
+    let err = liberate::execute_with_input(fx.path(), &argv(&["oldlib"]), &mut empty_input(), true)
         .unwrap_err();
     assert!(err.contains("Unknown library version '9'"), "{err}");
 }
 
 #[test]
-fn liberate_creates_init_then_reports_missing_rebuild_script() {
+fn liberate_create_ignores_rebuild_status() {
+    // T1153 CORE-50: PHP at ceb ignores the rebuild status entirely
+    // (`ArcanistLiberateWorkflow.php:82-93` discards `liberatePath`'s
+    // return): the run succeeds with no rebuild text, even with no
+    // rebuild script above the library (DONE goes to the console,
+    // like PHP's echo, not the return value).
     let fx = Fixture::named("lib-create");
     std::fs::create_dir_all(fx.dir.join("newlib")).unwrap();
-    // Creation succeeded (init file written) but no rebuild script exists
-    // above a temp dir, so the rebuild step fails deterministically. Like
-    // `arc liberate`, per-library rebuild failures still exit 0.
-    let out =
-        liberate::execute_with_input(fx.path(), &argv(&["newlib"]), &mut filled_input("my-lib\n"))
-            .unwrap();
-    assert!(out.contains("rebuild-map.php"), "{out}");
+    let out = liberate::execute_with_input(
+        fx.path(),
+        &argv(&["newlib"]),
+        &mut filled_input("my-lib\n"),
+        true,
+    )
+    .unwrap();
+    assert!(!out.contains("rebuild-map.php"), "{out}");
     let init =
         std::fs::read_to_string(fx.dir.join("newlib").join("__phutil_library_init__.php")).unwrap();
     assert!(init.contains("phutil_register_library('my-lib'"), "{init}");
@@ -645,18 +676,25 @@ fn liberate_creates_init_then_reports_missing_rebuild_script() {
 #[test]
 fn liberate_missing_directory_decline_and_accept() {
     let fx = Fixture::named("lib-mkdir");
-    let err = liberate::execute_with_input(fx.path(), &argv(&["ghost"]), &mut filled_input("n\n"))
-        .unwrap_err();
-    assert!(err.contains("does not exist"), "{err}");
+    // Declining the mkdir prompt aborts like PHP's `ArcanistPrompt`
+    // (`ArcanistUserAbortException`); the "does not exist" text stays in
+    // the banner, not the error.
+    let err =
+        liberate::execute_with_input(fx.path(), &argv(&["ghost"]), &mut filled_input("n\n"), true)
+            .unwrap_err();
+    assert!(err.contains("User aborted the workflow."), "{err}");
     assert!(!fx.dir.join("ghost").exists());
 
+    // PHP only accepts exactly `y`/`n` (lowercased) at toolset prompts
+    // (`ArcanistPrompt.php`); anything else re-prompts.
     let out = liberate::execute_with_input(
         fx.path(),
         &argv(&["fresh"]),
-        &mut filled_input("yes\nfresh-lib\n"),
+        &mut filled_input("y\nfresh-lib\n"),
+        true,
     )
     .unwrap();
-    assert!(out.contains("rebuild-map.php"), "{out}");
+    assert!(!out.contains("rebuild-map.php"), "{out}");
     assert!(
         fx.dir
             .join("fresh")
@@ -666,7 +704,9 @@ fn liberate_missing_directory_decline_and_accept() {
 }
 
 #[test]
-fn liberate_v2_reports_missing_rebuild_script() {
+fn liberate_v2_ignores_rebuild_status() {
+    // T1153 CORE-50: the rebuild status is ignored entirely (see
+    // `liberate_create_ignores_rebuild_status`); the run exits 0.
     let fx = Fixture::named("lib-v2");
     std::fs::create_dir_all(fx.dir.join("v2lib")).unwrap();
     std::fs::write(
@@ -679,12 +719,13 @@ fn liberate_v2_reports_missing_rebuild_script() {
         "<?php // @phutil-library-version 2\n",
     )
     .unwrap();
-    let out =
-        liberate::execute_with_input(fx.path(), &argv(&["v2lib"]), &mut empty_input()).unwrap();
-    assert!(out.contains("rebuild-map.php"), "{out}");
-    // Per-library rebuild failures still exit 0, like `arc liberate`.
+    let out = liberate::execute_with_input(fx.path(), &argv(&["v2lib"]), &mut empty_input(), true)
+        .unwrap();
+    assert!(!out.contains("rebuild-map.php"), "{out}");
+    // T1153 B21/B23: piped `run_in` carries `--` (`execute_with_input`
+    // models a TTY above, so it needs none).
     assert_eq!(
-        liberate::run_in(fx.path(), &argv(&["v2lib"])),
+        liberate::run_in(fx.path(), &argv(&["--", "v2lib"])),
         ExitCode::SUCCESS
     );
 }
@@ -700,6 +741,77 @@ fn liberate_scan_updates_found_library() {
     .unwrap();
     // v1 (no map): a fatal usage error aborting the workflow, like
     // `arc liberate` (the library was named on the WORK line instead).
-    let err = liberate::execute_with_input(fx.path(), &argv(&[]), &mut empty_input()).unwrap_err();
+    let err =
+        liberate::execute_with_input(fx.path(), &argv(&[]), &mut empty_input(), true).unwrap_err();
     assert!(err.contains("no longer supported"), "{err}");
+}
+
+// --- T1153 R3 auto-pagination ---------------------------------------------
+
+#[test]
+fn r3_dld12_download_follows_file_search_pages() {
+    fn hit(id: u32) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "phid": format!("PHID-FILE-{id}"),
+            "fields": {
+                "name": format!("f{id}.txt"),
+                "size": 1,
+                "dataURI": "http://127.0.0.1:9/x",
+            },
+        })
+    }
+    let page1 = serde_json::json!({
+        "result": {"data": [hit(7)], "cursor": {"after": "p2"}},
+        "error_code": null,
+    })
+    .to_string();
+    let page2 = serde_json::json!({
+        "result": {"data": [hit(9)]},
+        "error_code": null,
+    })
+    .to_string();
+    let (base, rx) = serve_seq(vec![page1, page2]);
+    let file = download::fetch_file_ref(&client_for(&base), 9).unwrap();
+    assert_eq!(file.id, 9);
+    assert_eq!(file.name, "f9.txt");
+    let seen = seen_requests(&rx);
+    assert_eq!(seen.len(), 2);
+    assert!(seen[0].0.contains("file.search"), "{}", seen[0].0);
+    assert!(!seen[0].1.contains("after"), "{}", seen[0].1);
+    assert!(seen[1].0.contains("file.search"), "{}", seen[1].0);
+    assert!(seen[1].1.contains("after"), "{}", seen[1].1);
+}
+
+#[test]
+fn r3_uploadu16_resolve_refs_follows_file_search_pages() {
+    fn hit(id: u32) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "phid": format!("PHID-FILE-{id}"),
+            "fields": {"name": format!("f{id}.txt"), "uri": format!("/F{id}")},
+        })
+    }
+    let page1 = serde_json::json!({
+        "result": {"data": [hit(1)], "cursor": {"after": "p2"}},
+        "error_code": null,
+    })
+    .to_string();
+    let page2 = serde_json::json!({
+        "result": {"data": [hit(2)]},
+        "error_code": null,
+    })
+    .to_string();
+    let (base, rx) = serve_seq(vec![page1, page2]);
+    let refs = upload::resolve_refs(
+        &client_for(&base),
+        &[("f2.txt".to_string(), "PHID-FILE-2".to_string())],
+        None,
+    )
+    .unwrap();
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].id, 2);
+    let seen = seen_requests(&rx);
+    assert_eq!(seen.len(), 2);
+    assert!(seen[1].1.contains("after"), "{}", seen[1].1);
 }

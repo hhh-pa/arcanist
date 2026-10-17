@@ -100,8 +100,9 @@ fn passing_filter_from_nested_dir_maps_to_pass() {
 fn unknown_engine_lists_available_engines() {
     let opts = unit::parse_args(&args(&["--engine", "phpunit"])).unwrap();
     let err = unit::execute(&opts, Path::new("."), None).unwrap_err();
-    assert!(err.contains("unknown engine 'phpunit'"), "{err}");
-    assert!(err.contains("available engines: cargo"), "{err}");
+    // UNIT-U8: PHP's subclass message, not an allowlist dump.
+    assert!(err.contains("is not a subclass of"), "{err}");
+    assert!(err.contains("\"phpunit\""), "{err}");
 }
 
 #[test]
@@ -164,12 +165,25 @@ const CANNED_XUNIT: &str = "<testsuite name=\"t\" tests=\"3\">\
 #[test]
 fn selection_prefers_explicit_unit_engine_arcunit_cargo() {
     let dir = temp_project("sel");
-    assert_eq!(
-        unit::discover_selection(&Options::default(), &dir).unwrap(),
-        unit::Selection::Cargo
-    );
+    // T1153 CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    // UNIT-U7: nothing configured is `ArcanistNoEngineException`.
+    let err = unit::discover_selection(&Options::default(), &dir).unwrap_err();
+    assert!(err.contains("No unit test engine is configured"), "{err}");
 
+    // UNIT-U15: class names no longer validate in `.arcunit` (only the
+    // `phutil` class-map name does).
     std::fs::copy(wire_unit_fixture("arcunit_nose.json"), dir.join(".arcunit")).unwrap();
+    let err = unit::discover_selection(&Options::default(), &dir).unwrap_err();
+    assert!(
+        err.contains("specifies invalid type 'NoseTestEngine'"),
+        "{err}"
+    );
+    std::fs::copy(
+        wire_unit_fixture("arcunit_phutil.json"),
+        dir.join(".arcunit"),
+    )
+    .unwrap();
     assert!(matches!(
         unit::discover_selection(&Options::default(), &dir).unwrap(),
         unit::Selection::Config { .. }
@@ -206,11 +220,15 @@ fn config_nose_runs_with_canned_output() {
     )
     .unwrap();
 
-    let selection = unit::discover_selection(&Options::default(), &dir).unwrap();
-    let unit::Selection::Config { engines, root } = selection else {
-        panic!("expected Config selection");
-    };
-    assert_eq!(root, dir);
+    // UNIT-U15: class names no longer validate via `.arcunit`
+    // discovery, so the canned run plans against an explicit list.
+    let text = std::fs::read_to_string(dir.join(".arcunit")).unwrap();
+    let engines = arc_rs::unit_config::parse_engine_specs(
+        &text,
+        &format!("{}/.arcunit", forward_slashes(&dir)),
+        &["NoseTestEngine"],
+    )
+    .unwrap();
     assert_eq!(engines.len(), 1);
 
     let runner = |argv: &[String], _cwd: &str| {
@@ -240,10 +258,11 @@ fn config_nose_runs_with_canned_output() {
         .iter()
         .map(unit::render_unit_result)
         .collect();
-    assert!(rendered.contains("  PASS 125ms a.ok\n"), "{rendered}");
-    assert!(rendered.contains("  FAIL a.bad\n"), "{rendered}");
+    // UNIT-U10: stripped markup keeps star/spaces/padding.
+    assert!(rendered.contains("   PASS  125ms   a.ok\n"), "{rendered}");
+    assert!(rendered.contains("   FAIL  a.bad\n"), "{rendered}");
     assert!(rendered.contains("oops\n"), "{rendered}");
-    assert!(rendered.contains("  SKIP a.skipped\n"), "{rendered}");
+    assert!(rendered.contains("   SKIP  a.skipped\n"), "{rendered}");
 
     let json = report.to_json();
     assert_eq!(json["engine"], "ArcanistConfigurationDrivenUnitTestEngine");
@@ -260,10 +279,18 @@ fn config_mixed_fixture_selects_two_engines() {
         dir.join(".arcunit"),
     )
     .unwrap();
-    let selection = unit::discover_selection(&Options::default(), &dir).unwrap();
-    let unit::Selection::Config { engines, .. } = selection else {
-        panic!("expected Config selection");
-    };
+    // UNIT-U15: class names no longer validate via `.arcunit` discovery.
+    let err = unit::discover_selection(&Options::default(), &dir).unwrap_err();
+    assert!(err.contains("specifies invalid type"), "{err}");
+    // Multi-engine planning (including `exclude` parsing) still works
+    // against an explicit available list.
+    let text = std::fs::read_to_string(dir.join(".arcunit")).unwrap();
+    let engines = arc_rs::unit_config::parse_engine_specs(
+        &text,
+        &format!("{}/.arcunit", forward_slashes(&dir)),
+        &["PytestTestEngine", "PhpunitTestEngine"],
+    )
+    .unwrap();
     assert_eq!(engines.len(), 2);
     assert_eq!(engines[0].engine_type, "PytestTestEngine");
     assert_eq!(engines[1].engine_type, "PhpunitTestEngine");
@@ -322,10 +349,15 @@ fn everything_rejected_when_no_child_supports_it() {
         r#"{"engines": {"p": {"type": "PytestTestEngine"}}}"#,
     )
     .unwrap();
-    let selection = unit::discover_selection(&Options::default(), &dir).unwrap();
-    let unit::Selection::Config { engines, .. } = selection else {
-        panic!("expected Config selection");
-    };
+    // UNIT-U15: class names no longer validate via `.arcunit` discovery,
+    // so the run plans against an explicit available list.
+    let text = std::fs::read_to_string(dir.join(".arcunit")).unwrap();
+    let engines = arc_rs::unit_config::parse_engine_specs(
+        &text,
+        &format!("{}/.arcunit", forward_slashes(&dir)),
+        &["PytestTestEngine"],
+    )
+    .unwrap();
     let runner = |_: &[String], _: &str| CapturedOutput::new(0, "", "");
     let err = unit::run_config_with_runner(
         &engines,
@@ -355,11 +387,12 @@ fn everything_rejected_when_no_child_supports_it() {
 
 #[test]
 fn render_per_test_lines_through_wired_lib() {
+    // UNIT-U10: stripped markup keeps star/spaces/padding.
     let mut pass = EngineUnitResult::new();
     pass.set_name("a.ok").unwrap();
     pass.set_result("pass");
     pass.set_duration(2.5);
-    assert_eq!(unit::render_unit_result(&pass), "  PASS  2.5s a.ok\n");
+    assert_eq!(unit::render_unit_result(&pass), "   PASS   2.5s   a.ok\n");
 
     let mut fail = EngineUnitResult::new();
     fail.set_namespace("ns");
@@ -368,7 +401,7 @@ fn render_per_test_lines_through_wired_lib() {
     fail.set_user_data("traceback");
     assert_eq!(
         unit::render_unit_result(&fail),
-        "  FAIL ns::bad\ntraceback\n"
+        "   FAIL  ns::bad\ntraceback\n"
     );
 
     assert_eq!(unit::format_time(61.0), "1m01s");
@@ -575,4 +608,56 @@ fn harbormaster_upload_sends_fail_over_mock_conduit() {
     assert_eq!(params["type"], "fail");
     // Missing userData means no details key at all.
     assert!(params["unit"][0].get("details").is_none());
+}
+
+// --- T1153 Wave 2: UNIT findings ---
+
+#[test]
+fn unit_u21_sendmessage_params_keep_php_order() {
+    let (base, rx) = serve_once(r#"{"error_code": null, "response": "PHID-HMBT-1"}"#);
+    let _home = arcrc_for(&base, "u21");
+    let results = vec![upload_result("t", "pass", None)];
+    unit::upload_results(
+        "PHID-HMBT-1",
+        unit_engine::WORKFLOW_RESULT_OKAY,
+        &results,
+        Some(base.as_str()),
+    )
+    .unwrap();
+
+    let (_, body) = rx.recv().unwrap();
+    // PHP sends buildTargetPHID, unit, type in order (`json_encode`
+    // keeps insertion order); `__conduit__` appends last.
+    let encoded = body
+        .strip_prefix("params=")
+        .unwrap()
+        .split('&')
+        .next()
+        .unwrap();
+    let params: serde_json::Value = serde_json::from_str(&form_decode(encoded)).unwrap();
+    let keys: Vec<&str> = params
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, vec!["buildTargetPHID", "unit", "type", "__conduit__"]);
+}
+
+#[test]
+fn d22_child_collecting_returns_cargo_results() {
+    // T1153 DIFF-D22: the collecting child run returns the exit code
+    // plus per-test results (the failing sample yields one fail).
+    let root = fixture_copy("d22");
+    std::process::Command::new("git")
+        .current_dir(&root)
+        .args(["init", "-q"])
+        .status()
+        .unwrap();
+    let report =
+        unit::run_in_collecting(&root, &args(&["--engine", "cargo", "--output", "none"])).unwrap();
+    assert_eq!(report.code, std::process::ExitCode::from(2));
+    assert_eq!(report.results.len(), 1);
+    assert_eq!(report.results[0].get_result(), "fail");
+    assert_eq!(report.results[0].get_name(), "cargo");
 }

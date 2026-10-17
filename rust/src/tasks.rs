@@ -10,12 +10,75 @@
 
 use std::process::ExitCode;
 
-use crate::{conduit, config, terminal};
+use crate::{
+    conduit::{self, EnvelopeKind},
+    config, get_config, terminal,
+};
 
 /// Subcommand name, matching `arc tasks`.
 pub const NAME: &str = "tasks";
 
-const USAGE: &str = "usage: arc tasks [--status STATUS] [--owner USER] [--order ORDER] [--limit N] [--unassigned] [--json] [--conduit-uri URI]\n";
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `crate::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistTasksWorkflow.php:14-64`).
+const HELP_SYNOPSIS: &str = "      **tasks** [__options__]";
+const HELP_TEXT: &str = "        View all assigned tasks.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[
+    (
+        "status",
+        None,
+        Some("task_status"),
+        "Show tasks that are open or closed, default is open.",
+    ),
+    (
+        "owner",
+        None,
+        Some("username"),
+        "Only show tasks assigned to the given username, also accepts @all to show all, default is you.",
+    ),
+    (
+        "order",
+        None,
+        Some("task_order"),
+        "Arrange tasks based on priority, created, or modified, default is priority.",
+    ),
+    (
+        "limit",
+        None,
+        Some("n"),
+        "Limit the amount of tasks outputted, default is all.",
+    ),
+    (
+        "unassigned",
+        None,
+        None,
+        "Only show tasks that are not assigned (upforgrabs).",
+    ),
+];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        None,
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &specs,
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(terminal::ansi_enabled())
+}
 
 /// Parsed `tasks` options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,8 +89,9 @@ pub struct Options {
     pub owner: Option<String>,
     /// Raw `--order` value (`priority`, `created`, or `modified`).
     pub order: Option<String>,
-    /// Maximum tasks to list.
-    pub limit: Option<u32>,
+    /// Raw `--limit` value, sent to conduit verbatim (T1153 RB-D28:
+    /// PHP strips the `int` paramtype, so `--limit abc` is sent raw).
+    pub limit: Option<String>,
     /// Only show unassigned tasks.
     pub unassigned: bool,
     /// Emit a JSON array instead of a table.
@@ -64,7 +128,7 @@ struct Parser {
     status: Option<String>,
     owner: Option<String>,
     order: Option<String>,
-    limit: Option<u32>,
+    limit: Option<String>,
     unassigned: bool,
     json: bool,
     conduit_uri: Option<String>,
@@ -120,15 +184,12 @@ impl Parser {
 
     fn flag_limit(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Option<Step> {
         if arg == "--limit" || arg.starts_with("--limit=") {
-            let raw = match flag_value(iter, arg, "--limit") {
-                Ok(raw) => raw,
+            // T1153 RB-D28: no integer validation — PHP strips the
+            // `int` paramtype (`newLegacyPhutilWorkflow` unsets it),
+            // so any value rides through to conduit verbatim.
+            match flag_value(iter, arg, "--limit") {
+                Ok(raw) => self.limit = Some(raw),
                 Err(message) => return Some(Step::Error(message)),
-            };
-            match raw.parse::<u32>() {
-                Ok(n) => self.limit = Some(n),
-                Err(_) => {
-                    return Some(Step::Error("--limit requires an integer value".to_string()));
-                }
             }
             return Some(Step::Handled);
         }
@@ -162,15 +223,28 @@ impl Parser {
         if arg == "--help" || arg == "-h" {
             return Step::Help;
         }
-        if arg.starts_with('-') {
-            return Step::Error(format!("unknown flag '{arg}'"));
+        // T1153 TASKS-1: `tasks` is a classic `ArcanistWorkflow`
+        // subclass (`ArcanistTasksWorkflow.php:6`), so unknown flags
+        // report the classic text over the `--`/`-`-stripped,
+        // `=`-split key (`ArcanistWorkflow.php:825-851` long,
+        // `:853-862` short). Per-command override, not a global
+        // change: the toolset `unknown flag` wording locked at
+        // `alias.rs:785` stays for the commands that keep it.
+        if let Some(long) = arg.strip_prefix("--") {
+            let key = long.split('=').next().unwrap_or("");
+            return Step::Error(format!("Unknown argument '{key}'. Try 'arc help'."));
         }
-        Step::Error(format!("unexpected argument '{arg}'"))
+        if let Some(key) = arg.strip_prefix('-') {
+            return Step::Error(format!("Unknown argument '{key}'. Try 'arc help'."));
+        }
+        // T1153 TASKS-2: positionals with no `$more_key` throw the
+        // first extra (`ArcanistWorkflow.php:887-895`).
+        Step::Error(format!("Unrecognized argument '{arg}'. Try 'arc help'."))
     }
 
     fn consume(&mut self, arg: &str, iter: &mut std::slice::Iter<'_, String>) -> Step {
         if self.end_of_flags {
-            return Step::Error(format!("unexpected argument '{arg}'"));
+            return Step::Error(format!("Unrecognized argument '{arg}'. Try 'arc help'."));
         }
         if let Some(step) = self.flag_status(arg, iter) {
             return step;
@@ -191,11 +265,10 @@ impl Parser {
     }
 
     fn finish(self) -> Result<Option<Options>, String> {
-        if self.owner.is_some() && self.unassigned {
-            return Err(
-                "--owner and --unassigned conflict (--owner suppresses unassigned)".to_string(),
-            );
-        }
+        // T1153 RB-D28: no owner/unassigned conflict — PHP strips the
+        // `conflict` spec (`newLegacyPhutilWorkflow` unsets it), so
+        // both flags are accepted and `--owner` wins in `execute`
+        // (`if ($owner) ... else if ($unassigned)`).
         Ok(Some(Options {
             status: self.status,
             owner: self.owner,
@@ -238,19 +311,36 @@ pub struct Task {
 
 /// Parse one `maniphest.query` row; `None` when it has no id.
 #[must_use]
-pub fn parse_task(value: &serde_json::Value) -> Option<Task> {
-    let id_value = value.get("id")?;
-    let id = if let Some(n) = id_value.as_i64() {
-        n.to_string()
-    } else if let Some(n) = id_value.as_u64() {
-        n.to_string()
-    } else {
-        let raw = id_value.as_str()?;
+/// Task id as digits: numbers stringify, `"T42"`/`"t42"` shed the prefix.
+fn task_id(id_value: &serde_json::Value) -> Option<String> {
+    if let Some(n) = id_value.as_i64() {
+        return Some(n.to_string());
+    }
+    if let Some(n) = id_value.as_u64() {
+        return Some(n.to_string());
+    }
+    let raw = id_value.as_str()?;
+    Some(
         raw.strip_prefix('T')
             .or_else(|| raw.strip_prefix('t'))
             .unwrap_or(raw)
-            .to_string()
-    };
+            .to_string(),
+    )
+}
+
+/// T1153 RB-D39: PHP reads `isClosed` with loose truthiness, so string
+/// forms (`"0"`/`""` false, anything else true) apply like numbers do.
+fn task_is_closed(value: Option<&serde_json::Value>) -> Option<bool> {
+    value.and_then(|v| {
+        v.as_bool()
+            .or_else(|| v.as_i64().map(|n| n != 0))
+            .or_else(|| v.as_u64().map(|n| n != 0))
+            .or_else(|| v.as_str().map(|s| !s.is_empty() && s != "0"))
+    })
+}
+
+pub fn parse_task(value: &serde_json::Value) -> Option<Task> {
+    let id = task_id(value.get("id")?)?;
     Some(Task {
         id,
         title: value
@@ -273,15 +363,13 @@ pub fn parse_task(value: &serde_json::Value) -> Option<Task> {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        is_closed: value.get("isClosed").and_then(|v| {
-            v.as_bool()
-                .or_else(|| v.as_i64().map(|n| n != 0))
-                .or_else(|| v.as_u64().map(|n| n != 0))
-        }),
+        is_closed: task_is_closed(value.get("isClosed")),
     })
 }
 
-/// Rows of a `maniphest.query` result, whether it is a list or a map.
+/// Rows of a `maniphest.query` result, whether it is a list or a map
+/// (T1153 RB-D26: server order, not sorted — `preserve_order` keeps
+/// the map's insertion order, matching PHP's `foreach`).
 #[must_use]
 pub fn parse_tasks(result: &serde_json::Value) -> Vec<Task> {
     let items: Vec<&serde_json::Value> = match result {
@@ -292,30 +380,48 @@ pub fn parse_tasks(result: &serde_json::Value) -> Vec<Task> {
     items.into_iter().filter_map(parse_task).collect()
 }
 
+/// True for the argument values PHP treats as empty in
+/// `loadManiphestTasks` (`($order ? ... : ...)`): missing, `""`, or
+/// `"0"` (the only falsy strings).
+fn is_blank_arg(value: Option<&str>) -> bool {
+    matches!(value, None | Some("") | Some("0"))
+}
+
 /// Build the `maniphest.query` parameters, mirroring the PHP defaults
 /// (`status-open`, `order-priority`); `all` maps to `any` like the PHP.
+/// Empty `--order`/`--status` fall back to the defaults (T1153 RB-D28:
+/// PHP's `?:` treats them as missing), and `--limit` rides through
+/// verbatim as the argv string PHP sends.
 #[must_use]
 pub fn query_params(
     owner_phid: Option<&str>,
     status: Option<&str>,
     order: Option<&str>,
-    limit: Option<u32>,
+    limit: Option<&str>,
 ) -> serde_json::Value {
     let mut params = serde_json::Map::new();
     if let Some(phid) = owner_phid {
         params.insert("ownerPHIDs".to_string(), serde_json::json!([phid]));
     }
-    if let Some(n) = limit {
-        params.insert("limit".to_string(), serde_json::Value::from(n));
+    if let Some(raw) = limit {
+        params.insert(
+            "limit".to_string(),
+            serde_json::Value::String(raw.to_string()),
+        );
     }
+    let order = if is_blank_arg(order) {
+        "priority"
+    } else {
+        order.unwrap_or("priority")
+    };
     params.insert(
         "order".to_string(),
-        serde_json::Value::String(format!("order-{}", order.unwrap_or("priority"))),
+        serde_json::Value::String(format!("order-{order}")),
     );
     let status = match status {
         Some("all") => "any",
-        Some(s) => s,
-        None => "open",
+        Some(s) if !is_blank_arg(Some(s)) => s,
+        _ => "open",
     };
     params.insert(
         "status".to_string(),
@@ -324,8 +430,13 @@ pub fn query_params(
     serde_json::Value::Object(params)
 }
 
-/// Authenticated user's PHID via `user.whoami`.
+/// Authenticated user's PHID: the identity cached at startup auth,
+/// else one `user.whoami` call (T1153 RB-D8: PHP resolves whoami once
+/// first, then reuses the cached PHID).
 pub fn user_phid(client: &conduit::Client) -> Result<String, String> {
+    if let Some((_, phid)) = client.authenticated_user() {
+        return Ok(phid);
+    }
     let who = client
         .call("user.whoami", &serde_json::json!({}))
         .map_err(|e| e.to_string())?;
@@ -452,7 +563,7 @@ pub fn execute(client: &conduit::Client, options: &Options) -> Result<String, St
         owner_phid.as_deref(),
         options.status.as_deref(),
         options.order.as_deref(),
-        options.limit,
+        options.limit.as_deref(),
     );
     let result = client
         .call("maniphest.query", &params)
@@ -475,30 +586,35 @@ pub fn run(argv: &[String]) -> ExitCode {
     let options = match parse_args(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", usage());
             return ExitCode::SUCCESS;
         }
-        Err(msg) => {
-            eprintln!("arc {NAME}: {msg}\n\n{USAGE}");
-            return ExitCode::FAILURE;
-        }
+        // T1153 RB-D4 (R4): `tasks` is a subprocess workflow:
+        // usage errors render `Usage Exception:` with no usage dump
+        // (`scripts/arcanist.php:432-444`).
+        Err(msg) => return conduit::report(EnvelopeKind::Usage, &msg),
     };
-    let client = match config::client_for(options.conduit_uri.as_deref()) {
+    // T1153 CORE-4/T1153 CORE-9: classic `requiresAuthentication` startup
+    // (tokenless engine, credential gate, `user.whoami` /
+    // `conduit.connect` verification).
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let user_file = config::arcrc_path();
+    let client = match config::authed_client_for(
+        options.conduit_uri.as_deref(),
+        &cwd,
+        user_file.as_deref(),
+        &get_config::LoadOptions::default(),
+        &config::command_description(),
+    ) {
         Ok(client) => client,
-        Err(msg) => {
-            eprintln!("arc {NAME}: {msg}");
-            return ExitCode::FAILURE;
-        }
+        Err(error) => return error.report(),
     };
     match execute(&client, &options) {
         Ok(out) => {
             print!("{out}");
             ExitCode::SUCCESS
         }
-        Err(msg) => {
-            eprintln!("arc {NAME}: {msg}");
-            ExitCode::FAILURE
-        }
+        Err(msg) => conduit::report(EnvelopeKind::Exception, &msg),
     }
 }
 

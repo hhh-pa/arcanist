@@ -1,4 +1,6 @@
 //! `weld` behavior through the wired library.
+//!
+//! T1153 BROWSE-B21: `weld` is toolset; piped runs carry `--`.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -65,11 +67,11 @@ fn module_name_is_weld() {
 #[test]
 fn help_succeeds_and_prints_usage() {
     let dir = Fixture::named("help");
-    let out = weld::execute(dir.path(), &args(&["--help"])).unwrap();
+    let out = weld::execute(dir.path(), &args(&["--help", "--"])).unwrap();
     let text = String::from_utf8(out).unwrap();
-    assert!(text.contains("usage: arc weld"), "unexpected: {text}");
+    assert!(text.contains("WELD WORKFLOW"), "unexpected: {text}");
     assert_eq!(
-        weld::run_in(dir.path(), &args(&["--help"])),
+        weld::run_in(dir.path(), &args(&["--help", "--"])),
         ExitCode::SUCCESS
     );
 }
@@ -81,7 +83,7 @@ fn run_uses_current_dir() {
     dir.write("b.txt", b"b1\nb2\nb3\n");
     let old = std::env::current_dir().unwrap();
     std::env::set_current_dir(dir.path()).unwrap();
-    let code = weld::run(&args(&["--seed", "1", "a.txt", "b.txt"]));
+    let code = weld::run(&args(&["--seed", "1", "a.txt", "b.txt", "--"]));
     std::env::set_current_dir(&old).unwrap();
     assert_eq!(code, ExitCode::SUCCESS);
 }
@@ -90,18 +92,18 @@ fn run_uses_current_dir() {
 fn requires_two_files() {
     let dir = Fixture::named("arity");
     dir.write("a.txt", b"a\n");
-    let err = weld::execute(dir.path(), &args(&["a.txt"])).unwrap_err();
+    let err = weld::execute(dir.path(), &args(&["a.txt", "--"])).unwrap_err();
     assert!(
         err.contains("Specify two or more files to weld together."),
         "unexpected: {err}"
     );
-    let err = weld::execute(dir.path(), &args(&[])).unwrap_err();
+    let err = weld::execute(dir.path(), &args(&["--"])).unwrap_err();
     assert!(
         err.contains("Specify two or more files to weld together."),
         "unexpected: {err}"
     );
     assert_eq!(
-        weld::run_in(dir.path(), &args(&["a.txt"])),
+        weld::run_in(dir.path(), &args(&["a.txt", "--"])),
         ExitCode::FAILURE
     );
 }
@@ -110,11 +112,13 @@ fn requires_two_files() {
 fn missing_file_fails() {
     let dir = Fixture::named("missing");
     dir.write("a.txt", b"a\n");
-    let err = weld::execute(dir.path(), &args(&["a.txt", "nope.txt"])).unwrap_err();
+    let err = weld::execute(dir.path(), &args(&["a.txt", "nope.txt", "--"])).unwrap_err();
     assert!(err.contains("cannot read 'nope.txt'"), "unexpected: {err}");
+    // T1153 CORE-49 (R4): `weld` is a toolset workflow; read
+    // failures escape into a PHP fatal (255), not exit 1.
     assert_eq!(
-        weld::run_in(dir.path(), &args(&["a.txt", "nope.txt"])),
-        ExitCode::FAILURE
+        weld::run_in(dir.path(), &args(&["a.txt", "nope.txt", "--"])),
+        ExitCode::from(255)
     );
 }
 
@@ -136,7 +140,7 @@ fn seeded_weld_is_deterministic() {
     let dir = Fixture::named("deterministic");
     dir.write("a.txt", b"alpha\nbeta\ngamma\ndelta\n");
     dir.write("b.txt", b"one\ntwo\nthree\nfour\n");
-    let argv = args(&["--seed", "1234", "a.txt", "b.txt"]);
+    let argv = args(&["--seed", "1234", "a.txt", "b.txt", "--"]);
     let first = weld::execute(dir.path(), &argv).unwrap();
     let second = weld::execute(dir.path(), &argv).unwrap();
     assert_eq!(first, second);
@@ -154,7 +158,7 @@ fn weld_fuses_both_sides_within_line_bounds() {
         .collect();
     dir.write("a.txt", &a);
     dir.write("b.txt", &b);
-    let out = weld::execute(dir.path(), &args(&["--seed", "9", "a.txt", "b.txt"])).unwrap();
+    let out = weld::execute(dir.path(), &args(&["--seed", "9", "a.txt", "b.txt", "--"])).unwrap();
     // Two 20-line files fuse with a ceil(20/2) = 10-line overlap.
     assert_eq!(count_lines(&out), 30);
     let text = String::from_utf8(out).unwrap();
@@ -171,11 +175,11 @@ fn empty_files_are_skipped() {
     dir.write("b.txt", b"b1\nb2\n");
     let with_empty = weld::execute(
         dir.path(),
-        &args(&["--seed", "3", "empty.txt", "a.txt", "b.txt"]),
+        &args(&["--seed", "3", "empty.txt", "a.txt", "b.txt", "--"]),
     )
     .unwrap();
     let without_empty =
-        weld::execute(dir.path(), &args(&["--seed", "3", "a.txt", "b.txt"])).unwrap();
+        weld::execute(dir.path(), &args(&["--seed", "3", "a.txt", "b.txt", "--"])).unwrap();
     assert_eq!(with_empty, without_empty);
 }
 
@@ -184,10 +188,10 @@ fn all_empty_files_weld_to_nothing() {
     let dir = Fixture::named("all-empty");
     dir.write("a.txt", b"");
     dir.write("b.txt", b"");
-    let out = weld::execute(dir.path(), &args(&["a.txt", "b.txt"])).unwrap();
+    let out = weld::execute(dir.path(), &args(&["a.txt", "b.txt", "--"])).unwrap();
     assert_eq!(out, Vec::<u8>::new());
     assert_eq!(
-        weld::run_in(dir.path(), &args(&["a.txt", "b.txt"])),
+        weld::run_in(dir.path(), &args(&["a.txt", "b.txt", "--"])),
         ExitCode::SUCCESS
     );
 }
@@ -219,7 +223,7 @@ fn binary_input_round_trips_deterministically() {
     let dir = Fixture::named("binary");
     dir.write("a.txt", &[0xff, 0xfe, b'\n', 0x00, b'a', b'\n']);
     dir.write("b.txt", &[0x80, 0x81, b'\n', b'z', b'\n']);
-    let argv = args(&["--seed", "11", "a.txt", "b.txt"]);
+    let argv = args(&["--seed", "11", "a.txt", "b.txt", "--"]);
     let first = weld::execute(dir.path(), &argv).unwrap();
     let second = weld::execute(dir.path(), &argv).unwrap();
     assert_eq!(first, second);
@@ -235,7 +239,13 @@ fn welds_the_shipped_fixtures() {
     assert!(b.exists(), "missing fixture: {}", b.display());
     let out = weld::execute(
         dir.path(),
-        &args(&["--seed", "2026", a.to_str().unwrap(), b.to_str().unwrap()]),
+        &args(&[
+            "--seed",
+            "2026",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "--",
+        ]),
     )
     .unwrap();
     // 6 + 5 lines with a 5-line overlap: 6 lines out.

@@ -52,6 +52,11 @@ fn patchable_matrix_matches_php() {
         description: "d".to_string(),
         original: None,
         replacement: None,
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     };
     assert!(!base.is_patchable());
     let with_original = LintMessage {
@@ -307,6 +312,11 @@ fn empty_file_message_stops_later_linters() {
                 description: "d".to_string(),
                 original: None,
                 replacement: None,
+                granularity: None,
+                locations: Vec::new(),
+                bypass_changed_line_filtering: None,
+                original_bytes: None,
+                replacement_bytes: None,
             }]
         }
     }
@@ -391,7 +401,8 @@ fn config_text_length_reaches_the_linter() {
     .unwrap();
     assert_eq!(
         Engine::from_config(&bad, Path::new(".")).err().unwrap(),
-        "Error in parsing '.arclint' file, for linter 't': 'text.max-line-length' must be an integer"
+        // T1153 LINT-40: chain messages render one per line.
+        "Error in parsing '.arclint' file, for linter 't'.\n'text.max-line-length' must be an integer"
     );
 }
 
@@ -626,6 +637,11 @@ fn changed_line_filter_keeps_errors_and_line_less() {
         description: "d".to_string(),
         original: None,
         replacement: None,
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     };
     let mut changed: HashMap<String, Option<BTreeSet<usize>>> = HashMap::new();
     changed.insert("a.php".to_string(), Some(BTreeSet::from([2])));
@@ -682,6 +698,11 @@ fn result_code_prefers_errors_then_warnings() {
             description: "d".to_string(),
             original: None,
             replacement: None,
+            granularity: None,
+            locations: Vec::new(),
+            bypass_changed_line_filtering: None,
+            original_bytes: None,
+            replacement_bytes: None,
         });
         result.applied[0] = applied;
         result
@@ -697,9 +718,10 @@ fn result_code_prefers_errors_then_warnings() {
     );
     // Applied patches do not count.
     assert_eq!(result_code(&[result("error", true)]), RESULT_OKAY);
+    // T1153 LINT-5: one leading space.
     assert_eq!(
         render_result_code_okay(RESULT_OKAY, false),
-        "   OKAY  No lint messages.\n"
+        " OKAY  No lint messages.\n"
     );
     assert_eq!(render_result_code_okay(RESULT_WARNINGS, false), "");
 }
@@ -731,6 +753,11 @@ fn warn123(
         description: "Consider this.".to_string(),
         original: original.map(str::to_string),
         replacement: replacement.map(str::to_string),
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     }
 }
 
@@ -1067,13 +1094,15 @@ fn json_renderer_escapes_slashes_and_adds_context() {
 
 #[test]
 fn word_wrap_indents_and_wraps() {
-    assert_eq!(word_wrap("hi", 4), "    hi\n");
-    assert_eq!(word_wrap("a\n\nb", 2), "  a\n  \n  b\n");
+    // T1153 LINT-24: no synthetic trailing newline; content wraps at
+    // 78 - indent (78 total here), like `phutil_console_wrap()`.
+    assert_eq!(word_wrap("hi", 4), "    hi");
+    assert_eq!(word_wrap("a\n\nb", 2), "  a\n  \n  b");
     let long = "word ".repeat(20);
     let wrapped = word_wrap(long.trim_end(), 4);
     assert!(wrapped.lines().count() > 1);
     assert!(wrapped.lines().all(|line| line.starts_with("    ")));
-    assert!(wrapped.lines().all(|line| line.len() <= 80));
+    assert!(wrapped.lines().all(|line| line.len() <= 78));
 }
 
 // -( patcher )-----------------------------------------------------------
@@ -1434,6 +1463,11 @@ fn cached_results_skip_execution_and_merge_like_php() {
             description: "cached".to_string(),
             original: None,
             replacement: None,
+            granularity: None,
+            locations: Vec::new(),
+            bypass_changed_line_filtering: None,
+            original_bytes: None,
+            replacement_bytes: None,
         },
         granularity: Some(GRANULARITY_FILE),
     };
@@ -1595,11 +1629,13 @@ fn explicit_paths_must_exist_and_stay_unwalked() {
         tmp.path(),
     )
     .unwrap();
-    // Sorted by display path; directories pass through unlisted.
+    // T1153 LINT-9: CLI order is kept (never sorted); directories pass
+    // through unlisted. `/`-typed CLI paths keep `/` displays on every
+    // platform (the join is byte-preserving without `.`/`..`).
     assert_eq!(files.len(), 2);
-    assert_eq!(files[0].1, "sub/empty");
-    assert_eq!(files[1].1, "sub/file.txt");
-    assert_eq!(files[1].0, file);
+    assert_eq!(files[0].1, "sub/file.txt");
+    assert_eq!(files[1].1, "sub/empty");
+    assert_eq!(files[0].0, file);
     assert_eq!(
         collect_explicit(&["nope.txt".to_string()], tmp.path(), tmp.path()).unwrap_err(),
         "Path 'nope.txt' does not exist!"
@@ -1638,9 +1674,12 @@ fn confirm_honors_answers_and_defaults() {
         confirm("Do it?", default_yes, &mut cursor)
     };
     assert!(ask("y\n", false));
-    assert!(ask("YES\n", false));
+    // LINT-8: only `y`/`n`/empty answer; `yes`/`no` re-prompt like PHP.
+    assert!(!ask("YES\n", false));
     assert!(!ask("n\n", true));
-    assert!(!ask("No\n", true));
+    assert!(ask("No\n", true));
+    assert!(ask("yes\ny\n", false));
+    assert!(!ask("no\nn\n", true));
     assert!(ask("\n", true));
     assert!(!ask("\n", false));
     assert!(ask("", true));
@@ -1661,6 +1700,11 @@ fn error_message(code: &str, name: &str, description: &str) -> LintMessage {
         description: description.to_string(),
         original: None,
         replacement: None,
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     }
 }
 
@@ -1716,9 +1760,10 @@ fn result_code_okay_with_ansi_uses_green_writer() {
         render_result_code_okay(RESULT_OKAY, true),
         "\x1b[42m\x1b[1m OKAY \x1b[m\x1b[49m No lint messages.\n"
     );
+    // T1153 LINT-5: one leading space, stripped from the log-line markup.
     assert_eq!(
         render_result_code_okay(RESULT_OKAY, false),
-        "   OKAY  No lint messages.\n"
+        " OKAY  No lint messages.\n"
     );
     assert_eq!(render_result_code_okay(RESULT_WARNINGS, true), "");
 }
@@ -1730,9 +1775,10 @@ fn lint_notice_line_uses_yellow_writer() {
         "\x1b[43m\x1b[1m LINT NOTICE \x1b[m\x1b[49m Automatically amending HEAD with lint \
          patches.\n"
     );
+    // T1153 LINT-6: the markup strips on non-TTYs.
     assert_eq!(
         lint_notice_line(false),
-        "** LINT NOTICE ** Automatically amending HEAD with lint patches.\n"
+        " LINT NOTICE  Automatically amending HEAD with lint patches.\n"
     );
 }
 
@@ -1781,6 +1827,11 @@ fn context_with_ansi_highlights_single_line_change() {
         description: "Fix it.".to_string(),
         original: Some("world".to_string()),
         replacement: Some("there".to_string()),
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     };
     let tty = render_context_with_ansi(&message, b"hello world\nbye\n", true);
     assert!(tty.contains(">>> -      1 hello \x1b[7mworld\x1b[m\n"));
@@ -1802,7 +1853,737 @@ fn context_with_ansi_skips_multiline_highlight() {
         description: "Fix it.".to_string(),
         original: Some("one\ntwo".to_string()),
         replacement: None,
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     };
     let tty = render_context_with_ansi(&message, b"one\ntwo\n", true);
     assert!(!tty.contains('\x1b'));
+}
+
+// -( R5 TTY gating: LINT-8 )--------------------------------------------------
+
+#[test]
+fn r5_lint8_confirm_with_tty_gates_pipes() {
+    // `phutil_console_prompt()` echoes, then `require_tty()` throws
+    // (`src/console/format.php:42-52`); scripted TTY sessions answer.
+    let mut piped = std::io::BufReader::new("y\n".as_bytes());
+    assert_eq!(
+        confirm_with_tty("Apply this patch to f?", true, &mut piped, false).unwrap_err(),
+        crate::prompt::NOT_INTERACTIVE
+    );
+    let mut tty = std::io::BufReader::new("y\n".as_bytes());
+    assert!(confirm_with_tty("Apply this patch to f?", true, &mut tty, true).unwrap());
+    // Amend-prompt default stays yes; Enter amends.
+    let mut enter = std::io::BufReader::new("\n".as_bytes());
+    assert!(confirm_with_tty("Amend HEAD with lint patches?", true, &mut enter, true).unwrap());
+}
+
+#[test]
+fn r4_lint1_no_effect_kinds() {
+    use arc_rs::conduit::EnvelopeKind;
+    // Both `ArcanistNoEffectException` sites route to stdout + exit 0.
+    assert_eq!(
+        classify_gather_error("No paths are lintable.".to_string()).kind,
+        EnvelopeKind::NoEffect
+    );
+    let error = arc_rs::conduit::ClassifiedError::no_effect("No linters to run.".to_string());
+    assert_eq!(error.kind, EnvelopeKind::NoEffect);
+    assert_eq!(error.kind.exit_code(), std::process::ExitCode::SUCCESS);
+}
+
+#[test]
+fn r4_lint2_lint3_gather_emit_kinds() {
+    use arc_rs::conduit::EnvelopeKind;
+    // Amend declines are usage; renderer and git failures are generic.
+    assert_eq!(
+        classify_emit_error(
+            "Sort out the lint changes that were applied to the working copy and relint."
+                .to_string()
+        )
+        .kind,
+        EnvelopeKind::Usage
+    );
+    assert_eq!(
+        classify_emit_error("Lint renderer \"x\" is unknown.".to_string()).kind,
+        EnvelopeKind::Exception
+    );
+    assert_eq!(
+        classify_gather_error("failed to run git: boom".to_string()).kind,
+        EnvelopeKind::Exception
+    );
+    // Usage renders with no dump: the classified parse path keeps the
+    // bare message (the `Usage Exception:` label applies at `run_in`).
+    assert!(matches!(
+        parse_args(&["--bogus".to_string()]),
+        ParseOutcome::Error(_)
+    ));
+}
+
+// -( T1153 Wave 2: lint retrocompat )--------------------------------------
+
+fn lint4_failing_parser(_output: &str) -> Vec<crate::lint_script_and_regex::ScriptRegexMatch> {
+    unreachable!("the script fails before parsing")
+}
+
+#[test]
+fn lint4_linter_failures_aggregate_without_rendering() {
+    // A failing linter never aborts the run: every path still lints and
+    // any failure becomes `Some linters failed:` (nothing renders).
+    let tmp = TempDir::new("lint4");
+    tmp.write("ok.txt", "ok\n");
+    let work = WorkCopy {
+        vcs: Vcs::Git,
+        vcs_root: tmp.path().to_path_buf(),
+        project_root: tmp.path().to_path_buf(),
+    };
+    let mut engine = Engine::empty();
+    engine.add_linter(Box::new(
+        crate::lint_script_and_regex::ScriptAndRegexLinter::with_script_and_parser(
+            "exit 1",
+            lint4_failing_parser,
+        ),
+    ));
+    assert_eq!(
+        workflow_lint_selection(
+            &engine,
+            &work,
+            &["ok.txt".to_string(), "ok.txt".to_string()]
+        )
+        .unwrap_err(),
+        "Some linters failed:"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn lint20_unreadable_files_fold_into_the_aggregate() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new("lint20");
+    let locked = tmp.write("locked.txt", "x\n");
+    tmp.write("ok.txt", "ok\n");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&locked).is_ok() {
+        // Privileged runner (e.g. root in CI containers): permission
+        // bits do not block reads, so the failure under test cannot
+        // trigger.
+        return;
+    }
+    let work = WorkCopy {
+        vcs: Vcs::Git,
+        vcs_root: tmp.path().to_path_buf(),
+        project_root: tmp.path().to_path_buf(),
+    };
+    let mut engine = Engine::empty();
+    engine.add_linter(Box::new(TextLinter::new()));
+    // The good path still lints, but the failure aggregates like PHP.
+    assert_eq!(
+        workflow_lint_selection(
+            &engine,
+            &work,
+            &["locked.txt".to_string(), "ok.txt".to_string()]
+        )
+        .unwrap_err(),
+        "Some linters failed:"
+    );
+}
+
+#[test]
+fn lint9_result_sections_keep_first_seen_order() {
+    let mut first = warn123(1, 1, None, None);
+    first.path = "b.txt".to_string();
+    let mut second = warn123(1, 1, None, None);
+    second.path = "a.txt".to_string();
+    let results = group_results(vec![first, second], &|path| PathBuf::from(path));
+    let paths: Vec<&str> = results.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(paths, vec!["b.txt", "a.txt"]);
+}
+
+#[test]
+fn lint9_explicit_paths_keep_cli_order_and_dupes() {
+    let tmp = TempDir::new("lint9");
+    tmp.write("b.txt", "b\n");
+    tmp.write("a.txt", "a\n");
+    let files = collect_explicit(
+        &[
+            "b.txt".to_string(),
+            "a.txt".to_string(),
+            "b.txt".to_string(),
+        ],
+        tmp.path(),
+        tmp.path(),
+    )
+    .unwrap();
+    let displays: Vec<&str> = files.iter().map(|(_, display)| display.as_str()).collect();
+    assert_eq!(displays, vec!["b.txt", "a.txt", "b.txt"]);
+}
+
+#[test]
+fn lint10_dotdot_segments_normalize_lexically() {
+    let tmp = TempDir::new("lint10");
+    tmp.write("file.txt", "x\n");
+    std::fs::create_dir(tmp.path().join("sub")).unwrap();
+    let files = collect_explicit(&["sub/../file.txt".to_string()], tmp.path(), tmp.path()).unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].1, "file.txt");
+    assert_eq!(files[0].0, tmp.path().join("file.txt"));
+}
+
+#[test]
+fn lint11_json_dict_carries_granularity_locations_and_bypass() {
+    let mut message = warn123(2, 3, None, None);
+    message.granularity = Some(4);
+    message.bypass_changed_line_filtering = Some(true);
+    message.locations = vec![OtherLocation {
+        path: Some("other.php".to_string()),
+        line: 9,
+        char: 0,
+        original: None,
+    }];
+    let dict = message_json_dict(&message, b"l1\nl2\nl3\n");
+    assert_eq!(dict["granularity"], serde_json::json!(4));
+    assert_eq!(dict["bypassChangedLineFiltering"], serde_json::json!(true));
+    assert_eq!(dict["locations"][0]["path"], serde_json::json!("other.php"));
+    assert_eq!(dict["locations"][0]["line"], serde_json::json!(9));
+    assert!(
+        !dict["locations"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("original")
+    );
+    // Key order matches `toDictionary()` plus trailing `context`.
+    let keys: Vec<&str> = dict
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            "line",
+            "char",
+            "code",
+            "severity",
+            "name",
+            "description",
+            "original",
+            "replacement",
+            "granularity",
+            "locations",
+            "bypassChangedLineFiltering",
+            "context",
+        ]
+    );
+}
+
+#[test]
+fn lint11_engine_stamps_cache_granularity() {
+    let mut engine = Engine::empty();
+    engine.add_linter(Box::new(TextLinter::new()));
+    let found = engine.lint_bytes("f.txt", b"ok  \n");
+    assert!(!found.is_empty());
+    assert!(found.iter().all(|m| m.granularity == Some(1)));
+    assert_eq!(
+        crate::lint_phutil_library::PhutilLibraryLinter::new().cache_granularity(),
+        4
+    );
+}
+
+#[test]
+fn lint11_del_passes_through_raw_in_json() {
+    assert_eq!(json_escape_nonascii("a\x7fb"), "a\x7fb");
+    assert_eq!(json_escape_nonascii("caf\u{e9}"), "caf\\u00e9");
+}
+
+#[test]
+fn lint12_xml_escapes_tabs_newlines_and_returns() {
+    assert_eq!(
+        xml_escape("a\tb\nc\rd\"e<f>g&h"),
+        "a&#9;b&#10;c&#13;d&quot;e&lt;f&gt;g&amp;h"
+    );
+    // Unknown severities render empty, like PHP's null attribute.
+    assert_eq!(xml_severity("bogus"), "");
+}
+
+#[test]
+fn lint13_console_lists_other_locations() {
+    let mut message = warn123(1, 1, None, None);
+    message.path = "a.php".to_string();
+    message.locations = vec![
+        OtherLocation {
+            path: None,
+            line: 9,
+            char: 0,
+            original: None,
+        },
+        OtherLocation {
+            path: Some("b.php".to_string()),
+            line: 0,
+            char: 0,
+            original: None,
+        },
+    ];
+    let mut result = LintResult::new("a.php".to_string(), PathBuf::from("a.php"), b"x\n".to_vec());
+    result.add_message(message);
+    let rendered = render_console_result_with_ansi(&result, false).unwrap();
+    assert!(
+        rendered.contains("Other locations: a.php:9, b.php"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn lint14_relevance_honors_bypass_and_other_locations() {
+    let changed: HashMap<String, Option<BTreeSet<usize>>> = [
+        ("a.php".to_string(), Some(BTreeSet::from([9]))),
+        ("b.php".to_string(), Some(BTreeSet::from([1]))),
+    ]
+    .into_iter()
+    .collect();
+    let mut bypassed = warn123(1, 1, None, None);
+    bypassed.path = "a.php".to_string();
+    bypassed.bypass_changed_line_filtering = Some(true);
+    let mut rescued = warn123(1, 1, None, None);
+    rescued.path = "a.php".to_string();
+    rescued.locations = vec![OtherLocation {
+        path: None,
+        line: 9,
+        char: 0,
+        original: None,
+    }];
+    // A line-less message on an unknown path still drops.
+    let mut dropped = warn123(0, 0, None, None);
+    dropped.path = "elsewhere.php".to_string();
+    let kept = filter_changed_lines(vec![bypassed, rescued, dropped], &changed);
+    assert_eq!(kept.len(), 2);
+}
+
+#[test]
+fn lint15_position_sort_is_stable_without_code_tiebreak() {
+    let mut result = LintResult::new("a.txt".to_string(), PathBuf::from("a.txt"), b"x\n".to_vec());
+    let mut first = warn123(2, 1, None, None);
+    first.code = "ZZZ".to_string();
+    let mut second = warn123(2, 1, None, None);
+    second.code = "AAA".to_string();
+    result.add_message(first);
+    result.add_message(second);
+    result.sort_messages();
+    assert_eq!(codes(&result.messages), vec!["ZZZ", "AAA"]);
+}
+
+#[test]
+fn lint16_renderer_list_follows_class_map_order() {
+    assert_eq!(
+        all_renderers(),
+        vec!["xml", "compiler", "console", "json", "none", "summary"]
+    );
+}
+
+#[test]
+fn lint17_binary_diff_markers_span_git_svn_and_hg() {
+    assert!(is_binary_diff_marker("Binary files a/b and b/b differ"));
+    assert!(is_binary_diff_marker("Files a/b and b/b differ"));
+    assert!(is_binary_diff_marker(
+        "Cannot display: file marked as a binary type."
+    ));
+    assert!(is_binary_diff_marker("Binary file b/b has changed"));
+    assert!(is_binary_diff_marker("GIT binary patch"));
+    assert!(is_binary_diff_marker("GIT binary patch\r"));
+    assert!(!is_binary_diff_marker("Binary files differ"));
+    assert!(!is_binary_diff_marker("+GIT binary patch"));
+    assert!(!is_binary_diff_marker("diff --git a/b b/b"));
+}
+
+#[test]
+fn lint18_patcher_allows_one_past_end_and_null_char_backs_up() {
+    // One past the last line appends instead of erroring.
+    let append = warn123(3, 1, Some(""), Some("tail"));
+    let (patched, applied) = build_patched_data(b"a\n", &[append]).unwrap();
+    assert_eq!(patched, b"a\ntail");
+    assert_eq!(applied, vec![true]);
+    // Two past the end still errors, with PHP's `$line`-renders-0 text.
+    let past = warn123(4, 1, Some(""), Some("tail"));
+    assert_eq!(
+        build_patched_data(b"a\n", &[past]).unwrap_err(),
+        "Data has fewer than 0 lines."
+    );
+    // A null char on line 1 lands before the start, so the dirty cursor
+    // skips the message.
+    let skipped = warn123(1, 0, Some(""), Some("Q"));
+    let (patched, applied) = build_patched_data(b"a\n", &[skipped]).unwrap();
+    assert_eq!(patched, b"a\n");
+    assert_eq!(applied, vec![false]);
+    // On later lines it patches one byte before the line start.
+    let backed = warn123(2, 0, Some("\n"), Some("Q"));
+    let (patched, applied) = build_patched_data(b"a\nb\n", &[backed]).unwrap();
+    assert_eq!(patched, b"aQb\n");
+    assert_eq!(applied, vec![true]);
+}
+
+#[test]
+#[cfg(unix)]
+fn lint22_single_engine_strips_directories() {
+    let tmp = TempDir::new("lint22");
+    let dir = tmp.path().join("sub");
+    std::fs::create_dir(&dir).unwrap();
+    let mut single = Engine::new();
+    single.single = true;
+    assert!(single.is_single());
+    assert!(single.lint_file(&dir, "sub").unwrap().is_empty());
+    assert!(!Engine::new().is_single());
+}
+
+#[test]
+fn lint24_wrap_matches_phutil_console_wrap() {
+    // Short lines pass through verbatim (no synthetic newline, spacing kept).
+    assert_eq!(word_wrap("aa  bb", 4), "    aa  bb");
+    assert_eq!(word_wrap("", 4), "");
+    assert_eq!(word_wrap("a\nb", 4), "    a\n    b");
+    // Content wraps at 78 - indent over characters, not bytes: the
+    // multibyte tail stays whole on the second line.
+    let text = format!("{} {} tail", "a ".repeat(9) + "a", "\u{e9}".repeat(60));
+    let wrapped = word_wrap(&text, 4);
+    assert_eq!(
+        wrapped,
+        format!("    {}a\n    {} tail", "a ".repeat(9), "\u{e9}".repeat(60))
+    );
+    // ANSI escapes ride along without counting toward the width.
+    assert_eq!(word_wrap("\x1b[31mhi\x1b[m", 4), "    \x1b[31mhi\x1b[m");
+}
+
+#[test]
+fn lint25_empty_file_renders_one_blank_context_line() {
+    let message = warn123(1, 1, None, None);
+    let rendered = render_context(&message, b"");
+    assert!(!rendered.contains("past the end"), "{rendered}");
+    assert!(rendered.contains('^'), "{rendered}");
+}
+
+#[test]
+fn lint30_phutil_xhpast_standard_matches_php() {
+    let config = phutil_xhpast_standard_config();
+    assert_eq!(config["xhpast.php-version"], serde_json::json!("5.2.3"));
+    assert_eq!(
+        config["xhpast.php-version.windows"],
+        serde_json::json!("5.3.0")
+    );
+    assert!(
+        config["xhpast.blacklisted.function"]["eval"]
+            .as_str()
+            .unwrap()
+            .contains("should be avoided")
+    );
+    assert_eq!(
+        config["xhpast.dynamic-string.classes"]["ExecFuture"],
+        serde_json::json!(0)
+    );
+    assert_eq!(
+        config["xhpast.dynamic-string.functions"]["qsprintf"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        config["xhpast.dynamic-string.functions"]["pht"],
+        serde_json::json!(0)
+    );
+}
+
+#[test]
+fn lint36_line_wrap_width_prints_raw() {
+    let mut data = vec![b'x'; 1501];
+    data.push(b'\n');
+    let found = TextLinter::with_max_line_length(1500).lint_bytes("w.txt", &data);
+    assert_eq!(codes(&found), vec!["TXT3"]);
+    assert_eq!(
+        found[0].description,
+        "This line is 1,501 characters long, but the convention is 1500 characters."
+    );
+}
+
+#[test]
+fn lint37_sections_and_rules_keep_file_order() {
+    let config = arclint::parse_arclint(
+        r#"{"linters": {"z-last": {"type": "text"}, "a-first": {"type": "text"}}}"#,
+    )
+    .unwrap();
+    let names: Vec<&str> = config.linters.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["z-last", "a-first"]);
+    // `severity.rules` first match wins in file order, not sorted order.
+    let overrides = arclint::SeverityOverrides {
+        map: HashMap::new(),
+        rules: vec![
+            ("/TXT9/".to_string(), "warning".to_string()),
+            ("/T/".to_string(), "error".to_string()),
+        ],
+    };
+    assert_eq!(overrides.severity_for("TXT9", "error"), "warning");
+}
+
+#[test]
+fn lint40_option_setter_failures_use_in_key_context() {
+    let config =
+        arclint::parse_arclint(r#"{"linters": {"j": {"type": "jshint", "standard": "bogus"}}}"#)
+            .unwrap();
+    let err = Engine::from_config(&config, Path::new(".")).err().unwrap();
+    assert!(
+        err.starts_with("Error in parsing '.arclint' file, in key 'standard' for linter 'j'.\n"),
+        "{err}"
+    );
+    let config = arclint::parse_arclint(
+        r#"{"linters": {"c": {"type": "csharp", "severity": {"SA1600": "disabled"}}}}"#,
+    )
+    .unwrap();
+    let err = Engine::from_config(&config, Path::new(".")).err().unwrap();
+    assert!(
+        err.starts_with("Error in parsing '.arclint' file, in key 'severity' for linter 'c'.\n"),
+        "{err}"
+    );
+    // Type-shape failures stay under the `for linter` context.
+    let config =
+        arclint::parse_arclint(r#"{"linters": {"j": {"type": "jshint", "flags": "nope"}}}"#)
+            .unwrap();
+    let err = Engine::from_config(&config, Path::new(".")).err().unwrap();
+    assert!(
+        err.starts_with("Error in parsing '.arclint' file, for linter 'j'.\n"),
+        "{err}"
+    );
+}
+
+#[test]
+fn lint41_negative_max_line_length_flags_every_line() {
+    assert!(option_value_matches(
+        OptionType::Int,
+        &serde_json::json!(-5)
+    ));
+    let mut linter = TextLinter::new();
+    let ctx = OptionContext {
+        project_root: Path::new("."),
+    };
+    linter
+        .set_option("text.max-line-length", &serde_json::json!(-5), &ctx)
+        .unwrap();
+    // Every line, including empty ones (`strlen > -5` always holds).
+    let found = linter.lint_bytes("n.txt", b"a\n\n");
+    let wraps: Vec<_> = found.iter().filter(|m| m.code == "TXT3").collect();
+    assert_eq!(wraps.len(), 3);
+    assert!(
+        wraps
+            .iter()
+            .all(|m| m.description.contains("convention is -5 characters"))
+    );
+}
+
+#[test]
+fn lint43_newline_patch_keeps_raw_bytes() {
+    let data = b"a\xffb\r\n";
+    let found = text("r.txt", data);
+    let dos = found.iter().find(|m| m.code == "TXT1").unwrap();
+    let (patched, _) = build_patched_data(data, std::slice::from_ref(dos)).unwrap();
+    assert_eq!(patched, b"a\xffb\n");
+}
+
+#[test]
+fn lint44_backslash_hidden_is_not_a_dotfile() {
+    assert_eq!(codes(&text("foo\\.hidden", b"")), vec!["TXT10"]);
+    assert!(text(".hidden", b"").is_empty());
+}
+
+#[test]
+fn d22_message_to_dictionary_has_php_keys() {
+    // T1153 DIFF-D22: `unresolvedLint` dicts carry the 12
+    // `toDictionary()` keys (`ArcanistLintMessage.php:56-71`).
+    let message = LintMessage {
+        path: "f.php".to_string(),
+        line: 3,
+        col: 7,
+        code: "X".to_string(),
+        severity: SEVERITY_WARNING.to_string(),
+        name: "n".to_string(),
+        description: "d".to_string(),
+        original: Some("a".to_string()),
+        replacement: Some("b".to_string()),
+        granularity: Some(2),
+        locations: Vec::new(),
+        bypass_changed_line_filtering: Some(true),
+        original_bytes: None,
+        replacement_bytes: None,
+    };
+    assert_eq!(
+        message.to_dictionary(),
+        serde_json::json!({
+            "path": "f.php",
+            "line": 3,
+            "char": 7,
+            "code": "X",
+            "severity": "warning",
+            "name": "n",
+            "description": "d",
+            "original": "a",
+            "replacement": "b",
+            "granularity": 2,
+            "locations": [],
+            "bypassChangedLineFiltering": true,
+        })
+    );
+    // Unset line/char render null.
+    let path_level = LintMessage {
+        line: 0,
+        col: 0,
+        ..message
+    };
+    let dict = path_level.to_dictionary();
+    assert_eq!(dict["line"], serde_json::Value::Null);
+    assert_eq!(dict["char"], serde_json::Value::Null);
+}
+
+#[test]
+fn d22_unresolved_dicts_skip_applied_messages() {
+    // T1153 DIFF-D22: applied patches resolve their messages
+    // (`ArcanistLintWorkflow.php:360-375`).
+    let mut result = LintResult::new("f".to_string(), std::path::PathBuf::from("f"), Vec::new());
+    let kept = LintMessage {
+        path: "f".to_string(),
+        line: 1,
+        col: 1,
+        code: "K".to_string(),
+        severity: SEVERITY_ERROR.to_string(),
+        name: "n".to_string(),
+        description: "kept".to_string(),
+        original: None,
+        replacement: None,
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
+    };
+    let fixed = LintMessage {
+        code: "F".to_string(),
+        description: "fixed".to_string(),
+        ..kept.clone()
+    };
+    result.add_message(kept);
+    result.add_message(fixed);
+    result.applied = vec![false, true];
+    let dicts = unresolved_dicts(std::slice::from_ref(&result));
+    assert_eq!(dicts.len(), 1);
+    assert_eq!(dicts[0]["description"], serde_json::json!("kept"));
+}
+
+#[test]
+fn d22_bare_child_amend_gates_like_argv_flags() {
+    // T1153 DIFF-D22: `diff`'s bare amend intent enables the amend
+    // prompt (gated on VCS support + mutable history, `:248-252`).
+    let tmp = TempDir::new("d22-amend");
+    let root = tmp.path().join("repo");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let work = WorkCopy {
+        vcs: Vcs::Git,
+        vcs_root: root.clone(),
+        project_root: root.clone(),
+    };
+    let bare = Options {
+        child_amend: true,
+        ..Default::default()
+    };
+    assert!(amend_enabled(&work, &bare).unwrap());
+    assert!(!amend_enabled(&work, &Options::default()).unwrap());
+    // Immutable history disables even the bare intent.
+    std::fs::write(root.join(".arcconfig"), r#"{"history.immutable": true}"#).unwrap();
+    assert!(!amend_enabled(&work, &bare).unwrap());
+}
+#[test]
+fn r10_lint_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "LINT WORKFLOW\n\
+         \n\
+         lint\n\
+         \x20     lint [options] [paths]\n\
+         \x20     lint [options] --rev [rev]\n\
+         \n\
+         \x20         Supports: git, svn, hg\n\
+         \x20         Run static analysis on changes to check for mistakes. If no files\n\
+         \x20         are specified, lint will be run on all files which have been\n\
+         modified.\n\
+         \n\
+         \x20     --amend-all\n\
+         \x20         When linting git repositories, amend HEAD with all patches\n\
+         \x20         suggested by lint without prompting.\n\
+         \n\
+         \x20     --amend-autofixes\n\
+         \x20         When linting git repositories, amend HEAD with autofix patches\n\
+         \x20         suggested by lint without prompting.\n\
+         \n\
+         \x20     --apply-patches\n\
+         \x20         Apply patches suggested by lint to the working copy without\n\
+         \x20         prompting.\n\
+         \n\
+         \x20     --engine classname\n\
+         \x20         Override configured lint engine for this project.\n\
+         \n\
+         \x20     --everything\n\
+         \x20         Lint all tracked files in the working copy. Ignored files and\n\
+         \x20         untracked files will not be linted.\n\
+         \n\
+         \x20     --lintall\n\
+         \x20         Show all lint warnings, not just those on changed lines. When paths\n\
+         \x20         are specified, this is the default behavior.\n\
+         \n\
+         \x20     --never-apply-patches\n\
+         \x20         Never apply patches suggested by lint.\n\
+         \n\
+         \x20     --outfile path\n\
+         \x20         Output the linter results to a file. Defaults to stdout.\n\
+         \n\
+         \x20     --output format\n\
+         \x20         Select an output format.\n\
+         \n\
+         \x20     --rev revision\n\
+         \x20         Lint changes since a specific revision.\n\
+         \n\
+         \x20     --severity string\n\
+         \x20         Set minimum message severity. One of: 'advice', 'autofix',\n\
+         \x20         'warning', 'error', 'disabled'. Defaults to 'advice'.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("LINT WORKFLOW"), "{}", usage());
+}
+
+#[test]
+fn b21_lint_needs_no_terminator() {
+    // T1153 B21/B23 VERIFIED for `lint`: it is a classic workflow,
+    // so PHP runs it via the `scripts/arcanist.php` re-exec, which
+    // never requires `--`. Parsing takes no TTY input, so
+    // piped-style argv parses directly, and `--help` without `--`
+    // still succeeds.
+    assert!(matches!(
+        parse_args(&args(&["--lintall"])),
+        ParseOutcome::Args(_)
+    ));
+    assert!(matches!(parse_args(&args(&["--help"])), ParseOutcome::Help));
+    let text = usage_text(false);
+    assert!(text.contains("LINT WORKFLOW"), "{text}");
+}
+
+#[test]
+fn b23_lint_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help lint`.
+    let text = usage_text(false);
+    assert!(text.starts_with("LINT WORKFLOW\n"), "{text}");
+    assert!(text.contains("Run static analysis on changes"), "{text}");
+    assert!(text.contains("--severity"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }

@@ -350,9 +350,10 @@ fn result_string_field(value: &serde_json::Value, key: &str) -> Option<String> {
     value.get(key)?.as_str().map(str::to_string)
 }
 
-/// Fetch an optional string-map field from a driver result object.
-/// Non-string values become empty (only keys matter downstream).
-fn result_map_field(value: &serde_json::Value, key: &str) -> Option<HashMap<String, String>> {
+/// Fetch an optional string-map field from a driver result object, in
+/// document order (serde keeps `preserve_order`, UNIT-U20). Non-string
+/// values become empty (only keys matter downstream).
+fn result_map_field(value: &serde_json::Value, key: &str) -> Option<Vec<(String, String)>> {
     let obj = value.get(key)?.as_object()?;
     Some(
         obj.iter()
@@ -390,7 +391,7 @@ fn parse_phutil_result(value: &serde_json::Value) -> Result<UnitResult, EngineEr
         result.set_user_data(&user_data);
     }
     if let Some(coverage) = result_map_field(value, "coverage") {
-        result.set_coverage(coverage);
+        result.set_coverage_ordered(coverage);
     }
     Ok(result)
 }

@@ -1,14 +1,22 @@
 //! `arc which` — explain the resolved config/repo context.
 //!
-//! PHP reference: `src/workflow/ArcanistWhichWorkflow.php`, the base
-//! commit rules (`src/parser/ArcanistBaseCommitParser.php`), and the git
-//! pieces of `src/repository/api/ArcanistGitAPI.php`.
+//! PHP reference: `src/workflow/ArcanistWhichWorkflow.php` (`run()` at
+//! `:57-261`), the base commit rules
+//! (`src/parser/ArcanistBaseCommitParser.php`), and the git pieces of
+//! `src/repository/api/ArcanistGitAPI.php`.
 //!
-//! Deviations (see T1128): the report keeps arc-rs's own section layout
-//! instead of PHP's console-formatted sections; long guidance paragraphs
-//! are not word-wrapped; only git working copies are detected; revision
-//! matching is opportunistic — when no conduit client is available the
-//! matching section says why instead of failing like PHP.
+//! Layout (T1153 RB-D16): the three ceb prose sections — `REPOSITORY`
+//! with its association reasons, `COMMIT RANGE` with its prose, and
+//! `MATCHING REVISIONS` — each `phutil_console_wrap()`-wrapped like
+//! PHP, printed in stages so failures land after the sections PHP has
+//! already printed. Association runs `repository.query` (T1153 RB-D17);
+//! the range shows the 16-char base with its summary (T1153 RB-D18).
+//!
+//! Deviations (see T1128): only git working copies are detected — the
+//! hg/svn repository APIs are not ported, so outside git the command
+//! reports PHP's working-copy usage text (T1153 RB-D16, Rule 3: no Rust
+//! hg/svn backend exists to drive). `--json` stays an arc-rs extension
+//! (PHP rejects it); it shapes no default byte.
 //!
 //! Console colors follow the PHP markup sites on TTYs: every section
 //! header renders bold (PHP wraps its `REPOSITORY`, `COMMIT RANGE`, and
@@ -22,7 +30,10 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use arc_rs::{conduit, config, get_config, git, terminal};
+use arc_rs::{
+    conduit::{self, EnvelopeKind},
+    config, get_config, git, terminal,
+};
 
 /// Subcommand name, matching `arc which`.
 pub const NAME: &str = "which";
@@ -31,22 +42,61 @@ pub const NAME: &str = "which";
 /// (`ArcanistGitAPI::GIT_MAGIC_ROOT_COMMIT`).
 pub const GIT_MAGIC_ROOT_COMMIT: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
-const USAGE: &str = "usage: arc which [--conduit-uri URI] [--head COMMIT] [--show-base] [--json] [--base RULES] [--any-status] [COMMIT]\n\
-|\n\
-|Explain how arc resolves the working copy, project, conduit, and\n\
-|commit-range context for the current directory. Optional COMMIT pins the\n\
-|base of the reported range; --head pins its end (default HEAD).\n\
-|\n\
-|Options:\n\
-|  --conduit-uri URI   Override Conduit URI discovery for this report.\n\
-|  --head COMMIT       End of the commit range (default HEAD).\n\
-|  --show-base         Print the base commit only and exit.\n\
-|  --base RULES        Additional rules for determining the base commit.\n\
-|  --any-status        Show committed and abandoned revisions.\n\
-|  --json              Emit the report as JSON.\n\
-|  -h, --help          Show this help.\n";
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `arc_rs::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistWhichWorkflow.php:12-65`).
+const HELP_SYNOPSIS: &str =
+    "      **which** [options] (svn)\n      **which** [options] [__commit__] (hg, git)";
+const HELP_TEXT: &str = "          Supports: svn, git, hg\n          Shows which repository the current working copy corresponds to,\n          which commits 'arc diff' will select, and which revision is in\n          the working copy (or which revisions, if more than one matches).";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[
+    (
+        "any-status",
+        None,
+        None,
+        "Show committed and abandoned revisions.",
+    ),
+    (
+        "base",
+        None,
+        Some("rules"),
+        "Additional rules for determining base revision.",
+    ),
+    ("show-base", None, None, "Print base commit only and exit."),
+    (
+        "head",
+        None,
+        Some("commit"),
+        "Specify the end of the commit range to select.",
+    ),
+];
 
-/// One commit in the reported range.
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<arc_rs::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    arc_rs::help::usage_text(
+        NAME,
+        None,
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &specs,
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(arc_rs::terminal::ansi_enabled())
+}
+
+/// One commit in the reported range (T1153 RB-D16: cloned into the
+/// staged range render).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
     pub sha: String,
     pub subject: String,
@@ -70,15 +120,24 @@ pub struct MatchedRevision {
     pub why: String,
 }
 
-/// Revision-matching outcome for the report.
+/// Everything `COMMIT RANGE` prints: the resolved base, its 16-char
+/// display with summary, the `git diff` command line, and the commits
+/// (T1153 RB-D18).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Matching {
-    OutsideRepo,
-    Unavailable(String),
-    Found(Vec<MatchedRevision>),
+pub struct RangeData {
+    pub base: String,
+    pub explanation: String,
+    pub base16: String,
+    pub summary: String,
+    pub command: String,
+    pub commits: Vec<Commit>,
+    /// Resolved head SHA, like PHP's `getHeadCommit()`.
+    pub head: String,
 }
 
-/// Resolved context for one directory.
+/// Resolved context for one directory (T1153 RB-D16: the staged
+/// sections' shared model, rendered by [`render_ansi`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Context {
     /// Directory the report was built for.
     pub dir: String,
@@ -98,50 +157,46 @@ pub struct Context {
     pub head_subject: Option<String>,
     /// `remote.origin.url`, if configured.
     pub remote_url: Option<String>,
-    /// `repository.callsign` with where it came from.
+    /// `repository.callsign` from any config source, if set.
     pub callsign: Option<String>,
-    pub callsign_source: Option<&'static str>,
     /// Resolved conduit URI, if any.
     pub conduit_uri: Option<String>,
     /// Where the conduit URI came from.
     pub conduit_source: &'static str,
     /// Whether `~/.arcrc` holds a token for the URI.
     pub token_installed: Option<bool>,
+    /// Associated repository name, if any.
+    pub repo_name: Option<String>,
+    /// Association reason trail.
+    pub repo_reasons: Vec<String>,
     /// Base commit of the range.
     pub base: Option<String>,
     /// Why that base was chosen.
     pub base_explanation: Option<String>,
+    /// 16-char base display.
+    pub base16: Option<String>,
+    /// Base commit summary.
+    pub summary: Option<String>,
+    /// `git diff` command line for the range.
+    pub command: Option<String>,
     /// End of the range (`--head` or `HEAD`).
     pub head_ref: String,
-    /// Commits in the range, oldest first.
+    /// Whether `--head` was given explicitly.
+    pub head_explicit: bool,
+    /// Commits in the range, newest first.
     pub commits: Vec<Commit>,
-    /// Argument suffix for `arc diff` guidance (`' X'` or `''`).
+    /// Argument suffix for `arc diff` guidance (`' X'`, `' --head Y'`).
     pub diff_arg: String,
     /// Differential revisions matching the working copy.
-    pub matching: Matching,
-}
-
-/// How `load_context` should match revisions.
-pub enum MatchConfig<'a> {
-    /// Skip matching (e.g. `--show-base`); the section is still rendered.
-    Unavailable(String),
-    /// Match through this client; `any_status` selects `status-any`.
-    Live {
-        client: &'a conduit::Client,
-        any_status: bool,
-    },
-}
-
-/// Interactive inputs for [`load_context`]: `--base` rules, a prompt hook
-/// (`None` on EOF), and revision matching.
-pub struct Resolution<'a> {
-    pub runtime_rules: &'a str,
-    pub prompt: &'a dyn Fn(&str) -> Option<String>,
-    pub match_config: MatchConfig<'a>,
+    pub matching: Vec<MatchedRevision>,
 }
 
 /// Resolve the conduit URI with its source, mirroring
-/// [`config::client_for`] precedence: flag, environment, `.arcconfig`.
+/// [`config::client_for`] precedence: flag, environment, then the merged
+/// `phabricator.uri` (else `default`, like [`config::discover_from`]).
+/// T1153 Wave-2 carry-over: the merged source label comes from
+/// [`get_config::merged_value`], so user/system/local URIs are no longer
+/// misreported as `project (.arcconfig)`.
 #[must_use]
 pub fn resolve_conduit_in(
     dir: &Path,
@@ -154,9 +209,44 @@ pub fn resolve_conduit_in(
     if let Some(uri) = env.filter(|v| !v.trim().is_empty()) {
         return (Some(uri.to_string()), "environment (ARC_CONDUIT_URI)");
     }
-    match config::discover_from(dir) {
-        Some(uri) => (Some(uri), "project (.arcconfig)"),
+    let user_file = config::arcrc_path();
+    let opts = get_config::LoadOptions::default();
+    let Ok(merged) = get_config::load_merged(dir, user_file.as_deref(), &opts) else {
+        return (None, "none");
+    };
+    let hit = get_config::merged_value("phabricator.uri", &merged)
+        .or_else(|| get_config::merged_value("default", &merged));
+    match hit {
+        Some((source, value)) => match value.as_str() {
+            Some(uri) => (Some(uri.to_string()), merged_source_label(source, dir)),
+            None => (None, "none"),
+        },
         None => (None, "none"),
+    }
+}
+
+/// Display label for a [`get_config::merged_value`] source, parallel to
+/// the `read_callsign` labels. The local label names the VCS metadata
+/// directory holding `arc/config`.
+fn merged_source_label(source: &str, dir: &Path) -> &'static str {
+    match source {
+        get_config::SOURCE_RUNTIME => "command line (--config)",
+        get_config::SOURCE_LOCAL => match get_config::find_vcs_root(dir).map(|(kind, _)| kind) {
+            Some(get_config::VcsKind::Hg) => "local (.hg/arc/config)",
+            Some(get_config::VcsKind::Svn) => "local (.svn/arc/config)",
+            Some(get_config::VcsKind::Git) => "local (.git/arc/config)",
+            None => "local",
+        },
+        get_config::SOURCE_PROJECT => "project (.arcconfig)",
+        get_config::SOURCE_USER => "user (~/.arcrc)",
+        get_config::SOURCE_SYSTEM => {
+            if cfg!(windows) {
+                "system (ProgramData\\Phabricator\\Arcanist\\config)"
+            } else {
+                "system (/etc/arcconfig)"
+            }
+        }
+        _ => "default",
     }
 }
 
@@ -172,41 +262,188 @@ pub fn token_installed(user_file: Option<&Path>, uri: &str) -> bool {
 
 /// Find the nearest `.arcconfig` above `dir`: `(root, file)`.
 #[must_use]
+/// Locate the project root and `.arcconfig` for `dir`, mirroring
+/// `ArcanistWorkingCopyIdentity::newFromPathWithConfig()` (T1153
+/// CORE-33): git and Mercurial read `.arcconfig` ONLY at the
+/// working-copy root, Subversion takes the nearest `.arcconfig` from
+/// `dir` up to the root, and outside any working copy there is no
+/// project at all. Infallible like before: unreadable files simply miss.
 pub fn find_project(dir: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
-    for ancestor in dir.ancestors() {
-        let file = ancestor.join(".arcconfig");
-        if file.is_file() {
-            return (Some(ancestor.to_path_buf()), Some(file));
+    let Some((kind, root)) = get_config::find_vcs_root(dir) else {
+        return (None, None);
+    };
+    if kind == get_config::VcsKind::Svn {
+        for ancestor in dir.ancestors() {
+            let file = ancestor.join(".arcconfig");
+            if file.is_file() {
+                return (Some(ancestor.to_path_buf()), Some(file));
+            }
+            if ancestor == root.as_path() {
+                break;
+            }
         }
+        return (None, None);
+    }
+    let file = root.join(".arcconfig");
+    if file.is_file() {
+        return (Some(root), Some(file));
     }
     (None, None)
 }
 
-/// Read `repository.callsign` from the project file, else the user file's
-/// `config` section.
-#[must_use]
-pub fn read_callsign(
-    project_file: Option<&Path>,
-    user_file: Option<&Path>,
-) -> Option<(String, &'static str)> {
-    if let Some(path) = project_file
-        && let Ok(text) = std::fs::read_to_string(path)
-        && let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text)
-        && let Some(callsign) = doc.get("repository.callsign").and_then(|v| v.as_str())
-    {
-        return Some((callsign.to_string(), "project (.arcconfig)"));
+/// The working-copy gate (`scripts/arcanist.php:260-266` at ceb): usage
+/// error, raised before conduit setup.
+pub const WORKING_COPY_REQUIRED: &str =
+    "This command must be run in a Git, Mercurial or Subversion working copy.";
+
+/// The stale-server association reason (`ArcanistWorkflow.php:1958-1963`
+/// at ceb).
+const OUTDATED_PHABRICATOR_REASON: &str = "This version of Arcanist is more recent than the version of \
+    Phabricator you are connecting to: the Phabricator install is out of date and does not have support \
+    for identifying repositories by callsign or URI. Update Phabricator to enable these features.";
+
+/// The no-match association reason (`ArcanistWorkflow.php:1970-1973` at
+/// ceb).
+const NO_REPOS_MATCHED_REASON: &str = "No repositories matched the query. Check that your configuration \
+    is correct, or use \"repository.callsign\" to select a repository explicitly.";
+
+/// One string-typed config value, mirroring `getConfigFromAllSources()`
+/// plus `willReadValue()` for `type: string` keys (T1153 RB-D17/T1153
+/// RB-D38, Rule 0: `ArcanistConfigurationManager.php:80-131` and
+/// `ArcanistSettings.php:247-257` at ceb). Every present non-null
+/// value must be a string (else the usage error below); the winner is
+/// the first non-null value in runtime > local > project > user >
+/// system > default order. JSON nulls read as missing, like PHP's
+/// `idx()`.
+fn string_config_winner(
+    key: &str,
+    merged: &get_config::MergedConfig,
+) -> Result<Option<String>, String> {
+    let maps = [
+        &merged.runtime,
+        &merged.sources.local,
+        &merged.sources.project,
+        &merged.sources.user,
+        &merged.sources.system,
+        &merged.sources.default,
+    ];
+    let mut winner: Option<String> = None;
+    for map in maps {
+        let Some(value) = map.get(key) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        let text = value
+            .as_str()
+            .ok_or_else(|| format!("Type of setting '{key}' must be string."))?;
+        if winner.is_none() {
+            winner = Some(text.to_string());
+        }
     }
-    if let Some(path) = user_file
-        && let Ok(text) = std::fs::read_to_string(path)
-        && let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text)
-        && let Some(callsign) = doc
-            .get("config")
-            .and_then(|c| c.get("repository.callsign"))
-            .and_then(|v| v.as_str())
-    {
-        return Some((callsign.to_string(), "user (~/.arcrc)"));
-    }
-    None
+    Ok(winner)
+}
+
+/// `repository.callsign` from any config source, type-checked like PHP.
+pub fn repository_callsign(merged: &get_config::MergedConfig) -> Result<Option<String>, String> {
+    string_config_winner("repository.callsign", merged)
+}
+
+/// PHP `if ($spec)` truthiness for a rule spec: only `""` and `"0"` are
+/// falsy (T1153 RB-D38, Rule 0: `buildBaseCommit()` gates on the raw
+/// values, so whitespace-only specs still take the rules path).
+fn is_truthy_rule_spec(spec: &str) -> bool {
+    !spec.is_empty() && spec != "0"
+}
+
+/// How the working copy associated (or not) with a Phabricator
+/// repository: the reason trail plus the unique match's name, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Association {
+    pub reasons: Vec<String>,
+    pub repo_name: Option<String>,
+}
+
+/// Identify the working-copy repository via `repository.query`,
+/// mirroring `getRepositoryQuery()` + `loadRepositoryInformation()`
+/// (T1153 RB-D17, Rule 0: `ArcanistWorkflow.php:1940-2044` at ceb):
+/// configured callsign first, then the VCS UUID (git has none), then
+/// the remote URI; no identifier means no query at all. Only a unique
+/// match associates; an outdated server (`ERR-CONDUIT-CALL`) means
+/// unassociated, while other conduit failures propagate.
+pub fn load_association(
+    client: &conduit::Client,
+    dir: &Path,
+    merged: &get_config::MergedConfig,
+) -> Result<Association, String> {
+    let mut reasons = Vec::new();
+    let callsign = repository_callsign(merged)?;
+    let query = match callsign {
+        Some(name) if is_truthy_rule_spec(&name) => {
+            reasons.push(format!(
+                "Configuration value \"repository.callsign\" is set to \"{name}\"."
+            ));
+            serde_json::json!({"callsigns": [name]})
+        }
+        _ => {
+            reasons.push("Configuration value \"repository.callsign\" is empty.".to_string());
+            // Git never overrides `getRepositoryUUID()` (the base
+            // `ArcanistRepositoryAPI.php:660` returns null).
+            reasons
+                .push("This repository has no VCS UUID (this is normal for git/hg).".to_string());
+            match git::remote_uri(dir)? {
+                Some(uri) => {
+                    reasons.push(format!(
+                        "The remote URI for this working copy is \"{uri}\"."
+                    ));
+                    serde_json::json!({"remoteURIs": [uri]})
+                }
+                None => {
+                    reasons.push(
+                        "Unable to determine the remote URI for this repository.".to_string(),
+                    );
+                    return Ok(Association {
+                        reasons,
+                        repo_name: None,
+                    });
+                }
+            }
+        }
+    };
+    let results = match client.call("repository.query", &query) {
+        Ok(results) => results,
+        Err(conduit::Error::Api { code, .. }) if code == "ERR-CONDUIT-CALL" => {
+            reasons.push(OUTDATED_PHABRICATOR_REASON.to_string());
+            return Ok(Association {
+                reasons,
+                repo_name: None,
+            });
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let rows = query_rows(&results);
+    let repo_name = if rows.is_empty() {
+        reasons.push(NO_REPOS_MATCHED_REASON.to_string());
+        None
+    } else if rows.len() > 1 {
+        // Sic `repostories` (`ArcanistWorkflow.php:1975` at ceb).
+        let callsigns = rows
+            .iter()
+            .map(|row| row_string(row, "callsign"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        reasons.push(format!(
+            "Multiple repostories ({callsigns}) matched the query. You can use the \
+             \"repository.callsign\" configuration to select the one you want."
+        ));
+        None
+    } else {
+        reasons.push("Found a unique matching repository.".to_string());
+        let name = row_string(rows[0], "name");
+        (!name.is_empty()).then_some(name)
+    };
+    Ok(Association { reasons, repo_name })
 }
 
 /// Resolve `rev` to a full commit SHA.
@@ -220,16 +457,46 @@ fn rev_to_commit(dir: &Path, rev: &str) -> Option<String> {
     if sha.is_empty() { None } else { Some(sha) }
 }
 
-/// Resolve the range head like `getHeadCommit()`, with git's own error.
+/// Missing-commit usage text (`ArcanistGitAPI.php:223,418`).
+fn unknown_commit_message(symbolic: &str) -> String {
+    format!("Unable to find any git commit named '{symbolic}' in this repository.")
+}
+
+/// True for the usage-class errors, which render `Usage Exception:`
+/// while most resolution failures are generic exceptions (T1153 RB-D4,
+/// Rule 0: the classes come from the ceb throw sites —
+/// `ArcanistGitAPI.php:221,269`, `ArcanistBaseCommitParser.php:23,111`,
+/// `ArcanistDifferentialCommitMessage.php:139`,
+/// `ArcanistSettings.php:252`, `scripts/arcanist.php:262`).
+fn is_usage_message(message: &str) -> bool {
+    message.starts_with("Unable to find any git commit named '")
+        || message.starts_with("The specified commit range is empty, backward or invalid")
+        || message.starts_with("None of the rules in your 'base' configuration")
+        || (message.starts_with("Rule '")
+            && message.contains("is invalid, it must have a type and name"))
+        || message.ends_with("is not a recognized rule.")
+        || message.starts_with("Invalid \"Differential Revision\" field in commit message.")
+        || message.starts_with("Specify exactly one base commit.")
+        || message.starts_with(WORKING_COPY_REQUIRED)
+        || message.starts_with("Type of setting '")
+}
+
+/// Report a resolution failure through its envelope arm (T1153 RB-D4).
+fn report_which_error(message: &str) -> ExitCode {
+    let kind = if is_usage_message(message) {
+        EnvelopeKind::Usage
+    } else {
+        EnvelopeKind::Exception
+    };
+    conduit::report(kind, message)
+}
+
+/// Resolve the range head like `getHeadCommit()` (`rev-parse` plus the
+/// missing-commit usage error, T1153 RB-D21).
 fn resolve_head(dir: &Path, head_ref: &str) -> Result<String, String> {
-    let out = git::output(dir, &["show", "-s", "--format=%H", head_ref, "--"])
-        .map_err(|e| format!("cannot resolve '{head_ref}': {e}"))?;
+    let out = git::output(dir, &["rev-parse", head_ref])?;
     if !out.status.success() {
-        let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        if detail.is_empty() {
-            return Err(format!("cannot resolve '{head_ref}' (empty repository?)"));
-        }
-        return Err(detail);
+        return Err(unknown_commit_message(head_ref));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -253,44 +520,39 @@ impl BaseSources {
             system: String::new(),
         }
     }
-
-    fn is_empty(&self) -> bool {
-        self.local.trim().is_empty()
-            && self.project.trim().is_empty()
-            && self.user.trim().is_empty()
-            && self.system.trim().is_empty()
-    }
 }
 
-/// Load every config source for `dir`.
-pub fn load_config_sources(
-    dir: &Path,
-    user_file: Option<&Path>,
-) -> Result<get_config::Sources, String> {
-    get_config::load_sources(dir, user_file)
-}
-
-/// `base` rules from loaded sources (`local`, `project`, `user`, `system`).
+/// `base` rules from loaded sources (`local`, `project`, `user`,
+/// `system`): plain per-source reads (T1153 RB-D38, Rule 0:
+/// `getConfigFromAllSources()` reads each source by exact key).
+/// Callers type-check first via [`string_config_winner`], so present
+/// values are strings here and missing ones read empty.
 #[must_use]
 pub fn base_sources_from(loaded: &get_config::Sources) -> BaseSources {
-    let at = |source: &str| {
-        get_config::value_at("base", source, loaded)
+    let at = |map: &serde_json::Map<String, serde_json::Value>| {
+        map.get("base")
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_default()
     };
     BaseSources {
-        local: at("local"),
-        project: at("project"),
-        user: at("user"),
-        system: at("system"),
+        local: at(&loaded.local),
+        project: at(&loaded.project),
+        user: at(&loaded.user),
+        system: at(&loaded.system),
     }
 }
 
 /// Split a `base` specification into rules, mirroring
-/// `tokenizeBaseCommitSpecification()`.
+/// `tokenizeBaseCommitSpecification()`
+/// (`ArcanistBaseCommitParser.php:13-30` at ceb, T1153 RB-D38e:
+/// `array_filter` drops falsy rules, so `0` vanishes silently).
 pub fn tokenize_base_rules(raw: &str) -> Result<Vec<String>, String> {
     let mut rules = Vec::new();
-    for rule in raw.split(',').map(str::trim).filter(|r| !r.is_empty()) {
+    for rule in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty() && *rule != "0")
+    {
         if !rule.contains(':') {
             return Err(format!(
                 "Rule '{rule}' is invalid, it must have a type and name like 'arc:upstream'."
@@ -431,6 +693,9 @@ impl<'a> Engine<'a> {
     fn resolve_arc_prompt(&mut self) -> Result<RuleOutcome, String> {
         self.explain("it is what you typed when prompted.".to_string());
         let answer = (self.prompt)("Against which commit?").unwrap_or_default();
+        if take_prompt_tty_failed() {
+            return Err(crate::prompt::NOT_INTERACTIVE.to_string());
+        }
         if answer.is_empty() {
             Ok(RuleOutcome::NoMatch)
         } else {
@@ -521,11 +786,11 @@ impl<'a> Engine<'a> {
             .clone()
             .unwrap_or_else(|| self.dir.to_path_buf());
         let mut cmd = if cfg!(windows) {
-            let mut cmd = std::process::Command::new("cmd");
+            let mut cmd = crate::proc_env::command("cmd");
             cmd.arg("/C").arg(command);
             cmd
         } else {
-            let mut cmd = std::process::Command::new("sh");
+            let mut cmd = crate::proc_env::command("sh");
             cmd.arg("-c").arg(command);
             cmd
         };
@@ -580,13 +845,12 @@ impl<'a> Engine<'a> {
                 let Ok(upstream) = upstream else {
                     return Ok(None);
                 };
-                let out = git::output(self.dir, &["merge-base", "--", &upstream, "HEAD"])
-                    .map_err(|e| format!("git merge-base failed: {e}"))?;
+                // `merge-base %s HEAD`, like PHP (no `--`): failures
+                // raise `CommandException`, not a wrapped message.
+                let command = format!("git merge-base {} HEAD", shell_arg(&upstream));
+                let out = git::output(self.dir, &["merge-base", &upstream, "HEAD"])?;
                 if !out.status.success() {
-                    return Err(format!(
-                        "git merge-base failed: {}",
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    ));
+                    return Err(execx_failed(&command, out.status, &out));
                 }
                 let base = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 self.explain(format!(
@@ -611,7 +875,7 @@ impl<'a> Engine<'a> {
         name: &str,
         source: &str,
     ) -> Result<Option<String>, String> {
-        if let Some(inner) = strip_wrapped(name, "merge-base(", ")") {
+        if let Some(inner) = strip_wrapped_nonempty(name, "merge-base(", ")") {
             let out = git::output(self.dir, &["merge-base", "--", inner, "HEAD"])
                 .map_err(|e| format!("git merge-base failed: {e}"))?;
             if !out.status.success() {
@@ -624,7 +888,7 @@ impl<'a> Engine<'a> {
             ));
             return Ok(Some(base));
         }
-        if let Some(inner) = strip_wrapped(name, "branch-unique(", ")") {
+        if let Some(inner) = strip_wrapped_nonempty(name, "branch-unique(", ")") {
             return self.resolve_branch_unique(rule, inner, source);
         }
         if git::ok(self.dir, &["cat-file", "-t", name]) {
@@ -687,9 +951,59 @@ impl<'a> Engine<'a> {
 }
 
 /// Strip one `prefix...suffix` wrapper (greedy inner, like `(.*)`).
+/// Unwrap `prefix...suffix`, mirroring PHP's `/^...\(.*\)$/`
+/// wrappings: `.` never spans `\n`, so multi-line inners never match
+/// (T1153 RB-D38e). (A trailing `\n` would still match PHP's `$`, but
+/// rule tokenizing trims every rule, so that shape is unreachable.)
 fn strip_wrapped<'b>(name: &'b str, prefix: &str, suffix: &str) -> Option<&'b str> {
-    name.strip_prefix(prefix)
-        .and_then(|rest| rest.strip_suffix(suffix))
+    let inner = name
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(suffix))?;
+    if inner.contains('\n') {
+        return None;
+    }
+    Some(inner)
+}
+
+/// Unwrap a git-side `prefix...+...suffix` wrapping (`merge-base(`,
+/// `branch-unique(`): like [`strip_wrapped`], but the inner `.+`
+/// also rejects empties.
+fn strip_wrapped_nonempty<'b>(name: &'b str, prefix: &str, suffix: &str) -> Option<&'b str> {
+    let inner = strip_wrapped(name, prefix, suffix)?;
+    if inner.is_empty() {
+        return None;
+    }
+    Some(inner)
+}
+
+/// `csprintf` `%s` escaping (`PhutilCommandString::escapeLinux()`):
+/// safe shell words pass through, anything else is single-quoted.
+fn shell_arg(value: &str) -> String {
+    let safe = !value.is_empty()
+        && value.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b':' | b'/' | b'@' | b'.' | b'_' | b'+' | b'-')
+        });
+    if safe {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+/// Render a failed `git` call like PHP's `CommandException`
+/// (`src/future/exec/CommandException.php`), which is what
+/// `execxLocal` raises (T1153 RB-D23).
+fn execx_failed(
+    command: &str,
+    status: std::process::ExitStatus,
+    out: &std::process::Output,
+) -> String {
+    crate::markers::command_exception_text(
+        status.code().unwrap_or(1),
+        command,
+        &String::from_utf8_lossy(&out.stdout),
+        &String::from_utf8_lossy(&out.stderr),
+    )
 }
 
 /// Local branch short names (`refs/heads/*`).
@@ -771,7 +1085,7 @@ pub fn resolve_base(
     explicit: Option<&str>,
     head_ref: &str,
     head_explicit: bool,
-    loaded: &get_config::Sources,
+    loaded: &get_config::MergedConfig,
     inputs: &BaseInputs<'_>,
 ) -> Result<(String, String), String> {
     if let Some(commit) = explicit {
@@ -780,28 +1094,42 @@ pub fn resolve_base(
     if is_shallow_history(dir) {
         return Ok(shallow_base(dir));
     }
-    let sources = base_sources_from(loaded);
-    if !inputs.runtime_rules.trim().is_empty() || !sources.is_empty() {
-        let all = [
-            source_rules("runtime", inputs.runtime_rules, &sources)?,
-            source_rules("local", "", &sources)?,
-            source_rules("project", "", &sources)?,
-            source_rules("user", "", &sources)?,
-            source_rules("system", "", &sources)?,
-        ];
-        let (project_root, _) = find_project(dir);
-        let mut engine = Engine::new(dir, project_root, inputs.prompt);
-        if let Some(commit) = engine.resolve(&all)? {
-            let why = engine.explanation.unwrap_or_default();
-            return Ok((commit, why));
-        }
-        return Err(
-            "None of the rules in your 'base' configuration matched a valid commit. \
-            Adjust rules or specify which commit you want to use explicitly."
-                .to_string(),
-        );
+    // T1153 RB-D38, Rule 0: the gate reads the winning `base` value
+    // (`ArcanistGitAPI.php:265-266` at ceb), so a falsy winner (`""`,
+    // `"0"`) takes the default chain even when lower sources hold
+    // rules; every source is type-checked first.
+    let winner = string_config_winner("base", loaded)?;
+    let gate = is_truthy_rule_spec(inputs.runtime_rules)
+        || winner.as_deref().is_some_and(is_truthy_rule_spec);
+    if !gate {
+        return resolve_default_base(dir, &loaded.sources, inputs.prompt);
     }
-    resolve_default_base(dir, loaded, inputs.prompt)
+    // A `--config base=` value overrides the `--base` flag (`$all_sources
+    // + $base_commit_rules` in `ArcanistRepositoryAPI.php:652` at ceb).
+    let runtime_spec = loaded
+        .runtime
+        .get("base")
+        .and_then(|v| v.as_str())
+        .unwrap_or(inputs.runtime_rules);
+    let sources = base_sources_from(&loaded.sources);
+    let all = [
+        source_rules("runtime", runtime_spec, &sources)?,
+        source_rules("local", "", &sources)?,
+        source_rules("project", "", &sources)?,
+        source_rules("user", "", &sources)?,
+        source_rules("system", "", &sources)?,
+    ];
+    let (project_root, _) = find_project(dir);
+    let mut engine = Engine::new(dir, project_root, inputs.prompt);
+    if let Some(commit) = engine.resolve(&all)? {
+        let why = engine.explanation.unwrap_or_default();
+        return Ok((commit, why));
+    }
+    Err(
+        "None of the rules in your 'base' configuration matched a valid commit. \
+        Adjust rules or specify which commit you want to use explicitly."
+            .to_string(),
+    )
 }
 
 /// An explicit base commit resolves to its merge-base with the head.
@@ -821,9 +1149,7 @@ fn resolve_explicit_base(
     let out = git::output(dir, &["merge-base", "--", commit, &head])
         .map_err(|e| format!("git merge-base failed: {e}"))?;
     if !out.status.success() {
-        return Err(format!(
-            "Unable to find any git commit named '{commit}' in this repository."
-        ));
+        return Err(unknown_commit_message(commit));
     }
     let base = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let why = if head_explicit {
@@ -913,13 +1239,16 @@ fn resolve_default_base(
             false,
         );
     }
-    print!("{DEFAULT_RANGE_ESSAY}");
+    print!(
+        "{}{}",
+        default_range_banner(terminal::ansi_enabled()),
+        default_range_essay()
+    );
     let answer = prompt("What default do you want to use? [origin/master]").unwrap_or_default();
-    let default = if answer.trim().is_empty() {
-        "origin/master".to_string()
-    } else {
-        answer
-    };
+    if take_prompt_tty_failed() {
+        return Err(crate::prompt::NOT_INTERACTIVE.to_string());
+    }
+    let default = default_range_answer(&answer);
     finish_default_base(
         dir,
         &default,
@@ -928,19 +1257,52 @@ fn resolve_default_base(
     )
 }
 
-const DEFAULT_RANGE_ESSAY: &str = "Select a Default Commit Range\n\n\
-You're running a command which operates on a range of revisions (usually, from some revision to \
-HEAD) but have not specified the revision that should determine the start of the range.\n\n\
+/// Raw default-range essay paragraphs (`ArcanistGitAPI.php:328-352`),
+/// wrapped at render time by [`default_range_essay`] like PHP's
+/// `phutil_console_wrap()` call.
+const DEFAULT_RANGE_ESSAY: &str = "You're running a command which operates on a range of revisions \
+(usually, from some revision to HEAD) but have not specified the revision that should determine \
+the start of the range.\n\n\
 Previously, arc assumed you meant 'HEAD^' when you did not specify a start revision, but this \
 behavior does not make much sense in most workflows outside of Facebook's historic git-svn \
 workflow.\n\n\
 arc no longer assumes 'HEAD^'. You must specify a relative commit explicitly when you invoke a \
 command (e.g., `arc diff HEAD^`, not just `arc diff`) or select a default for this working \
-copy.\n\nIn most cases, the best default is 'origin/master'. You can also select 'HEAD^' to \
-preserve the old behavior, or some other remote or branch. But you almost certainly want to \
+copy.\n\n\
+In most cases, the best default is 'origin/master'. You can also select 'HEAD^' to preserve the \
+old behavior, or some other remote or branch. But you almost certainly want to \
 select 'origin/master'.\n\n\
 (Technically: the merge-base of the selected revision and HEAD is used to determine the start \
 of the commit range.)";
+
+/// The `Select a Default Commit Range` banner
+/// (`ArcanistGitAPI.php:323-326`): `phutil_console_format()` of
+/// `<bg:green>** %s **</bg>`, ANSI on TTYs, markup-stripped otherwise.
+fn default_range_banner(ansi: bool) -> String {
+    terminal::tsprintf_ansi(
+        "<bg:green>** %s **</bg>\n\n",
+        &[terminal::TVal::Text("Select a Default Commit Range")],
+        ansi,
+    )
+    .map(|line| line.as_str().to_string())
+    .unwrap_or_default()
+}
+
+/// The default-range essay wrapped at column 78, like PHP's
+/// `phutil_console_wrap()` with no indent.
+fn default_range_essay() -> String {
+    terminal::console_wrap(DEFAULT_RANGE_ESSAY, 0, true)
+}
+
+/// Map one default-range answer: blank (whitespace-only) takes
+/// `origin/master`, anything else passes through raw (`:356-358`).
+fn default_range_answer(answer: &str) -> String {
+    if answer.trim().is_empty() {
+        "origin/master".to_string()
+    } else {
+        answer.to_string()
+    }
+}
 
 /// Verify a default relative commit, persist it when freshly prompted,
 /// and return its merge-base with HEAD.
@@ -998,41 +1360,76 @@ fn write_scratch_file(dir: &Path, value: &str) {
     }
 }
 
-/// Commits for the range, oldest first, mirroring
-/// `getLocalCommitInformation()` (`HEAD --not base`, or all of HEAD past
-/// the empty tree).
+/// The `getLocalCommitInformation()` log format (T1153 RB-D18, Rule 0:
+/// `ArcanistGitAPI.php:175-179` at ceb).
+const LOCAL_INFO_FORMAT: &str = "%H%x01%T%x01%P%x01%at%x01%an%x01%aE%x01%s%x01%s%n%n%b%x02";
+
+/// Commits for the range, newest first, mirroring
+/// `getLocalCommitInformation()`: `log <head> --not <base>` (or all of
+/// `HEAD` past the empty tree), with the `CommandException` text on
+/// failure like `execxLocal` (T1153 RB-D18, Rule 0:
+/// `ArcanistGitAPI.php:99-207` at ceb). `head` is the resolved head
+/// SHA, like PHP's `getHeadCommit()`.
 pub fn local_commit_information(
     dir: &Path,
     base: &str,
     head: &str,
 ) -> Result<Vec<LocalCommit>, String> {
-    let format = "%H%x01%T%x01%s%x01%B%x02";
-    let flag = std::format!("--format={format}");
-    let out = if base == GIT_MAGIC_ROOT_COMMIT {
-        git::output(dir, &["log", &flag, "HEAD", "--"])
+    let flag = format!("--format={LOCAL_INFO_FORMAT}");
+    let command = if base == GIT_MAGIC_ROOT_COMMIT {
+        format!("git log HEAD --format={} --", shell_arg(LOCAL_INFO_FORMAT))
     } else {
-        git::output(dir, &["log", head, "--not", base, &flag, "--"])
-    }
-    .map_err(|e| format!("failed to list commits: {e}"))?;
+        format!(
+            "git log {} --not {} --format={} --",
+            shell_arg(head),
+            shell_arg(base),
+            shell_arg(LOCAL_INFO_FORMAT)
+        )
+    };
+    let argv: Vec<&str> = if base == GIT_MAGIC_ROOT_COMMIT {
+        vec!["log", "HEAD", &flag, "--"]
+    } else {
+        vec!["log", head, "--not", base, &flag, "--"]
+    };
+    let out = git::output(dir, &argv)?;
     if !out.status.success() {
-        return Err(format!(
-            "git log failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        return Err(execx_failed(&command, out.status, &out));
     }
     Ok(parse_commit_records(&String::from_utf8_lossy(&out.stdout)))
 }
 
+/// Parse `%H/%T/%P/%at/%an/%aE/%s/(%s%n%n%b)` records: the title feeds
+/// `summary`, the trailing message is PHP-`rtrim()`ed (T1153 RB-D38a,
+/// kept: the `\x01`/`\x02` separators make a `commit <40hex>` line
+/// inside a message harmless, where PHP's medium-format `DiffParser`
+/// split misparses).
 fn parse_commit_records(text: &str) -> Vec<LocalCommit> {
     let mut commits = Vec::new();
     for record in text.split('\u{2}') {
-        let record = record.trim_matches([' ', '\n', '\u{2}']);
+        let record = record.trim_matches([' ', '\t', '\n', '\r', '\0', '\u{B}', '\u{2}']);
         if record.is_empty() {
             continue;
         }
-        let mut fields = record.splitn(4, '\u{1}');
-        let (Some(commit), Some(tree), Some(summary), Some(message)) =
-            (fields.next(), fields.next(), fields.next(), fields.next())
+        let mut fields = record.splitn(8, '\u{1}');
+        let (
+            Some(commit),
+            Some(tree),
+            _parents,
+            _time,
+            _author,
+            _author_email,
+            Some(summary),
+            Some(message),
+        ) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        )
         else {
             continue;
         };
@@ -1040,13 +1437,15 @@ fn parse_commit_records(text: &str) -> Vec<LocalCommit> {
             commit: commit.to_string(),
             tree: tree.to_string(),
             summary: summary.to_string(),
-            message: message.trim_end().to_string(),
+            message: message
+                .trim_end_matches([' ', '\t', '\n', '\r', '\0', '\u{B}'])
+                .to_string(),
         });
     }
     commits
 }
 
-/// Commits in the range, oldest first.
+/// Commits in the range, newest first (T1153 RB-D18: `git log` order).
 pub fn commits_between(dir: &Path, base: &str, head: &str) -> Result<Vec<Commit>, String> {
     Ok(local_commit_information(dir, base, head)?
         .into_iter()
@@ -1120,40 +1519,31 @@ pub fn git_commit_messages(
 /// `ArcanistDifferentialCommitMessage::parseRevisionIDFromRawCorpus()`.
 /// Returns `Ok(None)` when the corpus has no footer; errors on a
 /// malformed one.
-/// How `/^Differential Revision:\s*(.+)/im` matches at one line start:
-/// no match (try the next), a whitespace-only value (throw), or a raw
-/// value (monogram, URI, or throw).
-enum FooterValue<'a> {
-    None,
-    Empty,
-    Value(&'a str),
-}
-
 /// PCRE `\s`: space, tab, newline, CR, form feed, vertical tab.
 const FOOTER_SPACE: [char; 6] = [' ', '\t', '\n', '\r', '\u{c}', '\u{b}'];
 
 /// PHP `trim()` charlist (no form feed).
 const TRIM_CHARS: [char; 6] = [' ', '\t', '\n', '\r', '\0', '\u{b}'];
 
-fn footer_value(after: &str) -> FooterValue<'_> {
+/// How `/^Differential Revision:\s*(.+)/im` matches at one line start:
+/// the raw value, or no match (try the next start). T1153 RB-D20: a
+/// whitespace-only tail never matches — even with spaces in it — so
+/// an empty footer is skipped instead of throwing.
+fn footer_value(after: &str) -> Option<&str> {
     let stripped = after.trim_start_matches(FOOTER_SPACE);
-    if !stripped.is_empty() {
-        let raw = stripped.split('\n').next().unwrap_or("");
-        return FooterValue::Value(raw);
+    if stripped.is_empty() {
+        return None;
     }
-    let run = &after[..after.len() - stripped.len()];
-    if run.bytes().any(|b| b != b'\n') {
-        FooterValue::Empty
-    } else {
-        FooterValue::None
-    }
+    Some(stripped.split('\n').next().unwrap_or(""))
 }
 
 fn invalid_footer(value: &str) -> String {
+    // T1153 BROWSE-B25: the ceb-era Phabricator example, not the 2023
+    // devtools text.
     format!(
         "Invalid \"Differential Revision\" field in commit message. This field should have a \
-         revision identifier like \"D123\" or a server URI like \
-         \"https://devtools.example.com/D123\", but has \"{value}\"."
+         revision identifier like \"D123\" or a Phabricator URI like \
+         \"https://phabricator.example.com/D123\", but has \"{value}\"."
     )
 }
 
@@ -1176,20 +1566,17 @@ pub fn revision_id_from_corpus(corpus: &str) -> Result<Option<String>, String> {
         if !head.eq_ignore_ascii_case(PREFIX) {
             continue;
         }
-        match footer_value(after) {
-            FooterValue::None => continue,
-            FooterValue::Empty => return Err(invalid_footer("")),
-            FooterValue::Value(raw) => {
-                let value = raw.trim_matches(TRIM_CHARS);
-                if let Some(id) = bare_revision_id(value) {
-                    return Ok(Some(id));
-                }
-                if let Some(id) = uri_revision_id(value) {
-                    return Ok(Some(id));
-                }
-                return Err(invalid_footer(value));
-            }
+        let Some(raw) = footer_value(after) else {
+            continue;
+        };
+        let value = raw.trim_matches(TRIM_CHARS);
+        if let Some(id) = bare_revision_id(value) {
+            return Ok(Some(id));
         }
+        if let Some(id) = uri_revision_id(value) {
+            return Ok(Some(id));
+        }
+        return Err(invalid_footer(value));
     }
     Ok(None)
 }
@@ -1207,14 +1594,28 @@ fn bare_revision_id(value: &str) -> Option<String> {
     }
 }
 
+/// True for `PhutilURI` scheme heads (alpha start, scheme chars).
+fn is_uri_scheme(head: &str) -> bool {
+    let mut chars = head.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
 /// A server-URI footer value: the whole URI path must be a monogram.
+/// T1153 RB-D38b: without `://`, PHP's `PhutilURI` still splits a
+/// scheme, so `host:D123` carries path `D123` and resolves.
 fn uri_revision_id(value: &str) -> Option<String> {
     let without_query = value.split(['?', '#']).next().unwrap_or("");
-    let path = match without_query.split_once("://") {
-        Some((_, rest)) => rest.split_once('/').map_or("", |(_, path)| path),
-        None => without_query,
-    };
-    bare_revision_id(path.trim_matches('/'))
+    if let Some((_, rest)) = without_query.split_once("://") {
+        let path = rest.split_once('/').map_or("", |(_, path)| path);
+        return bare_revision_id(path.trim_matches('/'));
+    }
+    if let Some((head, rest)) = without_query.split_once(':')
+        && is_uri_scheme(head)
+    {
+        return bare_revision_id(rest.trim_matches('/'));
+    }
+    bare_revision_id(without_query.trim_matches('/'))
 }
 
 fn id_number(id: &str) -> serde_json::Value {
@@ -1365,21 +1766,42 @@ pub fn match_working_copy_revisions(
     attach_authors(client, rows)
 }
 
-/// Resolve other authors' names via `user.query`, like the PHP workflow.
-fn attach_authors(
-    client: &conduit::Client,
-    rows: Vec<(String, String, String, String)>,
-) -> Result<Vec<MatchedRevision>, String> {
+/// The viewer's PHID: the cached auth PHID, else one `user.whoami`
+/// call.
+///
+/// T1153 RB-D8: PHP resolves whoami once at startup auth, then reuses
+/// the cached viewer PHID (`getUserPHID()`); only call when uncached
+/// (e.g. direct library use without `config::authenticate`).
+fn viewer_phid(client: &conduit::Client) -> Result<String, String> {
+    if let Some((_, phid)) = client.authenticated_user() {
+        return Ok(phid);
+    }
     let who = client
         .call("user.whoami", &serde_json::json!({}))
         .map_err(|e| e.to_string())?;
-    let own = who.get("phid").and_then(|v| v.as_str()).unwrap_or("");
+    Ok(who
+        .get("phid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string())
+}
+
+/// Distinct author PHIDs in `rows` excluding the viewer.
+fn other_author_phids(rows: &[(String, String, String, String)], own: &str) -> Vec<String> {
     let mut others: Vec<String> = Vec::new();
-    for (_, _, author, _) in &rows {
+    for (_, _, author, _) in rows {
         if author != own && !others.iter().any(|p| p == author) {
             others.push(author.clone());
         }
     }
+    others
+}
+
+/// Map other-author PHIDs to user names via one `user.query` call.
+fn query_author_names(
+    client: &conduit::Client,
+    others: &[String],
+) -> Result<std::collections::BTreeMap<String, String>, String> {
     let mut names: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     if !others.is_empty() {
         let users = client
@@ -1389,21 +1811,43 @@ fn attach_authors(
             names.insert(row_string(user, "phid"), row_string(user, "userName"));
         }
     }
+    Ok(names)
+}
+
+/// Build one matched revision, resolving other authors' names.
+fn build_matched_revision(
+    id: String,
+    title: String,
+    author: String,
+    why: String,
+    own: &str,
+    names: &std::collections::BTreeMap<String, String>,
+) -> MatchedRevision {
+    let name = if author == own {
+        None
+    } else {
+        Some(names.get(&author).cloned().unwrap_or_default())
+    };
+    MatchedRevision {
+        monogram: format!("D{id}"),
+        title,
+        author: name,
+        why,
+    }
+}
+
+/// Resolve other authors' names via `user.query`, like the PHP workflow.
+fn attach_authors(
+    client: &conduit::Client,
+    rows: Vec<(String, String, String, String)>,
+) -> Result<Vec<MatchedRevision>, String> {
+    let own_phid = viewer_phid(client)?;
+    let own = own_phid.as_str();
+    let others = other_author_phids(&rows, own);
+    let names = query_author_names(client, &others)?;
     Ok(rows
         .into_iter()
-        .map(|(id, title, author, why)| {
-            let name = if author == own {
-                None
-            } else {
-                Some(names.get(&author).cloned().unwrap_or_default())
-            };
-            MatchedRevision {
-                monogram: format!("D{id}"),
-                title,
-                author: name,
-                why,
-            }
-        })
+        .map(|(id, title, author, why)| build_matched_revision(id, title, author, why, own, &names))
         .collect())
 }
 
@@ -1451,59 +1895,95 @@ fn load_repo_identity(dir: &Path, head_ref: &str, in_repo: bool) -> RepoIdentity
     }
 }
 
-struct RangeResolution {
-    base: String,
-    explanation: String,
-    commits: Vec<Commit>,
-    matching: Matching,
+/// `ArcanistGitAPI::getLocalCommitInformation()` on a repository with
+/// no commits (`ArcanistGitAPI.php:99-113`): PHP prints the repository
+/// section first, then fails with this text.
+const NO_LOCAL_COMMITS: &str =
+    "You can't get local commit information for a repository with no commits.";
+
+/// One commit's summary line, mirroring `getCommitSummary()` (T1153
+/// RB-D18, Rule 0: `ArcanistGitAPI.php:1246-1257` at ceb): the empty
+/// tree reads `(The Empty Tree)`, anything else resolves through
+/// `git log -n 1 --format=%s` (PHP-trimmed), and an unresolvable base
+/// raises the `CommandException` text like `execxLocal` does.
+fn commit_summary(dir: &Path, relative: &str) -> Result<String, String> {
+    if relative == GIT_MAGIC_ROOT_COMMIT {
+        return Ok("(The Empty Tree)".to_string());
+    }
+    let out = git::output(dir, &["log", "-n", "1", "--format=%s", relative])?;
+    if !out.status.success() {
+        let command = format!("git log -n 1 --format=%s {}", shell_arg(relative));
+        return Err(execx_failed(&command, out.status, &out));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .trim_matches(TRIM_CHARS)
+        .to_string())
 }
 
-fn resolve_report_range(
+/// The `arc diff` argument suffix: ` <commit>` plus ` --head %R` when
+/// `--head` was given (T1153 RB-D18, Rule 0:
+/// `ArcanistWhichWorkflow.php:89-99` at ceb).
+#[must_use]
+pub fn diff_arg(explicit: Option<&str>, head: Option<&str>) -> String {
+    let mut arg = explicit.map_or_else(String::new, |base| format!(" {base}"));
+    if let Some(head) = head {
+        arg.push_str(&format!(" --head {}", shell_arg(head)));
+    }
+    arg
+}
+
+/// Resolve everything `COMMIT RANGE` prints: base, direction check,
+/// summary, command line, and commits (T1153 RB-D18, Rule 0:
+/// `ArcanistWhichWorkflow.php:103-175` at ceb). The base stays raw —
+/// a rule like `git:HEAD~2` displays (and diffs) unexpanded.
+pub fn load_range_data(
     dir: &Path,
-    user_file: Option<&Path>,
-    explicit_base: Option<&str>,
+    merged: &get_config::MergedConfig,
+    explicit: Option<&str>,
     head_ref: &str,
     head_explicit: bool,
-    resolution: &Resolution<'_>,
-) -> Result<RangeResolution, String> {
-    let loaded = load_config_sources(dir, user_file)?;
+    runtime_rules: &str,
+    prompt: &dyn Fn(&str) -> Option<String>,
+) -> Result<RangeData, String> {
     let inputs = BaseInputs {
-        runtime_rules: resolution.runtime_rules,
-        prompt: resolution.prompt,
+        runtime_rules,
+        prompt,
     };
-    let (base, why) = resolve_base(
-        dir,
-        explicit_base,
-        head_ref,
-        head_explicit,
-        &loaded,
-        &inputs,
-    )?;
+    let (base, explanation) =
+        resolve_base(dir, explicit, head_ref, head_explicit, merged, &inputs)?;
     if !has_any_commit(dir) {
-        return Err(
-            "You can't get local commit information for a repository with no commits.".to_string(),
-        );
+        return Err(NO_LOCAL_COMMITS.to_string());
     }
     let resolved_head = resolve_head(dir, head_ref)?;
     if head_explicit && base != GIT_MAGIC_ROOT_COMMIT {
         check_range_direction(dir, &base, &resolved_head, head_ref)?;
     }
-    let commits = commits_between(dir, &base, head_ref)?;
-    let matching =
-        match &resolution.match_config {
-            MatchConfig::Unavailable(reason) => Matching::Unavailable(reason.clone()),
-            MatchConfig::Live { client, any_status } => Matching::Found(
-                match_working_copy_revisions(client, dir, &base, head_ref, *any_status)?,
-            ),
-        };
-    Ok(RangeResolution {
+    // T1153 RB-D18: PHP lists commits (`getLocalCommitInformation()`)
+    // before resolving the summary (`getCommitSummary()`), both
+    // through the resolved head.
+    let commits = commits_between(dir, &base, &resolved_head)?;
+    let summary = commit_summary(dir, &base)?;
+    let base16: String = base.chars().take(16).collect();
+    let command = format!("git diff {}", shell_arg(&format!("{base16}..{head_ref}")));
+    Ok(RangeData {
         base,
-        explanation: why,
+        explanation,
+        base16,
+        summary,
+        command,
         commits,
-        matching,
+        head: resolved_head,
     })
 }
 
+/// Build the full context for `dir`, for `--json` and tests. The text
+/// path resolves in stages instead (see [`run`]), so failures land
+/// after the sections PHP has already printed. `user_file` is the
+/// `~/.arcrc` path (`None` skips token lookups), `env` is the
+/// `ARC_CONDUIT_URI` value, `explicit_base` pins the base, `head_ref`
+/// pins the range end, `inputs` carries `--base` rules plus the prompt
+/// hook, and `client` (already authenticated) drives association plus
+/// revision matching (`any_status` selects `status-any`).
 #[allow(clippy::too_many_arguments)]
 pub fn load_context(
     dir: &Path,
@@ -1513,41 +1993,36 @@ pub fn load_context(
     explicit_base: Option<&str>,
     head_ref: &str,
     head_explicit: bool,
-    resolution: &Resolution<'_>,
+    merged: &get_config::MergedConfig,
+    inputs: &BaseInputs<'_>,
+    client: &conduit::Client,
+    any_status: bool,
 ) -> Result<Context, String> {
-    let in_repo = git::is_inside_work_tree(dir);
-    let identity = load_repo_identity(dir, head_ref, in_repo);
+    if !git::is_inside_work_tree(dir) {
+        return Err(WORKING_COPY_REQUIRED.to_string());
+    }
+    let identity = load_repo_identity(dir, head_ref, true);
     let (project_root, project_file) = find_project(dir);
-    let callsign = read_callsign(project_file.as_deref(), user_file);
+    let callsign = repository_callsign(merged)?;
     let (conduit_uri, conduit_source) = resolve_conduit_in(dir, flag_uri, env);
     let token = conduit_uri
         .as_ref()
         .map(|uri| token_installed(user_file, uri));
-    let (base, explanation, commits, matching) = if in_repo {
-        let range = resolve_report_range(
-            dir,
-            user_file,
-            explicit_base,
-            head_ref,
-            head_explicit,
-            resolution,
-        )?;
-        (
-            Some(range.base),
-            Some(range.explanation),
-            range.commits,
-            range.matching,
-        )
-    } else {
-        (None, None, Vec::new(), Matching::OutsideRepo)
-    };
-    let (callsign_name, callsign_source) = match callsign {
-        Some((name, source)) => (Some(name), Some(source)),
-        None => (None, None),
-    };
+    let assoc = load_association(client, dir, merged)?;
+    let range = load_range_data(
+        dir,
+        merged,
+        explicit_base,
+        head_ref,
+        head_explicit,
+        inputs.runtime_rules,
+        inputs.prompt,
+    )?;
+    let matching = match_working_copy_revisions(client, dir, &range.base, &range.head, any_status)?;
+    let head = head_explicit.then_some(head_ref);
     Ok(Context {
         dir: dir.to_string_lossy().to_string(),
-        vcs: if in_repo { "git" } else { "none" },
+        vcs: "git",
         vcs_root: identity.vcs_root,
         project_root: project_root.map(path_display),
         project_file: project_file.map(path_display),
@@ -1555,19 +2030,21 @@ pub fn load_context(
         head: identity.head,
         head_subject: identity.head_subject,
         remote_url: identity.remote_url,
-        callsign: callsign_name,
-        callsign_source,
+        callsign,
         conduit_uri,
         conduit_source,
         token_installed: token,
-        base,
-        base_explanation: explanation,
+        repo_name: assoc.repo_name,
+        repo_reasons: assoc.reasons,
+        base: Some(range.base),
+        base_explanation: Some(range.explanation),
+        base16: Some(range.base16),
+        summary: Some(range.summary),
+        command: Some(range.command),
         head_ref: head_ref.to_string(),
-        commits,
-        diff_arg: match explicit_base {
-            Some(base) => format!(" {base}"),
-            None => String::new(),
-        },
+        head_explicit,
+        commits: range.commits,
+        diff_arg: diff_arg(explicit_base, head),
         matching,
     })
 }
@@ -1578,147 +2055,175 @@ fn bold(text: &str, ansi: bool) -> String {
     terminal::console_format("**%s**", &[text], ansi)
 }
 
-fn render_working_copy(ctx: &Context, out: &mut String, ansi: bool) {
-    out.push_str(&bold("WORKING COPY", ansi));
-    out.push('\n');
-    out.push_str(&format!("    Directory: {}\n", ctx.dir));
-    match (&ctx.vcs_root, ctx.vcs) {
-        (Some(root), vcs) => out.push_str(&format!("    VCS: {vcs} (root {root})\n")),
-        (None, _) => out.push_str("    VCS: none (not inside a working copy)\n"),
-    }
-    match (&ctx.project_root, &ctx.project_file) {
-        (Some(root), Some(file)) => {
-            out.push_str(&format!("    Project: {root} (from {file})\n"));
-        }
-        _ => out.push_str("    Project: no .arcconfig found above this directory\n"),
-    }
+/// The bold `REPOSITORY` header line, printed before association
+/// resolves (T1153 RB-D17: `printRepositorySection()` writes the header
+/// first at `ArcanistWhichWorkflow.php:265`, so even callsign-type
+/// errors still show it).
+fn repository_header(ansi: bool) -> String {
+    terminal::console_format("**%s**\n", &["REPOSITORY"], ansi)
 }
 
-fn render_repository(ctx: &Context, out: &mut String, ansi: bool) {
-    out.push('\n');
-    out.push_str(&bold("REPOSITORY", ansi));
-    out.push('\n');
-    out.push_str(&format!(
-        "    Branch: {}\n",
-        ctx.branch.as_deref().unwrap_or("HEAD (detached)")
-    ));
-    match (&ctx.head, &ctx.head_subject) {
-        (Some(head), Some(subject)) => out.push_str(&format!("    HEAD: {head} {subject}\n")),
-        (Some(head), None) => out.push_str(&format!("    HEAD: {head}\n")),
-        (None, _) => out.push_str("    HEAD: none\n"),
+/// The `REPOSITORY` body: process prose, wrapped reasons, and the
+/// association verdict (T1153 RB-D16, Rule 0:
+/// `ArcanistWhichWorkflow.php:264-285` at ceb).
+fn render_repository_body(assoc: &Association, ansi: bool) -> String {
+    let mut out = String::from(
+        "To identify the repository associated with this working copy, arc followed this process:\n\n",
+    );
+    for reason in &assoc.reasons {
+        out.push_str(&terminal::console_wrap(reason, 4, true));
+        out.push_str("\n\n");
     }
-    out.push_str(&format!(
-        "    Remote (origin): {}\n",
-        ctx.remote_url.as_deref().unwrap_or("none")
-    ));
-    match (&ctx.callsign, &ctx.callsign_source) {
-        (Some(name), Some(source)) => {
-            out.push_str(&format!("    Callsign: {name} (from {source})\n"))
-        }
-        (Some(name), None) => out.push_str(&format!("    Callsign: {name}\n")),
-        (None, _) => out.push_str("    Callsign: not configured\n"),
+    match &assoc.repo_name {
+        Some(name) => out.push_str(&format!(
+            "This working copy is associated with the {} repository.\n",
+            bold(name, ansi)
+        )),
+        None => out.push_str("This working copy is not associated with any repository.\n"),
     }
+    out
 }
 
-fn render_conduit(ctx: &Context, out: &mut String, ansi: bool) {
-    out.push('\n');
-    out.push_str(&bold("CONDUIT", ansi));
-    out.push('\n');
-    match &ctx.conduit_uri {
-        Some(uri) => out.push_str(&format!("    URI: {uri} (from {})\n", ctx.conduit_source)),
-        None => out.push_str("    URI: none configured\n"),
-    }
-    match ctx.token_installed {
-        Some(true) => out.push_str("    Token: installed\n"),
-        Some(false) => out.push_str("    Token: missing (run `arc install-certificate`)\n"),
-        None => out.push_str("    Token: unknown (no conduit URI)\n"),
-    }
-}
-
-fn render_range(ctx: &Context, out: &mut String, ansi: bool) {
-    out.push('\n');
-    out.push_str(&bold("COMMIT RANGE", ansi));
-    out.push('\n');
-    match (&ctx.base, &ctx.base_explanation) {
-        (Some(base), Some(why)) => {
-            out.push_str(&format!("    Base: {base} ({why})\n"));
-            out.push_str(&format!("    Head: {}\n", ctx.head_ref));
-            out.push_str(&format!("    Command: git diff {base}..{}\n", ctx.head_ref));
-            if ctx.commits.is_empty() {
-                out.push_str("    (No commits.)\n");
-            } else {
-                for commit in &ctx.commits {
-                    let short = commit.sha.chars().take(16).collect::<String>();
-                    out.push_str(&format!("    {short}  {}\n", commit.subject));
-                }
-            }
-        }
-        _ => out.push_str("    (No commit range outside a working copy.)\n"),
-    }
-}
-
-/// `created` guidance: PHP bolds the verdict (`**created**`) in the
-/// same sentence, so it substitutes as a marked value here.
-fn created_guidance(diff_arg: &str, ansi: bool) -> String {
-    let command = format!("arc diff{diff_arg}");
-    terminal::console_format(
-        "Since there are no revisions in Differential which match this working copy, a \
-         new revision will be **%s** if you run '%s'.\n\n",
-        &["created", &command],
-        ansi,
+/// The full `REPOSITORY` section (T1153 RB-D16): header plus body. The
+/// caller appends the blank line `run()` adds after
+/// `printRepositorySection()`.
+#[must_use]
+pub fn render_repository(assoc: &Association, ansi: bool) -> String {
+    format!(
+        "{}{}",
+        repository_header(ansi),
+        render_repository_body(assoc, ansi)
     )
 }
 
-/// `updated` guidance: same shape, PHP bolds `**updated**`.
-fn updated_guidance(diff_arg: &str, ansi: bool) -> String {
-    let command = format!("arc diff{diff_arg}");
-    terminal::console_format(
-        "Since exactly one revision in Differential matches this working copy, it \
-         will be **%s** if you run '%s'.\n\n",
-        &["updated", &command],
-        ansi,
-    )
+/// The `COMMIT RANGE` section: wrapped prose around the 16-char base
+/// plus summary, the `will be sent` sentence, the diff command, and
+/// the commit list (T1153 RB-D16/T1153 RB-D18, Rule 0:
+/// `ArcanistWhichWorkflow.php:130-175` at ceb). `head` is the raw
+/// `--head` value when given.
+#[must_use]
+pub fn render_range(range: &RangeData, arg: &str, head: Option<&str>, ansi: bool) -> String {
+    let mut out = terminal::console_wrap(
+        &terminal::console_format(
+            "**%s**\n%s\n\n    %s  %s\n\n",
+            &[
+                "COMMIT RANGE",
+                &format!("If you run 'arc diff{arg}', changes between the commit:"),
+                &range.base16,
+                &range.summary,
+            ],
+            ansi,
+        ),
+        0,
+        true,
+    );
+    let will_be_sent = match head {
+        None => format!(
+            "...and the current working copy state will be sent to Differential, because {}",
+            range.explanation
+        ),
+        Some(head) => format!(
+            "...and \"{head}\" will be sent to Differential, because {}",
+            range.explanation
+        ),
+    };
+    out.push_str(&terminal::console_wrap(
+        &terminal::console_format(
+            "%s\n\n%s\n\n    $ %s\n\n%s\n\n",
+            &[
+                &will_be_sent,
+                "You can see the exact changes that will be sent by running this command:",
+                &range.command,
+                "These commits will be included in the diff:",
+            ],
+            ansi,
+        ),
+        0,
+        true,
+    ));
+    if range.commits.is_empty() {
+        out.push_str("    (No commits.)");
+    } else {
+        let lines: Vec<String> = range
+            .commits
+            .iter()
+            .map(|commit| {
+                format!(
+                    "    {}  {}",
+                    commit.sha.chars().take(16).collect::<String>(),
+                    commit.subject
+                )
+            })
+            .collect();
+        out.push_str(&lines.join("\n"));
+    }
+    out.push_str("\n\n\n");
+    out
 }
 
-fn render_matching(ctx: &Context, out: &mut String, ansi: bool) {
-    out.push('\n');
-    out.push_str(&bold("MATCHING REVISIONS", ansi));
-    out.push('\n');
-    match &ctx.matching {
-        Matching::OutsideRepo => {
-            out.push_str("    (No revisions match outside a working copy.)\n");
-        }
-        Matching::Unavailable(reason) => {
-            out.push_str(&format!("    (Revision matching unavailable: {reason})\n"));
-        }
-        Matching::Found(revisions) if revisions.is_empty() => {
-            out.push_str("    (No revisions match.)\n\n");
-            out.push_str(&created_guidance(&ctx.diff_arg, ansi));
-        }
-        Matching::Found(revisions) => {
-            for revision in revisions {
-                match &revision.author {
-                    Some(author) => out.push_str(&format!(
-                        "    {} ({author}) {}\n",
-                        revision.monogram, revision.title
-                    )),
-                    None => {
-                        out.push_str(&format!("    {} {}\n", revision.monogram, revision.title))
-                    }
-                }
-                out.push_str(&format!("        Reason: {}\n\n", revision.why));
-            }
-            if revisions.len() == 1 {
-                out.push_str(&updated_guidance(&ctx.diff_arg, ansi));
-            } else {
-                out.push_str(&format!(
-                    "Since more than one revision in Differential matches this working copy, you \
-                     will be asked which revision you want to update if you run 'arc diff {}'.\n\n",
-                    ctx.diff_arg
-                ));
-            }
-        }
+/// The `MATCHING REVISIONS` section (T1153 RB-D16, Rule 0:
+/// `ArcanistWhichWorkflow.php:186-261` at ceb). The subheader prints on
+/// every run (T1153 RB-D19); the multi-revision sentence keeps PHP's
+/// literal `"arc diff {$arg}"` double space and skips
+/// `phutil_console_format` like PHP.
+#[must_use]
+pub fn render_matching(revisions: &[MatchedRevision], diff_arg: &str, ansi: bool) -> String {
+    let mut out = terminal::console_wrap(
+        &terminal::console_format(
+            "**%s**\n%s\n\n",
+            &[
+                "MATCHING REVISIONS",
+                "These Differential revisions match the changes in this working copy:",
+            ],
+            ansi,
+        ),
+        0,
+        true,
+    );
+    if revisions.is_empty() {
+        out.push_str("    (No revisions match.)\n\n");
+        out.push_str(&terminal::console_wrap(
+            &terminal::console_format(
+                "Since there are no revisions in Differential which match this working copy, a \
+                 new revision will be **created** if you run '%s'.\n\n",
+                &[&format!("arc diff{diff_arg}")],
+                ansi,
+            ),
+            0,
+            true,
+        ));
+        return out;
     }
+    for revision in revisions {
+        match &revision.author {
+            Some(author) => out.push_str(&format!(
+                "    {} ({author}) {}\n",
+                revision.monogram, revision.title
+            )),
+            None => out.push_str(&format!("    {} {}\n", revision.monogram, revision.title)),
+        }
+        out.push_str(&format!("        Reason: {}\n\n", revision.why));
+    }
+    if revisions.len() == 1 {
+        out.push_str(&terminal::console_wrap(
+            &terminal::console_format(
+                "Since exactly one revision in Differential matches this working copy, it \
+                 will be **updated** if you run '%s'.",
+                &[&format!("arc diff{diff_arg}")],
+                ansi,
+            ),
+            0,
+            true,
+        ));
+    } else {
+        let sentence = format!(
+            "Since more than one revision in Differential matches this working copy, you will be \
+             asked which revision you want to update if you run 'arc diff {diff_arg}'."
+        );
+        out.push_str(&terminal::console_wrap(&sentence, 0, true));
+    }
+    out.push_str("\n\n");
+    out
 }
 
 /// Render the human-readable report with the process ANSI setting.
@@ -1731,36 +2236,33 @@ pub fn render(ctx: &Context) -> String {
 /// (deterministic under test).
 #[must_use]
 pub fn render_ansi(ctx: &Context, ansi: bool) -> String {
-    let mut out = String::new();
-    render_working_copy(ctx, &mut out, ansi);
-    render_repository(ctx, &mut out, ansi);
-    render_conduit(ctx, &mut out, ansi);
-    render_range(ctx, &mut out, ansi);
-    render_matching(ctx, &mut out, ansi);
-    out
+    let assoc = Association {
+        reasons: ctx.repo_reasons.clone(),
+        repo_name: ctx.repo_name.clone(),
+    };
+    let range = RangeData {
+        base: ctx.base.clone().unwrap_or_default(),
+        explanation: ctx.base_explanation.clone().unwrap_or_default(),
+        base16: ctx.base16.clone().unwrap_or_default(),
+        summary: ctx.summary.clone().unwrap_or_default(),
+        command: ctx.command.clone().unwrap_or_default(),
+        commits: ctx.commits.clone(),
+        head: ctx.head.clone().unwrap_or_default(),
+    };
+    let head = ctx.head_explicit.then_some(ctx.head_ref.as_str());
+    format!(
+        "{}\n{}{}",
+        render_repository(&assoc, ansi),
+        render_range(&range, &ctx.diff_arg, head, ansi),
+        render_matching(&ctx.matching, &ctx.diff_arg, ansi)
+    )
 }
 
-/// Render the machine-readable report.
+/// Render the machine-readable report (an arc-rs extension; PHP has
+/// no `--json`). Carries the association rows (T1153 RB-D17) next to
+/// the pre-existing keys.
 #[must_use]
 pub fn report_json(ctx: &Context) -> serde_json::Value {
-    let (matching, matching_note): (Vec<serde_json::Value>, Option<String>) = match &ctx.matching {
-        Matching::OutsideRepo => (Vec::new(), Some("outside a working copy".to_string())),
-        Matching::Unavailable(reason) => (Vec::new(), Some(reason.clone())),
-        Matching::Found(revisions) => (
-            revisions
-                .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "revision": r.monogram,
-                        "title": r.title,
-                        "author": r.author,
-                        "why": r.why,
-                    })
-                })
-                .collect(),
-            None,
-        ),
-    };
     serde_json::json!({
         "dir": ctx.dir,
         "vcs": ctx.vcs,
@@ -1775,14 +2277,27 @@ pub fn report_json(ctx: &Context) -> serde_json::Value {
         "conduit_uri": ctx.conduit_uri,
         "conduit_source": ctx.conduit_source,
         "token_installed": ctx.token_installed,
+        "repository_name": ctx.repo_name,
+        "repository_reasons": ctx.repo_reasons,
         "base": ctx.base,
         "base_explanation": ctx.base_explanation,
         "head_ref": ctx.head_ref,
         "commits": ctx.commits.iter().map(|c| serde_json::json!({"commit": c.sha, "summary": c.subject})).collect::<Vec<_>>(),
-        "matching": matching,
-        "matching_note": matching_note,
+        "matching": ctx.matching.iter().map(|r| {
+            serde_json::json!({
+                "revision": r.monogram,
+                "title": r.title,
+                "author": r.author,
+                "why": r.why,
+            })
+        }).collect::<Vec<_>>(),
     })
 }
+
+/// The multi-commit error, checked after the repository section
+/// prints (T1153 RB-D16: `parseBaseCommitArgument()`).
+const TOO_MANY_COMMITS: &str = "Specify exactly one base commit. The end of the commit range is always the \
+    working copy state.";
 
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
@@ -1793,7 +2308,7 @@ struct Options {
     json: bool,
     base_rules: Option<String>,
     any_status: bool,
-    commit: Option<String>,
+    commits: Vec<String>,
 }
 
 enum Parsed {
@@ -1818,7 +2333,7 @@ struct Parser {
     json: bool,
     base_rules: Option<String>,
     any_status: bool,
-    commit: Option<String>,
+    commits: Vec<String>,
 }
 
 impl Parser {
@@ -1831,11 +2346,17 @@ impl Parser {
             json: false,
             base_rules: None,
             any_status: false,
-            commit: None,
+            commits: Vec::new(),
         }
     }
 
     fn flag_conduit(&mut self, arg: &str, iter: &mut ArgIter<'_>) -> Option<Step> {
+        // T1153 RB-D25: `--flag=value` is accepted like PHP
+        // (`PhutilArgumentParser.php:143-150` at ceb).
+        if let Some(value) = arg.strip_prefix("--conduit-uri=") {
+            self.conduit_uri = Some(value.to_string());
+            return Some(Step::Handled);
+        }
         if arg != "--conduit-uri" {
             return None;
         }
@@ -1849,6 +2370,12 @@ impl Parser {
     }
 
     fn flag_head(&mut self, arg: &str, iter: &mut ArgIter<'_>) -> Option<Step> {
+        // T1153 RB-D25: `--head=X` is accepted like `--base=X`.
+        if let Some(value) = arg.strip_prefix("--head=") {
+            self.head = value.to_string();
+            self.head_explicit = true;
+            return Some(Step::Handled);
+        }
         if arg != "--head" {
             return None;
         }
@@ -1880,28 +2407,16 @@ impl Parser {
     }
 
     fn push_commit(&mut self, arg: &str) -> Step {
-        if self.commit.is_some() {
-            Step::Done(Parsed::Error(
-                "Specify exactly one base commit. The end of the commit range is always the \
-                 working copy state."
-                    .to_string(),
-            ))
-        } else {
-            self.commit = Some(arg.to_string());
-            Step::Handled
-        }
+        // T1153 RB-D16: the count check runs after the repository
+        // section prints (`parseBaseCommitArgument()` at
+        // `ArcanistWhichWorkflow.php:84-87`), so parsing collects.
+        self.commits.push(arg.to_string());
+        Step::Handled
     }
 
     fn consume_rest(&mut self, iter: &mut ArgIter<'_>) -> Option<Step> {
         for rest in iter.by_ref() {
-            if self.commit.is_some() {
-                return Some(Step::Done(Parsed::Error(
-                    "Specify exactly one base commit. The end of the commit range is always the \
-                     working copy state."
-                        .to_string(),
-                )));
-            }
-            self.commit = Some(rest.clone());
+            self.commits.push(rest.clone());
         }
         None
     }
@@ -1956,7 +2471,7 @@ impl Parser {
             json: self.json,
             base_rules: self.base_rules,
             any_status: self.any_status,
-            commit: self.commit,
+            commits: self.commits,
         }
     }
 }
@@ -1973,118 +2488,203 @@ fn parse_args(argv: &[String]) -> Parsed {
     Parsed::Options(parser.finish())
 }
 
+thread_local! {
+    /// Set by [`prompt_line_with_tty`] when stdin is not a TTY. The
+    /// prompt hook type (`Fn(&str) -> Option<String>`) has no error
+    /// channel, so the `phutil_console_require_tty()` failure rides
+    /// out-of-band: each prompt call site takes it right after the
+    /// hook returns (see [`take_prompt_tty_failed`]). Scripted hooks
+    /// never set it, so their `None` keeps meaning EOF/default.
+    static PROMPT_TTY_FAILED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Take the recorded prompt TTY failure, if any (resetting it).
+fn take_prompt_tty_failed() -> bool {
+    PROMPT_TTY_FAILED.take()
+}
+
+/// `phutil_console_prompt()`: two blank lines plus the query wrapped
+/// at indent 4, then one raw answer line. Piped stdin echoes the
+/// prompt, records the TTY failure (see [`take_prompt_tty_failed`]),
+/// and yields `None`; EOF yields `None` (the caller takes its default).
 fn prompt_line(prompt: &str) -> Option<String> {
-    use std::io::{BufRead, Write};
-    print!("{prompt} ");
-    std::io::stdout().flush().ok()?;
-    let mut line = String::new();
-    match std::io::stdin().lock().read_line(&mut line) {
-        Ok(0) => None,
-        Ok(_) => Some(line.trim_end_matches(['\r', '\n']).to_string()),
-        Err(_) => None,
+    prompt_line_with_tty(prompt, crate::prompt::stdin_is_terminal())
+}
+
+/// [`prompt_line`] with an injected TTY flag (deterministic tests).
+fn prompt_line_with_tty(prompt: &str, stdin_tty: bool) -> Option<String> {
+    print!("{}", crate::prompt::prompt_text(prompt));
+    if !stdin_tty {
+        PROMPT_TTY_FAILED.set(true);
+        return None;
     }
+    crate::prompt::read_answer(&mut std::io::stdin().lock())
 }
 
 /// Entry point: `argv` excludes the subcommand name.
 pub fn run(argv: &[String]) -> ExitCode {
     let options = match parse_args(argv) {
         Parsed::Help => {
-            print!("{USAGE}");
+            print!("{}", usage());
             return ExitCode::SUCCESS;
         }
         Parsed::Error(message) => {
-            eprintln!("arc {NAME}: {message}\n\n{USAGE}");
-            return ExitCode::FAILURE;
+            // T1153 RB-D4 (R4): `which` is a subprocess workflow, so
+            // usage errors render `Usage Exception:` with no usage dump
+            // (`scripts/arcanist.php:432-444`).
+            return conduit::report(EnvelopeKind::Usage, &message);
         }
         Parsed::Options(options) => options,
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let env_uri = std::env::var("ARC_CONDUIT_URI").ok();
-    let user_file = config::arcrc_path();
-    if options.show_base {
-        return run_show_base(
-            &cwd,
-            user_file.as_deref(),
-            options.commit.as_deref(),
-            &options.head,
-            options.head_explicit,
-            options.base_rules.as_deref().unwrap_or(""),
-        );
+    // T1153 RB-D16: the working-copy gate runs before conduit setup
+    // (`scripts/arcanist.php:260-266` at ceb).
+    if !git::is_inside_work_tree(&cwd) {
+        return conduit::report(EnvelopeKind::Usage, WORKING_COPY_REQUIRED);
     }
-    let owned_client = config::client_for(options.conduit_uri.as_deref());
-    let match_config = match &owned_client {
-        Ok(client) => MatchConfig::Live {
-            client,
-            any_status: options.any_status,
-        },
-        Err(message) => MatchConfig::Unavailable(message.clone()),
-    };
-    let resolution = Resolution {
-        runtime_rules: options.base_rules.as_deref().unwrap_or(""),
-        prompt: &prompt_line,
-        match_config,
-    };
-    let ctx = match load_context(
+    let user_file = config::arcrc_path();
+    let opts = get_config::LoadOptions::default();
+    // T1153 RB-D17: conduit plus authentication come next
+    // (`requiresConduit()`/`requiresAuthentication()`), even for
+    // `--show-base`, which never reaches the repository section.
+    let client = match config::authed_client_for(
+        options.conduit_uri.as_deref(),
         &cwd,
         user_file.as_deref(),
-        options.conduit_uri.as_deref(),
-        env_uri.as_deref(),
-        options.commit.as_deref(),
-        &options.head,
-        options.head_explicit,
-        &resolution,
+        &opts,
+        &config::command_description(),
     ) {
-        Ok(ctx) => ctx,
-        Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            return ExitCode::FAILURE;
-        }
+        Ok(client) => client,
+        Err(error) => return error.report(),
+    };
+    let merged = match get_config::load_merged(&cwd, user_file.as_deref(), &opts) {
+        Ok(merged) => merged,
+        Err(message) => return conduit::report(EnvelopeKind::Exception, &message),
     };
     if options.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report_json(&ctx)).unwrap_or_else(|_| "{}".to_string())
-        );
-    } else {
-        print!("{}", render(&ctx));
+        return run_json(&cwd, user_file.as_deref(), &options, &merged, &client);
     }
+    if options.show_base {
+        return run_show_base(&cwd, &options, &merged);
+    }
+    run_text(&cwd, &options, &merged, &client)
+}
+
+/// The text report, printed in stages like `run()` at
+/// `ArcanistWhichWorkflow.php:79-261`: the repository section first,
+/// then the base-argument check, then the range, then matching, so
+/// each failure lands after the sections PHP has already printed.
+fn run_text(
+    cwd: &Path,
+    options: &Options,
+    merged: &get_config::MergedConfig,
+    client: &conduit::Client,
+) -> ExitCode {
+    let ansi = terminal::ansi_enabled();
+    print!("{}", repository_header(ansi));
+    let assoc = match load_association(client, cwd, merged) {
+        Ok(assoc) => assoc,
+        Err(message) => return report_which_error(&message),
+    };
+    println!("{}", render_repository_body(&assoc, ansi));
+    if options.commits.len() > 1 {
+        return conduit::report(EnvelopeKind::Usage, TOO_MANY_COMMITS);
+    }
+    let explicit = options.commits.first().map(String::as_str);
+    let runtime_rules = options.base_rules.as_deref().unwrap_or("");
+    let range = match load_range_data(
+        cwd,
+        merged,
+        explicit,
+        &options.head,
+        options.head_explicit,
+        runtime_rules,
+        &prompt_line,
+    ) {
+        Ok(range) => range,
+        Err(message) => return report_which_error(&message),
+    };
+    let head = options.head_explicit.then_some(options.head.as_str());
+    let arg = diff_arg(explicit, head);
+    print!("{}", render_range(&range, &arg, head, ansi));
+    let revisions = match match_working_copy_revisions(
+        client,
+        cwd,
+        &range.base,
+        &range.head,
+        options.any_status,
+    ) {
+        Ok(revisions) => revisions,
+        Err(message) => return report_which_error(&message),
+    };
+    print!("{}", render_matching(&revisions, &arg, ansi));
     ExitCode::SUCCESS
 }
 
-/// `--show-base` prints the base commit only, without conduit.
-fn run_show_base(
-    cwd: &Path,
-    user_file: Option<&Path>,
-    explicit: Option<&str>,
-    head_ref: &str,
-    head_explicit: bool,
-    runtime_rules: &str,
-) -> ExitCode {
-    if !git::is_inside_work_tree(cwd) {
-        eprintln!("arc {NAME}: no commit range outside a working copy");
-        return ExitCode::FAILURE;
+/// `--show-base` prints the base commit only: authenticated like the
+/// main report, but with no repository section and no commit listing
+/// (`ArcanistWhichWorkflow.php:103-110` at ceb).
+fn run_show_base(cwd: &Path, options: &Options, merged: &get_config::MergedConfig) -> ExitCode {
+    if options.commits.len() > 1 {
+        return conduit::report(EnvelopeKind::Usage, TOO_MANY_COMMITS);
     }
-    let loaded = match load_config_sources(cwd, user_file) {
-        Ok(loaded) => loaded,
-        Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            return ExitCode::FAILURE;
-        }
-    };
     let inputs = BaseInputs {
-        runtime_rules,
+        runtime_rules: options.base_rules.as_deref().unwrap_or(""),
         prompt: &prompt_line,
     };
-    match resolve_base(cwd, explicit, head_ref, head_explicit, &loaded, &inputs) {
+    match resolve_base(
+        cwd,
+        options.commits.first().map(String::as_str),
+        &options.head,
+        options.head_explicit,
+        merged,
+        &inputs,
+    ) {
         Ok((base, _)) => {
             println!("{base}");
             ExitCode::SUCCESS
         }
-        Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            ExitCode::FAILURE
-        }
+        Err(message) => report_which_error(&message),
     }
+}
+
+/// `--json` builds the whole context before printing anything.
+fn run_json(
+    cwd: &Path,
+    user_file: Option<&Path>,
+    options: &Options,
+    merged: &get_config::MergedConfig,
+    client: &conduit::Client,
+) -> ExitCode {
+    if options.commits.len() > 1 {
+        return conduit::report(EnvelopeKind::Usage, TOO_MANY_COMMITS);
+    }
+    let env_uri = std::env::var("ARC_CONDUIT_URI").ok();
+    let inputs = BaseInputs {
+        runtime_rules: options.base_rules.as_deref().unwrap_or(""),
+        prompt: &prompt_line,
+    };
+    let ctx = match load_context(
+        cwd,
+        user_file,
+        options.conduit_uri.as_deref(),
+        env_uri.as_deref(),
+        options.commits.first().map(String::as_str),
+        &options.head,
+        options.head_explicit,
+        merged,
+        &inputs,
+        client,
+        options.any_status,
+    ) {
+        Ok(ctx) => ctx,
+        Err(message) => return report_which_error(&message),
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report_json(&ctx)).unwrap_or_else(|_| "{}".to_string())
+    );
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]

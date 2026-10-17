@@ -5,11 +5,11 @@
 //! and storage paths from `src/configuration/ArcanistConfigurationManager.php`
 //! (`~/.arcrc`) plus
 //! `src/workingcopyidentity/ArcanistWorkingCopyIdentity.php`
-//! (`.git/arc/config`).
+//! (`arc/config` under `.git`, `.hg`, or `.svn`).
 //!
 //! User writes preserve the rest of `~/.arcrc` (hosts, aliases). An empty
-//! value deletes the key. Local writes only support git working copies
-//! (see T1128).
+//! value deletes the key. Local writes resolve the enclosing git, hg, or
+//! svn working copy (T1153 CORE-32).
 //!
 //! Console output goes through the shared [`arc_rs::terminal`] API: the
 //! unknown-key warning is a true `tsprintf()` site (escaped `%s`
@@ -22,20 +22,49 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use arc_rs::terminal::{PhtArg, TVal};
-use arc_rs::{config, get_config, git, terminal};
+use arc_rs::{
+    conduit::{self, EnvelopeKind},
+    config, get_config, terminal,
+};
 
 /// Subcommand name, matching `arc set-config`.
 pub const NAME: &str = "set-config";
 
-const USAGE: &str = "usage: arc set-config [--local] [--] <name> <value>\n\
-\n\
-Write an arc configuration option. Writes user configuration (~/.arcrc)\n\
-by default, or the working copy's local configuration (.git/arc/config)\n\
-with --local. An empty value deletes the key.\n\
-\n\
-Options:\n\
-  --local         Write local (working-copy) config instead of user config.\n\
-  -h, --help      Show this help.\n";
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `arc_rs::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistSetConfigWorkflow.php:12-40`).
+const HELP_SYNOPSIS: &str = "      **set-config** [__options__] -- __name__ __value__";
+const HELP_TEXT: &str = "          Supports: cli\n          Sets an arc configuration option.\n\n          Options are either user (apply to all arc commands you invoke\n          from the current user) or local (apply only to the current working\n          copy). By default, user configuration is written. Use __--local__\n          to write local configuration.\n\n          User values are written to '~/.arcrc' on Linux and Mac OS X, and an\n          undisclosed location on Windows. Local values are written to an arc\n          directory under either .git, .hg, or .svn as appropriate.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[(
+    "local",
+    None,
+    None,
+    "Set a local config value instead of a user one.",
+)];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<arc_rs::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    arc_rs::help::usage_text(
+        NAME,
+        None,
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &specs,
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(arc_rs::terminal::ansi_enabled())
+}
 
 /// Setting type for coercion, mirroring the `ArcanistSettings` table
 /// (`string`, `bool`, `list`, `wild`, `aliases`). Unknown keys are `wild`.
@@ -89,6 +118,9 @@ pub fn coerce_value(key: &str, raw: &str) -> Result<serde_json::Value, String> {
                 Err(err())
             }
         }
+        // T1153 CORE-37: PHP throws a plain `Exception`
+        // (`ArcanistSettings.php:236-240` at ceb), so this renders
+        // through the `Exception` arm (exit 1), not the usage arm.
         "aliases" => Err(terminal::pht(
             "Use \"arc alias\" to configure aliases, not \"arc set-config\".",
             &[],
@@ -102,6 +134,30 @@ pub fn coerce_value(key: &str, raw: &str) -> Result<serde_json::Value, String> {
 #[must_use]
 pub fn format_value(value: &serde_json::Value) -> String {
     get_config::format_value("", value)
+}
+
+/// Parse `--config key=value` pairs into a runtime map, mirroring
+/// `ArcanistConfigurationManager::applyRuntimeArcConfig()`: split on the
+/// first `=`, coerce with `willWriteValue()`, and let later pairs win.
+/// Unknown keys stay `wild`, like stock PHP.
+pub fn parse_runtime_config(
+    pairs: &[String],
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let mut map = serde_json::Map::new();
+    for pair in pairs {
+        let Some((key, value)) = pair.split_once('=') else {
+            return Err(terminal::pht(
+                "Argument was '%s', but must be '%s'. For example, %s",
+                &[
+                    PhtArg::Text(pair),
+                    PhtArg::Text("name=value"),
+                    PhtArg::Text("history.immutable=true"),
+                ],
+            ));
+        };
+        map.insert(key.to_string(), coerce_value(key, value)?);
+    }
+    Ok(map)
 }
 
 /// The `(was ...)` operand: PHP formats the old value (possibly null)
@@ -213,10 +269,23 @@ pub fn apply_user(user_file: &Path, key: &str, raw: &str) -> Result<String, Stri
     Ok(message)
 }
 
-/// Local config file for a repository root: `<root>/.git/arc/config`.
+/// Local config file for a repository root of flavor `kind`:
+/// `<root>/.(git|hg|svn)/arc/config`, mirroring
+/// `ArcanistWorkingCopyIdentity::$localMetaDir` (T1153 CORE-32).
+#[must_use]
+pub fn local_config_path_for(kind: get_config::VcsKind, repo_root: &Path) -> PathBuf {
+    let meta = match kind {
+        get_config::VcsKind::Git => ".git",
+        get_config::VcsKind::Hg => ".hg",
+        get_config::VcsKind::Svn => ".svn",
+    };
+    repo_root.join(meta).join("arc").join("config")
+}
+
+/// Local config file for a git repository root: `<root>/.git/arc/config`.
 #[must_use]
 pub fn local_config_path(repo_root: &Path) -> PathBuf {
-    repo_root.join(".git").join("arc").join("config")
+    local_config_path_for(get_config::VcsKind::Git, repo_root)
 }
 
 /// Read a local config file; a missing file yields an empty config. The
@@ -236,7 +305,7 @@ pub fn read_local_file(path: &Path) -> Result<serde_json::Map<String, serde_json
         .ok_or_else(|| format!("'{}' is not a JSON object", path.display()))
 }
 
-/// Write a local config file, creating `.git/arc/` as needed.
+/// Write a local config file, creating the `arc/` dir as needed.
 pub fn write_local_file(
     path: &Path,
     map: &serde_json::Map<String, serde_json::Value>,
@@ -248,28 +317,41 @@ pub fn write_local_file(
     write_json_file(path, &serde_json::Value::Object(map.clone()), false)
 }
 
-/// Set or delete `key` in the local config of the repository rooted at
-/// `repo_root`. Returns the message to print.
-pub fn apply_local_at(repo_root: &Path, key: &str, raw: &str) -> Result<String, String> {
-    let path = local_config_path(repo_root);
+/// Set or delete `key` in the local config of the `kind` repository
+/// rooted at `repo_root`. Returns the message to print.
+pub fn apply_local_at_kind(
+    kind: get_config::VcsKind,
+    repo_root: &Path,
+    key: &str,
+    raw: &str,
+) -> Result<String, String> {
+    let path = local_config_path_for(kind, repo_root);
     let mut map = read_local_file(&path)?;
     let message = apply_to_map(&mut map, key, raw, "local")?;
     write_local_file(&path, &map)?;
     Ok(message)
 }
 
-/// Set or delete `key` in the local config of the repository containing
-/// `dir`. Fails outside a git working copy with the stock
-/// `scripts/arcanist.php` usage error (`--local` requires a repository).
+/// Set or delete `key` in the local config of the git repository rooted
+/// at `repo_root`. Returns the message to print.
+pub fn apply_local_at(repo_root: &Path, key: &str, raw: &str) -> Result<String, String> {
+    apply_local_at_kind(get_config::VcsKind::Git, repo_root, key, raw)
+}
+
+/// Set or delete `key` in the local config of the working copy
+/// containing `dir`, for git, hg, or svn alike (T1153 CORE-32: the VCS
+/// root comes from [`get_config::find_vcs_root`], pure filesystem like
+/// PHP's `$try` walk — no binaries needed). Fails outside any working
+/// copy with the stock `scripts/arcanist.php` usage error (`--local`
+/// requires a repository).
 pub fn apply_local(dir: &Path, key: &str, raw: &str) -> Result<String, String> {
-    if !git::is_inside_work_tree(dir) {
+    let Some((kind, root)) = get_config::find_vcs_root(dir) else {
         return Err(terminal::pht(
             "This command must be run in a Git, Mercurial or Subversion working copy.",
             &[],
         ));
-    }
-    let top = git::stdout_text(dir, &["rev-parse", "--show-toplevel"])?;
-    apply_local_at(Path::new(&top), key, raw)
+    };
+    apply_local_at_kind(kind, &root, key, raw)
 }
 
 fn apply_to_map(
@@ -314,35 +396,67 @@ struct Options {
     local: bool,
     key: String,
     value: String,
+    config: Vec<String>,
+    config_files: Vec<String>,
+    arcrc_file: Option<String>,
 }
 
 fn parse_args(argv: &[String]) -> Result<Option<Options>, String> {
-    let mut local = false;
+    let mut options = Options {
+        local: false,
+        key: String::new(),
+        value: String::new(),
+        config: Vec::new(),
+        config_files: Vec::new(),
+        arcrc_file: None,
+    };
     let mut positional = Vec::new();
     let mut end_of_flags = false;
-    for arg in argv {
+    let mut index = 0;
+    while index < argv.len() {
+        let arg = &argv[index];
+        index += 1;
         if end_of_flags {
             positional.push(arg.clone());
-        } else if arg == "--" {
-            end_of_flags = true;
-        } else if arg == "--local" {
-            local = true;
-        } else if arg == "-h" || arg == "--help" {
-            return Ok(None);
-        } else if arg.starts_with('-') {
-            return Err(format!("unknown flag '{arg}'"));
-        } else {
-            positional.push(arg.clone());
+            continue;
         }
+        if arg == "--" {
+            end_of_flags = true;
+            continue;
+        }
+        if arg == "--local" {
+            options.local = true;
+            continue;
+        }
+        if arg == "-h" || arg == "--help" {
+            return Ok(None);
+        }
+        let (name, inline) = match arg.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (arg.as_str(), None),
+        };
+        if crate::get_config::take_runtime_flag(
+            &mut options.config,
+            &mut options.config_files,
+            &mut options.arcrc_file,
+            name,
+            inline,
+            argv,
+            &mut index,
+        )? {
+            continue;
+        }
+        if arg.starts_with('-') {
+            return Err(format!("unknown flag '{arg}'"));
+        }
+        positional.push(arg.clone());
     }
     if positional.len() != 2 {
         return Err(terminal::pht("Specify a key and a value.", &[]));
     }
-    Ok(Some(Options {
-        local,
-        key: positional[0].clone(),
-        value: positional[1].clone(),
-    }))
+    options.key = positional[0].clone();
+    options.value = positional[1].clone();
+    Ok(Some(options))
 }
 
 /// Entry point: `argv` excludes the subcommand name.
@@ -350,14 +464,21 @@ pub fn run(argv: &[String]) -> ExitCode {
     let options = match parse_args(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", usage());
             return ExitCode::SUCCESS;
         }
-        Err(message) => {
-            eprintln!("arc {NAME}: {message}\n\n{USAGE}");
-            return ExitCode::FAILURE;
-        }
+        // T1153 CORE-49 (R4): `set-config` is a subprocess
+        // workflow: usage errors render `Usage Exception:` with no
+        // usage dump (`scripts/arcanist.php:432-444`).
+        Err(message) => return conduit::report(EnvelopeKind::Usage, &message),
     };
+    // `--config` validates like everywhere else, then stays inert: stock
+    // PHP consumes it before dispatch and the write ignores runtime
+    // sources. `--config-file` is likewise accepted and ignored.
+    if let Err(message) = parse_runtime_config(&options.config) {
+        eprintln!("arc {NAME}: {message}");
+        return ExitCode::FAILURE;
+    }
     if let Some(warning) = warn_if_unknown(&options.key) {
         eprintln!("{warning}");
     }
@@ -365,9 +486,13 @@ pub fn run(argv: &[String]) -> ExitCode {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         apply_local(&cwd, &options.key, &options.value)
     } else {
-        match config::arcrc_path() {
-            Some(path) => apply_user(&path, &options.key, &options.value),
-            None => Err("cannot locate ~/.arcrc (HOME/USERPROFILE is not set)".to_string()),
+        match get_config::resolve_user_file(
+            config::arcrc_path(),
+            options.arcrc_file.as_deref().map(Path::new),
+        ) {
+            Ok(Some(path)) => apply_user(&path, &options.key, &options.value),
+            Ok(None) => Err("cannot locate ~/.arcrc (HOME/USERPROFILE is not set)".to_string()),
+            Err(message) => Err(message),
         }
     };
     match result {
@@ -375,10 +500,9 @@ pub fn run(argv: &[String]) -> ExitCode {
             println!("{message}");
             ExitCode::SUCCESS
         }
-        Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            ExitCode::FAILURE
-        }
+        // T1153 CORE-49 (R4): write failures are generic exceptions
+        // under the red banner (`:449-468`).
+        Err(message) => conduit::report(EnvelopeKind::Exception, &message),
     }
 }
 

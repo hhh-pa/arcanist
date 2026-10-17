@@ -6,6 +6,8 @@ fn args(v: &[&str]) -> Vec<String> {
 
 #[test]
 fn classifies_help_and_version() {
+    // T1153 CORE-22: `--version`/`-V` are additive (PHP has no such
+    // flag; bare `arc` asks to choose a workflow).
     assert_eq!(classify(&args(&["--help"])), Action::Help);
     assert_eq!(classify(&args(&["-h"])), Action::Help);
     assert_eq!(classify(&args(&["help"])), Action::Help);
@@ -93,6 +95,9 @@ fn renders_call_conduit_envelope() {
 
 #[test]
 fn call_conduit_execute_rejects_bad_stdin_without_io() {
+    // T1153 CORE-6 (R4): the stdin error is an `ArcanistUsageException`
+    // in the toolset runtime, which escapes into a PHP fatal (255),
+    // not a caught exit 1.
     let args = CallArgs {
         method: "m".to_string(),
         conduit_uri: None,
@@ -100,13 +105,15 @@ fn call_conduit_execute_rejects_bad_stdin_without_io() {
     let mut out = Vec::new();
     assert_eq!(
         run_call_conduit_with(&args, &b"nope"[..], &mut out),
-        ExitCode::FAILURE
+        ExitCode::from(255)
     );
     assert!(out.is_empty());
 }
 
 #[test]
 fn call_conduit_execute_reports_missing_token_without_io() {
+    // T1153 CORE-6 (R4): conduit setup failures escape the toolset
+    // runtime into a PHP fatal (255), like transport failures.
     let args = CallArgs {
         method: "m".to_string(),
         conduit_uri: Some("https://call-conduit-test.invalid/".to_string()),
@@ -114,7 +121,7 @@ fn call_conduit_execute_reports_missing_token_without_io() {
     let mut out = Vec::new();
     assert_eq!(
         run_call_conduit_with(&args, &b"{}"[..], &mut out),
-        ExitCode::FAILURE
+        ExitCode::from(255)
     );
     assert!(out.is_empty());
 }
@@ -145,7 +152,8 @@ fn alias_command_is_registered() {
     let Some(run) = run else {
         panic!("alias is not registered");
     };
-    assert_eq!(run(&args(&["--help"])), ExitCode::SUCCESS);
+    // T1153 B21/B23: piped runs carry `--`.
+    assert_eq!(run(&args(&["--help", "--"])), ExitCode::SUCCESS);
 }
 
 #[test]
@@ -215,13 +223,20 @@ fn expansion_reports_shell_and_broken_chains() {
         args(&["ls", "-la"]),
         || Some((aliases, Vec::new())),
         |shell| {
-            assert_eq!(shell, &args(&["ls", "-la"]));
+            // T1153 CORE-23: PHP `phutil_passthru()` mediates the
+            // shell, so Unix runs through `sh -c` (direct elsewhere).
+            if cfg!(unix) {
+                assert_eq!(shell, &args(&["sh", "-c", "'ls' '-la'"]));
+            } else {
+                assert_eq!(shell, &args(&["ls", "-la"]));
+            }
             Ok(alias::ShellStatus::Exited(0))
         },
     );
     assert_eq!(outcome, Err(ExitCode::SUCCESS));
+    // T1153 CORE-23: cyan `SHELL ALIAS` log-engine hint on stderr.
     assert!(
-        notices.iter().any(|n| n.starts_with("SHELL ALIAS: ")),
+        notices.iter().any(|n| n.contains("SHELL ALIAS")),
         "{notices:?}"
     );
 
@@ -231,6 +246,8 @@ fn expansion_reports_shell_and_broken_chains() {
         || Some((aliases, Vec::new())),
         |_| panic!("no shell execution expected"),
     );
+    // T1153 CORE-27 (kept): a broken chain fails fast instead of
+    // PHP's legacy fallthrough to the unknown-command error.
     assert_eq!(outcome, Err(ExitCode::FAILURE));
 }
 
@@ -327,15 +344,16 @@ fn help_unknown_name_succeeds_with_no_workflow_message() {
 
 #[test]
 fn workflow_header_and_no_workflow_line_match_php() {
-    assert_eq!(workflow_header("bogus", false), "BOGUS WORKFLOW");
+    // T1153 RB-D5: header helpers live in the shared `help` renderer.
+    assert_eq!(help::workflow_header("bogus", false), "BOGUS WORKFLOW");
     assert_eq!(
-        no_workflow_line("bogus", false),
+        help::no_workflow_line("bogus", false),
         "There is no bogus workflow."
     );
     // Bold markers are interpreted on TTYs (exact ANSI bytes are
     // covered by the terminal console-format tests).
-    assert!(workflow_header("bogus", true).contains('\x1b'));
-    assert!(no_workflow_line("bogus", true).contains('\x1b'));
+    assert!(help::workflow_header("bogus", true).contains('\x1b'));
+    assert!(help::no_workflow_line("bogus", true).contains('\x1b'));
 }
 
 #[test]
@@ -356,9 +374,15 @@ fn call_conduit_accepts_help_flags() {
         dispatch(&args(&["help", "call-conduit"])),
         ExitCode::SUCCESS
     );
-    assert!(CALL_CONDUIT_USAGE.contains("Call Conduit API methods."));
-    assert!(CALL_CONDUIT_USAGE.contains("call-conduit -- method"));
-    assert!(CALL_CONDUIT_USAGE.contains("conduit.ping"));
+    // T1153 R10: help renders from the reference entry (the old
+    // `CALL_CONDUIT_USAGE` duplicate is gone); exact bytes are locked
+    // by `r10_call_conduit_help_matches_generated_format`.
+    let text = render_workflow_help("call-conduit", true, false);
+    assert!(text.contains("Call Conduit API methods."));
+    assert!(text.contains("call-conduit -- method"));
+    assert!(text.contains("conduit.ping"));
+    // T1153 CORE-67: the ceb help names Phabricator, not "writing scripts".
+    assert!(text.contains("integrate with\nPhabricator"));
 }
 
 #[test]
@@ -379,4 +403,488 @@ fn call_conduit_help_flag_as_uri_value_is_not_help() {
         classify(&args(&["call-conduit", "--conduit-uri", "--help"])),
         Action::Error("Provide exactly one Conduit method name to call.".to_string())
     );
+}
+
+#[test]
+fn r4_core49_unknown_command_exits_1() {
+    // Unknown commands render `Usage Exception:` (subprocess arm)
+    // with exit 1 and no usage dump.
+    assert_eq!(dispatch(&args(&["bogus-command"])), ExitCode::FAILURE);
+}
+
+#[test]
+fn r4_core49_call_conduit_parse_error_exits_1() {
+    // `call-conduit` parser errors render the toolset `USAGE
+    // EXCEPTION` label with exit 1 and no usage dump.
+    assert_eq!(
+        dispatch(&args(&["call-conduit", "--bogus"])),
+        ExitCode::FAILURE
+    );
+    assert_eq!(dispatch(&args(&["call-conduit"])), ExitCode::FAILURE);
+}
+
+#[test]
+fn core1_call_conduit_envelope_has_code_prefix() {
+    // The envelope `errorMessage` is the `ConduitClientException`
+    // message: `"{code}: {info}"` with no `<method>` infix at ceb.
+    let text = render_api_envelope("ERR-CONDUIT-CORE", "no such method");
+    let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(doc["error"], serde_json::json!("ERR-CONDUIT-CORE"));
+    assert_eq!(
+        doc["errorMessage"],
+        serde_json::json!("ERR-CONDUIT-CORE: no such method")
+    );
+}
+
+#[test]
+fn core16_toolset_exact_wins() {
+    assert!(matches!(
+        resolve_command("land", true),
+        Resolution::Run {
+            name: "land",
+            notice: None
+        }
+    ));
+    assert!(matches!(
+        resolve_command("land", false),
+        Resolution::Run {
+            name: "land",
+            notice: None
+        }
+    ));
+}
+
+#[test]
+fn core16_toolset_spelling_corrects_only_when_interactive() {
+    let Resolution::Run { name, notice } = resolve_command("ver", true) else {
+        panic!("expected toolset correction");
+    };
+    assert_eq!(name, "version");
+    assert_eq!(
+        notice.as_deref(),
+        Some("(Assuming \"ver\" is the British spelling of \"version\".)")
+    );
+    // Piped: no autocorrect, falls to the classic prefix stage, which
+    // also finds `version` (run without a notice).
+    assert!(matches!(
+        resolve_command("ver", false),
+        Resolution::Run {
+            name: "version",
+            notice: None
+        }
+    ));
+}
+
+#[test]
+fn core16_classic_exact_is_case_insensitive() {
+    assert!(matches!(
+        resolve_command("DIFF", false),
+        Resolution::Run {
+            name: "diff",
+            notice: None
+        }
+    ));
+}
+
+#[test]
+fn core16_classic_unique_prefix_runs() {
+    assert!(matches!(
+        resolve_command("wh", false),
+        Resolution::Run {
+            name: "which",
+            notice: None
+        }
+    ));
+    // T1153 CORE-66: `browse` is a concrete PHP workflow, so its
+    // unique prefix resolves (unlike the abstract `markers`).
+    assert!(matches!(
+        resolve_command("bro", false),
+        Resolution::Run {
+            name: "browse",
+            notice: None
+        }
+    ));
+}
+
+#[test]
+fn core16_classic_multi_prefix_lists_suggestions() {
+    let Resolution::Unknown { message } = resolve_command("l", false) else {
+        panic!("expected unknown");
+    };
+    assert!(message.contains("Unknown command 'l'. Try 'arc help'."));
+    assert!(message.contains("Did you mean:\n    land\n    liberate\n    lint\n"));
+}
+
+#[test]
+fn core16_unknown_command_without_suggestions() {
+    let Resolution::Unknown { message } = resolve_command("bogus", false) else {
+        panic!("expected unknown");
+    };
+    assert_eq!(message, "Unknown command 'bogus'. Try 'arc help'.");
+}
+
+#[test]
+fn core16_dash_led_names_never_correct() {
+    let Resolution::Unknown { message } = resolve_command("--help", true) else {
+        panic!("expected unknown");
+    };
+    assert!(message.contains("Unknown command '--help'."));
+}
+
+#[test]
+fn core20_bare_help_lists_synopses_sorted_with_help() {
+    // T1153 CORE-20: the full WORKFLOWS reference with synopses.
+    let text = render_help_bare(false, false);
+    assert!(text.starts_with("WORKFLOWS\n\n"));
+    assert!(text.contains("Amend the working copy, synchronizing the local commit message."));
+    assert!(text.contains("Show this help, or workflow help for command."));
+    assert!(text.contains("Install shell completion."));
+    assert!(text.contains("OPTION REFERENCE"));
+    assert!(text.contains("Use help command for a detailed command reference."));
+    assert!(text.contains("Use --show-standard-options to show additional options."));
+    let diff = text.find("diff [paths]").expect("diff entry");
+    let download = text
+        .find("download [options] -- file")
+        .expect("download entry");
+    assert!(diff < download, "ksorted");
+    let install = text.find("install-certificate").expect("install entry");
+    let inspect = text
+        .find("inspect [options] -- object")
+        .expect("inspect entry");
+    assert!(inspect < install, "ksorted inspect before install");
+}
+
+#[test]
+fn core20_detailed_help_matches_php_layout() {
+    let text = render_workflow_help("diff", true, false);
+    assert!(text.starts_with("diff\n"));
+    assert!(text.contains("Supports: git, svn, hg"));
+    assert!(text.contains("--add-all, -a"));
+    assert!(text.contains("Automatically add all unstaged"));
+    assert!(text.ends_with('\n'));
+}
+
+#[test]
+fn r10_browse_help_matches_ceb_bytes() {
+    // T1153 R10: `arc help browse` renders the ceb workflow help
+    // (`src/browse/workflow/ArcanistBrowseWorkflow.php:13-60`), not
+    // the Rust-extended resolver text. Byte-identical to the
+    // per-command `--help` (`browse::help_text`).
+    let text = render_workflow_help("browse", true, false);
+    assert!(
+        text.contains("browse [options] -- target ...\n"),
+        "{text:?}"
+    );
+    assert!(text.contains("browse -- file-name\n"), "{text:?}");
+    assert!(
+        text.contains("Open a file or object in a local web browser."),
+        "{text:?}"
+    );
+    assert!(text.contains("$ arc browse README"), "{text:?}");
+    assert!(text.contains("--branch branch-name\n"), "{text:?}");
+    assert!(
+        text.contains("Default branch name to view on server."),
+        "{text:?}"
+    );
+    assert!(text.contains("--types type-list\n"), "{text:?}");
+    assert!(text.contains("(DEPRECATED) Obsolete"), "{text:?}");
+}
+
+#[test]
+fn core20_legacy_synopsis_keeps_source_indent() {
+    let text = render_workflow_help("diff", false, false);
+    assert!(text.contains("      diff [paths] (svn)\n"));
+}
+
+#[test]
+fn core66_prompts_and_shell_complete_listed() {
+    // T1153 CORE-66: `prompts` and `shell-complete` are listed.
+    let text = render_help_bare(false, false);
+    assert!(text.contains("prompts workflow"));
+    assert!(text.contains("Install shell completion."));
+    let detailed = render_workflow_help("shell-complete", true, false);
+    assert!(detailed.contains("Internal. Current term in the argument list being completed."));
+}
+
+#[test]
+fn core67_call_conduit_help_is_ceb_bytes() {
+    let text = render_workflow_help("call-conduit", true, false);
+    assert!(text.contains("Call Conduit API methods."));
+    // The unwrapped ceb sentence (wrapping re-breaks the long line).
+    assert!(text.contains(
+        "primarily useful for writing scripts which integrate with\nPhabricator. Examples:"
+    ));
+}
+
+#[test]
+fn rbd3_strips_standard_globals_anywhere() {
+    let (rest, globals) = strip_globals(&args(&["--trace", "land", "--no-ansi"])).unwrap();
+    assert_eq!(rest, args(&["land"]));
+    assert!(globals.trace);
+    assert_eq!(globals.ansi, Some(false));
+    let (rest, globals) = strip_globals(&args(&["--ansi"])).unwrap();
+    assert!(rest.is_empty());
+    assert_eq!(globals.ansi, Some(true));
+}
+
+#[test]
+fn unitu22_global_flags_strip_after_command() {
+    // T1153 UNIT-U22: PHP consumes globals anywhere (`unit --trace`
+    // works); `--config` alone is initial-only (PHP throws past the
+    // first non-flag word).
+    let (rest, globals) = strip_globals(&args(&["unit", "--trace"])).unwrap();
+    assert_eq!(rest, args(&["unit"]));
+    assert!(globals.trace);
+    let (rest, globals) = strip_globals(&args(&["unit", "--conduit-uri", "https://x/"])).unwrap();
+    assert_eq!(rest, args(&["unit"]));
+    assert_eq!(globals.conduit_uri.as_deref(), Some("https://x/"));
+}
+
+#[test]
+fn rbd3_strips_valued_and_repeat_globals() {
+    // T1153 CORE-34: `--config`/`--config-file`/`--arcrc-file`
+    // (plus conduit overrides) strip like PHP; `--config` precedes
+    // any non-flag word (initial-only).
+    let (rest, globals) = strip_globals(&args(&[
+        "--config",
+        "base=a",
+        "--config",
+        "pager=b",
+        "--config-file",
+        "c.json",
+        "--conduit-uri",
+        "https://x/",
+        "--conduit-token=abc",
+        "--arcrc-file",
+        "r.json",
+        "--anonymous",
+        "diff",
+    ]))
+    .unwrap();
+    assert_eq!(rest, args(&["diff"]));
+    assert_eq!(globals.conduit_uri.as_deref(), Some("https://x/"));
+    assert_eq!(globals.conduit_token.as_deref(), Some("abc"));
+    assert_eq!(
+        globals.config,
+        vec!["base=a".to_string(), "pager=b".to_string()]
+    );
+    assert_eq!(globals.config_files, vec!["c.json".to_string()]);
+    assert_eq!(globals.arcrc_file.as_deref(), Some("r.json"));
+    assert!(globals.anonymous);
+}
+
+#[test]
+fn rbd3_terminator_and_lone_dash_pass_through() {
+    let (rest, _) = strip_globals(&args(&["--", "--trace", "land"])).unwrap();
+    assert_eq!(rest, args(&["--", "--trace", "land"]));
+    let (rest, _) = strip_globals(&args(&["-", "land"])).unwrap();
+    assert_eq!(rest, args(&["-", "land"]));
+}
+
+#[test]
+fn rbd3_standard_spec_errors_are_bold() {
+    let error = strip_globals(&args(&["--trace=x"])).unwrap_err();
+    assert_eq!(
+        error.message,
+        "Argument \"--trace\" does not take a parameter."
+    );
+    assert!(matches!(error.kind, conduit::EnvelopeKind::Usage));
+    let error = strip_globals(&args(&["--trace", "--trace"])).unwrap_err();
+    assert_eq!(error.message, "Argument \"--trace\" was provided twice.");
+    let error = strip_globals(&args(&["--ansi", "--no-ansi"])).unwrap_err();
+    assert_eq!(
+        error.message,
+        "Argument \"--no-ansi\" conflicts with argument \"--ansi\"."
+    );
+    // Reversed order: no conflict, last flag wins.
+    let (_, globals) = strip_globals(&args(&["--no-ansi", "--ansi"])).unwrap();
+    assert_eq!(globals.ansi, Some(true));
+    let error = strip_globals(&args(&["--xprofile"])).unwrap_err();
+    assert_eq!(
+        error.message,
+        "Argument \"--xprofile\" requires a parameter."
+    );
+}
+
+#[test]
+fn rbd3_config_and_toolset_errors_are_red() {
+    let error = strip_globals(&args(&["--conduit-uri"])).unwrap_err();
+    assert_eq!(
+        error.message,
+        "Argument \"--conduit-uri\" requires a parameter."
+    );
+    assert!(matches!(error.kind, conduit::EnvelopeKind::ToolsetUsage));
+    let error = strip_globals(&args(&["land", "--config", "a=b"])).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("appears after the first non-flag argument")
+    );
+    assert!(matches!(error.kind, conduit::EnvelopeKind::ToolsetUsage));
+}
+
+#[test]
+fn rbd3_classic_only_errors_use_subprocess_arm() {
+    let error = strip_globals(&args(&["--arcrc-file"])).unwrap_err();
+    assert_eq!(
+        error.message,
+        "Argument \"--arcrc-file\" requires a parameter."
+    );
+    assert!(matches!(error.kind, conduit::EnvelopeKind::Exception));
+    let error = strip_globals(&args(&["--anonymous=x"])).unwrap_err();
+    assert_eq!(
+        error.message,
+        "Argument \"--anonymous\" does not take a parameter."
+    );
+}
+
+#[test]
+fn core17_terminator_needed_only_for_toolset_without_dashes() {
+    // T1153 CORE-17: piped toolset runs (including `call-conduit`)
+    // require `--`; classic commands do not gate here.
+    assert!(needs_terminator_error(&args(&["land"])));
+    assert!(needs_terminator_error(&args(&["help"])));
+    assert!(needs_terminator_error(&args(&["call-conduit", "m"])));
+    assert!(!needs_terminator_error(&args(&["land", "--"])));
+    assert!(!needs_terminator_error(&args(&["land", "--", "x"])));
+    assert!(!needs_terminator_error(&args(&["diff"])));
+    assert!(!needs_terminator_error(&args(&["DIFF"])));
+    assert!(!needs_terminator_error(&args(&[])));
+    assert!(!needs_terminator_error(&args(&["--", "land"])));
+}
+
+#[test]
+fn core19_all_commands_export_arcanist() {
+    // T1153 CORE-19 (R2): PHP putenvs `$command` after `selectWorkflow()`
+    // for every command (`scripts/arcanist.php:229`), so hook children of
+    // toolset-style commands inherit it too. `help` exercises a
+    // non-classic name through the real dispatch (no other test sets the
+    // process-once cell, so this read is deterministic).
+    let globals = Globals::default();
+    let code = dispatch_run("help", None, "help", &args(&["arc"]), &globals);
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(arc_rs::globals::command_name().as_deref(), Some("help"));
+    // T1153 CORE-66: 37 concrete workflows at ceb (`browse` is real;
+    // only `markers` is abstract).
+    assert_eq!(ALL_WORKFLOWS.len(), 37);
+}
+
+#[test]
+fn core34_config_shape_dup_and_unknown_rejected() {
+    let error = validate_runtime_config(&args(&["bad"])).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("Configuration option \"bad\" is not valid.")
+    );
+    assert!(matches!(error.kind, conduit::EnvelopeKind::ToolsetUsage));
+    let error = validate_runtime_config(&args(&["base=a", "base=b"])).unwrap_err();
+    assert!(error.message.contains("was provided multiple times"));
+    let error = validate_runtime_config(&args(&["history.immutable=true"])).unwrap_err();
+    assert!(error.message.contains("is not a recognized option"));
+    let map = validate_runtime_config(&args(&["phabricator.uri=https://x/"])).unwrap();
+    assert!(map.contains_key("phabricator.uri"));
+}
+
+#[test]
+fn rbd1_call_conduit_flag_errors_use_parser_texts() {
+    let (result, _) = parse_call_conduit_with(&args(&["--bogus", "--", "m"]), false);
+    assert_eq!(
+        result.unwrap_err(),
+        "Argument \"--bogus\" is unrecognized. Use \"--\" to indicate the end of flags."
+    );
+    let (result, _) = parse_call_conduit_with(&args(&["--conduit-uri"]), false);
+    assert_eq!(
+        result.unwrap_err(),
+        "Argument \"--conduit-uri\" requires a parameter."
+    );
+    let (result, _) = parse_call_conduit_with(
+        &args(&["--conduit-uri", "a", "--conduit-uri", "b", "--", "m"]),
+        false,
+    );
+    assert_eq!(
+        result.unwrap_err(),
+        "Argument \"--conduit-uri\" was provided twice."
+    );
+    let (result, _) =
+        parse_call_conduit_with(&args(&["--conduit-uri=https://x/", "--", "m"]), false);
+    assert_eq!(result.unwrap().conduit_uri.as_deref(), Some("https://x/"));
+}
+
+#[test]
+fn rbd1_call_conduit_flag_correction_reports_notice() {
+    let (result, notices) = parse_call_conduit_with(&args(&["--conduit-ur", "u", "--", "m"]), true);
+    assert_eq!(result.unwrap().conduit_uri.as_deref(), Some("u"));
+    assert_eq!(
+        notices,
+        vec![
+            "(Assuming \"--conduit-ur\" is the British spelling of \"--conduit-uri\".)".to_string()
+        ]
+    );
+    let (result, _) = parse_call_conduit_with(&args(&["--conduit-ur", "u", "--", "m"]), false);
+    assert!(result.unwrap_err().contains("is unrecognized"));
+}
+
+#[test]
+fn core21_call_conduit_count_error_uses_red_arm() {
+    assert_eq!(
+        dispatch(&args(&["call-conduit", "--bogus", "--", "m"])),
+        ExitCode::FAILURE
+    );
+    assert_eq!(dispatch(&args(&["call-conduit"])), ExitCode::FAILURE);
+}
+
+#[test]
+fn rbd4_bare_arc_chooses_workflow_without_dump() {
+    assert_eq!(dispatch(&args(&[])), ExitCode::FAILURE);
+}
+
+#[test]
+fn core66_prompts_and_shell_complete_dispatch() {
+    assert_eq!(dispatch(&args(&["prompts", "--help"])), ExitCode::SUCCESS);
+    assert_eq!(
+        dispatch(&args(&["shell-complete", "--help"])),
+        ExitCode::SUCCESS
+    );
+}
+
+#[test]
+fn core36_get_config_help_is_ceb_verbatim() {
+    // T1153 CORE-36: the `get-config` synopsis and help transcribe
+    // `ArcanistGetConfigWorkflow` at ceb byte for byte.
+    // Plain-mode render strips console markup, so this locks the ceb
+    // wording (entry keeps the `**`/`__` bytes for ANSI bold).
+    let brief = render_workflow_help("get-config", false, false);
+    assert!(brief.contains("get-config [options] -- [name ...]"));
+    let text = render_workflow_help("get-config", true, false);
+    assert!(text.contains("Supports: cli"));
+    assert!(text.contains("Reads an arc configuration option. With no argument, reads all"));
+    assert!(text.contains("With --verbose, shows detailed information about one or more"));
+}
+
+#[test]
+fn r10_call_conduit_help_matches_generated_format() {
+    // T1153 R10: `arc call-conduit --help` reroutes to `arc help
+    // call-conduit` (ceb `PhutilArgumentParser.php:461-475`); both render
+    // this reference entry (ceb `ArcanistCallConduitWorkflow.php:12-38`).
+    assert_eq!(
+        render_workflow_help("call-conduit", true, false),
+        "call-conduit -- method\n\
+         Call Conduit API methods.\n\
+         \n\
+         Allows you to make a raw Conduit method call:\n\
+         \n\
+         \x20 - Run this command from a working directory.\n\
+         \x20 - Call parameters are required, and read as a JSON blob from stdin.\n\
+         \x20 - Results are written to stdout as a JSON blob.\n\
+         \n\
+         This workflow is primarily useful for writing scripts which integrate with\n\
+         Phabricator. Examples:\n\
+         \n\
+         \x20 $ echo '{}' | arc call-conduit -- conduit.ping\n\
+         \x20 $ echo '{\"phid\":\"PHID-FILE-xxxx\"}' | arc call-conduit -- file.download\n"
+    );
+    let ansi = render_workflow_help("call-conduit", true, true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
 }

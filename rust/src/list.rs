@@ -15,12 +15,39 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::{conduit, config, git, svn, terminal};
+use crate::{
+    conduit::{self, EnvelopeKind},
+    config, get_config, git, svn, terminal,
+};
 
 /// Subcommand name, matching `arc list`.
 pub const NAME: &str = "list";
 
-const USAGE: &str = "usage: arc list [--json] [--conduit-uri URI]\n";
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `crate::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistListWorkflow.php:12-24`).
+const HELP_SYNOPSIS: &str = "      **list**";
+const HELP_TEXT: &str =
+    "          Supports: git, svn, hg\n          List your open Differential revisions.";
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    crate::help::usage_text(
+        NAME,
+        None,
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &[],
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(terminal::ansi_enabled())
+}
 
 /// Parsed `list` options.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,8 +242,13 @@ pub fn working_copy_root(cwd: &Path) -> Option<String> {
         .map(|root| root.to_string_lossy().to_string())
 }
 
-/// Authenticated user's PHID via `user.whoami`.
+/// Authenticated user's PHID: the identity cached at startup auth,
+/// else one `user.whoami` call (T1153 RB-D8: PHP resolves whoami once
+/// first, then reuses the cached PHID).
 pub fn user_phid(client: &conduit::Client) -> Result<String, String> {
+    if let Some((_, phid)) = client.authenticated_user() {
+        return Ok(phid);
+    }
     let who = client
         .call("user.whoami", &serde_json::json!({}))
         .map_err(|e| e.to_string())?;
@@ -347,34 +379,38 @@ pub fn run_in(cwd: &Path, argv: &[String]) -> ExitCode {
     let options = match parse_args(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
-            print!("{USAGE}");
+            print!("{}", usage());
             return ExitCode::SUCCESS;
         }
-        Err(msg) => {
-            eprintln!("arc {NAME}: {msg}\n\n{USAGE}");
-            return ExitCode::FAILURE;
-        }
+        // T1153 RB-D4 (R4): `list` is a subprocess workflow:
+        // usage errors render `Usage Exception:` with no usage dump
+        // (`scripts/arcanist.php:432-444`).
+        Err(msg) => return conduit::report(EnvelopeKind::Usage, &msg),
     };
     if let Err(msg) = require_working_copy(cwd) {
-        eprintln!("arc {NAME}: {msg}");
-        return ExitCode::FAILURE;
+        // The working-copy gate is a usage error (same envelope).
+        return conduit::report(EnvelopeKind::Usage, &msg);
     }
-    let client = match config::client_for(options.conduit_uri.as_deref()) {
+    // T1153 CORE-4/T1153 CORE-9: classic `requiresAuthentication` startup
+    // (tokenless engine, credential gate, `user.whoami` /
+    // `conduit.connect` verification).
+    let user_file = config::arcrc_path();
+    let client = match config::authed_client_for(
+        options.conduit_uri.as_deref(),
+        cwd,
+        user_file.as_deref(),
+        &get_config::LoadOptions::default(),
+        &config::command_description(),
+    ) {
         Ok(client) => client,
-        Err(msg) => {
-            eprintln!("arc {NAME}: {msg}");
-            return ExitCode::FAILURE;
-        }
+        Err(error) => return error.report(),
     };
     match execute_in(&client, &options, cwd) {
         Ok(out) => {
             print!("{out}");
             ExitCode::SUCCESS
         }
-        Err(msg) => {
-            eprintln!("arc {NAME}: {msg}");
-            ExitCode::FAILURE
-        }
+        Err(msg) => conduit::report(EnvelopeKind::Exception, &msg),
     }
 }
 

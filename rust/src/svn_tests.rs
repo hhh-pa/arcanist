@@ -1048,8 +1048,7 @@ fn auto_locale_is_a_known_value() {
 #[test]
 fn commit_passes_files_encoding_and_message_file() {
     let fake = FakeSvn::named("commit");
-    let out = commit_with_locale(&fake.dir, &fake.svn, &["a.txt", "b.txt"], "msg\n", None).unwrap();
-    assert!(out.is_empty());
+    commit_with_locale(&fake.dir, &fake.svn, &["a.txt", "b.txt"], "msg\n", None).unwrap();
     let log = fake.log();
     assert!(
         log.contains("commit a.txt b.txt --encoding utf-8 -F"),
@@ -1059,30 +1058,41 @@ fn commit_passes_files_encoding_and_message_file() {
 
 #[test]
 fn commit_failure_reports_the_php_sentence() {
+    // T1153 CORE-65: the failure text is the bare PHP sentence
+    // (`ArcanistCommitWorkflow.php:163` at ceb); the live child output
+    // is already on the console, so nothing rides along.
     let fake = FakeSvn::named("commit-fail");
     fake.write(".fakesvn-fail-commit", b"");
     let err = commit_with_locale(&fake.dir, &fake.svn, &["a.txt"], "msg\n", None).unwrap_err();
-    assert!(
-        err.contains("Executing 'svn commit' failed!"),
-        "unexpected: {err}"
-    );
+    assert_eq!(err, "Executing 'svn commit' failed!");
 }
 
 #[test]
 fn commit_sets_lang_for_the_child() {
+    // T1153 CORE-65: the child streams live (nothing is captured), so
+    // the probe records `LANG` in a file instead of stdout.
     let dir = std::env::temp_dir().join(format!("arc-rs-svn-lang-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    let seen = dir.join("lang.seen");
     #[cfg(windows)]
     let svn = {
         let bat = dir.join("langprobe.bat");
-        std::fs::write(&bat, "@echo off\r\necho LANG=%LANG%\r\n").unwrap();
+        std::fs::write(
+            &bat,
+            format!("@echo off\r\necho LANG=%LANG%>{}\r\n", seen.display()),
+        )
+        .unwrap();
         SvnCommand::custom("cmd", &["/C", &bat.to_string_lossy()])
     };
     #[cfg(not(windows))]
     let svn = {
         let sh = dir.join("langprobe.sh");
-        std::fs::write(&sh, "#!/bin/sh\necho \"LANG=$LANG\"\n").unwrap();
+        std::fs::write(
+            &sh,
+            format!("#!/bin/sh\necho \"LANG=$LANG\" > \"{}\"\n", seen.display()),
+        )
+        .unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = std::fs::metadata(&sh).unwrap().permissions();
@@ -1091,12 +1101,47 @@ fn commit_sets_lang_for_the_child() {
         }
         SvnCommand::custom(&sh.to_string_lossy(), &[])
     };
-    let out = commit_with_locale(&dir, &svn, &[], "msg\n", Some("en_US.UTF-8")).unwrap();
-    assert!(out.contains("LANG=en_US.UTF-8"), "unexpected: {out}");
+    commit_with_locale(&dir, &svn, &[], "msg\n", Some("en_US.UTF-8")).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&seen).unwrap().trim(),
+        "LANG=en_US.UTF-8"
+    );
     #[cfg(not(windows))]
     {
-        let out = commit_with(&dir, &svn, &[], "msg\n").unwrap();
-        assert!(out.contains("LANG=en_US."), "unexpected: {out}");
+        std::fs::remove_file(&seen).ok();
+        commit_with(&dir, &svn, &[], "msg\n").unwrap();
+        let recorded = std::fs::read_to_string(&seen).unwrap();
+        assert!(recorded.contains("LANG=en_US."), "unexpected: {recorded}");
     }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn core65_commit_streams_both_pipes_live() {
+    // T1153 CORE-65: like `phutil_passthru`, both pipes inherit the
+    // terminal (two lines land on the test's console here); only the
+    // status comes back.
+    let dir = std::env::temp_dir().join(format!("arc-rs-svn-pipes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    #[cfg(windows)]
+    let svn = {
+        let bat = dir.join("pipes.bat");
+        std::fs::write(&bat, "@echo off\r\necho Sending .\r\necho noise>&2\r\n").unwrap();
+        SvnCommand::custom("cmd", &["/C", &bat.to_string_lossy()])
+    };
+    #[cfg(not(windows))]
+    let svn = {
+        let sh = dir.join("pipes.sh");
+        std::fs::write(&sh, "#!/bin/sh\necho \"Sending .\"\necho noise >&2\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&sh).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&sh, perms).unwrap();
+        }
+        SvnCommand::custom(&sh.to_string_lossy(), &[])
+    };
+    commit_with_locale(&dir, &svn, &[], "msg\n", None).unwrap();
     std::fs::remove_dir_all(&dir).ok();
 }

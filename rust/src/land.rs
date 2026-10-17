@@ -73,15 +73,8 @@
 //!   multi-source option. PHP requires list form and throws on anything
 //!   else; the port also accepts a `{prompt: response}` map and skips
 //!   malformed entries.
-//! - `arc.land.onto` configuration accepts one string or a list of strings.
-//! - The `NOT REVISION AUTHOR` gate shows the author PHID; PHP shows the
-//!   author monogram (via the user hardpoint, which the port skips).
 //! - The `MULTIPLE "ONTO" BRANCHES` error renders branch views from the
 //!   local branch tips; PHP renders remote marker data.
-//! - `history.immutable` legacy-strategy ambiguity check
-//!   (`ArcanistGitLandEngine.php:1649-1693`) is not ported: without
-//!   `--strategy` or `arc.land.strategy` configuration the port always
-//!   selects `squash`.
 //! - Mercurial remote-ref existence probes run `hg identify --id --rev REF
 //!   REMOTE`; if that probe errors for any reason the ref is treated as
 //!   new (PHP queries remote markers instead).
@@ -110,18 +103,237 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use arc_rs::{config, diff_submit, git, hg, land_checks};
+use arc_rs::{
+    commitgraph, conduit, config, diff_local, diff_submit, get_config, git, hg, land_checks,
+    revision,
+};
 
+use crate::conduit::ClassifiedError;
 use crate::terminal::{self, TVal};
 
 /// Subcommand name, matching `arc land`.
 pub const NAME: &str = "land";
 
-const USAGE: &str = "usage: arc land [--hold] [--keep-branches] [--onto-remote REMOTE] [--onto BRANCH] [--strategy NAME] [--revision REV] [--preview] [--into REF] [--into-remote REMOTE] [--into-local] [--into-empty] [--incremental] [--pick] [--conduit-uri URI] [-- ref ...]\n";
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `crate::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistLandWorkflow.php:13-129,131-229`).
+const HELP_EXAMPLES: &str = "**land** [__options__] -- [__ref__ ...]";
+const HELP_SYNOPSIS: &str = "Publish reviewed changes.";
+const HELP_TEXT: &str = "Supports: git, git/p4, git/svn, hg\n\
+\n\
+Publish accepted revisions after review. This command is the last step in the\n\
+standard Differential code review workflow.\n\
+\n\
+To publish changes in local branch or bookmark \"feature1\", you will usually\n\
+run this command:\n\
+\n\
+\x20 **$ arc land feature1**\n\
+\n\
+This workflow merges and pushes changes associated with revisions that are\n\
+ancestors of __ref__. Without __ref__, the current working copy state will be\n\
+used. You can specify multiple __ref__ arguments to publish multiple changes at\n\
+once.\n\
+\n\
+A __ref__ can be any symbol which identifies a commit: a branch name, a tag\n\
+name, a bookmark name, a topic name, a raw commit hash, a symbolic reference,\n\
+etc.\n\
+\n\
+When you provide a __ref__, all unpublished changes which are present in\n\
+ancestors of that __ref__ will be selected for publishing. (With the\n\
+**--pick** flag, only the unpublished changes you directly reference will be\n\
+selected.)\n\
+\n\
+For example, if you provide local branch \"feature3\" as a __ref__ argument, that\n\
+may also select the changes in \"feature1\" and \"feature2\" (if they are ancestors\n\
+of \"feature3\"). If you stack changes in a single local branch, all commits in\n\
+the stack may be selected.\n\
+\n\
+The workflow merges unpublished changes reachable from __ref__ \"into\" some\n\
+intermediate branch, then pushes the combined state \"onto\" some destination\n\
+branch (or list of branches).\n\
+\n\
+(In Mercurial, the \"into\" and \"onto\" branches may be bookmarks instead.)\n\
+\n\
+In the most common case, there is only one \"onto\" branch (often \"master\" or\n\
+\"default\" or some similar branch) and the \"into\" branch is the same branch. For\n\
+example, it is common to merge local feature branch \"feature1\" into\n\
+\"origin/master\", then push it onto \"origin/master\".\n\
+\n\
+The list of \"onto\" branches is selected by examining these sources in order:\n\
+\n\
+\x20 - the **--onto** flags;\n\
+\x20 - the __arc.land.onto__ configuration setting;\n\
+\x20 - (in Git) the upstream of the branch targeted by the land operation,\n\
+\x20 \x20 recursively;\n\
+\x20 - or by falling back to a standard default:\n\
+\x20 \x20 - (in Git) \"master\";\n\
+\x20 \x20 - (in Mercurial) \"default\".\n\
+\n\
+The remote to push \"onto\" is selected by examining these sources in order:\n\
+\n\
+\x20 - the **--onto-remote** flag;\n\
+\x20 - the __arc.land.onto-remote__ configuration setting;\n\
+\x20 - (in Git) the upstream of the current branch, recursively;\n\
+\x20 - (in Git) the special \"p4\" remote which indicates a repository has\n\
+\x20 \x20 been synchronized with Perforce;\n\
+\x20 - or by falling back to a standard default:\n\
+\x20 \x20 - (in Git) \"origin\";\n\
+\x20 \x20 - (in Mercurial) \"default\".\n\
+\n\
+The branch to merge \"into\" is selected by examining these sources in order:\n\
+\n\
+\x20 - the **--into** flag;\n\
+\x20 - the **--into-empty** flag;\n\
+\x20 - or by falling back to the first \"onto\" branch.\n\
+\n\
+The remote to merge \"into\" is selected by examining these sources in order:\n\
+\n\
+\x20 - the **--into-remote** flag;\n\
+\x20 - the **--into-local** flag (which disables fetching before merging);\n\
+\x20 - or by falling back to the \"onto\" remote.\n\
+\n\
+After selecting remotes and branches, the commits which will land are printed.\n\
+\n\
+With **--preview**, execution stops here, before the change is merged.\n\
+\n\
+The \"into\" branch is fetched from the \"into\" remote (unless **--into-local** or\n\
+**--into-empty** are specified) and the changes are merged into the state in\n\
+the \"into\" branch according to the selected merge strategy.\n\
+\n\
+The default merge strategy is \"squash\", which produces a single commit from\n\
+all local commits for each change. A different strategy can be selected with\n\
+the **--strategy** flag.\n\
+\n\
+The resulting merged change will be given an up-to-date commit message\n\
+describing the final state of the revision in Differential.\n\
+\n\
+With **--hold**, execution stops here, before the change is pushed.\n\
+\n\
+The change is pushed onto all of the \"onto\" branches in the \"onto\" remote.\n\
+\n\
+If you are landing multiple changes, they are normally all merged locally and\n\
+then all pushed in a single operation. Instead, you can merge and push them one\n\
+at a time with **--incremental**.\n\
+\n\
+Under merge strategies which mutate history (including the default \"squash\"\n\
+strategy), local refs which descend from commits that were published are\n\
+now updated. For example, if you land \"feature4\", local branches \"feature5\" and\n\
+\"feature6\" may now be rebased on the published version of the change.\n\
+\n\
+Once everything has been pushed, cleanup occurs. Consulting mystical sources of\n\
+power, the workflow makes a guess about what state you wanted to end up in\n\
+after the process finishes. The working copy is put into that state.\n\
+\n\
+Any obsolete refs that point at commits which were published are deleted,\n\
+unless the **--keep-branches** flag is passed.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[
+    (
+        "hold",
+        None,
+        None,
+        "Prepare the changes to be pushed, but do not actually push them.",
+    ),
+    (
+        "keep-branches",
+        None,
+        None,
+        "Keep local branches around after changes are pushed. By default, local branches are deleted after the changes they contain are published.",
+    ),
+    (
+        "onto-remote",
+        None,
+        Some("remote-name"),
+        "Push to a remote other than the default.\n\nRelated configuration: **arc.land.onto-remote**",
+    ),
+    (
+        "onto",
+        None,
+        Some("branch-name"),
+        "After merging, push changes onto a specified branch.\n\nSpecifying this flag multiple times will push to multiple branches.\n\nRelated configuration: **arc.land.onto**",
+    ),
+    (
+        "strategy",
+        None,
+        Some("strategy-name"),
+        "Merge using a particular strategy. Supported strategies are \"squash\" and \"merge\".\n\nThe \"squash\" strategy collapses multiple local commits into a single commit when publishing. It produces a linear published history (but discards local checkpoint commits). This is the default strategy.\n\nThe \"merge\" strategy generates a merge commit when publishing that retains local checkpoint commits (but produces a nonlinear published history). Select this strategy if you do not want \"arc land\" to discard checkpoint commits.\n\nRelated configuration: **arc.land.strategy**",
+    ),
+    (
+        "revision",
+        None,
+        Some("revision-identifier"),
+        "Land a specific revision, rather than determining revisions automatically from the commits that are landing.",
+    ),
+    (
+        "preview",
+        None,
+        None,
+        "Show the changes that will land. Does not modify the working copy or the remote.",
+    ),
+    (
+        "into",
+        None,
+        Some("commit-ref"),
+        "Specify the state to merge into. By default, this is the same as the \"onto\" ref.",
+    ),
+    (
+        "into-remote",
+        None,
+        Some("remote-name"),
+        "Specifies the remote to fetch the \"into\" ref from. By default, this is the same as the \"onto\" remote.",
+    ),
+    (
+        "into-local",
+        None,
+        None,
+        "Use the local \"into\" ref state instead of fetching it from a remote.",
+    ),
+    (
+        "into-empty",
+        None,
+        None,
+        "Merge into the empty state instead of an existing state. This mode is primarily useful when creating a new repository, and selected automatically if the \"onto\" ref does not exist and the \"into\" state is not specified.",
+    ),
+    (
+        "incremental",
+        None,
+        None,
+        "When landing multiple revisions at once, push and rebase after each merge completes instead of waiting until all merges are completed to push.\n\nThis is slower than the default behavior and not atomic, but may make it easier to resolve conflicts and land complicated changes by allowing you to make progress one step at a time.",
+    ),
+    (
+        "pick",
+        None,
+        None,
+        "Land only the changes directly named by arguments, instead of all reachable ancestors.",
+    ),
+];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &specs,
+        ansi,
+    )
+}
 
 /// `user.whoami` Conduit method; the result's `phid` is the viewer PHID
 /// (`src/workflow/ArcanistWorkflow.php:489-494`).
 pub const METHOD_WHOAMI: &str = "user.whoami";
+
+/// `user.search` Conduit method for author monograms
+/// (`ArcanistUserSymbolHardpointQuery.php:66-77`).
+pub const METHOD_USER_SEARCH: &str = "user.search";
 
 /// `edge.search` Conduit method for parent-revision edges
 /// (`ArcanistRevisionParentRevisionsHardpointQuery.php:26-28`).
@@ -184,6 +396,12 @@ pub struct Options {
     /// Conduit URI override (global `--conduit-uri`,
     /// `src/workflow/ArcanistWorkflow.php:304-310`).
     pub conduit_uri: Option<String>,
+    /// Runtime `--config key=value` pairs (highest-precedence source).
+    pub config: Vec<String>,
+    /// `--config-file` paths (replace the system/user sources).
+    pub config_file: Vec<String>,
+    /// `--arcrc-file` path (replaces `~/.arcrc`).
+    pub arcrc_file: Option<String>,
     /// Canonical long flag names in first-provision order (PHP `$dict`
     /// insertion order, `ArcanistWorkflow.php:791-884`). Empty for
     /// hand-built options, which skip the order-dependent checks.
@@ -200,6 +418,9 @@ enum ValueFlag {
     Into,
     IntoRemote,
     ConduitUri,
+    Config,
+    ConfigFile,
+    ArcrcFile,
 }
 
 /// A boolean `land` flag.
@@ -296,6 +517,18 @@ const FLAG_SPECS: &[FlagSpec] = &[
         long: "conduit-uri",
         flag: Flag::Value(ValueFlag::ConduitUri),
     },
+    FlagSpec {
+        long: "config",
+        flag: Flag::Value(ValueFlag::Config),
+    },
+    FlagSpec {
+        long: "config-file",
+        flag: Flag::Value(ValueFlag::ConfigFile),
+    },
+    FlagSpec {
+        long: "arcrc-file",
+        flag: Flag::Value(ValueFlag::ArcrcFile),
+    },
 ];
 
 /// Find a spec by long name (`--onto`).
@@ -314,6 +547,9 @@ fn store_value_flag(options: &mut Options, flag: ValueFlag, value: String) {
         ValueFlag::Into => options.into = Some(value),
         ValueFlag::IntoRemote => options.into_remote = Some(value),
         ValueFlag::ConduitUri => options.conduit_uri = Some(value),
+        ValueFlag::Config => options.config.push(value),
+        ValueFlag::ConfigFile => options.config_file.push(value),
+        ValueFlag::ArcrcFile => options.arcrc_file = Some(value),
     }
 }
 
@@ -392,6 +628,18 @@ fn parse_long_flag(
 /// `-x` token errors like an unknown long name. Returns `Ok(None)` when
 /// `--help` was requested.
 pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
+    parse_options_with_tty(argv, crate::prompt::stdin_is_terminal())
+}
+
+/// [`parse_options`] with an injected TTY flag (deterministic tests).
+/// T1153 B21/B23: piped runs without `--` fail with
+/// `MISSING_TERMINATOR` (checked after unknown-flag scanning, like
+/// PHP's `parseFull()`, but before success). `--help` without `--`
+/// when piped reports the terminator. Vs ceb
+/// `ArcanistRuntime.php:80-86,172-188` and
+/// `PhutilArgumentParser.php:331-336`.
+fn parse_options_with_tty(argv: &[String], stdin_tty: bool) -> Result<Option<Options>, String> {
+    let missing = crate::help::terminator_missing(argv, stdin_tty);
     let mut options = Options::default();
     let mut queue: VecDeque<String> = argv.iter().cloned().collect();
     let mut end_of_flags = false;
@@ -405,6 +653,9 @@ pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
             continue;
         }
         if arg == "--help" || arg == "-h" {
+            if missing {
+                return Err(crate::help::MISSING_TERMINATOR.to_string());
+            }
             return Ok(None);
         }
         if let Some(name) = arg.strip_prefix("--") {
@@ -417,6 +668,9 @@ pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
             return Err(format!("Unknown argument '{spelling}'. Try 'arc help'."));
         }
         options.refs.push(arg);
+    }
+    if missing {
+        return Err(crate::help::MISSING_TERMINATOR.to_string());
     }
     Ok(Some(options))
 }
@@ -506,6 +760,11 @@ pub struct Io {
     /// explicitly (`false` keeps the historical plain rendering
     /// byte-identical).
     pub ansi: bool,
+    /// True when stdin is an interactive terminal. Scripted
+    /// (`canned`) IO sets this, modelling a TTY session; `buffered`
+    /// and `live` IO read the real stdin state, so piped input fails
+    /// prompts like `phutil_console_require_tty()`.
+    pub stdin_tty: bool,
 }
 
 /// Configuration source scope holding saved prompt answers
@@ -560,7 +819,10 @@ impl Io {
     /// Buffered IO reading real stdin (for `execute`).
     #[must_use]
     pub fn buffered() -> Self {
-        Self::default()
+        Self {
+            stdin_tty: crate::prompt::stdin_is_terminal(),
+            ..Self::default()
+        }
     }
 
     /// Live IO reading real stdin (for `run_in`).
@@ -568,15 +830,17 @@ impl Io {
     pub fn live() -> Self {
         Self {
             live: true,
+            stdin_tty: crate::prompt::stdin_is_terminal(),
             ..Self::default()
         }
     }
 
-    /// Scripted answers, for tests.
+    /// Scripted answers, for tests (models a TTY session).
     #[must_use]
     pub fn canned(answers: &[&str]) -> Self {
         Self {
             canned: answers.iter().map(|answer| (*answer).to_string()).collect(),
+            stdin_tty: true,
             ..Self::default()
         }
     }
@@ -1051,8 +1315,14 @@ pub fn build_ref_view(id: i64, name: &str) -> RefView {
 /// configuration (`saveResponse()`, `:253-285`). A saved response runs
 /// the same loop without prompting, and the `Using saved response`
 /// notice prints after the loop (`:238-249`). Declining — or end of
-/// input — aborts with [`ABORT`].
+/// input — aborts with [`ABORT`]. Non-interactive stdin echoes the
+/// query and fails first, even with a saved response
+/// (`phutil_console_require_tty()`, `:77-88`).
 pub fn prompt_for_key(io: &mut Io, key: &str, query: &str) -> Result<(), String> {
+    if !io.stdin_tty {
+        io.push_out(&format!("{query}\n"));
+        return Err(crate::prompt::NOT_INTERACTIVE.to_string());
+    }
     io.push_out("\n");
     let mut saved_response = io.saved.get(key).map(|saved| saved.response.clone());
     let mut save_scope: Option<PromptScope> = None;
@@ -1388,11 +1658,16 @@ fn push_prompt_help(io: &mut Io, key: &str) {
 /// `default_no` is false) wrapped with a 4-space indent
 /// (`phutil_console_prompt()`, `:42-45`), loops until `y`/`n`/empty,
 /// then prints a blank line. End of input aborts with [`ABORT`].
+/// Non-interactive stdin echoes the prompt once, then fails with the
+/// `phutil_console_require_tty()` error (`:46-52`).
 pub fn console_confirm(io: &mut Io, query: &str, default_no: bool) -> Result<bool, String> {
     let options = if default_no { "[y/N]" } else { "[Y/n]" };
     let prompt = console_wrap(&format!("{query} {options} "), 4, true);
     loop {
         io.push_out(&format!("\n\n{prompt}"));
+        if !io.stdin_tty {
+            return Err(crate::prompt::NOT_INTERACTIVE.to_string());
+        }
         let Some(raw) = io.read_answer() else {
             return Err(ABORT.to_string());
         };
@@ -1460,30 +1735,91 @@ fn detect_vcs(dir: &Path) -> Option<Vcs> {
     None
 }
 
-/// Read one `.arcconfig` value, walking toward the filesystem root.
-///
-/// Later (nearer) files win; the first file defining `key` provides it.
-/// Mirrors the project half of `config::discover_from()`, generalized to
-/// any key.
-fn arcconfig_value(dir: &Path, key: &str) -> Option<serde_json::Value> {
-    dir.ancestors().find_map(|ancestor| {
-        let text = std::fs::read_to_string(ancestor.join(".arcconfig")).ok()?;
-        let doc: serde_json::Value = serde_json::from_str(&text).ok()?;
-        doc.get(key).cloned()
-    })
+/// Read one `arc.land.*` value through the full source merge (runtime
+/// `--config` > local > project > user > system > default), mirroring
+/// `ArcanistLandEngine::get*FromConfiguration()` → `getConfig()`.
+fn land_config_value(
+    options: &Options,
+    dir: &Path,
+    key: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let cli = get_config::load_options_from_cli(
+        &options.config,
+        &options.config_file,
+        options.arcrc_file.as_deref(),
+    )?;
+    let user_file = config::arcrc_path();
+    let merged = get_config::load_merged(dir, user_file.as_deref(), &cli)?;
+    Ok(get_config::merged_value(key, &merged).map(|(_, value)| value))
 }
 
-/// Parse an `arc.land.onto` configuration value: one string or a list of
-/// strings (`ArcanistLandEngine::getOntoFromConfiguration()`,
-/// `ArcanistLandEngine.php:255-258`).
-fn parse_onto_config(value: &serde_json::Value) -> Vec<String> {
+/// Parse an `arc.land.onto` configuration value
+/// (`ArcanistStringListConfigOption` via
+/// `ArcanistListConfigOption::getValueFromStorageValue()`,
+/// `src/config/option/ArcanistListConfigOption.php:48-69`).
+///
+/// Non-arrays fail with `Expected a list!`, non-natural lists with
+/// `Expected a natural list!` (plain exceptions, i.e. fatal), and
+/// non-string items with `Expected a string (at index ...)` (a usage
+/// error, `ArcanistStringListConfigOption::validateListItem()`).
+fn parse_onto_config(value: &serde_json::Value) -> Result<Vec<String>, String> {
+    let items = match value {
+        serde_json::Value::Array(items) => items.clone(),
+        serde_json::Value::Object(map) => {
+            natural_list_items(map).ok_or_else(|| "Expected a natural list!".to_string())?
+        }
+        _ => return Err("Expected a list!".to_string()),
+    };
+    let mut onto = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        match item.as_str() {
+            Some(name) => onto.push(name.to_string()),
+            None => {
+                return Err(format!(
+                    "Expected a string (at index \"{index}\"), found \"{}\".",
+                    describe_json_type(item)
+                ));
+            }
+        }
+    }
+    Ok(onto)
+}
+
+/// Collect a JSON object's values in `0..len` key order when they form a
+/// natural list (PHP decodes JSON objects to possibly-natural arrays).
+fn natural_list_items(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Option<Vec<serde_json::Value>> {
+    let mut items = vec![serde_json::Value::Null; map.len()];
+    for (key, value) in map {
+        let index: usize = key.parse().ok()?;
+        // Canonical decimal keys covering `0..len`: unique map keys
+        // reaching every index exactly once.
+        if key != &index.to_string() || index >= map.len() {
+            return None;
+        }
+        items[index] = value.clone();
+    }
+    Some(items)
+}
+
+/// `phutil_describe_type()` for JSON values in config-item errors.
+/// Scalar names follow libphutil (`integer`, `double`, `boolean`,
+/// `NULL`); nested arrays/objects report `array` (the exact libphutil
+/// rendering for those is unrecoverable from here).
+fn describe_json_type(value: &serde_json::Value) -> &'static str {
     match value {
-        serde_json::Value::String(name) => vec![name.clone()],
-        serde_json::Value::Array(items) => items
-            .iter()
-            .filter_map(|item| item.as_str().map(str::to_string))
-            .collect(),
-        _ => Vec::new(),
+        serde_json::Value::Null => "NULL",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(number) => {
+            if number.is_f64() {
+                "double"
+            } else {
+                "integer"
+            }
+        }
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => "array",
     }
 }
 
@@ -1527,13 +1863,16 @@ fn load_saved_prompts(dir: &Path) -> HashMap<String, SavedResponse> {
     if let Some(project) = find_dot_file(dir, ".arcconfig") {
         files.push((project, PromptScope::Project));
     }
-    let git_local = dir.join(".git").join("arc").join("config");
-    if git_local.is_file() {
-        files.push((git_local, PromptScope::WorkingCopy));
-    }
-    let hg_local = dir.join(".hg").join("arc").join("config");
-    if hg_local.is_file() {
-        files.push((hg_local, PromptScope::WorkingCopy));
+    // The local file lives under the repository metadata directory at
+    // the repo root (`getLocalConfigurationFilePath()`,
+    // `ArcanistWorkingCopy.php:85-89`), not under the CWD. Git wins
+    // over Mercurial, like [`detect_vcs`].
+    let metadata = find_dot_dir(dir, ".git").or_else(|| find_dot_dir(dir, ".hg"));
+    if let Some(root) = metadata {
+        let local = root.join("arc").join("config");
+        if local.is_file() {
+            files.push((local, PromptScope::WorkingCopy));
+        }
     }
     load_saved_prompts_from(&files)
 }
@@ -1607,7 +1946,9 @@ pub enum RevisionSymbol {
 }
 
 impl RevisionSymbol {
-    /// The resolved symbol text, as `getSymbol()` would return it.
+    /// The normalized symbol text. (PHP's `getSymbol()` echoes the raw
+    /// input instead; failure messages use the raw text via
+    /// [`resolve_forced_revision_with_raw`].)
     #[must_use]
     pub fn display(&self) -> String {
         match self {
@@ -1769,7 +2110,7 @@ fn validate_options(options: &Options, dir: &Path, io: &mut Io) -> Result<Valida
             "Arguments \"--into\" and \"--into-empty\" are mutually exclusive.".to_string(),
         );
     }
-    let strategy_config = arcconfig_value(dir, "arc.land.strategy")
+    let strategy_config = land_config_value(options, dir, "arc.land.strategy")?
         .as_ref()
         .and_then(parse_string_config);
     let (strategy, line) = select_strategy_with_ansi(
@@ -1786,7 +2127,11 @@ fn validate_options(options: &Options, dir: &Path, io: &mut Io) -> Result<Valida
         .as_deref()
         .map(parse_revision_symbol)
         .transpose()?;
-    Ok(Validated { strategy, revision })
+    Ok(Validated {
+        strategy,
+        revision,
+        revision_raw: options.revision.clone(),
+    })
 }
 
 /// Options plus validated selections.
@@ -1794,10 +2139,13 @@ fn validate_options(options: &Options, dir: &Path, io: &mut Io) -> Result<Valida
 struct Validated {
     strategy: Strategy,
     revision: Option<RevisionSymbol>,
+    /// Raw `--revision` text, echoed verbatim on resolution failure
+    /// (PHP echoes `getSymbol()`, `ArcanistLandEngine.php:821-827`).
+    revision_raw: Option<String>,
 }
 
 /// Resolve the conduit URI: the flag, `ARC_CONDUIT_URI`, or the
-/// `.arcconfig` walk-up from `dir` (like the diff port's
+/// merged-config discovery from `dir` (like the diff port's
 /// `discover_from(&dir)`, not the process working directory).
 pub fn resolve_conduit_uri(conduit_uri: Option<&str>, dir: &Path) -> Option<String> {
     conduit_uri
@@ -1806,8 +2154,22 @@ pub fn resolve_conduit_uri(conduit_uri: Option<&str>, dir: &Path) -> Option<Stri
         .or_else(|| config::discover_from(dir))
 }
 
-/// Resolve the conduit URI (flag, `ARC_CONDUIT_URI`, or `.arcconfig`
-/// walk-up from `dir`) and build an authenticated client from `~/.arcrc`.
+/// [`resolve_conduit_uri`] with an explicit user file and
+/// [`get_config::LoadOptions`].
+pub fn resolve_conduit_uri_with(
+    conduit_uri: Option<&str>,
+    dir: &Path,
+    user_file: Option<&Path>,
+    opts: &get_config::LoadOptions,
+) -> Option<String> {
+    conduit_uri
+        .map(str::to_string)
+        .or_else(|| std::env::var("ARC_CONDUIT_URI").ok())
+        .or_else(|| config::discover_uri_with(dir, user_file, opts))
+}
+
+/// Resolve the conduit URI (flag, `ARC_CONDUIT_URI`, or merged-config
+/// discovery from `dir`) and build an authenticated client from `~/.arcrc`.
 ///
 /// Mirrors [`config::client_for`], but discovers from the target working
 /// copy — like the diff port (`discover_from(&dir)`) — instead of the
@@ -1827,6 +2189,31 @@ pub fn client_for_dir(
     arc_rs::conduit::Client::new(&uri, &token).map_err(|e| e.to_string())
 }
 
+/// [`client_for_dir`] with an explicit user file and
+/// [`get_config::LoadOptions`], so `--config`/`--config-file`/
+/// `--arcrc-file` reach conduit setup like stock PHP.
+pub fn client_for_dir_with(
+    conduit_uri: Option<&str>,
+    dir: &Path,
+    user_file: Option<&Path>,
+    opts: &get_config::LoadOptions,
+) -> Result<arc_rs::conduit::Client, String> {
+    config::client_for_with(conduit_uri, dir, user_file, opts)
+}
+
+/// Config overrides for a land run: parsed `--config`/`--config-file`/
+/// `--arcrc-file` plus the default user file.
+fn load_options_for_run(
+    options: &Options,
+) -> Result<(get_config::LoadOptions, Option<PathBuf>), String> {
+    let cli = get_config::load_options_from_cli(
+        &options.config,
+        &options.config_file,
+        options.arcrc_file.as_deref(),
+    )?;
+    Ok((cli, config::arcrc_path()))
+}
+
 /// Note printed when Conduit is unavailable and revision discovery is
 /// skipped (a port extension; PHP requires Conduit).
 pub fn format_skip_note(reason: &str) -> String {
@@ -1844,7 +2231,8 @@ pub fn format_skip_note_with_ansi(reason: &str, ansi: bool) -> String {
     )
 }
 
-/// Load revision rows for `symbol` via `differential.revision.search`.
+/// Load revision rows for `symbol` via `differential.revision.search`,
+/// following `cursor.after` pagination like `ConduitSearchFuture`.
 ///
 /// Numeric symbols constrain `ids`; PHID symbols constrain `phids`
 /// (`ArcanistRevisionSymbolRef`, `src/ref/revision/ArcanistRevisionSymbolRef.php:18-24`).
@@ -1852,20 +2240,39 @@ pub fn fetch_revision_views(
     call: &diff_submit::ConduitCall<'_>,
     symbol: &RevisionSymbol,
 ) -> Result<Vec<land_checks::RevisionView>, String> {
-    let params = match symbol {
+    let constraints = match symbol {
         RevisionSymbol::Id(id) => {
             let numeric =
                 i64::try_from(*id).map_err(|_| format!("Revision ID {id} is out of range."))?;
-            diff_submit::revision_search_params(&[numeric])
+            serde_json::json!({"ids": [numeric]})
         }
         RevisionSymbol::Phid(phid) => serde_json::json!({"phids": [phid]}),
     };
-    let result = call(diff_submit::METHOD_REVISION_SEARCH, &params)?;
-    let rows = result
-        .get("data")
-        .and_then(|data| data.as_array())
-        .ok_or_else(|| "differential.revision.search response has no data list".to_string())?;
-    rows.iter().map(land_checks::parse_revision).collect()
+    search_revision_views(call, &constraints)
+}
+
+/// Run one `differential.revision.search` with `constraints`, following
+/// `cursor.after` pagination like `ConduitSearchFuture`.
+///
+/// A missing or malformed `data` list degrades to no rows
+/// (`ConduitSearchFuture::readResults()`,
+/// `src/conduit/ConduitSearchFuture.php:112-114`).
+fn search_revision_views(
+    call: &diff_submit::ConduitCall<'_>,
+    constraints: &serde_json::Value,
+) -> Result<Vec<land_checks::RevisionView>, String> {
+    let params = revision::conduit_search_params(constraints, None);
+    let mut views = Vec::new();
+    for page in conduit::search_pages(call, diff_submit::METHOD_REVISION_SEARCH, &params)? {
+        let rows = page.get("data").and_then(|data| data.as_array());
+        views.extend(
+            rows.into_iter()
+                .flatten()
+                .map(land_checks::parse_revision)
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+    }
+    Ok(views)
 }
 
 /// Resolve a `--revision` symbol to its revision, or fail with the
@@ -1875,13 +2282,22 @@ pub fn resolve_forced_revision(
     call: &diff_submit::ConduitCall<'_>,
     symbol: &RevisionSymbol,
 ) -> Result<land_checks::RevisionView, String> {
+    resolve_forced_revision_with_raw(call, symbol, &symbol.display())
+}
+
+/// [`resolve_forced_revision`] echoing the raw `--revision` text on
+/// failure, as PHP echoes `getSymbol()`
+/// (`ArcanistLandEngine.php:821-827`).
+pub fn resolve_forced_revision_with_raw(
+    call: &diff_submit::ConduitCall<'_>,
+    symbol: &RevisionSymbol,
+    raw: &str,
+) -> Result<land_checks::RevisionView, String> {
     let views = fetch_revision_views(call, symbol)?;
-    views.into_iter().next().ok_or_else(|| {
-        format!(
-            "Symbol \"{}\" does not identify a valid revision.",
-            symbol.display()
-        )
-    })
+    views
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("Symbol \"{raw}\" does not identify a valid revision."))
 }
 
 /// Load the viewer PHID via `user.whoami` (`result['phid']`,
@@ -1916,11 +2332,16 @@ pub fn fetch_parent_edges(
             params["after"] = serde_json::Value::String(cursor.clone());
         }
         let result = call(METHOD_EDGE_SEARCH, &params)?;
+        // A missing or malformed `data` list degrades to no edges
+        // (PHP iterates `$results['data']` directly, which yields no
+        // rows on malformed responses,
+        // `ArcanistRevisionParentRevisionsHardpointQuery.php:34-36`).
         let items = result
             .get("data")
             .and_then(|data| data.as_array())
-            .ok_or_else(|| "edge.search response has no data list".to_string())?;
-        for item in items {
+            .cloned()
+            .unwrap_or_default();
+        for item in &items {
             let src = item.get("sourcePHID").and_then(|v| v.as_str());
             let dst = item.get("destinationPHID").and_then(|v| v.as_str());
             if let (Some(src), Some(dst)) = (src, dst) {
@@ -1941,9 +2362,11 @@ pub fn fetch_parent_edges(
 
 /// Load parent revision views for the landing `revisions`.
 ///
-/// Follows `revision.parent` edges, then resolves each distinct parent
-/// PHID through `differential.revision.search`, like
-/// `ArcanistRevisionParentRevisionsHardpointQuery` (`:45-80`).
+/// Follows `revision.parent` edges, then resolves the distinct parent
+/// PHIDs with one batched `differential.revision.search`, like
+/// `ArcanistRevisionParentRevisionsHardpointQuery` (`:45-80`) feeding the
+/// batched symbol hardpoint query
+/// (`ArcanistSimpleSymbolHardpointQuery.php:47-62`).
 pub fn fetch_parent_links(
     call: &diff_submit::ConduitCall<'_>,
     revisions: &[land_checks::RevisionView],
@@ -1957,10 +2380,10 @@ pub fn fetch_parent_links(
         }
     }
     let mut parents: HashMap<String, land_checks::RevisionView> = HashMap::new();
-    for phid in &distinct {
-        let views = fetch_revision_views(call, &RevisionSymbol::Phid(phid.clone()))?;
-        if let Some(view) = views.into_iter().next() {
-            parents.insert(phid.clone(), view);
+    if !distinct.is_empty() {
+        let views = search_revision_views(call, &serde_json::json!({"phids": distinct}))?;
+        for view in views {
+            parents.insert(view.phid.clone(), view);
         }
     }
     let mut links = Vec::new();
@@ -1992,11 +2415,15 @@ struct BuildableRow {
 /// (`ArcanistBuildableRef::newFromConduit()`, `getObjectPHID()`,
 /// `getMonogram()`, `getURI()`,
 /// `src/ref/buildable/ArcanistBuildableRef.php:23-63`).
-fn parse_buildable_rows(result: &serde_json::Value) -> Result<Vec<BuildableRow>, String> {
+fn parse_buildable_rows(result: &serde_json::Value) -> Vec<BuildableRow> {
+    // A missing or malformed `data` list degrades to no rows
+    // (`ConduitSearchFuture::readResults()`,
+    // `src/conduit/ConduitSearchFuture.php:112-114`).
+    let empty = Vec::new();
     let items = result
         .get("data")
         .and_then(|data| data.as_array())
-        .ok_or_else(|| "harbormaster.buildable.search response has no data list".to_string())?;
+        .unwrap_or(&empty);
     let mut rows = Vec::new();
     for item in items {
         let phid = item.get("phid").and_then(|v| v.as_str()).unwrap_or("");
@@ -2025,7 +2452,7 @@ fn parse_buildable_rows(result: &serde_json::Value) -> Result<Vec<BuildableRow>,
             uri,
         });
     }
-    Ok(rows)
+    rows
 }
 
 /// Read a numeric `id` field (number or numeric string), like the
@@ -2051,11 +2478,15 @@ struct BuildRow {
 
 /// Parse `harbormaster.build.search` data rows
 /// (`ArcanistBuildRef`, `src/ref/build/ArcanistBuildRef.php:26-62`).
-fn parse_build_rows(result: &serde_json::Value) -> Result<Vec<BuildRow>, String> {
+fn parse_build_rows(result: &serde_json::Value) -> Vec<BuildRow> {
+    // A missing or malformed `data` list degrades to no rows
+    // (`ConduitSearchFuture::readResults()`,
+    // `src/conduit/ConduitSearchFuture.php:112-114`).
+    let empty = Vec::new();
     let items = result
         .get("data")
         .and_then(|data| data.as_array())
-        .ok_or_else(|| "harbormaster.build.search response has no data list".to_string())?;
+        .unwrap_or(&empty);
     let mut rows = Vec::new();
     for item in items {
         let fields = item.get("fields");
@@ -2084,7 +2515,7 @@ fn parse_build_rows(result: &serde_json::Value) -> Result<Vec<BuildRow>, String>
             name: name.to_string(),
         });
     }
-    Ok(rows)
+    rows
 }
 
 /// Guess the absolute URI for a buildable, like
@@ -2127,11 +2558,15 @@ fn conduit_base_uri(conduit_uri: &str) -> String {
 /// `plan PHID -> arc-land behavior`
 /// (`ArcanistBuildPlanRef::getBehavior()`,
 /// `src/ref/buildplan/ArcanistBuildPlanRef.php:30-35`).
-fn parse_plan_behaviors(result: &serde_json::Value) -> Result<HashMap<String, String>, String> {
+fn parse_plan_behaviors(result: &serde_json::Value) -> HashMap<String, String> {
+    // A missing or malformed `data` list degrades to no rows
+    // (`ConduitSearchFuture::readResults()`,
+    // `src/conduit/ConduitSearchFuture.php:112-114`).
+    let empty = Vec::new();
     let items = result
         .get("data")
         .and_then(|data| data.as_array())
-        .ok_or_else(|| "harbormaster.buildplan.search response has no data list".to_string())?;
+        .unwrap_or(&empty);
     let mut behaviors = HashMap::new();
     for item in items {
         let phid = item.get("phid").and_then(|v| v.as_str()).unwrap_or("");
@@ -2147,7 +2582,7 @@ fn parse_plan_behaviors(result: &serde_json::Value) -> Result<HashMap<String, St
             .unwrap_or(land_checks::PLAN_ALWAYS);
         behaviors.insert(phid.to_string(), behavior.to_string());
     }
-    Ok(behaviors)
+    behaviors
 }
 
 /// Load build views for the landing `revisions`, joined to revision PHIDs.
@@ -2159,9 +2594,11 @@ fn parse_plan_behaviors(result: &serde_json::Value) -> Result<HashMap<String, St
 /// `harbormaster.build.search` with `buildables`
 /// (`ArcanistBuildableBuildsHardpointQuery.php:19-23`), and
 /// `harbormaster.buildplan.search` with `phids`
-/// (`ArcanistBuildBuildplanHardpointQuery.php:21-25`). Revisions without a
-/// diff PHID (legacy rows) contribute no builds. `conduit_uri`
-/// absolutizes buildable URIs (see [`absolute_buildable_uri`]).
+/// (`ArcanistBuildBuildplanHardpointQuery.php:21-25`). Each search
+/// follows `cursor.after` pagination like `ConduitSearchFuture`.
+/// Revisions without a diff PHID (legacy rows) contribute no builds.
+/// `conduit_uri` absolutizes buildable URIs (see
+/// [`absolute_buildable_uri`]).
 pub fn fetch_build_views(
     call: &diff_submit::ConduitCall<'_>,
     revisions: &[land_checks::RevisionView],
@@ -2171,11 +2608,21 @@ pub fn fetch_build_views(
     if diff_phids.is_empty() {
         return Ok(Vec::new());
     }
-    let buildables = call(
+    let mut rows = Vec::new();
+    for page in conduit::search_pages(
+        call,
         METHOD_BUILDABLE_SEARCH,
-        &serde_json::json!({"objectPHIDs": diff_phids, "manual": false}),
-    )?;
-    let rows = parse_buildable_rows(&buildables)?;
+        &revision::conduit_search_params(
+            &serde_json::json!({"objectPHIDs": diff_phids, "manual": false}),
+            None,
+        ),
+    )? {
+        rows.extend(parse_buildable_rows(&page));
+    }
+    // One buildable per diff PHID, last row wins
+    // (`$buildable_refs[$object_phid] = $buildable_ref`,
+    // `ArcanistRevisionBuildableHardpointQuery.php:36-41`).
+    let rows = last_buildable_per_object(rows);
     // Join buildable objectPHID -> revision diffPHID, like
     // `confirmBuilds` (`ArcanistLandEngine.php:623-644`).
     let buildable_to_revision = join_buildable_revisions(&rows, revisions);
@@ -2183,11 +2630,14 @@ pub fn fetch_build_views(
         return Ok(Vec::new());
     }
     let phids: Vec<String> = rows.iter().map(|row| row.phid.clone()).collect();
-    let builds = call(
+    let mut build_rows = Vec::new();
+    for page in conduit::search_pages(
+        call,
         METHOD_BUILD_SEARCH,
-        &serde_json::json!({"buildables": phids}),
-    )?;
-    let build_rows = parse_build_rows(&builds)?;
+        &revision::conduit_search_params(&serde_json::json!({"buildables": phids}), None),
+    )? {
+        build_rows.extend(parse_build_rows(&page));
+    }
     let behaviors = fetch_plan_behaviors(call, &build_rows)?;
     let mut views = Vec::new();
     for row in &build_rows {
@@ -2248,11 +2698,33 @@ fn fetch_plan_behaviors(
     if plan_phids.is_empty() {
         return Ok(HashMap::new());
     }
-    let plans = call(
+    let mut behaviors = HashMap::new();
+    for page in conduit::search_pages(
+        call,
         METHOD_BUILDPLAN_SEARCH,
-        &serde_json::json!({"phids": plan_phids}),
-    )?;
-    parse_plan_behaviors(&plans)
+        &revision::conduit_search_params(&serde_json::json!({"phids": plan_phids}), None),
+    )? {
+        behaviors.extend(parse_plan_behaviors(&page));
+    }
+    Ok(behaviors)
+}
+
+/// Keep the last buildable row per `objectPHID`, in first-seen object
+/// order (PHP's `$buildable_refs` map keeps insertion order while
+/// overwriting values).
+fn last_buildable_per_object(rows: Vec<BuildableRow>) -> Vec<BuildableRow> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_object: HashMap<String, BuildableRow> = HashMap::new();
+    for row in rows {
+        if !by_object.contains_key(&row.object_phid) {
+            order.push(row.object_phid.clone());
+        }
+        by_object.insert(row.object_phid.clone(), row);
+    }
+    order
+        .into_iter()
+        .filter_map(|object| by_object.remove(&object))
+        .collect()
 }
 
 /// One build view for `row`, or `None` when its buildable belongs to no
@@ -2330,19 +2802,16 @@ pub fn fetch_commit_message(
 /// Evaluate the pre-land gates for `revisions` over `call`.
 ///
 /// Loads the viewer PHID, parent links, and builds, then runs
-/// [`land_checks::evaluate_gates`]. Without a viewer identity the author
-/// check can not run; viewing as the first revision's author reduces it to
-/// a no-op for single-revision lands.
+/// [`land_checks::evaluate_gates`]. A viewer failure propagates: PHP
+/// throws (`ArcanistRuntime::getViewer()`,
+/// `src/runtime/ArcanistRuntime.php:825-832`) instead of falling back to
+/// a revision author.
 pub fn load_gate_findings(
     call: &diff_submit::ConduitCall<'_>,
     revisions: &[land_checks::RevisionView],
     commit_count: usize,
 ) -> Result<Vec<land_checks::GateFinding>, String> {
-    let fallback = revisions
-        .first()
-        .map(|revision| revision.author_phid.clone())
-        .unwrap_or_default();
-    let viewer = fetch_viewer_phid(call).unwrap_or(fallback);
+    let viewer = fetch_viewer_phid(call)?;
     let links = fetch_parent_links(call, revisions)?;
     let landing: Vec<&str> = revisions.iter().map(|rev| rev.phid.as_str()).collect();
     // Gate verdicts never render URIs, so no conduit URI is needed.
@@ -2661,61 +3130,65 @@ pub fn display_symbols(symbols: &[String]) -> String {
         .join(", ")
 }
 
-/// Extract `Differential Revision` IDs from a commit message corpus.
+/// Extract the `Differential Revision` ID from a commit message corpus.
 ///
-/// Matches `differential revision:` (case-insensitive) followed by an
-/// optional URI and a `D123`/`123` monogram, collecting every ID. Ports the
-/// explicit-ID half of `loadWorkingCopyDifferentialRevisions()`
-/// (`ArcanistGitAPI.php:1192-1202`).
+/// Ports `ArcanistDifferentialCommitMessage::parseRevisionIDFromRawCorpus()`
+/// (`src/differential/ArcanistDifferentialCommitMessage.php:114-148`): the
+/// first line starting with `Differential Revision:` (case-insensitive)
+/// supplies the value (the rest of the line, trimmed), which must be a
+/// `D123` monogram or a URI whose path is one. Anything else is invalid:
+/// PHP throws an `ArcanistUsageException` there, which the message
+/// hardpoint query catches per commit
+/// (`ArcanistMessageRevisionHardpointQuery.php:33-41`), so callers treat
+/// an invalid or absent field as "no ID" and the result holds at most
+/// one ID. Bare digits, `D0`, and trailing garbage are invalid.
 pub fn differential_revision_ids(message: &str) -> Vec<u64> {
     const TAG: &[u8] = b"differential revision:";
-    let bytes = message.as_bytes();
-    let mut ids = Vec::new();
-    let mut index = 0;
-    while index + TAG.len() <= bytes.len() {
-        if bytes[index..index + TAG.len()].eq_ignore_ascii_case(TAG)
-            && let Some(after) = message.get(index + TAG.len()..)
-            && let Some(id) = first_revision_id_after(after)
-            && !ids.contains(&id)
-        {
-            ids.push(id);
+    for line in message.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.len() < TAG.len() || !line.as_bytes()[..TAG.len()].eq_ignore_ascii_case(TAG) {
+            continue;
         }
-        index += 1;
-    }
-    ids
-}
-
-/// Find the first `D123`/`123` monogram in `text`.
-fn first_revision_id_after(text: &str) -> Option<u64> {
-    let mut chars = text.char_indices().peekable();
-    while let Some((index, ch)) = chars.next() {
-        let start = if ch == 'D' || ch == 'd' {
-            match chars.peek() {
-                Some((_, next)) if next.is_ascii_digit() => index + 1,
-                _ => continue,
-            }
-        } else if ch.is_ascii_digit() {
-            // Skip digits that continue a longer token (part of a URI path
-            // segment or word); monograms start at a boundary.
-            if index > 0 {
-                let prev = text.as_bytes()[index - 1];
-                if prev.is_ascii_alphanumeric() {
-                    continue;
-                }
-            }
-            index
-        } else {
+        let Some(value) = line.get(TAG.len()..) else {
             continue;
         };
-        let digits: String = text[start..]
-            .chars()
-            .take_while(|ch| ch.is_ascii_digit())
-            .collect();
-        if let Ok(id) = digits.parse::<u64>() {
-            return Some(id);
+        let value = value.trim();
+        if value.is_empty() {
+            return Vec::new();
         }
+        return parse_differential_revision_value(value)
+            .into_iter()
+            .collect();
     }
-    None
+    Vec::new()
+}
+
+/// Parse one `Differential Revision` field value: `D123`, or a URI whose
+/// path (leading/trailing slashes trimmed) is `D123`. Returns `None`
+/// for anything else, where PHP throws.
+fn parse_differential_revision_value(value: &str) -> Option<u64> {
+    if let Some(id) = parse_revision_monogram(value) {
+        return Some(id);
+    }
+    // Otherwise, try to find a full URI: strip any query/fragment,
+    // drop the scheme and authority, and match the path.
+    let path = value.split(['?', '#']).next().unwrap_or(value);
+    let path = match path.find("://") {
+        Some(scheme_end) => path[scheme_end + 3..]
+            .split_once('/')
+            .map_or("", |(_, rest)| rest),
+        None => path,
+    };
+    parse_revision_monogram(path.trim_matches('/'))
+}
+
+/// Parse a `D123` monogram (`[dD][1-9][0-9]*`, anchored).
+fn parse_revision_monogram(text: &str) -> Option<u64> {
+    let digits = text.strip_prefix('D').or_else(|| text.strip_prefix('d'))?;
+    if !is_revision_id(digits) {
+        return None;
+    }
+    digits.parse::<u64>().ok()
 }
 
 /// Query legacy `differential.query` rows by revision ID.
@@ -2758,11 +3231,18 @@ pub fn query_revisions_by_hashes(
 /// (`ArcanistLandEngine::loadRevisionRefs()`, `:798-984`).
 ///
 /// `message_of` reads a commit's full message; `hashes_of` lists the
-/// commit-hash pairs to look up. Commits with exactly one related revision
-/// select it; a forced `--revision` selects itself for commits with no
-/// related revisions (or related sets including it), fails with the TODO
-/// error when other commits belong elsewhere, and ambiguity without a
-/// forced revision prints the `AMBIGUOUS REVISION` banner and fails.
+/// commit-hash pairs to look up. Message-derived IDs resolve through one
+/// batched `differential.revision.search` (rows keep `diffPHID`,
+/// `ArcanistMessageRevisionHardpointQuery.php:56-60`) and commit hashes
+/// through one batched `differential.query`
+/// (`ArcanistGitWorkingCopyRevisionHardpointQuery.php:47-78`); every
+/// commit's related revisions are the PHID-deduped union of both
+/// (`ArcanistObjectListHardpoint.php:10-24`). Commits with exactly one
+/// related revision select it; a forced `--revision` selects itself for
+/// commits with no related revisions (or related sets including it),
+/// fails with the TODO error when other commits belong elsewhere, and
+/// ambiguity without a forced revision prints the `AMBIGUOUS REVISION`
+/// banner and fails.
 /// Reads `(hash-type, hash)` pairs for one commit.
 type HashesOf<'a> = &'a dyn Fn(&str) -> Result<Vec<(String, String)>, String>;
 
@@ -2774,15 +3254,19 @@ pub fn load_revision_refs(
     hashes_of: HashesOf<'_>,
     forced: Option<&land_checks::RevisionView>,
 ) -> Result<(), String> {
-    for commit in commits.iter_mut() {
-        let message = message_of(&commit.hash)?;
-        let ids = differential_revision_ids(&message);
-        if ids.is_empty() {
-            let hashes = hashes_of(&commit.hash)?;
-            commit.related = query_revisions_by_hashes(call, &hashes)?;
-        } else {
-            commit.related = query_revisions_by_ids(call, &ids)?;
+    let mut related: Vec<Vec<land_checks::RevisionView>> = vec![Vec::new(); commits.len()];
+    attach_message_revisions(call, commits, message_of, &mut related)?;
+    attach_hash_revisions(call, commits, hashes_of, &mut related)?;
+    for (commit, views) in commits.iter_mut().zip(related) {
+        // Union the two hardpoint results, PHID-deduped
+        // (`ArcanistObjectListHardpoint::mergeHardpointValues()`).
+        let mut union: Vec<land_checks::RevisionView> = Vec::new();
+        for view in views {
+            if !union.iter().any(|known| known.phid == view.phid) {
+                union.push(view);
+            }
         }
+        commit.related = union;
     }
     for commit in commits.iter_mut() {
         if commit.related.len() == 1 {
@@ -2793,6 +3277,100 @@ pub fn load_revision_refs(
         apply_forced_revision(commits, force)?;
     } else {
         reject_ambiguous_commits(io, commits)?;
+    }
+    Ok(())
+}
+
+/// Resolve message-derived revision IDs through one batched
+/// `differential.revision.search`, attaching each returned revision to
+/// the commits whose messages named it
+/// (`ArcanistMessageRevisionHardpointQuery.php:29-70`).
+fn attach_message_revisions(
+    call: &diff_submit::ConduitCall<'_>,
+    commits: &[LandCommit],
+    message_of: &dyn Fn(&str) -> Result<String, String>,
+    related: &mut [Vec<land_checks::RevisionView>],
+) -> Result<(), String> {
+    let mut id_to_commits: HashMap<i64, Vec<usize>> = HashMap::new();
+    for (index, commit) in commits.iter().enumerate() {
+        let message = message_of(&commit.hash)?;
+        for id in differential_revision_ids(&message) {
+            let id = i64::try_from(id).unwrap_or(i64::MAX);
+            id_to_commits.entry(id).or_default().push(index);
+        }
+    }
+    if id_to_commits.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<i64> = id_to_commits.keys().copied().collect();
+    let views = search_revision_views(call, &serde_json::json!({"ids": ids}))?;
+    for view in views {
+        if let Some(indexes) = id_to_commits.get(&view.id) {
+            for index in indexes {
+                related[*index].push(view.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve commit hashes through one batched `differential.query`
+/// `commitHashes` call, attaching each returned revision to the commits
+/// whose hash pairs its `hashes` list echoes back
+/// (`ArcanistGitWorkingCopyRevisionHardpointQuery.php:20-78`).
+fn attach_hash_revisions(
+    call: &diff_submit::ConduitCall<'_>,
+    commits: &[LandCommit],
+    hashes_of: HashesOf<'_>,
+    related: &mut [Vec<land_checks::RevisionView>],
+) -> Result<(), String> {
+    let mut hash_to_commits: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut hashes: Vec<(String, String)> = Vec::new();
+    for (index, commit) in commits.iter().enumerate() {
+        for (kind, hash) in hashes_of(&commit.hash)? {
+            hash_to_commits
+                .entry(format!("{kind}:{hash}"))
+                .or_default()
+                .push(index);
+            hashes.push((kind, hash));
+        }
+    }
+    if hashes.is_empty() {
+        return Ok(());
+    }
+    let pairs: Vec<serde_json::Value> = hashes
+        .iter()
+        .map(|(kind, hash)| serde_json::json!([kind, hash]))
+        .collect();
+    let result = call(
+        diff_submit::METHOD_QUERY,
+        &serde_json::json!({"commitHashes": pairs}),
+    )?;
+    let rows = result.as_array().cloned().unwrap_or_default();
+    for row in rows {
+        let view = land_checks::parse_revision(&row)?;
+        let empty = Vec::new();
+        let echoed = row
+            .get("hashes")
+            .and_then(|hashes| hashes.as_array())
+            .unwrap_or(&empty);
+        for pair in echoed {
+            let key = pair
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str())
+                        .collect::<Vec<_>>()
+                        .join(":")
+                })
+                .unwrap_or_default();
+            if let Some(indexes) = hash_to_commits.get(&key) {
+                for index in indexes {
+                    related[*index].push(view.clone());
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -3289,7 +3867,7 @@ fn git_new_onto_remote(
         );
         return Ok(remote.to_string());
     }
-    if let Some(remote) = arcconfig_value(dir, "arc.land.onto-remote")
+    if let Some(remote) = land_config_value(options, dir, "arc.land.onto-remote")?
         .as_ref()
         .and_then(parse_string_config)
     {
@@ -3363,8 +3941,8 @@ pub fn git_select_onto_refs(
         );
         return Ok(options.onto.clone());
     }
-    if let Some(value) = arcconfig_value(dir, "arc.land.onto") {
-        let onto = parse_onto_config(&value);
+    if let Some(value) = land_config_value(options, dir, "arc.land.onto")? {
+        let onto = parse_onto_config(&value)?;
         if !onto.is_empty() {
             io.push_status(
                 "ONTO TARGET",
@@ -3758,8 +4336,12 @@ fn git_fetch_target(
 /// Run `git fetch --no-tags --quiet -- REMOTE REF`, returning success
 /// (`ArcanistGitLandEngine::fetchLandTarget()`, `:1510-1539`).
 fn git_fetch_quiet(dir: &Path, remote: &str, name: &str) -> bool {
-    git::output(dir, &["fetch", "--no-tags", "--quiet", "--", remote, name])
-        .is_ok_and(|out| out.status.success())
+    git_passthru_with(
+        dir,
+        "git",
+        &[],
+        &["fetch", "--no-tags", "--quiet", "--", remote, name],
+    )
 }
 
 /// Read a fetched remote-tracking commit (which must exist by now).
@@ -3816,24 +4398,14 @@ pub fn git_author_and_date(dir: &Path, commit: &str) -> Result<(String, String),
 }
 
 /// Rebase `min..max` onto `dst`, returning the new HEAD
-/// (`ArcanistGitLandEngine::applyRebaseOperation()`, `:1695-1730`).
+/// (`ArcanistGitLandEngine::executeMerge()`, `:326-337`).
 ///
-/// Checks `max` out first; `force_resolve` adds the recursive-theirs
-/// strategy. Failures abort the rebase, reset hard, and propagate.
-fn git_apply_rebase(
-    dir: &Path,
-    min: &str,
-    max: &str,
-    dst: &str,
-    force_resolve: bool,
-) -> Result<String, String> {
+/// Checks `max` out first, then `rebase --onto`. Failures abort the
+/// rebase, reset hard, and propagate.
+fn git_apply_rebase(dir: &Path, min: &str, max: &str, dst: &str) -> Result<String, String> {
     git::stdout_text(dir, &["checkout", max, "--"])?;
     let base = format!("{min}^");
-    let mut args = vec!["rebase", "--onto", dst];
-    if force_resolve {
-        args.extend(["--strategy", "recursive", "--strategy-option", "theirs"]);
-    }
-    args.extend(["--", &base]);
+    let args = ["rebase", "--onto", dst, "--", base.as_str()];
     if git::output(dir, &args).is_ok_and(|out| !out.status.success()) {
         git::output(dir, &["rebase", "--abort"]).ok();
         git::output(dir, &["reset", "--hard", "HEAD", "--"]).ok();
@@ -3843,7 +4415,7 @@ fn git_apply_rebase(
 }
 
 /// Merge `src` into `dst`, leaving the result uncommitted
-/// (`ArcanistGitLandEngine::applyMergeOperation()`, `:1732-1767`).
+/// (`ArcanistGitLandEngine::executeMerge()`, `:299-345`).
 ///
 /// Squash merges pass `--ff --squash` (the explicit `--ff` overrides user
 /// `merge.ff` configuration); non-squash merges pass `--no-ff`. Empty
@@ -3869,14 +4441,14 @@ fn git_apply_merge(
     args.extend(["--", src]);
     if git::output(dir, &args).is_ok_and(|out| !out.status.success()) {
         git::output(dir, &["merge", "--abort"]).ok();
-        git::output(dir, &["reset", "--hard", "HEAD"]).ok();
+        git::output(dir, &["reset", "--hard", "HEAD", "--"]).ok();
         return Err("merge failed".to_string());
     }
     Ok(())
 }
 
 /// Commit the index with `message`, returning the new HEAD
-/// (`ArcanistGitLandEngine::applyCommitOperation()`, `:1769-1802`).
+/// (`ArcanistGitLandEngine::executeMerge() commit step`, `:403-415`).
 ///
 /// The message arrives via stdin (`-F -`), like PHP's future write.
 fn git_apply_commit(
@@ -3899,7 +4471,7 @@ fn git_apply_commit(
         args.push("--allow-empty");
     }
     args.extend(["-F", "-", "--"]);
-    let mut child = std::process::Command::new("git")
+    let mut child = crate::proc_env::command("git")
         .current_dir(dir)
         .args(&args)
         .stdin(Stdio::piped())
@@ -3927,127 +4499,23 @@ fn git_apply_commit(
     git::stdout_text(dir, &["rev-parse", "--verify", "HEAD"])
 }
 
-/// Merge approaches for one set, in attempt order
-/// (`ArcanistGitLandEngine::executeMerge()`, `:329-336`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MergeApproach {
-    /// Squash a complex range down to one commit, then rebase-merge it.
-    ReduceRebaseMerge,
-    /// Rebase the range onto the into state, then merge.
-    RebaseMerge,
-    /// Merge the max commit directly.
-    Merge,
-}
-
-/// Approaches for a strategy: squash (non-empty) tries rebase-merge then
-/// reduce-rebase-merge; anything else merges directly.
-fn merge_approaches(squash: bool, is_empty: bool) -> Vec<MergeApproach> {
-    if squash && !is_empty {
-        vec![MergeApproach::RebaseMerge, MergeApproach::ReduceRebaseMerge]
-    } else {
-        vec![MergeApproach::Merge]
-    }
-}
-
-/// Execute one git merge approach, returning the merged max hash.
-#[allow(clippy::too_many_arguments)]
-fn git_merge_attempt(
-    dir: &Path,
-    io: &mut Io,
-    approach: MergeApproach,
-    min_hash: &str,
-    max_hash: &str,
-    into_commit: &str,
-    squash: bool,
-    is_empty: bool,
-) -> Result<String, String> {
-    match approach {
-        MergeApproach::RebaseMerge => {
-            io.push_status("MERGE", "Attempting to rebase changes.");
-            let merged = git_apply_rebase(dir, min_hash, max_hash, into_commit, false)?;
-            git_apply_merge(dir, &merged, into_commit, squash, is_empty)?;
-            Ok(merged)
-        }
-        MergeApproach::ReduceRebaseMerge => {
-            io.push_status("MERGE", "Attempting to reduce and rebase changes.");
-            let reduce_dst = format!("{min_hash}^");
-            // Squash the into state on top of the range, forcing later
-            // conflicts to resolve in our favor (`:389-402`).
-            git_apply_merge(dir, into_commit, max_hash, true, is_empty)?;
-            let join_hash = git_apply_commit(
-                dir,
-                &format!(
-                    "arc land: join ({} -> {})",
-                    git::display_hash(into_commit),
-                    git::display_hash(max_hash)
-                ),
-                None,
-                None,
-                true,
-            )?;
-            // Squash the range plus the join into one commit (`:409-420`).
-            git_apply_merge(dir, &join_hash, &reduce_dst, true, is_empty)?;
-            let reduce_hash = git_apply_commit(
-                dir,
-                &format!(
-                    "arc land: reduce ({}..{} -> {})",
-                    git::display_hash(min_hash),
-                    git::display_hash(max_hash),
-                    reduce_dst
-                ),
-                None,
-                None,
-                false,
-            )?;
-            let merged = git_apply_rebase(dir, &reduce_hash, &reduce_hash, into_commit, true)?;
-            git_apply_merge(dir, &merged, into_commit, squash, is_empty)?;
-            Ok(merged)
-        }
-        MergeApproach::Merge => {
-            io.push_status("MERGE", "Attempting to merge changes.");
-            git_apply_merge(dir, max_hash, into_commit, squash, is_empty)?;
-            Ok(max_hash.to_string())
-        }
-    }
-}
-
-/// Merge one commit set into `into_commit`
-/// (`ArcanistGitLandEngine::executeMerge()`, `:250-534`).
-///
-/// Returns the new cursor. Empty diffs fail (usually: already landed);
-/// every approach failing prints the `MERGE CONFLICT` banner and fails
-/// with `Encountered a merge conflict.`. `message_of` provides the landed
-/// commit message for the set. `incremental` selects the one-by-one hint
-/// (`!$use_incremental`, `:498-500`).
-#[allow(clippy::too_many_arguments)]
-pub fn git_execute_merge(
-    dir: &Path,
-    io: &mut Io,
-    set: &CommitSet,
-    commits: &[LandCommit],
-    into_commit: Option<&str>,
-    squash: bool,
-    incremental: bool,
-    message_of: &dyn Fn(&CommitSet) -> Result<String, String>,
-) -> Result<String, String> {
-    let min_hash = commits[set.commits[0]].hash.clone();
-    let max_hash = commits[set.commits[set.commits.len() - 1]].hash.clone();
-    let max_summary = display_summary(&commits[set.commits[set.commits.len() - 1]].summary);
+/// Resolve the into commit, writing a scratch empty commit when
+/// landing into the empty state. Returns the commit and whether the
+/// state was empty.
+fn resolve_merge_into(dir: &Path, into_commit: Option<&str>) -> Result<(String, bool), String> {
     let is_empty = into_commit.is_none();
-    // Merge onto a scratch empty commit when landing into the empty state
-    // (`:258-261`); `commit-tree` builds it without touching branches.
+    // Merge onto a scratch empty commit when landing into the empty
+    // state (`:257-261`): an empty tree with no author, committer, or
+    // message, written with `hash-object` (no git identity needed).
     let into_commit = match into_commit {
         Some(commit) => commit.to_string(),
-        None => git::stdout_text(
-            dir,
-            &[
-                "commit-tree",
-                git::GIT_MAGIC_ROOT_COMMIT,
-                "-m",
-                "arc land: empty",
-            ],
-        )?,
+        None => git_write_raw_commit(dir, &RawCommit::empty())?,
     };
+    Ok((into_commit, is_empty))
+}
+
+/// Reject merges whose into..max diff is empty (already landed).
+fn ensure_merge_nonempty(dir: &Path, into_commit: &str, max_hash: &str) -> Result<(), String> {
     let changes = git::stdout_text(
         dir,
         &[
@@ -4061,121 +4529,302 @@ pub fn git_execute_merge(
         return Err(format!(
             "Merging local \"{}\" into \"{}\" produces an empty diff. This usually means these \
              changes have already landed.",
-            git::display_hash(&max_hash),
-            git::display_hash(&into_commit)
+            git::display_hash(max_hash),
+            git::display_hash(into_commit)
         ));
     }
+    Ok(())
+}
+
+/// Merge the commit range: squash (non-empty) rebases the range onto
+/// the into state, then merges; anything else merges the max commit
+/// directly (`:322-345`).
+fn apply_merge_range(
+    dir: &Path,
+    min_hash: &str,
+    max_hash: &str,
+    into_commit: &str,
+    squash: bool,
+    is_empty: bool,
+) -> Result<String, String> {
+    if squash && !is_empty {
+        git_apply_rebase(dir, min_hash, max_hash, into_commit).and_then(|merged| {
+            git_apply_merge(dir, &merged, into_commit, squash, is_empty).map(|()| merged)
+        })
+    } else {
+        git_apply_merge(dir, max_hash, into_commit, squash, is_empty).map(|()| max_hash.to_string())
+    }
+}
+
+/// Drop the scratch empty parent (T12876, `:417-437`): re-read the
+/// raw commit, replace its parents (none under squash, the merged
+/// hash under merge), and write it back, preserving the tree, author,
+/// committer, and message bytes.
+fn drop_scratch_empty_parent(
+    dir: &Path,
+    cursor: &str,
+    squash: bool,
+    merged_hash: String,
+) -> Result<String, String> {
+    let mut raw = git_read_raw_commit(dir, cursor)?;
+    raw.parents = if squash {
+        Vec::new()
+    } else {
+        vec![merged_hash]
+    };
+    let cursor = git_write_raw_commit(dir, &raw)?;
+    git::stdout_text(dir, &["checkout", &cursor, "--"])?;
+    Ok(cursor)
+}
+
+/// Merge one commit set into `into_commit`
+/// (`ArcanistGitLandEngine::executeMerge()`, `:250-440`).
+///
+/// Returns the new cursor. Squash merges rebase the range onto the into
+/// state first (nothing else: the post-T13576 reduce fallback does not
+/// exist at ceb); anything else merges the max commit directly. Empty
+/// diffs fail (usually: already landed); a failed merge prints the `MERGE
+/// CONFLICT` banner and fails with `Encountered a merge conflict.`.
+/// `message_of` provides the landed commit message for the set.
+/// `has_unpushed` (previously merged but unpushed sets exist) selects the
+/// `--incremental` one-by-one hint (`:379-385`).
+#[allow(clippy::too_many_arguments)]
+pub fn git_execute_merge(
+    dir: &Path,
+    io: &mut Io,
+    set: &CommitSet,
+    commits: &[LandCommit],
+    into_commit: Option<&str>,
+    squash: bool,
+    has_unpushed: bool,
+    message_of: &dyn Fn(&CommitSet) -> Result<String, String>,
+) -> Result<String, String> {
+    let min_hash = commits[set.commits[0]].hash.clone();
+    let max_hash = commits[set.commits[set.commits.len() - 1]].hash.clone();
+    let max_summary = display_summary(&commits[set.commits[set.commits.len() - 1]].summary);
+    let (into_commit, is_empty) = resolve_merge_into(dir, into_commit)?;
+    ensure_merge_nonempty(dir, &into_commit, &max_hash)?;
     io.push_status(
         "MERGING",
         &format!("{} {max_summary}", git::display_hash(&max_hash)),
     );
-    let mut merged_hash = None;
-    for approach in merge_approaches(squash, is_empty) {
-        if let Ok(merged) = git_merge_attempt(
-            dir,
-            io,
-            approach,
-            &min_hash,
-            &max_hash,
-            &into_commit,
-            squash,
-            is_empty,
-        ) {
-            merged_hash = Some(merged);
-            break;
+    let merged = apply_merge_range(dir, &min_hash, &max_hash, &into_commit, squash, is_empty);
+    let merged_hash = match merged {
+        Ok(merged) => merged,
+        Err(_) => {
+            return Err(git_merge_conflict(
+                io,
+                commits,
+                set,
+                &max_hash,
+                &into_commit,
+                has_unpushed,
+            ));
         }
-    }
-    let Some(merged_hash) = merged_hash else {
-        return Err(git_merge_conflict(
-            io,
-            commits,
-            set,
-            &max_hash,
-            &into_commit,
-            incremental,
-        ));
     };
-    io.push_status("DONE", "Merge succeeded.");
     let (author, date) = git_author_and_date(dir, &max_hash)?;
     let message = message_of(set)?;
     let mut cursor = git_apply_commit(dir, &message, Some(&author), Some(&date), false)?;
     if is_empty {
-        // Drop the scratch empty parent (T12876, `:514-531`): rebuild the
-        // commit with squash (no parents) or merge (the merged hash) via
-        // `commit-tree`, then check it out.
-        cursor = git_rebuild_without_empty_parent(
-            dir,
-            &cursor,
-            &message,
-            &author,
-            &date,
-            squash,
-            &merged_hash,
-        )?;
-        git::stdout_text(dir, &["checkout", &cursor, "--"])?;
+        cursor = drop_scratch_empty_parent(dir, &cursor, squash, merged_hash)?;
     }
     Ok(cursor)
 }
 
-/// Rebuild `cursor` without its scratch empty parent, preserving the tree,
-/// message, author, and date (`ArcanistGitLandEngine.php:522-530`).
-///
-/// Squash rebuilds parentless; merge re-parents onto the merged hash.
-/// Author and date travel via `GIT_AUTHOR_*`/`GIT_COMMITTER_*`, since
-/// `commit-tree` takes no `--author` flag.
-fn git_rebuild_without_empty_parent(
-    dir: &Path,
-    cursor: &str,
-    message: &str,
-    author: &str,
-    date: &str,
-    squash: bool,
-    merged_hash: &str,
-) -> Result<String, String> {
-    let tree = git::stdout_text(dir, &["rev-parse", &format!("{cursor}^{{tree}}")])?;
-    let (name, email) = split_author(author);
-    let mut command = std::process::Command::new("git");
-    command.current_dir(dir).arg("commit-tree").arg(&tree);
-    if !squash {
-        command.arg("-p").arg(merged_hash);
+/// A parsed git commit object (`ArcanistGitRawCommit`,
+/// `src/repository/raw/ArcanistGitRawCommit.php`), with the raw author,
+/// committer, and message preserved verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct RawCommit {
+    /// `tree` line value, if present.
+    tree: Option<String>,
+    /// `parent` line values, in order.
+    parents: Vec<String>,
+    /// `author` line value, if present.
+    author: Option<String>,
+    /// `committer` line value, if present.
+    committer: Option<String>,
+    /// Message after the blank divider line, if any.
+    message: Option<String>,
+}
+
+impl RawCommit {
+    /// The scratch into-empty commit: the empty tree with no parents,
+    /// author, committer, or message (`newEmptyCommit()`).
+    fn empty() -> Self {
+        Self {
+            tree: Some(git::GIT_MAGIC_ROOT_COMMIT.to_string()),
+            ..Self::default()
+        }
     }
-    command
-        .arg("-m")
-        .arg(message)
-        .env("GIT_AUTHOR_NAME", &name)
-        .env("GIT_AUTHOR_EMAIL", &email)
-        .env("GIT_AUTHOR_DATE", date)
-        .env("GIT_COMMITTER_NAME", &name)
-        .env("GIT_COMMITTER_EMAIL", &email)
-        .env("GIT_COMMITTER_DATE", date);
-    let output = command
-        .output()
+}
+
+/// Parse a raw commit blob (`newFromRawBlob()`, `:21-94`): `tree`,
+/// `parent`, `author`, and `committer` header lines, a blank divider,
+/// then the verbatim message. Repeated non-parent labels, unknown
+/// labels, and malformed lines throw with the verbatim errors.
+fn parse_raw_commit_blob(blob: &str) -> Result<RawCommit, String> {
+    const PATTERN: &str = "(^(\\w+) ([^\\n]+)\\n?\\z)";
+    let mut raw = RawCommit::default();
+    let mut seen: HashMap<String, String> = HashMap::new();
+    let items: Vec<&str> = blob.split_inclusive('\n').collect();
+    let mut index = 0;
+    while index < items.len() {
+        let line = items[index];
+        index += 1;
+        if line == "\n" {
+            break;
+        }
+        let stripped = line.strip_suffix('\n').unwrap_or(line);
+        let Some((label, value)) = split_header_line(stripped) else {
+            return Err(format!(
+                "Expected to match pattern \"{PATTERN}\" against line \"{stripped}\" in raw \
+                 commit blob: {blob}"
+            ));
+        };
+        if let Some(first) = seen.get(label) {
+            if label != "parent" {
+                return Err(format!(
+                    "Encountered two \"{label}\" lines (\"{first}\", \"{stripped}\") while \
+                     parsing raw commit blob, expected at most one: {blob}"
+                ));
+            }
+        } else {
+            seen.insert(label.to_string(), stripped.to_string());
+        }
+        match label {
+            "tree" => raw.tree = Some(value.to_string()),
+            "parent" => raw.parents.push(value.to_string()),
+            "author" => raw.author = Some(value.to_string()),
+            "committer" => raw.committer = Some(value.to_string()),
+            _ => {
+                return Err(format!(
+                    "Unknown attribute label \"{label}\" in line \"{stripped}\" while parsing \
+                     raw commit blob: {blob}"
+                ));
+            }
+        }
+    }
+    let message: String = items[index..].concat();
+    if !message.is_empty() {
+        raw.message = Some(message);
+    }
+    Ok(raw)
+}
+
+/// Split one `label value` header line (`(\w+) ([^\n]+)`, anchored).
+fn split_header_line(line: &str) -> Option<(&str, &str)> {
+    let (label, value) = line.split_once(' ')?;
+    if label.is_empty()
+        || !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        || value.is_empty()
+    {
+        return None;
+    }
+    Some((label, value))
+}
+
+/// Render a raw commit blob (`getRawBlob()`, `:102-130`): the tree line,
+/// parent lines, author and committer lines, a blank divider, then the
+/// message. Absent fields emit nothing.
+fn render_raw_commit_blob(raw: &RawCommit) -> String {
+    let mut out = String::new();
+    if let Some(tree) = &raw.tree {
+        out.push_str(&format!("tree {tree}\n"));
+    }
+    for parent in &raw.parents {
+        out.push_str(&format!("parent {parent}\n"));
+    }
+    if let Some(author) = &raw.author {
+        out.push_str(&format!("author {author}\n"));
+    }
+    if let Some(committer) = &raw.committer {
+        out.push_str(&format!("committer {committer}\n"));
+    }
+    out.push('\n');
+    if let Some(message) = &raw.message {
+        out.push_str(message);
+    }
+    out
+}
+
+/// Read one raw commit (`ArcanistGitAPI::readRawCommit()`,
+/// `src/repository/api/ArcanistGitAPI.php:1738-1744`).
+fn git_read_raw_commit(dir: &Path, hash: &str) -> Result<RawCommit, String> {
+    let output = git::output(dir, &["cat-file", "commit", "--", hash])
         .map_err(|e| format!("failed to run git: {e}"))?;
     if !output.status.success() {
-        return Err("git commit-tree failed".to_string());
+        let detail = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let trimmed = detail.trim();
+        if trimmed.is_empty() {
+            return Err(format!("git cat-file commit {hash} failed"));
+        }
+        return Err(trimmed.to_string());
+    }
+    // The blob is used verbatim (no trimming): the message keeps its
+    // exact bytes.
+    parse_raw_commit_blob(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Write one raw commit, returning its hash
+/// (`ArcanistGitAPI::writeRawCommit()`,
+/// `src/repository/api/ArcanistGitAPI.php:1746-1754`).
+///
+/// `--literally` bypasses modern git's write-time fsck, which refuses
+/// PHP's authorless scratch commit; the stored object bytes are
+/// identical to PHP's write.
+fn git_write_raw_commit(dir: &Path, raw: &RawCommit) -> Result<String, String> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let blob = render_raw_commit_blob(raw);
+    let mut child = crate::proc_env::command("git")
+        .current_dir(dir)
+        .args([
+            "hash-object",
+            "-t",
+            "commit",
+            "--literally",
+            "--stdin",
+            "-w",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| "failed to write raw commit".to_string())?
+        .write_all(blob.as_bytes())
+        .map_err(|e| format!("failed to write raw commit: {e}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    if !output.status.success() {
+        return Err("git hash-object failed".to_string());
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Split `Name <email>` into parts; malformed authors become empty parts.
-fn split_author(author: &str) -> (String, String) {
-    if let Some(prefix) = author.strip_suffix('>')
-        && let Some((name, email)) = prefix.split_once(" <")
-    {
-        return (name.to_string(), email.to_string());
-    }
-    (String::new(), String::new())
-}
-
 /// Print the `MERGE CONFLICT` banner and return its error
-/// (`ArcanistGitLandEngine.php:461-501`).
+/// (`ArcanistGitLandEngine.php:347-401`).
+///
+/// The `--incremental` hint shows only when previously merged sets are
+/// still unpushed (`getHasUnpushedChanges()`, `:379-385`).
 fn git_merge_conflict(
     io: &mut Io,
     commits: &[LandCommit],
     set: &CommitSet,
     max_hash: &str,
     into_commit: &str,
-    incremental: bool,
+    has_unpushed: bool,
 ) -> String {
     let max = &commits[set.commits[set.commits.len() - 1]];
     let short_max = git::display_hash(max_hash);
@@ -4199,7 +4848,7 @@ fn git_merge_conflict(
         )
     };
     push_banner(io, "MERGE CONFLICT", &message);
-    if !incremental {
+    if has_unpushed {
         io.push_out(&render_hint_with_ansi(
             "Use \"--incremental\" to merge and push changes one by one.",
             io.ansi,
@@ -4227,14 +4876,41 @@ pub fn git_push_change(
     onto_refs: &[String],
     into_commit: &str,
 ) -> Result<(), String> {
+    git_push_change_with(dir, "git", &[], io, onto_remote, onto_refs, into_commit)
+}
+
+/// [`git_push_change`] with a program override (test seam).
+///
+/// The push inherits stdio (`newPassthru()`, `:494-501`): it may
+/// prompt for credentials, and progress belongs on the terminal.
+pub fn git_push_change_with(
+    dir: &Path,
+    program: &str,
+    prefix: &[String],
+    io: &mut Io,
+    onto_remote: &str,
+    onto_refs: &[String],
+    into_commit: &str,
+) -> Result<(), String> {
     io.push_status("PUSHING", &format!("Pushing changes to \"{onto_remote}\"."));
     let refspecs = git_onto_refspecs(onto_refs, into_commit);
     let mut args = vec!["push", "--", onto_remote];
     args.extend(refspecs.iter().map(String::as_str));
-    if git::output(dir, &args).is_ok_and(|out| !out.status.success()) {
+    if !git_passthru_with(dir, program, prefix, &args) {
         return Err("Push failed! Fix the error and run \"arc land\" again.".to_string());
     }
     Ok(())
+}
+
+/// Run `git` inheriting stdio, returning success (`newPassthru()`).
+///
+/// Fetch and push must not capture output: they may prompt for
+/// credentials, and progress belongs on the terminal
+/// (`ArcanistGitLandEngine.php:186-190`).
+fn git_passthru_with(dir: &Path, program: &str, prefix: &[String], args: &[&str]) -> bool {
+    let mut command = crate::proc_env::command(program);
+    command.current_dir(dir).args(prefix).args(args);
+    command.status().is_ok_and(|status| status.success())
 }
 
 /// `git p4 submit` argv for Perforce mode (`pushChange()`, `:551-585`):
@@ -4283,7 +4959,7 @@ pub fn git_p4_submit_with(
         &format!("Submitting changes to \"{onto_remote}\"."),
     );
     let argv = git_p4_submit_argv(into_commit);
-    let mut command = std::process::Command::new(program);
+    let mut command = crate::proc_env::command(program);
     command.current_dir(dir).args(prefix).args(&argv);
     let ok = command.status().is_ok_and(|status| status.success());
     if ok {
@@ -4303,7 +4979,7 @@ pub fn git_p4_sync_with(
     remote: &str,
     name: &str,
 ) -> Result<(), String> {
-    let mut command = std::process::Command::new(program);
+    let mut command = crate::proc_env::command(program);
     command.current_dir(dir).args(prefix).args([
         "p4",
         "sync",
@@ -4345,7 +5021,8 @@ pub fn parse_for_each_ref(output: &str) -> Result<Vec<(String, String)>, String>
         };
         branches.push((branch.to_string(), hash.to_string()));
     }
-    branches.sort_by_key(|branch| branch.0.to_lowercase());
+    // `natcasesort()` over the branch names (`:119-120`).
+    branches.sort_by(|a, b| commitgraph::natural_cmp(a.0.as_bytes(), b.0.as_bytes(), true));
     Ok(branches)
 }
 
@@ -4384,24 +5061,25 @@ pub fn git_prune_branches(
     sets: &[CommitSet],
     commits: &[LandCommit],
 ) -> Vec<String> {
-    let mut deleted = Vec::new();
-    let mut seen: Vec<String> = Vec::new();
+    // Collect branch names for every set hash first, like PHP's one map
+    // for all sets (`:31-40`), then sort once globally (`:42-49`).
+    let mut collected: Vec<(String, String)> = Vec::new();
     for set in sets {
         let old = &commits[set.commits[set.commits.len() - 1]].hash;
-        for (branch, hash) in git_branches_for_commit(dir, old, false) {
-            if seen.contains(&branch) {
-                continue;
-            }
-            seen.push(branch.clone());
-            io.push_status(
-                "CLEANUP",
-                &format!("Cleaning up branch \"{branch}\". To recover, run:"),
-            );
-            let recover = format!("git checkout -b {branch} {}", git::display_hash(&hash));
-            io.push_out(&format!("\n{}\n", shell_line(&recover, io.ansi)));
-            git::output(dir, &["branch", "-D", "--", &branch]).ok();
-            deleted.push(branch);
-        }
+        collected.extend(git_branches_for_commit(dir, old, false));
+    }
+    collected.sort_by(|a, b| commitgraph::natural_cmp(a.0.as_bytes(), b.0.as_bytes(), true));
+    collected.dedup_by(|a, b| a.0 == b.0);
+    let mut deleted = Vec::new();
+    for (branch, hash) in collected {
+        io.push_status(
+            "CLEANUP",
+            &format!("Cleaning up branch \"{branch}\". To recover, run:"),
+        );
+        let recover = format!("git checkout -b {branch} {}", git::display_hash(&hash));
+        io.push_out(&format!("\n{}\n", shell_line(&recover, io.ansi)));
+        git::output(dir, &["branch", "-D", "--", &branch]).ok();
+        deleted.push(branch);
     }
     deleted
 }
@@ -4925,7 +5603,7 @@ pub fn hg_select_onto_remote_with(
             &format!("Remote \"{remote}\" was selected with the \"--onto-remote\" flag."),
         );
         remote.to_string()
-    } else if let Some(remote) = arcconfig_value(dir, "arc.land.onto-remote")
+    } else if let Some(remote) = land_config_value(options, dir, "arc.land.onto-remote")?
         .as_ref()
         .and_then(parse_string_config)
     {
@@ -4968,8 +5646,8 @@ pub fn hg_select_onto_refs(
         );
         return Ok(options.onto.clone());
     }
-    if let Some(value) = arcconfig_value(dir, "arc.land.onto") {
-        let onto = parse_onto_config(&value);
+    if let Some(value) = land_config_value(options, dir, "arc.land.onto")? {
+        let onto = parse_onto_config(&value)?;
         if !onto.is_empty() {
             io.push_status(
                 "ONTO TARGET",
@@ -5163,7 +5841,8 @@ pub fn hg_select_into_commit_with(
         IntoState::Remote { remote, name } => {
             // Pull the ref, then resolve it locally; failures leave the
             // previous state alone, like the git ignore-failure fetch.
-            hg::output_with(dir, hg_cmd, &["pull", "--rev", name, remote]).ok();
+            // The pull inherits stdio (`newPassthru()`).
+            hg_passthru_with(dir, hg_cmd, &["pull", "--rev", name, remote]);
             if let Ok(commit) = hg_canonical_with(dir, hg_cmd, name) {
                 io.push_status(
                     "INTO COMMIT",
@@ -5351,6 +6030,22 @@ pub fn hg_execute_merge_with(
     Ok(tip.trim().to_string())
 }
 
+/// Run `hg` inheriting stdio, returning success (`newPassthru()`).
+///
+/// Push and pull must not capture output: they may prompt for
+/// credentials, and progress belongs on the terminal. Honors the
+/// `HgCommand` program/prefix plus the encoding args and `HGPLAIN`.
+fn hg_passthru_with(dir: &Path, hg_cmd: &hg::HgCommand, args: &[&str]) -> bool {
+    let mut command = crate::proc_env::command(&hg_cmd.program);
+    command
+        .current_dir(dir)
+        .args(&hg_cmd.prefix)
+        .args(hg::HG_ENCODING_ARGS)
+        .args(args)
+        .env(hg::HGPLAIN.0, hg::HGPLAIN.1);
+    command.status().is_ok_and(|status| status.success())
+}
+
 /// Current position of bookmark `name`, if any, driving `hg`
 /// through `hg_cmd` (test seam).
 fn hg_bookmark_position_with(dir: &Path, hg_cmd: &hg::HgCommand, name: &str) -> Option<String> {
@@ -5374,7 +6069,7 @@ fn hg_write_stdin_with(
 ) -> bool {
     use std::io::Write;
     use std::process::Stdio;
-    let mut command = std::process::Command::new(&hg_cmd.program);
+    let mut command = crate::proc_env::command(&hg_cmd.program);
     command
         .current_dir(dir)
         .args(&hg_cmd.prefix)
@@ -5462,7 +6157,9 @@ pub fn hg_push_change_with(
     args.push("--".to_string());
     args.push(onto_remote.to_string());
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    let pushed = hg::output_with(dir, hg_cmd, &argv).is_ok_and(|out| out.status.success());
+    // The push inherits stdio (`newPassthru()`,
+    // `ArcanistMercurialLandEngine.php:871-877`).
+    let pushed = hg_passthru_with(dir, hg_cmd, &argv);
     if !pushed {
         for (bookmark, old) in &restore {
             hg::output_with(dir, hg_cmd, &["bookmark", "--force", "--rev", old]).ok();
@@ -5793,7 +6490,8 @@ pub fn confirm_implicit_sets(
 pub struct ViewerIdentity {
     /// Viewer PHID from `user.whoami`.
     pub phid: String,
-    /// Viewer name from `user.whoami` (`userName`, else the PHID).
+    /// Viewer monogram from `user.whoami` (`@userName`,
+    /// `ArcanistUserRef::newFromConduitWhoami()` + `getMonogram()`).
     pub name: String,
 }
 
@@ -5808,13 +6506,56 @@ pub fn fetch_viewer_identity(
         .filter(|phid| !phid.is_empty())
         .map(str::to_string)
         .ok_or_else(|| "user.whoami response has no phid".to_string())?;
-    let name = result
+    let username = result
         .get("userName")
         .and_then(|name| name.as_str())
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| phid.clone());
-    Ok(ViewerIdentity { phid, name })
+        .unwrap_or("");
+    Ok(ViewerIdentity {
+        phid,
+        name: format!("@{username}"),
+    })
+}
+
+/// Load author monograms (`@username`) for `phids` with one batched
+/// `user.search`, keyed by user PHID
+/// (`ArcanistRevisionAuthorHardpointQuery.php:17-34`,
+/// `ArcanistUserSymbolHardpointQuery.php:66-77`). Unknown PHIDs are
+/// absent from the map.
+pub fn fetch_user_monograms(
+    call: &diff_submit::ConduitCall<'_>,
+    phids: &[String],
+) -> Result<HashMap<String, String>, String> {
+    let mut distinct: Vec<String> = Vec::new();
+    for phid in phids {
+        if !phid.is_empty() && !distinct.contains(phid) {
+            distinct.push(phid.clone());
+        }
+    }
+    let mut monograms = HashMap::new();
+    if distinct.is_empty() {
+        return Ok(monograms);
+    }
+    let params = revision::conduit_search_params(&serde_json::json!({"phids": distinct}), None);
+    for page in conduit::search_pages(call, METHOD_USER_SEARCH, &params)? {
+        let empty = Vec::new();
+        let rows = page
+            .get("data")
+            .and_then(|data| data.as_array())
+            .unwrap_or(&empty);
+        for row in rows {
+            let phid = row.get("phid").and_then(|v| v.as_str()).unwrap_or("");
+            if phid.is_empty() {
+                continue;
+            }
+            let username = row
+                .get("fields")
+                .and_then(|fields| fields.get("username"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            monograms.insert(phid.to_string(), format!("@{username}"));
+        }
+    }
+    Ok(monograms)
 }
 
 pub fn confirm_revision_gates(
@@ -5825,14 +6566,40 @@ pub fn confirm_revision_gates(
     builds: &[land_checks::BuildView],
     findings: &[land_checks::GateFinding],
 ) -> Result<(), String> {
+    confirm_revision_gates_with_authors(
+        io,
+        revisions,
+        viewer,
+        links,
+        builds,
+        findings,
+        &HashMap::new(),
+    )
+}
+
+/// [`confirm_revision_gates`] with author monograms for the
+/// `NOT REVISION AUTHOR` banner (`author PHID -> @username`, see
+/// [`fetch_user_monograms`]). Revisions without a known monogram show
+/// no `Author:` line, like PHP's missing author ref
+/// (`ArcanistLandEngine.php:310-316`).
+pub fn confirm_revision_gates_with_authors(
+    io: &mut Io,
+    revisions: &[land_checks::RevisionView],
+    viewer: &ViewerIdentity,
+    links: &[land_checks::ParentLink],
+    builds: &[land_checks::BuildView],
+    findings: &[land_checks::GateFinding],
+    authors: &HashMap<String, String>,
+) -> Result<(), String> {
     for finding in findings {
-        confirm_single_gate(io, revisions, viewer, links, builds, finding)?;
+        confirm_single_gate(io, revisions, viewer, links, builds, finding, authors)?;
     }
     Ok(())
 }
 
 /// Confirm one fired revision gate: print its banner and prompt its
 /// `arc.land.*` key. Declining aborts.
+#[allow(clippy::too_many_arguments)]
 fn confirm_single_gate(
     io: &mut Io,
     revisions: &[land_checks::RevisionView],
@@ -5840,10 +6607,11 @@ fn confirm_single_gate(
     links: &[land_checks::ParentLink],
     builds: &[land_checks::BuildView],
     finding: &land_checks::GateFinding,
+    authors: &HashMap<String, String>,
 ) -> Result<(), String> {
     match finding.prompt {
         land_checks::PROMPT_UNAUTHORED => {
-            confirm_unauthored(io, revisions, viewer)?;
+            confirm_unauthored(io, revisions, viewer, authors)?;
         }
         land_checks::PROMPT_CHANGES_PLANNED => {
             confirm_status_group(io, revisions, finding, StatusGroup::Planned)?;
@@ -5877,10 +6645,15 @@ enum StatusGroup {
 
 /// Print the `NOT REVISION AUTHOR` banner and prompt
 /// (`ArcanistLandEngine.php:293-333`).
+///
+/// `authors` maps author PHIDs to `@username` monograms (see
+/// [`fetch_user_monograms`]); revisions without a known monogram show
+/// no `Author:` line.
 fn confirm_unauthored(
     io: &mut Io,
     revisions: &[land_checks::RevisionView],
     viewer: &ViewerIdentity,
+    authors: &HashMap<String, String>,
 ) -> Result<(), String> {
     push_banner(
         io,
@@ -5892,10 +6665,10 @@ fn confirm_unauthored(
     );
     for index in land_checks::unauthored_indexes(revisions, &viewer.phid) {
         let revision = &revisions[index];
-        // PHP shows the author monogram (`:310-316`); without the user
-        // hardpoint the port shows the author PHID (see the module docs).
         let mut view = revision_ref_view(revision);
-        view.lines.push(format!("Author: {}", revision.author_phid));
+        if let Some(monogram) = authors.get(&revision.author_phid) {
+            view.lines.push(format!("Author: {monogram}"));
+        }
         io.push_out(&view.render_with_ansi(io.ansi));
     }
     io.push_out("\n");
@@ -5983,7 +6756,7 @@ fn confirm_open_parents(
     let count = groups.len();
     push_banner(
         io,
-        &format!("{count} OPEN PARENT REVISION(S)"),
+        &finding.title,
         &format!(
             "The changes you are landing depend on {count} open parent revision(s). Usually, you \
              should land parent revisions before landing the changes which depend on them. These \
@@ -6150,9 +6923,12 @@ fn print_landing(
 /// `ArcanistLandEngine.php:1101-1333`).
 ///
 /// `options.refs` selects the sources (else VCS defaults); then onto
-/// remote/refs, into state/commit, commit selection, revision discovery
-/// (online) or the offline single set, set filtering, the landing list,
-/// preview-or-confirm, gate confirms, and the merge/push loop.
+/// remote/refs, into state/commit, commit selection, revision discovery,
+/// set filtering, the landing list, preview-or-confirm, gate confirms,
+/// and the merge/push loop. Conduit is required: PHP resolves the viewer
+/// before the engine runs (`ArcanistLandWorkflow.php:329`,
+/// `ArcanistRuntime.php:825-832`), so land fails without it instead of
+/// landing an unassociated offline set.
 fn execute_engine(
     dir: &Path,
     options: &Options,
@@ -6162,17 +6938,20 @@ fn execute_engine(
 ) -> Result<(), String> {
     let squash = validated.strategy == Strategy::Squash;
     let mut prep = prepare_engine_commits(dir, options, vcs, io)?;
-    // Conduit: online discovery, or the offline single set with a note.
-    let client = client_for_dir(options.conduit_uri.as_deref(), dir);
-    let online = client.as_ref().ok();
-    announce_offline_fallback(io, &client);
+    let (cli, user_file) = load_options_for_run(options)?;
+    let client = client_for_dir_with(
+        options.conduit_uri.as_deref(),
+        dir,
+        user_file.as_deref(),
+        &cli,
+    )?;
     let mut sets = build_sets(
         dir,
         io,
         vcs,
         validated,
         &mut prep.commits,
-        online,
+        Some(&client),
         &hash_display_for(vcs),
     )?;
     let ansi = io.ansi;
@@ -6199,7 +6978,7 @@ fn execute_engine(
         return Ok(());
     }
     prompt_for_key(io, land_checks::PROMPT_CONFIRM, "Land these changes?")?;
-    confirm_gates_if_online(dir, options, io, online, &sets, &prep.commits)?;
+    confirm_gates_if_online(dir, options, io, Some(&client), &sets, &prep.commits)?;
     match vcs {
         Vcs::Git => land_git(
             dir,
@@ -6213,7 +6992,7 @@ fn execute_engine(
             prep.into_ref.as_deref(),
             &sets,
             &prep.commits,
-            online,
+            Some(&client),
         ),
         Vcs::Hg => land_hg(
             dir,
@@ -6227,7 +7006,7 @@ fn execute_engine(
             prep.hg_branch.as_deref(),
             &sets,
             &prep.commits,
-            online,
+            Some(&client),
         ),
     }
 }
@@ -6246,18 +7025,23 @@ struct EnginePrep {
 
 /// Select targets and landing commits: sources and remotes, commit
 /// selection and linking, then the commit-count confirm.
+///
+/// Source symbols resolve before onto/into selection
+/// (`ArcanistLandEngine.php:1106-1128`), so an invalid symbol fails
+/// before any onto/into output.
 fn prepare_engine_commits(
     dir: &Path,
     options: &Options,
     vcs: Vcs,
     io: &mut Io,
 ) -> Result<EnginePrep, String> {
-    // Sources and remotes.
-    let (raw_symbols, onto_remote, onto_refs, into_commit, into_ref, hg_branch) =
-        select_targets(dir, options, vcs, io)?;
+    // Sources, resolved first.
+    let raw_symbols = default_source_symbols(dir, options, vcs, io)?;
     let symbols_display = display_symbols(&raw_symbols);
-    // Commits.
     let resolved = resolve_sources(dir, io, vcs, &raw_symbols)?;
+    // Remotes, then commits.
+    let (onto_remote, onto_refs, into_commit, into_ref, hg_branch) =
+        select_targets(dir, options, vcs, io, &raw_symbols)?;
     let mut commits = select_source_commits(dir, vcs, &resolved, into_commit.as_deref())?;
     link_commits(&mut commits);
     let into_display = into_display_string(vcs, into_commit.as_deref());
@@ -6288,13 +7072,6 @@ fn into_display_string(vcs: Vcs, into_commit: Option<&str>) -> Option<String> {
     })
 }
 
-/// Print the offline skip note when Conduit is unreachable.
-fn announce_offline_fallback(io: &mut Io, client: &Result<arc_rs::conduit::Client, String>) {
-    if let Err(reason) = client {
-        io.push_err(&format_skip_note_with_ansi(reason, io.ansi));
-    }
-}
-
 /// Confirm the online revision gates when Conduit is reachable.
 fn confirm_gates_if_online(
     dir: &Path,
@@ -6310,7 +7087,13 @@ fn confirm_gates_if_online(
     let call = |method: &str, params: &serde_json::Value| {
         client.call(method, params).map_err(|e| e.to_string())
     };
-    let uri = resolve_conduit_uri(options.conduit_uri.as_deref(), dir);
+    let (cli, user_file) = load_options_for_run(options)?;
+    let uri = resolve_conduit_uri_with(
+        options.conduit_uri.as_deref(),
+        dir,
+        user_file.as_deref(),
+        &cli,
+    );
     confirm_online_gates(io, &call, sets, commits, uri.as_deref())
 }
 
@@ -6357,10 +7140,9 @@ fn shell_line(command: &str, ansi: bool) -> String {
     }
 }
 
-/// Source symbols, onto remote/refs, the into commit, the into ref
-/// for reconcile (git), and the branch marker (hg).
+/// Onto remote/refs, the into commit, the into ref for reconcile
+/// (git), and the branch marker (hg).
 type TargetSelection = (
-    Vec<String>,
     String,
     Vec<String>,
     Option<String>,
@@ -6368,32 +7150,46 @@ type TargetSelection = (
     Option<String>,
 );
 
-/// Source symbols, onto remote/refs, and the into commit, per VCS.
+/// Raw source symbols: explicit refs, else the VCS defaults
+/// (`ArcanistLandEngine.php:1106-1109`).
+fn default_source_symbols(
+    dir: &Path,
+    options: &Options,
+    vcs: Vcs,
+    io: &mut Io,
+) -> Result<Vec<String>, String> {
+    if !options.refs.is_empty() {
+        return Ok(options.refs.clone());
+    }
+    match vcs {
+        Vcs::Git => git_default_symbols(dir, io),
+        Vcs::Hg => hg_default_symbols(dir, io),
+    }
+}
+
+/// Onto remote/refs and the into commit for resolved `raw` symbols, per VCS.
 fn select_targets(
     dir: &Path,
     options: &Options,
     vcs: Vcs,
     io: &mut Io,
+    raw: &[String],
 ) -> Result<TargetSelection, String> {
     match vcs {
-        Vcs::Git => select_git_targets(dir, options, io),
-        Vcs::Hg => select_hg_targets(dir, options, io),
+        Vcs::Git => select_git_targets(dir, options, io, raw),
+        Vcs::Hg => select_hg_targets(dir, options, io, raw),
     }
 }
 
-/// Git source symbols, onto remote/refs, and the into commit.
+/// Git onto remote/refs and the into commit for resolved `raw` symbols.
 fn select_git_targets(
     dir: &Path,
     options: &Options,
     io: &mut Io,
+    raw: &[String],
 ) -> Result<TargetSelection, String> {
-    let raw = if options.refs.is_empty() {
-        git_default_symbols(dir, io)?
-    } else {
-        options.refs.clone()
-    };
-    let onto_remote = git_select_onto_remote(dir, io, options, &raw)?;
-    let onto_refs = git_select_onto_refs(dir, io, options, &raw)?;
+    let onto_remote = git_select_onto_remote(dir, io, options, raw)?;
+    let onto_refs = git_select_onto_refs(dir, io, options, raw)?;
     git_confirm_onto_refs(dir, io, &onto_remote, &onto_refs, options.hold)?;
     let into_state = select_into_state(io, options, &onto_remote, &onto_refs, &|remote| {
         git::remote_fetch_uri(dir, remote).is_some()
@@ -6403,20 +7199,16 @@ fn select_git_targets(
         _ => None,
     };
     let into_commit = git_select_into_commit(dir, io, &into_state, options.into.as_deref())?;
-    Ok((raw, onto_remote, onto_refs, into_commit, into_ref, None))
+    Ok((onto_remote, onto_refs, into_commit, into_ref, None))
 }
 
-/// Mercurial source symbols, onto remote/refs, and the into commit.
+/// Mercurial onto remote/refs and the into commit for resolved `raw` symbols.
 fn select_hg_targets(
     dir: &Path,
     options: &Options,
     io: &mut Io,
+    _raw: &[String],
 ) -> Result<TargetSelection, String> {
-    let raw = if options.refs.is_empty() {
-        hg_default_symbols(dir, io)?
-    } else {
-        options.refs.clone()
-    };
     let onto_remote = hg_select_onto_remote(dir, io, options)?;
     let onto_refs = hg_select_onto_refs(dir, io, options)?;
     let branch = hg_confirm_onto_refs(dir, io, &onto_remote, &onto_refs, options.hold)?;
@@ -6424,7 +7216,7 @@ fn select_hg_targets(
         hg::ok(dir, &["paths", remote])
     })?;
     let into_commit = hg_select_into_commit(dir, io, &into_state, options.into.as_deref())?;
-    Ok((raw, onto_remote, onto_refs, into_commit, None, branch))
+    Ok((onto_remote, onto_refs, into_commit, None, branch))
 }
 
 /// Resolve source symbols to commits, per VCS.
@@ -6481,11 +7273,11 @@ fn build_sets(
     let call = |method: &str, params: &serde_json::Value| {
         client.call(method, params).map_err(|e| e.to_string())
     };
-    let forced = validated
-        .revision
-        .as_ref()
-        .map(|symbol| resolve_forced_revision(&call, symbol))
-        .transpose()?;
+    let forced = match (&validated.revision, &validated.revision_raw) {
+        (Some(symbol), Some(raw)) => Some(resolve_forced_revision_with_raw(&call, symbol, raw)?),
+        (Some(symbol), None) => Some(resolve_forced_revision(&call, symbol)?),
+        (None, _) => None,
+    };
     let message_of = commit_message_reader(dir, vcs);
     let hashes_of = commit_hash_reader(dir, vcs);
     load_revision_refs(io, &call, commits, &message_of, &hashes_of, forced.as_ref())?;
@@ -6538,13 +7330,10 @@ fn confirm_online_gates(
 ) -> Result<(), String> {
     let revisions: Vec<land_checks::RevisionView> =
         sets.iter().filter_map(|set| set.revision.clone()).collect();
-    let viewer = fetch_viewer_identity(call).unwrap_or(ViewerIdentity {
-        phid: revisions
-            .first()
-            .map(|revision| revision.author_phid.clone())
-            .unwrap_or_default(),
-        name: String::new(),
-    });
+    // A viewer failure throws (PHP `ArcanistRuntime::getViewer()`); it
+    // must not fall back to a revision author and no-op the unauthored
+    // gate.
+    let viewer = fetch_viewer_identity(call)?;
     let links = fetch_parent_links(call, &revisions)?;
     let landing: Vec<&str> = revisions.iter().map(|rev| rev.phid.as_str()).collect();
     let builds = fetch_build_views(call, &revisions, conduit_uri)?;
@@ -6556,7 +7345,21 @@ fn confirm_online_gates(
         &builds,
         Some(commits.len()),
     );
-    confirm_revision_gates(io, &revisions, &viewer, &links, &builds, &findings)
+    // Author monograms for the unauthored banner, loaded only when that
+    // gate fires (`ArcanistLandEngine.php:295-299`).
+    let mut author_phids: Vec<String> = Vec::new();
+    if findings
+        .iter()
+        .any(|finding| finding.prompt == land_checks::PROMPT_UNAUTHORED)
+    {
+        for index in land_checks::unauthored_indexes(&revisions, &viewer.phid) {
+            author_phids.push(revisions[index].author_phid.clone());
+        }
+    }
+    let authors = fetch_user_monograms(call, &author_phids)?;
+    confirm_revision_gates_with_authors(
+        io, &revisions, &viewer, &links, &builds, &findings, &authors,
+    )
 }
 
 /// Saved git state (`ArcanistRepositoryLocalState` plus
@@ -6703,7 +7506,7 @@ fn push_state_banner(
 
 /// Render changed-file lists (`printFileLists()`, `:372-411`): each
 /// non-empty list prints its title, a blank line, and its indented
-/// paths; lists are blank-line separated with a trailing blank line.
+/// paths; lists are `"\n\n"` separated with a trailing blank line.
 fn render_file_lists(lists: &[(&str, &[String])], ansi: bool) -> String {
     let mut out = String::new();
     let mut first = true;
@@ -6712,7 +7515,7 @@ fn render_file_lists(lists: &[(&str, &[String])], ansi: bool) -> String {
             continue;
         }
         if !first {
-            out.push('\n');
+            out.push_str("\n\n");
         }
         first = false;
         out.push_str(&terminal::console_format("%s\n\n", &[title], ansi));
@@ -6724,52 +7527,44 @@ fn render_file_lists(lists: &[(&str, &[String])], ansi: bool) -> String {
     out
 }
 
-/// Fail on unresolved merge conflicts (`:62-98`).
-///
-/// Like PHP, conflicts print under the `Untracked Changes` list title
-/// (`printFileLists($conflicts, ...)`, `:91-95`).
-fn gate_merge_conflicts(io: &mut Io, dir: &Path, conflicts: &[String]) -> Result<(), String> {
-    if conflicts.is_empty() {
+/// Fail on unresolved merge conflicts (`:100-107`). The banner lists
+/// conflicts plus the untracked/unstaged/uncommitted files, like PHP's
+/// `printFileLists($conflicts, $untracked, $unstaged, $uncommitted)`.
+fn gate_merge_conflicts(io: &mut Io, dir: &Path, lists: &ChangeLists) -> Result<(), String> {
+    if lists.conflicts.is_empty() {
         return Ok(());
     }
-    let message = format!(
-        "You have unresolved merge conflicts (\"{}\") in this working copy.",
-        conflicts.len()
-    );
     push_state_banner(
         io,
         "MERGE CONFLICTS",
-        &message,
+        "You have merge conflicts in this working copy.",
         dir,
         &[
-            ("Untracked Changes", conflicts),
-            ("Unstaged Changes", &[]),
-            ("Uncommitted Changes", &[]),
+            ("Merge conflicts in working copy:", &lists.conflicts),
+            ("Untracked changes in working copy:", &lists.untracked),
+            ("Unstaged changes in working copy:", &lists.unstaged),
+            ("Uncommitted changes in working copy:", &lists.uncommitted),
         ],
     );
     Err("Resolve merge conflicts before proceeding.".to_string())
 }
 
-/// Confirm past dirty externals (`:103-132`): the wrapped message, a
-/// blank line, each external as a `- ` item, then a default-yes confirm.
+/// Confirm past dirty externals (`:109-134`): the message paragraph, a
+/// blank line, and the unwrapped 6-space-indented list, then a
+/// default-yes confirm (decline aborts).
 fn confirm_dirty_externals(io: &mut Io, externals: &[String]) -> Result<(), String> {
-    let message = format!(
-        "Some external changes (\"{}\") have uncommitted changes:",
-        externals.len()
-    );
-    let wrapped = console_wrap(&message, 0, true);
-    io.push_out(&terminal::console_format("%s\n\n", &[&wrapped], io.ansi));
+    let count = diff_local::format_count(externals.len());
+    let message = format!("{count} submodule(s) have uncommitted or untracked changes:");
+    io.push_out(&terminal::console_format("%s\n\n", &[&message], io.ansi));
     for external in externals {
         io.push_out(&terminal::console_format(
-            "      - %s\n",
+            "      %s\n",
             &[external],
             io.ansi,
         ));
     }
-    io.push_out("\n");
-    let prompt = "These external changes have uncommitted changes, but the external changes will \
-                  not be stashed. They will remain in the working copy. Continue?";
-    if console_confirm(io, prompt, false)? {
+    let prompt = format!("Ignore the changes to these {count} submodule(s) and continue?");
+    if console_confirm(io, &prompt, false)? {
         Ok(())
     } else {
         Err(ABORT.to_string())
@@ -6777,7 +7572,8 @@ fn confirm_dirty_externals(io: &mut Io, externals: &[String]) -> Result<(), Stri
 }
 
 /// Print the uncommitted-changes banner with file lists and ignore hints
-/// (`:135-190`). Returns true when changes need stashing.
+/// (`:137-155`). Returns true when changes need stashing. Ignore hints
+/// print only with untracked files (`:142-148`).
 fn push_uncommitted_banner(
     io: &mut Io,
     dir: &Path,
@@ -6788,21 +7584,20 @@ fn push_uncommitted_banner(
     if total == 0 {
         return false;
     }
-    let message = format!(
-        "You have uncommitted changes in this working copy: these {total} change(s) are not part \
-         of any commit."
-    );
     push_state_banner(
         io,
         "UNCOMMITTED CHANGES",
-        &message,
+        "You have uncommitted changes in this working copy.",
         dir,
         &[
-            ("Untracked Changes", &lists.untracked),
-            ("Unstaged Changes", &lists.unstaged),
-            ("Uncommitted Changes", &lists.uncommitted),
+            ("Untracked changes in working copy:", &lists.untracked),
+            ("Unstaged changes in working copy:", &lists.unstaged),
+            ("Uncommitted changes in working copy:", &lists.uncommitted),
         ],
     );
+    if lists.untracked.is_empty() {
+        return true;
+    }
     io.push_out(&render_hint_with_ansi(ignore_hint, io.ansi));
     io.push_out("\n");
     true
@@ -6817,7 +7612,7 @@ fn push_uncommitted_banner(
 pub fn save_local_state_git(dir: &Path, io: &mut Io) -> Result<GitLocalState, String> {
     let status = git::uncommitted_status(dir)?;
     let lists = change_lists(&status, &GIT_CHANGE_FLAGS);
-    gate_merge_conflicts(io, dir, &lists.conflicts)?;
+    gate_merge_conflicts(io, dir, &lists)?;
     if !lists.externals.is_empty() {
         confirm_dirty_externals(io, &lists.externals)?;
     }
@@ -6868,7 +7663,7 @@ pub fn save_local_state_hg_with(
 ) -> Result<HgLocalState, String> {
     let status = hg::get_uncommitted_status_with(dir, hg_cmd)?;
     let lists = change_lists(&status, &HG_CHANGE_FLAGS);
-    gate_merge_conflicts(io, dir, &lists.conflicts)?;
+    gate_merge_conflicts(io, dir, &lists)?;
     if !lists.externals.is_empty() {
         confirm_dirty_externals(io, &lists.externals)?;
     }
@@ -6882,9 +7677,8 @@ pub fn save_local_state_hg_with(
     ) {
         if !hg::mercurial_feature_supported_with(dir, hg_cmd, "shelve").unwrap_or(false) {
             return Err(
-                "You can not continue with uncommitted changes in the working copy. \
-                        Shelving is not supported, and these changes prevent \"arc land\" from \
-                        operating safely. Commit or discard these changes to continue."
+                "You can not continue with uncommitted changes. Commit or discard them before \
+                 proceeding."
                     .to_string(),
             );
         }
@@ -7209,11 +8003,28 @@ fn land_git_inner(
     let mut need_cascade: Vec<CommitSet> = Vec::new();
     let mut need_prune: Vec<CommitSet> = Vec::new();
     let mut deleted: Vec<String> = Vec::new();
+    // Merged-but-unpushed sets exist once a merge succeeds
+    // (`:1247`); pushing clears the flag (`:1261`). The conflict hint
+    // reads it.
+    let mut has_unpushed = false;
     let last = sets.len().saturating_sub(1);
+    let client_call = online.map(client_call_boxed);
+    let messages = prefetch_set_messages(
+        raw_symbols,
+        onto_refs,
+        commits,
+        client_call.as_deref(),
+        sets,
+    )?;
+    // No `--strategy`, no `arc.land.strategy`, but legacy
+    // `history.immutable` set: the default is ambiguous (git only,
+    // checked at merge time like `executeMerge()`).
+    confirm_legacy_strategy_configuration(dir, options, io)?;
     for (index, set) in sets.iter().enumerate() {
         need_prune.push(set.clone());
         need_cascade.push(set.clone());
-        let message_of = git_message_closure(raw_symbols, onto_refs, commits, online);
+        let message = messages[index].clone();
+        let message_of = move |_: &CommitSet| Ok(message.clone());
         cursor = Some(git_execute_merge(
             dir,
             io,
@@ -7221,9 +8032,10 @@ fn land_git_inner(
             commits,
             cursor.as_deref(),
             squash,
-            options.incremental,
+            has_unpushed,
             &message_of,
         )?);
+        has_unpushed = true;
         if git_should_push(options, index, last) {
             git_push_and_update(
                 dir,
@@ -7238,6 +8050,7 @@ fn land_git_inner(
                 &mut deleted,
                 commits,
             )?;
+            has_unpushed = false;
         }
     }
     git_finish_landing(
@@ -7337,31 +8150,90 @@ fn git_finish_landing(
     Ok(())
 }
 
-/// Landed-message closure: Differential messages online, the offline
-/// message otherwise.
-type SetMessage<'a> = Box<dyn Fn(&CommitSet) -> Result<String, String> + 'a>;
+/// Fail when the merge strategy is ambiguous under legacy
+/// `history.immutable` configuration
+/// (`ArcanistGitLandEngine::confirmLegacyStrategyConfiguration()`,
+/// `:1556-1600`).
+///
+/// With no `--strategy` and no `arc.land.strategy`, a truthy merged
+/// `history.immutable` value prints the `MERGE STRATEGY IS AMBIGUOUS`
+/// banner and fails (a usage error in PHP).
+fn confirm_legacy_strategy_configuration(
+    dir: &Path,
+    options: &Options,
+    io: &mut Io,
+) -> Result<(), String> {
+    if options.strategy.is_some() {
+        return Ok(());
+    }
+    let strategy_config = land_config_value(options, dir, "arc.land.strategy")?
+        .as_ref()
+        .and_then(parse_string_config);
+    if strategy_config
+        .as_deref()
+        .is_some_and(|name| !name.is_empty())
+    {
+        return Ok(());
+    }
+    let immutable = land_config_value(options, dir, "history.immutable")?;
+    if !immutable.as_ref().is_some_and(is_truthy_config) {
+        return Ok(());
+    }
+    push_banner(
+        io,
+        "MERGE STRATEGY IS AMBIGUOUS",
+        "See <https://secure.phabricator.com/T13547>. The default merge strategy under Git with \
+         \"history.immutable\" has changed from \"merge\" to \"squash\". Your configuration is \
+         ambiguous under this behavioral change. (Use \"--strategy\" or configure \
+         \"arc.land.strategy\" to bypass this check.)",
+    );
+    Err("Desired merge strategy is ambiguous, choose an explicit strategy.".to_string())
+}
 
-fn git_message_closure<'a>(
-    raw_symbols: &'a [String],
-    onto_refs: &'a [String],
-    commits: &'a [LandCommit],
-    online: Option<&'a arc_rs::conduit::Client>,
-) -> SetMessage<'a> {
-    Box::new(move |set| match (online, &set.revision) {
-        (Some(client), Some(revision)) => {
-            let call = |method: &str, params: &serde_json::Value| {
-                client.call(method, params).map_err(|e| e.to_string())
-            };
-            fetch_commit_message(&call, revision.id)
-        }
-        _ => {
-            let members: Vec<LandCommit> = set
-                .commits
-                .iter()
-                .map(|index| commits[*index].clone())
-                .collect();
-            Ok(offline_message(raw_symbols, onto_refs, &members))
-        }
+/// PHP `(bool)` cast for merged config values.
+fn is_truthy_config(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(flag) => *flag,
+        serde_json::Value::Number(number) => number.as_f64().is_some_and(|float| float != 0.0),
+        serde_json::Value::String(text) => !text.is_empty() && text != "0",
+        serde_json::Value::Array(items) => !items.is_empty(),
+        serde_json::Value::Object(map) => !map.is_empty(),
+    }
+}
+
+/// Fetch every set's landed message up front, in set order
+/// (`ArcanistLandEngine.php:526-534`): sets with a revision read
+/// `differential.getcommitmessage` over `call`; sets without one (or
+/// with no `call`) synthesize the local message. A fetch failure aborts
+/// before any merge runs. Returns one message per set, aligned with
+/// `sets`.
+fn prefetch_set_messages(
+    raw_symbols: &[String],
+    onto_refs: &[String],
+    commits: &[LandCommit],
+    call: Option<&diff_submit::ConduitCall<'_>>,
+    sets: &[CommitSet],
+) -> Result<Vec<String>, String> {
+    let mut messages = Vec::with_capacity(sets.len());
+    for set in sets {
+        let members: Vec<LandCommit> = set
+            .commits
+            .iter()
+            .map(|index| commits[*index].clone())
+            .collect();
+        messages.push(match (call, &set.revision) {
+            (Some(call), Some(revision)) => fetch_commit_message(call, revision.id)?,
+            _ => offline_message(raw_symbols, onto_refs, &members),
+        });
+    }
+    Ok(messages)
+}
+
+/// Adapt a client to a boxed [`diff_submit::ConduitCall`].
+fn client_call_boxed(client: &arc_rs::conduit::Client) -> Box<diff_submit::ConduitCall<'_>> {
+    Box::new(move |method: &str, params: &serde_json::Value| {
+        client.call(method, params).map_err(|e| e.to_string())
     })
 }
 
@@ -7450,6 +8322,78 @@ pub fn land_hg_with(
     }
 }
 
+/// Bookmarks to push: every onto ref except the branch marker.
+fn push_bookmarks_for(onto_refs: &[String], branch_marker: Option<&str>) -> Vec<String> {
+    onto_refs
+        .iter()
+        .filter(|name| Some(name.as_str()) != branch_marker)
+        .cloned()
+        .collect()
+}
+
+/// Push after this set: never under `--hold`, always under
+/// `--incremental`, else only after the last set.
+fn should_push_hg_set(options: &Options, index: usize, last: usize) -> bool {
+    if options.hold {
+        false
+    } else if options.incremental {
+        true
+    } else {
+        index == last
+    }
+}
+
+/// Push the cursor, cascade landed state, and prune landed branches.
+#[allow(clippy::too_many_arguments)]
+fn push_and_cascade_hg(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    io: &mut Io,
+    options: &Options,
+    onto_remote: &str,
+    push_bookmarks: &[String],
+    cursor: Option<&str>,
+    commits: &[LandCommit],
+    squash: bool,
+    need_cascade: &mut Vec<CommitSet>,
+    need_prune: &mut Vec<CommitSet>,
+) -> Result<(), String> {
+    hg_push_change_with(
+        dir,
+        hg_cmd,
+        io,
+        onto_remote,
+        push_bookmarks,
+        cursor_or(cursor),
+    )?;
+    need_cascade.reverse();
+    for cascade_set in need_cascade.iter() {
+        hg_cascade_state_with(dir, hg_cmd, cascade_set, commits, cursor_or(cursor), squash)?;
+    }
+    need_cascade.clear();
+    if !options.keep_branches {
+        hg_prune_branches_with(dir, hg_cmd, io, need_prune, commits)?;
+        need_prune.clear();
+    }
+    Ok(())
+}
+
+/// Print hold instructions and drop the saved local state.
+fn finish_hg_hold(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    io: &mut Io,
+    onto_remote: &str,
+    push_bookmarks: &[String],
+    cursor: Option<&str>,
+    state: &HgLocalState,
+) -> Result<(), String> {
+    let restore = hg_restore_commands(state);
+    hg_hold_text(io, push_bookmarks, onto_remote, cursor_or(cursor), &restore);
+    discard_local_state_hg_with(dir, hg_cmd, io, state)?;
+    Ok(())
+}
+
 /// The Mercurial merge/push loop proper (see [`land_hg_with`]).
 #[allow(clippy::too_many_arguments)]
 fn land_hg_inner_with(
@@ -7468,19 +8412,24 @@ fn land_hg_inner_with(
     online: Option<&arc_rs::conduit::Client>,
     state: &HgLocalState,
 ) -> Result<(), String> {
-    let push_bookmarks: Vec<String> = onto_refs
-        .iter()
-        .filter(|name| Some(name.as_str()) != branch_marker)
-        .cloned()
-        .collect();
+    let push_bookmarks = push_bookmarks_for(onto_refs, branch_marker);
     let mut cursor = into_commit.map(str::to_string);
     let mut need_cascade: Vec<CommitSet> = Vec::new();
     let mut need_prune: Vec<CommitSet> = Vec::new();
     let last = sets.len().saturating_sub(1);
+    let client_call = online.map(client_call_boxed);
+    let messages = prefetch_set_messages(
+        raw_symbols,
+        onto_refs,
+        commits,
+        client_call.as_deref(),
+        sets,
+    )?;
     for (index, set) in sets.iter().enumerate() {
         need_prune.push(set.clone());
         need_cascade.push(set.clone());
-        let message_of = git_message_closure(raw_symbols, onto_refs, commits, online);
+        let message = messages[index].clone();
+        let message_of = move |_: &CommitSet| Ok(message.clone());
         let merged = hg_execute_merge_with(
             dir,
             hg_cmd,
@@ -7493,51 +8442,32 @@ fn land_hg_inner_with(
             &message_of,
         )?;
         cursor = Some(merged);
-        let should_push = if options.hold {
-            false
-        } else if options.incremental {
-            true
-        } else {
-            index == last
-        };
-        if should_push {
-            hg_push_change_with(
+        if should_push_hg_set(options, index, last) {
+            push_and_cascade_hg(
                 dir,
                 hg_cmd,
                 io,
+                options,
                 onto_remote,
                 &push_bookmarks,
-                cursor_or(cursor.as_deref()),
+                cursor.as_deref(),
+                commits,
+                squash,
+                &mut need_cascade,
+                &mut need_prune,
             )?;
-            need_cascade.reverse();
-            for cascade_set in &need_cascade {
-                hg_cascade_state_with(
-                    dir,
-                    hg_cmd,
-                    cascade_set,
-                    commits,
-                    cursor_or(cursor.as_deref()),
-                    squash,
-                )?;
-            }
-            need_cascade.clear();
-            if !options.keep_branches {
-                hg_prune_branches_with(dir, hg_cmd, io, &need_prune, commits)?;
-                need_prune.clear();
-            }
         }
     }
     if options.hold {
-        let restore = hg_restore_commands(state);
-        hg_hold_text(
+        return finish_hg_hold(
+            dir,
+            hg_cmd,
             io,
-            &push_bookmarks,
             onto_remote,
-            cursor_or(cursor.as_deref()),
-            &restore,
+            &push_bookmarks,
+            cursor.as_deref(),
+            state,
         );
-        discard_local_state_hg_with(dir, hg_cmd, io, state)?;
-        return Ok(());
     }
     hg_reconcile_with(
         dir,
@@ -7550,21 +8480,112 @@ fn land_hg_inner_with(
     Ok(())
 }
 
+/// True for the engine errors PHP raises as
+/// `PhutilArgumentUsageException` (exit 1 under the `USAGE EXCEPTION`
+/// label): discovery failures (`ArcanistLandEngine.php:823-1153`),
+/// onto/into selection errors, merge conflicts, and empty merges
+/// (`ArcanistGitLandEngine.php:286-1348`), hg resolution errors
+/// (`ArcanistMercurialLandEngine.php:116-334`), push failures rewrapped
+/// by the cascade retry (`ArcanistLandEngine.php:1278-1290`), stash and
+/// strategy errors, and config-item errors. Anything else —
+/// fetch/merge operation failures (plain `ArcanistUsageException` or
+/// `CommandException`) and conduit errors — escapes into a fatal.
+fn is_toolset_usage_message(message: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "There are no commits to land.",
+        "Encountered a merge conflict.",
+        "Landing onto multiple branches at once is not supported in Mercurial.",
+        // Push failures rewrap into usage after the cascade retry
+        // (`ArcanistLandEngine.php:1278-1290`); these texts arise only
+        // from the push sites.
+        "Push failed! Fix the error and run \"arc land\" again.",
+        "Submit failed! Fix the error and run \"arc land\" again.",
+        // Stash errors (`ArcanistRepositoryLocalState.php:158-186`).
+        "Resolve merge conflicts before proceeding.",
+        "You can not continue with uncommitted changes. Commit or discard them before proceeding.",
+        // Legacy strategy ambiguity
+        // (`ArcanistGitLandEngine.php:1584-1599`).
+        "Desired merge strategy is ambiguous, choose an explicit strategy.",
+    ];
+    if EXACT.contains(&message) {
+        return true;
+    }
+    const PREFIXES: &[&str] = &[
+        "TODO: You are forcing a revision,",
+        "Revision for commit \"",
+        "Unable to determine revision for commit \"",
+        "Merging local \"",
+        "No pushable remote \"",
+        "Perforce mode does not support",
+        "The \"onto\" refs you have selected are connected to multiple different",
+        "The branches you are landing are connected to multiple different",
+        "Selected \"onto\" ref \"",
+        "No remote \"",
+        // `arc.land.onto` item errors
+        // (`ArcanistStringListConfigOption::validateListItem()`).
+        "Expected a string (at index \"",
+    ];
+    if PREFIXES.iter().any(|prefix| message.starts_with(prefix)) {
+        return true;
+    }
+    const SHAPES: &[(&str, &str)] = &[
+        ("Symbol \"", "\" does not identify a valid revision."),
+        (
+            "Symbol \"",
+            "\" does not identify a bookmark, branch, or commit.",
+        ),
+        ("Symbol \"", "\" is ambiguous."),
+        ("Branch \"", "\" does not exist in the local working copy."),
+        ("Remote \"", "is not a valid fetchable remote."),
+        ("Local ref \"", "\" does not exist."),
+        ("Ref \"", "\" does not exist in remote \""),
+    ];
+    SHAPES
+        .iter()
+        .any(|(prefix, infix)| message.starts_with(prefix) && message.contains(infix))
+}
+
+/// Classify an engine-stage error: declines ([`ABORT`]) are
+/// `ArcanistUserAbortException` (the `---` arm), toolset-usage texts
+/// render `USAGE EXCEPTION`, and everything else escapes into a
+/// fatal.
+fn classify_engine_error(message: String) -> ClassifiedError {
+    if message == ABORT {
+        ClassifiedError::user_abort(message)
+    } else if is_toolset_usage_message(&message) {
+        ClassifiedError::toolset_usage(message)
+    } else {
+        ClassifiedError::fatal(message)
+    }
+}
+
 /// Run the workflow with scripted or live IO, returning collected output.
 ///
-/// Parse errors append the usage text (like the old port); `--help`
-/// returns the usage text.
+/// Parse errors carry no usage text (PHP renders usage errors with no
+/// dump); `--help` returns the usage text.
 pub fn execute_with_io(dir: &Path, argv: &[String], io: &mut Io) -> Result<Out, String> {
+    execute_with_io_classified(dir, argv, io).map_err(|error| error.message)
+}
+
+/// [`execute_with_io`] with errors classified for the R4 envelope:
+/// argument, working-copy, and validation errors are toolset usage;
+/// engine errors split into declines (`---`), toolset usage, and
+/// fatal (see [`is_toolset_usage_message`]).
+pub fn execute_with_io_classified(
+    dir: &Path,
+    argv: &[String],
+    io: &mut Io,
+) -> Result<Out, ClassifiedError> {
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
-            io.push_out(USAGE);
+            io.push_out(&usage_text(io.ansi));
             return Ok(std::mem::take(&mut io.out));
         }
-        Err(message) => return Err(format!("{message}\n\n{USAGE}")),
+        Err(message) => return Err(ClassifiedError::toolset_usage(message)),
     };
     let Some(vcs) = detect_vcs(dir) else {
-        return Err(NOT_GIT_OR_HG.to_string());
+        return Err(ClassifiedError::toolset_usage(NOT_GIT_OR_HG.to_string()));
     };
     for (key, answer) in load_saved_prompts(dir) {
         io.saved.entry(key).or_insert(answer);
@@ -7574,13 +8595,24 @@ pub fn execute_with_io(dir: &Path, argv: &[String], io: &mut Io) -> Result<Out, 
             Vcs::Git => ".git",
             Vcs::Hg => ".hg",
         };
+        let user_path = get_config::resolve_user_file(
+            config::arcrc_path(),
+            options.arcrc_file.as_deref().map(Path::new),
+        )
+        .map_err(ClassifiedError::toolset_usage)?;
+        // Saved answers persist under the repo-root metadata directory,
+        // like the loader above (falling back to the CWD join when no
+        // metadata directory is found, e.g. `GIT_DIR` setups).
+        let local_path = find_dot_dir(dir, metadata)
+            .map(|root| root.join("arc").join("config"))
+            .unwrap_or_else(|| dir.join(metadata).join("arc").join("config"));
         io.config_writer = Some(ConfigWriter {
-            user_path: config::arcrc_path(),
-            local_path: Some(dir.join(metadata).join("arc").join("config")),
+            user_path,
+            local_path: Some(local_path),
         });
     }
-    let validated = validate_options(&options, dir, io)?;
-    execute_engine(dir, &options, vcs, &validated, io)?;
+    let validated = validate_options(&options, dir, io).map_err(ClassifiedError::toolset_usage)?;
+    execute_engine(dir, &options, vcs, &validated, io).map_err(classify_engine_error)?;
     Ok(std::mem::take(&mut io.out))
 }
 
@@ -7593,13 +8625,22 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<Out, String> {
 
 /// Run the workflow rooted at `dir` with live console IO.
 pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
+    // T1153 R4 (LAND-37): `land` is a toolset workflow
+    // (`ArcanistLandWorkflow extends ArcanistArcWorkflow`). Argument
+    // and validation errors render the red `USAGE EXCEPTION` label
+    // (exit 1), declined prompts the red `---` label (exit 1), and
+    // operation failures escape into a PHP fatal (255).
     let mut io = Io::live();
     io.ansi = terminal::ansi_enabled();
-    match execute_with_io(dir, argv, &mut io) {
+    match execute_with_io_classified(dir, argv, &mut io) {
         Ok(_) => ExitCode::SUCCESS,
-        Err(message) => {
-            eprintln!("arc land: {message}");
-            ExitCode::FAILURE
+        Err(error) => {
+            // T1153 B21/B23: the terminator failure prints the three
+            // cyan hints first (like `ArcanistRuntime.php:172-188`).
+            if error.message == crate::help::MISSING_TERMINATOR {
+                crate::help::print_terminator_hints(crate::terminal::ansi_enabled());
+            }
+            error.report()
         }
     }
 }

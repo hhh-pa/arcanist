@@ -124,39 +124,44 @@ fn canned(
 
 #[test]
 fn parse_defaults_are_empty() {
-    let options = parse_options(&args(&[])).unwrap().unwrap();
+    // T1153 B21/B23: TTY runs need no `--`.
+    let options = parse_options_with_tty(&args(&[]), true).unwrap().unwrap();
     assert_eq!(options, Options::default());
     assert!(options.provided.is_empty());
 }
 
 #[test]
 fn parse_covers_every_flag() {
-    let options = parse_options(&args(&[
-        "--hold",
-        "--keep-branches",
-        "--onto-remote",
-        "fork",
-        "--onto",
-        "stable",
-        "--onto=next",
-        "--strategy",
-        "merge",
-        "--revision",
-        "D89",
-        "--preview",
-        "--into",
-        "release",
-        "--into-remote",
-        "upstream",
-        "--into-local",
-        "--into-empty",
-        "--incremental",
-        "--pick",
-        "--conduit-uri",
-        "https://phab.example/api/",
-        "--",
-        "feature",
-    ]))
+    // T1153 B21/B23: TTY runs need no `--` (argv already carries `--`).
+    let options = parse_options_with_tty(
+        &args(&[
+            "--hold",
+            "--keep-branches",
+            "--onto-remote",
+            "fork",
+            "--onto",
+            "stable",
+            "--onto=next",
+            "--strategy",
+            "merge",
+            "--revision",
+            "D89",
+            "--preview",
+            "--into",
+            "release",
+            "--into-remote",
+            "upstream",
+            "--into-local",
+            "--into-empty",
+            "--incremental",
+            "--pick",
+            "--conduit-uri",
+            "https://phab.example/api/",
+            "--",
+            "feature",
+        ]),
+        true,
+    )
     .unwrap()
     .unwrap();
     assert!(options.hold);
@@ -200,14 +205,26 @@ fn parse_covers_every_flag() {
 
 #[test]
 fn parse_positionals_collect_into_refs() {
-    let options = parse_options(&args(&["a", "--", "b"])).unwrap().unwrap();
+    // T1153 B21/B23: TTY runs need no `--` (argv already carries `--`).
+    let options = parse_options_with_tty(&args(&["a", "--", "b"]), true)
+        .unwrap()
+        .unwrap();
     assert_eq!(options.refs, vec!["a".to_string(), "b".to_string()]);
 }
 
 #[test]
 fn parse_help_short_circuits() {
-    assert!(parse_options(&args(&["--help"])).unwrap().is_none());
-    assert!(parse_options(&args(&["--hold", "-h"])).unwrap().is_none());
+    // T1153 B21/B23: TTY runs need no `--`.
+    assert!(
+        parse_options_with_tty(&args(&["--help"]), true)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        parse_options_with_tty(&args(&["--hold", "-h"]), true)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -232,7 +249,10 @@ fn parse_missing_param_errors() {
 
 #[test]
 fn parse_bool_value_splices_back() {
-    let options = parse_options(&args(&["--hold=x"])).unwrap().unwrap();
+    // T1153 B21/B23: TTY runs need no `--`.
+    let options = parse_options_with_tty(&args(&["--hold=x"]), true)
+        .unwrap()
+        .unwrap();
     assert!(options.hold);
     assert_eq!(options.refs, vec!["x".to_string()]);
 }
@@ -490,7 +510,7 @@ fn fetch_revision_views_queries_ids_and_phids() {
     );
     assert_eq!(
         seen.borrow()[1],
-        serde_json::json!({"phids": ["PHID-DREV-89"]})
+        serde_json::json!({"constraints": {"phids": ["PHID-DREV-89"]}})
     );
 }
 
@@ -512,7 +532,8 @@ fn viewer_identity_reads_whoami() {
     )]);
     let viewer = fetch_viewer_identity(&call).unwrap();
     assert_eq!(viewer.phid, "PHID-USER-a");
-    assert_eq!(viewer.name, "alice");
+    // LAND-31: the banner shows the viewer monogram (`@alice`).
+    assert_eq!(viewer.name, "@alice");
     assert_eq!(fetch_viewer_phid(&call).unwrap(), "PHID-USER-a");
     let call = canned(vec![(METHOD_WHOAMI, serde_json::json!({}))]);
     assert!(fetch_viewer_identity(&call).is_err());
@@ -605,6 +626,56 @@ fn build_views_join_buildable_build_plan() {
 }
 
 #[test]
+fn build_gate_queries_nest_constraints() {
+    let seen: std::rc::Rc<std::cell::RefCell<Vec<(String, serde_json::Value)>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let probe = seen.clone();
+    let call = move |method: &str, params: &serde_json::Value| {
+        probe
+            .borrow_mut()
+            .push((method.to_string(), params.clone()));
+        Ok(match method {
+            METHOD_BUILDABLE_SEARCH => serde_json::json!({"data": [
+                {"id": 7, "phid": "PHID-HMBB-7", "fields": {"objectPHID": "PHID-DIFF-89"}},
+            ]}),
+            METHOD_BUILD_SEARCH => serde_json::json!({"data": [
+                {"id": 42, "fields": {
+                    "name": "Lint",
+                    "buildStatus": {"value": "passed"},
+                    "buildablePHID": "PHID-HMBB-7",
+                    "buildPlanPHID": "PHID-HMPA-1",
+                }},
+            ]}),
+            _ => serde_json::json!({"data": [
+                {"phid": "PHID-HMPA-1", "fields": {"behaviors": {"arc-land": {"value": "always"}}}},
+            ]}),
+        })
+    };
+    let revisions = vec![view(89, "accepted", "Accepted", false, "PHID-USER-a")];
+    fetch_build_views(&call, &revisions, None).unwrap();
+    assert_eq!(
+        *seen.borrow(),
+        vec![
+            (
+                METHOD_BUILDABLE_SEARCH.to_string(),
+                serde_json::json!({"constraints": {
+                    "objectPHIDs": ["PHID-DIFF-89"],
+                    "manual": false,
+                }}),
+            ),
+            (
+                METHOD_BUILD_SEARCH.to_string(),
+                serde_json::json!({"constraints": {"buildables": ["PHID-HMBB-7"]}}),
+            ),
+            (
+                METHOD_BUILDPLAN_SEARCH.to_string(),
+                serde_json::json!({"constraints": {"phids": ["PHID-HMPA-1"]}}),
+            ),
+        ]
+    );
+}
+
+#[test]
 fn build_views_skip_revisions_without_diff_phids() {
     let call = canned(vec![]);
     let mut revision = view(89, "accepted", "Accepted", false, "PHID-USER-a");
@@ -692,8 +763,17 @@ fn gate_preview_lists_findings() {
 
 #[test]
 fn client_for_dir_discovers_from_target() {
+    // T1153 CORE-12/T1153 CORE-33: discovery reads the merged config from the target working
+    // copy. Shadow options keep the ambient `~/.arcrc` out; the project
+    // file only counts at a working-copy root.
     let dir = temp_dir("client-dir");
-    let err = match client_for_dir(None, &dir) {
+    let empty = dir.join("empty.json");
+    std::fs::write(&empty, "{}").unwrap();
+    let shadow = arc_rs::get_config::LoadOptions {
+        config_files: vec![empty],
+        ..Default::default()
+    };
+    let err = match client_for_dir_with(None, &dir, None, &shadow) {
         Ok(_) => panic!("expected no conduit URI"),
         Err(err) => err,
     };
@@ -702,12 +782,13 @@ fn client_for_dir_discovers_from_target() {
         "no conduit URI: pass --conduit-uri, set ARC_CONDUIT_URI, or run inside a project with \
          .arcconfig"
     );
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
     std::fs::write(
         dir.join(".arcconfig"),
         r#"{"phabricator.uri": "https://phab.example/"}"#,
     )
     .unwrap();
-    let err = match client_for_dir(None, &dir) {
+    let err = match client_for_dir_with(None, &dir, None, &shadow) {
         Ok(_) => panic!("expected no token"),
         Err(err) => err,
     };
@@ -957,22 +1038,34 @@ fn display_symbols_quotes_and_escapes() {
 
 #[test]
 fn differential_ids_parse_messages() {
+    // LAND-4: first anchored `D123`-or-URI value only; anything else is
+    // invalid (PHP throws, the land message query skips).
     assert_eq!(
         differential_revision_ids("Subject\n\nDifferential Revision: https://phab.test/D123\n"),
         vec![123]
     );
     assert_eq!(
-        differential_revision_ids("differential revision: D7 and D9"),
+        differential_revision_ids("Differential Revision: D7\n"),
         vec![7]
     );
     assert_eq!(
-        differential_revision_ids("Differential Revision: D7\nquoted Differential Revision: D9\n"),
-        vec![7, 9]
+        differential_revision_ids("differential revision: d7\n"),
+        vec![7]
     );
     assert_eq!(
-        differential_revision_ids("Differential Revision: 42"),
-        vec![42]
+        differential_revision_ids("Differential Revision: https://phab.test/D123/\n"),
+        vec![123]
     );
+    assert!(differential_revision_ids("differential revision: D7 and D9").is_empty());
+    assert_eq!(
+        differential_revision_ids("Differential Revision: D7\nquoted Differential Revision: D9\n"),
+        vec![7]
+    );
+    assert!(differential_revision_ids("Differential Revision: 42").is_empty());
+    assert!(differential_revision_ids("Differential Revision: D0").is_empty());
+    assert!(differential_revision_ids("Differential Revision: D007").is_empty());
+    assert!(differential_revision_ids("  Differential Revision: D7").is_empty());
+    assert!(differential_revision_ids("Differential Revision:").is_empty());
     assert!(differential_revision_ids("no tag here").is_empty());
     assert!(differential_revision_ids("Differential Revision: none").is_empty());
 }
@@ -1014,9 +1107,11 @@ fn legacy_row(id: i64) -> serde_json::Value {
 
 #[test]
 fn discovery_selects_single_related_revisions() {
+    // LAND-2: message-derived IDs resolve via `differential.revision.search`
+    // (rows keep `diffPHID`), not legacy `differential.query`.
     let call = canned(vec![(
-        diff_submit::METHOD_QUERY,
-        serde_json::json!([legacy_row(12)]),
+        diff_submit::METHOD_REVISION_SEARCH,
+        serde_json::json!({"data": [modern_row(12, "accepted", "Accepted", false, "PHID-USER-a")]}),
     )]);
     let mut commits = vec![land_commit("aaa", &[], "one")];
     let mut io = Io::canned(&[]);
@@ -1030,13 +1125,23 @@ fn discovery_selects_single_related_revisions() {
     )
     .unwrap();
     assert_eq!(commits[0].explicit.as_ref().unwrap().monogram, "D12");
+    assert_eq!(
+        commits[0].explicit.as_ref().unwrap().diff_phid.as_deref(),
+        Some("PHID-DIFF-12")
+    );
 }
 
 #[test]
 fn discovery_rejects_ambiguous_without_forced_revision() {
+    // LAND-3: ambiguity comes from the union of message and hash results;
+    // here two hash-echoed rows attach to one commit.
+    let mut row11 = legacy_row(11);
+    row11["hashes"] = serde_json::json!([["gtcm", "aaa"]]);
+    let mut row12 = legacy_row(12);
+    row12["hashes"] = serde_json::json!([["gtcm", "aaa"]]);
     let call = canned(vec![(
         diff_submit::METHOD_QUERY,
-        serde_json::json!([legacy_row(11), legacy_row(12)]),
+        serde_json::json!([row11, row12]),
     )]);
     let mut commits = vec![land_commit("aaa", &[], "one")];
     commits[0].indirect_symbols.push("feature".to_string());
@@ -1045,8 +1150,8 @@ fn discovery_rejects_ambiguous_without_forced_revision() {
         &mut io,
         &call,
         &mut commits,
-        &|_| Ok("Differential Revision: D12".to_string()),
-        &|_| Ok(Vec::new()),
+        &|_| Ok("no tag".to_string()),
+        &|_| Ok(vec![("gtcm".to_string(), "aaa".to_string())]),
         None,
     )
     .unwrap_err();
@@ -1056,12 +1161,17 @@ fn discovery_rejects_ambiguous_without_forced_revision() {
 
 #[test]
 fn discovery_queries_hashes_without_message_ids() {
+    // LAND-3/LAND-17: one batched `commitHashes` query; rows attach via
+    // their echoed `hashes`, not by position.
     let seen: std::rc::Rc<std::cell::RefCell<Vec<serde_json::Value>>> =
         std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let probe = seen.clone();
-    let call = move |_method: &str, params: &serde_json::Value| {
+    let call = move |method: &str, params: &serde_json::Value| {
+        assert_eq!(method, diff_submit::METHOD_QUERY);
         probe.borrow_mut().push(params.clone());
-        Ok(serde_json::json!([legacy_row(3)]))
+        let mut row = legacy_row(3);
+        row["hashes"] = serde_json::json!([["gtcm", "aaa"]]);
+        Ok(serde_json::json!([row]))
     };
     let mut commits = vec![land_commit("aaa", &[], "one")];
     let mut io = Io::canned(&[]);
@@ -1075,6 +1185,7 @@ fn discovery_queries_hashes_without_message_ids() {
     )
     .unwrap();
     assert_eq!(commits[0].explicit.as_ref().unwrap().monogram, "D3");
+    assert_eq!(seen.borrow().len(), 1);
     assert_eq!(
         seen.borrow()[0],
         serde_json::json!({"commitHashes": [["gtcm", "aaa"]]})
@@ -1098,9 +1209,11 @@ fn discovery_force_selects_and_rejects_foreign() {
     .unwrap();
     assert_eq!(commits[0].explicit.as_ref().unwrap().monogram, "D9");
 
+    // LAND-2: the foreign related revision now arrives via
+    // `differential.revision.search`.
     let call = canned(vec![(
-        diff_submit::METHOD_QUERY,
-        serde_json::json!([legacy_row(4)]),
+        diff_submit::METHOD_REVISION_SEARCH,
+        serde_json::json!({"data": [modern_row(4, "accepted", "Accepted", false, "PHID-USER-a")]}),
     )]);
     let mut commits = vec![land_commit("aaa", &[], "one")];
     let mut io = Io::canned(&[]);
@@ -1383,7 +1496,8 @@ fn confirm_gates_render_parents_and_builds() {
     assert_eq!(findings.len(), 2);
     let mut io = Io::canned(&["y", "y"]);
     confirm_revision_gates(&mut io, &revisions, &viewer, &links, &builds, &findings).unwrap();
-    assert!(io.out.stdout.contains("** 1 OPEN PARENT REVISION(S) **"));
+    // LAND-38: PHP's title carries a trailing space.
+    assert!(io.out.stdout.contains("** 1 OPEN PARENT REVISION(S)  **"));
     assert!(io.out.stdout.contains("Parent of: D2 Work 2"));
     // The builds banner has no leading blank line; each affected revision
     // renders as a nested revision > buildable > builds tree.
@@ -1420,15 +1534,28 @@ fn detect_vcs_classifies_working_copies() {
 
 #[test]
 fn onto_config_parses_string_and_list() {
+    // LAND-39: bare strings fail with `Expected a list!`, non-string
+    // items with the usage error; only string lists parse.
     assert_eq!(
-        parse_onto_config(&serde_json::json!("stable")),
-        vec!["stable".to_string()]
+        parse_onto_config(&serde_json::json!("stable")).unwrap_err(),
+        "Expected a list!"
     );
     assert_eq!(
-        parse_onto_config(&serde_json::json!(["a", 1, "b"])),
+        parse_onto_config(&serde_json::json!(["a", "b"])).unwrap(),
         vec!["a".to_string(), "b".to_string()]
     );
-    assert!(parse_onto_config(&serde_json::json!(7)).is_empty());
+    assert_eq!(
+        parse_onto_config(&serde_json::json!(["a", 1, "b"])).unwrap_err(),
+        "Expected a string (at index \"1\"), found \"integer\"."
+    );
+    assert_eq!(
+        parse_onto_config(&serde_json::json!({"x": "a"})).unwrap_err(),
+        "Expected a natural list!"
+    );
+    assert_eq!(
+        parse_onto_config(&serde_json::json!(7)).unwrap_err(),
+        "Expected a list!"
+    );
     assert_eq!(
         parse_string_config(&serde_json::json!("origin")),
         Some("origin".to_string())
@@ -1552,25 +1679,9 @@ fn revision_id_and_phid_classifiers() {
     assert!(!is_revision_phid("PHID-DIFF-x"));
 }
 
-#[test]
-fn split_author_handles_malformed() {
-    assert_eq!(
-        split_author("Ada <ada@test>"),
-        ("Ada".to_string(), "ada@test".to_string())
-    );
-    assert_eq!(split_author("bogus"), (String::new(), String::new()));
-}
-
-#[test]
-fn merge_approaches_follow_strategy() {
-    assert_eq!(
-        merge_approaches(true, false),
-        vec![MergeApproach::RebaseMerge, MergeApproach::ReduceRebaseMerge]
-    );
-    assert_eq!(merge_approaches(true, true), vec![MergeApproach::Merge]);
-    assert_eq!(merge_approaches(false, false), vec![MergeApproach::Merge]);
-}
-
+// NOTE (LAND-12/LAND-43): `split_author_handles_malformed` and
+// `merge_approaches_follow_strategy` covered helpers the ceb-flow
+// restoration deleted; replacements live in the Wave 2 block at the end.
 #[test]
 fn validate_options_rejects_bad_combinations() {
     let dir = temp_dir("validate");
@@ -2396,19 +2507,21 @@ fn merge_conflict_banner_names_symbols_and_hints() {
         commits: vec![0],
         is_pick: false,
     };
+    // LAND-33: the hint shows only with previously merged but unpushed
+    // sets, regardless of the `--incremental` flag.
     let mut io = Io::canned(&[]);
-    let err = git_merge_conflict(&mut io, &commits, &set, "aaa", "bbb", false);
+    let err = git_merge_conflict(&mut io, &commits, &set, "aaa", "bbb", true);
     assert_eq!(err, "Encountered a merge conflict.");
     assert!(io.out.stdout.contains("** MERGE CONFLICT **"));
     assert!(io.out.stdout.contains("\"feature\""));
-    // The hint renders as a `%?` line, and only without `--incremental`.
+    // The hint renders as a `%?` line.
     assert!(
         io.out
             .stdout
             .contains("  ?   Use \"--incremental\" to merge and push changes one by one.\n\n")
     );
     let mut io = Io::canned(&[]);
-    git_merge_conflict(&mut io, &commits, &set, "aaa", "bbb", true);
+    git_merge_conflict(&mut io, &commits, &set, "aaa", "bbb", false);
     assert!(!io.out.stdout.contains("--incremental"));
 }
 
@@ -2566,9 +2679,15 @@ fn save_local_state_stashes_dirty_git_tree() {
     assert!(state.stashed);
     assert_eq!(state.local_ref.as_deref(), Some("feature"));
     assert_eq!(state.local_commit, head);
+    // LAND-34: verbatim banner texts and list titles.
     assert!(io.out.stdout.contains("** UNCOMMITTED CHANGES **"));
-    assert!(io.out.stdout.contains("Untracked Changes"));
-    assert!(io.out.stdout.contains("Unstaged Changes"));
+    assert!(
+        io.out
+            .stdout
+            .contains("You have uncommitted changes in this working copy.")
+    );
+    assert!(io.out.stdout.contains("Untracked changes in working copy:"));
+    assert!(io.out.stdout.contains("Unstaged changes in working copy:"));
     assert!(io.out.stdout.contains(".git/info/exclude"));
     assert!(io.out.stderr.contains("** SAVE STASH **"));
     // The tree is clean again; discarding applies the stash back.
@@ -2641,15 +2760,43 @@ fn change_lists_split_status_masks() {
 
 #[test]
 fn gate_merge_conflicts_lists_files_and_fails() {
+    // LAND-34: verbatim banner text and list titles; the banner also
+    // lists untracked/unstaged/uncommitted files like PHP.
     let dir = temp_dir("local-conflicts");
     let mut io = Io::canned(&[]);
-    assert!(gate_merge_conflicts(&mut io, &dir, &[]).is_ok());
+    let clean = ChangeLists {
+        conflicts: Vec::new(),
+        externals: Vec::new(),
+        untracked: Vec::new(),
+        unstaged: Vec::new(),
+        uncommitted: Vec::new(),
+    };
+    assert!(gate_merge_conflicts(&mut io, &dir, &clean).is_ok());
     let mut io = Io::canned(&[]);
-    let err = gate_merge_conflicts(&mut io, &dir, &["a.txt".to_string()]).unwrap_err();
+    let dirty = ChangeLists {
+        conflicts: vec!["a.txt".to_string()],
+        externals: Vec::new(),
+        untracked: vec!["u.txt".to_string()],
+        unstaged: Vec::new(),
+        uncommitted: vec!["c.txt".to_string()],
+    };
+    let err = gate_merge_conflicts(&mut io, &dir, &dirty).unwrap_err();
     assert_eq!(err, "Resolve merge conflicts before proceeding.");
     assert!(io.out.stdout.contains("** MERGE CONFLICTS **"));
-    assert!(io.out.stdout.contains("Untracked Changes"));
+    assert!(
+        io.out
+            .stdout
+            .contains("You have merge conflicts in this working copy.")
+    );
+    assert!(io.out.stdout.contains("Merge conflicts in working copy:"));
+    assert!(io.out.stdout.contains("Untracked changes in working copy:"));
+    assert!(
+        io.out
+            .stdout
+            .contains("Uncommitted changes in working copy:")
+    );
     assert!(io.out.stdout.contains("    a.txt\n"));
+    assert!(io.out.stdout.contains("    u.txt\n"));
 }
 
 #[test]
@@ -2663,39 +2810,48 @@ fn offline_message_lists_commits() {
 
 #[test]
 fn execute_help_parse_error_and_non_repo() {
+    // T1153 R10: `--help` renders the generated workflow help (exact
+    // bytes locked by `r10_land_help_matches_generated_format`).
     let dir = temp_dir("exec-misc");
     let mut io = Io::canned(&[]);
-    let out = execute_with_io(&dir, &args(&["--help"]), &mut io).unwrap();
-    assert_eq!(out.stdout, USAGE);
+    let out = execute_with_io(&dir, &args(&["--help", "--"]), &mut io).unwrap();
+    assert_eq!(out.stdout, usage_text(false));
+    // T1153 R4 (LAND-37): PHP renders usage errors with no usage
+    // dump; the envelope (`USAGE EXCEPTION` label) applies at `run_in`.
     let err = execute_with_io(&dir, &args(&["--nope"]), &mut Io::canned(&[])).unwrap_err();
-    assert!(err.starts_with("Unknown argument 'nope'."));
-    assert!(err.contains("usage: arc land"));
-    let err = execute_with_io(&dir, &args(&["--preview"]), &mut Io::canned(&[])).unwrap_err();
+    assert_eq!(err, "Unknown argument 'nope'. Try 'arc help'.");
+    let err = execute_with_io(&dir, &args(&["--preview", "--"]), &mut Io::canned(&[])).unwrap_err();
     assert_eq!(err, NOT_GIT_OR_HG);
-    let out = execute(&dir, &args(&["--help"])).unwrap();
-    assert_eq!(out.stdout, USAGE);
+    let out = execute(&dir, &args(&["--help", "--"])).unwrap();
+    assert!(out.stdout.contains("LAND WORKFLOW"));
 }
 
 #[test]
-fn execute_previews_offline_land() {
+fn execute_preview_without_conduit_fails() {
+    // T1153 B21/B23: piped runs carry `--`.
+    // LAND-6: even `--preview` needs Conduit (PHP resolves the viewer
+    // before the engine runs); there is no offline land anymore.
     let (repo, _bare) = repo_with_origin("preview");
     git(&repo, &["checkout", "-b", "feature"]);
     commit_file(&repo, "f.txt", "f\n", "feature work");
+    // T1153 CORE-12: discovery now honors ambient user config, so pin a project
+    // URI no host entry can match to force the failure hermetically.
+    std::fs::write(
+        repo.join(".arcconfig"),
+        r#"{"phabricator.uri": "https://127.0.0.1:9/"}"#,
+    )
+    .unwrap();
     let mut io = Io::canned(&[]);
-    let out = execute_with_io(&repo, &args(&["--preview", "feature"]), &mut io).unwrap();
-    assert!(out.stderr.contains("** STRATEGY **"));
-    assert!(out.stderr.contains("** ONTO TARGET **"));
-    assert!(out.stderr.contains("** LANDING **"));
-    assert!(out.stderr.contains("** PREVIEW **"));
-    assert!(out.stderr.contains("revision info unavailable"));
-    assert!(out.stdout.contains("feature work"));
+    let err = execute_with_io(&repo, &args(&["--preview", "--", "feature"]), &mut io).unwrap_err();
+    assert!(err.contains("no token for"), "{err}");
 }
 
 #[test]
 fn run_in_reports_success_and_failure() {
+    // T1153 B21/B23: piped runs carry `--` (`--nope` stays bare: scan errors report first).
     let dir = temp_dir("run-misc");
     assert!(matches!(
-        run_in(&dir, &args(&["--help"])),
+        run_in(&dir, &args(&["--help", "--"])),
         ExitCode::SUCCESS
     ));
     assert!(matches!(
@@ -2703,7 +2859,7 @@ fn run_in_reports_success_and_failure() {
         ExitCode::FAILURE
     ));
     assert!(matches!(
-        run_in(&dir, &args(&["--preview"])),
+        run_in(&dir, &args(&["--preview", "--"])),
         ExitCode::FAILURE
     ));
 }
@@ -3087,7 +3243,8 @@ fn render_file_lists_renders_titles_and_paths_in_both_modes() {
         ("Empty", empty.as_slice()),
         ("Removed", removed.as_slice()),
     ];
-    let expected = "Added\n\n    a.txt\n\nRemoved\n\n    gone.txt\n\n";
+    // LAND-34: lists are `"\n\n"` separated (PHP's separator echo).
+    let expected = "Added\n\n    a.txt\n\n\nRemoved\n\n    gone.txt\n\n";
     assert_eq!(render_file_lists(&lists, true), expected);
     assert_eq!(render_file_lists(&lists, false), expected);
 }
@@ -3103,4 +3260,1541 @@ fn console_wrap_at_hint_indent_matches_phutil_wrap() {
         format!("  ?\n      {}\n      {}", "a".repeat(66), "b".repeat(10))
     );
     assert_eq!(console_wrap("  ?   Use X.", 6, false), "  ?   Use X.");
+}
+
+#[test]
+fn r3_land16_revision_search_follows_after_cursor() {
+    let seen: std::rc::Rc<std::cell::RefCell<Vec<serde_json::Value>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let probe = seen.clone();
+    let call = move |method: &str, params: &serde_json::Value| {
+        assert_eq!(method, diff_submit::METHOD_REVISION_SEARCH);
+        probe.borrow_mut().push(params.clone());
+        if probe.borrow().len() == 1 {
+            Ok(serde_json::json!({
+                "data": [modern_row(89, "accepted", "Accepted", false, "PHID-USER-a")],
+                "cursor": {"after": "page2"},
+            }))
+        } else {
+            Ok(serde_json::json!({
+                "data": [modern_row(90, "accepted", "Accepted", false, "PHID-USER-a")],
+            }))
+        }
+    };
+    let views = fetch_revision_views(&call, &RevisionSymbol::Id(89)).unwrap();
+    assert_eq!(views.len(), 2);
+    assert_eq!(views[0].monogram, "D89");
+    assert_eq!(views[1].monogram, "D90");
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[0].get("after").is_none());
+    assert_eq!(seen[1]["after"], serde_json::json!("page2"));
+    assert_eq!(seen[1]["constraints"], serde_json::json!({"ids": [89]}));
+}
+
+#[test]
+fn r3_land16_build_searches_paginate() {
+    let calls: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let probe = calls.clone();
+    let call = move |method: &str, params: &serde_json::Value| {
+        let page = if params.get("after").is_some() { 2 } else { 1 };
+        probe.borrow_mut().push(format!("{method} p{page}"));
+        match (method, page) {
+            (METHOD_BUILDABLE_SEARCH, 1) => Ok(serde_json::json!({"data": [
+                {"id": 7, "phid": "PHID-HMBB-7", "fields": {"objectPHID": "PHID-DIFF-89"}},
+            ], "cursor": {"after": "b2"}})),
+            // LAND-19: the second page's buildable belongs to a second
+            // diff (one buildable per diff PHID, last wins).
+            (METHOD_BUILDABLE_SEARCH, _) => Ok(serde_json::json!({"data": [
+                {"id": 8, "phid": "PHID-HMBB-8", "fields": {"objectPHID": "PHID-DIFF-90"}},
+            ]})),
+            (METHOD_BUILD_SEARCH, 1) => Ok(serde_json::json!({"data": [
+                {"id": 42, "fields": {
+                    "name": "Lint",
+                    "buildStatus": {"value": "failed"},
+                    "buildablePHID": "PHID-HMBB-7",
+                    "buildPlanPHID": "PHID-HMPA-1",
+                }},
+            ], "cursor": {"after": "u2"}})),
+            (METHOD_BUILD_SEARCH, _) => Ok(serde_json::json!({"data": [
+                {"id": 43, "fields": {
+                    "name": "Unit",
+                    "buildStatus": {"value": "passed"},
+                    "buildablePHID": "PHID-HMBB-8",
+                    "buildPlanPHID": "PHID-HMPA-2",
+                }},
+            ]})),
+            (METHOD_BUILDPLAN_SEARCH, 1) => Ok(serde_json::json!({"data": [
+                {"phid": "PHID-HMPA-1", "fields": {"behaviors": {"arc-land": {"value": "always"}}}},
+            ], "cursor": {"after": "p2"}})),
+            (METHOD_BUILDPLAN_SEARCH, _) => Ok(serde_json::json!({"data": [
+                {"phid": "PHID-HMPA-2", "fields": {"behaviors": {"arc-land": {"value": "never"}}}},
+            ]})),
+            _ => Err(format!("unexpected conduit call {method}")),
+        }
+    };
+    let revisions = vec![
+        view(89, "accepted", "Accepted", false, "PHID-USER-a"),
+        view(90, "accepted", "Accepted", false, "PHID-USER-a"),
+    ];
+    let builds = fetch_build_views(&call, &revisions, None).unwrap();
+    assert_eq!(builds.len(), 2);
+    assert_eq!(builds[0].buildable_monogram, "B7");
+    assert_eq!(builds[0].plan_behavior.as_deref(), Some("always"));
+    assert_eq!(builds[1].buildable_monogram, "B8");
+    assert_eq!(builds[1].plan_behavior.as_deref(), Some("never"));
+    assert_eq!(
+        calls.borrow().clone(),
+        vec![
+            "harbormaster.buildable.search p1",
+            "harbormaster.buildable.search p2",
+            "harbormaster.build.search p1",
+            "harbormaster.build.search p2",
+            "harbormaster.buildplan.search p1",
+            "harbormaster.buildplan.search p2",
+        ]
+    );
+}
+
+// -( R5 TTY gating: LAND-10 )------------------------------------------------
+
+#[test]
+fn r5_land10_prompt_requires_tty_first() {
+    // `ArcanistPrompt.php:77-88`: piped stdin echoes the raw query,
+    // then throws — before any saved response is consulted.
+    let mut io = Io::canned(&["y"]);
+    io.stdin_tty = false;
+    assert_eq!(
+        prompt_for_key(&mut io, "k", "Land these changes?").unwrap_err(),
+        crate::prompt::NOT_INTERACTIVE
+    );
+    assert_eq!(io.out.stdout, "Land these changes?\n");
+    // A saved response does not bypass the gate.
+    let mut io = Io::canned(&[]);
+    io.stdin_tty = false;
+    io.saved.insert(
+        "k".to_string(),
+        SavedResponse {
+            response: "y".to_string(),
+            scope: PromptScope::User,
+        },
+    );
+    assert_eq!(
+        prompt_for_key(&mut io, "k", "q?").unwrap_err(),
+        crate::prompt::NOT_INTERACTIVE
+    );
+    assert_eq!(io.out.stdout, "q?\n");
+}
+
+#[test]
+fn r5_land10_console_confirm_requires_tty() {
+    // `phutil_console_prompt()` echoes, then `require_tty()` throws
+    // (`src/console/format.php:42-52`).
+    let mut io = Io::canned(&["y"]);
+    io.stdin_tty = false;
+    assert_eq!(
+        console_confirm(&mut io, "Delete?", true).unwrap_err(),
+        crate::prompt::NOT_INTERACTIVE
+    );
+    assert_eq!(io.out.stdout, "\n\n    Delete? [y/N] ");
+}
+
+#[test]
+fn r6_land13_onto_reads_full_merge() {
+    // LAND-13: `arc.land.onto` resolves runtime > local > project > user,
+    // not `.arcconfig` alone.
+    let repo = make_repo("r6-onto");
+    std::fs::write(
+        repo.join(".arcconfig"),
+        r#"{"arc.land.onto": ["from-project"]}"#,
+    )
+    .unwrap();
+    let mut io = Io::canned(&[]);
+    assert_eq!(
+        git_select_onto_refs(&repo, &mut io, &Options::default(), &[]).unwrap(),
+        vec!["from-project".to_string()]
+    );
+    assert!(
+        io.out
+            .stderr
+            .contains("reading \"arc.land.onto\" configuration")
+    );
+    // User source via `--arcrc-file`, below project.
+    let user = repo.join("arcrc.json");
+    std::fs::write(&user, r#"{"config": {"arc.land.onto": ["from-user"]}}"#).unwrap();
+    let user_opts = Options {
+        arcrc_file: Some(user.to_string_lossy().to_string()),
+        ..Options::default()
+    };
+    let mut io = Io::canned(&[]);
+    assert_eq!(
+        git_select_onto_refs(&repo, &mut io, &user_opts, &[]).unwrap(),
+        vec!["from-project".to_string()]
+    );
+    std::fs::remove_file(repo.join(".arcconfig")).unwrap();
+    let mut io = Io::canned(&[]);
+    assert_eq!(
+        git_select_onto_refs(&repo, &mut io, &user_opts, &[]).unwrap(),
+        vec!["from-user".to_string()]
+    );
+    // Local beats user; `--config` beats local.
+    let local_dir = repo.join(".git").join("arc");
+    std::fs::create_dir_all(&local_dir).unwrap();
+    std::fs::write(
+        local_dir.join("config"),
+        r#"{"arc.land.onto": ["from-local"]}"#,
+    )
+    .unwrap();
+    let mut io = Io::canned(&[]);
+    assert_eq!(
+        git_select_onto_refs(&repo, &mut io, &user_opts, &[]).unwrap(),
+        vec!["from-local".to_string()]
+    );
+    let rt_opts = Options {
+        arcrc_file: user_opts.arcrc_file.clone(),
+        config: vec!["arc.land.onto=from-rt".to_string()],
+        ..Options::default()
+    };
+    // LAND-39: a bare runtime string is not a list (PHP throws
+    // `Expected a list!` for the merged string value too).
+    let mut io = Io::canned(&[]);
+    assert_eq!(
+        git_select_onto_refs(&repo, &mut io, &rt_opts, &[]).unwrap_err(),
+        "Expected a list!"
+    );
+}
+
+#[test]
+fn r4_land37_toolset_usage_matcher() {
+    use arc_rs::conduit::EnvelopeKind;
+    // Engine errors PHP raises as `PhutilArgumentUsageException`.
+    for message in [
+        "There are no commits to land.",
+        "Encountered a merge conflict.",
+        "Landing onto multiple branches at once is not supported in Mercurial.",
+        "TODO: You are forcing a revision, but ...",
+        "Symbol \"D1\" does not identify a valid revision.",
+        "Symbol \"x\" does not identify a bookmark, branch, or commit.",
+        "Symbol \"x\" is ambiguous.",
+        "Revision for commit \"abc\" is ambiguous. Use \"--revision\" to force selection of a particular revision.",
+        "Unable to determine revision for commit \"abc\".",
+        "Merging local \"abc\" into \"def\" produces an empty diff. This usually means these changes have already landed.",
+        "Branch \"b\" does not exist in the local working copy.",
+        "No pushable remote \"r\" exists. Use the \"--onto-remote\" flag to choose a valid, pushable remote to land changes onto.",
+        "Perforce mode does not support the \"merge\" land strategy. Use the \"squash\" land strategy when landing to a Perforce remote (you can use \"--squash\" to select this strategy).",
+        "The \"onto\" refs you have selected are connected to multiple different remotes via Git branch upstreams. Use \"--onto-remote\" to select a single remote.",
+        "The branches you are landing are connected to multiple different remote branches via Git branch upstreams. Use \"--onto\" to select the refs you want to push to.",
+        "Selected \"onto\" ref \"\" is invalid: the empty string is not a valid ref.",
+        "Remote \"r\", specified with \"--into\", is not a valid fetchable remote.",
+        "Local ref \"l\" does not exist.",
+        "Ref \"r\" does not exist in remote \"o\".",
+        "No remote \"r\" exists in this repository.",
+        // T1153 Wave 1 carry-over: push failures rewrap into usage after
+        // the cascade retry.
+        "Push failed! Fix the error and run \"arc land\" again.",
+        "Submit failed! Fix the error and run \"arc land\" again.",
+        // LAND-8/LAND-34/LAND-35/LAND-39 usage errors.
+        "Desired merge strategy is ambiguous, choose an explicit strategy.",
+        "Resolve merge conflicts before proceeding.",
+        "You can not continue with uncommitted changes. Commit or discard them before proceeding.",
+        "Expected a string (at index \"0\"), found \"integer\".",
+    ] {
+        assert!(is_toolset_usage_message(message), "{message}");
+    }
+    // Operation failures escape into a fatal instead.
+    for message in [
+        "Fetch of \"m\" from remote \"o\" failed! Fix the error and run \"arc land\" again.",
+        "Perforce sync failed! Fix the error and run \"arc land\" again.",
+        "Branch \"b\" does not rebase cleanly from \"a\" onto \"c\", halting.",
+        "transport exploded",
+    ] {
+        assert!(!is_toolset_usage_message(message), "{message}");
+    }
+    assert_ne!(
+        EnvelopeKind::ToolsetUsage.exit_code(),
+        EnvelopeKind::Fatal.exit_code()
+    );
+}
+
+#[test]
+fn r6_land13_strategy_and_remote_merge() {
+    // LAND-13: `arc.land.strategy` and `arc.land.onto-remote` resolve
+    // through the same merge (strategy via `validate_options`).
+    let dir = temp_dir("r6-strategy");
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::write(
+        dir.join(".arcconfig"),
+        r#"{"arc.land.strategy": "merge", "arc.land.onto-remote": "proj-remote"}"#,
+    )
+    .unwrap();
+    let mut io = Io::canned(&[]);
+    let validated = validate_options(&Options::default(), &dir, &mut io).unwrap();
+    assert_eq!(validated.strategy, Strategy::Merge);
+    assert!(
+        io.out
+            .stderr
+            .contains("configured with \"arc.land.strategy\"")
+    );
+    let user = dir.join("arcrc.json");
+    std::fs::write(
+        &user,
+        r#"{"config": {"arc.land.strategy": "squash", "arc.land.onto-remote": "user-remote"}}"#,
+    )
+    .unwrap();
+    let user_opts = Options {
+        arcrc_file: Some(user.to_string_lossy().to_string()),
+        ..Options::default()
+    };
+    // Project beats user for both keys.
+    let mut io = Io::canned(&[]);
+    let validated = validate_options(&user_opts, &dir, &mut io).unwrap();
+    assert_eq!(validated.strategy, Strategy::Merge);
+    assert_eq!(
+        land_config_value(&user_opts, &dir, "arc.land.onto-remote").unwrap(),
+        Some(serde_json::json!("proj-remote"))
+    );
+    std::fs::remove_file(dir.join(".arcconfig")).unwrap();
+    let mut io = Io::canned(&[]);
+    let validated = validate_options(&user_opts, &dir, &mut io).unwrap();
+    assert_eq!(validated.strategy, Strategy::Squash);
+    // A stray subdir `.arcconfig` never counts (T1153 CORE-33).
+    let sub = dir.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join(".arcconfig"), r#"{"arc.land.strategy": "merge"}"#).unwrap();
+    let mut io = Io::canned(&[]);
+    let validated = validate_options(&user_opts, &sub, &mut io).unwrap();
+    assert_eq!(validated.strategy, Strategy::Squash);
+}
+
+#[test]
+fn r6_core34_land_config_flags_parse() {
+    // T1153 B21/B23: TTY runs need no `--`.
+    let opts = parse_options_with_tty(
+        &args(&[
+            "--config",
+            "a=1",
+            "--config=b=2",
+            "--config-file",
+            "f",
+            "--arcrc-file=g",
+        ]),
+        true,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(opts.config, ["a=1", "b=2"]);
+    assert_eq!(opts.config_file, ["f"]);
+    assert_eq!(opts.arcrc_file.as_deref(), Some("g"));
+}
+
+#[test]
+fn r4_land37_classified_parse_and_non_repo_are_usage() {
+    // T1153 B21/B23: piped runs carry `--` to reach the non-repo arm (`--nope` stays bare: scan first).
+    use arc_rs::conduit::EnvelopeKind;
+    let dir = temp_dir("r4-land37");
+    let err =
+        execute_with_io_classified(&dir, &args(&["--nope"]), &mut Io::canned(&[])).unwrap_err();
+    assert_eq!(err.kind, EnvelopeKind::ToolsetUsage);
+    assert_eq!(err.message, "Unknown argument 'nope'. Try 'arc help'.");
+    let err = execute_with_io_classified(&dir, &args(&["--preview", "--"]), &mut Io::canned(&[]))
+        .unwrap_err();
+    assert_eq!(err.kind, EnvelopeKind::ToolsetUsage);
+    assert_eq!(err.message, NOT_GIT_OR_HG);
+}
+
+#[test]
+fn r4_land37_engine_error_kinds() {
+    use arc_rs::conduit::EnvelopeKind;
+    // Declines surface as exactly `ABORT` (e.g. `prompt_for_key`
+    // with "n"), routed to the `---` arm (exit 1).
+    let mut io = Io::canned(&["n"]);
+    assert_eq!(prompt_for_key(&mut io, "k", "Land?").unwrap_err(), ABORT);
+    assert_eq!(
+        classify_engine_error(ABORT.to_string()).kind,
+        EnvelopeKind::UserAbort
+    );
+    assert_eq!(
+        classify_engine_error("There are no commits to land.".to_string()).kind,
+        EnvelopeKind::ToolsetUsage
+    );
+    // T1153 Wave 1 carry-over: push failures rewrap into usage after
+    // the cascade retry (`ArcanistLandEngine.php:1278-1290`).
+    assert_eq!(
+        classify_engine_error("Push failed! Fix the error and run \"arc land\" again.".to_string())
+            .kind,
+        EnvelopeKind::ToolsetUsage
+    );
+    assert_eq!(
+        classify_engine_error(
+            "Submit failed! Fix the error and run \"arc land\" again.".to_string()
+        )
+        .kind,
+        EnvelopeKind::ToolsetUsage
+    );
+    assert_eq!(
+        classify_engine_error(
+            "Desired merge strategy is ambiguous, choose an explicit strategy.".to_string()
+        )
+        .kind,
+        EnvelopeKind::ToolsetUsage
+    );
+    assert_eq!(
+        classify_engine_error("Resolve merge conflicts before proceeding.".to_string()).kind,
+        EnvelopeKind::ToolsetUsage
+    );
+    assert_eq!(
+        classify_engine_error(
+            "You can not continue with uncommitted changes. Commit or discard them before proceeding."
+                .to_string()
+        )
+        .kind,
+        EnvelopeKind::ToolsetUsage
+    );
+    assert_eq!(
+        classify_engine_error("Expected a string (at index \"0\"), found \"integer\".".to_string())
+            .kind,
+        EnvelopeKind::ToolsetUsage
+    );
+    // Fetch failures stay fatal (plain `ArcanistUsageException`, which the
+    // toolset runtime does not catch).
+    assert_eq!(
+        classify_engine_error(
+            "Fetch of \"master\" from remote \"origin\" failed! Fix the error and run \"arc land\" again."
+                .to_string()
+        )
+        .kind,
+        EnvelopeKind::Fatal
+    );
+}
+
+// -( T1153 Wave 2: LAND findings )--------------------------------------------
+
+#[test]
+fn land2_message_ids_batch_into_one_search() {
+    // One `differential.revision.search` carries every message-derived ID;
+    // rows keep `diffPHID` so build gates can run.
+    let seen: std::rc::Rc<std::cell::RefCell<Vec<serde_json::Value>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let probe = seen.clone();
+    let call = move |method: &str, params: &serde_json::Value| {
+        assert_eq!(method, diff_submit::METHOD_REVISION_SEARCH);
+        probe.borrow_mut().push(params.clone());
+        Ok(serde_json::json!({"data": [
+            modern_row(11, "accepted", "Accepted", false, "PHID-USER-a"),
+            modern_row(12, "accepted", "Accepted", false, "PHID-USER-a"),
+        ]}))
+    };
+    let mut commits = vec![
+        land_commit("aaa", &[], "one"),
+        land_commit("bbb", &["aaa"], "two"),
+    ];
+    let mut io = Io::canned(&[]);
+    load_revision_refs(
+        &mut io,
+        &call,
+        &mut commits,
+        &|hash| {
+            Ok(if hash == "aaa" {
+                "Differential Revision: D11".to_string()
+            } else {
+                "Differential Revision: D12".to_string()
+            })
+        },
+        &|_| Ok(Vec::new()),
+        None,
+    )
+    .unwrap();
+    assert_eq!(seen.borrow().len(), 1);
+    let mut ids = seen.borrow()[0]["constraints"]["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_i64().unwrap())
+        .collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(ids, vec![11, 12]);
+    assert_eq!(commits[0].explicit.as_ref().unwrap().monogram, "D11");
+    assert_eq!(commits[1].explicit.as_ref().unwrap().monogram, "D12");
+    assert!(commits[0].explicit.as_ref().unwrap().diff_phid.is_some());
+}
+
+#[test]
+fn land3_message_and_hash_results_union_phid_deduped() {
+    // The same revision found via message and via hash attaches once.
+    let mut row = modern_row(12, "accepted", "Accepted", false, "PHID-USER-a");
+    row["hashes"] = serde_json::json!([["gtcm", "aaa"]]);
+    let call = canned(vec![
+        (
+            diff_submit::METHOD_REVISION_SEARCH,
+            serde_json::json!({"data": [modern_row(12, "accepted", "Accepted", false, "PHID-USER-a")]}),
+        ),
+        (diff_submit::METHOD_QUERY, serde_json::json!([row])),
+    ]);
+    let mut commits = vec![land_commit("aaa", &[], "one")];
+    let mut io = Io::canned(&[]);
+    load_revision_refs(
+        &mut io,
+        &call,
+        &mut commits,
+        &|_| Ok("Differential Revision: D12".to_string()),
+        &|_| Ok(vec![("gtcm".to_string(), "aaa".to_string())]),
+        None,
+    )
+    .unwrap();
+    assert_eq!(commits[0].related.len(), 1);
+    assert_eq!(commits[0].explicit.as_ref().unwrap().monogram, "D12");
+}
+
+#[test]
+fn land3_rows_without_echoed_hashes_attach_nowhere() {
+    // A `differential.query` row whose `hashes` echo nothing (or are
+    // absent) matches no commit, like PHP's `$map` lookup.
+    let mut foreign = legacy_row(7);
+    foreign["hashes"] = serde_json::json!([["gtcm", "zzz"]]);
+    let call = canned(vec![(
+        diff_submit::METHOD_QUERY,
+        serde_json::json!([legacy_row(8), foreign]),
+    )]);
+    let mut commits = vec![land_commit("aaa", &[], "one")];
+    let mut io = Io::canned(&[]);
+    load_revision_refs(
+        &mut io,
+        &call,
+        &mut commits,
+        &|_| Ok("no tag".to_string()),
+        &|_| Ok(vec![("gtcm".to_string(), "aaa".to_string())]),
+        None,
+    )
+    .unwrap();
+    assert!(commits[0].related.is_empty());
+    assert!(commits[0].explicit.is_none());
+}
+
+#[test]
+fn land4_invalid_field_skips_message_query() {
+    // An invalid `Differential Revision:` value (bare digits here) sends
+    // no `revision.search`: PHP throws, the message query skips.
+    let call = move |method: &str, _params: &serde_json::Value| {
+        assert_eq!(method, diff_submit::METHOD_QUERY);
+        Ok(serde_json::json!([]))
+    };
+    let mut commits = vec![land_commit("aaa", &[], "one")];
+    let mut io = Io::canned(&[]);
+    load_revision_refs(
+        &mut io,
+        &call,
+        &mut commits,
+        &|_| Ok("Differential Revision: 42".to_string()),
+        &|_| Ok(vec![("gtcm".to_string(), "aaa".to_string())]),
+        None,
+    )
+    .unwrap();
+    assert!(commits[0].related.is_empty());
+}
+
+#[test]
+fn land5_git_hash_reader_sends_gtcm_and_gttr() {
+    // LAND-5 is CLEAN (Rule 4): PHP sends both `gtcm` and `gttr`
+    // (`ArcanistGitWorkingCopyRevisionHardpointQuery.php:28-45`), and so
+    // does the port. Lock the pair shape.
+    let dir = make_repo("land5-hashes");
+    let head = commit_file(&dir, "a.txt", "a\n", "add a");
+    let reader = commit_hash_reader(&dir, Vcs::Git);
+    let pairs = reader(&head).unwrap();
+    assert_eq!(pairs.len(), 2);
+    assert_eq!(pairs[0].0, "gtcm");
+    assert_eq!(pairs[0].1, head);
+    assert_eq!(pairs[1].0, "gttr");
+    assert_eq!(pairs[1].1.len(), 40);
+    let reader = commit_hash_reader(&dir, Vcs::Hg);
+    assert_eq!(
+        reader("abc").unwrap(),
+        vec![("hgcm".to_string(), "abc".to_string())]
+    );
+}
+
+#[test]
+fn land17_parent_phids_batch_into_one_search() {
+    // Distinct parent PHIDs resolve with a single `revision.search`.
+    let seen: std::rc::Rc<std::cell::RefCell<Vec<serde_json::Value>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let probe = seen.clone();
+    let call = move |method: &str, params: &serde_json::Value| {
+        if method == diff_submit::METHOD_REVISION_SEARCH {
+            probe.borrow_mut().push(params.clone());
+            return Ok(serde_json::json!({"data": [
+                modern_row(1, "accepted", "Accepted", false, "PHID-USER-a"),
+                modern_row(2, "accepted", "Accepted", false, "PHID-USER-a"),
+            ]}));
+        }
+        assert_eq!(method, METHOD_EDGE_SEARCH);
+        Ok(serde_json::json!({"data": [
+            {"sourcePHID": "PHID-DREV-3", "destinationPHID": "PHID-DREV-1"},
+            {"sourcePHID": "PHID-DREV-4", "destinationPHID": "PHID-DREV-2"},
+        ]}))
+    };
+    let revisions = vec![
+        view(3, "accepted", "Accepted", false, "PHID-USER-a"),
+        view(4, "accepted", "Accepted", false, "PHID-USER-a"),
+    ];
+    let links = fetch_parent_links(&call, &revisions).unwrap();
+    assert_eq!(links.len(), 2);
+    assert_eq!(seen.borrow().len(), 1);
+    assert_eq!(
+        seen.borrow()[0],
+        serde_json::json!({"constraints": {"phids": ["PHID-DREV-1", "PHID-DREV-2"]}})
+    );
+}
+
+#[test]
+fn land18_malformed_search_data_degrades_to_empty() {
+    // Missing or malformed `data` lists yield no rows instead of errors.
+    let call = canned(vec![
+        (diff_submit::METHOD_REVISION_SEARCH, serde_json::json!({})),
+        (METHOD_EDGE_SEARCH, serde_json::json!({"data": {}})),
+        (METHOD_BUILDABLE_SEARCH, serde_json::json!({})),
+        (METHOD_BUILD_SEARCH, serde_json::json!({"oops": []})),
+        (METHOD_BUILDPLAN_SEARCH, serde_json::json!({"data": []})),
+    ]);
+    let views = fetch_revision_views(&call, &RevisionSymbol::Id(89)).unwrap();
+    assert!(views.is_empty());
+    let revisions = vec![view(1, "accepted", "Accepted", false, "PHID-USER-a")];
+    assert!(fetch_parent_links(&call, &revisions).unwrap().is_empty());
+    let builds = fetch_build_views(&call, &revisions, None).unwrap();
+    assert!(builds.is_empty());
+    assert!(parse_buildable_rows(&serde_json::json!({})).is_empty());
+    assert!(parse_build_rows(&serde_json::json!({"data": 7})).is_empty());
+    assert!(parse_plan_behaviors(&serde_json::json!({})).is_empty());
+}
+
+#[test]
+fn land19_last_buildable_per_diff_wins() {
+    // Two buildables for one diff PHID: only the last one's builds join.
+    let call = canned(vec![
+        (
+            METHOD_BUILDABLE_SEARCH,
+            serde_json::json!({"data": [
+                {"id": 7, "phid": "PHID-HMBB-7", "fields": {"objectPHID": "PHID-DIFF-89"}},
+                {"id": 8, "phid": "PHID-HMBB-8", "fields": {"objectPHID": "PHID-DIFF-89"}},
+            ]}),
+        ),
+        (
+            METHOD_BUILD_SEARCH,
+            serde_json::json!({"data": [
+                {"id": 42, "fields": {
+                    "name": "Lint", "buildStatus": {"value": "failed"},
+                    "buildablePHID": "PHID-HMBB-7", "buildPlanPHID": "PHID-HMPA-1"}},
+                {"id": 43, "fields": {
+                    "name": "Unit", "buildStatus": {"value": "passed"},
+                    "buildablePHID": "PHID-HMBB-8", "buildPlanPHID": "PHID-HMPA-2"}},
+            ]}),
+        ),
+        (
+            METHOD_BUILDPLAN_SEARCH,
+            serde_json::json!({"data": [
+                {"phid": "PHID-HMPA-1", "fields": {"behaviors": {"arc-land": {"value": "always"}}}},
+                {"phid": "PHID-HMPA-2", "fields": {"behaviors": {"arc-land": {"value": "never"}}}},
+            ]}),
+        ),
+    ]);
+    let revisions = vec![view(89, "accepted", "Accepted", false, "PHID-USER-a")];
+    let builds = fetch_build_views(&call, &revisions, None).unwrap();
+    assert_eq!(builds.len(), 1);
+    assert_eq!(builds[0].buildable_monogram, "B8");
+    assert_eq!(builds[0].build_name, "Unit");
+}
+
+#[test]
+fn land7_whoami_failure_propagates() {
+    // No fallback to the first revision's author: the error surfaces.
+    let call = canned(vec![
+        (METHOD_EDGE_SEARCH, serde_json::json!({"data": []})),
+        (METHOD_BUILDABLE_SEARCH, serde_json::json!({"data": []})),
+    ]);
+    let revisions = vec![view(
+        1,
+        "needs-review",
+        "Needs Review",
+        false,
+        "PHID-USER-b",
+    )];
+    let err = load_gate_findings(&call, &revisions, 1).unwrap_err();
+    assert!(err.contains("user.whoami"), "{err}");
+}
+
+#[test]
+fn land31_author_monograms_render_in_unauthored_banner() {
+    let call = canned(vec![(
+        METHOD_USER_SEARCH,
+        serde_json::json!({"data": [
+            {"phid": "PHID-USER-b", "fields": {"username": "bob"}},
+        ]}),
+    )]);
+    let authors = fetch_user_monograms(
+        &call,
+        &["PHID-USER-b".to_string(), "PHID-USER-zzz".to_string()],
+    )
+    .unwrap();
+    assert_eq!(authors.get("PHID-USER-b").unwrap(), "@bob");
+    assert!(!authors.contains_key("PHID-USER-zzz"));
+
+    let revisions = vec![view(1, "accepted", "Accepted", false, "PHID-USER-b")];
+    let viewer = ViewerIdentity {
+        phid: "PHID-USER-a".to_string(),
+        name: "@alice".to_string(),
+    };
+    let findings = land_checks::evaluate_gates(
+        &revisions,
+        &viewer.phid,
+        &[],
+        &["PHID-DREV-1"],
+        &[],
+        Some(1),
+    );
+    assert_eq!(findings.len(), 1);
+    let mut io = Io::canned(&["y"]);
+    confirm_revision_gates_with_authors(
+        &mut io,
+        &revisions,
+        &viewer,
+        &[],
+        &[],
+        &findings,
+        &authors,
+    )
+    .unwrap();
+    assert!(
+        io.out.stdout.contains("(\"@alice\") are not the author"),
+        "{}",
+        io.out.stdout
+    );
+    assert!(io.out.stdout.contains("Author: @bob"), "{}", io.out.stdout);
+    assert!(!io.out.stdout.contains("PHID-USER-b"), "{}", io.out.stdout);
+
+    // Unknown authors show no `Author:` line (PHP's missing author ref).
+    let mut io = Io::canned(&["y"]);
+    confirm_revision_gates(&mut io, &revisions, &viewer, &[], &[], &findings).unwrap();
+    assert!(!io.out.stdout.contains("Author:"), "{}", io.out.stdout);
+}
+
+#[test]
+fn land43_squash_rebase_failure_is_a_conflict() {
+    // The ceb flow has no reduce fallback: when the rebase fails, the
+    // merge fails with `Encountered a merge conflict.` (and no
+    // `MERGE Attempting ...` status lines exist).
+    let repo = make_repo("land43-conflict");
+    let master = git(&repo, &["rev-parse", "master"]);
+    git(&repo, &["checkout", "-b", "feature"]);
+    std::fs::write(repo.join("file.txt"), "feature\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "feature work"]);
+    let tip = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["checkout", "-q", "master"]);
+    std::fs::write(repo.join("file.txt"), "master\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "master work"]);
+    let into = git(&repo, &["rev-parse", "HEAD"]);
+    let commits = vec![land_commit(&tip, &[&master], "feature work")];
+    let set = CommitSet {
+        revision: None,
+        commits: vec![0],
+        is_pick: false,
+    };
+    let mut io = Io::canned(&[]);
+    let err = git_execute_merge(
+        &repo,
+        &mut io,
+        &set,
+        &commits,
+        Some(&into),
+        true,
+        false,
+        &|_| Ok("Landed message".to_string()),
+    )
+    .unwrap_err();
+    assert_eq!(err, "Encountered a merge conflict.");
+    assert!(io.out.stdout.contains("** MERGE CONFLICT **"));
+    assert!(!io.out.stderr.contains("Attempting to rebase changes."));
+    assert!(
+        !io.out
+            .stderr
+            .contains("Attempting to reduce and rebase changes.")
+    );
+    assert!(!io.out.stderr.contains("Merge succeeded."));
+}
+
+#[test]
+fn land43_merge_commit_range_conflicts_like_ceb() {
+    // The merge-commit-range experiment behind the LAND-43 decision: a
+    // range whose replay conflicts fails instead of force-landing.
+    let repo = make_repo("land43-range");
+    let base = git(&repo, &["rev-parse", "master"]);
+    git(&repo, &["checkout", "-qb", "feature"]);
+    std::fs::write(repo.join("file.txt"), "B1\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "f1"]);
+    let min = git(&repo, &["rev-parse", "HEAD"]);
+    std::fs::write(repo.join("file.txt"), "base\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "f2 revert"]);
+    let mid = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["checkout", "-qb", "side", &base]);
+    std::fs::write(repo.join("other.txt"), "side\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "side1"]);
+    git(&repo, &["checkout", "-q", "feature"]);
+    git(&repo, &["merge", "--no-ff", "-m", "merge-side", "side"]);
+    let max = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["checkout", "-q", "master"]);
+    std::fs::write(repo.join("file.txt"), "B2\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "into"]);
+    let into = git(&repo, &["rev-parse", "HEAD"]);
+    let commits = vec![
+        land_commit(&min, &[&base], "f1"),
+        land_commit(&mid, &[&min], "f2 revert"),
+        land_commit(&max, &[&mid], "merge-side"),
+    ];
+    let set = CommitSet {
+        revision: None,
+        commits: vec![0, 1, 2],
+        is_pick: false,
+    };
+    let mut io = Io::canned(&[]);
+    // The range replays `f1` onto the into state, conflicts, and fails:
+    // no reduce fallback retries it.
+    let err = git_execute_merge(
+        &repo,
+        &mut io,
+        &set,
+        &commits,
+        Some(&into),
+        true,
+        false,
+        &|_| Ok("Landed message".to_string()),
+    )
+    .unwrap_err();
+    assert_eq!(err, "Encountered a merge conflict.");
+}
+
+#[test]
+fn land12_raw_commit_round_trips_and_rebuilds() {
+    // Blob parse/render fidelity plus the into-empty rebuild: no parents
+    // under squash, author/committer/message bytes preserved.
+    let blob = "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+        parent 1111111111111111111111111111111111111111\n\
+        author Ada <ada@test> 1 +0000\n\
+        committer Ron <ron@test> 2 +0000\n\
+        \n\
+        subject\n\
+        \n\
+        body\n";
+    let raw = parse_raw_commit_blob(blob).unwrap();
+    assert_eq!(
+        raw.tree.as_deref(),
+        Some("4b825dc642cb6eb9a060e54bf8d69288fbee4904")
+    );
+    assert_eq!(
+        raw.parents,
+        vec!["1111111111111111111111111111111111111111".to_string()]
+    );
+    assert_eq!(raw.author.as_deref(), Some("Ada <ada@test> 1 +0000"));
+    assert_eq!(raw.committer.as_deref(), Some("Ron <ron@test> 2 +0000"));
+    assert_eq!(raw.message.as_deref(), Some("subject\n\nbody\n"));
+    assert_eq!(render_raw_commit_blob(&raw), blob);
+    assert_eq!(
+        render_raw_commit_blob(&RawCommit::empty()),
+        "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\n"
+    );
+    assert!(parse_raw_commit_blob("tree abc\ngpgsig xyz\n\nm\n").is_err());
+    assert!(parse_raw_commit_blob("tree a\ntree b\n\nm\n").is_err());
+    assert!(parse_raw_commit_blob("bogus\n").is_err());
+
+    // Into-empty squash: parentless, author from the max commit,
+    // committer left to the runner, message intact.
+    let repo = make_repo("land12-empty");
+    git(&repo, &["checkout", "-b", "feature"]);
+    let tip = commit_file(&repo, "f.txt", "f\n", "feature work");
+    let commits = vec![land_commit(&tip, &[], "feature work")];
+    let set = CommitSet {
+        revision: None,
+        commits: vec![0],
+        is_pick: false,
+    };
+    let mut io = Io::canned(&[]);
+    let cursor = git_execute_merge(&repo, &mut io, &set, &commits, None, true, false, &|_| {
+        Ok("Landed message".to_string())
+    })
+    .unwrap();
+    assert_eq!(
+        git(&repo, &["rev-list", "--parents", "-n1", &cursor])
+            .split_whitespace()
+            .count(),
+        1
+    );
+    assert_eq!(
+        git(&repo, &["log", "--format=%s", "-n1", &cursor]),
+        "Landed message"
+    );
+    assert_eq!(
+        git(&repo, &["log", "--format=%an <%ae>", "-n1", &cursor]),
+        "Land Test <land@test>"
+    );
+    // The committer is the runner, not the original author@date: with a
+    // distinct identity the commit still lands byte-identically.
+    let raw = git_read_raw_commit(&repo, &cursor).unwrap();
+    assert!(raw.parents.is_empty());
+    assert_eq!(raw.message.as_deref(), Some("Landed message\n"));
+}
+
+#[test]
+fn land33_hint_tracks_unpushed_sets() {
+    // `git_execute_merge` shows the hint exactly when earlier sets are
+    // still unpushed (first-set conflicts never hint, even unflagged).
+    let repo = make_repo("land33-hint");
+    let master = git(&repo, &["rev-parse", "master"]);
+    git(&repo, &["checkout", "-b", "feature"]);
+    std::fs::write(repo.join("file.txt"), "feature\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "feature work"]);
+    let tip = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["checkout", "-q", "master"]);
+    std::fs::write(repo.join("file.txt"), "master\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "master work"]);
+    let into = git(&repo, &["rev-parse", "HEAD"]);
+    let commits = vec![land_commit(&tip, &[&master], "feature work")];
+    let set = CommitSet {
+        revision: None,
+        commits: vec![0],
+        is_pick: false,
+    };
+    let mut io = Io::canned(&[]);
+    git_execute_merge(
+        &repo,
+        &mut io,
+        &set,
+        &commits,
+        Some(&into),
+        true,
+        false,
+        &|_| Ok("Landed".to_string()),
+    )
+    .unwrap_err();
+    assert!(!io.out.stdout.contains("--incremental"));
+    let mut io = Io::canned(&[]);
+    git_execute_merge(
+        &repo,
+        &mut io,
+        &set,
+        &commits,
+        Some(&into),
+        true,
+        true,
+        &|_| Ok("Landed".to_string()),
+    )
+    .unwrap_err();
+    assert!(io.out.stdout.contains("--incremental"));
+}
+
+#[test]
+fn land8_immutable_without_strategy_is_ambiguous() {
+    // Legacy `history.immutable` with no explicit strategy fails at merge
+    // time; `--strategy` or `arc.land.strategy` bypasses the check.
+    let dir = make_repo("land8-immutable");
+    std::fs::write(dir.join(".arcconfig"), r#"{"history.immutable": true}"#).unwrap();
+    let options = Options::default();
+    let mut io = Io::canned(&[]);
+    let err = confirm_legacy_strategy_configuration(&dir, &options, &mut io).unwrap_err();
+    assert_eq!(
+        err,
+        "Desired merge strategy is ambiguous, choose an explicit strategy."
+    );
+    assert!(io.out.stdout.contains("** MERGE STRATEGY IS AMBIGUOUS **"));
+
+    let flagged = Options {
+        strategy: Some("squash".to_string()),
+        ..Options::default()
+    };
+    let mut io = Io::canned(&[]);
+    assert!(confirm_legacy_strategy_configuration(&dir, &flagged, &mut io).is_ok());
+
+    std::fs::write(
+        dir.join(".arcconfig"),
+        r#"{"history.immutable": true, "arc.land.strategy": "merge"}"#,
+    )
+    .unwrap();
+    let mut io = Io::canned(&[]);
+    assert!(confirm_legacy_strategy_configuration(&dir, &options, &mut io).is_ok());
+
+    std::fs::write(dir.join(".arcconfig"), r#"{"history.immutable": false}"#).unwrap();
+    let mut io = Io::canned(&[]);
+    assert!(confirm_legacy_strategy_configuration(&dir, &options, &mut io).is_ok());
+
+    assert!(is_truthy_config(&serde_json::json!(true)));
+    assert!(!is_truthy_config(&serde_json::json!(false)));
+    assert!(is_truthy_config(&serde_json::json!("yes")));
+    assert!(!is_truthy_config(&serde_json::json!("")));
+    assert!(!is_truthy_config(&serde_json::json!("0")));
+    assert!(!is_truthy_config(&serde_json::json!(0)));
+    assert!(is_truthy_config(&serde_json::json!(1)));
+    assert!(!is_truthy_config(&serde_json::Value::Null));
+}
+
+#[test]
+fn land11_set_messages_prefetch_in_order() {
+    // Messages load for every set up front, in order; a later failure
+    // aborts the prefetch (no lazy per-set fetch mid-loop).
+    let calls: std::rc::Rc<std::cell::RefCell<Vec<i64>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let probe = calls.clone();
+    let call = move |method: &str, params: &serde_json::Value| {
+        assert_eq!(method, diff_submit::METHOD_GET_COMMIT_MESSAGE);
+        let id = params["revision_id"].as_i64().unwrap();
+        probe.borrow_mut().push(id);
+        if id == 12 {
+            return Err("boom".to_string());
+        }
+        Ok(serde_json::json!(format!("message {id}")))
+    };
+    let sets = vec![
+        CommitSet {
+            revision: Some(view(11, "accepted", "Accepted", false, "PHID-USER-a")),
+            commits: vec![0],
+            is_pick: false,
+        },
+        CommitSet {
+            revision: None,
+            commits: vec![1],
+            is_pick: false,
+        },
+        CommitSet {
+            revision: Some(view(12, "accepted", "Accepted", false, "PHID-USER-a")),
+            commits: vec![2],
+            is_pick: false,
+        },
+    ];
+    let commits = vec![
+        land_commit("aaa", &[], "one"),
+        land_commit("bbb", &[], "two"),
+        land_commit("ccc", &[], "three"),
+    ];
+    let raw = vec!["feature".to_string()];
+    let onto = vec!["master".to_string()];
+    let err = prefetch_set_messages(&raw, &onto, &commits, Some(&call), &sets).unwrap_err();
+    assert_eq!(err, "boom");
+    assert_eq!(*calls.borrow(), vec![11, 12]);
+
+    let ok = canned(vec![(
+        diff_submit::METHOD_GET_COMMIT_MESSAGE,
+        serde_json::json!("fetched"),
+    )]);
+    let messages = prefetch_set_messages(&raw, &onto, &commits, Some(&ok), &sets[..2]).unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0], "fetched");
+    assert!(messages[1].contains("Land feature"));
+    // Without a call every set synthesizes the local message.
+    let messages = prefetch_set_messages(&raw, &onto, &commits, None, &sets[..2]).unwrap();
+    assert!(messages[0].contains("Land feature"));
+}
+
+#[test]
+fn land36_prune_sorts_branches_globally_natural() {
+    // One `natcasesort()` over every collected branch: `b9` sorts before
+    // `b10` however the sets order them.
+    let branches = parse_for_each_ref("refs/heads/b10 h1\nrefs/heads/b9 h2\n").unwrap();
+    assert_eq!(
+        branches
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["b9", "b10"]
+    );
+
+    let repo = make_repo("land36-prune");
+    git(&repo, &["checkout", "-b", "b10"]);
+    let tip10 = commit_file(&repo, "f10.txt", "x\n", "ten");
+    git(&repo, &["checkout", "-q", "master"]);
+    git(&repo, &["checkout", "-b", "b9"]);
+    let tip9 = commit_file(&repo, "f9.txt", "x\n", "nine");
+    git(&repo, &["checkout", "-q", "master"]);
+    let commits = vec![
+        land_commit(&tip10, &[], "ten"),
+        land_commit(&tip9, &[], "nine"),
+    ];
+    let sets = vec![
+        CommitSet {
+            revision: None,
+            commits: vec![0],
+            is_pick: false,
+        },
+        CommitSet {
+            revision: None,
+            commits: vec![1],
+            is_pick: false,
+        },
+    ];
+    let mut io = Io::canned(&[]);
+    let deleted = git_prune_branches(&repo, &mut io, &sets, &commits);
+    assert_eq!(deleted, vec!["b9".to_string(), "b10".to_string()]);
+}
+
+#[test]
+#[cfg(unix)]
+fn land9_push_reports_failure_without_capturing() {
+    // The push inherits stdio and maps failure to `Push failed! ...`.
+    // Unix-only: the stub programs (`true`/`false`/`sh`) have no
+    // Windows counterparts.
+    let dir = temp_dir("land9-push");
+    let mut io = Io::canned(&[]);
+    assert!(
+        git_push_change_with(
+            &dir,
+            "true",
+            &[],
+            &mut io,
+            "origin",
+            &["master".to_string()],
+            "aaa",
+        )
+        .is_ok()
+    );
+    let err = git_push_change_with(
+        &dir,
+        "false",
+        &[],
+        &mut io,
+        "origin",
+        &["master".to_string()],
+        "aaa",
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        "Push failed! Fix the error and run \"arc land\" again."
+    );
+    assert!(io.out.stderr.contains("** PUSHING **"));
+
+    let hg_cmd = hg::HgCommand::custom("true", &[]);
+    assert!(hg_passthru_with(&dir, &hg_cmd, &["push"]));
+    let hg_cmd = hg::HgCommand::custom("false", &[]);
+    assert!(!hg_passthru_with(&dir, &hg_cmd, &["push"]));
+    // Prefix and encoding args ride along to custom programs.
+    let seen = temp_dir("land9-argv");
+    let marker = seen.join("argv");
+    let script = format!("echo \"$@\" > {}", marker.display());
+    let hg_cmd = hg::HgCommand::custom("sh", &["-c", &script, "ignored"]);
+    assert!(hg_passthru_with(&dir, &hg_cmd, &["push"]));
+    let argv = std::fs::read_to_string(&marker).unwrap();
+    assert!(argv.contains("--encoding utf-8 push"), "{argv}");
+}
+
+#[test]
+fn land34_externals_block_uses_php_texts() {
+    // The dirty-externals block and prompt match `saveLocalState()`
+    // verbatim; declining aborts.
+    let mut io = Io::canned(&["y"]);
+    confirm_dirty_externals(&mut io, &["sub/mod".to_string(), "lib/ext".to_string()]).unwrap();
+    assert!(
+        io.out.stdout.contains(
+            "2 submodule(s) have uncommitted or untracked changes:\n\n      sub/mod\n      lib/ext\n"
+        ),
+        "{}",
+        io.out.stdout
+    );
+    assert!(
+        io.out
+            .stdout
+            .contains("Ignore the changes to these 2 submodule(s) and continue? [Y/n]"),
+        "{}",
+        io.out.stdout
+    );
+    let mut io = Io::canned(&["n"]);
+    assert_eq!(
+        confirm_dirty_externals(&mut io, &["sub/mod".to_string()]).unwrap_err(),
+        ABORT
+    );
+}
+
+#[test]
+fn land34_ignore_hints_need_untracked_files() {
+    // Ignore hints print only when untracked files exist.
+    let dir = temp_dir("land34-hints");
+    let tracked_only = ChangeLists {
+        conflicts: Vec::new(),
+        externals: Vec::new(),
+        untracked: Vec::new(),
+        unstaged: vec!["edit.txt".to_string()],
+        uncommitted: Vec::new(),
+    };
+    let mut io = Io::canned(&[]);
+    assert!(push_uncommitted_banner(
+        &mut io,
+        &dir,
+        &tracked_only,
+        "HINT"
+    ));
+    assert!(!io.out.stdout.contains("HINT"));
+    let with_untracked = ChangeLists {
+        untracked: vec!["new.txt".to_string()],
+        ..tracked_only
+    };
+    let mut io = Io::canned(&[]);
+    assert!(push_uncommitted_banner(
+        &mut io,
+        &dir,
+        &with_untracked,
+        "HINT"
+    ));
+    assert!(io.out.stdout.contains("HINT"));
+}
+
+#[test]
+fn land35_hg_without_shelve_matches_php_error() {
+    // Without shelve support, hg fails with the verbatim PHP usage error
+    // (no prompt is shown first).
+    let dir = temp_dir("land35-hg");
+    let script = dir.join("fakehg.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nfor a in \"$@\"; do\n  case \"$a\" in\n    status) echo '? new.txt'; exit 0;;\n  esac\ndone\nexit 1\n",
+    )
+    .unwrap();
+    let hg_cmd = hg::HgCommand::custom("sh", &[script.to_str().unwrap()]);
+    let mut io = Io::canned(&["y"]);
+    let err = save_local_state_hg_with(&dir, &hg_cmd, &mut io).unwrap_err();
+    assert_eq!(
+        err,
+        "You can not continue with uncommitted changes. Commit or discard them before proceeding."
+    );
+}
+
+#[test]
+fn land14_saved_prompts_read_repo_root_config() {
+    // Saved prompts load from the repo-root `.git/arc/config` even when
+    // land runs in a subdirectory.
+    let repo = make_repo("land14-prompts");
+    let sub = repo.join("sub").join("dir");
+    std::fs::create_dir_all(&sub).unwrap();
+    let local = repo.join(".git").join("arc").join("config");
+    std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+    std::fs::write(
+        &local,
+        r#"{"prompts": [{"prompt": "k", "response": "yes"}]}"#,
+    )
+    .unwrap();
+    let saved = load_saved_prompts(&sub);
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved["k"].response, "yes");
+}
+
+#[test]
+fn land39_onto_config_validates_list_shape() {
+    // Natural-list objects parse in key order; anything else fails.
+    assert_eq!(
+        parse_onto_config(&serde_json::json!({"1": "b", "0": "a"})).unwrap(),
+        vec!["a".to_string(), "b".to_string()]
+    );
+    assert_eq!(
+        parse_onto_config(&serde_json::json!({"0": "a", "2": "c"})).unwrap_err(),
+        "Expected a natural list!"
+    );
+    assert_eq!(
+        parse_onto_config(&serde_json::json!([true])).unwrap_err(),
+        "Expected a string (at index \"0\"), found \"boolean\"."
+    );
+    assert_eq!(
+        parse_onto_config(&serde_json::json!([1.5])).unwrap_err(),
+        "Expected a string (at index \"0\"), found \"double\"."
+    );
+    assert_eq!(
+        parse_onto_config(&serde_json::json!([null])).unwrap_err(),
+        "Expected a string (at index \"0\"), found \"NULL\"."
+    );
+    assert_eq!(
+        parse_onto_config(&serde_json::json!([])).unwrap(),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn land40_unresolved_revision_echoes_raw_symbol() {
+    // `--revision D123` failures echo `D123`, not the digits.
+    let call = canned(vec![(
+        diff_submit::METHOD_REVISION_SEARCH,
+        serde_json::json!({"data": []}),
+    )]);
+    let err =
+        resolve_forced_revision_with_raw(&call, &RevisionSymbol::Id(123), "D123").unwrap_err();
+    assert_eq!(err, "Symbol \"D123\" does not identify a valid revision.");
+    let err = resolve_forced_revision(&call, &RevisionSymbol::Id(123)).unwrap_err();
+    assert_eq!(err, "Symbol \"123\" does not identify a valid revision.");
+}
+
+#[test]
+fn land15_invalid_symbol_fails_before_onto_output() {
+    // T1153 B21/B23: piped runs carry `--`.
+    // Resolution runs before onto/into selection: an invalid symbol
+    // fails with no target output at all.
+    let (repo, _bare) = repo_with_origin("land15-order");
+    git(&repo, &["checkout", "-b", "feature"]);
+    commit_file(&repo, "f.txt", "f\n", "feature work");
+    let mut io = Io::canned(&[]);
+    let err = execute_with_io(&repo, &args(&["--", "nope"]), &mut io).unwrap_err();
+    assert!(err.contains("nope"), "{err}");
+    assert!(!io.out.stderr.contains("ONTO"), "{}", io.out.stderr);
+    assert!(!io.out.stderr.contains("INTO"), "{}", io.out.stderr);
+}
+#[test]
+fn r10_land_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "LAND WORKFLOW\n\
+         \n\
+         land [options] -- [ref ...]\n\
+         Publish reviewed changes.\n\
+         \n\
+         Supports: git, git/p4, git/svn, hg\n\
+         \n\
+         Publish accepted revisions after review. This command is the last step in the\n\
+         standard Differential code review workflow.\n\
+         \n\
+         To publish changes in local branch or bookmark \"feature1\", you will usually\n\
+         run this command:\n\
+         \n\
+         \x20 $ arc land feature1\n\
+         \n\
+         This workflow merges and pushes changes associated with revisions that are\n\
+         ancestors of ref. Without ref, the current working copy state will be used.\n\
+         You can specify multiple ref arguments to publish multiple changes at once.\n\
+         \n\
+         A ref can be any symbol which identifies a commit: a branch name, a tag name,\n\
+         a bookmark name, a topic name, a raw commit hash, a symbolic reference, etc.\n\
+         \n\
+         When you provide a ref, all unpublished changes which are present in\n\
+         ancestors of that ref will be selected for publishing. (With the --pick flag,\n\
+         only the unpublished changes you directly reference will be selected.)\n\
+         \n\
+         For example, if you provide local branch \"feature3\" as a ref argument, that\n\
+         may also select the changes in \"feature1\" and \"feature2\" (if they are\n\
+         ancestors of \"feature3\"). If you stack changes in a single local branch, all\n\
+         commits in the stack may be selected.\n\
+         \n\
+         The workflow merges unpublished changes reachable from ref \"into\" some\n\
+         intermediate branch, then pushes the combined state \"onto\" some destination\n\
+         branch (or list of branches).\n\
+         \n\
+         (In Mercurial, the \"into\" and \"onto\" branches may be bookmarks instead.)\n\
+         \n\
+         In the most common case, there is only one \"onto\" branch (often \"master\" or\n\
+         \"default\" or some similar branch) and the \"into\" branch is the same branch.\n\
+         For example, it is common to merge local feature branch \"feature1\" into\n\
+         \"origin/master\", then push it onto \"origin/master\".\n\
+         \n\
+         The list of \"onto\" branches is selected by examining these sources in order:\n\
+         \n\
+         \x20 - the --onto flags;\n\
+         \x20 - the arc.land.onto configuration setting;\n\
+         \x20 - (in Git) the upstream of the branch targeted by the land operation,\n\
+         \x20   recursively;\n\
+         \x20 - or by falling back to a standard default:\n\
+         \x20   - (in Git) \"master\";\n\
+         \x20   - (in Mercurial) \"default\".\n\
+         \n\
+         The remote to push \"onto\" is selected by examining these sources in order:\n\
+         \n\
+         \x20 - the --onto-remote flag;\n\
+         \x20 - the arc.land.onto-remote configuration setting;\n\
+         \x20 - (in Git) the upstream of the current branch, recursively;\n\
+         \x20 - (in Git) the special \"p4\" remote which indicates a repository has\n\
+         \x20   been synchronized with Perforce;\n\
+         \x20 - or by falling back to a standard default:\n\
+         \x20   - (in Git) \"origin\";\n\
+         \x20   - (in Mercurial) \"default\".\n\
+         \n\
+         The branch to merge \"into\" is selected by examining these sources in order:\n\
+         \n\
+         \x20 - the --into flag;\n\
+         \x20 - the --into-empty flag;\n\
+         \x20 - or by falling back to the first \"onto\" branch.\n\
+         \n\
+         The remote to merge \"into\" is selected by examining these sources in order:\n\
+         \n\
+         \x20 - the --into-remote flag;\n\
+         \x20 - the --into-local flag (which disables fetching before merging);\n\
+         \x20 - or by falling back to the \"onto\" remote.\n\
+         \n\
+         After selecting remotes and branches, the commits which will land are\n\
+         printed.\n\
+         \n\
+         With --preview, execution stops here, before the change is merged.\n\
+         \n\
+         The \"into\" branch is fetched from the \"into\" remote (unless --into-local or\n\
+         --into-empty are specified) and the changes are merged into the state in the\n\
+         \"into\" branch according to the selected merge strategy.\n\
+         \n\
+         The default merge strategy is \"squash\", which produces a single commit from\n\
+         all local commits for each change. A different strategy can be selected with\n\
+         the --strategy flag.\n\
+         \n\
+         The resulting merged change will be given an up-to-date commit message\n\
+         describing the final state of the revision in Differential.\n\
+         \n\
+         With --hold, execution stops here, before the change is pushed.\n\
+         \n\
+         The change is pushed onto all of the \"onto\" branches in the \"onto\" remote.\n\
+         \n\
+         If you are landing multiple changes, they are normally all merged locally and\n\
+         then all pushed in a single operation. Instead, you can merge and push them\n\
+         one at a time with --incremental.\n\
+         \n\
+         Under merge strategies which mutate history (including the default \"squash\"\n\
+         strategy), local refs which descend from commits that were published are now\n\
+         updated. For example, if you land \"feature4\", local branches \"feature5\" and\n\
+         \"feature6\" may now be rebased on the published version of the change.\n\
+         \n\
+         Once everything has been pushed, cleanup occurs. Consulting mystical sources\n\
+         of power, the workflow makes a guess about what state you wanted to end up in\n\
+         after the process finishes. The working copy is put into that state.\n\
+         \n\
+         Any obsolete refs that point at commits which were published are deleted,\n\
+         unless the --keep-branches flag is passed.\n\
+         \n\
+         \x20     --hold\n\
+         \x20         Prepare the changes to be pushed, but do not actually push them.\n\
+         \n\
+         \x20     --incremental\n\
+         \x20         When landing multiple revisions at once, push and rebase after each\n\
+         \x20         merge completes instead of waiting until all merges are completed\n\
+         \x20         to push.\n\
+         \x20         \n\
+         \x20         This is slower than the default behavior and not atomic, but may\n\
+         \x20         make it easier to resolve conflicts and land complicated changes by\n\
+         \x20         allowing you to make progress one step at a time.\n\
+         \n\
+         \x20     --into commit-ref\n\
+         \x20         Specify the state to merge into. By default, this is the same as\n\
+         \x20         the \"onto\" ref.\n\
+         \n\
+         \x20     --into-empty\n\
+         \x20         Merge into the empty state instead of an existing state. This mode\n\
+         \x20         is primarily useful when creating a new repository, and selected\n\
+         \x20         automatically if the \"onto\" ref does not exist and the \"into\" state\n\
+         \x20         is not specified.\n\
+         \n\
+         \x20     --into-local\n\
+         \x20         Use the local \"into\" ref state instead of fetching it from a remote.\n\
+         \n\
+         \x20     --into-remote remote-name\n\
+         \x20         Specifies the remote to fetch the \"into\" ref from. By default, this\n\
+         \x20         is the same as the \"onto\" remote.\n\
+         \n\
+         \x20     --keep-branches\n\
+         \x20         Keep local branches around after changes are pushed. By default,\n\
+         \x20         local branches are deleted after the changes they contain are\n\
+         \x20         published.\n\
+         \n\
+         \x20     --onto branch-name\n\
+         \x20         After merging, push changes onto a specified branch.\n\
+         \x20         \n\
+         \x20         Specifying this flag multiple times will push to multiple branches.\n\
+         \x20         \n\
+         \x20         Related configuration: arc.land.onto\n\
+         \n\
+         \x20     --onto-remote remote-name\n\
+         \x20         Push to a remote other than the default.\n\
+         \x20         \n\
+         \x20         Related configuration: arc.land.onto-remote\n\
+         \n\
+         \x20     --pick\n\
+         \x20         Land only the changes directly named by arguments, instead of all\n\
+         \x20         reachable ancestors.\n\
+         \n\
+         \x20     --preview\n\
+         \x20         Show the changes that will land. Does not modify the working copy\n\
+         \x20         or the remote.\n\
+         \n\
+         \x20     --revision revision-identifier\n\
+         \x20         Land a specific revision, rather than determining revisions\n\
+         \x20         automatically from the commits that are landing.\n\
+         \n\
+         \x20     --strategy strategy-name\n\
+         \x20         Merge using a particular strategy. Supported strategies are\n\
+         \x20         \"squash\" and \"merge\".\n\
+         \x20         \n\
+         \x20         The \"squash\" strategy collapses multiple local commits into a\n\
+         \x20         single commit when publishing. It produces a linear published\n\
+         \x20         history (but discards local checkpoint commits). This is the\n\
+         \x20         default strategy.\n\
+         \x20         \n\
+         \x20         The \"merge\" strategy generates a merge commit when publishing that\n\
+         \x20         retains local checkpoint commits (but produces a nonlinear\n\
+         \x20         published history). Select this strategy if you do not want \"arc\n\
+         \x20         land\" to discard checkpoint commits.\n\
+         \x20         \n\
+         \x20         Related configuration: arc.land.strategy\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `execute_with_io` pushes the same text with the IO ANSI mode.
+    assert!(usage_text(true).contains("LAND WORKFLOW"));
+}
+
+#[test]
+fn b21_land_requires_terminator_when_piped() {
+    // T1153 B21/B23: piped without `--` reports the terminator, even
+    // for `--help` and empty argv. Unknown flags still report first.
+    assert_eq!(
+        parse_options_with_tty(&args(&[]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    assert_eq!(
+        parse_options_with_tty(&args(&["--help"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    assert_eq!(
+        parse_options_with_tty(&args(&["--preview"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    let err = parse_options_with_tty(&args(&["--nope"]), false).unwrap_err();
+    assert_eq!(err, "Unknown argument 'nope'. Try 'arc help'.");
+    assert!(
+        parse_options_with_tty(&args(&["--"]), false)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        parse_options_with_tty(&args(&["--preview", "--", "feature"]), false)
+            .unwrap()
+            .is_some()
+    );
+    assert!(parse_options_with_tty(&args(&[]), true).unwrap().is_some());
+    assert_eq!(
+        crate::help::MISSING_TERMINATOR,
+        "Missing required \"--\" in argument list."
+    );
+}
+
+#[test]
+fn b23_land_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help land`.
+    let text = usage_text(false);
+    assert!(
+        text.starts_with("LAND WORKFLOW\n"),
+        "{}",
+        &text[..200.min(text.len())]
+    );
+    assert!(text.contains("Publish reviewed changes."), "{text}");
+    assert!(text.contains("--strategy"), "{text}");
+    assert!(text.contains("--onto"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }

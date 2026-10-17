@@ -1,5 +1,7 @@
 //! `export`/`patch` flows through the wired library.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -76,6 +78,30 @@ impl Drop for Fixture {
 
 fn argv(words: &[&str]) -> Vec<String> {
     words.iter().map(|s| s.to_string()).collect()
+}
+
+/// Owned HOME with a token for `conduit_base` (T1153 EXPORT-E30 harness
+/// for conduit-backed CLI paths).
+fn upx_home_with_token(tag: &str, conduit_base: &str) -> (Fixture, common::HomeGuard) {
+    let home = Fixture::named(tag);
+    let after_scheme = conduit_base.split("://").nth(1).unwrap_or(conduit_base);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    let scheme = conduit_base.split("://").next().unwrap_or("http");
+    let key = format!("{scheme}://{authority}/api/");
+    std::fs::write(
+        home.path().join(".arcrc"),
+        format!(r#"{{"hosts": {{"{key}": {{"token": "t"}}}}}}"#),
+    )
+    .unwrap();
+    let guard = common::with_owned_home(home.path().to_path_buf());
+    (home, guard)
+}
+
+fn upx_user_routes() -> Vec<&'static str> {
+    vec![
+        r#"{"result": {"phid": "PHID-USER-1"}, "error_code": null}"#,
+        r#"{"result": {"1": {"realName": "Ada"}}, "error_code": null}"#,
+    ]
 }
 
 /// Serve canned response bodies in order; returns the base URI and the
@@ -162,6 +188,8 @@ fn patch_rejects_bad_args_without_repo() {
 
 #[test]
 fn patch_help_succeeds() {
+    // T1153 B21/B23: `--help` renders the generated workflow help
+    // (classic: no `--` needed).
     let fx = Fixture::named("help");
     assert_eq!(
         patch::run_in(fx.path(), &argv(&["--help"])),
@@ -172,7 +200,8 @@ fn patch_help_succeeds() {
         ExitCode::SUCCESS
     );
     let out = patch::execute(fx.path(), &argv(&["--help"])).unwrap();
-    assert!(out.stdout.contains("usage: arc patch"), "{}", out.stdout);
+    // T1153 R10: `--help` renders the generated workflow help.
+    assert!(out.stdout.contains("PATCH WORKFLOW"), "{}", out.stdout);
 }
 
 #[test]
@@ -314,19 +343,25 @@ fn patch_apply_requires_repo() {
 }
 
 #[test]
-fn patch_fetches_revision_through_querydiffs_then_getrawdiff() {
-    let query = r#"{"result": {"77": {"id": 77}}, "error_code": null}"#;
-    let raw = r#"{"result": "diff --git a/x\n", "error_code": null}"#;
-    let (base, rx) = serve_seq(vec![query, raw]);
+fn patch_renders_revision_from_querydiffs_dicts() {
+    let query = r#"{"result": {"77": {"id": "77", "changes": [
+        {"type": "2", "fileType": "1", "oldPath": "a.txt", "currentPath": "a.txt",
+         "hunks": [{"oldOffset": "1", "oldLength": "1", "newOffset": "1",
+                    "newLength": "1", "corpus": "-a\n+b\n"}]}
+      ]}}, "error_code": null}"#;
+    let (base, rx) = serve_seq(vec![query]);
     let client = client_for(&base);
     let call = patch_call(&client);
 
     let bundle = patch::fetch_revision_bundle(&call, 123).unwrap();
-    assert_eq!(bundle.text, "diff --git a/x\n");
+    assert_eq!(
+        bundle.text,
+        "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+b\n\n"
+    );
     assert_eq!(bundle.revision_id, Some(123));
 
     let seen = seen_requests(&rx);
-    assert_eq!(seen.len(), 2);
+    assert_eq!(seen.len(), 1);
     assert!(
         seen[0].0.starts_with("POST /api/differential.querydiffs "),
         "{}",
@@ -334,36 +369,32 @@ fn patch_fetches_revision_through_querydiffs_then_getrawdiff() {
     );
     assert!(seen[0].1.contains("revisionIDs"), "{}", seen[0].1);
     assert!(seen[0].1.contains("123"), "{}", seen[0].1);
-    assert!(
-        seen[1].0.starts_with("POST /api/differential.getrawdiff "),
-        "{}",
-        seen[1].0
-    );
-    assert!(seen[1].1.contains("77"), "{}", seen[1].1);
 }
 
 #[test]
 fn patch_fetches_single_diff() {
-    let raw = r#"{"result": "patch-bytes\n", "error_code": null}"#;
-    let query = r#"{"result": {"9": {"id": 9}}, "error_code": null}"#;
-    let (base, rx) = serve_seq(vec![query, raw]);
+    let query = r#"{"result": {"9": {"id": "9", "changes": [
+        {"type": "2", "fileType": "1", "oldPath": "a.txt", "currentPath": "a.txt",
+         "hunks": [{"oldOffset": "1", "oldLength": "1", "newOffset": "1",
+                    "newLength": "1", "corpus": "-a\n+b\n"}]}
+      ]}}, "error_code": null}"#;
+    let (base, rx) = serve_seq(vec![query]);
     let client = client_for(&base);
     let call = patch_call(&client);
 
     let bundle = patch::fetch_diff_bundle(&call, 9).unwrap();
-    assert_eq!(bundle.text, "patch-bytes\n");
+    assert!(
+        bundle.text.contains("@@ -1 +1 @@\n-a\n+b\n"),
+        "{}",
+        bundle.text
+    );
 
     let seen = seen_requests(&rx);
-    assert_eq!(seen.len(), 2);
+    assert_eq!(seen.len(), 1);
     assert!(
         seen[0].0.starts_with("POST /api/differential.querydiffs "),
         "{}",
         seen[0].0
-    );
-    assert!(
-        seen[1].0.starts_with("POST /api/differential.getrawdiff "),
-        "{}",
-        seen[1].0
     );
 }
 
@@ -381,23 +412,44 @@ fn patch_rejects_unknown_revision() {
 
 #[test]
 fn export_git_and_unified_from_working_copy() {
+    // T1153 EXPORT-E30/E2/E5/E6: local text exports need conduit, cover
+    // the committed base..HEAD range, and render from the bundle.
     let fx = Fixture::named("export");
     fx.init_repo();
     fx.write("uf.txt", "a\nb\n");
     fx.commit_all("one");
     fx.write("uf.txt", "a\nB\n");
+    fx.commit_all("two");
+    let mut canned = upx_user_routes();
+    canned.extend(upx_user_routes());
+    let (base, rx) = serve_seq(canned);
+    let (_home, _guard) = upx_home_with_token("export-home", &base);
 
-    let git_out = export::execute(fx.path(), &argv(&["--git"])).unwrap();
+    let git_out = export::execute(
+        fx.path(),
+        &argv(&["--git", "--conduit-uri", &base, "HEAD~1"]),
+    )
+    .unwrap();
     assert!(
         git_out.contains("diff --git a/uf.txt b/uf.txt"),
         "{git_out}"
     );
     assert!(git_out.contains("-b\n+B"), "{git_out}");
 
-    let uni_out = export::execute(fx.path(), &argv(&["--unified"])).unwrap();
-    assert!(uni_out.contains("diff --git uf.txt uf.txt"), "{uni_out}");
-    assert!(!uni_out.contains("a/uf.txt"), "{uni_out}");
+    let uni_out = export::execute(
+        fx.path(),
+        &argv(&["--unified", "--conduit-uri", &base, "HEAD~1"]),
+    )
+    .unwrap();
+    assert!(uni_out.contains("Index: uf.txt"), "{uni_out}");
+    assert!(
+        uni_out.contains("==================================================================="),
+        "{uni_out}"
+    );
     assert!(uni_out.contains("--- uf.txt"), "{uni_out}");
+    assert!(uni_out.contains("+++ uf.txt"), "{uni_out}");
+    assert!(!uni_out.contains("diff --git"), "{uni_out}");
+    assert_eq!(seen_requests(&rx).len(), 4);
 }
 
 #[test]
@@ -409,11 +461,23 @@ fn export_honors_explicit_base() {
     fx.write("f.txt", "one\ntwo\n");
     fx.commit_all("two");
 
-    let out = export::execute(fx.path(), &argv(&["--git", &first])).unwrap();
+    // T1153 EXPORT-E30/E3: conduit first; explicit bases merge with HEAD.
+    let (base, rx) = serve_seq(upx_user_routes());
+    let (_home, _guard) = upx_home_with_token("base-home", &base);
+    let out =
+        export::execute(fx.path(), &argv(&["--git", "--conduit-uri", &base, &first])).unwrap();
     assert!(out.contains("+two"), "{out}");
 
-    let err = export::execute(fx.path(), &argv(&["--git", "does-not-exist"])).unwrap_err();
-    assert!(!err.is_empty());
+    let err = export::execute(
+        fx.path(),
+        &argv(&["--git", "--conduit-uri", &base, "does-not-exist"]),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("Unable to find any git commit named 'does-not-exist'"),
+        "{err}"
+    );
+    assert_eq!(seen_requests(&rx).len(), 2);
 }
 
 #[test]
@@ -468,8 +532,18 @@ fn export_single_diff_through_conduit() {
 
 #[test]
 fn export_local_requires_repo() {
+    // T1153 EXPORT-E30: without conduit config the conduit error wins...
     let fx = Fixture::named("exnorepo");
-    let err = export::execute(fx.path(), &argv(&["--git"])).unwrap_err();
+    let err = export::execute(
+        fx.path(),
+        &argv(&["--git", "--conduit-uri", "https://export-e30.invalid/"]),
+    )
+    .unwrap_err();
+    assert!(err.contains("no token"), "{err}");
+    // ...while configured conduit reaches the working-copy check.
+    let (base, _rx) = serve_seq(vec![]);
+    let (_home, _guard) = upx_home_with_token("exnorepo-home", &base);
+    let err = export::execute(fx.path(), &argv(&["--git", "--conduit-uri", &base])).unwrap_err();
     assert!(err.contains("working copy"), "{err}");
 }
 

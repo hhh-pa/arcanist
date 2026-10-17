@@ -68,53 +68,58 @@ fn current_branch(dir: &Path) -> String {
 
 #[test]
 fn parses_symbol_and_start_forms() {
+    // T1153 B21/B23: TTY runs need no `--`.
     assert_eq!(
-        parse_args(&args(&["feature"])),
+        parse_args_with_tty(&args(&["feature"]), true),
         ParseOutcome::Args(Options {
             start: None,
             symbol: "feature".to_string(),
         })
     );
     assert_eq!(
-        parse_args(&args(&["--start", "main", "feature"])),
+        parse_args_with_tty(&args(&["--start", "main", "feature"]), true),
         ParseOutcome::Args(Options {
             start: Some("main".to_string()),
             symbol: "feature".to_string(),
         })
     );
     assert_eq!(
-        parse_args(&args(&["--start=HEAD~1", "--", "feature"])),
+        parse_args_with_tty(&args(&["--start=HEAD~1", "--", "feature"]), true),
         ParseOutcome::Args(Options {
             start: Some("HEAD~1".to_string()),
             symbol: "feature".to_string(),
         })
     );
-    assert_eq!(parse_args(&args(&["--help"])), ParseOutcome::Help);
+    assert_eq!(
+        parse_args_with_tty(&args(&["--help"]), true),
+        ParseOutcome::Help
+    );
 }
 
 #[test]
 fn rejects_missing_extra_and_empty_symbols() {
+    // T1153 B21/B23: TTY runs need no `--`.
     assert_eq!(
-        parse_args(&args(&[])),
+        parse_args_with_tty(&args(&[]), true),
         ParseOutcome::Error(
             "Provide a branch, bookmark, task, or revision name to begin or resume work on."
                 .to_string()
         )
     );
     assert_eq!(
-        parse_args(&args(&["a", "b"])),
+        parse_args_with_tty(&args(&["a", "b"]), true),
         ParseOutcome::Error("Too many arguments: provide exactly one argument.".to_string())
     );
     assert_eq!(
-        parse_args(&args(&[""])),
+        parse_args_with_tty(&args(&[""]), true),
         ParseOutcome::Error("Provide a nonempty symbol to begin or resume work on.".to_string())
     );
     assert_eq!(
-        parse_args(&args(&["--start"])),
+        parse_args_with_tty(&args(&["--start"]), true),
         ParseOutcome::Error("--start requires a value".to_string())
     );
     assert_eq!(
-        parse_args(&args(&["--bogus", "a"])),
+        parse_args_with_tty(&args(&["--bogus", "a"]), true),
         ParseOutcome::Error("unknown flag '--bogus'".to_string())
     );
 }
@@ -134,6 +139,7 @@ fn classifies_revision_and_task_monograms() {
 
 #[test]
 fn resolves_branches_commits_and_default_start() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = init_repo("resolve");
     commit_file(tmp.path(), "f.txt", "one");
     let branch = current_branch(tmp.path());
@@ -150,12 +156,13 @@ fn resolves_branches_commits_and_default_start() {
 
 #[test]
 fn creates_and_resumes_branches() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = init_repo("create");
     commit_file(tmp.path(), "f.txt", "one");
     let first = current_branch(tmp.path());
 
     assert_eq!(
-        run_in(tmp.path(), &args(&["feature"])),
+        run_in(tmp.path(), &args(&["--", "feature"])),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(current_branch(tmp.path()), "feature");
@@ -167,7 +174,7 @@ fn creates_and_resumes_branches() {
     );
 
     assert_eq!(
-        run_in(tmp.path(), &args(&[&first])),
+        run_in(tmp.path(), &args(&["--", first.as_str()])),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(current_branch(tmp.path()), first);
@@ -175,20 +182,24 @@ fn creates_and_resumes_branches() {
 
 #[test]
 fn creates_from_explicit_startpoints() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = init_repo("start");
     commit_file(tmp.path(), "f.txt", "one");
     commit_file(tmp.path(), "f.txt", "two");
     let base = git(tmp.path(), &["rev-parse", "HEAD~1"]);
 
     assert_eq!(
-        run_in(tmp.path(), &args(&["--start", "HEAD~1", "older"])),
+        run_in(tmp.path(), &args(&["--start", "HEAD~1", "--", "older"])),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(git(tmp.path(), &["rev-parse", "older"]), base);
 
     git(tmp.path(), &["checkout", "--quiet", "older"]);
     assert_eq!(
-        run_in(tmp.path(), &args(&[&format!("--start={base}"), "from-sha"])),
+        run_in(
+            tmp.path(),
+            &args(&[&format!("--start={base}"), "--", "from-sha"])
+        ),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(git(tmp.path(), &["rev-parse", "from-sha"]), base);
@@ -196,10 +207,14 @@ fn creates_from_explicit_startpoints() {
 
 #[test]
 fn rejects_bad_startpoints_and_conduit_symbols() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = init_repo("reject");
     commit_file(tmp.path(), "f.txt", "one");
     assert_eq!(
-        run_in(tmp.path(), &args(&["--start", "no-such-rev", "feature"])),
+        run_in(
+            tmp.path(),
+            &args(&["--start", "no-such-rev", "--", "feature"])
+        ),
         std::process::ExitCode::FAILURE
     );
     // Unknown revision/task symbols fail through the mocked search (no
@@ -209,17 +224,17 @@ fn rejects_bad_startpoints_and_conduit_symbols() {
     };
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["D123"]), Some(&empty), &mut input),
+        run_in_with(tmp.path(), &args(&["--", "D123"]), Some(&empty), &mut input),
         std::process::ExitCode::FAILURE
     );
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["T1"]), Some(&empty), &mut input),
+        run_in_with(tmp.path(), &args(&["--", "T1"]), Some(&empty), &mut input),
         std::process::ExitCode::FAILURE
     );
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["123"]), Some(&empty), &mut input),
+        run_in_with(tmp.path(), &args(&["--", "123"]), Some(&empty), &mut input),
         std::process::ExitCode::FAILURE
     );
     // None of the failures created a branch.
@@ -229,24 +244,42 @@ fn rejects_bad_startpoints_and_conduit_symbols() {
 
 #[test]
 fn requires_a_supported_working_copy() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = TempDir::new("plain");
     assert_eq!(
-        run_in(tmp.path(), &args(&["feature"])),
+        run_in(tmp.path(), &args(&["--", "feature"])),
         std::process::ExitCode::FAILURE
     );
+    // Hermetic: real `hg` treats a bare `.hg` as operable (`log`
+    // prints the null node, `bookmark` exits 0), so the system binary
+    // would succeed where hg is installed (Ubuntu CI). Drive the hg
+    // engine through an always-failing command instead (T1153 WORK-HG).
     let hg = TempDir::new("hg");
     std::fs::create_dir(hg.path().join(".hg")).unwrap();
+    let options = match parse_args_with_tty(&args(&["feature"]), true) {
+        ParseOutcome::Args(options) => options,
+        _ => panic!("feature parses"),
+    };
+    let hg_cmd = crate::hg::HgCommand::custom("false", &[]);
+    let mut input = std::io::Cursor::new(b"");
     assert_eq!(
-        run_in(hg.path(), &args(&["feature"])),
+        run_hg_in_with_cmd(hg.path(), &hg_cmd, &options, None, &mut input),
         std::process::ExitCode::FAILURE
     );
 }
 
 #[test]
 fn run_reports_help_and_usage_errors() {
-    assert_eq!(run(&args(&["--help"])), std::process::ExitCode::SUCCESS);
-    assert_eq!(run(&args(&[])), std::process::ExitCode::FAILURE);
-    assert_eq!(run(&args(&["a", "b"])), std::process::ExitCode::FAILURE);
+    // T1153 B21/B23: piped runs carry `--` to reach each arm.
+    assert_eq!(
+        run(&args(&["--help", "--"])),
+        std::process::ExitCode::SUCCESS
+    );
+    assert_eq!(run(&args(&["--"])), std::process::ExitCode::FAILURE);
+    assert_eq!(
+        run(&args(&["a", "b", "--"])),
+        std::process::ExitCode::FAILURE
+    );
 }
 
 #[test]
@@ -375,6 +408,8 @@ fn renders_ref_views_and_ambiguous_block() {
         epoch: 9,
         summary: "work".to_string(),
         message: "work".to_string(),
+        // T1153 WORK-HG: git tips render as branches.
+        marker_type: "branch".to_string(),
     };
     assert_eq!(
         marker_ref_view(&tip, 80, false),
@@ -475,12 +510,13 @@ fn stash_list(dir: &Path) -> String {
 
 #[test]
 fn stashes_dirty_trees_around_branch_creation() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = init_repo("stash");
     commit_file(tmp.path(), "f.txt", "one");
     std::fs::write(tmp.path().join("extra.txt"), "untracked\n").unwrap();
     let mut input = std::io::Cursor::new(b"y\n");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["feature"]), None, &mut input),
+        run_in_with(tmp.path(), &args(&["--", "feature"]), None, &mut input),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(current_branch(tmp.path()), "feature");
@@ -497,12 +533,13 @@ fn stashes_dirty_trees_around_branch_creation() {
 
 #[test]
 fn declining_the_stash_aborts() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = init_repo("nostash");
     commit_file(tmp.path(), "f.txt", "one");
     std::fs::write(tmp.path().join("f.txt"), "dirty\n").unwrap();
     let mut input = std::io::Cursor::new(b"n\n");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["feature"]), None, &mut input),
+        run_in_with(tmp.path(), &args(&["--", "feature"]), None, &mut input),
         std::process::ExitCode::FAILURE
     );
     assert!(!branch_exists(tmp.path(), "feature"));
@@ -514,6 +551,7 @@ fn declining_the_stash_aborts() {
 
 #[test]
 fn failures_restore_state_and_stash() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = init_repo("restore");
     commit_file(tmp.path(), "f.txt", "one");
     let first = current_branch(tmp.path());
@@ -522,7 +560,7 @@ fn failures_restore_state_and_stash() {
     // stash; the failure must restore the branch and the stashed change.
     let mut input = std::io::Cursor::new(b"y\n");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["HEAD"]), None, &mut input),
+        run_in_with(tmp.path(), &args(&["--", "HEAD"]), None, &mut input),
         std::process::ExitCode::FAILURE
     );
     assert_eq!(current_branch(tmp.path()), first);
@@ -535,6 +573,7 @@ fn failures_restore_state_and_stash() {
 
 #[test]
 fn missing_tasks_fail_and_existing_tasks_hit_todo() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = init_repo("tasks");
     commit_file(tmp.path(), "f.txt", "one");
     let empty = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
@@ -542,7 +581,7 @@ fn missing_tasks_fail_and_existing_tasks_hit_todo() {
     };
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["T1"]), Some(&empty), &mut input),
+        run_in_with(tmp.path(), &args(&["--", "T1"]), Some(&empty), &mut input),
         std::process::ExitCode::FAILURE
     );
     // Monograms resolve to ID 0 upstream, so they never match, even when
@@ -550,12 +589,12 @@ fn missing_tasks_fail_and_existing_tasks_hit_todo() {
     let call = search_mock();
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["T7"]), Some(&call), &mut input),
+        run_in_with(tmp.path(), &args(&["--", "T7"]), Some(&call), &mut input),
         std::process::ExitCode::FAILURE
     );
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["7"]), Some(&call), &mut input),
+        run_in_with(tmp.path(), &args(&["--", "7"]), Some(&call), &mut input),
         std::process::ExitCode::FAILURE
     );
 }
@@ -569,6 +608,7 @@ fn commit_with_footer(dir: &Path, name: &str, footer: &str) {
 
 #[test]
 fn revision_symbols_switch_to_the_associated_branch() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = init_repo("revwork");
     commit_file(tmp.path(), "f.txt", "one");
     let first = current_branch(tmp.path());
@@ -579,7 +619,7 @@ fn revision_symbols_switch_to_the_associated_branch() {
     let call = search_mock();
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["123"]), Some(&call), &mut input),
+        run_in_with(tmp.path(), &args(&["--", "123"]), Some(&call), &mut input),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(current_branch(tmp.path()), "feature");
@@ -587,13 +627,14 @@ fn revision_symbols_switch_to_the_associated_branch() {
 
 #[test]
 fn unassociated_revisions_fail_without_switching() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = init_repo("revnone");
     commit_file(tmp.path(), "f.txt", "one");
     let first = current_branch(tmp.path());
     let call = search_mock();
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["123"]), Some(&call), &mut input),
+        run_in_with(tmp.path(), &args(&["--", "123"]), Some(&call), &mut input),
         std::process::ExitCode::FAILURE
     );
     assert_eq!(current_branch(tmp.path()), first);
@@ -615,6 +656,7 @@ fn commit_at_date(dir: &Path, name: &str, footer: &str, date: &str) {
 
 #[test]
 fn ambiguous_revisions_pick_the_most_recent_branch() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = init_repo("revamb");
     commit_file(tmp.path(), "f.txt", "one");
     let first = current_branch(tmp.path());
@@ -628,7 +670,7 @@ fn ambiguous_revisions_pick_the_most_recent_branch() {
     let call = search_mock();
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["123"]), Some(&call), &mut input),
+        run_in_with(tmp.path(), &args(&["--", "123"]), Some(&call), &mut input),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(current_branch(tmp.path()), "newer");
@@ -636,6 +678,7 @@ fn ambiguous_revisions_pick_the_most_recent_branch() {
 
 #[test]
 fn monogram_symbols_never_match_upstream() {
+    // T1153 B21/B23: piped runs carry `--`.
     let tmp = init_repo("revmono");
     commit_file(tmp.path(), "f.txt", "one");
     let first = current_branch(tmp.path());
@@ -646,7 +689,7 @@ fn monogram_symbols_never_match_upstream() {
     let call = search_mock();
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
-        run_in_with(tmp.path(), &args(&["D123"]), Some(&call), &mut input),
+        run_in_with(tmp.path(), &args(&["--", "D123"]), Some(&call), &mut input),
         std::process::ExitCode::FAILURE
     );
     assert_eq!(current_branch(tmp.path()), first);
@@ -672,4 +715,371 @@ fn save_and_restore_roundtrips_branches() {
         git(tmp.path(), &["rev-parse", "HEAD"]),
         git(tmp.path(), &["rev-parse", &detached.commit])
     );
+}
+// T1153 WORK-HG: hg tests use an inline `sh` fake (no `hg` binary in
+// CI), like `land35_hg_without_shelve_matches_php_error`.
+fn hg_fake_script() -> &'static str {
+    // NOTE: the `log` arm dispatches on fixture presence, not on the
+    // `--template` value: matching `{desc}` in sh fails under Git
+    // Bash on Windows (observed: footer association came back
+    // empty), while plain `cat`/`printf` works everywhere. The
+    // single `.fakehg-msg` test then also sees message bytes as the
+    // canonical node; its hash-miss still holds and `commit` is
+    // unasserted there (T1153 WORK-HG).
+    "#!/bin/sh\necho \"$*\" >> .fakehg.log\nargs=\"$*\"\ncase \"$args\" in\n  *--encoding*) shift 2 2>/dev/null || true;;\nesac\nsub=\"\"\nfor a in \"$@\"; do case \"$a\" in --encoding|--config|extensions.*) continue;; -*) continue;; *) sub=\"$a\"; break;; esac; done\nif [ -e \".fakehg-fail-$sub\" ]; then exit 1; fi\nNODE=\"0123456789abcdef0123456789abcdef01234567\"\ncase \"$sub\" in\n  branch) if [ \"$args\" != \"${args%--force*}\" ]; then exit 0; fi\n    if [ -e .fakehg-branch ]; then cat .fakehg-branch; else echo \"default\"; fi;;\n  bookmarks) if [ -e .fakehg-bookmarks ]; then cat .fakehg-bookmarks; fi;;\n  branches) if [ -e .fakehg-branches ]; then cat .fakehg-branches; fi;;\n  status) if [ -e .fakehg-status ]; then cat .fakehg-status; fi;;\n  log) if [ -e .fakehg-msg ]; then cat .fakehg-msg; else printf '%s' \"$NODE\"; fi;;\n  update|checkout|bookmark) exit 0;;\n  shelve|unshelve) if [ -e .fakehg-no-shelve ]; then exit 1; fi; exit 0;;\n  *) exit 0;;\nesac\nexit 0\n"
+}
+
+fn hg_test_repo(tag: &str) -> (TempDir, crate::hg::HgCommand) {
+    let tmp = TempDir::new(tag);
+    std::fs::create_dir_all(tmp.path().join(".hg")).unwrap();
+    let script = tmp.path().join("fakehg.sh");
+    std::fs::write(&script, hg_fake_script()).unwrap();
+    let hg_cmd = crate::hg::HgCommand::custom("sh", &[&script.to_string_lossy()]);
+    (tmp, hg_cmd)
+}
+
+fn hg_read_log(dir: &Path) -> String {
+    std::fs::read_to_string(dir.join(".fakehg.log")).unwrap_or_default()
+}
+
+#[test]
+fn hg_default_start_is_dot() {
+    // T1153 WORK-HG: `ArcanistMercurialAPI.php:451-453` returns `.`.
+    assert_eq!(hg_default_start(), ".");
+    assert_eq!(crate::hg::get_working_copy_revision(), ".");
+}
+
+#[test]
+fn hg_parses_bookmarks_and_active_mark() {
+    // T1153 WORK-HG: `*` marks the active bookmark.
+    assert_eq!(
+        parse_hg_bookmarks_active("  feat  3:abc\n* active  5:def\n"),
+        Some("active".to_string())
+    );
+    assert_eq!(parse_hg_bookmarks_active("  feat  3:abc\n"), None);
+    assert_eq!(parse_hg_bookmarks_active(""), None);
+    let names = parse_hg_bookmark_names("  feat  3:abc\n* active  5:def\n");
+    assert_eq!(names, vec!["feat".to_string(), "active".to_string()]);
+    let nodes = parse_hg_bookmark_nodes("  feat  3:abc123\n* active  5:def456\n");
+    assert_eq!(
+        nodes,
+        vec![
+            ("feat".to_string(), "abc123".to_string()),
+            ("active".to_string(), "def456".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn b21_work_requires_terminator_when_piped() {
+    // T1153 B21/B23: piped without `--` reports the terminator, even
+    // for `--help` and missing symbols. Unknown flags still report
+    // first; symbol-count validation runs after the terminator check.
+    assert!(matches!(
+        parse_args_with_tty(&args(&["feature"]), false),
+        ParseOutcome::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&args(&["--help"]), false),
+        ParseOutcome::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&args(&[]), false),
+        ParseOutcome::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&args(&["a", "b"]), false),
+        ParseOutcome::MissingTerminator
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&args(&["--bogus", "a"]), false),
+        ParseOutcome::Error(_)
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&args(&["--", "feature"]), false),
+        ParseOutcome::Args(_)
+    ));
+    assert!(matches!(
+        parse_args_with_tty(&args(&["feature"]), true),
+        ParseOutcome::Args(_)
+    ));
+    assert_eq!(
+        arc_rs::help::MISSING_TERMINATOR,
+        "Missing required \"--\" in argument list."
+    );
+}
+
+#[test]
+fn hg_renders_bookmark_ref_views() {
+    // T1153 WORK-HG: `ArcanistMarkerRef.php:27-36` renders
+    // `Bookmark "x"` for bookmarks, `Branch "x"` otherwise.
+    let bookmark = BranchTip {
+        name: "feat".to_string(),
+        commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+        tree: String::new(),
+        epoch: 0,
+        summary: "work".to_string(),
+        message: "work".to_string(),
+        marker_type: "bookmark".to_string(),
+    };
+    assert_eq!(
+        marker_ref_view(&bookmark, 80, false),
+        "  *   Bookmark \"feat\" 0123456789ab work\n"
+    );
+    let branch = BranchTip {
+        marker_type: "branch".to_string(),
+        ..bookmark
+    };
+    assert!(marker_ref_view(&branch, 80, false).contains("Branch \"feat\""));
+}
+
+#[test]
+fn hg_shelve_names_match_php_shape() {
+    // T1153 WORK-HG: `arc-` plus 12 `[a-z2-7]`
+    // (`Filesystem.php:538-558`).
+    for _ in 0..10 {
+        let name = new_hg_shelve_name();
+        assert!(name.starts_with("arc-"), "{name}");
+        assert_eq!(name.len(), 16, "{name}");
+        assert!(
+            name[4..]
+                .bytes()
+                .all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7')),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn hg_dirty_lists_group_status_flags() {
+    // T1153 WORK-HG: tracked files are uncommitted
+    // (`ArcanistMercurialAPI.php:307-323`).
+    let (tmp, hg_cmd) = hg_test_repo("hg-dirty");
+    std::fs::write(tmp.path().join(".fakehg-status"), "M a.txt\n? new.txt\n").unwrap();
+    let lists = hg_dirty_lists_with(tmp.path(), &hg_cmd).unwrap();
+    assert_eq!(lists.untracked, vec!["new.txt".to_string()]);
+    assert_eq!(lists.uncommitted, vec!["a.txt".to_string()]);
+    assert!(lists.unstaged.is_empty());
+    assert!(lists.externals.is_empty());
+}
+
+#[test]
+fn hg_save_and_restore_roundtrips_state() {
+    // T1153 WORK-HG: save reads commit/branch/bookmark; restore runs
+    // `update`, `branch --force`, `bookmark --force`
+    // (`ArcanistMercurialLocalState.php:82-107`).
+    let (tmp, hg_cmd) = hg_test_repo("hg-state");
+    std::fs::write(
+        tmp.path().join(".fakehg-bookmarks"),
+        "  feat  3:abc\n* active  5:def\n",
+    )
+    .unwrap();
+    let state = save_hg_state_with(tmp.path(), &hg_cmd).unwrap();
+    assert_eq!(state.commit, "0123456789abcdef0123456789abcdef01234567");
+    assert_eq!(state.branch, "default");
+    assert_eq!(state.bookmark.as_deref(), Some("active"));
+    restore_hg_state_with(tmp.path(), &hg_cmd, &state).unwrap();
+    let log = hg_read_log(tmp.path());
+    assert!(log.contains("update -- 0123456789abcdef"), "{log}");
+    assert!(log.contains("branch --force -- default"), "{log}");
+    assert!(log.contains("bookmark --force -- active"), "{log}");
+}
+
+#[test]
+fn hg_markers_match_bookmarks_and_branches() {
+    // T1153 WORK-HG: symbols match bookmarks plus branches
+    // (`ArcanistWorkEngine.php:37-57`).
+    let (tmp, hg_cmd) = hg_test_repo("hg-markers");
+    std::fs::write(tmp.path().join(".fakehg-bookmarks"), "  feat  3:abc\n").unwrap();
+    std::fs::write(
+        tmp.path().join(".fakehg-branches"),
+        "default                    1:abc123\n",
+    )
+    .unwrap();
+    let markers = hg_markers_for_symbol_with(tmp.path(), &hg_cmd, "feat");
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].1, "bookmark");
+    let markers = hg_markers_for_symbol_with(tmp.path(), &hg_cmd, "default");
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].1, "branch");
+    assert!(hg_markers_for_symbol_with(tmp.path(), &hg_cmd, "missing").is_empty());
+    // Same name in both lists is ambiguous.
+    std::fs::write(tmp.path().join(".fakehg-bookmarks"), "  default  3:abc\n").unwrap();
+    let markers = hg_markers_for_symbol_with(tmp.path(), &hg_cmd, "default");
+    assert_eq!(markers.len(), 2);
+}
+
+#[test]
+fn hg_dispatch_checks_out_and_creates_bookmarks() {
+    // T1153 WORK-HG: existing markers check out
+    // (`:31-54`); new symbols become bookmarks (`:11-29`).
+    let (tmp, hg_cmd) = hg_test_repo("hg-dispatch");
+    std::fs::write(tmp.path().join(".fakehg-bookmarks"), "  feat  3:abc\n").unwrap();
+    std::fs::write(tmp.path().join(".fakehg-branches"), "").unwrap();
+    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({"data": []}))
+    };
+    hg_dispatch_symbol_with(tmp.path(), &hg_cmd, "feat", None, &call).unwrap();
+    let log = hg_read_log(tmp.path());
+    assert!(log.contains("checkout feat --"), "{log}");
+    // New symbol creates a bookmark from `.` (no `update` when the
+    // start is the default).
+    std::fs::remove_file(tmp.path().join(".fakehg.log")).ok();
+    hg_dispatch_symbol_with(tmp.path(), &hg_cmd, "novel", None, &call).unwrap();
+    let log = hg_read_log(tmp.path());
+    assert!(log.contains("bookmark novel --"), "{log}");
+    assert!(!log.contains("update --"), "{log}");
+    // Explicit startpoints update first.
+    std::fs::remove_file(tmp.path().join(".fakehg.log")).ok();
+    hg_dispatch_symbol_with(
+        tmp.path(),
+        &hg_cmd,
+        "branched",
+        Some("abc123".to_string()),
+        &call,
+    )
+    .unwrap();
+    let log = hg_read_log(tmp.path());
+    assert!(log.contains("update -- abc123"), "{log}");
+    assert!(log.contains("bookmark branched --"), "{log}");
+}
+
+#[test]
+fn hg_ambiguous_symbols_fail_like_php() {
+    // T1153 WORK-HG: `ArcanistWorkEngine.php:42-51` throws
+    // `Symbol "x" is ambiguous.`
+    let (tmp, hg_cmd) = hg_test_repo("hg-ambiguous");
+    std::fs::write(tmp.path().join(".fakehg-bookmarks"), "  dup  3:abc\n").unwrap();
+    std::fs::write(tmp.path().join(".fakehg-branches"), "dup  1:abc123\n").unwrap();
+    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({"data": []}))
+    };
+    let err = hg_dispatch_symbol_with(tmp.path(), &hg_cmd, "dup", None, &call).unwrap_err();
+    assert_eq!(err, "Symbol \"dup\" is ambiguous.");
+}
+
+#[test]
+fn hg_without_shelve_fails_like_php() {
+    // T1153 WORK-HG: without shelve, hg fails with the verbatim PHP
+    // usage error (`ArcanistRepositoryLocalState.php:143-148`).
+    let (tmp, hg_cmd) = hg_test_repo("hg-noshelve");
+    std::fs::write(tmp.path().join(".fakehg-status"), "M a.txt\n").unwrap();
+    std::fs::write(tmp.path().join(".fakehg-no-shelve"), "").unwrap();
+    let lists = hg_dirty_lists_with(tmp.path(), &hg_cmd).unwrap();
+    let mut input: &[u8] = b"y\n";
+    let err = hg_maybe_shelve_with(tmp.path(), &hg_cmd, &mut input, &lists).unwrap_err();
+    assert_eq!(
+        err,
+        "You can not continue with uncommitted changes. Commit or discard them before proceeding."
+    );
+}
+
+#[test]
+fn hg_revision_symbols_find_hash_and_footer_markers() {
+    // T1153 WORK-HG: hg markers associate via `hgcm` hashes
+    // (`ArcanistMercurialAPI.php:578-592`) plus `Differential
+    // Revision:` footers, like git.
+    let (tmp, hg_cmd) = hg_test_repo("hg-rev");
+    std::fs::write(
+        tmp.path().join(".fakehg-bookmarks"),
+        "  feat  3:0123456789abcdef0123456789abcdef01234567\n",
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join(".fakehg-branches"), "").unwrap();
+    std::fs::write(
+        tmp.path().join(".fakehg-msg"),
+        "subject\n\nDifferential Revision: https://phab.example/D123\n",
+    )
+    .unwrap();
+    let call = |method: &str, params: &serde_json::Value| -> Result<serde_json::Value, String> {
+        if method == "differential.query" {
+            // Hash path misses (wrong node); footer path hits.
+            return Ok(serde_json::json!([{
+                "phid": "PHID-DREV-1",
+                "hashes": [["hgcm", "ffffffffffffffffffffffffffffffffffffffff"]],
+            }]));
+        }
+        if method == "differential.revision.search" {
+            let ids = params
+                .get("constraints")
+                .and_then(|c| c.get("ids"))
+                .cloned()
+                .unwrap_or_default();
+            if ids == serde_json::json!(["123"]) || ids == serde_json::json!([123]) {
+                return Ok(serde_json::json!({"data": [{
+                    "id": 123,
+                    "phid": "PHID-DREV-1",
+                }]}));
+            }
+            return Ok(serde_json::json!({"data": []}));
+        }
+        Ok(serde_json::json!({"data": []}))
+    };
+    let revision = Revision {
+        id: "123".to_string(),
+        phid: "PHID-DREV-1".to_string(),
+        monogram: "D123".to_string(),
+        title: "Fix it".to_string(),
+    };
+    let tips = hg_branches_for_revision_with(&call, tmp.path(), &hg_cmd, &revision).unwrap();
+    assert_eq!(tips.len(), 1);
+    assert_eq!(tips[0].name, "feat");
+    assert_eq!(tips[0].marker_type, "bookmark");
+}
+
+#[test]
+fn r10_work_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "WORK WORKFLOW\n\
+         \n\
+         work [--start start] symbol\n\
+         Begin or resume work.\n\
+         \n\
+         Begin or resume work on a branch, bookmark, task, or revision.\n\
+         \n\
+         The symbol may be a branch or bookmark name, a revision name (like \"D123\"), a\n\
+         task name (like \"T123\"), or a new symbol.\n\
+         \n\
+         If you provide a symbol which currently does not identify any ongoing work,\n\
+         Arcanist will create a new branch or bookmark with the name you provide.\n\
+         \n\
+         If you provide the name of an existing branch or bookmark, Arcanist will\n\
+         switch to that branch or bookmark.\n\
+         \n\
+         If you provide the name of a revision or task, Arcanist will look for a\n\
+         related branch or bookmark that exists in the working copy. If it finds one,\n\
+         it will switch to it. If it does not find one, it will attempt to create a\n\
+         new branch or bookmark.\n\
+         \n\
+         When \"arc work\" creates a branch or bookmark, it will use --start as the\n\
+         branchpoint if it is provided. Otherwise, the current working copy state will\n\
+         serve as the starting point.\n\
+         \n\
+         \x20     --start symbol\n\
+         \x20         When creating a new branch or bookmark, use this as the branch\n\
+         \x20         point.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("WORK WORKFLOW"), "{}", usage());
+}
+
+#[test]
+fn b23_work_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help work`.
+    let text = usage_text(false);
+    assert!(text.starts_with("WORK WORKFLOW\n"), "{text}");
+    assert!(text.contains("Begin or resume work."), "{text}");
+    assert!(text.contains("--start"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }

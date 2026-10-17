@@ -10,6 +10,9 @@ allow = [
     "BSL-1.0",
     "Unicode-3.0",
     "Unlicense",
+    # T1153: serde_json "preserve_order" (server-order fidelity, RB-D26)
+    # pulls foldhash via indexmap; Zlib is OSI-approved and FSF-free.
+    "Zlib",
 ]
 [licenses.private]
 ignore = true

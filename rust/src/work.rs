@@ -4,7 +4,9 @@
 //! symbol, `--start`), `src/work/ArcanistWorkEngine.php` (local-state
 //! dance, revision/task symbols), `src/work/ArcanistGitWorkEngine.php`
 //! (check out an existing branch, else `checkout -b` from the startpoint),
-//! and `src/repository/state/ArcanistRepositoryLocalState.php` (stash
+//! `src/work/ArcanistMercurialWorkEngine.php` (T1153 WORK-HG: bookmarks
+//! plus branch checkout), and
+//! `src/repository/state/ArcanistRepositoryLocalState.php` (stash
 //! prompts).
 //!
 //! Deviations: `--track` is passed only when the startpoint is itself a
@@ -26,7 +28,7 @@ use std::process::ExitCode;
 // into lib.rs and when included standalone by an integration test.
 extern crate self as arc_rs;
 
-use arc_rs::{config, diff_submit, git, prompt, terminal, which};
+use arc_rs::{config, diff_submit, git, hg, prompt, terminal, which};
 
 /// Abort text for declined prompts (same as `prompt::ABORT`).
 pub const ABORT: &str = "User aborted the workflow.";
@@ -34,20 +36,59 @@ pub const ABORT: &str = "User aborted the workflow.";
 /// Subcommand name, matching `arc work`.
 pub const NAME: &str = "work";
 
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `arc_rs::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistWorkWorkflow.php:11-50`).
+const HELP_EXAMPLES: &str = "**work** [--start __start__] __symbol__";
+const HELP_SYNOPSIS: &str = "Begin or resume work.";
+const HELP_TEXT: &str = "Begin or resume work on a branch, bookmark, task, or revision.\n\
+\n\
+The __symbol__ may be a branch or bookmark name, a revision name (like \"D123\"),\n\
+a task name (like \"T123\"), or a new symbol.\n\
+\n\
+If you provide a symbol which currently does not identify any ongoing work,\n\
+Arcanist will create a new branch or bookmark with the name you provide.\n\
+\n\
+If you provide the name of an existing branch or bookmark, Arcanist will switch\n\
+to that branch or bookmark.\n\
+\n\
+If you provide the name of a revision or task, Arcanist will look for a related\n\
+branch or bookmark that exists in the working copy. If it finds one, it will\n\
+switch to it. If it does not find one, it will attempt to create a new branch\n\
+or bookmark.\n\
+\n\
+When \"arc work\" creates a branch or bookmark, it will use **--start** as the\n\
+branchpoint if it is provided. Otherwise, the current working copy state will\n\
+serve as the starting point.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[(
+    "start",
+    None,
+    Some("symbol"),
+    "When creating a new branch or bookmark, use this as the branch point.",
+)];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<arc_rs::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    arc_rs::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &specs,
+        ansi,
+    )
+}
+
 fn usage() -> String {
-    "usage: arc work [--start START] SYMBOL\n\
-     \n\
-     Begin or resume work on a branch.\n\
-     \n\
-     If SYMBOL names an existing local branch, check it out. Otherwise create\n\
-     a new branch named SYMBOL from --start (or the current branch or HEAD).\n\
-     \n\
-     Options:\n\
-     \x20 --start START  Branch point for a new branch.\n\
-     \x20 -h, --help     Show this help.\n\
-     \n\
-     Not yet ported (see T1128): Mercurial bookmarks.\n"
-        .to_string()
+    usage_text(terminal::ansi_enabled())
 }
 
 /// Parsed `work` options.
@@ -62,10 +103,24 @@ pub enum ParseOutcome {
     Args(Options),
     Help,
     Error(String),
+    /// T1153 B21/B23: stdin is piped and argv carries no `--`.
+    MissingTerminator,
 }
 
 /// Parse `argv` (excluding the subcommand name).
 pub fn parse_args(argv: &[String]) -> ParseOutcome {
+    parse_args_with_tty(argv, arc_rs::prompt::stdin_is_terminal())
+}
+
+/// [`parse_args`] with an injected TTY flag (deterministic tests).
+/// T1153 B21/B23: piped runs without `--` fail with
+/// `MissingTerminator` (checked after unknown-flag scanning, like
+/// PHP's `parseFull()`, but before symbol-count validation). `--help`
+/// without `--` when piped reports the terminator. Vs ceb
+/// `ArcanistRuntime.php:80-86,172-188` and
+/// `PhutilArgumentParser.php:331-336`.
+fn parse_args_with_tty(argv: &[String], stdin_tty: bool) -> ParseOutcome {
+    let missing = arc_rs::help::terminator_missing(argv, stdin_tty);
     let mut start = None;
     let mut symbols = Vec::new();
     let mut end_of_flags = false;
@@ -83,12 +138,18 @@ pub fn parse_args(argv: &[String]) -> ParseOutcome {
         } else if let Some(value) = arg.strip_prefix("--start=") {
             start = Some(value.to_string());
         } else if arg == "-h" || arg == "--help" {
+            if missing {
+                return ParseOutcome::MissingTerminator;
+            }
             return ParseOutcome::Help;
         } else if arg.starts_with('-') {
             return ParseOutcome::Error(format!("unknown flag '{arg}'"));
         } else {
             symbols.push(arg.clone());
         }
+    }
+    if missing {
+        return ParseOutcome::MissingTerminator;
     }
     if symbols.is_empty() {
         return ParseOutcome::Error(
@@ -373,7 +434,8 @@ pub fn load_task(
         }))
 }
 
-/// A local branch tip, mirroring a git marker ref.
+/// A local branch tip, mirroring a git marker ref (or an hg
+/// branch/bookmark marker, T1153 WORK-HG).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchTip {
     pub name: String,
@@ -382,6 +444,10 @@ pub struct BranchTip {
     pub epoch: i64,
     pub summary: String,
     pub message: String,
+    /// `branch` or `bookmark` (T1153 WORK-HG: PHP renders
+    /// `Bookmark "x"` vs `Branch "x"`,
+    /// `ArcanistMarkerRef.php:27-36`).
+    pub marker_type: String,
 }
 
 fn parse_tip_record(record: &str) -> Option<BranchTip> {
@@ -407,6 +473,8 @@ fn parse_tip_record(record: &str) -> Option<BranchTip> {
         epoch: epoch.parse().unwrap_or(0),
         summary: summary.to_string(),
         message: message.to_string(),
+        // T1153 WORK-HG: git tips are always branches.
+        marker_type: "branch".to_string(),
     })
 }
 
@@ -534,6 +602,155 @@ pub fn branches_for_revision(
         .collect())
 }
 
+/// One hg bookmark entry: name plus node (T1153 WORK-HG).
+fn parse_hg_bookmark_nodes(output: &str) -> Vec<(String, String)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line
+                .trim_start()
+                .strip_prefix([' ', '*'])
+                .unwrap_or(line.trim_start());
+            let mut parts = trimmed.split_whitespace();
+            let name = parts.next().unwrap_or("");
+            let rev_node = parts.next().unwrap_or("");
+            let node = rev_node.split(':').nth(1).unwrap_or("");
+            if name.is_empty() || node.is_empty() {
+                None
+            } else {
+                Some((name.to_string(), node.to_string()))
+            }
+        })
+        .collect()
+}
+
+/// Hg branch/bookmark tips (T1153 WORK-HG: plain `hg` lists, like
+/// `land`; messages come from `hg log` per node for footer search).
+pub fn hg_branch_tips_with(dir: &Path, hg_cmd: &hg::HgCommand) -> Result<Vec<BranchTip>, String> {
+    let bookmarks = hg::stdout_text_with(dir, hg_cmd, &["bookmarks"]).unwrap_or_default();
+    let branches = hg::stdout_text_with(dir, hg_cmd, &["branches"]).unwrap_or_default();
+    let mut tips = Vec::new();
+    for (name, short) in parse_hg_bookmark_nodes(&bookmarks) {
+        // `hg bookmarks` gives a short hash; resolve to full node.
+        let node = hg_canonical_revision_with(dir, hg_cmd, &short).unwrap_or(short);
+        let message = hg::stdout_text_with(
+            dir,
+            hg_cmd,
+            &["log", "-l", "1", "--template", "{desc}", "-r", &node, "--"],
+        )
+        .unwrap_or_default();
+        let summary = message.lines().next().unwrap_or("").to_string();
+        tips.push(BranchTip {
+            name,
+            commit: node,
+            tree: String::new(),
+            epoch: 0,
+            summary,
+            message,
+            marker_type: "bookmark".to_string(),
+        });
+    }
+    let branch_map = hg::parse_mercurial_branches(&branches).unwrap_or_default();
+    for (name, entry) in branch_map {
+        // `hg branches` gives a short hash; resolve to full node.
+        let node = hg_canonical_revision_with(dir, hg_cmd, &name).unwrap_or(entry.rev);
+        let message = hg::stdout_text_with(
+            dir,
+            hg_cmd,
+            &["log", "-l", "1", "--template", "{desc}", "-r", &node, "--"],
+        )
+        .unwrap_or_default();
+        let summary = message.lines().next().unwrap_or("").to_string();
+        tips.push(BranchTip {
+            name,
+            commit: node,
+            tree: String::new(),
+            epoch: 0,
+            summary,
+            message,
+            marker_type: "branch".to_string(),
+        });
+    }
+    Ok(tips)
+}
+
+/// Hg tips with the system binary (T1153 WORK-HG).
+pub fn hg_branch_tips(dir: &Path) -> Result<Vec<BranchTip>, String> {
+    hg_branch_tips_with(dir, &hg::HgCommand::system())
+}
+
+/// Mark hg tips whose node is attached to the revision (T1153 WORK-HG:
+/// `hgcm` hashes, `ArcanistMercurialAPI.php:578-592`).
+fn mark_hg_hash_associated(
+    call: &diff_submit::ConduitCall,
+    tips: &[BranchTip],
+    phid: &str,
+    hits: &mut [bool],
+) -> Result<(), String> {
+    let mut hashes = Vec::new();
+    for tip in tips {
+        hashes.push(serde_json::json!(["hgcm", tip.commit]));
+    }
+    let result = call(
+        "differential.query",
+        &serde_json::json!({"commitHashes": hashes}),
+    )?;
+    let empty = Vec::new();
+    for row in query_rows(&result) {
+        if row_string(row, "phid") != phid {
+            continue;
+        }
+        let revision_hashes = row
+            .get("hashes")
+            .and_then(|hashes| hashes.as_array())
+            .unwrap_or(&empty);
+        for (tip, hit) in tips.iter().zip(hits.iter_mut()) {
+            let attached = revision_hashes.iter().any(|entry| {
+                let pair: Vec<&str> = entry
+                    .as_array()
+                    .map(|items| items.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                matches!(pair.as_slice(), ["hgcm", hash] if *hash == tip.commit)
+            });
+            if attached {
+                *hit = true;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Hg markers associated with `revision` (T1153 WORK-HG).
+pub fn hg_branches_for_revision_with(
+    call: &diff_submit::ConduitCall,
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    revision: &Revision,
+) -> Result<Vec<BranchTip>, String> {
+    let tips = hg_branch_tips_with(dir, hg_cmd)?;
+    if tips.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut hits = vec![false; tips.len()];
+    mark_hg_hash_associated(call, &tips, &revision.phid, &mut hits)?;
+    mark_footer_associated(call, &tips, &revision.phid, &mut hits)?;
+    Ok(tips
+        .into_iter()
+        .zip(hits)
+        .filter(|(_, hit)| *hit)
+        .map(|(tip, _)| tip)
+        .collect())
+}
+
+/// Hg association with the system binary (T1153 WORK-HG).
+pub fn hg_branches_for_revision(
+    call: &diff_submit::ConduitCall,
+    dir: &Path,
+    revision: &Revision,
+) -> Result<Vec<BranchTip>, String> {
+    hg_branches_for_revision_with(call, dir, &hg::HgCommand::system(), revision)
+}
+
 /// A revision ref view (stdout), mirroring `ArcanistRefView`.
 #[must_use]
 pub fn revision_ref_view(revision: &Revision, width: usize, ansi: bool) -> String {
@@ -545,11 +762,19 @@ pub fn revision_ref_view(revision: &Revision, width: usize, ansi: bool) -> Strin
     .render(0, width, ansi)
 }
 
-/// A marker ref view (stdout): `Branch "name"`, title `hash12 summary`.
+/// A marker ref view (stdout): `Branch "name"` (or `Bookmark "x"`
+/// for hg bookmarks, T1153 WORK-HG), title `hash12 summary`.
 #[must_use]
 pub fn marker_ref_view(tip: &BranchTip, width: usize, ansi: bool) -> String {
+    // T1153 WORK-HG: PHP `getRefDisplayName()` branches on marker
+    // type (`ArcanistMarkerRef.php:27-36`).
+    let label = if tip.marker_type == "bookmark" {
+        "Bookmark"
+    } else {
+        "Branch"
+    };
     terminal::RefView {
-        object_name: Some(format!("Branch \"{}\"", tip.name)),
+        object_name: Some(format!("{label} \"{}\"", tip.name)),
         title: Some(format!("{} {}", display_hash(&tip.commit), tip.summary)),
         ..terminal::RefView::default()
     }
@@ -586,13 +811,16 @@ pub fn ambiguous_marker_block(
     out
 }
 
-fn work_outside_repo(dir: &Path) -> ExitCode {
-    if dir.join(".hg").is_dir() {
-        eprintln!("arc {NAME}: Mercurial working copies are not yet ported (see T1128)");
-    } else {
-        eprintln!("arc {NAME}: \"arc work\" must be run in a Git or Mercurial working copy.");
-    }
+fn work_outside_repo() -> ExitCode {
+    // T1153 WORK-HG: hg is ported now; this fires only outside any
+    // working copy (`ArcanistWorkWorkflow.php:56-61`).
+    eprintln!("arc {NAME}: \"arc work\" must be run in a Git or Mercurial working copy.");
     ExitCode::FAILURE
+}
+
+/// True inside a Mercurial working copy (T1153 WORK-HG).
+fn is_hg_repo(dir: &Path) -> bool {
+    hg::find_root(dir).is_some()
 }
 
 /// Saved position for restore-on-failure, mirroring `ArcanistGitLocalState`.
@@ -636,6 +864,90 @@ pub fn restore_work_state(dir: &Path, state: &WorkState) -> Result<(), String> {
     }
     git::stdout_text(dir, &["submodule", "update", "--init", "--recursive"])?;
     Ok(())
+}
+
+/// Saved hg position, mirroring `ArcanistMercurialLocalState`
+/// (T1153 WORK-HG: `src/repository/state/ArcanistMercurialLocalState.php:6-12`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HgWorkState {
+    pub commit: String,
+    pub branch: String,
+    pub bookmark: Option<String>,
+}
+
+/// Record the hg commit, branch, and active bookmark (T1153 WORK-HG).
+pub fn save_hg_state_with(dir: &Path, hg_cmd: &hg::HgCommand) -> Result<HgWorkState, String> {
+    let commit = hg::stdout_text_with(
+        dir,
+        hg_cmd,
+        &["log", "-l", "1", "--template", "{node}", "-r", "."],
+    )?;
+    let branch = hg::stdout_text_with(dir, hg_cmd, &["branch"])?;
+    let bookmarks = hg::stdout_text_with(dir, hg_cmd, &["bookmarks"]).unwrap_or_default();
+    let bookmark = parse_hg_bookmarks_active(&bookmarks);
+    Ok(HgWorkState {
+        commit: commit.trim().to_string(),
+        branch: branch.trim().to_string(),
+        bookmark,
+    })
+}
+
+/// Record the hg position with the system binary (T1153 WORK-HG).
+pub fn save_hg_state(dir: &Path) -> Result<HgWorkState, String> {
+    save_hg_state_with(dir, &hg::HgCommand::system())
+}
+
+/// Active bookmark name from `hg bookmarks` output, if any (T1153
+/// WORK-HG: `*` marks the active entry, like `land::parse_hg_bookmarks`).
+fn parse_hg_bookmarks_active(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix('*') {
+            let name = rest.split_whitespace().next().unwrap_or("");
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Restore the saved hg position (T1153 WORK-HG:
+/// `ArcanistMercurialLocalState.php:82-107`).
+pub fn restore_hg_state_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    state: &HgWorkState,
+) -> Result<(), String> {
+    match &state.bookmark {
+        Some(bookmark) => push_status(
+            "LOAD STATE",
+            &format!(
+                "Restoring local state (at \"{}\" on branch \"{}\", bookmarked as \"{bookmark}\").",
+                display_hash(&state.commit),
+                state.branch
+            ),
+        ),
+        None => push_status(
+            "LOAD STATE",
+            &format!(
+                "Restoring local state (at \"{}\" on branch \"{}\").",
+                display_hash(&state.commit),
+                state.branch
+            ),
+        ),
+    }
+    hg::stdout_text_with(dir, hg_cmd, &["update", "--", &state.commit])?;
+    hg::stdout_text_with(dir, hg_cmd, &["branch", "--force", "--", &state.branch])?;
+    if let Some(bookmark) = &state.bookmark {
+        hg::stdout_text_with(dir, hg_cmd, &["bookmark", "--force", "--", bookmark])?;
+    }
+    Ok(())
+}
+
+/// Restore the hg position with the system binary (T1153 WORK-HG).
+pub fn restore_hg_state(dir: &Path, state: &HgWorkState) -> Result<(), String> {
+    restore_hg_state_with(dir, &hg::HgCommand::system(), state)
 }
 
 /// One path's status flags from `status --porcelain=2 -z`.
@@ -763,6 +1075,41 @@ pub fn dirty_lists(dir: &Path) -> Result<DirtyLists, String> {
     Ok(lists)
 }
 
+/// Group hg changed paths (T1153 WORK-HG:
+/// `ArcanistMercurialAPI.php:307-323` marks tracked files uncommitted;
+/// hg has no index, so unstaged stays empty).
+pub fn hg_dirty_lists_with(dir: &Path, hg_cmd: &hg::HgCommand) -> Result<DirtyLists, String> {
+    let status = hg::get_uncommitted_status_with(dir, hg_cmd)?;
+    let mut lists = DirtyLists::default();
+    for (path, mask) in &status {
+        if mask & hg::FLAG_UNTRACKED != 0 {
+            lists.untracked.push(path.clone());
+        }
+        if mask & hg::FLAG_EXTERNALS != 0 {
+            lists.externals.push(path.clone());
+        }
+    }
+    for (path, mask) in &status {
+        if mask & hg::FLAG_UNSTAGED != 0 && !lists.externals.iter().any(|e| e == path) {
+            lists.unstaged.push(path.clone());
+        }
+    }
+    for (path, mask) in &status {
+        if mask & hg::FLAG_UNCOMMITTED != 0
+            && !lists.unstaged.iter().any(|e| e == path)
+            && !lists.externals.iter().any(|e| e == path)
+        {
+            lists.uncommitted.push(path.clone());
+        }
+    }
+    Ok(lists)
+}
+
+/// Group hg changed paths with the system binary (T1153 WORK-HG).
+pub fn hg_dirty_lists(dir: &Path) -> Result<DirtyLists, String> {
+    hg_dirty_lists_with(dir, &hg::HgCommand::system())
+}
+
 /// `newDisplayFileList` + `printFileLists` rendering (stdout): each
 /// nonempty list is a title plus indented paths, lists are separated by
 /// blank lines, and one trailing newline always prints.
@@ -793,6 +1140,19 @@ fn render_file_lists(lists: &[(&str, &[String])], ansi: bool) -> String {
 pub fn repo_display_path(dir: &Path) -> String {
     let root = git::stdout_text(dir, &["rev-parse", "--show-toplevel"])
         .unwrap_or_else(|_| dir.to_string_lossy().into_owned());
+    let root = root.trim_end().to_string();
+    #[cfg(windows)]
+    let root = root.replace('/', "\\");
+    let sep = std::path::MAIN_SEPARATOR;
+    format!("{root}{sep}")
+}
+
+/// The hg repository root with a trailing separator (T1153 WORK-HG).
+#[must_use]
+pub fn hg_repo_display_path(dir: &Path) -> String {
+    let root = hg::find_root(dir)
+        .map(|root| root.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.to_string_lossy().into_owned());
     let root = root.trim_end().to_string();
     #[cfg(windows)]
     let root = root.replace('/', "\\");
@@ -847,6 +1207,64 @@ pub fn render_uncommitted_block(dir: &Path, lists: &DirtyLists, ansi: bool) -> S
             "To configure Git to ignore certain files in this working copy, add the file paths \
              to \"%s\".",
             &[terminal::PhtArg::Text(".git/info/exclude")],
+        );
+        out.push_str(
+            &terminal::tsprintf_ansi("%?\n", &[terminal::TVal::Text(&hint)], ansi)
+                .map(|t| t.to_string())
+                .unwrap_or_default(),
+        );
+    }
+    out
+}
+
+/// The hg UNCOMMITTED CHANGES block (T1153 WORK-HG: `.hgignore`
+/// hint, `ArcanistMercurialLocalState.php:118-124`).
+#[must_use]
+pub fn render_hg_uncommitted_block(dir: &Path, lists: &DirtyLists, ansi: bool) -> String {
+    let working_copy = terminal::tsprintf_ansi(
+        "    %s: %s\n",
+        &[
+            terminal::TVal::Text("Working Copy"),
+            terminal::TVal::Text(&hg_repo_display_path(dir)),
+        ],
+        ansi,
+    )
+    .map(|t| t.to_string())
+    .unwrap_or_default();
+    let working_copy = terminal::TerminalString::new(working_copy);
+    let mut out = terminal::tsprintf_ansi(
+        "\n%!\n%W\n\n%s\n",
+        &[
+            terminal::TVal::Text("UNCOMMITTED CHANGES"),
+            terminal::TVal::Text("You have uncommitted changes in this working copy."),
+            terminal::TVal::Terminal(&working_copy),
+        ],
+        ansi,
+    )
+    .map(|t| t.to_string())
+    .unwrap_or_default();
+    out.push_str(&render_file_lists(
+        &[
+            (
+                "Untracked changes in working copy:",
+                lists.untracked.as_slice(),
+            ),
+            (
+                "Unstaged changes in working copy:",
+                lists.unstaged.as_slice(),
+            ),
+            (
+                "Uncommitted changes in working copy:",
+                lists.uncommitted.as_slice(),
+            ),
+        ],
+        ansi,
+    ));
+    if !lists.untracked.is_empty() {
+        let hint = terminal::pht(
+            "To configure Mercurial to ignore certain files in the working copy, add them to \
+             \".hgignore\".",
+            &[],
         );
         out.push_str(
             &terminal::tsprintf_ansi("%?\n", &[terminal::TVal::Text(&hint)], ansi)
@@ -938,6 +1356,74 @@ pub fn apply_stash(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// `arc-` plus 12 random `[a-z2-7]` characters, like
+/// `Filesystem::readRandomCharacters(12)` (T1153 WORK-HG:
+/// `src/filesystem/Filesystem.php:538-558`, same as `land`).
+fn new_hg_shelve_name() -> String {
+    const MAP: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        ^ (std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut state = seed | 1;
+    let mut name = String::from("arc-");
+    for _ in 0..12 {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let byte = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        name.push(MAP[(byte >> 59) as usize] as char);
+    }
+    name
+}
+
+/// Shelve hg changes, returning the shelf name (T1153 WORK-HG:
+/// `ArcanistMercurialLocalState.php:147-164`).
+pub fn save_hg_shelve_with(dir: &Path, hg_cmd: &hg::HgCommand) -> Result<String, String> {
+    let name = new_hg_shelve_name();
+    hg::exec_with_extension_with(
+        dir,
+        hg_cmd,
+        "shelve",
+        &["shelve", "--unknown", "--name", &name, "--"],
+        None,
+    )?;
+    push_status("SHELVE", "Shelving uncommitted changes from working copy.");
+    Ok(name)
+}
+
+/// Shelve with the system binary (T1153 WORK-HG).
+pub fn save_hg_shelve(dir: &Path) -> Result<String, String> {
+    save_hg_shelve_with(dir, &hg::HgCommand::system())
+}
+
+/// Unshelve and delete the shelf (T1153 WORK-HG:
+/// `ArcanistMercurialLocalState.php:166-185`).
+pub fn apply_hg_shelve_with(dir: &Path, hg_cmd: &hg::HgCommand, name: &str) -> Result<(), String> {
+    push_status("UNSHELVE", "Restoring uncommitted changes to working copy.");
+    hg::exec_with_extension_with(
+        dir,
+        hg_cmd,
+        "shelve",
+        &["unshelve", "--keep", "--name", name, "--"],
+        None,
+    )?;
+    hg::exec_with_extension_with(
+        dir,
+        hg_cmd,
+        "shelve",
+        &["shelve", "--delete", name, "--"],
+        None,
+    )?;
+    Ok(())
+}
+
+/// Unshelve with the system binary (T1153 WORK-HG).
+pub fn apply_hg_shelve(dir: &Path, name: &str) -> Result<(), String> {
+    apply_hg_shelve_with(dir, &hg::HgCommand::system(), name)
+}
+
 fn checkout_branch(dir: &Path, symbol: &str) -> Result<(), String> {
     push_status("BRANCH", &format!("Checking out branch \"{symbol}\"."));
     git::stdout_text(dir, &["checkout", symbol, "--"])
@@ -974,6 +1460,131 @@ fn create_new_branch(dir: &Path, symbol: &str, start: &str) -> Result<(), String
     git::stdout_text(dir, &args)
         .map(|_| ())
         .map_err(|message| format!("git checkout failed: {message}"))
+}
+
+/// Default hg startpoint: `.` (T1153 WORK-HG:
+/// `ArcanistMercurialAPI.php:451-453` returns `.`).
+#[must_use]
+pub fn hg_default_start() -> String {
+    hg::get_working_copy_revision().to_string()
+}
+
+/// Resolve an hg rev to a node, or `None` (T1153 WORK-HG:
+/// `ArcanistMercurialAPI.php:51-58`).
+#[must_use]
+pub fn hg_canonical_revision_with(dir: &Path, hg_cmd: &hg::HgCommand, rev: &str) -> Option<String> {
+    hg::get_canonical_revision_name_with(dir, hg_cmd, rev).ok()
+}
+
+/// Resolve with the system binary (T1153 WORK-HG).
+#[must_use]
+pub fn hg_canonical_revision(dir: &Path, rev: &str) -> Option<String> {
+    hg_canonical_revision_with(dir, &hg::HgCommand::system(), rev)
+}
+
+/// Bookmark names from `hg bookmarks` output (T1153 WORK-HG).
+fn parse_hg_bookmark_names(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line
+                .trim_start()
+                .strip_prefix([' ', '*'])
+                .unwrap_or(line.trim_start());
+            let name = trimmed.split_whitespace().next().unwrap_or("");
+            if name.is_empty() {
+                None
+            } else {
+                Some(name.to_string())
+            }
+        })
+        .collect()
+}
+
+/// Branch names from `hg branches` output (T1153 WORK-HG).
+fn parse_hg_branch_names(output: &str) -> Vec<String> {
+    hg::parse_mercurial_branches(output)
+        .map(|map| map.into_keys().collect())
+        .unwrap_or_default()
+}
+
+/// Markers matching `symbol`: bookmarks plus branches (T1153 WORK-HG:
+/// `ArcanistWorkEngine.php:37-57` queries `withNames`; plain `hg`
+/// carries the same names as `arc-hg`, like `land`).
+fn hg_markers_for_symbol_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    symbol: &str,
+) -> Vec<(String, String)> {
+    let bookmarks = hg::stdout_text_with(dir, hg_cmd, &["bookmarks"]).unwrap_or_default();
+    let branches = hg::stdout_text_with(dir, hg_cmd, &["branches"]).unwrap_or_default();
+    let mut out = Vec::new();
+    for name in parse_hg_bookmark_names(&bookmarks) {
+        if name == symbol {
+            out.push((name, "bookmark".to_string()));
+        }
+    }
+    for name in parse_hg_branch_names(&branches) {
+        if name == symbol {
+            out.push((name, "branch".to_string()));
+        }
+    }
+    out
+}
+
+/// Check out an hg bookmark or branch (T1153 WORK-HG:
+/// `ArcanistMercurialWorkEngine.php:31-54`).
+fn hg_checkout_marker_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    name: &str,
+    marker_type: &str,
+) -> Result<(), String> {
+    if marker_type == "bookmark" {
+        push_status("BOOKMARK", &format!("Checking out bookmark \"{name}\"."));
+    } else {
+        push_status("BRANCH", &format!("Checking out branch \"{name}\"."));
+    }
+    hg::stdout_text_with(dir, hg_cmd, &["checkout", name, "--"])
+        .map(|_| ())
+        .map_err(|message| format!("hg checkout failed: {message}"))
+}
+
+/// Create a new hg bookmark (T1153 WORK-HG:
+/// `ArcanistMercurialWorkEngine.php:11-29`).
+fn hg_create_bookmark_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    symbol: &str,
+    start: &str,
+) -> Result<(), String> {
+    push_status(
+        "NEW BOOKMARK",
+        &format!("Creating new bookmark \"{symbol}\" from \"{start}\"."),
+    );
+    if start != hg_default_start() {
+        hg::stdout_text_with(dir, hg_cmd, &["update", "--", start])
+            .map_err(|message| format!("hg update failed: {message}"))?;
+    }
+    hg::stdout_text_with(dir, hg_cmd, &["bookmark", symbol, "--"])
+        .map(|_| ())
+        .map_err(|message| format!("hg bookmark failed: {message}"))
+}
+
+fn hg_resolve_start_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    start: Option<String>,
+) -> Result<String, String> {
+    match start {
+        Some(start) => {
+            if hg_canonical_revision_with(dir, hg_cmd, &start).is_none() {
+                return Err(format!("Unable to resolve startpoint \"{start}\"."));
+            }
+            Ok(start)
+        }
+        None => Ok(hg_default_start()),
+    }
 }
 
 /// Switch to the branch associated with a revision symbol.
@@ -1042,6 +1653,65 @@ fn dispatch_symbol(
     create_new_branch(dir, symbol, &start)
 }
 
+/// Switch to the hg marker associated with a revision (T1153 WORK-HG).
+fn hg_work_on_revision_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    symbol: &str,
+    parsed: &ObjectSymbol,
+    call: &diff_submit::ConduitCall,
+) -> Result<(), String> {
+    let revision = load_revision(call, parsed)?.ok_or_else(|| {
+        format!("No revision \"{symbol}\" exists, or you do not have permission to view it.")
+    })?;
+    let mut selected = hg_branches_for_revision_with(call, dir, hg_cmd, &revision)?;
+    if selected.is_empty() {
+        return Err(format!(
+            "Revision \"{}\" was not found anywhere in this working copy.",
+            revision.monogram
+        ));
+    }
+    selected.sort_by_key(|tip| tip.epoch);
+    let target = selected[selected.len() - 1].clone();
+    let width = terminal::terminal_width();
+    let ansi = terminal::ansi_enabled();
+    if selected.len() > 1 {
+        print!(
+            "{}",
+            ambiguous_marker_block(&revision.monogram, &selected, width, ansi)
+        );
+    }
+    push_status("REVISION", "Resuming work on revision:");
+    println!("{}", revision_ref_view(&revision, width, ansi));
+    hg_checkout_marker_with(dir, hg_cmd, &target.name, &target.marker_type)
+}
+
+fn hg_dispatch_symbol_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    symbol: &str,
+    start: Option<String>,
+    call: &diff_submit::ConduitCall,
+) -> Result<(), String> {
+    // T1153 WORK-HG: `ArcanistWorkEngine.php:41-57` moves to the
+    // marker, failing on ambiguity.
+    let markers = hg_markers_for_symbol_with(dir, hg_cmd, symbol);
+    if markers.len() > 1 {
+        return Err(format!("Symbol \"{symbol}\" is ambiguous."));
+    }
+    if let Some((name, marker_type)) = markers.into_iter().next() {
+        return hg_checkout_marker_with(dir, hg_cmd, &name, &marker_type);
+    }
+    if let Some(parsed) = revision_symbol(symbol) {
+        return hg_work_on_revision_with(dir, hg_cmd, symbol, &parsed, call);
+    }
+    if let Some(parsed) = task_symbol(symbol) {
+        return work_on_task(symbol, &parsed, call);
+    }
+    let start = hg_resolve_start_with(dir, hg_cmd, start)?;
+    hg_create_bookmark_with(dir, hg_cmd, symbol, &start)
+}
+
 /// The externals gate: list dirty submodules and confirm ignoring them.
 fn confirm_externals(input: &mut dyn BufRead, lists: &DirtyLists) -> Result<(), String> {
     if lists.externals.is_empty() {
@@ -1074,6 +1744,34 @@ fn maybe_stash(dir: &Path, input: &mut dyn BufRead, lists: &DirtyLists) -> Resul
     Ok(true)
 }
 
+/// The hg uncommitted gate (T1153 WORK-HG): without shelve support
+/// hg fails like PHP (`canStashChanges()`,
+/// `ArcanistRepositoryLocalState.php:124-148`). Returns the shelf
+/// name when shelved.
+fn hg_maybe_shelve_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    input: &mut dyn BufRead,
+    lists: &DirtyLists,
+) -> Result<Option<String>, String> {
+    if lists.untracked.is_empty() && lists.unstaged.is_empty() && lists.uncommitted.is_empty() {
+        return Ok(None);
+    }
+    print!(
+        "{}",
+        render_hg_uncommitted_block(dir, lists, terminal::ansi_enabled())
+    );
+    if !hg::mercurial_feature_supported_with(dir, hg_cmd, "shelve").unwrap_or(false) {
+        return Err(
+            "You can not continue with uncommitted changes. Commit or discard them before \
+             proceeding."
+                .to_string(),
+        );
+    }
+    stash_prompt(input, "Stash these changes and continue?")?;
+    save_hg_shelve_with(dir, hg_cmd).map(Some)
+}
+
 fn fail_with_restore(dir: &Path, state: &WorkState, stashed: bool, message: String) -> ExitCode {
     // Mirror the destructor restore: check the saved position back out,
     // re-apply the stash, then report the original error.
@@ -1082,6 +1780,28 @@ fn fail_with_restore(dir: &Path, state: &WorkState, stashed: bool, message: Stri
         return ExitCode::FAILURE;
     }
     if stashed && let Err(message) = apply_stash(dir) {
+        eprintln!("arc {NAME}: {message}");
+        return ExitCode::FAILURE;
+    }
+    eprintln!("arc {NAME}: {message}");
+    ExitCode::FAILURE
+}
+
+fn hg_fail_with_restore_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    state: &HgWorkState,
+    shelved: Option<&str>,
+    message: String,
+) -> ExitCode {
+    // T1153 WORK-HG: mirror the git restore (state, then shelf).
+    if let Err(restore) = restore_hg_state_with(dir, hg_cmd, state) {
+        eprintln!("arc {NAME}: {restore}");
+        return ExitCode::FAILURE;
+    }
+    if let Some(name) = shelved
+        && let Err(message) = apply_hg_shelve_with(dir, hg_cmd, name)
+    {
         eprintln!("arc {NAME}: {message}");
         return ExitCode::FAILURE;
     }
@@ -1132,11 +1852,69 @@ fn execute_parsed(
     }
 }
 
+fn hg_execute_parsed_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    options: &Options,
+    call: &diff_submit::ConduitCall,
+    input: &mut dyn BufRead,
+) -> ExitCode {
+    // T1153 WORK-HG: hg mirrors the git dance (save, gates, dispatch,
+    // restore on failure).
+    let state = match save_hg_state_with(dir, hg_cmd) {
+        Ok(state) => state,
+        Err(message) => {
+            eprintln!("arc {NAME}: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let lists = match hg_dirty_lists_with(dir, hg_cmd) {
+        Ok(lists) => lists,
+        Err(message) => {
+            eprintln!("arc {NAME}: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(message) = confirm_externals(input, &lists) {
+        eprintln!("arc {NAME}: {message}");
+        return ExitCode::FAILURE;
+    }
+    let shelved = match hg_maybe_shelve_with(dir, hg_cmd, input, &lists) {
+        Ok(shelved) => shelved,
+        Err(message) => {
+            eprintln!("arc {NAME}: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match hg_dispatch_symbol_with(dir, hg_cmd, &options.symbol, options.start.clone(), call) {
+        Ok(()) => {
+            if let Some(name) = &shelved
+                && let Err(message) = apply_hg_shelve_with(dir, hg_cmd, name)
+            {
+                eprintln!("arc {NAME}: {message}");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Err(message) => hg_fail_with_restore_with(dir, hg_cmd, &state, shelved.as_deref(), message),
+    }
+}
+
 fn parse_or_report(argv: &[String]) -> Result<Options, ExitCode> {
     match parse_args(argv) {
         ParseOutcome::Help => {
             print!("{}", usage());
             Err(ExitCode::SUCCESS)
+        }
+        // T1153 B21/B23: the terminator failure prints the three cyan
+        // hints first (like `ArcanistRuntime.php:172-188`) and reports
+        // through the toolset usage arm (exit 1).
+        ParseOutcome::MissingTerminator => {
+            arc_rs::help::print_terminator_hints(arc_rs::terminal::ansi_enabled());
+            Err(arc_rs::conduit::report(
+                arc_rs::conduit::EnvelopeKind::ToolsetUsage,
+                arc_rs::help::MISSING_TERMINATOR,
+            ))
         }
         ParseOutcome::Error(message) => {
             eprintln!("arc {NAME}: {message}\n\n{}", usage());
@@ -1159,8 +1937,12 @@ pub fn run_in_with(
         Ok(options) => options,
         Err(code) => return code,
     };
+    // T1153 WORK-HG: hg dispatches to the Mercurial engine.
+    if is_hg_repo(dir) {
+        return run_hg_in_with(dir, &options, call, input);
+    }
     if !git::is_inside_work_tree(dir) {
-        return work_outside_repo(dir);
+        return work_outside_repo();
     }
     if let Some(call) = call {
         return execute_parsed(dir, &options, call, input);
@@ -1181,6 +1963,52 @@ pub fn run_in_with(
         execute_parsed(
             dir,
             &options,
+            &|_, _| Err("conduit unavailable".to_string()),
+            input,
+        )
+    }
+}
+
+/// Hg entry with an injected Conduit caller (T1153 WORK-HG).
+fn run_hg_in_with(
+    dir: &Path,
+    options: &Options,
+    call: Option<&diff_submit::ConduitCall>,
+    input: &mut dyn BufRead,
+) -> ExitCode {
+    let hg_cmd = hg::HgCommand::system();
+    run_hg_in_with_cmd(dir, &hg_cmd, options, call, input)
+}
+
+/// Hg entry driving `hg` through `hg_cmd` (T1153 WORK-HG: test seam).
+pub fn run_hg_in_with_cmd(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    options: &Options,
+    call: Option<&diff_submit::ConduitCall>,
+    input: &mut dyn BufRead,
+) -> ExitCode {
+    if let Some(call) = call {
+        return hg_execute_parsed_with(dir, hg_cmd, options, call, input);
+    }
+    let markers = hg_markers_for_symbol_with(dir, hg_cmd, &options.symbol);
+    if markers.is_empty() && symbol_needs_conduit(&options.symbol) {
+        let client = match config::client_for(None) {
+            Ok(client) => client,
+            Err(message) => {
+                eprintln!("arc {NAME}: {message}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let live = |method: &str, params: &serde_json::Value| {
+            client.call(method, params).map_err(|e| e.to_string())
+        };
+        hg_execute_parsed_with(dir, hg_cmd, options, &live, input)
+    } else {
+        hg_execute_parsed_with(
+            dir,
+            hg_cmd,
+            options,
             &|_, _| Err("conduit unavailable".to_string()),
             input,
         )

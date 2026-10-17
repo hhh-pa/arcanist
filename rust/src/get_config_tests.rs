@@ -231,12 +231,20 @@ fn verbose_help_goes_through_console_wrap() {
 }
 
 #[test]
-fn project_config_walks_up_and_validates() {
+fn project_config_reads_vcs_root_and_validates() {
+    // T1153 CORE-33: git reads `.arcconfig` only at the working-copy root; a
+    // subdir file is invisible, and so is any file outside a repository.
     let tmp = TempDir::new("project");
     let child = tmp.path.join("a").join("b");
     std::fs::create_dir_all(&child).unwrap();
+    std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
     std::fs::write(
         tmp.path.join("a").join(".arcconfig"),
+        r#"{"phabricator.uri": "https://sub.example/"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path.join(".arcconfig"),
         r#"{"phabricator.uri": "https://x.example/"}"#,
     )
     .unwrap();
@@ -246,7 +254,13 @@ fn project_config_walks_up_and_validates() {
         map["phabricator.uri"],
         serde_json::json!("https://x.example/")
     );
-    let (none, empty) = read_project_config(&tmp.path).unwrap();
+    let plain = TempDir::new("plain");
+    std::fs::write(
+        plain.path.join(".arcconfig"),
+        r#"{"phabricator.uri": "https://plain.example/"}"#,
+    )
+    .unwrap();
+    let (none, empty) = read_project_config(&plain.path).unwrap();
     assert!(none.is_none() && empty.is_empty());
 
     std::fs::write(tmp.path.join(".arcconfig"), "not json").unwrap();
@@ -279,7 +293,9 @@ fn user_file_reads_config_and_aliases() {
     .unwrap();
     let map = read_user_file(&missing).unwrap();
     assert_eq!(map["editor"], serde_json::json!("nano"));
-    assert_eq!(map["aliases"], serde_json::json!({"a": "b"}));
+    // T1153 CORE-30: with a `config` section, classic `readUserArcConfig()`
+    // returns ONLY the section; top-level `aliases` siblings are dropped.
+    assert!(!map.contains_key("aliases"));
     assert!(!map.contains_key("hosts"));
 
     // Without a `config` section, stock PHP returns the whole file --
@@ -358,6 +374,8 @@ fn system_file_missing_is_empty_and_invalid_fails() {
 #[test]
 fn resolution_follows_source_precedence() {
     let tmp = TempDir::new("resolve");
+    // T1153 CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
     std::fs::write(
         tmp.path.join(".arcconfig"),
         r#"{"editor": "proj", "browser": "proj"}"#,
@@ -394,6 +412,8 @@ fn resolution_follows_source_precedence() {
 #[test]
 fn project_legacy_names_apply() {
     let tmp = TempDir::new("legacy");
+    // T1153 CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
     std::fs::write(
         tmp.path.join(".arcconfig"),
         r#"{"conduit_uri": "https://old.example/"}"#,
@@ -410,6 +430,8 @@ fn project_legacy_names_apply() {
 #[test]
 fn brief_render_matches_php_bytes() {
     let tmp = TempDir::new("brief");
+    // T1153 CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
     std::fs::write(tmp.path.join(".arcconfig"), r#"{"editor": "nano"}"#).unwrap();
     let sources = load_sources(&tmp.path, None).unwrap();
     assert_eq!(
@@ -430,6 +452,8 @@ fn brief_render_matches_php_bytes() {
 #[test]
 fn verbose_render_matches_php_bytes() {
     let tmp = TempDir::new("verbose");
+    // T1153 CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
     std::fs::write(tmp.path.join(".arcconfig"), r#"{"editor": "nano"}"#).unwrap();
     let sources = load_sources(&tmp.path, None).unwrap();
     // Source labels keep PHP's lowercase names; the example row prints
@@ -503,7 +527,10 @@ fn args_accept_flags_separator_and_help() {
         parse_args(&[]).unwrap().unwrap(),
         Options {
             show_source: false,
-            keys: vec![]
+            keys: vec![],
+            config: vec![],
+            config_files: vec![],
+            arcrc_file: None,
         }
     );
     assert!(
@@ -525,4 +552,466 @@ fn args_accept_flags_separator_and_help() {
         .unwrap();
     assert_eq!(opts.keys, ["--weird"]);
     assert!(parse_args(&["--bogus".to_string()]).is_err());
+}
+
+#[test]
+fn r6_core33_find_vcs_root_prefers_innermost_git_first() {
+    let tmp = TempDir::new("vcsroot");
+    assert_eq!(find_vcs_root(&tmp.path), None);
+    // Innermost level wins.
+    let outer = tmp.path.join("outer");
+    let inner = outer.join("inner");
+    std::fs::create_dir_all(inner.join(".hg")).unwrap();
+    std::fs::create_dir_all(outer.join(".git")).unwrap();
+    assert_eq!(find_vcs_root(&inner), Some((VcsKind::Hg, inner.clone())));
+    assert_eq!(find_vcs_root(&outer), Some((VcsKind::Git, outer.clone())));
+    // `.git` wins over `.hg`/`.svn` in one directory, like PHP's `$try`.
+    std::fs::create_dir_all(inner.join(".git")).unwrap();
+    std::fs::create_dir_all(inner.join(".svn")).unwrap();
+    assert_eq!(find_vcs_root(&inner), Some((VcsKind::Git, inner.clone())));
+    // A `.git` file (worktree/submodule pointer) counts like PHP's
+    // `pathExists()`.
+    let work = tmp.path.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join(".git"), "gitdir: /elsewhere\n").unwrap();
+    assert_eq!(find_vcs_root(&work), Some((VcsKind::Git, work)));
+}
+
+#[test]
+fn r6_core34_merged_value_precedence() {
+    let mut sources = empty_sources();
+    sources
+        .system
+        .insert("k".to_string(), serde_json::json!("system"));
+    sources
+        .user
+        .insert("k".to_string(), serde_json::json!("user"));
+    sources
+        .project
+        .insert("k".to_string(), serde_json::json!("project"));
+    sources
+        .local
+        .insert("k".to_string(), serde_json::json!("local"));
+    let plain = MergedConfig {
+        sources,
+        runtime: serde_json::Map::new(),
+    };
+    assert_eq!(
+        merged_value("k", &plain).unwrap(),
+        ("local", serde_json::json!("local"))
+    );
+    let mut runtime = serde_json::Map::new();
+    runtime.insert("k".to_string(), serde_json::json!("runtime"));
+    let with_runtime = MergedConfig {
+        sources: plain.sources,
+        runtime,
+    };
+    assert_eq!(
+        merged_value("k", &with_runtime).unwrap(),
+        (SOURCE_RUNTIME, serde_json::json!("runtime"))
+    );
+    assert!(merged_value("never-set", &with_runtime).is_none());
+    // Project legacy names still resolve through the merge.
+    let mut legacy = empty_sources();
+    legacy.project.insert(
+        "conduit_uri".to_string(),
+        serde_json::json!("https://old.example/"),
+    );
+    let merged = MergedConfig {
+        sources: legacy,
+        runtime: serde_json::Map::new(),
+    };
+    assert_eq!(
+        merged_value("phabricator.uri", &merged).unwrap().0,
+        "project"
+    );
+}
+
+#[test]
+fn r6_core34_checked_value_type_errors() {
+    let mut sources = empty_sources();
+    sources
+        .project
+        .insert("editor".to_string(), serde_json::json!(42));
+    let merged = MergedConfig {
+        sources,
+        runtime: serde_json::Map::new(),
+    };
+    assert_eq!(
+        checked_value("editor", &merged).unwrap_err(),
+        "Type of setting 'editor' must be string."
+    );
+    let mut sources = empty_sources();
+    sources
+        .user
+        .insert("history.immutable".to_string(), serde_json::json!("yes"));
+    let merged = MergedConfig {
+        sources,
+        runtime: serde_json::Map::new(),
+    };
+    assert_eq!(
+        checked_value("history.immutable", &merged).unwrap_err(),
+        "Type of setting 'history.immutable' must be boolean."
+    );
+    // A bad lower value errors even below a valid winner, like PHP's
+    // `getConfigFromAllSources()`.
+    let mut sources = empty_sources();
+    sources
+        .local
+        .insert("load".to_string(), serde_json::json!(["ok"]));
+    sources
+        .user
+        .insert("load".to_string(), serde_json::json!("nope"));
+    let merged = MergedConfig {
+        sources,
+        runtime: serde_json::Map::new(),
+    };
+    assert_eq!(
+        checked_value("load", &merged).unwrap_err(),
+        "Type of setting 'load' must be list."
+    );
+    // JSON objects pass `list`: PHP decodes to associative arrays.
+    let mut sources = empty_sources();
+    sources
+        .project
+        .insert("load".to_string(), serde_json::json!({"a": "b"}));
+    let merged = MergedConfig {
+        sources,
+        runtime: serde_json::Map::new(),
+    };
+    assert_eq!(
+        checked_value("load", &merged).unwrap().unwrap().0,
+        "project"
+    );
+    // Builtin defaults read unchecked.
+    let merged = MergedConfig {
+        sources: empty_sources(),
+        runtime: serde_json::Map::new(),
+    };
+    assert_eq!(
+        checked_value("arc.autostash", &merged).unwrap().unwrap(),
+        ("default", serde_json::json!(false))
+    );
+}
+
+#[test]
+fn r6_core34_config_file_shadows_system_user() {
+    let tmp = TempDir::new("conffile");
+    let user_file = tmp.path.join("arcrc.json");
+    std::fs::write(&user_file, r#"{"config": {"editor": "user"}}"#).unwrap();
+    let first = tmp.path.join("first.json");
+    let second = tmp.path.join("second.json");
+    std::fs::write(&first, r#"{"editor": "first"}"#).unwrap();
+    std::fs::write(&second, r#"{"editor": "second"}"#).unwrap();
+    // Without `--config-file`, the user value shows.
+    let merged = load_merged(&tmp.path, Some(&user_file), &LoadOptions::default()).unwrap();
+    assert_eq!(merged.sources.user["editor"], serde_json::json!("user"));
+    // With `--config-file`s, user+system go empty and later files win.
+    let opts = LoadOptions {
+        config_files: vec![first, second, tmp.path.join("missing.json")],
+        ..Default::default()
+    };
+    let merged = load_merged(&tmp.path, Some(&user_file), &opts).unwrap();
+    assert!(merged.sources.user.is_empty());
+    assert_eq!(
+        merged_value("editor", &merged).unwrap(),
+        ("system", serde_json::json!("second"))
+    );
+}
+
+#[test]
+fn r6_core34_arcrc_file_redirects_user_source() {
+    let tmp = TempDir::new("arcrcfile");
+    let custom = tmp.path.join("custom.json");
+    std::fs::write(&custom, r#"{"config": {"editor": "custom"}}"#).unwrap();
+    let opts = LoadOptions {
+        arcrc_file: Some(custom),
+        ..Default::default()
+    };
+    let merged = load_merged(&tmp.path, None, &opts).unwrap();
+    assert_eq!(
+        merged_value("editor", &merged).unwrap(),
+        ("user", serde_json::json!("custom"))
+    );
+    // A missing custom file errors, like PHP's
+    // `setUserConfigurationFileLocation()`.
+    let missing = LoadOptions {
+        arcrc_file: Some(tmp.path.join("nope.json")),
+        ..Default::default()
+    };
+    assert_eq!(
+        load_merged(&tmp.path, None, &missing).unwrap_err(),
+        "Custom arcrc file was specified, but it was not found!"
+    );
+    assert_eq!(
+        resolve_user_file(None, Some(Path::new("nope.json"))).unwrap_err(),
+        "Custom arcrc file was specified, but it was not found!"
+    );
+}
+
+#[test]
+fn r6_core34_runtime_excluded_from_display() {
+    // Stock `get-config` never shows `--config` values: display reads the
+    // static sources only.
+    let mut runtime = serde_json::Map::new();
+    runtime.insert("editor".to_string(), serde_json::json!("rt"));
+    runtime.insert("zzz-unknown".to_string(), serde_json::json!("rt"));
+    let merged = MergedConfig {
+        sources: empty_sources(),
+        runtime,
+    };
+    assert_eq!(merged_value("editor", &merged).unwrap().0, SOURCE_RUNTIME);
+    assert!(current_value("editor", &merged.sources).is_none());
+    assert!(!all_keys(&merged.sources).contains(&"zzz-unknown".to_string()));
+    let text = render_ansi("editor", &merged.sources, true, false);
+    assert!(text.contains("Current Value: -"), "{text}");
+    assert!(!text.contains("\"rt\""), "{text}");
+}
+
+#[test]
+fn r6_core34_cli_flags_parse_both_forms() {
+    let opts = parse_args(&[
+        "--config".to_string(),
+        "a=1".to_string(),
+        "--config=b=2".to_string(),
+        "--config-file".to_string(),
+        "f".to_string(),
+        "--arcrc-file=g".to_string(),
+    ])
+    .unwrap()
+    .unwrap();
+    assert_eq!(opts.config, ["a=1", "b=2"]);
+    assert_eq!(opts.config_files, ["f"]);
+    assert_eq!(opts.arcrc_file.as_deref(), Some("g"));
+    assert!(parse_args(&["--config".to_string()]).is_err());
+    let cli = load_options_from_cli(&opts.config, &opts.config_files, opts.arcrc_file.as_deref())
+        .unwrap();
+    assert_eq!(cli.runtime["a"], serde_json::json!("1"));
+    assert_eq!(cli.config_files, [PathBuf::from("f")]);
+    assert_eq!(cli.arcrc_file, Some(PathBuf::from("g")));
+    assert!(load_options_from_cli(&["lone".to_string()], &[], None).is_err());
+}
+
+#[test]
+fn core28_toolset_user_file_merges_section_and_top_level() {
+    let tmp = TempDir::new("core28");
+    let file = tmp.path.join(".arcrc");
+    std::fs::write(
+        &file,
+        r#"{
+            "hosts": {"https://h/api/": {"token": "t"}},
+            "config": {"editor": "nano", "aliases": ["section"]},
+            "aliases": ["top"],
+            "prompts": []
+        }"#,
+    )
+    .unwrap();
+    let map = read_user_file_toolset(&file).unwrap();
+    // Section wins collisions; other top-level keys merge in.
+    assert_eq!(map["editor"], serde_json::json!("nano"));
+    assert_eq!(map["aliases"], serde_json::json!(["section"]));
+    assert_eq!(map["prompts"], serde_json::json!([]));
+    // `hosts` and `config` are subtracted like PHP's `$subtract`.
+    assert!(!map.contains_key("hosts"));
+    assert!(!map.contains_key("config"));
+
+    // Without a section, the whole file minus `hosts`/`config` merges.
+    std::fs::write(&file, r#"{"hosts": {}, "aliases": ["top"]}"#).unwrap();
+    let map = read_user_file_toolset(&file).unwrap();
+    assert_eq!(map["aliases"], serde_json::json!(["top"]));
+    assert!(!map.contains_key("hosts"));
+
+    assert!(
+        read_user_file_toolset(&tmp.path.join("missing"))
+            .unwrap()
+            .is_empty()
+    );
+    std::fs::write(&file, "broken").unwrap();
+    assert!(
+        read_user_file_toolset(&file)
+            .unwrap_err()
+            .contains("~/.arcrc")
+    );
+}
+
+#[test]
+fn core30_classic_user_file_drops_all_top_level_siblings() {
+    // `user_file_reads_config_and_aliases` pins `aliases`/`hosts`; this
+    // pins every other top-level sibling next to a `config` section.
+    let tmp = TempDir::new("core30");
+    let file = tmp.path.join(".arcrc");
+    std::fs::write(
+        &file,
+        r#"{"config": {"editor": "nano"}, "editor": "top", "prompts": [], "other": 1}"#,
+    )
+    .unwrap();
+    let map = read_user_file(&file).unwrap();
+    assert_eq!(map.len(), 1);
+    assert_eq!(map["editor"], serde_json::json!("nano"));
+}
+
+#[test]
+fn core31_project_empty_key_answers_keys_without_legacy() {
+    let mut sources = empty_sources();
+    sources
+        .project
+        .insert("".to_string(), serde_json::json!("fallback"));
+    // `editor` has no legacy name, so PHP's null-key lookup hits `""`.
+    assert_eq!(
+        value_at("editor", "project", &sources).unwrap(),
+        serde_json::json!("fallback")
+    );
+    // Unknown keys behave the same (no setting row, no legacy name).
+    assert_eq!(
+        value_at("whatever.custom", "project", &sources).unwrap(),
+        serde_json::json!("fallback")
+    );
+    // Other sources never consult `""`.
+    sources.user.insert("".to_string(), serde_json::json!("u"));
+    assert!(value_at("editor", "user", &sources).is_none());
+    assert!(value_at("editor", "local", &sources).is_none());
+    // A canonical value wins over `""`.
+    sources
+        .project
+        .insert("editor".to_string(), serde_json::json!("vi"));
+    assert_eq!(
+        value_at("editor", "project", &sources).unwrap(),
+        serde_json::json!("vi")
+    );
+    // A key WITH a legacy name consults only that name, never `""`.
+    let mut sources = empty_sources();
+    sources
+        .project
+        .insert("".to_string(), serde_json::json!("fallback"));
+    assert!(value_at("phabricator.uri", "project", &sources).is_none());
+    sources.project.insert(
+        "conduit_uri".to_string(),
+        serde_json::json!("https://legacy.example/"),
+    );
+    assert_eq!(
+        value_at("phabricator.uri", "project", &sources).unwrap(),
+        serde_json::json!("https://legacy.example/")
+    );
+}
+
+#[test]
+fn core32_local_config_reads_git_hg_and_svn() {
+    for meta in [".git", ".hg", ".svn"] {
+        let tmp = TempDir::new("core32");
+        let child = tmp.path.join("sub");
+        std::fs::create_dir_all(&child).unwrap();
+        // The marker sits at the working-copy root, like PHP's
+        // `$localMetaDir`; reads from a subdirectory find it.
+        std::fs::create_dir_all(tmp.path.join(meta).join("arc")).unwrap();
+        std::fs::write(
+            tmp.path.join(meta).join("arc").join("config"),
+            r#"{"editor": "local"}"#,
+        )
+        .unwrap();
+        let map = read_local_config(&child).unwrap();
+        assert_eq!(map["editor"], serde_json::json!("local"), "{meta}");
+    }
+    // Present marker without a config file still reads empty.
+    let tmp = TempDir::new("core32empty");
+    std::fs::create_dir_all(tmp.path.join(".hg")).unwrap();
+    assert!(read_local_config(&tmp.path).unwrap().is_empty());
+}
+
+#[test]
+fn core33_project_discovery_svn_nearest_hg_root() {
+    // Subversion: nearest `.arcconfig` from `dir` up to the root wins.
+    let tmp = TempDir::new("core33svn");
+    let child = tmp.path.join("a").join("b");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::create_dir_all(tmp.path.join(".svn")).unwrap();
+    std::fs::write(
+        tmp.path.join(".arcconfig"),
+        r#"{"phabricator.uri": "https://root.example/"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path.join("a").join(".arcconfig"),
+        r#"{"phabricator.uri": "https://near.example/"}"#,
+    )
+    .unwrap();
+    let (file, map) = read_project_config(&child).unwrap();
+    assert_eq!(file.unwrap().parent().unwrap(), tmp.path.join("a"));
+    assert_eq!(
+        map["phabricator.uri"],
+        serde_json::json!("https://near.example/")
+    );
+    // Mercurial: root-only, like git; a subdir file is invisible.
+    let tmp = TempDir::new("core33hg");
+    let child = tmp.path.join("a");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::create_dir_all(tmp.path.join(".hg")).unwrap();
+    std::fs::write(
+        tmp.path.join("a").join(".arcconfig"),
+        r#"{"phabricator.uri": "https://sub.example/"}"#,
+    )
+    .unwrap();
+    let (none, empty) = read_project_config(&child).unwrap();
+    assert!(none.is_none() && empty.is_empty());
+}
+#[test]
+fn r10_get_config_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "GET-CONFIG WORKFLOW\n\
+         \n\
+         get-config\n\
+         \x20     get-config [options] -- [name ...]\n\
+         \n\
+         \x20         Supports: cli\n\
+         \x20         Reads an arc configuration option. With no argument, reads all\n\
+         \x20         options.\n\
+         \n\
+         \x20         With --verbose, shows detailed information about one or more\n\
+         \x20         options.\n\
+         \n\
+         \x20     --verbose\n\
+         \x20         Show detailed information about options.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("GET-CONFIG WORKFLOW"), "{}", usage());
+}
+
+#[test]
+fn b21_get_config_needs_no_terminator() {
+    // T1153 B21/B23 VERIFIED for `get-config`: it is a classic
+    // workflow, so PHP runs it via the `scripts/arcanist.php`
+    // re-exec, which never requires `--`. Parsing takes no TTY
+    // input, so piped-style argv parses directly, and `--help`
+    // without `--` still succeeds.
+    assert!(
+        parse_args(&["arc.land.onto".to_string()])
+            .unwrap()
+            .is_some()
+    );
+    assert!(parse_args(&["--help".to_string()]).unwrap().is_none());
+    let text = usage_text(false);
+    assert!(text.contains("GET-CONFIG WORKFLOW"), "{text}");
+}
+
+#[test]
+fn b23_get_config_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help get-config`.
+    let text = usage_text(false);
+    assert!(text.starts_with("GET-CONFIG WORKFLOW\n"), "{text}");
+    assert!(
+        text.contains("Reads an arc configuration option."),
+        "{text}"
+    );
+    assert!(text.contains("--verbose"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }

@@ -194,9 +194,12 @@ fn missing_value_fails() {
 fn empty_equals_value_stores_empty() {
     let options = options_of(&["--diff="]);
     assert_eq!(options.diff.as_deref(), Some(""));
+    // PATCH-P13: PHP skips falsy values, so an empty `--diff` means no
+    // source was given.
     assert_eq!(
         select_source(&options).unwrap_err(),
-        "invalid diff '': expected D12345"
+        "You must specify changes to apply to the working copy with \"D12345\", \"--revision\", \
+         \"--diff\", \"--arcbundle\", or \"--patch\"."
     );
 }
 
@@ -232,22 +235,14 @@ fn check_supports_restricts_vcs() {
 
 #[test]
 fn normalizes_ids() {
+    // PATCH-P13: revisions strip one D and pass through; diffs pass raw.
     assert_eq!(normalize_revision_id("D123").unwrap(), "123");
     assert_eq!(normalize_revision_id("d123").unwrap(), "123");
     assert_eq!(normalize_revision_id("123").unwrap(), "123");
-    assert_eq!(normalize_diff_id("D9").unwrap(), "9");
-    assert_eq!(
-        normalize_revision_id("Dx").unwrap_err(),
-        "invalid revision 'Dx': expected D12345"
-    );
-    assert_eq!(
-        normalize_revision_id("").unwrap_err(),
-        "invalid revision '': expected D12345"
-    );
-    assert_eq!(
-        normalize_diff_id("abc").unwrap_err(),
-        "invalid diff 'abc': expected D12345"
-    );
+    assert_eq!(normalize_diff_id("D9").unwrap(), "D9");
+    assert_eq!(normalize_revision_id("Dx").unwrap(), "x");
+    assert_eq!(normalize_revision_id("").unwrap(), "");
+    assert_eq!(normalize_diff_id("abc").unwrap(), "abc");
 }
 
 #[test]
@@ -290,10 +285,11 @@ fn source_selection_enforces_exclusivity() {
         "Options \"D12345\", \"--revision\", \"--diff\", \"--arcbundle\" and \"--patch\" are \
          mutually exclusive. Choose exactly one patch source."
     );
-    assert!(
-        select_source(&options_of(&["nope"]))
-            .unwrap_err()
-            .contains("invalid revision")
+    // PATCH-P13: non-numeric names pass through to Conduit, which fails
+    // server-side; there is no local validation left.
+    assert_eq!(
+        select_source(&options_of(&["nope"])).unwrap(),
+        Source::Named("nope".to_string())
     );
 }
 
@@ -319,13 +315,45 @@ fn bundle_helpers() {
 
 #[test]
 fn decodes_bytes() {
-    assert_eq!(decode_bytes(b"plain", None), "plain");
-    assert_eq!(decode_bytes(b"plain", Some("UTF-8")), "plain");
-    assert_eq!(decode_bytes(b"plain", Some("utf8")), "plain");
-    assert_eq!(decode_bytes(b"\xff", None), "\u{FFFD}");
-    assert_eq!(decode_bytes(&[0xE9], Some("latin1")), "é");
-    assert_eq!(decode_bytes(&[0x80], Some("windows-1252")), "€");
-    assert_eq!(decode_bytes(&[0x81], Some("latin1")), "\u{FFFD}");
+    assert_eq!(decode_bytes(b"plain", None).unwrap(), "plain");
+    assert_eq!(decode_bytes(b"plain", Some("UTF-8")).unwrap(), "plain");
+    assert_eq!(decode_bytes(b"plain", Some("utf8")).unwrap(), "plain");
+    assert_eq!(decode_bytes(b"\xff", None).unwrap(), "\u{FFFD}");
+    assert_eq!(decode_bytes(&[0xE9], Some("latin1")).unwrap(), "é");
+    assert_eq!(decode_bytes(&[0x80], Some("windows-1252")).unwrap(), "€");
+    // Latin-1 maps 1:1 (a control scalar here, not U+FFFD).
+    assert_eq!(decode_bytes(&[0x81], Some("latin1")).unwrap(), "");
+    // Valid UTF-8 passes through untouched whatever the encoding reads.
+    assert_eq!(
+        decode_bytes("café\n".as_bytes(), Some("windows-1252")).unwrap(),
+        "café\n"
+    );
+    // Unknown encodings throw.
+    assert_eq!(
+        decode_bytes(b"\xff", Some("shift-jis")).unwrap_err(),
+        "Unknown encoding \"shift-jis\"."
+    );
+}
+
+#[test]
+fn encodes_bytes_to_target() {
+    assert_eq!(encode_bytes("café\n", None).unwrap(), "café\n".as_bytes());
+    assert_eq!(
+        encode_bytes("café\n", Some("UTF-8")).unwrap(),
+        "café\n".as_bytes()
+    );
+    assert_eq!(
+        encode_bytes("café €\n", Some("windows-1252")).unwrap(),
+        b"caf\xe9 \x80\n".to_vec()
+    );
+    assert_eq!(
+        encode_bytes("café\n", Some("latin1")).unwrap(),
+        b"caf\xe9\n".to_vec()
+    );
+    assert_eq!(
+        encode_bytes("x", Some("shift-jis")).unwrap_err(),
+        "Unknown encoding \"shift-jis\"."
+    );
 }
 
 #[test]
@@ -365,14 +393,14 @@ fn gap2_cp1252_table_covers_all_bytes() {
     assert_eq!(specials.len(), 27);
     for (byte, expected) in specials {
         assert_eq!(
-            decode_bytes(&[*byte], Some("windows-1252")),
+            decode_bytes(&[*byte], Some("windows-1252")).unwrap(),
             expected.to_string(),
             "byte 0x{byte:02X}"
         );
     }
     for byte in [0x81u8, 0x8D, 0x8F, 0x90, 0x9D] {
         assert_eq!(
-            decode_bytes(&[byte], Some("windows-1252")),
+            decode_bytes(&[byte], Some("windows-1252")).unwrap(),
             "\u{FFFD}",
             "byte 0x{byte:02X}"
         );
@@ -383,12 +411,12 @@ fn gap2_cp1252_table_covers_all_bytes() {
         }
         let expected = char::from_u32(u32::from(byte)).unwrap().to_string();
         assert_eq!(
-            decode_bytes(&[byte], Some("cp1252")),
+            decode_bytes(&[byte], Some("cp1252")).unwrap(),
             expected,
             "byte 0x{byte:02X}"
         );
     }
-    assert_eq!(decode_bytes(&[0x80], None), "\u{FFFD}");
+    assert_eq!(decode_bytes(&[0x80], None).unwrap(), "\u{FFFD}");
 }
 
 #[test]
@@ -427,6 +455,7 @@ fn file_bundle_rejects_empty_stdin() {
         bundle,
         Bundle {
             text: "diff --git a/f.txt b/f.txt\n".to_string(),
+            encoding: Some("utf-8".to_string()),
             ..Bundle::default()
         }
     );
@@ -437,15 +466,20 @@ fn file_bundle_decodes_with_encoding() {
     let dir = temp_dir("file_bundle_enc");
     let path = dir.join("fix.patch");
     let mut bytes = b"diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+".to_vec();
-    bytes.push(0x80);
+    bytes.push(0xE9);
     bytes.push(b'\n');
     std::fs::write(&path, &bytes).unwrap();
     let mut io = Io::buffered();
     let bundle = load_file_bundle(&path.to_string_lossy(), Some("latin1"), &mut io).unwrap();
-    assert_eq!(
-        bundle.text,
-        "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+€\n"
-    );
+    // T1153 EXPORT-E9: the raw byte rides as transport and the encoding
+    // converts at the sinks, like `convertNonUTF8Diff()` (invalid bytes
+    // become `?`, like `mb_convert_encoding()`).
+    assert_eq!(bundle.text, transport_bytes(&bytes));
+    assert_eq!(bundle.encoding.as_deref(), Some("latin1"));
+    let mut converted = bytes.clone();
+    let last = converted.len() - 2;
+    converted[last] = b'?';
+    assert_eq!(bundle_patch_bytes(&bundle).unwrap(), converted);
 }
 
 #[test]
@@ -456,6 +490,23 @@ fn quotes_git_targets() {
     assert_eq!(quote_git_target("a\nb"), "\"a\\nb\"");
     assert_eq!(quote_git_target("a\tb"), "\"a\\tb\"");
     assert_eq!(quote_git_target("a\x01b"), "\"a\\001b\"");
+}
+
+fn parsed_hunk(
+    old_start: u64,
+    old_len: u64,
+    new_start: u64,
+    new_len: u64,
+    corpus: &str,
+) -> crate::diff_local::ParsedHunk {
+    crate::diff_local::ParsedHunk {
+        old_start,
+        old_len,
+        new_start,
+        new_len,
+        corpus: corpus.to_string(),
+        synthetic_counts: None,
+    }
 }
 
 fn bundle_change(change_type: u32, old: Option<&str>, current: Option<&str>) -> BundleChange {
@@ -479,11 +530,11 @@ fn bundle_change(change_type: u32, old: Option<&str>, current: Option<&str>) -> 
 fn renders_add_change_delete() {
     let mut changes = vec![
         BundleChange {
-            hunks: vec!["@@ -0,0 +1 @@\n+hi\n".to_string()],
+            hunks: vec![parsed_hunk(0, 0, 1, 1, "+hi\n")],
             ..bundle_change(TYPE_ADD, None, Some("new.txt"))
         },
         BundleChange {
-            hunks: vec!["@@ -1 +1 @@\n-a\n+b\n".to_string()],
+            hunks: vec![parsed_hunk(1, 1, 1, 1, "-a\n+b\n")],
             ..bundle_change(TYPE_CHANGE, Some("old.txt"), Some("old.txt"))
         },
         BundleChange {
@@ -601,7 +652,7 @@ fn multicopy_without_sibling_fails() {
 #[test]
 fn render_appends_missing_trailing_newline() {
     let mut changes = vec![BundleChange {
-        hunks: vec!["@@ -1 +1 @@\n-a\n+b".to_string()],
+        hunks: vec![parsed_hunk(1, 1, 1, 1, "-a\n+b")],
         ..bundle_change(TYPE_CHANGE, Some("a.txt"), Some("a.txt"))
     }];
     let text = render_git_patch(&mut changes).unwrap();
@@ -710,12 +761,14 @@ fn parses_diff_rows_as_map_or_list() {
     });
     let rows = parse_diff_rows(&map);
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].id, 3);
-    assert_eq!(rows[1].id, 5);
-    assert_eq!(rows[1].revision_id, Some(9));
-    assert_eq!(rows[1].base_revision, "base");
-    assert_eq!(rows[1].author_name, "Ada");
-    assert_eq!(rows[1].author_email, "ada@test");
+    // PATCH-P3: server order is kept (no id sort); the map above lists 5
+    // before 3, so 5 stays head.
+    assert_eq!(rows[0].id, 5);
+    assert_eq!(rows[1].id, 3);
+    assert_eq!(rows[0].revision_id, Some(9));
+    assert_eq!(rows[0].base_revision, "base");
+    assert_eq!(rows[0].author_name, "Ada");
+    assert_eq!(rows[0].author_email, "ada@test");
     let list = serde_json::json!([{"id": 1}]);
     assert_eq!(parse_diff_rows(&list).len(), 1);
     assert!(parse_diff_rows(&serde_json::json!("x")).is_empty());
@@ -739,26 +792,36 @@ fn extracts_raw_diff_text() {
     assert_eq!(raw_diff_text(&serde_json::json!({})), None);
 }
 
-fn diff_responses(raw: serde_json::Value) -> std::collections::HashMap<String, serde_json::Value> {
-    std::collections::HashMap::from([
-        (
-            diff_submit::METHOD_QUERY_DIFFS.to_string(),
-            serde_json::json!({
-                "1": {"id": 1, "revisionID": 7, "sourceControlBaseRevision": "base1",
-                      "authorName": "Ada", "authorEmail": "ada@test"},
-                "2": {"id": 2, "revisionID": 7, "sourceControlBaseRevision": "base2",
-                      "authorName": "Ada", "authorEmail": "ada@test"}
-            }),
-        ),
-        (METHOD_GET_RAW_DIFF.to_string(), raw),
-    ])
+fn diff_responses() -> std::collections::HashMap<String, serde_json::Value> {
+    let change = serde_json::json!({
+        "type": "2", "fileType": "1",
+        "oldPath": "a.txt", "currentPath": "a.txt",
+        "hunks": [{"oldOffset": "1", "oldLength": "1",
+                   "newOffset": "1", "newLength": "1",
+                   "corpus": "-a\n+b\n"}],
+    });
+    std::collections::HashMap::from([(
+        diff_submit::METHOD_QUERY_DIFFS.to_string(),
+        // PATCH-P3: server order is id DESC (newest first), so the head row
+        // carries the latest changes.
+        serde_json::json!({
+            "2": {"id": "2", "revisionID": "7", "sourceControlBaseRevision": "base2",
+                  "authorName": "Ada", "authorEmail": "ada@test",
+                  "changes": [change]},
+            "1": {"id": "1", "revisionID": "7", "sourceControlBaseRevision": "base1",
+                  "authorName": "Ada", "authorEmail": "ada@test", "changes": []},
+        }),
+    )])
 }
 
 #[test]
 fn fetches_latest_diff_bundle() {
-    let call = stub_call(diff_responses(serde_json::json!("patch text")));
+    let call = stub_call(diff_responses());
     let bundle = fetch_revision_bundle(&call, 7).unwrap();
-    assert_eq!(bundle.text, "patch text");
+    assert_eq!(
+        bundle.text,
+        "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+b\n\n"
+    );
     assert_eq!(bundle.base_revision.as_deref(), Some("base2"));
     assert_eq!(bundle.revision_id, Some(7));
     assert_eq!(bundle.author_name.as_deref(), Some("Ada"));
@@ -767,9 +830,13 @@ fn fetches_latest_diff_bundle() {
 
 #[test]
 fn fetch_prefers_row_revision_when_unset() {
-    let call = stub_call(diff_responses(serde_json::json!({"rawDiff": "rd"})));
+    let call = stub_call(diff_responses());
     let bundle = fetch_conduit_bundle(&call, &serde_json::json!({"ids": [2]}), None).unwrap();
-    assert_eq!(bundle.text, "rd");
+    assert!(
+        bundle.text.contains("@@ -1 +1 @@\n-a\n+b\n"),
+        "{}",
+        bundle.text
+    );
     assert_eq!(bundle.revision_id, Some(7));
 }
 
@@ -786,12 +853,16 @@ fn fetch_fails_without_diffs() {
 }
 
 #[test]
-fn fetch_fails_on_bad_raw_diff() {
-    let call = stub_call(diff_responses(serde_json::json!({"nonsense": true})));
-    assert_eq!(
-        fetch_diff_bundle(&call, 2).unwrap_err(),
-        "differential.getrawdiff returned an unexpected response"
-    );
+fn fetch_renders_empty_text_without_changes() {
+    let call = stub_call(std::collections::HashMap::from([(
+        diff_submit::METHOD_QUERY_DIFFS.to_string(),
+        serde_json::json!({
+            "2": {"id": "2", "revisionID": "7", "sourceControlBaseRevision": "base2",
+                  "authorName": "Ada", "authorEmail": "ada@test"},
+        }),
+    )]));
+    let bundle = fetch_diff_bundle(&call, 2).unwrap();
+    assert_eq!(bundle.text, "\n");
 }
 
 #[test]
@@ -861,7 +932,7 @@ fn loads_each_bundle_kind() {
     assert_eq!(loaded.bundle.text, "diff --git a/f b/f\n");
     assert!(loaded.arcbundle_dicts.is_none());
 
-    let call = stub_call(diff_responses(serde_json::json!("raw")));
+    let call = stub_call(diff_responses());
     let loaded = load_bundle(
         &Source::Revision("7".to_string()),
         &options,
@@ -869,7 +940,7 @@ fn loads_each_bundle_kind() {
         Some(&call),
     )
     .unwrap();
-    assert_eq!(loaded.bundle.text, "raw");
+    assert!(loaded.bundle.text.contains("@@ -1 +1 @@\n-a\n+b\n"));
     assert_eq!(loaded.bundle.revision_id, Some(7));
     let loaded = load_bundle(
         &Source::Named("7".to_string()),
@@ -886,7 +957,7 @@ fn loads_each_bundle_kind() {
         Some(&call),
     )
     .unwrap();
-    assert_eq!(loaded.bundle.text, "raw");
+    assert!(loaded.bundle.text.contains("@@ -1 +1 @@\n-a\n+b\n"));
 
     let bundle_path = write_arcbundle(
         &dir,
@@ -895,9 +966,9 @@ fn loads_each_bundle_kind() {
             ("meta.json", br#"{"revisionID":3}"#),
             (
                 "changes.json",
-                br#"[{"type":2,"fileType":1,"oldPath":"a.txt","currentPath":"a.txt","hunks":[{"corpus":0}]}]"#,
+                br#"[{"type":2,"fileType":1,"oldPath":"a.txt","currentPath":"a.txt","hunks":[{"oldOffset":1,"oldLength":1,"newOffset":1,"newLength":1,"corpus":0}]}]"#,
             ),
-            ("hunks/0", b"@@ -1 +1 @@\n-a\n+b\n"),
+            ("hunks/0", b"-a\n+b\n"),
         ],
     );
     let loaded = load_bundle(
@@ -910,34 +981,45 @@ fn loads_each_bundle_kind() {
     assert_eq!(loaded.bundle.revision_id, Some(3));
     let (dicts, corpora) = loaded.arcbundle_dicts.unwrap();
     assert_eq!(dicts.len(), 1);
-    assert_eq!(corpora, vec![vec!["@@ -1 +1 @@\n-a\n+b\n".to_string()]]);
+    assert_eq!(corpora, vec![vec![parsed_hunk(1, 1, 1, 1, "-a\n+b\n")]]);
+    assert!(loaded.bundle.text.contains("@@ -1 +1 @@\n-a\n+b\n"));
 }
 
 #[test]
-fn load_bundle_rejects_bad_ids_and_missing_conduit() {
+fn load_bundle_passes_raw_ids_and_requires_conduit() {
     let options = Options::default();
     let mut io = Io::buffered();
-    let call = stub_call(diff_responses(serde_json::json!("raw")));
-    assert_eq!(
-        load_bundle(
-            &Source::Revision("Dx".to_string()),
-            &options,
-            &mut io,
-            Some(&call)
-        )
-        .unwrap_err(),
-        "invalid revision 'Dx': expected D12345"
-    );
-    assert_eq!(
-        load_bundle(
-            &Source::Diff("Dx".to_string()),
-            &options,
-            &mut io,
-            Some(&call)
-        )
-        .unwrap_err(),
-        "invalid diff 'Dx': expected D12345"
-    );
+    // PATCH-P13: raw ids reach Conduit verbatim (no local validation);
+    // the stub answers regardless, so the loads succeed here and the
+    // server would fail on the real wire.
+    let seen = std::cell::RefCell::new(Vec::new());
+    let call = |method: &str, params: &serde_json::Value| {
+        seen.borrow_mut()
+            .push((method.to_string(), params.to_string()));
+        Ok(serde_json::json!({
+            "2": {"id": "2", "revisionID": "7",
+                  "sourceControlBaseRevision": "base2",
+                  "authorName": "Ada", "authorEmail": "ada@test",
+                  "changes": []},
+        }))
+    };
+    load_bundle(
+        &Source::Revision("x".to_string()),
+        &options,
+        &mut io,
+        Some(&call),
+    )
+    .unwrap();
+    load_bundle(
+        &Source::Diff("D12".to_string()),
+        &options,
+        &mut io,
+        Some(&call),
+    )
+    .unwrap();
+    let seen = seen.borrow();
+    assert!(seen[0].1.contains("\"x\""), "{}", seen[0].1);
+    assert!(seen[1].1.contains("\"D12\""), "{}", seen[1].1);
     for source in [
         Source::Named("7".to_string()),
         Source::Revision("7".to_string()),
@@ -1106,17 +1188,12 @@ fn clean_check_prompts_for_untracked() {
 
 #[test]
 fn clean_check_commit_prompt_paths() {
+    // PATCH-P9: the yes-path now commits via the editor (covered below
+    // through `resolve_uncommitted_tree` with a stub editor; the public
+    // entry would launch the real `$EDITOR` here).
     let repo = make_repo("clean_commit");
     std::fs::write(repo.join("file.txt"), "dirty\n").unwrap();
     let backends = Backends::default();
-    let mut io = Io::canned(&["y"]);
-    let error = require_clean_tree(&repo, Vcs::Git, &backends, &mut io, false).unwrap_err();
-    assert!(error.contains("interactive editor"), "{error}");
-    assert!(
-        io.out.stdout.contains("Unstaged changes in working copy"),
-        "{}",
-        io.out.stdout
-    );
     let mut io = Io::canned(&["n"]);
     assert_eq!(
         require_clean_tree(&repo, Vcs::Git, &backends, &mut io, false).unwrap_err(),
@@ -1288,18 +1365,25 @@ fn loads_dependency_nodes_breadth_first() {
         assert_eq!(method, diff_submit::METHOD_QUERY);
         if params.to_string().contains("\"ids\"") {
             Ok(start.clone())
-        } else if params.to_string().contains("PHID-DREV-2") {
-            Ok(dep2.clone())
         } else {
-            Ok(dep3.clone())
+            let mut rows = dep2.as_array().cloned().unwrap_or_default();
+            rows.extend(dep3.as_array().cloned().unwrap_or_default());
+            Ok(serde_json::Value::Array(rows))
         }
     };
     let has_local = |hash: Option<&str>| hash == Some("local");
     let (nodes, start_phid) = load_dependency_nodes(&call, 1, &has_local, "gtcm").unwrap();
     assert_eq!(start_phid, "PHID-DREV-1");
-    // PHID-DREV-2 is pruned (commit local); PHID-DREV-3 is kept.
-    assert_eq!(nodes.len(), 2);
-    assert_eq!(nodes[1].phid, "PHID-DREV-3");
+    // PATCH-P4: one batched query per level (start + one frontier call).
+    assert_eq!(calls.borrow().len(), 2);
+    assert!(calls.borrow()[1].contains("PHID-DREV-2"));
+    assert!(calls.borrow()[1].contains("PHID-DREV-3"));
+    // PATCH-P5: PHID-DREV-2 is kept with empty edges (commit local);
+    // PHID-DREV-3 is kept with its edges.
+    assert_eq!(nodes.len(), 3);
+    assert_eq!(nodes[1].phid, "PHID-DREV-2");
+    assert!(nodes[1].depends_on.is_empty());
+    assert_eq!(nodes[2].phid, "PHID-DREV-3");
     let empty = stub_call(std::collections::HashMap::from([(
         diff_submit::METHOD_QUERY.to_string(),
         serde_json::json!([]),
@@ -1913,8 +1997,8 @@ fn svn_changes_from_dicts_map() {
         serde_json::json!({"type": 5, "fileType": 5, "oldPath": "l", "currentPath": "l2"}),
     ];
     let corpora = vec![
-        vec!["@@ -0,0 +1 @@\n".to_string(), "+x\n".to_string()],
-        vec!["@@ -1 +1 @@\n-t\n+u\n".to_string()],
+        vec![parsed_hunk(0, 0, 1, 1, "+x\n")],
+        vec![parsed_hunk(1, 1, 1, 1, "-t\n+u\n")],
     ];
     let changes = svn_changes_from_dicts(&dicts, &corpora);
     assert_eq!(changes.len(), 2);
@@ -2333,11 +2417,14 @@ fn sanity_check_paths() {
 
 #[test]
 fn commit_template_is_verbatim() {
+    // PATCH-P12: the ceb template text (`:900-909`), not the invented one.
     assert_eq!(
         COMMIT_TEMPLATE,
-        "\n\n# Enter a commit message.\n#\n# This message will be associated with a Differential \
-         revision.\n#\n# Differential Revision: <URL or ID of the Differential Revision>\n#\n"
+        "\n\n# Enter a commit message for this patch. If you just want to apply the patch to the \
+         working copy without committing, re-run arc patch with the --nocommit flag.\n"
     );
+    assert_eq!(patch_commit_template(None), COMMIT_TEMPLATE);
+    assert!(patch_commit_template(Some("494")).contains("for revision D494."));
 }
 
 #[test]
@@ -2364,14 +2451,17 @@ fn gap2_preview_passes_patch_bytes_through_verbatim() {
 
 #[test]
 fn execute_help_preview_and_errors() {
+    // T1153 B21/B23: `--help` renders the generated workflow help.
     let dir = temp_dir("exec_help");
     let backends = Backends::default();
     let mut io = Io::buffered();
-    let out = execute_with_io(&dir, &argv(&["--help"]), &mut io, &backends).unwrap();
-    assert_eq!(out.stdout, USAGE);
+    // T1153 R10: `--help` renders the generated workflow help (exact
+    // bytes locked by `r10_patch_help_matches_generated_format`).
+    let out = execute_with_io_ansi(&dir, &argv(&["--help"]), &mut io, &backends, false).unwrap();
+    assert_eq!(out.stdout, usage_text(false));
     let mut io = Io::buffered();
     let error = execute_with_io(&dir, &argv(&["--bogus"]), &mut io, &backends).unwrap_err();
-    assert!(error.ends_with(USAGE), "{error}");
+    assert!(error.contains("PATCH WORKFLOW"), "{error}");
     // `--preview` needs no repository for file sources.
     std::fs::write(dir.join("fix.patch"), "diff --git a/f b/f\n").unwrap();
     let patch = dir.join("fix.patch").to_string_lossy().to_string();
@@ -2441,21 +2531,23 @@ fn execute_git_patch_flow() {
 }
 
 #[test]
-fn execute_commit_without_message_fails() {
+fn execute_patch_nocommit_applies_without_editor() {
+    // PATCH-P8: committing without a message now opens the editor (covered
+    // at the resolver level); `--nocommit` still applies cleanly.
     let repo = make_repo("exec_commit");
     let patch = repo.join("fix.patch");
     std::fs::write(&patch, &change_bundle().text).unwrap();
     let patch = patch.to_string_lossy().to_string();
     let backends = Backends::default();
     let mut io = Io::canned(&["y"]);
-    let error = execute_with_io(
+    let out = execute_with_io(
         &repo,
-        &argv(&["--patch", &patch, "--nobranch", "--force"]),
+        &argv(&["--patch", &patch, "--nobranch", "--force", "--nocommit"]),
         &mut io,
         &backends,
     )
-    .unwrap_err();
-    assert!(error.contains("--nocommit"), "{error}");
+    .unwrap();
+    assert!(out.stderr.contains("APPLIED"), "{}", out.stderr);
 }
 
 #[test]
@@ -2491,9 +2583,15 @@ fn execute_pops_stash_on_failure() {
 
 #[test]
 fn run_entry_points() {
+    // T1153 B21/B23: `--help` renders the generated workflow help.
     let dir = temp_dir("run_points");
     assert_eq!(run_in(&dir, &argv(&["--help"])), ExitCode::SUCCESS);
-    assert_eq!(execute(&dir, &argv(&["--help"])).unwrap().stdout, USAGE);
+    assert_eq!(
+        execute_ansi(&dir, &argv(&["--help"]), false)
+            .unwrap()
+            .stdout,
+        usage_text(false)
+    );
     assert_eq!(run(&argv(&["--help"])), ExitCode::SUCCESS);
 }
 
@@ -2575,7 +2673,7 @@ fn gap2_build_binary_add() {
 #[test]
 fn gap2_render_with_blobs_matches_text() {
     let mut text_changes = vec![BundleChange {
-        hunks: vec!["@@ -1 +1 @@\n-a\n+b\n".to_string()],
+        hunks: vec![parsed_hunk(1, 1, 1, 1, "-a\n+b\n")],
         ..bundle_change(TYPE_CHANGE, Some("a.txt"), Some("a.txt"))
     }];
     let expected = render_git_patch(&mut text_changes.clone()).unwrap();
@@ -3015,4 +3113,1163 @@ fn ansi_clean_tree_desc_underlines_path() {
             assert!(!io.out.stdout.contains('\x1b'), "{}", io.out.stdout);
         }
     }
+}
+
+#[test]
+fn dependency_nodes_accept_string_ids() {
+    let node = parse_dependency_node(&serde_json::json!({
+        "phid": "PHID-DREV-1",
+        "id": "494",
+        "auxiliary": {"phabricator:depends-on": ["PHID-DREV-2"]},
+    }))
+    .unwrap();
+    assert_eq!(node.id, 494);
+    assert_eq!(node.depends_on, vec!["PHID-DREV-2".to_string()]);
+    let node = parse_dependency_node(&serde_json::json!({
+        "phid": "PHID-DREV-1",
+        "id": 494,
+    }))
+    .unwrap();
+    assert_eq!(node.id, 494);
+}
+
+#[test]
+fn diff_rows_accept_string_ids() {
+    let rows = parse_diff_rows(&serde_json::json!({
+        "1633": {"id": "1633", "revisionID": "494", "authorName": "a", "authorEmail": "e"},
+    }));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, 1633);
+    assert_eq!(rows[0].revision_id, Some(494));
+}
+
+#[test]
+fn revision_suffix_matches_closed_string_rows() {
+    let call = |_: &str, _: &serde_json::Value| {
+        Ok(serde_json::json!([
+            {"id": "491", "status": "3", "dateModified": "100"},
+            {"id": "492", "status": "1", "dateModified": "200"},
+        ]))
+    };
+    assert_eq!(
+        revision_suffix_for_hash(&call, "gtcm", "abc"),
+        Some(" \\ D491".to_string())
+    );
+}
+
+#[test]
+fn render_hunks_rebuilds_headers_from_offsets() {
+    // Length 1 omits `,len` like git; missing trailing newline is added.
+    assert_eq!(
+        render_hunks(&[parsed_hunk(1, 1, 1, 1, "-a\n+b")]),
+        "@@ -1 +1 @@\n-a\n+b\n"
+    );
+    assert_eq!(
+        render_hunks(&[parsed_hunk(0, 0, 1, 3, "+a\n+b\n+c\n")]),
+        "@@ -0,0 +1,3 @@\n+a\n+b\n+c\n"
+    );
+    assert_eq!(render_hunks(&[]), "");
+}
+
+#[test]
+fn conduit_hunks_coerce_string_offsets() {
+    let hunks = conduit_hunks_from_dict(&serde_json::json!({
+        "hunks": [
+            {"oldOffset": "1", "oldLength": "1", "newOffset": "1",
+             "newLength": "1", "corpus": "-a\n+b\n"},
+            {"corpus": "+x\n"},
+        ],
+    }));
+    assert_eq!(
+        hunks,
+        vec![
+            parsed_hunk(1, 1, 1, 1, "-a\n+b\n"),
+            parsed_hunk(0, 0, 0, 0, "+x\n"),
+        ]
+    );
+    assert!(conduit_hunks_from_dict(&serde_json::json!({})).is_empty());
+}
+
+#[test]
+fn break_hunk_splits_seven_line_gaps_like_diff_u() {
+    // PHI838: 7 unchanged lines between changes split into two hunks.
+    let mut body = vec!["-old".to_string(), "+new".to_string()];
+    for i in 0..7 {
+        body.push(format!(" ctx{i}"));
+    }
+    body.push("-gone".to_string());
+    body.push("+here".to_string());
+    let corpus = body.join("\n") + "\n";
+    let small = break_hunk_into_small_hunks(&parsed_hunk(10, 9, 10, 9, &corpus));
+    assert_eq!(small.len(), 2);
+    assert_eq!(
+        (
+            small[0].old_start,
+            small[0].old_len,
+            small[0].new_start,
+            small[0].new_len
+        ),
+        (10, 4, 10, 4)
+    );
+    assert_eq!(
+        (
+            small[1].old_start,
+            small[1].old_len,
+            small[1].new_start,
+            small[1].new_len
+        ),
+        (15, 4, 15, 4)
+    );
+    assert!(small[0].corpus.ends_with(" ctx2\n"));
+    assert!(small[1].corpus.starts_with(" ctx4\n"));
+}
+
+#[test]
+fn break_hunk_keeps_small_changes_whole() {
+    // Lengths recompute from the corpus; input lengths are ignored.
+    let small = break_hunk_into_small_hunks(&parsed_hunk(1, 99, 1, 99, " a\n-b\n+b\n c\n"));
+    assert_eq!(small.len(), 1);
+    assert_eq!(
+        (
+            small[0].old_start,
+            small[0].old_len,
+            small[0].new_start,
+            small[0].new_len
+        ),
+        (1, 3, 1, 3)
+    );
+    assert_eq!(small[0].corpus, " a\n-b\n+b\n c\n");
+}
+
+#[test]
+fn break_hunk_matches_server_split_live_vector() {
+    // D494 `.arclint`: one stored hunk (1,86,1,109) renders as the same
+    // two headers orsay serves.
+    let corpus = include_str!("../tests/fixtures/patch/arclint-live-corpus.txt");
+    let small = break_hunk_into_small_hunks(&parsed_hunk(1, 86, 1, 109, corpus));
+    assert_eq!(small.len(), 2);
+    assert_eq!(
+        (
+            small[0].old_start,
+            small[0].old_len,
+            small[0].new_start,
+            small[0].new_len
+        ),
+        (8, 6, 8, 13)
+    );
+    assert_eq!(
+        (
+            small[1].old_start,
+            small[1].old_len,
+            small[1].new_start,
+            small[1].new_len
+        ),
+        (58, 15, 65, 31)
+    );
+    let rendered = render_hunks(&[parsed_hunk(1, 86, 1, 109, corpus)]);
+    assert!(rendered.contains("@@ -8,6 +8,13 @@\n"), "{rendered:.200}");
+    assert!(
+        rendered.contains("@@ -58,15 +65,31 @@\n"),
+        "{rendered:.200}"
+    );
+}
+
+/* T1153 PATCH-P findings: string-id monograms, raw id fetches. */
+
+#[test]
+fn p6_dependency_monograms_accept_string_ids() {
+    // Orsay types `differential.query` ids as strings; the whole plan
+    // must still yield children.
+    let repo = make_repo("p6_string_monograms");
+    let bundle = Bundle {
+        revision_id: Some(1),
+        ..Bundle::default()
+    };
+    let options = Options::default();
+    let mut io = Io::buffered();
+    let start = serde_json::json!([{
+        "phid": "PHID-DREV-1", "id": "1",
+        "auxiliary": {"phabricator:depends-on": ["PHID-DREV-2"]}
+    }]);
+    let dep = serde_json::json!([{
+        "phid": "PHID-DREV-2", "id": "2", "auxiliary": {}
+    }]);
+    let both = serde_json::json!([
+        {"phid": "PHID-DREV-1", "id": "1"},
+        {"phid": "PHID-DREV-2", "id": "2"}
+    ]);
+    let graph = |_: &str, params: &serde_json::Value| {
+        let text = params.to_string();
+        if text.contains("\"ids\"") {
+            Ok(start.clone())
+        } else if text.contains("PHID-DREV-1") {
+            Ok(both.clone())
+        } else {
+            Ok(dep.clone())
+        }
+    };
+    let children =
+        plan_dependency_children(&repo, Vcs::Git, &bundle, &options, &mut io, &graph).unwrap();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].revision.as_deref(), Some("D2"));
+}
+
+#[test]
+fn p8_editor_fallback_commits_without_revision() {
+    let bundle = Bundle::default();
+    let edit = |template: &str| -> Result<String, String> {
+        assert_eq!(template, COMMIT_TEMPLATE);
+        Ok("my patch\n# comment\n".to_string())
+    };
+    assert_eq!(
+        resolve_commit_message_with_editor(&bundle, None, Some(&edit)).unwrap(),
+        "my patch\n"
+    );
+    // A blank edit aborts.
+    let blank = |_: &str| -> Result<String, String> { Ok("# only\n".to_string()) };
+    assert_eq!(
+        resolve_commit_message_with_editor(&bundle, None, Some(&blank)).unwrap_err(),
+        diff_local::USER_ABORT
+    );
+    // Without an editor the guidance error survives.
+    assert_eq!(
+        resolve_commit_message_with_editor(&bundle, None, None).unwrap_err(),
+        NO_COMMIT_MESSAGE
+    );
+}
+
+#[test]
+fn p8_empty_fetch_opens_noted_template() {
+    let call = stub_call(std::collections::HashMap::from([(
+        diff_submit::METHOD_GET_COMMIT_MESSAGE.to_string(),
+        serde_json::json!(""),
+    )]));
+    let bundle = Bundle {
+        revision_id: Some(494),
+        ..Bundle::default()
+    };
+    let edit = |template: &str| -> Result<String, String> {
+        assert!(template.contains("for revision D494."), "{template}");
+        Ok("typed\n".to_string())
+    };
+    assert_eq!(
+        resolve_commit_message_with_editor(&bundle, Some(&call), Some(&edit)).unwrap(),
+        "typed\n"
+    );
+}
+
+#[test]
+fn p9_yes_path_commits_via_editor() {
+    // HEAD carries a revision footer, so the prompt offers a new commit
+    // (the D8 working-copy lookup is unported; revision IDs decline).
+    let repo = make_repo("p9_create");
+    git(
+        &repo,
+        &[
+            "commit",
+            "--allow-empty",
+            "-m",
+            "x\n\nDifferential Revision: D1",
+        ],
+    );
+    std::fs::write(repo.join("file.txt"), "dirty\n").unwrap();
+    let backends = Backends::default();
+    let mut io = Io::canned(&["y"]);
+    let status = TreeStatus {
+        unstaged: vec!["file.txt".to_string()],
+        ..TreeStatus::default()
+    };
+    let seen = std::cell::RefCell::new(String::new());
+    let edit = |template: &str| -> Result<String, String> {
+        *seen.borrow_mut() = template.to_string();
+        Ok("wip save\n".to_string())
+    };
+    let outcome = resolve_uncommitted_tree(
+        &repo,
+        Vcs::Git,
+        &backends,
+        &mut io,
+        &status,
+        "desc",
+        None,
+        &edit,
+    )
+    .unwrap();
+    assert_eq!(outcome, StashState::Clean);
+    assert!(
+        io.out.stdout.contains("create a new commit"),
+        "{}",
+        io.out.stdout
+    );
+    let template = seen.borrow().clone();
+    assert!(template.contains("# Enter a commit message."), "{template}");
+    assert!(template.contains("#     file.txt"), "{template}");
+    assert_eq!(git(&repo, &["log", "-1", "--format=%s"]), "wip save");
+    assert_eq!(git(&repo, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn p9_yes_path_amends_when_detected() {
+    // Plain HEAD by the repo author: amend wording, no editor, same count.
+    let repo = make_repo("p9_amend");
+    std::fs::write(repo.join(".arcconfig"), "{\"history.immutable\": false}").unwrap();
+    std::fs::write(repo.join("file.txt"), "dirty\n").unwrap();
+    let backends = Backends::default();
+    let mut io = Io::canned(&["y"]);
+    let status = TreeStatus {
+        unstaged: vec!["file.txt".to_string()],
+        ..TreeStatus::default()
+    };
+    let edit = |_: &str| -> Result<String, String> {
+        panic!("PATCH-P9: amend path never opens the editor")
+    };
+    resolve_uncommitted_tree(
+        &repo,
+        Vcs::Git,
+        &backends,
+        &mut io,
+        &status,
+        "desc",
+        None,
+        &edit,
+    )
+    .unwrap();
+    assert!(
+        io.out.stdout.contains("amend these 1 change(s)"),
+        "{}",
+        io.out.stdout
+    );
+    assert_eq!(git(&repo, &["rev-list", "--count", "HEAD"]), "1");
+    assert_eq!(git(&repo, &["status", "--porcelain", "--", "file.txt"]), "");
+}
+
+#[test]
+fn p9_unchanged_and_empty_templates_error() {
+    let repo = make_repo("p9_template");
+    git(
+        &repo,
+        &[
+            "commit",
+            "--allow-empty",
+            "-m",
+            "x\n\nDifferential Revision: D1",
+        ],
+    );
+    std::fs::write(repo.join("file.txt"), "dirty\n").unwrap();
+    let backends = Backends::default();
+    let status = TreeStatus {
+        unstaged: vec!["file.txt".to_string()],
+        ..TreeStatus::default()
+    };
+    let mut io = Io::canned(&["y"]);
+    let echo = |template: &str| -> Result<String, String> { Ok(template.to_string()) };
+    assert_eq!(
+        resolve_uncommitted_tree(
+            &repo,
+            Vcs::Git,
+            &backends,
+            &mut io,
+            &status,
+            "desc",
+            None,
+            &echo,
+        )
+        .unwrap_err(),
+        MUST_PROVIDE_MESSAGE
+    );
+    // An all-comments edit strips to `"\n"` (never `""`, like PHP), so
+    // the nonempty check cannot trip — `git commit` itself refuses.
+    let mut io = Io::canned(&["y"]);
+    let empty = |_: &str| -> Result<String, String> { Ok("# only\n".to_string()) };
+    let error = resolve_uncommitted_tree(
+        &repo,
+        Vcs::Git,
+        &backends,
+        &mut io,
+        &status,
+        "desc",
+        None,
+        &empty,
+    )
+    .unwrap_err();
+    assert!(error.contains("empty commit message"), "{error}");
+    assert_eq!(
+        MUST_PROVIDE_NONEMPTY_MESSAGE,
+        "You must provide a nonempty commit message."
+    );
+}
+
+#[test]
+fn p9_published_head_declines_amend() {
+    // A `diffusion.querycommits` hit means published: create wording.
+    let repo = make_repo("p9_published");
+    std::fs::write(
+        repo.join(".arcconfig"),
+        "{\"history.immutable\": false, \"repository.callsign\": \"X\"}",
+    )
+    .unwrap();
+    let backends = Backends::default();
+    let hash = git(&repo, &["rev-parse", "HEAD"]);
+    let call = |method: &str, params: &serde_json::Value| {
+        if method == "repository.query" {
+            return Ok(serde_json::json!([{"id": "7", "callsign": "X"}]));
+        }
+        if method == "diffusion.querycommits" {
+            assert_eq!(params["names"], serde_json::json!([format!("rX{hash}")]));
+            return Ok(serde_json::json!({
+                "identifierMap": {format!("rX{hash}"): {"id": 1}}
+            }));
+        }
+        Err(format!("PATCH-P9: unexpected {method}"))
+    };
+    let (amend, _) = calculate_patch_should_amend(&repo, Vcs::Git, &backends, Some(&call)).unwrap();
+    assert!(!amend);
+    let (amend, head) = calculate_patch_should_amend(&repo, Vcs::Git, &backends, None).unwrap();
+    assert!(amend);
+    assert!(head.unwrap().contains("base"));
+}
+
+#[test]
+fn p10_invalid_session_reauthenticates_and_retries_once() {
+    let options = Options::default();
+    let mut io = Io::buffered();
+    let seen = std::cell::RefCell::new(Vec::new());
+    let calls = std::cell::Cell::new(0u32);
+    let call = |method: &str, params: &serde_json::Value| {
+        seen.borrow_mut()
+            .push((method.to_string(), params.to_string()));
+        if method == "user.whoami" {
+            return Ok(serde_json::json!({"phid": "PHID-USER-1"}));
+        }
+        calls.set(calls.get() + 1);
+        if calls.get() == 1 {
+            return Err("ERR-INVALID-SESSION: session expired".to_string());
+        }
+        Ok(serde_json::json!({
+            "12": {"id": "12", "revisionID": "7",
+                   "sourceControlBaseRevision": "base",
+                   "authorName": "Ada", "authorEmail": "ada@test",
+                   "changes": []},
+        }))
+    };
+    let loaded = load_bundle_with_reauth(
+        &Source::Revision("7".to_string()),
+        &options,
+        &mut io,
+        Some(&call),
+    )
+    .unwrap();
+    assert_eq!(loaded.bundle.revision_id, Some(7));
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 3);
+    assert_eq!(seen[0].0, diff_submit::METHOD_QUERY_DIFFS);
+    assert_eq!(seen[1].0, "user.whoami");
+    assert_eq!(seen[2].0, diff_submit::METHOD_QUERY_DIFFS);
+    assert!(is_invalid_session_error("ERR-INVALID-SESSION: x"));
+    assert!(is_invalid_session_error("ERR-INVALID-SESSION"));
+    assert!(!is_invalid_session_error("ERR-OTHER: x"));
+}
+
+#[test]
+fn p10_reauth_failure_propagates() {
+    let options = Options::default();
+    let mut io = Io::buffered();
+    let call = |method: &str, _: &serde_json::Value| {
+        if method == "user.whoami" {
+            return Err("ERR-INVALID-AUTH: bad token".to_string());
+        }
+        Err("ERR-INVALID-SESSION: expired".to_string())
+    };
+    // Like PHP, the re-auth error (not the load error) surfaces.
+    assert_eq!(
+        load_bundle_with_reauth(
+            &Source::Revision("7".to_string()),
+            &options,
+            &mut io,
+            Some(&call),
+        )
+        .unwrap_err(),
+        "ERR-INVALID-AUTH: bad token"
+    );
+}
+
+#[test]
+fn p11_repository_encoding_lookup() {
+    let repo = make_repo("p11_encoding");
+    std::fs::write(repo.join(".arcconfig"), "{\"repository.callsign\": \"X\"}").unwrap();
+    let backends = Backends::default();
+    let answer = std::cell::RefCell::new(serde_json::json!([{"encoding": "cp1252"}]));
+    let call = |method: &str, params: &serde_json::Value| {
+        assert_eq!(method, "repository.query");
+        assert!(params.to_string().contains("\"X\""), "{}", params);
+        Ok(answer.borrow().clone())
+    };
+    assert_eq!(
+        patch_repository_encoding(&repo, Vcs::Git, &backends, &call).unwrap(),
+        Some("cp1252".to_string())
+    );
+    // Missing/empty encodings and ambiguous matches default to UTF-8.
+    for rows in [
+        serde_json::json!([{}]),
+        serde_json::json!([{"encoding": ""}]),
+        serde_json::json!([]),
+        serde_json::json!([{"encoding": "a"}, {"encoding": "b"}]),
+    ] {
+        *answer.borrow_mut() = rows;
+        assert_eq!(
+            patch_repository_encoding(&repo, Vcs::Git, &backends, &call).unwrap(),
+            Some("UTF-8".to_string())
+        );
+    }
+}
+
+#[test]
+fn p11_repository_encoding_failures() {
+    let repo = make_repo("p11_failures");
+    std::fs::write(repo.join(".arcconfig"), "{\"repository.callsign\": \"X\"}").unwrap();
+    let backends = Backends::default();
+    // `ERR-CONDUIT-CALL` (unknown method) still yields UTF-8; other
+    // conduit failures yield no override.
+    let call = |_: &str, _: &serde_json::Value| {
+        Err::<serde_json::Value, String>("ERR-CONDUIT-CALL: nope".to_string())
+    };
+    assert_eq!(
+        patch_repository_encoding(&repo, Vcs::Git, &backends, &call).unwrap(),
+        Some("UTF-8".to_string())
+    );
+    let call = |_: &str, _: &serde_json::Value| {
+        Err::<serde_json::Value, String>("ERR-OTHER: boom".to_string())
+    };
+    assert_eq!(
+        patch_repository_encoding(&repo, Vcs::Git, &backends, &call).unwrap(),
+        None
+    );
+    assert!(is_conduit_call_error("ERR-CONDUIT-CALL: x"));
+    assert!(!is_conduit_call_error("ERR-OTHER: x"));
+}
+
+#[test]
+fn p13_raw_fetches_send_verbatim_string_ids() {
+    let seen = std::cell::RefCell::new(Vec::new());
+    let call = |method: &str, params: &serde_json::Value| {
+        seen.borrow_mut()
+            .push((method.to_string(), params.to_string()));
+        Ok(serde_json::json!({
+            "12": {"id": "12", "revisionID": "7",
+                   "sourceControlBaseRevision": "base",
+                   "authorName": "Ada", "authorEmail": "ada@test",
+                   "changes": []},
+        }))
+    };
+    let bundle = fetch_revision_bundle_raw(&call, "x").unwrap();
+    assert_eq!(bundle.revision_id, Some(7));
+    fetch_diff_bundle_raw(&call, "D12").unwrap();
+    let seen = seen.borrow();
+    assert!(
+        seen[0].1.contains("\"revisionIDs\":[\"x\"]"),
+        "{}",
+        seen[0].1
+    );
+    assert!(seen[1].1.contains("\"ids\":[\"D12\"]"), "{}", seen[1].1);
+}
+#[test]
+fn r10_patch_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "PATCH WORKFLOW\n\
+         \n\
+         patch\n\
+         \x20     patch D12345\n\
+         \x20     patch --revision revision_id\n\
+         \x20     patch --diff diff_id\n\
+         \x20     patch --patch file\n\
+         \x20     patch --arcbundle bundlefile\n\
+         \n\
+         \x20         Supports: git, svn, hg\n\
+         \x20         Apply the changes in a Differential revision, patchfile, or arc\n\
+         \x20         bundle to the working copy.\n\
+         \n\
+         \x20     --arcbundle bundlefile\n\
+         \x20         Apply changes from an arc bundle generated with 'arc export'.\n\
+         \n\
+         \x20     --diff diff_id\n\
+         \x20         Apply changes from a Differential diff. Normally you want to use\n\
+         \x20         --revision to get the most recent changes, but you can specifically\n\
+         \x20         apply an out-of-date diff or a diff which was never attached to a\n\
+         \x20         revision by using this flag.\n\
+         \n\
+         \x20     --encoding encoding\n\
+         \x20         Attempt to convert non UTF-8 patch into specified encoding.\n\
+         \n\
+         \x20     --force\n\
+         \x20         Do not run any sanity checks.\n\
+         \n\
+         \x20     --nobranch\n\
+         \x20         Normally, a new branch (git) or bookmark (hg) is created and then\n\
+         \x20         the patch is applied and committed in the new branch/bookmark. This\n\
+         \x20         flag cherry-picks the resultant commit onto the original branch and\n\
+         \x20         deletes the temporary branch.\n\
+         \n\
+         \x20     --nocommit\n\
+         \x20         Normally under git/hg, if the patch is successful, the changes are\n\
+         \x20         committed to the working copy. This flag prevents the commit.\n\
+         \n\
+         \x20     --patch patchfile\n\
+         \x20         Apply changes from a git patchfile or unified patchfile.\n\
+         \n\
+         \x20     --revision revision_id\n\
+         \x20         Apply changes from a Differential revision, using the most recent\n\
+         \x20         diff that has been attached to it. You can run 'arc patch D12345'\n\
+         \x20         as a shorthand.\n\
+         \n\
+         \x20     --skip-dependencies\n\
+         \x20         Normally, if a patch has dependencies that are not present in the\n\
+         \x20         working copy, arc tries to apply them as well. This flag prevents\n\
+         \x20         such work.\n\
+         \n\
+         \x20     --update\n\
+         \x20         Update the local working copy before applying the patch.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `execute_with_io_ansi` pushes the same text with explicit ANSI.
+    assert!(usage_text(true).contains("PATCH WORKFLOW"));
+}
+
+#[test]
+fn b21_patch_needs_no_terminator() {
+    // T1153 B21/B23 VERIFIED for `patch`: it is a classic workflow,
+    // so PHP runs it via the `scripts/arcanist.php` re-exec, which
+    // never requires `--`. Parsing takes no TTY input, so
+    // piped-style argv parses directly, and `--help` without `--`
+    // still succeeds.
+    assert!(parse_options(&argv(&["D123"])).unwrap().is_some());
+    assert_eq!(parse_options(&argv(&["--help"])).unwrap(), None);
+    let text = usage_text(false);
+    assert!(text.contains("PATCH WORKFLOW"), "{text}");
+}
+
+#[test]
+fn b23_patch_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help patch`.
+    // Extensions stay undocumented.
+    let text = usage_text(false);
+    assert!(text.starts_with("PATCH WORKFLOW\n"), "{text}");
+    assert!(
+        text.contains("Apply the changes in a Differential revision"),
+        "{text}"
+    );
+    assert!(text.contains("--nocommit"), "{text}");
+    assert!(!text.contains("--preview"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+}
+
+// T1153 EXPORT-E9 residual: byte-faithful corpus path. Raw bytes ride
+// the `String` pipeline as transport (valid UTF-8 verbatim, invalid
+// bytes smuggled, real U+E000 markers doubled) and convert only at
+// the sinks, matching PHP's raw passthrough plus
+// `convertNonUTF8Diff()`.
+
+const E9_ESC: char = '\u{E000}';
+
+fn e9_smuggle(byte: u8) -> String {
+    format!(
+        "{E9_ESC}{}",
+        char::from_u32(0xE100 + u32::from(byte)).unwrap()
+    )
+}
+
+fn e9_invalid_vectors() -> Vec<Vec<u8>> {
+    vec![
+        vec![0xE9],
+        vec![0x80],
+        vec![0xFF],
+        vec![0xFE, 0xFF],
+        vec![0xE9, 0x80],
+        vec![0xED, 0xA0, 0x80],
+        vec![0xC0, 0xAF],
+        vec![0xF5, 0x80, 0x80, 0x80],
+        vec![0xC3],
+        vec![0xE2, 0x82],
+        b"caf\xe9 mix \x80\xff end".to_vec(),
+        "caf\u{00e9} valid \u{20ac} ".as_bytes().to_vec(),
+        b"\x00nul\x00".to_vec(),
+        b"a\r\nb\r\n".to_vec(),
+        vec![],
+    ]
+}
+
+#[test]
+fn e9_transport_round_trips_bytes() {
+    for bytes in e9_invalid_vectors() {
+        assert_eq!(untransport_bytes(&transport_bytes(&bytes)), bytes);
+    }
+    // Valid UTF-8 (however exotic) passes through verbatim.
+    for text in [
+        "",
+        "plain ascii",
+        "caf\u{00e9} \u{20ac} \u{1f600} \u{4e2d}",
+        "\x00\x01\x02",
+    ] {
+        assert_eq!(transport_bytes(text.as_bytes()), text);
+    }
+}
+
+#[test]
+fn e9_transport_escapes_real_markers() {
+    let marker = E9_ESC.to_string();
+    assert_eq!(
+        transport_bytes(marker.as_bytes()),
+        format!("{E9_ESC}{E9_ESC}")
+    );
+    assert_eq!(
+        untransport_bytes(&format!("{E9_ESC}{E9_ESC}")),
+        marker.as_bytes()
+    );
+    // A natural marker + smuggle-range pair round-trips exactly.
+    let pair = format!("{E9_ESC}\u{E100}");
+    assert_eq!(
+        untransport_bytes(&transport_bytes(pair.as_bytes())),
+        pair.as_bytes()
+    );
+    // A lone marker reads literally instead of panicking.
+    assert_eq!(
+        untransport_bytes(&E9_ESC.to_string()),
+        E9_ESC.to_string().as_bytes()
+    );
+}
+
+#[test]
+fn e9_transport_preserves_diff_structure() {
+    let bytes = b"diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+\xe9\n";
+    let carried = transport_bytes(bytes);
+    assert!(carried.starts_with("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+"));
+    assert!(carried.ends_with(&format!("{}\n", e9_smuggle(0xE9))));
+}
+
+#[test]
+fn e9_untransport_lossy_views() {
+    assert_eq!(untransport_lossy(&e9_smuggle(0xE9)), "\u{FFFD}");
+    assert_eq!(untransport_lossy("plain caf\u{00e9}"), "plain caf\u{00e9}");
+    assert_eq!(
+        untransport_lossy(&format!("{E9_ESC}{E9_ESC}")),
+        E9_ESC.to_string()
+    );
+    assert_eq!(untransport_lossy(""), "");
+}
+
+#[test]
+fn e9_escape_markers_round_trip() {
+    assert_eq!(escape_transport_markers("plain"), "plain");
+    assert_eq!(
+        escape_transport_markers(&E9_ESC.to_string()),
+        format!("{E9_ESC}{E9_ESC}")
+    );
+    let escaped = escape_transport_markers("a\u{E000}b");
+    assert_eq!(untransport_lossy(&escaped), "a\u{E000}b");
+}
+
+#[test]
+fn e9_convert_passes_empty_and_utf8_through() {
+    let valid = "caf\u{00e9} \u{20ac}\n".as_bytes().to_vec();
+    let invalid = b"caf\xe9 \x80\xff\n".to_vec();
+    for encoding in [None, Some(""), Some("0"), Some("UTF-8"), Some("utf8")] {
+        assert_eq!(convert_bytes(&valid, encoding).unwrap(), valid);
+        assert_eq!(convert_bytes(&invalid, encoding).unwrap(), invalid);
+    }
+}
+
+#[test]
+fn e9_convert_cp1252_table() {
+    assert_eq!(
+        convert_bytes("caf\u{00e9} \u{20ac}\n".as_bytes(), Some("windows-1252")).unwrap(),
+        b"caf\xe9 \x80\n"
+    );
+    // Unmappable scalars and invalid bytes become `?`, like mb.
+    assert_eq!(
+        convert_bytes("\u{4e2d}\n".as_bytes(), Some("cp1252")).unwrap(),
+        b"?\n"
+    );
+    assert_eq!(
+        convert_bytes(b"\xff\n", Some("windows-1252")).unwrap(),
+        b"?\n"
+    );
+    // Undefined cp1252 bytes decode lossily, like PHP's converter.
+    assert_eq!(
+        decode_bytes(&[0x81], Some("windows-1252")).unwrap(),
+        "\u{FFFD}"
+    );
+}
+
+#[test]
+fn e9_convert_latin1_one_to_one() {
+    assert_eq!(
+        convert_bytes("caf\u{00e9}\n".as_bytes(), Some("latin1")).unwrap(),
+        b"caf\xe9\n"
+    );
+    assert_eq!(
+        convert_bytes("\u{20ac}\n".as_bytes(), Some("latin1")).unwrap(),
+        b"?\n"
+    );
+    assert_eq!(convert_bytes(b"\xe9\n", Some("latin1")).unwrap(), b"?\n");
+}
+
+#[test]
+fn e9_convert_invalid_grouping_matches_mb() {
+    // Pinned against `mb_convert_encoding(..., 'Windows-1252', 'UTF-8')`.
+    for (input, expected) in [
+        (b"\xe9\x80".as_slice(), "?"),
+        (b"\xed\xa0\x80".as_slice(), "???"),
+        (b"\xf0\x28\x8c\x28".as_slice(), "?(?("),
+        (b"\xc0\xaf".as_slice(), "??"),
+        (b"\x80".as_slice(), "?"),
+        (b"\xc3".as_slice(), "?"),
+        (b"\xfe\xff".as_slice(), "??"),
+        (b"a\xffb".as_slice(), "a?b"),
+    ] {
+        for encoding in ["windows-1252", "latin1"] {
+            assert_eq!(
+                convert_bytes(input, Some(encoding)).unwrap(),
+                expected.as_bytes(),
+                "{input:?} / {encoding}"
+            );
+        }
+    }
+}
+
+#[test]
+fn e9_convert_unknown_throws() {
+    assert_eq!(
+        convert_bytes(b"x", Some("klingon-9")).unwrap_err(),
+        "Unknown encoding \"klingon-9\"."
+    );
+}
+
+#[test]
+fn e9_encode_transport_text_converts_at_sink() {
+    let carried = transport_bytes(b"caf\xe9\n");
+    assert_eq!(encode_transport_text(&carried, None).unwrap(), b"caf\xe9\n");
+    assert_eq!(
+        encode_transport_text(&carried, Some("UTF-8")).unwrap(),
+        b"caf\xe9\n"
+    );
+    assert_eq!(
+        encode_transport_text(&carried, Some("windows-1252")).unwrap(),
+        b"caf?\n"
+    );
+    let valid = transport_bytes("caf\u{00e9}\n".as_bytes());
+    assert_eq!(
+        encode_transport_text(&valid, Some("windows-1252")).unwrap(),
+        b"caf\xe9\n"
+    );
+}
+
+#[test]
+fn e9_convert_transport_text_round_trip() {
+    for bytes in e9_invalid_vectors() {
+        let carried = transport_bytes(&bytes);
+        for encoding in [None, Some("UTF-8"), Some("windows-1252"), Some("latin1")] {
+            let converted = convert_transport_text(&carried, encoding).unwrap();
+            assert_eq!(
+                untransport_bytes(&converted),
+                convert_bytes(&bytes, encoding).unwrap(),
+                "{bytes:?} / {encoding:?}"
+            );
+        }
+    }
+    assert_eq!(
+        convert_transport_text("x", Some("klingon-9")).unwrap_err(),
+        "Unknown encoding \"klingon-9\"."
+    );
+}
+
+#[test]
+fn e9_bundle_patch_bytes_convert_like_php() {
+    let bundle = Bundle {
+        text: transport_bytes(b"+caf\xe9\n"),
+        ..Bundle::default()
+    };
+    assert_eq!(bundle_patch_bytes(&bundle).unwrap(), b"+caf\xe9\n");
+    let bundle = Bundle {
+        text: transport_bytes(b"+caf\xe9\n"),
+        encoding: Some("latin1".to_string()),
+        ..Bundle::default()
+    };
+    assert_eq!(bundle_patch_bytes(&bundle).unwrap(), b"+caf?\n");
+    let bundle = Bundle {
+        text: "+x\n".to_string(),
+        encoding: Some("klingon-9".to_string()),
+        ..Bundle::default()
+    };
+    assert_eq!(
+        bundle_patch_bytes(&bundle).unwrap_err(),
+        "Unknown encoding \"klingon-9\"."
+    );
+}
+
+#[test]
+fn e9_load_file_bundle_carries_raw_bytes() {
+    let dir = temp_dir("e9_file_bundle");
+    let path = dir.join("raw.patch");
+    let bytes = b"diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\xe9\x80\n".to_vec();
+    std::fs::write(&path, &bytes).unwrap();
+    let name = path.to_string_lossy().to_string();
+    for encoding in [None, Some("UTF-8")] {
+        let mut io = Io::buffered();
+        let bundle = load_file_bundle(&name, encoding, &mut io).unwrap();
+        assert_eq!(bundle.text, transport_bytes(&bytes));
+        assert_eq!(bundle.encoding, encoding.map(str::to_string));
+        assert_eq!(bundle_patch_bytes(&bundle).unwrap(), bytes);
+    }
+    let mut io = Io::buffered();
+    let bundle = load_file_bundle(&name, Some("windows-1252"), &mut io).unwrap();
+    assert_eq!(bundle.encoding.as_deref(), Some("windows-1252"));
+    assert_eq!(
+        bundle_patch_bytes(&bundle).unwrap(),
+        convert_bytes(&bytes, Some("windows-1252")).unwrap()
+    );
+    let mut io = Io::buffered();
+    assert_eq!(
+        load_file_bundle(&name, Some("klingon-9"), &mut io).unwrap(),
+        Bundle {
+            text: transport_bytes(&bytes),
+            encoding: Some("klingon-9".to_string()),
+            ..Bundle::default()
+        }
+    );
+}
+
+#[test]
+fn e9_quote_git_target_preserves_transport() {
+    // ASCII behavior is unchanged (also covered by `quotes_git_targets`).
+    assert_eq!(quote_git_target("plain"), "plain");
+    // Unquoted transport paths pass through verbatim.
+    let carried = transport_bytes(b"f-\xe9.txt");
+    assert_eq!(quote_git_target(&carried), carried);
+    // Quoting runs over raw bytes; high bytes re-ride as transport.
+    let quoted = quote_git_target(&transport_bytes(b"a\"b\xe9"));
+    assert_eq!(quoted, format!("\"a\\\"b{}\"", e9_smuggle(0xE9)));
+    assert_eq!(untransport_bytes(&quoted), b"\"a\\\"b\xe9\"");
+}
+
+#[test]
+fn e9_unquote_git_path_decodes_high_octals() {
+    assert_eq!(unquote_git_path("\"a\\tb\""), "a\tb");
+    assert_eq!(unquote_git_path("plain"), "plain");
+    // Valid octals decode to real chars; invalid ones ride as transport.
+    assert_eq!(unquote_git_path("\"a\\303\\251\""), "a\u{00e9}");
+    let decoded = unquote_git_path("\"a\\351\"");
+    assert_eq!(decoded, format!("a{}", e9_smuggle(0xE9)));
+    assert_eq!(untransport_bytes(&decoded), b"a\xe9");
+    // `\r` maps to CR like `stripcslashes()` (covers the carriage arm
+    // of the cognitive-gate split).
+    assert_eq!(unquote_git_path("\"a\\rb\""), "a\rb");
+}
+
+#[test]
+fn e9_strip_ansi_codes_preserves_bytes() {
+    let mut raw = "caf\u{00e9} ".as_bytes().to_vec();
+    raw.push(0xE9);
+    let carried = transport_bytes(&raw);
+    let colored = format!("\x1b[32m{carried}\x1b[m");
+    assert_eq!(strip_ansi_codes(&colored), carried);
+    assert_eq!(strip_ansi_codes("plain"), "plain");
+}
+
+#[test]
+fn e9_validate_accepts_non_ascii_without_panic() {
+    // Multibyte chars before a unified date used to panic on byte slicing.
+    validate_patch_text("--- caf\u{00e9}g.txt\t2024-01-02 03:04:05\n+++ f\n").unwrap();
+    validate_patch_text(&transport_bytes(
+        b"diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@ func\xe9\n-a\n+b\n",
+    ))
+    .unwrap();
+    assert!(validate_patch_text("not a diff\n").is_err());
+}
+
+#[test]
+fn e9_parse_error_hides_transport() {
+    let lines = vec![transport_bytes(b"+bad \xe9 line\n")];
+    let rendered = format_parse_error("broken", &lines, 0);
+    assert!(rendered.contains('\u{FFFD}'), "{rendered}");
+    assert!(!rendered.contains(E9_ESC), "{rendered}");
+}
+
+#[test]
+fn e9_arcbundle_carries_raw_corpora() {
+    let dir = temp_dir("e9_arcbundle");
+    let changes = br#"[{"type":1,"fileType":1,"oldPath":"f","currentPath":"f","hunks":[{"oldStart":1,"oldLines":1,"newStart":1,"newLines":1,"corpus":0}]}]"#;
+    let corpus = b" line\n-line\n+caf\xe9 raw\n";
+    let bundle = write_arcbundle(
+        &dir,
+        "raw.bundle",
+        &[
+            ("changes.json", changes),
+            ("hunks/0", corpus),
+            ("meta.json", b"{}"),
+        ],
+    );
+    let name = bundle.to_string_lossy().to_string();
+    let loaded = load_arcbundle(&name, None).unwrap();
+    assert_eq!(loaded.encoding, None);
+    assert!(
+        untransport_bytes(&loaded.text)
+            .windows(corpus.len())
+            .any(|w| w == corpus),
+        "raw corpus survives the render"
+    );
+    assert_eq!(
+        bundle_patch_bytes(&loaded).unwrap(),
+        untransport_bytes(&loaded.text)
+    );
+}
+
+#[test]
+fn e9_arcbundle_meta_encoding_converts_at_sink() {
+    let dir = temp_dir("e9_arcbundle_enc");
+    let changes = br#"[{"type":1,"fileType":1,"oldPath":"f","currentPath":"f","hunks":[{"oldStart":1,"oldLines":1,"newStart":1,"newLines":1,"corpus":0}]}]"#;
+    let bundle = write_arcbundle(
+        &dir,
+        "enc.bundle",
+        &[
+            ("changes.json", changes),
+            ("hunks/0", b" line\n-line\n+caf\xe9 raw\n"),
+            ("meta.json", br#"{"encoding":"windows-1252"}"#),
+        ],
+    );
+    let name = bundle.to_string_lossy().to_string();
+    let loaded = load_arcbundle(&name, None).unwrap();
+    // The meta encoding is stored, not decoded: unknown names only throw
+    // when the bundle converts at an apply sink, like PHP.
+    assert_eq!(loaded.encoding.as_deref(), Some("windows-1252"));
+    assert!(
+        bundle_patch_bytes(&loaded)
+            .unwrap()
+            .windows(4)
+            .any(|w| w == b"caf?"),
+        "converts like convertNonUTF8Diff"
+    );
+}
+
+#[test]
+fn e9_svn_changes_stay_lossy() {
+    // The svn apply path keeps its historical lossy behavior (no svn
+    // binary exists here to oracle-verify a byte port): transport in,
+    // replacement chars out, never transport markers.
+    let changes = parse_git_patch_for_svn(&transport_bytes(
+        b"diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\xe9\n",
+    ));
+    assert_eq!(changes.len(), 1);
+    assert!(
+        changes[0].hunks.contains('\u{FFFD}'),
+        "{}",
+        changes[0].hunks
+    );
+    assert!(!changes[0].hunks.contains(E9_ESC), "{}", changes[0].hunks);
+    let dicts: Vec<serde_json::Value> =
+        vec![serde_json::json!({"type": 1, "fileType": 1, "oldPath": "o", "currentPath": "f"})];
+    let hunks = vec![crate::diff_local::ParsedHunk {
+        old_start: 1,
+        old_len: 1,
+        new_start: 1,
+        new_len: 1,
+        corpus: transport_bytes(b"+q\xff\n"),
+        synthetic_counts: None,
+    }];
+    let changes = svn_changes_from_dicts(&dicts, &[hunks]);
+    assert!(changes[0].hunks.contains('\u{FFFD}'));
+    assert!(!changes[0].hunks.contains(E9_ESC));
+}
+
+#[test]
+fn e9_transport_parse_decodes_quoted_bytes() {
+    // `parse_unified_diff_transport` matches the lossy parse on
+    // structure, but C-quoted filenames decode byte-faithfully. (The
+    // `+++` line keeps quotes verbatim, so the rename header carries
+    // the quoted name: PHP keeps the decoded `rename to` path.)
+    let text = "diff --git a/o b/n\nrename from o\nrename to \"n\\351\"\n--- a/o\n+++ \"b/n\\351\"\n@@ -1 +1 @@\n-a\n+b\n";
+    let lossy = crate::diff_local::parse_unified_diff(text).unwrap();
+    assert_eq!(lossy[0].current_path, "n\u{FFFD}");
+    let carried =
+        crate::diff_local::parse_unified_diff_transport(&transport_bytes(text.as_bytes())).unwrap();
+    assert_eq!(untransport_bytes(&carried[0].current_path), b"n\xe9");
+    assert_eq!(carried[0].hunks.len(), lossy[0].hunks.len());
+    assert_eq!(carried[0].old_path, lossy[0].old_path);
+}
+
+#[test]
+fn e9_apply_bundle_encoding_stores_selection() {
+    let backends = Backends::default();
+    let repo = make_repo("e9_apply_encoding");
+    std::fs::write(repo.join(".arcconfig"), "{\"repository.callsign\": \"X\"}").unwrap();
+    let answer = std::cell::RefCell::new(serde_json::json!([{"encoding": "cp1252"}]));
+    let call = |method: &str, _params: &serde_json::Value| {
+        assert_eq!(method, "repository.query");
+        Ok(answer.borrow().clone())
+    };
+    let call_ref: &diff_submit::ConduitCall = &call;
+    // Conduit sources store the flag, else the repository encoding.
+    let mut loaded = LoadedBundle {
+        bundle: Bundle {
+            text: "t".to_string(),
+            ..Bundle::default()
+        },
+        arcbundle_dicts: None,
+    };
+    let options = options_of(&["--encoding", "latin1"]);
+    apply_patch_bundle_encoding(
+        &repo,
+        Vcs::Git,
+        &backends,
+        &Source::Revision("D1".to_string()),
+        &options,
+        Some(call_ref),
+        &mut loaded,
+    )
+    .unwrap();
+    assert_eq!(loaded.bundle.encoding.as_deref(), Some("latin1"));
+    assert_eq!(loaded.bundle.text, "t");
+    let mut loaded = LoadedBundle {
+        bundle: Bundle::default(),
+        arcbundle_dicts: None,
+    };
+    let options = options_of(&[]);
+    apply_patch_bundle_encoding(
+        &repo,
+        Vcs::Git,
+        &backends,
+        &Source::Diff("123".to_string()),
+        &options,
+        Some(call_ref),
+        &mut loaded,
+    )
+    .unwrap();
+    assert_eq!(loaded.bundle.encoding.as_deref(), Some("cp1252"));
+    // File sources keep their flag-stored encoding untouched.
+    let mut loaded = LoadedBundle {
+        bundle: Bundle {
+            encoding: Some("utf-8".to_string()),
+            ..Bundle::default()
+        },
+        arcbundle_dicts: None,
+    };
+    apply_patch_bundle_encoding(
+        &repo,
+        Vcs::Git,
+        &backends,
+        &Source::Patch("f".to_string()),
+        &options_of(&[]),
+        Some(call_ref),
+        &mut loaded,
+    )
+    .unwrap();
+    assert_eq!(loaded.bundle.encoding.as_deref(), Some("utf-8"));
 }

@@ -14,22 +14,23 @@
 //!
 //! Known limits (see T1128): only one file is passed per invocation
 //! (PHP batches paths up to the command-line limit); a nonzero tool exit
-//! or invalid JSON yields no messages (the PHP linter raises, but the
-//! [`Linter`](arc_rs::lint::Linter) trait has no error channel); reported
-//! paths are the display paths passed to
-//! [`lint_bytes`](arc_rs::lint::Linter::lint_bytes), never the staged
-//! temp-file paths. A missing tool, a missing Mono runtime, or a cslint
-//! version other than 1 makes the linter inactive (the PHP linter raises;
-//! same silent-inactive treatment as other external tools here). The
-//! `binary` hint resolves against the project root (PHP resolves against
-//! the process working directory). Discovery-map keys serialize in sorted
-//! order (the JSON map preserves no insertion order here).
+//! or invalid JSON yields no messages (the PHP linter raises; unfiled,
+//! unlike the load failures below); reported paths are the display paths
+//! passed to [`lint_bytes`](arc_rs::lint::Linter::lint_bytes), never the
+//! staged temp-file paths. A missing tool, a missing Mono runtime, or a
+//! cslint version other than 1 fails loudly through
+//! [`Linter::take_error`](arc_rs::lint::Linter::take_error) for the
+//! engine's aggregate, like PHP's `loadEnvironment()` (T1153 LINT-32).
+//! The `binary` hint resolves against the project root (PHP resolves
+//! against the process working directory). Discovery-map keys serialize
+//! in sorted order (the JSON map preserves no insertion order here).
 
 extern crate self as arc_rs;
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use arc_rs::lint::{LintMessage, Linter, OptionContext, SEVERITY_AUTOFIX, SEVERITY_ERROR};
 
@@ -44,6 +45,7 @@ const SEVERITY_DISABLED: &str = "disabled";
 pub struct CsharpLinter {
     binary_hint: Option<PathBuf>,
     discovery: Option<BTreeMap<String, Vec<String>>>,
+    error: RefCell<Option<String>>,
 }
 
 impl CsharpLinter {
@@ -53,17 +55,37 @@ impl CsharpLinter {
     }
 
     /// Resolve the tool honoring the configured `binary` hint and
-    /// discovery map, mirroring `loadEnvironment()`; `None` means
-    /// inactive (tool, runtime, or supported version missing).
-    fn resolve(&self) -> Option<(PathBuf, Vec<String>)> {
-        let path = std::env::var_os("PATH")?;
+    /// discovery map, mirroring `loadEnvironment()` (T1153 LINT-32):
+    /// the runtime comes first, then the tool, then the version probe,
+    /// and every failure reports PHP's text for the aggregate.
+    fn resolve(&self) -> Result<(PathBuf, Vec<String>), String> {
+        self.resolve_in(&std::env::var_os("PATH").unwrap_or_default())
+    }
+
+    /// [`resolve`](Self::resolve) against an explicit `PATH` value, so
+    /// tests need not depend on the ambient environment.
+    fn resolve_in(&self, path_env: &std::ffi::OsStr) -> Result<(PathBuf, Vec<String>), String> {
+        let path = path_env.to_os_string();
+        #[cfg(not(windows))]
+        let mono = find_on_path(&path, runtime_name())
+            .ok_or_else(|| "Unable to find Mono and you are not on Windows!".to_string())?;
         let settings = settings_base64(self.discovery.as_ref());
-        let (program, prefix) = resolve_command_in(&path, self.binary_hint.as_deref(), &settings)?;
-        if version_supported(&program, &prefix) {
-            Some((program, prefix))
-        } else {
-            None
-        }
+        let cslint = self
+            .binary_hint
+            .as_deref()
+            .filter(|hint| hint.is_file())
+            .map(Path::to_path_buf)
+            .or_else(|| find_on_path(&path, binary_name()))
+            .ok_or_else(|| "Unable to locate cslint.".to_string())?;
+        let mut prefix = command_flags_for(&settings);
+        #[cfg(not(windows))]
+        prefix.insert(0, cslint.to_string_lossy().into_owned());
+        #[cfg(not(windows))]
+        let program = mono;
+        #[cfg(windows)]
+        let program = cslint;
+        check_version(&program, &prefix)?;
+        Ok((program, prefix))
     }
 }
 
@@ -239,7 +261,7 @@ fn find_on_path(path_env: &std::ffi::OsStr, binary: &str) -> Option<PathBuf> {
 /// `binary` hint pointing at an existing file wins over the `PATH`
 /// lookup, like PHP. `None` means the linter is inactive. This is the
 /// pure lookup half of `loadEnvironment()`; the version probe runs
-/// separately in [`version_supported`].
+/// separately in [`check_version`].
 fn resolve_command_in(
     path_env: &std::ffi::OsStr,
     hint: Option<&Path>,
@@ -268,25 +290,43 @@ pub fn resolve_command() -> Option<(PathBuf, Vec<String>)> {
     resolve_command_in(&path, None, default_settings_base64())
 }
 
-/// True when `<program> -v` (plus the cslint path under Mono, which is
-/// `prefix[0]` there by construction) reports exactly
-/// [`SUPPORTED_VERSION`], mirroring the `loadEnvironment()` gate: a
-/// failing probe or any other version makes the linter inactive.
-fn version_supported(program: &Path, prefix: &[String]) -> bool {
-    let mut command = Command::new(program);
+/// Probe `<program> -v` (plus the cslint path under Mono, which is
+/// `prefix[0]` there by construction), mirroring the `loadEnvironment()`
+/// gate (T1153 LINT-32): a failing probe or an older version reports
+/// PHP's upgrade text, a newer version the Arcanist-upgrade text.
+fn check_version(program: &Path, prefix: &[String]) -> Result<(), String> {
+    let mut command = crate::proc_env::command(program);
     if !cfg!(windows) {
         let Some(cslint) = prefix.first() else {
-            return false;
+            return Err(old_version_error());
         };
         command.arg(cslint);
     }
     command.arg("-v").stdin(Stdio::null());
     let Ok(output) = arc_rs::lint::spawn_with_retry(&mut command) else {
-        return false;
+        return Err(old_version_error());
     };
     let code = output.status.code().unwrap_or(1);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    version_output_supported(code, &stdout)
+    if version_output_supported(code, &stdout) {
+        return Ok(());
+    }
+    // PHP reports newer versions with a distinct text.
+    if code == 0 && php_int_cast(&stdout) > SUPPORTED_VERSION {
+        return Err(
+            "Arcanist does not support this version of cslint (it is newer). \
+             You can try upgrading Arcanist with `arc upgrade`."
+                .to_string(),
+        );
+    }
+    Err(old_version_error())
+}
+
+/// PHP's old-cslint text (`loadEnvironment()`).
+fn old_version_error() -> String {
+    format!(
+        "You are running an old version of cslint. Please upgrade to version {SUPPORTED_VERSION}."
+    )
 }
 
 /// Pure half of the version gate: the probe must exit 0 and its stdout
@@ -362,7 +402,7 @@ fn staged_name(display_path: &str) -> String {
 }
 
 fn run_tool(program: &Path, prefix: &[String], file: &Path) -> Option<(i32, String, String)> {
-    let mut command = Command::new(program);
+    let mut command = crate::proc_env::command(program);
     command.args(prefix).arg(file).stdin(Stdio::null());
     let output = arc_rs::lint::spawn_with_retry(&mut command).ok()?;
     let code = output.status.code().unwrap_or(1);
@@ -458,6 +498,11 @@ fn parse_issue(path: &str, issue: &serde_json::Value) -> Option<LintMessage> {
             .get("ReplacementText")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     })
 }
 
@@ -667,17 +712,26 @@ impl Linter for CsharpLinter {
     }
 
     fn lint_bytes(&self, path: &str, data: &[u8]) -> Vec<LintMessage> {
+        *self.error.borrow_mut() = None;
         if !is_supported(path) {
             return Vec::new();
         }
         if data.contains(&0) {
             return Vec::new();
         }
-        let command = self.resolve();
-        let borrowed = command
-            .as_ref()
-            .map(|(program, prefix)| (program.as_path(), prefix.as_slice()));
+        let command = match self.resolve() {
+            Ok(command) => command,
+            Err(error) => {
+                *self.error.borrow_mut() = Some(error);
+                return Vec::new();
+            }
+        };
+        let borrowed = Some((command.0.as_path(), command.1.as_slice()));
         lint_with_command(path, data, borrowed)
+    }
+
+    fn take_error(&self) -> Option<String> {
+        self.error.borrow_mut().take()
     }
 
     fn set_option(
@@ -704,14 +758,14 @@ impl Linter for CsharpLinter {
 
     fn validate_severity_entry(&self, code: &str, severity: &str) -> Result<String, String> {
         // StyleCop rules may not be disabled, like PHP's
-        // `setCustomSeverityMap()` veto.
+        // `setCustomSeverityMap()` veto (ceb wording, T1153 LINT-31).
         if code.starts_with("SA") && severity == "disabled" {
             return Err(
                 "In order to keep StyleCop integration with IDEs and other tools consistent \
-                 with lint results, you aren't permitted to disable StyleCop rules within \
+                 with Arcanist results, you aren't permitted to disable StyleCop rules within \
                  '.arclint'. Instead configure the severity using the StyleCop settings dialog \
                  (usually accessible from within your IDE). StyleCop settings for your project \
-                 will be used when linting."
+                 will be used when linting for Arcanist."
                     .to_string(),
             );
         }

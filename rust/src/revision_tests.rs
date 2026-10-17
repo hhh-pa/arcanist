@@ -78,6 +78,7 @@ fn reads_ids_like_php_int_cast() {
 
 #[test]
 fn parses_revision_ids_from_messages() {
+    // T1153 RB-D37: `D123` or URI-path parsing like PHP.
     assert_eq!(
         revision_id_from_message("subject\n\nDifferential Revision: D123\n"),
         Ok(Some(123))
@@ -111,11 +112,11 @@ fn parses_revision_ids_from_messages() {
 #[test]
 fn rejects_invalid_revision_fields() {
     let err = revision_id_from_message("Differential Revision: D0\n").unwrap_err();
-    assert!(
-        err.contains("Invalid \"Differential Revision\" field"),
-        "{err}"
+    // T1153 RB-D37: the ceb bytes name a Phabricator URI.
+    assert_eq!(
+        err,
+        "Invalid \"Differential Revision\" field in commit message. This field should have a revision identifier like \"D123\" or a Phabricator URI like \"https://phabricator.example.com/D123\", but has \"D0\"."
     );
-    assert!(err.contains("but has \"D0\""), "{err}");
     assert!(revision_id_from_message("Differential Revision: 123\n").is_err());
     assert!(revision_id_from_message("Differential Revision: D12x\n").is_err());
     assert!(revision_id_from_message("Differential Revision: https://host/other\n").is_err());
@@ -138,6 +139,19 @@ fn merges_refs_by_phid_with_hash_refs_first() {
     assert_eq!(merged.len(), 2);
     assert_eq!(merged[0].name(), Some("via hash"));
     assert_eq!(merged[1].name(), Some("other"));
+}
+
+#[test]
+fn merges_phid_less_refs_first_wins() {
+    // T1153 RB-D15: a missing PHID keys as `""` like PHP's
+    // `mergeHardpointValues`, so only the first PHID-less ref is kept.
+    let first =
+        RevisionRef::from_search_hit(&serde_json::json!({"id": 3, "fields": {"title": "first"}}));
+    let second =
+        RevisionRef::from_search_hit(&serde_json::json!({"id": 4, "fields": {"title": "second"}}));
+    let merged = merge_revision_refs(vec![first], vec![second]);
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].name(), Some("first"));
 }
 
 #[test]
@@ -211,6 +225,26 @@ fn uri_pair_same(left: &str, right: &str) {
 }
 
 #[test]
+fn rbd38c_scp_garbage_matches_phutil_uri() {
+    // T1153 RB-D38c: PCRE greediness (the digit rule sees the LAST
+    // colon's tail), first-`@` user split, T12961 scp host checks.
+    assert!(!is_scp_uri("a.b:1:2"));
+    assert!(!is_scp_uri("u@h:12:34"));
+    assert!(is_scp_uri("u@h:p1:p2"));
+    assert_eq!(normalize_git_uri("u@h:p1:p2"), "h/p1:p2");
+    // Double-`@` yields host `b@c`, rejected like PHP.
+    assert_eq!(normalize_git_domain("a@b@c:d", &HashMap::new()), "<void>");
+    // Garbage scp hosts fail like `parse_url` hosts (T12961).
+    assert_eq!(
+        normalize_git_domain("user@-evil:path", &HashMap::new()),
+        "<void>"
+    );
+    assert_eq!(normalize_git_path("\0ssh://h/p"), "");
+    // Ambiguous URIs degrade to no-match (PHP throws; kept).
+    assert_eq!(normalize_git_path("ssh://h?x:1/y"), "");
+}
+
+#[test]
 fn evaluates_permanent_ref_rules() {
     let missing = RepositoryRef::from_search_hit(&serde_json::json!({"fields": {}}));
     assert!(!missing.is_permanent_ref("master"));
@@ -248,6 +282,8 @@ fn reads_repository_uris() {
 
 #[test]
 fn matches_permanent_rule_patterns() {
+    // T1153 RB-D31 (kept): the common subset matches; PCRE-only
+    // constructs never match.
     assert!(regexp_match("master", "master"));
     assert!(regexp_match("master", "xmasterx"));
     assert!(!regexp_match("^master$", "xmaster"));
@@ -266,4 +302,103 @@ fn matches_permanent_rule_patterns() {
     assert!(!regexp_match("(?=a)a", "a"));
     assert!(!regexp_match("(a)\\1", "aa"));
     assert!(!regexp_match("(unclosed", "unclosed"));
+}
+
+#[test]
+fn search_params_builder_nests_constraints() {
+    assert_eq!(
+        conduit_search_params(&serde_json::json!({"phids": ["PHID-USER-9"]}), None),
+        serde_json::json!({"constraints": {"phids": ["PHID-USER-9"]}})
+    );
+    assert_eq!(
+        conduit_search_params(
+            &serde_json::json!({"ids": [123]}),
+            Some(&serde_json::json!({"uris": true})),
+        ),
+        serde_json::json!({
+            "constraints": {"ids": [123]},
+            "attachments": {"uris": true},
+        })
+    );
+}
+
+/// True when `line` names a new-style `.search` call that must nest its
+/// constraints: a method literal (`"user.search"`) or a `METHOD_*_SEARCH`
+/// constant at a call — excluding comments, constant definitions, and
+/// flat-by-design `edge.search` (PHP sends it flat via `yieldConduit`).
+fn is_nested_search_call_site(line: &str) -> bool {
+    let is_literal = line.contains(".search\"");
+    let is_constant = line.contains("METHOD_") && line.contains("SEARCH");
+    if !is_literal && !is_constant {
+        return false;
+    }
+    if line.trim_start().starts_with('/') || line.contains("pub const") {
+        return false;
+    }
+    !(line.contains("edge.search") || line.contains("EDGE_SEARCH"))
+}
+
+/// True when the ±6-line window around `index` shows nested constraints.
+fn search_window_is_nested(lines: &[&str], index: usize) -> bool {
+    let low = index.saturating_sub(6);
+    let high = (index + 7).min(lines.len());
+    let window = lines[low..high].join("\n");
+    window.contains("\"constraints\"")
+        || window.contains("conduit_search")
+        || window.contains("search_params(")
+        || window.contains("search_constraints(")
+}
+
+/// Scan one source file for flat `.search` params, pushing
+/// `name:line: text` failures; returns the call sites checked.
+fn scan_file_for_flat_search(name: &str, body: &str, failures: &mut Vec<String>) -> usize {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut checked = 0;
+    for (index, line) in lines.iter().enumerate() {
+        if !is_nested_search_call_site(line) {
+            continue;
+        }
+        checked += 1;
+        if !search_window_is_nested(&lines, index) {
+            failures.push(format!("{}:{}: {}", name, index + 1, line.trim()));
+        }
+    }
+    checked
+}
+
+/// Every new-style `.search` call site must send its constraints nested
+/// under a top-level `constraints` key (T1153): the server rejects flat
+/// constraint params with `ERR-CONDUIT-CALL`, exactly like PHP
+/// `ConduitSearchFuture` wraps them.
+///
+/// This test enumerates the call sites textually so a future flat
+/// addition fails loudly (see [`is_nested_search_call_site`]).
+#[test]
+fn every_search_call_site_nests_constraints() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut entries: Vec<_> = std::fs::read_dir(&src)
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    entries.sort_by_key(|entry| entry.file_name());
+    let mut checked = 0;
+    let mut failures = Vec::new();
+    for entry in entries {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.ends_with("_tests.rs") {
+            continue;
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        checked += scan_file_for_flat_search(name, &body, &mut failures);
+    }
+    assert!(checked > 0, "search call-site scan found nothing");
+    assert!(
+        failures.is_empty(),
+        "flat .search params (missing top-level constraints):\n{}",
+        failures.join("\n")
+    );
 }

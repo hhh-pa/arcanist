@@ -72,6 +72,25 @@ pub const PROP_ONTO: &str = "arc:onto";
 /// (`ArcanistDiffWorkflow.php:2272`).
 pub const CREATION_METHOD_ARC: &str = "arc";
 
+/// Loose `i64` coercion for legacy-query scalars (T1153 R2): orsay types
+/// `differential.query` / `user.query` / `differential.querydiffs`
+/// scalars as strings while other servers send numbers; PHP compares
+/// loosely. Accepts both, `None` otherwise.
+#[must_use]
+pub fn loose_i64(value: &serde_json::Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|s| s.parse::<i64>().ok()))
+}
+
+/// Loose `u64` coercion, same wire rule as [`loose_i64`] for IDs.
+#[must_use]
+pub fn loose_u64(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|s| s.parse::<u64>().ok()))
+}
+
 /// `ArcanistLintWorkflow::RESULT_OKAY` (`ArcanistLintWorkflow.php:8`).
 pub const LINT_RESULT_OKAY: i64 = 0;
 /// `ArcanistLintWorkflow::RESULT_WARNINGS` (`ArcanistLintWorkflow.php:9`).
@@ -185,6 +204,16 @@ pub struct DiffHunk {
     pub old_length: i64,
     /// `newLength`.
     pub new_length: i64,
+    /// True when the hunk header spelled the old `,length` (T1153
+    /// EXPORT-E11: PHP keeps the regex captures as strings
+    /// (`ArcanistDiffParser.php:919-935`), so offsets render as strings
+    /// and lengths render as strings when explicit, integer `1` when
+    /// omitted). Parsed paths set both from
+    /// [`crate::diff_local::HunkLenExplicit`].
+    pub old_len_explicit: bool,
+    /// True when the hunk header spelled the new `,length` (T1153
+    /// EXPORT-E11, as above).
+    pub new_len_explicit: bool,
     /// `addLines`.
     pub add_lines: i64,
     /// `delLines`.
@@ -203,8 +232,9 @@ pub struct DiffHunk {
 pub struct DiffChange {
     /// `metadata`.
     pub metadata: serde_json::Value,
-    /// `oldPath`.
-    pub old_path: String,
+    /// `oldPath`, null when PHP never sets it (T1153 EXPORT-E14:
+    /// move/copy-away companions report null).
+    pub old_path: Option<String>,
     /// `currentPath`.
     pub current_path: String,
     /// `awayPaths`.
@@ -228,8 +258,10 @@ impl Default for DiffChange {
     /// (`ArcanistDiffChange.php:18-19`), everything else empty.
     fn default() -> Self {
         Self {
-            metadata: serde_json::Value::Object(serde_json::Map::new()),
-            old_path: String::new(),
+            // DIFF-D18: PHP `$metadata = array()` encodes as `[]`, not `{}`.
+            metadata: serde_json::Value::Array(Vec::new()),
+            // T1153 EXPORT-E14: PHP's `oldPath` property defaults to null.
+            old_path: None,
             current_path: String::new(),
             away_paths: Vec::new(),
             old_properties: serde_json::Value::Array(Vec::new()),
@@ -247,21 +279,49 @@ impl DiffChange {
     #[must_use]
     pub fn new_text(old_path: &str, current_path: &str) -> Self {
         Self {
-            old_path: old_path.to_string(),
+            old_path: Some(old_path.to_string()),
             current_path: current_path.to_string(),
+            ..Self::default()
+        }
+    }
+
+    /// A move/copy-away companion (T1153 EXPORT-E14): null old path, no
+    /// hunks, PHP defaults otherwise.
+    #[must_use]
+    pub fn new_companion(change_type: i64, current_path: &str, away_paths: &[String]) -> Self {
+        Self {
+            old_path: None,
+            current_path: current_path.to_string(),
+            away_paths: away_paths.to_vec(),
+            change_type,
             ..Self::default()
         }
     }
 }
 
+/// Render a hunk length in `toDictionary` shape (T1153 EXPORT-E11):
+/// the spelled string when the header carried `,length`, else the
+/// integer the parser substitutes (`ArcanistDiffParser.php:922-933`).
+fn hunk_len_json(length: i64, explicit: bool) -> serde_json::Value {
+    if explicit {
+        serde_json::Value::String(length.to_string())
+    } else {
+        serde_json::json!(length)
+    }
+}
+
 /// Render a hunk with verbatim `ArcanistDiffHunk::toDictionary` keys.
+///
+/// Offsets render as strings and lengths as strings-when-explicit
+/// (T1153 EXPORT-E11: `ArcanistDiffParser.php:919-933` keeps the regex
+/// captures, `ArcanistDiffHunk.php:18-30` passes them through).
 #[must_use]
 pub fn hunk_json(hunk: &DiffHunk) -> serde_json::Value {
     serde_json::json!({
-        "oldOffset": hunk.old_offset,
-        "newOffset": hunk.new_offset,
-        "oldLength": hunk.old_length,
-        "newLength": hunk.new_length,
+        "oldOffset": hunk.old_offset.to_string(),
+        "newOffset": hunk.new_offset.to_string(),
+        "oldLength": hunk_len_json(hunk.old_length, hunk.old_len_explicit),
+        "newLength": hunk_len_json(hunk.new_length, hunk.new_len_explicit),
         "addLines": hunk.add_lines,
         "delLines": hunk.del_lines,
         "isMissingOldNewline": hunk.is_missing_old_newline,
@@ -276,7 +336,7 @@ pub fn change_json(change: &DiffChange) -> serde_json::Value {
     let hunks: Vec<serde_json::Value> = change.hunks.iter().map(hunk_json).collect();
     serde_json::json!({
         "metadata": change.metadata,
-        "oldPath": change.old_path,
+        "oldPath": opt_json(&change.old_path),
         "currentPath": change.current_path,
         "awayPaths": change.away_paths,
         "oldProperties": change.old_properties,
@@ -423,16 +483,6 @@ pub fn commit_message_update_params(
     })
 }
 
-/// Build the `--update` message `differential.getcommitmessage` params:
-/// `revision_id`, `edit` = `edit` (`ArcanistDiffWorkflow.php:1600-1603`).
-#[must_use]
-pub fn get_commit_message_edit_params(revision_id: i64) -> serde_json::Value {
-    serde_json::json!({
-        "revision_id": revision_id,
-        "edit": "edit",
-    })
-}
-
 /// Build the create-template `differential.getcommitmessage` params:
 /// `revision_id` = null, `edit` = `create`, `fields`
 /// (`ArcanistDiffWorkflow.php:1416-1422`).
@@ -464,6 +514,51 @@ pub fn set_diff_property_params(diff_id: i64, name: &str, data: &str) -> serde_j
         "name": name,
         "data": data,
     })
+}
+
+/// Drop null-valued keys (`getModernCommonDictionary()`,
+/// `ArcanistWorkflow.php:2256-2261`).
+#[must_use]
+pub fn modern_common_dictionary(map: &serde_json::Value) -> serde_json::Value {
+    let Some(object) = map.as_object() else {
+        return map.clone();
+    };
+    serde_json::Value::Object(
+        object
+            .iter()
+            .filter(|(_, value)| !value.is_null())
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
+}
+
+/// Modernize one lint message (`getModernLintDictionary()`, `:2239-2242`).
+#[must_use]
+pub fn modern_lint_dictionary(message: &serde_json::Value) -> serde_json::Value {
+    modern_common_dictionary(message)
+}
+
+/// Modernize one unit result (`getModernUnitDictionary()`, `:2244-2254`):
+/// drop nulls, then move a nonempty `userData` string to `details`.
+#[must_use]
+pub fn modern_unit_dictionary(message: &serde_json::Value) -> serde_json::Value {
+    let modern = modern_common_dictionary(message);
+    let Some(object) = modern.as_object() else {
+        return modern;
+    };
+    let mut object = object.clone();
+    let details = object
+        .get("userData")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !details.is_empty() {
+        object.insert(
+            "details".to_string(),
+            serde_json::Value::String(details.to_string()),
+        );
+    }
+    object.remove("userData");
+    serde_json::Value::Object(object)
 }
 
 /// Build the `differential.query` params: `ids`
@@ -806,7 +901,9 @@ pub fn check_draft_update(
 /// (`ArcanistDiffWorkflow.php:515-521`).
 pub fn check_draft_create(is_draft: bool, has_transactions: bool) -> Result<(), String> {
     if is_draft && !has_transactions {
-        return Err("You have specified \"--draft\", but the software version on the server is too old to support draft revisions. Omit the flag or upgrade the server software.".to_string());
+        // DIFF-D20: ceb wording ("the version of Phabricator on the
+        // server"), not the 2023 "software version" text.
+        return Err("You have specified \"--draft\", but the version of Phabricator on the server is too old to support draft revisions. Omit the flag or upgrade the server software.".to_string());
     }
     Ok(())
 }
@@ -1255,9 +1352,9 @@ pub fn sendmessage_unit_params(
 
 /// Push lint/unit results to Harbormaster autotargets over the seam.
 ///
-/// PHP: `updateAutotargets()` (`:2777-2855`). Lint and unit messages are
-/// caller-normalized (`getModernLintDictionary()` / `getModernUnitDictionary()`
-/// are identity here: this port stores dictionaries already). Returns false
+/// PHP: `updateAutotargets()` (`:2777-2855`). Messages are modernized
+/// per message (`getModernLintDictionary()` /
+/// `getModernUnitDictionary()`, DIFF-D12) before sending. Returns false
 /// when the query fails or any send fails, like PHP's exception swallowing
 /// (`:2792-2794`, `:2844-2853`).
 ///
@@ -1279,21 +1376,25 @@ pub fn update_autotargets(
     };
     let mut sends = Vec::new();
     if let Some(target) = autotarget_phid(&response, AUTOTARGET_LINT_KEY) {
-        let severities: Vec<&str> = lint_messages
+        let lint: Vec<serde_json::Value> =
+            lint_messages.iter().map(modern_lint_dictionary).collect();
+        let severities: Vec<&str> = lint
             .iter()
             .filter_map(|message| message.get("severity").and_then(|value| value.as_str()))
             .collect();
         sends.push(sendmessage_lint_params(
             &target,
-            lint_messages,
+            &lint,
             lint_autotarget_type(&severities),
         ));
     }
     if let Some(target) = autotarget_phid(&response, AUTOTARGET_UNIT_KEY) {
+        let unit: Vec<serde_json::Value> =
+            unit_results.iter().map(modern_unit_dictionary).collect();
         let unit_type = crate::diff_local::harbormaster_type_from_result(
             i32::try_from(unit_result).unwrap_or(crate::diff_local::UNIT_RESULT_FAIL),
         );
-        sends.push(sendmessage_unit_params(&target, unit_results, unit_type));
+        sends.push(sendmessage_unit_params(&target, &unit, unit_type));
     }
     for params in &sends {
         if call(METHOD_SENDMESSAGE, params).is_err() {
@@ -1334,6 +1435,72 @@ pub fn php_json_encode(value: &serde_json::Value) -> Result<String, serde_json::
 /// inspect `--json`, but its bytes stay slash-consistent regardless).
 pub fn php_json_encode_pretty(value: &serde_json::Value) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(value).map(|text| php_escape_json_slashes(&text))
+}
+
+/// Staging push statuses (`ArcanistDiffWorkflow.php:25-32`).
+pub const STAGING_PUSHED: &str = "pushed";
+/// Staging skip: `--skip-staging`.
+pub const STAGING_USER_SKIP: &str = "user.skip";
+/// Staging skip: raw diff source.
+pub const STAGING_DIFF_RAW: &str = "diff.raw";
+/// Staging skip: repository unknown.
+pub const STAGING_REPOSITORY_UNKNOWN: &str = "repository.unknown";
+/// Staging skip: server lacks staging support.
+pub const STAGING_REPOSITORY_UNAVAILABLE: &str = "repository.unavailable";
+/// Staging skip: repository kind unsupported.
+pub const STAGING_REPOSITORY_UNSUPPORTED: &str = "repository.unsupported";
+/// Staging skip: no staging area configured.
+pub const STAGING_REPOSITORY_UNCONFIGURED: &str = "repository.unconfigured";
+/// Staging skip: client cannot stage this repository.
+pub const STAGING_CLIENT_UNSUPPORTED: &str = "client.unsupported";
+/// The staging diff property (`:2607`).
+pub const PROP_STAGING: &str = "arc.staging";
+
+/// Staging push refs: the base tag (skipped for the magic root commit)
+/// plus the diff tag (`:2687-2712`). `prefix` defaults to
+/// `phabricator`; LFS working copies push the base commit to the diff
+/// tag here (the force-push follows separately).
+#[must_use]
+pub fn staging_push_refs(
+    staging_uri: &str,
+    prefix: &str,
+    diff_id: i64,
+    base_commit: &str,
+    head_commit: &str,
+    is_lfs: bool,
+) -> Vec<serde_json::Value> {
+    let mut refs = Vec::new();
+    if base_commit != crate::git::GIT_MAGIC_ROOT_COMMIT {
+        refs.push(staging_push_ref(
+            staging_uri,
+            &format!("refs/tags/{prefix}/base/{diff_id}"),
+            "base",
+            base_commit,
+        ));
+    }
+    refs.push(staging_push_ref(
+        staging_uri,
+        &format!("refs/tags/{prefix}/diff/{diff_id}"),
+        "diff",
+        if is_lfs { base_commit } else { head_commit },
+    ));
+    refs
+}
+
+/// One staging push-ref row: `ref`, `type`, `commit`, `remote`.
+#[must_use]
+pub fn staging_push_ref(
+    staging_uri: &str,
+    tag: &str,
+    kind: &str,
+    commit: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "ref": tag,
+        "type": kind,
+        "commit": commit,
+        "remote": {"uri": staging_uri},
+    })
 }
 
 /// `arc.staging` diff property payload (`:2598-2620`).

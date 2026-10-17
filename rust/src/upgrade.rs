@@ -14,6 +14,11 @@
 //! [`uncommitted_paths`], and [`render_uncommitted_block`] remain as the
 //! checkout-based (`git pull`) port for library checkouts; the live
 //! `--apply` path replaces the binary and does not use them.
+//!
+//! Redesign note (T1153 CORE-56, kept): PHP pulls the install
+//! checkout (`git pull --rebase`), which is unportable — a static
+//! binary has no checkout to pull. Bare `arc upgrade` reports,
+//! `--apply` replaces the binary from release assets instead.
 
 extern crate self as arc_rs;
 
@@ -29,20 +34,31 @@ use arc_rs::terminal::{self, PhtArg, TVal};
 /// Subcommand name, matching `arc upgrade`.
 pub const NAME: &str = "upgrade";
 
-const USAGE: &str = "usage: arc upgrade [--check] [--json] [--apply] [--yes]\n\
-\n\
-Report the running arc version and whether the enclosing git checkout\n\
-is behind its upstream. With --apply, replace the running executable\n\
-with the latest stable release instead of reporting (--check is\n\
-ignored; --json prints the result as JSON).\n\
-\n\
-Options:\n\
-  --check         Exit non-zero when the checkout is behind its upstream.\n\
-  --json          Emit the report (or --apply result) as JSON.\n\
-  --apply         Download the latest stable release and replace the\n\
-                  running executable (prompts first; --yes skips).\n\
-  --yes           Skip the upgrade prompt (scripting).\n\
-  -h, --help      Show this help.\n";
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not the short usage line (which stays for error dumps). The
+/// renderer is the shared `arc_rs::help` module; this file keeps only
+/// the data (ceb `src/workflow/ArcanistUpgradeWorkflow.php:11-27`).
+const HELP_EXAMPLES: &str = "**upgrade**";
+const HELP_SYNOPSIS: &str = "Upgrade Arcanist to the latest version.";
+const HELP_TEXT: &str = "Upgrade Arcanist to the latest version.";
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    arc_rs::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &[],
+        ansi,
+    )
+}
+
+fn usage() -> String {
+    usage_text(terminal::ansi_enabled())
+}
 
 /// The running version, from `Cargo.toml`.
 #[must_use]
@@ -297,7 +313,7 @@ pub fn rebuild_note() -> &'static str {
 /// Run `git pull --rebase origin -- <branch>` in `root`, returning stdout
 /// on success and `(stdout, stderr)` on failure.
 fn pull_rebase(root: &Path, branch: &str) -> Result<String, (String, String)> {
-    let out = std::process::Command::new("git")
+    let out = crate::proc_env::command("git")
         .current_dir(root)
         .args(["pull", "--rebase", "origin", "--", branch])
         .output()
@@ -313,7 +329,7 @@ fn pull_rebase(root: &Path, branch: &str) -> Result<String, (String, String)> {
 
 /// Best-effort `git rebase --abort` after a failed pull, mirroring PHP.
 fn abort_rebase(root: &Path) {
-    std::process::Command::new("git")
+    crate::proc_env::command("git")
         .current_dir(root)
         .args(["rebase", "--abort"])
         .output()
@@ -1411,15 +1427,34 @@ enum Parsed {
     Help,
     Options(Options),
     Error(String),
+    /// T1153 B21/B23: stdin is piped and argv carries no `--`.
+    MissingTerminator,
 }
 
 fn parse_args(argv: &[String]) -> Parsed {
+    parse_args_with_tty(argv, arc_rs::prompt::stdin_is_terminal())
+}
+
+/// [`parse_args`] with an injected TTY flag (deterministic tests).
+/// T1153 B21/B23: piped runs without `--` fail with
+/// `MissingTerminator` (checked after unknown-flag scanning, like
+/// PHP's `parseFull()`, but before success). A lone `--` is the
+/// terminator (accepted); `--help` after `--` is a positional
+/// (rejected, like PHP). Vs ceb `ArcanistRuntime.php:80-86,172-188`
+/// and `PhutilArgumentParser.php:331-336`.
+fn parse_args_with_tty(argv: &[String], stdin_tty: bool) -> Parsed {
+    let missing = arc_rs::help::terminator_missing(argv, stdin_tty);
     let mut check = false;
     let mut json = false;
     let mut apply = false;
     let mut yes = false;
+    let mut end_of_flags = false;
     for arg in argv {
-        if arg == "--check" {
+        if end_of_flags {
+            return Parsed::Error(format!("unexpected argument '{arg}'"));
+        } else if arg == "--" {
+            end_of_flags = true;
+        } else if arg == "--check" {
             check = true;
         } else if arg == "--json" {
             json = true;
@@ -1428,12 +1463,18 @@ fn parse_args(argv: &[String]) -> Parsed {
         } else if arg == "--yes" {
             yes = true;
         } else if arg == "-h" || arg == "--help" {
+            if missing {
+                return Parsed::MissingTerminator;
+            }
             return Parsed::Help;
         } else if arg.starts_with('-') {
             return Parsed::Error(format!("unknown flag '{arg}'"));
         } else {
             return Parsed::Error(format!("unexpected argument '{arg}'"));
         }
+    }
+    if missing {
+        return Parsed::MissingTerminator;
     }
     Parsed::Options(Options {
         check,
@@ -1495,11 +1536,21 @@ fn run_apply_command(cwd: &Path, options: &Options) -> ExitCode {
 pub fn run(argv: &[String]) -> ExitCode {
     let options = match parse_args(argv) {
         Parsed::Help => {
-            print!("{USAGE}");
+            print!("{}", usage());
             return ExitCode::SUCCESS;
         }
+        // T1153 B21/B23: the terminator failure prints the three cyan
+        // hints first (like `ArcanistRuntime.php:172-188`) and reports
+        // through the toolset usage arm (exit 1).
+        Parsed::MissingTerminator => {
+            arc_rs::help::print_terminator_hints(arc_rs::terminal::ansi_enabled());
+            return arc_rs::conduit::report(
+                arc_rs::conduit::EnvelopeKind::ToolsetUsage,
+                arc_rs::help::MISSING_TERMINATOR,
+            );
+        }
         Parsed::Error(message) => {
-            eprintln!("arc {NAME}: {message}\n\n{USAGE}");
+            eprintln!("arc {NAME}: {message}\n\n{}", usage());
             return ExitCode::FAILURE;
         }
         Parsed::Options(options) => options,

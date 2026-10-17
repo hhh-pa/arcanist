@@ -28,18 +28,19 @@ impl Drop for TempDir {
 
 #[test]
 fn uri_normalization_requires_http_and_domain() {
+    // T1153 CORE-43: the ceb example host is `phabricator.example.com`.
     assert_eq!(CLI_TOKEN.len(), 32);
     assert_eq!(API_TOKEN.len(), 32);
     for raw in [
-        "https://devtools.example.com/",
-        "https://devtools.example.com",
-        "https://devtools.example.com/api/",
-        "https://devtools.example.com/api",
-        "https://devtools.example.com/some/path",
+        "https://phabricator.example.com/",
+        "https://phabricator.example.com",
+        "https://phabricator.example.com/api/",
+        "https://phabricator.example.com/api",
+        "https://phabricator.example.com/some/path",
     ] {
         assert_eq!(
             normalize_uri(raw).unwrap(),
-            "https://devtools.example.com/api/",
+            "https://phabricator.example.com/api/",
             "for {raw}"
         );
     }
@@ -52,12 +53,12 @@ fn uri_normalization_requires_http_and_domain() {
         "https://h.example:8443/api/"
     );
     assert_eq!(
-        normalize_uri("devtools.example.com").unwrap_err(),
-        "Server URI \"devtools.example.com\" must include a protocol and domain. It should be in the form \"https://devtools.example.com/\"."
+        normalize_uri("phabricator.example.com").unwrap_err(),
+        "Server URI \"phabricator.example.com\" must include a protocol and domain. It should be in the form \"https://phabricator.example.com/\"."
     );
     assert_eq!(
         normalize_uri("ftp://h.example/").unwrap_err(),
-        "Server URI \"ftp://h.example/\" must include the \"http\" or \"https\" protocol. It should be in the form \"https://devtools.example.com/\"."
+        "Server URI \"ftp://h.example/\" must include the \"http\" or \"https\" protocol. It should be in the form \"https://phabricator.example.com/\"."
     );
     assert!(
         normalize_uri("https://")
@@ -84,7 +85,9 @@ fn token_shapes_validate() {
 
 #[test]
 fn uri_resolution_follows_precedence() {
+    // T1153 CORE-33: the project file only counts at a working-copy root.
     let tmp = TempDir::new("resolve");
+    std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
     std::fs::write(
         tmp.path.join(".arcconfig"),
         r#"{"phabricator.uri": "https://cfg.example/"}"#,
@@ -118,9 +121,16 @@ fn uri_resolution_follows_precedence() {
         resolve_uri(None, None, None, &tmp.path).unwrap(),
         "https://cfg.example/api/"
     );
+    // T1153 CORE-12: with user/system shadowed, bare discovery still errors.
     let bare = TempDir::new("bare");
+    let empty = bare.path.join("empty.json");
+    std::fs::write(&empty, "{}").unwrap();
+    let shadow = arc_rs::get_config::LoadOptions {
+        config_files: vec![empty],
+        ..Default::default()
+    };
     assert_eq!(
-        resolve_uri(None, None, None, &bare.path).unwrap_err(),
+        resolve_uri_with(None, None, None, &bare.path, None, &shadow).unwrap_err(),
         "Specify an explicit URI or run this command from within a project which is configured with a .arcconfig."
     );
     assert!(resolve_uri(Some("notauri"), None, None, &tmp.path).is_err());
@@ -145,10 +155,10 @@ fn messages_match_php_call_sites() {
         connect_message("https://h.example/api/"),
         "Connecting to \"https://h.example/api/\"..."
     );
-    assert_eq!(login_header_markup(), "**LOG IN**\n");
+    assert_eq!(login_header_markup(), "**LOGIN TO PHABRICATOR**\n");
     assert_eq!(
         login_page_block("https://h.example/conduit/login/"),
-        "Open this page in your browser and log in if necessary:\n\nhttps://h.example/conduit/login/\n\nThen paste the API Token on that page below."
+        "Open this page in your browser and login to Phabricator if necessary:\n\nhttps://h.example/conduit/login/\n\nThen paste the API Token on that page below."
     );
     assert_eq!(
         standard_token_notice(),
@@ -197,8 +207,14 @@ fn token_storage_roundtrips_and_preserves_config() {
         Some(CLI_TOKEN.to_string())
     );
     std::fs::write(&path, "nope").unwrap();
-    assert!(read_token_doc(&path).is_err());
+    // T1153 CORE-42: the `readUserConfigurationFile()` text, literal `~/.arcrc`.
+    assert_eq!(
+        read_token_doc(&path).unwrap_err(),
+        "Your '~/.arcrc' file is not a valid JSON file."
+    );
     assert!(install_token(&path, "https://h.example/api/", CLI_TOKEN).is_err());
+    // T1153 CORE-35 (kept): non-object docs are rejected upfront
+    // (PHP returns them raw and fatals downstream).
     std::fs::write(&path, "[1]").unwrap();
     assert!(read_token_doc(&path).is_err());
     std::fs::write(&path, r#"{"hosts": 7}"#).unwrap();
@@ -336,6 +352,7 @@ fn certificate_exchange_parses_user_and_cert() {
             certificate: "CERT".to_string(),
         }
     );
+    // T1153 CORE-45 (kept): a missing certificate is rejected.
     let bad = stub_call(
         [(
             "conduit.getcertificate".to_string(),
@@ -423,7 +440,10 @@ fn styled_renders_match_console_output() {
         render_connect("https://h.example/api/", false),
         " CONNECT  Connecting to \"https://h.example/api/\"...\n"
     );
-    assert_eq!(render_login_header(false).unwrap(), "LOG IN\n");
+    assert_eq!(
+        render_login_header(false).unwrap(),
+        "LOGIN TO PHABRICATOR\n"
+    );
     assert_eq!(
         render_success(true, false),
         " SUCCESS!  API Token installed.\n"
@@ -431,6 +451,16 @@ fn styled_renders_match_console_output() {
     assert_eq!(
         render_success(false, false),
         " SUCCESS!  Certificate installed.\n"
+    );
+    // T1153 CORE-44: status nesting (`<bg:color>** %s **</bg>`), not the
+    // log-engine order — plain text stays identical.
+    assert_eq!(
+        render_connect("https://h.example/api/", true),
+        "\x1b[44m\x1b[1m CONNECT \x1b[m\x1b[49m Connecting to \"https://h.example/api/\"...\n"
+    );
+    assert_eq!(
+        render_success(true, true),
+        "\x1b[42m\x1b[1m SUCCESS! \x1b[m\x1b[49m API Token installed.\n"
     );
 }
 
@@ -459,10 +489,269 @@ fn args_accept_one_uri_and_flags() {
             conduit_uri: None,
             token: Some("t".to_string()),
             force: true,
+            config: vec![],
+            config_files: vec![],
+            arcrc_file: None,
         }
     );
     let dashed = parse_args(&["--".to_string(), "https://h.example/".to_string()])
         .unwrap()
         .unwrap();
     assert_eq!(dashed.uri, Some("https://h.example/".to_string()));
+}
+
+// -( R5 TTY gating: T1153 CORE-39/T1153 CORE-40, both CLEAN )-----------------------------------
+
+#[test]
+fn r5_core39_token_prompt_gates_pipes() {
+    // CLEAN: `phutil_console_prompt()` requires a TTY
+    // (`ArcanistInstallCertificateWorkflow.php:103-109` via
+    // `src/console/format.php:46-52`); blanks re-prompt, EOF fails fast
+    // (T1153 CORE-46 keep).
+    let mut piped = std::io::BufReader::new("cli-tok\n".as_bytes());
+    assert_eq!(
+        prompt_token_from(&mut piped, false).unwrap_err(),
+        crate::prompt::NOT_INTERACTIVE
+    );
+    let mut blanks = std::io::BufReader::new("\n  \ncli-tok\n".as_bytes());
+    assert_eq!(
+        prompt_token_from(&mut blanks, true).unwrap(),
+        "cli-tok".to_string()
+    );
+    let mut eof = std::io::BufReader::new("".as_bytes());
+    assert_eq!(
+        prompt_token_from(&mut eof, true).unwrap_err(),
+        "no token provided (EOF on stdin)".to_string()
+    );
+}
+
+#[test]
+fn r6_core38_uri_uses_full_precedence_and_default() {
+    // T1153 CORE-38: discovery reads `phabricator.uri` from any source, then
+    // `default` — including the project legacy `conduit_uri`.
+    let tmp = TempDir::new("core38");
+    std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
+    let user = tmp.path.join("arcrc.json");
+    std::fs::write(&user, r#"{"config": {"default": "https://d.example/"}}"#).unwrap();
+    let opts = arc_rs::get_config::LoadOptions::default();
+    assert_eq!(
+        resolve_uri_with(None, None, None, &tmp.path, Some(&user), &opts).unwrap(),
+        "https://d.example/api/"
+    );
+    std::fs::write(
+        tmp.path.join(".arcconfig"),
+        r#"{"conduit_uri": "https://old.example/"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        resolve_uri_with(None, None, None, &tmp.path, Some(&user), &opts).unwrap(),
+        "https://old.example/api/"
+    );
+    // `--config` beats the project file.
+    let rt = arc_rs::get_config::load_options_from_cli(
+        &["phabricator.uri=https://rt.example/".to_string()],
+        &[],
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        resolve_uri_with(None, None, None, &tmp.path, Some(&user), &rt).unwrap(),
+        "https://rt.example/api/"
+    );
+    // Explicit inputs still beat discovery.
+    assert_eq!(
+        resolve_uri_with(
+            None,
+            Some("https://flag.example/"),
+            None,
+            &tmp.path,
+            Some(&user),
+            &rt
+        )
+        .unwrap(),
+        "https://flag.example/api/"
+    );
+}
+
+#[test]
+fn r5_core40_install_anyway_enter_declines() {
+    // CLEAN: `ArcanistInstallCertificateWorkflow.php:126` defaults to
+    // no (`[y/N]`), so Enter declines and the token is not installed.
+    let mut enter = std::io::BufReader::new("\n".as_bytes());
+    assert!(!prompt_confirm_from(&mut enter, "Install this token anyway?", true, true).unwrap());
+    let mut yes = std::io::BufReader::new("y\n".as_bytes());
+    assert!(prompt_confirm_from(&mut yes, "Install this token anyway?", true, true).unwrap());
+}
+
+#[test]
+fn r6_core38_mistyped_uri_errors() {
+    let tmp = TempDir::new("core38type");
+    std::fs::create_dir_all(tmp.path.join(".git")).unwrap();
+    std::fs::write(tmp.path.join(".arcconfig"), r#"{"phabricator.uri": 42}"#).unwrap();
+    let opts = arc_rs::get_config::LoadOptions::default();
+    assert_eq!(
+        resolve_uri_with(None, None, None, &tmp.path, None, &opts).unwrap_err(),
+        "Type of setting 'phabricator.uri' must be string."
+    );
+}
+
+#[test]
+fn r6_core34_install_config_flags_parse() {
+    let opts = parse_args(&[
+        "https://h.example/".to_string(),
+        "--config".to_string(),
+        "a=1".to_string(),
+        "--config-file=f".to_string(),
+        "--arcrc-file".to_string(),
+        "g".to_string(),
+    ])
+    .unwrap()
+    .unwrap();
+    assert_eq!(opts.config, ["a=1"]);
+    assert_eq!(opts.config_files, ["f"]);
+    assert_eq!(opts.arcrc_file.as_deref(), Some("g"));
+    assert!(parse_args(&["--config".to_string()]).is_err());
+}
+
+// T1153 CORE-41: the `readUserConfigurationFile()` permission gate.
+// Unix-only (PHP skips it on Windows); chmod works as root, so no
+// readability tricks are needed.
+#[cfg(unix)]
+fn open_arcrc(tmp: &TempDir, mode: u32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = tmp.path.join(".arcrc");
+    std::fs::write(&path, "{}").unwrap();
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(mode);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+#[cfg(unix)]
+fn arcrc_mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+#[test]
+#[cfg(unix)]
+fn core41_open_arcrc_prompts_to_chmod() {
+    // Accept narrows to 0600; decline keeps the mode and errors.
+    let tmp = TempDir::new("chmod-yes");
+    let path = open_arcrc(&tmp, 0o644);
+    let mut input = std::io::BufReader::new(std::io::Cursor::new(b"y\n".to_vec()));
+    ensure_arcrc_permissions_from(&mut input, &path, true).unwrap();
+    assert_eq!(arcrc_mode(&path), 0o600);
+
+    let tmp = TempDir::new("chmod-no");
+    let path = open_arcrc(&tmp, 0o644);
+    let mut input = std::io::BufReader::new(std::io::Cursor::new(b"n\n".to_vec()));
+    assert_eq!(
+        ensure_arcrc_permissions_from(&mut input, &path, true).unwrap_err(),
+        "Set ~/.arcrc to file mode 600."
+    );
+    assert_eq!(arcrc_mode(&path), 0o644);
+}
+
+#[test]
+#[cfg(unix)]
+fn core41_chmod_prompt_defaults_yes() {
+    // T1153 CORE-40/T1153 CORE-41: PHP passes `$default_no = false`
+    // ([Y/n]): empty input chmods.
+    let tmp = TempDir::new("chmod-default");
+    let path = open_arcrc(&tmp, 0o640);
+    let mut input = std::io::BufReader::new(std::io::Cursor::new(b"\n".to_vec()));
+    ensure_arcrc_permissions_from(&mut input, &path, true).unwrap();
+    assert_eq!(arcrc_mode(&path), 0o600);
+}
+
+#[test]
+#[cfg(unix)]
+fn core41_closed_or_missing_arcrc_skips_prompt() {
+    // A 0600 or missing file never prompts: with a non-TTY even an
+    // accidental prompt would fail, so Ok proves the skip.
+    let tmp = TempDir::new("chmod-skip");
+    let path = open_arcrc(&tmp, 0o600);
+    let mut input = std::io::BufReader::new(std::io::Cursor::new(Vec::new()));
+    ensure_arcrc_permissions_from(&mut input, &path, false).unwrap();
+    assert_eq!(arcrc_mode(&path), 0o600);
+    let missing = tmp.path.join("no-arcrc");
+    let mut input = std::io::BufReader::new(std::io::Cursor::new(Vec::new()));
+    ensure_arcrc_permissions_from(&mut input, &missing, false).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn core41_open_arcrc_fails_when_piped() {
+    // Non-TTY stdin echoes the prompt once, then fails like PHP's
+    // `phutil_console_require_tty` throw.
+    let tmp = TempDir::new("chmod-pipe");
+    let path = open_arcrc(&tmp, 0o644);
+    let mut input = std::io::BufReader::new(std::io::Cursor::new(Vec::new()));
+    let err = ensure_arcrc_permissions_from(&mut input, &path, false).unwrap_err();
+    assert!(err.contains("not a TTY"), "{err}");
+    assert_eq!(arcrc_mode(&path), 0o644);
+}
+#[test]
+fn r10_install_certificate_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "INSTALL-CERTIFICATE WORKFLOW\n\
+         \n\
+         install-certificate\n\
+         \x20     install-certificate [uri]\n\
+         \n\
+         \x20         Supports: http, https\n\
+         \x20         Installs Conduit credentials into your ~/.arcrc for the given\n\
+         install\n\
+         \x20         of Phabricator. You need to do this before you can use 'arc', as it\n\
+         \x20         enables 'arc' to link your command-line activity with your account\n\
+         on\n\
+         \x20         the web. Run this command from within a project directory to\n\
+         install\n\
+         \x20         that project's certificate, or specify an explicit URI (like\n\
+         \x20         \"https://phabricator.example.com/\").\n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(
+        usage().contains("INSTALL-CERTIFICATE WORKFLOW"),
+        "{}",
+        usage()
+    );
+}
+
+#[test]
+fn b21_install_certificate_needs_no_terminator() {
+    // T1153 B21/B23 VERIFIED for `install-certificate`: it is a
+    // classic workflow, so PHP runs it via the
+    // `scripts/arcanist.php` re-exec, which never requires `--`.
+    // Parsing takes no TTY input, so piped-style argv parses
+    // directly, and `--help` without `--` still succeeds.
+    assert!(
+        parse_args(&["https://host/".to_string()])
+            .unwrap()
+            .is_some()
+    );
+    assert!(parse_args(&["--help".to_string()]).unwrap().is_none());
+    let text = usage_text(false);
+    assert!(text.contains("INSTALL-CERTIFICATE WORKFLOW"), "{text}");
+}
+
+#[test]
+fn b23_install_certificate_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to
+    // `arc help install-certificate`. Extensions stay undocumented.
+    let text = usage_text(false);
+    assert!(text.starts_with("INSTALL-CERTIFICATE WORKFLOW\n"), "{text}");
+    assert!(text.contains("Installs Conduit credentials"), "{text}");
+    assert!(!text.contains("--token"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }

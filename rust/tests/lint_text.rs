@@ -218,7 +218,8 @@ fn lint_summary_renderer_writes_exact_bytes() {
         std::fs::read_to_string(&out).unwrap(),
         "tab.txt:2:Error: Tab Literal\n"
     );
-    // Clean files append the OKAY line through the same sink.
+    // T1153 LINT-7: with `--outfile`, PHP renders the OKAY line after
+    // renaming the temp file away, so the outfile never carries it.
     tmp.write("clean.txt", "ok\n");
     assert_eq!(
         code(run_in(
@@ -227,10 +228,7 @@ fn lint_summary_renderer_writes_exact_bytes() {
         )),
         Some(0)
     );
-    assert_eq!(
-        std::fs::read_to_string(&out).unwrap(),
-        "   OKAY  No lint messages.\n"
-    );
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "");
 }
 
 #[test]
@@ -315,18 +313,19 @@ fn lint_console_renderer_writes_exact_bytes() {
         )),
         Some(0)
     );
+    // T1153 LINT-24: content wraps at 78 - indent. T1153 LINT-7: the
+    // OKAY line is lost with `--outfile`, like PHP.
     assert_eq!(
         std::fs::read_to_string(&out).unwrap(),
         ">>> Lint for c.txt:\n\
          \n\
          \n\
          \x20\x20\x20Auto-Fix  (TXT6) Trailing Whitespace\n\
-         \x20\x20\x20\x20This line contains trailing whitespace. Consider setting up your editor to\n\
-         \x20\x20\x20\x20automatically remove trailing whitespace.\n\
+         \x20\x20\x20\x20This line contains trailing whitespace. Consider setting up your editor\n\
+         \x20\x20\x20\x20to automatically remove trailing whitespace.\n\
          \n\
          \x20\x20\x20\x20>>> -      1 ok  \n\
-         \x20\x20\x20\x20\x20\x20\x20\x20+        ok\n\
-         \x20\x20\x20OKAY  No lint messages.\n"
+         \x20\x20\x20\x20\x20\x20\x20\x20+        ok\n"
     );
 }
 
@@ -462,13 +461,15 @@ fn lint_everything_covers_tracked_only() {
         Some(2)
     );
     // ...and to the status selection (which is empty here).
+    // T1153 R4 (LINT-1): "No paths are lintable." is
+    // `ArcanistNoEffectException`: stdout + exit 0, not exit 1.
     assert_eq!(
         code(run_in_with(
             tmp.path(),
             &["--rev", "HEAD", "--output", "none"],
             ""
         )),
-        Some(1)
+        Some(0)
     );
 }
 
@@ -549,6 +550,8 @@ fn lint_comprehensive_and_single_engines() {
         Some(2)
     );
     // `externals/` is excluded: nothing lintable.
+    // T1153 R4 (LINT-1): "No paths are lintable." is
+    // `ArcanistNoEffectException`: stdout + exit 0, not exit 1.
     tmp.write("externals/a.php", "ok\nx\ty\n");
     assert_eq!(
         code(run_in(
@@ -561,7 +564,7 @@ fn lint_comprehensive_and_single_engines() {
                 "none"
             ]
         )),
-        Some(1)
+        Some(0)
     );
 
     // Single runs one linter class.
@@ -584,6 +587,27 @@ fn lint_comprehensive_and_single_engines() {
     );
 }
 
+// -( T1153 Wave 2: lint retrocompat )--------------------------------------
+
+#[test]
+#[cfg(unix)]
+fn lint4_unreadable_file_aggregates_to_exit_1() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = git_repo("lint4");
+    let locked = tmp.write("locked.txt", "x\n");
+    tmp.write("ok.txt", "ok\n");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&locked).is_ok() {
+        // Privileged runner (e.g. root in CI containers): permission
+        // bits do not block reads, so the failure under test cannot
+        // trigger.
+        return;
+    }
+    // T1153 LINT-4/LINT-20: any linter failure aggregates to exit 1 with
+    // nothing rendered (the `Some linters failed:` envelope shows above).
+    assert_eq!(code(run_in(tmp.path(), &["locked.txt", "ok.txt"])), Some(1));
+}
+
 #[test]
 fn write_patch_to_disk_roundtrip() {
     let tmp = git_repo("patchdisk");
@@ -600,4 +624,49 @@ fn write_patch_to_disk_roundtrip() {
     let applied = lint::write_patch_to_disk(&result).unwrap();
     assert!(applied.iter().any(|flag| *flag));
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "ok\n");
+}
+
+#[test]
+fn d22_child_collecting_returns_unresolved_dicts() {
+    // T1153 DIFF-D22: the collecting child run returns the result code
+    // plus `toDictionary()` dicts for unresolved messages.
+    let tmp = git_repo("d22-collect");
+    tmp.write("warn.txt", "ok\nx\ty\n");
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-m", "base"]);
+    let argv = args(&["warn.txt", "--output", "none"]);
+    let mut empty = BufReader::new("".as_bytes());
+    let report = lint::run_child_collecting(tmp.path(), &argv, false, &mut empty, false).unwrap();
+    assert_eq!(report.code, 2);
+    assert_eq!(report.unresolved.len(), 1);
+    assert_eq!(report.unresolved[0]["severity"], serde_json::json!("error"));
+    assert_eq!(report.unresolved[0]["path"], serde_json::json!("warn.txt"));
+    assert!(
+        report.unresolved[0]
+            .get("bypassChangedLineFiltering")
+            .is_some()
+    );
+}
+
+#[test]
+fn d22_bare_child_amend_prompts_and_resolves() {
+    // T1153 DIFF-D22: diff's bare amend intent prompts once patches
+    // reach disk (default yes), and applied messages resolve out of
+    // the unresolved dicts.
+    let tmp = git_repo("d22-amend");
+    git(tmp.path(), &["config", "user.email", "lint@test"]);
+    git(tmp.path(), &["config", "user.name", "lint"]);
+    tmp.write("fix.txt", "ok  \n");
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-m", "base"]);
+    let argv = args(&["fix.txt", "--apply-patches"]);
+    let mut input = Cursor::new("y\n".as_bytes().to_vec());
+    // Injected input models a TTY session, like `run_in_with_input`.
+    let report = lint::run_child_collecting(tmp.path(), &argv, true, &mut input, true).unwrap();
+    assert_eq!(report.code, 0);
+    assert!(report.unresolved.is_empty());
+    assert_eq!(
+        git(tmp.path(), &["show", "HEAD:fix.txt"]),
+        "ok\n".to_string()
+    );
 }

@@ -70,9 +70,21 @@ fn parses_help() {
 fn rejects_bad_args() {
     assert!(parse_args(&args(&[])).is_err());
     assert!(parse_args(&args(&["D1", "D2"])).is_err());
-    assert!(parse_args(&args(&["--bogus", "D1"])).is_err());
     assert!(parse_args(&args(&["--conduit-uri"])).is_err());
     assert!(parse_args(&args(&["--conduit-uri="])).is_err());
+    // LAND-42: `Unknown argument 'bogus'. Try 'arc help'.`
+    assert_eq!(
+        parse_args(&args(&["--bogus", "D1"])).unwrap_err(),
+        "Unknown argument 'bogus'. Try 'arc help'."
+    );
+    assert_eq!(
+        parse_args(&args(&["-x", "D1"])).unwrap_err(),
+        "Unknown argument 'x'. Try 'arc help'."
+    );
+    assert_eq!(
+        parse_args(&args(&["--bogus=1", "D1"])).unwrap_err(),
+        "Unknown argument 'bogus'. Try 'arc help'."
+    );
 }
 
 #[test]
@@ -149,7 +161,8 @@ fn builds_result_json() {
 
 #[test]
 fn close_targets_revision_id_number() {
-    assert_eq!(id_param("123"), serde_json::json!(123));
+    // LAND-32: the normalized ID travels as a string, as PHP sends it.
+    assert_eq!(id_param("123"), serde_json::json!("123"));
 }
 
 #[test]
@@ -232,6 +245,8 @@ fn repository_query_prefers_configured_callsign() {
     std::fs::create_dir_all(&dir).unwrap();
     // The project source beats user/system sources, so this holds no
     // matter what the ambient machine configures.
+    // T1153 CORE-33: the project file only counts at a working-copy root.
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
     std::fs::write(dir.join(".arcconfig"), r#"{"repository.callsign": "X"}"#).unwrap();
     assert_eq!(
         repository_query(&dir).unwrap(),
@@ -257,4 +272,126 @@ fn detects_working_copy_flavors() {
     std::fs::create_dir_all(&plain).unwrap();
     assert!(detect_working_copy(&plain).is_none());
     std::fs::remove_dir_all(&base).ok();
+}
+
+// -( T1153 Wave 2: LAND findings )--------------------------------------------
+
+#[test]
+fn land21_finalized_message_fails_outside_repo() {
+    // Outside a repository the finalized message throws like PHP's
+    // `ArcanistCapabilityNotSupportedException`; `--quiet` still skips it.
+    let rev = parse_revision(&revision(STATUS_ACCEPTED, "PHID-USER-1")).unwrap();
+    let plain = std::env::temp_dir().join(format!("arc-rs-close-plain-{}", std::process::id()));
+    std::fs::create_dir_all(&plain).unwrap();
+    let err = closing_message(&Some(rev.clone()), false, &plain).unwrap_err();
+    assert_eq!(
+        err,
+        "This repository API ('filesystem') does not support the requested capability."
+    );
+    assert_eq!(closing_message(&Some(rev), true, &plain).unwrap(), "");
+    let repo = plain.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let status = std::process::Command::new("git")
+        .current_dir(&repo)
+        .args(["init", "-q", "-b", "master"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let rev = parse_revision(&revision(STATUS_ACCEPTED, "PHID-USER-1")).unwrap();
+    let message = closing_message(&Some(rev), false, &repo).unwrap();
+    assert!(message.contains("git push"), "{message}");
+    std::fs::remove_dir_all(&plain).ok();
+}
+
+#[test]
+fn land32_close_sends_string_revision_ids() {
+    // Both `differential.query` ids and `differential.close` revisionID
+    // travel as strings, as PHP sends them.
+    assert_eq!(id_param("123"), serde_json::json!("123"));
+    assert_eq!(id_param("D123"), serde_json::json!("D123"));
+}
+
+#[test]
+fn land22_user_phid_reuses_handshake_identity() {
+    // T1153 LAND-22: `user_phid` answers from the cached handshake
+    // identity without a `user.whoami` call (no network here: the
+    // client points at an unroutable host, so a call would fail).
+    // Amend (`confirm_author`) and commit (`resolve_svn_user_phid`)
+    // share this helper, so both adopt the cache too.
+    let client = conduit::Client::new("https://conduit.test/", "api-test").unwrap();
+    client.set_authenticated_user("alice", "PHID-USER-1");
+    assert_eq!(user_phid(&client).unwrap(), "PHID-USER-1");
+}
+#[test]
+fn r10_close_revision_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "CLOSE-REVISION WORKFLOW\n\
+         \n\
+         close-revision\n\
+         \x20     close-revision [options] revision\n\
+         \n\
+         \x20         Supports: git, hg, svn\n\
+         \x20         Close a revision which has been committed (svn) or pushed (git,\n\
+         hg).\n\
+         \x20         You should not normally need to do this: arc commit (svn), arc\n\
+         amend\n\
+         \x20         (git, hg), arc land (git, hg), or repository tracking on the master\n\
+         \x20         remote repository should do it for you. However, if these\n\
+         mechanisms\n\
+         \x20         have failed for some reason you can use this command to manually\n\
+         \x20         change a revision status from \"Accepted\" to \"Closed\".\n\
+         \n\
+         \x20     --finalize\n\
+         \x20         Close only if the repository is untracked and the revision is\n\
+         \x20         accepted. Continue even if the close can't happen. This is a soft\n\
+         \x20         version of '' used by other workflows.\n\
+         \n\
+         \x20     --quiet\n\
+         \x20         Do not print a success message.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("CLOSE-REVISION WORKFLOW"), "{}", usage());
+}
+
+#[test]
+fn b21_close_revision_needs_no_terminator() {
+    // T1153 B21/B23 VERIFIED for `close-revision`: it is a classic
+    // workflow (`ArcanistWorkflow`, `supportsToolset()` false), so
+    // PHP runs it via the `scripts/arcanist.php` re-exec, which
+    // never requires `--`. Parsing takes no TTY input, so
+    // piped-style argv parses directly, and `--help` without `--`
+    // still succeeds.
+    assert!(parse_args(&args(&["D123"])).unwrap().is_some());
+    assert_eq!(parse_args(&args(&["--help"])).unwrap(), None);
+    assert!(parse_args(&args(&[])).is_err());
+    let text = usage_text(false);
+    assert!(text.contains("CLOSE-REVISION WORKFLOW"), "{text}");
+}
+
+#[test]
+fn b23_close_revision_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help close-revision`
+    // (classic: source indentation kept verbatim, no unwrap).
+    // Extensions stay undocumented.
+    let text = usage_text(false);
+    assert!(text.starts_with("CLOSE-REVISION WORKFLOW\n"), "{text}");
+    assert!(
+        text.contains("Close a revision which has been committed"),
+        "{text}"
+    );
+    assert!(text.contains("--finalize"), "{text}");
+    assert!(text.contains("--quiet"), "{text}");
+    assert!(!text.contains("--force"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }

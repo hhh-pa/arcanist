@@ -810,3 +810,129 @@ fn gap2_clean_check_fatal_conflicts() {
     assert!(err.contains("Conflicts in working copy:"), "{err}");
     assert!(err.contains("    c.txt"), "{err}");
 }
+
+/* T1153 wave 3 parser halves (EXPORT-E11..E24/E37 + E20). */
+
+#[test]
+fn e11_hunk_bits_parallel_real_diff() {
+    let fx = Fixture::named("e11-bits");
+    fx.init_repo();
+    fx.write("f.txt", "a\nb\nc\n");
+    let first = fx.commit_all("one");
+    fx.write(
+        "f.txt",
+        "a\nB2\nB3\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\nLAST\n",
+    );
+    let text = diff_local::get_full_git_diff(fx.path(), &first, None, 3).unwrap();
+    let changes = diff_local::parse_unified_diff(&text).unwrap();
+    assert_eq!(changes.len(), 1);
+    let change = &changes[0];
+    assert_eq!(change.hunk_len_explicit.len(), change.hunks.len());
+    assert!(!change.hunks.is_empty());
+    // A multi-line hunk spells `,length` on both sides.
+    assert!(
+        change
+            .hunk_len_explicit
+            .iter()
+            .any(|bits| { bits.old_explicit && bits.new_explicit })
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn e13_chmod_modes_retained_on_real_diff() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fixture::named("e13-modes");
+    fx.init_repo();
+    fx.write("f.txt", "a\n");
+    let first = fx.commit_all("one");
+    let mut perms = std::fs::metadata(fx.path().join("f.txt"))
+        .unwrap()
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(fx.path().join("f.txt"), perms).unwrap();
+    let text = diff_local::get_full_git_diff(fx.path(), &first, None, 3).unwrap();
+    assert!(text.contains("old mode"), "{text}");
+    let changes = diff_local::parse_unified_diff(&text).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].old_mode.as_deref(), Some("100644"));
+    assert_eq!(changes[0].new_mode.as_deref(), Some("100755"));
+}
+
+#[test]
+fn e15_rejects_corrupt_hunk_counts() {
+    let short = "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n\
+        @@ -1,2 +1,2 @@\n a\n+b\n";
+    let err = diff_local::parse_unified_diff(short).unwrap_err();
+    assert!(err.contains(diff_local::WRONG_HUNK_LINE_COUNT), "{err:?}");
+    let bad_marker = "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n\
+        @@ -1 +1 @@\n-a\n\\ bogus\n+b\n";
+    let err = diff_local::parse_unified_diff(bad_marker).unwrap_err();
+    assert!(
+        err.contains(diff_local::EXPECTED_NO_NEWLINE_MARKER),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn e16_quoted_unicode_rename_decodes() {
+    let fx = Fixture::named("e16-quote");
+    fx.init_repo();
+    fx.git(&["config", "core.quotePath", "true"]);
+    fx.write("uniä.txt", "x\n");
+    fx.commit_all("one");
+    fx.git(&["mv", "uniä.txt", "uniäx.txt"]);
+    let text = diff_local::get_full_git_diff(fx.path(), "HEAD", None, 3).unwrap();
+    assert!(text.contains("\\303\\244"), "{text}");
+    let changes = diff_local::parse_unified_diff(&text).unwrap();
+    assert_eq!(changes.len(), 1);
+    let change = &changes[0];
+    assert_eq!(change.change_type, diff_local::TYPE_MOVE_HERE);
+    assert_eq!(change.current_path, "uniäx.txt");
+}
+
+#[test]
+fn e20_pure_rename_synthetic_end_to_end() {
+    let fx = Fixture::named("e20-synth");
+    fx.init_repo();
+    fx.write("o.txt", "one\ntwo\n");
+    let first = fx.commit_all("one");
+    fx.git(&["mv", "o.txt", "n.txt"]);
+    let text = diff_local::get_full_git_diff(fx.path(), &first, None, 3).unwrap();
+    let changes = diff_local::parse_unified_diff(&text).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert!(changes[0].hunks.is_empty());
+    assert!(diff_local::needs_synthetic_git_hunks(&changes[0]));
+    // The move-disabled reparse reads as an add; `+` rewrites to context.
+    // (`Fixture::git` trims stdout, so the final line stays unterminated.)
+    let raw = fx.git(&["diff", "--no-renames", &first, "--", "n.txt"]);
+    let made = diff_local::synthetic_hunks_for_path(&raw, "n.txt")
+        .unwrap()
+        .unwrap();
+    assert_eq!(made.hunks.len(), 1);
+    assert_eq!(made.hunks[0].corpus, " one\n two");
+}
+
+#[test]
+fn e21_typechange_two_blocks_merge() {
+    // Symlink fixtures are not portable; use the probed git form.
+    let text = "diff --git a/link b/link\ndeleted file mode 120000\n--- a/link\n\
+        +++ /dev/null\n@@ -1 +0,0 @@\n-real\n\\ No newline at end of file\n\
+        diff --git a/link b/link\nnew file mode 100644\n--- /dev/null\n+++ b/link\n\
+        @@ -0,0 +1 @@\n+content\n";
+    let changes = diff_local::parse_unified_diff(text).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].change_type, diff_local::TYPE_CHANGE);
+    assert_eq!(changes[0].old_mode.as_deref(), Some("120000"));
+    assert_eq!(changes[0].new_mode.as_deref(), Some("100644"));
+}
+
+#[test]
+fn e24_duplicate_index_blocks_merge() {
+    let text = "Index: f.txt\n--- f.txt\t(revision 1)\n+++ f.txt\t(working copy)\n\
+        @@ -1 +1 @@\n-a\n+b\nIndex: f.txt\n--- f.txt\t(revision 2)\n\
+        +++ f.txt\t(working copy)\n@@ -1 +1 @@\n-a\n+c\n";
+    let changes = diff_local::parse_unified_diff(text).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].hunks[0].corpus, "-a\n+c\n");
+}

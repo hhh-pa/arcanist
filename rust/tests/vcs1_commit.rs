@@ -270,9 +270,12 @@ fn run_uses_current_dir() {
 
 #[test]
 fn help_succeeds_and_prints_usage() {
+    // T1153 B21/B23: `--help` renders the generated workflow help
+    // (classic: no `--` needed).
     let repo = Fixture::init_repo("help");
     let out = commit::execute(repo.path(), &args(&["--help"])).unwrap();
-    assert!(out.contains("usage: arc commit"), "unexpected: {out}");
+    // T1153 R10: `--help` renders the generated workflow help.
+    assert!(out.contains("COMMIT WORKFLOW"), "unexpected: {out}");
     assert_eq!(
         commit::run_in(repo.path(), &args(&["--help"])),
         ExitCode::SUCCESS

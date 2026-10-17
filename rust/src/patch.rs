@@ -47,14 +47,15 @@
 //!   source encodings still decode as Windows-1252 (PHP supports any
 //!   `mbstring` encoding). UTF-8 input passes through. The
 //!   repository-encoding lookup (`getRepositoryEncoding()`, UTF-8 by
-//!   default) is not ported: conduit sources always decode as UTF-8
-//!   unless `--encoding` says otherwise.
-//! - Interactive editors are not ported: commit-message editing (patch
-//!   commits, and the clean-check "create a commit" yes-path) fails with
-//!   a guidance error naming `--nocommit` instead of opening `$EDITOR`.
-//! - The clean-check amend detection (`calculateShouldAmend()`) is not
-//!   ported: the prompt always offers "create a new commit", never
-//!   "amend".
+//!   default) feeds conduit bundles (PATCH-P11): `--encoding` wins,
+//!   else the unique repository match, else UTF-8.
+//! - Patch commits and the clean-check yes-path open `$EDITOR` like
+//!   PHP (PATCH-P8/P9); without an editor hook the guidance error naming
+//!   `--nocommit` survives only in the offline resolver.
+//! - The clean-check amend detection (`calculateShouldAmend()`) is
+//!   ported except the final working-copy revision lookup (D8): messages
+//!   carrying a revision ID conservatively decline, and the
+//!   published-check is skipped without a conduit channel.
 //! - `arc patch` outside a working copy fails with the established
 //!   port message (`not inside a git, hg, or svn working copy`); the PHP
 //!   runner error was not found in the vendored sources.
@@ -90,12 +91,101 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use arc_rs::land::{self, Io, Out};
-use arc_rs::{diff_submit, git, hg, svn, terminal};
+use arc_rs::{
+    config, diff,
+    diff_local::{self, ParsedHunk},
+    diff_submit, get_config, git, hg, svn, terminal,
+};
 
 /// Subcommand name, matching `arc patch`.
 pub const NAME: &str = "patch";
 
-const USAGE: &str = "usage: arc patch [--revision ID] [--diff ID] [--arcbundle FILE] [--patch FILE] [--encoding NAME] [--update] [--nocommit] [--skip-dependencies] [--nobranch] [--force] [--preview] [--conduit-uri URI] [D12345]\n";
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
+}
+
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not the short error-dump usage. The renderer is the shared
+/// `arc_rs::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistPatchWorkflow.php:20-116`).
+const HELP_SYNOPSIS: &str = "      **patch** __D12345__\n      **patch** __--revision__ __revision_id__\n      **patch** __--diff__ __diff_id__\n      **patch** __--patch__ __file__\n      **patch** __--arcbundle__ __bundlefile__";
+const HELP_TEXT: &str = "          Supports: git, svn, hg\n          Apply the changes in a Differential revision, patchfile, or arc\n          bundle to the working copy.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[
+    (
+        "revision",
+        None,
+        Some("revision_id"),
+        "Apply changes from a Differential revision, using the most recent diff that has been attached to it. You can run 'arc patch D12345' as a shorthand.",
+    ),
+    (
+        "diff",
+        None,
+        Some("diff_id"),
+        "Apply changes from a Differential diff. Normally you want to use --revision to get the most recent changes, but you can specifically apply an out-of-date diff or a diff which was never attached to a revision by using this flag.",
+    ),
+    (
+        "arcbundle",
+        None,
+        Some("bundlefile"),
+        "Apply changes from an arc bundle generated with 'arc export'.",
+    ),
+    (
+        "patch",
+        None,
+        Some("patchfile"),
+        "Apply changes from a git patchfile or unified patchfile.",
+    ),
+    (
+        "encoding",
+        None,
+        Some("encoding"),
+        "Attempt to convert non UTF-8 patch into specified encoding.",
+    ),
+    (
+        "update",
+        None,
+        None,
+        "Update the local working copy before applying the patch.",
+    ),
+    (
+        "nocommit",
+        None,
+        None,
+        "Normally under git/hg, if the patch is successful, the changes are committed to the working copy. This flag prevents the commit.",
+    ),
+    (
+        "skip-dependencies",
+        None,
+        None,
+        "Normally, if a patch has dependencies that are not present in the working copy, arc tries to apply them as well. This flag prevents such work.",
+    ),
+    (
+        "nobranch",
+        None,
+        None,
+        "Normally, a new branch (git) or bookmark (hg) is created and then the patch is applied and committed in the new branch/bookmark. This flag cherry-picks the resultant commit onto the original branch and deletes the temporary branch.",
+    ),
+    ("force", None, None, "Do not run any sanity checks."),
+];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<arc_rs::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    arc_rs::help::usage_text(
+        NAME,
+        None,
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &specs,
+        ansi,
+    )
+}
 
 /// Error when no working copy is detected (established port message; see
 /// the module docs).
@@ -459,10 +549,16 @@ pub fn select_source(options: &Options) -> Result<Source, String> {
     if let Some(path) = options.patch.as_deref() {
         sources.push(Source::Patch(path.to_string()));
     }
-    if let Some(diff) = options.diff.as_deref() {
+    // PATCH-P13: PHP skips falsy values (`if (!$value) continue`,
+    // `:127-130`), so empty ids mean "no source", not a local error.
+    if let Some(diff) = options.diff.as_deref().filter(|diff| !diff.is_empty()) {
         sources.push(Source::Diff(normalize_numeric_id("diff", diff)?));
     }
-    if let Some(revision) = options.revision.as_deref() {
+    if let Some(revision) = options
+        .revision
+        .as_deref()
+        .filter(|revision| !revision.is_empty())
+    {
         sources.push(Source::Revision(normalize_numeric_id(
             "revision", revision,
         )?));
@@ -485,28 +581,34 @@ pub fn select_source(options: &Options) -> Result<Source, String> {
 }
 
 /// Normalize a revision monogram: strip one leading `D` (either case),
-/// like `ArcanistWorkflow::normalizeRevisionID()` (`:1586-1588`), then
-/// require digits (a fail-fast port extension; PHP would fail later at
-/// Conduit with a passthrough error).
+/// like `ArcanistWorkflow::normalizeRevisionID()`, and pass the rest to
+/// Conduit unvalidated (`ArcanistPatchWorkflow.php:132-143`).
+///
+/// PATCH-P13: the old digit check was a fail-fast port extension; PHP
+/// fails server-side with a passthrough error instead.
 pub fn normalize_revision_id(value: &str) -> Result<String, String> {
     normalize_numeric_id("revision", value)
 }
 
-/// Normalize a `--diff` ID the same way (`:256-258` normalizes both).
+/// Pass a `--diff` ID through untouched: PHP never normalizes `diff`
+/// (`:132-143` only touches `revision`/`name`).
+///
+/// PATCH-P13: `--diff D12` reaches Conduit verbatim and fails there.
 pub fn normalize_diff_id(value: &str) -> Result<String, String> {
     normalize_numeric_id("diff", value)
 }
 
-/// Strip one leading `D`/`d` and require an all-digit remainder.
+/// Strip one leading `D`/`d` for revisions; pass diffs through raw.
+/// Never fails: non-numeric ids fail server-side, like PHP.
 fn normalize_numeric_id(kind: &str, value: &str) -> Result<String, String> {
-    let stripped = value
+    if kind == "diff" {
+        return Ok(value.to_string());
+    }
+    Ok(value
         .strip_prefix('D')
         .or_else(|| value.strip_prefix('d'))
-        .unwrap_or(value);
-    if stripped.is_empty() || !stripped.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(format!("invalid {kind} '{value}': expected D12345"));
-    }
-    Ok(stripped.to_string())
+        .unwrap_or(value)
+        .to_string())
 }
 
 /// A loaded patch bundle: the patch text plus metadata.
@@ -518,6 +620,9 @@ fn normalize_numeric_id(kind: &str, value: &str) -> Result<String, String> {
 pub struct Bundle {
     /// Patch text to apply.
     pub text: String,
+    /// Selected `--encoding` (or bundle/repo encoding), converted at
+    /// the apply sinks like `convertNonUTF8Diff()` (T1153 EXPORT-E9).
+    pub encoding: Option<String>,
     /// Base commit the change applies against, if known.
     pub base_revision: Option<String>,
     /// Differential revision ID, if known.
@@ -554,22 +659,140 @@ fn is_utf8_name(encoding: &str) -> bool {
     matches!(encoding.to_lowercase().as_str(), "utf-8" | "utf8")
 }
 
-/// Decode `bytes` with `encoding` (`ArcanistBundle::setEncoding()` /
-/// `convertNonUTF8Diff()`, `src/parser/ArcanistBundle.php:72-88,493-498`).
+/// True for Windows-1252 encoding names (case-insensitive,
+/// dash-optional).
+fn is_cp1252_name(encoding: &str) -> bool {
+    matches!(
+        encoding.to_lowercase().as_str(),
+        "cp1252" | "windows-1252" | "windows1252"
+    )
+}
+
+/// True for ISO-8859-1 encoding names (case-insensitive, dash-optional).
+fn is_latin1_name(encoding: &str) -> bool {
+    matches!(
+        encoding.to_lowercase().as_str(),
+        "latin1" | "latin-1" | "iso-8859-1" | "iso8859-1" | "iso88591"
+    )
+}
+
+/// Decode input `bytes` with `--encoding` (the `tryEncoding` direction:
+/// foreign bytes into UTF-8, `ArcanistDiffParser.php:1006-1019`).
 ///
-/// UTF-8 (or no encoding) decodes lossily; anything else decodes through
-/// a Windows-1252 table (see the module docs). The table is complete
-/// and verified byte-for-byte against the Windows-1252 standard:
-/// bytes outside `0x80..0xA0` map to the identical Latin-1 scalar, the
-/// 27 defined `0x80..0xA0` bytes map per the standard, and the 5
-/// undefined bytes (`0x81,0x8D,0x8F,0x90,0x9D`) become U+FFFD (PHP
-/// delegates to `mb_convert_encoding()` with no vendored table;
-/// U+FFFD matches Rust lossy conversion and `phutil_utf8ize()`).
-pub fn decode_bytes(bytes: &[u8], encoding: Option<&str>) -> String {
+/// Valid UTF-8 passes through untouched however `--encoding` reads (PHP
+/// converts only non-UTF-8 corpora). Otherwise cp1252-family names decode
+/// through the Windows-1252 table and latin1-family names map 1:1; UTF-8
+/// names and no encoding fall back lossily; anything else throws like
+/// PHP's converter.
+///
+/// Byte-faithful pipelines (export text/bundle, patch bundles) no longer
+/// decode here: they carry [`transport_bytes`] through parse/render and
+/// convert only at the sink ([`encode_transport_text`],
+/// [`convert_transport_text`]), matching PHP's raw passthrough plus
+/// `convertNonUTF8Diff()`.
+pub fn decode_bytes(bytes: &[u8], encoding: Option<&str>) -> Result<String, String> {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return Ok(text.to_string());
+    }
     match encoding {
-        None => String::from_utf8_lossy(bytes).into_owned(),
-        Some(name) if is_utf8_name(name) => String::from_utf8_lossy(bytes).into_owned(),
-        Some(_) => bytes.iter().map(|byte| decode_cp1252(*byte)).collect(),
+        None => Ok(String::from_utf8_lossy(bytes).into_owned()),
+        Some(name) if is_utf8_name(name) => Ok(String::from_utf8_lossy(bytes).into_owned()),
+        Some(name) if is_cp1252_name(name) => {
+            Ok(bytes.iter().map(|byte| decode_cp1252(*byte)).collect())
+        }
+        Some(name) if is_latin1_name(name) => Ok(bytes.iter().map(|byte| *byte as char).collect()),
+        Some(name) => Err(format!("Unknown encoding \"{name}\".")),
+    }
+}
+
+/// Encode rendered UTF-8 `text` into `--encoding` bytes
+/// (`ArcanistBundle::convertNonUTF8Diff()`, `:493-498`: UTF-8 to target).
+/// Unmappable scalars become `?` like `mb_convert_encoding()`; unknown
+/// encodings throw.
+pub fn encode_bytes(text: &str, encoding: Option<&str>) -> Result<Vec<u8>, String> {
+    match encoding {
+        None => Ok(text.as_bytes().to_vec()),
+        Some(name) if is_utf8_name(name) => Ok(text.as_bytes().to_vec()),
+        Some(name) if is_cp1252_name(name) => Ok(text
+            .chars()
+            .map(|ch| encode_cp1252(ch).unwrap_or(b'?'))
+            .collect()),
+        Some(name) if is_latin1_name(name) => Ok(text
+            .chars()
+            .map(|ch| {
+                let n = ch as u32;
+                u8::try_from(n).unwrap_or(b'?')
+            })
+            .collect()),
+        Some(name) => Err(format!("Unknown encoding \"{name}\".")),
+    }
+}
+
+/// True for `--encoding` values PHP's `nonempty()` drops (empty string
+/// and `"0"` are falsy there): no conversion, like no encoding.
+fn is_empty_encoding(name: &str) -> bool {
+    name.is_empty() || name == "0"
+}
+
+/// Map one scalar to latin1, or `None` when unmappable.
+fn encode_latin1_byte(ch: char) -> Option<u8> {
+    u8::try_from(ch as u32).ok()
+}
+
+/// Convert one `utf8_chunks()` walk with `encode`: valid scalars map
+/// (unmappable become `?`) and each invalid sequence becomes one `?`,
+/// matching `mb_convert_encoding()` grouping (probed: `E9 80` yields
+/// one `?`, `ED A0 80` three, `F0 28 8C 28` `?(?(`).
+fn convert_mapped_bytes(bytes: &[u8], encode: fn(char) -> Option<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    for chunk in bytes.utf8_chunks() {
+        for ch in chunk.valid().chars() {
+            out.push(encode(ch).unwrap_or(b'?'));
+        }
+        if !chunk.invalid().is_empty() {
+            out.push(b'?');
+        }
+    }
+    out
+}
+
+/// Convert raw `bytes` from UTF-8 into `--encoding` bytes: the
+/// `convertNonUTF8Diff()` direction (`ArcanistBundle.php:493-498`) over
+/// byte input. `None`, empty/`"0"`, and UTF-8 names pass bytes through
+/// untouched (PHP no-ops identical conversions, even for invalid
+/// input); cp1252-family converts via the table and latin1-family 1:1,
+/// with `?` for invalid sequences and unmappable scalars like
+/// `mb_convert_encoding()`; unknown encodings throw.
+pub fn convert_bytes(bytes: &[u8], encoding: Option<&str>) -> Result<Vec<u8>, String> {
+    match encoding {
+        None => Ok(bytes.to_vec()),
+        Some(name) if is_empty_encoding(name) => Ok(bytes.to_vec()),
+        Some(name) if is_utf8_name(name) => Ok(bytes.to_vec()),
+        Some(name) if is_cp1252_name(name) => Ok(convert_mapped_bytes(bytes, encode_cp1252)),
+        Some(name) if is_latin1_name(name) => Ok(convert_mapped_bytes(bytes, encode_latin1_byte)),
+        Some(name) => Err(format!("Unknown encoding \"{name}\".")),
+    }
+}
+
+/// Sink conversion for transport text: restore the raw bytes, then
+/// [`convert_bytes`] into `--encoding` (T1153 EXPORT-E9).
+pub fn encode_transport_text(text: &str, encoding: Option<&str>) -> Result<Vec<u8>, String> {
+    convert_bytes(&untransport_bytes(text), encoding)
+}
+
+/// Convert transport `text` into `--encoding` and re-transport the
+/// result, for verbatim bundle producers (`arc patch` has no render
+/// step, so the selected encoding converts at load instead of at a
+/// render sink). `None`/empty/`"0"`/UTF-8 names keep the text as is.
+pub fn convert_transport_text(text: &str, encoding: Option<&str>) -> Result<String, String> {
+    match encoding {
+        None => Ok(text.to_string()),
+        Some(name) if is_empty_encoding(name) => Ok(text.to_string()),
+        Some(name) if is_utf8_name(name) => Ok(text.to_string()),
+        Some(_) => Ok(transport_bytes(&convert_bytes(
+            &untransport_bytes(text),
+            encoding,
+        )?)),
     }
 }
 
@@ -616,6 +839,126 @@ fn decode_cp1252(byte: u8) -> char {
         return CP1252_80_9F[(byte - 0x80) as usize].unwrap_or('\u{FFFD}');
     }
     byte as char
+}
+
+/// Transport escape marker (private-use U+E000): starts every
+/// multi-char transport sequence (T1153 EXPORT-E9 byte-faithfulness).
+const TRANSPORT_ESC: char = '\u{E000}';
+
+/// Base of the smuggled-byte range: invalid byte `b` rides the pipeline
+/// as `TRANSPORT_ESC` + `char(U+E100 + b)` (T1153 EXPORT-E9).
+const TRANSPORT_BYTE_BASE: u32 = 0xE100;
+
+/// Carry raw `bytes` through the `String`-based pipeline without loss
+/// (T1153 EXPORT-E9): valid UTF-8 passes through verbatim, each invalid
+/// byte rides as a smuggle sequence, and real U+E000 markers double so
+/// the encoding stays unambiguous. ASCII bytes (all diff structure)
+/// are never altered, so the parser observes no difference.
+///
+/// Inverse: [`untransport_bytes`]; display form: [`untransport_lossy`].
+#[must_use]
+pub fn transport_bytes(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for chunk in bytes.utf8_chunks() {
+        escape_valid_chunk(&mut out, chunk.valid());
+        for byte in chunk.invalid() {
+            push_transport_byte(&mut out, *byte);
+        }
+    }
+    out
+}
+
+/// Append one valid UTF-8 chunk, doubling real transport markers.
+fn escape_valid_chunk(out: &mut String, valid: &str) {
+    for ch in valid.chars() {
+        if ch == TRANSPORT_ESC {
+            out.push(TRANSPORT_ESC);
+        }
+        out.push(ch);
+    }
+}
+
+/// True for a smuggled-byte scalar (U+E100..U+E1FF).
+fn is_smuggled_byte(ch: char) -> bool {
+    matches!(ch as u32, 0xE100..=0xE1FF)
+}
+
+/// Push one raw byte as transport: ASCII verbatim, high bytes smuggled.
+fn push_transport_byte(out: &mut String, byte: u8) {
+    if byte < 0x80 {
+        out.push(byte as char);
+    } else {
+        out.push(TRANSPORT_ESC);
+        let scalar = TRANSPORT_BYTE_BASE + u32::from(byte);
+        out.push(char::from_u32(scalar).unwrap_or('\u{FFFD}'));
+    }
+}
+
+/// Restore the raw bytes behind transport text (inverse of
+/// [`transport_bytes`]): smuggle sequences yield their byte, doubled
+/// markers yield U+E000, and every other char yields its UTF-8 bytes.
+/// A lone marker (unreachable from pipeline output) reads literally.
+/// Escape-free input round-trips to its own UTF-8 bytes.
+#[must_use]
+pub fn untransport_bytes(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut buf = [0u8; 4];
+    while let Some(ch) = chars.next() {
+        if ch != TRANSPORT_ESC {
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            continue;
+        }
+        match chars.peek() {
+            Some(next) if *next == TRANSPORT_ESC => {
+                chars.next();
+                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+            Some(next) if is_smuggled_byte(*next) => {
+                let scalar = chars.next().unwrap_or('\u{FFFD}') as u32;
+                out.push((scalar - TRANSPORT_BYTE_BASE) as u8);
+            }
+            _ => out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes()),
+        }
+    }
+    out
+}
+
+/// Display form of transport text: raw bytes decoded lossily, like the
+/// historical `String::from_utf8_lossy` rendering. Escape-free input
+/// (including every pre-transport pipeline string) round-trips
+/// unchanged, so lossy-only consumers keep their exact behavior.
+#[must_use]
+pub fn untransport_lossy(text: &str) -> String {
+    String::from_utf8_lossy(&untransport_bytes(text)).into_owned()
+}
+
+/// Normalize a valid-UTF-8 pipeline string (conduit/JSON text, which is
+/// never smuggled): double real transport markers so downstream
+/// un-transporting stays a bijection. Marker-free input is unchanged.
+#[must_use]
+pub fn escape_transport_markers(text: &str) -> String {
+    if !text.contains(TRANSPORT_ESC) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    escape_valid_chunk(&mut out, text);
+    out
+}
+
+/// Reverse of [`decode_cp1252`]: `None` for unmappable scalars.
+fn encode_cp1252(ch: char) -> Option<u8> {
+    let n = ch as u32;
+    if n < 0x80 {
+        return u8::try_from(n).ok();
+    }
+    if (0xA0..=0xFF).contains(&n) {
+        return u8::try_from(n).ok();
+    }
+    CP1252_80_9F
+        .iter()
+        .position(|slot| *slot == Some(ch))
+        .and_then(|index| u8::try_from(0x80 + index).ok())
 }
 
 /// Read patch bytes from `path` or `-` (stdin).
@@ -677,7 +1020,9 @@ fn has_leading_ansi(text: &str) -> bool {
     false
 }
 
-/// Strip all `\x1B\[[\d;]*m` sequences.
+/// Strip all `\x1B\[[\d;]*m` sequences. Detection stays byte-oriented
+/// (ANSI codes are ASCII) but surviving text copies per char, so
+/// non-ASCII bytes and transport sequences pass through intact.
 fn strip_ansi_codes(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
@@ -693,8 +1038,9 @@ fn strip_ansi_codes(text: &str) -> String {
                 continue;
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        let ch = text[i..].chars().next().unwrap_or('\u{FFFD}');
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -721,7 +1067,9 @@ fn has_unified_date(rest: &str) -> bool {
     let bytes = rest.as_bytes();
     let mut i = 0;
     while i + 10 <= bytes.len() {
-        if is_date_prefix(&rest[i..]) {
+        // `get` skips non-boundary offsets (multibyte chars) instead of
+        // panicking; dates are ASCII, so decisions never change.
+        if rest.get(i..).is_some_and(is_date_prefix) {
             let mut ws_start = i;
             while ws_start > 0 && is_pcre_space(bytes[ws_start - 1]) {
                 ws_start -= 1;
@@ -862,7 +1210,14 @@ pub fn format_parse_error(message: &str, lines: &[String], idx: usize) -> String
             continue;
         }
         let marker = if i == idx { ">>>  " } else { "" };
-        context.push_str(&format!("{:>8} {:>6}   {}", marker, i + 1, line));
+        // Transport never leaks into the display: the lossy view matches
+        // the historical rendering, and is identical for escape-free input.
+        context.push_str(&format!(
+            "{:>8} {:>6}   {}",
+            marker,
+            i + 1,
+            untransport_lossy(line)
+        ));
     }
     format!("Diff Parse Exception: {message}\n\n{context}")
 }
@@ -958,26 +1313,39 @@ fn probe_hg_export_header(lines: &[String], idx: usize) -> bool {
 /// Load a `--patch` bundle from a file or `-`
 /// (`ArcanistPatchWorkflow.php:361-377` via `ArcanistBundle::newFromDiff()`).
 ///
-/// Empty stdin fails with [`NO_STDIN_PATCH`]; decoded text is
-/// pre-parsed like `ArcanistDiffParser::parseDiff()` (empty and
-/// malformed headers fail with byte-for-byte parse errors) and
-/// carries no metadata. Valid patches pass through verbatim.
+/// Empty stdin fails with [`NO_STDIN_PATCH`]; the raw bytes ride as
+/// transport (T1153 EXPORT-E9) and pre-parse like
+/// `ArcanistDiffParser::parseDiff()` (empty and malformed headers fail
+/// with byte-for-byte parse errors). The bundle carries no metadata.
+/// The encoding converts at the apply sinks, like
+/// `convertNonUTF8Diff()` at render; without one the patch passes
+/// through byte-verbatim.
 pub fn load_file_bundle(path: &str, encoding: Option<&str>, io: &mut Io) -> Result<Bundle, String> {
     let bytes = read_patch_bytes(path, io)?;
     if path == "-" && bytes.is_empty() {
         return Err(NO_STDIN_PATCH.to_string());
     }
-    let text = decode_bytes(&bytes, encoding);
-    validate_patch_text(&text)?;
+    let transported = transport_bytes(&bytes);
+    validate_patch_text(&transported)?;
     Ok(Bundle {
-        text,
+        text: transported,
+        encoding: encoding.map(str::to_string),
         ..Bundle::default()
     })
 }
 
+/// Patchfile bytes for a bundle (T1153 EXPORT-E9): convert the selected
+/// encoding over the transport text (like `convertNonUTF8Diff()`),
+/// then restore raw bytes. Unknown encodings throw here (at apply,
+/// after branching, like PHP).
+pub fn bundle_patch_bytes(bundle: &Bundle) -> Result<Vec<u8>, String> {
+    let converted = convert_transport_text(&bundle.text, bundle.encoding.as_deref())?;
+    Ok(untransport_bytes(&converted))
+}
+
 /// List `tar` members of `bundle` (`tar tfO`, via `tar -tf`).
 fn tar_list(bundle: &str) -> Result<Vec<String>, String> {
-    let output = std::process::Command::new("tar")
+    let output = crate::proc_env::command("tar")
         .args(["-tf", bundle])
         .output()
         .map_err(|e| format!("failed to read arcbundle '{bundle}': {e}"))?;
@@ -1003,7 +1371,7 @@ fn tar_list(bundle: &str) -> Result<Vec<String>, String> {
 /// matches either spelling.
 fn tar_extract(bundle: &str, member: &str) -> Result<Vec<u8>, String> {
     for candidate in [member.to_string(), format!("./{member}")] {
-        let output = std::process::Command::new("tar")
+        let output = crate::proc_env::command("tar")
             .args(["-xOf", bundle])
             .arg(&candidate)
             .output()
@@ -1092,8 +1460,9 @@ pub struct BundleChange {
     pub old_mode: Option<String>,
     /// `unix:filemode` after, when properties carry it.
     pub new_mode: Option<String>,
-    /// Decoded hunk corpora.
-    pub hunks: Vec<String>,
+    /// Decoded hunks: offsets plus body-only corpora (headers are
+    /// rebuilt at render, like `ArcanistBundle::buildHunkChanges()`).
+    pub hunks: Vec<ParsedHunk>,
     /// `old:binary-phid` metadata for binary/image changes.
     pub old_binary_phid: Option<String>,
     /// `new:binary-phid` metadata for binary/image changes.
@@ -1118,7 +1487,7 @@ impl BundleChange {
 }
 
 /// Parse one `changes.json` change dictionary with decoded hunk corpora.
-fn parse_bundle_change(value: &serde_json::Value, hunks: Vec<String>) -> BundleChange {
+fn parse_bundle_change(value: &serde_json::Value, hunks: Vec<ParsedHunk>) -> BundleChange {
     let mode = |key: &str| {
         value
             .get(key)
@@ -1126,23 +1495,26 @@ fn parse_bundle_change(value: &serde_json::Value, hunks: Vec<String>) -> BundleC
             .and_then(|v| v.as_str())
             .map(str::to_string)
     };
+    // Path-ish fields ride the transport pipeline downstream, so real
+    // markers escape here (T1153 EXPORT-E9); marker-free values pass
+    // through unchanged.
+    let path_field = |key: &str| {
+        value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(escape_transport_markers)
+    };
     BundleChange {
         change_type: value
             .get("type")
-            .and_then(|v| v.as_u64())
+            .and_then(diff_submit::loose_u64)
             .unwrap_or(u64::from(TYPE_CHANGE)) as u32,
         file_type: value
             .get("fileType")
-            .and_then(|v| v.as_u64())
+            .and_then(diff_submit::loose_u64)
             .unwrap_or(u64::from(FILE_TEXT)) as u32,
-        old_path: value
-            .get("oldPath")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        current_path: value
-            .get("currentPath")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
+        old_path: path_field("oldPath"),
+        current_path: path_field("currentPath"),
         old_mode: mode("oldProperties"),
         new_mode: mode("newProperties"),
         hunks,
@@ -1162,7 +1534,7 @@ fn parse_bundle_change(value: &serde_json::Value, hunks: Vec<String>) -> BundleC
             .map(|items| {
                 items
                     .iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .filter_map(|v| v.as_str().map(escape_transport_markers))
                     .collect()
             })
             .unwrap_or_default(),
@@ -1173,29 +1545,58 @@ fn parse_bundle_change(value: &serde_json::Value, hunks: Vec<String>) -> BundleC
 
 /// Quote a git target path (`encodeGitTargetPath()`): plain paths pass
 /// through; paths with quotes, backslashes, or control bytes render
-/// C-quoted.
+/// C-quoted. Quoting runs over the un-transported raw bytes (like PHP's
+/// byte strings) and re-transports high bytes, so transport paths
+/// survive quoting; ASCII behavior is unchanged.
 pub fn quote_git_target(path: &str) -> String {
-    let needs_quotes = path
-        .bytes()
-        .any(|byte| byte == b'"' || byte == b'\\' || byte < 0x20 || byte == 0x7f);
+    let raw = untransport_bytes(path);
+    let needs_quotes = raw
+        .iter()
+        .any(|byte| *byte == b'"' || *byte == b'\\' || *byte < 0x20 || *byte == 0x7f);
     if !needs_quotes {
         return path.to_string();
     }
     let mut quoted = String::from("\"");
-    for byte in path.bytes() {
-        match byte {
-            b'"' => quoted.push_str("\\\""),
-            b'\\' => quoted.push_str("\\\\"),
-            b'\n' => quoted.push_str("\\n"),
-            b'\t' => quoted.push_str("\\t"),
-            other if other < 0x20 || other == 0x7f => {
-                quoted.push_str(&format!("\\{other:03o}"));
-            }
-            other => quoted.push(other as char),
-        }
+    let mut pending: Vec<u8> = Vec::new();
+    for byte in raw {
+        push_quoted_byte(&mut quoted, &mut pending, byte);
     }
+    flush_transport_pending(&mut quoted, &mut pending);
     quoted.push('"');
     quoted
+}
+
+/// Quote one raw target byte: escapes and ASCII flush first, while
+/// consecutive high bytes buffer up so valid sequences re-decode
+/// together.
+fn push_quoted_byte(quoted: &mut String, pending: &mut Vec<u8>, byte: u8) {
+    match byte {
+        b'"' => {
+            flush_transport_pending(quoted, pending);
+            quoted.push_str("\\\"");
+        }
+        b'\\' => {
+            flush_transport_pending(quoted, pending);
+            quoted.push_str("\\\\");
+        }
+        b'\n' => {
+            flush_transport_pending(quoted, pending);
+            quoted.push_str("\\n");
+        }
+        b'\t' => {
+            flush_transport_pending(quoted, pending);
+            quoted.push_str("\\t");
+        }
+        other if other < 0x20 || other == 0x7f => {
+            flush_transport_pending(quoted, pending);
+            quoted.push_str(&format!("\\{other:03o}"));
+        }
+        other if other < 0x80 => {
+            flush_transport_pending(quoted, pending);
+            quoted.push(other as char);
+        }
+        other => pending.push(other),
+    }
 }
 
 /// Rotate `v` left by `n` bits (SHA-1 helper).
@@ -1604,6 +2005,151 @@ fn push_change_headers(change: &BundleChange, result: &mut String) {
     }
 }
 
+/// Render hunks with rebuilt `@@` headers (`buildHunkChanges()`,
+/// `:487-522`): each hunk is first broken into small hunks (3-line
+/// context), lengths of 1 omit `,len` like git, and a corpus without a
+/// trailing newline gains one.
+fn render_hunks(hunks: &[ParsedHunk]) -> String {
+    fn head(offset: u64, len: u64) -> String {
+        if len == 1 {
+            format!("{offset}")
+        } else {
+            format!("{offset},{len}")
+        }
+    }
+    let mut out = String::new();
+    for hunk in hunks {
+        for small in break_hunk_into_small_hunks(hunk) {
+            out.push_str(&format!(
+                "@@ -{} +{} @@\n",
+                head(small.old_start, small.old_len),
+                head(small.new_start, small.new_len)
+            ));
+            out.push_str(&small.corpus);
+            if !small.corpus.is_empty()
+                && !small.corpus.ends_with('\n')
+                && !small.corpus.ends_with('\r')
+            {
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// First byte of `line` (0 when empty): the change-type discriminant.
+fn first_byte_of(line: &str) -> u8 {
+    line.as_bytes().first().copied().unwrap_or(0)
+}
+
+/// Index of the first added/removed line at or after `from`, or `None`
+/// when only context remains (PHP `:533-542`).
+fn find_next_change(lines: &[&str], from: usize) -> Option<usize> {
+    let mut jj = from;
+    while jj < lines.len() {
+        let byte = first_byte_of(lines[jj]);
+        if byte == b'-' || byte == b'+' {
+            return Some(jj);
+        }
+        jj += 1;
+    }
+    None
+}
+
+/// Outcome of scanning one small hunk body (PHP `:556-600`).
+struct SmallHunkScan {
+    /// One-past-the-end line index (after split-point rewind).
+    end: usize,
+    old_lines: u64,
+    new_lines: u64,
+    adjust: u64,
+}
+
+/// Scan a small hunk body from the change at `start`: a context gap over
+/// `2 * CONTEXT` lines ends the hunk, rewinding to the split point
+/// recorded `CONTEXT` lines past the last change (PHP `:556-600`).
+fn scan_small_hunk(lines: &[&str], start: usize) -> SmallHunkScan {
+    const CONTEXT: usize = 3;
+    let n = lines.len();
+    let mut jj = start;
+    let mut old_lines: u64 = 0;
+    let mut new_lines: u64 = 0;
+    let mut hunk_adjust: u64 = 0;
+    let mut last_change = start;
+    let mut break_here: Option<usize> = None;
+    while jj < n {
+        if first_byte_of(lines[jj]) == b' ' {
+            if jj - last_change > CONTEXT && break_here.is_none() {
+                break_here = Some(jj);
+            }
+            // PHP: `>= ($context * 2 + 1)`.
+            if jj - last_change > CONTEXT * 2 {
+                break;
+            }
+        } else {
+            break_here = None;
+            last_change = jj;
+            match first_byte_of(lines[jj]) {
+                b'\\' => hunk_adjust += 1,
+                b'-' => old_lines += 1,
+                b'+' => new_lines += 1,
+                _ => {}
+            }
+        }
+        jj += 1;
+    }
+    if let Some(at) = break_here {
+        jj = at;
+    }
+    SmallHunkScan {
+        end: jj,
+        old_lines,
+        new_lines,
+        adjust: hunk_adjust,
+    }
+}
+
+/// Break one hunk into small hunks with 3 lines of context
+/// (`breakHunkIntoSmallHunks()`, `:524-622`): disjoint output (git apply
+/// rejects overlaps), no overlong trailing context (patch rejects it),
+/// and 7-line gaps split like `diff -u` (PHI838). Line indexes advance
+/// both files (`\` lines adjust lengths but still advance offsets).
+fn break_hunk_into_small_hunks(base: &ParsedHunk) -> Vec<ParsedHunk> {
+    const CONTEXT: usize = 3;
+    let lines: Vec<&str> = base.corpus.split_inclusive('\n').collect();
+    let n = lines.len();
+    let mut old_offset = base.old_start;
+    let mut new_offset = base.new_start;
+    let mut results = Vec::new();
+    let mut ii = 0;
+    while ii < n {
+        let Some(change) = find_next_change(&lines, ii) else {
+            break;
+        };
+        let hunk_start = change.saturating_sub(CONTEXT);
+        let scan = scan_small_hunk(&lines, change);
+        let jj = scan.end;
+        let hunk_length = jj.min(n) - hunk_start;
+        let count_length = hunk_length as u64 - scan.adjust;
+        let corpus: String = lines[hunk_start..hunk_start + hunk_length].concat();
+        // Adjacent hunks share context, so `hunk_start` may precede `ii`.
+        let back = ii as i64 - hunk_start as i64;
+        results.push(ParsedHunk {
+            old_start: (old_offset as i64 - back).max(0) as u64,
+            old_len: count_length - scan.new_lines,
+            new_start: (new_offset as i64 - back).max(0) as u64,
+            new_len: count_length - scan.old_lines,
+            corpus,
+            // Splitter hunks count from the corpus (T1153 EXPORT-E20).
+            synthetic_counts: None,
+        });
+        old_offset += (jj - ii) as u64 - scan.new_lines;
+        new_offset += (jj - ii) as u64 - scan.old_lines;
+        ii = jj;
+    }
+    results
+}
+
 /// Render bundle changes as a git patch with binary blobs
 /// (`ArcanistBundle::toGitPatch()` full form, `:313-485`).
 ///
@@ -1632,7 +2178,7 @@ pub fn render_git_patch_with_blobs(
                 .and_then(|cur| sources.get(cur));
             build_binary_change(change, old_source, loader)?
         } else {
-            change.hunks.concat()
+            render_hunks(&change.hunks)
         };
         if change.change_type == TYPE_COPY_AWAY
             && body.is_empty()
@@ -1689,7 +2235,7 @@ fn render_text_change(change: &BundleChange, result: &mut String) -> Result<(), 
     if change.file_type == FILE_IMAGE || change.file_type == FILE_BINARY {
         return Err("binary patches are not yet ported by arc patch".to_string());
     }
-    let body: String = change.hunks.concat();
+    let body: String = render_hunks(&change.hunks);
     if change.change_type == TYPE_COPY_AWAY
         && body.is_empty()
         && change.defaulted_old_mode() == change.defaulted_new_mode()
@@ -1753,13 +2299,13 @@ pub fn load_arcbundle(path: &str, encoding: Option<&str>) -> Result<Bundle, Stri
     let dicts: Vec<serde_json::Value> = serde_json::from_slice(&raw)
         .map_err(|e| format!("failed to read arcbundle '{path}': {e}"))?;
     let decode_as = encoding.or(meta.encoding.as_deref());
-    let mut changes = arcbundle_changes(path, &dicts, decode_as)?;
+    let mut changes = arcbundle_changes(path, &dicts)?;
     let text = render_git_patch_with_blobs(&mut changes, &|phid: &str| {
         tar_extract(path, &format!("blobs/{phid}"))
     })?;
-    let text = decode_bytes(text.as_bytes(), decode_as);
     Ok(Bundle {
         text,
+        encoding: decode_as.map(str::to_string),
         base_revision: meta.base_revision,
         revision_id: meta.revision_id,
         author_name: meta.author_name,
@@ -1788,28 +2334,20 @@ fn require_arcbundle_member(path: &str, members: &[String], member: &str) -> Res
     }
 }
 
-/// Parse one [`BundleChange`] per dict, decoding each hunk corpus.
-fn arcbundle_changes(
-    path: &str,
-    dicts: &[serde_json::Value],
-    decode_as: Option<&str>,
-) -> Result<Vec<BundleChange>, String> {
+/// Parse one [`BundleChange`] per dict, carrying each hunk corpus as
+/// transport (conversion happens after render, like
+/// `convertNonUTF8Diff()`).
+fn arcbundle_changes(path: &str, dicts: &[serde_json::Value]) -> Result<Vec<BundleChange>, String> {
     let mut changes = Vec::new();
     for dict in dicts {
-        changes.push(parse_bundle_change(
-            dict,
-            arcbundle_corpora(path, dict, decode_as)?,
-        ));
+        changes.push(parse_bundle_change(dict, arcbundle_corpora(path, dict)?));
     }
     Ok(changes)
 }
 
-/// Decode one change dict's hunk corpora from the `hunks/N` members.
-fn arcbundle_corpora(
-    path: &str,
-    dict: &serde_json::Value,
-    decode_as: Option<&str>,
-) -> Result<Vec<String>, String> {
+/// Carry one change dict's hunks: offsets from the dict plus the
+/// body-only corpus from the `hunks/N` members, as transport.
+fn arcbundle_corpora(path: &str, dict: &serde_json::Value) -> Result<Vec<ParsedHunk>, String> {
     let mut hunks = Vec::new();
     if let Some(items) = dict.get("hunks").and_then(|v| v.as_array()) {
         for hunk in items {
@@ -1817,10 +2355,68 @@ fn arcbundle_corpora(
                 format!("failed to read arcbundle '{path}': hunk corpus is not an index")
             })?;
             let bytes = tar_extract(path, &format!("hunks/{index}"))?;
-            hunks.push(decode_bytes(&bytes, decode_as));
+            let (old_start, old_len, new_start, new_len) = hunk_offsets(hunk);
+            hunks.push(ParsedHunk {
+                old_start,
+                old_len,
+                new_start,
+                new_len,
+                corpus: transport_bytes(&bytes),
+                // Bundle hunks count from the corpus (T1153 EXPORT-E20).
+                synthetic_counts: None,
+            });
         }
     }
     Ok(hunks)
+}
+
+/// Parse inline `hunks[]` from one `differential.querydiffs` change dict
+/// (`ArcanistDiffHunk::newFromDictionary()`): offsets coerce loosely and
+/// corpora arrive body-only.
+pub fn conduit_hunks_from_dict(dict: &serde_json::Value) -> Vec<ParsedHunk> {
+    dict.get("hunks")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .map(|hunk| {
+                    let (old_start, old_len, new_start, new_len) = hunk_offsets(hunk);
+                    ParsedHunk {
+                        old_start,
+                        old_len,
+                        new_start,
+                        new_len,
+                        corpus: hunk
+                            .get("corpus")
+                            .and_then(|v| v.as_str())
+                            .map(escape_transport_markers)
+                            .unwrap_or_default(),
+                        // Conduit hunks count from the corpus (T1153 EXPORT-E20).
+                        synthetic_counts: None,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Loose hunk offsets from a change dict (`oldOffset`, `oldLength`,
+/// `newOffset`, `newLength`), defaulting to 0.
+fn hunk_offsets(dict: &serde_json::Value) -> (u64, u64, u64, u64) {
+    (
+        dict.get("oldOffset")
+            .and_then(diff_submit::loose_u64)
+            .unwrap_or(0),
+        dict.get("oldLength")
+            .and_then(diff_submit::loose_u64)
+            .unwrap_or(0),
+        dict.get("newOffset")
+            .and_then(diff_submit::loose_u64)
+            .unwrap_or(0),
+        dict.get("newLength")
+            .and_then(diff_submit::loose_u64)
+            .unwrap_or(0),
+    )
 }
 
 /// One `differential.querydiffs` row.
@@ -1848,10 +2444,13 @@ pub fn parse_diff_rows(result: &serde_json::Value) -> Vec<DiffRow> {
         _ => Vec::new(),
     };
     for value in values {
-        let id = value.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+        let id = value
+            .get("id")
+            .and_then(diff_submit::loose_u64)
+            .unwrap_or(0);
         rows.push(DiffRow {
             id,
-            revision_id: value.get("revisionID").and_then(|v| v.as_u64()),
+            revision_id: value.get("revisionID").and_then(diff_submit::loose_u64),
             base_revision: value
                 .get("sourceControlBaseRevision")
                 .and_then(|v| v.as_str())
@@ -1869,12 +2468,11 @@ pub fn parse_diff_rows(result: &serde_json::Value) -> Vec<DiffRow> {
                 .to_string(),
         });
     }
-    rows.sort_by_key(|row| row.id);
+    // PATCH-P3: PHP takes `head()` of the server-ordered rows
+    // (`ArcanistWorkflow.php:1384`); no id sort — row order is the
+    // server's `querydiffs` order.
     rows
 }
-
-/// Conduit method returning the raw diff text.
-const METHOD_GET_RAW_DIFF: &str = "differential.getrawdiff";
 
 /// Extract raw-diff text: a bare string, or `.rawDiff`/`.diff` (the
 /// established lenient shapes).
@@ -1904,20 +2502,28 @@ pub fn fetch_conduit_bundle(
 ) -> Result<Bundle, String> {
     let result = call(diff_submit::METHOD_QUERY_DIFFS, params)?;
     let rows = parse_diff_rows(&result);
-    let Some(diff) = rows.into_iter().next_back() else {
+    // PATCH-P3: `head()` — the first row in server order, not max id.
+    let Some(diff) = rows.into_iter().next() else {
         return Err(NO_DIFF_OR_REVISION.to_string());
     };
-    let text = call(
-        METHOD_GET_RAW_DIFF,
-        &serde_json::json!({"diffID": diff.id.to_string()}),
-    )
-    .map_err(|e| e.to_string())
-    .and_then(|result| {
-        raw_diff_text(&result)
-            .ok_or_else(|| "differential.getrawdiff returned an unexpected response".to_string())
-    })?;
+    let row = result
+        .get(diff.id.to_string())
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let mut changes: Vec<BundleChange> = row
+        .get("changes")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .map(|dict| parse_bundle_change(dict, conduit_hunks_from_dict(dict)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let text = render_git_patch_with_blobs(&mut changes, &|phid| fetch_file_blob(call, phid))?;
     Ok(Bundle {
         text,
+        encoding: None,
         base_revision: Some(diff.base_revision).filter(|base| !base.is_empty()),
         revision_id: revision_id.or(diff.revision_id),
         author_name: Some(diff.author_name).filter(|name| !name.is_empty()),
@@ -1943,6 +2549,30 @@ pub fn fetch_revision_bundle(
 pub fn fetch_diff_bundle(
     call: &diff_submit::ConduitCall<'_>,
     diff_id: u64,
+) -> Result<Bundle, String> {
+    fetch_conduit_bundle(call, &serde_json::json!({"ids": [diff_id]}), None)
+}
+
+/// Load the bundle for a raw `--revision` / positional id: the id goes
+/// to `querydiffs` verbatim as a string (PHP passes argv strings
+/// unvalidated; PATCH-P13). Non-numeric ids fail server-side; the bundle
+/// revision id falls back to the row's.
+pub fn fetch_revision_bundle_raw(
+    call: &diff_submit::ConduitCall<'_>,
+    revision_id: &str,
+) -> Result<Bundle, String> {
+    fetch_conduit_bundle(
+        call,
+        &serde_json::json!({"revisionIDs": [revision_id]}),
+        revision_id.parse::<u64>().ok(),
+    )
+}
+
+/// Load the bundle for a raw `--diff` id, verbatim like PHP
+/// (PATCH-P13).
+pub fn fetch_diff_bundle_raw(
+    call: &diff_submit::ConduitCall<'_>,
+    diff_id: &str,
 ) -> Result<Bundle, String> {
     fetch_conduit_bundle(call, &serde_json::json!({"ids": [diff_id]}), None)
 }
@@ -2346,10 +2976,10 @@ pub enum StashState {
 /// `--force` skips the whole check (`ArcanistPatchWorkflow.php:312-314`).
 /// Incomplete directories, conflicts, and missing files fail with the
 /// verbatim errors; dirty externals and untracked files prompt (declining
-/// aborts); uncommitted/unstaged changes prompt to create a commit —
-/// answering yes fails with port guidance (no interactive editor), and
-/// answering no autostashes under git with `arc.autostash`, else fails
-/// with the verbatim error. Returns whether a stash must be popped.
+/// aborts); uncommitted/unstaged changes prompt to commit — answering
+/// yes commits via the editor (PATCH-P9), and answering no autostashes
+/// under git with `arc.autostash`, else fails with the verbatim error.
+/// Returns whether a stash must be popped.
 pub fn require_clean_tree(
     dir: &Path,
     vcs: Vcs,
@@ -2368,6 +2998,22 @@ pub fn require_clean_tree_ansi(
     io: &mut Io,
     force: bool,
     ansi: bool,
+) -> Result<StashState, String> {
+    require_clean_tree_with_call(dir, vcs, backends, io, force, ansi, None)
+}
+
+/// [`require_clean_tree_ansi`] with a conduit channel for amend
+/// detection: the published-check runs when `call` is present
+/// (PATCH-P9).
+#[allow(clippy::too_many_arguments)]
+pub fn require_clean_tree_with_call(
+    dir: &Path,
+    vcs: Vcs,
+    backends: &Backends,
+    io: &mut Io,
+    force: bool,
+    ansi: bool,
+    call: Option<&diff_submit::ConduitCall<'_>>,
 ) -> Result<StashState, String> {
     if force {
         return Ok(StashState::Clean);
@@ -2389,7 +3035,9 @@ pub fn require_clean_tree_ansi(
     if status.unstaged.is_empty() && status.uncommitted.is_empty() {
         return Ok(StashState::Clean);
     }
-    resolve_uncommitted_tree(dir, vcs, io, &status, &desc)
+    resolve_uncommitted_tree(dir, vcs, backends, io, &status, &desc, call, &|template| {
+        diff::edit_interactively(template, EDITOR_COMMIT_MESSAGE, None, None, 0)
+    })
 }
 
 /// Fail on incomplete directories, conflicts, and missing files with the
@@ -2486,15 +3134,399 @@ fn prune_tree_overlaps(status: &mut TreeStatus) {
 }
 
 /// Print the uncommitted/unstaged lists and resolve them: offering a new
-/// commit (yes fails without an interactive editor), autostashing under
-/// git with `arc.autostash`, else failing with the verbatim error.
+/// Editor name for clean-check commit messages (`:1239`).
+pub const EDITOR_COMMIT_MESSAGE: &str = "commit-message";
+/// Error when the commit template leaves the editor unchanged (`:1243`).
+pub const MUST_PROVIDE_MESSAGE: &str = "You must provide a commit message.";
+/// Error when the stripped commit message is empty (`:1251`).
+pub const MUST_PROVIDE_NONEMPTY_MESSAGE: &str = "You must provide a nonempty commit message.";
+
+/// Ask-for-add prompt: amend vs create wording (`getAskForAddPrompt()`,
+/// `ArcanistWorkflow.php:1348-1359`).
+#[must_use]
+pub fn ask_for_add_prompt(amend: bool, count: usize) -> String {
+    if amend {
+        format!("Do you want to amend these {count} change(s) to the current commit?")
+    } else {
+        format!("Do you want to create a new commit with these {count} change(s)?")
+    }
+}
+
+/// Editor template for a clean-check commit: the comment header plus the
+/// unique sorted paths (`:1222-1237`).
+#[must_use]
+pub fn commit_offer_template(unstaged: &[String], uncommitted: &[String]) -> String {
+    let mut paths: Vec<&str> = unstaged
+        .iter()
+        .chain(uncommitted.iter())
+        .map(String::as_str)
+        .collect();
+    paths.sort_unstable();
+    paths.dedup();
+    let mut template = "\n\n# Enter a commit message.\n#\n# Changes:\n#\n".to_string();
+    for path in paths {
+        template.push_str("#     ");
+        template.push_str(path);
+        template.push('\n');
+    }
+    template
+}
+
+/// HEAD/tip identity for amend detection.
+struct HeadInfo {
+    /// Commit hash.
+    hash: String,
+    /// Commit author name (parsed like `getAuthor()`).
+    author: String,
+    /// Full commit message.
+    message: String,
+}
+
+/// `HEAD` identity, or `None` with no commits.
+fn git_head_info(dir: &Path) -> Result<Option<HeadInfo>, String> {
+    if !git::ok(dir, &["rev-parse", "--verify", "HEAD"]) {
+        return Ok(None);
+    }
+    let out = git::stdout_text(dir, &["log", "-1", "--format=%H\x01%an\x01%B", "--"])?;
+    let mut parts = out.splitn(3, '\x01');
+    let (Some(hash), Some(author), Some(message)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return Err("malformed git log output".to_string());
+    };
+    Ok(Some(HeadInfo {
+        hash: hash.to_string(),
+        author: author.to_string(),
+        message: message.to_string(),
+    }))
+}
+
+/// Working-parent identity, or `None` with no commits.
+fn hg_tip_info(dir: &Path, hg_cmd: &hg::HgCommand) -> Result<Option<HeadInfo>, String> {
+    let out = hg::output_with(
+        dir,
+        hg_cmd,
+        &[
+            "log",
+            "-r",
+            ".",
+            "--template",
+            "{node}\x01{author}\x01{desc}",
+        ],
+    )?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut parts = text.splitn(3, '\x01');
+    let (Some(node), Some(full_author), Some(desc)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return Ok(None);
+    };
+    if node.is_empty() {
+        return Ok(None);
+    }
+    let (author, _) = hg::parse_full_author(full_author);
+    Ok(Some(HeadInfo {
+        hash: node.to_string(),
+        author: author.unwrap_or_default(),
+        message: desc.to_string(),
+    }))
+}
+
+/// `isHistoryImmutable()` for the clean check (`ArcanistWorkflow.php:1592-1600`).
+fn patch_history_immutable(dir: &Path, vcs: Vcs) -> bool {
+    let default = !matches!(vcs, Vcs::Git);
+    let user_file = config::arcrc_path();
+    let merged = get_config::load_merged(
+        dir,
+        user_file.as_deref(),
+        &get_config::LoadOptions::default(),
+    );
+    let Ok(merged) = merged else {
+        return default;
+    };
+    get_config::merged_value("history.immutable", &merged)
+        .and_then(|(_, value)| value.as_bool())
+        .unwrap_or(default)
+}
+
+/// The `repository.query` constraint for the amend published-check,
+/// mirroring `getRepositoryQuery()`: configured callsign, then the VCS
+/// UUID (svn), then the remote URI.
+fn amend_repository_query(
+    dir: &Path,
+    vcs: Vcs,
+    backends: &Backends,
+) -> Result<Option<serde_json::Value>, String> {
+    let user_file = config::arcrc_path();
+    let sources = get_config::load_sources(dir, user_file.as_deref())?;
+    if let Some((_, value)) = get_config::current_value("repository.callsign", &sources)
+        && let Some(callsign) = value.as_str().map(str::trim)
+        && !callsign.is_empty()
+    {
+        return Ok(Some(serde_json::json!({"callsigns": [callsign]})));
+    }
+    let (uuid, remote) = match vcs {
+        Vcs::Git => (None, git::remote_uri(dir)?),
+        Vcs::Hg => (None, hg::get_remote_uri_with(dir, &backends.hg)?),
+        Vcs::Svn => (
+            svn::get_repository_uuid_with(dir, &backends.svn)?,
+            svn::get_remote_uri_with(dir, &backends.svn)?,
+        ),
+    };
+    if let Some(uuid) = uuid {
+        return Ok(Some(serde_json::json!({"uuids": [uuid]})));
+    }
+    Ok(remote.map(|remote| serde_json::json!({"remoteURIs": [remote]})))
+}
+
+/// Project repository encoding for bundle conversion
+/// (`getRepositoryEncoding()`, `ArcanistWorkflow.php:1780-1784`, via
+/// `loadRepositoryInformation()`): the unique `repository.query` match's
+/// `encoding`, defaulting to UTF-8. Unidentified repositories and
+/// `ERR-CONDUIT-CALL` (unknown method) also yield UTF-8; other conduit
+/// failures yield None (PHP catches them at `:408-410`).
+///
+/// PATCH-P11: applied to conduit bundles (render is a no-op for UTF-8;
+/// `decode_bytes` also passes valid UTF-8 through for legacy names,
+/// where PHP's converter would mangle already-UTF-8 conduit content).
+fn patch_repository_encoding(
+    dir: &Path,
+    vcs: Vcs,
+    backends: &Backends,
+    call: &diff_submit::ConduitCall<'_>,
+) -> Result<Option<String>, String> {
+    let query = match amend_repository_query(dir, vcs, backends)? {
+        Some(query) => query,
+        None => return Ok(Some("UTF-8".to_string())),
+    };
+    let results = match call("repository.query", &query) {
+        Ok(results) => results,
+        Err(error) if is_conduit_call_error(&error) => {
+            return Ok(Some("UTF-8".to_string()));
+        }
+        Err(_) => return Ok(None),
+    };
+    let matches = results.as_array().cloned().unwrap_or_default();
+    if matches.len() != 1 {
+        return Ok(Some("UTF-8".to_string()));
+    }
+    Ok(Some(
+        matches[0]
+            .get("encoding")
+            .and_then(|v| v.as_str())
+            .filter(|encoding| !encoding.is_empty())
+            .unwrap_or("UTF-8")
+            .to_string(),
+    ))
+}
+
+/// True for `ERR-CONDUIT-CALL` failures (unknown conduit method).
+#[must_use]
+pub fn is_conduit_call_error(error: &str) -> bool {
+    error == "ERR-CONDUIT-CALL" || error.starts_with("ERR-CONDUIT-CALL:")
+}
+
+/// True when `hash` is already known upstream (`calculateShouldAmend()`'s
+/// `diffusion.querycommits` probe, `:1294-1311`): an unidentified
+/// repository skips the check, like PHP's `if ($repository)` guard.
+fn patch_commit_published(
+    call: &diff_submit::ConduitCall<'_>,
+    query: &serde_json::Value,
+    hash: &str,
+) -> Result<bool, String> {
+    let results = call("repository.query", query)?;
+    let matches = results.as_array().cloned().unwrap_or_default();
+    if matches.len() != 1 {
+        return Ok(false);
+    }
+    let row = &matches[0];
+    let name = match row.get("callsign").and_then(|v| v.as_str()) {
+        Some(callsign) if !callsign.is_empty() => format!("r{callsign}{hash}"),
+        _ => {
+            let id = row.get("id").and_then(diff_submit::loose_u64).unwrap_or(0);
+            format!("R{id}:{hash}")
+        }
+    };
+    let result = call(
+        "diffusion.querycommits",
+        &serde_json::json!({"names": [name.clone()]}),
+    )?;
+    Ok(result
+        .get("identifierMap")
+        .and_then(|map| map.get(&name))
+        .is_some_and(|hit| !hit.is_null()))
+}
+
+/// Amend decision plus the HEAD message for the amend itself.
+///
+/// PATCH-P9: ports `calculateShouldAmend()` (`:1261-1327`) except the
+/// final working-copy revision lookup (D8's unported
+/// `loadWorkingCopyDifferentialRevisions()`): a message carrying a
+/// revision ID conservatively declines. Without a conduit channel the
+/// published-check is skipped (an unidentified repository skips it in
+/// PHP too); PHP without conduit fatals outright, so no reference
+/// behavior exists there.
+fn calculate_patch_should_amend(
+    dir: &Path,
+    vcs: Vcs,
+    backends: &Backends,
+    call: Option<&diff_submit::ConduitCall<'_>>,
+) -> Result<(bool, Option<String>), String> {
+    let supports_amend = patch_vcs_supports_amend(dir, vcs, backends);
+    if patch_history_immutable(dir, vcs) || !supports_amend {
+        return Ok((false, None));
+    }
+    let Some(head) = patch_head_info_for(dir, vcs, backends)? else {
+        return Ok((false, None));
+    };
+    let parsed = diff_local::CommitMessage::new_from_raw_corpus(&head.message)?;
+    if parsed.git_svn_base_revision.is_some() {
+        return Ok((false, None));
+    }
+    if !patch_head_author_matches(dir, vcs, backends, &head)? {
+        return Ok((false, None));
+    }
+    if patch_head_published(call, dir, vcs, backends, &head.hash)? {
+        return Ok((false, None));
+    }
+    if parsed.revision_id.is_some() {
+        // Residual: PHP consults the working-copy open revisions (D8);
+        // without that loader, decline.
+        return Ok((false, None));
+    }
+    Ok((true, Some(head.message)))
+}
+
+/// Whether `vcs` can amend: git always, hg when its commit help offers
+/// `--amend`, never svn.
+fn patch_vcs_supports_amend(dir: &Path, vcs: Vcs, backends: &Backends) -> bool {
+    match vcs {
+        Vcs::Git => true,
+        Vcs::Hg => diff::hg_supports_amend_with(dir, &backends.hg),
+        Vcs::Svn => false,
+    }
+}
+
+/// HEAD identity for the amend decision: git `HEAD`, the hg working
+/// parent, none on svn.
+fn patch_head_info_for(
+    dir: &Path,
+    vcs: Vcs,
+    backends: &Backends,
+) -> Result<Option<HeadInfo>, String> {
+    match vcs {
+        Vcs::Git => git_head_info(dir),
+        Vcs::Hg => hg_tip_info(dir, &backends.hg),
+        Vcs::Svn => Ok(None),
+    }
+}
+
+/// Whether the working-copy author matches the HEAD commit author.
+fn patch_head_author_matches(
+    dir: &Path,
+    vcs: Vcs,
+    backends: &Backends,
+    head: &HeadInfo,
+) -> Result<bool, String> {
+    match vcs {
+        Vcs::Git => git::author(dir).map(|author| author == head.author),
+        Vcs::Hg => hg::get_author_with(dir, &backends.hg)
+            .map(|author| author.as_deref() == Some(head.author.as_str())),
+        Vcs::Svn => Ok(false),
+    }
+}
+
+/// Whether the HEAD commit is already known upstream. Without a conduit
+/// channel or an identified repository the check is skipped.
+fn patch_head_published(
+    call: Option<&diff_submit::ConduitCall<'_>>,
+    dir: &Path,
+    vcs: Vcs,
+    backends: &Backends,
+    hash: &str,
+) -> Result<bool, String> {
+    let Some(call) = call else {
+        return Ok(false);
+    };
+    let Some(query) = amend_repository_query(dir, vcs, backends)? else {
+        return Ok(false);
+    };
+    patch_commit_published(call, &query, hash)
+}
+
+/// Stage `unstaged` for commit on any VCS (`addToCommit()`).
+fn patch_add_to_commit(
+    dir: &Path,
+    vcs: Vcs,
+    backends: &Backends,
+    unstaged: &[String],
+) -> Result<(), String> {
+    if unstaged.is_empty() {
+        return Ok(());
+    }
+    let refs: Vec<&str> = unstaged.iter().map(String::as_str).collect();
+    match vcs {
+        Vcs::Git => git::add_to_commit(dir, &refs),
+        Vcs::Hg => hg::add_to_commit_with(dir, &backends.hg, &refs),
+        Vcs::Svn => svn::add_to_commit_with(dir, &backends.svn, &refs),
+    }
+}
+
+/// Commit the staged yes-path changes: amend the HEAD message, or edit a
+/// new message and commit it (`:1218-1254`).
+fn commit_yes_path_changes(
+    dir: &Path,
+    vcs: Vcs,
+    backends: &Backends,
+    amend: bool,
+    head_message: Option<&str>,
+    template: &str,
+    edit: EditHook<'_>,
+) -> Result<(), String> {
+    if amend {
+        let message = head_message.unwrap_or("");
+        return match vcs {
+            Vcs::Git => git::amend_commit(dir, Some(message)),
+            Vcs::Hg => hg::amend_commit_with(dir, &backends.hg, Some(message), None),
+            Vcs::Svn => Ok(()),
+        };
+    }
+    let edited = edit(template)?;
+    if edited == template {
+        return Err(MUST_PROVIDE_MESSAGE.to_string());
+    }
+    let stripped = diff_local::remove_comments(&edited);
+    if stripped.is_empty() {
+        return Err(MUST_PROVIDE_NONEMPTY_MESSAGE.to_string());
+    }
+    match vcs {
+        Vcs::Git => git::do_commit(dir, &stripped),
+        Vcs::Hg => hg::do_commit_with(dir, &backends.hg, &stripped),
+        // Subversion supports no local commits: staged, but uncommitted.
+        Vcs::Svn => Ok(()),
+    }
+}
+
+/// Offer to commit uncommitted/unstaged changes, then autostash or fail
+/// (`askForAdd()` + the commit block, `:1159-1258`).
+///
+/// PATCH-P9: "yes" commits via the editor (amending when
+/// [`calculate_patch_should_amend`] says so) instead of failing; the
+/// prompt varies between amend and create wording.
+#[allow(clippy::too_many_arguments)]
 fn resolve_uncommitted_tree(
     dir: &Path,
     vcs: Vcs,
+    backends: &Backends,
     io: &mut Io,
     status: &TreeStatus,
     desc: &str,
+    call: Option<&diff_submit::ConduitCall<'_>>,
+    edit: EditHook<'_>,
 ) -> Result<StashState, String> {
+    // Warmed before the echo, like PHP (`:1163-1165`).
+    let (amend, head_message) = calculate_patch_should_amend(dir, vcs, backends, call)?;
     io.push_out(&format!(
         "You have uncommitted changes in this working copy.\n\n{desc}"
     ));
@@ -2513,26 +3545,32 @@ fn resolve_uncommitted_tree(
     }
     io.push_out(&format!("{}\n", lists.join("\n\n")));
     let count = status.unstaged.len() + status.uncommitted.len();
-    // Amend detection is not ported (see the module docs): always offer a
-    // new commit (`getAskForAddPrompt()`, `:1348-1359`).
-    let query = format!("Do you want to create a new commit with these {count} change(s)?");
-    if land::console_confirm(io, &query, true)? {
+    if !land::console_confirm(io, &ask_for_add_prompt(amend, count), true)? {
+        if autostash_permitted(dir) && vcs == Vcs::Git {
+            io.push_out(
+                "Stashing uncommitted changes. (You can restore them with `git stash pop`).\n",
+            );
+            git::stdout_text(dir, &["stash"])?;
+            return Ok(StashState::Stashed);
+        }
         return Err(
-            "Can not commit changes without an interactive editor. Commit, stash, or discard \
-             them manually, then run \"arc patch\" again."
+            "You can not continue with uncommitted changes. Commit or discard them before \
+             proceeding."
                 .to_string(),
         );
     }
-    if autostash_permitted(dir) && vcs == Vcs::Git {
-        io.push_out("Stashing uncommitted changes. (You can restore them with `git stash pop`).\n");
-        git::stdout_text(dir, &["stash"])?;
-        return Ok(StashState::Stashed);
-    }
-    Err(
-        "You can not continue with uncommitted changes. Commit or discard them before \
-         proceeding."
-            .to_string(),
-    )
+    patch_add_to_commit(dir, vcs, backends, &status.unstaged)?;
+    let template = commit_offer_template(&status.unstaged, &status.uncommitted);
+    commit_yes_path_changes(
+        dir,
+        vcs,
+        backends,
+        amend,
+        head_message.as_deref(),
+        &template,
+        edit,
+    )?;
+    Ok(StashState::Clean)
 }
 
 /// Pop an autostash taken by [`require_clean_tree`]
@@ -2618,7 +3656,7 @@ pub struct DependencyNode {
 /// Parse a legacy `differential.query` row into a dependency node.
 pub fn parse_dependency_node(row: &serde_json::Value) -> Option<DependencyNode> {
     let phid = row.get("phid")?.as_str()?.to_string();
-    let id = row.get("id")?.as_u64()?;
+    let id = row.get("id").and_then(diff_submit::loose_u64)?;
     let depends_on = row
         .get("auxiliary")
         .and_then(|aux| aux.get("phabricator:depends-on"))
@@ -2640,9 +3678,11 @@ pub fn parse_dependency_node(row: &serde_json::Value) -> Option<DependencyNode> 
 /// (`buildDependencyGraph()`, `:1115-1144`, plus
 /// `ArcanistDifferentialDependencyGraph::loadEdges()`, `:33-56`).
 ///
-/// Expands `phabricator:depends-on` edges breadth-first via
-/// `differential.query`, pruning revisions whose commit hash is already
-/// local (`has_local_commit`). Returns nodes in discovery order.
+/// Expands `phabricator:depends-on` edges breadth-first, one batched
+/// `differential.query` per frontier level like `loadEdges()` (PATCH-P4).
+/// Revisions whose commit hash is already local are kept with empty
+/// edges — still applied, just not expanded — like PHP (PATCH-P5).
+/// Returns nodes in discovery order.
 pub fn load_dependency_nodes(
     call: &diff_submit::ConduitCall<'_>,
     start_id: u64,
@@ -2662,33 +3702,40 @@ pub fn load_dependency_nodes(
     let mut nodes: Vec<DependencyNode> = vec![start];
     let mut seen = vec![start_phid.clone()];
     let mut queue: VecDeque<String> = nodes[0].depends_on.iter().cloned().collect();
-    while let Some(phid) = queue.pop_front() {
-        if seen.contains(&phid) {
+    while !queue.is_empty() {
+        // One batched query per frontier level (PATCH-P4).
+        let mut level: Vec<String> = queue.drain(..).collect();
+        level.retain(|phid| !seen.contains(phid));
+        if level.is_empty() {
             continue;
         }
-        seen.push(phid.clone());
+        seen.extend(level.iter().cloned());
         let result = call(
             diff_submit::METHOD_QUERY,
-            &serde_json::json!({"phids": [phid]}),
+            &serde_json::json!({"phids": level}),
         )?;
         let rows = result.as_array().cloned().unwrap_or_default();
-        let Some(node) = rows.first().and_then(parse_dependency_node) else {
-            continue;
-        };
-        let hash = rows
-            .first()
-            .and_then(|row| row.get("hashes"))
-            .and_then(|hashes| hashes.get(hash_key))
-            .and_then(|hash| hash.as_str());
-        if has_local_commit(hash) {
-            continue;
-        }
-        for dep in &node.depends_on {
-            if !seen.contains(dep) {
-                queue.push_back(dep.clone());
+        for row in &rows {
+            let Some(mut node) = parse_dependency_node(row) else {
+                continue;
+            };
+            let hash = row
+                .get("hashes")
+                .and_then(|hashes| hashes.get(hash_key))
+                .and_then(|hash| hash.as_str());
+            if has_local_commit(hash) {
+                // PATCH-P5: kept with empty edges (still applied).
+                node.depends_on.clear();
+                nodes.push(node);
+                continue;
             }
+            for dep in &node.depends_on {
+                if !seen.contains(dep) {
+                    queue.push_back(dep.clone());
+                }
+            }
+            nodes.push(node);
         }
-        nodes.push(node);
     }
     Ok((nodes, start_phid))
 }
@@ -2756,13 +3803,13 @@ pub fn revision_suffix_for_hash(
     let mut rows = result.as_array().cloned().unwrap_or_default();
     rows.sort_by_key(|row| {
         row.get("dateModified")
-            .and_then(|v| v.as_i64())
+            .and_then(diff_submit::loose_i64)
             .unwrap_or(0)
     });
     let mut found = None;
     for row in &rows {
-        if row.get("status").and_then(|v| v.as_i64()) == Some(STATUS_CLOSED)
-            && let Some(id) = row.get("id").and_then(|v| v.as_u64())
+        if row.get("status").and_then(diff_submit::loose_i64) == Some(STATUS_CLOSED)
+            && let Some(id) = row.get("id").and_then(diff_submit::loose_u64)
         {
             found = Some(format!(" \\ D{id}"));
         }
@@ -2849,9 +3896,25 @@ fn suffixed_revision(
     text
 }
 
-/// Exact `$EDITOR` template for patch commit messages
-/// (`ArcanistPatchWorkflow.php:954-965`).
-pub const COMMIT_TEMPLATE: &str = "\n\n# Enter a commit message.\n#\n# This message will be associated with a Differential revision.\n#\n# Differential Revision: <URL or ID of the Differential Revision>\n#\n";
+/// Exact `$EDITOR` template for patch commit messages, without a
+/// failed-fetch note (`ArcanistPatchWorkflow.php:900-909`).
+///
+/// PATCH-P12: the old text and citation (`:954-965`) were invented; PHP
+/// renders `sprintf("\n\n# %s%s\n", $help, $prompt_message)`.
+pub const COMMIT_TEMPLATE: &str = "\n\n# Enter a commit message for this patch. If you just want to apply the patch to the working copy without committing, re-run arc patch with the --nocommit flag.\n";
+
+/// Render the patch commit-message template, appending the failed-fetch
+/// note for `revision_id` when Differential had no message
+/// (`ArcanistPatchWorkflow.php:888-909`).
+#[must_use]
+pub fn patch_commit_template(failed_revision_id: Option<&str>) -> String {
+    match failed_revision_id {
+        None => COMMIT_TEMPLATE.to_string(),
+        Some(id) => format!(
+            "\n\n# Enter a commit message for this patch. If you just want to apply the patch to the working copy without committing, re-run arc patch with the --nocommit flag.  Note arcanist failed to load the commit message from differential for revision D{id}.\n"
+        ),
+    }
+}
 
 /// Load a patch commit message via `differential.getcommitmessage`
 /// with `{revision_id}` (`getCommitMessage()`, `:924-940`).
@@ -2878,11 +3941,17 @@ pub struct TempPatchFile {
 impl TempPatchFile {
     /// Write `text` to a unique temp file.
     pub fn write(text: &str) -> Result<Self, String> {
+        Self::write_bytes(text.as_bytes())
+    }
+
+    /// Write raw `bytes` to a unique temp file (T1153 EXPORT-E9: the
+    /// byte sink behind transport bundle text).
+    pub fn write_bytes(bytes: &[u8]) -> Result<Self, String> {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let path =
             std::env::temp_dir().join(format!("arc-rs-patch-{}-{id}.patch", std::process::id()));
-        std::fs::write(&path, text)
+        std::fs::write(&path, bytes)
             .map_err(|e| format!("Failed to write temporary patch file: {e}"))?;
         Ok(Self { path })
     }
@@ -2989,7 +4058,9 @@ pub fn git_apply_patch_ansi(
     io: &mut Io,
     ansi: bool,
 ) -> Result<(), String> {
-    let patchfile = TempPatchFile::write(&bundle.text)?;
+    // Bundle text rides as transport; the patchfile carries converted
+    // raw bytes, like `toGitPatch()` plus `convertNonUTF8Diff()`.
+    let patchfile = TempPatchFile::write_bytes(&bundle_patch_bytes(bundle)?)?;
     let path = patchfile.path.to_string_lossy().to_string();
     let output = git::output(
         dir,
@@ -3017,7 +4088,7 @@ pub fn git_apply_patch_ansi(
 pub fn git_commit_patch(dir: &Path, bundle: &Bundle, message: &str) -> Result<(), String> {
     use std::io::Write;
     use std::process::Stdio;
-    let mut command = std::process::Command::new("git");
+    let mut command = crate::proc_env::command("git");
     command.current_dir(dir).arg("commit").arg("-a");
     if let Some(author) = bundle.full_author() {
         command.arg(format!("--author={author}"));
@@ -3134,20 +4205,68 @@ pub fn git_cherry_pick_temp_ansi(
     Ok(())
 }
 
+/// Editor name for patch commit messages (`:909-911`).
+pub const EDITOR_PATCH_COMMIT: &str = "arcanist-patch-commit-message";
+
+/// Interactive editor hook: template text to edited text.
+pub type EditHook<'a> = &'a dyn Fn(&str) -> Result<String, String>;
+
+/// Guidance error when no commit message exists and no editor is wired.
+pub const NO_COMMIT_MESSAGE: &str = "Unable to determine a commit message for this patch. Re-run with --nocommit to apply \
+     without committing.";
+
 /// Resolve the commit message: Differential messages for bundles with a
 /// revision ID, else the port guidance error (no interactive editor; see
-/// the module docs).
+/// [`resolve_commit_message_with_editor`]).
 pub fn resolve_commit_message(
     bundle: &Bundle,
     call: Option<&diff_submit::ConduitCall<'_>>,
 ) -> Result<String, String> {
+    resolve_commit_message_with_editor(bundle, call, None)
+}
+
+/// Resolve the commit message with an editor fallback
+/// (`getCommitMessage()`, `ArcanistPatchWorkflow.php:876-925`).
+///
+/// PATCH-P8: bundles without a Differential message (no revision ID, or
+/// an empty fetch) open the editor on [`patch_commit_template`] instead
+/// of failing; a blank result aborts. `edit` maps the template to the
+/// edited text; `None` keeps the [`NO_COMMIT_MESSAGE`] guidance error.
+pub fn resolve_commit_message_with_editor(
+    bundle: &Bundle,
+    call: Option<&diff_submit::ConduitCall<'_>>,
+    edit: Option<EditHook<'_>>,
+) -> Result<String, String> {
+    let mut prompt_revision: Option<String> = None;
     if let (Some(id), Some(call)) = (bundle.revision_id, call) {
-        return fetch_patch_commit_message(call, id);
+        let fetched = fetch_patch_commit_message(call, id)?;
+        if !fetched.is_empty() {
+            return Ok(fetched);
+        }
+        prompt_revision = Some(id.to_string());
     }
-    Err(
-        "Unable to determine a commit message for this patch. Re-run with --nocommit to apply \
-         without committing."
-            .to_string(),
+    let Some(edit) = edit else {
+        return Err(NO_COMMIT_MESSAGE.to_string());
+    };
+    let template = patch_commit_template(prompt_revision.as_deref());
+    let edited = edit(&template)?;
+    let stripped = diff_local::remove_comments(&edited);
+    if stripped.trim().is_empty() {
+        return Err(diff_local::USER_ABORT.to_string());
+    }
+    Ok(stripped)
+}
+
+/// [`resolve_commit_message_with_editor`] over the real interactive
+/// editor, for the apply flows.
+fn resolve_commit_message_interactive(
+    bundle: &Bundle,
+    call: Option<&diff_submit::ConduitCall<'_>>,
+) -> Result<String, String> {
+    resolve_commit_message_with_editor(
+        bundle,
+        call,
+        Some(&|template| diff::edit_interactively(template, EDITOR_PATCH_COMMIT, None, None, 0)),
     )
 }
 
@@ -3193,7 +4312,7 @@ pub fn apply_git_ansi(
     git_apply_patch_ansi(dir, bundle, io, ansi)?;
     git_submodule_update(dir, io)?;
     if should_commit(options) {
-        let message = resolve_commit_message(bundle, call)?;
+        let message = resolve_commit_message_interactive(bundle, call)?;
         git_commit_patch(dir, bundle, &message)?;
         git_write_okay_ansi(io, "COMMITTED", "Successfully committed patch.", ansi);
     } else {
@@ -3356,7 +4475,9 @@ pub fn hg_import_patch_ansi(
 ) -> Result<(), String> {
     // The patch travels via temp file instead of `-` stdin so custom
     // backends work; `hg import` accepts a file the same way.
-    let patchfile = TempPatchFile::write(&bundle.text)?;
+    // Bundle text rides as transport; the patchfile carries converted
+    // raw bytes, like `toGitPatch()` plus `convertNonUTF8Diff()`.
+    let patchfile = TempPatchFile::write_bytes(&bundle_patch_bytes(bundle)?)?;
     let path = patchfile.path.to_string_lossy().to_string();
     let output = hg::output_with(dir, hg, &["import", "--no-commit", &path])?;
     if output.status.success() {
@@ -3497,7 +4618,7 @@ pub fn apply_hg_ansi(
 ) -> Result<(), String> {
     hg_import_patch_ansi(dir, hg, bundle, io, ansi)?;
     if should_commit(options) {
-        let message = resolve_commit_message(bundle, call)?;
+        let message = resolve_commit_message_interactive(bundle, call)?;
         hg_commit_patch(dir, hg, bundle, &message)?;
         if !should_branch(options)
             && has_base_local
@@ -3551,47 +4672,51 @@ pub struct SvnChange {
 /// hunk corpora).
 pub fn svn_changes_from_dicts(
     dicts: &[serde_json::Value],
-    corpora: &[Vec<String>],
+    corpora: &[Vec<ParsedHunk>],
 ) -> Vec<SvnChange> {
     dicts
         .iter()
         .zip(corpora.iter())
-        .map(|(dict, hunks)| {
-            let props = |key: &str| {
-                dict.get(key)
-                    .and_then(|v| v.as_object())
-                    .map(|map| {
-                        map.iter()
-                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            };
-            let file_type = dict
-                .get("fileType")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(u64::from(FILE_TEXT)) as u32;
-            SvnChange {
-                change_type: dict
-                    .get("type")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(u64::from(TYPE_CHANGE)) as u32,
-                file_type,
-                old_path: dict
-                    .get("oldPath")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                current_path: dict
-                    .get("currentPath")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                hunks: hunks.concat(),
-                old_props: props("oldProperties"),
-                new_props: props("newProperties"),
-                symlink_target: symlink_target_from_hunks(file_type, &hunks.concat()),
-            }
-        })
+        .map(|(dict, hunks)| svn_change_lossy(svn_change_from_dict(dict, hunks)))
         .collect()
+}
+
+/// One svn change from an arcbundle change dictionary plus its hunk
+/// corpora (transport-safe: callers lossy-view the result).
+fn svn_change_from_dict(dict: &serde_json::Value, hunks: &[ParsedHunk]) -> SvnChange {
+    let props = |key: &str| {
+        dict.get(key)
+            .and_then(|v| v.as_object())
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let file_type = dict
+        .get("fileType")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(u64::from(FILE_TEXT)) as u32;
+    SvnChange {
+        change_type: dict
+            .get("type")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(u64::from(TYPE_CHANGE)) as u32,
+        file_type,
+        old_path: dict
+            .get("oldPath")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        current_path: dict
+            .get("currentPath")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        hunks: render_hunks(hunks),
+        old_props: props("oldProperties"),
+        new_props: props("newProperties"),
+        symlink_target: symlink_target_from_hunks(file_type, &render_hunks(hunks)),
+    }
 }
 
 /// Symlink target from hunk bodies: the single added line, when the
@@ -3608,39 +4733,90 @@ fn symlink_target_from_hunks(file_type: u32, body: &str) -> Option<String> {
 }
 
 /// Unquote a git C-quoted path (`"a\"b"` -> `a"b`); plain paths pass
-/// through.
+/// through. Decoded bytes ride as transport (T1153 EXPORT-E9): valid
+/// sequences decode to real chars, the rest smuggled, so non-UTF-8
+/// paths survive; ASCII behavior is unchanged.
 pub fn unquote_git_path(path: &str) -> String {
     if !(path.starts_with('"') && path.ends_with('"') && path.len() >= 2) {
         return path.to_string();
     }
     let inner = &path[1..path.len() - 1];
     let mut out = String::new();
+    // Consecutive decoded high bytes buffer up so valid sequences
+    // decode together; anything else flushes first.
+    let mut pending: Vec<u8> = Vec::new();
     let mut chars = inner.chars();
     while let Some(ch) = chars.next() {
         if ch != '\\' {
+            flush_transport_pending(&mut out, &mut pending);
             out.push(ch);
             continue;
         }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some(other) => {
-                if other.is_ascii_digit() {
-                    let mut octal = String::from(other);
-                    octal.push(chars.next().unwrap_or('0'));
-                    octal.push(chars.next().unwrap_or('0'));
-                    if let Ok(byte) = u8::from_str_radix(&octal, 8) {
-                        out.push(byte as char);
-                    }
-                } else {
-                    out.push(other);
-                }
-            }
-            None => out.push('\\'),
+        push_unquoted_escape(&mut out, &mut pending, &mut chars);
+    }
+    flush_transport_pending(&mut out, &mut pending);
+    out
+}
+
+/// Consume one escape sequence after a backslash: `n`/`t`/`r` map to
+/// control chars, octal triplets buffer raw bytes (ASCII ones flush
+/// through immediately), anything else — or a trailing backslash —
+/// passes through literally.
+fn push_unquoted_escape(out: &mut String, pending: &mut Vec<u8>, chars: &mut std::str::Chars<'_>) {
+    match chars.next() {
+        Some('n') => {
+            flush_transport_pending(out, pending);
+            out.push('\n');
+        }
+        Some('t') => {
+            flush_transport_pending(out, pending);
+            out.push('\t');
+        }
+        Some('r') => {
+            flush_transport_pending(out, pending);
+            out.push('\r');
+        }
+        Some(other) => push_unquoted_char(out, pending, chars, other),
+        None => {
+            flush_transport_pending(out, pending);
+            out.push('\\');
         }
     }
-    out
+}
+
+/// Emit a non-trivial escape payload: an octal digit starts a triplet
+/// (ASCII bytes flush through, high bytes buffer for joint decoding),
+/// any other char passes through literally.
+fn push_unquoted_char(
+    out: &mut String,
+    pending: &mut Vec<u8>,
+    chars: &mut std::str::Chars<'_>,
+    other: char,
+) {
+    if !other.is_ascii_digit() {
+        flush_transport_pending(out, pending);
+        out.push(other);
+        return;
+    }
+    let mut octal = String::from(other);
+    octal.push(chars.next().unwrap_or('0'));
+    octal.push(chars.next().unwrap_or('0'));
+    let Ok(byte) = u8::from_str_radix(&octal, 8) else {
+        return;
+    };
+    if byte < 0x80 {
+        flush_transport_pending(out, pending);
+        out.push(byte as char);
+    } else {
+        pending.push(byte);
+    }
+}
+
+/// Flush buffered high bytes as transport (valid sequences decode
+/// together; the rest smuggle).
+fn flush_transport_pending(out: &mut String, pending: &mut Vec<u8>) {
+    out.push_str(&transport_bytes(pending));
+    pending.clear();
 }
 
 /// Strip one `a/` or `b/` prefix from a `---`/`+++` path.
@@ -3723,6 +4899,23 @@ fn parse_svn_section(section: &str) -> Vec<SvnChange> {
     svn_section_modes(&mut change, &headers);
     svn_section_symlink(&mut change);
     svn_section_classify(change, &headers)
+        .into_iter()
+        .map(svn_change_lossy)
+        .collect()
+}
+
+/// View one svn change lossily (T1153 EXPORT-E9 residual carry): the svn
+/// apply path keeps its historical lossy behavior (its filesystem, CLI,
+/// and prompt sinks are `String`-only, and no svn binary exists here to
+/// oracle-verify a byte port), while transport inputs stay contained.
+fn svn_change_lossy(mut change: SvnChange) -> SvnChange {
+    change.old_path = change.old_path.map(|path| untransport_lossy(&path));
+    change.current_path = change.current_path.map(|path| untransport_lossy(&path));
+    change.hunks = untransport_lossy(&change.hunks);
+    change.symlink_target = change
+        .symlink_target
+        .map(|target| untransport_lossy(&target));
+    change
 }
 
 /// Parsed `diff --git` section headers (before the first `@@`).
@@ -4342,9 +5535,11 @@ pub fn run_patch_file_with(
     patch_text: &str,
     patch_bin: &str,
 ) -> Result<(bool, String), String> {
-    let patchfile = TempPatchFile::write(patch_text)?;
+    // Patch text may ride as transport; the patchfile carries raw bytes
+    // (identical bytes for escape-free input).
+    let patchfile = TempPatchFile::write_bytes(&untransport_bytes(patch_text))?;
     let file = patchfile.path.to_string_lossy().to_string();
-    let output = std::process::Command::new(patch_bin)
+    let output = crate::proc_env::command(patch_bin)
         .current_dir(dir)
         .args(["-p0", "-i", &file])
         .output()
@@ -4353,6 +5548,16 @@ pub fn run_patch_file_with(
         output.status.success(),
         String::from_utf8_lossy(&output.stdout).to_string(),
     ))
+}
+
+/// Apply one per-file patch, converting the bundle encoding first
+/// (the `convertNonUTF8Diff()` render step; T1153 EXPORT-E9).
+fn run_patch_file_converted(
+    dir: &Path,
+    patch_text: &str,
+    encoding: Option<&str>,
+) -> Result<(bool, String), String> {
+    run_patch_file(dir, &convert_transport_text(patch_text, encoding)?)
 }
 
 /// Touch one svn file (`(cd %s; touch %s)`): create it when missing,
@@ -4389,9 +5594,9 @@ pub fn run_symlink(dir: &Path, target: &str, path: &str) -> Result<(), String> {
 pub struct LoadedBundle {
     /// The bundle.
     pub bundle: Bundle,
-    /// Arcbundle change dicts with decoded hunk corpora, when the source
+    /// Arcbundle change dicts with transport hunks, when the source
     /// is an arcbundle.
-    pub arcbundle_dicts: Option<(Vec<serde_json::Value>, Vec<Vec<String>>)>,
+    pub arcbundle_dicts: Option<(Vec<serde_json::Value>, Vec<Vec<ParsedHunk>>)>,
 }
 
 /// Load the bundle for `source`.
@@ -4418,31 +5623,28 @@ pub fn load_bundle(
 }
 
 /// Load the bundle for a `--revision` / positional `D123` source.
+///
+/// PATCH-P13: the id goes to Conduit verbatim (strings, like PHP's argv
+/// passthrough); local parsing was a fail-fast extension.
 fn load_revision_source_bundle(
     id: &str,
     call: Option<&diff_submit::ConduitCall<'_>>,
 ) -> Result<LoadedBundle, String> {
     let call = require_call(call)?;
-    let revision_id = id
-        .parse::<u64>()
-        .map_err(|_| format!("invalid revision '{id}': expected D12345"))?;
     Ok(LoadedBundle {
-        bundle: fetch_revision_bundle(call, revision_id)?,
+        bundle: fetch_revision_bundle_raw(call, id)?,
         arcbundle_dicts: None,
     })
 }
 
-/// Load the bundle for a `--diff` source.
+/// Load the bundle for a `--diff` source (verbatim ids, PATCH-P13).
 fn load_diff_source_bundle(
     id: &str,
     call: Option<&diff_submit::ConduitCall<'_>>,
 ) -> Result<LoadedBundle, String> {
     let call = require_call(call)?;
-    let diff_id = id
-        .parse::<u64>()
-        .map_err(|_| format!("invalid diff '{id}': expected D12345"))?;
     Ok(LoadedBundle {
-        bundle: fetch_diff_bundle(call, diff_id)?,
+        bundle: fetch_diff_bundle_raw(call, id)?,
         arcbundle_dicts: None,
     })
 }
@@ -4473,24 +5675,21 @@ fn require_call<'a>(
     })
 }
 
-/// An arcbundle plus raw change dicts and decoded hunk corpora.
-type ArcbundleWithDicts = (Bundle, Vec<serde_json::Value>, Vec<Vec<String>>);
+/// An arcbundle plus raw change dicts and transport hunks.
+type ArcbundleWithDicts = (Bundle, Vec<serde_json::Value>, Vec<Vec<ParsedHunk>>);
 
-/// Load an arcbundle plus its raw change dicts and decoded corpora.
+/// Load an arcbundle plus its raw change dicts and transport corpora.
 fn load_arcbundle_with_dicts(
     path: &str,
     encoding: Option<&str>,
 ) -> Result<ArcbundleWithDicts, String> {
     let bundle = load_arcbundle(path, encoding)?;
-    let members = tar_list(path)?;
-    let meta = arcbundle_meta(path, &members)?;
     let raw = tar_extract(path, "changes.json")?;
     let dicts: Vec<serde_json::Value> = serde_json::from_slice(&raw)
         .map_err(|e| format!("failed to read arcbundle '{path}': {e}"))?;
-    let decode_as = encoding.or(meta.encoding.as_deref());
     let mut corpora = Vec::new();
     for dict in &dicts {
-        corpora.push(arcbundle_corpora(path, dict, decode_as)?);
+        corpora.push(arcbundle_corpora(path, dict)?);
     }
     Ok((bundle, dicts, corpora))
 }
@@ -4741,9 +5940,11 @@ fn fetch_dependency_monograms(
     let rows = result.as_array().cloned().unwrap_or_default();
     let mut monograms: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for row in &rows {
+        // PATCH-P6 remainder: orsay types `id` as a string; strict
+        // `as_u64` dropped every monogram (deps never applied).
         if let (Some(phid), Some(id)) = (
             row.get("phid").and_then(|v| v.as_str()),
-            row.get("id").and_then(|v| v.as_u64()),
+            row.get("id").and_then(diff_submit::loose_u64),
         ) {
             monograms.insert(phid.to_string(), format!("D{id}"));
         }
@@ -4847,33 +6048,10 @@ fn run_patch_flow(
         return Err(NOT_A_WORKING_COPY.to_string());
     };
     check_supports(options, vcs.name())?;
-    if options.update {
-        update_working_copy(dir, vcs, backends, io)?;
-    }
-    let stash = require_clean_tree_ansi(dir, vcs, backends, io, options.force, ansi)?;
-    let outcome = run_patch_flow_inner(dir, options, io, backends, &source, vcs, ansi);
-    let pop = unstash_changes(dir, stash);
-    match (outcome, pop) {
-        (Ok(outcome), Ok(())) => Ok(outcome),
-        (Ok(_), Err(error)) => Err(error),
-        (Err(error), _) => Err(error),
-    }
-}
-
-/// The patch flow between the clean check and the stash pop.
-fn run_patch_flow_inner(
-    dir: &Path,
-    options: &Options,
-    io: &mut Io,
-    backends: &Backends,
-    source: &Source,
-    vcs: Vcs,
-    ansi: bool,
-) -> Result<FlowOutcome, String> {
-    let client = match source {
-        Source::Patch(_) => None,
-        _ => Some(land::client_for_dir(options.conduit_uri.as_deref(), dir)?),
-    };
+    // Built before the clean check, like PHP's workflow setup: conduit
+    // errors precede worktree errors, and amend detection (PATCH-P9) can
+    // run the published-check. `--patch` sources stay conduit-less.
+    let client = setup_patch_client(&source, options, dir)?;
     let call = |method: &str, params: &serde_json::Value| {
         client
             .as_ref()
@@ -4884,7 +6062,140 @@ fn run_patch_flow_inner(
     let call_option: Option<&diff_submit::ConduitCall<'_>> = client
         .as_ref()
         .map(|_| &call as &dyn Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>);
-    let loaded = load_bundle(source, options, io, call_option)?;
+    if options.update {
+        update_working_copy(dir, vcs, backends, io)?;
+    }
+    let stash =
+        require_clean_tree_with_call(dir, vcs, backends, io, options.force, ansi, call_option)?;
+    let mut loaded = load_bundle_with_reauth(&source, options, io, call_option)?;
+    apply_patch_bundle_encoding(
+        dir,
+        vcs,
+        backends,
+        &source,
+        options,
+        call_option,
+        &mut loaded,
+    )?;
+    let outcome = run_patch_flow_inner(dir, options, io, backends, vcs, ansi, call_option, loaded);
+    let pop = unstash_changes(dir, stash);
+    combine_patch_flow_outcome(outcome, pop)
+}
+
+/// Conduit client for the flow, built before the clean check so conduit
+/// errors precede worktree errors. `--patch` sources stay conduit-less.
+fn setup_patch_client(
+    source: &Source,
+    options: &Options,
+    dir: &Path,
+) -> Result<Option<arc_rs::conduit::Client>, String> {
+    match source {
+        Source::Patch(_) => Ok(None),
+        _ => Ok(Some(land::client_for_dir(
+            options.conduit_uri.as_deref(),
+            dir,
+        )?)),
+    }
+}
+
+/// PATCH-P11: select the `--encoding` flag, else the repository
+/// encoding (`:404-414`), for a conduit bundle. The selection rides on
+/// the bundle and converts at the apply sinks (T1153 EXPORT-E9).
+fn apply_patch_bundle_encoding(
+    dir: &Path,
+    vcs: Vcs,
+    backends: &Backends,
+    source: &Source,
+    options: &Options,
+    call_option: Option<&diff_submit::ConduitCall<'_>>,
+    loaded: &mut LoadedBundle,
+) -> Result<(), String> {
+    if !matches!(
+        source,
+        Source::Revision(_) | Source::Diff(_) | Source::Named(_)
+    ) {
+        return Ok(());
+    }
+    let encoding = match options.encoding.as_deref() {
+        Some(flag) => Some(flag.to_string()),
+        None => match call_option {
+            Some(call) => patch_repository_encoding(dir, vcs, backends, call)?,
+            None => None,
+        },
+    };
+    if let Some(encoding) = encoding {
+        // Selected encoding rides on the bundle and converts at the
+        // apply sinks, like `convertNonUTF8Diff()` at render.
+        loaded.bundle.encoding = Some(encoding);
+    }
+    Ok(())
+}
+
+/// Merge the flow outcome with the stash-pop outcome: a failed pop
+/// fails an otherwise clean run, and a flow error wins over the pop.
+fn combine_patch_flow_outcome(
+    outcome: Result<FlowOutcome, String>,
+    pop: Result<(), String>,
+) -> Result<FlowOutcome, String> {
+    match (outcome, pop) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), _) => Err(error),
+    }
+}
+
+/// Load the bundle, re-authenticating and retrying once on
+/// `ERR-INVALID-SESSION` (PATCH-P10, `:392-400`).
+///
+/// PHP retries the whole `run()` via unbounded recursion (re-pulling and
+/// re-prompting, and looping forever on a persistently failing server);
+/// this retries just the failed load, once: the try in PHP wraps only
+/// the bundle load, and the whole-run recursion is incidental.
+fn load_bundle_with_reauth(
+    source: &Source,
+    options: &Options,
+    io: &mut Io,
+    call_option: Option<&diff_submit::ConduitCall<'_>>,
+) -> Result<LoadedBundle, String> {
+    match load_bundle(source, options, io, call_option) {
+        Err(error) if is_invalid_session_error(&error) => {
+            let Some(call) = call_option else {
+                return Err(error);
+            };
+            reauthenticate_patch_conduit(call)?;
+            load_bundle(source, options, io, call_option)
+        }
+        outcome => outcome,
+    }
+}
+
+/// True for `ERR-INVALID-SESSION` conduit failures, matched on the
+/// stringified `{code}: {info}` shape (`conduit::Error` Display).
+#[must_use]
+pub fn is_invalid_session_error(error: &str) -> bool {
+    error == "ERR-INVALID-SESSION" || error.starts_with("ERR-INVALID-SESSION:")
+}
+
+/// Re-verify the conduit session after `ERR-INVALID-SESSION`: the token
+/// arm of `authenticateConduit()` (`ArcanistWorkflow.php:479-498`) is a
+/// `user.whoami` round-trip; failures propagate like PHP.
+fn reauthenticate_patch_conduit(call: &diff_submit::ConduitCall<'_>) -> Result<(), String> {
+    call("user.whoami", &serde_json::json!({}))?;
+    Ok(())
+}
+
+/// The patch flow between the bundle load and the stash pop.
+#[allow(clippy::too_many_arguments)]
+fn run_patch_flow_inner(
+    dir: &Path,
+    options: &Options,
+    io: &mut Io,
+    backends: &Backends,
+    vcs: Vcs,
+    ansi: bool,
+    call_option: Option<&diff_submit::ConduitCall<'_>>,
+    loaded: LoadedBundle,
+) -> Result<FlowOutcome, String> {
     let has_base_local =
         ensure_base_present_with_ansi(dir, vcs, &loaded.bundle, io, backends, ansi)?;
     let branch = maybe_create_branch(
@@ -4969,7 +6280,7 @@ fn apply_patch_bundle(
     io: &mut Io,
     backends: &Backends,
     bundle: &Bundle,
-    arcbundle_dicts: Option<&(Vec<serde_json::Value>, Vec<Vec<String>>)>,
+    arcbundle_dicts: Option<&(Vec<serde_json::Value>, Vec<Vec<ParsedHunk>>)>,
     vcs: Vcs,
     branch: &BranchState,
     has_base_local: bool,
@@ -5010,13 +6321,13 @@ fn apply_patch_bundle(
     }
 }
 
-/// Apply the loaded bundle under svn, from arcbundle dicts (with decoded
-/// corpora) or parsed git-patch text.
+/// Apply the loaded bundle under svn, from arcbundle dicts (with
+/// transport corpora) or parsed git-patch text.
 fn apply_patch_svn(
     dir: &Path,
     backends: &Backends,
     bundle: &Bundle,
-    arcbundle_dicts: Option<&(Vec<serde_json::Value>, Vec<Vec<String>>)>,
+    arcbundle_dicts: Option<&(Vec<serde_json::Value>, Vec<Vec<ParsedHunk>>)>,
     io: &mut Io,
     ansi: bool,
 ) -> Result<FlowOutcome, String> {
@@ -5024,12 +6335,13 @@ fn apply_patch_svn(
         Some((dicts, corpora)) => svn_changes_from_dicts(dicts, corpora),
         None => parse_git_patch_for_svn(&bundle.text),
     };
+    let encoding = bundle.encoding.clone();
     let outcome = apply_svn_ansi(
         dir,
         &backends.svn,
         &changes,
         io,
-        &mut |_, patch| run_patch_file(dir, patch),
+        &mut |_, patch| run_patch_file_converted(dir, patch, encoding.as_deref()),
         &mut |path| run_touch_file(dir, path),
         &mut |target, path| run_symlink(dir, target, path),
         ansi,
@@ -5067,10 +6379,10 @@ pub fn execute_with_io_ansi(
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
-            io.push_out(USAGE);
+            io.push_out(&usage_text(ansi));
             return Ok(std::mem::take(&mut io.out));
         }
-        Err(message) => return Err(format!("{message}\n\n{USAGE}")),
+        Err(message) => return Err(format!("{message}\n\n{}", usage())),
     };
     if options.preview {
         return execute_preview(dir, &options, io);
@@ -5099,7 +6411,11 @@ fn execute_preview(dir: &Path, options: &Options, io: &mut Io) -> Result<Out, St
         .as_ref()
         .map(|_| &call as &dyn Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>);
     let loaded = load_bundle(&source, options, io, call_option)?;
-    io.push_out(&loaded.bundle.text);
+    // `--preview` shows what would apply: converted, then lossily to
+    // the text sink (identical to the historical rendering for
+    // escape-free bundles without an encoding).
+    let converted = convert_transport_text(&loaded.bundle.text, loaded.bundle.encoding.as_deref())?;
+    io.push_out(&untransport_lossy(&converted));
     Ok(std::mem::take(&mut io.out))
 }
 

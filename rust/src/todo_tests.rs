@@ -132,14 +132,24 @@ fn execute_threads_ansi_through_finish() {
         uri: "https://example.test/T55".to_string(),
     };
     let options = plain_options(&["Do", "thing"]);
-    let dir = std::env::temp_dir();
     assert_eq!(
-        finish_created_task(&dir, &task, &options, false).unwrap(),
+        render_created_task(&task, &options, false).unwrap(),
         render_created(&task, false)
     );
-    let styled = finish_created_task(&dir, &task, &options, true).unwrap();
+    let styled = render_created_task(&task, &options, true).unwrap();
     assert_eq!(styled, render_created(&task, true));
     assert!(styled.contains('\u{1b}'), "got: {styled}");
+}
+
+#[test]
+fn rbd29b_create_returns_task_for_browse_after_print() {
+    // `--browse` no longer runs inside `execute`: the outcome carries
+    // the task so the caller prints first, then browses (like PHP).
+    let client = conduit::Client::new("http://127.0.0.1:9/", "t").unwrap();
+    let options = plain_options(&[]);
+    let outcome = create_in_ansi(std::env::temp_dir().as_path(), &client, &options, false).unwrap();
+    assert_eq!(outcome.text, "Please provide a summary.\n");
+    assert_eq!(outcome.task, None);
 }
 
 #[test]
@@ -171,4 +181,81 @@ fn builds_created_json() {
             "uri": "https://example.test/T55",
         })
     );
+}
+
+#[test]
+fn r4_rbd4_parse_error_has_no_dump() {
+    // `todo` is a subprocess workflow: argument errors render `Usage
+    // Exception:` (exit 1) with no usage dump.
+    assert_eq!(run(&args(&["--bogus"])), std::process::ExitCode::FAILURE);
+}
+
+#[test]
+fn rbd8_user_phid_prefers_cached_identity() {
+    // The startup-auth identity answers without I/O: an unroutable
+    // client still resolves when cached.
+    let client = conduit::Client::new("http://127.0.0.1:9/", "t").unwrap();
+    client.set_authenticated_user("alice", "PHID-USER-1");
+    assert_eq!(user_phid(&client).unwrap(), "PHID-USER-1");
+}
+#[test]
+fn r10_todo_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "TODO WORKFLOW\n\
+         \n\
+         todo\n\
+         \x20     todo summary [options]\n\
+         \n\
+         \x20       Quickly create a task for yourself.\n\
+         \n\
+         \x20     --browse\n\
+         \x20         After creating the task, open it in a web browser.\n\
+         \n\
+         \x20     --cc cc, -C cc\n\
+         \x20         Other users to CC on the new task.\n\
+         \n\
+         \x20     --project project\n\
+         \x20         Projects to assign to the task.\n\
+         \n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("TODO WORKFLOW"), "{}", usage());
+}
+
+#[test]
+fn b21_todo_needs_no_terminator() {
+    // T1153 B21/B23 VERIFIED for `todo`: it is a classic workflow,
+    // so PHP runs it via the `scripts/arcanist.php` re-exec, which
+    // never requires `--`. Parsing takes no TTY input, so
+    // piped-style argv parses directly, and `--help` without `--`
+    // still succeeds.
+    assert!(parse_args(&args(&["fix", "it"])).unwrap().is_some());
+    assert_eq!(parse_args(&args(&["--help"])).unwrap(), None);
+    let text = usage_text(false);
+    assert!(text.contains("TODO WORKFLOW"), "{text}");
+}
+
+#[test]
+fn b23_todo_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help todo`.
+    // Extensions stay undocumented.
+    let text = usage_text(false);
+    assert!(text.starts_with("TODO WORKFLOW\n"), "{text}");
+    assert!(
+        text.contains("Quickly create a task for yourself."),
+        "{text}"
+    );
+    assert!(text.contains("--browse"), "{text}");
+    assert!(!text.contains("--json"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }

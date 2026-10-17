@@ -12,15 +12,12 @@
 //!
 //! Divergences from PHP (all deliberate):
 //!
-//! - `askForRepositoryUpdate` (the advisory `diffusion.looksoon` hint) is
-//!   skipped: arc-rs cannot resolve the repository PHID yet, the same
-//!   known limit `close_revision` documents.
 //! - Banners and prompts render as plain text through `land::console_confirm`
 //!   (the `phutil_console_confirm` port); prompt queries and error
 //!   sentences keep the PHP wording.
-//! - `svn commit` output is captured and returned, where PHP streams it
-//!   live with `phutil_passthru`; failures append the captured output to
-//!   the PHP sentence.
+//! - Git support plus `-m`/`--all`/`--allow-empty` are pure arc-rs
+//!   extensions (T1153 CORE-64): PHP commits svn only
+//!   (`ArcanistCommitWorkflow.php:282-284` at ceb).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -32,28 +29,49 @@ use crate::{amend, close_revision, config, git, land, svn};
 
 pub const NAME: &str = "commit";
 
-fn usage() -> String {
-    format!(
-        "usage: arc {NAME} [(-m MESSAGE | --revision ID)] [--all] [--allow-empty] [--show]\n\
-         \n\
-         Under git, create a local commit. The message comes from\n\
-         -m/--message (repeatable, joined with a blank line), or from\n\
-         Differential via --revision. Nothing is pushed.\n\
-         \n\
-         Under Subversion, commit an accepted Differential revision: the\n\
-         revision is guessed from the working copy unless --revision is\n\
-         given, sanity checks prompt, then 'svn commit' runs and the\n\
-         revision is finalized. -m/--all/--allow-empty are git-only.\n\
-         \n\
-         Options:\n\
-         \x20 -m, --message MSG   commit message (repeatable, git only)\n\
-         \x20 --revision ID       fetch the message from Differential (D123 or 123)\n\
-         \x20 --conduit-uri URI   Conduit URI (else ARC_CONDUIT_URI or .arcconfig)\n\
-         \x20 -a, --all           stage tracked modifications before committing\n\
-         \x20 --allow-empty       allow a commit with no changes\n\
-         \x20 --show              print the message without committing\n\
-         \x20 -h, --help          show this help\n"
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `crate::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistCommitWorkflow.php:14-62`).
+const HELP_SYNOPSIS: &str = "      **commit** [--revision __revision_id__] [--show]";
+const HELP_TEXT: &str =
+    "          Supports: svn\n          Commit a revision which has been accepted by a reviewer.";
+/// Non-wildcard argument specs: (name, short, param, help).
+const HELP_SPECS: &[(&str, Option<&str>, Option<&str>, &str)] = &[
+    (
+        "show",
+        None,
+        None,
+        "Show the command which would be issued, but do not actually commit anything.",
+    ),
+    (
+        "revision",
+        None,
+        Some("revision_id"),
+        "Commit a specific revision. If you do not specify a revision, arc will look for committable revisions.",
+    ),
+];
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    let specs: Vec<crate::help::SpecView<'_>> = HELP_SPECS
+        .iter()
+        .map(|(name, short, param, help)| (*name, *short, *param, Some(*help)))
+        .collect();
+    crate::help::usage_text(
+        NAME,
+        None,
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        false,
+        &specs,
+        ansi,
     )
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
 }
 
 /// Parsed `commit` options.
@@ -690,6 +708,23 @@ fn svn_commit_file_list(
     Ok(files)
 }
 
+/// Ask Phabricator to pick up the push soon (T1153 COMMIT-C3):
+/// `askForRepositoryUpdate()` (`ArcanistWorkflow.php:2218-2235`) sends
+/// an advisory `diffusion.looksoon` for the working copy's repository.
+/// Fully best-effort: repository-resolution failures are swallowed
+/// like the nudge itself (the commit already landed, so failing here
+/// would report failure for a success), matching
+/// [`finalize_revision`]'s untracked swallowing.
+fn ask_for_repository_update(client: &Client, dir: &Path) {
+    let Ok(Some(phid)) = close_revision::resolve_repository_phid(client, dir) else {
+        return;
+    };
+    let _ = client.call(
+        "diffusion.looksoon",
+        &serde_json::json!({"repositories": [phid]}),
+    );
+}
+
 /// Close the committed revision softly, like the `close-revision
 /// --finalize` child workflow (`:168-174`). `--finalize` never prompts.
 fn finalize_revision(
@@ -741,12 +776,13 @@ fn flow_svn(
     ));
     let files = svn_commit_file_list(io, &target.client, svn, &target.root, target.id)?;
     let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
-    let mut out = svn::commit_with(&target.root, svn, &file_refs, &target.message)?;
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str(&finalize_revision(&target.client, options, dir, target.id)?);
-    Ok(out)
+    // T1153 CORE-65: the commit streams live like `phutil_passthru`,
+    // so only the finalize text is returned here.
+    svn::commit_with(&target.root, svn, &file_refs, &target.message)?;
+    // T1153 COMMIT-C3: the advisory nudge runs after the commit and
+    // before the finalize child (`:165-174`).
+    ask_for_repository_update(&target.client, dir);
+    finalize_revision(&target.client, options, dir, target.id)
 }
 
 /// Resolve the revision to commit, run sanity checks (unless `--show`),

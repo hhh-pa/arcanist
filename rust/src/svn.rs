@@ -103,7 +103,7 @@ pub struct CommandResult {
 }
 
 fn command_for(dir: &Path, svn: &SvnCommand, args: &[&str]) -> std::process::Command {
-    let mut cmd = std::process::Command::new(&svn.program);
+    let mut cmd = crate::proc_env::command(&svn.program);
     cmd.current_dir(dir);
     cmd.args(&svn.prefix);
     cmd.args(args);
@@ -1373,7 +1373,7 @@ fn run_program(
     prefix: &[&str],
     args: &[&str],
 ) -> Result<RawOutput, String> {
-    let out = std::process::Command::new(program)
+    let out = crate::proc_env::command(program)
         .current_dir(dir)
         .args(prefix)
         .args(args)
@@ -1763,45 +1763,36 @@ pub fn select_svn_locale(locales_output: &str) -> &'static str {
 /// `en_US.utf8` when the probe fails. PHP swallows probe errors the same
 /// way; Windows callers pass no locale at all (PHP skips `LANG` there).
 pub fn svn_lang_env_var() -> &'static str {
-    let output = std::process::Command::new("locale").arg("-a").output();
+    let output = crate::proc_env::command("locale").arg("-a").output();
     match output {
         Ok(out) if out.status.success() => select_svn_locale(&String::from_utf8_lossy(&out.stdout)),
         _ => "en_US.utf8",
     }
 }
 
-/// Failure message for `svn commit`, starting from the PHP sentence
-/// (`ArcanistCommitWorkflow.php:163`) with the captured output appended:
-/// PHP streams it live, while this port captures it.
-fn commit_failed_message(out: &std::process::Output) -> String {
-    const BASE: &str = "Executing 'svn commit' failed!";
-    let detail = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let detail = detail.trim();
-    if detail.is_empty() {
-        BASE.to_string()
-    } else {
-        format!("{BASE}: {detail}")
-    }
+/// Failure message for `svn commit`: the bare PHP sentence
+/// (`ArcanistCommitWorkflow.php:163` at ceb). The child streams live,
+/// so its output is already on the console; nothing rides along here.
+fn commit_failed_message() -> String {
+    "Executing 'svn commit' failed!".to_string()
 }
 
 /// Commit `files` with `message`: `svn commit <files> --encoding utf-8
 /// -F <tmp>`, with `LANG` set to `locale` when given.
 ///
 /// PHP: the `svn commit` call in `ArcanistCommitWorkflow::run`
-/// (`src/workflow/ArcanistCommitWorkflow.php:148-164`). Returns raw
-/// stdout (the `Sending ... Committed revision N` progress) so callers
-/// can show it, like PHP's passthru.
+/// (`src/workflow/ArcanistCommitWorkflow.php:148-164`), which runs
+/// `phutil_passthru` (live stdio). Both pipes stream live like PHP's
+/// (T1153 CORE-65): the `Sending ... Committed revision N` progress
+/// lands on the console during the commit, and the caller gets only
+/// the status.
 pub fn commit_with_locale(
     dir: &Path,
     svn: &SvnCommand,
     files: &[&str],
     message: &str,
     locale: Option<&str>,
-) -> Result<String, String> {
+) -> Result<(), String> {
     let tmp = write_temp_file("svncommit", message.as_bytes())?;
     let tmp_name = tmp.to_string_lossy().into_owned();
     let mut argv: Vec<&str> = Vec::with_capacity(files.len() + 5);
@@ -1812,12 +1803,16 @@ pub fn commit_with_locale(
     if let Some(locale) = locale {
         cmd.env("LANG", locale);
     }
+    // T1153 CORE-65: PHP's `phutil_passthru` streams both pipes live,
+    // so both inherit the terminal here; nothing is captured.
+    cmd.stdout(std::process::Stdio::inherit());
+    cmd.stderr(std::process::Stdio::inherit());
     let out = spawn_output(&mut cmd).map_err(|e| format!("failed to run {}: {e}", svn.program))?;
     std::fs::remove_file(&tmp).ok();
     if !out.status.success() {
-        return Err(commit_failed_message(&out));
+        return Err(commit_failed_message());
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(())
 }
 
 /// Commit `files` with `message`, probing `LANG` on non-Windows.
@@ -1828,7 +1823,7 @@ pub fn commit_with(
     svn: &SvnCommand,
     files: &[&str],
     message: &str,
-) -> Result<String, String> {
+) -> Result<(), String> {
     #[cfg(windows)]
     let locale = None;
     #[cfg(not(windows))]
@@ -1837,7 +1832,7 @@ pub fn commit_with(
 }
 
 /// Commit `files` with `message` using the system binary.
-pub fn commit(dir: &Path, files: &[&str], message: &str) -> Result<String, String> {
+pub fn commit(dir: &Path, files: &[&str], message: &str) -> Result<(), String> {
     commit_with(dir, &SvnCommand::system(), files, message)
 }
 

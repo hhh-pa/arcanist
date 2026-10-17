@@ -13,22 +13,38 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::{config, git, grid, markers};
+use crate::{
+    argparse,
+    conduit::{self, EnvelopeKind},
+    config, get_config, git, grid, markers,
+};
 
 pub const NAME: &str = "branches";
 
-fn usage() -> String {
-    format!(
-        "usage: arc {NAME} [--all] [--json] [--conduit-uri URI]\n\
-         \n\
-         Show an enhanced view of branches in the working copy.\n\
-         \n\
-         Options:\n\
-         \x20 --all              include remote-tracking branches\n\
-         \x20 --json             emit a JSON array of branch objects\n\
-         \x20 --conduit-uri URI  conduit server (or ARC_CONDUIT_URI)\n\
-         \x20 -h, --help         show this help\n"
+/// T1153 R10: `--help` renders the generated workflow help
+/// (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+/// not a short custom usage string. The renderer is the shared
+/// `crate::help` module; this file keeps only the data (ceb
+/// `src/workflow/ArcanistBranchesWorkflow.php:16-30`).
+const HELP_EXAMPLES: &str = "**branches**";
+const HELP_SYNOPSIS: &str = "Show an enhanced view of branches in the working copy.";
+const HELP_TEXT: &str = "Lists branches in the working copy, annotated with additional information\nabout review status.";
+
+/// The full `--help` text via the shared renderer.
+fn usage_text(ansi: bool) -> String {
+    crate::help::usage_text(
+        NAME,
+        Some(HELP_EXAMPLES),
+        Some(HELP_SYNOPSIS),
+        Some(HELP_TEXT),
+        true,
+        &[],
+        ansi,
     )
+}
+
+fn usage() -> String {
+    usage_text(crate::terminal::ansi_enabled())
 }
 
 /// One listed branch (the `--json` shape).
@@ -51,40 +67,64 @@ pub struct Options {
     pub conduit_uri: Option<String>,
 }
 
+/// True when `-h`/`--help` appears before any `--` terminator (direct
+/// calls still reroute to usage; the binary strips standard help flags
+/// globally first).
+fn wants_help(argv: &[String]) -> bool {
+    let mut terminated = false;
+    for arg in argv {
+        if arg == "--" {
+            terminated = true;
+        } else if !terminated && (arg == "-h" || arg == "--help") {
+            return true;
+        }
+    }
+    false
+}
+
 /// Parse `argv` (excluding the subcommand name).
 ///
 /// Returns `Ok(None)` when `--help` was requested.
+///
+/// T1153 LAND-42: toolset workflows parse through
+/// `PhutilArgumentParser` (`parseWorkflowsFull`), so this shares the
+/// ported texts with `markers` (see there for the full list).
 pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
-    let mut all = false;
-    let mut json = false;
-    let mut conduit_uri = None;
-    let mut iter = argv.iter();
-    while let Some(arg) = iter.next() {
-        if arg == "--all" {
-            all = true;
-        } else if arg == "--json" {
-            json = true;
-        } else if arg == "--conduit-uri" {
-            let Some(value) = iter.next() else {
-                return Err("--conduit-uri requires a value".to_string());
-            };
-            conduit_uri = Some(value.clone());
-        } else if let Some(value) = arg.strip_prefix("--conduit-uri=") {
-            conduit_uri = Some(value.to_string());
-        } else if arg == "-h" || arg == "--help" {
-            return Ok(None);
-        } else if arg == "--" {
-            return Err("unexpected argument '--': branches takes no paths".to_string());
-        } else if arg.starts_with('-') {
-            return Err(format!("unknown flag '{arg}'"));
-        } else {
-            return Err(format!("unexpected argument '{arg}'"));
+    parse_options_with_tty(argv, crate::prompt::stdin_is_terminal())
+}
+
+/// [`parse_options`] with an injected TTY flag (deterministic tests).
+/// T1153 B21/B23: piped runs without `--` fail with
+/// `MISSING_TERMINATOR` (checked after unknown-flag scanning, like
+/// PHP's `parseFull()`, but before success). `--help` without `--`
+/// when piped reports the terminator. Vs ceb
+/// `ArcanistRuntime.php:80-86,172-188` and
+/// `PhutilArgumentParser.php:331-336`.
+fn parse_options_with_tty(argv: &[String], stdin_tty: bool) -> Result<Option<Options>, String> {
+    let missing = crate::help::terminator_missing(argv, stdin_tty);
+    if wants_help(argv) {
+        if missing {
+            return Err(crate::help::MISSING_TERMINATOR.to_string());
         }
+        return Ok(None);
+    }
+    let parsed = argparse::parse_toolset(
+        argv,
+        &[
+            argparse::FlagSpec::boolean("all"),
+            argparse::FlagSpec::boolean("json"),
+            argparse::FlagSpec::valued("conduit-uri", "uri"),
+        ],
+        false,
+        false,
+    )?;
+    if missing {
+        return Err(crate::help::MISSING_TERMINATOR.to_string());
     }
     Ok(Some(Options {
-        all,
-        json,
-        conduit_uri,
+        all: parsed.flag("all"),
+        json: parsed.flag("json"),
+        conduit_uri: parsed.value("conduit-uri").map(str::to_string),
     }))
 }
 
@@ -200,15 +240,47 @@ fn detect_vcs(dir: &Path) -> Option<&'static str> {
     }
 }
 
+/// Reject working copies whose VCS cannot list branches.
+///
+/// Shared by [`execute`] (ahead of conduit setup, per PHP's
+/// `getRepositoryAPI` order) and `execute_core` (the test seam).
+fn check_branches_support(dir: &Path) -> Result<&'static str, String> {
+    let vcs = detect_vcs(dir).unwrap_or("filesystem");
+    if !markers::supports_marker_type(vcs, markers::MARKER_TYPE_BRANCH) {
+        return Err(markers::support_error(vcs, markers::MARKER_TYPE_BRANCH));
+    }
+    Ok(vcs)
+}
+
 /// Run the workflow rooted at `dir`, returning stdout text or an error message.
 pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => return Ok(usage()),
-        Err(message) => return Err(format!("{message}\n\n{}", usage())),
+        // T1153 RB-D4 (R4): PHP renders usage errors with no dump.
+        Err(message) => return Err(message),
     };
-    let owned_client = config::client_for(options.conduit_uri.as_deref()).ok();
-    execute_core(dir, &options, grid::terminal_width(), owned_client.as_ref())
+    if options.json {
+        // The `--json` extension never calls conduit; it stays offline.
+        return execute_core(dir, &options, grid::terminal_width(), None);
+    }
+    // T1153 LAND-28: the working-copy/support gate runs before
+    // conduit setup — PHP's getRepositoryAPI (and its usage error)
+    // precedes the marker query.
+    check_branches_support(dir)?;
+    // T1153 LAND-23: the engine needs conduit (tokenless when only
+    // credentials are missing — calls then fail mapped); without a
+    // URI the setup block replaces the grid.
+    let owned_client = match config::client_for_tokenless_with(
+        options.conduit_uri.as_deref(),
+        dir,
+        config::arcrc_path().as_deref(),
+        &get_config::LoadOptions::default(),
+    ) {
+        Ok(client) => client,
+        Err(message) => return Err(conduit::toolset_setup_message(&message)),
+    };
+    execute_core(dir, &options, grid::terminal_width(), Some(&owned_client))
 }
 
 /// Run the workflow with an explicit terminal width and conduit client.
@@ -223,7 +295,8 @@ pub fn execute_with_client(
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => return Ok(usage()),
-        Err(message) => return Err(format!("{message}\n\n{}", usage())),
+        // T1153 RB-D4 (R4): PHP renders usage errors with no dump.
+        Err(message) => return Err(message),
     };
     execute_core(dir, &options, terminal, client)
 }
@@ -234,6 +307,11 @@ fn execute_core(
     terminal: Option<usize>,
     client: Option<&crate::conduit::Client>,
 ) -> Result<String, String> {
+    // T1153 LAND-28: outside a repository PHP resolves a
+    // `filesystem` API, whose empty marker-type list fails the
+    // support check (usage error, like the `svn` gate this matches).
+    // The gate runs ahead of both renderers.
+    let vcs = check_branches_support(dir)?;
     if options.json {
         return match detect_vcs(dir) {
             Some("hg") => {
@@ -264,10 +342,6 @@ fn execute_core(
             }
         };
     }
-    let vcs = detect_vcs(dir).ok_or_else(|| "not inside a git repository".to_string())?;
-    if !markers::supports_marker_type(vcs, markers::MARKER_TYPE_BRANCH) {
-        return Err(markers::support_error(vcs, markers::MARKER_TYPE_BRANCH));
-    }
     markers::run_workflow(
         dir,
         vcs,
@@ -285,8 +359,39 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(message) => {
-            eprintln!("arc {NAME}: {message}");
-            ExitCode::FAILURE
+            // T1153 B21/B23: the terminator failure prints the three
+            // cyan hints first (like `ArcanistRuntime.php:172-188`).
+            if message == crate::help::MISSING_TERMINATOR {
+                crate::help::print_terminator_hints(crate::terminal::ansi_enabled());
+            }
+            // T1153 CORE-5: auth-coded query failures render login
+            // guidance (the toolset runtime's auth arm). The calls
+            // went out on a strict client, re-resolved here for the
+            // mapping context (config reads only, no I/O).
+            let client = parse_options(argv)
+                .ok()
+                .flatten()
+                .and_then(|options| config::client_for(options.conduit_uri.as_deref()).ok());
+            if let Some(client) = client
+                && let Some(code) = conduit::auth_report_for(&client, &message)
+            {
+                return code;
+            }
+            // T1153 RB-D4 (R4): `branches` runs in the toolset
+            // runtime (via `ArcanistMarkersWorkflow`). Argument,
+            // support-gate, and limit errors render the red `USAGE
+            // EXCEPTION` label (exit 1); query and render failures
+            // escape into a fatal (255). (T1153 RB-D4's "outside-repo
+            // branches exits 255" does not reproduce at ceb: the
+            // support gate throws `PhutilArgumentUsageException`,
+            // caught at `ArcanistRuntime.php:38-39` — exit 1.)
+            let kind =
+                if parse_options(argv).is_err() || markers::is_toolset_usage_message(&message) {
+                    EnvelopeKind::ToolsetUsage
+                } else {
+                    EnvelopeKind::Fatal
+                };
+            conduit::report(kind, &message)
         }
     }
 }

@@ -6,26 +6,78 @@ fn args(v: &[&str]) -> Vec<String> {
 
 #[test]
 fn parses_empty_and_thing_words() {
-    assert_eq!(parse_args(&args(&[])).unwrap(), Some(Vec::new()));
+    // T1153 B21/B23: TTY runs need no `--`.
     assert_eq!(
-        parse_args(&args(&["remotes"])).unwrap(),
+        parse_args_with_tty(&args(&[]), true).unwrap(),
+        Some(Vec::new())
+    );
+    assert_eq!(
+        parse_args_with_tty(&args(&["remotes"]), true).unwrap(),
         Some(args(&["remotes"]))
     );
     assert_eq!(
-        parse_args(&args(&["--", "big", "rock"])).unwrap(),
+        parse_args_with_tty(&args(&["--", "big", "rock"]), true).unwrap(),
         Some(args(&["big", "rock"]))
     );
 }
 
 #[test]
 fn parses_help() {
-    assert_eq!(parse_args(&args(&["--help"])).unwrap(), None);
-    assert_eq!(parse_args(&args(&["-h"])).unwrap(), None);
+    // T1153 B21/B23: TTY runs need no `--`.
+    assert_eq!(parse_args_with_tty(&args(&["--help"]), true).unwrap(), None);
+    assert_eq!(parse_args_with_tty(&args(&["-h"]), true).unwrap(), None);
 }
 
 #[test]
 fn rejects_unknown_flags() {
-    assert!(parse_args(&args(&["--bogus"])).is_err());
+    // T1153 B21/B23: TTY runs need no `--`.
+    assert!(parse_args_with_tty(&args(&["--bogus"]), true).is_err());
+}
+
+#[test]
+fn b21_look_requires_terminator_when_piped() {
+    // T1153 B21/B23: piped without `--` reports the terminator, even
+    // for `--help` and empty argv. Unknown flags still report first.
+    assert_eq!(
+        parse_args_with_tty(&args(&[]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    assert_eq!(
+        parse_args_with_tty(&args(&["--help"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    assert_eq!(
+        parse_args_with_tty(&args(&["remotes"]), false),
+        Err(crate::help::MISSING_TERMINATOR.to_string())
+    );
+    let err = parse_args_with_tty(&args(&["--bogus"]), false).unwrap_err();
+    assert!(err.contains("unknown flag"), "unexpected: {err}");
+    assert!(
+        parse_args_with_tty(&args(&["--"]), false)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        parse_args_with_tty(&args(&["--", "remotes"]), false)
+            .unwrap()
+            .is_some()
+    );
+    assert!(parse_args_with_tty(&args(&[]), true).unwrap().is_some());
+    assert_eq!(
+        crate::help::MISSING_TERMINATOR,
+        "Missing required \"--\" in argument list."
+    );
+}
+
+#[test]
+fn b23_look_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help look`.
+    let text = usage_text(false);
+    assert!(text.starts_with("LOOK WORKFLOW\n"), "{text}");
+    assert!(text.contains("small clearing"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
 
 #[test]
@@ -208,6 +260,37 @@ fn git_uri_normalization_matches_normalizer() {
 }
 
 #[test]
+fn rbd10_normalization_follows_phutil_uri_edges() {
+    // The shared `revision` port decides the `PhutilURI` edges: dotless
+    // `host:path` is a scheme (not scp), digit tails are ports (not
+    // paths), query strings never reach the path, garbage ports void
+    // the URI, and drive letters split as schemes.
+    for uri in [
+        "localhost:repo",
+        "host:22",
+        "a:b:c",
+        "ssh://host/repo?x=1",
+        "ssh://host:abc/repo",
+        "ssh://host:22/repo",
+        "C:\\repo",
+        "C:/repo",
+        "user@host:/repo",
+        "git@domain.com:bananas.git",
+    ] {
+        assert_eq!(
+            normalize_git_uri(uri),
+            crate::revision::normalize_git_uri(uri),
+            "for {uri}"
+        );
+    }
+    assert_eq!(normalize_git_uri("localhost:repo"), "<void>/repo");
+    assert_eq!(normalize_git_uri("host:22"), "<void>/22");
+    assert_eq!(normalize_git_uri("ssh://host/repo?x=1"), "host/repo");
+    assert_eq!(normalize_git_uri("ssh://host:abc/repo"), "<void>/");
+    assert_eq!(normalize_git_uri("C:\\repo"), "<void>/\\repo");
+}
+
+#[test]
 fn repository_search_parses_names_uris_and_rules() {
     let value = serde_json::json!({
         "data": [
@@ -264,6 +347,8 @@ fn repository_search_uses_constraints_shape() {
 
 #[test]
 fn repository_matching_uses_normalized_uris() {
+    // T1153 RB-D11: normalized comparison, last match wins on
+    // collisions (like PHP's `$uri_map` overwrite).
     let repos = vec![RepositoryRef {
         name: "repo".to_string(),
         uris: vec!["ssh://git@h.test/repo.git".to_string()],
@@ -275,6 +360,22 @@ fn repository_matching_uses_normalized_uris() {
     );
     assert_eq!(match_repository(&repos, "git@h.test:other"), None);
     assert_eq!(match_repository(&[], "git@h.test:repo"), None);
+    let colliding = vec![
+        RepositoryRef {
+            name: "first".to_string(),
+            uris: vec!["ssh://git@h.test/repo.git".to_string()],
+            permanent_rules: None,
+        },
+        RepositoryRef {
+            name: "second".to_string(),
+            uris: vec!["ssh://git@h.test/repo.git".to_string()],
+            permanent_rules: None,
+        },
+    ];
+    assert_eq!(
+        match_repository(&colliding, "git@h.test:repo").map(|r| r.name.as_str()),
+        Some("second")
+    );
 }
 
 #[test]
@@ -971,4 +1072,94 @@ fn fixed_tz_subprocesses_match_oracles() {
             "TZ={tz} probe child failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
         );
     }
+}
+
+#[test]
+fn r3_rbd11_resolve_repositories_follows_after_cursor() {
+    fn repo_row(name: &str, uri: &str) -> serde_json::Value {
+        serde_json::json!({
+            "fields": {"name": name},
+            "attachments": {"uris": {"uris": [
+                {"fields": {"uri": {"effective": uri}}},
+            ]}},
+        })
+    }
+    let seen: std::cell::RefCell<Vec<serde_json::Value>> = std::cell::RefCell::new(Vec::new());
+    let call = |method: &str, params: &serde_json::Value| {
+        assert_eq!(method, "diffusion.repository.search");
+        seen.borrow_mut().push(params.clone());
+        if seen.borrow().len() == 1 {
+            Ok(serde_json::json!({
+                "data": [repo_row("one", "git@h.test:one.git")],
+                "cursor": {"after": "p2"},
+            }))
+        } else {
+            Ok(serde_json::json!({
+                "data": [repo_row("two", "git@h.test:two.git")],
+            }))
+        }
+    };
+    let uris = vec!["git@h.test:one.git".to_string()];
+    let repos = resolve_repositories(&call, &uris).unwrap();
+    assert_eq!(repos.len(), 2);
+    assert_eq!(repos[0].name, "one");
+    assert_eq!(repos[1].name, "two");
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[0].get("after").is_none());
+    assert_eq!(seen[1]["after"], serde_json::json!("p2"));
+    assert_eq!(
+        seen[1]["attachments"],
+        serde_json::json!({"uris": true}),
+        "attachments survive onto page two"
+    );
+}
+
+#[test]
+fn r3_rbd11_match_repository_prefers_last_on_collision() {
+    let repos = vec![
+        RepositoryRef {
+            name: "first".to_string(),
+            uris: vec!["git@h.test:repo.git".to_string()],
+            permanent_rules: None,
+        },
+        RepositoryRef {
+            name: "second".to_string(),
+            uris: vec!["ssh://git@h.test/repo".to_string()],
+            permanent_rules: None,
+        },
+    ];
+    assert_eq!(
+        match_repository(&repos, "git@h.test:repo").map(|r| r.name.as_str()),
+        Some("second")
+    );
+}
+
+#[test]
+fn r4_rbd4_parse_error_has_no_dump() {
+    // `look` runs in the toolset runtime: argument errors render
+    // `USAGE EXCEPTION` (exit 1) with no usage dump.
+    assert_eq!(run(&args(&["--bogus"])), std::process::ExitCode::FAILURE);
+}
+#[test]
+fn r10_look_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "LOOK WORKFLOW\n\
+         \n\
+         look\n\
+         look [options] -- thing\n\
+         You stand in the middle of a small clearing.\n\
+         \n\
+         Look around, or look at a specific thing.\n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("LOOK WORKFLOW"), "{}", usage());
 }

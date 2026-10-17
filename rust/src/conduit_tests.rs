@@ -126,6 +126,7 @@ fn stores_session_from_connect_result() {
 
 #[test]
 fn rejects_non_object_params() {
+    // T1153 CORE-14 (kept): scalar stdin is a clean error, not a fatal.
     let client = test_client();
     let err = client.call("m", &serde_json::json!([1])).unwrap_err();
     assert_eq!(
@@ -145,7 +146,9 @@ fn parses_success_response() {
 
 #[test]
 fn parses_api_error_with_method_prefix() {
-    // PHP `ConduitClientException` messages are `<method> info`.
+    // T1153 CORE-1: at ceb `ConduitClientException` is `"{code}: {info}"`
+    // with no `<method>` infix (the infix was a newer-baseline artifact);
+    // `info` is the raw `error_info`.
     let err = parse_response(
         r#"{"result": null, "error_code": "E", "error_info": "no"}"#,
         "user.whoami",
@@ -155,7 +158,7 @@ fn parses_api_error_with_method_prefix() {
         err,
         Error::Api {
             code: "E".to_string(),
-            info: "<user.whoami> no".to_string()
+            info: "no".to_string()
         }
     );
 }
@@ -413,5 +416,349 @@ fn signs_requests_with_known_vector() {
          CPkOVhWm9lM7/vFB9/6u9ToVeU/tyM62oYWs7S2gAkvnS+8NYIEO2sYv77m5nmVE99qXD/SLiCMAZsYT3NLN+QgGBojwNrcfg\
          of9Lip9ivQppVi+Srhwam3Zjmg2VUDWb/JUfQt4Fb9CwUWpVgiy+4JJaN7ZU4UnDhP6d7udHk/9BdOcKNj3M5rYgP75ILXDTL\
          EkNIkhFwvCIsCTgj+/AokXD+Ozpue+wARFT2/pR1lsKb4LXyv8uG0f/fbg=="
+    );
+}
+
+#[test]
+fn r3_search_pages_follows_after_until_null() {
+    let seen: std::cell::RefCell<Vec<serde_json::Value>> = std::cell::RefCell::new(Vec::new());
+    let call = |method: &str, params: &serde_json::Value| {
+        assert_eq!(method, "differential.revision.search");
+        seen.borrow_mut().push(params.clone());
+        if seen.borrow().len() == 1 {
+            Ok(serde_json::json!({"data": [{"id": 1}], "cursor": {"after": "c1"}}))
+        } else {
+            Ok(serde_json::json!({"data": [{"id": 2}]}))
+        }
+    };
+    let base = serde_json::json!({"constraints": {"ids": [1, 2]}});
+    let pages = search_pages(&call, "differential.revision.search", &base).unwrap();
+    assert_eq!(pages.len(), 2);
+    assert_eq!(pages[0]["data"][0]["id"], serde_json::json!(1));
+    assert_eq!(pages[1]["data"][0]["id"], serde_json::json!(2));
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[0].get("after").is_none());
+    assert_eq!(seen[1]["after"], serde_json::json!("c1"));
+    assert_eq!(seen[1]["constraints"], serde_json::json!({"ids": [1, 2]}));
+}
+
+#[test]
+fn r3_search_pages_single_page_without_cursor_calls_once() {
+    let calls = std::cell::Cell::new(0);
+    let call = |_method: &str, _params: &serde_json::Value| {
+        calls.set(calls.get() + 1);
+        Ok(serde_json::json!({"data": [], "cursor": {"after": null}}))
+    };
+    let pages = search_pages(&call, "file.search", &serde_json::json!({})).unwrap();
+    assert_eq!(pages.len(), 1);
+    assert_eq!(calls.get(), 1);
+}
+
+#[test]
+fn r4_core6_conduit_errors_render_bare() {
+    // No `transport error:` / `protocol error:` / `conduit error`
+    // infix: PHP prints the raw message under the envelope.
+    assert_eq!(Error::Transport("boom".to_string()).to_string(), "boom");
+    assert_eq!(
+        Error::Protocol("bad frame".to_string()).to_string(),
+        "bad frame"
+    );
+    // Exactly `ConduitClientException` (`"{code}: {info}"`).
+    assert_eq!(
+        Error::Api {
+            code: "ERR-CONDUIT-CORE".to_string(),
+            info: "nope".to_string(),
+        }
+        .to_string(),
+        "ERR-CONDUIT-CORE: nope"
+    );
+}
+
+#[test]
+fn r4_core6_envelope_exit_codes() {
+    use std::process::ExitCode;
+    assert_eq!(EnvelopeKind::NoEffect.exit_code(), ExitCode::SUCCESS);
+    assert_eq!(EnvelopeKind::Fatal.exit_code(), ExitCode::from(EXIT_FATAL));
+    assert_eq!(EXIT_FATAL, 255);
+    for kind in [
+        EnvelopeKind::Usage,
+        EnvelopeKind::Exception,
+        EnvelopeKind::ToolsetUsage,
+        EnvelopeKind::ToolsetConduit,
+        EnvelopeKind::UserAbort,
+    ] {
+        assert_eq!(kind.exit_code(), ExitCode::FAILURE, "{kind:?}");
+    }
+    assert!(EnvelopeKind::NoEffect.uses_stdout());
+    assert!(!EnvelopeKind::Usage.uses_stdout());
+    assert!(!EnvelopeKind::Fatal.uses_stdout());
+}
+
+#[test]
+fn r4_core6_subprocess_arms_render_plain() {
+    assert_eq!(
+        EnvelopeKind::NoEffect.render("No linters to run.", false),
+        "No linters to run.\n"
+    );
+    assert_eq!(
+        EnvelopeKind::Usage.render("oops", false),
+        "Usage Exception: oops\n"
+    );
+    // Usage messages are rstripped like PHP (`:436`).
+    assert_eq!(
+        EnvelopeKind::Usage.render("oops  \n", false),
+        "Usage Exception: oops\n"
+    );
+    assert_eq!(
+        EnvelopeKind::Exception.render("boom", false),
+        " Exception \nboom\n(Run with `--trace` for a full exception trace.)\n"
+    );
+}
+
+#[test]
+fn r4_core6_toolset_arms_render_plain() {
+    assert_eq!(
+        EnvelopeKind::ToolsetUsage.render("oops", false),
+        " USAGE EXCEPTION  oops\n"
+    );
+    assert_eq!(
+        EnvelopeKind::ToolsetConduit.render("oops", false),
+        " CONDUIT  oops\n"
+    );
+    assert_eq!(
+        EnvelopeKind::UserAbort.render("User aborted the workflow.", false),
+        " ---  User aborted the workflow.\n"
+    );
+    // Fatal: the raw message only (the PHP trace is unportable).
+    assert_eq!(EnvelopeKind::Fatal.render("boom", false), "boom\n");
+}
+
+#[test]
+fn r4_core6_usage_bold_on_tty() {
+    assert_eq!(
+        EnvelopeKind::Usage.render("oops", true),
+        "\x1b[1mUsage Exception:\x1b[m oops\n"
+    );
+    let banner = EnvelopeKind::Exception.render("boom", true);
+    assert!(banner.contains("\x1b[41m"), "{banner:?}");
+    assert!(banner.contains("Exception"), "{banner:?}");
+}
+
+#[test]
+fn core3_base_uri_strips_configured_path() {
+    // PHP replaces the whole path (`setPath('/api/'.$method)`), so a
+    // configured path never leaks into the request path.
+    assert_eq!(
+        normalize_base("http://h.test:8080/foo"),
+        "http://h.test:8080/api/"
+    );
+    assert_eq!(
+        normalize_base("https://h.test/foo/bar/"),
+        "https://h.test/api/"
+    );
+    assert_eq!(test_client().base_uri(), "https://conduit.test/api/");
+}
+
+#[test]
+fn core5_auth_guidance_login_blocks() {
+    // Tokenless `ERR-INVALID-SESSION` maps to the login block with the
+    // server domain and the install command (path `/`).
+    let guidance =
+        auth_guidance("ERR-INVALID-SESSION", false, "https://phab.example/api/").unwrap();
+    assert_eq!(guidance.title, "LOGIN REQUIRED");
+    assert_eq!(guidance.summary, "Conduit API login required.");
+    assert!(guidance.body.contains("phab.example"), "{}", guidance.body);
+    assert!(
+        guidance
+            .body
+            .contains("arc install-certificate https://phab.example/"),
+        "{}",
+        guidance.body
+    );
+    assert!(
+        guidance.body.contains("run this command:"),
+        "{}",
+        guidance.body
+    );
+}
+
+#[test]
+fn core5_auth_guidance_invalid_credentials() {
+    // `ERR-INVALID-AUTH` maps with or without a token.
+    for has_token in [false, true] {
+        let guidance = auth_guidance(
+            "ERR-INVALID-AUTH",
+            has_token,
+            "http://h.test:8080/api/conduit.ping",
+        )
+        .unwrap();
+        assert_eq!(guidance.title, "INVALID CREDENTIALS");
+        assert_eq!(guidance.summary, "Invalid Conduit API credentials.");
+        // The prose domain excludes the port; the install URI keeps it.
+        assert!(guidance.body.contains("\"h.test\""), "{}", guidance.body);
+        assert!(
+            guidance
+                .body
+                .contains("arc install-certificate http://h.test:8080/"),
+            "{}",
+            guidance.body
+        );
+    }
+}
+
+#[test]
+fn core5_auth_guidance_passthrough() {
+    // A tokened `ERR-INVALID-SESSION` rethrows the original (`break`),
+    // and unknown codes never map.
+    assert_eq!(
+        auth_guidance("ERR-INVALID-SESSION", true, "https://h/"),
+        None
+    );
+    assert_eq!(auth_guidance("ERR-CONDUIT-CORE", false, "https://h/"), None);
+    assert_eq!(auth_guidance("ERR-OTHER", true, "https://h/"), None);
+    assert_eq!(
+        auth_error_code("ERR-INVALID-AUTH: bad"),
+        Some("ERR-INVALID-AUTH")
+    );
+    assert_eq!(
+        auth_error_code("ERR-INVALID-SESSION: gone"),
+        Some("ERR-INVALID-SESSION")
+    );
+    assert_eq!(auth_error_code("query failed: ERR-INVALID-AUTH: bad"), None);
+    assert_eq!(auth_error_code("boom"), None);
+}
+
+#[test]
+fn core5_no_uri_block_shape() {
+    // `raiseURIException()` block: wrapped paragraph, blank line,
+    // three `      - ` items, trailing blank line.
+    let block = no_uri_block();
+    assert!(
+        block.starts_with("This command needs to communicate with Phabricator,"),
+        "{block:?}"
+    );
+    for item in [
+        "Run in a working copy with \"phabricator.uri\" set in \".arcconfig\".",
+        "Set a default URI with `arc set-config phabricator.uri <uri>`.",
+        "Specify a URI explicitly with `--config phabricator.uri=<uri>`.",
+    ] {
+        assert!(block.contains(&format!("      - {item}")), "{block:?}");
+    }
+    assert!(block.ends_with("\n\n"), "{block:?}");
+    assert_eq!(
+        toolset_setup_message("no conduit URI: pass --conduit-uri"),
+        block
+    );
+    assert_eq!(
+        toolset_setup_message("Custom arcrc file was specified, but it was not found!"),
+        "Custom arcrc file was specified, but it was not found!"
+    );
+}
+
+#[test]
+fn core8_tls_trusts_listed_domains() {
+    let tls = TlsConfig {
+        cabundle: None,
+        blind_trust: vec!["phab.example".to_string()],
+    };
+    assert!(tls.trusts_domain("https://phab.example/api/"));
+    assert!(tls.trusts_domain("https://PHAB.EXAMPLE:8080/foo"));
+    assert!(!tls.trusts_domain("https://other.example/"));
+    assert!(!TlsConfig::default().trusts_domain("https://phab.example/"));
+}
+
+#[test]
+fn core8_tls_client_build_paths() {
+    // Blind trust builds (no I/O); a missing bundle fails transport-class.
+    let tls = TlsConfig {
+        cabundle: None,
+        blind_trust: vec!["phab.example".to_string()],
+    };
+    let client = Client::new_with_tls("https://phab.example/", "t", &tls).unwrap();
+    assert_eq!(client.base_uri(), "https://phab.example/api/");
+    let tls = TlsConfig {
+        cabundle: Some(std::path::PathBuf::from("/nonexistent-ca-bundle.pem")),
+        blind_trust: Vec::new(),
+    };
+    let err = Client::new_with_tls("https://phab.example/", "t", &tls).unwrap_err();
+    assert!(
+        err.to_string().contains("failed to read CA bundle"),
+        "{err}"
+    );
+}
+
+#[test]
+fn rbd8_auth_identity_cache_roundtrips() {
+    // PHP caches the auth identity on the workflow; `user_phid`
+    // helpers consult this before calling `user.whoami`.
+    let client = test_client();
+    assert_eq!(client.authenticated_user(), None);
+    client.set_authenticated_user("alice", "PHID-USER-1");
+    assert_eq!(
+        client.authenticated_user(),
+        Some(("alice".to_string(), "PHID-USER-1".to_string()))
+    );
+}
+
+#[test]
+fn land22_cached_user_phid_reuses_handshake() {
+    // T1153 LAND-22: a cached handshake identity answers without any
+    // `user.whoami` call (no network here: the test client points at
+    // an unroutable host, so a call would fail loudly).
+    let client = test_client();
+    assert_eq!(client.authenticated_user(), None);
+    client.set_authenticated_user("alice", "PHID-USER-1");
+    assert_eq!(client.cached_user_phid().unwrap(), "PHID-USER-1");
+}
+
+#[test]
+fn unitu21_wire_escapes_non_ascii_like_php() {
+    // T1153 UNIT-U21: PHP `json_encode()` emits lowercase `\uXXXX`
+    // (surrogate pairs past U+FFFF); ASCII — including serde's own
+    // escapes and the caller's `\/` — passes through untouched.
+    assert_eq!(escape_non_ascii_json(r#"{"a":1}"#), r#"{"a":1}"#);
+    assert_eq!(escape_non_ascii_json("a\\/b\"c\\\\d"), "a\\/b\"c\\\\d");
+    assert_eq!(escape_non_ascii_json("é"), "\\u00e9");
+    assert_eq!(escape_non_ascii_json("ü/中"), "\\u00fc/\\u4e2d");
+    assert_eq!(escape_non_ascii_json("😀"), "\\ud83d\\ude00");
+    assert_eq!(escape_non_ascii_json("a\u{2028}b"), "a\\u2028b");
+}
+
+#[test]
+fn unitu21_call_body_carries_escaped_params() {
+    // T1153 UNIT-U21: end to end through `encode_call_body` (offline:
+    // no gzip capability, no post): the form body carries the
+    // `\uXXXX` escapes rawurlencoded, never raw UTF-8.
+    let client = test_client();
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "name".to_string(),
+        serde_json::Value::String("héllo.wörld/a".to_string()),
+    );
+    let (body, gzipped) = client.encode_call_body("conduit.ping", &mut map).unwrap();
+    assert!(!gzipped);
+    let body = String::from_utf8(body).unwrap();
+    assert!(body.contains("%5Cu00e9"), "{body}");
+    assert!(body.contains("%5Cu00f6"), "{body}");
+    assert!(body.contains("%5C%2F"), "{body}");
+    assert!(!body.contains("é"), "{body}");
+    assert!(!body.contains("ö"), "{body}");
+}
+
+#[test]
+fn core16_toolset_parse_error_is_bold() {
+    // Bold `**Usage Exception:**` rendering like `Usage` (the toolset
+    // `parse()` catch), exit 1; `report()` rethrows only
+    // `Usage`/`Exception` under `--trace`, never this arm.
+    let rendered = EnvelopeKind::ToolsetParseError.render("boom", false);
+    assert_eq!(rendered, "Usage Exception: boom\n");
+    assert_eq!(
+        EnvelopeKind::ToolsetParseError.exit_code(),
+        std::process::ExitCode::FAILURE
+    );
+    assert_eq!(
+        ClassifiedError::toolset_parse_error("boom".to_string()).report(),
+        std::process::ExitCode::FAILURE
     );
 }

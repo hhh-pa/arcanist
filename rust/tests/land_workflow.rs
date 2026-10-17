@@ -95,9 +95,10 @@ fn args(list: &[&str]) -> Vec<String> {
 }
 
 fn make_feature(repo: &Fixture) {
+    // LAND-6: commits name D1 so the online mock script can associate them.
     repo.git(&["checkout", "-qb", "feature"]);
-    repo.commit_file("a.txt", "a\n", "add a");
-    repo.commit_file("b.txt", "b\n", "add b");
+    repo.commit_file("a.txt", "a\n", "add a\n\nDifferential Revision: D1");
+    repo.commit_file("b.txt", "b\n", "add b\n\nDifferential Revision: D1");
 }
 
 /// Repo with a local `origin` (land requires a pushable remote) plus the
@@ -124,11 +125,192 @@ fn temp_home(tag: &str) -> common::HomeGuard {
 }
 
 /// Run the engine with scripted answers and an isolated HOME, so conduit
-/// discovery always takes the offline path.
+/// discovery always fails. Only fits flows that fail before Conduit is
+/// needed (LAND-6: everything else requires Conduit now).
 fn run_engine(dir: &Path, list: &[&str], answers: &[&str]) -> Result<land::Out, String> {
     let _guard = temp_home("engine");
     let mut io = land::Io::canned(answers);
-    land::execute_with_io(dir, &args(list), &mut io)
+    // T1153 B21/B23: piped runs carry `--` (appended centrally here).
+    let mut full = args(list);
+    full.push("--".to_string());
+    land::execute_with_io(dir, &full, &mut io)
+}
+
+/* LAND-6: mock Conduit over HTTP for the online engine flows. */
+
+/// Read one request head (through the blank line) from a mock
+/// connection.
+fn read_mock_head(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        if stream.read_exact(&mut byte).is_err() {
+            break;
+        }
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    head
+}
+
+/// `Content-Length` of a mock request head (either case), else 0.
+fn mock_content_length(head: &str) -> usize {
+    head.lines()
+        .find_map(|line| {
+            line.strip_prefix("Content-Length: ")
+                .or_else(|| line.strip_prefix("content-length: "))
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// Conduit method from a mock request line (`/api/<method>`).
+fn mock_method(head: &str) -> String {
+    head.lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|path| path.strip_prefix("/api/"))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Success envelope for a canned method, or the loud
+/// `ERR-UNKNOWN-METHOD` envelope.
+fn mock_payload(responses: &HashMap<String, serde_json::Value>, method: &str) -> serde_json::Value {
+    match responses.get(method) {
+        Some(result) => serde_json::json!({
+            "error_code": null,
+            "error_info": null,
+            "result": result,
+        }),
+        None => serde_json::json!({
+            "error_code": "ERR-UNKNOWN-METHOD",
+            "error_info": format!("<{method}> no canned response"),
+            "result": null,
+        }),
+    }
+}
+
+/// Serve `responses` (Conduit method -> `result` payload) on a loopback
+/// mock server. Returns the `--conduit-uri` base plus a receiver collecting
+/// one `(method, raw body)` per request. Unknown methods fail loudly with
+/// an `ERR-UNKNOWN-METHOD` envelope.
+fn serve_methods(
+    responses: HashMap<String, serde_json::Value>,
+) -> (String, std::sync::mpsc::Receiver<(String, Vec<u8>)>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}/api/");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = match stream {
+                Ok(stream) => stream,
+                Err(_) => break,
+            };
+            let head = String::from_utf8_lossy(&read_mock_head(&mut stream)).to_string();
+            let len = mock_content_length(&head);
+            let mut body = vec![0u8; len];
+            if stream.read_exact(&mut body).is_err() {
+                continue;
+            }
+            let method = mock_method(&head);
+            tx.send((method.clone(), body)).ok();
+            let payload = mock_payload(&responses, &method);
+            let text = serde_json::to_string(&payload).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                text.len(),
+                text
+            );
+            if stream.write_all(response.as_bytes()).is_err() {
+                break;
+            }
+        }
+    });
+    (base, rx)
+}
+
+/// Standard online script: both feature commits name D1 (accepted,
+/// owner-authored), no parents or builds, and a canned landed message.
+fn online_responses() -> HashMap<String, serde_json::Value> {
+    HashMap::from([
+        (
+            "differential.revision.search".to_string(),
+            serde_json::json!({"data": [{
+                "id": 1,
+                "phid": "PHID-DREV-1",
+                "fields": {
+                    "status": {"value": "accepted", "name": "Accepted", "closed": false},
+                    "title": "Work 1",
+                    "authorPHID": "PHID-USER-owner",
+                    "diffPHID": "PHID-DIFF-1",
+                },
+            }]}),
+        ),
+        ("differential.query".to_string(), serde_json::json!([])),
+        (
+            "user.whoami".to_string(),
+            serde_json::json!({"phid": "PHID-USER-owner", "userName": "owner"}),
+        ),
+        ("edge.search".to_string(), serde_json::json!({"data": []})),
+        (
+            "harbormaster.buildable.search".to_string(),
+            serde_json::json!({"data": []}),
+        ),
+        (
+            "differential.getcommitmessage".to_string(),
+            serde_json::json!("Land feature\n\nadd a\nadd b\n"),
+        ),
+        ("user.search".to_string(), serde_json::json!({"data": []})),
+    ])
+}
+
+/// Install an isolated HOME whose `.arcrc` carries a token for `base`.
+fn home_with_token(tag: &str, base: &str) -> common::HomeGuard {
+    let home = std::env::temp_dir().join(format!(
+        "arc-rs-land-home-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join(".arcrc"),
+        serde_json::json!({"hosts": {base: {"token": "test-token"}}}).to_string(),
+    )
+    .unwrap();
+    with_owned_home(home)
+}
+
+/// Run the engine online against `responses`, with scripted answers.
+fn run_online_with(
+    responses: HashMap<String, serde_json::Value>,
+    dir: &Path,
+    list: &[&str],
+    answers: &[&str],
+) -> Result<land::Out, String> {
+    let (base, _seen) = serve_methods(responses);
+    let _guard = home_with_token("engine", &base);
+    let mut full: Vec<String> = list.iter().map(|item| (*item).to_string()).collect();
+    full.push("--conduit-uri".to_string());
+    full.push(base);
+    // T1153 B21/B23: piped runs carry `--` (appended centrally here).
+    full.push("--".to_string());
+    let mut io = land::Io::canned(answers);
+    land::execute_with_io(dir, &full, &mut io)
+}
+
+/// Run the engine online against the standard script.
+fn run_online(dir: &Path, list: &[&str], answers: &[&str]) -> Result<land::Out, String> {
+    run_online_with(online_responses(), dir, list, answers)
 }
 
 #[test]
@@ -138,11 +320,14 @@ fn module_name_is_land() {
 
 #[test]
 fn run_uses_current_dir() {
+    // T1153 B21/B23: piped runs carry `--`.
+    // LAND-6: `--preview` needs Conduit too, so this contract runs online.
     let (repo, _bare) = repo_with_origin("run-contract");
     let old = std::env::current_dir().unwrap();
     std::env::set_current_dir(repo.path()).unwrap();
-    let _guard = temp_home("run-contract");
-    let code = land::run(&args(&["--preview"]));
+    let (base, _seen) = serve_methods(online_responses());
+    let _guard = home_with_token("run-contract", &base);
+    let code = land::run(&args(&["--preview", "--conduit-uri", &base, "--"]));
     std::env::set_current_dir(&old).unwrap();
     assert_eq!(code, ExitCode::SUCCESS);
     // Unchanged: still on the feature branch.
@@ -151,30 +336,34 @@ fn run_uses_current_dir() {
 
 #[test]
 fn help_succeeds_and_prints_usage() {
+    // T1153 B21/B23: piped runs carry `--`; `--help` asserts the generated `LAND WORKFLOW` help.
     let repo = Fixture::init_repo("help");
-    let out = land::execute(repo.path(), &args(&["--help"])).unwrap();
-    assert!(out.stdout.contains("usage: arc land"), "{}", out.stdout);
+    let out = land::execute(repo.path(), &args(&["--help", "--"])).unwrap();
+    // T1153 R10: `--help` renders the generated workflow help.
+    assert!(out.stdout.contains("LAND WORKFLOW"), "{}", out.stdout);
     assert_eq!(
-        land::run_in(repo.path(), &args(&["--help"])),
+        land::run_in(repo.path(), &args(&["--help", "--"])),
         ExitCode::SUCCESS
     );
 }
 
 #[test]
 fn preview_lists_commits_without_changing_anything() {
+    // LAND-6: preview resolves revisions online; the offline note is gone.
     let (repo, _bare) = repo_with_origin("preview");
     let master_before = repo.git(&["rev-parse", "master"]);
 
-    let out = run_engine(repo.path(), &["--preview"], &[]).unwrap();
+    let out = run_online(repo.path(), &["--preview"], &[]).unwrap();
     assert!(out.stderr.contains("** STRATEGY **"), "{}", out.stderr);
     assert!(out.stderr.contains("** ONTO TARGET **"), "{}", out.stderr);
     assert!(out.stderr.contains("** LANDING **"), "{}", out.stderr);
     assert!(out.stderr.contains("** PREVIEW **"), "{}", out.stderr);
     assert!(
-        out.stderr.contains("revision info unavailable"),
+        !out.stderr.contains("revision info unavailable"),
         "{}",
         out.stderr
     );
+    assert!(out.stdout.contains("D1"), "{}", out.stdout);
     assert!(
         out.stdout.contains("add a") && out.stdout.contains("add b"),
         "{}",
@@ -192,7 +381,7 @@ fn lands_squash_onto_master() {
     repo.git(&["fetch", "-q", "origin"]);
     repo.git(&["branch", "--set-upstream-to=origin/master", "master"]);
 
-    let out = run_engine(repo.path(), &[], &["y", "y"]).unwrap();
+    let out = run_online(repo.path(), &[], &["y", "y"]).unwrap();
     assert!(
         out.stderr.contains("** DONE ** Landed changes."),
         "{}",
@@ -224,7 +413,7 @@ fn land_with_hold_skips_push() {
     let (repo, bare) = repo_with_origin("hold");
     let remote_before = bare.git(&["rev-parse", "refs/heads/master"]);
 
-    let out = run_engine(repo.path(), &["--hold"], &["y", "y"]).unwrap();
+    let out = run_online(repo.path(), &["--hold"], &["y", "y"]).unwrap();
     assert!(out.stdout.contains("HOLD CHANGES"), "{}", out.stdout);
     assert!(out.stdout.contains("git push --"), "{}", out.stdout);
 
@@ -236,7 +425,7 @@ fn land_with_hold_skips_push() {
 #[test]
 fn keep_branches_preserves_feature() {
     let (repo, _bare) = repo_with_origin("keep");
-    let out = run_engine(repo.path(), &["--keep-branches"], &["y", "y"]).unwrap();
+    let out = run_online(repo.path(), &["--keep-branches"], &["y", "y"]).unwrap();
     assert!(
         out.stderr.contains("** DONE ** Landed changes."),
         "{}",
@@ -251,10 +440,10 @@ fn dirty_tree_stashes_and_restores() {
     let (repo, _bare) = repo_with_origin("dirty");
     repo.write("a.txt", "uncommitted\n");
 
-    run_engine(repo.path(), &["--preview"], &[]).expect("preview allows dirt");
+    run_online(repo.path(), &["--preview"], &[]).expect("preview allows dirt");
 
     // Accepting the stash prompt lands, then applies the stash back.
-    let out = run_engine(repo.path(), &[], &["y", "y"]).unwrap();
+    let out = run_online(repo.path(), &[], &["y", "y"]).unwrap();
     assert!(
         out.stdout.contains("** UNCOMMITTED CHANGES **"),
         "{}",
@@ -280,7 +469,7 @@ fn dirty_tree_stashes_and_restores() {
 fn dirty_tree_decline_aborts() {
     let (repo, _bare) = repo_with_origin("dirty-decline");
     repo.write("a.txt", "uncommitted\n");
-    let err = run_engine(repo.path(), &[], &["y", "n"]).unwrap_err();
+    let err = run_online(repo.path(), &[], &["y", "n"]).unwrap_err();
     assert_eq!(err, "User aborted the workflow.");
     // Nothing landed: the feature branch still exists.
     assert!(!repo.git(&["branch", "--list", "feature"]).is_empty());
@@ -290,7 +479,7 @@ fn dirty_tree_decline_aborts() {
 fn detached_head_lands_head() {
     let (repo, _bare) = repo_with_origin("detached");
     repo.git(&["checkout", "-q", "--detach", "HEAD"]);
-    let out = run_engine(repo.path(), &["--preview"], &[]).unwrap();
+    let out = run_online(repo.path(), &["--preview"], &[]).unwrap();
     assert!(
         out.stderr.contains("Landing the current HEAD"),
         "{}",
@@ -318,9 +507,12 @@ fn nothing_to_land_fails() {
 #[test]
 fn outside_repo_fails() {
     let empty = Fixture::named("notrepo");
-    let err = land::execute(empty.path(), &args(&[])).unwrap_err();
+    let err = land::execute(empty.path(), &args(&["--"])).unwrap_err();
     assert_eq!(err, land::NOT_GIT_OR_HG);
-    assert_eq!(land::run_in(empty.path(), &args(&[])), ExitCode::FAILURE);
+    assert_eq!(
+        land::run_in(empty.path(), &args(&["--"])),
+        ExitCode::FAILURE
+    );
 }
 
 #[test]
@@ -334,7 +526,7 @@ fn onto_flag_targets_another_branch() {
     repo.git(&["branch", "--set-upstream-to=origin/stable", "stable"]);
     let master_before = repo.git(&["rev-parse", "master"]);
 
-    let out = run_engine(repo.path(), &["--onto", "stable"], &["y", "y"]).unwrap();
+    let out = run_online(repo.path(), &["--onto", "stable"], &["y", "y"]).unwrap();
     assert!(
         out.stderr.contains("** DONE ** Landed changes."),
         "{}",
@@ -370,8 +562,15 @@ fn new_onto_branch_prompts_and_aborts() {
 
 #[test]
 fn new_onto_branch_is_created_when_confirmed() {
+    // LAND-6: into-empty ranges include the unassociated base commit, so
+    // `--revision` forces it under D1 (PHP errors otherwise, like the port).
     let (repo, bare) = repo_with_origin("onto-create");
-    let out = run_engine(repo.path(), &["--onto", "fresh"], &["y", "y", "y"]).unwrap();
+    let out = run_online(
+        repo.path(),
+        &["--onto", "fresh", "--revision", "D1"],
+        &["y", "y", "y"],
+    )
+    .unwrap();
     assert!(
         out.stderr.contains("** DONE ** Landed changes."),
         "{}",
@@ -385,7 +584,7 @@ fn new_onto_branch_is_created_when_confirmed() {
 fn positional_ref_selects_source() {
     let (repo, _bare) = repo_with_origin("positional");
     repo.git(&["checkout", "-q", "master"]);
-    let out = run_engine(repo.path(), &["--preview", "feature"], &[]).unwrap();
+    let out = run_online(repo.path(), &["--preview", "feature"], &[]).unwrap();
     assert!(
         out.stdout.contains("add a") && out.stdout.contains("add b"),
         "{}",
@@ -395,16 +594,19 @@ fn positional_ref_selects_source() {
 }
 
 #[test]
-fn revision_preview_skips_gates_without_conduit() {
+fn revision_preview_resolves_forced_revision_online() {
+    // LAND-6 (ex `revision_preview_skips_gates_without_conduit`): the
+    // forced revision resolves through Conduit; nothing is skipped.
     let (repo, _bare) = repo_with_origin("revskip-preview");
 
-    let out = run_engine(repo.path(), &["--preview", "--revision", "D123"], &[]).unwrap();
+    let out = run_online(repo.path(), &["--preview", "--revision", "D1"], &[]).unwrap();
     assert!(
-        out.stderr.contains("revision info unavailable"),
+        !out.stderr.contains("revision info unavailable"),
         "{}",
         out.stderr
     );
     assert!(out.stderr.contains("** PREVIEW **"), "{}", out.stderr);
+    assert!(out.stdout.contains("D1"), "{}", out.stdout);
     assert!(
         out.stdout.contains("add a") && out.stdout.contains("add b"),
         "{}",
@@ -415,14 +617,16 @@ fn revision_preview_skips_gates_without_conduit() {
 }
 
 #[test]
-fn revision_land_skips_gates_without_conduit() {
+fn revision_land_runs_gates_online() {
+    // LAND-6 (ex `revision_land_skips_gates_without_conduit`): landing
+    // with `--revision` runs discovery and gates online.
     let (repo, _bare) = repo_with_origin("revskip-land");
     repo.git(&["fetch", "-q", "origin"]);
     repo.git(&["branch", "--set-upstream-to=origin/master", "master"]);
 
-    let out = run_engine(repo.path(), &["--revision", "123"], &["y", "y"]).unwrap();
+    let out = run_online(repo.path(), &["--revision", "1"], &["y", "y"]).unwrap();
     assert!(
-        out.stderr.contains("revision info unavailable"),
+        !out.stderr.contains("revision info unavailable"),
         "{}",
         out.stderr
     );
@@ -435,7 +639,79 @@ fn revision_land_skips_gates_without_conduit() {
 }
 
 #[test]
+fn land11_message_failure_aborts_before_merge() {
+    // The landed message loads before any merge runs: a fetch failure
+    // aborts with the target untouched.
+    let (repo, _bare) = repo_with_origin("land11-msgfail");
+    let master_before = repo.git(&["rev-parse", "master"]);
+    let mut responses = online_responses();
+    responses.remove("differential.getcommitmessage");
+    let err = run_online_with(responses, repo.path(), &[], &["y", "y"]).unwrap_err();
+    assert!(err.contains("no canned response"), "{err}");
+    assert_eq!(repo.git(&["rev-parse", "master"]), master_before);
+}
+
+#[test]
+fn land31_unauthored_banner_shows_monograms() {
+    // The `NOT REVISION AUTHOR` gate names the viewer and the author by
+    // `@monogram`, loaded over `user.search`.
+    let (repo, _bare) = repo_with_origin("land31-author");
+    let mut responses = online_responses();
+    responses.insert(
+        "differential.revision.search".to_string(),
+        serde_json::json!({"data": [{
+            "id": 1,
+            "phid": "PHID-DREV-1",
+            "fields": {
+                "status": {"value": "accepted", "name": "Accepted", "closed": false},
+                "title": "Work 1",
+                "authorPHID": "PHID-USER-bob",
+                "diffPHID": "PHID-DIFF-1",
+            },
+        }]}),
+    );
+    responses.insert(
+        "user.search".to_string(),
+        serde_json::json!({"data": [
+            {"phid": "PHID-USER-bob", "fields": {"username": "bob"}},
+        ]}),
+    );
+    let out = run_online_with(responses, repo.path(), &[], &["y", "y"]).unwrap();
+    assert!(
+        out.stdout.contains("(\"@owner\") are not the author"),
+        "{}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("Author: @bob"), "{}", out.stdout);
+    assert!(
+        out.stderr.contains("** DONE ** Landed changes."),
+        "{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn land6_land_without_conduit_fails() {
+    // LAND-6: without Conduit the engine fails instead of landing an
+    // unassociated offline set.
+    let (repo, _bare) = repo_with_origin("land6-offline");
+    // Either discovery error fits (an ambient `ARC_CONDUIT_URI` shifts
+    // the failure from URI discovery to the token lookup).
+    let err = run_engine(repo.path(), &["--preview"], &["y", "y"]).unwrap_err();
+    assert!(
+        err.contains("no conduit URI") || err.contains("no token for"),
+        "{err}"
+    );
+    let err = run_engine(repo.path(), &[], &["y", "y"]).unwrap_err();
+    assert!(
+        err.contains("no conduit URI") || err.contains("no token for"),
+        "{err}"
+    );
+}
+
+#[test]
 fn revision_flag_rejects_bad_values() {
+    // T1153 B21/B23: missing-param scan errors stay bare (they report before the terminator check).
     let (repo, _bare) = repo_with_origin("revbad");
     let err = run_engine(repo.path(), &["--preview", "--revision", "nope"], &[]).unwrap_err();
     assert!(
@@ -451,6 +727,7 @@ fn revision_flag_rejects_bad_values() {
 
 #[test]
 fn bad_flags_fail() {
+    // T1153 B21/B23: scan errors stay bare (they report before the terminator check).
     let repo = Fixture::init_repo("flags");
     let err = land::execute(repo.path(), &args(&["--bogus"])).unwrap_err();
     assert!(
@@ -877,7 +1154,11 @@ fn hg_shelve_unsupported_fails() {
     let hg_cmd = fake_hg_land_command(repo.path());
     let mut io = land::Io::canned(&["y"]);
     let err = land::save_local_state_hg_with(repo.path(), &hg_cmd, &mut io).unwrap_err();
-    assert!(err.contains("Shelving is not supported"), "{err}");
+    // LAND-35: the verbatim PHP usage error.
+    assert_eq!(
+        err,
+        "You can not continue with uncommitted changes. Commit or discard them before proceeding."
+    );
 }
 
 #[test]
@@ -934,6 +1215,6 @@ fn svn_working_copy_is_rejected_like_any_non_git_hg_tree() {
     // SvnCommand path exists for land.
     let svn = Fixture::named("svn-tree");
     std::fs::create_dir_all(svn.path().join(".svn")).unwrap();
-    let err = land::execute(svn.path(), &args(&[])).unwrap_err();
+    let err = land::execute(svn.path(), &args(&["--"])).unwrap_err();
     assert_eq!(err, land::NOT_GIT_OR_HG);
 }

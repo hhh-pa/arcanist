@@ -218,7 +218,7 @@ pub fn terminal_width() -> Option<usize> {
 
 #[cfg(not(windows))]
 fn terminal_width_from_tput() -> Option<usize> {
-    let output = std::process::Command::new("tput")
+    let output = crate::proc_env::command("tput")
         .arg("cols")
         .stdin(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::null())
@@ -250,7 +250,8 @@ fn is_stop_char(glyph: &[char]) -> bool {
 
 /// Truncate `text` to at most `maximum` glyphs.
 ///
-/// Mirrors `PhutilUTF8StringTruncator` with only `setMaximumGlyphs()`:
+/// Mirrors `PhutilUTF8StringTruncator` with only `setMaximumGlyphs()`
+/// (`src/utils/PhutilUTF8StringTruncator.php` at ceb, T1153 RB-D35):
 /// strings within the limit return unmodified, longer strings are cut with
 /// room for the `…` terminator, preferring word and sentence boundaries.
 #[must_use]
@@ -268,7 +269,10 @@ pub fn truncate_glyphs(text: &str, maximum: usize) -> String {
     if cutoff == 0 {
         return TRUNCATOR_TERMINATOR.to_string();
     }
-    let search = (cutoff.saturating_sub(256)).max(cutoff / 2);
+    // T1153 RB-D35: PHP divides by two as a float (`$cutoff / 2`,
+    // `src/utils/PhutilUTF8StringTruncator.php:204-209`), so odd cutoffs
+    // round the search floor up (like `terminal`'s truncator).
+    let search = cutoff.div_ceil(2).max(cutoff.saturating_sub(256));
     let mut word_boundary: Option<usize> = None;
     let mut stop_boundary: Option<usize> = None;
     let mut any_nonboundary = false;
@@ -541,17 +545,19 @@ impl GridView {
 
     /// Draw the grid: rows joined with newlines plus one trailing newline.
     ///
-    /// A grid with no rows renders `Array`, matching PHP's array-to-string
-    /// coercion in `drawGrid()`; the markers workflows always produce rows
-    /// (or fail earlier in the partition query), so this is unreachable
-    /// in practice.
+    /// T1153 RB-D36: a grid with no rows renders `"\n"` — `phutil_glue`
+    /// returns `[]` for no rows and `%s` of it is `""`
+    /// (`src/utils/utils.php:1955-1958`, `src/xsprintf/tsprintf.php` via
+    /// `PhutilTerminalString::escapeStringValue`).
     #[must_use]
     pub fn draw(&self, terminal: Option<usize>) -> String {
         if self.columns.is_empty() {
             panic!("Can not draw a grid with no columns!");
         }
+        // T1153 RB-D36: PHP string-casts the empty row list, printing
+        // `Array`.
         if self.rows.is_empty() {
-            return "Array\n".to_string();
+            return "\n".to_string();
         }
         let widths = self.column_widths(terminal);
         let mut out = String::new();

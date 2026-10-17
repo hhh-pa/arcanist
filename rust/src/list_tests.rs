@@ -226,3 +226,96 @@ fn run_in_fails_outside_repo_before_conduit() {
 
     std::fs::remove_dir_all(&plain).ok();
 }
+
+#[test]
+fn execute_propagates_conduit_errors() {
+    // T1153 RB-D27 lock: execute errors (incl. conduit failures) surface as Err
+    // so run() prints them to stderr with exit 1, like PHP.
+    let client = crate::conduit::Client::new("http://127.0.0.1:9/", "t").unwrap();
+    let options = Options {
+        json: false,
+        conduit_uri: None,
+    };
+    let err = execute(&client, &options).unwrap_err();
+    assert!(!err.is_empty());
+}
+
+#[test]
+fn r4_rbd4_parse_and_working_copy_are_usage() {
+    // `list` is a subprocess workflow: argument and working-copy
+    // errors render `Usage Exception:` (exit 1) with no usage dump.
+    assert_eq!(
+        run_in(&std::env::temp_dir(), &args(&["--bogus"])),
+        std::process::ExitCode::FAILURE
+    );
+    let dir = std::env::temp_dir().join(format!(
+        "arc-rs-list-r4-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    assert_eq!(run_in(&dir, &args(&[])), std::process::ExitCode::FAILURE);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn rbd8_user_phid_prefers_cached_identity() {
+    // The startup-auth identity answers without I/O: an unroutable
+    // client still resolves when cached.
+    let client = conduit::Client::new("http://127.0.0.1:9/", "t").unwrap();
+    client.set_authenticated_user("alice", "PHID-USER-1");
+    assert_eq!(user_phid(&client).unwrap(), "PHID-USER-1");
+}
+#[test]
+fn r10_list_help_matches_generated_format() {
+    // T1153 R10: `--help` renders the generated workflow help
+    // (`PhutilHelpArgumentWorkflow::execute()` + `renderWorkflowHelp()`),
+    // byte-identical to `arc help <name>` for one name.
+    assert_eq!(
+        usage_text(false),
+        "LIST WORKFLOW\n\
+         \n\
+         list\n\
+         \x20     list\n\
+         \n\
+         \x20         Supports: git, svn, hg\n\
+         \x20         List your open Differential revisions.\n\
+         \n"
+    );
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+    // `run()` prints `usage()` (same text, ambient ANSI mode).
+    assert!(usage().contains("LIST WORKFLOW"), "{}", usage());
+}
+
+#[test]
+fn b21_list_needs_no_terminator() {
+    // T1153 B21/B23 VERIFIED for `list`: it is a classic workflow,
+    // so PHP runs it via the `scripts/arcanist.php` re-exec, which
+    // never requires `--`. Parsing takes no TTY input, so
+    // piped-style argv parses directly, and `--help` without `--`
+    // still succeeds.
+    assert!(parse_args(&args(&["--json"])).unwrap().is_some());
+    assert_eq!(parse_args(&args(&["--help"])).unwrap(), None);
+    let text = usage_text(false);
+    assert!(text.contains("LIST WORKFLOW"), "{text}");
+}
+
+#[test]
+fn b23_list_help_matches_generated_format() {
+    // T1153 B21/B23: `--help` renders the generated workflow help via
+    // the shared renderer, byte-identical to `arc help list`.
+    // Extensions stay undocumented.
+    let text = usage_text(false);
+    assert!(text.starts_with("LIST WORKFLOW\n"), "{text}");
+    assert!(
+        text.contains("List your open Differential revisions."),
+        "{text}"
+    );
+    assert!(!text.contains("--json"), "{text}");
+    let ansi = usage_text(true);
+    assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+}

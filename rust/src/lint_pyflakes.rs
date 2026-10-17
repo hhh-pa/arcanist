@@ -23,7 +23,6 @@ use arc_rs::lint::{LintMessage, Linter, OptionContext};
 use arc_rs::lint_external::{ToolOptions, apply_tool_option, version_requirement_satisfied};
 use arc_rs::linters::version_pattern_for;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Default binary name, mirroring PHP `getDefaultBinary()`.
 pub const BINARY: &str = "pyflakes";
@@ -134,7 +133,7 @@ fn lint_with_binary_and_flags(
     let Some(scratch) = write_scratch("pyflakes", ".py", path, data) else {
         return Vec::new();
     };
-    let mut command = Command::new(tool);
+    let mut command = crate::proc_env::command(tool);
     command
         .args(flags)
         .arg(&scratch.file)
@@ -173,26 +172,28 @@ fn parse_line(path: &str, line: &str) -> Option<LintMessage> {
     None
 }
 
+/// Match `/^(.*?):(\d+): (.*)$/` at one path boundary (T1153 LINT-33):
+/// ceb PHP has no column group, so the char is always null and a
+/// `path:line:col` line reads the column digits as the line number.
 fn parse_at(path: &str, line: &str, colon: usize) -> Option<LintMessage> {
     let after_path = line.get(colon + 1..)?;
     let (line_no, rest) = take_digits(after_path)?;
-    let rest = rest.strip_prefix(':')?;
-    // The column may be empty, mirroring `(?<column>\d*) `.
-    let (col, rest) = match take_digits(rest) {
-        Some((col_no, after)) => (col_no, after),
-        None => (1, rest),
-    };
-    let description = rest.strip_prefix(' ')?.trim().to_string();
+    let description = rest.strip_prefix(": ")?.trim().to_string();
     Some(LintMessage {
         path: path.to_string(),
         line: line_no,
-        col,
+        col: 0,
         code: "PYFLAKES".to_string(),
         severity: severity_for(&description).to_string(),
         name: "PYFLAKES".to_string(),
         description,
         original: None,
         replacement: None,
+        granularity: None,
+        locations: Vec::new(),
+        bypass_changed_line_filtering: None,
+        original_bytes: None,
+        replacement_bytes: None,
     })
 }
 

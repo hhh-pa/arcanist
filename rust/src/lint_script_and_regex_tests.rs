@@ -42,13 +42,14 @@ fn parses_canned_output_with_defaults() {
     .unwrap();
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].path, "file.txt");
-    assert_eq!((messages[0].line, messages[0].col), (3, 1));
+    // T1153 LINT-27: no `char` group means PHP null (0), not 1:1.
+    assert_eq!((messages[0].line, messages[0].col), (3, 0));
     assert_eq!(messages[0].code, "S&RX");
     assert_eq!(messages[0].severity, "error");
     assert_eq!(messages[0].name, "Lint");
     assert_eq!(messages[0].description, "Too many goats!");
     assert_eq!(messages[1].severity, "warning");
-    assert_eq!((messages[1].line, messages[1].col), (22, 1));
+    assert_eq!((messages[1].line, messages[1].col), (22, 0));
 }
 
 #[test]
@@ -139,18 +140,19 @@ fn line_char_and_offset_groups_map_like_php() {
     };
     assert_eq!(match_line_and_char(&line, data), (2, 3));
 
-    // Zero lines become 1; "0" chars count as absent (PHP falsiness).
+    // Zero lines become 1; "0" chars count as absent (PHP falsiness),
+    // reported as null (0). (T1153 LINT-27.)
     let zero = ScriptRegexMatch {
         line: Some("0".to_string()),
         char: Some("0".to_string()),
         ..ScriptRegexMatch::default()
     };
-    assert_eq!(match_line_and_char(&zero, data), (1, 1));
+    assert_eq!(match_line_and_char(&zero, data), (1, 0));
 
-    // Missing groups mean whole-file, reported at 1:1.
+    // Missing groups mean whole-file: null line/char (PHP null).
     assert_eq!(
         match_line_and_char(&ScriptRegexMatch::default(), data),
-        (1, 1)
+        (0, 0)
     );
 
     // Offset supersedes line/char; garbage offsets behave like (int) 0.
@@ -294,7 +296,8 @@ fn pcre_parse_matches_the_php_doc_example() {
     assert!(!halted);
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].severity, "error");
-    assert_eq!((messages[0].line, messages[0].col), (13, 1));
+    // T1153 LINT-27: no `char` group means PHP null (0).
+    assert_eq!((messages[0].line, messages[0].col), (13, 0));
     assert_eq!(messages[0].description, "Too many goats!");
     assert_eq!(messages[0].code, "S&RX");
     assert_eq!(messages[0].name, "Lint");
@@ -406,4 +409,82 @@ fn throw_message_text_is_exact() {
         "ArcanistScriptAndRegexLinter: configuration captured a 'throw' named capturing group, \
          'boom'. Script output:\nout\n"
     );
+}
+
+// -( T1153 Wave 2: lint retrocompat )--------------------------------------
+
+fn lint28_failing_parser(_output: &str) -> Vec<ScriptRegexMatch> {
+    unreachable!("the script fails before parsing")
+}
+
+fn lint28_throwing_parser(_output: &str) -> Vec<ScriptRegexMatch> {
+    vec![ScriptRegexMatch {
+        throw: Some("boom".to_string()),
+        ..ScriptRegexMatch::default()
+    }]
+}
+
+#[test]
+fn lint27_offset_resolves_against_the_matched_file() {
+    let matches = vec![ScriptRegexMatch {
+        file: Some("other.txt".to_string()),
+        offset: Some("4".to_string()),
+        ..ScriptRegexMatch::default()
+    }];
+    let (messages, _) = messages_from_matches(matches, "out\n", "f.txt", b"ab\n", &|file| {
+        assert_eq!(file, "other.txt");
+        Some(b"zz\nqq\n".to_vec())
+    })
+    .unwrap();
+    // Offset 4 in the matched bytes is line 2, not line 3 of "ab\n".
+    assert_eq!((messages[0].line, messages[0].col), (2, 2));
+    assert_eq!(messages[0].path, "other.txt");
+    // An unsuppliable file errors like PHP's `loadData()` failure.
+    let matches = vec![ScriptRegexMatch {
+        file: Some("gone.txt".to_string()),
+        offset: Some("0".to_string()),
+        ..ScriptRegexMatch::default()
+    }];
+    assert!(messages_from_matches(matches, "out\n", "f.txt", b"ab\n", &|_| None).is_err());
+}
+
+#[test]
+fn lint28_script_failure_and_throw_wait_on_take_error() {
+    // A nonzero script exit records a failure for the aggregate.
+    let linter = ScriptAndRegexLinter::with_script_and_parser("exit 3", lint28_failing_parser);
+    assert!(linter.lint_bytes("f.txt", b"x\n").is_empty());
+    assert!(linter.take_error().is_some());
+    assert!(linter.take_error().is_none());
+    // A `throw` match records the PHP usage text.
+    let throwing = ScriptAndRegexLinter::with_script_and_parser("echo hi", lint28_throwing_parser);
+    assert!(throwing.lint_bytes("f.txt", b"x\n").is_empty());
+    let error = throwing.take_error().unwrap();
+    assert!(error.contains("'throw'"), "{error}");
+}
+
+#[test]
+fn lint29_named_severity_wins_without_severity_group() {
+    // No `severity` group, but a named `warning` group: ceb PHP returns
+    // the named severity instead of short-circuiting to error.
+    let named = ScriptRegexMatch {
+        warning: Some("x".to_string()),
+        ..ScriptRegexMatch::default()
+    };
+    assert_eq!(match_severity(&named), "warning");
+    assert_eq!(match_severity(&ScriptRegexMatch::default()), SEVERITY_ERROR);
+    // Named groups beat the severity value only in map order: an
+    // `error` group beats `severity: warning`, but an `advice` group
+    // loses to it.
+    let early = ScriptRegexMatch {
+        error: Some("x".to_string()),
+        severity: Some("warning".to_string()),
+        ..ScriptRegexMatch::default()
+    };
+    assert_eq!(match_severity(&early), "error");
+    let late = ScriptRegexMatch {
+        advice: Some("x".to_string()),
+        severity: Some("warning".to_string()),
+        ..ScriptRegexMatch::default()
+    };
+    assert_eq!(match_severity(&late), "warning");
 }

@@ -191,6 +191,7 @@ fn revision_id_first_match_wins() {
 
 #[test]
 fn revision_id_rejects_invalid_values() {
+    // T1153 RB-D37: PHP's exact error text (`phabricator.example.com`).
     for bad in [
         "D0",
         "D",
@@ -212,8 +213,8 @@ fn revision_id_rejects_invalid_values() {
     assert_eq!(
         parse_revision_id_from_raw_corpus("T\nDifferential Revision: D0\n").unwrap_err(),
         "Invalid \"Differential Revision\" field in commit message. This field \
-         should have a revision identifier like \"D123\" or a server URI \
-         like \"https://devtools.example.com/D123\", but has \"D0\"."
+         should have a revision identifier like \"D123\" or a Phabricator URI \
+         like \"https://phabricator.example.com/D123\", but has \"D0\"."
     );
 }
 
@@ -547,14 +548,18 @@ fn update_revision_id_requires_digits() {
     assert_eq!(parse_update_revision_id("D5 ").unwrap(), 5);
     assert_eq!(parse_update_revision_id(" 5").unwrap(), 5);
     assert_eq!(parse_update_revision_id("0").unwrap(), 0);
+    // DIFF-D21: `is_numeric()` forms are accepted and truncated.
+    assert_eq!(parse_update_revision_id("1e3").unwrap(), 1000);
+    assert_eq!(parse_update_revision_id("12.3").unwrap(), 12);
+    assert_eq!(parse_update_revision_id("+123").unwrap(), 123);
+    assert_eq!(parse_update_revision_id(" 1e2 ").unwrap(), 100);
     for bad in [
         "",
         "D",
         " D5",
-        "1e3",
-        "12.3",
-        "+123",
         "D12x",
+        "-5",
+        "0x10",
         "99999999999999999999999",
     ] {
         assert_eq!(
@@ -1003,12 +1008,12 @@ fn gap2_run_lint_maps_codes_and_outcomes() {
     let calls = RefCell::new(0);
     let counting = |_: &Path, _: &[String]| {
         *calls.borrow_mut() += 1;
-        ChildOutcome::Code(0)
+        ChildOutcome::Code(0, Vec::new())
     };
     let mut out = Vec::new();
     assert_eq!(
         run_lint(&dir, Some("abc"), &[], true, &counting, &mut out).unwrap(),
-        Some(LINT_RESULT_SKIP)
+        (Some(LINT_RESULT_SKIP), Vec::new())
     );
     assert_eq!(*calls.borrow(), 0);
     assert!(out.is_empty());
@@ -1025,11 +1030,11 @@ fn gap2_run_lint_maps_codes_and_outcomes() {
                 None,
                 &[],
                 false,
-                &run(ChildOutcome::Code(code)),
+                &run(ChildOutcome::Code(code, Vec::new())),
                 &mut out
             )
             .unwrap(),
-            Some(code)
+            (Some(code), Vec::new())
         );
         assert_eq!(out, format!("Linting...\n{banner}").into_bytes());
     }
@@ -1041,11 +1046,11 @@ fn gap2_run_lint_maps_codes_and_outcomes() {
             None,
             &[],
             false,
-            &run(ChildOutcome::Code(3)),
+            &run(ChildOutcome::Code(3, Vec::new())),
             &mut out
         )
         .unwrap(),
-        Some(3)
+        (Some(3), Vec::new())
     );
     assert_eq!(out, b"Linting...\n");
     // No engine / no effect print notices and yield None.
@@ -1060,7 +1065,7 @@ fn gap2_run_lint_maps_codes_and_outcomes() {
             &mut out
         )
         .unwrap(),
-        None
+        (None, Vec::new())
     );
     assert_eq!(
         out,
@@ -1077,7 +1082,7 @@ fn gap2_run_lint_maps_codes_and_outcomes() {
             &mut out,
         )
         .unwrap(),
-        None
+        (None, Vec::new())
     );
     assert_eq!(out, b"Linting...\nnothing to lint\n");
     // Child failures abort after the start notice.
@@ -1099,7 +1104,7 @@ fn gap2_run_lint_maps_codes_and_outcomes() {
     let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
     let capture = |_: &Path, argv: &[String]| {
         *seen.borrow_mut() = argv.to_vec();
-        ChildOutcome::Code(0)
+        ChildOutcome::Code(0, Vec::new())
     };
     let flags = ["amend-all".to_string(), "apply-patches".to_string()];
     let mut out = Vec::new();
@@ -1130,12 +1135,12 @@ fn gap2_run_unit_confirms_unsound_and_maps_codes() {
             None,
             &[],
             true,
-            &run(ChildOutcome::Code(0)),
+            &run(ChildOutcome::Code(0, Vec::new())),
             &mut input,
             &mut out
         )
         .unwrap(),
-        Some(UNIT_RESULT_SKIP)
+        (Some(UNIT_RESULT_SKIP), Vec::new())
     );
     assert!(out.is_empty());
     for (code, banner) in [
@@ -1150,31 +1155,31 @@ fn gap2_run_unit_confirms_unsound_and_maps_codes() {
                 None,
                 &[],
                 false,
-                &run(ChildOutcome::Code(code)),
+                &run(ChildOutcome::Code(code, Vec::new())),
                 &mut input,
                 &mut out,
             )
             .unwrap(),
-            Some(code)
+            (Some(code), Vec::new())
         );
         assert_eq!(out, format!("Running unit tests...\n{banner}").into_bytes());
     }
-    // Unsound prompts (default yes); declining aborts.
-    for answer in ["y\n", "\n"] {
+    // Unsound prompts (DIFF-D16: default no, like PHP); only `y` continues.
+    {
         let mut out = Vec::new();
-        let mut input = Cursor::new(answer.as_bytes().to_vec());
+        let mut input = Cursor::new(b"y\n".to_vec());
         assert_eq!(
             run_unit(
                 &dir,
                 None,
                 &[],
                 false,
-                &run(ChildOutcome::Code(UNIT_RESULT_UNSOUND)),
+                &run(ChildOutcome::Code(UNIT_RESULT_UNSOUND, Vec::new())),
                 &mut input,
                 &mut out,
             )
             .unwrap(),
-            Some(UNIT_RESULT_UNSOUND)
+            (Some(UNIT_RESULT_UNSOUND), Vec::new())
         );
         let text = String::from_utf8(out).unwrap();
         // The prompt renderer wraps long prompts; both halves show.
@@ -1185,26 +1190,29 @@ fn gap2_run_unit_confirms_unsound_and_maps_codes() {
         assert!(text.contains("Ignore unsound test failures?"), "{text}");
         assert!(text.contains("** UNIT UNSOUND **"), "{text}");
     }
-    let mut out = Vec::new();
-    let mut input = Cursor::new(b"n\n".to_vec());
-    assert_eq!(
-        run_unit(
-            &dir,
-            None,
-            &[],
-            false,
-            &run(ChildOutcome::Code(UNIT_RESULT_UNSOUND)),
-            &mut input,
-            &mut out,
-        )
-        .unwrap_err(),
-        USER_ABORT
-    );
-    assert!(
-        !String::from_utf8(out)
-            .unwrap()
-            .contains("** UNIT UNSOUND **")
-    );
+    // DIFF-D16: `n` and empty (Enter/EOF take the no default) abort.
+    for answer in [b"n\n".to_vec(), b"\n".to_vec(), b"".to_vec()] {
+        let mut out = Vec::new();
+        let mut input = Cursor::new(answer);
+        assert_eq!(
+            run_unit(
+                &dir,
+                None,
+                &[],
+                false,
+                &run(ChildOutcome::Code(UNIT_RESULT_UNSOUND, Vec::new())),
+                &mut input,
+                &mut out,
+            )
+            .unwrap_err(),
+            USER_ABORT
+        );
+        assert!(
+            !String::from_utf8(out)
+                .unwrap()
+                .contains("** UNIT UNSOUND **")
+        );
+    }
     // No engine yields None.
     let mut out = Vec::new();
     let mut input = Cursor::new(b"".to_vec());
@@ -1219,7 +1227,7 @@ fn gap2_run_unit_confirms_unsound_and_maps_codes() {
             &mut out
         )
         .unwrap(),
-        None
+        (None, Vec::new())
     );
     assert_eq!(
         out,
@@ -1229,7 +1237,7 @@ fn gap2_run_unit_confirms_unsound_and_maps_codes() {
     let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
     let capture = |_: &Path, argv: &[String]| {
         *seen.borrow_mut() = argv.to_vec();
-        ChildOutcome::Code(0)
+        ChildOutcome::Code(0, Vec::new())
     };
     let mut out = Vec::new();
     let mut input = Cursor::new(b"".to_vec());
@@ -1257,11 +1265,11 @@ fn gap2_run_lint_unit_combines_reports() {
     use std::cell::RefCell;
     use std::io::Cursor;
     let dir = std::env::temp_dir();
-    let lint = |_: &Path, _: &[String]| ChildOutcome::Code(0);
+    let lint = |_: &Path, _: &[String]| ChildOutcome::Code(0, Vec::new());
     let unit_calls = RefCell::new(0);
     let unit = |_: &Path, _: &[String]| {
         *unit_calls.borrow_mut() += 1;
-        ChildOutcome::Code(2)
+        ChildOutcome::Code(2, Vec::new())
     };
     let mut out = Vec::new();
     let mut input = Cursor::new(b"".to_vec());
@@ -1282,6 +1290,34 @@ fn gap2_run_lint_unit_combines_reports() {
     assert_eq!(report.unit_result, Some(2));
     assert!(report.unresolved_lint.is_empty());
     assert!(report.test_results.is_empty());
+    // T1153 DIFF-D22: child dicts flow into the report (they feed the
+    // `arc:lint`/`arc:unit` diff properties).
+    {
+        let lint_dicts =
+            |_: &Path, _: &[String]| ChildOutcome::Code(1, vec![serde_json::json!({"code": "X"})]);
+        let unit_dicts =
+            |_: &Path, _: &[String]| ChildOutcome::Code(0, vec![serde_json::json!({"name": "t"})]);
+        let mut out = Vec::new();
+        let mut input = Cursor::new(b"".to_vec());
+        let report = run_lint_unit(
+            &dir,
+            None,
+            &[],
+            &[],
+            false,
+            false,
+            &lint_dicts,
+            &unit_dicts,
+            &mut input,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(
+            report.unresolved_lint,
+            vec![serde_json::json!({"code": "X"})]
+        );
+        assert_eq!(report.test_results, vec![serde_json::json!({"name": "t"})]);
+    }
     let text = String::from_utf8(out).unwrap();
     assert!(text.starts_with("Linting...\n** LINT OKAY **"), "{text}");
     assert!(
@@ -1499,11 +1535,7 @@ fn unified_diff_parses_git_change() {
         (hunk.old_start, hunk.old_len, hunk.new_start, hunk.new_len),
         (1, 2, 1, 3)
     );
-    assert!(
-        hunk.corpus.starts_with("@@ -1,2 +1,3 @@\n"),
-        "{}",
-        hunk.corpus
-    );
+    assert_eq!(hunk.corpus, " a\n+b\n c\n");
     assert!(hunk.corpus.contains("+b\n"), "{}", hunk.corpus);
     assert_eq!(change.corpus_size(), hunk.corpus.len());
     assert_eq!(change.commit_hash, None);
@@ -1541,6 +1573,30 @@ fn unified_diff_handles_add_delete_rename_binary() {
     let changes = parse_unified_diff(git_binary).unwrap();
     assert_eq!(changes[0].file_type, FILE_BINARY);
     assert!(changes[0].hunks.is_empty());
+}
+
+#[test]
+fn old_path_add_reports_dev_null_like_php() {
+    // T1153 OLD-PATH: `ArcanistDiffParser.php:801-808` unconditionally
+    // `setOldPath($old_file)` from the `---` line, so git/hg ADD
+    // carries `/dev/null` (not empty or the current path).
+    let add = "diff --git a/new.txt b/new.txt\nnew file mode 100644\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hi\n";
+    let changes = parse_unified_diff(add).unwrap();
+    assert_eq!(changes[0].change_type, TYPE_ADD);
+    assert_eq!(changes[0].old_path, "/dev/null");
+    assert_eq!(changes[0].current_path, "new.txt");
+    // Hg `--git` ADD uses the same `/dev/null` shape.
+    let hg_add = "diff -r abc123 new.txt\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hi\n";
+    let changes = parse_unified_diff(hg_add).unwrap();
+    assert_eq!(changes[0].change_type, TYPE_ADD);
+    assert_eq!(changes[0].old_path, "/dev/null");
+    // DELETE keeps the path on both sides (PHP discards the `+++`
+    // `/dev/null`, `:804-808` only sets the old path from `---`).
+    let delete = "diff --git a/old.txt b/old.txt\ndeleted file mode 100644\n--- a/old.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-bye\n";
+    let changes = parse_unified_diff(delete).unwrap();
+    assert_eq!(changes[0].change_type, TYPE_DELETE);
+    assert_eq!(changes[0].old_path, "old.txt");
+    assert_eq!(changes[0].current_path, "old.txt");
 }
 
 #[test]
@@ -1639,6 +1695,594 @@ fn gap2_leading_diff_cc_recovers_to_later_git_block() {
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].current_path, "g.txt");
     assert_eq!(changes[0].hunks.len(), 1);
+}
+
+/* T1153 wave 3 parser halves: EXPORT-E11..E24/E37 + E20. */
+
+fn e_headers(body: &str) -> String {
+    format!("diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n{body}")
+}
+
+#[test]
+fn e11_hunk_length_explicitness_bits() {
+    // Explicit `,length` on both sides.
+    let changes = parse_unified_diff(&e_headers("@@ -1,2 +1,3 @@\n a\n+b\n c\n")).unwrap();
+    assert_eq!(changes[0].hunks.len(), 1);
+    assert_eq!(
+        changes[0].hunk_len_explicit,
+        vec![HunkLenExplicit {
+            old_explicit: true,
+            new_explicit: true,
+        }]
+    );
+    // Bare offsets imply length 1 and encode as numbers.
+    let changes = parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\n+b\n")).unwrap();
+    assert_eq!(
+        changes[0].hunk_len_explicit,
+        vec![HunkLenExplicit {
+            old_explicit: false,
+            new_explicit: false,
+        }]
+    );
+    // Spelled `,1` differs from omitted (string "1" vs number 1).
+    let changes = parse_unified_diff(&e_headers("@@ -1,1 +1,1 @@\n-a\n+b\n")).unwrap();
+    assert_eq!(
+        (changes[0].hunks[0].old_len, changes[0].hunks[0].new_len),
+        (1, 1)
+    );
+    assert_eq!(
+        changes[0].hunk_len_explicit,
+        vec![HunkLenExplicit {
+            old_explicit: true,
+            new_explicit: true,
+        }]
+    );
+    // Mixed: explicit old, bare new.
+    let changes = parse_unified_diff(&e_headers("@@ -0,0 +1 @@\n+hi\n")).unwrap();
+    assert_eq!(
+        changes[0].hunk_len_explicit,
+        vec![HunkLenExplicit {
+            old_explicit: true,
+            new_explicit: false,
+        }]
+    );
+}
+
+#[test]
+fn e12_corpus_retains_original_line_endings() {
+    // CRLF bodies keep `\r\n`.
+    let changes = parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\r\n+b\r\n")).unwrap();
+    assert_eq!(changes[0].hunks[0].corpus, "-a\r\n+b\r\n");
+    // An unterminated final line stays unterminated.
+    let changes = parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\n+b")).unwrap();
+    assert_eq!(changes[0].hunks[0].corpus, "-a\n+b");
+    // LF bodies are byte-identical to before.
+    let changes = parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\n+b\n")).unwrap();
+    assert_eq!(changes[0].hunks[0].corpus, "-a\n+b\n");
+}
+
+#[test]
+fn e13_filemodes_retained_through_parser() {
+    let text = "diff --git a/f.txt b/f.txt\nold mode 100644\nnew mode 100755\n";
+    let changes = parse_unified_diff(text).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].change_type, TYPE_CHANGE);
+    assert_eq!(changes[0].old_mode.as_deref(), Some("100644"));
+    assert_eq!(changes[0].new_mode.as_deref(), Some("100755"));
+
+    let add = "diff --git a/n.txt b/n.txt\nnew file mode 100644\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1 @@\n+hi\n";
+    let changes = parse_unified_diff(add).unwrap();
+    assert_eq!(changes[0].change_type, TYPE_ADD);
+    assert_eq!(changes[0].old_mode, None);
+    assert_eq!(changes[0].new_mode.as_deref(), Some("100644"));
+
+    let delete = "diff --git a/o.txt b/o.txt\ndeleted file mode 100644\n--- a/o.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-bye\n";
+    let changes = parse_unified_diff(delete).unwrap();
+    assert_eq!(changes[0].change_type, TYPE_DELETE);
+    assert_eq!(changes[0].old_mode.as_deref(), Some("100644"));
+    assert_eq!(changes[0].new_mode, None);
+
+    // Plain changes carry no modes.
+    let changes = parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\n+b\n")).unwrap();
+    assert_eq!(changes[0].old_mode, None);
+    assert_eq!(changes[0].new_mode, None);
+}
+
+#[test]
+fn e15_hunk_body_validates_line_counts() {
+    // Too few lines.
+    let err = parse_unified_diff(&e_headers("@@ -1,2 +1,2 @@\n a\n+b\n")).unwrap_err();
+    assert!(err.contains(WRONG_HUNK_LINE_COUNT), "{err:?}");
+    // Too many added lines (counter goes negative).
+    let err = parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\n+b\n+c\n")).unwrap_err();
+    assert!(err.contains(WRONG_HUNK_LINE_COUNT), "{err:?}");
+    // Too many removed lines.
+    let err = parse_unified_diff(&e_headers("@@ -1,2 +1,1 @@\n-a\n-b\n-c\n+d\n")).unwrap_err();
+    assert!(err.contains(WRONG_HUNK_LINE_COUNT), "{err:?}");
+    // A new header with unexhausted counts fails at that line.
+    let err =
+        parse_unified_diff(&e_headers("@@ -1,2 +1,2 @@\n a\n@@ -9 +9 @@\n-b\n+c\n")).unwrap_err();
+    assert!(err.contains(WRONG_HUNK_LINE_COUNT), "{err:?}");
+    assert!(err.contains("@@ -9 +9 @@"), "{err:?}");
+    // The next block with unexhausted counts fails too.
+    let err = parse_unified_diff(&format!(
+        "{}diff --git a/g.txt b/g.txt\n--- a/g.txt\n+++ b/g.txt\n@@ -1 +1 @@\n-x\n+y\n",
+        e_headers("@@ -1,2 +1,2 @@\n a\n")
+    ))
+    .unwrap_err();
+    assert!(err.contains(WRONG_HUNK_LINE_COUNT), "{err:?}");
+}
+
+#[test]
+fn e15_hunk_boundaries_mirror_php() {
+    // A context line past exhausted counts ends the hunk (consumed).
+    let changes =
+        parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\n+b\n c\n@@ -2 +2 @@\n-d\n+e\n")).unwrap();
+    assert_eq!(changes[0].hunks.len(), 2);
+    assert_eq!(changes[0].hunks[0].corpus, "-a\n+b\n");
+    assert_eq!(changes[0].hunks[1].corpus, "-d\n+e\n");
+    // A `-` line with the old side exhausted holds for a following
+    // file (here skipped as between-block noise).
+    let changes = parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\n+b\n--- stray\n")).unwrap();
+    assert_eq!(changes[0].hunks.len(), 1);
+    assert_eq!(changes[0].hunks[0].corpus, "-a\n+b\n");
+    // ...but with the new side unexhausted it is a miscount.
+    let err = parse_unified_diff(&e_headers("@@ -1,1 +1,2 @@\n-a\n+b\n-c\n+d\n")).unwrap_err();
+    assert!(err.contains(WRONG_HUNK_LINE_COUNT), "{err:?}");
+    // Empty lines count as context (`diff.suppressBlankEmpty`).
+    let changes = parse_unified_diff(&e_headers("@@ -1,2 +1,2 @@\n a\n\n b\n")).unwrap();
+    assert_eq!(changes[0].hunks[0].corpus, " a\n\n");
+    // A zero-length hunk holds no body.
+    let changes = parse_unified_diff(&e_headers("@@ -0,0 +0,0 @@\n")).unwrap();
+    assert_eq!(changes[0].hunks.len(), 1);
+    assert!(changes[0].hunks[0].corpus.is_empty());
+}
+
+#[test]
+fn e15_no_newline_markers_validate_and_persist() {
+    // Malformed `\` lines fail.
+    let err = parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\n\\ bogus\n+b\n")).unwrap_err();
+    assert!(err.contains(EXPECTED_NO_NEWLINE_MARKER), "{err:?}");
+    // Well-formed markers persist in the corpus; a middle marker
+    // (new side unexhausted) continues the hunk.
+    let changes = parse_unified_diff(&e_headers(
+        "@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+b\n\\ No newline at end of file\n",
+    ))
+    .unwrap();
+    assert_eq!(
+        changes[0].hunks[0].corpus,
+        "-a\n\\ No newline at end of file\n+b\n\\ No newline at end of file\n"
+    );
+}
+
+#[test]
+fn e15_malformed_hunk_headers_fail() {
+    // Missing closing `@@`.
+    let err = parse_unified_diff(&e_headers("@@ -1 +1\n-a\n+b\n")).unwrap_err();
+    assert!(err.contains(EXPECTED_HUNK_HEADER), "{err:?}");
+    // Combined-style third range.
+    let err = parse_unified_diff(&e_headers("@@ -1,2 +1,2 +1,2 @@\n-a\n+b\n")).unwrap_err();
+    assert!(err.contains(EXPECTED_HUNK_HEADER), "{err:?}");
+    // Non-numeric range.
+    let err = parse_unified_diff(&e_headers("@@ -a +1 @@\n-a\n+b\n")).unwrap_err();
+    assert!(err.contains(EXPECTED_HUNK_HEADER), "{err:?}");
+    // Without `---`/`+++` the failure names the hunk target instead.
+    let err = parse_unified_diff("diff --git a/f.txt b/f.txt\n@@ -1 +1\n").unwrap_err();
+    assert!(err.contains(EXPECTED_HUNK_TARGET), "{err:?}");
+}
+
+#[test]
+fn e16_c_quoted_paths_decode_like_php() {
+    // `---`/`+++` paths stay literal, quotes included.
+    let changes = parse_unified_diff(
+        "diff --git a/f.txt b/f.txt\n--- \"a/old name\"\n+++ \"b/new name\"\n@@ -1 +1 @@\n-a\n+b\n",
+    )
+    .unwrap();
+    assert_eq!(changes[0].old_path, "\"a/old name\"");
+    assert_eq!(changes[0].current_path, "\"b/new name\"");
+    // The `diff --git` pair decodes (quoted, with spaces).
+    let changes = parse_unified_diff(
+        "diff --git \"a/old name\" \"b/old name\"\n--- \"a/old name\"\n+++ \"b/old name\"\n@@ -1 +1 @@\n-a\n+b\n",
+    )
+    .unwrap();
+    // Non-rename `+++` still overwrites from the literal line (the
+    // `+++`-discard applies to resolved renames/copies only).
+    assert_eq!(changes[0].old_path, "\"a/old name\"");
+    assert_eq!(changes[0].current_path, "\"b/old name\"");
+    // Quoted renames decode the `rename to` side and keep the
+    // literal `---` old path (PHP overwrites the decoded source).
+    let changes = parse_unified_diff(
+        "diff --git \"a/o n\" \"b/n n\"\nrename from \"o n\"\nrename to \"n n\"\n--- \"a/o n\"\n+++ \"b/n n\"\n@@ -1 +1 @@\n-x\n+y\n",
+    )
+    .unwrap();
+    assert_eq!(changes[0].change_type, TYPE_MOVE_HERE);
+    assert_eq!(changes[0].old_path, "\"a/o n\"");
+    assert_eq!(changes[0].current_path, "n n");
+    // Octal escapes decode to bytes.
+    let changes = parse_unified_diff(
+        "diff --git \"a/f\\303\\244\" \"b/f\\303\\244\"\n--- \"a/f\\303\\244\"\n+++ \"b/f\\303\\244\"\n@@ -1 +1 @@\n-a\n+b\n",
+    )
+    .unwrap();
+    assert_eq!(changes[0].old_path, "\"a/f\\303\\244\"");
+    // Unquoted paths are untouched.
+    let changes = parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\n+b\n")).unwrap();
+    assert_eq!(changes[0].old_path, "f.txt");
+    assert_eq!(changes[0].current_path, "f.txt");
+}
+
+#[test]
+fn e16_git_common_filename_and_unescape_units() {
+    assert_eq!(
+        extract_git_common_filename("a/f.txt b/f.txt", false).as_deref(),
+        Some("f.txt")
+    );
+    assert_eq!(
+        extract_git_common_filename("\"a/old name\" \"b/old name\"", false).as_deref(),
+        Some("old name")
+    );
+    assert_eq!(extract_git_common_filename("a/o b/n", false), None);
+    assert_eq!(
+        extract_git_common_filename("a/f.txt b/f.txt junk", false),
+        None
+    );
+    assert_eq!(
+        extract_git_common_filename("src/f dst/f", false).as_deref(),
+        Some("f")
+    );
+    assert_eq!(
+        extract_git_common_filename("f f", false).as_deref(),
+        Some("f")
+    );
+    assert_eq!(
+        extract_git_common_filename("a/ a/", false).as_deref(),
+        Some("a/")
+    );
+    assert_eq!(
+        extract_git_common_filename("/f /f", false).as_deref(),
+        Some("/f")
+    );
+    assert_eq!(unescape_git_filename("\"a\\tb\"", false), "a\tb");
+    assert_eq!(unescape_git_filename("\"a\\303\\244\"", false), "aä");
+    assert_eq!(unescape_git_filename("plain", false), "plain");
+    assert_eq!(unescape_git_filename("\"\"", false), "\"\"");
+    assert_eq!(stripcslashes("a\\nb\\ x", false), "a\nb x");
+    assert_eq!(stripcslashes("\\101", false), "A");
+    // Degenerate `a/`-only targets strip like PHP.
+    assert_eq!(diff_path_value("--- a/", false), "");
+    assert_eq!(strip_ab_prefix("a/"), "");
+}
+
+#[test]
+fn e21_typechange_blocks_merge_to_change() {
+    // Real git form (probed): a delete block plus an add block.
+    let text = "diff --git a/link b/link\n\
+        deleted file mode 120000\n\
+        index ac558a3..0000000\n\
+        --- a/link\n\
+        +++ /dev/null\n\
+        @@ -1 +0,0 @@\n\
+        -real\n\
+        \\ No newline at end of file\n\
+        diff --git a/link b/link\n\
+        new file mode 100644\n\
+        index 0000000..d95f3ad\n\
+        --- /dev/null\n\
+        +++ b/link\n\
+        @@ -0,0 +1 @@\n\
+        +content\n";
+    let changes = parse_unified_diff(text).unwrap();
+    assert_eq!(changes.len(), 1);
+    let change = &changes[0];
+    assert_eq!(change.change_type, TYPE_CHANGE);
+    assert_eq!(change.old_path, "/dev/null");
+    assert_eq!(change.current_path, "link");
+    assert_eq!(change.old_mode.as_deref(), Some("120000"));
+    assert_eq!(change.new_mode.as_deref(), Some("100644"));
+    assert_eq!(change.hunks.len(), 1);
+    assert_eq!(change.hunks[0].corpus, "+content\n");
+    // Reversed order (add then delete) deletes unconditionally.
+    let text = "diff --git a/f b/f\n\
+        new file mode 100644\n\
+        --- /dev/null\n\
+        +++ b/f\n\
+        @@ -0,0 +1 @@\n\
+        +hi\n\
+        diff --git a/f b/f\n\
+        deleted file mode 100644\n\
+        --- a/f\n\
+        +++ /dev/null\n\
+        @@ -1 +0,0 @@\n\
+        -hi\n";
+    let changes = parse_unified_diff(text).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].change_type, TYPE_DELETE);
+    // Both flags in one block read as delete-then-new.
+    let text = "diff --git a/f b/f\n\
+        deleted file mode 120000\n\
+        new file mode 100644\n\
+        --- a/f\n\
+        +++ b/f\n\
+        @@ -1 +1 @@\n\
+        -a\n\
+        +b\n";
+    let changes = parse_unified_diff(text).unwrap();
+    assert_eq!(changes[0].change_type, TYPE_CHANGE);
+}
+
+#[test]
+fn e22_files_differ_wording_is_binary() {
+    let text = "diff --git a/f b/f\nFiles a/f and b/f differ\n";
+    let changes = parse_unified_diff(text).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].file_type, FILE_BINARY);
+    assert!(changes[0].hunks.is_empty());
+    assert_eq!(changes[0].hunk_len_explicit.len(), 0);
+}
+
+#[test]
+fn e23_malformed_binary_lines_fail() {
+    // Before `---`/`+++`: the hunk-target text.
+    let err = parse_unified_diff("diff --git a/f b/f\nBinary files x\n").unwrap_err();
+    assert!(err.contains(EXPECTED_HUNK_TARGET), "{err:?}");
+    // Past the paths: the hunk-header text.
+    let err = parse_unified_diff(&e_headers("Binary files x\n")).unwrap_err();
+    assert!(err.contains(EXPECTED_HUNK_HEADER), "{err:?}");
+    // The `Files` wording without a tail fails the same way.
+    let err = parse_unified_diff("diff --git a/f b/f\nFiles x\n").unwrap_err();
+    assert!(err.contains(EXPECTED_HUNK_TARGET), "{err:?}");
+}
+
+#[test]
+fn e24_duplicate_blocks_merge_later_wins() {
+    // Later hunks win; the position stays stable.
+    let text = "Index: b.txt\n\
+        --- b.txt\t(revision 1)\n\
+        +++ b.txt\t(working copy)\n\
+        @@ -1 +1 @@\n\
+        -b\n\
+        +B\n\
+        Index: a.txt\n\
+        --- a.txt\t(revision 1)\n\
+        +++ a.txt\t(working copy)\n\
+        @@ -1 +1 @@\n\
+        -a\n\
+        +A\n\
+        Index: b.txt\n\
+        --- b.txt\t(revision 2)\n\
+        +++ b.txt\t(working copy)\n\
+        @@ -1 +1 @@\n\
+        -b\n\
+        +B2\n";
+    let changes = parse_unified_diff(text).unwrap();
+    assert_eq!(changes.len(), 2);
+    assert_eq!(changes[0].current_path, "b.txt");
+    assert_eq!(changes[0].hunks[0].corpus, "-b\n+B2\n");
+    assert_eq!(changes[1].current_path, "a.txt");
+    // An armless incoming block keeps the existing type (PHP
+    // mutates the reused change through arms only).
+    let text = "diff --git a/f b/f\n\
+        deleted file mode 100644\n\
+        --- a/f\n\
+        +++ /dev/null\n\
+        @@ -1 +0,0 @@\n\
+        -x\n\
+        diff --git a/f b/f\n\
+        --- a/f\n\
+        +++ b/f\n\
+        @@ -1 +1 @@\n\
+        -x\n\
+        +y\n";
+    let changes = parse_unified_diff(text).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].change_type, TYPE_DELETE);
+    assert_eq!(changes[0].hunks[0].corpus, "-x\n+y\n");
+    // Binary is sticky across the merge.
+    let text = "diff --git a/f b/f\n\
+        Binary files a/f and b/f differ\n\
+        diff --git a/f b/f\n\
+        --- a/f\n\
+        +++ b/f\n\
+        @@ -1 +1 @@\n\
+        -a\n\
+        +b\n";
+    let changes = parse_unified_diff(text).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].file_type, FILE_BINARY);
+    assert_eq!(changes[0].hunks[0].corpus, "-a\n+b\n");
+    // Filemodes union across the merge.
+    let text = "diff --git a/f b/f\n\
+        old mode 100644\n\
+        diff --git a/f b/f\n\
+        new mode 100755\n";
+    let changes = parse_unified_diff(text).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].old_mode.as_deref(), Some("100644"));
+    assert_eq!(changes[0].new_mode.as_deref(), Some("100755"));
+}
+
+#[test]
+fn e24_rename_blocks_never_merge() {
+    // Unkeyed rename/copy blocks stay separate (like PHP's
+    // `buildChange(null)`). Companion folding is EXPORT-E14
+    // carry-over: the export side fabricates one companion per
+    // here-change today.
+    let text = "diff --git a/src b/one\n\
+        copy from src\n\
+        copy to one\n\
+        --- a/src\n\
+        +++ b/one\n\
+        @@ -1 +1 @@\n\
+        -a\n\
+        +b\n\
+        diff --git a/src b/two\n\
+        copy from src\n\
+        copy to two\n\
+        --- a/src\n\
+        +++ b/two\n\
+        @@ -1 +1 @@\n\
+        -a\n\
+        +b\n";
+    let changes = parse_unified_diff(text).unwrap();
+    assert_eq!(changes.len(), 2);
+    assert_eq!(changes[0].change_type, TYPE_COPY_HERE);
+    assert_eq!(changes[1].change_type, TYPE_COPY_HERE);
+}
+
+#[test]
+fn e37_hg_binary_changed_marker_is_binary() {
+    let text = "diff -r abc123 f.bin\nBinary file f.bin has changed\n";
+    let changes = parse_unified_diff(text).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].current_path, "f.bin");
+    assert_eq!(changes[0].file_type, FILE_BINARY);
+    assert!(changes[0].hunks.is_empty());
+}
+
+#[test]
+fn e20_synthetic_predicate_flags_pure_moves() {
+    let pure =
+        "diff --git a/o.txt b/n.txt\nsimilarity index 100%\nrename from o.txt\nrename to n.txt\n";
+    let changes = parse_unified_diff(pure).unwrap();
+    assert_eq!(changes[0].change_type, TYPE_MOVE_HERE);
+    assert!(changes[0].hunks.is_empty());
+    assert!(needs_synthetic_git_hunks(&changes[0]));
+
+    let moved = "diff --git a/o.txt b/n.txt\nrename from o.txt\nrename to n.txt\n--- a/o.txt\n+++ b/n.txt\n@@ -1 +1 @@\n-x\n+y\n";
+    let changes = parse_unified_diff(moved).unwrap();
+    assert!(!needs_synthetic_git_hunks(&changes[0]));
+
+    let plain = parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\n+b\n")).unwrap();
+    assert!(!needs_synthetic_git_hunks(&plain[0]));
+}
+
+#[test]
+fn e14_single_move_gains_away_companion() {
+    // T1153 EXPORT-E14: one rename yields the here-change plus a
+    // `MOVE_AWAY` companion (null old path, away path set) right after
+    // it, like PHP's `buildChange($oldPath)` (`:668-687`).
+    let text = "diff --git a/g.txt b/h.txt\nsimilarity index 90%\nrename from g.txt\nrename to h.txt\n--- a/g.txt\n+++ b/h.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    let full = with_companions(&parse_unified_diff(text).unwrap());
+    assert_eq!(full.len(), 2);
+    assert_eq!(full[0].change_type, TYPE_MOVE_HERE);
+    assert_eq!(full[1].change_type, TYPE_MOVE_AWAY);
+    assert_eq!(full[1].current_path, "g.txt");
+    assert!(full[1].old_path.is_empty());
+    assert_eq!(full[1].away_paths, vec!["h.txt".to_string()]);
+    assert!(full[1].hunks.is_empty());
+    assert_eq!(full[1].file_type, FILE_TEXT);
+}
+
+#[test]
+fn e14_repeats_from_one_source_fold_to_one_companion() {
+    // T1153 EXPORT-E14: two copies from one source fold to one
+    // `COPY_AWAY` with both away paths (`:654-666`); a move folded
+    // onto it retypes to `MULTICOPY` (`:677-678`).
+    let text = "diff --git a/src b/one\ncopy from src\ncopy to one\n--- a/src\n+++ b/one\n@@ -1 +1 @@\n-a\n+b\n\
+        diff --git a/src b/two\ncopy from src\ncopy to two\n--- a/src\n+++ b/two\n@@ -1 +1 @@\n-a\n+b\n";
+    let full = with_companions(&parse_unified_diff(text).unwrap());
+    assert_eq!(full.len(), 3);
+    assert_eq!(full[1].change_type, TYPE_COPY_AWAY);
+    assert_eq!(full[1].current_path, "src");
+    assert_eq!(
+        full[1].away_paths,
+        vec!["one".to_string(), "two".to_string()]
+    );
+    // A move onto the copy-away retypes to multicopy.
+    let mut fold = CompanionFold::new();
+    let (at, is_new) = fold.fold(TYPE_COPY_HERE, "src", "one");
+    assert!(is_new);
+    let (again, is_new) = fold.fold(TYPE_MOVE_HERE, "src", "two");
+    assert!(!is_new);
+    assert_eq!(again, at);
+    assert_eq!(fold.companion(at).change_type, TYPE_MULTICOPY);
+    assert_eq!(
+        fold.companion(at).away_paths,
+        vec!["one".to_string(), "two".to_string()]
+    );
+}
+
+#[test]
+fn e14_with_companions_skips_paired_and_repeats() {
+    // T1153 EXPORT-E14: here-changes the Subversion collector already
+    // paired keep their companion (no double), and re-running the
+    // fold is a no-op.
+    let text =
+        "diff --git a/g.txt b/h.txt\nsimilarity index 100%\nrename from g.txt\nrename to h.txt\n";
+    let once = with_companions(&parse_unified_diff(text).unwrap());
+    assert_eq!(once.len(), 2);
+    let twice = with_companions(&once);
+    assert_eq!(twice, once);
+    // Non-moves pass through untouched.
+    let plain = parse_unified_diff(&e_headers("@@ -1 +1 @@\n-a\n+b\n")).unwrap();
+    assert_eq!(with_companions(&plain), plain);
+}
+
+#[test]
+fn e20_attach_fabricates_here_and_companion_hunks() {
+    // T1153 EXPORT-E20: `attach_synthetic_git_hunks` runs the
+    // `loadSyntheticData()` fabrication over folded companions too:
+    // the here-change gains context hunks (counts kept from the
+    // add-side reparse), the move-away companion delete-side hunks.
+    let text =
+        "diff --git a/o.txt b/n.txt\nsimilarity index 100%\nrename from o.txt\nrename to n.txt\n";
+    let mut full = with_companions(&parse_unified_diff(text).unwrap());
+    assert_eq!(full.len(), 2);
+    let raw_for = |path: &str| -> Result<String, String> {
+        if path == "n.txt" {
+            Ok("diff --git a/n.txt b/n.txt\nnew file mode 100644\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1,2 @@\n+one\n+two\n".to_string())
+        } else {
+            Ok("diff --git a/o.txt b/o.txt\ndeleted file mode 100644\n--- a/o.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-one\n-two\n".to_string())
+        }
+    };
+    attach_synthetic_git_hunks(&mut full, &raw_for).unwrap();
+    assert_eq!(full[0].hunks.len(), 1);
+    assert_eq!(full[0].hunks[0].corpus, " one\n two\n");
+    assert_eq!(hunk_counts(&full[0].hunks[0]), (2, 0));
+    assert_eq!(full[1].hunks.len(), 1);
+    assert_eq!(full[1].hunks[0].corpus, "-one\n-two\n");
+    assert_eq!(hunk_counts(&full[1].hunks[0]), (0, 2));
+    // Paths with no reparse match keep no hunks, like PHP.
+    let mut lonely = with_companions(&parse_unified_diff(text).unwrap());
+    let empty = |_: &str| -> Result<String, String> {
+        Ok("diff --git a/q b/q\n--- a/q\n+++ b/q\n@@ -1 +1 @@\n-a\n+b\n".to_string())
+    };
+    attach_synthetic_git_hunks(&mut lonely, &empty).unwrap();
+    assert!(lonely[0].hunks.is_empty());
+    assert!(lonely[1].hunks.is_empty());
+}
+
+#[test]
+fn e20_synthetic_hunks_rewrite_adds_to_context() {
+    // A pure-move reparse reads as an add; `+` rewrites to ` `.
+    let raw = "diff --git a/n.txt b/n.txt\nnew file mode 100644\n--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1,2 @@\n+one\n+two\n";
+    let made = synthetic_hunks_for_path(raw, "n.txt").unwrap().unwrap();
+    assert_eq!(made.file_type, FILE_TEXT);
+    assert_eq!(made.hunks.len(), 1);
+    assert_eq!(
+        (
+            made.hunks[0].old_start,
+            made.hunks[0].old_len,
+            made.hunks[0].new_start,
+            made.hunks[0].new_len,
+        ),
+        (0, 0, 1, 2)
+    );
+    assert_eq!(made.hunks[0].corpus, " one\n two\n");
+    // The move-source reparse reads as a delete; `-` lines persist.
+    let raw = "diff --git a/o.txt b/o.txt\ndeleted file mode 100644\n--- a/o.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-one\n-two\n";
+    let made = synthetic_hunks_for_path(raw, "o.txt").unwrap().unwrap();
+    assert_eq!(made.hunks[0].corpus, "-one\n-two\n");
+    // No change targets the path: nothing attaches.
+    assert!(
+        synthetic_hunks_for_path(raw, "elsewhere")
+            .unwrap()
+            .is_none()
+    );
+    // Binary reparses propagate the file type with no hunks.
+    let raw = "diff --git a/i.png b/i.png\nBinary files a/i.png and b/i.png differ\n";
+    let made = synthetic_hunks_for_path(raw, "i.png").unwrap().unwrap();
+    assert_eq!(made.file_type, FILE_BINARY);
+    assert!(made.hunks.is_empty());
 }
 
 struct FailingReader;
@@ -2544,6 +3188,9 @@ fn gap2_apply_svn_copy_info_flows() {
         change_type: TYPE_COPY_HERE,
         file_type: FILE_TEXT,
         hunks: Vec::new(),
+        hunk_len_explicit: Vec::new(),
+        old_mode: None,
+        new_mode: None,
         away_paths: Vec::new(),
         commit_hash: None,
         message: None,
@@ -2560,6 +3207,9 @@ fn gap2_apply_svn_copy_info_flows() {
             change_type: TYPE_MESSAGE,
             file_type: FILE_TEXT,
             hunks: Vec::new(),
+            hunk_len_explicit: Vec::new(),
+            old_mode: None,
+            new_mode: None,
             away_paths: Vec::new(),
             commit_hash: None,
             message: None,
@@ -4003,7 +4653,7 @@ fn ansi_lint_banners_gain_backgrounds() {
             None,
             &[],
             false,
-            &run(ChildOutcome::Code(code)),
+            &run(ChildOutcome::Code(code, Vec::new())),
             &mut out,
             false,
         )
@@ -4015,7 +4665,7 @@ fn ansi_lint_banners_gain_backgrounds() {
             None,
             &[],
             false,
-            &run(ChildOutcome::Code(code)),
+            &run(ChildOutcome::Code(code, Vec::new())),
             &mut out,
             true,
         )
@@ -4047,7 +4697,7 @@ fn ansi_unit_banners_gain_backgrounds() {
             None,
             &[],
             false,
-            &run(ChildOutcome::Code(code)),
+            &run(ChildOutcome::Code(code, Vec::new())),
             &mut input,
             &mut out,
             false,
@@ -4064,7 +4714,7 @@ fn ansi_unit_banners_gain_backgrounds() {
             None,
             &[],
             false,
-            &run(ChildOutcome::Code(code)),
+            &run(ChildOutcome::Code(code, Vec::new())),
             &mut input,
             &mut out,
             true,
@@ -4094,7 +4744,7 @@ fn ansi_unit_banners_gain_backgrounds() {
             None,
             &[],
             false,
-            &run(ChildOutcome::Code(UNIT_RESULT_UNSOUND)),
+            &run(ChildOutcome::Code(UNIT_RESULT_UNSOUND, Vec::new())),
             &mut input,
             &mut out,
             ansi,
@@ -4116,4 +4766,213 @@ fn ansi_working_copy_desc_underlines_path() {
         working_copy_desc_ansi("/repo", true),
         "  Working copy: \x1b[4m/repo\x1b[m\n\n"
     );
+}
+
+#[test]
+fn away_check_reads_user_query_lists() {
+    use std::io::Cursor;
+    let call = |method: &str, _: &serde_json::Value| {
+        assert_eq!(method, "user.query");
+        Ok(serde_json::json!([
+            {"userName": "bob", "realName": "Bob",
+             "currentStatus": "away", "currentStatusUntil": 1_700_000_000},
+        ]))
+    };
+    let mut message = CommitMessage::new_from_raw_corpus("Title\n").unwrap();
+    message.set_field_value(
+        "reviewerPHIDs",
+        FieldValue::List(vec!["PHID-USER-9".to_string()]),
+    );
+    let mut out = Vec::new();
+    validate_commit_message(
+        &mut Cursor::new(b"y\n".to_vec()),
+        &mut out,
+        &call,
+        &message,
+        "PHID-USER-me",
+        0,
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("bob"), "unexpected: {text}");
+}
+
+#[test]
+fn from_revision_corpus_fetch_sends_edit_false() {
+    use std::io::Cursor;
+    let seen: std::rc::Rc<std::cell::RefCell<Vec<serde_json::Value>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let probe = seen.clone();
+    let call = move |method: &str, params: &serde_json::Value| {
+        if method == "differential.getcommitmessage" {
+            probe.borrow_mut().push(params.clone());
+            return Ok(serde_json::json!("Template title\n"));
+        }
+        if method == "differential.query" {
+            return Ok(serde_json::json!([
+                {"id": 7, "title": "Mine",
+                 "authorPHID": "PHID-USER-me", "statusName": "Draft"},
+            ]));
+        }
+        Ok(serde_json::json!({"fields": {}}))
+    };
+    let mut out = Vec::new();
+    get_commit_message_from_revision_with(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &call,
+        "7",
+        "PHID-USER-me",
+    )
+    .unwrap();
+    assert_eq!(
+        *seen.borrow(),
+        vec![serde_json::json!({"revision_id": 7, "edit": false})]
+    );
+}
+
+// -( R5 TTY gating: DIFF-D16 )------------------------------------------------
+
+#[test]
+fn r5_diff_d16_unsound_shows_y_n_default() {
+    // `ArcanistDiffWorkflow.php:1241-1244` calls
+    // `phutil_console_confirm()` with the default `$default_no`, so the
+    // unsound prompt renders `[y/N]` and Enter declines.
+    use std::io::Cursor;
+    let dir = std::env::temp_dir();
+    let run = |_: &Path, _: &[String]| ChildOutcome::Code(UNIT_RESULT_UNSOUND, Vec::new());
+    let mut out = Vec::new();
+    let mut input = Cursor::new(b"y\n".to_vec());
+    assert_eq!(
+        run_unit(&dir, None, &[], false, &run, &mut input, &mut out).unwrap(),
+        (Some(UNIT_RESULT_UNSOUND), Vec::new())
+    );
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("[y/N]"), "{text}");
+    assert!(!text.contains("[Y/n]"), "{text}");
+}
+
+/* T1153 DIFF-D findings: numeric grammar, hg bookmarks, hg prefills. */
+
+#[test]
+fn d21_is_php_numeric_matches_ceb() {
+    for numeric in [
+        "123", "+123", "-123", "12.3", ".5", "5.", "1e3", "1E3", "2e-2", "+.5e+2",
+    ] {
+        assert!(is_php_numeric(numeric), "{numeric}");
+    }
+    for other in [
+        "", ".", "e3", "1e", "0x10", "12x", "1.2.3", " 12", "D12", "NaN", "inf",
+    ] {
+        assert!(!is_php_numeric(other), "{other}");
+    }
+}
+
+#[test]
+fn d19_parses_hg_active_bookmark() {
+    let output = "  old                       1:aaa\n* active                    3:bbb\n  other                     2:ccc\n";
+    assert_eq!(parse_hg_active_bookmark(output).as_deref(), Some("active"));
+    assert_eq!(parse_hg_active_bookmark("  none  1:aaa\n"), None);
+    assert_eq!(parse_hg_active_bookmark(""), None);
+    assert_eq!(parse_hg_active_bookmark("*\n"), None);
+}
+
+#[test]
+fn d9_selects_usable_hg_messages() {
+    let pairs = vec![
+        ("n3".to_string(), "third\n".to_string()),
+        ("n2".to_string(), "second\n".to_string()),
+        ("n1".to_string(), "first\n".to_string()),
+    ];
+    let empty: HashSet<String> = HashSet::new();
+    assert_eq!(
+        select_usable_hg_messages(&pairs, &empty),
+        vec![
+            "third\n".to_string(),
+            "second\n".to_string(),
+            "first\n".to_string()
+        ]
+    );
+    // One message means an amend workflow: nothing usable.
+    assert!(select_usable_hg_messages(&pairs[..1], &empty).is_empty());
+    // Attached commits stop the scan.
+    let attached: HashSet<String> = ["n2".to_string()].into_iter().collect();
+    assert_eq!(
+        select_usable_hg_messages(&pairs, &attached),
+        vec!["third\n".to_string()]
+    );
+}
+
+#[test]
+fn d8_partial_fields_merge_on_parser_errors() {
+    // DIFF-D8 (`:1876`): conduit parser errors add note lines but the
+    // partial fields still merge into the defaults.
+    let call = |method: &str, _: &serde_json::Value| {
+        assert_eq!(method, diff_submit::METHOD_PARSE_COMMIT_MESSAGE);
+        Ok(serde_json::json!({
+            "fields": {"title": "Part", "summary": "kept"},
+            "errors": ["unknown reviewer robert"],
+        }))
+    };
+    let local = vec![LocalCommitInfo {
+        commit: "abcdef1234567890".to_string(),
+        tree: String::new(),
+        parents: Vec::new(),
+        time: String::new(),
+        author: "t".to_string(),
+        summary: "Part".to_string(),
+        message: "Part\n".to_string(),
+        author_email: String::new(),
+    }];
+    let (fields, included, notes) =
+        get_default_create_fields_with(&call, &local, true, None, None, false).unwrap();
+    assert_eq!(
+        fields.get("title"),
+        Some(&FieldValue::Text("Part".to_string()))
+    );
+    assert_eq!(
+        fields.get("summary"),
+        Some(&FieldValue::Text("kept".to_string()))
+    );
+    assert_eq!(included, vec!["abcdef123456 Part".to_string()]);
+    assert_eq!(
+        notes,
+        vec![
+            "NOTE: commit abcdef123456 could not be completely parsed:".to_string(),
+            "  - unknown reviewer robert".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn d8_saved_template_zero_scratch_is_falsy() {
+    // DIFF-D8: PHP tests `if ($saved)`, so a `"0"` scratch file counts
+    // as no saved message (no notice, no prompt).
+    use std::io::Cursor;
+    let root = gap2_d1_scratch("d8-zero");
+    let meta = root.join(".git");
+    diff::write_scratch_file(&meta, SCRATCH_CREATE_MESSAGE, "0");
+    let mut out = Vec::new();
+    let reused = resolve_saved_template(
+        &mut Cursor::new(b"".to_vec()),
+        &mut out,
+        &meta,
+        &root,
+        false,
+    )
+    .unwrap();
+    assert_eq!(reused, None);
+    assert!(out.is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn d8_saved_notice_zero_preview_omits_block() {
+    // DIFF-D8: PHP tests `if ($preview)`, so a `"0"` first line omits
+    // the `Message begins:` block like an empty preview.
+    let with_zero = saved_message_notice("/tmp/x", "0");
+    assert!(!with_zero.contains("Message begins:"), "{with_zero}");
+    assert!(with_zero.contains("You can use this message"));
+    let with_text = saved_message_notice("/tmp/x", "Hello");
+    assert!(with_text.contains("Message begins:"), "{with_text}");
 }
