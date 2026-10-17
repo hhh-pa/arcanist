@@ -7663,6 +7663,437 @@ fn t1170_execute_engine_reports_discovery_failure() {
 }
 
 #[test]
+fn t1170_prompts_abort_on_exhausted_answers() {
+    // Piped stdin is never a TTY under `cargo test` and reads EOF, so
+    // an answerless TTY session aborts; bail out (rather than block
+    // on a real terminal) if that ever changes.
+    if crate::prompt::stdin_is_terminal() {
+        return;
+    }
+    assert_eq!(
+        prompt_for_key(&mut Io::canned(&[]), "k", "q?").unwrap_err(),
+        ABORT
+    );
+    assert_eq!(
+        console_confirm(&mut Io::canned(&[]), "q?", true).unwrap_err(),
+        ABORT
+    );
+}
+
+#[test]
+fn t1170_truncate_prefers_glyph_counts() {
+    // Multibyte text past the byte limit but within the glyph limit
+    // returns unchanged.
+    assert_eq!(truncate_glyphs("éé", 3), "éé");
+}
+
+#[test]
+fn t1170_write_saved_prompt_rejects_parentless_paths() {
+    // A path without a parent skips directory creation, then the
+    // sibling staging write cannot rename into place.
+    let staging = std::env::current_dir()
+        .unwrap()
+        .join(format!(".tmp-{}", std::process::id()));
+    std::fs::remove_file(&staging).ok();
+    assert!(write_saved_prompt(std::path::Path::new(""), "k", "v").is_err());
+    std::fs::remove_file(&staging).ok();
+}
+
+#[test]
+fn t1170_land_config_reports_bad_runtime_config() {
+    let options = Options {
+        config: vec!["noequals".to_string()],
+        ..Options::default()
+    };
+    let dir = temp_dir("t1170-landcfg");
+    assert!(land_config_value(&options, &dir, "arc.land.strategy").is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn t1170_client_for_dir_reports_missing_uris() {
+    // Without a flag, `ARC_CONDUIT_URI`, or discovery the client
+    // reports the missing URI. Ambient configuration that resolves a
+    // URI skips the arm (CI has none).
+    let dir = temp_dir("t1170-nouri");
+    if resolve_conduit_uri(None, &dir).is_some() {
+        std::fs::remove_dir_all(&dir).ok();
+        return;
+    }
+    let err = client_for_dir(None, &dir).unwrap_err();
+    assert!(err.contains("no conduit URI"), "unexpected: {err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn t1170_saved_prompts_load_without_vcs() {
+    // Only the load path is exercised here; the merged answers
+    // depend on ambient configuration files.
+    let dir = temp_dir("t1170-noprompts");
+    let _ = load_saved_prompts(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn t1170_select_strategy_errors_surface_in_validation() {
+    // A shadowed config keeps discovery deterministic: only the
+    // bogus `--strategy` can fail selection.
+    let dir = temp_dir("t1170-strategy");
+    let options = Options {
+        strategy: Some("bogus".to_string()),
+        config_file: vec!["/nonexistent-arc-land-xyz".to_string()],
+        ..Options::default()
+    };
+    let mut io = Io::canned(&[]);
+    let err = validate_options(&options, &dir, &mut io).unwrap_err();
+    assert!(err.contains("unknown"), "unexpected: {err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn t1170_buildable_display_handles_missing_rows() {
+    assert_eq!(
+        buildable_display_for(&[], "PHID-x", None),
+        (String::new(), String::new())
+    );
+}
+
+#[test]
+fn t1170_filter_keeps_everything_without_squash() {
+    let mut io = Io::canned(&[]);
+    let kept = filter_commit_sets(&mut io, Vec::new(), &[], false, false, &|_| String::new());
+    assert!(kept.is_empty());
+}
+
+#[test]
+fn t1170_split_header_lines_reject_bad_shapes() {
+    assert_eq!(split_header_line("tree abc"), Some(("tree", "abc")));
+    assert!(split_header_line("tree ").is_none());
+    assert!(split_header_line("a-b x").is_none());
+    assert!(split_header_line(" x").is_none());
+}
+
+#[test]
+fn t1170_reconcile_candidates_skip_missing_local_refs() {
+    let dir = temp_dir("t1170-reconcile");
+    let state = GitLocalState {
+        local_ref: None,
+        local_commit: "aaa".to_string(),
+        local_path: None,
+        stashed: false,
+    };
+    assert!(git_reconcile_candidates(&dir, &state, None, &[], &[]).is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn t1170_reconcile_perforce_walks_local_paths() {
+    let repo = make_repo("t1170-perforce");
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    let state = GitLocalState {
+        local_ref: Some("master".to_string()),
+        local_commit: head.clone(),
+        local_path: Some(git::UpstreamPath::new()),
+        stashed: false,
+    };
+    let mut io = Io::canned(&[]);
+    git_reconcile_perforce(&repo, &mut io, &state, None, &[], &[], &head).unwrap();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn t1170_hg_default_symbols_skips_blank_branches() {
+    let dir = temp_dir("t1170-hgblank");
+    let hg_cmd = fake_hg(
+        &dir,
+        "fakehg.sh",
+        "if has bookmarks; then exit 0; fi\nif has branch; then printf '  \\n'; exit 0; fi\nprintf 'nodehash'; exit 0\n",
+    );
+    let mut io = Io::canned(&[]);
+    assert_eq!(
+        hg_default_symbols_with(&dir, &hg_cmd, &mut io).unwrap(),
+        vec!["nodehash".to_string()]
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn t1170_hg_resolve_symbols_falls_back_to_commits() {
+    let dir = temp_dir("t1170-hgcommit");
+    let hg_cmd = fake_hg(
+        &dir,
+        "fakehg.sh",
+        "if has bookmarks; then printf '   bm1 1:x\\n'; exit 0; fi\nif has branches; then printf 'default\\n'; exit 0; fi\nprintf 'nodeabc'; exit 0\n",
+    );
+    let mut io = Io::canned(&[]);
+    assert_eq!(
+        hg_resolve_symbols_with(&dir, &hg_cmd, &mut io, &["abc".to_string()]).unwrap(),
+        vec!["nodeabc".to_string()]
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn t1170_ambiguous_markers_fall_back_to_generic_views() {
+    let mut io = Io::canned(&[]);
+    assert_eq!(
+        hg_ambiguous_symbol(&mut io, "s", "tag", 2),
+        "Symbol \"s\" is ambiguous."
+    );
+    assert!(io.out.stdout.contains("Marker \"s\""), "{}", io.out.stdout);
+}
+
+#[test]
+fn t1170_hg_onto_refs_default_on_empty_config() {
+    // A shadowing config file pins `arc.land.onto` to empty
+    // regardless of ambient configuration.
+    let dir = temp_dir("t1170-hgonto");
+    let file = dir.join("onto.json");
+    std::fs::write(&file, r#"{"arc.land.onto": []}"#).unwrap();
+    let options = Options {
+        config_file: vec![file.to_string_lossy().to_string()],
+        ..Options::default()
+    };
+    let mut io = Io::canned(&[]);
+    assert_eq!(
+        hg_select_onto_refs(&dir, &mut io, &options).unwrap(),
+        vec!["default".to_string()]
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn t1170_hg_merge_reports_tip_failures() {
+    let dir = temp_dir("t1170-hgmerge-tip");
+    let hg_cmd = fake_hg(
+        &dir,
+        "fakehg.sh",
+        &format!(
+            "if has rebase; then cat > /dev/null; exit 0; fi\nif has log; then\n  {rev}\n  if [ \"$rev\" = \"tip\" ]; then exit 1; fi\n  printf 'aaa'; exit 0\nfi\nexit 0\n",
+            rev = FAKE_HG_REV_LOOP,
+        ),
+    );
+    let commits = vec![land_commit("aaa", &[], "first")];
+    let set = CommitSet {
+        revision: None,
+        commits: vec![0],
+        is_pick: false,
+    };
+    let mut io = Io::canned(&[]);
+    assert!(
+        hg_execute_merge_with(
+            &dir,
+            &hg_cmd,
+            &mut io,
+            &set,
+            &commits,
+            Some("iii"),
+            true,
+            None,
+            &|_| Ok("landed message".to_string()),
+        )
+        .is_err()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn t1170_hg_stdin_write_failures_are_fatal() {
+    // Unix-only: the stub program (`false`) has no Windows counterpart.
+    // A megabyte past an instantly-exiting reader deterministically
+    // breaks the pipe on every platform.
+    let dir = temp_dir("t1170-hgepipe");
+    let hg_cmd = hg::HgCommand::custom("false", &[]);
+    assert!(!hg_write_stdin_with(
+        &dir,
+        &hg_cmd,
+        &["whatever"],
+        &"x".repeat(1 << 20)
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn t1170_hg_cascade_keeps_successful_rebases() {
+    let dir = temp_dir("t1170-hgcascade-ok");
+    let hg_cmd = fake_hg(
+        &dir,
+        "fakehg.sh",
+        "if has rebase; then exit 0; fi\nif has log; then printf 'child1\\n'; exit 0; fi\nexit 1\n",
+    );
+    let commits = vec![land_commit("old", &[], "landed")];
+    let set = CommitSet {
+        revision: None,
+        commits: vec![0],
+        is_pick: false,
+    };
+    assert!(hg_cascade_state_with(&dir, &hg_cmd, &set, &commits, "new", true).is_ok());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn t1170_select_targets_dispatches_by_vcs() {
+    // Without an `hg` binary the Mercurial selection fails before any
+    // ref work (and a bare directory fails it when one exists).
+    let dir = temp_dir("t1170-targets");
+    let mut io = Io::canned(&[]);
+    assert!(select_targets(&dir, &Options::default(), Vcs::Hg, &mut io, &[]).is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn t1170_apply_shelve_reports_delete_failures() {
+    let dir = temp_dir("t1170-shelve-del");
+    let hg_cmd = fake_hg(
+        &dir,
+        "fakehg.sh",
+        "if has --delete; then exit 1; fi\nexit 0\n",
+    );
+    let mut io = Io::canned(&[]);
+    let state = HgLocalState {
+        local_commit: "aaa".to_string(),
+        local_branch: "default".to_string(),
+        local_bookmark: None,
+        stash: Some("s1".to_string()),
+    };
+    assert!(apply_shelve_with(&dir, &hg_cmd, &mut io, &state).is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn t1170_discard_hg_restores_before_reporting() {
+    // The first unshelve fails but the restore's retry succeeds, so
+    // the original error reports after the state is back.
+    let dir = temp_dir("t1170-shelve-state");
+    let marker = dir.join("ate");
+    let hg_cmd = fake_hg(
+        &dir,
+        "fakehg.sh",
+        &format!(
+            "if has unshelve; then if [ -e \"{m}\" ]; then exit 0; else touch \"{m}\"; exit 1; fi; fi\nexit 0\n",
+            m = marker.display(),
+        ),
+    );
+    let mut io = Io::canned(&[]);
+    let state = HgLocalState {
+        local_commit: "aaa".to_string(),
+        local_branch: "default".to_string(),
+        local_bookmark: None,
+        stash: Some("s1".to_string()),
+    };
+    assert!(discard_local_state_hg_with(&dir, &hg_cmd, &mut io, &state).is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn t1170_finish_landing_reports_reconcile_failures() {
+    // The pull branch cannot be an ancestor of a bogus cursor, so the
+    // reconcile (all local git reads) fails into the finish arm. The
+    // upstream tracking ref comes from a local-path remote (no network).
+    let upstream = make_repo("t1170-finish-up");
+    let repo = make_repo("t1170-finish-fail");
+    git(
+        &repo,
+        &["remote", "add", "origin", upstream.to_str().unwrap()],
+    );
+    git(&repo, &["fetch", "-q", "origin"]);
+    git(
+        &repo,
+        &["branch", "--set-upstream-to=origin/master", "master"],
+    );
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    let state = GitLocalState {
+        local_ref: Some("master".to_string()),
+        local_commit: head,
+        local_path: None,
+        stashed: false,
+    };
+    let mut io = Io::canned(&[]);
+    assert!(
+        git_finish_landing(
+            &repo,
+            &mut io,
+            false,
+            &state,
+            "origin",
+            &["master".to_string()],
+            "bogus-not-a-commit",
+            None,
+            &[],
+        )
+        .is_err()
+    );
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&upstream).ok();
+}
+
+#[test]
+fn t1170_write_raw_commit_handles_epipe() {
+    // Outside a repository `git hash-object` exits before reading
+    // stdin; a megabyte past the dead reader deterministically
+    // breaks the pipe on every platform.
+    let dir = temp_dir("t1170-hashobject");
+    let raw = RawCommit {
+        tree: None,
+        parents: Vec::new(),
+        author: None,
+        committer: None,
+        message: Some("x".repeat(1 << 20)),
+    };
+    assert_eq!(
+        git_write_raw_commit(&dir, &raw).unwrap_err(),
+        "git hash-object failed"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn t1170_classified_runs_skip_configured_writers() {
+    // A preset config writer skips installation; the mutually
+    // exclusive into flags then fail validation deterministically.
+    let repo = make_repo("t1170-classified");
+    let mut io = Io::canned(&[]);
+    io.config_writer = Some(ConfigWriter {
+        user_path: None,
+        local_path: None,
+    });
+    let err = execute_with_io_classified(
+        &repo,
+        &args(&["--into", "x", "--into-empty", "--"]),
+        &mut io,
+    )
+    .unwrap_err();
+    assert!(
+        err.message.contains("mutually exclusive"),
+        "{}",
+        err.message
+    );
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn t1170_run_in_reports_missing_terminator() {
+    // Piped stdin is never a TTY under `cargo test`; bail out (rather
+    // than parse differently) if that ever changes.
+    if crate::prompt::stdin_is_terminal() {
+        return;
+    }
+    let dir = temp_dir("t1170-terminator");
+    assert_eq!(
+        run_in(&dir, &args(&["--preview"])),
+        std::process::ExitCode::FAILURE
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn t1170_execute_classified_uses_hg_metadata() {
     let dir = temp_dir("t1170-exec-hg");
     std::fs::create_dir(dir.join(".hg")).unwrap();

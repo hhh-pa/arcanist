@@ -305,6 +305,187 @@ fn matches_permanent_rule_patterns() {
 }
 
 #[test]
+fn legacy_status_codes_cover_numbers_and_unknown_shapes() {
+    // A numeric `status` mangles like its string spelling.
+    let reference = RevisionRef::from_query_row(&serde_json::json!({
+        "id": 1, "status": 2, "statusName": "Accepted",
+    }));
+    assert_eq!(reference.status(), Some("accepted"));
+    // Unknown codes leave the status empty.
+    let reference = RevisionRef::from_query_row(&serde_json::json!({
+        "id": 1, "status": 99, "statusName": "X",
+    }));
+    assert!(reference.status().is_none());
+    // Non-scalar shapes are not codes at all.
+    let reference = RevisionRef::from_query_row(&serde_json::json!({
+        "id": 1, "status": true, "statusName": "X",
+    }));
+    assert!(reference.status().is_none());
+}
+
+#[test]
+fn reads_negative_id_prefixes_like_php() {
+    assert_eq!(
+        RevisionRef::from_search_hit(&serde_json::json!({"id": "-5"})).id(),
+        4_294_967_291
+    );
+    assert_eq!(
+        RevisionRef::from_search_hit(&serde_json::json!({"id": "+7"})).id(),
+        7
+    );
+}
+
+#[test]
+fn uri_revision_ids_reject_nested_paths() {
+    assert!(revision_id_from_message("Differential Revision: https://h.example/a/D1\n").is_err());
+}
+
+/// Serve `expected` requests from `routes` (method -> envelope
+/// result JSON); returns the base URI. (Local replicate of the
+/// `export_tests` stub.)
+fn serve_revision_routes(
+    routes: std::collections::HashMap<String, String>,
+    expected: usize,
+) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for _ in 0..expected {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            let head_text = String::from_utf8_lossy(&head).to_string();
+            let len: usize = head_text
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(key, value)| {
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).unwrap();
+            let method = head_text
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .strip_prefix("/api/")
+                .unwrap_or("")
+                .to_string();
+            let result = routes.get(&method).cloned().unwrap_or("null".to_string());
+            let canned = format!(r#"{{"result": {result}, "error_code": null}}"#);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                canned.len(),
+                canned
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    base
+}
+
+#[test]
+fn loads_by_commit_hashes_cover_row_shapes() {
+    // Empty input short-circuits without conduit traffic.
+    let idle = crate::conduit::Client::new("https://conduit.test/", "t").unwrap();
+    assert!(load_by_commit_hashes(&idle, &[]).unwrap().is_empty());
+    assert!(load_repositories_by_uris(&idle, &[]).unwrap().is_empty());
+    // Rows without hashes, with empty hashes, and with malformed
+    // pairs are skipped; well-formed pairs map back by kind.
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "differential.query".to_string(),
+        r#"[{"id":1},{"id":2,"hashes":[]},{"id":3,"hashes":[[1,2],["gtcm","abc"]]}]"#.to_string(),
+    );
+    let base = serve_revision_routes(routes, 1);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    let loaded =
+        load_by_commit_hashes(&client, &[("gtcm".to_string(), "abc".to_string())]).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].0, "gtcm:abc");
+    assert_eq!(loaded[0].1.id(), 3);
+}
+
+#[test]
+fn conduit_failures_propagate_from_loaders() {
+    // A refused connection fails the search loaders.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let client = crate::conduit::Client::new(&format!("http://127.0.0.1:{port}/"), "t").unwrap();
+    assert!(load_by_ids(&client, &[1]).is_err());
+    assert!(load_repositories_by_uris(&client, &["x".to_string()]).is_err());
+}
+
+#[test]
+fn uri_parsing_covers_degenerate_shapes() {
+    // Whitespace disqualifies scp syntax.
+    assert!(!is_scp_uri("user@ho st:path"));
+    // A scheme carrying `/` or `:` is never an ambiguous query URI.
+    assert!(!is_ambiguous_query_uri("a:b://h/x"));
+    // A URI without a path is never ambiguous either.
+    assert!(!is_ambiguous_query_uri("https://host"));
+    // Degenerate scheme prefixes split empty.
+    assert_eq!(split_scheme(":foo"), (String::new(), ":foo"));
+    assert_eq!(split_scheme("1abc:foo"), (String::new(), "1abc:foo"));
+    assert_eq!(split_scheme("a b:foo"), (String::new(), "a b:foo"));
+}
+
+#[test]
+fn null_permanent_rules_match_nothing() {
+    let nulls = RepositoryRef::from_search_hit(&serde_json::json!({
+        "fields": {"refRules": {"permanentRefRules": null}},
+    }));
+    assert!(!nulls.is_permanent_ref("master"));
+}
+
+#[test]
+fn matches_regexp_repeats_and_classes() {
+    // Exact and open counts.
+    assert!(regexp_match("a{2}", "aa"));
+    assert!(!regexp_match("a{2}", "a"));
+    assert!(regexp_match("a{2,}", "aaa"));
+    assert!(!regexp_match("a{2,}", "a"));
+    // Malformed counts parse as literals.
+    assert!(regexp_match("a{2x}", "a{2x}"));
+    assert!(regexp_match("a{}", "a{}"));
+    assert!(regexp_match("a{3,2}", "a{3,2}"));
+    assert!(regexp_match("a{x}", "a{x}"));
+    // Lazy modifiers match like greedy ones.
+    assert!(regexp_match("a*?", "aaa"));
+    assert!(regexp_match("a+?", "aaa"));
+    assert!(regexp_match("a??", "a"));
+    // Classes, negation, and ranges.
+    assert!(regexp_match("[ab]", "b"));
+    assert!(!regexp_match("[ab]", "c"));
+    assert!(regexp_match("[^a]", "b"));
+    assert!(!regexp_match("[^a]", "a"));
+    assert!(regexp_match("[a-z]", "m"));
+    assert!(regexp_match(r"[\]]", "]"));
+    assert!(regexp_match("[a\\", "\\"));
+    assert!(regexp_match("[a-", "A"));
+    // Escape classes.
+    assert!(regexp_match(r"\w", "a"));
+    assert!(regexp_match(r"\s", " "));
+    assert!(regexp_match(r"\D", "a"));
+    assert!(regexp_match(r"\W", "!"));
+    assert!(regexp_match(r"\S", "a"));
+    // Escaped literals and trailing backslashes.
+    assert!(regexp_match(r"\.", "."));
+    assert!(regexp_match("a\\", "a\\"));
+}
+
+#[test]
 fn search_params_builder_nests_constraints() {
     assert_eq!(
         conduit_search_params(&serde_json::json!({"phids": ["PHID-USER-9"]}), None),

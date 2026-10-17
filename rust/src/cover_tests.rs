@@ -1328,3 +1328,359 @@ fn b23_cover_help_matches_generated_format() {
     let ansi = usage_text(true);
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
+
+// -( T1170 COV: close cover.rs )-------------------------------------------------
+
+#[test]
+fn lexical_clean_resolves_dot_segments() {
+    assert_eq!(lexical_clean(Path::new("a/./b")), Path::new("a").join("b"));
+    assert_eq!(lexical_clean(Path::new("a/../b")), PathBuf::from("b"));
+    assert_eq!(lexical_clean(Path::new("a/..")), PathBuf::from("."));
+}
+
+#[test]
+fn relative_to_dir_reports_identity_and_disjoint_paths() {
+    let tmp = TempDir::new("reldir");
+    assert_eq!(
+        relative_to_dir(tmp.path(), tmp.path()),
+        Some(".".to_string())
+    );
+    assert_eq!(relative_to_dir(Path::new("a"), Path::new("b")), None);
+}
+
+#[test]
+fn check_cover_paths_keeps_unrelatable_absolute_paths() {
+    let tmp = TempDir::new("coverabs");
+    let file = tmp.path().join("f.txt");
+    std::fs::write(&file, "x").unwrap();
+    let absolute = file.to_string_lossy().into_owned();
+    let specs = check_cover_paths(Path::new("elsewhere"), std::slice::from_ref(&absolute)).unwrap();
+    assert_eq!(specs, vec![absolute]);
+}
+
+#[test]
+fn minusminus_lines_name_unnamed_diffs() {
+    let files = parse_diff_unified0("diff --git abc\n--- a/foo.txt\n");
+    assert_eq!(
+        files,
+        vec![FileChanges {
+            path: "foo.txt".to_string(),
+            lines: Vec::new(),
+        }]
+    );
+}
+
+#[test]
+fn blame_file_reports_missing_head() {
+    let repo = init_repo("nohead");
+    let err = blame_file(repo.path(), "f.txt").unwrap_err();
+    assert!(err.contains("no HEAD commit"), "{err}");
+}
+
+#[test]
+fn blame_cover_lines_skips_missing_base_empty_and_failed_blames() {
+    let tmp = TempDir::new("blameskip");
+    assert!(blame_cover_lines(tmp.path(), None, &[]).is_empty());
+    let empty = vec![FileChanges {
+        path: "x".to_string(),
+        lines: Vec::new(),
+    }];
+    assert!(blame_cover_lines(tmp.path(), Some("HEAD"), &empty).is_empty());
+    std::fs::write(tmp.path().join("f.txt"), "x\n").unwrap();
+    let files = vec![FileChanges {
+        path: "f.txt".to_string(),
+        lines: vec![1],
+    }];
+    assert!(blame_cover_lines(tmp.path(), Some("HEAD"), &files).is_empty());
+}
+
+#[test]
+fn render_covers_uses_process_ansi() {
+    assert_eq!(render_covers(&Vec::new()), "");
+    let covers: Covers = vec![("ann".to_string(), vec![("f".to_string(), vec![1])])];
+    assert!(render_covers(&covers).contains("ann"));
+}
+
+#[test]
+fn engine_log_writes_verbose_lines() {
+    let tmp = TempDir::new("enginelog");
+    let mut loud = std::io::Cursor::new(Vec::new());
+    let engine = BaseRuleEngine {
+        dir: tmp.path(),
+        top: tmp.path(),
+        input: &mut loud,
+        stdin_tty: false,
+        verbose: true,
+    };
+    engine.log("hello");
+    let mut quiet_cursor = std::io::Cursor::new(Vec::new());
+    let quiet = BaseRuleEngine {
+        dir: tmp.path(),
+        top: tmp.path(),
+        input: &mut quiet_cursor,
+        stdin_tty: false,
+        verbose: false,
+    };
+    quiet.log("silent");
+}
+
+#[test]
+fn colon_less_rules_are_invalid() {
+    let tmp = TempDir::new("badrule");
+    let mut input = std::io::Cursor::new(Vec::new());
+    let mut engine = BaseRuleEngine {
+        dir: tmp.path(),
+        top: tmp.path(),
+        input: &mut input,
+        stdin_tty: false,
+        verbose: false,
+    };
+    let mut trying: VecDeque<&str> = VecDeque::new();
+    match resolve_base_rule(&mut engine, "nocolon", "user", &mut trying) {
+        Err(err) => assert_eq!(
+            err,
+            "Rule 'nocolon' is invalid, it must have a type and name like 'arc:upstream'."
+        ),
+        _ => panic!("a colon-less rule must be invalid"),
+    }
+}
+
+#[test]
+fn static_source_names_cover_every_source() {
+    assert_eq!(static_source_name("runtime"), Some("runtime"));
+    assert_eq!(static_source_name("system"), Some("system"));
+    assert_eq!(static_source_name("bogus"), None);
+}
+
+#[test]
+fn path_within_top_rejects_unresolvable_paths() {
+    let tmp = TempDir::new("within");
+    assert!(!path_within_top(tmp.path(), tmp.path(), "no-such-file"));
+}
+
+#[test]
+fn execute_cover_text_uses_process_ansi() {
+    let tmp = TempDir::new("covertext");
+    let err = execute_cover_text(tmp.path(), &options(&[])).unwrap_err();
+    assert!(err.contains("must be run in a Git"), "{err}");
+}
+
+#[test]
+fn project_default_relative_accepts_scalars() {
+    let tmp = c1_repo("c1-numrel");
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"git.default-relative-commit": 42}"#,
+    )
+    .unwrap();
+    assert!(
+        cover(tmp.path(), &[])
+            .unwrap_err()
+            .contains("git cat-file failed")
+    );
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"git.default-relative-commit": true}"#,
+    )
+    .unwrap();
+    assert!(
+        cover(tmp.path(), &[])
+            .unwrap_err()
+            .contains("git cat-file failed")
+    );
+}
+
+#[test]
+fn project_default_relative_ignores_non_scalars() {
+    let tmp = c1_repo("c1-nonrel");
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"git.default-relative-commit": ["x"]}"#,
+    )
+    .unwrap();
+    // The array reads unset, so resolution falls through to the
+    // (non-interactive) prompt and fails there.
+    assert!(cover(tmp.path(), &[]).is_err());
+}
+
+#[test]
+fn write_scratch_default_tolerates_unwritable_metadata() {
+    let plain = TempDir::new("scratchplain");
+    write_scratch_default(plain.path(), "HEAD~1");
+    let repo = init_repo("scratchblocked");
+    std::fs::write(repo.path().join(".git").join("arc"), "block").unwrap();
+    write_scratch_default(repo.path(), "HEAD~1");
+    assert!(repo.path().join(".git").join("arc").is_file());
+}
+
+#[test]
+fn base_rules_support_verbose_yield_and_legacy_names() {
+    let tmp = c1_repo("c1-verbose");
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"base": "arc:verbose, literal:HEAD~1"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"base": "arc:yield, literal:HEAD~1"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"base": "arc:global, literal:HEAD~1"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"base": "arc:args, literal:HEAD~1"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+}
+
+#[test]
+fn base_rules_support_nodiff_bookmark_and_reject_unknown_arc() {
+    let tmp = c1_repo("c1-nodiff");
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"base": "arc:nodiff(x), literal:HEAD~1"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"base": "arc:bookmark, literal:HEAD~1"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+    std::fs::write(tmp.path().join(".arcconfig"), r#"{"base": "arc:bogus"}"#).unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Err(
+            "Base commit rule 'arc:bogus' (from source 'project') is not a recognized rule."
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn exec_rule_reports_command_failure_as_no_match() {
+    let tmp = c1_repo("c1-execfail");
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"base": "arc:exec(false), literal:HEAD~1"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+}
+
+#[test]
+fn git_plain_names_resolve_verified_commits() {
+    let tmp = c1_repo("c1-gitname");
+    std::fs::write(tmp.path().join(".arcconfig"), r#"{"base": "git:HEAD~1"}"#).unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+}
+
+#[test]
+fn upstream_rule_follows_configured_tracking() {
+    let tmp = c1_repo("c1-uprule");
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"base": "arc:upstream, literal:HEAD~1"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+    let middle = git(tmp.path(), &["rev-parse", "HEAD~1"]);
+    set_upstream(tmp.path(), &middle);
+    std::fs::write(tmp.path().join(".arcconfig"), r#"{"base": "arc:upstream"}"#).unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+}
+
+#[test]
+fn branch_unique_rule_handles_empty_matches() {
+    let tmp = c1_repo("c1-bu-edge");
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"base": "git:branch-unique(no-such-ref), literal:HEAD~1"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"base": "git:branch-unique(HEAD), literal:HEAD~1"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"base": "git:branch-unique(HEAD~2), literal:HEAD~1"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("yara\n  f.txt: line 2\n".to_string())
+    );
+}
+
+#[test]
+fn branch_unique_rule_skips_narrower_commits() {
+    let tmp = init_repo("c1-bu-narrow");
+    commit_as(tmp.path(), "f.txt", "zero\n", "zelda");
+    commit_as(tmp.path(), "f.txt", "zero\none\n", "ann");
+    git(tmp.path(), &["branch", "-m", "main"]);
+    git(tmp.path(), &["checkout", "-b", "feat"]);
+    commit_as(tmp.path(), "f.txt", "zero\none\ntwo\n", "bob");
+    commit_as(tmp.path(), "f.txt", "zero\none\ntwo\nthree\n", "cid");
+    std::fs::write(tmp.path().join("f.txt"), "zero\none\ntwo\nTHREE\n").unwrap();
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"base": "git:branch-unique(main)"}"#,
+    )
+    .unwrap();
+    // HEAD and its parent sit on one branch each, so the walk skips to
+    // the merge-base on two branches.
+    assert_eq!(
+        cover(tmp.path(), &[]),
+        Ok("ann\n  f.txt: line 2\n".to_string())
+    );
+}

@@ -13,6 +13,12 @@ fn options_of(words: &[&str]) -> BrowseOptions {
 }
 
 #[test]
+#[should_panic(expected = "expected options")]
+fn options_of_rejects_non_options() {
+    options_of(&["--bogus"]);
+}
+
+#[test]
 fn parses_flags_targets_and_help() {
     let opts = options_of(&["--branch", "dev", "--types", "path,object", "--", "a:3"]);
     assert_eq!(opts.branch, Some("dev".to_string()));
@@ -262,11 +268,10 @@ fn resolves_repositories_by_remote_uri() {
     assert_eq!(repo.phid, "PHID-REPO-2");
     assert_eq!(repo.default_branch, "dev");
 
-    // Outside repositories there is nothing to resolve (no conduit call).
+    // Outside repositories there is nothing to resolve (no conduit call:
+    // the empty route table errors loudly if `resolve_repo` calls out).
     let bare = TempDir::new("norepo");
-    let never = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        panic!("must not call conduit outside a repo")
-    };
+    let never = mock(HashMap::new());
     assert!(resolve_repo(&bare.path, &never).unwrap().is_none());
 }
 
@@ -666,10 +671,7 @@ fn r4_browseb20_workflow_error_is_fatal() {
         Err("boom".to_string())
     };
     let mut input: &[u8] = &[];
-    let options = match parse_args(&argv(&["T999"])) {
-        Parsed::Options(options) => options,
-        _ => panic!("expected options"),
-    };
+    let options = options_of(&["T999"]);
     assert_eq!(
         run_prepared(&dir, &options, &call, "", &mut input),
         std::process::ExitCode::from(255)
@@ -1124,4 +1126,446 @@ fn browse_b26_phid_lookup_keeps_ref_order() {
         serde_json::to_string(&seen[0]["names"]).unwrap(),
         r#"{"T9":"T9","T7":"T7"}"#
     );
+}
+
+// -( T1170 coverage: query helpers, remotes, paths )--------------------------
+
+#[test]
+fn query_rows_falls_back_to_empty_for_scalars() {
+    assert!(query_rows(&serde_json::Value::Null).is_empty());
+    assert!(query_rows(&serde_json::json!(7)).is_empty());
+    assert!(query_rows(&serde_json::json!("x")).is_empty());
+    assert_eq!(query_rows(&serde_json::json!([1])).len(), 1);
+    assert_eq!(query_rows(&serde_json::json!({"a": 1})).len(), 1);
+}
+
+#[test]
+fn upstream_remote_prefers_longest_matching_remote() {
+    // A tracking branch resolves through `@{upstream}`; the remote is
+    // the longest remote name matching the upstream's first segment.
+    let tmp = TempDir::new("upstream");
+    let bare = tmp.path.join("bare.git");
+    git(&tmp.path, &["init", "--bare", "-q", "bare.git"]);
+    let work = tmp.path.join("w");
+    std::fs::create_dir(&work).unwrap();
+    git(&work, &["init", "-q", "-b", "master"]);
+    git(&work, &["config", "user.email", "t@t"]);
+    git(&work, &["config", "user.name", "t"]);
+    git(&work, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(work.join("f.txt"), "one\n").unwrap();
+    git(&work, &["add", "f.txt"]);
+    git(&work, &["commit", "-qm", "add f"]);
+    git(&work, &["remote", "add", "origin", &bare.to_string_lossy()]);
+    git(&work, &["push", "-q", "-u", "origin", "master"]);
+    assert_eq!(upstream_remote(&work).as_deref(), Some("origin"));
+    let uri = remote_uri(&work).unwrap();
+    assert!(uri.contains("bare"), "{uri}");
+    // Without an upstream there is no remote to resolve.
+    let bare_repo = fixture_repo("noupstream");
+    assert!(upstream_remote(&bare_repo.path).is_none());
+}
+
+#[test]
+fn remote_uri_falls_back_to_ls_remote_via_insteadof() {
+    // `git remote get-url` fails for unknown remotes while `ls-remote
+    // --get-url` still expands `insteadOf`: the fallback arm answers.
+    // (`ls-remote --get-url` prints without any network traffic.)
+    let tmp = fixture_repo("insteadof");
+    git(
+        &tmp.path,
+        &[
+            "config",
+            "url.https://phab.example/rewritten.insteadOf",
+            "origin",
+        ],
+    );
+    assert_eq!(
+        remote_uri(&tmp.path).as_deref(),
+        Some("https://phab.example/rewritten")
+    );
+}
+
+#[test]
+fn configured_callsign_rejects_empty_and_non_string() {
+    let tmp = fixture_repo("callsignguard");
+    std::fs::write(
+        tmp.path.join(".arcconfig"),
+        r#"{"repository.callsign": ""}"#,
+    )
+    .unwrap();
+    assert!(configured_callsign(&tmp.path).is_none());
+    std::fs::write(tmp.path.join(".arcconfig"), r#"{"repository.callsign": 7}"#).unwrap();
+    assert!(configured_callsign(&tmp.path).is_none());
+}
+
+#[test]
+fn repo_info_rejects_rows_without_phid_or_uri() {
+    for row in [
+        serde_json::json!({"uri": "https://phab.example/diffusion/X/"}),
+        serde_json::json!({"phid": "PHID-REPO-1"}),
+    ] {
+        let tmp = repo_fixture("badrow");
+        let mut routes = HashMap::new();
+        routes.insert("repository.query".to_string(), serde_json::json!([row]));
+        let call = mock(routes);
+        assert!(resolve_repo(&tmp.path, &call).unwrap().is_none());
+    }
+}
+
+#[test]
+fn resolve_path_handles_absolute_and_parent_segments() {
+    let tmp = fixture_repo("resolvepath");
+    let abs = tmp.path.join("sub").join("f.txt");
+    assert_eq!(resolve_path(&tmp.path, &abs.to_string_lossy()), abs);
+    assert_eq!(
+        resolve_path(&tmp.path, "a/../b"),
+        tmp.path.join("b"),
+        "parent segments pop lexically"
+    );
+}
+
+#[test]
+fn canonicalize_lax_climbs_missing_ancestors() {
+    // Nothing on this chain exists, so every ancestor lookup fails and
+    // the lexical path survives.
+    let missing = Path::new("definitely-missing-t1170-a").join("definitely-missing-t1170-b");
+    assert_eq!(canonicalize_lax(&missing), missing);
+}
+
+// -( T1170 coverage: default targets, footers, id shapes )--------------------
+
+#[test]
+fn path_uri_resolves_default_target_at_repo_root() {
+    // A missing token on a path-typed ref browses "." (the root itself,
+    // which canonicalizes equal to the toplevel).
+    let tmp = repo_fixture("rootdefault");
+    let call = mock(repo_routes());
+    let mut ctx = BrowseCtx::new(&tmp.path, &call, "https://phab.example/api/");
+    let refs = vec![BrowseRef {
+        token: None,
+        types: vec![BROWSE_PATH.to_string()],
+        branch: None,
+    }];
+    let resolved = resolve_refs(&mut ctx, &refs).unwrap();
+    assert!(resolved[0].commits.is_empty());
+    assert_eq!(resolved[0].uris.len(), 1);
+    assert_eq!(
+        resolved[0].uris[0].uri,
+        "https://phab.example/diffusion/X/browse/master/"
+    );
+}
+
+#[test]
+fn untyped_default_target_resolves_nothing() {
+    // Untyped with no token: HEAD commits resolve, but there is no
+    // object token to look up and no path to browse.
+    let tmp = repo_fixture("emptydefault");
+    let head = git(&tmp.path, &["rev-parse", "HEAD"]);
+    let mut routes = repo_routes();
+    routes.insert("diffusion.querycommits".to_string(), serde_json::json!({}));
+    routes.insert("differential.query".to_string(), serde_json::json!([]));
+    let call = mock(routes);
+    let mut ctx = BrowseCtx::new(&tmp.path, &call, "https://phab.example/api/");
+    let refs = vec![BrowseRef {
+        token: None,
+        types: Vec::new(),
+        branch: None,
+    }];
+    let resolved = resolve_refs(&mut ctx, &refs).unwrap();
+    assert_eq!(resolved[0].commits, vec![head]);
+    assert!(resolved[0].uris.is_empty());
+}
+
+#[test]
+fn hash_revision_hits_short_circuits_empty_input() {
+    let call = mock(HashMap::new());
+    assert!(hash_revision_hits(&call, &[]).unwrap().is_empty());
+}
+
+#[test]
+fn footer_ids_skips_unreadable_commits_and_finds_footers() {
+    let tmp = fixture_repo("footers");
+    git(
+        &tmp.path,
+        &[
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "second",
+            "-m",
+            "Differential Revision: D5",
+        ],
+    );
+    let head = git(&tmp.path, &["rev-parse", "HEAD"]);
+    let by_id = footer_ids(&tmp.path, &["bogus-hash-t1170".to_string(), head]);
+    assert_eq!(by_id, BTreeMap::from([("5".to_string(), vec![1])]));
+}
+
+#[test]
+fn id_param_and_row_helpers_cover_scalar_shapes() {
+    assert_eq!(id_param("7"), serde_json::json!(7));
+    assert_eq!(id_param("D7"), serde_json::json!("D7"));
+    assert_eq!(row_id_string(&serde_json::json!({"id": "D7"})), "D7");
+    assert_eq!(row_id_string(&serde_json::json!({"id": -3})), "-3");
+    assert_eq!(row_id_string(&serde_json::json!({"id": 1.5})), "");
+    assert_eq!(row_id_string(&serde_json::json!({})), "");
+    assert!(!row_closed(&serde_json::json!({})));
+    assert!(!row_closed(&serde_json::json!({"fields": {}})));
+    assert!(!row_closed(&serde_json::json!({"fields": {"status": {}}})));
+    assert!(row_closed(
+        &serde_json::json!({"fields": {"status": {"closed": true}}})
+    ));
+}
+
+#[test]
+fn revision_search_tolerates_bare_rows_and_missing_data() {
+    // Rows without `fields` fall back to `/D{id}`; pages without `data`
+    // contribute no rows.
+    let bare = |method: &str, _: &serde_json::Value| {
+        assert_eq!(method, "differential.revision.search");
+        Ok(serde_json::json!({"data": [{"id": 3}]}))
+    };
+    assert_eq!(
+        search_revision_hits(&bare, &["3".to_string()]).unwrap(),
+        vec![("3".to_string(), "/D3".to_string(), false)]
+    );
+    let dataless = |method: &str, _: &serde_json::Value| {
+        assert_eq!(method, "differential.revision.search");
+        Ok(serde_json::json!({"cursor": {}}))
+    };
+    assert!(
+        search_revision_hits(&dataless, &["3".to_string()])
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn revision_uris_skips_closed_and_unknown_ids() {
+    let tmp = repo_fixture("revuris");
+    git(
+        &tmp.path,
+        &[
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "second",
+            "-m",
+            "Differential Revision: D5",
+        ],
+    );
+    let head = git(&tmp.path, &["rev-parse", "HEAD"]);
+    let mut routes = HashMap::new();
+    routes.insert("differential.query".to_string(), serde_json::json!([]));
+    routes.insert(
+        "differential.revision.search".to_string(),
+        serde_json::json!({"data": [
+            {"id": 9, "fields": {"uri": "https://phab.example/D9", "status": {"closed": true}}},
+            {"id": 10, "fields": {"uri": "https://phab.example/D10", "status": {"closed": false}}},
+            {"id": 5, "fields": {"uri": "https://phab.example/D5", "status": {"closed": false}}},
+        ]}),
+    );
+    let call = mock(routes);
+    let mut ctx = BrowseCtx::new(&tmp.path, &call, "https://phab.example/api/");
+    let uris = revision_uris(&mut ctx, std::slice::from_ref(&head)).unwrap();
+    assert_eq!(
+        uris,
+        BTreeMap::from([(head, vec!["https://phab.example/D5".to_string()])])
+    );
+}
+
+#[test]
+fn commits_for_untyped_default_resolves_head() {
+    let tmp = fixture_repo("defaulthead");
+    let head = git(&tmp.path, &["rev-parse", "HEAD"]);
+    let rf = BrowseRef {
+        token: None,
+        types: Vec::new(),
+        branch: None,
+    };
+    assert_eq!(commits_for_one_ref(&tmp.path, &rf).unwrap(), vec![head]);
+}
+
+#[test]
+fn explicit_non_path_type_skips_path_resolution() {
+    let tmp = repo_fixture("skippath");
+    let call = mock(repo_routes());
+    let mut ctx = BrowseCtx::new(&tmp.path, &call, "https://phab.example/api/");
+    let refs = vec![
+        BrowseRef {
+            token: Some("f.txt".to_string()),
+            types: vec![BROWSE_PATH.to_string()],
+            branch: None,
+        },
+        BrowseRef {
+            token: Some("f.txt".to_string()),
+            types: vec![BROWSE_COMMIT.to_string()],
+            branch: None,
+        },
+    ];
+    let resolved = resolve_refs(&mut ctx, &refs).unwrap();
+    assert_eq!(resolved[0].uris.len(), 1);
+    assert!(resolved[1].uris.is_empty());
+}
+
+// -( T1170 coverage: tables, prompts, run paths )------------------------------
+
+#[test]
+fn render_pick_table_skips_single_uri_refs() {
+    let refs = vec![pick_ref(Some("HEAD"))];
+    let resolved = vec![pick_hits(&[("https://x/1", "commit")])];
+    assert_eq!(
+        render_pick_table(&refs, &resolved, true, false),
+        "Pick Type URI\n"
+    );
+}
+
+#[test]
+fn console_select_uses_real_stdin_state() {
+    // The wrapper passes the ambient TTY state through: piped runs get
+    // the non-interactive error, interactive runs read the pick.
+    let outcome = console_select(&mut std::io::Cursor::new(b"2\n"), "Pick?", 1, 3);
+    assert!(
+        outcome == Ok(2) || outcome == Err(crate::prompt::NOT_INTERACTIVE.to_string()),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn absolute_uri_keeps_schemeless_bases_relative() {
+    assert_eq!(
+        absolute_uri("phab.example/api", "/D1"),
+        "phab.example/api/D1"
+    );
+    assert_eq!(
+        absolute_uri("https://phab.example/api/", "/D1?x=1#y"),
+        "https://phab.example/D1"
+    );
+}
+
+#[test]
+fn disambiguate_lists_table_for_many_refs() {
+    // Several refs: the table prints and the caller picks via `--types`
+    // (no prompt); a missing token names the default behavior.
+    let refs = vec![pick_ref(None), pick_ref(Some("x"))];
+    let resolved = vec![
+        pick_hits(&[("u1", "commit"), ("u2", "object")]),
+        pick_hits(&[("u3", "commit")]),
+    ];
+    let mut input: &[u8] = &[];
+    assert_eq!(
+        disambiguate_with_tty(&refs, &resolved, &mut input, false, false).unwrap(),
+        Vec::new()
+    );
+}
+
+#[test]
+fn execute_refs_propagates_ambiguous_pick_failure() {
+    // One ref resolving two URIs needs a pick; piped runs fail with
+    // the non-interactive error through the `?` arm.
+    let tmp = repo_fixture("ambigpick");
+    let mut routes = repo_routes();
+    routes.insert(
+        "phid.lookup".to_string(),
+        serde_json::json!({"f.txt": {"uri": "https://phab.example/F1"}}),
+    );
+    let call = mock(routes);
+    let mut ctx = BrowseCtx::new(&tmp.path, &call, "https://phab.example/api/");
+    let refs = vec![BrowseRef {
+        token: Some("f.txt".to_string()),
+        types: Vec::new(),
+        branch: None,
+    }];
+    let mut input: &[u8] = &[];
+    assert_eq!(
+        execute_refs_with_tty(&mut ctx, &refs, &mut input, false, false).unwrap_err(),
+        crate::prompt::NOT_INTERACTIVE
+    );
+}
+
+#[test]
+fn build_refs_defaults_to_bare_target() {
+    assert_eq!(
+        build_refs(&options_of(&[])),
+        vec![BrowseRef {
+            token: None,
+            types: Vec::new(),
+            branch: None,
+        }]
+    );
+}
+
+#[test]
+fn run_without_force_skips_deprecation() {
+    // No `--force`: past the deprecation gate to the injected caller;
+    // outside a repository nothing resolves and there is nothing to open.
+    let dir = TempDir::new("noforce");
+    let call = mock(HashMap::new());
+    let mut input: &[u8] = &[];
+    assert_eq!(
+        run_in_with(
+            &dir.path,
+            &argv(&["--types", "path", "--"]),
+            Some(&call),
+            &mut input
+        ),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
+#[test]
+fn run_without_caller_fails_before_browser() {
+    // No injected caller: a real client is built (missing credentials
+    // fail fast), and outside a repository there is no HEAD to resolve,
+    // so both arms fail before any conduit traffic or browser launch.
+    let dir = TempDir::new("nocaller");
+    let mut input: &[u8] = &[];
+    assert_eq!(
+        run_in_with(&dir.path, &argv(&["--"]), None, &mut input),
+        std::process::ExitCode::from(255)
+    );
+}
+
+#[test]
+fn run_prepared_reports_unopenable_browser() {
+    let tmp = repo_fixture("badbrowser");
+    std::fs::write(
+        tmp.path.join(".arcconfig"),
+        r#"{"repository.callsign": "X", "browser": "definitely-not-a-browser-t1170"}"#,
+    )
+    .unwrap();
+    let mut routes = repo_routes();
+    routes.insert("phid.lookup".to_string(), serde_json::json!({}));
+    let call = mock(routes);
+    let mut input: &[u8] = &[];
+    assert_eq!(
+        run_prepared(&tmp.path, &options_of(&["f.txt"]), &call, "", &mut input),
+        std::process::ExitCode::from(255)
+    );
+}
+
+#[test]
+fn run_dispatches_through_real_cwd() {
+    assert_eq!(run(&argv(&["--bogus"])), std::process::ExitCode::FAILURE);
+}
+
+#[test]
+fn run_in_with_enforces_terminator_when_piped() {
+    // Piped runs without `--` fail at the terminator gate (both the
+    // help and options arms); interactive runs proceed instead. The
+    // expectations stay branchless so neither stdin state leaves a
+    // dead arm behind.
+    use std::process::ExitCode;
+    let piped = !crate::prompt::stdin_is_terminal();
+    let dir = TempDir::new("terminator");
+    let call = mock(HashMap::new());
+    let mut input: &[u8] = &[];
+    let help = run_in_with(&dir.path, &argv(&["--help"]), Some(&call), &mut input);
+    let help_want = [ExitCode::SUCCESS, ExitCode::FAILURE][usize::from(piped)];
+    assert_eq!(help, help_want);
+    let options = run_in_with(&dir.path, &argv(&["f.txt"]), Some(&call), &mut input);
+    let options_want = [ExitCode::from(255), ExitCode::FAILURE][usize::from(piped)];
+    assert_eq!(options, options_want);
 }

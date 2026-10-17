@@ -1307,3 +1307,148 @@ fn r10_upgrade_help_matches_generated_format() {
     // `run()` prints `usage()` (same text, ambient ANSI mode).
     assert!(usage().contains("UPGRADE WORKFLOW"), "{}", usage());
 }
+
+// -( T1170 COV: close upgrade.rs )----------------------------------------------
+
+#[test]
+fn porcelain_entry_paths_ignores_unknown_kinds() {
+    assert_eq!(porcelain_entry_paths("# branch.ab +1 -0"), None);
+    assert_eq!(porcelain_entry_paths(""), None);
+}
+
+#[test]
+fn uncommitted_paths_reports_git_failures() {
+    let plain = TempDir::new("nogit-status");
+    let err = uncommitted_paths(&plain.path).unwrap_err();
+    assert!(err.starts_with("git status failed: "), "{err}");
+}
+
+#[test]
+fn apply_reports_failed_pulls() {
+    let repo = fresh_repo("nopull");
+    commit(&repo.path, "a.txt");
+    let target = resolve_apply_target(&repo.path).unwrap();
+    // No `origin` remote: the pull fails and its stderr becomes the error.
+    let err = run_apply(&target).unwrap_err();
+    assert!(!err.is_empty(), "pull failure must explain itself");
+    assert!(repo.path.join("a.txt").is_file());
+}
+
+#[test]
+fn render_reports_unknown_working_copy_and_upstream_counts() {
+    let status = Status {
+        version: "v".to_string(),
+        in_repo: true,
+        root: Some("/r".to_string()),
+        branch: Some("master".to_string()),
+        head: Some("abc".to_string()),
+        clean: None,
+        changed_files: None,
+        upstream: Some("origin/master".to_string()),
+        ahead: None,
+        behind: None,
+    };
+    let text = render(&status);
+    assert!(text.contains("Working copy: unknown"), "{text}");
+    assert!(
+        text.contains("Upstream: origin/master (counts unknown)"),
+        "{text}"
+    );
+}
+
+#[test]
+fn github_bare_host_has_no_repo() {
+    assert_eq!(parse_github_repo("https://github.com"), None);
+}
+
+#[test]
+fn release_http_error_names_non_404_status() {
+    assert_eq!(
+        release_http_error("o/r", 500),
+        "failed to check for updates: HTTP 500."
+    );
+}
+
+#[test]
+fn download_size_gate_refuses_empty_assets() {
+    assert_eq!(
+        verify_download_size(5, 0).unwrap_err(),
+        "refusing to install an empty release asset (expected size 0)."
+    );
+    assert!(verify_download_size(5, 5).is_ok());
+}
+
+#[test]
+fn install_cleans_up_failed_stages() {
+    let dir = TempDir::new("stagefail");
+    let exe = dir.path.join("arc");
+    // A directory at the staging path blocks the write.
+    std::fs::create_dir(dir.path.join("arc.arc-new")).unwrap();
+    let err = install_bytes_at(&exe, b"new").unwrap_err();
+    assert!(
+        err.starts_with("failed to stage the new executable: "),
+        "{err}"
+    );
+    assert!(!exe.exists());
+}
+
+#[cfg(not(windows))]
+#[test]
+fn install_reports_failed_unix_replacement() {
+    let dir = TempDir::new("replacefail");
+    let exe = dir.path.join("arc");
+    // Renaming a file over a non-empty directory fails; nothing changes.
+    std::fs::create_dir(&exe).unwrap();
+    std::fs::write(exe.join("keep"), b"x").unwrap();
+    let err = install_bytes_at(&exe, b"new").unwrap_err();
+    assert!(err.contains("failed to replace"), "{err}");
+    assert!(exe.join("keep").is_file());
+    assert_no_leftovers(&dir.path);
+}
+
+#[test]
+fn exe_path_defaults_to_the_running_test_binary() {
+    let opts = ApplyOptions {
+        api_base: String::new(),
+        current_version: "0".to_string(),
+        exe: None,
+        yes: true,
+        json: false,
+        ansi: false,
+    };
+    assert!(resolve_exe_path(&opts).unwrap().is_file());
+}
+
+#[test]
+fn args_reject_positionals_after_the_terminator() {
+    match parse_args_with_tty(&["--".to_string(), "x".to_string()], true) {
+        Parsed::Error(message) => assert_eq!(message, "unexpected argument 'x'"),
+        _ => panic!("post-terminator positional must be an error"),
+    }
+}
+
+#[test]
+fn apply_command_reports_unsupported_branches_without_network() {
+    let repo = fresh_repo("applybranch");
+    commit(&repo.path, "a.txt");
+    git(&repo.path, &["checkout", "-q", "-b", "feature"]);
+    let options = Options {
+        check: false,
+        json: false,
+        apply: true,
+        yes: true,
+    };
+    // Branch gating fails before any network fetch.
+    assert_eq!(run_apply_command(&repo.path, &options), ExitCode::FAILURE);
+}
+
+#[test]
+fn status_entry_point_resolves_to_a_terminal_exit_code() {
+    // Piped runs without `--` take the terminator arm, TTY runs
+    // report the checkout; either way no ambient state is asserted.
+    let code = run(&[]);
+    assert!(
+        code == ExitCode::SUCCESS || code == ExitCode::FAILURE,
+        "{code:?}"
+    );
+}

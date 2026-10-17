@@ -834,3 +834,366 @@ fn b23_linters_help_matches_generated_format() {
     let ansi = usage_text(true);
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
+
+// -( Coverage: versions, engines, selection, entry )-----------------------------
+
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-linters-tests-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+#[cfg(unix)]
+fn write_script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// A fake working copy: `.git` marker plus an optional `.arcconfig`.
+fn fake_root(dir: &Path, arcconfig: Option<&str>) {
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    if let Some(text) = arcconfig {
+        std::fs::write(dir.join(".arcconfig"), text).unwrap();
+    }
+}
+
+#[test]
+fn describe_falls_back_to_generic_rule() {
+    assert_eq!(describe("bogus-linter"), "Lint rule.");
+    assert_eq!(describe("JSCS"), "Checks JavaScript code style.");
+}
+
+#[test]
+fn hlint_parser_rejects_empty_version() {
+    assert_eq!(parse_hlint_version("HLint v ,"), None);
+    assert_eq!(
+        parse_hlint_version("HLint v3.8, (something)"),
+        Some("3.8".to_string())
+    );
+}
+
+#[test]
+fn pylint_parser_rejects_minor_only() {
+    assert_eq!(parse_pylint_version("pylint 3.0, extras"), None);
+    assert_eq!(
+        parse_pylint_version("pylint 3.0.1, extras"),
+        Some("3.0.1".to_string())
+    );
+}
+
+#[test]
+fn ruby_parser_rejects_minor_only() {
+    assert_eq!(parse_ruby_version("ruby 1.2 (2024-01-01)"), None);
+    assert_eq!(
+        parse_ruby_version("ruby 3.0.0p0 (2021-12-25 revision 0)"),
+        Some("3.0.0".to_string())
+    );
+}
+
+#[test]
+fn probe_skips_linters_without_version_pattern() {
+    // `closure` has a binary but no `getVersion()`: configured
+    // without a version, and no probe runs.
+    assert_eq!(probe_version(meta("ArcanistClosureLinter")), Ok(None));
+}
+
+#[test]
+#[cfg(unix)]
+fn probe_reports_successful_versions() {
+    let tmp = TempDir::new("probe-ok");
+    let tool = write_script(tmp.path(), "fake-jscs", "#!/bin/sh\necho 1.2.3\n");
+    let binary = tool.to_string_lossy().into_owned();
+    assert_eq!(
+        probe_version_with_bin(meta("ArcanistJscsLinter"), Some(&binary)),
+        Ok(Some("1.2.3".to_string()))
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn probe_reports_php_versions() {
+    let tmp = TempDir::new("probe-php");
+    let tool = write_script(tmp.path(), "fake-php", "#!/bin/sh\necho 8.1.2\n");
+    let binary = tool.to_string_lossy().into_owned();
+    assert_eq!(
+        probe_version_with_bin(meta("ArcanistPhpLinter"), Some(&binary)),
+        Ok(Some("8.1.2".to_string()))
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn probe_reports_nonzero_exits() {
+    let tmp = TempDir::new("probe-exit");
+    let tool = write_script(tmp.path(), "fake-jscs", "#!/bin/sh\nexit 3\n");
+    let binary = tool.to_string_lossy().into_owned();
+    let error = probe_version_with_bin(meta("ArcanistJscsLinter"), Some(&binary)).unwrap_err();
+    assert_eq!(error.class, "CommandException");
+    assert!(
+        error.message.contains("exited with status 3"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn probe_lenient_pattern_ignores_nonzero_exits() {
+    // `jsonlint` tolerates a nonzero exit: the triple still parses.
+    let tmp = TempDir::new("probe-lenient");
+    let tool = write_script(
+        tmp.path(),
+        "fake-jsonlint",
+        "#!/bin/sh\necho 1.2.3\nexit 3\n",
+    );
+    let binary = tool.to_string_lossy().into_owned();
+    assert_eq!(
+        probe_version_with_bin(meta("ArcanistJSONLintLinter"), Some(&binary)),
+        Ok(Some("1.2.3".to_string()))
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn probe_reports_spawn_failures() {
+    // Spawning a directory fails with permission denied (not
+    // not-found), surfacing the generic command error.
+    let tmp = TempDir::new("probe-spawn");
+    let binary = tmp.path().to_string_lossy().into_owned();
+    let error = probe_version_with_bin(meta("ArcanistJscsLinter"), Some(&binary)).unwrap_err();
+    assert_eq!(error.class, "CommandException");
+    assert!(error.message.contains("Failed to run"), "{}", error.message);
+    assert!(error.message.contains("--version"), "{}", error.message);
+}
+
+#[test]
+#[cfg(unix)]
+fn probe_binary_version_reports_php_versions() {
+    let tmp = TempDir::new("binver-php");
+    let tool = write_script(tmp.path(), "fake-php", "#!/bin/sh\necho 8.0.0\n");
+    assert_eq!(
+        probe_binary_version(VersionPattern::PhpVersion, &tool),
+        Some("8.0.0".to_string())
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn probe_binary_version_ignores_nonzero_exits() {
+    let tmp = TempDir::new("binver-exit");
+    let tool = write_script(tmp.path(), "fake-tool", "#!/bin/sh\nexit 3\n");
+    assert_eq!(
+        probe_binary_version(VersionPattern::ExactTriple, &tool),
+        None
+    );
+}
+
+#[test]
+fn configured_classes_rejects_unknown_engines() {
+    let tmp = TempDir::new("bad-engine");
+    fake_root(tmp.path(), Some(r#"{"lint.engine": "Bogus"}"#));
+    assert_eq!(
+        configured_classes(tmp.path()),
+        Err("Configured lint engine \"Bogus\" is not a subclass of \
+             \"ArcanistLintEngine\", but must be."
+            .to_string())
+    );
+}
+
+#[test]
+fn spec_bin_reads_first_string_entry() {
+    use std::collections::HashMap;
+    let root = std::path::Path::new("proj");
+    let extra = |bin: serde_json::Value| {
+        let mut map = HashMap::new();
+        map.insert("bin".to_string(), bin);
+        map
+    };
+    // Lists take the first string; a relative path with a separator
+    // resolves against the project root.
+    assert_eq!(
+        spec_bin(root, &extra(serde_json::json!([1, "tools/lint", "other"]))),
+        Some(root.join("tools/lint").to_string_lossy().into_owned())
+    );
+    // No string entry, a scalar, and a missing key all yield nothing.
+    assert_eq!(spec_bin(root, &extra(serde_json::json!([1, true]))), None);
+    assert_eq!(spec_bin(root, &extra(serde_json::json!(42))), None);
+    assert_eq!(spec_bin(root, &HashMap::new()), None);
+    // Absolute paths pass through untouched.
+    assert_eq!(
+        spec_bin(root, &extra(serde_json::json!("/custom/tool"))),
+        Some("/custom/tool".to_string())
+    );
+}
+
+#[test]
+fn single_engine_requires_linter_name() {
+    let tmp = TempDir::new("single-missing");
+    fake_root(
+        tmp.path(),
+        Some(r#"{"lint.engine": "ArcanistSingleLintEngine"}"#),
+    );
+    assert_eq!(
+        configured_classes(tmp.path()),
+        Err(
+            "You must configure 'lint.engine.single.linter' with the name of a linter in \
+             order to use ArcanistSingleLintEngine."
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn single_engine_accepts_known_linters() {
+    let tmp = TempDir::new("single-ok");
+    fake_root(
+        tmp.path(),
+        Some(
+            r#"{"lint.engine": "ArcanistSingleLintEngine", "lint.engine.single.linter": "ArcanistTextLinter"}"#,
+        ),
+    );
+    assert_eq!(
+        configured_classes(tmp.path()),
+        Ok(vec!["ArcanistTextLinter"])
+    );
+}
+
+#[test]
+fn collect_entries_skips_unknown_classes() {
+    let entries = collect_entries(&["ArcanistTextLinter", "Bogus"]);
+    assert_eq!(entries.len(), LINTERS.len());
+    let text = entries
+        .iter()
+        .find(|entry| entry.meta.class == "ArcanistTextLinter")
+        .unwrap();
+    assert_eq!(text.status, LinterStatus::Configured);
+    assert_eq!(text.version, None);
+    assert!(text.error.is_none());
+}
+
+#[test]
+fn collect_entries_marks_probe_failures() {
+    let entries = collect_entries_with_bins(&[ConfiguredLinter {
+        class: "ArcanistJSHintLinter",
+        bin: Some("arc-rs-no-such-binary-xyz".to_string()),
+    }]);
+    let jshint = entries
+        .iter()
+        .find(|entry| entry.meta.class == "ArcanistJSHintLinter")
+        .unwrap();
+    assert_eq!(jshint.status, LinterStatus::Error);
+    assert_eq!(
+        jshint.error.as_ref().unwrap().class,
+        "ArcanistMissingLinterException"
+    );
+}
+
+#[test]
+fn parse_args_splits_double_dash() {
+    match parse_args(&["--".to_string(), "text".to_string()]) {
+        ParseOutcome::Args(options) => {
+            assert_eq!(options.exact, vec!["text".to_string()]);
+            assert!(!options.verbose);
+        }
+        _ => panic!("expected args"),
+    }
+}
+
+#[test]
+fn parse_args_splices_verbose_values() {
+    // `--verbose=value` splices the value back as a positional.
+    match parse_args(&["--verbose=x".to_string()]) {
+        ParseOutcome::Args(options) => {
+            assert!(options.verbose);
+            assert_eq!(options.exact, vec!["x".to_string()]);
+        }
+        _ => panic!("expected args"),
+    }
+}
+
+#[test]
+fn parse_args_rejects_short_flags() {
+    match parse_args(&["-x".to_string()]) {
+        ParseOutcome::Error(message) => {
+            assert_eq!(message, "Unknown argument 'x'. Try 'arc help'.");
+        }
+        _ => panic!("expected error"),
+    }
+}
+
+#[test]
+fn run_in_reports_bad_configuration() {
+    let tmp = TempDir::new("run-bad");
+    fake_root(tmp.path(), Some(r#"{"lint.engine": "Bogus"}"#));
+    assert_eq!(run_in(tmp.path(), &[]), std::process::ExitCode::FAILURE);
+}
+
+#[test]
+fn run_in_renders_exact_matches() {
+    // No engine configured: every linter shows available, and the
+    // exact name renders without probing anything.
+    let tmp = TempDir::new("run-exact");
+    fake_root(tmp.path(), None);
+    assert_eq!(
+        run_in(tmp.path(), &["text".to_string()]),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
+#[test]
+fn run_in_covers_help_search_and_full_listings() {
+    let tmp = TempDir::new("run-modes");
+    fake_root(tmp.path(), None);
+    // `--help` prints usage.
+    assert_eq!(
+        run_in(tmp.path(), &["--help".to_string()]),
+        std::process::ExitCode::SUCCESS
+    );
+    // An exact name with no match reports and exits zero.
+    assert_eq!(
+        run_in(tmp.path(), &["frobnicate".to_string()]),
+        std::process::ExitCode::SUCCESS
+    );
+    // Search terms filter the registry.
+    assert_eq!(
+        run_in(
+            tmp.path(),
+            &["--search".to_string(), "javascript".to_string()]
+        ),
+        std::process::ExitCode::SUCCESS
+    );
+    // No selection lists every linter.
+    assert_eq!(run_in(tmp.path(), &[]), std::process::ExitCode::SUCCESS);
+}
+
+#[test]
+fn run_dispatches_through_cwd() {
+    assert_eq!(
+        run(&["--help".to_string()]),
+        std::process::ExitCode::SUCCESS
+    );
+}

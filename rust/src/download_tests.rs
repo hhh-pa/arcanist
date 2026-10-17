@@ -742,6 +742,417 @@ fn dl_b21_terminator_ordering() {
     );
 }
 
+/// Serve one raw status line with an empty body; returns its URL.
+fn serve_status_once(status: u16) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/f", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if stream.read_exact(&mut byte).is_err() {
+                return;
+            }
+            head.push(byte[0]);
+        }
+        let response =
+            format!("HTTP/1.1 {status} Oops\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    url
+}
+
+/// Serve a body shorter than its declared length, then close early;
+/// returns its URL.
+fn serve_truncated_once(declared: usize, body: Vec<u8>) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/f", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if stream.read_exact(&mut byte).is_err() {
+                return;
+            }
+            head.push(byte[0]);
+        }
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.write_all(&body).unwrap();
+    });
+    url
+}
+
+/// A loopback URL nothing listens on: bind a port, then release it.
+fn closed_port_url() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    format!("http://127.0.0.1:{port}/f")
+}
+
+// -( Coverage: args, targets, transport edges )---------------------------------
+
+#[test]
+fn parses_attached_flag_values() {
+    let opts = args_of(&["--as=out.bin", "--conduit-uri=http://x/", "--", "F1"]);
+    assert_eq!(opts.save_as, Some("out.bin".to_string()));
+    assert_eq!(opts.conduit_uri, Some("http://x/".to_string()));
+    // A missing `--conduit-uri` value errors immediately.
+    let ParseOutcome::Error(message) = parse_args(&argv(&["--conduit-uri"])) else {
+        panic!("expected missing-value error");
+    };
+    assert_eq!(message, "--conduit-uri requires a value");
+}
+
+#[test]
+fn canonical_target_climbs_past_missing_parents() {
+    let dir = dl_tempdir("climb");
+    let file = dl_file(1, "f.bin", 1, "http://127.0.0.1:9/x");
+    // `nosub` does not exist, but its parent does: the target
+    // resolves through the nearest existing ancestor.
+    let target = resolve_target(&dir.join("nosub"), Some("f.bin"), &file).unwrap();
+    assert_eq!(
+        target,
+        dir.canonicalize().unwrap().join("nosub").join("f.bin")
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn canonical_target_falls_back_to_lexical_join() {
+    // A relative directory with no existing ancestor resolves
+    // lexically (no filesystem writes involved).
+    let dir = std::path::Path::new("arc-rs-dl-no-such-dir-xyz");
+    let file = dl_file(1, "f.bin", 1, "http://127.0.0.1:9/x");
+    let target = resolve_target(dir, Some("f.bin"), &file).unwrap();
+    assert_eq!(target, dir.join("f.bin"));
+}
+
+#[test]
+fn resolve_unique_skips_twice_taken_names() {
+    let dir = dl_tempdir("uniq2");
+    let file = dl_file(1, "f.bin", 1, "http://127.0.0.1:9/x");
+    std::fs::write(dir.join("f.bin"), "a").unwrap();
+    std::fs::write(dir.join("f.bin.1"), "b").unwrap();
+    let target = resolve_target(&dir, None, &file).unwrap();
+    assert_eq!(target.file_name().unwrap(), "f.bin.2");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn progress_sink_throttles_and_overwrites() {
+    // Piped sinks publish at most every 2s: the immediate second
+    // update only accumulates.
+    let mut sink = ProgressSink::new(8, false);
+    sink.made_progress(4);
+    sink.made_progress(4);
+    assert_eq!(sink.completed, 8);
+    // TTY sinks overwrite the line in place.
+    let mut sink = ProgressSink::new(8, true);
+    sink.made_progress(8);
+    assert_eq!(sink.completed, 8);
+    sink.complete();
+}
+
+#[test]
+fn fail_download_silences_sink_and_removes_partial() {
+    let dir = dl_tempdir("faildl");
+    let target = dir.join("partial.bin");
+    std::fs::write(&target, "half").unwrap();
+    let mut sink = Some(ProgressSink::new(10, false));
+    let message = fail_download(&mut sink, &target, "boom".to_string());
+    assert_eq!(message, "boom");
+    assert!(sink.is_none());
+    assert!(!target.exists());
+    // Without a sink the partial still goes.
+    let target = dir.join("partial2.bin");
+    std::fs::write(&target, "half").unwrap();
+    let mut none: Option<ProgressSink> = None;
+    assert_eq!(
+        fail_download(&mut none, &target, "bang".to_string()),
+        "bang"
+    );
+    assert!(!target.exists());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn create_target_reports_open_failures() {
+    let dir = dl_tempdir("createrr");
+    let err = create_target(&dir.join("nosub").join("f.bin"), true).unwrap_err();
+    assert!(err.contains("failed to open"), "{err}");
+    assert!(err.contains("f.bin"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn open_response_reports_transport_and_status_failures() {
+    let dir = dl_tempdir("openerr");
+    let target = dir.join("f.bin");
+    let mut sink: Option<ProgressSink> = None;
+    let err = open_download_response(
+        &closed_port_url(),
+        std::time::Duration::from_secs(5),
+        &mut sink,
+        &target,
+    )
+    .unwrap_err();
+    assert!(err.starts_with("download failed: "), "{err}");
+    // A sink fails along with the transport.
+    let mut sink = Some(ProgressSink::new(4 * 1024 * 1024 + 1, false));
+    let err = open_download_response(
+        &closed_port_url(),
+        std::time::Duration::from_secs(5),
+        &mut sink,
+        &target,
+    )
+    .unwrap_err();
+    assert!(err.starts_with("download failed: "), "{err}");
+    assert!(sink.is_none());
+    // Non-2xx statuses fail with the status line.
+    let mut sink: Option<ProgressSink> = None;
+    let err = open_download_response(
+        &serve_status_once(500),
+        std::time::Duration::from_secs(5),
+        &mut sink,
+        &target,
+    )
+    .unwrap_err();
+    assert!(err.contains("HTTP 500"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn pump_reports_write_failures() {
+    let dir = dl_tempdir("pumperr");
+    let url = serve_bytes_once(b"hello".to_vec());
+    let target = dir.join("f.bin");
+    let mut sink: Option<ProgressSink> = None;
+    let mut response =
+        open_download_response(&url, std::time::Duration::from_secs(5), &mut sink, &target)
+            .unwrap();
+    let ro = dir.join("ro.bin");
+    std::fs::write(&ro, "x").unwrap();
+    let mut out = std::fs::File::open(&ro).unwrap();
+    let err = pump_download_response(&mut response, &mut out, &mut sink, &target).unwrap_err();
+    assert!(err.contains("failed to write"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn pump_drives_progress_sink() {
+    let dir = dl_tempdir("pumpsink");
+    let url = serve_bytes_once(b"hello".to_vec());
+    let target = dir.join("f.bin");
+    let mut into: Option<ProgressSink> = None;
+    let mut response =
+        open_download_response(&url, std::time::Duration::from_secs(5), &mut into, &target)
+            .unwrap();
+    let mut out = create_target(&target, true).unwrap();
+    let mut sink = Some(ProgressSink::new(5, false));
+    let written = pump_download_response(&mut response, &mut out, &mut sink, &target).unwrap();
+    assert_eq!(written, 5);
+    assert_eq!(sink.as_ref().unwrap().completed, 5);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn pump_reports_truncated_bodies() {
+    let dir = dl_tempdir("pumptrunc");
+    let url = serve_truncated_once(100, b"0123456789".to_vec());
+    let target = dir.join("f.bin");
+    let mut into: Option<ProgressSink> = None;
+    let mut response =
+        open_download_response(&url, std::time::Duration::from_secs(5), &mut into, &target)
+            .unwrap();
+    let mut out = create_target(&target, true).unwrap();
+    let mut sink: Option<ProgressSink> = None;
+    let err = pump_download_response(&mut response, &mut out, &mut sink, &target).unwrap_err();
+    assert!(err.starts_with("download failed: "), "{err}");
+    assert!(!target.exists());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn download_to_path_fails_sink_on_create_error() {
+    let dir = dl_tempdir("tocreate");
+    let url = serve_bytes_once(b"hello".to_vec());
+    // The target's parent is missing, so creation fails after the
+    // response opens; only the sink fails, like PHP.
+    let target = dir.join("nosub").join("f.bin");
+    let err = download_to_path(
+        &url,
+        std::time::Duration::from_secs(5),
+        &target,
+        false,
+        5 * 1024 * 1024,
+        false,
+    )
+    .unwrap_err();
+    assert!(err.contains("failed to open"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn download_to_path_completes_sink() {
+    let dir = dl_tempdir("tocomplete");
+    let body = b"hello".to_vec();
+    let url = serve_bytes_once(body.clone());
+    let target = dir.join("f.bin");
+    let written = download_to_path(
+        &url,
+        std::time::Duration::from_secs(5),
+        &target,
+        true,
+        5 * 1024 * 1024,
+        false,
+    )
+    .unwrap();
+    assert_eq!(written, body.len() as u64);
+    assert_eq!(std::fs::read(&target).unwrap(), body);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn stdout_path_reports_size_mismatch() {
+    let body = vec![7u8; 16];
+    let url = serve_bytes_once(body);
+    let page = serde_json::json!({
+        "result": {"data": [{
+            "id": 9,
+            "phid": "PHID-FILE-9",
+            "fields": {"name": "short.bin", "size": 64, "dataURI": url},
+        }]},
+        "error_code": null,
+    })
+    .to_string();
+    let (base, rx) = serve_seq(vec![page]);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    let dir = dl_tempdir("stdoutmm");
+    let err =
+        download_file_for_symbol(&client, &dir, &FileSymbol::Id(9), "F9", Some("-")).unwrap_err();
+    assert!(err.contains("does not match expected file size"), "{err}");
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .len(),
+        1
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn stdout_path_writes_matching_bytes() {
+    // Matching sizes stream the body to stdout (captured) with empty
+    // returned text.
+    let body = vec![9u8; 32];
+    let url = serve_bytes_once(body);
+    let page = serde_json::json!({
+        "result": {"data": [{
+            "id": 9,
+            "phid": "PHID-FILE-9",
+            "fields": {"name": "out.bin", "size": 32, "dataURI": url},
+        }]},
+        "error_code": null,
+    })
+    .to_string();
+    let (base, rx) = serve_seq(vec![page]);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    let dir = dl_tempdir("stdoutok");
+    let out = download_file_for_symbol(&client, &dir, &FileSymbol::Id(9), "F9", Some("-")).unwrap();
+    assert_eq!(out, "");
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .len(),
+        1
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn file_download_propagates_transport_errors() {
+    let page = serde_json::json!({
+        "result": {"data": [{
+            "id": 9,
+            "phid": "PHID-FILE-9",
+            "fields": {"name": "f9.bin", "size": 4, "dataURI": closed_port_url()},
+        }]},
+        "error_code": null,
+    })
+    .to_string();
+    let (base, rx) = serve_seq(vec![page]);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    let dir = dl_tempdir("transport");
+    let err = download_file_for_symbol(&client, &dir, &FileSymbol::Id(9), "F9", None).unwrap_err();
+    assert!(err.starts_with("download failed: "), "{err}");
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .len(),
+        1
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn download_file_resolves_plain_ids() {
+    // The plain-ID wrapper lands the same bytes as the symbol path.
+    let body: Vec<u8> = (0..1000u32).map(|n| (n % 251) as u8).collect();
+    let url = serve_bytes_once(body.clone());
+    let page = serde_json::json!({
+        "result": {"data": [{
+            "id": 9,
+            "phid": "PHID-FILE-9",
+            "fields": {"name": "f9.bin", "size": body.len(), "dataURI": url},
+        }]},
+        "error_code": null,
+    })
+    .to_string();
+    let (base, rx) = serve_seq(vec![page]);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    let dir = dl_tempdir("plainid");
+    let out = download_file(&client, &dir, 9, None).unwrap();
+    assert_eq!(out, "");
+    assert_eq!(std::fs::read(dir.join("f9.bin")).unwrap(), body);
+    assert_eq!(
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .len(),
+        1
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn run_in_reports_help_and_usage_errors() {
+    // `--help` prints usage and exits zero.
+    assert_eq!(
+        run_in(&std::env::temp_dir(), &argv(&["--help", "--"])),
+        std::process::ExitCode::SUCCESS
+    );
+    // Parse errors are toolset usage (exit 1).
+    assert_eq!(
+        run_in(&std::env::temp_dir(), &argv(&["--"])),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn run_dispatches_through_cwd() {
+    assert_eq!(
+        run(&argv(&["--help", "--"])),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
 #[test]
 fn dl_b23_help_matches_generated_format() {
     assert_eq!(

@@ -1573,8 +1573,6 @@ fn run_lint_unit_stdio_ansi(
     ansi: bool,
 ) -> Result<diff_local::LintUnitReport, String> {
     let (lint_flags, unit_flags) = set_child_flags(options);
-    let stdin = std::io::stdin();
-    let mut input = stdin.lock();
     let mut out = std::io::stdout();
     // T1153 DIFF-D22: the lint child amends when `shouldAmend()`
     // (bare `setShouldAmendChanges()`), like PHP's `runLint()`.
@@ -1587,19 +1585,38 @@ fn run_lint_unit_stdio_ansi(
     let run_lint_child = |dir: &Path, argv: &[String]| {
         diff_local::run_lint_in_process_with_amend(dir, argv, amend_lint)
     };
-    diff_local::run_lint_unit_ansi(
+    // Never hold `stdin.lock()` across the lint child: it locks stdin
+    // itself and a second guard on this thread deadlocks (`StdinLock`
+    // is not reentrant). Run the phases separately so each lock's
+    // lifetime ends before the next begins (same order and flags as
+    // `run_lint_unit_ansi`, which must not be called with a live guard).
+    let (lint_result, unresolved_lint) = diff_local::run_lint_ansi(
         cwd,
         base,
         &lint_flags,
-        &unit_flags,
         diff_local::should_skip_lint(options.nolint, is_raw, head),
-        diff_local::should_skip_unit(options.nounit, is_raw, head),
         &run_lint_child,
+        &mut out,
+        ansi,
+    )?;
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let (unit_result, test_results) = diff_local::run_unit_ansi(
+        cwd,
+        base,
+        &unit_flags,
+        diff_local::should_skip_unit(options.nounit, is_raw, head),
         &diff_local::run_unit_in_process,
         &mut input,
         &mut out,
         ansi,
-    )
+    )?;
+    Ok(diff_local::LintUnitReport {
+        lint_result,
+        unresolved_lint,
+        unit_result,
+        test_results,
+    })
 }
 
 /// Collect everything a submit sends, without touching Conduit.

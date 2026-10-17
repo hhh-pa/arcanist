@@ -366,3 +366,163 @@ fn lint32_version_probe_reports_old_and_new_texts() {
     script(tmp.path(), "cslint.exe", "#!/bin/sh\necho 1\n");
     assert!(linter.resolve_in(tmp.path().as_os_str()).is_ok());
 }
+
+// -( T1170 COV: close lint_csharp.rs )----------------------------------------
+
+#[test]
+fn discovery_json_renders_multi_value_maps_and_control_escapes() {
+    let mut map = BTreeMap::new();
+    map.insert("k".to_string(), vec!["a".to_string(), "b".to_string()]);
+    assert_eq!(discovery_json(&map), r#"{"k":["a","b"]}"#);
+    assert_eq!(php_json_escape("\u{8}\u{c}\r\t"), "\\b\\f\\r\\t");
+}
+
+#[test]
+fn trailing_dot_has_no_extension() {
+    assert_eq!(extension_of("foo."), None);
+    assert!(!is_supported("foo."));
+}
+
+#[test]
+fn ambient_command_lookup_stays_consistent_when_present() {
+    // Hermetic by construction: no assumption about the ambient PATH,
+    // only that a found command carries the default flags.
+    match resolve_command() {
+        None => {}
+        Some((_, prefix)) => {
+            if cfg!(windows) {
+                assert_eq!(prefix, command_flags());
+            } else {
+                assert_eq!(&prefix[1..], command_flags().as_slice());
+            }
+        }
+    }
+}
+
+#[test]
+fn version_probe_failures_report_old_cslint_text() {
+    let tmp = TempDir::new("probe-fail");
+    let missing = tmp.path().join("no-such-cslint");
+    let prefix = vec!["cslint".to_string()];
+    assert_eq!(
+        check_version(&missing, &prefix).unwrap_err(),
+        old_version_error()
+    );
+    assert_eq!(
+        check_version(&missing, &[]).unwrap_err(),
+        old_version_error()
+    );
+}
+
+#[test]
+fn version_cast_accepts_signed_numbers() {
+    assert!(version_output_supported(0, "+1"));
+    assert!(!version_output_supported(0, "-1"));
+    assert!(!version_output_supported(0, "+2"));
+}
+
+#[test]
+fn staged_name_falls_back_to_cs_without_a_safe_extension() {
+    assert_eq!(staged_name("noext"), "src.cs");
+    assert_eq!(staged_name("a.verylongextension"), "src.cs");
+    assert_eq!(staged_name("a.c++"), "src.c++");
+    assert_eq!(staged_name("dir/Foo.cs"), "src.cs");
+}
+
+#[cfg(unix)]
+#[test]
+fn tool_stdout_flows_through_lint_with_command() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new("tool-out");
+    let fake = tmp.path().join("cslint");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\necho '[{\"Issues\":[{\"LineNumber\":4,\"Column\":2,\"Index\":{\"Code\":\"C\",\"Name\":\"N\",\"Message\":\"m\",\"Severity\":3},\"Parameters\":[]}]}]'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let prefix: Vec<String> = Vec::new();
+    let messages = lint_with_command("Foo.cs", b"class A {}\n", Some((&fake, &prefix)));
+    assert_eq!(messages.len(), 1);
+    assert_eq!((messages[0].line, messages[0].col), (4, 2));
+    assert_eq!(messages[0].severity, "error");
+}
+
+#[test]
+fn results_without_issues_stop_parsing() {
+    assert!(parse_output("F.cs", 0, r#"[{"FileName":"x"}]"#, "").is_empty());
+}
+
+#[test]
+fn issues_without_an_index_object_are_skipped() {
+    let stdout = r#"[{"Issues":[{"LineNumber":1},{"Index":42,"LineNumber":2}]}]"#;
+    assert!(parse_output("F.cs", 0, stdout, "").is_empty());
+}
+
+#[test]
+fn positions_accept_numbers_strings_and_missing_values() {
+    let stdout = r#"[{"Issues":[
+      {"LineNumber":-3,"Column":2.5,"Index":{"Code":"A","Name":"N","Message":"m","Severity":2}},
+      {"LineNumber":"7","Column":"x","Index":{"Code":"B","Name":"N","Message":"m","Severity":2}},
+      {"Index":{"Code":"C","Name":"N","Message":"m","Severity":2}}
+    ]}]"#;
+    let messages = parse_output("F.cs", 0, stdout, "");
+    assert_eq!(messages.len(), 3);
+    assert_eq!((messages[0].line, messages[0].col), (1, 1));
+    assert_eq!((messages[1].line, messages[1].col), (7, 1));
+    assert_eq!((messages[2].line, messages[2].col), (1, 1));
+}
+
+#[test]
+fn parameters_render_every_json_scalar_shape() {
+    let stdout = r#"[{"Issues":[
+      {"LineNumber":1,"Column":1,"Index":{"Code":"C","Name":"N","Message":"%s|%s|%s|%s|%s|%s","Severity":2},
+       "Parameters":[42,true,false,null,[1],{"a":1}]}
+    ]}]"#;
+    let messages = parse_output("F.cs", 0, stdout, "");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].description, "42|1||||");
+}
+
+#[test]
+fn vsprintf_renders_integer_and_char_conversions() {
+    assert_eq!(
+        vsprintf("%u", &["-1".to_string()]).as_deref(),
+        Some("18446744073709551615")
+    );
+    assert_eq!(vsprintf("%c", &["65".to_string()]).as_deref(), Some("A"));
+    assert_eq!(vsprintf("%X", &["255".to_string()]).as_deref(), Some("FF"));
+    assert_eq!(vsprintf("%o", &["8".to_string()]).as_deref(), Some("10"));
+    assert_eq!(vsprintf("%b", &["5".to_string()]).as_deref(), Some("101"));
+    assert_eq!(vsprintf("%d", &["-42".to_string()]).as_deref(), Some("-42"));
+    assert_eq!(vsprintf("%d", &["abc".to_string()]).as_deref(), Some("0"));
+}
+
+#[test]
+fn vsprintf_declines_bad_positional_and_precision_forms() {
+    assert_eq!(
+        vsprintf("%99999999999999999999999$s", &["x".to_string()]),
+        None
+    );
+    assert_eq!(vsprintf("%.*f", &["1".to_string(), "2".to_string()]), None);
+    assert_eq!(vsprintf("%.f", &["1".to_string()]), None);
+}
+
+#[test]
+fn binary_option_rejects_non_strings_and_discovery_skips_malformed_entries() {
+    let tmp = TempDir::new("bad-options");
+    let ctx = OptionContext {
+        project_root: tmp.path(),
+    };
+    let mut linter = CsharpLinter::new();
+    assert_eq!(
+        linter
+            .set_option("binary", &serde_json::json!(42), &ctx)
+            .unwrap_err(),
+        "'binary' must be a string"
+    );
+    assert!(read_discovery_map(&serde_json::json!("nope")).is_empty());
+    let map = read_discovery_map(&serde_json::json!({"a": 1, "b": ["x", 2]}));
+    assert_eq!(map.len(), 1);
+    assert_eq!(map["b"], vec!["x".to_string()]);
+}

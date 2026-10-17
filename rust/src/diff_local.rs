@@ -2580,6 +2580,9 @@ pub fn run_lint_unit<R: BufRead, W: Write>(
 
 /// [`run_lint_unit`] with an explicit ANSI setting for banners.
 #[allow(clippy::too_many_arguments)]
+/// Callers must NOT pass a live `StdinLock` as `input`: the lint child
+/// locks stdin itself and a second guard on the same thread deadlocks.
+/// Lock stdin only around the unit phase (see `diff::run_lint_unit_stdio_ansi`).
 pub fn run_lint_unit_ansi<R: BufRead, W: Write>(
     cwd: &Path,
     base: Option<&str>,

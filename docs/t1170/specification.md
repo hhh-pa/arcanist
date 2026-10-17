@@ -100,12 +100,14 @@ understood.
 - `WARN` (executable check): script sweeping every check-run of the
   branch HEAD for `annotation_level == "warning"` returns empty; log
   grep for rustc/cargo warnings returns empty.
-- `COV` (TDD per file): `scripts/ci/canonical-lcov.py` — the local
-  replica of the gates' canonical LCOV pipeline, validated to
-  reproduce CI's 92.89% to within 2 lines — shows the touched
-  file(s) at 100% before moving on (plain `cargo llvm-cov` output is
-  NOT representative: it drops the recovered records and reads ~72%
-  on the same suite). Full suite stays green (`cargo test --locked`,
+- `COV` (TDD per file): `go run ./scripts/ci/go/cmd/canonical-lcov` —
+  the local replica of the gates' canonical LCOV pipeline (Go port of
+  the retired `canonical-lcov.py`, validated byte-identical on real
+  profile data; reproduces CI's 92.89% to within 2 lines) — shows the
+  touched file(s) at 100% before moving on (plain `cargo llvm-cov`
+  output is NOT representative: it drops the recovered records and
+  reads ~72% on the same suite). Full suite stays green
+  (`cargo test --locked`,
   fmt, clippy `-D warnings`); final proof is `codecov/project` 100%
   + `codecov/patch` 100% on the branch build.
 

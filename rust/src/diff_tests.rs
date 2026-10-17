@@ -49,16 +49,16 @@ fn g1_editor_helpers() {
         dir.join("missing.sh").to_string_lossy().as_ref()
     ));
 
-    if cfg!(windows) {
-        assert_eq!(shell_quote("a b"), "\"a b\"");
-    } else {
-        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
-    }
+    #[cfg(windows)]
+    assert_eq!(shell_quote("a b"), "\"a b\"");
+    #[cfg(not(windows))]
+    assert_eq!(shell_quote("a'b"), "'a'\\''b'");
 
     assert_eq!(editor_offset_flag("vim", 0), "");
-    if cfg!(windows) {
-        assert_eq!(editor_offset_flag("vim", 3), "");
-    } else {
+    #[cfg(windows)]
+    assert_eq!(editor_offset_flag("vim", 3), "");
+    #[cfg(not(windows))]
+    {
         assert_eq!(editor_offset_flag("vim", 3), "+3");
         assert_eq!(editor_offset_flag("mate", 3), "-l 3");
     }
@@ -85,11 +85,10 @@ fn g1_edit_interactively_roundtrip() {
     assert_eq!(out, "template\n");
 
     // Editors can rewrite the document through the shell.
-    let append = if cfg!(windows) {
-        "echo MARKED>>"
-    } else {
-        "printf MARKED >>"
-    };
+    #[cfg(windows)]
+    let append = "echo MARKED>>";
+    #[cfg(not(windows))]
+    let append = "printf MARKED >>";
     let out = edit_interactively("base\n", "msg", Some("Task line."), Some(append), 0).unwrap();
     assert!(out.contains("MARKED"), "{out:?}");
 
@@ -173,21 +172,25 @@ fn g1_browser_helpers() {
             "http://x/".to_string()
         ]
     );
-    if cfg!(windows) {
-        assert_eq!(
-            browser_open_argv("http://x/", None, &none).unwrap(),
-            vec![
-                "cmd".to_string(),
-                "/c".to_string(),
-                "start".to_string(),
-                "http://x/".to_string()
-            ]
-        );
-    } else {
-        assert_eq!(
-            browser_open_argv("http://x/", None, &none).unwrap_err(),
-            NO_BROWSER_MESSAGE
-        );
+    // Windows always resolves through `cmd /c start`.
+    #[cfg(windows)]
+    assert_eq!(
+        browser_open_argv("http://x/", None, &none).unwrap(),
+        vec![
+            "cmd".to_string(),
+            "/c".to_string(),
+            "start".to_string(),
+            "http://x/".to_string()
+        ]
+    );
+    // Elsewhere an unresolvable browser surfaces the PHP message.
+    #[cfg(not(windows))]
+    assert_eq!(
+        browser_open_argv("http://x/", None, &none).unwrap_err(),
+        NO_BROWSER_MESSAGE
+    );
+    #[cfg(not(windows))]
+    {
         let has_xdg = |name: &str| name == "xdg-open";
         assert_eq!(
             browser_open_argv("http://x/", None, &has_xdg).unwrap(),
@@ -210,20 +213,15 @@ fn gap2_open_submit_result_in_browser_matrix() {
     use std::cell::RefCell;
     let none = |_: &str| false;
     // No URI or no --browse: the runner never runs.
-    let calls = RefCell::new(0);
-    let counting = |_: &str, _: &[String]| {
-        *calls.borrow_mut() += 1;
-        Ok(())
-    };
-    open_submit_result_in_browser(None, true, None, &none, &counting).unwrap();
-    open_submit_result_in_browser(Some("http://x/"), false, None, &none, &counting).unwrap();
-    assert_eq!(*calls.borrow(), 0);
-    // --browse with a URI opens through the resolved browser argv.
     let seen: RefCell<Vec<(String, Vec<String>)>> = RefCell::new(Vec::new());
     let recording = |uri: &str, browser: &[String]| {
         seen.borrow_mut().push((uri.to_string(), browser.to_vec()));
         Ok(())
     };
+    open_submit_result_in_browser(None, true, None, &none, &recording).unwrap();
+    open_submit_result_in_browser(Some("http://x/"), false, None, &none, &recording).unwrap();
+    assert!(seen.borrow().is_empty());
+    // --browse with a URI opens through the resolved browser argv.
     let configured = ["my-browser".to_string(), "--new".to_string()];
     open_submit_result_in_browser(
         Some("http://x/D1"),
@@ -247,14 +245,15 @@ fn gap2_open_submit_result_in_browser_matrix() {
     // Unresolvable browser surfaces the PHP message (off Windows, where
     // `cmd /c start` always resolves).
     let ok_run = |_: &str, _: &[String]| Ok(());
-    if cfg!(windows) {
-        open_submit_result_in_browser(Some("http://x/"), true, None, &none, &ok_run).unwrap();
-    } else {
-        assert_eq!(
-            open_submit_result_in_browser(Some("http://x/"), true, None, &none, &ok_run)
-                .unwrap_err(),
-            NO_BROWSER_MESSAGE
-        );
+    #[cfg(windows)]
+    open_submit_result_in_browser(Some("http://x/"), true, None, &none, &ok_run).unwrap();
+    #[cfg(not(windows))]
+    assert_eq!(
+        open_submit_result_in_browser(Some("http://x/"), true, None, &none, &ok_run).unwrap_err(),
+        NO_BROWSER_MESSAGE
+    );
+    #[cfg(not(windows))]
+    {
         let has_xdg = |name: &str| name == "xdg-open";
         open_submit_result_in_browser(Some("http://x/"), true, None, &has_xdg, &recording).unwrap();
         assert_eq!(
@@ -810,26 +809,27 @@ fn g1_confirm_prompt_helpers() {
 
 #[test]
 fn g1_prompt_confirm_requires_tty() {
-    if !cfg!(unix) {
-        return; // PHP has no TTY gate without posix_isatty (Windows).
-    }
-    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        return; // Interactive session: the TTY gate cannot fail deterministically.
-    }
-    assert_eq!(
-        prompt_confirm("Continue?", true).unwrap_err(),
-        STDIN_NOT_TTY
-    );
+    // PHP has no TTY gate without posix_isatty (Windows).
+    #[cfg(not(unix))]
+    return;
+    // Interactive session: the TTY gate cannot fail deterministically
+    // (it would block on input), so an interactive run checks nothing.
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let gated = (!interactive).then(|| prompt_confirm("Continue?", true).unwrap_err());
+    assert_eq!(gated.as_deref(), (!interactive).then_some(STDIN_NOT_TTY));
 }
 
 #[test]
 fn gap2_tty_gate_matches_php_platform_semantics() {
     // PHP `phutil_console_require_tty()`: gate exists only where
     // `posix_isatty` exists; elsewhere prompting reads stdin directly.
-    if cfg!(unix) {
+    #[cfg(unix)]
+    {
         assert!(super::tty_gate_blocks_with(false));
         assert!(!super::tty_gate_blocks_with(true));
-    } else {
+    }
+    #[cfg(not(unix))]
+    {
         assert!(!super::tty_gate_blocks_with(false));
         assert!(!super::tty_gate_blocks_with(true));
     }
@@ -1736,12 +1736,11 @@ fn merges_fields_oldest_first_with_faux_flags() {
         fields.get(diff_local::FIELD_TITLE),
         Some(&diff_local::FieldValue::Text("Oldest title".to_string()))
     );
-    let summary = match fields.get(diff_local::FIELD_SUMMARY) {
-        Some(diff_local::FieldValue::Text(text)) => text.clone(),
-        other => panic!("missing summary: {other:?}"),
-    };
-    assert!(summary.contains("Old body"), "{summary}");
-    assert!(summary.contains("Newest title"), "{summary}");
+    let summary = fields.get(diff_local::FIELD_SUMMARY);
+    assert!(
+        matches!(summary, Some(diff_local::FieldValue::Text(text)) if text.contains("Old body") && text.contains("Newest title")),
+        "missing summary: {summary:?}"
+    );
     assert_eq!(
         fields.get(diff_local::FIELD_REVIEWERS),
         Some(&diff_local::FieldValue::List(vec![
@@ -1899,13 +1898,12 @@ fn ansi_worktree_blocks_thread_underline() {
 #[test]
 fn ansi_submit_reports_bold_label_and_underline_uri() {
     let call = |method: &str, _params: &serde_json::Value| {
-        if method == diff_submit::METHOD_CREATE_DIFF {
-            Ok(serde_json::json!({"diffid": 1, "uri": "http://x/D1"}))
-        } else if method == diff_submit::METHOD_SET_DIFF_PROPERTY {
-            Ok(serde_json::Value::Null)
-        } else {
-            Err(format!("unexpected {method}"))
-        }
+        assert_eq!(
+            method,
+            diff_submit::METHOD_CREATE_DIFF,
+            "unexpected {method}"
+        );
+        Ok(serde_json::json!({"diffid": 1, "uri": "http://x/D1"}))
     };
     let input = SubmitInput {
         mode: SubmitMode::Only,
@@ -1963,21 +1961,23 @@ fn create_uses_revision_edit_when_server_sends_transactions() {
                 ],
             }));
         }
-        if method == diff_submit::METHOD_REVISION_EDIT {
-            let types: Vec<&str> = params["transactions"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|t| t["type"].as_str().unwrap())
-                .collect();
-            assert_eq!(types, vec!["title", "reviewers.set", "update", "draft"]);
-            assert_eq!(
-                params["transactions"][2]["value"],
-                serde_json::json!("PHID-DIFF-9")
-            );
-            return Ok(serde_json::json!({"object": {"id": 7}}));
-        }
-        Err(format!("unexpected {method}"))
+        assert_eq!(
+            method,
+            diff_submit::METHOD_REVISION_EDIT,
+            "unexpected {method}"
+        );
+        let types: Vec<&str> = params["transactions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, vec!["title", "reviewers.set", "update", "draft"]);
+        assert_eq!(
+            params["transactions"][2]["value"],
+            serde_json::json!("PHID-DIFF-9")
+        );
+        Ok(serde_json::json!({"object": {"id": 7}}))
     };
     let input = create_test_input(true, Some("Add thing\n\nReviewers: alice\n"));
     let revision = submit_create_revision(
@@ -2001,10 +2001,12 @@ fn create_edits_without_draft_transaction_when_not_draft() {
                 "transactions": [{"type": "title", "value": "T"}],
             }));
         }
-        if method == diff_submit::METHOD_REVISION_EDIT {
-            return Ok(serde_json::json!({"object": {"id": 8}}));
-        }
-        Err(format!("unexpected {method}"))
+        assert_eq!(
+            method,
+            diff_submit::METHOD_REVISION_EDIT,
+            "unexpected {method}"
+        );
+        Ok(serde_json::json!({"object": {"id": 8}}))
     };
     let input = create_test_input(false, Some("T\n"));
     let revision = submit_create_revision(&call, &input, 3, None, "u").unwrap();
@@ -2019,15 +2021,17 @@ fn create_falls_back_to_legacy_without_transactions() {
                 "fields": {"title": "T", "reviewerPHIDs": ["PHID-USER-1"]},
             }));
         }
-        if method == diff_submit::METHOD_CREATE_REVISION {
-            assert_eq!(
-                params["fields"]["reviewerPHIDs"],
-                serde_json::json!(["PHID-USER-1"])
-            );
-            assert_eq!(params["diffid"], serde_json::json!(3));
-            return Ok(serde_json::json!({"revisionid": 9, "uri": "https://phab.test/D9"}));
-        }
-        Err(format!("unexpected {method}"))
+        assert_eq!(
+            method,
+            diff_submit::METHOD_CREATE_REVISION,
+            "unexpected {method}"
+        );
+        assert_eq!(
+            params["fields"]["reviewerPHIDs"],
+            serde_json::json!(["PHID-USER-1"])
+        );
+        assert_eq!(params["diffid"], serde_json::json!(3));
+        Ok(serde_json::json!({"revisionid": 9, "uri": "https://phab.test/D9"}))
     };
     let input = create_test_input(false, Some("T\n\nReviewers: alice\n"));
     let revision = submit_create_revision(&call, &input, 3, None, "u").unwrap();
@@ -2038,10 +2042,12 @@ fn create_falls_back_to_legacy_without_transactions() {
 #[test]
 fn create_draft_without_transactions_errors_like_php() {
     let call = |method: &str, _: &serde_json::Value| {
-        if method == diff_submit::METHOD_PARSE_COMMIT_MESSAGE {
-            return Ok(serde_json::json!({"fields": {"title": "T"}}));
-        }
-        Err(format!("unexpected {method}"))
+        assert_eq!(
+            method,
+            diff_submit::METHOD_PARSE_COMMIT_MESSAGE,
+            "unexpected {method}"
+        );
+        Ok(serde_json::json!({"fields": {"title": "T"}}))
     };
     let input = create_test_input(true, Some("T\n"));
     let err = submit_create_revision(&call, &input, 3, None, "u").unwrap_err();
@@ -2051,11 +2057,13 @@ fn create_draft_without_transactions_errors_like_php() {
 #[test]
 fn create_without_corpus_keeps_local_fields_legacy() {
     let call = |method: &str, params: &serde_json::Value| {
-        if method == diff_submit::METHOD_CREATE_REVISION {
-            assert_eq!(params["fields"]["title"], serde_json::json!("Local"));
-            return Ok(serde_json::json!({"revisionid": 1, "uri": "u"}));
-        }
-        Err(format!("unexpected {method}"))
+        assert_eq!(
+            method,
+            diff_submit::METHOD_CREATE_REVISION,
+            "unexpected {method}"
+        );
+        assert_eq!(params["fields"]["title"], serde_json::json!("Local"));
+        Ok(serde_json::json!({"revisionid": 1, "uri": "u"}))
     };
     let input = create_test_input(false, None);
     submit_create_revision(&call, &input, 3, None, "u").unwrap();
@@ -2074,10 +2082,12 @@ fn create_scrubs_placeholder_titles() {
                 ],
             }));
         }
-        if method == diff_submit::METHOD_REVISION_EDIT {
-            return Ok(serde_json::json!({"object": {"id": 2}}));
-        }
-        Err(format!("unexpected {method}"))
+        assert_eq!(
+            method,
+            diff_submit::METHOD_REVISION_EDIT,
+            "unexpected {method}"
+        );
+        Ok(serde_json::json!({"object": {"id": 2}}))
     };
     // Flags-only corpus: placeholder title dropped, reviewers kept, edit
     // path still taken on the remaining transaction.
@@ -2136,7 +2146,8 @@ fn r9_core62_no_browser_message_matches_ceb() {
     assert_eq!(NO_BROWSER_MESSAGE, expected);
     // The scan-failure path surfaces the same bytes (off Windows, where
     // `cmd /c start` always resolves).
-    if !cfg!(windows) {
+    #[cfg(not(windows))]
+    {
         let none = |_: &str| false;
         assert_eq!(
             browser_open_argv("http://example.test/", None, &none).unwrap_err(),
@@ -2163,12 +2174,14 @@ fn update_stub_call() -> impl Fn(&str, &serde_json::Value) -> Result<serde_json:
             assert_eq!(params["edit"], serde_json::json!(false));
             return Ok(serde_json::json!("Thing\n\nSummary: yes\n"));
         }
-        if method == diff_submit::METHOD_PARSE_COMMIT_MESSAGE {
-            return Ok(serde_json::json!({
-                "fields": {"title": "Thing", "summary": "yes"},
-            }));
-        }
-        Err(format!("DIFF-D test: unexpected {method}"))
+        assert_eq!(
+            method,
+            diff_submit::METHOD_PARSE_COMMIT_MESSAGE,
+            "DIFF-D test: unexpected {method}"
+        );
+        Ok(serde_json::json!({
+            "fields": {"title": "Thing", "summary": "yes"},
+        }))
     }
 }
 
@@ -2195,9 +2208,7 @@ fn update_test_target(fields: &serde_json::Value) -> UpdateTarget<'_> {
 fn d6_update_resolves_remote_fields_not_empty() {
     let meta = scratch_dir("d6-fields");
     let call = update_stub_call();
-    let edit = |_: &str, _: &str| -> Result<String, String> {
-        panic!("DIFF-D6: no editor without --edit or missing --message")
-    };
+    let edit = |_: &str, _: &str| -> Result<String, String> { panic!("DIFF-D6: no editor") };
     let prefill = || -> Result<Option<String>, String> { Ok(None) };
     let mut reader = std::io::BufReader::new(std::io::empty());
     let mut writer = Vec::new();
@@ -2227,10 +2238,12 @@ fn d6_update_resolves_remote_fields_not_empty() {
 fn d6_update_missing_revision_names_arg() {
     let meta = scratch_dir("d6-missing");
     let call = |method: &str, _: &serde_json::Value| {
-        if method == diff_submit::METHOD_QUERY {
-            return Ok(serde_json::json!([]));
-        }
-        Err(format!("DIFF-D6: unexpected {method}"))
+        assert_eq!(
+            method,
+            diff_submit::METHOD_QUERY,
+            "DIFF-D6: unexpected {method}"
+        );
+        Ok(serde_json::json!([]))
     };
     let edit = |_: &str, _: &str| -> Result<String, String> { Ok(String::new()) };
     let prefill = || -> Result<Option<String>, String> { Ok(None) };
@@ -2264,10 +2277,8 @@ fn d6_update_foreign_revision_confirms() {
                 "id": 5, "title": "Theirs", "authorPHID": "PHID-USER-9",
             }]));
         }
-        if method == "user.whoami" {
-            return Ok(serde_json::json!({"phid": "PHID-USER-1"}));
-        }
-        Err(format!("DIFF-D6: unexpected {method}"))
+        assert_eq!(method, "user.whoami", "DIFF-D6: unexpected {method}");
+        Ok(serde_json::json!({"phid": "PHID-USER-1"}))
     };
     let edit = |_: &str, _: &str| -> Result<String, String> { Ok(String::new()) };
     let prefill = || -> Result<Option<String>, String> { Ok(None) };
@@ -2363,9 +2374,7 @@ fn d9_blank_editor_output_aborts() {
 fn d9_raw_update_without_message_errors() {
     let meta = scratch_dir("d9-raw");
     let call = update_stub_call();
-    let edit = |_: &str, _: &str| -> Result<String, String> {
-        panic!("DIFF-D9: raw sources never open the editor")
-    };
+    let edit = |_: &str, _: &str| -> Result<String, String> { panic!("DIFF-D9: no editor") };
     let prefill = || -> Result<Option<String>, String> { Ok(None) };
     let mut reader = std::io::BufReader::new(std::io::empty());
     let mut writer = Vec::new();
@@ -2468,10 +2477,12 @@ fn d17_json_updates_and_creates_print_nothing() {
         if method == diff_submit::METHOD_CREATE_DIFF {
             return Ok(serde_json::json!({"diffid": 3, "uri": "http://x/D1"}));
         }
-        if method == diff_submit::METHOD_UPDATE_REVISION {
-            return Ok(serde_json::json!({"revisionid": 5, "uri": "http://x/D5"}));
-        }
-        Err(format!("DIFF-D17: unexpected {method}"))
+        assert_eq!(
+            method,
+            diff_submit::METHOD_UPDATE_REVISION,
+            "DIFF-D17: unexpected {method}"
+        );
+        Ok(serde_json::json!({"revisionid": 5, "uri": "http://x/D5"}))
     };
     let input = SubmitInput {
         mode: SubmitMode::Update(5),
@@ -2583,13 +2594,15 @@ fn d11_autotarget_hit_gates_lint_unit_props() {
         if method == diff_submit::METHOD_SENDMESSAGE {
             return Ok(serde_json::json!(null));
         }
-        if method == diff_submit::METHOD_SET_DIFF_PROPERTY {
-            props
-                .borrow_mut()
-                .push(params["name"].as_str().unwrap_or("").to_string());
-            return Ok(serde_json::json!(null));
-        }
-        Err(format!("DIFF-D11: unexpected {method}"))
+        assert_eq!(
+            method,
+            diff_submit::METHOD_SET_DIFF_PROPERTY,
+            "DIFF-D11: unexpected {method}"
+        );
+        props
+            .borrow_mut()
+            .push(params["name"].as_str().unwrap_or("").to_string());
+        Ok(serde_json::json!(null))
     };
     let input = SubmitInput {
         mode: SubmitMode::Only,
@@ -2624,13 +2637,15 @@ fn d11_autotarget_miss_keeps_legacy_props() {
         if method == diff_submit::METHOD_CREATE_DIFF {
             return Ok(serde_json::json!({"diffid": 3, "uri": "http://x/D1"}));
         }
-        if method == diff_submit::METHOD_SET_DIFF_PROPERTY {
-            props
-                .borrow_mut()
-                .push(params["name"].as_str().unwrap_or("").to_string());
-            return Ok(serde_json::json!(null));
-        }
-        Err(format!("DIFF-D11: unexpected {method}"))
+        assert_eq!(
+            method,
+            diff_submit::METHOD_SET_DIFF_PROPERTY,
+            "DIFF-D11: unexpected {method}"
+        );
+        props
+            .borrow_mut()
+            .push(params["name"].as_str().unwrap_or("").to_string());
+        Ok(serde_json::json!(null))
     };
     let input = SubmitInput {
         mode: SubmitMode::Only,
@@ -2655,11 +2670,7 @@ fn d11_autotarget_miss_keeps_legacy_props() {
 #[test]
 fn d13_staging_skip_ladder_records_statuses() {
     let recorded = std::cell::RefCell::new(Vec::new());
-    let repo_rows = std::cell::RefCell::new(serde_json::json!([{}]));
     let call = |method: &str, params: &serde_json::Value| {
-        if method == "repository.query" {
-            return Ok(repo_rows.borrow().clone());
-        }
         assert_eq!(method, diff_submit::METHOD_SET_DIFF_PROPERTY);
         assert_eq!(params["name"], serde_json::json!("arc.staging"));
         assert_eq!(params["diff_id"], serde_json::json!(9));
@@ -2691,11 +2702,8 @@ fn d13_staging_skip_ladder_records_statuses() {
     assert_eq!(recorded.len(), 3);
     assert!(recorded[0].contains("\"user.skip\""), "{}", recorded[0]);
     assert!(recorded[1].contains("\"diff.raw\""), "{}", recorded[1]);
-    assert!(
-        recorded[2].contains("\"repository.unknown\""),
-        "{}",
-        recorded[2]
-    );
+    let third = &recorded[2];
+    assert!(third.contains("\"repository.unknown\""), "{third}");
 }
 
 #[test]
@@ -2744,11 +2752,8 @@ fn d13_staging_server_ladder_records_statuses() {
     };
     submit_changes_to_staging_area(&dir, &options, &call, Some(VcsKind::Svn), 9, "b", false)
         .unwrap();
-    assert!(
-        payload.borrow().contains("client.unsupported"),
-        "{}",
-        payload.borrow()
-    );
+    let body = payload.borrow();
+    assert!(body.contains("client.unsupported"), "{body}");
     assert!(is_old_server_error("ERR-CONDUIT-CALL: x"));
     assert!(!is_old_server_error("ERR-OTHER: x"));
 }
@@ -2886,9 +2891,11 @@ fn d8_create_message_defaults_run_before_saved_resume() {
     let seen = std::cell::RefCell::new(Vec::new());
     let call = |method: &str, _: &serde_json::Value| {
         seen.borrow_mut().push(method.to_string());
-        if method == diff_submit::METHOD_GET_COMMIT_MESSAGE {
-            panic!("DIFF-D8: saved resume must not fetch the server template");
-        }
+        assert_ne!(
+            method,
+            diff_submit::METHOD_GET_COMMIT_MESSAGE,
+            "DIFF-D8: saved resume must not fetch the server template"
+        );
         assert_eq!(method, diff_submit::METHOD_PARSE_COMMIT_MESSAGE);
         Ok(serde_json::json!({"fields": {"title": "X"}}))
     };
@@ -3121,9 +3128,7 @@ fn d8_footer_target_skips_ownership_uses_edit_template() {
         assert_eq!(method, diff_submit::METHOD_PARSE_COMMIT_MESSAGE);
         Ok(serde_json::json!({"fields": {"title": "Seven"}}))
     };
-    let edit = |_: &str, _: &str| -> Result<String, String> {
-        panic!("DIFF-D8: --message skips the editor")
-    };
+    let edit = |_: &str, _: &str| -> Result<String, String> { panic!("DIFF-D8: no editor") };
     let prefill = || -> Result<Option<String>, String> { Ok(None) };
     let mut reader = std::io::BufReader::new(std::io::empty());
     let mut writer = Vec::new();
@@ -3176,8 +3181,7 @@ fn d8_resolve_create_message_file_returns_footer_redirect() {
         assert_eq!(method, diff_submit::METHOD_PARSE_COMMIT_MESSAGE);
         Ok(serde_json::json!({"fields": {"title": "File title"}}))
     };
-    let edit =
-        |_: &str| -> Result<String, String> { panic!("DIFF-D8: --message-file never edits") };
+    let edit = |_: &str| -> Result<String, String> { panic!("DIFF-D8: no edit") };
     let mut reader = std::io::BufReader::new(std::io::empty());
     let mut writer = Vec::new();
     let mut context = CreateMessageContext {
@@ -3676,9 +3680,7 @@ fn t1170_update_uses_cached_template_on_second_run() {
             .push((template.to_string(), name.to_string()));
         Ok("final words\n".to_string())
     };
-    let prefill = || -> Result<Option<String>, String> {
-        panic!("T1170: no prefill when a cached template exists")
-    };
+    let prefill = || -> Result<Option<String>, String> { panic!("T1170: no prefill") };
     let mut reader = std::io::BufReader::new(std::io::empty());
     let mut writer = Vec::new();
     let mut resolver = UpdateResolver {
@@ -3705,9 +3707,7 @@ fn t1170_update_uses_cached_template_on_second_run() {
 
 #[test]
 fn t1170_maybe_apply_full_update_non_update_skips() {
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        panic!("T1170: no conduit for non-update modes")
-    };
+    let call = t1170_no_conduit;
     let dir = scratch_dir("t1170-noupdate");
     let options = Options::default();
     let mut input = create_test_input(false, None);
@@ -3936,10 +3936,9 @@ fn t1170_submit_over_with_browse_reports_then_errors() {
         browse: true,
         ..Options::default()
     };
-    let err = match submit_over_with_browse_ansi(&dir, &options, &call, &input, false) {
-        Ok(_) => panic!("T1170: missing browser must fail the submit"),
-        Err(err) => err,
-    };
+    let err = submit_over_with_browse_ansi(&dir, &options, &call, &input, false)
+        .err()
+        .expect("T1170: missing browser must fail the submit");
     assert!(err.contains("https://phab.test/diff/3/"), "{err}");
     assert!(err.contains("definitely-not-a-browser-t1170"), "{err}");
 }
@@ -4033,9 +4032,7 @@ fn t1170_finalize_client_submit_create_and_update() {
 
 #[test]
 fn t1170_submit_redirect_passthrough() {
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        panic!("T1170: no conduit for non-create modes")
-    };
+    let call = t1170_no_conduit;
     let options = Options::default();
     let dir = scratch_dir("t1170-redir");
     let redirect =
@@ -4099,12 +4096,8 @@ fn t1170_push_staging_refs_failed_push_errors() {
     std::fs::write(dir.join("f.txt"), "a\n").unwrap();
     t1170_commit(&dir, "one");
     let base = t1170_rev(&dir, "HEAD");
-    let recorded = std::cell::RefCell::new(Vec::new());
-    let record = |status: &str, refs: &[serde_json::Value]| {
-        recorded.borrow_mut().push(status.to_string());
-        assert!(refs.is_empty());
-        Ok(())
-    };
+    // A failed push records nothing: any record attempt fails the test.
+    let record = |_: &str, _: &[serde_json::Value]| panic!("T1170: no record on failure");
     let bogus = dir.join("no-such-remote-t1170");
     let err = push_staging_refs(
         &dir,
@@ -4117,7 +4110,6 @@ fn t1170_push_staging_refs_failed_push_errors() {
     )
     .unwrap_err();
     assert!(err.contains("--skip-staging"), "{err}");
-    assert!(recorded.borrow().is_empty());
     // The ANSI notice path reports the same failure.
     let err = push_staging_refs(
         &dir,
@@ -4514,9 +4506,7 @@ fn t1170_git_update_prefill_usable_and_covered() {
 fn t1170_default_update_prefill_git_and_none() {
     let dir = t1170_three_commit_repo("t1170-dprefill");
     // Svn and unknown kinds never prefill.
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        panic!("T1170: no conduit for svn/unknown kinds")
-    };
+    let call = t1170_no_conduit;
     let options = Options::default();
     assert_eq!(
         default_update_prefill(
@@ -4616,19 +4606,14 @@ fn t1170_create_local_commits_matrix() {
             create_local_commits(&dir, &fake, Some(VcsKind::Hg), "base", None, None).unwrap();
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].commit, "n1");
-        assert!(
-            infos[0].message.contains("First line"),
-            "{}",
-            infos[0].message
-        );
+        let first = &infos[0].message;
+        assert!(first.contains("First line"), "{first}");
     }
 }
 
 #[test]
 fn t1170_bare_submit_mode_without_working_copy_creates() {
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        panic!("T1170: no conduit without a working copy")
-    };
+    let call = t1170_no_conduit;
     let dir = scratch_dir("t1170-bare");
     let hg = hg::HgCommand::default();
     assert!(
@@ -4746,10 +4731,10 @@ fn t1170_prepare_submit_create_with_message_file() {
 fn t1170_run_help_returns_success() {
     assert_eq!(run(&args(&["--help"])), ExitCode::SUCCESS);
     assert_eq!(run(&args(&["--bogus-flag-t1170"])), ExitCode::FAILURE);
-    // Read-only `--json` inspects and writes successfully in a checkout.
-    if is_inside_git_repo(Path::new(".")) {
-        assert_eq!(run(&args(&["--json"])), ExitCode::SUCCESS);
-    }
+    // Read-only `--json` inspects and writes successfully in a checkout
+    // (cargo always runs tests from the package root, inside the repo).
+    assert!(is_inside_git_repo(Path::new(".")));
+    assert_eq!(run(&args(&["--json"])), ExitCode::SUCCESS);
 }
 
 #[test]
@@ -4846,11 +4831,13 @@ fn t1170_create_submit_json_discards_report() {
         if method == diff_submit::METHOD_PARSE_COMMIT_MESSAGE {
             return Ok(serde_json::json!({"fields": {"title": "T"}}));
         }
-        if method == diff_submit::METHOD_CREATE_REVISION {
-            assert_eq!(params["diffid"], serde_json::json!(3));
-            return Ok(serde_json::json!({"revisionid": 9, "uri": "https://phab.test/D9"}));
-        }
-        Err(format!("unexpected {method}"))
+        assert_eq!(
+            method,
+            diff_submit::METHOD_CREATE_REVISION,
+            "unexpected {method}"
+        );
+        assert_eq!(params["diffid"], serde_json::json!(3));
+        Ok(serde_json::json!({"revisionid": 9, "uri": "https://phab.test/D9"}))
     };
     let mut input = create_test_input(false, Some("T\n"));
     input.json = true;
@@ -4919,10 +4906,9 @@ fn t1170_report_create_submit_propagates_revision_failure() {
         phid: None,
         uri: "https://phab.test/diff/3/".to_string(),
     };
-    let Err(err) = report_create_submit(&call, &created, &create_test_input(false, None), false)
-    else {
-        panic!("expected the conduit failure to propagate");
-    };
+    let err = report_create_submit(&call, &created, &create_test_input(false, None), false)
+        .err()
+        .expect("expected the conduit failure to propagate");
     assert_eq!(err, "conduit down");
 }
 
@@ -5028,15 +5014,15 @@ fn t1170_saved_template_prompt_write_failure_aborts() {
     let err =
         create_message_from_user(&mut context, &defaults(), &local, Some("main")).unwrap_err();
     assert!(err.contains("failed to write prompt"), "{err}");
+    // The double fails flush too (production never reaches it on this path).
+    assert!(std::io::Write::flush(&mut writer).is_err());
 }
 
 #[test]
 fn t1170_resolve_create_message_missing_file_fails() {
     // A missing `--message-file` fails before any conduit traffic.
     let root = scratch_dir("t1170-cmmiss");
-    let call = |method: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        panic!("unexpected conduit call {method}")
-    };
+    let call = t1170_no_conduit;
     let edit = |_: &str| -> Result<String, String> { Ok(String::new()) };
     let mut reader = std::io::BufReader::new(std::io::empty());
     let mut writer = Vec::new();
@@ -5245,14 +5231,13 @@ fn t1170_prompt_confirm_with_tty_matrix() {
     assert!(!prompt_confirm_with_tty("P?", true, true).unwrap());
     assert!(prompt_confirm_with_tty("P?", false, true).unwrap());
     // A non-TTY stdin blocks on Unix, reads through elsewhere.
-    if cfg!(unix) {
-        assert_eq!(
-            prompt_confirm_with_tty("P?", true, false).unwrap_err(),
-            STDIN_NOT_TTY
-        );
-    } else {
-        assert!(!prompt_confirm_with_tty("P?", true, false).unwrap());
-    }
+    #[cfg(unix)]
+    assert_eq!(
+        prompt_confirm_with_tty("P?", true, false).unwrap_err(),
+        STDIN_NOT_TTY
+    );
+    #[cfg(not(unix))]
+    assert!(!prompt_confirm_with_tty("P?", true, false).unwrap());
 }
 
 #[test]
@@ -5331,6 +5316,8 @@ fn t1170_run_in_matrix() {
         run_in(&args(&["--json"]), &repo, &mut FailSink),
         ExitCode::FAILURE
     );
+    // The double's flush is a no-op (writes are what fail).
+    assert!(std::io::Write::flush(&mut FailSink).is_ok());
     // Inspection errors fail without writing.
     let mut sink = Vec::new();
     assert_eq!(
@@ -5505,9 +5492,7 @@ fn t1170_load_working_copy_revisions_hg_and_svn() {
     // Hg with an empty log finds no revisions without conduit traffic.
     let dir = scratch_dir("t1170-wcrev");
     let hg = t1170_fake_hg(&dir);
-    let call = |method: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        panic!("unexpected conduit call {method}")
-    };
+    let call = t1170_no_conduit;
     let revisions = load_working_copy_revisions(
         &call,
         &dir,
@@ -5832,9 +5817,6 @@ fn t1170_file_message_call()
         if method == "user.whoami" {
             return Ok(serde_json::json!({"phid": "PHID-USER-1"}));
         }
-        if method == diff_submit::METHOD_QUERY {
-            return Ok(serde_json::json!([]));
-        }
         assert_eq!(method, diff_submit::METHOD_PARSE_COMMIT_MESSAGE);
         Ok(serde_json::json!({"fields": {"title": "Filed title"}}))
     }
@@ -5958,9 +5940,7 @@ fn t1170_apply_footer_redirect_matrix() {
         assert_eq!(input.message.as_deref(), Some("m"));
     }
     // Without a redirect there is nothing to pre-resolve.
-    let call = |method: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        panic!("unexpected conduit call {method}")
-    };
+    let call = t1170_no_conduit;
     let mut input = create_test_input(false, None);
     let skip = apply_footer_redirect(&repo, &defaults(), &call, &mut input, &None).unwrap();
     assert!(!skip);
@@ -6091,11 +6071,35 @@ fn t1170_amend_after_create_hg_modes() {
 type MockRoute =
     dyn Fn(&str, &serde_json::Value) -> Result<serde_json::Value, (String, String)> + Send + Sync;
 
-fn t1170_unexpected(method: &str) -> Result<serde_json::Value, (String, String)> {
-    Err((
-        "ERR-UNEXPECTED".to_string(),
-        format!("t1170: no route for {method}"),
-    ))
+/// Route guard for [`MockConduit`] servers that must see no traffic: any
+/// request fails the test loudly. (Each multi-route server instead ends
+/// its chain with an `assert_eq!` on the last method, so no fallback arm
+/// sits uncovered.)
+fn t1170_no_traffic(
+    method: &str,
+    _: &serde_json::Value,
+) -> Result<serde_json::Value, (String, String)> {
+    panic!("t1170: no route for {method}")
+}
+
+#[test]
+#[should_panic(expected = "t1170: no route")]
+fn t1170_no_traffic_guard_fails_loudly() {
+    let _ = t1170_no_traffic("bogus.method", &serde_json::json!({}));
+}
+
+/// Never-call conduit guard for scenarios that must stay offline: any
+/// request fails the test loudly. A plain `fn` (not a closure) so the
+/// higher-ranked `Fn(&str, &Value)` bound is satisfied at every use.
+/// Covered by [`t1170_no_conduit_guard_fails_loudly`].
+fn t1170_no_conduit(method: &str, _: &serde_json::Value) -> Result<serde_json::Value, String> {
+    panic!("T1170: unexpected conduit call {method}")
+}
+
+#[test]
+#[should_panic(expected = "T1170: unexpected conduit call")]
+fn t1170_no_conduit_guard_fails_loudly() {
+    let _ = t1170_no_conduit("bogus.method", &serde_json::json!({}));
 }
 
 /// A hermetic Conduit server: loopback-only, ephemeral port, canned
@@ -6127,10 +6131,9 @@ impl MockConduit {
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((stream, _)) => Self::handle(stream, &calls, route.as_ref()),
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(std::time::Duration::from_millis(1));
-                        }
-                        Err(_) => break,
+                        // Nonblocking poll: WouldBlock is the idle beat; a
+                        // real accept error just retries (stop() bounds us).
+                        Err(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
                     }
                 }
             }
@@ -6201,9 +6204,8 @@ impl MockConduit {
             .unwrap_or(0);
         let mut body = raw[head_end..].to_vec();
         while body.len() < length {
-            let Ok(count) = stream.read(&mut buf) else {
-                break;
-            };
+            // Hermetic loopback: reads fail only on test bugs (loud).
+            let count = stream.read(&mut buf).unwrap();
             if count == 0 {
                 break;
             }
@@ -6237,9 +6239,8 @@ impl MockConduit {
         use std::io::Read;
         let mut raw = Vec::new();
         loop {
-            let Ok(count) = stream.read(buf) else {
-                return None;
-            };
+            // Hermetic loopback: reads fail only on test bugs (loud).
+            let count = stream.read(buf).unwrap();
             if count == 0 {
                 return None;
             }
@@ -6301,6 +6302,41 @@ impl Drop for MockConduit {
     }
 }
 
+#[test]
+fn t1170_mock_conduit_tolerates_aborted_and_oversized_requests() {
+    use std::io::Write;
+    let mut mock = MockConduit::start(|_, _| Ok(serde_json::json!({"ok": true})));
+    // Abort mid-body: headers promise more than ever arrives.
+    let mut hung = std::net::TcpStream::connect(mock.addr).unwrap();
+    hung.write_all(b"POST /api/x HTTP/1.1\r\nContent-Length: 100\r\n\r\nshort")
+        .unwrap();
+    drop(hung);
+    // A headless megabyte trips the read cap.
+    let mut big = std::net::TcpStream::connect(mock.addr).unwrap();
+    big.write_all(&vec![b'x'; 1_100_000]).unwrap();
+    drop(big);
+    // A bare close ends the head read.
+    drop(std::net::TcpStream::connect(mock.addr).unwrap());
+    // The blocking round trip below is the barrier: the server answers
+    // connections in accept order, so when it lands, the three aborted
+    // connections above are fully handled too. Its 9KB body also forces
+    // the multi-read body loop (reads top out at 4KB).
+    let spool = "v".repeat(9000);
+    let out = mock
+        .client()
+        .call("x", &serde_json::json!({"p": spool}))
+        .unwrap();
+    assert_eq!(out, serde_json::json!({"ok": true}));
+    // Only the aborted-body and round-trip requests carried a head.
+    assert_eq!(mock.calls().len(), 2);
+    mock.stop();
+}
+
+#[test]
+fn t1170_percent_decode_handles_lowercase_and_stray_percent() {
+    assert_eq!(MockConduit::percent_decode("%3a%3A%zz%"), "::%zz%");
+}
+
 fn t1170_creatediff_result() -> serde_json::Value {
     // No `phid`: old servers skip the autotarget upload.
     serde_json::json!({"diffid": 3, "uri": "https://phab.test/diff/3/"})
@@ -6309,7 +6345,7 @@ fn t1170_creatediff_result() -> serde_json::Value {
 #[test]
 fn t1170_stamp_repository_phid_matrix() {
     // Raw sources never stamp, without any conduit traffic.
-    let mut mock = MockConduit::start(|method, _| t1170_unexpected(method));
+    let mut mock = MockConduit::start(t1170_no_traffic);
     let client = mock.client();
     let repo = t1170_seed_git_repo("t1170-stamp", 1);
     let mut spec = serde_json::json!({});
@@ -6334,10 +6370,8 @@ fn t1170_stamp_repository_phid_matrix() {
         .unwrap();
     assert!(remote.success());
     let mut mock = MockConduit::start(|method, _| {
-        if method == "repository.query" {
-            return Ok(serde_json::json!([{"phid": "PHID-REPO-9"}]));
-        }
-        t1170_unexpected(method)
+        assert_eq!(method, "repository.query");
+        Ok(serde_json::json!([{"phid": "PHID-REPO-9"}]))
     });
     let client = mock.client();
     stamp_repository_phid(&client, &repo, false, &mut spec).unwrap();
@@ -6382,10 +6416,8 @@ fn t1170_submit_via_client_only_mode() {
         if method == diff_submit::METHOD_CREATE_DIFF {
             return Ok(t1170_creatediff_result());
         }
-        if method == diff_submit::METHOD_SET_DIFF_PROPERTY {
-            return Ok(serde_json::json!({}));
-        }
-        t1170_unexpected(method)
+        assert_eq!(method, diff_submit::METHOD_SET_DIFF_PROPERTY);
+        Ok(serde_json::json!({}))
     });
     let options = t1170_submit_options("only");
     let text = submit_via_client_with_client_ansi(
@@ -6428,11 +6460,9 @@ fn t1170_submit_via_client_update_mode() {
         if method == diff_submit::METHOD_SET_DIFF_PROPERTY {
             return Ok(serde_json::json!({}));
         }
-        if method == diff_submit::METHOD_UPDATE_REVISION {
-            assert_eq!(params["message"], serde_json::json!("take two"));
-            return Ok(serde_json::json!({"revisionid": 5, "uri": "https://phab.test/D5"}));
-        }
-        t1170_unexpected(method)
+        assert_eq!(method, diff_submit::METHOD_UPDATE_REVISION);
+        assert_eq!(params["message"], serde_json::json!("take two"));
+        Ok(serde_json::json!({"revisionid": 5, "uri": "https://phab.test/D5"}))
     });
     let options = t1170_submit_options("update");
     let mode = submit_mode(&options).unwrap().unwrap();
@@ -6468,11 +6498,9 @@ fn t1170_submit_via_client_create_mode_amends() {
         if method == diff_submit::METHOD_SET_DIFF_PROPERTY {
             return Ok(serde_json::json!({}));
         }
-        if method == diff_submit::METHOD_CREATE_REVISION {
-            assert_eq!(params["diffid"], serde_json::json!(3));
-            return Ok(serde_json::json!({"revisionid": 11, "uri": "https://phab.test/D11"}));
-        }
-        t1170_unexpected(method)
+        assert_eq!(method, diff_submit::METHOD_CREATE_REVISION);
+        assert_eq!(params["diffid"], serde_json::json!(3));
+        Ok(serde_json::json!({"revisionid": 11, "uri": "https://phab.test/D11"}))
     });
     let mut options = t1170_submit_options("create");
     options.message_file = Some(path.to_string_lossy().into_owned());
@@ -6496,11 +6524,8 @@ fn t1170_submit_via_client_create_mode_amends() {
         .args(["log", "-1", "--format=%B"])
         .output()
         .unwrap();
-    assert!(
-        String::from_utf8_lossy(&out.stdout).contains("Amended title"),
-        "{:?}",
-        String::from_utf8_lossy(&out.stdout)
-    );
+    let amended = String::from_utf8_lossy(&out.stdout);
+    assert!(amended.contains("Amended title"), "{amended:?}");
 }
 
 #[test]
@@ -6515,10 +6540,8 @@ fn t1170_submit_prepared_skip_resolution_keeps_message() {
         if method == diff_submit::METHOD_SET_DIFF_PROPERTY {
             return Ok(serde_json::json!({}));
         }
-        if method == diff_submit::METHOD_UPDATE_REVISION {
-            return Ok(serde_json::json!({"revisionid": 5, "uri": "https://phab.test/D5"}));
-        }
-        t1170_unexpected(method)
+        assert_eq!(method, diff_submit::METHOD_UPDATE_REVISION);
+        Ok(serde_json::json!({"revisionid": 5, "uri": "https://phab.test/D5"}))
     });
     let options = t1170_submit_options("update");
     let client = mock.client();
@@ -6593,10 +6616,8 @@ fn t1170_submit_bare_git_modes() {
         if method == "user.whoami" {
             return Ok(serde_json::json!({"phid": "PHID-USER-1"}));
         }
-        if method == "differential.query" {
-            return Ok(serde_json::json!([]));
-        }
-        t1170_unexpected(method)
+        assert_eq!(method, "differential.query");
+        Ok(serde_json::json!([]))
     });
     let range = Range {
         base: t1170_rev(&repo, "HEAD~1"),
@@ -6619,10 +6640,8 @@ fn t1170_submit_full_via_client_only_mode() {
         if method == diff_submit::METHOD_CREATE_DIFF {
             return Ok(t1170_creatediff_result());
         }
-        if method == diff_submit::METHOD_SET_DIFF_PROPERTY {
-            return Ok(serde_json::json!({}));
-        }
-        t1170_unexpected(method)
+        assert_eq!(method, diff_submit::METHOD_SET_DIFF_PROPERTY);
+        Ok(serde_json::json!({}))
     });
     let options = t1170_submit_options("only");
     let text = submit_full_via_client_with_client_ansi(
@@ -6663,11 +6682,9 @@ fn t1170_submit_full_via_client_update_mode() {
         if method == diff_submit::METHOD_SET_DIFF_PROPERTY {
             return Ok(serde_json::json!({}));
         }
-        if method == diff_submit::METHOD_UPDATE_REVISION {
-            assert_eq!(params["message"], serde_json::json!("take two"));
-            return Ok(serde_json::json!({"revisionid": 5, "uri": "https://phab.test/D5"}));
-        }
-        t1170_unexpected(method)
+        assert_eq!(method, diff_submit::METHOD_UPDATE_REVISION);
+        assert_eq!(params["message"], serde_json::json!("take two"));
+        Ok(serde_json::json!({"revisionid": 5, "uri": "https://phab.test/D5"}))
     });
     let options = t1170_submit_options("update");
     let text = submit_full_via_client_with_client_ansi(
@@ -6799,11 +6816,10 @@ fn t1170_resolve_submit_create_redirect_viewer_failure_propagates() {
         Err("whoami down".to_string())
     };
     let base = t1170_rev(&repo, "HEAD~1");
-    let Err(err) =
+    let err =
         resolve_submit_create_redirect(&repo, &options, &call, &SubmitMode::Create, &base, None)
-    else {
-        panic!("expected the viewer failure to propagate");
-    };
+            .err()
+            .expect("expected the viewer failure to propagate");
     assert_eq!(err, "whoami down");
 }
 
@@ -6841,10 +6857,8 @@ fn t1170_submit_prepared_finalize_failure_propagates() {
         if method == diff_submit::METHOD_CREATE_REVISION {
             return Ok(serde_json::json!({"revisionid": 11, "uri": "https://phab.test/D11"}));
         }
-        if method == diff_submit::METHOD_GET_COMMIT_MESSAGE {
-            return Err(("ERR-BOOM".to_string(), "fetch down".to_string()));
-        }
-        t1170_unexpected(method)
+        assert_eq!(method, diff_submit::METHOD_GET_COMMIT_MESSAGE);
+        Err(("ERR-BOOM".to_string(), "fetch down".to_string()))
     });
     let client = mock.client();
     let options = t1170_submit_options("only");
@@ -6911,10 +6925,8 @@ fn t1170_submit_bare_detection_failure_propagates() {
     // An unresolvable range fails detection before the inner submit.
     let repo = t1170_seed_git_repo("t1170-barefail", 1);
     let mock = MockConduit::start(|method, _| {
-        if method == "user.whoami" {
-            return Ok(serde_json::json!({"phid": "PHID-USER-1"}));
-        }
-        t1170_unexpected(method)
+        assert_eq!(method, "user.whoami");
+        Ok(serde_json::json!({"phid": "PHID-USER-1"}))
     });
     let range = Range {
         base: "bogus-base-t1170".to_string(),
@@ -6931,9 +6943,6 @@ fn t1170_submit_full_finalize_failure_propagates() {
     // A failing post-create fetch aborts full finalization too.
     let repo = t1170_dirty_submit_repo("t1170-fullfinfail");
     let mock = MockConduit::start(|method, _| {
-        if method == diff_submit::METHOD_PARSE_COMMIT_MESSAGE {
-            return Ok(serde_json::json!({"fields": {"title": "T"}}));
-        }
         if method == diff_submit::METHOD_CREATE_DIFF {
             return Ok(t1170_creatediff_result());
         }
@@ -6943,10 +6952,8 @@ fn t1170_submit_full_finalize_failure_propagates() {
         if method == diff_submit::METHOD_CREATE_REVISION {
             return Ok(serde_json::json!({"revisionid": 11, "uri": "https://phab.test/D11"}));
         }
-        if method == diff_submit::METHOD_GET_COMMIT_MESSAGE {
-            return Err(("ERR-BOOM".to_string(), "fetch down".to_string()));
-        }
-        t1170_unexpected(method)
+        assert_eq!(method, diff_submit::METHOD_GET_COMMIT_MESSAGE);
+        Err(("ERR-BOOM".to_string(), "fetch down".to_string()))
     });
     let options = t1170_submit_options("create");
     let err = submit_full_via_client_with_client_ansi(

@@ -3983,3 +3983,80 @@ fn child_collecting_runs_each_selection() {
     assert_eq!(err.message, "No tests to run.");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// -( T1170 COV: close unit.rs )--------------------------------------------------
+
+#[test]
+fn phpunit_engine_from_config_reads_project_files() {
+    let root = unique_dir("phpunit-cfg");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let root_s = forward_slashes(&root);
+    std::fs::write(root.join("phpunit.xml"), "<x/>").unwrap();
+    std::fs::write(
+        root.join(".arcconfig"),
+        r#"{"phpunit_config": "phpunit.xml", "unit.phpunit.binary": "my-phpunit"}"#,
+    )
+    .unwrap();
+    let engine = phpunit_engine_from_config(&root_s);
+    assert!(engine.config_file.is_some());
+    assert!(engine.binary.ends_with("my-phpunit"), "{}", engine.binary);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn single_nose_selection_with_no_paths_succeeds_empty() {
+    let root = unique_dir("single-empty");
+    std::fs::create_dir_all(&root).unwrap();
+    let opts = Options::default();
+    // Nose with no paths runs no commands, so the real runner is safe.
+    let (code, results) = run_single_collecting(&opts, &root, "NoseTestEngine", &[], false)
+        .expect("empty nose selection succeeds");
+    assert!(results.is_empty());
+    assert_eq!(
+        run_single_selection(&opts, &root, "NoseTestEngine", &[], false),
+        code
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn config_selection_with_idle_nose_succeeds_empty() {
+    let root = unique_dir("config-empty");
+    std::fs::create_dir_all(&root).unwrap();
+    let opts = Options::default();
+    let engines = vec![PlannedEngine {
+        name: "nose".to_string(),
+        engine_type: "NoseTestEngine".to_string(),
+        include: Vec::new(),
+        exclude: Vec::new(),
+    }];
+    let (code, results) = run_config_collecting(&opts, &engines, &root, &[], false)
+        .expect("idle config selection succeeds");
+    assert!(results.is_empty());
+    assert_eq!(
+        run_config_selection(&opts, &engines, &root, &[], false),
+        code
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn upload_results_for_options_rejects_bad_cli_config() {
+    let root = unique_dir("upload-badcfg");
+    std::fs::create_dir_all(&root).unwrap();
+    let opts = Options {
+        config: vec!["bogus".to_string()],
+        ..Options::default()
+    };
+    let err = upload_results_for_options(&opts, &root, "PHID-X", 0, &[]).unwrap_err();
+    assert!(err.contains("name=value"), "{err}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn run_rejects_everything_with_paths() {
+    assert_eq!(
+        run(&args(&["--everything", "x"])),
+        std::process::ExitCode::FAILURE
+    );
+}

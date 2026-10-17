@@ -13,6 +13,113 @@ fn empty_options() -> Options {
     }
 }
 
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path =
+            std::env::temp_dir().join(format!("arc-rs-amend-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+fn git(dir: &std::path::Path, argv: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(argv)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        argv.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn amend_repo(tag: &str) -> TempDir {
+    let tmp = TempDir::new(tag);
+    git(tmp.path(), &["init", "-q", "-b", "master"]);
+    git(tmp.path(), &["config", "user.email", "amend@test"]);
+    git(tmp.path(), &["config", "user.name", "amend"]);
+    git(tmp.path(), &["config", "commit.gpgsign", "false"]);
+    git(tmp.path(), &["config", "core.autocrlf", "false"]);
+    std::fs::write(tmp.path().join("file.txt"), "base\n").unwrap();
+    git(tmp.path(), &["add", "file.txt"]);
+    git(tmp.path(), &["commit", "-qm", "initial commit"]);
+    tmp
+}
+
+/// Serve `expected` requests from `routes` (method -> envelope
+/// result JSON); returns the base URI. (Local replicate of the
+/// `export_tests` stub.)
+fn serve_amend_routes(
+    routes: std::collections::HashMap<String, String>,
+    expected: usize,
+) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for _ in 0..expected {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            let head_text = String::from_utf8_lossy(&head).to_string();
+            let len: usize = head_text
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(key, value)| {
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).unwrap();
+            let method = head_text
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .strip_prefix("/api/")
+                .unwrap_or("")
+                .to_string();
+            let result = routes.get(&method).cloned().unwrap_or("null".to_string());
+            let canned = format!(r#"{{"result": {result}, "error_code": null}}"#);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                canned.len(),
+                canned
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    base
+}
+
 #[test]
 fn parses_defaults() {
     // T1153 B21/B23: TTY runs need no `--`.
@@ -424,6 +531,228 @@ fn announce_text_modes() {
         "Amending commit message to reflect revision:\n\n\x1b[46m\x1b[1m  *  \x1b[m\x1b[49m \x1b[1mD123\x1b[m Fix it\n\n"
     );
 }
+#[test]
+fn rejects_empty_inline_flag_values() {
+    // T1153 B21/B23: TTY runs need no `--`.
+    for flag in ["--message=", "--revision=", "--conduit-uri="] {
+        let err = parse_options_with_tty(&args(&[flag]), true).unwrap_err();
+        assert!(
+            err.contains("requires a non-empty value"),
+            "unexpected: {err}"
+        );
+    }
+    let options = parse_options_with_tty(&args(&["--conduit-uri=http://x/"]), true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(options.conduit_uri, Some("http://x/".to_string()));
+}
+
+#[test]
+fn flag_tail_rejects_bare_terminator() {
+    // Unreachable through the parser (it strips `--` first), but the
+    // tail keeps its own positional rejection.
+    let Step::Error(message) = flag_tail("--") else {
+        panic!("expected flag_tail to reject '--'");
+    };
+    assert!(message.contains("takes no paths"), "unexpected: {message}");
+}
+
+#[test]
+fn commit_message_requires_a_string_result() {
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "differential.getcommitmessage".to_string(),
+        "42".to_string(),
+    );
+    let base = serve_amend_routes(routes, 1);
+    let client = Client::new(&base, "t").unwrap();
+    assert_eq!(
+        fetch_commit_message(&client, 123).unwrap_err(),
+        "conduit differential.getcommitmessage returned a non-string result"
+    );
+}
+
+#[test]
+fn loads_revisions_for_symbols() {
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "differential.query".to_string(),
+        r#"[{"id": 123, "title": "Add thing"}]"#.to_string(),
+    );
+    let base = serve_amend_routes(routes, 1);
+    let client = Client::new(&base, "t").unwrap();
+    let revision = load_revision_for_symbol(&client, "D123").unwrap();
+    assert_eq!(revision.id, "123");
+    assert_eq!(revision.title, "Add thing");
+    assert!(load_revision_for_symbol(&client, "bogus").is_err());
+}
+
+#[test]
+fn annotates_ids_in_one_batched_call() {
+    // Empty input short-circuits without conduit traffic.
+    let idle = Client::new("https://conduit.test/", "t").unwrap();
+    assert!(annotate_ids(&idle, &[]).unwrap().is_empty());
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "differential.query".to_string(),
+        r#"[{"id": 7, "title": "Seven", "statusName": "Accepted"}]"#.to_string(),
+    );
+    let base = serve_amend_routes(routes, 1);
+    let client = Client::new(&base, "t").unwrap();
+    let map = annotate_ids(&client, &[7]).unwrap();
+    assert_eq!(
+        map.get("7"),
+        Some(&AnnotatedRevision {
+            monogram: "D7".to_string(),
+            status: "Accepted".to_string(),
+            title: "Seven".to_string(),
+        })
+    );
+}
+
+#[test]
+fn annotates_head_messages_with_deduped_ids() {
+    let idle = Client::new("https://conduit.test/", "t").unwrap();
+    let (heads, map) = annotations_for_messages(&idle, &[]).unwrap();
+    assert!(heads.is_empty());
+    assert!(map.is_empty());
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "differential.query".to_string(),
+        r#"[{"id": 123, "title": "Add thing", "statusName": "Accepted"}]"#.to_string(),
+    );
+    let base = serve_amend_routes(routes, 1);
+    let client = Client::new(&base, "t").unwrap();
+    let (heads, map) = annotations_for_messages(
+        &client,
+        &[
+            "work\n\nDifferential Revision: D123\n".to_string(),
+            "work\n\nDifferential Revision: D123\n".to_string(),
+            "no trailer here\n".to_string(),
+        ],
+    )
+    .unwrap();
+    assert_eq!(heads, vec![Some(123), Some(123), None]);
+    assert_eq!(map.len(), 1);
+    assert_eq!(map["123"].monogram, "D123");
+}
+
+#[test]
+fn confirms_foreign_authors_without_real_names() {
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "user.search".to_string(),
+        r#"{"data": [{"fields": {"username": "author"}}]}"#.to_string(),
+    );
+    let base = serve_amend_routes(routes, 1);
+    let client = Client::new(&base, "t").unwrap();
+    client.set_authenticated_user("viewer", "PHID-USER-VIEWER");
+    let mut io = land::Io::canned(&["y"]);
+    confirm_author(&mut io, &client, &revision("123", "T"), false).unwrap();
+    assert!(
+        io.out.stdout.contains("NOT REVISION AUTHOR"),
+        "unexpected: {}",
+        io.out.stdout
+    );
+    assert!(
+        io.out.stdout.contains("**  *  ** @author\n"),
+        "unexpected: {}",
+        io.out.stdout
+    );
+}
+
+#[test]
+fn revision_client_with_explicit_uri_reports_config_errors() {
+    // The explicit arm builds through real config discovery, which
+    // fails for an unknown host without credentials; either way it
+    // never touches the network.
+    let mut options = empty_options();
+    options.revision = Some("123".to_string());
+    options.conduit_uri = Some("bogus-no-scheme".to_string());
+    assert!(revision_client(&options).is_err());
+}
+
+#[test]
+fn show_without_state_needs_an_explicit_source() {
+    let mut options = empty_options();
+    options.show = true;
+    assert_eq!(
+        show_without_state(&options).unwrap_err(),
+        "amend --show requires --message <text> or --revision <id>"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn amend_git_reports_silent_hook_failures() {
+    // A `commit-msg` hook that fails without output makes `git
+    // commit` fail silently; our own error surfaces instead of git
+    // prose. Unix-only: hook executability needs `chmod`.
+    use std::os::unix::fs::PermissionsExt;
+    let repo = amend_repo("silent-fail");
+    let hook = repo.path().join(".git").join("hooks").join("commit-msg");
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&hook, permissions).unwrap();
+    assert_eq!(
+        amend_git(repo.path(), "msg\n").unwrap_err(),
+        "git commit --amend failed"
+    );
+}
+
+#[test]
+fn finish_returns_messages_for_show() {
+    let tmp = TempDir::new("show");
+    let mut options = empty_options();
+    options.show = true;
+    assert_eq!(finish_git(tmp.path(), &options, "m\n").unwrap(), "m\n");
+    assert_eq!(
+        finish_hg(tmp.path(), &options, &hg::HgCommand::system(), "m\n").unwrap(),
+        "m\n"
+    );
+}
+
+#[test]
+fn flows_short_circuit_show_with_messages() {
+    // `--show` with `-m` skips support checks and resolution entirely.
+    let tmp = TempDir::new("flows");
+    let mut options = empty_options();
+    options.show = true;
+    options.messages = vec!["hello".to_string()];
+    let mut io = land::Io::buffered();
+    assert_eq!(
+        flow_git(tmp.path(), &options, &mut io, false).unwrap(),
+        "hello\n"
+    );
+    assert_eq!(
+        flow_hg(
+            tmp.path(),
+            &options,
+            &mut io,
+            &hg::HgCommand::system(),
+            false
+        )
+        .unwrap(),
+        "hello\n"
+    );
+    assert!(io.out.stdout.is_empty());
+}
+
+#[test]
+fn run_in_reports_missing_terminator() {
+    // Piped stdin is never a TTY under `cargo test`; bail out (rather
+    // than parse differently) if that ever changes.
+    if crate::prompt::stdin_is_terminal() {
+        return;
+    }
+    let tmp = TempDir::new("terminator");
+    assert_eq!(
+        run_in(tmp.path(), &args(&["-m", "x"])),
+        std::process::ExitCode::FAILURE
+    );
+}
+
 #[test]
 fn r10_amend_help_matches_generated_format() {
     // T1153 R10: `--help` renders the generated workflow help

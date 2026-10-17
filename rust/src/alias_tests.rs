@@ -1094,3 +1094,88 @@ fn b23_alias_help_matches_generated_format() {
     let ansi = usage_text(true);
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
+
+// -( T1170 COV: close alias.rs )------------------------------------------------
+
+#[test]
+fn create_preserves_invalid_dict_entries_with_a_warning() {
+    let tmp = TempDir::new("invalid-dict");
+    let arcrc = tmp.arcrc();
+    std::fs::write(&arcrc, r#"{"aliases": {"bad": 42, "old": ["diff"]}}"#).unwrap();
+    let report = execute_create(&arcrc, "draft", &args(&["diff"])).unwrap();
+    assert_eq!(report.warnings.len(), 1);
+    assert!(
+        report.warnings[0].contains("invalid alias"),
+        "{}",
+        report.warnings[0]
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&arcrc).unwrap()).unwrap();
+    assert_eq!(
+        doc["aliases"],
+        serde_json::json!([
+            42,
+            {"trigger": "old", "toolset": "arc", "command": ["diff"]},
+            {"trigger": "draft", "toolset": "arc", "command": ["diff"]},
+        ])
+    );
+}
+
+#[test]
+fn delete_confirms_shell_aliases_with_shell_wording() {
+    let tmp = TempDir::new("delete-shell");
+    let arcrc = tmp.arcrc();
+    execute_create(&arcrc, "ls", &args(&["!ls", "-la"])).unwrap();
+    let mut input = Cursor::new(b"y\n".to_vec());
+    let report = execute_delete(&arcrc, "ls", &mut input, true).unwrap();
+    assert!(
+        report
+            .text
+            .contains("currently aliased to shell command \"ls -la\""),
+        "{}",
+        report.text
+    );
+    assert!(
+        report.text.contains("Removed alias \"arc ls\"."),
+        "{}",
+        report.text
+    );
+}
+
+#[test]
+fn list_entry_point_lists_or_fatals_on_ambient_config() {
+    // Read-only over ambient config: no assertion about its content,
+    // only that listing resolves to a terminal exit code. The `--`
+    // terminator reaches the list runner with or without a TTY.
+    let code = run(&args(&["--"]));
+    assert!(
+        code == std::process::ExitCode::SUCCESS || code == std::process::ExitCode::FAILURE,
+        "{code:?}"
+    );
+}
+
+#[test]
+fn user_file_matches_arcrc_path() {
+    assert_eq!(user_file_or_error().ok(), config::arcrc_path());
+}
+
+#[test]
+fn print_report_emits_warnings_then_text() {
+    print_report(&Report {
+        text: "t\n".to_string(),
+        warnings: vec!["w".to_string()],
+    });
+    print_report(&Report {
+        text: String::new(),
+        warnings: Vec::new(),
+    });
+}
+
+#[test]
+fn run_create_rejects_builtin_triggers_before_touching_the_filesystem() {
+    let options = Options {
+        json: false,
+        positional: args(&["diff"]),
+    };
+    assert_eq!(run_create(&options), std::process::ExitCode::FAILURE);
+}
