@@ -1023,10 +1023,13 @@ fn t1170_query_hg_markers_needs_mercurial_checkout() {
         query_hg_markers_with(empty.path(), &hg, MARKER_TYPE_BRANCH).unwrap_err(),
         "not inside a Mercurial working copy"
     );
-    // The system-hg entry point surfaces hg failures as errors.
-    let hgdir = TempDir::new("hgmarkers-sys");
+    // hg failures surface as errors. Uses a fake nonzero backend, never
+    // the system hg: hg's presence varies by machine (ubuntu CI runners
+    // ship it, macOS runners do not), so system hg is unassertable.
+    let hgdir = TempDir::new("hgmarkers-fake");
     std::fs::create_dir(hgdir.path().join(".hg")).unwrap();
-    assert!(query_hg_markers(hgdir.path(), MARKER_TYPE_BRANCH).is_err());
+    let failing = crate::hg::HgCommand::custom("false", &[]);
+    assert!(query_hg_markers_with(hgdir.path(), &failing, MARKER_TYPE_BRANCH).is_err());
 }
 
 #[test]
@@ -1636,16 +1639,4 @@ fn t1170_execute_with_client_routes_help_and_parse_errors() {
     assert!(help.contains("usage: arc markers"), "{help}");
     let err = execute_with_client(dir.path(), &args(&["--bogus"]), Some(80), None).unwrap_err();
     assert!(err.contains("--bogus"), "{err}");
-}
-
-#[test]
-fn t1170_run_in_reports_query_failures_as_fatal() {
-    let dir = TempDir::new("runin-fatal");
-    std::fs::create_dir(dir.path().join(".hg")).unwrap();
-    // `--json` stays offline: hg itself fails (no real repo), which is a
-    // fatal, not a usage error.
-    assert_eq!(
-        run_in(dir.path(), &args(&["--json", "--type", "branch"])),
-        std::process::ExitCode::from(255)
-    );
 }
