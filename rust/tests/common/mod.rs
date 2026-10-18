@@ -52,6 +52,41 @@ pub fn with_owned_home(home: PathBuf) -> HomeGuard {
     install(&home, true)
 }
 
+#[allow(dead_code, reason = "shared helper; only CWD-pinning binaries use it")]
+static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Restores the saved working directory on drop (panic-safe).
+/// Serializes CWD mutation per test binary: each binary holds at most
+/// one CWD-mutating test (the `run_uses_current_dir` contract pin),
+/// and every sibling was audited CWD-immune (absolute dirs, explicit
+/// `.current_dir` on spawns) as of T1176. Any future CWD-dependent
+/// test must go through [`with_current_dir`]. Only land_workflow's
+/// contract test holds both this and `ENV_LOCK`, always CWD-then-ENV
+/// (guard declared first), and no other test holds both — so no lock
+/// order can invert. The locks stay separate: sharing `ENV_LOCK` would
+/// self-deadlock that test (`Mutex` is not reentrant).
+#[allow(dead_code, reason = "shared helper; only CWD-pinning binaries use it")]
+pub struct CwdGuard {
+    saved: PathBuf,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+/// Run with `dir` as the process working directory, restoring the
+/// previous one on drop (even on panic).
+#[allow(dead_code, reason = "shared helper; only CWD-pinning binaries use it")]
+pub fn with_current_dir(dir: &Path) -> CwdGuard {
+    let lock = CWD_LOCK.lock().unwrap();
+    let saved = std::env::current_dir().unwrap();
+    std::env::set_current_dir(dir).unwrap();
+    CwdGuard { saved, _lock: lock }
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.saved);
+    }
+}
+
 impl Drop for HomeGuard {
     fn drop(&mut self) {
         // SAFETY: still holding the process-wide env lock.

@@ -5,6 +5,8 @@ use std::process::{Command, ExitCode};
 
 use arc_rs::bookmarks;
 
+mod common;
+
 /// Unique scratch dir for one test; removed on drop (best effort).
 struct Fixture {
     dir: PathBuf,
@@ -76,11 +78,9 @@ fn module_name_is_bookmarks() {
 #[test]
 fn run_uses_current_dir() {
     let dir = Fixture::named("run-contract");
-    let old = std::env::current_dir().unwrap();
-    std::env::set_current_dir(dir.path()).unwrap();
+    let _cwd = common::with_current_dir(dir.path());
     // T1153 B21/B23: piped runs carry `--`.
     let code = bookmarks::run(&args(&["--help", "--"]));
-    std::env::set_current_dir(&old).unwrap();
     assert_eq!(code, ExitCode::SUCCESS);
 }
 

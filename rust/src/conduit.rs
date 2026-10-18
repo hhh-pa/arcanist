@@ -5,7 +5,10 @@
 //! Responses may carry the `for(;;);` shield and an
 //! `X-Conduit-Capabilities` header (mirroring `ConduitFuture.php`).
 
+#[cfg(feature = "loom")]
+use loom::sync::Mutex;
 use std::collections::BTreeSet;
+#[cfg(not(feature = "loom"))]
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -1269,3 +1272,7 @@ pub fn report(kind: EnvelopeKind, message: &str) -> std::process::ExitCode {
 #[cfg(test)]
 #[path = "conduit_tests.rs"]
 mod conduit_tests;
+
+#[cfg(all(test, feature = "loom"))]
+#[path = "conduit_loom.rs"]
+mod conduit_loom;

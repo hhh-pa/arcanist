@@ -323,12 +323,12 @@ fn run_uses_current_dir() {
     // T1153 B21/B23: piped runs carry `--`.
     // LAND-6: `--preview` needs Conduit too, so this contract runs online.
     let (repo, _bare) = repo_with_origin("run-contract");
-    let old = std::env::current_dir().unwrap();
-    std::env::set_current_dir(repo.path()).unwrap();
+    // CWD-then-ENV lock order (see `common::CwdGuard`): the CWD guard
+    // must be declared before the HOME guard.
+    let _cwd = common::with_current_dir(repo.path());
     let (base, _seen) = serve_methods(online_responses());
     let _guard = home_with_token("run-contract", &base);
     let code = land::run(&args(&["--preview", "--conduit-uri", &base, "--"]));
-    std::env::set_current_dir(&old).unwrap();
     assert_eq!(code, ExitCode::SUCCESS);
     // Unchanged: still on the feature branch.
     assert_eq!(repo.git(&["symbolic-ref", "--short", "HEAD"]), "feature");

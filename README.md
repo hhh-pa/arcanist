@@ -28,11 +28,17 @@ Prebuilt binaries for Linux, macOS, and Windows are attached to each
 Or build from source. From the repository root:
 
 ```sh
-cargo install --path rust
+cargo install --locked --path rust
+```
+
+Or straight from GitHub, without cloning:
+
+```sh
+cargo install --locked --git https://github.com/hhh-pa/arcanist
 ```
 
 This installs `arc` into `~/.cargo/bin`; keep that directory on your
-`PATH`. Reinstall after `git pull` to pick up updates.
+`PATH`. Reinstall (or run `arc upgrade --apply --`) to pick up updates.
 
 ## Not ported: `phage`
 

@@ -10,6 +10,8 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod common;
+
 use arc_rs::branches;
 use arc_rs::conduit::Client;
 
@@ -168,10 +170,8 @@ fn run_uses_current_dir() {
     // the grid proves the working copy resolved from the cwd).
     add_remote(&repo);
     let (base, _client, _seen) = empty_conduit(false);
-    let old = std::env::current_dir().unwrap();
-    std::env::set_current_dir(repo.path()).unwrap();
+    let _cwd = common::with_current_dir(repo.path());
     let code = branches::run(&args(&["--conduit-uri", &base, "--"]));
-    std::env::set_current_dir(&old).unwrap();
     assert_eq!(code, ExitCode::SUCCESS);
 }
 

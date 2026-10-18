@@ -7,6 +7,8 @@ use std::process::ExitCode;
 
 use arc_rs::weld;
 
+mod common;
+
 /// Unique scratch dir for one test; removed on drop (best effort).
 struct Fixture {
     dir: PathBuf,
@@ -81,10 +83,8 @@ fn run_uses_current_dir() {
     let dir = Fixture::named("run-contract");
     dir.write("a.txt", b"a1\na2\na3\n");
     dir.write("b.txt", b"b1\nb2\nb3\n");
-    let old = std::env::current_dir().unwrap();
-    std::env::set_current_dir(dir.path()).unwrap();
+    let _cwd = common::with_current_dir(dir.path());
     let code = weld::run(&args(&["--seed", "1", "a.txt", "b.txt", "--"]));
-    std::env::set_current_dir(&old).unwrap();
     assert_eq!(code, ExitCode::SUCCESS);
 }
 

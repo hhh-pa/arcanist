@@ -462,7 +462,7 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
 /// One installable release binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseAsset {
-    /// Asset file name (e.g. `arc-windows-x86_64.exe`).
+    /// Asset file name (e.g. `arc-x86_64-unknown-linux-gnu.tar.gz`).
     pub name: String,
     /// Expected byte size, verified after download.
     pub size: u64,
@@ -589,17 +589,40 @@ pub fn resolve_release_target(dir: &Path) -> Result<ReleaseTarget, String> {
     }
 }
 
-/// Current platform tag (`os-arch`, e.g. `windows-x86_64`), from
-/// `std::env::consts`. Release binaries are published as
-/// `arc-<tag>` (plus `.exe` on Windows).
+/// Current platform tag: the Rust target triple
+/// (`release.yml` publishes `arc-<triple>.tar.gz`), from
+/// `std::env::consts`. Unmapped platforms fall back to `os-arch`,
+/// which matches no real asset and yields the clean no-asset error.
 #[must_use]
 pub fn platform_tag() -> String {
-    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+    triple_for(std::env::consts::OS, std::env::consts::ARCH)
 }
 
-/// Exact asset names for `platform`, in preference order.
-fn platform_asset_names(platform: &str) -> [String; 2] {
-    [format!("arc-{platform}.exe"), format!("arc-{platform}")]
+/// Map `(os, arch)` (`std::env::consts` vocabulary) to the release
+/// target triple. Split out so every mapping (and the fallback) is
+/// unit-testable without the running platform.
+fn triple_for(os: &str, arch: &str) -> String {
+    match (os, arch) {
+        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
+        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        ("windows", "x86_64") => "x86_64-pc-windows-msvc",
+        ("windows", "aarch64") => "aarch64-pc-windows-msvc",
+        _ => return format!("{os}-{arch}"),
+    }
+    .to_string()
+}
+
+/// Exact asset names for `platform`, in preference order: the tarball
+/// layout `release.yml` publishes, then raw-binary layouts (kept so an
+/// uncompressed release still upgrades; see [`installable_bytes`]).
+fn platform_asset_names(platform: &str) -> [String; 3] {
+    [
+        format!("arc-{platform}.tar.gz"),
+        format!("arc-{platform}.exe"),
+        format!("arc-{platform}"),
+    ]
 }
 
 /// `releases/latest` API URL for `repo` under `api_base` (the stable
@@ -655,8 +678,10 @@ pub fn release_tag(release: &serde_json::Value) -> Result<String, String> {
 }
 
 /// Pick the current-platform binary from a release document: an exact
-/// `arc-<tag>[.exe]` name wins, else a lone `arc-*` asset;
-/// anything else is a clean error (never a guess between candidates).
+/// name from [`platform_asset_names`] wins, else a clean error listing
+/// the candidates. Never a lone-asset fallback: with several platforms
+/// per release, a lone `arc-*` asset is most likely a FOREIGN binary,
+/// and installing one bricks the executable.
 pub fn select_asset(release: &serde_json::Value, platform: &str) -> Result<ReleaseAsset, String> {
     let assets = release
         .get("assets")
@@ -704,28 +729,25 @@ fn parse_assets(raw: &[serde_json::Value]) -> Vec<ReleaseAsset> {
 
 fn asset_for_platform(assets: &[ReleaseAsset], platform: &str) -> Result<ReleaseAsset, String> {
     let names = platform_asset_names(platform);
-    if let Some(exact) = assets.iter().find(|asset| names.contains(&asset.name)) {
-        return Ok(exact.clone());
+    for name in &names {
+        if let Some(exact) = assets.iter().find(|asset| asset.name == *name) {
+            return Ok(exact.clone());
+        }
     }
     let candidates: Vec<&ReleaseAsset> = assets
         .iter()
         .filter(|asset| asset.name.starts_with("arc-"))
         .collect();
-    match candidates.as_slice() {
-        [only] => Ok((*only).clone()),
-        [] => Err(format!(
-            "the latest release has no installable asset for \"{platform}\"."
-        )),
-        _ => Err(ambiguous_asset_error(platform, &candidates)),
-    }
-}
-
-fn ambiguous_asset_error(platform: &str, candidates: &[&ReleaseAsset]) -> String {
     let names: Vec<&str> = candidates.iter().map(|asset| asset.name.as_str()).collect();
-    format!(
+    if names.is_empty() {
+        return Err(format!(
+            "the latest release has no installable asset for \"{platform}\"."
+        ));
+    }
+    Err(format!(
         "the latest release has no exact asset for \"{platform}\" (candidates: {}).",
         names.join(", ")
-    )
+    ))
 }
 
 /// Numeric core plus prerelease suffix of a version tag (one leading
@@ -822,6 +844,73 @@ pub fn download_release_bytes(
     verify_download_size(bytes.len() as u64, expected_size)?;
     verify_sha256_hex(&bytes, &want_hex)?;
     Ok(bytes)
+}
+
+/// Resolve downloaded asset bytes to the executable image: gzip
+/// archives yield their `arc`/`arc.exe` member, anything else installs
+/// raw (forward/back-compat with uncompressed release layouts).
+fn installable_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    if !is_gzip(bytes) {
+        return Ok(bytes.to_vec());
+    }
+    extract_archive_member(bytes, exe_member_name())
+}
+
+/// Gzip magic (`1f 8b`): tarballs from `release.yml` always carry it.
+fn is_gzip(bytes: &[u8]) -> bool {
+    bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b
+}
+
+/// Archive member holding the executable for this platform.
+#[cfg(windows)]
+fn exe_member_name() -> &'static str {
+    "arc.exe"
+}
+
+/// Archive member holding the executable for this platform.
+#[cfg(not(windows))]
+fn exe_member_name() -> &'static str {
+    "arc"
+}
+
+/// Extract the single `member` file from a gzip-compressed tarball:
+/// exactly one regular-file match wins; missing, empty, or ambiguous
+/// members are clean errors (never a partial install).
+fn extract_archive_member(bytes: &[u8], member: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let gz = flate2::read::GzDecoder::new(bytes);
+    let mut archive = tar::Archive::new(gz);
+    // `entries()` only wraps the reader (lazily); entry iteration
+    // surfaces real I/O failures below.
+    let entries = archive
+        .entries()
+        .expect("tar entries() never fails before iteration");
+    let mut found: Option<Vec<u8>> = None;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("cannot read release archive: {e}"))?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let raw = entry.path_bytes();
+        let name = String::from_utf8_lossy(&raw);
+        if name.rsplit('/').next().unwrap_or("") != member {
+            continue;
+        }
+        if found.is_some() {
+            return Err(format!(
+                "release archive has several {member} members; refusing to guess."
+            ));
+        }
+        let mut data = Vec::new();
+        entry
+            .read_to_end(&mut data)
+            .map_err(|e| format!("cannot read release archive: {e}"))?;
+        if data.is_empty() {
+            return Err(format!("release archive member {member} is empty."));
+        }
+        found = Some(data);
+    }
+    found.ok_or_else(|| format!("release archive has no {member} member."))
 }
 
 /// Pre-download gate: refuse empty assets and releases without a usable
@@ -1389,7 +1478,8 @@ fn download_install_report(
 ) -> Result<ApplyReport, String> {
     let upgrading = upgrading_line(&target.channel, opts.ansi);
     let bytes = download_release_bytes(&asset.url, asset.size, asset.digest.as_deref())?;
-    let backup = install_bytes_at(exe, &bytes)?;
+    let image = installable_bytes(&bytes)?;
+    let backup = install_bytes_at(exe, &image)?;
     let mut stdout_text = downloading_line(&asset.name, asset.size, opts.ansi);
     stdout_text.push_str(&replaced_line(exe, latest, backup.as_deref(), opts.ansi));
     let mut stderr_text = upgrading;
