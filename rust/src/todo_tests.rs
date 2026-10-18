@@ -332,3 +332,63 @@ fn b23_todo_help_matches_generated_format() {
     let ansi = usage_text(true);
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
+
+#[test]
+fn run_reports_auth_failure_for_unreachable_uri() {
+    // T1170 coverage: `run()` with valid args reaches the classic
+    // startup gate. The URI is unroutable (localhost discard port),
+    // so `authed_client_for` fails deterministically on every
+    // machine: no stored credential matches that host key (and even
+    // an ambient `ARC_CONDUIT_TOKEN` only leads to a refused
+    // `user.whoami`). No writes, no external network, and the
+    // outcome (a non-zero envelope) is HOME-independent.
+    let code = run(&args(&[
+        "file",
+        "the",
+        "report",
+        "--conduit-uri",
+        "http://127.0.0.1:9/",
+    ]));
+    assert_ne!(code, std::process::ExitCode::SUCCESS);
+}
+// -( T1170 wave 6h: helper-arm coverage )--------------------------------------
+
+fn serve_one_addr(uri: &str) -> String {
+    uri.trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+#[test]
+fn serve_one_answers_connections_that_close_early() {
+    // A client that half-closes without sending headers reads EOF
+    // (`n == 0`): the handler still answers instead of hanging.
+    use std::io::Read as _;
+    let (uri, handle) = serve_one("{}");
+    let stream = std::net::TcpStream::connect(serve_one_addr(&uri)).unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut reply = Vec::new();
+    let mut stream = stream;
+    stream.read_to_end(&mut reply).unwrap();
+    handle.join().unwrap();
+    assert!(reply.windows(2).any(|w| w == b"{}"));
+}
+
+#[test]
+fn serve_one_tolerates_partially_sent_headers() {
+    // Headers arriving in two chunks take the keep-reading edge: the
+    // first read holds an incomplete head, the second completes it.
+    use std::io::{Read as _, Write as _};
+    let (uri, handle) = serve_one("{}");
+    let mut stream = std::net::TcpStream::connect(serve_one_addr(&uri)).unwrap();
+    stream.write_all(b"P").unwrap();
+    stream.flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    stream
+        .write_all(b"OST / HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+    let mut reply = Vec::new();
+    stream.read_to_end(&mut reply).unwrap();
+    handle.join().unwrap();
+    assert!(reply.windows(2).any(|w| w == b"{}"));
+}

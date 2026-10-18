@@ -1744,3 +1744,64 @@ fn t1170_execute_builds_tokenless_client_then_queries() {
     .unwrap_err();
     assert!(!err.is_empty(), "{err}");
 }
+
+// -( T1170 wave 6g batch D )--------------------------------------------------
+
+#[test]
+fn t1170_query_git_remotes_rejects_remote_less_checkouts() {
+    // T1153 RB-D9: empty `git remote -v` output throws (`split_lines`
+    // yields one empty line, which misses the remote pattern), so a
+    // remote-less checkout fails instead of listing nothing. Pins the
+    // invariant behind `published_git_hashes`' empty-remotes arm.
+    let repo = init_repo("noremotes");
+    let err = query_git_remotes(repo.path()).unwrap_err();
+    assert!(err.contains("Failed to match remote pattern"), "{err}");
+}
+
+#[test]
+fn t1170_remote_cache_markers_always_carry_remote_names() {
+    // `query_git_markers(..., remote_cache = true)` keeps only
+    // `refs/remotes/<remote>/...` records, each parsed with
+    // `remote_name = Some(..)` (a bare `refs/remotes/<name>` record is
+    // skipped, never emitted nameless). Pins the invariant behind
+    // `published_git_hashes`' nameless-marker arm.
+    let repo = init_repo("remotecache");
+    let head = git(repo.path(), &["rev-parse", "HEAD"]);
+    git(
+        repo.path(),
+        &["remote", "add", "origin", "https://example.test/repo.git"],
+    );
+    git(
+        repo.path(),
+        &["update-ref", "refs/remotes/origin/main", &head],
+    );
+    git(
+        repo.path(),
+        &["update-ref", "refs/remotes/origin/feature", &head],
+    );
+    let markers = query_git_markers(repo.path(), MARKER_TYPE_BRANCH, true).unwrap();
+    assert_eq!(markers.len(), 2);
+    for marker in &markers {
+        assert_eq!(marker.remote_name.as_deref(), Some("origin"), "{marker:?}");
+    }
+}
+// -( T1170 wave 6h: helper-arm coverage )--------------------------------------
+
+#[test]
+fn revision_helper_builds_published_refs() {
+    // The `published` arm of the `revision` helper builds a
+    // published-status ref (every other caller passes `false`).
+    let published = revision(3, "PHID-DREV-3", "shipped", true);
+    assert!(published.is_status_published());
+    assert_eq!(published.status(), Some("published"));
+    let review = revision(4, "PHID-DREV-4", "wip", false);
+    assert!(!review.is_status_published());
+}
+
+#[test]
+#[should_panic(expected = "failed:")]
+fn git_helper_reports_failing_commands() {
+    // A failing git invocation panics with the command and stderr.
+    let tmp = TempDir::new("w6h-git-fail");
+    git(tmp.path(), &["--bogus-flag-xyz"]);
+}

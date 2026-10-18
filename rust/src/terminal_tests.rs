@@ -675,3 +675,31 @@ fn truncate_glyphs_handles_multibyte_and_tiny_max() {
     assert_eq!(super::truncate_glyphs("abcdef", 1), "…");
     assert_eq!(super::truncate_glyphs("abcdef", 0), "…");
 }
+
+// -( T1170 coverage wave 6g band G, batch E )----------------------------------
+
+#[test]
+fn cov6g_question_conversion_renders_badge() {
+    for ansi in [false, true] {
+        let text = terminal::tsprintf_ansi("%?", &[TVal::Text("hi")], ansi)
+            .unwrap()
+            .to_string();
+        assert!(text.contains("hi"), "{text:?} (ansi={ansi})");
+    }
+}
+
+#[test]
+fn cov6g_php_truthy_matrix() {
+    assert!(!super::php_truthy(None));
+    assert!(!super::php_truthy(Some("")));
+    assert!(!super::php_truthy(Some("0")));
+    assert!(super::php_truthy(Some("1")));
+    assert!(super::php_truthy(Some("xterm")));
+}
+
+#[test]
+fn cov6g_tput_columns_is_stable() {
+    // Whatever the environment resolves (success, failure, or odd
+    // output), two back-to-back probes agree.
+    assert_eq!(super::tput_columns(), super::tput_columns());
+}

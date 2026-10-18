@@ -220,3 +220,28 @@ fn passthru_returns_the_script_status() {
         std::process::ExitCode::SUCCESS
     );
 }
+
+// -( T1170 coverage wave 6g band G, batch E )----------------------------------
+
+#[test]
+fn cov6g_run_in_missing_cwd_reports_launch_failure() {
+    // `find_script` walks ancestors lexically, so it resolves above a
+    // missing directory; the spawn then fails on `current_dir` and
+    // `run_in` reports the launch failure.
+    if python3_on_path().is_none() {
+        return;
+    }
+    let tmp = TempDir::new("cov6g-missing-cwd");
+    let script_dir = tmp.path().join("support").join("arcanoid");
+    std::fs::create_dir_all(&script_dir).unwrap();
+    std::fs::write(script_dir.join("arcanoid.py"), "# never launched\n").unwrap();
+    let missing = tmp.path().join("gone");
+    assert!(!missing.exists());
+    // The script resolves lexically above the missing cwd, so the
+    // failure below can only be the spawn/launch arm.
+    assert!(find_script(&missing).is_some());
+    assert_eq!(
+        run_in(&missing, &args(&["--"])),
+        std::process::ExitCode::FAILURE
+    );
+}

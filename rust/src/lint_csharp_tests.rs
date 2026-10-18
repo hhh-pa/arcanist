@@ -535,3 +535,51 @@ fn unknown_printf_spec_declines() {
         Some("hi!".to_string())
     );
 }
+
+// -( T1170 coverage wave 6g band G, batch E )----------------------------------
+
+#[cfg(unix)]
+fn cov6g_write_script(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[test]
+#[cfg(unix)]
+fn cov6g_check_version_probe_shapes() {
+    let tmp = TempDir::new("cov6g-version");
+    let cslint = tmp.path().join("cslint.exe");
+    std::fs::write(&cslint, "fake").unwrap();
+    let prefix = vec![cslint.to_string_lossy().into_owned()];
+    // Exit 0 printing the supported version passes the gate.
+    let mono = cov6g_write_script(tmp.path(), "mono", "#!/bin/sh\necho 1\n");
+    assert!(check_version(&mono, &prefix).is_ok());
+    // A failing probe reports the old-version text.
+    let bad = cov6g_write_script(tmp.path(), "badmono", "#!/bin/sh\nexit 3\n");
+    let err = check_version(&bad, &prefix).unwrap_err();
+    assert!(err.contains("old version of cslint"), "{err}");
+    // A newer version reports the Arcanist-upgrade text.
+    let new = cov6g_write_script(tmp.path(), "newmono", "#!/bin/sh\necho 2\n");
+    let err = check_version(&new, &prefix).unwrap_err();
+    assert!(err.contains("newer"), "{err}");
+    // An empty prefix cannot happen via `resolve` (the cslint path is
+    // always first); the direct call still reports old-version text.
+    assert!(check_version(&mono, &[]).is_err());
+}
+
+#[test]
+fn cov6g_push_conversion_rejects_unknown_spec() {
+    // `vsprintf` pre-filters specs, so the fallthrough arm is only
+    // reachable by direct call.
+    let mut out = String::new();
+    assert_eq!(push_conversion(&mut out, 'q', "x", None), None);
+    assert!(out.is_empty());
+    let mut out = String::new();
+    assert_eq!(push_conversion(&mut out, 's', "x", None), Some(()));
+    assert_eq!(out, "x");
+}

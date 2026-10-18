@@ -1178,3 +1178,43 @@ fn dl_b23_help_matches_generated_format() {
         Err(message) => panic!("expected help, got {message}"),
     }
 }
+
+// -( T1170 wave 6h: helper-arm coverage )--------------------------------------
+
+#[test]
+#[should_panic(expected = "expected args for")]
+fn args_of_panics_on_invalid_argv() {
+    // `args_of` unwraps `Args`: a bare `--` (no file) panics.
+    args_of(&["--"]);
+}
+
+#[test]
+fn serve_helpers_release_aborted_connections() {
+    // A client that drops mid-headers takes each serve helper's
+    // early-return arm instead of blocking forever: once the handler
+    // returns, its listener is gone and the port refuses.
+    for url in [
+        serve_bytes_once(b"hi".to_vec()),
+        serve_status_once(200),
+        serve_truncated_once(9, b"short".to_vec()),
+    ] {
+        let addr = url
+            .trim_start_matches("http://")
+            .trim_end_matches("/f")
+            .to_string();
+        let mut stream = std::net::TcpStream::connect(&addr).unwrap();
+        use std::io::Write as _;
+        stream.write_all(b"X").unwrap();
+        drop(stream);
+        // Poll until the handler returns and drops its listener; the
+        // bound keeps a stuck handler from hanging the suite.
+        for _ in 0..500 {
+            if std::net::TcpStream::connect(&addr).is_err() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let released = std::net::TcpStream::connect(&addr).is_err();
+        assert!(released, "aborted {url} never released");
+    }
+}

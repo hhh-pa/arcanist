@@ -1452,3 +1452,36 @@ fn status_entry_point_resolves_to_a_terminal_exit_code() {
         "{code:?}"
     );
 }
+
+// -( T1170 wave 6h: helper-arm coverage )--------------------------------------
+
+#[test]
+#[should_panic(expected = "failed:")]
+fn git_helper_reports_failing_commands() {
+    // A failing git invocation panics with the command and stderr.
+    let tmp = TempDir::new("w6h-git-fail");
+    git(&tmp.path, &["--bogus-flag-xyz"]);
+}
+
+#[test]
+fn mock_server_answers_unknown_routes_with_500() {
+    // `take_route` falls back to `unexpected_route` when no stub
+    // matches, so a misbehaving client gets a 500 naming the request.
+    let route = take_route(&mut Vec::new(), "GET /unknown HTTP/1.1");
+    assert_eq!(route.status, "500 Internal Server Error");
+    assert!(
+        String::from_utf8_lossy(&route.body).contains("unexpected request: GET /unknown HTTP/1.1")
+    );
+}
+
+#[test]
+fn mock_server_tolerates_truncated_requests() {
+    // A client that disconnects before sending headers yields an
+    // empty request line instead of hanging the mock.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = std::net::TcpStream::connect(addr).unwrap();
+    drop(client);
+    let (mut stream, _) = listener.accept().unwrap();
+    assert_eq!(read_request_line(&mut stream), "");
+}

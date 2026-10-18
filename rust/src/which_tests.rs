@@ -2923,3 +2923,32 @@ fn t1170_run_in_reports_unreadable_config() {
         std::process::ExitCode::FAILURE
     );
 }
+
+// -( T1170 wave 6h: helper-arm coverage )--------------------------------------
+
+#[test]
+#[should_panic(expected = "bad source")]
+fn merged_with_panics_on_unknown_sources() {
+    // `merged_with` only knows the five config layers.
+    merged_with("k", serde_json::json!(1), "bogus");
+}
+
+#[test]
+#[should_panic(expected = "unexpected help")]
+fn options_of_panics_on_help() {
+    options_of(&["--help"]);
+}
+
+#[test]
+#[should_panic(expected = "unexpected parse error")]
+fn options_of_panics_on_errors() {
+    options_of(&["--bogus"]);
+}
+
+#[test]
+#[should_panic(expected = "failed:")]
+fn git_helper_reports_failing_commands() {
+    // A failing git invocation panics with the command and stderr.
+    let tmp = TempDir::new("w6h-git-fail");
+    git(&tmp.path, &["--bogus-flag-xyz"]);
+}

@@ -726,3 +726,83 @@ fn execute_with_input_reports_missing_terminator() {
     let err = execute_with_input(dir.path(), &argv(&[]), &mut input, false).unwrap_err();
     assert_eq!(err, crate::help::MISSING_TERMINATOR);
 }
+
+// -( T1170 coverage wave 6g band G, batch E )----------------------------------
+
+/// `BufRead` that plants the library init file on first read, so the
+/// post-confirm recheck in `ensure_library_with` observes a library
+/// that did not exist at entry.
+struct Cov6gPlantOnRead {
+    lib: PathBuf,
+    planted: bool,
+    inner: std::io::Cursor<Vec<u8>>,
+}
+
+impl Cov6gPlantOnRead {
+    fn new(lib: PathBuf, answer: &str) -> Self {
+        Self {
+            lib,
+            planted: false,
+            inner: std::io::Cursor::new(answer.as_bytes().to_vec()),
+        }
+    }
+
+    fn plant(&mut self) {
+        if self.planted {
+            return;
+        }
+        self.planted = true;
+        std::fs::create_dir_all(&self.lib).unwrap();
+        std::fs::write(self.lib.join(INIT_FILE), "<?php\n").unwrap();
+    }
+}
+
+impl std::io::Read for Cov6gPlantOnRead {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.plant();
+        self.inner.read(buf)
+    }
+}
+
+impl std::io::BufRead for Cov6gPlantOnRead {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        self.plant();
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.inner.consume(amt);
+    }
+}
+
+#[test]
+fn cov6g_ensure_library_sees_init_created_during_confirm() {
+    let dir = TempDir::new("cov6g-plant");
+    let lib = dir.path().join("newlib");
+    let mut input = Cov6gPlantOnRead::new(lib.clone(), "y\n");
+    let mut noop = |_: crate::prompts::PromptScope, _: &str| Ok(());
+    assert_eq!(
+        ensure_library_with(&lib, &mut input, true, None, &mut noop),
+        Ok(false)
+    );
+    assert!(lib.join(INIT_FILE).is_file());
+}
+
+#[test]
+fn cov6g_run_in_two_paths_is_usage_failure() {
+    // Piped (no `--`): the terminator failure prints the usage hints,
+    // then reports toolset usage. On a TTY the same argv fails one-path
+    // validation instead. Both exit 1 before any prompt, so this never
+    // blocks on stdin in either state.
+    let dir = TempDir::new("cov6g-two-paths");
+    let code = run_in(dir.path(), &argv(&["a", "b"]));
+    assert_eq!(code, std::process::ExitCode::FAILURE);
+}
+// -( T1170 wave 6h: helper-arm coverage )--------------------------------------
+
+#[test]
+#[should_panic(expected = "expected args for")]
+fn args_of_panics_on_invalid_argv() {
+    // T1153 B21/B23: TTY runs need no `--`; two paths still error.
+    args_of(&["a", "b"]);
+}

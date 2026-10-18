@@ -876,3 +876,13 @@ fn b23_inspect_help_matches_generated_format() {
     let ansi = usage_text(true);
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
+
+// -( T1170 wave 6h: helper-arm coverage )--------------------------------------
+
+#[test]
+#[should_panic(expected = "failed:")]
+fn git_helper_reports_failing_commands() {
+    // A failing git invocation panics with the command and stderr.
+    let tmp = TempDir::new("w6h-git-fail");
+    git(tmp.path(), &["--bogus-flag-xyz"]);
+}

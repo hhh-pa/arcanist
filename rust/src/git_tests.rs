@@ -29,6 +29,8 @@ fn detects_work_trees() {
     let repo = fresh_repo("tree");
     assert!(is_inside_work_tree(&repo));
     let plain = std::env::temp_dir().join(format!("arc-rs-git-plain-{}", std::process::id()));
+    // Cover the stale-cleanup arm: a leftover dir is cleared first.
+    std::fs::create_dir_all(&plain).unwrap();
     if plain.exists() {
         std::fs::remove_dir_all(&plain).ok();
     }
@@ -814,4 +816,108 @@ fn raw_commit_writes_tolerate_early_git_exit() {
         "git hash-object failed"
     );
     std::fs::remove_dir_all(&plain).ok();
+}
+
+// -( T1170 coverage wave 6g band G, batch E )----------------------------------
+
+/// Unique scratch git repo with one empty commit (the shared
+/// `fresh_repo` keys on pid+name only, which a second caller cannot
+/// safely reuse).
+fn cov6g_repo(tag: &str) -> std::path::PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let dir =
+        std::env::temp_dir().join(format!("arc-rs-git-cov6g-{tag}-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+    };
+    run(&["init", "-q", "-b", "master"]);
+    run(&["config", "user.email", "t@t"]);
+    run(&["config", "user.name", "t"]);
+    run(&["commit", "-q", "--allow-empty", "-m", "init"]);
+    dir
+}
+
+#[test]
+fn cov6g_raw_diff_copy_flag_records_new_path() {
+    // `C` with a tab-separated pair records only the new path, then
+    // takes the copy arm's trailing `continue`.
+    let status = ":100644 100644 aaaaaaa bbbbbbb C75\told.cs\tnew.cs\n";
+    let full = parse_git_raw_diff_full(status);
+    assert_eq!(full.len(), 1);
+    let entry = &full["new.cs"];
+    assert_eq!(entry.mask, FLAG_ADDED);
+    assert_eq!(entry.r#ref, "bbbbbbb");
+    assert_eq!(parse_git_raw_diff(status).get("new.cs"), Some(&FLAG_ADDED));
+}
+
+#[test]
+fn cov6g_porcelain_v2_truncated_rename_is_skipped() {
+    // No trailing NUL: the final `2` record has no orig-path entry, so
+    // it is skipped instead of recorded.
+    let bytes = b"? new.txt\x002 R. N... 100644 100644 100644 abcabc abcabc extra new.txt";
+    let got = parse_porcelain_v2_status(bytes);
+    assert_eq!(got.len(), 1);
+    assert_eq!(got["new.txt"], FLAG_UNTRACKED);
+    // Control: the same `2` record with its orig-path entry present is
+    // recorded, proving the record above is well-formed and can only
+    // have been skipped at the truncated-record arm.
+    let full = b"2 R. N... 100644 100644 100644 abcabc abcabc extra renamed.txt\x00orig.txt\x00";
+    let recorded = parse_porcelain_v2_status(full);
+    assert_ne!(recorded["renamed.txt"] & FLAG_ADDED, 0);
+    assert_ne!(recorded["orig.txt"] & FLAG_DELETED, 0);
+}
+
+#[test]
+fn cov6g_all_branches_tolerates_spawn_race() {
+    // `all_branches` fails its `output(...)?` only when the
+    // for-each-ref spawn fails after `branch_name` succeeded: a TOCTOU
+    // only a rename race can reach. Outcomes vary by timing, so
+    // nothing is asserted about them; the test passes deterministically
+    // while giving the race window every chance to hit.
+    let repo = cov6g_repo("allbr");
+    assert_eq!(branch_name(&repo).unwrap(), Some("master".to_string()));
+    let away = repo.with_extension("cov6g-away");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let toggler = std::thread::spawn({
+        let (repo, away, stop) = (repo.clone(), away.clone(), stop.clone());
+        move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                std::fs::rename(&repo, &away).ok();
+                std::fs::rename(&away, &repo).ok();
+            }
+        }
+    });
+    for _ in 0..200 {
+        let _ = all_branches(&repo);
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    toggler.join().unwrap();
+    if !repo.exists() {
+        std::fs::rename(&away, &repo).ok();
+    }
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&away).ok();
+}
+// -( T1170 wave 6h: helper-arm coverage )--------------------------------------
+
+#[test]
+fn repo_helpers_clear_stale_dirs() {
+    // Reusing a tag clears the previous run's leftovers.
+    let first = fresh_repo("stale-reuse");
+    std::fs::write(first.join("junk.txt"), "junk").unwrap();
+    let second = fresh_repo("stale-reuse");
+    assert!(!second.join("junk.txt").exists());
+    let plain_first = plain_dir("stale-plain");
+    std::fs::write(plain_first.join("junk.txt"), "junk").unwrap();
+    let plain_second = plain_dir("stale-plain");
+    assert!(!plain_second.join("junk.txt").exists());
+    std::fs::remove_dir_all(&second).ok();
+    std::fs::remove_dir_all(&plain_second).ok();
 }

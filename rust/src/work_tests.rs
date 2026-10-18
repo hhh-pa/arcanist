@@ -2162,3 +2162,20 @@ fn apply_hg_shelve_reports_failed_delete() {
     assert!(log.contains("unshelve --keep --name arc-test"), "{log}");
     assert!(log.contains("shelve --delete arc-test"), "{log}");
 }
+
+// -( T1170 wave 6h: helper-arm coverage )--------------------------------------
+
+#[test]
+#[should_panic(expected = "--bogus parses")]
+fn hg_options_panics_on_invalid_symbols() {
+    // `hg_options` unwraps `Args`: an unknown flag panics.
+    hg_options("--bogus");
+}
+
+#[test]
+#[should_panic(expected = "failed:")]
+fn git_helper_reports_failing_commands() {
+    // A failing git invocation panics with the command and stderr.
+    let tmp = TempDir::new("w6h-git-fail");
+    git(tmp.path(), &["--bogus-flag-xyz"]);
+}

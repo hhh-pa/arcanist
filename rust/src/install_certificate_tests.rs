@@ -1118,3 +1118,38 @@ fn b23_install_certificate_help_matches_generated_format() {
     let ansi = usage_text(true);
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
+
+// -( T1170 coverage wave 6g band G, batch E )----------------------------------
+
+/// Best-effort cover for the `metadata` failure arm of
+/// `arcrc_mode_is_open`: the error needs the file to vanish between
+/// `is_file` and `metadata`, which only a removal race can arrange.
+/// Either outcome is accepted, so the test passes deterministically
+/// while giving the race every chance to hit.
+#[test]
+#[cfg(unix)]
+fn cov6g_arcrc_mode_metadata_race() {
+    let tmp = TempDir::new("cov6g-moderace");
+    let target = tmp.path.join("arcrc");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let churn = std::thread::spawn({
+        let (target, stop) = (target.clone(), stop.clone());
+        move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                std::fs::write(&target, "x").ok();
+                std::fs::remove_file(&target).ok();
+            }
+        }
+    });
+    for _ in 0..10_000 {
+        match arcrc_mode_is_open(&target) {
+            Ok(_) => {}
+            Err(message) => assert!(
+                message.contains("Unable to read file permissions"),
+                "{message}"
+            ),
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    churn.join().unwrap();
+}

@@ -723,3 +723,19 @@ fn unreadable_input_reports_not_readable() {
     assert!(probed.is_ok() || probed.unwrap_err().contains("not readable"));
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
 }
+
+/// Non-permission read failures surface the `readBytes()` open-failure
+/// text. `/proc/self/mem` stats as a regular file but every read
+/// faults (EIO) — the only deterministic trigger, hence Linux-only
+/// (macOS/Windows have no equivalent). Skips when `/proc` is
+/// unavailable (some containers).
+#[cfg(target_os = "linux")]
+#[test]
+fn input_read_error_reports_open_failure() {
+    if std::fs::symlink_metadata("/proc/self/mem").is_err() {
+        return;
+    }
+    let tmp = TempDir::new("read-error");
+    let err = read_input_file(tmp.path(), "/proc/self/mem").unwrap_err();
+    assert!(err.contains("Failed to read file"), "{err}");
+}

@@ -64,6 +64,18 @@ fn empty_output_and_no_matches_stay_silent() {
             .unwrap()
             .is_empty()
     );
+    // A colon without a trailing space, and a non-numeric line, also
+    // match nothing (the parser's skip arms).
+    assert!(
+        parse_output_with(severity_line_parser, "error:3\n", "f.txt", b"x\n")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        parse_output_with(severity_line_parser, "error:X boom\n", "f.txt", b"x\n")
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

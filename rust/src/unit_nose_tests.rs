@@ -46,6 +46,9 @@ fn select_tests_maps_dirs_and_files() {
         .insert("/r/tests/pkg".to_string(), "x\n".to_string());
     fs.files
         .insert("/r/tests/pkg/test_mod.py".to_string(), "x\n".to_string());
+    // The fake's line counts back the coverage readers.
+    assert_eq!(fs.line_count("/r/pkg/mod.py"), Some(1));
+    assert_eq!(fs.line_count("/r/missing.py"), None);
     // Directory input maps to tests/<path>.
     let found = select_tests(&["pkg".to_string()], "/r", &fs);
     assert_eq!(found, vec!["/r/tests/pkg".to_string()]);
@@ -92,6 +95,9 @@ fn coverage_skips_empty_and_foreign_files() {
     let xml = r#"<coverage><package><classes>
       <class filename="/r/pkg/mod.py"><lines>
         <line number="1" hits="1"/><line number="3" hits="0"/>
+      </lines></class>
+      <class filename="/r/pkg/other.py"><lines>
+        <line number="1" hits="1"/>
       </lines></class>
       <class filename="/elsewhere/x.py"><lines>
         <line number="1" hits="1"/>

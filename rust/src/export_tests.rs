@@ -1910,5 +1910,52 @@ fn run_sink_failure_is_fatal() {
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(buf, usage().into_bytes());
+    // The failing sink's `flush` is a no-op success.
+    assert!(std::io::Write::flush(&mut FailSink).is_ok());
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// -( T1170 coverage wave 6g band G, batch E )----------------------------------
+
+#[test]
+fn cov6g_local_diff_bytes_tolerates_spawn_race() {
+    // The `output(...)?` in `local_diff_bytes` fails only when the
+    // diff spawn fails after the work-tree and head probes succeeded:
+    // a TOCTOU only a rename race can reach. Outcomes vary by timing,
+    // so nothing is asserted about them; the test passes
+    // deterministically while giving the race window every chance to
+    // hit.
+    let dir = fixture_repo("cov6g-race");
+    std::fs::write(dir.join("f.txt"), "one\n").unwrap();
+    git(&dir, &["add", "f.txt"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    let away = dir.with_extension("cov6g-away");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let toggler = std::thread::spawn({
+        let (dir, away, stop) = (dir.clone(), away.clone(), stop.clone());
+        move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                std::fs::rename(&dir, &away).ok();
+                std::fs::rename(&away, &dir).ok();
+            }
+        }
+    });
+    for _ in 0..400 {
+        let _ = local_diff_bytes(&dir, Format::Git, "HEAD");
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    toggler.join().unwrap();
+    if !dir.exists() {
+        std::fs::rename(&away, &dir).ok();
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&away).ok();
+}
+// -( T1170 wave 6h: helper-arm coverage )--------------------------------------
+
+#[test]
+#[should_panic(expected = "expected args for")]
+fn args_of_panics_on_invalid_argv() {
+    // `args_of` unwraps `Args`: no format at all panics.
+    args_of(&[]);
 }

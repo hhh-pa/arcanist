@@ -4249,3 +4249,108 @@ fn cov_rename_over_replaces_a_file_with_a_directory() {
     assert!(dest.is_dir());
     assert!(!from.exists());
 }
+
+#[test]
+fn cov6g_normalize_lexical_skips_current_dir_segments() {
+    // T1170 wave 6g: the CurDir arm of normalize_lexical.
+    assert_eq!(normalize_lexical(Path::new("a/./b")), PathBuf::from("a/b"));
+    assert_eq!(normalize_lexical(Path::new("./a")), PathBuf::from("a"));
+    assert_eq!(
+        normalize_lexical(Path::new("a/././b")),
+        PathBuf::from("a/b")
+    );
+}
+
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(unix)]
+static COV6G_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(unix)]
+fn cov6g_temp_dir(name: &str) -> PathBuf {
+    let id = COV6G_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!(
+        "arc_rs_lint_cov6g_{}_{}_{}",
+        std::process::id(),
+        id,
+        name
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+#[cfg(unix)]
+fn cov6g_spawn_with_retry_reports_text_file_busy() {
+    // T1170 wave 6g: hold a script open for writing while spawning it.
+    // Linux exec fails with ETXTBSY (errno 26), exercising the retry
+    // arm; other unix spawns succeed. Either outcome passes, so the
+    // test is deterministic on every unix.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = cov6g_temp_dir("etxtbsy");
+    let script = dir.join("busy.sh");
+    std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _held = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&script)
+        .unwrap();
+    let mut cmd = Command::new(&script);
+    cmd.current_dir(&dir);
+    match spawn_with_retry(&mut cmd) {
+        Err(error) => assert_eq!(
+            error.raw_os_error(),
+            Some(26),
+            "expected ETXTBSY, got {error}"
+        ),
+        Ok(output) => assert!(
+            output.status.success(),
+            "script should run where ETXTBSY does not apply: {output:?}"
+        ),
+    }
+}
+// -( T1170 wave 6h: helper-arm coverage )--------------------------------------
+
+#[test]
+#[should_panic(expected = "unexpected help")]
+fn parse_panics_on_help() {
+    parse(&["--help"]);
+}
+
+#[test]
+#[should_panic(expected = "unexpected error")]
+fn parse_panics_on_errors() {
+    parse(&["--bogus"]);
+}
+
+#[test]
+#[should_panic(expected = "expected error, got args")]
+fn parse_error_panics_on_args() {
+    parse_error(&[]);
+}
+
+#[test]
+#[should_panic(expected = "expected error, got help")]
+fn parse_error_panics_on_help() {
+    parse_error(&["--help"]);
+}
+
+#[test]
+#[should_panic(expected = "expected engine error")]
+fn engine_error_panics_when_an_engine_resolves() {
+    // `engine_error` unwraps the failure: a resolvable engine panics.
+    let tmp = TempDir::new("w6h-engine-ok");
+    std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+    let work = discover_working_copy(tmp.path()).unwrap();
+    engine_error(&work, Some(ENGINE_COMPREHENSIVE));
+}
+
+#[test]
+#[should_panic(expected = "failed:")]
+fn git_helper_reports_failing_commands() {
+    // A failing git invocation panics with the command and stderr.
+    let tmp = TempDir::new("w6h-git-fail");
+    git(tmp.path(), &["--bogus-flag-xyz"]);
+}

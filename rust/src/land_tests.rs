@@ -8119,3 +8119,22 @@ fn t1170_describe_json_type_names_all_shapes() {
     assert_eq!(describe_json_type(&serde_json::json!([1])), "array");
     assert_eq!(describe_json_type(&serde_json::json!({"a": 1})), "array");
 }
+
+// -( T1170 wave 6h: helper-arm coverage )--------------------------------------
+
+/// `temp_dir` with cleanup on drop, so `should_panic` tests do not leak.
+struct W6hDir(PathBuf);
+
+impl Drop for W6hDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+#[test]
+#[should_panic(expected = "failed:")]
+fn git_helper_reports_failing_commands() {
+    // A failing git invocation panics with the command and stderr.
+    let dir = W6hDir(temp_dir("w6h-git-fail"));
+    git(&dir.0, &["--bogus-flag-xyz"]);
+}

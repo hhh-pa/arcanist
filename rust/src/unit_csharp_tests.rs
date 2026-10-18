@@ -164,6 +164,7 @@ fn unit_u20_cscover_cache_and_parse_keep_file_order() {
     let xml = r#"<coverage>
       <instrumented file="/r/Z.cs" start="1" end="1"/>
       <instrumented file="/r/A.cs" start="1" end="1"/>
+      <instrumented file="/r/Q.cs" start="1" end="1"/>
       <executed file="/r/Z.cs" start="1" end="1"/>
     </coverage>"#;
     let counts = |p: &str| {

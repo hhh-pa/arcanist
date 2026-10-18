@@ -6625,3 +6625,25 @@ fn t1170_conduit_truthy_shapes_drive_amend_decision() {
         assert_eq!(calculate_should_amend(&check).unwrap(), expected, "{value}");
     }
 }
+
+// -( T1170 coverage wave 6g band G, batch E )----------------------------------
+
+#[test]
+fn cov6g_resolve_explicit_base_ok() {
+    let Some(repo) = T1170GitRepo::named("cov6g-base") else {
+        return;
+    };
+    repo.commit_file("a.txt", "a\n", "second");
+    let sha = resolve_explicit_base(&repo.dir, "HEAD~1", "HEAD").unwrap();
+    assert_eq!(sha.len(), 40);
+    assert!(sha.chars().all(|c| c.is_ascii_hexdigit()), "{sha}");
+}
+// -( T1170 wave 6h: helper-arm coverage )--------------------------------------
+
+#[test]
+fn gap2_d1_ok_call_rejects_unexpected_methods() {
+    // The canned-conduit helper only stubs the template-flow methods;
+    // anything else errors naming the call.
+    let err = gap2_d1_ok_call("bogus.method", &serde_json::json!({})).unwrap_err();
+    assert_eq!(err, "unexpected conduit call bogus.method");
+}

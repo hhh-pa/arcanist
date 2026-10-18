@@ -441,3 +441,28 @@ fn run_in_reports_query_failures_as_fatal() {
         std::process::ExitCode::from(255)
     );
 }
+
+// -( T1170 wave 6g batch D )--------------------------------------------------
+
+#[test]
+fn t1170_run_in_without_terminator_is_usage_failure() {
+    // Piped runs (stdin not a TTY) fail argument parsing with
+    // MISSING_TERMINATOR, rendered through `run_in`'s hints arm;
+    // interactive runs reach the outside-repo support gate instead.
+    // Both are toolset usage failures (exit 1 — the auth arm reports
+    // exit 1 too), so the outcome pins without depending on stdin.
+    let dir = TempDir::new("no-terminator");
+    assert_eq!(
+        run_in(dir.path(), &args(&[])),
+        std::process::ExitCode::FAILURE
+    );
+}
+// -( T1170 wave 6h: helper-arm coverage )--------------------------------------
+
+#[test]
+#[should_panic(expected = "failed:")]
+fn git_helper_reports_failing_commands() {
+    // A failing git invocation panics with the command and stderr.
+    let tmp = TempDir::new("w6h-git-fail");
+    git(tmp.path(), &["--bogus-flag-xyz"]);
+}

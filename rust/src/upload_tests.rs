@@ -822,3 +822,19 @@ fn collect_errors_report_the_first_failure() {
 fn run_reports_usage_errors_without_browsing() {
     assert_eq!(run(&argv(&["--bogus"])), std::process::ExitCode::FAILURE);
 }
+
+/// Non-permission read failures surface the `readBytes()` open-failure
+/// text. `/proc/self/mem` stats as a regular file but every read
+/// faults (EIO) — the only deterministic trigger, hence Linux-only
+/// (macOS/Windows have no equivalent). Skips when `/proc` is
+/// unavailable (some containers).
+#[cfg(target_os = "linux")]
+#[test]
+fn upload_read_error_reports_open_failure() {
+    if std::fs::symlink_metadata("/proc/self/mem").is_err() {
+        return;
+    }
+    let tmp = TempDir::new("read-error");
+    let err = read_upload_bytes(tmp.path(), "/proc/self/mem").unwrap_err();
+    assert!(err.contains("failed to open"), "{err}");
+}

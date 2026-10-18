@@ -6703,3 +6703,21 @@ fn targetless_symlinks_are_skipped() {
     // was skipped.
     run_svn_symlinks(&[change], &mut no_link).unwrap();
 }
+
+#[test]
+fn cov6g_read_patch_bytes_uses_scripted_stdin_for_dash() {
+    // T1170 wave 6g: the scripted-stdin arm (read_patch_bytes, `-`
+    // with `io.patch_stdin` set).
+    let mut io = Io::buffered();
+    io.patch_stdin = Some("diff --git a/f b/f\n".to_string());
+    assert_eq!(
+        read_patch_bytes("-", &mut io).unwrap(),
+        b"diff --git a/f b/f\n"
+    );
+    // A real path still reads from disk (the scripted value only
+    // applies to `-`).
+    let dir = temp_dir("cov6g_patch_stdin");
+    std::fs::write(dir.join("p.diff"), "patch-bytes").unwrap();
+    let path = dir.join("p.diff").to_string_lossy().to_string();
+    assert_eq!(read_patch_bytes(&path, &mut io).unwrap(), b"patch-bytes");
+}
