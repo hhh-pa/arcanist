@@ -869,13 +869,11 @@ fn read_upload_bytes(dir: &Path, path: &str) -> Result<Vec<u8>, String> {
     match std::fs::read(&disk) {
         Ok(data) => Ok(data),
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Err(format!(
-            "Unable to upload file: path \"{path}\" is not readable." // LCOV_EXCL_LINE // Reason: gates run as root, which reads through chmod 000, so EACCES never triggers where gates measure; covered on macOS runs
-        )), // LCOV_EXCL_LINE // Reason: gates run as root, which reads through chmod 000, so EACCES never triggers where gates measure; covered on macOS runs
-        // LCOV_EXCL_START // Reason: TOCTOU-only: is_file pre-check passes, so only deletion between check and read reaches here
+            "Unable to upload file: path \"{path}\" is not readable."
+        )),
         Err(_) => Err(format!(
             "Unable to upload file: failed to open path \"{path}\" for reading."
         )),
-        // LCOV_EXCL_STOP
     }
 }
 

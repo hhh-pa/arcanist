@@ -251,7 +251,12 @@ jobs:
           path: ci-tools-bin
           key: ci-tools-${{ runner.os }}-${{ hashFiles('scripts/ci/go/**') }}
       - name: run quality gates
-        run: docker run --rm -v "${{ github.workspace }}:/work" -v "${{ github.workspace }}/ci-tools-bin:/tools" -w /work "$GATE_IMAGE:$GATE_KEY" /tools/rust-quality-gates rust rust/target/llvm-cov nextest --run-ignored all --no-fail-fast
+        # T1176 DEMARK: run as the host uid, not root, so chmod-based
+        # tests genuinely fail reads (root reads through chmod 000).
+        # Numeric uid/gid matches the mounted workspace ownership; no
+        # passwd entry needed. HOME points at a scratch dir (tests
+        # override it with isolated fakes anyway).
+        run: docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "${{ github.workspace }}:/work" -v "${{ github.workspace }}/ci-tools-bin:/tools" -w /work "$GATE_IMAGE:$GATE_KEY" /tools/rust-quality-gates rust rust/target/llvm-cov nextest --run-ignored all --no-fail-fast
       # The container runs as root; hand the report back so later steps can
       # read it.
       - name: take ownership of coverage report

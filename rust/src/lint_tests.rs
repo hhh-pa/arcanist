@@ -1968,12 +1968,9 @@ fn lint20_unreadable_files_fold_into_the_aggregate() {
     let locked = tmp.write("locked.txt", "x\n");
     tmp.write("ok.txt", "ok\n");
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-    if std::fs::read(&locked).is_ok() {
-        // Privileged runner (e.g. root in CI containers): permission
-        // bits do not block reads, so the failure under test cannot
-        // trigger.
-        return; // LCOV_EXCL_LINE // Reason: privileged-runner skip; runs only where reads ignore permission bits (root CI)
-    } // LCOV_EXCL_START // Reason: post-root-skip body; dead where gates measure (CI runs as root, so the skip always takes); covered on macOS runs
+    // Non-root runners only (the suite assumes a non-root user, like the
+    // gates container since T1176 DEMARK): root reads through chmod 000,
+    // so the failure under test cannot trigger there.
     let work = WorkCopy {
         vcs: Vcs::Git,
         vcs_root: tmp.path().to_path_buf(),
@@ -1991,7 +1988,6 @@ fn lint20_unreadable_files_fold_into_the_aggregate() {
         .unwrap_err(),
         "Some linters failed:"
     );
-    // LCOV_EXCL_STOP
 }
 
 /// LINT-20 on Linux CI: the chmod trigger cannot fail a read for root,

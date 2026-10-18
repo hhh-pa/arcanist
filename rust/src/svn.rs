@@ -1983,7 +1983,7 @@ pub fn migrate_scratch_dir(work_root: &Path, metadata: &Path) -> bool {
     }
     for name in &names {
         if std::fs::copy(old.join(name), new.join(name)).is_err() {
-            return false; // LCOV_EXCL_LINE // Reason: copy fails only via unreadable sources; gates run as root so chmod cannot trigger; covered on macOS runs
+            return false;
         }
     }
     std::fs::remove_dir_all(&old).is_ok() && !old.exists()

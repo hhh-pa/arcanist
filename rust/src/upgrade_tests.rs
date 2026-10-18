@@ -1181,6 +1181,17 @@ fn execute_apply_updates_copy_end_to_end() {
 }
 
 #[test]
+fn install_bytes_at_cleans_up_on_chmod_failure() {
+    let tmp = TempDir::new("chmod-fail");
+    let exe = exe_copy(&tmp.path, "tool.exe", b"old");
+    let err =
+        install_bytes_at_with(&exe, b"new", |_| Err("EACCES (injected)".to_string())).unwrap_err();
+    assert!(err.contains("EACCES"), "{err}");
+    assert_eq!(std::fs::read(&exe).unwrap(), b"old");
+    assert_no_leftovers(&tmp.path);
+}
+
+#[test]
 fn execute_apply_refuses_corrupt_tarball_without_touching_exe() {
     let tmp = TempDir::new("e2e-corrupt");
     let exe = exe_copy(&tmp.path, "tool-copy.exe", b"old-bytes");

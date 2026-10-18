@@ -1146,6 +1146,17 @@ fn probe_counter() -> u64 {
 /// previous executable, if any. Any failure removes the staged file and
 /// leaves `exe` untouched.
 pub fn install_bytes_at(exe: &Path, bytes: &[u8]) -> Result<Option<PathBuf>, String> {
+    install_bytes_at_with(exe, bytes, make_executable)
+}
+
+/// [`install_bytes_at`] with the chmod step injected: chmod on a
+/// just-written temp file can only fail through a TOCTOU deletion, so
+/// tests drive the failure arm with a failing closure instead.
+fn install_bytes_at_with(
+    exe: &Path,
+    bytes: &[u8],
+    chmod: fn(&Path) -> Result<(), String>,
+) -> Result<Option<PathBuf>, String> {
     ensure_executable_writable(exe)?;
     let tmp = sibling_temp(exe);
     std::fs::remove_file(&tmp).ok();
@@ -1153,9 +1164,9 @@ pub fn install_bytes_at(exe: &Path, bytes: &[u8]) -> Result<Option<PathBuf>, Str
         std::fs::remove_file(&tmp).ok();
         return Err(format!("failed to stage the new executable: {error}"));
     }
-    if let Err(message) = make_executable(&tmp) {
-        std::fs::remove_file(&tmp).ok(); // LCOV_EXCL_START // Reason: chmod on a just-written temp file fails only on a TOCTOU deletion
-        return Err(message); // LCOV_EXCL_STOP
+    if let Err(message) = chmod(&tmp) {
+        std::fs::remove_file(&tmp).ok();
+        return Err(message);
     }
     replace_with_tmp(exe, &tmp)
 }
