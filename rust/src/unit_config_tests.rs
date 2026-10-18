@@ -34,7 +34,7 @@ fn invalid_type_names_available_engines() {
         err.message()
             .contains("Test engine 'a' specifies invalid type 'bogus'."),
         "{}",
-        err.message()
+        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
     assert!(err.message().contains("phutil, nose"), "{}", err.message());
     assert!(matches!(err, EngineError::Usage(_)));
@@ -76,7 +76,7 @@ fn missing_type_and_bad_shapes_error() {
             "Expected '.arcunit' file to be a valid JSON file, but failed to decode '/r/.arcunit'.\n"
         ),
         "{}",
-        err.message()
+        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
     let err = parse_engine_specs(r#"{"nope": 1}"#, "/r/.arcunit", &["phutil"]).unwrap_err();
     assert_eq!(
@@ -184,4 +184,45 @@ fn supports_run_all_is_any() {
     assert_eq!(available_index(&["a", "b"], "b"), Some(1));
     assert_eq!(available_index(&["a"], "z"), None);
     assert_eq!(available_list(&["a", "b"]), "a, b");
+}
+
+#[test]
+fn non_string_rule_entries_reject_the_list() {
+    let err = parse_engine_specs(
+        r#"{"engines": {"a": {"type": "phutil", "include": ["src/", 7]}}}"#,
+        "/r/.arcunit",
+        &["phutil"],
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.message(),
+        "Error in parsing '.arcunit' file, for test engine 'a'.\n'include' must be a regex or a list of regexes"
+    );
+}
+
+#[test]
+fn bad_exclude_shape_errors() {
+    let err = parse_engine_specs(
+        r#"{"engines": {"a": {"type": "phutil", "exclude": 7}}}"#,
+        "/r/.arcunit",
+        &["phutil"],
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.message(),
+        "Error in parsing '.arcunit' file, for test engine 'a'.\n'exclude' must be a regex or a list of regexes"
+    );
+}
+
+#[test]
+fn counts_results_by_code() {
+    use arc_rs::unit_engine::{RESULT_FAIL, RESULT_PASS};
+    let mut pass = UnitResult::new();
+    pass.set_result(RESULT_PASS);
+    let mut fail = UnitResult::new();
+    fail.set_result(RESULT_FAIL);
+    let counts = count_by_result(&[pass.clone(), fail, pass]);
+    assert_eq!(counts.get(RESULT_PASS), Some(&2));
+    assert_eq!(counts.get(RESULT_FAIL), Some(&1));
+    assert!(count_by_result(&[]).is_empty());
 }

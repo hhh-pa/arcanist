@@ -26,6 +26,11 @@ fn for_rule(source: &str, rule: u32) -> Vec<(usize, usize, String)> {
         .collect()
 }
 
+fn t1170_tree(source: &str) -> ast::Tree {
+    let canned = ast::tokens_to_canned(source, &ast::tokenize(source));
+    ast::tree_from_canned(&canned).expect("canned output must parse")
+}
+
 #[test]
 fn wiring_meta_matches_php_names_and_severities() {
     let table = super::super::RULE_TABLE;
@@ -597,4 +602,123 @@ fn partial_catch_reports_last_duplicate_and_scopes_per_try() {
     );
     assert_eq!(hits.len(), 1);
     assert_eq!((hits[0].0, hits[0].1), (11, 10));
+}
+
+#[test]
+fn node_start_skips_a_balanced_subscript() {
+    // A `]` directly before the class keyword walks back over its
+    // matcher; rule 87 still reports at the class name.
+    let hits = for_rule("<?php $a[0]\nclass C extends Phobject {}\n", 87);
+    assert_eq!(hits.len(), 1);
+    assert_eq!((hits[0].0, hits[0].1), (2, 7));
+}
+
+#[test]
+fn node_start_stops_at_an_unbalanced_bracket() {
+    let hits = for_rule("<?php ]\nclass C extends Phobject {}\n", 87);
+    assert_eq!(hits.len(), 1);
+    assert_eq!((hits[0].0, hits[0].1), (2, 7));
+}
+
+#[test]
+fn truncated_class_declaration_is_skipped_safely() {
+    // `class` at EOF yields a nameless, bodyless block: rules 87/95
+    // skip it, rule 113 has no body to scan, rule 88 still fires.
+    assert!(for_rule("<?php class", 87).is_empty());
+    assert!(for_rule("<?php class", 95).is_empty());
+    assert!(for_rule("<?php class", 113).is_empty());
+    assert_eq!(for_rule("<?php class", 88).len(), 1);
+}
+
+#[test]
+fn docblock_marker_needs_word_boundaries() {
+    // A glued marker neither exempts (rule 87 fires) nor matches.
+    let hits = for_rule(
+        "<?php\n/**x@concrete-extensible*/\nclass C extends Phobject {}\n",
+        87,
+    );
+    assert_eq!(hits.len(), 1);
+    // A rejected first hit falls through to a valid second marker.
+    assert!(
+        for_rule(
+            "<?php\n/** x@concrete-extensible @concrete-extensible */\nclass C extends Phobject {}\n",
+            87
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn bodiless_constructor_has_no_returns_to_flag() {
+    // A `__construct` terminated by `}` (no `;`/body) has no span.
+    assert!(for_rule("<?php interface I { function __construct() }\n", 92).is_empty());
+}
+
+#[test]
+fn closures_outside_the_constructor_do_not_mask_returns() {
+    let hits = for_rule(
+        "<?php class A extends Phobject { function __construct() { return 1; } function m() { $f = function () {}; } }\n",
+        92,
+    );
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn truncated_return_counts_as_bare() {
+    assert!(
+        for_rule(
+            "<?php class A extends Phobject { function __construct() { return",
+            92
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn continue_walk_crosses_function_boundaries() {
+    let hits = for_rule(
+        "<?php function f($x) { switch ($x) { case 1: continue; } }\n",
+        128,
+    );
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn public_property_with_nested_brackets_still_flags() {
+    let hits = for_rule(
+        "<?php class A extends Phobject { public $a = [1, 2]; }\n",
+        130,
+    );
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn paren_less_catch_has_no_names_to_collect() {
+    assert!(for_rule("<?php try {} catch {}\n", 132).is_empty());
+}
+
+#[test]
+fn glued_marker_at_end_of_doc_matches_nothing() {
+    // The needle ending the doc with a glued prefix advances past the
+    // end without matching (the scan's fallthrough arm).
+    assert!(!super::has_concrete_extensible("x@concrete-extensible"));
+    assert!(super::has_concrete_extensible(" @concrete-extensible "));
+}
+
+#[test]
+fn t1170_find_bytes_rejects_short_haystacks() {
+    // T1170 band J: a haystack shorter than the needle never
+    // matches (the guard the doc scan relies on).
+    assert_eq!(super::find_bytes(b"ab", b"abc"), None);
+    assert_eq!(super::find_bytes(b"xxabc", b"abc"), Some(2));
+}
+
+#[test]
+fn t1170_class_at_file_start_has_no_docblock() {
+    // T1170 band J: a class node at token 0 has no preceding
+    // docblock by construction.
+    let tree = t1170_tree("<?php class A {}\n");
+    let mut block = tree.blocks()[0].clone();
+    block.kw_idx = 0;
+    assert!(!super::class_docblock_exempts(&tree, &block));
 }

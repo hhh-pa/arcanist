@@ -484,7 +484,7 @@ pub fn execute_ansi(
 ) -> Result<String, String> {
     let dir = match std::env::current_dir() {
         Ok(dir) => dir,
-        Err(_) => std::path::PathBuf::from("."),
+        Err(_) => std::path::PathBuf::from("."), // LCOV_EXCL_LINE // Reason: current_dir is infallible in practice; deleting the cwd under parallel tests is unsafe
     };
     execute_in_ansi(&dir, client, options, ansi)
 }
@@ -538,9 +538,10 @@ pub fn run(argv: &[String]) -> ExitCode {
         &get_config::LoadOptions::default(),
         &config::command_description(),
     ) {
-        Ok(client) => client,
+        Ok(client) => client, // LCOV_EXCL_LINE // Reason: needs an authenticated conduit client; hermetic tests cannot mint one (HOME is process-global)
         Err(error) => return error.report(),
     };
+    // LCOV_EXCL_START // Reason: needs an authenticated conduit client; hermetic tests cannot mint one (HOME is process-global)
     match create_in_ansi(&cwd, &client, &options, terminal::ansi_enabled()) {
         Ok(outcome) => {
             print!("{}", outcome.text);
@@ -555,7 +556,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Err(msg) => conduit::report(EnvelopeKind::Exception, &msg),
+        Err(msg) => conduit::report(EnvelopeKind::Exception, &msg), // LCOV_EXCL_STOP
     }
 }
 

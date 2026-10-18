@@ -1,7 +1,10 @@
 package lcov
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -154,5 +157,103 @@ func TestLineSetsAndSubset(t *testing.T) {
 	}
 	if !IsSubset(covered, total) || IsSubset(total, covered) {
 		t.Fatalf("subset broken: %v %v", total, covered)
+	}
+}
+
+func writeSource(t *testing.T, dir, name, body string) string {
+	t.Helper()
+	p := filepath.Join(dir, name)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestApplyExclusionsGolden(t *testing.T) {
+	dir := t.TempDir()
+	src := writeSource(t, dir, "src.rs",
+		"fn covered() {\n"+ // 1 kept
+			"    alive(); // LCOV_EXCL_LINE\n"+ // 2 dropped (covered, still dropped)
+			"    alive();\n"+ // 3 kept
+			"    // LCOV_EXCL_START\n"+ // 4 dropped (marker line itself)
+			"    dead_windows_only();\n"+ // 5 dropped
+			"    also_dead(); // LCOV_EXCL_LINE\n"+ // 6 dropped
+			"    // LCOV_EXCL_STOP\n"+ // 7 dropped (marker line itself)
+			"    alive();\n"+ // 8 kept
+			"}\n") // 9 kept
+	in := "SF:" + src + "\n" +
+		"FN:1,covered\nFN:5,windows_only\n" +
+		"FNDA:3,covered\nFNDA:0,windows_only\nFNDA:9,orphan\n" +
+		"BRDA:2,0,0,5\nBRDA:3,0,0,2\nBRDA:6,0,1,-\n" +
+		"DA:1,3\nDA:2,3\nDA:3,1\nDA:4,0\nDA:5,0\nDA:6,0\nDA:7,0\nDA:8,2\nDA:9,3\n" +
+		"end_of_record\n"
+	records, _ := ParseRecords(in)
+	filtered, err := ApplyExclusions(records, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "SF:" + src + "\n" +
+		"FN:1,covered\n" +
+		"FNDA:3,covered\nFNDA:9,orphan\n" +
+		"FNF:2\nFNH:2\n" +
+		"BRDA:3,0,0,2\n" +
+		"BRF:1\nBRH:1\n" +
+		"DA:1,3\nDA:3,1\nDA:8,2\nDA:9,3\n" +
+		"LF:4\nLH:4\n" +
+		"end_of_record\n"
+	if got := Emit(filtered); got != want {
+		t.Fatalf("mismatch:\n got: %q\nwant: %q", got, want)
+	}
+	// Input records are never mutated.
+	if records[0].Rec.DA["2"] != 3 {
+		t.Fatalf("input mutated: %v", records[0].Rec.DA)
+	}
+}
+
+func TestApplyExclusionsErrors(t *testing.T) {
+	dir := t.TempDir()
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"unclosed START", "a\n// LCOV_EXCL_START\nb\n", "without closing"},
+		{"nested START",
+			"// LCOV_EXCL_START\na\n// LCOV_EXCL_START\nb\n// LCOV_EXCL_STOP\n// LCOV_EXCL_STOP\n",
+			"nested"},
+		{"stray STOP", "a\n// LCOV_EXCL_STOP\n", "without"},
+		{"START and STOP on one line", "// LCOV_EXCL_START LCOV_EXCL_STOP\n", "same line"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := writeSource(t, dir, "bad.rs", tc.body)
+			records, _ := ParseRecords("SF:" + src + "\nDA:1,0\nend_of_record\n")
+			_, err := ApplyExclusions(records, dir)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+	t.Run("missing file fails closed", func(t *testing.T) {
+		records, _ := ParseRecords("SF:" + filepath.Join(dir, "gone.rs") + "\nDA:1,0\nend_of_record\n")
+		if _, err := ApplyExclusions(records, dir); err == nil {
+			t.Fatal("expected error for unreadable source")
+		}
+	})
+}
+
+func TestApplyExclusionsResolvesRelativeSF(t *testing.T) {
+	dir := t.TempDir()
+	writeSource(t, dir, "sub/f.rs", "alive();\ndead(); // LCOV_EXCL_LINE\n")
+	records, _ := ParseRecords("SF:sub/f.rs\nDA:1,1\nDA:2,0\nend_of_record\n")
+	filtered, err := ApplyExclusions(records, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := Emit(filtered), "SF:sub/f.rs\nDA:1,1\nLF:1\nLH:1\nend_of_record\n"; got != want {
+		t.Fatalf("mismatch:\n got: %q\nwant: %q", got, want)
 	}
 }

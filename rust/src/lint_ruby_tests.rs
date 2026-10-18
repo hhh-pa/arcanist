@@ -131,6 +131,166 @@ fn skips_lines_with_broken_positions() {
     assert!(parse_output("a.rb", "\n").is_empty());
 }
 
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-lint-ruby-tests-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+#[cfg(unix)]
+fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) {}
+
+fn option_ctx(root: &Path) -> OptionContext<'_> {
+    OptionContext { project_root: root }
+}
+
+fn set_bin(linter: &mut RubyLinter, ctx: &OptionContext, tool: &Path) {
+    linter
+        .set_option(
+            "bin",
+            &serde_json::json!(tool.to_string_lossy().into_owned()),
+            ctx,
+        )
+        .unwrap();
+}
+
+#[test]
+fn default_flags_are_empty() {
+    assert!(default_flags().is_empty());
+}
+
+#[test]
+fn set_option_delegates_bin_flags_and_version() {
+    let tmp = TempDir::new("tool-opts");
+    let tool = tmp.path().join("fake-ruby");
+    std::fs::write(&tool, b"#!/bin/sh\nexit 0\n").unwrap();
+    make_executable(&tool);
+    let ctx = option_ctx(tmp.path());
+    let mut linter = RubyLinter::new();
+    set_bin(&mut linter, &ctx, &tool);
+    linter
+        .set_option("flags", &serde_json::json!(["--extra"]), &ctx)
+        .unwrap();
+    linter
+        .set_option("version", &serde_json::json!(">= 1.0"), &ctx)
+        .unwrap();
+    assert!(
+        linter
+            .set_option("bogus", &serde_json::json!(1), &ctx)
+            .is_err()
+    );
+}
+
+#[test]
+fn unconfigured_runs_use_the_ambient_path() {
+    // Whatever the ambient `PATH` holds decides: with no `ruby` the
+    // linter stays silent, with one it runs it. Only the lookup runs.
+    let linter = RubyLinter::new();
+    let _ = linter.lint_bytes("a.rb", b"x = 1\n");
+    let _ = binary_on_path(BINARY);
+}
+
+#[test]
+#[cfg(unix)]
+fn lint_bytes_runs_configured_tool_and_parses_stderr() {
+    let tmp = TempDir::new("run");
+    let tool = write_script(
+        tmp.path(),
+        "fake-ruby",
+        "#!/bin/sh\necho 'target.rb:2: syntax error, oops' >&2\nexit 1\n",
+    );
+    let ctx = option_ctx(tmp.path());
+    let mut linter = RubyLinter::new();
+    set_bin(&mut linter, &ctx, &tool);
+    let messages = linter.lint_bytes("a.rb", b"x = 1\n");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].code, "RUBY");
+    assert_eq!(messages[0].severity, "error");
+}
+
+#[test]
+#[cfg(unix)]
+fn version_requirement_gates_linting() {
+    let tmp = TempDir::new("version");
+    let ctx = option_ctx(tmp.path());
+    let tool = write_script(tmp.path(), "fake-ruby", "#!/bin/sh\necho junk\n");
+    let mut linter = RubyLinter::new();
+    set_bin(&mut linter, &ctx, &tool);
+    linter
+        .set_option("version", &serde_json::json!(">= 1.0"), &ctx)
+        .unwrap();
+    assert!(linter.lint_bytes("a.rb", b"x = 1\n").is_empty());
+    let tool = write_script(
+        tmp.path(),
+        "fake-ruby-new",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'ruby 3.2.2'; else echo 'target.rb:2: syntax error, oops' >&2; fi\n",
+    );
+    let mut linter = RubyLinter::new();
+    set_bin(&mut linter, &ctx, &tool);
+    linter
+        .set_option("version", &serde_json::json!(">= 1.0"), &ctx)
+        .unwrap();
+    assert_eq!(linter.lint_bytes("a.rb", b"x = 1\n").len(), 1);
+}
+
+#[test]
+#[cfg(unix)]
+fn custom_severity_setters_recolor_tool_output() {
+    use std::collections::HashMap;
+    let tmp = TempDir::new("severity");
+    let tool = write_script(
+        tmp.path(),
+        "fake-ruby",
+        "#!/bin/sh\necho 'target.rb:3: boom, with detail' >&2\n",
+    );
+    let ctx = option_ctx(tmp.path());
+    let mut linter = RubyLinter::new();
+    set_bin(&mut linter, &ctx, &tool);
+    let mut map = HashMap::new();
+    map.insert("boom".to_string(), "warning".to_string());
+    linter.set_custom_severity_map(&map);
+    linter.set_custom_severity_rules(&[("boom".to_string(), "warning".to_string())]);
+    let messages = linter.lint_bytes("a.rb", b"x = 1\n");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].severity, "warning");
+}
+
 #[test]
 fn custom_severities_apply_by_message_head_like_php() {
     use std::collections::HashMap;

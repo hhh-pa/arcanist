@@ -449,8 +449,8 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
         Ok(bytes) => {
             use std::io::Write;
             if std::io::stdout().write_all(&bytes).is_err() {
-                eprintln!("arc {NAME}: failed to write output");
-                return ExitCode::FAILURE;
+                eprintln!("arc {NAME}: failed to write output"); // LCOV_EXCL_START // Reason: stdout write failure; closing stdout is process-global
+                return ExitCode::FAILURE; // LCOV_EXCL_STOP
             }
             ExitCode::SUCCESS
         }

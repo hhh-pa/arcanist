@@ -184,6 +184,79 @@ fn builds_created_json() {
 }
 
 #[test]
+fn parses_created_ids_beyond_i64_and_strings() {
+    let task = parse_created(&serde_json::json!({
+        "id": 18446744073709551615u64,
+        "title": "Big",
+        "uri": "https://example.test/T1",
+    }))
+    .unwrap();
+    assert_eq!(task.id, "18446744073709551615");
+    let task = parse_created(&serde_json::json!({
+        "id": "77",
+        "title": "Str",
+        "uri": "https://example.test/T77",
+    }))
+    .unwrap();
+    assert_eq!(task.id, "77");
+}
+
+#[test]
+fn error_text_helpers_render_verbatim() {
+    assert_eq!(
+        conduit_error_text(conduit::Error::Transport("down".to_string())),
+        "down"
+    );
+    assert_eq!(
+        missing_task_id(),
+        "conduit maniphest.createtask response has no id"
+    );
+    let parse = serde_json::from_str::<serde_json::Value>("{bad").unwrap_err();
+    assert!(json_encode_error(parse).starts_with("failed to encode JSON: "),);
+}
+
+/// Serve one canned Conduit response on loopback, returning the base URI.
+/// The handler reads the request headers, then answers `response`.
+fn serve_one(response: &str) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let uri = format!("http://{}/", listener.local_addr().unwrap());
+    let body = response.to_string();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let mut seen = Vec::new();
+        loop {
+            let n = stream.read(&mut buf).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            seen.extend_from_slice(&buf[..n]);
+            if seen.windows(4).any(|w| w == b"\r\n\r\n") || seen.len() > 65536 {
+                break;
+            }
+        }
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(reply.as_bytes()).unwrap();
+        stream.flush().unwrap();
+    });
+    (uri, handle)
+}
+
+#[test]
+fn cc_resolution_ignores_scalar_results() {
+    let (uri, handle) = serve_one(r#"{"error_code":null,"error_info":null,"result":"scalar"}"#);
+    let client = conduit::Client::new(&uri, "t").unwrap();
+    let phids = resolve_cc_phids(&client, &["alice".to_string()]).unwrap();
+    assert!(phids.is_empty());
+    handle.join().unwrap();
+}
+
+#[test]
 fn r4_rbd4_parse_error_has_no_dump() {
     // `todo` is a subprocess workflow: argument errors render `Usage
     // Exception:` (exit 1) with no usage dump.
@@ -258,4 +331,64 @@ fn b23_todo_help_matches_generated_format() {
     assert!(!text.contains("--json"), "{text}");
     let ansi = usage_text(true);
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+}
+
+#[test]
+fn run_reports_auth_failure_for_unreachable_uri() {
+    // T1170 coverage: `run()` with valid args reaches the classic
+    // startup gate. The URI is unroutable (localhost discard port),
+    // so `authed_client_for` fails deterministically on every
+    // machine: no stored credential matches that host key (and even
+    // an ambient `ARC_CONDUIT_TOKEN` only leads to a refused
+    // `user.whoami`). No writes, no external network, and the
+    // outcome (a non-zero envelope) is HOME-independent.
+    let code = run(&args(&[
+        "file",
+        "the",
+        "report",
+        "--conduit-uri",
+        "http://127.0.0.1:9/",
+    ]));
+    assert_ne!(code, std::process::ExitCode::SUCCESS);
+}
+// -( T1170 wave 6h: helper-arm coverage )--------------------------------------
+
+fn serve_one_addr(uri: &str) -> String {
+    uri.trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+#[test]
+fn serve_one_answers_connections_that_close_early() {
+    // A client that half-closes without sending headers reads EOF
+    // (`n == 0`): the handler still answers instead of hanging.
+    use std::io::Read as _;
+    let (uri, handle) = serve_one("{}");
+    let stream = std::net::TcpStream::connect(serve_one_addr(&uri)).unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut reply = Vec::new();
+    let mut stream = stream;
+    stream.read_to_end(&mut reply).unwrap();
+    handle.join().unwrap();
+    assert!(reply.windows(2).any(|w| w == b"{}"));
+}
+
+#[test]
+fn serve_one_tolerates_partially_sent_headers() {
+    // Headers arriving in two chunks take the keep-reading edge: the
+    // first read holds an incomplete head, the second completes it.
+    use std::io::{Read as _, Write as _};
+    let (uri, handle) = serve_one("{}");
+    let mut stream = std::net::TcpStream::connect(serve_one_addr(&uri)).unwrap();
+    stream.write_all(b"P").unwrap();
+    stream.flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    stream
+        .write_all(b"OST / HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+    let mut reply = Vec::new();
+    stream.read_to_end(&mut reply).unwrap();
+    handle.join().unwrap();
+    assert!(reply.windows(2).any(|w| w == b"{}"));
 }

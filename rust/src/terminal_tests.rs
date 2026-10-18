@@ -601,3 +601,105 @@ fn detects_process_settings() {
         "x"
     );
 }
+
+// -( T1170 COV5: close terminal.rs )----------------------------------------------
+
+#[test]
+fn pht_int_conversions_render_numbers() {
+    assert_eq!(terminal::pht("%d", &[PhtArg::Int(-7)]), "-7");
+    assert_eq!(terminal::pht("%d", &[PhtArg::Number(7, 2)]), "7");
+    assert_eq!(terminal::pht("%d", &[PhtArg::Text("42x")]), "42");
+    assert_eq!(terminal::pht("%d", &[PhtArg::Text("abc")]), "0");
+}
+
+#[test]
+fn pht_rejects_bad_conversions() {
+    assert_eq!(
+        terminal::pht("100%x done", &[]),
+        "[Invalid Translation!] 100%x done"
+    );
+}
+
+#[test]
+fn pht_nested_variants_select_and_reject() {
+    const PATTERN: &str = "Analyzing %s file(s) with %s subprocess(es)...";
+    assert_eq!(
+        terminal::pht(PATTERN, &[PhtArg::Int(1), PhtArg::Int(1)]),
+        "Analyzing one file with a single subprocess..."
+    );
+    assert_eq!(
+        terminal::pht(PATTERN, &[PhtArg::Int(2), PhtArg::Int(3)]),
+        "Analyzing 2 files with 3 subprocesses..."
+    );
+    let bad_first = terminal::pht(PATTERN, &[PhtArg::Text("x"), PhtArg::Int(2)]);
+    assert!(bad_first.contains("[Invalid Translation!]"), "{bad_first}");
+    assert!(bad_first.contains("argument 1"), "{bad_first}");
+    let bad_second = terminal::pht(PATTERN, &[PhtArg::Int(1), PhtArg::Text("y")]);
+    assert!(
+        bad_second.contains("[Invalid Translation!]"),
+        "{bad_second}"
+    );
+    assert!(bad_second.contains("argument 2"), "{bad_second}");
+}
+
+#[test]
+fn format_number_groups_and_signs() {
+    assert_eq!(super::format_number(-1_234_567, 2), "-1,234,567.00");
+    assert_eq!(super::format_number(1_234_567, 0), "1,234,567");
+    assert_eq!(super::format_number(0, 3), "0.000");
+}
+
+#[test]
+fn combine_glyphs_handles_empty_and_combiners() {
+    assert!(super::combine_glyphs("").is_empty());
+    assert_eq!(super::combine_glyphs("\u{301}ab"), [" \u{301}", "a", "b"]);
+    assert_eq!(super::combine_glyphs("e\u{301}x"), ["e\u{301}", "x"]);
+}
+
+#[test]
+fn console_width_skips_ansi_and_counts_wide() {
+    assert_eq!(super::console_strlen("\x1b[1mab\x1b[0m"), 2);
+    assert_eq!(super::console_strlen("\x1b[31X"), 5);
+    assert_eq!(super::console_strlen("e\u{301}"), 1);
+    assert_eq!(super::console_strlen("\u{1100}"), 2);
+    assert_eq!(super::console_strlen("\u{1160}"), 1);
+    assert_eq!(super::console_strlen("\u{2329}"), 2);
+    assert_eq!(super::console_strlen("\u{4e00}ab"), 4);
+    // NUL glyphs contribute no width.
+    assert_eq!(super::console_strlen("\u{0}ab"), 2);
+}
+
+#[test]
+fn truncate_glyphs_handles_multibyte_and_tiny_max() {
+    assert_eq!(super::truncate_glyphs("éééé", 5), "éééé");
+    assert_eq!(super::truncate_glyphs("abcdef", 1), "…");
+    assert_eq!(super::truncate_glyphs("abcdef", 0), "…");
+}
+
+// -( T1170 coverage wave 6g band G, batch E )----------------------------------
+
+#[test]
+fn cov6g_question_conversion_renders_badge() {
+    for ansi in [false, true] {
+        let text = terminal::tsprintf_ansi("%?", &[TVal::Text("hi")], ansi)
+            .unwrap()
+            .to_string();
+        assert!(text.contains("hi"), "{text:?} (ansi={ansi})");
+    }
+}
+
+#[test]
+fn cov6g_php_truthy_matrix() {
+    assert!(!super::php_truthy(None));
+    assert!(!super::php_truthy(Some("")));
+    assert!(!super::php_truthy(Some("0")));
+    assert!(super::php_truthy(Some("1")));
+    assert!(super::php_truthy(Some("xterm")));
+}
+
+#[test]
+fn cov6g_tput_columns_is_stable() {
+    // Whatever the environment resolves (success, failure, or odd
+    // output), two back-to-back probes agree.
+    assert_eq!(super::tput_columns(), super::tput_columns());
+}

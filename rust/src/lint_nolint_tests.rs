@@ -24,3 +24,8 @@ fn linter_is_always_silent() {
     assert!(linter.lint_bytes("f.txt", b"plain").is_empty());
     assert!(linter.lint_bytes("f.txt", b"// @nolint\n").is_empty());
 }
+
+#[test]
+fn severities_are_not_customizable() {
+    assert!(!NoLintLinter::new().can_customize_severities());
+}

@@ -53,6 +53,21 @@ fn parses_browser_config_values() {
         Some(vec!["ok".to_string()])
     );
     assert_eq!(configured_argv(&serde_json::json!([[1]])), None);
+    // Falsy members of a truthy list still cast (`false` and `null`
+    // spell the empty string, like PHP).
+    assert_eq!(
+        configured_argv(&serde_json::json!([false])),
+        Some(vec![String::new()])
+    );
+    assert_eq!(
+        configured_argv(&serde_json::json!([null])),
+        Some(vec![String::new()])
+    );
+    // A truthy object maps its values in order.
+    assert_eq!(
+        configured_argv(&serde_json::json!({"a": "x"})),
+        Some(vec!["x".to_string()])
+    );
 }
 
 #[test]
@@ -111,6 +126,35 @@ fn null_browser() -> Vec<String> {
 fn opens_uris_with_a_configured_browser() {
     let browser = null_browser();
     open_uris_in_browser(&["http://example.test/P1".to_string()], Some(&browser)).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn path_scan_finds_the_posix_shell() {
+    // `sh` ships on every unix test machine; the scan finds it
+    // executable without spawning anything.
+    assert!(binary_exists("sh"));
+}
+
+#[test]
+#[cfg(unix)]
+fn reports_browsers_that_exit_nonzero() {
+    // `false` spawns fine but exits 1, so the open fails with PHP's
+    // error (no network: the URI is just an ignored argument).
+    let err = open_uris_in_browser(
+        &["http://example.test/P1".to_string()],
+        Some(&["false".to_string()]),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("Failed to open URI \"http://example.test/P1\" in browser"),
+        "{err}"
+    );
+    assert!(err.contains("false"), "{err}");
+    assert!(
+        err.contains("Check your \"browser\" config option."),
+        "{err}"
+    );
 }
 
 #[test]

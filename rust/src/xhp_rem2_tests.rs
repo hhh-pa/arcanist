@@ -547,3 +547,217 @@ fn list_assignment_flags_trailing_commas() {
     assert_eq!(hits.len(), 1);
     assert!(for_rule("<?php [$a, $b] = $c;\n", 77).is_empty());
 }
+
+// -( T1170 COV5: close xhp_rem2.rs )---------------------------------------------
+
+fn check_canned(json: &str) -> Vec<(u32, usize, usize, String)> {
+    let tree = ast::tree_from_canned(json).expect("hand-written JSON must parse");
+    let options = ast::XhpOptions::default();
+    let ctx = ast::RuleCtx {
+        tree: &tree,
+        path: "test.php",
+        options: &options,
+    };
+    let mut out = Vec::new();
+    super::apply(&ctx, &mut out);
+    out.iter()
+        .map(|f| {
+            let (line, col) = tree.line_col(f.offset);
+            (f.rule, line, col, f.message.clone())
+        })
+        .collect()
+}
+
+fn for_rule_canned(json: &str, rule: u32) -> Vec<(usize, usize, String)> {
+    check_canned(json)
+        .into_iter()
+        .filter(|(r, _, _, _)| *r == rule)
+        .map(|(_, line, col, message)| (line, col, message))
+        .collect()
+}
+
+#[test]
+fn modifier_scan_skips_brackets_and_stops() {
+    // A non-attribute `]` ends the modifier run.
+    assert!(for_rule("<?php class A {\n$x = [1] public function f() {}\n}\n", 52).is_empty());
+    // Nested brackets unwind first.
+    assert!(
+        for_rule(
+            "<?php class A {\n$x = [[1]] public function f() {}\n}\n",
+            52
+        )
+        .is_empty()
+    );
+    // A statement boundary stops the attribute scan.
+    assert!(
+        for_rule(
+            "<?php class A {\npublic $x = 1; 2] public function f() {}\n}\n",
+            52
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn attribute_scan_past_start_returns_none() {
+    // No trivia, brackets, or stops before the `]`: the scan runs
+    // off the start of the token stream.
+    let hits = for_rule_canned(
+        r#"{"source": "C]final class A {}",
+          "tokens": [["T_STRING", "C", 0], ["]", "]", 1],
+            ["T_WHITESPACE", " ", 2], ["T_FINAL", "final", 3],
+            ["T_WHITESPACE", " ", 8], ["T_CLASS", "class", 9],
+            ["T_WHITESPACE", " ", 14], ["T_STRING", "A", 15],
+            ["T_WHITESPACE", " ", 16], ["{", "{", 17], ["}", "}", 18]]}"#,
+        55,
+    );
+    assert!(hits.is_empty());
+}
+
+#[test]
+fn duplicate_case_handles_colon_less_arms() {
+    // The first arm ends at the next arm.
+    let hits = for_rule("<?php switch ($x) {\ncase 1 case 1:\nbreak;\n}\n", 50);
+    assert_eq!(hits.len(), 1);
+    // The last arm ends at the switch body end.
+    let hits = for_rule("<?php switch ($x) {\ncase 1:\nbreak;\ncase 1 }\n", 50);
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn properties_need_brace_bodies() {
+    assert!(for_rule("<?php class A;\n", 52).is_empty());
+    assert!(for_rule("<?php class A;\n", 72).is_empty());
+}
+
+#[test]
+fn unclosed_attribute_abandons_property() {
+    assert!(for_rule("<?php class A {\n#[Foo public $x;\n}\n", 52).is_empty());
+}
+
+#[test]
+fn methods_outside_final_classes_are_ignored() {
+    assert!(
+        for_rule(
+            "<?php final class A {}\nclass B {\nfunction g() {}\n}\n",
+            55
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn anonymous_classes_have_no_name() {
+    assert!(
+        for_rule(
+            "<?php $x = new class {\nfunction f() { return 1; }\n};\n",
+            57
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn qualified_self_names_walk_back() {
+    assert!(
+        for_rule(
+            "<?php class Foo {\nfunction f() { return Foo\\Bar::baz(); }\n}\n",
+            57
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn arrow_without_parens_has_no_lparen() {
+    assert!(for_rule("<?php $f = fn => 42;\n", 60).is_empty());
+}
+
+#[test]
+fn anonymous_method_closures_are_skipped() {
+    assert!(for_rule("<?php class A {\npublic $f = function() {};\n}\n", 63).is_empty());
+}
+
+#[test]
+fn useless_override_rejects_partial_forwards() {
+    for body in [
+        "{ return; }",
+        "{ parent; }",
+        "{ parent foo; }",
+        "{ parent::; }",
+        "{ parent::f; }",
+        "{ parent::f x; }",
+        "{ parent::f(; }",
+        "{ parent::f() + 1; }",
+        "{ parent::f($x + 1); }",
+    ] {
+        let src = format!("<?php class A {{\nfunction f($x) {body}\n}}\n");
+        assert!(for_rule(&src, 63).is_empty(), "{body}");
+    }
+}
+
+#[test]
+fn parent_access_skips_other_classes() {
+    let hits = for_rule(
+        "<?php class A {}\nclass B {\nfunction f() { parent::g(); }\n}\n",
+        64,
+    );
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn tostring_without_body_is_skipped() {
+    assert!(for_rule("<?php interface I {\nfunction __toString();\n}\n", 67).is_empty());
+}
+
+#[test]
+fn instanceof_at_end_is_skipped() {
+    assert!(for_rule("<?php $x instanceof", 69).is_empty());
+}
+
+#[test]
+fn instanceof_leading_scalar_flags() {
+    let hits = for_rule_canned(
+        r#"{"source": "5 instanceof X;",
+          "tokens": [["T_LNUMBER", "5", 0], ["T_WHITESPACE", " ", 1],
+            ["T_INSTANCEOF", "instanceof", 2], ["T_WHITESPACE", " ", 12],
+            ["T_STRING", "X", 13], [";", ";", 14]]}"#,
+        69,
+    );
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].2,
+        "`instanceof` expects an object instance, constant given."
+    );
+}
+
+#[test]
+fn instanceof_absolute_names_walk_back() {
+    let hits = for_rule("<?php \\FOO instanceof X;\n", 69);
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn array_hint_without_semantic_default_records_nothing() {
+    // Trivia-only and missing defaults record no range at all.
+    assert!(for_rule("<?php function f(array $x = /*c*/) {}\n", 70).is_empty());
+    assert!(for_rule("<?php function f(array $x = ) {}\n", 70).is_empty());
+}
+
+#[test]
+fn list_scan_skips_trivia_before_close() {
+    assert!(for_rule("<?php list($a, $b ) = $c;\n", 77).is_empty());
+}
+
+fn t1170_tree(source: &str) -> ast::Tree {
+    let canned = ast::tokens_to_canned(source, &ast::tokenize(source));
+    ast::tree_from_canned(&canned).expect("canned output must parse")
+}
+
+#[test]
+fn t1170_empty_default_range_is_not_an_array() {
+    // T1170 band J: a default range with no tokens cannot be an
+    // array default.
+    let tree = t1170_tree("<?php 1\n");
+    assert!(!super::default_is_array(&tree, (3, 1)));
+}

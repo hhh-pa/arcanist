@@ -361,3 +361,108 @@ fn core10_force_token_overrides_file() {
     );
     assert_eq!(resolve_token(None, None), None);
 }
+
+// -( T1170 wave 5d )-----------------------------------------------------------
+
+#[test]
+fn core4_missing_custom_arcrc_fails_client() {
+    let (dir, mut shadow) = r6_shadowed("core4arcrc");
+    shadow.arcrc_file = Some(dir.join("no-such-arcrc.json"));
+    let err = client_for_tokenless_with(None, &dir, None, &shadow).unwrap_err();
+    assert!(err.contains("arcrc"), "{err}");
+}
+
+#[test]
+fn core8_relative_cabundle_resolves_against_project() {
+    let (dir, mut shadow) = r6_shadowed("core8rel");
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::write(
+        dir.join(".arcconfig"),
+        r#"{"phabricator.uri": "https://h.test/"}"#,
+    )
+    .unwrap();
+    shadow.runtime.insert(
+        "https.cabundle".to_string(),
+        serde_json::json!("rel/ca.pem"),
+    );
+    let tls = tls_config_for(&dir, None, &shadow);
+    assert_eq!(tls.cabundle, Some(dir.join("rel/ca.pem")));
+    // Without a project file the linted directory is the root.
+    let (plain, mut shadow) = r6_shadowed("core8plain");
+    shadow.runtime.insert(
+        "https.cabundle".to_string(),
+        serde_json::json!("rel/ca.pem"),
+    );
+    let tls = tls_config_for(&plain, None, &shadow);
+    assert_eq!(tls.cabundle, Some(plain.join("rel/ca.pem")));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&plain).ok();
+}
+
+#[test]
+fn core4_authed_client_maps_setup_failures() {
+    // A URI that fails client construction (not URI discovery)
+    // classifies as a generic exception, not a usage error.
+    let (dir, shadow) = r6_shadowed("core4setup");
+    let err = authed_client_for(Some("::::"), &dir, None, &shadow, "test").unwrap_err();
+    assert!(matches!(err.kind, crate::conduit::EnvelopeKind::Exception));
+    assert!(
+        err.message.contains("must include a valid host"),
+        "{}",
+        err.message
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Serve one canned Conduit envelope, then close.
+fn serve_once(body: String) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8(head).unwrap();
+        let len: usize = head
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+            })
+            .unwrap_or(0);
+        let mut raw = vec![0u8; len];
+        stream.read_exact(&mut raw).unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    base
+}
+
+#[test]
+fn core9_authenticate_maps_unknown_failures_raw() {
+    // A `conduit.connect` failure outside the three credential codes
+    // propagates raw under the generic arm (no install guidance).
+    let base = serve_once(
+        r#"{"result": null, "error_code": "ERR-OTHER", "error_info": "boom"}"#.to_string(),
+    );
+    let mut client = crate::conduit::Client::new(&base, "").unwrap();
+    let creds = Credentials {
+        token: None,
+        user: Some("u".to_string()),
+        cert: Some("c".to_string()),
+    };
+    let err = authenticate(&mut client, &creds, "test").unwrap_err();
+    assert!(matches!(err.kind, crate::conduit::EnvelopeKind::Exception));
+    assert!(err.message.contains("ERR-OTHER"), "{}", err.message);
+}

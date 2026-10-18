@@ -108,9 +108,9 @@ fn binary_exists(name: &str) -> bool {
                 return true;
             }
             cfg!(windows)
-                && ["exe", "cmd", "bat", "com"]
+                && ["exe", "cmd", "bat", "com"] // LCOV_EXCL_START // Reason: windows-only extension probe; cfg!(windows) is false on ubuntu CI
                     .iter()
-                    .any(|ext| is_executable_file(&dir.join(format!("{name}.{ext}"))))
+                    .any(|ext| is_executable_file(&dir.join(format!("{name}.{ext}")))) // LCOV_EXCL_STOP
         })
     })
 }

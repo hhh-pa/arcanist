@@ -128,3 +128,155 @@ fn tolerates_crlf_line_endings() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].line, 2);
 }
+
+#[cfg(unix)]
+fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+fn option_ctx(root: &Path) -> OptionContext<'_> {
+    OptionContext { project_root: root }
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) {}
+
+#[test]
+fn trailing_dot_has_no_extension() {
+    assert!(!is_supported("a."));
+    assert_eq!(extension_of("a."), None);
+    assert_eq!(staged_name("Makefile"), "src.php");
+    assert_eq!(staged_name("a.php"), "src.php");
+}
+
+#[test]
+fn empty_path_segments_are_skipped() {
+    assert!(binary_in(std::ffi::OsStr::new("")).is_none());
+}
+
+#[test]
+fn malformed_diagnostics_are_skipped() {
+    for stderr in [
+        // Empty error type.
+        " error: boom in /tmp/a.php on line 3\n",
+        // Empty message after the marker.
+        "Parse error: \n",
+        // Non-numeric line number.
+        "PHP Parse error:  oops in /tmp/a.php on line abc\n",
+        // Missing line digits.
+        "PHP Parse error:  oops in /tmp/a.php on line \n",
+        // Empty file after the greedy message split.
+        "Parse error: x in  on line 5\n",
+    ] {
+        assert!(
+            parse_output("a.php", 255, "", stderr).is_empty(),
+            "{stderr:?}"
+        );
+    }
+}
+
+#[test]
+fn severities_are_not_customizable() {
+    assert!(!PhpLinter::new().can_customize_severities());
+}
+
+#[test]
+fn set_option_delegates_bin_flags_and_version() {
+    let tmp = TempDir::new("tool-opts");
+    let tool = tmp.path().join("fake-php");
+    std::fs::write(&tool, b"#!/bin/sh\nexit 0\n").unwrap();
+    make_executable(&tool);
+    let ctx = option_ctx(tmp.path());
+    let mut linter = PhpLinter::new();
+    linter
+        .set_option(
+            "bin",
+            &serde_json::json!(tool.to_string_lossy().into_owned()),
+            &ctx,
+        )
+        .unwrap();
+    linter
+        .set_option("flags", &serde_json::json!(["-l"]), &ctx)
+        .unwrap();
+    assert!(
+        linter
+            .set_option("flags", &serde_json::json!("-l"), &ctx)
+            .is_err()
+    );
+    linter
+        .set_option("version", &serde_json::json!(">= 8.0"), &ctx)
+        .unwrap();
+    assert!(
+        linter
+            .set_option("bogus", &serde_json::json!(true), &ctx)
+            .is_err()
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn lint_with_binary_runs_the_tool() {
+    let tmp = TempDir::new("run");
+    let tool = write_script(
+        tmp.path(),
+        "fake-php",
+        "#!/bin/sh\necho 'PHP Parse error:  oops in /tmp/a.php on line 2'\n",
+    );
+    let messages = lint_with_binary("a.php", b"<?php echo 1;\n", Some(&tool));
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].code, "PHP1");
+}
+
+#[test]
+#[cfg(unix)]
+fn version_requirement_gates_linting() {
+    let tmp = TempDir::new("version");
+    let ctx = option_ctx(tmp.path());
+    // The version probe runs `php --run 'echo phpversion();'`: a tool
+    // failing that probe stays inactive.
+    let tool = write_script(
+        tmp.path(),
+        "fake-php",
+        "#!/bin/sh\nif [ \"$1\" = \"--run\" ]; then exit 1; else echo 'clean'; fi\n",
+    );
+    let mut linter = PhpLinter::new();
+    linter
+        .set_option(
+            "bin",
+            &serde_json::json!(tool.to_string_lossy().into_owned()),
+            &ctx,
+        )
+        .unwrap();
+    linter
+        .set_option("version", &serde_json::json!(">= 8.0"), &ctx)
+        .unwrap();
+    assert!(linter.lint_bytes("a.php", b"<?php echo 1;\n").is_empty());
+    // A tool answering the probe proceeds to lint.
+    let tool = write_script(
+        tmp.path(),
+        "fake-php-new",
+        "#!/bin/sh\nif [ \"$1\" = \"--run\" ]; then echo '8.1.0'; else echo 'PHP Parse error:  oops in /tmp/a.php on line 2'; fi\n",
+    );
+    let mut linter = PhpLinter::new();
+    linter
+        .set_option(
+            "bin",
+            &serde_json::json!(tool.to_string_lossy().into_owned()),
+            &ctx,
+        )
+        .unwrap();
+    linter
+        .set_option("version", &serde_json::json!(">= 8.1.0"), &ctx)
+        .unwrap();
+    assert_eq!(linter.lint_bytes("a.php", b"<?php echo 1;\n").len(), 1);
+}

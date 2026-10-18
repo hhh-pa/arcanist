@@ -246,7 +246,7 @@ fn r4_rbd4_parse_error_has_no_dump() {
     // `USAGE EXCEPTION` (exit 1) with no usage dump.
     match execute(&std::env::temp_dir(), &args(&["--bogus"])) {
         Err(message) => assert!(!message.contains("usage:"), "{message}"),
-        _ => panic!("expected parse error"),
+        _ => panic!("expected parse error"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the parse error always matches
     }
     assert_eq!(
         run_in(&std::env::temp_dir(), &args(&["--bogus"])),
@@ -295,4 +295,175 @@ fn r10_branches_help_matches_generated_format() {
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
     // `run()` prints `usage()` (same text, ambient ANSI mode).
     assert!(usage().contains("BRANCHES WORKFLOW"), "{}", usage());
+}
+
+// -( T1170 wave 5d )-----------------------------------------------------------
+
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-branches-tests-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn init_repo(tag: &str) -> TempDir {
+    let tmp = TempDir::new(tag);
+    git(tmp.path(), &["init", "-q", "-b", "master"]);
+    git(tmp.path(), &["config", "user.email", "t@t"]);
+    git(tmp.path(), &["config", "user.name", "t"]);
+    git(tmp.path(), &["config", "commit.gpgsign", "false"]);
+    std::fs::write(tmp.path().join("f.txt"), "one\n").unwrap();
+    git(tmp.path(), &["add", "f.txt"]);
+    git(tmp.path(), &["commit", "-qm", "add f"]);
+    tmp
+}
+
+#[test]
+fn list_rejects_directories_outside_repos() {
+    let dir = TempDir::new("outside");
+    assert_eq!(
+        list(dir.path(), false).unwrap_err(),
+        "not inside a git repository"
+    );
+}
+
+#[test]
+fn list_propagates_git_query_failures() {
+    // A corrupt `packed-refs` keeps `rev-parse` green (the work-tree
+    // gate passes) while `for-each-ref` fails, surfacing the git
+    // error through `list`.
+    let repo = init_repo("corrupt-refs");
+    git(repo.path(), &["pack-refs", "--all"]);
+    let packed = repo.path().join(".git").join("packed-refs");
+    assert!(packed.is_file());
+    std::fs::write(&packed, "GARBAGE NOT A REF\n").unwrap();
+    assert!(git::is_inside_work_tree(repo.path()));
+    let err = list(repo.path(), false).unwrap_err();
+    assert!(err.contains("packed-refs"), "{err}");
+}
+
+#[test]
+fn detect_vcs_covers_hg() {
+    let dir = TempDir::new("vcs");
+    std::fs::create_dir(dir.path().join(".hg")).unwrap();
+    assert_eq!(detect_vcs(dir.path()), Some("hg"));
+    let empty = TempDir::new("vcs-empty");
+    assert_eq!(detect_vcs(empty.path()), None);
+}
+
+#[test]
+fn execute_reports_conduit_setup_failures() {
+    // The explicit URI wins over ambient discovery, and its parse
+    // failure surfaces without any network traffic.
+    let repo = init_repo("setup-fail");
+    let err = execute(repo.path(), &args(&["--conduit-uri", "::::", "--"])).unwrap_err();
+    assert!(err.contains("must include a valid host"), "{err}");
+}
+
+#[test]
+fn execute_with_client_covers_help_and_usage_errors() {
+    let dir = TempDir::new("exec");
+    // `--help` before `--` parses without TTY input.
+    let text = execute_with_client(dir.path(), &args(&["--help", "--"]), None, None).unwrap();
+    assert!(text.contains("BRANCHES WORKFLOW"), "{text}");
+    // Toolset parse errors carry no dump.
+    let err = execute_with_client(dir.path(), &args(&["--bogus"]), None, None).unwrap_err();
+    assert!(err.contains("unrecognized"), "{err}");
+    assert!(!err.contains("BRANCHES WORKFLOW"), "{err}");
+}
+
+#[test]
+fn execute_core_hg_json_reaches_marker_list() {
+    // Under Mercurial `--json` renders through the marker list. The
+    // system `hg` backend is unassertable (presence varies), so both
+    // outcomes only pin their shapes.
+    let dir = TempDir::new("hg-json");
+    std::fs::create_dir(dir.path().join(".hg")).unwrap();
+    let options = Options {
+        all: false,
+        json: true,
+        conduit_uri: None,
+    };
+    match execute_core(dir.path(), &options, None, None) {
+        // LCOV_EXCL_START // Reason: Ok arm needs system hg; absent on CI, the Err arm pins here
+        Ok(text) => {
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert!(value.is_array(), "{text}"); // LCOV_EXCL_STOP
+        }
+        Err(message) => assert!(!message.is_empty()),
+    }
+}
+
+#[test]
+fn run_in_reports_query_failures_as_fatal() {
+    // A git query failure is not a usage error, so it escapes into
+    // a fatal (255) instead of the toolset usage arm.
+    let repo = init_repo("fatal");
+    git(repo.path(), &["pack-refs", "--all"]);
+    let packed = repo.path().join(".git").join("packed-refs");
+    std::fs::write(&packed, "GARBAGE NOT A REF\n").unwrap();
+    assert_eq!(
+        run_in(repo.path(), &args(&["--json", "--"])),
+        std::process::ExitCode::from(255)
+    );
+}
+
+// -( T1170 wave 6g batch D )--------------------------------------------------
+
+#[test]
+fn t1170_run_in_without_terminator_is_usage_failure() {
+    // Piped runs (stdin not a TTY) fail argument parsing with
+    // MISSING_TERMINATOR, rendered through `run_in`'s hints arm;
+    // interactive runs reach the outside-repo support gate instead.
+    // Both are toolset usage failures (exit 1 — the auth arm reports
+    // exit 1 too), so the outcome pins without depending on stdin.
+    let dir = TempDir::new("no-terminator");
+    assert_eq!(
+        run_in(dir.path(), &args(&[])),
+        std::process::ExitCode::FAILURE
+    );
+}
+// -( T1170 wave 6h: helper-arm coverage )--------------------------------------
+
+#[test]
+#[should_panic(expected = "failed:")]
+fn git_helper_reports_failing_commands() {
+    // A failing git invocation panics with the command and stderr.
+    let tmp = TempDir::new("w6h-git-fail");
+    git(tmp.path(), &["--bogus-flag-xyz"]);
 }

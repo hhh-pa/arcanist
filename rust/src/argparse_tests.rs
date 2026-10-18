@@ -24,6 +24,14 @@ fn core16_flag_distance_allows_single_insdel_only() {
 }
 
 #[test]
+fn flag_distance_routes_through_match_and_delete_cells() {
+    // Hand-computed on the stripped 3x3 matrix: the interior `b` match
+    // takes the diagonal (replacement wins), and the trailing mismatch
+    // after it deletes (delete wins over insert).
+    assert_eq!(flag_distance("axbyc", "azbwc"), 4);
+}
+
+#[test]
 fn core16_command_corrector_matches_php() {
     // Unique prefixes are accepted as shorthand.
     assert_eq!(
@@ -44,6 +52,22 @@ fn rbd1_flag_corrector_is_strict() {
     );
     // A single replacement costs 10, over the max of 1.
     assert!(correct_flags("xb", &["ab"]).is_empty());
+}
+
+#[test]
+fn correctors_with_no_options_match_nothing() {
+    assert!(correct_commands("ver", &[]).is_empty());
+    assert!(correct_flags("nolint", &[]).is_empty());
+}
+
+#[test]
+fn flag_corrector_keeps_tied_suggestions() {
+    // Two single-deletion candidates tie at the best distance, so both
+    // survive (distance order, then name order).
+    assert_eq!(
+        correct_flags("ac", &["abc", "adc"]),
+        vec!["abc".to_string(), "adc".to_string()]
+    );
 }
 
 #[test]

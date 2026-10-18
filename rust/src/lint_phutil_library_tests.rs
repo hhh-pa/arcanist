@@ -227,6 +227,165 @@ fn unknown_and_noncanonical_uses_report() {
     assert_eq!(message.severity, "error");
 }
 
+fn use_(symbol: &str, use_type: UseType) -> SymbolUse {
+    SymbolUse {
+        symbol: symbol.to_string(),
+        use_type,
+        library: "lib".to_string(),
+        file: "b.php".to_string(),
+        offset: 0,
+    }
+}
+
+#[test]
+fn builtins_and_all_use_types_report() {
+    let builtins = [BuiltinSymbol {
+        symbol: "strlen".to_string(),
+        symbol_type: SymbolType::Function,
+    }];
+    let defs = [
+        def("Widget", SymbolType::Class, "lib", "a.php"),
+        def("Iface", SymbolType::Interface, "lib", "a.php"),
+        def("Thing", SymbolType::Class, "lib", "a.php"),
+    ];
+    let uses = [
+        use_("strlen", UseType::Function),
+        use_("STRLEN", UseType::Function),
+        use_("widget", UseType::Class),
+        use_("iface", UseType::Interface),
+        use_("thing", UseType::ClassOrInterface),
+        use_("nope", UseType::Function),
+    ];
+    let findings = check_unknown_symbols(&uses, &defs, &builtins, "arc", "/arc");
+    assert_eq!(findings.len(), 5);
+    assert_eq!(findings[0].code, "PHL4");
+    assert_eq!(
+        findings[0].description,
+        "Function symbol \"STRLEN\" should be written as \"strlen\"."
+    );
+    assert_eq!(findings[1].code, "PHL4");
+    assert_eq!(
+        findings[1].description,
+        "Class symbol \"widget\" should be written as \"Widget\"."
+    );
+    assert_eq!(findings[2].code, "PHL4");
+    assert_eq!(
+        findings[2].description,
+        "Interface symbol \"iface\" should be written as \"Iface\"."
+    );
+    assert_eq!(findings[3].code, "PHL4");
+    assert_eq!(
+        findings[3].description,
+        "Class or interface symbol \"thing\" should be written as \"Thing\"."
+    );
+    assert_eq!(findings[4].code, "PHL1");
+    assert!(
+        findings[4]
+            .description
+            .starts_with("Use of unknown function symbol \"nope\".")
+    );
+}
+
+#[test]
+fn xml_prologs_are_not_open_tags() {
+    let messages = lint("<?xml version=\"1.0\"?>\n<?php class A {} class B {}\n");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].code, "PHL3");
+}
+
+#[test]
+fn xml_like_tags_with_identifier_tails_open_php() {
+    let messages = lint("<?xmlfoo\nclass A {}\nclass B {}\n");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].code, "PHL3");
+}
+
+#[test]
+fn spaced_double_colon_reference_and_by_ref_forms() {
+    // `A : : class` is a constant fetch (no declaration); `&r` declares
+    // a function, so it mixes with the class below.
+    let messages =
+        lint("<?php\n$x = A : : class;\nfunction &r() {}\nclass $bad {}\nclass Real {}\n");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].code, "PHL3");
+    assert!(
+        messages[0].description.contains("mixes function (r)"),
+        "{}",
+        messages[0].description // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+    );
+    assert!(
+        messages[0].description.contains("(Real)"),
+        "{}",
+        messages[0].description // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+    );
+}
+
+#[test]
+fn comments_between_keyword_and_name_are_trivia() {
+    let messages = lint("<?php\nclass // c\n Foo {}\nclass /* c */ Bar {}\n");
+    assert_eq!(messages.len(), 1);
+    assert!(
+        messages[0].description.contains("(Foo, Bar)"),
+        "{}",
+        messages[0].description // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+    );
+}
+
+#[test]
+fn close_tag_inside_a_comment_ends_php_mode() {
+    let messages = lint("<?php\n// foo ?>\nclass A {}\n<?php\nclass B {}\nclass C {}\n");
+    assert_eq!(messages.len(), 1);
+    assert!(
+        messages[0].description.contains("(B, C)"),
+        "{}",
+        messages[0].description // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+    );
+}
+
+#[test]
+fn unterminated_comments_and_strings_swallow_the_rest() {
+    assert!(lint("<?php\nclass A {}\n/* never ends").is_empty());
+    assert!(lint("<?php\n$s = \"a\\\"b\";\n$t = 'it\\'s';\nclass A {}\n").is_empty());
+    assert!(lint("<?php\n$u = 'oops\nclass A {}\n").is_empty());
+}
+
+#[test]
+fn heredoc_openers_cover_quoting_gaps_and_bad_labels() {
+    // Quoted labels skip like plain ones.
+    assert!(lint("<?php\n$h = <<<'NOW'\nclass Fake {}\nNOW;\nclass A {}\n").is_empty());
+    assert!(lint("<?php\n$h = <<<\"DQ\"\nclass Fake {}\nDQ;\nclass A {}\n").is_empty());
+    // Spaces between `<<<` and the label.
+    assert!(lint("<?php\n$h = <<<   EOT\nclass Fake {}\nEOT;\nclass A {}\n").is_empty());
+    // Unterminated bodies run to the end of input.
+    assert!(lint("<?php\nclass A {}\n$h = <<<EOT\nfoo\nbar\n").is_empty());
+    // An opener cut off at EOF still consumes nothing after it.
+    assert!(lint("<?php\nclass A {}\n$x = <<<EOT").is_empty());
+    // A digit-led label is not a heredoc; scanning continues.
+    assert!(lint("<?php\n$h = <<< 9abc\nclass A {}\n").is_empty());
+    // Junk after the label voids the opener; the later class counts.
+    assert!(lint("<?php\n$a = <<<EOT foo\nclass A {}\n").is_empty());
+    // A mismatched quote voids the opener; the quote swallows the rest.
+    assert!(lint("<?php\n$a = <<<\"EOT'\nclass A {}\n").is_empty());
+}
+
+#[test]
+fn heredoc_terminators_tolerate_indent_and_prefixes() {
+    // Indented terminators still end the body.
+    let messages = lint("<?php\n$h = <<<EOT\nfoo\n  EOT;\nclass A {}\nclass B {}\n");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].code, "PHL3");
+    // A body line starting with the label plus identifier bytes is not
+    // a terminator.
+    assert!(lint("<?php\n$h = <<<EOT\nEOTfoo\nEOT;\nclass A {}\n").is_empty());
+}
+
+#[test]
+fn left_boundary_at_offset_zero_matches() {
+    assert!(is_left_boundary(b"class", 0));
+    assert!(!is_left_boundary(b"xclass", 1));
+    assert!(is_left_boundary(b" class", 1));
+}
+
 #[test]
 fn unknown_details_match_php_text() {
     assert_eq!(

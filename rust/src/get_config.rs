@@ -479,10 +479,10 @@ fn read_user_doc(path: &Path) -> Result<serde_json::Map<String, serde_json::Valu
 #[must_use]
 pub fn system_config_path() -> PathBuf {
     if cfg!(windows) {
-        let base = std::env::var_os("ProgramData")
+        let base = std::env::var_os("ProgramData") // LCOV_EXCL_START // Reason: windows-only system config path; cfg!(windows) is false on ubuntu CI
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("C:\\ProgramData"));
-        base.join("Phabricator").join("Arcanist").join("config")
+        base.join("Phabricator").join("Arcanist").join("config") // LCOV_EXCL_STOP
     } else {
         PathBuf::from("/etc/arcconfig")
     }

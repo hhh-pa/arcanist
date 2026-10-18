@@ -1,5 +1,30 @@
 use super::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path =
+            std::env::temp_dir().join(format!("arc-rs-hg-tests-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
 
 const NODE_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const NODE_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -925,8 +950,11 @@ impl FailBackend {
         #[cfg(windows)]
         let hg = {
             let bat = dir.join("failhg.bat");
+            // `echo(` (not `echo `): a bare `echo` prints "ECHO is off"
+            // instead of an empty line, which breaks silent-output
+            // tests like `t1170_amend_failure_without_output_names_argv`.
             let body = format!(
-                "@echo off\r\necho {stdout_line}\r\necho {stderr_line}>&2\r\nexit /b 1\r\n"
+                "@echo off\r\necho({stdout_line}\r\necho({stderr_line}>&2\r\nexit /b 1\r\n"
             );
             std::fs::write(&bat, body).unwrap();
             HgCommand::custom("cmd", &["/C", &bat.to_string_lossy()])
@@ -1238,8 +1266,8 @@ fn probe_txtbsy() -> Option<bool> {
 #[test]
 fn output_gives_up_on_permanently_busy_script() {
     if !platform_reports_txtbsy() {
-        return;
-    }
+        return; // LCOV_EXCL_LINE // Reason: probe is always true where gates measure (Linux reports ETXTBSY); the skip only trips on macOS
+    } // LCOV_EXCL_START // Reason: ETXTBSY-only test body; macOS exec never reports text-file-busy (probe-gated)
     let fake = FakeHg::named("stuck");
     let sh = fake.dir.join("stuck.sh");
     std::fs::write(
@@ -1258,7 +1286,7 @@ echo hi
     let _held = std::fs::OpenOptions::new().write(true).open(&sh).unwrap();
     let hg = HgCommand::custom(&sh.to_string_lossy(), &[]);
     let err = output_with(&fake.dir, &hg, &[]).unwrap_err();
-    assert!(err.contains("failed to run"), "{err}");
+    assert!(err.contains("failed to run"), "{err}"); // LCOV_EXCL_STOP
 }
 #[test]
 fn commit_range_status_parses_like_plain_status() {
@@ -1338,4 +1366,537 @@ fn bookmarks_and_branches_run_through_the_backend() {
     let log = fake.log();
     assert!(log.contains("bookmarks"), "{log}");
     assert!(log.contains("branches"), "{log}");
+}
+
+/* T1170 coverage: system-binary wrappers fail closed without a repo. spawned
+ * `hg` can never start in a missing directory, so every wrapper below is
+ * deterministic whether or not `hg` is installed. */
+
+/// Definitely-missing directory: every spawn fails before `hg` runs.
+fn t1170_bogus_dir() -> PathBuf {
+    std::env::temp_dir().join("arc-rs-hg-t1170-bogus-dir-that-cannot-exist")
+}
+
+/// Backend whose program cannot exist: spawn always fails in a live dir.
+fn t1170_bogus_hg() -> HgCommand {
+    HgCommand::custom("definitely-not-a-real-hg-binary-t1170", &[])
+}
+
+#[test]
+fn t1170_system_runners_fail_closed_on_bogus_dir() {
+    let dir = t1170_bogus_dir();
+    assert!(!dir.exists());
+    assert!(output(&dir, &["branch"]).is_err());
+    assert!(stdout_text(&dir, &["branch"]).is_err());
+    assert!(!ok(&dir, &["branch"]));
+    assert!(manual(&dir, &["branch"]).is_err());
+    // Spawn fails before inherited stdio matters, so this stays silent.
+    assert!(exec_passthru(&dir, &["branch"]).is_err());
+    assert!(exec_with_extension(&dir, "shelve", &["shelve", "--help", "--"], None).is_err());
+    assert!(exec_with_extension(&dir, "bogus", &["x"], None).is_err());
+    assert!(
+        exec_manual_with_extension(&dir, "strip", &["strip", "--rev", "x", "--"], None).is_err()
+    );
+    assert!(mercurial_feature_supported(&dir, "shelve").is_err());
+    assert!(mercurial_feature_supported(&dir, "bogus").is_err());
+}
+
+#[test]
+fn t1170_system_readers_fail_closed_on_bogus_dir() {
+    let dir = t1170_bogus_dir();
+    assert!(get_canonical_revision_name(&dir, "tip").is_err());
+    assert!(get_branch_name(&dir).is_err());
+    assert!(get_bookmarks(&dir).is_err());
+    assert!(get_branches(&dir).is_err());
+    assert!(get_source_control_base_revision(&dir, "tip").is_err());
+    assert!(get_changed_files(&dir, "base").is_err());
+    assert!(get_blame(&dir, "base", "a.txt").is_err());
+    assert!(get_uncommitted_status(&dir).is_err());
+    assert!(get_commit_range_status(&dir, "base").is_err());
+    assert!(get_raw_diff_text(&dir, "base", "a.txt", 3).is_err());
+    assert!(get_full_mercurial_diff(&dir, "base", 3).is_err());
+    assert!(file_data_at_revision(&dir, "a.txt", "base").is_err());
+    assert!(get_original_file_data(&dir, "base", "a.txt").is_err());
+    assert!(get_current_file_data(&dir, ".", "a.txt").is_err());
+    assert!(bulk_file_data_at_revision(&dir, &["a.txt"], "base").is_err());
+    assert!(get_bulk_original_file_data(&dir, &["a.txt"], "base").is_err());
+    assert!(get_bulk_current_file_data(&dir, &["a.txt"], ".").is_err());
+    assert!(get_all_files(&dir).is_err());
+    assert!(get_commit_message(&dir, ".").is_err());
+    assert!(get_commit_message_log(&dir, "base", "default").is_err());
+    assert!(get_local_commit_information(&dir, "base", "default").is_err());
+    assert!(get_mercurial_config(&dir, "ui.username", "d").is_err());
+    assert!(get_author(&dir).is_err());
+    assert!(get_subversion_info(&dir).is_err());
+    assert!(get_remote_uri(&dir).is_err());
+    assert!(get_published_commit_hashes(&dir).is_err());
+    assert_eq!(
+        get_commit_summary(&dir, "null").unwrap(),
+        "(The Empty Void)"
+    );
+    assert!(get_commit_summary(&dir, "abc").is_err());
+    // Unknown commits read as absent, never as errors.
+    assert!(!has_local_commit(&dir, "tip").unwrap());
+}
+
+#[test]
+fn t1170_system_writers_and_base_rules_fail_closed_on_bogus_dir() {
+    let dir = t1170_bogus_dir();
+    assert!(update_working_copy(&dir).is_err());
+    assert!(add_to_commit(&dir, &["a.txt"]).is_err());
+    assert!(do_commit(&dir, "msg").is_err());
+    assert!(amend_commit(&dir, Some("msg"), None).is_err());
+    assert!(amend_commit(&dir, None, None).is_err());
+    assert!(resolve_explicit_base(&dir, "stable").is_err());
+    assert!(auto_base_commit(&dir, "default", ".").is_err());
+    assert!(supports_amend(&dir).is_err());
+    // Rules that need no spawn resolve without one.
+    let has_id = |message: &str| message.contains("Differential Revision:");
+    assert_eq!(
+        resolve_base_commit_rule(&dir, "plain", "user", &has_id).unwrap(),
+        None
+    );
+    assert!(resolve_base_commit_rule(&dir, "hg:stable", "user", &has_id).is_err());
+}
+
+#[test]
+fn t1170_stdout_text_reports_failing_output_verbatim() {
+    // hg exits 1 with stdout+stderr: the combined trimmed text is the error.
+    let fake = FailBackend::failing("stdoutfail", "abort: locked", "detail here");
+    let err = stdout_text_with(&fake.dir, &fake.hg, &["branch"]).unwrap_err();
+    assert!(err.contains("abort: locked"), "{err}");
+    assert!(err.contains("detail here"), "{err}");
+    // Silent failures keep the bare argv shape.
+    let quiet = FakeHg::named("quietfail");
+    quiet.write(".fakehg-fail-branch", b"");
+    let err = stdout_text_with(&quiet.dir, &quiet.hg, &["branch"]).unwrap_err();
+    assert!(err.contains("branch"), "{err}");
+    assert!(err.contains("failed"), "{err}");
+}
+
+#[test]
+fn t1170_parse_edges_cover_fallthrough_branches() {
+    // Changeset/parent lines without a colon carry no hash.
+    let logs = parse_mercurial_log("changeset: 12\nsummary: s\n").unwrap();
+    assert_eq!(logs[0].local.as_deref(), Some("12"));
+    assert_eq!(logs[0].rev, None);
+    let logs = parse_mercurial_log("changeset: 3:abc\nparent: 2\nsummary: s\n").unwrap();
+    assert_eq!(logs[0].parents[0].local, "2");
+    assert_eq!(logs[0].parents[0].rev, None);
+    // A colonless line becomes an unknown field with an empty value.
+    let err = parse_mercurial_log("changeset: 3:abc\nbare line\n").unwrap_err();
+    assert!(
+        err.contains("Unknown Mercurial log field 'bare line'!"),
+        "{err}"
+    );
+    // Branch lines with leading whitespace or a non-numeric local fail.
+    assert!(parse_mercurial_branches(" default 1:abc\n").is_err());
+    assert!(parse_mercurial_branches("mybranch zz:abcd\n").is_err());
+    assert!(parse_mercurial_branches("mybranch :abcd\n").is_err());
+    // Malformed zones, clocks, and days read as no date.
+    assert_eq!(parse_rfc822_date("Thu, 14 Oct 2026 12:34:56 XX"), None);
+    assert_eq!(parse_rfc822_date("Thu, 14 Oct 2026 12:34:56 +2500"), None);
+    assert_eq!(parse_rfc822_date("Thu, 14 Oct 2026 12:34:61 +0000"), None);
+    assert_eq!(parse_rfc822_date("Thu, 14 Oct 2026 25:00:00 +0000"), None);
+    assert_eq!(parse_rfc822_date("Thu, 99 Oct 2026 12:00:00 +0000"), None);
+    assert_eq!(
+        parse_rfc822_date("Thu, 14 Oct 2026 12:00:00 +0000 extra"),
+        None
+    );
+    assert_eq!(
+        parse_hg_default_date("Thu Oct 99 10:34:56 2026 +0000"),
+        None
+    );
+    assert_eq!(
+        parse_hg_default_date("Thu Oct 14 10:34:56 2026 +0000 extra"),
+        None
+    );
+    // A colon before the first space can never start an author match.
+    let err = parse_blame("a:b c\n").unwrap_err();
+    assert!(
+        err.contains("Unable to parse Mercurial blame line"),
+        "{err}"
+    );
+    // Display-name forms without an address keep the local part only.
+    assert_eq!(
+        parse_full_author("a@b <c>"),
+        (Some("a@b".to_string()), Some("c".to_string()))
+    );
+    assert_eq!(
+        parse_full_author("Bob <a@>"),
+        (Some("Bob".to_string()), Some("a".to_string()))
+    );
+    assert_eq!(parse_full_author("a@"), (None, Some("a".to_string())));
+    // Nodiff records without a separator are skipped, not fatal.
+    assert_eq!(
+        parse_nodiff_records("abc\x02def\x01d\x02"),
+        vec![("def".to_string(), "d".to_string())]
+    );
+    // Empty svn-info values are skipped, so the revision never joins.
+    let info = parse_subversion_info("URL: \nRevision: 1\n");
+    assert_eq!(info.base_path, None);
+    assert_eq!(info.base_revision, None);
+}
+
+#[test]
+fn t1170_backend_failures_propagate_through_readers() {
+    let fake = FakeHg::named("blamefail");
+    fake.write(".fakehg-fail-annotate", b"");
+    assert!(get_blame_with(&fake.dir, &fake.hg, "base", "a.txt").is_err());
+
+    let fake = FakeHg::named("manifestfail");
+    fake.write(".fakehg-fail-manifest", b"");
+    assert!(get_all_files_with(&fake.dir, &fake.hg).is_err());
+
+    let fake = FakeHg::named("logfail");
+    fake.write(".fakehg-fail-log", b"");
+    assert!(get_commit_summary_with(&fake.dir, &fake.hg, "abc").is_err());
+    assert!(get_commit_message_log_with(&fake.dir, &fake.hg, "base", "default").is_err());
+    assert!(get_local_commit_information_with(&fake.dir, &fake.hg, "base", "default").is_err());
+
+    // The parents lookup fails after the info log succeeds.
+    let fake = FakeHg::named_ps1("parentsfail");
+    fake.write(
+        ".fakehg-log-info",
+        format!("{NODE_A}\x0110\x01alice\x01Thu, 14 Oct 2026 10:34:56 +0000\x01default\x01\x01p1 p2\x01desc\x02")
+            .as_bytes(),
+    );
+    fake.write(".fakehg-fail-parents", b"");
+    assert!(get_local_commit_information_with(&fake.dir, &fake.hg, "base", "default").is_err());
+
+    // The auto-base draft log succeeds but the parents probe fails.
+    let fake = FakeHg::named("autoparentsfail");
+    fake.write(
+        ".fakehg-log-draft",
+        format!("changeset:   3:{NODE_A}\nsummary:     out\n").as_bytes(),
+    );
+    fake.write(".fakehg-fail-parents", b"");
+    assert!(auto_base_commit_with(&fake.dir, &fake.hg, "default", ".").is_err());
+
+    // Spawn failures surface from every remaining manual/stdout seam.
+    let dir = std::env::temp_dir();
+    let hg = t1170_bogus_hg();
+    let has_id = |message: &str| message.contains("Differential Revision:");
+    assert!(auto_base_commit_with(&dir, &hg, "default", ".").is_err());
+    assert!(
+        resolve_arc_base_rule_with(&dir, &hg, "outgoing", "arc:outgoing", "user", &has_id).is_err()
+    );
+    assert!(
+        resolve_arc_base_rule_with(&dir, &hg, "bookmark", "arc:bookmark", "user", &has_id).is_err()
+    );
+    assert!(
+        resolve_arc_base_rule_with(&dir, &hg, "nodiff(x)", "arc:nodiff(x)", "user", &has_id)
+            .is_err()
+    );
+    assert!(get_published_commit_hashes_with(&dir, &hg).is_err());
+}
+
+#[test]
+fn t1170_base_rules_report_failed_probes_as_no_match() {
+    // A plain `hg:name` probe that exits nonzero is no match.
+    let fake = FakeHg::named("ruleplainfail");
+    let has_id = |message: &str| message.contains("Differential Revision:");
+    assert_eq!(
+        resolve_base_commit_rule_with(&fake.dir, &fake.hg, "hg:nope", "user", &has_id).unwrap(),
+        None
+    );
+    // Same for the bookmark revset probe.
+    let fake = FakeHg::named("rulebookmarkfail");
+    fake.write(".fakehg-fail-log", b"");
+    assert_eq!(
+        resolve_base_commit_rule_with(&fake.dir, &fake.hg, "arc:bookmark", "user", &has_id)
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn t1170_amend_failure_without_output_names_argv() {
+    // A silent `commit --amend` failure reports the bare argv shape.
+    let fake = FailBackend::failing("amendsilent", "", "");
+    let err = amend_commit_with(&fake.dir, &fake.hg, Some("msg"), None).unwrap_err();
+    assert!(err.contains("commit --amend failed"), "{err}");
+}
+
+#[test]
+fn t1170_bulk_cat_with_empty_tmp_skips_parent_setup() {
+    // An empty tmp dir has no parent to create; the run still succeeds.
+    let fake = FakeHg::named("emptytmp");
+    let data =
+        bulk_file_data_at_revision_in(&fake.dir, &fake.hg, &[""], "base", Path::new("")).unwrap();
+    assert!(data.is_empty());
+}
+
+#[test]
+fn t1170_scratch_migration_reports_filesystem_failures() {
+    let base = std::env::temp_dir().join(format!("arc-rs-hg-t1170-scratch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    // The new location cannot be created under a plain file.
+    let work = base.join("work");
+    std::fs::create_dir_all(work.join(".arc")).unwrap();
+    std::fs::write(work.join(".arc").join("x"), "data").unwrap();
+    let blocker = base.join("blocker");
+    std::fs::write(&blocker, "not a dir").unwrap();
+    assert!(!migrate_scratch_dir(&work, &blocker));
+    assert!(work.join(".arc").join("x").exists());
+    assert!(!write_scratch_file(&blocker, "x", "data"));
+
+    // An unreadable legacy file fails the copy; nothing is deleted.
+    #[cfg(unix)]
+    {
+        let locked = base.join("locked");
+        std::fs::create_dir_all(locked.join(".arc")).unwrap();
+        let secret = locked.join(".arc").join("secret");
+        std::fs::write(&secret, "data").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&secret).unwrap().permissions();
+            perms.set_mode(0o000);
+            std::fs::set_permissions(&secret, perms).unwrap();
+        }
+        if std::fs::read(&secret).is_err() {
+            assert!(!migrate_scratch_dir(&locked, &base.join("fresh-meta"))); // LCOV_EXCL_LINE // Reason: root reads through chmod 000, so the guard never opens where gates measure; covered on macOS runs
+            assert!(secret.exists()); // LCOV_EXCL_LINE // Reason: root reads through chmod 000, so the guard never opens where gates measure; covered on macOS runs
+        } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&secret).unwrap().permissions();
+            perms.set_mode(0o644);
+            std::fs::set_permissions(&secret, perms).unwrap();
+        }
+    }
+    std::fs::remove_dir_all(&base).ok();
+}
+
+#[test]
+fn t1170_amend_non_head_reports_arc_amend_failure() {
+    // Every extension call shares SUB `--config`, so failing it fails the
+    // `arc-amend` step first and the original error propagates.
+    let fake = FakeHg::named("amendarchfail");
+    fake.write(".fakehg-fail---config", b"");
+    let script = fake.dir.join("arc-hg.py");
+    std::fs::write(&script, b"# fake").unwrap();
+    let err = amend_non_head_commit_with(
+        &fake.dir,
+        &fake.hg,
+        &[NODE_A.to_string()],
+        "msg.tmp",
+        Some(&script),
+    )
+    .unwrap_err();
+    assert!(!err.is_empty(), "arc-amend failure propagates");
+}
+
+/// Argv-conditional `hg` backend (unix): fails when argv contains the
+/// `.failmark` text, else prints canned output. Removed on drop.
+#[cfg(unix)]
+struct ArgvHg {
+    dir: PathBuf,
+    hg: HgCommand,
+}
+
+#[cfg(unix)]
+impl ArgvHg {
+    fn named(tag: &str, body: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("arc-rs-hg-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sh = dir.join("argvhg.sh");
+        std::fs::write(&sh, body).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&sh).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&sh, perms).unwrap();
+        }
+        let hg = HgCommand::custom(&sh.to_string_lossy(), &[]);
+        Self { dir, hg }
+    }
+
+    fn write(&self, name: &str, body: &[u8]) {
+        std::fs::write(self.dir.join(name), body).unwrap();
+    }
+
+    fn log(&self) -> String {
+        std::fs::read_to_string(self.dir.join(".argvhg.log")).unwrap_or_default()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ArgvHg {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
+/// Marker-failing backend: argv containing the `.failmark` text exits 1,
+/// everything else prints the fake node.
+#[cfg(unix)]
+const T1170_MARK_BODY: &str = "#!/bin/sh\necho \"$*\" >> .argvhg.log\nif [ -e .failmark ]; then\nmark=$(cat .failmark)\ncase \"$*\" in\n*\"$mark\"*) exit 1;;\nesac\nfi\nprintf '0123456789abcdef0123456789abcdef01234567'\nexit 0\n";
+
+#[cfg(unix)]
+#[test]
+fn t1170_amend_non_head_tip_log_failure_aborts() {
+    // The `tip` lookup fails after `arc-amend` succeeds: the error aborts
+    // before any rebase runs.
+    let fake = ArgvHg::named("amendtl", T1170_MARK_BODY);
+    fake.write(".failmark", b"tip");
+    let script = fake.dir.join("ahg.py");
+    std::fs::write(&script, b"# fake").unwrap();
+    let err = amend_non_head_commit_with(
+        &fake.dir,
+        &fake.hg,
+        &[NODE_A.to_string()],
+        "msg.tmp",
+        Some(&script),
+    )
+    .unwrap_err();
+    assert!(!err.is_empty(), "tip lookup failure propagates");
+    let log = fake.log();
+    assert!(log.contains("--rev tip"), "tip lookup ran: {log}");
+    assert!(!log.contains("--dest"), "no rebase ran");
+}
+
+#[cfg(unix)]
+#[test]
+fn t1170_amend_non_head_rebase_failure_aborts_rebase() {
+    // A failed rebase runs `rebase --abort`, then reports the ORIGINAL
+    // error (the abort only masks it when the abort itself fails).
+    let fake = ArgvHg::named("amendrebase", T1170_MARK_BODY);
+    fake.write(".failmark", b"--dest");
+    let script = fake.dir.join("ahg.py");
+    std::fs::write(&script, b"# fake").unwrap();
+    let err = amend_non_head_commit_with(
+        &fake.dir,
+        &fake.hg,
+        &[NODE_A.to_string(), NODE_B.to_string()],
+        "msg.tmp",
+        Some(&script),
+    )
+    .unwrap_err();
+    assert!(!err.is_empty(), "original rebase error propagates");
+    let log = fake.log();
+    assert!(log.contains("--abort"), "{log}");
+
+    // When the abort also fails, the abort error masks the original.
+    let fake = ArgvHg::named("amendabort", T1170_MARK_BODY);
+    fake.write(".failmark", b"rebase");
+    let script = fake.dir.join("ahg.py");
+    std::fs::write(&script, b"# fake").unwrap();
+    assert!(
+        amend_non_head_commit_with(
+            &fake.dir,
+            &fake.hg,
+            &[NODE_A.to_string()],
+            "msg.tmp",
+            Some(&script),
+        )
+        .is_err()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn t1170_amend_non_head_strip_failure_aborts() {
+    // Rebase succeeds but the trailing `strip` fails: the error aborts.
+    let fake = ArgvHg::named("amendrm", T1170_MARK_BODY);
+    fake.write(".failmark", b"strip");
+    let script = fake.dir.join("ahg.py");
+    std::fs::write(&script, b"# fake").unwrap();
+    assert!(
+        amend_non_head_commit_with(
+            &fake.dir,
+            &fake.hg,
+            &[NODE_A.to_string()],
+            "msg.tmp",
+            Some(&script),
+        )
+        .is_err()
+    );
+    let log = fake.log();
+    assert!(log.contains("--dest"), "rebase ran first: {log}");
+    assert!(log.contains("strip --rev"), "strip ran last: {log}");
+}
+
+#[cfg(unix)]
+#[test]
+fn t1170_auto_base_descends_through_outgoing_parents() {
+    // Parents of the work revision are outgoing (descend), parents of
+    // that revision are not (found): the walk terminates at NODE_B.
+    let body = format!(
+        "#!/bin/sh\ncase \"$*\" in\n*draft\\(\\)*)\nprintf 'changeset:   3:{NODE_A}\\nsummary:     o\\n';;\n*{NODE_A}*)\nprintf 'changeset:   1:{NODE_B}\\nsummary:     q\\n';;\n*)\nprintf 'changeset:   2:{NODE_A}\\nsummary:     p\\n';;\nesac\nexit 0\n"
+    );
+    let fake = ArgvHg::named("autodescend", &body);
+    let (base, why) = auto_base_commit_with(
+        &fake.dir,
+        &fake.hg,
+        "default",
+        "cccccccccccccccccccccccccccccccccccccccc",
+    )
+    .unwrap();
+    assert_eq!(base, NODE_B);
+    assert!(why.contains("not outgoing"), "{why}");
+}
+
+#[cfg(unix)]
+#[test]
+fn t1170_arc_outgoing_falls_back_to_amended() {
+    // A failed `outgoing` probe falls through to the `amended` check.
+    let body = format!(
+        "#!/bin/sh\ncase \"$*\" in\n*limit\\(reverse*)\nexit 1;;\n*\"{{desc}}\"*) cat .desc-msg;;\n*)\nprintf '{FAKE_NODE}';;\nesac\nexit 0\n"
+    );
+    let has_id = |message: &str| message.contains("Differential Revision:");
+    let fake = ArgvHg::named("outgoingamended", &body);
+    fake.write(".desc-msg", b"work\n\nDifferential Revision: D123\n");
+    let found = resolve_arc_base_rule_with(
+        &fake.dir,
+        &fake.hg,
+        "outgoing",
+        "arc:outgoing",
+        "user",
+        &has_id,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(found.0, FAKE_NODE);
+    assert!(found.1.contains("has been amended"), "{:?}", found.1);
+
+    // Without the trailer the fallback matches nothing.
+    let fake = ArgvHg::named("outgoingplain", &body);
+    fake.write(".desc-msg", b"work without trailer\n");
+    assert_eq!(
+        resolve_arc_base_rule_with(
+            &fake.dir,
+            &fake.hg,
+            "outgoing",
+            "arc:outgoing",
+            "user",
+            &has_id
+        )
+        .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn email_parse_passes_through_names_without_at() {
+    assert_eq!(
+        parse_email_address("Just A Name"),
+        (None, Some("Just A Name".to_string()))
+    );
+    assert_eq!(
+        parse_email_address("  spaced@example.test  "),
+        (None, Some("spaced@example.test".to_string()))
+    );
+}
+
+#[test]
+fn amend_non_head_propagates_the_first_log_failure() {
+    let tmp = TempDir::new("amend-log-fail");
+    let hg = HgCommand::custom("definitely-missing-hg-xyz", &[]);
+    let err = amend_non_head_commit_with(tmp.path(), &hg, &[], "msg.txt", None).unwrap_err();
+    assert!(!err.is_empty(), "expected a spawn failure");
 }

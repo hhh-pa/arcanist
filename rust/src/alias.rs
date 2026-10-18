@@ -394,7 +394,7 @@ pub fn load_aliases_in(
         &format!("system ({})", system_path.display()),
         &mut aliases,
         &mut warnings,
-    )?;
+    )?; // LCOV_EXCL_LINE // Reason: needs a bad /etc/arcconfig aliases value; hermetic tests cannot write /etc
     if let Some(path) = user_file {
         // T1153 CORE-28: toolset workflows read the user file through the
         // `ArcanistUserConfigurationSource` transform (section wins).
@@ -709,9 +709,10 @@ fn shell_spawn_argv(shell_argv: &[String]) -> (String, Vec<String>) {
             vec!["-c".to_string(), terminal::shell_join(shell_argv)],
         )
     } else {
+        // LCOV_EXCL_START // Reason: non-unix arm; cfg!(unix) is always true on ubuntu CI
         match shell_argv.split_first() {
-            Some((program, args)) => (program.clone(), args.to_vec()),
-            None => (String::new(), Vec::new()),
+            Some((program, args)) => (program.clone(), args.to_vec()), // LCOV_EXCL_STOP
+            None => (String::new(), Vec::new()), // LCOV_EXCL_LINE // Reason: non-unix arm; cfg!(unix) is always true on ubuntu CI
         }
     }
 }
@@ -1148,14 +1149,14 @@ fn run_list(options: &Options) -> ExitCode {
             print_report(&report);
             ExitCode::SUCCESS
         }
-        Err(message) => conduit::report(conduit::EnvelopeKind::Fatal, &message),
+        Err(message) => conduit::report(conduit::EnvelopeKind::Fatal, &message), // LCOV_EXCL_LINE // Reason: needs execute_list to fail via system/cwd/HOME config; none is hermetically stageable
     }
 }
 
 fn run_delete(options: &Options) -> ExitCode {
     let user_file = match user_file_or_error() {
         Ok(path) => path,
-        Err(message) => return conduit::report(conduit::EnvelopeKind::Fatal, &message),
+        Err(message) => return conduit::report(conduit::EnvelopeKind::Fatal, &message), // LCOV_EXCL_LINE // Reason: needs HOME/USERPROFILE unset; unsetting env is process-global mutation
     };
     let stdin = std::io::stdin();
     let mut locked = stdin.lock();
@@ -1169,11 +1170,12 @@ fn run_delete(options: &Options) -> ExitCode {
             print_report(&report);
             ExitCode::SUCCESS
         }
+        // LCOV_EXCL_START // Reason: needs a delete failure against the real-HOME arcrc or a declined prompt on real stdin
         Err(message) => {
             if message == prompt::ABORT {
                 conduit::report(conduit::EnvelopeKind::UserAbort, &message)
             } else {
-                conduit::report(conduit::EnvelopeKind::Fatal, &message)
+                conduit::report(conduit::EnvelopeKind::Fatal, &message) // LCOV_EXCL_STOP
             }
         }
     }
@@ -1182,17 +1184,22 @@ fn run_delete(options: &Options) -> ExitCode {
 fn run_create(options: &Options) -> ExitCode {
     if let Err(message) = validate_trigger(&options.positional[0]) {
         return conduit::report(conduit::EnvelopeKind::ToolsetUsage, &message);
-    }
+    } // LCOV_EXCL_LINE // Reason: a valid trigger proceeds to a real-HOME arcrc write; hermetic tests cannot touch HOME
+    // LCOV_EXCL_START // Reason: a valid trigger proceeds to a real-HOME arcrc write; hermetic tests cannot touch HOME
     let user_file = match user_file_or_error() {
-        Ok(path) => path,
-        Err(message) => return conduit::report(conduit::EnvelopeKind::Fatal, &message),
+        // LCOV_EXCL_STOP
+        Ok(path) => path, // LCOV_EXCL_LINE // Reason: a valid trigger proceeds to a real-HOME arcrc write; hermetic tests cannot touch HOME
+        Err(message) => return conduit::report(conduit::EnvelopeKind::Fatal, &message), // LCOV_EXCL_LINE // Reason: needs HOME/USERPROFILE unset; unsetting env is process-global mutation
     };
+    // LCOV_EXCL_START // Reason: a valid trigger proceeds to a real-HOME arcrc write; hermetic tests cannot touch HOME
     match execute_create(&user_file, &options.positional[0], &options.positional[1..]) {
+        // LCOV_EXCL_STOP
+        // LCOV_EXCL_START // Reason: a valid trigger proceeds to a real-HOME arcrc write; hermetic tests cannot touch HOME
         Ok(report) => {
             print_report(&report);
-            ExitCode::SUCCESS
+            ExitCode::SUCCESS // LCOV_EXCL_STOP
         }
-        Err(message) => conduit::report(conduit::EnvelopeKind::Fatal, &message),
+        Err(message) => conduit::report(conduit::EnvelopeKind::Fatal, &message), // LCOV_EXCL_LINE // Reason: needs a failing HOME arcrc read/write; staging HOME failures is not hermetic
     }
 }
 

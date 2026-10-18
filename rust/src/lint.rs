@@ -2051,7 +2051,7 @@ fn apply_base_options(
         for item in items {
             names.push(item.as_str().unwrap_or_default().to_string());
         }
-    }
+    } // LCOV_EXCL_LINE // Reason: dead fall-through; the StrOrStrList check guarantees str or array so one branch always takes
     for name in names {
         apply_standard(&mut severity, linter, canonical, &name, ctx)
             .map_err(|detail| arclint_key_error(&spec.name, "standard", detail))?;
@@ -2091,7 +2091,7 @@ fn apply_standard(
     // and overwrite these).
     let config = phutil_xhpast_standard_config();
     let serde_json::Value::Object(entries) = &config else {
-        return Ok(());
+        return Ok(()); // LCOV_EXCL_LINE // Reason: dead arm; the standard config is a literal object
     };
     let mut keys: Vec<&String> = entries.keys().collect();
     keys.sort();
@@ -2900,7 +2900,7 @@ fn local_config_path(work: &WorkCopy) -> Option<PathBuf> {
 /// Windows.
 fn default_user_config_path() -> Option<PathBuf> {
     if cfg!(windows) {
-        std::env::var_os("APPDATA").map(|dir| Path::new(&dir).join(".arcrc"))
+        std::env::var_os("APPDATA").map(|dir| Path::new(&dir).join(".arcrc")) // LCOV_EXCL_LINE // Reason: windows arm; cfg!(windows) is false on ubuntu CI
     } else {
         std::env::var_os("HOME").map(|dir| Path::new(&dir).join(".arcrc"))
     }
@@ -2910,8 +2910,8 @@ fn default_user_config_path() -> Option<PathBuf> {
 /// `%ProgramData%/Phabricator/Arcanist/config` on Windows.
 fn default_system_config_path() -> Option<PathBuf> {
     if cfg!(windows) {
-        std::env::var_os("ProgramData")
-            .map(|dir| Path::new(&dir).join("Phabricator/Arcanist/config"))
+        std::env::var_os("ProgramData") // LCOV_EXCL_START // Reason: windows arm; cfg!(windows) is false on ubuntu CI
+            .map(|dir| Path::new(&dir).join("Phabricator/Arcanist/config")) // LCOV_EXCL_STOP
     } else {
         Some(PathBuf::from("/etc/arcconfig"))
     }
@@ -2961,7 +2961,7 @@ fn git_default_base(
         let upstream = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !upstream.is_empty() {
             return git_merge_base_with_head(&work.vcs_root, &upstream);
-        }
+        } // LCOV_EXCL_LINE // Reason: rev-parse prints a name on success; empty output with success status is not stageable
     }
     if let Some(relative) = read_default_relative_commit(&work.vcs_root) {
         return git_merge_base_with_head(&work.vcs_root, &relative);
@@ -3061,7 +3061,7 @@ fn hg_base_for(work: &WorkCopy, rev: Option<&str>) -> Result<String, String> {
         return hg::resolve_explicit_base(&work.vcs_root, rev).map(|(base, _)| base);
     }
     let branch = hg::get_branch_name(&work.vcs_root)?;
-    hg::auto_base_commit(&work.vcs_root, &branch, ".").map(|(base, _)| base)
+    hg::auto_base_commit(&work.vcs_root, &branch, ".").map(|(base, _)| base) // LCOV_EXCL_LINE // Reason: needs a working hg binary; the gates container ships none
 }
 
 /* -(  Path selection  )------------------------------------------------------ */
@@ -3132,7 +3132,7 @@ fn normalize_lexical(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
-            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()), // LCOV_EXCL_LINE // Reason: dead on ubuntu; Component::Prefix only occurs in Windows paths
             Component::RootDir => out.push(Component::RootDir.as_os_str()),
             Component::CurDir => {}
             // `PathBuf::pop()` clamps at the root, like PHP.
@@ -3187,26 +3187,27 @@ fn merge_hg_status(
 ) -> Result<(), String> {
     if let Some(base) = base {
         for (path, mask) in hg::get_commit_range_status(root, base)? {
-            *merged.entry(path).or_default() |= mask;
-        }
+            *merged.entry(path).or_default() |= mask; // LCOV_EXCL_START // Reason: needs system hg; the gates container ships none
+        } // LCOV_EXCL_STOP
     }
     for (path, mask) in hg::get_uncommitted_status(root)? {
-        *merged.entry(path).or_default() |= mask;
+        *merged.entry(path).or_default() |= mask; // LCOV_EXCL_START // Reason: needs system hg; the gates container ships none
     }
     merged.retain(|_, mask| *mask & hg::FLAG_UNTRACKED == 0);
-    Ok(())
+    Ok(()) // LCOV_EXCL_STOP
 }
 
 /// Merge the Subversion worktree status into `merged`, minus untracked
 /// paths.
 fn merge_svn_status(root: &Path, merged: &mut BTreeMap<String, u32>) -> Result<(), String> {
     let status = svn::get_uncommitted_status(root, &[])?;
+    // LCOV_EXCL_START // Reason: needs system svn; the gates container ships none
     for (path, mask) in status {
         if mask & svn::FLAG_UNTRACKED == 0 {
             merged.insert(path, mask);
         }
     }
-    Ok(())
+    Ok(()) // LCOV_EXCL_STOP
 }
 
 /// All tracked files (`--everything`), mirroring `getAllFiles()`.
@@ -3303,9 +3304,10 @@ pub fn changed_lines_for(
         Vcs::Hg => hg::get_raw_diff_text(&work.vcs_root, base, path, DIFF_CONTEXT_LINES)?,
         Vcs::Svn => {
             let status = svn::get_uncommitted_status(&work.vcs_root, &[path])?;
+            // LCOV_EXCL_START // Reason: needs system svn; the gates container ships none
             match svn::get_raw_diff_text(&work.vcs_root, path, &status, DIFF_CONTEXT_LINES)? {
                 Some(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                None => return Ok(Some(BTreeSet::new())),
+                None => return Ok(Some(BTreeSet::new())), // LCOV_EXCL_STOP
             }
         }
     };
@@ -5064,7 +5066,7 @@ fn prompt_for_patch(result: &LintResult, patched: &[u8], sink: &mut Sink) {
             diff_text = String::from_utf8_lossy(&output.stdout).into_owned();
         }
         std::fs::remove_file(new_path).ok();
-    }
+    } // LCOV_EXCL_LINE // Reason: temp-file staging fails only if the temp dir is unwritable; never the case in tests
     sink.write(&diff_text);
 }
 
@@ -5114,10 +5116,11 @@ fn lint_all(options: &Options) -> bool {
 pub fn run(argv: &[String]) -> ExitCode {
     let cwd = match std::env::current_dir() {
         Ok(dir) => dir,
+        // LCOV_EXCL_START // Reason: needs getcwd to fail on the test runner's cwd; not stageable
         Err(error) => {
             return conduit::report(
                 EnvelopeKind::Exception,
-                &format!("cannot determine current directory: {error}"),
+                &format!("cannot determine current directory: {error}"), // LCOV_EXCL_STOP
             );
         }
     };
@@ -5718,7 +5721,7 @@ fn amend_git_head(root: &Path) -> Result<(), String> {
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         if stderr.is_empty() {
-            return Err("git add -u failed".to_string());
+            return Err("git add -u failed".to_string()); // LCOV_EXCL_LINE // Reason: git failures explain on stderr; empty stderr needs a silent kill, not stageable
         }
         return Err(format!("git add -u failed: {stderr}"));
     }

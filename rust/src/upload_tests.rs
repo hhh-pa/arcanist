@@ -11,6 +11,33 @@ fn args_of(words: &[&str]) -> Options {
     opts
 }
 
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-upload-tests-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
 #[test]
 fn parses_paths_and_flags() {
     // T1153 BROWSE-B21: piped runs carry `--`.
@@ -29,10 +56,11 @@ fn parses_paths_and_flags() {
 fn requires_paths_and_rejects_unknown_flags() {
     // T1153 BROWSE-B21: `--` present, so validation (not the
     // terminator) reports.
-    let ParseOutcome::Error(message) = parse_args(&argv(&["--"])) else {
-        panic!("expected error for no paths");
-    };
-    assert!(message.contains("one or more paths"), "{message}");
+    let outcome = parse_args(&argv(&["--"]));
+    assert!(
+        matches!(&outcome, ParseOutcome::Error(message) if message.contains("one or more paths")),
+        "expected no-paths error"
+    );
 
     assert!(matches!(
         parse_args(&argv(&["--bogus", "a"])),
@@ -257,10 +285,11 @@ fn r4_uploadu15_aggregate_errors_are_fatal() {
     // stay toolset usage (exit 1) with no usage dump.
     // T1153 BROWSE-B21: `--` present, so validation (not the
     // terminator) reports.
-    match execute(&std::env::temp_dir(), &argv(&["--"])) {
-        Err(message) => assert!(!message.contains("usage:"), "{message}"),
-        _ => panic!("expected parse error"),
-    }
+    let outcome = execute(&std::env::temp_dir(), &argv(&["--"]));
+    assert!(
+        matches!(&outcome, Err(message) if !message.contains("usage:")),
+        "expected parse error"
+    );
     assert_eq!(
         run_in(&std::env::temp_dir(), &argv(&["--bogus"])),
         std::process::ExitCode::FAILURE
@@ -339,12 +368,9 @@ fn upload_u4_local_file_error_texts() {
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-        if std::fs::File::open(&locked).is_err() {
-            assert_eq!(
-                read_upload_bytes(&dir, "locked.bin").unwrap_err(),
-                "Unable to upload file: path \"locked.bin\" is not readable."
-            );
-        }
+        let probed = read_upload_bytes(&dir, "locked.bin");
+        let denied = "Unable to upload file: path \"locked.bin\" is not readable.";
+        assert!(probed.is_ok() || probed.unwrap_err() == denied);
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
     }
     std::fs::write(dir.join("ok.bin"), b"data").unwrap();
@@ -562,8 +588,253 @@ fn upx_b23_upload_help_matches_generated_format() {
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
     assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
     // `--help` still exits zero once `--` satisfies the terminator.
-    match execute(&std::env::temp_dir(), &argv(&["--help", "--"])) {
-        Ok(text) => assert!(text.contains("UPLOAD WORKFLOW"), "{text}"),
-        Err(message) => panic!("expected help, got {message}"),
+    let text = execute(&std::env::temp_dir(), &argv(&["--help", "--"])).expect("expected help");
+    assert!(text.contains("UPLOAD WORKFLOW"), "{text}");
+}
+
+// -( T1170 COV5: close upload.rs )------------------------------------------------
+
+#[test]
+#[should_panic(expected = "expected args")]
+fn args_of_panics_on_parse_error() {
+    args_of(&["--"]);
+}
+
+#[test]
+fn conduit_uri_flag_takes_space_equals_and_missing_forms() {
+    for words in [&["--conduit-uri"][..], &["--conduit-uri", ""][..]] {
+        let outcome = parse_args_with_tty(&argv(words), true);
+        assert!(matches!(outcome, ParseOutcome::Error(_)), "{words:?}");
     }
+    let opts = args_of(&["--conduit-uri=https://h/", "a.bin", "--"]);
+    assert_eq!(opts.conduit_uri, Some("https://h/".to_string()));
+    let opts = args_of(&["--conduit-uri", "https://h/", "a.bin", "--"]);
+    assert_eq!(opts.conduit_uri, Some("https://h/".to_string()));
+}
+
+#[test]
+fn php_escape_keeps_short_escapes_and_slashes() {
+    assert_eq!(
+        php_escape_json_text("{\"a\":\"x\\ny\\/z\"}", true),
+        "{\"a\":\"x\\ny\\/z\"}"
+    );
+    assert_eq!(
+        php_escape_json_text("{\"a\":\"x\\ny/z\",\"b\":\"caf\u{e9}\"}", false),
+        "{\"a\":\"x\\ny/z\",\"b\":\"caf\\u00e9\"}"
+    );
+}
+
+#[test]
+fn phid_of_reads_strings_objects_and_missing() {
+    assert_eq!(
+        phid_of(&serde_json::json!("PHID-FILE-1")),
+        Some("PHID-FILE-1".to_string())
+    );
+    assert_eq!(phid_of(&serde_json::json!("")), None);
+    assert_eq!(
+        phid_of(&serde_json::json!({"phid": "PHID-FILE-1"})),
+        Some("PHID-FILE-1".to_string())
+    );
+    assert_eq!(
+        phid_of(&serde_json::json!({"filePHID": "PHID-FILE-2"})),
+        Some("PHID-FILE-2".to_string())
+    );
+    assert_eq!(phid_of(&serde_json::json!({"phid": ""})), None);
+    assert_eq!(phid_of(&serde_json::json!({"other": 1})), None);
+    assert_eq!(phid_of(&serde_json::json!(7)), None);
+    assert_eq!(phid_of(&serde_json::json!(null)), None);
+}
+
+#[test]
+fn conduit_flags_treat_arrays_and_objects_as_nonempty() {
+    assert!(conduit_truthy(Some(&serde_json::json!([0]))));
+    assert!(!conduit_truthy(Some(&serde_json::json!([]))));
+    assert!(conduit_truthy(Some(&serde_json::json!({"a": 0}))));
+    assert!(!conduit_truthy(Some(&serde_json::json!({}))));
+    assert!(conduit_truthy(Some(&serde_json::json!(2.5))));
+    assert!(!conduit_truthy(Some(&serde_json::json!(0.0))));
+}
+
+#[test]
+fn querychunks_failure_reports_the_conduit_error() {
+    let (base, _rx) = serve_seq(vec![
+        upload_u_envelope(r#"{"upload": true, "filePHID": "PHID-FILE-1"}"#),
+        r#"{"result": null, "error_code": "ERR-CONDUIT-CORE", "error_info": "chunks boom"}"#
+            .to_string(),
+    ]);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    let err = upload_data(&client, "a.bin", b"data", false).unwrap_err();
+    assert!(err.contains("chunks boom"), "{err}");
+}
+
+#[test]
+fn progress_bar_width_throttle_and_erase() {
+    assert!(ChunkProgress::width() <= 78);
+    let mut bar = ChunkProgress::new();
+    bar.set_total(4);
+    bar.update(1);
+    // A fresh draw timestamp throttles the next redraw.
+    bar.last_update = Some(std::time::Instant::now());
+    bar.redraw();
+    // A drawn bar erases on finish.
+    bar.drawn = true;
+    bar.finish();
+    ChunkProgress::new().finish();
+}
+
+#[test]
+fn chunks_upload_missing_ranges_and_resume() {
+    // One finished chunk (resume announce) plus one missing range.
+    let (base, rx) = serve_seq(vec![
+        upload_u_envelope(r#"{"upload": true, "filePHID": "PHID-FILE-1"}"#),
+        upload_u_envelope(
+            r#"[{"complete": true, "byteStart": 0, "byteEnd": 5},
+                {"complete": false, "byteStart": 5, "byteEnd": 10}]"#,
+        ),
+        upload_u_envelope(r#"{"ok": true}"#),
+    ]);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    assert_eq!(
+        upload_data(&client, "a.bin", b"0123456789", true).unwrap(),
+        "PHID-FILE-1"
+    );
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(seen.len(), 3);
+    assert!(seen[0].contains("deleteAfterEpoch"), "{}", seen[0]);
+    assert!(seen[2].contains("NTY3ODk"), "{}", seen[2]);
+}
+
+#[test]
+fn chunk_upload_failure_reports_chunks_error() {
+    let (base, _rx) = serve_seq(vec![
+        upload_u_envelope(r#"{"upload": true, "filePHID": "PHID-FILE-1"}"#),
+        upload_u_envelope(r#"[{"complete": false, "byteStart": 0, "byteEnd": 4}]"#),
+        r#"{"result": null, "error_code": "ERR-CONDUIT-CORE", "error_info": "chunk boom"}"#
+            .to_string(),
+    ]);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    let err = upload_data(&client, "a.bin", b"data", false).unwrap_err();
+    assert!(err.contains("Unable to upload file chunks"), "{err}");
+    assert!(err.contains("chunk boom"), "{err}");
+}
+
+#[test]
+fn refused_files_and_old_servers_take_legacy_paths() {
+    // `upload:false` with an empty PHID: the server refused the file.
+    let (base, _rx) = serve_seq(vec![upload_u_envelope(
+        r#"{"upload": false, "filePHID": ""}"#,
+    )]);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    let err = upload_data(&client, "big.bin", b"data", false).unwrap_err();
+    assert!(err.contains("refused to accept"), "{err}");
+    // `file.allocate` missing (old server): straight to `file.upload`.
+    let (base, rx) = serve_seq(vec![
+        r#"{"result": null, "error_code": "ERR-CONDUIT-CORE", "error_info": "no allocate"}"#
+            .to_string(),
+        upload_u_envelope(r#""PHID-FILE-3""#),
+    ]);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    assert_eq!(
+        upload_data(&client, "a.bin", b"data", false).unwrap(),
+        "PHID-FILE-3"
+    );
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[1].contains("data_base64"), "{}", seen[1]);
+}
+
+#[test]
+fn non_alpha_scheme_is_not_a_domain() {
+    assert_eq!(
+        absolute_uri(Some("https://h/"), "9x://foo/bar"),
+        "https://h9x://foo/bar"
+    );
+}
+
+#[test]
+fn failed_search_propagates_the_conduit_error() {
+    let (base, _rx) = serve_seq(vec![
+        r#"{"result": null, "error_code": "ERR-CONDUIT-CORE", "error_info": "search boom"}"#
+            .to_string(),
+    ]);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    let err = resolve_refs(
+        &client,
+        &[("a.bin".to_string(), "PHID-FILE-1".to_string())],
+        None,
+    )
+    .unwrap_err();
+    assert!(err.contains("search boom"), "{err}");
+}
+
+#[test]
+fn upload_paths_renders_refs_for_each_file() {
+    let tmp = TempDir::new("paths");
+    std::fs::write(tmp.path().join("a.bin"), b"1").unwrap();
+    let (base, rx) = serve_seq(vec![
+        upload_u_envelope(r#"{"upload": false, "filePHID": "PHID-FILE-1"}"#),
+        serde_json::json!({
+            "result": {"data": [{
+                "id": 1, "phid": "PHID-FILE-1",
+                "fields": {"name": "a.bin", "uri": "/F1"},
+            }]},
+            "error_code": null,
+        })
+        .to_string(),
+    ]);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    let out = upload_paths(
+        &client,
+        tmp.path(),
+        &["a.bin".to_string()],
+        false,
+        false,
+        Some("https://phab.example/api/"),
+    )
+    .unwrap();
+    assert!(out.contains("F1"), "{out}");
+    assert!(out.contains("https://phab.example/F1"), "{out}");
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(seen.len(), 2);
+}
+
+#[test]
+fn collect_errors_report_the_first_failure() {
+    let tmp = TempDir::new("collect");
+    std::fs::write(tmp.path().join("ok.bin"), b"1").unwrap();
+    let (base, _rx) = serve_seq(vec![upload_u_envelope(
+        r#"{"upload": false, "filePHID": "PHID-FILE-1"}"#,
+    )]);
+    let client = crate::conduit::Client::new(&base, "t").unwrap();
+    let err = upload_paths(
+        &client,
+        tmp.path(),
+        &["missing.bin".to_string(), "ok.bin".to_string()],
+        false,
+        false,
+        None,
+    )
+    .unwrap_err();
+    assert!(err.contains("missing.bin"), "{err}");
+}
+
+#[test]
+fn run_reports_usage_errors_without_browsing() {
+    assert_eq!(run(&argv(&["--bogus"])), std::process::ExitCode::FAILURE);
+}
+
+/// Non-permission read failures surface the `readBytes()` open-failure
+/// text. `/proc/self/mem` stats as a regular file but every read
+/// faults (EIO) — the only deterministic trigger, hence Linux-only
+/// (macOS/Windows have no equivalent). Skips when `/proc` is
+/// unavailable (some containers).
+#[cfg(target_os = "linux")]
+#[test]
+fn upload_read_error_reports_open_failure() {
+    if std::fs::symlink_metadata("/proc/self/mem").is_err() {
+        return; // LCOV_EXCL_LINE // Reason: /proc is always present where gates measure; the skip only trips where /proc is missing (macOS)
+    }
+    let tmp = TempDir::new("read-error");
+    let err = read_upload_bytes(tmp.path(), "/proc/self/mem").unwrap_err();
+    assert!(err.contains("failed to open"), "{err}");
 }

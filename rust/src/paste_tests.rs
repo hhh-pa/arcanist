@@ -11,6 +11,33 @@ fn args_of(words: &[&str]) -> Options {
     opts
 }
 
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-paste-tests-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
 #[test]
 fn parses_create_options() {
     // T1153 BROWSE-B21: piped runs carry `--`.
@@ -38,10 +65,11 @@ fn rejects_read_mode_creation_flags() {
         &["P1", "--input", "f", "--"][..],
         &["P1", "--browse", "--"][..],
     ] {
-        let ParseOutcome::Error(message) = parse_args(&argv(words)) else {
-            panic!("expected error for {words:?}");
-        };
-        assert!(message.contains("not supported when reading"), "{message}");
+        let outcome = parse_args(&argv(words));
+        assert!(
+            matches!(&outcome, ParseOutcome::Error(message) if message.contains("not supported when reading")),
+            "expected read-mode error for {words:?}"
+        );
     }
     assert!(matches!(
         parse_args(&argv(&["P1", "P2", "--"])),
@@ -556,8 +584,158 @@ fn upx_b23_paste_help_matches_generated_format() {
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
     assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
     // `--help` still exits zero once `--` satisfies the terminator.
-    match execute(&std::env::temp_dir(), &argv(&["--help", "--"])) {
-        Ok(text) => assert!(text.contains("PASTE WORKFLOW"), "{text}"),
-        Err(message) => panic!("expected help, got {message}"),
+    let text = execute(&std::env::temp_dir(), &argv(&["--help", "--"])).expect("expected help");
+    assert!(text.contains("PASTE WORKFLOW"), "{text}");
+}
+
+// -( T1170 COV5: close paste.rs )------------------------------------------------
+
+#[test]
+#[should_panic(expected = "expected args")]
+fn args_of_panics_on_parse_error() {
+    args_of(&["P1", "P2", "--"]);
+}
+
+#[test]
+fn valued_flags_take_space_equals_and_missing_forms() {
+    // Missing values (and empty values) report per flag.
+    for words in [
+        &["--title"][..],
+        &["--title", ""][..],
+        &["--lang"][..],
+        &["--input"][..],
+        &["--conduit-uri"][..],
+    ] {
+        let outcome = parse_args_with_tty(&argv(words), true);
+        assert!(matches!(outcome, ParseOutcome::Error(_)), "{words:?}");
     }
+    // `--flag value` and `--flag=value` both land.
+    let opts = args_of(&["--title", "t", "--lang=r", "--"]);
+    assert_eq!(opts.title, Some("t".to_string()));
+    assert_eq!(opts.lang, Some("r".to_string()));
+    let opts = args_of(&["--title=t2", "--input=f.txt", "--"]);
+    assert_eq!(opts.title, Some("t2".to_string()));
+    assert_eq!(opts.input, Some("f.txt".to_string()));
+    let opts = args_of(&["--input=f2.txt", "--conduit-uri=https://h/", "--"]);
+    assert_eq!(opts.input, Some("f2.txt".to_string()));
+    assert_eq!(opts.conduit_uri, Some("https://h/".to_string()));
+    let opts = args_of(&["--conduit-uri", "https://h/", "--"]);
+    assert_eq!(opts.conduit_uri, Some("https://h/".to_string()));
+}
+
+#[test]
+fn non_alpha_scheme_is_not_a_domain() {
+    assert_eq!(
+        absolute_uri(Some("https://h/"), "9x://foo/bar"),
+        "https://h9x://foo/bar"
+    );
+}
+
+#[test]
+fn search_hit_ids_read_numbers_strings_and_missing() {
+    let hit = serde_json::json!({
+        "id": "42",
+        "fields": {"title": "t", "uri": "/P42"},
+    });
+    let detail = detail_from_search_hit(&hit, None);
+    assert_eq!(detail.id, 42);
+    assert_eq!(detail.title, Some("t".to_string()));
+    for hit in [
+        serde_json::json!({"id": null}),
+        serde_json::json!({"id": true}),
+    ] {
+        let detail = detail_from_search_hit(&hit, None);
+        assert_eq!(detail.id, 0);
+        assert_eq!(detail.uri, "/P0");
+    }
+}
+
+#[test]
+fn missing_paths_resolve_through_ancestors() {
+    let tmp = TempDir::new("resolve");
+    let canonical = std::fs::canonicalize(tmp.path()).unwrap();
+    // Two missing levels walk up twice before resolving.
+    assert_eq!(
+        resolve_input_path(tmp.path(), "a/b/c.txt"),
+        canonical.join("a/b/c.txt").to_string_lossy().to_string()
+    );
+    std::fs::create_dir_all(tmp.path().join("a")).unwrap();
+    assert_eq!(
+        resolve_input_path(tmp.path(), "a/b/c.txt"),
+        canonical.join("a/b/c.txt").to_string_lossy().to_string()
+    );
+    // Nothing resolvable: the joined path passes through.
+    assert_eq!(
+        resolve_input_path(
+            std::path::Path::new("definitely-missing-arc-rs-xyz-5a"),
+            "f.txt"
+        ),
+        std::path::Path::new("definitely-missing-arc-rs-xyz-5a")
+            .join("f.txt")
+            .to_string_lossy()
+            .to_string()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_input_resolves_through_parent() {
+    let tmp = TempDir::new("symlink");
+    std::fs::write(tmp.path().join("target.txt"), b"data").unwrap();
+    std::os::unix::fs::symlink(tmp.path().join("target.txt"), tmp.path().join("link.txt")).unwrap();
+    let canonical = std::fs::canonicalize(tmp.path()).unwrap();
+    assert_eq!(
+        resolve_input_path(tmp.path(), "link.txt"),
+        canonical.join("link.txt").to_string_lossy().to_string()
+    );
+    assert_eq!(read_input_file(tmp.path(), "link.txt").unwrap(), b"data");
+}
+
+#[cfg(unix)]
+#[test]
+fn blocked_parent_reports_noexec() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new("noexec");
+    let sub = tmp.path().join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let err = read_input_file(tmp.path(), "sub/f.txt").unwrap_err();
+    assert!(err.contains("not executable"), "{err}");
+    assert!(err.contains("+x"), "{err}");
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn run_reports_usage_errors() {
+    assert_eq!(run(&argv(&["--bogus"])), std::process::ExitCode::FAILURE);
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_input_reports_not_readable() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new("unreadable");
+    let locked = tmp.path().join("locked.txt");
+    std::fs::write(&locked, b"x").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Best effort: root ignores permission bits.
+    let probed = read_input_file(tmp.path(), "locked.txt");
+    assert!(probed.is_ok() || probed.unwrap_err().contains("not readable"));
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+/// Non-permission read failures surface the `readBytes()` open-failure
+/// text. `/proc/self/mem` stats as a regular file but every read
+/// faults (EIO) — the only deterministic trigger, hence Linux-only
+/// (macOS/Windows have no equivalent). Skips when `/proc` is
+/// unavailable (some containers).
+#[cfg(target_os = "linux")]
+#[test]
+fn input_read_error_reports_open_failure() {
+    if std::fs::symlink_metadata("/proc/self/mem").is_err() {
+        return; // LCOV_EXCL_LINE // Reason: /proc is always present where gates measure; the skip only trips where /proc is missing (macOS)
+    }
+    let tmp = TempDir::new("read-error");
+    let err = read_input_file(tmp.path(), "/proc/self/mem").unwrap_err();
+    assert!(err.contains("Failed to read file"), "{err}");
 }

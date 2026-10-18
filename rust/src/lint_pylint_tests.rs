@@ -145,6 +145,157 @@ fn display_names_humanize_symbols_byte_based() {
     assert_eq!(display_name("école-x"), "école X");
 }
 
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-lint-pylint-tests-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+#[cfg(unix)]
+fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) {}
+
+fn option_ctx(root: &Path) -> OptionContext<'_> {
+    OptionContext { project_root: root }
+}
+
+fn set_bin(linter: &mut PyLintLinter, ctx: &OptionContext, tool: &Path) {
+    linter
+        .set_option(
+            "bin",
+            &serde_json::json!(tool.to_string_lossy().into_owned()),
+            ctx,
+        )
+        .unwrap();
+}
+
+#[test]
+fn set_config_feeds_the_rcfile_flag() {
+    let tmp = TempDir::new("flags");
+    let ctx = option_ctx(tmp.path());
+    let mut linter = PyLintLinter::new();
+    linter
+        .set_option("pylint.config", &serde_json::json!("pylintrc"), &ctx)
+        .unwrap();
+    assert!(mandatory_flag_strings(Some("pylintrc")).contains(&"--rcfile=pylintrc".to_string()));
+    assert!(default_flags().is_empty());
+    assert_eq!(
+        linter.set_option("pylint.config", &serde_json::json!(42), &ctx),
+        Err("'pylint.config' must be a string".to_string())
+    );
+}
+
+#[test]
+fn set_option_delegates_bin_flags_and_version() {
+    let tmp = TempDir::new("tool-opts");
+    let tool = tmp.path().join("fake-pylint");
+    std::fs::write(&tool, b"#!/bin/sh\nexit 0\n").unwrap();
+    make_executable(&tool);
+    let ctx = option_ctx(tmp.path());
+    let mut linter = PyLintLinter::new();
+    set_bin(&mut linter, &ctx, &tool);
+    linter
+        .set_option("flags", &serde_json::json!(["--extra"]), &ctx)
+        .unwrap();
+    linter
+        .set_option("version", &serde_json::json!(">= 1.0"), &ctx)
+        .unwrap();
+    assert!(
+        linter
+            .set_option("bogus", &serde_json::json!(1), &ctx)
+            .is_err()
+    );
+}
+
+#[test]
+fn unconfigured_runs_use_the_ambient_path() {
+    // Whatever the ambient `PATH` holds decides: with no `pylint` the
+    // linter stays silent, with one it runs it. Only the lookup runs.
+    let linter = PyLintLinter::new();
+    let _ = linter.lint_bytes("a.py", b"x = 1\n");
+    let _ = binary_on_path(BINARY);
+}
+
+#[test]
+#[cfg(unix)]
+fn lint_bytes_runs_configured_tool_and_parses_output() {
+    let tmp = TempDir::new("run");
+    let tool = write_script(
+        tmp.path(),
+        "fake-pylint",
+        "#!/bin/sh\necho '1|0|C0114|missing-docstring|Missing docstring'\nexit 1\n",
+    );
+    let ctx = option_ctx(tmp.path());
+    let mut linter = PyLintLinter::new();
+    set_bin(&mut linter, &ctx, &tool);
+    let messages = linter.lint_bytes("a.py", b"x = 1\n");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].code, "C0114");
+    assert_eq!(messages[0].severity, "advice");
+}
+
+#[test]
+#[cfg(unix)]
+fn version_requirement_gates_linting() {
+    let tmp = TempDir::new("version");
+    let ctx = option_ctx(tmp.path());
+    let tool = write_script(tmp.path(), "fake-pylint", "#!/bin/sh\necho junk\n");
+    let mut linter = PyLintLinter::new();
+    set_bin(&mut linter, &ctx, &tool);
+    linter
+        .set_option("version", &serde_json::json!(">= 1.0"), &ctx)
+        .unwrap();
+    assert!(linter.lint_bytes("a.py", b"x = 1\n").is_empty());
+    let tool = write_script(
+        tmp.path(),
+        "fake-pylint-new",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'pylint 2.1.0'; else echo '1|0|E0602|undefined-variable|Undefined'; fi\n",
+    );
+    let mut linter = PyLintLinter::new();
+    set_bin(&mut linter, &ctx, &tool);
+    linter
+        .set_option("version", &serde_json::json!(">= 1.0"), &ctx)
+        .unwrap();
+    let messages = linter.lint_bytes("a.py", b"x = 1\n");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].severity, "error");
+}
+
 #[test]
 fn severity_codes_need_a_letter_and_four_digits_like_php() {
     let linter = PyLintLinter::new();

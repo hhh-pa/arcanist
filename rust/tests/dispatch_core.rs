@@ -228,3 +228,20 @@ fn core19_classic_commands_see_arc_environment() {
         text(&out.stderr)
     );
 }
+
+#[test]
+fn t1170_markers_query_failure_is_fatal() {
+    // Query failures (here: no conduit URI anywhere, so client setup
+    // fails before any call goes out) render the fatal envelope (255),
+    // not usage. Binary-level: the empty-HOME + scrubbed-env fixture
+    // makes "no URI" deterministic, which no in-process test can do
+    // (the real ~/.arcrc and process env leak in).
+    let (home, repo) = fixture("markers-fatal");
+    let out = arc(&home, &repo, &["markers", "--type", "branch", "--"]);
+    assert_eq!(out.status.code(), Some(255));
+    assert!(
+        text(&out.stderr).contains("no Phabricator URI"),
+        "{:?}",
+        text(&out.stderr)
+    );
+}

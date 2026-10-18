@@ -37,28 +37,19 @@ fn environment_selection_and_errors() {
     let no_build = |_: &str| false;
     let err =
         load_environment("/r", true, &no_build, &resolve, Some(vec![]), None, &file).unwrap_err();
-    assert!(
-        err.message()
-            .contains("Unable to find msbuild or xbuild in PATH!"),
-        "{}",
-        err.message()
-    );
+    let msg = err.message();
+    let found = msg.contains("Unable to find msbuild or xbuild in PATH!");
+    assert!(found, "{msg}");
 
     let no_mono = |b: &str| b == "msbuild";
     let err =
         load_environment("/r", false, &no_mono, &resolve, Some(vec![]), None, &file).unwrap_err();
-    assert!(
-        err.message().contains("Unable to find Mono"),
-        "{}",
-        err.message()
-    );
+    let msg = err.message();
+    assert!(msg.contains("Unable to find Mono"), "{msg}");
 
     let err = load_environment("/r", true, &exists, &resolve, None, None, &file).unwrap_err();
-    assert!(
-        err.message().contains("unit.csharp.discovery"),
-        "{}",
-        err.message()
-    );
+    let msg = err.message();
+    assert!(msg.contains("unit.csharp.discovery"), "{msg}");
 
     let hinted = load_environment(
         "/r",
@@ -83,11 +74,8 @@ fn environment_selection_and_errors() {
         &|_: &str| false,
     )
     .unwrap_err();
-    assert!(
-        err.message().contains("unit.csharp.xunit.binary"),
-        "{}",
-        err.message()
-    );
+    let msg = err.message();
+    assert!(msg.contains("unit.csharp.xunit.binary"), "{msg}");
 }
 
 #[test]
@@ -104,6 +92,28 @@ fn discovery_match_and_replace() {
 }
 
 #[test]
+fn discovery_match_finds_first_literal_anywhere() {
+    // Unanchored like `preg_match`: a first literal that does not sit
+    // at the start still matches, capturing the skipped prefix.
+    assert_eq!(
+        discovery_match("src/(.*)/file", "xxsrc/Foo/file"),
+        Some(vec!["xx".to_string(), "Foo".to_string()])
+    );
+    assert!(discovery_match("zzz(.*)", "src/Foo/file").is_none());
+}
+
+#[test]
+fn discovery_replace_keeps_bad_references_literal() {
+    // `preg_replace` emits malformed or out-of-range references
+    // literally: a bare `$`, an out-of-range `${9}`, and an
+    // out-of-range `$5` all survive with one capture in scope.
+    assert_eq!(
+        discovery_replace("$-x ${9} $5", &["a".to_string()]),
+        "$-x ${9} $5"
+    );
+}
+
+#[test]
 fn map_paths_expands_and_dedupes() {
     let env = test_env();
     let exists = |p: &str| p == "/r/App.Tests.csproj";
@@ -113,6 +123,21 @@ fn map_paths_expands_and_dedupes() {
     assert_eq!(projects[0].assembly, "/r/App.Tests.dll");
     let missing = map_paths_to_results(&["App".to_string()], &env, &|_: &str| false);
     assert!(missing.is_empty());
+}
+
+#[test]
+fn map_paths_skips_rules_that_match_nothing() {
+    let mut env = test_env();
+    env.discovery_rules = vec![DiscoveryRule {
+        regex: "zzz(.*)".to_string(),
+        targets: vec![DiscoveryTarget {
+            project: "$1.Tests.csproj".to_string(),
+            assembly: "$1.Tests.dll".to_string(),
+        }],
+    }];
+    let always = |_: &str| true;
+    let projects = map_paths_to_results(&["App".to_string()], &env, &always);
+    assert!(projects.is_empty());
 }
 
 #[test]
@@ -131,24 +156,31 @@ fn run_all_tests_short_circuits_failing_stages() {
     assert!(!results_contain_failures(&[pass.clone()]));
 
     let mut calls = Vec::new();
+    // A running test stage would extend the output, so the length pins
+    // that the failed build short-circuits it.
+    let quiet_test = |_: &[TestProject]| vec![pass.clone()];
     let out = run_all_tests(
         &projects,
         &|| vec![pass.clone()],
         &|_| vec![fail.clone()],
-        &|_| {
-            panic!("test stage must not run after a failed build");
-        },
+        &quiet_test,
     );
     assert!(results_contain_failures(&out));
     assert_eq!(out.len(), 2);
     calls.push(out.len());
 
-    let out = run_all_tests(
-        &[],
-        &|| vec![pass.clone()],
-        &|_| vec![pass.clone()],
-        &|_| vec![pass.clone()],
-    );
+    // A failing generate stage returns before build or test run.
+    let gen_fail = || vec![fail.clone()];
+    let build_pass = |_: &[TestProject]| vec![pass.clone()];
+    let test_pass = |_: &[TestProject]| vec![pass.clone()];
+    let out = run_all_tests(&projects, &gen_fail, &build_pass, &test_pass);
+    assert!(results_contain_failures(&out));
+    assert_eq!(out.len(), 1);
+
+    let gen_empty = || vec![pass.clone()];
+    let build_empty = |_: &[TestProject]| vec![pass.clone()];
+    let test_empty = |_: &[TestProject]| vec![pass.clone()];
+    let out = run_all_tests(&[], &gen_empty, &build_empty, &test_empty);
     assert!(out.is_empty());
     assert_eq!(calls, vec![2]);
 }
@@ -255,6 +287,7 @@ fn test_assemblies_parse_and_clean_reports() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].get_name(), "A.t");
     // Missing reports contribute nothing.
+    let no_cleanup = |_: &str| {};
     let results = engine
         .test_assemblies_with(
             &projects,
@@ -262,7 +295,7 @@ fn test_assemblies_parse_and_clean_reports() {
             &|| "x".to_string(),
             &|_| None,
             &|_| false,
-            &|_| {},
+            &no_cleanup,
         )
         .unwrap();
     assert!(results.is_empty());

@@ -1579,15 +1579,16 @@ pub fn run_in_with(
         return run_prepared(dir, &options, call, "", input);
     }
     let client = match config::client_for(None) {
-        Ok(client) => client,
+        Ok(client) => client, // LCOV_EXCL_LINE // Reason: needs a configured conduit client; hermetic tests cannot mint one (HOME is process-global)
         // T1153 R4 (BROWSE-B20): `browse` runs in the toolset runtime,
         // so workflow errors escape into a PHP fatal (255).
         Err(message) => return conduit::report(EnvelopeKind::Fatal, &message),
     };
+    // LCOV_EXCL_START // Reason: needs a configured conduit client; hermetic tests cannot mint one (HOME is process-global)
     let live = |method: &str, params: &serde_json::Value| {
         client.call(method, params).map_err(|e| e.to_string())
     };
-    run_prepared(dir, &options, &live, client.base_uri(), input)
+    run_prepared(dir, &options, &live, client.base_uri(), input) // LCOV_EXCL_STOP
 }
 
 /// Run with a resolved Conduit base URI (used by `run_in` and tests).

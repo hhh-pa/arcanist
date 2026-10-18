@@ -40,6 +40,16 @@ fn rbd5_examples_default_and_unwrap() {
 }
 
 #[test]
+fn rbd5_missing_help_body_skips_help_section() {
+    // `None` help renders no help block: header, examples, synopsis,
+    // then the trailing blank.
+    let text = usage_text("paste", None, Some("syn"), None, false, &[], false);
+    assert!(text.starts_with("PASTE WORKFLOW\n\n"), "{text:?}");
+    assert!(text.contains("syn\n"), "{text:?}");
+    assert!(text.ends_with("\n\n"), "{text:?}");
+}
+
+#[test]
 fn rbd5_specs_sort_by_name_with_shorts() {
     let text = render_argument_specs(
         &[

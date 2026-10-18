@@ -332,3 +332,114 @@ fn lint42_unknown_top_level_keys_are_config_errors() {
         "Error in parsing '.arclint' file.\nunknown option 'bogus'."
     );
 }
+
+// -( T1170 wave 5d )-----------------------------------------------------------
+
+#[test]
+fn pcre_classes_treat_negated_close_as_literal() {
+    // A `]` right after `[^` is a literal, like PCRE.
+    assert!(compile_pcre("/[^]]/").is_ok());
+    assert!(pcre_matches("/[^]]/", "a"));
+    assert!(!pcre_matches("/[^]]/", "]"));
+}
+
+#[test]
+fn pcre_bracket_delimiters_nest() {
+    // `{x{2}}`: the inner braces nest (depth 1) instead of ending
+    // the pattern, and the body stays a valid repetition.
+    assert!(compile_pcre("{x{2}}").is_ok());
+    assert!(pcre_matches("{x{2}}", "xx"));
+    assert!(!pcre_matches("{x{2}}", "x"));
+}
+
+#[test]
+fn pcre_anchored_modifier_pins_to_start() {
+    assert!(compile_pcre("/x/A").is_ok());
+    assert!(pcre_matches("/x/A", "xyz"));
+    assert!(!pcre_matches("/x/A", "yxy"));
+}
+
+#[test]
+fn pcre_translate_rejects_trailing_backslash() {
+    // Unreachable through the scanner (a trailing backslash always
+    // escapes the closer), so the translator is called directly.
+    assert_eq!(
+        translate_pcre_body("a\\", b'/', b'/', PcreFlags::default()).unwrap_err(),
+        "trailing backslash"
+    );
+}
+
+#[test]
+fn pcre_expands_space_and_dot_escapes() {
+    assert!(compile_pcre("/[\\h]/").is_ok());
+    assert!(compile_pcre("/[\\v]/").is_ok());
+    assert!(compile_pcre("/\\H/").is_ok());
+    assert!(compile_pcre("/\\V/").is_ok());
+    assert!(compile_pcre("/\\C/").is_ok());
+    assert!(pcre_matches("/\\H/", "a"));
+    assert!(!pcre_matches("/\\H/", " "));
+    assert!(pcre_matches("/\\C/", "a"));
+}
+
+#[test]
+fn pcre_quotes_unterminated_spans_to_end() {
+    // An unterminated `\Q` quotes to the end of the pattern.
+    assert!(compile_pcre("/\\Qabc/").is_ok());
+    assert!(pcre_matches("/\\Qabc/", "zabc"));
+    assert!(!pcre_matches("/\\Qabc/", "zabd"));
+}
+
+#[test]
+fn group_names_reject_lookbehinds_and_bad_names() {
+    assert_eq!(group_name_after("(?<name>x)", "(?<", ">"), Some("name"));
+    assert_eq!(group_name_after("(?<=a)b", "(?<", ">"), None);
+    assert_eq!(group_name_after("(?<!a)b", "(?<", ">"), None);
+    assert_eq!(group_name_after("(?<ab-c>", "(?<", ">"), None);
+    assert_eq!(group_name_after("(?<>", "(?<", ">"), None);
+}
+
+#[test]
+fn severity_maps_reject_bad_shapes() {
+    let mut map = HashMap::new();
+    let mut rules = Vec::new();
+    let err = parse_severity_map(
+        "L",
+        "severity",
+        &serde_json::json!(["x"]),
+        &mut map,
+        &mut rules,
+        false,
+    )
+    .unwrap_err();
+    assert!(err.contains("severity maps must be objects"), "{err}");
+    assert!(err.contains("for linter 'L'"), "{err}");
+    let mut map = HashMap::new();
+    let mut rules = Vec::new();
+    let err = parse_severity_map(
+        "L",
+        "severity",
+        &serde_json::json!({"E1": 42}),
+        &mut map,
+        &mut rules,
+        false,
+    )
+    .unwrap_err();
+    assert!(err.contains("must be a string"), "{err}");
+}
+
+#[test]
+fn linter_specs_must_be_objects() {
+    let err = parse_linter_spec("L", &serde_json::json!([])).unwrap_err();
+    assert!(err.contains("linter specs must be objects"), "{err}");
+    assert!(err.contains("for linter 'L'"), "{err}");
+}
+
+#[test]
+fn routing_excludes_drop_paths() {
+    let routing = SectionRouting::new(&[], &["/\\.min\\.js$/".to_string()], &[]);
+    assert!(!routing.allows("a.min.js"));
+    assert!(routing.allows("a.js"));
+    let routing = SectionRouting::new(&[], &[], &["/\\.min\\.js$/".to_string()]);
+    assert!(!routing.allows("a.min.js"));
+    assert!(routing.allows("a.js"));
+}

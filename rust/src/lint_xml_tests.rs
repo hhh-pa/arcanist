@@ -36,7 +36,7 @@ fn well_formed_documents_pass() {
         assert!(
             check_well_formed(data).is_ok(),
             "for {}",
-            String::from_utf8_lossy(data)
+            String::from_utf8_lossy(data), // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
         );
         assert!(XmlLinter::new().lint_bytes("f.xml", data).is_empty());
     }
@@ -134,6 +134,247 @@ fn deep_nesting_is_rejected_not_stack_overflowing() {
     }
     let error = check_well_formed(&data).unwrap_err();
     assert!(error.message.contains("too deep"), "{}", error.message);
+}
+
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-lint-xml-tests-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+#[test]
+fn directories_named_xml_are_skipped() {
+    let tmp = TempDir::new("dirskip");
+    let dir = tmp.path().join("sub.xml");
+    std::fs::create_dir_all(&dir).unwrap();
+    let linter = XmlLinter::new();
+    assert!(
+        linter
+            .lint_bytes(dir.to_string_lossy().as_ref(), b"<r/>")
+            .is_empty()
+    );
+    // Missing display paths still check content.
+    assert!(!linter.lint_bytes("ghost.xml", b"<r>").is_empty());
+}
+
+#[test]
+fn lowercase_hex_and_malformed_char_refs() {
+    // Lowercase hex digits decode.
+    assert!(check_well_formed(b"<r>&#xab;</r>").is_ok());
+    // Non-hex `x` digits are malformed.
+    let error = check_well_formed(b"<r>&#xzz;</r>").unwrap_err();
+    assert!(
+        error.message.contains("invalid character reference"),
+        "{}",
+        error.message
+    );
+    // The hex helper maps only hex digits.
+    assert_eq!(hex_val(b'a'), 10);
+    assert_eq!(hex_val(b'F'), 15);
+    assert_eq!(hex_val(b'z'), 0);
+}
+
+#[test]
+fn declaration_lookalikes_without_space_are_not_declarations() {
+    // `<?xml` not followed by whitespace is a PI (reserved target).
+    let error = check_well_formed(b"<?xml?><r/>").unwrap_err();
+    assert!(
+        error.message.contains("reserved processing instruction"),
+        "{}",
+        error.message
+    );
+    // `<!DOCTYPE` not followed by whitespace is not a doctype.
+    let error = check_well_formed(b"<!DOCTYPEfoo><r/>").unwrap_err();
+    assert!(
+        error.message.contains("expected root element"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn attribute_value_edges() {
+    let cases: &[(&[u8], &str)] = &[
+        (b"<r a>", "expected '='"),
+        (b"<r a=\"x>", "unterminated attribute value"),
+    ];
+    for (data, fragment) in cases {
+        let error = check_well_formed(data).expect_err("should fail");
+        assert!(
+            error.message.contains(fragment),
+            "{}: {}",
+            String::from_utf8_lossy(data), // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+            error.message
+        );
+    }
+    // References inside values validate.
+    assert!(check_well_formed(b"<r a=\"&amp;\"/>").is_ok());
+    let error = check_well_formed(b"<r a=\"&bogus;\"/>").unwrap_err();
+    assert!(
+        error.message.contains("unknown entity"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn quoted_string_edges_in_declarations() {
+    // Unquoted version value.
+    let error = check_well_formed(b"<?xml version=1.0?><r/>").unwrap_err();
+    assert!(
+        error.message.contains("invalid XML declaration"),
+        "{}",
+        error.message
+    );
+    // Truncated declaration (the unterminated-quote error surfaces
+    // mapped as an invalid declaration).
+    let error = check_well_formed(b"<?xml version=\"1.0").unwrap_err();
+    assert!(
+        error.message.contains("invalid XML declaration"),
+        "{}",
+        error.message
+    );
+    // Truncated reference.
+    let error = check_well_formed(b"<r>&amp").unwrap_err();
+    assert!(
+        error.message.contains("unterminated entity reference"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn processing_instruction_edges() {
+    let cases: &[(&[u8], &str)] = &[
+        (b"<? ?><r/>", "invalid processing instruction"),
+        (
+            b"<?pi!><r/>",
+            "expected whitespace in processing instruction",
+        ),
+    ];
+    for (data, fragment) in cases {
+        let error = check_well_formed(data).expect_err("should fail");
+        assert!(
+            error.message.contains(fragment),
+            "{}: {}",
+            String::from_utf8_lossy(data), // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+            error.message
+        );
+    }
+}
+
+#[test]
+fn xml_declaration_attribute_edges() {
+    let cases: &[(&[u8], &str)] = &[
+        // Missing version opener.
+        (b"<?xml ?><r/>", "invalid XML declaration"),
+        // Truncated after version.
+        (b"<?xml version=\"1.0\"", "unterminated XML declaration"),
+        // Junk where whitespace belongs.
+        (
+            b"<?xml version=\"1.0\"!>",
+            "expected whitespace in XML declaration",
+        ),
+        // Nameless attribute.
+        (b"<?xml version=\"1.0\" !>", "invalid XML declaration"),
+        // Repeated encoding.
+        (
+            b"<?xml version=\"1.0\" encoding=\"a\" encoding=\"b\"?><r/>",
+            "invalid encoding declaration",
+        ),
+        // Bad standalone value.
+        (
+            b"<?xml version=\"1.0\" standalone=\"maybe\"?><r/>",
+            "invalid standalone declaration",
+        ),
+        // Unknown attribute.
+        (
+            b"<?xml version=\"1.0\" foo=\"bar\"?><r/>",
+            "unknown XML declaration attribute",
+        ),
+    ];
+    for (data, fragment) in cases {
+        let error = check_well_formed(data).expect_err("should fail");
+        assert!(
+            error.message.contains(fragment),
+            "{}: {}",
+            String::from_utf8_lossy(data), // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+            error.message
+        );
+    }
+    // Trailing space before `?>` is valid.
+    assert!(check_well_formed(b"<?xml version=\"1.0\" ?><r/>").is_ok());
+}
+
+#[test]
+fn doctype_edges() {
+    let cases: &[(&[u8], &str)] = &[
+        (b"<!DOCTYPE ><r/>", "invalid DOCTYPE"),
+        (b"<!DOCTYPE root", "unterminated DOCTYPE"),
+        (b"<!DOCTYPE root !>", "invalid DOCTYPE"),
+    ];
+    for (data, fragment) in cases {
+        let error = check_well_formed(data).expect_err("should fail");
+        assert!(
+            error.message.contains(fragment),
+            "{}: {}",
+            String::from_utf8_lossy(data), // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+            error.message
+        );
+    }
+    // Internal subsets skip comments and PIs; a subset without the
+    // closing `>` is unterminated.
+    let error = check_well_formed(b"<!DOCTYPE r [ <!-- c --> <?pi d?> ]").unwrap_err();
+    assert!(
+        error.message.contains("unterminated DOCTYPE"),
+        "{}",
+        error.message
+    );
+    assert!(check_well_formed(b"<!DOCTYPE r [ <!-- c --> <?pi d?> ]><r/>").is_ok());
+}
+
+#[test]
+fn start_tag_and_content_edges() {
+    let cases: &[(&[u8], &str)] = &[
+        (b"<r/ >", "expected '>'"),
+        (
+            b"<r a=\"1\"b=\"2\"/>",
+            "expected whitespace before attribute",
+        ),
+        (b"<r", "unterminated start tag"),
+        (b"<r><!FOO></r>", "markup declaration is not allowed here"),
+        (b"<r></>", "invalid end tag"),
+    ];
+    for (data, fragment) in cases {
+        let error = check_well_formed(data).expect_err("should fail");
+        assert!(
+            error.message.contains(fragment),
+            "{}: {}",
+            String::from_utf8_lossy(data), // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+            error.message
+        );
+    }
 }
 
 // -( T1153 Wave 2: lint retrocompat )--------------------------------------

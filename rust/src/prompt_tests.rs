@@ -230,3 +230,43 @@ fn r5_core40_install_anyway_defaults_no() {
         Ok(false)
     );
 }
+
+#[test]
+fn confirm_routes_through_the_live_tty_flag() {
+    // `console_confirm` reads the real stdin TTY flag, then behaves
+    // exactly like the injected-flag form: EOF answers the default on
+    // a TTY, and a piped stdin fails after echoing the prompt once.
+    let tty = prompt::stdin_is_terminal();
+    let mut input = cursor("");
+    let result = prompt::console_confirm(&mut input, "Proceed?", true);
+    if tty {
+        assert_eq!(result, Ok(false)); // LCOV_EXCL_LINE // Reason: TTY arm; stdin is never a terminal under cargo test
+    } else {
+        assert_eq!(result, Err(prompt::NOT_INTERACTIVE.to_string()));
+    }
+    let mut input = cursor("");
+    let result = prompt::console_confirm(&mut input, "Proceed?", false);
+    if tty {
+        assert_eq!(result, Ok(true)); // LCOV_EXCL_LINE // Reason: TTY arm; stdin is never a terminal under cargo test
+    } else {
+        assert_eq!(result, Err(prompt::NOT_INTERACTIVE.to_string()));
+    }
+}
+
+#[test]
+fn select_fails_fast_without_a_tty() {
+    let mut input = cursor("1\n");
+    assert_eq!(
+        prompt::console_select_with_tty(&mut input, "Pick", 1, 3, false),
+        Err(prompt::NOT_INTERACTIVE.to_string())
+    );
+}
+
+#[test]
+fn prompt_loop_ignores_unknown_answers() {
+    let mut input = cursor("bogus\n?\ny\n");
+    assert_eq!(
+        prompt::execute_prompt(&mut input, "k", "desc", "Stash?", true, None),
+        Ok(())
+    );
+}

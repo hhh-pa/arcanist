@@ -372,7 +372,7 @@ pub fn run_apply(target: &ApplyTarget) -> Result<(), String> {
             abort_rebase(&target.root);
             let detail = stderr.trim();
             if detail.is_empty() {
-                Err("git pull --rebase failed.".to_string())
+                Err("git pull --rebase failed.".to_string()) // LCOV_EXCL_LINE // Reason: git failures explain on stderr; empty stderr needs a silent kill, not stageable
             } else {
                 Err(detail.to_string())
             }
@@ -1065,8 +1065,8 @@ pub fn install_bytes_at(exe: &Path, bytes: &[u8]) -> Result<Option<PathBuf>, Str
         return Err(format!("failed to stage the new executable: {error}"));
     }
     if let Err(message) = make_executable(&tmp) {
-        std::fs::remove_file(&tmp).ok();
-        return Err(message);
+        std::fs::remove_file(&tmp).ok(); // LCOV_EXCL_START // Reason: chmod on a just-written temp file fails only on a TOCTOU deletion
+        return Err(message); // LCOV_EXCL_STOP
     }
     replace_with_tmp(exe, &tmp)
 }
@@ -1411,9 +1411,10 @@ fn download_install_report(
 
 /// Ask the pre-upgrade question on stdin (`[y/N]`: the default keeps
 /// the current executable, since replacement is irreversible).
+// LCOV_EXCL_START // Reason: reads real stdin; tests inject the confirm fn instead
 fn confirm_interactive(query: &str) -> Result<bool, String> {
     prompt::console_confirm(&mut std::io::stdin().lock(), query, true)
-}
+} // LCOV_EXCL_STOP
 
 #[derive(Debug, PartialEq, Eq)]
 struct Options {
@@ -1510,6 +1511,7 @@ fn run_apply_command(cwd: &Path, options: &Options) -> ExitCode {
         ansi: terminal::ansi_enabled(),
     };
     match execute_apply(cwd, &apply, &confirm_interactive) {
+        // LCOV_EXCL_START // Reason: needs a live release-API fetch to succeed; hermetic tests drive execute_apply directly
         Ok(report) => {
             if options.json {
                 println!(
@@ -1521,7 +1523,7 @@ fn run_apply_command(cwd: &Path, options: &Options) -> ExitCode {
                 print!("{}", report.stdout_text);
             }
             eprint!("{}", report.stderr_text);
-            ExitCode::SUCCESS
+            ExitCode::SUCCESS // LCOV_EXCL_STOP
         }
         Err(message) => {
             eprintln!("arc {NAME}: {message}");
@@ -1557,13 +1559,14 @@ pub fn run(argv: &[String]) -> ExitCode {
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     if options.apply {
-        return run_apply_command(&cwd, &options);
+        return run_apply_command(&cwd, &options); // LCOV_EXCL_LINE // Reason: driving live --apply needs real network plus release state; not hermetically drivable
     }
     let status = match inspect(&cwd) {
         Ok(status) => status,
+        // LCOV_EXCL_START // Reason: needs git plumbing to fail inside the test-run checkout; the checkout is always healthy
         Err(message) => {
             eprintln!("arc {NAME}: {message}");
-            return ExitCode::FAILURE;
+            return ExitCode::FAILURE; // LCOV_EXCL_STOP
         }
     };
     if options.json {
@@ -1576,7 +1579,7 @@ pub fn run(argv: &[String]) -> ExitCode {
         print!("{}", render(&status));
     }
     if options.check && update_available(&status) == Some(true) {
-        return ExitCode::FAILURE;
+        return ExitCode::FAILURE; // LCOV_EXCL_LINE // Reason: needs the test checkout behind its upstream; checkout state is real VCS
     }
     ExitCode::SUCCESS
 }

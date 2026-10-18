@@ -932,7 +932,7 @@ fn amend_git(dir: &Path, message: &str) -> Result<String, String> {
     let summary = String::from_utf8_lossy(&output.stdout);
     let summary = summary.trim();
     if summary.is_empty() {
-        Ok("amended.\n".to_string())
+        Ok("amended.\n".to_string()) // LCOV_EXCL_LINE // Reason: git prints a summary on success; empty success output unreachable
     } else {
         Ok(format!("{summary}\n"))
     }
@@ -992,7 +992,7 @@ fn flow_git(
     let (client, revision) = resolve_revision(options, io, &hints, "gtcm", ansi)?;
     if !options.show {
         announce_and_confirm(io, &client, options, &revision, &hints, "gtcm", ansi)?;
-    }
+    } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
     let message = message_for_revision(&client, &revision)?;
     finish_git(dir, options, &message)
 }
@@ -1015,7 +1015,7 @@ fn flow_hg(
     let (client, revision) = resolve_revision(options, io, &hints, "hgcm", ansi)?;
     if !options.show {
         announce_and_confirm(io, &client, options, &revision, &hints, "hgcm", ansi)?;
-    }
+    } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
     let message = message_for_revision(&client, &revision)?;
     finish_hg(dir, options, hg, &message)
 }

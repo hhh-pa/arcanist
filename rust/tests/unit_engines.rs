@@ -723,11 +723,24 @@ struct SpawnRunner;
 
 impl CommandRunner for SpawnRunner {
     fn run(&self, argv: &[String], cwd: &str) -> CapturedOutput {
-        let out = std::process::Command::new(&argv[0])
-            .args(&argv[1..])
-            .current_dir(cwd)
-            .output()
-            .expect("spawn fake php");
+        // Freshly written + chmodded scripts can spuriously fail to
+        // exec on Linux runners (ETXTBSY "Text file busy"); retry the
+        // transient error briefly, then fail as before.
+        let mut attempts = 0;
+        let out = loop {
+            match std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .current_dir(cwd)
+                .output()
+            {
+                Ok(out) => break out,
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 50 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("spawn fake php: {e}"),
+            }
+        };
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         CapturedOutput::new(out.status.code().unwrap_or(-1), &stdout, &stderr)

@@ -119,3 +119,179 @@ fn invalid_json_yields_no_messages() {
     assert!(parse_output("Main.hs", 0, "{\"a\":1}", "").is_empty());
     assert!(parse_output("Main.hs", 0, "[]", "").is_empty());
 }
+
+#[cfg(unix)]
+fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+fn option_ctx(root: &Path) -> OptionContext<'_> {
+    OptionContext { project_root: root }
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) {}
+
+#[test]
+fn trailing_dot_has_no_extension() {
+    assert!(!is_supported("Main."));
+    assert_eq!(extension_of("Main."), None);
+    assert_eq!(staged_name("Makefile"), "src.hs");
+    assert_eq!(staged_name("a.verylongextension"), "src.hs");
+    assert_eq!(staged_name("Main.hs"), "src.hs");
+}
+
+#[test]
+fn empty_path_segments_are_skipped() {
+    assert!(binary_in(std::ffi::OsStr::new("")).is_none());
+}
+
+#[test]
+fn missing_or_unshaped_notes_add_no_suffix() {
+    for idea in [
+        r#"[{"module":"M","decl":"d","severity":"Warning","hint":"h","startLine":1,"startColumn":1,"from":"a","to":"b"}]"#,
+        r#"[{"module":"M","decl":"d","severity":"Warning","hint":"h","startLine":1,"startColumn":1,"from":"a","to":"b","note":"x"}]"#,
+        r#"[{"module":"M","decl":"d","severity":"Warning","hint":"h","startLine":1,"startColumn":1,"from":"a","to":"b","note":[42,{"k":"v"}]}]"#,
+    ] {
+        let messages = parse_output("Main.hs", 0, idea, "");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].description, "In module `M`, declaration `d`.");
+    }
+}
+
+#[test]
+fn positions_tolerate_numbers_strings_and_missing_values() {
+    let line_of = |idea: &str| parse_output("Main.hs", 0, idea, "")[0].line;
+    let col_of = |idea: &str| parse_output("Main.hs", 0, idea, "")[0].col;
+    let idea = |line: &str, col: &str| {
+        format!(
+            r#"[{{"module":"M","decl":"d","severity":"Warning","hint":"h","startLine":{line},"startColumn":{col},"from":"a","to":"b","note":[]}}]"#
+        )
+    };
+    assert_eq!(line_of(&idea("-3", "1")), 1);
+    assert_eq!(line_of(&idea("2.5", "1")), 1);
+    assert_eq!(
+        (
+            line_of(&idea("\"7\"", "\"3\"")),
+            col_of(&idea("\"7\"", "\"3\""))
+        ),
+        (7, 3)
+    );
+    assert_eq!(line_of(&idea("\"abc\"", "1")), 1);
+    let messages = parse_output("Main.hs", 0, "[{}]", "");
+    assert_eq!(messages.len(), 1);
+    assert_eq!((messages[0].line, messages[0].col), (1, 1));
+}
+
+#[test]
+fn set_option_delegates_bin_flags_and_version() {
+    let tmp = TempDir::new("tool-opts");
+    let tool = tmp.path().join("fake-hlint");
+    std::fs::write(&tool, b"#!/bin/sh\nexit 0\n").unwrap();
+    make_executable(&tool);
+    let ctx = option_ctx(tmp.path());
+    let mut linter = HlintLinter::new();
+    linter
+        .set_option(
+            "bin",
+            &serde_json::json!(tool.to_string_lossy().into_owned()),
+            &ctx,
+        )
+        .unwrap();
+    linter
+        .set_option("flags", &serde_json::json!(["--json"]), &ctx)
+        .unwrap();
+    assert!(
+        linter
+            .set_option("flags", &serde_json::json!("--json"), &ctx)
+            .is_err()
+    );
+    linter
+        .set_option("version", &serde_json::json!(">= 3.0"), &ctx)
+        .unwrap();
+    assert!(
+        linter
+            .set_option("bogus", &serde_json::json!(true), &ctx)
+            .is_err()
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn lint_with_binary_runs_the_tool() {
+    let tmp = TempDir::new("run");
+    let flat = IDEAS.replace('\n', "");
+    let tool = write_script(
+        tmp.path(),
+        "fake-hlint",
+        &format!("#!/bin/sh\nprintf '%s\\n' '{flat}'\n"),
+    );
+    let messages = lint_with_binary("Main.hs", b"f x = x\n", Some(&tool));
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0].name, "Use null");
+}
+
+#[test]
+#[cfg(unix)]
+fn version_requirement_gates_linting() {
+    let tmp = TempDir::new("version");
+    let ctx = option_ctx(tmp.path());
+    // A tool reporting no parseable version stays inactive.
+    let tool = write_script(tmp.path(), "fake-hlint", "#!/bin/sh\necho junk\n");
+    let mut linter = HlintLinter::new();
+    linter
+        .set_option(
+            "bin",
+            &serde_json::json!(tool.to_string_lossy().into_owned()),
+            &ctx,
+        )
+        .unwrap();
+    linter
+        .set_option("version", &serde_json::json!(">= 3.0"), &ctx)
+        .unwrap();
+    assert!(linter.lint_bytes("Main.hs", b"f x = x\n").is_empty());
+    // A tool answering `--version` proceeds to lint.
+    let flat = IDEAS.replace('\n', "");
+    let tool = write_script(
+        tmp.path(),
+        "fake-hlint-new",
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'HLint v3.8, Copyright'; else printf '%s\\n' '{flat}'; fi\n"
+        ),
+    );
+    let mut linter = HlintLinter::new();
+    linter
+        .set_option(
+            "bin",
+            &serde_json::json!(tool.to_string_lossy().into_owned()),
+            &ctx,
+        )
+        .unwrap();
+    linter
+        .set_option("version", &serde_json::json!(">= 3.8"), &ctx)
+        .unwrap();
+    assert_eq!(linter.lint_bytes("Main.hs", b"f x = x\n").len(), 3);
+    // An unsatisfied requirement stays inactive even with a version.
+    linter
+        .set_option("version", &serde_json::json!(">= 9.9"), &ctx)
+        .unwrap();
+    assert!(linter.lint_bytes("Main.hs", b"f x = x\n").is_empty());
+}
+
+#[test]
+fn t1170_parse_idea_rejects_non_objects() {
+    // T1170 band J: only objects parse into ideas; anything else
+    // yields no message.
+    assert!(parse_idea("a.hs", &serde_json::json!(5)).is_none());
+    assert!(parse_idea("a.hs", &serde_json::json!(null)).is_none());
+}

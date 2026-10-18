@@ -293,11 +293,16 @@ pub fn read_token_doc(path: &Path) -> Result<serde_json::Value, String> {
 
 /// `readUserConfigurationFile()` permission prompt (T1153 CORE-41):
 /// `pht("File permissions on your %s are too open. Fix them by
-/// chmod'ing to 600?", '~/.arcrc')`.
+/// chmod'ing to 600?", '~/.arcrc')`. Unix-only like its sole use site
+/// (`ensure_arcrc_permissions_unix`), so the definition is gated too
+/// (T1170: ungated, this is dead code on Windows).
+#[cfg(not(windows))]
 const CHMOD_PROMPT: &str =
     "File permissions on your ~/.arcrc are too open. Fix them by chmod'ing to 600?";
 
 /// Decline text: `pht('Set %s to file mode 600.', '~/.arcrc')`.
+/// Unix-only like its sole use site (T1170).
+#[cfg(not(windows))]
 const CHMOD_DECLINED: &str = "Set ~/.arcrc to file mode 600.";
 
 /// True when an existing `path` has group/other permission bits set
@@ -890,9 +895,10 @@ fn fail(message: String) -> ExitCode {
 fn install_arcrc_for(arcrc_file: Option<&str>) -> Result<PathBuf, ExitCode> {
     match get_config::resolve_user_file(config::arcrc_path(), arcrc_file.map(Path::new)) {
         Ok(Some(path)) => Ok(path),
+        // LCOV_EXCL_START // Reason: needs HOME/USERPROFILE unset; always set in CI
         Ok(None) => Err(fail(
             "cannot locate ~/.arcrc (HOME/USERPROFILE is not set)".to_string(),
-        )),
+        )), // LCOV_EXCL_STOP
         Err(message) => Err(fail(message)),
     }
 }
@@ -906,7 +912,7 @@ fn install_token_value(options: &Options) -> Result<String, ExitCode> {
         return Ok(token.to_string());
     }
     match prompt_token() {
-        Ok(token) => Ok(token),
+        Ok(token) => Ok(token), // LCOV_EXCL_LINE // Reason: prompt success arm; needs a TTY
         Err(message) => Err(fail(message)),
     }
 }
@@ -919,8 +925,8 @@ fn confirm_standard_token(force: bool) -> Result<(), ExitCode> {
     print!("{}", standard_token_notice());
     let _ = std::io::stdout().flush();
     match prompt_confirm(CONFIRM_INSTALL_ANYWAY, true) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(fail(NOT_INSTALLING.to_string())),
+        Ok(true) => Ok(()), // LCOV_EXCL_START // Reason: confirm arms; need a TTY
+        Ok(false) => Err(fail(NOT_INSTALLING.to_string())), // LCOV_EXCL_STOP
         Err(message) => Err(fail(message)),
     }
 }
@@ -982,7 +988,7 @@ fn prepare_install(argv: &[String]) -> Result<InstallPlan, ExitCode> {
     let options = install_options(argv)?;
     let cwd = match std::env::current_dir() {
         Ok(dir) => dir,
-        Err(_) => PathBuf::from("."),
+        Err(_) => PathBuf::from("."), // LCOV_EXCL_LINE // Reason: current_dir is infallible in practice; deleting the cwd under parallel tests is unsafe
     };
     let uri = resolve_install_uri(&options, &cwd)?;
     let arcrc = install_arcrc_for(options.arcrc_file.as_deref())?;
@@ -1029,7 +1035,7 @@ fn read_install_token(
 ) -> Result<String, ExitCode> {
     match render_login_header(ansi) {
         Ok(header) => print!("{header}"),
-        Err(message) => return Err(fail(message)),
+        Err(message) => return Err(fail(message)), // LCOV_EXCL_LINE // Reason: fixed valid pattern plus correct argc; the render cannot fail
     }
     let token_url = token_login_url(uri, is_token_auth);
     println!("{}", login_page_block(&token_url));

@@ -79,6 +79,16 @@ fn lint_bytes_skips_without_running_tool() {
 }
 
 #[test]
+fn lint_bytes_stays_silent_without_the_tool() {
+    // With no `bin` override the linter consults PATH; `pyflakes` is
+    // absent from PATH here, so supported inputs stay silent without
+    // spawning anything. (Clean input would lint empty even where the
+    // tool is installed.)
+    let linter = PyFlakesLinter::new();
+    assert!(linter.lint_bytes("a.py", b"x = 1\n").is_empty());
+}
+
+#[test]
 fn binary_lookup_reads_only_the_given_path_env() {
     let dir = std::env::temp_dir().join(format!("arc-rs-pyflakes-lookup-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

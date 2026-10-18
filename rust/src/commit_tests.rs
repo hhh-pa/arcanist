@@ -4,6 +4,44 @@ fn args(list: &[&str]) -> Vec<String> {
     list.iter().map(|item| (*item).to_string()).collect()
 }
 
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-commit-tests-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+#[cfg(unix)]
+fn write_fake_svn(dir: &Path, stdout: &str) -> String {
+    let script = dir.join("svn");
+    std::fs::write(&script, format!("#!/bin/sh\nprintf '%s' '{stdout}'\n")).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+    script.to_string_lossy().to_string()
+}
+
 fn empty_options() -> Options {
     Options {
         messages: Vec::new(),
@@ -483,4 +521,150 @@ fn b23_commit_help_matches_generated_format() {
     );
     let ansi = usage_text(true);
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+}
+
+#[test]
+fn conduit_uri_rejects_empty_inline_values() {
+    assert_eq!(
+        parse_options(&args(&["--conduit-uri="])).unwrap_err(),
+        "--conduit-uri requires a non-empty value"
+    );
+}
+
+#[test]
+fn commit_message_rejects_non_string_results() {
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "differential.getcommitmessage".to_string(),
+        r#"{"result": 42, "error_code": null}"#.to_string(),
+    );
+    let (base, _rx) = serve_recording(routes, 1);
+    let client = Client::new(&base, "t").unwrap();
+    assert_eq!(
+        fetch_commit_message(&client, 7).unwrap_err(),
+        "conduit differential.getcommitmessage returned a non-string result"
+    );
+}
+
+#[test]
+fn message_file_allocation_fails_when_exhausted() {
+    // Pre-create a wide run of colliding names: every attempt hits
+    // `AlreadyExists` until the loop gives up.
+    let start = MESSAGE_COUNTER.load(std::sync::atomic::Ordering::Relaxed);
+    let mut created = Vec::new();
+    for n in start..start + 1000 {
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-cov5e-exhaust-{}-{n}.msg",
+            std::process::id()
+        ));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        created.push(path);
+    }
+    assert_eq!(
+        write_message_file("cov5e-exhaust", "x").unwrap_err(),
+        "failed to allocate a unique commit message file"
+    );
+    for path in &created {
+        std::fs::remove_file(path).ok();
+    }
+}
+
+#[test]
+fn message_file_reports_uncreatable_paths() {
+    let err = write_message_file("cov5e-no-such-dir-xyz/msg", "x").unwrap_err();
+    assert!(
+        err.starts_with("failed to write commit message file: "),
+        "{err}"
+    );
+}
+
+#[test]
+fn root_match_rejects_unresolvable_roots() {
+    assert!(!root_matches_source(
+        std::path::Path::new("/definitely/missing/root-xyz"),
+        "other"
+    ));
+}
+
+#[test]
+fn guessed_revision_propagates_query_failures() {
+    let tmp = TempDir::new("guess-fail");
+    let client = Client::new("http://127.0.0.1:9/", "t").unwrap();
+    assert!(
+        !svn_guessed_revision(&client, "PHID-USER-1", tmp.path())
+            .unwrap_err()
+            .is_empty()
+    );
+}
+
+#[test]
+fn guessed_revision_skips_foreign_source_paths() {
+    let tmp = TempDir::new("guess-foreign");
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "differential.query".to_string(),
+        r#"{"result": [{"id": 1, "sourcePath": "/foreign/path"}], "error_code": null}"#.to_string(),
+    );
+    let (base, _rx) = serve_recording(routes, 1);
+    let client = Client::new(&base, "t").unwrap();
+    let err = svn_guessed_revision(&client, "PHID-USER-1", tmp.path()).unwrap_err();
+    assert!(err.contains("Unable to identify the revision"), "{err}");
+}
+
+#[test]
+#[cfg(unix)]
+fn commit_file_list_aborts_on_missing_paths() {
+    let tmp = TempDir::new("file-list-abort");
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "differential.getcommitpaths".to_string(),
+        r#"{"result": ["ghost.txt"], "error_code": null}"#.to_string(),
+    );
+    let (base, _rx) = serve_recording(routes, 1);
+    let client = Client::new(&base, "t").unwrap();
+    let program = write_fake_svn(tmp.path(), r#"<?xml version="1.0"?><status></status>"#);
+    let svn = svn::SvnCommand::custom(&program, &[]);
+    let mut io = land::Io::canned(&["n"]);
+    let err = svn_commit_file_list(&mut io, &client, &svn, tmp.path(), 7).unwrap_err();
+    assert_eq!(err, land::ABORT);
+}
+
+#[test]
+#[cfg(unix)]
+fn t1170_flow_git_reports_silent_hook_failures() {
+    // T1170 band J: mirror of amend's silent-hook test — a
+    // `commit-msg` hook that fails without output surfaces our own
+    // error instead of git prose. Unix-only: hooks need `chmod`.
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new("t1170-silent-fail");
+    let git = |argv: &[&str]| {
+        let output = std::process::Command::new("git")
+            .current_dir(tmp.path())
+            .args(argv)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    };
+    git(&["init", "-q", "-b", "master"]);
+    git(&["config", "user.email", "t@t"]);
+    git(&["config", "user.name", "t"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(tmp.path().join("file.txt"), "base\n").unwrap();
+    git(&["add", "file.txt"]);
+    let hook = tmp.path().join(".git").join("hooks").join("commit-msg");
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&hook, permissions).unwrap();
+    let mut options = empty_options();
+    options.messages = vec!["msg".to_string()];
+    options.all = true;
+    assert_eq!(
+        flow_git(tmp.path(), &options).unwrap_err(),
+        "git commit failed"
+    );
 }

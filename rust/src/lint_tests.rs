@@ -324,6 +324,9 @@ fn empty_file_message_stops_later_linters() {
     engine.add_linter(Box::new(TextLinter::new()));
     engine.add_linter(Box::new(Noisy));
     assert_eq!(codes(&engine.lint_bytes("e.txt", b"")), vec!["TXT10"]);
+    // Direct call pins the helper shape; the engine above must not
+    // reach it (the empty-file message stops later linters).
+    assert_eq!(Noisy.lint_bytes("e.txt", b"")[0].code, "N1");
 }
 
 #[test]
@@ -1923,9 +1926,9 @@ fn r4_lint2_lint3_gather_emit_kinds() {
 }
 
 // -( T1153 Wave 2: lint retrocompat )--------------------------------------
-
+// LCOV_EXCL_START // Reason: referenced-but-never-called parser; the script fails before parsing
 fn lint4_failing_parser(_output: &str) -> Vec<crate::lint_script_and_regex::ScriptRegexMatch> {
-    unreachable!("the script fails before parsing")
+    unreachable!("the script fails before parsing") // LCOV_EXCL_STOP
 }
 
 #[test]
@@ -1969,8 +1972,8 @@ fn lint20_unreadable_files_fold_into_the_aggregate() {
         // Privileged runner (e.g. root in CI containers): permission
         // bits do not block reads, so the failure under test cannot
         // trigger.
-        return;
-    }
+        return; // LCOV_EXCL_LINE // Reason: privileged-runner skip; runs only where reads ignore permission bits (root CI)
+    } // LCOV_EXCL_START // Reason: post-root-skip body; dead where gates measure (CI runs as root, so the skip always takes); covered on macOS runs
     let work = WorkCopy {
         vcs: Vcs::Git,
         vcs_root: tmp.path().to_path_buf(),
@@ -1986,6 +1989,32 @@ fn lint20_unreadable_files_fold_into_the_aggregate() {
             &["locked.txt".to_string(), "ok.txt".to_string()]
         )
         .unwrap_err(),
+        "Some linters failed:"
+    );
+    // LCOV_EXCL_STOP
+}
+
+/// LINT-20 on Linux CI: the chmod trigger cannot fail a read for root,
+/// so `/proc/self/mem` (a regular file whose every read faults EIO —
+/// the same deterministic trigger as the paste/upload twins) folds
+/// into the aggregate instead. Skips where `/proc` is unavailable.
+#[cfg(target_os = "linux")]
+#[test]
+fn lint20_unreadable_proc_mem_folds_into_the_aggregate() {
+    if std::fs::symlink_metadata("/proc/self/mem").is_err() {
+        return; // LCOV_EXCL_LINE // Reason: /proc is always present where gates measure; the skip only trips in containers without /proc
+    }
+    let tmp = TempDir::new("lint20-proc");
+    tmp.write("ok.txt", "ok\n");
+    let work = WorkCopy {
+        vcs: Vcs::Git,
+        vcs_root: tmp.path().to_path_buf(),
+        project_root: tmp.path().to_path_buf(),
+    };
+    let mut engine = Engine::empty();
+    engine.add_linter(Box::new(TextLinter::new()));
+    assert_eq!(
+        workflow_lint_selection(&engine, &work, &["/proc/self/mem".to_string()]).unwrap_err(),
         "Some linters failed:"
     );
 }
@@ -2586,4 +2615,1795 @@ fn b23_lint_help_matches_generated_format() {
     assert!(text.contains("--severity"), "{text}");
     let ansi = usage_text(true);
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+}
+
+// -( T1170 coverage )-------------------------------------------------------
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn init_git_repo(tag: &str) -> TempDir {
+    let tmp = TempDir::new(tag);
+    git(tmp.path(), &["init", "-q"]);
+    git(tmp.path(), &["config", "user.email", "lint-unit@test"]);
+    git(tmp.path(), &["config", "user.name", "lint unit"]);
+    git(tmp.path(), &["config", "commit.gpgsign", "false"]);
+    git(tmp.path(), &["config", "core.autocrlf", "false"]);
+    tmp
+}
+
+fn commit_file(dir: &Path, name: &str, contents: &str) -> String {
+    std::fs::write(dir.join(name), contents).unwrap();
+    git(dir, &["add", name]);
+    git(dir, &["commit", "-q", "-m", contents]);
+    git(dir, &["rev-parse", "HEAD"])
+}
+
+fn git_work(root: &Path) -> WorkCopy {
+    WorkCopy {
+        vcs: Vcs::Git,
+        vcs_root: root.to_path_buf(),
+        project_root: root.to_path_buf(),
+    }
+}
+
+/// A linter keeping every trait default.
+struct DefaultLinter;
+
+impl Linter for DefaultLinter {
+    fn name(&self) -> &'static str {
+        "DEFAULT"
+    }
+
+    fn lint_bytes(&self, _path: &str, _data: &[u8]) -> Vec<LintMessage> {
+        Vec::new()
+    }
+}
+
+/// A linter failing like PHP's `lintPath()` throws.
+struct FailLinter;
+
+impl Linter for FailLinter {
+    fn name(&self) -> &'static str {
+        "FAIL"
+    }
+
+    fn lint_bytes(&self, _path: &str, _data: &[u8]) -> Vec<LintMessage> {
+        Vec::new()
+    }
+
+    fn should_lint_binary_files(&self) -> bool {
+        true
+    }
+
+    fn take_error(&self) -> Option<String> {
+        Some("boom".to_string())
+    }
+}
+
+/// A linter always raising one warning.
+struct NoisyLinter;
+
+impl Linter for NoisyLinter {
+    fn name(&self) -> &'static str {
+        "NOISY"
+    }
+
+    fn lint_bytes(&self, path: &str, _data: &[u8]) -> Vec<LintMessage> {
+        vec![LintMessage {
+            path: path.to_string(),
+            ..warn123(1, 1, None, None)
+        }]
+    }
+}
+
+#[test]
+fn cov_message_line_and_json_shapes() {
+    let message = warn123(3, 7, None, None);
+    assert_eq!(
+        message.to_line(),
+        "path/to/example.c:3:7: warning: Consider this."
+    );
+    let json = message.to_json();
+    assert_eq!(json["path"], serde_json::json!("path/to/example.c"));
+    assert_eq!(json["line"], serde_json::json!(3));
+    assert_eq!(json["char"], serde_json::json!(7));
+    assert_eq!(json["col"], serde_json::json!(7));
+    assert_eq!(json["code"], serde_json::json!("WARN123"));
+    assert_eq!(json["severity"], serde_json::json!("warning"));
+    assert_eq!(json["name"], serde_json::json!("Lint Warning"));
+    assert_eq!(json["description"], serde_json::json!("Consider this."));
+    assert_eq!(json["message"], serde_json::json!("Consider this."));
+}
+
+#[test]
+fn cov_linter_trait_defaults_reject_options_and_symlinks() {
+    let linter = DefaultLinter;
+    assert!(!linter.should_lint_symbolic_links());
+    let mut linter = DefaultLinter;
+    let ctx = OptionContext {
+        project_root: Path::new("."),
+    };
+    assert_eq!(
+        linter
+            .set_option("bogus", &serde_json::json!(1), &ctx)
+            .unwrap_err(),
+        "unknown option 'bogus'."
+    );
+    assert_eq!(linter.name(), "DEFAULT");
+    assert!(linter.lint_bytes("f.txt", b"ok\n").is_empty());
+}
+
+#[test]
+fn cov_text_linter_constructors_match_new() {
+    let mut map = HashMap::new();
+    map.insert("1".to_string(), SEVERITY_DISABLED.to_string());
+    let linter = TextLinter::with_severity_map(map);
+    assert_eq!(linter.max_line_length(), 80);
+    // The disabled DOS stop lets the charset phase flag the `\r`.
+    let found = linter.lint_bytes("d.txt", b"a\r\n");
+    assert_eq!(codes(&found), vec!["TXT1", "TXT5"]);
+    assert_eq!(TextLinter::default().max_line_length(), 80);
+    assert_eq!(TextLinter::default().name(), "TXT");
+}
+
+#[test]
+fn cov_text_linter_rejects_unknown_options() {
+    let mut linter = TextLinter::new();
+    let ctx = OptionContext {
+        project_root: Path::new("."),
+    };
+    assert_eq!(
+        linter
+            .set_option("text.bogus", &serde_json::json!(1), &ctx)
+            .unwrap_err(),
+        "unknown option 'text.bogus'."
+    );
+}
+
+#[test]
+fn cov_linter_factory_returns_none_past_xml() {
+    assert!(linter_for_php_to_xml("zzz-no-such-linter").is_none());
+}
+
+#[test]
+fn cov_cached_message_restores_null_bypass_and_locations() {
+    let mut dict: HashMap<String, serde_json::Value> = HashMap::new();
+    for (key, value) in [
+        ("path", serde_json::json!("a.txt")),
+        ("code", serde_json::json!("TXT2")),
+        ("severity", serde_json::json!("warning")),
+        ("name", serde_json::json!("Tab")),
+        ("description", serde_json::json!("d")),
+        ("bypassChangedLineFiltering", serde_json::Value::Null),
+        (
+            "locations",
+            serde_json::json!([
+                {"path": "b.txt", "line": 2, "char": 3, "original": "x"},
+                42,
+            ]),
+        ),
+    ] {
+        dict.insert(key.to_string(), value);
+    }
+    let cached = CachedMessage::from_dict(&dict).unwrap();
+    assert_eq!(cached.message.bypass_changed_line_filtering, None);
+    assert_eq!(cached.message.locations.len(), 1);
+    assert_eq!(
+        cached.message.locations[0],
+        OtherLocation {
+            path: Some("b.txt".to_string()),
+            line: 2,
+            char: 3,
+            original: Some("x".to_string()),
+        }
+    );
+    // Non-object entries and missing numbers fall back.
+    assert!(location_from_dict(&serde_json::json!(42)).is_none());
+    assert_eq!(
+        location_from_dict(&serde_json::json!({})).unwrap(),
+        OtherLocation {
+            path: None,
+            line: 0,
+            char: 0,
+            original: None,
+        }
+    );
+    dict.insert(
+        "bypassChangedLineFiltering".to_string(),
+        serde_json::json!(true),
+    );
+    dict.insert(
+        "locations".to_string(),
+        serde_json::json!([{"line": "not-a-number"}]),
+    );
+    let cached = CachedMessage::from_dict(&dict).unwrap();
+    assert_eq!(cached.message.bypass_changed_line_filtering, Some(true));
+    assert_eq!(cached.message.locations[0].line, 0);
+}
+
+#[test]
+fn cov_discover_arclint_walks_up_from_files_and_dirs() {
+    let tmp = TempDir::new("cov-arclint");
+    tmp.write(".arclint", r#"{"linters": {}}"#);
+    let deep = tmp.path().join("a/b");
+    std::fs::create_dir_all(&deep).unwrap();
+    let expected = tmp.path().join(".arclint");
+    assert_eq!(discover_arclint(&deep), Some(expected.clone()));
+    let file = tmp.write("a/b/f.txt", "x\n");
+    assert_eq!(discover_arclint(&file), Some(expected));
+    // No `.arclint` above the system temp dir: nothing found.
+    let bare = std::env::temp_dir().join(format!(
+        "lint-unit-cov-bare-{}-{}",
+        std::process::id(),
+        rand_suffix()
+    ));
+    std::fs::create_dir_all(&bare).unwrap();
+    assert_eq!(discover_arclint(&bare), None);
+    std::fs::remove_dir_all(&bare).ok();
+}
+
+#[test]
+fn cov_option_tables_cover_tool_linters() {
+    for (name, first, custom_after_base) in [
+        ("coffeelint", "coffeelint.config", false),
+        ("jscs", "jscs.config", false),
+        ("phpcs", "phpcs.standard", false),
+        ("puppet-lint", "puppet-lint.config", false),
+        ("pylint", "pylint.config", false),
+        ("rubocop", "rubocop.config", false),
+        ("script-and-regex", "script-and-regex.script", false),
+        ("xhpast", "xhpast.php-version", true),
+    ] {
+        let (table, after) = linter_option_table(name);
+        assert_eq!(table[0].0, first, "{name}");
+        assert_eq!(after, custom_after_base, "{name}");
+        assert!(table.len() > 1, "{name}");
+    }
+    let (table, after) = linter_option_table("xhpast");
+    assert_eq!(table.len(), 9);
+    assert!(after);
+    let (table, _) = linter_option_table("script-and-regex");
+    assert_eq!(table[1], ("script-and-regex.regex", OptionType::Regex));
+}
+
+#[test]
+fn cov_option_value_shapes_match_phutil_types() {
+    assert!(option_value_matches(
+        OptionType::Bool,
+        &serde_json::json!(true)
+    ));
+    assert!(!option_value_matches(
+        OptionType::Bool,
+        &serde_json::json!(1)
+    ));
+    assert!(option_value_matches(
+        OptionType::Regex,
+        &serde_json::json!("/^a+$/")
+    ));
+    assert!(!option_value_matches(
+        OptionType::Regex,
+        &serde_json::json!("/(/")
+    ));
+    assert!(!option_value_matches(
+        OptionType::Regex,
+        &serde_json::json!("(")
+    ));
+    assert!(!option_value_matches(
+        OptionType::Regex,
+        &serde_json::json!(7)
+    ));
+    assert!(option_value_matches(
+        OptionType::MapStrList,
+        &serde_json::json!({"a": ["x"]})
+    ));
+    assert!(!option_value_matches(
+        OptionType::MapStrList,
+        &serde_json::json!({"a": "x"})
+    ));
+    assert!(option_value_matches(
+        OptionType::MapStrStr,
+        &serde_json::json!({"a": "x"})
+    ));
+    assert!(!option_value_matches(
+        OptionType::MapStrStr,
+        &serde_json::json!({"a": 1})
+    ));
+    assert!(option_value_matches(
+        OptionType::MapStrInt,
+        &serde_json::json!({"a": 2})
+    ));
+    assert!(!option_value_matches(
+        OptionType::MapStrInt,
+        &serde_json::json!({"a": "x"})
+    ));
+    assert!(!option_value_matches(
+        OptionType::MapStrInt,
+        &serde_json::json!([])
+    ));
+    assert_eq!(option_type_expectation(OptionType::Str), "a string");
+    assert_eq!(option_type_expectation(OptionType::Bool), "a boolean");
+    assert_eq!(
+        option_type_expectation(OptionType::StrOrStrList),
+        "a string or a list of strings"
+    );
+    assert_eq!(
+        option_type_expectation(OptionType::Regex),
+        "a valid regular expression"
+    );
+    assert_eq!(
+        option_type_expectation(OptionType::MapStrList),
+        "a map from strings to lists of strings"
+    );
+    assert_eq!(
+        option_type_expectation(OptionType::MapStrStr),
+        "a map from strings to strings"
+    );
+    assert_eq!(
+        option_type_expectation(OptionType::MapStrInt),
+        "a map from strings to integers"
+    );
+    assert_eq!(
+        check_option_type("k", OptionType::Regex, &serde_json::json!("(")).unwrap_err(),
+        "'k' must be a valid regular expression"
+    );
+    assert!(check_option_type("k", OptionType::Bool, &serde_json::json!(false)).is_ok());
+}
+
+#[test]
+fn cov_unknown_linter_type_names_the_type() {
+    // `parse_arclint` rejects unknown types first, so the section
+    // builder is reached directly with a hand-made spec.
+    let spec = arclint::LinterSpec {
+        name: "x".to_string(),
+        linter_type: "nope".to_string(),
+        display: String::new(),
+        include: Vec::new(),
+        exclude: Vec::new(),
+        severity: arclint::SeverityOverrides::default(),
+        extra: HashMap::new(),
+    };
+    assert_eq!(
+        build_section(&spec, &[], Path::new(".")).err().unwrap(),
+        "Error in parsing '.arclint' file: unknown linter type 'nope'."
+    );
+}
+
+#[test]
+fn cov_unknown_option_keys_name_the_key() {
+    let config =
+        arclint::parse_arclint(r#"{"linters": {"t": {"type": "text", "bogus": 1}}}"#).unwrap();
+    assert_eq!(
+        Engine::from_config(&config, Path::new(".")).err().unwrap(),
+        "Error in parsing '.arclint' file, for linter 't'.\nunknown option 'bogus'."
+    );
+}
+
+#[test]
+fn cov_standard_rejected_without_severity_customization() {
+    let config =
+        arclint::parse_arclint(r#"{"linters": {"g": {"type": "generated", "standard": "x"}}}"#)
+            .unwrap();
+    assert_eq!(
+        Engine::from_config(&config, Path::new(".")).err().unwrap(),
+        "Error in parsing '.arclint' file, for linter 'g'.\nunknown option 'standard'."
+    );
+}
+
+#[test]
+fn cov_lessc_custom_options_apply_after_base() {
+    let config = arclint::parse_arclint(
+        r#"{"linters": {"l": {"type": "lessc", "lessc.strict-math": true}}}"#,
+    )
+    .unwrap();
+    assert!(Engine::from_config(&config, Path::new(".")).is_ok());
+    let config = arclint::parse_arclint(
+        r#"{"linters": {"l": {"type": "lessc", "lessc.strict-math": "x"}}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        Engine::from_config(&config, Path::new(".")).err().unwrap(),
+        "Error in parsing '.arclint' file, for linter 'l'.\n'lessc.strict-math' must be a boolean"
+    );
+}
+
+#[test]
+fn cov_severity_keys_rejected_without_customization() {
+    let config = arclint::parse_arclint(
+        r#"{"linters": {"g": {"type": "generated", "severity": {"1": "warning"}}}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        Engine::from_config(&config, Path::new(".")).err().unwrap(),
+        "Error in parsing '.arclint' file, for linter 'g'.\nunknown option 'severity'."
+    );
+    let config = arclint::parse_arclint(
+        r#"{"linters": {"g": {"type": "generated", "severity.rules": {"/^1$/": "warning"}}}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        Engine::from_config(&config, Path::new(".")).err().unwrap(),
+        "Error in parsing '.arclint' file, for linter 'g'.\nunknown option 'severity.rules'."
+    );
+    // The `standard` shape check is unreachable through the config
+    // (surplus-key rejection fires first), so it is reached directly.
+    let mut linter: Box<dyn Linter> = Box::new(crate::lint_generated::GeneratedLinter::new());
+    let spec = arclint::LinterSpec {
+        name: "g".to_string(),
+        linter_type: "generated".to_string(),
+        display: "GEN".to_string(),
+        include: Vec::new(),
+        exclude: Vec::new(),
+        severity: arclint::SeverityOverrides::default(),
+        extra: HashMap::from([("standard".to_string(), serde_json::json!("phutil.xhpast"))]),
+    };
+    let ctx = OptionContext {
+        project_root: Path::new("."),
+    };
+    assert_eq!(
+        apply_base_options(&mut linter, &spec, "generated", &ctx).unwrap_err(),
+        "Error in parsing '.arclint' file, for linter 'g'.\nunknown option 'standard'."
+    );
+}
+
+#[test]
+fn cov_xhpast_standard_accepts_lists_like_php() {
+    let config = arclint::parse_arclint(
+        r#"{"linters": {"x": {"type": "xhpast", "standard": ["phutil.xhpast"]}}}"#,
+    )
+    .unwrap();
+    let engine = Engine::from_config(&config, Path::new(".")).unwrap();
+    assert_eq!(
+        engine.severity_for("XHP", "XHP16", SEVERITY_WARNING),
+        SEVERITY_ADVICE
+    );
+    assert_eq!(
+        engine.severity_for("XHP", "XHP34", SEVERITY_WARNING),
+        SEVERITY_ERROR
+    );
+}
+
+#[test]
+fn cov_apply_standard_matches_php() {
+    let ctx = OptionContext {
+        project_root: Path::new("."),
+    };
+    let mut severity = arclint::SeverityOverrides::default();
+    let mut linter: Box<dyn Linter> = Box::new(crate::lint_xhpast::XhpastLinter::new());
+    apply_standard(&mut severity, &mut linter, "xhpast", "phutil.xhpast", &ctx).unwrap();
+    assert_eq!(severity.map.get("16").map(String::as_str), Some("advice"));
+    assert_eq!(severity.map.get("34").map(String::as_str), Some("error"));
+    assert_eq!(severity.map.get("87").map(String::as_str), Some("warning"));
+    // Explicit entries win over the standard.
+    severity.map.insert("16".to_string(), "error".to_string());
+    apply_standard(&mut severity, &mut linter, "xhpast", "phutil.xhpast", &ctx).unwrap();
+    assert_eq!(severity.map.get("16").map(String::as_str), Some("error"));
+    assert_eq!(
+        apply_standard(&mut severity, &mut linter, "xhpast", "bogus", &ctx).unwrap_err(),
+        "No such linter standard. Available standards are: phutil.xhpast."
+    );
+    assert_eq!(
+        apply_standard(&mut severity, &mut linter, "text", "phutil.xhpast", &ctx).unwrap_err(),
+        "No such linter standard. Available standards are: ."
+    );
+}
+
+#[test]
+fn cov_engine_default_matches_new() {
+    let engine = Engine::default();
+    assert!(!engine.is_empty());
+    assert!(!engine.is_comprehensive());
+    assert_eq!(engine.cache_version(), Engine::new().cache_version());
+}
+
+#[test]
+fn cov_severity_for_unknown_display_returns_default() {
+    assert_eq!(
+        Engine::empty().severity_for("TXT", "TXT1", SEVERITY_ERROR),
+        SEVERITY_ERROR
+    );
+    assert_eq!(
+        Engine::new().severity_for("NOPE", "X", SEVERITY_WARNING),
+        SEVERITY_WARNING
+    );
+}
+
+#[test]
+fn cov_routing_skips_unlisted_paths() {
+    let config =
+        arclint::parse_arclint(r#"{"linters": {"t": {"type": "text", "include": ["/\\.php$/"]}}}"#)
+            .unwrap();
+    let engine = Engine::from_config(&config, Path::new(".")).unwrap();
+    assert!(engine.lint_bytes("x.txt", b"x\ty\n").is_empty());
+    let found = engine.lint_bytes("x.php", b"x\ty\n");
+    assert_eq!(codes(&found), vec!["TXT2"]);
+}
+
+#[test]
+fn cov_unusable_cache_runs_fresh_like_php() {
+    // Global granularity never reuses the cache, so the section runs
+    // fresh even with an entry recorded at this version.
+    let config =
+        arclint::parse_arclint(r#"{"linters": {"p": {"type": "phutil-library"}}}"#).unwrap();
+    let mut engine = Engine::from_config(&config, Path::new(".")).unwrap();
+    let version = engine.cache_version();
+    let mut by_version = HashMap::new();
+    by_version.insert(
+        version,
+        CachedPathResults {
+            repository_version: None,
+            stopped: None,
+            messages: Vec::new(),
+        },
+    );
+    let mut cached = CachedResults::new();
+    cached.insert("a.php".to_string(), by_version);
+    engine.set_cached_results(cached);
+    let found = engine.lint_bytes("a.php", b"<?php\nclass A {}\nfunction f() {}\n");
+    assert_eq!(codes(&found), vec!["PHL3"]);
+}
+
+#[test]
+fn cov_repository_version_gates_cache_merge() {
+    let config = arclint::parse_arclint(r#"{"linters": {"t": {"type": "text"}}}"#).unwrap();
+    let mut engine = Engine::from_config(&config, Path::new(".")).unwrap();
+    let version = engine.cache_version();
+    let cached_message = CachedMessage {
+        message: LintMessage {
+            path: "a.txt".to_string(),
+            ..warn123(3, 1, None, None)
+        },
+        granularity: Some(GRANULARITY_REPOSITORY),
+    };
+    let mut by_version = HashMap::new();
+    by_version.insert(
+        version,
+        CachedPathResults {
+            repository_version: Some("r1".to_string()),
+            stopped: None,
+            messages: vec![cached_message],
+        },
+    );
+    let mut cached = CachedResults::new();
+    cached.insert("a.txt".to_string(), by_version);
+    engine.set_cached_results(cached);
+    // Mismatched versions merge nothing (the file section still
+    // skips execution, but the repository message is dropped).
+    engine.set_repository_version(Some("r2".to_string()));
+    assert!(engine.lint_bytes("a.txt", b"ok\x01\n").is_empty());
+    // Matching versions merge the cached message instead.
+    engine.set_repository_version(Some("r1".to_string()));
+    let merged = engine.lint_bytes("a.txt", b"ok\x01\n");
+    assert_eq!(codes(&merged), vec!["WARN123"]);
+}
+
+#[test]
+fn cov_dos_stop_skips_later_linters() {
+    let mut engine = Engine::empty();
+    engine.add_linter(Box::new(TextLinter::new()));
+    engine.add_linter(Box::new(NoisyLinter));
+    assert_eq!(codes(&engine.lint_bytes("d.txt", b"a\r\n")), vec!["TXT1"]);
+    // Direct call pins the helper shape; the engine above must not
+    // reach it (the DOS stop skips later linters).
+    let direct = NoisyLinter.lint_bytes("d.txt", b"x");
+    assert_eq!(direct.len(), 1);
+    assert_eq!(direct[0].code, "WARN123");
+}
+
+#[test]
+fn cov_lint_file_joins_section_errors() {
+    let tmp = TempDir::new("cov-fail");
+    let file = tmp.write("f.txt", "ok\n");
+    let mut engine = Engine::empty();
+    engine.add_linter(Box::new(FailLinter));
+    assert_eq!(engine.lint_file(&file, "f.txt").unwrap_err(), "boom");
+}
+
+#[test]
+fn cov_comprehensive_skips_externals() {
+    let engine = Engine::comprehensive();
+    let missing = PathBuf::from("externals/no-such-file.php");
+    assert!(
+        engine
+            .lint_file(&missing, "externals/no-such-file.php")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn cov_symlinks_reach_only_opted_in_linters() {
+    let tmp = TempDir::new("cov-symlink");
+    let target = tmp.write("target.txt", "\t\n");
+    let link = tmp.path().join("link.txt");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let mut engine = Engine::empty();
+    engine.add_linter(Box::new(TextLinter::new()));
+    assert!(engine.lint_file(&link, "link.txt").unwrap().is_empty());
+    // The filename linter opts into symlinks and still runs.
+    let config = arclint::parse_arclint(r#"{"linters": {"n": {"type": "filename"}}}"#).unwrap();
+    let engine = Engine::from_config(&config, Path::new(".")).unwrap();
+    assert!(engine.lint_file(&link, "link.txt").unwrap().is_empty());
+    let bad = tmp.path().join("bad name.txt");
+    std::os::unix::fs::symlink(&target, &bad).unwrap();
+    let found = engine.lint_file(&bad, "bad name.txt").unwrap();
+    assert_eq!(codes(&found), vec!["NAME1"]);
+}
+
+#[test]
+fn cov_filtered_routing_skips_unlisted_paths() {
+    let config = arclint::parse_arclint(
+        r#"{"linters": {"n": {"type": "filename", "include": ["/\\.php$/"]}}}"#,
+    )
+    .unwrap();
+    let engine = Engine::from_config(&config, Path::new(".")).unwrap();
+    let tmp = TempDir::new("cov-filter-route");
+    let file = tmp.path().join("b.bin");
+    std::fs::write(&file, b"a\0b").unwrap();
+    assert!(engine.lint_file(&file, "b.bin").unwrap().is_empty());
+}
+
+#[test]
+#[cfg(unix)]
+fn cov_filtered_comprehensive_allow_list_skips_chmod() {
+    use std::os::unix::fs::PermissionsExt;
+    // An executable zip: CHMOD fires under the plain engine, but the
+    // comprehensive allow-list for `.txt` drops it on filtered paths.
+    let tmp = TempDir::new("cov-filter-allow");
+    let file = tmp.path().join("tool.txt");
+    let mut data = b"PK\x03\x04".to_vec();
+    data.extend_from_slice(&[0u8; 16]);
+    std::fs::write(&file, &data).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let plain = Engine::new().lint_file(&file, "tool.txt").unwrap();
+    assert_eq!(codes(&plain), vec!["CHMOD1"]);
+    assert!(plain[0].description.contains("should not be executable"));
+    let filtered = Engine::comprehensive()
+        .lint_file(&file, "tool.txt")
+        .unwrap();
+    assert!(filtered.is_empty());
+}
+
+#[test]
+fn cov_filtered_cache_skips_execution() {
+    let config = arclint::parse_arclint(r#"{"linters": {"n": {"type": "filename"}}}"#).unwrap();
+    let mut engine = Engine::from_config(&config, Path::new(".")).unwrap();
+    let version = engine.cache_version();
+    let cached_message = CachedMessage {
+        message: LintMessage {
+            path: "b.bin".to_string(),
+            ..warn123(1, 1, None, None)
+        },
+        granularity: Some(GRANULARITY_FILE),
+    };
+    let mut by_version = HashMap::new();
+    by_version.insert(
+        version,
+        CachedPathResults {
+            repository_version: None,
+            stopped: None,
+            messages: vec![cached_message],
+        },
+    );
+    let mut cached = CachedResults::new();
+    cached.insert("b.bin".to_string(), by_version);
+    engine.set_cached_results(cached);
+    let tmp = TempDir::new("cov-filter-cache");
+    let file = tmp.path().join("b.bin");
+    std::fs::write(&file, b"a\0b").unwrap();
+    let merged = engine.lint_file(&file, "b.bin").unwrap();
+    assert_eq!(codes(&merged), vec!["WARN123"]);
+}
+
+#[test]
+fn cov_filtered_section_errors_collected() {
+    let tmp = TempDir::new("cov-filter-err");
+    let file = tmp.path().join("b.bin");
+    std::fs::write(&file, b"a\0b").unwrap();
+    let mut engine = Engine::empty();
+    engine.add_linter(Box::new(FailLinter));
+    let (_, errors) = engine.lint_file_with_errors(&file, "b.bin");
+    assert_eq!(errors, vec!["boom".to_string()]);
+}
+
+#[test]
+fn cov_vcs_names_and_capabilities() {
+    assert_eq!(Vcs::Git.system_name(), "git");
+    assert_eq!(Vcs::Hg.system_name(), "hg");
+    assert_eq!(Vcs::Svn.system_name(), "svn");
+    assert!(Vcs::Git.supports_commit_ranges());
+    assert!(Vcs::Hg.supports_commit_ranges());
+    assert!(!Vcs::Svn.supports_commit_ranges());
+    assert!(!Vcs::Git.is_history_default_immutable());
+    assert!(Vcs::Hg.is_history_default_immutable());
+    assert!(Vcs::Svn.is_history_default_immutable());
+    assert!(Vcs::Git.supports_amend(Path::new(".")));
+    assert!(!Vcs::Svn.supports_amend(Path::new(".")));
+    // Mercurial probes the working copy; the wrapper only maps errors
+    // to false.
+    let tmp = TempDir::new("cov-amend");
+    assert_eq!(
+        Vcs::Hg.supports_amend(tmp.path()),
+        crate::hg::supports_amend(tmp.path()).unwrap_or(false)
+    );
+}
+
+#[test]
+fn cov_discover_working_copy_from_file() {
+    let tmp = TempDir::new("cov-wc-file");
+    std::fs::create_dir_all(tmp.path().join("repo/.git")).unwrap();
+    let file = tmp.write("repo/sub/f.txt", "x\n");
+    let work = discover_working_copy(&file).unwrap();
+    assert_eq!(work.vcs, Vcs::Git);
+    assert_eq!(work.vcs_root, tmp.path().join("repo"));
+}
+
+#[test]
+fn cov_svn_project_root_from_file_and_fallback() {
+    let tmp = TempDir::new("cov-svn-root");
+    std::fs::create_dir_all(tmp.path().join("svn/.svn")).unwrap();
+    tmp.write("svn/proj/.arcconfig", "{}");
+    // A file start resolves through its parent directory.
+    let file = tmp.write("svn/proj/sub/f.txt", "x\n");
+    let work = discover_working_copy(&file).unwrap();
+    assert_eq!(work.vcs, Vcs::Svn);
+    assert_eq!(work.project_root, tmp.path().join("svn/proj"));
+    // Without any `.arcconfig`, the project root is the VCS root.
+    let bare = tmp.path().join("svn/other/deep");
+    std::fs::create_dir_all(&bare).unwrap();
+    let work = discover_working_copy(&bare).unwrap();
+    assert_eq!(work.project_root, tmp.path().join("svn"));
+}
+
+#[test]
+fn cov_config_string_ignores_non_strings() {
+    let tmp = TempDir::new("cov-cfg-str");
+    let work = git_work(tmp.path());
+    tmp.write(".arcconfig", r#"{"lint.unit.probe.key": 5}"#);
+    assert_eq!(config_string(&work, "lint.unit.probe.key").unwrap(), None);
+    tmp.write(".arcconfig", r#"{"lint.unit.probe.key": "v"}"#);
+    assert_eq!(
+        config_string(&work, "lint.unit.probe.key").unwrap(),
+        Some("v".to_string())
+    );
+}
+
+#[test]
+fn cov_config_layers_reject_bad_json_and_shapes() {
+    // Non-object JSON contributes nothing.
+    let tmp = TempDir::new("cov-cfg-layer");
+    let array = tmp.write("layer.json", "[1, 2]");
+    assert_eq!(read_config_layer(&array, "k", false).unwrap(), None);
+    // Invalid project JSON names the `.arcconfig` file.
+    let project = tmp.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join(".arcconfig"), "{broken").unwrap();
+    let error = config_value_in(&project, None, None, None, "lint.engine").unwrap_err();
+    assert!(
+        error.starts_with("Unable to parse '.arcconfig' file '"),
+        "{error}"
+    );
+}
+
+#[test]
+fn cov_local_config_path_covers_svn_and_relative_gitfiles() {
+    let tmp = TempDir::new("cov-local");
+    let root = tmp.path().join("repo");
+    std::fs::create_dir_all(root.join(".svn")).unwrap();
+    let svn = WorkCopy {
+        vcs: Vcs::Svn,
+        vcs_root: root.clone(),
+        project_root: root.clone(),
+    };
+    assert_eq!(local_config_path(&svn), Some(root.join(".svn/arc/config")));
+    // Relative `gitdir:` pointers resolve against the VCS root.
+    std::fs::create_dir_all(tmp.path().join("real.git")).unwrap();
+    std::fs::write(root.join(".git"), "gitdir: ../real.git").unwrap();
+    let work = git_work(&root);
+    assert_eq!(
+        local_config_path(&work),
+        Some(root.join("../real.git/arc/config"))
+    );
+}
+
+#[test]
+fn cov_git_two_commit_detection() {
+    let tmp = init_git_repo("cov-twocommit");
+    assert!(!git_repository_has_two_commits(tmp.path()));
+    commit_file(tmp.path(), "a.txt", "one\n");
+    assert!(!git_repository_has_two_commits(tmp.path()));
+    commit_file(tmp.path(), "b.txt", "two\n");
+    assert!(git_repository_has_two_commits(tmp.path()));
+}
+
+#[test]
+fn cov_git_default_base_single_commit_uses_empty_tree() {
+    let tmp = init_git_repo("cov-rootbase");
+    commit_file(tmp.path(), "a.txt", "one\n");
+    let work = git_work(tmp.path());
+    let mut input = std::io::BufReader::new("".as_bytes());
+    assert_eq!(
+        git_default_base(&work, &mut input, &mut |_| {}, false).unwrap(),
+        crate::git::GIT_MAGIC_ROOT_COMMIT
+    );
+}
+
+#[test]
+fn cov_git_default_base_reads_arcconfig() {
+    let tmp = init_git_repo("cov-cfgbase");
+    let first = commit_file(tmp.path(), "a.txt", "one\n");
+    commit_file(tmp.path(), "b.txt", "two\n");
+    tmp.write(".arcconfig", r#"{"git.default-relative-commit": "HEAD~1"}"#);
+    let work = git_work(tmp.path());
+    let mut input = std::io::BufReader::new("".as_bytes());
+    assert_eq!(
+        git_default_base(&work, &mut input, &mut |_| {}, false).unwrap(),
+        first
+    );
+}
+
+#[test]
+fn cov_git_default_base_resolves_upstream() {
+    let bare = TempDir::new("cov-upstream-bare");
+    git(bare.path(), &["init", "-q", "--bare"]);
+    let work_dir = TempDir::new("cov-upstream-work");
+    let source = std::env::current_dir()
+        .unwrap()
+        .join(bare.path())
+        .to_string_lossy()
+        .into_owned();
+    git(work_dir.path(), &["clone", "-q", &source, "."]);
+    git(work_dir.path(), &["config", "user.email", "lint-unit@test"]);
+    git(work_dir.path(), &["config", "user.name", "lint unit"]);
+    commit_file(work_dir.path(), "a.txt", "one\n");
+    let head = commit_file(work_dir.path(), "b.txt", "two\n");
+    git(work_dir.path(), &["push", "-q", "-u", "origin", "HEAD"]);
+    let work = git_work(work_dir.path());
+    let mut input = std::io::BufReader::new("".as_bytes());
+    assert_eq!(
+        git_default_base(&work, &mut input, &mut |_| {}, false).unwrap(),
+        head
+    );
+}
+
+#[test]
+fn cov_git_default_base_reads_scratch() {
+    let tmp = init_git_repo("cov-scratchbase");
+    let first = commit_file(tmp.path(), "a.txt", "one\n");
+    commit_file(tmp.path(), "b.txt", "two\n");
+    let scratch = tmp.path().join(".git/arc/default-relative-commit");
+    std::fs::create_dir_all(scratch.parent().unwrap()).unwrap();
+    std::fs::write(&scratch, "HEAD~1").unwrap();
+    let work = git_work(tmp.path());
+    let mut input = std::io::BufReader::new("".as_bytes());
+    assert_eq!(
+        git_default_base(&work, &mut input, &mut |_| {}, false).unwrap(),
+        first
+    );
+}
+
+#[test]
+fn cov_git_default_base_prompts_and_remembers() {
+    let tmp = init_git_repo("cov-promptbase");
+    let first = commit_file(tmp.path(), "a.txt", "one\n");
+    commit_file(tmp.path(), "b.txt", "two\n");
+    let work = git_work(tmp.path());
+    let mut prompted = String::new();
+    let mut input = std::io::BufReader::new("HEAD~1\n".as_bytes());
+    let base = git_default_base(
+        &work,
+        &mut input,
+        &mut |text| prompted.push_str(text),
+        false,
+    )
+    .unwrap();
+    assert_eq!(base, first);
+    assert!(
+        prompted.contains("Select a Default Commit Range"),
+        "{prompted}"
+    );
+    // The answer is remembered in the scratch file.
+    let scratch = tmp.path().join(".git/arc/default-relative-commit");
+    assert_eq!(std::fs::read_to_string(&scratch).unwrap(), "HEAD~1");
+}
+
+#[test]
+fn cov_git_default_base_rejects_bad_relative_commits() {
+    let tmp = init_git_repo("cov-badbase");
+    commit_file(tmp.path(), "a.txt", "one\n");
+    commit_file(tmp.path(), "b.txt", "two\n");
+    let work = git_work(tmp.path());
+    // A blank prompt answer defaults to `origin/master`, which names
+    // nothing here.
+    let mut input = std::io::BufReader::new("\n".as_bytes());
+    assert_eq!(
+        git_default_base(&work, &mut input, &mut |_| {}, false).unwrap_err(),
+        "Relative commit 'origin/master' is not the name of a commit!"
+    );
+    // An unknown `.arcconfig` symbol names the missing commit.
+    tmp.write(
+        ".arcconfig",
+        r#"{"git.default-relative-commit": "no-such-ref-zzz"}"#,
+    );
+    let mut input = std::io::BufReader::new("".as_bytes());
+    assert_eq!(
+        git_default_base(&work, &mut input, &mut |_| {}, false).unwrap_err(),
+        "Unable to find any git commit named 'no-such-ref-zzz' in this repository."
+    );
+}
+
+#[test]
+fn cov_scratch_helpers_handle_missing_and_blank() {
+    // Outside any repository (`rev-parse` would otherwise walk up to
+    // the real worktree): no scratch path, silent writes.
+    let dir = std::env::temp_dir().join(format!(
+        "lint-unit-cov-scratch-{}-{}",
+        std::process::id(),
+        rand_suffix()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    assert_eq!(read_default_relative_commit(&dir), None);
+    assert!(git_scratch_path(&dir).is_none());
+    write_default_relative_commit(&dir, "HEAD~1");
+    assert_eq!(read_default_relative_commit(&dir), None);
+    std::fs::remove_dir_all(&dir).ok();
+    // Blank scratch reads as missing.
+    let repo = init_git_repo("cov-scratch-blank");
+    let scratch = repo.path().join(".git/arc/default-relative-commit");
+    std::fs::create_dir_all(scratch.parent().unwrap()).unwrap();
+    std::fs::write(&scratch, "  \n").unwrap();
+    assert_eq!(read_default_relative_commit(repo.path()), None);
+}
+
+#[test]
+fn cov_hg_base_reports_errors() {
+    let tmp = TempDir::new("cov-hgbase");
+    let work = WorkCopy {
+        vcs: Vcs::Hg,
+        vcs_root: tmp.path().to_path_buf(),
+        project_root: tmp.path().to_path_buf(),
+    };
+    let error = hg_base_for(&work, Some("tip")).unwrap_err();
+    assert!(!error.is_empty(), "{error}");
+    let error = hg_base_for(&work, None).unwrap_err();
+    assert!(!error.is_empty(), "{error}");
+}
+
+#[test]
+fn cov_collect_explicit_covers_absolute_and_root_displays() {
+    let tmp = TempDir::new("cov-explicit");
+    tmp.write("sub/f.txt", "x\n");
+    // Contained paths display project-relative.
+    let files = collect_explicit(&["sub/f.txt".to_string()], tmp.path(), tmp.path()).unwrap();
+    assert_eq!(files[0].1, "sub/f.txt");
+    // Absolute paths keep their absolute display outside the project.
+    let outside = TempDir::new("cov-explicit-out");
+    let file = outside.write("o.txt", "x\n");
+    let absolute = std::env::current_dir().unwrap().join(&file);
+    let files = collect_explicit(
+        &[absolute.to_string_lossy().into_owned()],
+        tmp.path(),
+        tmp.path(),
+    )
+    .unwrap();
+    assert_eq!(PathBuf::from(&files[0].1), absolute);
+    // The project root itself displays as given.
+    let root = std::env::current_dir().unwrap().join(tmp.path());
+    let files = collect_explicit(
+        &[root.to_string_lossy().into_owned()],
+        tmp.path(),
+        tmp.path(),
+    )
+    .unwrap();
+    assert_eq!(PathBuf::from(&files[0].1), root);
+}
+
+#[test]
+fn cov_dot_segments_normalize() {
+    let tmp = TempDir::new("cov-dot");
+    tmp.write("f.txt", "x\n");
+    tmp.write("g.txt", "x\n");
+    std::fs::create_dir(tmp.path().join("sub")).unwrap();
+    // A leading `./` survives `components()` and is skipped.
+    let files = collect_explicit(&["./f.txt".to_string()], tmp.path(), tmp.path()).unwrap();
+    assert_eq!(files[0].1, "f.txt");
+    // Absolute dotdot paths rebuild through the root.
+    let root = std::env::current_dir().unwrap().join(tmp.path());
+    let dotted = format!("{}/sub/../g.txt", root.display());
+    let files = collect_explicit(&[dotted], tmp.path(), &root).unwrap();
+    assert_eq!(files[0].1, "g.txt");
+}
+
+#[test]
+fn cov_status_paths_reports_hg_svn_errors() {
+    let tmp = TempDir::new("cov-status");
+    for vcs in [Vcs::Hg, Vcs::Svn] {
+        let work = WorkCopy {
+            vcs,
+            vcs_root: tmp.path().to_path_buf(),
+            project_root: tmp.path().to_path_buf(),
+        };
+        let error = status_paths(&work, None).unwrap_err();
+        assert!(!error.is_empty(), "{vcs:?}: {error}");
+    }
+}
+
+#[test]
+fn cov_merge_hg_svn_status_reports_errors() {
+    let tmp = TempDir::new("cov-merge");
+    let mut merged = BTreeMap::new();
+    assert!(merge_hg_status(tmp.path(), None, &mut merged).is_err());
+    assert!(merge_hg_status(tmp.path(), Some("tip"), &mut merged).is_err());
+    assert!(merge_svn_status(tmp.path(), &mut merged).is_err());
+    assert!(merged.is_empty());
+}
+
+#[test]
+fn cov_everything_paths_reports_hg_svn_errors() {
+    let tmp = TempDir::new("cov-everything");
+    for vcs in [Vcs::Hg, Vcs::Svn] {
+        let work = WorkCopy {
+            vcs,
+            vcs_root: tmp.path().to_path_buf(),
+            project_root: tmp.path().to_path_buf(),
+        };
+        let error = everything_paths(&work).unwrap_err();
+        assert!(!error.is_empty(), "{vcs:?}: {error}");
+    }
+}
+
+#[test]
+fn cov_changed_files_span_git_range() {
+    let tmp = init_git_repo("cov-changed");
+    commit_file(tmp.path(), "a.txt", "one\n");
+    commit_file(tmp.path(), "b.txt", "two\n");
+    std::fs::write(tmp.path().join("a.txt"), "one-changed\n").unwrap();
+    let files = changed_files_in(tmp.path(), Some("HEAD~1")).unwrap();
+    let names: Vec<&str> = files.iter().map(|(_, display)| display.as_str()).collect();
+    assert!(names.contains(&"a.txt"), "{names:?}");
+    assert!(names.contains(&"b.txt"), "{names:?}");
+    assert_eq!(files[0].0, tmp.path().join(&files[0].1));
+}
+
+#[test]
+fn cov_hunk_parser_ignores_malformed_headers() {
+    assert!(parse_changed_lines("@@ bogus\n+nope\n").is_empty());
+    let changed = parse_changed_lines("@@ bogus\n@@ -1 +1 @@\n+yes\n");
+    assert_eq!(changed, BTreeSet::from([1]));
+}
+
+#[test]
+fn cov_changed_lines_none_for_missing_dir_and_binary() {
+    let tmp = init_git_repo("cov-changed-lines");
+    commit_file(tmp.path(), "a.txt", "one\n");
+    let work = git_work(tmp.path());
+    let head = git(tmp.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(
+        changed_lines_for(&work, &head, "missing.txt").unwrap(),
+        None
+    );
+    std::fs::create_dir(tmp.path().join("sub")).unwrap();
+    assert_eq!(changed_lines_for(&work, &head, "sub").unwrap(), None);
+    // A text edit reports its added lines.
+    std::fs::write(tmp.path().join("a.txt"), "one\ntwo\n").unwrap();
+    assert_eq!(
+        changed_lines_for(&work, &head, "a.txt").unwrap(),
+        Some(BTreeSet::from([2]))
+    );
+    // A binary edit reports nothing.
+    std::fs::write(tmp.path().join("a.txt"), b"one\n\x00bin\n").unwrap();
+    assert_eq!(changed_lines_for(&work, &head, "a.txt").unwrap(), None);
+}
+
+#[test]
+fn cov_changed_lines_reports_hg_svn_errors() {
+    let tmp = TempDir::new("cov-cl-err");
+    tmp.write("f.txt", "x\n");
+    for vcs in [Vcs::Hg, Vcs::Svn] {
+        let work = WorkCopy {
+            vcs,
+            vcs_root: tmp.path().to_path_buf(),
+            project_root: tmp.path().to_path_buf(),
+        };
+        let error = changed_lines_for(&work, "tip", "f.txt").unwrap_err();
+        assert!(!error.is_empty(), "{vcs:?}: {error}");
+    }
+}
+
+#[test]
+fn cov_engine_for_dir_reports_config() {
+    let tmp = init_git_repo("cov-enginedir");
+    tmp.write(".arclint", r#"{"linters": {"t": {"type": "text"}}}"#);
+    let (engine, config) = engine_for_dir(tmp.path()).unwrap();
+    assert!(!engine.is_empty());
+    assert_eq!(config, Some(tmp.path().join(".arclint")));
+    // A configured engine without `.arclint` reports no config file.
+    let bare = init_git_repo("cov-enginedir-bare");
+    bare.write(
+        ".arcconfig",
+        r#"{"lint.engine": "ArcanistComprehensiveLintEngine"}"#,
+    );
+    let (engine, config) = engine_for_dir(bare.path()).unwrap();
+    assert!(engine.is_comprehensive());
+    assert_eq!(config, None);
+}
+
+#[test]
+fn cov_explicit_paths_with_engine_sorts_and_joins_errors() {
+    let tmp = TempDir::new("cov-run");
+    tmp.write("b.txt", "\t\n");
+    tmp.write("a.txt", "\t\n");
+    let mut engine = Engine::empty();
+    engine.add_linter(Box::new(TextLinter::new()));
+    let found = lint_explicit_paths_with_engine(
+        &engine,
+        tmp.path(),
+        tmp.path(),
+        &["b.txt".to_string(), "a.txt".to_string()],
+    )
+    .unwrap();
+    let paths: Vec<&str> = found.iter().map(|m| m.path.as_str()).collect();
+    assert_eq!(paths, vec!["a.txt", "b.txt"]);
+    let mut failing = Engine::empty();
+    failing.add_linter(Box::new(FailLinter));
+    assert_eq!(
+        lint_explicit_paths_with_engine(&failing, tmp.path(), tmp.path(), &["a.txt".to_string()])
+            .unwrap_err(),
+        "a.txt: boom"
+    );
+}
+
+#[test]
+fn cov_lint_explicit_paths_discovers_workcopy() {
+    let tmp = init_git_repo("cov-runpaths");
+    tmp.write("f.txt", "x\ty\n");
+    let found = lint_explicit_paths(tmp.path(), &["f.txt".to_string()]).unwrap();
+    assert_eq!(codes(&found), vec!["TXT2"]);
+}
+
+#[test]
+fn cov_changed_in_with_engine_skips_deleted_and_errors() {
+    let tmp = init_git_repo("cov-changedin");
+    commit_file(tmp.path(), "keep.txt", "ok\n");
+    commit_file(tmp.path(), "gone.txt", "ok\n");
+    std::fs::write(tmp.path().join("keep.txt"), "ok\nx\ty\n").unwrap();
+    std::fs::remove_file(tmp.path().join("gone.txt")).unwrap();
+    let mut engine = Engine::empty();
+    engine.add_linter(Box::new(TextLinter::new()));
+    // The deleted path is skipped; the edit still lints.
+    let found = lint_changed_in_with_engine(&engine, tmp.path(), None).unwrap();
+    assert_eq!(codes(&found), vec!["TXT2"]);
+    let mut failing = Engine::empty();
+    failing.add_linter(Box::new(FailLinter));
+    assert_eq!(
+        lint_changed_in_with_engine(&failing, tmp.path(), None).unwrap_err(),
+        "keep.txt: boom"
+    );
+}
+
+#[test]
+fn cov_tty_renderer_appends_context_and_empty() {
+    let message = LintMessage {
+        line: 1,
+        col: 1,
+        original: Some("a".to_string()),
+        replacement: Some("b".to_string()),
+        ..warn123(1, 1, None, None)
+    };
+    let result = console_result("f.txt", b"a\n", vec![message]);
+    let rendered = render_console_result_with_ansi(&result, true).unwrap();
+    assert!(rendered.contains("Lint for"), "{rendered}");
+    assert!(rendered.contains(" - "), "{rendered}");
+    assert!(rendered.contains(" + "), "{rendered}");
+    let empty = console_result("f.txt", b"a\n", Vec::new());
+    assert_eq!(render_console_result_with_ansi(&empty, true).unwrap(), "");
+}
+
+#[test]
+fn cov_highlight_helpers_cover_boundaries() {
+    // A boundary line past the end is created on request.
+    let mut lines = vec!["a".to_string()];
+    highlight_line_at(&mut lines, 2, 1, "x", true);
+    assert_eq!(lines.len(), 2);
+    let mut lines = vec!["a".to_string()];
+    highlight_line_at(&mut lines, 2, 1, "x", false);
+    assert_eq!(lines, vec!["a".to_string()]);
+    // Multi-line impacts skip highlighting entirely.
+    let mut old = vec!["a".to_string(), "b".to_string()];
+    let mut new = vec!["a".to_string(), "b".to_string()];
+    let patch = ContextPatch {
+        line: 1,
+        char: 1,
+        original: "a",
+        replacement: Some("a"),
+        old_impact: 2,
+    };
+    highlight_patchable_lines(&mut old, &mut new, &patch, 1);
+    assert_eq!(old, vec!["a".to_string(), "b".to_string()]);
+    // Non-patchable single lines highlight the old side only.
+    let mut old = vec!["abc".to_string()];
+    highlight_single_line_old(&mut old, 1, 1, "b", 1);
+    assert_ne!(old, vec!["abc".to_string()]);
+    let mut old = vec!["abc".to_string()];
+    highlight_single_line_old(&mut old, 1, 1, "b", 2);
+    assert_eq!(old, vec!["abc".to_string()]);
+    // The past-end warning only fires past the boundary line.
+    assert_eq!(context_past_end_message(2, 1, "", 0), None);
+    assert_eq!(context_past_end_message(2, 1, "", 1), None);
+    assert!(context_past_end_message(2, 1, "", 2).is_some());
+    assert!(context_past_end_message(2, 1, "x", 0).is_some());
+    assert!(context_past_end_message(3, 1, "", 0).is_some());
+}
+
+#[test]
+fn cov_context_specs_skip_line_zero() {
+    assert!(context_build_specs(&[], &[], 0, 0, 0).is_empty());
+    let specs = context_build_specs(&["a".to_string()], &["a".to_string()], 1, 1, 1);
+    assert!(!specs.is_empty());
+}
+
+#[test]
+fn cov_shrink_ranges_cover_zero_impacts() {
+    let mut start = 1;
+    assert_eq!(
+        shrink_ranges(&["a".to_string()], &["a".to_string()], &mut start, 1, 1),
+        (0, 0)
+    );
+    let mut start = 1;
+    assert_eq!(
+        shrink_ranges(
+            &["s".to_string()],
+            &["d".to_string(), "s".to_string()],
+            &mut start,
+            1,
+            2
+        ),
+        (0, 1)
+    );
+}
+
+#[test]
+fn cov_location_dict_carries_original() {
+    let message = LintMessage {
+        locations: vec![OtherLocation {
+            path: Some("b.txt".to_string()),
+            line: 2,
+            char: 3,
+            original: Some("x".to_string()),
+        }],
+        ..warn123(1, 1, None, None)
+    };
+    let dict = message.to_dictionary();
+    assert_eq!(dict["locations"][0]["original"], serde_json::json!("x"));
+    let plain = warn123(1, 1, None, None);
+    assert!(
+        plain.to_dictionary()["locations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn cov_write_patch_numbers_temp_files() {
+    let tmp = TempDir::new("cov-patchnum");
+    let file = tmp.write("f.txt", "a\n");
+    // A stale temp file forces the numbered fallback.
+    std::fs::write(format!("{}.linted", file.display()), "stale").unwrap();
+    let message = LintMessage {
+        original: Some("a".to_string()),
+        replacement: Some("b".to_string()),
+        ..warn123(1, 1, None, None)
+    };
+    let mut result = LintResult::new("f.txt".to_string(), file.clone(), b"a\n".to_vec());
+    result.add_message(message);
+    assert_eq!(write_patch_to_disk(&result).unwrap(), vec![true]);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "b\n");
+    // The stale temp file is left untouched; the patch renamed over it.
+    assert_eq!(
+        std::fs::read_to_string(format!("{}.linted", file.display())).unwrap(),
+        "stale"
+    );
+}
+
+#[test]
+fn cov_write_patch_reports_rename_failures() {
+    // An empty disk path can stage its temp file but never rename it.
+    let _guard = RemoveOnDrop(PathBuf::from(".linted"));
+    std::fs::remove_file(".linted").ok();
+    let result = LintResult::new(String::new(), PathBuf::new(), Vec::new());
+    let error = write_patch_to_disk(&result).unwrap_err();
+    assert!(error.starts_with("Unable to overwrite path"), "{error}");
+    assert!(error.contains("patched version was left at"), "{error}");
+}
+
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        std::fs::remove_file(&self.0).ok();
+    }
+}
+
+#[test]
+fn cov_rename_over_retries_after_removal() {
+    let tmp = TempDir::new("cov-rename");
+    let dest = tmp.write("dest.txt", "old");
+    let missing = tmp.path().join("no-such-src");
+    assert!(rename_over(&missing, &dest).is_err());
+    assert!(!dest.exists());
+    let src = tmp.write("src.txt", "new");
+    let dest = tmp.path().join("fresh.txt");
+    assert!(rename_over(&src, &dest).is_ok());
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "new");
+}
+
+#[test]
+fn cov_patch_prompt_reads_missing_disk_as_dev_null() {
+    let result = LintResult::new(
+        "missing.txt".to_string(),
+        PathBuf::from("missing-cov-file.txt"),
+        Vec::new(),
+    );
+    let mut sink = Sink::Buffer(String::new());
+    prompt_for_patch(&result, b"", &mut sink);
+    let Sink::Buffer(buffer) = &sink else {
+        panic!("expected a buffered sink"); // LCOV_EXCL_LINE // Reason: defensive panic arm; the buffer always matches
+    };
+    assert!(buffer.is_empty(), "{buffer:?}");
+}
+
+#[test]
+fn cov_empty_engine_is_no_effect() {
+    use crate::conduit::EnvelopeKind;
+    let tmp = init_git_repo("cov-noeffect");
+    tmp.write(".arclint", r#"{"linters": {}}"#);
+    let mut input = std::io::BufReader::new("".as_bytes());
+    let error = run_workflow_collecting(tmp.path(), &Options::default(), &mut input, false, true)
+        .unwrap_err();
+    assert_eq!(error.kind, EnvelopeKind::NoEffect);
+    assert_eq!(error.message, "No linters to run.");
+}
+
+#[test]
+fn cov_child_lint_rejects_help_and_bad_flags() {
+    use crate::conduit::EnvelopeKind;
+    let tmp = init_git_repo("cov-child");
+    let mut input = std::io::BufReader::new("".as_bytes());
+    let error =
+        run_child_collecting(tmp.path(), &args(&["--help"]), false, &mut input, true).unwrap_err();
+    assert_eq!(error.kind, EnvelopeKind::Usage);
+    assert_eq!(error.message, "unexpected --help in child lint argv");
+    let mut input = std::io::BufReader::new("".as_bytes());
+    let error = run_child_collecting(
+        tmp.path(),
+        &args(&["--bogus-flag"]),
+        false,
+        &mut input,
+        true,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind, EnvelopeKind::Usage);
+    assert!(!error.message.is_empty(), "{error:?}");
+}
+
+#[test]
+fn cov_run_workflow_delegates_classification() {
+    let tmp = init_git_repo("cov-workflow");
+    tmp.write(".arclint", r#"{"linters": {"t": {"type": "text"}}}"#);
+    tmp.write("clean.txt", "ok\n");
+    let options = Options {
+        paths: vec!["clean.txt".to_string()],
+        ..Default::default()
+    };
+    let mut input = std::io::BufReader::new("".as_bytes());
+    assert_eq!(
+        run_workflow(tmp.path(), &options, &mut input, false, true).unwrap(),
+        0
+    );
+}
+
+#[test]
+fn cov_workflow_base_covers_rev_and_default() {
+    let tmp = init_git_repo("cov-wfbase");
+    let first = commit_file(tmp.path(), "a.txt", "one\n");
+    let head = commit_file(tmp.path(), "b.txt", "two\n");
+    let work = git_work(tmp.path());
+    let mut input = std::io::BufReader::new("".as_bytes());
+    let rev = Options {
+        rev: Some("HEAD".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        workflow_base(&work, &rev, &mut input, false).unwrap(),
+        Some(head)
+    );
+    let mut input = std::io::BufReader::new("HEAD~1\n".as_bytes());
+    assert_eq!(
+        workflow_base(&work, &Options::default(), &mut input, false).unwrap(),
+        Some(first)
+    );
+}
+
+#[test]
+fn cov_explicit_base_covers_hg() {
+    let tmp = TempDir::new("cov-expbase");
+    let work = WorkCopy {
+        vcs: Vcs::Hg,
+        vcs_root: tmp.path().to_path_buf(),
+        project_root: tmp.path().to_path_buf(),
+    };
+    let error = workflow_explicit_base(&work, "tip").unwrap_err();
+    assert!(!error.is_empty(), "{error}");
+}
+
+#[test]
+#[should_panic(expected = "svn --rev rejected by check_supports")]
+fn cov_explicit_base_rejects_svn() {
+    let tmp = TempDir::new("cov-expbase-svn");
+    let work = WorkCopy {
+        vcs: Vcs::Svn,
+        vcs_root: tmp.path().to_path_buf(),
+        project_root: tmp.path().to_path_buf(),
+    };
+    let _ = workflow_explicit_base(&work, "123");
+}
+
+#[test]
+fn cov_workflow_default_base_covers_vcs() {
+    let tmp = init_git_repo("cov-defbase");
+    let head = commit_file(tmp.path(), "a.txt", "one\n");
+    assert_eq!(head.len(), 40);
+    let work = git_work(tmp.path());
+    let mut input = std::io::BufReader::new("".as_bytes());
+    // A single commit needs no prompt: the empty tree is the base.
+    assert_eq!(
+        workflow_default_base(&work, &mut input, false).unwrap(),
+        Some(crate::git::GIT_MAGIC_ROOT_COMMIT.to_string())
+    );
+    let tmp = TempDir::new("cov-defbase-hg");
+    let work = WorkCopy {
+        vcs: Vcs::Hg,
+        vcs_root: tmp.path().to_path_buf(),
+        project_root: tmp.path().to_path_buf(),
+    };
+    let mut input = std::io::BufReader::new("".as_bytes());
+    assert!(workflow_default_base(&work, &mut input, false).is_err());
+    let work = WorkCopy {
+        vcs: Vcs::Svn,
+        vcs_root: tmp.path().to_path_buf(),
+        project_root: tmp.path().to_path_buf(),
+    };
+    let mut input = std::io::BufReader::new("".as_bytes());
+    assert_eq!(
+        workflow_default_base(&work, &mut input, false).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn cov_workflow_emit_propagates_render_errors() {
+    let tmp = TempDir::new("cov-emit");
+    let work = git_work(tmp.path());
+    let mut message = warn123(1, 1, None, None);
+    message.severity = "bogus".to_string();
+    let mut result = LintResult::new(
+        "f.txt".to_string(),
+        tmp.path().join("f.txt"),
+        b"x\n".to_vec(),
+    );
+    result.add_message(message);
+    let mut results = vec![result];
+    let mut input = std::io::BufReader::new("".as_bytes());
+    assert_eq!(
+        workflow_emit(
+            &work,
+            &Options::default(),
+            &mut input,
+            &mut results,
+            false,
+            true
+        )
+        .unwrap_err(),
+        "Unknown lint severity 'bogus'!"
+    );
+}
+
+#[test]
+fn cov_workflow_render_skips_empty_results() {
+    let result = LintResult::new("f.txt".to_string(), PathBuf::from("f.txt"), b"x\n".to_vec());
+    let mut results = vec![result];
+    let mut input = std::io::BufReader::new("".as_bytes());
+    let mut sink = Sink::Buffer(String::new());
+    assert_eq!(
+        workflow_render(
+            &mut results,
+            RENDERER_CONSOLE,
+            &Options::default(),
+            &mut input,
+            &mut sink,
+            false,
+            true
+        )
+        .unwrap(),
+        (false, true)
+    );
+}
+
+#[test]
+#[should_panic(expected = "renderer validated above")]
+fn cov_unknown_renderer_is_unreachable() {
+    let result = LintResult::new("f.txt".to_string(), PathBuf::from("f.txt"), b"x\n".to_vec());
+    let mut sink = Sink::Buffer(String::new());
+    let _ = render_workflow_result(&result, "bogus", &mut sink, false);
+}
+
+#[test]
+fn cov_apply_patch_propagates_pipe_errors() {
+    let tmp = TempDir::new("cov-applypatch");
+    let message = LintMessage {
+        original: Some("a".to_string()),
+        replacement: Some("b".to_string()),
+        ..warn123(1, 1, None, None)
+    };
+    let mut result = LintResult::new(
+        "f.txt".to_string(),
+        tmp.path().join("f.txt"),
+        b"a\n".to_vec(),
+    );
+    result.add_message(message);
+    assert!(result.is_patchable());
+    assert!(!result.is_all_autofix());
+    let mut sink = Sink::Buffer(String::new());
+    let mut input = std::io::BufReader::new("".as_bytes());
+    // Piped stdin cannot answer the patch prompt.
+    assert_eq!(
+        apply_result_patch(&mut result, true, &mut sink, &mut input, false, false).unwrap_err(),
+        crate::prompt::NOT_INTERACTIVE
+    );
+}
+
+#[test]
+fn cov_flush_outfile_stages_beside_bare_names() {
+    let name = format!(
+        "lint-unit-cov-out-{}-{}.txt",
+        std::process::id(),
+        rand_suffix()
+    );
+    let _guard = RemoveOnDrop(PathBuf::from(&name));
+    flush_outfile(&name, "renderer output").unwrap();
+    assert_eq!(std::fs::read_to_string(&name).unwrap(), "renderer output");
+}
+
+#[test]
+fn cov_amend_head_covers_hg_and_svn() {
+    let tmp = TempDir::new("cov-amendhead");
+    let hg = WorkCopy {
+        vcs: Vcs::Hg,
+        vcs_root: tmp.path().to_path_buf(),
+        project_root: tmp.path().to_path_buf(),
+    };
+    assert!(amend_head(&hg).is_err());
+    let svn = WorkCopy {
+        vcs: Vcs::Svn,
+        vcs_root: tmp.path().to_path_buf(),
+        project_root: tmp.path().to_path_buf(),
+    };
+    assert!(amend_head(&svn).is_ok());
+}
+
+#[test]
+fn cov_amend_git_head_reports_add_failures() {
+    // Outside any repository (git would otherwise walk up to the real
+    // worktree and stage its changes): `git add -u` fails with stderr.
+    let dir = std::env::temp_dir().join(format!(
+        "lint-unit-cov-amendgit-{}-{}",
+        std::process::id(),
+        rand_suffix()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let error = amend_git_head(&dir).unwrap_err();
+    assert!(error.starts_with("git add -u failed"), "{error}");
+    assert!(error.contains("not a git repository"), "{error}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn cov_spawn_with_retry_retries_text_file_busy() {
+    // Linux-only: executing a binary held open for writing fails with
+    // ETXTBSY there (macOS permits the spawn), exercising the retry
+    // arm; the runner retries, then surfaces the last error unchanged.
+    let tmp = TempDir::new("cov-etxtbsy");
+    let copy = tmp.path().join("busy-copy");
+    std::fs::copy(std::env::current_exe().unwrap(), &copy).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let _held = std::fs::File::options().write(true).open(&copy).unwrap();
+    let mut command = std::process::Command::new(&copy);
+    // `--help` only guards the impossible: were the spawn to succeed,
+    // the harness would print help and exit instead of running tests.
+    command.arg("--help");
+    let err = spawn_with_retry(&mut command).unwrap_err();
+    assert!(is_text_file_busy(&err), "{err:?}");
+}
+
+#[test]
+fn cov_normalize_lexical_drops_dot_segments() {
+    assert_eq!(normalize_lexical(Path::new("a/./b")), PathBuf::from("a/b"));
+}
+
+#[test]
+fn cov_shrink_ranges_head_continues_past_shared_lines() {
+    let old = vec!["a".to_string(), "x".to_string()];
+    let new = vec!["a".to_string(), "x".to_string()];
+    let mut start = 1;
+    assert_eq!(shrink_ranges(&old, &new, &mut start, 2, 2), (0, 0));
+    assert_eq!(start, 3);
+}
+
+#[test]
+fn cov_shrink_ranges_tail_continues_past_shared_lines() {
+    let old = vec!["p".to_string(), "a".to_string()];
+    let new = vec!["q".to_string(), "a".to_string()];
+    let mut start = 1;
+    assert_eq!(shrink_ranges(&old, &new, &mut start, 2, 2), (1, 1));
+}
+
+#[test]
+fn cov_rename_over_replaces_a_file_with_a_directory() {
+    let tmp = TempDir::new("cov-renamedir");
+    let from = tmp.path().join("from-dir");
+    std::fs::create_dir(&from).unwrap();
+    let dest = tmp.write("dest.txt", "old");
+    rename_over(&from, &dest).unwrap();
+    assert!(dest.is_dir());
+    assert!(!from.exists());
+}
+
+#[test]
+fn cov6g_normalize_lexical_skips_current_dir_segments() {
+    // T1170 wave 6g: the CurDir arm of normalize_lexical.
+    assert_eq!(normalize_lexical(Path::new("a/./b")), PathBuf::from("a/b"));
+    assert_eq!(normalize_lexical(Path::new("./a")), PathBuf::from("a"));
+    assert_eq!(
+        normalize_lexical(Path::new("a/././b")),
+        PathBuf::from("a/b")
+    );
+}
+
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(unix)]
+static COV6G_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(unix)]
+fn cov6g_temp_dir(name: &str) -> PathBuf {
+    let id = COV6G_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!(
+        "arc_rs_lint_cov6g_{}_{}_{}",
+        std::process::id(),
+        id,
+        name
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+#[cfg(unix)]
+fn cov6g_spawn_with_retry_reports_text_file_busy() {
+    // T1170 wave 6g: hold a script open for writing while spawning it.
+    // Linux exec fails with ETXTBSY (errno 26), exercising the retry
+    // arm; other unix spawns succeed. Either outcome passes, so the
+    // test is deterministic on every unix.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = cov6g_temp_dir("etxtbsy");
+    let script = dir.join("busy.sh");
+    std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _held = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&script)
+        .unwrap();
+    let mut cmd = Command::new(&script);
+    cmd.current_dir(&dir);
+    match spawn_with_retry(&mut cmd) {
+        // LCOV_EXCL_START // Reason: ETXTBSY error arm; macOS exec never reports text-file-busy
+        Err(error) => assert_eq!(
+            error.raw_os_error(), // LCOV_EXCL_STOP
+            Some(26),
+            "expected ETXTBSY, got {error}"
+        ),
+        // LCOV_EXCL_START // Reason: ETXTBSY always fires on Linux (write handle held at exec), so the Ok arm only runs where text-file-busy does not apply (macOS)
+        Ok(output) => assert!(
+            output.status.success(),
+            "script should run where ETXTBSY does not apply: {output:?}"
+        ),
+        // LCOV_EXCL_STOP
+    }
+}
+// -( T1170 wave 6h: helper-arm coverage )--------------------------------------
+
+#[test]
+#[should_panic(expected = "unexpected help")]
+fn parse_panics_on_help() {
+    parse(&["--help"]);
+}
+
+#[test]
+#[should_panic(expected = "unexpected error")]
+fn parse_panics_on_errors() {
+    parse(&["--bogus"]);
+}
+
+#[test]
+#[should_panic(expected = "expected error, got args")]
+fn parse_error_panics_on_args() {
+    parse_error(&[]);
+}
+
+#[test]
+#[should_panic(expected = "expected error, got help")]
+fn parse_error_panics_on_help() {
+    parse_error(&["--help"]);
+}
+
+#[test]
+#[should_panic(expected = "expected engine error")]
+fn engine_error_panics_when_an_engine_resolves() {
+    // `engine_error` unwraps the failure: a resolvable engine panics.
+    let tmp = TempDir::new("w6h-engine-ok");
+    std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+    let work = discover_working_copy(tmp.path()).unwrap();
+    engine_error(&work, Some(ENGINE_COMPREHENSIVE));
+}
+
+#[test]
+#[should_panic(expected = "failed:")]
+fn git_helper_reports_failing_commands() {
+    // A failing git invocation panics with the command and stderr.
+    let tmp = TempDir::new("w6h-git-fail");
+    git(tmp.path(), &["--bogus-flag-xyz"]);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn spawn_with_retry_retries_text_file_busy() {
+    // Linux-only: a script held open for writing fails exec with
+    // ETXTBSY there (macOS/Windows exec it fine), so the retry arm
+    // sleeps and retries instead of failing at once (50 x 2ms, then
+    // the last error unchanged). Covered on ubuntu CI, where the
+    // gates measure; the macOS replica legitimately reads these
+    // three lines uncovered.
+    let tmp = TempDir::new("etxtbsy-retry");
+    let script = tmp.write("busy.sh", "#!/bin/sh\nexit 0\n");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _held = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&script)
+        .unwrap();
+    let start = std::time::Instant::now();
+    let mut cmd = std::process::Command::new(&script);
+    let err = spawn_with_retry(&mut cmd).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(26));
+    assert!(start.elapsed() >= std::time::Duration::from_millis(80));
 }

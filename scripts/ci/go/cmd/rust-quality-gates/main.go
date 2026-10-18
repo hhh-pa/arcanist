@@ -709,6 +709,13 @@ func upgradeLCOVWithCanonical(env []string, workspace, reportDir string) (bool, 
 			s.Raw, s.SF, s.What)
 	}
 	canon := lcov.Canonicalize(rawRecords, workspace)
+	// Filter LCOV_EXCL_*-marked lines (T1170 endgame) from the
+	// published artifact only: the cargo-superset check below still
+	// runs on raw records so marker filtering can never trip it.
+	filtered, err := lcov.ApplyExclusions(canon, workspace)
+	if err != nil {
+		return false, fmt.Errorf("LCOV exclusion markers: %w", err)
+	}
 	lcovPath := filepath.Join(reportDir, "lcov.info")
 	data, err := os.ReadFile(lcovPath)
 	if err != nil {
@@ -757,18 +764,19 @@ func upgradeLCOVWithCanonical(env []string, workspace, reportDir string) (bool, 
 	if err := os.Rename(htmlTmp, htmlDir); err != nil {
 		return false, err
 	}
-	if err := os.WriteFile(lcovPath, []byte(lcov.Emit(canon)), 0o666); err != nil {
+	if err := os.WriteFile(lcovPath, []byte(lcov.Emit(filtered)), 0o666); err != nil {
 		return false, err
 	}
+	filteredTotal, filteredCovered := lcov.LineSets(filtered)
 	recovered := 0
-	for key := range canonCovered {
+	for key := range filteredCovered {
 		if !cargoCovered[key] {
 			recovered++
 		}
 	}
 	fmt.Printf("canonical coverage: cargo %d/%d lines -> canonical %d/%d "+
 		"(recovered %d genuinely-executed lines)\n",
-		len(cargoCovered), len(cargoTotal), len(canonCovered), len(canonTotal), recovered)
+		len(cargoCovered), len(cargoTotal), len(filteredCovered), len(filteredTotal), recovered)
 	return true, nil
 }
 
@@ -913,12 +921,13 @@ func coverageReports(env []string, workspace, reportDir string, covRunner []stri
 	if err := printLCOVSummary(lcovPath, workspace); err != nil {
 		return err
 	}
-	// The 80% status quo, enforced: attained coverage must never regress.
+	// T1170 endgame: 100% enforced (suite plus LCOV exclusions);
+	// attained coverage must never regress.
 	floorBin, err := sibling("coverage-floor")
 	if err != nil {
 		return err
 	}
-	return run([]string{floorBin, lcovPath, "80"}, env, workspace)
+	return run([]string{floorBin, lcovPath, "100"}, env, workspace)
 }
 
 // provisionDeny installs cargo-deny: upstream ships only musl

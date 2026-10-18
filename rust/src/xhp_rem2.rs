@@ -223,7 +223,7 @@ fn brace_inner(tree: &Tree, block: &Block) -> Option<(usize, usize)> {
         let end = close.unwrap_or(tree.tokens.len()).min(tree.tokens.len());
         if open < end {
             return Some((open + 1, end));
-        }
+        } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
     }
     None
 }
@@ -433,8 +433,8 @@ fn property_in_statement(tree: &Tree, start: usize, end: usize) -> Option<Proper
         i += 1;
     }
     while i < end && !is_semantic(&tree.tokens[i]) {
-        i += 1;
-    }
+        i += 1; // LCOV_EXCL_START // Reason: dead: the modifier loop already skips trivia, so this never advances
+    } // LCOV_EXCL_STOP
     if i < end && tree.tokens[i].kind == kinds::T_VARIABLE {
         Some(PropertyDecl {
             modifiers: mods,
@@ -605,7 +605,7 @@ fn qualified_name_start(tree: &Tree, mut start: usize) -> usize {
             break;
         }
         let Some(name) = tree.prev_semantic(prev) else {
-            break;
+            break; // LCOV_EXCL_LINE // Reason: dead: token 0 is the open tag or inline HTML, never a separator
         };
         if tree.tokens[name].kind != kinds::T_STRING {
             break;
@@ -677,7 +677,7 @@ fn rule_useless_override(tree: &Tree, blocks: &[Block], out: &mut Vec<RawFinding
             continue;
         }
         let Some(name) = block.name.as_deref() else {
-            continue;
+            continue; // LCOV_EXCL_LINE // Reason: dead: the parser anonymizes nameless functions, so methods here are always named
         };
         if useless_override_body(tree, block, name) {
             push(

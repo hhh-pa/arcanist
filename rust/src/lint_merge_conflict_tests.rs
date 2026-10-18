@@ -1,5 +1,34 @@
 use super::*;
 
+use std::path::{Path, PathBuf};
+
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-mergeconflict-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
 #[test]
 fn linter_name_is_merge_conflict() {
     assert_eq!(MergeConflictLinter::new().name(), "MERGECONFLICT");
@@ -65,4 +94,15 @@ fn applies_to_every_extension() {
     for path in ["a.rs", "b.json", "c.xml", "Makefile", "no-ext"] {
         assert_eq!(linter.lint_bytes(path, b"<<<<<<<\n").len(), 1, "for {path}");
     }
+}
+
+#[test]
+fn existing_directories_are_skipped() {
+    let tmp = TempDir::new("dir");
+    let path = tmp.path().to_string_lossy().into_owned();
+    assert!(
+        MergeConflictLinter::new()
+            .lint_bytes(&path, b"<<<<<<<\n")
+            .is_empty()
+    );
 }

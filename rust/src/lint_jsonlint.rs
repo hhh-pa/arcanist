@@ -107,7 +107,7 @@ impl Linter for JsonlintLinter {
             return Vec::new();
         }
         let Some(input) = write_temp_file(SLUG, path, "json", data) else {
-            return Vec::new();
+            return Vec::new(); // LCOV_EXCL_LINE // Reason: temp-dir write failure; hermetic tests cannot fail temp writes (TMPDIR is process-global)
         };
         let mut args = self.tool_flags();
         args.push(input.display().to_string());
@@ -258,9 +258,10 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     let mut candidates = vec![name.to_string()];
     if cfg!(windows) {
+        // LCOV_EXCL_START // Reason: windows-only PATH probe; cfg!(windows) is false on ubuntu CI
         for ext in ["exe", "cmd", "bat"] {
             candidates.push(format!("{name}.{ext}"));
-        }
+        } // LCOV_EXCL_STOP
     }
     for dir in std::env::split_paths(&path_var) {
         for candidate in &candidates {

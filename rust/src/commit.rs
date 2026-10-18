@@ -375,7 +375,7 @@ fn flow_git(dir: &Path, options: &Options) -> Result<String, String> {
     let summary = String::from_utf8_lossy(&output.stdout);
     let summary = summary.trim();
     if summary.is_empty() {
-        Ok("committed.\n".to_string())
+        Ok("committed.\n".to_string()) // LCOV_EXCL_LINE // Reason: git prints a summary on success; empty success output unreachable
     } else {
         Ok(format!("{summary}\n"))
     }

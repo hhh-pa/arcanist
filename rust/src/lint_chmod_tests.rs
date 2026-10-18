@@ -1,5 +1,32 @@
 use super::*;
 
+use std::path::{Path, PathBuf};
+
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path =
+            std::env::temp_dir().join(format!("arc-rs-chmod-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
 fn png() -> Vec<u8> {
     let mut data = b"\x89PNG\r\n\x1a\n".to_vec();
     data.extend_from_slice(&[0u8; 16]);
@@ -132,6 +159,13 @@ fn lint_bytes_is_silent_without_disk_state() {
             .lint_bytes("definitely/missing/run.sh", b"echo hi\n")
             .is_empty()
     );
+}
+
+#[test]
+fn directories_are_never_executable() {
+    let tmp = TempDir::new("dirstat");
+    let dir = tmp.path().to_string_lossy().into_owned();
+    assert!(ChmodLinter::new().lint_bytes(&dir, b"echo hi\n").is_empty());
 }
 
 #[cfg(unix)]

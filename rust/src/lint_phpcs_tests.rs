@@ -131,15 +131,20 @@ fn binary_lookup_skips_empty_dirs() {
 }
 
 #[test]
+#[cfg(windows)]
 fn windows_lookup_finds_dot_exe() {
     let dir = TempDir::new("phpcs-path-exe");
     std::fs::write(dir.path().join("phpcs.exe"), "x").unwrap();
     let found = binary_in(dir.path().as_os_str());
-    if cfg!(windows) {
-        assert_eq!(found, Some(dir.path().join("phpcs.exe")));
-    } else {
-        assert!(found.is_none());
-    }
+    assert_eq!(found, Some(dir.path().join("phpcs.exe")));
+}
+
+#[test]
+#[cfg(not(windows))]
+fn windows_lookup_ignores_dot_exe() {
+    let dir = TempDir::new("phpcs-path-exe");
+    std::fs::write(dir.path().join("phpcs.exe"), "x").unwrap();
+    assert!(binary_in(dir.path().as_os_str()).is_none());
 }
 
 #[test]
@@ -211,6 +216,156 @@ fn attribute_edges_reject_fallback_and_default() {
     let lines: Vec<usize> = messages.iter().map(|m| m.line).collect();
     assert_eq!(lines, vec![7, 8, 1, 1]);
     assert_eq!(messages[3].col, 1);
+}
+
+#[cfg(unix)]
+fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) {}
+
+fn option_ctx(root: &Path) -> OptionContext<'_> {
+    OptionContext { project_root: root }
+}
+
+fn set_bin(linter: &mut PhpcsLinter, ctx: &OptionContext, tool: &Path) {
+    linter
+        .set_option(
+            "bin",
+            &serde_json::json!(tool.to_string_lossy().into_owned()),
+            ctx,
+        )
+        .unwrap();
+}
+
+#[test]
+fn standard_feeds_the_standard_flag() {
+    assert!(mandatory_flags(Some("PSR2")).contains(&"--standard=PSR2".to_string()));
+    assert_eq!(mandatory_flags(None), vec!["--report=xml".to_string()]);
+}
+
+#[test]
+fn binary_lookup_skips_empty_path_entries() {
+    let tmp = TempDir::new("lookup-empty");
+    let marker = tmp.path().join(binary_name());
+    std::fs::write(&marker, b"x").unwrap();
+    let both = std::env::join_paths([std::path::Path::new(""), tmp.path()]).unwrap();
+    assert_eq!(binary_in(&both), Some(marker));
+}
+
+#[test]
+fn unterminated_file_tag_yields_no_messages() {
+    assert!(parse_output("a.php", 1, "<phpcs><file name=\"a", "").is_empty());
+    assert!(parse_output("a.php", 1, "<phpcs><file name=\"a</phpcs>", "").is_empty());
+}
+
+#[test]
+fn set_standard_and_delegated_options() {
+    let tmp = TempDir::new("tool-opts");
+    let tool = tmp.path().join("fake-phpcs");
+    std::fs::write(&tool, b"#!/bin/sh\nexit 0\n").unwrap();
+    make_executable(&tool);
+    let ctx = option_ctx(tmp.path());
+    let mut linter = PhpcsLinter::new();
+    linter
+        .set_option("phpcs.standard", &serde_json::json!("PSR2"), &ctx)
+        .unwrap();
+    assert_eq!(
+        linter.set_option("phpcs.standard", &serde_json::json!(42), &ctx),
+        Err("'phpcs.standard' must be a string".to_string())
+    );
+    set_bin(&mut linter, &ctx, &tool);
+    linter
+        .set_option("flags", &serde_json::json!(["--extra"]), &ctx)
+        .unwrap();
+    linter
+        .set_option("version", &serde_json::json!(">= 1.0"), &ctx)
+        .unwrap();
+    assert!(
+        linter
+            .set_option("bogus", &serde_json::json!(1), &ctx)
+            .is_err()
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn lint_bytes_runs_configured_tool_and_parses_report() {
+    let tmp = TempDir::new("run");
+    let one_line = REPORT.replace('\n', "");
+    let tool = write_script(
+        tmp.path(),
+        "fake-phpcs",
+        &format!("#!/bin/sh\nprintf '%s\\n' '{one_line}'\nexit 1\n"),
+    );
+    let ctx = option_ctx(tmp.path());
+    let mut linter = PhpcsLinter::new();
+    set_bin(&mut linter, &ctx, &tool);
+    let messages = linter.lint_bytes("a.php", b"<?php echo 1;\n");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].code, "PHPCS.E.PSR1.Files.SideEffects");
+    assert_eq!(messages[1].severity, "warning");
+}
+
+#[test]
+#[cfg(unix)]
+fn lint_bytes_passes_the_configured_standard() {
+    let tmp = TempDir::new("run-standard");
+    let one_line = REPORT.replace('\n', "");
+    let tool = write_script(
+        tmp.path(),
+        "fake-phpcs",
+        &format!(
+            "#!/bin/sh\nif printf '%s' \"$*\" | grep -q -- '--standard=PSR2'; then printf '%s\\n' '{one_line}'; exit 1; else exit 0; fi\n"
+        ),
+    );
+    let ctx = option_ctx(tmp.path());
+    let mut linter = PhpcsLinter::new();
+    linter
+        .set_option("phpcs.standard", &serde_json::json!("PSR2"), &ctx)
+        .unwrap();
+    set_bin(&mut linter, &ctx, &tool);
+    assert_eq!(linter.lint_bytes("a.php", b"<?php echo 1;\n").len(), 2);
+}
+
+#[test]
+#[cfg(unix)]
+fn version_requirement_gates_linting() {
+    let tmp = TempDir::new("version");
+    let ctx = option_ctx(tmp.path());
+    let tool = write_script(tmp.path(), "fake-phpcs", "#!/bin/sh\necho junk\n");
+    let mut linter = PhpcsLinter::new();
+    set_bin(&mut linter, &ctx, &tool);
+    linter
+        .set_option("version", &serde_json::json!(">= 1.0"), &ctx)
+        .unwrap();
+    assert!(linter.lint_bytes("a.php", b"<?php echo 1;\n").is_empty());
+    let one_line = REPORT.replace('\n', "");
+    let tool = write_script(
+        tmp.path(),
+        "fake-phpcs-new",
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'PHP_CodeSniffer version 3.7.1'; else printf '%s\\n' '{one_line}'; exit 1; fi\n"
+        ),
+    );
+    let mut linter = PhpcsLinter::new();
+    set_bin(&mut linter, &ctx, &tool);
+    linter
+        .set_option("version", &serde_json::json!(">= 1.0"), &ctx)
+        .unwrap();
+    assert_eq!(linter.lint_bytes("a.php", b"<?php echo 1;\n").len(), 2);
 }
 
 #[test]

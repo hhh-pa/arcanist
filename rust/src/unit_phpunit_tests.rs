@@ -114,7 +114,7 @@ fn config_and_binary_resolution() {
         err.message()
             .contains("PHPUnit configuration file was not found in"),
         "{}",
-        err.message()
+        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 
     let on_path = |b: &str| b == "phpunit";
@@ -165,7 +165,7 @@ fn json_report_repair_and_empty_guidance() {
     assert!(
         err.message().contains("JSON report file is empty"),
         "{}",
-        err.message()
+        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 }
 
@@ -200,7 +200,7 @@ fn parser_maps_events_statuses_and_trailing_start() {
     assert!(
         results[1].get_user_data().unwrap().contains("F.php:3"),
         "{:?}",
-        results[1].get_user_data()
+        results[1].get_user_data() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
     assert_eq!(results[2].get_result(), RESULT_SKIP);
     assert_eq!(results[3].get_result(), RESULT_BROKEN);
@@ -289,4 +289,220 @@ fn unit_u20_clover_keeps_document_order() {
     let reports = read_clover_coverage_ordered(clover, "/r", &affected, &counts);
     let names: Vec<&str> = reports.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(names, vec!["src/Z.php", "src/A.php"]);
+}
+
+// -( T1170 wave 5d )-----------------------------------------------------------
+
+#[test]
+fn default_engine_matches_new() {
+    let engine = PhpunitEngine::new();
+    assert_eq!(engine.binary, PHPUNIT_BINARY);
+    assert_eq!(engine.config_file, None);
+    let defaulted = PhpunitEngine::default();
+    assert_eq!(defaulted.binary, PHPUNIT_BINARY);
+    assert_eq!(defaulted.config_file, None);
+}
+
+#[test]
+fn run_with_skips_missing_test_files() {
+    // Selected `*Test.php` files resolve without a probe, so a
+    // vanished test is skipped silently after selection.
+    let fs = FakeFs {
+        dirs: HashSet::new(),
+        files: HashMap::new(),
+    };
+    let engine = PhpunitEngine::with_binary_and_config("fake-phpunit", None);
+    let ctx = EngineContext {
+        paths: vec!["TTest.php".to_string()],
+        enable_coverage: Some(false),
+        ..EngineContext::new("/r")
+    };
+    let runner = |_: &[String], _: &str| -> CapturedOutput {
+        panic!("the missing test must not run"); // LCOV_EXCL_LINE // Reason: must-not-run guard; the missing test never executes
+    };
+    let results = engine.run_with(&ctx, &runner, &fs).unwrap();
+    assert!(results.is_empty());
+}
+
+#[test]
+fn run_with_reads_clover_through_line_counts() {
+    let mut files = HashMap::new();
+    files.insert("/r/TTest.php".to_string(), "<?php\n".to_string());
+    let fs = FakeFs {
+        dirs: HashSet::new(),
+        files,
+    };
+    let engine = PhpunitEngine::with_binary_and_config("fake-phpunit", None);
+    let ctx = EngineContext::new("/r");
+    let ctx = EngineContext {
+        paths: vec!["TTest.php".to_string()],
+        ..ctx
+    };
+    let runner = |argv: &[String], _cwd: &str| {
+        let json = argv
+            .iter()
+            .skip_while(|a| a.as_str() != "--log-json")
+            .nth(1)
+            .unwrap();
+        let clover = argv
+            .iter()
+            .skip_while(|a| a.as_str() != "--coverage-clover")
+            .nth(1)
+            .unwrap();
+        std::fs::write(
+            json,
+            "{\"event\":\"test\",\"test\":\"T::t\",\"status\":\"pass\",\"time\":0.1}",
+        )
+        .unwrap();
+        std::fs::write(
+            clover,
+            "<coverage><project><file name=\"/r/TTest.php\">\
+             <line num=\"1\" type=\"stmt\" count=\"1\"/></file></project></coverage>",
+        )
+        .unwrap();
+        CapturedOutput::new(0, "", "")
+    };
+    let results = engine.run_with(&ctx, &runner, &fs).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get_result(), RESULT_PASS);
+    assert!(results[0].get_coverage().is_some());
+}
+
+#[test]
+fn run_with_propagates_unparseable_json() {
+    let mut files = HashMap::new();
+    files.insert("/r/TTest.php".to_string(), "<?php\n".to_string());
+    let fs = FakeFs {
+        dirs: HashSet::new(),
+        files,
+    };
+    let engine = PhpunitEngine::with_binary_and_config("fake-phpunit", None);
+    let ctx = EngineContext {
+        paths: vec!["TTest.php".to_string()],
+        enable_coverage: Some(false),
+        ..EngineContext::new("/r")
+    };
+    let runner = |argv: &[String], _cwd: &str| {
+        let json = argv
+            .iter()
+            .skip_while(|a| a.as_str() != "--log-json")
+            .nth(1)
+            .unwrap();
+        std::fs::write(json, "{{{").unwrap();
+        CapturedOutput::new(0, "", "")
+    };
+    let err = engine.run_with(&ctx, &runner, &fs).unwrap_err();
+    assert!(!err.message().is_empty(), "{}", err.message());
+}
+
+#[test]
+fn find_test_file_skips_locations_above_the_root() {
+    // `/r/tests/` is a search location for `/r/pkg/Foo.php`, but it
+    // sits above the `/r/pkg` project root, so its match is skipped.
+    assert!(get_search_locations_for_tests("/r/pkg/Foo.php").contains(&"/r/tests/".to_string()));
+    let above = |p: &str| p == "/r/tests/FooTest.php";
+    assert_eq!(find_test_file("/r/pkg/Foo.php", "/r/pkg", &above), None);
+}
+
+#[test]
+fn path_helpers_cover_roots_and_bare_names() {
+    assert_eq!(
+        walk_to_root("abc"),
+        vec!["abc".to_string(), "/".to_string()]
+    );
+    assert_eq!(
+        walk_to_root("/a/b"),
+        vec!["/a/b".to_string(), "/a".to_string(), "/".to_string()]
+    );
+    assert_eq!(dir_name("/x"), "/");
+    assert_eq!(dir_name("/a/b"), "/a");
+    assert_eq!(dir_name("Foo.php"), "");
+    assert_eq!(join_root("/r", "/abs/x.php"), "/abs/x.php");
+    assert_eq!(join_root("/r", "C:\\x.php"), "C:/x.php");
+    assert_eq!(join_root("/r", "pkg/x.php"), "/r/pkg/x.php");
+}
+
+#[test]
+fn parser_skips_unknown_event_kinds() {
+    let json = concat!(
+        "{\"event\":\"suiteStart\"}",
+        "{\"event\":\"test\",\"test\":\"A::t\",\"status\":\"pass\",\"time\":0}",
+        "{\"other\":1}",
+    );
+    let affected = HashMap::new();
+    let results = parse_phpunit_results(
+        "T.php",
+        json,
+        None,
+        "",
+        Some(false),
+        "/r",
+        &affected,
+        &|_| None,
+    )
+    .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get_name(), "A::t");
+    assert_eq!(results[0].get_result(), RESULT_PASS);
+}
+
+#[test]
+fn trace_lines_accept_strings_and_skip_garbage() {
+    let json = "{\"event\":\"test\",\"test\":\"A::t\",\"status\":\"fail\",\
+        \"message\":\"nope\",\"time\":0,\
+        \"trace\":[{\"file\":\"F.php\",\"line\":\"7\"},{\"file\":\"G.php\",\"line\":true}]}";
+    let affected = HashMap::new();
+    let results = parse_phpunit_results(
+        "T.php",
+        json,
+        None,
+        "",
+        Some(false),
+        "/r",
+        &affected,
+        &|_| None,
+    )
+    .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get_result(), RESULT_FAIL);
+    let data = results[0].get_user_data().unwrap();
+    assert!(data.contains("F.php:7"), "{data}");
+    assert!(data.contains("G.php:"), "{data}");
+}
+
+#[test]
+fn clover_skips_nameless_and_uncounted_files() {
+    let clover = r#"<coverage><project>
+      <file><line num="1" type="stmt" count="1"/></file>
+      <file name="/r/src/D.php"><line num="1" type="stmt" count="1"/></file>
+      <file name="/r/src/E.php"><line num="1" type="stmt" count="1"/></file>
+    </project></coverage>"#;
+    let mut affected = HashMap::new();
+    affected.insert("/r/src/D.php".to_string(), "t".to_string());
+    affected.insert("/r/src/E.php".to_string(), "t".to_string());
+    let counts = |path: &str| {
+        if path == "/r/src/E.php" {
+            Some(1)
+        } else {
+            None
+        }
+    };
+    let reports = read_clover_coverage_ordered(clover, "/r", &affected, &counts);
+    assert_eq!(reports, vec![("src/E.php".to_string(), "C".to_string())]);
+}
+
+#[test]
+fn clover_skips_out_of_range_lines() {
+    let clover = r#"<coverage><project>
+      <file name="/r/src/A.php">
+        <line num="0" type="stmt" count="9"/>
+        <line num="99" type="stmt" count="9"/>
+        <line num="2" type="stmt" count="3"/>
+      </file>
+    </project></coverage>"#;
+    let mut affected = HashMap::new();
+    affected.insert("/r/src/A.php".to_string(), "t".to_string());
+    let counts = |_: &str| Some(3);
+    let reports = read_clover_coverage_ordered(clover, "/r", &affected, &counts);
+    assert_eq!(reports, vec![("src/A.php".to_string(), "NCN".to_string())]);
 }

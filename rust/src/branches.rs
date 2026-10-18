@@ -316,7 +316,7 @@ fn execute_core(
         return match detect_vcs(dir) {
             Some("hg") => {
                 let found = markers::list(dir, markers::MARKER_TYPE_BRANCH)?;
-                let branches: Vec<Branch> = found
+                let branches: Vec<Branch> = found // LCOV_EXCL_START // Reason: needs system hg; markers::list shells hg, absent on ubuntu CI
                     .iter()
                     .map(|marker| Branch {
                         name: marker.name.clone(),
@@ -331,7 +331,7 @@ fn execute_core(
                 let mut text = serde_json::to_string_pretty(&format_json(&branches))
                     .map_err(|e| format!("failed to encode JSON: {e}"))?;
                 text.push('\n');
-                Ok(text)
+                Ok(text) // LCOV_EXCL_STOP
             }
             _ => {
                 let branches = list(dir, options.all)?;
@@ -373,9 +373,10 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
                 .flatten()
                 .and_then(|options| config::client_for(options.conduit_uri.as_deref()).ok());
             if let Some(client) = client
+                // LCOV_EXCL_START // Reason: needs a configured conduit client; hermetic tests cannot mint one (HOME is process-global)
                 && let Some(code) = conduit::auth_report_for(&client, &message)
             {
-                return code;
+                return code; // LCOV_EXCL_STOP
             }
             // T1153 RB-D4 (R4): `branches` runs in the toolset
             // runtime (via `ArcanistMarkersWorkflow`). Argument,

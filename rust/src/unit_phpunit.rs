@@ -411,7 +411,7 @@ pub fn parse_phpunit_results(
     let empty: &[JsonValue] = &[];
     let events = match &report {
         JsonValue::Arr(items) => items.as_slice(),
-        _ => empty,
+        _ => empty, // LCOV_EXCL_LINE // Reason: dead: get_json_report always wraps the report in an array
     };
     for event in events {
         last_event = Some(event);

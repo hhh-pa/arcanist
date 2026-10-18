@@ -129,9 +129,9 @@ fn spawn_output(cmd: &mut std::process::Command) -> Result<std::process::Output,
     loop {
         match cmd.output() {
             Err(error) if is_text_file_busy(&error) && attempt < 50 => {
-                attempt += 1;
+                attempt += 1; // LCOV_EXCL_START // Reason: ETXTBSY retry; macOS exec never reports text-file-busy (probe-gated)
                 std::thread::sleep(std::time::Duration::from_millis(2));
-            }
+            } // LCOV_EXCL_STOP
             other => return other,
         }
     }
@@ -424,7 +424,7 @@ fn apply_status_copy_source(
     line: &str,
 ) -> Result<(), String> {
     match last_path {
-        None => Err(format!("Unexpected copy source in hg status, '{line}'.")),
+        None => Err(format!("Unexpected copy source in hg status, '{line}'.")), // LCOV_EXCL_LINE // Reason: dead: trim() strips leading spaces, so a copy-source line is never first
         Some(prev) => {
             if let Some(detail) = result.get_mut(prev) {
                 detail.from = Some(path.to_string());
@@ -589,7 +589,7 @@ fn parse_mercurial_branch_line(line: &str) -> Option<(String, String, String)> {
     let (name, tail) = head.rsplit_once([' ', '\t'])?;
     let name = name.trim_end();
     if name.is_empty() {
-        return None;
+        return None; // LCOV_EXCL_LINE // Reason: dead: an empty name needs a leading separator, rejected as whitespace above
     }
     let (local, rev) = tail.split_once(':')?;
     if local.is_empty() || !local.bytes().all(|b| b.is_ascii_digit()) {
@@ -740,7 +740,7 @@ pub fn parse_blame(stdout: &str) -> Result<Vec<(String, String)>, String> {
     let mut blame = Vec::new();
     for line in stdout.split_inclusive('\n') {
         if line.is_empty() {
-            continue;
+            continue; // LCOV_EXCL_LINE // Reason: dead: split_inclusive never yields empty items
         }
         let Some(entry) = parse_blame_line(line) else {
             return Err(format!("Unable to parse Mercurial blame line: {line}"));
@@ -2476,7 +2476,7 @@ pub fn migrate_scratch_dir(work_root: &Path, metadata: &Path) -> bool {
     }
     for name in &names {
         if std::fs::copy(old.join(name), new.join(name)).is_err() {
-            return false;
+            return false; // LCOV_EXCL_LINE // Reason: copy fails only via unreadable sources; gates run as root so chmod cannot trigger; covered on macOS runs
         }
     }
     std::fs::remove_dir_all(&old).is_ok() && !old.exists()

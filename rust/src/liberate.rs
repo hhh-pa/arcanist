@@ -457,10 +457,11 @@ pub fn rebuild_map(path: &Path, clean: bool, script: Option<&Path>) -> Option<St
         |s| Some(s.to_path_buf()),
     );
     let Some(script) = script else {
+        // LCOV_EXCL_START // Reason: lookup-miss arm; runs only where no support tree sits above library or binary
         return Some(format!(
             "cannot rebuild '{}': support/lib/rebuild-map.php was not found above the library or the arc binary",
             path.display()
-        ));
+        )); // LCOV_EXCL_STOP
     };
     let mut command = crate::proc_env::command("php");
     command.arg("-f").arg(&script).arg("--");
@@ -469,11 +470,11 @@ pub fn rebuild_map(path: &Path, clean: bool, script: Option<&Path>) -> Option<St
     }
     command.arg(path);
     match command.status() {
-        Ok(status) if status.success() => None,
+        Ok(status) if status.success() => None, // LCOV_EXCL_START // Reason: php outcome arms; php is absent from the coverage image
         Ok(status) => Some(format!(
             "rebuild-map.php failed for '{}' (exit {status})",
             path.display()
-        )),
+        )), // LCOV_EXCL_STOP
         Err(e) => Some(format!(
             "cannot run php '{}': {e} (is PHP installed?)",
             script.display()

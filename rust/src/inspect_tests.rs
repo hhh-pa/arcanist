@@ -498,6 +498,290 @@ fn ref_trees_carry_no_markup() {
 }
 
 #[test]
+fn simple_symbols_resolve_without_prefixes() {
+    let kind = symbol_type("build").unwrap();
+    assert_eq!(
+        resolve_simple_symbol(kind, "123").unwrap(),
+        ResolvedSymbol {
+            kind: "id",
+            value: "123".to_string(),
+        }
+    );
+}
+
+#[test]
+fn user_symbols_cover_functions_ids_and_phids() {
+    // Bare calls with inner whitespace are functions.
+    assert_eq!(resolve_user_symbol("viewer( )").unwrap().kind, "function");
+    assert_eq!(resolve_user_symbol("viewer(\t)").unwrap().kind, "function");
+    // A head with whitespace is not a call; the whole symbol then
+    // fails username validation too.
+    assert!(resolve_user_symbol("a b()").is_err());
+    // An unclosed call falls back to a username.
+    assert_eq!(
+        resolve_user_symbol("viewer(").unwrap(),
+        ResolvedSymbol {
+            kind: "username",
+            value: "viewer(".to_string(),
+        }
+    );
+    // Decimal IDs and user PHIDs resolve like PHP.
+    assert_eq!(
+        resolve_user_symbol("123").unwrap(),
+        ResolvedSymbol {
+            kind: "id",
+            value: "123".to_string(),
+        }
+    );
+    assert_eq!(
+        resolve_user_symbol("PHID-USER-abc").unwrap(),
+        ResolvedSymbol {
+            kind: "phid",
+            value: "PHID-USER-abc".to_string(),
+        }
+    );
+}
+
+#[test]
+fn renders_unexplored_commit_objects() {
+    let out = render_commit_symbol(
+        "s",
+        CommitSymbolObject::Commit(CommitInfo {
+            hash: "h".to_string(),
+            message: "m".to_string(),
+        }),
+        false,
+    );
+    assert!(
+        out.contains("   o [ArcanistScalarHardpoint] message"),
+        "{out}"
+    );
+}
+
+#[test]
+fn hg_paths_parse_strictly() {
+    assert_eq!(
+        parse_hg_paths("default = https://x\nup = ssh://y").unwrap(),
+        vec![
+            ("default".to_string(), "https://x".to_string()),
+            ("up".to_string(), "ssh://y".to_string()),
+        ]
+    );
+    assert!(parse_hg_paths("garbage line").is_err());
+    // A lone empty line matches nothing.
+    assert!(parse_hg_paths("").is_err());
+}
+
+#[test]
+fn commit_symbols_outside_repos_fail_cleanly() {
+    let plain = TempDir::new("nonrepo");
+    let err = resolve_commit_symbol(plain.path(), "HEAD").unwrap_err();
+    assert!(err.contains("unexpected line"), "{err}");
+}
+
+#[test]
+fn remote_lookup_covers_hg_and_svn_roots() {
+    // Without an `hg` binary the hg lookup fails before parsing paths
+    // (and a bare `.hg` dir fails it when one exists).
+    let hg_dir = TempDir::new("hgroot");
+    std::fs::create_dir_all(hg_dir.path().join(".hg")).unwrap();
+    assert!(lookup_remote(hg_dir.path(), "default").is_err());
+    // Subversion roots hit the not-implemented fatal.
+    let svn_dir = TempDir::new("svnroot");
+    std::fs::create_dir_all(svn_dir.path().join(".svn")).unwrap();
+    assert_eq!(
+        lookup_remote(svn_dir.path(), "trunk").unwrap_err(),
+        "Method newRemoteRefQueryTemplate in class ArcanistSubversionAPI is not implemented!"
+    );
+}
+
+#[test]
+fn explores_browse_fallbacks_and_uris() {
+    use std::collections::HashMap;
+    let tmp = init_repo("browseblob");
+    std::fs::write(tmp.path().join("f.txt"), "one\n").unwrap();
+    git(tmp.path(), &["add", "f.txt"]);
+    git(tmp.path(), &["commit", "-m", "first subject"]);
+    let blob = git(tmp.path(), &["rev-parse", "HEAD:f.txt"]);
+    let mut lookup = serde_json::Map::new();
+    lookup.insert(
+        blob.clone(),
+        serde_json::json!({"uri": "https://phab.test/blob"}),
+    );
+    let mut routes = HashMap::new();
+    routes.insert("repository.query".to_string(), serde_json::json!([]));
+    routes.insert("phid.lookup".to_string(), serde_json::Value::Object(lookup));
+    routes.insert("differential.query".to_string(), serde_json::json!([]));
+    let call = move |method: &str, _: &serde_json::Value| {
+        routes
+            .get(method)
+            .cloned()
+            .ok_or_else(|| format!("unexpected call {method}"))
+    };
+    let mut ctx = browse::BrowseCtx::new(tmp.path(), &call, "");
+    let block = render_browse(tmp.path(), &blob, true, Some(&mut ctx)).unwrap();
+    // The blob resolves to file content, not a commit, so the message
+    // load falls back to empty...
+    assert!(block.contains("Commit \"one\""), "{block}");
+    assert!(block.contains("> \"\""), "{block}");
+    // ...while the object lookup still contributes its URI.
+    assert!(
+        block.contains("Browse URI \"https://phab.test/blob\""),
+        "{block}"
+    );
+}
+
+#[test]
+fn inspectors_reject_missing_arguments() {
+    let tmp = TempDir::new("arity");
+    for spec in ["commit", "user", "remote"] {
+        let err = inspect_one(tmp.path(), spec, false).unwrap_err();
+        assert!(
+            err.contains("Expected exactly one argument"),
+            "{spec}: {err}"
+        );
+    }
+}
+
+#[test]
+fn conduit_errors_render_raw() {
+    assert_eq!(
+        conduit_error_text(conduit::Error::Transport("boom".to_string())),
+        "boom"
+    );
+}
+
+#[test]
+fn run_in_reports_missing_terminator() {
+    // Piped stdin is never a TTY under `cargo test`; bail out (rather
+    // than parse differently) if that ever changes.
+    if crate::prompt::stdin_is_terminal() {
+        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
+    }
+    let tmp = TempDir::new("terminator");
+    assert_eq!(
+        run_in(tmp.path(), &args(&["working-copy(HEAD)"])),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn browse_auth_failures_render_login_guidance() {
+    let tmp = init_repo("authfail");
+    std::fs::write(tmp.path().join("f.txt"), "one\n").unwrap();
+    git(tmp.path(), &["add", "f.txt"]);
+    git(tmp.path(), &["commit", "-m", "first subject"]);
+    let call = |method: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
+        assert_eq!(method, "differential.query");
+        Err("ERR-INVALID-AUTH: bad credentials".to_string())
+    };
+    let mut ctx = browse::BrowseCtx::new(tmp.path(), &call, "");
+    let client = conduit::Client::new("https://phab.test/", "tok").unwrap();
+    let options = Options {
+        explore: true,
+        objects: vec!["browse(HEAD)".to_string()],
+    };
+    assert_eq!(
+        finish_inspect_blocks(tmp.path(), &options, Some(&mut ctx), Some(&client)),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn bad_commits_escape_into_a_fatal() {
+    let tmp = init_repo("fatal");
+    std::fs::write(tmp.path().join("f.txt"), "one\n").unwrap();
+    git(tmp.path(), &["add", "f.txt"]);
+    git(tmp.path(), &["commit", "-m", "first subject"]);
+    assert_eq!(
+        run_in(
+            tmp.path(),
+            &args(&["--explore", "--", "working-copy(no-such-rev-xyz)"])
+        ),
+        std::process::ExitCode::from(255)
+    );
+}
+
+/// Serve `expected` requests from `routes` (method -> envelope
+/// result JSON); returns the base URI. (Local replicate of the
+/// `export_tests` stub.)
+fn serve_inspect_routes(
+    routes: std::collections::HashMap<String, String>,
+    expected: usize,
+) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for _ in 0..expected {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            let head_text = String::from_utf8_lossy(&head).to_string();
+            let len: usize = head_text
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(key, value)| {
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).unwrap();
+            let method = head_text
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .strip_prefix("/api/")
+                .unwrap_or("")
+                .to_string();
+            let result = routes.get(&method).cloned().unwrap_or("null".to_string());
+            let canned = format!(r#"{{"result": {result}, "error_code": null}}"#);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                canned.len(),
+                canned
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    base
+}
+
+#[test]
+fn explore_browse_builds_a_tokenless_client_from_config() {
+    // `--explore` over `browse(...)` without an injected caller builds
+    // a tokenless client from the project `.arcconfig` and drives the
+    // engine over live conduit calls (here a localhost stub).
+    let tmp = init_repo("livebrowse");
+    std::fs::write(tmp.path().join("f.txt"), "one\n").unwrap();
+    git(tmp.path(), &["add", "f.txt"]);
+    git(tmp.path(), &["commit", "-m", "first subject"]);
+    let mut routes = std::collections::HashMap::new();
+    routes.insert("differential.query".to_string(), "[]".to_string());
+    routes.insert("phid.lookup".to_string(), "{}".to_string());
+    routes.insert("repository.query".to_string(), "[]".to_string());
+    let base = serve_inspect_routes(routes, 2);
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        format!(r#"{{"phabricator.uri": "{base}"}}"#),
+    )
+    .unwrap();
+    assert_eq!(
+        run_in(tmp.path(), &args(&["--explore", "--", "browse(HEAD)"])),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
+#[test]
 fn r4_rbd4_spec_errors_are_toolset_usage() {
     // Malformed specs and unknown types are toolset usage (exit 1);
     // bad commits escape into a fatal (255).
@@ -591,4 +875,14 @@ fn b23_inspect_help_matches_generated_format() {
     assert!(text.contains("--explore"), "{text}");
     let ansi = usage_text(true);
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+}
+
+// -( T1170 wave 6h: helper-arm coverage )--------------------------------------
+
+#[test]
+#[should_panic(expected = "failed:")]
+fn git_helper_reports_failing_commands() {
+    // A failing git invocation panics with the command and stderr.
+    let tmp = TempDir::new("w6h-git-fail");
+    git(tmp.path(), &["--bogus-flag-xyz"]);
 }

@@ -39,12 +39,12 @@ fn git(dir: &Path, args: &[&str]) {
         .args(args)
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
+    let detail = format!(
         "git {} failed: {}",
         args.join(" "),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(output.status.success(), "{detail}");
 }
 
 fn git_output(dir: &Path, args: &[&str]) -> String {
@@ -54,12 +54,12 @@ fn git_output(dir: &Path, args: &[&str]) -> String {
         .args(args)
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
+    let detail = format!(
         "git {} failed: {}",
         args.join(" "),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(output.status.success(), "{detail}");
     String::from_utf8_lossy(&output.stdout)
         .trim_end()
         .to_string()
@@ -86,11 +86,11 @@ fn commit_at(dir: &Path, name: &str, date: &str) {
         .env("GIT_COMMITTER_DATE", date)
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
+    let detail = format!(
         "git commit failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(output.status.success(), "{detail}");
 }
 
 #[test]
@@ -214,6 +214,18 @@ fn renders_php_version_line() {
 }
 
 #[test]
+fn live_version_line_matches_fixed_offset_rendering() {
+    // Zone-independent: the live render equals the fixed-offset render
+    // at the live offset, whatever the machine zone is.
+    for timestamp in [0, 1_791_243_000] {
+        let live = render_version_line("abc123", timestamp);
+        let now = u64::try_from(timestamp).unwrap_or(0);
+        let offset = look::local_utc_offset(now);
+        assert_eq!(live, render_version_line_in("abc123", timestamp, offset));
+    }
+}
+
+#[test]
 fn reports_fixture_checkout_version() {
     let repo = fresh_repo("happy");
     commit_at(&repo.path, "a.txt", "2026-10-05 12:00:00 +0000");
@@ -269,6 +281,18 @@ fn rejects_directories_outside_any_checkout() {
 }
 
 #[test]
+fn run_in_reports_not_a_checkout_as_usage_error() {
+    // T1153 CORE-49: with `--` present the parse succeeds and the
+    // not-a-git-copy error escapes as a toolset `USAGE EXCEPTION`
+    // (exit 1), like the parse errors above.
+    let tmp = TempDir::new("notacheckout");
+    assert_eq!(
+        run_in(tmp.path(), &args(&["--"])),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
 fn fails_without_commits() {
     let repo = fresh_repo("empty");
     assert!(head_commit(&repo.path).is_err());
@@ -308,4 +332,29 @@ fn run_reports_help_and_usage_errors() {
 fn git_is_available_on_test_machines() {
     // Every fixture here shells out to git, like the other suites.
     assert!(git_binary_available());
+}
+
+/// `readable_path()` also strips the resolved-CWD prefix: when `cwd`
+/// passes through a symlink, `canonicalize` differs and paths stored
+/// under the canonical directory still trim (T1153 CORE-61). macOS
+/// covers this incidentally (`/tmp` is a symlink); the explicit link
+/// pins it on Linux, where temp dirs are canonical already.
+#[cfg(unix)]
+#[test]
+fn readable_path_strips_resolved_cwd_prefix() {
+    let tmp = TempDir::new("readable-link");
+    // Canonical root: on macOS the temp dir itself sits under a
+    // symlink (`/var` -> `/private/var`), which would add a second
+    // resolution hop and defeat the `resolved != cwd` pin.
+    let root = tmp.path().canonicalize().unwrap();
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&root, &link).unwrap();
+    let file = root.join("sub").join("f.txt");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "x").unwrap();
+    let want = format!("sub{}f.txt", std::path::MAIN_SEPARATOR);
+    // Through the link, the cwd prefix strips directly ...
+    assert_eq!(readable_path(&link, &link.join("sub").join("f.txt")), want);
+    // ... while the canonical path needs the resolved parent.
+    assert_eq!(readable_path(&link, &file), want);
 }

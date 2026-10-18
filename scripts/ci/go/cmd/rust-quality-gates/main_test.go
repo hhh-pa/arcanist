@@ -202,7 +202,9 @@ func TestStubGoldens(t *testing.T) {
 	}{
 		{"full-run", nil, 0},
 		{"raw-small", []string{"STUB_RAW=small"}, 0},
-		{"raw-narrow", []string{"STUB_RAW=narrow"}, 0},
+		// Narrow keeps the unfiltered cargo report by design (fallback
+		// path); under the 100 floor that fails the gates.
+		{"raw-narrow", []string{"STUB_RAW=narrow"}, 1},
 		{"audit-fail", []string{"STUB_AUDIT_FAIL=1"}, 1},
 		{"llvmcov-fail", []string{"STUB_LLVMCOV_FAIL=1"}, 1},
 		{"rustc-fail", []string{"STUB_RUSTC_FAIL=1"}, 0},

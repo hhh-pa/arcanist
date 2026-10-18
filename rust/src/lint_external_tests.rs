@@ -1,4 +1,32 @@
 use super::*;
+use std::path::{Path, PathBuf};
+
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-lint-external-tests-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
 
 fn canned_parser(
     _path: &str,
@@ -167,4 +195,101 @@ fn temp_file_resolves_as_path_candidate() {
     assert!(resolved.interpreter.is_none());
     assert!(!binary_exists("definitely-missing-lint-binary-xyz"));
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn tool_options_reject_mistyped_flags_and_version() {
+    let mut options = ToolOptions::default();
+    assert_eq!(
+        apply_tool_option(
+            &mut options,
+            "flags",
+            &serde_json::json!(["--ok", 42]),
+            Path::new(".")
+        )
+        .unwrap_err(),
+        "'flags' must be a list of strings"
+    );
+    assert_eq!(
+        apply_tool_option(
+            &mut options,
+            "version",
+            &serde_json::json!(42),
+            Path::new(".")
+        )
+        .unwrap_err(),
+        "'version' must be a string"
+    );
+    assert_eq!(
+        apply_tool_option(
+            &mut options,
+            "flags",
+            &serde_json::json!(["--ok"]),
+            Path::new(".")
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn configured_bin_accepts_lists_and_rejects_shapes() {
+    let root = TempDir::new("bin");
+    assert_eq!(
+        resolve_configured_bin(
+            &serde_json::json!(["nope-a-xyz", "nope-b-xyz"]),
+            root.path()
+        )
+        .unwrap_err(),
+        "None of the configured binaries can be located."
+    );
+    assert_eq!(
+        resolve_configured_bin(&serde_json::json!(["ok", 42]), root.path()).unwrap_err(),
+        "'bin' must be a string or a list of strings"
+    );
+    assert_eq!(
+        resolve_configured_bin(&serde_json::json!(42), root.path()).unwrap_err(),
+        "'bin' must be a string or a list of strings"
+    );
+}
+
+#[test]
+fn configured_bin_falls_back_to_the_project_root() {
+    let root = TempDir::new("binroot");
+    let tool = root.path().join("cov5e-tool");
+    std::fs::write(&tool, b"#!/bin/sh\necho hi\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&tool).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&tool, permissions).unwrap();
+    }
+    // A bare name missing from PATH resolves against the root.
+    assert_eq!(
+        resolve_configured_bin(&serde_json::json!("cov5e-tool"), root.path()).unwrap(),
+        tool
+    );
+}
+
+#[test]
+fn unspawnable_binary_stays_silent() {
+    // An executable script naming a missing interpreter passes
+    // resolution but fails exec (ENOENT, with no shell fallback),
+    // which stays silent like a missing binary.
+    let root = TempDir::new("badinterp");
+    let tool = root.path().join("fake-tool");
+    std::fs::write(&tool, b"#!/definitely/missing/interp-xyz\necho hi\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&tool).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&tool, permissions).unwrap();
+    }
+    let config = ExternalToolConfig {
+        binaries: vec![tool.to_string_lossy().to_string()],
+        ..ExternalToolConfig::default()
+    };
+    let linter = ExternalLinter::with_config(config, canned_parser);
+    assert!(linter.lint_bytes("file.txt", b"data\n").is_empty());
 }

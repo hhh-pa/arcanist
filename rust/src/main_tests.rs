@@ -149,9 +149,7 @@ fn alias_command_is_registered() {
         .iter()
         .find(|(name, _)| *name == alias::NAME)
         .map(|(_, run)| *run);
-    let Some(run) = run else {
-        panic!("alias is not registered");
-    };
+    let run = run.expect("alias is not registered");
     // T1153 B21/B23: piped runs carry `--`.
     assert_eq!(run(&args(&["--help", "--"])), ExitCode::SUCCESS);
 }
@@ -178,6 +176,48 @@ fn dispatch_target(argv: &[String]) -> CommandFn {
     find_command(cmd).unwrap_or_else(|| panic!("{cmd} is not registered"))
 }
 
+/// Unwrap a [`Resolution::Run`]; the rejection arm is covered by
+/// [`expect_run_rejects_unknown`].
+fn expect_run(resolved: Resolution) -> (&'static str, Option<String>) {
+    match resolved {
+        Resolution::Run { name, notice } => (name, notice),
+        Resolution::Unknown { message } => panic!("expected run, got unknown: {message}"),
+    }
+}
+
+/// Unwrap a [`Resolution::Unknown`]; the rejection arm is covered by
+/// [`expect_unknown_rejects_run`].
+fn expect_unknown(resolved: Resolution) -> String {
+    match resolved {
+        Resolution::Unknown { message } => message,
+        Resolution::Run { name, .. } => panic!("expected unknown, got run: {name}"),
+    }
+}
+
+/// Shell-spawn callback for expansions that must stay in-process;
+/// covered by [`no_shell_panics`].
+fn no_shell(shell: &[String]) -> Result<alias::ShellStatus, String> {
+    panic!("no shell execution expected: {shell:?}")
+}
+
+#[test]
+#[should_panic(expected = "expected run")]
+fn expect_run_rejects_unknown() {
+    expect_run(resolve_command("bogus", false));
+}
+
+#[test]
+#[should_panic(expected = "expected unknown")]
+fn expect_unknown_rejects_run() {
+    expect_unknown(resolve_command("land", true));
+}
+
+#[test]
+#[should_panic(expected = "no shell execution expected")]
+fn no_shell_panics() {
+    let _ = no_shell(&[]);
+}
+
 #[test]
 fn stored_alias_expands_through_main_dispatch() {
     for stored in [
@@ -188,11 +228,10 @@ fn stored_alias_expands_through_main_dispatch() {
         let (outcome, notices) = alias::apply_expansion_with(
             args(&["draft", "extra"]),
             || Some((aliases, Vec::new())),
-            |_| panic!("no shell execution expected"),
+            no_shell,
         );
-        let Ok(argv) = outcome else {
-            panic!("expected dispatch, got {outcome:?}");
-        };
+        assert!(outcome.is_ok(), "expected dispatch, got {outcome:?}");
+        let argv = outcome.unwrap();
         assert_eq!(argv, args(&["diff", "--draft", "extra"]));
         assert_eq!(notices.len(), 1);
         assert!(
@@ -206,11 +245,8 @@ fn stored_alias_expands_through_main_dispatch() {
 fn expansion_leaves_builtins_and_flags_alone() {
     for argv in [args(&["diff"]), args(&["--help"]), args(&["bogus"])] {
         let aliases = stored_aliases(serde_json::json!({"diff": ["lint"]}));
-        let (outcome, notices) = alias::apply_expansion_with(
-            argv.clone(),
-            || Some((aliases, Vec::new())),
-            |_| panic!("no shell execution expected"),
-        );
+        let (outcome, notices) =
+            alias::apply_expansion_with(argv.clone(), || Some((aliases, Vec::new())), no_shell);
         assert_eq!(outcome, Ok(argv));
         assert!(notices.is_empty());
     }
@@ -225,11 +261,10 @@ fn expansion_reports_shell_and_broken_chains() {
         |shell| {
             // T1153 CORE-23: PHP `phutil_passthru()` mediates the
             // shell, so Unix runs through `sh -c` (direct elsewhere).
-            if cfg!(unix) {
-                assert_eq!(shell, &args(&["sh", "-c", "'ls' '-la'"]));
-            } else {
-                assert_eq!(shell, &args(&["ls", "-la"]));
-            }
+            #[cfg(unix)]
+            assert_eq!(shell, &args(&["sh", "-c", "'ls' '-la'"]));
+            #[cfg(not(unix))]
+            assert_eq!(shell, &args(&["ls", "-la"]));
             Ok(alias::ShellStatus::Exited(0))
         },
     );
@@ -241,11 +276,8 @@ fn expansion_reports_shell_and_broken_chains() {
     );
 
     let aliases = stored_aliases(serde_json::json!({"a": ["gone"]}));
-    let (outcome, _) = alias::apply_expansion_with(
-        args(&["a"]),
-        || Some((aliases, Vec::new())),
-        |_| panic!("no shell execution expected"),
-    );
+    let (outcome, _) =
+        alias::apply_expansion_with(args(&["a"]), || Some((aliases, Vec::new())), no_shell);
     // T1153 CORE-27 (kept): a broken chain fails fast instead of
     // PHP's legacy fallthrough to the unknown-command error.
     assert_eq!(outcome, Err(ExitCode::FAILURE));
@@ -456,9 +488,7 @@ fn core16_toolset_exact_wins() {
 
 #[test]
 fn core16_toolset_spelling_corrects_only_when_interactive() {
-    let Resolution::Run { name, notice } = resolve_command("ver", true) else {
-        panic!("expected toolset correction");
-    };
+    let (name, notice) = expect_run(resolve_command("ver", true));
     assert_eq!(name, "version");
     assert_eq!(
         notice.as_deref(),
@@ -508,26 +538,20 @@ fn core16_classic_unique_prefix_runs() {
 
 #[test]
 fn core16_classic_multi_prefix_lists_suggestions() {
-    let Resolution::Unknown { message } = resolve_command("l", false) else {
-        panic!("expected unknown");
-    };
+    let message = expect_unknown(resolve_command("l", false));
     assert!(message.contains("Unknown command 'l'. Try 'arc help'."));
     assert!(message.contains("Did you mean:\n    land\n    liberate\n    lint\n"));
 }
 
 #[test]
 fn core16_unknown_command_without_suggestions() {
-    let Resolution::Unknown { message } = resolve_command("bogus", false) else {
-        panic!("expected unknown");
-    };
+    let message = expect_unknown(resolve_command("bogus", false));
     assert_eq!(message, "Unknown command 'bogus'. Try 'arc help'.");
 }
 
 #[test]
 fn core16_dash_led_names_never_correct() {
-    let Resolution::Unknown { message } = resolve_command("--help", true) else {
-        panic!("expected unknown");
-    };
+    let message = expect_unknown(resolve_command("--help", true));
     assert!(message.contains("Unknown command '--help'."));
 }
 
@@ -758,8 +782,13 @@ fn core19_all_commands_export_arcanist() {
     // T1153 CORE-19 (R2): PHP putenvs `$command` after `selectWorkflow()`
     // for every command (`scripts/arcanist.php:229`), so hook children of
     // toolset-style commands inherit it too. `help` exercises a
-    // non-classic name through the real dispatch (no other test sets the
-    // process-once cell, so this read is deterministic).
+    // non-classic name through the real dispatch.
+    //
+    // The command cell is process-once (`OnceLock`: first writer wins)
+    // and the harness runs tests in parallel threads, so EVERY dispatch
+    // resolving to a different name must live in THIS test, sequenced
+    // after the pin: a standalone `dispatch(["call-cond"])` test raced
+    // this pin (`"call-conduit"` vs `"help"`, T1170 endgame).
     let globals = Globals::default();
     let code = dispatch_run("help", None, "help", &args(&["arc"]), &globals);
     assert_eq!(code, ExitCode::SUCCESS);
@@ -767,6 +796,12 @@ fn core19_all_commands_export_arcanist() {
     // T1153 CORE-66: 37 concrete workflows at ceb (`browse` is real;
     // only `markers` is abstract).
     assert_eq!(ALL_WORKFLOWS.len(), 37);
+    // T1170 endgame band I: `call-cond` prefix-resolves to `call-conduit`,
+    // which dispatches through `classify` rather than the command table,
+    // so the table lookup misses and the unknown-command arm reports
+    // (exit 1) — while the cell keeps the first ("help") value.
+    assert_eq!(dispatch(&args(&["call-cond"])), ExitCode::FAILURE);
+    assert_eq!(arc_rs::globals::command_name().as_deref(), Some("help"));
 }
 
 #[test]
@@ -888,3 +923,318 @@ fn r10_call_conduit_help_matches_generated_format() {
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
     assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
 }
+
+// -( T1170 coverage: global phases, resolution, dispatch )--------------------
+
+#[test]
+#[allow(unpredictable_function_pointer_comparisons)]
+fn find_command_ci_matches_case_insensitively() {
+    // The lookup returns fn items; comparing identity is the point of this test.
+    assert_eq!(find_command_ci("DIFF"), find_command("diff"));
+    assert_eq!(find_command_ci("diff"), find_command("diff"));
+    assert!(find_command_ci("bogus").is_none());
+}
+
+#[test]
+fn strip_standard_handles_dash_and_valued_flags() {
+    // Any single dash requests help (PHP accepts help flags anywhere).
+    let mut globals = Globals::default();
+    assert_eq!(
+        strip_standard(&args(&["-x", "diff"]), &mut globals).unwrap(),
+        args(&["diff"])
+    );
+    assert!(globals.show_help);
+    // `--xprofile` is the only valued standard flag (parsed, ignored).
+    let mut globals = Globals::default();
+    assert!(
+        strip_standard(&args(&["--xprofile=prof"]), &mut globals)
+            .unwrap()
+            .is_empty()
+    );
+    let mut globals = Globals::default();
+    assert!(
+        strip_standard(&args(&["--xprofile", "prof"]), &mut globals)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!globals.show_help);
+    // Display-only and PHP-only boolean flags.
+    let mut globals = Globals::default();
+    assert!(
+        strip_standard(&args(&["--show-standard-options"]), &mut globals)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(globals.show_standard_options);
+    let mut globals = Globals::default();
+    assert!(
+        strip_standard(&args(&["--recon"]), &mut globals)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(globals, Globals::default());
+}
+
+#[test]
+fn strip_config_takes_inline_values_and_reports_missing() {
+    let mut globals = Globals::default();
+    assert!(
+        strip_config(&args(&["--config=k=v"]), &mut globals)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(globals.config, args(&["k=v"]));
+    let mut globals = Globals::default();
+    assert!(strip_config(&args(&["--config"]), &mut globals).is_err());
+}
+
+#[test]
+fn strip_toolset_reports_duplicates() {
+    let mut globals = Globals::default();
+    assert!(strip_toolset(&args(&["--conduit-uri", "a"]), &mut globals).is_ok());
+    assert_eq!(globals.conduit_uri.as_deref(), Some("a"));
+    let mut globals = Globals::default();
+    assert!(
+        strip_toolset(
+            &args(&["--conduit-uri", "a", "--conduit-uri", "b"]),
+            &mut globals
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn strip_classic_consumes_arcrc_and_anonymous() {
+    let mut globals = Globals::default();
+    assert!(
+        strip_classic(&args(&["--arcrc-file=/tmp/x"]), &mut globals)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(globals.arcrc_file.as_deref(), Some("/tmp/x"));
+    let mut globals = Globals::default();
+    assert!(
+        strip_classic(
+            &args(&["--arcrc-file", "a", "--arcrc-file", "b"]),
+            &mut globals
+        )
+        .is_err()
+    );
+    let mut globals = Globals::default();
+    assert!(strip_classic(&args(&["--anonymous", "--anonymous"]), &mut globals).is_err());
+    let mut globals = Globals::default();
+    assert!(strip_classic(&args(&["--anonymous"]), &mut globals).is_ok());
+    assert!(globals.anonymous);
+}
+
+#[test]
+fn strip_classic_ignores_phutil_library() {
+    let mut globals = Globals::default();
+    assert!(
+        strip_classic(&args(&["--load-phutil-library=x"]), &mut globals)
+            .unwrap()
+            .is_empty()
+    );
+    let mut globals = Globals::default();
+    assert!(
+        strip_classic(&args(&["--load-phutil-library", "x"]), &mut globals)
+            .unwrap()
+            .is_empty()
+    );
+    let mut globals = Globals::default();
+    assert!(strip_classic(&args(&["--load-phutil-library"]), &mut globals).is_err());
+}
+
+#[test]
+fn resolve_command_corrects_british_spellings() {
+    let (name, notice) = expect_run(resolve_command("dift", false));
+    assert_eq!(name, "diff");
+    assert!(notice.unwrap().contains("dift"), "typo carries a notice");
+    let message = expect_unknown(resolve_command("tl", false));
+    assert!(message.contains("Did you mean"), "{message}");
+    assert!(
+        message.contains("lint") && message.contains("list"),
+        "{message}"
+    );
+}
+
+#[test]
+fn dispatch_reports_global_and_config_errors() {
+    assert_eq!(dispatch(&args(&["--config"])), ExitCode::FAILURE);
+    assert_eq!(
+        dispatch(&args(&["--config", "bad-value"])),
+        ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn help_flag_with_unknown_command_reports_usage() {
+    assert_eq!(
+        dispatch_help_flag(&args(&["bogus"]), &Globals::default()),
+        ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn dispatch_action_renders_help_version_and_missing() {
+    assert_eq!(
+        dispatch_inner(&args(&["-h"]), &Globals::default()),
+        ExitCode::SUCCESS
+    );
+    assert_eq!(
+        dispatch_inner(&args(&["--version"]), &Globals::default()),
+        ExitCode::SUCCESS
+    );
+    assert_eq!(
+        dispatch_inner(&args(&["call-conduit", "--help"]), &Globals::default()),
+        ExitCode::SUCCESS
+    );
+    assert_eq!(
+        dispatch_action(Action::Missing, &args(&[]), &Globals::default()),
+        ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn call_conduit_setup_failure_is_fatal() {
+    let call_args = CallArgs {
+        method: "m".to_string(),
+        conduit_uri: Some("::not-a-uri".to_string()),
+    };
+    let mut out = Vec::new();
+    assert_eq!(
+        run_call_conduit_with(&call_args, &b"{}"[..], &mut out),
+        ExitCode::from(255)
+    );
+    assert!(out.is_empty());
+}
+
+// -( T1170 coverage: call-conduit over loopback )------------------------------
+
+struct FailWriter;
+
+impl std::io::Write for FailWriter {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("t1170 sink closed"))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serve one canned Conduit JSON body over loopback HTTP, then close.
+/// Returns the base URI plus the server thread (join it to surface
+/// panics). Every line below runs on each use (no optional arms).
+fn serve_once(body: &'static str) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let uri = format!("http://{}/", listener.local_addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 4096];
+        for _ in 0..1000 {
+            if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+            let count = stream.read(&mut buf).unwrap();
+            raw.extend_from_slice(&buf[..count]);
+        }
+        let text = String::from_utf8_lossy(&raw);
+        let head_end = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let length: usize = text
+            .to_ascii_lowercase()
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("content-length:")
+                    .and_then(|value| value.trim().parse().ok())
+            })
+            .next()
+            .unwrap_or(0);
+        let mut rest = vec![0u8; head_end + length - raw.len()];
+        stream.read_exact(&mut rest).unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.flush().unwrap();
+    });
+    (uri, handle)
+}
+
+#[test]
+fn call_conduit_api_error_lands_in_envelope() {
+    let (uri, server) = serve_once(r#"{"error_code": "ERR-FOO", "error_info": "boom"}"#);
+    let args = CallArgs {
+        method: "m".to_string(),
+        conduit_uri: Some(uri),
+    };
+    let mut out = Vec::new();
+    assert_eq!(
+        run_call_conduit_with(&args, &b"{}"[..], &mut out),
+        ExitCode::SUCCESS
+    );
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("ERR-FOO: boom"), "{text}");
+    server.join().unwrap();
+}
+
+#[test]
+fn call_conduit_auth_error_reports_guidance() {
+    let (uri, server) = serve_once(r#"{"error_code": "ERR-INVALID-AUTH", "error_info": "bad"}"#);
+    let args = CallArgs {
+        method: "m".to_string(),
+        conduit_uri: Some(uri),
+    };
+    let mut out = Vec::new();
+    assert_eq!(
+        run_call_conduit_with(&args, &b"{}"[..], &mut out),
+        ExitCode::FAILURE
+    );
+    assert!(out.is_empty());
+    server.join().unwrap();
+}
+
+#[test]
+fn call_conduit_write_failure_is_fatal() {
+    let (uri, server) = serve_once(r#"{"error_code": "ERR-FOO", "error_info": "boom"}"#);
+    let args = CallArgs {
+        method: "m".to_string(),
+        conduit_uri: Some(uri),
+    };
+    let mut out = FailWriter;
+    assert_eq!(
+        run_call_conduit_with(&args, &b"{}"[..], &mut out),
+        ExitCode::FAILURE
+    );
+    assert!(std::io::Write::flush(&mut out).is_ok());
+    server.join().unwrap();
+}
+
+// -( T1170 wave 5d )-----------------------------------------------------------
+
+#[test]
+fn core19_dispatch_run_prints_spelling_notice() {
+    // A resolved command with a spelling notice prints the notice
+    // before running. `help` renders without side effects; the name
+    // matches the CORE-19 pin, so the process-once command cell stays
+    // deterministic no matter which test runs first.
+    let globals = Globals::default();
+    let code = dispatch_run(
+        "help",
+        Some("(Assuming \"hep\" is the British spelling of \"help\".)"),
+        "hep",
+        &args(&["arc"]),
+        &globals,
+    );
+    assert_eq!(code, ExitCode::SUCCESS);
+}
+
+// T1170 endgame band I: `call_conduit_prefix_reports_unknown_command`
+// merged into `core19_all_commands_export_arcanist` above (the command
+// cell is process-once; a standalone different-name dispatch raced the
+// CORE-19 pin).

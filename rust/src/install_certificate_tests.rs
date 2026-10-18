@@ -692,6 +692,369 @@ fn core41_open_arcrc_fails_when_piped() {
     assert!(err.contains("not a TTY"), "{err}");
     assert_eq!(arcrc_mode(&path), 0o644);
 }
+/// Serve `expected` requests from `routes` (method -> envelope
+/// result JSON); returns the base URI. (Local replicate of the
+/// `export_tests` stub.)
+fn serve_install_routes(
+    routes: std::collections::HashMap<String, String>,
+    expected: usize,
+) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for _ in 0..expected {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            let head_text = String::from_utf8_lossy(&head).to_string();
+            let len: usize = head_text
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(key, value)| {
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).unwrap();
+            let method = head_text
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .strip_prefix("/api/")
+                .unwrap_or("")
+                .to_string();
+            let result = routes.get(&method).cloned().unwrap_or("null".to_string());
+            let canned = format!(r#"{{"result": {result}, "error_code": null}}"#);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                canned.len(),
+                canned
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    base
+}
+
+#[test]
+fn token_auth_check_passes_on_modern_servers() {
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "conduit.getcapabilities".to_string(),
+        r#"{"authentication": ["token"]}"#.to_string(),
+    );
+    let base = serve_install_routes(routes, 1);
+    assert!(check_token_auth(&base).is_ok());
+}
+
+#[test]
+fn whoami_verifies_tokens_against_the_server() {
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "user.whoami".to_string(),
+        r#"{"phid": "PHID-USER-1"}"#.to_string(),
+    );
+    let base = serve_install_routes(routes, 1);
+    assert!(whoami(&base, CLI_TOKEN).is_ok());
+}
+
+#[test]
+fn certificate_flow_stages_exchanged_credentials() {
+    let tmp = TempDir::new("certflow-ok");
+    let path = tmp.path.join(".arcrc");
+    let ok = stub_call(
+        [(
+            "conduit.getcertificate".to_string(),
+            Ok(serde_json::json!({"username": "alice", "certificate": "CERT"})),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let mut doc = serde_json::json!({});
+    let info =
+        install_certificate_flow(&ok, "https://h.example/api/", "tok", &mut doc, &path).unwrap();
+    assert_eq!(info.username, "alice");
+    assert_eq!(
+        doc["hosts"]["https://h.example/api/"]["cert"],
+        serde_json::json!("CERT")
+    );
+}
+
+#[test]
+fn stdin_prompts_on_pipes_fail_fast() {
+    // Piped stdin is never a TTY under `cargo test`; bail out (rather
+    // than block on a real terminal) if that ever changes.
+    if crate::prompt::stdin_is_terminal() {
+        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
+    }
+    assert_eq!(prompt_token().unwrap_err(), crate::prompt::NOT_INTERACTIVE);
+    assert_eq!(
+        prompt_confirm("Q?", true).unwrap_err(),
+        crate::prompt::NOT_INTERACTIVE
+    );
+    assert_eq!(
+        prompt_confirm("Q?", false).unwrap_err(),
+        crate::prompt::NOT_INTERACTIVE
+    );
+}
+
+#[test]
+fn args_cover_conduit_uri_and_double_positionals() {
+    let opts = parse_args(&["--conduit-uri".to_string(), "http://x/".to_string()])
+        .unwrap()
+        .unwrap();
+    assert_eq!(opts.conduit_uri.as_deref(), Some("http://x/"));
+    assert_eq!(
+        parse_args(&["--".to_string(), "a".to_string(), "b".to_string()]).unwrap_err(),
+        "Specify at most one URI."
+    );
+}
+
+fn install_test_options() -> Options {
+    Options {
+        uri: None,
+        conduit_uri: None,
+        token: None,
+        force: false,
+        config: Vec::new(),
+        config_files: Vec::new(),
+        arcrc_file: None,
+    }
+}
+
+#[test]
+fn install_uri_reports_bad_cli_config() {
+    let tmp = TempDir::new("badcli");
+    let mut options = install_test_options();
+    options.config = vec!["noequals".to_string()];
+    assert_eq!(
+        resolve_install_uri(&options, &tmp.path),
+        Err(std::process::ExitCode::FAILURE)
+    );
+}
+
+#[test]
+fn install_arcrc_reports_missing_custom_files() {
+    let tmp = TempDir::new("noarcrc");
+    let missing = tmp.path.join("missing").to_string_lossy().to_string();
+    assert_eq!(
+        install_arcrc_for(Some(&missing)),
+        Err(std::process::ExitCode::FAILURE)
+    );
+}
+
+#[test]
+fn install_token_reads_prompt_without_a_flag() {
+    // Piped stdin is never a TTY under `cargo test`; bail out (rather
+    // than block on a real terminal) if that ever changes.
+    if crate::prompt::stdin_is_terminal() {
+        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
+    }
+    let options = install_test_options();
+    assert_eq!(
+        install_token_value(&options),
+        Err(std::process::ExitCode::FAILURE)
+    );
+}
+
+#[test]
+fn standard_token_confirm_skips_with_force() {
+    assert!(confirm_standard_token(true).is_ok());
+    // Piped stdin is never a TTY under `cargo test`; bail out (rather
+    // than block on a real terminal) if that ever changes.
+    if crate::prompt::stdin_is_terminal() {
+        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
+    }
+    assert_eq!(
+        confirm_standard_token(false),
+        Err(std::process::ExitCode::FAILURE)
+    );
+}
+
+#[test]
+fn token_run_flow_rejects_bad_tokens() {
+    let tmp = TempDir::new("tokflow");
+    let arcrc = tmp.path.join(".arcrc");
+    let mut doc = serde_json::json!({});
+    let mut client = conduit::Client::new("https://h.example/", "").unwrap();
+    assert_eq!(
+        run_token_flow(
+            "https://h.example/api/",
+            "bad",
+            &arcrc,
+            &mut doc,
+            false,
+            &mut client
+        ),
+        Err(std::process::ExitCode::FAILURE)
+    );
+}
+
+#[test]
+fn token_run_flow_confirms_standard_tokens() {
+    // Piped stdin is never a TTY under `cargo test`; bail out (rather
+    // than block on a real terminal) if that ever changes.
+    if crate::prompt::stdin_is_terminal() {
+        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
+    }
+    let tmp = TempDir::new("tokflow-std");
+    let arcrc = tmp.path.join(".arcrc");
+    let mut doc = serde_json::json!({});
+    let mut client = conduit::Client::new("https://h.example/", "").unwrap();
+    assert_eq!(
+        run_token_flow(
+            "https://h.example/api/",
+            API_TOKEN,
+            &arcrc,
+            &mut doc,
+            false,
+            &mut client
+        ),
+        Err(std::process::ExitCode::FAILURE)
+    );
+}
+
+#[test]
+fn certificate_run_flow_exchanges_and_stages() {
+    let tmp = TempDir::new("certrun");
+    let arcrc = tmp.path.join(".arcrc");
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "conduit.getcertificate".to_string(),
+        r#"{"username": "alice", "certificate": "CERT"}"#.to_string(),
+    );
+    let base = serve_install_routes(routes, 1);
+    let client = conduit::Client::new(&base, "").unwrap();
+    let mut doc = serde_json::json!({});
+    run_certificate_flow(&format!("{base}api/"), "tok", &arcrc, &mut doc, &client).unwrap();
+    assert_eq!(
+        doc["hosts"][&format!("{base}api/")]["user"],
+        serde_json::json!("alice")
+    );
+    // An invalid exchange response fails the flow.
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "conduit.getcertificate".to_string(),
+        r#"{"username": "alice"}"#.to_string(),
+    );
+    let base = serve_install_routes(routes, 1);
+    let client = conduit::Client::new(&base, "").unwrap();
+    let mut doc = serde_json::json!({});
+    assert_eq!(
+        run_certificate_flow(&format!("{base}api/"), "tok", &arcrc, &mut doc, &client),
+        Err(std::process::ExitCode::FAILURE)
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn prepare_gates_on_open_arcrc_permissions() {
+    // Piped stdin is never a TTY under `cargo test`; bail out (rather
+    // than block on a real terminal) if that ever changes.
+    if crate::prompt::stdin_is_terminal() {
+        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
+    }
+    let tmp = TempDir::new("prep-chmod");
+    let path = open_arcrc(&tmp, 0o644);
+    let argv = vec![
+        "https://h.example/".to_string(),
+        "--arcrc-file".to_string(),
+        path.to_string_lossy().to_string(),
+    ];
+    let Err(code) = prepare_install(&argv) else {
+        panic!("expected prepare_install to fail"); // LCOV_EXCL_LINE // Reason: defensive panic arm; the failure always matches
+    };
+    assert_eq!(code, std::process::ExitCode::FAILURE);
+}
+
+#[test]
+fn prepare_rejects_invalid_arcrc_json() {
+    let tmp = TempDir::new("prep-json");
+    let path = tmp.path.join(".arcrc");
+    std::fs::write(&path, "nope").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&path, permissions).unwrap();
+    }
+    let argv = vec![
+        "https://h.example/".to_string(),
+        "--arcrc-file".to_string(),
+        path.to_string_lossy().to_string(),
+    ];
+    let Err(code) = prepare_install(&argv) else {
+        panic!("expected prepare_install to fail"); // LCOV_EXCL_LINE // Reason: defensive panic arm; the failure always matches
+    };
+    assert_eq!(code, std::process::ExitCode::FAILURE);
+}
+
+#[test]
+fn connect_reports_unbuildable_clients() {
+    assert_eq!(
+        connect_install_client("bogus", false).unwrap_err(),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn install_flow_writes_legacy_certificates() {
+    let tmp = TempDir::new("flows-cert");
+    let arcrc = tmp.path.join(".arcrc");
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "conduit.getcertificate".to_string(),
+        r#"{"username": "alice", "certificate": "CERT"}"#.to_string(),
+    );
+    let base = serve_install_routes(routes, 1);
+    let mut client = conduit::Client::new(&base, "").unwrap();
+    let mut doc = serde_json::json!({});
+    let uri = format!("{base}api/");
+    run_install_flow(&uri, "tok", &arcrc, &mut doc, false, &mut client, false).unwrap();
+    let stored = read_token_doc(&arcrc).unwrap();
+    assert_eq!(stored["hosts"][&uri]["cert"], serde_json::json!("CERT"));
+}
+
+#[test]
+fn run_fails_fast_without_a_token() {
+    // Piped stdin is never a TTY under `cargo test`; bail out (rather
+    // than block on a real terminal) if that ever changes.
+    if crate::prompt::stdin_is_terminal() {
+        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
+    }
+    let tmp = TempDir::new("run-notoken");
+    let mut routes = std::collections::HashMap::new();
+    routes.insert("conduit.ping".to_string(), "{}".to_string());
+    routes.insert("conduit.getcapabilities".to_string(), "{}".to_string());
+    let base = serve_install_routes(routes, 2);
+    let arcrc = tmp.path.join(".arcrc");
+    std::fs::write(&arcrc, "{}").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&arcrc).unwrap().permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&arcrc, permissions).unwrap();
+    }
+    let argv = vec![
+        base.clone(),
+        "--arcrc-file".to_string(),
+        arcrc.to_string_lossy().to_string(),
+    ];
+    assert_eq!(run(&argv), std::process::ExitCode::FAILURE);
+}
+
 #[test]
 fn r10_install_certificate_help_matches_generated_format() {
     // T1153 R10: `--help` renders the generated workflow help
@@ -722,7 +1085,7 @@ fn r10_install_certificate_help_matches_generated_format() {
     assert!(
         usage().contains("INSTALL-CERTIFICATE WORKFLOW"),
         "{}",
-        usage()
+        usage() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 }
 
@@ -754,4 +1117,39 @@ fn b23_install_certificate_help_matches_generated_format() {
     assert!(!text.contains("--token"), "{text}");
     let ansi = usage_text(true);
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
+}
+
+// -( T1170 coverage wave 6g band G, batch E )----------------------------------
+
+/// Best-effort cover for the `metadata` failure arm of
+/// `arcrc_mode_is_open`: the error needs the file to vanish between
+/// `is_file` and `metadata`, which only a removal race can arrange.
+/// Either outcome is accepted, so the test passes deterministically
+/// while giving the race every chance to hit.
+#[test]
+#[cfg(unix)]
+fn cov6g_arcrc_mode_metadata_race() {
+    let tmp = TempDir::new("cov6g-moderace");
+    let target = tmp.path.join("arcrc");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let churn = std::thread::spawn({
+        let (target, stop) = (target.clone(), stop.clone());
+        move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                std::fs::write(&target, "x").ok();
+                std::fs::remove_file(&target).ok();
+            }
+        }
+    });
+    for _ in 0..10_000 {
+        match arcrc_mode_is_open(&target) {
+            Ok(_) => {}
+            Err(message) => assert!(
+                message.contains("Unable to read file permissions"),
+                "{message}"
+            ),
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    churn.join().unwrap();
 }

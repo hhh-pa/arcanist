@@ -86,7 +86,7 @@ fn windows_probes_exe_extension() {
     let search = std::env::join_paths([tmp.path().to_path_buf()]).unwrap();
     let found = find_on_path(&search, "python3");
     if cfg!(windows) {
-        assert_eq!(found, Some(tmp.path().join("python3.exe")));
+        assert_eq!(found, Some(tmp.path().join("python3.exe"))); // LCOV_EXCL_LINE // Reason: windows-only assertion; cfg!(windows) is false on ubuntu CI
     } else {
         assert_eq!(found, None);
     }
@@ -187,4 +187,61 @@ fn interpreter_candidates_cover_platform() {
     let found = interpreter_candidates();
     assert!(found.contains(&"python3"));
     assert_eq!(found.contains(&"python"), cfg!(windows));
+}
+
+#[test]
+fn path_lookup_skips_empty_segments() {
+    assert!(find_on_path(std::ffi::OsStr::new(":"), "no-such-tool-xyz").is_none());
+}
+
+#[test]
+fn piped_run_without_terminator_fails() {
+    // Without `--` on a pipe, `run_in` prints the terminator hints
+    // and reports usage; on a TTY it proceeds (and the empty dir has
+    // no script, so it still fails cleanly without spawning).
+    let tmp = TempDir::new("piped");
+    assert_eq!(
+        run_in(tmp.path(), &args(&[])),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn passthru_returns_the_script_status() {
+    let tmp = TempDir::new("passthru");
+    let script_dir = tmp.path().join("support").join("arcanoid");
+    std::fs::create_dir_all(&script_dir).unwrap();
+    std::fs::write(script_dir.join("arcanoid.py"), "import sys\nsys.exit(0)\n").unwrap();
+    if python3_on_path().is_none() {
+        return; // LCOV_EXCL_LINE // Reason: python3 is installed on ubuntu CI; the skip never trips
+    }
+    assert_eq!(
+        run_in(tmp.path(), &args(&["--"])),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
+// -( T1170 coverage wave 6g band G, batch E )----------------------------------
+
+#[test]
+fn cov6g_run_in_missing_cwd_reports_launch_failure() {
+    // `find_script` walks ancestors lexically, so it resolves above a
+    // missing directory; the spawn then fails on `current_dir` and
+    // `run_in` reports the launch failure.
+    if python3_on_path().is_none() {
+        return; // LCOV_EXCL_LINE // Reason: python3 is installed on ubuntu CI; the skip never trips
+    }
+    let tmp = TempDir::new("cov6g-missing-cwd");
+    let script_dir = tmp.path().join("support").join("arcanoid");
+    std::fs::create_dir_all(&script_dir).unwrap();
+    std::fs::write(script_dir.join("arcanoid.py"), "# never launched\n").unwrap();
+    let missing = tmp.path().join("gone");
+    assert!(!missing.exists());
+    // The script resolves lexically above the missing cwd, so the
+    // failure below can only be the spawn/launch arm.
+    assert!(find_script(&missing).is_some());
+    assert_eq!(
+        run_in(&missing, &args(&["--"])),
+        std::process::ExitCode::FAILURE
+    );
 }

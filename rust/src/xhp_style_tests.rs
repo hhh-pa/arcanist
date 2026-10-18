@@ -84,6 +84,32 @@ fn comment_style_flags_hash_comments() {
 }
 
 #[test]
+fn comment_helpers_tolerate_unlexable_shapes() {
+    // Defensive edges the tokenizer never produces: a `#[\...]`
+    // comment (always lexed as an attribute) and a `/` that opens no
+    // comment marker.
+    let tree = ast::Tree {
+        source: "#[\\x]".to_string(),
+        tokens: vec![ast::Token {
+            kind: ast::kinds::T_COMMENT.to_string(),
+            value: "#[\\x]".to_string(),
+            offset: 0,
+        }],
+        ..Default::default()
+    };
+    let ctx = ast::RuleCtx {
+        tree: &tree,
+        path: "test.php",
+        options: &ast::XhpOptions::default(),
+    };
+    let mut out = Vec::new();
+    super::rule_comment_style(&ctx, &mut out);
+    assert!(out.is_empty());
+    assert!(!super::needs_comment_space("/ab"));
+    assert!(!super::needs_comment_space("/"));
+}
+
+#[test]
 fn elseif_usage_message_is_exact() {
     let hits = for_rule("<?php if ($a) {} elseif ($b) {}\n", 42);
     assert_eq!(hits.len(), 1);
@@ -356,6 +382,29 @@ fn decl_parens_distinguishes_anonymous() {
 }
 
 #[test]
+fn decl_paren_helpers_tolerate_missing_anchors() {
+    // Defensive edges the parser never produces (a declaration paren
+    // with no predecessor; a closure `use` span with no `use`
+    // keyword before its paren).
+    let tree = ast::tree_from_source("<?php function foo($x) {}\n");
+    let blocks = tree.blocks();
+    assert_eq!(blocks.len(), 1);
+    let mut out = Vec::new();
+    super::decl_paren_leading(&tree, &blocks[0], 0, &mut out);
+    assert!(out.is_empty());
+
+    let tree = ast::tree_from_source("<?php $f = function ($x) use ($y) {};\n");
+    let blocks = tree.blocks();
+    let found = blocks.into_iter().find(|b| b.closure_use.is_some());
+    let mut block = found.unwrap();
+    let rparen = block.rparen.unwrap();
+    block.closure_use = Some((rparen + 1, rparen + 1));
+    let mut out = Vec::new();
+    super::decl_use_spacing(&tree, &block, &mut out);
+    assert!(out.is_empty());
+}
+
+#[test]
 fn keyword_casing_flags_uppercase_keywords() {
     let hits = for_rule("<?php IF ($x) {}\n", 40);
     assert_eq!(hits.len(), 1);
@@ -473,4 +522,381 @@ fn hand_written_canned_json_parses() {
     let mut out = Vec::new();
     super::apply(&ctx, &mut out);
     assert!(out.iter().any(|f| f.rule == 42));
+}
+
+// -( T1170 coverage: boundary tokens )----------------------------------------
+
+#[test]
+fn open_tag_skips_empty_files() {
+    assert!(for_rule("", 15).is_empty());
+}
+
+#[test]
+fn newline_after_open_tag_accepts_blank_line() {
+    assert!(for_rule("<?php\n\necho;\n", 81).is_empty());
+}
+
+#[test]
+fn curly_index_ignores_plain_blocks() {
+    // `{` after `)` is a control block, not an index.
+    assert!(for_rule("<?php if ($x) { echo; }\n", 119).is_empty());
+    // A bare block has no indexable object before it.
+    assert!(for_rule("<?php { echo; }\n", 119).is_empty());
+    // Trait adaptation braces are legal.
+    assert!(for_rule("<?php class C { use T { foo as bar; } }\n", 119).is_empty());
+}
+
+fn for_rule_json(tokens: &str, rule: u32) -> Vec<(usize, usize, String)> {
+    // Degenerate token streams (a leading operator with no previous
+    // token) never survive the real tokenizer, which emits
+    // `T_INLINE_HTML` without an open tag; hand-written canned JSON
+    // pins the defensive arms directly (as for rule 42 above).
+    let json = format!(r#"{{"source": "xxxxxxxxxx", "tokens": [{tokens}]}}"#);
+    let tree = ast::tree_from_canned(&json).expect("hand-written JSON must parse");
+    let ctx = ast::RuleCtx {
+        tree: &tree,
+        path: "test.php",
+        options: &ast::XhpOptions::default(),
+    };
+    let mut out = Vec::new();
+    super::apply(&ctx, &mut out);
+    out.iter()
+        .filter(|f| f.rule == rule)
+        .map(|f| {
+            let (line, col) = tree.line_col(f.offset);
+            (line, col, f.message.clone())
+        })
+        .collect()
+}
+
+#[test]
+fn degenerate_streams_skip_missing_neighbors() {
+    // A leading `{` has no previous token at all.
+    assert!(for_rule_json(r#"["{", "{", 0]"#, 119).is_empty());
+    // A leading `[` has no previous token at all.
+    assert!(for_rule_json(r#"["[", "[", 0]"#, 28).is_empty());
+    // A leading `T_STRING` has no previous token at all.
+    assert!(for_rule_json(r#"["T_STRING", "foo", 0]"#, 37).is_empty());
+    // A leading `++` has no previous token at all.
+    assert!(for_rule_json(r#"["T_INC", "++", 0]"#, 75).is_empty());
+    // A leading `->` has no previous token at all.
+    assert!(
+        for_rule_json(
+            r#"["T_OBJECT_OPERATOR", "->", 0], ["T_STRING", "foo", 2]"#,
+            74
+        )
+        .is_empty()
+    );
+    // A leading `&` before a variable is still adjacent.
+    assert!(for_rule_json(r#"["&", "&", 0], ["T_VARIABLE", "$x", 1]"#, 123).is_empty());
+}
+
+#[test]
+fn degenerate_streams_flag_lone_operators() {
+    // A leading `;` is an unnecessary semicolon.
+    assert_eq!(for_rule_json(r#"[";", ";", 0]"#, 56).len(), 1);
+    // A leading `=` has no previous operand to compare gaps with.
+    assert_eq!(for_rule_json(r#"["=", "=", 0]"#, 27).len(), 1);
+}
+
+#[test]
+fn curly_index_flags_string_offsets() {
+    let hits = for_rule("<?php $x = foo{'k'};\n", 119);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].2, "Use `$x['key']` instead of `$x{'key'}`.");
+}
+
+#[test]
+fn paren_rules_tolerate_truncated_array() {
+    // `array` at EOF (or not followed by parens) contributes no group.
+    assert!(for_rule("<?php array", 25).is_empty());
+    assert!(for_rule("<?php array;\n", 25).is_empty());
+}
+
+#[test]
+fn new_parens_tolerates_truncated_new() {
+    assert!(for_rule("<?php new", 49).is_empty());
+    // A name at EOF still misses its constructor parens.
+    assert_eq!(for_rule("<?php new Foo", 49).len(), 1);
+}
+
+#[test]
+fn comment_spacing_ignores_bare_marker() {
+    assert!(for_rule("<?php //\n", 34).is_empty());
+}
+
+#[test]
+fn call_parens_tolerates_unclosed_call() {
+    assert!(for_rule("<?php foo($x;\n", 37).is_empty());
+}
+
+#[test]
+fn method_sites_tolerate_truncated_fetches() {
+    // A method name at EOF has no paren to check.
+    assert!(for_rule("<?php $x->foo", 37).is_empty());
+    // A property fetch is not a call.
+    assert!(for_rule("<?php $x->foo;\n", 37).is_empty());
+}
+
+#[test]
+fn concat_spacing_handles_dot_near_eof() {
+    let hits = for_rule("<?php $a .$b", 44);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].2,
+        "Convention: no spaces around string concatenation operator."
+    );
+    // A trailing `.` has no right-hand operand to check.
+    let hits = for_rule("<?php $a .", 44);
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn empty_block_ignores_unclosed_brace() {
+    assert!(for_rule("<?php if ($x) {", 47).is_empty());
+}
+
+#[test]
+fn empty_block_exempts_alternate_switch() {
+    assert!(for_rule("<?php switch ($x): case 1: break; endswitch;\n", 47).is_empty());
+}
+
+// -( T1170 coverage: offsets, refs, operators )--------------------------------
+
+#[test]
+fn curly_index_walks_back_over_subscripts() {
+    let hits = for_rule("<?php $a[0]{'k'};\n", 119);
+    assert_eq!(hits.len(), 1);
+    // An unmatchable `]` stops the walk at the brace itself.
+    assert_eq!(for_rule("<?php $a]{'k'};\n", 119).len(), 1);
+}
+
+#[test]
+fn new_parens_ignores_non_names() {
+    assert!(for_rule("<?php new 'x';\n", 49).is_empty());
+}
+
+#[test]
+fn new_parens_flags_missing_constructor_call() {
+    let hits = for_rule("<?php new Foo;\n", 49);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].2, "Use parentheses when invoking a constructor.");
+    // A qualified name ends at the first non-name token.
+    let hits = for_rule("<?php new\\Foo;\n", 49);
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn unnecessary_semicolon_ignores_unclosed_for() {
+    assert!(for_rule("<?php for ($i = 0;", 56).is_empty());
+}
+
+#[test]
+fn cast_spacing_ignores_truncated_cast() {
+    assert!(for_rule("<?php (in", 66).is_empty());
+}
+
+#[test]
+fn object_op_spacing_tolerates_truncated_operator() {
+    // A trailing `->` has no next token, so no gap to check.
+    assert!(for_rule("<?php $x->", 74).is_empty());
+}
+
+#[test]
+fn ref_spacing_ignores_non_references() {
+    // `&` at EOF or before a non-variable is never a reference.
+    assert!(for_rule("<?php $x = &", 123).is_empty());
+    assert!(for_rule("<?php $a & 3;\n", 123).is_empty());
+}
+
+#[test]
+fn parent_ref_ignores_braceless_classes() {
+    assert!(for_rule("<?php class C extends P;\n", 83).is_empty());
+}
+
+#[test]
+fn parent_ref_ignores_variable_receivers() {
+    assert!(
+        for_rule(
+            "<?php class C extends P { function f() { $x::foo(); } }\n",
+            83
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn parent_ref_walks_qualified_names() {
+    assert!(
+        for_rule(
+            "<?php class C extends P { function f() { Foo\\Bar::baz(); } }\n",
+            83
+        )
+        .is_empty()
+    );
+}
+
+fn for_rule_with_options(
+    source: &str,
+    rule: u32,
+    options: &ast::XhpOptions,
+) -> Vec<(usize, usize, String)> {
+    let canned = ast::tokens_to_canned(source, &ast::tokenize(source));
+    let tree = ast::tree_from_canned(&canned).expect("canned output must parse");
+    let ctx = ast::RuleCtx {
+        tree: &tree,
+        path: "test.php",
+        options,
+    };
+    let mut out = Vec::new();
+    super::apply(&ctx, &mut out);
+    out.iter()
+        .filter(|f| f.rule == rule)
+        .map(|f| {
+            let (line, col) = tree.line_col(f.offset);
+            (line, col, f.message.clone())
+        })
+        .collect()
+}
+
+#[test]
+fn parent_ref_keeps_old_php_closure_calls() {
+    // Before PHP 5.4, `parent::` cannot spell a closure call, so the
+    // old-version run stays silent while the default run flags it.
+    let source = "<?php class C extends P { function f() { $o = new class { }; $g = function () { P::foo(); }; } }\n";
+    let legacy = ast::XhpOptions {
+        php_version: Some("5.3.0".to_string()),
+        ..ast::XhpOptions::default()
+    };
+    assert!(for_rule_with_options(source, 83, &legacy).is_empty());
+    assert_eq!(
+        for_rule_with_options(source, 83, &ast::XhpOptions::default()).len(),
+        1
+    );
+}
+
+#[test]
+fn binary_spacing_tolerates_unclosed_declare() {
+    assert!(for_rule("<?php declare(ticks = 1;\n", 27).is_empty());
+}
+
+#[test]
+fn binary_spacing_ignores_open_tag_equals() {
+    // `=` after the open tag is not a declaration.
+    assert!(for_rule("<?php = $b;\n", 27).is_empty());
+}
+
+#[test]
+fn comma_spacing_ignores_trailing_comma() {
+    assert!(for_rule("<?php foo($a,", 27).is_empty());
+}
+
+// -( T1170 coverage: declarations, arrays, modifiers )-------------------------
+
+#[test]
+fn decl_parens_flags_spaced_empty_params() {
+    let hits = for_rule("<?php function foo( ) {}\n", 38);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].2,
+        "Convention: no spaces before closing parenthesis in function and method declarations."
+    );
+}
+
+#[test]
+fn decl_parens_ignores_invoked_closure() {
+    // An immediately-invoked closure's second paren group is not a
+    // `use` list, so the `use` scan finds nothing.
+    assert!(for_rule("<?php (function () {})();\n", 38).is_empty());
+}
+
+#[test]
+fn keyword_casing_ignores_capitalized_names() {
+    assert!(for_rule("<?php function True() {}\n", 40).is_empty());
+}
+
+#[test]
+fn call_parens_tolerates_heredoc_argument() {
+    assert!(for_rule("<?php foo(<<<EOT\ntext\nEOT\n);\n", 37).is_empty());
+}
+
+#[test]
+fn call_parens_checks_multi_token_arguments() {
+    let hits = for_rule("<?php foo($x + $y );\n", 37);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].2,
+        "Convention: no spaces before closing parentheses."
+    );
+    let hits = for_rule("<?php foo( $x );\n", 37);
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn array_separator_exempts_heredoc_values() {
+    assert!(for_rule("<?php $a = [\n  <<<EOT\ntext\nEOT\n];\n", 48).is_empty());
+}
+
+#[test]
+fn array_separator_scans_nested_last_values() {
+    let hits = for_rule("<?php $a = [\n  \"k\" => foo(1)\n];\n", 48);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].2, "Multi-lined arrays should have trailing commas.");
+    let hits = for_rule("<?php $a = [\n  \"k\" => $x\n];\n", 48);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].2, "Multi-lined arrays should have trailing commas.");
+}
+
+#[test]
+fn modifier_ordering_skips_attributes() {
+    assert!(for_rule("<?php class C { #[Foo] public function bar() {} }\n", 71).is_empty());
+}
+
+#[test]
+fn modifier_ordering_ignores_stray_bracket() {
+    assert!(
+        for_rule(
+            "<?php class C { function a() {} ] public function b() {} }\n",
+            71
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn modifier_ordering_skips_matched_bracket() {
+    assert!(
+        for_rule(
+            "<?php class C { function a() {} [0] public function b() {} }\n",
+            71
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn modifier_ordering_ignores_unknown_words() {
+    // `var` is not a method modifier, so the run cannot be ordered.
+    assert!(for_rule("<?php class C { var public function f() {} }\n", 71).is_empty());
+}
+
+#[test]
+fn modifier_ordering_tolerates_stray_paren() {
+    assert!(for_rule("<?php class C { public $x = BAR); }\n", 71).is_empty());
+}
+
+#[test]
+fn modifier_ordering_ignores_bare_variables() {
+    assert!(for_rule("<?php class C { $x = 1; }\n", 71).is_empty());
+}
+
+#[test]
+fn modifier_ordering_stops_runs_at_keywords() {
+    assert!(
+        for_rule(
+            "<?php class C { public function f() {} public $y = 2; }\n",
+            71
+        )
+        .is_empty()
+    );
 }

@@ -93,7 +93,7 @@ fn missing_junit_fails_with_php_message() {
     assert!(
         err.message().contains("Command failed with error #3!"),
         "{}",
-        err.message()
+        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
     assert!(require_junit_output(true, 0, &argv, "", "").is_ok());
 }
@@ -190,7 +190,7 @@ fn run_with_uses_canned_outputs() {
     assert!(
         err.message().contains("Command failed with error #3!"),
         "{}",
-        err.message()
+        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 }
 
@@ -218,4 +218,80 @@ fn unit_u20_coverage_keeps_document_order() {
     let reports = read_coverage_ordered(cover, "/r", &paths, &counts, &is_dir, &is_file);
     let names: Vec<&str> = reports.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(names, vec!["zeta.py", "alpha.py"]);
+}
+
+#[test]
+fn default_engine_matches_new() {
+    let engine = PytestEngine::default();
+    assert_eq!(engine.binary, PYTEST_BINARY);
+    assert_eq!(engine.coverage_binary, COVERAGE_BINARY);
+}
+
+#[test]
+fn run_with_reads_coverage_unless_disabled() {
+    let mut files = HashMap::new();
+    files.insert("/r/pkg/mod.py".to_string(), "x\ny\n".to_string());
+    let fs = FakeFs {
+        dirs: HashSet::new(),
+        files,
+    };
+    let engine = PytestEngine::with_binaries("fake-pytest", "fake-coverage");
+    let ctx = EngineContext {
+        paths: vec!["pkg/mod.py".to_string()],
+        ..EngineContext::new("/r")
+    };
+    let cover_xml = "<coverage><packages><package><classes>\
+      <class filename=\"pkg.mod.py\"><lines><line number=\"1\" hits=\"1\"/></lines></class>\
+    </classes></package></packages></coverage>";
+    let runner = |argv: &[String], _cwd: &str| {
+        if argv[0] == "fake-coverage" && argv[1] == "run" {
+            let junit = argv.iter().find(|a| a.starts_with("--junit-xml=")).unwrap();
+            std::fs::write(
+                junit.trim_start_matches("--junit-xml="),
+                "<testsuite><testcase classname=\"a\" name=\"t\" time=\"1\"/></testsuite>",
+            )
+            .unwrap();
+        }
+        if argv[0] == "fake-coverage" && argv[1] == "xml" {
+            let out = argv.iter().find(|a| a.ends_with(".xml")).unwrap();
+            std::fs::write(out, cover_xml).unwrap();
+        }
+        CapturedOutput::new(0, "", "")
+    };
+    let results = engine.run_with(&ctx, &runner, &fs).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get_result(), RESULT_PASS);
+    let coverage = results[0].get_coverage().unwrap();
+    assert!(coverage.contains_key("pkg/mod.py"));
+}
+
+#[test]
+fn coverage_skips_classes_without_filenames() {
+    let cover = r#"<coverage><packages><package><classes>
+      <class><lines><line number="1" hits="1"/></lines></class>
+    </classes></package></packages></coverage>"#;
+    let is_dir = |_: &str| false;
+    let is_file = |_: &str| true;
+    let counts = |_: &str| Some(1);
+    let reports = read_coverage_ordered(cover, "/r", &[], &counts, &is_dir, &is_file);
+    assert!(reports.is_empty());
+}
+
+#[test]
+fn coverage_skips_unmeasurable_files() {
+    let cover = r#"<coverage><packages><package><classes>
+      <class filename="pkg.mod.py"><lines><line number="1" hits="1"/></lines></class>
+    </classes></package></packages></coverage>"#;
+    let is_dir = |_: &str| false;
+    let is_file = |p: &str| p == "/r/pkg/mod.py";
+    let counts = |_: &str| None;
+    let reports = read_coverage_ordered(
+        cover,
+        "/r",
+        &["pkg/mod.py".to_string()],
+        &counts,
+        &is_dir,
+        &is_file,
+    );
+    assert!(reports.is_empty());
 }

@@ -485,7 +485,7 @@ pub fn version_compare(left: &str, right: &str) -> Ordering {
                     Ordering::Less
                 };
             }
-            (None, None) => {}
+            (None, None) => {} // LCOV_EXCL_LINE // Reason: dead: width is the max length, so some side is always present
         }
     }
     Ordering::Equal
@@ -540,7 +540,7 @@ pub fn binary_exists(candidate: &str) -> bool {
         return is_executable_file(path);
     }
     let Some(dirs) = std::env::var_os("PATH") else {
-        return false;
+        return false; // LCOV_EXCL_LINE // Reason: PATH is always set in CI; the unset arm never runs
     };
     for dir in std::env::split_paths(&dirs) {
         let full = dir.join(candidate);

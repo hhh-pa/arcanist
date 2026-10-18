@@ -381,3 +381,277 @@ fn unit_u20_legacy_sets_render_sorted() {
         .collect();
     assert_eq!(keys, vec!["a.php", "z.php"]);
 }
+
+// --- T1170 CI hygiene: full line coverage ---
+
+#[test]
+fn broken_code_spec_has_name_and_description() {
+    assert_eq!(UnitResult::get_result_code_name("broken"), Some("Broken"));
+    assert_eq!(
+        UnitResult::get_result_code_description("broken"),
+        Some(
+            "The test failed in an abnormal or severe way. For example, the harness crashed instead of reporting a failure."
+        )
+    );
+}
+
+#[test]
+fn dict_json_escapes_controls_and_astral_chars() {
+    let mut result = UnitResult::new();
+    result.set_name("a\nb\rc\td𝄞").unwrap();
+    result.set_result(RESULT_PASS);
+    let json = result.to_dictionary().to_json_string();
+    assert!(
+        json.contains("\"name\":\"a\\nb\\rc\\td\\ud834\\udd1e\""),
+        "{json}"
+    );
+}
+
+#[test]
+fn dict_json_renders_nonempty_maps_in_order() {
+    let mut result = UnitResult::new();
+    result.set_name("t").unwrap();
+    result.set_result(RESULT_PASS);
+    result.set_extra_data_ordered(vec![
+        ("b\"k".to_string(), "v/v".to_string()),
+        ("a".to_string(), "1".to_string()),
+    ]);
+    result.set_coverage_ordered(vec![("f.php".to_string(), "CU".to_string())]);
+    let json = result.to_dictionary().to_json_string();
+    assert!(
+        json.contains("\"extra\":{\"b\\\"k\":\"v\\/v\",\"a\":\"1\"}"),
+        "{json}"
+    );
+    assert!(json.contains("\"coverage\":{\"f.php\":\"CU\"}"), "{json}");
+}
+
+#[test]
+fn engine_error_display_shows_message() {
+    assert_eq!(format!("{}", EngineError::no_effect()), "No tests to run.");
+    assert_eq!(format!("{}", EngineError::Usage("bad".to_string())), "bad");
+    assert_eq!(
+        format!("{}", EngineError::Failed("boom".to_string())),
+        "boom"
+    );
+    assert!(EngineError::no_effect().is_no_effect());
+    assert!(!EngineError::Usage("x".to_string()).is_no_effect());
+}
+
+struct DummyEngine;
+
+impl UnitEngine for DummyEngine {
+    fn run(
+        &self,
+        _ctx: &EngineContext,
+        _runner: &dyn CommandRunner,
+    ) -> Result<Vec<UnitResult>, EngineError> {
+        Ok(Vec::new())
+    }
+}
+
+#[test]
+fn unit_engine_defaults_match_php_base() {
+    let engine = DummyEngine;
+    assert_eq!(engine.engine_configuration_name(), None);
+    assert!(!engine.supports_run_all_tests());
+    assert!(engine.should_echo_test_results());
+    let ctx = EngineContext::new("/repo");
+    let runner = |_: &[String], _: &str| CapturedOutput::new(0, "", "");
+    assert!(engine.run(&ctx, &runner).unwrap().is_empty());
+}
+
+#[test]
+fn strip_xml_comments_drops_unterminated_tail() {
+    assert_eq!(strip_xml_comments("a<!--no end"), "a");
+    assert_eq!(strip_xml_comments("x<!-- c -->y"), "xy");
+}
+
+#[test]
+fn unescape_xml_passes_through_bad_entities() {
+    assert_eq!(unescape_xml("&#xZZ;"), "&#xZZ;");
+    assert_eq!(unescape_xml("&#99999999;"), "&#99999999;");
+    assert_eq!(unescape_xml("&foo;"), "&foo;");
+    assert_eq!(unescape_xml("a & b"), "a & b");
+}
+
+#[test]
+fn text_content_handles_cdata_tags_and_bare_text() {
+    assert_eq!(text_content("<![CDATA[abc"), "abc");
+    assert_eq!(text_content("a<b>c</b>d"), "acd");
+    assert_eq!(text_content("ab<cd"), "ab");
+}
+
+#[test]
+fn find_elements_handles_truncated_markup() {
+    assert!(find_elements("<a ", "a").is_empty());
+    assert!(find_elements("<a>hello", "a").is_empty());
+    assert_eq!(find_tag_end("no close"), None);
+}
+
+#[test]
+fn attr_scan_drops_valueless_and_bare_values() {
+    let found = find_elements("<a =\"v\">x</a>", "a");
+    assert_eq!(found.len(), 1);
+    let found = find_elements("<a disabled>x</a>", "a");
+    assert_eq!(found.len(), 1);
+    assert!(found[0].attrs.is_empty());
+    let found = find_elements("<a x=1>y</a>", "a");
+    assert_eq!(found.len(), 1);
+    assert!(found[0].attrs.is_empty());
+    let found = find_elements("<a x = \"1\">y</a>", "a");
+    assert_eq!(found[0].attr("x"), Some("1"));
+}
+
+#[test]
+fn json_value_accessors_return_none_for_wrong_types() {
+    let null = JsonValue::Null;
+    assert_eq!(null.get("k"), None);
+    assert_eq!(null.as_arr(), None);
+    assert_eq!(null.as_str(), None);
+    assert_eq!(null.as_num(), None);
+    assert_eq!(JsonValue::Bool(true).as_num(), None);
+}
+
+#[test]
+fn json_parser_rejects_bad_literals_and_shapes() {
+    assert_eq!(parse_json("false").unwrap(), JsonValue::Bool(false));
+    assert!(parse_json("").is_err());
+    assert!(parse_json("!").is_err());
+    assert!(parse_json("{\"a\" 1}").is_err());
+    assert!(parse_json("{\"a\":1").is_err());
+    assert!(parse_json("{\"a\":1;}").is_err());
+    assert!(parse_json("[1").is_err());
+    assert!(parse_json("[1;]").is_err());
+}
+
+#[test]
+fn json_parser_reads_all_string_escapes() {
+    assert_eq!(
+        parse_json(r#""a\"b\\c\/d""#).unwrap(),
+        JsonValue::Str("a\"b\\c/d".to_string())
+    );
+    assert_eq!(
+        parse_json(r#""a\bb""#).unwrap(),
+        JsonValue::Str("a\u{0008}b".to_string())
+    );
+    assert_eq!(
+        parse_json(r#""a\fb""#).unwrap(),
+        JsonValue::Str("a\u{000C}b".to_string())
+    );
+    assert_eq!(
+        parse_json(r#""a\rb""#).unwrap(),
+        JsonValue::Str("a\rb".to_string())
+    );
+    assert_eq!(
+        parse_json(r#""a\tb""#).unwrap(),
+        JsonValue::Str("a\tb".to_string())
+    );
+}
+
+#[test]
+fn json_parser_rejects_bad_strings_and_escapes() {
+    assert!(parse_json(&format!("\"a{}b\"", '\u{01}')).is_err());
+    assert!(parse_json("\"abc").is_err());
+    assert!(parse_json("\"ab\\").is_err());
+    assert!(parse_json(r#""a\qb""#).is_err());
+}
+
+#[test]
+fn json_parser_handles_surrogate_pairs() {
+    assert_eq!(
+        parse_json(r#""𐀀""#).unwrap(),
+        JsonValue::Str("𐀀".to_string())
+    );
+    assert_eq!(
+        parse_json(r#""\ud834\udd1e""#).unwrap(),
+        JsonValue::Str("𝄞".to_string())
+    );
+    assert!(parse_json(r#""\ud834\u0041""#).is_err());
+    assert!(parse_json(r#""\ud834""#).is_err());
+    assert!(parse_json(r#""\ud834\q""#).is_err());
+    assert!(parse_json(r#""\u12""#).is_err());
+    assert!(parse_json(r#""\uZZZZ""#).is_err());
+}
+
+#[test]
+fn json_parser_reads_signed_exponents() {
+    assert_eq!(parse_json("1e+2").unwrap(), JsonValue::Num(100.0));
+    assert_eq!(parse_json("1e-2").unwrap(), JsonValue::Num(0.01));
+    assert_eq!(parse_json("1E2").unwrap(), JsonValue::Num(100.0));
+}
+
+#[test]
+fn temp_file_create_reports_uncreatable_paths() {
+    let err = TempFile::create("a/b", ".tmp").err().unwrap();
+    assert!(err.contains("cannot create temp file:"), "{err}");
+}
+
+/// Parse the counter `n` out of a `TempFile` path for `prefix`/`suffix`.
+fn temp_counter(path: &std::path::Path, prefix: &str, suffix: &str) -> u64 {
+    let name = path.file_name().unwrap().to_str().unwrap();
+    let head = format!("arc-rs-{prefix}-{}-", std::process::id());
+    name.strip_prefix(&head)
+        .unwrap()
+        .strip_suffix(suffix)
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn temp_file_create_skips_collisions() {
+    let prefix = "coll1";
+    let suffix = ".tmp";
+    let probe = TempFile::create(prefix, suffix).unwrap();
+    let next = temp_counter(probe.path(), prefix, suffix) + 1;
+    let pid = std::process::id();
+    let mut squatted = Vec::new();
+    for m in next..=(next + 50) {
+        let path = std::env::temp_dir().join(format!("arc-rs-{prefix}-{pid}-{m}{suffix}"));
+        std::fs::write(&path, b"squat").unwrap();
+        squatted.push(path);
+    }
+    // The next counter value is squatted, so creation collides and then
+    // succeeds on a later value.
+    let tmp = TempFile::create(prefix, suffix).unwrap();
+    assert!(tmp.path().exists());
+    drop(tmp);
+    drop(probe);
+    for path in squatted {
+        std::fs::remove_file(&path).ok();
+    }
+}
+
+#[test]
+fn temp_file_create_reports_too_many_collisions() {
+    let prefix = "collmany";
+    let suffix = ".tmp";
+    let probe = TempFile::create(prefix, suffix).unwrap();
+    let next = temp_counter(probe.path(), prefix, suffix) + 1;
+    let pid = std::process::id();
+    let mut squatted = Vec::new();
+    for m in next..=(next + 1200) {
+        let path = std::env::temp_dir().join(format!("arc-rs-{prefix}-{pid}-{m}{suffix}"));
+        std::fs::write(&path, b"squat").unwrap();
+        squatted.push(path);
+    }
+    let err = TempFile::create(prefix, suffix).err().unwrap();
+    assert_eq!(err, "cannot create temp file: too many collisions");
+    drop(probe);
+    for path in squatted {
+        std::fs::remove_file(&path).ok();
+    }
+}
+
+#[test]
+fn temp_file_keep_preserves_on_drop() {
+    let path = {
+        let mut tmp = TempFile::create("keepme", ".tmp").unwrap();
+        tmp.keep();
+        let path = tmp.path().to_path_buf();
+        assert!(path.exists());
+        path
+    };
+    assert!(path.exists());
+    std::fs::remove_file(&path).unwrap();
+}

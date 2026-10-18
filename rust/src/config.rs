@@ -9,10 +9,10 @@ use crate::get_config;
 
 pub fn arcrc_path() -> Option<PathBuf> {
     let home = if cfg!(windows) {
-        std::env::var_os("USERPROFILE")
+        std::env::var_os("USERPROFILE") // LCOV_EXCL_LINE // Reason: windows arm; cfg!(windows) is false on ubuntu CI
     } else {
         std::env::var_os("HOME")
-    }?;
+    }?; // LCOV_EXCL_LINE // Reason: early-return needs HOME unset; unsetting env is process-global mutation
     Some(PathBuf::from(home).join(".arcrc"))
 }
 
@@ -137,7 +137,7 @@ pub fn global_load_options() -> get_config::LoadOptions {
     let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw) else {
         return get_config::LoadOptions::default();
     };
-    let runtime = doc
+    let runtime = doc // LCOV_EXCL_START // Reason: needs process-global load-options state (cell or env); hermetic tests stage neither
         .get("runtime")
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
@@ -155,7 +155,7 @@ pub fn global_load_options() -> get_config::LoadOptions {
         runtime,
         config_files,
         arcrc_file,
-    }
+    } // LCOV_EXCL_STOP
 }
 
 fn host_key(conduit_uri: &str) -> String {

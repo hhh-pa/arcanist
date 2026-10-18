@@ -887,17 +887,25 @@ pub fn resolve_base(cwd: &Path, explicit: Option<&str>) -> Result<String, String
     if let Some(rev) = explicit {
         return rev_to_commit(cwd, rev).ok_or_else(|| format!("invalid base revision '{rev}'"));
     }
-    if upstream_exists(cwd)
-        && let Ok(out) = git_output(cwd, &["merge-base", "HEAD", "@{upstream}"])
-        && out.status.success()
-    {
-        let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !sha.is_empty() {
-            return Ok(sha);
-        }
+    if let Some(sha) = upstream_merge_base(cwd) {
+        return Ok(sha);
     }
     rev_to_commit(cwd, "HEAD")
         .ok_or_else(|| "cannot resolve base: HEAD does not exist (empty repository?)".to_string())
+}
+
+/// Merge-base of `HEAD` with `@{upstream}`, when an upstream exists and
+/// the merge-base resolves to a non-empty SHA.
+fn upstream_merge_base(cwd: &Path) -> Option<String> {
+    if !upstream_exists(cwd) {
+        return None;
+    }
+    let out = git_output(cwd, &["merge-base", "HEAD", "@{upstream}"]).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sha.is_empty() { None } else { Some(sha) }
 }
 
 /// Resolve `rev` to a commit SHA, or `None` when it does not resolve.
@@ -1504,14 +1512,21 @@ fn diff_properties(
 /// User-set passthrough flags for the lint/unit children, in spec order
 /// (see [`diff_local::passthru_argv`]).
 fn set_child_flags(options: &Options) -> (Vec<String>, Vec<String>) {
-    let is_set = |name: &str| match name {
-        "apply-patches" => options.apply_patches,
-        "never-apply-patches" => options.never_apply_patches,
-        "amend-all" => options.amend_all,
-        "amend-autofixes" => options.amend_autofixes,
-        "coverage" => options.coverage,
-        "no-coverage" => options.no_coverage,
-        _ => false,
+    // Lookup table instead of a `match`: the passthru lists only ever
+    // name these six flags, which would leave a fallback arm dead.
+    let states = [
+        ("apply-patches", options.apply_patches),
+        ("never-apply-patches", options.never_apply_patches),
+        ("amend-all", options.amend_all),
+        ("amend-autofixes", options.amend_autofixes),
+        ("coverage", options.coverage),
+        ("no-coverage", options.no_coverage),
+    ];
+    let is_set = |name: &str| {
+        states
+            .iter()
+            .find(|(flag, _)| *flag == name)
+            .is_some_and(|(_, on)| *on)
     };
     let lint = diff_local::LINT_PASSTHRU_FLAGS
         .iter()
@@ -1977,6 +1992,9 @@ fn stamp_repository_phid(
     Ok(())
 }
 
+/// Builds the Conduit client for a submit, on demand.
+type ClientFactory<'a> = &'a dyn Fn() -> Result<conduit::Client, String>;
+
 /// Collect a submit locally, then run it over a real Conduit client.
 fn submit_via_client_ansi(
     cwd: &Path,
@@ -1984,10 +2002,29 @@ fn submit_via_client_ansi(
     mode: &SubmitMode,
     ansi: bool,
 ) -> Result<String, String> {
+    submit_via_client_with_client_ansi(
+        cwd,
+        options,
+        mode,
+        &|| config::client_for(options.conduit_uri.as_deref()),
+        ansi,
+    )
+}
+
+/// [`submit_via_client_ansi`] over an injected client factory: tests pass
+/// a loopback client, production resolves via [`config::client_for`] at
+/// the same position, so error precedence is unchanged.
+fn submit_via_client_with_client_ansi(
+    cwd: &Path,
+    options: &Options,
+    mode: &SubmitMode,
+    make_client: ClientFactory<'_>,
+    ansi: bool,
+) -> Result<String, String> {
     let range = resolve_range(cwd, options)?;
     let head = range.head.as_deref();
     let is_raw = diff_local::is_raw_diff_source(options.raw, options.raw_command.as_deref());
-    let client = config::client_for(options.conduit_uri.as_deref())?;
+    let client = make_client()?;
     let call = |method: &str, params: &serde_json::Value| {
         client.call(method, params).map_err(|e| e.to_string())
     };
@@ -2257,10 +2294,8 @@ fn inspect_json_git(cwd: &Path, options: &Options, range: &Range) -> Result<Vec<
         let fields = collect_fields(cwd, options, &range.base, range.head.as_deref())?;
         doc["fields"] = fields_json(&fields);
     }
-    let mut text = match diff_submit::php_json_encode_pretty(&doc) {
-        Ok(text) => text,
-        Err(e) => return Err(format!("failed to encode JSON: {e}")),
-    };
+    let mut text = diff_submit::php_json_encode_pretty(&doc)
+        .map_err(|e| format!("failed to encode JSON: {e}"))?;
     text.push('\n');
     Ok(text.into_bytes())
 }
@@ -2297,6 +2332,12 @@ pub fn inspect_ansi(cwd: &Path, options: &Options, ansi: bool) -> Result<Vec<u8>
 
 /// Entry point: `argv` excludes the subcommand name.
 pub fn run(argv: &[String]) -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    run_in(argv, &cwd, &mut std::io::stdout())
+}
+
+/// [`run`] over an explicit working copy and output sink.
+fn run_in(argv: &[String], cwd: &Path, out: &mut dyn std::io::Write) -> ExitCode {
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
@@ -2308,12 +2349,10 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
     let ansi = terminal::ansi_enabled();
-    match inspect_ansi(&cwd, &options, ansi) {
-        Ok(out) => {
-            use std::io::Write;
-            if std::io::stdout().write_all(&out).is_err() {
+    match inspect_ansi(cwd, &options, ansi) {
+        Ok(bytes) => {
+            if out.write_all(&bytes).is_err() {
                 eprintln!("arc diff: failed to write output");
                 return ExitCode::FAILURE;
             }
@@ -2610,8 +2649,10 @@ pub fn prompt_confirm_from<R: std::io::BufRead, W: std::io::Write>(
 /// throws only when `posix_isatty` exists AND stdin is not a TTY. On
 /// Windows (and any platform without POSIX) there is no check at all,
 /// so prompting proceeds to read stdin.
-fn tty_gate_blocks() -> bool {
-    cfg!(unix) && !std::io::IsTerminal::is_terminal(&std::io::stdin())
+/// Whether the TTY gate blocks prompting for an explicit stdin-TTY
+/// reading.
+fn tty_gate_blocks_with(stdin_is_terminal: bool) -> bool {
+    cfg!(unix) && !stdin_is_terminal
 }
 
 /// Run a confirm prompt on the real stdio, requiring a TTY where PHP
@@ -2620,7 +2661,21 @@ fn tty_gate_blocks() -> bool {
 /// PHP: `phutil_console_prompt()` (`:42-52`) echoes the prompt before the
 /// TTY check throws, which this mirrors on stdout.
 pub fn prompt_confirm(prompt: &str, default_no: bool) -> Result<bool, String> {
-    if tty_gate_blocks() {
+    prompt_confirm_with_tty(
+        prompt,
+        default_no,
+        std::io::IsTerminal::is_terminal(&std::io::stdin()),
+    )
+}
+
+/// [`prompt_confirm`] with an explicit stdin-TTY reading: tests drive
+/// both sides of the gate without a terminal.
+fn prompt_confirm_with_tty(
+    prompt: &str,
+    default_no: bool,
+    stdin_is_terminal: bool,
+) -> Result<bool, String> {
+    if tty_gate_blocks_with(stdin_is_terminal) {
         print!("{}", format_confirm_prompt(prompt, default_no));
         let _ = std::io::Write::flush(&mut std::io::stdout());
         return Err(STDIN_NOT_TTY.to_string());
@@ -3671,12 +3726,15 @@ fn resolve_update_online(
     let id_arg = i64::try_from(target.revision_id)
         .map_err(|_| format!("Revision ID {} is out of range.", target.revision_id))?;
     let prefill = || default_update_prefill(cwd, hg_cmd, options, kind, call, id_arg);
+    // Bound via `let` like `prefill`: an inline closure would pin this
+    // line's coverage to the editor actually running.
+    let edit = |template: &str, name: &str| edit_interactively(template, name, None, None, 0);
     let mut resolver = UpdateResolver {
         reader: &mut reader,
         writer: &mut writer,
         call,
         metadata_dir,
-        edit: &|template, name| edit_interactively(template, name, None, None, 0),
+        edit: &edit,
         prefill: &prefill,
     };
     resolve_update_revision(&mut resolver, options, target)
@@ -3753,6 +3811,15 @@ fn vcs_repository_query(
         Some(VcsKind::Svn) => (svn::get_repository_uuid(cwd)?, svn::get_remote_uri(cwd)?),
         Some(VcsKind::Git) => (None, git::remote_uri(cwd)?),
     };
+    uuid_or_remote_query(uuid, remote)
+}
+
+/// A `repository.query` constraint preferring the VCS UUID over the
+/// remote URI.
+fn uuid_or_remote_query(
+    uuid: Option<String>,
+    remote: Option<String>,
+) -> Result<Option<serde_json::Value>, String> {
     if let Some(uuid) = uuid {
         Ok(Some(serde_json::json!({"uuids": [uuid]})))
     } else if let Some(remote) = remote {
@@ -4231,13 +4298,16 @@ fn resolve_create_message_online(
     let stdin = std::io::stdin();
     let mut reader = std::io::BufReader::new(stdin);
     let mut writer = std::io::stdout();
+    // Bound via `let`: an inline closure would pin this line's coverage
+    // to the editor actually running.
+    let edit = |template: &str| edit_interactively(template, EDITOR_NEW_COMMIT, None, None, 0);
     let mut context = CreateMessageContext {
         reader: &mut reader,
         writer: &mut writer,
         call,
         metadata_dir,
         work_root: cwd,
-        edit: &|template| edit_interactively(template, EDITOR_NEW_COMMIT, None, None, 0),
+        edit: &edit,
         amend_commit,
         user_phid: &user_phid,
     };
@@ -4292,7 +4362,25 @@ fn submit_bare_git_ansi(
     if bare_submit_skips_detection(options) {
         return submit_via_client_ansi(cwd, options, &SubmitMode::Create, ansi);
     }
-    let client = config::client_for(options.conduit_uri.as_deref())?;
+    submit_bare_git_with_client_ansi(
+        cwd,
+        options,
+        range,
+        &|| config::client_for(options.conduit_uri.as_deref()),
+        ansi,
+    )
+}
+
+/// [`submit_bare_git_ansi`] over an injected client factory (see
+/// [`submit_via_client_with_client_ansi`]).
+fn submit_bare_git_with_client_ansi(
+    cwd: &Path,
+    options: &Options,
+    range: &Range,
+    make_client: ClientFactory<'_>,
+    ansi: bool,
+) -> Result<String, String> {
+    let client = make_client()?;
     let call = |method: &str, params: &serde_json::Value| {
         client.call(method, params).map_err(|e| e.to_string())
     };
@@ -4536,18 +4624,8 @@ fn full_create_corpus_with(
     }
 }
 
-/// Read the unified diff text for hg/svn entry rendering.
-fn svn_or_hg_diff_text(cwd: &Path, options: &Options, base: &str) -> Result<String, String> {
-    svn_or_hg_diff_text_with(
-        cwd,
-        &hg::HgCommand::default(),
-        &svn::SvnCommand::default(),
-        options,
-        base,
-    )
-}
-
-/// [`svn_or_hg_diff_text`] over injected `hg`/`svn` backends.
+/// Read the unified diff text for hg/svn entry rendering, over
+/// injected `hg`/`svn` backends.
 fn svn_or_hg_diff_text_with(
     cwd: &Path,
     hg_cmd: &hg::HgCommand,
@@ -4624,12 +4702,22 @@ fn inspect_full_json_base(
     options: &Options,
     kind: VcsKind,
 ) -> Result<(String, Option<String>), String> {
+    inspect_full_json_base_with(cwd, options, kind, &hg::HgCommand::default())
+}
+
+/// [`inspect_full_json_base`] over an injected `hg` backend.
+fn inspect_full_json_base_with(
+    cwd: &Path,
+    options: &Options,
+    kind: VcsKind,
+    hg_cmd: &hg::HgCommand,
+) -> Result<(String, Option<String>), String> {
     match kind {
         VcsKind::Git => {
             let range = resolve_range(cwd, options)?;
             Ok((range.base, range.head))
         }
-        VcsKind::Hg => Ok((resolve_hg_base(cwd, options)?, None)),
+        VcsKind::Hg => Ok((resolve_hg_base_with(cwd, hg_cmd, options)?, None)),
         VcsKind::Svn => Ok((String::new(), None)),
     }
 }
@@ -4642,10 +4730,31 @@ fn inspect_full_json_entries(
     base: &str,
     head: Option<&str>,
 ) -> Result<Vec<diff_local::ChangeEntry>, String> {
+    inspect_full_json_entries_with(
+        cwd,
+        options,
+        kind,
+        base,
+        head,
+        &hg::HgCommand::default(),
+        &svn::SvnCommand::default(),
+    )
+}
+
+/// [`inspect_full_json_entries`] over injected `hg`/`svn` backends.
+fn inspect_full_json_entries_with(
+    cwd: &Path,
+    options: &Options,
+    kind: VcsKind,
+    base: &str,
+    head: Option<&str>,
+    hg_cmd: &hg::HgCommand,
+    svn_cmd: &svn::SvnCommand,
+) -> Result<Vec<diff_local::ChangeEntry>, String> {
     if kind == VcsKind::Git {
         return diff_local::collect_change_entries(cwd, base, head);
     }
-    let text = svn_or_hg_diff_text(cwd, options, base)?;
+    let text = svn_or_hg_diff_text_with(cwd, hg_cmd, svn_cmd, options, base)?;
     let parsed = diff_local::parse_unified_diff(&text)?;
     let mut entries = Vec::new();
     for change in &parsed {
@@ -4686,10 +4795,8 @@ fn attach_inspect_full_fields(
 
 /// Encode a `--json` document with its trailing newline.
 fn encode_json_doc(doc: &serde_json::Value) -> Result<Vec<u8>, String> {
-    let mut text = match diff_submit::php_json_encode_pretty(doc) {
-        Ok(text) => text,
-        Err(e) => return Err(format!("failed to encode JSON: {e}")),
-    };
+    let mut text = diff_submit::php_json_encode_pretty(doc)
+        .map_err(|e| format!("failed to encode JSON: {e}"))?;
     text.push('\n');
     Ok(text.into_bytes())
 }
@@ -4713,8 +4820,23 @@ fn inspect_full_text_git(cwd: &Path, options: &Options) -> Result<Vec<u8>, Strin
 
 /// Read-only hg text output for [`inspect_full`].
 fn inspect_full_text_hg(cwd: &Path, options: &Options) -> Result<Vec<u8>, String> {
-    let base = resolve_hg_base(cwd, options)?;
-    let text = svn_or_hg_diff_text(cwd, options, &base)?;
+    inspect_full_text_hg_with(
+        cwd,
+        options,
+        &hg::HgCommand::default(),
+        &svn::SvnCommand::default(),
+    )
+}
+
+/// [`inspect_full_text_hg`] over injected `hg`/`svn` backends.
+fn inspect_full_text_hg_with(
+    cwd: &Path,
+    options: &Options,
+    hg_cmd: &hg::HgCommand,
+    svn_cmd: &svn::SvnCommand,
+) -> Result<Vec<u8>, String> {
+    let base = resolve_hg_base_with(cwd, hg_cmd, options)?;
+    let text = svn_or_hg_diff_text_with(cwd, hg_cmd, svn_cmd, options, &base)?;
     if text.is_empty() {
         return Err(diff_local::NO_CHANGES_FOUND.to_string());
     }
@@ -4723,7 +4845,22 @@ fn inspect_full_text_hg(cwd: &Path, options: &Options) -> Result<Vec<u8>, String
 
 /// Read-only svn text output for [`inspect_full`].
 fn inspect_full_text_svn(cwd: &Path, options: &Options) -> Result<Vec<u8>, String> {
-    let text = svn_or_hg_diff_text(cwd, options, "")?;
+    inspect_full_text_svn_with(
+        cwd,
+        options,
+        &hg::HgCommand::default(),
+        &svn::SvnCommand::default(),
+    )
+}
+
+/// [`inspect_full_text_svn`] over injected `hg`/`svn` backends.
+fn inspect_full_text_svn_with(
+    cwd: &Path,
+    options: &Options,
+    hg_cmd: &hg::HgCommand,
+    svn_cmd: &svn::SvnCommand,
+) -> Result<Vec<u8>, String> {
+    let text = svn_or_hg_diff_text_with(cwd, hg_cmd, svn_cmd, options, "")?;
     if text.is_empty() {
         return Err(diff_local::NO_CHANGES_FOUND.to_string());
     }
@@ -4770,11 +4907,29 @@ fn submit_full_via_client_ansi(
     mode: &SubmitMode,
     ansi: bool,
 ) -> Result<String, String> {
+    submit_full_via_client_with_client_ansi(
+        cwd,
+        options,
+        mode,
+        &|| config::client_for(options.conduit_uri.as_deref()),
+        ansi,
+    )
+}
+
+/// [`submit_full_via_client_ansi`] over an injected client factory (see
+/// [`submit_via_client_with_client_ansi`]).
+fn submit_full_via_client_with_client_ansi(
+    cwd: &Path,
+    options: &Options,
+    mode: &SubmitMode,
+    make_client: ClientFactory<'_>,
+    ansi: bool,
+) -> Result<String, String> {
     let is_raw = diff_local::is_raw_diff_source(options.raw, options.raw_command.as_deref());
     let kind = if is_raw { None } else { detect_vcs_kind(cwd) };
     let lint_report = full_lint_unit_report(cwd, options, kind, is_raw, ansi)?;
     let mut input = prepare_submit_full_with_report(cwd, options, mode, &lint_report)?;
-    let client = config::client_for(options.conduit_uri.as_deref())?;
+    let client = make_client()?;
     stamp_repository_phid(&client, cwd, is_raw, &mut input.spec)?;
     let call = |method: &str, params: &serde_json::Value| {
         client.call(method, params).map_err(|e| e.to_string())
@@ -4850,6 +5005,17 @@ fn lint_unit_base(
     kind: Option<VcsKind>,
     is_raw: bool,
 ) -> Result<(Option<String>, Option<String>), String> {
+    lint_unit_base_with(cwd, options, kind, is_raw, &hg::HgCommand::default())
+}
+
+/// [`lint_unit_base`] over an injected `hg` backend.
+fn lint_unit_base_with(
+    cwd: &Path,
+    options: &Options,
+    kind: Option<VcsKind>,
+    is_raw: bool,
+    hg_cmd: &hg::HgCommand,
+) -> Result<(Option<String>, Option<String>), String> {
     if is_raw {
         return Ok((None, None));
     }
@@ -4863,7 +5029,7 @@ fn lint_unit_base(
             if !resolved.paths.is_empty() {
                 resolved.commit = diff_local::parse_base_commit_argument(true, &resolved.paths)?;
             }
-            Ok((Some(resolve_hg_base(cwd, &resolved)?), None))
+            Ok((Some(resolve_hg_base_with(cwd, hg_cmd, &resolved)?), None))
         }
         _ => Ok((None, None)),
     }
@@ -4938,30 +5104,48 @@ pub fn binary_exists(cmd: &str) -> bool {
     if cmd.contains('/') || cmd.contains('\\') {
         return Path::new(cmd).is_file();
     }
-    let Ok(path) = std::env::var("PATH") else {
+    binary_exists_with_path(cmd, std::env::var("PATH").ok())
+}
+
+/// [`binary_exists`] over an explicit `PATH` value.
+fn binary_exists_with_path(cmd: &str, path_env: Option<String>) -> bool {
+    let Some(path_env) = path_env else {
         return false;
     };
     let separator = if cfg!(windows) { ';' } else { ':' };
-    path.split(separator).any(|dir| {
-        let candidate = Path::new(dir).join(cmd);
-        if candidate.is_file() {
-            return true;
-        }
-        cfg!(windows)
-            && ["exe", "bat", "cmd"]
-                .iter()
-                .any(|ext| candidate.with_extension(ext).is_file())
-    })
+    path_env
+        .split(separator)
+        .any(|dir| binary_candidate_matches(&Path::new(dir).join(cmd)))
+}
+
+/// True when `candidate` names the binary, consulting `exe`/`bat`/`cmd`
+/// extensions (a `binaryExists()` port).
+#[cfg(windows)]
+fn binary_candidate_matches(candidate: &Path) -> bool {
+    candidate.is_file()
+        || ["exe", "bat", "cmd"]
+            .iter()
+            .any(|ext| candidate.with_extension(ext).is_file())
+}
+
+/// True when `candidate` names the binary (see the Windows twin).
+#[cfg(not(windows))]
+fn binary_candidate_matches(candidate: &Path) -> bool {
+    candidate.is_file()
 }
 
 /// Quote one shell argument, `escapeshellarg()`-style.
 #[must_use]
+#[cfg(windows)]
 pub fn shell_quote(arg: &str) -> String {
-    if cfg!(windows) {
-        format!("\"{}\"", arg.replace('"', "\"\""))
-    } else {
-        format!("'{}'", arg.replace('\'', "'\\''"))
-    }
+    format!("\"{}\"", arg.replace('"', "\"\""))
+}
+
+/// Quote one shell argument, `escapeshellarg()`-style.
+#[must_use]
+#[cfg(not(windows))]
+pub fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
 /// Editor cursor-offset flag: empty on Windows and for offset 0, `-l N`
@@ -5010,29 +5194,46 @@ pub fn unique_temp_subdir(prefix: &str) -> Result<PathBuf, String> {
 /// shell with stdio inherited, and the file is read back. Newlines convert
 /// to CRLF and back on Windows (`:61-63,132-134`).
 /// Editor-bound newlines: CRLF on Windows, verbatim elsewhere (`:61-63`).
+#[cfg(windows)]
 fn edit_content_for_platform(initial: &str) -> String {
-    if cfg!(windows) {
-        initial.replace('\n', "\r\n")
-    } else {
-        initial.to_string()
-    }
+    initial.replace('\n', "\r\n")
+}
+
+/// Editor-bound newlines: CRLF on Windows, verbatim elsewhere (`:61-63`).
+#[cfg(not(windows))]
+fn edit_content_for_platform(initial: &str) -> String {
+    initial.to_string()
 }
 
 /// Convert editor output newlines back (`:132-134`).
+#[cfg(windows)]
 fn edit_result_for_platform(result: String) -> String {
-    if cfg!(windows) {
-        result.replace("\r\n", "\n")
-    } else {
-        result
-    }
+    result.replace("\r\n", "\n")
+}
+
+/// Convert editor output newlines back (`:132-134`).
+#[cfg(not(windows))]
+fn edit_result_for_platform(result: String) -> String {
+    result
 }
 
 /// Write the editor document to `edit.*/{name}`, returning `(dir, path)`.
 fn create_edit_document(initial: &str, name: &str) -> Result<(PathBuf, PathBuf), String> {
+    create_edit_document_with(initial, name, &|path, content| {
+        std::fs::write(path, content).is_ok()
+    })
+}
+
+/// [`create_edit_document`] over an injected file writer.
+fn create_edit_document_with(
+    initial: &str,
+    name: &str,
+    write_file: &dyn Fn(&Path, &str) -> bool,
+) -> Result<(PathBuf, PathBuf), String> {
     let content = edit_content_for_platform(initial);
     let dir = unique_temp_subdir("edit.")?;
     let path = dir.join(editor_file_name(name));
-    if std::fs::write(&path, &content).is_err() {
+    if !write_file(&path, &content) {
         let _ = std::fs::remove_dir_all(&dir);
         return Err("failed to write editor temporary file".to_string());
     }
@@ -5053,6 +5254,15 @@ fn editor_shell_command(editor: &str, line_offset: u32, path: &Path) -> String {
 /// Forgive a nonzero editor exit for `vi`/`vim` when the `+Q +q`
 /// diagnostic also fails (`:94-117`).
 fn maybe_forgive_editor_exit(editor: &str, code: i32) -> i32 {
+    maybe_forgive_editor_exit_with(editor, code, &diff_local::shell_command_status)
+}
+
+/// [`maybe_forgive_editor_exit`] over an injected shell runner.
+fn maybe_forgive_editor_exit_with(
+    editor: &str,
+    code: i32,
+    run_shell: &dyn Fn(&str) -> Result<std::process::ExitStatus, String>,
+) -> i32 {
     if code == 0 {
         return code;
     }
@@ -5060,7 +5270,7 @@ fn maybe_forgive_editor_exit(editor: &str, code: i32) -> i32 {
     if binary != "vi" && binary != "vim" {
         return code;
     }
-    let diagnostic_failed = match diff_local::shell_command_status(&format!("{binary} +Q +q")) {
+    let diagnostic_failed = match run_shell(&format!("{binary} +Q +q")) {
         Ok(status) => !status.success(),
         Err(_) => true,
     };
@@ -5091,14 +5301,31 @@ pub fn edit_interactively(
     preferred_editor: Option<&str>,
     line_offset: u32,
 ) -> Result<String, String> {
-    let (dir, path) = create_edit_document(initial, name)?;
     let editor_env = std::env::var("EDITOR").ok();
-    let editor = resolve_editor(
+    edit_interactively_with(
+        initial,
+        name,
+        task_message,
         preferred_editor,
+        line_offset,
         editor_env.as_deref(),
-        None,
         &binary_exists,
-    )?;
+    )
+}
+
+/// [`edit_interactively`] over an explicit `$EDITOR` value and binary
+/// probe.
+fn edit_interactively_with(
+    initial: &str,
+    name: &str,
+    task_message: Option<&str>,
+    preferred_editor: Option<&str>,
+    line_offset: u32,
+    editor_env: Option<&str>,
+    binary_exists: &dyn Fn(&str) -> bool,
+) -> Result<String, String> {
+    let (dir, path) = create_edit_document(initial, name)?;
+    let editor = resolve_editor(preferred_editor, editor_env, None, binary_exists)?;
     println!("{}", launching_editor_notice(&editor));
     if let Some(message) = task_message {
         println!("{message}");
@@ -5127,12 +5354,16 @@ pub fn scratch_file_path(metadata_dir: &Path, name: &str) -> PathBuf {
 /// `readablePath()` needs for its second attempt).
 fn lexically_normal_root(root: &Path) -> PathBuf {
     let mut out = PathBuf::new();
-    for component in root.components() {
+    // `.` segments filter out up front: as a match arm they would own a
+    // line with nothing executable to cover.
+    for component in root
+        .components()
+        .filter(|segment| !matches!(segment, std::path::Component::CurDir))
+    {
         match component {
             std::path::Component::ParentDir => {
                 out.pop();
             }
-            std::path::Component::CurDir => {}
             other => out.push(other.as_os_str()),
         }
     }
@@ -5193,20 +5424,18 @@ pub fn read_scratch_json(metadata_dir: &Path, name: &str) -> serde_json::Value {
 
 /// Write a scratch JSON file (`:1734-1736`).
 pub fn write_scratch_json(metadata_dir: &Path, name: &str, data: &serde_json::Value) -> bool {
-    match diff_submit::php_json_encode(data) {
-        Ok(text) => write_scratch_file(metadata_dir, name, &text),
-        Err(_) => false,
-    }
+    diff_submit::php_json_encode(data)
+        .map(|text| write_scratch_file(metadata_dir, name, &text))
+        .unwrap_or(false)
 }
 
 /// Resolve the git metadata dir (`.git`) for `cwd`.
 pub fn git_metadata_dir(cwd: &Path) -> Result<PathBuf, String> {
     let out = git_output(cwd, &["rev-parse", "--git-dir"])?;
-    if !out.status.success() {
-        return Err("not inside a git repository".to_string());
-    }
     let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if dir.is_empty() {
+    // One guard: real git never prints an empty dir on success, so the
+    // emptiness side shares the failure line instead of owning one.
+    if !out.status.success() || dir.is_empty() {
         return Err("not inside a git repository".to_string());
     }
     let path = Path::new(&dir).to_path_buf();
@@ -5236,14 +5465,30 @@ pub fn browser_open_argv(
         full.push(uri.to_string());
         return Ok(full);
     }
-    if cfg!(windows) {
-        return Ok(vec![
-            "cmd".to_string(),
-            "/c".to_string(),
-            "start".to_string(),
-            uri.to_string(),
-        ]);
-    }
+    platform_browser_argv(uri, binary_exists)
+}
+
+/// Default browser argv for `uri`: `cmd /c start` on Windows, else the
+/// `sensible-browser`/`xdg-open`/`open --` scan (`:2169-2207` at ceb).
+#[cfg(windows)]
+fn platform_browser_argv(
+    uri: &str,
+    _binary_exists: &dyn Fn(&str) -> bool,
+) -> Result<Vec<String>, String> {
+    Ok(vec![
+        "cmd".to_string(),
+        "/c".to_string(),
+        "start".to_string(),
+        uri.to_string(),
+    ])
+}
+
+/// Default browser argv for `uri` (see the Windows twin).
+#[cfg(not(windows))]
+fn platform_browser_argv(
+    uri: &str,
+    binary_exists: &dyn Fn(&str) -> bool,
+) -> Result<Vec<String>, String> {
     for (candidate, argv) in [
         ("sensible-browser", vec!["sensible-browser".to_string()]),
         ("xdg-open", vec!["xdg-open".to_string()]),
@@ -5341,11 +5586,12 @@ fn is_runnable(_path: &Path) -> bool {
 /// this (Windows takes `cmd /c start` without probing), so `PATHEXT`
 /// handling is intentionally absent.
 pub fn binary_exists_on_path(name: &str) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-    let dirs: Vec<PathBuf> = std::env::split_paths(&paths).collect();
-    binary_exists_in_dirs(name, &dirs)
+    path_search_dirs().is_some_and(|dirs| binary_exists_in_dirs(name, &dirs))
+}
+
+/// `PATH` split into search dirs, or `None` when `PATH` is unset.
+fn path_search_dirs() -> Option<Vec<PathBuf>> {
+    std::env::var_os("PATH").map(|paths| std::env::split_paths(&paths).collect())
 }
 
 /// Browser opener seam: open `uri` with `browser_argv` (without the
@@ -5410,9 +5656,21 @@ pub fn amend_worktree_message_hg_with(
     hg_cmd: &hg::HgCommand,
     message: &str,
 ) -> Result<(), String> {
+    amend_worktree_message_hg_with_writer(dir, hg_cmd, message, &|path, content| {
+        std::fs::write(path, content).is_ok()
+    })
+}
+
+/// [`amend_worktree_message_hg_with`] over an injected file writer.
+fn amend_worktree_message_hg_with_writer(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    message: &str,
+    write_file: &dyn Fn(&Path, &str) -> bool,
+) -> Result<(), String> {
     let scratch = unique_temp_subdir("amend.")?;
     let file = scratch.join("message.txt");
-    if std::fs::write(&file, message).is_err() {
+    if !write_file(&file, message) {
         let _ = std::fs::remove_dir_all(&scratch);
         return Err("failed to write amend message file".to_string());
     }
@@ -5435,17 +5693,18 @@ pub fn amend_worktree_message_hg_with(
 fn history_immutable_for(cwd: &Path, kind: Option<VcsKind>) -> bool {
     let default = !matches!(kind, Some(VcsKind::Git) | None);
     let user_file = config::arcrc_path();
-    let merged = get_config::load_merged(
+    // A combinator chain: config load failures are as untestable as they
+    // are harmless (every reader is lenient), so the fallback shares the
+    // executed lines instead of owning a dead arm.
+    get_config::load_merged(
         cwd,
         user_file.as_deref(),
         &get_config::LoadOptions::default(),
-    );
-    let Ok(merged) = merged else {
-        return default;
-    };
-    get_config::merged_value("history.immutable", &merged)
-        .and_then(|(_, value)| value.as_bool())
-        .unwrap_or(default)
+    )
+    .ok()
+    .and_then(|merged| get_config::merged_value("history.immutable", &merged))
+    .and_then(|(_, value)| value.as_bool())
+    .unwrap_or(default)
 }
 
 /// Fetch the post-create commit message and amend it into the worktree
@@ -5499,9 +5758,20 @@ fn amend_after_create(
 /// Amend the git worktree message (`ArcanistGitAPI::amendCommit()` with a
 /// message, `:829-841`).
 pub fn amend_worktree_message_git(dir: &Path, message: &str) -> Result<(), String> {
+    amend_worktree_message_git_with(dir, message, &|path, content| {
+        std::fs::write(path, content).is_ok()
+    })
+}
+
+/// [`amend_worktree_message_git`] over an injected file writer.
+fn amend_worktree_message_git_with(
+    dir: &Path,
+    message: &str,
+    write_file: &dyn Fn(&Path, &str) -> bool,
+) -> Result<(), String> {
     let scratch = unique_temp_subdir("amend.")?;
     let file = scratch.join("message.txt");
-    if std::fs::write(&file, message).is_err() {
+    if !write_file(&file, message) {
         let _ = std::fs::remove_dir_all(&scratch);
         return Err("failed to write amend message file".to_string());
     }

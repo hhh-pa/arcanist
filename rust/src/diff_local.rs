@@ -1054,7 +1054,7 @@ pub fn resolve_explicit_base(
         let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !sha.is_empty() {
             return Ok(sha);
-        }
+        } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
     }
     Err(format!(
         "Unable to find any git commit named '{symbolic_base}' in this repository."
@@ -4931,7 +4931,7 @@ pub fn parse_hg_active_bookmark(output: &str) -> Option<String> {
         let name = line.strip_prefix('*')?.trim_start();
         let name = name.split_whitespace().next()?;
         if name.is_empty() {
-            return None;
+            return None; // LCOV_EXCL_LINE // Reason: dead: split_whitespace never yields an empty name
         }
         Some(name.to_string())
     })
@@ -4979,7 +4979,7 @@ pub fn parse_hg_status_details(output: &str) -> Result<Vec<(HgStatusEntry, u32)>
         let path = line[2..].to_string();
         if code == ' ' {
             let Some((last, _)) = entries.last_mut() else {
-                return Err(format!("Unexpected copy source in hg status, '{line}'."));
+                return Err(format!("Unexpected copy source in hg status, '{line}'.")); // LCOV_EXCL_LINE // Reason: dead: trim() strips leading spaces, so a copy-source line is never first
             };
             last.from = Some(path);
             continue;
@@ -5771,9 +5771,10 @@ fn resolve_list_path(base: &Path, path: &str) -> String {
     let mut rooted = false;
     for component in joined.components() {
         match component {
+            // LCOV_EXCL_START // Reason: dead on ubuntu; Component::Prefix only occurs in Windows paths
             std::path::Component::Prefix(prefix) => {
                 parts.push(prefix.as_os_str().to_string_lossy().into_owned());
-            }
+            } // LCOV_EXCL_STOP
             std::path::Component::RootDir => rooted = true,
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
@@ -6211,7 +6212,7 @@ pub fn svn_working_copy_root(cwd: &Path) -> PathBuf {
 #[must_use]
 pub fn default_svn_diff_cmd() -> Option<PathBuf> {
     if cfg!(windows) {
-        return None;
+        return None; // LCOV_EXCL_LINE // Reason: windows-only early return; cfg!(windows) is false on ubuntu CI
     }
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
@@ -7146,7 +7147,7 @@ pub fn resolve_message_source(
             id,
         )?)),
         // Unreachable: `!create && update.is_none()` returned above.
-        None => Ok(MessageSource::CreateFromUser),
+        None => Ok(MessageSource::CreateFromUser), // LCOV_EXCL_LINE // Reason: unreachable: `!create && update.is_none()` returns above
     }
 }
 
@@ -7739,7 +7740,7 @@ fn commit_clean_check_changes(
     }
     let message = remove_comments(&edited);
     if message.is_empty() {
-        return Err(MUST_PROVIDE_NONEMPTY_MESSAGE.to_string());
+        return Err(MUST_PROVIDE_NONEMPTY_MESSAGE.to_string()); // LCOV_EXCL_LINE // Reason: dead: remove_comments always returns newline-terminated text, never empty
     }
     if let Some(commit) = vcs.do_commit {
         commit(&message)?;

@@ -617,3 +617,179 @@ fn product_name_literals_are_not_ported() {
     // contents are never reported here.
     assert!(check("<?php pht('Phabricator rocks');\n").is_empty());
 }
+
+// -( T1170 COV5: close xhp_calls.rs )--------------------------------------------
+
+fn for_rule(source: &str, rule: u32) -> Vec<(usize, usize, String)> {
+    check(source)
+        .into_iter()
+        .filter(|(r, _, _, _)| *r == rule)
+        .map(|(_, line, col, message)| (line, col, message))
+        .collect()
+}
+
+fn for_rule_with_options(
+    source: &str,
+    rule: u32,
+    options: &ast::XhpOptions,
+) -> Vec<(usize, usize, String)> {
+    check_with_options(source, options)
+        .into_iter()
+        .filter(|(r, _, _, _)| *r == rule)
+        .map(|(_, line, col, message)| (line, col, message))
+        .collect()
+}
+
+fn for_rule_blob(canned: &str, rule: u32) -> Vec<(usize, usize, String)> {
+    check_blob(canned)
+        .into_iter()
+        .filter(|(r, _, _, _)| *r == rule)
+        .map(|(_, line, col, message)| (line, col, message))
+        .collect()
+}
+
+#[test]
+fn constructs_skip_call_name_rules() {
+    // `isset` is a construct: every `is_construct` early-out runs.
+    assert!(check("<?php isset($x);\n").is_empty());
+}
+
+#[test]
+fn arg_scans_trim_trivia_and_nesting() {
+    assert!(for_rule("<?php f($x );\n", 53).is_empty());
+    assert!(for_rule("<?php f( );\n", 53).is_empty());
+    assert!(for_rule("<?php f(g($x));\n", 53).is_empty());
+}
+
+#[test]
+fn arg_less_define_is_skipped() {
+    assert!(for_rule("<?php define();\n", 12).is_empty());
+}
+
+#[test]
+fn unclosed_strpos_call_is_skipped() {
+    assert!(for_rule("<?php strpos($a\n", 36).is_empty());
+}
+
+#[test]
+fn double_quote_chains_cross_brackets() {
+    let hits = for_rule("<?php $x = \"a\" . ($y);\n", 41);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].2,
+        "String does not require double quotes. For consistency, prefer single quotes."
+    );
+    let hits = for_rule("<?php $x = ($y) . \"b\";\n", 41);
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn single_quote_literal_has_no_inner_text() {
+    let hits = for_rule_blob(
+        "{\"source\": \"\\\"\", \"tokens\": [[\"T_CONSTANT_ENCAPSED_STRING\", \"\\\"\", 0]]}",
+        41,
+    );
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn leading_paren_has_no_call_context() {
+    assert!(
+        for_rule_blob(
+            "{\"source\": \"($x);\", \"tokens\": [[\"(\", \"(\", 0],[\"T_VARIABLE\", \"$x\", 1],[\";\", \";\", 3]]}",
+            53
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn leading_call_name_is_not_a_declaration() {
+    assert!(
+        for_rule_blob(
+            "{\"source\": \"f()\", \"tokens\": [[\"T_STRING\", \"f\", 0],[\"(\", \"(\", 1],[\")\", \")\", 2]]}",
+            53
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn by_ref_declaration_names_are_not_calls() {
+    assert!(for_rule("<?php function &foo() {}\n", 53).is_empty());
+}
+
+#[test]
+fn custom_printf_functions_take_effect() {
+    let options = ast::XhpOptions {
+        printf: vec![("myprintf".to_string(), 0)],
+        ..ast::XhpOptions::default()
+    };
+    let hits = for_rule_with_options("<?php myprintf();\n", 54, &options);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].2,
+        "This function is expected to have a format string."
+    );
+    assert!(for_rule_with_options("<?php myprintf('x', $y);\n", 54, &options).is_empty());
+    assert!(for_rule_with_options("<?php otherfunc();\n", 54, &options).is_empty());
+}
+
+#[test]
+fn anonymous_classes_have_no_name_index() {
+    assert!(for_rule("<?php $x = new class {};\n", 62).is_empty());
+}
+
+#[test]
+fn body_less_classes_have_no_end() {
+    assert!(for_rule("<?php class A $x;\n", 62).is_empty());
+    assert!(for_rule("<?php class A extends\n", 62).is_empty());
+}
+
+#[test]
+fn dynamic_function_keys_match_case_insensitively() {
+    let options = ast::XhpOptions {
+        dynamic_functions: vec![("MYFUNC".to_string(), 0)],
+        ..ast::XhpOptions::default()
+    };
+    let hits = for_rule_with_options("<?php myfunc($x);\n", 86, &options);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].2,
+        "Parameter 1 of `myfunc` should be a scalar string, otherwise it's not safe."
+    );
+    assert!(for_rule_with_options("<?php myfunc('lit');\n", 86, &options).is_empty());
+    assert!(for_rule_with_options("<?php otherfunc($x);\n", 86, &options).is_empty());
+}
+
+#[test]
+fn negative_dynamic_params_are_safe() {
+    let options = ast::XhpOptions {
+        dynamic_functions: vec![("f".to_string(), -1)],
+        ..ast::XhpOptions::default()
+    };
+    assert!(for_rule_with_options("<?php f($x);\n", 86, &options).is_empty());
+}
+
+#[test]
+fn dynamic_class_names_scan_and_skip() {
+    for src in [
+        "<?php $x = new",
+        "<?php $x = new $y;\n",
+        "<?php $x = new Foo",
+        "<?php $x = new Foo;\n",
+        "<?php $x = new Foo($x);\n",
+        "<?php $x = new Foo\\",
+        "<?php $x = new Foo\\5;\n",
+        "<?php $x = new A\\B($x);\n",
+    ] {
+        assert!(for_rule(src, 86).is_empty(), "{src}");
+    }
+    // A watched class with a dynamic argument reports.
+    let options = ast::XhpOptions {
+        dynamic_classes: vec![("a\\b".to_string(), 0)],
+        ..ast::XhpOptions::default()
+    };
+    let hits = for_rule_with_options("<?php $x = new A\\B($y);\n", 86, &options);
+    assert_eq!(hits.len(), 1);
+}

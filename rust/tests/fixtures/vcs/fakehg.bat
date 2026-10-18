@@ -1,5 +1,7 @@
 @echo off
 rem Fake `hg` for hermetic tests. Logs argv, then prints canned output.
+rem NOTE: cmd.exe mangles shell-special argv (`<`, `>`, `|`, `&`) when
+rem logging/forwarding; tests with such argv must use fakehg.ps1 instead.
 set "ARGS=%*"
 echo %ARGS%>> .fakehg.log
 if "%~1"=="--encoding" (

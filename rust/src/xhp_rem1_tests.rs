@@ -258,6 +258,13 @@ fn exit_expression_statement_forms_ok() {
 }
 
 #[test]
+fn class_filename_skips_classless_files() {
+    assert!(for_rule("<?php echo 1;\n", 19).is_empty());
+    // Non-word lone names (here: non-ASCII) skip the rename check.
+    assert!(for_rule("<?php class F\u{f6}\u{f6} {}\n", 19).is_empty());
+}
+
+#[test]
 fn class_filename_mismatch_checks_lone_declaration() {
     let options = ast::XhpOptions::default();
     let hits = for_rule_with("<?php class Foo {}\n", "src/Bar.php", &options, 19);
@@ -1198,4 +1205,565 @@ fn compat_symbol_constant_namespaced() {
     );
     // Ordinary qualified names still miss.
     assert!(for_rule_with("<?php echo A\\B;\n", "a.php", &old, 45).is_empty());
+}
+
+// T1170 coverage below: one behavioral test per uncovered shape. Every
+// `check` runs all rules, so each snippet pins its rule's findings
+// while covering shared helpers for the rest.
+
+#[test]
+fn undeclared_static_global_edge_shapes() {
+    // Initialized statics skip their values when collecting declarators.
+    assert!(
+        for_rule(
+            "<?php function f() { static $x = array(1, 2), $y = 3; echo $x; echo $y; }\n",
+            5
+        )
+        .is_empty()
+    );
+    // Brackets outside `= value` still nest the scan.
+    assert!(for_rule("<?php function f() { static $a[0]; }\n", 5).is_empty());
+    // A stray closer ends the declarator scan.
+    assert!(for_rule("<?php function f() { static $a); }\n", 5).is_empty());
+    // `static`/`global` before a non-variable declares nothing.
+    assert!(
+        for_rule(
+            "<?php function f() { $g = static function () { return 1; }; }\n",
+            5
+        )
+        .is_empty()
+    );
+    assert!(for_rule("<?php function f() { global FOO; }\n", 5).is_empty());
+    // Truncated declarators scan to EOF.
+    assert!(for_rule("<?php function f() { static $x = 1", 5).is_empty());
+    assert!(for_rule("<?php function f() { global", 5).is_empty());
+}
+
+#[test]
+fn undeclared_dynamic_scope_endings() {
+    // A non-variable `global` destroys the scope at its offset.
+    assert!(for_rule("<?php function f() { global FOO; echo $x; }\n", 5).is_empty());
+    // `$$x` assignment destroys the scope at its offset.
+    assert!(for_rule("<?php function f() { $$x = 1; echo $x; }\n", 5).is_empty());
+}
+
+#[test]
+fn undeclared_catch_and_destructuring_declare() {
+    assert!(
+        for_rule(
+            "<?php function f() { try {} catch (Exception $e) { echo $e; } }\n",
+            5
+        )
+        .is_empty()
+    );
+    // A `catch` without a header declares nothing but still scans.
+    assert!(for_rule("<?php function f() { try {} catch {} }\n", 5).is_empty());
+    assert!(
+        for_rule(
+            "<?php function f($x) { list($a, $b) = $x; echo $a; echo $b; }\n",
+            5
+        )
+        .is_empty()
+    );
+    assert!(for_rule("<?php function f($x) { [$a, $b] = $x; echo $a; }\n", 5).is_empty());
+}
+
+#[test]
+fn undeclared_static_access_parts_excluded() {
+    // Variables inside `::` call brackets are access parts, not uses.
+    assert!(for_rule("<?php function f($x) { Foo::bar($x); }\n", 5).is_empty());
+    // A `$var::` receiver is an access part too.
+    assert!(for_rule("<?php function f($x) { $x::m(); }\n", 5).is_empty());
+}
+
+#[test]
+fn bodies_missing_scan_nothing() {
+    // Truncated declarations have no body range; every per-body rule
+    // skips them quietly.
+    for rule in [5, 9, 10, 13, 17, 19, 20, 22, 23, 24, 30, 32, 39] {
+        assert!(
+            for_rule("<?php function f()", rule).is_empty(),
+            "rule {rule}"
+        );
+    }
+}
+
+#[test]
+fn naming_skips_anonymous_classes() {
+    assert!(for_rule("<?php $x = new class {};\n", 9).is_empty());
+}
+
+#[test]
+fn naming_const_initializers_nest() {
+    assert!(for_rule("<?php const X = [1, 2];\n", 9).is_empty());
+    // A stray closer ends the declarator scan.
+    assert!(for_rule("<?php const X = 1];\n", 9).is_empty());
+    // A non-name where a declarator belongs ends the statement.
+    assert!(for_rule("<?php const 123 = 1;\n", 9).is_empty());
+}
+
+#[test]
+fn naming_ignores_dynamic_define_names() {
+    assert!(for_rule("<?php define($x, 1);\n", 9).is_empty());
+}
+
+#[test]
+fn implicit_constructor_ignores_outside_functions() {
+    assert!(for_rule("<?php class A {} function f() {}\n", 10).is_empty());
+}
+
+#[test]
+fn static_this_ignores_traits_and_truncated() {
+    assert!(
+        for_rule(
+            "<?php trait T { public static function v() { $this->f(); } }\n",
+            13
+        )
+        .is_empty()
+    );
+    assert!(for_rule("<?php class A { public static function v()", 13).is_empty());
+}
+
+#[test]
+fn exit_colon_scan_exhausts_cleanly() {
+    // A `:` scan that reaches the file start through depth-tracked
+    // brackets is statement position (the `<?=` opener is not a stop).
+    assert!(for_rule("<?= ($x) : exit;\n", 17).is_empty());
+}
+
+#[test]
+fn tautological_skips_empty_operands() {
+    assert!(for_rule("<?php $a = ||;\n", 20).is_empty());
+    assert!(for_rule("<?php if ($x == /*c*/) {}\n", 20).is_empty());
+    // A comparison nested in an `==` operand stops the scan there.
+    assert!(for_rule("<?php if ($x == $y == $z) {}\n", 20).is_empty());
+}
+
+#[test]
+fn duplicate_keys_groups_by_literal_shape() {
+    // Hex, binary, and octal keys normalize to their values.
+    let hits = for_rule("<?php $a = array(0x10 => 1, 16 => 2);\n", 22);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].2,
+        "Duplicate key in array initializer. PHP will ignore all but the last entry."
+    );
+    assert_eq!(
+        for_rule("<?php $a = array(0b101 => 1, 5 => 2);\n", 22).len(),
+        1
+    );
+    assert_eq!(
+        for_rule("<?php $a = array(010 => 1, 8 => 2);\n", 22).len(),
+        1
+    );
+    // `019` is not valid octal, so it groups by its raw text.
+    assert_eq!(
+        for_rule("<?php $a = array(019 => 1, 019 => 2);\n", 22).len(),
+        1
+    );
+    // Integral floats group with their integer value.
+    assert_eq!(
+        for_rule("<?php $a = array(1.0 => 1, 1 => 2);\n", 22).len(),
+        1
+    );
+    assert_eq!(
+        for_rule("<?php $a = array(1.5 => 1, 1.5 => 2);\n", 22).len(),
+        1
+    );
+    // Unrepresentable floats group by raw text.
+    assert_eq!(
+        for_rule("<?php $a = array(1e99999 => 1, 1e99999 => 2);\n", 22).len(),
+        1
+    );
+    // Booleans group as symbols.
+    assert_eq!(
+        for_rule("<?php $a = array(true => 1, true => 2);\n", 22).len(),
+        1
+    );
+    // Magic constants and compound keys form no group at all.
+    assert!(for_rule("<?php $a = array(__DIR__ => 1, __DIR__ => 2);\n", 22).is_empty());
+    assert!(for_rule("<?php $a = array($x + 1 => 2);\n", 22).is_empty());
+}
+
+#[test]
+fn duplicate_keys_normalizes_edge_literals() {
+    // Empty-after-prefix radixes and unparseable floats survive raw.
+    assert_eq!(super::u64_from_radix("", 16), None);
+    assert_eq!(super::normalize_int("0x"), "0x");
+    assert_eq!(super::normalize_float("abc"), "abc");
+    assert_eq!(super::normalize_float(""), "");
+}
+
+#[test]
+fn duplicate_keys_bare_array_keyword() {
+    // A lone `array` keyword is not an `array(...)` literal.
+    assert!(for_rule("<?php echo array;\n", 22).is_empty());
+    // `[` after a control `)` or a block `}` opens a short literal.
+    assert!(for_rule("<?php if ($x) [1, 2];\n", 22).is_empty());
+    assert!(for_rule("<?php function f() { $a = 1; } [1, 2];\n", 22).is_empty());
+    // Unrelated blocks never match the dereference probe, whatever
+    // their body shape.
+    assert!(for_rule("<?php function f(); function g() { $b = 2; } [1, 2];\n", 22).is_empty());
+    // ...even when the `}` never opened.
+    assert!(for_rule("<?php function f() { $a = 1; } } [1];\n", 22).is_empty());
+}
+
+#[test]
+fn reused_iterator_degenerate_headers() {
+    // Header-less loops contribute no iterators.
+    assert!(for_rule("<?php for {}\n", 23).is_empty());
+    assert!(for_rule("<?php foreach {}\n", 23).is_empty());
+    // A `foreach` without `as` contributes no iterators.
+    assert!(for_rule("<?php foreach ($a) {}\n", 23).is_empty());
+    // Calls in the iterated expression nest the header scan.
+    assert!(for_rule("<?php foreach (foo($a) as $x) {}\n", 23).is_empty());
+}
+
+#[test]
+fn brace_bare_block_gap_checked() {
+    // A bare `{` still needs its single preceding space.
+    let hits = for_rule("<?php{}", 24);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].2,
+        "Put opening braces on the same line as control statements and \
+         declarations, with a single space before them."
+    );
+    assert!(for_rule("<?php {}", 24).is_empty());
+}
+
+#[test]
+fn brace_helpers_tolerate_missing_predecessors() {
+    // Defensive edges parsed sources never produce (the open tag is
+    // always the first semantic token): a bare `{`, a block `{`, an
+    // `else`, and a type name with no semantic predecessor.
+    let bare = ast::Tree {
+        source: "{ }".to_string(),
+        tokens: vec![ast::Token {
+            kind: "{".to_string(),
+            value: "{".to_string(),
+            offset: 0,
+        }],
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    super::brace_bare_blocks(&bare, &[], &mut out);
+    assert!(out.is_empty());
+
+    let donor = ast::tree_from_source("<?php function f() {}\n");
+    let blocks = donor.blocks();
+    assert_eq!(blocks.len(), 1);
+    let mut block = blocks[0].clone();
+    block.body = ast::BodySpan::Brace {
+        open: 0,
+        close: None,
+    };
+    let mut out = Vec::new();
+    super::brace_open_gap(&donor, &block, &mut out);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].rule, 24);
+
+    let donor =
+        ast::tree_from_source("<?php function f() { if ($a) { $b = 1; }else{ $c = 2; } }\n");
+    let blocks = donor.blocks();
+    let found = blocks
+        .into_iter()
+        .find(|b| matches!(b.kind, ast::BlockKind::Else));
+    let mut block = found.unwrap();
+    let mut out = Vec::new();
+    super::brace_else_gap(&donor, &block, &mut out);
+    assert_eq!(out.len(), 1);
+    block.kw_idx = 0;
+    let mut out = Vec::new();
+    super::brace_else_gap(&donor, &block, &mut out);
+    assert!(out.is_empty());
+
+    let solo = ast::Tree {
+        source: "C".to_string(),
+        tokens: vec![ast::Token {
+            kind: ast::kinds::T_STRING.to_string(),
+            value: "C".to_string(),
+            offset: 0,
+        }],
+        ..Default::default()
+    };
+    assert!(super::is_type_name_start(&solo, 0, 0));
+}
+
+#[test]
+fn brace_else_without_braces() {
+    // A truncated `else` has no end to hug.
+    assert!(for_rule("<?php if ($x) {} else", 24).is_empty());
+    // A braceless `else` body flags the missing braces instead.
+    let hits = for_rule("<?php if ($x) {} else foo();\n", 24);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].2, "Use braces to surround a statement block.");
+}
+
+#[test]
+fn fallthrough_colon_switches() {
+    let hits = for_rule("<?php switch ($x): case 1: $x++; endswitch;\n", 30);
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn fallthrough_braceless_arm_ends_at_eof() {
+    // Defensive: cases never attach to braceless switch bodies (the
+    // parser only scans brace/colon bodies), but a missing body end
+    // still falls back to EOF.
+    let source = "<?php switch ($x) { case 1: $x++; }\n";
+    let canned = ast::tokens_to_canned(source, &ast::tokenize(source));
+    let tree = ast::tree_from_canned(&canned).expect("canned output must parse");
+    let blocks = tree.blocks();
+    let switch = blocks
+        .iter()
+        .find(|block| block.kind == ast::BlockKind::Switch)
+        .expect("switch block");
+    assert_eq!(switch.cases.len(), 1);
+    for body in [
+        ast::BodySpan::Single { first: 0, last: 0 },
+        ast::BodySpan::Empty { semi: 0 },
+        ast::BodySpan::Missing,
+    ] {
+        let mut braceless = switch.clone();
+        braceless.body = body;
+        assert_eq!(
+            super::case_range_end(&tree, &braceless, 0),
+            tree.tokens.len()
+        );
+    }
+}
+
+#[test]
+fn fallthrough_nested_declaration_scopes() {
+    // Terminators inside nested declarations do not silence the arm,
+    // so the declaration span is still tracked.
+    let hits = for_rule(
+        "<?php switch ($x) { case 1: function foo() {} $x++; }\n",
+        30,
+    );
+    assert_eq!(hits.len(), 1);
+    // A plain nested block is neither a loop nor a scope.
+    assert!(for_rule("<?php switch ($x) { case 1: if ($y) { break; } }\n", 30).is_empty());
+}
+
+#[test]
+fn reused_reference_unset_without_semicolon() {
+    // `unset($x)` without a trailing `;` still clears.
+    assert!(
+        for_rule(
+            "<?php function f() { foreach ($a as &$x) {} unset($x) }\n",
+            39
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn reused_reference_nested_closures_skipped() {
+    assert!(
+        for_rule(
+            "<?php function f() { $g = function() { foreach ($a as &$x) {} }; }\n",
+            39
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn reused_reference_reassignment_clears() {
+    // `$x = &$y` counts as unsetting `$x`.
+    assert!(
+        for_rule(
+            "<?php function f() { foreach ($a as &$x) {} $x = &$y; $x++; }\n",
+            39
+        )
+        .is_empty()
+    );
+    // `$$x` targets never count.
+    assert!(for_rule("<?php function f() { $$x = &$y; }\n", 39).is_empty());
+    // Dereferenced references do not count either, so both the
+    // reassignment target and the later use flag.
+    assert_eq!(
+        for_rule(
+            "<?php function f() { foreach ($a as &$x) {} $x = &$y[0]; $x++; }\n",
+            39
+        )
+        .len(),
+        2
+    );
+    // Non-reference right-hand sides never count.
+    assert!(for_rule("<?php function f() { $x = &5; }\n", 39).is_empty());
+    // Truncated assignments scan nothing.
+    assert!(for_rule("<?php function f() { $x =", 39).is_empty());
+    assert!(for_rule("<?php function f() { $x = &", 39).is_empty());
+}
+
+#[test]
+fn reused_reference_use_before_loop_ignores() {
+    assert!(for_rule("<?php function f() { $x++; foreach ($a as &$x) {} }\n", 39).is_empty());
+}
+
+#[test]
+fn compat53_closure_use_is_not_an_import() {
+    // A closure `use` is not an import `use`: only the closure fires.
+    let options = versioned("5.2.3");
+    assert_eq!(
+        for_rule_with("<?php f(function () use ($x) {});\n", "a.php", &options, 45).len(),
+        1
+    );
+}
+
+#[test]
+fn compat53_short_ternary_nonempty_shapes() {
+    let options = versioned("5.2.3");
+    // A parenthesized middle is a full ternary.
+    assert!(for_rule_with("<?php $x ? ($y) : 2;\n", "a.php", &options, 45).is_empty());
+    // A closer, `;`, or EOF before any `:` is not a ternary at all.
+    assert!(for_rule_with("<?php f($x ? 1);\n", "a.php", &options, 45).is_empty());
+    assert!(for_rule_with("<?php $x ? 1;\n", "a.php", &options, 45).is_empty());
+    assert!(for_rule_with("<?php $x ?", "a.php", &options, 45).is_empty());
+}
+
+#[test]
+fn compat54_static_call_index_ignored() {
+    // `C::f()[0]` indexes a static call, not a plain call.
+    let options = versioned("5.3.0");
+    assert!(for_rule_with("<?php C::f()[0];\n", "a.php", &options, 45).is_empty());
+}
+
+#[test]
+fn compat54_truncated_closure_skipped() {
+    let options = versioned("5.3.0");
+    assert!(for_rule_with("<?php function ()", "a.php", &options, 45).is_empty());
+}
+
+#[test]
+fn compat54_closure_self_matches_fixture() {
+    let options = versioned("5.3.0");
+    let hits = for_rule_with(
+        "<?php $f = function () { self::foo(); };\n",
+        "a.php",
+        &options,
+        45,
+    );
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].2,
+        "The use of `self` in an anonymous closure is not available before PHP 5.4."
+    );
+}
+
+#[test]
+fn compat_symbol_windows_plain_functions() {
+    // Functions with no Windows row take the plain path.
+    let options = versioned_windows("5.3.0", "5.2.0");
+    let hits = for_rule_with("<?php array_column(array(), 'x');\n", "a.php", &options, 45);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        hits[0].2,
+        "This codebase targets PHP 5.3.0, but `array_column()` was not introduced until PHP 5.5.0."
+    );
+}
+
+#[test]
+fn compat_symbol_prerelease_user_versions() {
+    // User versions with `pl` and unknown tags compare in
+    // `version_compare()` order against the table.
+    for target in ["5.4.0pl1", "5.4.0p1", "5.4.0zzz"] {
+        let hits = for_rule_with(
+            "<?php array_column(array());\n",
+            "a.php",
+            &versioned(target),
+            45,
+        );
+        assert_eq!(hits.len(), 1, "{target}");
+    }
+}
+
+#[test]
+fn compat_symbol_whitelist_non_guards() {
+    let options = versioned("5.3.0");
+    // An empty condition guards nothing.
+    assert!(for_rule_with("<?php if () {}\n", "a.php", &options, 45).is_empty());
+    // A bare name without a call guards nothing.
+    assert!(for_rule_with("<?php if (function_exists) {}\n", "a.php", &options, 45).is_empty());
+    // A compound condition guards nothing, so uses still flag.
+    assert_eq!(
+        for_rule_with(
+            "<?php if (function_exists('x') && $y) { array_column(array()); }\n",
+            "a.php",
+            &options,
+            45
+        )
+        .len(),
+        1
+    );
+}
+
+#[test]
+fn compat_symbol_static_class_names() {
+    let options = versioned("5.3.0");
+    // `static` resolves as a class name but misses the table.
+    assert!(for_rule_with("<?php new static;\n", "a.php", &options, 45).is_empty());
+    // A `\` without a name resolves to nothing.
+    assert!(for_rule_with("<?php new \\123;\n", "a.php", &options, 45).is_empty());
+}
+
+#[test]
+fn compat_symbol_inheritance_lists() {
+    let options = versioned("5.3.0");
+    // Non-name tokens end the inheritance scan.
+    assert!(for_rule_with("<?php class X extends 123 {}\n", "a.php", &options, 45).is_empty());
+    assert!(for_rule_with("<?php class X extends \\123 {}\n", "a.php", &options, 45).is_empty());
+    // Comma-separated names each resolve.
+    assert!(for_rule_with("<?php class X implements A, B {}\n", "a.php", &options, 45).is_empty());
+}
+
+#[test]
+fn compat_symbol_catch_without_header() {
+    let options = versioned("5.3.0");
+    assert!(for_rule_with("<?php try {} catch {}\n", "a.php", &options, 45).is_empty());
+}
+
+#[test]
+fn compat_symbol_grouped_return_types() {
+    let options = versioned("5.3.0");
+    assert!(for_rule_with("<?php function f(): (A&B)|C {}\n", "a.php", &options, 45).is_empty());
+}
+
+#[test]
+fn compat_symbol_lowercase_magic_ignored() {
+    let options = versioned("5.3.0");
+    // Magic spellings without uppercase cannot match any table key.
+    assert!(for_rule_with("<?php echo __dir__;\n", "a.php", &options, 45).is_empty());
+}
+
+#[test]
+fn compat_symbol_broken_imports() {
+    let options = versioned("5.3.0");
+    assert!(for_rule_with("<?php use 123;\n", "a.php", &options, 45).is_empty());
+    assert!(for_rule_with("<?php use \\123;\n", "a.php", &options, 45).is_empty());
+}
+
+#[test]
+fn compat_symbol_namespace_edge_shapes() {
+    let options = versioned("5.3.0");
+    assert!(for_rule_with("<?php namespace", "a.php", &options, 45).is_empty());
+    // A magic spelling after `namespace` hides instead of resolving.
+    assert!(for_rule_with("<?php namespace __DIR__;\n", "a.php", &options, 45).is_empty());
+}
+
+#[test]
+fn compat_symbol_by_ref_declarations_excluded() {
+    let options = versioned("5.3.0");
+    assert!(
+        for_rule_with(
+            "<?php function &JSON_PRETTY_PRINT() {}\n",
+            "a.php",
+            &options,
+            45
+        )
+        .is_empty()
+    );
 }

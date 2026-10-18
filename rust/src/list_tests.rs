@@ -319,3 +319,36 @@ fn b23_list_help_matches_generated_format() {
     let ansi = usage_text(true);
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
+
+#[test]
+fn conduit_uri_takes_a_separate_value() {
+    let options = parse_args(&args(&["--conduit-uri", "https://x.test/"]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(options.conduit_uri, Some("https://x.test/".to_string()));
+}
+
+#[test]
+fn status_names_cover_every_code() {
+    assert_eq!(status_name_for(0), "Needs Review");
+    assert_eq!(status_name_for(1), "Needs Revision");
+    assert_eq!(status_name_for(2), "Accepted");
+    assert_eq!(status_name_for(3), "Closed");
+    assert_eq!(status_name_for(4), "Abandoned");
+    assert_eq!(status_name_for(5), "Changes Planned");
+    assert_eq!(status_name_for(6), "In Preparation");
+    assert_eq!(status_name_for(99), "Unknown");
+}
+
+#[test]
+fn revision_ids_accept_big_and_prefixed_forms() {
+    let revision =
+        parse_revision(&serde_json::json!({"id": 18_446_744_073_709_551_615u64})).unwrap();
+    assert_eq!(revision.id, "18446744073709551615");
+    let revision = parse_revision(&serde_json::json!({"id": "D42"})).unwrap();
+    assert_eq!(revision.id, "42");
+    let revision = parse_revision(&serde_json::json!({"id": "d7"})).unwrap();
+    assert_eq!(revision.id, "7");
+    let revision = parse_revision(&serde_json::json!({"id": "42"})).unwrap();
+    assert_eq!(revision.id, "42");
+}
