@@ -4,6 +4,9 @@ version = "0.3.0"
 edition = "2024"
 description = "Rust port of Arcanist (arc)"
 license = "Apache-2.0"
+homepage = "https://github.com/hhh-pa/arcanist"
+repository = "https://github.com/hhh-pa/arcanist"
+keywords = ["arcanist", "phabricator", "cli"]
 autobins = false
 
 [[bin]]
