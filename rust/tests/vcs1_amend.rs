@@ -258,10 +258,8 @@ fn module_name_is_amend() {
 #[test]
 fn run_uses_current_dir() {
     let repo = Fixture::init_repo("run-contract");
-    let old = std::env::current_dir().unwrap();
-    std::env::set_current_dir(repo.path()).unwrap();
+    let _cwd = common::with_current_dir(repo.path());
     let code = amend::run(&args(&["-m", "from run", "--"]));
-    std::env::set_current_dir(&old).unwrap();
     assert_eq!(code, ExitCode::SUCCESS);
     assert_eq!(repo.git(&["log", "-1", "--format=%s"]), "from run");
 }

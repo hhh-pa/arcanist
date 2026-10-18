@@ -89,6 +89,33 @@ jobs:
           save-if: 'true'
       - run: cargo test --locked
 
+  loom:
+    name: loom concurrency models
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout
+      actions: write # cargo cache
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/profile-runner
+        with:
+          cache-key: runner-profile-${{ runner.os }}-${{ hashFiles('.github/actions/profile-runner/**', 'scripts/ci/go/go.mod', 'scripts/ci/go/cmd/runner-profile/**', 'scripts/ci/go/internal/executil/**') }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          save-if: 'true'
+      # T1176 MC: exhaustive interleaving checks over the crate's
+      # shared-state protocols (see rust/src/conduit_loom.rs). Models
+      # are compiled out of every other job.
+      - run: cargo test --locked --lib --features loom loom
+      - run: cargo clippy --locked --all-targets --features loom -- -D warnings
+
   quality-gates:
     name: quality gates
     runs-on: ubuntu-latest

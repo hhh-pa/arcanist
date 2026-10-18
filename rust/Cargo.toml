@@ -19,6 +19,15 @@ rsa = "0.9"
 serde_json = { version = "1", features = ["preserve_order"] }
 sha1 = { version = "0.10", features = ["oid"] }
 
+# Concurrency model checker (T1176 MC): enabled only by the loom CI job
+# via `--features loom`. Optional (never in default builds). A cargo
+# feature, not `--cfg loom`, which would leak into dependencies like
+# hyper-util and break their builds.
+loom = { version = "0.7", optional = true }
+
+[features]
+loom = ["dep:loom"]
+
 # Deny the `unused` lint group (unused_mut, dead_code, unused_imports,
 # ...) package-wide, on every platform/profile/target. Clippy's `-D
 # warnings` only runs on Linux, so without this Windows-only dead code
