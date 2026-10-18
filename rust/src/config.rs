@@ -7,61 +7,6 @@ use std::path::{Path, PathBuf};
 
 use crate::get_config;
 
-/// PC-1 serial-env lock: tests that must stage process-global env
-/// hold this across the whole mutate-assert-restore window, so staged
-/// values never leak into a sibling serial test. (Env reads outside
-/// the serial set stay racy by nature; the staged vars are read only
-/// on narrow paths no parallel test asserts on.)
-#[cfg(test)]
-pub(crate) static PC1_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Save/swap/restore one env var for a serial test: the original
-/// value (or absence) returns on drop, even when the test panics.
-#[cfg(test)]
-pub(crate) struct Pc1EnvGuard {
-    key: &'static str,
-    saved: Option<std::ffi::OsString>,
-}
-
-#[cfg(test)]
-impl Pc1EnvGuard {
-    /// Stage `value` for `key`, saving the current setting.
-    pub(crate) fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
-        let saved = std::env::var_os(key);
-        // SAFETY: the caller holds PC1_ENV_LOCK, serializing PC-1
-        // staged mutations against each other; Drop restores below.
-        unsafe { std::env::set_var(key, value) };
-        Self { key, saved }
-    }
-
-    /// Remove `key`, saving the current setting.
-    pub(crate) fn remove(key: &'static str) -> Self {
-        let saved = std::env::var_os(key);
-        // SAFETY: same lock discipline as `set`.
-        unsafe { std::env::remove_var(key) };
-        Self { key, saved }
-    }
-
-    /// The value `key` had before staging (`None` when unset).
-    pub(crate) fn saved(&self) -> Option<&std::ffi::OsStr> {
-        self.saved.as_deref()
-    }
-}
-
-#[cfg(test)]
-impl Drop for Pc1EnvGuard {
-    fn drop(&mut self) {
-        // SAFETY: same lock discipline as `set`; restore keeps the
-        // staged value from leaking past the test window.
-        unsafe {
-            match &self.saved {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-}
-
 pub fn arcrc_path() -> Option<PathBuf> {
     #[cfg(windows)]
     let home_src = std::env::var_os("USERPROFILE");

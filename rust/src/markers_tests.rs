@@ -327,9 +327,6 @@ fn land26_command_sections_truncate_like_php() {
 
 #[test]
 fn land25_bundled_extension_materializes() {
-    // Serial with the PC-1 `ARC_HG_EXTENSION` staging test: a staged
-    // extension would shadow the bundled copy under test here.
-    let _serial = pc1_serial();
     // Outside any checkout the bundled `arc-hg.py` copy resolves,
     // with the compiled-in bytes on disk — and a deleted copy
     // reinstalls on the next call. One test (not two): the target
@@ -996,8 +993,6 @@ fn t1170_query_git_markers_filters_type_and_marks_current() {
 
 #[test]
 fn t1170_arc_hg_script_prefers_checkout_copy() {
-    // Serial with the PC-1 `ARC_HG_EXTENSION` staging test (see above).
-    let _serial = pc1_serial();
     let root = TempDir::new("archg");
     let nested = root.path().join("a").join("b");
     let script = root.path().join("support").join("hg").join("arc-hg.py");
@@ -1875,14 +1870,8 @@ fn run_in_maps_auth_failures_to_login_guidance() {
 }
 
 // -( T1176 PC-1: env-globals )------------------------------------------------
-
-/// Take the PC-1 serial-env lock, tolerating a poisoned mutex (a
-/// panicked sibling still restored its var via its guard's `Drop`).
-fn pc1_serial() -> std::sync::MutexGuard<'static, ()> {
-    crate::config::PC1_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
+// (Child-process env staging needs no serial lock: the parent
+// environment is never mutated.)
 
 #[test]
 #[cfg(unix)]
@@ -1924,25 +1913,85 @@ fn pc1_adopt_installed_copy_matches_bytes() {
     assert_eq!(adopt_installed_copy(&tmp.path().join("missing.py")), None);
 }
 
+/// Spawn this test binary with `vars` set, running only `probe`
+/// (child-process env staging: no in-process mutation, no `unsafe`).
+fn spawn_probe_env(probe: &str, vars: &[(&str, &str)]) -> (bool, String, String) {
+    let exe = std::env::current_exe().expect("test binary path");
+    let mut command = std::process::Command::new(&exe);
+    for (key, value) in vars {
+        command.env(key, value);
+    }
+    let out = command
+        .args(["--nocapture", probe])
+        .output()
+        .expect("spawn probe child");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// Assert a probe child passed and printed its marker.
+fn assert_probe_env_ok(probe: &str, vars: &[(&str, &str)], marker: &str) {
+    let (success, stdout, stderr) = spawn_probe_env(probe, vars);
+    assert!(
+        success && stdout.contains("1 passed") && stdout.contains(marker),
+        "{probe} child failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+}
+
+#[test]
+fn pc1_arc_hg_extension_probe() {
+    if std::env::var("ARC_RS_PC1_HGEXT_CHILD").as_deref() != Ok("1") {
+        println!("PC1-HGEXT-PROBE-OK");
+        return;
+    }
+    let dir = PathBuf::from(std::env::var_os("ARC_RS_PC1_HGEXT_DIR").expect("probe dir"));
+    let staged = std::env::var_os("ARC_HG_EXTENSION").expect("staged extension");
+    let case = std::env::var("ARC_RS_PC1_HGEXT_CASE").expect("probe case");
+    if case == "file" {
+        assert_eq!(arc_hg_script(&dir), Some(PathBuf::from(staged)));
+    } else {
+        // A staged path that is not a file falls through to the
+        // checkout search and the bundled copy.
+        let resolved = arc_hg_script(&dir).expect("bundled copy resolves");
+        assert_ne!(resolved, PathBuf::from(staged));
+    }
+    println!("PC1-HGEXT-PROBE-OK");
+}
+
 #[test]
 fn pc1_arc_hg_extension_env_wins() {
-    // Serial: staging ARC_HG_EXTENSION is process-global mutation.
-    let _serial = pc1_serial();
     let tmp = TempDir::new("pc1-hg-ext");
     let staged = tmp.path().join("staged-hg.py");
     std::fs::write(&staged, "# staged extension").unwrap();
-    let guard = crate::config::Pc1EnvGuard::set("ARC_HG_EXTENSION", staged.as_os_str());
-    assert_eq!(arc_hg_script(tmp.path()), Some(staged));
-    drop(guard);
-    // A staged path that is not a file falls through to the checkout
-    // search and the bundled copy.
-    let guard = crate::config::Pc1EnvGuard::set(
-        "ARC_HG_EXTENSION",
-        tmp.path().join("missing.py").as_os_str(),
+    let dir = tmp.path().to_str().expect("utf8 dir").to_string();
+    let staged_str = staged.to_str().expect("utf8 staged").to_string();
+    assert_probe_env_ok(
+        "pc1_arc_hg_extension_probe",
+        &[
+            ("ARC_RS_PC1_HGEXT_CHILD", "1"),
+            ("ARC_RS_PC1_HGEXT_CASE", "file"),
+            ("ARC_RS_PC1_HGEXT_DIR", dir.as_str()),
+            ("ARC_HG_EXTENSION", staged_str.as_str()),
+        ],
+        "PC1-HGEXT-PROBE-OK",
     );
-    let resolved = arc_hg_script(tmp.path()).expect("bundled copy resolves");
-    assert_ne!(resolved, tmp.path().join("missing.py"));
-    let saved = guard.saved().map(|value| value.to_os_string());
-    drop(guard);
-    assert_eq!(std::env::var_os("ARC_HG_EXTENSION"), saved);
+    let missing = tmp
+        .path()
+        .join("missing.py")
+        .to_str()
+        .expect("utf8 missing")
+        .to_string();
+    assert_probe_env_ok(
+        "pc1_arc_hg_extension_probe",
+        &[
+            ("ARC_RS_PC1_HGEXT_CHILD", "1"),
+            ("ARC_RS_PC1_HGEXT_CASE", "missing"),
+            ("ARC_RS_PC1_HGEXT_DIR", dir.as_str()),
+            ("ARC_HG_EXTENSION", missing.as_str()),
+        ],
+        "PC1-HGEXT-PROBE-OK",
+    );
 }
