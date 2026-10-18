@@ -674,9 +674,26 @@ fn release_url_shapes() {
         "http://127.0.0.1:9/repos/o/r/releases/latest"
     );
     assert!(platform_tag().contains('-'));
+}
+
+#[test]
+fn triple_for_maps_consts_to_release_triples() {
+    for (os, arch, want) in [
+        ("linux", "x86_64", "x86_64-unknown-linux-gnu"),
+        ("linux", "aarch64", "aarch64-unknown-linux-gnu"),
+        ("macos", "x86_64", "x86_64-apple-darwin"),
+        ("macos", "aarch64", "aarch64-apple-darwin"),
+        ("windows", "x86_64", "x86_64-pc-windows-msvc"),
+        ("windows", "aarch64", "aarch64-pc-windows-msvc"),
+        // Unmapped platforms fall back to `os-arch`, matching no
+        // real asset (clean no-asset error downstream).
+        ("plan9", "arm", "plan9-arm"),
+    ] {
+        assert_eq!(triple_for(os, arch), want, "{os}-{arch}");
+    }
     assert_eq!(
         platform_tag(),
-        format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+        triple_for(std::env::consts::OS, std::env::consts::ARCH)
     );
 }
 
@@ -686,45 +703,58 @@ fn select_asset_prefers_exact_platform() {
         "tag_name": "v9.9.9",
         "assets": [
             {"name": "checksums.txt", "size": 100, "browser_download_url": "http://x/sums"},
-            {"name": "arc-linux-x86_64", "size": 10, "browser_download_url": "http://x/lin"},
-            {"name": "arc-windows-x86_64.exe", "size": 20, "browser_download_url": "http://x/win"},
+            {"name": "arc-x86_64-unknown-linux-gnu.tar.gz", "size": 10, "browser_download_url": "http://x/lin"},
+            {"name": "arc-x86_64-pc-windows-msvc.tar.gz", "size": 20, "browser_download_url": "http://x/win"},
         ]
     });
-    let win = select_asset(&doc, "windows-x86_64").unwrap();
+    let win = select_asset(&doc, "x86_64-pc-windows-msvc").unwrap();
     assert_eq!(win.url, "http://x/win");
     assert_eq!(win.size, 20);
-    let lin = select_asset(&doc, "linux-x86_64").unwrap();
+    let lin = select_asset(&doc, "x86_64-unknown-linux-gnu").unwrap();
     assert_eq!(lin.url, "http://x/lin");
+    // Tarball wins over the raw layouts when several match.
+    let doc = serde_json::json!({
+        "tag_name": "v9.9.9",
+        "assets": [
+            {"name": "arc-x86_64-unknown-linux-gnu", "size": 1, "browser_download_url": "http://x/raw"},
+            {"name": "arc-x86_64-unknown-linux-gnu.tar.gz", "size": 2, "browser_download_url": "http://x/tgz"},
+        ]
+    });
+    let pick = select_asset(&doc, "x86_64-unknown-linux-gnu").unwrap();
+    assert_eq!(pick.url, "http://x/tgz");
 }
 
 #[test]
-fn select_asset_falls_back_to_lone_candidate() {
+fn select_asset_rejects_lone_foreign_asset() {
+    // No lone-asset fallback: a lone `arc-*` asset is most likely a
+    // foreign platform's binary, and installing one bricks arc.
     let doc = serde_json::json!({
         "tag_name": "v9.9.9",
         "assets": [
             {"name": "arc-mystery", "size": 7, "browser_download_url": "http://x/only"},
         ]
     });
-    let only = select_asset(&doc, "plan9-arm").unwrap();
-    assert_eq!(only.url, "http://x/only");
+    let err = select_asset(&doc, "plan9-arm").unwrap_err();
+    assert!(err.contains("no exact asset"), "{err}");
+    assert!(err.contains("arc-mystery"), "{err}");
 }
 
 #[test]
 fn select_asset_refuses_missing_and_ambiguous() {
     let empty = serde_json::json!({"tag_name": "v9", "assets": []});
-    let err = select_asset(&empty, "windows-x86_64").unwrap_err();
+    let err = select_asset(&empty, "x86_64-pc-windows-msvc").unwrap_err();
     assert!(err.contains("no installable asset"), "{err}");
 
     // Malformed entries (missing name/URL, zero size) never qualify.
     let bad = serde_json::json!({
         "tag_name": "v9",
         "assets": [
-            {"name": "arc-windows-x86_64.exe", "size": 0, "browser_download_url": "http://x/e"},
+            {"name": "arc-x86_64-pc-windows-msvc.tar.gz", "size": 0, "browser_download_url": "http://x/e"},
             {"name": "", "size": 5, "browser_download_url": "http://x/n"},
             {"name": "arc-x", "size": 5},
         ]
     });
-    let err = select_asset(&bad, "windows-x86_64").unwrap_err();
+    let err = select_asset(&bad, "x86_64-pc-windows-msvc").unwrap_err();
     assert!(err.contains("no installable asset"), "{err}");
 
     let multi = serde_json::json!({
@@ -734,16 +764,100 @@ fn select_asset_refuses_missing_and_ambiguous() {
             {"name": "arc-b", "size": 2, "browser_download_url": "http://x/b"},
         ]
     });
-    let err = select_asset(&multi, "windows-x86_64").unwrap_err();
+    let err = select_asset(&multi, "x86_64-pc-windows-msvc").unwrap_err();
     assert!(err.contains("candidates: arc-a, arc-b"), "{err}");
 
     let no_list = serde_json::json!({"tag_name": "v9"});
-    let err = select_asset(&no_list, "windows-x86_64").unwrap_err();
+    let err = select_asset(&no_list, "x86_64-pc-windows-msvc").unwrap_err();
     assert!(err.contains("no \"assets\" list"), "{err}");
 
     let no_tag = serde_json::json!({"assets": []});
     let err = release_tag(&no_tag).unwrap_err();
     assert!(err.contains("no \"tag_name\""), "{err}");
+}
+
+/// Gzip-compress `data` in memory (upgrade fixtures).
+fn gzip_bytes(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// Build a gzip-compressed tarball in memory: `files` are regular
+/// members, `dirs` directory members (upgrade fixtures).
+fn tarball_bytes(files: &[(&str, &[u8])], dirs: &[&str]) -> Vec<u8> {
+    let mut tar_data = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_data);
+        for dir in dirs {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_size(0);
+            header.set_cksum();
+            builder.append_data(&mut header, dir, &b""[..]).unwrap();
+        }
+        for (name, data) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_cksum();
+            builder.append_data(&mut header, name, *data).unwrap();
+        }
+    }
+    gzip_bytes(&tar_data)
+}
+
+#[test]
+fn installable_bytes_passes_raw_through() {
+    assert_eq!(
+        installable_bytes(b"raw-binary-bytes").unwrap(),
+        b"raw-binary-bytes"
+    );
+    // Too short for gzip magic: raw, not an error.
+    assert_eq!(installable_bytes(b"x").unwrap(), b"x");
+    assert_eq!(installable_bytes(b"").unwrap(), b"");
+}
+
+#[test]
+fn installable_bytes_extracts_tarball_member() {
+    let member = exe_member_name();
+    // Non-matching members and directories are skipped.
+    let tgz = tarball_bytes(
+        &[(member, b"new-binary"), ("README.md", b"notes")],
+        &["docs"],
+    );
+    assert_eq!(installable_bytes(&tgz).unwrap(), b"new-binary");
+    // Nested paths match on the file name.
+    let nested = format!("pkg/{member}");
+    let tgz = tarball_bytes(&[(nested.as_str(), b"n")], &[]);
+    assert_eq!(installable_bytes(&tgz).unwrap(), b"n");
+}
+
+#[test]
+fn extract_archive_member_rejects_corrupt_and_wrong() {
+    // Gzip of non-tar garbage: entry iteration fails.
+    let garbage = gzip_bytes(b"not a tarball at all, just text padding......");
+    let err = extract_archive_member(&garbage, "arc").unwrap_err();
+    assert!(err.contains("cannot read release archive"), "{err}");
+    // Valid header, truncated data: member read fails. Large,
+    // incompressible member data pins the cut inside the member.
+    let big: Vec<u8> = (0..3000).map(|i| (i * 7919 % 251) as u8).collect();
+    let mut full = tarball_bytes(&[("arc", &big)], &[]);
+    full.truncate(full.len() - 100);
+    let err = extract_archive_member(&full, "arc").unwrap_err();
+    assert!(err.contains("cannot read release archive"), "{err}");
+    // No matching member.
+    let tgz = tarball_bytes(&[("README", b"x")], &[]);
+    let err = extract_archive_member(&tgz, "arc").unwrap_err();
+    assert!(err.contains("has no arc member"), "{err}");
+    // Empty member installs nothing.
+    let tgz = tarball_bytes(&[("arc", b"")], &[]);
+    let err = extract_archive_member(&tgz, "arc").unwrap_err();
+    assert!(err.contains("is empty"), "{err}");
+    // Two matches: refuse to guess.
+    let tgz = tarball_bytes(&[("arc", b"one"), ("sub/arc", b"two")], &[]);
+    let err = extract_archive_member(&tgz, "arc").unwrap_err();
+    assert!(err.contains("several arc members"), "{err}");
 }
 
 #[test]
@@ -1001,18 +1115,19 @@ fn detail_lines_are_plain_and_escaped() {
 fn execute_apply_updates_copy_end_to_end() {
     let tmp = TempDir::new("e2e");
     let exe = exe_copy(&tmp.path, "tool-copy.exe", b"old-bytes");
-    let body = b"new-binary-bytes-v999";
-    let name = format!("arc-{}.exe", platform_tag());
+    // The real release layout: a tarball holding the executable.
+    let body = tarball_bytes(&[(exe_member_name(), b"new-binary-bytes-v999")], &[]);
+    let name = format!("arc-{}.tar.gz", platform_tag());
     let (listener, base, seen) = mock_listener();
     let doc = release_doc(
         "v9.9.9",
-        &format!("[{}]", asset_entry_checked(&name, body, &base)),
+        &format!("[{}]", asset_entry_checked(&name, &body, &base)),
     );
     run_mock(
         listener,
         vec![
             json_route("releases/latest", &doc),
-            route("/dl/", "200 OK", body.to_vec()),
+            route("/dl/", "200 OK", body.clone()),
         ],
         seen.clone(),
     );
@@ -1023,7 +1138,7 @@ fn execute_apply_updates_copy_end_to_end() {
     assert_eq!(report.latest, "v9.9.9");
     assert_eq!(report.repo, DEFAULT_RELEASE_REPO);
     assert_eq!(report.channel, "stable");
-    assert_eq!(std::fs::read(&exe).unwrap(), body);
+    assert_eq!(std::fs::read(&exe).unwrap(), b"new-binary-bytes-v999");
     assert!(
         report
             .stdout_text
@@ -1061,8 +1176,35 @@ fn execute_apply_updates_copy_end_to_end() {
     assert_eq!(json["latest"], serde_json::json!("v9.9.9"));
     assert_eq!(
         json["asset"]["digest"],
-        serde_json::json!(format!("sha256:{}", sha256_hex(body)))
+        serde_json::json!(format!("sha256:{}", sha256_hex(&body)))
     );
+}
+
+#[test]
+fn execute_apply_refuses_corrupt_tarball_without_touching_exe() {
+    let tmp = TempDir::new("e2e-corrupt");
+    let exe = exe_copy(&tmp.path, "tool-copy.exe", b"old-bytes");
+    let body = gzip_bytes(b"not a tarball at all, just text padding......");
+    let name = format!("arc-{}.tar.gz", platform_tag());
+    let (listener, base, seen) = mock_listener();
+    let doc = release_doc(
+        "v9.9.9",
+        &format!("[{}]", asset_entry_checked(&name, &body, &base)),
+    );
+    run_mock(
+        listener,
+        vec![
+            json_route("releases/latest", &doc),
+            route("/dl/", "200 OK", body.clone()),
+        ],
+        seen.clone(),
+    );
+    let opts = apply_opts(&base, "0.1.0", &exe);
+    let err = execute_apply(&tmp.path, &opts, &confirm_yes).unwrap_err();
+    assert!(err.contains("cannot read release archive"), "{err}");
+    // The live executable is untouched; no staging leftovers.
+    assert_eq!(std::fs::read(&exe).unwrap(), b"old-bytes");
+    assert_no_leftovers(&tmp.path);
 }
 
 #[test]

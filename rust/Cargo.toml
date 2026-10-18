@@ -17,6 +17,7 @@ regex = "1"
 reqwest = { version = "0.12", features = ["blocking"] }
 rsa = "0.9"
 serde_json = { version = "1", features = ["preserve_order"] }
+tar = "0.4"
 sha1 = { version = "0.10", features = ["oid"] }
 
 # Concurrency model checker (T1176 MC): enabled only by the loom CI job
