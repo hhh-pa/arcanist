@@ -713,11 +713,10 @@ fn linters_l26_probe_honors_configured_bin() {
     // The `.arclint` `bin` reaches the configured set without probing.
     // The bin must be absolute on every platform (a bare `/...` is
     // drive-relative on Windows and resolves against the project root).
-    let bin = if cfg!(windows) {
-        "C:/custom/flake8" // LCOV_EXCL_LINE // Reason: windows-only fixture path; cfg!(windows) is false on ubuntu CI
-    } else {
-        "/custom/flake8"
-    };
+    #[cfg(windows)]
+    let bin = "C:/custom/flake8";
+    #[cfg(not(windows))]
+    let bin = "/custom/flake8";
     let dir = std::env::temp_dir().join(format!("linters-bin-{}", std::process::id()));
     std::fs::create_dir_all(dir.join(".git")).unwrap();
     std::fs::write(

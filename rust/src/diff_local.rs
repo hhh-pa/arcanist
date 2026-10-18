@@ -5771,18 +5771,21 @@ fn resolve_list_path(base: &Path, path: &str) -> String {
     let mut rooted = false;
     for component in joined.components() {
         match component {
-            // LCOV_EXCL_START // Reason: dead on ubuntu; Component::Prefix only occurs in Windows paths
+            #[cfg(windows)]
             std::path::Component::Prefix(prefix) => {
                 parts.push(prefix.as_os_str().to_string_lossy().into_owned());
-            } // LCOV_EXCL_STOP
+            }
             std::path::Component::RootDir => rooted = true,
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
                 parts.pop();
             }
-            std::path::Component::Normal(part) => {
-                parts.push(part.to_string_lossy().into_owned());
-            }
+            // `Normal` on every platform: `Prefix` matches above on
+            // Windows and is unconstructible elsewhere, so the
+            // wildcard's only reachable input is `Normal` (and the
+            // arm stays covered without a fallback line that could
+            // never execute where gates measure).
+            other => parts.push(other.as_os_str().to_string_lossy().into_owned()),
         }
     }
     let mut out = parts.join("/");
@@ -6211,12 +6214,15 @@ pub fn svn_working_copy_root(cwd: &Path) -> PathBuf {
 /// PHP's `$root.'/../scripts/repository/binary_safe_diff.sh'`.
 #[must_use]
 pub fn default_svn_diff_cmd() -> Option<PathBuf> {
-    if cfg!(windows) {
-        return None; // LCOV_EXCL_LINE // Reason: windows-only early return; cfg!(windows) is false on ubuntu CI
-    }
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    Some(dir.join("../scripts/repository/binary_safe_diff.sh"))
+    #[cfg(windows)]
+    let out = None;
+    #[cfg(not(windows))]
+    let out = {
+        let exe = std::env::current_exe().ok()?;
+        let dir = exe.parent()?;
+        Some(dir.join("../scripts/repository/binary_safe_diff.sh"))
+    };
+    out
 }
 
 /// Collect submit-ready parsed changes from an svn working copy.

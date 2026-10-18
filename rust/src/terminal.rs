@@ -645,10 +645,13 @@ pub fn tsprintf(pattern: &str, args: &[TVal]) -> Result<TerminalString, String> 
     tsprintf_ansi(pattern, args, ansi_enabled())
 }
 
+#[cfg(windows)]
 fn tput_columns() -> usize {
-    if cfg!(windows) {
-        return 0; // LCOV_EXCL_LINE // Reason: windows-only early return; cfg!(windows) is false on ubuntu CI
-    }
+    0
+}
+
+#[cfg(not(windows))]
+fn tput_columns() -> usize {
     let Ok(output) = crate::proc_env::command("tput").arg("cols").output() else {
         return 0; // LCOV_EXCL_LINE // Reason: tput is present on ubuntu CI; the spawn-failure arm never runs
     };
@@ -716,9 +719,14 @@ pub fn ansi_enabled() -> bool {
     } else {
         term
     };
-    if cfg!(windows) && term != "cygwin" && term != "ansi" {
-        return false; // LCOV_EXCL_LINE // Reason: windows-only early return; cfg!(windows) is false on ubuntu CI
+    #[cfg(windows)]
+    if term != "cygwin" && term != "ansi" {
+        return false;
     }
+    // `term` only gates the Windows early return above; keep it observed
+    // off Windows so the binding stays live on every target.
+    #[cfg(not(windows))]
+    let _ = &term;
     use std::io::IsTerminal;
     std::io::stdout().is_terminal()
 }

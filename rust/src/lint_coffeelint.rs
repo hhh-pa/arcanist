@@ -243,13 +243,16 @@ fn has_extension(path: &str, allowed: &[&str]) -> bool {
 
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
-    let mut candidates = vec![name.to_string()];
-    if cfg!(windows) {
-        // LCOV_EXCL_START // Reason: windows-only PATH probe; cfg!(windows) is false on ubuntu CI
+    #[cfg(windows)]
+    let candidates = {
+        let mut candidates = vec![name.to_string()];
         for ext in ["exe", "cmd", "bat"] {
             candidates.push(format!("{name}.{ext}"));
-        } // LCOV_EXCL_STOP
-    }
+        }
+        candidates
+    };
+    #[cfg(not(windows))]
+    let candidates = vec![name.to_string()];
     for dir in std::env::split_paths(&path_var) {
         for candidate in &candidates {
             let full = dir.join(candidate);

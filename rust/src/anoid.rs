@@ -94,12 +94,12 @@ pub fn find_on_path(path_env: &std::ffi::OsStr, binary: &str) -> Option<PathBuf>
         if candidate.is_file() {
             return Some(candidate);
         }
-        if cfg!(windows) {
-            let exe = dir.join(format!("{binary}.exe")); // LCOV_EXCL_LINE // Reason: windows-only .exe probe; cfg!(windows) is false on ubuntu CI
-            // LCOV_EXCL_START // Reason: windows-only .exe probe; cfg!(windows) is false on ubuntu CI
+        #[cfg(windows)]
+        {
+            let exe = dir.join(format!("{binary}.exe"));
             if exe.is_file() {
                 return Some(exe);
-            } // LCOV_EXCL_STOP
+            }
         }
     }
     None
@@ -107,11 +107,11 @@ pub fn find_on_path(path_env: &std::ffi::OsStr, binary: &str) -> Option<PathBuf>
 
 /// Candidate interpreter names: stock Windows installs call it `python`.
 fn interpreter_candidates() -> &'static [&'static str] {
-    if cfg!(windows) {
-        &["python3", "python"] // LCOV_EXCL_LINE // Reason: windows-only python fallback; cfg!(windows) is false on ubuntu CI
-    } else {
-        &["python3"]
-    }
+    #[cfg(windows)]
+    let out: &'static [&'static str] = &["python3", "python"];
+    #[cfg(not(windows))]
+    let out: &'static [&'static str] = &["python3"];
+    out
 }
 
 /// Locate a Python 3 interpreter on the real `$PATH`.

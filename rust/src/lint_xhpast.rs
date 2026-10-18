@@ -283,11 +283,12 @@ fn find_on_path(path_env: &std::ffi::OsStr, binary: &str) -> Option<PathBuf> {
         if candidate.is_file() {
             return Some(candidate);
         }
-        if cfg!(windows) {
-            let exe = dir.join(format!("{binary}.exe")); // LCOV_EXCL_START // Reason: windows-only .exe probe; cfg!(windows) is false on ubuntu CI
+        #[cfg(windows)]
+        {
+            let exe = dir.join(format!("{binary}.exe"));
             if exe.is_file() {
                 return Some(exe);
-            } // LCOV_EXCL_STOP
+            }
         }
     }
     None

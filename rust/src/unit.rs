@@ -1690,11 +1690,10 @@ pub fn binary_exists(name: &str) -> bool {
 #[must_use]
 pub fn resolve_binary_path(name: &str) -> Option<String> {
     let path_var = std::env::var_os("PATH")?;
-    let extensions: &[&str] = if cfg!(windows) {
-        &["", ".exe", ".bat", ".cmd"] // LCOV_EXCL_LINE // Reason: windows arm; cfg!(windows) is false on ubuntu CI
-    } else {
-        &[""]
-    };
+    #[cfg(windows)]
+    let extensions: &[&str] = &["", ".exe", ".bat", ".cmd"];
+    #[cfg(not(windows))]
+    let extensions: &[&str] = &[""];
     for dir in std::env::split_paths(&path_var) {
         for ext in extensions {
             let candidate = dir.join(format!("{name}{ext}"));

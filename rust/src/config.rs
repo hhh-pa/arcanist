@@ -8,11 +8,11 @@ use std::path::{Path, PathBuf};
 use crate::get_config;
 
 pub fn arcrc_path() -> Option<PathBuf> {
-    let home = if cfg!(windows) {
-        std::env::var_os("USERPROFILE") // LCOV_EXCL_LINE // Reason: windows arm; cfg!(windows) is false on ubuntu CI
-    } else {
-        std::env::var_os("HOME")
-    }?; // LCOV_EXCL_LINE // Reason: early-return needs HOME unset; unsetting env is process-global mutation
+    #[cfg(windows)]
+    let home_src = std::env::var_os("USERPROFILE");
+    #[cfg(not(windows))]
+    let home_src = std::env::var_os("HOME");
+    let home = home_src?; // LCOV_EXCL_LINE // Reason: early-return needs HOME unset; unsetting env is process-global mutation
     Some(PathBuf::from(home).join(".arcrc"))
 }
 

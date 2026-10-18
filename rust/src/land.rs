@@ -1831,15 +1831,17 @@ fn parse_string_config(value: &serde_json::Value) -> Option<String> {
 
 /// System-wide config file (`ArcanistConfigurationEngine.php:39-50`).
 fn system_config_path() -> PathBuf {
-    if cfg!(windows) {
-        let root = std::env::var("ProgramData").unwrap_or_default(); // LCOV_EXCL_START // Reason: windows arm; cfg!(windows) is false on ubuntu CI
+    #[cfg(windows)]
+    let path = {
+        let root = std::env::var("ProgramData").unwrap_or_default();
         PathBuf::from(root)
             .join("Phabricator")
             .join("Arcanist")
-            .join("config") // LCOV_EXCL_STOP
-    } else {
-        PathBuf::from("/etc/arcconfig")
-    }
+            .join("config")
+    };
+    #[cfg(not(windows))]
+    let path = PathBuf::from("/etc/arcconfig");
+    path
 }
 
 /// Load saved prompt responses from every configuration source.

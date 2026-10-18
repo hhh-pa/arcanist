@@ -249,11 +249,12 @@ fn find_on_path(path_env: &std::ffi::OsStr, binary: &str) -> Option<PathBuf> {
         if candidate.is_file() {
             return Some(candidate);
         }
-        if cfg!(windows) {
-            let exe = dir.join(format!("{binary}.exe")); // LCOV_EXCL_START // Reason: windows-only .exe probe; cfg!(windows) is false on ubuntu CI
+        #[cfg(windows)]
+        {
+            let exe = dir.join(format!("{binary}.exe"));
             if exe.is_file() {
                 return Some(exe);
-            } // LCOV_EXCL_STOP
+            }
         }
     }
     None
@@ -274,14 +275,19 @@ fn resolve_command_in(
         .filter(|path| path.is_file())
         .map(Path::to_path_buf)
         .or_else(|| find_on_path(path_env, binary_name()))?;
-    let mut prefix = command_flags_for(settings);
-    if cfg!(windows) {
-        Some((cslint, prefix)) // LCOV_EXCL_LINE // Reason: windows direct-exec arm; cfg!(windows) is false on ubuntu CI
-    } else {
+    #[cfg(windows)]
+    let out = {
+        let prefix = command_flags_for(settings);
+        Some((cslint, prefix))
+    };
+    #[cfg(not(windows))]
+    let out = {
+        let mut prefix = command_flags_for(settings);
         let mono = find_on_path(path_env, runtime_name())?;
         prefix.insert(0, cslint.to_string_lossy().into_owned());
         Some((mono, prefix))
-    }
+    };
+    out
 }
 
 /// Resolve the tool on the real `$PATH` with default settings; `None`

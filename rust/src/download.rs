@@ -470,11 +470,11 @@ pub fn download_bytes_with_timeout(url: &str, timeout: Duration) -> Result<Vec<u
 
 /// T1153 DL-D4: PHP `basename()` only strips `/` on Linux.
 fn basename(name: &str) -> &str {
-    if cfg!(windows) {
-        name.rsplit(['/', '\\']).next().unwrap_or(name) // LCOV_EXCL_LINE // Reason: windows-only basename arm; cfg!(windows) is false on ubuntu CI
-    } else {
-        name.rsplit('/').next().unwrap_or(name)
-    }
+    #[cfg(windows)]
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    #[cfg(not(windows))]
+    let base = name.rsplit('/').next().unwrap_or(name);
+    base
 }
 
 /// `Filesystem::pathExists()`: true for symlinks, even broken ones

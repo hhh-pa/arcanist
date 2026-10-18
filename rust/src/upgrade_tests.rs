@@ -1022,12 +1022,12 @@ fn install_replaces_copy() {
     let exe = exe_copy(&tmp.path, "tool-copy.exe", b"old-bytes");
     let backup = install_bytes_at(&exe, b"new-bytes").unwrap();
     assert_eq!(std::fs::read(&exe).unwrap(), b"new-bytes");
-    if cfg!(windows) {
-        let old = backup.expect("windows keeps the old image"); // LCOV_EXCL_START // Reason: windows-only assertions; cfg!(windows) is false on ubuntu CI
-        assert_eq!(std::fs::read(&old).unwrap(), b"old-bytes"); // LCOV_EXCL_STOP
-    } else {
-        assert!(backup.is_none());
-    }
+    #[cfg(windows)]
+    let old = backup.expect("windows keeps the old image");
+    #[cfg(windows)]
+    assert_eq!(std::fs::read(&old).unwrap(), b"old-bytes");
+    #[cfg(not(windows))]
+    assert!(backup.is_none());
     assert_no_leftovers(&tmp.path);
     #[cfg(unix)]
     {
@@ -1158,17 +1158,18 @@ fn execute_apply_updates_copy_end_to_end() {
     );
     assert!(saw(&seen, "releases/latest"));
     assert!(saw(&seen, "/dl/"));
-    if cfg!(windows) {
-        let backup = report.backup.clone().expect("windows keeps the old image"); // LCOV_EXCL_START // Reason: windows-only assertions; cfg!(windows) is false on ubuntu CI
-        assert_eq!(std::fs::read(&backup).unwrap(), b"old-bytes");
-        assert!(
-            report.stdout_text.contains("Previous executable kept as"), // LCOV_EXCL_STOP
-            "{:?}",
-            report.stdout_text
-        );
-    } else {
-        assert!(report.backup.is_none());
-    }
+    #[cfg(windows)]
+    let backup = report.backup.clone().expect("windows keeps the old image");
+    #[cfg(windows)]
+    assert_eq!(std::fs::read(&backup).unwrap(), b"old-bytes");
+    #[cfg(windows)]
+    assert!(
+        report.stdout_text.contains("Previous executable kept as"),
+        "{:?}",
+        report.stdout_text
+    );
+    #[cfg(not(windows))]
+    assert!(report.backup.is_none());
     assert_no_leftovers(&tmp.path);
     let json = apply_result_json(&report);
     assert_eq!(json["updated"], serde_json::json!(true));

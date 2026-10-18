@@ -85,11 +85,10 @@ fn windows_probes_exe_extension() {
     std::fs::write(tmp.path().join("python3.exe"), b"MZ").unwrap();
     let search = std::env::join_paths([tmp.path().to_path_buf()]).unwrap();
     let found = find_on_path(&search, "python3");
-    if cfg!(windows) {
-        assert_eq!(found, Some(tmp.path().join("python3.exe"))); // LCOV_EXCL_LINE // Reason: windows-only assertion; cfg!(windows) is false on ubuntu CI
-    } else {
-        assert_eq!(found, None);
-    }
+    #[cfg(windows)]
+    assert_eq!(found, Some(tmp.path().join("python3.exe")));
+    #[cfg(not(windows))]
+    assert_eq!(found, None);
 }
 
 #[test]

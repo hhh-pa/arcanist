@@ -87,11 +87,14 @@ fn command_lookup_needs_analyzer_and_runtime() {
     assert!(resolve_command_in(tmp.path().as_os_str(), None, settings).is_none());
     let cslint = tmp.path().join(binary_name());
     std::fs::write(&cslint, b"x").unwrap();
-    if cfg!(windows) {
-        let (program, prefix) = resolve_command_in(tmp.path().as_os_str(), None, settings).unwrap(); // LCOV_EXCL_START // Reason: windows-only assertions; cfg!(windows) is false on ubuntu CI
+    #[cfg(windows)]
+    {
+        let (program, prefix) = resolve_command_in(tmp.path().as_os_str(), None, settings).unwrap();
         assert_eq!(program, cslint);
-        assert_eq!(prefix, command_flags()); // LCOV_EXCL_STOP
-    } else {
+        assert_eq!(prefix, command_flags());
+    }
+    #[cfg(not(windows))]
+    {
         assert!(resolve_command_in(tmp.path().as_os_str(), None, settings).is_none());
         let mono = tmp.path().join(runtime_name());
         std::fs::write(&mono, b"x").unwrap();
@@ -110,25 +113,28 @@ fn existing_binary_hint_wins_over_path_lookup() {
     std::fs::write(&hint, b"x").unwrap();
     #[cfg(not(windows))]
     std::fs::write(tmp.path().join(runtime_name()), b"x").unwrap();
-    let (program, prefix) =
-        resolve_command_in(tmp.path().as_os_str(), Some(&hint), settings).unwrap();
-    if cfg!(windows) {
-        assert_eq!(program, hint); // LCOV_EXCL_LINE // Reason: windows-only assertion; cfg!(windows) is false on ubuntu CI
-    } else {
-        assert_eq!(prefix[0], hint.to_string_lossy());
-    }
+    #[cfg(windows)]
+    let (program, _) = resolve_command_in(tmp.path().as_os_str(), Some(&hint), settings).unwrap();
+    #[cfg(not(windows))]
+    let (_, prefix) = resolve_command_in(tmp.path().as_os_str(), Some(&hint), settings).unwrap();
+    #[cfg(windows)]
+    assert_eq!(program, hint);
+    #[cfg(not(windows))]
+    assert_eq!(prefix[0], hint.to_string_lossy());
     // A missing hint falls back to the `PATH` lookup, like PHP.
     let missing = tmp.path().join("no-such-cslint.exe");
     assert!(resolve_command_in(tmp.path().as_os_str(), Some(&missing), settings).is_none());
     let cslint = tmp.path().join(binary_name());
     std::fs::write(&cslint, b"x").unwrap();
-    let (program, prefix) =
+    #[cfg(windows)]
+    let (program, _) =
         resolve_command_in(tmp.path().as_os_str(), Some(&missing), settings).unwrap();
-    if cfg!(windows) {
-        assert_eq!(program, cslint); // LCOV_EXCL_LINE // Reason: windows-only assertion; cfg!(windows) is false on ubuntu CI
-    } else {
-        assert_eq!(prefix[0], cslint.to_string_lossy());
-    }
+    #[cfg(not(windows))]
+    let (_, prefix) = resolve_command_in(tmp.path().as_os_str(), Some(&missing), settings).unwrap();
+    #[cfg(windows)]
+    assert_eq!(program, cslint);
+    #[cfg(not(windows))]
+    assert_eq!(prefix[0], cslint.to_string_lossy());
 }
 
 #[test]

@@ -2899,22 +2899,22 @@ fn local_config_path(work: &WorkCopy) -> Option<PathBuf> {
 /// Default user layer path: `$HOME/.arcrc`, or `%APPDATA%/.arcrc` on
 /// Windows.
 fn default_user_config_path() -> Option<PathBuf> {
-    if cfg!(windows) {
-        std::env::var_os("APPDATA").map(|dir| Path::new(&dir).join(".arcrc")) // LCOV_EXCL_LINE // Reason: windows arm; cfg!(windows) is false on ubuntu CI
-    } else {
-        std::env::var_os("HOME").map(|dir| Path::new(&dir).join(".arcrc"))
-    }
+    #[cfg(windows)]
+    let path = std::env::var_os("APPDATA").map(|dir| Path::new(&dir).join(".arcrc"));
+    #[cfg(not(windows))]
+    let path = std::env::var_os("HOME").map(|dir| Path::new(&dir).join(".arcrc"));
+    path
 }
 
 /// Default system layer path: `/etc/arcconfig`, or
 /// `%ProgramData%/Phabricator/Arcanist/config` on Windows.
 fn default_system_config_path() -> Option<PathBuf> {
-    if cfg!(windows) {
-        std::env::var_os("ProgramData") // LCOV_EXCL_START // Reason: windows arm; cfg!(windows) is false on ubuntu CI
-            .map(|dir| Path::new(&dir).join("Phabricator/Arcanist/config")) // LCOV_EXCL_STOP
-    } else {
-        Some(PathBuf::from("/etc/arcconfig"))
-    }
+    #[cfg(windows)]
+    let path = std::env::var_os("ProgramData")
+        .map(|dir| Path::new(&dir).join("Phabricator/Arcanist/config"));
+    #[cfg(not(windows))]
+    let path = Some(PathBuf::from("/etc/arcconfig"));
+    path
 }
 
 /* -(  Base commits  )-------------------------------------------------------- */
@@ -3132,14 +3132,17 @@ fn normalize_lexical(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
-            Component::Prefix(prefix) => out.push(prefix.as_os_str()), // LCOV_EXCL_LINE // Reason: dead on ubuntu; Component::Prefix only occurs in Windows paths
+            #[cfg(windows)]
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
             Component::RootDir => out.push(Component::RootDir.as_os_str()),
             Component::CurDir => {}
             // `PathBuf::pop()` clamps at the root, like PHP.
             Component::ParentDir => {
                 out.pop();
             }
-            Component::Normal(part) => out.push(part),
+            // `Normal` on every platform: `Prefix` matches above on
+            // Windows and is unconstructible elsewhere.
+            other => out.push(other.as_os_str()),
         }
     }
     out
