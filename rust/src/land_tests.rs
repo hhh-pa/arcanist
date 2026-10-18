@@ -8173,3 +8173,334 @@ fn client_for_dir_discovers_from_target_defensive_ok_arm() {
         "no conduit URI",
     );
 }
+
+// T1176 S11c: full online Hg engine runs through one arg-dispatching
+// fake `hg` plus a loopback conduit stub. Unix-only: the fake is a
+// shell script driven via `sh` (no ambient `hg` runs in these tests).
+
+/// Fake node hashes (40 chars each): into commit, landing parent and
+/// child, saved local commit, and merged tip.
+#[cfg(unix)]
+const S11C_INTO: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+#[cfg(unix)]
+const S11C_PARENT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+#[cfg(unix)]
+const S11C_CHILD: &str = "cccccccccccccccccccccccccccccccccccccccc";
+#[cfg(unix)]
+const S11C_LOCAL: &str = "dddddddddddddddddddddddddddddddddddddddd";
+#[cfg(unix)]
+const S11C_TIP: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+/// TempDir plus the one fake `hg` answering every subcommand the S11c
+/// runs issue. Unhandled subcommands (or `log` revs) fail loudly,
+/// naming the gap.
+#[cfg(unix)]
+fn s11c_dir_and_hg(name: &str) -> (PathBuf, hg::HgCommand) {
+    let dir = temp_dir(name);
+    std::fs::create_dir(dir.join(".hg")).unwrap();
+    let body = format!(
+        "{rev_loop}\n\
+         if has bookmark; then exit 0; fi\n\
+         if has bookmarks; then printf ' * feat                      2:{child}\\n'; exit 0; fi\n\
+         if has branches; then printf 'default                        0:{into}\\n'; exit 0; fi\n\
+         if has identify; then exit 0; fi\n\
+         if has paths; then exit 0; fi\n\
+         if has pull; then exit 0; fi\n\
+         if has push; then exit 0; fi\n\
+         if has update; then exit 0; fi\n\
+         if has rebase; then exit 0; fi\n\
+         if has strip; then exit 0; fi\n\
+         if has status; then exit 0; fi\n\
+         if has branch; then printf 'default'; exit 0; fi\n\
+         if has log; then\n\
+           case \"$rev\" in\n\
+             feat) printf '{child}' ;;\n\
+             bm) printf '{into}' ;;\n\
+             .) printf '{local}' ;;\n\
+             tip) printf '{tip}' ;;\n\
+             *ancestors*) printf '{child}-{parent} -child work\\n{parent}-{into} -parent work' ;;\n\
+             {parent}) printf 'parent work\\n\\nDifferential Revision: D1' ;;\n\
+             {child}) printf 'child work' ;;\n\
+             *children*) printf '' ;;\n\
+             *) echo \"fake-hg: unhandled log rev: $rev\" >&2; exit 1 ;;\n\
+           esac\n\
+           exit 0\n\
+         fi\n\
+         echo \"fake-hg: unhandled: $*\" >&2\nexit 1\n",
+        rev_loop = FAKE_HG_REV_LOOP,
+        into = S11C_INTO,
+        parent = S11C_PARENT,
+        child = S11C_CHILD,
+        local = S11C_LOCAL,
+        tip = S11C_TIP,
+    );
+    let hg_cmd = fake_hg(&dir, "fakehg.sh", &body);
+    (dir, hg_cmd)
+}
+
+/// Serve canned conduit responses by method, recording each request's
+/// method in arrival order. Unknown methods fail loudly with
+/// `ERR-NO-ROUTE` so gaps surface as engine errors.
+#[cfg(unix)]
+fn s11c_serve_routes(
+    routes: std::collections::HashMap<String, String>,
+    expected: usize,
+) -> (String, std::sync::mpsc::Receiver<Vec<String>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for _ in 0..expected {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            let head_text = String::from_utf8_lossy(&head).to_string();
+            let len: usize = head_text
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(key, value)| {
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).unwrap();
+            let method = head_text
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .strip_prefix("/api/")
+                .unwrap_or("")
+                .to_string();
+            seen.push(method.clone());
+            let canned = routes.get(&method).cloned().unwrap_or_else(|| {
+                r#"{"result": null, "error_code": "ERR-NO-ROUTE", "error_info": "no stub route"}"#
+                    .to_string()
+            });
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                canned.len(),
+                canned
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+        tx.send(seen).unwrap();
+    });
+    (base, rx)
+}
+
+#[cfg(unix)]
+fn s11c_envelope(result: &str) -> String {
+    format!(r#"{{"result": {result}, "error_code": null}}"#)
+}
+
+/// The arcrc host key for a stub base, mirroring
+/// `config::host_key` (`{scheme}://{authority}/api/`).
+#[cfg(unix)]
+fn s11c_host_key_for(base: &str) -> String {
+    let after_scheme = base.split("://").nth(1).unwrap_or(base);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    let scheme = base.split("://").next().unwrap_or("https");
+    format!("{scheme}://{authority}/api/")
+}
+
+/// Fake arcrc granting a token for the stub `base`.
+#[cfg(unix)]
+fn s11c_fake_arcrc(dir: &Path, base: &str) -> PathBuf {
+    let path = dir.join("fake.arcrc");
+    let key = s11c_host_key_for(base);
+    std::fs::write(
+        &path,
+        format!(r#"{{"hosts": {{"{key}": {{"token": "x"}}}}}}"#),
+    )
+    .unwrap();
+    path
+}
+
+/// Accepted D1 row without a diff PHID (so the gates skip the
+/// buildable searches), self-authored by the stub viewer.
+#[cfg(unix)]
+fn s11c_d1_row() -> String {
+    r#"{"id": 1, "phid": "PHID-DREV-1", "fields": {"status": {"value": "accepted", "name": "Accepted", "closed": false}, "title": "Work 1", "authorPHID": "PHID-USER-a"}}"#
+        .to_string()
+}
+
+/// Engine options for the S11c runs: explicit source plus onto
+/// selections, stub conduit, and the fake arcrc (no HOME reads).
+#[cfg(unix)]
+fn s11c_options(base: &str, arcrc: &Path) -> Options {
+    Options {
+        refs: vec!["feat".to_string()],
+        onto: vec!["bm".to_string()],
+        onto_remote: Some("default".to_string()),
+        conduit_uri: Some(base.to_string()),
+        arcrc_file: Some(arcrc.to_string_lossy().to_string()),
+        ..Options::default()
+    }
+}
+
+#[cfg(unix)]
+fn s11c_validated() -> Validated {
+    Validated {
+        strategy: Strategy::Squash,
+        revision: None,
+        revision_raw: None,
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn t1176_s11c_hg_engine_lands_through_fake_hg() {
+    let (dir, hg_cmd) = s11c_dir_and_hg("s11c-hg-land");
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "differential.revision.search".to_string(),
+        s11c_envelope(&format!(r#"{{"data": [{}]}}"#, s11c_d1_row())),
+    );
+    routes.insert("differential.query".to_string(), s11c_envelope("[]"));
+    routes.insert(
+        "user.whoami".to_string(),
+        s11c_envelope(r#"{"phid": "PHID-USER-a", "userName": "alice"}"#),
+    );
+    routes.insert("edge.search".to_string(), s11c_envelope(r#"{"data": []}"#));
+    routes.insert(
+        "differential.getcommitmessage".to_string(),
+        s11c_envelope(r#""Land D1: work""#),
+    );
+    let (base, rx) = s11c_serve_routes(routes, 5);
+    let arcrc = s11c_fake_arcrc(&dir, &base);
+    let options = s11c_options(&base, &arcrc);
+    let validated = s11c_validated();
+    let mut io = Io::canned(&["y", "y"]);
+    execute_engine_with(&dir, &hg_cmd, &options, Vcs::Hg, &validated, &mut io).unwrap();
+    assert!(io.out.stderr.contains("DONE"), "{}", io.out.stderr);
+    assert!(
+        io.out.stdout.contains("IMPLICIT COMMITS"),
+        "{}",
+        io.out.stdout
+    );
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(
+        seen,
+        vec![
+            "differential.revision.search",
+            "differential.query",
+            "user.whoami",
+            "edge.search",
+            "differential.getcommitmessage",
+        ]
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn t1176_s11c_hg_engine_declined_implicit_sets_aborts() {
+    let (dir, hg_cmd) = s11c_dir_and_hg("s11c-hg-decline");
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "differential.revision.search".to_string(),
+        s11c_envelope(&format!(r#"{{"data": [{}]}}"#, s11c_d1_row())),
+    );
+    routes.insert("differential.query".to_string(), s11c_envelope("[]"));
+    let (base, rx) = s11c_serve_routes(routes, 2);
+    let arcrc = s11c_fake_arcrc(&dir, &base);
+    let options = s11c_options(&base, &arcrc);
+    let validated = s11c_validated();
+    let mut io = Io::canned(&["n"]);
+    let err =
+        execute_engine_with(&dir, &hg_cmd, &options, Vcs::Hg, &validated, &mut io).unwrap_err();
+    assert_eq!(err, ABORT);
+    assert!(
+        io.out.stdout.contains("IMPLICIT COMMITS"),
+        "{}",
+        io.out.stdout
+    );
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(
+        seen,
+        vec!["differential.revision.search", "differential.query"]
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn s11c_stub_falls_back_on_unknown_method() {
+    use std::io::{Read, Write};
+    // Unrouted methods get ERR-NO-ROUTE (never a hang), covering
+    // the stub's fallback closure.
+    let (base, rx) = s11c_serve_routes(std::collections::HashMap::new(), 1);
+    let addr = base
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+    let mut stream = std::net::TcpStream::connect(addr).unwrap();
+    stream
+        .write_all(
+            b"POST /api/bogus.method HTTP/1.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        )
+        .unwrap();
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).unwrap();
+    assert!(reply.contains("ERR-NO-ROUTE"), "{reply}");
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(seen, vec!["bogus.method"]);
+}
+
+#[test]
+#[cfg(unix)]
+fn t1176_s11c_hg_engine_into_remote_checks_fetchable() {
+    // `--into` consults the fetchable closure (`hg paths <remote>`
+    // through the fake, exit 0) instead of defaulting the into
+    // remote; the land otherwise proceeds exactly like the no-flag
+    // run.
+    let (dir, hg_cmd) = s11c_dir_and_hg("s11c-hg-into");
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "differential.revision.search".to_string(),
+        s11c_envelope(&format!(r#"{{"data": [{}]}}"#, s11c_d1_row())),
+    );
+    routes.insert("differential.query".to_string(), s11c_envelope("[]"));
+    routes.insert(
+        "user.whoami".to_string(),
+        s11c_envelope(r#"{"phid": "PHID-USER-a", "userName": "alice"}"#),
+    );
+    routes.insert("edge.search".to_string(), s11c_envelope(r#"{"data": []}"#));
+    routes.insert(
+        "differential.getcommitmessage".to_string(),
+        s11c_envelope(r#""Land D1: work""#),
+    );
+    let (base, rx) = s11c_serve_routes(routes, 5);
+    let arcrc = s11c_fake_arcrc(&dir, &base);
+    let mut options = s11c_options(&base, &arcrc);
+    options.into_remote = Some("default".to_string());
+    let validated = s11c_validated();
+    let mut io = Io::canned(&["y", "y"]);
+    execute_engine_with(&dir, &hg_cmd, &options, Vcs::Hg, &validated, &mut io).unwrap();
+    assert!(io.out.stderr.contains("DONE"), "{}", io.out.stderr);
+    assert!(
+        io.out.stderr.contains("Will merge into remote \"default\""),
+        "{}",
+        io.out.stderr
+    );
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(
+        seen,
+        vec![
+            "differential.revision.search",
+            "differential.query",
+            "user.whoami",
+            "edge.search",
+            "differential.getcommitmessage",
+        ]
+    );
+}

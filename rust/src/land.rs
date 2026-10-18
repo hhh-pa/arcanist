@@ -6932,8 +6932,20 @@ fn execute_engine(
     validated: &Validated,
     io: &mut Io,
 ) -> Result<(), String> {
+    execute_engine_with(dir, &hg::HgCommand::system(), options, vcs, validated, io)
+}
+
+/// [`execute_engine`] driving `hg` through `hg_cmd` (test seam).
+fn execute_engine_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    options: &Options,
+    vcs: Vcs,
+    validated: &Validated,
+    io: &mut Io,
+) -> Result<(), String> {
     let squash = validated.strategy == Strategy::Squash;
-    let mut prep = prepare_engine_commits(dir, options, vcs, io)?;
+    let mut prep = prepare_engine_commits(dir, hg_cmd, options, vcs, io)?;
     let (cli, user_file) = load_options_for_run(options)?;
     let client = client_for_dir_with(
         options.conduit_uri.as_deref(),
@@ -6941,8 +6953,9 @@ fn execute_engine(
         user_file.as_deref(),
         &cli,
     )?;
-    let mut sets = build_sets(
+    let mut sets = build_sets_with(
         dir,
+        hg_cmd,
         io,
         vcs,
         validated,
@@ -6966,7 +6979,7 @@ fn execute_engine(
             &prep.commits,
             &prep.symbols_display,
             &hash_display_for(vcs),
-        )?; // LCOV_EXCL_LINE // Reason: needs a declined implicit-sets confirm in a full online engine run; no unit test stages that run
+        )?;
     }
     print_landing(io, &sets, &prep.commits, &hash_display_for(vcs));
     if options.preview {
@@ -6990,9 +7003,9 @@ fn execute_engine(
             &prep.commits,
             Some(&client),
         ),
-        // LCOV_EXCL_START // Reason: hg land flow; reaching it needs live conduit creds plus system hg
-        Vcs::Hg => land_hg(
+        Vcs::Hg => land_hg_with(
             dir,
+            hg_cmd,
             io,
             options,
             squash,
@@ -7003,7 +7016,7 @@ fn execute_engine(
             prep.hg_branch.as_deref(),
             &sets,
             &prep.commits,
-            Some(&client), // LCOV_EXCL_STOP
+            Some(&client),
         ),
     }
 }
@@ -7028,18 +7041,20 @@ struct EnginePrep {
 /// before any onto/into output.
 fn prepare_engine_commits(
     dir: &Path,
+    hg_cmd: &hg::HgCommand,
     options: &Options,
     vcs: Vcs,
     io: &mut Io,
 ) -> Result<EnginePrep, String> {
     // Sources, resolved first.
-    let raw_symbols = default_source_symbols(dir, options, vcs, io)?;
+    let raw_symbols = default_source_symbols_with(dir, hg_cmd, options, vcs, io)?;
     let symbols_display = display_symbols(&raw_symbols);
-    let resolved = resolve_sources(dir, io, vcs, &raw_symbols)?;
+    let resolved = resolve_sources_with(dir, hg_cmd, io, vcs, &raw_symbols)?;
     // Remotes, then commits.
     let (onto_remote, onto_refs, into_commit, into_ref, hg_branch) =
-        select_targets(dir, options, vcs, io, &raw_symbols)?;
-    let mut commits = select_source_commits(dir, vcs, &resolved, into_commit.as_deref())?;
+        select_targets_with(dir, hg_cmd, options, vcs, io, &raw_symbols)?;
+    let mut commits =
+        select_source_commits_with(dir, hg_cmd, vcs, &resolved, into_commit.as_deref())?;
     link_commits(&mut commits);
     let into_display = into_display_string(vcs, into_commit.as_deref());
     confirm_commit_count(
@@ -7149,8 +7164,20 @@ type TargetSelection = (
 
 /// Raw source symbols: explicit refs, else the VCS defaults
 /// (`ArcanistLandEngine.php:1106-1109`).
+#[cfg(test)]
 fn default_source_symbols(
     dir: &Path,
+    options: &Options,
+    vcs: Vcs,
+    io: &mut Io,
+) -> Result<Vec<String>, String> {
+    default_source_symbols_with(dir, &hg::HgCommand::system(), options, vcs, io)
+}
+
+/// [`default_source_symbols`] driving `hg` through `hg_cmd` (test seam).
+fn default_source_symbols_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
     options: &Options,
     vcs: Vcs,
     io: &mut Io,
@@ -7160,11 +7187,12 @@ fn default_source_symbols(
     }
     match vcs {
         Vcs::Git => git_default_symbols(dir, io),
-        Vcs::Hg => hg_default_symbols(dir, io),
+        Vcs::Hg => hg_default_symbols_with(dir, hg_cmd, io),
     }
 }
 
 /// Onto remote/refs and the into commit for resolved `raw` symbols, per VCS.
+#[cfg(test)]
 fn select_targets(
     dir: &Path,
     options: &Options,
@@ -7172,9 +7200,21 @@ fn select_targets(
     io: &mut Io,
     raw: &[String],
 ) -> Result<TargetSelection, String> {
+    select_targets_with(dir, &hg::HgCommand::system(), options, vcs, io, raw)
+}
+
+/// [`select_targets`] driving `hg` through `hg_cmd` (test seam).
+fn select_targets_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    options: &Options,
+    vcs: Vcs,
+    io: &mut Io,
+    raw: &[String],
+) -> Result<TargetSelection, String> {
     match vcs {
         Vcs::Git => select_git_targets(dir, options, io, raw),
-        Vcs::Hg => select_hg_targets(dir, options, io, raw),
+        Vcs::Hg => select_hg_targets_with(dir, hg_cmd, options, io, raw),
     }
 }
 
@@ -7200,6 +7240,7 @@ fn select_git_targets(
 }
 
 /// Mercurial onto remote/refs and the into commit for resolved `raw` symbols.
+#[cfg(test)]
 fn select_hg_targets(
     dir: &Path,
     options: &Options,
@@ -7216,16 +7257,48 @@ fn select_hg_targets(
     Ok((onto_remote, onto_refs, into_commit, None, branch)) // LCOV_EXCL_STOP
 }
 
+/// [`select_hg_targets`] driving `hg` through `hg_cmd` (test seam).
+fn select_hg_targets_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    options: &Options,
+    io: &mut Io,
+    _raw: &[String],
+) -> Result<TargetSelection, String> {
+    let onto_remote = hg_select_onto_remote_with(dir, hg_cmd, io, options)?;
+    let onto_refs = hg_select_onto_refs(dir, io, options)?;
+    let branch =
+        hg_confirm_onto_refs_with(dir, hg_cmd, io, &onto_remote, &onto_refs, options.hold)?;
+    let into_state = select_into_state(io, options, &onto_remote, &onto_refs, &|remote| {
+        hg::ok_with(dir, hg_cmd, &["paths", remote])
+    })?;
+    let into_commit =
+        hg_select_into_commit_with(dir, hg_cmd, io, &into_state, options.into.as_deref())?;
+    Ok((onto_remote, onto_refs, into_commit, None, branch))
+}
+
 /// Resolve source symbols to commits, per VCS.
+#[cfg(test)]
 fn resolve_sources(
     dir: &Path,
     io: &mut Io,
     vcs: Vcs,
     raw: &[String],
 ) -> Result<Vec<GitSymbol>, String> {
+    resolve_sources_with(dir, &hg::HgCommand::system(), io, vcs, raw)
+}
+
+/// [`resolve_sources`] driving `hg` through `hg_cmd` (test seam).
+fn resolve_sources_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    io: &mut Io,
+    vcs: Vcs,
+    raw: &[String],
+) -> Result<Vec<GitSymbol>, String> {
     let resolved = match vcs {
         Vcs::Git => git_resolve_symbols(dir, raw)?,
-        Vcs::Hg => hg_resolve_symbols(dir, io, raw)?,
+        Vcs::Hg => hg_resolve_symbols_with(dir, hg_cmd, io, raw)?,
     };
     Ok(raw
         .iter()
@@ -7236,22 +7309,59 @@ fn resolve_sources(
 }
 
 /// Select landing commits, per VCS.
+#[cfg(test)]
 fn select_source_commits(
     dir: &Path,
     vcs: Vcs,
     symbols: &[GitSymbol],
     into_commit: Option<&str>,
 ) -> Result<Vec<LandCommit>, String> {
+    select_source_commits_with(dir, &hg::HgCommand::system(), vcs, symbols, into_commit)
+}
+
+/// [`select_source_commits`] driving `hg` through `hg_cmd` (test seam).
+fn select_source_commits_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    vcs: Vcs,
+    symbols: &[GitSymbol],
+    into_commit: Option<&str>,
+) -> Result<Vec<LandCommit>, String> {
     match vcs {
         Vcs::Git => git_select_commits(dir, symbols, into_commit),
-        Vcs::Hg => hg_select_commits(dir, symbols, into_commit),
+        Vcs::Hg => hg_select_commits_with(dir, hg_cmd, symbols, into_commit),
     }
 }
 
 /// Build landing sets: online discovery and grouping, or the offline
 /// single unassociated set.
+#[cfg(test)]
 fn build_sets(
     dir: &Path,
+    io: &mut Io,
+    vcs: Vcs,
+    validated: &Validated,
+    commits: &mut [LandCommit],
+    online: Option<&arc_rs::conduit::Client>,
+    display_hash: &dyn Fn(&str) -> String,
+) -> Result<Vec<CommitSet>, String> {
+    build_sets_with(
+        dir,
+        &hg::HgCommand::system(),
+        io,
+        vcs,
+        validated,
+        commits,
+        online,
+        display_hash,
+    )
+}
+
+/// [`build_sets`] driving `hg` through `hg_cmd` (test seam).
+#[allow(clippy::too_many_arguments)]
+fn build_sets_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
     io: &mut Io,
     vcs: Vcs,
     validated: &Validated,
@@ -7275,7 +7385,7 @@ fn build_sets(
         (Some(symbol), None) => Some(resolve_forced_revision(&call, symbol)?),
         (None, _) => None,
     };
-    let message_of = commit_message_reader(dir, vcs);
+    let message_of = commit_message_reader_with(dir, hg_cmd, vcs);
     let hashes_of = commit_hash_reader(dir, vcs);
     load_revision_refs(io, &call, commits, &message_of, &hashes_of, forced.as_ref())?;
     group_commit_sets(io, commits, display_hash)
@@ -7286,13 +7396,26 @@ type MessageReader<'a> = Box<dyn Fn(&str) -> Result<String, String> + 'a>;
 
 /// Full-message reader per VCS: `git log --format=%B` or
 /// `hg log --template {desc}`.
+#[cfg(test)]
 fn commit_message_reader(dir: &Path, vcs: Vcs) -> MessageReader<'_> {
+    commit_message_reader_with(dir, &hg::HgCommand::system(), vcs)
+}
+
+/// [`commit_message_reader`] driving `hg` through `hg_cmd` (test seam).
+fn commit_message_reader_with<'a>(
+    dir: &'a Path,
+    hg_cmd: &hg::HgCommand,
+    vcs: Vcs,
+) -> MessageReader<'a> {
     match vcs {
         Vcs::Git => {
             Box::new(|hash| git::stdout_text(dir, &["log", "-n1", "--format=%B", hash, "--"]))
         }
         Vcs::Hg => {
-            Box::new(|hash| hg::stdout_text(dir, &["log", "--rev", hash, "--template", "{desc}"]))
+            let owned = hg_cmd.clone();
+            Box::new(move |hash| {
+                hg::stdout_text_with(dir, &owned, &["log", "--rev", hash, "--template", "{desc}"])
+            })
         }
     }
 }
@@ -8240,6 +8363,7 @@ fn cursor_or(cursor: Option<&str>) -> &str {
 }
 
 /// Run the Mercurial merge/push loop (base loop plus hg halves).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn land_hg(
     dir: &Path,
