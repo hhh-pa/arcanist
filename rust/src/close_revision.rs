@@ -696,6 +696,12 @@ fn confirm_interactive(query: &str) -> Result<bool, String> {
 
 /// Entry point: `argv` excludes the subcommand name.
 pub fn run(argv: &[String]) -> ExitCode {
+    run_with_user_file(argv, config::arcrc_path().as_deref())
+}
+
+/// [`run`] with an explicit credential file (test seam: hermetic
+/// tests stage a fake arcrc instead of touching HOME).
+fn run_with_user_file(argv: &[String], user_file: Option<&Path>) -> ExitCode {
     let mut options = match parse_args(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
@@ -707,8 +713,16 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let client = match config::client_for(options.conduit_uri.as_deref()) {
-        Ok(client) => client, // LCOV_EXCL_LINE // Reason: needs a configured conduit client; hermetic tests cannot mint one (HOME is process-global)
+    // Byte-identical to `config::client_for(..)` when the wrapper
+    // passes the ambient user file (same cwd fallback).
+    let config_dir = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    let client = match config::client_for_with(
+        options.conduit_uri.as_deref(),
+        &config_dir,
+        user_file,
+        &get_config::LoadOptions::default(),
+    ) {
+        Ok(client) => client,
         Err(msg) => {
             eprintln!("arc {NAME}: {msg}");
             return ExitCode::FAILURE;

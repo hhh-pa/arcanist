@@ -1776,7 +1776,7 @@ fn export_bundle_reports_missing_credentials() {
         "--conduit-uri",
         "https://export-bundle.invalid/",
     ]);
-    let err = export_bundle(&dir, &opts, "o.tar.gz").unwrap_err();
+    let err = export_bundle(&dir, &opts, "o.tar.gz", None).unwrap_err();
     assert!(err.contains("no token for"), "{err}");
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -1993,4 +1993,63 @@ fn rejects_mixed_sources_and_stray_positionals_defensive_error_arm() {
 fn upx_b21_export_needs_no_terminator_defensive_error_arm() {
     // `expect_export_help` unwraps `Ok`: an unknown flag panics.
     expect_export_help(&["--git", "--bogus"]);
+}
+
+/// The arcrc host key for a stub base, mirroring
+/// `config::host_key` (`{scheme}://{authority}/api/`).
+fn host_key_for(base: &str) -> String {
+    let after_scheme = base.split("://").nth(1).unwrap_or(base);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    let scheme = base.split("://").next().unwrap_or("https");
+    format!("{scheme}://{authority}/api/")
+}
+
+/// Fake arcrc granting a token for the stub `base`.
+fn fake_arcrc(dir: &std::path::Path, base: &str) -> std::path::PathBuf {
+    let path = dir.join("fake.arcrc");
+    let key = host_key_for(base);
+    std::fs::write(
+        &path,
+        format!(r#"{{"hosts": {{"{key}": {{"token": "x"}}}}}}"#),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn execute_writes_local_bundle_through_configured_client() {
+    let dir = fixture_repo("live");
+    std::fs::write(dir.join("f.txt"), "one\n").unwrap();
+    git(&dir, &["add", "f.txt"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    std::fs::write(dir.join("f.txt"), "one\ntwo\n").unwrap();
+    git(&dir, &["add", "f.txt"]);
+    git(&dir, &["commit", "-qm", "add"]);
+
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "user.whoami".to_string(),
+        envelope(r#"{"phid": "PHID-USER-1"}"#),
+    );
+    routes.insert(
+        "user.query".to_string(),
+        envelope(r#"{"1": {"realName": "Ada"}}"#),
+    );
+    let base = serve(routes, 2);
+    let arcrc = fake_arcrc(&dir, &base);
+    let out = execute_with_user_file(
+        &dir,
+        &argv(&[
+            "--arcbundle",
+            "out.tar.gz",
+            "HEAD~1",
+            "--conduit-uri",
+            base.as_str(),
+        ]),
+        Some(&arcrc),
+    )
+    .unwrap();
+    assert_eq!(out, "Done.\n");
+    assert!(dir.join("out.tar.gz").is_file());
+    std::fs::remove_dir_all(&dir).ok();
 }

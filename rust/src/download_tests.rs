@@ -1277,3 +1277,49 @@ fn dl_b23_help_matches_generated_format_defensive_error_arm() {
     // `expect_dl_help` unwraps `Ok`: a missing file symbol panics.
     expect_dl_help(&["--"]);
 }
+
+/// The arcrc host key for a stub base, mirroring
+/// `config::host_key` (`{scheme}://{authority}/api/`).
+fn host_key_for(base: &str) -> String {
+    let after_scheme = base.split("://").nth(1).unwrap_or(base);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    let scheme = base.split("://").next().unwrap_or("https");
+    format!("{scheme}://{authority}/api/")
+}
+
+/// Fake arcrc granting a token for the stub `base`.
+fn fake_arcrc(dir: &std::path::Path, base: &str) -> std::path::PathBuf {
+    let path = dir.join("fake.arcrc");
+    let key = host_key_for(base);
+    std::fs::write(
+        &path,
+        format!(r#"{{"hosts": {{"{key}": {{"token": "x"}}}}}}"#),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn execute_downloads_through_configured_client() {
+    let dir = dl_tempdir("live");
+    let data_url = serve_bytes_once(b"payload-bytes".to_vec());
+    let hit = serde_json::json!({
+        "id": 7,
+        "phid": "PHID-FILE-7",
+        "fields": {"name": "f7.txt", "size": 13, "dataURI": data_url},
+    });
+    let page = serde_json::json!({"result": {"data": [hit]}, "error_code": null}).to_string();
+    let (base, rx) = serve_seq(vec![page]);
+    let arcrc = fake_arcrc(&dir, &base);
+    let out = execute_with_user_file(
+        &dir,
+        &argv(&["--conduit-uri", base.as_str(), "--", "F7"]),
+        Some(&arcrc),
+    )
+    .unwrap();
+    assert_eq!(out, String::new());
+    assert_eq!(std::fs::read(dir.join("f7.txt")).unwrap(), b"payload-bytes");
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(seen.len(), 1);
+    std::fs::remove_dir_all(&dir).ok();
+}

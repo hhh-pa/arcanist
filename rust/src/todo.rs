@@ -515,6 +515,18 @@ pub fn execute_in_ansi(
 
 /// Entry point: `argv` excludes the subcommand name.
 pub fn run(argv: &[String]) -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    run_in_with_user_file(&cwd, argv, config::arcrc_path().as_deref())
+}
+
+/// [`run`] with an explicit working copy and credential file (test
+/// seam: hermetic tests stage a fake arcrc instead of touching HOME,
+/// and a fixture cwd instead of the ambient one).
+fn run_in_with_user_file(
+    cwd: &std::path::Path,
+    argv: &[String],
+    user_file: Option<&std::path::Path>,
+) -> ExitCode {
     let options = match parse_args(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
@@ -529,20 +541,17 @@ pub fn run(argv: &[String]) -> ExitCode {
     // T1153 CORE-4/T1153 CORE-9: classic `requiresAuthentication` startup
     // (tokenless engine, credential gate, `user.whoami` /
     // `conduit.connect` verification).
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let user_file = config::arcrc_path();
     let client = match config::authed_client_for(
         options.conduit_uri.as_deref(),
-        &cwd,
-        user_file.as_deref(),
+        cwd,
+        user_file,
         &get_config::LoadOptions::default(),
         &config::command_description(),
     ) {
-        Ok(client) => client, // LCOV_EXCL_LINE // Reason: needs an authenticated conduit client; hermetic tests cannot mint one (HOME is process-global)
+        Ok(client) => client,
         Err(error) => return error.report(),
     };
-    // LCOV_EXCL_START // Reason: needs an authenticated conduit client; hermetic tests cannot mint one (HOME is process-global)
-    match create_in_ansi(&cwd, &client, &options, terminal::ansi_enabled()) {
+    match create_in_ansi(cwd, &client, &options, terminal::ansi_enabled()) {
         Ok(outcome) => {
             print!("{}", outcome.text);
             // T1153 RB-D29b: the creation line prints first; `--browse`
@@ -550,13 +559,13 @@ pub fn run(argv: &[String]) -> ExitCode {
             // `openURIsInBrowser` throw).
             if options.browse
                 && let Some(task) = outcome.task
-                && let Err(msg) = open_created_in_browser(&cwd, &task)
+                && let Err(msg) = open_created_in_browser(cwd, &task)
             {
                 return conduit::report(EnvelopeKind::Usage, &msg);
             }
             ExitCode::SUCCESS
         }
-        Err(msg) => conduit::report(EnvelopeKind::Exception, &msg), // LCOV_EXCL_STOP
+        Err(msg) => conduit::report(EnvelopeKind::Exception, &msg),
     }
 }
 

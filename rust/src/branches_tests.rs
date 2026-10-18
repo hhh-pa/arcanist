@@ -486,3 +486,95 @@ fn r4_rbd4_parse_error_has_no_dump_defensive_ok_arm() {
     // `expect_execute_error` unwraps `Err`: `--help` (past `--`) succeeds.
     expect_execute_error(&["--help", "--"]);
 }
+
+/// Serve canned conduit responses in order, recording request bodies.
+fn serve_seq(canned: Vec<String>) -> (String, std::sync::mpsc::Receiver<Vec<String>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for body in canned {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8(head).unwrap();
+            let len: usize = head
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                })
+                .unwrap_or(0);
+            let mut raw = vec![0u8; len];
+            stream.read_exact(&mut raw).unwrap();
+            seen.push(String::from_utf8(raw).unwrap());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+        tx.send(seen).unwrap();
+    });
+    (base, rx)
+}
+
+/// The arcrc host key for a stub base, mirroring
+/// `config::host_key` (`{scheme}://{authority}/api/`).
+fn host_key_for(base: &str) -> String {
+    let after_scheme = base.split("://").nth(1).unwrap_or(base);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    let scheme = base.split("://").next().unwrap_or("https");
+    format!("{scheme}://{authority}/api/")
+}
+
+/// Fake arcrc granting a token for the stub `base`.
+fn fake_arcrc(dir: &Path, base: &str) -> std::path::PathBuf {
+    let path = dir.join("fake.arcrc");
+    let key = host_key_for(base);
+    std::fs::write(
+        &path,
+        format!(r#"{{"hosts": {{"{key}": {{"token": "x"}}}}}}"#),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn run_in_maps_auth_failures_to_login_guidance() {
+    let repo = init_repo("autharm");
+    let sha = git(repo.path(), &["rev-parse", "HEAD"]);
+    git(
+        repo.path(),
+        &["remote", "add", "origin", "git@h.test:repo.git"],
+    );
+    git(
+        repo.path(),
+        &["update-ref", "refs/remotes/origin/main", &sha],
+    );
+    let auth_err =
+        r#"{"result": null, "error_code": "ERR-INVALID-AUTH", "error_info": "bad token"}"#
+            .to_string();
+    // One `diffusion.repository.search` per run below.
+    let (base, rx) = serve_seq(vec![auth_err.clone(), auth_err]);
+    let arcrc = fake_arcrc(repo.path(), &base);
+    let argv = args(&["--conduit-uri", base.as_str(), "--"]);
+    assert_eq!(
+        run_in_with_user_file(repo.path(), &argv, Some(&arcrc)),
+        ExitCode::FAILURE
+    );
+    // The underlying failure carries the auth code (not a fatal).
+    let err = execute_with_user_file(repo.path(), &argv, Some(&arcrc)).unwrap_err();
+    assert!(err.starts_with("ERR-INVALID-AUTH:"), "{err}");
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(seen.len(), 2);
+}

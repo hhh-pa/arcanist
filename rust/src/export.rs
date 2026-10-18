@@ -2011,21 +2011,47 @@ fn export_bundle_with_client(
     Ok("Done.\n".to_string())
 }
 
-/// Write an `--arcbundle` file, returning the stdout text.
-fn export_bundle(dir: &Path, opts: &Options, path: &str) -> Result<String, String> {
-    let client = crate::config::client_for(opts.conduit_uri.as_deref())?;
-    export_bundle_with_client(dir, opts, path, &client) // LCOV_EXCL_LINE // Reason: needs a configured conduit client; hermetic tests cannot mint one (HOME is process-global)
+/// Write an `--arcbundle` file, returning the stdout text, with an
+/// explicit credential file (test seam: hermetic tests stage a fake
+/// arcrc instead of touching HOME; production passes
+/// [`config::arcrc_path`](crate::config::arcrc_path)).
+fn export_bundle(
+    dir: &Path,
+    opts: &Options,
+    path: &str,
+    user_file: Option<&Path>,
+) -> Result<String, String> {
+    // Byte-identical to `config::client_for(..)` when the wrapper
+    // passes the ambient user file (same cwd fallback).
+    let config_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let client = crate::config::client_for_with(
+        opts.conduit_uri.as_deref(),
+        &config_dir,
+        user_file,
+        &crate::get_config::LoadOptions::default(),
+    )?;
+    export_bundle_with_client(dir, opts, path, &client)
 }
 
 /// Run the workflow rooted at `dir`, returning stdout text or an error message.
 pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
+    execute_with_user_file(dir, argv, crate::config::arcrc_path().as_deref())
+}
+
+/// [`execute`] with an explicit credential file (test seam: hermetic
+/// tests stage a fake arcrc instead of touching HOME).
+fn execute_with_user_file(
+    dir: &Path,
+    argv: &[String],
+    user_file: Option<&Path>,
+) -> Result<String, String> {
     let opts = match parse_args(argv) {
         ParseOutcome::Args(opts) => opts,
         ParseOutcome::Help => return Ok(usage()),
         // T1153 R4 (EXPORT-E28): PHP renders usage errors with no dump.
         ParseOutcome::Error(message) => return Err(message),
     };
-    execute_with_opts(dir, &opts)
+    execute_with_opts_and_user_file(dir, &opts, user_file)
 }
 
 /// Render text output from bundle changes: a git patch or a unified
@@ -2118,8 +2144,16 @@ fn execute_conduit_export_text(
 
 /// [`execute`] over parsed options.
 fn execute_with_opts(dir: &Path, opts: &Options) -> Result<String, String> {
+    execute_with_opts_and_user_file(dir, opts, crate::config::arcrc_path().as_deref())
+}
+
+fn execute_with_opts_and_user_file(
+    dir: &Path,
+    opts: &Options,
+    user_file: Option<&Path>,
+) -> Result<String, String> {
     if let Format::Bundle { path } = &opts.format {
-        return export_bundle(dir, opts, path);
+        return export_bundle(dir, opts, path, user_file);
     }
     let git = matches!(opts.format, Format::Git);
     match &opts.source {

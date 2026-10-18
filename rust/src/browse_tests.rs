@@ -1569,3 +1569,108 @@ fn run_in_with_enforces_terminator_when_piped() {
     let options_want = [ExitCode::from(255), ExitCode::FAILURE][usize::from(piped)];
     assert_eq!(options, options_want);
 }
+
+/// Loopback stub routing each conduit method to its canned envelope.
+fn serve_routes(routes: HashMap<String, String>, expected: usize) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for _ in 0..expected {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            let head_text = String::from_utf8_lossy(&head).to_string();
+            let len: usize = head_text
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(key, value)| {
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).unwrap();
+            let method = head_text
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .strip_prefix("/api/")
+                .unwrap_or("")
+                .to_string();
+            let canned = routes
+                .get(&method)
+                .cloned()
+                .unwrap_or_else(|| r#"{"result": null, "error_code": "ERR-NO-ROUTE"}"#.to_string());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                canned.len(),
+                canned
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    base
+}
+
+fn live_envelope(result: &str) -> String {
+    format!(r#"{{"result": {result}, "error_code": null}}"#)
+}
+
+/// The arcrc host key for a stub base, mirroring
+/// `config::host_key` (`{scheme}://{authority}/api/`).
+fn host_key_for(base: &str) -> String {
+    let after_scheme = base.split("://").nth(1).unwrap_or(base);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    let scheme = base.split("://").next().unwrap_or("https");
+    format!("{scheme}://{authority}/api/")
+}
+
+/// Fake arcrc granting a token for the stub `base`.
+fn fake_arcrc(dir: &std::path::Path, base: &str) -> std::path::PathBuf {
+    let path = dir.join("fake.arcrc");
+    let key = host_key_for(base);
+    std::fs::write(
+        &path,
+        format!(r#"{{"hosts": {{"{key}": {{"token": "x"}}}}}}"#),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn live_client_browses_object_refs() {
+    let tmp = fixture_repo("live");
+    std::fs::write(
+        tmp.path.join(".arcconfig"),
+        serde_json::json!({"browser": null_browser()}).to_string(),
+    )
+    .unwrap();
+    let mut routes = HashMap::new();
+    routes.insert(
+        "phid.lookup".to_string(),
+        live_envelope(r#"{"T7": {"uri": "https://phab.example/T7"}}"#),
+    );
+    let base = serve_routes(routes, 1);
+    let arcrc = fake_arcrc(&tmp.path, &base);
+    let mut input = std::io::Cursor::new(b"");
+    assert_eq!(
+        run_in_with_user_file(
+            &tmp.path,
+            &argv(&["--types", "object", "--", "T7"]),
+            None,
+            &mut input,
+            Some(&arcrc),
+            Some(&base),
+        ),
+        ExitCode::SUCCESS
+    );
+}

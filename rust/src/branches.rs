@@ -254,6 +254,16 @@ fn check_branches_support(dir: &Path) -> Result<&'static str, String> {
 
 /// Run the workflow rooted at `dir`, returning stdout text or an error message.
 pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
+    execute_with_user_file(dir, argv, config::arcrc_path().as_deref())
+}
+
+/// [`execute`] with an explicit credential file (test seam: hermetic
+/// tests stage a fake arcrc instead of touching HOME).
+fn execute_with_user_file(
+    dir: &Path,
+    argv: &[String],
+    user_file: Option<&Path>,
+) -> Result<String, String> {
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => return Ok(usage()),
@@ -280,7 +290,7 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
     let owned_client = match config::client_for_tokenless_with(
         options.conduit_uri.as_deref(),
         dir,
-        config::arcrc_path().as_deref(),
+        user_file,
         &get_config::LoadOptions::default(),
     ) {
         Ok(client) => client,
@@ -366,7 +376,13 @@ fn execute_core(
 }
 
 pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
-    match execute(dir, argv) {
+    run_in_with_user_file(dir, argv, config::arcrc_path().as_deref())
+}
+
+/// [`run_in`] with an explicit credential file (test seam: hermetic
+/// tests stage a fake arcrc instead of touching HOME).
+fn run_in_with_user_file(dir: &Path, argv: &[String], user_file: Option<&Path>) -> ExitCode {
+    match execute_with_user_file(dir, argv, user_file) {
         Ok(text) => {
             print!("{text}");
             ExitCode::SUCCESS
@@ -381,15 +397,23 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             // guidance (the toolset runtime's auth arm). The calls
             // went out on a strict client, re-resolved here for the
             // mapping context (config reads only, no I/O).
-            let client = parse_options(argv)
+            // Byte-identical to `config::client_for(..)` when the
+            // wrapper passes the ambient user file (same cwd fallback).
+            let config_dir =
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let client = parse_options(argv).ok().flatten().and_then(|options| {
+                config::client_for_with(
+                    options.conduit_uri.as_deref(),
+                    &config_dir,
+                    user_file,
+                    &get_config::LoadOptions::default(),
+                )
                 .ok()
-                .flatten()
-                .and_then(|options| config::client_for(options.conduit_uri.as_deref()).ok());
+            });
             if let Some(client) = client
-                // LCOV_EXCL_START // Reason: needs a configured conduit client; hermetic tests cannot mint one (HOME is process-global)
                 && let Some(code) = conduit::auth_report_for(&client, &message)
             {
-                return code; // LCOV_EXCL_STOP
+                return code;
             }
             // T1153 RB-D4 (R4): `branches` runs in the toolset
             // runtime (via `ArcanistMarkersWorkflow`). Argument,

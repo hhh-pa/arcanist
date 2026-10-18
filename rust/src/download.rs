@@ -897,6 +897,16 @@ fn is_toolset_usage_message(message: &str) -> bool {
 
 /// Run the workflow rooted at `dir`, returning stdout text or an error message.
 pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
+    execute_with_user_file(dir, argv, crate::config::arcrc_path().as_deref())
+}
+
+/// [`execute`] with an explicit credential file (test seam: hermetic
+/// tests stage a fake arcrc instead of touching HOME).
+fn execute_with_user_file(
+    dir: &Path,
+    argv: &[String],
+    user_file: Option<&Path>,
+) -> Result<String, String> {
     let opts = match parse_args(argv) {
         ParseOutcome::Args(opts) => opts,
         ParseOutcome::Help => return Ok(usage()),
@@ -906,14 +916,21 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
         // T1153 R4 (DL-D2): PHP renders usage errors with no usage dump.
         ParseOutcome::Error(message) => return Err(message),
     };
-    let client = crate::config::client_for(opts.conduit_uri.as_deref())?;
-    // LCOV_EXCL_START // Reason: needs a configured conduit client; hermetic tests cannot mint one (HOME is process-global)
+    // Byte-identical to `config::client_for(..)` when the wrapper
+    // passes the ambient user file (same cwd fallback).
+    let config_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let client = crate::config::client_for_with(
+        opts.conduit_uri.as_deref(),
+        &config_dir,
+        user_file,
+        &crate::get_config::LoadOptions::default(),
+    )?;
     download_file_for_symbol(
         &client,
         dir,
         &opts.file,
         &opts.symbol,
-        opts.save_as.as_deref(), // LCOV_EXCL_STOP
+        opts.save_as.as_deref(),
     )
 }
 

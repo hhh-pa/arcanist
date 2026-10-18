@@ -546,3 +546,40 @@ fn t1170_confirm_interactive_errors_when_not_interactive() {
         crate::prompt::NOT_INTERACTIVE
     );
 }
+
+/// The arcrc host key for a stub base, mirroring
+/// `config::host_key` (`{scheme}://{authority}/api/`).
+fn host_key_for(base: &str) -> String {
+    let after_scheme = base.split("://").nth(1).unwrap_or(base);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    let scheme = base.split("://").next().unwrap_or("https");
+    format!("{scheme}://{authority}/api/")
+}
+
+/// Fake arcrc granting a token for the stub `base`.
+fn fake_arcrc(dir: &std::path::Path, base: &str) -> std::path::PathBuf {
+    let path = dir.join("fake.arcrc");
+    let key = host_key_for(base);
+    std::fs::write(
+        &path,
+        format!(r#"{{"hosts": {{"{key}": {{"token": "x"}}}}}}"#),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn run_reports_missing_revision_over_live_client() {
+    // No `--finalize`: an unknown revision errors before any prompt,
+    // so no stdin is needed.
+    let tmp = TempDir::new("live");
+    let base = serve_once(r#"{"result": [], "error_code": null}"#.to_string());
+    let arcrc = fake_arcrc(tmp.path(), &base);
+    assert_eq!(
+        run_with_user_file(
+            &args(&["--conduit-uri", base.as_str(), "D999"]),
+            Some(&arcrc)
+        ),
+        std::process::ExitCode::FAILURE
+    );
+}

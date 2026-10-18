@@ -1531,6 +1531,28 @@ pub fn run_in_with(
     call: Option<&diff_submit::ConduitCall>,
     input: &mut dyn BufRead,
 ) -> ExitCode {
+    run_in_with_user_file(
+        dir,
+        argv,
+        call,
+        input,
+        config::arcrc_path().as_deref(),
+        None,
+    )
+}
+
+/// [`run_in_with`] with an explicit credential file and conduit URI
+/// override (test seam: hermetic tests stage a fake arcrc plus a
+/// loopback stub instead of touching HOME; `browse` takes no
+/// `--conduit-uri` flag, so the URI rides the seam too).
+fn run_in_with_user_file(
+    dir: &Path,
+    argv: &[String],
+    call: Option<&diff_submit::ConduitCall>,
+    input: &mut dyn BufRead,
+    user_file: Option<&Path>,
+    conduit_uri: Option<&str>,
+) -> ExitCode {
     // T1153 BROWSE-B21: the terminator check runs after a
     // successful parse (unknown flags report first, like PHP's
     // `parseFull()`), and also gates `--help` (which reroutes
@@ -1578,17 +1600,24 @@ pub fn run_in_with(
     if let Some(call) = call {
         return run_prepared(dir, &options, call, "", input);
     }
-    let client = match config::client_for(None) {
-        Ok(client) => client, // LCOV_EXCL_LINE // Reason: needs a configured conduit client; hermetic tests cannot mint one (HOME is process-global)
+    // Byte-identical to `config::client_for(None)` when the wrapper
+    // passes the ambient values (same cwd fallback, same user file).
+    let config_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let client = match config::client_for_with(
+        conduit_uri,
+        &config_dir,
+        user_file,
+        &get_config::LoadOptions::default(),
+    ) {
+        Ok(client) => client,
         // T1153 R4 (BROWSE-B20): `browse` runs in the toolset runtime,
         // so workflow errors escape into a PHP fatal (255).
         Err(message) => return conduit::report(EnvelopeKind::Fatal, &message),
     };
-    // LCOV_EXCL_START // Reason: needs a configured conduit client; hermetic tests cannot mint one (HOME is process-global)
     let live = |method: &str, params: &serde_json::Value| {
         client.call(method, params).map_err(|e| e.to_string())
     };
-    run_prepared(dir, &options, &live, client.base_uri(), input) // LCOV_EXCL_STOP
+    run_prepared(dir, &options, &live, client.base_uri(), input)
 }
 
 /// Run with a resolved Conduit base URI (used by `run_in` and tests).

@@ -376,6 +376,12 @@ fn require_working_copy(cwd: &Path) -> Result<(), String> {
 
 /// Entry point rooted at `cwd`: `argv` excludes the subcommand name.
 pub fn run_in(cwd: &Path, argv: &[String]) -> ExitCode {
+    run_in_with_user_file(cwd, argv, config::arcrc_path().as_deref())
+}
+
+/// [`run_in`] with an explicit credential file (test seam: hermetic
+/// tests stage a fake arcrc instead of touching HOME).
+fn run_in_with_user_file(cwd: &Path, argv: &[String], user_file: Option<&Path>) -> ExitCode {
     let options = match parse_args(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
@@ -394,24 +400,22 @@ pub fn run_in(cwd: &Path, argv: &[String]) -> ExitCode {
     // T1153 CORE-4/T1153 CORE-9: classic `requiresAuthentication` startup
     // (tokenless engine, credential gate, `user.whoami` /
     // `conduit.connect` verification).
-    let user_file = config::arcrc_path();
     let client = match config::authed_client_for(
         options.conduit_uri.as_deref(),
         cwd,
-        user_file.as_deref(),
+        user_file,
         &get_config::LoadOptions::default(),
         &config::command_description(),
     ) {
-        Ok(client) => client, // LCOV_EXCL_LINE // Reason: needs an authenticated conduit client; hermetic tests cannot mint one (HOME is process-global)
+        Ok(client) => client,
         Err(error) => return error.report(),
     };
-    // LCOV_EXCL_START // Reason: needs an authenticated conduit client; hermetic tests cannot mint one (HOME is process-global)
     match execute_in(&client, &options, cwd) {
         Ok(out) => {
             print!("{out}");
             ExitCode::SUCCESS
         }
-        Err(msg) => conduit::report(EnvelopeKind::Exception, &msg), // LCOV_EXCL_STOP
+        Err(msg) => conduit::report(EnvelopeKind::Exception, &msg),
     }
 }
 

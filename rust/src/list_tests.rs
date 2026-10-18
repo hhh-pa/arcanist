@@ -352,3 +352,172 @@ fn revision_ids_accept_big_and_prefixed_forms() {
     let revision = parse_revision(&serde_json::json!({"id": "42"})).unwrap();
     assert_eq!(revision.id, "42");
 }
+
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-list-tests-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+fn list_repo(tag: &str) -> TempDir {
+    let tmp = TempDir::new(tag);
+    git(&tmp.path, &["init", "-q", "-b", "master"]);
+    git(&tmp.path, &["config", "user.email", "t@t"]);
+    git(&tmp.path, &["config", "user.name", "t"]);
+    git(&tmp.path, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(tmp.path.join("f.txt"), "one\n").unwrap();
+    git(&tmp.path, &["add", "f.txt"]);
+    git(&tmp.path, &["commit", "-qm", "add f"]);
+    tmp
+}
+
+/// Loopback stub routing each conduit method to its canned envelope.
+fn serve_routes(routes: std::collections::HashMap<String, String>, expected: usize) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for _ in 0..expected {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            let head_text = String::from_utf8_lossy(&head).to_string();
+            let len: usize = head_text
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(key, value)| {
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).unwrap();
+            let method = head_text
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .strip_prefix("/api/")
+                .unwrap_or("")
+                .to_string();
+            let canned = routes
+                .get(&method)
+                .cloned()
+                .unwrap_or_else(|| r#"{"result": null, "error_code": "ERR-NO-ROUTE"}"#.to_string());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                canned.len(),
+                canned
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    base
+}
+
+fn envelope(result: &str) -> String {
+    format!(r#"{{"result": {result}, "error_code": null}}"#)
+}
+
+/// The arcrc host key for a stub base, mirroring
+/// `config::host_key` (`{scheme}://{authority}/api/`).
+fn host_key_for(base: &str) -> String {
+    let after_scheme = base.split("://").nth(1).unwrap_or(base);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    let scheme = base.split("://").next().unwrap_or("https");
+    format!("{scheme}://{authority}/api/")
+}
+
+/// Fake arcrc granting a token for the stub `base`.
+fn fake_arcrc(dir: &std::path::Path, base: &str) -> std::path::PathBuf {
+    let path = dir.join("fake.arcrc");
+    let key = host_key_for(base);
+    std::fs::write(
+        &path,
+        format!(r#"{{"hosts": {{"{key}": {{"token": "x"}}}}}}"#),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn authed_run_lists_open_revisions() {
+    let repo = list_repo("authed-ok");
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "user.whoami".to_string(),
+        envelope(r#"{"userName": "alice", "phid": "PHID-USER-1"}"#),
+    );
+    routes.insert("differential.query".to_string(), envelope("[]"));
+    let base = serve_routes(routes, 2);
+    let arcrc = fake_arcrc(&repo.path, &base);
+    assert_eq!(
+        run_in_with_user_file(
+            &repo.path,
+            &args(&["--conduit-uri", base.as_str()]),
+            Some(&arcrc)
+        ),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
+#[test]
+fn authed_run_reports_query_errors() {
+    let repo = list_repo("authed-err");
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "user.whoami".to_string(),
+        envelope(r#"{"userName": "alice", "phid": "PHID-USER-1"}"#),
+    );
+    routes.insert(
+        "differential.query".to_string(),
+        r#"{"result": null, "error_code": "ERR-QUERY", "error_info": "boom"}"#.to_string(),
+    );
+    let base = serve_routes(routes, 2);
+    let arcrc = fake_arcrc(&repo.path, &base);
+    assert_eq!(
+        run_in_with_user_file(
+            &repo.path,
+            &args(&["--conduit-uri", base.as_str()]),
+            Some(&arcrc)
+        ),
+        std::process::ExitCode::FAILURE
+    );
+}

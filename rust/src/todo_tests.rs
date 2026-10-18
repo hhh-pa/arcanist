@@ -392,3 +392,185 @@ fn serve_one_tolerates_partially_sent_headers() {
     handle.join().unwrap();
     assert!(reply.windows(2).any(|w| w == b"{}"));
 }
+
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-todo-tests-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+/// Loopback stub routing each conduit method to its canned envelope.
+fn serve_routes(routes: std::collections::HashMap<String, String>, expected: usize) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for _ in 0..expected {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            let head_text = String::from_utf8_lossy(&head).to_string();
+            let len: usize = head_text
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(key, value)| {
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).unwrap();
+            let method = head_text
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .strip_prefix("/api/")
+                .unwrap_or("")
+                .to_string();
+            let canned = routes
+                .get(&method)
+                .cloned()
+                .unwrap_or_else(|| r#"{"result": null, "error_code": "ERR-NO-ROUTE"}"#.to_string());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                canned.len(),
+                canned
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    base
+}
+
+fn envelope(result: &str) -> String {
+    format!(r#"{{"result": {result}, "error_code": null}}"#)
+}
+
+/// The arcrc host key for a stub base, mirroring
+/// `config::host_key` (`{scheme}://{authority}/api/`).
+fn host_key_for(base: &str) -> String {
+    let after_scheme = base.split("://").nth(1).unwrap_or(base);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    let scheme = base.split("://").next().unwrap_or("https");
+    format!("{scheme}://{authority}/api/")
+}
+
+/// Fake arcrc granting a token for the stub `base`.
+fn fake_arcrc(dir: &std::path::Path, base: &str) -> std::path::PathBuf {
+    let path = dir.join("fake.arcrc");
+    let key = host_key_for(base);
+    std::fs::write(
+        &path,
+        format!(r#"{{"hosts": {{"{key}": {{"token": "x"}}}}}}"#),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn authed_run_creates_task() {
+    let tmp = TempDir::new("authed-ok");
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "user.whoami".to_string(),
+        envelope(r#"{"userName": "alice", "phid": "PHID-USER-1"}"#),
+    );
+    routes.insert(
+        "maniphest.createtask".to_string(),
+        envelope(r#"{"id": 77, "title": "my summary", "uri": "http://phab.example/T77"}"#),
+    );
+    let base = serve_routes(routes, 2);
+    let arcrc = fake_arcrc(&tmp.path, &base);
+    assert_eq!(
+        run_in_with_user_file(
+            &tmp.path,
+            &args(&["--conduit-uri", base.as_str(), "my", "summary"]),
+            Some(&arcrc)
+        ),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
+#[test]
+fn authed_run_reports_create_errors() {
+    let tmp = TempDir::new("authed-err");
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "user.whoami".to_string(),
+        envelope(r#"{"userName": "alice", "phid": "PHID-USER-1"}"#),
+    );
+    routes.insert(
+        "maniphest.createtask".to_string(),
+        r#"{"result": null, "error_code": "ERR-CREATE", "error_info": "boom"}"#.to_string(),
+    );
+    let base = serve_routes(routes, 2);
+    let arcrc = fake_arcrc(&tmp.path, &base);
+    assert_eq!(
+        run_in_with_user_file(
+            &tmp.path,
+            &args(&["--conduit-uri", base.as_str(), "my", "summary"]),
+            Some(&arcrc)
+        ),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn authed_run_browse_failure_reports_usage() {
+    // `--browse` after a successful create opens the task URI. The
+    // fixture cwd configures a bogus `browser`, so the open fails
+    // hermetically (no PATH scan, never a real browser — the
+    // badbrowser precedent in browse_tests).
+    let tmp = TempDir::new("authed-browse");
+    // Project config needs a VCS root; `.git` existence suffices.
+    std::fs::create_dir(tmp.path.join(".git")).unwrap();
+    std::fs::write(
+        tmp.path.join(".arcconfig"),
+        r#"{"browser": "definitely-not-a-browser-t1176"}"#,
+    )
+    .unwrap();
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "user.whoami".to_string(),
+        envelope(r#"{"userName": "alice", "phid": "PHID-USER-1"}"#),
+    );
+    routes.insert(
+        "maniphest.createtask".to_string(),
+        envelope(r#"{"id": 77, "title": "my summary", "uri": "http://phab.example/T77"}"#),
+    );
+    let base = serve_routes(routes, 2);
+    let arcrc = fake_arcrc(&tmp.path, &base);
+    assert_eq!(
+        run_in_with_user_file(
+            &tmp.path,
+            &args(&["--conduit-uri", base.as_str(), "--browse", "my", "summary"]),
+            Some(&arcrc)
+        ),
+        std::process::ExitCode::FAILURE
+    );
+}
