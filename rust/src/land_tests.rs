@@ -8187,7 +8187,7 @@ fn s11c_dir_and_hg(name: &str) -> (PathBuf, hg::HgCommand) {
          if has pull; then exit 0; fi\n\
          if has push; then exit 0; fi\n\
          if has update; then exit 0; fi\n\
-         if has rebase; then exit 0; fi\n\
+         if has rebase; then cat > /dev/null; exit 0; fi\n\
          if has strip; then exit 0; fi\n\
          if has status; then exit 0; fi\n\
          if has branch; then printf 'default'; exit 0; fi\n\
