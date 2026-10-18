@@ -2051,7 +2051,7 @@ fn apply_base_options(
         for item in items {
             names.push(item.as_str().unwrap_or_default().to_string());
         }
-    } // LCOV_EXCL_LINE // Reason: dead fall-through; the StrOrStrList check guarantees str or array so one branch always takes
+    }
     for name in names {
         apply_standard(&mut severity, linter, canonical, &name, ctx)
             .map_err(|detail| arclint_key_error(&spec.name, "standard", detail))?;
@@ -2961,7 +2961,7 @@ fn git_default_base(
         let upstream = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !upstream.is_empty() {
             return git_merge_base_with_head(&work.vcs_root, &upstream);
-        } // LCOV_EXCL_LINE // Reason: rev-parse prints a name on success; empty output with success status is not stageable
+        }
     }
     if let Some(relative) = read_default_relative_commit(&work.vcs_root) {
         return git_merge_base_with_head(&work.vcs_root, &relative);
@@ -5069,7 +5069,7 @@ fn prompt_for_patch(result: &LintResult, patched: &[u8], sink: &mut Sink) {
             diff_text = String::from_utf8_lossy(&output.stdout).into_owned();
         }
         std::fs::remove_file(new_path).ok();
-    } // LCOV_EXCL_LINE // Reason: temp-file staging fails only if the temp dir is unwritable; never the case in tests
+    }
     sink.write(&diff_text);
 }
 

@@ -6174,7 +6174,7 @@ fn t1170_setup_patch_client_requires_token() {
     let dir = temp_dir("t1170_setup_client");
     let options = options_of(&["--conduit-uri", "https://patch-test.invalid/api/"]);
     assert_eq!(
-        setup_patch_client(&Source::Named("1".to_string()), &options, &dir).unwrap_err(),
+        setup_patch_client_with(&Source::Named("1".to_string()), &options, &dir, None).unwrap_err(),
         "no token for https://patch-test.invalid/api/ in ~/.arcrc"
     );
 }
@@ -6401,9 +6401,114 @@ fn t1170_preview_conduit_requires_token() {
     ]);
     let mut io = Io::buffered();
     assert_eq!(
-        execute_preview(&dir, &options, &mut io).unwrap_err(),
+        execute_preview_with(&dir, &options, &mut io, None).unwrap_err(),
         "no token for https://patch-test.invalid/api/ in ~/.arcrc"
     );
+}
+
+/// Serve one canned conduit response, whatever the method.
+fn serve_one(canned: String) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8_lossy(&head).to_string();
+        let len: usize = head
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(key, value)| {
+                    key.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+            })
+            .unwrap_or(0);
+        let mut body = vec![0u8; len];
+        stream.read_exact(&mut body).unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            canned.len(),
+            canned
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    base
+}
+
+fn patch_envelope(result: &str) -> String {
+    format!(r#"{{"result": {result}, "error_code": null}}"#)
+}
+
+/// The arcrc host key for a stub base, mirroring
+/// `config::host_key` (`{scheme}://{authority}/api/`).
+fn host_key_for(base: &str) -> String {
+    let after_scheme = base.split("://").nth(1).unwrap_or(base);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    let scheme = base.split("://").next().unwrap_or("https");
+    format!("{scheme}://{authority}/api/")
+}
+
+/// Fake arcrc granting a token for the stub `base`.
+fn fake_arcrc(dir: &Path, base: &str) -> PathBuf {
+    let path = dir.join("fake.arcrc");
+    let key = host_key_for(base);
+    std::fs::write(
+        &path,
+        format!(r#"{{"hosts": {{"{key}": {{"token": "x"}}}}}}"#),
+    )
+    .unwrap();
+    path
+}
+
+/// One `differential.querydiffs` row with no changes.
+fn empty_diffs_envelope() -> String {
+    patch_envelope(
+        r#"{"7": {"id": 7, "revisionID": 1, "sourceControlBaseRevision": "", "authorName": "", "authorEmail": "", "changes": []}}"#,
+    )
+}
+
+#[test]
+fn revision_flow_reports_project_config_failure_after_conduit_load() {
+    // A conduit revision load succeeds against the stub (covering the
+    // live call body), then the encoding lookup fails on the
+    // malformed project config (covering the `?` propagation).
+    let repo = make_repo("t1176_s11b_encoding");
+    std::fs::write(repo.join(".arcconfig"), "{invalid-json").unwrap();
+    git(&repo, &["add", ".arcconfig"]);
+    git(&repo, &["commit", "-m", "bad config"]);
+    let base = serve_one(empty_diffs_envelope());
+    let creds = temp_dir("t1176_s11b_creds");
+    let arcrc = fake_arcrc(&creds, &base);
+    let backends = Backends::default();
+    let mut io = Io::buffered();
+    let err = execute_with_io_ansi_and_user_file(
+        &repo,
+        &argv(&["--revision", "D1", "--conduit-uri", &base]),
+        &mut io,
+        &backends,
+        false,
+        Some(&arcrc),
+    )
+    .unwrap_err();
+    assert!(err.contains(".arcconfig"), "{err}");
+}
+
+#[test]
+fn preview_loads_revision_bundle_with_staged_credentials() {
+    let dir = temp_dir("t1176_s11b_preview");
+    let base = serve_one(empty_diffs_envelope());
+    let arcrc = fake_arcrc(&dir, &base);
+    let options = options_of(&["--preview", "--revision", "D1", "--conduit-uri", &base]);
+    let mut io = Io::buffered();
+    let out = execute_preview_with(&dir, &options, &mut io, Some(&arcrc)).unwrap();
+    // The empty bundle renders as the bare trailing newline.
+    assert_eq!(out.stdout, "\n");
 }
 
 // -( T1170 COV5: close patch.rs )-------------------------------------------------

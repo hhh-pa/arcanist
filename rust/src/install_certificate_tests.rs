@@ -855,6 +855,29 @@ fn install_arcrc_reports_missing_custom_files() {
 }
 
 #[test]
+fn install_arcrc_stages_unset_default() {
+    // `None` with no override stages the unset-HOME arm.
+    assert_eq!(
+        install_arcrc_for_with(None, None),
+        Err(std::process::ExitCode::FAILURE)
+    );
+    // A staged default resolves through the seam.
+    let tmp = TempDir::new("witharcrc");
+    let staged = tmp.path.join(".arcrc");
+    std::fs::write(&staged, "{}").unwrap();
+    assert_eq!(
+        install_arcrc_for_with(Some(staged.clone()), None),
+        Ok(staged.clone())
+    );
+    // A missing override still errors through the seam.
+    let missing = tmp.path.join("missing").to_string_lossy().to_string();
+    assert_eq!(
+        install_arcrc_for_with(Some(staged), Some(&missing)),
+        Err(std::process::ExitCode::FAILURE)
+    );
+}
+
+#[test]
 fn install_token_reads_prompt_without_a_flag() {
     // Piped stdin is never a TTY under `cargo test`; fail loud
     // (rather than block on a real terminal) if that ever changes.

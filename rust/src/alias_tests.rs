@@ -1178,8 +1178,134 @@ fn create_dispatch_rejects_builtin_triggers_through_run() {
 }
 
 #[test]
-fn user_file_matches_arcrc_path() {
-    assert_eq!(user_file_or_error().ok(), config::arcrc_path());
+fn list_with_stages_user_file_and_hostile_arms() {
+    let options = Options {
+        json: false,
+        positional: Vec::new(),
+    };
+    // `None` stages the unset-HOME arm: no user aliases, clean list.
+    let tmp = TempDir::new("list-with");
+    assert_eq!(
+        run_list_with(tmp.path(), None, &options),
+        std::process::ExitCode::SUCCESS
+    );
+    // A staged user file lists through the runner.
+    let arcrc = tmp.arcrc();
+    execute_create(&arcrc, "draft", &args(&["diff"])).unwrap();
+    assert_eq!(
+        run_list_with(tmp.path(), Some(&arcrc), &options),
+        std::process::ExitCode::SUCCESS
+    );
+    // A hostile user file (non-list `aliases`) fails fatal (255).
+    std::fs::write(&arcrc, r#"{"aliases": 42}"#).unwrap();
+    assert_eq!(
+        run_list_with(tmp.path(), Some(&arcrc), &options),
+        std::process::ExitCode::from(255)
+    );
+}
+
+#[test]
+fn delete_with_stages_unset_decline_and_failure_arms() {
+    let mut input = Cursor::new(b"y\n".to_vec());
+    assert_eq!(
+        run_delete_with(None, "draft", &mut input, true),
+        std::process::ExitCode::from(255)
+    );
+    // A declined prompt aborts (exit 1) and keeps the stored alias.
+    let tmp = TempDir::new("delete-with");
+    let arcrc = tmp.arcrc();
+    execute_create(&arcrc, "draft", &args(&["diff"])).unwrap();
+    let mut input = Cursor::new(b"n\n".to_vec());
+    assert_eq!(
+        run_delete_with(Some(&arcrc), "draft", &mut input, true),
+        std::process::ExitCode::FAILURE
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&arcrc).unwrap()).unwrap();
+    assert_eq!(doc["aliases"].as_array().unwrap().len(), 1);
+    // A hostile user file (non-list `aliases`) fails fatal (255).
+    std::fs::write(&arcrc, r#"{"aliases": 42}"#).unwrap();
+    let mut input = Cursor::new(b"y\n".to_vec());
+    assert_eq!(
+        run_delete_with(Some(&arcrc), "draft", &mut input, true),
+        std::process::ExitCode::from(255)
+    );
+    // Confirming through the runner removes the alias.
+    std::fs::remove_file(&arcrc).unwrap();
+    execute_create(&arcrc, "draft", &args(&["diff"])).unwrap();
+    let mut input = Cursor::new(b"y\n".to_vec());
+    assert_eq!(
+        run_delete_with(Some(&arcrc), "draft", &mut input, true),
+        std::process::ExitCode::SUCCESS
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&arcrc).unwrap()).unwrap();
+    assert_eq!(doc["aliases"], serde_json::json!([]));
+}
+
+#[test]
+fn create_with_stages_unset_failure_and_success_arms() {
+    let options = Options {
+        json: false,
+        positional: args(&["draft", "diff"]),
+    };
+    // `None` stages the unset-HOME arm (fatal, 255).
+    assert_eq!(
+        run_create_with(None, &options),
+        std::process::ExitCode::from(255)
+    );
+    // A hostile user file (non-list `aliases`) fails fatal (255).
+    let tmp = TempDir::new("create-with");
+    let arcrc = tmp.arcrc();
+    std::fs::write(&arcrc, r#"{"aliases": 42}"#).unwrap();
+    assert_eq!(
+        run_create_with(Some(&arcrc), &options),
+        std::process::ExitCode::from(255)
+    );
+    // A valid trigger writes through the runner.
+    std::fs::remove_file(&arcrc).unwrap();
+    assert_eq!(
+        run_create_with(Some(&arcrc), &options),
+        std::process::ExitCode::SUCCESS
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&arcrc).unwrap()).unwrap();
+    assert_eq!(
+        doc["aliases"],
+        serde_json::json!([{"trigger": "draft", "toolset": "arc", "command": ["diff"]}])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn runners_report_unreadable_arcrc_as_fatal() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new("unreadable");
+    let arcrc = tmp.arcrc();
+    std::fs::write(&arcrc, r#"{"aliases": []}"#).unwrap();
+    std::fs::set_permissions(&arcrc, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let list_options = Options {
+        json: false,
+        positional: Vec::new(),
+    };
+    assert_eq!(
+        run_list_with(tmp.path(), Some(&arcrc), &list_options),
+        std::process::ExitCode::from(255)
+    );
+    let mut input = Cursor::new(b"y\n".to_vec());
+    assert_eq!(
+        run_delete_with(Some(&arcrc), "draft", &mut input, true),
+        std::process::ExitCode::from(255)
+    );
+    let create_options = Options {
+        json: false,
+        positional: args(&["draft", "diff"]),
+    };
+    assert_eq!(
+        run_create_with(Some(&arcrc), &create_options),
+        std::process::ExitCode::from(255)
+    );
+    std::fs::set_permissions(&arcrc, std::fs::Permissions::from_mode(0o644)).unwrap();
 }
 
 #[test]
@@ -1200,7 +1326,10 @@ fn run_create_rejects_builtin_triggers_before_touching_the_filesystem() {
         json: false,
         positional: args(&["diff"]),
     };
-    assert_eq!(run_create(&options), std::process::ExitCode::FAILURE);
+    assert_eq!(
+        run_create_with(None, &options),
+        std::process::ExitCode::FAILURE
+    );
 }
 // -( T1176 S5: defensive-arm coverage )--------------------------------------
 

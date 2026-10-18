@@ -2173,27 +2173,12 @@ pub fn resolve_conduit_uri_with(
 /// Resolve the conduit URI (flag, `ARC_CONDUIT_URI`, or merged-config
 /// discovery from `dir`) and build an authenticated client from `~/.arcrc`.
 ///
-/// Mirrors [`config::client_for`], but discovers from the target working
-/// copy — like the diff port (`discover_from(&dir)`) — instead of the
-/// process working directory.
-pub fn client_for_dir(
-    conduit_uri: Option<&str>,
-    dir: &Path,
-) -> Result<arc_rs::conduit::Client, String> {
-    let uri = resolve_conduit_uri(conduit_uri, dir).ok_or_else(|| {
-        "no conduit URI: pass --conduit-uri, set ARC_CONDUIT_URI, or run inside a project \
-         with .arcconfig"
-            .to_string()
-    })?;
-    let token = config::arcrc_path()
-        .and_then(|path| config::token_for_file(&path, &uri))
-        .ok_or_else(|| format!("no token for {uri} in ~/.arcrc"))?;
-    arc_rs::conduit::Client::new(&uri, &token).map_err(|e| e.to_string()) // LCOV_EXCL_LINE // Reason: needs a token for the URI; tests stage no credentials
-}
-
-/// [`client_for_dir`] with an explicit user file and
+/// Conduit client for `dir` with an explicit user file and
 /// [`get_config::LoadOptions`], so `--config`/`--config-file`/
-/// `--arcrc-file` reach conduit setup like stock PHP.
+/// `--arcrc-file` reach conduit setup like stock PHP. Discovers from
+/// the target working copy — like the diff port
+/// (`discover_from(&dir)`) — instead of the process working
+/// directory.
 pub fn client_for_dir_with(
     conduit_uri: Option<&str>,
     dir: &Path,

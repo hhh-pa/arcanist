@@ -174,6 +174,27 @@ fn paste_p_envelope(result: &str) -> String {
     format!(r#"{{"result": {result}, "error_code": null}}"#)
 }
 
+/// The arcrc host key for a stub base, mirroring
+/// `config::host_key` (`{scheme}://{authority}/api/`).
+fn host_key_for(base: &str) -> String {
+    let after_scheme = base.split("://").nth(1).unwrap_or(base);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    let scheme = base.split("://").next().unwrap_or("https");
+    format!("{scheme}://{authority}/api/")
+}
+
+/// Fake arcrc granting a token for the stub `base`.
+fn fake_arcrc(dir: &Path, base: &str) -> std::path::PathBuf {
+    let path = dir.join("fake.arcrc");
+    let key = host_key_for(base);
+    std::fs::write(
+        &path,
+        format!(r#"{{"hosts": {{"{key}": {{"token": "x"}}}}}}"#),
+    )
+    .unwrap();
+    path
+}
+
 fn paste_p_search_hit(id: u64, title: &str) -> String {
     paste_p_envelope(&format!(
         r#"{{"data": [{{"id": {id}, "phid": "PHID-PSTE-{id}", "fields": {{"title": "{title}", "uri": "/P{id}"}}}}]}}"#
@@ -238,6 +259,29 @@ fn browse_opens_the_created_paste() {
     assert!(err.contains("Failed to open URI"), "{err}");
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn execute_browses_created_paste_with_staged_credentials() {
+    let tmp = TempDir::new("browse-authed");
+    // Project config needs a VCS root; `.git` existence suffices.
+    std::fs::create_dir(tmp.path.join(".git")).unwrap();
+    std::fs::write(tmp.path.join(".arcconfig"), null_browser_config()).unwrap();
+    // T1153 PASTE-P1/PASTE-P16: create via `paste.edit`, then the
+    // mandatory re-search.
+    let edit = paste_p_envelope(r#"{"object": {"id": 5, "phid": "PHID-PSTE-5"}}"#);
+    let (base, rx) = serve_seq(vec![edit, paste_p_search_hit(5, "t")]);
+    let arcrc = fake_arcrc(&tmp.path, &base);
+    let text = execute_with_stdin_and_user_file(
+        tmp.path(),
+        &argv(&["--conduit-uri", base.as_str(), "--browse", "--"]),
+        Some("hello"),
+        Some(&arcrc),
+    )
+    .unwrap();
+    assert!(text.contains("P5"), "{text}");
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(seen.len(), 2);
 }
 
 #[test]

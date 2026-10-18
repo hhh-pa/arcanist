@@ -893,12 +893,21 @@ fn fail(message: String) -> ExitCode {
 /// Credentials target: `--arcrc-file` wins over `~/.arcrc`, like stock
 /// PHP's `writeUserConfigurationFile()` at the custom location.
 fn install_arcrc_for(arcrc_file: Option<&str>) -> Result<PathBuf, ExitCode> {
-    match get_config::resolve_user_file(config::arcrc_path(), arcrc_file.map(Path::new)) {
+    install_arcrc_for_with(config::arcrc_path(), arcrc_file)
+}
+
+/// [`install_arcrc_for`] with an explicit default user file (test
+/// seam: hermetic tests stage `None` for the unset-HOME arm instead
+/// of unsetting process-global env).
+fn install_arcrc_for_with(
+    default: Option<PathBuf>,
+    arcrc_file: Option<&str>,
+) -> Result<PathBuf, ExitCode> {
+    match get_config::resolve_user_file(default, arcrc_file.map(Path::new)) {
         Ok(Some(path)) => Ok(path),
-        // LCOV_EXCL_START // Reason: needs HOME/USERPROFILE unset; always set in CI
         Ok(None) => Err(fail(
             "cannot locate ~/.arcrc (HOME/USERPROFILE is not set)".to_string(),
-        )), // LCOV_EXCL_STOP
+        )),
         Err(message) => Err(fail(message)),
     }
 }

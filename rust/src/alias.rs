@@ -1085,11 +1085,6 @@ pub fn execute_delete(
     })
 }
 
-fn user_file_or_error() -> Result<PathBuf, String> {
-    config::arcrc_path()
-        .ok_or_else(|| "cannot locate ~/.arcrc (HOME/USERPROFILE is not set)".to_string())
-}
-
 fn print_report(report: &Report) {
     for warning in &report.warnings {
         eprintln!("ALIAS: {warning}");
@@ -1139,67 +1134,88 @@ pub fn run(argv: &[String]) -> ExitCode {
     if options.positional.len() == 1 {
         return run_delete(&options);
     }
-    run_create(&options)
+    run_create_with(config::arcrc_path().as_deref(), &options)
 }
 
 fn run_list(options: &Options) -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    match execute_list(&cwd, config::arcrc_path().as_deref(), options.json) {
+    run_list_with(&cwd, config::arcrc_path().as_deref(), options)
+}
+
+/// [`run_list`] with an explicit working copy and credential file
+/// (test seam: hermetic tests stage a fake arcrc, a hostile one, or
+/// `None` instead of touching HOME).
+fn run_list_with(dir: &Path, user_file: Option<&Path>, options: &Options) -> ExitCode {
+    match execute_list(dir, user_file, options.json) {
         Ok(report) => {
             print_report(&report);
             ExitCode::SUCCESS
         }
-        Err(message) => conduit::report(conduit::EnvelopeKind::Fatal, &message), // LCOV_EXCL_LINE // Reason: needs execute_list to fail via system/cwd/HOME config; none is hermetically stageable
+        Err(message) => conduit::report(conduit::EnvelopeKind::Fatal, &message),
     }
 }
 
 fn run_delete(options: &Options) -> ExitCode {
-    let user_file = match user_file_or_error() {
-        Ok(path) => path,
-        Err(message) => return conduit::report(conduit::EnvelopeKind::Fatal, &message), // LCOV_EXCL_LINE // Reason: needs HOME/USERPROFILE unset; unsetting env is process-global mutation
-    };
+    let user_file = config::arcrc_path();
     let stdin = std::io::stdin();
     let mut locked = stdin.lock();
-    match execute_delete(
-        &user_file,
+    run_delete_with(
+        user_file.as_deref(),
         &options.positional[0],
         &mut locked,
         prompt::stdin_is_terminal(),
-    ) {
+    )
+}
+
+/// [`run_delete`] with explicit inputs (test seam: `None` stages the
+/// unset-HOME arm, hostile paths stage arcrc failures, and canned
+/// stdin plus `stdin_tty` stage declined prompts).
+fn run_delete_with(
+    user_file: Option<&Path>,
+    trigger: &str,
+    input: &mut dyn BufRead,
+    stdin_tty: bool,
+) -> ExitCode {
+    let Some(user_file) = user_file else {
+        return conduit::report(
+            conduit::EnvelopeKind::Fatal,
+            "cannot locate ~/.arcrc (HOME/USERPROFILE is not set)",
+        );
+    };
+    match execute_delete(user_file, trigger, input, stdin_tty) {
         Ok(report) => {
             print_report(&report);
             ExitCode::SUCCESS
         }
-        // LCOV_EXCL_START // Reason: needs a delete failure against the real-HOME arcrc or a declined prompt on real stdin
         Err(message) => {
             if message == prompt::ABORT {
                 conduit::report(conduit::EnvelopeKind::UserAbort, &message)
             } else {
-                conduit::report(conduit::EnvelopeKind::Fatal, &message) // LCOV_EXCL_STOP
+                conduit::report(conduit::EnvelopeKind::Fatal, &message)
             }
         }
     }
 }
 
-fn run_create(options: &Options) -> ExitCode {
+/// Create runner with an explicit credential file (test seam: like
+/// [`run_delete_with`]; `run` passes the ambient `~/.arcrc`, so a
+/// builtin trigger still fails before any filesystem read).
+fn run_create_with(user_file: Option<&Path>, options: &Options) -> ExitCode {
     if let Err(message) = validate_trigger(&options.positional[0]) {
         return conduit::report(conduit::EnvelopeKind::ToolsetUsage, &message);
-    } // LCOV_EXCL_LINE // Reason: a valid trigger proceeds to a real-HOME arcrc write; hermetic tests cannot touch HOME
-    // LCOV_EXCL_START // Reason: a valid trigger proceeds to a real-HOME arcrc write; hermetic tests cannot touch HOME
-    let user_file = match user_file_or_error() {
-        // LCOV_EXCL_STOP
-        Ok(path) => path, // LCOV_EXCL_LINE // Reason: a valid trigger proceeds to a real-HOME arcrc write; hermetic tests cannot touch HOME
-        Err(message) => return conduit::report(conduit::EnvelopeKind::Fatal, &message), // LCOV_EXCL_LINE // Reason: needs HOME/USERPROFILE unset; unsetting env is process-global mutation
+    }
+    let Some(user_file) = user_file else {
+        return conduit::report(
+            conduit::EnvelopeKind::Fatal,
+            "cannot locate ~/.arcrc (HOME/USERPROFILE is not set)",
+        );
     };
-    // LCOV_EXCL_START // Reason: a valid trigger proceeds to a real-HOME arcrc write; hermetic tests cannot touch HOME
-    match execute_create(&user_file, &options.positional[0], &options.positional[1..]) {
-        // LCOV_EXCL_STOP
-        // LCOV_EXCL_START // Reason: a valid trigger proceeds to a real-HOME arcrc write; hermetic tests cannot touch HOME
+    match execute_create(user_file, &options.positional[0], &options.positional[1..]) {
         Ok(report) => {
             print_report(&report);
-            ExitCode::SUCCESS // LCOV_EXCL_STOP
+            ExitCode::SUCCESS
         }
-        Err(message) => conduit::report(conduit::EnvelopeKind::Fatal, &message), // LCOV_EXCL_LINE // Reason: needs a failing HOME arcrc read/write; staging HOME failures is not hermetic
+        Err(message) => conduit::report(conduit::EnvelopeKind::Fatal, &message),
     }
 }
 

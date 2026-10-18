@@ -6074,6 +6074,27 @@ fn run_patch_flow(
     backends: &Backends,
     ansi: bool,
 ) -> Result<FlowOutcome, String> {
+    run_patch_flow_with(
+        dir,
+        options,
+        io,
+        backends,
+        ansi,
+        config::arcrc_path().as_deref(),
+    )
+}
+
+/// [`run_patch_flow`] with an explicit credential file (test seam:
+/// hermetic tests stage a fake arcrc plus a loopback stub instead of
+/// touching HOME).
+fn run_patch_flow_with(
+    dir: &Path,
+    options: &Options,
+    io: &mut Io,
+    backends: &Backends,
+    ansi: bool,
+    user_file: Option<&Path>,
+) -> Result<FlowOutcome, String> {
     let source = select_source(options)?;
     let Some(vcs) = detect_vcs(dir) else {
         return Err(NOT_A_WORKING_COPY.to_string());
@@ -6082,14 +6103,14 @@ fn run_patch_flow(
     // Built before the clean check, like PHP's workflow setup: conduit
     // errors precede worktree errors, and amend detection (PATCH-P9) can
     // run the published-check. `--patch` sources stay conduit-less.
-    let client = setup_patch_client(&source, options, dir)?;
+    let client = setup_patch_client_with(&source, options, dir, user_file)?;
     let call = |method: &str, params: &serde_json::Value| {
-        client // LCOV_EXCL_START // Reason: live conduit call body; tests use --patch sources (client None) since conduit needs creds
+        client
             .as_ref()
             .expect("conduit client")
             .call(method, params)
             .map_err(|e| e.to_string())
-    }; // LCOV_EXCL_STOP
+    };
     let call_option: Option<&diff_submit::ConduitCall<'_>> = client
         .as_ref()
         .map(|_| &call as &dyn Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>);
@@ -6107,7 +6128,7 @@ fn run_patch_flow(
         options,
         call_option,
         &mut loaded,
-    )?; // LCOV_EXCL_LINE // Reason: encoding lookup fails only through live conduit; --patch flows carry no client
+    )?;
     let outcome = run_patch_flow_inner(dir, options, io, backends, vcs, ansi, call_option, loaded);
     let pop = unstash_changes(dir, stash);
     combine_patch_flow_outcome(outcome, pop)
@@ -6115,17 +6136,35 @@ fn run_patch_flow(
 
 /// Conduit client for the flow, built before the clean check so conduit
 /// errors precede worktree errors. `--patch` sources stay conduit-less.
-fn setup_patch_client(
+/// Takes an explicit credential file (test seam: hermetic tests stage a
+/// fake arcrc instead of touching HOME); same URI precedence and
+/// token lookup as the classic ambient setup.
+fn setup_patch_client_with(
     source: &Source,
     options: &Options,
     dir: &Path,
+    user_file: Option<&Path>,
 ) -> Result<Option<arc_rs::conduit::Client>, String> {
     match source {
         Source::Patch(_) => Ok(None),
-        _ => Ok(Some(land::client_for_dir(
-            options.conduit_uri.as_deref(),
-            dir,
-        )?)),
+        _ => {
+            let uri = land::resolve_conduit_uri_with(
+                options.conduit_uri.as_deref(),
+                dir,
+                user_file,
+                &get_config::LoadOptions::default(),
+            )
+            .ok_or_else(|| {
+                "no conduit URI: pass --conduit-uri, set ARC_CONDUIT_URI, or run inside a project \
+                 with .arcconfig"
+                    .to_string()
+            })?;
+            let token = user_file
+                .and_then(|path| config::token_for_file(path, &uri))
+                .ok_or_else(|| format!("no token for {uri} in ~/.arcrc"))?;
+            let client = arc_rs::conduit::Client::new(&uri, &token).map_err(|e| e.to_string())?;
+            Ok(Some(client))
+        }
     }
 }
 
@@ -6431,6 +6470,27 @@ pub fn execute_with_io_ansi(
     backends: &Backends,
     ansi: bool,
 ) -> Result<Out, String> {
+    execute_with_io_ansi_and_user_file(
+        dir,
+        argv,
+        io,
+        backends,
+        ansi,
+        config::arcrc_path().as_deref(),
+    )
+}
+
+/// [`execute_with_io_ansi`] with an explicit credential file (test
+/// seam: hermetic tests stage a fake arcrc plus a loopback stub
+/// instead of touching HOME).
+fn execute_with_io_ansi_and_user_file(
+    dir: &Path,
+    argv: &[String],
+    io: &mut Io,
+    backends: &Backends,
+    ansi: bool,
+    user_file: Option<&Path>,
+) -> Result<Out, String> {
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
@@ -6440,28 +6500,32 @@ pub fn execute_with_io_ansi(
         Err(message) => return Err(format!("{message}\n\n{}", usage())),
     };
     if options.preview {
-        return execute_preview(dir, &options, io);
+        return execute_preview_with(dir, &options, io, user_file);
     }
-    match run_patch_flow(dir, &options, io, backends, ansi)? {
+    match run_patch_flow_with(dir, &options, io, backends, ansi, user_file)? {
         FlowOutcome::Done => Ok(std::mem::take(&mut io.out)),
         FlowOutcome::SvnHunksFailed => Err(String::new()),
     }
 }
 
 /// Print the patch for `--preview` without touching the working copy.
-fn execute_preview(dir: &Path, options: &Options, io: &mut Io) -> Result<Out, String> {
+/// Takes an explicit credential file (test seam: hermetic tests stage
+/// a fake arcrc plus a loopback stub instead of touching HOME).
+fn execute_preview_with(
+    dir: &Path,
+    options: &Options,
+    io: &mut Io,
+    user_file: Option<&Path>,
+) -> Result<Out, String> {
     let source = select_source(options)?;
-    let client = match &source {
-        Source::Patch(_) => None,
-        _ => Some(land::client_for_dir(options.conduit_uri.as_deref(), dir)?),
-    };
+    let client = setup_patch_client_with(&source, options, dir, user_file)?;
     let call = |method: &str, params: &serde_json::Value| {
-        client // LCOV_EXCL_START // Reason: live conduit call body; tests use --patch sources (client None) since conduit needs creds
+        client
             .as_ref()
             .expect("conduit client")
             .call(method, params)
             .map_err(|e| e.to_string())
-    }; // LCOV_EXCL_STOP
+    };
     let call_option: Option<&diff_submit::ConduitCall<'_>> = client
         .as_ref()
         .map(|_| &call as &dyn Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>);

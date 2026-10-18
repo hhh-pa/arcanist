@@ -16,7 +16,7 @@
 //! terminal width. Chunk progress goes to stderr with a TTY progress bar,
 //! like PHP.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::conduit::{self, EnvelopeKind};
@@ -1000,6 +1000,16 @@ struct UploadParts {
 }
 
 fn execute_parts(dir: &Path, argv: &[String]) -> Result<UploadParts, String> {
+    execute_parts_with(dir, argv, crate::config::arcrc_path().as_deref())
+}
+
+/// [`execute_parts`] with an explicit credential file (test seam:
+/// hermetic tests stage a fake arcrc instead of touching HOME).
+fn execute_parts_with(
+    dir: &Path,
+    argv: &[String],
+    user_file: Option<&Path>,
+) -> Result<UploadParts, String> {
     let opts = match parse_args(argv) {
         ParseOutcome::Args(opts) => opts,
         ParseOutcome::Help => {
@@ -1015,7 +1025,15 @@ fn execute_parts(dir: &Path, argv: &[String]) -> Result<UploadParts, String> {
         // T1153 R4 (UPLOAD-U15): PHP renders usage errors with no dump.
         ParseOutcome::Error(message) => return Err(message),
     };
-    let client = crate::config::client_for(opts.conduit_uri.as_deref())?;
+    // Byte-identical to `config::client_for(..)` when the wrapper
+    // passes the ambient user file (same cwd fallback).
+    let config_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let client = crate::config::client_for_with(
+        opts.conduit_uri.as_deref(),
+        &config_dir,
+        user_file,
+        &crate::get_config::LoadOptions::default(),
+    )?;
     let base = resolve_conduit_uri(opts.conduit_uri.as_deref());
     let uploads = collect_uploads(&client, dir, &opts.paths, opts.temporary)?;
     let refs = resolve_refs(&client, &uploads, base.as_deref())?;
@@ -1030,10 +1048,20 @@ fn execute_parts(dir: &Path, argv: &[String]) -> Result<UploadParts, String> {
 
 /// Run the workflow rooted at `dir`, returning stdout text or an error message.
 pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
-    let parts = execute_parts(dir, argv)?;
+    execute_with_user_file(dir, argv, crate::config::arcrc_path().as_deref())
+}
+
+/// [`execute`] with an explicit credential file (test seam: hermetic
+/// tests stage a fake arcrc instead of touching HOME).
+fn execute_with_user_file(
+    dir: &Path,
+    argv: &[String],
+    user_file: Option<&Path>,
+) -> Result<String, String> {
+    let parts = execute_parts_with(dir, argv, user_file)?;
     if parts.browse {
-        let configured = crate::browser::configured_browser(dir); // LCOV_EXCL_START // Reason: needs a token-bearing client to reach browse; unit tests stage no credentials
-        crate::browser::open_uris_in_browser(&parts.uris, configured.as_deref())?; // LCOV_EXCL_STOP
+        let configured = crate::browser::configured_browser(dir);
+        crate::browser::open_uris_in_browser(&parts.uris, configured.as_deref())?;
     }
     Ok(parts.text)
 }
@@ -1055,7 +1083,7 @@ pub fn run_in_with_sink(dir: &Path, argv: &[String], sink: &mut dyn FnMut(&str))
                     // Browse failures are uncaught `ArcanistUsageException`s
                     // (a plain `Exception` subclass): fatal (255).
                     return conduit::report(EnvelopeKind::Fatal, &message);
-                } // LCOV_EXCL_LINE // Reason: browse-success fall-through; reaching it needs a token-bearing client
+                }
             }
             ExitCode::SUCCESS
         }

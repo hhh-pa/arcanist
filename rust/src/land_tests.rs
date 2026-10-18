@@ -2641,7 +2641,7 @@ fn hg_merge_and_push_surface_limits() {
     assert!(
         hg_execute_merge(&dir, &mut io, &set, &commits, None, true, None, &|_| {
             Ok("m".to_string()) // LCOV_EXCL_LINE // Reason: closure body never invoked on this error path
-        }) // LCOV_EXCL_LINE // Reason: closure body never invoked on this error path
+        })
         .is_err()
     );
     let mut io = Io::canned(&[]);
@@ -7713,7 +7713,7 @@ fn t1170_land_config_reports_bad_runtime_config() {
 }
 
 #[test]
-fn t1170_client_for_dir_reports_missing_uris() {
+fn t1170_client_for_dir_with_reports_missing_uris() {
     // Without a flag, `ARC_CONDUIT_URI`, or discovery the client
     // reports the missing URI. Ambient configuration that resolves a
     // URI skips the arm (CI has none).
@@ -7722,7 +7722,13 @@ fn t1170_client_for_dir_reports_missing_uris() {
         std::fs::remove_dir_all(&dir).ok(); // LCOV_EXCL_START // Reason: skip arm for ambient conduit config; CI provides none
         return; // LCOV_EXCL_STOP
     }
-    let err = client_for_dir(None, &dir).unwrap_err();
+    let err = client_for_dir_with(
+        None,
+        &dir,
+        None,
+        &arc_rs::get_config::LoadOptions::default(),
+    )
+    .unwrap_err();
     assert!(err.contains("no conduit URI"), "unexpected: {err}");
     std::fs::remove_dir_all(&dir).ok();
 }

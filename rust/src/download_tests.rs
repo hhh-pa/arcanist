@@ -1235,7 +1235,7 @@ fn serve_helpers_release_aborted_connections() {
             std::thread::sleep(std::time::Duration::from_millis(20));
             if std::net::TcpStream::connect(&addr).is_err() {
                 break;
-            } // LCOV_EXCL_LINE // Reason: llvm brace-counter flake; line covered in prior run and the loop body executes
+            }
         }
         let released = std::net::TcpStream::connect(&addr).is_err();
         assert!(released, "aborted {url} never released");
