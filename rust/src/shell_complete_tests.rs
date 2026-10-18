@@ -483,6 +483,43 @@ fn install_flow_rejects_unsupported_shells_before_prompting() {
 }
 
 #[test]
+fn run_install_with_installs_on_tty_yes() {
+    // The injected seam stages the install-success arm: a TTY "y"
+    // writes the hook line into a scratch HOME's `.profile`.
+    let home = scratch("install-yes");
+    let home_text = home.to_string_lossy().to_string();
+    let mut input = std::io::Cursor::new("y\n");
+    let mut save = |_: crate::prompts::PromptScope, _: &str| -> Result<(), String> { Ok(()) };
+    assert!(
+        run_install_with(
+            "bash",
+            None,
+            Some(&home_text),
+            &mut input,
+            true,
+            None,
+            &mut save
+        )
+        .is_ok()
+    );
+    let profile = std::fs::read_to_string(home.join(".profile")).unwrap();
+    assert!(profile.contains("arcanist-shell-complete"), "{profile}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn run_install_with_reports_install_errors() {
+    // The injected seam stages the failure arm: no HOME means no
+    // install target.
+    let mut input = std::io::Cursor::new("");
+    let mut save = |_: crate::prompts::PromptScope, _: &str| -> Result<(), String> { Ok(()) };
+    assert_eq!(
+        run_install_with("bash", None, None, &mut input, false, None, &mut save),
+        Err(std::process::ExitCode::FAILURE)
+    );
+}
+
+#[test]
 fn t1170_run_generate_regenerates_rules() {
     use std::process::ExitCode;
     assert_eq!(run(&args(&["--generate"])), ExitCode::SUCCESS);

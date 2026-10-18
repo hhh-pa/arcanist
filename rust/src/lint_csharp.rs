@@ -46,6 +46,13 @@ pub struct CsharpLinter {
     binary_hint: Option<PathBuf>,
     discovery: Option<BTreeMap<String, Vec<String>>>,
     error: RefCell<Option<String>>,
+    /// Test seam: base directory for the staged temp input (`None` uses
+    /// `std::env::temp_dir()`, the production behavior).
+    temp_dir: Option<PathBuf>,
+    /// Test seam: directory searched for the tool instead of the
+    /// ambient `$PATH` (`None` searches the ambient `$PATH`, the
+    /// production behavior).
+    path_dir: Option<PathBuf>,
 }
 
 impl CsharpLinter {
@@ -59,7 +66,10 @@ impl CsharpLinter {
     /// the runtime comes first, then the tool, then the version probe,
     /// and every failure reports PHP's text for the aggregate.
     fn resolve(&self) -> Result<(PathBuf, Vec<String>), String> {
-        self.resolve_in(&std::env::var_os("PATH").unwrap_or_default())
+        match &self.path_dir {
+            Some(dir) => self.resolve_in(dir.as_os_str()),
+            None => self.resolve_in(&std::env::var_os("PATH").unwrap_or_default()),
+        }
     }
 
     /// [`resolve`](Self::resolve) against an explicit `PATH` value, so
@@ -249,11 +259,12 @@ fn find_on_path(path_env: &std::ffi::OsStr, binary: &str) -> Option<PathBuf> {
         if candidate.is_file() {
             return Some(candidate);
         }
-        if cfg!(windows) {
-            let exe = dir.join(format!("{binary}.exe")); // LCOV_EXCL_START // Reason: windows-only .exe probe; cfg!(windows) is false on ubuntu CI
+        #[cfg(windows)]
+        {
+            let exe = dir.join(format!("{binary}.exe"));
             if exe.is_file() {
                 return Some(exe);
-            } // LCOV_EXCL_STOP
+            }
         }
     }
     None
@@ -274,14 +285,19 @@ fn resolve_command_in(
         .filter(|path| path.is_file())
         .map(Path::to_path_buf)
         .or_else(|| find_on_path(path_env, binary_name()))?;
-    let mut prefix = command_flags_for(settings);
-    if cfg!(windows) {
-        Some((cslint, prefix)) // LCOV_EXCL_LINE // Reason: windows direct-exec arm; cfg!(windows) is false on ubuntu CI
-    } else {
+    #[cfg(windows)]
+    let out = {
+        let prefix = command_flags_for(settings);
+        Some((cslint, prefix))
+    };
+    #[cfg(not(windows))]
+    let out = {
+        let mut prefix = command_flags_for(settings);
         let mono = find_on_path(path_env, runtime_name())?;
         prefix.insert(0, cslint.to_string_lossy().into_owned());
         Some((mono, prefix))
-    }
+    };
+    out
 }
 
 /// Resolve the tool on the real `$PATH` with default settings; `None`
@@ -304,7 +320,7 @@ fn check_version(program: &Path, prefix: &[String]) -> Result<(), String> {
             return Err(old_version_error());
         };
         command.arg(cslint);
-    } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
+    }
     command.arg("-v").stdin(Stdio::null());
     let Ok(output) = arc_rs::lint::spawn_with_retry(&mut command) else {
         return Err(old_version_error());
@@ -363,14 +379,14 @@ struct StagedFile {
 }
 
 impl StagedFile {
-    fn stage(display_path: &str, data: &[u8]) -> Result<Self, String> {
+    fn stage(dir: &Path, display_path: &str, data: &[u8]) -> Result<Self, String> {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = dir.join(format!(
             "arc-rs-lint-csharp-{}-{nanos}-{n}",
             std::process::id()
         ));
@@ -423,11 +439,23 @@ pub fn lint_with_command(
     data: &[u8],
     command: Option<(&Path, &[String])>,
 ) -> Vec<LintMessage> {
+    let dir = std::env::temp_dir();
+    lint_with_command_in(&dir, path, data, command)
+}
+
+/// [`lint_with_command`] with the staging base directory injected, so
+/// tests can cover the staging-failure arm with an unwritable directory.
+fn lint_with_command_in(
+    dir: &Path,
+    path: &str,
+    data: &[u8],
+    command: Option<(&Path, &[String])>,
+) -> Vec<LintMessage> {
     let Some((program, prefix)) = command else {
         return Vec::new();
     };
-    let Ok(staged) = StagedFile::stage(path, data) else {
-        return Vec::new(); // LCOV_EXCL_LINE // Reason: staging failure; hermetic tests cannot fail temp-dir writes
+    let Ok(staged) = StagedFile::stage(dir, path, data) else {
+        return Vec::new();
     };
     let Some((code, stdout, stderr)) = run_tool(program, prefix, staged.path()) else {
         return Vec::new();
@@ -723,14 +751,15 @@ impl Linter for CsharpLinter {
             return Vec::new();
         }
         let command = match self.resolve() {
-            Ok(command) => command, // LCOV_EXCL_LINE // Reason: resolve-Ok arm; needs cslint plus mono, absent on ubuntu CI
+            Ok(command) => command,
             Err(error) => {
                 *self.error.borrow_mut() = Some(error);
                 return Vec::new();
             }
         };
-        let borrowed = Some((command.0.as_path(), command.1.as_slice())); // LCOV_EXCL_START // Reason: resolve-Ok arm; needs cslint plus mono, absent on ubuntu CI
-        lint_with_command(path, data, borrowed) // LCOV_EXCL_STOP
+        let borrowed = Some((command.0.as_path(), command.1.as_slice()));
+        let dir = self.temp_dir.clone().unwrap_or_else(std::env::temp_dir);
+        lint_with_command_in(&dir, path, data, borrowed)
     }
 
     fn take_error(&self) -> Option<String> {

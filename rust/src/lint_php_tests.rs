@@ -280,3 +280,23 @@ fn version_requirement_gates_linting() {
         .unwrap();
     assert_eq!(linter.lint_bytes("a.php", b"<?php echo 1;\n").len(), 1);
 }
+
+#[test]
+#[cfg(unix)]
+fn temp_write_failure_reports_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new("temp-fail");
+    let tool = tmp.path().join("fake-php");
+    std::fs::write(&tool, b"x").unwrap();
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let mut linter = PhpLinter {
+        temp_dir: Some(locked.clone()),
+        ..Default::default()
+    };
+    linter.options.bin = Some(tool);
+    assert!(linter.lint_bytes("a.php", b"<?php echo 1;").is_empty());
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+}

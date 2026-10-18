@@ -248,3 +248,88 @@ fn drawing_without_columns_panics_like_php() {
     let grid = GridView::new();
     let _ = grid.draw(Some(80));
 }
+
+// -( T1176 PC-2: demark tty-commands )-----------------------------------------
+
+#[cfg(unix)]
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-grid-tests-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+#[cfg(unix)]
+fn write_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn tput_spawn_failure_yields_none() {
+    // No `tput` at the seam path: the spawn-failure arm returns None.
+    let tmp = TempDir::new("tput-missing");
+    assert_eq!(terminal_width_from_program(tmp.path().join("tput")), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn tput_failing_exit_yields_none() {
+    let tmp = TempDir::new("tput-fail");
+    let fake = write_script(tmp.path(), "tput", "#!/bin/sh\nexit 1\n");
+    assert_eq!(terminal_width_from_program(&fake), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn tput_success_parses_widths_end_to_end() {
+    let tmp = TempDir::new("tput-ok");
+    for (body, expected) in [
+        ("#!/bin/sh\necho 80\n", Some(80)),
+        ("#!/bin/sh\nprintf '  120\\t\\n'\n", Some(120)),
+        ("#!/bin/sh\nprintf '%s' '0'\n", None),
+        ("#!/bin/sh\nprintf '%s' ''\n", None),
+        ("#!/bin/sh\nprintf '%s' 'junk'\n", None),
+    ] {
+        let fake = write_script(tmp.path(), "tput", body);
+        assert_eq!(terminal_width_from_program(&fake), expected, "{body:?}");
+    }
+}
+
+#[cfg(not(windows))]
+#[test]
+fn parse_tput_width_matrix() {
+    assert_eq!(parse_tput_width("80\n"), Some(80));
+    assert_eq!(parse_tput_width("  120  "), Some(120));
+    assert_eq!(parse_tput_width("0"), None);
+    assert_eq!(parse_tput_width(""), None);
+    assert_eq!(parse_tput_width("junk"), None);
+    assert_eq!(parse_tput_width("-5"), None);
+    assert_eq!(parse_tput_width("80x"), None);
+}

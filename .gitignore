@@ -4,3 +4,7 @@
 # Rust build trees.
 /rust/target/
 /rust/target-*/
+
+# TLC model-checker artifacts
+tla/*_TTrace_*
+tla/states/

@@ -404,19 +404,67 @@ pub struct CommitInfo {
 
 /// Resolve `rev` and read its full hash and message with git.
 pub fn read_commit(dir: &Path, rev: &str) -> Result<CommitInfo, String> {
-    if !git::is_inside_work_tree(dir) {
+    read_commit_with(dir, rev, None)
+}
+
+/// [`git::stdout_text`] with the `git` program override injected (test
+/// seam; production passes `None`, which spawns `git`). Mirrors
+/// `git::stdout_text` exactly: trimmed stdout on success, the combined
+/// trimmed output (or a `git <args> failed` fallback) on failure.
+fn git_stdout_text(
+    dir: &Path,
+    args: &[&str],
+    git_program: Option<&Path>,
+) -> Result<String, String> {
+    let out = git::output_with_git(dir, args, git_program)?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+    } else {
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let trimmed = combined.trim();
+        if trimmed.is_empty() {
+            Err(format!("git {} failed", args.join(" ")))
+        } else {
+            Err(trimmed.to_string())
+        }
+    }
+}
+
+/// [`git::is_inside_work_tree`] with the `git` program override
+/// injected (test seam; production passes `None`, which spawns `git`).
+fn git_inside_work_tree(dir: &Path, git_program: Option<&Path>) -> bool {
+    let Ok(out) = git::output_with_git(dir, &["rev-parse", "--is-inside-work-tree"], git_program)
+    else {
+        return false;
+    };
+    out.status.success() && out.stdout.trim_ascii() == b"true"
+}
+
+/// [`read_commit`] with the `git` program override injected (test seam;
+/// production passes `None`, which spawns `git`).
+fn read_commit_with(
+    dir: &Path,
+    rev: &str,
+    git_program: Option<&Path>,
+) -> Result<CommitInfo, String> {
+    if !git_inside_work_tree(dir, git_program) {
         return Err(
             "\"arc inspect\" must be run in a Git working copy to inspect \"working-copy(...)\"."
                 .to_string(),
         );
     }
     let arg = format!("{rev}^{{commit}}");
-    let hash = git::stdout_text(dir, &["rev-parse", "--verify", &arg])
+    let hash = git_stdout_text(dir, &["rev-parse", "--verify", &arg], git_program)
         .map_err(|_| format!("unknown commit \"{rev}\"."))?;
     if hash.is_empty() {
-        return Err(format!("unknown commit \"{rev}\".")); // LCOV_EXCL_LINE // Reason: rev-parse prints the hash on success; empty success output unreachable
+        return Err(format!("unknown commit \"{rev}\"."));
     }
-    let message = git::stdout_text(dir, &["show", "-s", "--format=%B", &hash]).unwrap_or_default();
+    let message = git_stdout_text(dir, &["show", "-s", "--format=%B", &hash], git_program)
+        .unwrap_or_default();
     Ok(CommitInfo { hash, message })
 }
 
@@ -534,7 +582,7 @@ pub fn resolve_commit_symbol(dir: &Path, symbol: &str) -> Result<Option<String>,
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
         let _ = writeln!(stdin, "{symbol}");
-    } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
+    }
     let output = child
         .wait_with_output()
         .map_err(|e| format!("failed to run git: {e}"))?;
@@ -562,20 +610,7 @@ pub fn lookup_remote(dir: &Path, name: &str) -> Result<(), String> {
             return Ok(());
         }
     } else if markers::find_hg_root(dir).is_some() {
-        let output = hg::output_with(dir, &hg::HgCommand::system(), &["paths"])?;
-        // LCOV_EXCL_START // Reason: needs system hg for `hg paths`; absent on ubuntu CI
-        if !output.status.success() {
-            return Err(markers::command_exception_text(
-                output.status.code().unwrap_or(1),
-                "hg paths",
-                &String::from_utf8_lossy(&output.stdout),
-                &String::from_utf8_lossy(&output.stderr),
-            ));
-        }
-        let paths = parse_hg_paths(&String::from_utf8_lossy(&output.stdout))?;
-        if paths.iter().any(|(remote, _)| remote == name) {
-            return Ok(());
-        } // LCOV_EXCL_STOP
+        return lookup_remote_hg(dir, name, &hg::HgCommand::system());
     } else if markers::find_svn_root(dir).is_some() {
         return Err(
             "Method newRemoteRefQueryTemplate in class ArcanistSubversionAPI is not implemented!"
@@ -586,6 +621,25 @@ pub fn lookup_remote(dir: &Path, name: &str) -> Result<(), String> {
             "Method newRemoteRefQueryTemplate in class ArcanistFilesystemAPI is not implemented!"
                 .to_string(),
         );
+    }
+    Err(format!("This working copy has no remote named \"{name}\"."))
+}
+
+/// The Mercurial branch of [`lookup_remote`] with an injectable `hg`
+/// (test seam; production passes [`hg::HgCommand::system`]).
+fn lookup_remote_hg(dir: &Path, name: &str, hg_command: &hg::HgCommand) -> Result<(), String> {
+    let output = hg::output_with(dir, hg_command, &["paths"])?;
+    if !output.status.success() {
+        return Err(markers::command_exception_text(
+            output.status.code().unwrap_or(1),
+            "hg paths",
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        ));
+    }
+    let paths = parse_hg_paths(&String::from_utf8_lossy(&output.stdout))?;
+    if paths.iter().any(|(remote, _)| remote == name) {
+        return Ok(());
     }
     Err(format!("This working copy has no remote named \"{name}\"."))
 }

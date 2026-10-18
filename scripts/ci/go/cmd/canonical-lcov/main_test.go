@@ -134,14 +134,21 @@ func TestApplyExclusions(t *testing.T) {
 	if err := os.WriteFile(other, []byte("// LCOV_EXCL_LINE\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	brace := filepath.Join(dir, "c.rs")
+	braceBody := "fn f() {\n" + // 1 code, DA 0: kept (true miss)
+		"}\n" // 2 bare, DA 0: dropped
+	if err := os.WriteFile(brace, []byte(braceBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	merged := map[string]map[int]int64{
 		src:   {1: 1, 2: 7, 3: 0, 4: 0, 5: 0},
 		other: {1: 0},
+		brace: {1: 0, 2: 0},
 	}
 	if err := applyExclusions(merged); err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]map[int]int64{src: {1: 1}, other: {}}
+	want := map[string]map[int]int64{src: {1: 1}, other: {}, brace: {1: 0}}
 	if !reflect.DeepEqual(merged, want) {
 		t.Fatalf("merged = %v, want %v", merged, want)
 	}

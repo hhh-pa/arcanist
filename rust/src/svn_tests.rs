@@ -663,11 +663,10 @@ fn diffs_known_paths() {
     assert!(log.contains("diff --depth empty a.txt"), "{log}");
     let unix_config = SvnDiffConfig::unix(3, "/scripts/binary_safe_diff.sh");
     get_raw_diff_text_with(&fake.dir, &fake.svn, "a.txt", &status, &unix_config).unwrap();
+    let log = fake.log();
     assert!(
-        fake.log()
-            .contains("--diff-cmd /scripts/binary_safe_diff.sh -x -U3"),
-        "{}",
-        fake.log() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+        log.contains("--diff-cmd /scripts/binary_safe_diff.sh -x -U3"),
+        "{log}"
     );
 }
 
@@ -722,11 +721,10 @@ fn diffs_binary_files() {
         &SvnDiffConfig::windows(3),
     )
     .unwrap();
+    let log = fake.log();
     assert!(
-        fake.log()
-            .contains("propset svn:mime-type application/octet-stream"),
-        "{}",
-        fake.log() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+        log.contains("propset svn:mime-type application/octet-stream"),
+        "{log}"
     );
 
     let octet = FakeSvn::named("octet");
@@ -811,11 +809,10 @@ fn diffs_copied_additions() {
         diff_log.contains("-L a/orig.txt -L b/copied.txt -U3"),
         "{diff_log}"
     );
+    let log = fake.log();
     assert!(
-        fake.log()
-            .contains("cat https://svn.example.test/repo/trunk/orig.txt@40"),
-        "{}",
-        fake.log() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+        log.contains("cat https://svn.example.test/repo/trunk/orig.txt@40"),
+        "{log}"
     );
 
     let same = FakeSvn::named("copysame");
@@ -909,35 +906,6 @@ echo hi
     releaser.join().unwrap();
 }
 
-/// True when exec refuses a write-held script with ETXTBSY (Linux
-/// does; macOS does not enforce it). Probed once per process so the
-/// stuck-script test pins behavior only where the errno exists.
-#[cfg(unix)]
-fn platform_reports_txtbsy() -> bool {
-    static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *PROBE.get_or_init(|| probe_txtbsy().unwrap_or(false))
-}
-
-#[cfg(unix)]
-fn probe_txtbsy() -> Option<bool> {
-    let dir = std::env::temp_dir().join(format!("arc-rs-txtbsy-probe-svn-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).ok()?;
-    let sh = dir.join("probe.sh");
-    std::fs::write(&sh, "#!/bin/sh\nexit 0\n").ok()?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&sh).ok()?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&sh, perms).ok()?;
-    }
-    let _held = std::fs::OpenOptions::new().write(true).open(&sh).ok()?;
-    let failed_busy = std::process::Command::new(&sh)
-        .output()
-        .is_err_and(|error| error.raw_os_error() == Some(26));
-    std::fs::remove_dir_all(&dir).ok();
-    Some(failed_busy)
-}
-
 #[test]
 fn output_retry_loop_is_bounded() {
     // A permanently busy spawn fails after the bound with the last
@@ -960,13 +928,12 @@ fn lang_env_var_falls_back_when_probe_fails() {
 }
 
 /// A permanently busy script still fails (after the bound) with the
-/// original error shape.
-#[cfg(unix)]
+/// original error shape. Linux-only: only Linux exec refuses a
+/// write-held script with ETXTBSY (macOS does not enforce it), so the
+/// test is meaningless elsewhere.
+#[cfg(target_os = "linux")]
 #[test]
 fn output_gives_up_on_permanently_busy_script() {
-    if !platform_reports_txtbsy() {
-        return; // LCOV_EXCL_LINE // Reason: probe is always true where gates measure (Linux reports ETXTBSY); the skip only trips on macOS
-    } // LCOV_EXCL_START // Reason: ETXTBSY-only test body; macOS exec never reports text-file-busy (probe-gated)
     let fake = FakeSvn::named("stuck");
     let sh = fake.dir.join("stuck.sh");
     std::fs::write(
@@ -985,7 +952,7 @@ echo hi
     let _held = std::fs::OpenOptions::new().write(true).open(&sh).unwrap();
     let svn = SvnCommand::custom(&sh.to_string_lossy(), &[]);
     let err = output_with(&fake.dir, &svn, &[]).unwrap_err();
-    assert!(err.contains("failed to run"), "{err}"); // LCOV_EXCL_STOP
+    assert!(err.contains("failed to run"), "{err}");
 }
 #[test]
 fn normalizes_status_path_separators() {
@@ -1516,9 +1483,9 @@ fn scratch_migration_reports_filesystem_failures() {
         // Root reads through permission bits; only assert where the
         // file is actually unreadable (same guard as the hg twin).
         if std::fs::read(&secret).is_err() {
-            assert!(!migrate_scratch_dir(&locked, &base.join("fresh-meta"))); // LCOV_EXCL_LINE // Reason: root reads through chmod 000, so the guard never opens where gates measure; covered on macOS runs
-            assert!(secret.exists()); // LCOV_EXCL_LINE // Reason: root reads through chmod 000, so the guard never opens where gates measure; covered on macOS runs
-        } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
+            assert!(!migrate_scratch_dir(&locked, &base.join("fresh-meta")));
+            assert!(secret.exists());
+        }
         {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = std::fs::metadata(&secret).unwrap().permissions();

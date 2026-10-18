@@ -81,4 +81,12 @@ RUN mkdir -p /tmp/warm/rust/src && printf 'fn main() {}\n' > /tmp/warm/rust/src/
         echo "udeps warm: nightly tree prebuilt (udeps exit $STATUS; unused-deps verdict deferred to runtime)"; } \
     && rm -rf /tmp/warm
 
+# T1176 DEMARK: the gates run as the host uid (see the workflow's
+# `--user`), so chmod-based unreadability genuinely fails reads (root
+# reads through permission bits, which deadened the EACCES arms and
+# post-root-skip test bodies). The prebuilt tree and cargo home stay
+# usable: world-writable is fine in an ephemeral CI container. Last so
+# everything the warm layer created is covered.
+RUN chmod -R a+rwX /opt/target /usr/local/cargo /usr/local/rustup
+
 WORKDIR /work

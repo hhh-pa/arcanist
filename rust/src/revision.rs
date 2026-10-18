@@ -235,7 +235,7 @@ pub fn revision_id_from_message(corpus: &str) -> Result<Option<u32>, String> {
     // case-insensitive, and `\s*` may span line breaks.
     let prefix = "differential revision:";
     let mut search = 0;
-    while search <= corpus.len() {
+    loop {
         let line_end = corpus[search..]
             .find('\n')
             .map(|index| search + index)
@@ -271,7 +271,6 @@ pub fn revision_id_from_message(corpus: &str) -> Result<Option<u32>, String> {
         }
         search = line_end + 1;
     }
-    Ok(None) // LCOV_EXCL_LINE // Reason: dead: the loop always returns via line_end==len; the guard never fails
 }
 
 /// Match a bare `D123` value (`/^[dD]([1-9]\d*)\z/`).
@@ -1173,9 +1172,6 @@ fn match_repeat(
             longest.extend(advanced.iter().copied());
         }
         counts = advanced;
-        if depth > chars.len() + 1 {
-            break; // LCOV_EXCL_LINE // Reason: dead bound: rounds advance strictly, so empty-advance exits first
-        }
     }
     longest.sort_unstable();
     longest.dedup();

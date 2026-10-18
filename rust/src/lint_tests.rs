@@ -1926,9 +1926,8 @@ fn r4_lint2_lint3_gather_emit_kinds() {
 }
 
 // -( T1153 Wave 2: lint retrocompat )--------------------------------------
-// LCOV_EXCL_START // Reason: referenced-but-never-called parser; the script fails before parsing
 fn lint4_failing_parser(_output: &str) -> Vec<crate::lint_script_and_regex::ScriptRegexMatch> {
-    unreachable!("the script fails before parsing") // LCOV_EXCL_STOP
+    unreachable!("the script fails before parsing")
 }
 
 #[test]
@@ -1968,12 +1967,9 @@ fn lint20_unreadable_files_fold_into_the_aggregate() {
     let locked = tmp.write("locked.txt", "x\n");
     tmp.write("ok.txt", "ok\n");
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-    if std::fs::read(&locked).is_ok() {
-        // Privileged runner (e.g. root in CI containers): permission
-        // bits do not block reads, so the failure under test cannot
-        // trigger.
-        return; // LCOV_EXCL_LINE // Reason: privileged-runner skip; runs only where reads ignore permission bits (root CI)
-    } // LCOV_EXCL_START // Reason: post-root-skip body; dead where gates measure (CI runs as root, so the skip always takes); covered on macOS runs
+    // Non-root runners only (the suite assumes a non-root user, like the
+    // gates container since T1176 DEMARK): root reads through chmod 000,
+    // so the failure under test cannot trigger there.
     let work = WorkCopy {
         vcs: Vcs::Git,
         vcs_root: tmp.path().to_path_buf(),
@@ -1991,19 +1987,20 @@ fn lint20_unreadable_files_fold_into_the_aggregate() {
         .unwrap_err(),
         "Some linters failed:"
     );
-    // LCOV_EXCL_STOP
 }
 
 /// LINT-20 on Linux CI: the chmod trigger cannot fail a read for root,
 /// so `/proc/self/mem` (a regular file whose every read faults EIO —
 /// the same deterministic trigger as the paste/upload twins) folds
-/// into the aggregate instead. Skips where `/proc` is unavailable.
+/// into the aggregate instead. Fails loud where `/proc` is missing
+/// (the gates image always provides it).
 #[cfg(target_os = "linux")]
 #[test]
 fn lint20_unreadable_proc_mem_folds_into_the_aggregate() {
-    if std::fs::symlink_metadata("/proc/self/mem").is_err() {
-        return; // LCOV_EXCL_LINE // Reason: /proc is always present where gates measure; the skip only trips in containers without /proc
-    }
+    assert!(
+        std::path::Path::new("/proc/self/mem").exists(),
+        "gates guarantee /proc on Linux; failing loud instead of skipping"
+    );
     let tmp = TempDir::new("lint20-proc");
     tmp.write("ok.txt", "ok\n");
     let work = WorkCopy {
@@ -3723,6 +3720,140 @@ fn cov_changed_lines_reports_hg_svn_errors() {
     }
 }
 
+#[cfg(unix)]
+fn chmod_exec(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Absolute form of a [`TempDir`] path: fakes spawn with the work dir
+/// as their cwd, so a relative program path would resolve wrong.
+#[cfg(unix)]
+fn abspath(path: &Path) -> PathBuf {
+    std::env::current_dir().unwrap().join(path)
+}
+
+#[test]
+#[cfg(unix)]
+fn t1176_merge_hg_status_merges_range_and_uncommitted() {
+    // Fake `hg` stages both merges: the range arm answers the
+    // `--rev ... --rev tip` probe, the uncommitted arm answers `status`;
+    // untracked entries stay dropped.
+    let tmp = TempDir::new("t1176-hg-status");
+    let fake = tmp.write(
+        "fakehg.sh",
+        "#!/bin/sh\ncase \" $* \" in\n*\" tip \"*) printf 'M range.txt\\n';;\n*) printf 'M work.txt\\n? new.txt\\n';;\nesac\nexit 0\n",
+    );
+    chmod_exec(&fake);
+    let hg_cmd = hg::HgCommand::custom(abspath(&fake).to_str().unwrap(), &[]);
+    let mut merged = BTreeMap::new();
+    merge_hg_status_with(tmp.path(), Some("tip"), &mut merged, &hg_cmd).unwrap();
+    assert!(merged.contains_key("range.txt"), "{merged:?}");
+    assert!(merged.contains_key("work.txt"), "{merged:?}");
+    assert!(!merged.contains_key("new.txt"), "{merged:?}");
+}
+
+#[test]
+#[cfg(unix)]
+fn t1176_merge_svn_status_drops_untracked() {
+    // Fake `svn` answers the `--xml status` probe; untracked entries
+    // stay dropped.
+    let tmp = TempDir::new("t1176-svn-status");
+    tmp.write(
+        "status.xml",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<status>\n<target path=\".\">\n<entry path=\"m.txt\">\n<wc-status props=\"none\" item=\"modified\" revision=\"42\">\n</wc-status>\n</entry>\n<entry path=\"u.txt\">\n<wc-status props=\"none\" item=\"unversioned\" revision=\"42\">\n</wc-status>\n</entry>\n</target>\n</status>\n",
+    );
+    let fake = tmp.write(
+        "fakesvn.sh",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\ncat \"$dir/status.xml\"\nexit 0\n",
+    );
+    chmod_exec(&fake);
+    let svn_cmd = svn::SvnCommand::custom(abspath(&fake).to_str().unwrap(), &[]);
+    let mut merged = BTreeMap::new();
+    merge_svn_status_with(tmp.path(), &mut merged, &svn_cmd).unwrap();
+    assert_eq!(merged.keys().collect::<Vec<_>>(), vec!["m.txt"]);
+}
+
+#[test]
+#[cfg(unix)]
+fn t1176_changed_lines_svn_reports_diff_lines() {
+    // Fake `svn` answers status (modified) plus a one-hunk diff.
+    let tmp = TempDir::new("t1176-svn-diff");
+    tmp.write("f.txt", "x\n");
+    tmp.write(
+        "status.xml",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<status>\n<target path=\".\">\n<entry path=\"f.txt\">\n<wc-status props=\"none\" item=\"modified\" revision=\"42\">\n</wc-status>\n</entry>\n</target>\n</status>\n",
+    );
+    let fake = tmp.write(
+        "fakesvn.sh",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\ncase \" $* \" in\n*\" status \"*) cat \"$dir/status.xml\";;\n*) printf '@@ -1 +1,2 @@\\n one\\n+two\\n';;\nesac\nexit 0\n",
+    );
+    chmod_exec(&fake);
+    let svn_cmd = svn::SvnCommand::custom(abspath(&fake).to_str().unwrap(), &[]);
+    let work = WorkCopy {
+        vcs: Vcs::Svn,
+        vcs_root: tmp.path().to_path_buf(),
+        project_root: tmp.path().to_path_buf(),
+    };
+    assert_eq!(
+        changed_lines_for_with(&work, "tip", "f.txt", &svn_cmd).unwrap(),
+        Some(BTreeSet::from([2]))
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn t1176_changed_lines_svn_missing_status_is_empty() {
+    // A path absent from the status output yields an empty change.
+    let tmp = TempDir::new("t1176-svn-empty");
+    tmp.write("f.txt", "x\n");
+    tmp.write(
+        "status.xml",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<status>\n<target path=\".\">\n<entry path=\"other.txt\">\n<wc-status props=\"none\" item=\"modified\" revision=\"42\">\n</wc-status>\n</entry>\n</target>\n</status>\n",
+    );
+    let fake = tmp.write(
+        "fakesvn.sh",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\ncat \"$dir/status.xml\"\nexit 0\n",
+    );
+    chmod_exec(&fake);
+    let svn_cmd = svn::SvnCommand::custom(abspath(&fake).to_str().unwrap(), &[]);
+    let work = WorkCopy {
+        vcs: Vcs::Svn,
+        vcs_root: tmp.path().to_path_buf(),
+        project_root: tmp.path().to_path_buf(),
+    };
+    assert_eq!(
+        changed_lines_for_with(&work, "tip", "f.txt", &svn_cmd).unwrap(),
+        Some(BTreeSet::new())
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn t1176_changed_lines_svn_diff_error_propagates() {
+    // A failing `svn diff` (unexpected code + stderr) propagates as
+    // Err, covering the `?` continuation of the diff call.
+    let tmp = TempDir::new("t1176-svn-differr");
+    tmp.write("f.txt", "x\n");
+    tmp.write(
+        "status.xml",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<status>\n<target path=\".\">\n<entry path=\"f.txt\">\n<wc-status props=\"none\" item=\"modified\" revision=\"42\">\n</wc-status>\n</entry>\n</target>\n</status>\n",
+    );
+    let fake = tmp.write(
+        "fakesvn.sh",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\ncase \" $* \" in\n*\" status \"*) cat \"$dir/status.xml\";;\n*) printf 'boom\\n' >&2; exit 1;;\nesac\nexit 0\n",
+    );
+    chmod_exec(&fake);
+    let svn_cmd = svn::SvnCommand::custom(abspath(&fake).to_str().unwrap(), &[]);
+    let work = WorkCopy {
+        vcs: Vcs::Svn,
+        vcs_root: tmp.path().to_path_buf(),
+        project_root: tmp.path().to_path_buf(),
+    };
+    let err = changed_lines_for_with(&work, "tip", "f.txt", &svn_cmd).unwrap_err();
+    assert!(err.contains("unexpected error code"), "{err}");
+}
+
 #[test]
 fn cov_engine_for_dir_reports_config() {
     let tmp = init_git_repo("cov-enginedir");
@@ -3951,6 +4082,13 @@ fn cov_rename_over_retries_after_removal() {
     assert_eq!(std::fs::read_to_string(&dest).unwrap(), "new");
 }
 
+fn expect_buffer(sink: &Sink) -> &String {
+    let Sink::Buffer(buffer) = sink else {
+        panic!("expected a buffered sink");
+    };
+    buffer
+}
+
 #[test]
 fn cov_patch_prompt_reads_missing_disk_as_dev_null() {
     let result = LintResult::new(
@@ -3960,9 +4098,7 @@ fn cov_patch_prompt_reads_missing_disk_as_dev_null() {
     );
     let mut sink = Sink::Buffer(String::new());
     prompt_for_patch(&result, b"", &mut sink);
-    let Sink::Buffer(buffer) = &sink else {
-        panic!("expected a buffered sink"); // LCOV_EXCL_LINE // Reason: defensive panic arm; the buffer always matches
-    };
+    let buffer = expect_buffer(&sink);
     assert!(buffer.is_empty(), "{buffer:?}");
 }
 
@@ -4290,14 +4426,18 @@ fn cov6g_normalize_lexical_skips_current_dir_segments() {
 #[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(unix)]
-static COV6G_COUNTER: AtomicU64 = AtomicU64::new(0);
+// -( T1176 PB-2: hg/git backends, deleted-cwd, ETXTBSY split )----------------
 
 #[cfg(unix)]
-fn cov6g_temp_dir(name: &str) -> PathBuf {
-    let id = COV6G_COUNTER.fetch_add(1, Ordering::SeqCst);
+static PB2_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// House scratch dir (pid + per-file counter); any stale run is
+/// removed first so it never leaks into the next.
+#[cfg(unix)]
+fn pb2_temp_dir(name: &str) -> PathBuf {
+    let id = PB2_COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!(
-        "arc_rs_lint_cov6g_{}_{}_{}",
+        "arc_rs_lint_pb2_{}_{}_{}",
         std::process::id(),
         id,
         name
@@ -4307,17 +4447,140 @@ fn cov6g_temp_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// Write `contents` to `dir`/`name`, returning the path.
+#[cfg(unix)]
+fn pb2_write(dir: &Path, name: &str, contents: &str) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, contents).unwrap();
+    path
+}
+
 #[test]
 #[cfg(unix)]
-fn cov6g_spawn_with_retry_reports_text_file_busy() {
-    // T1170 wave 6g: hold a script open for writing while spawning it.
-    // Linux exec fails with ETXTBSY (errno 26), exercising the retry
-    // arm; other unix spawns succeed. Either outcome passes, so the
-    // test is deterministic on every unix.
+fn pb2_hg_base_for_explicit_rev_resolves_node() {
+    // Fake `hg` answers the ancestor probe with a node, covering the
+    // explicit-rev arm of `hg_base_for_with`.
+    let dir = pb2_temp_dir("hg-explicit");
+    let fake = pb2_write(
+        &dir,
+        "fakehg.sh",
+        "#!/bin/sh\nprintf '0123456789abcdef0123456789abcdef01234567\\n'\nexit 0\n",
+    );
+    chmod_exec(&fake);
+    let hg_cmd = hg::HgCommand::custom(fake.to_str().unwrap(), &[]);
+    let work = WorkCopy {
+        vcs: Vcs::Hg,
+        vcs_root: dir.clone(),
+        project_root: dir.clone(),
+    };
+    assert_eq!(
+        hg_base_for_with(&work, Some("tip"), &hg_cmd).unwrap(),
+        "0123456789abcdef0123456789abcdef01234567"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn pb2_hg_base_for_auto_base_reports_no_outgoing() {
+    // Fake `hg` answers `branch` plus an empty draft log, covering
+    // the automatic-base arm: no outgoing commits means the working
+    // rev. The draft probe also matches `branch`, so it sorts first.
+    let dir = pb2_temp_dir("hg-auto");
+    let fake = pb2_write(
+        &dir,
+        "fakehg.sh",
+        "#!/bin/sh\ncase \" $* \" in\n*draft*) exit 0;;\n*) printf 'default\\n';;\nesac\nexit 0\n",
+    );
+    chmod_exec(&fake);
+    let hg_cmd = hg::HgCommand::custom(fake.to_str().unwrap(), &[]);
+    let work = WorkCopy {
+        vcs: Vcs::Hg,
+        vcs_root: dir.clone(),
+        project_root: dir.clone(),
+    };
+    assert_eq!(hg_base_for_with(&work, None, &hg_cmd).unwrap(), ".");
+}
+
+#[test]
+#[cfg(unix)]
+fn pb2_amend_git_head_silent_failure_reports_bare_error() {
+    // A failing `git add -u` with empty stderr (a silent kill)
+    // reports the bare error, covering the empty-stderr arm.
+    let dir = pb2_temp_dir("git-silent");
+    let fake = pb2_write(&dir, "fakegit.sh", "#!/bin/sh\nexit 1\n");
+    chmod_exec(&fake);
+    assert_eq!(
+        amend_git_head_with(&dir, Some(&fake)).unwrap_err(),
+        "git add -u failed"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn pb2_amend_git_head_add_success_reaches_amend() {
+    // A succeeding `git add -u` continues into `git commit --amend`,
+    // which fails outside any repository; the temp dir sits outside
+    // every worktree, so `git` never touches real VCS state.
+    let dir = pb2_temp_dir("git-amend");
+    let fake = pb2_write(&dir, "fakegit.sh", "#!/bin/sh\nexit 0\n");
+    chmod_exec(&fake);
+    assert!(amend_git_head_with(&dir, Some(&fake)).is_err());
+}
+
+/// Deleted-cwd driver: re-executes the probe below under a removed
+/// cwd, so `current_dir()` fails without mutating this process. The
+/// child is the same instrumented test binary, so its profile covers
+/// `run`'s getcwd error arm.
+#[test]
+#[cfg(unix)]
+fn pb2_lint_run_reports_deleted_cwd() {
+    let exe = std::env::current_exe().expect("test binary path");
+    let exe = exe.to_str().expect("utf-8 test binary path");
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "d=$(mktemp -d); cd $d; rmdir $d; exec \"{exe}\" --nocapture pb2_lint_run_deleted_cwd_probe"
+        ))
+        .env("ARC_RS_PB2_GETCWD_CHILD", "1")
+        .output()
+        .expect("spawn deleted-cwd child");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success()
+            && stdout.contains("1 passed")
+            && stdout.contains("PB2-GETCWD-OK")
+            && stderr.contains("cannot determine current directory"),
+        "deleted-cwd child failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+}
+
+/// Deleted-cwd probe: a no-op in parent runs; under the driver's
+/// removed cwd (`ARC_RS_PB2_GETCWD_CHILD`) it pins `run`'s getcwd
+/// error report.
+#[test]
+#[cfg(unix)]
+fn pb2_lint_run_deleted_cwd_probe() {
+    if std::env::var_os("ARC_RS_PB2_GETCWD_CHILD").is_none() {
+        return;
+    }
+    assert!(
+        std::env::current_dir().is_err(),
+        "probe cwd should be deleted"
+    );
+    let code = run(&[]);
+    assert_eq!(code, std::process::ExitCode::FAILURE);
+    println!("PB2-GETCWD-OK");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn pb2_spawn_with_retry_reports_text_file_busy() {
+    // Linux-only: exec of a script held open for writing fails with
+    // ETXTBSY (errno 26), so the error arm is deterministic here.
     use std::os::unix::fs::PermissionsExt;
-    let dir = cov6g_temp_dir("etxtbsy");
-    let script = dir.join("busy.sh");
-    std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+    let dir = pb2_temp_dir("etxtbsy-busy");
+    let script = pb2_write(&dir, "busy.sh", "#!/bin/sh\necho hi\n");
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     let _held = std::fs::OpenOptions::new()
         .write(true)
@@ -4325,20 +4588,34 @@ fn cov6g_spawn_with_retry_reports_text_file_busy() {
         .unwrap();
     let mut cmd = Command::new(&script);
     cmd.current_dir(&dir);
-    match spawn_with_retry(&mut cmd) {
-        // LCOV_EXCL_START // Reason: ETXTBSY error arm; macOS exec never reports text-file-busy
-        Err(error) => assert_eq!(
-            error.raw_os_error(), // LCOV_EXCL_STOP
-            Some(26),
-            "expected ETXTBSY, got {error}"
-        ),
-        // LCOV_EXCL_START // Reason: ETXTBSY always fires on Linux (write handle held at exec), so the Ok arm only runs where text-file-busy does not apply (macOS)
-        Ok(output) => assert!(
-            output.status.success(),
-            "script should run where ETXTBSY does not apply: {output:?}"
-        ),
-        // LCOV_EXCL_STOP
-    }
+    let error = spawn_with_retry(&mut cmd).unwrap_err();
+    assert_eq!(
+        error.raw_os_error(),
+        Some(26),
+        "expected ETXTBSY, got {error}"
+    );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn pb2_spawn_with_retry_succeeds_where_no_text_file_busy() {
+    // macOS-only: exec never reports text-file-busy, so the held-open
+    // script runs and the Ok arm is deterministic here.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = pb2_temp_dir("etxtbsy-ok");
+    let script = pb2_write(&dir, "busy.sh", "#!/bin/sh\necho hi\n");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _held = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&script)
+        .unwrap();
+    let mut cmd = Command::new(&script);
+    cmd.current_dir(&dir);
+    let output = spawn_with_retry(&mut cmd).unwrap();
+    assert!(
+        output.status.success(),
+        "script should run where ETXTBSY does not apply: {output:?}"
+    );
 }
 // -( T1170 wave 6h: helper-arm coverage )--------------------------------------
 
@@ -4406,4 +4683,21 @@ fn spawn_with_retry_retries_text_file_busy() {
     let err = spawn_with_retry(&mut cmd).unwrap_err();
     assert_eq!(err.raw_os_error(), Some(26));
     assert!(start.elapsed() >= std::time::Duration::from_millis(80));
+}
+// -( T1176 S5: defensive-arm coverage )--------------------------------------
+
+#[test]
+#[should_panic(expected = "expected a buffered sink")]
+fn cov_patch_prompt_reads_missing_disk_as_dev_null_defensive_stdout_arm() {
+    // `expect_buffer` unwraps `Buffer`: a stdout sink panics.
+    expect_buffer(&Sink::Stdout);
+}
+// -( T1176 S10: stub/guard coverage )----------------------------------------
+
+#[test]
+#[should_panic(expected = "the script fails before parsing")]
+fn lint4_failing_parser_companion_panics_before_parsing() {
+    // The script always fails first, so the parser is unreachable in the
+    // engine flow; the direct call pins the contract.
+    lint4_failing_parser("out");
 }

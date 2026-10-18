@@ -293,6 +293,27 @@ fn run_in_reports_not_a_checkout_as_usage_error() {
 }
 
 #[test]
+fn missing_git_reports_the_php_text() {
+    // Staged through the injected probe: no ambient `git` assumption.
+    let tmp = TempDir::new("nogit");
+    assert_eq!(
+        head_of_with_git(tmp.path(), tmp.path(), false).unwrap_err(),
+        missing_git_message()
+    );
+}
+
+#[test]
+fn run_in_without_git_is_fatal() {
+    // T1153 CORE-49: the missing-`git` throw escapes as a PHP fatal
+    // (255); staged through the injected probe.
+    let tmp = TempDir::new("nogit-run");
+    assert_eq!(
+        run_in_with_git(tmp.path(), &args(&["--"]), false),
+        std::process::ExitCode::from(255)
+    );
+}
+
+#[test]
 fn fails_without_commits() {
     let repo = fresh_repo("empty");
     assert!(head_commit(&repo.path).is_err());

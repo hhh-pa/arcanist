@@ -301,15 +301,24 @@ fn missing_tool_reports_nothing() {
 }
 
 #[test]
-fn binary_on_path_probes_plain_names() {
-    if let Some(path) = binary_on_path("rubocop") {
-        // LCOV_EXCL_START // Reason: rubocop-present arm; rubocop is absent on ubuntu CI
-        assert!(
-            path.file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with("rubocop")), // LCOV_EXCL_STOP
-            "{path:?}"
-        );
-    }
+fn binary_in_probes_plain_names() {
+    // Staged through `binary_in`: a plain name resolves against the
+    // given search path, with no assumption about the ambient PATH.
+    let dir = std::env::temp_dir().join(format!(
+        "arc-rs-rubocop-probe-present-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let marker = dir.join(BINARY);
+    std::fs::write(&marker, b"x").unwrap();
+    let path = binary_in(dir.as_os_str()).unwrap();
+    assert_eq!(path, marker);
+    assert!(
+        path.file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("rubocop")),
+        "{path:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -430,4 +439,24 @@ fn custom_severity_setters_reach_lint_bytes() {
     let messages = linter.lint_bytes("a.rb", b"x = 1\n");
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].severity, "error");
+}
+
+#[test]
+#[cfg(unix)]
+fn temp_write_failure_reports_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new("temp-fail");
+    let tool = tmp.path().join("fake-rubocop");
+    std::fs::write(&tool, b"x").unwrap();
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let mut linter = RuboCopLinter {
+        temp_dir: Some(locked.clone()),
+        ..Default::default()
+    };
+    linter.options.bin = Some(tool);
+    assert!(linter.lint_bytes("a.rb", b"x = 1").is_empty());
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
 }

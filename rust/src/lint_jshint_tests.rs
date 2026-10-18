@@ -60,12 +60,31 @@ fn lookup_miss_reports_no_tool() {
     assert!(find_on_path("arc-rs-definitely-missing-tool").is_none());
 }
 
-#[cfg(unix)]
+// -( T1176 PC-2: demark tty-commands )-----------------------------------------
+
+#[test]
+fn resolve_binary_falls_back_to_path_lookup() {
+    // The default linter delegates to the PATH lookup; both calls run
+    // the same lookup, so they agree without depending on ambient PATH
+    // contents.
+    assert_eq!(JshintLinter::new().resolve_binary(), find_on_path(BINARY));
+}
+
+#[test]
+fn find_on_path_matches_absolute_paths() {
+    // An absolute candidate survives the directory join, so a temp
+    // file exercises the hit arm without touching PATH.
+    let tmp = TempDir::new("path-hit");
+    let tool = tmp.path().join("probe-target");
+    std::fs::write(&tool, b"x").unwrap();
+    let absolute = tool.to_string_lossy().to_string();
+    assert_eq!(find_on_path(&absolute), Some(tool));
+}
+
 struct TempDir {
     path: PathBuf,
 }
 
-#[cfg(unix)]
 impl TempDir {
     fn new(tag: &str) -> Self {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -83,7 +102,6 @@ impl TempDir {
     }
 }
 
-#[cfg(unix)]
 impl Drop for TempDir {
     fn drop(&mut self) {
         std::fs::remove_dir_all(&self.path).ok();
@@ -264,11 +282,8 @@ fn long_stderr_truncates_on_char_boundaries() {
     let linter = JshintLinter::with_binary(&tool);
     let messages = linter.lint_bytes("a.js", b"var x = 1;\n");
     assert_eq!(messages.len(), 1);
-    assert!(
-        messages[0].description.ends_with("..."),
-        "{}",
-        messages[0].description // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    let description = &messages[0].description;
+    assert!(description.ends_with("..."), "{description}");
     assert!(messages[0].description.len() < loud.len());
 }
 
@@ -299,4 +314,58 @@ fn severity_codes_are_raw_like_php() {
             "{code:?}"
         );
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn temp_write_failure_on_input_reports_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new("temp-fail-input");
+    let tool = tmp.path().join("fake-jshint");
+    std::fs::write(&tool, b"x").unwrap();
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let linter = JshintLinter {
+        binary: Some(tool),
+        temp_dir: Some(locked.clone()),
+        ..Default::default()
+    };
+    assert!(linter.lint_bytes("a.js", b"var x = 1;").is_empty());
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn temp_write_failure_on_reporter_cleans_up_input() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new("temp-fail-reporter");
+    let tool = tmp.path().join("fake-jshint");
+    std::fs::write(&tool, b"x").unwrap();
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Writable input dir plus an unwritable reporter dir: the input
+    // stages, the reporter fails, and the cleanup arm removes the input.
+    let linter = JshintLinter {
+        binary: Some(tool),
+        temp_dir: Some(tmp.path().to_path_buf()),
+        reporter_dir: Some(locked.clone()),
+        ..Default::default()
+    };
+    assert!(linter.lint_bytes("a.js", b"var x = 1;").is_empty());
+    let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("arc-rs-lint-jshint-")
+        })
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
 }

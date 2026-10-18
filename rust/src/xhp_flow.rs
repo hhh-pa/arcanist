@@ -371,9 +371,7 @@ fn rule_namespace_first(ctx: &RuleCtx, out: &mut Vec<RawFinding>) {
     if !tree.tokens.iter().any(|t| t.kind == kinds::T_NAMESPACE) {
         return;
     }
-    let Some(first) = first_statement(tree) else {
-        return; // LCOV_EXCL_LINE // Reason: dead: a namespace token is itself a first statement
-    };
+    let first = first_statement(tree).expect("a namespace token is itself a first statement");
     if tree.tokens[first].kind == kinds::T_NAMESPACE {
         return;
     }

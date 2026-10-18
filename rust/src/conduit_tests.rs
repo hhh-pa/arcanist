@@ -915,3 +915,67 @@ fn core16_toolset_parse_error_is_bold() {
         std::process::ExitCode::FAILURE
     );
 }
+
+// -( T1176 PC-1: env-globals )------------------------------------------------
+
+/// Spawn this test binary with `vars` set, running only `probe`
+/// (child-process env staging: no in-process mutation, no `unsafe`).
+fn spawn_probe_env(probe: &str, vars: &[(&str, &str)]) -> (bool, String, String) {
+    let exe = std::env::current_exe().expect("test binary path");
+    let mut command = std::process::Command::new(&exe);
+    for (key, value) in vars {
+        command.env(key, value);
+    }
+    let out = command
+        .args(["--nocapture", probe])
+        .output()
+        .expect("spawn probe child");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// Assert a probe child passed and printed its marker.
+fn assert_probe_env_ok(probe: &str, vars: &[(&str, &str)], marker: &str) {
+    let (success, stdout, stderr) = spawn_probe_env(probe, vars);
+    assert!(
+        success && stdout.contains("1 passed") && stdout.contains(marker),
+        "{probe} child failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+}
+
+#[test]
+fn pc1_report_trace_probe() {
+    if std::env::var("ARC_RS_PC1_TRACE_CHILD").as_deref() != Ok("1") {
+        println!("PC1-TRACE-PROBE-OK");
+        return;
+    }
+    // Goes through the `terminal::trace_enabled` globals seam (cell,
+    // else `ARC_TRACE`), like the `--trace` runtime path.
+    assert!(crate::terminal::trace_enabled());
+    assert_eq!(
+        report(EnvelopeKind::Usage, "u-msg"),
+        std::process::ExitCode::from(EXIT_FATAL)
+    );
+    assert_eq!(
+        report(EnvelopeKind::Exception, "e-msg"),
+        std::process::ExitCode::from(EXIT_FATAL)
+    );
+    // Toolset arms keep their rendering under `--trace`.
+    assert_eq!(
+        report(EnvelopeKind::ToolsetUsage, "t-msg"),
+        std::process::ExitCode::FAILURE
+    );
+    println!("PC1-TRACE-PROBE-OK");
+}
+
+#[test]
+fn pc1_report_trace_rethrows_usage_and_exception() {
+    assert_probe_env_ok(
+        "pc1_report_trace_probe",
+        &[("ARC_RS_PC1_TRACE_CHILD", "1"), ("ARC_TRACE", "1")],
+        "PC1-TRACE-PROBE-OK",
+    );
+}

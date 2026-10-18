@@ -703,3 +703,207 @@ fn cov6g_tput_columns_is_stable() {
     // output), two back-to-back probes agree.
     assert_eq!(super::tput_columns(), super::tput_columns());
 }
+
+// -( T1176 PC-2: demark tty-commands )-----------------------------------------
+
+#[cfg(unix)]
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-terminal-tests-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+#[cfg(unix)]
+fn write_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[test]
+fn question_conversion_survives_hostile_values() {
+    // The `%?` nested format substitutes values; hostile text that looks
+    // like patterns, markup, or ANSI can never fail it (white-box pin
+    // for the infallible nested `expect`, formerly `?`). Each value
+    // renders literally (escaped), proving values never re-parse.
+    let hostile: &[(&str, &str)] = &[
+        ("%s", "%s"),
+        ("%q", "%q"),
+        ("%5s", "%5s"),
+        ("%", "%"),
+        ("%%", "%%"),
+        ("%?%!%>", "%?%!%>"),
+        ("100%", "100%"),
+        ("**x**", "**x**"),
+        ("__y__", "__y__"),
+        ("##z##", "##z##"),
+        ("<bg:red>w</bg>", "<bg:red>w</bg>"),
+        ("<fg:blue>v</fg>", "<fg:blue>v</fg>"),
+        ("\x1b[31mred\x1b[0m", "<ESC>[31mred<ESC>[0m"),
+        ("a\0b", "a<NUL>b"),
+        ("\r\n", "<CR><LF>"),
+        ("", ""),
+        (" ", " "),
+    ];
+    for (value, expected) in hostile {
+        let plain = terminal::tsprintf_ansi("%?", &[TVal::Text(value)], false)
+            .unwrap()
+            .to_string();
+        assert!(plain.starts_with("  ?   "), "{plain:?} for {value:?}");
+        assert!(plain.contains(expected), "{plain:?} for {value:?}");
+        let ansi = terminal::tsprintf_ansi("%?", &[TVal::Text(value)], true)
+            .unwrap()
+            .to_string();
+        assert!(
+            ansi.contains('?') && ansi.contains("\x1b["),
+            "{ansi:?} for {value:?}"
+        );
+        assert!(ansi.contains(expected), "{ansi:?} for {value:?}");
+    }
+    // Long values wrap but still succeed.
+    let big = "x".repeat(500);
+    for ansi in [false, true] {
+        let text = terminal::tsprintf_ansi("%?", &[TVal::Text(&big)], ansi)
+            .unwrap()
+            .to_string();
+        assert!(text.contains('?'), "{text:?} (ansi={ansi})");
+    }
+    // Non-text values take the same nested path.
+    for ansi in [false, true] {
+        assert!(terminal::tsprintf_ansi("%?", &[TVal::Int(-42)], ansi).is_ok());
+        let inner = terminal::tsprintf_ansi("%s", &[TVal::Text("i%q")], ansi).unwrap();
+        assert!(terminal::tsprintf_ansi("%?", &[TVal::Terminal(&inner)], ansi).is_ok());
+        assert!(terminal::tsprintf_ansi("%?", &[TVal::Owned("%5s".to_string())], ansi).is_ok());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn tput_spawn_failure_yields_zero() {
+    // No `tput` at the seam path: the spawn-failure arm returns 0.
+    let tmp = TempDir::new("tput-missing");
+    assert_eq!(super::tput_columns_with(tmp.path().join("tput")), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn tput_failing_exit_yields_zero() {
+    let tmp = TempDir::new("tput-fail");
+    let fake = write_script(tmp.path(), "tput", "#!/bin/sh\nexit 1\n");
+    assert_eq!(super::tput_columns_with(&fake), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn tput_success_parses_widths_end_to_end() {
+    let tmp = TempDir::new("tput-ok");
+    for (body, expected) in [
+        ("#!/bin/sh\necho 80\n", 80),
+        ("#!/bin/sh\nprintf '  120\\t\\n'\n", 120),
+        ("#!/bin/sh\nprintf '%s' '+42'\n", 42),
+        ("#!/bin/sh\nprintf '%s' '80x'\n", 80),
+        ("#!/bin/sh\nprintf '%s' '-80'\n", 0),
+        ("#!/bin/sh\nprintf '%s' '0'\n", 0),
+        ("#!/bin/sh\nprintf '%s' ''\n", 0),
+    ] {
+        let fake = write_script(tmp.path(), "tput", body);
+        assert_eq!(super::tput_columns_with(&fake), expected, "{body:?}");
+    }
+}
+
+#[cfg(not(windows))]
+#[test]
+fn parse_tput_width_matrix() {
+    assert_eq!(super::parse_tput_width("80\n"), 80);
+    assert_eq!(super::parse_tput_width("  120\t\n"), 120);
+    assert_eq!(super::parse_tput_width("\0\x0b80\x0b\0"), 80);
+    assert_eq!(super::parse_tput_width("+42"), 42);
+    assert_eq!(super::parse_tput_width("007"), 7);
+    assert_eq!(super::parse_tput_width("80x"), 80);
+    assert_eq!(super::parse_tput_width("8 0"), 8);
+    assert_eq!(super::parse_tput_width("-80"), 0);
+    assert_eq!(super::parse_tput_width("-"), 0);
+    assert_eq!(super::parse_tput_width("+"), 0);
+    assert_eq!(super::parse_tput_width("0"), 0);
+    assert_eq!(super::parse_tput_width(""), 0);
+    assert_eq!(super::parse_tput_width("   "), 0);
+    assert_eq!(super::parse_tput_width("x80"), 0);
+    assert_eq!(
+        super::parse_tput_width("99999999999999999999999"),
+        usize::MAX
+    );
+}
+
+#[test]
+fn resolve_term_applies_ansicon_fallback() {
+    assert_eq!(super::resolve_term(String::new(), Some("1")), "ansi");
+    assert_eq!(super::resolve_term("0".to_string(), Some("x")), "ansi");
+    assert_eq!(super::resolve_term("xterm".to_string(), Some("1")), "xterm");
+    assert_eq!(super::resolve_term(String::new(), None), "");
+    assert_eq!(super::resolve_term(String::new(), Some("")), "");
+    assert_eq!(super::resolve_term(String::new(), Some("0")), "");
+    assert_eq!(super::resolve_term("0".to_string(), None), "0");
+}
+
+#[test]
+fn ansi_decision_follows_term_gate_then_tty_probe() {
+    // Hermetic pin for the TERM gate: no env mutation (a global TERM
+    // write would race parallel `tput` probes) and no TTY needed.
+    #[cfg(not(windows))]
+    {
+        assert!(super::ansi_enabled_for("", true));
+        assert!(super::ansi_enabled_for("ansi", true));
+        assert!(!super::ansi_enabled_for("ansi", false));
+        assert!(!super::ansi_enabled_for("dumb", false));
+    }
+    #[cfg(windows)]
+    {
+        assert!(super::ansi_enabled_for("ansi", true));
+        assert!(super::ansi_enabled_for("cygwin", true));
+        assert!(!super::ansi_enabled_for("ansi", false));
+        assert!(!super::ansi_enabled_for("dumb", true));
+        assert!(!super::ansi_enabled_for("", true));
+    }
+}
+
+#[test]
+fn ansicon_fallback_enables_ansi_end_to_end() {
+    // TERM unset + ANSICON set resolves to `ansi`, which passes the
+    // gate and defers to the TTY probe.
+    let term = super::resolve_term(String::new(), Some("1"));
+    assert_eq!(term, "ansi");
+    assert!(super::ansi_enabled_for(&term, true));
+    assert!(!super::ansi_enabled_for(&term, false));
+    // Without ANSICON the empty TERM fails the Windows gate (off
+    // Windows TERM never gates, so the probe alone decides).
+    let term = super::resolve_term(String::new(), None);
+    #[cfg(windows)]
+    assert!(!super::ansi_enabled_for(&term, true));
+    #[cfg(not(windows))]
+    assert!(super::ansi_enabled_for(&term, true));
+}

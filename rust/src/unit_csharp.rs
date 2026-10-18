@@ -486,7 +486,7 @@ pub fn parse_assembly_results(
             let map = result.get_coverage().cloned().unwrap_or_default();
             result.set_coverage(map);
         }
-    } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
+    }
     Ok(results)
 }
 

@@ -449,6 +449,70 @@ fn serve_once(body: String) -> String {
     base
 }
 
+/// House scratch dir (pid + per-file counter); removed on drop.
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-config-pc1-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+/// Spawn this test binary with `vars` set and `removals` removed,
+/// running only `probe` (child-process env staging: no in-process
+/// mutation, so no `unsafe` and no serial lock).
+fn spawn_probe_env(
+    probe: &str,
+    vars: &[(&str, &str)],
+    removals: &[&str],
+) -> (bool, String, String) {
+    let exe = std::env::current_exe().expect("test binary path");
+    let mut command = std::process::Command::new(&exe);
+    for (key, value) in vars {
+        command.env(key, value);
+    }
+    for key in removals {
+        command.env_remove(key);
+    }
+    let out = command
+        .args(["--nocapture", probe])
+        .output()
+        .expect("spawn probe child");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// Assert a probe child passed and printed its marker.
+fn assert_probe_env_ok(probe: &str, vars: &[(&str, &str)], removals: &[&str], marker: &str) {
+    let (success, stdout, stderr) = spawn_probe_env(probe, vars, removals);
+    assert!(
+        success && stdout.contains("1 passed") && stdout.contains(marker),
+        "{probe} child failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+}
+
 #[test]
 fn core9_authenticate_maps_unknown_failures_raw() {
     // A `conduit.connect` failure outside the three credential codes
@@ -465,4 +529,134 @@ fn core9_authenticate_maps_unknown_failures_raw() {
     let err = authenticate(&mut client, &creds, "test").unwrap_err();
     assert!(matches!(err.kind, crate::conduit::EnvelopeKind::Exception));
     assert!(err.message.contains("ERR-OTHER"), "{}", err.message);
+}
+
+// -( T1176 PC-1: env-globals )------------------------------------------------
+
+/// Home env key `arcrc_path()` reads on this platform.
+#[cfg(windows)]
+const HOME_KEY: &str = "USERPROFILE";
+#[cfg(not(windows))]
+const HOME_KEY: &str = "HOME";
+
+#[test]
+fn pc1_arcrc_path_home_probe() {
+    if std::env::var("ARC_RS_PC1_HOME_CHILD").as_deref() != Ok("1") {
+        println!("PC1-HOME-PROBE-OK");
+        return;
+    }
+    match std::env::var_os(HOME_KEY) {
+        None => assert_eq!(arcrc_path(), None),
+        Some(home) => assert_eq!(arcrc_path(), Some(PathBuf::from(home).join(".arcrc"))),
+    }
+    println!("PC1-HOME-PROBE-OK");
+}
+
+#[test]
+fn pc1_arcrc_path_without_home_returns_none() {
+    // HOME removed in the child: no arcrc path ...
+    assert_probe_env_ok(
+        "pc1_arcrc_path_home_probe",
+        &[("ARC_RS_PC1_HOME_CHILD", "1")],
+        &[HOME_KEY],
+        "PC1-HOME-PROBE-OK",
+    );
+    // ... and a set HOME resolves `~/.arcrc`.
+    let home = TempDir::new("home");
+    let home_str = home.path().to_str().expect("utf8 home").to_string();
+    assert_probe_env_ok(
+        "pc1_arcrc_path_home_probe",
+        &[
+            ("ARC_RS_PC1_HOME_CHILD", "1"),
+            (HOME_KEY, home_str.as_str()),
+        ],
+        &[],
+        "PC1-HOME-PROBE-OK",
+    );
+}
+
+#[test]
+fn pc1_global_load_options_probe() {
+    if std::env::var("ARC_RS_PC1_OPTS_CHILD").as_deref() != Ok("1") {
+        println!("PC1-OPTS-PROBE-OK");
+        return;
+    }
+    let opts = global_load_options();
+    let case = std::env::var("ARC_RS_PC1_OPTS_CASE").expect("probe case");
+    if case == "empty" {
+        assert!(opts.runtime.is_empty());
+        assert!(opts.config_files.is_empty());
+        assert_eq!(opts.arcrc_file, None);
+    } else {
+        assert_eq!(
+            opts.runtime.get("phabricator.uri"),
+            Some(&serde_json::json!("https://rt.example/"))
+        );
+        assert_eq!(opts.config_files, vec![PathBuf::from("a.json")]);
+        assert_eq!(opts.arcrc_file, Some(PathBuf::from("u.json")));
+    }
+    println!("PC1-OPTS-PROBE-OK");
+}
+
+#[test]
+fn pc1_global_load_options_without_channel_reads_default() {
+    assert_probe_env_ok(
+        "pc1_global_load_options_probe",
+        &[
+            ("ARC_RS_PC1_OPTS_CHILD", "1"),
+            ("ARC_RS_PC1_OPTS_CASE", "empty"),
+        ],
+        &["ARC_GLOBAL_LOAD_OPTIONS"],
+        "PC1-OPTS-PROBE-OK",
+    );
+}
+
+#[test]
+fn pc1_global_load_options_with_channel_parses() {
+    let raw = r#"{"runtime": {"phabricator.uri": "https://rt.example/"}, "config_files": ["a.json", 42], "arcrc_file": "u.json"}"#;
+    assert_probe_env_ok(
+        "pc1_global_load_options_probe",
+        &[
+            ("ARC_RS_PC1_OPTS_CHILD", "1"),
+            ("ARC_RS_PC1_OPTS_CASE", "json"),
+            ("ARC_GLOBAL_LOAD_OPTIONS", raw),
+        ],
+        &[],
+        "PC1-OPTS-PROBE-OK",
+    );
+}
+
+#[test]
+fn pc1_parse_load_options_json_fixture_matrix() {
+    // Full document.
+    let opts = parse_load_options_json(
+        r#"{"runtime": {"a": 1}, "config_files": ["x", "y"], "arcrc_file": "z"}"#,
+    );
+    assert_eq!(opts.runtime.len(), 1);
+    assert_eq!(
+        opts.config_files,
+        vec![PathBuf::from("x"), PathBuf::from("y")]
+    );
+    assert_eq!(opts.arcrc_file, Some(PathBuf::from("z")));
+    // Missing keys read empty.
+    let opts = parse_load_options_json("{}");
+    assert!(opts.runtime.is_empty());
+    assert!(opts.config_files.is_empty());
+    assert_eq!(opts.arcrc_file, None);
+    // Mistyped values read empty (only the dispatcher writes this
+    // channel, so leniency mirrors the pre-extraction behavior).
+    let opts =
+        parse_load_options_json(r#"{"runtime": [1], "config_files": {"x": 1}, "arcrc_file": 7}"#);
+    assert!(opts.runtime.is_empty());
+    assert!(opts.config_files.is_empty());
+    assert_eq!(opts.arcrc_file, None);
+    // Non-string list members drop; unparseable input reads default.
+    let opts = parse_load_options_json(r#"{"config_files": ["x", null, 3]}"#);
+    assert_eq!(opts.config_files, vec![PathBuf::from("x")]);
+    for raw in ["not json", "", "42", "[1]"] {
+        let opts = parse_load_options_json(raw);
+        assert!(opts.runtime.is_empty(), "for {raw:?}");
+        assert!(opts.config_files.is_empty(), "for {raw:?}");
+        assert_eq!(opts.arcrc_file, None, "for {raw:?}");
+    }
 }

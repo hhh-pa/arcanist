@@ -210,9 +210,6 @@ fn command_distance(a: &str, b: &str) -> i64 {
     if y.is_empty() {
         return DELETE * x.len() as i64;
     }
-    if x == y {
-        return 0; // LCOV_EXCL_LINE // Reason: dead: strip_affixes leaves equal remainders only when both empty, which returns above
-    }
 
     let (mut m, mut d) = command_init_matrix(&x, &y);
     let (xl, yl) = (x.len(), y.len());
@@ -236,9 +233,6 @@ fn flag_distance(a: &str, b: &str) -> i64 {
     }
     if y.is_empty() {
         return DELETE * x.len() as i64;
-    }
-    if x == y {
-        return 0; // LCOV_EXCL_LINE // Reason: dead: strip_affixes leaves equal remainders only when both empty, which returns above
     }
     let xl = x.len();
     let yl = y.len();

@@ -107,10 +107,13 @@ fn binary_exists(name: &str) -> bool {
             if is_executable_file(&dir.join(name)) {
                 return true;
             }
-            cfg!(windows)
-                && ["exe", "cmd", "bat", "com"] // LCOV_EXCL_START // Reason: windows-only extension probe; cfg!(windows) is false on ubuntu CI
-                    .iter()
-                    .any(|ext| is_executable_file(&dir.join(format!("{name}.{ext}")))) // LCOV_EXCL_STOP
+            #[cfg(windows)]
+            let probe = ["exe", "cmd", "bat", "com"]
+                .iter()
+                .any(|ext| is_executable_file(&dir.join(format!("{name}.{ext}"))));
+            #[cfg(not(windows))]
+            let probe = false;
+            probe
         })
     })
 }

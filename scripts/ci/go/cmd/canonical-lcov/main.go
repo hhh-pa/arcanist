@@ -233,17 +233,22 @@ func addCount(record map[int]int64, lineno int, count uint64) {
 }
 
 // applyExclusions deletes DA lines covered by LCOV exclusion
-// markers, sharing internal/lcov's marker semantics with CI's
-// canonical pipeline. Fully-excluded files keep an empty record so
-// the writer still emits their LF:0/LH:0 block, exactly like Emit.
+// markers plus zero-count bare-brace lines, sharing internal/lcov's
+// semantics with CI's canonical pipeline. Fully-excluded files keep
+// an empty record so the writer still emits their LF:0/LH:0 block,
+// exactly like Emit.
 func applyExclusions(merged map[string]map[int]int64) error {
 	for sf, record := range merged {
 		excluded, err := lcov.ExcludedLines(sf)
 		if err != nil {
 			return err
 		}
-		for lineno := range record {
-			if excluded[lineno] {
+		braces, err := lcov.BareBraceLines(sf)
+		if err != nil {
+			return err
+		}
+		for lineno, count := range record {
+			if excluded[lineno] || (count == 0 && braces[lineno]) {
 				delete(record, lineno)
 			}
 		}

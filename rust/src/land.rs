@@ -887,16 +887,24 @@ impl Io {
         }
         // `live` output already echoed above, so the prompt is visible.
         // Flush once more in case output bypassed `push_out`.
-        use std::io::{BufRead, Write};
+        use std::io::Write;
         std::io::stdout().flush().ok();
         std::io::stderr().flush().ok();
-        let mut line = String::new();
-        let stdin = std::io::stdin();
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) => None,
-            Ok(_) => Some(line.trim_end_matches(['\r', '\n']).to_string()), // LCOV_EXCL_START // Reason: needs bytes on real stdin; cargo-test stdin is always EOF
-            Err(_) => None,                                                 // LCOV_EXCL_STOP
-        }
+        read_answer_line(&mut std::io::stdin().lock())
+    }
+}
+
+/// Read one answer line from `reader`, without the trailing newline.
+///
+/// Returns `None` on end of input (EOF) or read failure. Split from
+/// `Io::read_answer` so tests can stage bytes, EOF, and errors through
+/// any `BufRead` (production passes the stdin lock).
+fn read_answer_line(reader: &mut dyn std::io::BufRead) -> Option<String> {
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) => None,
+        Ok(_) => Some(line.trim_end_matches(['\r', '\n']).to_string()),
+        Err(_) => None,
     }
 }
 
@@ -943,10 +951,9 @@ fn split_glyphs(text: &str) -> Vec<String> {
     };
     for ch in chars {
         if ch.len_utf8() > 1 && is_combining_mark(ch) {
-            match &mut buf {
-                Some(pending) => pending.push(ch),
-                None => buf = Some(ch.to_string()), // LCOV_EXCL_LINE // Reason: dead arm; buf is always Some here (preset for leading marks, set by the first base char)
-            }
+            buf.as_mut()
+                .expect("buf is always Some here (preset for leading marks, set by the first base char)")
+                .push(ch);
         } else {
             if let Some(pending) = buf.take() {
                 parts.push(pending);
@@ -1032,9 +1039,10 @@ pub fn console_strlen(text: &str) -> usize {
     }
     let mut width = 0;
     for glyph in split_glyphs(&stripped) {
-        let Some(first) = glyph.chars().next() else {
-            continue; // LCOV_EXCL_LINE // Reason: dead arm; split_glyphs never emits empty glyphs
-        };
+        let first = glyph
+            .chars()
+            .next()
+            .expect("split_glyphs never emits empty glyphs");
         let code = first as u32;
         if code == 0 {
             continue;
@@ -1831,15 +1839,17 @@ fn parse_string_config(value: &serde_json::Value) -> Option<String> {
 
 /// System-wide config file (`ArcanistConfigurationEngine.php:39-50`).
 fn system_config_path() -> PathBuf {
-    if cfg!(windows) {
-        let root = std::env::var("ProgramData").unwrap_or_default(); // LCOV_EXCL_START // Reason: windows arm; cfg!(windows) is false on ubuntu CI
+    #[cfg(windows)]
+    let path = {
+        let root = std::env::var("ProgramData").unwrap_or_default();
         PathBuf::from(root)
             .join("Phabricator")
             .join("Arcanist")
-            .join("config") // LCOV_EXCL_STOP
-    } else {
-        PathBuf::from("/etc/arcconfig")
-    }
+            .join("config")
+    };
+    #[cfg(not(windows))]
+    let path = PathBuf::from("/etc/arcconfig");
+    path
 }
 
 /// Load saved prompt responses from every configuration source.
@@ -2144,18 +2154,10 @@ struct Validated {
     revision_raw: Option<String>,
 }
 
-/// Resolve the conduit URI: the flag, `ARC_CONDUIT_URI`, or the
+/// Resolve the conduit URI — the flag, `ARC_CONDUIT_URI`, or the
 /// merged-config discovery from `dir` (like the diff port's
-/// `discover_from(&dir)`, not the process working directory).
-pub fn resolve_conduit_uri(conduit_uri: Option<&str>, dir: &Path) -> Option<String> {
-    conduit_uri
-        .map(str::to_string)
-        .or_else(|| std::env::var("ARC_CONDUIT_URI").ok())
-        .or_else(|| config::discover_from(dir))
-}
-
-/// [`resolve_conduit_uri`] with an explicit user file and
-/// [`get_config::LoadOptions`].
+/// `discover_from(&dir)`, not the process working directory) — with
+/// an explicit user file and [`get_config::LoadOptions`].
 pub fn resolve_conduit_uri_with(
     conduit_uri: Option<&str>,
     dir: &Path,
@@ -2171,27 +2173,12 @@ pub fn resolve_conduit_uri_with(
 /// Resolve the conduit URI (flag, `ARC_CONDUIT_URI`, or merged-config
 /// discovery from `dir`) and build an authenticated client from `~/.arcrc`.
 ///
-/// Mirrors [`config::client_for`], but discovers from the target working
-/// copy — like the diff port (`discover_from(&dir)`) — instead of the
-/// process working directory.
-pub fn client_for_dir(
-    conduit_uri: Option<&str>,
-    dir: &Path,
-) -> Result<arc_rs::conduit::Client, String> {
-    let uri = resolve_conduit_uri(conduit_uri, dir).ok_or_else(|| {
-        "no conduit URI: pass --conduit-uri, set ARC_CONDUIT_URI, or run inside a project \
-         with .arcconfig"
-            .to_string()
-    })?;
-    let token = config::arcrc_path()
-        .and_then(|path| config::token_for_file(&path, &uri))
-        .ok_or_else(|| format!("no token for {uri} in ~/.arcrc"))?;
-    arc_rs::conduit::Client::new(&uri, &token).map_err(|e| e.to_string()) // LCOV_EXCL_LINE // Reason: needs a token for the URI; tests stage no credentials
-}
-
-/// [`client_for_dir`] with an explicit user file and
+/// Conduit client for `dir` with an explicit user file and
 /// [`get_config::LoadOptions`], so `--config`/`--config-file`/
-/// `--arcrc-file` reach conduit setup like stock PHP.
+/// `--arcrc-file` reach conduit setup like stock PHP. Discovers from
+/// the target working copy — like the diff port
+/// (`discover_from(&dir)`) — instead of the process working
+/// directory.
 pub fn client_for_dir_with(
     conduit_uri: Option<&str>,
     dir: &Path,
@@ -3149,9 +3136,7 @@ pub fn differential_revision_ids(message: &str) -> Vec<u64> {
         if line.len() < TAG.len() || !line.as_bytes()[..TAG.len()].eq_ignore_ascii_case(TAG) {
             continue;
         }
-        let Some(value) = line.get(TAG.len()..) else {
-            continue; // LCOV_EXCL_LINE // Reason: dead arm; the byte-prefix match guarantees TAG.len() is a char boundary
-        };
+        let value = &line[TAG.len()..];
         let value = value.trim();
         if value.is_empty() {
             return Vec::new();
@@ -4284,17 +4269,30 @@ fn git_fetch_target(
     remote: &str,
     name: &str,
 ) -> Result<Option<String>, String> {
+    git_fetch_target_with(dir, io, remote, name, "git", &[])
+}
+
+/// [`git_fetch_target`] with the `git p4 sync` invocation overridden
+/// (test seam; production passes `"git"` with no prefix — see
+/// [`git_p4_sync_with`]).
+fn git_fetch_target_with(
+    dir: &Path,
+    io: &mut Io,
+    remote: &str,
+    name: &str,
+    p4_program: &str,
+    p4_prefix: &[String],
+) -> Result<Option<String>, String> {
     if git_is_perforce_remote(dir, remote) {
         io.push_status(
             "P4 SYNC",
             &format!("Synchronizing \"{name}\" from Perforce..."),
         );
-        git_p4_sync(dir, remote, name)?;
-        // LCOV_EXCL_START // Reason: needs a successful Perforce sync; no p4 tooling in CI
+        git_p4_sync_with(dir, p4_program, p4_prefix, remote, name)?;
         return Ok(Some(git_remote_commit(
             dir,
             &format!("refs/remotes/{remote}/{name}"),
-        ))); // LCOV_EXCL_STOP
+        )));
     }
     let full_ref = format!("refs/remotes/{remote}/{name}");
     if git::output(dir, &["rev-parse", "--verify", &full_ref])
@@ -4390,12 +4388,16 @@ pub struct GitSymbol {
 pub fn git_author_and_date(dir: &Path, commit: &str) -> Result<(String, String), String> {
     let info = git::stdout_text(dir, &["log", "-n1", "--format=%aD%n%an%n%ae", commit, "--"])?;
     let mut lines = info.split('\n');
-    match (lines.next(), lines.next(), lines.next()) {
-        (Some(date), Some(author), Some(email)) => {
-            Ok((format!("{author} <{email}>"), date.to_string()))
-        }
-        _ => Err(format!("could not read author and date of \"{commit}\"")), // LCOV_EXCL_LINE // Reason: dead arm; the fixed --format always yields three lines on success
-    }
+    let date = lines
+        .next()
+        .expect("the fixed --format always yields three lines on success");
+    let author = lines
+        .next()
+        .expect("the fixed --format always yields three lines on success");
+    let email = lines
+        .next()
+        .expect("the fixed --format always yields three lines on success");
+    Ok((format!("{author} <{email}>"), date.to_string()))
 }
 
 /// Rebase `min..max` onto `dst`, returning the new HEAD
@@ -4754,7 +4756,17 @@ fn render_raw_commit_blob(raw: &RawCommit) -> String {
 /// Read one raw commit (`ArcanistGitAPI::readRawCommit()`,
 /// `src/repository/api/ArcanistGitAPI.php:1738-1744`).
 fn git_read_raw_commit(dir: &Path, hash: &str) -> Result<RawCommit, String> {
-    let output = git::output(dir, &["cat-file", "commit", "--", hash])
+    git_read_raw_commit_with(dir, hash, None)
+}
+
+/// [`git_read_raw_commit`] with the `git` program override injected
+/// (test seam; production passes `None`, which spawns `git`).
+fn git_read_raw_commit_with(
+    dir: &Path,
+    hash: &str,
+    git: Option<&Path>,
+) -> Result<RawCommit, String> {
+    let output = git::output_with_git(dir, &["cat-file", "commit", "--", hash], git)
         .map_err(|e| format!("failed to run git: {e}"))?;
     if !output.status.success() {
         let detail = format!(
@@ -4764,13 +4776,39 @@ fn git_read_raw_commit(dir: &Path, hash: &str) -> Result<RawCommit, String> {
         );
         let trimmed = detail.trim();
         if trimmed.is_empty() {
-            return Err(format!("git cat-file commit {hash} failed")); // LCOV_EXCL_LINE // Reason: git failures explain on stdout/stderr; silence needs a kill, not stageable
+            return Err(format!("git cat-file commit {hash} failed"));
         }
         return Err(trimmed.to_string());
     }
     // The blob is used verbatim (no trimming): the message keeps its
     // exact bytes.
     parse_raw_commit_blob(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Write one raw commit, returning its hash
+/// (`ArcanistGitAPI::writeRawCommit()`,
+/// `src/repository/api/ArcanistGitAPI.php:1746-1754`).
+///
+/// Assert a `git hash-object --stdin` pipe-write failure is the benign
+/// early-exit EPIPE.
+///
+/// White-box proof that only EPIPE is possible: `stdin` is a pipe
+/// opened by `Stdio::piped()` on a successfully spawned `git
+/// hash-object --stdin`, and `write_all` pumps an in-memory blob into
+/// it over a blocking fd. The sole failure mode is the reader going
+/// away — git exiting before reading stdin (e.g. its fatal firing
+/// outside a repository) — which the OS reports as EPIPE. No
+/// filesystem, network, or caller-supplied buffer is involved; the pipe
+/// is freshly created (never closed or bad); `std` retries interrupts
+/// internally. Any other `ErrorKind` would indicate a platform or std
+/// bug, so it panics instead of masking the exit-status check below
+/// with a misleading error.
+fn assert_pipe_write_is_epipe(error: &std::io::Error) {
+    if error.kind() != std::io::ErrorKind::BrokenPipe {
+        unreachable!(
+            "pipe writes to git fail only as EPIPE (git exited before reading stdin); got {error:?}"
+        );
+    }
 }
 
 /// Write one raw commit, returning its hash
@@ -4810,8 +4848,7 @@ fn git_write_raw_commit(dir: &Path, raw: &RawCommit) -> Result<String, String> {
         // outside a repo): fall through to the exit-status check for
         // the canonical error instead of this scheduling-dependent
         // EPIPE (Linux CI hit EPIPE, macOS the status).
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
-        Err(e) => return Err(format!("failed to write raw commit: {e}")), // LCOV_EXCL_LINE // Reason: pipe writes to git fail only as EPIPE; other write errors are not stageable
+        Err(e) => assert_pipe_write_is_epipe(&e),
     }
     let output = child
         .wait_with_output()
@@ -6945,8 +6982,20 @@ fn execute_engine(
     validated: &Validated,
     io: &mut Io,
 ) -> Result<(), String> {
+    execute_engine_with(dir, &hg::HgCommand::system(), options, vcs, validated, io)
+}
+
+/// [`execute_engine`] driving `hg` through `hg_cmd` (test seam).
+fn execute_engine_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    options: &Options,
+    vcs: Vcs,
+    validated: &Validated,
+    io: &mut Io,
+) -> Result<(), String> {
     let squash = validated.strategy == Strategy::Squash;
-    let mut prep = prepare_engine_commits(dir, options, vcs, io)?;
+    let mut prep = prepare_engine_commits(dir, hg_cmd, options, vcs, io)?;
     let (cli, user_file) = load_options_for_run(options)?;
     let client = client_for_dir_with(
         options.conduit_uri.as_deref(),
@@ -6954,8 +7003,9 @@ fn execute_engine(
         user_file.as_deref(),
         &cli,
     )?;
-    let mut sets = build_sets(
+    let mut sets = build_sets_with(
         dir,
+        hg_cmd,
         io,
         vcs,
         validated,
@@ -6979,7 +7029,7 @@ fn execute_engine(
             &prep.commits,
             &prep.symbols_display,
             &hash_display_for(vcs),
-        )?; // LCOV_EXCL_LINE // Reason: needs a declined implicit-sets confirm in a full online engine run; no unit test stages that run
+        )?;
     }
     print_landing(io, &sets, &prep.commits, &hash_display_for(vcs));
     if options.preview {
@@ -7003,9 +7053,9 @@ fn execute_engine(
             &prep.commits,
             Some(&client),
         ),
-        // LCOV_EXCL_START // Reason: hg land flow; reaching it needs live conduit creds plus system hg
-        Vcs::Hg => land_hg(
+        Vcs::Hg => land_hg_with(
             dir,
+            hg_cmd,
             io,
             options,
             squash,
@@ -7016,7 +7066,7 @@ fn execute_engine(
             prep.hg_branch.as_deref(),
             &sets,
             &prep.commits,
-            Some(&client), // LCOV_EXCL_STOP
+            Some(&client),
         ),
     }
 }
@@ -7041,18 +7091,20 @@ struct EnginePrep {
 /// before any onto/into output.
 fn prepare_engine_commits(
     dir: &Path,
+    hg_cmd: &hg::HgCommand,
     options: &Options,
     vcs: Vcs,
     io: &mut Io,
 ) -> Result<EnginePrep, String> {
     // Sources, resolved first.
-    let raw_symbols = default_source_symbols(dir, options, vcs, io)?;
+    let raw_symbols = default_source_symbols_with(dir, hg_cmd, options, vcs, io)?;
     let symbols_display = display_symbols(&raw_symbols);
-    let resolved = resolve_sources(dir, io, vcs, &raw_symbols)?;
+    let resolved = resolve_sources_with(dir, hg_cmd, io, vcs, &raw_symbols)?;
     // Remotes, then commits.
     let (onto_remote, onto_refs, into_commit, into_ref, hg_branch) =
-        select_targets(dir, options, vcs, io, &raw_symbols)?;
-    let mut commits = select_source_commits(dir, vcs, &resolved, into_commit.as_deref())?;
+        select_targets_with(dir, hg_cmd, options, vcs, io, &raw_symbols)?;
+    let mut commits =
+        select_source_commits_with(dir, hg_cmd, vcs, &resolved, into_commit.as_deref())?;
     link_commits(&mut commits);
     let into_display = into_display_string(vcs, into_commit.as_deref());
     confirm_commit_count(
@@ -7162,8 +7214,20 @@ type TargetSelection = (
 
 /// Raw source symbols: explicit refs, else the VCS defaults
 /// (`ArcanistLandEngine.php:1106-1109`).
+#[cfg(test)]
 fn default_source_symbols(
     dir: &Path,
+    options: &Options,
+    vcs: Vcs,
+    io: &mut Io,
+) -> Result<Vec<String>, String> {
+    default_source_symbols_with(dir, &hg::HgCommand::system(), options, vcs, io)
+}
+
+/// [`default_source_symbols`] driving `hg` through `hg_cmd` (test seam).
+fn default_source_symbols_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
     options: &Options,
     vcs: Vcs,
     io: &mut Io,
@@ -7173,11 +7237,12 @@ fn default_source_symbols(
     }
     match vcs {
         Vcs::Git => git_default_symbols(dir, io),
-        Vcs::Hg => hg_default_symbols(dir, io),
+        Vcs::Hg => hg_default_symbols_with(dir, hg_cmd, io),
     }
 }
 
 /// Onto remote/refs and the into commit for resolved `raw` symbols, per VCS.
+#[cfg(test)]
 fn select_targets(
     dir: &Path,
     options: &Options,
@@ -7185,9 +7250,21 @@ fn select_targets(
     io: &mut Io,
     raw: &[String],
 ) -> Result<TargetSelection, String> {
+    select_targets_with(dir, &hg::HgCommand::system(), options, vcs, io, raw)
+}
+
+/// [`select_targets`] driving `hg` through `hg_cmd` (test seam).
+fn select_targets_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    options: &Options,
+    vcs: Vcs,
+    io: &mut Io,
+    raw: &[String],
+) -> Result<TargetSelection, String> {
     match vcs {
         Vcs::Git => select_git_targets(dir, options, io, raw),
-        Vcs::Hg => select_hg_targets(dir, options, io, raw),
+        Vcs::Hg => select_hg_targets_with(dir, hg_cmd, options, io, raw),
     }
 }
 
@@ -7213,32 +7290,58 @@ fn select_git_targets(
 }
 
 /// Mercurial onto remote/refs and the into commit for resolved `raw` symbols.
+#[cfg(test)]
 fn select_hg_targets(
     dir: &Path,
     options: &Options,
     io: &mut Io,
+    raw: &[String],
+) -> Result<TargetSelection, String> {
+    select_hg_targets_with(dir, &hg::HgCommand::system(), options, io, raw)
+}
+
+/// [`select_hg_targets`] driving `hg` through `hg_cmd` (test seam).
+fn select_hg_targets_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    options: &Options,
+    io: &mut Io,
     _raw: &[String],
 ) -> Result<TargetSelection, String> {
-    let onto_remote = hg_select_onto_remote(dir, io, options)?;
-    let onto_refs = hg_select_onto_refs(dir, io, options)?; // LCOV_EXCL_START // Reason: hg target selection needs system hg; the gates container ships none
-    let branch = hg_confirm_onto_refs(dir, io, &onto_remote, &onto_refs, options.hold)?;
+    let onto_remote = hg_select_onto_remote_with(dir, hg_cmd, io, options)?;
+    let onto_refs = hg_select_onto_refs(dir, io, options)?;
+    let branch =
+        hg_confirm_onto_refs_with(dir, hg_cmd, io, &onto_remote, &onto_refs, options.hold)?;
     let into_state = select_into_state(io, options, &onto_remote, &onto_refs, &|remote| {
-        hg::ok(dir, &["paths", remote])
+        hg::ok_with(dir, hg_cmd, &["paths", remote])
     })?;
-    let into_commit = hg_select_into_commit(dir, io, &into_state, options.into.as_deref())?;
-    Ok((onto_remote, onto_refs, into_commit, None, branch)) // LCOV_EXCL_STOP
+    let into_commit =
+        hg_select_into_commit_with(dir, hg_cmd, io, &into_state, options.into.as_deref())?;
+    Ok((onto_remote, onto_refs, into_commit, None, branch))
 }
 
 /// Resolve source symbols to commits, per VCS.
+#[cfg(test)]
 fn resolve_sources(
     dir: &Path,
     io: &mut Io,
     vcs: Vcs,
     raw: &[String],
 ) -> Result<Vec<GitSymbol>, String> {
+    resolve_sources_with(dir, &hg::HgCommand::system(), io, vcs, raw)
+}
+
+/// [`resolve_sources`] driving `hg` through `hg_cmd` (test seam).
+fn resolve_sources_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    io: &mut Io,
+    vcs: Vcs,
+    raw: &[String],
+) -> Result<Vec<GitSymbol>, String> {
     let resolved = match vcs {
         Vcs::Git => git_resolve_symbols(dir, raw)?,
-        Vcs::Hg => hg_resolve_symbols(dir, io, raw)?,
+        Vcs::Hg => hg_resolve_symbols_with(dir, hg_cmd, io, raw)?,
     };
     Ok(raw
         .iter()
@@ -7249,22 +7352,59 @@ fn resolve_sources(
 }
 
 /// Select landing commits, per VCS.
+#[cfg(test)]
 fn select_source_commits(
     dir: &Path,
     vcs: Vcs,
     symbols: &[GitSymbol],
     into_commit: Option<&str>,
 ) -> Result<Vec<LandCommit>, String> {
+    select_source_commits_with(dir, &hg::HgCommand::system(), vcs, symbols, into_commit)
+}
+
+/// [`select_source_commits`] driving `hg` through `hg_cmd` (test seam).
+fn select_source_commits_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    vcs: Vcs,
+    symbols: &[GitSymbol],
+    into_commit: Option<&str>,
+) -> Result<Vec<LandCommit>, String> {
     match vcs {
         Vcs::Git => git_select_commits(dir, symbols, into_commit),
-        Vcs::Hg => hg_select_commits(dir, symbols, into_commit),
+        Vcs::Hg => hg_select_commits_with(dir, hg_cmd, symbols, into_commit),
     }
 }
 
 /// Build landing sets: online discovery and grouping, or the offline
 /// single unassociated set.
+#[cfg(test)]
 fn build_sets(
     dir: &Path,
+    io: &mut Io,
+    vcs: Vcs,
+    validated: &Validated,
+    commits: &mut [LandCommit],
+    online: Option<&arc_rs::conduit::Client>,
+    display_hash: &dyn Fn(&str) -> String,
+) -> Result<Vec<CommitSet>, String> {
+    build_sets_with(
+        dir,
+        &hg::HgCommand::system(),
+        io,
+        vcs,
+        validated,
+        commits,
+        online,
+        display_hash,
+    )
+}
+
+/// [`build_sets`] driving `hg` through `hg_cmd` (test seam).
+#[allow(clippy::too_many_arguments)]
+fn build_sets_with(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
     io: &mut Io,
     vcs: Vcs,
     validated: &Validated,
@@ -7288,7 +7428,7 @@ fn build_sets(
         (Some(symbol), None) => Some(resolve_forced_revision(&call, symbol)?),
         (None, _) => None,
     };
-    let message_of = commit_message_reader(dir, vcs);
+    let message_of = commit_message_reader_with(dir, hg_cmd, vcs);
     let hashes_of = commit_hash_reader(dir, vcs);
     load_revision_refs(io, &call, commits, &message_of, &hashes_of, forced.as_ref())?;
     group_commit_sets(io, commits, display_hash)
@@ -7299,13 +7439,26 @@ type MessageReader<'a> = Box<dyn Fn(&str) -> Result<String, String> + 'a>;
 
 /// Full-message reader per VCS: `git log --format=%B` or
 /// `hg log --template {desc}`.
+#[cfg(test)]
 fn commit_message_reader(dir: &Path, vcs: Vcs) -> MessageReader<'_> {
+    commit_message_reader_with(dir, &hg::HgCommand::system(), vcs)
+}
+
+/// [`commit_message_reader`] driving `hg` through `hg_cmd` (test seam).
+fn commit_message_reader_with<'a>(
+    dir: &'a Path,
+    hg_cmd: &hg::HgCommand,
+    vcs: Vcs,
+) -> MessageReader<'a> {
     match vcs {
         Vcs::Git => {
             Box::new(|hash| git::stdout_text(dir, &["log", "-n1", "--format=%B", hash, "--"]))
         }
         Vcs::Hg => {
-            Box::new(|hash| hg::stdout_text(dir, &["log", "--rev", hash, "--template", "{desc}"]))
+            let owned = hg_cmd.clone();
+            Box::new(move |hash| {
+                hg::stdout_text_with(dir, &owned, &["log", "--rev", hash, "--template", "{desc}"])
+            })
         }
     }
 }
@@ -7674,9 +7827,6 @@ pub fn save_local_state_hg_with(
     let status = hg::get_uncommitted_status_with(dir, hg_cmd)?;
     let lists = change_lists(&status, &HG_CHANGE_FLAGS);
     gate_merge_conflicts(io, dir, &lists)?;
-    if !lists.externals.is_empty() {
-        confirm_dirty_externals(io, &lists.externals)?; // LCOV_EXCL_LINE // Reason: dead arm; hg status sets no externals flag
-    }
     let mut stash = None;
     if push_uncommitted_banner(
         io,
@@ -7812,10 +7962,7 @@ pub fn discard_local_state_git(
 ) -> Result<(), String> {
     match apply_stash_git(dir, io, state) {
         Ok(()) => Ok(()),
-        Err(err) => {
-            restore_local_state_git(dir, io, state)?;
-            Err(err) // LCOV_EXCL_LINE // Reason: unreachable; stash-apply failures persist across the restore checkout or fail the checkout itself
-        }
+        Err(err) => restore_local_state_git(dir, io, state).and(Err(err)),
     }
 }
 
@@ -8253,6 +8400,7 @@ fn cursor_or(cursor: Option<&str>) -> &str {
 }
 
 /// Run the Mercurial merge/push loop (base loop plus hg halves).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn land_hg(
     dir: &Path,

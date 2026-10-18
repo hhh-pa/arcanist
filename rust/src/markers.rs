@@ -516,23 +516,38 @@ fn arc_hg_content_tag() -> u64 {
 /// atomically installing it when the bytes differ. Best-effort:
 /// `None` leaves the caller to run bare.
 fn materialize_bundled_arc_hg() -> Option<PathBuf> {
-    let target = std::env::temp_dir().join(format!("arc-hg-{:016x}.py", arc_hg_content_tag()));
+    materialize_bundled_arc_hg_in(None)
+}
+
+/// [`materialize_bundled_arc_hg`] with an explicit base directory
+/// (test seam: `None` uses `std::env::temp_dir()`, the production
+/// behavior).
+fn materialize_bundled_arc_hg_in(temp_dir: Option<&Path>) -> Option<PathBuf> {
+    let dir = temp_dir.map_or_else(std::env::temp_dir, Path::to_path_buf);
+    let target = dir.join(format!("arc-hg-{:016x}.py", arc_hg_content_tag()));
     if std::fs::read(&target).is_ok_and(|bytes| bytes == ARC_HG_BUNDLED.as_bytes()) {
         return Some(target);
     }
     let tmp = target.with_extension(format!("{}.tmp", std::process::id()));
     if std::fs::write(&tmp, ARC_HG_BUNDLED).is_err() {
-        return None; // LCOV_EXCL_LINE // Reason: temp write failure; only a planted directory triggers it, racy under parallel tests
+        return None;
     }
     if std::fs::rename(&tmp, &target).is_err() {
-        std::fs::remove_file(&tmp).ok(); // LCOV_EXCL_START // Reason: rename-failure arm; only a planted directory or a racing installer triggers it
+        std::fs::remove_file(&tmp).ok();
         // A lost install race still converges when the winner matches.
-        if std::fs::read(&target).is_ok_and(|bytes| bytes == ARC_HG_BUNDLED.as_bytes()) {
-            return Some(target);
-        }
-        return None; // LCOV_EXCL_STOP
+        return adopt_installed_copy(&target);
     }
     Some(target)
+}
+
+/// Adopt an installed copy after a lost install race: when the
+/// winner's bytes already match, no reinstall is needed.
+fn adopt_installed_copy(target: &Path) -> Option<PathBuf> {
+    if std::fs::read(target).is_ok_and(|bytes| bytes == ARC_HG_BUNDLED.as_bytes()) {
+        Some(target.to_path_buf())
+    } else {
+        None
+    }
 }
 
 /// Locate the `arc-hg` extension script: `ARC_HG_EXTENSION` first, then an
@@ -542,10 +557,10 @@ fn materialize_bundled_arc_hg() -> Option<PathBuf> {
 #[must_use]
 pub fn arc_hg_script(dir: &Path) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("ARC_HG_EXTENSION") {
-        let path = PathBuf::from(path); // LCOV_EXCL_START // Reason: needs ARC_HG_EXTENSION set; env is process-global
+        let path = PathBuf::from(path);
         if path.is_file() {
             return Some(path);
-        } // LCOV_EXCL_STOP
+        }
     }
     if let Some(found) = dir
         .ancestors()
@@ -700,7 +715,7 @@ pub fn query_hg_markers_with(
         let (flag, value) = hg::extension_config_arg("arc-hg", Some(script))?;
         args.insert(0, value);
         args.insert(0, flag);
-    } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
+    }
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = hg::output_with(dir, hg_command, &argv)?;
     // T1153 LAND-26: PHP's future throws on a nonzero exit, so the
@@ -733,9 +748,6 @@ pub fn published_git_hashes(
     client: Option<&crate::conduit::Client>,
 ) -> Result<Vec<String>, String> {
     let remotes = query_git_remotes(dir)?;
-    if remotes.is_empty() {
-        return Ok(Vec::new()); // LCOV_EXCL_LINE // Reason: dead: empty remote output errors in parse_remote_line, so Ok is never empty
-    }
     let markers = query_git_markers(dir, MARKER_TYPE_BRANCH, true)?;
     if markers.is_empty() {
         return Ok(Vec::new());
@@ -762,9 +774,10 @@ pub fn published_git_hashes(
         .collect();
     let mut hashes = Vec::new();
     for marker in &markers {
-        let Some(remote_name) = &marker.remote_name else {
-            continue; // LCOV_EXCL_LINE // Reason: dead: the remote-cache filter guarantees remote_name is set
-        };
+        let remote_name = marker
+            .remote_name
+            .as_ref()
+            .expect("the remote-cache filter guarantees remote_name is set");
         let Some(remote) = by_name.get(remote_name.as_str()) else {
             continue;
         };
@@ -2498,6 +2511,16 @@ fn check_markers_support(dir: &Path, requested: Option<&str>) -> Result<String, 
 }
 
 pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
+    execute_with_user_file(dir, argv, config::arcrc_path().as_deref())
+}
+
+/// [`execute`] with an explicit credential file (test seam: hermetic
+/// tests stage a fake arcrc instead of touching HOME).
+fn execute_with_user_file(
+    dir: &Path,
+    argv: &[String],
+    user_file: Option<&Path>,
+) -> Result<String, String> {
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => return Ok(usage()),
@@ -2524,7 +2547,7 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
     let owned_client = match config::client_for_tokenless_with(
         options.conduit_uri.as_deref(),
         dir,
-        config::arcrc_path().as_deref(),
+        user_file,
         &get_config::LoadOptions::default(),
     ) {
         Ok(client) => client,
@@ -2577,7 +2600,13 @@ fn execute_core(
 }
 
 pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
-    match execute(dir, argv) {
+    run_in_with_user_file(dir, argv, config::arcrc_path().as_deref())
+}
+
+/// [`run_in`] with an explicit credential file (test seam: hermetic
+/// tests stage a fake arcrc instead of touching HOME).
+fn run_in_with_user_file(dir: &Path, argv: &[String], user_file: Option<&Path>) -> ExitCode {
+    match execute_with_user_file(dir, argv, user_file) {
         Ok(text) => {
             print!("{text}");
             ExitCode::SUCCESS
@@ -2587,15 +2616,23 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             // guidance (the toolset runtime's auth arm). The calls
             // went out on a strict client, re-resolved here for the
             // mapping context (config reads only, no I/O).
-            let client = parse_options(argv)
+            // Byte-identical to `config::client_for(..)` when the
+            // wrapper passes the ambient user file (same cwd fallback).
+            let config_dir =
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let client = parse_options(argv).ok().flatten().and_then(|options| {
+                config::client_for_with(
+                    options.conduit_uri.as_deref(),
+                    &config_dir,
+                    user_file,
+                    &get_config::LoadOptions::default(),
+                )
                 .ok()
-                .flatten()
-                .and_then(|options| config::client_for(options.conduit_uri.as_deref()).ok());
+            });
             if let Some(client) = client
-                // LCOV_EXCL_START // Reason: needs a configured conduit client; hermetic tests cannot mint one (HOME is process-global)
                 && let Some(code) = conduit::auth_report_for(&client, &message)
             {
-                return code; // LCOV_EXCL_STOP
+                return code;
             }
             // T1153 RB-D4 (R4): `markers`/`branches` run in the
             // toolset runtime (`ArcanistMarkersWorkflow extends

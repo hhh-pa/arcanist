@@ -18,6 +18,41 @@ fn builtin(name: &str) -> bool {
     is_builtin_command(name)
 }
 
+fn expect_dispatch(expanded: Expansion) -> (Vec<String>, Vec<String>) {
+    let Expansion::Dispatch { argv, hints } = expanded else {
+        panic!("expected dispatch, got {expanded:?}");
+    };
+    (argv, hints)
+}
+
+fn expect_dispatch_hints(expanded: Expansion) -> Vec<String> {
+    let Expansion::Dispatch { hints, .. } = expanded else {
+        panic!("expected dispatch");
+    };
+    hints
+}
+
+fn expect_shell(expanded: Expansion) -> (Vec<String>, String) {
+    let Expansion::Shell { argv, hint } = expanded else {
+        panic!("expected shell, got {expanded:?}");
+    };
+    (argv, hint)
+}
+
+fn expect_shell_bare(expanded: Expansion) -> (Vec<String>, String) {
+    let Expansion::Shell { argv, hint } = expanded else {
+        panic!("expected shell");
+    };
+    (argv, hint)
+}
+
+fn expect_failure(expanded: Expansion) -> (String, Vec<String>) {
+    let Expansion::Failed { message, hints } = expanded else {
+        panic!("expected failure, got {expanded:?}");
+    };
+    (message, hints)
+}
+
 struct TempDir {
     path: PathBuf,
 }
@@ -160,16 +195,11 @@ fn expansion_passes_builtins_through_untouched() {
 fn expansion_appends_user_args_after_alias_args() {
     let aliases = vec![alias("arc", "draft", &["diff", "--draft"], "user")];
     let expanded = expand(&args(&["draft", "extra"]), &aliases, builtin);
-    let Expansion::Dispatch { argv, hints } = expanded else {
-        panic!("expected dispatch, got {expanded:?}"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (argv, hints) = expect_dispatch(expanded);
     assert_eq!(argv, args(&["diff", "--draft", "extra"]));
     assert_eq!(hints.len(), 1);
-    assert!(
-        hints[0].contains("arc draft -> arc diff --draft"),
-        "{}",
-        hints[0] // LCOV_EXCL_LINE // Reason: assert-message arg; evaluates only if the passing assert fails
-    );
+    let hint = &hints[0];
+    assert!(hint.contains("arc draft -> arc diff --draft"), "{hint}");
 }
 
 #[test]
@@ -179,9 +209,7 @@ fn expansion_resolves_chains() {
         alias("arc", "b", &["diff"], "user"),
     ];
     let expanded = expand(&args(&["a", "user-arg"]), &aliases, builtin);
-    let Expansion::Dispatch { argv, hints } = expanded else {
-        panic!("expected dispatch, got {expanded:?}"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (argv, hints) = expect_dispatch(expanded);
     assert_eq!(argv, args(&["diff", "--from-a", "user-arg"]));
     assert_eq!(hints.len(), 2);
 }
@@ -190,9 +218,7 @@ fn expansion_resolves_chains() {
 fn expansion_resolves_shell_aliases() {
     let aliases = vec![alias("arc", "ls", &["!ls", "-la"], "user")];
     let expanded = expand(&args(&["ls", "/tmp"]), &aliases, builtin);
-    let Expansion::Shell { argv, hint } = expanded else {
-        panic!("expected shell, got {expanded:?}"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (argv, hint) = expect_shell(expanded);
     assert_eq!(argv, args(&["ls", "-la", "/tmp"]));
     assert!(hint.contains("arc ls -> $ 'ls' '-la' '/tmp'"), "{hint}");
 }
@@ -200,9 +226,7 @@ fn expansion_resolves_shell_aliases() {
 #[test]
 fn expansion_quotes_shell_display_words() {
     let aliases = vec![alias("arc", "g", &["!echo", "a b"], "user")];
-    let Expansion::Shell { argv, hint } = expand(&args(&["g"]), &aliases, builtin) else {
-        panic!("expected shell"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (argv, hint) = expect_shell_bare(expand(&args(&["g"]), &aliases, builtin));
     assert_eq!(argv, args(&["echo", "a b"]));
     assert!(hint.contains("'echo' 'a b'"), "{hint}");
 }
@@ -242,17 +266,13 @@ fn expansion_quotes_effect_alias_tail_like_pct_lr() {
     // quoting are quoted, safe words stay bare.
     let aliases = vec![alias("arc", "draft", &["diff", "a b", "--x"], "user")];
     let expanded = expand(&args(&["draft"]), &aliases, builtin);
-    let Expansion::Dispatch { argv, hints } = expanded else {
-        panic!("expected dispatch, got {expanded:?}"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (argv, hints) = expect_dispatch(expanded);
     assert_eq!(argv, args(&["diff", "a b", "--x"]));
     assert_eq!(hints.len(), 1);
     assert_eq!(hints[0], "arc draft -> arc diff 'a b' --x");
 
     let aliases = vec![alias("arc", "eq", &["diff", "a=b"], "user")];
-    let Expansion::Dispatch { hints, .. } = expand(&args(&["eq"]), &aliases, builtin) else {
-        panic!("expected dispatch"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let hints = expect_dispatch_hints(expand(&args(&["eq"]), &aliases, builtin));
     assert_eq!(hints[0], "arc eq -> arc diff 'a=b'");
 }
 
@@ -263,9 +283,7 @@ fn expansion_reports_cycles() {
         alias("arc", "b", &["a"], "user"),
     ];
     let expanded = expand(&args(&["a"]), &aliases, builtin);
-    let Expansion::Failed { message, .. } = expanded else {
-        panic!("expected failure, got {expanded:?}"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (message, _) = expect_failure(expanded);
     assert!(message.contains("cycle"), "{message}");
     assert!(message.contains("b -> a -> b"), "{message}");
 }
@@ -274,9 +292,7 @@ fn expansion_reports_cycles() {
 fn expansion_reports_self_cycles() {
     let aliases = vec![alias("arc", "loop", &["loop"], "user")];
     let expanded = expand(&args(&["loop"]), &aliases, builtin);
-    let Expansion::Failed { message, hints } = expanded else {
-        panic!("expected failure, got {expanded:?}"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (message, hints) = expect_failure(expanded);
     assert!(message.contains("cycle"), "{message}");
     assert!(message.contains("loop -> loop"), "{message}");
     assert_eq!(hints.len(), 1);
@@ -289,9 +305,7 @@ fn expansion_chain_ending_at_builtin_keeps_every_hint() {
         alias("arc", "b", &["diff", "--all"], "user"),
     ];
     let expanded = expand(&args(&["a", "user-arg"]), &aliases, builtin);
-    let Expansion::Dispatch { argv, hints } = expanded else {
-        panic!("expected dispatch, got {expanded:?}"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (argv, hints) = expect_dispatch(expanded);
     assert_eq!(argv, args(&["diff", "--all", "user-arg"]));
     assert_eq!(
         hints,
@@ -312,9 +326,7 @@ fn expansion_multi_hop_to_shell_keeps_only_the_shell_hint() {
         alias("arc", "b", &["!echo", "hi"], "user"),
     ];
     let expanded = expand(&args(&["a", "user-arg"]), &aliases, builtin);
-    let Expansion::Shell { argv, hint } = expanded else {
-        panic!("expected shell, got {expanded:?}"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (argv, hint) = expect_shell(expanded);
     assert_eq!(argv, args(&["echo", "hi", "--from-a", "user-arg"]));
     assert_eq!(hint, "arc b -> $ 'echo' 'hi' '--from-a' 'user-arg'");
 }
@@ -323,9 +335,7 @@ fn expansion_multi_hop_to_shell_keeps_only_the_shell_hint() {
 fn expansion_reports_dangling_chains_but_passes_unknown_through() {
     let aliases = vec![alias("arc", "a", &["gone"], "user")];
     let expanded = expand(&args(&["a"]), &aliases, builtin);
-    let Expansion::Failed { message, hints } = expanded else {
-        panic!("expected failure, got {expanded:?}"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (message, hints) = expect_failure(expanded);
     assert!(message.contains("Alias resolved to \"gone\""), "{message}");
     assert_eq!(hints.len(), 1);
 
@@ -343,9 +353,7 @@ fn expansion_reports_dangling_chains_but_passes_unknown_through() {
 fn expansion_suggests_cross_toolset_aliases() {
     let aliases = vec![alias("phage", "draft", &["diff"], "user")];
     let expanded = expand(&args(&["draft"]), &aliases, builtin);
-    let Expansion::Dispatch { argv, hints } = expanded else {
-        panic!("expected dispatch, got {expanded:?}"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (argv, hints) = expect_dispatch(expanded);
     assert_eq!(argv, args(&["draft"]));
     assert_eq!(hints.len(), 1);
     assert!(hints[0].contains("did you mean"), "{}", hints[0]);
@@ -359,9 +367,7 @@ fn expansion_prefers_last_definition_and_hints_shadowed_ones() {
         alias("arc", "draft", &["diff"], "local"),
     ];
     let expanded = expand(&args(&["draft"]), &aliases, builtin);
-    let Expansion::Dispatch { argv, hints } = expanded else {
-        panic!("expected dispatch, got {expanded:?}"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (argv, hints) = expect_dispatch(expanded);
     assert_eq!(argv, args(&["diff"]));
     assert!(hints.iter().any(|h| h.contains("Multiple")), "{hints:?}");
     assert!(
@@ -382,9 +388,7 @@ fn expansion_enforces_stack_limit() {
         });
     }
     let expanded = expand(&args(&["a0"]), &aliases, builtin);
-    let Expansion::Failed { message, .. } = expanded else {
-        panic!("expected failure, got {expanded:?}"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (message, _) = expect_failure(expanded);
     assert!(message.contains("unreasonably deep"), "{message}");
 }
 
@@ -658,6 +662,29 @@ fn list_fails_on_non_array_aliases_value() {
 }
 
 #[test]
+fn load_rejects_bad_system_aliases_value() {
+    // The system source is the only one hermetic tests cannot stage
+    // through load_aliases_in (/etc is privileged), so its bad-value
+    // error path is pinned directly against a fixture map.
+    let system: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(r#"{"aliases": 42}"#).unwrap();
+    let mut aliases = Vec::new();
+    let mut warnings = Vec::new();
+    let err = take_system_source(
+        &system,
+        Path::new("/etc/arcconfig"),
+        &mut aliases,
+        &mut warnings,
+    )
+    .unwrap_err();
+    assert!(err.contains("is not valid"), "{err}");
+    assert!(err.contains("Expected a list or dictionary!"), "{err}");
+    assert!(err.contains("system (/etc/arcconfig)"), "{err}");
+    assert!(aliases.is_empty());
+    assert!(warnings.is_empty());
+}
+
+#[test]
 fn shell_status_mapping_passes_codes_and_fails_signals() {
     assert_eq!(
         shell_status_exit_code(ShellStatus::Exited(0)),
@@ -717,12 +744,15 @@ fn shell_runner_maps_spawn_outcomes() {
         "arc g -> $ echo hi",
         |program, argv| {
             // T1153 CORE-23: Unix mediates the shell (`sh -c`).
-            if cfg!(unix) {
+            #[cfg(unix)]
+            {
                 assert_eq!(program, "sh");
                 assert_eq!(argv, &["-c".to_string(), "'echo' 'hi'".to_string()]);
-            } else {
-                assert_eq!(program, "echo"); // LCOV_EXCL_START // Reason: non-unix arm; cfg!(unix) is always true on ubuntu CI
-                assert_eq!(argv, &["hi".to_string()]); // LCOV_EXCL_STOP
+            }
+            #[cfg(not(unix))]
+            {
+                assert_eq!(program, "echo");
+                assert_eq!(argv, &["hi".to_string()]);
             }
             Ok(ShellStatus::Exited(0))
         },
@@ -749,11 +779,8 @@ fn shell_runner_maps_spawn_outcomes() {
     });
     assert_eq!(code, ExitCode::FAILURE);
     assert_eq!(notices.len(), 2);
-    assert!(
-        notices[1].contains("cannot execute shell alias"),
-        "{}",
-        notices[1] // LCOV_EXCL_LINE // Reason: assert-message arg; evaluates only if the passing assert fails
-    );
+    let notice = &notices[1];
+    assert!(notice.contains("cannot execute shell alias"), "{notice}");
     assert!(notices[1].contains("not found"), "{}", notices[1]);
 
     // T1153 CORE-23: an empty shell command exits 0 like PHP's
@@ -767,13 +794,33 @@ fn loaded(aliases: Vec<Alias>) -> Option<(Vec<Alias>, Vec<String>)> {
     Some((aliases, Vec::new()))
 }
 
+fn must_not_spawn_for_dispatch(_: &[String]) -> Result<ShellStatus, String> {
+    unreachable!("must not spawn for dispatch")
+}
+
+#[test]
+#[should_panic(expected = "must not spawn for dispatch")]
+fn must_not_spawn_for_dispatch_fires() {
+    let _ = must_not_spawn_for_dispatch(&[]);
+}
+
+fn must_not_spawn_for_broken_chains(_: &[String]) -> Result<ShellStatus, String> {
+    unreachable!("must not spawn for broken chains")
+}
+
+#[test]
+#[should_panic(expected = "must not spawn for broken chains")]
+fn must_not_spawn_for_broken_chains_fires() {
+    let _ = must_not_spawn_for_broken_chains(&[]);
+}
+
 #[test]
 fn expansion_driver_dispatches_and_reports_shell_and_broken_chains() {
     let aliases = vec![alias("arc", "draft", &["diff", "--draft"], "user")];
     let (result, notices) = apply_expansion_with(
         args(&["draft", "extra"]),
         || loaded(aliases),
-        |_| panic!("must not spawn for dispatch"), // LCOV_EXCL_LINE // Reason: must-not-spawn guard; firing fails the test
+        must_not_spawn_for_dispatch,
     );
     assert_eq!(result, Ok(args(&["diff", "--draft", "extra"])));
     // T1153 CORE-23: cyan log-engine hint (` ALIAS  ...` plain).
@@ -788,11 +835,10 @@ fn expansion_driver_dispatches_and_reports_shell_and_broken_chains() {
         || loaded(aliases),
         |shell| {
             // T1153 CORE-23: Unix mediates the shell (`sh -c`).
-            if cfg!(unix) {
-                assert_eq!(shell, &args(&["sh", "-c", "'echo' 'hi'"]));
-            } else {
-                assert_eq!(shell, &args(&["echo", "hi"])); // LCOV_EXCL_LINE // Reason: non-unix arm; cfg!(unix) is always true on ubuntu CI
-            }
+            #[cfg(unix)]
+            assert_eq!(shell, &args(&["sh", "-c", "'echo' 'hi'"]));
+            #[cfg(not(unix))]
+            assert_eq!(shell, &args(&["echo", "hi"]));
             Ok(ShellStatus::Exited(0))
         },
     );
@@ -816,25 +862,30 @@ fn expansion_driver_dispatches_and_reports_shell_and_broken_chains() {
     let (result, notices) = apply_expansion_with(
         args(&["a"]),
         || loaded(aliases),
-        |_| panic!("must not spawn for broken chains"), // LCOV_EXCL_LINE // Reason: must-not-spawn guard; firing fails the test
+        must_not_spawn_for_broken_chains,
     );
     assert_eq!(result, Err(ExitCode::FAILURE));
     assert_eq!(notices.len(), 2);
     // T1153 CORE-23: cyan log-engine hint (` ALIAS  ...` plain).
     assert!(notices[0].starts_with(" ALIAS  "), "{}", notices[0]);
-    assert!(
-        notices[1].contains("Alias resolved to \"gone\""),
-        "{}",
-        notices[1] // LCOV_EXCL_LINE // Reason: assert-message arg; evaluates only if the passing assert fails
-    );
+    let notice = &notices[1];
+    assert!(notice.contains("Alias resolved to \"gone\""), "{notice}");
+}
+
+fn must_not_load_aliases() -> Option<(Vec<Alias>, Vec<String>)> {
+    panic!("must not load")
+}
+
+fn must_not_spawn_for_passthrough(_: &[String]) -> Result<ShellStatus, String> {
+    panic!("must not spawn")
 }
 
 #[test]
 fn expansion_driver_passes_through_flags_and_unreadable_config() {
     let (result, notices) = apply_expansion_with(
         args(&["--help"]),
-        || panic!("must not load"), // LCOV_EXCL_START // Reason: must-not-call guards; firing fails the test
-        |_| panic!("must not spawn"), // LCOV_EXCL_STOP
+        must_not_load_aliases,
+        must_not_spawn_for_passthrough,
     );
     assert_eq!(result, Ok(args(&["--help"])));
     assert!(notices.is_empty());
@@ -853,17 +904,14 @@ fn expansion_driver_emits_configuration_warnings_first() {
     let (result, notices) = apply_expansion_with(
         args(&["draft"]),
         || Some((aliases, vec![warning.clone()])),
-        |_| panic!("must not spawn for dispatch"), // LCOV_EXCL_LINE // Reason: must-not-spawn guard; firing fails the test
+        must_not_spawn_for_dispatch,
     );
     assert_eq!(result, Ok(args(&["diff"])));
     assert_eq!(notices.len(), 2);
     // T1153 CORE-23: cyan log-engine hints (` ALIAS  ...` plain).
     assert_eq!(notices[0], format!(" ALIAS  {warning}"));
-    assert!(
-        notices[1].starts_with(" ALIAS  arc draft -> "),
-        "{}",
-        notices[1] // LCOV_EXCL_LINE // Reason: assert-message arg; evaluates only if the passing assert fails
-    );
+    let notice = &notices[1];
+    assert!(notice.starts_with(" ALIAS  arc draft -> "), "{notice}");
 }
 
 #[test]
@@ -1104,11 +1152,8 @@ fn create_preserves_invalid_dict_entries_with_a_warning() {
     std::fs::write(&arcrc, r#"{"aliases": {"bad": 42, "old": ["diff"]}}"#).unwrap();
     let report = execute_create(&arcrc, "draft", &args(&["diff"])).unwrap();
     assert_eq!(report.warnings.len(), 1);
-    assert!(
-        report.warnings[0].contains("invalid alias"),
-        "{}",
-        report.warnings[0] // LCOV_EXCL_LINE // Reason: assert-message arg; evaluates only if the passing assert fails
-    );
+    let warning = &report.warnings[0];
+    assert!(warning.contains("invalid alias"), "{warning}");
     let doc: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&arcrc).unwrap()).unwrap();
     assert_eq!(
@@ -1178,8 +1223,134 @@ fn create_dispatch_rejects_builtin_triggers_through_run() {
 }
 
 #[test]
-fn user_file_matches_arcrc_path() {
-    assert_eq!(user_file_or_error().ok(), config::arcrc_path());
+fn list_with_stages_user_file_and_hostile_arms() {
+    let options = Options {
+        json: false,
+        positional: Vec::new(),
+    };
+    // `None` stages the unset-HOME arm: no user aliases, clean list.
+    let tmp = TempDir::new("list-with");
+    assert_eq!(
+        run_list_with(tmp.path(), None, &options),
+        std::process::ExitCode::SUCCESS
+    );
+    // A staged user file lists through the runner.
+    let arcrc = tmp.arcrc();
+    execute_create(&arcrc, "draft", &args(&["diff"])).unwrap();
+    assert_eq!(
+        run_list_with(tmp.path(), Some(&arcrc), &options),
+        std::process::ExitCode::SUCCESS
+    );
+    // A hostile user file (non-list `aliases`) fails fatal (255).
+    std::fs::write(&arcrc, r#"{"aliases": 42}"#).unwrap();
+    assert_eq!(
+        run_list_with(tmp.path(), Some(&arcrc), &options),
+        std::process::ExitCode::from(255)
+    );
+}
+
+#[test]
+fn delete_with_stages_unset_decline_and_failure_arms() {
+    let mut input = Cursor::new(b"y\n".to_vec());
+    assert_eq!(
+        run_delete_with(None, "draft", &mut input, true),
+        std::process::ExitCode::from(255)
+    );
+    // A declined prompt aborts (exit 1) and keeps the stored alias.
+    let tmp = TempDir::new("delete-with");
+    let arcrc = tmp.arcrc();
+    execute_create(&arcrc, "draft", &args(&["diff"])).unwrap();
+    let mut input = Cursor::new(b"n\n".to_vec());
+    assert_eq!(
+        run_delete_with(Some(&arcrc), "draft", &mut input, true),
+        std::process::ExitCode::FAILURE
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&arcrc).unwrap()).unwrap();
+    assert_eq!(doc["aliases"].as_array().unwrap().len(), 1);
+    // A hostile user file (non-list `aliases`) fails fatal (255).
+    std::fs::write(&arcrc, r#"{"aliases": 42}"#).unwrap();
+    let mut input = Cursor::new(b"y\n".to_vec());
+    assert_eq!(
+        run_delete_with(Some(&arcrc), "draft", &mut input, true),
+        std::process::ExitCode::from(255)
+    );
+    // Confirming through the runner removes the alias.
+    std::fs::remove_file(&arcrc).unwrap();
+    execute_create(&arcrc, "draft", &args(&["diff"])).unwrap();
+    let mut input = Cursor::new(b"y\n".to_vec());
+    assert_eq!(
+        run_delete_with(Some(&arcrc), "draft", &mut input, true),
+        std::process::ExitCode::SUCCESS
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&arcrc).unwrap()).unwrap();
+    assert_eq!(doc["aliases"], serde_json::json!([]));
+}
+
+#[test]
+fn create_with_stages_unset_failure_and_success_arms() {
+    let options = Options {
+        json: false,
+        positional: args(&["draft", "diff"]),
+    };
+    // `None` stages the unset-HOME arm (fatal, 255).
+    assert_eq!(
+        run_create_with(None, &options),
+        std::process::ExitCode::from(255)
+    );
+    // A hostile user file (non-list `aliases`) fails fatal (255).
+    let tmp = TempDir::new("create-with");
+    let arcrc = tmp.arcrc();
+    std::fs::write(&arcrc, r#"{"aliases": 42}"#).unwrap();
+    assert_eq!(
+        run_create_with(Some(&arcrc), &options),
+        std::process::ExitCode::from(255)
+    );
+    // A valid trigger writes through the runner.
+    std::fs::remove_file(&arcrc).unwrap();
+    assert_eq!(
+        run_create_with(Some(&arcrc), &options),
+        std::process::ExitCode::SUCCESS
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&arcrc).unwrap()).unwrap();
+    assert_eq!(
+        doc["aliases"],
+        serde_json::json!([{"trigger": "draft", "toolset": "arc", "command": ["diff"]}])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn runners_report_unreadable_arcrc_as_fatal() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new("unreadable");
+    let arcrc = tmp.arcrc();
+    std::fs::write(&arcrc, r#"{"aliases": []}"#).unwrap();
+    std::fs::set_permissions(&arcrc, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let list_options = Options {
+        json: false,
+        positional: Vec::new(),
+    };
+    assert_eq!(
+        run_list_with(tmp.path(), Some(&arcrc), &list_options),
+        std::process::ExitCode::from(255)
+    );
+    let mut input = Cursor::new(b"y\n".to_vec());
+    assert_eq!(
+        run_delete_with(Some(&arcrc), "draft", &mut input, true),
+        std::process::ExitCode::from(255)
+    );
+    let create_options = Options {
+        json: false,
+        positional: args(&["draft", "diff"]),
+    };
+    assert_eq!(
+        run_create_with(Some(&arcrc), &create_options),
+        std::process::ExitCode::from(255)
+    );
+    std::fs::set_permissions(&arcrc, std::fs::Permissions::from_mode(0o644)).unwrap();
 }
 
 #[test]
@@ -1200,5 +1371,76 @@ fn run_create_rejects_builtin_triggers_before_touching_the_filesystem() {
         json: false,
         positional: args(&["diff"]),
     };
-    assert_eq!(run_create(&options), std::process::ExitCode::FAILURE);
+    assert_eq!(
+        run_create_with(None, &options),
+        std::process::ExitCode::FAILURE
+    );
+}
+// -( T1176 S5: defensive-arm coverage )--------------------------------------
+
+#[test]
+#[should_panic(expected = "expected dispatch, got")]
+fn expansion_appends_user_args_after_alias_args_defensive_failed_arm() {
+    // `expect_dispatch` unwraps `Dispatch`: a failed chain panics.
+    expect_dispatch(Expansion::Failed {
+        message: "boom".to_string(),
+        hints: Vec::new(),
+    });
+}
+
+#[test]
+#[should_panic(expected = "expected dispatch")]
+fn expansion_quotes_effect_alias_tail_like_pct_lr_defensive_failed_arm() {
+    // `expect_dispatch_hints` unwraps `Dispatch`: a failed chain panics.
+    expect_dispatch_hints(Expansion::Failed {
+        message: "boom".to_string(),
+        hints: Vec::new(),
+    });
+}
+
+#[test]
+#[should_panic(expected = "expected shell, got")]
+fn expansion_resolves_shell_aliases_defensive_dispatch_arm() {
+    // `expect_shell` unwraps `Shell`: a dispatch panics.
+    expect_shell(Expansion::Dispatch {
+        argv: Vec::new(),
+        hints: Vec::new(),
+    });
+}
+
+#[test]
+#[should_panic(expected = "expected shell")]
+fn expansion_quotes_shell_display_words_defensive_dispatch_arm() {
+    // `expect_shell_bare` unwraps `Shell`: a dispatch panics.
+    expect_shell_bare(Expansion::Dispatch {
+        argv: Vec::new(),
+        hints: Vec::new(),
+    });
+}
+
+#[test]
+#[should_panic(expected = "expected failure, got")]
+fn expansion_reports_cycles_defensive_dispatch_arm() {
+    // `expect_failure` unwraps `Failed`: a dispatch panics.
+    expect_failure(Expansion::Dispatch {
+        argv: Vec::new(),
+        hints: Vec::new(),
+    });
+}
+// -( T1176 S10: stub/guard coverage )----------------------------------------
+
+#[test]
+#[should_panic(expected = "must not load")]
+fn must_not_load_aliases_companion_panics() {
+    // The flag-passthrough path never loads config; the direct call pins
+    // the guard.
+    let _ = must_not_load_aliases();
+}
+
+#[test]
+#[should_panic(expected = "must not spawn")]
+fn must_not_spawn_for_passthrough_companion_panics() {
+    // The flag-passthrough path never spawns; the direct call pins the
+    // guard.
+    let _ = must_not_spawn_for_passthrough(&[]);
 }

@@ -93,12 +93,10 @@ fn failed_parse_yields_one_unable_to_parse_warning() {
         assert_eq!(messages[0].code, "XHP2");
         assert_eq!(messages[0].name, "Unable to Parse");
         assert_eq!(messages[0].severity, "warning");
+        let description = &messages[0].description;
         assert!(
-            messages[0]
-                .description
-                .contains(&format!("exit status {exit_code}")),
-            "{}",
-            messages[0].description // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+            description.contains(&format!("exit status {exit_code}")),
+            "{description}"
         );
     }
 }
@@ -216,12 +214,10 @@ fn parse_output_syntax_stderr_yields_xhp1_at_line() {
     assert_eq!(messages[0].name, "PHP Syntax Error!");
     assert_eq!(messages[0].severity, "error");
     assert_eq!((messages[0].line, messages[0].col), (9, 1));
+    let description = &messages[0].description;
     assert!(
-        messages[0]
-            .description
-            .starts_with("This file contains a syntax error: "),
-        "{}",
-        messages[0].description // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+        description.starts_with("This file contains a syntax error: "),
+        "{description}"
     );
 }
 
@@ -379,4 +375,29 @@ fn tool_garbage_falls_back_to_source_rules() {
         lint_with_binary_and_options("src/a.php", source.as_bytes(), Some(&tool), &options);
     let tree = xhp_ast::tree_from_source(source);
     assert_eq!(messages, lint_tree("src/a.php", &tree, &options));
+}
+
+#[test]
+#[cfg(unix)]
+fn temp_write_failure_reports_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new("temp-fail");
+    let missing = tmp.path().join("no-such-xhpast");
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // `lint_bytes` resolves the tool from the ambient PATH, so drive
+    // the dir-taking core directly with an explicit binary.
+    assert!(
+        lint_with_binary_and_options_in(
+            &locked,
+            "src/a.php",
+            b"<?php echo 1;",
+            Some(&missing),
+            &xhp_ast::XhpOptions::default()
+        )
+        .is_empty()
+    );
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
 }

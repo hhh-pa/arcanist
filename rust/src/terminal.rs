@@ -491,11 +491,15 @@ fn convert_markup(
         }
         b'?' => {
             pattern_so_far[pos] = b's';
+            // The nested pattern holds exactly one `%s` and no modifiers,
+            // so formatting it with the single value is infallible: values
+            // substitute and never re-parse as patterns.
             let nested = tsprintf_ansi(
                 "<bg:green>**  ?  **</bg> %s",
                 std::slice::from_ref(value),
                 ansi,
-            )?; // LCOV_EXCL_LINE // Reason: nested fixed-pattern format is infallible; the `?` never propagates
+            )
+            .expect("fixed nested pattern carries exactly one %s");
             Ok(console_wrap(nested.as_str(), 6, false))
         }
         b'>' => {
@@ -645,27 +649,46 @@ pub fn tsprintf(pattern: &str, args: &[TVal]) -> Result<TerminalString, String> 
     tsprintf_ansi(pattern, args, ansi_enabled())
 }
 
+#[cfg(windows)]
 fn tput_columns() -> usize {
-    if cfg!(windows) {
-        return 0; // LCOV_EXCL_LINE // Reason: windows-only early return; cfg!(windows) is false on ubuntu CI
-    }
-    let Ok(output) = crate::proc_env::command("tput").arg("cols").output() else {
-        return 0; // LCOV_EXCL_LINE // Reason: tput is present on ubuntu CI; the spawn-failure arm never runs
+    0
+}
+
+#[cfg(not(windows))]
+fn tput_columns() -> usize {
+    tput_columns_with("tput")
+}
+
+/// Spawn `program cols` and parse the width. `program` is a test seam so
+/// hermetic tests can point at fixture-local fake `tput` scripts instead
+/// of depending on a terminal.
+#[cfg(not(windows))]
+fn tput_columns_with<S: AsRef<std::ffi::OsStr>>(program: S) -> usize {
+    let Ok(output) = crate::proc_env::command(program).arg("cols").output() else {
+        return 0;
     };
     if !output.status.success() {
-        return 0; // LCOV_EXCL_LINE // Reason: tput cols succeeds with a terminal; without one (gate container) this arm takes instead
-    } // LCOV_EXCL_START // Reason: tput fails where gates measure (no terminal in the gate container), so the success-parse body never executes on CI; covered on developer runs
-    let text = String::from_utf8_lossy(&output.stdout);
+        return 0;
+    }
+    parse_tput_width(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parse `tput cols` output to a positive width, else 0: surrounding
+/// whitespace (and NUL/vertical-tab padding) is ignored, a leading `-`
+/// rejects, a leading `+` is skipped, digits accumulate (saturating),
+/// and parsing stops at the first non-digit.
+#[cfg(not(windows))]
+fn parse_tput_width(text: &str) -> usize {
     let trimmed = text.trim_matches([' ', '\t', '\n', '\r', '\0', '\u{b}']);
     if trimmed.starts_with('-') {
-        return 0; // LCOV_EXCL_LINE // Reason: tput prints plain widths; negative output never occurs
+        return 0;
     }
     let digits = trimmed.strip_prefix('+').unwrap_or(trimmed);
     let mut value: usize = 0;
     let mut any = false;
     for byte in digits.bytes() {
         if !byte.is_ascii_digit() {
-            break; // LCOV_EXCL_LINE // Reason: tput prints plain digits; the non-digit break never trips
+            break;
         }
         any = true;
         value = value
@@ -673,7 +696,6 @@ fn tput_columns() -> usize {
             .saturating_add(usize::from(byte - b'0'));
     }
     if any && value > 0 { value } else { 0 }
-    // LCOV_EXCL_STOP
 }
 
 /// Console display width, mirroring `phutil_console_get_terminal_width()`.
@@ -688,6 +710,16 @@ fn php_truthy(value: Option<&str>) -> bool {
     match value {
         None => false,
         Some(text) => !text.is_empty() && text != "0",
+    }
+}
+
+/// Apply the ANSICON fallback: when TERM is empty (or `"0"`) but ANSICON
+/// is set and truthy, the console speaks ANSI.
+fn resolve_term(term: String, ansicon: Option<&str>) -> String {
+    if !php_truthy(Some(&term)) && php_truthy(ansicon) {
+        "ansi".to_string()
+    } else {
+        term
     }
 }
 
@@ -711,16 +743,25 @@ pub fn ansi_enabled() -> bool {
         return forced;
     }
     let term = std::env::var("TERM").unwrap_or_default().to_lowercase();
-    let term = if !php_truthy(Some(&term)) && php_truthy(std::env::var("ANSICON").ok().as_deref()) {
-        "ansi".to_string() // LCOV_EXCL_LINE // Reason: needs TERM unset with ANSICON set; env is process-global
-    } else {
-        term
-    };
-    if cfg!(windows) && term != "cygwin" && term != "ansi" {
-        return false; // LCOV_EXCL_LINE // Reason: windows-only early return; cfg!(windows) is false on ubuntu CI
-    }
+    let term = resolve_term(term, std::env::var("ANSICON").ok().as_deref());
     use std::io::IsTerminal;
-    std::io::stdout().is_terminal()
+    ansi_enabled_for(&term, std::io::stdout().is_terminal())
+}
+
+/// Decide ANSI for a resolved TERM value and TTY probe: Windows rejects
+/// non-ANSI terminals outright, otherwise the probe decides. Split from
+/// [`ansi_enabled`] so tests can pin the TERM gate hermetically (process
+/// env is global; mutating TERM would race parallel `tput` probes).
+fn ansi_enabled_for(term: &str, stdout_tty: bool) -> bool {
+    #[cfg(windows)]
+    if term != "cygwin" && term != "ansi" {
+        return false;
+    }
+    // `term` only gates the Windows early return above; keep it observed
+    // off Windows so the binding stays live on every target.
+    #[cfg(not(windows))]
+    let _ = term;
+    stdout_tty
 }
 
 /// A `pht` substitution value.
@@ -1083,9 +1124,10 @@ fn console_strlen(text: &str) -> usize {
     }
     let mut len = 0;
     for glyph in combine_glyphs(&stripped) {
-        let Some(first) = glyph.chars().next() else {
-            continue; // LCOV_EXCL_LINE // Reason: dead: combine_glyphs only pushes nonempty buffers
-        };
+        let first = glyph
+            .chars()
+            .next()
+            .expect("combine_glyphs only pushes nonempty buffers");
         let codepoint = first as u32;
         if codepoint == 0 {
             continue;

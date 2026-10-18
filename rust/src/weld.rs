@@ -445,12 +445,17 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<Vec<u8>, String> {
 }
 
 pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
+    run_in_with(dir, argv, &mut std::io::stdout())
+}
+
+/// [`run_in`] over an explicit sink, so the stdout-failure arm (only
+/// reachable with a closed/broken stdout) stays unit-testable.
+fn run_in_with(dir: &Path, argv: &[String], out: &mut dyn std::io::Write) -> ExitCode {
     match execute(dir, argv) {
         Ok(bytes) => {
-            use std::io::Write;
-            if std::io::stdout().write_all(&bytes).is_err() {
-                eprintln!("arc {NAME}: failed to write output"); // LCOV_EXCL_START // Reason: stdout write failure; closing stdout is process-global
-                return ExitCode::FAILURE; // LCOV_EXCL_STOP
+            if out.write_all(&bytes).is_err() {
+                eprintln!("arc {NAME}: failed to write output");
+                return ExitCode::FAILURE;
             }
             ExitCode::SUCCESS
         }

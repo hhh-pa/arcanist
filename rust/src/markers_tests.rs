@@ -673,12 +673,17 @@ fn r4_rbd4_toolset_usage_matcher() {
     assert!(!is_toolset_usage_message("boom"));
 }
 
+fn expect_execute_error(words: &[&str]) -> String {
+    match execute(&std::env::temp_dir(), &args(words)) {
+        Err(message) => message,
+        _ => panic!("expected parse error"),
+    }
+}
+
 #[test]
 fn r4_rbd4_parse_error_has_no_dump() {
-    match execute(&std::env::temp_dir(), &args(&["--bogus"])) {
-        Err(message) => assert!(!message.contains("usage:"), "{message}"),
-        _ => panic!("expected parse error"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    }
+    let message = expect_execute_error(&["--bogus"]);
+    assert!(!message.contains("usage:"), "{message}");
     assert_eq!(
         run_in(&std::env::temp_dir(), &args(&["--bogus"])),
         std::process::ExitCode::FAILURE
@@ -1804,4 +1809,189 @@ fn git_helper_reports_failing_commands() {
     // A failing git invocation panics with the command and stderr.
     let tmp = TempDir::new("w6h-git-fail");
     git(tmp.path(), &["--bogus-flag-xyz"]);
+}
+
+#[test]
+#[should_panic(expected = "expected parse error")]
+fn r4_rbd4_parse_error_has_no_dump_defensive_ok_arm() {
+    // `expect_execute_error` unwraps `Err`: `--help` succeeds.
+    expect_execute_error(&["--help"]);
+}
+
+/// The arcrc host key for a stub base, mirroring
+/// `config::host_key` (`{scheme}://{authority}/api/`).
+fn host_key_for(base: &str) -> String {
+    let after_scheme = base.split("://").nth(1).unwrap_or(base);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    let scheme = base.split("://").next().unwrap_or("https");
+    format!("{scheme}://{authority}/api/")
+}
+
+/// Fake arcrc granting a token for the stub `base`.
+fn fake_arcrc(dir: &Path, base: &str) -> std::path::PathBuf {
+    let path = dir.join("fake.arcrc");
+    let key = host_key_for(base);
+    std::fs::write(
+        &path,
+        format!(r#"{{"hosts": {{"{key}": {{"token": "x"}}}}}}"#),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn run_in_maps_auth_failures_to_login_guidance() {
+    let repo = init_repo("autharm");
+    let sha = git(repo.path(), &["rev-parse", "HEAD"]);
+    git(
+        repo.path(),
+        &["remote", "add", "origin", "git@h.test:repo.git"],
+    );
+    git(
+        repo.path(),
+        &["update-ref", "refs/remotes/origin/main", &sha],
+    );
+    let auth_err =
+        r#"{"result": null, "error_code": "ERR-INVALID-AUTH", "error_info": "bad token"}"#
+            .to_string();
+    // One `diffusion.repository.search` per run below.
+    let (base, rx) = serve_seq(vec![auth_err.clone(), auth_err]);
+    let arcrc = fake_arcrc(repo.path(), &base);
+    let argv = args(&["--conduit-uri", base.as_str()]);
+    assert_eq!(
+        run_in_with_user_file(repo.path(), &argv, Some(&arcrc)),
+        ExitCode::FAILURE
+    );
+    // The underlying failure carries the auth code (not a fatal).
+    let err = execute_with_user_file(repo.path(), &argv, Some(&arcrc)).unwrap_err();
+    assert!(err.starts_with("ERR-INVALID-AUTH:"), "{err}");
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(seen.len(), 2);
+}
+
+// -( T1176 PC-1: env-globals )------------------------------------------------
+// (Child-process env staging needs no serial lock: the parent
+// environment is never mutated.)
+
+#[test]
+#[cfg(unix)]
+fn pc1_materialize_write_failure_returns_none() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new("pc1-write-fail");
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    assert_eq!(materialize_bundled_arc_hg_in(Some(&locked)), None);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn pc1_materialize_rename_failure_returns_none() {
+    // A non-empty directory at the target path fails the atomic
+    // rename on every platform; the stray tmp file is cleaned up.
+    let tmp = TempDir::new("pc1-rename-fail");
+    let target = tmp
+        .path()
+        .join(format!("arc-hg-{:016x}.py", arc_hg_content_tag()));
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("occupant.txt"), "x").unwrap();
+    assert_eq!(materialize_bundled_arc_hg_in(Some(tmp.path())), None);
+    let stray = target.with_extension(format!("{}.tmp", std::process::id()));
+    assert!(!stray.exists());
+}
+
+#[test]
+fn pc1_adopt_installed_copy_matches_bytes() {
+    let tmp = TempDir::new("pc1-adopt");
+    let matching = tmp.path().join("match.py");
+    std::fs::write(&matching, ARC_HG_BUNDLED).unwrap();
+    assert_eq!(adopt_installed_copy(&matching), Some(matching));
+    let stale = tmp.path().join("stale.py");
+    std::fs::write(&stale, "# stale copy").unwrap();
+    assert_eq!(adopt_installed_copy(&stale), None);
+    assert_eq!(adopt_installed_copy(&tmp.path().join("missing.py")), None);
+}
+
+/// Spawn this test binary with `vars` set, running only `probe`
+/// (child-process env staging: no in-process mutation, no `unsafe`).
+fn spawn_probe_env(probe: &str, vars: &[(&str, &str)]) -> (bool, String, String) {
+    let exe = std::env::current_exe().expect("test binary path");
+    let mut command = std::process::Command::new(&exe);
+    for (key, value) in vars {
+        command.env(key, value);
+    }
+    let out = command
+        .args(["--nocapture", probe])
+        .output()
+        .expect("spawn probe child");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// Assert a probe child passed and printed its marker.
+fn assert_probe_env_ok(probe: &str, vars: &[(&str, &str)], marker: &str) {
+    let (success, stdout, stderr) = spawn_probe_env(probe, vars);
+    assert!(
+        success && stdout.contains("1 passed") && stdout.contains(marker),
+        "{probe} child failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+}
+
+#[test]
+fn pc1_arc_hg_extension_probe() {
+    if std::env::var("ARC_RS_PC1_HGEXT_CHILD").as_deref() != Ok("1") {
+        println!("PC1-HGEXT-PROBE-OK");
+        return;
+    }
+    let dir = PathBuf::from(std::env::var_os("ARC_RS_PC1_HGEXT_DIR").expect("probe dir"));
+    let staged = std::env::var_os("ARC_HG_EXTENSION").expect("staged extension");
+    let case = std::env::var("ARC_RS_PC1_HGEXT_CASE").expect("probe case");
+    if case == "file" {
+        assert_eq!(arc_hg_script(&dir), Some(PathBuf::from(staged)));
+    } else {
+        // A staged path that is not a file falls through to the
+        // checkout search and the bundled copy.
+        let resolved = arc_hg_script(&dir).expect("bundled copy resolves");
+        assert_ne!(resolved, PathBuf::from(staged));
+    }
+    println!("PC1-HGEXT-PROBE-OK");
+}
+
+#[test]
+fn pc1_arc_hg_extension_env_wins() {
+    let tmp = TempDir::new("pc1-hg-ext");
+    let staged = tmp.path().join("staged-hg.py");
+    std::fs::write(&staged, "# staged extension").unwrap();
+    let dir = tmp.path().to_str().expect("utf8 dir").to_string();
+    let staged_str = staged.to_str().expect("utf8 staged").to_string();
+    assert_probe_env_ok(
+        "pc1_arc_hg_extension_probe",
+        &[
+            ("ARC_RS_PC1_HGEXT_CHILD", "1"),
+            ("ARC_RS_PC1_HGEXT_CASE", "file"),
+            ("ARC_RS_PC1_HGEXT_DIR", dir.as_str()),
+            ("ARC_HG_EXTENSION", staged_str.as_str()),
+        ],
+        "PC1-HGEXT-PROBE-OK",
+    );
+    let missing = tmp
+        .path()
+        .join("missing.py")
+        .to_str()
+        .expect("utf8 missing")
+        .to_string();
+    assert_probe_env_ok(
+        "pc1_arc_hg_extension_probe",
+        &[
+            ("ARC_RS_PC1_HGEXT_CHILD", "1"),
+            ("ARC_RS_PC1_HGEXT_CASE", "missing"),
+            ("ARC_RS_PC1_HGEXT_DIR", dir.as_str()),
+            ("ARC_HG_EXTENSION", missing.as_str()),
+        ],
+        "PC1-HGEXT-PROBE-OK",
+    );
 }

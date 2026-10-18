@@ -47,6 +47,9 @@ pub struct LesscLinter {
     options: ToolOptions,
     strict_math: bool,
     strict_units: bool,
+    /// Test seam: base directory for the staged temp input (`None` uses
+    /// `std::env::temp_dir()`, the production behavior).
+    temp_dir: Option<PathBuf>,
 }
 
 impl LesscLinter {
@@ -64,6 +67,7 @@ impl LesscLinter {
             options: ToolOptions::default(),
             strict_math: false,
             strict_units: false,
+            temp_dir: None,
         }
     }
 
@@ -119,8 +123,9 @@ impl Linter for LesscLinter {
         {
             return Vec::new();
         }
-        let Some(input) = write_temp_file(SLUG, path, "less", data) else {
-            return Vec::new(); // LCOV_EXCL_LINE // Reason: temp-dir write failure; hermetic tests cannot fail temp writes (TMPDIR is process-global)
+        let dir = self.temp_dir.clone().unwrap_or_else(std::env::temp_dir);
+        let Some(input) = write_temp_file(&dir, SLUG, path, "less", data) else {
+            return Vec::new();
         };
         let mut args = self.tool_flags();
         args.push(input.display().to_string());
@@ -268,13 +273,16 @@ fn has_extension(path: &str, allowed: &[&str]) -> bool {
 
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
-    let mut candidates = vec![name.to_string()];
-    if cfg!(windows) {
-        // LCOV_EXCL_START // Reason: windows-only PATH probe; cfg!(windows) is false on ubuntu CI
+    #[cfg(windows)]
+    let candidates = {
+        let mut candidates = vec![name.to_string()];
         for ext in ["exe", "cmd", "bat"] {
             candidates.push(format!("{name}.{ext}"));
-        } // LCOV_EXCL_STOP
-    }
+        }
+        candidates
+    };
+    #[cfg(not(windows))]
+    let candidates = vec![name.to_string()];
     for dir in std::env::split_paths(&path_var) {
         for candidate in &candidates {
             let full = dir.join(candidate);
@@ -294,11 +302,17 @@ fn temp_extension(path: &str, fallback: &str) -> String {
     }
 }
 
-fn write_temp_file(slug: &str, path: &str, fallback_ext: &str, data: &[u8]) -> Option<PathBuf> {
+fn write_temp_file(
+    dir: &Path,
+    slug: &str,
+    path: &str,
+    fallback_ext: &str,
+    data: &[u8],
+) -> Option<PathBuf> {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let pid = std::process::id();
     let ext = temp_extension(path, fallback_ext);
-    let file = std::env::temp_dir().join(format!("arc-rs-lint-{slug}-{pid}-{n}.{ext}"));
+    let file = dir.join(format!("arc-rs-lint-{slug}-{pid}-{n}.{ext}"));
     std::fs::write(&file, data).ok()?;
     Some(file)
 }

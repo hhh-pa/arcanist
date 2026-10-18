@@ -242,6 +242,69 @@ fn serve_seq(canned: Vec<String>) -> (String, std::sync::mpsc::Receiver<Vec<Stri
     (base, rx)
 }
 
+fn upload_envelope(result: &str) -> String {
+    format!(r#"{{"result": {result}, "error_code": null}}"#)
+}
+
+/// The arcrc host key for a stub base, mirroring
+/// `config::host_key` (`{scheme}://{authority}/api/`).
+fn host_key_for(base: &str) -> String {
+    let after_scheme = base.split("://").nth(1).unwrap_or(base);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    let scheme = base.split("://").next().unwrap_or("https");
+    format!("{scheme}://{authority}/api/")
+}
+
+/// Fake arcrc granting a token for the stub `base`.
+fn fake_arcrc(dir: &Path, base: &str) -> std::path::PathBuf {
+    let path = dir.join("fake.arcrc");
+    let key = host_key_for(base);
+    std::fs::write(
+        &path,
+        format!(r#"{{"hosts": {{"{key}": {{"token": "x"}}}}}}"#),
+    )
+    .unwrap();
+    path
+}
+
+/// A fake browser command which exits zero without doing anything.
+#[cfg(windows)]
+fn null_browser_config() -> &'static str {
+    r#"{"browser": ["cmd", "/c", "rem"]}"#
+}
+
+/// A fake browser command which exits zero without doing anything.
+#[cfg(not(windows))]
+fn null_browser_config() -> &'static str {
+    r#"{"browser": ["true"]}"#
+}
+
+#[test]
+fn execute_browses_uploads_with_staged_credentials() {
+    let tmp = TempDir::new("browse-authed");
+    // Project config needs a VCS root; `.git` existence suffices.
+    std::fs::create_dir(tmp.path.join(".git")).unwrap();
+    std::fs::write(tmp.path.join(".arcconfig"), null_browser_config()).unwrap();
+    std::fs::write(tmp.path.join("a.bin"), b"data").unwrap();
+    // The server already holds the bytes (`upload: false`), so the
+    // flow is one `file.allocate` plus one `file.search`.
+    let allocate = upload_envelope(r#"{"upload": false, "filePHID": "PHID-FILE-1"}"#);
+    let search = upload_envelope(
+        r#"{"data": [{"phid": "PHID-FILE-1", "id": 1, "fields": {"name": "a.bin", "uri": "/F1"}}]}"#,
+    );
+    let (base, rx) = serve_seq(vec![allocate, search]);
+    let arcrc = fake_arcrc(&tmp.path, &base);
+    let text = execute_with_user_file(
+        tmp.path(),
+        &argv(&["--conduit-uri", base.as_str(), "--browse", "--", "a.bin"]),
+        Some(&arcrc),
+    )
+    .unwrap();
+    assert!(text.contains("F1"), "{text}");
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(seen.len(), 2);
+}
+
 #[test]
 fn r3_uploadu16_file_search_follows_after_cursor() {
     fn hit(id: u64, name: &str) -> serde_json::Value {
@@ -826,15 +889,45 @@ fn run_reports_usage_errors_without_browsing() {
 /// Non-permission read failures surface the `readBytes()` open-failure
 /// text. `/proc/self/mem` stats as a regular file but every read
 /// faults (EIO) — the only deterministic trigger, hence Linux-only
-/// (macOS/Windows have no equivalent). Skips when `/proc` is
-/// unavailable (some containers).
+/// (macOS/Windows have no equivalent). Fails loud when `/proc` is
+/// missing (the gates image always provides it).
 #[cfg(target_os = "linux")]
 #[test]
 fn upload_read_error_reports_open_failure() {
-    if std::fs::symlink_metadata("/proc/self/mem").is_err() {
-        return; // LCOV_EXCL_LINE // Reason: /proc is always present where gates measure; the skip only trips where /proc is missing (macOS)
-    }
+    assert!(
+        std::path::Path::new("/proc/self/mem").exists(),
+        "gates guarantee /proc on Linux; failing loud instead of skipping"
+    );
     let tmp = TempDir::new("read-error");
     let err = read_upload_bytes(tmp.path(), "/proc/self/mem").unwrap_err();
     assert!(err.contains("failed to open"), "{err}");
+}
+
+// -( T1176 PC-2: demark tty-commands )-----------------------------------------
+
+#[test]
+fn progress_bar_draws_when_tty_is_forced() {
+    // The TTY body runs with injected state; cargo-test stderr stays
+    // piped, so `draw()` itself can never reach it.
+    let mut bar = ChunkProgress::new();
+    bar.set_total(4);
+    assert!(!bar.drawn);
+    bar.draw_with(true, 78);
+    assert!(bar.drawn);
+    assert!(bar.last_update.is_some());
+    bar.finish();
+}
+
+#[test]
+fn progress_bar_skips_without_total_tty_or_width() {
+    let mut bar = ChunkProgress::new();
+    bar.draw_with(true, 78);
+    assert!(!bar.drawn);
+    bar.set_total(4);
+    bar.draw_with(false, 78);
+    assert!(!bar.drawn);
+    assert!(bar.last_update.is_none());
+    bar.draw_with(true, 5);
+    assert!(!bar.drawn);
+    assert!(bar.last_update.is_none());
 }

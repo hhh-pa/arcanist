@@ -424,9 +424,8 @@ fn throw_message_text_is_exact() {
 }
 
 // -( T1153 Wave 2: lint retrocompat )--------------------------------------
-// LCOV_EXCL_START // Reason: referenced-but-never-called parser; the script fails before parsing
 fn lint28_failing_parser(_output: &str) -> Vec<ScriptRegexMatch> {
-    unreachable!("the script fails before parsing") // LCOV_EXCL_STOP
+    unreachable!("the script fails before parsing")
 }
 
 fn lint28_throwing_parser(_output: &str) -> Vec<ScriptRegexMatch> {
@@ -603,6 +602,12 @@ fn binary_lookup_covers_paths_and_path_search() {
 }
 
 #[test]
+fn binary_lookup_without_path_resolves_nothing() {
+    // Unset-`PATH` arm via the seam: bare names resolve nothing.
+    assert!(!binary_exists_with_path("sh", None));
+}
+
+#[test]
 fn run_script_defaults_to_the_working_directory() {
     let output = run_script_for_path("echo", "hello").unwrap();
     assert!(output.contains("hello"), "{output:?}");
@@ -614,4 +619,13 @@ fn php_int_casts_signs_and_garbage() {
     assert_eq!(php_int("+5"), 5);
     assert_eq!(php_int("  42x"), 42);
     assert_eq!(php_int("abc"), 0);
+}
+// -( T1176 S10: stub/guard coverage )----------------------------------------
+
+#[test]
+#[should_panic(expected = "the script fails before parsing")]
+fn lint28_failing_parser_companion_panics_before_parsing() {
+    // The script always fails first, so the parser is unreachable in the
+    // linter flow; the direct call pins the contract.
+    lint28_failing_parser("out");
 }

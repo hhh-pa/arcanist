@@ -462,9 +462,10 @@ fn split_requirement(requirement: &str) -> (&str, &str) {
 pub fn version_compare(left: &str, right: &str) -> Ordering {
     let left = split_version(left);
     let right = split_version(right);
-    let width = left.len().max(right.len());
-    for index in 0..width {
-        match (left.get(index), right.get(index)) {
+    let mut left = left.iter();
+    let mut right = right.iter();
+    loop {
+        match (left.next(), right.next()) {
             (Some(a), Some(b)) => {
                 let ordering = compare_segment(a, b);
                 if ordering != Ordering::Equal {
@@ -485,7 +486,7 @@ pub fn version_compare(left: &str, right: &str) -> Ordering {
                     Ordering::Less
                 };
             }
-            (None, None) => {} // LCOV_EXCL_LINE // Reason: dead: width is the max length, so some side is always present
+            (None, None) => break,
         }
     }
     Ordering::Equal
@@ -540,7 +541,9 @@ pub fn binary_exists(candidate: &str) -> bool {
         return is_executable_file(path);
     }
     let Some(dirs) = std::env::var_os("PATH") else {
-        return false; // LCOV_EXCL_LINE // Reason: PATH is always set in CI; the unset arm never runs
+        // Staged by the `env_hermetic` subprocess test (child without
+        // `PATH`); unsetting `PATH` in-process would mutate ambient state.
+        return false;
     };
     for dir in std::env::split_paths(&dirs) {
         let full = dir.join(candidate);

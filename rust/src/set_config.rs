@@ -269,6 +269,22 @@ pub fn apply_user(user_file: &Path, key: &str, raw: &str) -> Result<String, Stri
     Ok(message)
 }
 
+/// [`run`]'s user-scope write with an explicit default user file
+/// (test seam: hermetic tests stage `None` for the unset-HOME arm
+/// instead of unsetting process-global env).
+fn apply_user_opt(
+    default: Option<&Path>,
+    arcrc_file: Option<&Path>,
+    key: &str,
+    raw: &str,
+) -> Result<String, String> {
+    match get_config::resolve_user_file(default.map(Path::to_path_buf), arcrc_file) {
+        Ok(Some(path)) => apply_user(&path, key, raw),
+        Ok(None) => Err("cannot locate ~/.arcrc (HOME/USERPROFILE is not set)".to_string()),
+        Err(message) => Err(message),
+    }
+}
+
 /// Local config file for a repository root of flavor `kind`:
 /// `<root>/.(git|hg|svn)/arc/config`, mirroring
 /// `ArcanistWorkingCopyIdentity::$localMetaDir` (T1153 CORE-32).
@@ -486,14 +502,12 @@ pub fn run(argv: &[String]) -> ExitCode {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         apply_local(&cwd, &options.key, &options.value)
     } else {
-        match get_config::resolve_user_file(
-            config::arcrc_path(),
+        apply_user_opt(
+            config::arcrc_path().as_deref(),
             options.arcrc_file.as_deref().map(Path::new),
-        ) {
-            Ok(Some(path)) => apply_user(&path, &options.key, &options.value),
-            Ok(None) => Err("cannot locate ~/.arcrc (HOME/USERPROFILE is not set)".to_string()), // LCOV_EXCL_LINE // Reason: needs HOME/USERPROFILE unset; always set in CI
-            Err(message) => Err(message),
-        }
+            &options.key,
+            &options.value,
+        )
     };
     match result {
         Ok(message) => {

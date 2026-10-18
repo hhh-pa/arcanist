@@ -60,6 +60,9 @@ pub fn is_supported_path(path: &str) -> bool {
 #[derive(Debug, Default)]
 pub struct PyFlakesLinter {
     options: ToolOptions,
+    /// Test seam: base directory for the staged temp input (`None` uses
+    /// `std::env::temp_dir()`, the production behavior).
+    temp_dir: Option<PathBuf>,
 }
 
 impl PyFlakesLinter {
@@ -96,7 +99,8 @@ impl Linter for PyFlakesLinter {
         let flags = self
             .options
             .command_flags(&mandatory_flag_strings(), &default_flags());
-        lint_with_binary_and_flags(path, data, Some(tool), &flags)
+        let dir = self.temp_dir.clone().unwrap_or_else(std::env::temp_dir);
+        lint_with_binary_and_flags(&dir, path, data, Some(tool), &flags)
     }
 
     fn can_customize_severities(&self) -> bool {
@@ -116,11 +120,13 @@ impl Linter for PyFlakesLinter {
 /// Lint with an explicit tool binary (test seam mirroring bundle E);
 /// `None` means the tool is not installed and reports nothing.
 pub fn lint_with_binary(path: &str, data: &[u8], binary: Option<&Path>) -> Vec<LintMessage> {
-    lint_with_binary_and_flags(path, data, binary, &mandatory_flag_strings())
+    let dir = std::env::temp_dir();
+    lint_with_binary_and_flags(&dir, path, data, binary, &mandatory_flag_strings())
 }
 
 /// Linter body with explicit flags (configured flags replace defaults).
 fn lint_with_binary_and_flags(
+    dir: &Path,
     path: &str,
     data: &[u8],
     binary: Option<&Path>,
@@ -130,8 +136,8 @@ fn lint_with_binary_and_flags(
         // Inactive when the tool is not installed, mirroring PHP.
         return Vec::new();
     };
-    let Some(scratch) = write_scratch("pyflakes", ".py", path, data) else {
-        return Vec::new(); // LCOV_EXCL_LINE // Reason: temp-dir write failure; hermetic tests cannot fail temp writes (TMPDIR is process-global)
+    let Some(scratch) = write_scratch(dir, "pyflakes", ".py", path, data) else {
+        return Vec::new();
     };
     let mut command = crate::proc_env::command(tool);
     command
@@ -275,10 +281,16 @@ impl Scratch {
 /// The tool runs with the linted file's directory as its working
 /// directory when that directory exists (so tool config files apply,
 /// mirroring PHP running from the project root), else the temp dir.
-fn write_scratch(slug: &str, suffix: &str, display: &str, data: &[u8]) -> Option<Scratch> {
+fn write_scratch(
+    dir: &Path,
+    slug: &str,
+    suffix: &str,
+    display: &str,
+    data: &[u8],
+) -> Option<Scratch> {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("arc-rs-lint-{slug}-{}-{n}", std::process::id()));
+    let dir = dir.join(format!("arc-rs-lint-{slug}-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).ok()?;
     let file = dir.join(format!("target{suffix}"));
     std::fs::write(&file, data).ok()?;

@@ -14,7 +14,7 @@
 //! Creates report through the log engine (`DONE` on stderr) plus a
 //! [`crate::terminal::RefView`] on stdout, like PHP.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 pub const NAME: &str = "paste";
@@ -528,10 +528,20 @@ pub fn create_paste(
 
 /// `ArcanistWorkflow::readStdin()`: the `INPUT` hint on interactive stdin
 /// (T1153 PASTE-P15), then all input bytes.
-// LCOV_EXCL_START // Reason: reads real stdin (blocks on a terminal); tests inject stdin_text instead
 fn read_stdin_bytes() -> Result<Vec<u8>, String> {
-    use std::io::Read;
-    if crate::prompt::stdin_is_terminal() {
+    read_stdin_bytes_with(
+        &mut std::io::stdin().lock(),
+        crate::prompt::stdin_is_terminal(),
+    )
+}
+
+/// [`read_stdin_bytes`] with injected input and TTY flag (test seam;
+/// production passes real stdin and its TTY state).
+fn read_stdin_bytes_with(
+    input: &mut dyn std::io::BufRead,
+    stdin_tty: bool,
+) -> Result<Vec<u8>, String> {
+    if stdin_tty {
         eprint!(
             "{}",
             crate::terminal::format_log(
@@ -543,11 +553,11 @@ fn read_stdin_bytes() -> Result<Vec<u8>, String> {
         );
     }
     let mut bytes = Vec::new();
-    std::io::stdin()
+    input
         .read_to_end(&mut bytes)
         .map_err(|e| format!("failed to read stdin: {e}"))?;
     Ok(bytes)
-} // LCOV_EXCL_STOP
+}
 
 /// Resolve `--input` for messages, mirroring `Filesystem::resolvePath()`:
 /// absolute against `dir`, symlink parents resolved, missing paths resolved
@@ -559,8 +569,11 @@ fn resolve_input_path(dir: &Path, path: &str) -> String {
             && let Ok(canonical) = std::fs::canonicalize(parent)
         {
             return canonical.join(name).to_string_lossy().to_string();
-        } // LCOV_EXCL_START // Reason: a symlink parent exists by construction; canonicalize fails only on a TOCTOU race
-        return joined.to_string_lossy().to_string(); // LCOV_EXCL_STOP
+        }
+        // TOCTOU race: the symlink parent existed for `is_symlink`
+        // but vanished before `canonicalize` (see the racing-renamer
+        // test).
+        return joined.to_string_lossy().to_string();
     }
     if let Ok(canonical) = std::fs::canonicalize(&joined) {
         return canonical.to_string_lossy().to_string();
@@ -615,9 +628,9 @@ fn read_input_file(dir: &Path, path: &str) -> Result<Vec<u8>, String> {
     match std::fs::read(&disk) {
         Ok(data) => Ok(data),
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            Err(format!("Path '{display}' is not readable.")) // LCOV_EXCL_LINE // Reason: gates run as root, which reads through chmod 000, so EACCES never triggers where gates measure; covered on macOS runs
+            Err(format!("Path '{display}' is not readable."))
         }
-        Err(_) => Err(format!("Failed to read file '{display}'.")), // LCOV_EXCL_LINE // Reason: TOCTOU-only: is_file pre-check passes, so only deletion/replacement between check and read reaches here
+        Err(_) => Err(format!("Failed to read file '{display}'.")),
     }
 }
 
@@ -631,7 +644,7 @@ fn read_create_bytes(
     match opts.input.as_deref() {
         None | Some("-") => match stdin_text {
             Some(text) => Ok(text.as_bytes().to_vec()),
-            None => read_stdin_bytes().map_err(crate::conduit::ClassifiedError::fatal), // LCOV_EXCL_LINE // Reason: real-stdin arm; tests inject stdin_text instead
+            None => read_stdin_bytes().map_err(crate::conduit::ClassifiedError::fatal),
         },
         Some(path) => read_input_file(dir, path).map_err(crate::conduit::ClassifiedError::fatal),
     }
@@ -768,6 +781,22 @@ fn execute_parts(
     argv: &[String],
     stdin_text: Option<&str>,
 ) -> Result<PasteParts, crate::conduit::ClassifiedError> {
+    execute_parts_with(
+        dir,
+        argv,
+        stdin_text,
+        crate::config::arcrc_path().as_deref(),
+    )
+}
+
+/// [`execute_parts`] with an explicit credential file (test seam:
+/// hermetic tests stage a fake arcrc instead of touching HOME).
+fn execute_parts_with(
+    dir: &Path,
+    argv: &[String],
+    stdin_text: Option<&str>,
+    user_file: Option<&Path>,
+) -> Result<PasteParts, crate::conduit::ClassifiedError> {
     use crate::conduit::ClassifiedError;
     let opts = match parse_args(argv) {
         ParseOutcome::Args(opts) => opts,
@@ -784,15 +813,26 @@ fn execute_parts(
         }
         ParseOutcome::Error(message) => return Err(ClassifiedError::toolset_usage(message)),
     };
-    let client =
-        crate::config::client_for(opts.conduit_uri.as_deref()).map_err(ClassifiedError::fatal)?;
+    // Byte-identical to `config::client_for(..)` when the wrapper
+    // passes the ambient user file (same cwd fallback).
+    let config_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let client = crate::config::client_for_with(
+        opts.conduit_uri.as_deref(),
+        &config_dir,
+        user_file,
+        &crate::get_config::LoadOptions::default(),
+    )
+    .map_err(ClassifiedError::fatal)?;
 
     if let Some(symbol) = opts.symbol {
         // T1153 PASTE-P4: PHP `echo`s the content raw (no `\n` appended).
-        return Ok(PasteParts {
-            text: read_paste_classified(&client, &symbol)?,
-            browse_uri: None, // LCOV_EXCL_LINE // Reason: coverage artifact; the literal constructs but llvm assigns this line a zero region
-        });
+        let text = read_paste_classified(&client, &symbol)?;
+        // Single-line literal (fmt-pinned): a split literal's field
+        // lines get zero regions from llvm, so the fields ride on
+        // this executed line instead.
+        #[rustfmt::skip]
+        let parts = PasteParts { text, browse_uri: None };
+        return Ok(parts);
     }
     create_paste_parts(dir, &client, &opts, stdin_text)
 }
@@ -804,10 +844,26 @@ pub fn execute_with_stdin(
     argv: &[String],
     stdin_text: Option<&str>,
 ) -> Result<String, String> {
-    let parts = execute_parts(dir, argv, stdin_text).map_err(|err| err.message)?;
+    execute_with_stdin_and_user_file(
+        dir,
+        argv,
+        stdin_text,
+        crate::config::arcrc_path().as_deref(),
+    )
+}
+
+/// [`execute_with_stdin`] with an explicit credential file (test
+/// seam: hermetic tests stage a fake arcrc instead of touching HOME).
+fn execute_with_stdin_and_user_file(
+    dir: &Path,
+    argv: &[String],
+    stdin_text: Option<&str>,
+    user_file: Option<&Path>,
+) -> Result<String, String> {
+    let parts = execute_parts_with(dir, argv, stdin_text, user_file).map_err(|err| err.message)?;
     if let Some(uri) = parts.browse_uri {
-        let configured = crate::browser::configured_browser(dir); // LCOV_EXCL_START // Reason: needs a token-bearing client to reach browse; unit tests stage no credentials
-        crate::browser::open_uris_in_browser(std::slice::from_ref(&uri), configured.as_deref())?; // LCOV_EXCL_STOP
+        let configured = crate::browser::configured_browser(dir);
+        crate::browser::open_uris_in_browser(std::slice::from_ref(&uri), configured.as_deref())?;
     }
     Ok(parts.text)
 }
@@ -844,7 +900,7 @@ pub fn run_in_with_sink(dir: &Path, argv: &[String], sink: &mut dyn FnMut(&str))
                     configured.as_deref(),
                 ) {
                     return crate::conduit::ClassifiedError::fatal(message).report();
-                } // LCOV_EXCL_LINE // Reason: browse-success fall-through; reaching it needs a token-bearing client
+                }
             }
             ExitCode::SUCCESS
         }

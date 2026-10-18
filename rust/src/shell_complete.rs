@@ -429,9 +429,6 @@ pub fn detect_shell(shell_env: Option<&str>, ansi: bool) -> (String, Result<Stri
     if detected.is_empty() {
         return (out, Err("Unable to detect any supported shell, so autocompletion rules can not be installed. Use \"--shell\" to select a shell.".to_string()));
     }
-    if detected.len() > 1 {
-        return (out, Err("Multiple supported shells were detected. Unable to determine which shell to install autocompletion rules for. Use \"--shell\" to select a shell.".to_string())); // LCOV_EXCL_LINE // Reason: dead: at most one shell is ever pushed, so multiple-detection never triggers
-    }
     (out, Ok(detected[0].to_string()))
 }
 
@@ -843,21 +840,45 @@ fn run_generate_or_install(
     let mut locked = stdin.lock();
     let mut saver =
         crate::prompts::response_saver(crate::prompts::INSTALL_PROMPT_KEY, user_file, local_file);
-    match install_in(
-        (!shell_arg.is_empty()).then_some(shell_arg.as_str()),
+    run_install_with(
+        shell_arg.as_str(),
         std::env::var("SHELL").ok().as_deref(),
         home.as_deref(),
-        &default_shell_root(),
         &mut locked,
         stdin_tty,
         saved.as_deref(),
         &mut saver,
+    )
+}
+
+/// The install branch of [`run_generate_or_install`] with injected
+/// environment (test seam; production passes HOME, SHELL, real stdin
+/// and its TTY state, the saved response, and the config saver).
+#[allow(clippy::too_many_arguments)]
+fn run_install_with(
+    shell_arg: &str,
+    shell_env: Option<&str>,
+    home: Option<&str>,
+    input: &mut dyn BufRead,
+    stdin_tty: bool,
+    saved: Option<&str>,
+    save: &mut dyn FnMut(crate::prompts::PromptScope, &str) -> Result<(), String>,
+) -> Result<(), ExitCode> {
+    match install_in(
+        (!shell_arg.is_empty()).then_some(shell_arg),
+        shell_env,
+        home,
+        &default_shell_root(),
+        input,
+        stdin_tty,
+        saved,
+        save,
     ) {
-        Ok(text) => print!("{text}"), // LCOV_EXCL_LINE // Reason: install-success arm; needs a TTY prompt or a pre-seeded HOME
+        Ok(text) => print!("{text}"),
         Err(error) => return Err(error.report()),
     }
-    print!("{}", generate_in(&default_shell_root())); // LCOV_EXCL_START // Reason: install-success arm; needs a TTY prompt or a pre-seeded HOME
-    Ok(()) // LCOV_EXCL_STOP
+    print!("{}", generate_in(&default_shell_root()));
+    Ok(())
 }
 
 /// Entry point: `argv` excludes the subcommand name.

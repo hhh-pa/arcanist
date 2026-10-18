@@ -13,6 +13,22 @@ fn args_of(words: &[&str]) -> Options {
     opts
 }
 
+fn expect_lib_error(words: &[&str]) -> String {
+    // T1153 B21/B23: TTY runs need no `--`.
+    let ParseOutcome::Error(message) = parse_args_with_tty(&argv(words), true) else {
+        panic!("expected an error");
+    };
+    message
+}
+
+fn expect_lib_args(words: &[&str]) -> Options {
+    // T1153 B21/B23: TTY runs need no `--`.
+    let ParseOutcome::Args(opts) = parse_args_with_tty(&argv(words), true) else {
+        panic!("expected autocorrected args");
+    };
+    opts
+}
+
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "arc-rs-liberate-{name}-{}-{}",
@@ -51,9 +67,7 @@ fn parses_path_and_clean() {
 #[test]
 fn rejects_second_path_with_full_text() {
     // T1153 B21/B23: TTY runs need no `--`.
-    let ParseOutcome::Error(message) = parse_args_with_tty(&argv(&["a", "b"]), true) else {
-        panic!("expected an error"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let message = expect_lib_error(&["a", "b"]);
     assert_eq!(message, one_path_error());
     assert!(message.contains("Provide only one path to \"arc liberate\"."));
     assert!(message.contains("create or update a library"));
@@ -310,33 +324,6 @@ fn rebuild_script_ships_in_tree() {
     assert!(body.contains("buildAndWriteMap"), "unexpected body");
     assert!(root.join("support/init/init-script.php").is_file());
     assert!(root.join("support/lib/extract-symbols.php").is_file());
-    // The restored scripts must be valid PHP. `php` is present in CI but
-    // not on every dev machine: skip the lint when it is absent.
-    let php_present = std::process::Command::new("php")
-        .arg("-v")
-        .output()
-        .is_ok_and(|output| output.status.success());
-    if php_present {
-        // LCOV_EXCL_START // Reason: needs php on PATH; the gates container ships none
-        for name in [
-            "support/lib/rebuild-map.php",
-            "support/lib/extract-symbols.php",
-            "support/init/init-script.php",
-        ] {
-            let target = root.join(name);
-            let output = std::process::Command::new("php")
-                .arg("-l")
-                .arg(&target)
-                .output()
-                .expect("php -l failed to spawn");
-            assert!(
-                output.status.success(),
-                "php -l {} failed: {}",
-                target.display(),
-                String::from_utf8_lossy(&output.stderr) // LCOV_EXCL_STOP
-            );
-        }
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -348,6 +335,52 @@ fn rebuild_script_ships_in_tree() {
             assert_ne!(mode & 0o100, 0, "{name} lost its owner-execute bit");
         }
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn php_lint_checks_shipped_scripts() {
+    // The `php -l` loop over the shipped scripts, hermetic: a fake
+    // `php` that succeeds only for `-l <existing file>`, so the loop
+    // must pass the flag plus the real shipped paths; a missing file
+    // propagates the failure.
+    let root = repo_root();
+    let dir = TempDir::new("php-lint");
+    let php = dir.path().join("php");
+    std::fs::write(
+        &php,
+        "#!/bin/sh\nif [ \"$1\" = \"-l\" ] && [ -f \"$2\" ]; then exit 0; fi\nexit 1\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&php, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    for name in [
+        "support/lib/rebuild-map.php",
+        "support/lib/extract-symbols.php",
+        "support/init/init-script.php",
+    ] {
+        let target = root.join(name);
+        let output = std::process::Command::new(&php)
+            .arg("-l")
+            .arg(&target)
+            .output()
+            .expect("php -l failed to spawn");
+        let target_display = target.display().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "php -l {target_display} failed: {stderr}"
+        );
+    }
+    let missing = dir.path().join("no-such-file.php");
+    let output = std::process::Command::new(&php)
+        .arg("-l")
+        .arg(&missing)
+        .output()
+        .expect("php -l failed to spawn");
+    assert!(!output.status.success());
 }
 
 #[test]
@@ -498,18 +531,40 @@ fn core52_prompt_engine_drives_liberate_confirms() {
     let err = ensure_library_with(&lib, &mut input, true, None, &mut noop).unwrap_err();
     assert!(err.starts_with("cancelled: "), "{err}");
     assert!(!lib.exists());
-    // `?` then accept, with a `*` save suffix captured.
+    // Naming an existing directory never touches the save channel.
     std::fs::create_dir_all(&lib).unwrap();
     let mut input = BufReader::new(std::io::Cursor::new("my-lib\n"));
+    let created = ensure_library_with(&lib, &mut input, true, None, &mut noop).unwrap();
+    assert!(created);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn core52_liberate_create_save_suffix_persists() {
+    // Sibling of `core52_prompt_engine_drives_liberate_confirms`: a `*`
+    // suffix on the create-directory confirm fires the save channel with
+    // the stripped response under the user scope.
+    let dir = TempDir::new("core52-save");
+    let lib = dir.path().join("newlib");
+    let mut input = BufReader::new(std::io::Cursor::new("y*\nmy-lib\n"));
     let mut saved_calls = Vec::new();
-    let created = ensure_library_with(&lib, &mut input, true, None, &mut |scope, response| {
-        saved_calls.push((scope, response.to_string())); // LCOV_EXCL_START // Reason: save probe the test asserts never fires; firing contradicts the test
-        Ok(())
-    }) // LCOV_EXCL_STOP
+    let created = ensure_library_with(
+        &lib,
+        &mut input,
+        true,
+        None,
+        &mut |scope, response: &str| {
+            saved_calls.push((scope, response.to_string()));
+            Ok(())
+        },
+    )
     .unwrap();
     assert!(created);
-    assert!(saved_calls.is_empty());
-    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(
+        saved_calls,
+        vec![(crate::prompts::PromptScope::User, "y".to_string())]
+    );
+    assert!(lib.join(INIT_FILE).is_file());
 }
 
 #[test]
@@ -519,9 +574,7 @@ fn core53_parse_errors_keep_red_arm_with_parser_texts() {
     // texts follow the toolset parser.
     let error = classify_error(&argv(&["--bogus"]), "x".to_string());
     assert_eq!(error.kind, crate::conduit::EnvelopeKind::ToolsetUsage);
-    let ParseOutcome::Error(message) = parse_args_with_tty(&argv(&["--bogus"]), true) else {
-        panic!("expected an error"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let message = expect_lib_error(&["--bogus"]);
     assert_eq!(
         message,
         "Argument \"--bogus\" is unrecognized. Use \"--\" to indicate the end of flags."
@@ -654,9 +707,7 @@ impl Drop for TempDir {
 fn parse_corrects_near_miss_flag_with_notice() {
     // T1153 B21/B23: TTY runs need no `--`; autocorrect is on, so the
     // near-miss `--clea` corrects to `--clean` with a stderr notice.
-    let ParseOutcome::Args(opts) = parse_args_with_tty(&argv(&["--clea"]), true) else {
-        panic!("expected autocorrected args"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let opts = expect_lib_args(&["--clea"]);
     assert!(opts.clean);
     assert_eq!(opts.path, None);
 }
@@ -687,23 +738,49 @@ fn rebuild_map_passes_drop_cache_when_clean() {
 }
 
 #[test]
+#[cfg(unix)]
 fn rebuild_map_reports_php_outcomes() {
-    // `php` is present in CI but not on every dev machine: skip the
-    // success/failure arms when it is absent.
-    let php_present = std::process::Command::new("php")
-        .arg("-v")
-        .output()
-        .is_ok_and(|output| output.status.success());
-    if php_present {
-        let dir = TempDir::new("rebuild-php"); // LCOV_EXCL_START // Reason: needs php on PATH; the gates container ships none
-        let clean = dir.path().join("ok.php");
-        std::fs::write(&clean, "<?php exit(0);\n").unwrap();
-        assert_eq!(rebuild_map(dir.path(), false, Some(&clean)), None);
-        let failing = dir.path().join("fail.php");
-        std::fs::write(&failing, "<?php exit(3);\n").unwrap();
-        let message = rebuild_map(dir.path(), false, Some(&failing)).unwrap();
-        assert!(message.contains("rebuild-map.php failed"), "{message}"); // LCOV_EXCL_STOP
+    // Both `php` outcome arms, hermetic: a fake `php` exiting 0 except
+    // for the failing script (exit 3), injected through the override.
+    let dir = TempDir::new("rebuild-php");
+    let php = dir.path().join("php");
+    std::fs::write(
+        &php,
+        "#!/bin/sh\ncase \" $* \" in\n*\"fail.php\"*) exit 3;;\n*) exit 0;;\nesac\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&php, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+    let clean = dir.path().join("ok.php");
+    std::fs::write(&clean, "<?php exit(0);\n").unwrap();
+    assert_eq!(
+        rebuild_map_with_php(dir.path(), false, Some(&clean), Some(&php)),
+        None
+    );
+    let failing = dir.path().join("fail.php");
+    std::fs::write(&failing, "<?php exit(3);\n").unwrap();
+    let message = rebuild_map_with_php(dir.path(), false, Some(&failing), Some(&php)).unwrap();
+    assert!(message.contains("rebuild-map.php failed"), "{message}");
+}
+
+#[test]
+fn rebuild_lookup_miss_without_support_tree_reports_not_found() {
+    // Lookup-miss arm, deterministic: a clean temp root carries no support
+    // tree above it, and the `None` binary override skips the exe-ancestor
+    // search, so the lookup misses regardless of where the test binary lives.
+    let dir = TempDir::new("rebuild-miss");
+    assert_eq!(
+        find_rebuild_script_with_exe(dir.path(), dir.path(), None),
+        None
+    );
+    let message =
+        rebuild_map_with_php_and_exe(dir.path(), false, None, None, None).expect("miss text");
+    assert!(
+        message.contains("support/lib/rebuild-map.php was not found above"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -750,7 +827,7 @@ impl Cov6gPlantOnRead {
 
     fn plant(&mut self) {
         if self.planted {
-            return; // LCOV_EXCL_LINE // Reason: plant-once guard; the helper reads exactly once
+            return;
         }
         self.planted = true;
         std::fs::create_dir_all(&self.lib).unwrap();
@@ -759,11 +836,10 @@ impl Cov6gPlantOnRead {
 }
 
 impl std::io::Read for Cov6gPlantOnRead {
-    // LCOV_EXCL_START // Reason: Read impl required by the BufRead supertrait; the engine only calls fill_buf
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.plant();
         self.inner.read(buf)
-    } // LCOV_EXCL_STOP
+    }
 }
 
 impl std::io::BufRead for Cov6gPlantOnRead {
@@ -788,6 +864,24 @@ fn cov6g_ensure_library_sees_init_created_during_confirm() {
         Ok(false)
     );
     assert!(lib.join(INIT_FILE).is_file());
+    // Second read trips the plant-once guard (the confirm already planted).
+    std::io::BufRead::fill_buf(&mut input).unwrap();
+}
+
+#[test]
+fn cov6g_plant_on_read_read_plants_and_returns_bytes() {
+    // Direct `Read::read` unit test for the `BufRead` supertrait stub: the
+    // first read plants the init file and streams the queued answer bytes.
+    let dir = TempDir::new("cov6g-read");
+    let lib = dir.path().join("newlib");
+    let mut input = Cov6gPlantOnRead::new(lib.clone(), "y\n");
+    let mut buf = [0u8; 4];
+    let n = std::io::Read::read(&mut input, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"y\n");
+    assert!(lib.join(INIT_FILE).is_file());
+    // Second read trips the plant-once guard through the `Read` path too.
+    let n = std::io::Read::read(&mut input, &mut buf).unwrap();
+    assert_eq!(n, 0);
 }
 
 #[test]
@@ -807,4 +901,18 @@ fn cov6g_run_in_two_paths_is_usage_failure() {
 fn args_of_panics_on_invalid_argv() {
     // T1153 B21/B23: TTY runs need no `--`; two paths still error.
     args_of(&["a", "b"]);
+}
+
+#[test]
+#[should_panic(expected = "expected an error")]
+fn rejects_second_path_with_full_text_defensive_args_arm() {
+    // `expect_lib_error` unwraps `Error`: a single path parses.
+    expect_lib_error(&["lib"]);
+}
+
+#[test]
+#[should_panic(expected = "expected autocorrected args")]
+fn parse_corrects_near_miss_flag_with_notice_defensive_error_arm() {
+    // `expect_lib_args` unwraps `Args`: an unknown flag errors.
+    expect_lib_args(&["--bogus"]);
 }

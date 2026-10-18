@@ -563,11 +563,20 @@ fn export_prompt_line(prompt: &str) -> Option<String> {
     print!("{}", crate::prompt::prompt_text(prompt));
     use std::io::Write;
     std::io::stdout().flush().ok();
-    if !crate::prompt::stdin_is_terminal() {
+    export_prompt_line_with(
+        &mut std::io::stdin().lock(),
+        crate::prompt::stdin_is_terminal(),
+    )
+}
+
+/// [`export_prompt_line`] with injected input and TTY flag (test
+/// seam; production passes real stdin and its TTY state).
+fn export_prompt_line_with(input: &mut dyn std::io::BufRead, stdin_tty: bool) -> Option<String> {
+    if !stdin_tty {
         EXPORT_PROMPT_TTY_FAILED.set(true);
         return None;
-    } // LCOV_EXCL_START // Reason: needs a TTY; stdin is never a terminal under cargo test
-    crate::prompt::read_answer(&mut std::io::stdin().lock()) // LCOV_EXCL_STOP
+    }
+    crate::prompt::read_answer(input)
 }
 
 /// Resolve the local base commit: an explicit base goes through
@@ -612,6 +621,19 @@ fn resolve_export_base_with_prompt(
 }
 
 pub fn local_diff_bytes(dir: &Path, format: Format, base: &str) -> Result<Vec<u8>, String> {
+    local_diff_bytes_with_git(dir, format, base, None)
+}
+
+/// [`local_diff_bytes`] with the `git` program override injected (test
+/// seam; production passes `None`, which spawns `git`). Only the diff
+/// spawn takes the override; the work-tree and head probes keep the
+/// ambient binary, so a healthy checkout stages spawn failure alone.
+pub fn local_diff_bytes_with_git(
+    dir: &Path,
+    format: Format,
+    base: &str,
+    git: Option<&Path>,
+) -> Result<Vec<u8>, String> {
     if !crate::git::is_inside_work_tree(dir) {
         return Err("not inside a git working copy".to_string());
     }
@@ -621,7 +643,7 @@ pub fn local_diff_bytes(dir: &Path, format: Format, base: &str) -> Result<Vec<u8
     // renders from the bundle (T1153 EXPORT-E5).
     let _ = format;
     let head = resolve_export_head(dir)?;
-    let out = crate::git::output(
+    let out = crate::git::output_with_git(
         dir,
         &[
             "-c",
@@ -640,6 +662,7 @@ pub fn local_diff_bytes(dir: &Path, format: Format, base: &str) -> Result<Vec<u8
             &head,
             "--",
         ],
+        git,
     )?;
 
     if out.status.success() {
@@ -2002,21 +2025,47 @@ fn export_bundle_with_client(
     Ok("Done.\n".to_string())
 }
 
-/// Write an `--arcbundle` file, returning the stdout text.
-fn export_bundle(dir: &Path, opts: &Options, path: &str) -> Result<String, String> {
-    let client = crate::config::client_for(opts.conduit_uri.as_deref())?;
-    export_bundle_with_client(dir, opts, path, &client) // LCOV_EXCL_LINE // Reason: needs a configured conduit client; hermetic tests cannot mint one (HOME is process-global)
+/// Write an `--arcbundle` file, returning the stdout text, with an
+/// explicit credential file (test seam: hermetic tests stage a fake
+/// arcrc instead of touching HOME; production passes
+/// [`config::arcrc_path`](crate::config::arcrc_path)).
+fn export_bundle(
+    dir: &Path,
+    opts: &Options,
+    path: &str,
+    user_file: Option<&Path>,
+) -> Result<String, String> {
+    // Byte-identical to `config::client_for(..)` when the wrapper
+    // passes the ambient user file (same cwd fallback).
+    let config_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let client = crate::config::client_for_with(
+        opts.conduit_uri.as_deref(),
+        &config_dir,
+        user_file,
+        &crate::get_config::LoadOptions::default(),
+    )?;
+    export_bundle_with_client(dir, opts, path, &client)
 }
 
 /// Run the workflow rooted at `dir`, returning stdout text or an error message.
 pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
+    execute_with_user_file(dir, argv, crate::config::arcrc_path().as_deref())
+}
+
+/// [`execute`] with an explicit credential file (test seam: hermetic
+/// tests stage a fake arcrc instead of touching HOME).
+fn execute_with_user_file(
+    dir: &Path,
+    argv: &[String],
+    user_file: Option<&Path>,
+) -> Result<String, String> {
     let opts = match parse_args(argv) {
         ParseOutcome::Args(opts) => opts,
         ParseOutcome::Help => return Ok(usage()),
         // T1153 R4 (EXPORT-E28): PHP renders usage errors with no dump.
         ParseOutcome::Error(message) => return Err(message),
     };
-    execute_with_opts(dir, &opts)
+    execute_with_opts_and_user_file(dir, &opts, user_file)
 }
 
 /// Render text output from bundle changes: a git patch or a unified
@@ -2042,6 +2091,13 @@ fn decode_local_export_diff(dir: &Path, base: &str) -> Result<String, String> {
     Ok(crate::patch::transport_bytes(&bytes))
 }
 
+/// Blob loader for local exports: local changes carry their binary
+/// bytes inline (`loadSyntheticData`), never conduit PHIDs, so any
+/// load request has nowhere to go.
+fn local_export_blob_loader(phid: &str, _name: Option<&str>) -> Result<Vec<u8>, String> {
+    Err(format!("Nowhere to load blob '{phid}' from!"))
+}
+
 /// Text export over a local workcopy (T1153 EXPORT-E30: PHP requires
 /// conduit (and queries the author) for ALL local exports, even
 /// `--git`/`--unified`).
@@ -2050,8 +2106,17 @@ fn execute_local_export_text(
     opts: &Options,
     base: &Option<String>,
     git: bool,
+    user_file: Option<&Path>,
 ) -> Result<String, String> {
-    let client = crate::config::client_for(opts.conduit_uri.as_deref())?;
+    // Byte-identical to `config::client_for(..)` when the wrapper
+    // passes the ambient user file (same cwd fallback).
+    let config_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let client = crate::config::client_for_with(
+        opts.conduit_uri.as_deref(),
+        &config_dir,
+        user_file,
+        &crate::get_config::LoadOptions::default(),
+    )?;
     let base = resolve_export_base(dir, base.as_deref())?;
     let text = decode_local_export_diff(dir, &base)?;
     let parsed = crate::diff_local::parse_unified_diff_transport(&text)?;
@@ -2060,9 +2125,7 @@ fn execute_local_export_text(
     // the query before rendering.
     viewer_real_name(&client)?;
     let mut changes = local_render_changes(dir, &base, &head, &parsed);
-    render_export_text(&mut changes, git, &|phid, _| {
-        Err(format!("Nowhere to load blob '{phid}' from!")) // LCOV_EXCL_START // Reason: blob-loader closure; needs a conduit-backed export with binary adds (integration-only)
-    }) // LCOV_EXCL_STOP
+    render_export_text(&mut changes, git, &local_export_blob_loader)
 }
 
 /// `getBlob($phid, $name)`: download one conduit blob, naming the
@@ -2090,8 +2153,17 @@ fn execute_conduit_export_text(
     opts: &Options,
     source: &Source,
     git: bool,
+    user_file: Option<&Path>,
 ) -> Result<String, String> {
-    let client = crate::config::client_for(opts.conduit_uri.as_deref())?;
+    // Byte-identical to `config::client_for(..)` when the wrapper
+    // passes the ambient user file (same cwd fallback).
+    let config_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let client = crate::config::client_for_with(
+        opts.conduit_uri.as_deref(),
+        &config_dir,
+        user_file,
+        &crate::get_config::LoadOptions::default(),
+    )?;
     let diff = first_diff_dict(&client, &querydiffs_params(source))?;
     let items = diff
         .get("changes")
@@ -2103,19 +2175,22 @@ fn execute_conduit_export_text(
     // `getBlob($phid, $name)`: the render path passes the file
     // basename, so the stderr message names the file.
     render_export_text(&mut changes, git, &|phid, name| {
-        download_export_blob(&client, phid, name) // LCOV_EXCL_START // Reason: blob-download closure; needs a conduit diff with binary files plus creds (integration-only)
-    }) // LCOV_EXCL_STOP
+        download_export_blob(&client, phid, name)
+    })
 }
 
-/// [`execute`] over parsed options.
-fn execute_with_opts(dir: &Path, opts: &Options) -> Result<String, String> {
+fn execute_with_opts_and_user_file(
+    dir: &Path,
+    opts: &Options,
+    user_file: Option<&Path>,
+) -> Result<String, String> {
     if let Format::Bundle { path } = &opts.format {
-        return export_bundle(dir, opts, path);
+        return export_bundle(dir, opts, path, user_file);
     }
     let git = matches!(opts.format, Format::Git);
     match &opts.source {
-        Source::Local { base } => execute_local_export_text(dir, opts, base, git),
-        other => execute_conduit_export_text(opts, other, git),
+        Source::Local { base } => execute_local_export_text(dir, opts, base, git, user_file),
+        other => execute_conduit_export_text(opts, other, git, user_file),
     }
 }
 
@@ -2124,15 +2199,25 @@ fn execute_with_opts(dir: &Path, opts: &Options) -> Result<String, String> {
 /// the sink (`convertNonUTF8Diff()`). Bundle writes keep UTF-8 stdout
 /// (the file carries its own encoding record).
 pub fn execute_bytes(dir: &Path, argv: &[String]) -> Result<Vec<u8>, String> {
+    execute_bytes_with_user_file(dir, argv, crate::config::arcrc_path().as_deref())
+}
+
+/// [`execute_bytes`] with an explicit credential file (test seam:
+/// hermetic tests stage a fake arcrc instead of touching HOME).
+fn execute_bytes_with_user_file(
+    dir: &Path,
+    argv: &[String],
+    user_file: Option<&Path>,
+) -> Result<Vec<u8>, String> {
     let opts = match parse_args(argv) {
         ParseOutcome::Args(opts) => opts,
         ParseOutcome::Help => return Ok(usage().into_bytes()),
         // T1153 R4 (EXPORT-E28): PHP renders usage errors with no dump.
         ParseOutcome::Error(message) => return Err(message),
     };
-    let text = execute_with_opts(dir, &opts)?;
+    let text = execute_with_opts_and_user_file(dir, &opts, user_file)?;
     if matches!(opts.format, Format::Bundle { .. }) {
-        return Ok(text.into_bytes()); // LCOV_EXCL_LINE // Reason: Bundle success arm; needs conduit creds (integration-only)
+        return Ok(text.into_bytes());
     }
     // Local text rides as transport (T1153 EXPORT-E9); conduit text is
     // already UTF-8. Both convert at the sink, like
@@ -2140,7 +2225,7 @@ pub fn execute_bytes(dir: &Path, argv: &[String]) -> Result<Vec<u8>, String> {
     if matches!(opts.source, Source::Local { .. }) {
         crate::patch::encode_transport_text(&text, opts.encoding.as_deref())
     } else {
-        crate::patch::encode_bytes(&text, opts.encoding.as_deref()) // LCOV_EXCL_LINE // Reason: conduit-source sink arm; needs creds plus network (integration-only)
+        crate::patch::encode_bytes(&text, opts.encoding.as_deref())
     }
 }
 

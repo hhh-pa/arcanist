@@ -273,3 +273,23 @@ fn configured_config_reaches_the_tool() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].name, "Unquoted File Mode");
 }
+
+#[test]
+#[cfg(unix)]
+fn temp_write_failure_reports_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new("temp-fail");
+    let tool = tmp.path().join("fake-puppetlint");
+    std::fs::write(&tool, b"x").unwrap();
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let mut linter = PuppetlintLinter {
+        temp_dir: Some(locked.clone()),
+        ..Default::default()
+    };
+    linter.options.bin = Some(tool);
+    assert!(linter.lint_bytes("site.pp", b"file { 'x': }").is_empty());
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+}

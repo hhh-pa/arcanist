@@ -529,25 +529,16 @@ fn parse_long_flag(
 }
 
 /// Parse one `-x` token (`ArcanistWorkflow.php:852-862`).
+///
+/// `unit` defines no short flags, so every `-x` token is unknown.
 fn parse_short_flag(
-    options: &mut Options,
-    queue: &mut VecDeque<String>,
-    typed: &str,
+    _options: &mut Options,
+    _queue: &mut VecDeque<String>,
+    _typed: &str,
     spelling: &str,
 ) -> Result<(), String> {
-    let Some(spec) = lookup_short(spelling) else {
-        return Err(format!("Unknown argument '{spelling}'. Try 'arc help'."));
-    };
-    // LCOV_EXCL_START // Reason: unreachable; no FLAG_SPECS entry defines a short spelling, so lookup always misses
-    if !spec.flag.takes_param() {
-        store_flag(options, spec, None);
-        return Ok(());
-    }
-    let value = queue
-        .pop_front()
-        .ok_or_else(|| format!("Option '{typed}' requires a parameter."))?;
-    store_flag(options, spec, Some(value));
-    Ok(()) // LCOV_EXCL_STOP
+    debug_assert!(lookup_short(spelling).is_none());
+    Err(format!("Unknown argument '{spelling}'. Try 'arc help'."))
 }
 
 /// Parse `argv` (excluding the `unit` subcommand name).
@@ -579,7 +570,6 @@ pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
         }
         if let Some(spelling) = arg.strip_prefix('-') {
             parse_short_flag(&mut options, &mut queue, &arg, spelling)?;
-            continue; // LCOV_EXCL_LINE // Reason: unreachable; short flags always error since no spec defines one
         }
         options.paths.push(arg);
     }
@@ -1113,17 +1103,12 @@ pub fn validate_paths(
 ) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     for path in paths {
-        let candidate = cwd.join(path);
-        let full = if candidate.exists() {
-            candidate
-        } else {
-            let absolute = PathBuf::from(path);
-            if absolute.is_absolute() && absolute.exists() {
-                absolute // LCOV_EXCL_LINE // Reason: join() with an absolute path is identity, so both existence checks agree; reaching here needs a TOCTOU flip
-            } else {
-                return Err(format!("Path '{path}' does not exist!"));
-            }
-        };
+        // `Path::join` with an absolute `path` is identity, so one
+        // existence check covers both relative and absolute spellings.
+        let full = cwd.join(path);
+        if !full.exists() {
+            return Err(format!("Path '{path}' does not exist!"));
+        }
         let display = full.to_string_lossy().replace('\\', "/");
         let root = project_root.to_string_lossy().replace('\\', "/");
         let root = root.trim_end_matches('/');
@@ -1690,11 +1675,10 @@ pub fn binary_exists(name: &str) -> bool {
 #[must_use]
 pub fn resolve_binary_path(name: &str) -> Option<String> {
     let path_var = std::env::var_os("PATH")?;
-    let extensions: &[&str] = if cfg!(windows) {
-        &["", ".exe", ".bat", ".cmd"] // LCOV_EXCL_LINE // Reason: windows arm; cfg!(windows) is false on ubuntu CI
-    } else {
-        &[""]
-    };
+    #[cfg(windows)]
+    let extensions: &[&str] = &["", ".exe", ".bat", ".cmd"];
+    #[cfg(not(windows))]
+    let extensions: &[&str] = &[""];
     for dir in std::env::split_paths(&path_var) {
         for ext in extensions {
             let candidate = dir.join(format!("{name}{ext}"));
@@ -1851,16 +1835,13 @@ pub struct XunitPlan {
 /// Load the xUnit environment and map the run paths to test projects
 /// (`XUnitTestEngine.php:36-95,103-113`) with real filesystem probes.
 /// Engine params read through the config merge (UNIT-U13 follow-through).
-pub fn prepare_xunit_run(ctx: &EngineContext) -> Result<XunitPlan, EngineError> {
-    let merged = lenient_engine_merged(&ctx.project_root);
-    prepare_xunit_run_with_merged(ctx, merged.as_ref())
-}
-
-/// [`prepare_xunit_run`] with an explicit merged config (`None` falls back
-/// to the project-root `.arcconfig`, like the pre-merge read).
-pub fn prepare_xunit_run_with_merged(
+/// The toolchain probe is injected (test seam; production passes
+/// [`binary_exists`]); `merged = None` falls back to the project-root
+/// `.arcconfig`, like the pre-merge read.
+pub fn prepare_xunit_run_with_merged_and_exists(
     ctx: &EngineContext,
     merged: Option<&get_config::MergedConfig>,
+    exists: &dyn Fn(&str) -> bool,
 ) -> Result<XunitPlan, EngineError> {
     let is_windows = cfg!(windows);
     let discovery = engine_param_from(merged, &ctx.project_root, unit_xunit::DISCOVERY_KEY)
@@ -1869,13 +1850,12 @@ pub fn prepare_xunit_run_with_merged(
     let env = unit_xunit::load_environment(
         &ctx.project_root,
         is_windows,
-        &binary_exists,
-        &|b| resolve_binary_path(b).unwrap_or_else(|| b.to_string()), // LCOV_EXCL_LINE // Reason: invoked only past the msbuild/mono checks; neither exists on ubuntu CI
+        exists,
+        &|b| resolve_binary_path(b).unwrap_or_else(|| b.to_string()),
         discovery,
         hint.as_deref(),
-        &|p| Path::new(p).exists(), // LCOV_EXCL_LINE // Reason: invoked only past the msbuild/mono checks; neither exists on ubuntu CI
+        &|p| Path::new(p).exists(),
     )?;
-    // LCOV_EXCL_START // Reason: xunit setup needs msbuild/xbuild and mono on PATH; neither exists on ubuntu CI
     let paths = if ctx.run_all_tests {
         all_files_under(&ctx.project_root)
     } else {
@@ -1886,7 +1866,7 @@ pub fn prepare_xunit_run_with_merged(
         env,
         projects,
         is_windows,
-    }) // LCOV_EXCL_STOP
+    })
 }
 
 /// Run generate, build, then test over a plan, stopping after the first
@@ -1915,12 +1895,22 @@ pub fn run_xunit_with_runner(
     ctx: &EngineContext,
     runner: &dyn CommandRunner,
 ) -> Result<Vec<EngineUnitResult>, EngineError> {
-    let plan = prepare_xunit_run(ctx)?;
-    // LCOV_EXCL_START // Reason: the xunit plan never builds without msbuild/mono on PATH
+    run_xunit_with_runner_and_exists(ctx, runner, &binary_exists)
+}
+
+/// [`run_xunit_with_runner`] with the toolchain probe injected (test
+/// seam; production passes [`binary_exists`]).
+pub fn run_xunit_with_runner_and_exists(
+    ctx: &EngineContext,
+    runner: &dyn CommandRunner,
+    exists: &dyn Fn(&str) -> bool,
+) -> Result<Vec<EngineUnitResult>, EngineError> {
+    let merged = lenient_engine_merged(&ctx.project_root);
+    let plan = prepare_xunit_run_with_merged_and_exists(ctx, merged.as_ref(), exists)?;
     if plan.projects.is_empty() {
         return Ok(Vec::new());
     }
-    run_xunit_plan(&plan, runner) // LCOV_EXCL_STOP
+    run_xunit_plan(&plan, runner)
 }
 
 /// xUnit generate stage (`generateProjects`, lines 215-264).
@@ -2284,11 +2274,22 @@ pub fn run_csharp_with_runner(
     ctx: &EngineContext,
     runner: &dyn CommandRunner,
 ) -> Result<Vec<EngineUnitResult>, EngineError> {
-    let plan = prepare_xunit_run(ctx)?;
+    run_csharp_with_runner_and_exists(ctx, runner, &binary_exists)
+}
+
+/// [`run_csharp_with_runner`] with the toolchain probe injected (test
+/// seam; production passes [`binary_exists`]).
+pub fn run_csharp_with_runner_and_exists(
+    ctx: &EngineContext,
+    runner: &dyn CommandRunner,
+    exists: &dyn Fn(&str) -> bool,
+) -> Result<Vec<EngineUnitResult>, EngineError> {
+    let merged = lenient_engine_merged(&ctx.project_root);
+    let plan = prepare_xunit_run_with_merged_and_exists(ctx, merged.as_ref(), exists)?;
     // The cover engine resolves before any stage runs (like the parent
     // `loadEnvironment` plus the cover half throwing first), even when no
     // projects mapped.
-    let merged = lenient_engine_merged(&ctx.project_root); // LCOV_EXCL_START // Reason: the csharp run needs the xunit plan, which needs msbuild/mono; neither exists on ubuntu CI
+    let merged = lenient_engine_merged(&ctx.project_root);
     let cover = load_csharp_cover(ctx, merged.as_ref())?;
     if plan.projects.is_empty() {
         return Ok(Vec::new());
@@ -2304,7 +2305,7 @@ pub fn run_csharp_with_runner(
     }
     let mut tested = run_csharp_test(&plan, cover.as_ref(), ctx.enable_coverage, runner)?;
     results.append(&mut tested);
-    Ok(results) // LCOV_EXCL_STOP
+    Ok(results)
 }
 
 /// Build a phpunit engine from the config merge (`prepareConfigFile`,
@@ -2493,33 +2494,33 @@ pub fn run_single_with_php(
     // read below (missing/unreadable sources fall back per-param).
     let merged = lenient_engine_merged(&ctx.project_root);
     let merged_ref = merged.as_ref();
-    match engine_type {
-        "NoseTestEngine" => {
-            unit_nose::NoseEngine::new().run_with(ctx, runner, &unit_nose::RealNoseFs)
-        }
-        "PytestTestEngine" => unit_pytest::PytestEngine::new().run_with(ctx, runner, &RealPytestFs),
-        "PhpunitTestEngine" => {
-            let engine = phpunit_engine_from_merged(&ctx.project_root, merged_ref);
-            // Surface a configured-but-missing phpunit config verbatim
-            // (`PhpunitTestEngine.php:263-266`).
-            if let Some(config_value) =
-                engine_param_string_from(merged_ref, &ctx.project_root, unit_phpunit::CONFIG_KEY)
-            {
-                let full = format!("{}/{config_value}", ctx.project_root);
-                if !Path::new(&full).exists() {
-                    return Err(EngineError::Failed(format!(
-                        "PHPUnit configuration file was not found in {full}"
-                    )));
-                }
+    // The SINGLE_AVAILABLE guard above admits only names with branches
+    // below; the final else is the C# engine.
+    if engine_type == "NoseTestEngine" {
+        unit_nose::NoseEngine::new().run_with(ctx, runner, &unit_nose::RealNoseFs)
+    } else if engine_type == "PytestTestEngine" {
+        unit_pytest::PytestEngine::new().run_with(ctx, runner, &RealPytestFs)
+    } else if engine_type == "PhpunitTestEngine" {
+        let engine = phpunit_engine_from_merged(&ctx.project_root, merged_ref);
+        // Surface a configured-but-missing phpunit config verbatim
+        // (`PhpunitTestEngine.php:263-266`).
+        if let Some(config_value) =
+            engine_param_string_from(merged_ref, &ctx.project_root, unit_phpunit::CONFIG_KEY)
+        {
+            let full = format!("{}/{config_value}", ctx.project_root);
+            if !Path::new(&full).exists() {
+                return Err(EngineError::Failed(format!(
+                    "PHPUnit configuration file was not found in {full}"
+                )));
             }
-            engine.run_with(ctx, runner, &RealPhpunitFs)
         }
-        "PhutilUnitTestEngine" | "phutil" => {
-            run_phutil_with_runner_merged(ctx, runner, engine_type, php, merged_ref)
-        }
-        "XUnitTestEngine" => run_xunit_with_runner(ctx, runner),
-        "CSharpToolsTestEngine" => run_csharp_with_runner(ctx, runner),
-        _ => Err(EngineError::Usage(not_a_subclass_message(engine_type))), // LCOV_EXCL_LINE // Reason: dead arm; the SINGLE_AVAILABLE guard admits only names with arms above
+        engine.run_with(ctx, runner, &RealPhpunitFs)
+    } else if engine_type == "PhutilUnitTestEngine" || engine_type == "phutil" {
+        run_phutil_with_runner_merged(ctx, runner, engine_type, php, merged_ref)
+    } else if engine_type == "XUnitTestEngine" {
+        run_xunit_with_runner(ctx, runner)
+    } else {
+        run_csharp_with_runner(ctx, runner)
     }
 }
 
@@ -3974,11 +3975,10 @@ fn parse_unit_options(argv: &[String]) -> Result<Options, ExitCode> {
 fn unit_working_dir() -> Result<PathBuf, ExitCode> {
     match std::env::current_dir() {
         Ok(dir) => Ok(dir),
-        // LCOV_EXCL_START // Reason: needs getcwd to fail on the test runner's cwd; not stageable
         Err(e) => Err(conduit::report(
             EnvelopeKind::Exception,
             &format!("cannot read current directory: {e}"),
-        )), // LCOV_EXCL_STOP
+        )),
     }
 }
 
@@ -4107,21 +4107,26 @@ pub fn run(argv: &[String]) -> ExitCode {
     };
     let cwd = match unit_working_dir() {
         Ok(dir) => dir,
-        Err(code) => return code, // LCOV_EXCL_LINE // Reason: needs getcwd to fail on the test runner's cwd; not stageable
+        Err(code) => return code,
     };
+    run_opts_in(&opts, &cwd)
+}
+
+/// [`run`] dispatch with options and the working directory injected
+/// (test seam; production passes the parsed argv and the process working
+/// directory).
+pub fn run_opts_in(opts: &Options, cwd: &Path) -> ExitCode {
     let ansi = terminal::ansi_enabled();
-    match plan_run(&opts, &cwd) {
-        Ok(PlannedRun::Cargo) => run_cargo_selection(&opts, &cwd), // LCOV_EXCL_LINE // Reason: reaching it runs cargo test in the live checkout (recursive suite); no test drives run() that far
+    match plan_run(opts, cwd) {
+        Ok(PlannedRun::Cargo) => run_cargo_selection(opts, cwd),
         Ok(PlannedRun::Single { class, paths }) => {
-            // LCOV_EXCL_START // Reason: reaching it spawns the live test runner; no test drives run() that far
-            run_single_selection(&opts, &cwd, &class, &paths, ansi) // LCOV_EXCL_STOP
+            run_single_selection(opts, cwd, &class, &paths, ansi)
         }
         Ok(PlannedRun::Config {
-            // LCOV_EXCL_START // Reason: needs a .arcunit in the test-run checkout; the repo has none
             engines,
             root,
             paths,
-        }) => run_config_selection(&opts, &engines, &root, &paths, ansi), // LCOV_EXCL_STOP
+        }) => run_config_selection(opts, &engines, &root, &paths, ansi),
         Err(error) => error.report(),
     }
 }

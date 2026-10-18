@@ -722,3 +722,21 @@ fn t1170_class_at_file_start_has_no_docblock() {
     block.kw_idx = 0;
     assert!(!super::class_docblock_exempts(&tree, &block));
 }
+// -( T1176 S12: dead-arm coverage )------------------------------------------
+
+#[test]
+#[should_panic(expected = "methods here are always named")]
+fn rule_unexpected_return_dead_unnamed() {
+    // The parser anonymizes nameless functions, so a non-anonymous
+    // method always has a name; clearing it by hand breaks the
+    // guarantee and panics.
+    let tree = t1170_tree("<?php class A { function f() {} }\n");
+    let mut blocks = tree.blocks();
+    let method = blocks
+        .iter_mut()
+        .find(|b| b.kind == ast::BlockKind::Function)
+        .expect("method block");
+    method.name = None;
+    let mut out = Vec::new();
+    super::rule_unexpected_return(&tree, &blocks, &mut out);
+}

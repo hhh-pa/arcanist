@@ -1054,7 +1054,7 @@ pub fn resolve_explicit_base(
         let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !sha.is_empty() {
             return Ok(sha);
-        } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
+        }
     }
     Err(format!(
         "Unable to find any git commit named '{symbolic_base}' in this repository."
@@ -4930,9 +4930,6 @@ pub fn parse_hg_active_bookmark(output: &str) -> Option<String> {
     output.lines().find_map(|line| {
         let name = line.strip_prefix('*')?.trim_start();
         let name = name.split_whitespace().next()?;
-        if name.is_empty() {
-            return None; // LCOV_EXCL_LINE // Reason: dead: split_whitespace never yields an empty name
-        }
         Some(name.to_string())
     })
 }
@@ -4978,9 +4975,9 @@ pub fn parse_hg_status_details(output: &str) -> Result<Vec<(HgStatusEntry, u32)>
         let code = bytes[0] as char;
         let path = line[2..].to_string();
         if code == ' ' {
-            let Some((last, _)) = entries.last_mut() else {
-                return Err(format!("Unexpected copy source in hg status, '{line}'.")); // LCOV_EXCL_LINE // Reason: dead: trim() strips leading spaces, so a copy-source line is never first
-            };
+            let (last, _) = entries
+                .last_mut()
+                .expect("trim() strips leading spaces, so a copy-source line is never first");
             last.from = Some(path);
             continue;
         }
@@ -5771,18 +5768,21 @@ fn resolve_list_path(base: &Path, path: &str) -> String {
     let mut rooted = false;
     for component in joined.components() {
         match component {
-            // LCOV_EXCL_START // Reason: dead on ubuntu; Component::Prefix only occurs in Windows paths
+            #[cfg(windows)]
             std::path::Component::Prefix(prefix) => {
                 parts.push(prefix.as_os_str().to_string_lossy().into_owned());
-            } // LCOV_EXCL_STOP
+            }
             std::path::Component::RootDir => rooted = true,
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
                 parts.pop();
             }
-            std::path::Component::Normal(part) => {
-                parts.push(part.to_string_lossy().into_owned());
-            }
+            // `Normal` on every platform: `Prefix` matches above on
+            // Windows and is unconstructible elsewhere, so the
+            // wildcard's only reachable input is `Normal` (and the
+            // arm stays covered without a fallback line that could
+            // never execute where gates measure).
+            other => parts.push(other.as_os_str().to_string_lossy().into_owned()),
         }
     }
     let mut out = parts.join("/");
@@ -6211,12 +6211,15 @@ pub fn svn_working_copy_root(cwd: &Path) -> PathBuf {
 /// PHP's `$root.'/../scripts/repository/binary_safe_diff.sh'`.
 #[must_use]
 pub fn default_svn_diff_cmd() -> Option<PathBuf> {
-    if cfg!(windows) {
-        return None; // LCOV_EXCL_LINE // Reason: windows-only early return; cfg!(windows) is false on ubuntu CI
-    }
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    Some(dir.join("../scripts/repository/binary_safe_diff.sh"))
+    #[cfg(windows)]
+    let out = None;
+    #[cfg(not(windows))]
+    let out = {
+        let exe = std::env::current_exe().ok()?;
+        let dir = exe.parent()?;
+        Some(dir.join("../scripts/repository/binary_safe_diff.sh"))
+    };
+    out
 }
 
 /// Collect submit-ready parsed changes from an svn working copy.
@@ -7142,13 +7145,10 @@ pub fn resolve_message_source(
         }
         return Ok(MessageSource::CreateFromUser);
     }
-    match update {
-        Some(id) => Ok(MessageSource::UpdateFromRevision(parse_update_revision_id(
-            id,
-        )?)),
-        // Unreachable: `!create && update.is_none()` returned above.
-        None => Ok(MessageSource::CreateFromUser), // LCOV_EXCL_LINE // Reason: unreachable: `!create && update.is_none()` returns above
-    }
+    let id = update.expect("`!create && update.is_none()` returns above");
+    Ok(MessageSource::UpdateFromRevision(parse_update_revision_id(
+        id,
+    )?))
 }
 
 /* -(  Clean working-copy check (D3)  )--------------------------------------- */
@@ -7739,9 +7739,6 @@ fn commit_clean_check_changes(
         return Err(MUST_PROVIDE_MESSAGE.to_string());
     }
     let message = remove_comments(&edited);
-    if message.is_empty() {
-        return Err(MUST_PROVIDE_NONEMPTY_MESSAGE.to_string()); // LCOV_EXCL_LINE // Reason: dead: remove_comments always returns newline-terminated text, never empty
-    }
     if let Some(commit) = vcs.do_commit {
         commit(&message)?;
     }

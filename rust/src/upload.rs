@@ -16,7 +16,7 @@
 //! terminal width. Chunk progress goes to stderr with a TTY progress bar,
 //! like PHP.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::conduit::{self, EnvelopeKind};
@@ -511,10 +511,15 @@ impl ChunkProgress {
 
     /// `draw()`: erase the line and repaint the bar on stderr.
     fn draw(&mut self) {
-        if self.total == 0 || !Self::stderr_is_tty() {
+        self.draw_with(Self::stderr_is_tty(), Self::width());
+    }
+
+    /// `draw()` with injected TTY state and width, so tests can force the
+    /// TTY body without a real terminal (cargo-test stderr is piped).
+    fn draw_with(&mut self, is_tty: bool, width: usize) {
+        if self.total == 0 || !is_tty {
             return;
-        } // LCOV_EXCL_START // Reason: needs stderr to be a TTY; cargo-test stderr is piped
-        let width = Self::width();
+        }
         let chrome_width = "[] 100.0%   ".len();
         if width < chrome_width {
             return;
@@ -522,7 +527,7 @@ impl ChunkProgress {
         self.last_update = Some(std::time::Instant::now());
         self.drawn = true;
         Self::erase_line(width);
-        eprint!("{}", render_chunk_bar(self.done, self.total, width)); // LCOV_EXCL_STOP
+        eprint!("{}", render_chunk_bar(self.done, self.total, width));
     }
 
     /// Destructor-equivalent (`done($clean_exit = false)`): erase the bar.
@@ -869,13 +874,11 @@ fn read_upload_bytes(dir: &Path, path: &str) -> Result<Vec<u8>, String> {
     match std::fs::read(&disk) {
         Ok(data) => Ok(data),
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Err(format!(
-            "Unable to upload file: path \"{path}\" is not readable." // LCOV_EXCL_LINE // Reason: gates run as root, which reads through chmod 000, so EACCES never triggers where gates measure; covered on macOS runs
-        )), // LCOV_EXCL_LINE // Reason: gates run as root, which reads through chmod 000, so EACCES never triggers where gates measure; covered on macOS runs
-        // LCOV_EXCL_START // Reason: TOCTOU-only: is_file pre-check passes, so only deletion between check and read reaches here
+            "Unable to upload file: path \"{path}\" is not readable."
+        )),
         Err(_) => Err(format!(
             "Unable to upload file: failed to open path \"{path}\" for reading."
         )),
-        // LCOV_EXCL_STOP
     }
 }
 
@@ -886,10 +889,12 @@ fn upload_single_path(
     temporary: bool,
 ) -> Result<(String, String), String> {
     let data = read_upload_bytes(dir, path)?;
-    let name = match dir.join(path).file_name() {
-        Some(name) => name.to_string_lossy().to_string(),
-        None => path.to_string(), // LCOV_EXCL_LINE // Reason: dead arm; a path that read successfully always has a file_name
-    };
+    let name = dir
+        .join(path)
+        .file_name()
+        .expect("a path that read successfully always has a file_name")
+        .to_string_lossy()
+        .to_string();
     let phid = upload_data(client, &name, &data, temporary)?;
     Ok((path.to_string(), phid))
 }
@@ -941,10 +946,8 @@ pub fn render_uploaded_refs_ansi(
 ) -> Result<String, String> {
     if json {
         let list: Vec<serde_json::Value> = refs.iter().map(UploadedRef::to_json).collect();
-        let mut text = match serde_json::to_string_pretty(&list) {
-            Ok(text) => text,
-            Err(error) => return Err(format!("failed to encode JSON: {error}")), // LCOV_EXCL_LINE // Reason: dead arm; to_string_pretty on a Vec<Value> cannot fail
-        };
+        let mut text = serde_json::to_string_pretty(&list)
+            .expect("to_string_pretty on a Vec<Value> cannot fail");
         text = php_escape_json_text(&text, false);
         text.push('\n');
         return Ok(text);
@@ -1002,6 +1005,16 @@ struct UploadParts {
 }
 
 fn execute_parts(dir: &Path, argv: &[String]) -> Result<UploadParts, String> {
+    execute_parts_with(dir, argv, crate::config::arcrc_path().as_deref())
+}
+
+/// [`execute_parts`] with an explicit credential file (test seam:
+/// hermetic tests stage a fake arcrc instead of touching HOME).
+fn execute_parts_with(
+    dir: &Path,
+    argv: &[String],
+    user_file: Option<&Path>,
+) -> Result<UploadParts, String> {
     let opts = match parse_args(argv) {
         ParseOutcome::Args(opts) => opts,
         ParseOutcome::Help => {
@@ -1017,7 +1030,15 @@ fn execute_parts(dir: &Path, argv: &[String]) -> Result<UploadParts, String> {
         // T1153 R4 (UPLOAD-U15): PHP renders usage errors with no dump.
         ParseOutcome::Error(message) => return Err(message),
     };
-    let client = crate::config::client_for(opts.conduit_uri.as_deref())?;
+    // Byte-identical to `config::client_for(..)` when the wrapper
+    // passes the ambient user file (same cwd fallback).
+    let config_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let client = crate::config::client_for_with(
+        opts.conduit_uri.as_deref(),
+        &config_dir,
+        user_file,
+        &crate::get_config::LoadOptions::default(),
+    )?;
     let base = resolve_conduit_uri(opts.conduit_uri.as_deref());
     let uploads = collect_uploads(&client, dir, &opts.paths, opts.temporary)?;
     let refs = resolve_refs(&client, &uploads, base.as_deref())?;
@@ -1032,10 +1053,20 @@ fn execute_parts(dir: &Path, argv: &[String]) -> Result<UploadParts, String> {
 
 /// Run the workflow rooted at `dir`, returning stdout text or an error message.
 pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
-    let parts = execute_parts(dir, argv)?;
+    execute_with_user_file(dir, argv, crate::config::arcrc_path().as_deref())
+}
+
+/// [`execute`] with an explicit credential file (test seam: hermetic
+/// tests stage a fake arcrc instead of touching HOME).
+fn execute_with_user_file(
+    dir: &Path,
+    argv: &[String],
+    user_file: Option<&Path>,
+) -> Result<String, String> {
+    let parts = execute_parts_with(dir, argv, user_file)?;
     if parts.browse {
-        let configured = crate::browser::configured_browser(dir); // LCOV_EXCL_START // Reason: needs a token-bearing client to reach browse; unit tests stage no credentials
-        crate::browser::open_uris_in_browser(&parts.uris, configured.as_deref())?; // LCOV_EXCL_STOP
+        let configured = crate::browser::configured_browser(dir);
+        crate::browser::open_uris_in_browser(&parts.uris, configured.as_deref())?;
     }
     Ok(parts.text)
 }
@@ -1057,7 +1088,7 @@ pub fn run_in_with_sink(dir: &Path, argv: &[String], sink: &mut dyn FnMut(&str))
                     // Browse failures are uncaught `ArcanistUsageException`s
                     // (a plain `Exception` subclass): fatal (255).
                     return conduit::report(EnvelopeKind::Fatal, &message);
-                } // LCOV_EXCL_LINE // Reason: browse-success fall-through; reaching it needs a token-bearing client
+                }
             }
             ExitCode::SUCCESS
         }

@@ -314,9 +314,6 @@ fn run_tests_propagates_unparseable_xunit() {
     let err = engine
         .run_tests(&["t.py".to_string()], "./", &ctx, &runner, &fs)
         .unwrap_err();
-    assert!(
-        err.message().contains("must not be empty"),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    let message = err.message();
+    assert!(message.contains("must not be empty"), "{message}");
 }

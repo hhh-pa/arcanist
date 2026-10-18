@@ -36,6 +36,9 @@ const SEVERITY_WARNING: &str = "warning";
 #[derive(Debug, Default)]
 pub struct CpplintLinter {
     options: ToolOptions,
+    /// Test seam: base directory for the staged temp input (`None` uses
+    /// `std::env::temp_dir()`, the production behavior).
+    temp_dir: Option<PathBuf>,
 }
 
 impl CpplintLinter {
@@ -103,11 +106,12 @@ fn find_on_path(path_env: &std::ffi::OsStr, binary: &str) -> Option<PathBuf> {
         if candidate.is_file() {
             return Some(candidate);
         }
-        if cfg!(windows) {
-            let exe = dir.join(format!("{binary}.exe")); // LCOV_EXCL_START // Reason: windows-only .exe probe; cfg!(windows) is false on ubuntu CI
+        #[cfg(windows)]
+        {
+            let exe = dir.join(format!("{binary}.exe"));
             if exe.is_file() {
                 return Some(exe);
-            } // LCOV_EXCL_STOP
+            }
         }
     }
     None
@@ -132,14 +136,14 @@ struct StagedFile {
 }
 
 impl StagedFile {
-    fn stage(display_path: &str, data: &[u8]) -> Result<Self, String> {
+    fn stage(dir: &Path, display_path: &str, data: &[u8]) -> Result<Self, String> {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = dir.join(format!(
             "arc-rs-lint-cpplint-{}-{nanos}-{n}",
             std::process::id()
         ));
@@ -188,11 +192,13 @@ fn run_tool(binary: &Path, file: &Path, flags: &[String]) -> Option<(i32, String
 /// Linter body with an explicit tool path (mirrors the PHP `bin` option).
 /// `None` (tool absent) reports no messages.
 pub fn lint_with_binary(path: &str, data: &[u8], binary: Option<&Path>) -> Vec<LintMessage> {
-    lint_with_binary_and_flags(path, data, binary, &command_flags())
+    let dir = std::env::temp_dir();
+    lint_with_binary_and_flags(&dir, path, data, binary, &command_flags())
 }
 
 /// Linter body with explicit flags (configured flags replace defaults).
 fn lint_with_binary_and_flags(
+    dir: &Path,
     path: &str,
     data: &[u8],
     binary: Option<&Path>,
@@ -201,8 +207,8 @@ fn lint_with_binary_and_flags(
     let Some(binary) = binary else {
         return Vec::new();
     };
-    let Ok(staged) = StagedFile::stage(path, data) else {
-        return Vec::new(); // LCOV_EXCL_LINE // Reason: staging failure; hermetic tests cannot fail temp-dir writes
+    let Ok(staged) = StagedFile::stage(dir, path, data) else {
+        return Vec::new();
     };
     let Some((code, stdout, stderr)) = run_tool(binary, staged.path(), flags) else {
         return Vec::new();
@@ -312,7 +318,8 @@ impl Linter for CpplintLinter {
         let flags = self
             .options
             .command_flags(&mandatory_flags(), &default_flags());
-        lint_with_binary_and_flags(path, data, Some(binary), &flags)
+        let dir = self.temp_dir.clone().unwrap_or_else(std::env::temp_dir);
+        lint_with_binary_and_flags(&dir, path, data, Some(binary), &flags)
     }
 
     fn set_option(

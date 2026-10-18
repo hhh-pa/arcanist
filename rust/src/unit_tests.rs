@@ -1,6 +1,35 @@
 use super::*;
 use crate::unit_engine::UnitResult as EngineUnitResult;
 use crate::unit_engine::{CapturedOutput, EngineContext};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-unit-tests-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
 
 fn args(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
@@ -1349,6 +1378,194 @@ fn xunit_and_csharp_runs_cover_stages() {
         "{message}"
     );
     std::fs::remove_dir_all(&root).ok();
+}
+
+/// C# project fixture: a working-copy root (bare `.git`, so the
+/// project `.arcconfig` counts) with discovery rules, an xunit hint,
+/// and the hinted files on disk.
+fn xunit_fixture(tag: &str) -> TempDir {
+    let dir = TempDir::new(tag);
+    std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+    std::fs::write(dir.path().join("Tests.csproj"), "<x/>\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("tools")).unwrap();
+    std::fs::write(dir.path().join("tools/xunit.exe"), "fake\n").unwrap();
+    std::fs::write(
+        dir.path().join(".arcconfig"),
+        r#"{"unit.csharp.discovery": {"src/": [["Tests.csproj", "Tests.dll"]]}, "unit.csharp.xunit.binary": "tools/xunit.exe"}"#,
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn xunit_plan_builds_past_injected_toolchain() {
+    // The toolchain probe is injected true: the resolve/file closures
+    // run, and discovery maps the run path to the staged project.
+    let dir = xunit_fixture("xunit-plan");
+    let root_s = forward_slashes(dir.path());
+    let ctx = EngineContext {
+        project_root: root_s.clone(),
+        paths: vec!["src/foo.cs".to_string()],
+        enable_coverage: Some(false),
+        run_all_tests: false,
+    };
+    let plan = prepare_xunit_run_with_merged_and_exists(&ctx, None, &|_| true).unwrap();
+    assert_eq!(plan.env.build_engine, "msbuild");
+    assert_eq!(plan.projects.len(), 1);
+    assert_eq!(plan.projects[0].project, format!("{root_s}/Tests.csproj"));
+}
+
+#[test]
+fn xunit_run_executes_stages_past_injected_toolchain() {
+    // Past the injected toolchain the plan runs generate/build/test
+    // through the canned runner; no mapped projects returns empty.
+    let dir = xunit_fixture("xunit-run-ok");
+    let root_s = forward_slashes(dir.path());
+    let runner = |_: &[String], _: &str| CapturedOutput::new(0, "", "");
+    let ctx = EngineContext {
+        project_root: root_s.clone(),
+        paths: vec!["src/foo.cs".to_string()],
+        enable_coverage: Some(false),
+        run_all_tests: false,
+    };
+    let results = run_xunit_with_runner_and_exists(&ctx, &runner, &|_| true).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get_result(), "pass");
+    let empty = EngineContext {
+        project_root: root_s.clone(),
+        paths: Vec::new(),
+        enable_coverage: Some(false),
+        run_all_tests: false,
+    };
+    assert!(
+        run_xunit_with_runner_and_exists(&empty, &runner, &|_| true)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn csharp_run_executes_stages_past_injected_toolchain() {
+    // Same staging for the C# cover path (coverage disabled, so the
+    // plain xUnit future runs); no mapped projects returns empty.
+    let dir = xunit_fixture("csharp-run-ok");
+    let root_s = forward_slashes(dir.path());
+    let runner = |_: &[String], _: &str| CapturedOutput::new(0, "", "");
+    let ctx = EngineContext {
+        project_root: root_s.clone(),
+        paths: vec!["src/foo.cs".to_string()],
+        enable_coverage: Some(false),
+        run_all_tests: false,
+    };
+    let results = run_csharp_with_runner_and_exists(&ctx, &runner, &|_| true).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get_result(), "pass");
+    let empty = EngineContext {
+        project_root: root_s.clone(),
+        paths: Vec::new(),
+        enable_coverage: Some(false),
+        run_all_tests: false,
+    };
+    assert!(
+        run_csharp_with_runner_and_exists(&empty, &runner, &|_| true)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn csharp_run_generate_failure_short_circuits_later_stages() {
+    // Both Protobuild markers (`Build/` plus root `Protobuild.exe`)
+    // stage the generate stage; a nonzero Protobuild exit
+    // short-circuits build+test (early-Ok), so the runner sees exactly
+    // one call and the single "fail" carries the regenerate name.
+    let dir = xunit_fixture("csharp-gen-fail");
+    std::fs::create_dir_all(dir.path().join("Build")).unwrap();
+    std::fs::write(dir.path().join("Protobuild.exe"), "fake\n").unwrap();
+    let calls = AtomicUsize::new(0);
+    let runner = |_: &[String], _: &str| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        CapturedOutput::new(1, "", "")
+    };
+    let ctx = EngineContext {
+        project_root: forward_slashes(dir.path()),
+        paths: vec!["src/foo.cs".to_string()],
+        enable_coverage: Some(false),
+        run_all_tests: false,
+    };
+    let results = run_csharp_with_runner_and_exists(&ctx, &runner, &|_| true).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get_result(), "fail");
+    assert!(results[0].get_name().contains("regenerate"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn csharp_run_build_failure_skips_test_stage() {
+    // No Protobuild markers skips generate; a nonzero msbuild exit
+    // then short-circuits the test stage: one call, one "fail".
+    let dir = xunit_fixture("csharp-build-fail");
+    let calls = AtomicUsize::new(0);
+    let runner = |_: &[String], _: &str| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        CapturedOutput::new(1, "", "")
+    };
+    let ctx = EngineContext {
+        project_root: forward_slashes(dir.path()),
+        paths: vec!["src/foo.cs".to_string()],
+        enable_coverage: Some(false),
+        run_all_tests: false,
+    };
+    let results = run_csharp_with_runner_and_exists(&ctx, &runner, &|_| true).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].get_result(), "fail");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn xunit_prepare_run_all_walks_project_files() {
+    // run_all_tests walks the whole tree instead of ctx paths; the
+    // walked src/ file maps to the csproj, staging the walker arm.
+    let dir = xunit_fixture("xunit-run-all");
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/foo.cs"), "class X {}\n").unwrap();
+    let ctx = EngineContext {
+        project_root: forward_slashes(dir.path()),
+        paths: Vec::new(),
+        enable_coverage: Some(false),
+        run_all_tests: true,
+    };
+    let plan = prepare_xunit_run_with_merged_and_exists(&ctx, None, &|_| true).unwrap();
+    assert_eq!(plan.projects.len(), 1);
+    assert!(format!("{:?}", plan.projects[0]).contains("Tests.csproj"));
+}
+
+#[test]
+fn run_opts_in_config_selection_with_arcunit_fixture() {
+    // A `.arcunit` fixture stages the Config dispatch: zero engines
+    // means nothing spawns; the empty merge reports NoEffect (exit 0).
+    let dir = TempDir::new("arcunit-run");
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(args)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{args:?}: {stderr}");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@t.test"]);
+    git(&["config", "user.name", "t"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+    git(&["add", "a.txt"]);
+    git(&["commit", "-qm", "one"]);
+    std::fs::write(dir.path().join(".arcunit"), "{\"engines\": {}}").unwrap();
+    assert_eq!(
+        run_opts_in(&Options::default(), dir.path()),
+        ExitCode::SUCCESS
+    );
 }
 
 // --- Gap2: hg/svn selection (U1/U2) ---
@@ -4102,4 +4319,127 @@ fn run_single_selection_rejects_everything_for_pytest() {
         plan_run(&opts, &cwd),
         Ok(PlannedRun::Single { .. })
     ));
+}
+
+// -( T1176 PB-3 )----------------------------------------------------------------
+
+#[test]
+#[allow(clippy::join_absolute_paths)]
+fn validate_paths_absolute_join_is_identity() {
+    // White-box pin for the single-`exists` collapse in `validate_paths`:
+    // `Path::join` with an absolute path is identity (the linted call is
+    // the asserted behavior), so an absolute spelling resolves regardless
+    // of `cwd` and a missing one errors.
+    assert_eq!(
+        Path::new("/nonexistent-cwd").join("/abs/pinned.php"),
+        PathBuf::from("/abs/pinned.php")
+    );
+    let dir = TempDir::new("pb3-abs-identity");
+    std::fs::write(dir.path().join("f.php"), "<?php\n").unwrap();
+    let abs = dir.path().join("f.php").to_string_lossy().to_string();
+    // `cwd` lacks the file, so only the absolute identity resolves it.
+    let elsewhere = TempDir::new("pb3-abs-cwd");
+    let out = validate_paths(&[abs], elsewhere.path(), dir.path()).unwrap();
+    assert_eq!(out, vec!["f.php".to_string()]);
+    let missing = dir.path().join("missing.php").to_string_lossy().to_string();
+    let err = validate_paths(&[missing], dir.path(), dir.path()).unwrap_err();
+    assert!(err.ends_with("' does not exist!"), "{err}");
+}
+
+/// Deleted-cwd child oracle: the parent below re-runs only this probe
+/// with the cwd deleted, so the suite never chdirs itself. In a normal
+/// run the cwd is valid and the probe passes trivially.
+#[test]
+fn pb3_getcwd_probe_child_deleted_cwd() {
+    if std::env::current_dir().is_ok() {
+        return;
+    }
+    // getcwd fails: `unit_working_dir` reports the Exception envelope...
+    let err = super::unit_working_dir().unwrap_err();
+    assert_eq!(err, std::process::ExitCode::FAILURE);
+    // ...and `run` propagates it through the early return.
+    assert_eq!(super::run(&[]), std::process::ExitCode::FAILURE);
+    println!("PB3-GETCWD-PROBE-OK");
+}
+
+#[test]
+#[cfg(unix)]
+fn pb3_deleted_cwd_child_reports_getcwd_failure() {
+    // `unit_working_dir`'s Err arm plus `run`'s early return: a child
+    // whose cwd was deleted (sh-side `cd` plus `rmdir`, never the test
+    // process) re-runs the probe above, where getcwd fails.
+    let exe = std::env::current_exe().expect("test binary path");
+    let out = std::process::Command::new("sh")
+        .args([
+            "-c",
+            "d=$(mktemp -d); cd \"$d\"; rmdir \"$d\"; exec \"$@\"",
+            "sh",
+        ])
+        .arg(&exe)
+        .args(["--nocapture", "pb3_getcwd_probe_child_deleted_cwd"])
+        .output()
+        .expect("spawn deleted-cwd probe child");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success()
+            && stdout.contains("1 passed")
+            && stdout.contains("PB3-GETCWD-PROBE-OK")
+            && stderr.contains("cannot read current directory"),
+        "deleted-cwd probe child failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+}
+
+// Slow: runs `cargo test` in a fixture crate; CI coverage runs
+// `--run-ignored all`, so this still executes under coverage.
+#[test]
+#[ignore]
+fn pb3_run_opts_in_cargo_arm_fixture() {
+    // The `run_opts_in` Cargo arm: an explicit `--engine cargo` plans a
+    // cargo run, which executes `cargo test` (offline) in a fixture
+    // crate. The `.hg` marker passes the working-copy gate without
+    // touching real VCS state.
+    let dir = TempDir::new("pb3-cargo-arm");
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"t1176pb3fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src").join("lib.rs"),
+        "#[test]\nfn passes() {\n    assert_eq!(1 + 1, 2);\n}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join(".hg")).unwrap();
+    let opts = parse_args(&args(&["--engine", "cargo"])).unwrap();
+    assert!(matches!(plan_run(&opts, dir.path()), Ok(PlannedRun::Cargo)));
+    assert_eq!(
+        run_opts_in(&opts, dir.path()),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
+// Slow-suite slot: drives the `run_opts_in` Single arm end to end; CI
+// coverage runs `--run-ignored all`, so this still executes under
+// coverage.
+#[test]
+#[ignore]
+fn pb3_run_opts_in_single_arm_fixture() {
+    // The `run_opts_in` Single arm via a fixture engine that completes
+    // without spawning real tools: NoseTestEngine with one source path
+    // whose `tests/test_*` mapping is absent selects nothing, so the
+    // engine runs zero commands and the run succeeds.
+    let dir = TempDir::new("pb3-single-arm");
+    std::fs::create_dir_all(dir.path().join(".hg")).unwrap();
+    std::fs::write(dir.path().join("mod.py"), "x = 1\n").unwrap();
+    let opts = parse_args(&args(&["--engine", "NoseTestEngine", "mod.py"])).unwrap();
+    assert!(matches!(
+        plan_run(&opts, dir.path()),
+        Ok(PlannedRun::Single { .. })
+    ));
+    assert_eq!(
+        run_opts_in(&opts, dir.path()),
+        std::process::ExitCode::SUCCESS
+    );
 }

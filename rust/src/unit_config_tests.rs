@@ -30,11 +30,10 @@ fn parses_engines_map_with_rule_lists() {
 fn invalid_type_names_available_engines() {
     let data = r#"{"engines": {"a": {"type": "bogus"}}}"#;
     let err = parse_engine_specs(data, "/r/.arcunit", &["phutil", "nose"]).unwrap_err();
+    let message = err.message();
     assert!(
-        err.message()
-            .contains("Test engine 'a' specifies invalid type 'bogus'."),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+        message.contains("Test engine 'a' specifies invalid type 'bogus'."),
+        "{message}"
     );
     assert!(err.message().contains("phutil, nose"), "{}", err.message());
     assert!(matches!(err, EngineError::Usage(_)));
@@ -71,12 +70,12 @@ fn missing_type_and_bad_shapes_error() {
         "Error in parsing '.arcunit' file, for test engine 'a'.\nunknown key 'bogus'"
     );
     let err = parse_engine_specs("not json", "/r/.arcunit", &["phutil"]).unwrap_err();
+    let message = err.message();
     assert!(
-        err.message().starts_with(
+        message.starts_with(
             "Expected '.arcunit' file to be a valid JSON file, but failed to decode '/r/.arcunit'.\n"
         ),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+        "{message}"
     );
     let err = parse_engine_specs(r#"{"nope": 1}"#, "/r/.arcunit", &["phutil"]).unwrap_err();
     assert_eq!(

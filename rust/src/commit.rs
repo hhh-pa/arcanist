@@ -344,6 +344,16 @@ fn write_message_file(tag: &str, message: &str) -> Result<std::path::PathBuf, St
 /// Git flow (arc-rs extension): create a local commit from an explicit
 /// message. Unchanged behavior; prompting lives in the svn flow only.
 fn flow_git(dir: &Path, options: &Options) -> Result<String, String> {
+    flow_git_with(dir, options, None)
+}
+
+/// [`flow_git`] with the `git` program override injected (test seam;
+/// production passes `None`, which spawns `git`).
+fn flow_git_with(
+    dir: &Path,
+    options: &Options,
+    git_program: Option<&Path>,
+) -> Result<String, String> {
     let message = resolve_message(options)?;
     if options.show {
         return Ok(message);
@@ -357,7 +367,7 @@ fn flow_git(dir: &Path, options: &Options) -> Result<String, String> {
     if options.allow_empty {
         args.push("--allow-empty");
     }
-    let output = git::output(dir, &args);
+    let output = git::output_with_git(dir, &args, git_program);
     std::fs::remove_file(&file).ok();
     let output = output?;
     if !output.status.success() {
@@ -375,7 +385,7 @@ fn flow_git(dir: &Path, options: &Options) -> Result<String, String> {
     let summary = String::from_utf8_lossy(&output.stdout);
     let summary = summary.trim();
     if summary.is_empty() {
-        Ok("committed.\n".to_string()) // LCOV_EXCL_LINE // Reason: git prints a summary on success; empty success output unreachable
+        Ok("committed.\n".to_string())
     } else {
         Ok(format!("{summary}\n"))
     }

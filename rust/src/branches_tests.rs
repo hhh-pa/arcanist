@@ -240,14 +240,19 @@ fn b23_branches_help_matches_generated_format() {
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
 
+fn expect_execute_error(words: &[&str]) -> String {
+    match execute(&std::env::temp_dir(), &args(words)) {
+        Err(message) => message,
+        _ => panic!("expected parse error"),
+    }
+}
+
 #[test]
 fn r4_rbd4_parse_error_has_no_dump() {
     // `branches` runs in the toolset runtime: argument errors render
     // `USAGE EXCEPTION` (exit 1) with no usage dump.
-    match execute(&std::env::temp_dir(), &args(&["--bogus"])) {
-        Err(message) => assert!(!message.contains("usage:"), "{message}"),
-        _ => panic!("expected parse error"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the parse error always matches
-    }
+    let message = expect_execute_error(&["--bogus"]);
+    assert!(!message.contains("usage:"), "{message}");
     assert_eq!(
         run_in(&std::env::temp_dir(), &args(&["--bogus"])),
         std::process::ExitCode::FAILURE
@@ -409,24 +414,31 @@ fn execute_with_client_covers_help_and_usage_errors() {
 
 #[test]
 fn execute_core_hg_json_reaches_marker_list() {
-    // Under Mercurial `--json` renders through the marker list. The
-    // system `hg` backend is unassertable (presence varies), so both
-    // outcomes only pin their shapes.
+    // Under Mercurial `--json` renders through the marker list, staged
+    // here with a fake `hg` answering `arc-ls-markers` (no system hg).
     let dir = TempDir::new("hg-json");
     std::fs::create_dir(dir.path().join(".hg")).unwrap();
+    let script = dir.path().join("fakehg.sh");
+    std::fs::write(
+        &script,
+        "printf '%s' '[{\"type\":\"branch\",\"name\":\"default\",\"node\":\"0123456789abcdef0123456789abcdef01234567\",\"description\":\"first commit\",\"isActive\":true}]'\n",
+    )
+    .unwrap();
+    let hg_cmd = crate::hg::HgCommand::custom("sh", &[&script.to_string_lossy()]);
     let options = Options {
         all: false,
         json: true,
         conduit_uri: None,
     };
-    match execute_core(dir.path(), &options, None, None) {
-        // LCOV_EXCL_START // Reason: Ok arm needs system hg; absent on CI, the Err arm pins here
-        Ok(text) => {
-            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-            assert!(value.is_array(), "{text}"); // LCOV_EXCL_STOP
-        }
-        Err(message) => assert!(!message.is_empty()),
-    }
+    let text = execute_core(dir.path(), &options, None, None, &hg_cmd).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(value.is_array(), "{text}");
+    assert_eq!(value[0]["name"], "default");
+    assert_eq!(value[0]["current"], true);
+    assert_eq!(value[0]["hash"], "0123456");
+    assert_eq!(value[0]["subject"], "first commit");
+    // The ambient marker-list wrapper stays callable without a system hg.
+    let _ = markers::list(dir.path(), markers::MARKER_TYPE_BRANCH);
 }
 
 #[test]
@@ -466,4 +478,103 @@ fn git_helper_reports_failing_commands() {
     // A failing git invocation panics with the command and stderr.
     let tmp = TempDir::new("w6h-git-fail");
     git(tmp.path(), &["--bogus-flag-xyz"]);
+}
+
+#[test]
+#[should_panic(expected = "expected parse error")]
+fn r4_rbd4_parse_error_has_no_dump_defensive_ok_arm() {
+    // `expect_execute_error` unwraps `Err`: `--help` (past `--`) succeeds.
+    expect_execute_error(&["--help", "--"]);
+}
+
+/// Serve canned conduit responses in order, recording request bodies.
+fn serve_seq(canned: Vec<String>) -> (String, std::sync::mpsc::Receiver<Vec<String>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for body in canned {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8(head).unwrap();
+            let len: usize = head
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                })
+                .unwrap_or(0);
+            let mut raw = vec![0u8; len];
+            stream.read_exact(&mut raw).unwrap();
+            seen.push(String::from_utf8(raw).unwrap());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+        tx.send(seen).unwrap();
+    });
+    (base, rx)
+}
+
+/// The arcrc host key for a stub base, mirroring
+/// `config::host_key` (`{scheme}://{authority}/api/`).
+fn host_key_for(base: &str) -> String {
+    let after_scheme = base.split("://").nth(1).unwrap_or(base);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    let scheme = base.split("://").next().unwrap_or("https");
+    format!("{scheme}://{authority}/api/")
+}
+
+/// Fake arcrc granting a token for the stub `base`.
+fn fake_arcrc(dir: &Path, base: &str) -> std::path::PathBuf {
+    let path = dir.join("fake.arcrc");
+    let key = host_key_for(base);
+    std::fs::write(
+        &path,
+        format!(r#"{{"hosts": {{"{key}": {{"token": "x"}}}}}}"#),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn run_in_maps_auth_failures_to_login_guidance() {
+    let repo = init_repo("autharm");
+    let sha = git(repo.path(), &["rev-parse", "HEAD"]);
+    git(
+        repo.path(),
+        &["remote", "add", "origin", "git@h.test:repo.git"],
+    );
+    git(
+        repo.path(),
+        &["update-ref", "refs/remotes/origin/main", &sha],
+    );
+    let auth_err =
+        r#"{"result": null, "error_code": "ERR-INVALID-AUTH", "error_info": "bad token"}"#
+            .to_string();
+    // One `diffusion.repository.search` per run below.
+    let (base, rx) = serve_seq(vec![auth_err.clone(), auth_err]);
+    let arcrc = fake_arcrc(repo.path(), &base);
+    let argv = args(&["--conduit-uri", base.as_str(), "--"]);
+    assert_eq!(
+        run_in_with_user_file(repo.path(), &argv, Some(&arcrc)),
+        ExitCode::FAILURE
+    );
+    // The underlying failure carries the auth code (not a fatal).
+    let err = execute_with_user_file(repo.path(), &argv, Some(&arcrc)).unwrap_err();
+    assert!(err.starts_with("ERR-INVALID-AUTH:"), "{err}");
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(seen.len(), 2);
 }

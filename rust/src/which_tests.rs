@@ -672,22 +672,16 @@ fn context_covers_repos_and_plain_dirs() {
 fn args_cover_flags_ranges_and_unported() {
     assert!(matches!(parse_args(&[]), Parsed::Options(_)));
     assert!(matches!(parse_args(&["--help".to_string()]), Parsed::Help));
-    match parse_args(&["--base".to_string(), "arc:upstream".to_string()]) {
-        Parsed::Options(opts) => assert_eq!(opts.base_rules.as_deref(), Some("arc:upstream")),
-        _ => panic!("expected --base options"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    }
-    match parse_args(&["--base=arc:empty".to_string()]) {
-        Parsed::Options(opts) => assert_eq!(opts.base_rules.as_deref(), Some("arc:empty")),
-        _ => panic!("expected --base= options"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    }
+    let opts = expect_which_options(&["--base", "arc:upstream"], "--base options");
+    assert_eq!(opts.base_rules.as_deref(), Some("arc:upstream"));
+    let opts = expect_which_options(&["--base=arc:empty"], "--base= options");
+    assert_eq!(opts.base_rules.as_deref(), Some("arc:empty"));
     assert!(matches!(
         parse_args(&["--base".to_string()]),
         Parsed::Error(_)
     ));
-    match parse_args(&["--any-status".to_string()]) {
-        Parsed::Options(opts) => assert!(opts.any_status),
-        _ => panic!("expected --any-status options"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    }
+    let opts = expect_which_options(&["--any-status"], "--any-status options");
+    assert!(opts.any_status);
     assert!(matches!(
         parse_args(&["--bogus".to_string()]),
         Parsed::Error(_)
@@ -702,35 +696,20 @@ fn args_cover_flags_ranges_and_unported() {
     ));
     // T1153 RB-D16: parsing collects every positional; the count
     // check runs after the repository section prints.
-    match parse_args(&["a".to_string(), "b".to_string()]) {
-        Parsed::Options(opts) => {
-            assert_eq!(opts.commits, vec!["a".to_string(), "b".to_string()])
-        }
-        _ => panic!("expected two-commit options"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    }
-    match parse_args(&[
-        "abc123".to_string(),
-        "--head".to_string(),
-        "HEAD".to_string(),
-    ]) {
-        Parsed::Options(opts) => {
-            assert_eq!(opts.commits, vec!["abc123".to_string()]);
-            assert_eq!(opts.head, "HEAD");
-        }
-        _ => panic!("expected options"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    }
+    let opts = expect_which_options(&["a", "b"], "two-commit options");
+    assert_eq!(opts.commits, vec!["a".to_string(), "b".to_string()]);
+    let opts = expect_which_options(&["abc123", "--head", "HEAD"], "options");
+    assert_eq!(opts.commits, vec!["abc123".to_string()]);
+    assert_eq!(opts.head, "HEAD");
     // T1153 RB-D25: `--flag=value` works for `--head` and
     // `--conduit-uri` too.
-    match parse_args(&["--head=abc123".to_string()]) {
-        Parsed::Options(opts) => assert_eq!(opts.head, "abc123"),
-        _ => panic!("expected --head= options"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    }
-    match parse_args(&["--conduit-uri=https://h.test/api/".to_string()]) {
-        Parsed::Options(opts) => {
-            assert_eq!(opts.conduit_uri.as_deref(), Some("https://h.test/api/"))
-        }
-        _ => panic!("expected --conduit-uri= options"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    }
+    let opts = expect_which_options(&["--head=abc123"], "--head= options");
+    assert_eq!(opts.head, "abc123");
+    let opts = expect_which_options(
+        &["--conduit-uri=https://h.test/api/"],
+        "--conduit-uri= options",
+    );
+    assert_eq!(opts.conduit_uri.as_deref(), Some("https://h.test/api/"));
 }
 
 #[test]
@@ -1829,11 +1808,8 @@ fn rbd16_range_section_bytes() {
     // Empty ranges keep the placeholder.
     let mut empty = range.clone();
     empty.commits.clear();
-    assert!(
-        render_range(&empty, "", None, false).contains("    (No commits.)\n\n\n"),
-        "{}",
-        render_range(&empty, "", None, false) // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    let rendered = render_range(&empty, "", None, false);
+    assert!(rendered.contains("    (No commits.)\n\n\n"), "{rendered}");
 }
 
 // -( Wave 6 coverage: staged runners, separator, log failure, author arms )----
@@ -1844,6 +1820,21 @@ fn options_of(argv: &[&str]) -> Options {
         Parsed::Options(opts) => opts,
         Parsed::Help => panic!("unexpected help for {argv:?}"),
         Parsed::Error(message) => panic!("unexpected parse error for {argv:?}: {message}"),
+    }
+}
+
+fn expect_which_options(argv: &[&str], what: &str) -> Options {
+    let owned: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+    match parse_args(&owned) {
+        Parsed::Options(opts) => opts,
+        _ => panic!("expected {what}"),
+    }
+}
+
+fn expect_log_err(dir: &Path, base: &str, head: &str) -> String {
+    match local_commit_information(dir, base, head) {
+        Ok(_) => panic!("expected log failure"),
+        Err(message) => message,
     }
 }
 
@@ -2050,13 +2041,11 @@ fn w6_run_json_context_error_outside_repo() {
 #[test]
 fn w6_double_dash_collects_positionals() {
     // Everything after `--` is a positional, even flag shapes.
-    match parse_args(&["--".to_string(), "abc123".to_string(), "--head".to_string()]) {
-        Parsed::Options(opts) => assert_eq!(
-            opts.commits,
-            vec!["abc123".to_string(), "--head".to_string()]
-        ),
-        _ => panic!("expected options"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    }
+    let opts = expect_which_options(&["--", "abc123", "--head"], "options");
+    assert_eq!(
+        opts.commits,
+        vec!["abc123".to_string(), "--head".to_string()]
+    );
 }
 
 #[test]
@@ -2065,10 +2054,7 @@ fn w6_local_log_failure_reports_command() {
     // `CommandException` text names the command and exit code.
     let repo = fresh_repo("w6logfail");
     commit(&repo.path, "a.txt");
-    let err = match local_commit_information(&repo.path, "zzz-no-such-rev", "HEAD") {
-        Ok(_) => panic!("expected log failure"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the log failure always matches
-        Err(message) => message,
-    };
+    let err = expect_log_err(&repo.path, "zzz-no-such-rev", "HEAD");
     assert!(
         err.starts_with(
             "Command failed with error #128!\nCOMMAND\ngit log HEAD --not zzz-no-such-rev"
@@ -2673,11 +2659,8 @@ fn t1170_matching_queries_explicit_ids_and_whoami() {
     assert_eq!(matched.len(), 2);
     assert_eq!(matched[0].monogram, "D77");
     assert_eq!(matched[0].author, None);
-    assert!(
-        matched[0].why.contains("explicit 'Differential Revision'"),
-        "{}",
-        matched[0].why // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    let why = &matched[0].why;
+    assert!(why.contains("explicit 'Differential Revision'"), "{why}");
     assert_eq!(matched[1].monogram, "D78");
     assert_eq!(matched[1].author.as_deref(), Some("bob"));
     let (request, body) = seen.recv().unwrap();
@@ -2811,15 +2794,11 @@ fn t1170_render_uses_ambient_ansi() {
 
 #[test]
 fn t1170_conduit_uri_takes_a_separate_value() {
-    match parse_args(&[
-        "--conduit-uri".to_string(),
-        "https://h.test/api/".to_string(),
-    ]) {
-        Parsed::Options(opts) => {
-            assert_eq!(opts.conduit_uri.as_deref(), Some("https://h.test/api/"))
-        }
-        _ => panic!("expected --conduit-uri options"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    }
+    let opts = expect_which_options(
+        &["--conduit-uri", "https://h.test/api/"],
+        "--conduit-uri options",
+    );
+    assert_eq!(opts.conduit_uri.as_deref(), Some("https://h.test/api/"));
 }
 
 fn t1170_arcrc_with_token(path: &Path, mock_base: &str) {
@@ -2951,4 +2930,20 @@ fn git_helper_reports_failing_commands() {
     // A failing git invocation panics with the command and stderr.
     let tmp = TempDir::new("w6h-git-fail");
     git(&tmp.path, &["--bogus-flag-xyz"]);
+}
+
+#[test]
+#[should_panic(expected = "expected --base options")]
+fn args_cover_flags_ranges_and_unported_defensive_error_arm() {
+    // `expect_which_options` unwraps `Options`: an unknown flag panics.
+    expect_which_options(&["--bogus"], "--base options");
+}
+
+#[test]
+#[should_panic(expected = "expected log failure")]
+fn w6_local_log_failure_reports_command_defensive_ok_arm() {
+    // `expect_log_err` unwraps `Err`: a resolvable base panics.
+    let repo = fresh_repo("w6h-log-ok");
+    commit(&repo.path, "a.txt");
+    expect_log_err(&repo.path, "HEAD", "HEAD");
 }

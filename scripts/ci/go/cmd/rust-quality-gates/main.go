@@ -716,6 +716,12 @@ func upgradeLCOVWithCanonical(env []string, workspace, reportDir string) (bool, 
 	if err != nil {
 		return false, fmt.Errorf("LCOV exclusion markers: %w", err)
 	}
+	// Drop uncoverable bare-brace zeros (T1176 DEMARK S3) from the
+	// published artifact only, like the marker filter above.
+	filtered, err = lcov.ApplyBareBraceFilter(filtered, workspace)
+	if err != nil {
+		return false, fmt.Errorf("LCOV bare-brace filter: %w", err)
+	}
 	lcovPath := filepath.Join(reportDir, "lcov.info")
 	data, err := os.ReadFile(lcovPath)
 	if err != nil {

@@ -696,6 +696,12 @@ fn confirm_interactive(query: &str) -> Result<bool, String> {
 
 /// Entry point: `argv` excludes the subcommand name.
 pub fn run(argv: &[String]) -> ExitCode {
+    run_with_user_file(argv, config::arcrc_path().as_deref())
+}
+
+/// [`run`] with an explicit credential file (test seam: hermetic
+/// tests stage a fake arcrc instead of touching HOME).
+fn run_with_user_file(argv: &[String], user_file: Option<&Path>) -> ExitCode {
     let mut options = match parse_args(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
@@ -707,16 +713,37 @@ pub fn run(argv: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let client = match config::client_for(options.conduit_uri.as_deref()) {
-        Ok(client) => client, // LCOV_EXCL_LINE // Reason: needs a configured conduit client; hermetic tests cannot mint one (HOME is process-global)
+    // Byte-identical to `config::client_for(..)` when the wrapper
+    // passes the ambient user file (same cwd fallback).
+    let config_dir = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    let client = match config::client_for_with(
+        options.conduit_uri.as_deref(),
+        &config_dir,
+        user_file,
+        &get_config::LoadOptions::default(),
+    ) {
+        Ok(client) => client,
         Err(msg) => {
             eprintln!("arc {NAME}: {msg}");
             return ExitCode::FAILURE;
         }
     };
-    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf()); // LCOV_EXCL_START // Reason: live run body; needs conduit creds plus network plus a TTY confirm
+    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    run_live(&cwd, &client, &mut options, &confirm_interactive)
+}
+
+/// Live close over an explicit directory and confirm hook: `--finalize`
+/// repository resolution, then [`execute_in`]. Test seam: hermetic tests
+/// stage a TempDir, a stub client, and a canned confirm instead of the
+/// process directory, conduit creds, and a TTY prompt.
+fn run_live(
+    dir: &Path,
+    client: &conduit::Client,
+    options: &mut Options,
+    confirm: &dyn Fn(&str) -> Result<bool, String>,
+) -> ExitCode {
     if options.finalize {
-        match resolve_repository_phid(&client, &cwd) {
+        match resolve_repository_phid(client, dir) {
             Ok(phid) => options.repository_phid = phid,
             Err(msg) => {
                 eprintln!("arc {NAME}: {msg}");
@@ -724,7 +751,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             }
         }
     }
-    match execute_in(&cwd, &client, &options, &confirm_interactive) {
+    match execute_in(dir, client, options, confirm) {
         Ok(report) => {
             print!("{}", report.stdout);
             eprint!("{}", report.stderr);
@@ -732,7 +759,7 @@ pub fn run(argv: &[String]) -> ExitCode {
         }
         Err(msg) => {
             eprintln!("arc {NAME}: {msg}");
-            ExitCode::FAILURE // LCOV_EXCL_STOP
+            ExitCode::FAILURE
         }
     }
 }

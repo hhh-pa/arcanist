@@ -428,3 +428,23 @@ fn cmd_shim_binaries_route_through_cmd() {
             .is_empty()
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn temp_write_failure_reports_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new("temp-fail");
+    let tool = tmp.path().join("fake-csslint");
+    std::fs::write(&tool, b"x").unwrap();
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let linter = CsslintLinter {
+        binary: Some(tool),
+        temp_dir: Some(locked.clone()),
+        ..Default::default()
+    };
+    assert!(linter.lint_bytes("a.css", b".a { color: red; }").is_empty());
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+}

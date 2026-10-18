@@ -409,10 +409,7 @@ pub fn parse_phpunit_results(
     let mut last_test_finished = true;
     let mut last_event: Option<&JsonValue> = None;
     let empty: &[JsonValue] = &[];
-    let events = match &report {
-        JsonValue::Arr(items) => items.as_slice(),
-        _ => empty, // LCOV_EXCL_LINE // Reason: dead: get_json_report always wraps the report in an array
-    };
+    let events = report.as_arr().unwrap_or(empty);
     for event in events {
         last_event = Some(event);
         match event.get("event").and_then(JsonValue::as_str) {

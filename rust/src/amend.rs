@@ -911,10 +911,16 @@ fn write_message_file(tag: &str, message: &str) -> Result<std::path::PathBuf, St
 /// Rewrite the HEAD message via `git commit --amend`, returning git's
 /// summary.
 fn amend_git(dir: &Path, message: &str) -> Result<String, String> {
+    amend_git_with(dir, message, None)
+}
+
+/// [`amend_git`] with the `git` program override injected (test seam;
+/// production passes `None`, which spawns `git`).
+fn amend_git_with(dir: &Path, message: &str, git_program: Option<&Path>) -> Result<String, String> {
     let file = write_message_file("amend", message)?;
     let path = file.to_string_lossy().to_string();
     let args: Vec<&str> = vec!["commit", "--amend", "--allow-empty", "-F", path.as_str()];
-    let output = git::output(dir, &args);
+    let output = git::output_with_git(dir, &args, git_program);
     std::fs::remove_file(&file).ok();
     let output = output?;
     if !output.status.success() {
@@ -932,7 +938,7 @@ fn amend_git(dir: &Path, message: &str) -> Result<String, String> {
     let summary = String::from_utf8_lossy(&output.stdout);
     let summary = summary.trim();
     if summary.is_empty() {
-        Ok("amended.\n".to_string()) // LCOV_EXCL_LINE // Reason: git prints a summary on success; empty success output unreachable
+        Ok("amended.\n".to_string())
     } else {
         Ok(format!("{summary}\n"))
     }
@@ -992,7 +998,7 @@ fn flow_git(
     let (client, revision) = resolve_revision(options, io, &hints, "gtcm", ansi)?;
     if !options.show {
         announce_and_confirm(io, &client, options, &revision, &hints, "gtcm", ansi)?;
-    } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
+    }
     let message = message_for_revision(&client, &revision)?;
     finish_git(dir, options, &message)
 }
@@ -1015,7 +1021,7 @@ fn flow_hg(
     let (client, revision) = resolve_revision(options, io, &hints, "hgcm", ansi)?;
     if !options.show {
         announce_and_confirm(io, &client, options, &revision, &hints, "hgcm", ansi)?;
-    } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
+    }
     let message = message_for_revision(&client, &revision)?;
     finish_hg(dir, options, hg, &message)
 }

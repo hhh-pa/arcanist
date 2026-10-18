@@ -559,9 +559,9 @@ pub fn select_source(options: &Options) -> Result<Source, String> {
         .as_deref()
         .filter(|revision| !revision.is_empty())
     {
-        sources.push(Source::Revision(normalize_numeric_id(
-            "revision", revision,
-        )?)); // LCOV_EXCL_LINE // Reason: dead arm; normalize_numeric_id always returns Ok
+        let revision = normalize_numeric_id("revision", revision)
+            .expect("normalize_numeric_id always returns Ok");
+        sources.push(Source::Revision(revision));
     }
     if sources.is_empty() {
         return Err(
@@ -968,13 +968,13 @@ pub fn read_patch_bytes(path: &str, io: &mut Io) -> Result<Vec<u8>, String> {
     if path == "-" {
         if let Some(scripted) = io.patch_stdin.clone() {
             return Ok(scripted.into_bytes());
-        } // LCOV_EXCL_START // Reason: reads real stdin (blocks on a terminal); tests inject patch_stdin instead
+        }
         use std::io::Read;
         let mut bytes = Vec::new();
         std::io::stdin()
             .read_to_end(&mut bytes)
             .map_err(|e| format!("Failed to read patch from stdin: {e}"))?;
-        return Ok(bytes); // LCOV_EXCL_STOP
+        return Ok(bytes);
     }
     std::fs::read(path).map_err(|e| format!("Failed to read patch file '{path}': {e}"))
 }
@@ -1738,9 +1738,6 @@ fn base85_encode_groups(chunk: &[u8], buf: &mut String) {
     while remaining > 0 {
         let mut accum: u32 = 0;
         for shift in [24u32, 16, 8, 0] {
-            if remaining == 0 {
-                break; // LCOV_EXCL_LINE // Reason: dead break; the post-decrement check below always fires first
-            }
             accum += u32::from(chunk[pos]) << shift;
             pos += 1;
             remaining -= 1;
@@ -2771,20 +2768,11 @@ pub fn hg_tree_status(dir: &Path, hg: &hg::HgCommand, args: &[&str]) -> Result<T
         if mask & hg::FLAG_UNTRACKED == 0 {
             mask |= hg::FLAG_UNCOMMITTED;
         }
-        if mask & hg::FLAG_CONFLICT != 0 {
-            status.conflicts.push(path.clone()); // LCOV_EXCL_LINE // Reason: dead arm; conflicts split out before parsing and no status code sets this flag
-        }
         if mask & hg::FLAG_MISSING != 0 {
             status.missing.push(path.clone());
         }
-        if mask & hg::FLAG_UNSTAGED != 0 {
-            status.unstaged.push(path.clone()); // LCOV_EXCL_LINE // Reason: dead arm; hg status sets no unstaged flag (no index)
-        }
         if mask & hg::FLAG_UNCOMMITTED != 0 {
             status.uncommitted.push(path.clone());
-        }
-        if mask & hg::FLAG_EXTERNALS != 0 {
-            status.externals.push(path.clone()); // LCOV_EXCL_LINE // Reason: dead arm; hg status sets no externals flag
         }
         if mask & hg::FLAG_UNTRACKED != 0 {
             status.untracked.push(path);
@@ -3036,8 +3024,8 @@ pub fn require_clean_tree_with_call(
         return Ok(StashState::Clean);
     }
     resolve_uncommitted_tree(dir, vcs, backends, io, &status, &desc, call, &|template| {
-        diff::edit_interactively(template, EDITOR_COMMIT_MESSAGE, None, None, 0) // LCOV_EXCL_START // Reason: real-editor closure; invoking it needs an interactive editor session
-    }) // LCOV_EXCL_STOP
+        diff::edit_interactively(template, EDITOR_COMMIT_MESSAGE, None, None, 0)
+    })
 }
 
 /// Fail on incomplete directories, conflicts, and missing files with the
@@ -3189,10 +3177,15 @@ fn git_head_info(dir: &Path) -> Result<Option<HeadInfo>, String> {
     }
     let out = git::stdout_text(dir, &["log", "-1", "--format=%H\x01%an\x01%B", "--"])?;
     let mut parts = out.splitn(3, '\x01');
-    let (Some(hash), Some(author), Some(message)) = (parts.next(), parts.next(), parts.next())
-    else {
-        return Err("malformed git log output".to_string()); // LCOV_EXCL_LINE // Reason: dead arm; git log with a fixed --format always yields three fields on success
-    };
+    let hash = parts
+        .next()
+        .expect("git log with a fixed --format always yields three fields on success");
+    let author = parts
+        .next()
+        .expect("git log with a fixed --format always yields three fields on success");
+    let message = parts
+        .next()
+        .expect("git log with a fixed --format always yields three fields on success");
     Ok(Some(HeadInfo {
         hash: hash.to_string(),
         author: author.to_string(),
@@ -3497,9 +3490,6 @@ fn commit_yes_path_changes(
         return Err(MUST_PROVIDE_MESSAGE.to_string());
     }
     let stripped = diff_local::remove_comments(&edited);
-    if stripped.is_empty() {
-        return Err(MUST_PROVIDE_NONEMPTY_MESSAGE.to_string()); // LCOV_EXCL_LINE // Reason: dead arm; remove_comments always returns at least a newline, so stripped is never empty
-    }
     match vcs {
         Vcs::Git => git::do_commit(dir, &stripped),
         Vcs::Hg => hg::do_commit_with(dir, &backends.hg, &stripped),
@@ -4177,10 +4167,26 @@ pub fn git_cherry_pick_temp_ansi(
     new_branch: &str,
     ansi: bool,
 ) -> Result<(), String> {
+    git_cherry_pick_temp_ansi_with_git(dir, io, original_branch, new_branch, ansi, None)
+}
+
+/// [`git_cherry_pick_temp_ansi`] with the `git` program for the
+/// cherry-pick spawn overridden (test seam; production passes `None`,
+/// which spawns `git`). Only the cherry-pick spawn takes the override;
+/// the checkout, submodule updates, and branch cleanup always run the
+/// system binary.
+pub fn git_cherry_pick_temp_ansi_with_git(
+    dir: &Path,
+    io: &mut Io,
+    original_branch: &str,
+    new_branch: &str,
+    ansi: bool,
+    git: Option<&Path>,
+) -> Result<(), String> {
     git::stdout_text(dir, &["checkout", original_branch, "--"])?;
     git_submodule_update(dir, io)?;
     let mut failure: Option<String> = None;
-    match git::output(dir, &["cherry-pick", "--", new_branch]) {
+    match git::output_with_git(dir, &["cherry-pick", "--", new_branch], git) {
         Ok(output) if output.status.success() => {
             if let Err(error) = git_submodule_update(dir, io) {
                 failure = Some(error);
@@ -4193,10 +4199,9 @@ pub fn git_cherry_pick_temp_ansi(
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
-        // LCOV_EXCL_START // Reason: needs the git spawn itself to fail; git is always present in tests
         Err(error) => {
             failure = Some(error);
-        } // LCOV_EXCL_STOP
+        }
     }
     git::output(dir, &["branch", "-D", "--", new_branch]).ok();
     if let Some(detail) = failure {
@@ -4267,7 +4272,7 @@ fn resolve_commit_message_interactive(
     resolve_commit_message_with_editor(
         bundle,
         call,
-        Some(&|template| diff::edit_interactively(template, EDITOR_PATCH_COMMIT, None, None, 0)), // LCOV_EXCL_LINE // Reason: real-editor closure; invoking it needs an interactive editor session
+        Some(&|template| diff::edit_interactively(template, EDITOR_PATCH_COMMIT, None, None, 0)),
     )
 }
 
@@ -5825,34 +5830,33 @@ pub fn maybe_create_branch(
     if !want {
         return Ok(BranchState::default());
     }
-    match vcs {
-        Vcs::Git => {
-            let original = git::branch_name(dir)
-                .ok()
-                .flatten()
-                .or_else(|| git::canonical_revision_name(dir, "HEAD").ok());
-            let new = git_create_branch(dir, bundle, has_base_local, io)?;
-            Ok(BranchState {
-                original,
-                new: Some(new),
-            })
-        }
-        Vcs::Hg => {
-            let bookmarks =
-                hg::stdout_text_with(dir, &backends.hg, &["bookmarks"]).unwrap_or_default();
-            let original = land::parse_hg_bookmarks(&bookmarks)
-                .into_iter()
-                .find(|(_, active)| *active)
-                .map(|(name, _)| name)
-                .or_else(|| hg_canonical(dir, &backends.hg, ".").ok());
-            let new = hg_create_bookmark(dir, &backends.hg, bundle, has_base_local, io)?;
-            Ok(BranchState {
-                original,
-                new: Some(new),
-            })
-        }
-        Vcs::Svn => Ok(BranchState::default()), // LCOV_EXCL_LINE // Reason: dead arm; can_branch(Svn) is false so svn always early-returns above
+    if vcs == Vcs::Git {
+        let original = git::branch_name(dir)
+            .ok()
+            .flatten()
+            .or_else(|| git::canonical_revision_name(dir, "HEAD").ok());
+        let new = git_create_branch(dir, bundle, has_base_local, io)?;
+        return Ok(BranchState {
+            original,
+            new: Some(new),
+        });
     }
+    debug_assert_eq!(
+        vcs,
+        Vcs::Hg,
+        "can_branch(Svn) is false so svn always early-returns above"
+    );
+    let bookmarks = hg::stdout_text_with(dir, &backends.hg, &["bookmarks"]).unwrap_or_default();
+    let original = land::parse_hg_bookmarks(&bookmarks)
+        .into_iter()
+        .find(|(_, active)| *active)
+        .map(|(name, _)| name)
+        .or_else(|| hg_canonical(dir, &backends.hg, ".").ok());
+    let new = hg_create_bookmark(dir, &backends.hg, bundle, has_base_local, io)?;
+    Ok(BranchState {
+        original,
+        new: Some(new),
+    })
 }
 
 /// Plan revision-dependency child options oldest-first (the planning
@@ -6074,6 +6078,27 @@ fn run_patch_flow(
     backends: &Backends,
     ansi: bool,
 ) -> Result<FlowOutcome, String> {
+    run_patch_flow_with(
+        dir,
+        options,
+        io,
+        backends,
+        ansi,
+        config::arcrc_path().as_deref(),
+    )
+}
+
+/// [`run_patch_flow`] with an explicit credential file (test seam:
+/// hermetic tests stage a fake arcrc plus a loopback stub instead of
+/// touching HOME).
+fn run_patch_flow_with(
+    dir: &Path,
+    options: &Options,
+    io: &mut Io,
+    backends: &Backends,
+    ansi: bool,
+    user_file: Option<&Path>,
+) -> Result<FlowOutcome, String> {
     let source = select_source(options)?;
     let Some(vcs) = detect_vcs(dir) else {
         return Err(NOT_A_WORKING_COPY.to_string());
@@ -6082,14 +6107,14 @@ fn run_patch_flow(
     // Built before the clean check, like PHP's workflow setup: conduit
     // errors precede worktree errors, and amend detection (PATCH-P9) can
     // run the published-check. `--patch` sources stay conduit-less.
-    let client = setup_patch_client(&source, options, dir)?;
+    let client = setup_patch_client_with(&source, options, dir, user_file)?;
     let call = |method: &str, params: &serde_json::Value| {
-        client // LCOV_EXCL_START // Reason: live conduit call body; tests use --patch sources (client None) since conduit needs creds
+        client
             .as_ref()
             .expect("conduit client")
             .call(method, params)
             .map_err(|e| e.to_string())
-    }; // LCOV_EXCL_STOP
+    };
     let call_option: Option<&diff_submit::ConduitCall<'_>> = client
         .as_ref()
         .map(|_| &call as &dyn Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>);
@@ -6107,7 +6132,7 @@ fn run_patch_flow(
         options,
         call_option,
         &mut loaded,
-    )?; // LCOV_EXCL_LINE // Reason: encoding lookup fails only through live conduit; --patch flows carry no client
+    )?;
     let outcome = run_patch_flow_inner(dir, options, io, backends, vcs, ansi, call_option, loaded);
     let pop = unstash_changes(dir, stash);
     combine_patch_flow_outcome(outcome, pop)
@@ -6115,17 +6140,35 @@ fn run_patch_flow(
 
 /// Conduit client for the flow, built before the clean check so conduit
 /// errors precede worktree errors. `--patch` sources stay conduit-less.
-fn setup_patch_client(
+/// Takes an explicit credential file (test seam: hermetic tests stage a
+/// fake arcrc instead of touching HOME); same URI precedence and
+/// token lookup as the classic ambient setup.
+fn setup_patch_client_with(
     source: &Source,
     options: &Options,
     dir: &Path,
+    user_file: Option<&Path>,
 ) -> Result<Option<arc_rs::conduit::Client>, String> {
     match source {
         Source::Patch(_) => Ok(None),
-        _ => Ok(Some(land::client_for_dir(
-            options.conduit_uri.as_deref(),
-            dir,
-        )?)),
+        _ => {
+            let uri = land::resolve_conduit_uri_with(
+                options.conduit_uri.as_deref(),
+                dir,
+                user_file,
+                &get_config::LoadOptions::default(),
+            )
+            .ok_or_else(|| {
+                "no conduit URI: pass --conduit-uri, set ARC_CONDUIT_URI, or run inside a project \
+                 with .arcconfig"
+                    .to_string()
+            })?;
+            let token = user_file
+                .and_then(|path| config::token_for_file(path, &uri))
+                .ok_or_else(|| format!("no token for {uri} in ~/.arcrc"))?;
+            let client = arc_rs::conduit::Client::new(&uri, &token).map_err(|e| e.to_string())?;
+            Ok(Some(client))
+        }
     }
 }
 
@@ -6190,9 +6233,8 @@ fn load_bundle_with_reauth(
 ) -> Result<LoadedBundle, String> {
     match load_bundle(source, options, io, call_option) {
         Err(error) if is_invalid_session_error(&error) => {
-            let Some(call) = call_option else {
-                return Err(error); // LCOV_EXCL_LINE // Reason: dead arm; session errors arise only from conduit calls, which require call=Some
-            };
+            let call = call_option
+                .expect("session errors arise only from conduit calls, which require call=Some");
             reauthenticate_patch_conduit(call)?;
             load_bundle(source, options, io, call_option)
         }
@@ -6275,6 +6317,16 @@ fn run_patch_flow_inner(
     )
 }
 
+/// Fold one dependency child outcome into the parent flow: an applied
+/// child continues the loop, while svn hunk failures abort the parent
+/// with the empty error.
+fn combine_dependency_child_outcome(outcome: FlowOutcome) -> Result<(), String> {
+    match outcome {
+        FlowOutcome::Done => Ok(()),
+        FlowOutcome::SvnHunksFailed => Err(String::new()),
+    }
+}
+
 /// Apply revision dependencies oldest-first when the base is not local and
 /// the bundle/options/VCS call for it.
 #[allow(clippy::too_many_arguments)]
@@ -6294,10 +6346,8 @@ fn run_patch_dependencies(
         let children =
             plan_dependency_children_with(dir, vcs, bundle, options, io, call_ref, backends)?;
         for child_options in &children {
-            match run_patch_flow(dir, child_options, io, backends, ansi)? {
-                FlowOutcome::Done => {} // LCOV_EXCL_START // Reason: dependency children need conduit (revision sources); without creds the child errors before returning an outcome
-                FlowOutcome::SvnHunksFailed => return Err(String::new()), // LCOV_EXCL_STOP
-            }
+            let outcome = run_patch_flow(dir, child_options, io, backends, ansi)?;
+            combine_dependency_child_outcome(outcome)?;
         }
     }
     Ok(())
@@ -6431,6 +6481,27 @@ pub fn execute_with_io_ansi(
     backends: &Backends,
     ansi: bool,
 ) -> Result<Out, String> {
+    execute_with_io_ansi_and_user_file(
+        dir,
+        argv,
+        io,
+        backends,
+        ansi,
+        config::arcrc_path().as_deref(),
+    )
+}
+
+/// [`execute_with_io_ansi`] with an explicit credential file (test
+/// seam: hermetic tests stage a fake arcrc plus a loopback stub
+/// instead of touching HOME).
+fn execute_with_io_ansi_and_user_file(
+    dir: &Path,
+    argv: &[String],
+    io: &mut Io,
+    backends: &Backends,
+    ansi: bool,
+    user_file: Option<&Path>,
+) -> Result<Out, String> {
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => {
@@ -6440,28 +6511,32 @@ pub fn execute_with_io_ansi(
         Err(message) => return Err(format!("{message}\n\n{}", usage())),
     };
     if options.preview {
-        return execute_preview(dir, &options, io);
+        return execute_preview_with(dir, &options, io, user_file);
     }
-    match run_patch_flow(dir, &options, io, backends, ansi)? {
+    match run_patch_flow_with(dir, &options, io, backends, ansi, user_file)? {
         FlowOutcome::Done => Ok(std::mem::take(&mut io.out)),
         FlowOutcome::SvnHunksFailed => Err(String::new()),
     }
 }
 
 /// Print the patch for `--preview` without touching the working copy.
-fn execute_preview(dir: &Path, options: &Options, io: &mut Io) -> Result<Out, String> {
+/// Takes an explicit credential file (test seam: hermetic tests stage
+/// a fake arcrc plus a loopback stub instead of touching HOME).
+fn execute_preview_with(
+    dir: &Path,
+    options: &Options,
+    io: &mut Io,
+    user_file: Option<&Path>,
+) -> Result<Out, String> {
     let source = select_source(options)?;
-    let client = match &source {
-        Source::Patch(_) => None,
-        _ => Some(land::client_for_dir(options.conduit_uri.as_deref(), dir)?),
-    };
+    let client = setup_patch_client_with(&source, options, dir, user_file)?;
     let call = |method: &str, params: &serde_json::Value| {
-        client // LCOV_EXCL_START // Reason: live conduit call body; tests use --patch sources (client None) since conduit needs creds
+        client
             .as_ref()
             .expect("conduit client")
             .call(method, params)
             .map_err(|e| e.to_string())
-    }; // LCOV_EXCL_STOP
+    };
     let call_option: Option<&diff_submit::ConduitCall<'_>> = client
         .as_ref()
         .map(|_| &call as &dyn Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String>);

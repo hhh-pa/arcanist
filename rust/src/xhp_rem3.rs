@@ -264,7 +264,9 @@ fn rule_this_reassignment(tree: &Tree, out: &mut Vec<RawFinding>) {
 fn rule_unexpected_return(tree: &Tree, blocks: &[Block], out: &mut Vec<RawFinding>) {
     for (idx, block) in method_blocks(tree, blocks) {
         let Some(name) = block.name.as_deref() else {
-            continue; // LCOV_EXCL_LINE // Reason: dead: the parser anonymizes nameless functions, so methods here are always named
+            unreachable!(
+                "the parser anonymizes nameless functions, so methods here are always named"
+            )
         };
         if !name.eq_ignore_ascii_case("__construct") && !name.eq_ignore_ascii_case("__destruct") {
             continue;
@@ -378,9 +380,11 @@ fn self_reference_target(tree: &Tree, new_idx: usize, name: &str) -> Option<usiz
     if tree.tokens[n].kind != kinds::T_STRING || !tree.tokens[n].value.eq_ignore_ascii_case(name) {
         return None;
     }
-    if tree.prev_semantic(n) != Some(new_idx) {
-        return None; // LCOV_EXCL_LINE // Reason: dead: n is the next semantic after new_idx, so prev(n) is always new_idx
-    }
+    debug_assert_eq!(
+        tree.prev_semantic(n),
+        Some(new_idx),
+        "n is the next semantic after new_idx, so prev(n) is always new_idx"
+    );
     if tree
         .next_semantic(n)
         .is_some_and(|a| tree.tokens[a].kind == "\\")

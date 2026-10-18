@@ -596,6 +596,38 @@ fn remote_lookup_covers_hg_and_svn_roots() {
 }
 
 #[test]
+fn hg_remote_lookup_reads_paths_from_fake_hg() {
+    // Staged with a fake `hg` answering `paths` (no system hg): a
+    // listed remote resolves, an unlisted one reports no such remote.
+    let dir = TempDir::new("hg-remote");
+    std::fs::create_dir_all(dir.path().join(".hg")).unwrap();
+    let script = dir.path().join("fakehg.sh");
+    std::fs::write(
+        &script,
+        "printf '%s\\n' 'default = https://example.test/x'\n",
+    )
+    .unwrap();
+    let hg_cmd = crate::hg::HgCommand::custom("sh", &[&script.to_string_lossy()]);
+    assert!(lookup_remote_hg(dir.path(), "default", &hg_cmd).is_ok());
+    assert_eq!(
+        lookup_remote_hg(dir.path(), "missing", &hg_cmd).unwrap_err(),
+        "This working copy has no remote named \"missing\"."
+    );
+}
+
+#[test]
+fn hg_remote_lookup_reports_failed_paths() {
+    // A failing `hg paths` surfaces the command-exception dump.
+    let dir = TempDir::new("hg-remote-fail");
+    std::fs::create_dir_all(dir.path().join(".hg")).unwrap();
+    let script = dir.path().join("fakehg.sh");
+    std::fs::write(&script, "exit 1\n").unwrap();
+    let hg_cmd = crate::hg::HgCommand::custom("sh", &[&script.to_string_lossy()]);
+    let err = lookup_remote_hg(dir.path(), "default", &hg_cmd).unwrap_err();
+    assert!(err.contains("hg paths"), "{err}");
+}
+
+#[test]
 fn explores_browse_fallbacks_and_uris() {
     use std::collections::HashMap;
     let tmp = init_repo("browseblob");
@@ -653,11 +685,12 @@ fn conduit_errors_render_raw() {
 
 #[test]
 fn run_in_reports_missing_terminator() {
-    // Piped stdin is never a TTY under `cargo test`; bail out (rather
-    // than parse differently) if that ever changes.
-    if crate::prompt::stdin_is_terminal() {
-        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
-    }
+    // Piped stdin is never a TTY under `cargo test`; fail loud
+    // (rather than parse differently) if that ever changes.
+    assert!(
+        !crate::prompt::stdin_is_terminal(),
+        "tests must run with non-TTY stdin"
+    );
     let tmp = TempDir::new("terminator");
     assert_eq!(
         run_in(tmp.path(), &args(&["working-copy(HEAD)"])),
@@ -885,4 +918,100 @@ fn git_helper_reports_failing_commands() {
     // A failing git invocation panics with the command and stderr.
     let tmp = TempDir::new("w6h-git-fail");
     git(tmp.path(), &["--bogus-flag-xyz"]);
+}
+
+/// A fixture-local fake `git` program running `body` (Unix-only: the
+/// seam passes a script path, which needs a shebang plus `+x`).
+#[cfg(unix)]
+fn write_fake_git(dir: &Path, body: &str) -> PathBuf {
+    let script = dir.join("git");
+    std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+    script
+}
+
+#[cfg(unix)]
+#[test]
+fn read_commit_empty_rev_parse_output_is_unknown() {
+    // White-box: real rev-parse always prints the hash on success, so
+    // the empty-output arm is reachable only behind a fake backend.
+    let tmp = TempDir::new("git-empty-hash");
+    let fake = write_fake_git(
+        tmp.path(),
+        r#"if [ "$1" = "rev-parse" ] && [ "$2" = "--is-inside-work-tree" ]; then
+  printf 'true\n'
+  exit 0
+fi
+exit 0"#,
+    );
+    assert_eq!(
+        read_commit_with(tmp.path(), "HEAD", Some(&fake)),
+        Err("unknown commit \"HEAD\".".to_string())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn read_commit_seam_reads_hash_and_message() {
+    // The seam preserves the success path: hash plus message from the
+    // fake backend, and the outside-a-work-tree rejection.
+    let tmp = TempDir::new("git-hash");
+    let fake = write_fake_git(
+        tmp.path(),
+        r#"if [ "$1" = "rev-parse" ] && [ "$2" = "--is-inside-work-tree" ]; then
+  printf 'true\n'
+  exit 0
+fi
+if [ "$1" = "rev-parse" ]; then
+  printf 'abc123\n'
+  exit 0
+fi
+printf 'the message\n'"#,
+    );
+    assert_eq!(
+        read_commit_with(tmp.path(), "HEAD", Some(&fake)),
+        Ok(CommitInfo {
+            hash: "abc123".to_string(),
+            message: "the message".to_string(),
+        })
+    );
+    // A backend that fails the work-tree probe rejects the read, like
+    // running outside a working copy (staged aside: same script name).
+    let side = tmp.path().join("side");
+    std::fs::create_dir_all(&side).unwrap();
+    let outside = write_fake_git(&side, "exit 1");
+    assert_eq!(
+        read_commit_with(tmp.path(), "HEAD", Some(&outside)),
+        Err(
+            "\"arc inspect\" must be run in a Git working copy to inspect \"working-copy(...)\"."
+                .to_string()
+        )
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn git_stdout_text_failure_without_output_falls_back_to_command() {
+    // Failure with empty stdout+stderr yields the `git <args> failed`
+    // fallback instead of an empty message.
+    let tmp = TempDir::new("git-empty-fail");
+    let fake = write_fake_git(tmp.path(), "exit 1");
+    assert_eq!(
+        git_stdout_text(tmp.path(), &["rev-parse", "HEAD"], Some(&fake)),
+        Err("git rev-parse HEAD failed".to_string())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn git_inside_work_tree_spawn_failure_is_outside() {
+    // An unspawnable git program fails the probe: outside a work tree.
+    let tmp = TempDir::new("git-missing-program");
+    assert!(!git_inside_work_tree(
+        tmp.path(),
+        Some(&tmp.path().join("no-such-git"))
+    ));
 }

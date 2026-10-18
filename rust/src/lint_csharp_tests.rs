@@ -87,11 +87,14 @@ fn command_lookup_needs_analyzer_and_runtime() {
     assert!(resolve_command_in(tmp.path().as_os_str(), None, settings).is_none());
     let cslint = tmp.path().join(binary_name());
     std::fs::write(&cslint, b"x").unwrap();
-    if cfg!(windows) {
-        let (program, prefix) = resolve_command_in(tmp.path().as_os_str(), None, settings).unwrap(); // LCOV_EXCL_START // Reason: windows-only assertions; cfg!(windows) is false on ubuntu CI
+    #[cfg(windows)]
+    {
+        let (program, prefix) = resolve_command_in(tmp.path().as_os_str(), None, settings).unwrap();
         assert_eq!(program, cslint);
-        assert_eq!(prefix, command_flags()); // LCOV_EXCL_STOP
-    } else {
+        assert_eq!(prefix, command_flags());
+    }
+    #[cfg(not(windows))]
+    {
         assert!(resolve_command_in(tmp.path().as_os_str(), None, settings).is_none());
         let mono = tmp.path().join(runtime_name());
         std::fs::write(&mono, b"x").unwrap();
@@ -110,25 +113,28 @@ fn existing_binary_hint_wins_over_path_lookup() {
     std::fs::write(&hint, b"x").unwrap();
     #[cfg(not(windows))]
     std::fs::write(tmp.path().join(runtime_name()), b"x").unwrap();
-    let (program, prefix) =
-        resolve_command_in(tmp.path().as_os_str(), Some(&hint), settings).unwrap();
-    if cfg!(windows) {
-        assert_eq!(program, hint); // LCOV_EXCL_LINE // Reason: windows-only assertion; cfg!(windows) is false on ubuntu CI
-    } else {
-        assert_eq!(prefix[0], hint.to_string_lossy());
-    }
+    #[cfg(windows)]
+    let (program, _) = resolve_command_in(tmp.path().as_os_str(), Some(&hint), settings).unwrap();
+    #[cfg(not(windows))]
+    let (_, prefix) = resolve_command_in(tmp.path().as_os_str(), Some(&hint), settings).unwrap();
+    #[cfg(windows)]
+    assert_eq!(program, hint);
+    #[cfg(not(windows))]
+    assert_eq!(prefix[0], hint.to_string_lossy());
     // A missing hint falls back to the `PATH` lookup, like PHP.
     let missing = tmp.path().join("no-such-cslint.exe");
     assert!(resolve_command_in(tmp.path().as_os_str(), Some(&missing), settings).is_none());
     let cslint = tmp.path().join(binary_name());
     std::fs::write(&cslint, b"x").unwrap();
-    let (program, prefix) =
+    #[cfg(windows)]
+    let (program, _) =
         resolve_command_in(tmp.path().as_os_str(), Some(&missing), settings).unwrap();
-    if cfg!(windows) {
-        assert_eq!(program, cslint); // LCOV_EXCL_LINE // Reason: windows-only assertion; cfg!(windows) is false on ubuntu CI
-    } else {
-        assert_eq!(prefix[0], cslint.to_string_lossy());
-    }
+    #[cfg(not(windows))]
+    let (_, prefix) = resolve_command_in(tmp.path().as_os_str(), Some(&missing), settings).unwrap();
+    #[cfg(windows)]
+    assert_eq!(program, cslint);
+    #[cfg(not(windows))]
+    assert_eq!(prefix[0], cslint.to_string_lossy());
 }
 
 #[test]
@@ -384,20 +390,48 @@ fn trailing_dot_has_no_extension() {
 }
 
 #[test]
-fn ambient_command_lookup_stays_consistent_when_present() {
-    // Hermetic by construction: no assumption about the ambient PATH,
-    // only that a found command carries the default flags.
-    match resolve_command() {
-        None => {}
-        // LCOV_EXCL_START // Reason: ambient-cslint arm; cslint plus mono are absent on ubuntu CI
-        Some((_, prefix)) => {
-            if cfg!(windows) {
-                assert_eq!(prefix, command_flags());
-            } else {
-                assert_eq!(&prefix[1..], command_flags().as_slice()); // LCOV_EXCL_STOP
-            }
-        }
+fn staged_command_lookup_carries_default_flags() {
+    // Staged through `resolve_command_in`: a found command carries the
+    // default flags, with no assumption about the ambient PATH.
+    let tmp = TempDir::new("resolve-present");
+    let cslint = tmp.path().join(binary_name());
+    std::fs::write(&cslint, b"x").unwrap();
+    #[cfg(not(windows))]
+    std::fs::write(tmp.path().join(runtime_name()), b"x").unwrap();
+    let settings = default_settings_base64();
+    #[cfg(windows)]
+    let (program, prefix) = resolve_command_in(tmp.path().as_os_str(), None, settings).unwrap();
+    #[cfg(not(windows))]
+    let (_, prefix) = resolve_command_in(tmp.path().as_os_str(), None, settings).unwrap();
+    #[cfg(windows)]
+    {
+        assert_eq!(program, cslint);
+        assert_eq!(prefix, command_flags());
     }
+    #[cfg(not(windows))]
+    {
+        assert_eq!(&prefix[1..], command_flags().as_slice());
+    }
+    // The ambient wrapper stays callable without assuming a result.
+    let _ = resolve_command();
+}
+
+#[test]
+#[cfg(unix)]
+fn lint_bytes_runs_staged_mono_and_cslint() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Staged through `path_dir`: a fake `mono` answering the version
+    // probe drives the resolve-Ok arm without ambient tools.
+    let tmp = TempDir::new("resolve-ok");
+    let mono = tmp.path().join(runtime_name());
+    std::fs::write(&mono, "#!/bin/sh\necho 1\n").unwrap();
+    std::fs::set_permissions(&mono, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(tmp.path().join(binary_name()), b"x").unwrap();
+    let mut linter = CsharpLinter::new();
+    linter.path_dir = Some(tmp.path().to_path_buf());
+    assert!(linter.lint_bytes("a.cs", b"class A {}\n").is_empty());
+    assert_eq!(linter.take_error(), None);
 }
 
 #[test]
@@ -583,4 +617,29 @@ fn cov6g_push_conversion_rejects_unknown_spec() {
     let mut out = String::new();
     assert_eq!(push_conversion(&mut out, 's', "x", None), Some(()));
     assert_eq!(out, "x");
+}
+
+#[test]
+#[cfg(unix)]
+fn temp_write_failure_reports_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new("temp-fail");
+    let missing = tmp.path().join("no-such-cslint");
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // `lint_bytes` cannot reach staging where cslint plus mono are
+    // absent, so drive the dir-taking core directly.
+    let prefix: Vec<String> = Vec::new();
+    assert!(
+        lint_with_command_in(
+            &locked,
+            "Foo.cs",
+            b"class A {}",
+            Some((&missing, prefix.as_slice()))
+        )
+        .is_empty()
+    );
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
 }

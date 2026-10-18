@@ -893,12 +893,21 @@ fn fail(message: String) -> ExitCode {
 /// Credentials target: `--arcrc-file` wins over `~/.arcrc`, like stock
 /// PHP's `writeUserConfigurationFile()` at the custom location.
 fn install_arcrc_for(arcrc_file: Option<&str>) -> Result<PathBuf, ExitCode> {
-    match get_config::resolve_user_file(config::arcrc_path(), arcrc_file.map(Path::new)) {
+    install_arcrc_for_with(config::arcrc_path(), arcrc_file)
+}
+
+/// [`install_arcrc_for`] with an explicit default user file (test
+/// seam: hermetic tests stage `None` for the unset-HOME arm instead
+/// of unsetting process-global env).
+fn install_arcrc_for_with(
+    default: Option<PathBuf>,
+    arcrc_file: Option<&str>,
+) -> Result<PathBuf, ExitCode> {
+    match get_config::resolve_user_file(default, arcrc_file.map(Path::new)) {
         Ok(Some(path)) => Ok(path),
-        // LCOV_EXCL_START // Reason: needs HOME/USERPROFILE unset; always set in CI
         Ok(None) => Err(fail(
             "cannot locate ~/.arcrc (HOME/USERPROFILE is not set)".to_string(),
-        )), // LCOV_EXCL_STOP
+        )),
         Err(message) => Err(fail(message)),
     }
 }
@@ -906,27 +915,45 @@ fn install_arcrc_for(arcrc_file: Option<&str>) -> Result<PathBuf, ExitCode> {
 /// Read the token: `--token` (trimmed like prompted input) or the
 /// interactive prompt loop.
 fn install_token_value(options: &Options) -> Result<String, ExitCode> {
+    install_token_value_with(options, &prompt_token)
+}
+
+/// [`install_token_value`] with an injectable token prompt (test
+/// seam; production passes [`prompt_token`]).
+fn install_token_value_with(
+    options: &Options,
+    prompt: &dyn Fn() -> Result<String, String>,
+) -> Result<String, ExitCode> {
     if let Some(token) = options.token.as_deref().map(str::trim)
         && !token.is_empty()
     {
         return Ok(token.to_string());
     }
-    match prompt_token() {
-        Ok(token) => Ok(token), // LCOV_EXCL_LINE // Reason: prompt success arm; needs a TTY
+    match prompt() {
+        Ok(token) => Ok(token),
         Err(message) => Err(fail(message)),
     }
 }
 
 /// Confirm installing a standard `api-` token (`--force` skips the ask).
 fn confirm_standard_token(force: bool) -> Result<(), ExitCode> {
+    confirm_standard_token_with(force, &|question| prompt_confirm(question, true))
+}
+
+/// [`confirm_standard_token`] with an injectable confirm fn (test
+/// seam; production passes [`prompt_confirm`] with `default_no`).
+fn confirm_standard_token_with(
+    force: bool,
+    confirm: &dyn Fn(&str) -> Result<bool, String>,
+) -> Result<(), ExitCode> {
     if force {
         return Ok(());
     }
     print!("{}", standard_token_notice());
     let _ = std::io::stdout().flush();
-    match prompt_confirm(CONFIRM_INSTALL_ANYWAY, true) {
-        Ok(true) => Ok(()), // LCOV_EXCL_START // Reason: confirm arms; need a TTY
-        Ok(false) => Err(fail(NOT_INSTALLING.to_string())), // LCOV_EXCL_STOP
+    match confirm(CONFIRM_INSTALL_ANYWAY) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(fail(NOT_INSTALLING.to_string())),
         Err(message) => Err(fail(message)),
     }
 }
@@ -988,7 +1015,7 @@ fn prepare_install(argv: &[String]) -> Result<InstallPlan, ExitCode> {
     let options = install_options(argv)?;
     let cwd = match std::env::current_dir() {
         Ok(dir) => dir,
-        Err(_) => PathBuf::from("."), // LCOV_EXCL_LINE // Reason: current_dir is infallible in practice; deleting the cwd under parallel tests is unsafe
+        Err(_) => PathBuf::from("."),
     };
     let uri = resolve_install_uri(&options, &cwd)?;
     let arcrc = install_arcrc_for(options.arcrc_file.as_deref())?;
@@ -1033,10 +1060,8 @@ fn read_install_token(
     ansi: bool,
     options: &Options,
 ) -> Result<String, ExitCode> {
-    match render_login_header(ansi) {
-        Ok(header) => print!("{header}"),
-        Err(message) => return Err(fail(message)), // LCOV_EXCL_LINE // Reason: fixed valid pattern plus correct argc; the render cannot fail
-    }
+    let header = render_login_header(ansi).expect("login header renders a fixed valid pattern");
+    print!("{header}");
     let token_url = token_login_url(uri, is_token_auth);
     println!("{}", login_page_block(&token_url));
     install_token_value(options)

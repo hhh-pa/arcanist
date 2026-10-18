@@ -242,6 +242,13 @@ fn rejects_bad_startpoints_and_conduit_symbols() {
     assert!(!branch_exists(tmp.path(), "123"));
 }
 
+fn expect_work_args(words: &[&str]) -> Options {
+    match parse_args_with_tty(&args(words), true) {
+        ParseOutcome::Args(options) => options,
+        _ => panic!("feature parses"),
+    }
+}
+
 #[test]
 fn requires_a_supported_working_copy() {
     // T1153 B21/B23: piped runs carry `--`.
@@ -256,10 +263,7 @@ fn requires_a_supported_working_copy() {
     // engine through an always-failing command instead (T1153 WORK-HG).
     let hg = TempDir::new("hg");
     std::fs::create_dir(hg.path().join(".hg")).unwrap();
-    let options = match parse_args_with_tty(&args(&["feature"]), true) {
-        ParseOutcome::Args(options) => options,
-        _ => panic!("feature parses"), // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let options = expect_work_args(&["feature"]);
     let hg_cmd = crate::hg::HgCommand::custom("false", &[]);
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
@@ -916,9 +920,7 @@ fn hg_dispatch_checks_out_and_creates_bookmarks() {
     let (tmp, hg_cmd) = hg_test_repo("hg-dispatch");
     std::fs::write(tmp.path().join(".fakehg-bookmarks"), "  feat  3:abc\n").unwrap();
     std::fs::write(tmp.path().join(".fakehg-branches"), "").unwrap();
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub body never invoked on this path
-    }; // LCOV_EXCL_STOP
+    let call = empty_conduit_data;
     hg_dispatch_symbol_with(tmp.path(), &hg_cmd, "feat", None, &call).unwrap();
     let log = hg_read_log(tmp.path());
     assert!(log.contains("checkout feat --"), "{log}");
@@ -951,9 +953,7 @@ fn hg_ambiguous_symbols_fail_like_php() {
     let (tmp, hg_cmd) = hg_test_repo("hg-ambiguous");
     std::fs::write(tmp.path().join(".fakehg-bookmarks"), "  dup  3:abc\n").unwrap();
     std::fs::write(tmp.path().join(".fakehg-branches"), "dup  1:abc123\n").unwrap();
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub body never invoked on this path
-    }; // LCOV_EXCL_STOP
+    let call = empty_conduit_data;
     let err = hg_dispatch_symbol_with(tmp.path(), &hg_cmd, "dup", None, &call).unwrap_err();
     assert_eq!(err, "Symbol \"dup\" is ambiguous.");
 }
@@ -1306,6 +1306,14 @@ fn branches_for_revision_skips_footer_decoys() {
     assert_eq!(tips[0].name, "feature");
 }
 
+fn must_not_call_conduit(_: &str, _: &serde_json::Value) -> Result<serde_json::Value, String> {
+    Err("must not be called".to_string())
+}
+
+fn empty_conduit_data(_: &str, _: &serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({"data": []}))
+}
+
 #[test]
 fn branches_for_revision_is_empty_without_branches() {
     // T1170: no local tips means no association and no Conduit traffic
@@ -1317,9 +1325,7 @@ fn branches_for_revision_is_empty_without_branches() {
         monogram: "D123".to_string(),
         title: "Fix it".to_string(),
     };
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Err("must not be called".to_string()) // LCOV_EXCL_START // Reason: must-not-call guard; firing fails the test
-    }; // LCOV_EXCL_STOP
+    let call = must_not_call_conduit;
     assert_eq!(
         branches_for_revision(&call, tmp.path(), &revision).unwrap(),
         Vec::new()
@@ -1621,9 +1627,7 @@ fn run_in_dispatches_hg_repos() {
     std::fs::write(tmp.path().join(".hg"), "not-a-repo\n").unwrap();
     assert!(is_hg_repo(tmp.path()));
     assert!(!git::is_inside_work_tree(tmp.path()));
-    let empty = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
-    }; // LCOV_EXCL_STOP
+    let empty = empty_conduit_data;
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
         run_in_with(
@@ -1670,9 +1674,7 @@ fn hg_system_wrappers_handle_plain_dirs() {
     // repo instead of failing (work.rs:678-680,746-752,732).
     let tmp = TempDir::new("hg-plain");
     assert_eq!(hg_branch_tips(tmp.path()).unwrap(), Vec::new());
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Err("must not be called".to_string()) // LCOV_EXCL_START // Reason: must-not-call guard; firing fails the test
-    }; // LCOV_EXCL_STOP
+    let call = must_not_call_conduit;
     assert_eq!(
         hg_branches_for_revision(&call, tmp.path(), &revision_123()).unwrap(),
         Vec::new()
@@ -1712,9 +1714,7 @@ fn hg_branches_for_revision_is_empty_without_markers() {
     // T1170: no hg tips means no association and no Conduit traffic
     // (work.rs:732).
     let (tmp, hg_cmd) = hg_test_repo("hg-no-markers");
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Err("must not be called".to_string()) // LCOV_EXCL_START // Reason: must-not-call guard; firing fails the test
-    }; // LCOV_EXCL_STOP
+    let call = must_not_call_conduit;
     assert_eq!(
         hg_branches_for_revision_with(&call, tmp.path(), &hg_cmd, &revision_123()).unwrap(),
         Vec::new()
@@ -1837,9 +1837,7 @@ fn hg_dispatch_checks_out_branch_markers() {
         "stable  1:abcdef123456\n",
     )
     .unwrap();
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
-    }; // LCOV_EXCL_STOP
+    let call = empty_conduit_data;
     hg_dispatch_symbol_with(tmp.path(), &hg_cmd, "stable", None, &call).unwrap();
     let log = hg_read_log(tmp.path());
     assert!(log.contains("checkout stable --"), "{log}");
@@ -1851,9 +1849,7 @@ fn hg_dispatch_rejects_unresolvable_starts() {
     // (work.rs:1582).
     let (tmp, hg_cmd) = hg_test_repo("hg-bad-start");
     std::fs::write(tmp.path().join(".fakehg-fail-log"), "").unwrap();
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
-    }; // LCOV_EXCL_STOP
+    let call = empty_conduit_data;
     assert_eq!(
         hg_dispatch_symbol_with(
             tmp.path(),
@@ -1909,6 +1905,54 @@ fn hg_revision_dispatch_checks_out_single_marker() {
     hg_dispatch_symbol_with(tmp.path(), &hg_cmd, "123", None, &call).unwrap();
     let log = hg_read_log(tmp.path());
     assert!(log.contains("checkout feat --"), "{log}");
+}
+
+#[test]
+fn live_client_without_credentials_fails_like_php() {
+    // Git live-conduit path with no token for the conduit host: client
+    // construction fails and the command exits FAILURE (nothing dials).
+    let tmp = init_repo("live-git-nocreds");
+    commit_file(tmp.path(), "a.txt", "one");
+    let creds = TempDir::new("live-git-nocreds-creds");
+    let arcrc = creds.path().join("fake.arcrc");
+    std::fs::write(&arcrc, r#"{"hosts": {}}"#).unwrap();
+    let mut input = std::io::Cursor::new(b"");
+    assert_eq!(
+        run_in_with_user_file(
+            tmp.path(),
+            &args(&["--", "123"]),
+            None,
+            &mut input,
+            Some(&arcrc),
+            Some("http://127.0.0.1:9/"),
+        ),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn live_client_without_credentials_fails_hg_like_php() {
+    // Hg live-conduit twin: no token for the conduit host fails the
+    // client before any marker lookup dials out.
+    let (tmp, hg_cmd) = hg_test_repo("live-hg-nocreds");
+    std::fs::write(tmp.path().join(".fakehg-bookmarks"), "  feat  3:abc\n").unwrap();
+    std::fs::write(tmp.path().join(".fakehg-branches"), "").unwrap();
+    let arcrc = tmp.path().join("fake.arcrc");
+    std::fs::write(&arcrc, r#"{"hosts": {}}"#).unwrap();
+    let options = hg_options("123");
+    let mut input = std::io::Cursor::new(b"");
+    assert_eq!(
+        run_hg_in_with_cmd_user_file(
+            tmp.path(),
+            &hg_cmd,
+            &options,
+            None,
+            &mut input,
+            Some(&arcrc),
+            Some("http://127.0.0.1:9/"),
+        ),
+        std::process::ExitCode::FAILURE
+    );
 }
 
 #[test]
@@ -2035,9 +2079,7 @@ fn run_hg_in_with_cmd_runs_bookmark_flow() {
     // (work.rs:1889-1897).
     let (tmp, hg_cmd) = hg_test_repo("hg-run-ok");
     let options = hg_options("novel");
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
-    }; // LCOV_EXCL_STOP
+    let call = empty_conduit_data;
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
         run_hg_in_with_cmd(tmp.path(), &hg_cmd, &options, Some(&call), &mut input),
@@ -2054,9 +2096,7 @@ fn run_hg_in_with_cmd_shelves_and_restores() {
     let (tmp, hg_cmd) = hg_test_repo("hg-run-shelve");
     std::fs::write(tmp.path().join(".fakehg-status"), "M a.txt\n").unwrap();
     let options = hg_options("novel");
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
-    }; // LCOV_EXCL_STOP
+    let call = empty_conduit_data;
     let mut input = std::io::Cursor::new(b"y\n");
     assert_eq!(
         run_hg_in_with_cmd(tmp.path(), &hg_cmd, &options, Some(&call), &mut input),
@@ -2077,9 +2117,7 @@ fn run_hg_in_with_cmd_fails_when_unshelve_fails() {
     std::fs::write(tmp.path().join(".fakehg-status"), "M a.txt\n").unwrap();
     std::fs::write(tmp.path().join(".fakehg-fail-unshelve"), "").unwrap();
     let options = hg_options("novel");
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
-    }; // LCOV_EXCL_STOP
+    let call = empty_conduit_data;
     let mut input = std::io::Cursor::new(b"y\n");
     assert_eq!(
         run_hg_in_with_cmd(tmp.path(), &hg_cmd, &options, Some(&call), &mut input),
@@ -2097,9 +2135,7 @@ fn run_hg_in_with_cmd_fails_when_status_fails() {
     let (tmp, hg_cmd) = hg_test_repo("hg-run-status");
     std::fs::write(tmp.path().join(".fakehg-fail-status"), "").unwrap();
     let options = hg_options("novel");
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
-    }; // LCOV_EXCL_STOP
+    let call = empty_conduit_data;
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
         run_hg_in_with_cmd(tmp.path(), &hg_cmd, &options, Some(&call), &mut input),
@@ -2117,9 +2153,7 @@ fn run_hg_in_with_cmd_fails_without_shelve() {
     std::fs::write(tmp.path().join(".fakehg-status"), "M a.txt\n").unwrap();
     std::fs::write(tmp.path().join(".fakehg-no-shelve"), "").unwrap();
     let options = hg_options("novel");
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
-    }; // LCOV_EXCL_STOP
+    let call = empty_conduit_data;
     let mut input = std::io::Cursor::new(b"y\n");
     assert_eq!(
         run_hg_in_with_cmd(tmp.path(), &hg_cmd, &options, Some(&call), &mut input),
@@ -2137,9 +2171,7 @@ fn run_hg_in_with_cmd_restores_after_ambiguous_dispatch() {
     std::fs::write(tmp.path().join(".fakehg-bookmarks"), "  dup  3:abc\n").unwrap();
     std::fs::write(tmp.path().join(".fakehg-branches"), "dup  1:abc123\n").unwrap();
     let options = hg_options("dup");
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
-    }; // LCOV_EXCL_STOP
+    let call = empty_conduit_data;
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
         run_hg_in_with_cmd(tmp.path(), &hg_cmd, &options, Some(&call), &mut input),
@@ -2178,4 +2210,244 @@ fn git_helper_reports_failing_commands() {
     // A failing git invocation panics with the command and stderr.
     let tmp = TempDir::new("w6h-git-fail");
     git(tmp.path(), &["--bogus-flag-xyz"]);
+}
+
+#[test]
+#[should_panic(expected = "feature parses")]
+fn requires_a_supported_working_copy_defensive_error_arm() {
+    // `expect_work_args` unwraps `Args`: an empty symbol errors.
+    expect_work_args(&[]);
+}
+// -( T1176 S10: stub/guard coverage )----------------------------------------
+
+#[test]
+fn must_not_call_conduit_companion_reports_the_canned_error() {
+    // The must-not-call guard keeps guarding: direct calls fail closed
+    // with the byte-identical message the callers propagate.
+    assert_eq!(
+        must_not_call_conduit("m", &serde_json::json!({})).unwrap_err(),
+        "must not be called"
+    );
+}
+
+#[test]
+fn empty_conduit_data_companion_returns_the_canned_payload() {
+    // The never-invoked stub keeps its canned empty payload.
+    assert_eq!(
+        empty_conduit_data("m", &serde_json::json!({})).unwrap(),
+        serde_json::json!({"data": []})
+    );
+}
+// -( T1176 S12: dead-arm coverage )------------------------------------------
+
+#[test]
+fn conduit_unavailable_pill_companion_reports_the_canned_error() {
+    // The poison-pill conduit caller keeps failing closed with the
+    // byte-identical message the dispatch callers propagate.
+    assert_eq!(
+        conduit_unavailable_pill("m", &serde_json::json!({})).unwrap_err(),
+        "conduit unavailable"
+    );
+}
+// -( T1176 PC-4: work-upgrade demark )----------------------------------------
+
+#[test]
+fn flags_for_entry_rejects_unknown_kinds() {
+    // `status_flags` skips unknown porcelain kinds via the `if let`
+    // guard; the pure `None` contract pins here directly.
+    assert!(flags_for_entry("# branch.oid abc123").is_none());
+    assert!(flags_for_entry("X XY subm mH mI mW hH hI path").is_none());
+    assert!(flags_for_entry("").is_none());
+}
+
+#[test]
+fn hg_dispatch_revision_with_empty_conduit_reports_not_found() {
+    // Sibling of the marker/ambiguity paths above: a revision symbol
+    // with no markers DOES invoke the shared empty stub (via
+    // `load_revision`), which answers no rows.
+    let (tmp, hg_cmd) = hg_test_repo("hg-empty-rev");
+    std::fs::write(tmp.path().join(".fakehg-bookmarks"), "").unwrap();
+    std::fs::write(tmp.path().join(".fakehg-branches"), "").unwrap();
+    let call = empty_conduit_data;
+    let err = hg_dispatch_symbol_with(tmp.path(), &hg_cmd, "D123", None, &call).unwrap_err();
+    assert_eq!(
+        err,
+        "No revision \"D123\" exists, or you do not have permission to view it."
+    );
+}
+
+#[test]
+fn hg_dispatch_task_with_empty_conduit_reports_not_found() {
+    // Sibling on the task path: `work_on_task` invokes the same shared
+    // empty stub (via `maniphest.search`), which answers no rows.
+    let (tmp, hg_cmd) = hg_test_repo("hg-empty-task");
+    std::fs::write(tmp.path().join(".fakehg-bookmarks"), "").unwrap();
+    std::fs::write(tmp.path().join(".fakehg-branches"), "").unwrap();
+    let call = empty_conduit_data;
+    let err = hg_dispatch_symbol_with(tmp.path(), &hg_cmd, "T7", None, &call).unwrap_err();
+    assert_eq!(
+        err,
+        "No task \"T7\" exists, or you do not have permission to view it."
+    );
+}
+
+/// Loopback stub routing each conduit method to its canned envelope.
+fn serve_routes(routes: std::collections::HashMap<String, String>, expected: usize) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for _ in 0..expected {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            let head_text = String::from_utf8_lossy(&head).to_string();
+            let len: usize = head_text
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(key, value)| {
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).unwrap();
+            let method = head_text
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .strip_prefix("/api/")
+                .unwrap_or("")
+                .to_string();
+            let canned = routes
+                .get(&method)
+                .cloned()
+                .unwrap_or_else(|| r#"{"result": null, "error_code": "ERR-NO-ROUTE"}"#.to_string());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                canned.len(),
+                canned
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    base
+}
+
+fn live_envelope(result: &str) -> String {
+    format!(r#"{{"result": {result}, "error_code": null}}"#)
+}
+
+/// The arcrc host key for a stub base, mirroring
+/// `config::host_key` (`{scheme}://{authority}/api/`).
+fn host_key_for(base: &str) -> String {
+    let after_scheme = base.split("://").nth(1).unwrap_or(base);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    let scheme = base.split("://").next().unwrap_or("https");
+    format!("{scheme}://{authority}/api/")
+}
+
+/// Fake arcrc granting a token for the stub `base`.
+fn fake_arcrc(dir: &Path, base: &str) -> PathBuf {
+    let path = dir.join("fake.arcrc");
+    let key = host_key_for(base);
+    std::fs::write(
+        &path,
+        format!(r#"{{"hosts": {{"{key}": {{"token": "x"}}}}}}"#),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn live_client_resumes_revision_branch() {
+    // Git live-conduit path: no local `123` branch, so the seamed
+    // client dials the loopback stub, associates the tip by hash, and
+    // checks the branch out. The bare `123` resolves to ID 123
+    // (`D123` would cast to 0, like PHP).
+    let tmp = init_repo("live-git");
+    commit_file(tmp.path(), "a.txt", "one");
+    let branch = current_branch(tmp.path());
+    let commit = git(tmp.path(), &["rev-parse", "HEAD"]);
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "differential.revision.search".to_string(),
+        live_envelope(
+            r#"{"data": [{"id": 123, "phid": "PHID-DREV-1", "fields": {"title": "Fix it"}}]}"#,
+        ),
+    );
+    routes.insert(
+        "differential.query".to_string(),
+        live_envelope(&format!(
+            r#"[{{"phid": "PHID-DREV-1", "hashes": [["gtcm", "{commit}"]]}}]"#
+        )),
+    );
+    let base = serve_routes(routes, 2);
+    // Credentials live outside the repo so the checkout stays clean.
+    let creds = TempDir::new("live-git-creds");
+    let arcrc = fake_arcrc(creds.path(), &base);
+    let mut input = std::io::Cursor::new(b"");
+    assert_eq!(
+        run_in_with_user_file(
+            tmp.path(),
+            &args(&["--", "123"]),
+            None,
+            &mut input,
+            Some(&arcrc),
+            Some(&base),
+        ),
+        std::process::ExitCode::SUCCESS
+    );
+    assert_eq!(current_branch(tmp.path()), branch);
+}
+
+#[test]
+fn live_client_resumes_hg_marker() {
+    // Hg live-conduit path: no `123` marker, so the seamed client
+    // dials the loopback stub, associates the bookmark by `hgcm` hash,
+    // and checks it out. The bare `123` resolves to ID 123 (`D123`
+    // would cast to 0, like PHP).
+    let (tmp, hg_cmd) = hg_test_repo("live-hg");
+    std::fs::write(tmp.path().join(".fakehg-bookmarks"), "  feat  3:abc\n").unwrap();
+    std::fs::write(tmp.path().join(".fakehg-branches"), "").unwrap();
+    let node = "0123456789abcdef0123456789abcdef01234567";
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "differential.revision.search".to_string(),
+        live_envelope(
+            r#"{"data": [{"id": 123, "phid": "PHID-DREV-1", "fields": {"title": "Fix it"}}]}"#,
+        ),
+    );
+    routes.insert(
+        "differential.query".to_string(),
+        live_envelope(&format!(
+            r#"[{{"phid": "PHID-DREV-1", "hashes": [["hgcm", "{node}"]]}}]"#
+        )),
+    );
+    let base = serve_routes(routes, 2);
+    let arcrc = fake_arcrc(tmp.path(), &base);
+    let options = hg_options("123");
+    let mut input = std::io::Cursor::new(b"");
+    assert_eq!(
+        run_hg_in_with_cmd_user_file(
+            tmp.path(),
+            &hg_cmd,
+            &options,
+            None,
+            &mut input,
+            Some(&arcrc),
+            Some(&base),
+        ),
+        std::process::ExitCode::SUCCESS
+    );
+    let log = hg_read_log(tmp.path());
+    assert!(log.contains("checkout feat --"), "{log}");
 }

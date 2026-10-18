@@ -999,17 +999,25 @@ fn skip_predicates_cover_nolint_nounit_raw_head() {
     assert!(!should_skip_unit(false, false, Some("")));
 }
 
+/// Counting lint child runner shared by the skip test (which asserts
+/// the spy never runs) and its non-skip sibling (which drives it once).
+fn gap2_counting_lint_run(
+    calls: &std::cell::RefCell<usize>,
+) -> impl Fn(&Path, &[String]) -> ChildOutcome + '_ {
+    |_: &Path, _: &[String]| {
+        *calls.borrow_mut() += 1;
+        ChildOutcome::Code(0, Vec::new())
+    }
+}
+
 #[test]
 fn gap2_run_lint_maps_codes_and_outcomes() {
     use std::cell::RefCell;
     let dir = std::env::temp_dir();
     let run = |outcome: ChildOutcome| move |_: &Path, _: &[String]| outcome.clone();
     // Skip short-circuits silently.
-    let calls = RefCell::new(0);
-    let counting = |_: &Path, _: &[String]| {
-        *calls.borrow_mut() += 1; // LCOV_EXCL_START // Reason: skip short-circuits before the spy runs; the test asserts the skip
-        ChildOutcome::Code(0, Vec::new())
-    }; // LCOV_EXCL_STOP
+    let calls = RefCell::new(0usize);
+    let counting = gap2_counting_lint_run(&calls);
     let mut out = Vec::new();
     assert_eq!(
         run_lint(&dir, Some("abc"), &[], true, &counting, &mut out).unwrap(),
@@ -1119,6 +1127,24 @@ fn gap2_run_lint_maps_codes_and_outcomes() {
     let mut out = Vec::new();
     run_lint(&dir, None, &[], false, &capture, &mut out).unwrap();
     assert!(seen.borrow().is_empty());
+}
+
+#[test]
+fn gap2_run_lint_spy_runs_on_non_skip_path() {
+    use std::cell::RefCell;
+    // Sibling of gap2_run_lint_maps_codes_and_outcomes: the same
+    // counting spy on the non-skip path, where the runner runs once.
+    let dir = gap2_d1_scratch("lint-spy");
+    let calls = RefCell::new(0usize);
+    let counting = gap2_counting_lint_run(&calls);
+    let mut out = Vec::new();
+    assert_eq!(
+        run_lint(&dir, None, &[], false, &counting, &mut out).unwrap(),
+        (Some(0), Vec::new())
+    );
+    assert_eq!(*calls.borrow(), 1);
+    assert_eq!(out, b"Linting...\n** LINT OKAY ** No lint problems.\n");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -3291,11 +3317,8 @@ fn gap2_merge_svn_path_diffs_shapes() {
     assert_eq!(changes.len(), 2);
     let file = changes.iter().find(|c| c.current_path == "a.txt").unwrap();
     assert_eq!(file.hunks.len(), 1);
-    assert!(
-        file.hunks[0].corpus.contains("-file\n"),
-        "{}",
-        file.hunks[0].corpus // LCOV_EXCL_LINE // Reason: assert-message arg; evaluates only if the passing assert fails
-    );
+    let corpus = &file.hunks[0].corpus;
+    assert!(corpus.contains("-file\n"), "{corpus}");
 
     // Blank-only diff text fails like PHP's `parseDiff()` guard.
     let data = vec![gap2_path_data(
@@ -3593,15 +3616,17 @@ fn gap2_check_revision_ownership_flows() {
     assert_eq!(err, diff_submit::OWNERSHIP_ABORT);
 }
 
+fn must_not_call_conduit(_: &str, _: &serde_json::Value) -> Result<serde_json::Value, String> {
+    Err("must not call".to_string())
+}
+
 #[test]
 fn gap2_validate_commit_message_flows() {
     use std::io::Cursor;
 
     // No revision, no reviewers: silent success, no conduit calls.
     let message = CommitMessage::new_from_raw_corpus("Title\n").unwrap();
-    let fail = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Err("must not call".to_string()) // LCOV_EXCL_START // Reason: must-not-call guard; firing fails the test
-    }; // LCOV_EXCL_STOP
+    let fail = must_not_call_conduit;
     let mut out = Vec::new();
     validate_commit_message(
         &mut Cursor::new(b"".to_vec()),
@@ -3706,16 +3731,25 @@ fn gap2_unresolved_errors_error_shapes() {
     );
 }
 
+/// Counting editor stub shared by the verbatim first-pass test (which
+/// asserts the spy never runs) and its editor-path sibling (which drives
+/// it once).
+fn gap2_counting_edit(
+    calls: &std::cell::RefCell<usize>,
+) -> impl Fn(&str) -> Result<String, String> + '_ {
+    |_: &str| {
+        *calls.borrow_mut() += 1;
+        Ok("Edited\n".to_string())
+    }
+}
+
 #[test]
 fn gap2_edit_create_message_first_pass() {
     use std::io::Cursor;
     let root = gap2_d1_scratch("loop-first");
     let meta = root.join(".git");
     let calls = std::cell::RefCell::new(0usize);
-    let edit = |_: &str| -> Result<String, String> {
-        *calls.borrow_mut() += 1; // LCOV_EXCL_START // Reason: verbatim skips the editor on this path; the spy never runs
-        Ok("Edited\n".to_string())
-    }; // LCOV_EXCL_STOP
+    let edit = gap2_counting_edit(&calls);
 
     // Verbatim skips the editor on the first pass for non-default templates.
     let mut input = Cursor::new(b"".to_vec());
@@ -3765,6 +3799,34 @@ fn gap2_edit_create_message_first_pass() {
     let err = edit_create_message(&mut editor, "Title\n", "Title\n", true, false, &[]).unwrap_err();
     assert_eq!(err, TEMPLATE_NOT_EDITED);
 
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn gap2_edit_create_message_first_pass_editor_path() {
+    use std::io::Cursor;
+    // Sibling of gap2_edit_create_message_first_pass: the same counting
+    // edit spy with verbatim off, so the editor runs once.
+    let root = gap2_d1_scratch("loop-first-editor");
+    let meta = root.join(".git");
+    let calls = std::cell::RefCell::new(0usize);
+    let edit = gap2_counting_edit(&calls);
+    let mut input = Cursor::new(b"".to_vec());
+    let mut out = Vec::new();
+    let mut editor = CreateMessageEditor {
+        reader: &mut input,
+        writer: &mut out,
+        call: &gap2_d1_ok_call,
+        metadata_dir: &meta,
+        work_root: &root,
+        edit: &edit,
+        amend_commit: None,
+        user_phid: "PHID-USER-me",
+        away_offset: 0,
+    };
+    let message = edit_create_message(&mut editor, "Seed\n", "Seed\n", false, false, &[]).unwrap();
+    assert_eq!(*calls.borrow(), 1);
+    assert_eq!(message.raw_corpus, "Edited\n");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -4553,9 +4615,7 @@ fn gap2_format_count_grouping() {
 #[test]
 fn gap2_calculate_should_amend_decisions() {
     let no_revisions = || -> Result<Vec<(i64, String)>, String> { Ok(Vec::new()) };
-    let fail_call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Err("must not call".to_string()) // LCOV_EXCL_START // Reason: must-not-call guard; firing fails the test
-    }; // LCOV_EXCL_STOP
+    let fail_call = must_not_call_conduit;
     let head = gap2_d1_local_commit("abc123", "Work", "Work\n");
     let base = || AmendCheck {
         history_immutable: false,
@@ -5009,25 +5069,14 @@ fn t1170_tag_lines_with_padded_or_punctuated_names_stay_body() {
     );
 }
 
-/// True when the `git` binary runs (real-repo tests probe this first).
-fn t1170_git_available() -> bool {
-    std::process::Command::new("git")
-        .arg("--version")
-        .output()
-        .is_ok_and(|out| out.status.success())
-}
-
-/// Scratch git repo with one empty commit; removed on drop. `None` when
-/// `git` is unavailable (the caller skips).
+/// Scratch git repo with one empty commit; removed on drop. `git`
+/// ships on every CI runner, so the tests use it unconditionally.
 struct T1170GitRepo {
     dir: std::path::PathBuf,
 }
 
 impl T1170GitRepo {
-    fn named(tag: &str) -> Option<Self> {
-        if !t1170_git_available() {
-            return None; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
-        }
+    fn named(tag: &str) -> Self {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!(
@@ -5055,7 +5104,7 @@ impl T1170GitRepo {
             "-m",
             "init",
         ]);
-        Some(Self { dir })
+        Self { dir }
     }
 
     fn run(&self, args: &[&str]) {
@@ -5090,9 +5139,7 @@ impl Drop for T1170GitRepo {
 
 #[test]
 fn t1170_git_log_failures_report_stderr() {
-    let Some(repo) = T1170GitRepo::named("logfail") else {
-        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
-    };
+    let repo = T1170GitRepo::named("logfail");
     let err = get_local_commit_information(&repo.dir, "missing-base", "HEAD").unwrap_err();
     assert!(err.contains("git log failed"), "{err}");
     let err = get_git_update_messages(&repo.dir, "missing-base", "HEAD").unwrap_err();
@@ -5107,9 +5154,7 @@ fn t1170_git_log_failures_report_stderr() {
 
 #[test]
 fn t1170_symbolic_ref_unexpected_exit_fails() {
-    let Some(repo) = T1170GitRepo::named("symref") else {
-        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
-    };
+    let repo = T1170GitRepo::named("symref");
     // Outside any repo `git symbolic-ref` exits 128: neither 0 nor 1.
     let plain =
         std::env::temp_dir().join(format!("arc-rs-diff-t1170-plain-{}", std::process::id()));
@@ -5124,9 +5169,7 @@ fn t1170_symbolic_ref_unexpected_exit_fails() {
 
 #[test]
 fn t1170_collect_change_entries_classifies_worktree_shapes() {
-    let Some(repo) = T1170GitRepo::named("classify") else {
-        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
-    };
+    let repo = T1170GitRepo::named("classify");
     repo.commit_file("a.txt", "one\n", "add a");
     let base = git::stdout_text(&repo.dir, &["rev-parse", "HEAD~1"]).unwrap();
     // A path the range adds but the worktree lost reads as plain text.
@@ -5147,9 +5190,7 @@ fn t1170_collect_change_entries_classifies_worktree_shapes() {
 #[cfg(unix)]
 #[test]
 fn t1170_collect_change_entries_spots_symlinks() {
-    let Some(repo) = T1170GitRepo::named("symlink") else {
-        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
-    };
+    let repo = T1170GitRepo::named("symlink");
     repo.commit_file("a.txt", "one\n", "add a");
     std::fs::remove_file(repo.dir.join("a.txt")).unwrap();
     std::os::unix::fs::symlink("target", repo.dir.join("a.txt")).unwrap();
@@ -5161,9 +5202,7 @@ fn t1170_collect_change_entries_spots_symlinks() {
 
 #[test]
 fn t1170_copy_status_maps_to_copy_here() {
-    let Some(repo) = T1170GitRepo::named("copydetect") else {
-        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
-    };
+    let repo = T1170GitRepo::named("copydetect");
     let body: String = (1..=20).map(|n| format!("line {n}\n")).collect();
     repo.commit_file("a.txt", &body, "add a");
     // `-C` reports a copy only from a modified source to a
@@ -5192,14 +5231,17 @@ fn t1170_copy_status_maps_to_copy_here() {
     assert_eq!(copied.old_path.as_deref(), Some("a.txt"));
 }
 
+fn conduit_must_not_run_for_empty_log(
+    _: &str,
+    _: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    panic!("conduit must not run for an empty log")
+}
+
 #[test]
 fn t1170_working_copy_revisions_with_empty_log_returns_none() {
-    let Some(repo) = T1170GitRepo::named("emptylog") else {
-        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
-    };
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        panic!("conduit must not run for an empty log"); // LCOV_EXCL_LINE // Reason: must-not-call guard; firing fails the test
-    };
+    let repo = T1170GitRepo::named("emptylog");
+    let call = conduit_must_not_run_for_empty_log;
     let revisions =
         load_working_copy_revisions_git(&call, &repo.dir, "HEAD", "HEAD", "PHID-U").unwrap();
     assert!(revisions.is_empty());
@@ -5207,9 +5249,7 @@ fn t1170_working_copy_revisions_with_empty_log_returns_none() {
 
 #[test]
 fn t1170_raw_diff_bytes_failure_reports_stderr() {
-    let Some(repo) = T1170GitRepo::named("rawfail") else {
-        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
-    };
+    let repo = T1170GitRepo::named("rawfail");
     let err = get_raw_diff_bytes(&repo.dir, "missing-base", "f.txt").unwrap_err();
     assert!(err.contains("git diff failed"), "{err}");
 }
@@ -5317,15 +5357,21 @@ fn t1170_hg_working_copy_revisions_by_commit_hash() {
 }
 
 #[cfg(unix)]
+fn conduit_must_not_run_without_commits(
+    _: &str,
+    _: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    panic!("conduit must not run without commits")
+}
+
+#[cfg(unix)]
 #[test]
 fn t1170_hg_working_copy_revisions_empty_without_commits() {
     // No footer IDs and no local commits: empty without querying.
     let fake = T1170FakeHg::named("hgempty");
     fake.write(".resp-log", "n1\x01no trailer here\x02".as_bytes());
     fake.write(".resp-local", b"");
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        panic!("conduit must not run without commits"); // LCOV_EXCL_LINE // Reason: must-not-call guard; firing fails the test
-    };
+    let call = conduit_must_not_run_without_commits;
     let revisions =
         load_working_copy_revisions_hg(&call, &fake.dir, &fake.hg, "base", "default", "PHID-U")
             .unwrap();
@@ -5411,9 +5457,7 @@ fn t1170_lint_in_process_empty_engine_has_no_effect() {
 
 #[test]
 fn t1170_lint_in_process_comprehensive_run_collects() {
-    let Some(repo) = T1170GitRepo::named("lintrun") else {
-        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
-    };
+    let repo = T1170GitRepo::named("lintrun");
     std::fs::write(
         repo.dir.join(".arcconfig"),
         "{\"lint.engine\": \"ArcanistComprehensiveLintEngine\"}",
@@ -5628,6 +5672,13 @@ fn t1170_exit_code_value_maps_child_codes() {
     assert_eq!(exit_code_value(ExitCode::from(7)), 1);
 }
 
+fn expect_unit_code(dir: &std::path::Path, argv: &[String]) -> (i32, Vec<serde_json::Value>) {
+    match run_unit_in_process(dir, argv) {
+        ChildOutcome::Code(code, dicts) => (code, dicts),
+        _ => panic!("expected unit results"),
+    }
+}
+
 #[test]
 fn t1170_run_unit_in_process_collects_cargo_results() {
     // A scratch checkout (marker only) with an `.arcunit` sentinel
@@ -5649,13 +5700,9 @@ fn t1170_run_unit_in_process_collects_cargo_results() {
     )
     .unwrap();
     let argv = ["--engine".to_string(), "cargo".to_string()];
-    match run_unit_in_process(&dir, &argv) {
-        ChildOutcome::Code(code, dicts) => {
-            assert_eq!(code, 0);
-            assert_eq!(dicts.len(), 1);
-        }
-        _ => panic!("expected unit results"), // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    }
+    let (code, dicts) = expect_unit_code(&dir, &argv);
+    assert_eq!(code, 0);
+    assert_eq!(dicts.len(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5737,6 +5784,18 @@ fn t1170_select_reviewer_users_ignores_scalars() {
     assert_eq!(select_reviewer_users(&users, &["PHID-1"]).len(), 1);
 }
 
+/// Counting amend hook shared by the other-error test (which asserts
+/// the spy never runs) and its amended-path sibling (which drives it
+/// once).
+fn gap2_counting_amend(
+    amended: &std::cell::RefCell<usize>,
+) -> impl Fn(&str) -> Result<(), String> + '_ {
+    |_: &str| {
+        *amended.borrow_mut() += 1;
+        Ok(())
+    }
+}
+
 #[test]
 fn t1170_edit_create_message_other_error_without_draft() {
     use std::io::Cursor;
@@ -5745,10 +5804,7 @@ fn t1170_edit_create_message_other_error_without_draft() {
     let root = gap2_d1_scratch("loop-other");
     let meta = root.join(".git");
     let amended = std::cell::RefCell::new(0usize);
-    let amend = |_: &str| -> Result<(), String> {
-        *amended.borrow_mut() += 1; // LCOV_EXCL_START // Reason: spy asserted never called below; the flow takes the other path
-        Ok(())
-    }; // LCOV_EXCL_STOP
+    let amend = gap2_counting_amend(&amended);
     let passthrough = |template: &str| -> Result<String, String> { Ok(template.to_string()) };
     let mut input = Cursor::new(b"".to_vec());
     let mut out = Vec::new();
@@ -5767,6 +5823,38 @@ fn t1170_edit_create_message_other_error_without_draft() {
     let err = edit_create_message(&mut editor, template, template, false, false, &[]).unwrap_err();
     assert!(err.contains("Invalid \"Differential Revision\""), "{err}");
     assert_eq!(*amended.borrow(), 0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn t1170_edit_create_message_amended_path_runs_hook() {
+    use std::io::Cursor;
+    // Sibling of t1170_edit_create_message_other_error_without_draft:
+    // the same counting amend spy on the amended path, where the
+    // changed message reaches the hook once.
+    let root = gap2_d1_scratch("loop-other-amended");
+    let meta = root.join(".git");
+    let amended = std::cell::RefCell::new(0usize);
+    let amend = gap2_counting_amend(&amended);
+    let edit = |_: &str| -> Result<String, String> { Ok("Amended title\n".to_string()) };
+    let mut input = Cursor::new(b"".to_vec());
+    let mut out = Vec::new();
+    let mut editor = CreateMessageEditor {
+        reader: &mut input,
+        writer: &mut out,
+        call: &gap2_d1_ok_call,
+        metadata_dir: &meta,
+        work_root: &root,
+        edit: &edit,
+        amend_commit: Some(&amend),
+        user_phid: "PHID-USER-me",
+        away_offset: 0,
+    };
+    let message = edit_create_message(&mut editor, "Old\n", "Old\n", false, false, &[]).unwrap();
+    assert_eq!(*amended.borrow(), 1);
+    assert_eq!(message.raw_corpus, "Amended title\n");
+    // Amending never touches the scratch file.
+    assert!(diff::read_scratch_file(&meta, SCRATCH_CREATE_MESSAGE).is_none());
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -6630,9 +6718,7 @@ fn t1170_conduit_truthy_shapes_drive_amend_decision() {
 
 #[test]
 fn cov6g_resolve_explicit_base_ok() {
-    let Some(repo) = T1170GitRepo::named("cov6g-base") else {
-        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
-    };
+    let repo = T1170GitRepo::named("cov6g-base");
     repo.commit_file("a.txt", "a\n", "second");
     let sha = resolve_explicit_base(&repo.dir, "HEAD~1", "HEAD").unwrap();
     assert_eq!(sha.len(), 40);
@@ -6646,4 +6732,48 @@ fn gap2_d1_ok_call_rejects_unexpected_methods() {
     // anything else errors naming the call.
     let err = gap2_d1_ok_call("bogus.method", &serde_json::json!({})).unwrap_err();
     assert_eq!(err, "unexpected conduit call bogus.method");
+}
+
+/// `gap2_d1_scratch` with cleanup on drop, so `should_panic` tests do not leak.
+struct S5ScratchDir(std::path::PathBuf);
+
+impl Drop for S5ScratchDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+#[test]
+#[should_panic(expected = "expected unit results")]
+fn t1170_run_unit_in_process_collects_cargo_results_defensive_no_engine_arm() {
+    // `expect_unit_code` unwraps `Code`: a bare checkout has no engine.
+    let dir = S5ScratchDir(gap2_d1_scratch("s5-noengine"));
+    let argv = ["--engine".to_string(), "cargo".to_string()];
+    expect_unit_code(&dir.0, &argv);
+}
+// -( T1176 S10: stub/guard coverage )----------------------------------------
+
+#[test]
+fn must_not_call_conduit_companion_reports_the_canned_error() {
+    // The must-not-call guard keeps guarding: direct calls fail closed
+    // with the byte-identical message the callers propagate.
+    assert_eq!(
+        must_not_call_conduit("m", &serde_json::json!({})).unwrap_err(),
+        "must not call"
+    );
+}
+
+#[test]
+#[should_panic(expected = "conduit must not run for an empty log")]
+fn conduit_must_not_run_for_empty_log_companion_panics() {
+    // The empty-log guard keeps guarding: any conduit call panics.
+    let _ = conduit_must_not_run_for_empty_log("m", &serde_json::json!({}));
+}
+
+#[cfg(unix)]
+#[test]
+#[should_panic(expected = "conduit must not run without commits")]
+fn conduit_must_not_run_without_commits_companion_panics() {
+    // The no-commits guard keeps guarding: any conduit call panics.
+    let _ = conduit_must_not_run_without_commits("m", &serde_json::json!({}));
 }

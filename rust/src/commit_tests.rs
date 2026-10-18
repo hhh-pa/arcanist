@@ -668,3 +668,46 @@ fn t1170_flow_git_reports_silent_hook_failures() {
         "git commit failed"
     );
 }
+
+/// A fixture-local fake `git` program running `body` (Unix-only: the
+/// seam passes a script path, which needs a shebang plus `+x`).
+#[cfg(unix)]
+fn write_fake_git(dir: &Path, body: &str) -> PathBuf {
+    let script = dir.join("git");
+    std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+    script
+}
+
+#[cfg(unix)]
+#[test]
+fn flow_git_empty_success_output_falls_back() {
+    // White-box: real git always prints a summary on success, so the
+    // empty-output fallback is reachable only behind a fake backend.
+    let tmp = TempDir::new("git-empty");
+    let fake = write_fake_git(tmp.path(), "exit 0");
+    let mut options = empty_options();
+    options.messages = vec!["msg".to_string()];
+    assert_eq!(
+        flow_git_with(tmp.path(), &options, Some(&fake)),
+        Ok("committed.\n".to_string())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn flow_git_passes_through_nonempty_summaries() {
+    // The seam preserves the success path: git's summary passes
+    // through verbatim (plus the trailing newline).
+    let tmp = TempDir::new("git-summary");
+    let fake = write_fake_git(tmp.path(), "printf '%s\\n' '[master abc1234] msg'");
+    let mut options = empty_options();
+    options.messages = vec!["msg".to_string()];
+    assert_eq!(
+        flow_git_with(tmp.path(), &options, Some(&fake)),
+        Ok("[master abc1234] msg\n".to_string())
+    );
+}

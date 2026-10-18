@@ -792,11 +792,12 @@ fn certificate_flow_stages_exchanged_credentials() {
 
 #[test]
 fn stdin_prompts_on_pipes_fail_fast() {
-    // Piped stdin is never a TTY under `cargo test`; bail out (rather
-    // than block on a real terminal) if that ever changes.
-    if crate::prompt::stdin_is_terminal() {
-        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
-    }
+    // Piped stdin is never a TTY under `cargo test`; fail loud
+    // (rather than block on a real terminal) if that ever changes.
+    assert!(
+        !crate::prompt::stdin_is_terminal(),
+        "tests must run with non-TTY stdin"
+    );
     assert_eq!(prompt_token().unwrap_err(), crate::prompt::NOT_INTERACTIVE);
     assert_eq!(
         prompt_confirm("Q?", true).unwrap_err(),
@@ -854,12 +855,36 @@ fn install_arcrc_reports_missing_custom_files() {
 }
 
 #[test]
+fn install_arcrc_stages_unset_default() {
+    // `None` with no override stages the unset-HOME arm.
+    assert_eq!(
+        install_arcrc_for_with(None, None),
+        Err(std::process::ExitCode::FAILURE)
+    );
+    // A staged default resolves through the seam.
+    let tmp = TempDir::new("witharcrc");
+    let staged = tmp.path.join(".arcrc");
+    std::fs::write(&staged, "{}").unwrap();
+    assert_eq!(
+        install_arcrc_for_with(Some(staged.clone()), None),
+        Ok(staged.clone())
+    );
+    // A missing override still errors through the seam.
+    let missing = tmp.path.join("missing").to_string_lossy().to_string();
+    assert_eq!(
+        install_arcrc_for_with(Some(staged), Some(&missing)),
+        Err(std::process::ExitCode::FAILURE)
+    );
+}
+
+#[test]
 fn install_token_reads_prompt_without_a_flag() {
-    // Piped stdin is never a TTY under `cargo test`; bail out (rather
-    // than block on a real terminal) if that ever changes.
-    if crate::prompt::stdin_is_terminal() {
-        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
-    }
+    // Piped stdin is never a TTY under `cargo test`; fail loud
+    // (rather than block on a real terminal) if that ever changes.
+    assert!(
+        !crate::prompt::stdin_is_terminal(),
+        "tests must run with non-TTY stdin"
+    );
     let options = install_test_options();
     assert_eq!(
         install_token_value(&options),
@@ -870,13 +895,51 @@ fn install_token_reads_prompt_without_a_flag() {
 #[test]
 fn standard_token_confirm_skips_with_force() {
     assert!(confirm_standard_token(true).is_ok());
-    // Piped stdin is never a TTY under `cargo test`; bail out (rather
-    // than block on a real terminal) if that ever changes.
-    if crate::prompt::stdin_is_terminal() {
-        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
-    }
+    // Piped stdin is never a TTY under `cargo test`; fail loud
+    // (rather than block on a real terminal) if that ever changes.
+    assert!(
+        !crate::prompt::stdin_is_terminal(),
+        "tests must run with non-TTY stdin"
+    );
     assert_eq!(
         confirm_standard_token(false),
+        Err(std::process::ExitCode::FAILURE)
+    );
+}
+
+#[test]
+fn install_token_value_with_stages_prompt_arms() {
+    // `--token` wins trimmed without prompting; otherwise the
+    // injected prompt's success and failure arms route through.
+    let mut options = install_test_options();
+    options.token = Some("  cli-token  ".to_string());
+    assert_eq!(
+        install_token_value_with(&options, &|| panic!("must not prompt")),
+        Ok("cli-token".to_string())
+    );
+    let options = install_test_options();
+    assert_eq!(
+        install_token_value_with(&options, &|| Ok("prompted".to_string())),
+        Ok("prompted".to_string())
+    );
+    assert_eq!(
+        install_token_value_with(&options, &|| Err("piped".to_string())),
+        Err(std::process::ExitCode::FAILURE)
+    );
+}
+
+#[test]
+fn confirm_standard_token_with_stages_confirm_arms() {
+    // `--force` skips the ask; otherwise the injected confirm's
+    // yes/no/error arms route through.
+    assert!(confirm_standard_token_with(true, &|_| panic!("must not prompt")).is_ok());
+    assert!(confirm_standard_token_with(false, &|_| Ok(true)).is_ok());
+    assert_eq!(
+        confirm_standard_token_with(false, &|_| Ok(false)),
+        Err(std::process::ExitCode::FAILURE)
+    );
+    assert_eq!(
+        confirm_standard_token_with(false, &|_| Err("piped".to_string())),
         Err(std::process::ExitCode::FAILURE)
     );
 }
@@ -902,11 +965,12 @@ fn token_run_flow_rejects_bad_tokens() {
 
 #[test]
 fn token_run_flow_confirms_standard_tokens() {
-    // Piped stdin is never a TTY under `cargo test`; bail out (rather
-    // than block on a real terminal) if that ever changes.
-    if crate::prompt::stdin_is_terminal() {
-        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
-    }
+    // Piped stdin is never a TTY under `cargo test`; fail loud
+    // (rather than block on a real terminal) if that ever changes.
+    assert!(
+        !crate::prompt::stdin_is_terminal(),
+        "tests must run with non-TTY stdin"
+    );
     let tmp = TempDir::new("tokflow-std");
     let arcrc = tmp.path.join(".arcrc");
     let mut doc = serde_json::json!({});
@@ -956,14 +1020,22 @@ fn certificate_run_flow_exchanges_and_stages() {
     );
 }
 
+fn expect_prepare_failure(argv: &[String]) -> std::process::ExitCode {
+    let Err(code) = prepare_install(argv) else {
+        panic!("expected prepare_install to fail");
+    };
+    code
+}
+
 #[test]
 #[cfg(unix)]
 fn prepare_gates_on_open_arcrc_permissions() {
-    // Piped stdin is never a TTY under `cargo test`; bail out (rather
-    // than block on a real terminal) if that ever changes.
-    if crate::prompt::stdin_is_terminal() {
-        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
-    }
+    // Piped stdin is never a TTY under `cargo test`; fail loud
+    // (rather than block on a real terminal) if that ever changes.
+    assert!(
+        !crate::prompt::stdin_is_terminal(),
+        "tests must run with non-TTY stdin"
+    );
     let tmp = TempDir::new("prep-chmod");
     let path = open_arcrc(&tmp, 0o644);
     let argv = vec![
@@ -971,9 +1043,7 @@ fn prepare_gates_on_open_arcrc_permissions() {
         "--arcrc-file".to_string(),
         path.to_string_lossy().to_string(),
     ];
-    let Err(code) = prepare_install(&argv) else {
-        panic!("expected prepare_install to fail"); // LCOV_EXCL_LINE // Reason: defensive panic arm; the failure always matches
-    };
+    let code = expect_prepare_failure(&argv);
     assert_eq!(code, std::process::ExitCode::FAILURE);
 }
 
@@ -994,9 +1064,7 @@ fn prepare_rejects_invalid_arcrc_json() {
         "--arcrc-file".to_string(),
         path.to_string_lossy().to_string(),
     ];
-    let Err(code) = prepare_install(&argv) else {
-        panic!("expected prepare_install to fail"); // LCOV_EXCL_LINE // Reason: defensive panic arm; the failure always matches
-    };
+    let code = expect_prepare_failure(&argv);
     assert_eq!(code, std::process::ExitCode::FAILURE);
 }
 
@@ -1028,11 +1096,12 @@ fn install_flow_writes_legacy_certificates() {
 
 #[test]
 fn run_fails_fast_without_a_token() {
-    // Piped stdin is never a TTY under `cargo test`; bail out (rather
-    // than block on a real terminal) if that ever changes.
-    if crate::prompt::stdin_is_terminal() {
-        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
-    }
+    // Piped stdin is never a TTY under `cargo test`; fail loud
+    // (rather than block on a real terminal) if that ever changes.
+    assert!(
+        !crate::prompt::stdin_is_terminal(),
+        "tests must run with non-TTY stdin"
+    );
     let tmp = TempDir::new("run-notoken");
     let mut routes = std::collections::HashMap::new();
     routes.insert("conduit.ping".to_string(), "{}".to_string());
@@ -1082,11 +1151,8 @@ fn r10_install_certificate_help_matches_generated_format() {
     let ansi = usage_text(true);
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
     // `run()` prints `usage()` (same text, ambient ANSI mode).
-    assert!(
-        usage().contains("INSTALL-CERTIFICATE WORKFLOW"),
-        "{}",
-        usage() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    let text = usage();
+    assert!(text.contains("INSTALL-CERTIFICATE WORKFLOW"), "{text}");
 }
 
 #[test]
@@ -1152,4 +1218,119 @@ fn cov6g_arcrc_mode_metadata_race() {
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     churn.join().unwrap();
+}
+// -( T1176 S5: defensive-arm coverage )--------------------------------------
+
+#[test]
+#[should_panic(expected = "expected prepare_install to fail")]
+fn prepare_gates_on_open_arcrc_permissions_defensive_ok_arm() {
+    // `expect_prepare_failure` unwraps `Err`: a valid private arcrc stages `Ok`.
+    let tmp = TempDir::new("prep-ok");
+    let path = tmp.path.join("fresh-arcrc");
+    std::fs::write(&path, "{}").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&path, permissions).unwrap();
+    }
+    let argv = vec![
+        "https://h.example/".to_string(),
+        "--arcrc-file".to_string(),
+        path.to_string_lossy().to_string(),
+    ];
+    let _code = expect_prepare_failure(&argv);
+}
+
+// -( T1176 PC-1: env-globals )------------------------------------------------
+
+#[test]
+fn pc1_login_header_render_is_infallible() {
+    // White-box: `tsprintf_ansi` fails only on pattern/argc defects
+    // (adversarial cases below), so the fixed `"**%s**\n"` pattern
+    // with exactly one argument — the `read_install_token` call —
+    // cannot fail, and its `Err` arm pins `unreachable!`.
+    use arc_rs::terminal::{TVal, tsprintf_ansi};
+    let one = [TVal::Text("a")];
+    assert_eq!(
+        tsprintf_ansi("%s %s", &one, false).unwrap_err(),
+        "Too few arguments to xsprintf()."
+    );
+    assert_eq!(
+        tsprintf_ansi("%s", &[TVal::Text("a"), TVal::Text("b")], false).unwrap_err(),
+        "Too many arguments to xsprintf()."
+    );
+    assert!(
+        tsprintf_ansi("%5s", &one, false)
+            .unwrap_err()
+            .contains("does not support")
+    );
+    assert!(
+        tsprintf_ansi("%q", &one, false)
+            .unwrap_err()
+            .contains("Unsupported escape sequence")
+    );
+    assert_eq!(
+        render_login_header(false),
+        Ok("LOGIN TO PHABRICATOR\n".to_string())
+    );
+    assert_eq!(
+        render_login_header(true),
+        Ok("\u{1b}[1mLOGIN TO PHABRICATOR\u{1b}[m\n".to_string())
+    );
+}
+
+/// Probe marker: the deleted-cwd child re-runs only the probe test,
+/// so the suite never chdirs its own process (TZ-precedent shape).
+const PC1_DELETED_CWD_ENV: &str = "ARC_RS_PC1_INSTCERT_DELETED_CWD";
+#[cfg(unix)]
+const PC1_DELETED_CWD_PROBE: &str = "pc1_deleted_cwd_probe_install_plan";
+
+/// Probe body for `pc1_deleted_cwd_prepare_install_falls_back`:
+/// with a deleted cwd, `prepare_install` falls back to `"."` and the
+/// explicit-URI plan still resolves (missing arcrc reads empty, so no
+/// conduit traffic happens). Direct suite runs pass through.
+#[test]
+fn pc1_deleted_cwd_probe_install_plan() {
+    if std::env::var_os(PC1_DELETED_CWD_ENV).is_none() {
+        return;
+    }
+    println!("INSTCERT-PC1-DELETED-CWD-OK");
+    assert!(
+        std::env::current_dir().is_err(),
+        "probe premise: the child runs with a deleted cwd"
+    );
+    let plan = prepare_install(&["https://h.test/".to_string()]).expect("plan resolves");
+    assert!(plan.uri.contains("h.test"), "{}", plan.uri);
+}
+
+/// Deleted-cwd child: `sh` owns the cwd deletion (never the test
+/// process), then re-execs this test binary on the probe filter. The
+/// child HOME is an empty fixture; `ARC_CONDUIT_URI` stays unset so
+/// the positional URI is the only channel.
+#[test]
+#[cfg(unix)]
+fn pc1_deleted_cwd_prepare_install_falls_back() {
+    let tmp = TempDir::new("deleted-cwd-home");
+    let exe = std::env::current_exe().expect("test binary path");
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("d=$(mktemp -d); cd \"$d\"; rmdir \"$d\"; exec \"$0\" \"$@\"")
+        .arg(&exe)
+        .args(["--nocapture", PC1_DELETED_CWD_PROBE])
+        .env(PC1_DELETED_CWD_ENV, "1")
+        .env("HOME", &tmp.path)
+        .env_remove("ARC_CONDUIT_URI")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("spawn deleted-cwd probe child");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success()
+            && stdout.contains("1 passed")
+            && stdout.contains("INSTCERT-PC1-DELETED-CWD-OK"),
+        "deleted-cwd probe child failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
 }

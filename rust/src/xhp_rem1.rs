@@ -1085,7 +1085,7 @@ fn remove_loop_uses(tree: &Tree, scope: &ForeachScope, uses: &mut HashMap<String
         let start = tree.tokens[*iter].offset;
         if let Some(list) = uses.get_mut(name) {
             list.retain(|use_offset| *use_offset < start || *use_offset >= scope.end_offset);
-        } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
+        }
     }
 }
 
@@ -1957,9 +1957,6 @@ fn array_entry_key(tree: &Tree, first: usize, last: usize) -> Option<(String, us
         last + 1,
         kinds::T_DOUBLE_ARROW,
     )?;
-    if arrow == 0 {
-        return None; // LCOV_EXCL_LINE // Reason: dead: entries start after an opener, so a found arrow is never at index 0
-    }
     let (kfirst, klast) = trim_semantic(tree, first, arrow - 1)?;
     key_group(tree, kfirst, klast).map(|key| (key, kfirst))
 }

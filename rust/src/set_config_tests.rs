@@ -156,6 +156,35 @@ fn apply_user_sets_deletes_and_preserves_hosts() {
 }
 
 #[test]
+fn apply_user_opt_stages_unset_default_and_overrides() {
+    // `None` with no override stages the unset-HOME arm.
+    assert_eq!(
+        apply_user_opt(None, None, "editor", "vim").unwrap_err(),
+        "cannot locate ~/.arcrc (HOME/USERPROFILE is not set)"
+    );
+    let tmp = TempDir::new("user-opt");
+    // A staged default writes through the seam.
+    let path = tmp.path.join(".arcrc");
+    let message = apply_user_opt(Some(&path), None, "editor", "vim").unwrap();
+    assert_eq!(
+        message,
+        "Set key \"editor\" = \"vim\" in user config (was null)."
+    );
+    let doc = read_user_doc(&path).unwrap();
+    assert_eq!(doc["config"]["editor"], serde_json::json!("vim"));
+    // A hostile staged default (unparseable JSON) fails the write.
+    std::fs::write(&path, "{nope").unwrap();
+    assert!(apply_user_opt(Some(&path), None, "editor", "x").is_err());
+    // A missing `--arcrc-file` override errors like stock PHP.
+    let missing = tmp.path.join("missing");
+    assert!(
+        apply_user_opt(Some(&path), Some(&missing), "editor", "x")
+            .unwrap_err()
+            .contains("was specified, but it was not found")
+    );
+}
+
+#[test]
 fn local_files_roundtrip_at_explicit_roots() {
     let tmp = TempDir::new("local");
     let root = tmp.path.join("repo");

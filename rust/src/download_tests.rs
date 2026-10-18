@@ -11,6 +11,41 @@ fn args_of(words: &[&str]) -> Options {
     opts
 }
 
+fn expect_dl_error(words: &[&str], what: &str) -> String {
+    let ParseOutcome::Error(message) = parse_args(&argv(words)) else {
+        panic!("expected {what}");
+    };
+    message
+}
+
+fn expect_dl_tty_error(words: &[&str], what: &str) -> String {
+    let ParseOutcome::Error(message) = parse_args_with_tty(&argv(words), true) else {
+        panic!("expected {what}");
+    };
+    message
+}
+
+fn expect_dl_args(words: &[&str]) -> Options {
+    let ParseOutcome::Args(opts) = parse_args(&argv(words)) else {
+        panic!("expected args");
+    };
+    opts
+}
+
+fn expect_dl_execute_error(words: &[&str]) -> String {
+    match execute(&std::env::temp_dir(), &argv(words)) {
+        Err(message) => message,
+        _ => panic!("expected error"),
+    }
+}
+
+fn expect_dl_help(words: &[&str]) -> String {
+    match execute(&std::env::temp_dir(), &argv(words)) {
+        Ok(text) => text,
+        Err(message) => panic!("expected help, got {message}"),
+    }
+}
+
 #[test]
 fn parses_id_and_as() {
     // T1153 BROWSE-B21: piped runs carry `--`.
@@ -32,9 +67,7 @@ fn parses_id_and_as() {
 fn rejects_missing_extra_and_bad_symbols() {
     // T1153 BROWSE-B21: `--` present, so validation (not the
     // terminator) reports.
-    let ParseOutcome::Error(message) = parse_args(&argv(&["--"])) else {
-        panic!("expected error for no file"); // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    };
+    let message = expect_dl_error(&["--"], "error for no file");
     // T1153 DL-3: the live `runWorkflow()` no-argv text.
     assert_eq!(message, "Specify a file to download, like \"F123\".");
 
@@ -57,9 +90,7 @@ fn dl4_unknown_flag_uses_toolset_text() {
     // T1153 DL-4: unknown flags throw the full value
     // (`PhutilArgumentParser.php:819-825`); post-`--` leftovers
     // ride the wildcard into symbol validation instead.
-    let ParseOutcome::Error(message) = parse_args_with_tty(&argv(&["--bogus"]), true) else {
-        panic!("expected unknown-flag error"); // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    };
+    let message = expect_dl_tty_error(&["--bogus"], "unknown-flag error");
     assert_eq!(
         message,
         "Argument \"--bogus\" is unrecognized. Use \"--\" to indicate the end of flags."
@@ -323,14 +354,10 @@ fn r4_dld2_arg_errors_are_toolset_usage() {
     // Parse errors carry no usage dump.
     // T1153 BROWSE-B21: `--` present, so validation (not the
     // terminator) reports.
-    match parse_args(&argv(&["--"])) {
-        ParseOutcome::Error(message) => assert!(!message.contains("usage:"), "{message}"),
-        _ => panic!("expected parse error"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    }
-    match execute(&std::env::temp_dir(), &argv(&["--"])) {
-        Err(message) => assert!(!message.contains("usage:"), "{message}"),
-        _ => panic!("expected error"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    }
+    let message = expect_dl_error(&["--"], "parse error");
+    assert!(!message.contains("usage:"), "{message}");
+    let message = expect_dl_execute_error(&["--"]);
+    assert!(!message.contains("usage:"), "{message}");
 }
 
 #[test]
@@ -648,10 +675,8 @@ fn dl_d11_missing_data_uri_is_fatal_class() {
 fn dl_d14_empty_as_means_cwd_exists() {
     // A separate `--as ''` is an empty value (like `--as=`), which
     // resolves to the working directory: `already exists`.
-    match parse_args(&argv(&["--as", "", "--", "F1"])) {
-        ParseOutcome::Args(opts) => assert_eq!(opts.save_as, Some(String::new())),
-        _ => panic!("expected args"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    }
+    let opts = expect_dl_args(&["--as", "", "--", "F1"]);
+    assert_eq!(opts.save_as, Some(String::new()));
     let dir = dl_tempdir("emptyas");
     let file = dl_file(1, "f.bin", 1, "http://127.0.0.1:9/x");
     let err = resolve_target(&dir, Some(""), &file).unwrap_err();
@@ -805,9 +830,7 @@ fn parses_attached_flag_values() {
     assert_eq!(opts.save_as, Some("out.bin".to_string()));
     assert_eq!(opts.conduit_uri, Some("http://x/".to_string()));
     // A missing `--conduit-uri` value errors immediately.
-    let ParseOutcome::Error(message) = parse_args(&argv(&["--conduit-uri"])) else {
-        panic!("expected missing-value error"); // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    };
+    let message = expect_dl_error(&["--conduit-uri"], "missing-value error");
     assert_eq!(message, "--conduit-uri requires a value");
 }
 
@@ -1173,10 +1196,8 @@ fn dl_b23_help_matches_generated_format() {
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
     assert!(ansi.contains("\x1b[4m"), "{ansi:?}");
     // `--help` still exits zero once `--` satisfies the terminator.
-    match execute(&std::env::temp_dir(), &argv(&["--help", "--"])) {
-        Ok(text) => assert!(text.contains("DOWNLOAD WORKFLOW"), "{text}"),
-        Err(message) => panic!("expected help, got {message}"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    }
+    let text = expect_dl_help(&["--help", "--"]);
+    assert!(text.contains("DOWNLOAD WORKFLOW"), "{text}");
 }
 
 // -( T1170 wave 6h: helper-arm coverage )--------------------------------------
@@ -1214,9 +1235,91 @@ fn serve_helpers_release_aborted_connections() {
             std::thread::sleep(std::time::Duration::from_millis(20));
             if std::net::TcpStream::connect(&addr).is_err() {
                 break;
-            } // LCOV_EXCL_LINE // Reason: llvm brace-counter flake; line covered in prior run and the loop body executes
+            }
         }
         let released = std::net::TcpStream::connect(&addr).is_err();
         assert!(released, "aborted {url} never released");
     }
+}
+// -( T1176 S5: defensive-arm coverage )--------------------------------------
+
+#[test]
+#[should_panic(expected = "expected error for no file")]
+fn rejects_missing_extra_and_bad_symbols_defensive_args_arm() {
+    // `expect_dl_error` unwraps `Error`: a valid file symbol panics.
+    expect_dl_error(&["--", "F1"], "error for no file");
+}
+
+#[test]
+#[should_panic(expected = "expected unknown-flag error")]
+fn dl4_unknown_flag_uses_toolset_text_defensive_args_arm() {
+    // `expect_dl_tty_error` unwraps `Error`: a valid file symbol panics.
+    expect_dl_tty_error(&["--", "F1"], "unknown-flag error");
+}
+
+#[test]
+#[should_panic(expected = "expected args")]
+fn dl_d14_empty_as_means_cwd_exists_defensive_error_arm() {
+    // `expect_dl_args` unwraps `Args`: a missing file symbol panics.
+    expect_dl_args(&["--"]);
+}
+
+#[test]
+#[should_panic(expected = "expected error")]
+fn r4_dld2_arg_errors_are_toolset_usage_defensive_ok_arm() {
+    // `expect_dl_execute_error` unwraps `Err`: `--help` succeeds.
+    expect_dl_execute_error(&["--help", "--"]);
+}
+
+#[test]
+#[should_panic(expected = "expected help, got")]
+fn dl_b23_help_matches_generated_format_defensive_error_arm() {
+    // `expect_dl_help` unwraps `Ok`: a missing file symbol panics.
+    expect_dl_help(&["--"]);
+}
+
+/// The arcrc host key for a stub base, mirroring
+/// `config::host_key` (`{scheme}://{authority}/api/`).
+fn host_key_for(base: &str) -> String {
+    let after_scheme = base.split("://").nth(1).unwrap_or(base);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    let scheme = base.split("://").next().unwrap_or("https");
+    format!("{scheme}://{authority}/api/")
+}
+
+/// Fake arcrc granting a token for the stub `base`.
+fn fake_arcrc(dir: &std::path::Path, base: &str) -> std::path::PathBuf {
+    let path = dir.join("fake.arcrc");
+    let key = host_key_for(base);
+    std::fs::write(
+        &path,
+        format!(r#"{{"hosts": {{"{key}": {{"token": "x"}}}}}}"#),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn execute_downloads_through_configured_client() {
+    let dir = dl_tempdir("live");
+    let data_url = serve_bytes_once(b"payload-bytes".to_vec());
+    let hit = serde_json::json!({
+        "id": 7,
+        "phid": "PHID-FILE-7",
+        "fields": {"name": "f7.txt", "size": 13, "dataURI": data_url},
+    });
+    let page = serde_json::json!({"result": {"data": [hit]}, "error_code": null}).to_string();
+    let (base, rx) = serve_seq(vec![page]);
+    let arcrc = fake_arcrc(&dir, &base);
+    let out = execute_with_user_file(
+        &dir,
+        &argv(&["--conduit-uri", base.as_str(), "--", "F7"]),
+        Some(&arcrc),
+    )
+    .unwrap();
+    assert_eq!(out, String::new());
+    assert_eq!(std::fs::read(dir.join("f7.txt")).unwrap(), b"payload-bytes");
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(seen.len(), 1);
+    std::fs::remove_dir_all(&dir).ok();
 }

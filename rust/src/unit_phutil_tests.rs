@@ -1,6 +1,33 @@
 use super::*;
 use arc_rs::unit_engine::EngineError;
 
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-unit-phutil-tests-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
 #[test]
 fn selection_prefers_run_all_and_rejects_empty() {
     let all = select_tests(true, vec!["A".to_string()], vec!["B".to_string()]).unwrap();
@@ -21,17 +48,12 @@ fn coverage_gate_matches_xdebug_branches() {
     assert_eq!(resolve_coverage(Some(true), true).unwrap(), Some(true));
     let err = resolve_coverage(Some(true), false).unwrap_err();
     assert!(matches!(err, EngineError::Usage(_)));
+    let message = err.message();
     assert!(
-        err.message()
-            .contains("You specified --coverage but XDebug is not available"),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+        message.contains("You specified --coverage but XDebug is not available"),
+        "{message}"
     );
-    assert!(
-        err.message().contains("PhutilUnitTestEngine"),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    assert!(message.contains("PhutilUnitTestEngine"), "{message}");
 }
 
 #[test]
@@ -111,11 +133,8 @@ fn test_paths_skip_outside_and_unloaded() {
     let no_name = |_: &str| None;
     let err =
         get_test_paths(&["x.php".to_string()], "/", &root_for, &no_name, &is_file).unwrap_err();
-    assert!(
-        err.message().contains("not been loaded"),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    let message = err.message();
+    assert!(message.contains("not been loaded"), "{message}");
 
     // Symlink maze: path outside its library is skipped.
     let root_other = |_: &str| Some("/other".to_string());
@@ -150,15 +169,26 @@ fn php_discovery_probes_path() {
     assert_eq!(php_candidates(), &["php"]);
     assert_eq!(PHP_BINARY, "php");
     assert_eq!(INIT_SCRIPT_KEY, "unit.phutil.init-script");
-    // Self-consistent without assuming php is present or absent.
-    match php_on_path() {
-        // LCOV_EXCL_START // Reason: php-present arm; php is absent on ubuntu CI
-        Some(path) => assert_eq!(
-            php_argv_prefix(),
-            Some(vec![path.to_string_lossy().into_owned()]) // LCOV_EXCL_STOP
-        ),
-        None => assert_eq!(php_argv_prefix(), None),
-    }
+    // Staged present: a fake `php` file on an explicit search path.
+    let tmp = TempDir::new("php-present");
+    let php = tmp.path().join(PHP_BINARY);
+    std::fs::write(&php, b"x").unwrap();
+    let found = php_on_path_in(tmp.path().as_os_str()).unwrap();
+    assert_eq!(found, php);
+    assert_eq!(
+        php_argv_prefix_in(tmp.path().as_os_str()),
+        Some(vec![php.to_string_lossy().into_owned()])
+    );
+    // Staged absent: an empty search path resolves nothing.
+    let empty = tmp.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    assert_eq!(php_on_path_in(empty.as_os_str()), None);
+    assert_eq!(php_argv_prefix_in(empty.as_os_str()), None);
+    // The ambient wrappers stay consistent without assuming a result.
+    assert_eq!(
+        php_argv_prefix(),
+        php_on_path().map(|path| vec![path.to_string_lossy().into_owned()])
+    );
     assert_eq!(
         missing_php_message("phutil"),
         "Engine 'phutil' requires PHP on your $PATH (php) to execute phutil tests."
@@ -258,43 +288,33 @@ fn parses_driver_errors_and_empty_selection() {
 #[test]
 fn rejects_malformed_driver_output() {
     let err = parse_phutil_output("not json", "o.json").unwrap_err();
+    let message = err.message();
     assert!(
-        err.message()
-            .contains("cannot parse phutil output 'o.json'"),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+        message.contains("cannot parse phutil output 'o.json'"),
+        "{message}"
     );
 
     let err = parse_phutil_output(r#"{"results": [{"result": "pass"}]}"#, "o.json").unwrap_err();
-    assert!(
-        err.message().contains("missing its 'name'"),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    let message = err.message();
+    assert!(message.contains("missing its 'name'"), "{message}");
 
     let err = parse_phutil_output(r#"{"results": [{"name": "t"}]}"#, "o.json").unwrap_err();
-    assert!(
-        err.message().contains("missing its 'result'"),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    let message = err.message();
+    assert!(message.contains("missing its 'result'"), "{message}");
 
     let err = parse_phutil_output(
         r#"{"results": [{"name": "t", "result": "bogus"}]}"#,
         "o.json",
     )
     .unwrap_err();
-    assert!(
-        err.message().contains("unknown result code 'bogus'"),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    let message = err.message();
+    assert!(message.contains("unknown result code 'bogus'"), "{message}");
 
     let err = parse_phutil_output(r#"{"other": 1}"#, "o.json").unwrap_err();
+    let message = err.message();
     assert!(
-        err.message().contains("neither 'results' nor 'error'"),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+        message.contains("neither 'results' nor 'error'"),
+        "{message}"
     );
 
     let long = "t".repeat(256);
@@ -303,11 +323,8 @@ fn rejects_malformed_driver_output() {
         "o.json",
     )
     .unwrap_err();
-    assert!(
-        err.message().contains("maximum length"),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    let message = err.message();
+    assert!(message.contains("maximum length"), "{message}");
 }
 
 #[test]

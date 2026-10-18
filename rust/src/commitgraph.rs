@@ -280,7 +280,7 @@ fn ingest_record(
         for parent in &record.parents {
             node.add_parent(parent);
         }
-    } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
+    }
     for parent in &record.parents {
         graph.get_or_new_node(parent);
         if let Some(node) = graph.node_mut(parent) {

@@ -176,9 +176,6 @@ impl Linter for ScriptAndRegexLinter {
         // read from the project root when it names another file (T1153
         // LINT-27).
         let file_bytes = |file: &str| -> Option<Vec<u8>> {
-            if file == path {
-                return Some(data.to_vec()); // LCOV_EXCL_LINE // Reason: dead: messages_from_matches short-circuits file==path, so this arm never runs
-            }
             self.root
                 .as_deref()
                 .and_then(|root| std::fs::read(root.join(file)).ok())
@@ -470,8 +467,16 @@ pub fn binary_exists(candidate: &str) -> bool {
     if candidate.contains('/') || candidate.contains('\\') {
         return is_executable_file(path);
     }
-    let Some(dirs) = std::env::var_os("PATH") else {
-        return false; // LCOV_EXCL_LINE // Reason: PATH is always set in CI; the unset arm never runs
+    binary_exists_with_path(candidate, std::env::var_os("PATH"))
+}
+
+/// [`binary_exists`] over an explicit `PATH` value (test seam;
+/// production passes `var_os("PATH")`; unsetting `PATH` in-process
+/// would mutate ambient process state, so the `None` arm stages here
+/// instead of through a subprocess the binary never reaches).
+fn binary_exists_with_path(candidate: &str, dirs: Option<std::ffi::OsString>) -> bool {
+    let Some(dirs) = dirs else {
+        return false;
     };
     for dir in std::env::split_paths(&dirs) {
         let full = dir.join(candidate);

@@ -456,6 +456,22 @@ fn confirm_no(_: &str) -> Result<bool, String> {
     Ok(false)
 }
 
+#[test]
+fn confirm_interactive_errors_when_not_interactive() {
+    // `confirm_interactive` locks process stdin, which no hermetic
+    // test may read: under a terminal it would block waiting for
+    // input. Away from a terminal `console_confirm` refuses before
+    // reading, so only that arm pins here.
+    assert!(
+        !crate::prompt::stdin_is_terminal(),
+        "tests must run with non-TTY stdin"
+    );
+    assert_eq!(
+        confirm_interactive("Upgrade arc?").unwrap_err(),
+        crate::prompt::NOT_INTERACTIVE
+    );
+}
+
 fn set_readonly(path: &Path, readonly: bool) {
     let mut perms = std::fs::metadata(path).unwrap().permissions();
     perms.set_readonly(readonly);
@@ -980,10 +996,10 @@ fn download_refuses_checksum_problems_before_and_after_fetch() {
         run_mock(listener, vec![], seen.clone());
         let err = download_release_bytes(&format!("{base}dl/x"), 13, digest).unwrap_err();
         assert!(err.contains(needle), "{err}");
+        let seen_lines = seen.lock().unwrap().clone();
         assert!(
-            seen.lock().unwrap().is_empty(),
-            "pre-download gate must not fetch: {:?}",
-            seen.lock().unwrap() // LCOV_EXCL_LINE // Reason: assert-message expression; evaluates only if the passing assert fails
+            seen_lines.is_empty(),
+            "pre-download gate must not fetch: {seen_lines:?}"
         );
     }
 
@@ -1022,12 +1038,12 @@ fn install_replaces_copy() {
     let exe = exe_copy(&tmp.path, "tool-copy.exe", b"old-bytes");
     let backup = install_bytes_at(&exe, b"new-bytes").unwrap();
     assert_eq!(std::fs::read(&exe).unwrap(), b"new-bytes");
-    if cfg!(windows) {
-        let old = backup.expect("windows keeps the old image"); // LCOV_EXCL_START // Reason: windows-only assertions; cfg!(windows) is false on ubuntu CI
-        assert_eq!(std::fs::read(&old).unwrap(), b"old-bytes"); // LCOV_EXCL_STOP
-    } else {
-        assert!(backup.is_none());
-    }
+    #[cfg(windows)]
+    let old = backup.expect("windows keeps the old image");
+    #[cfg(windows)]
+    assert_eq!(std::fs::read(&old).unwrap(), b"old-bytes");
+    #[cfg(not(windows))]
+    assert!(backup.is_none());
     assert_no_leftovers(&tmp.path);
     #[cfg(unix)]
     {
@@ -1158,17 +1174,18 @@ fn execute_apply_updates_copy_end_to_end() {
     );
     assert!(saw(&seen, "releases/latest"));
     assert!(saw(&seen, "/dl/"));
-    if cfg!(windows) {
-        let backup = report.backup.clone().expect("windows keeps the old image"); // LCOV_EXCL_START // Reason: windows-only assertions; cfg!(windows) is false on ubuntu CI
-        assert_eq!(std::fs::read(&backup).unwrap(), b"old-bytes");
-        assert!(
-            report.stdout_text.contains("Previous executable kept as"), // LCOV_EXCL_STOP
-            "{:?}",
-            report.stdout_text
-        );
-    } else {
-        assert!(report.backup.is_none());
-    }
+    #[cfg(windows)]
+    let backup = report.backup.clone().expect("windows keeps the old image");
+    #[cfg(windows)]
+    assert_eq!(std::fs::read(&backup).unwrap(), b"old-bytes");
+    #[cfg(windows)]
+    assert!(
+        report.stdout_text.contains("Previous executable kept as"),
+        "{:?}",
+        report.stdout_text
+    );
+    #[cfg(not(windows))]
+    assert!(report.backup.is_none());
     assert_no_leftovers(&tmp.path);
     let json = apply_result_json(&report);
     assert_eq!(json["updated"], serde_json::json!(true));
@@ -1178,6 +1195,17 @@ fn execute_apply_updates_copy_end_to_end() {
         json["asset"]["digest"],
         serde_json::json!(format!("sha256:{}", sha256_hex(&body)))
     );
+}
+
+#[test]
+fn install_bytes_at_cleans_up_on_chmod_failure() {
+    let tmp = TempDir::new("chmod-fail");
+    let exe = exe_copy(&tmp.path, "tool.exe", b"old");
+    let err =
+        install_bytes_at_with(&exe, b"new", |_| Err("EACCES (injected)".to_string())).unwrap_err();
+    assert!(err.contains("EACCES"), "{err}");
+    assert_eq!(std::fs::read(&exe).unwrap(), b"old");
+    assert_no_leftovers(&tmp.path);
 }
 
 #[test]
@@ -1561,12 +1589,17 @@ fn exe_path_defaults_to_the_running_test_binary() {
     assert!(resolve_exe_path(&opts).unwrap().is_file());
 }
 
+fn expect_upgrade_error(argv: &[String]) -> String {
+    match parse_args_with_tty(argv, true) {
+        Parsed::Error(message) => message,
+        _ => panic!("post-terminator positional must be an error"),
+    }
+}
+
 #[test]
 fn args_reject_positionals_after_the_terminator() {
-    match parse_args_with_tty(&["--".to_string(), "x".to_string()], true) {
-        Parsed::Error(message) => assert_eq!(message, "unexpected argument 'x'"),
-        _ => panic!("post-terminator positional must be an error"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the error always matches
-    }
+    let message = expect_upgrade_error(&["--".to_string(), "x".to_string()]);
+    assert_eq!(message, "unexpected argument 'x'");
 }
 
 #[test]
@@ -1581,7 +1614,16 @@ fn apply_command_reports_unsupported_branches_without_network() {
         yes: true,
     };
     // Branch gating fails before any network fetch.
-    assert_eq!(run_apply_command(&repo.path, &options), ExitCode::FAILURE);
+    assert_eq!(
+        run_apply_command_with(
+            &repo.path,
+            &options,
+            RELEASE_API_BASE,
+            None,
+            &confirm_interactive
+        ),
+        ExitCode::FAILURE
+    );
 }
 
 #[test]
@@ -1648,4 +1690,193 @@ fn render_reports_up_to_date_status() {
     };
     let text = render(&status);
     assert!(text.contains("Status: up to date"), "{text}");
+}
+// -( T1176 S5: defensive-arm coverage )--------------------------------------
+
+#[test]
+#[should_panic(expected = "post-terminator positional must be an error")]
+fn args_reject_positionals_after_the_terminator_defensive_options_arm() {
+    // `expect_upgrade_error` unwraps `Error`: empty argv parses.
+    expect_upgrade_error(&[]);
+}
+// -( T1176 PC-4: work-upgrade demark )----------------------------------------
+
+/// Fake `git` staging a silent pull failure: `pull` exits nonzero with
+/// empty stdout/stderr, everything else succeeds quietly. Unix-only
+/// (shell script).
+#[cfg(unix)]
+#[test]
+fn apply_reports_silent_pull_failures() {
+    let repo = fresh_repo("silent-pull");
+    commit(&repo.path, "a.txt");
+    let target = resolve_apply_target(&repo.path).unwrap();
+    // The fake lives outside the repo so the checkout stays clean.
+    let bin = TempDir::new("silent-bin");
+    let fake = bin.path.join("fake-git.sh");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\ncase \" $* \" in\n*\" pull \"*) exit 1;;\n*) exit 0;;\nesac\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert_eq!(
+        run_apply_with_git(&target, Some(&fake)).unwrap_err(),
+        "git pull --rebase failed."
+    );
+}
+
+#[test]
+fn run_apply_command_reports_success() {
+    // The `Ok` arm of `run_apply_command_with`: a loopback release API
+    // serves a newer tarball, the scratch executable is replaced, and
+    // the command succeeds.
+    let tmp = TempDir::new("apply-cmd");
+    let exe = exe_copy(&tmp.path, "tool-copy.exe", b"old-bytes");
+    let body = tarball_bytes(&[(exe_member_name(), b"new-binary-bytes-v999")], &[]);
+    let name = format!("arc-{}.tar.gz", platform_tag());
+    let (listener, base, seen) = mock_listener();
+    let doc = release_doc(
+        "v9.9.9",
+        &format!("[{}]", asset_entry_checked(&name, &body, &base)),
+    );
+    run_mock(
+        listener,
+        vec![
+            json_route("releases/latest", &doc),
+            route("/dl/", "200 OK", body.clone()),
+        ],
+        seen.clone(),
+    );
+    let options = Options {
+        check: false,
+        json: false,
+        apply: true,
+        yes: true,
+    };
+    assert_eq!(
+        run_apply_command_with(&tmp.path, &options, &base, Some(&exe), &confirm_yes),
+        ExitCode::SUCCESS
+    );
+    assert_eq!(std::fs::read(&exe).unwrap(), b"new-binary-bytes-v999");
+    assert!(saw(&seen, "releases/latest"));
+    assert!(saw(&seen, "/dl/"));
+}
+
+#[test]
+fn run_apply_command_reports_success_as_json() {
+    // The `Ok` arm with `json`: same loopback release fetch, but the
+    // report renders as pretty JSON instead of plain text.
+    let tmp = TempDir::new("apply-cmd-json");
+    let exe = exe_copy(&tmp.path, "tool-copy.exe", b"old-bytes");
+    let body = tarball_bytes(&[(exe_member_name(), b"new-binary-bytes-v999")], &[]);
+    let name = format!("arc-{}.tar.gz", platform_tag());
+    let (listener, base, seen) = mock_listener();
+    let doc = release_doc(
+        "v9.9.9",
+        &format!("[{}]", asset_entry_checked(&name, &body, &base)),
+    );
+    run_mock(
+        listener,
+        vec![
+            json_route("releases/latest", &doc),
+            route("/dl/", "200 OK", body.clone()),
+        ],
+        seen.clone(),
+    );
+    let options = Options {
+        check: false,
+        json: true,
+        apply: true,
+        yes: true,
+    };
+    assert_eq!(
+        run_apply_command_with(&tmp.path, &options, &base, Some(&exe), &confirm_yes),
+        ExitCode::SUCCESS
+    );
+    assert_eq!(std::fs::read(&exe).unwrap(), b"new-binary-bytes-v999");
+    assert!(saw(&seen, "releases/latest"));
+    assert!(saw(&seen, "/dl/"));
+}
+
+#[test]
+fn run_apply_end_to_end_with_fixture_release() {
+    // `--apply` through `run_in_with`: argv parsing, the loopback
+    // release fetch, and the scratch-executable install all succeed.
+    let tmp = TempDir::new("apply-e2e");
+    let exe = exe_copy(&tmp.path, "tool-copy.exe", b"old-bytes");
+    let body = tarball_bytes(&[(exe_member_name(), b"new-binary-bytes-v999")], &[]);
+    let name = format!("arc-{}.tar.gz", platform_tag());
+    let (listener, base, seen) = mock_listener();
+    let doc = release_doc(
+        "v9.9.9",
+        &format!("[{}]", asset_entry_checked(&name, &body, &base)),
+    );
+    run_mock(
+        listener,
+        vec![
+            json_route("releases/latest", &doc),
+            route("/dl/", "200 OK", body.clone()),
+        ],
+        seen.clone(),
+    );
+    let argv = ["--apply".to_string(), "--yes".to_string(), "--".to_string()];
+    assert_eq!(
+        run_in_with(&tmp.path, &argv, &base, Some(&exe), &confirm_yes),
+        ExitCode::SUCCESS
+    );
+    assert_eq!(std::fs::read(&exe).unwrap(), b"new-binary-bytes-v999");
+    assert!(saw(&seen, "releases/latest"));
+}
+
+#[test]
+fn run_reports_corrupted_checkout_health() {
+    // A corrupted index keeps `is_inside_work_tree` true while `status`
+    // fails, so `inspect` errors and `run_in` reports FAILURE.
+    let repo = fresh_repo("corrupt-idx");
+    commit(&repo.path, "a.txt");
+    std::fs::write(
+        repo.path.join(".git").join("index"),
+        b"garbage-not-an-index",
+    )
+    .unwrap();
+    assert!(inspect(&repo.path).is_err());
+    assert_eq!(run_in(&repo.path, &["--".to_string()]), ExitCode::FAILURE);
+}
+
+#[test]
+fn run_check_fails_when_behind_upstream() {
+    // Ahead/behind pair over local paths only: the clone fetches the
+    // seed's second commit, lands behind, and `--check` fails while a
+    // plain run still succeeds.
+    let origin = TempDir::new("behind-origin");
+    git(&origin.path, &["init", "-q", "--bare", "-b", "master"]);
+    let seed = fresh_repo("behind-seed");
+    commit(&seed.path, "a.txt");
+    git(
+        &seed.path,
+        &["remote", "add", "origin", &origin.path.to_string_lossy()],
+    );
+    git(&seed.path, &["push", "-q", "-u", "origin", "master"]);
+    let work = TempDir::new("behind-work");
+    git(
+        &work.path,
+        &["clone", "-q", &origin.path.to_string_lossy(), "."],
+    );
+    git(&work.path, &["config", "user.email", "t@t"]);
+    git(&work.path, &["config", "user.name", "t"]);
+    git(&work.path, &["config", "commit.gpgsign", "false"]);
+    commit(&seed.path, "b.txt");
+    git(&seed.path, &["push", "-q", "origin", "master"]);
+    git(&work.path, &["fetch", "-q", "origin"]);
+    let status = inspect(&work.path).unwrap();
+    assert_eq!(status.behind, Some(1));
+    assert_eq!(update_available(&status), Some(true));
+    assert_eq!(
+        run_in(&work.path, &["--check".to_string(), "--".to_string()]),
+        ExitCode::FAILURE
+    );
+    assert_eq!(run_in(&work.path, &["--".to_string()]), ExitCode::SUCCESS);
 }

@@ -144,3 +144,26 @@ fn lint33_column_without_colon_matches_nothing() {
     // in ceb PHP's `/^(.*?):(\d+): (.*)$/` and is dropped.
     assert!(parse_output("a.py", "f.py:3:5 something odd\n").is_empty());
 }
+
+#[test]
+#[cfg(unix)]
+fn temp_write_failure_reports_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base =
+        std::env::temp_dir().join(format!("arc-rs-pyflakes-temp-fail-{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    let tool = base.join("fake-pyflakes");
+    std::fs::write(&tool, b"x").unwrap();
+    let locked = base.join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let mut linter = PyFlakesLinter {
+        temp_dir: Some(locked.clone()),
+        ..Default::default()
+    };
+    linter.options.bin = Some(tool);
+    assert!(linter.lint_bytes("a.py", b"x = 1").is_empty());
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::remove_dir_all(&base).ok();
+}

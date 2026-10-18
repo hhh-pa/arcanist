@@ -125,13 +125,22 @@ fn command_for(dir: &Path, hg: &HgCommand, args: &[&str]) -> std::process::Comma
 /// (parallel tests, an editor saving a hook); the error is transient by
 /// nature, so retry bounded, then return the last error unchanged.
 fn spawn_output(cmd: &mut std::process::Command) -> Result<std::process::Output, std::io::Error> {
+    spawn_output_with_limit(cmd, 50)
+}
+
+/// [`spawn_output`] with an injectable retry bound, so tests can exhaust
+/// the retries quickly instead of sleeping through all fifty.
+fn spawn_output_with_limit(
+    cmd: &mut std::process::Command,
+    max_attempts: u32,
+) -> Result<std::process::Output, std::io::Error> {
     let mut attempt = 0;
     loop {
         match cmd.output() {
-            Err(error) if is_text_file_busy(&error) && attempt < 50 => {
-                attempt += 1; // LCOV_EXCL_START // Reason: ETXTBSY retry; macOS exec never reports text-file-busy (probe-gated)
+            Err(error) if is_text_file_busy(&error) && attempt < max_attempts => {
+                attempt += 1;
                 std::thread::sleep(std::time::Duration::from_millis(2));
-            } // LCOV_EXCL_STOP
+            }
             other => return other,
         }
     }
@@ -421,10 +430,10 @@ fn apply_status_copy_source(
     result: &mut BTreeMap<String, HgStatusDetail>,
     last_path: &Option<String>,
     path: &str,
-    line: &str,
+    _line: &str,
 ) -> Result<(), String> {
     match last_path {
-        None => Err(format!("Unexpected copy source in hg status, '{line}'.")), // LCOV_EXCL_LINE // Reason: dead: trim() strips leading spaces, so a copy-source line is never first
+        None => unreachable!("trim() strips leading spaces, so a copy-source line is never first"),
         Some(prev) => {
             if let Some(detail) = result.get_mut(prev) {
                 detail.from = Some(path.to_string());
@@ -588,9 +597,6 @@ fn parse_mercurial_branch_line(line: &str) -> Option<(String, String, String)> {
         .unwrap_or(line);
     let (name, tail) = head.rsplit_once([' ', '\t'])?;
     let name = name.trim_end();
-    if name.is_empty() {
-        return None; // LCOV_EXCL_LINE // Reason: dead: an empty name needs a leading separator, rejected as whitespace above
-    }
     let (local, rev) = tail.split_once(':')?;
     if local.is_empty() || !local.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -739,9 +745,6 @@ fn parse_blame_line(line: &str) -> Option<(String, String)> {
 pub fn parse_blame(stdout: &str) -> Result<Vec<(String, String)>, String> {
     let mut blame = Vec::new();
     for line in stdout.split_inclusive('\n') {
-        if line.is_empty() {
-            continue; // LCOV_EXCL_LINE // Reason: dead: split_inclusive never yields empty items
-        }
         let Some(entry) = parse_blame_line(line) else {
             return Err(format!("Unable to parse Mercurial blame line: {line}"));
         };
@@ -2476,7 +2479,7 @@ pub fn migrate_scratch_dir(work_root: &Path, metadata: &Path) -> bool {
     }
     for name in &names {
         if std::fs::copy(old.join(name), new.join(name)).is_err() {
-            return false; // LCOV_EXCL_LINE // Reason: copy fails only via unreadable sources; gates run as root so chmod cannot trigger; covered on macOS runs
+            return false;
         }
     }
     std::fs::remove_dir_all(&old).is_ok() && !old.exists()

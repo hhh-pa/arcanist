@@ -537,11 +537,223 @@ fn t1170_confirm_interactive_errors_when_not_interactive() {
     // may read: under a terminal it would block waiting for input. Away
     // from a terminal `console_confirm` refuses before reading, so only
     // that arm pins here (CI and grading runs are non-interactive).
-    if crate::prompt::stdin_is_terminal() {
-        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
-    }
+    assert!(
+        !crate::prompt::stdin_is_terminal(),
+        "tests must run with non-TTY stdin"
+    );
     assert_eq!(
         confirm_interactive("Close revision D123?").unwrap_err(),
         crate::prompt::NOT_INTERACTIVE
     );
+}
+
+/// The arcrc host key for a stub base, mirroring
+/// `config::host_key` (`{scheme}://{authority}/api/`).
+fn host_key_for(base: &str) -> String {
+    let after_scheme = base.split("://").nth(1).unwrap_or(base);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    let scheme = base.split("://").next().unwrap_or("https");
+    format!("{scheme}://{authority}/api/")
+}
+
+/// Fake arcrc granting a token for the stub `base`.
+fn fake_arcrc(dir: &std::path::Path, base: &str) -> std::path::PathBuf {
+    let path = dir.join("fake.arcrc");
+    let key = host_key_for(base);
+    std::fs::write(
+        &path,
+        format!(r#"{{"hosts": {{"{key}": {{"token": "x"}}}}}}"#),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn run_reports_missing_revision_over_live_client() {
+    // No `--finalize`: an unknown revision errors before any prompt,
+    // so no stdin is needed.
+    let tmp = TempDir::new("live");
+    let base = serve_once(r#"{"result": [], "error_code": null}"#.to_string());
+    let arcrc = fake_arcrc(tmp.path(), &base);
+    assert_eq!(
+        run_with_user_file(
+            &args(&["--conduit-uri", base.as_str(), "D999"]),
+            Some(&arcrc)
+        ),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+// -( T1176 PC-3: export-conduit demark )---------------------------------------
+
+fn envelope(result: &str) -> String {
+    format!(r#"{{"result": {result}, "error_code": null}}"#)
+}
+
+/// Serve `expected` requests from `routes` (method -> envelope).
+fn serve(routes: std::collections::HashMap<String, String>, expected: usize) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for _ in 0..expected {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            let head_text = String::from_utf8_lossy(&head).to_string();
+            let len: usize = head_text
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(key, value)| {
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).unwrap();
+            let method = head_text
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .strip_prefix("/api/")
+                .unwrap_or("")
+                .to_string();
+            let canned = routes
+                .get(&method)
+                .cloned()
+                .unwrap_or_else(|| r#"{"result": null, "error_code": "ERR-NO-ROUTE"}"#.to_string());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                canned.len(),
+                canned
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    base
+}
+
+/// Canned ownership confirm answering yes (each canned hook is
+/// invoked by at least one test below).
+fn canned_yes(_prompt: &str) -> Result<bool, String> {
+    Ok(true)
+}
+
+/// Canned ownership confirm answering no.
+fn canned_no(_prompt: &str) -> Result<bool, String> {
+    Ok(false)
+}
+
+/// An accepted `differential.query` row with a landed commit, so the
+/// closing message is a plain `Done.` with no VCS probes.
+fn landed_revision(author: &str) -> serde_json::Value {
+    let mut rev = revision(STATUS_ACCEPTED, author);
+    rev["commits"] = serde_json::json!([{}]);
+    rev
+}
+
+#[test]
+fn t1176_pc3_run_live_closes_accepted_revision() {
+    // Someone else's accepted revision: the canned confirm accepts
+    // the ownership prompt and the close succeeds.
+    let tmp = TempDir::new("close-ok");
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "differential.query".to_string(),
+        envelope(&serde_json::json!([landed_revision("PHID-USER-9")]).to_string()),
+    );
+    routes.insert(
+        "user.whoami".to_string(),
+        envelope(r#"{"userName": "me", "phid": "PHID-USER-1"}"#),
+    );
+    routes.insert("differential.close".to_string(), envelope("{}"));
+    let base = serve(routes, 3);
+    let client = conduit::Client::new(&base, "t").unwrap();
+    let mut options = parse_args(&args(&["D123"])).unwrap().unwrap();
+    assert_eq!(
+        run_live(tmp.path(), &client, &mut options, &canned_yes),
+        std::process::ExitCode::SUCCESS
+    );
+}
+
+#[test]
+fn t1176_pc3_run_live_abort_reports_failure() {
+    // The canned confirm declines the ownership prompt: the close is
+    // refused before any `differential.close` call.
+    let tmp = TempDir::new("close-abort");
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "differential.query".to_string(),
+        envelope(&serde_json::json!([landed_revision("PHID-USER-9")]).to_string()),
+    );
+    routes.insert(
+        "user.whoami".to_string(),
+        envelope(r#"{"userName": "me", "phid": "PHID-USER-1"}"#),
+    );
+    let base = serve(routes, 2);
+    let client = conduit::Client::new(&base, "t").unwrap();
+    let mut options = parse_args(&args(&["D123"])).unwrap().unwrap();
+    assert_eq!(
+        run_live(tmp.path(), &client, &mut options, &canned_no),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn t1176_pc3_run_live_finalize_untracked_closes() {
+    // `--finalize` outside any repository: no repository PHID
+    // resolves (the stale value is overwritten), nothing prompts,
+    // and the accepted revision closes.
+    let tmp = TempDir::new("close-finalize");
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "differential.query".to_string(),
+        envelope(&serde_json::json!([landed_revision("PHID-USER-9")]).to_string()),
+    );
+    routes.insert("differential.close".to_string(), envelope("{}"));
+    let base = serve(routes, 2);
+    let client = conduit::Client::new(&base, "t").unwrap();
+    let mut options = parse_args(&args(&["--finalize", "D123"])).unwrap().unwrap();
+    options.repository_phid = Some("PHID-REPO-STALE".to_string());
+    assert_eq!(
+        run_live(tmp.path(), &client, &mut options, &canned_yes),
+        std::process::ExitCode::SUCCESS
+    );
+    assert_eq!(options.repository_phid, None);
+}
+
+#[test]
+fn t1176_pc3_run_live_finalize_errors_propagate() {
+    // `--finalize` with a configured callsign: a conduit failure
+    // while resolving the repository PHID fails the run before any
+    // close, leaving the PHID untouched.
+    let tmp = TempDir::new("close-finalize-err");
+    std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+    std::fs::write(
+        tmp.path().join(".arcconfig"),
+        r#"{"repository.callsign": "X"}"#,
+    )
+    .unwrap();
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "repository.query".to_string(),
+        r#"{"result": null, "error_code": "ERR-INVALID-AUTH", "error_info": "bad"}"#.to_string(),
+    );
+    let base = serve(routes, 1);
+    let client = conduit::Client::new(&base, "t").unwrap();
+    let mut options = parse_args(&args(&["--finalize", "D123"])).unwrap().unwrap();
+    options.repository_phid = Some("PHID-REPO-STALE".to_string());
+    assert_eq!(
+        run_live(tmp.path(), &client, &mut options, &canned_yes),
+        std::process::ExitCode::FAILURE
+    );
+    assert_eq!(options.repository_phid, Some("PHID-REPO-STALE".to_string()));
 }

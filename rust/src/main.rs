@@ -121,16 +121,22 @@ fn parse_call_conduit(rest: &[String]) -> Result<CallArgs, String> {
     use std::io::IsTerminal;
     let (result, notices) = parse_call_conduit_with(rest, std::io::stdin().is_terminal());
     let ansi = terminal::ansi_enabled();
-    for notice in &notices {
-        // LCOV_EXCL_START // Reason: autocorrect notices need TTY stdin; cargo-test stdin is never a TTY
+    report_call_notices(&notices, ansi);
+    result
+}
+
+/// Render spelling-correction notices to stderr, like PHP's scan-time
+/// logging (test seam: `parse_call_conduit` only sees notices on TTY
+/// stdin, which cargo-test stdin never is).
+fn report_call_notices(notices: &[String], ansi: bool) {
+    for notice in notices {
         eprint!(
             "{}",
             terminal::tsprintf_ansi("%s\n", &[terminal::TVal::Text(notice)], ansi)
                 .map(|t| t.to_string())
-                .unwrap_or_default() // LCOV_EXCL_STOP
+                .unwrap_or_default()
         );
     }
-    result
 }
 
 fn classify(argv: &[String]) -> Action {
@@ -267,11 +273,16 @@ fn find_command(name: &str) -> Option<CommandFn> {
 /// invocation (shell alias executed or broken chain). Unreadable
 /// configuration is a pass-through: each command surfaces its own
 /// config errors, so expansion must not break unrelated commands.
-fn apply_alias_expansion(argv: Vec<String>) -> Result<Vec<String>, ExitCode> {
+/// The working copy and user file are explicit so hermetic tests can
+/// stage a fixture HOME instead of the real one.
+fn apply_alias_expansion_in(
+    argv: Vec<String>,
+    dir: &std::path::Path,
+    user_file: Option<&std::path::Path>,
+) -> Result<Vec<String>, ExitCode> {
     let (outcome, notices) = alias::apply_expansion_with(
         argv,
-        || alias::load_aliases().ok(),
-        // LCOV_EXCL_START // Reason: shell-alias spawn needs aliases from real HOME/cwd config; neither is hermetically stageable
+        || alias::load_aliases_in(dir, user_file).ok(),
         |shell_argv| {
             // Shell words are never empty here (creation requires a
             // command); an empty `sh -c ''` would exit 0 like PHP's
@@ -285,11 +296,11 @@ fn apply_alias_expansion(argv: Vec<String>) -> Result<Vec<String>, ExitCode> {
                 .status()
                 .map(|status| alias::shell_status_from_exit_status(&status))
                 .map_err(|e| e.to_string())
-        }, // LCOV_EXCL_STOP
+        },
     );
     for notice in &notices {
-        eprintln!("{notice}"); // LCOV_EXCL_START // Reason: expansion notices need real-config aliases; unit tests stage none
-    } // LCOV_EXCL_STOP
+        eprintln!("{notice}");
+    }
     outcome
 }
 
@@ -564,13 +575,12 @@ fn strip_config(argv: &[String], globals: &mut Globals) -> Result<Vec<String>, G
                 next.clone()
             }
         };
-        match name {
-            // `--library` names PHP libraries (nothing to load in a
-            // static binary): parsed, ignored.
-            "library" => {}
-            "config" => globals.config.push(value),
-            "config-file" => globals.config_files.push(value),
-            _ => {} // LCOV_EXCL_LINE // Reason: dead arm; the allowlist guard above admits only the three handled flags
+        // `--library` names PHP libraries (nothing to load in a
+        // static binary): parsed, ignored.
+        if name == "config" {
+            globals.config.push(value);
+        } else if name == "config-file" {
+            globals.config_files.push(value);
         }
         index += 1;
     }
@@ -616,10 +626,10 @@ fn strip_toolset(argv: &[String], globals: &mut Globals) -> Result<Vec<String>, 
                 "Argument \"--{name}\" was provided twice."
             )));
         }
-        match name {
-            "conduit-uri" => globals.conduit_uri = Some(value),
-            "conduit-token" => globals.conduit_token = Some(value),
-            _ => {} // LCOV_EXCL_LINE // Reason: dead arm; the allowlist guard above admits only the two handled flags
+        if name == "conduit-uri" {
+            globals.conduit_uri = Some(value);
+        } else {
+            globals.conduit_token = Some(value);
         }
         index += 1;
     }
@@ -2873,27 +2883,45 @@ fn dispatch_inner(argv: &[String], globals: &Globals) -> ExitCode {
     dispatch_action(classify(argv), argv, globals)
 }
 
-/// Binary entry: strip globals, trace, expand aliases, gate the
-/// non-interactive `--` rule, dispatch. T1153 CORE-18 stays unported
-/// (Rule 3): PHP's SIGINT double-press routing needs `pcntl_signal`,
-/// which has no `std` equivalent (`libc` is transitive-only and
-/// `Cargo.toml` is frozen), so interrupts keep the default behavior.
+/// Binary entry: [`run_with_argv`] on the real process argv. T1153
+/// CORE-18 stays unported (Rule 3): PHP's SIGINT double-press routing
+/// needs `pcntl_signal`, which has no `std` equivalent (`libc` is
+/// transitive-only and `Cargo.toml` is frozen), so interrupts keep
+/// the default behavior.
 fn main() -> ExitCode {
-    let full: Vec<String> = std::env::args().collect();
+    run_with_argv(&std::env::args().collect::<Vec<String>>())
+}
+
+/// `main` on an explicit argv slice (test seam: slice tests stage bad
+/// globals without touching the real process argv).
+fn run_with_argv(full: &[String]) -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    run_with_argv_in(full, &cwd, config::arcrc_path().as_deref())
+}
+
+/// [`run_with_argv`] with an explicit working copy and user file for
+/// alias expansion (test seam: hermetic tests stage a fixture HOME).
+/// Strip globals, trace, expand aliases, gate the non-interactive
+/// `--` rule, dispatch.
+fn run_with_argv_in(
+    full: &[String],
+    dir: &std::path::Path,
+    user_file: Option<&std::path::Path>,
+) -> ExitCode {
     let argv: Vec<String> = full.iter().skip(1).cloned().collect();
     let (stripped, globals) = match strip_globals(&argv) {
         Ok(pair) => pair,
-        Err(error) => return conduit::report(error.kind, &error.message), // LCOV_EXCL_LINE // Reason: bad globals in the real process argv; unit tests cannot stage argv
+        Err(error) => return conduit::report(error.kind, &error.message),
     };
     if let Err(error) = apply_globals(&globals) {
         return conduit::report(error.kind, &error.message);
     }
     if terminal::trace_enabled() {
-        trace_argv(&full);
+        trace_argv(full);
     }
-    let argv = match apply_alias_expansion(stripped) {
+    let argv = match apply_alias_expansion_in(stripped, dir, user_file) {
         Ok(argv) => argv,
-        Err(code) => return code, // LCOV_EXCL_LINE // Reason: alias expansion handles the invocation only with real-config aliases
+        Err(code) => return code,
     };
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) && needs_terminator_error(&argv) {
         let ansi = terminal::ansi_enabled();

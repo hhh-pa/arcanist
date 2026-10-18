@@ -33,11 +33,8 @@ fn well_formed_documents_pass() {
         b"<r>a</r>   \n  <!-- ok -->\n",
     ];
     for data in docs {
-        assert!(
-            check_well_formed(data).is_ok(),
-            "for {}",
-            String::from_utf8_lossy(data), // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-        );
+        let text = String::from_utf8_lossy(data);
+        assert!(check_well_formed(data).is_ok(), "for {text}");
         assert!(XmlLinter::new().lint_bytes("f.xml", data).is_empty());
     }
 }
@@ -221,10 +218,10 @@ fn attribute_value_edges() {
     ];
     for (data, fragment) in cases {
         let error = check_well_formed(data).expect_err("should fail");
+        let text = String::from_utf8_lossy(data);
         assert!(
             error.message.contains(fragment),
-            "{}: {}",
-            String::from_utf8_lossy(data), // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+            "{text}: {}",
             error.message
         );
     }
@@ -275,10 +272,10 @@ fn processing_instruction_edges() {
     ];
     for (data, fragment) in cases {
         let error = check_well_formed(data).expect_err("should fail");
+        let text = String::from_utf8_lossy(data);
         assert!(
             error.message.contains(fragment),
-            "{}: {}",
-            String::from_utf8_lossy(data), // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+            "{text}: {}",
             error.message
         );
     }
@@ -316,10 +313,10 @@ fn xml_declaration_attribute_edges() {
     ];
     for (data, fragment) in cases {
         let error = check_well_formed(data).expect_err("should fail");
+        let text = String::from_utf8_lossy(data);
         assert!(
             error.message.contains(fragment),
-            "{}: {}",
-            String::from_utf8_lossy(data), // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+            "{text}: {}",
             error.message
         );
     }
@@ -336,10 +333,10 @@ fn doctype_edges() {
     ];
     for (data, fragment) in cases {
         let error = check_well_formed(data).expect_err("should fail");
+        let text = String::from_utf8_lossy(data);
         assert!(
             error.message.contains(fragment),
-            "{}: {}",
-            String::from_utf8_lossy(data), // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+            "{text}: {}",
             error.message
         );
     }
@@ -368,10 +365,10 @@ fn start_tag_and_content_edges() {
     ];
     for (data, fragment) in cases {
         let error = check_well_formed(data).expect_err("should fail");
+        let text = String::from_utf8_lossy(data);
         assert!(
             error.message.contains(fragment),
-            "{}: {}",
-            String::from_utf8_lossy(data), // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+            "{text}: {}",
             error.message
         );
     }

@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use crate::{
     argparse,
     conduit::{self, EnvelopeKind},
-    config, get_config, git, grid, markers,
+    config, get_config, git, grid, hg, markers,
 };
 
 pub const NAME: &str = "branches";
@@ -254,6 +254,16 @@ fn check_branches_support(dir: &Path) -> Result<&'static str, String> {
 
 /// Run the workflow rooted at `dir`, returning stdout text or an error message.
 pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
+    execute_with_user_file(dir, argv, config::arcrc_path().as_deref())
+}
+
+/// [`execute`] with an explicit credential file (test seam: hermetic
+/// tests stage a fake arcrc instead of touching HOME).
+fn execute_with_user_file(
+    dir: &Path,
+    argv: &[String],
+    user_file: Option<&Path>,
+) -> Result<String, String> {
     let options = match parse_options(argv) {
         Ok(Some(options)) => options,
         Ok(None) => return Ok(usage()),
@@ -262,7 +272,13 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
     };
     if options.json {
         // The `--json` extension never calls conduit; it stays offline.
-        return execute_core(dir, &options, grid::terminal_width(), None);
+        return execute_core(
+            dir,
+            &options,
+            grid::terminal_width(),
+            None,
+            &hg::HgCommand::system(),
+        );
     }
     // T1153 LAND-28: the working-copy/support gate runs before
     // conduit setup — PHP's getRepositoryAPI (and its usage error)
@@ -274,13 +290,19 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
     let owned_client = match config::client_for_tokenless_with(
         options.conduit_uri.as_deref(),
         dir,
-        config::arcrc_path().as_deref(),
+        user_file,
         &get_config::LoadOptions::default(),
     ) {
         Ok(client) => client,
         Err(message) => return Err(conduit::toolset_setup_message(&message)),
     };
-    execute_core(dir, &options, grid::terminal_width(), Some(&owned_client))
+    execute_core(
+        dir,
+        &options,
+        grid::terminal_width(),
+        Some(&owned_client),
+        &hg::HgCommand::system(),
+    )
 }
 
 /// Run the workflow with an explicit terminal width and conduit client.
@@ -298,7 +320,7 @@ pub fn execute_with_client(
         // T1153 RB-D4 (R4): PHP renders usage errors with no dump.
         Err(message) => return Err(message),
     };
-    execute_core(dir, &options, terminal, client)
+    execute_core(dir, &options, terminal, client, &hg::HgCommand::system())
 }
 
 fn execute_core(
@@ -306,6 +328,7 @@ fn execute_core(
     options: &Options,
     terminal: Option<usize>,
     client: Option<&crate::conduit::Client>,
+    hg_command: &hg::HgCommand,
 ) -> Result<String, String> {
     // T1153 LAND-28: outside a repository PHP resolves a
     // `filesystem` API, whose empty marker-type list fails the
@@ -315,8 +338,8 @@ fn execute_core(
     if options.json {
         return match detect_vcs(dir) {
             Some("hg") => {
-                let found = markers::list(dir, markers::MARKER_TYPE_BRANCH)?;
-                let branches: Vec<Branch> = found // LCOV_EXCL_START // Reason: needs system hg; markers::list shells hg, absent on ubuntu CI
+                let found = markers::list_with(dir, markers::MARKER_TYPE_BRANCH, hg_command)?;
+                let branches: Vec<Branch> = found
                     .iter()
                     .map(|marker| Branch {
                         name: marker.name.clone(),
@@ -331,7 +354,7 @@ fn execute_core(
                 let mut text = serde_json::to_string_pretty(&format_json(&branches))
                     .map_err(|e| format!("failed to encode JSON: {e}"))?;
                 text.push('\n');
-                Ok(text) // LCOV_EXCL_STOP
+                Ok(text)
             }
             _ => {
                 let branches = list(dir, options.all)?;
@@ -353,7 +376,13 @@ fn execute_core(
 }
 
 pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
-    match execute(dir, argv) {
+    run_in_with_user_file(dir, argv, config::arcrc_path().as_deref())
+}
+
+/// [`run_in`] with an explicit credential file (test seam: hermetic
+/// tests stage a fake arcrc instead of touching HOME).
+fn run_in_with_user_file(dir: &Path, argv: &[String], user_file: Option<&Path>) -> ExitCode {
+    match execute_with_user_file(dir, argv, user_file) {
         Ok(text) => {
             print!("{text}");
             ExitCode::SUCCESS
@@ -368,15 +397,23 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
             // guidance (the toolset runtime's auth arm). The calls
             // went out on a strict client, re-resolved here for the
             // mapping context (config reads only, no I/O).
-            let client = parse_options(argv)
+            // Byte-identical to `config::client_for(..)` when the
+            // wrapper passes the ambient user file (same cwd fallback).
+            let config_dir =
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let client = parse_options(argv).ok().flatten().and_then(|options| {
+                config::client_for_with(
+                    options.conduit_uri.as_deref(),
+                    &config_dir,
+                    user_file,
+                    &get_config::LoadOptions::default(),
+                )
                 .ok()
-                .flatten()
-                .and_then(|options| config::client_for(options.conduit_uri.as_deref()).ok());
+            });
             if let Some(client) = client
-                // LCOV_EXCL_START // Reason: needs a configured conduit client; hermetic tests cannot mint one (HOME is process-global)
                 && let Some(code) = conduit::auth_report_for(&client, &message)
             {
-                return code; // LCOV_EXCL_STOP
+                return code;
             }
             // T1153 RB-D4 (R4): `branches` runs in the toolset
             // runtime (via `ArcanistMarkersWorkflow`). Argument,
