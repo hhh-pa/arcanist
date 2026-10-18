@@ -906,27 +906,45 @@ fn install_arcrc_for(arcrc_file: Option<&str>) -> Result<PathBuf, ExitCode> {
 /// Read the token: `--token` (trimmed like prompted input) or the
 /// interactive prompt loop.
 fn install_token_value(options: &Options) -> Result<String, ExitCode> {
+    install_token_value_with(options, &prompt_token)
+}
+
+/// [`install_token_value`] with an injectable token prompt (test
+/// seam; production passes [`prompt_token`]).
+fn install_token_value_with(
+    options: &Options,
+    prompt: &dyn Fn() -> Result<String, String>,
+) -> Result<String, ExitCode> {
     if let Some(token) = options.token.as_deref().map(str::trim)
         && !token.is_empty()
     {
         return Ok(token.to_string());
     }
-    match prompt_token() {
-        Ok(token) => Ok(token), // LCOV_EXCL_LINE // Reason: prompt success arm; needs a TTY
+    match prompt() {
+        Ok(token) => Ok(token),
         Err(message) => Err(fail(message)),
     }
 }
 
 /// Confirm installing a standard `api-` token (`--force` skips the ask).
 fn confirm_standard_token(force: bool) -> Result<(), ExitCode> {
+    confirm_standard_token_with(force, &|question| prompt_confirm(question, true))
+}
+
+/// [`confirm_standard_token`] with an injectable confirm fn (test
+/// seam; production passes [`prompt_confirm`] with `default_no`).
+fn confirm_standard_token_with(
+    force: bool,
+    confirm: &dyn Fn(&str) -> Result<bool, String>,
+) -> Result<(), ExitCode> {
     if force {
         return Ok(());
     }
     print!("{}", standard_token_notice());
     let _ = std::io::stdout().flush();
-    match prompt_confirm(CONFIRM_INSTALL_ANYWAY, true) {
-        Ok(true) => Ok(()), // LCOV_EXCL_START // Reason: confirm arms; need a TTY
-        Ok(false) => Err(fail(NOT_INSTALLING.to_string())), // LCOV_EXCL_STOP
+    match confirm(CONFIRM_INSTALL_ANYWAY) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(fail(NOT_INSTALLING.to_string())),
         Err(message) => Err(fail(message)),
     }
 }

@@ -456,6 +456,22 @@ fn confirm_no(_: &str) -> Result<bool, String> {
     Ok(false)
 }
 
+#[test]
+fn confirm_interactive_errors_when_not_interactive() {
+    // `confirm_interactive` locks process stdin, which no hermetic
+    // test may read: under a terminal it would block waiting for
+    // input. Away from a terminal `console_confirm` refuses before
+    // reading, so only that arm pins here.
+    assert!(
+        !crate::prompt::stdin_is_terminal(),
+        "tests must run with non-TTY stdin"
+    );
+    assert_eq!(
+        confirm_interactive("Upgrade arc?").unwrap_err(),
+        crate::prompt::NOT_INTERACTIVE
+    );
+}
+
 fn set_readonly(path: &Path, readonly: bool) {
     let mut perms = std::fs::metadata(path).unwrap().permissions();
     perms.set_readonly(readonly);

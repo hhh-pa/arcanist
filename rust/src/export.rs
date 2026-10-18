@@ -563,11 +563,20 @@ fn export_prompt_line(prompt: &str) -> Option<String> {
     print!("{}", crate::prompt::prompt_text(prompt));
     use std::io::Write;
     std::io::stdout().flush().ok();
-    if !crate::prompt::stdin_is_terminal() {
+    export_prompt_line_with(
+        &mut std::io::stdin().lock(),
+        crate::prompt::stdin_is_terminal(),
+    )
+}
+
+/// [`export_prompt_line`] with injected input and TTY flag (test
+/// seam; production passes real stdin and its TTY state).
+fn export_prompt_line_with(input: &mut dyn std::io::BufRead, stdin_tty: bool) -> Option<String> {
+    if !stdin_tty {
         EXPORT_PROMPT_TTY_FAILED.set(true);
         return None;
-    } // LCOV_EXCL_START // Reason: needs a TTY; stdin is never a terminal under cargo test
-    crate::prompt::read_answer(&mut std::io::stdin().lock()) // LCOV_EXCL_STOP
+    }
+    crate::prompt::read_answer(input)
 }
 
 /// Resolve the local base commit: an explicit base goes through

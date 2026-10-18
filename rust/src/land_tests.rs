@@ -7666,11 +7666,12 @@ fn t1170_execute_engine_reports_discovery_failure() {
 #[test]
 fn t1170_prompts_abort_on_exhausted_answers() {
     // Piped stdin is never a TTY under `cargo test` and reads EOF, so
-    // an answerless TTY session aborts; bail out (rather than block
+    // an answerless TTY session aborts; fail loud (rather than block
     // on a real terminal) if that ever changes.
-    if crate::prompt::stdin_is_terminal() {
-        return; // LCOV_EXCL_LINE // Reason: bail-out for real-terminal runs; cargo test stdin is never a TTY
-    }
+    assert!(
+        !crate::prompt::stdin_is_terminal(),
+        "tests must run with non-TTY stdin"
+    );
     assert_eq!(
         prompt_for_key(&mut Io::canned(&[]), "k", "q?").unwrap_err(),
         ABORT
@@ -8081,11 +8082,12 @@ fn t1170_classified_runs_skip_configured_writers() {
 
 #[test]
 fn t1170_run_in_reports_missing_terminator() {
-    // Piped stdin is never a TTY under `cargo test`; bail out (rather
-    // than parse differently) if that ever changes.
-    if crate::prompt::stdin_is_terminal() {
-        return; // LCOV_EXCL_LINE // Reason: bail-out for real-terminal runs; cargo test stdin is never a TTY
-    }
+    // Piped stdin is never a TTY under `cargo test`; fail loud
+    // (rather than parse differently) if that ever changes.
+    assert!(
+        !crate::prompt::stdin_is_terminal(),
+        "tests must run with non-TTY stdin"
+    );
     let dir = temp_dir("t1170-terminator");
     assert_eq!(
         run_in(&dir, &args(&["--preview"])),

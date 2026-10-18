@@ -591,6 +591,34 @@ fn upx_b23_paste_help_matches_generated_format() {
 // -( T1170 COV5: close paste.rs )------------------------------------------------
 
 #[test]
+fn read_stdin_bytes_with_stages_both_tty_arms() {
+    // The injected seam stages both arms: the INPUT hint plus bytes
+    // on a TTY, bare bytes on a pipe.
+    let mut tty = std::io::Cursor::new("paste-bytes");
+    assert_eq!(
+        read_stdin_bytes_with(&mut tty, true).unwrap(),
+        b"paste-bytes"
+    );
+    let mut piped = std::io::Cursor::new("piped-bytes");
+    assert_eq!(
+        read_stdin_bytes_with(&mut piped, false).unwrap(),
+        b"piped-bytes"
+    );
+}
+
+#[test]
+fn read_stdin_bytes_reads_real_stdin_to_eof() {
+    // The ambient wrapper reads real stdin to EOF; cargo-test stdin
+    // is always EOF. Fail loud (rather than block on a real
+    // terminal) if that ever changes.
+    assert!(
+        !crate::prompt::stdin_is_terminal(),
+        "tests must run with non-TTY stdin"
+    );
+    assert_eq!(read_stdin_bytes().unwrap(), b"");
+}
+
+#[test]
 #[should_panic(expected = "expected args")]
 fn args_of_panics_on_parse_error() {
     args_of(&["P1", "P2", "--"]);

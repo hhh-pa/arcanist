@@ -528,10 +528,20 @@ pub fn create_paste(
 
 /// `ArcanistWorkflow::readStdin()`: the `INPUT` hint on interactive stdin
 /// (T1153 PASTE-P15), then all input bytes.
-// LCOV_EXCL_START // Reason: reads real stdin (blocks on a terminal); tests inject stdin_text instead
 fn read_stdin_bytes() -> Result<Vec<u8>, String> {
-    use std::io::Read;
-    if crate::prompt::stdin_is_terminal() {
+    read_stdin_bytes_with(
+        &mut std::io::stdin().lock(),
+        crate::prompt::stdin_is_terminal(),
+    )
+}
+
+/// [`read_stdin_bytes`] with injected input and TTY flag (test seam;
+/// production passes real stdin and its TTY state).
+fn read_stdin_bytes_with(
+    input: &mut dyn std::io::BufRead,
+    stdin_tty: bool,
+) -> Result<Vec<u8>, String> {
+    if stdin_tty {
         eprint!(
             "{}",
             crate::terminal::format_log(
@@ -543,11 +553,11 @@ fn read_stdin_bytes() -> Result<Vec<u8>, String> {
         );
     }
     let mut bytes = Vec::new();
-    std::io::stdin()
+    input
         .read_to_end(&mut bytes)
         .map_err(|e| format!("failed to read stdin: {e}"))?;
     Ok(bytes)
-} // LCOV_EXCL_STOP
+}
 
 /// Resolve `--input` for messages, mirroring `Filesystem::resolvePath()`:
 /// absolute against `dir`, symlink parents resolved, missing paths resolved

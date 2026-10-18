@@ -861,6 +861,18 @@ fn rbd1_call_conduit_flag_correction_reports_notice() {
 }
 
 #[test]
+fn call_notices_render_to_stderr() {
+    // The notice renderer runs with and without notices (the parse
+    // wrapper only sees notices on TTY stdin, which cargo-test stdin
+    // never is).
+    report_call_notices(&[], false);
+    report_call_notices(
+        &["(Assuming \"--conduit-ur\" is the British spelling of \"--conduit-uri\".)".to_string()],
+        false,
+    );
+}
+
+#[test]
 fn core21_call_conduit_count_error_uses_red_arm() {
     assert_eq!(
         dispatch(&args(&["call-conduit", "--bogus", "--", "m"])),

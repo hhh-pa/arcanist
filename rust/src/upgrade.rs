@@ -1512,10 +1512,9 @@ fn download_install_report(
 
 /// Ask the pre-upgrade question on stdin (`[y/N]`: the default keeps
 /// the current executable, since replacement is irreversible).
-// LCOV_EXCL_START // Reason: reads real stdin; tests inject the confirm fn instead
 fn confirm_interactive(query: &str) -> Result<bool, String> {
     prompt::console_confirm(&mut std::io::stdin().lock(), query, true)
-} // LCOV_EXCL_STOP
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct Options {

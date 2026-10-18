@@ -968,13 +968,13 @@ pub fn read_patch_bytes(path: &str, io: &mut Io) -> Result<Vec<u8>, String> {
     if path == "-" {
         if let Some(scripted) = io.patch_stdin.clone() {
             return Ok(scripted.into_bytes());
-        } // LCOV_EXCL_START // Reason: reads real stdin (blocks on a terminal); tests inject patch_stdin instead
+        }
         use std::io::Read;
         let mut bytes = Vec::new();
         std::io::stdin()
             .read_to_end(&mut bytes)
             .map_err(|e| format!("Failed to read patch from stdin: {e}"))?;
-        return Ok(bytes); // LCOV_EXCL_STOP
+        return Ok(bytes);
     }
     std::fs::read(path).map_err(|e| format!("Failed to read patch file '{path}': {e}"))
 }

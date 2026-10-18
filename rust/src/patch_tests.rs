@@ -6722,6 +6722,19 @@ fn cov6g_read_patch_bytes_uses_scripted_stdin_for_dash() {
     assert_eq!(read_patch_bytes(&path, &mut io).unwrap(), b"patch-bytes");
 }
 
+#[test]
+fn read_patch_bytes_reads_real_stdin_when_unscripted() {
+    // Without scripted stdin, `-` reads real stdin to EOF; cargo-test
+    // stdin is always EOF. Fail loud (rather than block on a real
+    // terminal) if that ever changes.
+    assert!(
+        !crate::prompt::stdin_is_terminal(),
+        "tests must run with non-TTY stdin"
+    );
+    let mut io = Io::buffered();
+    assert_eq!(read_patch_bytes("-", &mut io).unwrap(), b"");
+}
+
 // -( T1170 endgame band I: direct helper-arm tests )---------------------------
 
 #[test]

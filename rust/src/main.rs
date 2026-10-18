@@ -121,16 +121,22 @@ fn parse_call_conduit(rest: &[String]) -> Result<CallArgs, String> {
     use std::io::IsTerminal;
     let (result, notices) = parse_call_conduit_with(rest, std::io::stdin().is_terminal());
     let ansi = terminal::ansi_enabled();
-    for notice in &notices {
-        // LCOV_EXCL_START // Reason: autocorrect notices need TTY stdin; cargo-test stdin is never a TTY
+    report_call_notices(&notices, ansi);
+    result
+}
+
+/// Render spelling-correction notices to stderr, like PHP's scan-time
+/// logging (test seam: `parse_call_conduit` only sees notices on TTY
+/// stdin, which cargo-test stdin never is).
+fn report_call_notices(notices: &[String], ansi: bool) {
+    for notice in notices {
         eprint!(
             "{}",
             terminal::tsprintf_ansi("%s\n", &[terminal::TVal::Text(notice)], ansi)
                 .map(|t| t.to_string())
-                .unwrap_or_default() // LCOV_EXCL_STOP
+                .unwrap_or_default()
         );
     }
-    result
 }
 
 fn classify(argv: &[String]) -> Action {

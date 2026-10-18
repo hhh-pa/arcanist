@@ -792,11 +792,12 @@ fn certificate_flow_stages_exchanged_credentials() {
 
 #[test]
 fn stdin_prompts_on_pipes_fail_fast() {
-    // Piped stdin is never a TTY under `cargo test`; bail out (rather
-    // than block on a real terminal) if that ever changes.
-    if crate::prompt::stdin_is_terminal() {
-        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
-    }
+    // Piped stdin is never a TTY under `cargo test`; fail loud
+    // (rather than block on a real terminal) if that ever changes.
+    assert!(
+        !crate::prompt::stdin_is_terminal(),
+        "tests must run with non-TTY stdin"
+    );
     assert_eq!(prompt_token().unwrap_err(), crate::prompt::NOT_INTERACTIVE);
     assert_eq!(
         prompt_confirm("Q?", true).unwrap_err(),
@@ -855,11 +856,12 @@ fn install_arcrc_reports_missing_custom_files() {
 
 #[test]
 fn install_token_reads_prompt_without_a_flag() {
-    // Piped stdin is never a TTY under `cargo test`; bail out (rather
-    // than block on a real terminal) if that ever changes.
-    if crate::prompt::stdin_is_terminal() {
-        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
-    }
+    // Piped stdin is never a TTY under `cargo test`; fail loud
+    // (rather than block on a real terminal) if that ever changes.
+    assert!(
+        !crate::prompt::stdin_is_terminal(),
+        "tests must run with non-TTY stdin"
+    );
     let options = install_test_options();
     assert_eq!(
         install_token_value(&options),
@@ -870,13 +872,51 @@ fn install_token_reads_prompt_without_a_flag() {
 #[test]
 fn standard_token_confirm_skips_with_force() {
     assert!(confirm_standard_token(true).is_ok());
-    // Piped stdin is never a TTY under `cargo test`; bail out (rather
-    // than block on a real terminal) if that ever changes.
-    if crate::prompt::stdin_is_terminal() {
-        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
-    }
+    // Piped stdin is never a TTY under `cargo test`; fail loud
+    // (rather than block on a real terminal) if that ever changes.
+    assert!(
+        !crate::prompt::stdin_is_terminal(),
+        "tests must run with non-TTY stdin"
+    );
     assert_eq!(
         confirm_standard_token(false),
+        Err(std::process::ExitCode::FAILURE)
+    );
+}
+
+#[test]
+fn install_token_value_with_stages_prompt_arms() {
+    // `--token` wins trimmed without prompting; otherwise the
+    // injected prompt's success and failure arms route through.
+    let mut options = install_test_options();
+    options.token = Some("  cli-token  ".to_string());
+    assert_eq!(
+        install_token_value_with(&options, &|| panic!("must not prompt")),
+        Ok("cli-token".to_string())
+    );
+    let options = install_test_options();
+    assert_eq!(
+        install_token_value_with(&options, &|| Ok("prompted".to_string())),
+        Ok("prompted".to_string())
+    );
+    assert_eq!(
+        install_token_value_with(&options, &|| Err("piped".to_string())),
+        Err(std::process::ExitCode::FAILURE)
+    );
+}
+
+#[test]
+fn confirm_standard_token_with_stages_confirm_arms() {
+    // `--force` skips the ask; otherwise the injected confirm's
+    // yes/no/error arms route through.
+    assert!(confirm_standard_token_with(true, &|_| panic!("must not prompt")).is_ok());
+    assert!(confirm_standard_token_with(false, &|_| Ok(true)).is_ok());
+    assert_eq!(
+        confirm_standard_token_with(false, &|_| Ok(false)),
+        Err(std::process::ExitCode::FAILURE)
+    );
+    assert_eq!(
+        confirm_standard_token_with(false, &|_| Err("piped".to_string())),
         Err(std::process::ExitCode::FAILURE)
     );
 }
@@ -902,11 +942,12 @@ fn token_run_flow_rejects_bad_tokens() {
 
 #[test]
 fn token_run_flow_confirms_standard_tokens() {
-    // Piped stdin is never a TTY under `cargo test`; bail out (rather
-    // than block on a real terminal) if that ever changes.
-    if crate::prompt::stdin_is_terminal() {
-        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
-    }
+    // Piped stdin is never a TTY under `cargo test`; fail loud
+    // (rather than block on a real terminal) if that ever changes.
+    assert!(
+        !crate::prompt::stdin_is_terminal(),
+        "tests must run with non-TTY stdin"
+    );
     let tmp = TempDir::new("tokflow-std");
     let arcrc = tmp.path.join(".arcrc");
     let mut doc = serde_json::json!({});
@@ -966,11 +1007,12 @@ fn expect_prepare_failure(argv: &[String]) -> std::process::ExitCode {
 #[test]
 #[cfg(unix)]
 fn prepare_gates_on_open_arcrc_permissions() {
-    // Piped stdin is never a TTY under `cargo test`; bail out (rather
-    // than block on a real terminal) if that ever changes.
-    if crate::prompt::stdin_is_terminal() {
-        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
-    }
+    // Piped stdin is never a TTY under `cargo test`; fail loud
+    // (rather than block on a real terminal) if that ever changes.
+    assert!(
+        !crate::prompt::stdin_is_terminal(),
+        "tests must run with non-TTY stdin"
+    );
     let tmp = TempDir::new("prep-chmod");
     let path = open_arcrc(&tmp, 0o644);
     let argv = vec![
@@ -1031,11 +1073,12 @@ fn install_flow_writes_legacy_certificates() {
 
 #[test]
 fn run_fails_fast_without_a_token() {
-    // Piped stdin is never a TTY under `cargo test`; bail out (rather
-    // than block on a real terminal) if that ever changes.
-    if crate::prompt::stdin_is_terminal() {
-        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
-    }
+    // Piped stdin is never a TTY under `cargo test`; fail loud
+    // (rather than block on a real terminal) if that ever changes.
+    assert!(
+        !crate::prompt::stdin_is_terminal(),
+        "tests must run with non-TTY stdin"
+    );
     let tmp = TempDir::new("run-notoken");
     let mut routes = std::collections::HashMap::new();
     routes.insert("conduit.ping".to_string(), "{}".to_string());

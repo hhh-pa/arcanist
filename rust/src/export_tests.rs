@@ -1328,13 +1328,32 @@ fn blob_phids_skips_changes_without_metadata() {
 
 #[test]
 fn export_prompt_line_fails_without_tty() {
-    // Piped stdin is never a TTY under `cargo test`; bail out (rather
-    // than block on a real terminal) if that ever changes.
-    if crate::prompt::stdin_is_terminal() {
-        return; // LCOV_EXCL_LINE // Reason: needs a real TTY stdin; cargo-test stdin is never a terminal
-    }
+    // Piped stdin is never a TTY under `cargo test`; fail loud
+    // (rather than block on a real terminal) if that ever changes.
+    assert!(
+        !crate::prompt::stdin_is_terminal(),
+        "tests must run with non-TTY stdin"
+    );
     assert_eq!(export_prompt_line("Base?"), None);
     // The flag was set; `take` asserts that and resets it.
+    assert!(EXPORT_PROMPT_TTY_FAILED.take());
+}
+
+#[test]
+fn export_prompt_line_with_reads_one_line_on_tty() {
+    // The injected seam stages the TTY arm: one answer line.
+    let mut input = std::io::Cursor::new("my-base\n");
+    assert_eq!(
+        export_prompt_line_with(&mut input, true),
+        Some("my-base".to_string())
+    );
+}
+
+#[test]
+fn export_prompt_line_with_fails_without_tty() {
+    // The injected seam stages the piped arm: no TTY, no answer.
+    let mut input = std::io::Cursor::new("ignored\n");
+    assert_eq!(export_prompt_line_with(&mut input, false), None);
     assert!(EXPORT_PROMPT_TTY_FAILED.take());
 }
 

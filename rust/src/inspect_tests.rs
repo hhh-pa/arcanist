@@ -685,11 +685,12 @@ fn conduit_errors_render_raw() {
 
 #[test]
 fn run_in_reports_missing_terminator() {
-    // Piped stdin is never a TTY under `cargo test`; bail out (rather
-    // than parse differently) if that ever changes.
-    if crate::prompt::stdin_is_terminal() {
-        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
-    }
+    // Piped stdin is never a TTY under `cargo test`; fail loud
+    // (rather than parse differently) if that ever changes.
+    assert!(
+        !crate::prompt::stdin_is_terminal(),
+        "tests must run with non-TTY stdin"
+    );
     let tmp = TempDir::new("terminator");
     assert_eq!(
         run_in(tmp.path(), &args(&["working-copy(HEAD)"])),
