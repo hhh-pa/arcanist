@@ -562,20 +562,7 @@ pub fn lookup_remote(dir: &Path, name: &str) -> Result<(), String> {
             return Ok(());
         }
     } else if markers::find_hg_root(dir).is_some() {
-        let output = hg::output_with(dir, &hg::HgCommand::system(), &["paths"])?;
-        // LCOV_EXCL_START // Reason: needs system hg for `hg paths`; absent on ubuntu CI
-        if !output.status.success() {
-            return Err(markers::command_exception_text(
-                output.status.code().unwrap_or(1),
-                "hg paths",
-                &String::from_utf8_lossy(&output.stdout),
-                &String::from_utf8_lossy(&output.stderr),
-            ));
-        }
-        let paths = parse_hg_paths(&String::from_utf8_lossy(&output.stdout))?;
-        if paths.iter().any(|(remote, _)| remote == name) {
-            return Ok(());
-        } // LCOV_EXCL_STOP
+        return lookup_remote_hg(dir, name, &hg::HgCommand::system());
     } else if markers::find_svn_root(dir).is_some() {
         return Err(
             "Method newRemoteRefQueryTemplate in class ArcanistSubversionAPI is not implemented!"
@@ -586,6 +573,25 @@ pub fn lookup_remote(dir: &Path, name: &str) -> Result<(), String> {
             "Method newRemoteRefQueryTemplate in class ArcanistFilesystemAPI is not implemented!"
                 .to_string(),
         );
+    }
+    Err(format!("This working copy has no remote named \"{name}\"."))
+}
+
+/// The Mercurial branch of [`lookup_remote`] with an injectable `hg`
+/// (test seam; production passes [`hg::HgCommand::system`]).
+fn lookup_remote_hg(dir: &Path, name: &str, hg_command: &hg::HgCommand) -> Result<(), String> {
+    let output = hg::output_with(dir, hg_command, &["paths"])?;
+    if !output.status.success() {
+        return Err(markers::command_exception_text(
+            output.status.code().unwrap_or(1),
+            "hg paths",
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        ));
+    }
+    let paths = parse_hg_paths(&String::from_utf8_lossy(&output.stdout))?;
+    if paths.iter().any(|(remote, _)| remote == name) {
+        return Ok(());
     }
     Err(format!("This working copy has no remote named \"{name}\"."))
 }

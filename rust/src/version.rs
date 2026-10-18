@@ -243,8 +243,18 @@ pub fn render_version_line(commit: &str, timestamp: i64) -> String {
 /// `cwd` relativizes the not-a-git-copy error like
 /// `Filesystem::readablePath()` (T1153 CORE-61).
 fn head_of(cwd: &Path, tool_dir: &Path) -> Result<(i64, String), String> {
-    if !git_binary_available() {
-        return Err(missing_git_message()); // LCOV_EXCL_LINE // Reason: git is installed on ubuntu CI; the missing-git arm never runs
+    head_of_with_git(cwd, tool_dir, git_binary_available())
+}
+
+/// [`head_of`] with the `git`-presence probe injected (test seam;
+/// production passes [`git_binary_available`]).
+fn head_of_with_git(
+    cwd: &Path,
+    tool_dir: &Path,
+    git_available: bool,
+) -> Result<(i64, String), String> {
+    if !git_available {
+        return Err(missing_git_message());
     }
     let root = library_root(cwd, tool_dir)?;
     head_commit(&root)
@@ -280,6 +290,12 @@ fn tool_dir() -> PathBuf {
 
 /// Display the version per `argv`, resolving the checkout from `tool_dir`.
 pub fn run_in(tool_dir: &Path, argv: &[String]) -> ExitCode {
+    run_in_with_git(tool_dir, argv, git_binary_available())
+}
+
+/// [`run_in`] with the `git`-presence probe injected (test seam;
+/// production passes [`git_binary_available`]).
+fn run_in_with_git(tool_dir: &Path, argv: &[String], git_available: bool) -> ExitCode {
     use crate::conduit::{EnvelopeKind, report};
     match parse_args(argv) {
         Ok(None) => {
@@ -298,11 +314,11 @@ pub fn run_in(tool_dir: &Path, argv: &[String]) -> ExitCode {
         }
         Ok(Some(())) => {}
     }
-    if !git_binary_available() {
+    if !git_available {
         // T1153 CORE-49: the missing-`git` throw is an
         // `ArcanistUsageException` (`:39-44` at ceb), which escapes
         // the toolset runtime into a PHP fatal (255).
-        return report(EnvelopeKind::Fatal, &missing_git_message()); // LCOV_EXCL_LINE // Reason: git is installed on ubuntu CI; the missing-git arm never runs
+        return report(EnvelopeKind::Fatal, &missing_git_message());
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     match version_text(&cwd, tool_dir) {

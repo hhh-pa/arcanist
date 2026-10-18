@@ -160,6 +160,12 @@ pub fn passthru(program: &Path, args: &[&str], dir: &Path) -> Result<ExitCode, S
 
 /// Pilot the probe from `dir` per `argv`.
 pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
+    run_in_with_python(dir, argv, python3_on_path())
+}
+
+/// [`run_in`] with the interpreter lookup injected (test seam;
+/// production passes [`python3_on_path`]).
+fn run_in_with_python(dir: &Path, argv: &[String], python: Option<PathBuf>) -> ExitCode {
     use crate::conduit::{EnvelopeKind, report};
     match parse_args(argv) {
         Ok(None) => {
@@ -178,15 +184,14 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
         }
         Ok(Some(())) => {}
     }
-    let Some(python) = python3_on_path() else {
+    let Some(python) = python else {
         // T1153 CORE-59: PHP's verbatim text
         // (`ArcanistAnoidWorkflow.php:28-32` at ceb), thrown as a
         // `PhutilArgumentUsageException` (the `USAGE EXCEPTION` arm).
         // The Windows `python` fallback stays additive and unnamed.
-        // LCOV_EXCL_START // Reason: python3 is installed on ubuntu CI; the missing-interpreter arm never runs
         return report(
             EnvelopeKind::ToolsetUsage,
-            "The \"arc anoid\" workflow requires \"python3\" to be available in your $PATH.", // LCOV_EXCL_STOP
+            "The \"arc anoid\" workflow requires \"python3\" to be available in your $PATH.",
         );
     };
     let Some(script) = find_script(dir) else {

@@ -92,7 +92,7 @@ impl Linter for RubyLinter {
         }
         let tool = self.options.bin.clone().or_else(|| binary_on_path(BINARY));
         let Some(ref tool) = tool else {
-            return Vec::new(); // LCOV_EXCL_LINE // Reason: tool-absent arm; runs only where ruby is missing from PATH
+            return Vec::new();
         };
         if let Some(requirement) = &self.options.version
             && !version_requirement_satisfied(

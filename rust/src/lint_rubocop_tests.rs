@@ -301,15 +301,24 @@ fn missing_tool_reports_nothing() {
 }
 
 #[test]
-fn binary_on_path_probes_plain_names() {
-    if let Some(path) = binary_on_path("rubocop") {
-        // LCOV_EXCL_START // Reason: rubocop-present arm; rubocop is absent on ubuntu CI
-        assert!(
-            path.file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with("rubocop")), // LCOV_EXCL_STOP
-            "{path:?}"
-        );
-    }
+fn binary_in_probes_plain_names() {
+    // Staged through `binary_in`: a plain name resolves against the
+    // given search path, with no assumption about the ambient PATH.
+    let dir = std::env::temp_dir().join(format!(
+        "arc-rs-rubocop-probe-present-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let marker = dir.join(BINARY);
+    std::fs::write(&marker, b"x").unwrap();
+    let path = binary_in(dir.as_os_str()).unwrap();
+    assert_eq!(path, marker);
+    assert!(
+        path.file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("rubocop")),
+        "{path:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

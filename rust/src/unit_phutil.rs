@@ -274,15 +274,26 @@ fn php_candidates() -> &'static [&'static str] {
 #[must_use]
 pub fn php_on_path() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
+    php_on_path_in(&path)
+}
+
+/// [`php_on_path`] against an explicit search path (test seam).
+fn php_on_path_in(path_env: &std::ffi::OsStr) -> Option<PathBuf> {
     php_candidates()
         .iter()
-        .find_map(|binary| arc_rs::anoid::find_on_path(&path, binary))
+        .find_map(|binary| arc_rs::anoid::find_on_path(path_env, binary))
 }
 
 /// Default `php` invocation prefix: the resolved interpreter path, if any.
 #[must_use]
 pub fn php_argv_prefix() -> Option<Vec<String>> {
-    php_on_path().map(|path| vec![path.to_string_lossy().into_owned()])
+    let path = std::env::var_os("PATH")?;
+    php_argv_prefix_in(&path)
+}
+
+/// [`php_argv_prefix`] against an explicit search path (test seam).
+fn php_argv_prefix_in(path_env: &std::ffi::OsStr) -> Option<Vec<String>> {
+    php_on_path_in(path_env).map(|path| vec![path.to_string_lossy().into_owned()])
 }
 
 /// Clear error when no `php` is available (the php-absent path is correct:

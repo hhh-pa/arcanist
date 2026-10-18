@@ -49,6 +49,10 @@ pub struct CsharpLinter {
     /// Test seam: base directory for the staged temp input (`None` uses
     /// `std::env::temp_dir()`, the production behavior).
     temp_dir: Option<PathBuf>,
+    /// Test seam: directory searched for the tool instead of the
+    /// ambient `$PATH` (`None` searches the ambient `$PATH`, the
+    /// production behavior).
+    path_dir: Option<PathBuf>,
 }
 
 impl CsharpLinter {
@@ -62,7 +66,10 @@ impl CsharpLinter {
     /// the runtime comes first, then the tool, then the version probe,
     /// and every failure reports PHP's text for the aggregate.
     fn resolve(&self) -> Result<(PathBuf, Vec<String>), String> {
-        self.resolve_in(&std::env::var_os("PATH").unwrap_or_default())
+        match &self.path_dir {
+            Some(dir) => self.resolve_in(dir.as_os_str()),
+            None => self.resolve_in(&std::env::var_os("PATH").unwrap_or_default()),
+        }
     }
 
     /// [`resolve`](Self::resolve) against an explicit `PATH` value, so
@@ -744,15 +751,15 @@ impl Linter for CsharpLinter {
             return Vec::new();
         }
         let command = match self.resolve() {
-            Ok(command) => command, // LCOV_EXCL_LINE // Reason: resolve-Ok arm; needs cslint plus mono, absent on ubuntu CI
+            Ok(command) => command,
             Err(error) => {
                 *self.error.borrow_mut() = Some(error);
                 return Vec::new();
             }
         };
-        let borrowed = Some((command.0.as_path(), command.1.as_slice())); // LCOV_EXCL_START // Reason: resolve-Ok arm; needs cslint plus mono, absent on ubuntu CI
+        let borrowed = Some((command.0.as_path(), command.1.as_slice()));
         let dir = self.temp_dir.clone().unwrap_or_else(std::env::temp_dir);
-        lint_with_command_in(&dir, path, data, borrowed) // LCOV_EXCL_STOP
+        lint_with_command_in(&dir, path, data, borrowed)
     }
 
     fn take_error(&self) -> Option<String> {

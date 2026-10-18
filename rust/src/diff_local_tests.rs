@@ -5006,25 +5006,14 @@ fn t1170_tag_lines_with_padded_or_punctuated_names_stay_body() {
     );
 }
 
-/// True when the `git` binary runs (real-repo tests probe this first).
-fn t1170_git_available() -> bool {
-    std::process::Command::new("git")
-        .arg("--version")
-        .output()
-        .is_ok_and(|out| out.status.success())
-}
-
-/// Scratch git repo with one empty commit; removed on drop. `None` when
-/// `git` is unavailable (the caller skips).
+/// Scratch git repo with one empty commit; removed on drop. `git`
+/// ships on every CI runner, so the tests use it unconditionally.
 struct T1170GitRepo {
     dir: std::path::PathBuf,
 }
 
 impl T1170GitRepo {
-    fn named(tag: &str) -> Option<Self> {
-        if !t1170_git_available() {
-            return None; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
-        }
+    fn named(tag: &str) -> Self {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!(
@@ -5052,7 +5041,7 @@ impl T1170GitRepo {
             "-m",
             "init",
         ]);
-        Some(Self { dir })
+        Self { dir }
     }
 
     fn run(&self, args: &[&str]) {
@@ -5087,9 +5076,7 @@ impl Drop for T1170GitRepo {
 
 #[test]
 fn t1170_git_log_failures_report_stderr() {
-    let Some(repo) = T1170GitRepo::named("logfail") else {
-        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
-    };
+    let repo = T1170GitRepo::named("logfail");
     let err = get_local_commit_information(&repo.dir, "missing-base", "HEAD").unwrap_err();
     assert!(err.contains("git log failed"), "{err}");
     let err = get_git_update_messages(&repo.dir, "missing-base", "HEAD").unwrap_err();
@@ -5104,9 +5091,7 @@ fn t1170_git_log_failures_report_stderr() {
 
 #[test]
 fn t1170_symbolic_ref_unexpected_exit_fails() {
-    let Some(repo) = T1170GitRepo::named("symref") else {
-        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
-    };
+    let repo = T1170GitRepo::named("symref");
     // Outside any repo `git symbolic-ref` exits 128: neither 0 nor 1.
     let plain =
         std::env::temp_dir().join(format!("arc-rs-diff-t1170-plain-{}", std::process::id()));
@@ -5121,9 +5106,7 @@ fn t1170_symbolic_ref_unexpected_exit_fails() {
 
 #[test]
 fn t1170_collect_change_entries_classifies_worktree_shapes() {
-    let Some(repo) = T1170GitRepo::named("classify") else {
-        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
-    };
+    let repo = T1170GitRepo::named("classify");
     repo.commit_file("a.txt", "one\n", "add a");
     let base = git::stdout_text(&repo.dir, &["rev-parse", "HEAD~1"]).unwrap();
     // A path the range adds but the worktree lost reads as plain text.
@@ -5144,9 +5127,7 @@ fn t1170_collect_change_entries_classifies_worktree_shapes() {
 #[cfg(unix)]
 #[test]
 fn t1170_collect_change_entries_spots_symlinks() {
-    let Some(repo) = T1170GitRepo::named("symlink") else {
-        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
-    };
+    let repo = T1170GitRepo::named("symlink");
     repo.commit_file("a.txt", "one\n", "add a");
     std::fs::remove_file(repo.dir.join("a.txt")).unwrap();
     std::os::unix::fs::symlink("target", repo.dir.join("a.txt")).unwrap();
@@ -5158,9 +5139,7 @@ fn t1170_collect_change_entries_spots_symlinks() {
 
 #[test]
 fn t1170_copy_status_maps_to_copy_here() {
-    let Some(repo) = T1170GitRepo::named("copydetect") else {
-        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
-    };
+    let repo = T1170GitRepo::named("copydetect");
     let body: String = (1..=20).map(|n| format!("line {n}\n")).collect();
     repo.commit_file("a.txt", &body, "add a");
     // `-C` reports a copy only from a modified source to a
@@ -5191,9 +5170,7 @@ fn t1170_copy_status_maps_to_copy_here() {
 
 #[test]
 fn t1170_working_copy_revisions_with_empty_log_returns_none() {
-    let Some(repo) = T1170GitRepo::named("emptylog") else {
-        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
-    };
+    let repo = T1170GitRepo::named("emptylog");
     let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
         panic!("conduit must not run for an empty log"); // LCOV_EXCL_LINE // Reason: must-not-call guard; firing fails the test
     };
@@ -5204,9 +5181,7 @@ fn t1170_working_copy_revisions_with_empty_log_returns_none() {
 
 #[test]
 fn t1170_raw_diff_bytes_failure_reports_stderr() {
-    let Some(repo) = T1170GitRepo::named("rawfail") else {
-        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
-    };
+    let repo = T1170GitRepo::named("rawfail");
     let err = get_raw_diff_bytes(&repo.dir, "missing-base", "f.txt").unwrap_err();
     assert!(err.contains("git diff failed"), "{err}");
 }
@@ -5408,9 +5383,7 @@ fn t1170_lint_in_process_empty_engine_has_no_effect() {
 
 #[test]
 fn t1170_lint_in_process_comprehensive_run_collects() {
-    let Some(repo) = T1170GitRepo::named("lintrun") else {
-        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
-    };
+    let repo = T1170GitRepo::named("lintrun");
     std::fs::write(
         repo.dir.join(".arcconfig"),
         "{\"lint.engine\": \"ArcanistComprehensiveLintEngine\"}",
@@ -6630,9 +6603,7 @@ fn t1170_conduit_truthy_shapes_drive_amend_decision() {
 
 #[test]
 fn cov6g_resolve_explicit_base_ok() {
-    let Some(repo) = T1170GitRepo::named("cov6g-base") else {
-        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
-    };
+    let repo = T1170GitRepo::named("cov6g-base");
     repo.commit_file("a.txt", "a\n", "second");
     let sha = resolve_explicit_base(&repo.dir, "HEAD~1", "HEAD").unwrap();
     assert_eq!(sha.len(), 40);

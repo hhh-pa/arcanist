@@ -332,3 +332,17 @@ fn temp_write_failure_reports_nothing() {
     assert!(linter.lint_bytes("a.rb", b"x = 1").is_empty());
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
+
+/// Missing-`ruby` arm: with no `ruby` on PATH the default linter
+/// resolves no tool and lints nothing. Linux-only: macOS ships
+/// `/usr/bin/ruby`, which would resolve instead. Conditional (not a
+/// hard assert) so Linux dev machines WITH ruby stay green — the
+/// gates image has no ruby, and the 100% floor would fail loudly if
+/// that ever drifted.
+#[cfg(target_os = "linux")]
+#[test]
+fn missing_ruby_lints_nothing() {
+    if binary_on_path(BINARY).is_none() {
+        assert!(RubyLinter::new().lint_bytes("a.rb", b"x = 1").is_empty());
+    }
+}

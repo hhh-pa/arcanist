@@ -390,20 +390,48 @@ fn trailing_dot_has_no_extension() {
 }
 
 #[test]
-fn ambient_command_lookup_stays_consistent_when_present() {
-    // Hermetic by construction: no assumption about the ambient PATH,
-    // only that a found command carries the default flags.
-    match resolve_command() {
-        None => {}
-        // LCOV_EXCL_START // Reason: ambient-cslint arm; cslint plus mono are absent on ubuntu CI
-        Some((_, prefix)) => {
-            if cfg!(windows) {
-                assert_eq!(prefix, command_flags());
-            } else {
-                assert_eq!(&prefix[1..], command_flags().as_slice()); // LCOV_EXCL_STOP
-            }
-        }
+fn staged_command_lookup_carries_default_flags() {
+    // Staged through `resolve_command_in`: a found command carries the
+    // default flags, with no assumption about the ambient PATH.
+    let tmp = TempDir::new("resolve-present");
+    let cslint = tmp.path().join(binary_name());
+    std::fs::write(&cslint, b"x").unwrap();
+    #[cfg(not(windows))]
+    std::fs::write(tmp.path().join(runtime_name()), b"x").unwrap();
+    let settings = default_settings_base64();
+    #[cfg(windows)]
+    let (program, prefix) = resolve_command_in(tmp.path().as_os_str(), None, settings).unwrap();
+    #[cfg(not(windows))]
+    let (_, prefix) = resolve_command_in(tmp.path().as_os_str(), None, settings).unwrap();
+    #[cfg(windows)]
+    {
+        assert_eq!(program, cslint);
+        assert_eq!(prefix, command_flags());
     }
+    #[cfg(not(windows))]
+    {
+        assert_eq!(&prefix[1..], command_flags().as_slice());
+    }
+    // The ambient wrapper stays callable without assuming a result.
+    let _ = resolve_command();
+}
+
+#[test]
+#[cfg(unix)]
+fn lint_bytes_runs_staged_mono_and_cslint() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Staged through `path_dir`: a fake `mono` answering the version
+    // probe drives the resolve-Ok arm without ambient tools.
+    let tmp = TempDir::new("resolve-ok");
+    let mono = tmp.path().join(runtime_name());
+    std::fs::write(&mono, "#!/bin/sh\necho 1\n").unwrap();
+    std::fs::set_permissions(&mono, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(tmp.path().join(binary_name()), b"x").unwrap();
+    let mut linter = CsharpLinter::new();
+    linter.path_dir = Some(tmp.path().to_path_buf());
+    assert!(linter.lint_bytes("a.cs", b"class A {}\n").is_empty());
+    assert_eq!(linter.take_error(), None);
 }
 
 #[test]

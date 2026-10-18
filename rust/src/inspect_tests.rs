@@ -596,6 +596,38 @@ fn remote_lookup_covers_hg_and_svn_roots() {
 }
 
 #[test]
+fn hg_remote_lookup_reads_paths_from_fake_hg() {
+    // Staged with a fake `hg` answering `paths` (no system hg): a
+    // listed remote resolves, an unlisted one reports no such remote.
+    let dir = TempDir::new("hg-remote");
+    std::fs::create_dir_all(dir.path().join(".hg")).unwrap();
+    let script = dir.path().join("fakehg.sh");
+    std::fs::write(
+        &script,
+        "printf '%s\\n' 'default = https://example.test/x'\n",
+    )
+    .unwrap();
+    let hg_cmd = crate::hg::HgCommand::custom("sh", &[&script.to_string_lossy()]);
+    assert!(lookup_remote_hg(dir.path(), "default", &hg_cmd).is_ok());
+    assert_eq!(
+        lookup_remote_hg(dir.path(), "missing", &hg_cmd).unwrap_err(),
+        "This working copy has no remote named \"missing\"."
+    );
+}
+
+#[test]
+fn hg_remote_lookup_reports_failed_paths() {
+    // A failing `hg paths` surfaces the command-exception dump.
+    let dir = TempDir::new("hg-remote-fail");
+    std::fs::create_dir_all(dir.path().join(".hg")).unwrap();
+    let script = dir.path().join("fakehg.sh");
+    std::fs::write(&script, "exit 1\n").unwrap();
+    let hg_cmd = crate::hg::HgCommand::custom("sh", &[&script.to_string_lossy()]);
+    let err = lookup_remote_hg(dir.path(), "default", &hg_cmd).unwrap_err();
+    assert!(err.contains("hg paths"), "{err}");
+}
+
+#[test]
 fn explores_browse_fallbacks_and_uris() {
     use std::collections::HashMap;
     let tmp = init_repo("browseblob");

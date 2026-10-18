@@ -206,16 +206,30 @@ fn piped_run_without_terminator_fails() {
 }
 
 #[test]
+fn missing_interpreter_reports_usage_text() {
+    // Staged through the injected lookup: no ambient `python3` needed.
+    let tmp = TempDir::new("nopython");
+    assert_eq!(
+        run_in_with_python(tmp.path(), &args(&["--"]), None),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+#[cfg(unix)]
 fn passthru_returns_the_script_status() {
+    use std::os::unix::fs::PermissionsExt;
+
     let tmp = TempDir::new("passthru");
     let script_dir = tmp.path().join("support").join("arcanoid");
     std::fs::create_dir_all(&script_dir).unwrap();
     std::fs::write(script_dir.join("arcanoid.py"), "import sys\nsys.exit(0)\n").unwrap();
-    if python3_on_path().is_none() {
-        return; // LCOV_EXCL_LINE // Reason: python3 is installed on ubuntu CI; the skip never trips
-    }
+    // Staged interpreter: a fake `python3` exiting 0, no ambient tool.
+    let python = tmp.path().join("fake-python3");
+    std::fs::write(&python, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(
-        run_in(tmp.path(), &args(&["--"])),
+        run_in_with_python(tmp.path(), &args(&["--"]), Some(python)),
         std::process::ExitCode::SUCCESS
     );
 }
@@ -223,24 +237,28 @@ fn passthru_returns_the_script_status() {
 // -( T1170 coverage wave 6g band G, batch E )----------------------------------
 
 #[test]
+#[cfg(unix)]
 fn cov6g_run_in_missing_cwd_reports_launch_failure() {
+    use std::os::unix::fs::PermissionsExt;
+
     // `find_script` walks ancestors lexically, so it resolves above a
     // missing directory; the spawn then fails on `current_dir` and
     // `run_in` reports the launch failure.
-    if python3_on_path().is_none() {
-        return; // LCOV_EXCL_LINE // Reason: python3 is installed on ubuntu CI; the skip never trips
-    }
     let tmp = TempDir::new("cov6g-missing-cwd");
     let script_dir = tmp.path().join("support").join("arcanoid");
     std::fs::create_dir_all(&script_dir).unwrap();
     std::fs::write(script_dir.join("arcanoid.py"), "# never launched\n").unwrap();
+    // Staged interpreter: never launched, so its body is irrelevant.
+    let python = tmp.path().join("fake-python3");
+    std::fs::write(&python, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
     let missing = tmp.path().join("gone");
     assert!(!missing.exists());
     // The script resolves lexically above the missing cwd, so the
     // failure below can only be the spawn/launch arm.
     assert!(find_script(&missing).is_some());
     assert_eq!(
-        run_in(&missing, &args(&["--"])),
+        run_in_with_python(&missing, &args(&["--"]), Some(python)),
         std::process::ExitCode::FAILURE
     );
 }

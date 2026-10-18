@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use crate::{
     argparse,
     conduit::{self, EnvelopeKind},
-    config, get_config, git, grid, markers,
+    config, get_config, git, grid, hg, markers,
 };
 
 pub const NAME: &str = "branches";
@@ -262,7 +262,13 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
     };
     if options.json {
         // The `--json` extension never calls conduit; it stays offline.
-        return execute_core(dir, &options, grid::terminal_width(), None);
+        return execute_core(
+            dir,
+            &options,
+            grid::terminal_width(),
+            None,
+            &hg::HgCommand::system(),
+        );
     }
     // T1153 LAND-28: the working-copy/support gate runs before
     // conduit setup — PHP's getRepositoryAPI (and its usage error)
@@ -280,7 +286,13 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
         Ok(client) => client,
         Err(message) => return Err(conduit::toolset_setup_message(&message)),
     };
-    execute_core(dir, &options, grid::terminal_width(), Some(&owned_client))
+    execute_core(
+        dir,
+        &options,
+        grid::terminal_width(),
+        Some(&owned_client),
+        &hg::HgCommand::system(),
+    )
 }
 
 /// Run the workflow with an explicit terminal width and conduit client.
@@ -298,7 +310,7 @@ pub fn execute_with_client(
         // T1153 RB-D4 (R4): PHP renders usage errors with no dump.
         Err(message) => return Err(message),
     };
-    execute_core(dir, &options, terminal, client)
+    execute_core(dir, &options, terminal, client, &hg::HgCommand::system())
 }
 
 fn execute_core(
@@ -306,6 +318,7 @@ fn execute_core(
     options: &Options,
     terminal: Option<usize>,
     client: Option<&crate::conduit::Client>,
+    hg_command: &hg::HgCommand,
 ) -> Result<String, String> {
     // T1153 LAND-28: outside a repository PHP resolves a
     // `filesystem` API, whose empty marker-type list fails the
@@ -315,8 +328,8 @@ fn execute_core(
     if options.json {
         return match detect_vcs(dir) {
             Some("hg") => {
-                let found = markers::list(dir, markers::MARKER_TYPE_BRANCH)?;
-                let branches: Vec<Branch> = found // LCOV_EXCL_START // Reason: needs system hg; markers::list shells hg, absent on ubuntu CI
+                let found = markers::list_with(dir, markers::MARKER_TYPE_BRANCH, hg_command)?;
+                let branches: Vec<Branch> = found
                     .iter()
                     .map(|marker| Branch {
                         name: marker.name.clone(),
@@ -331,7 +344,7 @@ fn execute_core(
                 let mut text = serde_json::to_string_pretty(&format_json(&branches))
                     .map_err(|e| format!("failed to encode JSON: {e}"))?;
                 text.push('\n');
-                Ok(text) // LCOV_EXCL_STOP
+                Ok(text)
             }
             _ => {
                 let branches = list(dir, options.all)?;

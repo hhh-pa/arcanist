@@ -414,24 +414,31 @@ fn execute_with_client_covers_help_and_usage_errors() {
 
 #[test]
 fn execute_core_hg_json_reaches_marker_list() {
-    // Under Mercurial `--json` renders through the marker list. The
-    // system `hg` backend is unassertable (presence varies), so both
-    // outcomes only pin their shapes.
+    // Under Mercurial `--json` renders through the marker list, staged
+    // here with a fake `hg` answering `arc-ls-markers` (no system hg).
     let dir = TempDir::new("hg-json");
     std::fs::create_dir(dir.path().join(".hg")).unwrap();
+    let script = dir.path().join("fakehg.sh");
+    std::fs::write(
+        &script,
+        "printf '%s' '[{\"type\":\"branch\",\"name\":\"default\",\"node\":\"0123456789abcdef0123456789abcdef01234567\",\"description\":\"first commit\",\"isActive\":true}]'\n",
+    )
+    .unwrap();
+    let hg_cmd = crate::hg::HgCommand::custom("sh", &[&script.to_string_lossy()]);
     let options = Options {
         all: false,
         json: true,
         conduit_uri: None,
     };
-    match execute_core(dir.path(), &options, None, None) {
-        // LCOV_EXCL_START // Reason: Ok arm needs system hg; absent on CI, the Err arm pins here
-        Ok(text) => {
-            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-            assert!(value.is_array(), "{text}"); // LCOV_EXCL_STOP
-        }
-        Err(message) => assert!(!message.is_empty()),
-    }
+    let text = execute_core(dir.path(), &options, None, None, &hg_cmd).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(value.is_array(), "{text}");
+    assert_eq!(value[0]["name"], "default");
+    assert_eq!(value[0]["current"], true);
+    assert_eq!(value[0]["hash"], "0123456");
+    assert_eq!(value[0]["subject"], "first commit");
+    // The ambient marker-list wrapper stays callable without a system hg.
+    let _ = markers::list(dir.path(), markers::MARKER_TYPE_BRANCH);
 }
 
 #[test]
