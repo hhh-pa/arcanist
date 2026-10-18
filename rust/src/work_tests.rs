@@ -258,7 +258,7 @@ fn requires_a_supported_working_copy() {
     std::fs::create_dir(hg.path().join(".hg")).unwrap();
     let options = match parse_args_with_tty(&args(&["feature"]), true) {
         ParseOutcome::Args(options) => options,
-        _ => panic!("feature parses"),
+        _ => panic!("feature parses"), // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
     };
     let hg_cmd = crate::hg::HgCommand::custom("false", &[]);
     let mut input = std::io::Cursor::new(b"");
@@ -917,8 +917,8 @@ fn hg_dispatch_checks_out_and_creates_bookmarks() {
     std::fs::write(tmp.path().join(".fakehg-bookmarks"), "  feat  3:abc\n").unwrap();
     std::fs::write(tmp.path().join(".fakehg-branches"), "").unwrap();
     let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []}))
-    };
+        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub body never invoked on this path
+    }; // LCOV_EXCL_STOP
     hg_dispatch_symbol_with(tmp.path(), &hg_cmd, "feat", None, &call).unwrap();
     let log = hg_read_log(tmp.path());
     assert!(log.contains("checkout feat --"), "{log}");
@@ -952,8 +952,8 @@ fn hg_ambiguous_symbols_fail_like_php() {
     std::fs::write(tmp.path().join(".fakehg-bookmarks"), "  dup  3:abc\n").unwrap();
     std::fs::write(tmp.path().join(".fakehg-branches"), "dup  1:abc123\n").unwrap();
     let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []}))
-    };
+        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub body never invoked on this path
+    }; // LCOV_EXCL_STOP
     let err = hg_dispatch_symbol_with(tmp.path(), &hg_cmd, "dup", None, &call).unwrap_err();
     assert_eq!(err, "Symbol \"dup\" is ambiguous.");
 }
@@ -1318,8 +1318,8 @@ fn branches_for_revision_is_empty_without_branches() {
         title: "Fix it".to_string(),
     };
     let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Err("must not be called".to_string())
-    };
+        Err("must not be called".to_string()) // LCOV_EXCL_START // Reason: must-not-call guard; firing fails the test
+    }; // LCOV_EXCL_STOP
     assert_eq!(
         branches_for_revision(&call, tmp.path(), &revision).unwrap(),
         Vec::new()
@@ -1622,8 +1622,8 @@ fn run_in_dispatches_hg_repos() {
     assert!(is_hg_repo(tmp.path()));
     assert!(!git::is_inside_work_tree(tmp.path()));
     let empty = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []}))
-    };
+        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
+    }; // LCOV_EXCL_STOP
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
         run_in_with(
@@ -1671,8 +1671,8 @@ fn hg_system_wrappers_handle_plain_dirs() {
     let tmp = TempDir::new("hg-plain");
     assert_eq!(hg_branch_tips(tmp.path()).unwrap(), Vec::new());
     let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Err("must not be called".to_string())
-    };
+        Err("must not be called".to_string()) // LCOV_EXCL_START // Reason: must-not-call guard; firing fails the test
+    }; // LCOV_EXCL_STOP
     assert_eq!(
         hg_branches_for_revision(&call, tmp.path(), &revision_123()).unwrap(),
         Vec::new()
@@ -1713,8 +1713,8 @@ fn hg_branches_for_revision_is_empty_without_markers() {
     // (work.rs:732).
     let (tmp, hg_cmd) = hg_test_repo("hg-no-markers");
     let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Err("must not be called".to_string())
-    };
+        Err("must not be called".to_string()) // LCOV_EXCL_START // Reason: must-not-call guard; firing fails the test
+    }; // LCOV_EXCL_STOP
     assert_eq!(
         hg_branches_for_revision_with(&call, tmp.path(), &hg_cmd, &revision_123()).unwrap(),
         Vec::new()
@@ -1838,8 +1838,8 @@ fn hg_dispatch_checks_out_branch_markers() {
     )
     .unwrap();
     let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []}))
-    };
+        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
+    }; // LCOV_EXCL_STOP
     hg_dispatch_symbol_with(tmp.path(), &hg_cmd, "stable", None, &call).unwrap();
     let log = hg_read_log(tmp.path());
     assert!(log.contains("checkout stable --"), "{log}");
@@ -1852,8 +1852,8 @@ fn hg_dispatch_rejects_unresolvable_starts() {
     let (tmp, hg_cmd) = hg_test_repo("hg-bad-start");
     std::fs::write(tmp.path().join(".fakehg-fail-log"), "").unwrap();
     let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []}))
-    };
+        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
+    }; // LCOV_EXCL_STOP
     assert_eq!(
         hg_dispatch_symbol_with(
             tmp.path(),
@@ -2036,8 +2036,8 @@ fn run_hg_in_with_cmd_runs_bookmark_flow() {
     let (tmp, hg_cmd) = hg_test_repo("hg-run-ok");
     let options = hg_options("novel");
     let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []}))
-    };
+        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
+    }; // LCOV_EXCL_STOP
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
         run_hg_in_with_cmd(tmp.path(), &hg_cmd, &options, Some(&call), &mut input),
@@ -2055,8 +2055,8 @@ fn run_hg_in_with_cmd_shelves_and_restores() {
     std::fs::write(tmp.path().join(".fakehg-status"), "M a.txt\n").unwrap();
     let options = hg_options("novel");
     let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []}))
-    };
+        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
+    }; // LCOV_EXCL_STOP
     let mut input = std::io::Cursor::new(b"y\n");
     assert_eq!(
         run_hg_in_with_cmd(tmp.path(), &hg_cmd, &options, Some(&call), &mut input),
@@ -2078,8 +2078,8 @@ fn run_hg_in_with_cmd_fails_when_unshelve_fails() {
     std::fs::write(tmp.path().join(".fakehg-fail-unshelve"), "").unwrap();
     let options = hg_options("novel");
     let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []}))
-    };
+        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
+    }; // LCOV_EXCL_STOP
     let mut input = std::io::Cursor::new(b"y\n");
     assert_eq!(
         run_hg_in_with_cmd(tmp.path(), &hg_cmd, &options, Some(&call), &mut input),
@@ -2098,8 +2098,8 @@ fn run_hg_in_with_cmd_fails_when_status_fails() {
     std::fs::write(tmp.path().join(".fakehg-fail-status"), "").unwrap();
     let options = hg_options("novel");
     let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []}))
-    };
+        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
+    }; // LCOV_EXCL_STOP
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
         run_hg_in_with_cmd(tmp.path(), &hg_cmd, &options, Some(&call), &mut input),
@@ -2118,8 +2118,8 @@ fn run_hg_in_with_cmd_fails_without_shelve() {
     std::fs::write(tmp.path().join(".fakehg-no-shelve"), "").unwrap();
     let options = hg_options("novel");
     let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []}))
-    };
+        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
+    }; // LCOV_EXCL_STOP
     let mut input = std::io::Cursor::new(b"y\n");
     assert_eq!(
         run_hg_in_with_cmd(tmp.path(), &hg_cmd, &options, Some(&call), &mut input),
@@ -2138,8 +2138,8 @@ fn run_hg_in_with_cmd_restores_after_ambiguous_dispatch() {
     std::fs::write(tmp.path().join(".fakehg-branches"), "dup  1:abc123\n").unwrap();
     let options = hg_options("dup");
     let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []}))
-    };
+        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
+    }; // LCOV_EXCL_STOP
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
         run_hg_in_with_cmd(tmp.path(), &hg_cmd, &options, Some(&call), &mut input),

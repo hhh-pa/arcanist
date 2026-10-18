@@ -6359,7 +6359,7 @@ fn t1170_flow_svn_hunks_failure_exits_empty() {
     // Failed svn hunks print the warning and exit empty
     // (patch.rs:6392): the caller exits 1 without printing more.
     if !has_patch_binary() {
-        return;
+        return; // LCOV_EXCL_LINE // Reason: skip arm for patch-less machines; the gates image installs patch via build-essential
     }
     let dir = temp_dir("t1170_flow_svn");
     std::fs::create_dir(dir.join(".svn")).unwrap();
@@ -6720,4 +6720,29 @@ fn cov6g_read_patch_bytes_uses_scripted_stdin_for_dash() {
     std::fs::write(dir.join("p.diff"), "patch-bytes").unwrap();
     let path = dir.join("p.diff").to_string_lossy().to_string();
     assert_eq!(read_patch_bytes(&path, &mut io).unwrap(), b"patch-bytes");
+}
+
+// -( T1170 endgame band I: direct helper-arm tests )---------------------------
+
+#[test]
+fn transport_pushes_ascii_verbatim() {
+    // `push_transport_byte` documents ASCII-verbatim passthrough, but
+    // live callers only feed it invalid-UTF-8 bytes (always >= 0x80),
+    // so the ASCII arm is covered here directly.
+    let mut out = String::new();
+    push_transport_byte(&mut out, b'A');
+    assert_eq!(out, "A");
+    let mut out = String::new();
+    push_transport_byte(&mut out, 0x80);
+    assert!(out.starts_with(TRANSPORT_ESC));
+}
+
+#[test]
+fn base64_padding_byte_maps_to_none() {
+    // `base64_val` documents `=` as padding, but the decoder skips
+    // padding positions before consulting the table (and rejects
+    // stray `=` earlier), so the arm is covered here directly.
+    assert_eq!(base64_val(b'='), None);
+    assert_eq!(base64_val(b'A'), Some(0));
+    assert_eq!(base64_val(b'?'), None);
 }

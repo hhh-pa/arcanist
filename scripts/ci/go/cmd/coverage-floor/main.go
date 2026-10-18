@@ -14,7 +14,7 @@ import (
 	"github.com/hhh-pa/arcanist/scripts/ci/go/internal/lcov"
 )
 
-const usage = "Usage: coverage-floor <lcov.info> [floor=80.0]\n"
+const usage = "Usage: coverage-floor <lcov.info> [floor=100.0]\n"
 
 type row struct {
 	pct float64
@@ -29,7 +29,7 @@ func run(argv []string) int {
 		return 2
 	}
 	path := argv[0]
-	floor := 80.0
+	floor := 100.0
 	if len(argv) > 1 {
 		parsed, err := strconv.ParseFloat(argv[1], 64)
 		if err != nil {
@@ -89,8 +89,8 @@ func run(argv []string) int {
 			fmt.Printf("  %6.2f%% %5d/%-5d %s\n", 100*r.pct, r.hit, r.tot, r.sf)
 		}
 		fmt.Printf(
-			"FAIL: line coverage %.2f%% is below the %.2f%% floor\n",
-			pct, floor,
+			"FAIL: line coverage %.2f%% (%d/%d) is below the %.2f%% floor\n",
+			pct, hit, tot, floor,
 		)
 		return 1
 	}

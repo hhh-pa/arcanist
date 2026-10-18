@@ -114,7 +114,7 @@ fn config_and_binary_resolution() {
         err.message()
             .contains("PHPUnit configuration file was not found in"),
         "{}",
-        err.message()
+        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 
     let on_path = |b: &str| b == "phpunit";
@@ -165,7 +165,7 @@ fn json_report_repair_and_empty_guidance() {
     assert!(
         err.message().contains("JSON report file is empty"),
         "{}",
-        err.message()
+        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 }
 
@@ -200,7 +200,7 @@ fn parser_maps_events_statuses_and_trailing_start() {
     assert!(
         results[1].get_user_data().unwrap().contains("F.php:3"),
         "{:?}",
-        results[1].get_user_data()
+        results[1].get_user_data() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
     assert_eq!(results[2].get_result(), RESULT_SKIP);
     assert_eq!(results[3].get_result(), RESULT_BROKEN);
@@ -318,7 +318,7 @@ fn run_with_skips_missing_test_files() {
         ..EngineContext::new("/r")
     };
     let runner = |_: &[String], _: &str| -> CapturedOutput {
-        panic!("the missing test must not run");
+        panic!("the missing test must not run"); // LCOV_EXCL_LINE // Reason: must-not-run guard; the missing test never executes
     };
     let results = engine.run_with(&ctx, &runner, &fs).unwrap();
     assert!(results.is_empty());

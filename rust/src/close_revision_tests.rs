@@ -538,7 +538,7 @@ fn t1170_confirm_interactive_errors_when_not_interactive() {
     // from a terminal `console_confirm` refuses before reading, so only
     // that arm pins here (CI and grading runs are non-interactive).
     if crate::prompt::stdin_is_terminal() {
-        return;
+        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
     }
     assert_eq!(
         confirm_interactive("Close revision D123?").unwrap_err(),

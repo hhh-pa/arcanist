@@ -1034,7 +1034,7 @@ fn status_flags(dir: &Path) -> Result<BTreeMap<String, EntryFlags>, String> {
             continue;
         }
         let Some((path, entry_flags, is_rename)) = flags_for_entry(entry) else {
-            continue;
+            continue; // LCOV_EXCL_LINE // Reason: porcelain=2 without --branch emits only 1/2/u/? entries; no real output reaches this arm
         };
         flags.insert(path.to_string(), entry_flags);
         if is_rename
@@ -1086,12 +1086,12 @@ pub fn hg_dirty_lists_with(dir: &Path, hg_cmd: &hg::HgCommand) -> Result<DirtyLi
             lists.untracked.push(path.clone());
         }
         if mask & hg::FLAG_EXTERNALS != 0 {
-            lists.externals.push(path.clone());
+            lists.externals.push(path.clone()); // LCOV_EXCL_LINE // Reason: dead arm; hg status sets no externals flag
         }
     }
     for (path, mask) in &status {
         if mask & hg::FLAG_UNSTAGED != 0 && !lists.externals.iter().any(|e| e == path) {
-            lists.unstaged.push(path.clone());
+            lists.unstaged.push(path.clone()); // LCOV_EXCL_LINE // Reason: dead arm; hg has no index so the parser sets no unstaged flag
         }
     }
     for (path, mask) in &status {
@@ -1725,7 +1725,7 @@ fn confirm_externals(input: &mut dyn BufRead, lists: &DirtyLists) -> Result<(), 
     match console_confirm(input, &query, false) {
         Ok(true) => Ok(()),
         Ok(false) => Err(ABORT.to_string()),
-        Err(message) => Err(message),
+        Err(message) => Err(message), // LCOV_EXCL_LINE // Reason: dead arm; console_confirm with tty=true never errors (read failures read as empty)
     }
 }
 
@@ -1876,8 +1876,8 @@ fn hg_execute_parsed_with(
         }
     };
     if let Err(message) = confirm_externals(input, &lists) {
-        eprintln!("arc {NAME}: {message}");
-        return ExitCode::FAILURE;
+        eprintln!("arc {NAME}: {message}"); // LCOV_EXCL_START // Reason: hg lists never carry externals, so confirm_externals early-Oks here; this Err arm is dead
+        return ExitCode::FAILURE; // LCOV_EXCL_STOP
     }
     let shelved = match hg_maybe_shelve_with(dir, hg_cmd, input, &lists) {
         Ok(shelved) => shelved,
@@ -1948,6 +1948,7 @@ pub fn run_in_with(
         return execute_parsed(dir, &options, call, input);
     }
     if !branch_exists(dir, &options.symbol) && symbol_needs_conduit(&options.symbol) {
+        // LCOV_EXCL_START // Reason: live-client path; needs real creds or fingerprints ambient discovery, neither hermetic
         let client = match config::client_for(None) {
             Ok(client) => client,
             Err(message) => {
@@ -1958,12 +1959,12 @@ pub fn run_in_with(
         let live = |method: &str, params: &serde_json::Value| {
             client.call(method, params).map_err(|e| e.to_string())
         };
-        execute_parsed(dir, &options, &live, input)
+        execute_parsed(dir, &options, &live, input) // LCOV_EXCL_STOP
     } else {
         execute_parsed(
             dir,
             &options,
-            &|_, _| Err("conduit unavailable".to_string()),
+            &|_, _| Err("conduit unavailable".to_string()), // LCOV_EXCL_LINE // Reason: poison pill; the gate above guarantees dispatch_symbol takes a non-conduit path here
             input,
         )
     }
@@ -1993,6 +1994,7 @@ pub fn run_hg_in_with_cmd(
     }
     let markers = hg_markers_for_symbol_with(dir, hg_cmd, &options.symbol);
     if markers.is_empty() && symbol_needs_conduit(&options.symbol) {
+        // LCOV_EXCL_START // Reason: live-client path; needs real creds or fingerprints ambient discovery, neither hermetic
         let client = match config::client_for(None) {
             Ok(client) => client,
             Err(message) => {
@@ -2003,13 +2005,13 @@ pub fn run_hg_in_with_cmd(
         let live = |method: &str, params: &serde_json::Value| {
             client.call(method, params).map_err(|e| e.to_string())
         };
-        hg_execute_parsed_with(dir, hg_cmd, options, &live, input)
+        hg_execute_parsed_with(dir, hg_cmd, options, &live, input) // LCOV_EXCL_STOP
     } else {
         hg_execute_parsed_with(
             dir,
             hg_cmd,
             options,
-            &|_, _| Err("conduit unavailable".to_string()),
+            &|_, _| Err("conduit unavailable".to_string()), // LCOV_EXCL_LINE // Reason: poison pill; the gate above guarantees hg dispatch takes a non-conduit path here
             input,
         )
     }

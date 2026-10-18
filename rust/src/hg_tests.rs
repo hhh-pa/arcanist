@@ -1267,7 +1267,7 @@ fn probe_txtbsy() -> Option<bool> {
 fn output_gives_up_on_permanently_busy_script() {
     if !platform_reports_txtbsy() {
         return;
-    }
+    } // LCOV_EXCL_START // Reason: ETXTBSY-only test body; macOS exec never reports text-file-busy (probe-gated)
     let fake = FakeHg::named("stuck");
     let sh = fake.dir.join("stuck.sh");
     std::fs::write(
@@ -1286,7 +1286,7 @@ echo hi
     let _held = std::fs::OpenOptions::new().write(true).open(&sh).unwrap();
     let hg = HgCommand::custom(&sh.to_string_lossy(), &[]);
     let err = output_with(&fake.dir, &hg, &[]).unwrap_err();
-    assert!(err.contains("failed to run"), "{err}");
+    assert!(err.contains("failed to run"), "{err}"); // LCOV_EXCL_STOP
 }
 #[test]
 fn commit_range_status_parses_like_plain_status() {
@@ -1659,7 +1659,7 @@ fn t1170_scratch_migration_reports_filesystem_failures() {
         if std::fs::read(&secret).is_err() {
             assert!(!migrate_scratch_dir(&locked, &base.join("fresh-meta")));
             assert!(secret.exists());
-        }
+        } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
         {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = std::fs::metadata(&secret).unwrap().permissions();

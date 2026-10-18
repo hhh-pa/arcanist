@@ -1007,9 +1007,9 @@ fn gap2_run_lint_maps_codes_and_outcomes() {
     // Skip short-circuits silently.
     let calls = RefCell::new(0);
     let counting = |_: &Path, _: &[String]| {
-        *calls.borrow_mut() += 1;
+        *calls.borrow_mut() += 1; // LCOV_EXCL_START // Reason: skip short-circuits before the spy runs; the test asserts the skip
         ChildOutcome::Code(0, Vec::new())
-    };
+    }; // LCOV_EXCL_STOP
     let mut out = Vec::new();
     assert_eq!(
         run_lint(&dir, Some("abc"), &[], true, &counting, &mut out).unwrap(),
@@ -3294,7 +3294,7 @@ fn gap2_merge_svn_path_diffs_shapes() {
     assert!(
         file.hunks[0].corpus.contains("-file\n"),
         "{}",
-        file.hunks[0].corpus
+        file.hunks[0].corpus // LCOV_EXCL_LINE // Reason: assert-message arg; evaluates only if the passing assert fails
     );
 
     // Blank-only diff text fails like PHP's `parseDiff()` guard.
@@ -3600,8 +3600,8 @@ fn gap2_validate_commit_message_flows() {
     // No revision, no reviewers: silent success, no conduit calls.
     let message = CommitMessage::new_from_raw_corpus("Title\n").unwrap();
     let fail = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Err("must not call".to_string())
-    };
+        Err("must not call".to_string()) // LCOV_EXCL_START // Reason: must-not-call guard; firing fails the test
+    }; // LCOV_EXCL_STOP
     let mut out = Vec::new();
     validate_commit_message(
         &mut Cursor::new(b"".to_vec()),
@@ -3713,9 +3713,9 @@ fn gap2_edit_create_message_first_pass() {
     let meta = root.join(".git");
     let calls = std::cell::RefCell::new(0usize);
     let edit = |_: &str| -> Result<String, String> {
-        *calls.borrow_mut() += 1;
+        *calls.borrow_mut() += 1; // LCOV_EXCL_START // Reason: verbatim skips the editor on this path; the spy never runs
         Ok("Edited\n".to_string())
-    };
+    }; // LCOV_EXCL_STOP
 
     // Verbatim skips the editor on the first pass for non-default templates.
     let mut input = Cursor::new(b"".to_vec());
@@ -4554,8 +4554,8 @@ fn gap2_format_count_grouping() {
 fn gap2_calculate_should_amend_decisions() {
     let no_revisions = || -> Result<Vec<(i64, String)>, String> { Ok(Vec::new()) };
     let fail_call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Err("must not call".to_string())
-    };
+        Err("must not call".to_string()) // LCOV_EXCL_START // Reason: must-not-call guard; firing fails the test
+    }; // LCOV_EXCL_STOP
     let head = gap2_d1_local_commit("abc123", "Work", "Work\n");
     let base = || AmendCheck {
         history_immutable: false,
@@ -5026,7 +5026,7 @@ struct T1170GitRepo {
 impl T1170GitRepo {
     fn named(tag: &str) -> Option<Self> {
         if !t1170_git_available() {
-            return None;
+            return None; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
         }
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -5091,7 +5091,7 @@ impl Drop for T1170GitRepo {
 #[test]
 fn t1170_git_log_failures_report_stderr() {
     let Some(repo) = T1170GitRepo::named("logfail") else {
-        return;
+        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
     };
     let err = get_local_commit_information(&repo.dir, "missing-base", "HEAD").unwrap_err();
     assert!(err.contains("git log failed"), "{err}");
@@ -5108,7 +5108,7 @@ fn t1170_git_log_failures_report_stderr() {
 #[test]
 fn t1170_symbolic_ref_unexpected_exit_fails() {
     let Some(repo) = T1170GitRepo::named("symref") else {
-        return;
+        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
     };
     // Outside any repo `git symbolic-ref` exits 128: neither 0 nor 1.
     let plain =
@@ -5125,7 +5125,7 @@ fn t1170_symbolic_ref_unexpected_exit_fails() {
 #[test]
 fn t1170_collect_change_entries_classifies_worktree_shapes() {
     let Some(repo) = T1170GitRepo::named("classify") else {
-        return;
+        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
     };
     repo.commit_file("a.txt", "one\n", "add a");
     let base = git::stdout_text(&repo.dir, &["rev-parse", "HEAD~1"]).unwrap();
@@ -5148,7 +5148,7 @@ fn t1170_collect_change_entries_classifies_worktree_shapes() {
 #[test]
 fn t1170_collect_change_entries_spots_symlinks() {
     let Some(repo) = T1170GitRepo::named("symlink") else {
-        return;
+        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
     };
     repo.commit_file("a.txt", "one\n", "add a");
     std::fs::remove_file(repo.dir.join("a.txt")).unwrap();
@@ -5162,7 +5162,7 @@ fn t1170_collect_change_entries_spots_symlinks() {
 #[test]
 fn t1170_copy_status_maps_to_copy_here() {
     let Some(repo) = T1170GitRepo::named("copydetect") else {
-        return;
+        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
     };
     let body: String = (1..=20).map(|n| format!("line {n}\n")).collect();
     repo.commit_file("a.txt", &body, "add a");
@@ -5195,10 +5195,10 @@ fn t1170_copy_status_maps_to_copy_here() {
 #[test]
 fn t1170_working_copy_revisions_with_empty_log_returns_none() {
     let Some(repo) = T1170GitRepo::named("emptylog") else {
-        return;
+        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
     };
     let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        panic!("conduit must not run for an empty log");
+        panic!("conduit must not run for an empty log"); // LCOV_EXCL_LINE // Reason: must-not-call guard; firing fails the test
     };
     let revisions =
         load_working_copy_revisions_git(&call, &repo.dir, "HEAD", "HEAD", "PHID-U").unwrap();
@@ -5208,7 +5208,7 @@ fn t1170_working_copy_revisions_with_empty_log_returns_none() {
 #[test]
 fn t1170_raw_diff_bytes_failure_reports_stderr() {
     let Some(repo) = T1170GitRepo::named("rawfail") else {
-        return;
+        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
     };
     let err = get_raw_diff_bytes(&repo.dir, "missing-base", "f.txt").unwrap_err();
     assert!(err.contains("git diff failed"), "{err}");
@@ -5324,7 +5324,7 @@ fn t1170_hg_working_copy_revisions_empty_without_commits() {
     fake.write(".resp-log", "n1\x01no trailer here\x02".as_bytes());
     fake.write(".resp-local", b"");
     let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        panic!("conduit must not run without commits");
+        panic!("conduit must not run without commits"); // LCOV_EXCL_LINE // Reason: must-not-call guard; firing fails the test
     };
     let revisions =
         load_working_copy_revisions_hg(&call, &fake.dir, &fake.hg, "base", "default", "PHID-U")
@@ -5412,7 +5412,7 @@ fn t1170_lint_in_process_empty_engine_has_no_effect() {
 #[test]
 fn t1170_lint_in_process_comprehensive_run_collects() {
     let Some(repo) = T1170GitRepo::named("lintrun") else {
-        return;
+        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
     };
     std::fs::write(
         repo.dir.join(".arcconfig"),
@@ -5654,7 +5654,7 @@ fn t1170_run_unit_in_process_collects_cargo_results() {
             assert_eq!(code, 0);
             assert_eq!(dicts.len(), 1);
         }
-        _ => panic!("expected unit results"),
+        _ => panic!("expected unit results"), // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -5746,9 +5746,9 @@ fn t1170_edit_create_message_other_error_without_draft() {
     let meta = root.join(".git");
     let amended = std::cell::RefCell::new(0usize);
     let amend = |_: &str| -> Result<(), String> {
-        *amended.borrow_mut() += 1;
+        *amended.borrow_mut() += 1; // LCOV_EXCL_START // Reason: spy asserted never called below; the flow takes the other path
         Ok(())
-    };
+    }; // LCOV_EXCL_STOP
     let passthrough = |template: &str| -> Result<String, String> { Ok(template.to_string()) };
     let mut input = Cursor::new(b"".to_vec());
     let mut out = Vec::new();
@@ -6631,7 +6631,7 @@ fn t1170_conduit_truthy_shapes_drive_amend_decision() {
 #[test]
 fn cov6g_resolve_explicit_base_ok() {
     let Some(repo) = T1170GitRepo::named("cov6g-base") else {
-        return;
+        return; // LCOV_EXCL_LINE // Reason: needs git missing from PATH; the gates container installs git
     };
     repo.commit_file("a.txt", "a\n", "second");
     let sha = resolve_explicit_base(&repo.dir, "HEAD~1", "HEAD").unwrap();

@@ -1250,11 +1250,12 @@ pub fn report(kind: EnvelopeKind, message: &str) -> std::process::ExitCode {
     // toolset arms keep their rendering: the toolset runtime catches
     // them with or without `--trace`.
     if crate::terminal::trace_enabled()
+        // LCOV_EXCL_START // Reason: needs --trace/ARC_TRACE; the process-global switch no hermetic test may set
         && matches!(kind, EnvelopeKind::Usage | EnvelopeKind::Exception)
     {
         let trace = std::backtrace::Backtrace::capture();
         eprint!("\n{message}\n{trace}");
-        return std::process::ExitCode::from(EXIT_FATAL);
+        return std::process::ExitCode::from(EXIT_FATAL); // LCOV_EXCL_STOP
     }
     let text = kind.render(message, crate::terminal::ansi_enabled());
     if kind.uses_stdout() {

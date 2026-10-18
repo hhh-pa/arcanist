@@ -36,7 +36,7 @@ fn well_formed_documents_pass() {
         assert!(
             check_well_formed(data).is_ok(),
             "for {}",
-            String::from_utf8_lossy(data)
+            String::from_utf8_lossy(data), // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
         );
         assert!(XmlLinter::new().lint_bytes("f.xml", data).is_empty());
     }
@@ -224,7 +224,7 @@ fn attribute_value_edges() {
         assert!(
             error.message.contains(fragment),
             "{}: {}",
-            String::from_utf8_lossy(data),
+            String::from_utf8_lossy(data), // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
             error.message
         );
     }
@@ -278,7 +278,7 @@ fn processing_instruction_edges() {
         assert!(
             error.message.contains(fragment),
             "{}: {}",
-            String::from_utf8_lossy(data),
+            String::from_utf8_lossy(data), // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
             error.message
         );
     }
@@ -319,7 +319,7 @@ fn xml_declaration_attribute_edges() {
         assert!(
             error.message.contains(fragment),
             "{}: {}",
-            String::from_utf8_lossy(data),
+            String::from_utf8_lossy(data), // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
             error.message
         );
     }
@@ -339,7 +339,7 @@ fn doctype_edges() {
         assert!(
             error.message.contains(fragment),
             "{}: {}",
-            String::from_utf8_lossy(data),
+            String::from_utf8_lossy(data), // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
             error.message
         );
     }
@@ -371,7 +371,7 @@ fn start_tag_and_content_edges() {
         assert!(
             error.message.contains(fragment),
             "{}: {}",
-            String::from_utf8_lossy(data),
+            String::from_utf8_lossy(data), // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
             error.message
         );
     }

@@ -240,14 +240,14 @@ fn confirm_routes_through_the_live_tty_flag() {
     let mut input = cursor("");
     let result = prompt::console_confirm(&mut input, "Proceed?", true);
     if tty {
-        assert_eq!(result, Ok(false));
+        assert_eq!(result, Ok(false)); // LCOV_EXCL_LINE // Reason: TTY arm; stdin is never a terminal under cargo test
     } else {
         assert_eq!(result, Err(prompt::NOT_INTERACTIVE.to_string()));
     }
     let mut input = cursor("");
     let result = prompt::console_confirm(&mut input, "Proceed?", false);
     if tty {
-        assert_eq!(result, Ok(true));
+        assert_eq!(result, Ok(true)); // LCOV_EXCL_LINE // Reason: TTY arm; stdin is never a terminal under cargo test
     } else {
         assert_eq!(result, Err(prompt::NOT_INTERACTIVE.to_string()));
     }

@@ -317,3 +317,14 @@ fn version_requirement_gates_linting() {
     assert_eq!(messages[0].code, "C901");
     assert_eq!(messages[0].severity, "advice");
 }
+
+#[test]
+fn t1170_unconfigured_linter_stays_silent_without_tool() {
+    // T1170 band J: with no `bin` override and no flake8 on PATH
+    // the linter stays inactive (mirroring PHP).
+    assert!(
+        Flake8Linter::new()
+            .lint_bytes("a.py", b"x = 1\n")
+            .is_empty()
+    );
+}

@@ -424,9 +424,9 @@ fn throw_message_text_is_exact() {
 }
 
 // -( T1153 Wave 2: lint retrocompat )--------------------------------------
-
+// LCOV_EXCL_START // Reason: referenced-but-never-called parser; the script fails before parsing
 fn lint28_failing_parser(_output: &str) -> Vec<ScriptRegexMatch> {
-    unreachable!("the script fails before parsing")
+    unreachable!("the script fails before parsing") // LCOV_EXCL_STOP
 }
 
 fn lint28_throwing_parser(_output: &str) -> Vec<ScriptRegexMatch> {

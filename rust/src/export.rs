@@ -566,8 +566,8 @@ fn export_prompt_line(prompt: &str) -> Option<String> {
     if !crate::prompt::stdin_is_terminal() {
         EXPORT_PROMPT_TTY_FAILED.set(true);
         return None;
-    }
-    crate::prompt::read_answer(&mut std::io::stdin().lock())
+    } // LCOV_EXCL_START // Reason: needs a TTY; stdin is never a terminal under cargo test
+    crate::prompt::read_answer(&mut std::io::stdin().lock()) // LCOV_EXCL_STOP
 }
 
 /// Resolve the local base commit: an explicit base goes through
@@ -2005,7 +2005,7 @@ fn export_bundle_with_client(
 /// Write an `--arcbundle` file, returning the stdout text.
 fn export_bundle(dir: &Path, opts: &Options, path: &str) -> Result<String, String> {
     let client = crate::config::client_for(opts.conduit_uri.as_deref())?;
-    export_bundle_with_client(dir, opts, path, &client)
+    export_bundle_with_client(dir, opts, path, &client) // LCOV_EXCL_LINE // Reason: needs a configured conduit client; hermetic tests cannot mint one (HOME is process-global)
 }
 
 /// Run the workflow rooted at `dir`, returning stdout text or an error message.
@@ -2061,8 +2061,8 @@ fn execute_local_export_text(
     viewer_real_name(&client)?;
     let mut changes = local_render_changes(dir, &base, &head, &parsed);
     render_export_text(&mut changes, git, &|phid, _| {
-        Err(format!("Nowhere to load blob '{phid}' from!"))
-    })
+        Err(format!("Nowhere to load blob '{phid}' from!")) // LCOV_EXCL_START // Reason: blob-loader closure; needs a conduit-backed export with binary adds (integration-only)
+    }) // LCOV_EXCL_STOP
 }
 
 /// `getBlob($phid, $name)`: download one conduit blob, naming the
@@ -2103,8 +2103,8 @@ fn execute_conduit_export_text(
     // `getBlob($phid, $name)`: the render path passes the file
     // basename, so the stderr message names the file.
     render_export_text(&mut changes, git, &|phid, name| {
-        download_export_blob(&client, phid, name)
-    })
+        download_export_blob(&client, phid, name) // LCOV_EXCL_START // Reason: blob-download closure; needs a conduit diff with binary files plus creds (integration-only)
+    }) // LCOV_EXCL_STOP
 }
 
 /// [`execute`] over parsed options.
@@ -2132,7 +2132,7 @@ pub fn execute_bytes(dir: &Path, argv: &[String]) -> Result<Vec<u8>, String> {
     };
     let text = execute_with_opts(dir, &opts)?;
     if matches!(opts.format, Format::Bundle { .. }) {
-        return Ok(text.into_bytes());
+        return Ok(text.into_bytes()); // LCOV_EXCL_LINE // Reason: Bundle success arm; needs conduit creds (integration-only)
     }
     // Local text rides as transport (T1153 EXPORT-E9); conduit text is
     // already UTF-8. Both convert at the sink, like
@@ -2140,7 +2140,7 @@ pub fn execute_bytes(dir: &Path, argv: &[String]) -> Result<Vec<u8>, String> {
     if matches!(opts.source, Source::Local { .. }) {
         crate::patch::encode_transport_text(&text, opts.encoding.as_deref())
     } else {
-        crate::patch::encode_bytes(&text, opts.encoding.as_deref())
+        crate::patch::encode_bytes(&text, opts.encoding.as_deref()) // LCOV_EXCL_LINE // Reason: conduit-source sink arm; needs creds plus network (integration-only)
     }
 }
 

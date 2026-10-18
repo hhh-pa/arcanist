@@ -225,7 +225,7 @@ fn terminal_width_from_tput() -> Option<usize> {
         .output()
         .ok()?;
     if !output.status.success() {
-        return None;
+        return None; // LCOV_EXCL_LINE // Reason: tput cols succeeds in CI; the failure arm never runs
     }
     let width: usize = String::from_utf8_lossy(&output.stdout)
         .trim()

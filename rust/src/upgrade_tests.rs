@@ -869,7 +869,7 @@ fn download_refuses_checksum_problems_before_and_after_fetch() {
         assert!(
             seen.lock().unwrap().is_empty(),
             "pre-download gate must not fetch: {:?}",
-            seen.lock().unwrap()
+            seen.lock().unwrap() // LCOV_EXCL_LINE // Reason: assert-message expression; evaluates only if the passing assert fails
         );
     }
 
@@ -909,8 +909,8 @@ fn install_replaces_copy() {
     let backup = install_bytes_at(&exe, b"new-bytes").unwrap();
     assert_eq!(std::fs::read(&exe).unwrap(), b"new-bytes");
     if cfg!(windows) {
-        let old = backup.expect("windows keeps the old image");
-        assert_eq!(std::fs::read(&old).unwrap(), b"old-bytes");
+        let old = backup.expect("windows keeps the old image"); // LCOV_EXCL_START // Reason: windows-only assertions; cfg!(windows) is false on ubuntu CI
+        assert_eq!(std::fs::read(&old).unwrap(), b"old-bytes"); // LCOV_EXCL_STOP
     } else {
         assert!(backup.is_none());
     }
@@ -1044,10 +1044,10 @@ fn execute_apply_updates_copy_end_to_end() {
     assert!(saw(&seen, "releases/latest"));
     assert!(saw(&seen, "/dl/"));
     if cfg!(windows) {
-        let backup = report.backup.clone().expect("windows keeps the old image");
+        let backup = report.backup.clone().expect("windows keeps the old image"); // LCOV_EXCL_START // Reason: windows-only assertions; cfg!(windows) is false on ubuntu CI
         assert_eq!(std::fs::read(&backup).unwrap(), b"old-bytes");
         assert!(
-            report.stdout_text.contains("Previous executable kept as"),
+            report.stdout_text.contains("Previous executable kept as"), // LCOV_EXCL_STOP
             "{:?}",
             report.stdout_text
         );
@@ -1423,7 +1423,7 @@ fn exe_path_defaults_to_the_running_test_binary() {
 fn args_reject_positionals_after_the_terminator() {
     match parse_args_with_tty(&["--".to_string(), "x".to_string()], true) {
         Parsed::Error(message) => assert_eq!(message, "unexpected argument 'x'"),
-        _ => panic!("post-terminator positional must be an error"),
+        _ => panic!("post-terminator positional must be an error"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the error always matches
     }
 }
 
@@ -1484,4 +1484,26 @@ fn mock_server_tolerates_truncated_requests() {
     drop(client);
     let (mut stream, _) = listener.accept().unwrap();
     assert_eq!(read_request_line(&mut stream), "");
+}
+
+// -( T1170 endgame band I )----------------------------------------------------
+
+#[test]
+fn render_reports_up_to_date_status() {
+    // A known-behind count of zero renders `up to date` (the middle
+    // `update_available` arm).
+    let status = Status {
+        version: "v".to_string(),
+        in_repo: true,
+        root: Some("/r".to_string()),
+        branch: Some("master".to_string()),
+        head: Some("abc".to_string()),
+        clean: Some(true),
+        changed_files: Some(0),
+        upstream: Some("origin/master".to_string()),
+        ahead: Some(0),
+        behind: Some(0),
+    };
+    let text = render(&status);
+    assert!(text.contains("Status: up to date"), "{text}");
 }

@@ -795,7 +795,7 @@ fn stdin_prompts_on_pipes_fail_fast() {
     // Piped stdin is never a TTY under `cargo test`; bail out (rather
     // than block on a real terminal) if that ever changes.
     if crate::prompt::stdin_is_terminal() {
-        return;
+        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
     }
     assert_eq!(prompt_token().unwrap_err(), crate::prompt::NOT_INTERACTIVE);
     assert_eq!(
@@ -858,7 +858,7 @@ fn install_token_reads_prompt_without_a_flag() {
     // Piped stdin is never a TTY under `cargo test`; bail out (rather
     // than block on a real terminal) if that ever changes.
     if crate::prompt::stdin_is_terminal() {
-        return;
+        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
     }
     let options = install_test_options();
     assert_eq!(
@@ -873,7 +873,7 @@ fn standard_token_confirm_skips_with_force() {
     // Piped stdin is never a TTY under `cargo test`; bail out (rather
     // than block on a real terminal) if that ever changes.
     if crate::prompt::stdin_is_terminal() {
-        return;
+        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
     }
     assert_eq!(
         confirm_standard_token(false),
@@ -905,7 +905,7 @@ fn token_run_flow_confirms_standard_tokens() {
     // Piped stdin is never a TTY under `cargo test`; bail out (rather
     // than block on a real terminal) if that ever changes.
     if crate::prompt::stdin_is_terminal() {
-        return;
+        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
     }
     let tmp = TempDir::new("tokflow-std");
     let arcrc = tmp.path.join(".arcrc");
@@ -962,7 +962,7 @@ fn prepare_gates_on_open_arcrc_permissions() {
     // Piped stdin is never a TTY under `cargo test`; bail out (rather
     // than block on a real terminal) if that ever changes.
     if crate::prompt::stdin_is_terminal() {
-        return;
+        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
     }
     let tmp = TempDir::new("prep-chmod");
     let path = open_arcrc(&tmp, 0o644);
@@ -972,7 +972,7 @@ fn prepare_gates_on_open_arcrc_permissions() {
         path.to_string_lossy().to_string(),
     ];
     let Err(code) = prepare_install(&argv) else {
-        panic!("expected prepare_install to fail");
+        panic!("expected prepare_install to fail"); // LCOV_EXCL_LINE // Reason: defensive panic arm; the failure always matches
     };
     assert_eq!(code, std::process::ExitCode::FAILURE);
 }
@@ -995,7 +995,7 @@ fn prepare_rejects_invalid_arcrc_json() {
         path.to_string_lossy().to_string(),
     ];
     let Err(code) = prepare_install(&argv) else {
-        panic!("expected prepare_install to fail");
+        panic!("expected prepare_install to fail"); // LCOV_EXCL_LINE // Reason: defensive panic arm; the failure always matches
     };
     assert_eq!(code, std::process::ExitCode::FAILURE);
 }
@@ -1031,7 +1031,7 @@ fn run_fails_fast_without_a_token() {
     // Piped stdin is never a TTY under `cargo test`; bail out (rather
     // than block on a real terminal) if that ever changes.
     if crate::prompt::stdin_is_terminal() {
-        return;
+        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
     }
     let tmp = TempDir::new("run-notoken");
     let mut routes = std::collections::HashMap::new();
@@ -1085,7 +1085,7 @@ fn r10_install_certificate_help_matches_generated_format() {
     assert!(
         usage().contains("INSTALL-CERTIFICATE WORKFLOW"),
         "{}",
-        usage()
+        usage() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 }
 

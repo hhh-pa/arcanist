@@ -748,3 +748,16 @@ fn array_hint_without_semantic_default_records_nothing() {
 fn list_scan_skips_trivia_before_close() {
     assert!(for_rule("<?php list($a, $b ) = $c;\n", 77).is_empty());
 }
+
+fn t1170_tree(source: &str) -> ast::Tree {
+    let canned = ast::tokens_to_canned(source, &ast::tokenize(source));
+    ast::tree_from_canned(&canned).expect("canned output must parse")
+}
+
+#[test]
+fn t1170_empty_default_range_is_not_an_array() {
+    // T1170 band J: a default range with no tokens cannot be an
+    // array default.
+    let tree = t1170_tree("<?php 1\n");
+    assert!(!super::default_is_array(&tree, (3, 1)));
+}

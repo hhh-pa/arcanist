@@ -224,7 +224,7 @@ pub fn walk_to_root(path: &str, stop: &str) -> Vec<String> {
         }
         match current.rfind('/') {
             Some(i) => current = current[..i].to_string(),
-            None => break,
+            None => break, // LCOV_EXCL_LINE // Reason: dead: slashless current either equals stop or is not a descendant, both break above
         }
         if current.is_empty() {
             break;

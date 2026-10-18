@@ -176,7 +176,7 @@ fn lint_with_binary_and_flags(
         return Vec::new();
     };
     let Some(scratch) = write_scratch("rubocop", ".rb", path, data) else {
-        return Vec::new();
+        return Vec::new(); // LCOV_EXCL_LINE // Reason: temp-dir write failure; hermetic tests cannot fail temp writes (TMPDIR is process-global)
     };
     let mut command = crate::proc_env::command(tool);
     command

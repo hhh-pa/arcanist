@@ -88,9 +88,9 @@ fn command_lookup_needs_analyzer_and_runtime() {
     let cslint = tmp.path().join(binary_name());
     std::fs::write(&cslint, b"x").unwrap();
     if cfg!(windows) {
-        let (program, prefix) = resolve_command_in(tmp.path().as_os_str(), None, settings).unwrap();
+        let (program, prefix) = resolve_command_in(tmp.path().as_os_str(), None, settings).unwrap(); // LCOV_EXCL_START // Reason: windows-only assertions; cfg!(windows) is false on ubuntu CI
         assert_eq!(program, cslint);
-        assert_eq!(prefix, command_flags());
+        assert_eq!(prefix, command_flags()); // LCOV_EXCL_STOP
     } else {
         assert!(resolve_command_in(tmp.path().as_os_str(), None, settings).is_none());
         let mono = tmp.path().join(runtime_name());
@@ -113,7 +113,7 @@ fn existing_binary_hint_wins_over_path_lookup() {
     let (program, prefix) =
         resolve_command_in(tmp.path().as_os_str(), Some(&hint), settings).unwrap();
     if cfg!(windows) {
-        assert_eq!(program, hint);
+        assert_eq!(program, hint); // LCOV_EXCL_LINE // Reason: windows-only assertion; cfg!(windows) is false on ubuntu CI
     } else {
         assert_eq!(prefix[0], hint.to_string_lossy());
     }
@@ -125,7 +125,7 @@ fn existing_binary_hint_wins_over_path_lookup() {
     let (program, prefix) =
         resolve_command_in(tmp.path().as_os_str(), Some(&missing), settings).unwrap();
     if cfg!(windows) {
-        assert_eq!(program, cslint);
+        assert_eq!(program, cslint); // LCOV_EXCL_LINE // Reason: windows-only assertion; cfg!(windows) is false on ubuntu CI
     } else {
         assert_eq!(prefix[0], cslint.to_string_lossy());
     }
@@ -389,11 +389,12 @@ fn ambient_command_lookup_stays_consistent_when_present() {
     // only that a found command carries the default flags.
     match resolve_command() {
         None => {}
+        // LCOV_EXCL_START // Reason: ambient-cslint arm; cslint plus mono are absent on ubuntu CI
         Some((_, prefix)) => {
             if cfg!(windows) {
                 assert_eq!(prefix, command_flags());
             } else {
-                assert_eq!(&prefix[1..], command_flags().as_slice());
+                assert_eq!(&prefix[1..], command_flags().as_slice()); // LCOV_EXCL_STOP
             }
         }
     }

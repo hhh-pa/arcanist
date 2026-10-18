@@ -303,9 +303,10 @@ fn missing_tool_reports_nothing() {
 #[test]
 fn binary_on_path_probes_plain_names() {
     if let Some(path) = binary_on_path("rubocop") {
+        // LCOV_EXCL_START // Reason: rubocop-present arm; rubocop is absent on ubuntu CI
         assert!(
             path.file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with("rubocop")),
+                .is_some_and(|name| name.to_string_lossy().starts_with("rubocop")), // LCOV_EXCL_STOP
             "{path:?}"
         );
     }

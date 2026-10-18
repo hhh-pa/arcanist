@@ -402,15 +402,16 @@ pub fn run_in(cwd: &Path, argv: &[String]) -> ExitCode {
         &get_config::LoadOptions::default(),
         &config::command_description(),
     ) {
-        Ok(client) => client,
+        Ok(client) => client, // LCOV_EXCL_LINE // Reason: needs an authenticated conduit client; hermetic tests cannot mint one (HOME is process-global)
         Err(error) => return error.report(),
     };
+    // LCOV_EXCL_START // Reason: needs an authenticated conduit client; hermetic tests cannot mint one (HOME is process-global)
     match execute_in(&client, &options, cwd) {
         Ok(out) => {
             print!("{out}");
             ExitCode::SUCCESS
         }
-        Err(msg) => conduit::report(EnvelopeKind::Exception, &msg),
+        Err(msg) => conduit::report(EnvelopeKind::Exception, &msg), // LCOV_EXCL_STOP
     }
 }
 

@@ -677,7 +677,7 @@ fn r4_rbd4_toolset_usage_matcher() {
 fn r4_rbd4_parse_error_has_no_dump() {
     match execute(&std::env::temp_dir(), &args(&["--bogus"])) {
         Err(message) => assert!(!message.contains("usage:"), "{message}"),
-        _ => panic!("expected parse error"),
+        _ => panic!("expected parse error"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     }
     assert_eq!(
         run_in(&std::env::temp_dir(), &args(&["--bogus"])),

@@ -798,32 +798,17 @@ fn tls_rejects_malformed_bundles() {
     assert!(err.to_string().contains("invalid CA bundle"), "{err}");
 }
 
+/// Self-signed `CN=t1170` fixture (was minted by `openssl` at test
+/// time; embedded so the test runs where `openssl` is missing too).
+const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIBmTCCAQICCQCR1Cgl1zIklTANBgkqhkiG9w0BAQsFADAQMQ4wDAYDVQQDDAV0\nMTE3MDAgFw0yNjEwMTgwODQzMjJaGA8yMTI2MDkyNDA4NDMyMlowEDEOMAwGA1UE\nAwwFdDExNzAwgZ8wDQYJKoZIhvcNAQEBBQADgY0AMIGJAoGBAM5IfyPoDEqCd5ih\ne0KcdWOBlRYqzJv+q1ju6LJqWVJrHhuP93w8cgebdCze4MFKAWRN4Idj9iamyzqj\nBWBAtlnuTBRT1i2sJZBthSD8IJWltX6Q5a9bJSHg1PUF8L5GOAcvygthSGBnDLcU\n5dcsT0Q/QmpJTqhhK3WlIWMI0W0BAgMBAAEwDQYJKoZIhvcNAQELBQADgYEAO8mX\n6U9g9WFqZYtQrF98JdtG+mlRLE7mb3YoLw8w3bSnDn3rgcNPbJ+Wabtk3ZAfHO6x\nyZ63Z5kfLPcNc6gt3B+n89/UXdXfp4USb5SF6IUuGfg97HGT4qFppyOAAZpgrAT6\nOviVVEblKPBnzCL5i70FdHZ8XR9YqcoaXYP70Ts=\n-----END CERTIFICATE-----\n";
+
 #[test]
 fn tls_loads_valid_ca_bundles() {
-    // Self-signed fixture minted by `openssl`; skipped when it is missing.
+    // T1170 band J: the CA fixture is embedded (no `openssl` needed),
+    // so this loads deterministically on every runner.
     let tmp = TempDir::new("cabundle-ok");
     let cert = tmp.path().join("ca.pem");
-    let minted = std::process::Command::new("openssl")
-        .args([
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:1024",
-            "-keyout",
-            tmp.path().join("key.pem").to_string_lossy().as_ref(),
-            "-out",
-            cert.to_string_lossy().as_ref(),
-            "-days",
-            "1",
-            "-nodes",
-            "-subj",
-            "/CN=t1170",
-        ])
-        .output()
-        .is_ok_and(|out| out.status.success());
-    if !minted {
-        return;
-    }
+    std::fs::write(&cert, TEST_CA_PEM).unwrap();
     let tls = TlsConfig {
         cabundle: Some(cert),
         blind_trust: Vec::new(),

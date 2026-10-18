@@ -271,7 +271,7 @@ pub fn revision_id_from_message(corpus: &str) -> Result<Option<u32>, String> {
         }
         search = line_end + 1;
     }
-    Ok(None)
+    Ok(None) // LCOV_EXCL_LINE // Reason: dead: the loop always returns via line_end==len; the guard never fails
 }
 
 /// Match a bare `D123` value (`/^[dD]([1-9]\d*)\z/`).
@@ -1174,7 +1174,7 @@ fn match_repeat(
         }
         counts = advanced;
         if depth > chars.len() + 1 {
-            break;
+            break; // LCOV_EXCL_LINE // Reason: dead bound: rounds advance strictly, so empty-advance exits first
         }
     }
     longest.sort_unstable();

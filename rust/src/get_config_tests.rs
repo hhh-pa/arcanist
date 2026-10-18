@@ -364,7 +364,7 @@ fn system_file_missing_is_empty_and_invalid_fails() {
     assert!(err.ends_with("file is not a valid JSON file."), "{err}");
     let path = system_config_path();
     if cfg!(windows) {
-        assert!(path.ends_with(Path::new("Phabricator").join("Arcanist").join("config")));
+        assert!(path.ends_with(Path::new("Phabricator").join("Arcanist").join("config"))); // LCOV_EXCL_LINE // Reason: windows-only assertion; cfg!(windows) is false on ubuntu CI
     } else {
         assert_eq!(path, PathBuf::from("/etc/arcconfig"));
     }

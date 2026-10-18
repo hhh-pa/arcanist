@@ -86,7 +86,7 @@ fn windows_probes_exe_extension() {
     let search = std::env::join_paths([tmp.path().to_path_buf()]).unwrap();
     let found = find_on_path(&search, "python3");
     if cfg!(windows) {
-        assert_eq!(found, Some(tmp.path().join("python3.exe")));
+        assert_eq!(found, Some(tmp.path().join("python3.exe"))); // LCOV_EXCL_LINE // Reason: windows-only assertion; cfg!(windows) is false on ubuntu CI
     } else {
         assert_eq!(found, None);
     }
@@ -213,7 +213,7 @@ fn passthru_returns_the_script_status() {
     std::fs::create_dir_all(&script_dir).unwrap();
     std::fs::write(script_dir.join("arcanoid.py"), "import sys\nsys.exit(0)\n").unwrap();
     if python3_on_path().is_none() {
-        return;
+        return; // LCOV_EXCL_LINE // Reason: python3 is installed on ubuntu CI; the skip never trips
     }
     assert_eq!(
         run_in(tmp.path(), &args(&["--"])),
@@ -229,7 +229,7 @@ fn cov6g_run_in_missing_cwd_reports_launch_failure() {
     // missing directory; the spawn then fails on `current_dir` and
     // `run_in` reports the launch failure.
     if python3_on_path().is_none() {
-        return;
+        return; // LCOV_EXCL_LINE // Reason: python3 is installed on ubuntu CI; the skip never trips
     }
     let tmp = TempDir::new("cov6g-missing-cwd");
     let script_dir = tmp.path().join("support").join("arcanoid");

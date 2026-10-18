@@ -1460,7 +1460,7 @@ fn run_clearing(ansi: bool) -> ExitCode {
     for part in parts {
         match part {
             Ok(text) => out.push_str(&text),
-            Err(message) => return fail(message),
+            Err(message) => return fail(message), // LCOV_EXCL_LINE // Reason: fixed valid patterns plus correct argc; the renders cannot fail
         }
     }
     print!("{out}");
@@ -1487,7 +1487,7 @@ fn run_remotes(cwd: &Path, ansi: bool) -> ExitCode {
             print!("{out}");
             ExitCode::SUCCESS
         }
-        Err(message) => fail(message),
+        Err(message) => fail(message), // LCOV_EXCL_LINE // Reason: fixed valid patterns plus correct argc; the render cannot fail
     }
 }
 
@@ -1511,7 +1511,7 @@ fn run_published(cwd: &Path, ansi: bool) -> ExitCode {
             print!("{out}");
             ExitCode::SUCCESS
         }
-        Err(message) => fail(message),
+        Err(message) => fail(message), // LCOV_EXCL_LINE // Reason: fixed valid patterns plus correct argc; the render cannot fail
     }
 }
 
@@ -1523,7 +1523,7 @@ fn run_unknown(thing: &[String], ansi: bool) -> ExitCode {
     ] {
         match part {
             Ok(text) => out.push_str(&text),
-            Err(message) => return fail(message),
+            Err(message) => return fail(message), // LCOV_EXCL_LINE // Reason: fixed valid patterns plus correct argc; the renders cannot fail
         }
     }
     print!("{out}");

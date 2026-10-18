@@ -774,7 +774,7 @@ fn client_for_dir_discovers_from_target() {
         ..Default::default()
     };
     let err = match client_for_dir_with(None, &dir, None, &shadow) {
-        Ok(_) => panic!("expected no conduit URI"),
+        Ok(_) => panic!("expected no conduit URI"), // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
         Err(err) => err,
     };
     assert_eq!(
@@ -789,7 +789,7 @@ fn client_for_dir_discovers_from_target() {
     )
     .unwrap();
     let err = match client_for_dir_with(None, &dir, None, &shadow) {
-        Ok(_) => panic!("expected no token"),
+        Ok(_) => panic!("expected no token"), // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
         Err(err) => err,
     };
     assert!(err.starts_with("no token for https://phab.example/"));
@@ -991,8 +991,8 @@ fn link_commits_reverses_and_marks_heads() {
 fn confirm_commit_count_rejects_empty() {
     let mut io = Io::canned(&[]);
     let err = confirm_commit_count(&mut io, &[], "\"a\"", Some("mstr"), &|hash| {
-        hash.to_string()
-    })
+        hash.to_string() // LCOV_EXCL_START // Reason: formatter never runs; empty sets print no commits
+    }) // LCOV_EXCL_STOP
     .unwrap_err();
     assert_eq!(err, "There are no commits to land.");
     assert!(io.out.stdout.contains("** NOTHING TO LAND **"));
@@ -1022,8 +1022,8 @@ fn confirm_commit_count_passes_small_sets_quietly() {
     let commits = vec![land_commit("aaa", &[], "one")];
     let mut io = Io::canned(&[]);
     confirm_commit_count(&mut io, &commits, "\"a\"", Some("mstr"), &|hash| {
-        hash.to_string()
-    })
+        hash.to_string() // LCOV_EXCL_START // Reason: formatter never runs; small sets print no commits
+    }) // LCOV_EXCL_STOP
     .unwrap();
     assert!(io.out.is_empty());
 }
@@ -2466,7 +2466,7 @@ fn git_execute_merge_squashes_and_merges() {
         Some(&cursor),
         true,
         false,
-        &|_| Ok("again".to_string()),
+        &|_| Ok("again".to_string()), // LCOV_EXCL_LINE // Reason: message closure never invoked; the empty-diff error precedes the merge
     )
     .unwrap_err();
     assert!(err.contains("produces an empty diff"));
@@ -2625,7 +2625,7 @@ fn hg_merge_and_push_surface_limits() {
             Some("bbb"),
             false,
             None,
-            &|_| { Ok("m".to_string()) }
+            &|_| { Ok("m".to_string()) } // LCOV_EXCL_LINE // Reason: message closure never invoked; the strategy error precedes the merge
         )
         .unwrap_err(),
         "TODO: Support merge strategies"
@@ -2633,8 +2633,8 @@ fn hg_merge_and_push_surface_limits() {
     let mut io = Io::canned(&[]);
     assert!(
         hg_execute_merge(&dir, &mut io, &set, &commits, None, true, None, &|_| {
-            Ok("m".to_string())
-        })
+            Ok("m".to_string()) // LCOV_EXCL_LINE // Reason: closure body never invoked on this error path
+        }) // LCOV_EXCL_LINE // Reason: closure body never invoked on this error path
         .is_err()
     );
     let mut io = Io::canned(&[]);
@@ -3331,7 +3331,7 @@ fn r3_land16_build_searches_paginate() {
             (METHOD_BUILDPLAN_SEARCH, _) => Ok(serde_json::json!({"data": [
                 {"phid": "PHID-HMPA-2", "fields": {"behaviors": {"arc-land": {"value": "never"}}}},
             ]})),
-            _ => Err(format!("unexpected conduit call {method}")),
+            _ => Err(format!("unexpected conduit call {method}")), // LCOV_EXCL_LINE // Reason: defensive arm; the test issues only expected conduit calls
         }
     };
     let revisions = vec![
@@ -4010,7 +4010,7 @@ fn land43_squash_rebase_failure_is_a_conflict() {
         Some(&into),
         true,
         false,
-        &|_| Ok("Landed message".to_string()),
+        &|_| Ok("Landed message".to_string()), // LCOV_EXCL_LINE // Reason: message closure never invoked; the merge conflict precedes the merge
     )
     .unwrap_err();
     assert_eq!(err, "Encountered a merge conflict.");
@@ -4072,7 +4072,7 @@ fn land43_merge_commit_range_conflicts_like_ceb() {
         Some(&into),
         true,
         false,
-        &|_| Ok("Landed message".to_string()),
+        &|_| Ok("Landed message".to_string()), // LCOV_EXCL_LINE // Reason: message closure never invoked; the merge conflict precedes the merge
     )
     .unwrap_err();
     assert_eq!(err, "Encountered a merge conflict.");
@@ -4179,7 +4179,7 @@ fn land33_hint_tracks_unpushed_sets() {
         Some(&into),
         true,
         false,
-        &|_| Ok("Landed".to_string()),
+        &|_| Ok("Landed".to_string()), // LCOV_EXCL_LINE // Reason: message closure never invoked; the error precedes the merge
     )
     .unwrap_err();
     assert!(!io.out.stdout.contains("--incremental"));
@@ -4192,7 +4192,7 @@ fn land33_hint_tracks_unpushed_sets() {
         Some(&into),
         true,
         true,
-        &|_| Ok("Landed".to_string()),
+        &|_| Ok("Landed".to_string()), // LCOV_EXCL_LINE // Reason: message closure never invoked; the error precedes the merge
     )
     .unwrap_err();
     assert!(io.out.stdout.contains("--incremental"));
@@ -4812,7 +4812,7 @@ fn b23_land_help_matches_generated_format() {
     assert!(
         text.starts_with("LAND WORKFLOW\n"),
         "{}",
-        &text[..200.min(text.len())]
+        &text[..200.min(text.len())] // LCOV_EXCL_LINE // Reason: assert-message expression; evaluates only if the passing assert fails
     );
     assert!(text.contains("Publish reviewed changes."), "{text}");
     assert!(text.contains("--strategy"), "{text}");
@@ -5620,7 +5620,7 @@ fn t1170_hg_push_change_skips_bookmark_already_at_cursor() {
     assert!(
         !calls.exists(),
         "unexpected calls: {:?}",
-        std::fs::read_to_string(&calls)
+        std::fs::read_to_string(&calls) // LCOV_EXCL_LINE // Reason: assert-message expression; evaluates only if the passing assert fails
     );
 }
 
@@ -6446,7 +6446,7 @@ fn t1170_git_execute_merge_conflict_reports_symbols() {
             Some(&master),
             false,
             true,
-            &|_| { Ok("msg".to_string()) }
+            &|_| { Ok("msg".to_string()) } // LCOV_EXCL_LINE // Reason: message closure never invoked; the merge conflict precedes the merge
         )
         .unwrap_err(),
         "Encountered a merge conflict."
@@ -6526,7 +6526,7 @@ fn t1170_git_merge_diff_query_failure() {
             Some("def"),
             false,
             false,
-            &|_| { Ok("msg".to_string()) }
+            &|_| { Ok("msg".to_string()) } // LCOV_EXCL_LINE // Reason: message closure never invoked; the error precedes the merge
         )
         .is_err()
     );
@@ -7447,7 +7447,7 @@ fn t1170_build_sets_offline_groups_unassociated() {
         &validated,
         &mut commits,
         None,
-        &|hash| hash.to_string(),
+        &|hash| hash.to_string(), // LCOV_EXCL_LINE // Reason: formatter never invoked; this build path formats no hashes
     )
     .unwrap();
     assert_eq!(sets.len(), 1);
@@ -7584,7 +7584,7 @@ fn t1170_build_sets_online_reports_conduit_failure() {
         &validated,
         &mut commits,
         Some(&client),
-        &|hash| hash.to_string(),
+        &|hash| hash.to_string(), // LCOV_EXCL_LINE // Reason: formatter never invoked; the transport failure precedes formatting
     )
     .unwrap_err();
     assert!(!err.is_empty(), "expected the transport failure");
@@ -7668,7 +7668,7 @@ fn t1170_prompts_abort_on_exhausted_answers() {
     // an answerless TTY session aborts; bail out (rather than block
     // on a real terminal) if that ever changes.
     if crate::prompt::stdin_is_terminal() {
-        return;
+        return; // LCOV_EXCL_LINE // Reason: bail-out for real-terminal runs; cargo test stdin is never a TTY
     }
     assert_eq!(
         prompt_for_key(&mut Io::canned(&[]), "k", "q?").unwrap_err(),
@@ -7717,8 +7717,8 @@ fn t1170_client_for_dir_reports_missing_uris() {
     // URI skips the arm (CI has none).
     let dir = temp_dir("t1170-nouri");
     if resolve_conduit_uri(None, &dir).is_some() {
-        std::fs::remove_dir_all(&dir).ok();
-        return;
+        std::fs::remove_dir_all(&dir).ok(); // LCOV_EXCL_START // Reason: skip arm for ambient conduit config; CI provides none
+        return; // LCOV_EXCL_STOP
     }
     let err = client_for_dir(None, &dir).unwrap_err();
     assert!(err.contains("no conduit URI"), "unexpected: {err}");
@@ -8083,7 +8083,7 @@ fn t1170_run_in_reports_missing_terminator() {
     // Piped stdin is never a TTY under `cargo test`; bail out (rather
     // than parse differently) if that ever changes.
     if crate::prompt::stdin_is_terminal() {
-        return;
+        return; // LCOV_EXCL_LINE // Reason: bail-out for real-terminal runs; cargo test stdin is never a TTY
     }
     let dir = temp_dir("t1170-terminator");
     assert_eq!(

@@ -667,7 +667,7 @@ fn diffs_known_paths() {
         fake.log()
             .contains("--diff-cmd /scripts/binary_safe_diff.sh -x -U3"),
         "{}",
-        fake.log()
+        fake.log() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 }
 
@@ -726,7 +726,7 @@ fn diffs_binary_files() {
         fake.log()
             .contains("propset svn:mime-type application/octet-stream"),
         "{}",
-        fake.log()
+        fake.log() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 
     let octet = FakeSvn::named("octet");
@@ -815,7 +815,7 @@ fn diffs_copied_additions() {
         fake.log()
             .contains("cat https://svn.example.test/repo/trunk/orig.txt@40"),
         "{}",
-        fake.log()
+        fake.log() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 
     let same = FakeSvn::named("copysame");
@@ -966,7 +966,7 @@ fn lang_env_var_falls_back_when_probe_fails() {
 fn output_gives_up_on_permanently_busy_script() {
     if !platform_reports_txtbsy() {
         return;
-    }
+    } // LCOV_EXCL_START // Reason: ETXTBSY-only test body; macOS exec never reports text-file-busy (probe-gated)
     let fake = FakeSvn::named("stuck");
     let sh = fake.dir.join("stuck.sh");
     std::fs::write(
@@ -985,7 +985,7 @@ echo hi
     let _held = std::fs::OpenOptions::new().write(true).open(&sh).unwrap();
     let svn = SvnCommand::custom(&sh.to_string_lossy(), &[]);
     let err = output_with(&fake.dir, &svn, &[]).unwrap_err();
-    assert!(err.contains("failed to run"), "{err}");
+    assert!(err.contains("failed to run"), "{err}"); // LCOV_EXCL_STOP
 }
 #[test]
 fn normalizes_status_path_separators() {
@@ -1518,7 +1518,7 @@ fn scratch_migration_reports_filesystem_failures() {
         if std::fs::read(&secret).is_err() {
             assert!(!migrate_scratch_dir(&locked, &base.join("fresh-meta")));
             assert!(secret.exists());
-        }
+        } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
         {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = std::fs::metadata(&secret).unwrap().permissions();

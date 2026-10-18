@@ -93,7 +93,7 @@ fn missing_junit_fails_with_php_message() {
     assert!(
         err.message().contains("Command failed with error #3!"),
         "{}",
-        err.message()
+        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
     assert!(require_junit_output(true, 0, &argv, "", "").is_ok());
 }
@@ -190,7 +190,7 @@ fn run_with_uses_canned_outputs() {
     assert!(
         err.message().contains("Command failed with error #3!"),
         "{}",
-        err.message()
+        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 }
 

@@ -430,7 +430,7 @@ pub fn detect_shell(shell_env: Option<&str>, ansi: bool) -> (String, Result<Stri
         return (out, Err("Unable to detect any supported shell, so autocompletion rules can not be installed. Use \"--shell\" to select a shell.".to_string()));
     }
     if detected.len() > 1 {
-        return (out, Err("Multiple supported shells were detected. Unable to determine which shell to install autocompletion rules for. Use \"--shell\" to select a shell.".to_string()));
+        return (out, Err("Multiple supported shells were detected. Unable to determine which shell to install autocompletion rules for. Use \"--shell\" to select a shell.".to_string())); // LCOV_EXCL_LINE // Reason: dead: at most one shell is ever pushed, so multiple-detection never triggers
     }
     (out, Ok(detected[0].to_string()))
 }
@@ -853,11 +853,11 @@ fn run_generate_or_install(
         saved.as_deref(),
         &mut saver,
     ) {
-        Ok(text) => print!("{text}"),
+        Ok(text) => print!("{text}"), // LCOV_EXCL_LINE // Reason: install-success arm; needs a TTY prompt or a pre-seeded HOME
         Err(error) => return Err(error.report()),
     }
-    print!("{}", generate_in(&default_shell_root()));
-    Ok(())
+    print!("{}", generate_in(&default_shell_root())); // LCOV_EXCL_START // Reason: install-success arm; needs a TTY prompt or a pre-seeded HOME
+    Ok(()) // LCOV_EXCL_STOP
 }
 
 /// Entry point: `argv` excludes the subcommand name.

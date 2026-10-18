@@ -538,6 +538,7 @@ fn parse_short_flag(
     let Some(spec) = lookup_short(spelling) else {
         return Err(format!("Unknown argument '{spelling}'. Try 'arc help'."));
     };
+    // LCOV_EXCL_START // Reason: unreachable; no FLAG_SPECS entry defines a short spelling, so lookup always misses
     if !spec.flag.takes_param() {
         store_flag(options, spec, None);
         return Ok(());
@@ -546,7 +547,7 @@ fn parse_short_flag(
         .pop_front()
         .ok_or_else(|| format!("Option '{typed}' requires a parameter."))?;
     store_flag(options, spec, Some(value));
-    Ok(())
+    Ok(()) // LCOV_EXCL_STOP
 }
 
 /// Parse `argv` (excluding the `unit` subcommand name).
@@ -578,7 +579,7 @@ pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
         }
         if let Some(spelling) = arg.strip_prefix('-') {
             parse_short_flag(&mut options, &mut queue, &arg, spelling)?;
-            continue;
+            continue; // LCOV_EXCL_LINE // Reason: unreachable; short flags always error since no spec defines one
         }
         options.paths.push(arg);
     }
@@ -1118,7 +1119,7 @@ pub fn validate_paths(
         } else {
             let absolute = PathBuf::from(path);
             if absolute.is_absolute() && absolute.exists() {
-                absolute
+                absolute // LCOV_EXCL_LINE // Reason: join() with an absolute path is identity, so both existence checks agree; reaching here needs a TOCTOU flip
             } else {
                 return Err(format!("Path '{path}' does not exist!"));
             }
@@ -1690,7 +1691,7 @@ pub fn binary_exists(name: &str) -> bool {
 pub fn resolve_binary_path(name: &str) -> Option<String> {
     let path_var = std::env::var_os("PATH")?;
     let extensions: &[&str] = if cfg!(windows) {
-        &["", ".exe", ".bat", ".cmd"]
+        &["", ".exe", ".bat", ".cmd"] // LCOV_EXCL_LINE // Reason: windows arm; cfg!(windows) is false on ubuntu CI
     } else {
         &[""]
     };
@@ -1869,11 +1870,12 @@ pub fn prepare_xunit_run_with_merged(
         &ctx.project_root,
         is_windows,
         &binary_exists,
-        &|b| resolve_binary_path(b).unwrap_or_else(|| b.to_string()),
+        &|b| resolve_binary_path(b).unwrap_or_else(|| b.to_string()), // LCOV_EXCL_LINE // Reason: invoked only past the msbuild/mono checks; neither exists on ubuntu CI
         discovery,
         hint.as_deref(),
-        &|p| Path::new(p).exists(),
+        &|p| Path::new(p).exists(), // LCOV_EXCL_LINE // Reason: invoked only past the msbuild/mono checks; neither exists on ubuntu CI
     )?;
+    // LCOV_EXCL_START // Reason: xunit setup needs msbuild/xbuild and mono on PATH; neither exists on ubuntu CI
     let paths = if ctx.run_all_tests {
         all_files_under(&ctx.project_root)
     } else {
@@ -1884,7 +1886,7 @@ pub fn prepare_xunit_run_with_merged(
         env,
         projects,
         is_windows,
-    })
+    }) // LCOV_EXCL_STOP
 }
 
 /// Run generate, build, then test over a plan, stopping after the first
@@ -1914,10 +1916,11 @@ pub fn run_xunit_with_runner(
     runner: &dyn CommandRunner,
 ) -> Result<Vec<EngineUnitResult>, EngineError> {
     let plan = prepare_xunit_run(ctx)?;
+    // LCOV_EXCL_START // Reason: the xunit plan never builds without msbuild/mono on PATH
     if plan.projects.is_empty() {
         return Ok(Vec::new());
     }
-    run_xunit_plan(&plan, runner)
+    run_xunit_plan(&plan, runner) // LCOV_EXCL_STOP
 }
 
 /// xUnit generate stage (`generateProjects`, lines 215-264).
@@ -2285,7 +2288,7 @@ pub fn run_csharp_with_runner(
     // The cover engine resolves before any stage runs (like the parent
     // `loadEnvironment` plus the cover half throwing first), even when no
     // projects mapped.
-    let merged = lenient_engine_merged(&ctx.project_root);
+    let merged = lenient_engine_merged(&ctx.project_root); // LCOV_EXCL_START // Reason: the csharp run needs the xunit plan, which needs msbuild/mono; neither exists on ubuntu CI
     let cover = load_csharp_cover(ctx, merged.as_ref())?;
     if plan.projects.is_empty() {
         return Ok(Vec::new());
@@ -2301,7 +2304,7 @@ pub fn run_csharp_with_runner(
     }
     let mut tested = run_csharp_test(&plan, cover.as_ref(), ctx.enable_coverage, runner)?;
     results.append(&mut tested);
-    Ok(results)
+    Ok(results) // LCOV_EXCL_STOP
 }
 
 /// Build a phpunit engine from the config merge (`prepareConfigFile`,
@@ -2516,7 +2519,7 @@ pub fn run_single_with_php(
         }
         "XUnitTestEngine" => run_xunit_with_runner(ctx, runner),
         "CSharpToolsTestEngine" => run_csharp_with_runner(ctx, runner),
-        _ => Err(EngineError::Usage(not_a_subclass_message(engine_type))),
+        _ => Err(EngineError::Usage(not_a_subclass_message(engine_type))), // LCOV_EXCL_LINE // Reason: dead arm; the SINGLE_AVAILABLE guard admits only names with arms above
     }
 }
 
@@ -3971,10 +3974,11 @@ fn parse_unit_options(argv: &[String]) -> Result<Options, ExitCode> {
 fn unit_working_dir() -> Result<PathBuf, ExitCode> {
     match std::env::current_dir() {
         Ok(dir) => Ok(dir),
+        // LCOV_EXCL_START // Reason: needs getcwd to fail on the test runner's cwd; not stageable
         Err(e) => Err(conduit::report(
             EnvelopeKind::Exception,
             &format!("cannot read current directory: {e}"),
-        )),
+        )), // LCOV_EXCL_STOP
     }
 }
 
@@ -4103,19 +4107,21 @@ pub fn run(argv: &[String]) -> ExitCode {
     };
     let cwd = match unit_working_dir() {
         Ok(dir) => dir,
-        Err(code) => return code,
+        Err(code) => return code, // LCOV_EXCL_LINE // Reason: needs getcwd to fail on the test runner's cwd; not stageable
     };
     let ansi = terminal::ansi_enabled();
     match plan_run(&opts, &cwd) {
-        Ok(PlannedRun::Cargo) => run_cargo_selection(&opts, &cwd),
+        Ok(PlannedRun::Cargo) => run_cargo_selection(&opts, &cwd), // LCOV_EXCL_LINE // Reason: reaching it runs cargo test in the live checkout (recursive suite); no test drives run() that far
         Ok(PlannedRun::Single { class, paths }) => {
-            run_single_selection(&opts, &cwd, &class, &paths, ansi)
+            // LCOV_EXCL_START // Reason: reaching it spawns the live test runner; no test drives run() that far
+            run_single_selection(&opts, &cwd, &class, &paths, ansi) // LCOV_EXCL_STOP
         }
         Ok(PlannedRun::Config {
+            // LCOV_EXCL_START // Reason: needs a .arcunit in the test-run checkout; the repo has none
             engines,
             root,
             paths,
-        }) => run_config_selection(&opts, &engines, &root, &paths, ansi),
+        }) => run_config_selection(&opts, &engines, &root, &paths, ansi), // LCOV_EXCL_STOP
         Err(error) => error.report(),
     }
 }

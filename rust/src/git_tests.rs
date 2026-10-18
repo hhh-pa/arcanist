@@ -900,7 +900,7 @@ fn cov6g_all_branches_tolerates_spawn_race() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     toggler.join().unwrap();
     if !repo.exists() {
-        std::fs::rename(&away, &repo).ok();
+        std::fs::rename(&away, &repo).ok(); // LCOV_EXCL_LINE // Reason: swap-restore arm; unix renames cannot fail here, so it never runs on ubuntu CI
     }
     std::fs::remove_dir_all(&repo).ok();
     std::fs::remove_dir_all(&away).ok();

@@ -115,3 +115,11 @@ fn existing_directories_are_skipped() {
     let path = dir.to_string_lossy().into_owned();
     assert!(JsonLinter::new().lint_bytes(&path, b"{oops").is_empty());
 }
+
+#[test]
+fn t1170_short_message_keeps_text_without_positions() {
+    // T1170 band J: messages without serde's " at line L column C"
+    // trailer pass through unstripped.
+    assert_eq!(short_message("boom"), "boom");
+    assert_eq!(short_message("x at line 1 column 2"), "x");
+}

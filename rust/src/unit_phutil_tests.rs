@@ -25,12 +25,12 @@ fn coverage_gate_matches_xdebug_branches() {
         err.message()
             .contains("You specified --coverage but XDebug is not available"),
         "{}",
-        err.message()
+        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
     assert!(
         err.message().contains("PhutilUnitTestEngine"),
         "{}",
-        err.message()
+        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 }
 
@@ -114,7 +114,7 @@ fn test_paths_skip_outside_and_unloaded() {
     assert!(
         err.message().contains("not been loaded"),
         "{}",
-        err.message()
+        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 
     // Symlink maze: path outside its library is skipped.
@@ -152,9 +152,10 @@ fn php_discovery_probes_path() {
     assert_eq!(INIT_SCRIPT_KEY, "unit.phutil.init-script");
     // Self-consistent without assuming php is present or absent.
     match php_on_path() {
+        // LCOV_EXCL_START // Reason: php-present arm; php is absent on ubuntu CI
         Some(path) => assert_eq!(
             php_argv_prefix(),
-            Some(vec![path.to_string_lossy().into_owned()])
+            Some(vec![path.to_string_lossy().into_owned()]) // LCOV_EXCL_STOP
         ),
         None => assert_eq!(php_argv_prefix(), None),
     }
@@ -261,21 +262,21 @@ fn rejects_malformed_driver_output() {
         err.message()
             .contains("cannot parse phutil output 'o.json'"),
         "{}",
-        err.message()
+        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 
     let err = parse_phutil_output(r#"{"results": [{"result": "pass"}]}"#, "o.json").unwrap_err();
     assert!(
         err.message().contains("missing its 'name'"),
         "{}",
-        err.message()
+        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 
     let err = parse_phutil_output(r#"{"results": [{"name": "t"}]}"#, "o.json").unwrap_err();
     assert!(
         err.message().contains("missing its 'result'"),
         "{}",
-        err.message()
+        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 
     let err = parse_phutil_output(
@@ -286,14 +287,14 @@ fn rejects_malformed_driver_output() {
     assert!(
         err.message().contains("unknown result code 'bogus'"),
         "{}",
-        err.message()
+        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 
     let err = parse_phutil_output(r#"{"other": 1}"#, "o.json").unwrap_err();
     assert!(
         err.message().contains("neither 'results' nor 'error'"),
         "{}",
-        err.message()
+        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 
     let long = "t".repeat(256);
@@ -305,7 +306,7 @@ fn rejects_malformed_driver_output() {
     assert!(
         err.message().contains("maximum length"),
         "{}",
-        err.message()
+        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 }
 

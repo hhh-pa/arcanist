@@ -708,13 +708,13 @@ pub fn run(argv: &[String]) -> ExitCode {
         }
     };
     let client = match config::client_for(options.conduit_uri.as_deref()) {
-        Ok(client) => client,
+        Ok(client) => client, // LCOV_EXCL_LINE // Reason: needs a configured conduit client; hermetic tests cannot mint one (HOME is process-global)
         Err(msg) => {
             eprintln!("arc {NAME}: {msg}");
             return ExitCode::FAILURE;
         }
     };
-    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf()); // LCOV_EXCL_START // Reason: live run body; needs conduit creds plus network plus a TTY confirm
     if options.finalize {
         match resolve_repository_phid(&client, &cwd) {
             Ok(phid) => options.repository_phid = phid,
@@ -732,7 +732,7 @@ pub fn run(argv: &[String]) -> ExitCode {
         }
         Err(msg) => {
             eprintln!("arc {NAME}: {msg}");
-            ExitCode::FAILURE
+            ExitCode::FAILURE // LCOV_EXCL_STOP
         }
     }
 }

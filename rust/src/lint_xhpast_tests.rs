@@ -98,7 +98,7 @@ fn failed_parse_yields_one_unable_to_parse_warning() {
                 .description
                 .contains(&format!("exit status {exit_code}")),
             "{}",
-            messages[0].description
+            messages[0].description // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
         );
     }
 }
@@ -221,7 +221,7 @@ fn parse_output_syntax_stderr_yields_xhp1_at_line() {
             .description
             .starts_with("This file contains a syntax error: "),
         "{}",
-        messages[0].description
+        messages[0].description // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 }
 

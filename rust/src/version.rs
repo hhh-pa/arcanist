@@ -244,7 +244,7 @@ pub fn render_version_line(commit: &str, timestamp: i64) -> String {
 /// `Filesystem::readablePath()` (T1153 CORE-61).
 fn head_of(cwd: &Path, tool_dir: &Path) -> Result<(i64, String), String> {
     if !git_binary_available() {
-        return Err(missing_git_message());
+        return Err(missing_git_message()); // LCOV_EXCL_LINE // Reason: git is installed on ubuntu CI; the missing-git arm never runs
     }
     let root = library_root(cwd, tool_dir)?;
     head_commit(&root)
@@ -302,7 +302,7 @@ pub fn run_in(tool_dir: &Path, argv: &[String]) -> ExitCode {
         // T1153 CORE-49: the missing-`git` throw is an
         // `ArcanistUsageException` (`:39-44` at ceb), which escapes
         // the toolset runtime into a PHP fatal (255).
-        return report(EnvelopeKind::Fatal, &missing_git_message());
+        return report(EnvelopeKind::Fatal, &missing_git_message()); // LCOV_EXCL_LINE // Reason: git is installed on ubuntu CI; the missing-git arm never runs
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     match version_text(&cwd, tool_dir) {

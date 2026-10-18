@@ -782,8 +782,13 @@ fn core19_all_commands_export_arcanist() {
     // T1153 CORE-19 (R2): PHP putenvs `$command` after `selectWorkflow()`
     // for every command (`scripts/arcanist.php:229`), so hook children of
     // toolset-style commands inherit it too. `help` exercises a
-    // non-classic name through the real dispatch (no other test sets the
-    // process-once cell, so this read is deterministic).
+    // non-classic name through the real dispatch.
+    //
+    // The command cell is process-once (`OnceLock`: first writer wins)
+    // and the harness runs tests in parallel threads, so EVERY dispatch
+    // resolving to a different name must live in THIS test, sequenced
+    // after the pin: a standalone `dispatch(["call-cond"])` test raced
+    // this pin (`"call-conduit"` vs `"help"`, T1170 endgame).
     let globals = Globals::default();
     let code = dispatch_run("help", None, "help", &args(&["arc"]), &globals);
     assert_eq!(code, ExitCode::SUCCESS);
@@ -791,6 +796,12 @@ fn core19_all_commands_export_arcanist() {
     // T1153 CORE-66: 37 concrete workflows at ceb (`browse` is real;
     // only `markers` is abstract).
     assert_eq!(ALL_WORKFLOWS.len(), 37);
+    // T1170 endgame band I: `call-cond` prefix-resolves to `call-conduit`,
+    // which dispatches through `classify` rather than the command table,
+    // so the table lookup misses and the unknown-command arm reports
+    // (exit 1) — while the cell keeps the first ("help") value.
+    assert_eq!(dispatch(&args(&["call-cond"])), ExitCode::FAILURE);
+    assert_eq!(arc_rs::globals::command_name().as_deref(), Some("help"));
 }
 
 #[test]
@@ -1222,3 +1233,8 @@ fn core19_dispatch_run_prints_spelling_notice() {
     );
     assert_eq!(code, ExitCode::SUCCESS);
 }
+
+// T1170 endgame band I: `call_conduit_prefix_reports_unknown_command`
+// merged into `core19_all_commands_export_arcanist` above (the command
+// cell is process-once; a standalone different-name dispatch raced the
+// CORE-19 pin).

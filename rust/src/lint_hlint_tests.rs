@@ -287,3 +287,11 @@ fn version_requirement_gates_linting() {
         .unwrap();
     assert!(linter.lint_bytes("Main.hs", b"f x = x\n").is_empty());
 }
+
+#[test]
+fn t1170_parse_idea_rejects_non_objects() {
+    // T1170 band J: only objects parse into ideas; anything else
+    // yields no message.
+    assert!(parse_idea("a.hs", &serde_json::json!(5)).is_none());
+    assert!(parse_idea("a.hs", &serde_json::json!(null)).is_none());
+}

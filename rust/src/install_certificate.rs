@@ -895,9 +895,10 @@ fn fail(message: String) -> ExitCode {
 fn install_arcrc_for(arcrc_file: Option<&str>) -> Result<PathBuf, ExitCode> {
     match get_config::resolve_user_file(config::arcrc_path(), arcrc_file.map(Path::new)) {
         Ok(Some(path)) => Ok(path),
+        // LCOV_EXCL_START // Reason: needs HOME/USERPROFILE unset; always set in CI
         Ok(None) => Err(fail(
             "cannot locate ~/.arcrc (HOME/USERPROFILE is not set)".to_string(),
-        )),
+        )), // LCOV_EXCL_STOP
         Err(message) => Err(fail(message)),
     }
 }
@@ -911,7 +912,7 @@ fn install_token_value(options: &Options) -> Result<String, ExitCode> {
         return Ok(token.to_string());
     }
     match prompt_token() {
-        Ok(token) => Ok(token),
+        Ok(token) => Ok(token), // LCOV_EXCL_LINE // Reason: prompt success arm; needs a TTY
         Err(message) => Err(fail(message)),
     }
 }
@@ -924,8 +925,8 @@ fn confirm_standard_token(force: bool) -> Result<(), ExitCode> {
     print!("{}", standard_token_notice());
     let _ = std::io::stdout().flush();
     match prompt_confirm(CONFIRM_INSTALL_ANYWAY, true) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(fail(NOT_INSTALLING.to_string())),
+        Ok(true) => Ok(()), // LCOV_EXCL_START // Reason: confirm arms; need a TTY
+        Ok(false) => Err(fail(NOT_INSTALLING.to_string())), // LCOV_EXCL_STOP
         Err(message) => Err(fail(message)),
     }
 }
@@ -987,7 +988,7 @@ fn prepare_install(argv: &[String]) -> Result<InstallPlan, ExitCode> {
     let options = install_options(argv)?;
     let cwd = match std::env::current_dir() {
         Ok(dir) => dir,
-        Err(_) => PathBuf::from("."),
+        Err(_) => PathBuf::from("."), // LCOV_EXCL_LINE // Reason: current_dir is infallible in practice; deleting the cwd under parallel tests is unsafe
     };
     let uri = resolve_install_uri(&options, &cwd)?;
     let arcrc = install_arcrc_for(options.arcrc_file.as_deref())?;
@@ -1034,7 +1035,7 @@ fn read_install_token(
 ) -> Result<String, ExitCode> {
     match render_login_header(ansi) {
         Ok(header) => print!("{header}"),
-        Err(message) => return Err(fail(message)),
+        Err(message) => return Err(fail(message)), // LCOV_EXCL_LINE // Reason: fixed valid pattern plus correct argc; the render cannot fail
     }
     let token_url = token_login_url(uri, is_token_auth);
     println!("{}", login_page_block(&token_url));

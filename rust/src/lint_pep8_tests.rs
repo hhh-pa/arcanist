@@ -292,3 +292,10 @@ fn version_requirement_gates_linting() {
     assert_eq!(messages[0].code, "W291");
     assert_eq!(messages[0].severity, "warning");
 }
+
+#[test]
+fn t1170_unconfigured_linter_stays_silent_without_tool() {
+    // T1170 band J: with no `bin` override and no pep8 on PATH
+    // the linter stays inactive (mirroring PHP).
+    assert!(Pep8Linter::new().lint_bytes("a.py", b"x = 1\n").is_empty());
+}

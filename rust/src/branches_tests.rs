@@ -246,7 +246,7 @@ fn r4_rbd4_parse_error_has_no_dump() {
     // `USAGE EXCEPTION` (exit 1) with no usage dump.
     match execute(&std::env::temp_dir(), &args(&["--bogus"])) {
         Err(message) => assert!(!message.contains("usage:"), "{message}"),
-        _ => panic!("expected parse error"),
+        _ => panic!("expected parse error"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the parse error always matches
     }
     assert_eq!(
         run_in(&std::env::temp_dir(), &args(&["--bogus"])),
@@ -420,9 +420,10 @@ fn execute_core_hg_json_reaches_marker_list() {
         conduit_uri: None,
     };
     match execute_core(dir.path(), &options, None, None) {
+        // LCOV_EXCL_START // Reason: Ok arm needs system hg; absent on CI, the Err arm pins here
         Ok(text) => {
             let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-            assert!(value.is_array(), "{text}");
+            assert!(value.is_array(), "{text}"); // LCOV_EXCL_STOP
         }
         Err(message) => assert!(!message.is_empty()),
     }

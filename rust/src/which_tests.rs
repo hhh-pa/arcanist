@@ -674,11 +674,11 @@ fn args_cover_flags_ranges_and_unported() {
     assert!(matches!(parse_args(&["--help".to_string()]), Parsed::Help));
     match parse_args(&["--base".to_string(), "arc:upstream".to_string()]) {
         Parsed::Options(opts) => assert_eq!(opts.base_rules.as_deref(), Some("arc:upstream")),
-        _ => panic!("expected --base options"),
+        _ => panic!("expected --base options"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     }
     match parse_args(&["--base=arc:empty".to_string()]) {
         Parsed::Options(opts) => assert_eq!(opts.base_rules.as_deref(), Some("arc:empty")),
-        _ => panic!("expected --base= options"),
+        _ => panic!("expected --base= options"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     }
     assert!(matches!(
         parse_args(&["--base".to_string()]),
@@ -686,7 +686,7 @@ fn args_cover_flags_ranges_and_unported() {
     ));
     match parse_args(&["--any-status".to_string()]) {
         Parsed::Options(opts) => assert!(opts.any_status),
-        _ => panic!("expected --any-status options"),
+        _ => panic!("expected --any-status options"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     }
     assert!(matches!(
         parse_args(&["--bogus".to_string()]),
@@ -706,7 +706,7 @@ fn args_cover_flags_ranges_and_unported() {
         Parsed::Options(opts) => {
             assert_eq!(opts.commits, vec!["a".to_string(), "b".to_string()])
         }
-        _ => panic!("expected two-commit options"),
+        _ => panic!("expected two-commit options"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     }
     match parse_args(&[
         "abc123".to_string(),
@@ -717,19 +717,19 @@ fn args_cover_flags_ranges_and_unported() {
             assert_eq!(opts.commits, vec!["abc123".to_string()]);
             assert_eq!(opts.head, "HEAD");
         }
-        _ => panic!("expected options"),
+        _ => panic!("expected options"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     }
     // T1153 RB-D25: `--flag=value` works for `--head` and
     // `--conduit-uri` too.
     match parse_args(&["--head=abc123".to_string()]) {
         Parsed::Options(opts) => assert_eq!(opts.head, "abc123"),
-        _ => panic!("expected --head= options"),
+        _ => panic!("expected --head= options"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     }
     match parse_args(&["--conduit-uri=https://h.test/api/".to_string()]) {
         Parsed::Options(opts) => {
             assert_eq!(opts.conduit_uri.as_deref(), Some("https://h.test/api/"))
         }
-        _ => panic!("expected --conduit-uri= options"),
+        _ => panic!("expected --conduit-uri= options"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     }
 }
 
@@ -1832,7 +1832,7 @@ fn rbd16_range_section_bytes() {
     assert!(
         render_range(&empty, "", None, false).contains("    (No commits.)\n\n\n"),
         "{}",
-        render_range(&empty, "", None, false)
+        render_range(&empty, "", None, false) // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 }
 
@@ -2055,7 +2055,7 @@ fn w6_double_dash_collects_positionals() {
             opts.commits,
             vec!["abc123".to_string(), "--head".to_string()]
         ),
-        _ => panic!("expected options"),
+        _ => panic!("expected options"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     }
 }
 
@@ -2066,7 +2066,7 @@ fn w6_local_log_failure_reports_command() {
     let repo = fresh_repo("w6logfail");
     commit(&repo.path, "a.txt");
     let err = match local_commit_information(&repo.path, "zzz-no-such-rev", "HEAD") {
-        Ok(_) => panic!("expected log failure"),
+        Ok(_) => panic!("expected log failure"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the log failure always matches
         Err(message) => message,
     };
     assert!(
@@ -2676,7 +2676,7 @@ fn t1170_matching_queries_explicit_ids_and_whoami() {
     assert!(
         matched[0].why.contains("explicit 'Differential Revision'"),
         "{}",
-        matched[0].why
+        matched[0].why // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
     assert_eq!(matched[1].monogram, "D78");
     assert_eq!(matched[1].author.as_deref(), Some("bob"));
@@ -2818,7 +2818,7 @@ fn t1170_conduit_uri_takes_a_separate_value() {
         Parsed::Options(opts) => {
             assert_eq!(opts.conduit_uri.as_deref(), Some("https://h.test/api/"))
         }
-        _ => panic!("expected --conduit-uri options"),
+        _ => panic!("expected --conduit-uri options"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     }
 }
 

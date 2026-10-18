@@ -17,13 +17,13 @@ fn cover_engine_loading_branches() {
     assert!(
         err.message().contains("unit.csharp.coverage.binary"),
         "{}",
-        err.message()
+        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
     let err = load_cover_engine("/r", Some("missing.exe"), None, &exists).unwrap_err();
     assert!(
         err.message().contains("have you built yet?"),
         "{}",
-        err.message()
+        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
     assert_eq!(CSCOVER_BINARY_KEY, "unit.csharp.cscover.binary");
     assert_eq!(COVERAGE_MATCH_KEY, "unit.csharp.coverage.match");

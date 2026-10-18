@@ -96,9 +96,10 @@ pub fn find_on_path(path_env: &std::ffi::OsStr, binary: &str) -> Option<PathBuf>
         }
         if cfg!(windows) {
             let exe = dir.join(format!("{binary}.exe")); // LCOV_EXCL_LINE // Reason: windows-only .exe probe; cfg!(windows) is false on ubuntu CI
+            // LCOV_EXCL_START // Reason: windows-only .exe probe; cfg!(windows) is false on ubuntu CI
             if exe.is_file() {
                 return Some(exe);
-            }
+            } // LCOV_EXCL_STOP
         }
     }
     None
@@ -107,7 +108,7 @@ pub fn find_on_path(path_env: &std::ffi::OsStr, binary: &str) -> Option<PathBuf>
 /// Candidate interpreter names: stock Windows installs call it `python`.
 fn interpreter_candidates() -> &'static [&'static str] {
     if cfg!(windows) {
-        &["python3", "python"]
+        &["python3", "python"] // LCOV_EXCL_LINE // Reason: windows-only python fallback; cfg!(windows) is false on ubuntu CI
     } else {
         &["python3"]
     }
@@ -182,9 +183,10 @@ pub fn run_in(dir: &Path, argv: &[String]) -> ExitCode {
         // (`ArcanistAnoidWorkflow.php:28-32` at ceb), thrown as a
         // `PhutilArgumentUsageException` (the `USAGE EXCEPTION` arm).
         // The Windows `python` fallback stays additive and unnamed.
+        // LCOV_EXCL_START // Reason: python3 is installed on ubuntu CI; the missing-interpreter arm never runs
         return report(
             EnvelopeKind::ToolsetUsage,
-            "The \"arc anoid\" workflow requires \"python3\" to be available in your $PATH.",
+            "The \"arc anoid\" workflow requires \"python3\" to be available in your $PATH.", // LCOV_EXCL_STOP
         );
     };
     let Some(script) = find_script(dir) else {

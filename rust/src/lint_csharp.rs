@@ -250,10 +250,10 @@ fn find_on_path(path_env: &std::ffi::OsStr, binary: &str) -> Option<PathBuf> {
             return Some(candidate);
         }
         if cfg!(windows) {
-            let exe = dir.join(format!("{binary}.exe"));
+            let exe = dir.join(format!("{binary}.exe")); // LCOV_EXCL_START // Reason: windows-only .exe probe; cfg!(windows) is false on ubuntu CI
             if exe.is_file() {
                 return Some(exe);
-            }
+            } // LCOV_EXCL_STOP
         }
     }
     None
@@ -276,7 +276,7 @@ fn resolve_command_in(
         .or_else(|| find_on_path(path_env, binary_name()))?;
     let mut prefix = command_flags_for(settings);
     if cfg!(windows) {
-        Some((cslint, prefix))
+        Some((cslint, prefix)) // LCOV_EXCL_LINE // Reason: windows direct-exec arm; cfg!(windows) is false on ubuntu CI
     } else {
         let mono = find_on_path(path_env, runtime_name())?;
         prefix.insert(0, cslint.to_string_lossy().into_owned());
@@ -304,7 +304,7 @@ fn check_version(program: &Path, prefix: &[String]) -> Result<(), String> {
             return Err(old_version_error());
         };
         command.arg(cslint);
-    }
+    } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
     command.arg("-v").stdin(Stdio::null());
     let Ok(output) = arc_rs::lint::spawn_with_retry(&mut command) else {
         return Err(old_version_error());
@@ -427,7 +427,7 @@ pub fn lint_with_command(
         return Vec::new();
     };
     let Ok(staged) = StagedFile::stage(path, data) else {
-        return Vec::new();
+        return Vec::new(); // LCOV_EXCL_LINE // Reason: staging failure; hermetic tests cannot fail temp-dir writes
     };
     let Some((code, stdout, stderr)) = run_tool(program, prefix, staged.path()) else {
         return Vec::new();
@@ -723,14 +723,14 @@ impl Linter for CsharpLinter {
             return Vec::new();
         }
         let command = match self.resolve() {
-            Ok(command) => command,
+            Ok(command) => command, // LCOV_EXCL_LINE // Reason: resolve-Ok arm; needs cslint plus mono, absent on ubuntu CI
             Err(error) => {
                 *self.error.borrow_mut() = Some(error);
                 return Vec::new();
             }
         };
-        let borrowed = Some((command.0.as_path(), command.1.as_slice()));
-        lint_with_command(path, data, borrowed)
+        let borrowed = Some((command.0.as_path(), command.1.as_slice())); // LCOV_EXCL_START // Reason: resolve-Ok arm; needs cslint plus mono, absent on ubuntu CI
+        lint_with_command(path, data, borrowed) // LCOV_EXCL_STOP
     }
 
     fn take_error(&self) -> Option<String> {

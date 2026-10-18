@@ -342,7 +342,7 @@ fn args_parse_search_search_and_exact() {
             assert_eq!(options.search, vec!["php".to_string()]);
             assert!(!options.verbose);
         }
-        _ => panic!("expected args"),
+        _ => panic!("expected args"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     }
     match parse_args(&[
         "--search=a".to_string(),
@@ -352,26 +352,26 @@ fn args_parse_search_search_and_exact() {
         ParseOutcome::Args(options) => {
             assert_eq!(options.search, vec!["a".to_string(), "b".to_string()]);
         }
-        _ => panic!("expected args"),
+        _ => panic!("expected args"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     }
     match parse_args(&["--verbose".to_string(), "text".to_string()]) {
         ParseOutcome::Args(options) => {
             assert!(options.verbose);
             assert_eq!(options.exact, vec!["text".to_string()]);
         }
-        _ => panic!("expected args"),
+        _ => panic!("expected args"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     }
     match parse_args(&["--search".to_string()]) {
         ParseOutcome::Error(message) => {
             assert_eq!(message, "Option '--search' requires a parameter.")
         }
-        _ => panic!("expected error"),
+        _ => panic!("expected error"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     }
     match parse_args(&["--bogus".to_string()]) {
         ParseOutcome::Error(message) => {
             assert_eq!(message, "Unknown argument 'bogus'. Try 'arc help'.")
         }
-        _ => panic!("expected error"),
+        _ => panic!("expected error"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     }
     assert!(matches!(
         parse_args(&["--help".to_string()]),
@@ -406,7 +406,7 @@ fn r4_lintersl24_usage_error_has_no_dump() {
         ParseOutcome::Error(message) => {
             assert!(!message.contains("usage:"), "{message}");
         }
-        _ => panic!("expected parse error"),
+        _ => panic!("expected parse error"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     }
     assert_eq!(
         run_in(Path::new("."), &["--bogus".to_string()]),
@@ -509,7 +509,7 @@ fn linters_l8_wrap_stays_within_78_columns() {
         assert!(
             line.len() <= 78,
             "overlong line ({len}): {line}",
-            len = line.len()
+            len = line.len() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
         );
     }
 }
@@ -727,7 +727,7 @@ fn linters_l26_probe_honors_configured_bin() {
     // The bin must be absolute on every platform (a bare `/...` is
     // drive-relative on Windows and resolves against the project root).
     let bin = if cfg!(windows) {
-        "C:/custom/flake8"
+        "C:/custom/flake8" // LCOV_EXCL_LINE // Reason: windows-only fixture path; cfg!(windows) is false on ubuntu CI
     } else {
         "/custom/flake8"
     };
@@ -1119,7 +1119,7 @@ fn parse_args_splits_double_dash() {
             assert_eq!(options.exact, vec!["text".to_string()]);
             assert!(!options.verbose);
         }
-        _ => panic!("expected args"),
+        _ => panic!("expected args"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     }
 }
 
@@ -1131,7 +1131,7 @@ fn parse_args_splices_verbose_values() {
             assert!(options.verbose);
             assert_eq!(options.exact, vec!["x".to_string()]);
         }
-        _ => panic!("expected args"),
+        _ => panic!("expected args"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     }
 }
 
@@ -1141,7 +1141,7 @@ fn parse_args_rejects_short_flags() {
         ParseOutcome::Error(message) => {
             assert_eq!(message, "Unknown argument 'x'. Try 'arc help'.");
         }
-        _ => panic!("expected error"),
+        _ => panic!("expected error"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     }
 }
 

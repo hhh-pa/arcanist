@@ -311,12 +311,12 @@ fn spaced_double_colon_reference_and_by_ref_forms() {
     assert!(
         messages[0].description.contains("mixes function (r)"),
         "{}",
-        messages[0].description
+        messages[0].description // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
     assert!(
         messages[0].description.contains("(Real)"),
         "{}",
-        messages[0].description
+        messages[0].description // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 }
 
@@ -327,7 +327,7 @@ fn comments_between_keyword_and_name_are_trivia() {
     assert!(
         messages[0].description.contains("(Foo, Bar)"),
         "{}",
-        messages[0].description
+        messages[0].description // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 }
 
@@ -338,7 +338,7 @@ fn close_tag_inside_a_comment_ends_php_mode() {
     assert!(
         messages[0].description.contains("(B, C)"),
         "{}",
-        messages[0].description
+        messages[0].description // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 }
 

@@ -656,7 +656,7 @@ fn run_in_reports_missing_terminator() {
     // Piped stdin is never a TTY under `cargo test`; bail out (rather
     // than parse differently) if that ever changes.
     if crate::prompt::stdin_is_terminal() {
-        return;
+        return; // LCOV_EXCL_LINE // Reason: stdin is never a TTY under cargo test; the guard never trips
     }
     let tmp = TempDir::new("terminator");
     assert_eq!(

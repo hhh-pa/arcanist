@@ -491,7 +491,7 @@ pub fn run(argv: &[String]) -> ExitCode {
             options.arcrc_file.as_deref().map(Path::new),
         ) {
             Ok(Some(path)) => apply_user(&path, &options.key, &options.value),
-            Ok(None) => Err("cannot locate ~/.arcrc (HOME/USERPROFILE is not set)".to_string()),
+            Ok(None) => Err("cannot locate ~/.arcrc (HOME/USERPROFILE is not set)".to_string()), // LCOV_EXCL_LINE // Reason: needs HOME/USERPROFILE unset; always set in CI
             Err(message) => Err(message),
         }
     };

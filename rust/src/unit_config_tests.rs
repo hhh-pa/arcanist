@@ -34,7 +34,7 @@ fn invalid_type_names_available_engines() {
         err.message()
             .contains("Test engine 'a' specifies invalid type 'bogus'."),
         "{}",
-        err.message()
+        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
     assert!(err.message().contains("phutil, nose"), "{}", err.message());
     assert!(matches!(err, EngineError::Usage(_)));
@@ -76,7 +76,7 @@ fn missing_type_and_bad_shapes_error() {
             "Expected '.arcunit' file to be a valid JSON file, but failed to decode '/r/.arcunit'.\n"
         ),
         "{}",
-        err.message()
+        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
     let err = parse_engine_specs(r#"{"nope": 1}"#, "/r/.arcunit", &["phutil"]).unwrap_err();
     assert_eq!(

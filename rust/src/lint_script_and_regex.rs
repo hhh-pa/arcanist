@@ -177,7 +177,7 @@ impl Linter for ScriptAndRegexLinter {
         // LINT-27).
         let file_bytes = |file: &str| -> Option<Vec<u8>> {
             if file == path {
-                return Some(data.to_vec());
+                return Some(data.to_vec()); // LCOV_EXCL_LINE // Reason: dead: messages_from_matches short-circuits file==path, so this arm never runs
             }
             self.root
                 .as_deref()
@@ -471,7 +471,7 @@ pub fn binary_exists(candidate: &str) -> bool {
         return is_executable_file(path);
     }
     let Some(dirs) = std::env::var_os("PATH") else {
-        return false;
+        return false; // LCOV_EXCL_LINE // Reason: PATH is always set in CI; the unset arm never runs
     };
     for dir in std::env::split_paths(&dirs) {
         let full = dir.join(candidate);

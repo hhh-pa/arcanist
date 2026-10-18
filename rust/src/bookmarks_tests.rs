@@ -318,3 +318,18 @@ fn execute_core_json_lists_bookmarks() {
         }])
     );
 }
+
+#[test]
+fn t1170_run_in_reports_terminator_through_toolset_arm() {
+    // T1170 band J: piped `run_in` without `--` takes the
+    // MISSING_TERMINATOR arm (prints hints, toolset usage exit 1).
+    // No TTY guard: piped runs fail parsing and interactive runs hit
+    // the outside-repo gate, and both are toolset usage failures, so
+    // the outcome pins without depending on stdin (same shape as the
+    // branches twin).
+    let dir = TempDir::new("t1170-terminator");
+    assert_eq!(
+        run_in(dir.path(), &args(&[])),
+        std::process::ExitCode::FAILURE
+    );
+}

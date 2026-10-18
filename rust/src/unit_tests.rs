@@ -4031,3 +4031,75 @@ fn run_rejects_everything_with_paths() {
         std::process::ExitCode::FAILURE
     );
 }
+
+// -( T1170 endgame band I )----------------------------------------------------
+
+fn stage_custom_harness_crate(tag: &str) -> PathBuf {
+    // A fixture crate whose test binary is a custom harness
+    // (`harness = false`) printing one byte with no trailing newline.
+    let dir = unique_dir(tag);
+    std::fs::create_dir_all(dir.join("tests")).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"t1170fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
+         [[test]]\nname = \"t\"\npath = \"tests/t.rs\"\nharness = false\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("tests").join("t.rs"),
+        "fn main() {\n    print!(\"x\");\n}\n",
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn cargo_run_merges_unterminated_stdout_with_stderr() {
+    // `cargo test` stdout without a trailing newline (custom harness)
+    // gains the separator before stderr is appended.
+    let dir = stage_custom_harness_crate("cargo-nonl");
+    let report = super::execute(&Options::default(), &dir, None).unwrap();
+    assert!(report.success);
+    assert!(
+        report.tail.starts_with("x\n"),
+        "unexpected tail: {:?}",
+        report.tail
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn cargo_quiet_run_reports_without_stderr() {
+    // `cargo test --quiet` writes no status to stderr; the run still
+    // reports its pass with the harness tail.
+    let dir = stage_passing_crate("cargo-quiet");
+    let opts = Options {
+        cargo_args: vec!["--quiet".to_string()],
+        ..Options::default()
+    };
+    let report = super::execute(&opts, &dir, None).unwrap();
+    assert!(report.success);
+    assert!(report.tail.contains("test result"), "{}", report.tail);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn run_single_selection_rejects_everything_for_pytest() {
+    // `--engine PytestTestEngine --everything` plans a single-engine
+    // run, then fails the run-all gate before any binary is spawned
+    // (no ambient-tool dependence, deterministic everywhere).
+    assert_eq!(
+        run(&args(&["--engine", "PytestTestEngine", "--everything"])),
+        std::process::ExitCode::FAILURE
+    );
+    // The plan really is single-engine (not the usage-error arm):
+    // `run` uses the process checkout, which is always a git tree.
+    let cwd = std::env::current_dir().unwrap();
+    let opts = parse_options(&args(&["--engine", "PytestTestEngine", "--everything"]))
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        plan_run(&opts, &cwd),
+        Ok(PlannedRun::Single { .. })
+    ));
+}

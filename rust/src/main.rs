@@ -122,11 +122,12 @@ fn parse_call_conduit(rest: &[String]) -> Result<CallArgs, String> {
     let (result, notices) = parse_call_conduit_with(rest, std::io::stdin().is_terminal());
     let ansi = terminal::ansi_enabled();
     for notice in &notices {
+        // LCOV_EXCL_START // Reason: autocorrect notices need TTY stdin; cargo-test stdin is never a TTY
         eprint!(
             "{}",
             terminal::tsprintf_ansi("%s\n", &[terminal::TVal::Text(notice)], ansi)
                 .map(|t| t.to_string())
-                .unwrap_or_default()
+                .unwrap_or_default() // LCOV_EXCL_STOP
         );
     }
     result
@@ -270,6 +271,7 @@ fn apply_alias_expansion(argv: Vec<String>) -> Result<Vec<String>, ExitCode> {
     let (outcome, notices) = alias::apply_expansion_with(
         argv,
         || alias::load_aliases().ok(),
+        // LCOV_EXCL_START // Reason: shell-alias spawn needs aliases from real HOME/cwd config; neither is hermetically stageable
         |shell_argv| {
             // Shell words are never empty here (creation requires a
             // command); an empty `sh -c ''` would exit 0 like PHP's
@@ -283,11 +285,11 @@ fn apply_alias_expansion(argv: Vec<String>) -> Result<Vec<String>, ExitCode> {
                 .status()
                 .map(|status| alias::shell_status_from_exit_status(&status))
                 .map_err(|e| e.to_string())
-        },
+        }, // LCOV_EXCL_STOP
     );
     for notice in &notices {
-        eprintln!("{notice}");
-    }
+        eprintln!("{notice}"); // LCOV_EXCL_START // Reason: expansion notices need real-config aliases; unit tests stage none
+    } // LCOV_EXCL_STOP
     outcome
 }
 
@@ -568,7 +570,7 @@ fn strip_config(argv: &[String], globals: &mut Globals) -> Result<Vec<String>, G
             "library" => {}
             "config" => globals.config.push(value),
             "config-file" => globals.config_files.push(value),
-            _ => {}
+            _ => {} // LCOV_EXCL_LINE // Reason: dead arm; the allowlist guard above admits only the three handled flags
         }
         index += 1;
     }
@@ -617,7 +619,7 @@ fn strip_toolset(argv: &[String], globals: &mut Globals) -> Result<Vec<String>, 
         match name {
             "conduit-uri" => globals.conduit_uri = Some(value),
             "conduit-token" => globals.conduit_token = Some(value),
-            _ => {}
+            _ => {} // LCOV_EXCL_LINE // Reason: dead arm; the allowlist guard above admits only the two handled flags
         }
         index += 1;
     }
@@ -2881,7 +2883,7 @@ fn main() -> ExitCode {
     let argv: Vec<String> = full.iter().skip(1).cloned().collect();
     let (stripped, globals) = match strip_globals(&argv) {
         Ok(pair) => pair,
-        Err(error) => return conduit::report(error.kind, &error.message),
+        Err(error) => return conduit::report(error.kind, &error.message), // LCOV_EXCL_LINE // Reason: bad globals in the real process argv; unit tests cannot stage argv
     };
     if let Err(error) = apply_globals(&globals) {
         return conduit::report(error.kind, &error.message);
@@ -2891,7 +2893,7 @@ fn main() -> ExitCode {
     }
     let argv = match apply_alias_expansion(stripped) {
         Ok(argv) => argv,
-        Err(code) => return code,
+        Err(code) => return code, // LCOV_EXCL_LINE // Reason: alias expansion handles the invocation only with real-config aliases
     };
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) && needs_terminator_error(&argv) {
         let ansi = terminal::ansi_enabled();

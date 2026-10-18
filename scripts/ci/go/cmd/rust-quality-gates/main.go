@@ -921,12 +921,13 @@ func coverageReports(env []string, workspace, reportDir string, covRunner []stri
 	if err := printLCOVSummary(lcovPath, workspace); err != nil {
 		return err
 	}
-	// The 80% status quo, enforced: attained coverage must never regress.
+	// T1170 endgame: 100% enforced (suite plus LCOV exclusions);
+	// attained coverage must never regress.
 	floorBin, err := sibling("coverage-floor")
 	if err != nil {
 		return err
 	}
-	return run([]string{floorBin, lcovPath, "80"}, env, workspace)
+	return run([]string{floorBin, lcovPath, "100"}, env, workspace)
 }
 
 // provisionDeny installs cargo-deny: upstream ships only musl

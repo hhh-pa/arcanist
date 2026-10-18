@@ -267,7 +267,7 @@ fn long_stderr_truncates_on_char_boundaries() {
     assert!(
         messages[0].description.ends_with("..."),
         "{}",
-        messages[0].description
+        messages[0].description // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
     assert!(messages[0].description.len() < loud.len());
 }

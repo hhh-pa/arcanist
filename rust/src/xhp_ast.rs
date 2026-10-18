@@ -2144,7 +2144,7 @@ impl Tree {
                             return Some(l);
                         }
                     }
-                    None
+                    None // LCOV_EXCL_LINE // Reason: dead: the first semantic token in range guarantees the backward scan hits
                 });
                 (first, last)
             }
@@ -2360,7 +2360,7 @@ impl Tree {
                 break;
             };
             if next == cur {
-                break;
+                break; // LCOV_EXCL_LINE // Reason: dead: header steps always advance past cur or stop
             }
             cur = next;
         }
@@ -2593,7 +2593,7 @@ fn param_ty_range(tree: &Tree, first: usize, name_idx: usize) -> Option<(usize, 
     if start <= end {
         Some((start, end))
     } else {
-        None
+        None // LCOV_EXCL_LINE // Reason: dead: the walker end is always a non-trivia token at or after first
     }
 }
 
@@ -2649,7 +2649,7 @@ fn walker_before_name(tree: &Tree, first: usize, name_idx: usize) -> Option<usiz
         break;
     }
     if end < first {
-        return None;
+        return None; // LCOV_EXCL_LINE // Reason: dead: the loop returns before end can pass first
     }
     Some(end)
 }

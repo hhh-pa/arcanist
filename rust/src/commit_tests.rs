@@ -632,3 +632,39 @@ fn commit_file_list_aborts_on_missing_paths() {
     let err = svn_commit_file_list(&mut io, &client, &svn, tmp.path(), 7).unwrap_err();
     assert_eq!(err, land::ABORT);
 }
+
+#[test]
+#[cfg(unix)]
+fn t1170_flow_git_reports_silent_hook_failures() {
+    // T1170 band J: mirror of amend's silent-hook test — a
+    // `commit-msg` hook that fails without output surfaces our own
+    // error instead of git prose. Unix-only: hooks need `chmod`.
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new("t1170-silent-fail");
+    let git = |argv: &[&str]| {
+        let output = std::process::Command::new("git")
+            .current_dir(tmp.path())
+            .args(argv)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    };
+    git(&["init", "-q", "-b", "master"]);
+    git(&["config", "user.email", "t@t"]);
+    git(&["config", "user.name", "t"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(tmp.path().join("file.txt"), "base\n").unwrap();
+    git(&["add", "file.txt"]);
+    let hook = tmp.path().join(".git").join("hooks").join("commit-msg");
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&hook, permissions).unwrap();
+    let mut options = empty_options();
+    options.messages = vec!["msg".to_string()];
+    options.all = true;
+    assert_eq!(
+        flow_git(tmp.path(), &options).unwrap_err(),
+        "git commit failed"
+    );
+}

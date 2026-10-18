@@ -260,3 +260,44 @@ fn namespace_first_binary_scan_handles_brackets() {
     assert_eq!(hits.len(), 1);
     assert!(hits[0].2.ends_with("n_VARIABLE"), "{}", hits[0].2);
 }
+
+fn t1170_tree(source: &str) -> ast::Tree {
+    let canned = ast::tokens_to_canned(source, &ast::tokenize(source));
+    ast::tree_from_canned(&canned).expect("canned output must parse")
+}
+
+#[test]
+fn t1170_first_statement_empty_without_code() {
+    // T1170 band J: trivia-only files have no first statement.
+    assert_eq!(super::first_statement(&t1170_tree("<?php // only\n")), None);
+}
+
+#[test]
+fn t1170_lone_trailing_tokens_keep_plain_types() {
+    // T1170 band J: a variable/string with no next token keeps its
+    // plain node type.
+    let tree = t1170_tree("<?php $x");
+    let var = tree
+        .tokens
+        .iter()
+        .position(|t| t.kind == ast::kinds::T_VARIABLE)
+        .unwrap();
+    assert_eq!(super::variable_statement_type(&tree, var), "n_VARIABLE");
+    let tree = t1170_tree("<?php foo");
+    let name = tree
+        .tokens
+        .iter()
+        .position(|t| t.kind == ast::kinds::T_STRING)
+        .unwrap();
+    assert_eq!(super::string_statement_type(&tree, name), "n_SYMBOL_NAME");
+}
+
+#[test]
+fn t1170_flat_symbols_stop_at_stray_closer() {
+    // T1170 band J: an unmatched closer ends the flat import scan.
+    let tree = t1170_tree("<?php }");
+    let closer = tree.tokens.iter().position(|t| t.kind == "}").unwrap();
+    let mut symbols = Vec::new();
+    super::flat_symbols(&tree, closer, closer, &mut symbols);
+    assert!(symbols.is_empty());
+}

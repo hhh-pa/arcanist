@@ -26,6 +26,11 @@ fn for_rule(source: &str, rule: u32) -> Vec<(usize, usize, String)> {
         .collect()
 }
 
+fn t1170_tree(source: &str) -> ast::Tree {
+    let canned = ast::tokens_to_canned(source, &ast::tokenize(source));
+    ast::tree_from_canned(&canned).expect("canned output must parse")
+}
+
 #[test]
 fn wiring_meta_matches_php_names_and_severities() {
     let table = super::super::RULE_TABLE;
@@ -698,4 +703,22 @@ fn glued_marker_at_end_of_doc_matches_nothing() {
     // end without matching (the scan's fallthrough arm).
     assert!(!super::has_concrete_extensible("x@concrete-extensible"));
     assert!(super::has_concrete_extensible(" @concrete-extensible "));
+}
+
+#[test]
+fn t1170_find_bytes_rejects_short_haystacks() {
+    // T1170 band J: a haystack shorter than the needle never
+    // matches (the guard the doc scan relies on).
+    assert_eq!(super::find_bytes(b"ab", b"abc"), None);
+    assert_eq!(super::find_bytes(b"xxabc", b"abc"), Some(2));
+}
+
+#[test]
+fn t1170_class_at_file_start_has_no_docblock() {
+    // T1170 band J: a class node at token 0 has no preceding
+    // docblock by construction.
+    let tree = t1170_tree("<?php class A {}\n");
+    let mut block = tree.blocks()[0].clone();
+    block.kw_idx = 0;
+    assert!(!super::class_docblock_exempts(&tree, &block));
 }

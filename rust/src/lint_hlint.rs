@@ -97,10 +97,10 @@ fn find_on_path(path_env: &std::ffi::OsStr, binary: &str) -> Option<PathBuf> {
             return Some(candidate);
         }
         if cfg!(windows) {
-            let exe = dir.join(format!("{binary}.exe"));
+            let exe = dir.join(format!("{binary}.exe")); // LCOV_EXCL_START // Reason: windows-only .exe probe; cfg!(windows) is false on ubuntu CI
             if exe.is_file() {
                 return Some(exe);
-            }
+            } // LCOV_EXCL_STOP
         }
     }
     None
@@ -195,7 +195,7 @@ fn lint_with_binary_and_flags(
         return Vec::new();
     };
     let Ok(staged) = StagedFile::stage(path, data) else {
-        return Vec::new();
+        return Vec::new(); // LCOV_EXCL_LINE // Reason: staging failure; hermetic tests cannot fail temp-dir writes
     };
     let Some((code, stdout, stderr)) = run_tool(binary, staged.path(), flags) else {
         return Vec::new();
@@ -220,7 +220,7 @@ pub fn parse_output(path: &str, _exit_code: i32, stdout: &str, _stderr: &str) ->
             return Vec::new();
         }
         let Some(message) = parse_idea(path, idea) else {
-            continue;
+            continue; // LCOV_EXCL_LINE // Reason: dead: parse_output returns on non-objects above, so this never fails
         };
         out.push(message);
     }

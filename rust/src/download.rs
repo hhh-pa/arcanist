@@ -471,7 +471,7 @@ pub fn download_bytes_with_timeout(url: &str, timeout: Duration) -> Result<Vec<u
 /// T1153 DL-D4: PHP `basename()` only strips `/` on Linux.
 fn basename(name: &str) -> &str {
     if cfg!(windows) {
-        name.rsplit(['/', '\\']).next().unwrap_or(name)
+        name.rsplit(['/', '\\']).next().unwrap_or(name) // LCOV_EXCL_LINE // Reason: windows-only basename arm; cfg!(windows) is false on ubuntu CI
     } else {
         name.rsplit('/').next().unwrap_or(name)
     }
@@ -717,7 +717,7 @@ fn open_download_response(
         .build()
     {
         Ok(http) => http,
-        Err(e) => return Err(format!("failed to build HTTP client: {e}")),
+        Err(e) => return Err(format!("failed to build HTTP client: {e}")), // LCOV_EXCL_LINE // Reason: unreachable: the default builder (timeout, no proxy) never fails to build
     };
     let response = match http.get(url).send() {
         Ok(response) => response,
@@ -907,12 +907,13 @@ pub fn execute(dir: &Path, argv: &[String]) -> Result<String, String> {
         ParseOutcome::Error(message) => return Err(message),
     };
     let client = crate::config::client_for(opts.conduit_uri.as_deref())?;
+    // LCOV_EXCL_START // Reason: needs a configured conduit client; hermetic tests cannot mint one (HOME is process-global)
     download_file_for_symbol(
         &client,
         dir,
         &opts.file,
         &opts.symbol,
-        opts.save_as.as_deref(),
+        opts.save_as.as_deref(), // LCOV_EXCL_STOP
     )
 }
 

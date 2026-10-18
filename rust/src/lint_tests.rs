@@ -1926,9 +1926,9 @@ fn r4_lint2_lint3_gather_emit_kinds() {
 }
 
 // -( T1153 Wave 2: lint retrocompat )--------------------------------------
-
+// LCOV_EXCL_START // Reason: referenced-but-never-called parser; the script fails before parsing
 fn lint4_failing_parser(_output: &str) -> Vec<crate::lint_script_and_regex::ScriptRegexMatch> {
-    unreachable!("the script fails before parsing")
+    unreachable!("the script fails before parsing") // LCOV_EXCL_STOP
 }
 
 #[test]
@@ -1972,7 +1972,7 @@ fn lint20_unreadable_files_fold_into_the_aggregate() {
         // Privileged runner (e.g. root in CI containers): permission
         // bits do not block reads, so the failure under test cannot
         // trigger.
-        return;
+        return; // LCOV_EXCL_LINE // Reason: privileged-runner skip; runs only where reads ignore permission bits (root CI)
     }
     let work = WorkCopy {
         vcs: Vcs::Git,
@@ -3935,7 +3935,7 @@ fn cov_patch_prompt_reads_missing_disk_as_dev_null() {
     let mut sink = Sink::Buffer(String::new());
     prompt_for_patch(&result, b"", &mut sink);
     let Sink::Buffer(buffer) = &sink else {
-        panic!("expected a buffered sink");
+        panic!("expected a buffered sink"); // LCOV_EXCL_LINE // Reason: defensive panic arm; the buffer always matches
     };
     assert!(buffer.is_empty(), "{buffer:?}");
 }
@@ -4300,8 +4300,9 @@ fn cov6g_spawn_with_retry_reports_text_file_busy() {
     let mut cmd = Command::new(&script);
     cmd.current_dir(&dir);
     match spawn_with_retry(&mut cmd) {
+        // LCOV_EXCL_START // Reason: ETXTBSY error arm; macOS exec never reports text-file-busy
         Err(error) => assert_eq!(
-            error.raw_os_error(),
+            error.raw_os_error(), // LCOV_EXCL_STOP
             Some(26),
             "expected ETXTBSY, got {error}"
         ),
@@ -4353,4 +4354,28 @@ fn git_helper_reports_failing_commands() {
     // A failing git invocation panics with the command and stderr.
     let tmp = TempDir::new("w6h-git-fail");
     git(tmp.path(), &["--bogus-flag-xyz"]);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn spawn_with_retry_retries_text_file_busy() {
+    // Linux-only: a script held open for writing fails exec with
+    // ETXTBSY there (macOS/Windows exec it fine), so the retry arm
+    // sleeps and retries instead of failing at once (50 x 2ms, then
+    // the last error unchanged). Covered on ubuntu CI, where the
+    // gates measure; the macOS replica legitimately reads these
+    // three lines uncovered.
+    let tmp = TempDir::new("etxtbsy-retry");
+    let script = tmp.write("busy.sh", "#!/bin/sh\nexit 0\n");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _held = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&script)
+        .unwrap();
+    let start = std::time::Instant::now();
+    let mut cmd = std::process::Command::new(&script);
+    let err = spawn_with_retry(&mut cmd).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(26));
+    assert!(start.elapsed() >= std::time::Duration::from_millis(80));
 }

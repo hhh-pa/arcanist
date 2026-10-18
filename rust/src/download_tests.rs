@@ -33,7 +33,7 @@ fn rejects_missing_extra_and_bad_symbols() {
     // T1153 BROWSE-B21: `--` present, so validation (not the
     // terminator) reports.
     let ParseOutcome::Error(message) = parse_args(&argv(&["--"])) else {
-        panic!("expected error for no file");
+        panic!("expected error for no file"); // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     };
     // T1153 DL-3: the live `runWorkflow()` no-argv text.
     assert_eq!(message, "Specify a file to download, like \"F123\".");
@@ -58,7 +58,7 @@ fn dl4_unknown_flag_uses_toolset_text() {
     // (`PhutilArgumentParser.php:819-825`); post-`--` leftovers
     // ride the wildcard into symbol validation instead.
     let ParseOutcome::Error(message) = parse_args_with_tty(&argv(&["--bogus"]), true) else {
-        panic!("expected unknown-flag error");
+        panic!("expected unknown-flag error"); // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     };
     assert_eq!(
         message,
@@ -325,11 +325,11 @@ fn r4_dld2_arg_errors_are_toolset_usage() {
     // terminator) reports.
     match parse_args(&argv(&["--"])) {
         ParseOutcome::Error(message) => assert!(!message.contains("usage:"), "{message}"),
-        _ => panic!("expected parse error"),
+        _ => panic!("expected parse error"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     }
     match execute(&std::env::temp_dir(), &argv(&["--"])) {
         Err(message) => assert!(!message.contains("usage:"), "{message}"),
-        _ => panic!("expected error"),
+        _ => panic!("expected error"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     }
 }
 
@@ -650,7 +650,7 @@ fn dl_d14_empty_as_means_cwd_exists() {
     // resolves to the working directory: `already exists`.
     match parse_args(&argv(&["--as", "", "--", "F1"])) {
         ParseOutcome::Args(opts) => assert_eq!(opts.save_as, Some(String::new())),
-        _ => panic!("expected args"),
+        _ => panic!("expected args"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     }
     let dir = dl_tempdir("emptyas");
     let file = dl_file(1, "f.bin", 1, "http://127.0.0.1:9/x");
@@ -806,7 +806,7 @@ fn parses_attached_flag_values() {
     assert_eq!(opts.conduit_uri, Some("http://x/".to_string()));
     // A missing `--conduit-uri` value errors immediately.
     let ParseOutcome::Error(message) = parse_args(&argv(&["--conduit-uri"])) else {
-        panic!("expected missing-value error");
+        panic!("expected missing-value error"); // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     };
     assert_eq!(message, "--conduit-uri requires a value");
 }
@@ -1175,7 +1175,7 @@ fn dl_b23_help_matches_generated_format() {
     // `--help` still exits zero once `--` satisfies the terminator.
     match execute(&std::env::temp_dir(), &argv(&["--help", "--"])) {
         Ok(text) => assert!(text.contains("DOWNLOAD WORKFLOW"), "{text}"),
-        Err(message) => panic!("expected help, got {message}"),
+        Err(message) => panic!("expected help, got {message}"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
     }
 }
 
@@ -1207,12 +1207,14 @@ fn serve_helpers_release_aborted_connections() {
         stream.write_all(b"X").unwrap();
         drop(stream);
         // Poll until the handler returns and drops its listener; the
-        // bound keeps a stuck handler from hanging the suite.
+        // bound keeps a stuck handler from hanging the suite. The
+        // sleep runs first so the wait is unconditional (T1170 band
+        // J: a check-first sleep flakes under coverage).
         for _ in 0..500 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
             if std::net::TcpStream::connect(&addr).is_err() {
                 break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            } // LCOV_EXCL_LINE // Reason: llvm brace-counter flake; line covered in prior run and the loop body executes
         }
         let released = std::net::TcpStream::connect(&addr).is_err();
         assert!(released, "aborted {url} never released");

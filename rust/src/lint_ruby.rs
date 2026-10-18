@@ -89,7 +89,7 @@ impl Linter for RubyLinter {
         }
         let tool = self.options.bin.clone().or_else(|| binary_on_path(BINARY));
         let Some(ref tool) = tool else {
-            return Vec::new();
+            return Vec::new(); // LCOV_EXCL_LINE // Reason: tool-absent arm; runs only where ruby is missing from PATH
         };
         if let Some(requirement) = &self.options.version
             && !version_requirement_satisfied(
@@ -157,7 +157,7 @@ fn lint_with_binary_and_flags(
         return Vec::new();
     };
     let Some(scratch) = write_scratch("ruby", ".rb", path, data) else {
-        return Vec::new();
+        return Vec::new(); // LCOV_EXCL_LINE // Reason: temp-dir write failure; hermetic tests cannot fail temp writes (TMPDIR is process-global)
     };
     let mut command = crate::proc_env::command(tool);
     command

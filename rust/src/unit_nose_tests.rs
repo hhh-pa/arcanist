@@ -317,6 +317,6 @@ fn run_tests_propagates_unparseable_xunit() {
     assert!(
         err.message().contains("must not be empty"),
         "{}",
-        err.message()
+        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
     );
 }
