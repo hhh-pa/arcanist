@@ -1174,5 +1174,5 @@ fn prepare_gates_on_open_arcrc_permissions_defensive_ok_arm() {
         "--arcrc-file".to_string(),
         path.to_string_lossy().to_string(),
     ];
-    expect_prepare_failure(&argv);
+    let _code = expect_prepare_failure(&argv);
 }
