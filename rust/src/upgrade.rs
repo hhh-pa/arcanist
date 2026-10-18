@@ -311,9 +311,18 @@ pub fn rebuild_note() -> &'static str {
 }
 
 /// Run `git pull --rebase origin -- <branch>` in `root`, returning stdout
-/// on success and `(stdout, stderr)` on failure.
-fn pull_rebase(root: &Path, branch: &str) -> Result<String, (String, String)> {
-    let out = crate::proc_env::command("git")
+/// on success and `(stdout, stderr)` on failure, with the `git` program
+/// override injected (`None` spawns `git`; test seam).
+fn pull_rebase_with_git(
+    root: &Path,
+    branch: &str,
+    git: Option<&Path>,
+) -> Result<String, (String, String)> {
+    let mut cmd = match git {
+        Some(program) => crate::proc_env::command(program),
+        None => crate::proc_env::command("git"),
+    };
+    let out = cmd
         .current_dir(root)
         .args(["pull", "--rebase", "origin", "--", branch])
         .output()
@@ -327,10 +336,14 @@ fn pull_rebase(root: &Path, branch: &str) -> Result<String, (String, String)> {
     }
 }
 
-/// Best-effort `git rebase --abort` after a failed pull, mirroring PHP.
-fn abort_rebase(root: &Path) {
-    crate::proc_env::command("git")
-        .current_dir(root)
+/// Best-effort `git rebase --abort` after a failed pull, mirroring PHP,
+/// with the `git` program override injected (`None` spawns `git`).
+fn abort_rebase_with_git(root: &Path, git: Option<&Path>) {
+    let mut cmd = match git {
+        Some(program) => crate::proc_env::command(program),
+        None => crate::proc_env::command("git"),
+    };
+    cmd.current_dir(root)
         .args(["rebase", "--abort"])
         .output()
         .ok();
@@ -339,6 +352,13 @@ fn abort_rebase(root: &Path) {
 /// Perform the `--apply` upgrade: cleanliness gate, pull, abort on
 /// failure. Status lines go to stderr; pull output passes through stdout.
 pub fn run_apply(target: &ApplyTarget) -> Result<(), String> {
+    run_apply_with_git(target, None)
+}
+
+/// [`run_apply`] with the `git` program override injected (test seam:
+/// hermetic tests stage a fake `git` for the pull while the
+/// cleanliness gate keeps using the real one).
+fn run_apply_with_git(target: &ApplyTarget, git: Option<&Path>) -> Result<(), String> {
     let dirty = uncommitted_paths(&target.root)?;
     if !dirty.is_empty() {
         print!(
@@ -355,7 +375,7 @@ pub fn run_apply(target: &ApplyTarget) -> Result<(), String> {
             &[PhtArg::Text(APPLY_LIBRARY), PhtArg::Text(&target.branch)],
         ),
     );
-    match pull_rebase(&target.root, &target.branch) {
+    match pull_rebase_with_git(&target.root, &target.branch, git) {
         Ok(stdout) => {
             print!("{stdout}");
             push_status(
@@ -369,10 +389,10 @@ pub fn run_apply(target: &ApplyTarget) -> Result<(), String> {
         Err((stdout, stderr)) => {
             print!("{stdout}");
             eprint!("{stderr}");
-            abort_rebase(&target.root);
+            abort_rebase_with_git(&target.root, git);
             let detail = stderr.trim();
             if detail.is_empty() {
-                Err("git pull --rebase failed.".to_string()) // LCOV_EXCL_LINE // Reason: git failures explain on stderr; empty stderr needs a silent kill, not stageable
+                Err("git pull --rebase failed.".to_string())
             } else {
                 Err(detail.to_string())
             }
@@ -1599,31 +1619,37 @@ fn preparing_line(ansi: bool) -> String {
 }
 
 /// Run the `--apply` self-update (see [`execute_apply`]): human
-/// transcript, or the JSON result with `--json`.
-fn run_apply_command(cwd: &Path, options: &Options) -> ExitCode {
+/// transcript, or the JSON result with `--json`, with the release API
+/// base, executable, and confirmation injected (`RELEASE_API_BASE` /
+/// the running binary / interactive prompting in production; hermetic
+/// tests stage a loopback API plus a scratch executable).
+fn run_apply_command_with(
+    cwd: &Path,
+    options: &Options,
+    api_base: &str,
+    exe: Option<&Path>,
+    confirm: &dyn Fn(&str) -> Result<bool, String>,
+) -> ExitCode {
     eprint!("{}", preparing_line(terminal::ansi_enabled()));
     let apply = ApplyOptions {
-        api_base: RELEASE_API_BASE.to_string(),
+        api_base: api_base.to_string(),
         current_version: version().to_string(),
-        exe: None,
+        exe: exe.map(Path::to_path_buf),
         yes: options.yes,
         json: options.json,
         ansi: terminal::ansi_enabled(),
     };
-    match execute_apply(cwd, &apply, &confirm_interactive) {
-        // LCOV_EXCL_START // Reason: needs a live release-API fetch to succeed; hermetic tests drive execute_apply directly
+    match execute_apply(cwd, &apply, confirm) {
         Ok(report) => {
             if options.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&apply_result_json(&report))
-                        .unwrap_or_else(|_| "{}".to_string())
-                );
+                let pretty = serde_json::to_string_pretty(&apply_result_json(&report))
+                    .unwrap_or_else(|_| "{}".to_string());
+                println!("{pretty}");
             } else {
                 print!("{}", report.stdout_text);
             }
             eprint!("{}", report.stderr_text);
-            ExitCode::SUCCESS // LCOV_EXCL_STOP
+            ExitCode::SUCCESS
         }
         Err(message) => {
             eprintln!("arc {NAME}: {message}");
@@ -1636,6 +1662,26 @@ fn run_apply_command(cwd: &Path, options: &Options) -> ExitCode {
 /// (network fetch, then replaces the running executable): keep it out
 /// of integration tests; `upgrade_tests` covers it hermetically.
 pub fn run(argv: &[String]) -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    run_in(&cwd, argv)
+}
+
+/// [`run`] rooted at an explicit directory (test seam: hermetic tests
+/// stage corrupted or behind-upstream fixtures instead of depending on
+/// the test-run checkout's health).
+fn run_in(cwd: &Path, argv: &[String]) -> ExitCode {
+    run_in_with(cwd, argv, RELEASE_API_BASE, None, &confirm_interactive)
+}
+
+/// [`run_in`] with the release API base, executable, and confirmation
+/// injected for the `--apply` path (test seam).
+fn run_in_with(
+    cwd: &Path,
+    argv: &[String],
+    api_base: &str,
+    exe: Option<&Path>,
+    confirm: &dyn Fn(&str) -> Result<bool, String>,
+) -> ExitCode {
     let options = match parse_args(argv) {
         Parsed::Help => {
             print!("{}", usage());
@@ -1657,16 +1703,14 @@ pub fn run(argv: &[String]) -> ExitCode {
         }
         Parsed::Options(options) => options,
     };
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     if options.apply {
-        return run_apply_command(&cwd, &options); // LCOV_EXCL_LINE // Reason: driving live --apply needs real network plus release state; not hermetically drivable
+        return run_apply_command_with(cwd, &options, api_base, exe, confirm);
     }
-    let status = match inspect(&cwd) {
+    let status = match inspect(cwd) {
         Ok(status) => status,
-        // LCOV_EXCL_START // Reason: needs git plumbing to fail inside the test-run checkout; the checkout is always healthy
         Err(message) => {
             eprintln!("arc {NAME}: {message}");
-            return ExitCode::FAILURE; // LCOV_EXCL_STOP
+            return ExitCode::FAILURE;
         }
     };
     if options.json {
@@ -1679,7 +1723,7 @@ pub fn run(argv: &[String]) -> ExitCode {
         print!("{}", render(&status));
     }
     if options.check && update_available(&status) == Some(true) {
-        return ExitCode::FAILURE; // LCOV_EXCL_LINE // Reason: needs the test checkout behind its upstream; checkout state is real VCS
+        return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
 }

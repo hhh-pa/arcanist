@@ -6881,3 +6881,327 @@ fn base64_padding_byte_maps_to_none() {
     assert_eq!(base64_val(b'A'), Some(0));
     assert_eq!(base64_val(b'?'), None);
 }
+
+// -( T1176 PB-4: interactive-editor trampolines + live-conduit deps )----------
+
+/// Spawn this test binary with `vars` set, running only `probe`.
+fn spawn_probe(probe: &str, vars: &[(&str, &str)]) -> (bool, String, String) {
+    let exe = std::env::current_exe().expect("test binary path");
+    let mut command = std::process::Command::new(&exe);
+    for (key, value) in vars {
+        command.env(key, value);
+    }
+    let out = command
+        .args(["--nocapture", probe])
+        .output()
+        .expect("spawn probe child");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    (out.status.success(), stdout, stderr)
+}
+
+/// Assert a probe child passed and printed its marker.
+fn assert_probe_ok(probe: &str, vars: &[(&str, &str)], marker: &str) {
+    let (success, stdout, stderr) = spawn_probe(probe, vars);
+    assert!(
+        success && stdout.contains("1 passed") && stdout.contains(marker),
+        "{probe} child failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+}
+
+/// The yes-path editor closure over a pinned non-interactive `$EDITOR`.
+///
+/// Runs only with `EDITOR=true`/`false` (see
+/// [`t1176_pb4_clean_tree_editor_trampoline`]); otherwise this would
+/// launch the ambient editor.
+#[test]
+fn pb4_clean_tree_editor_probe() {
+    let editor = std::env::var("EDITOR").unwrap_or_default();
+    if editor != "true" && editor != "false" {
+        println!("PB4-CLEAN-TREE-PROBE-OK");
+        return;
+    }
+    // A revision footer declines the amend, so the yes-path edits a new
+    // message through the real closure (the p9_yes_path_commits_via_editor
+    // setup, driven through the public entry).
+    let repo = make_repo("pb4_clean_tree_probe");
+    git(
+        &repo,
+        &[
+            "commit",
+            "--allow-empty",
+            "-m",
+            "x\n\nDifferential Revision: D1",
+        ],
+    );
+    std::fs::write(repo.join("file.txt"), "dirty\n").unwrap();
+    let backends = Backends::default();
+    let mut io = Io::canned(&["y"]);
+    let err = require_clean_tree_with_call(&repo, Vcs::Git, &backends, &mut io, false, false, None)
+        .unwrap_err();
+    if editor == "true" {
+        // `true` leaves the template untouched: the yes-path refuses.
+        assert_eq!(err, MUST_PROVIDE_MESSAGE);
+    } else {
+        assert_eq!(err, diff::editor_exit_error(1));
+    }
+    assert!(
+        io.out.stdout.contains("create a new commit"),
+        "{}",
+        io.out.stdout
+    );
+    println!("PB4-CLEAN-TREE-PROBE-OK");
+}
+
+/// The commit-message editor closure over a pinned non-interactive
+/// `$EDITOR` (same ambient-editor guard as
+/// [`pb4_clean_tree_editor_probe`]).
+#[test]
+fn pb4_commit_message_editor_probe() {
+    let editor = std::env::var("EDITOR").unwrap_or_default();
+    if editor != "true" && editor != "false" {
+        println!("PB4-COMMIT-MESSAGE-PROBE-OK");
+        return;
+    }
+    // No revision ID, so the message resolves through the real editor
+    // closure.
+    let bundle = Bundle::default();
+    let err = resolve_commit_message_interactive(&bundle, None).unwrap_err();
+    if editor == "true" {
+        // `true` leaves the all-comments template untouched: abort.
+        assert_eq!(err, diff_local::USER_ABORT);
+    } else {
+        assert_eq!(err, diff::editor_exit_error(1));
+    }
+    println!("PB4-COMMIT-MESSAGE-PROBE-OK");
+}
+
+#[test]
+fn t1176_pb4_clean_tree_editor_trampoline() {
+    // The child carries `$EDITOR`, so the suite never mutates its own
+    // environment; each arm drives the closure end to end.
+    assert_probe_ok(
+        "pb4_clean_tree_editor_probe",
+        &[("EDITOR", "true")],
+        "PB4-CLEAN-TREE-PROBE-OK",
+    );
+    assert_probe_ok(
+        "pb4_clean_tree_editor_probe",
+        &[("EDITOR", "false")],
+        "PB4-CLEAN-TREE-PROBE-OK",
+    );
+}
+
+#[test]
+fn t1176_pb4_commit_message_editor_trampoline() {
+    assert_probe_ok(
+        "pb4_commit_message_editor_probe",
+        &[("EDITOR", "true")],
+        "PB4-COMMIT-MESSAGE-PROBE-OK",
+    );
+    assert_probe_ok(
+        "pb4_commit_message_editor_probe",
+        &[("EDITOR", "false")],
+        "PB4-COMMIT-MESSAGE-PROBE-OK",
+    );
+}
+
+/// Serve canned conduit envelopes routed by method name, for as many
+/// sequential requests as the flow makes.
+fn serve_routes(routes: std::collections::HashMap<String, String>) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        // `flatten` skips transient accept errors (an aborted client
+        // must not kill the stub); the listener never closes in
+        // tests, so no permanent-error spin is possible.
+        for mut stream in listener.incoming().flatten() {
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                if stream.read_exact(&mut byte).is_err() {
+                    break;
+                }
+                head.push(byte[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head = String::from_utf8_lossy(&head).to_string();
+            let len: usize = head
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(key, value)| {
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                })
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            if stream.read_exact(&mut body).is_err() {
+                break;
+            }
+            let target = head.lines().next().unwrap_or("").to_string();
+            let canned = routes
+                .iter()
+                .find(|(method, _)| target.contains(method.as_str()))
+                .map(|(_, canned)| canned.clone())
+                .unwrap_or_else(|| patch_envelope("null"));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                canned.len(),
+                canned
+            );
+            // Best-effort: a vanished client must not end the stub.
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    base
+}
+
+#[test]
+fn stub_server_tolerates_aborted_clients() {
+    // Misbehaving clients trip the stub's robustness arms: an
+    // immediate close ends header reading at EOF, and headers
+    // promising a body that never arrives end body reading at EOF.
+    // Each stub serves one aborted client then exits its loop.
+    let base = serve_routes(std::collections::HashMap::new());
+    let addr = base
+        .strip_prefix("http://")
+        .and_then(|s| s.strip_suffix('/'))
+        .unwrap()
+        .to_string();
+    drop(std::net::TcpStream::connect(&addr).unwrap());
+    let base = serve_routes(std::collections::HashMap::new());
+    let addr = base
+        .strip_prefix("http://")
+        .and_then(|s| s.strip_suffix('/'))
+        .unwrap()
+        .to_string();
+    let mut stream = std::net::TcpStream::connect(&addr).unwrap();
+    use std::io::Write;
+    stream
+        .write_all(b"POST /api/x HTTP/1.1\r\nContent-Length: 100\r\n\r\n")
+        .unwrap();
+    drop(stream);
+}
+
+/// Drive one dependency child through the real flow against a loopback
+/// stub.
+///
+/// Runs only in the [`t1176_pb4_dependencies_drive_child_flow`] child
+/// (which pins `HOME` to a fixture dir for the temp credentials the
+/// child flow reads through the ambient arcrc path).
+#[test]
+fn pb4_dependency_child_probe() {
+    if std::env::var("ARC_RS_PB4_DEPS_CHILD").as_deref() != Ok("1") {
+        println!("PB4-DEPS-PROBE-OK");
+        return;
+    }
+    let home = PathBuf::from(std::env::var_os("HOME").expect("pinned HOME for temp credentials"));
+    let repo = make_repo("pb4_deps_probe");
+    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+    git(&repo, &["add", "a.txt"]);
+    git(&repo, &["commit", "-m", "add a.txt"]);
+    // The stub serves the dependency revision bundle; temp creds live
+    // under the pinned HOME.
+    let row = serde_json::json!({
+        "7": {"id": "7", "revisionID": "2", "sourceControlBaseRevision": "base-dep",
+              "authorName": "Ada", "authorEmail": "ada@test",
+              "changes": [{
+                  "type": "2", "fileType": "1",
+                  "oldPath": "a.txt", "currentPath": "a.txt",
+                  "hunks": [{"oldOffset": "1", "oldLength": "1",
+                             "newOffset": "1", "newLength": "1",
+                             "corpus": "-a\n+b\n"}],
+              }]},
+    });
+    let base = serve_routes(std::collections::HashMap::from([(
+        diff_submit::METHOD_QUERY_DIFFS.to_string(),
+        patch_envelope(&row.to_string()),
+    )]));
+    let key = host_key_for(&base);
+    std::fs::write(
+        home.join(".arcrc"),
+        format!(r#"{{"hosts": {{"{key}": {{"token": "x"}}}}}}"#),
+    )
+    .unwrap();
+    // D1 depends on D2 (the apply_dependencies_runs_children graph).
+    let start = serde_json::json!([{
+        "phid": "PHID-DREV-1", "id": 1,
+        "auxiliary": {"phabricator:depends-on": ["PHID-DREV-2"]}
+    }]);
+    let dep = serde_json::json!([{
+        "phid": "PHID-DREV-2", "id": 2, "auxiliary": {}
+    }]);
+    let both = serde_json::json!([
+        {"phid": "PHID-DREV-1", "id": 1},
+        {"phid": "PHID-DREV-2", "id": 2}
+    ]);
+    let graph = |_: &str, params: &serde_json::Value| {
+        let text = params.to_string();
+        if text.contains("\"ids\"") {
+            Ok(start.clone())
+        } else if text.contains("PHID-DREV-1") {
+            Ok(both.clone())
+        } else {
+            Ok(dep.clone())
+        }
+    };
+    let graph_ref: &diff_submit::ConduitCall = &graph;
+    let bundle = Bundle {
+        revision_id: Some(1),
+        ..Bundle::default()
+    };
+    let options = Options {
+        conduit_uri: Some(base),
+        nocommit: true,
+        ..Options::default()
+    };
+    let backends = Backends::default();
+    let mut io = Io::buffered();
+    run_patch_dependencies(
+        &repo,
+        &options,
+        &mut io,
+        &backends,
+        &bundle,
+        Vcs::Git,
+        false,
+        Some(graph_ref),
+        false,
+    )
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "b\n");
+    assert!(io.out.stderr.contains("APPLIED"), "{}", io.out.stderr);
+    println!("PB4-DEPS-PROBE-OK");
+}
+
+#[test]
+fn t1176_pb4_dependencies_drive_child_flow() {
+    // The child flow authenticates through the ambient arcrc path, so
+    // HOME is pinned to a fixture dir in the child only; EDITOR=false
+    // fails fast instead of hanging if the flow ever edits.
+    let home = temp_dir("t1176_pb4_deps_home");
+    let home_str = home.to_str().expect("utf8 home");
+    assert_probe_ok(
+        "pb4_dependency_child_probe",
+        &[
+            ("ARC_RS_PB4_DEPS_CHILD", "1"),
+            ("HOME", home_str),
+            ("USERPROFILE", home_str),
+            ("EDITOR", "false"),
+        ],
+        "PB4-DEPS-PROBE-OK",
+    );
+}
+
+#[test]
+fn t1176_pb4_dependency_child_outcome_combines() {
+    assert_eq!(combine_dependency_child_outcome(FlowOutcome::Done), Ok(()));
+    assert_eq!(
+        combine_dependency_child_outcome(FlowOutcome::SvnHunksFailed),
+        Err(String::new())
+    );
+}

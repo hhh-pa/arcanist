@@ -1446,25 +1446,35 @@ fn render_published_output(hashes: &[String], ansi: bool) -> Result<String, Stri
     Ok(out)
 }
 
-fn run_clearing(ansi: bool) -> ExitCode {
-    let now = now_unix();
-    let time = hour_text(local_hour(now), lunar_phase(now as i64));
-    let parts = [
-        render_title(ansi),
-        render_paragraph(clearing_text(), ansi),
-        render_paragraph(time, ansi),
-        render_paragraph(trails_text(), ansi),
-        render_markup(north_markup(), ansi),
-    ];
+/// Print concatenated render parts, exiting `code` on success. A render
+/// failure escapes through the fatal envelope; production call sites
+/// pass fixed valid patterns with correct argc, so only an adversarial
+/// pattern (white-box tests) reaches the failure arm.
+fn emit_parts(parts: Vec<Result<String, String>>, code: ExitCode) -> ExitCode {
     let mut out = String::new();
     for part in parts {
         match part {
             Ok(text) => out.push_str(&text),
-            Err(message) => return fail(message), // LCOV_EXCL_LINE // Reason: fixed valid patterns plus correct argc; the renders cannot fail
+            Err(message) => return fail(message),
         }
     }
     print!("{out}");
-    ExitCode::SUCCESS
+    code
+}
+
+fn run_clearing(ansi: bool) -> ExitCode {
+    let now = now_unix();
+    let time = hour_text(local_hour(now), lunar_phase(now as i64));
+    emit_parts(
+        vec![
+            render_title(ansi),
+            render_paragraph(clearing_text(), ansi),
+            render_paragraph(time, ansi),
+            render_paragraph(trails_text(), ansi),
+            render_markup(north_markup(), ansi),
+        ],
+        ExitCode::SUCCESS,
+    )
 }
 
 fn run_remotes(cwd: &Path, ansi: bool) -> ExitCode {
@@ -1482,13 +1492,10 @@ fn run_remotes(cwd: &Path, ansi: bool) -> ExitCode {
         Ok(remotes) => remotes,
         Err(message) => return fail_mapped(&client, message),
     };
-    match render_remotes_output(&remotes, ansi) {
-        Ok(out) => {
-            print!("{out}");
-            ExitCode::SUCCESS
-        }
-        Err(message) => fail(message), // LCOV_EXCL_LINE // Reason: fixed valid patterns plus correct argc; the render cannot fail
-    }
+    emit_parts(
+        vec![render_remotes_output(&remotes, ansi)],
+        ExitCode::SUCCESS,
+    )
 }
 
 fn run_published(cwd: &Path, ansi: bool) -> ExitCode {
@@ -1506,28 +1513,20 @@ fn run_published(cwd: &Path, ansi: bool) -> ExitCode {
         Ok(hashes) => hashes,
         Err(message) => return fail_mapped(&client, message),
     };
-    match render_published_output(&hashes, ansi) {
-        Ok(out) => {
-            print!("{out}");
-            ExitCode::SUCCESS
-        }
-        Err(message) => fail(message), // LCOV_EXCL_LINE // Reason: fixed valid patterns plus correct argc; the render cannot fail
-    }
+    emit_parts(
+        vec![render_published_output(&hashes, ansi)],
+        ExitCode::SUCCESS,
+    )
 }
 
 fn run_unknown(thing: &[String], ansi: bool) -> ExitCode {
-    let mut out = String::new();
-    for part in [
-        render_title(ansi),
-        render_line(&unknown_message(thing), ansi),
-    ] {
-        match part {
-            Ok(text) => out.push_str(&text),
-            Err(message) => return fail(message), // LCOV_EXCL_LINE // Reason: fixed valid patterns plus correct argc; the renders cannot fail
-        }
-    }
-    print!("{out}");
-    ExitCode::FAILURE
+    emit_parts(
+        vec![
+            render_title(ansi),
+            render_line(&unknown_message(thing), ansi),
+        ],
+        ExitCode::FAILURE,
+    )
 }
 
 /// Entry point: `argv` excludes the subcommand name.

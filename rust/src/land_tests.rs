@@ -110,6 +110,20 @@ fn land_commit(hash: &str, parents: &[&str], summary: &str) -> LandCommit {
     }
 }
 
+/// Identity hash formatter (T1176 PB-1 consolidation: one covered site
+/// instead of an inline formatter per call site, several of which never
+/// ran on their error/early-return paths).
+fn identity_hash(hash: &str) -> String {
+    hash.to_string()
+}
+
+/// Fixed landed message for merge tests (T1176 PB-1 consolidation: one
+/// covered site instead of an inline message closure per call site,
+/// several of which never ran because an error precedes the merge).
+fn stub_commit_message(_set: &CommitSet) -> Result<String, String> {
+    Ok("stub landed message".to_string())
+}
+
 fn canned(
     responses: Vec<(&str, serde_json::Value)>,
 ) -> impl Fn(&str, &serde_json::Value) -> Result<serde_json::Value, String> {
@@ -997,10 +1011,8 @@ fn link_commits_reverses_and_marks_heads() {
 #[test]
 fn confirm_commit_count_rejects_empty() {
     let mut io = Io::canned(&[]);
-    let err = confirm_commit_count(&mut io, &[], "\"a\"", Some("mstr"), &|hash| {
-        hash.to_string() // LCOV_EXCL_START // Reason: formatter never runs; empty sets print no commits
-    }) // LCOV_EXCL_STOP
-    .unwrap_err();
+    let err =
+        confirm_commit_count(&mut io, &[], "\"a\"", Some("mstr"), &identity_hash).unwrap_err();
     assert_eq!(err, "There are no commits to land.");
     assert!(io.out.stdout.contains("** NOTHING TO LAND **"));
 }
@@ -1011,16 +1023,13 @@ fn confirm_commit_count_prompts_large_sets() {
         .map(|index| land_commit(&format!("h{index:04}"), &[], &format!("c{index}")))
         .collect();
     let mut io = Io::canned(&["y"]);
-    confirm_commit_count(&mut io, &commits, "\"a\"", None, &|hash| hash.to_string()).unwrap();
+    confirm_commit_count(&mut io, &commits, "\"a\"", None, &identity_hash).unwrap();
     assert!(io.out.stdout.contains("** LARGE WORKING SET **"));
     assert!(io.out.stdout.contains("< ... 41 more commits ... >"));
     assert!(io.out.stdout.contains("Land 51 commit(s)?"));
     let mut io = Io::canned(&["n"]);
     assert!(
-        confirm_commit_count(&mut io, &commits, "\"a\"", Some("mstr"), &|hash| {
-            hash.to_string()
-        })
-        .is_err()
+        confirm_commit_count(&mut io, &commits, "\"a\"", Some("mstr"), &identity_hash).is_err()
     );
 }
 
@@ -1028,10 +1037,7 @@ fn confirm_commit_count_prompts_large_sets() {
 fn confirm_commit_count_passes_small_sets_quietly() {
     let commits = vec![land_commit("aaa", &[], "one")];
     let mut io = Io::canned(&[]);
-    confirm_commit_count(&mut io, &commits, "\"a\"", Some("mstr"), &|hash| {
-        hash.to_string() // LCOV_EXCL_START // Reason: formatter never runs; small sets print no commits
-    }) // LCOV_EXCL_STOP
-    .unwrap();
+    confirm_commit_count(&mut io, &commits, "\"a\"", Some("mstr"), &identity_hash).unwrap();
     assert!(io.out.is_empty());
 }
 
@@ -1291,7 +1297,7 @@ fn grouping_orders_sets_and_marks_implicit() {
     new.is_head = true;
     let mut commits = vec![old, new];
     let mut io = Io::canned(&[]);
-    let sets = group_commit_sets(&mut io, &mut commits, &|hash| hash.to_string()).unwrap();
+    let sets = group_commit_sets(&mut io, &mut commits, &identity_hash).unwrap();
     assert_eq!(sets.len(), 2);
     assert_eq!(sets[0].revision.as_ref().unwrap().monogram, "D1");
     assert_eq!(sets[1].revision.as_ref().unwrap().monogram, "D2");
@@ -1302,7 +1308,7 @@ fn grouping_orders_sets_and_marks_implicit() {
 fn grouping_reports_unknown_revisions() {
     let mut commits = vec![land_commit("aaa", &[], "one")];
     let mut io = Io::canned(&[]);
-    let err = group_commit_sets(&mut io, &mut commits, &|hash| hash.to_string()).unwrap_err();
+    let err = group_commit_sets(&mut io, &mut commits, &identity_hash).unwrap_err();
     assert_eq!(err, "Unable to determine revision for commit \"aaa\".");
     assert!(io.out.stdout.contains("** UNKNOWN REVISION **"));
 }
@@ -1357,7 +1363,7 @@ fn render_commit_set_marks_implicit() {
         commits: vec![0, 1],
         is_pick: false,
     };
-    let text = render_commit_set(&set, &commits, &|hash| hash.to_string());
+    let text = render_commit_set(&set, &commits, &identity_hash);
     assert!(text.contains("D1 Work 1"));
     assert!(text.contains("! aaa implicit work"));
     assert!(text.contains("bbb  plain work"));
@@ -1372,7 +1378,7 @@ fn confirm_implicit_skips_without_implicit_sets() {
         is_pick: false,
     }];
     let mut io = Io::canned(&[]);
-    confirm_implicit_sets(&mut io, &sets, &commits, "\"a\"", &|hash| hash.to_string()).unwrap();
+    confirm_implicit_sets(&mut io, &sets, &commits, "\"a\"", &identity_hash).unwrap();
     assert!(io.out.is_empty());
 }
 
@@ -1387,7 +1393,7 @@ fn confirm_implicit_prompts_with_banner() {
         is_pick: false,
     }];
     let mut io = Io::canned(&["y"]);
-    confirm_implicit_sets(&mut io, &sets, &commits, "\"a\"", &|hash| hash.to_string()).unwrap();
+    confirm_implicit_sets(&mut io, &sets, &commits, "\"a\"", &identity_hash).unwrap();
     assert!(io.out.stdout.contains("** IMPLICIT COMMITS **"));
     assert!(io.out.stdout.contains("Continue with this mapping"));
 }
@@ -2473,7 +2479,7 @@ fn git_execute_merge_squashes_and_merges() {
         Some(&cursor),
         true,
         false,
-        &|_| Ok("again".to_string()), // LCOV_EXCL_LINE // Reason: message closure never invoked; the empty-diff error precedes the merge
+        &stub_commit_message,
     )
     .unwrap_err();
     assert!(err.contains("produces an empty diff"));
@@ -2632,16 +2638,23 @@ fn hg_merge_and_push_surface_limits() {
             Some("bbb"),
             false,
             None,
-            &|_| { Ok("m".to_string()) } // LCOV_EXCL_LINE // Reason: message closure never invoked; the strategy error precedes the merge
+            &stub_commit_message,
         )
         .unwrap_err(),
         "TODO: Support merge strategies"
     );
     let mut io = Io::canned(&[]);
     assert!(
-        hg_execute_merge(&dir, &mut io, &set, &commits, None, true, None, &|_| {
-            Ok("m".to_string()) // LCOV_EXCL_LINE // Reason: closure body never invoked on this error path
-        })
+        hg_execute_merge(
+            &dir,
+            &mut io,
+            &set,
+            &commits,
+            None,
+            true,
+            None,
+            &stub_commit_message
+        )
         .is_err()
     );
     let mut io = Io::canned(&[]);
@@ -3338,7 +3351,7 @@ fn r3_land16_build_searches_paginate() {
             (METHOD_BUILDPLAN_SEARCH, _) => Ok(serde_json::json!({"data": [
                 {"phid": "PHID-HMPA-2", "fields": {"behaviors": {"arc-land": {"value": "never"}}}},
             ]})),
-            _ => Err(format!("unexpected conduit call {method}")), // LCOV_EXCL_LINE // Reason: defensive arm; the test issues only expected conduit calls
+            _ => Err(format!("unexpected conduit call {method}")),
         }
     };
     let revisions = vec![
@@ -3361,6 +3374,11 @@ fn r3_land16_build_searches_paginate() {
             "harbormaster.buildplan.search p1",
             "harbormaster.buildplan.search p2",
         ]
+    );
+    // The defensive arm fires on unknown methods.
+    assert_eq!(
+        call("nope.unknown", &serde_json::json!({})).unwrap_err(),
+        "unexpected conduit call nope.unknown"
     );
 }
 
@@ -4017,7 +4035,7 @@ fn land43_squash_rebase_failure_is_a_conflict() {
         Some(&into),
         true,
         false,
-        &|_| Ok("Landed message".to_string()), // LCOV_EXCL_LINE // Reason: message closure never invoked; the merge conflict precedes the merge
+        &stub_commit_message,
     )
     .unwrap_err();
     assert_eq!(err, "Encountered a merge conflict.");
@@ -4079,7 +4097,7 @@ fn land43_merge_commit_range_conflicts_like_ceb() {
         Some(&into),
         true,
         false,
-        &|_| Ok("Landed message".to_string()), // LCOV_EXCL_LINE // Reason: message closure never invoked; the merge conflict precedes the merge
+        &stub_commit_message,
     )
     .unwrap_err();
     assert_eq!(err, "Encountered a merge conflict.");
@@ -4186,7 +4204,7 @@ fn land33_hint_tracks_unpushed_sets() {
         Some(&into),
         true,
         false,
-        &|_| Ok("Landed".to_string()), // LCOV_EXCL_LINE // Reason: message closure never invoked; the error precedes the merge
+        &stub_commit_message,
     )
     .unwrap_err();
     assert!(!io.out.stdout.contains("--incremental"));
@@ -4199,7 +4217,7 @@ fn land33_hint_tracks_unpushed_sets() {
         Some(&into),
         true,
         true,
-        &|_| Ok("Landed".to_string()), // LCOV_EXCL_LINE // Reason: message closure never invoked; the error precedes the merge
+        &stub_commit_message,
     )
     .unwrap_err();
     assert!(io.out.stdout.contains("--incremental"));
@@ -6477,7 +6495,7 @@ fn t1170_git_execute_merge_conflict_reports_symbols() {
             Some(&master),
             false,
             true,
-            &|_| { Ok("msg".to_string()) } // LCOV_EXCL_LINE // Reason: message closure never invoked; the merge conflict precedes the merge
+            &stub_commit_message,
         )
         .unwrap_err(),
         "Encountered a merge conflict."
@@ -6557,7 +6575,7 @@ fn t1170_git_merge_diff_query_failure() {
             Some("def"),
             false,
             false,
-            &|_| { Ok("msg".to_string()) } // LCOV_EXCL_LINE // Reason: message closure never invoked; the error precedes the merge
+            &stub_commit_message,
         )
         .is_err()
     );
@@ -7478,7 +7496,7 @@ fn t1170_build_sets_offline_groups_unassociated() {
         &validated,
         &mut commits,
         None,
-        &|hash| hash.to_string(), // LCOV_EXCL_LINE // Reason: formatter never invoked; this build path formats no hashes
+        &identity_hash,
     )
     .unwrap();
     assert_eq!(sets.len(), 1);
@@ -7615,7 +7633,7 @@ fn t1170_build_sets_online_reports_conduit_failure() {
         &validated,
         &mut commits,
         Some(&client),
-        &|hash| hash.to_string(), // LCOV_EXCL_LINE // Reason: formatter never invoked; the transport failure precedes formatting
+        &identity_hash,
     )
     .unwrap_err();
     assert!(!err.is_empty(), "expected the transport failure");
@@ -8512,4 +8530,282 @@ fn t1176_s11c_hg_engine_into_remote_checks_fetchable() {
             "differential.getcommitmessage",
         ]
     );
+}
+
+// T1176 PB-1: companions for the demarked prompt-reader seam,
+// silent-git seam, EPIPE pin, and consolidated message/formatter
+// helpers (each sibling drives the success/formatting path whose
+// error-path twin never invoked the helper).
+
+#[test]
+fn t1176_read_answer_line_trims_bytes_and_reports_eof() {
+    let mut bytes = std::io::Cursor::new("y\n");
+    assert_eq!(read_answer_line(&mut bytes), Some("y".to_string()));
+    let mut crlf = std::io::Cursor::new("n\r\n");
+    assert_eq!(read_answer_line(&mut crlf), Some("n".to_string()));
+    let mut empty = std::io::Cursor::new("");
+    assert_eq!(read_answer_line(&mut empty), None);
+}
+
+#[test]
+fn t1176_read_answer_line_maps_errors_to_none() {
+    struct FailingReader;
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("boom"))
+        }
+    }
+    impl std::io::BufRead for FailingReader {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            Err(std::io::Error::other("boom"))
+        }
+        fn consume(&mut self, _amount: usize) {}
+    }
+    assert_eq!(read_answer_line(&mut FailingReader), None);
+    // Supertrait stubs: `read`/`consume` never run in the flow above
+    // (`read_line` only needs `fill_buf`), so drive them directly.
+    let mut reader = FailingReader;
+    assert!(std::io::Read::read(&mut reader, &mut [0u8; 4]).is_err());
+    std::io::BufRead::consume(&mut reader, 1);
+}
+
+#[test]
+#[should_panic(expected = "fail only as EPIPE")]
+fn t1176_pipe_write_non_epipe_is_unreachable() {
+    assert_pipe_write_is_epipe(&std::io::Error::other("boom"));
+}
+
+#[test]
+fn t1176_pipe_write_epipe_is_benign() {
+    assert_pipe_write_is_epipe(&std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        "closed",
+    ));
+}
+
+#[test]
+#[cfg(unix)]
+fn t1176_git_read_raw_commit_reports_silent_failure() {
+    // A git that fails silently (nonzero, empty output): the fallback
+    // names the hash instead of echoing an empty detail.
+    let dir = temp_dir("t1176-catfile-silent");
+    let script = dir.join("fakegit.sh");
+    std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert_eq!(
+        git_read_raw_commit_with(&dir, "abc123", Some(&script)).unwrap_err(),
+        "git cat-file commit abc123 failed"
+    );
+}
+
+#[test]
+fn t1176_git_execute_merge_stub_message_squash_lands() {
+    // Siblings of the squash error-path closures (empty-diff, conflicts,
+    // into errors): a clean squash lands, invoking the helper.
+    let repo = make_repo("t1176-merge-stub-squash");
+    let master = git(&repo, &["rev-parse", "master"]);
+    git(&repo, &["checkout", "-b", "feature"]);
+    let tip = commit_file(&repo, "f.txt", "f\n", "feature work");
+    let commits = vec![land_commit(&tip, &[&master], "feature work")];
+    let set = CommitSet {
+        revision: None,
+        commits: vec![0],
+        is_pick: false,
+    };
+    let mut io = Io::canned(&[]);
+    let cursor = git_execute_merge(
+        &repo,
+        &mut io,
+        &set,
+        &commits,
+        Some(&master),
+        true,
+        false,
+        &stub_commit_message,
+    )
+    .unwrap();
+    assert_eq!(
+        git(&repo, &["log", "--format=%s", "-n1", &cursor]),
+        "stub landed message"
+    );
+}
+
+#[test]
+fn t1176_git_execute_merge_stub_message_merge_lands() {
+    // Siblings of the merge-strategy error-path closures (conflict,
+    // norepo error): a clean merge lands, invoking the helper.
+    let repo = make_repo("t1176-merge-stub-merge");
+    let master = git(&repo, &["rev-parse", "master"]);
+    git(&repo, &["checkout", "-b", "feature"]);
+    let tip = commit_file(&repo, "g.txt", "g\n", "feature work");
+    let commits = vec![land_commit(&tip, &[&master], "feature work")];
+    let set = CommitSet {
+        revision: None,
+        commits: vec![0],
+        is_pick: false,
+    };
+    let mut io = Io::canned(&[]);
+    let cursor = git_execute_merge(
+        &repo,
+        &mut io,
+        &set,
+        &commits,
+        Some(&master),
+        false,
+        false,
+        &stub_commit_message,
+    )
+    .unwrap();
+    let parents = git(&repo, &["rev-list", "--parents", "-n1", &cursor]);
+    assert_eq!(parents.split_whitespace().count(), 3);
+    assert_eq!(
+        git(&repo, &["log", "--format=%s", "-n1", &cursor]),
+        "stub landed message"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn t1176_hg_execute_merge_valid_strategy_succeeds() {
+    // Sibling of the strategy-error arm (squash=false): squash=true
+    // drives the rebase to success through the fake hg.
+    let dir = temp_dir("t1176-hg-strategy");
+    let message_file = dir.join("message");
+    let hg_cmd = fake_hg(
+        &dir,
+        "fakehg.sh",
+        &format!(
+            "if has rebase; then\n  cat > \"{message}\"; exit 0\nfi\n\
+             if has bookmarks; then exit 0; fi\n\
+             if has update; then exit 0; fi\n\
+             if has log; then printf 'tiphash'; exit 0; fi\nexit 1\n",
+            message = message_file.display(),
+        ),
+    );
+    let commits = vec![land_commit("aaa", &[], "first")];
+    let set = CommitSet {
+        revision: None,
+        commits: vec![0],
+        is_pick: false,
+    };
+    let mut io = Io::canned(&[]);
+    let tip = hg_execute_merge_with(
+        &dir,
+        &hg_cmd,
+        &mut io,
+        &set,
+        &commits,
+        Some("iii"),
+        true,
+        None,
+        &stub_commit_message,
+    )
+    .unwrap();
+    assert_eq!(tip, "tiphash");
+    assert_eq!(
+        std::fs::read_to_string(&message_file).unwrap(),
+        "stub landed message"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn t1176_hg_execute_merge_into_commit_restores_bookmarks() {
+    // Sibling of the into-None error arm: a real into commit plus branch
+    // marker drives the rebase to success and moves back the bookmark
+    // sitting on the obsolete range.
+    let dir = temp_dir("t1176-hg-into");
+    let calls = dir.join("calls");
+    let message_file = dir.join("message");
+    let hg_cmd = fake_hg(
+        &dir,
+        "fakehg.sh",
+        &format!(
+            "if has rebase; then\n  if has --abort; then printf 'abort\\n' >> \"{calls}\"; exit 0; fi\n  \
+             cat > \"{message}\"; printf 'rebase\\n' >> \"{calls}\"; exit 0\nfi\n\
+             if has bookmarks; then printf '   keep  1:aaa\\n'; exit 0; fi\n\
+             if has bookmark; then printf 'bookmark %s\\n' \"$*\" >> \"{calls}\"; exit 0; fi\n\
+             if has update; then printf 'update\\n' >> \"{calls}\"; exit 0; fi\n\
+             if has branch; then printf 'branch\\n' >> \"{calls}\"; exit 0; fi\n\
+             if has log; then\n  {rev}\n  if [ \"$rev\" = \"tip\" ]; then printf 'cccnewtip'; exit 0; fi\n  \
+             printf 'aaa'; exit 0\nfi\nexit 1\n",
+            calls = calls.display(),
+            message = message_file.display(),
+            rev = FAKE_HG_REV_LOOP,
+        ),
+    );
+    let commits = vec![
+        land_commit("aaa", &[], "first"),
+        land_commit("bbb", &["aaa"], "second"),
+    ];
+    let set = CommitSet {
+        revision: None,
+        commits: vec![0, 1],
+        is_pick: false,
+    };
+    let mut io = Io::canned(&[]);
+    let tip = hg_execute_merge_with(
+        &dir,
+        &hg_cmd,
+        &mut io,
+        &set,
+        &commits,
+        Some("iii"),
+        true,
+        Some("stable"),
+        &stub_commit_message,
+    )
+    .unwrap();
+    assert_eq!(tip, "cccnewtip");
+    assert_eq!(
+        std::fs::read_to_string(&message_file).unwrap(),
+        "stub landed message"
+    );
+    let calls = std::fs::read_to_string(&calls).unwrap();
+    assert!(calls.contains("update"), "{calls}");
+    assert!(calls.contains("branch"), "{calls}");
+    assert!(calls.contains("rebase"), "{calls}");
+    assert!(calls.contains("--force --rev aaa -- keep"), "{calls}");
+}
+
+#[test]
+#[cfg(unix)]
+fn t1176_build_sets_healthy_transport_formats_unknown_hash() {
+    // Siblings of the non-formatting build paths (offline sets,
+    // transport failure): healthy transport that knows no revision for
+    // the commit fails grouping with UNKNOWN REVISION, formatting the
+    // hash through the consolidated helper.
+    let repo = make_repo("t1176-sets-healthy");
+    let tip = commit_file(&repo, "f.txt", "f\n", "feature work");
+    let mut routes = std::collections::HashMap::new();
+    routes.insert("differential.query".to_string(), s11c_envelope("[]"));
+    let (base, rx) = s11c_serve_routes(routes, 1);
+    let client = arc_rs::conduit::Client::new(&format!("{base}api/"), "token").unwrap();
+    let validated = Validated {
+        strategy: Strategy::Squash,
+        revision: None,
+        revision_raw: None,
+    };
+    let mut commits = vec![land_commit(&tip, &[], "feature work")];
+    let mut io = Io::canned(&[]);
+    let err = build_sets(
+        &repo,
+        &mut io,
+        Vcs::Git,
+        &validated,
+        &mut commits,
+        Some(&client),
+        &identity_hash,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        format!("Unable to determine revision for commit \"{tip}\".")
+    );
+    assert!(io.out.stdout.contains("** UNKNOWN REVISION **"));
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(seen, vec!["differential.query".to_string()]);
 }

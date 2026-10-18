@@ -919,3 +919,99 @@ fn git_helper_reports_failing_commands() {
     let tmp = TempDir::new("w6h-git-fail");
     git(tmp.path(), &["--bogus-flag-xyz"]);
 }
+
+/// A fixture-local fake `git` program running `body` (Unix-only: the
+/// seam passes a script path, which needs a shebang plus `+x`).
+#[cfg(unix)]
+fn write_fake_git(dir: &Path, body: &str) -> PathBuf {
+    let script = dir.join("git");
+    std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+    script
+}
+
+#[cfg(unix)]
+#[test]
+fn read_commit_empty_rev_parse_output_is_unknown() {
+    // White-box: real rev-parse always prints the hash on success, so
+    // the empty-output arm is reachable only behind a fake backend.
+    let tmp = TempDir::new("git-empty-hash");
+    let fake = write_fake_git(
+        tmp.path(),
+        r#"if [ "$1" = "rev-parse" ] && [ "$2" = "--is-inside-work-tree" ]; then
+  printf 'true\n'
+  exit 0
+fi
+exit 0"#,
+    );
+    assert_eq!(
+        read_commit_with(tmp.path(), "HEAD", Some(&fake)),
+        Err("unknown commit \"HEAD\".".to_string())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn read_commit_seam_reads_hash_and_message() {
+    // The seam preserves the success path: hash plus message from the
+    // fake backend, and the outside-a-work-tree rejection.
+    let tmp = TempDir::new("git-hash");
+    let fake = write_fake_git(
+        tmp.path(),
+        r#"if [ "$1" = "rev-parse" ] && [ "$2" = "--is-inside-work-tree" ]; then
+  printf 'true\n'
+  exit 0
+fi
+if [ "$1" = "rev-parse" ]; then
+  printf 'abc123\n'
+  exit 0
+fi
+printf 'the message\n'"#,
+    );
+    assert_eq!(
+        read_commit_with(tmp.path(), "HEAD", Some(&fake)),
+        Ok(CommitInfo {
+            hash: "abc123".to_string(),
+            message: "the message".to_string(),
+        })
+    );
+    // A backend that fails the work-tree probe rejects the read, like
+    // running outside a working copy (staged aside: same script name).
+    let side = tmp.path().join("side");
+    std::fs::create_dir_all(&side).unwrap();
+    let outside = write_fake_git(&side, "exit 1");
+    assert_eq!(
+        read_commit_with(tmp.path(), "HEAD", Some(&outside)),
+        Err(
+            "\"arc inspect\" must be run in a Git working copy to inspect \"working-copy(...)\"."
+                .to_string()
+        )
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn git_stdout_text_failure_without_output_falls_back_to_command() {
+    // Failure with empty stdout+stderr yields the `git <args> failed`
+    // fallback instead of an empty message.
+    let tmp = TempDir::new("git-empty-fail");
+    let fake = write_fake_git(tmp.path(), "exit 1");
+    assert_eq!(
+        git_stdout_text(tmp.path(), &["rev-parse", "HEAD"], Some(&fake)),
+        Err("git rev-parse HEAD failed".to_string())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn git_inside_work_tree_spawn_failure_is_outside() {
+    // An unspawnable git program fails the probe: outside a work tree.
+    let tmp = TempDir::new("git-missing-program");
+    assert!(!git_inside_work_tree(
+        tmp.path(),
+        Some(&tmp.path().join("no-such-git"))
+    ));
+}

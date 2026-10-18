@@ -4426,14 +4426,18 @@ fn cov6g_normalize_lexical_skips_current_dir_segments() {
 #[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(unix)]
-static COV6G_COUNTER: AtomicU64 = AtomicU64::new(0);
+// -( T1176 PB-2: hg/git backends, deleted-cwd, ETXTBSY split )----------------
 
 #[cfg(unix)]
-fn cov6g_temp_dir(name: &str) -> PathBuf {
-    let id = COV6G_COUNTER.fetch_add(1, Ordering::SeqCst);
+static PB2_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// House scratch dir (pid + per-file counter); any stale run is
+/// removed first so it never leaks into the next.
+#[cfg(unix)]
+fn pb2_temp_dir(name: &str) -> PathBuf {
+    let id = PB2_COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!(
-        "arc_rs_lint_cov6g_{}_{}_{}",
+        "arc_rs_lint_pb2_{}_{}_{}",
         std::process::id(),
         id,
         name
@@ -4443,17 +4447,140 @@ fn cov6g_temp_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// Write `contents` to `dir`/`name`, returning the path.
+#[cfg(unix)]
+fn pb2_write(dir: &Path, name: &str, contents: &str) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, contents).unwrap();
+    path
+}
+
 #[test]
 #[cfg(unix)]
-fn cov6g_spawn_with_retry_reports_text_file_busy() {
-    // T1170 wave 6g: hold a script open for writing while spawning it.
-    // Linux exec fails with ETXTBSY (errno 26), exercising the retry
-    // arm; other unix spawns succeed. Either outcome passes, so the
-    // test is deterministic on every unix.
+fn pb2_hg_base_for_explicit_rev_resolves_node() {
+    // Fake `hg` answers the ancestor probe with a node, covering the
+    // explicit-rev arm of `hg_base_for_with`.
+    let dir = pb2_temp_dir("hg-explicit");
+    let fake = pb2_write(
+        &dir,
+        "fakehg.sh",
+        "#!/bin/sh\nprintf '0123456789abcdef0123456789abcdef01234567\\n'\nexit 0\n",
+    );
+    chmod_exec(&fake);
+    let hg_cmd = hg::HgCommand::custom(fake.to_str().unwrap(), &[]);
+    let work = WorkCopy {
+        vcs: Vcs::Hg,
+        vcs_root: dir.clone(),
+        project_root: dir.clone(),
+    };
+    assert_eq!(
+        hg_base_for_with(&work, Some("tip"), &hg_cmd).unwrap(),
+        "0123456789abcdef0123456789abcdef01234567"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn pb2_hg_base_for_auto_base_reports_no_outgoing() {
+    // Fake `hg` answers `branch` plus an empty draft log, covering
+    // the automatic-base arm: no outgoing commits means the working
+    // rev. The draft probe also matches `branch`, so it sorts first.
+    let dir = pb2_temp_dir("hg-auto");
+    let fake = pb2_write(
+        &dir,
+        "fakehg.sh",
+        "#!/bin/sh\ncase \" $* \" in\n*draft*) exit 0;;\n*) printf 'default\\n';;\nesac\nexit 0\n",
+    );
+    chmod_exec(&fake);
+    let hg_cmd = hg::HgCommand::custom(fake.to_str().unwrap(), &[]);
+    let work = WorkCopy {
+        vcs: Vcs::Hg,
+        vcs_root: dir.clone(),
+        project_root: dir.clone(),
+    };
+    assert_eq!(hg_base_for_with(&work, None, &hg_cmd).unwrap(), ".");
+}
+
+#[test]
+#[cfg(unix)]
+fn pb2_amend_git_head_silent_failure_reports_bare_error() {
+    // A failing `git add -u` with empty stderr (a silent kill)
+    // reports the bare error, covering the empty-stderr arm.
+    let dir = pb2_temp_dir("git-silent");
+    let fake = pb2_write(&dir, "fakegit.sh", "#!/bin/sh\nexit 1\n");
+    chmod_exec(&fake);
+    assert_eq!(
+        amend_git_head_with(&dir, Some(&fake)).unwrap_err(),
+        "git add -u failed"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn pb2_amend_git_head_add_success_reaches_amend() {
+    // A succeeding `git add -u` continues into `git commit --amend`,
+    // which fails outside any repository; the temp dir sits outside
+    // every worktree, so `git` never touches real VCS state.
+    let dir = pb2_temp_dir("git-amend");
+    let fake = pb2_write(&dir, "fakegit.sh", "#!/bin/sh\nexit 0\n");
+    chmod_exec(&fake);
+    assert!(amend_git_head_with(&dir, Some(&fake)).is_err());
+}
+
+/// Deleted-cwd driver: re-executes the probe below under a removed
+/// cwd, so `current_dir()` fails without mutating this process. The
+/// child is the same instrumented test binary, so its profile covers
+/// `run`'s getcwd error arm.
+#[test]
+#[cfg(unix)]
+fn pb2_lint_run_reports_deleted_cwd() {
+    let exe = std::env::current_exe().expect("test binary path");
+    let exe = exe.to_str().expect("utf-8 test binary path");
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "d=$(mktemp -d); cd $d; rmdir $d; exec \"{exe}\" --nocapture pb2_lint_run_deleted_cwd_probe"
+        ))
+        .env("ARC_RS_PB2_GETCWD_CHILD", "1")
+        .output()
+        .expect("spawn deleted-cwd child");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success()
+            && stdout.contains("1 passed")
+            && stdout.contains("PB2-GETCWD-OK")
+            && stderr.contains("cannot determine current directory"),
+        "deleted-cwd child failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+}
+
+/// Deleted-cwd probe: a no-op in parent runs; under the driver's
+/// removed cwd (`ARC_RS_PB2_GETCWD_CHILD`) it pins `run`'s getcwd
+/// error report.
+#[test]
+#[cfg(unix)]
+fn pb2_lint_run_deleted_cwd_probe() {
+    if std::env::var_os("ARC_RS_PB2_GETCWD_CHILD").is_none() {
+        return;
+    }
+    assert!(
+        std::env::current_dir().is_err(),
+        "probe cwd should be deleted"
+    );
+    let code = run(&[]);
+    assert_eq!(code, std::process::ExitCode::FAILURE);
+    println!("PB2-GETCWD-OK");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn pb2_spawn_with_retry_reports_text_file_busy() {
+    // Linux-only: exec of a script held open for writing fails with
+    // ETXTBSY (errno 26), so the error arm is deterministic here.
     use std::os::unix::fs::PermissionsExt;
-    let dir = cov6g_temp_dir("etxtbsy");
-    let script = dir.join("busy.sh");
-    std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+    let dir = pb2_temp_dir("etxtbsy-busy");
+    let script = pb2_write(&dir, "busy.sh", "#!/bin/sh\necho hi\n");
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     let _held = std::fs::OpenOptions::new()
         .write(true)
@@ -4461,20 +4588,34 @@ fn cov6g_spawn_with_retry_reports_text_file_busy() {
         .unwrap();
     let mut cmd = Command::new(&script);
     cmd.current_dir(&dir);
-    match spawn_with_retry(&mut cmd) {
-        // LCOV_EXCL_START // Reason: ETXTBSY error arm; macOS exec never reports text-file-busy
-        Err(error) => assert_eq!(
-            error.raw_os_error(), // LCOV_EXCL_STOP
-            Some(26),
-            "expected ETXTBSY, got {error}"
-        ),
-        // LCOV_EXCL_START // Reason: ETXTBSY always fires on Linux (write handle held at exec), so the Ok arm only runs where text-file-busy does not apply (macOS)
-        Ok(output) => assert!(
-            output.status.success(),
-            "script should run where ETXTBSY does not apply: {output:?}"
-        ),
-        // LCOV_EXCL_STOP
-    }
+    let error = spawn_with_retry(&mut cmd).unwrap_err();
+    assert_eq!(
+        error.raw_os_error(),
+        Some(26),
+        "expected ETXTBSY, got {error}"
+    );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn pb2_spawn_with_retry_succeeds_where_no_text_file_busy() {
+    // macOS-only: exec never reports text-file-busy, so the held-open
+    // script runs and the Ok arm is deterministic here.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = pb2_temp_dir("etxtbsy-ok");
+    let script = pb2_write(&dir, "busy.sh", "#!/bin/sh\necho hi\n");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _held = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&script)
+        .unwrap();
+    let mut cmd = Command::new(&script);
+    cmd.current_dir(&dir);
+    let output = spawn_with_retry(&mut cmd).unwrap();
+    assert!(
+        output.status.success(),
+        "script should run where ETXTBSY does not apply: {output:?}"
+    );
 }
 // -( T1170 wave 6h: helper-arm coverage )--------------------------------------
 

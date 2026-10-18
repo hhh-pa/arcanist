@@ -60,12 +60,31 @@ fn lookup_miss_reports_no_tool() {
     assert!(find_on_path("arc-rs-definitely-missing-tool").is_none());
 }
 
-#[cfg(unix)]
+// -( T1176 PC-2: demark tty-commands )-----------------------------------------
+
+#[test]
+fn resolve_binary_falls_back_to_path_lookup() {
+    // The default linter delegates to the PATH lookup; both calls run
+    // the same lookup, so they agree without depending on ambient PATH
+    // contents.
+    assert_eq!(JshintLinter::new().resolve_binary(), find_on_path(BINARY));
+}
+
+#[test]
+fn find_on_path_matches_absolute_paths() {
+    // An absolute candidate survives the directory join, so a temp
+    // file exercises the hit arm without touching PATH.
+    let tmp = TempDir::new("path-hit");
+    let tool = tmp.path().join("probe-target");
+    std::fs::write(&tool, b"x").unwrap();
+    let absolute = tool.to_string_lossy().to_string();
+    assert_eq!(find_on_path(&absolute), Some(tool));
+}
+
 struct TempDir {
     path: PathBuf,
 }
 
-#[cfg(unix)]
 impl TempDir {
     fn new(tag: &str) -> Self {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -83,7 +102,6 @@ impl TempDir {
     }
 }
 
-#[cfg(unix)]
 impl Drop for TempDir {
     fn drop(&mut self) {
         std::fs::remove_dir_all(&self.path).ok();

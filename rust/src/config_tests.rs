@@ -449,6 +449,42 @@ fn serve_once(body: String) -> String {
     base
 }
 
+/// House scratch dir (pid + per-file counter); removed on drop.
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-config-pc1-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+/// Take the PC-1 serial-env lock, tolerating a poisoned mutex (a
+/// panicked sibling still restored its var via its guard's `Drop`).
+fn pc1_serial() -> std::sync::MutexGuard<'static, ()> {
+    PC1_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn core9_authenticate_maps_unknown_failures_raw() {
     // A `conduit.connect` failure outside the three credential codes
@@ -465,4 +501,96 @@ fn core9_authenticate_maps_unknown_failures_raw() {
     let err = authenticate(&mut client, &creds, "test").unwrap_err();
     assert!(matches!(err.kind, crate::conduit::EnvelopeKind::Exception));
     assert!(err.message.contains("ERR-OTHER"), "{}", err.message);
+}
+
+// -( T1176 PC-1: env-globals )------------------------------------------------
+
+/// Home env key `arcrc_path()` reads on this platform.
+#[cfg(windows)]
+const HOME_KEY: &str = "USERPROFILE";
+#[cfg(not(windows))]
+const HOME_KEY: &str = "HOME";
+
+#[test]
+fn pc1_arcrc_path_without_home_returns_none() {
+    // Serial: staging HOME is process-global mutation, so one lock
+    // spans both windows and each guard restores on drop.
+    let _serial = pc1_serial();
+    let home = TempDir::new("home");
+    let guard = Pc1EnvGuard::remove(HOME_KEY);
+    let saved = guard.saved().map(|value| value.to_os_string());
+    assert_eq!(arcrc_path(), None);
+    drop(guard);
+    assert_eq!(std::env::var_os(HOME_KEY), saved);
+    // Staging-home companion: a set HOME resolves `~/.arcrc`.
+    let guard = Pc1EnvGuard::set(HOME_KEY, home.path().as_os_str());
+    assert_eq!(arcrc_path(), Some(home.path().join(".arcrc")));
+    let saved = guard.saved().map(|value| value.to_os_string());
+    drop(guard);
+    assert_eq!(std::env::var_os(HOME_KEY), saved);
+}
+
+#[test]
+fn pc1_global_load_options_without_channel_reads_default() {
+    let _serial = pc1_serial();
+    let guard = Pc1EnvGuard::remove("ARC_GLOBAL_LOAD_OPTIONS");
+    let opts = global_load_options();
+    assert!(opts.runtime.is_empty());
+    assert!(opts.config_files.is_empty());
+    assert_eq!(opts.arcrc_file, None);
+    let saved = guard.saved().map(|value| value.to_os_string());
+    drop(guard);
+    assert_eq!(std::env::var_os("ARC_GLOBAL_LOAD_OPTIONS"), saved);
+}
+
+#[test]
+fn pc1_global_load_options_with_channel_parses() {
+    let _serial = pc1_serial();
+    let raw = r#"{"runtime": {"phabricator.uri": "https://rt.example/"}, "config_files": ["a.json", 42], "arcrc_file": "u.json"}"#;
+    let guard = Pc1EnvGuard::set("ARC_GLOBAL_LOAD_OPTIONS", std::ffi::OsStr::new(raw));
+    let opts = global_load_options();
+    assert_eq!(
+        opts.runtime.get("phabricator.uri"),
+        Some(&serde_json::json!("https://rt.example/"))
+    );
+    assert_eq!(opts.config_files, vec![PathBuf::from("a.json")]);
+    assert_eq!(opts.arcrc_file, Some(PathBuf::from("u.json")));
+    let saved = guard.saved().map(|value| value.to_os_string());
+    drop(guard);
+    assert_eq!(std::env::var_os("ARC_GLOBAL_LOAD_OPTIONS"), saved);
+}
+
+#[test]
+fn pc1_parse_load_options_json_fixture_matrix() {
+    // Full document.
+    let opts = parse_load_options_json(
+        r#"{"runtime": {"a": 1}, "config_files": ["x", "y"], "arcrc_file": "z"}"#,
+    );
+    assert_eq!(opts.runtime.len(), 1);
+    assert_eq!(
+        opts.config_files,
+        vec![PathBuf::from("x"), PathBuf::from("y")]
+    );
+    assert_eq!(opts.arcrc_file, Some(PathBuf::from("z")));
+    // Missing keys read empty.
+    let opts = parse_load_options_json("{}");
+    assert!(opts.runtime.is_empty());
+    assert!(opts.config_files.is_empty());
+    assert_eq!(opts.arcrc_file, None);
+    // Mistyped values read empty (only the dispatcher writes this
+    // channel, so leniency mirrors the pre-extraction behavior).
+    let opts =
+        parse_load_options_json(r#"{"runtime": [1], "config_files": {"x": 1}, "arcrc_file": 7}"#);
+    assert!(opts.runtime.is_empty());
+    assert!(opts.config_files.is_empty());
+    assert_eq!(opts.arcrc_file, None);
+    // Non-string list members drop; unparseable input reads default.
+    let opts = parse_load_options_json(r#"{"config_files": ["x", null, 3]}"#);
+    assert_eq!(opts.config_files, vec![PathBuf::from("x")]);
+    for raw in ["not json", "", "42", "[1]"] {
+        let opts = parse_load_options_json(raw);
+        assert!(opts.runtime.is_empty(), "for {raw:?}");
+        assert!(opts.config_files.is_empty(), "for {raw:?}");
+        assert_eq!(opts.arcrc_file, None, "for {raw:?}");
+    }
 }

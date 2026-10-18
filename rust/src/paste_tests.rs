@@ -812,3 +812,124 @@ fn input_read_error_reports_open_failure() {
     let err = read_input_file(tmp.path(), "/proc/self/mem").unwrap_err();
     assert!(err.contains("Failed to read file"), "{err}");
 }
+
+/// The symlink-parent fallback covers a TOCTOU race only: the parent
+/// exists for `is_symlink` but vanishes before `canonicalize`. A
+/// racing renamer flips the parent aside while the resolver loops, so
+/// a flip eventually lands inside the window. Detection is exact:
+/// every other arm returns a canonicalized path (through the `real`
+/// directory), while only the fallback returns the purely lexical
+/// join (through the `alias` symlink).
+#[cfg(unix)]
+#[test]
+fn toctou_symlink_parent_falls_back_to_lexical_join() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let tmp = TempDir::new("toctou");
+    let real = tmp.path().join("real");
+    let race = real.join("race");
+    let parent_a = race.join("a");
+    let parent_b = race.join("b");
+    std::fs::create_dir_all(&parent_a).unwrap();
+    std::fs::write(real.join("target.txt"), b"data").unwrap();
+    std::os::unix::fs::symlink(real.join("target.txt"), parent_a.join("link.txt")).unwrap();
+    let alias = tmp.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let renamer_stop = Arc::clone(&stop);
+    let renamer = std::thread::spawn(move || {
+        while !renamer_stop.load(Ordering::Relaxed) {
+            std::fs::rename(&parent_a, &parent_b).ok();
+            std::fs::rename(&parent_b, &parent_a).ok();
+        }
+    });
+
+    // Only the fallback returns this purely lexical string: every
+    // other arm canonicalizes, which resolves `alias` to `real`.
+    let lexical = alias
+        .join("race")
+        .join("a")
+        .join("link.txt")
+        .to_string_lossy()
+        .to_string();
+    let mut hit = false;
+    for _ in 0..500_000 {
+        if resolve_input_path(&alias, "race/a/link.txt") == lexical {
+            hit = true;
+            break;
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    renamer.join().unwrap();
+    assert!(hit, "racing renamer never landed in the TOCTOU window");
+}
+
+/// Probe child for [`real_stdin_arm_reads_piped_stdin`]: in-process it
+/// is a no-op (real stdin belongs to the runner); the parent re-runs
+/// it in a subprocess with piped stdin.
+#[test]
+fn paste_stdin_probe_child() {
+    if std::env::var("ARC_RS_PASTE_STDIN_PROBE").is_err() {
+        return;
+    }
+    let tmp = TempDir::new("stdin-probe");
+    let opts = args_of(&["--"]);
+    let bytes = read_create_bytes(tmp.path(), &opts, None).expect("piped stdin");
+    println!("PASTE-STDIN-PROBE-OK len={}", bytes.len());
+}
+
+#[test]
+fn real_stdin_arm_reads_piped_stdin() {
+    // The real-stdin arm (`stdin_text: None`) reads piped bytes to
+    // EOF in a subprocess, leaving the runner's stdin alone.
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let exe = std::env::current_exe().expect("test binary path");
+    let mut child = Command::new(&exe)
+        .env("ARC_RS_PASTE_STDIN_PROBE", "1")
+        .args(["--nocapture", "paste_stdin_probe_child"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn probe child");
+    child
+        .stdin
+        .as_mut()
+        .expect("piped stdin")
+        .write_all(b"piped-paste-bytes")
+        .expect("write stdin");
+    drop(child.stdin.take());
+    let out = child.wait_with_output().expect("probe output");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("PASTE-STDIN-PROBE-OK len=17"),
+        "probe child failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+}
+
+#[test]
+fn execute_reads_symbol_through_staged_credentials() {
+    // The symbol read path resolves the client from staged
+    // credentials (never HOME) and echoes the content raw.
+    let tmp = TempDir::new("read-authed");
+    let hit = paste_p_envelope(
+        r#"{"data": [{"id": 5, "attachments": {"content": {"content": "raw-bytes"}}}]}"#,
+    );
+    let (base, rx) = serve_seq(vec![hit]);
+    let arcrc = fake_arcrc(&tmp.path, &base);
+    let text = execute_with_stdin_and_user_file(
+        tmp.path(),
+        &argv(&["--conduit-uri", base.as_str(), "P5", "--"]),
+        None,
+        Some(&arcrc),
+    )
+    .unwrap();
+    assert_eq!(text, "raw-bytes");
+    let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(seen.len(), 1);
+}

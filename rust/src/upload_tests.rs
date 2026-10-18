@@ -902,3 +902,32 @@ fn upload_read_error_reports_open_failure() {
     let err = read_upload_bytes(tmp.path(), "/proc/self/mem").unwrap_err();
     assert!(err.contains("failed to open"), "{err}");
 }
+
+// -( T1176 PC-2: demark tty-commands )-----------------------------------------
+
+#[test]
+fn progress_bar_draws_when_tty_is_forced() {
+    // The TTY body runs with injected state; cargo-test stderr stays
+    // piped, so `draw()` itself can never reach it.
+    let mut bar = ChunkProgress::new();
+    bar.set_total(4);
+    assert!(!bar.drawn);
+    bar.draw_with(true, 78);
+    assert!(bar.drawn);
+    assert!(bar.last_update.is_some());
+    bar.finish();
+}
+
+#[test]
+fn progress_bar_skips_without_total_tty_or_width() {
+    let mut bar = ChunkProgress::new();
+    bar.draw_with(true, 78);
+    assert!(!bar.drawn);
+    bar.set_total(4);
+    bar.draw_with(false, 78);
+    assert!(!bar.drawn);
+    assert!(bar.last_update.is_none());
+    bar.draw_with(true, 5);
+    assert!(!bar.drawn);
+    assert!(bar.last_update.is_none());
+}

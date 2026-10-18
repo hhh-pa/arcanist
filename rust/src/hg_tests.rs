@@ -1881,3 +1881,88 @@ fn apply_status_copy_source_dead_no_prev() {
     let mut map = std::collections::BTreeMap::new();
     let _ = apply_status_copy_source(&mut map, &None, "copy.txt", "  copy.txt");
 }
+// -( T1176 PC-2: demark tty-commands )------------------------------------------
+
+#[test]
+fn text_file_busy_matches_errno_26_on_unix_only() {
+    let busy = std::io::Error::from_raw_os_error(26);
+    let missing = std::io::Error::from_raw_os_error(2);
+    #[cfg(unix)]
+    {
+        assert!(is_text_file_busy(&busy));
+        assert!(!is_text_file_busy(&missing));
+    }
+    #[cfg(not(unix))]
+    {
+        assert!(!is_text_file_busy(&busy));
+        assert!(!is_text_file_busy(&missing));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn spawn_output_retries_txtbsy_to_success() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new("etxtbsy-retry");
+    let script = tmp.path().join("busy.sh");
+    std::fs::write(&script, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let held = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&script)
+        .unwrap();
+    // Probe: Linux must report ETXTBSY while the write handle is held;
+    // fail loud instead of passing without covering the retry arm.
+    match std::process::Command::new(&script).output() {
+        Err(error) if is_text_file_busy(&error) => {}
+        other => panic!("expected ETXTBSY probe failure, got {other:?}"),
+    }
+    // Release after 50ms; the retry loop must ride through to success.
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(held);
+        });
+        let output = spawn_output(&mut std::process::Command::new(&script))
+            .expect("retry must succeed after the write handle releases");
+        assert!(output.status.success());
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn spawn_output_with_limit_exhausts_txtbsy() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new("etxtbsy-limit");
+    let script = tmp.path().join("busy.sh");
+    std::fs::write(&script, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _held = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&script)
+        .unwrap();
+    let error = spawn_output_with_limit(&mut std::process::Command::new(&script), 3)
+        .expect_err("held write handle must keep failing with ETXTBSY");
+    assert!(is_text_file_busy(&error), "{error:?}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn spawn_output_passes_through_where_txtbsy_never_fires() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new("etxtbsy-passthrough");
+    let script = tmp.path().join("busy.sh");
+    std::fs::write(&script, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _held = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&script)
+        .unwrap();
+    // Probe: macOS exec succeeds despite the held write handle.
+    let probe = std::process::Command::new(&script)
+        .output()
+        .expect("probe spawns");
+    assert!(probe.status.success(), "expected passthrough success");
+    let output = spawn_output(&mut std::process::Command::new(&script)).unwrap();
+    assert!(output.status.success());
+}

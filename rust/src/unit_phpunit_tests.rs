@@ -296,6 +296,16 @@ fn default_engine_matches_new() {
     assert_eq!(defaulted.config_file, None);
 }
 
+fn missing_test_must_not_run(_: &[String], _: &str) -> CapturedOutput {
+    unreachable!("the missing test must not run")
+}
+
+#[test]
+#[should_panic(expected = "the missing test must not run")]
+fn missing_test_must_not_run_fires() {
+    let _ = missing_test_must_not_run(&[], "");
+}
+
 #[test]
 fn run_with_skips_missing_test_files() {
     // Selected `*Test.php` files resolve without a probe, so a
@@ -310,9 +320,7 @@ fn run_with_skips_missing_test_files() {
         enable_coverage: Some(false),
         ..EngineContext::new("/r")
     };
-    let runner = |_: &[String], _: &str| -> CapturedOutput {
-        panic!("the missing test must not run"); // LCOV_EXCL_LINE // Reason: must-not-run guard; the missing test never executes
-    };
+    let runner = missing_test_must_not_run;
     let results = engine.run_with(&ctx, &runner, &fs).unwrap();
     assert!(results.is_empty());
 }

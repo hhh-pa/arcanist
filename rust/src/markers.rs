@@ -516,23 +516,38 @@ fn arc_hg_content_tag() -> u64 {
 /// atomically installing it when the bytes differ. Best-effort:
 /// `None` leaves the caller to run bare.
 fn materialize_bundled_arc_hg() -> Option<PathBuf> {
-    let target = std::env::temp_dir().join(format!("arc-hg-{:016x}.py", arc_hg_content_tag()));
+    materialize_bundled_arc_hg_in(None)
+}
+
+/// [`materialize_bundled_arc_hg`] with an explicit base directory
+/// (test seam: `None` uses `std::env::temp_dir()`, the production
+/// behavior).
+fn materialize_bundled_arc_hg_in(temp_dir: Option<&Path>) -> Option<PathBuf> {
+    let dir = temp_dir.map_or_else(std::env::temp_dir, Path::to_path_buf);
+    let target = dir.join(format!("arc-hg-{:016x}.py", arc_hg_content_tag()));
     if std::fs::read(&target).is_ok_and(|bytes| bytes == ARC_HG_BUNDLED.as_bytes()) {
         return Some(target);
     }
     let tmp = target.with_extension(format!("{}.tmp", std::process::id()));
     if std::fs::write(&tmp, ARC_HG_BUNDLED).is_err() {
-        return None; // LCOV_EXCL_LINE // Reason: temp write failure; only a planted directory triggers it, racy under parallel tests
+        return None;
     }
     if std::fs::rename(&tmp, &target).is_err() {
-        std::fs::remove_file(&tmp).ok(); // LCOV_EXCL_START // Reason: rename-failure arm; only a planted directory or a racing installer triggers it
+        std::fs::remove_file(&tmp).ok();
         // A lost install race still converges when the winner matches.
-        if std::fs::read(&target).is_ok_and(|bytes| bytes == ARC_HG_BUNDLED.as_bytes()) {
-            return Some(target);
-        }
-        return None; // LCOV_EXCL_STOP
+        return adopt_installed_copy(&target);
     }
     Some(target)
+}
+
+/// Adopt an installed copy after a lost install race: when the
+/// winner's bytes already match, no reinstall is needed.
+fn adopt_installed_copy(target: &Path) -> Option<PathBuf> {
+    if std::fs::read(target).is_ok_and(|bytes| bytes == ARC_HG_BUNDLED.as_bytes()) {
+        Some(target.to_path_buf())
+    } else {
+        None
+    }
 }
 
 /// Locate the `arc-hg` extension script: `ARC_HG_EXTENSION` first, then an
@@ -542,10 +557,10 @@ fn materialize_bundled_arc_hg() -> Option<PathBuf> {
 #[must_use]
 pub fn arc_hg_script(dir: &Path) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("ARC_HG_EXTENSION") {
-        let path = PathBuf::from(path); // LCOV_EXCL_START // Reason: needs ARC_HG_EXTENSION set; env is process-global
+        let path = PathBuf::from(path);
         if path.is_file() {
             return Some(path);
-        } // LCOV_EXCL_STOP
+        }
     }
     if let Some(found) = dir
         .ancestors()

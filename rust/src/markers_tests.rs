@@ -327,6 +327,9 @@ fn land26_command_sections_truncate_like_php() {
 
 #[test]
 fn land25_bundled_extension_materializes() {
+    // Serial with the PC-1 `ARC_HG_EXTENSION` staging test: a staged
+    // extension would shadow the bundled copy under test here.
+    let _serial = pc1_serial();
     // Outside any checkout the bundled `arc-hg.py` copy resolves,
     // with the compiled-in bytes on disk — and a deleted copy
     // reinstalls on the next call. One test (not two): the target
@@ -993,6 +996,8 @@ fn t1170_query_git_markers_filters_type_and_marks_current() {
 
 #[test]
 fn t1170_arc_hg_script_prefers_checkout_copy() {
+    // Serial with the PC-1 `ARC_HG_EXTENSION` staging test (see above).
+    let _serial = pc1_serial();
     let root = TempDir::new("archg");
     let nested = root.path().join("a").join("b");
     let script = root.path().join("support").join("hg").join("arc-hg.py");
@@ -1867,4 +1872,77 @@ fn run_in_maps_auth_failures_to_login_guidance() {
     assert!(err.starts_with("ERR-INVALID-AUTH:"), "{err}");
     let seen = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
     assert_eq!(seen.len(), 2);
+}
+
+// -( T1176 PC-1: env-globals )------------------------------------------------
+
+/// Take the PC-1 serial-env lock, tolerating a poisoned mutex (a
+/// panicked sibling still restored its var via its guard's `Drop`).
+fn pc1_serial() -> std::sync::MutexGuard<'static, ()> {
+    crate::config::PC1_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[test]
+#[cfg(unix)]
+fn pc1_materialize_write_failure_returns_none() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new("pc1-write-fail");
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    assert_eq!(materialize_bundled_arc_hg_in(Some(&locked)), None);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn pc1_materialize_rename_failure_returns_none() {
+    // A non-empty directory at the target path fails the atomic
+    // rename on every platform; the stray tmp file is cleaned up.
+    let tmp = TempDir::new("pc1-rename-fail");
+    let target = tmp
+        .path()
+        .join(format!("arc-hg-{:016x}.py", arc_hg_content_tag()));
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("occupant.txt"), "x").unwrap();
+    assert_eq!(materialize_bundled_arc_hg_in(Some(tmp.path())), None);
+    let stray = target.with_extension(format!("{}.tmp", std::process::id()));
+    assert!(!stray.exists());
+}
+
+#[test]
+fn pc1_adopt_installed_copy_matches_bytes() {
+    let tmp = TempDir::new("pc1-adopt");
+    let matching = tmp.path().join("match.py");
+    std::fs::write(&matching, ARC_HG_BUNDLED).unwrap();
+    assert_eq!(adopt_installed_copy(&matching), Some(matching));
+    let stale = tmp.path().join("stale.py");
+    std::fs::write(&stale, "# stale copy").unwrap();
+    assert_eq!(adopt_installed_copy(&stale), None);
+    assert_eq!(adopt_installed_copy(&tmp.path().join("missing.py")), None);
+}
+
+#[test]
+fn pc1_arc_hg_extension_env_wins() {
+    // Serial: staging ARC_HG_EXTENSION is process-global mutation.
+    let _serial = pc1_serial();
+    let tmp = TempDir::new("pc1-hg-ext");
+    let staged = tmp.path().join("staged-hg.py");
+    std::fs::write(&staged, "# staged extension").unwrap();
+    let guard = crate::config::Pc1EnvGuard::set("ARC_HG_EXTENSION", staged.as_os_str());
+    assert_eq!(arc_hg_script(tmp.path()), Some(staged));
+    drop(guard);
+    // A staged path that is not a file falls through to the checkout
+    // search and the bundled copy.
+    let guard = crate::config::Pc1EnvGuard::set(
+        "ARC_HG_EXTENSION",
+        tmp.path().join("missing.py").as_os_str(),
+    );
+    let resolved = arc_hg_script(tmp.path()).expect("bundled copy resolves");
+    assert_ne!(resolved, tmp.path().join("missing.py"));
+    let saved = guard.saved().map(|value| value.to_os_string());
+    drop(guard);
+    assert_eq!(std::env::var_os("ARC_HG_EXTENSION"), saved);
 }

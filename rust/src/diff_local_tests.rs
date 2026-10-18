@@ -999,17 +999,25 @@ fn skip_predicates_cover_nolint_nounit_raw_head() {
     assert!(!should_skip_unit(false, false, Some("")));
 }
 
+/// Counting lint child runner shared by the skip test (which asserts
+/// the spy never runs) and its non-skip sibling (which drives it once).
+fn gap2_counting_lint_run(
+    calls: &std::cell::RefCell<usize>,
+) -> impl Fn(&Path, &[String]) -> ChildOutcome + '_ {
+    |_: &Path, _: &[String]| {
+        *calls.borrow_mut() += 1;
+        ChildOutcome::Code(0, Vec::new())
+    }
+}
+
 #[test]
 fn gap2_run_lint_maps_codes_and_outcomes() {
     use std::cell::RefCell;
     let dir = std::env::temp_dir();
     let run = |outcome: ChildOutcome| move |_: &Path, _: &[String]| outcome.clone();
     // Skip short-circuits silently.
-    let calls = RefCell::new(0);
-    let counting = |_: &Path, _: &[String]| {
-        *calls.borrow_mut() += 1; // LCOV_EXCL_START // Reason: skip short-circuits before the spy runs; the test asserts the skip
-        ChildOutcome::Code(0, Vec::new())
-    }; // LCOV_EXCL_STOP
+    let calls = RefCell::new(0usize);
+    let counting = gap2_counting_lint_run(&calls);
     let mut out = Vec::new();
     assert_eq!(
         run_lint(&dir, Some("abc"), &[], true, &counting, &mut out).unwrap(),
@@ -1119,6 +1127,24 @@ fn gap2_run_lint_maps_codes_and_outcomes() {
     let mut out = Vec::new();
     run_lint(&dir, None, &[], false, &capture, &mut out).unwrap();
     assert!(seen.borrow().is_empty());
+}
+
+#[test]
+fn gap2_run_lint_spy_runs_on_non_skip_path() {
+    use std::cell::RefCell;
+    // Sibling of gap2_run_lint_maps_codes_and_outcomes: the same
+    // counting spy on the non-skip path, where the runner runs once.
+    let dir = gap2_d1_scratch("lint-spy");
+    let calls = RefCell::new(0usize);
+    let counting = gap2_counting_lint_run(&calls);
+    let mut out = Vec::new();
+    assert_eq!(
+        run_lint(&dir, None, &[], false, &counting, &mut out).unwrap(),
+        (Some(0), Vec::new())
+    );
+    assert_eq!(*calls.borrow(), 1);
+    assert_eq!(out, b"Linting...\n** LINT OKAY ** No lint problems.\n");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -3705,16 +3731,25 @@ fn gap2_unresolved_errors_error_shapes() {
     );
 }
 
+/// Counting editor stub shared by the verbatim first-pass test (which
+/// asserts the spy never runs) and its editor-path sibling (which drives
+/// it once).
+fn gap2_counting_edit(
+    calls: &std::cell::RefCell<usize>,
+) -> impl Fn(&str) -> Result<String, String> + '_ {
+    |_: &str| {
+        *calls.borrow_mut() += 1;
+        Ok("Edited\n".to_string())
+    }
+}
+
 #[test]
 fn gap2_edit_create_message_first_pass() {
     use std::io::Cursor;
     let root = gap2_d1_scratch("loop-first");
     let meta = root.join(".git");
     let calls = std::cell::RefCell::new(0usize);
-    let edit = |_: &str| -> Result<String, String> {
-        *calls.borrow_mut() += 1; // LCOV_EXCL_START // Reason: verbatim skips the editor on this path; the spy never runs
-        Ok("Edited\n".to_string())
-    }; // LCOV_EXCL_STOP
+    let edit = gap2_counting_edit(&calls);
 
     // Verbatim skips the editor on the first pass for non-default templates.
     let mut input = Cursor::new(b"".to_vec());
@@ -3764,6 +3799,34 @@ fn gap2_edit_create_message_first_pass() {
     let err = edit_create_message(&mut editor, "Title\n", "Title\n", true, false, &[]).unwrap_err();
     assert_eq!(err, TEMPLATE_NOT_EDITED);
 
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn gap2_edit_create_message_first_pass_editor_path() {
+    use std::io::Cursor;
+    // Sibling of gap2_edit_create_message_first_pass: the same counting
+    // edit spy with verbatim off, so the editor runs once.
+    let root = gap2_d1_scratch("loop-first-editor");
+    let meta = root.join(".git");
+    let calls = std::cell::RefCell::new(0usize);
+    let edit = gap2_counting_edit(&calls);
+    let mut input = Cursor::new(b"".to_vec());
+    let mut out = Vec::new();
+    let mut editor = CreateMessageEditor {
+        reader: &mut input,
+        writer: &mut out,
+        call: &gap2_d1_ok_call,
+        metadata_dir: &meta,
+        work_root: &root,
+        edit: &edit,
+        amend_commit: None,
+        user_phid: "PHID-USER-me",
+        away_offset: 0,
+    };
+    let message = edit_create_message(&mut editor, "Seed\n", "Seed\n", false, false, &[]).unwrap();
+    assert_eq!(*calls.borrow(), 1);
+    assert_eq!(message.raw_corpus, "Edited\n");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -5721,6 +5784,18 @@ fn t1170_select_reviewer_users_ignores_scalars() {
     assert_eq!(select_reviewer_users(&users, &["PHID-1"]).len(), 1);
 }
 
+/// Counting amend hook shared by the other-error test (which asserts
+/// the spy never runs) and its amended-path sibling (which drives it
+/// once).
+fn gap2_counting_amend(
+    amended: &std::cell::RefCell<usize>,
+) -> impl Fn(&str) -> Result<(), String> + '_ {
+    |_: &str| {
+        *amended.borrow_mut() += 1;
+        Ok(())
+    }
+}
+
 #[test]
 fn t1170_edit_create_message_other_error_without_draft() {
     use std::io::Cursor;
@@ -5729,10 +5804,7 @@ fn t1170_edit_create_message_other_error_without_draft() {
     let root = gap2_d1_scratch("loop-other");
     let meta = root.join(".git");
     let amended = std::cell::RefCell::new(0usize);
-    let amend = |_: &str| -> Result<(), String> {
-        *amended.borrow_mut() += 1; // LCOV_EXCL_START // Reason: spy asserted never called below; the flow takes the other path
-        Ok(())
-    }; // LCOV_EXCL_STOP
+    let amend = gap2_counting_amend(&amended);
     let passthrough = |template: &str| -> Result<String, String> { Ok(template.to_string()) };
     let mut input = Cursor::new(b"".to_vec());
     let mut out = Vec::new();
@@ -5751,6 +5823,38 @@ fn t1170_edit_create_message_other_error_without_draft() {
     let err = edit_create_message(&mut editor, template, template, false, false, &[]).unwrap_err();
     assert!(err.contains("Invalid \"Differential Revision\""), "{err}");
     assert_eq!(*amended.borrow(), 0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn t1170_edit_create_message_amended_path_runs_hook() {
+    use std::io::Cursor;
+    // Sibling of t1170_edit_create_message_other_error_without_draft:
+    // the same counting amend spy on the amended path, where the
+    // changed message reaches the hook once.
+    let root = gap2_d1_scratch("loop-other-amended");
+    let meta = root.join(".git");
+    let amended = std::cell::RefCell::new(0usize);
+    let amend = gap2_counting_amend(&amended);
+    let edit = |_: &str| -> Result<String, String> { Ok("Amended title\n".to_string()) };
+    let mut input = Cursor::new(b"".to_vec());
+    let mut out = Vec::new();
+    let mut editor = CreateMessageEditor {
+        reader: &mut input,
+        writer: &mut out,
+        call: &gap2_d1_ok_call,
+        metadata_dir: &meta,
+        work_root: &root,
+        edit: &edit,
+        amend_commit: Some(&amend),
+        user_phid: "PHID-USER-me",
+        away_offset: 0,
+    };
+    let message = edit_create_message(&mut editor, "Old\n", "Old\n", false, false, &[]).unwrap();
+    assert_eq!(*amended.borrow(), 1);
+    assert_eq!(message.raw_corpus, "Amended title\n");
+    // Amending never touches the scratch file.
+    assert!(diff::read_scratch_file(&meta, SCRATCH_CREATE_MESSAGE).is_none());
     let _ = std::fs::remove_dir_all(&root);
 }
 

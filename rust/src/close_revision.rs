@@ -728,9 +728,22 @@ fn run_with_user_file(argv: &[String], user_file: Option<&Path>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf()); // LCOV_EXCL_START // Reason: live run body; needs conduit creds plus network plus a TTY confirm
+    let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    run_live(&cwd, &client, &mut options, &confirm_interactive)
+}
+
+/// Live close over an explicit directory and confirm hook: `--finalize`
+/// repository resolution, then [`execute_in`]. Test seam: hermetic tests
+/// stage a TempDir, a stub client, and a canned confirm instead of the
+/// process directory, conduit creds, and a TTY prompt.
+fn run_live(
+    dir: &Path,
+    client: &conduit::Client,
+    options: &mut Options,
+    confirm: &dyn Fn(&str) -> Result<bool, String>,
+) -> ExitCode {
     if options.finalize {
-        match resolve_repository_phid(&client, &cwd) {
+        match resolve_repository_phid(client, dir) {
             Ok(phid) => options.repository_phid = phid,
             Err(msg) => {
                 eprintln!("arc {NAME}: {msg}");
@@ -738,7 +751,7 @@ fn run_with_user_file(argv: &[String], user_file: Option<&Path>) -> ExitCode {
             }
         }
     }
-    match execute_in(&cwd, &client, &options, &confirm_interactive) {
+    match execute_in(dir, client, options, confirm) {
         Ok(report) => {
             print!("{}", report.stdout);
             eprint!("{}", report.stderr);
@@ -746,7 +759,7 @@ fn run_with_user_file(argv: &[String], user_file: Option<&Path>) -> ExitCode {
         }
         Err(msg) => {
             eprintln!("arc {NAME}: {msg}");
-            ExitCode::FAILURE // LCOV_EXCL_STOP
+            ExitCode::FAILURE
         }
     }
 }

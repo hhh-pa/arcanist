@@ -21,14 +21,14 @@
 
 use std::collections::BTreeMap;
 use std::io::BufRead;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 // Alias the current crate so `arc_rs::...` paths resolve both once wired
 // into lib.rs and when included standalone by an integration test.
 extern crate self as arc_rs;
 
-use arc_rs::{config, diff_submit, git, hg, prompt, terminal, which};
+use arc_rs::{config, diff_submit, get_config, git, hg, prompt, terminal, which};
 
 /// Abort text for declined prompts (same as `prompt::ABORT`).
 pub const ABORT: &str = "User aborted the workflow.";
@@ -1033,15 +1033,17 @@ fn status_flags(dir: &Path) -> Result<BTreeMap<String, EntryFlags>, String> {
         if entry.is_empty() {
             continue;
         }
-        let Some((path, entry_flags, is_rename)) = flags_for_entry(entry) else {
-            continue; // LCOV_EXCL_LINE // Reason: porcelain=2 without --branch emits only 1/2/u/? entries; no real output reaches this arm
-        };
-        flags.insert(path.to_string(), entry_flags);
-        if is_rename
-            && let Some(orig) = fields.next()
-            && !orig.is_empty()
-        {
-            flags.insert(orig.to_string(), entry_flags);
+        // Unknown kinds (e.g. `#` headers) are skipped; `flags_for_entry`
+        // returning `None` is pinned directly by
+        // `flags_for_entry_rejects_unknown_kinds`.
+        if let Some((path, entry_flags, is_rename)) = flags_for_entry(entry) {
+            flags.insert(path.to_string(), entry_flags);
+            if is_rename
+                && let Some(orig) = fields.next()
+                && !orig.is_empty()
+            {
+                flags.insert(orig.to_string(), entry_flags);
+            }
         }
     }
     Ok(flags)
@@ -1869,10 +1871,11 @@ fn hg_execute_parsed_with(
             return ExitCode::FAILURE;
         }
     };
-    if let Err(message) = confirm_externals(input, &lists) {
-        eprintln!("arc {NAME}: {message}"); // LCOV_EXCL_START // Reason: hg lists never carry externals, so confirm_externals early-Oks here; this Err arm is dead
-        return ExitCode::FAILURE; // LCOV_EXCL_STOP
-    }
+    // Hg lists never carry externals, so the gate early-Oks here; the
+    // decline path is pinned on the git engine plus
+    // `externals_gate_accepts_and_declines`.
+    confirm_externals(input, &lists)
+        .expect("hg lists never carry externals, so confirm_externals early-Oks here");
     let shelved = match hg_maybe_shelve_with(dir, hg_cmd, input, &lists) {
         Ok(shelved) => shelved,
         Err(message) => {
@@ -1927,13 +1930,43 @@ pub fn run_in_with(
     call: Option<&diff_submit::ConduitCall>,
     input: &mut dyn BufRead,
 ) -> ExitCode {
+    run_in_with_user_file(
+        dir,
+        argv,
+        call,
+        input,
+        config::arcrc_path().as_deref(),
+        None,
+    )
+}
+
+/// [`run_in_with`] with an explicit credential file and conduit URI
+/// override (test seam: hermetic tests stage a fake arcrc plus a
+/// loopback stub instead of touching HOME).
+fn run_in_with_user_file(
+    dir: &Path,
+    argv: &[String],
+    call: Option<&diff_submit::ConduitCall>,
+    input: &mut dyn BufRead,
+    user_file: Option<&Path>,
+    conduit_uri: Option<&str>,
+) -> ExitCode {
     let options = match parse_or_report(argv) {
         Ok(options) => options,
         Err(code) => return code,
     };
     // T1153 WORK-HG: hg dispatches to the Mercurial engine.
     if is_hg_repo(dir) {
-        return run_hg_in_with(dir, &options, call, input);
+        let hg_cmd = hg::HgCommand::system();
+        return run_hg_in_with_cmd_user_file(
+            dir,
+            &hg_cmd,
+            &options,
+            call,
+            input,
+            user_file,
+            conduit_uri,
+        );
     }
     if !git::is_inside_work_tree(dir) {
         return work_outside_repo();
@@ -1942,8 +1975,15 @@ pub fn run_in_with(
         return execute_parsed(dir, &options, call, input);
     }
     if !branch_exists(dir, &options.symbol) && symbol_needs_conduit(&options.symbol) {
-        // LCOV_EXCL_START // Reason: live-client path; needs real creds or fingerprints ambient discovery, neither hermetic
-        let client = match config::client_for(None) {
+        // Byte-identical to `config::client_for(None)` when the wrapper
+        // passes the ambient values (same cwd fallback, same user file).
+        let config_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let client = match config::client_for_with(
+            conduit_uri,
+            &config_dir,
+            user_file,
+            &get_config::LoadOptions::default(),
+        ) {
             Ok(client) => client,
             Err(message) => {
                 eprintln!("arc {NAME}: {message}");
@@ -1953,7 +1993,7 @@ pub fn run_in_with(
         let live = |method: &str, params: &serde_json::Value| {
             client.call(method, params).map_err(|e| e.to_string())
         };
-        execute_parsed(dir, &options, &live, input) // LCOV_EXCL_STOP
+        execute_parsed(dir, &options, &live, input)
     } else {
         execute_parsed(dir, &options, &conduit_unavailable_pill, input)
     }
@@ -1967,16 +2007,6 @@ fn conduit_unavailable_pill(_: &str, _: &serde_json::Value) -> Result<serde_json
     Err("conduit unavailable".to_string())
 }
 
-fn run_hg_in_with(
-    dir: &Path,
-    options: &Options,
-    call: Option<&diff_submit::ConduitCall>,
-    input: &mut dyn BufRead,
-) -> ExitCode {
-    let hg_cmd = hg::HgCommand::system();
-    run_hg_in_with_cmd(dir, &hg_cmd, options, call, input)
-}
-
 /// Hg entry driving `hg` through `hg_cmd` (T1153 WORK-HG: test seam).
 pub fn run_hg_in_with_cmd(
     dir: &Path,
@@ -1985,13 +2015,43 @@ pub fn run_hg_in_with_cmd(
     call: Option<&diff_submit::ConduitCall>,
     input: &mut dyn BufRead,
 ) -> ExitCode {
+    run_hg_in_with_cmd_user_file(
+        dir,
+        hg_cmd,
+        options,
+        call,
+        input,
+        config::arcrc_path().as_deref(),
+        None,
+    )
+}
+
+/// [`run_hg_in_with_cmd`] with an explicit credential file and conduit
+/// URI override (test seam: hermetic tests stage a fake arcrc plus a
+/// loopback stub instead of touching HOME).
+fn run_hg_in_with_cmd_user_file(
+    dir: &Path,
+    hg_cmd: &hg::HgCommand,
+    options: &Options,
+    call: Option<&diff_submit::ConduitCall>,
+    input: &mut dyn BufRead,
+    user_file: Option<&Path>,
+    conduit_uri: Option<&str>,
+) -> ExitCode {
     if let Some(call) = call {
         return hg_execute_parsed_with(dir, hg_cmd, options, call, input);
     }
     let markers = hg_markers_for_symbol_with(dir, hg_cmd, &options.symbol);
     if markers.is_empty() && symbol_needs_conduit(&options.symbol) {
-        // LCOV_EXCL_START // Reason: live-client path; needs real creds or fingerprints ambient discovery, neither hermetic
-        let client = match config::client_for(None) {
+        // Byte-identical to `config::client_for(None)` when the wrapper
+        // passes the ambient values (same cwd fallback, same user file).
+        let config_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let client = match config::client_for_with(
+            conduit_uri,
+            &config_dir,
+            user_file,
+            &get_config::LoadOptions::default(),
+        ) {
             Ok(client) => client,
             Err(message) => {
                 eprintln!("arc {NAME}: {message}");
@@ -2001,7 +2061,7 @@ pub fn run_hg_in_with_cmd(
         let live = |method: &str, params: &serde_json::Value| {
             client.call(method, params).map_err(|e| e.to_string())
         };
-        hg_execute_parsed_with(dir, hg_cmd, options, &live, input) // LCOV_EXCL_STOP
+        hg_execute_parsed_with(dir, hg_cmd, options, &live, input)
     } else {
         hg_execute_parsed_with(dir, hg_cmd, options, &conduit_unavailable_pill, input)
     }

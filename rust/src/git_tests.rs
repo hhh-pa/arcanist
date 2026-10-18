@@ -925,9 +925,12 @@ fn cov6g_all_branches_tolerates_spawn_race() {
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     toggler.join().unwrap();
-    if !repo.exists() {
-        std::fs::rename(&away, &repo).ok(); // LCOV_EXCL_LINE // Reason: swap-restore arm; unix renames cannot fail here, so it never runs on ubuntu CI
-    }
+    // The toggler only exits at the loop guard, i.e. after a complete
+    // swap-swap iteration (or none), and renames inside a writable
+    // temp dir cannot fail on unix, so `repo` unconditionally exists
+    // after `join`: the old swap-restore arm was dead. This assert
+    // enforces that invariant on every run.
+    assert!(repo.exists(), "swap toggler restores the repo before exit");
     std::fs::remove_dir_all(&repo).ok();
     std::fs::remove_dir_all(&away).ok();
 }
@@ -981,4 +984,103 @@ fn ancient_git_config_fallback_resolves_remote_uri() {
         load_git_remote_uri_with(tmp.path(), "origin", true, Some(&fake)).as_deref(),
         Some("https://example.test/repo.git\n")
     );
+}
+// -( T1176 PB-5: legacy-toolchain fallback coverage )----------------------------
+
+/// `ls-remote` fallback body: a fake `git` reporting 1.9 without
+/// `remote get-url` (added in 2.7) resolves the URI through
+/// `ls-remote --get-url`, staging the git < 2.7 fallback.
+/// Unix-only (shell script).
+#[cfg(unix)]
+#[test]
+fn ancient_git_ls_remote_fallback_resolves_remote_uri() {
+    let tmp = TempDir::new("ancient-lsremote");
+    let fake = tmp.path().join("git");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"--version\" ]; then echo \"git version 1.9.5\"; exit 0; fi\n\
+         if [ \"$1\" = \"remote\" ]; then exit 1; fi\n\
+         if [ \"$1\" = \"ls-remote\" ]; then echo \"https://example.test/ls.git\"; exit 0; fi\n\
+         exit 1\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&fake).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake, perms).unwrap();
+    }
+    // Unlike the config fallback, the ls-remote arm returns the
+    // normalized URI (no trailing newline).
+    assert_eq!(
+        load_git_remote_uri_with(tmp.path(), "origin", false, Some(&fake)).as_deref(),
+        Some("https://example.test/ls.git")
+    );
+    assert_eq!(
+        load_git_remote_uri_with(tmp.path(), "origin", true, Some(&fake)).as_deref(),
+        Some("https://example.test/ls.git")
+    );
+}
+
+/// git 1.7.5-2.7 early-out: a fake `git` reporting 2.0 whose
+/// `remote get-url` and `ls-remote --get-url` both miss returns
+/// `None` without reaching the `config` fallback. The `config` arm
+/// serves a sentinel URI, so `None` proves the early-out.
+/// Unix-only (shell script).
+#[cfg(unix)]
+#[test]
+fn git_2_0_skips_config_fallback_after_ls_remote_miss() {
+    let tmp = TempDir::new("git20-earlyout");
+    let fake = tmp.path().join("git");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"--version\" ]; then echo \"git version 2.0.0\"; exit 0; fi\n\
+         if [ \"$1\" = \"remote\" ]; then exit 1; fi\n\
+         if [ \"$1\" = \"ls-remote\" ]; then exit 1; fi\n\
+         if [ \"$1\" = \"config\" ]; then echo \"https://must.not/be-reached.invalid\"; exit 0; fi\n\
+         exit 1\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&fake).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake, perms).unwrap();
+    }
+    assert!(version_at_least("2.0.0", "1.7.5"));
+    assert_eq!(
+        load_git_remote_uri_with(tmp.path(), "origin", false, Some(&fake)),
+        None
+    );
+    assert_eq!(
+        load_git_remote_uri_with(tmp.path(), "origin", true, Some(&fake)),
+        None
+    );
+}
+
+// -( T1176 PB-5: stdin-write classifier )---------------------------------------
+
+#[test]
+fn stdin_write_tolerates_ok_and_epipe() {
+    // White-box: the `hash-object --stdin` classifier accepts a clean
+    // write and EPIPE (git exited early); both covered arms.
+    tolerate_stdin_write(Ok(()));
+    tolerate_stdin_write(Err(std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        "reader closed",
+    )));
+}
+
+#[test]
+#[should_panic(expected = "fail only as EPIPE")]
+fn stdin_write_non_epipe_is_unreachable() {
+    // White-box proof: `ChildStdin` is a blocking pipe to a
+    // live-or-exited child, so only EPIPE can occur; anything else
+    // violates the guarantee and panics.
+    tolerate_stdin_write(Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "synthetic",
+    )));
 }

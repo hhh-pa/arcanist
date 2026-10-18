@@ -1250,3 +1250,92 @@ fn core19_dispatch_run_prints_spelling_notice() {
 // merged into `core19_all_commands_export_arcanist` above (the command
 // cell is process-once; a standalone different-name dispatch raced the
 // CORE-19 pin).
+
+// -( T1176 PC-1: env-globals )------------------------------------------------
+
+/// House scratch dir (pid + per-file counter); removed on drop.
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path =
+            std::env::temp_dir().join(format!("arc-rs-main-pc1-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+/// Fixture HOME holding one `.arcrc` with `aliases_json` as the
+/// `aliases` value; returns the home dir and the `.arcrc` path.
+fn fixture_home(tag: &str, aliases_json: &str) -> (TempDir, std::path::PathBuf) {
+    let home = TempDir::new(tag);
+    let arcrc = home.path().join(".arcrc");
+    std::fs::write(&arcrc, format!("{{\"aliases\": {aliases_json}}}")).unwrap();
+    (home, arcrc)
+}
+
+#[test]
+#[cfg(unix)]
+fn pc1_shell_alias_spawns_through_expansion() {
+    // A fixture-HOME shell alias drives the spawner closure: `sh -c`
+    // runs `true`, so expansion handles the invocation with SUCCESS.
+    let (home, arcrc) = fixture_home("shell", r#"{"sh": ["!true"]}"#);
+    let outcome = apply_alias_expansion_in(args(&["sh"]), home.path(), Some(&arcrc));
+    assert_eq!(outcome, Err(ExitCode::SUCCESS));
+}
+
+#[test]
+fn pc1_expansion_notices_print_for_warning_alias() {
+    // An invalid entry warns (ALIAS hint on stderr) while the unknown
+    // command passes through to dispatch untouched.
+    let (home, arcrc) = fixture_home("warning", r#"{"bad": [42]}"#);
+    let outcome = apply_alias_expansion_in(args(&["some-cmd"]), home.path(), Some(&arcrc));
+    assert_eq!(outcome, Ok(args(&["some-cmd"])));
+}
+
+#[test]
+fn pc1_run_with_argv_reports_bad_globals() {
+    // Slice test: bad globals in the staged argv report through the
+    // usage envelope without touching the real process argv.
+    assert_eq!(
+        run_with_argv(&args(&["arc", "--trace=x"])),
+        ExitCode::FAILURE
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn pc1_run_with_argv_in_shell_alias_handles_invocation() {
+    // Same HOME fixture: a shell alias handling the invocation
+    // returns its exit code out of `run_with_argv_in`.
+    let (home, arcrc) = fixture_home("run-shell", r#"{"sh": ["!true"]}"#);
+    assert_eq!(
+        run_with_argv_in(&args(&["arc", "sh"]), home.path(), Some(&arcrc)),
+        ExitCode::SUCCESS
+    );
+}
+
+#[test]
+fn pc1_run_with_argv_in_dispatches_help() {
+    // The `--`-terminated argv flows past the terminator gate into
+    // dispatch (stdin-independent: `help --` needs no terminator).
+    let (home, arcrc) = fixture_home("run-help", "{}");
+    assert_eq!(
+        run_with_argv_in(&args(&["arc", "help", "--"]), home.path(), Some(&arcrc)),
+        ExitCode::SUCCESS
+    );
+}

@@ -531,18 +531,40 @@ fn core52_prompt_engine_drives_liberate_confirms() {
     let err = ensure_library_with(&lib, &mut input, true, None, &mut noop).unwrap_err();
     assert!(err.starts_with("cancelled: "), "{err}");
     assert!(!lib.exists());
-    // `?` then accept, with a `*` save suffix captured.
+    // Naming an existing directory never touches the save channel.
     std::fs::create_dir_all(&lib).unwrap();
     let mut input = BufReader::new(std::io::Cursor::new("my-lib\n"));
+    let created = ensure_library_with(&lib, &mut input, true, None, &mut noop).unwrap();
+    assert!(created);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn core52_liberate_create_save_suffix_persists() {
+    // Sibling of `core52_prompt_engine_drives_liberate_confirms`: a `*`
+    // suffix on the create-directory confirm fires the save channel with
+    // the stripped response under the user scope.
+    let dir = TempDir::new("core52-save");
+    let lib = dir.path().join("newlib");
+    let mut input = BufReader::new(std::io::Cursor::new("y*\nmy-lib\n"));
     let mut saved_calls = Vec::new();
-    let created = ensure_library_with(&lib, &mut input, true, None, &mut |scope, response| {
-        saved_calls.push((scope, response.to_string())); // LCOV_EXCL_START // Reason: save probe the test asserts never fires; firing contradicts the test
-        Ok(())
-    }) // LCOV_EXCL_STOP
+    let created = ensure_library_with(
+        &lib,
+        &mut input,
+        true,
+        None,
+        &mut |scope, response: &str| {
+            saved_calls.push((scope, response.to_string()));
+            Ok(())
+        },
+    )
     .unwrap();
     assert!(created);
-    assert!(saved_calls.is_empty());
-    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(
+        saved_calls,
+        vec![(crate::prompts::PromptScope::User, "y".to_string())]
+    );
+    assert!(lib.join(INIT_FILE).is_file());
 }
 
 #[test]
@@ -744,6 +766,24 @@ fn rebuild_map_reports_php_outcomes() {
 }
 
 #[test]
+fn rebuild_lookup_miss_without_support_tree_reports_not_found() {
+    // Lookup-miss arm, deterministic: a clean temp root carries no support
+    // tree above it, and the `None` binary override skips the exe-ancestor
+    // search, so the lookup misses regardless of where the test binary lives.
+    let dir = TempDir::new("rebuild-miss");
+    assert_eq!(
+        find_rebuild_script_with_exe(dir.path(), dir.path(), None),
+        None
+    );
+    let message =
+        rebuild_map_with_php_and_exe(dir.path(), false, None, None, None).expect("miss text");
+    assert!(
+        message.contains("support/lib/rebuild-map.php was not found above"),
+        "{message}"
+    );
+}
+
+#[test]
 fn liberate_path_delegates_to_prompt_channel() {
     let dir = TempDir::new("delegate");
     let file = dir.path().join("plain-file");
@@ -787,7 +827,7 @@ impl Cov6gPlantOnRead {
 
     fn plant(&mut self) {
         if self.planted {
-            return; // LCOV_EXCL_LINE // Reason: plant-once guard; the helper reads exactly once
+            return;
         }
         self.planted = true;
         std::fs::create_dir_all(&self.lib).unwrap();
@@ -796,11 +836,10 @@ impl Cov6gPlantOnRead {
 }
 
 impl std::io::Read for Cov6gPlantOnRead {
-    // LCOV_EXCL_START // Reason: Read impl required by the BufRead supertrait; the engine only calls fill_buf
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.plant();
         self.inner.read(buf)
-    } // LCOV_EXCL_STOP
+    }
 }
 
 impl std::io::BufRead for Cov6gPlantOnRead {
@@ -825,6 +864,24 @@ fn cov6g_ensure_library_sees_init_created_during_confirm() {
         Ok(false)
     );
     assert!(lib.join(INIT_FILE).is_file());
+    // Second read trips the plant-once guard (the confirm already planted).
+    std::io::BufRead::fill_buf(&mut input).unwrap();
+}
+
+#[test]
+fn cov6g_plant_on_read_read_plants_and_returns_bytes() {
+    // Direct `Read::read` unit test for the `BufRead` supertrait stub: the
+    // first read plants the init file and streams the queued answer bytes.
+    let dir = TempDir::new("cov6g-read");
+    let lib = dir.path().join("newlib");
+    let mut input = Cov6gPlantOnRead::new(lib.clone(), "y\n");
+    let mut buf = [0u8; 4];
+    let n = std::io::Read::read(&mut input, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"y\n");
+    assert!(lib.join(INIT_FILE).is_file());
+    // Second read trips the plant-once guard through the `Read` path too.
+    let n = std::io::Read::read(&mut input, &mut buf).unwrap();
+    assert_eq!(n, 0);
 }
 
 #[test]

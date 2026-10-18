@@ -511,10 +511,15 @@ impl ChunkProgress {
 
     /// `draw()`: erase the line and repaint the bar on stderr.
     fn draw(&mut self) {
-        if self.total == 0 || !Self::stderr_is_tty() {
+        self.draw_with(Self::stderr_is_tty(), Self::width());
+    }
+
+    /// `draw()` with injected TTY state and width, so tests can force the
+    /// TTY body without a real terminal (cargo-test stderr is piped).
+    fn draw_with(&mut self, is_tty: bool, width: usize) {
+        if self.total == 0 || !is_tty {
             return;
-        } // LCOV_EXCL_START // Reason: needs stderr to be a TTY; cargo-test stderr is piped
-        let width = Self::width();
+        }
         let chrome_width = "[] 100.0%   ".len();
         if width < chrome_width {
             return;
@@ -522,7 +527,7 @@ impl ChunkProgress {
         self.last_update = Some(std::time::Instant::now());
         self.drawn = true;
         Self::erase_line(width);
-        eprint!("{}", render_chunk_bar(self.done, self.total, width)); // LCOV_EXCL_STOP
+        eprint!("{}", render_chunk_bar(self.done, self.total, width));
     }
 
     /// Destructor-equivalent (`done($clean_exit = false)`): erase the bar.

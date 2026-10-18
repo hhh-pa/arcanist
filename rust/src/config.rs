@@ -7,12 +7,67 @@ use std::path::{Path, PathBuf};
 
 use crate::get_config;
 
+/// PC-1 serial-env lock: tests that must stage process-global env
+/// hold this across the whole mutate-assert-restore window, so staged
+/// values never leak into a sibling serial test. (Env reads outside
+/// the serial set stay racy by nature; the staged vars are read only
+/// on narrow paths no parallel test asserts on.)
+#[cfg(test)]
+pub(crate) static PC1_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Save/swap/restore one env var for a serial test: the original
+/// value (or absence) returns on drop, even when the test panics.
+#[cfg(test)]
+pub(crate) struct Pc1EnvGuard {
+    key: &'static str,
+    saved: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl Pc1EnvGuard {
+    /// Stage `value` for `key`, saving the current setting.
+    pub(crate) fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+        let saved = std::env::var_os(key);
+        // SAFETY: the caller holds PC1_ENV_LOCK, serializing PC-1
+        // staged mutations against each other; Drop restores below.
+        unsafe { std::env::set_var(key, value) };
+        Self { key, saved }
+    }
+
+    /// Remove `key`, saving the current setting.
+    pub(crate) fn remove(key: &'static str) -> Self {
+        let saved = std::env::var_os(key);
+        // SAFETY: same lock discipline as `set`.
+        unsafe { std::env::remove_var(key) };
+        Self { key, saved }
+    }
+
+    /// The value `key` had before staging (`None` when unset).
+    pub(crate) fn saved(&self) -> Option<&std::ffi::OsStr> {
+        self.saved.as_deref()
+    }
+}
+
+#[cfg(test)]
+impl Drop for Pc1EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: same lock discipline as `set`; restore keeps the
+        // staged value from leaking past the test window.
+        unsafe {
+            match &self.saved {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
 pub fn arcrc_path() -> Option<PathBuf> {
     #[cfg(windows)]
     let home_src = std::env::var_os("USERPROFILE");
     #[cfg(not(windows))]
     let home_src = std::env::var_os("HOME");
-    let home = home_src?; // LCOV_EXCL_LINE // Reason: early-return needs HOME unset; unsetting env is process-global mutation
+    let home = home_src?;
     Some(PathBuf::from(home).join(".arcrc"))
 }
 
@@ -134,10 +189,19 @@ pub fn global_load_options() -> get_config::LoadOptions {
     let Some(raw) = crate::globals::load_options() else {
         return get_config::LoadOptions::default();
     };
-    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw) else {
+    parse_load_options_json(&raw)
+}
+
+/// Pure half of [`global_load_options`]: [`get_config::LoadOptions`]
+/// from one dispatcher JSON document (`runtime` object,
+/// `config_files` string list, `arcrc_file` string). Unparseable or
+/// mistyped input reads default (no overrides).
+#[must_use]
+pub fn parse_load_options_json(raw: &str) -> get_config::LoadOptions {
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(raw) else {
         return get_config::LoadOptions::default();
     };
-    let runtime = doc // LCOV_EXCL_START // Reason: needs process-global load-options state (cell or env); hermetic tests stage neither
+    let runtime = doc
         .get("runtime")
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
@@ -155,7 +219,7 @@ pub fn global_load_options() -> get_config::LoadOptions {
         runtime,
         config_files,
         arcrc_file,
-    } // LCOV_EXCL_STOP
+    }
 }
 
 fn host_key(conduit_uri: &str) -> String {

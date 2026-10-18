@@ -4,6 +4,31 @@ fn args(list: &[&str]) -> Vec<String> {
     list.iter().map(|item| (*item).to_string()).collect()
 }
 
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path =
+            std::env::temp_dir().join(format!("arc-rs-weld-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
 #[test]
 fn parses_files_and_seed() {
     // T1153 BROWSE-B21: TTY runs need no `--`.
@@ -349,4 +374,40 @@ fn r4_core49_run_in_without_terminator_prints_hints() {
         run_in(&std::env::temp_dir(), &args(&["a", "b"])),
         std::process::ExitCode::FAILURE
     );
+}
+
+/// A sink that always fails, standing in for a closed/broken stdout.
+struct FailSink;
+
+impl std::io::Write for FailSink {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("closed"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn broken_sink_fails_and_working_sink_gets_bytes() {
+    // A broken stdout fails the run; a working sink gets the welded
+    // bytes (deterministic under `--seed`).
+    // T1153 BROWSE-B21: piped runs carry `--`.
+    let tmp = TempDir::new("runsink");
+    std::fs::write(tmp.path().join("a.txt"), b"alpha\n").unwrap();
+    std::fs::write(tmp.path().join("b.txt"), b"beta\n").unwrap();
+    let argv = args(&["--seed", "1", "--", "a.txt", "b.txt"]);
+    assert_eq!(
+        run_in_with(tmp.path(), &argv, &mut FailSink),
+        std::process::ExitCode::FAILURE
+    );
+    let mut buf = Vec::new();
+    assert_eq!(
+        run_in_with(tmp.path(), &argv, &mut buf),
+        std::process::ExitCode::SUCCESS
+    );
+    assert_eq!(buf, execute(tmp.path(), &argv).unwrap());
+    // The failing sink's `flush` is a no-op success.
+    assert!(std::io::Write::flush(&mut FailSink).is_ok());
 }

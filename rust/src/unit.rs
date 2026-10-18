@@ -1103,17 +1103,12 @@ pub fn validate_paths(
 ) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     for path in paths {
-        let candidate = cwd.join(path);
-        let full = if candidate.exists() {
-            candidate
-        } else {
-            let absolute = PathBuf::from(path);
-            if absolute.is_absolute() && absolute.exists() {
-                absolute // LCOV_EXCL_LINE // Reason: join() with an absolute path is identity, so both existence checks agree; reaching here needs a TOCTOU flip
-            } else {
-                return Err(format!("Path '{path}' does not exist!"));
-            }
-        };
+        // `Path::join` with an absolute `path` is identity, so one
+        // existence check covers both relative and absolute spellings.
+        let full = cwd.join(path);
+        if !full.exists() {
+            return Err(format!("Path '{path}' does not exist!"));
+        }
         let display = full.to_string_lossy().replace('\\', "/");
         let root = project_root.to_string_lossy().replace('\\', "/");
         let root = root.trim_end_matches('/');
@@ -3980,11 +3975,10 @@ fn parse_unit_options(argv: &[String]) -> Result<Options, ExitCode> {
 fn unit_working_dir() -> Result<PathBuf, ExitCode> {
     match std::env::current_dir() {
         Ok(dir) => Ok(dir),
-        // LCOV_EXCL_START // Reason: needs getcwd to fail on the test runner's cwd; not stageable
         Err(e) => Err(conduit::report(
             EnvelopeKind::Exception,
             &format!("cannot read current directory: {e}"),
-        )), // LCOV_EXCL_STOP
+        )),
     }
 }
 
@@ -4113,7 +4107,7 @@ pub fn run(argv: &[String]) -> ExitCode {
     };
     let cwd = match unit_working_dir() {
         Ok(dir) => dir,
-        Err(code) => return code, // LCOV_EXCL_LINE // Reason: needs getcwd to fail on the test runner's cwd; not stageable
+        Err(code) => return code,
     };
     run_opts_in(&opts, &cwd)
 }
@@ -4124,10 +4118,9 @@ pub fn run(argv: &[String]) -> ExitCode {
 pub fn run_opts_in(opts: &Options, cwd: &Path) -> ExitCode {
     let ansi = terminal::ansi_enabled();
     match plan_run(opts, cwd) {
-        Ok(PlannedRun::Cargo) => run_cargo_selection(opts, cwd), // LCOV_EXCL_LINE // Reason: reaching it runs cargo test in the live checkout (recursive suite); no test drives run() that far
+        Ok(PlannedRun::Cargo) => run_cargo_selection(opts, cwd),
         Ok(PlannedRun::Single { class, paths }) => {
-            // LCOV_EXCL_START // Reason: reaching it spawns the live test runner; no test drives run() that far
-            run_single_selection(opts, cwd, &class, &paths, ansi) // LCOV_EXCL_STOP
+            run_single_selection(opts, cwd, &class, &paths, ansi)
         }
         Ok(PlannedRun::Config {
             engines,

@@ -484,7 +484,7 @@ pub fn execute_ansi(
 ) -> Result<String, String> {
     let dir = match std::env::current_dir() {
         Ok(dir) => dir,
-        Err(_) => std::path::PathBuf::from("."), // LCOV_EXCL_LINE // Reason: current_dir is infallible in practice; deleting the cwd under parallel tests is unsafe
+        Err(_) => std::path::PathBuf::from("."),
     };
     execute_in_ansi(&dir, client, options, ansi)
 }

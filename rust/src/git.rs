@@ -1828,14 +1828,14 @@ fn load_git_remote_uri_with(
         return None;
     }
     if let Ok(out) = output_with_git(dir, &["ls-remote", "--get-url", remote_name], git) {
-        let success = out.status.success(); // LCOV_EXCL_START // Reason: ls-remote fallback body; needs git older than 2.7, but CI git is modern
+        let success = out.status.success();
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         if let Some(uri) = remote_uri_from_ls_remote(success, &text, remote_name) {
             return Some(uri);
-        } // LCOV_EXCL_STOP
+        }
     }
     if version_at_least(&version, "1.7.5") {
-        return None; // LCOV_EXCL_LINE // Reason: git 1.7.5-2.7 early-out; CI git is modern
+        return None;
     }
     let key = format!("remote.{remote_name}.url");
     if let Ok(out) = output_with_git(dir, &["config", "--", &key], git)
@@ -2283,6 +2283,20 @@ pub fn read_raw_commit(dir: &Path, hash: &str) -> Result<RawCommit, String> {
     RawCommit::new_from_raw_blob(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// Tolerate an `EPIPE` from a `hash-object --stdin` pipe write.
+///
+/// Git may exit before reading stdin; the status check below
+/// reports it (same tolerance as `land.rs`). Any other write error
+/// is unreachable: the handle is a blocking pipe to a live-or-exited
+/// child, whose writes fail only as `EPIPE`.
+fn tolerate_stdin_write(result: std::io::Result<()>) {
+    match result {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => unreachable!("stdin pipe writes fail only as EPIPE, got: {e:?}"),
+    }
+}
+
 /// Write a raw commit object, returning its hash.
 ///
 /// PHP: `ArcanistGitAPI::writeRawCommit`
@@ -2300,13 +2314,7 @@ pub fn write_raw_commit(dir: &Path, commit: &RawCommit) -> Result<String, String
         .map_err(|e| format!("failed to run git: {e}"))?;
     if let Some(stdin) = child.stdin.take() {
         let mut stdin = stdin;
-        match stdin.write_all(commit.get_raw_blob().as_bytes()) {
-            Ok(()) => {}
-            // Same EPIPE tolerance as land.rs: git may exit before
-            // reading stdin; the status check below reports it.
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
-            Err(e) => return Err(format!("failed to write raw commit: {e}")), // LCOV_EXCL_LINE // Reason: stdin pipe writes fail only as EPIPE (covered arm); other errors unreachable
-        }
+        tolerate_stdin_write(stdin.write_all(commit.get_raw_blob().as_bytes()));
     }
     let out = child
         .wait_with_output()

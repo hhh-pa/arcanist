@@ -662,6 +662,29 @@ fn list_fails_on_non_array_aliases_value() {
 }
 
 #[test]
+fn load_rejects_bad_system_aliases_value() {
+    // The system source is the only one hermetic tests cannot stage
+    // through load_aliases_in (/etc is privileged), so its bad-value
+    // error path is pinned directly against a fixture map.
+    let system: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(r#"{"aliases": 42}"#).unwrap();
+    let mut aliases = Vec::new();
+    let mut warnings = Vec::new();
+    let err = take_system_source(
+        &system,
+        Path::new("/etc/arcconfig"),
+        &mut aliases,
+        &mut warnings,
+    )
+    .unwrap_err();
+    assert!(err.contains("is not valid"), "{err}");
+    assert!(err.contains("Expected a list or dictionary!"), "{err}");
+    assert!(err.contains("system (/etc/arcconfig)"), "{err}");
+    assert!(aliases.is_empty());
+    assert!(warnings.is_empty());
+}
+
+#[test]
 fn shell_status_mapping_passes_codes_and_fails_signals() {
     assert_eq!(
         shell_status_exit_code(ShellStatus::Exited(0)),
@@ -721,12 +744,15 @@ fn shell_runner_maps_spawn_outcomes() {
         "arc g -> $ echo hi",
         |program, argv| {
             // T1153 CORE-23: Unix mediates the shell (`sh -c`).
-            if cfg!(unix) {
+            #[cfg(unix)]
+            {
                 assert_eq!(program, "sh");
                 assert_eq!(argv, &["-c".to_string(), "'echo' 'hi'".to_string()]);
-            } else {
-                assert_eq!(program, "echo"); // LCOV_EXCL_START // Reason: non-unix arm; cfg!(unix) is always true on ubuntu CI
-                assert_eq!(argv, &["hi".to_string()]); // LCOV_EXCL_STOP
+            }
+            #[cfg(not(unix))]
+            {
+                assert_eq!(program, "echo");
+                assert_eq!(argv, &["hi".to_string()]);
             }
             Ok(ShellStatus::Exited(0))
         },
@@ -768,13 +794,33 @@ fn loaded(aliases: Vec<Alias>) -> Option<(Vec<Alias>, Vec<String>)> {
     Some((aliases, Vec::new()))
 }
 
+fn must_not_spawn_for_dispatch(_: &[String]) -> Result<ShellStatus, String> {
+    unreachable!("must not spawn for dispatch")
+}
+
+#[test]
+#[should_panic(expected = "must not spawn for dispatch")]
+fn must_not_spawn_for_dispatch_fires() {
+    let _ = must_not_spawn_for_dispatch(&[]);
+}
+
+fn must_not_spawn_for_broken_chains(_: &[String]) -> Result<ShellStatus, String> {
+    unreachable!("must not spawn for broken chains")
+}
+
+#[test]
+#[should_panic(expected = "must not spawn for broken chains")]
+fn must_not_spawn_for_broken_chains_fires() {
+    let _ = must_not_spawn_for_broken_chains(&[]);
+}
+
 #[test]
 fn expansion_driver_dispatches_and_reports_shell_and_broken_chains() {
     let aliases = vec![alias("arc", "draft", &["diff", "--draft"], "user")];
     let (result, notices) = apply_expansion_with(
         args(&["draft", "extra"]),
         || loaded(aliases),
-        |_| panic!("must not spawn for dispatch"), // LCOV_EXCL_LINE // Reason: must-not-spawn guard; firing fails the test
+        must_not_spawn_for_dispatch,
     );
     assert_eq!(result, Ok(args(&["diff", "--draft", "extra"])));
     // T1153 CORE-23: cyan log-engine hint (` ALIAS  ...` plain).
@@ -789,11 +835,10 @@ fn expansion_driver_dispatches_and_reports_shell_and_broken_chains() {
         || loaded(aliases),
         |shell| {
             // T1153 CORE-23: Unix mediates the shell (`sh -c`).
-            if cfg!(unix) {
-                assert_eq!(shell, &args(&["sh", "-c", "'echo' 'hi'"]));
-            } else {
-                assert_eq!(shell, &args(&["echo", "hi"])); // LCOV_EXCL_LINE // Reason: non-unix arm; cfg!(unix) is always true on ubuntu CI
-            }
+            #[cfg(unix)]
+            assert_eq!(shell, &args(&["sh", "-c", "'echo' 'hi'"]));
+            #[cfg(not(unix))]
+            assert_eq!(shell, &args(&["echo", "hi"]));
             Ok(ShellStatus::Exited(0))
         },
     );
@@ -817,7 +862,7 @@ fn expansion_driver_dispatches_and_reports_shell_and_broken_chains() {
     let (result, notices) = apply_expansion_with(
         args(&["a"]),
         || loaded(aliases),
-        |_| panic!("must not spawn for broken chains"), // LCOV_EXCL_LINE // Reason: must-not-spawn guard; firing fails the test
+        must_not_spawn_for_broken_chains,
     );
     assert_eq!(result, Err(ExitCode::FAILURE));
     assert_eq!(notices.len(), 2);
@@ -859,7 +904,7 @@ fn expansion_driver_emits_configuration_warnings_first() {
     let (result, notices) = apply_expansion_with(
         args(&["draft"]),
         || Some((aliases, vec![warning.clone()])),
-        |_| panic!("must not spawn for dispatch"), // LCOV_EXCL_LINE // Reason: must-not-spawn guard; firing fails the test
+        must_not_spawn_for_dispatch,
     );
     assert_eq!(result, Ok(args(&["diff"])));
     assert_eq!(notices.len(), 2);

@@ -125,13 +125,22 @@ fn command_for(dir: &Path, hg: &HgCommand, args: &[&str]) -> std::process::Comma
 /// (parallel tests, an editor saving a hook); the error is transient by
 /// nature, so retry bounded, then return the last error unchanged.
 fn spawn_output(cmd: &mut std::process::Command) -> Result<std::process::Output, std::io::Error> {
+    spawn_output_with_limit(cmd, 50)
+}
+
+/// [`spawn_output`] with an injectable retry bound, so tests can exhaust
+/// the retries quickly instead of sleeping through all fifty.
+fn spawn_output_with_limit(
+    cmd: &mut std::process::Command,
+    max_attempts: u32,
+) -> Result<std::process::Output, std::io::Error> {
     let mut attempt = 0;
     loop {
         match cmd.output() {
-            Err(error) if is_text_file_busy(&error) && attempt < 50 => {
-                attempt += 1; // LCOV_EXCL_START // Reason: ETXTBSY retry; macOS exec never reports text-file-busy (probe-gated)
+            Err(error) if is_text_file_busy(&error) && attempt < max_attempts => {
+                attempt += 1;
                 std::thread::sleep(std::time::Duration::from_millis(2));
-            } // LCOV_EXCL_STOP
+            }
             other => return other,
         }
     }

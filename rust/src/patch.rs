@@ -3024,8 +3024,8 @@ pub fn require_clean_tree_with_call(
         return Ok(StashState::Clean);
     }
     resolve_uncommitted_tree(dir, vcs, backends, io, &status, &desc, call, &|template| {
-        diff::edit_interactively(template, EDITOR_COMMIT_MESSAGE, None, None, 0) // LCOV_EXCL_START // Reason: real-editor closure; invoking it needs an interactive editor session
-    }) // LCOV_EXCL_STOP
+        diff::edit_interactively(template, EDITOR_COMMIT_MESSAGE, None, None, 0)
+    })
 }
 
 /// Fail on incomplete directories, conflicts, and missing files with the
@@ -4272,7 +4272,7 @@ fn resolve_commit_message_interactive(
     resolve_commit_message_with_editor(
         bundle,
         call,
-        Some(&|template| diff::edit_interactively(template, EDITOR_PATCH_COMMIT, None, None, 0)), // LCOV_EXCL_LINE // Reason: real-editor closure; invoking it needs an interactive editor session
+        Some(&|template| diff::edit_interactively(template, EDITOR_PATCH_COMMIT, None, None, 0)),
     )
 }
 
@@ -6317,6 +6317,16 @@ fn run_patch_flow_inner(
     )
 }
 
+/// Fold one dependency child outcome into the parent flow: an applied
+/// child continues the loop, while svn hunk failures abort the parent
+/// with the empty error.
+fn combine_dependency_child_outcome(outcome: FlowOutcome) -> Result<(), String> {
+    match outcome {
+        FlowOutcome::Done => Ok(()),
+        FlowOutcome::SvnHunksFailed => Err(String::new()),
+    }
+}
+
 /// Apply revision dependencies oldest-first when the base is not local and
 /// the bundle/options/VCS call for it.
 #[allow(clippy::too_many_arguments)]
@@ -6336,10 +6346,8 @@ fn run_patch_dependencies(
         let children =
             plan_dependency_children_with(dir, vcs, bundle, options, io, call_ref, backends)?;
         for child_options in &children {
-            match run_patch_flow(dir, child_options, io, backends, ansi)? {
-                FlowOutcome::Done => {} // LCOV_EXCL_START // Reason: dependency children need conduit (revision sources); without creds the child errors before returning an outcome
-                FlowOutcome::SvnHunksFailed => return Err(String::new()), // LCOV_EXCL_STOP
-            }
+            let outcome = run_patch_flow(dir, child_options, io, backends, ansi)?;
+            combine_dependency_child_outcome(outcome)?;
         }
     }
     Ok(())

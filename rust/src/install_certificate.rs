@@ -1015,7 +1015,7 @@ fn prepare_install(argv: &[String]) -> Result<InstallPlan, ExitCode> {
     let options = install_options(argv)?;
     let cwd = match std::env::current_dir() {
         Ok(dir) => dir,
-        Err(_) => PathBuf::from("."), // LCOV_EXCL_LINE // Reason: current_dir is infallible in practice; deleting the cwd under parallel tests is unsafe
+        Err(_) => PathBuf::from("."),
     };
     let uri = resolve_install_uri(&options, &cwd)?;
     let arcrc = install_arcrc_for(options.arcrc_file.as_deref())?;
@@ -1060,10 +1060,8 @@ fn read_install_token(
     ansi: bool,
     options: &Options,
 ) -> Result<String, ExitCode> {
-    match render_login_header(ansi) {
-        Ok(header) => print!("{header}"),
-        Err(message) => return Err(fail(message)), // LCOV_EXCL_LINE // Reason: fixed valid pattern plus correct argc; the render cannot fail
-    }
+    let header = render_login_header(ansi).expect("login header renders a fixed valid pattern");
+    print!("{header}");
     let token_url = token_login_url(uri, is_token_auth);
     println!("{}", login_page_block(&token_url));
     install_token_value(options)

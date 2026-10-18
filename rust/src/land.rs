@@ -887,16 +887,24 @@ impl Io {
         }
         // `live` output already echoed above, so the prompt is visible.
         // Flush once more in case output bypassed `push_out`.
-        use std::io::{BufRead, Write};
+        use std::io::Write;
         std::io::stdout().flush().ok();
         std::io::stderr().flush().ok();
-        let mut line = String::new();
-        let stdin = std::io::stdin();
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) => None,
-            Ok(_) => Some(line.trim_end_matches(['\r', '\n']).to_string()), // LCOV_EXCL_START // Reason: needs bytes on real stdin; cargo-test stdin is always EOF
-            Err(_) => None,                                                 // LCOV_EXCL_STOP
-        }
+        read_answer_line(&mut std::io::stdin().lock())
+    }
+}
+
+/// Read one answer line from `reader`, without the trailing newline.
+///
+/// Returns `None` on end of input (EOF) or read failure. Split from
+/// `Io::read_answer` so tests can stage bytes, EOF, and errors through
+/// any `BufRead` (production passes the stdin lock).
+fn read_answer_line(reader: &mut dyn std::io::BufRead) -> Option<String> {
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) => None,
+        Ok(_) => Some(line.trim_end_matches(['\r', '\n']).to_string()),
+        Err(_) => None,
     }
 }
 
@@ -4748,7 +4756,17 @@ fn render_raw_commit_blob(raw: &RawCommit) -> String {
 /// Read one raw commit (`ArcanistGitAPI::readRawCommit()`,
 /// `src/repository/api/ArcanistGitAPI.php:1738-1744`).
 fn git_read_raw_commit(dir: &Path, hash: &str) -> Result<RawCommit, String> {
-    let output = git::output(dir, &["cat-file", "commit", "--", hash])
+    git_read_raw_commit_with(dir, hash, None)
+}
+
+/// [`git_read_raw_commit`] with the `git` program override injected
+/// (test seam; production passes `None`, which spawns `git`).
+fn git_read_raw_commit_with(
+    dir: &Path,
+    hash: &str,
+    git: Option<&Path>,
+) -> Result<RawCommit, String> {
+    let output = git::output_with_git(dir, &["cat-file", "commit", "--", hash], git)
         .map_err(|e| format!("failed to run git: {e}"))?;
     if !output.status.success() {
         let detail = format!(
@@ -4758,13 +4776,39 @@ fn git_read_raw_commit(dir: &Path, hash: &str) -> Result<RawCommit, String> {
         );
         let trimmed = detail.trim();
         if trimmed.is_empty() {
-            return Err(format!("git cat-file commit {hash} failed")); // LCOV_EXCL_LINE // Reason: git failures explain on stdout/stderr; silence needs a kill, not stageable
+            return Err(format!("git cat-file commit {hash} failed"));
         }
         return Err(trimmed.to_string());
     }
     // The blob is used verbatim (no trimming): the message keeps its
     // exact bytes.
     parse_raw_commit_blob(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Write one raw commit, returning its hash
+/// (`ArcanistGitAPI::writeRawCommit()`,
+/// `src/repository/api/ArcanistGitAPI.php:1746-1754`).
+///
+/// Assert a `git hash-object --stdin` pipe-write failure is the benign
+/// early-exit EPIPE.
+///
+/// White-box proof that only EPIPE is possible: `stdin` is a pipe
+/// opened by `Stdio::piped()` on a successfully spawned `git
+/// hash-object --stdin`, and `write_all` pumps an in-memory blob into
+/// it over a blocking fd. The sole failure mode is the reader going
+/// away — git exiting before reading stdin (e.g. its fatal firing
+/// outside a repository) — which the OS reports as EPIPE. No
+/// filesystem, network, or caller-supplied buffer is involved; the pipe
+/// is freshly created (never closed or bad); `std` retries interrupts
+/// internally. Any other `ErrorKind` would indicate a platform or std
+/// bug, so it panics instead of masking the exit-status check below
+/// with a misleading error.
+fn assert_pipe_write_is_epipe(error: &std::io::Error) {
+    if error.kind() != std::io::ErrorKind::BrokenPipe {
+        unreachable!(
+            "pipe writes to git fail only as EPIPE (git exited before reading stdin); got {error:?}"
+        );
+    }
 }
 
 /// Write one raw commit, returning its hash
@@ -4804,8 +4848,7 @@ fn git_write_raw_commit(dir: &Path, raw: &RawCommit) -> Result<String, String> {
         // outside a repo): fall through to the exit-status check for
         // the canonical error instead of this scheduling-dependent
         // EPIPE (Linux CI hit EPIPE, macOS the status).
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
-        Err(e) => return Err(format!("failed to write raw commit: {e}")), // LCOV_EXCL_LINE // Reason: pipe writes to git fail only as EPIPE; other write errors are not stageable
+        Err(e) => assert_pipe_write_is_epipe(&e),
     }
     let output = child
         .wait_with_output()

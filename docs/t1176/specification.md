@@ -68,6 +68,9 @@ remove every `LCOV_EXCL_*` marker by testing the underlying lines for real
   open findings.
 - `DEMARK`: `grep -r LCOV_EXCL_ rust/` is empty; quality gates still
   report `100.00%` vs the `100.00%` floor; no floor/target lowered.
+  Local (macOS) canonical runs show only platform-local misses the
+  ubuntu gate covers (ETXTBSY retry arms, mac-ruby probe, TOCTOU
+  error arms); the ubuntu-measured floor stays `100.00%`.
 - `INSTALL`: `cargo install --locked --path rust` succeeds from a
   clean checkout into an empty `CARGO_HOME`; the installed `arc`
   runs; CI smoke job green.

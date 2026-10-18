@@ -1768,3 +1768,73 @@ fn system_zone_matches_live_etc_contents() {
         system_tz_offset_from(localtime.as_deref(), timezone.as_deref(), now)
     );
 }
+
+#[test]
+fn emit_parts_reports_genuine_render_failures() {
+    // White-box: the shared failure arm handles a REAL `tsprintf`
+    // error — `%d` with no argument is an argc failure from the
+    // production renderer, not a fabricated `Err`.
+    let bad = render_markup("%d", false);
+    assert!(bad.is_err(), "adversarial pattern must fail");
+    // The failure short-circuits (nothing prints) and escapes fatal.
+    assert_eq!(
+        emit_parts(
+            vec![Ok("shown".to_string()), bad],
+            std::process::ExitCode::SUCCESS
+        ),
+        std::process::ExitCode::from(255)
+    );
+}
+
+#[test]
+fn emit_parts_concatenates_and_exits_given_code() {
+    assert_eq!(
+        emit_parts(
+            vec![Ok("a".to_string()), Ok("b".to_string())],
+            std::process::ExitCode::FAILURE
+        ),
+        std::process::ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn fixed_look_render_patterns_never_fail() {
+    // White-box proof that production paths never reach the shared
+    // failure arm: every fixed pattern plus argc combination the call
+    // sites use succeeds in both ANSI modes, and adversarial VALUES
+    // (conversion-looking text) render literally — only the pattern
+    // and argc can fail, and both are fixed.
+    let phases = [
+        LunarPhase::New,
+        LunarPhase::Full,
+        LunarPhase::Waxing,
+        LunarPhase::Waning,
+    ];
+    for ansi in [false, true] {
+        assert!(render_title(ansi).is_ok());
+        assert!(render_paragraph(clearing_text(), ansi).is_ok());
+        assert!(render_paragraph(trails_text(), ansi).is_ok());
+        for hour in [0, 11, 12, 23, 24] {
+            for phase in &phases {
+                assert!(render_paragraph(hour_text(hour, *phase), ansi).is_ok());
+            }
+        }
+        assert!(render_markup(north_markup(), ansi).is_ok());
+        assert!(render_markup(stream_markup(), ansi).is_ok());
+        assert!(render_markup("\n", ansi).is_ok());
+        assert!(render_paragraph(grove_text(), ansi).is_ok());
+        assert!(render_paragraph(grove_remotes_text(), ansi).is_ok());
+        assert!(render_paragraph(river_text(), ansi).is_ok());
+        assert!(render_paragraph(floating_text(), ansi).is_ok());
+        assert!(render_quiet_river(ansi).is_ok());
+        assert!(render_bubbles_tail(ansi).is_ok());
+        // Adversarial values render literally.
+        assert!(render_line("%d%s%W%!%%", ansi).is_ok());
+        assert!(render_line(&unknown_message(&args(&["%d", "%s"])), ansi).is_ok());
+        assert!(render_paragraph("%d%s%W%!%%", ansi).is_ok());
+        // The composed outputs succeed on empty and loaded inputs.
+        assert!(render_remotes_output(&[], ansi).is_ok());
+        assert!(render_published_output(&[], ansi).is_ok());
+        assert!(render_published_output(&["%d".to_string()], ansi).is_ok());
+    }
+}

@@ -569,8 +569,11 @@ fn resolve_input_path(dir: &Path, path: &str) -> String {
             && let Ok(canonical) = std::fs::canonicalize(parent)
         {
             return canonical.join(name).to_string_lossy().to_string();
-        } // LCOV_EXCL_START // Reason: a symlink parent exists by construction; canonicalize fails only on a TOCTOU race
-        return joined.to_string_lossy().to_string(); // LCOV_EXCL_STOP
+        }
+        // TOCTOU race: the symlink parent existed for `is_symlink`
+        // but vanished before `canonicalize` (see the racing-renamer
+        // test).
+        return joined.to_string_lossy().to_string();
     }
     if let Ok(canonical) = std::fs::canonicalize(&joined) {
         return canonical.to_string_lossy().to_string();
@@ -641,7 +644,7 @@ fn read_create_bytes(
     match opts.input.as_deref() {
         None | Some("-") => match stdin_text {
             Some(text) => Ok(text.as_bytes().to_vec()),
-            None => read_stdin_bytes().map_err(crate::conduit::ClassifiedError::fatal), // LCOV_EXCL_LINE // Reason: real-stdin arm; tests inject stdin_text instead
+            None => read_stdin_bytes().map_err(crate::conduit::ClassifiedError::fatal),
         },
         Some(path) => read_input_file(dir, path).map_err(crate::conduit::ClassifiedError::fatal),
     }
@@ -823,10 +826,13 @@ fn execute_parts_with(
 
     if let Some(symbol) = opts.symbol {
         // T1153 PASTE-P4: PHP `echo`s the content raw (no `\n` appended).
-        return Ok(PasteParts {
-            text: read_paste_classified(&client, &symbol)?,
-            browse_uri: None, // LCOV_EXCL_LINE // Reason: coverage artifact; the literal constructs but llvm assigns this line a zero region
-        });
+        let text = read_paste_classified(&client, &symbol)?;
+        // Single-line literal (fmt-pinned): a split literal's field
+        // lines get zero regions from llvm, so the fields ride on
+        // this executed line instead.
+        #[rustfmt::skip]
+        let parts = PasteParts { text, browse_uri: None };
+        return Ok(parts);
     }
     create_paste_parts(dir, &client, &opts, stdin_text)
 }

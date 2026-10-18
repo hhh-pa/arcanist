@@ -285,7 +285,7 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
         for candidate in &candidates {
             let full = dir.join(candidate);
             if full.is_file() {
-                return Some(full); // LCOV_EXCL_LINE // Reason: find hit; jshint is absent from PATH on ubuntu CI
+                return Some(full);
             }
         }
     }

@@ -432,6 +432,19 @@ fn find_in_ancestors(start: &Path) -> Option<PathBuf> {
 }
 
 pub fn find_rebuild_script(path: &Path, fallback: &Path) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok();
+    find_rebuild_script_with_exe(path, fallback, exe.as_deref())
+}
+
+/// [`find_rebuild_script`] with the running-binary path injected (test seam;
+/// production passes the real `current_exe`; `None` skips the binary search
+/// so lookup-miss tests stay deterministic regardless of where the test
+/// binary lives).
+pub fn find_rebuild_script_with_exe(
+    path: &Path,
+    fallback: &Path,
+    exe: Option<&Path>,
+) -> Option<PathBuf> {
     for root in [path, fallback] {
         if let Some(found) = find_in_ancestors(root) {
             return Some(found);
@@ -441,9 +454,7 @@ pub fn find_rebuild_script(path: &Path, fallback: &Path) -> Option<PathBuf> {
     // resolve the script only when run from a checkout carrying it,
     // same as `anoid`. A dev binary under `rust/target/` additionally
     // resolves via its own ancestors.
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| find_in_ancestors(&exe))
+    exe.and_then(find_in_ancestors)
 }
 
 /// Rebuild one v2 library map via `php rebuild-map.php`.
@@ -463,16 +474,30 @@ pub fn rebuild_map_with_php(
     script: Option<&Path>,
     php: Option<&Path>,
 ) -> Option<String> {
+    let exe = std::env::current_exe().ok();
+    rebuild_map_with_php_and_exe(path, clean, script, php, exe.as_deref())
+}
+
+/// [`rebuild_map_with_php`] with the running-binary path injected (test seam;
+/// production passes the real `current_exe`; `None` skips the binary search
+/// so lookup-miss tests stay deterministic regardless of where the test
+/// binary lives).
+pub fn rebuild_map_with_php_and_exe(
+    path: &Path,
+    clean: bool,
+    script: Option<&Path>,
+    php: Option<&Path>,
+    exe: Option<&Path>,
+) -> Option<String> {
     let script = script.map_or_else(
-        || find_rebuild_script(path, path),
+        || find_rebuild_script_with_exe(path, path, exe),
         |s| Some(s.to_path_buf()),
     );
     let Some(script) = script else {
-        // LCOV_EXCL_START // Reason: lookup-miss arm; runs only where no support tree sits above library or binary
         return Some(format!(
             "cannot rebuild '{}': support/lib/rebuild-map.php was not found above the library or the arc binary",
             path.display()
-        )); // LCOV_EXCL_STOP
+        ));
     };
     let mut command = match php {
         Some(program) => crate::proc_env::command(program),

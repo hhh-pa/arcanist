@@ -1242,3 +1242,95 @@ fn prepare_gates_on_open_arcrc_permissions_defensive_ok_arm() {
     ];
     let _code = expect_prepare_failure(&argv);
 }
+
+// -( T1176 PC-1: env-globals )------------------------------------------------
+
+#[test]
+fn pc1_login_header_render_is_infallible() {
+    // White-box: `tsprintf_ansi` fails only on pattern/argc defects
+    // (adversarial cases below), so the fixed `"**%s**\n"` pattern
+    // with exactly one argument — the `read_install_token` call —
+    // cannot fail, and its `Err` arm pins `unreachable!`.
+    use arc_rs::terminal::{TVal, tsprintf_ansi};
+    let one = [TVal::Text("a")];
+    assert_eq!(
+        tsprintf_ansi("%s %s", &one, false).unwrap_err(),
+        "Too few arguments to xsprintf()."
+    );
+    assert_eq!(
+        tsprintf_ansi("%s", &[TVal::Text("a"), TVal::Text("b")], false).unwrap_err(),
+        "Too many arguments to xsprintf()."
+    );
+    assert!(
+        tsprintf_ansi("%5s", &one, false)
+            .unwrap_err()
+            .contains("does not support")
+    );
+    assert!(
+        tsprintf_ansi("%q", &one, false)
+            .unwrap_err()
+            .contains("Unsupported escape sequence")
+    );
+    assert_eq!(
+        render_login_header(false),
+        Ok("LOGIN TO PHABRICATOR\n".to_string())
+    );
+    assert_eq!(
+        render_login_header(true),
+        Ok("\u{1b}[1mLOGIN TO PHABRICATOR\u{1b}[m\n".to_string())
+    );
+}
+
+/// Probe marker: the deleted-cwd child re-runs only the probe test,
+/// so the suite never chdirs its own process (TZ-precedent shape).
+const PC1_DELETED_CWD_ENV: &str = "ARC_RS_PC1_INSTCERT_DELETED_CWD";
+#[cfg(unix)]
+const PC1_DELETED_CWD_PROBE: &str = "pc1_deleted_cwd_probe_install_plan";
+
+/// Probe body for `pc1_deleted_cwd_prepare_install_falls_back`:
+/// with a deleted cwd, `prepare_install` falls back to `"."` and the
+/// explicit-URI plan still resolves (missing arcrc reads empty, so no
+/// conduit traffic happens). Direct suite runs pass through.
+#[test]
+fn pc1_deleted_cwd_probe_install_plan() {
+    if std::env::var_os(PC1_DELETED_CWD_ENV).is_none() {
+        return;
+    }
+    println!("INSTCERT-PC1-DELETED-CWD-OK");
+    assert!(
+        std::env::current_dir().is_err(),
+        "probe premise: the child runs with a deleted cwd"
+    );
+    let plan = prepare_install(&["https://h.test/".to_string()]).expect("plan resolves");
+    assert!(plan.uri.contains("h.test"), "{}", plan.uri);
+}
+
+/// Deleted-cwd child: `sh` owns the cwd deletion (never the test
+/// process), then re-execs this test binary on the probe filter. The
+/// child HOME is an empty fixture; `ARC_CONDUIT_URI` stays unset so
+/// the positional URI is the only channel.
+#[test]
+#[cfg(unix)]
+fn pc1_deleted_cwd_prepare_install_falls_back() {
+    let tmp = TempDir::new("deleted-cwd-home");
+    let exe = std::env::current_exe().expect("test binary path");
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("d=$(mktemp -d); cd \"$d\"; rmdir \"$d\"; exec \"$0\" \"$@\"")
+        .arg(&exe)
+        .args(["--nocapture", PC1_DELETED_CWD_PROBE])
+        .env(PC1_DELETED_CWD_ENV, "1")
+        .env("HOME", &tmp.path)
+        .env_remove("ARC_CONDUIT_URI")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("spawn deleted-cwd probe child");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success()
+            && stdout.contains("1 passed")
+            && stdout.contains("INSTCERT-PC1-DELETED-CWD-OK"),
+        "deleted-cwd probe child failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+}

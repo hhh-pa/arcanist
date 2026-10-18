@@ -376,6 +376,24 @@ fn take_source(
     Ok(())
 }
 
+/// Parse aliases from an already-read system config map into the
+/// accumulators. Split from [`load_aliases_in`]'s `/etc` read so hermetic
+/// tests can pin the bad-value error path with a fixture map (writing
+/// `/etc/arcconfig` needs privileges).
+fn take_system_source(
+    system: &serde_json::Map<String, serde_json::Value>,
+    system_path: &Path,
+    aliases: &mut Vec<Alias>,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    take_source(
+        system,
+        &format!("system ({})", system_path.display()),
+        aliases,
+        warnings,
+    )
+}
+
 /// Load aliases from every file source, least to most specific (system,
 /// user, project, local), mirroring the PHP source order. Later entries
 /// win during resolution. A non-array `aliases` value in any source is a
@@ -389,12 +407,7 @@ pub fn load_aliases_in(
     let mut warnings = Vec::new();
     let system_path = get_config::system_config_path();
     let system = get_config::read_system_config()?;
-    take_source(
-        &system,
-        &format!("system ({})", system_path.display()),
-        &mut aliases,
-        &mut warnings,
-    )?; // LCOV_EXCL_LINE // Reason: needs a bad /etc/arcconfig aliases value; hermetic tests cannot write /etc
+    take_system_source(&system, &system_path, &mut aliases, &mut warnings)?;
     if let Some(path) = user_file {
         // T1153 CORE-28: toolset workflows read the user file through the
         // `ArcanistUserConfigurationSource` transform (section wins).
@@ -703,18 +716,17 @@ fn hint_notice(label: &str, message: &str) -> String {
 /// metacharacters expand and unknown commands exit 127); elsewhere the
 /// words spawn directly (PHP `bypass_shell` on Windows).
 fn shell_spawn_argv(shell_argv: &[String]) -> (String, Vec<String>) {
-    if cfg!(unix) {
-        (
-            "sh".to_string(),
-            vec!["-c".to_string(), terminal::shell_join(shell_argv)],
-        )
-    } else {
-        // LCOV_EXCL_START // Reason: non-unix arm; cfg!(unix) is always true on ubuntu CI
-        match shell_argv.split_first() {
-            Some((program, args)) => (program.clone(), args.to_vec()), // LCOV_EXCL_STOP
-            None => (String::new(), Vec::new()), // LCOV_EXCL_LINE // Reason: non-unix arm; cfg!(unix) is always true on ubuntu CI
-        }
-    }
+    #[cfg(unix)]
+    let spawned = (
+        "sh".to_string(),
+        vec!["-c".to_string(), terminal::shell_join(shell_argv)],
+    );
+    #[cfg(not(unix))]
+    let spawned = match shell_argv.split_first() {
+        Some((program, args)) => (program.clone(), args.to_vec()),
+        None => (String::new(), Vec::new()),
+    };
+    spawned
 }
 
 /// Run a resolved shell alias through an injected spawner, mirroring

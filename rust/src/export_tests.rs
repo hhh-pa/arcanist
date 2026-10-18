@@ -83,15 +83,8 @@ fn rejects_mixed_sources_and_stray_positionals() {
     // ignored; multiple positionals still fail for local sources.
     let opts = expect_export_args(&["--git", "--revision", "1", "HEAD"], "ignored positional");
     assert_eq!(opts.source, Source::Revision(1));
-    assert!(
-        // LCOV_EXCL_START // Reason: false arm fails the passing assert
-        matches!(
-            // LCOV_EXCL_STOP
-            parse_args(&argv(&["--git", "a", "b"])),
-            ParseOutcome::Error(_)
-        ),
-        "multi-positional local source"
-    );
+    let message = expect_export_error(&["--git", "a", "b"], "multi-positional local source");
+    assert!(message.contains("exactly one base commit"), "{message}");
 }
 
 #[test]
@@ -811,9 +804,16 @@ fn export_e_render_changes(dir: &std::path::Path, base: &str) -> Vec<crate::patc
     local_render_changes(dir, base, &head, &parsed)
 }
 
-// LCOV_EXCL_START // Reason: blob guard passed as a callback but never invoked; text renders load no blobs
 fn export_e_no_blobs(_phid: &str, _name: Option<&str>) -> Result<Vec<u8>, String> {
-    panic!("text renders load no blobs") // LCOV_EXCL_STOP
+    panic!("text renders load no blobs")
+}
+
+#[test]
+#[should_panic(expected = "text renders load no blobs")]
+fn export_e_no_blobs_guard_fires_when_invoked() {
+    // The guard documents the text-render contract (no blob loads);
+    // invoking it directly pins the failure it reports.
+    let _ = export_e_no_blobs("PHID-FILE-9", Some("a.bin"));
 }
 
 #[test]
@@ -1935,35 +1935,70 @@ fn run_sink_failure_is_fatal() {
 fn cov6g_local_diff_bytes_tolerates_spawn_race() {
     // The `output(...)?` in `local_diff_bytes` fails only when the
     // diff spawn fails after the work-tree and head probes succeeded:
-    // a TOCTOU only a rename race can reach. Outcomes vary by timing,
-    // so nothing is asserted about them; the test passes
-    // deterministically while giving the race window every chance to
-    // hit.
+    // a TOCTOU only a rename race can reach. The toggle below is
+    // channel-gated: the helper parks the repo away, waits for the
+    // probe, then restores it, so every probe deterministically runs
+    // against a moved-away work tree. Outcomes still vary (the probes
+    // fail before any spawn), so nothing is asserted about them; the
+    // final gated cycle leaves the repo parked, so the restore runs
+    // deterministically instead of on toggler timing.
     let dir = fixture_repo("cov6g-race");
     std::fs::write(dir.join("f.txt"), "one\n").unwrap();
     git(&dir, &["add", "f.txt"]);
     git(&dir, &["commit", "-qm", "init"]);
     let away = dir.with_extension("cov6g-away");
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (moved_tx, moved_rx) = std::sync::mpsc::channel::<()>();
+    let (back_tx, back_rx) = std::sync::mpsc::channel::<()>();
     let toggler = std::thread::spawn({
         let (dir, away, stop) = (dir.clone(), away.clone(), stop.clone());
         move || {
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
                 std::fs::rename(&dir, &away).ok();
+                moved_tx.send(()).unwrap();
+                back_rx.recv().unwrap();
                 std::fs::rename(&away, &dir).ok();
             }
         }
     });
-    for _ in 0..400 {
+    for _ in 0..50 {
+        moved_rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .unwrap();
         let _ = local_diff_bytes(&dir, Format::Git, "HEAD");
+        back_tx.send(()).unwrap();
     }
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    toggler.join().unwrap();
+    // Final gated cycle: the helper stays parked until the restore
+    // below runs, so `stop` is set before it is released (it then
+    // observes `stop` and exits instead of parking again).
+    moved_rx
+        .recv_timeout(std::time::Duration::from_secs(15))
+        .unwrap();
+    assert!(!dir.exists());
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
     if !dir.exists() {
-        std::fs::rename(&away, &dir).ok(); // LCOV_EXCL_LINE // Reason: race-window restore; the toggler timing decides, not deterministically reachable
+        std::fs::rename(&away, &dir).ok();
     }
+    back_tx.send(()).unwrap();
+    toggler.join().unwrap();
+    assert!(dir.exists());
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(&away).ok();
+}
+
+#[test]
+fn local_diff_bytes_spawn_failure_reports_git_error() {
+    // The diff spawn fails while the probes succeed (healthy repo,
+    // unspawnable git program): the `?` propagates the spawn error
+    // deterministically, replacing the old rename-race staging.
+    let dir = fixture_repo("diff-spawn-fail");
+    std::fs::write(dir.join("f.txt"), "one\n").unwrap();
+    git(&dir, &["add", "f.txt"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    let err = local_diff_bytes_with_git(&dir, Format::Git, "HEAD", Some(&dir.join("no-such-git")))
+        .unwrap_err();
+    assert!(err.contains("failed to run git"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
 }
 // -( T1170 wave 6h: helper-arm coverage )--------------------------------------
 
@@ -2052,4 +2087,252 @@ fn execute_writes_local_bundle_through_configured_client() {
     assert_eq!(out, "Done.\n");
     assert!(dir.join("out.tar.gz").is_file());
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// -( T1176 PC-3: export-conduit demark )---------------------------------------
+
+/// Owned scratch dir (pid + counter tag); removed on drop.
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "arc-rs-export-pc3-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
+/// Initialize `dir` as a commit-ready git repo.
+fn init_repo(dir: &std::path::Path) {
+    git(dir, &["init", "-q", "-b", "master"]);
+    git(dir, &["config", "user.email", "t@t"]);
+    git(dir, &["config", "user.name", "t"]);
+    git(dir, &["config", "commit.gpgsign", "false"]);
+}
+
+/// `user.whoami` + `user.query` routes for the EXPORT-E30 author query.
+fn author_routes() -> std::collections::HashMap<String, String> {
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "user.whoami".to_string(),
+        envelope(r#"{"phid": "PHID-USER-1"}"#),
+    );
+    routes.insert(
+        "user.query".to_string(),
+        envelope(r#"{"1": {"realName": "Ada"}}"#),
+    );
+    routes
+}
+
+#[test]
+fn t1176_pc3_local_blob_loader_reports_no_source() {
+    // Local changes carry binary bytes inline, never PHIDs, so the
+    // local blob loader always errors; the name is ignored.
+    for name in [Some("a.bin"), None] {
+        assert_eq!(
+            local_export_blob_loader("PHID-FILE-1", name).unwrap_err(),
+            "Nowhere to load blob 'PHID-FILE-1' from!"
+        );
+    }
+}
+
+#[test]
+fn t1176_pc3_local_git_binary_add_end_to_end() {
+    // Local `--git` over a stubbed conduit (EXPORT-E30): a binary add
+    // renders its bytes from disk through the real entry point.
+    let tmp = TempDir::new("local-bin");
+    let dir = tmp.path();
+    init_repo(dir);
+    std::fs::write(dir.join("f.txt"), "one\n").unwrap();
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-qm", "one"]);
+    let blob: &[u8] = b"BIN\x00ADD-bytes!";
+    std::fs::write(dir.join("a.bin"), blob).unwrap();
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-qm", "two"]);
+
+    let base = serve(author_routes(), 2);
+    let arcrc = fake_arcrc(dir, &base);
+    let text = execute_with_user_file(
+        dir,
+        &argv(&["--git", "HEAD~1", "--conduit-uri", base.as_str()]),
+        Some(&arcrc),
+    )
+    .unwrap();
+    // Independent oracle: the new blob SHA from git itself; the old
+    // side of an add is 40 zeros.
+    let new_sha = crate::git::stdout_text(dir, &["rev-parse", "HEAD:a.bin"]).unwrap();
+    assert!(text.contains("diff --git a/a.bin b/a.bin\n"), "{text}");
+    assert!(
+        text.contains(&format!("index {}..{new_sha}\n", "0".repeat(40))),
+        "{text}"
+    );
+    assert!(text.contains("GIT binary patch\n"), "{text}");
+    assert!(
+        text.contains(&format!("literal {}\n", blob.len())),
+        "{text}"
+    );
+    assert!(!text.contains("Binary files"), "{text}");
+}
+
+#[test]
+fn t1176_pc3_conduit_git_binary_add_downloads_blob() {
+    // Conduit `--git` with a binary add: the blob-download closure
+    // fetches the new bytes over `file.download`.
+    let tmp = TempDir::new("conduit-bin");
+    let dir = tmp.path();
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "differential.querydiffs".to_string(),
+        envelope(
+            r#"{"7": {"id": 7, "changes": [
+                {"metadata": {"new:binary-phid": "PHID-FILE-9"},
+                 "oldPath": "a.bin", "currentPath": "a.bin", "awayPaths": [],
+                 "oldProperties": {}, "newProperties": {}, "type": 1,
+                 "fileType": 3, "commitHash": null, "hunks": []}]}}"#,
+        ),
+    );
+    // "blob-bytes" in base64.
+    routes.insert(
+        "file.download".to_string(),
+        envelope(r#""YmxvYi1ieXRlcw==""#),
+    );
+    let base = serve(routes, 2);
+    let arcrc = fake_arcrc(dir, &base);
+    let text = execute_with_user_file(
+        dir,
+        &argv(&["--git", "--diff", "7", "--conduit-uri", base.as_str()]),
+        Some(&arcrc),
+    )
+    .unwrap();
+    let new_sha = crate::patch::git_blob_sha1(b"blob-bytes");
+    assert!(text.contains("diff --git a/a.bin b/a.bin\n"), "{text}");
+    assert!(text.contains("new file mode 100644\n"), "{text}");
+    assert!(
+        text.contains(&format!("index {}..{new_sha}\n", "0".repeat(40))),
+        "{text}"
+    );
+    assert!(text.contains("GIT binary patch\n"), "{text}");
+    assert!(text.contains("literal 10\n"), "{text}");
+    assert!(text.contains("literal 0\n"), "{text}");
+}
+
+#[test]
+fn t1176_pc3_bundle_bytes_success_end_to_end() {
+    // `--arcbundle` through the bytes sink: the Bundle success arm
+    // returns the UTF-8 stdout bytes verbatim.
+    let tmp = TempDir::new("bundle-bytes");
+    let dir = tmp.path();
+    init_repo(dir);
+    std::fs::write(dir.join("f.txt"), "one\n").unwrap();
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-qm", "one"]);
+    std::fs::write(dir.join("f.txt"), "one\ntwo\n").unwrap();
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-qm", "two"]);
+
+    let base = serve(author_routes(), 2);
+    let arcrc = fake_arcrc(dir, &base);
+    let bytes = execute_bytes_with_user_file(
+        dir,
+        &argv(&[
+            "--arcbundle",
+            "out.tar.gz",
+            "HEAD~1",
+            "--conduit-uri",
+            base.as_str(),
+        ]),
+        Some(&arcrc),
+    )
+    .unwrap();
+    assert_eq!(bytes, b"Done.\n");
+    assert!(dir.join("out.tar.gz").is_file());
+}
+
+#[test]
+fn t1176_pc3_conduit_sink_applies_encoding() {
+    // Conduit `--git` with `--encoding`: the conduit-source sink arm
+    // converts the rendered UTF-8 text at the sink.
+    let tmp = TempDir::new("conduit-enc");
+    let dir = tmp.path();
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "differential.querydiffs".to_string(),
+        envelope(
+            r#"{"31": {"id": 31, "changes": [{
+                "metadata": {},
+                "oldPath": "a.txt",
+                "currentPath": "a.txt",
+                "awayPaths": [],
+                "oldProperties": [],
+                "newProperties": [],
+                "type": "2",
+                "fileType": "1",
+                "commitHash": null,
+                "hunks": [{
+                    "oldOffset": "1", "oldLength": "1",
+                    "newOffset": "1", "newLength": "1",
+                    "addLines": 1, "delLines": 1,
+                    "isMissingOldNewline": false,
+                    "isMissingNewNewline": false,
+                    "corpus": "-caf\u00e9\n+caf\u00e9!\n"}]}]}}"#,
+        ),
+    );
+    let base = serve(routes, 1);
+    let arcrc = fake_arcrc(dir, &base);
+    let bytes = execute_bytes_with_user_file(
+        dir,
+        &argv(&[
+            "--git",
+            "--diff",
+            "31",
+            "--encoding",
+            "windows-1252",
+            "--conduit-uri",
+            base.as_str(),
+        ]),
+        Some(&arcrc),
+    )
+    .unwrap();
+    assert!(bytes.windows(7).any(|w| w == b"+caf\xE9!\n"), "{bytes:?}");
+}
+
+#[test]
+fn conduit_export_without_credentials_reports_client_error() {
+    // Conduit `--git` with no token for the conduit host: client
+    // construction fails before any query dials out.
+    let tmp = TempDir::new("conduit-nocreds");
+    let dir = tmp.path();
+    let arcrc = dir.join("fake.arcrc");
+    std::fs::write(&arcrc, r#"{"hosts": {}}"#).unwrap();
+    let err = execute_bytes_with_user_file(
+        dir,
+        &argv(&[
+            "--git",
+            "--diff",
+            "31",
+            "--conduit-uri",
+            "http://127.0.0.1:9/",
+        ]),
+        Some(&arcrc),
+    )
+    .unwrap_err();
+    assert!(!err.is_empty(), "expected a credentials error");
 }

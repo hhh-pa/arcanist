@@ -915,3 +915,35 @@ fn core16_toolset_parse_error_is_bold() {
         std::process::ExitCode::FAILURE
     );
 }
+
+// -( T1176 PC-1: env-globals )------------------------------------------------
+
+#[test]
+fn pc1_report_trace_rethrows_usage_and_exception() {
+    // Serial: staging ARC_TRACE is process-global mutation, so the
+    // shared lock excludes sibling serial tests and the guard
+    // restores. Goes through the `terminal::trace_enabled` globals
+    // seam (cell, else `ARC_TRACE`), like the `--trace` runtime path.
+    use crate::config::{PC1_ENV_LOCK, Pc1EnvGuard};
+    let _serial = PC1_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let guard = Pc1EnvGuard::set("ARC_TRACE", std::ffi::OsStr::new("1"));
+    assert!(crate::terminal::trace_enabled());
+    assert_eq!(
+        report(EnvelopeKind::Usage, "u-msg"),
+        std::process::ExitCode::from(EXIT_FATAL)
+    );
+    assert_eq!(
+        report(EnvelopeKind::Exception, "e-msg"),
+        std::process::ExitCode::from(EXIT_FATAL)
+    );
+    // Toolset arms keep their rendering under `--trace`.
+    assert_eq!(
+        report(EnvelopeKind::ToolsetUsage, "t-msg"),
+        std::process::ExitCode::FAILURE
+    );
+    let saved = guard.saved().map(|value| value.to_os_string());
+    drop(guard);
+    assert_eq!(std::env::var_os("ARC_TRACE"), saved);
+}

@@ -218,21 +218,31 @@ pub fn terminal_width() -> Option<usize> {
 
 #[cfg(not(windows))]
 fn terminal_width_from_tput() -> Option<usize> {
-    let output = crate::proc_env::command("tput")
+    terminal_width_from_program("tput")
+}
+
+/// Spawn `program cols` and parse the width. `program` is a test seam so
+/// hermetic tests can point at fixture-local fake `tput` scripts instead
+/// of depending on a terminal.
+#[cfg(not(windows))]
+fn terminal_width_from_program<S: AsRef<std::ffi::OsStr>>(program: S) -> Option<usize> {
+    let output = crate::proc_env::command(program)
         .arg("cols")
         .stdin(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
     if !output.status.success() {
-        return None; // LCOV_EXCL_LINE // Reason: tput cols succeeds with a terminal; without one (gate container) this arm takes instead
-    } // LCOV_EXCL_START // Reason: tput fails where gates measure (no terminal in the gate container), so the success-parse body never executes on CI; covered on developer runs
-    let width: usize = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .ok()?;
+        return None;
+    }
+    parse_tput_width(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parse `tput cols` output to a positive width.
+#[cfg(not(windows))]
+fn parse_tput_width(text: &str) -> Option<usize> {
+    let width: usize = text.trim().parse().ok()?;
     if width > 0 { Some(width) } else { None }
-    // LCOV_EXCL_STOP
 }
 
 /// The default truncation terminator (`…`), like the truncator default.

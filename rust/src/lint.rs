@@ -3057,11 +3057,20 @@ fn prompt_default_relative_commit(
 /// Mercurial base commit: explicit `--rev` resolves against the working
 /// copy (`resolve_explicit_base()`), else the automatic base.
 fn hg_base_for(work: &WorkCopy, rev: Option<&str>) -> Result<String, String> {
+    hg_base_for_with(work, rev, &hg::HgCommand::system())
+}
+
+/// [`hg_base_for`] driving `hg` through `hg_cmd` (test seam).
+fn hg_base_for_with(
+    work: &WorkCopy,
+    rev: Option<&str>,
+    hg_cmd: &hg::HgCommand,
+) -> Result<String, String> {
     if let Some(rev) = rev {
-        return hg::resolve_explicit_base(&work.vcs_root, rev).map(|(base, _)| base);
+        return hg::resolve_explicit_base_with(&work.vcs_root, hg_cmd, rev).map(|(base, _)| base);
     }
-    let branch = hg::get_branch_name(&work.vcs_root)?;
-    hg::auto_base_commit(&work.vcs_root, &branch, ".").map(|(base, _)| base) // LCOV_EXCL_LINE // Reason: needs a working hg binary; the gates container ships none
+    let branch = hg::get_branch_name_with(&work.vcs_root, hg_cmd)?;
+    hg::auto_base_commit_with(&work.vcs_root, hg_cmd, &branch, ".").map(|(base, _)| base)
 }
 
 /* -(  Path selection  )------------------------------------------------------ */
@@ -5153,11 +5162,10 @@ fn lint_all(options: &Options) -> bool {
 pub fn run(argv: &[String]) -> ExitCode {
     let cwd = match std::env::current_dir() {
         Ok(dir) => dir,
-        // LCOV_EXCL_START // Reason: needs getcwd to fail on the test runner's cwd; not stageable
         Err(error) => {
             return conduit::report(
                 EnvelopeKind::Exception,
-                &format!("cannot determine current directory: {error}"), // LCOV_EXCL_STOP
+                &format!("cannot determine current directory: {error}"),
             );
         }
     };
@@ -5754,11 +5762,17 @@ fn amend_head(work: &WorkCopy) -> Result<(), String> {
 
 /// Stage the worktree (`git add -u`) and amend HEAD.
 fn amend_git_head(root: &Path) -> Result<(), String> {
-    let out = git::output(root, &["add", "-u"])?;
+    amend_git_head_with(root, None)
+}
+
+/// [`amend_git_head`] with the `git` program override injected (test
+/// seam; production passes `None`, which spawns `git`).
+fn amend_git_head_with(root: &Path, git: Option<&Path>) -> Result<(), String> {
+    let out = git::output_with_git(root, &["add", "-u"], git)?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         if stderr.is_empty() {
-            return Err("git add -u failed".to_string()); // LCOV_EXCL_LINE // Reason: git failures explain on stderr; empty stderr needs a silent kill, not stageable
+            return Err("git add -u failed".to_string());
         }
         return Err(format!("git add -u failed: {stderr}"));
     }

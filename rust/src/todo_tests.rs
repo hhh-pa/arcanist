@@ -574,3 +574,58 @@ fn authed_run_browse_failure_reports_usage() {
         std::process::ExitCode::FAILURE
     );
 }
+
+// -( T1176 PC-1: env-globals )------------------------------------------------
+
+/// Probe marker: the deleted-cwd child re-runs only the probe test,
+/// so the suite never chdirs its own process (TZ-precedent shape).
+const PC1_DELETED_CWD_ENV: &str = "ARC_RS_PC1_TODO_DELETED_CWD";
+#[cfg(unix)]
+const PC1_DELETED_CWD_PROBE: &str = "pc1_deleted_cwd_probe_blank_summary";
+
+/// Probe body for `pc1_deleted_cwd_falls_back_to_dot`: with a deleted
+/// cwd, `execute_ansi` falls back to `"."` and the blank summary
+/// short-circuits before any conduit traffic. Direct suite runs (cwd
+/// intact, env unset) pass through.
+#[test]
+fn pc1_deleted_cwd_probe_blank_summary() {
+    if std::env::var_os(PC1_DELETED_CWD_ENV).is_none() {
+        return;
+    }
+    println!("TODO-PC1-DELETED-CWD-OK");
+    assert!(
+        std::env::current_dir().is_err(),
+        "probe premise: the child runs with a deleted cwd"
+    );
+    let client = conduit::Client::new("https://probe.invalid/", "dummy")
+        .expect("client construction performs no I/O");
+    let options = plain_options(&[]);
+    assert_eq!(
+        execute_ansi(&client, &options, false),
+        Ok("Please provide a summary.\n".to_string())
+    );
+}
+
+/// Deleted-cwd child: `sh` owns the cwd deletion (never the test
+/// process), then re-execs this test binary on the probe filter.
+#[test]
+#[cfg(unix)]
+fn pc1_deleted_cwd_falls_back_to_dot() {
+    let exe = std::env::current_exe().expect("test binary path");
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("d=$(mktemp -d); cd \"$d\"; rmdir \"$d\"; exec \"$0\" \"$@\"")
+        .arg(&exe)
+        .args(["--nocapture", PC1_DELETED_CWD_PROBE])
+        .env(PC1_DELETED_CWD_ENV, "1")
+        .output()
+        .expect("spawn deleted-cwd probe child");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success()
+            && stdout.contains("1 passed")
+            && stdout.contains("TODO-PC1-DELETED-CWD-OK"),
+        "deleted-cwd probe child failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+}
