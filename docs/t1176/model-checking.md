@@ -23,6 +23,7 @@ zero `unsafe` (geiger gate). The complete inventory:
 | Checker | Class | Verdict |
 |---------|-------|---------|
 | **Loom 0.7** (chosen) | Exhaustive interleaving exploration for Mutex/RwLock/atomics/thread models | Fits #1–#3 exactly: small protocols, exhaustive schedules, stable toolchain, dev-only dep, fast (<1s). Implemented in `rust/src/conduit_loom.rs`, CI job `loom`. |
+| **TLA+ / TLC 1.8.0** (chosen, alongside Loom) | Exhaustive state-space proof over a TLA+ model: deadlock-freedom + invariants + liveness over *every* reachable state | Complements Loom: Loom explores interleavings of the real Rust code (bounded by its scheduler model); TLC proves properties of the protocol design itself. Models in `tla/`, run manually (java + tla2tools.jar), results below. |
 | Shuttle | Randomized scheduler for threads/async | Rejected: schedules randomly rather than exhaustively; our protocols are small enough to exhaust. No async runtime to schedule. |
 | Kani (CBMC) | Bit-precise proofs over bounded code + `unsafe` | Rejected: zero `unsafe` in tree; needs nightly + CBMC in CI for no reachable proof target. |
 | Miri | UB + data-race detection by interpretation | Rejected: the suite builds `reqwest`/TLS clients (FFI: ring, sockets) that Miri cannot execute; the remaining pure subset has no shared-memory threading, so expected signal ≈ 0 at high CI cost. |
@@ -59,10 +60,31 @@ dependency behind `[features] loom = ["dep:loom"]`.
   no panic, capabilities union monotonic, identity pairs never torn.
   Fetch-add uniqueness holds on every schedule (negative-controlled:
   a broken assertion fails the model).
+- **F4 (proven): lock discipline + first-wins, by TLC.**
+  `tla/Locks.tla` models the guard discipline (`C` = CWD_LOCK,
+  `E` = ENV_LOCK; t1 takes C-then-E, t2 takes E, t3 takes C):
+  TLC 1.8.0 checks all 40 distinct states — no deadlock, `TypeOK`
+  holds, temporal `Liveness` (every thread finishes) holds.
+  `tla/FirstWins.tla` models the `OnceLock` first-wins contract
+  (2 writers, 1 reader): all 14 distinct states satisfy `Coherence`
+  (readers never disagree), `Consistent` (cell == winner once set),
+  and `Liveness`. Negative control `tla/LocksBad.tla` inverts the
+  dual-lock orders (t1: E-then-C vs t3: C-then-E): TLC finds the
+  deadly embrace at depth 4 (t1 holds E wants C, t3 holds C wants
+  E), proving the model can catch the bug class — so the clean
+  `Locks` result is not vacuous. Single-lock threads can never join
+  a wait cycle, which is why the production shape (exactly one
+  dual-holder, fixed C-then-E order) is provably safe.
+  Reproduce: `java -cp tla2tools.jar tlc2.TLC -config tla/M.cfg tla/M`
+  for M in Locks, FirstWins (expect exit 0, "No error has been
+  found") and LocksBad (expect exit 11, "Deadlock reached").
 
 ## Residual risks
 
-- Loom has no `OnceLock`; first-wins is covered by audit + the merged
-  regression test, not by a model.
+- TLC proves the *model*, not the implementation: the Locks/FirstWins
+  results assume the Rust code matches the modeled protocol (guard
+  orders, set-once cells). Loom covers the implementation side for
+  #1–#3; first-wins has the merged regression test plus the TLA+
+  proof, but no Loom model (Loom has no `OnceLock`).
 - Future tests must route CWD dependence through `with_current_dir`
   (comment-enforced, like `HomeGuard` before it).
