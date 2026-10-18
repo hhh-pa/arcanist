@@ -3720,6 +3720,140 @@ fn cov_changed_lines_reports_hg_svn_errors() {
     }
 }
 
+#[cfg(unix)]
+fn chmod_exec(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Absolute form of a [`TempDir`] path: fakes spawn with the work dir
+/// as their cwd, so a relative program path would resolve wrong.
+#[cfg(unix)]
+fn abspath(path: &Path) -> PathBuf {
+    std::env::current_dir().unwrap().join(path)
+}
+
+#[test]
+#[cfg(unix)]
+fn t1176_merge_hg_status_merges_range_and_uncommitted() {
+    // Fake `hg` stages both merges: the range arm answers the
+    // `--rev ... --rev tip` probe, the uncommitted arm answers `status`;
+    // untracked entries stay dropped.
+    let tmp = TempDir::new("t1176-hg-status");
+    let fake = tmp.write(
+        "fakehg.sh",
+        "#!/bin/sh\ncase \" $* \" in\n*\" tip \"*) printf 'M range.txt\\n';;\n*) printf 'M work.txt\\n? new.txt\\n';;\nesac\nexit 0\n",
+    );
+    chmod_exec(&fake);
+    let hg_cmd = hg::HgCommand::custom(abspath(&fake).to_str().unwrap(), &[]);
+    let mut merged = BTreeMap::new();
+    merge_hg_status_with(tmp.path(), Some("tip"), &mut merged, &hg_cmd).unwrap();
+    assert!(merged.contains_key("range.txt"), "{merged:?}");
+    assert!(merged.contains_key("work.txt"), "{merged:?}");
+    assert!(!merged.contains_key("new.txt"), "{merged:?}");
+}
+
+#[test]
+#[cfg(unix)]
+fn t1176_merge_svn_status_drops_untracked() {
+    // Fake `svn` answers the `--xml status` probe; untracked entries
+    // stay dropped.
+    let tmp = TempDir::new("t1176-svn-status");
+    tmp.write(
+        "status.xml",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<status>\n<target path=\".\">\n<entry path=\"m.txt\">\n<wc-status props=\"none\" item=\"modified\" revision=\"42\">\n</wc-status>\n</entry>\n<entry path=\"u.txt\">\n<wc-status props=\"none\" item=\"unversioned\" revision=\"42\">\n</wc-status>\n</entry>\n</target>\n</status>\n",
+    );
+    let fake = tmp.write(
+        "fakesvn.sh",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\ncat \"$dir/status.xml\"\nexit 0\n",
+    );
+    chmod_exec(&fake);
+    let svn_cmd = svn::SvnCommand::custom(abspath(&fake).to_str().unwrap(), &[]);
+    let mut merged = BTreeMap::new();
+    merge_svn_status_with(tmp.path(), &mut merged, &svn_cmd).unwrap();
+    assert_eq!(merged.keys().collect::<Vec<_>>(), vec!["m.txt"]);
+}
+
+#[test]
+#[cfg(unix)]
+fn t1176_changed_lines_svn_reports_diff_lines() {
+    // Fake `svn` answers status (modified) plus a one-hunk diff.
+    let tmp = TempDir::new("t1176-svn-diff");
+    tmp.write("f.txt", "x\n");
+    tmp.write(
+        "status.xml",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<status>\n<target path=\".\">\n<entry path=\"f.txt\">\n<wc-status props=\"none\" item=\"modified\" revision=\"42\">\n</wc-status>\n</entry>\n</target>\n</status>\n",
+    );
+    let fake = tmp.write(
+        "fakesvn.sh",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\ncase \" $* \" in\n*\" status \"*) cat \"$dir/status.xml\";;\n*) printf '@@ -1 +1,2 @@\\n one\\n+two\\n';;\nesac\nexit 0\n",
+    );
+    chmod_exec(&fake);
+    let svn_cmd = svn::SvnCommand::custom(abspath(&fake).to_str().unwrap(), &[]);
+    let work = WorkCopy {
+        vcs: Vcs::Svn,
+        vcs_root: tmp.path().to_path_buf(),
+        project_root: tmp.path().to_path_buf(),
+    };
+    assert_eq!(
+        changed_lines_for_with(&work, "tip", "f.txt", &svn_cmd).unwrap(),
+        Some(BTreeSet::from([2]))
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn t1176_changed_lines_svn_missing_status_is_empty() {
+    // A path absent from the status output yields an empty change.
+    let tmp = TempDir::new("t1176-svn-empty");
+    tmp.write("f.txt", "x\n");
+    tmp.write(
+        "status.xml",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<status>\n<target path=\".\">\n<entry path=\"other.txt\">\n<wc-status props=\"none\" item=\"modified\" revision=\"42\">\n</wc-status>\n</entry>\n</target>\n</status>\n",
+    );
+    let fake = tmp.write(
+        "fakesvn.sh",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\ncat \"$dir/status.xml\"\nexit 0\n",
+    );
+    chmod_exec(&fake);
+    let svn_cmd = svn::SvnCommand::custom(abspath(&fake).to_str().unwrap(), &[]);
+    let work = WorkCopy {
+        vcs: Vcs::Svn,
+        vcs_root: tmp.path().to_path_buf(),
+        project_root: tmp.path().to_path_buf(),
+    };
+    assert_eq!(
+        changed_lines_for_with(&work, "tip", "f.txt", &svn_cmd).unwrap(),
+        Some(BTreeSet::new())
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn t1176_changed_lines_svn_diff_error_propagates() {
+    // A failing `svn diff` (unexpected code + stderr) propagates as
+    // Err, covering the `?` continuation of the diff call.
+    let tmp = TempDir::new("t1176-svn-differr");
+    tmp.write("f.txt", "x\n");
+    tmp.write(
+        "status.xml",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<status>\n<target path=\".\">\n<entry path=\"f.txt\">\n<wc-status props=\"none\" item=\"modified\" revision=\"42\">\n</wc-status>\n</entry>\n</target>\n</status>\n",
+    );
+    let fake = tmp.write(
+        "fakesvn.sh",
+        "#!/bin/sh\ndir=$(dirname \"$0\")\ncase \" $* \" in\n*\" status \"*) cat \"$dir/status.xml\";;\n*) printf 'boom\\n' >&2; exit 1;;\nesac\nexit 0\n",
+    );
+    chmod_exec(&fake);
+    let svn_cmd = svn::SvnCommand::custom(abspath(&fake).to_str().unwrap(), &[]);
+    let work = WorkCopy {
+        vcs: Vcs::Svn,
+        vcs_root: tmp.path().to_path_buf(),
+        project_root: tmp.path().to_path_buf(),
+    };
+    let err = changed_lines_for_with(&work, "tip", "f.txt", &svn_cmd).unwrap_err();
+    assert!(err.contains("unexpected error code"), "{err}");
+}
+
 #[test]
 fn cov_engine_for_dir_reports_config() {
     let tmp = init_git_repo("cov-enginedir");

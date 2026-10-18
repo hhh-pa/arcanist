@@ -452,6 +452,17 @@ pub fn find_rebuild_script(path: &Path, fallback: &Path) -> Option<PathBuf> {
 /// the exit status comes back. Returns the failure message when the
 /// rebuild fails, or `None` on success.
 pub fn rebuild_map(path: &Path, clean: bool, script: Option<&Path>) -> Option<String> {
+    rebuild_map_with_php(path, clean, script, None)
+}
+
+/// [`rebuild_map`] with the `php` program overridden (test seam;
+/// production passes `None`, which spawns `php`).
+pub fn rebuild_map_with_php(
+    path: &Path,
+    clean: bool,
+    script: Option<&Path>,
+    php: Option<&Path>,
+) -> Option<String> {
     let script = script.map_or_else(
         || find_rebuild_script(path, path),
         |s| Some(s.to_path_buf()),
@@ -463,18 +474,21 @@ pub fn rebuild_map(path: &Path, clean: bool, script: Option<&Path>) -> Option<St
             path.display()
         )); // LCOV_EXCL_STOP
     };
-    let mut command = crate::proc_env::command("php");
+    let mut command = match php {
+        Some(program) => crate::proc_env::command(program),
+        None => crate::proc_env::command("php"),
+    };
     command.arg("-f").arg(&script).arg("--");
     if clean {
         command.arg("--drop-cache");
     }
     command.arg(path);
     match command.status() {
-        Ok(status) if status.success() => None, // LCOV_EXCL_START // Reason: php outcome arms; php is absent from the coverage image
+        Ok(status) if status.success() => None,
         Ok(status) => Some(format!(
             "rebuild-map.php failed for '{}' (exit {status})",
             path.display()
-        )), // LCOV_EXCL_STOP
+        )),
         Err(e) => Some(format!(
             "cannot run php '{}': {e} (is PHP installed?)",
             script.display()

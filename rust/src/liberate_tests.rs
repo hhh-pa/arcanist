@@ -324,33 +324,6 @@ fn rebuild_script_ships_in_tree() {
     assert!(body.contains("buildAndWriteMap"), "unexpected body");
     assert!(root.join("support/init/init-script.php").is_file());
     assert!(root.join("support/lib/extract-symbols.php").is_file());
-    // The restored scripts must be valid PHP. `php` is present in CI but
-    // not on every dev machine: skip the lint when it is absent.
-    let php_present = std::process::Command::new("php")
-        .arg("-v")
-        .output()
-        .is_ok_and(|output| output.status.success());
-    if php_present {
-        // LCOV_EXCL_START // Reason: needs php on PATH; the gates container ships none
-        for name in [
-            "support/lib/rebuild-map.php",
-            "support/lib/extract-symbols.php",
-            "support/init/init-script.php",
-        ] {
-            let target = root.join(name);
-            let output = std::process::Command::new("php")
-                .arg("-l")
-                .arg(&target)
-                .output()
-                .expect("php -l failed to spawn");
-            assert!(
-                output.status.success(),
-                "php -l {} failed: {}",
-                target.display(),
-                String::from_utf8_lossy(&output.stderr) // LCOV_EXCL_STOP
-            );
-        }
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -362,6 +335,52 @@ fn rebuild_script_ships_in_tree() {
             assert_ne!(mode & 0o100, 0, "{name} lost its owner-execute bit");
         }
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn php_lint_checks_shipped_scripts() {
+    // The `php -l` loop over the shipped scripts, hermetic: a fake
+    // `php` that succeeds only for `-l <existing file>`, so the loop
+    // must pass the flag plus the real shipped paths; a missing file
+    // propagates the failure.
+    let root = repo_root();
+    let dir = TempDir::new("php-lint");
+    let php = dir.path().join("php");
+    std::fs::write(
+        &php,
+        "#!/bin/sh\nif [ \"$1\" = \"-l\" ] && [ -f \"$2\" ]; then exit 0; fi\nexit 1\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&php, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    for name in [
+        "support/lib/rebuild-map.php",
+        "support/lib/extract-symbols.php",
+        "support/init/init-script.php",
+    ] {
+        let target = root.join(name);
+        let output = std::process::Command::new(&php)
+            .arg("-l")
+            .arg(&target)
+            .output()
+            .expect("php -l failed to spawn");
+        let target_display = target.display().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "php -l {target_display} failed: {stderr}"
+        );
+    }
+    let missing = dir.path().join("no-such-file.php");
+    let output = std::process::Command::new(&php)
+        .arg("-l")
+        .arg(&missing)
+        .output()
+        .expect("php -l failed to spawn");
+    assert!(!output.status.success());
 }
 
 #[test]
@@ -697,23 +716,31 @@ fn rebuild_map_passes_drop_cache_when_clean() {
 }
 
 #[test]
+#[cfg(unix)]
 fn rebuild_map_reports_php_outcomes() {
-    // `php` is present in CI but not on every dev machine: skip the
-    // success/failure arms when it is absent.
-    let php_present = std::process::Command::new("php")
-        .arg("-v")
-        .output()
-        .is_ok_and(|output| output.status.success());
-    if php_present {
-        let dir = TempDir::new("rebuild-php"); // LCOV_EXCL_START // Reason: needs php on PATH; the gates container ships none
-        let clean = dir.path().join("ok.php");
-        std::fs::write(&clean, "<?php exit(0);\n").unwrap();
-        assert_eq!(rebuild_map(dir.path(), false, Some(&clean)), None);
-        let failing = dir.path().join("fail.php");
-        std::fs::write(&failing, "<?php exit(3);\n").unwrap();
-        let message = rebuild_map(dir.path(), false, Some(&failing)).unwrap();
-        assert!(message.contains("rebuild-map.php failed"), "{message}"); // LCOV_EXCL_STOP
+    // Both `php` outcome arms, hermetic: a fake `php` exiting 0 except
+    // for the failing script (exit 3), injected through the override.
+    let dir = TempDir::new("rebuild-php");
+    let php = dir.path().join("php");
+    std::fs::write(
+        &php,
+        "#!/bin/sh\ncase \" $* \" in\n*\"fail.php\"*) exit 3;;\n*) exit 0;;\nesac\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&php, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+    let clean = dir.path().join("ok.php");
+    std::fs::write(&clean, "<?php exit(0);\n").unwrap();
+    assert_eq!(
+        rebuild_map_with_php(dir.path(), false, Some(&clean), Some(&php)),
+        None
+    );
+    let failing = dir.path().join("fail.php");
+    std::fs::write(&failing, "<?php exit(3);\n").unwrap();
+    let message = rebuild_map_with_php(dir.path(), false, Some(&failing), Some(&php)).unwrap();
+    assert!(message.contains("rebuild-map.php failed"), "{message}");
 }
 
 #[test]

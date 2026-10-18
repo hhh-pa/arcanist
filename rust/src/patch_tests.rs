@@ -1866,6 +1866,35 @@ fn cherry_pick_failure_banner_and_cleanup() {
     assert!(!git(&repo, &["branch", "--list", "temp"]).contains("temp"));
 }
 
+#[test]
+fn cherry_pick_spawn_failure_reports_and_cleans_up() {
+    // The cherry-pick spawn itself fails (a nonexistent `git` program):
+    // the spawn error becomes the failure detail behind the verbatim
+    // banner, and the temp branch is still deleted.
+    let repo = make_repo("cherry_spawn_fail");
+    git(&repo, &["checkout", "-b", "temp"]);
+    std::fs::write(repo.join("file.txt"), "temp\n").unwrap();
+    git(&repo, &["commit", "-am", "temp"]);
+    git(&repo, &["checkout", "master"]);
+    let mut io = Io::buffered();
+    let err = git_cherry_pick_temp_ansi_with_git(
+        &repo,
+        &mut io,
+        "master",
+        "temp",
+        false,
+        Some(std::path::Path::new("/nonexistent-git-xyz")),
+    )
+    .unwrap_err();
+    assert!(err.starts_with("failed to run git:"), "{err}");
+    assert!(
+        io.out.stdout.contains("** Cherry Pick Failed!**"),
+        "{}",
+        io.out.stdout
+    );
+    assert!(!git(&repo, &["branch", "--list", "temp"]).contains("temp"));
+}
+
 /// Fake `hg` backend logging argv to `.fakehg.log` (portable .bat/.sh).
 fn fake_hg_backend(dir: &std::path::Path) -> hg::HgCommand {
     #[cfg(windows)]

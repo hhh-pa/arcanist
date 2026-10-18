@@ -1840,16 +1840,13 @@ pub struct XunitPlan {
 /// Load the xUnit environment and map the run paths to test projects
 /// (`XUnitTestEngine.php:36-95,103-113`) with real filesystem probes.
 /// Engine params read through the config merge (UNIT-U13 follow-through).
-pub fn prepare_xunit_run(ctx: &EngineContext) -> Result<XunitPlan, EngineError> {
-    let merged = lenient_engine_merged(&ctx.project_root);
-    prepare_xunit_run_with_merged(ctx, merged.as_ref())
-}
-
-/// [`prepare_xunit_run`] with an explicit merged config (`None` falls back
-/// to the project-root `.arcconfig`, like the pre-merge read).
-pub fn prepare_xunit_run_with_merged(
+/// The toolchain probe is injected (test seam; production passes
+/// [`binary_exists`]); `merged = None` falls back to the project-root
+/// `.arcconfig`, like the pre-merge read.
+pub fn prepare_xunit_run_with_merged_and_exists(
     ctx: &EngineContext,
     merged: Option<&get_config::MergedConfig>,
+    exists: &dyn Fn(&str) -> bool,
 ) -> Result<XunitPlan, EngineError> {
     let is_windows = cfg!(windows);
     let discovery = engine_param_from(merged, &ctx.project_root, unit_xunit::DISCOVERY_KEY)
@@ -1858,13 +1855,12 @@ pub fn prepare_xunit_run_with_merged(
     let env = unit_xunit::load_environment(
         &ctx.project_root,
         is_windows,
-        &binary_exists,
-        &|b| resolve_binary_path(b).unwrap_or_else(|| b.to_string()), // LCOV_EXCL_LINE // Reason: invoked only past the msbuild/mono checks; neither exists on ubuntu CI
+        exists,
+        &|b| resolve_binary_path(b).unwrap_or_else(|| b.to_string()),
         discovery,
         hint.as_deref(),
-        &|p| Path::new(p).exists(), // LCOV_EXCL_LINE // Reason: invoked only past the msbuild/mono checks; neither exists on ubuntu CI
+        &|p| Path::new(p).exists(),
     )?;
-    // LCOV_EXCL_START // Reason: xunit setup needs msbuild/xbuild and mono on PATH; neither exists on ubuntu CI
     let paths = if ctx.run_all_tests {
         all_files_under(&ctx.project_root)
     } else {
@@ -1875,7 +1871,7 @@ pub fn prepare_xunit_run_with_merged(
         env,
         projects,
         is_windows,
-    }) // LCOV_EXCL_STOP
+    })
 }
 
 /// Run generate, build, then test over a plan, stopping after the first
@@ -1904,12 +1900,22 @@ pub fn run_xunit_with_runner(
     ctx: &EngineContext,
     runner: &dyn CommandRunner,
 ) -> Result<Vec<EngineUnitResult>, EngineError> {
-    let plan = prepare_xunit_run(ctx)?;
-    // LCOV_EXCL_START // Reason: the xunit plan never builds without msbuild/mono on PATH
+    run_xunit_with_runner_and_exists(ctx, runner, &binary_exists)
+}
+
+/// [`run_xunit_with_runner`] with the toolchain probe injected (test
+/// seam; production passes [`binary_exists`]).
+pub fn run_xunit_with_runner_and_exists(
+    ctx: &EngineContext,
+    runner: &dyn CommandRunner,
+    exists: &dyn Fn(&str) -> bool,
+) -> Result<Vec<EngineUnitResult>, EngineError> {
+    let merged = lenient_engine_merged(&ctx.project_root);
+    let plan = prepare_xunit_run_with_merged_and_exists(ctx, merged.as_ref(), exists)?;
     if plan.projects.is_empty() {
         return Ok(Vec::new());
     }
-    run_xunit_plan(&plan, runner) // LCOV_EXCL_STOP
+    run_xunit_plan(&plan, runner)
 }
 
 /// xUnit generate stage (`generateProjects`, lines 215-264).
@@ -2273,11 +2279,22 @@ pub fn run_csharp_with_runner(
     ctx: &EngineContext,
     runner: &dyn CommandRunner,
 ) -> Result<Vec<EngineUnitResult>, EngineError> {
-    let plan = prepare_xunit_run(ctx)?;
+    run_csharp_with_runner_and_exists(ctx, runner, &binary_exists)
+}
+
+/// [`run_csharp_with_runner`] with the toolchain probe injected (test
+/// seam; production passes [`binary_exists`]).
+pub fn run_csharp_with_runner_and_exists(
+    ctx: &EngineContext,
+    runner: &dyn CommandRunner,
+    exists: &dyn Fn(&str) -> bool,
+) -> Result<Vec<EngineUnitResult>, EngineError> {
+    let merged = lenient_engine_merged(&ctx.project_root);
+    let plan = prepare_xunit_run_with_merged_and_exists(ctx, merged.as_ref(), exists)?;
     // The cover engine resolves before any stage runs (like the parent
     // `loadEnvironment` plus the cover half throwing first), even when no
     // projects mapped.
-    let merged = lenient_engine_merged(&ctx.project_root); // LCOV_EXCL_START // Reason: the csharp run needs the xunit plan, which needs msbuild/mono; neither exists on ubuntu CI
+    let merged = lenient_engine_merged(&ctx.project_root);
     let cover = load_csharp_cover(ctx, merged.as_ref())?;
     if plan.projects.is_empty() {
         return Ok(Vec::new());
@@ -2293,7 +2310,7 @@ pub fn run_csharp_with_runner(
     }
     let mut tested = run_csharp_test(&plan, cover.as_ref(), ctx.enable_coverage, runner)?;
     results.append(&mut tested);
-    Ok(results) // LCOV_EXCL_STOP
+    Ok(results)
 }
 
 /// Build a phpunit engine from the config merge (`prepareConfigFile`,
@@ -4098,19 +4115,25 @@ pub fn run(argv: &[String]) -> ExitCode {
         Ok(dir) => dir,
         Err(code) => return code, // LCOV_EXCL_LINE // Reason: needs getcwd to fail on the test runner's cwd; not stageable
     };
+    run_opts_in(&opts, &cwd)
+}
+
+/// [`run`] dispatch with options and the working directory injected
+/// (test seam; production passes the parsed argv and the process working
+/// directory).
+pub fn run_opts_in(opts: &Options, cwd: &Path) -> ExitCode {
     let ansi = terminal::ansi_enabled();
-    match plan_run(&opts, &cwd) {
-        Ok(PlannedRun::Cargo) => run_cargo_selection(&opts, &cwd), // LCOV_EXCL_LINE // Reason: reaching it runs cargo test in the live checkout (recursive suite); no test drives run() that far
+    match plan_run(opts, cwd) {
+        Ok(PlannedRun::Cargo) => run_cargo_selection(opts, cwd), // LCOV_EXCL_LINE // Reason: reaching it runs cargo test in the live checkout (recursive suite); no test drives run() that far
         Ok(PlannedRun::Single { class, paths }) => {
             // LCOV_EXCL_START // Reason: reaching it spawns the live test runner; no test drives run() that far
-            run_single_selection(&opts, &cwd, &class, &paths, ansi) // LCOV_EXCL_STOP
+            run_single_selection(opts, cwd, &class, &paths, ansi) // LCOV_EXCL_STOP
         }
         Ok(PlannedRun::Config {
-            // LCOV_EXCL_START // Reason: needs a .arcunit in the test-run checkout; the repo has none
             engines,
             root,
             paths,
-        }) => run_config_selection(&opts, &engines, &root, &paths, ansi), // LCOV_EXCL_STOP
+        }) => run_config_selection(opts, &engines, &root, &paths, ansi),
         Err(error) => error.report(),
     }
 }

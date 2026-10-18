@@ -39,7 +39,7 @@ pub fn output(dir: &Path, args: &[&str]) -> Result<std::process::Output, String>
 
 /// [`output`] with the `git` program override injected (test seam;
 /// production passes `None`, which spawns `git`).
-fn output_with_git(
+pub(crate) fn output_with_git(
     dir: &Path,
     args: &[&str],
     git: Option<&Path>,

@@ -4261,17 +4261,30 @@ fn git_fetch_target(
     remote: &str,
     name: &str,
 ) -> Result<Option<String>, String> {
+    git_fetch_target_with(dir, io, remote, name, "git", &[])
+}
+
+/// [`git_fetch_target`] with the `git p4 sync` invocation overridden
+/// (test seam; production passes `"git"` with no prefix — see
+/// [`git_p4_sync_with`]).
+fn git_fetch_target_with(
+    dir: &Path,
+    io: &mut Io,
+    remote: &str,
+    name: &str,
+    p4_program: &str,
+    p4_prefix: &[String],
+) -> Result<Option<String>, String> {
     if git_is_perforce_remote(dir, remote) {
         io.push_status(
             "P4 SYNC",
             &format!("Synchronizing \"{name}\" from Perforce..."),
         );
-        git_p4_sync(dir, remote, name)?;
-        // LCOV_EXCL_START // Reason: needs a successful Perforce sync; no p4 tooling in CI
+        git_p4_sync_with(dir, p4_program, p4_prefix, remote, name)?;
         return Ok(Some(git_remote_commit(
             dir,
             &format!("refs/remotes/{remote}/{name}"),
-        ))); // LCOV_EXCL_STOP
+        )));
     }
     let full_ref = format!("refs/remotes/{remote}/{name}");
     if git::output(dir, &["rev-parse", "--verify", &full_ref])
@@ -7239,16 +7252,9 @@ fn select_hg_targets(
     dir: &Path,
     options: &Options,
     io: &mut Io,
-    _raw: &[String],
+    raw: &[String],
 ) -> Result<TargetSelection, String> {
-    let onto_remote = hg_select_onto_remote(dir, io, options)?;
-    let onto_refs = hg_select_onto_refs(dir, io, options)?; // LCOV_EXCL_START // Reason: hg target selection needs system hg; the gates container ships none
-    let branch = hg_confirm_onto_refs(dir, io, &onto_remote, &onto_refs, options.hold)?;
-    let into_state = select_into_state(io, options, &onto_remote, &onto_refs, &|remote| {
-        hg::ok(dir, &["paths", remote])
-    })?;
-    let into_commit = hg_select_into_commit(dir, io, &into_state, options.into.as_deref())?;
-    Ok((onto_remote, onto_refs, into_commit, None, branch)) // LCOV_EXCL_STOP
+    select_hg_targets_with(dir, &hg::HgCommand::system(), options, io, raw)
 }
 
 /// [`select_hg_targets`] driving `hg` through `hg_cmd` (test seam).

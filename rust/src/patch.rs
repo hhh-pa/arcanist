@@ -4167,10 +4167,26 @@ pub fn git_cherry_pick_temp_ansi(
     new_branch: &str,
     ansi: bool,
 ) -> Result<(), String> {
+    git_cherry_pick_temp_ansi_with_git(dir, io, original_branch, new_branch, ansi, None)
+}
+
+/// [`git_cherry_pick_temp_ansi`] with the `git` program for the
+/// cherry-pick spawn overridden (test seam; production passes `None`,
+/// which spawns `git`). Only the cherry-pick spawn takes the override;
+/// the checkout, submodule updates, and branch cleanup always run the
+/// system binary.
+pub fn git_cherry_pick_temp_ansi_with_git(
+    dir: &Path,
+    io: &mut Io,
+    original_branch: &str,
+    new_branch: &str,
+    ansi: bool,
+    git: Option<&Path>,
+) -> Result<(), String> {
     git::stdout_text(dir, &["checkout", original_branch, "--"])?;
     git_submodule_update(dir, io)?;
     let mut failure: Option<String> = None;
-    match git::output(dir, &["cherry-pick", "--", new_branch]) {
+    match git::output_with_git(dir, &["cherry-pick", "--", new_branch], git) {
         Ok(output) if output.status.success() => {
             if let Err(error) = git_submodule_update(dir, io) {
                 failure = Some(error);
@@ -4183,10 +4199,9 @@ pub fn git_cherry_pick_temp_ansi(
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
-        // LCOV_EXCL_START // Reason: needs the git spawn itself to fail; git is always present in tests
         Err(error) => {
             failure = Some(error);
-        } // LCOV_EXCL_STOP
+        }
     }
     git::output(dir, &["branch", "-D", "--", new_branch]).ok();
     if let Some(detail) = failure {

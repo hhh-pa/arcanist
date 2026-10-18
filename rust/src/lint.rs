@@ -3188,29 +3188,47 @@ fn merge_hg_status(
     base: Option<&str>,
     merged: &mut BTreeMap<String, u32>,
 ) -> Result<(), String> {
+    merge_hg_status_with(root, base, merged, &hg::HgCommand::system())
+}
+
+/// [`merge_hg_status`] driving `hg` through `hg_cmd` (test seam).
+fn merge_hg_status_with(
+    root: &Path,
+    base: Option<&str>,
+    merged: &mut BTreeMap<String, u32>,
+    hg_cmd: &hg::HgCommand,
+) -> Result<(), String> {
     if let Some(base) = base {
-        for (path, mask) in hg::get_commit_range_status(root, base)? {
-            *merged.entry(path).or_default() |= mask; // LCOV_EXCL_START // Reason: needs system hg; the gates container ships none
-        } // LCOV_EXCL_STOP
+        for (path, mask) in hg::get_commit_range_status_with(root, hg_cmd, base)? {
+            *merged.entry(path).or_default() |= mask;
+        }
     }
-    for (path, mask) in hg::get_uncommitted_status(root)? {
-        *merged.entry(path).or_default() |= mask; // LCOV_EXCL_START // Reason: needs system hg; the gates container ships none
+    for (path, mask) in hg::get_uncommitted_status_with(root, hg_cmd)? {
+        *merged.entry(path).or_default() |= mask;
     }
     merged.retain(|_, mask| *mask & hg::FLAG_UNTRACKED == 0);
-    Ok(()) // LCOV_EXCL_STOP
+    Ok(())
 }
 
 /// Merge the Subversion worktree status into `merged`, minus untracked
 /// paths.
 fn merge_svn_status(root: &Path, merged: &mut BTreeMap<String, u32>) -> Result<(), String> {
-    let status = svn::get_uncommitted_status(root, &[])?;
-    // LCOV_EXCL_START // Reason: needs system svn; the gates container ships none
+    merge_svn_status_with(root, merged, &svn::SvnCommand::system())
+}
+
+/// [`merge_svn_status`] driving `svn` through `svn_cmd` (test seam).
+fn merge_svn_status_with(
+    root: &Path,
+    merged: &mut BTreeMap<String, u32>,
+    svn_cmd: &svn::SvnCommand,
+) -> Result<(), String> {
+    let status = svn::get_uncommitted_status_with(root, svn_cmd, &[])?;
     for (path, mask) in status {
         if mask & svn::FLAG_UNTRACKED == 0 {
             merged.insert(path, mask);
         }
     }
-    Ok(()) // LCOV_EXCL_STOP
+    Ok(())
 }
 
 /// All tracked files (`--everything`), mirroring `getAllFiles()`.
@@ -3296,6 +3314,17 @@ pub fn changed_lines_for(
     base: &str,
     path: &str,
 ) -> Result<Option<BTreeSet<usize>>, String> {
+    changed_lines_for_with(work, base, path, &svn::SvnCommand::system())
+}
+
+/// [`changed_lines_for`] driving `svn` through `svn_cmd` (test seam;
+/// the git and Mercurial arms always run the system binaries).
+pub fn changed_lines_for_with(
+    work: &WorkCopy,
+    base: &str,
+    path: &str,
+    svn_cmd: &svn::SvnCommand,
+) -> Result<Option<BTreeSet<usize>>, String> {
     let disk = work.vcs_root.join(path);
     if disk.is_dir() || std::fs::symlink_metadata(&disk).is_err() {
         return Ok(None);
@@ -3306,11 +3335,16 @@ pub fn changed_lines_for(
         Vcs::Git => git::raw_diff_text(&work.vcs_root, base, path, DIFF_CONTEXT_LINES, true)?,
         Vcs::Hg => hg::get_raw_diff_text(&work.vcs_root, base, path, DIFF_CONTEXT_LINES)?,
         Vcs::Svn => {
-            let status = svn::get_uncommitted_status(&work.vcs_root, &[path])?;
-            // LCOV_EXCL_START // Reason: needs system svn; the gates container ships none
-            match svn::get_raw_diff_text(&work.vcs_root, path, &status, DIFF_CONTEXT_LINES)? {
+            let status = svn::get_uncommitted_status_with(&work.vcs_root, svn_cmd, &[path])?;
+            match svn::get_raw_diff_text_with(
+                &work.vcs_root,
+                svn_cmd,
+                path,
+                &status,
+                &svn::SvnDiffConfig::windows(DIFF_CONTEXT_LINES),
+            )? {
                 Some(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                None => return Ok(Some(BTreeSet::new())), // LCOV_EXCL_STOP
+                None => return Ok(Some(BTreeSet::new())),
             }
         }
     };

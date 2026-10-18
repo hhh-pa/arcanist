@@ -6395,6 +6395,36 @@ fn t1170_git_fetch_target_perforce_syncs() {
 }
 
 #[test]
+#[cfg(unix)]
+fn t1176_git_fetch_target_perforce_sync_success() {
+    // A successful Perforce sync resolves the remote-tracking commit:
+    // the `git p4 sync` spawn is a fake exiting 0, the p4 ref is real.
+    let repo = make_repo("t1176-p4fetch-ok");
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["update-ref", "refs/remotes/p4/master", &head]);
+    let script = repo.join("fakep4.sh");
+    std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut io = Io::canned(&[]);
+    assert_eq!(
+        git_fetch_target_with(
+            &repo,
+            &mut io,
+            "p4",
+            "master",
+            script.to_str().unwrap(),
+            &[]
+        )
+        .unwrap(),
+        Some(head)
+    );
+    assert!(io.out.stderr.contains("** P4 SYNC **"), "{}", io.out.stderr);
+}
+
+#[test]
 fn t1170_git_is_perforce_remote_resolves_absolute_git_dir() {
     // Linked worktrees report an absolute `--git-dir`, which resolves
     // directly instead of joining onto the working copy.
