@@ -165,11 +165,8 @@ fn expansion_appends_user_args_after_alias_args() {
     };
     assert_eq!(argv, args(&["diff", "--draft", "extra"]));
     assert_eq!(hints.len(), 1);
-    assert!(
-        hints[0].contains("arc draft -> arc diff --draft"),
-        "{}",
-        hints[0] // LCOV_EXCL_LINE // Reason: assert-message arg; evaluates only if the passing assert fails
-    );
+    let hint = &hints[0];
+    assert!(hint.contains("arc draft -> arc diff --draft"), "{hint}");
 }
 
 #[test]
@@ -749,11 +746,8 @@ fn shell_runner_maps_spawn_outcomes() {
     });
     assert_eq!(code, ExitCode::FAILURE);
     assert_eq!(notices.len(), 2);
-    assert!(
-        notices[1].contains("cannot execute shell alias"),
-        "{}",
-        notices[1] // LCOV_EXCL_LINE // Reason: assert-message arg; evaluates only if the passing assert fails
-    );
+    let notice = &notices[1];
+    assert!(notice.contains("cannot execute shell alias"), "{notice}");
     assert!(notices[1].contains("not found"), "{}", notices[1]);
 
     // T1153 CORE-23: an empty shell command exits 0 like PHP's
@@ -822,11 +816,8 @@ fn expansion_driver_dispatches_and_reports_shell_and_broken_chains() {
     assert_eq!(notices.len(), 2);
     // T1153 CORE-23: cyan log-engine hint (` ALIAS  ...` plain).
     assert!(notices[0].starts_with(" ALIAS  "), "{}", notices[0]);
-    assert!(
-        notices[1].contains("Alias resolved to \"gone\""),
-        "{}",
-        notices[1] // LCOV_EXCL_LINE // Reason: assert-message arg; evaluates only if the passing assert fails
-    );
+    let notice = &notices[1];
+    assert!(notice.contains("Alias resolved to \"gone\""), "{notice}");
 }
 
 #[test]
@@ -859,11 +850,8 @@ fn expansion_driver_emits_configuration_warnings_first() {
     assert_eq!(notices.len(), 2);
     // T1153 CORE-23: cyan log-engine hints (` ALIAS  ...` plain).
     assert_eq!(notices[0], format!(" ALIAS  {warning}"));
-    assert!(
-        notices[1].starts_with(" ALIAS  arc draft -> "),
-        "{}",
-        notices[1] // LCOV_EXCL_LINE // Reason: assert-message arg; evaluates only if the passing assert fails
-    );
+    let notice = &notices[1];
+    assert!(notice.starts_with(" ALIAS  arc draft -> "), "{notice}");
 }
 
 #[test]
@@ -1104,11 +1092,8 @@ fn create_preserves_invalid_dict_entries_with_a_warning() {
     std::fs::write(&arcrc, r#"{"aliases": {"bad": 42, "old": ["diff"]}}"#).unwrap();
     let report = execute_create(&arcrc, "draft", &args(&["diff"])).unwrap();
     assert_eq!(report.warnings.len(), 1);
-    assert!(
-        report.warnings[0].contains("invalid alias"),
-        "{}",
-        report.warnings[0] // LCOV_EXCL_LINE // Reason: assert-message arg; evaluates only if the passing assert fails
-    );
+    let warning = &report.warnings[0];
+    assert!(warning.contains("invalid alias"), "{warning}");
     let doc: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&arcrc).unwrap()).unwrap();
     assert_eq!(

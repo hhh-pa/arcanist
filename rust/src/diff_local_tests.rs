@@ -3291,11 +3291,8 @@ fn gap2_merge_svn_path_diffs_shapes() {
     assert_eq!(changes.len(), 2);
     let file = changes.iter().find(|c| c.current_path == "a.txt").unwrap();
     assert_eq!(file.hunks.len(), 1);
-    assert!(
-        file.hunks[0].corpus.contains("-file\n"),
-        "{}",
-        file.hunks[0].corpus // LCOV_EXCL_LINE // Reason: assert-message arg; evaluates only if the passing assert fails
-    );
+    let corpus = &file.hunks[0].corpus;
+    assert!(corpus.contains("-file\n"), "{corpus}");
 
     // Blank-only diff text fails like PHP's `parseDiff()` guard.
     let data = vec![gap2_path_data(

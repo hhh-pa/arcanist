@@ -110,11 +110,10 @@ fn config_and_binary_resolution() {
     );
     assert_eq!(resolve_config_file("/r", None, &exists).unwrap(), None);
     let err = resolve_config_file("/r", Some("missing.xml"), &exists).unwrap_err();
+    let message = err.message();
     assert!(
-        err.message()
-            .contains("PHPUnit configuration file was not found in"),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+        message.contains("PHPUnit configuration file was not found in"),
+        "{message}"
     );
 
     let on_path = |b: &str| b == "phpunit";
@@ -162,11 +161,8 @@ fn json_report_repair_and_empty_guidance() {
     let report = get_json_report("{\"event\":\"test\"} {\"event\":\"testStart\"}").unwrap();
     assert_eq!(report.as_arr().unwrap().len(), 2);
     let err = get_json_report("").unwrap_err();
-    assert!(
-        err.message().contains("JSON report file is empty"),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    let message = err.message();
+    assert!(message.contains("JSON report file is empty"), "{message}");
 }
 
 #[test]
@@ -197,11 +193,8 @@ fn parser_maps_events_statuses_and_trailing_start() {
     assert_eq!(results[0].get_result(), RESULT_PASS);
     assert_eq!(results[0].get_duration(), Some(0.5));
     assert_eq!(results[1].get_result(), RESULT_FAIL);
-    assert!(
-        results[1].get_user_data().unwrap().contains("F.php:3"),
-        "{:?}",
-        results[1].get_user_data() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    let user_data = results[1].get_user_data();
+    assert!(user_data.unwrap().contains("F.php:3"), "{user_data:?}");
     assert_eq!(results[2].get_result(), RESULT_SKIP);
     assert_eq!(results[3].get_result(), RESULT_BROKEN);
     assert_eq!(results[4].get_name(), "A::t5");

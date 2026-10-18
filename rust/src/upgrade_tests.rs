@@ -980,10 +980,10 @@ fn download_refuses_checksum_problems_before_and_after_fetch() {
         run_mock(listener, vec![], seen.clone());
         let err = download_release_bytes(&format!("{base}dl/x"), 13, digest).unwrap_err();
         assert!(err.contains(needle), "{err}");
+        let seen_lines = seen.lock().unwrap().clone();
         assert!(
-            seen.lock().unwrap().is_empty(),
-            "pre-download gate must not fetch: {:?}",
-            seen.lock().unwrap() // LCOV_EXCL_LINE // Reason: assert-message expression; evaluates only if the passing assert fails
+            seen_lines.is_empty(),
+            "pre-download gate must not fetch: {seen_lines:?}"
         );
     }
 

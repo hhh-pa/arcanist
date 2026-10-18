@@ -506,11 +506,8 @@ fn linters_l8_wrap_stays_within_78_columns() {
     let refs: Vec<&LinterEntry> = entries.iter().collect();
     let rendered = render_entries(&refs, true);
     for line in rendered.lines() {
-        assert!(
-            line.len() <= 78,
-            "overlong line ({len}): {line}",
-            len = line.len() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-        );
+        let len = line.len();
+        assert!(len <= 78, "overlong line ({len}): {line}");
     }
 }
 

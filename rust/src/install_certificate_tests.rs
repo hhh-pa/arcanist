@@ -1082,11 +1082,8 @@ fn r10_install_certificate_help_matches_generated_format() {
     let ansi = usage_text(true);
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
     // `run()` prints `usage()` (same text, ambient ANSI mode).
-    assert!(
-        usage().contains("INSTALL-CERTIFICATE WORKFLOW"),
-        "{}",
-        usage() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    let text = usage();
+    assert!(text.contains("INSTALL-CERTIFICATE WORKFLOW"), "{text}");
 }
 
 #[test]

@@ -21,17 +21,12 @@ fn coverage_gate_matches_xdebug_branches() {
     assert_eq!(resolve_coverage(Some(true), true).unwrap(), Some(true));
     let err = resolve_coverage(Some(true), false).unwrap_err();
     assert!(matches!(err, EngineError::Usage(_)));
+    let message = err.message();
     assert!(
-        err.message()
-            .contains("You specified --coverage but XDebug is not available"),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+        message.contains("You specified --coverage but XDebug is not available"),
+        "{message}"
     );
-    assert!(
-        err.message().contains("PhutilUnitTestEngine"),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    assert!(message.contains("PhutilUnitTestEngine"), "{message}");
 }
 
 #[test]
@@ -111,11 +106,8 @@ fn test_paths_skip_outside_and_unloaded() {
     let no_name = |_: &str| None;
     let err =
         get_test_paths(&["x.php".to_string()], "/", &root_for, &no_name, &is_file).unwrap_err();
-    assert!(
-        err.message().contains("not been loaded"),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    let message = err.message();
+    assert!(message.contains("not been loaded"), "{message}");
 
     // Symlink maze: path outside its library is skipped.
     let root_other = |_: &str| Some("/other".to_string());
@@ -258,43 +250,33 @@ fn parses_driver_errors_and_empty_selection() {
 #[test]
 fn rejects_malformed_driver_output() {
     let err = parse_phutil_output("not json", "o.json").unwrap_err();
+    let message = err.message();
     assert!(
-        err.message()
-            .contains("cannot parse phutil output 'o.json'"),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+        message.contains("cannot parse phutil output 'o.json'"),
+        "{message}"
     );
 
     let err = parse_phutil_output(r#"{"results": [{"result": "pass"}]}"#, "o.json").unwrap_err();
-    assert!(
-        err.message().contains("missing its 'name'"),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    let message = err.message();
+    assert!(message.contains("missing its 'name'"), "{message}");
 
     let err = parse_phutil_output(r#"{"results": [{"name": "t"}]}"#, "o.json").unwrap_err();
-    assert!(
-        err.message().contains("missing its 'result'"),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    let message = err.message();
+    assert!(message.contains("missing its 'result'"), "{message}");
 
     let err = parse_phutil_output(
         r#"{"results": [{"name": "t", "result": "bogus"}]}"#,
         "o.json",
     )
     .unwrap_err();
-    assert!(
-        err.message().contains("unknown result code 'bogus'"),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    let message = err.message();
+    assert!(message.contains("unknown result code 'bogus'"), "{message}");
 
     let err = parse_phutil_output(r#"{"other": 1}"#, "o.json").unwrap_err();
+    let message = err.message();
     assert!(
-        err.message().contains("neither 'results' nor 'error'"),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+        message.contains("neither 'results' nor 'error'"),
+        "{message}"
     );
 
     let long = "t".repeat(256);
@@ -303,11 +285,8 @@ fn rejects_malformed_driver_output() {
         "o.json",
     )
     .unwrap_err();
-    assert!(
-        err.message().contains("maximum length"),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    let message = err.message();
+    assert!(message.contains("maximum length"), "{message}");
 }
 
 #[test]

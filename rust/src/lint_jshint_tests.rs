@@ -264,11 +264,8 @@ fn long_stderr_truncates_on_char_boundaries() {
     let linter = JshintLinter::with_binary(&tool);
     let messages = linter.lint_bytes("a.js", b"var x = 1;\n");
     assert_eq!(messages.len(), 1);
-    assert!(
-        messages[0].description.ends_with("..."),
-        "{}",
-        messages[0].description // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    let description = &messages[0].description;
+    assert!(description.ends_with("..."), "{description}");
     assert!(messages[0].description.len() < loud.len());
 }
 

@@ -90,10 +90,10 @@ fn argv_wraps_coverage_unless_disabled() {
 fn missing_junit_fails_with_php_message() {
     let argv = vec!["py.test".to_string()];
     let err = require_junit_output(false, 3, &argv, "o", "e").unwrap_err();
+    let message = err.message();
     assert!(
-        err.message().contains("Command failed with error #3!"),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+        message.contains("Command failed with error #3!"),
+        "{message}"
     );
     assert!(require_junit_output(true, 0, &argv, "", "").is_ok());
 }
@@ -187,10 +187,10 @@ fn run_with_uses_canned_outputs() {
         files: HashMap::new(),
     };
     let err = engine.run_with(&ctx, &missing, &fs).unwrap_err();
+    let message = err.message();
     assert!(
-        err.message().contains("Command failed with error #3!"),
-        "{}",
-        err.message() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+        message.contains("Command failed with error #3!"),
+        "{message}"
     );
 }
 

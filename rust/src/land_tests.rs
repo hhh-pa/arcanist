@@ -4809,11 +4809,8 @@ fn b23_land_help_matches_generated_format() {
     // T1153 B21/B23: `--help` renders the generated workflow help via
     // the shared renderer, byte-identical to `arc help land`.
     let text = usage_text(false);
-    assert!(
-        text.starts_with("LAND WORKFLOW\n"),
-        "{}",
-        &text[..200.min(text.len())] // LCOV_EXCL_LINE // Reason: assert-message expression; evaluates only if the passing assert fails
-    );
+    let head = &text[..200.min(text.len())];
+    assert!(text.starts_with("LAND WORKFLOW\n"), "{head}");
     assert!(text.contains("Publish reviewed changes."), "{text}");
     assert!(text.contains("--strategy"), "{text}");
     assert!(text.contains("--onto"), "{text}");
@@ -5617,11 +5614,8 @@ fn t1170_hg_push_change_skips_bookmark_already_at_cursor() {
     )
     .unwrap();
     // No bookmark move and no pull-back: nothing was displaced.
-    assert!(
-        !calls.exists(),
-        "unexpected calls: {:?}",
-        std::fs::read_to_string(&calls) // LCOV_EXCL_LINE // Reason: assert-message expression; evaluates only if the passing assert fails
-    );
+    let calls_content = std::fs::read_to_string(&calls);
+    assert!(!calls.exists(), "unexpected calls: {calls_content:?}");
 }
 
 #[test]

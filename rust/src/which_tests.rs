@@ -1829,11 +1829,8 @@ fn rbd16_range_section_bytes() {
     // Empty ranges keep the placeholder.
     let mut empty = range.clone();
     empty.commits.clear();
-    assert!(
-        render_range(&empty, "", None, false).contains("    (No commits.)\n\n\n"),
-        "{}",
-        render_range(&empty, "", None, false) // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    let rendered = render_range(&empty, "", None, false);
+    assert!(rendered.contains("    (No commits.)\n\n\n"), "{rendered}");
 }
 
 // -( Wave 6 coverage: staged runners, separator, log failure, author arms )----
@@ -2673,11 +2670,8 @@ fn t1170_matching_queries_explicit_ids_and_whoami() {
     assert_eq!(matched.len(), 2);
     assert_eq!(matched[0].monogram, "D77");
     assert_eq!(matched[0].author, None);
-    assert!(
-        matched[0].why.contains("explicit 'Differential Revision'"),
-        "{}",
-        matched[0].why // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    let why = &matched[0].why;
+    assert!(why.contains("explicit 'Differential Revision'"), "{why}");
     assert_eq!(matched[1].monogram, "D78");
     assert_eq!(matched[1].author.as_deref(), Some("bob"));
     let (request, body) = seen.recv().unwrap();

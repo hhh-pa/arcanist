@@ -663,11 +663,10 @@ fn diffs_known_paths() {
     assert!(log.contains("diff --depth empty a.txt"), "{log}");
     let unix_config = SvnDiffConfig::unix(3, "/scripts/binary_safe_diff.sh");
     get_raw_diff_text_with(&fake.dir, &fake.svn, "a.txt", &status, &unix_config).unwrap();
+    let log = fake.log();
     assert!(
-        fake.log()
-            .contains("--diff-cmd /scripts/binary_safe_diff.sh -x -U3"),
-        "{}",
-        fake.log() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+        log.contains("--diff-cmd /scripts/binary_safe_diff.sh -x -U3"),
+        "{log}"
     );
 }
 
@@ -722,11 +721,10 @@ fn diffs_binary_files() {
         &SvnDiffConfig::windows(3),
     )
     .unwrap();
+    let log = fake.log();
     assert!(
-        fake.log()
-            .contains("propset svn:mime-type application/octet-stream"),
-        "{}",
-        fake.log() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+        log.contains("propset svn:mime-type application/octet-stream"),
+        "{log}"
     );
 
     let octet = FakeSvn::named("octet");
@@ -811,11 +809,10 @@ fn diffs_copied_additions() {
         diff_log.contains("-L a/orig.txt -L b/copied.txt -U3"),
         "{diff_log}"
     );
+    let log = fake.log();
     assert!(
-        fake.log()
-            .contains("cat https://svn.example.test/repo/trunk/orig.txt@40"),
-        "{}",
-        fake.log() // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
+        log.contains("cat https://svn.example.test/repo/trunk/orig.txt@40"),
+        "{log}"
     );
 
     let same = FakeSvn::named("copysame");

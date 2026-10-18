@@ -308,38 +308,25 @@ fn spaced_double_colon_reference_and_by_ref_forms() {
         lint("<?php\n$x = A : : class;\nfunction &r() {}\nclass $bad {}\nclass Real {}\n");
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].code, "PHL3");
-    assert!(
-        messages[0].description.contains("mixes function (r)"),
-        "{}",
-        messages[0].description // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
-    assert!(
-        messages[0].description.contains("(Real)"),
-        "{}",
-        messages[0].description // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    let description = &messages[0].description;
+    assert!(description.contains("mixes function (r)"), "{description}");
+    assert!(description.contains("(Real)"), "{description}");
 }
 
 #[test]
 fn comments_between_keyword_and_name_are_trivia() {
     let messages = lint("<?php\nclass // c\n Foo {}\nclass /* c */ Bar {}\n");
     assert_eq!(messages.len(), 1);
-    assert!(
-        messages[0].description.contains("(Foo, Bar)"),
-        "{}",
-        messages[0].description // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    let description = &messages[0].description;
+    assert!(description.contains("(Foo, Bar)"), "{description}");
 }
 
 #[test]
 fn close_tag_inside_a_comment_ends_php_mode() {
     let messages = lint("<?php\n// foo ?>\nclass A {}\n<?php\nclass B {}\nclass C {}\n");
     assert_eq!(messages.len(), 1);
-    assert!(
-        messages[0].description.contains("(B, C)"),
-        "{}",
-        messages[0].description // LCOV_EXCL_LINE // Reason: assert format arg; evaluated only on failure
-    );
+    let description = &messages[0].description;
+    assert!(description.contains("(B, C)"), "{description}");
 }
 
 #[test]
