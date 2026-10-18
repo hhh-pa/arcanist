@@ -297,3 +297,57 @@ fn severity_codes_are_raw_like_php() {
         );
     }
 }
+
+#[test]
+#[cfg(unix)]
+fn temp_write_failure_on_input_reports_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new("temp-fail-input");
+    let tool = tmp.path().join("fake-jshint");
+    std::fs::write(&tool, b"x").unwrap();
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let linter = JshintLinter {
+        binary: Some(tool),
+        temp_dir: Some(locked.clone()),
+        ..Default::default()
+    };
+    assert!(linter.lint_bytes("a.js", b"var x = 1;").is_empty());
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn temp_write_failure_on_reporter_cleans_up_input() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new("temp-fail-reporter");
+    let tool = tmp.path().join("fake-jshint");
+    std::fs::write(&tool, b"x").unwrap();
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Writable input dir plus an unwritable reporter dir: the input
+    // stages, the reporter fails, and the cleanup arm removes the input.
+    let linter = JshintLinter {
+        binary: Some(tool),
+        temp_dir: Some(tmp.path().to_path_buf()),
+        reporter_dir: Some(locked.clone()),
+        ..Default::default()
+    };
+    assert!(linter.lint_bytes("a.js", b"var x = 1;").is_empty());
+    let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("arc-rs-lint-jshint-")
+        })
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+}

@@ -46,6 +46,9 @@ pub struct CsharpLinter {
     binary_hint: Option<PathBuf>,
     discovery: Option<BTreeMap<String, Vec<String>>>,
     error: RefCell<Option<String>>,
+    /// Test seam: base directory for the staged temp input (`None` uses
+    /// `std::env::temp_dir()`, the production behavior).
+    temp_dir: Option<PathBuf>,
 }
 
 impl CsharpLinter {
@@ -369,14 +372,14 @@ struct StagedFile {
 }
 
 impl StagedFile {
-    fn stage(display_path: &str, data: &[u8]) -> Result<Self, String> {
+    fn stage(dir: &Path, display_path: &str, data: &[u8]) -> Result<Self, String> {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = dir.join(format!(
             "arc-rs-lint-csharp-{}-{nanos}-{n}",
             std::process::id()
         ));
@@ -429,11 +432,23 @@ pub fn lint_with_command(
     data: &[u8],
     command: Option<(&Path, &[String])>,
 ) -> Vec<LintMessage> {
+    let dir = std::env::temp_dir();
+    lint_with_command_in(&dir, path, data, command)
+}
+
+/// [`lint_with_command`] with the staging base directory injected, so
+/// tests can cover the staging-failure arm with an unwritable directory.
+fn lint_with_command_in(
+    dir: &Path,
+    path: &str,
+    data: &[u8],
+    command: Option<(&Path, &[String])>,
+) -> Vec<LintMessage> {
     let Some((program, prefix)) = command else {
         return Vec::new();
     };
-    let Ok(staged) = StagedFile::stage(path, data) else {
-        return Vec::new(); // LCOV_EXCL_LINE // Reason: staging failure; hermetic tests cannot fail temp-dir writes
+    let Ok(staged) = StagedFile::stage(dir, path, data) else {
+        return Vec::new();
     };
     let Some((code, stdout, stderr)) = run_tool(program, prefix, staged.path()) else {
         return Vec::new();
@@ -736,7 +751,8 @@ impl Linter for CsharpLinter {
             }
         };
         let borrowed = Some((command.0.as_path(), command.1.as_slice())); // LCOV_EXCL_START // Reason: resolve-Ok arm; needs cslint plus mono, absent on ubuntu CI
-        lint_with_command(path, data, borrowed) // LCOV_EXCL_STOP
+        let dir = self.temp_dir.clone().unwrap_or_else(std::env::temp_dir);
+        lint_with_command_in(&dir, path, data, borrowed) // LCOV_EXCL_STOP
     }
 
     fn take_error(&self) -> Option<String> {

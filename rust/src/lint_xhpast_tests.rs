@@ -376,3 +376,28 @@ fn tool_garbage_falls_back_to_source_rules() {
     let tree = xhp_ast::tree_from_source(source);
     assert_eq!(messages, lint_tree("src/a.php", &tree, &options));
 }
+
+#[test]
+#[cfg(unix)]
+fn temp_write_failure_reports_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new("temp-fail");
+    let missing = tmp.path().join("no-such-xhpast");
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // `lint_bytes` resolves the tool from the ambient PATH, so drive
+    // the dir-taking core directly with an explicit binary.
+    assert!(
+        lint_with_binary_and_options_in(
+            &locked,
+            "src/a.php",
+            b"<?php echo 1;",
+            Some(&missing),
+            &xhp_ast::XhpOptions::default()
+        )
+        .is_empty()
+    );
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+}

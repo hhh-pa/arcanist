@@ -313,3 +313,23 @@ fn severity_codes_need_a_letter_and_four_digits_like_php() {
         );
     }
 }
+
+#[test]
+#[cfg(unix)]
+fn temp_write_failure_reports_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new("temp-fail");
+    let tool = tmp.path().join("fake-pylint");
+    std::fs::write(&tool, b"x").unwrap();
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let mut linter = PyLintLinter {
+        temp_dir: Some(locked.clone()),
+        ..Default::default()
+    };
+    linter.options.bin = Some(tool);
+    assert!(linter.lint_bytes("a.py", b"x = 1").is_empty());
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+}

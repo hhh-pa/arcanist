@@ -316,3 +316,23 @@ fn cmd_shim_binaries_route_through_cmd() {
     let linter = JsonlintLinter::with_binary(&tool);
     assert!(linter.lint_bytes("a.json", b"{\"a\": 1}\n").is_empty());
 }
+
+#[test]
+#[cfg(unix)]
+fn temp_write_failure_reports_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new("temp-fail");
+    let tool = tmp.path().join("fake-jsonlint");
+    std::fs::write(&tool, b"x").unwrap();
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let linter = JsonlintLinter {
+        binary: Some(tool),
+        temp_dir: Some(locked.clone()),
+        ..Default::default()
+    };
+    assert!(linter.lint_bytes("a.json", b"[1]").is_empty());
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+}

@@ -43,6 +43,9 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct JsonlintLinter {
     binary: Option<PathBuf>,
     options: ToolOptions,
+    /// Test seam: base directory for the staged temp input (`None` uses
+    /// `std::env::temp_dir()`, the production behavior).
+    temp_dir: Option<PathBuf>,
 }
 
 impl JsonlintLinter {
@@ -58,6 +61,7 @@ impl JsonlintLinter {
         Self {
             binary: Some(path.to_path_buf()),
             options: ToolOptions::default(),
+            temp_dir: None,
         }
     }
 
@@ -106,8 +110,9 @@ impl Linter for JsonlintLinter {
         {
             return Vec::new();
         }
-        let Some(input) = write_temp_file(SLUG, path, "json", data) else {
-            return Vec::new(); // LCOV_EXCL_LINE // Reason: temp-dir write failure; hermetic tests cannot fail temp writes (TMPDIR is process-global)
+        let dir = self.temp_dir.clone().unwrap_or_else(std::env::temp_dir);
+        let Some(input) = write_temp_file(&dir, SLUG, path, "json", data) else {
+            return Vec::new();
         };
         let mut args = self.tool_flags();
         args.push(input.display().to_string());
@@ -285,11 +290,17 @@ fn temp_extension(path: &str, fallback: &str) -> String {
     }
 }
 
-fn write_temp_file(slug: &str, path: &str, fallback_ext: &str, data: &[u8]) -> Option<PathBuf> {
+fn write_temp_file(
+    dir: &Path,
+    slug: &str,
+    path: &str,
+    fallback_ext: &str,
+    data: &[u8],
+) -> Option<PathBuf> {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let pid = std::process::id();
     let ext = temp_extension(path, fallback_ext);
-    let file = std::env::temp_dir().join(format!("arc-rs-lint-{slug}-{pid}-{n}.{ext}"));
+    let file = dir.join(format!("arc-rs-lint-{slug}-{pid}-{n}.{ext}"));
     std::fs::write(&file, data).ok()?;
     Some(file)
 }

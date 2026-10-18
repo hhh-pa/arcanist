@@ -590,3 +590,28 @@ fn cov6g_push_conversion_rejects_unknown_spec() {
     assert_eq!(push_conversion(&mut out, 's', "x", None), Some(()));
     assert_eq!(out, "x");
 }
+
+#[test]
+#[cfg(unix)]
+fn temp_write_failure_reports_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new("temp-fail");
+    let missing = tmp.path().join("no-such-cslint");
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // `lint_bytes` cannot reach staging where cslint plus mono are
+    // absent, so drive the dir-taking core directly.
+    let prefix: Vec<String> = Vec::new();
+    assert!(
+        lint_with_command_in(
+            &locked,
+            "Foo.cs",
+            b"class A {}",
+            Some((&missing, prefix.as_slice()))
+        )
+        .is_empty()
+    );
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+}

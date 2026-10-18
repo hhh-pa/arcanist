@@ -71,6 +71,9 @@ mod xhp_style;
 #[derive(Debug, Default)]
 pub struct XhpastLinter {
     options: std::collections::HashMap<String, serde_json::Value>,
+    /// Test seam: base directory for the staged temp input (`None` uses
+    /// `std::env::temp_dir()`, the production behavior).
+    temp_dir: Option<PathBuf>,
 }
 
 impl XhpastLinter {
@@ -313,14 +316,14 @@ struct StagedFile {
 }
 
 impl StagedFile {
-    fn stage(display_path: &str, data: &[u8]) -> Result<Self, String> {
+    fn stage(dir: &Path, display_path: &str, data: &[u8]) -> Result<Self, String> {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = dir.join(format!(
             "arc-rs-lint-xhpast-{}-{nanos}-{n}",
             std::process::id()
         ));
@@ -522,11 +525,25 @@ pub fn lint_with_binary_and_options(
     binary: Option<&Path>,
     options: &xhp_ast::XhpOptions,
 ) -> Vec<LintMessage> {
+    let dir = std::env::temp_dir();
+    lint_with_binary_and_options_in(&dir, path, data, binary, options)
+}
+
+/// [`lint_with_binary_and_options`] with the staging base directory
+/// injected, so tests can cover the staging-failure arm with an
+/// unwritable directory.
+fn lint_with_binary_and_options_in(
+    dir: &Path,
+    path: &str,
+    data: &[u8],
+    binary: Option<&Path>,
+    options: &xhp_ast::XhpOptions,
+) -> Vec<LintMessage> {
     let Some(binary) = binary else {
         return Vec::new();
     };
-    let Ok(staged) = StagedFile::stage(path, data) else {
-        return Vec::new(); // LCOV_EXCL_LINE // Reason: staging failure; hermetic tests cannot fail temp-dir writes
+    let Ok(staged) = StagedFile::stage(dir, path, data) else {
+        return Vec::new();
     };
     let Some((code, stdout, stderr)) = run_tool(binary, staged.path()) else {
         return Vec::new();
@@ -579,7 +596,8 @@ impl Linter for XhpastLinter {
             return Vec::new();
         }
         let options = xhp_ast::XhpOptions::from_map(&self.options);
-        lint_with_binary_and_options(path, data, binary_on_path().as_deref(), &options)
+        let dir = self.temp_dir.clone().unwrap_or_else(std::env::temp_dir);
+        lint_with_binary_and_options_in(&dir, path, data, binary_on_path().as_deref(), &options)
     }
 
     fn set_option(
