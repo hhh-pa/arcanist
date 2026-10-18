@@ -1310,6 +1310,14 @@ fn branches_for_revision_skips_footer_decoys() {
     assert_eq!(tips[0].name, "feature");
 }
 
+fn must_not_call_conduit(_: &str, _: &serde_json::Value) -> Result<serde_json::Value, String> {
+    Err("must not be called".to_string())
+}
+
+fn empty_conduit_data(_: &str, _: &serde_json::Value) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({"data": []}))
+}
+
 #[test]
 fn branches_for_revision_is_empty_without_branches() {
     // T1170: no local tips means no association and no Conduit traffic
@@ -1321,9 +1329,7 @@ fn branches_for_revision_is_empty_without_branches() {
         monogram: "D123".to_string(),
         title: "Fix it".to_string(),
     };
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Err("must not be called".to_string()) // LCOV_EXCL_START // Reason: must-not-call guard; firing fails the test
-    }; // LCOV_EXCL_STOP
+    let call = must_not_call_conduit;
     assert_eq!(
         branches_for_revision(&call, tmp.path(), &revision).unwrap(),
         Vec::new()
@@ -1625,9 +1631,7 @@ fn run_in_dispatches_hg_repos() {
     std::fs::write(tmp.path().join(".hg"), "not-a-repo\n").unwrap();
     assert!(is_hg_repo(tmp.path()));
     assert!(!git::is_inside_work_tree(tmp.path()));
-    let empty = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
-    }; // LCOV_EXCL_STOP
+    let empty = empty_conduit_data;
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
         run_in_with(
@@ -1674,9 +1678,7 @@ fn hg_system_wrappers_handle_plain_dirs() {
     // repo instead of failing (work.rs:678-680,746-752,732).
     let tmp = TempDir::new("hg-plain");
     assert_eq!(hg_branch_tips(tmp.path()).unwrap(), Vec::new());
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Err("must not be called".to_string()) // LCOV_EXCL_START // Reason: must-not-call guard; firing fails the test
-    }; // LCOV_EXCL_STOP
+    let call = must_not_call_conduit;
     assert_eq!(
         hg_branches_for_revision(&call, tmp.path(), &revision_123()).unwrap(),
         Vec::new()
@@ -1716,9 +1718,7 @@ fn hg_branches_for_revision_is_empty_without_markers() {
     // T1170: no hg tips means no association and no Conduit traffic
     // (work.rs:732).
     let (tmp, hg_cmd) = hg_test_repo("hg-no-markers");
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Err("must not be called".to_string()) // LCOV_EXCL_START // Reason: must-not-call guard; firing fails the test
-    }; // LCOV_EXCL_STOP
+    let call = must_not_call_conduit;
     assert_eq!(
         hg_branches_for_revision_with(&call, tmp.path(), &hg_cmd, &revision_123()).unwrap(),
         Vec::new()
@@ -1841,9 +1841,7 @@ fn hg_dispatch_checks_out_branch_markers() {
         "stable  1:abcdef123456\n",
     )
     .unwrap();
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
-    }; // LCOV_EXCL_STOP
+    let call = empty_conduit_data;
     hg_dispatch_symbol_with(tmp.path(), &hg_cmd, "stable", None, &call).unwrap();
     let log = hg_read_log(tmp.path());
     assert!(log.contains("checkout stable --"), "{log}");
@@ -1855,9 +1853,7 @@ fn hg_dispatch_rejects_unresolvable_starts() {
     // (work.rs:1582).
     let (tmp, hg_cmd) = hg_test_repo("hg-bad-start");
     std::fs::write(tmp.path().join(".fakehg-fail-log"), "").unwrap();
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
-    }; // LCOV_EXCL_STOP
+    let call = empty_conduit_data;
     assert_eq!(
         hg_dispatch_symbol_with(
             tmp.path(),
@@ -2039,9 +2035,7 @@ fn run_hg_in_with_cmd_runs_bookmark_flow() {
     // (work.rs:1889-1897).
     let (tmp, hg_cmd) = hg_test_repo("hg-run-ok");
     let options = hg_options("novel");
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
-    }; // LCOV_EXCL_STOP
+    let call = empty_conduit_data;
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
         run_hg_in_with_cmd(tmp.path(), &hg_cmd, &options, Some(&call), &mut input),
@@ -2058,9 +2052,7 @@ fn run_hg_in_with_cmd_shelves_and_restores() {
     let (tmp, hg_cmd) = hg_test_repo("hg-run-shelve");
     std::fs::write(tmp.path().join(".fakehg-status"), "M a.txt\n").unwrap();
     let options = hg_options("novel");
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
-    }; // LCOV_EXCL_STOP
+    let call = empty_conduit_data;
     let mut input = std::io::Cursor::new(b"y\n");
     assert_eq!(
         run_hg_in_with_cmd(tmp.path(), &hg_cmd, &options, Some(&call), &mut input),
@@ -2081,9 +2073,7 @@ fn run_hg_in_with_cmd_fails_when_unshelve_fails() {
     std::fs::write(tmp.path().join(".fakehg-status"), "M a.txt\n").unwrap();
     std::fs::write(tmp.path().join(".fakehg-fail-unshelve"), "").unwrap();
     let options = hg_options("novel");
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
-    }; // LCOV_EXCL_STOP
+    let call = empty_conduit_data;
     let mut input = std::io::Cursor::new(b"y\n");
     assert_eq!(
         run_hg_in_with_cmd(tmp.path(), &hg_cmd, &options, Some(&call), &mut input),
@@ -2101,9 +2091,7 @@ fn run_hg_in_with_cmd_fails_when_status_fails() {
     let (tmp, hg_cmd) = hg_test_repo("hg-run-status");
     std::fs::write(tmp.path().join(".fakehg-fail-status"), "").unwrap();
     let options = hg_options("novel");
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
-    }; // LCOV_EXCL_STOP
+    let call = empty_conduit_data;
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
         run_hg_in_with_cmd(tmp.path(), &hg_cmd, &options, Some(&call), &mut input),
@@ -2121,9 +2109,7 @@ fn run_hg_in_with_cmd_fails_without_shelve() {
     std::fs::write(tmp.path().join(".fakehg-status"), "M a.txt\n").unwrap();
     std::fs::write(tmp.path().join(".fakehg-no-shelve"), "").unwrap();
     let options = hg_options("novel");
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
-    }; // LCOV_EXCL_STOP
+    let call = empty_conduit_data;
     let mut input = std::io::Cursor::new(b"y\n");
     assert_eq!(
         run_hg_in_with_cmd(tmp.path(), &hg_cmd, &options, Some(&call), &mut input),
@@ -2141,9 +2127,7 @@ fn run_hg_in_with_cmd_restores_after_ambiguous_dispatch() {
     std::fs::write(tmp.path().join(".fakehg-bookmarks"), "  dup  3:abc\n").unwrap();
     std::fs::write(tmp.path().join(".fakehg-branches"), "dup  1:abc123\n").unwrap();
     let options = hg_options("dup");
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"data": []})) // LCOV_EXCL_START // Reason: stub never invoked on this path
-    }; // LCOV_EXCL_STOP
+    let call = empty_conduit_data;
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
         run_hg_in_with_cmd(tmp.path(), &hg_cmd, &options, Some(&call), &mut input),
@@ -2189,4 +2173,24 @@ fn git_helper_reports_failing_commands() {
 fn requires_a_supported_working_copy_defensive_error_arm() {
     // `expect_work_args` unwraps `Args`: an empty symbol errors.
     expect_work_args(&[]);
+}
+// -( T1176 S10: stub/guard coverage )----------------------------------------
+
+#[test]
+fn must_not_call_conduit_companion_reports_the_canned_error() {
+    // The must-not-call guard keeps guarding: direct calls fail closed
+    // with the byte-identical message the callers propagate.
+    assert_eq!(
+        must_not_call_conduit("m", &serde_json::json!({})).unwrap_err(),
+        "must not be called"
+    );
+}
+
+#[test]
+fn empty_conduit_data_companion_returns_the_canned_payload() {
+    // The never-invoked stub keeps its canned empty payload.
+    assert_eq!(
+        empty_conduit_data("m", &serde_json::json!({})).unwrap(),
+        serde_json::json!({"data": []})
+    );
 }

@@ -3590,15 +3590,17 @@ fn gap2_check_revision_ownership_flows() {
     assert_eq!(err, diff_submit::OWNERSHIP_ABORT);
 }
 
+fn must_not_call_conduit(_: &str, _: &serde_json::Value) -> Result<serde_json::Value, String> {
+    Err("must not call".to_string())
+}
+
 #[test]
 fn gap2_validate_commit_message_flows() {
     use std::io::Cursor;
 
     // No revision, no reviewers: silent success, no conduit calls.
     let message = CommitMessage::new_from_raw_corpus("Title\n").unwrap();
-    let fail = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Err("must not call".to_string()) // LCOV_EXCL_START // Reason: must-not-call guard; firing fails the test
-    }; // LCOV_EXCL_STOP
+    let fail = must_not_call_conduit;
     let mut out = Vec::new();
     validate_commit_message(
         &mut Cursor::new(b"".to_vec()),
@@ -4550,9 +4552,7 @@ fn gap2_format_count_grouping() {
 #[test]
 fn gap2_calculate_should_amend_decisions() {
     let no_revisions = || -> Result<Vec<(i64, String)>, String> { Ok(Vec::new()) };
-    let fail_call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        Err("must not call".to_string()) // LCOV_EXCL_START // Reason: must-not-call guard; firing fails the test
-    }; // LCOV_EXCL_STOP
+    let fail_call = must_not_call_conduit;
     let head = gap2_d1_local_commit("abc123", "Work", "Work\n");
     let base = || AmendCheck {
         history_immutable: false,
@@ -5168,12 +5168,17 @@ fn t1170_copy_status_maps_to_copy_here() {
     assert_eq!(copied.old_path.as_deref(), Some("a.txt"));
 }
 
+fn conduit_must_not_run_for_empty_log(
+    _: &str,
+    _: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    panic!("conduit must not run for an empty log")
+}
+
 #[test]
 fn t1170_working_copy_revisions_with_empty_log_returns_none() {
     let repo = T1170GitRepo::named("emptylog");
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        panic!("conduit must not run for an empty log"); // LCOV_EXCL_LINE // Reason: must-not-call guard; firing fails the test
-    };
+    let call = conduit_must_not_run_for_empty_log;
     let revisions =
         load_working_copy_revisions_git(&call, &repo.dir, "HEAD", "HEAD", "PHID-U").unwrap();
     assert!(revisions.is_empty());
@@ -5289,15 +5294,21 @@ fn t1170_hg_working_copy_revisions_by_commit_hash() {
 }
 
 #[cfg(unix)]
+fn conduit_must_not_run_without_commits(
+    _: &str,
+    _: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    panic!("conduit must not run without commits")
+}
+
+#[cfg(unix)]
 #[test]
 fn t1170_hg_working_copy_revisions_empty_without_commits() {
     // No footer IDs and no local commits: empty without querying.
     let fake = T1170FakeHg::named("hgempty");
     fake.write(".resp-log", "n1\x01no trailer here\x02".as_bytes());
     fake.write(".resp-local", b"");
-    let call = |_: &str, _: &serde_json::Value| -> Result<serde_json::Value, String> {
-        panic!("conduit must not run without commits"); // LCOV_EXCL_LINE // Reason: must-not-call guard; firing fails the test
-    };
+    let call = conduit_must_not_run_without_commits;
     let revisions =
         load_working_copy_revisions_hg(&call, &fake.dir, &fake.hg, "base", "default", "PHID-U")
             .unwrap();
@@ -6635,4 +6646,30 @@ fn t1170_run_unit_in_process_collects_cargo_results_defensive_no_engine_arm() {
     let dir = S5ScratchDir(gap2_d1_scratch("s5-noengine"));
     let argv = ["--engine".to_string(), "cargo".to_string()];
     expect_unit_code(&dir.0, &argv);
+}
+// -( T1176 S10: stub/guard coverage )----------------------------------------
+
+#[test]
+fn must_not_call_conduit_companion_reports_the_canned_error() {
+    // The must-not-call guard keeps guarding: direct calls fail closed
+    // with the byte-identical message the callers propagate.
+    assert_eq!(
+        must_not_call_conduit("m", &serde_json::json!({})).unwrap_err(),
+        "must not call"
+    );
+}
+
+#[test]
+#[should_panic(expected = "conduit must not run for an empty log")]
+fn conduit_must_not_run_for_empty_log_companion_panics() {
+    // The empty-log guard keeps guarding: any conduit call panics.
+    let _ = conduit_must_not_run_for_empty_log("m", &serde_json::json!({}));
+}
+
+#[cfg(unix)]
+#[test]
+#[should_panic(expected = "conduit must not run without commits")]
+fn conduit_must_not_run_without_commits_companion_panics() {
+    // The no-commits guard keeps guarding: any conduit call panics.
+    let _ = conduit_must_not_run_without_commits("m", &serde_json::json!({}));
 }

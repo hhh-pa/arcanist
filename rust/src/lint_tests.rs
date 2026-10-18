@@ -1926,9 +1926,8 @@ fn r4_lint2_lint3_gather_emit_kinds() {
 }
 
 // -( T1153 Wave 2: lint retrocompat )--------------------------------------
-// LCOV_EXCL_START // Reason: referenced-but-never-called parser; the script fails before parsing
 fn lint4_failing_parser(_output: &str) -> Vec<crate::lint_script_and_regex::ScriptRegexMatch> {
-    unreachable!("the script fails before parsing") // LCOV_EXCL_STOP
+    unreachable!("the script fails before parsing")
 }
 
 #[test]
@@ -4415,4 +4414,13 @@ fn spawn_with_retry_retries_text_file_busy() {
 fn cov_patch_prompt_reads_missing_disk_as_dev_null_defensive_stdout_arm() {
     // `expect_buffer` unwraps `Buffer`: a stdout sink panics.
     expect_buffer(&Sink::Stdout);
+}
+// -( T1176 S10: stub/guard coverage )----------------------------------------
+
+#[test]
+#[should_panic(expected = "the script fails before parsing")]
+fn lint4_failing_parser_companion_panics_before_parsing() {
+    // The script always fails first, so the parser is unreachable in the
+    // engine flow; the direct call pins the contract.
+    lint4_failing_parser("out");
 }

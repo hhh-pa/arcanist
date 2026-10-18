@@ -827,12 +827,20 @@ fn expansion_driver_dispatches_and_reports_shell_and_broken_chains() {
     assert!(notice.contains("Alias resolved to \"gone\""), "{notice}");
 }
 
+fn must_not_load_aliases() -> Option<(Vec<Alias>, Vec<String>)> {
+    panic!("must not load")
+}
+
+fn must_not_spawn_for_passthrough(_: &[String]) -> Result<ShellStatus, String> {
+    panic!("must not spawn")
+}
+
 #[test]
 fn expansion_driver_passes_through_flags_and_unreadable_config() {
     let (result, notices) = apply_expansion_with(
         args(&["--help"]),
-        || panic!("must not load"), // LCOV_EXCL_START // Reason: must-not-call guards; firing fails the test
-        |_| panic!("must not spawn"), // LCOV_EXCL_STOP
+        must_not_load_aliases,
+        must_not_spawn_for_passthrough,
     );
     assert_eq!(result, Ok(args(&["--help"])));
     assert!(notices.is_empty());
@@ -1244,4 +1252,21 @@ fn expansion_reports_cycles_defensive_dispatch_arm() {
         argv: Vec::new(),
         hints: Vec::new(),
     });
+}
+// -( T1176 S10: stub/guard coverage )----------------------------------------
+
+#[test]
+#[should_panic(expected = "must not load")]
+fn must_not_load_aliases_companion_panics() {
+    // The flag-passthrough path never loads config; the direct call pins
+    // the guard.
+    let _ = must_not_load_aliases();
+}
+
+#[test]
+#[should_panic(expected = "must not spawn")]
+fn must_not_spawn_for_passthrough_companion_panics() {
+    // The flag-passthrough path never spawns; the direct call pins the
+    // guard.
+    let _ = must_not_spawn_for_passthrough(&[]);
 }
