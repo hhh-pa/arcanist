@@ -2146,18 +2146,10 @@ struct Validated {
     revision_raw: Option<String>,
 }
 
-/// Resolve the conduit URI: the flag, `ARC_CONDUIT_URI`, or the
+/// Resolve the conduit URI — the flag, `ARC_CONDUIT_URI`, or the
 /// merged-config discovery from `dir` (like the diff port's
-/// `discover_from(&dir)`, not the process working directory).
-pub fn resolve_conduit_uri(conduit_uri: Option<&str>, dir: &Path) -> Option<String> {
-    conduit_uri
-        .map(str::to_string)
-        .or_else(|| std::env::var("ARC_CONDUIT_URI").ok())
-        .or_else(|| config::discover_from(dir))
-}
-
-/// [`resolve_conduit_uri`] with an explicit user file and
-/// [`get_config::LoadOptions`].
+/// `discover_from(&dir)`, not the process working directory) — with
+/// an explicit user file and [`get_config::LoadOptions`].
 pub fn resolve_conduit_uri_with(
     conduit_uri: Option<&str>,
     dir: &Path,

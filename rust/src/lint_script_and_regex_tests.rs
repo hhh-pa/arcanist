@@ -602,6 +602,12 @@ fn binary_lookup_covers_paths_and_path_search() {
 }
 
 #[test]
+fn binary_lookup_without_path_resolves_nothing() {
+    // Unset-`PATH` arm via the seam: bare names resolve nothing.
+    assert!(!binary_exists_with_path("sh", None));
+}
+
+#[test]
 fn run_script_defaults_to_the_working_directory() {
     let output = run_script_for_path("echo", "hello").unwrap();
     assert!(output.contains("hello"), "{output:?}");

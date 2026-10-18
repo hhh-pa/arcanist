@@ -906,35 +906,6 @@ echo hi
     releaser.join().unwrap();
 }
 
-/// True when exec refuses a write-held script with ETXTBSY (Linux
-/// does; macOS does not enforce it). Probed once per process so the
-/// stuck-script test pins behavior only where the errno exists.
-#[cfg(unix)]
-fn platform_reports_txtbsy() -> bool {
-    static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *PROBE.get_or_init(|| probe_txtbsy().unwrap_or(false))
-}
-
-#[cfg(unix)]
-fn probe_txtbsy() -> Option<bool> {
-    let dir = std::env::temp_dir().join(format!("arc-rs-txtbsy-probe-svn-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).ok()?;
-    let sh = dir.join("probe.sh");
-    std::fs::write(&sh, "#!/bin/sh\nexit 0\n").ok()?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&sh).ok()?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&sh, perms).ok()?;
-    }
-    let _held = std::fs::OpenOptions::new().write(true).open(&sh).ok()?;
-    let failed_busy = std::process::Command::new(&sh)
-        .output()
-        .is_err_and(|error| error.raw_os_error() == Some(26));
-    std::fs::remove_dir_all(&dir).ok();
-    Some(failed_busy)
-}
-
 #[test]
 fn output_retry_loop_is_bounded() {
     // A permanently busy spawn fails after the bound with the last
@@ -957,13 +928,12 @@ fn lang_env_var_falls_back_when_probe_fails() {
 }
 
 /// A permanently busy script still fails (after the bound) with the
-/// original error shape.
-#[cfg(unix)]
+/// original error shape. Linux-only: only Linux exec refuses a
+/// write-held script with ETXTBSY (macOS does not enforce it), so the
+/// test is meaningless elsewhere.
+#[cfg(target_os = "linux")]
 #[test]
 fn output_gives_up_on_permanently_busy_script() {
-    if !platform_reports_txtbsy() {
-        return; // LCOV_EXCL_LINE // Reason: probe is always true where gates measure (Linux reports ETXTBSY); the skip only trips on macOS
-    } // LCOV_EXCL_START // Reason: ETXTBSY-only test body; macOS exec never reports text-file-busy (probe-gated)
     let fake = FakeSvn::named("stuck");
     let sh = fake.dir.join("stuck.sh");
     std::fs::write(
@@ -982,7 +952,7 @@ echo hi
     let _held = std::fs::OpenOptions::new().write(true).open(&sh).unwrap();
     let svn = SvnCommand::custom(&sh.to_string_lossy(), &[]);
     let err = output_with(&fake.dir, &svn, &[]).unwrap_err();
-    assert!(err.contains("failed to run"), "{err}"); // LCOV_EXCL_STOP
+    assert!(err.contains("failed to run"), "{err}");
 }
 #[test]
 fn normalizes_status_path_separators() {

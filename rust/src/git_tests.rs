@@ -606,6 +606,32 @@ fn plain_dir(name: &str) -> std::path::PathBuf {
     dir
 }
 
+/// House scratch dir (pid + per-file counter); removed on drop.
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path =
+            std::env::temp_dir().join(format!("arc-rs-git-tests-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.path).ok();
+    }
+}
+
 fn commit_one(dir: &std::path::Path, name: &str, contents: &str) {
     std::fs::write(dir.join(name), contents).unwrap();
     for args in [
@@ -920,4 +946,39 @@ fn repo_helpers_clear_stale_dirs() {
     assert!(!plain_second.join("junk.txt").exists());
     std::fs::remove_dir_all(&second).ok();
     std::fs::remove_dir_all(&plain_second).ok();
+}
+
+/// Ancient-git fallback chain: a fake `git` reporting 1.7.4 without
+/// `remote get-url` (added in 2.7) or working `ls-remote --get-url`
+/// resolves the URI through `config remote.<name>.url`, staging the
+/// config fallback guard. Unix-only (shell script).
+#[cfg(unix)]
+#[test]
+fn ancient_git_config_fallback_resolves_remote_uri() {
+    let tmp = TempDir::new("ancient-git");
+    let fake = tmp.path().join("git");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"--version\" ]; then echo \"git version 1.7.4\"; exit 0; fi\n\
+         if [ \"$1\" = \"remote\" ]; then exit 1; fi\n\
+         if [ \"$1\" = \"ls-remote\" ]; then exit 1; fi\n\
+         if [ \"$1\" = \"config\" ]; then echo \"https://example.test/repo.git\"; exit 0; fi\n\
+         exit 1\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&fake).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake, perms).unwrap();
+    }
+    assert_eq!(
+        load_git_remote_uri_with(tmp.path(), "origin", false, Some(&fake)).as_deref(),
+        Some("https://example.test/repo.git\n")
+    );
+    assert_eq!(
+        load_git_remote_uri_with(tmp.path(), "origin", true, Some(&fake)).as_deref(),
+        Some("https://example.test/repo.git\n")
+    );
 }

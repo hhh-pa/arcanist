@@ -1992,13 +1992,15 @@ fn lint20_unreadable_files_fold_into_the_aggregate() {
 /// LINT-20 on Linux CI: the chmod trigger cannot fail a read for root,
 /// so `/proc/self/mem` (a regular file whose every read faults EIO —
 /// the same deterministic trigger as the paste/upload twins) folds
-/// into the aggregate instead. Skips where `/proc` is unavailable.
+/// into the aggregate instead. Fails loud where `/proc` is missing
+/// (the gates image always provides it).
 #[cfg(target_os = "linux")]
 #[test]
 fn lint20_unreadable_proc_mem_folds_into_the_aggregate() {
-    if std::fs::symlink_metadata("/proc/self/mem").is_err() {
-        return; // LCOV_EXCL_LINE // Reason: /proc is always present where gates measure; the skip only trips in containers without /proc
-    }
+    assert!(
+        std::path::Path::new("/proc/self/mem").exists(),
+        "gates guarantee /proc on Linux; failing loud instead of skipping"
+    );
     let tmp = TempDir::new("lint20-proc");
     tmp.write("ok.txt", "ok\n");
     let work = WorkCopy {

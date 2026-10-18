@@ -4401,16 +4401,6 @@ fn stub_hg(dir: &std::path::Path, name: &str, body: &str) -> hg::HgCommand {
     hg::HgCommand::custom(&script.to_string_lossy(), &[])
 }
 
-/// True when the system `patch` binary runs (absent on some machines, so
-/// the failure-expecting flow test probes and returns early instead of
-/// failing; all other patch tests use [`fake_patch_shim`]).
-fn has_patch_binary() -> bool {
-    std::process::Command::new("patch")
-        .arg("--version")
-        .output()
-        .is_ok()
-}
-
 /// Fake `patch` binary routing through `git apply` (hermetic: system
 /// patch is absent on some machines and fails valid input on Windows
 /// CI). The shim applies the `-i` file in its cwd with newline
@@ -6358,9 +6348,7 @@ fn t1170_apply_patch_svn_from_dicts() {
 fn t1170_flow_svn_hunks_failure_exits_empty() {
     // Failed svn hunks print the warning and exit empty
     // (patch.rs:6392): the caller exits 1 without printing more.
-    if !has_patch_binary() {
-        return; // LCOV_EXCL_LINE // Reason: skip arm for patch-less machines; the gates image installs patch via build-essential
-    }
+    // `patch` ships on every CI runner (build-essential), so no probe.
     let dir = temp_dir("t1170_flow_svn");
     std::fs::create_dir(dir.join(".svn")).unwrap();
     std::fs::write(dir.join("v.txt"), "zzz\n").unwrap();

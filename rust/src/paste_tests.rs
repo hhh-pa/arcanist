@@ -799,14 +799,15 @@ fn unreadable_input_reports_not_readable() {
 /// Non-permission read failures surface the `readBytes()` open-failure
 /// text. `/proc/self/mem` stats as a regular file but every read
 /// faults (EIO) — the only deterministic trigger, hence Linux-only
-/// (macOS/Windows have no equivalent). Skips when `/proc` is
-/// unavailable (some containers).
+/// (macOS/Windows have no equivalent). Fails loud when `/proc` is
+/// missing (the gates image always provides it).
 #[cfg(target_os = "linux")]
 #[test]
 fn input_read_error_reports_open_failure() {
-    if std::fs::symlink_metadata("/proc/self/mem").is_err() {
-        return; // LCOV_EXCL_LINE // Reason: /proc is always present where gates measure; the skip only trips where /proc is missing (macOS)
-    }
+    assert!(
+        std::path::Path::new("/proc/self/mem").exists(),
+        "gates guarantee /proc on Linux; failing loud instead of skipping"
+    );
     let tmp = TempDir::new("read-error");
     let err = read_input_file(tmp.path(), "/proc/self/mem").unwrap_err();
     assert!(err.contains("Failed to read file"), "{err}");

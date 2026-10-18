@@ -467,8 +467,16 @@ pub fn binary_exists(candidate: &str) -> bool {
     if candidate.contains('/') || candidate.contains('\\') {
         return is_executable_file(path);
     }
-    let Some(dirs) = std::env::var_os("PATH") else {
-        return false; // LCOV_EXCL_LINE // Reason: PATH is always set in CI; the unset arm never runs
+    binary_exists_with_path(candidate, std::env::var_os("PATH"))
+}
+
+/// [`binary_exists`] over an explicit `PATH` value (test seam;
+/// production passes `var_os("PATH")`; unsetting `PATH` in-process
+/// would mutate ambient process state, so the `None` arm stages here
+/// instead of through a subprocess the binary never reaches).
+fn binary_exists_with_path(candidate: &str, dirs: Option<std::ffi::OsString>) -> bool {
+    let Some(dirs) = dirs else {
+        return false;
     };
     for dir in std::env::split_paths(&dirs) {
         let full = dir.join(candidate);

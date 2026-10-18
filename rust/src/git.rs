@@ -34,8 +34,21 @@ use std::path::{Path, PathBuf};
 /// Run git in `dir`, returning the raw output. Spawn failures become
 /// errors; non-zero exit statuses are left for the caller to interpret.
 pub fn output(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    crate::proc_env::command("git")
-        .current_dir(dir)
+    output_with_git(dir, args, None)
+}
+
+/// [`output`] with the `git` program override injected (test seam;
+/// production passes `None`, which spawns `git`).
+fn output_with_git(
+    dir: &Path,
+    args: &[&str],
+    git: Option<&Path>,
+) -> Result<std::process::Output, String> {
+    let mut cmd = match git {
+        Some(program) => crate::proc_env::command(program),
+        None => crate::proc_env::command("git"),
+    };
+    cmd.current_dir(dir)
         .args(args)
         .output()
         .map_err(|e| format!("failed to run git: {e}"))
@@ -44,7 +57,13 @@ pub fn output(dir: &Path, args: &[&str]) -> Result<std::process::Output, String>
 /// Run git in `dir`, returning trimmed stdout, or the combined trimmed
 /// output when git exits non-zero.
 pub fn stdout_text(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = output(dir, args)?;
+    stdout_text_with(dir, args, None)
+}
+
+/// [`stdout_text`] with the `git` program override injected (test
+/// seam; production passes `None`).
+fn stdout_text_with(dir: &Path, args: &[&str], git: Option<&Path>) -> Result<String, String> {
+    let out = output_with_git(dir, args, git)?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
     } else {
@@ -1628,7 +1647,13 @@ pub fn lfs_output_indicates_lfs(success: bool, stdout: &[u8]) -> bool {
 /// PHP: `ArcanistGitAPI::getGitVersion`
 /// (`src/repository/api/ArcanistGitAPI.php:53`).
 pub fn git_version(dir: &Path) -> Result<String, String> {
-    stdout_text(dir, &["--version"]).map(|text| parse_git_version(&text))
+    git_version_with(dir, None)
+}
+
+/// [`git_version`] with the `git` program override injected (test
+/// seam; production passes `None`).
+fn git_version_with(dir: &Path, git: Option<&Path>) -> Result<String, String> {
+    stdout_text_with(dir, &["--version"], git).map(|text| parse_git_version(&text))
 }
 
 /// Metadata (`.git`) directory for `dir`.
@@ -1775,22 +1800,34 @@ pub fn get_path_to_upstream(dir: &Path, start: &str) -> Result<UpstreamPath, Str
 /// 1.7.5) `config remote.<name>.url`. Returns the raw stdout; the
 /// caller normalizes it.
 fn load_git_remote_uri(dir: &Path, remote_name: &str, for_push: bool) -> Option<String> {
+    load_git_remote_uri_with(dir, remote_name, for_push, None)
+}
+
+/// [`load_git_remote_uri`] with the `git` program override injected
+/// (test seam; production passes `None`, which spawns `git`). The
+/// fake-`git` test stages the ancient fallback chain below.
+fn load_git_remote_uri_with(
+    dir: &Path,
+    remote_name: &str,
+    for_push: bool,
+    git: Option<&Path>,
+) -> Option<String> {
     let mut args: Vec<&str> = vec!["remote", "get-url"];
     if for_push {
         args.push("--push");
     }
     args.push("--");
     args.push(remote_name);
-    if let Ok(out) = output(dir, &args)
+    if let Ok(out) = output_with_git(dir, &args, git)
         && out.status.success()
     {
         return Some(String::from_utf8_lossy(&out.stdout).into_owned());
     }
-    let version = git_version(dir).unwrap_or_default();
+    let version = git_version_with(dir, git).unwrap_or_default();
     if version_at_least(&version, "2.7") {
         return None;
     }
-    if let Ok(out) = output(dir, &["ls-remote", "--get-url", remote_name]) {
+    if let Ok(out) = output_with_git(dir, &["ls-remote", "--get-url", remote_name], git) {
         let success = out.status.success(); // LCOV_EXCL_START // Reason: ls-remote fallback body; needs git older than 2.7, but CI git is modern
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         if let Some(uri) = remote_uri_from_ls_remote(success, &text, remote_name) {
@@ -1801,11 +1838,10 @@ fn load_git_remote_uri(dir: &Path, remote_name: &str, for_push: bool) -> Option<
         return None; // LCOV_EXCL_LINE // Reason: git 1.7.5-2.7 early-out; CI git is modern
     }
     let key = format!("remote.{remote_name}.url");
-    if let Ok(out) = output(dir, &["config", "--", &key])
-        // LCOV_EXCL_START // Reason: ancient-git config fallback guard; CI git is modern
+    if let Ok(out) = output_with_git(dir, &["config", "--", &key], git)
         && out.status.success()
     {
-        return Some(String::from_utf8_lossy(&out.stdout).into_owned()); // LCOV_EXCL_STOP
+        return Some(String::from_utf8_lossy(&out.stdout).into_owned());
     }
     None
 }

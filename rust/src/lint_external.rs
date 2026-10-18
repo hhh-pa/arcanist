@@ -541,7 +541,9 @@ pub fn binary_exists(candidate: &str) -> bool {
         return is_executable_file(path);
     }
     let Some(dirs) = std::env::var_os("PATH") else {
-        return false; // LCOV_EXCL_LINE // Reason: PATH is always set in CI; the unset arm never runs
+        // Staged by the `env_hermetic` subprocess test (child without
+        // `PATH`); unsetting `PATH` in-process would mutate ambient state.
+        return false;
     };
     for dir in std::env::split_paths(&dirs) {
         let full = dir.join(candidate);
