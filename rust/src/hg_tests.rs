@@ -1913,10 +1913,10 @@ fn spawn_output_retries_txtbsy_to_success() {
         .unwrap();
     // Probe: Linux must report ETXTBSY while the write handle is held;
     // fail loud instead of passing without covering the retry arm.
-    match std::process::Command::new(&script).output() {
-        Err(error) if is_text_file_busy(&error) => {}
-        other => panic!("expected ETXTBSY probe failure, got {other:?}"),
-    }
+    let err = std::process::Command::new(&script)
+        .output()
+        .expect_err("expected ETXTBSY probe failure");
+    assert!(is_text_file_busy(&err), "expected ETXTBSY, got {err:?}");
     // Release after 50ms; the retry loop must ride through to success.
     std::thread::scope(|scope| {
         scope.spawn(|| {
