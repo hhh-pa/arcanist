@@ -21,7 +21,7 @@
 // several tests read the user config layer and fail or mis-cover
 // otherwise. Unix-only in practice: like its Python predecessor, object
 // discovery skips dotted names, so Windows `.exe` test objects are not
-// found. Stdlib only.
+// found. Stdlib plus internal/lcov (itself stdlib-only) only.
 package main
 
 import (
@@ -35,6 +35,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/hhh-pa/arcanist/scripts/ci/go/internal/lcov"
 )
 
 var excluded = []string{
@@ -152,6 +154,12 @@ func main() {
 	raw := run(exportCmd)
 
 	merged := parseCanonical(raw, top)
+	// Drop LCOV_EXCL_*-marked lines (T1170 endgame) through the same
+	// marker core CI's canonical pipeline uses, so local % == CI %.
+	if err := applyExclusions(merged); err != nil {
+		fmt.Fprintf(os.Stderr, "LCOV exclusion markers: %s\n", err)
+		os.Exit(1)
+	}
 	var hit, total int64
 	var files []string
 	for sf := range maps.Keys(merged) {
@@ -222,6 +230,25 @@ func addCount(record map[int]int64, lineno int, count uint64) {
 	} else {
 		record[lineno] = prev + int64(count)
 	}
+}
+
+// applyExclusions deletes DA lines covered by LCOV exclusion
+// markers, sharing internal/lcov's marker semantics with CI's
+// canonical pipeline. Fully-excluded files keep an empty record so
+// the writer still emits their LF:0/LH:0 block, exactly like Emit.
+func applyExclusions(merged map[string]map[int]int64) error {
+	for sf, record := range merged {
+		excluded, err := lcov.ExcludedLines(sf)
+		if err != nil {
+			return err
+		}
+		for lineno := range record {
+			if excluded[lineno] {
+				delete(record, lineno)
+			}
+		}
+	}
+	return nil
 }
 
 // parseCanonical folds raw llvm-cov LCOV into path-normalized per-line

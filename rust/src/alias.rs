@@ -711,7 +711,7 @@ fn shell_spawn_argv(shell_argv: &[String]) -> (String, Vec<String>) {
     } else {
         match shell_argv.split_first() {
             Some((program, args)) => (program.clone(), args.to_vec()),
-            None => (String::new(), Vec::new()),
+            None => (String::new(), Vec::new()), // LCOV_EXCL_LINE // Reason: non-unix arm; cfg!(unix) is always true on ubuntu CI
         }
     }
 }

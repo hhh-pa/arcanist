@@ -1,5 +1,7 @@
 #!/bin/sh
-# Stub rust-code-analysis-cli: serves rca-<basename>.json per -p file.
+# Stub rust-code-analysis-cli: serves rca-<path>.json per -p file,
+# falling back to rca-<basename>.json (<path> is the -p relative path
+# with ./ stripped, .rs stripped, and / flattened to -).
 outdir=""
 files=""
 prev=""
@@ -19,5 +21,10 @@ if [ "$1" = "--version" ]; then
 fi
 for f in $files; do
   mkdir -p "$outdir/$(dirname "$f")"
-  cat "$STUB_DATA/rca-$(basename "$f" .rs).json" > "$outdir/$f.json"
+  key=$(printf '%s' "$f" | sed -e 's|^\./||' -e 's|\.rs$||' -e 's|/|-|g')
+  if [ -f "$STUB_DATA/rca-$key.json" ]; then
+    cat "$STUB_DATA/rca-$key.json" > "$outdir/$f.json"
+  else
+    cat "$STUB_DATA/rca-$(basename "$f" .rs).json" > "$outdir/$f.json"
+  fi
 done

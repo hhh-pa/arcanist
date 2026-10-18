@@ -2,6 +2,8 @@ package main
 
 import (
 	"math"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -114,5 +116,44 @@ func TestParseCanonicalSkipsMalformedDA(t *testing.T) {
 	want := map[string]map[int]int64{"/repo/rust/src/a.rs": {2: 2}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("parseCanonical = %v, want %v", got, want)
+	}
+}
+
+func TestApplyExclusions(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "a.rs")
+	body := "alive();\n" + // 1 kept
+		"dead(); // LCOV_EXCL_LINE\n" + // 2 dropped (covered, still dropped)
+		"// LCOV_EXCL_START\n" + // 3 dropped
+		"windows_only();\n" + // 4 dropped
+		"// LCOV_EXCL_STOP\n" // 5 dropped
+	if err := os.WriteFile(src, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(dir, "b.rs")
+	if err := os.WriteFile(other, []byte("// LCOV_EXCL_LINE\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	merged := map[string]map[int]int64{
+		src:   {1: 1, 2: 7, 3: 0, 4: 0, 5: 0},
+		other: {1: 0},
+	}
+	if err := applyExclusions(merged); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]map[int]int64{src: {1: 1}, other: {}}
+	if !reflect.DeepEqual(merged, want) {
+		t.Fatalf("merged = %v, want %v", merged, want)
+	}
+}
+
+func TestApplyExclusionsErrors(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "a.rs")
+	if err := os.WriteFile(src, []byte("// LCOV_EXCL_START\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyExclusions(map[string]map[int]int64{src: {1: 0}}); err == nil {
+		t.Fatal("expected error for unclosed START")
 	}
 }

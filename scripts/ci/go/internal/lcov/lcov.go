@@ -5,6 +5,7 @@
 package lcov
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"path"
@@ -580,4 +581,116 @@ func IsSubset(sub, super map[LineKey]bool) bool {
 		}
 	}
 	return true
+}
+
+// LCOV exclusion markers (T1170 endgame): LLVM 22's llvm-cov does not
+// honor LCOV_EXCL_* markers, so the canonical producer filters marked
+// lines itself, after Canonicalize and before Emit recomputes LF/LH.
+const (
+	ExclLine  = "LCOV_EXCL_LINE"
+	ExclStart = "LCOV_EXCL_START"
+	ExclStop  = "LCOV_EXCL_STOP"
+)
+
+// ExcludedLines scans one source file for LCOV exclusion markers and
+// returns the 1-based line numbers to drop from coverage. Markers
+// match by substring so they ride trailing comments. Semantics:
+//   - a line containing LCOV_EXCL_LINE excludes itself;
+//   - lines from a LCOV_EXCL_START line through its LCOV_EXCL_STOP
+//     line (both marker lines included) are excluded;
+//   - a START inside an open region, a STOP with no open region, a
+//     line carrying both START and STOP, and a START left open at EOF
+//     are marker misuse and return an error naming file and line.
+func ExcludedLines(path string) (map[int]bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	excluded := map[int]bool{}
+	inRegion := false
+	startLine := 0
+	for i, line := range strings.Split(string(data), "\n") {
+		lineno := i + 1
+		hasStart := strings.Contains(line, ExclStart)
+		hasStop := strings.Contains(line, ExclStop)
+		switch {
+		case hasStart && hasStop:
+			return nil, fmt.Errorf("%s:%d: %s and %s on the same line",
+				path, lineno, ExclStart, ExclStop)
+		case hasStop:
+			if !inRegion {
+				return nil, fmt.Errorf("%s:%d: %s without %s",
+					path, lineno, ExclStop, ExclStart)
+			}
+			excluded[lineno] = true
+			inRegion = false
+		case hasStart:
+			if inRegion {
+				return nil, fmt.Errorf("%s:%d: nested %s (region opened at line %d)",
+					path, lineno, ExclStart, startLine)
+			}
+			excluded[lineno] = true
+			inRegion = true
+			startLine = lineno
+		case inRegion:
+			excluded[lineno] = true
+		case strings.Contains(line, ExclLine):
+			excluded[lineno] = true
+		}
+	}
+	if inRegion {
+		return nil, fmt.Errorf("%s:%d: %s without closing %s",
+			path, startLine, ExclStart, ExclStop)
+	}
+	return excluded, nil
+}
+
+// ApplyExclusions drops coverage records for LCOV-excluded source
+// lines (see ExcludedLines): DA entries on excluded lines, BRDA
+// entries keyed to excluded lines, FN entries on excluded lines, and
+// FNDA entries whose function name resolves (via FN) to an excluded
+// line. FNDA names with no FN entry are kept, as are records with
+// non-numeric line keys (unmappable to source lines). Relative SFs
+// resolve against workspaceRoot; canonical SFs are already absolute.
+// Records are copied, never mutated. Marker misuse or an unreadable
+// source file aborts with an error (fail closed: a silent skip would
+// let local % drift from CI % with no signal).
+func ApplyExclusions(records []SFRecord, workspaceRoot string) ([]SFRecord, error) {
+	out := make([]SFRecord, 0, len(records))
+	for _, sr := range records {
+		p := sr.SF
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(workspaceRoot, p)
+		}
+		excluded, err := ExcludedLines(p)
+		if err != nil {
+			return nil, err
+		}
+		rec := NewRecord()
+		for line, count := range sr.Rec.DA {
+			if n, ok := parseCount(line); !ok || !excluded[int(n)] {
+				rec.DA[line] = count
+			}
+		}
+		for key, taken := range sr.Rec.BRDA {
+			if n, ok := parseCount(key.Line); !ok || !excluded[int(n)] {
+				rec.BRDA[key] = taken
+			}
+		}
+		droppedFNs := map[string]bool{}
+		for key := range sr.Rec.FN {
+			if n, ok := parseCount(key.Line); ok && excluded[int(n)] {
+				droppedFNs[key.Name] = true
+				continue
+			}
+			rec.FN[key] = true
+		}
+		for name, count := range sr.Rec.FNDA {
+			if !droppedFNs[name] {
+				rec.FNDA[name] = count
+			}
+		}
+		out = append(out, SFRecord{SF: sr.SF, Rec: rec})
+	}
+	return out, nil
 }

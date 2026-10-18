@@ -5772,7 +5772,7 @@ fn resolve_list_path(base: &Path, path: &str) -> String {
     for component in joined.components() {
         match component {
             std::path::Component::Prefix(prefix) => {
-                parts.push(prefix.as_os_str().to_string_lossy().into_owned());
+                parts.push(prefix.as_os_str().to_string_lossy().into_owned()); // LCOV_EXCL_LINE // Reason: dead on ubuntu; Component::Prefix only occurs in Windows paths
             }
             std::path::Component::RootDir => rooted = true,
             std::path::Component::CurDir => {}

@@ -95,7 +95,7 @@ pub fn find_on_path(path_env: &std::ffi::OsStr, binary: &str) -> Option<PathBuf>
             return Some(candidate);
         }
         if cfg!(windows) {
-            let exe = dir.join(format!("{binary}.exe"));
+            let exe = dir.join(format!("{binary}.exe")); // LCOV_EXCL_LINE // Reason: windows-only .exe probe; cfg!(windows) is false on ubuntu CI
             if exe.is_file() {
                 return Some(exe);
             }
