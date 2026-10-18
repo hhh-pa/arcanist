@@ -5625,6 +5625,13 @@ fn t1170_exit_code_value_maps_child_codes() {
     assert_eq!(exit_code_value(ExitCode::from(7)), 1);
 }
 
+fn expect_unit_code(dir: &std::path::Path, argv: &[String]) -> (i32, Vec<serde_json::Value>) {
+    match run_unit_in_process(dir, argv) {
+        ChildOutcome::Code(code, dicts) => (code, dicts),
+        _ => panic!("expected unit results"),
+    }
+}
+
 #[test]
 fn t1170_run_unit_in_process_collects_cargo_results() {
     // A scratch checkout (marker only) with an `.arcunit` sentinel
@@ -5646,13 +5653,9 @@ fn t1170_run_unit_in_process_collects_cargo_results() {
     )
     .unwrap();
     let argv = ["--engine".to_string(), "cargo".to_string()];
-    match run_unit_in_process(&dir, &argv) {
-        ChildOutcome::Code(code, dicts) => {
-            assert_eq!(code, 0);
-            assert_eq!(dicts.len(), 1);
-        }
-        _ => panic!("expected unit results"), // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    }
+    let (code, dicts) = expect_unit_code(&dir, &argv);
+    assert_eq!(code, 0);
+    assert_eq!(dicts.len(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -6643,4 +6646,22 @@ fn gap2_d1_ok_call_rejects_unexpected_methods() {
     // anything else errors naming the call.
     let err = gap2_d1_ok_call("bogus.method", &serde_json::json!({})).unwrap_err();
     assert_eq!(err, "unexpected conduit call bogus.method");
+}
+
+/// `gap2_d1_scratch` with cleanup on drop, so `should_panic` tests do not leak.
+struct S5ScratchDir(std::path::PathBuf);
+
+impl Drop for S5ScratchDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+#[test]
+#[should_panic(expected = "expected unit results")]
+fn t1170_run_unit_in_process_collects_cargo_results_defensive_no_engine_arm() {
+    // `expect_unit_code` unwraps `Code`: a bare checkout has no engine.
+    let dir = S5ScratchDir(gap2_d1_scratch("s5-noengine"));
+    let argv = ["--engine".to_string(), "cargo".to_string()];
+    expect_unit_code(&dir.0, &argv);
 }

@@ -11,6 +11,27 @@ fn args_of(words: &[&str]) -> Options {
     opts
 }
 
+fn expect_export_error(words: &[&str], what: &str) -> String {
+    let ParseOutcome::Error(message) = parse_args(&argv(words)) else {
+        panic!("expected {what}");
+    };
+    message
+}
+
+fn expect_export_args(words: &[&str], what: &str) -> Options {
+    let ParseOutcome::Args(opts) = parse_args(&argv(words)) else {
+        panic!("expected {what}");
+    };
+    opts
+}
+
+fn expect_export_help(words: &[&str]) -> String {
+    match execute(&std::env::temp_dir(), &argv(words)) {
+        Ok(text) => text,
+        Err(message) => panic!("expected help, got {message}"),
+    }
+}
+
 #[test]
 fn parses_formats_and_local_base() {
     let opts = args_of(&["--git"]);
@@ -43,32 +64,25 @@ fn parses_conduit_sources() {
 
 #[test]
 fn requires_exactly_one_format() {
-    let ParseOutcome::Error(message) = parse_args(&argv(&[])) else {
-        panic!("expected error for no format"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let message = expect_export_error(&[], "error for no format");
     assert!(message.contains("Specify one of"), "{message}");
 
-    let ParseOutcome::Error(message) = parse_args(&argv(&["--git", "--unified"])) else {
-        panic!("expected error for two formats"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let message = expect_export_error(&["--git", "--unified"], "error for two formats");
     assert!(message.contains("not compatible"), "{message}");
 }
 
 #[test]
 fn rejects_mixed_sources_and_stray_positionals() {
-    let ParseOutcome::Error(message) =
-        parse_args(&argv(&["--git", "--revision", "1", "--diff", "2"]))
-    else {
-        panic!("expected error for mixed sources"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let message = expect_export_error(
+        &["--git", "--revision", "1", "--diff", "2"],
+        "error for mixed sources",
+    );
     assert!(message.contains("not compatible"), "{message}");
 
     // T1153 EXPORT-E27: positionals with `--revision` are silently
     // ignored; multiple positionals still fail for local sources.
-    match parse_args(&argv(&["--git", "--revision", "1", "HEAD"])) {
-        ParseOutcome::Args(opts) => assert_eq!(opts.source, Source::Revision(1)),
-        _ => panic!("expected ignored positional"), // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    }
+    let opts = expect_export_args(&["--git", "--revision", "1", "HEAD"], "ignored positional");
+    assert_eq!(opts.source, Source::Revision(1));
     assert!(
         // LCOV_EXCL_START // Reason: false arm fails the passing assert
         matches!(
@@ -100,16 +114,12 @@ fn parses_arcbundle_format() {
         parse_args(&argv(&["--arcbundle"])),
         ParseOutcome::Error(_)
     ));
-    let ParseOutcome::Error(message) = parse_args(&argv(&["--arcbundle", "x", "--git"])) else {
-        panic!("expected error for mixed formats"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let message = expect_export_error(&["--arcbundle", "x", "--git"], "error for mixed formats");
     assert_eq!(
         message,
         "Options '--git', '--unified' and '--arcbundle' are not compatible. Choose exactly one export format."
     );
-    let ParseOutcome::Error(message) = parse_args(&argv(&["--revision", "1"])) else {
-        panic!("expected error for no format"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let message = expect_export_error(&["--revision", "1"], "error for no format");
     assert_eq!(
         message,
         "Specify one of '--git', '--unified' or '--arcbundle <path>' to choose an export format."
@@ -510,13 +520,11 @@ fn r4_exporte7_empty_local_export_errors() {
 fn r4_exporte28_multi_positional_message_and_exit() {
     // PHP's `parseBaseCommitArgument()` text; the exit was and stays
     // 1 (`export` is a subprocess workflow — never 255).
-    match parse_args(&argv(&["--git", "a", "b"])) {
-        ParseOutcome::Error(message) => assert_eq!(
-            message,
-            "Specify exactly one base commit. The end of the commit range is always the working copy state."
-        ),
-        _ => panic!("expected parse error"), // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    }
+    let message = expect_export_error(&["--git", "a", "b"], "parse error");
+    assert_eq!(
+        message,
+        "Specify exactly one base commit. The end of the commit range is always the working copy state."
+    );
     let dir = fixture_repo("r4-e28");
     assert_eq!(
         run_in(&dir, &argv(&["--git", "a", "b"])),
@@ -755,18 +763,12 @@ fn export_e17_normalizes_conduit_dicts() {
 
 #[test]
 fn export_e25_raw_ids_parse_and_send_raw() {
-    match parse_args(&argv(&["--git", "--revision", "Dx"])) {
-        ParseOutcome::Args(opts) => assert_eq!(opts.source, Source::RevisionRaw("x".to_string())),
-        _ => panic!("expected raw revision"), // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    }
-    match parse_args(&argv(&["--git", "--revision", "DD1"])) {
-        ParseOutcome::Args(opts) => assert_eq!(opts.source, Source::RevisionRaw("D1".to_string())),
-        _ => panic!("expected one-strip revision"), // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    }
-    match parse_args(&argv(&["--git", "--diff", "Dx"])) {
-        ParseOutcome::Args(opts) => assert_eq!(opts.source, Source::DiffRaw("Dx".to_string())),
-        _ => panic!("expected raw diff"), // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    }
+    let opts = expect_export_args(&["--git", "--revision", "Dx"], "raw revision");
+    assert_eq!(opts.source, Source::RevisionRaw("x".to_string()));
+    let opts = expect_export_args(&["--git", "--revision", "DD1"], "one-strip revision");
+    assert_eq!(opts.source, Source::RevisionRaw("D1".to_string()));
+    let opts = expect_export_args(&["--git", "--diff", "Dx"], "raw diff");
+    assert_eq!(opts.source, Source::DiffRaw("Dx".to_string()));
     assert_eq!(
         querydiffs_params(&Source::Revision(9)),
         serde_json::json!({"revisionIDs": ["9"]})
@@ -796,10 +798,8 @@ fn export_e27_multi_positionals_ignored_for_conduit() {
 
 #[test]
 fn export_e29_source_conflict_beats_missing_format() {
-    match parse_args(&argv(&["--revision", "1", "--diff", "2"])) {
-        ParseOutcome::Error(message) => assert!(message.contains("not compatible"), "{message}"),
-        _ => panic!("expected conflict"), // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    }
+    let message = expect_export_error(&["--revision", "1", "--diff", "2"], "conflict");
+    assert!(message.contains("not compatible"), "{message}");
 }
 
 fn export_e_render_changes(dir: &std::path::Path, base: &str) -> Vec<crate::patch::BundleChange> {
@@ -1062,10 +1062,8 @@ fn upx_b21_export_needs_no_terminator() {
     // still succeeds.
     let opts = args_of(&["--git", "HEAD"]);
     assert_eq!(opts.format, Format::Git);
-    match execute(&std::env::temp_dir(), &argv(&["--help"])) {
-        Ok(text) => assert!(text.contains("EXPORT WORKFLOW"), "{text}"),
-        Err(message) => panic!("expected help, got {message}"), // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    }
+    let text = expect_export_help(&["--help"]);
+    assert!(text.contains("EXPORT WORKFLOW"), "{text}");
 }
 
 #[test]
@@ -1170,12 +1168,8 @@ fn missing_values_for_value_flags_error() {
         ("--diff", &["--git", "--diff"][..]),
         ("--conduit-uri", &["--git", "--conduit-uri"][..]),
     ] {
-        match parse_args(&argv(words)) {
-            ParseOutcome::Error(message) => {
-                assert_eq!(message, format!("{flag} requires a value"));
-            }
-            _ => panic!("expected missing-value error for {flag}"), // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-        }
+        let message = expect_export_error(words, &format!("missing-value error for {flag}"));
+        assert_eq!(message, format!("{flag} requires a value"));
     }
     // Empty values are missing too (`take_value` rejects `""`).
     assert!(matches!(
@@ -1217,10 +1211,8 @@ fn double_dash_ends_flag_parsing() {
 
 #[test]
 fn unknown_flag_errors() {
-    match parse_args(&argv(&["--git", "--bogus"])) {
-        ParseOutcome::Error(message) => assert_eq!(message, "unknown flag '--bogus'"),
-        _ => panic!("expected unknown-flag error"), // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    }
+    let message = expect_export_error(&["--git", "--bogus"], "unknown-flag error");
+    assert_eq!(message, "unknown flag '--bogus'");
 }
 
 #[test]
@@ -1961,4 +1953,25 @@ fn cov6g_local_diff_bytes_tolerates_spawn_race() {
 fn args_of_panics_on_invalid_argv() {
     // `args_of` unwraps `Args`: no format at all panics.
     args_of(&[]);
+}
+
+#[test]
+#[should_panic(expected = "expected error for no format")]
+fn requires_exactly_one_format_defensive_args_arm() {
+    // `expect_export_error` unwraps `Error`: a valid format panics.
+    expect_export_error(&["--git"], "error for no format");
+}
+
+#[test]
+#[should_panic(expected = "expected ignored positional")]
+fn rejects_mixed_sources_and_stray_positionals_defensive_error_arm() {
+    // `expect_export_args` unwraps `Args`: an unknown flag panics.
+    expect_export_args(&["--git", "--bogus"], "ignored positional");
+}
+
+#[test]
+#[should_panic(expected = "expected help, got")]
+fn upx_b21_export_needs_no_terminator_defensive_error_arm() {
+    // `expect_export_help` unwraps `Ok`: an unknown flag panics.
+    expect_export_help(&["--git", "--bogus"]);
 }

@@ -761,6 +761,19 @@ fn gate_preview_lists_findings() {
     assert!(text.contains("[arc.land.not-accepted]"));
 }
 
+fn expect_client_err(
+    conduit_uri: Option<&str>,
+    dir: &Path,
+    user_file: Option<&Path>,
+    opts: &arc_rs::get_config::LoadOptions,
+    what: &str,
+) -> String {
+    match client_for_dir_with(conduit_uri, dir, user_file, opts) {
+        Ok(_) => panic!("expected {what}"),
+        Err(err) => err,
+    }
+}
+
 #[test]
 fn client_for_dir_discovers_from_target() {
     // T1153 CORE-12/T1153 CORE-33: discovery reads the merged config from the target working
@@ -773,10 +786,7 @@ fn client_for_dir_discovers_from_target() {
         config_files: vec![empty],
         ..Default::default()
     };
-    let err = match client_for_dir_with(None, &dir, None, &shadow) {
-        Ok(_) => panic!("expected no conduit URI"), // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-        Err(err) => err,
-    };
+    let err = expect_client_err(None, &dir, None, &shadow, "no conduit URI");
     assert_eq!(
         err,
         "no conduit URI: pass --conduit-uri, set ARC_CONDUIT_URI, or run inside a project with \
@@ -788,10 +798,7 @@ fn client_for_dir_discovers_from_target() {
         r#"{"phabricator.uri": "https://phab.example/"}"#,
     )
     .unwrap();
-    let err = match client_for_dir_with(None, &dir, None, &shadow) {
-        Ok(_) => panic!("expected no token"), // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-        Err(err) => err,
-    };
+    let err = expect_client_err(None, &dir, None, &shadow, "no token");
     assert!(err.starts_with("no token for https://phab.example/"));
 }
 
@@ -8131,4 +8138,30 @@ fn git_helper_reports_failing_commands() {
     // A failing git invocation panics with the command and stderr.
     let dir = W6hDir(temp_dir("w6h-git-fail"));
     git(&dir.0, &["--bogus-flag-xyz"]);
+}
+
+#[test]
+#[should_panic(expected = "expected no conduit URI")]
+fn client_for_dir_discovers_from_target_defensive_ok_arm() {
+    // `expect_client_err` unwraps `Err`: a URI plus a token panics.
+    let dir = W6hDir(temp_dir("client-ok"));
+    let arcrc = dir.0.join("arcrc.json");
+    std::fs::write(
+        &arcrc,
+        r#"{"hosts": {"https://phab.example/api/": {"token": "test-token"}}}"#,
+    )
+    .unwrap();
+    let empty = dir.0.join("empty.json");
+    std::fs::write(&empty, "{}").unwrap();
+    let shadow = arc_rs::get_config::LoadOptions {
+        config_files: vec![empty],
+        ..Default::default()
+    };
+    expect_client_err(
+        Some("https://phab.example/"),
+        &dir.0,
+        Some(&arcrc),
+        &shadow,
+        "no conduit URI",
+    );
 }

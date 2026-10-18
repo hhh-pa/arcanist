@@ -1572,12 +1572,17 @@ fn exe_path_defaults_to_the_running_test_binary() {
     assert!(resolve_exe_path(&opts).unwrap().is_file());
 }
 
+fn expect_upgrade_error(argv: &[String]) -> String {
+    match parse_args_with_tty(argv, true) {
+        Parsed::Error(message) => message,
+        _ => panic!("post-terminator positional must be an error"),
+    }
+}
+
 #[test]
 fn args_reject_positionals_after_the_terminator() {
-    match parse_args_with_tty(&["--".to_string(), "x".to_string()], true) {
-        Parsed::Error(message) => assert_eq!(message, "unexpected argument 'x'"),
-        _ => panic!("post-terminator positional must be an error"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the error always matches
-    }
+    let message = expect_upgrade_error(&["--".to_string(), "x".to_string()]);
+    assert_eq!(message, "unexpected argument 'x'");
 }
 
 #[test]
@@ -1659,4 +1664,12 @@ fn render_reports_up_to_date_status() {
     };
     let text = render(&status);
     assert!(text.contains("Status: up to date"), "{text}");
+}
+// -( T1176 S5: defensive-arm coverage )--------------------------------------
+
+#[test]
+#[should_panic(expected = "post-terminator positional must be an error")]
+fn args_reject_positionals_after_the_terminator_defensive_options_arm() {
+    // `expect_upgrade_error` unwraps `Error`: empty argv parses.
+    expect_upgrade_error(&[]);
 }

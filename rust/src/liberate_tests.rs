@@ -13,6 +13,22 @@ fn args_of(words: &[&str]) -> Options {
     opts
 }
 
+fn expect_lib_error(words: &[&str]) -> String {
+    // T1153 B21/B23: TTY runs need no `--`.
+    let ParseOutcome::Error(message) = parse_args_with_tty(&argv(words), true) else {
+        panic!("expected an error");
+    };
+    message
+}
+
+fn expect_lib_args(words: &[&str]) -> Options {
+    // T1153 B21/B23: TTY runs need no `--`.
+    let ParseOutcome::Args(opts) = parse_args_with_tty(&argv(words), true) else {
+        panic!("expected autocorrected args");
+    };
+    opts
+}
+
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "arc-rs-liberate-{name}-{}-{}",
@@ -51,9 +67,7 @@ fn parses_path_and_clean() {
 #[test]
 fn rejects_second_path_with_full_text() {
     // T1153 B21/B23: TTY runs need no `--`.
-    let ParseOutcome::Error(message) = parse_args_with_tty(&argv(&["a", "b"]), true) else {
-        panic!("expected an error"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let message = expect_lib_error(&["a", "b"]);
     assert_eq!(message, one_path_error());
     assert!(message.contains("Provide only one path to \"arc liberate\"."));
     assert!(message.contains("create or update a library"));
@@ -519,9 +533,7 @@ fn core53_parse_errors_keep_red_arm_with_parser_texts() {
     // texts follow the toolset parser.
     let error = classify_error(&argv(&["--bogus"]), "x".to_string());
     assert_eq!(error.kind, crate::conduit::EnvelopeKind::ToolsetUsage);
-    let ParseOutcome::Error(message) = parse_args_with_tty(&argv(&["--bogus"]), true) else {
-        panic!("expected an error"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let message = expect_lib_error(&["--bogus"]);
     assert_eq!(
         message,
         "Argument \"--bogus\" is unrecognized. Use \"--\" to indicate the end of flags."
@@ -654,9 +666,7 @@ impl Drop for TempDir {
 fn parse_corrects_near_miss_flag_with_notice() {
     // T1153 B21/B23: TTY runs need no `--`; autocorrect is on, so the
     // near-miss `--clea` corrects to `--clean` with a stderr notice.
-    let ParseOutcome::Args(opts) = parse_args_with_tty(&argv(&["--clea"]), true) else {
-        panic!("expected autocorrected args"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let opts = expect_lib_args(&["--clea"]);
     assert!(opts.clean);
     assert_eq!(opts.path, None);
 }
@@ -807,4 +817,18 @@ fn cov6g_run_in_two_paths_is_usage_failure() {
 fn args_of_panics_on_invalid_argv() {
     // T1153 B21/B23: TTY runs need no `--`; two paths still error.
     args_of(&["a", "b"]);
+}
+
+#[test]
+#[should_panic(expected = "expected an error")]
+fn rejects_second_path_with_full_text_defensive_args_arm() {
+    // `expect_lib_error` unwraps `Error`: a single path parses.
+    expect_lib_error(&["lib"]);
+}
+
+#[test]
+#[should_panic(expected = "expected autocorrected args")]
+fn parse_corrects_near_miss_flag_with_notice_defensive_error_arm() {
+    // `expect_lib_args` unwraps `Args`: an unknown flag errors.
+    expect_lib_args(&["--bogus"]);
 }

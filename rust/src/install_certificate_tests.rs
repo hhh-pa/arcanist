@@ -956,6 +956,13 @@ fn certificate_run_flow_exchanges_and_stages() {
     );
 }
 
+fn expect_prepare_failure(argv: &[String]) -> std::process::ExitCode {
+    let Err(code) = prepare_install(argv) else {
+        panic!("expected prepare_install to fail");
+    };
+    code
+}
+
 #[test]
 #[cfg(unix)]
 fn prepare_gates_on_open_arcrc_permissions() {
@@ -971,9 +978,7 @@ fn prepare_gates_on_open_arcrc_permissions() {
         "--arcrc-file".to_string(),
         path.to_string_lossy().to_string(),
     ];
-    let Err(code) = prepare_install(&argv) else {
-        panic!("expected prepare_install to fail"); // LCOV_EXCL_LINE // Reason: defensive panic arm; the failure always matches
-    };
+    let code = expect_prepare_failure(&argv);
     assert_eq!(code, std::process::ExitCode::FAILURE);
 }
 
@@ -994,9 +999,7 @@ fn prepare_rejects_invalid_arcrc_json() {
         "--arcrc-file".to_string(),
         path.to_string_lossy().to_string(),
     ];
-    let Err(code) = prepare_install(&argv) else {
-        panic!("expected prepare_install to fail"); // LCOV_EXCL_LINE // Reason: defensive panic arm; the failure always matches
-    };
+    let code = expect_prepare_failure(&argv);
     assert_eq!(code, std::process::ExitCode::FAILURE);
 }
 
@@ -1149,4 +1152,27 @@ fn cov6g_arcrc_mode_metadata_race() {
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     churn.join().unwrap();
+}
+// -( T1176 S5: defensive-arm coverage )--------------------------------------
+
+#[test]
+#[should_panic(expected = "expected prepare_install to fail")]
+fn prepare_gates_on_open_arcrc_permissions_defensive_ok_arm() {
+    // `expect_prepare_failure` unwraps `Err`: a valid private arcrc stages `Ok`.
+    let tmp = TempDir::new("prep-ok");
+    let path = tmp.path.join("fresh-arcrc");
+    std::fs::write(&path, "{}").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&path, permissions).unwrap();
+    }
+    let argv = vec![
+        "https://h.example/".to_string(),
+        "--arcrc-file".to_string(),
+        path.to_string_lossy().to_string(),
+    ];
+    expect_prepare_failure(&argv);
 }

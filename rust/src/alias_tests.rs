@@ -18,6 +18,41 @@ fn builtin(name: &str) -> bool {
     is_builtin_command(name)
 }
 
+fn expect_dispatch(expanded: Expansion) -> (Vec<String>, Vec<String>) {
+    let Expansion::Dispatch { argv, hints } = expanded else {
+        panic!("expected dispatch, got {expanded:?}");
+    };
+    (argv, hints)
+}
+
+fn expect_dispatch_hints(expanded: Expansion) -> Vec<String> {
+    let Expansion::Dispatch { hints, .. } = expanded else {
+        panic!("expected dispatch");
+    };
+    hints
+}
+
+fn expect_shell(expanded: Expansion) -> (Vec<String>, String) {
+    let Expansion::Shell { argv, hint } = expanded else {
+        panic!("expected shell, got {expanded:?}");
+    };
+    (argv, hint)
+}
+
+fn expect_shell_bare(expanded: Expansion) -> (Vec<String>, String) {
+    let Expansion::Shell { argv, hint } = expanded else {
+        panic!("expected shell");
+    };
+    (argv, hint)
+}
+
+fn expect_failure(expanded: Expansion) -> (String, Vec<String>) {
+    let Expansion::Failed { message, hints } = expanded else {
+        panic!("expected failure, got {expanded:?}");
+    };
+    (message, hints)
+}
+
 struct TempDir {
     path: PathBuf,
 }
@@ -160,9 +195,7 @@ fn expansion_passes_builtins_through_untouched() {
 fn expansion_appends_user_args_after_alias_args() {
     let aliases = vec![alias("arc", "draft", &["diff", "--draft"], "user")];
     let expanded = expand(&args(&["draft", "extra"]), &aliases, builtin);
-    let Expansion::Dispatch { argv, hints } = expanded else {
-        panic!("expected dispatch, got {expanded:?}"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (argv, hints) = expect_dispatch(expanded);
     assert_eq!(argv, args(&["diff", "--draft", "extra"]));
     assert_eq!(hints.len(), 1);
     let hint = &hints[0];
@@ -176,9 +209,7 @@ fn expansion_resolves_chains() {
         alias("arc", "b", &["diff"], "user"),
     ];
     let expanded = expand(&args(&["a", "user-arg"]), &aliases, builtin);
-    let Expansion::Dispatch { argv, hints } = expanded else {
-        panic!("expected dispatch, got {expanded:?}"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (argv, hints) = expect_dispatch(expanded);
     assert_eq!(argv, args(&["diff", "--from-a", "user-arg"]));
     assert_eq!(hints.len(), 2);
 }
@@ -187,9 +218,7 @@ fn expansion_resolves_chains() {
 fn expansion_resolves_shell_aliases() {
     let aliases = vec![alias("arc", "ls", &["!ls", "-la"], "user")];
     let expanded = expand(&args(&["ls", "/tmp"]), &aliases, builtin);
-    let Expansion::Shell { argv, hint } = expanded else {
-        panic!("expected shell, got {expanded:?}"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (argv, hint) = expect_shell(expanded);
     assert_eq!(argv, args(&["ls", "-la", "/tmp"]));
     assert!(hint.contains("arc ls -> $ 'ls' '-la' '/tmp'"), "{hint}");
 }
@@ -197,9 +226,7 @@ fn expansion_resolves_shell_aliases() {
 #[test]
 fn expansion_quotes_shell_display_words() {
     let aliases = vec![alias("arc", "g", &["!echo", "a b"], "user")];
-    let Expansion::Shell { argv, hint } = expand(&args(&["g"]), &aliases, builtin) else {
-        panic!("expected shell"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (argv, hint) = expect_shell_bare(expand(&args(&["g"]), &aliases, builtin));
     assert_eq!(argv, args(&["echo", "a b"]));
     assert!(hint.contains("'echo' 'a b'"), "{hint}");
 }
@@ -239,17 +266,13 @@ fn expansion_quotes_effect_alias_tail_like_pct_lr() {
     // quoting are quoted, safe words stay bare.
     let aliases = vec![alias("arc", "draft", &["diff", "a b", "--x"], "user")];
     let expanded = expand(&args(&["draft"]), &aliases, builtin);
-    let Expansion::Dispatch { argv, hints } = expanded else {
-        panic!("expected dispatch, got {expanded:?}"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (argv, hints) = expect_dispatch(expanded);
     assert_eq!(argv, args(&["diff", "a b", "--x"]));
     assert_eq!(hints.len(), 1);
     assert_eq!(hints[0], "arc draft -> arc diff 'a b' --x");
 
     let aliases = vec![alias("arc", "eq", &["diff", "a=b"], "user")];
-    let Expansion::Dispatch { hints, .. } = expand(&args(&["eq"]), &aliases, builtin) else {
-        panic!("expected dispatch"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let hints = expect_dispatch_hints(expand(&args(&["eq"]), &aliases, builtin));
     assert_eq!(hints[0], "arc eq -> arc diff 'a=b'");
 }
 
@@ -260,9 +283,7 @@ fn expansion_reports_cycles() {
         alias("arc", "b", &["a"], "user"),
     ];
     let expanded = expand(&args(&["a"]), &aliases, builtin);
-    let Expansion::Failed { message, .. } = expanded else {
-        panic!("expected failure, got {expanded:?}"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (message, _) = expect_failure(expanded);
     assert!(message.contains("cycle"), "{message}");
     assert!(message.contains("b -> a -> b"), "{message}");
 }
@@ -271,9 +292,7 @@ fn expansion_reports_cycles() {
 fn expansion_reports_self_cycles() {
     let aliases = vec![alias("arc", "loop", &["loop"], "user")];
     let expanded = expand(&args(&["loop"]), &aliases, builtin);
-    let Expansion::Failed { message, hints } = expanded else {
-        panic!("expected failure, got {expanded:?}"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (message, hints) = expect_failure(expanded);
     assert!(message.contains("cycle"), "{message}");
     assert!(message.contains("loop -> loop"), "{message}");
     assert_eq!(hints.len(), 1);
@@ -286,9 +305,7 @@ fn expansion_chain_ending_at_builtin_keeps_every_hint() {
         alias("arc", "b", &["diff", "--all"], "user"),
     ];
     let expanded = expand(&args(&["a", "user-arg"]), &aliases, builtin);
-    let Expansion::Dispatch { argv, hints } = expanded else {
-        panic!("expected dispatch, got {expanded:?}"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (argv, hints) = expect_dispatch(expanded);
     assert_eq!(argv, args(&["diff", "--all", "user-arg"]));
     assert_eq!(
         hints,
@@ -309,9 +326,7 @@ fn expansion_multi_hop_to_shell_keeps_only_the_shell_hint() {
         alias("arc", "b", &["!echo", "hi"], "user"),
     ];
     let expanded = expand(&args(&["a", "user-arg"]), &aliases, builtin);
-    let Expansion::Shell { argv, hint } = expanded else {
-        panic!("expected shell, got {expanded:?}"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (argv, hint) = expect_shell(expanded);
     assert_eq!(argv, args(&["echo", "hi", "--from-a", "user-arg"]));
     assert_eq!(hint, "arc b -> $ 'echo' 'hi' '--from-a' 'user-arg'");
 }
@@ -320,9 +335,7 @@ fn expansion_multi_hop_to_shell_keeps_only_the_shell_hint() {
 fn expansion_reports_dangling_chains_but_passes_unknown_through() {
     let aliases = vec![alias("arc", "a", &["gone"], "user")];
     let expanded = expand(&args(&["a"]), &aliases, builtin);
-    let Expansion::Failed { message, hints } = expanded else {
-        panic!("expected failure, got {expanded:?}"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (message, hints) = expect_failure(expanded);
     assert!(message.contains("Alias resolved to \"gone\""), "{message}");
     assert_eq!(hints.len(), 1);
 
@@ -340,9 +353,7 @@ fn expansion_reports_dangling_chains_but_passes_unknown_through() {
 fn expansion_suggests_cross_toolset_aliases() {
     let aliases = vec![alias("phage", "draft", &["diff"], "user")];
     let expanded = expand(&args(&["draft"]), &aliases, builtin);
-    let Expansion::Dispatch { argv, hints } = expanded else {
-        panic!("expected dispatch, got {expanded:?}"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (argv, hints) = expect_dispatch(expanded);
     assert_eq!(argv, args(&["draft"]));
     assert_eq!(hints.len(), 1);
     assert!(hints[0].contains("did you mean"), "{}", hints[0]);
@@ -356,9 +367,7 @@ fn expansion_prefers_last_definition_and_hints_shadowed_ones() {
         alias("arc", "draft", &["diff"], "local"),
     ];
     let expanded = expand(&args(&["draft"]), &aliases, builtin);
-    let Expansion::Dispatch { argv, hints } = expanded else {
-        panic!("expected dispatch, got {expanded:?}"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (argv, hints) = expect_dispatch(expanded);
     assert_eq!(argv, args(&["diff"]));
     assert!(hints.iter().any(|h| h.contains("Multiple")), "{hints:?}");
     assert!(
@@ -379,9 +388,7 @@ fn expansion_enforces_stack_limit() {
         });
     }
     let expanded = expand(&args(&["a0"]), &aliases, builtin);
-    let Expansion::Failed { message, .. } = expanded else {
-        panic!("expected failure, got {expanded:?}"); // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let (message, _) = expect_failure(expanded);
     assert!(message.contains("unreasonably deep"), "{message}");
 }
 
@@ -1186,4 +1193,55 @@ fn run_create_rejects_builtin_triggers_before_touching_the_filesystem() {
         positional: args(&["diff"]),
     };
     assert_eq!(run_create(&options), std::process::ExitCode::FAILURE);
+}
+// -( T1176 S5: defensive-arm coverage )--------------------------------------
+
+#[test]
+#[should_panic(expected = "expected dispatch, got")]
+fn expansion_appends_user_args_after_alias_args_defensive_failed_arm() {
+    // `expect_dispatch` unwraps `Dispatch`: a failed chain panics.
+    expect_dispatch(Expansion::Failed {
+        message: "boom".to_string(),
+        hints: Vec::new(),
+    });
+}
+
+#[test]
+#[should_panic(expected = "expected dispatch")]
+fn expansion_quotes_effect_alias_tail_like_pct_lr_defensive_failed_arm() {
+    // `expect_dispatch_hints` unwraps `Dispatch`: a failed chain panics.
+    expect_dispatch_hints(Expansion::Failed {
+        message: "boom".to_string(),
+        hints: Vec::new(),
+    });
+}
+
+#[test]
+#[should_panic(expected = "expected shell, got")]
+fn expansion_resolves_shell_aliases_defensive_dispatch_arm() {
+    // `expect_shell` unwraps `Shell`: a dispatch panics.
+    expect_shell(Expansion::Dispatch {
+        argv: Vec::new(),
+        hints: Vec::new(),
+    });
+}
+
+#[test]
+#[should_panic(expected = "expected shell")]
+fn expansion_quotes_shell_display_words_defensive_dispatch_arm() {
+    // `expect_shell_bare` unwraps `Shell`: a dispatch panics.
+    expect_shell_bare(Expansion::Dispatch {
+        argv: Vec::new(),
+        hints: Vec::new(),
+    });
+}
+
+#[test]
+#[should_panic(expected = "expected failure, got")]
+fn expansion_reports_cycles_defensive_dispatch_arm() {
+    // `expect_failure` unwraps `Failed`: a dispatch panics.
+    expect_failure(Expansion::Dispatch {
+        argv: Vec::new(),
+        hints: Vec::new(),
+    });
 }

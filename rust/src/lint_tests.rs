@@ -3947,6 +3947,13 @@ fn cov_rename_over_retries_after_removal() {
     assert_eq!(std::fs::read_to_string(&dest).unwrap(), "new");
 }
 
+fn expect_buffer(sink: &Sink) -> &String {
+    let Sink::Buffer(buffer) = sink else {
+        panic!("expected a buffered sink");
+    };
+    buffer
+}
+
 #[test]
 fn cov_patch_prompt_reads_missing_disk_as_dev_null() {
     let result = LintResult::new(
@@ -3956,9 +3963,7 @@ fn cov_patch_prompt_reads_missing_disk_as_dev_null() {
     );
     let mut sink = Sink::Buffer(String::new());
     prompt_for_patch(&result, b"", &mut sink);
-    let Sink::Buffer(buffer) = &sink else {
-        panic!("expected a buffered sink"); // LCOV_EXCL_LINE // Reason: defensive panic arm; the buffer always matches
-    };
+    let buffer = expect_buffer(&sink);
     assert!(buffer.is_empty(), "{buffer:?}");
 }
 
@@ -4402,4 +4407,12 @@ fn spawn_with_retry_retries_text_file_busy() {
     let err = spawn_with_retry(&mut cmd).unwrap_err();
     assert_eq!(err.raw_os_error(), Some(26));
     assert!(start.elapsed() >= std::time::Duration::from_millis(80));
+}
+// -( T1176 S5: defensive-arm coverage )--------------------------------------
+
+#[test]
+#[should_panic(expected = "expected a buffered sink")]
+fn cov_patch_prompt_reads_missing_disk_as_dev_null_defensive_stdout_arm() {
+    // `expect_buffer` unwraps `Buffer`: a stdout sink panics.
+    expect_buffer(&Sink::Stdout);
 }

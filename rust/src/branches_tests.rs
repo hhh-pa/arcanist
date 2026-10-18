@@ -240,14 +240,19 @@ fn b23_branches_help_matches_generated_format() {
     assert!(ansi.contains("\x1b[1m"), "{ansi:?}");
 }
 
+fn expect_execute_error(words: &[&str]) -> String {
+    match execute(&std::env::temp_dir(), &args(words)) {
+        Err(message) => message,
+        _ => panic!("expected parse error"),
+    }
+}
+
 #[test]
 fn r4_rbd4_parse_error_has_no_dump() {
     // `branches` runs in the toolset runtime: argument errors render
     // `USAGE EXCEPTION` (exit 1) with no usage dump.
-    match execute(&std::env::temp_dir(), &args(&["--bogus"])) {
-        Err(message) => assert!(!message.contains("usage:"), "{message}"),
-        _ => panic!("expected parse error"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the parse error always matches
-    }
+    let message = expect_execute_error(&["--bogus"]);
+    assert!(!message.contains("usage:"), "{message}");
     assert_eq!(
         run_in(&std::env::temp_dir(), &args(&["--bogus"])),
         std::process::ExitCode::FAILURE
@@ -466,4 +471,11 @@ fn git_helper_reports_failing_commands() {
     // A failing git invocation panics with the command and stderr.
     let tmp = TempDir::new("w6h-git-fail");
     git(tmp.path(), &["--bogus-flag-xyz"]);
+}
+
+#[test]
+#[should_panic(expected = "expected parse error")]
+fn r4_rbd4_parse_error_has_no_dump_defensive_ok_arm() {
+    // `expect_execute_error` unwraps `Err`: `--help` (past `--`) succeeds.
+    expect_execute_error(&["--help", "--"]);
 }

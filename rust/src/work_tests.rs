@@ -242,6 +242,13 @@ fn rejects_bad_startpoints_and_conduit_symbols() {
     assert!(!branch_exists(tmp.path(), "123"));
 }
 
+fn expect_work_args(words: &[&str]) -> Options {
+    match parse_args_with_tty(&args(words), true) {
+        ParseOutcome::Args(options) => options,
+        _ => panic!("feature parses"),
+    }
+}
+
 #[test]
 fn requires_a_supported_working_copy() {
     // T1153 B21/B23: piped runs carry `--`.
@@ -256,10 +263,7 @@ fn requires_a_supported_working_copy() {
     // engine through an always-failing command instead (T1153 WORK-HG).
     let hg = TempDir::new("hg");
     std::fs::create_dir(hg.path().join(".hg")).unwrap();
-    let options = match parse_args_with_tty(&args(&["feature"]), true) {
-        ParseOutcome::Args(options) => options,
-        _ => panic!("feature parses"), // LCOV_EXCL_LINE // Reason: defensive panic; firing it fails the test
-    };
+    let options = expect_work_args(&["feature"]);
     let hg_cmd = crate::hg::HgCommand::custom("false", &[]);
     let mut input = std::io::Cursor::new(b"");
     assert_eq!(
@@ -2178,4 +2182,11 @@ fn git_helper_reports_failing_commands() {
     // A failing git invocation panics with the command and stderr.
     let tmp = TempDir::new("w6h-git-fail");
     git(tmp.path(), &["--bogus-flag-xyz"]);
+}
+
+#[test]
+#[should_panic(expected = "feature parses")]
+fn requires_a_supported_working_copy_defensive_error_arm() {
+    // `expect_work_args` unwraps `Args`: an empty symbol errors.
+    expect_work_args(&[]);
 }

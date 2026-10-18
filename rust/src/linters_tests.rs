@@ -16,6 +16,20 @@ fn entry(class: &str) -> LinterEntry {
     }
 }
 
+fn expect_lint_args(argv: &[String]) -> Options {
+    match parse_args(argv) {
+        ParseOutcome::Args(options) => options,
+        _ => panic!("expected args"),
+    }
+}
+
+fn expect_lint_error(argv: &[String], what: &str) -> String {
+    match parse_args(argv) {
+        ParseOutcome::Error(message) => message,
+        _ => panic!("expected {what}"),
+    }
+}
+
 #[test]
 fn registry_lists_all_thirty_three_classes() {
     // T1153 LINTERS-L1: `filename` is listed, so the registry holds 34 classes.
@@ -337,42 +351,22 @@ fn no_match_message_matches_php() {
 
 #[test]
 fn args_parse_search_search_and_exact() {
-    match parse_args(&["--search".to_string(), "php".to_string()]) {
-        ParseOutcome::Args(options) => {
-            assert_eq!(options.search, vec!["php".to_string()]);
-            assert!(!options.verbose);
-        }
-        _ => panic!("expected args"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    }
-    match parse_args(&[
+    let options = expect_lint_args(&["--search".to_string(), "php".to_string()]);
+    assert_eq!(options.search, vec!["php".to_string()]);
+    assert!(!options.verbose);
+    let options = expect_lint_args(&[
         "--search=a".to_string(),
         "--search".to_string(),
         "b".to_string(),
-    ]) {
-        ParseOutcome::Args(options) => {
-            assert_eq!(options.search, vec!["a".to_string(), "b".to_string()]);
-        }
-        _ => panic!("expected args"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    }
-    match parse_args(&["--verbose".to_string(), "text".to_string()]) {
-        ParseOutcome::Args(options) => {
-            assert!(options.verbose);
-            assert_eq!(options.exact, vec!["text".to_string()]);
-        }
-        _ => panic!("expected args"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    }
-    match parse_args(&["--search".to_string()]) {
-        ParseOutcome::Error(message) => {
-            assert_eq!(message, "Option '--search' requires a parameter.")
-        }
-        _ => panic!("expected error"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    }
-    match parse_args(&["--bogus".to_string()]) {
-        ParseOutcome::Error(message) => {
-            assert_eq!(message, "Unknown argument 'bogus'. Try 'arc help'.")
-        }
-        _ => panic!("expected error"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    }
+    ]);
+    assert_eq!(options.search, vec!["a".to_string(), "b".to_string()]);
+    let options = expect_lint_args(&["--verbose".to_string(), "text".to_string()]);
+    assert!(options.verbose);
+    assert_eq!(options.exact, vec!["text".to_string()]);
+    let message = expect_lint_error(&["--search".to_string()], "error");
+    assert_eq!(message, "Option '--search' requires a parameter.");
+    let message = expect_lint_error(&["--bogus".to_string()], "error");
+    assert_eq!(message, "Unknown argument 'bogus'. Try 'arc help'.");
     assert!(matches!(
         parse_args(&["--help".to_string()]),
         ParseOutcome::Help
@@ -402,12 +396,8 @@ fn xhpast_rules_table_has_one_ported_rule() {
 fn r4_lintersl24_usage_error_has_no_dump() {
     // Argument errors render `Usage Exception:` with exit 1 and no
     // usage dump (the label applies at `run_in`).
-    match parse_args(&["--bogus".to_string()]) {
-        ParseOutcome::Error(message) => {
-            assert!(!message.contains("usage:"), "{message}");
-        }
-        _ => panic!("expected parse error"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    }
+    let message = expect_lint_error(&["--bogus".to_string()], "parse error");
+    assert!(!message.contains("usage:"), "{message}");
     assert_eq!(
         run_in(Path::new("."), &["--bogus".to_string()]),
         std::process::ExitCode::FAILURE
@@ -1111,35 +1101,23 @@ fn collect_entries_marks_probe_failures() {
 
 #[test]
 fn parse_args_splits_double_dash() {
-    match parse_args(&["--".to_string(), "text".to_string()]) {
-        ParseOutcome::Args(options) => {
-            assert_eq!(options.exact, vec!["text".to_string()]);
-            assert!(!options.verbose);
-        }
-        _ => panic!("expected args"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    }
+    let options = expect_lint_args(&["--".to_string(), "text".to_string()]);
+    assert_eq!(options.exact, vec!["text".to_string()]);
+    assert!(!options.verbose);
 }
 
 #[test]
 fn parse_args_splices_verbose_values() {
     // `--verbose=value` splices the value back as a positional.
-    match parse_args(&["--verbose=x".to_string()]) {
-        ParseOutcome::Args(options) => {
-            assert!(options.verbose);
-            assert_eq!(options.exact, vec!["x".to_string()]);
-        }
-        _ => panic!("expected args"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    }
+    let options = expect_lint_args(&["--verbose=x".to_string()]);
+    assert!(options.verbose);
+    assert_eq!(options.exact, vec!["x".to_string()]);
 }
 
 #[test]
 fn parse_args_rejects_short_flags() {
-    match parse_args(&["-x".to_string()]) {
-        ParseOutcome::Error(message) => {
-            assert_eq!(message, "Unknown argument 'x'. Try 'arc help'.");
-        }
-        _ => panic!("expected error"), // LCOV_EXCL_LINE // Reason: defensive panic arm; the expected variant always matches
-    }
+    let message = expect_lint_error(&["-x".to_string()], "error");
+    assert_eq!(message, "Unknown argument 'x'. Try 'arc help'.");
 }
 
 #[test]
@@ -1193,4 +1171,19 @@ fn run_dispatches_through_cwd() {
         run(&["--help".to_string()]),
         std::process::ExitCode::SUCCESS
     );
+}
+// -( T1176 S5: defensive-arm coverage )--------------------------------------
+
+#[test]
+#[should_panic(expected = "expected args")]
+fn args_parse_search_search_and_exact_defensive_error_arm() {
+    // `expect_lint_args` unwraps `Args`: an unknown flag panics.
+    expect_lint_args(&["--bogus".to_string()]);
+}
+
+#[test]
+#[should_panic(expected = "expected error")]
+fn args_parse_search_search_and_exact_defensive_args_arm() {
+    // `expect_lint_error` unwraps `Error`: a valid search panics.
+    expect_lint_error(&["--search".to_string(), "php".to_string()], "error");
 }
