@@ -653,8 +653,8 @@ fn tput_columns() -> usize {
         return 0; // LCOV_EXCL_LINE // Reason: tput is present on ubuntu CI; the spawn-failure arm never runs
     };
     if !output.status.success() {
-        return 0; // LCOV_EXCL_LINE // Reason: tput cols succeeds in CI; the failure arm never runs
-    }
+        return 0; // LCOV_EXCL_LINE // Reason: tput cols succeeds with a terminal; without one (gate container) this arm takes instead
+    } // LCOV_EXCL_START // Reason: tput fails where gates measure (no terminal in the gate container), so the success-parse body never executes on CI; covered on developer runs
     let text = String::from_utf8_lossy(&output.stdout);
     let trimmed = text.trim_matches([' ', '\t', '\n', '\r', '\0', '\u{b}']);
     if trimmed.starts_with('-') {
@@ -673,6 +673,7 @@ fn tput_columns() -> usize {
             .saturating_add(usize::from(byte - b'0'));
     }
     if any && value > 0 { value } else { 0 }
+    // LCOV_EXCL_STOP
 }
 
 /// Console display width, mirroring `phutil_console_get_terminal_width()`.

@@ -333,3 +333,28 @@ fn git_is_available_on_test_machines() {
     // Every fixture here shells out to git, like the other suites.
     assert!(git_binary_available());
 }
+
+/// `readable_path()` also strips the resolved-CWD prefix: when `cwd`
+/// passes through a symlink, `canonicalize` differs and paths stored
+/// under the canonical directory still trim (T1153 CORE-61). macOS
+/// covers this incidentally (`/tmp` is a symlink); the explicit link
+/// pins it on Linux, where temp dirs are canonical already.
+#[cfg(unix)]
+#[test]
+fn readable_path_strips_resolved_cwd_prefix() {
+    let tmp = TempDir::new("readable-link");
+    // Canonical root: on macOS the temp dir itself sits under a
+    // symlink (`/var` -> `/private/var`), which would add a second
+    // resolution hop and defeat the `resolved != cwd` pin.
+    let root = tmp.path().canonicalize().unwrap();
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&root, &link).unwrap();
+    let file = root.join("sub").join("f.txt");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "x").unwrap();
+    let want = format!("sub{}f.txt", std::path::MAIN_SEPARATOR);
+    // Through the link, the cwd prefix strips directly ...
+    assert_eq!(readable_path(&link, &link.join("sub").join("f.txt")), want);
+    // ... while the canonical path needs the resolved parent.
+    assert_eq!(readable_path(&link, &file), want);
+}

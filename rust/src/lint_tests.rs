@@ -1973,7 +1973,7 @@ fn lint20_unreadable_files_fold_into_the_aggregate() {
         // bits do not block reads, so the failure under test cannot
         // trigger.
         return; // LCOV_EXCL_LINE // Reason: privileged-runner skip; runs only where reads ignore permission bits (root CI)
-    }
+    } // LCOV_EXCL_START // Reason: post-root-skip body; dead where gates measure (CI runs as root, so the skip always takes); covered on macOS runs
     let work = WorkCopy {
         vcs: Vcs::Git,
         vcs_root: tmp.path().to_path_buf(),
@@ -1989,6 +1989,32 @@ fn lint20_unreadable_files_fold_into_the_aggregate() {
             &["locked.txt".to_string(), "ok.txt".to_string()]
         )
         .unwrap_err(),
+        "Some linters failed:"
+    );
+    // LCOV_EXCL_STOP
+}
+
+/// LINT-20 on Linux CI: the chmod trigger cannot fail a read for root,
+/// so `/proc/self/mem` (a regular file whose every read faults EIO —
+/// the same deterministic trigger as the paste/upload twins) folds
+/// into the aggregate instead. Skips where `/proc` is unavailable.
+#[cfg(target_os = "linux")]
+#[test]
+fn lint20_unreadable_proc_mem_folds_into_the_aggregate() {
+    if std::fs::symlink_metadata("/proc/self/mem").is_err() {
+        return; // LCOV_EXCL_LINE // Reason: /proc is always present where gates measure; the skip only trips in containers without /proc
+    }
+    let tmp = TempDir::new("lint20-proc");
+    tmp.write("ok.txt", "ok\n");
+    let work = WorkCopy {
+        vcs: Vcs::Git,
+        vcs_root: tmp.path().to_path_buf(),
+        project_root: tmp.path().to_path_buf(),
+    };
+    let mut engine = Engine::empty();
+    engine.add_linter(Box::new(TextLinter::new()));
+    assert_eq!(
+        workflow_lint_selection(&engine, &work, &["/proc/self/mem".to_string()]).unwrap_err(),
         "Some linters failed:"
     );
 }
@@ -4306,10 +4332,12 @@ fn cov6g_spawn_with_retry_reports_text_file_busy() {
             Some(26),
             "expected ETXTBSY, got {error}"
         ),
+        // LCOV_EXCL_START // Reason: ETXTBSY always fires on Linux (write handle held at exec), so the Ok arm only runs where text-file-busy does not apply (macOS)
         Ok(output) => assert!(
             output.status.success(),
             "script should run where ETXTBSY does not apply: {output:?}"
         ),
+        // LCOV_EXCL_STOP
     }
 }
 // -( T1170 wave 6h: helper-arm coverage )--------------------------------------

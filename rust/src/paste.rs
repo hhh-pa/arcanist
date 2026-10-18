@@ -615,7 +615,7 @@ fn read_input_file(dir: &Path, path: &str) -> Result<Vec<u8>, String> {
     match std::fs::read(&disk) {
         Ok(data) => Ok(data),
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            Err(format!("Path '{display}' is not readable."))
+            Err(format!("Path '{display}' is not readable.")) // LCOV_EXCL_LINE // Reason: gates run as root, which reads through chmod 000, so EACCES never triggers where gates measure; covered on macOS runs
         }
         Err(_) => Err(format!("Failed to read file '{display}'.")), // LCOV_EXCL_LINE // Reason: TOCTOU-only: is_file pre-check passes, so only deletion/replacement between check and read reaches here
     }

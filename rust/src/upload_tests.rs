@@ -832,7 +832,7 @@ fn run_reports_usage_errors_without_browsing() {
 #[test]
 fn upload_read_error_reports_open_failure() {
     if std::fs::symlink_metadata("/proc/self/mem").is_err() {
-        return;
+        return; // LCOV_EXCL_LINE // Reason: /proc is always present where gates measure; the skip only trips where /proc is missing (macOS)
     }
     let tmp = TempDir::new("read-error");
     let err = read_upload_bytes(tmp.path(), "/proc/self/mem").unwrap_err();

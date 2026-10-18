@@ -1266,7 +1266,7 @@ fn probe_txtbsy() -> Option<bool> {
 #[test]
 fn output_gives_up_on_permanently_busy_script() {
     if !platform_reports_txtbsy() {
-        return;
+        return; // LCOV_EXCL_LINE // Reason: probe is always true where gates measure (Linux reports ETXTBSY); the skip only trips on macOS
     } // LCOV_EXCL_START // Reason: ETXTBSY-only test body; macOS exec never reports text-file-busy (probe-gated)
     let fake = FakeHg::named("stuck");
     let sh = fake.dir.join("stuck.sh");
@@ -1657,8 +1657,8 @@ fn t1170_scratch_migration_reports_filesystem_failures() {
             std::fs::set_permissions(&secret, perms).unwrap();
         }
         if std::fs::read(&secret).is_err() {
-            assert!(!migrate_scratch_dir(&locked, &base.join("fresh-meta")));
-            assert!(secret.exists());
+            assert!(!migrate_scratch_dir(&locked, &base.join("fresh-meta"))); // LCOV_EXCL_LINE // Reason: root reads through chmod 000, so the guard never opens where gates measure; covered on macOS runs
+            assert!(secret.exists()); // LCOV_EXCL_LINE // Reason: root reads through chmod 000, so the guard never opens where gates measure; covered on macOS runs
         } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
         {
             use std::os::unix::fs::PermissionsExt;
