@@ -237,6 +237,10 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: rust/target/llvm-cov/lcov.info
+          # Scope to exactly the gate report: the default repo search
+          # scoops the Go tools' .lcov fixtures too (8 files uploaded,
+          # numbers polluted, processing never posts statuses).
+          disable_search: true
           fail_ci_if_error: false
       - name: upload test results to codecov
         if: ${{ !cancelled() && hashFiles('rust/target/nextest/default/junit.xml') != '' }}
@@ -245,6 +249,7 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: rust/target/nextest/default/junit.xml
           report_type: test_results
+          disable_search: true
           fail_ci_if_error: false
 
   go-tools-test:

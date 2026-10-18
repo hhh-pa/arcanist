@@ -5,3 +5,14 @@
 # coverage accounting.
 ignore:
   - "scripts/ci/go/**"
+
+# T1170 endgame: the suite plus LCOV exclusions must hold every line
+# covered. Both gates pin 100% so any regression fails loudly.
+coverage:
+  status:
+    project:
+      default:
+        target: 100%
+    patch:
+      default:
+        target: 100%
