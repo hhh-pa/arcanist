@@ -700,7 +700,7 @@ pub fn query_hg_markers_with(
         let (flag, value) = hg::extension_config_arg("arc-hg", Some(script))?;
         args.insert(0, value);
         args.insert(0, flag);
-    } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
+    }
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = hg::output_with(dir, hg_command, &argv)?;
     // T1153 LAND-26: PHP's future throws on a nonzero exit, so the

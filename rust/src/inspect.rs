@@ -534,7 +534,7 @@ pub fn resolve_commit_symbol(dir: &Path, symbol: &str) -> Result<Option<String>,
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
         let _ = writeln!(stdin, "{symbol}");
-    } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
+    }
     let output = child
         .wait_with_output()
         .map_err(|e| format!("failed to run git: {e}"))?;

@@ -1518,7 +1518,7 @@ fn scratch_migration_reports_filesystem_failures() {
         if std::fs::read(&secret).is_err() {
             assert!(!migrate_scratch_dir(&locked, &base.join("fresh-meta")));
             assert!(secret.exists());
-        } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
+        }
         {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = std::fs::metadata(&secret).unwrap().permissions();

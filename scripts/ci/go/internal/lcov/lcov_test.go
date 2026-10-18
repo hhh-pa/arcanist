@@ -245,6 +245,67 @@ func TestApplyExclusionsErrors(t *testing.T) {
 	})
 }
 
+func TestBareBraceLines(t *testing.T) {
+	dir := t.TempDir()
+	src := writeSource(t, dir, "b.rs",
+		"fn f() {\n"+ // 1 code: not bare
+			"    }\n"+ // 2 bare
+			"} // trailing comment\n"+ // 3 bare (comment stripped)
+			"    }),\n"+ // 4 bare
+			"    } else {\n"+ // 5 branch line: not bare
+			"}));\n"+ // 6 bare
+			"    // just a comment\n"+ // 7 comment-only: not bare
+			"\n"+ // 8 empty: not bare
+			"    foo();\n"+ // 9 code: not bare
+			"};\n"+ // 10 bare
+			"    (\n") // 11 opener: not bare (conservative)
+	braces, err := BareBraceLines(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[int]bool{2: true, 3: true, 4: true, 6: true, 10: true}
+	if !reflect.DeepEqual(braces, want) {
+		t.Fatalf("got %v want %v", braces, want)
+	}
+	if _, err := BareBraceLines(filepath.Join(dir, "gone.rs")); err == nil {
+		t.Fatal("expected error for unreadable source")
+	}
+}
+
+func TestApplyBareBraceFilter(t *testing.T) {
+	dir := t.TempDir()
+	src := writeSource(t, dir, "s.rs",
+		"fn f() {\n"+ // 1 DA 3: kept
+			"    }\n"+ // 2 DA 0: dropped (uncoverable zero)
+			"    }\n"+ // 3 DA 5: kept (covered brace stays)
+			"    missed();\n"+ // 4 DA 0: kept (true miss still fails the floor)
+			"}\n") // 5 DA 0: dropped
+	in := "SF:" + src + "\n" +
+		"DA:1,3\nDA:2,0\nDA:3,5\nDA:4,0\nDA:5,0\nDA:xx,0\n" +
+		"end_of_record\n"
+	records, _ := ParseRecords(in)
+	filtered, err := ApplyBareBraceFilter(records, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "SF:" + src + "\n" +
+		"DA:1,3\nDA:3,5\nDA:4,0\nDA:xx,0\n" +
+		"LF:4\nLH:2\n" +
+		"end_of_record\n"
+	if got := Emit(filtered); got != want {
+		t.Fatalf("mismatch:\n got: %q\nwant: %q", got, want)
+	}
+	// Input records are never mutated.
+	if _, ok := records[0].Rec.DA["2"]; !ok {
+		t.Fatalf("input mutated: %v", records[0].Rec.DA)
+	}
+	// Unreadable source fails closed.
+	missing, _ := ParseRecords("SF:" + filepath.Join(dir, "gone.rs") + "\nDA:1,0\nend_of_record\n")
+	if _, err := ApplyBareBraceFilter(missing, dir); err == nil {
+		t.Fatal("expected error for unreadable source")
+	}
+}
+
 func TestApplyExclusionsResolvesRelativeSF(t *testing.T) {
 	dir := t.TempDir()
 	writeSource(t, dir, "sub/f.rs", "alive();\ndead(); // LCOV_EXCL_LINE\n")

@@ -1085,7 +1085,7 @@ fn remove_loop_uses(tree: &Tree, scope: &ForeachScope, uses: &mut HashMap<String
         let start = tree.tokens[*iter].offset;
         if let Some(list) = uses.get_mut(name) {
             list.retain(|use_offset| *use_offset < start || *use_offset >= scope.end_offset);
-        } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
+        }
     }
 }
 

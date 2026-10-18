@@ -645,6 +645,85 @@ func ExcludedLines(path string) (map[int]bool, error) {
 	return excluded, nil
 }
 
+// isBareBrace reports whether a source line holds nothing but a bare
+// closing run: closing brackets/braces/parens, semicolons, and commas
+// (after trimming whitespace and a trailing // comment). Openers are
+// deliberately absent — a line holding `({[` stays measured, keeping
+// the filter conservative — and `} else {` holds an identifier, so
+// branch lines are never bare.
+func isBareBrace(line string) bool {
+	if i := strings.Index(line, "//"); i >= 0 {
+		line = line[:i]
+	}
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return false
+	}
+	for _, r := range line {
+		switch r {
+		case '}', ']', ')', ';', ',':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// BareBraceLines scans one source file and returns the 1-based line
+// numbers holding nothing but a bare closing run (see isBareBrace).
+// Such lines hold no executable statement, so LLVM assigns them no
+// region; where llvm-cov still emits DA:<line>,0 the zero is a
+// measurement artifact no test can ever cover, not a test gap.
+// (T1176 DEMARK S3: replaces the lone-brace LCOV_EXCL_LINE markers.)
+func BareBraceLines(path string) (map[int]bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	braces := map[int]bool{}
+	for i, line := range strings.Split(string(data), "\n") {
+		if isBareBrace(line) {
+			braces[i+1] = true
+		}
+	}
+	return braces, nil
+}
+
+// ApplyBareBraceFilter drops zero-count DA entries on bare-brace
+// source lines (see BareBraceLines): uncoverable-by-construction
+// lines whose DA:0 would otherwise fail the 100% floor forever.
+// Covered bare-brace lines (LLVM sometimes ends a region on the
+// brace) are kept, so the filter can only remove lines no test could
+// ever cover; zero-count lines holding real code are kept, so true
+// misses still fail the floor. Records with non-numeric line keys
+// are kept (unmappable to source lines), and BRDA/FN/FNDA are
+// untouched (the floor measures DA lines only). Relative SFs resolve
+// against workspaceRoot; canonical SFs are already absolute. Records
+// are copied, never mutated. An unreadable source file aborts with an
+// error (fail closed, like ApplyExclusions).
+func ApplyBareBraceFilter(records []SFRecord, workspaceRoot string) ([]SFRecord, error) {
+	out := make([]SFRecord, 0, len(records))
+	for _, sr := range records {
+		p := sr.SF
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(workspaceRoot, p)
+		}
+		braces, err := BareBraceLines(p)
+		if err != nil {
+			return nil, err
+		}
+		rec := copyRecord(sr.Rec)
+		for line, count := range rec.DA {
+			n, ok := parseCount(line)
+			if ok && count == 0 && braces[int(n)] {
+				delete(rec.DA, line)
+			}
+		}
+		out = append(out, SFRecord{SF: sr.SF, Rec: rec})
+	}
+	return out, nil
+}
+
 // ApplyExclusions drops coverage records for LCOV-excluded source
 // lines (see ExcludedLines): DA entries on excluded lines, BRDA
 // entries keyed to excluded lines, FN entries on excluded lines, and

@@ -1177,7 +1177,7 @@ pub fn parse_git_raw_diff_full(status: &str) -> BTreeMap<String, RawDiffEntry> {
                 },
             );
             continue;
-        } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
+        }
         files.insert(
             file.to_string(),
             RawDiffEntry {
@@ -2274,7 +2274,7 @@ pub fn write_raw_commit(dir: &Path, commit: &RawCommit) -> Result<String, String
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
             Err(e) => return Err(format!("failed to write raw commit: {e}")), // LCOV_EXCL_LINE // Reason: stdin pipe writes fail only as EPIPE (covered arm); other errors unreachable
         }
-    } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
+    }
     let out = child
         .wait_with_output()
         .map_err(|e| format!("failed to run git: {e}"))?;

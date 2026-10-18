@@ -304,7 +304,7 @@ fn check_version(program: &Path, prefix: &[String]) -> Result<(), String> {
             return Err(old_version_error());
         };
         command.arg(cslint);
-    } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
+    }
     command.arg("-v").stdin(Stdio::null());
     let Ok(output) = arc_rs::lint::spawn_with_retry(&mut command) else {
         return Err(old_version_error());

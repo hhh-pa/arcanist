@@ -223,7 +223,7 @@ fn brace_inner(tree: &Tree, block: &Block) -> Option<(usize, usize)> {
         let end = close.unwrap_or(tree.tokens.len()).min(tree.tokens.len());
         if open < end {
             return Some((open + 1, end));
-        } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
+        }
     }
     None
 }

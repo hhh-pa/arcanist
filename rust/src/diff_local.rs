@@ -1054,7 +1054,7 @@ pub fn resolve_explicit_base(
         let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !sha.is_empty() {
             return Ok(sha);
-        } // LCOV_EXCL_LINE // Reason: brace carries no llvm count though the block executes
+        }
     }
     Err(format!(
         "Unable to find any git commit named '{symbolic_base}' in this repository."
