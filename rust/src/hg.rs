@@ -421,10 +421,10 @@ fn apply_status_copy_source(
     result: &mut BTreeMap<String, HgStatusDetail>,
     last_path: &Option<String>,
     path: &str,
-    line: &str,
+    _line: &str,
 ) -> Result<(), String> {
     match last_path {
-        None => Err(format!("Unexpected copy source in hg status, '{line}'.")), // LCOV_EXCL_LINE // Reason: dead: trim() strips leading spaces, so a copy-source line is never first
+        None => unreachable!("trim() strips leading spaces, so a copy-source line is never first"),
         Some(prev) => {
             if let Some(detail) = result.get_mut(prev) {
                 detail.from = Some(path.to_string());
@@ -588,9 +588,6 @@ fn parse_mercurial_branch_line(line: &str) -> Option<(String, String, String)> {
         .unwrap_or(line);
     let (name, tail) = head.rsplit_once([' ', '\t'])?;
     let name = name.trim_end();
-    if name.is_empty() {
-        return None; // LCOV_EXCL_LINE // Reason: dead: an empty name needs a leading separator, rejected as whitespace above
-    }
     let (local, rev) = tail.split_once(':')?;
     if local.is_empty() || !local.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -739,9 +736,6 @@ fn parse_blame_line(line: &str) -> Option<(String, String)> {
 pub fn parse_blame(stdout: &str) -> Result<Vec<(String, String)>, String> {
     let mut blame = Vec::new();
     for line in stdout.split_inclusive('\n') {
-        if line.is_empty() {
-            continue; // LCOV_EXCL_LINE // Reason: dead: split_inclusive never yields empty items
-        }
         let Some(entry) = parse_blame_line(line) else {
             return Err(format!("Unable to parse Mercurial blame line: {line}"));
         };

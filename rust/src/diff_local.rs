@@ -4930,9 +4930,6 @@ pub fn parse_hg_active_bookmark(output: &str) -> Option<String> {
     output.lines().find_map(|line| {
         let name = line.strip_prefix('*')?.trim_start();
         let name = name.split_whitespace().next()?;
-        if name.is_empty() {
-            return None; // LCOV_EXCL_LINE // Reason: dead: split_whitespace never yields an empty name
-        }
         Some(name.to_string())
     })
 }
@@ -4978,9 +4975,9 @@ pub fn parse_hg_status_details(output: &str) -> Result<Vec<(HgStatusEntry, u32)>
         let code = bytes[0] as char;
         let path = line[2..].to_string();
         if code == ' ' {
-            let Some((last, _)) = entries.last_mut() else {
-                return Err(format!("Unexpected copy source in hg status, '{line}'.")); // LCOV_EXCL_LINE // Reason: dead: trim() strips leading spaces, so a copy-source line is never first
-            };
+            let (last, _) = entries
+                .last_mut()
+                .expect("trim() strips leading spaces, so a copy-source line is never first");
             last.from = Some(path);
             continue;
         }
@@ -7148,13 +7145,10 @@ pub fn resolve_message_source(
         }
         return Ok(MessageSource::CreateFromUser);
     }
-    match update {
-        Some(id) => Ok(MessageSource::UpdateFromRevision(parse_update_revision_id(
-            id,
-        )?)),
-        // Unreachable: `!create && update.is_none()` returned above.
-        None => Ok(MessageSource::CreateFromUser), // LCOV_EXCL_LINE // Reason: unreachable: `!create && update.is_none()` returns above
-    }
+    let id = update.expect("`!create && update.is_none()` returns above");
+    Ok(MessageSource::UpdateFromRevision(parse_update_revision_id(
+        id,
+    )?))
 }
 
 /* -(  Clean working-copy check (D3)  )--------------------------------------- */
@@ -7745,9 +7739,6 @@ fn commit_clean_check_changes(
         return Err(MUST_PROVIDE_MESSAGE.to_string());
     }
     let message = remove_comments(&edited);
-    if message.is_empty() {
-        return Err(MUST_PROVIDE_NONEMPTY_MESSAGE.to_string()); // LCOV_EXCL_LINE // Reason: dead: remove_comments always returns newline-terminated text, never empty
-    }
     if let Some(commit) = vcs.do_commit {
         commit(&message)?;
     }

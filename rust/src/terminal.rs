@@ -1091,9 +1091,10 @@ fn console_strlen(text: &str) -> usize {
     }
     let mut len = 0;
     for glyph in combine_glyphs(&stripped) {
-        let Some(first) = glyph.chars().next() else {
-            continue; // LCOV_EXCL_LINE // Reason: dead: combine_glyphs only pushes nonempty buffers
-        };
+        let first = glyph
+            .chars()
+            .next()
+            .expect("combine_glyphs only pushes nonempty buffers");
         let codepoint = first as u32;
         if codepoint == 0 {
             continue;

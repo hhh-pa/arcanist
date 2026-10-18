@@ -733,9 +733,6 @@ pub fn published_git_hashes(
     client: Option<&crate::conduit::Client>,
 ) -> Result<Vec<String>, String> {
     let remotes = query_git_remotes(dir)?;
-    if remotes.is_empty() {
-        return Ok(Vec::new()); // LCOV_EXCL_LINE // Reason: dead: empty remote output errors in parse_remote_line, so Ok is never empty
-    }
     let markers = query_git_markers(dir, MARKER_TYPE_BRANCH, true)?;
     if markers.is_empty() {
         return Ok(Vec::new());
@@ -762,9 +759,10 @@ pub fn published_git_hashes(
         .collect();
     let mut hashes = Vec::new();
     for marker in &markers {
-        let Some(remote_name) = &marker.remote_name else {
-            continue; // LCOV_EXCL_LINE // Reason: dead: the remote-cache filter guarantees remote_name is set
-        };
+        let remote_name = marker
+            .remote_name
+            .as_ref()
+            .expect("the remote-cache filter guarantees remote_name is set");
         let Some(remote) = by_name.get(remote_name.as_str()) else {
             continue;
         };

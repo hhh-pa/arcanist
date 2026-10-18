@@ -176,9 +176,6 @@ impl Linter for ScriptAndRegexLinter {
         // read from the project root when it names another file (T1153
         // LINT-27).
         let file_bytes = |file: &str| -> Option<Vec<u8>> {
-            if file == path {
-                return Some(data.to_vec()); // LCOV_EXCL_LINE // Reason: dead: messages_from_matches short-circuits file==path, so this arm never runs
-            }
             self.root
                 .as_deref()
                 .and_then(|root| std::fs::read(root.join(file)).ok())

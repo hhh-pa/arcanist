@@ -711,14 +711,11 @@ fn open_download_response(
     sink: &mut Option<ProgressSink>,
     target: &Path,
 ) -> Result<reqwest::blocking::Response, String> {
-    let http = match reqwest::blocking::Client::builder()
+    let http = reqwest::blocking::Client::builder()
         .timeout(timeout)
         .no_proxy()
         .build()
-    {
-        Ok(http) => http,
-        Err(e) => return Err(format!("failed to build HTTP client: {e}")), // LCOV_EXCL_LINE // Reason: unreachable: the default builder (timeout, no proxy) never fails to build
-    };
+        .expect("the default builder (timeout, no proxy) never fails to build");
     let response = match http.get(url).send() {
         Ok(response) => response,
         Err(e) => {

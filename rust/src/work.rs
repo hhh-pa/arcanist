@@ -1085,14 +1085,6 @@ pub fn hg_dirty_lists_with(dir: &Path, hg_cmd: &hg::HgCommand) -> Result<DirtyLi
         if mask & hg::FLAG_UNTRACKED != 0 {
             lists.untracked.push(path.clone());
         }
-        if mask & hg::FLAG_EXTERNALS != 0 {
-            lists.externals.push(path.clone()); // LCOV_EXCL_LINE // Reason: dead arm; hg status sets no externals flag
-        }
-    }
-    for (path, mask) in &status {
-        if mask & hg::FLAG_UNSTAGED != 0 && !lists.externals.iter().any(|e| e == path) {
-            lists.unstaged.push(path.clone()); // LCOV_EXCL_LINE // Reason: dead arm; hg has no index so the parser sets no unstaged flag
-        }
     }
     for (path, mask) in &status {
         if mask & hg::FLAG_UNCOMMITTED != 0
@@ -1722,10 +1714,12 @@ fn confirm_externals(input: &mut dyn BufRead, lists: &DirtyLists) -> Result<(), 
         render_externals_block(&lists.externals, terminal::ansi_enabled())
     );
     let query = externals_query(lists.externals.len());
-    match console_confirm(input, &query, false) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(ABORT.to_string()),
-        Err(message) => Err(message), // LCOV_EXCL_LINE // Reason: dead arm; console_confirm with tty=true never errors (read failures read as empty)
+    let confirmed = console_confirm(input, &query, false)
+        .expect("console_confirm with tty=true never errors (read failures read as empty)");
+    if confirmed {
+        Ok(())
+    } else {
+        Err(ABORT.to_string())
     }
 }
 
@@ -1961,16 +1955,18 @@ pub fn run_in_with(
         };
         execute_parsed(dir, &options, &live, input) // LCOV_EXCL_STOP
     } else {
-        execute_parsed(
-            dir,
-            &options,
-            &|_, _| Err("conduit unavailable".to_string()), // LCOV_EXCL_LINE // Reason: poison pill; the gate above guarantees dispatch_symbol takes a non-conduit path here
-            input,
-        )
+        execute_parsed(dir, &options, &conduit_unavailable_pill, input)
     }
 }
 
 /// Hg entry with an injected Conduit caller (T1153 WORK-HG).
+/// Poison-pill conduit caller for the no-conduit dispatch paths: the gates
+/// above guarantee dispatch never calls conduit here, so any call fails
+/// closed with the byte-identical message the callers propagate.
+fn conduit_unavailable_pill(_: &str, _: &serde_json::Value) -> Result<serde_json::Value, String> {
+    Err("conduit unavailable".to_string())
+}
+
 fn run_hg_in_with(
     dir: &Path,
     options: &Options,
@@ -2007,13 +2003,7 @@ pub fn run_hg_in_with_cmd(
         };
         hg_execute_parsed_with(dir, hg_cmd, options, &live, input) // LCOV_EXCL_STOP
     } else {
-        hg_execute_parsed_with(
-            dir,
-            hg_cmd,
-            options,
-            &|_, _| Err("conduit unavailable".to_string()), // LCOV_EXCL_LINE // Reason: poison pill; the gate above guarantees hg dispatch takes a non-conduit path here
-            input,
-        )
+        hg_execute_parsed_with(dir, hg_cmd, options, &conduit_unavailable_pill, input)
     }
 }
 

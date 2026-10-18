@@ -529,25 +529,16 @@ fn parse_long_flag(
 }
 
 /// Parse one `-x` token (`ArcanistWorkflow.php:852-862`).
+///
+/// `unit` defines no short flags, so every `-x` token is unknown.
 fn parse_short_flag(
-    options: &mut Options,
-    queue: &mut VecDeque<String>,
-    typed: &str,
+    _options: &mut Options,
+    _queue: &mut VecDeque<String>,
+    _typed: &str,
     spelling: &str,
 ) -> Result<(), String> {
-    let Some(spec) = lookup_short(spelling) else {
-        return Err(format!("Unknown argument '{spelling}'. Try 'arc help'."));
-    };
-    // LCOV_EXCL_START // Reason: unreachable; no FLAG_SPECS entry defines a short spelling, so lookup always misses
-    if !spec.flag.takes_param() {
-        store_flag(options, spec, None);
-        return Ok(());
-    }
-    let value = queue
-        .pop_front()
-        .ok_or_else(|| format!("Option '{typed}' requires a parameter."))?;
-    store_flag(options, spec, Some(value));
-    Ok(()) // LCOV_EXCL_STOP
+    debug_assert!(lookup_short(spelling).is_none());
+    Err(format!("Unknown argument '{spelling}'. Try 'arc help'."))
 }
 
 /// Parse `argv` (excluding the `unit` subcommand name).
@@ -579,7 +570,6 @@ pub fn parse_options(argv: &[String]) -> Result<Option<Options>, String> {
         }
         if let Some(spelling) = arg.strip_prefix('-') {
             parse_short_flag(&mut options, &mut queue, &arg, spelling)?;
-            continue; // LCOV_EXCL_LINE // Reason: unreachable; short flags always error since no spec defines one
         }
         options.paths.push(arg);
     }
@@ -2492,33 +2482,33 @@ pub fn run_single_with_php(
     // read below (missing/unreadable sources fall back per-param).
     let merged = lenient_engine_merged(&ctx.project_root);
     let merged_ref = merged.as_ref();
-    match engine_type {
-        "NoseTestEngine" => {
-            unit_nose::NoseEngine::new().run_with(ctx, runner, &unit_nose::RealNoseFs)
-        }
-        "PytestTestEngine" => unit_pytest::PytestEngine::new().run_with(ctx, runner, &RealPytestFs),
-        "PhpunitTestEngine" => {
-            let engine = phpunit_engine_from_merged(&ctx.project_root, merged_ref);
-            // Surface a configured-but-missing phpunit config verbatim
-            // (`PhpunitTestEngine.php:263-266`).
-            if let Some(config_value) =
-                engine_param_string_from(merged_ref, &ctx.project_root, unit_phpunit::CONFIG_KEY)
-            {
-                let full = format!("{}/{config_value}", ctx.project_root);
-                if !Path::new(&full).exists() {
-                    return Err(EngineError::Failed(format!(
-                        "PHPUnit configuration file was not found in {full}"
-                    )));
-                }
+    // The SINGLE_AVAILABLE guard above admits only names with branches
+    // below; the final else is the C# engine.
+    if engine_type == "NoseTestEngine" {
+        unit_nose::NoseEngine::new().run_with(ctx, runner, &unit_nose::RealNoseFs)
+    } else if engine_type == "PytestTestEngine" {
+        unit_pytest::PytestEngine::new().run_with(ctx, runner, &RealPytestFs)
+    } else if engine_type == "PhpunitTestEngine" {
+        let engine = phpunit_engine_from_merged(&ctx.project_root, merged_ref);
+        // Surface a configured-but-missing phpunit config verbatim
+        // (`PhpunitTestEngine.php:263-266`).
+        if let Some(config_value) =
+            engine_param_string_from(merged_ref, &ctx.project_root, unit_phpunit::CONFIG_KEY)
+        {
+            let full = format!("{}/{config_value}", ctx.project_root);
+            if !Path::new(&full).exists() {
+                return Err(EngineError::Failed(format!(
+                    "PHPUnit configuration file was not found in {full}"
+                )));
             }
-            engine.run_with(ctx, runner, &RealPhpunitFs)
         }
-        "PhutilUnitTestEngine" | "phutil" => {
-            run_phutil_with_runner_merged(ctx, runner, engine_type, php, merged_ref)
-        }
-        "XUnitTestEngine" => run_xunit_with_runner(ctx, runner),
-        "CSharpToolsTestEngine" => run_csharp_with_runner(ctx, runner),
-        _ => Err(EngineError::Usage(not_a_subclass_message(engine_type))), // LCOV_EXCL_LINE // Reason: dead arm; the SINGLE_AVAILABLE guard admits only names with arms above
+        engine.run_with(ctx, runner, &RealPhpunitFs)
+    } else if engine_type == "PhutilUnitTestEngine" || engine_type == "phutil" {
+        run_phutil_with_runner_merged(ctx, runner, engine_type, php, merged_ref)
+    } else if engine_type == "XUnitTestEngine" {
+        run_xunit_with_runner(ctx, runner)
+    } else {
+        run_csharp_with_runner(ctx, runner)
     }
 }
 

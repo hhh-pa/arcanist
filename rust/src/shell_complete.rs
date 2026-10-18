@@ -429,9 +429,6 @@ pub fn detect_shell(shell_env: Option<&str>, ansi: bool) -> (String, Result<Stri
     if detected.is_empty() {
         return (out, Err("Unable to detect any supported shell, so autocompletion rules can not be installed. Use \"--shell\" to select a shell.".to_string()));
     }
-    if detected.len() > 1 {
-        return (out, Err("Multiple supported shells were detected. Unable to determine which shell to install autocompletion rules for. Use \"--shell\" to select a shell.".to_string())); // LCOV_EXCL_LINE // Reason: dead: at most one shell is ever pushed, so multiple-detection never triggers
-    }
     (out, Ok(detected[0].to_string()))
 }
 

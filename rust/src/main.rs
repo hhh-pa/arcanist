@@ -570,13 +570,12 @@ fn strip_config(argv: &[String], globals: &mut Globals) -> Result<Vec<String>, G
                 next.clone()
             }
         };
-        match name {
-            // `--library` names PHP libraries (nothing to load in a
-            // static binary): parsed, ignored.
-            "library" => {}
-            "config" => globals.config.push(value),
-            "config-file" => globals.config_files.push(value),
-            _ => {} // LCOV_EXCL_LINE // Reason: dead arm; the allowlist guard above admits only the three handled flags
+        // `--library` names PHP libraries (nothing to load in a
+        // static binary): parsed, ignored.
+        if name == "config" {
+            globals.config.push(value);
+        } else if name == "config-file" {
+            globals.config_files.push(value);
         }
         index += 1;
     }
@@ -622,10 +621,10 @@ fn strip_toolset(argv: &[String], globals: &mut Globals) -> Result<Vec<String>, 
                 "Argument \"--{name}\" was provided twice."
             )));
         }
-        match name {
-            "conduit-uri" => globals.conduit_uri = Some(value),
-            "conduit-token" => globals.conduit_token = Some(value),
-            _ => {} // LCOV_EXCL_LINE // Reason: dead arm; the allowlist guard above admits only the two handled flags
+        if name == "conduit-uri" {
+            globals.conduit_uri = Some(value);
+        } else {
+            globals.conduit_token = Some(value);
         }
         index += 1;
     }

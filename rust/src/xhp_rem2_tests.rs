@@ -761,3 +761,45 @@ fn t1170_empty_default_range_is_not_an_array() {
     let tree = t1170_tree("<?php 1\n");
     assert!(!super::default_is_array(&tree, (3, 1)));
 }
+// -( T1176 S12: dead-arm coverage )------------------------------------------
+
+#[test]
+#[should_panic(expected = "never a separator")]
+fn qualified_name_start_dead_no_prev() {
+    // Token 0 is the open tag or inline HTML in real files, so a
+    // separator always has a previous semantic token; a hand-built
+    // tree with a leading separator breaks the guarantee and panics.
+    let tree = ast::Tree {
+        tokens: vec![
+            ast::Token {
+                kind: "\\".to_string(),
+                value: "\\".to_string(),
+                offset: 0,
+            },
+            ast::Token {
+                kind: ast::kinds::T_STRING.to_string(),
+                value: "Foo".to_string(),
+                offset: 1,
+            },
+        ],
+        ..Default::default()
+    };
+    let _ = super::qualified_name_start(&tree, 1);
+}
+
+#[test]
+#[should_panic(expected = "methods here are always named")]
+fn rule_useless_override_dead_unnamed() {
+    // The parser anonymizes nameless functions, so a non-anonymous
+    // method always has a name; clearing it by hand breaks the
+    // guarantee and panics.
+    let tree = t1170_tree("<?php class A { function f() {} }\n");
+    let mut blocks = tree.blocks();
+    let method = blocks
+        .iter_mut()
+        .find(|b| b.kind == ast::BlockKind::Function)
+        .expect("method block");
+    method.name = None;
+    let mut out = Vec::new();
+    super::rule_useless_override(&tree, &blocks, &mut out);
+}

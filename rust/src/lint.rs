@@ -2090,9 +2090,9 @@ fn apply_standard(
     // `setLinterConfigurationValue()` loop (explicit keys apply after
     // and overwrite these).
     let config = phutil_xhpast_standard_config();
-    let serde_json::Value::Object(entries) = &config else {
-        return Ok(()); // LCOV_EXCL_LINE // Reason: dead arm; the standard config is a literal object
-    };
+    let entries = config
+        .as_object()
+        .expect("the standard config is a literal object");
     let mut keys: Vec<&String> = entries.keys().collect();
     keys.sort();
     for key in keys {

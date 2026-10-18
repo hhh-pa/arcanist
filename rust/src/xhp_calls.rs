@@ -1610,9 +1610,8 @@ fn dynamic_arg_unsafe(tree: &Tree, args: &[(usize, usize)], param: i64) -> bool 
     if param < 0 {
         return false;
     }
-    let Ok(index) = usize::try_from(param) else {
-        return false; // LCOV_EXCL_LINE // Reason: dead: negative params return above, so try_from cannot fail
-    };
+    let index =
+        usize::try_from(param).expect("negative params return above, so try_from cannot fail");
     let Some(&(first, last)) = args.get(index) else {
         return false;
     };

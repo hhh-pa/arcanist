@@ -943,10 +943,9 @@ fn split_glyphs(text: &str) -> Vec<String> {
     };
     for ch in chars {
         if ch.len_utf8() > 1 && is_combining_mark(ch) {
-            match &mut buf {
-                Some(pending) => pending.push(ch),
-                None => buf = Some(ch.to_string()), // LCOV_EXCL_LINE // Reason: dead arm; buf is always Some here (preset for leading marks, set by the first base char)
-            }
+            buf.as_mut()
+                .expect("buf is always Some here (preset for leading marks, set by the first base char)")
+                .push(ch);
         } else {
             if let Some(pending) = buf.take() {
                 parts.push(pending);
@@ -1032,9 +1031,10 @@ pub fn console_strlen(text: &str) -> usize {
     }
     let mut width = 0;
     for glyph in split_glyphs(&stripped) {
-        let Some(first) = glyph.chars().next() else {
-            continue; // LCOV_EXCL_LINE // Reason: dead arm; split_glyphs never emits empty glyphs
-        };
+        let first = glyph
+            .chars()
+            .next()
+            .expect("split_glyphs never emits empty glyphs");
         let code = first as u32;
         if code == 0 {
             continue;
@@ -3136,9 +3136,7 @@ pub fn differential_revision_ids(message: &str) -> Vec<u64> {
         if line.len() < TAG.len() || !line.as_bytes()[..TAG.len()].eq_ignore_ascii_case(TAG) {
             continue;
         }
-        let Some(value) = line.get(TAG.len()..) else {
-            continue; // LCOV_EXCL_LINE // Reason: dead arm; the byte-prefix match guarantees TAG.len() is a char boundary
-        };
+        let value = &line[TAG.len()..];
         let value = value.trim();
         if value.is_empty() {
             return Vec::new();
@@ -4377,12 +4375,16 @@ pub struct GitSymbol {
 pub fn git_author_and_date(dir: &Path, commit: &str) -> Result<(String, String), String> {
     let info = git::stdout_text(dir, &["log", "-n1", "--format=%aD%n%an%n%ae", commit, "--"])?;
     let mut lines = info.split('\n');
-    match (lines.next(), lines.next(), lines.next()) {
-        (Some(date), Some(author), Some(email)) => {
-            Ok((format!("{author} <{email}>"), date.to_string()))
-        }
-        _ => Err(format!("could not read author and date of \"{commit}\"")), // LCOV_EXCL_LINE // Reason: dead arm; the fixed --format always yields three lines on success
-    }
+    let date = lines
+        .next()
+        .expect("the fixed --format always yields three lines on success");
+    let author = lines
+        .next()
+        .expect("the fixed --format always yields three lines on success");
+    let email = lines
+        .next()
+        .expect("the fixed --format always yields three lines on success");
+    Ok((format!("{author} <{email}>"), date.to_string()))
 }
 
 /// Rebase `min..max` onto `dst`, returning the new HEAD
@@ -7784,9 +7786,6 @@ pub fn save_local_state_hg_with(
     let status = hg::get_uncommitted_status_with(dir, hg_cmd)?;
     let lists = change_lists(&status, &HG_CHANGE_FLAGS);
     gate_merge_conflicts(io, dir, &lists)?;
-    if !lists.externals.is_empty() {
-        confirm_dirty_externals(io, &lists.externals)?; // LCOV_EXCL_LINE // Reason: dead arm; hg status sets no externals flag
-    }
     let mut stash = None;
     if push_uncommitted_banner(
         io,
@@ -7922,10 +7921,7 @@ pub fn discard_local_state_git(
 ) -> Result<(), String> {
     match apply_stash_git(dir, io, state) {
         Ok(()) => Ok(()),
-        Err(err) => {
-            restore_local_state_git(dir, io, state)?;
-            Err(err) // LCOV_EXCL_LINE // Reason: unreachable; stash-apply failures persist across the restore checkout or fail the checkout itself
-        }
+        Err(err) => restore_local_state_git(dir, io, state).and(Err(err)),
     }
 }
 

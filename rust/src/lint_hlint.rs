@@ -225,10 +225,9 @@ pub fn parse_output(path: &str, _exit_code: i32, stdout: &str, _stderr: &str) ->
             // fatals the same way. Either discards everything so far.
             return Vec::new();
         }
-        let Some(message) = parse_idea(path, idea) else {
-            continue; // LCOV_EXCL_LINE // Reason: dead: parse_output returns on non-objects above, so this never fails
-        };
-        out.push(message);
+        if let Some(message) = parse_idea(path, idea) {
+            out.push(message);
+        }
     }
     out
 }

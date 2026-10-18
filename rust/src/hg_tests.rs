@@ -1900,3 +1900,14 @@ fn amend_non_head_propagates_the_first_log_failure() {
     let err = amend_non_head_commit_with(tmp.path(), &hg, &[], "msg.txt", None).unwrap_err();
     assert!(!err.is_empty(), "expected a spawn failure");
 }
+// -( T1176 S12: dead-arm coverage )------------------------------------------
+
+#[test]
+#[should_panic(expected = "a copy-source line is never first")]
+fn apply_status_copy_source_dead_no_prev() {
+    // `trim()` strips leading spaces, so a copy-source continuation is
+    // never the first status line; calling with no previous entry
+    // breaks the guarantee and panics.
+    let mut map = std::collections::BTreeMap::new();
+    let _ = apply_status_copy_source(&mut map, &None, "copy.txt", "  copy.txt");
+}

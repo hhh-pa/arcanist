@@ -2137,14 +2137,9 @@ impl Tree {
             Some(c) => {
                 let first = self.next_semantic(c).filter(|f| *f < boundary);
                 let last = first.and_then(|_| {
-                    let mut l = boundary;
-                    while l > c + 1 {
-                        l -= 1;
-                        if is_semantic(&self.tokens[l]) {
-                            return Some(l);
-                        }
-                    }
-                    None // LCOV_EXCL_LINE // Reason: dead: the first semantic token in range guarantees the backward scan hits
+                    (c + 1..boundary)
+                        .rev()
+                        .find(|&l| is_semantic(&self.tokens[l]))
                 });
                 (first, last)
             }
@@ -2359,9 +2354,6 @@ impl Tree {
             let Some(next) = self.class_header_step(&mut block, cur) else {
                 break;
             };
-            if next == cur {
-                break; // LCOV_EXCL_LINE // Reason: dead: header steps always advance past cur or stop
-            }
             cur = next;
         }
         block
@@ -2590,11 +2582,7 @@ fn param_ty_range(tree: &Tree, first: usize, name_idx: usize) -> Option<(usize, 
     while start <= end && !is_semantic(&tree.tokens[start]) {
         start += 1;
     }
-    if start <= end {
-        Some((start, end))
-    } else {
-        None // LCOV_EXCL_LINE // Reason: dead: the walker end is always a non-trivia token at or after first
-    }
+    (start <= end).then_some((start, end))
 }
 
 fn param_default_range(tree: &Tree, eq_at: Option<usize>, last: usize) -> Option<(usize, usize)> {
@@ -2647,9 +2635,6 @@ fn walker_before_name(tree: &Tree, first: usize, name_idx: usize) -> Option<usiz
             continue;
         }
         break;
-    }
-    if end < first {
-        return None; // LCOV_EXCL_LINE // Reason: dead: the loop returns before end can pass first
     }
     Some(end)
 }

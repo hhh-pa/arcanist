@@ -559,9 +559,9 @@ pub fn select_source(options: &Options) -> Result<Source, String> {
         .as_deref()
         .filter(|revision| !revision.is_empty())
     {
-        sources.push(Source::Revision(normalize_numeric_id(
-            "revision", revision,
-        )?)); // LCOV_EXCL_LINE // Reason: dead arm; normalize_numeric_id always returns Ok
+        let revision = normalize_numeric_id("revision", revision)
+            .expect("normalize_numeric_id always returns Ok");
+        sources.push(Source::Revision(revision));
     }
     if sources.is_empty() {
         return Err(
@@ -1738,9 +1738,6 @@ fn base85_encode_groups(chunk: &[u8], buf: &mut String) {
     while remaining > 0 {
         let mut accum: u32 = 0;
         for shift in [24u32, 16, 8, 0] {
-            if remaining == 0 {
-                break; // LCOV_EXCL_LINE // Reason: dead break; the post-decrement check below always fires first
-            }
             accum += u32::from(chunk[pos]) << shift;
             pos += 1;
             remaining -= 1;
@@ -2771,20 +2768,11 @@ pub fn hg_tree_status(dir: &Path, hg: &hg::HgCommand, args: &[&str]) -> Result<T
         if mask & hg::FLAG_UNTRACKED == 0 {
             mask |= hg::FLAG_UNCOMMITTED;
         }
-        if mask & hg::FLAG_CONFLICT != 0 {
-            status.conflicts.push(path.clone()); // LCOV_EXCL_LINE // Reason: dead arm; conflicts split out before parsing and no status code sets this flag
-        }
         if mask & hg::FLAG_MISSING != 0 {
             status.missing.push(path.clone());
         }
-        if mask & hg::FLAG_UNSTAGED != 0 {
-            status.unstaged.push(path.clone()); // LCOV_EXCL_LINE // Reason: dead arm; hg status sets no unstaged flag (no index)
-        }
         if mask & hg::FLAG_UNCOMMITTED != 0 {
             status.uncommitted.push(path.clone());
-        }
-        if mask & hg::FLAG_EXTERNALS != 0 {
-            status.externals.push(path.clone()); // LCOV_EXCL_LINE // Reason: dead arm; hg status sets no externals flag
         }
         if mask & hg::FLAG_UNTRACKED != 0 {
             status.untracked.push(path);
@@ -3189,10 +3177,15 @@ fn git_head_info(dir: &Path) -> Result<Option<HeadInfo>, String> {
     }
     let out = git::stdout_text(dir, &["log", "-1", "--format=%H\x01%an\x01%B", "--"])?;
     let mut parts = out.splitn(3, '\x01');
-    let (Some(hash), Some(author), Some(message)) = (parts.next(), parts.next(), parts.next())
-    else {
-        return Err("malformed git log output".to_string()); // LCOV_EXCL_LINE // Reason: dead arm; git log with a fixed --format always yields three fields on success
-    };
+    let hash = parts
+        .next()
+        .expect("git log with a fixed --format always yields three fields on success");
+    let author = parts
+        .next()
+        .expect("git log with a fixed --format always yields three fields on success");
+    let message = parts
+        .next()
+        .expect("git log with a fixed --format always yields three fields on success");
     Ok(Some(HeadInfo {
         hash: hash.to_string(),
         author: author.to_string(),
@@ -3497,9 +3490,6 @@ fn commit_yes_path_changes(
         return Err(MUST_PROVIDE_MESSAGE.to_string());
     }
     let stripped = diff_local::remove_comments(&edited);
-    if stripped.is_empty() {
-        return Err(MUST_PROVIDE_NONEMPTY_MESSAGE.to_string()); // LCOV_EXCL_LINE // Reason: dead arm; remove_comments always returns at least a newline, so stripped is never empty
-    }
     match vcs {
         Vcs::Git => git::do_commit(dir, &stripped),
         Vcs::Hg => hg::do_commit_with(dir, &backends.hg, &stripped),
@@ -5825,34 +5815,33 @@ pub fn maybe_create_branch(
     if !want {
         return Ok(BranchState::default());
     }
-    match vcs {
-        Vcs::Git => {
-            let original = git::branch_name(dir)
-                .ok()
-                .flatten()
-                .or_else(|| git::canonical_revision_name(dir, "HEAD").ok());
-            let new = git_create_branch(dir, bundle, has_base_local, io)?;
-            Ok(BranchState {
-                original,
-                new: Some(new),
-            })
-        }
-        Vcs::Hg => {
-            let bookmarks =
-                hg::stdout_text_with(dir, &backends.hg, &["bookmarks"]).unwrap_or_default();
-            let original = land::parse_hg_bookmarks(&bookmarks)
-                .into_iter()
-                .find(|(_, active)| *active)
-                .map(|(name, _)| name)
-                .or_else(|| hg_canonical(dir, &backends.hg, ".").ok());
-            let new = hg_create_bookmark(dir, &backends.hg, bundle, has_base_local, io)?;
-            Ok(BranchState {
-                original,
-                new: Some(new),
-            })
-        }
-        Vcs::Svn => Ok(BranchState::default()), // LCOV_EXCL_LINE // Reason: dead arm; can_branch(Svn) is false so svn always early-returns above
+    if vcs == Vcs::Git {
+        let original = git::branch_name(dir)
+            .ok()
+            .flatten()
+            .or_else(|| git::canonical_revision_name(dir, "HEAD").ok());
+        let new = git_create_branch(dir, bundle, has_base_local, io)?;
+        return Ok(BranchState {
+            original,
+            new: Some(new),
+        });
     }
+    debug_assert_eq!(
+        vcs,
+        Vcs::Hg,
+        "can_branch(Svn) is false so svn always early-returns above"
+    );
+    let bookmarks = hg::stdout_text_with(dir, &backends.hg, &["bookmarks"]).unwrap_or_default();
+    let original = land::parse_hg_bookmarks(&bookmarks)
+        .into_iter()
+        .find(|(_, active)| *active)
+        .map(|(name, _)| name)
+        .or_else(|| hg_canonical(dir, &backends.hg, ".").ok());
+    let new = hg_create_bookmark(dir, &backends.hg, bundle, has_base_local, io)?;
+    Ok(BranchState {
+        original,
+        new: Some(new),
+    })
 }
 
 /// Plan revision-dependency child options oldest-first (the planning
@@ -6229,9 +6218,8 @@ fn load_bundle_with_reauth(
 ) -> Result<LoadedBundle, String> {
     match load_bundle(source, options, io, call_option) {
         Err(error) if is_invalid_session_error(&error) => {
-            let Some(call) = call_option else {
-                return Err(error); // LCOV_EXCL_LINE // Reason: dead arm; session errors arise only from conduit calls, which require call=Some
-            };
+            let call = call_option
+                .expect("session errors arise only from conduit calls, which require call=Some");
             reauthenticate_patch_conduit(call)?;
             load_bundle(source, options, io, call_option)
         }

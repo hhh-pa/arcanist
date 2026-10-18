@@ -884,10 +884,12 @@ fn upload_single_path(
     temporary: bool,
 ) -> Result<(String, String), String> {
     let data = read_upload_bytes(dir, path)?;
-    let name = match dir.join(path).file_name() {
-        Some(name) => name.to_string_lossy().to_string(),
-        None => path.to_string(), // LCOV_EXCL_LINE // Reason: dead arm; a path that read successfully always has a file_name
-    };
+    let name = dir
+        .join(path)
+        .file_name()
+        .expect("a path that read successfully always has a file_name")
+        .to_string_lossy()
+        .to_string();
     let phid = upload_data(client, &name, &data, temporary)?;
     Ok((path.to_string(), phid))
 }
@@ -939,10 +941,8 @@ pub fn render_uploaded_refs_ansi(
 ) -> Result<String, String> {
     if json {
         let list: Vec<serde_json::Value> = refs.iter().map(UploadedRef::to_json).collect();
-        let mut text = match serde_json::to_string_pretty(&list) {
-            Ok(text) => text,
-            Err(error) => return Err(format!("failed to encode JSON: {error}")), // LCOV_EXCL_LINE // Reason: dead arm; to_string_pretty on a Vec<Value> cannot fail
-        };
+        let mut text = serde_json::to_string_pretty(&list)
+            .expect("to_string_pretty on a Vec<Value> cannot fail");
         text = php_escape_json_text(&text, false);
         text.push('\n');
         return Ok(text);

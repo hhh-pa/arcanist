@@ -432,9 +432,6 @@ fn property_in_statement(tree: &Tree, start: usize, end: usize) -> Option<Proper
         mods.push(i);
         i += 1;
     }
-    while i < end && !is_semantic(&tree.tokens[i]) {
-        i += 1; // LCOV_EXCL_START // Reason: dead: the modifier loop already skips trivia, so this never advances
-    } // LCOV_EXCL_STOP
     if i < end && tree.tokens[i].kind == kinds::T_VARIABLE {
         Some(PropertyDecl {
             modifiers: mods,
@@ -605,7 +602,7 @@ fn qualified_name_start(tree: &Tree, mut start: usize) -> usize {
             break;
         }
         let Some(name) = tree.prev_semantic(prev) else {
-            break; // LCOV_EXCL_LINE // Reason: dead: token 0 is the open tag or inline HTML, never a separator
+            unreachable!("token 0 is the open tag or inline HTML, never a separator")
         };
         if tree.tokens[name].kind != kinds::T_STRING {
             break;
@@ -677,7 +674,9 @@ fn rule_useless_override(tree: &Tree, blocks: &[Block], out: &mut Vec<RawFinding
             continue;
         }
         let Some(name) = block.name.as_deref() else {
-            continue; // LCOV_EXCL_LINE // Reason: dead: the parser anonymizes nameless functions, so methods here are always named
+            unreachable!(
+                "the parser anonymizes nameless functions, so methods here are always named"
+            )
         };
         if useless_override_body(tree, block, name) {
             push(

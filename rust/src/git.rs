@@ -1223,9 +1223,6 @@ pub fn parse_porcelain_v2_status(stdout: &[u8]) -> BTreeMap<String, u32> {
         };
         let mask = porcelain_entry_mask(&fields);
         if head[0] == "2" {
-            if rest.is_empty() {
-                continue; // LCOV_EXCL_LINE // Reason: dead: the loop guard guarantees a following part, so rest is never empty here
-            }
             let orig = String::from_utf8_lossy(rest[0]).into_owned();
             rest = &rest[1..];
             let current = result.get(&path).copied().unwrap_or(0) | mask;

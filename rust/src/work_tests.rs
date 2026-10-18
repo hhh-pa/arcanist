@@ -2194,3 +2194,14 @@ fn empty_conduit_data_companion_returns_the_canned_payload() {
         serde_json::json!({"data": []})
     );
 }
+// -( T1176 S12: dead-arm coverage )------------------------------------------
+
+#[test]
+fn conduit_unavailable_pill_companion_reports_the_canned_error() {
+    // The poison-pill conduit caller keeps failing closed with the
+    // byte-identical message the dispatch callers propagate.
+    assert_eq!(
+        conduit_unavailable_pill("m", &serde_json::json!({})).unwrap_err(),
+        "conduit unavailable"
+    );
+}

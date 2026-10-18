@@ -1957,9 +1957,6 @@ fn array_entry_key(tree: &Tree, first: usize, last: usize) -> Option<(String, us
         last + 1,
         kinds::T_DOUBLE_ARROW,
     )?;
-    if arrow == 0 {
-        return None; // LCOV_EXCL_LINE // Reason: dead: entries start after an opener, so a found arrow is never at index 0
-    }
     let (kfirst, klast) = trim_semantic(tree, first, arrow - 1)?;
     key_group(tree, kfirst, klast).map(|key| (key, kfirst))
 }

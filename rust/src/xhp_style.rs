@@ -1526,9 +1526,10 @@ fn rule_decl_parens(ctx: &RuleCtx, out: &mut Vec<RawFinding>) {
         if block.kind != BlockKind::Function {
             continue;
         }
-        let (Some(lparen), rparen) = (block.lparen, block.rparen) else {
-            continue; // LCOV_EXCL_LINE // Reason: dead: parse_function returns None without `(`, so Function blocks always carry lparen
-        };
+        let lparen = block.lparen.expect(
+            "parse_function returns None without `(`, so Function blocks always carry lparen",
+        );
+        let rparen = block.rparen;
         decl_paren_leading(tree, block, lparen, out);
         if let Some(rparen) = rparen {
             decl_paren_trailing(tree, lparen, rparen, out);
@@ -1744,9 +1745,9 @@ fn self_parent_casing(tree: &Tree, out: &mut Vec<RawFinding>) {
         if !ranges.iter().any(|(s, e)| i > *s && i < *e) {
             continue;
         }
-        let Some(name) = tree.prev_semantic(i) else {
-            continue; // LCOV_EXCL_LINE // Reason: dead: the class brace precedes i, so prev always exists
-        };
+        let name = tree
+            .prev_semantic(i)
+            .expect("the class brace precedes i, so prev always exists");
         if tree.tokens[name].kind != kinds::T_STRING {
             continue;
         }

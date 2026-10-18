@@ -222,10 +222,10 @@ pub fn walk_to_root(path: &str, stop: &str) -> Vec<String> {
         if current == stop {
             break;
         }
-        match current.rfind('/') {
-            Some(i) => current = current[..i].to_string(),
-            None => break, // LCOV_EXCL_LINE // Reason: dead: slashless current either equals stop or is not a descendant, both break above
-        }
+        let i = current.rfind('/').expect(
+            "slashless current either equals stop or is not a descendant, both break above",
+        );
+        current = current[..i].to_string();
         if current.is_empty() {
             break;
         }
