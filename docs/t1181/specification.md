@@ -60,4 +60,8 @@ was verified available (registry API 404). Ref T1176 (close comment).
   Jenkinsfile/`.arclint` in this repo. One `scripts/ci` change: the
   gate-image warm layer stubs `src/lib.rs` too, because the manifest's
   new explicit `[lib]` makes the lib target mandatory (autodetect used
-  to skip the missing file).
+  to skip the missing file) — and `cargo clean -p arcanist-rs` drops
+  the stub's own units from both warm target dirs afterward, because
+  cargo reads a seeded stub rlib as Fresh (missing dep-info inputs
+  don't dirty it) and integration tests then link the module-less
+  stub (E0432); dependencies stay prebuilt.

@@ -62,6 +62,12 @@ RUN mkdir -p /tmp/prov-work \
 # dependencies, so every dep reports unused): only a genuine build failure
 # ("could not compile" in the log, or zero fingerprints) fails the image,
 # otherwise the log stays quiet and the verdict stays a runtime one.
+# After warming, `cargo clean -p` drops the stub's own units (rlib, bins,
+# fingerprints) from both target dirs while keeping the prebuilt
+# dependencies: cargo's freshness check ignores dep-info inputs that no
+# longer exist, so a seeded stub rlib reads as Fresh and poisons runtime
+# builds (T1181: integration tests linked the module-less stub rlib and
+# failed with E0432).
 # Registry sources stay extracted: cargo fingerprints compare mtimes, and
 # re-extraction would stale every prebuilt unit.
 ENV CARGO_TARGET_DIR=/opt/target
@@ -83,6 +89,8 @@ RUN mkdir -p /tmp/warm/rust/src && printf 'fn main() {}\n' > /tmp/warm/rust/src/
             echo "udeps warm: nightly build FAILED:"; cat "$UDEPS_LOG"; exit 1; \
         fi; \
         echo "udeps warm: nightly tree prebuilt (udeps exit $STATUS; unused-deps verdict deferred to runtime)"; } \
+    && cargo clean -p arcanist-rs \
+    && CARGO_TARGET_DIR=/opt/target/nightly cargo clean -p arcanist-rs \
     && rm -rf /tmp/warm
 
 # T1176 DEMARK: the gates run as the host uid (see the workflow's
