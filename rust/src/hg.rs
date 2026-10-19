@@ -120,56 +120,17 @@ fn command_for(dir: &Path, hg: &HgCommand, args: &[&str]) -> std::process::Comma
     cmd
 }
 
-/// Spawn `cmd`, retrying briefly on ETXTBSY ("Text file busy"). A
-/// freshly written executable can still be settling when it is spawned
-/// (parallel tests, an editor saving a hook); the error is transient by
-/// nature, so retry bounded, then return the last error unchanged.
-fn spawn_output(cmd: &mut std::process::Command) -> Result<std::process::Output, std::io::Error> {
-    spawn_output_with_limit(cmd, 50)
-}
-
-/// [`spawn_output`] with an injectable retry bound, so tests can exhaust
-/// the retries quickly instead of sleeping through all fifty.
-fn spawn_output_with_limit(
-    cmd: &mut std::process::Command,
-    max_attempts: u32,
-) -> Result<std::process::Output, std::io::Error> {
-    let mut attempt = 0;
-    loop {
-        match cmd.output() {
-            Err(error) if is_text_file_busy(&error) && attempt < max_attempts => {
-                attempt += 1;
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-            other => return other,
-        }
-    }
-}
-
-/// True for ETXTBSY (errno 26 on Linux and the BSDs, including macOS).
-/// Windows has no such spawn error.
-#[cfg(unix)]
-fn is_text_file_busy(error: &std::io::Error) -> bool {
-    error.raw_os_error() == Some(26)
-}
-
-/// True for ETXTBSY (errno 26 on Linux and the BSDs, including macOS).
-/// Windows has no such spawn error.
-#[cfg(not(unix))]
-fn is_text_file_busy(_error: &std::io::Error) -> bool {
-    false
-}
-
 /// Run `hg` in `dir`, returning the raw output. Spawn failures become
 /// errors; non-zero exit statuses are left for the caller to interpret.
 /// Mirrors `git::output`, plus the `hg` encoding prefix, `HGPLAIN`, and
-/// backend override (`ArcanistMercurialAPI.php:22-26,35-43`).
+/// backend override (`ArcanistMercurialAPI.php:22-26,35-43`). Transient
+/// ETXTBSY retries come from the shared [`crate::proc_env::spawn_output`].
 pub fn output_with(
     dir: &Path,
     hg: &HgCommand,
     args: &[&str],
 ) -> Result<std::process::Output, String> {
-    spawn_output(&mut command_for(dir, hg, args))
+    crate::proc_env::spawn_output(&mut command_for(dir, hg, args))
         .map_err(|e| format!("failed to run {}: {e}", hg.program))
 }
 

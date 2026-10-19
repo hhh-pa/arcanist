@@ -2,6 +2,8 @@
 //! engine stops and routing, argument parsing, renderers, and patching.
 
 use super::*;
+#[cfg(target_os = "linux")]
+use crate::proc_env::is_text_file_busy;
 
 fn text(path: &str, data: &[u8]) -> Vec<LintMessage> {
     TextLinter::new().lint_bytes(path, data)

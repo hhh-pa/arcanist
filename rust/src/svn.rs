@@ -110,55 +110,16 @@ fn command_for(dir: &Path, svn: &SvnCommand, args: &[&str]) -> std::process::Com
     cmd
 }
 
-/// Spawn `cmd`, retrying briefly on ETXTBSY ("Text file busy"). A
-/// freshly written executable can still be settling when it is spawned
-/// (parallel tests, an editor saving a hook); the error is transient by
-/// nature, so retry bounded, then return the last error unchanged.
-fn spawn_output(cmd: &mut std::process::Command) -> Result<std::process::Output, std::io::Error> {
-    spawn_output_retry(cmd, &is_text_file_busy)
-}
-
-/// Retry loop with an injectable busy predicate, so tests can force the
-/// ETXTBSY path where the platform never reports it (macOS, Windows).
-fn spawn_output_retry(
-    cmd: &mut std::process::Command,
-    is_busy: &dyn Fn(&std::io::Error) -> bool,
-) -> Result<std::process::Output, std::io::Error> {
-    let mut attempt = 0;
-    loop {
-        match cmd.output() {
-            Err(error) if is_busy(&error) && attempt < 50 => {
-                attempt += 1;
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-            other => return other,
-        }
-    }
-}
-
-/// True for ETXTBSY (errno 26 on Linux and the BSDs, including macOS).
-/// Windows has no such spawn error.
-#[cfg(unix)]
-fn is_text_file_busy(error: &std::io::Error) -> bool {
-    error.raw_os_error() == Some(26)
-}
-
-/// True for ETXTBSY (errno 26 on Linux and the BSDs, including macOS).
-/// Windows has no such spawn error.
-#[cfg(not(unix))]
-fn is_text_file_busy(_error: &std::io::Error) -> bool {
-    false
-}
-
 /// Run `svn` in `dir`, returning the raw output. Spawn failures become
 /// errors; non-zero exit statuses are left for the caller to interpret.
-/// Mirrors `git::output` (`ArcanistSubversionAPI.php:39-45`).
+/// Mirrors `git::output` (`ArcanistSubversionAPI.php:39-45`). Transient
+/// ETXTBSY retries come from the shared [`crate::proc_env::spawn_output`].
 pub fn output_with(
     dir: &Path,
     svn: &SvnCommand,
     args: &[&str],
 ) -> Result<std::process::Output, String> {
-    spawn_output(&mut command_for(dir, svn, args))
+    crate::proc_env::spawn_output(&mut command_for(dir, svn, args))
         .map_err(|e| format!("failed to run {}: {e}", svn.program))
 }
 
@@ -1821,7 +1782,8 @@ pub fn commit_with_locale(
     // so both inherit the terminal here; nothing is captured.
     cmd.stdout(std::process::Stdio::inherit());
     cmd.stderr(std::process::Stdio::inherit());
-    let out = spawn_output(&mut cmd).map_err(|e| format!("failed to run {}: {e}", svn.program))?;
+    let out = crate::proc_env::spawn_output(&mut cmd)
+        .map_err(|e| format!("failed to run {}: {e}", svn.program))?;
     std::fs::remove_file(&tmp).ok();
     if !out.status.success() {
         return Err(commit_failed_message());

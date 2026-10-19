@@ -7009,6 +7009,24 @@ fn t1176_pb4_commit_message_editor_trampoline() {
 /// Serve canned conduit envelopes routed by method name, for as many
 /// sequential requests as the flow makes.
 fn serve_routes(routes: std::collections::HashMap<String, String>) -> String {
+    serve_routes_with_abort_sink(routes, None)
+}
+
+/// Report one aborted stub connection down `sink`, if any (shared by
+/// the header-read and body-read abort arms below).
+fn abort_sink_send(sink: &Option<std::sync::mpsc::Sender<()>>) {
+    if let Some(sink) = sink {
+        let _ = sink.send(());
+    }
+}
+
+/// [`serve_routes`] that reports each aborted connection down `sink`
+/// (test seam: abort tests wait for the server instead of racing
+/// process exit; `None` detaches like before).
+fn serve_routes_with_abort_sink(
+    routes: std::collections::HashMap<String, String>,
+    sink: Option<std::sync::mpsc::Sender<()>>,
+) -> String {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}/", listener.local_addr().unwrap());
@@ -7021,6 +7039,7 @@ fn serve_routes(routes: std::collections::HashMap<String, String>) -> String {
             let mut byte = [0u8; 1];
             loop {
                 if stream.read_exact(&mut byte).is_err() {
+                    abort_sink_send(&sink);
                     break;
                 }
                 head.push(byte[0]);
@@ -7040,6 +7059,7 @@ fn serve_routes(routes: std::collections::HashMap<String, String>) -> String {
                 .unwrap_or(0);
             let mut body = vec![0u8; len];
             if stream.read_exact(&mut body).is_err() {
+                abort_sink_send(&sink);
                 break;
             }
             let target = head.lines().next().unwrap_or("").to_string();
@@ -7066,14 +7086,19 @@ fn stub_server_tolerates_aborted_clients() {
     // immediate close ends header reading at EOF, and headers
     // promising a body that never arrives end body reading at EOF.
     // Each stub serves one aborted client then exits its loop.
-    let base = serve_routes(std::collections::HashMap::new());
+    // Both stubs share one abort channel: the test waits for both
+    // reports, so it cannot return (and nextest cannot exit the
+    // test process) before the detached server threads ran —
+    // receipt is the assertion that each abort was tolerated.
+    let (sink, aborted) = std::sync::mpsc::channel();
+    let base = serve_routes_with_abort_sink(std::collections::HashMap::new(), Some(sink.clone()));
     let addr = base
         .strip_prefix("http://")
         .and_then(|s| s.strip_suffix('/'))
         .unwrap()
         .to_string();
     drop(std::net::TcpStream::connect(&addr).unwrap());
-    let base = serve_routes(std::collections::HashMap::new());
+    let base = serve_routes_with_abort_sink(std::collections::HashMap::new(), Some(sink));
     let addr = base
         .strip_prefix("http://")
         .and_then(|s| s.strip_suffix('/'))
@@ -7085,6 +7110,14 @@ fn stub_server_tolerates_aborted_clients() {
         .write_all(b"POST /api/x HTTP/1.1\r\nContent-Length: 100\r\n\r\n")
         .unwrap();
     drop(stream);
+    // Order-free: either stub's server may report first.
+    let wait = std::time::Duration::from_secs(30);
+    aborted
+        .recv_timeout(wait)
+        .expect("first aborted connection observed");
+    aborted
+        .recv_timeout(wait)
+        .expect("second aborted connection observed");
 }
 
 /// Drive one dependency child through the real flow against a loopback

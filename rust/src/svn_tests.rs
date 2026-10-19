@@ -1,4 +1,5 @@
 use super::*;
+use crate::proc_env::spawn_output_retry;
 use std::path::PathBuf;
 
 /// Controlled dir plus a fake `svn` backend; removed on drop.
