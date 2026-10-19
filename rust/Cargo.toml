@@ -1,5 +1,5 @@
 [package]
-name = "arc-rs"
+name = "arcanist-rs"
 version = "0.3.0"
 edition = "2024"
 description = "Rust port of Arcanist (arc)"
@@ -8,6 +8,12 @@ homepage = "https://github.com/hhh-pa/arcanist"
 repository = "https://github.com/hhh-pa/arcanist"
 keywords = ["arcanist", "phabricator", "cli"]
 autobins = false
+
+# T1181: the lib keeps its historical `arc_rs` target name so the
+# package rename needs no source changes (73 files use `arc_rs::`).
+[lib]
+name = "arc_rs"
+path = "src/lib.rs"
 
 [[bin]]
 name = "arc"

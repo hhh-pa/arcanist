@@ -1,6 +1,6 @@
-# arc-rs — Arcanist in Rust
+# arcanist-rs — Arcanist in Rust
 
-`arc-rs` is a full-state Rust port of [Arcanist](http://phabricator.org),
+`arcanist-rs` is a full-state Rust port of [Arcanist](http://phabricator.org),
 the command-line tool for Phabricator. One static binary, no PHP runtime:
 it sends code for review, downloads patches, transfers files, shows
 status, makes API calls, and everything else `arc` does. Behavior —
@@ -17,13 +17,19 @@ cargo build --release
 ./target/release/arc --help
 ```
 
-The shipped binary is named `arc` (the cargo package stays `arc-rs`).
+The shipped binary is named `arc` (the cargo package is `arcanist-rs`).
 
 ## Install to PATH
 
 Prebuilt binaries for Linux, macOS, and Windows are attached to each
 [GitHub release](https://github.com/hhh-pa/arcanist/releases): download
 `arc-<target>.tar.gz`, unpack it, and put `arc` on your `PATH`.
+
+Or from the crates.io registry:
+
+```sh
+cargo install arcanist-rs
+```
 
 Or build from source. From the repository root:
 
