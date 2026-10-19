@@ -57,4 +57,7 @@ was verified available (registry API 404). Ref T1176 (close comment).
   `cargo publish --dry-run`, the existing `cargo install smoke` CI job
   (path-based, unaffected), and the post-publish registry install probe.
 - **CI impact:** no `.github/workflows` changes needed; no
-  Jenkinsfile/`.arclint` in this repo.
+  Jenkinsfile/`.arclint` in this repo. One `scripts/ci` change: the
+  gate-image warm layer stubs `src/lib.rs` too, because the manifest's
+  new explicit `[lib]` makes the lib target mandatory (autodetect used
+  to skip the missing file).

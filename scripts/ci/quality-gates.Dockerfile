@@ -47,14 +47,17 @@ RUN mkdir -p /tmp/prov-work \
     && rm -rf /tmp/prov-work /tmp/gates-bin /usr/local/cargo/registry
 
 # Prebuilt dependency tree ("builder" layer): compiling the workspace's
-# dependencies once here means gate runs rebuild arc-rs itself only.
+# dependencies once here means gate runs rebuild arcanist-rs itself only.
 # CARGO_TARGET_DIR lives outside the /work mount so the prebuilt tree
 # survives it; the gates script already honors CARGO_TARGET_DIR, and its
 # llvm-cov seed copies this debug tree so coverage deps stay fresh too.
 # The nightly udeps tree warms with the script's exact command and target
-# dir (pin extracted from the script: no drift). The warm stub must COMPILE
-# as a normal bin: an empty main.rs passes `cargo test --no-run` (the test
-# harness supplies main) but fails udeps with E0601, hence `fn main() {}`.
+# dir (pin extracted from the script: no drift). The warm stubs must COMPILE
+# as the manifest's real targets: an empty main.rs passes `cargo test
+# --no-run` (the test harness supplies main) but fails udeps with E0601,
+# hence `fn main() {}` — and the manifest's explicit `[lib]` requires a
+# stub lib.rs too (autodetect would skip a missing one, an explicit
+# `[lib]` path is mandatory).
 # A nonzero udeps exit on the stub is EXPECTED (the stub uses no
 # dependencies, so every dep reports unused): only a genuine build failure
 # ("could not compile" in the log, or zero fingerprints) fails the image,
@@ -65,6 +68,7 @@ ENV CARGO_TARGET_DIR=/opt/target
 COPY rust/Cargo.toml rust/Cargo.lock /tmp/warm/rust/
 COPY scripts/ci/go/cmd/rust-quality-gates/main.go /tmp/warm/pins.go
 RUN mkdir -p /tmp/warm/rust/src && printf 'fn main() {}\n' > /tmp/warm/rust/src/main.rs \
+    && printf '// warm stub for the explicit [lib] target\n' > /tmp/warm/rust/src/lib.rs \
     && cd /tmp/warm/rust && cargo fetch \
     && cargo test --no-run \
     && NIGHTLY=$(grep -E '^\s*UDEPSNightly = ' /tmp/warm/pins.go | cut -d'"' -f2) \
