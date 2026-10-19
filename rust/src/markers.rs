@@ -496,10 +496,12 @@ pub fn query_git_remotes(dir: &Path) -> Result<Vec<RemoteRef>, String> {
         .collect())
 }
 
-/// The bundled `arc-hg` extension (`support/hg/arc-hg.py`), compiled in
-/// so Mercurial calls always pass a script path like PHP
+/// The bundled `arc-hg` extension (`rust/support/hg/arc-hg.py`),
+/// compiled in so Mercurial calls always pass a script path like PHP
 /// (`getMercurialExtensionArguments`), even outside a source checkout.
-const ARC_HG_BUNDLED: &str = include_str!("../../support/hg/arc-hg.py");
+/// The script lives inside the crate root so `cargo package` ships it
+/// (T1181: `include_str!` cannot reach outside the package).
+const ARC_HG_BUNDLED: &str = include_str!("../support/hg/arc-hg.py");
 
 /// FNV-1a over the bundled script: a stable content tag for the
 /// materialized copy's file name.
@@ -550,10 +552,12 @@ fn adopt_installed_copy(target: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Locate the `arc-hg` extension script: `ARC_HG_EXTENSION` first, then an
-/// upward `support/hg/arc-hg.py` search from `dir`, then the bundled
-/// copy (T1153 LAND-25: PHP always passes its bundled script path, so
-/// the query never runs bare on user configuration alone).
+/// Locate the `arc-hg` extension script: `ARC_HG_EXTENSION` first, then
+/// an upward checkout search from `dir` (the legacy
+/// `support/hg/arc-hg.py` layout, then the crate-local
+/// `rust/support/hg/arc-hg.py` layout), then the bundled copy (T1153
+/// LAND-25: PHP always passes its bundled script path, so the query
+/// never runs bare on user configuration alone).
 #[must_use]
 pub fn arc_hg_script(dir: &Path) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("ARC_HG_EXTENSION") {
@@ -562,14 +566,28 @@ pub fn arc_hg_script(dir: &Path) -> Option<PathBuf> {
             return Some(path);
         }
     }
-    if let Some(found) = dir
-        .ancestors()
-        .map(|dir| dir.join("support").join("hg").join("arc-hg.py"))
-        .find(|path| path.is_file())
-    {
+    if let Some(found) = find_checkout_script(dir, &[]) {
+        return Some(found);
+    }
+    if let Some(found) = find_checkout_script(dir, &["rust"]) {
         return Some(found);
     }
     materialize_bundled_arc_hg()
+}
+
+/// Upward search for `arc-hg.py` under one checkout layout: each
+/// ancestor's `<prefix>/support/hg/arc-hg.py` (`prefix` empty is the
+/// legacy repo-root layout; `["rust"]` is the crate-local layout).
+fn find_checkout_script(dir: &Path, prefix: &[&str]) -> Option<PathBuf> {
+    dir.ancestors()
+        .map(|dir| {
+            let mut path = dir.to_path_buf();
+            for segment in prefix {
+                path = path.join(segment);
+            }
+            path.join("support").join("hg").join("arc-hg.py")
+        })
+        .find(|path| path.is_file())
 }
 
 /// PHP `empty()` truthiness for `hg arc-ls-markers` flags.

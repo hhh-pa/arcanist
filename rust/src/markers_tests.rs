@@ -1003,6 +1003,27 @@ fn t1170_arc_hg_script_prefers_checkout_copy() {
 }
 
 #[test]
+fn t1181_arc_hg_script_finds_crate_local_layout() {
+    let root = TempDir::new("archg-rust");
+    let nested = root.path().join("a").join("b");
+    let script = root
+        .path()
+        .join("rust")
+        .join("support")
+        .join("hg")
+        .join("arc-hg.py");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+    std::fs::write(&script, "# fake arc-hg").unwrap();
+    assert_eq!(arc_hg_script(&nested), Some(script));
+    // Legacy layout still wins when both exist.
+    let legacy = root.path().join("support").join("hg").join("arc-hg.py");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::write(&legacy, "# fake legacy arc-hg").unwrap();
+    assert_eq!(arc_hg_script(&nested), Some(legacy));
+}
+
+#[test]
 fn t1170_hg_flags_treat_arrays_and_objects_like_php_empty() {
     let markers = parse_hg_ls_markers(
         r#"[
