@@ -20,7 +20,8 @@ was verified available (registry API 404). Ref T1176 (close comment).
 **Acceptance criteria:**
 
 - `[package] name` is `arcanist-rs`; `cargo publish --dry-run` succeeds.
-- No Rust source file changes: the lib target keeps the name `arc_rs`.
+- The lib target keeps the name `arc_rs` (no `arc_rs::` churn); the only
+  source change is the `arc-hg.py` relocation below, with tests.
 - `cargo install arcanist-rs` from the registry into an empty `CARGO_HOME`
   succeeds and the installed `arc --version` works (verified post-publish).
 - Full local gates green (fmt, clippy `-D warnings`, tests, geiger
@@ -33,6 +34,15 @@ was verified available (registry API 404). Ref T1176 (close comment).
   `arc_rs::`; the default lib name would otherwise follow the package).
   `[[bin]] name = "arc"` unchanged. Refresh `rust/Cargo.lock` via a
   normal build (root entry only).
+- **`arc-hg.py` relocation (dry-run finding):** `markers.rs` bundles the
+  script via `include_str!("../../support/hg/arc-hg.py")`, which escapes
+  the crate root and fails `cargo package` verification (the only such
+  escape in the tree). Move it to `rust/support/hg/arc-hg.py`, repoint
+  the `include_str!`, and extend the upward checkout search to try the
+  legacy `support/` layout first and the crate-local `rust/support/`
+  layout second (same bytes either way; legacy wins on ties). Covered
+  by a new `markers_tests.rs` test for the crate-local layout plus
+  tie precedence.
 - **Docs:** root `README.md` + `rust/README.md` install sections gain the
   registry install line; the "package stays `arc-rs`" note is updated.
   Update live `arc-rs` references (fixture comment, audit comment).
