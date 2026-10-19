@@ -48,10 +48,8 @@ pub(crate) fn output_with_git(
         Some(program) => crate::proc_env::command(program),
         None => crate::proc_env::command("git"),
     };
-    cmd.current_dir(dir)
-        .args(args)
-        .output()
-        .map_err(|e| format!("failed to run git: {e}"))
+    cmd.current_dir(dir).args(args);
+    crate::proc_env::spawn_output(&mut cmd).map_err(|e| format!("failed to run git: {e}"))
 }
 
 /// Run git in `dir`, returning trimmed stdout, or the combined trimmed

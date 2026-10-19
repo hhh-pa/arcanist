@@ -1,4 +1,9 @@
 use super::*;
+use crate::proc_env::is_text_file_busy;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::proc_env::spawn_output;
+#[cfg(target_os = "linux")]
+use crate::proc_env::spawn_output_with_limit;
 use std::path::{Path, PathBuf};
 
 struct TempDir {

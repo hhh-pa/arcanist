@@ -1060,6 +1060,41 @@ fn git_2_0_skips_config_fallback_after_ls_remote_miss() {
     );
 }
 
+// -( T1183: shared ETXTBSY spawn retry )-------------------------------------------
+
+/// The `git` seam rides through transient ETXTBSY via the shared
+/// [`crate::proc_env::spawn_output`] (Linux-only: only Linux reports
+/// ETXTBSY for a held write handle — see the `hg` retry tests).
+#[cfg(target_os = "linux")]
+#[test]
+fn output_with_git_retries_txtbsy_to_success() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new("git-etxtbsy-retry");
+    let fake = tmp.path().join("git");
+    std::fs::write(&fake, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let held = std::fs::OpenOptions::new().write(true).open(&fake).unwrap();
+    // Probe: Linux must report ETXTBSY while the write handle is held;
+    // fail loud instead of passing without covering the retry arm.
+    let err = std::process::Command::new(&fake)
+        .output()
+        .expect_err("expected ETXTBSY probe failure");
+    assert!(
+        crate::proc_env::is_text_file_busy(&err),
+        "expected ETXTBSY, got {err:?}"
+    );
+    // Release after 50ms; the retry loop must ride through to success.
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(held);
+        });
+        let out = output_with_git(tmp.path(), &["--version"], Some(&fake))
+            .expect("retry must succeed after the write handle releases");
+        assert!(out.status.success());
+    });
+}
+
 // -( T1176 PB-5: stdin-write classifier )---------------------------------------
 
 #[test]
