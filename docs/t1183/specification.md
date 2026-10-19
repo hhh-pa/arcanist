@@ -49,15 +49,22 @@ tests and root-cause retries, no behavior change.
   `recv_timeout`s (30s) twice — receipt proves execution, converting the
   race into a functional assertion. No platform specifics (loopback TCP
   + channel).
-- **Shared spawn retry:** move `spawn_output` / `spawn_output_with_limit`
-  / `is_text_file_busy` from `hg.rs` to `proc_env.rs` (the documented
-  shared choke point: "every spawn site builds its `Command` here");
-  `hg::output_with` and `git::output_with_git` (the only direct
-  `.output()` in `git.rs`, covering all 37 wrapper uses) both call it.
-  Net deletion in `hg.rs`. Existing `hg_tests.rs` retry tests stay in
-  place, retargeted at `crate::proc_env::` paths; add one `git_tests.rs`
-  test (Linux-only, held-write-handle + 50ms release, mirroring the hg
-  transient-success test) proving `output_with_git` rides through.
+- **Shared spawn retry:** consolidate the three identical ETXTBSY retry
+  loops (`hg`, `lint`, `svn`) into `proc_env.rs` (the documented shared
+  choke point: "every spawn site builds its `Command` here"), and adopt
+  it in `git` (which has none — the observed flakes): one core plus
+  `spawn_output` /
+  `spawn_output_with_limit` (injectable bound, from `hg`) /
+  `spawn_output_retry` (injectable predicate, from `svn`) wrappers so
+  every existing test seam keeps working. `hg`/`svn`/`lint` delete
+  their copies (net deletion; `lint::spawn_with_retry` stays as the
+  public choke point delegating to shared code); `git::output_with_git`
+  (the only direct `.output()` in `git.rs`, covering all 37 wrapper
+  uses) adopts it — this fixes the observed git-seam flakes.
+  Existing retry tests stay in place, retargeted at `crate::proc_env::`
+  paths; add one `git_tests.rs` test (Linux-only, held-write-handle +
+  50ms release, mirroring the hg transient-success test) proving
+  `output_with_git` rides through.
 - **Evaluated and rejected:** fail-closed version detection (user-visible
   behavior change with unknown PHP parity; retries remove the observed
   root cause instead); `svn`-seam retry (no observed flakes — same
