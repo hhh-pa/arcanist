@@ -948,11 +948,47 @@ fn find_command_ci_matches_case_insensitively() {
 }
 
 #[test]
-fn strip_standard_handles_dash_and_valued_flags() {
-    // Any single dash requests help (PHP accepts help flags anywhere).
+fn t1191_strip_standard_passes_workflow_short_flags_through() {
+    // Only `-h` is global help; every other single-dash token belongs
+    // to the workflow (`diff -m`/`-F`/`-a`, `-V`, ...).
+    for flag in ["-m", "-a", "-F", "-x", "-V", "-help"] {
+        let mut globals = Globals::default();
+        assert_eq!(
+            strip_standard(&args(&["diff", flag, "value"]), &mut globals).unwrap(),
+            args(&["diff", flag, "value"]),
+            "{flag} must reach the workflow"
+        );
+        assert!(!globals.show_help, "{flag} must not request help");
+    }
+    // `-h` (and only `-h`) still requests help from anywhere.
     let mut globals = Globals::default();
     assert_eq!(
-        strip_standard(&args(&["-x", "diff"]), &mut globals).unwrap(),
+        strip_standard(&args(&["diff", "-h"]), &mut globals).unwrap(),
+        args(&["diff"])
+    );
+    assert!(globals.show_help);
+    // End to end (without conduit): the stripped `diff --update 1 -m x`
+    // argv parses as an update with a message.
+    let (rest, globals) = strip_globals(&args(&["diff", "--update", "1", "-m", "x"])).unwrap();
+    assert!(!globals.show_help);
+    let options = diff::parse_options(&rest[1..]).unwrap().unwrap();
+    assert_eq!(options.update.as_deref(), Some("1"));
+    assert_eq!(options.message.as_deref(), Some("x"));
+    // `arc -V` reaches the version action again (strip used to eat it).
+    let (rest, globals) = strip_globals(&args(&["-V"])).unwrap();
+    assert!(!globals.show_help);
+    assert_eq!(classify(&rest), Action::Version);
+}
+
+#[test]
+fn strip_standard_handles_dash_and_valued_flags() {
+    // T1191 contract correction: `-h` requests help (PHP accepts help
+    // flags anywhere); any other single dash passes through to the
+    // workflow. The old expectation (`-x` eats into help) made the
+    // port's own short flags (`diff -m`/`-F`/`-a`, `-V`) unreachable.
+    let mut globals = Globals::default();
+    assert_eq!(
+        strip_standard(&args(&["-h", "diff"]), &mut globals).unwrap(),
         args(&["diff"])
     );
     assert!(globals.show_help);

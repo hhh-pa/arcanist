@@ -401,9 +401,10 @@ fn split_flag_value(text: &str) -> (&str, Option<&str>) {
 }
 
 /// Split one argv token into its dash prefix and flag body (`None`
-/// for positionals, which the caller copies to `rest`). Any single
-/// dash prefixes `-h` (PHP's global parser accepts help flags on any
-/// workflow).
+/// for positionals, which the caller copies to `rest`). Single-dash
+/// bodies arrive uninterpreted; only `-h` is global help (claimed in
+/// `strip_standard`, since PHP accepts help flags on any workflow),
+/// and the rest pass through to workflow parsers.
 fn standard_token_kind(arg: &str) -> Option<(&str, &str)> {
     if let Some(body) = arg.strip_prefix("--") {
         Some(("--", body))
@@ -504,6 +505,14 @@ fn strip_standard(argv: &[String], globals: &mut Globals) -> Result<Vec<String>,
             continue;
         };
         let (name, inline) = split_flag_value(body);
+        if pre == "-" && name != "h" {
+            // Only `-h` is a global help flag; every other single-dash
+            // token belongs to the workflow (T1191: `diff -m`/`-F`/`-a`
+            // and `-V` were unreachable while this ate them as help).
+            rest.push(arg.clone());
+            index += 1;
+            continue;
+        }
         let canonical = if pre == "-" { "help" } else { name };
         if !is_standard_flag(canonical) {
             rest.push(arg.clone());
