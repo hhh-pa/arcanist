@@ -589,16 +589,30 @@ pub fn release_repo_for(dir: &Path) -> String {
 /// repo on the `"stable"` channel; inside checkouts the `fork`/`origin`
 /// repo on the checkout branch, which must be supported (PHP's branch
 /// rule: a dev binary built from a feature branch is never clobbered
-/// by a stable release).
+/// by a stable release). A checkout counts only when the running
+/// executable lives inside it (T1191): any other enclosing checkout
+/// (the user's project, or the arcanist sources under an installed
+/// binary) is incidental and upgrades on the stable channel instead.
 pub fn resolve_release_target(dir: &Path) -> Result<ReleaseTarget, String> {
+    let exe = std::env::current_exe().ok();
+    resolve_release_target_with(dir, exe.as_deref())
+}
+
+/// [`resolve_release_target`] with the running executable injected
+/// (test seam; production passes the resolved exe). `None` (unknown
+/// exe) treats any checkout as incidental.
+pub fn resolve_release_target_with(
+    dir: &Path,
+    exe: Option<&Path>,
+) -> Result<ReleaseTarget, String> {
     if !git::is_inside_work_tree(dir) {
-        return Ok(ReleaseTarget {
-            repo: DEFAULT_RELEASE_REPO.to_string(),
-            channel: "stable".to_string(),
-        });
+        return Ok(stable_default_target());
     }
     let root = git::stdout_text(dir, &["rev-parse", "--show-toplevel"])
         .map_err(|e| format!("failed to find the checkout root: {e}"))?;
+    if !exe_inside_checkout(exe, Path::new(&root)) {
+        return Ok(stable_default_target());
+    }
     let branch = git::stdout_text(dir, &["symbolic-ref", "--short", "HEAD"]).ok();
     match branch {
         Some(name) if APPLY_BRANCHES.contains(&name.as_str()) => Ok(ReleaseTarget {
@@ -607,6 +621,56 @@ pub fn resolve_release_target(dir: &Path) -> Result<ReleaseTarget, String> {
         }),
         other => Err(unsupported_branch_message(&root, other.as_deref())),
     }
+}
+
+/// The incidental/outside-checkout target: default repo, stable channel.
+fn stable_default_target() -> ReleaseTarget {
+    ReleaseTarget {
+        repo: DEFAULT_RELEASE_REPO.to_string(),
+        channel: "stable".to_string(),
+    }
+}
+
+/// True when the running executable lives inside the checkout `root`
+/// (the dev flow: the checkout is the software under upgrade).
+/// `None` (unknown exe) never counts as inside.
+fn exe_inside_checkout(exe: Option<&Path>, root: &Path) -> bool {
+    let Some(exe) = exe else {
+        return false;
+    };
+    checkout_contains(&canonicalized(exe), &canonicalized(root))
+}
+
+/// Resolve symlinks for prefix comparison, falling back to the raw
+/// path when the target does not exist (staged/fixture paths).
+fn canonicalized(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Component-wise prefix check, case-insensitive like the filesystem.
+#[cfg(windows)]
+fn checkout_contains(exe: &Path, root: &Path) -> bool {
+    let mut exe = exe.components();
+    let mut root = root.components();
+    loop {
+        match (exe.next(), root.next()) {
+            (_, None) => return true,
+            (None, _) => return false,
+            (Some(left), Some(right)) => {
+                if left.as_os_str().to_string_lossy().to_lowercase()
+                    != right.as_os_str().to_string_lossy().to_lowercase()
+                {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+/// Component-wise prefix check (byte-exact, like the filesystem).
+#[cfg(not(windows))]
+fn checkout_contains(exe: &Path, root: &Path) -> bool {
+    exe.starts_with(root)
 }
 
 /// Current platform tag: the Rust target triple
@@ -1422,19 +1486,20 @@ fn upgraded_line(ansi: bool) -> String {
 }
 
 /// Run the `--apply` self-update against `dir` (which only selects the
-/// release channel; the checkout itself is never modified): resolve the
-/// channel, fetch the latest release, confirm, download, verify, and
-/// atomically replace the executable. `confirm` asks the pre-upgrade
-/// question. Returns the transcript for `run` to emit; prints nothing.
+/// release channel together with the executable; the checkout itself is
+/// never modified): resolve the channel, fetch the latest release,
+/// confirm, download, verify, and atomically replace the executable.
+/// `confirm` asks the pre-upgrade question. Returns the transcript for
+/// `run` to emit; prints nothing.
 pub fn execute_apply(
     dir: &Path,
     opts: &ApplyOptions,
     confirm: &dyn Fn(&str) -> Result<bool, String>,
 ) -> Result<ApplyReport, String> {
-    let target = resolve_release_target(dir)?;
+    let exe = resolve_exe_path(opts)?;
+    let target = resolve_release_target_with(dir, Some(&exe))?;
     let release = fetch_latest_release(&opts.api_base, &target.repo)?;
     let latest = release_tag(&release)?;
-    let exe = resolve_exe_path(opts)?;
     if !is_newer(&latest, &opts.current_version) {
         return Ok(already_report(&target, &latest, opts, &exe));
     }

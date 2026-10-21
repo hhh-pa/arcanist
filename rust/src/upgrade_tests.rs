@@ -628,13 +628,17 @@ fn release_target_gates_branches() {
     assert_eq!(outside.repo, DEFAULT_RELEASE_REPO);
     assert_eq!(outside.channel, "stable");
 
+    // T1191 contract correction: the branch gate only applies to the dev
+    // flow (executable inside the checkout). A bare CWD checkout is
+    // incidental — see t1191_release_target_ignores_incidental_checkouts.
     let repo = fresh_repo("targetrepo");
     commit(&repo.path, "a.txt");
     git(
         &repo.path,
         &["remote", "add", "fork", "https://github.com/me/fork.git"],
     );
-    let master = resolve_release_target(&repo.path).unwrap();
+    let exe = exe_copy(&repo.path, "arc-dev", b"dev");
+    let master = resolve_release_target_with(&repo.path, Some(&exe)).unwrap();
     assert_eq!(
         master,
         ReleaseTarget {
@@ -644,12 +648,66 @@ fn release_target_gates_branches() {
     );
 
     git(&repo.path, &["checkout", "-q", "-b", "feature"]);
-    let err = resolve_release_target(&repo.path).unwrap_err();
+    let err = resolve_release_target_with(&repo.path, Some(&exe)).unwrap_err();
     assert!(
         err.contains("not supported for automatic upgrades"),
         "{err}"
     );
     assert!(err.contains("master, stable"), "{err}");
+}
+
+#[test]
+fn t1191_release_target_ignores_incidental_checkouts() {
+    // T1191: the CWD checkout is not the arcanist library unless the
+    // running executable lives inside it. The test binary runs outside
+    // every fixture checkout, so the wrapper must treat fixtures as
+    // incidental: stable channel + default repo on any branch.
+    let repo = fresh_repo("incidental");
+    commit(&repo.path, "a.txt");
+    git(
+        &repo.path,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/me/not-arcanist.git",
+        ],
+    );
+    let master = resolve_release_target(&repo.path).unwrap();
+    assert_eq!(master.repo, DEFAULT_RELEASE_REPO);
+    assert_eq!(master.channel, "stable");
+    git(&repo.path, &["checkout", "-q", "-b", "feature"]);
+    let feature = resolve_release_target(&repo.path).unwrap();
+    assert_eq!(feature.repo, DEFAULT_RELEASE_REPO);
+    assert_eq!(feature.channel, "stable");
+    // Unknown exe never counts as the dev flow; neither does a
+    // missing exe path (canonicalize falls back to the raw path).
+    let unknown = resolve_release_target_with(&repo.path, None).unwrap();
+    assert_eq!(unknown.repo, DEFAULT_RELEASE_REPO);
+    assert_eq!(unknown.channel, "stable");
+    let missing = std::env::temp_dir().join("t1191-no-such-exe-arc");
+    let staged = resolve_release_target_with(&repo.path, Some(&missing)).unwrap();
+    assert_eq!(staged.repo, DEFAULT_RELEASE_REPO);
+    assert_eq!(staged.channel, "stable");
+}
+
+#[test]
+#[cfg(windows)]
+fn t1191_checkout_contains_ignores_case() {
+    // Windows prefix comparison is case-insensitive but still
+    // component-wise (`Repo2` is not inside `repo`).
+    assert!(checkout_contains(
+        Path::new("C:\\Repo\\arc.exe"),
+        Path::new("c:\\repo")
+    ));
+    assert!(!checkout_contains(
+        Path::new("C:\\Repo2\\arc.exe"),
+        Path::new("c:\\repo")
+    ));
+    assert!(!checkout_contains(
+        Path::new("C:\\Other\\arc.exe"),
+        Path::new("c:\\repo")
+    ));
 }
 
 #[test]
@@ -1613,13 +1671,16 @@ fn apply_command_reports_unsupported_branches_without_network() {
         apply: true,
         yes: true,
     };
-    // Branch gating fails before any network fetch.
+    // T1191: the gate guards the dev flow (executable inside the
+    // checkout), still failing before any network fetch. An incidental
+    // checkout with an outside exe upgrades on stable instead.
+    let exe = exe_copy(&repo.path, "arc-dev", b"dev");
     assert_eq!(
         run_apply_command_with(
             &repo.path,
             &options,
             RELEASE_API_BASE,
-            None,
+            Some(&exe),
             &confirm_interactive
         ),
         ExitCode::FAILURE
