@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 use crate::get_config;
 
 pub fn arcrc_path() -> Option<PathBuf> {
+    if let Some(home) = crate::globals::test_home() {
+        return Some(home.join(".arcrc"));
+    }
     #[cfg(windows)]
     let home_src = std::env::var_os("USERPROFILE");
     #[cfg(not(windows))]

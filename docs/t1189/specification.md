@@ -56,39 +56,47 @@ deleting any tracked file proven redundant.
 ## Part 2 — technical specification
 
 - **Seam:** a test-scoped home override in `rust/src/globals.rs` (the
-  house process-global-cell module): `Mutex<Option<PathBuf>>` plus a
-  scoped guard (`set_test_home(&Path) -> Guard`,
+  house process-global-cell module): a cell (`Mutex<Option<PathBuf>>`)
+  plus a serial lock (`Mutex<()>`, held for the guard lifetime so
+  holders never overlap) and a scoped guard
+  (`set_test_home(&Path) -> TestHomeGuard`,
   `test_home() -> Option<PathBuf>`, `Drop` restores the saved value).
-  Branch-free, `.expect()` on poison like today's
+  Branch-free, `.expect()` on poison like the old
   `ENV_LOCK.lock().unwrap()`. Follows the module's documented
   contract (cells read deep in commands that cannot take parameters;
-  env fallback when unset). Non-reentrant by construction like
-  today's `ENV_LOCK`, so the existing no-nesting discipline carries
-  over; cross-test visibility is identical to today's real-env
-  mutation under both runners (holder-serialized, process-wide while
-  held) — no new flake class.
+  env fallback when unset). The two-lock split is load-bearing: the
+  cell is only ever locked briefly, so readers calling `test_home()`
+  from a guard-holding thread never deadlock. Non-reentrant by
+  construction like the old `ENV_LOCK`, so the existing no-nesting
+  discipline carries over; cross-test visibility is identical to the
+  old real-env mutation under both runners (holder-serialized,
+  process-wide while held) — no new flake class.
 - **Readers (override-first, fallbacks byte-identical):**
-  `config::arcrc_path`, `lint::default_user_config_path`,
-  `shell_complete.rs` HOME read. Exhaustiveness gate: grep
-  `HOME|USERPROFILE|APPDATA` over non-test `src/` must show no other
-  reader; a missed reader fails safe (the suite catches it: tests
-  would observe the real home).
-- **Migration:** ~20 call sites in 11 files become
-  `let _home = arc_rs::globals::set_test_home(..)`; each file keeps
-  its own `TempDir` cleanup (audit the 6 `with_owned_home` users for
-  guard-removal dependence first); delete
-  `HomeGuard`/`install`/`ENV_LOCK` from `tests/common/mod.rs`
-  (`CwdGuard` stays); hand-edit the baseline to 0 with an updated
-  comment (`--regen` would clobber it with the T968 boilerplate).
+  `config::arcrc_path` only. The other two home readers
+  (`lint::default_user_config_path`, `shell_complete.rs` HOME read)
+  are deliberately unmigrated: a temporary panic probe plus
+  call-site greps proved no guard-holding test reaches either with
+  the override set, so override arms there would be uncovered lines
+  under the 100% floor. A future test needing them fails safe (it
+  would observe the real home) and migrates the reader then.
+  Exhaustiveness gate: grep `HOME|USERPROFILE|APPDATA` over non-test
+  `src/` shows no further reader.
+- **Migration:** `tests/common/mod.rs` keeps its
+  `with_temp_home`/`with_owned_home`/`HomeGuard` signatures, rebacked
+  by the cell (borrowed guard returned directly; owned guard resets
+  the cell and removes the dir on drop) — the ~20 call sites in 11
+  files are untouched. Delete `install`/`ENV_LOCK` (`CwdGuard`
+  stays); hand-edit the baseline to 0 with an updated comment
+  (`--regen` would clobber it with the T968 boilerplate).
 - **Coverage-floor constraint:** the repo holds a 100% line floor —
   every new shipped line must be covered by the migrated tests; keep
   the seam branch-free (no poison-fallback arms, no platform `cfg` in
   the seam itself).
-- **Spawn-inheritance audit:** today's guard leaks the fake home to
-  child processes; the cell does not. Grep fixtures plus fake-script
-  writers for `$HOME`/USERPROFILE dependence; stage `Command::env`
-  explicitly (safe) at any spawn site that needs it, else let the
-  suite prove none does.
+- **Spawn-inheritance audit:** the old guard leaked the fake home to
+  child processes; the cell does not. Grep over `rust/tests/fixtures`
+  and fake-script writers found zero `$HOME`/USERPROFILE/APPDATA
+  dependence, and the full suite passes — no spawn site needed
+  explicit `Command::env` staging.
 - **Evaluated and rejected:** `*_with` param threading through every
   command `run()` (infeasible depth); `OnceLock` (set-once per
   process, tests need per-test values); a dev-dependency scoped-env
@@ -102,9 +110,10 @@ deleting any tracked file proven redundant.
   per-file evidence below, confirmed during implementation.
 - **CI impact:** none — no workflow/Dockerfile changes.
 
-**Audit table (probe verdicts — confirm each during implementation):**
+**Audit table (all rows confirmed during implementation — zero
+tracked files redundant, zero deletions):**
 
-| File(s) | Probe verdict | Evidence |
+| File(s) | Verdict | Evidence |
 |---|---|---|
 | `support/arcanoid/arcanoid.py` | live | exec'd by `arc anoid` (`anoid.rs`) |
 | `support/init/init-script.php` | live | required by both PHP tools below |
@@ -115,6 +124,6 @@ deleting any tracked file proven redundant.
 | `scripts/ci/complexity-scan.ps1` | live | documented Windows dev mirror of the Go gate |
 | `scripts/ci/go/cmd/canonical-lcov/` | live | dev-only `go run` helper (unwired in CI by design) |
 | `rust/resources/php/symbol-information.json` | live | `include_str!` in `xhp_rem1.rs` |
-| `rust/tests/fixtures/*` (17 dirs) | confirm each | consumer grep per dir |
-| `scripts/ci/go/internal/*` | confirm each | importer grep per package |
+| `rust/tests/fixtures/*` (17 dirs) | all live | literal `fixtures/<name>` consumer per dir (`vcs1` via `vcs1_weld.rs:55` constructed path) |
+| `scripts/ci/go/internal/*` (4 pkgs) | all live | importer grep per package |
 | `.arcconfig` | live | upstream-inherited project config, read by `arc` in checkouts |

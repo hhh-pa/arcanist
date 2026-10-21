@@ -9,7 +9,9 @@
 //! the safe `std::env::var` path.
 //!
 //! Setters are `main`-only (binary entry + dispatch). They ignore
-//! repeat sets: `main` runs once per process.
+//! repeat sets: `main` runs once per process. The one exception is
+//! the test-home cell below: tests-only, scoped per fake home (a
+//! set-once cell cannot vary per test).
 
 use std::sync::OnceLock;
 
@@ -129,4 +131,49 @@ pub fn load_options() -> Option<String> {
 #[must_use]
 pub fn command_name() -> Option<String> {
     COMMAND_NAME.get().cloned()
+}
+
+static TEST_HOME_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static TEST_HOME: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+/// Scoped test-home override, restoring the previous value on drop
+/// (panic-safe). Integration tests hold one per fake home instead of
+/// mutating the process environment (`std::env::set_var` is `unsafe`
+/// in edition 2024); home-derived readers consult [`test_home`]
+/// first and fall back to the environment when unset, so production
+/// (which never sets this) behaves exactly as before. The serial
+/// lock is held for the guard lifetime (holders never overlap); the
+/// cell itself is only locked briefly, so readers never deadlock.
+/// Non-reentrant like the `Mutex` it stands on: a thread holding a
+/// guard must not set the override again. Cross-test visibility
+/// matches the old real-env mutation (holder-serialized,
+/// process-wide while held).
+pub struct TestHomeGuard {
+    saved: Option<std::path::PathBuf>,
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+/// Point home-derived paths at `home` until the returned guard drops
+/// (tests only — see [`TestHomeGuard`]).
+pub fn set_test_home(home: &std::path::Path) -> TestHomeGuard {
+    let serial = TEST_HOME_SERIAL.lock().expect("test-home lock");
+    let mut slot = TEST_HOME.lock().expect("test-home lock");
+    let saved = slot.replace(home.to_path_buf());
+    TestHomeGuard {
+        saved,
+        _serial: serial,
+    }
+}
+
+/// The test-home override while a [`TestHomeGuard`] is held, else
+/// `None` (readers fall back to the environment).
+#[must_use]
+pub fn test_home() -> Option<std::path::PathBuf> {
+    TEST_HOME.lock().expect("test-home lock").clone()
+}
+
+impl Drop for TestHomeGuard {
+    fn drop(&mut self) {
+        *TEST_HOME.lock().expect("test-home lock") = self.saved.take();
+    }
 }
