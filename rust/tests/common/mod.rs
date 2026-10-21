@@ -1,55 +1,36 @@
-//! Shared integration-test helpers: a process-serialized HOME/USERPROFILE
-//! override. This is the only place in the workspace that mutates the
-//! process environment (unsafe in edition 2024), keeping the geiger
-//! baseline minimal.
+//! Shared integration-test helpers: fake homes through the
+//! `globals::set_test_home` cell (no process-environment mutation,
+//! so no `unsafe`), plus a working-directory guard.
 
 use std::path::{Path, PathBuf};
 
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Restores saved HOME/USERPROFILE on drop; removes the dir when owned.
+/// Owned-home guard: resets the test-home override and removes the
+/// dir on drop.
 pub struct HomeGuard {
-    owned: Option<PathBuf>,
-    saved_home: Option<std::ffi::OsString>,
-    saved_profile: Option<std::ffi::OsString>,
-    _lock: std::sync::MutexGuard<'static, ()>,
+    _cell: arc_rs::globals::TestHomeGuard,
+    owned: PathBuf,
 }
 
-fn install(home: &Path, owned: bool) -> HomeGuard {
-    let lock = ENV_LOCK.lock().unwrap();
-    let saved_home = std::env::var_os("HOME");
-    let saved_profile = std::env::var_os("USERPROFILE");
-    // SAFETY: the process-wide lock serializes every env mutation and
-    // read in this test binary, so no other thread can observe a
-    // half-updated environment.
-    unsafe {
-        std::env::set_var("HOME", home);
-        std::env::set_var("USERPROFILE", home);
-    }
-    HomeGuard {
-        owned: owned.then(|| home.to_path_buf()),
-        saved_home,
-        saved_profile,
-        _lock: lock,
-    }
-}
-
-/// Point HOME/USERPROFILE at `dir` (borrowed, left in place).
+/// Point home-derived paths at `dir` (borrowed, left in place).
 #[allow(
     dead_code,
     reason = "shared helper; each test binary uses one constructor"
 )]
-pub fn with_temp_home(dir: &Path) -> HomeGuard {
-    install(dir, false)
+pub fn with_temp_home(dir: &Path) -> arc_rs::globals::TestHomeGuard {
+    arc_rs::globals::set_test_home(dir)
 }
 
-/// Point HOME/USERPROFILE at `home`, removing it on drop.
+/// Point home-derived paths at `home`, removing it on drop.
 #[allow(
     dead_code,
     reason = "shared helper; each test binary uses one constructor"
 )]
 pub fn with_owned_home(home: PathBuf) -> HomeGuard {
-    install(&home, true)
+    let cell = arc_rs::globals::set_test_home(&home);
+    HomeGuard {
+        _cell: cell,
+        owned: home,
+    }
 }
 
 #[allow(dead_code, reason = "shared helper; only CWD-pinning binaries use it")]
@@ -61,10 +42,11 @@ static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// and every sibling was audited CWD-immune (absolute dirs, explicit
 /// `.current_dir` on spawns) as of T1176. Any future CWD-dependent
 /// test must go through [`with_current_dir`]. Only land_workflow's
-/// contract test holds both this and `ENV_LOCK`, always CWD-then-ENV
-/// (guard declared first), and no other test holds both — so no lock
-/// order can invert. The locks stay separate: sharing `ENV_LOCK` would
-/// self-deadlock that test (`Mutex` is not reentrant).
+/// contract test holds both this and the test-home guard, always
+/// CWD-then-home (guard declared first), and no other test holds both
+/// — so no lock order can invert. The locks stay separate: sharing
+/// the home cell's serial lock would self-deadlock that test (`Mutex`
+/// is not reentrant).
 #[allow(dead_code, reason = "shared helper; only CWD-pinning binaries use it")]
 pub struct CwdGuard {
     saved: PathBuf,
@@ -89,19 +71,6 @@ impl Drop for CwdGuard {
 
 impl Drop for HomeGuard {
     fn drop(&mut self) {
-        // SAFETY: still holding the process-wide env lock.
-        unsafe {
-            match &self.saved_home {
-                Some(value) => std::env::set_var("HOME", value),
-                None => std::env::remove_var("HOME"),
-            }
-            match &self.saved_profile {
-                Some(value) => std::env::set_var("USERPROFILE", value),
-                None => std::env::remove_var("USERPROFILE"),
-            }
-        }
-        if let Some(owned) = &self.owned {
-            std::fs::remove_dir_all(owned).ok();
-        }
+        std::fs::remove_dir_all(&self.owned).ok();
     }
 }
