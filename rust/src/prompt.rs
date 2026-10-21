@@ -49,10 +49,20 @@ pub fn prompt_text(prompt: &str) -> String {
 /// Read one answer line (`None` on EOF/error), like `rtrim($response)`.
 pub fn read_answer(input: &mut dyn BufRead) -> Option<String> {
     std::io::stdout().flush().ok();
+    read_answer_result(input).ok().flatten()
+}
+
+/// Read one answer line, without the trailing newline, surfacing read
+/// failures: `Ok(None)` is EOF, `Err` is a read failure. The shared core
+/// behind [`read_answer`] (which collapses errors to `None`) and the
+/// land/browse/diff prompt readers. Lines split on `\n` with a trailing
+/// `\r` trimmed, so LF-only, CRLF, and lone-CR answers all complete.
+pub fn read_answer_result(input: &mut dyn BufRead) -> Result<Option<String>, std::io::Error> {
     let mut line = String::new();
     match input.read_line(&mut line) {
-        Ok(0) | Err(_) => None,
-        Ok(_) => Some(line.trim_end_matches(['\r', '\n']).to_string()),
+        Ok(0) => Ok(None),
+        Ok(_) => Ok(Some(line.trim_end_matches(['\r', '\n']).to_string())),
+        Err(error) => Err(error),
     }
 }
 

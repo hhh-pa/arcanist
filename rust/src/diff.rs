@@ -2629,12 +2629,9 @@ pub fn prompt_confirm_from<R: std::io::BufRead, W: std::io::Write>(
         std::io::Write::write_all(writer, rendered.as_bytes())
             .map_err(|e| format!("failed to write prompt: {e}"))?;
         std::io::Write::flush(writer).map_err(|e| format!("failed to write prompt: {e}"))?;
-        let mut response = String::new();
-        let read = std::io::BufRead::read_line(reader, &mut response)
-            .map_err(|e| format!("failed to read user input: {e}"))?;
-        if read == 0 {
-            response.clear();
-        }
+        let response = crate::prompt::read_answer_result(reader)
+            .map_err(|e| format!("failed to read user input: {e}"))?
+            .unwrap_or_default();
         if let Some(answer) = interpret_confirm_answer(&response, default_no) {
             std::io::Write::write_all(writer, b"\n")
                 .map_err(|e| format!("failed to write prompt: {e}"))?;

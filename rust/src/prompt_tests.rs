@@ -271,3 +271,97 @@ fn prompt_loop_ignores_unknown_answers() {
         Ok(())
     );
 }
+
+// -( T1191 shared prompt reader )--------------------------------------------
+
+/// Always-failing `BufRead` (T1176 `FailingReader` idiom): proves error
+/// mapping where it IS read, and gate-before-read order where it must
+/// NOT be read (a read would resolve to a default instead of erroring).
+struct FailingReader;
+impl std::io::Read for FailingReader {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("boom"))
+    }
+}
+impl std::io::BufRead for FailingReader {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        Err(std::io::Error::other("boom"))
+    }
+    fn consume(&mut self, _amount: usize) {}
+}
+
+#[test]
+fn t1191_read_answer_splits_lf_and_trims_cr() {
+    // LF-only (no CR): the Windows ConPTY-injection shape — completes
+    // like any newline, never blocks.
+    let mut lf = cursor("y\n");
+    assert_eq!(prompt::read_answer(&mut lf), Some("y".to_string()));
+    // CRLF (the Enter key on every console).
+    let mut crlf = cursor("n\r\n");
+    assert_eq!(prompt::read_answer(&mut crlf), Some("n".to_string()));
+    // Lone CR at EOF and unterminated final lines still answer.
+    let mut lone_cr = cursor("y\r");
+    assert_eq!(prompt::read_answer(&mut lone_cr), Some("y".to_string()));
+    let mut bare = cursor("y");
+    assert_eq!(prompt::read_answer(&mut bare), Some("y".to_string()));
+    // An empty line answers empty (callers map it to the default);
+    // EOF answers None.
+    let mut empty_line = cursor("\n");
+    assert_eq!(prompt::read_answer(&mut empty_line), Some(String::new()));
+    let mut eof = cursor("");
+    assert_eq!(prompt::read_answer(&mut eof), None);
+    // Multi-line input reads one line per call.
+    let mut two = cursor("a\nb\n");
+    assert_eq!(prompt::read_answer(&mut two), Some("a".to_string()));
+    assert_eq!(prompt::read_answer(&mut two), Some("b".to_string()));
+    assert_eq!(prompt::read_answer(&mut two), None);
+    // Invalid UTF-8 fails the line read, like any read error.
+    let mut bad = std::io::Cursor::new([0xffu8, b'\n']);
+    assert_eq!(prompt::read_answer(&mut bad), None);
+}
+
+#[test]
+fn t1191_read_answer_maps_errors_to_none() {
+    assert_eq!(prompt::read_answer(&mut FailingReader), None);
+    // Supertrait stubs never run via `read_line` (it only needs
+    // `fill_buf`), so drive them directly (T1176 idiom).
+    let mut reader = FailingReader;
+    assert!(std::io::Read::read(&mut reader, &mut [0u8; 4]).is_err());
+    std::io::BufRead::consume(&mut reader, 1);
+}
+
+#[test]
+fn t1191_read_answer_result_reports_eof_and_errors() {
+    // The shared core surfaces the read outcome: lines, EOF, errors.
+    let mut lf = cursor("y\n");
+    assert_eq!(
+        prompt::read_answer_result(&mut lf).unwrap(),
+        Some("y".to_string())
+    );
+    let mut eof = cursor("");
+    assert_eq!(prompt::read_answer_result(&mut eof).unwrap(), None);
+    assert!(prompt::read_answer_result(&mut FailingReader).is_err());
+}
+
+#[test]
+fn t1191_prompts_refuse_piped_stdin_without_reading() {
+    // The not-interactive gate precedes every read: had any prompt read
+    // the failing input, the error would have resolved to a default
+    // (Ok) instead of refusing.
+    assert_eq!(
+        prompt::console_confirm_with_tty(&mut FailingReader, "Proceed?", "[y/N]", true, false),
+        Err(prompt::NOT_INTERACTIVE.to_string())
+    );
+    assert_eq!(
+        prompt::console_select_with_tty(&mut FailingReader, "Pick", 1, 3, false),
+        Err(prompt::NOT_INTERACTIVE.to_string())
+    );
+    assert_eq!(
+        prompt::console_prompt_with_tty(&mut FailingReader, "Name?", false),
+        Err(prompt::NOT_INTERACTIVE.to_string())
+    );
+    assert_eq!(
+        prompt::execute_prompt(&mut FailingReader, "k", "d", "Go?", false, None),
+        Err(prompt::NOT_INTERACTIVE.to_string())
+    );
+}

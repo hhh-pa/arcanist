@@ -95,9 +95,14 @@ the arcanist library.
   Result<Option<String>, std::io::Error>` (`\n`-split,
   trailing-`\r` trim, `None` on EOF); `prompt::read_answer` keeps its
   signature/semantics as the `None`-on-error wrapper;
-  `land::read_answer_line` and `diff::prompt_confirm_from`'s inline
-  `read_line` delegate to the core (diff keeps its
-  `failed to read user input` error mapping). Follows the T1176 seam
+  `land::read_answer_line`, `browse::read_answer`, and
+  `diff::prompt_confirm_from`'s inline `read_line` delegate to it
+  (land/browse keep thin wrappers so the existing delegation tests
+  keep proving identical semantics; diff keeps its
+  `failed to read user input` error mapping). Deliberately excluded:
+  the lint default-range prompt and `liberate::prompt_line`, whose
+  full-trim/keep-partial-on-error semantics differ — consolidating
+  them would change behavior. Follows the T1176 seam
   precedent (free function over `BufRead` stages bytes/EOF/errors in
   tests; no `Io` churn). Matrix tests: LF, CRLF, lone-CR-at-EOF,
   empty line, EOF-empty, multi-line (two reads), invalid UTF-8,

@@ -808,6 +808,31 @@ fn g1_confirm_prompt_helpers() {
 }
 
 #[test]
+fn t1191_prompt_confirm_reports_read_errors() {
+    // A failing stdin surfaces the read error (never an answer).
+    struct FailingReader;
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("boom"))
+        }
+    }
+    impl std::io::BufRead for FailingReader {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            Err(std::io::Error::other("boom"))
+        }
+        fn consume(&mut self, _amount: usize) {}
+    }
+    let mut out = Vec::new();
+    let err = prompt_confirm_from(&mut FailingReader, &mut out, "P?", true).unwrap_err();
+    assert!(err.starts_with("failed to read user input: "), "{err:?}");
+    // Supertrait stubs never run via the shared reader, so drive them
+    // directly (T1176 idiom).
+    let mut reader = FailingReader;
+    assert!(std::io::Read::read(&mut reader, &mut [0u8; 4]).is_err());
+    std::io::BufRead::consume(&mut reader, 1);
+}
+
+#[test]
 #[cfg(unix)] // PHP has no TTY gate without posix_isatty (Windows).
 fn g1_prompt_confirm_requires_tty() {
     // Interactive session: the TTY gate cannot fail deterministically
