@@ -37,6 +37,29 @@ pub fn stdin_is_terminal() -> bool {
     std::io::stdin().is_terminal()
 }
 
+/// `CSI ? 9001 l`: leave win32-input mode (key-event reporting).
+/// Written before live prompt reads on Windows; terminals that do not
+/// implement the mode ignore it.
+#[cfg(windows)]
+pub const WIN32_INPUT_DISABLE: &str = "\x1b[?9001l";
+
+/// Lock live stdin for a prompt read.
+///
+/// On Windows, first restores cooked input reporting: arc never
+/// enables win32-input mode (T1191 audit), but a driving harness may
+/// have left it on — keys would then arrive as escape sequences with
+/// no newline and the prompt read below would block forever. The
+/// flush applies the mode change before the read. Unix emits nothing
+/// (zero behavior change).
+pub fn live_stdin_lock() -> std::io::StdinLock<'static> {
+    #[cfg(windows)]
+    {
+        print!("{WIN32_INPUT_DISABLE}");
+        std::io::stdout().flush().ok();
+    }
+    std::io::stdin().lock()
+}
+
 /// The echoed prompt: two blank lines plus the query wrapped at indent 4.
 #[must_use]
 pub fn prompt_text(prompt: &str) -> String {

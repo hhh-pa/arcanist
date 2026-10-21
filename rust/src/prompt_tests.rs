@@ -344,6 +344,21 @@ fn t1191_read_answer_result_reports_eof_and_errors() {
 }
 
 #[test]
+fn t1191_live_stdin_lock_returns_a_lock() {
+    // Construction only: stdin is never a TTY under test, so this just
+    // exercises the helper (and, on Windows, the guard write).
+    let mut lock = prompt::live_stdin_lock();
+    let _ = &mut lock;
+}
+
+#[test]
+#[cfg(windows)]
+fn t1191_win32_input_disable_sequence_shape() {
+    // `CSI ? 9001 l`: leave win32-input mode (key-event reporting).
+    assert_eq!(prompt::WIN32_INPUT_DISABLE, "\x1b[?9001l");
+}
+
+#[test]
 fn t1191_prompts_refuse_piped_stdin_without_reading() {
     // The not-interactive gate precedes every read: had any prompt read
     // the failing input, the error would have resolved to a default

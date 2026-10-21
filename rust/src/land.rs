@@ -890,7 +890,7 @@ impl Io {
         use std::io::Write;
         std::io::stdout().flush().ok();
         std::io::stderr().flush().ok();
-        read_answer_line(&mut std::io::stdin().lock())
+        read_answer_line(&mut crate::prompt::live_stdin_lock())
     }
 }
 

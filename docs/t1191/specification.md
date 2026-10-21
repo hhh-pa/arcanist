@@ -136,16 +136,19 @@ the arcanist library.
   stable, incidental-master-ignores-foreign-remote. Uncanonicalizable
   exe paths fall back to the raw-path prefix check (documented).
 - **Slice 4 — `?9001l` guard (`cfg(windows)` only):** new
-  `prompt::live_stdin_lock()` returning `StdinLock`, emitting the
-  disable sequence on Windows before the lock; pure
-  `win32_input_disable_sequence()` byte test + a call-the-function
-  test (line coverage). Migrate prompt-live-stdin sites only
-  (`land.rs:893`, `diff.rs:2683`, `upgrade.rs:1536`,
-  `close_revision.rs:694`, install_certificate/which prompt sites
-  after verifying each is a prompt); bulk-data stdin sites
-  (export/cover/paste reads) are explicitly excluded (no stdout
-  pollution of machine-readable output). Residual risk (negligible):
-  resetting a mode an outer app wanted left on.
+  `prompt::live_stdin_lock()` returning `StdinLock`: on Windows it
+  prints `WIN32_INPUT_DISABLE` (`CSI ? 9001 l`) and flushes (the flush
+  applies the mode change before the read); Unix emits nothing. A
+  byte-exact const test (`cfg(windows)`) plus a call-the-function
+  test (line coverage). Wrap rule: a live-stdin lock is wrapped iff
+  every path from it reaches a prompt read or a prompt echo — so the
+  guard never emits into a previously stdout-clean machine flow.
+  Wrapped (8): land, diff, upgrade, close_revision, export
+  (`export_prompt_line` is a prompt, not bulk), install_certificate
+  token + confirm, which. Skipped: paste (bulk), cover/alias/lint
+  speculative locks (prompt may never fire), the install_certificate
+  chmod lock (Windows never reads past it). Residual risk
+  (negligible): resetting a mode an outer app wanted left on.
 - **Out of scope (decided, not deferred):** a `ReadConsoleInputW` /
   `SetConsoleMode` console reader needs FFI `unsafe` (geiger
   regression) or a safe-wrapper dependency (the T1189 verdict calls

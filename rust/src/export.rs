@@ -564,7 +564,7 @@ fn export_prompt_line(prompt: &str) -> Option<String> {
     use std::io::Write;
     std::io::stdout().flush().ok();
     export_prompt_line_with(
-        &mut std::io::stdin().lock(),
+        &mut crate::prompt::live_stdin_lock(),
         crate::prompt::stdin_is_terminal(),
     )
 }

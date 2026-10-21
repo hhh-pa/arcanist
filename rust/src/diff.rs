@@ -2677,7 +2677,7 @@ fn prompt_confirm_with_tty(
         let _ = std::io::Write::flush(&mut std::io::stdout());
         return Err(STDIN_NOT_TTY.to_string());
     }
-    let mut reader = std::io::stdin().lock();
+    let mut reader = crate::prompt::live_stdin_lock();
     let mut stdout = std::io::stdout();
     prompt_confirm_from(&mut reader, &mut stdout, prompt, default_no)
 }

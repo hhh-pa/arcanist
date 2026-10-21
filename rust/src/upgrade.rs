@@ -1598,7 +1598,7 @@ fn download_install_report(
 /// Ask the pre-upgrade question on stdin (`[y/N]`: the default keeps
 /// the current executable, since replacement is irreversible).
 fn confirm_interactive(query: &str) -> Result<bool, String> {
-    prompt::console_confirm(&mut std::io::stdin().lock(), query, true)
+    prompt::console_confirm(&mut prompt::live_stdin_lock(), query, true)
 }
 
 #[derive(Debug, PartialEq, Eq)]

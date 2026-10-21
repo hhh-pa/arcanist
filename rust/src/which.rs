@@ -2538,7 +2538,7 @@ fn prompt_line_with_tty(prompt: &str, stdin_tty: bool) -> Option<String> {
         PROMPT_TTY_FAILED.set(true);
         return None;
     }
-    crate::prompt::read_answer(&mut std::io::stdin().lock())
+    crate::prompt::read_answer(&mut crate::prompt::live_stdin_lock())
 }
 
 /// Entry point: `argv` excludes the subcommand name.
