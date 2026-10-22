@@ -691,7 +691,7 @@ fn select_unique_phid(results: &serde_json::Value) -> Option<String> {
 /// no (`[y/N]`), so Enter aborts the close
 /// (`ArcanistCloseRevisionWorkflow.php:121`).
 fn confirm_interactive(query: &str) -> Result<bool, String> {
-    prompt::console_confirm(&mut std::io::stdin().lock(), query, true)
+    prompt::console_confirm(&mut prompt::live_stdin_lock(), query, true)
 }
 
 /// Entry point: `argv` excludes the subcommand name.

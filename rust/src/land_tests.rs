@@ -8570,6 +8570,26 @@ fn t1176_read_answer_line_maps_errors_to_none() {
 }
 
 #[test]
+fn t1191_prompts_refuse_piped_stdin_without_reading() {
+    // The TTY gate precedes every read: the scripted answer stays queued.
+    let mut io = Io {
+        canned: std::collections::VecDeque::from(["y".to_string()]),
+        stdin_tty: false,
+        ..Default::default()
+    };
+    assert_eq!(
+        prompt_for_key(&mut io, "k", "q?"),
+        Err(crate::prompt::NOT_INTERACTIVE.to_string())
+    );
+    assert_eq!(io.canned.len(), 1);
+    assert_eq!(
+        console_confirm(&mut io, "q?", true),
+        Err(crate::prompt::NOT_INTERACTIVE.to_string())
+    );
+    assert_eq!(io.canned.len(), 1);
+}
+
+#[test]
 #[should_panic(expected = "fail only as EPIPE")]
 fn t1176_pipe_write_non_epipe_is_unreachable() {
     assert_pipe_write_is_epipe(&std::io::Error::other("boom"));

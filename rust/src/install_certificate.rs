@@ -649,7 +649,7 @@ pub fn prompt_token_from(input: &mut dyn BufRead, stdin_tty: bool) -> Result<Str
 
 /// [`prompt_token_from`] on real stdin.
 pub fn prompt_token() -> Result<String, String> {
-    prompt_token_from(&mut std::io::stdin().lock(), prompt::stdin_is_terminal())
+    prompt_token_from(&mut prompt::live_stdin_lock(), prompt::stdin_is_terminal())
 }
 
 /// Confirm `question` via the shared `phutil_console_confirm` port,
@@ -667,7 +667,7 @@ pub fn prompt_confirm_from(
 /// [`prompt_confirm_from`] on real stdin.
 pub fn prompt_confirm(question: &str, default_no: bool) -> Result<bool, String> {
     prompt_confirm_from(
-        &mut std::io::stdin().lock(),
+        &mut prompt::live_stdin_lock(),
         question,
         default_no,
         prompt::stdin_is_terminal(),

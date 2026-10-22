@@ -37,6 +37,29 @@ pub fn stdin_is_terminal() -> bool {
     std::io::stdin().is_terminal()
 }
 
+/// `CSI ? 9001 l`: leave win32-input mode (key-event reporting).
+/// Written before live prompt reads on Windows; terminals that do not
+/// implement the mode ignore it.
+#[cfg(windows)]
+pub const WIN32_INPUT_DISABLE: &str = "\x1b[?9001l";
+
+/// Lock live stdin for a prompt read.
+///
+/// On Windows, first restores cooked input reporting: arc never
+/// enables win32-input mode (T1191 audit), but a driving harness may
+/// have left it on — keys would then arrive as escape sequences with
+/// no newline and the prompt read below would block forever. The
+/// flush applies the mode change before the read. Unix emits nothing
+/// (zero behavior change).
+pub fn live_stdin_lock() -> std::io::StdinLock<'static> {
+    #[cfg(windows)]
+    {
+        print!("{WIN32_INPUT_DISABLE}");
+        std::io::stdout().flush().ok();
+    }
+    std::io::stdin().lock()
+}
+
 /// The echoed prompt: two blank lines plus the query wrapped at indent 4.
 #[must_use]
 pub fn prompt_text(prompt: &str) -> String {
@@ -49,10 +72,20 @@ pub fn prompt_text(prompt: &str) -> String {
 /// Read one answer line (`None` on EOF/error), like `rtrim($response)`.
 pub fn read_answer(input: &mut dyn BufRead) -> Option<String> {
     std::io::stdout().flush().ok();
+    read_answer_result(input).ok().flatten()
+}
+
+/// Read one answer line, without the trailing newline, surfacing read
+/// failures: `Ok(None)` is EOF, `Err` is a read failure. The shared core
+/// behind [`read_answer`] (which collapses errors to `None`) and the
+/// land/browse/diff prompt readers. Lines split on `\n` with a trailing
+/// `\r` trimmed, so LF-only, CRLF, and lone-CR answers all complete.
+pub fn read_answer_result(input: &mut dyn BufRead) -> Result<Option<String>, std::io::Error> {
     let mut line = String::new();
     match input.read_line(&mut line) {
-        Ok(0) | Err(_) => None,
-        Ok(_) => Some(line.trim_end_matches(['\r', '\n']).to_string()),
+        Ok(0) => Ok(None),
+        Ok(_) => Ok(Some(line.trim_end_matches(['\r', '\n']).to_string())),
+        Err(error) => Err(error),
     }
 }
 

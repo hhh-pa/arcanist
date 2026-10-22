@@ -890,7 +890,7 @@ impl Io {
         use std::io::Write;
         std::io::stdout().flush().ok();
         std::io::stderr().flush().ok();
-        read_answer_line(&mut std::io::stdin().lock())
+        read_answer_line(&mut crate::prompt::live_stdin_lock())
     }
 }
 
@@ -898,14 +898,10 @@ impl Io {
 ///
 /// Returns `None` on end of input (EOF) or read failure. Split from
 /// `Io::read_answer` so tests can stage bytes, EOF, and errors through
-/// any `BufRead` (production passes the stdin lock).
+/// any `BufRead` (production passes the stdin lock); the read itself is
+/// the shared [`crate::prompt::read_answer`] helper.
 fn read_answer_line(reader: &mut dyn std::io::BufRead) -> Option<String> {
-    let mut line = String::new();
-    match reader.read_line(&mut line) {
-        Ok(0) => None,
-        Ok(_) => Some(line.trim_end_matches(['\r', '\n']).to_string()),
-        Err(_) => None,
-    }
+    crate::prompt::read_answer(reader)
 }
 
 /// Soft-wrap text for console display

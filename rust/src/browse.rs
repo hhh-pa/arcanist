@@ -21,7 +21,7 @@
 //! PHP's order is nondeterministic).
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, Write};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -1296,14 +1296,10 @@ pub fn render_pick_table(
     out
 }
 
-/// Read one answer line (`None` on EOF/error).
+/// Read one answer line (`None` on EOF/error): the shared
+/// [`crate::prompt::read_answer`] helper.
 fn read_answer(input: &mut dyn BufRead) -> Option<String> {
-    std::io::stdout().flush().ok();
-    let mut line = String::new();
-    match input.read_line(&mut line) {
-        Ok(0) | Err(_) => None,
-        Ok(_) => Some(line.trim_end_matches(['\r', '\n']).to_string()),
-    }
+    crate::prompt::read_answer(input)
 }
 
 /// The wrapped select prompt, like `phutil_console_prompt()`: the
