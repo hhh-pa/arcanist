@@ -2516,6 +2516,12 @@ fn d22_bare_child_amend_gates_like_argv_flags() {
         child_amend: true,
         ..Default::default()
     };
+    // T1232: stage the project layer explicitly — `amend_enabled`
+    // reads the real user/system config underneath, so an unstaged
+    // project file lets a developer's `~/.arcrc`
+    // (`history.immutable`) flip this test. The project layer
+    // shadows both.
+    std::fs::write(root.join(".arcconfig"), r#"{"history.immutable": false}"#).unwrap();
     assert!(amend_enabled(&work, &bare).unwrap());
     assert!(!amend_enabled(&work, &Options::default()).unwrap());
     // Immutable history disables even the bare intent.

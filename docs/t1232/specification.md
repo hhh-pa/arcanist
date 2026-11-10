@@ -65,6 +65,16 @@ pipe, and why it was reported broken.
   this evidence plus regression tests; correct code is not edited to
   chase the symptom.
 
+**Follow-on scope (added mid-task at user request):** harden
+the three amend tests that fail on hosts whose `~/.arcrc` sets
+`history.immutable` (unit `d22_bare_child_amend_gates_like_argv_flags`
+plus integration `lint_amend_all_amends_and_decline_aborts` and
+`d22_bare_child_amend_prompts_and_resolves`): `amend_enabled` reads
+the real user/system config layers underneath, and the tests staged
+no project layer, so a developer config flipped them (green in CI,
+red locally). Fix stages an explicit project `.arcconfig` in each
+(test-only; production layering is correct PHP behavior).
+
 **Scenarios:**
 
 - Given `echo '{"ping":1}' | arc call-conduit --conduit-uri <mock>
@@ -127,7 +137,23 @@ pipe, and why it was reported broken.
     fix drivers (Rule 4). New test-only lines keep the 100% shipped
     line floor untouched; `[lints.rust] unused = deny` holds (no
     dead helpers).
-- **TDD/verification:** slice 1 then 2; run the focused
+- **Slice 3 — amend-test hermetic fix (test-only):** the same
+  real-`~/.arcrc` leak broke three amend tests on hosts with
+  `history.immutable` set (green in CI, red locally). Fix stages
+  an explicit project `.arcconfig`
+  (`{"history.immutable": false}`, which shadows user+system) in
+  each: `d22_bare_child_amend_gates_like_argv_flags`
+  (`rust/src/lint_tests.rs`, whose existing overwrite with `true`
+  keeps pinning the immutable arm),
+  `lint_amend_all_amends_and_decline_aborts` and
+  `d22_bare_child_amend_prompts_and_resolves`
+  (`rust/tests/lint_text.rs`). All three failures reproduced on the
+  untouched base first. No production lines change, so the 100%
+  shipped-line floor and geiger-0 are untouched; production
+  layering (user config gates amend) is correct PHP behavior.
+  Audited: `config_bool`'s sole production caller is
+  `amend_enabled`, and no other test reaches real user config.
+- **TDD/verification:** slices in order; run the focused
   `dispatch_core` target, then the full `cargo test --locked`,
   `cargo fmt --check`, `cargo clippy -- -D warnings`; push branch
   and watch CI (3 OSes + quality gates) to green before reporting.

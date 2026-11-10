@@ -400,6 +400,9 @@ fn lint_patch_prompts_accept_and_decline() {
 #[test]
 fn lint_amend_all_amends_and_decline_aborts() {
     let tmp = git_repo("amend");
+    // T1232: stage mutable history explicitly — without a project
+    // layer the real `~/.arcrc` decides and flips this test.
+    tmp.write(".arcconfig", r#"{"history.immutable": false}"#);
     // The amend flow shells out to `git commit --amend`, which needs an
     // identity the `-c` flags on the helper cannot provide.
     git(tmp.path(), &["config", "user.email", "lint@test"]);
@@ -654,6 +657,9 @@ fn d22_bare_child_amend_prompts_and_resolves() {
     // reach disk (default yes), and applied messages resolve out of
     // the unresolved dicts.
     let tmp = git_repo("d22-amend");
+    // T1232: stage mutable history explicitly — without a project
+    // layer the real `~/.arcrc` decides and flips this test.
+    tmp.write(".arcconfig", r#"{"history.immutable": false}"#);
     git(tmp.path(), &["config", "user.email", "lint@test"]);
     git(tmp.path(), &["config", "user.name", "lint"]);
     tmp.write("fix.txt", "ok  \n");
