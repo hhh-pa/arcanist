@@ -2528,6 +2528,26 @@ fn d22_bare_child_amend_gates_like_argv_flags() {
     std::fs::write(root.join(".arcconfig"), r#"{"history.immutable": true}"#).unwrap();
     assert!(!amend_enabled(&work, &bare).unwrap());
 }
+
+#[test]
+fn t1232_config_bool_fallback_reads_none() {
+    // `config_bool`'s fallback arm: untyped non-bool values and
+    // missing keys read as None. The project layer carries the
+    // probe value (unknown keys skip the type check), so the
+    // outcome never depends on ambient user config. Covers the arm
+    // the d22 hermetic fix stopped reaching through `amend_enabled`.
+    let tmp = TempDir::new("t1232-bool-none");
+    let root = tmp.path().join("repo");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join(".arcconfig"), r#"{"t1232.probe": 7}"#).unwrap();
+    let work = WorkCopy {
+        vcs: Vcs::Git,
+        vcs_root: root.clone(),
+        project_root: root,
+    };
+    assert_eq!(config_bool(&work, "t1232.probe").unwrap(), None);
+    assert_eq!(config_bool(&work, "t1232.absent").unwrap(), None);
+}
 #[test]
 fn r10_lint_help_matches_generated_format() {
     // T1153 R10: `--help` renders the generated workflow help

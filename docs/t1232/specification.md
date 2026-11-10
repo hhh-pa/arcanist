@@ -153,6 +153,13 @@ red locally). Fix stages an explicit project `.arcconfig` in each
   layering (user config gates amend) is correct PHP behavior.
   Audited: `config_bool`'s sole production caller is
   `amend_enabled`, and no other test reaches real user config.
+  Plus `t1232_config_bool_fallback_reads_none`
+  (`rust/src/lint_tests.rs`): the d22 staging stopped reaching
+  `config_bool`'s fallback arm through `amend_enabled`, dropping
+  the 100% line floor by one line (153713/153714 in CI) — the new
+  test pins the arm directly via an untyped project-layer probe
+  key plus a missing key (hermetic both ways), restoring the
+  floor (verified with `cargo llvm-cov`: 2 hits).
 - **TDD/verification:** slices in order; run the focused
   `dispatch_core` target, then the full `cargo test --locked`,
   `cargo fmt --check`, `cargo clippy -- -D warnings`; push branch
