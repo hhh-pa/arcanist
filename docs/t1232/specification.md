@@ -51,12 +51,19 @@ pipe, and why it was reported broken.
     `ArcanistRuntime::execute()` into a PHP fatal: bare message on
     stderr, exit 255. Rust `Fatal` renders exactly that (message +
     255 are the stable observables per the house fatal policy).
-- Likely reporter-side causes for the original failure: a missing
-  `--` (the noninteractive gate fires on ANY piped stdin), malformed
-  JSON reaching stdin (shell quoting), or a transient conduit error —
-  all repository-external. Per T1153 Rule 4 the behavior is recorded
-  clean with this evidence plus regression tests; correct code is
-  not edited to chase the symptom.
+- Root cause (confirmed by reproduction): the failure is caller-side
+  shell mangling, not arc. Piping through `echo` expands the JSON
+  newline escapes before arc runs (both this tool's shell and zsh do),
+  so arc receives invalid JSON — literal newlines inside string values
+  — which it correctly rejects with the stdin-blob fatal, exactly like
+  PHP. The same bytes via `printf '%s'` or a file redirect succeed
+  (this task's own Spec-line update proved it). Fix: the five echo-pipe
+  conduit snippets in the agent skills (start-task twice,
+  address-review, land-review, request-review) now use `printf '%s'`,
+  matching the safe `printf` form the same files already used
+  elsewhere. Per T1153 Rule 4 the Rust behavior is recorded clean with
+  this evidence plus regression tests; correct code is not edited to
+  chase the symptom.
 
 **Scenarios:**
 

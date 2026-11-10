@@ -3,6 +3,7 @@
 //! `arc` with piped stdin (like CI), an empty `HOME`, and a scratch
 //! git checkout, so config discovery and TTY checks are hermetic.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
@@ -243,5 +244,130 @@ fn t1170_markers_query_failure_is_fatal() {
         text(&out.stderr).contains("no Phabricator URI"),
         "{:?}",
         text(&out.stderr)
+    );
+}
+
+/// Serve one Conduit request with a canned JSON body; returns the base
+/// URI and the received raw request body.
+fn serve_once(canned: &'static str) -> (String, std::sync::mpsc::Receiver<Vec<u8>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            use std::io::Read;
+            stream.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8(head).unwrap();
+        let len: usize = head
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(key, value)| {
+                    if key.eq_ignore_ascii_case("content-length") {
+                        value.trim().parse().ok()
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or(0);
+        let mut body = vec![0u8; len];
+        if len > 0 {
+            use std::io::Read;
+            stream.read_exact(&mut body).unwrap();
+        }
+        tx.send(body).unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            canned.len(),
+            canned
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    (base, rx)
+}
+
+/// [`arc`] with written piped stdin instead of null stdin: feeds
+/// `stdin_bytes` to the child (like `printf ... | arc ...`), closes
+/// the pipe, and waits.
+fn arc_with_stdin(home: &PathBuf, repo: &PathBuf, argv: &[&str], stdin_bytes: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_arc"))
+        .args(argv)
+        .env("HOME", home)
+        .env("ARC_TRACE", "")
+        .env("ARC_ANSI", "")
+        .env("ARC_GLOBAL_CONDUIT_URI", "")
+        .env("ARC_GLOBAL_CONDUIT_TOKEN", "")
+        .env("ARC_ANONYMOUS", "")
+        .env("ARC_GLOBAL_LOAD_OPTIONS", "")
+        .env("ARC_CONDUIT_URI", "")
+        .env("ARC_CONDUIT_TOKEN", "")
+        .current_dir(repo)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(stdin_bytes)
+        .unwrap();
+    drop(child.stdin.take());
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn t1232_piped_stdin_json_reaches_envelope() {
+    // T1232 Rule 4 lock: `printf '<json>' | arc call-conduit
+    // --conduit-uri <uri> -- <method>` delivers the piped blob as
+    // params and prints the envelope (exit 0, silent stderr). The
+    // reported failure was caller-side `echo` escape mangling, not
+    // this path — this test pins the path so a real regression
+    // cannot hide behind that report.
+    let (home, repo) = fixture("pipe-envelope");
+    let (base, seen) = serve_once(r#"{"result": {"pong": true}, "error_code": null}"#);
+    let out = arc_with_stdin(
+        &home,
+        &repo,
+        &["call-conduit", "--conduit-uri", &base, "--", "conduit.ping"],
+        br#"{"ping": 1}"#,
+    );
+    assert_eq!(out.status.code(), Some(0));
+    assert!(text(&out.stderr).is_empty(), "{:?}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(envelope["error"], serde_json::Value::Null);
+    assert_eq!(envelope["errorMessage"], serde_json::Value::Null);
+    assert_eq!(envelope["response"], serde_json::json!({"pong": true}));
+    // No trailing newline: PHP `echo`s the encoded blob as-is.
+    assert!(!stdout.ends_with('\n'), "{stdout:?}");
+    // And the piped params reached the wire.
+    let body = seen
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    let body = String::from_utf8(body).unwrap();
+    assert!(body.contains("ping"), "{body}");
+}
+
+#[test]
+fn t1232_piped_garbage_stdin_is_fatal() {
+    // T1232 Rule 4 lock: unparseable piped stdin is the
+    // `ArcanistUsageException` fatal (bare message on stderr, exit
+    // 255, silent stdout) — like PHP, where the exception escapes
+    // `ArcanistRuntime::execute()`. Errors ride stderr, so a
+    // trailing `2>&1` merges them into any downstream pipe.
+    let (home, repo) = fixture("pipe-garbage");
+    let out = arc_with_stdin(&home, &repo, &["call-conduit", "--", "m"], b"not json");
+    assert_eq!(out.status.code(), Some(255));
+    assert!(text(&out.stdout).is_empty());
+    assert_eq!(
+        text(&out.stderr),
+        "Provide method parameters on stdin as a JSON blob.\n"
     );
 }
