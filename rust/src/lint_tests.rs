@@ -2516,11 +2516,37 @@ fn d22_bare_child_amend_gates_like_argv_flags() {
         child_amend: true,
         ..Default::default()
     };
+    // T1232: stage the project layer explicitly — `amend_enabled`
+    // reads the real user/system config underneath, so an unstaged
+    // project file lets a developer's `~/.arcrc`
+    // (`history.immutable`) flip this test. The project layer
+    // shadows both.
+    std::fs::write(root.join(".arcconfig"), r#"{"history.immutable": false}"#).unwrap();
     assert!(amend_enabled(&work, &bare).unwrap());
     assert!(!amend_enabled(&work, &Options::default()).unwrap());
     // Immutable history disables even the bare intent.
     std::fs::write(root.join(".arcconfig"), r#"{"history.immutable": true}"#).unwrap();
     assert!(!amend_enabled(&work, &bare).unwrap());
+}
+
+#[test]
+fn t1232_config_bool_fallback_reads_none() {
+    // `config_bool`'s fallback arm: untyped non-bool values and
+    // missing keys read as None. The project layer carries the
+    // probe value (unknown keys skip the type check), so the
+    // outcome never depends on ambient user config. Covers the arm
+    // the d22 hermetic fix stopped reaching through `amend_enabled`.
+    let tmp = TempDir::new("t1232-bool-none");
+    let root = tmp.path().join("repo");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join(".arcconfig"), r#"{"t1232.probe": 7}"#).unwrap();
+    let work = WorkCopy {
+        vcs: Vcs::Git,
+        vcs_root: root.clone(),
+        project_root: root,
+    };
+    assert_eq!(config_bool(&work, "t1232.probe").unwrap(), None);
+    assert_eq!(config_bool(&work, "t1232.absent").unwrap(), None);
 }
 #[test]
 fn r10_lint_help_matches_generated_format() {

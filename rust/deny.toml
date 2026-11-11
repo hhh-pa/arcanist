@@ -29,6 +29,10 @@ skip = [
     "core-foundation@0.9",
     "getrandom@0.2",
     "syn@2.0",
+    # T1232: rustix 1.1.6 (RUSTSEC-2026-0486 fix) requires windows-sys
+    # 0.52 while the tokio stack requires 0.61; un-unifiable until one
+    # side moves. Drop when dependents unify.
+    "windows-sys@0.52",
 ]
 [sources]
 unknown-registry = "deny"
