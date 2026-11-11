@@ -160,6 +160,17 @@ red locally). Fix stages an explicit project `.arcconfig` in each
   test pins the arm directly via an untyped project-layer probe
   key plus a missing key (hermetic both ways), restoring the
   floor (verified with `cargo llvm-cov`: 2 hits).
+- **Slice 4 — rustix advisory bump (`rust/Cargo.lock` only,
+  added at user request to unblock PR checks):** CI `cargo audit
+  --deny warnings` started failing on newly-published
+  `RUSTSEC-2026-0486` (unsound) against the locked `rustix 1.1.5`
+  (transitive via `tempfile` and `xattr`/`tar`). Bump to `1.1.6`,
+  the patched release; its manifest requires `windows-sys 0.52`,
+  so the `windows-sys` edges of `rustix`, `tempfile`, and `errno`
+  re-point to the already-locked `0.52.0` — no packages
+  added/removed, dep count unchanged. Verified with the exact CI
+  gate locally (`cargo audit --deny warnings` exit 0) plus the
+  full suite. This is the branch's only non-test change.
 - **TDD/verification:** slices in order; run the focused
   `dispatch_core` target, then the full `cargo test --locked`,
   `cargo fmt --check`, `cargo clippy -- -D warnings`; push branch
