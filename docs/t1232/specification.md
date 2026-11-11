@@ -168,9 +168,14 @@ red locally). Fix stages an explicit project `.arcconfig` in each
   the patched release; its manifest requires `windows-sys 0.52`,
   so the `windows-sys` edges of `rustix`, `tempfile`, and `errno`
   re-point to the already-locked `0.52.0` — no packages
-  added/removed, dep count unchanged. Verified with the exact CI
-  gate locally (`cargo audit --deny warnings` exit 0) plus the
-  full suite. This is the branch's only non-test change.
+  added/removed, dep count unchanged. The split trips `cargo deny`
+  `bans` (duplicate `windows-sys`), un-unifiable while rustix 1.1.6
+  pins 0.52 and the tokio stack pins 0.61, so `deny.toml` gains the
+  precedent-shaped `"windows-sys@0.52"` skip with a drop-when-unified
+  note. Verified with both exact CI gates locally (`cargo audit
+  --deny warnings` and `cargo deny check licenses bans sources`,
+  exit 0) plus the full suite. The lockfile and `deny.toml` entries
+  are the branch's only non-test changes.
 - **TDD/verification:** slices in order; run the focused
   `dispatch_core` target, then the full `cargo test --locked`,
   `cargo fmt --check`, `cargo clippy -- -D warnings`; push branch
