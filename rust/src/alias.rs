@@ -695,7 +695,8 @@ pub fn shell_status_from_exit_status(status: &std::process::ExitStatus) -> Shell
 /// the return "undefined"), or `128+N` when `sh` interposes between
 /// `proc_open()` and the real child — there is no single PHP value to
 /// match, so Rust uses a fixed failure.
-#[must_use]
+// `ExitCode` is already `#[must_use]`; an attribute here trips
+// `clippy::double_must_use`.
 pub fn shell_status_exit_code(status: ShellStatus) -> ExitCode {
     match status {
         ShellStatus::Exited(code) => u8::try_from(code).map_or(ExitCode::FAILURE, ExitCode::from),

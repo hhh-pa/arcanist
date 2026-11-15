@@ -1113,7 +1113,8 @@ pub enum EnvelopeKind {
 
 impl EnvelopeKind {
     /// Process exit code for this error class.
-    #[must_use]
+    // `ExitCode` is already `#[must_use]`; an attribute here trips
+    // `clippy::double_must_use`.
     pub fn exit_code(self) -> std::process::ExitCode {
         match self {
             Self::NoEffect => std::process::ExitCode::SUCCESS,
