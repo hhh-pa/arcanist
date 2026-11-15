@@ -3683,7 +3683,8 @@ fn render_full_output(
 
 /// Exit code for a workflow result (`RESULT_OKAY` 0, `RESULT_UNSOUND` 1,
 /// `RESULT_FAIL` 2; `ArcanistUnitWorkflow.php:8-11,243-253`).
-#[must_use]
+// `ExitCode` is already `#[must_use]`; an attribute here trips
+// `clippy::double_must_use`.
 pub fn exit_code_for_overall(overall: i32) -> ExitCode {
     ExitCode::from(overall as u8)
 }
