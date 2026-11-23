@@ -58,6 +58,23 @@ the resolved-conflict shape fails.
 - **Bug 2 (`rust/Cargo.lock` only):** `cargo update -p url` to
   `>= 2.5.9` (`url` is transitive; no `Cargo.toml` change). Fix any
   `cargo deny` fallout if the bump splits a duplicated crate.
+- **Enabling fix — gate image rebuild broke the coverage floor
+  (found on branch CI):** the image key hashes `rust/Cargo.lock`, so
+  the bug-2 bump forced a rebuild from `rust:slim-trixie`, which had
+  floated from 1.99.1 to 1.100.0. Rust 1.100 (a) moved test binaries
+  out of `target/<profile>/deps/` into per-unit
+  `build/<pkg>/<unit>/out/` dirs, so canonical coverage found 0 of 41
+  objects and fell back to the 98.57% raw report; and (b) maps
+  coverage regions more finely, exposing ~400 never-executed lines
+  the 1.99 mapping marked covered (verified: new image finds 0
+  objects vs 41 on the old image; local 1.100 gate run recovers with
+  discovery fixed but still reports 99.72%). Fix: pin the base to
+  `rust:1.99.1-slim-trixie` (documented in the Dockerfile with the
+  unpin condition) AND teach `rawLLVMCovExport` both layouts (new
+  `scanTestObjects`, skipping `build_script_build` by name), so the
+  next unpin only needs the suite re-baselined. Re-baselining the
+  suite to 100% under the 1.100 mapping is a separate follow-up task,
+  explicitly out of scope here.
 
 ## Acceptance criteria
 
@@ -77,5 +94,7 @@ the resolved-conflict shape fails.
 ## CI impact
 
 No Jenkinsfile/.arclint changes needed (GitHub Actions repo; no
-workflow changes — lockfile bump only for bug 2). Gates are the `rust`
-workflow checks plus Codecov statuses on the PR.
+`.github/workflows` changes). `scripts/ci` changes: gate Dockerfile
+base pin (`rust:1.99.1-slim-trixie`) + `scanTestObjects` discovery in
+`rust-quality-gates` with stub/golden updates (enabling fix above).
+Gates are the `rust` workflow checks plus Codecov statuses on the PR.
