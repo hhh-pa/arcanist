@@ -4535,9 +4535,42 @@ fn ensure_merge_nonempty(dir: &Path, into_commit: &str, max_hash: &str) -> Resul
     Ok(())
 }
 
+/// True when the squash range merged the into state back in (T1281):
+/// some merge commit in `min^..max` has a parent already reachable
+/// from the into commit (the into target itself, or an ancestor of it
+/// when the target moved again after the merge-back).
+///
+/// Merges of unrelated branches answer false, keeping the historical
+/// rebase-first path (LAND-43). Detection failure (e.g. a parentless
+/// `min`, whose `min^` is invalid) likewise answers false.
+fn range_merges_into_history(
+    dir: &Path,
+    min_hash: &str,
+    max_hash: &str,
+    into_commit: &str,
+) -> bool {
+    let range = format!("{min_hash}^..{max_hash}");
+    let Ok(merges) = git::stdout_text(dir, &["log", "--merges", "--format=%P", &range, "--"])
+    else {
+        return false;
+    };
+    merges
+        .split_whitespace()
+        .any(|parent| git::ok(dir, &["merge-base", "--is-ancestor", parent, into_commit]))
+}
+
 /// Merge the commit range: squash (non-empty) rebases the range onto
 /// the into state, then merges; anything else merges the max commit
 /// directly (`:322-345`).
+///
+/// T1281 (Rule 2 deviation from ceb): when the squash range merged the
+/// into state back in, the rebase is skipped and the range tip merges
+/// directly. Replaying pre-merge commits re-hits conflicts the merge
+/// already resolved, failing lands whose final tree merges cleanly;
+/// the direct squash-merge applies exactly that final tree (trivially
+/// when the into state is an ancestor of the tip, else a true 3-way).
+/// Linear ranges — and ranges merging unrelated branches (LAND-43) —
+/// keep the ceb git-command sequence byte for byte.
 fn apply_merge_range(
     dir: &Path,
     min_hash: &str,
@@ -4546,7 +4579,7 @@ fn apply_merge_range(
     squash: bool,
     is_empty: bool,
 ) -> Result<String, String> {
-    if squash && !is_empty {
+    if squash && !is_empty && !range_merges_into_history(dir, min_hash, max_hash, into_commit) {
         git_apply_rebase(dir, min_hash, max_hash, into_commit).and_then(|merged| {
             git_apply_merge(dir, &merged, into_commit, squash, is_empty).map(|()| merged)
         })
@@ -4581,7 +4614,9 @@ fn drop_scratch_empty_parent(
 ///
 /// Returns the new cursor. Squash merges rebase the range onto the into
 /// state first (nothing else: the post-T13576 reduce fallback does not
-/// exist at ceb); anything else merges the max commit directly. Empty
+/// exist at ceb), except ranges that merged the into state back in,
+/// which merge the tip directly (T1281); anything else merges the max
+/// commit directly. Empty
 /// diffs fail (usually: already landed); a failed merge prints the `MERGE
 /// CONFLICT` banner and fails with `Encountered a merge conflict.`.
 /// `message_of` provides the landed commit message for the set.

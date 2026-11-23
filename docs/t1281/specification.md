@@ -34,12 +34,17 @@ the resolved-conflict shape fails.
 
 ## Fix
 
-- **Bug 1 (`rust/src/land.rs`, `apply_merge_range`):** when the squash
-  range `min^..max` contains merge commits (`git rev-list --merges
-  --count`), skip the rebase and squash-merge the range tip (`max`)
-  directly onto the into-commit with the existing squash argv
-  (`--ff --squash`). Linear ranges keep the exact ceb git-command
-  sequence; only the previously-failing merge-containing shape is
+- **Bug 1 (`rust/src/land.rs`, `apply_merge_range`):** when a merge
+  commit in the squash range `min^..max` has a parent already reachable
+  from the into-commit (`git log --merges --format=%P` +
+  `git merge-base --is-ancestor`), skip the rebase and squash-merge the
+  range tip (`max`) directly onto the into-commit with the existing
+  squash argv (`--ff --squash`). This covers the into target merged back
+  in, including when the target moved again afterwards (then the direct
+  merge is a true 3-way). Linear ranges — and ranges merging unrelated
+  branches, whose rebase-first failure stays pinned by LAND-43
+  (`land43_merge_commit_range_conflicts_like_ceb`) — keep the exact ceb
+  git-command sequence; only the previously-failing merge-back shape is
   rerouted, and a genuine conflict there still reports through the
   existing `MERGE CONFLICT` path. Detection-command failure falls back
   to the rebase path (current behavior preserved).
