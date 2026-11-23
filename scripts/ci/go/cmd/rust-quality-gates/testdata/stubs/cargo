@@ -35,6 +35,14 @@ case "$1" in
         printf '#!/bin/sh\n' > "$ct/debug/deps/testobj"
         chmod +x "$ct/debug/deps/testobj"
         printf 'not-an-object\n' > "$ct/debug/deps/testobj.d"
+        # Cargo 1.100+ per-unit layout (T1281): one test binary plus
+        # decoys the discovery must skip (build script, dotted file).
+        mkdir -p "$ct/debug/build/app/abc123/out"
+        printf '#!/bin/sh\n' > "$ct/debug/build/app/abc123/out/newlayoutobj"
+        chmod +x "$ct/debug/build/app/abc123/out/newlayoutobj"
+        printf '#!/bin/sh\n' > "$ct/debug/build/app/abc123/out/build_script_build"
+        chmod +x "$ct/debug/build/app/abc123/out/build_script_build"
+        printf 'not-an-object\n' > "$ct/debug/build/app/abc123/out/newlayoutobj.d"
         echo "stub: suite ran"
         ;;
       report)

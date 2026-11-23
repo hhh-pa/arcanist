@@ -409,6 +409,61 @@ fn lands_squash_onto_master() {
 }
 
 #[test]
+fn t1281_squash_land_tolerates_master_merged_into_feature() {
+    let repo = Fixture::init_repo("t1281-mergeback");
+    let bare = Fixture::init_bare("t1281-mergeback-bare");
+    repo.git(&["remote", "add", "origin", &bare.dir.to_string_lossy()]);
+    repo.git(&["push", "-q", "origin", "master"]);
+    repo.git(&["checkout", "-qb", "feature"]);
+    repo.write("file.txt", "feat1\n");
+    repo.git(&["add", "file.txt"]);
+    repo.git(&["commit", "-qm", "edit line\n\nDifferential Revision: D1"]);
+    repo.git(&["checkout", "-q", "master"]);
+    repo.write("file.txt", "master\n");
+    repo.git(&["add", "file.txt"]);
+    repo.git(&["commit", "-qm", "master moves the same line"]);
+    repo.git(&["push", "-q", "origin", "master"]);
+    repo.git(&["checkout", "-q", "feature"]);
+    // The merge-back resolves the same-line conflict; the squash must not
+    // replay the pre-merge history and re-hit it.
+    let status = Command::new("git")
+        .current_dir(repo.path())
+        .args(["merge", "-m", "merge master into feature", "master"])
+        .status()
+        .unwrap();
+    assert!(!status.success(), "expected the merge-back to conflict");
+    repo.write("file.txt", "resolved\n");
+    repo.git(&["add", "file.txt"]);
+    repo.git(&["commit", "-qm", "merge master into feature"]);
+    repo.commit_file("b.txt", "b\n", "add b\n\nDifferential Revision: D1");
+    repo.git(&["push", "-q", "origin", "feature"]);
+    repo.git(&["fetch", "-q", "origin"]);
+    repo.git(&["branch", "--set-upstream-to=origin/master", "master"]);
+
+    let out = run_online(
+        repo.path(),
+        &[
+            "--onto",
+            "master",
+            "--strategy",
+            "squash",
+            "--revision",
+            "D1",
+        ],
+        &["y", "y"],
+    )
+    .unwrap();
+    assert!(
+        out.stderr.contains("** DONE ** Landed changes."),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(bare.git(&["rev-list", "--count", "refs/heads/master"]), "3");
+    let body = bare.git(&["log", "-1", "--format=%B", "refs/heads/master"]);
+    assert!(body.contains("Land feature"), "unexpected message: {body}");
+}
+
+#[test]
 fn land_with_hold_skips_push() {
     let (repo, bare) = repo_with_origin("hold");
     let remote_before = bare.git(&["rev-parse", "refs/heads/master"]);

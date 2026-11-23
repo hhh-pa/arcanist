@@ -31,8 +31,8 @@ stub: suite ran
 WARNING: $REPORT/lcov.info has absurd count 18446744073709551615 at src/absurd.rs DA:1; clamped to 0
 + cargo llvm-cov report --html --output-dir $REPORT
 + $SYS/lib/rustlib/x86_64-stub/bin/llvm-profdata merge -sparse ... (1 profraw) -o $WS/target/llvm-cov-target/canonical.profdata
-+ $SYS/lib/rustlib/x86_64-stub/bin/llvm-cov export -instr-profile=$WS/target/llvm-cov-target/canonical.profdata --format=lcov ... (1 objects)
-+ $SYS/lib/rustlib/x86_64-stub/bin/llvm-cov show -instr-profile=$WS/target/llvm-cov-target/canonical.profdata --format=html --output-dir=$REPORT/html.canonical -object ... (1 objects)
++ $SYS/lib/rustlib/x86_64-stub/bin/llvm-cov export -instr-profile=$WS/target/llvm-cov-target/canonical.profdata --format=lcov ... (2 objects)
++ $SYS/lib/rustlib/x86_64-stub/bin/llvm-cov show -instr-profile=$WS/target/llvm-cov-target/canonical.profdata --format=html --output-dir=$REPORT/html.canonical -object ... (2 objects)
 canonical coverage: cargo 8/9 lines -> canonical 4/4 (recovered 0 genuinely-executed lines)
 coverage for $WS: 100.00% lines (4/4, 1 files)
   100.00%     4/4     src/a.rs

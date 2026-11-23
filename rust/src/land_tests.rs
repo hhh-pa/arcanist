@@ -4104,6 +4104,173 @@ fn land43_merge_commit_range_conflicts_like_ceb() {
 }
 
 #[test]
+fn t1281_mergeback_skips_rebase_and_lands_resolved_tree() {
+    // T1281: the feature branch merged the into target back in and
+    // resolved the same-line conflict in the merge. Squash must merge
+    // the range tip directly instead of replaying pre-merge commits
+    // (the replay re-hits the resolved conflict and fails).
+    let repo = make_repo("t1281-mergeback");
+    git(&repo, &["checkout", "-qb", "feature"]);
+    std::fs::write(repo.join("file.txt"), "feat1\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "f1"]);
+    let min = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["checkout", "-q", "master"]);
+    std::fs::write(repo.join("file.txt"), "master\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "into"]);
+    let into = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["checkout", "-q", "feature"]);
+    let status = std::process::Command::new("git")
+        .current_dir(&repo)
+        .args(["merge", "-m", "merge master into feature", "master"])
+        .status()
+        .unwrap();
+    assert!(!status.success(), "expected the merge-back to conflict");
+    std::fs::write(repo.join("file.txt"), "resolved\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "merge master into feature"]);
+    let merge = git(&repo, &["rev-parse", "HEAD"]);
+    let max = commit_file(&repo, "b.txt", "b\n", "f2");
+    assert!(range_merges_into_history(&repo, &min, &max, &into));
+    assert!(!range_merges_into_history(&repo, &min, &min, &into));
+    let commits = vec![
+        land_commit(&min, &[&into], "f1"),
+        land_commit(&merge, &[&min, &into], "merge master into feature"),
+        land_commit(&max, &[&merge], "f2"),
+    ];
+    let set = CommitSet {
+        revision: None,
+        commits: vec![0, 1, 2],
+        is_pick: false,
+    };
+    let mut io = Io::canned(&[]);
+    let cursor = git_execute_merge(
+        &repo,
+        &mut io,
+        &set,
+        &commits,
+        Some(&into),
+        true,
+        false,
+        &stub_commit_message,
+    )
+    .unwrap();
+    assert_eq!(
+        git(&repo, &["log", "--format=%s", "-n1", &cursor]),
+        "stub landed message"
+    );
+    assert_eq!(
+        git(&repo, &["show", &format!("{cursor}:file.txt")]),
+        "resolved"
+    );
+    assert_eq!(git(&repo, &["show", &format!("{cursor}:b.txt")]), "b");
+    // Squash: single parent, the into commit.
+    assert_eq!(
+        git(&repo, &["rev-list", "--parents", "-n1", &cursor]),
+        format!("{cursor} {into}")
+    );
+}
+
+#[test]
+fn t1281_merge_detection_failure_keeps_rebase_path() {
+    // T1281: a parentless `min` (the root commit) makes `min^` invalid,
+    // so merge detection fails and answers false — the historical
+    // rebase-first path runs (and reports its own failure here).
+    let repo = make_repo("t1281-noparent");
+    let root = git(&repo, &["rev-parse", "master"]);
+    git(&repo, &["checkout", "-qb", "feature"]);
+    let tip = commit_file(&repo, "f.txt", "f\n", "feature work");
+    assert!(!range_merges_into_history(&repo, &root, &tip, &root));
+    let commits = vec![
+        land_commit(&root, &[], "base"),
+        land_commit(&tip, &[&root], "feature work"),
+    ];
+    let set = CommitSet {
+        revision: None,
+        commits: vec![0, 1],
+        is_pick: false,
+    };
+    let mut io = Io::canned(&[]);
+    let err = git_execute_merge(
+        &repo,
+        &mut io,
+        &set,
+        &commits,
+        Some(&root),
+        true,
+        false,
+        &stub_commit_message,
+    )
+    .unwrap_err();
+    assert_eq!(err, "Encountered a merge conflict.");
+}
+
+#[test]
+fn t1281_mergeback_with_moved_target_merges_three_way() {
+    // T1281: the into target moved again (elsewhere in the tree) after
+    // the merge-back. The direct squash-merge is a true 3-way against
+    // the merged-in base and still lands; the rebase replay would
+    // re-hit the resolved same-line conflict and fail.
+    let repo = make_repo("t1281-moved");
+    git(&repo, &["checkout", "-qb", "feature"]);
+    std::fs::write(repo.join("file.txt"), "feat1\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "f1"]);
+    let min = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["checkout", "-q", "master"]);
+    std::fs::write(repo.join("file.txt"), "master\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "old master"]);
+    git(&repo, &["checkout", "-q", "feature"]);
+    let status = std::process::Command::new("git")
+        .current_dir(&repo)
+        .args(["merge", "-m", "merge master into feature", "master"])
+        .status()
+        .unwrap();
+    assert!(!status.success(), "expected the merge-back to conflict");
+    std::fs::write(repo.join("file.txt"), "resolved\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "merge master into feature"]);
+    let merge = git(&repo, &["rev-parse", "HEAD"]);
+    let max = commit_file(&repo, "b.txt", "b\n", "f2");
+    git(&repo, &["checkout", "-q", "master"]);
+    let into = commit_file(&repo, "other.txt", "later\n", "target moves on");
+    assert!(range_merges_into_history(&repo, &min, &max, &into));
+    let commits = vec![
+        land_commit(&min, &[&into], "f1"),
+        land_commit(&merge, &[&min], "merge master into feature"),
+        land_commit(&max, &[&merge], "f2"),
+    ];
+    let set = CommitSet {
+        revision: None,
+        commits: vec![0, 1, 2],
+        is_pick: false,
+    };
+    let mut io = Io::canned(&[]);
+    let cursor = git_execute_merge(
+        &repo,
+        &mut io,
+        &set,
+        &commits,
+        Some(&into),
+        true,
+        false,
+        &stub_commit_message,
+    )
+    .unwrap();
+    assert_eq!(
+        git(&repo, &["show", &format!("{cursor}:file.txt")]),
+        "resolved"
+    );
+    assert_eq!(
+        git(&repo, &["show", &format!("{cursor}:other.txt")]),
+        "later"
+    );
+    assert_eq!(git(&repo, &["show", &format!("{cursor}:b.txt")]), "b");
+}
+
+#[test]
 fn land12_raw_commit_round_trips_and_rebuilds() {
     // Blob parse/render fidelity plus the into-empty rebuild: no parents
     // under squash, author/committer/message bytes preserved.

@@ -607,6 +607,33 @@ func llvmToolPath(env []string, workspace, name string) (string, error) {
 	return "", fmt.Errorf("cannot find %s (the llvm-tools-preview rustup component provides it)", name)
 }
 
+// scanTestObjects returns the extensionless executables directly
+// under dir (test binaries). Build-script binaries share the cargo
+// 1.100+ per-unit out dirs, so `build_script_build` is skipped by
+// name; dotted outputs (.d, .rlib, .rmeta, .o) never match. A
+// missing dir yields nothing; read errors propagate.
+func scanTestObjects(dir string) ([]string, error) {
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		return nil, nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var objs []string
+	for _, e := range entries {
+		if e.Name() == "build_script_build" || strings.Contains(e.Name(), ".") {
+			continue
+		}
+		p := filepath.Join(dir, e.Name())
+		if info, err := os.Stat(p); err == nil && !info.IsDir() && executil.IsExecutable(p) {
+			objs = append(objs, p)
+		}
+	}
+	return objs, nil
+}
+
 // rawLLVMCovExport runs raw `llvm-cov export --format=lcov` over
 // every test object. Unlike `cargo llvm-cov report`, this keeps the
 // `<crate>/tests/../src` records that cargo's built-in filter drops;
@@ -641,22 +668,40 @@ func rawLLVMCovExport(env []string, workspace, covtarget, llvmCov, llvmProfdata 
 	}
 	var objs []string
 	for _, sub := range []string{"debug", "release"} {
-		deps := filepath.Join(covtarget, sub, "deps")
-		info, err := os.Stat(deps)
-		if err != nil || !info.IsDir() {
-			continue
-		}
-		entries, err := os.ReadDir(deps)
+		profile := filepath.Join(covtarget, sub)
+		// Cargo <= 1.99: test binaries live directly under deps/.
+		found, err := scanTestObjects(filepath.Join(profile, "deps"))
 		if err != nil {
 			return "", nil, "", err
 		}
-		for _, e := range entries {
-			if strings.Contains(e.Name(), ".") {
+		objs = append(objs, found...)
+		// Cargo 1.100+: per-unit output dirs (T1281); test binaries
+		// live in build/<pkg>/<unit>/out/ next to build-script
+		// outputs. Real trees use one layout or the other; scanning
+		// both keeps old images working too.
+		buildDir := filepath.Join(profile, "build")
+		pkgs, err := os.ReadDir(buildDir)
+		if err != nil {
+			continue
+		}
+		for _, pkg := range pkgs {
+			if !pkg.IsDir() {
 				continue
 			}
-			p := filepath.Join(deps, e.Name())
-			if info, err := os.Stat(p); err == nil && !info.IsDir() && executil.IsExecutable(p) {
-				objs = append(objs, p)
+			units, err := os.ReadDir(filepath.Join(buildDir, pkg.Name()))
+			if err != nil {
+				return "", nil, "", err
+			}
+			for _, unit := range units {
+				if !unit.IsDir() {
+					continue
+				}
+				out := filepath.Join(buildDir, pkg.Name(), unit.Name(), "out")
+				found, err := scanTestObjects(out)
+				if err != nil {
+					return "", nil, "", err
+				}
+				objs = append(objs, found...)
 			}
 		}
 	}
